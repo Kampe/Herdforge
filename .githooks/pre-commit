@@ -1,0 +1,10 @@
+#!/bin/sh
+# chain the users global hook first (if any), then enforce the root guard
+gh="$HOME/.config/git/hooks/pre-commit"
+[ -x "$gh" ] && "$gh" "$@" || true
+gitdir=$(git rev-parse --git-dir 2>/dev/null)
+case "$gitdir" in *"/worktrees/"*) exit 0 ;; esac
+if [ "$HERD_ALLOW_ROOT_COMMIT" != "1" ]; then
+  echo "REFUSED: commit to the shared root checkout is forbidden (FAC-110). Fleet work belongs in .herd/worktrees/<ref>." >&2
+  exit 1
+fi
