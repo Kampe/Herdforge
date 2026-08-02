@@ -24,7 +24,9 @@ type ReceiptStore interface {
 // FileReceiptStore persists receipts as atomically replaced, mode-0600 JSON
 // files named by their self-authenticating SHA-256 digest.
 type FileReceiptStore struct {
-	Dir string
+	Dir        string
+	createTemp func(string, string) (*os.File, error)
+	rename     func(string, string) error
 }
 
 func NewFileReceiptStore(dir string) (*FileReceiptStore, error) {
@@ -58,7 +60,15 @@ func (s *FileReceiptStore) Persist(ctx context.Context, receipt Receipt) error {
 	if err != nil {
 		return fmt.Errorf("encode receipt: %w", err)
 	}
-	tmp, err := os.CreateTemp(s.Dir, ".receipt-*.tmp")
+	createTemp := s.createTemp
+	if createTemp == nil {
+		createTemp = os.CreateTemp
+	}
+	rename := s.rename
+	if rename == nil {
+		rename = os.Rename
+	}
+	tmp, err := createTemp(s.Dir, ".receipt-*.tmp")
 	if err != nil {
 		return fmt.Errorf("create receipt temporary file: %w", err)
 	}
@@ -79,7 +89,7 @@ func (s *FileReceiptStore) Persist(ctx context.Context, receipt Receipt) error {
 	if err := tmp.Close(); err != nil {
 		return fmt.Errorf("close receipt: %w", err)
 	}
-	if err := os.Rename(tmpName, path); err != nil {
+	if err := rename(tmpName, path); err != nil {
 		return fmt.Errorf("install receipt: %w", err)
 	}
 	return nil
