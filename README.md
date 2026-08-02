@@ -13,6 +13,7 @@ Use the current commands as assisted operations and keep integration visible to 
 
 - [Target workflow and fleet contract](docs/architecture/TARGET-WORKFLOW.md)
 - [Architecture and fleet audit — 2026-08-02](docs/architecture/AUDIT-2026-08-02.md)
+- [Second-pass audit and runtime integration findings — 2026-08-02](docs/architecture/AUDIT-SECOND-PASS-2026-08-02.md)
 - [Technical implementation guide](docs/architecture/AGENT-IMPLEMENTATION-GUIDE.md)
 
 ## The intended loop
