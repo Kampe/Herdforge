@@ -200,11 +200,28 @@ func (d *Dispatcher) compensate(ctx context.Context, ticketRef, reason string) e
 }
 
 // failWithCompensate runs compensation and joins any compensate error with primary.
+// Primary is always preserved; compensation errors never replace it.
 func (d *Dispatcher) failWithCompensate(ctx context.Context, ticketRef, reason string, primary error) error {
 	if cErr := d.compensate(ctx, ticketRef, reason); cErr != nil {
 		return errors.Join(primary, cErr)
 	}
 	return primary
+}
+
+// rollbackTab closes a partial-launch tab then runs durable compensation.
+// TabClose errors are never discarded: they are joined into primary and
+// additionally compensated under reason+"_orphan_tab_close_failed" so an
+// orphan session cannot be silently accepted (FAC-121 R3).
+func (d *Dispatcher) rollbackTab(ctx context.Context, h HerdrLauncher, tabID, ticketRef, reason string, primary error) error {
+	if tabID != "" && h != nil {
+		if closeErr := h.TabClose(tabID); closeErr != nil {
+			primary = errors.Join(primary, fmt.Errorf("tab close %q during %s: %w", tabID, reason, closeErr))
+			if cErr := d.compensate(ctx, ticketRef, reason+"_orphan_tab_close_failed"); cErr != nil {
+				primary = errors.Join(primary, cErr)
+			}
+		}
+	}
+	return d.failWithCompensate(ctx, ticketRef, reason, primary)
 }
 
 func (d *Dispatcher) Dispatch(ctx context.Context, opts DispatchOptions) (*DispatchResult, error) {
@@ -269,6 +286,7 @@ func (d *Dispatcher) Dispatch(ctx context.Context, opts DispatchOptions) (*Dispa
 		return nil, fmt.Errorf("worktree created without a Git branch; refusing fictional packet branch")
 	}
 
+	// Worktree side effect already landed — every subsequent error must compensate.
 	if err := d.record(ctx, StepRecord{
 		TicketRef: task.Ref,
 		Step:      StepWorktree,
@@ -277,12 +295,13 @@ func (d *Dispatcher) Dispatch(ctx context.Context, opts DispatchOptions) (*Dispa
 		BaseSHA:   wtInfo.BaseSHA,
 		AnchorRef: wtInfo.AnchorRef,
 	}); err != nil {
-		return nil, err
+		return nil, d.failWithCompensate(ctx, task.Ref, "record_worktree_failed", err)
 	}
 
 	// 4. Flip ticket to in-progress (partial: compensator marks Recovering on later failure)
 	if err := d.TaskProvider.UpdateStatus(ctx, task.ID, "in-progress"); err != nil {
-		return nil, fmt.Errorf("failed to update ticket status: %w", err)
+		return nil, d.failWithCompensate(ctx, task.Ref, "board_status_failed",
+			fmt.Errorf("failed to update ticket status: %w", err))
 	}
 	if err := d.record(ctx, StepRecord{
 		TicketRef: task.Ref,
@@ -411,14 +430,12 @@ func (d *Dispatcher) launch(
 		PaneID:    tab.Pane.ID,
 		AgentName: tabLabel,
 	}); err != nil {
-		_ = h.TabClose(tab.ID)
-		return d.failWithCompensate(ctx, task.Ref, "record_tab_failed", err)
+		return d.rollbackTab(ctx, h, tab.ID, task.Ref, "record_tab_failed", err)
 	}
 
 	if err := h.AgentStart(tabLabel, lane.AgentKind, tab.Pane.ID, herdr.LaneAgentArgs(model)...); err != nil {
-		// Compensate: close orphan tab so failed start leaves no session.
-		_ = h.TabClose(tab.ID)
-		return d.failWithCompensate(ctx, task.Ref, "agent_start_failed",
+		// Close orphan tab then durable compensate — TabClose errors must not be silent.
+		return d.rollbackTab(ctx, h, tab.ID, task.Ref, "agent_start_failed",
 			fmt.Errorf("worktree ready but agent start failed: %w", err))
 	}
 	if err := d.record(ctx, StepRecord{
@@ -430,8 +447,7 @@ func (d *Dispatcher) launch(
 		PaneID:    tab.Pane.ID,
 		AgentName: tabLabel,
 	}); err != nil {
-		_ = h.TabClose(tab.ID)
-		return d.failWithCompensate(ctx, task.Ref, "record_agent_start_failed", err)
+		return d.rollbackTab(ctx, h, tab.ID, task.Ref, "record_agent_start_failed", err)
 	}
 
 	// Always prove consumption — no production SkipPromptVerify bypass.
@@ -446,18 +462,15 @@ func (d *Dispatcher) launch(
 	receipt, err := h.DeliverAndProve(tabLabel, packet, timeout)
 	result.Receipt = receipt
 	if err != nil {
-		_ = h.TabClose(tab.ID)
-		return d.failWithCompensate(ctx, task.Ref, "prompt_delivery_failed",
+		return d.rollbackTab(ctx, h, tab.ID, task.Ref, "prompt_delivery_failed",
 			fmt.Errorf("worktree ready but prompt consumption not proven: %w", err))
 	}
 	if receipt == nil || !receipt.Consumed || !receipt.Verified {
-		_ = h.TabClose(tab.ID)
-		return d.failWithCompensate(ctx, task.Ref, "prompt_receipt_invalid",
+		return d.rollbackTab(ctx, h, tab.ID, task.Ref, "prompt_receipt_invalid",
 			fmt.Errorf("worktree ready but prompt receipt did not prove consumption"))
 	}
 	if !herdr.ConsumptionProven(receipt.BaselineStatus, receipt.FinalStatus) {
-		_ = h.TabClose(tab.ID)
-		return d.failWithCompensate(ctx, task.Ref, "prompt_sequence_invalid",
+		return d.rollbackTab(ctx, h, tab.ID, task.Ref, "prompt_sequence_invalid",
 			fmt.Errorf("prompt receipt sequence %q is not a valid consumption proof", receipt.SequenceToken))
 	}
 
@@ -470,8 +483,7 @@ func (d *Dispatcher) launch(
 		AgentName: tabLabel,
 		Receipt:   receipt.SequenceToken,
 	}); err != nil {
-		_ = h.TabClose(tab.ID)
-		return d.failWithCompensate(ctx, task.Ref, "record_prompt_failed", err)
+		return d.rollbackTab(ctx, h, tab.ID, task.Ref, "record_prompt_failed", err)
 	}
 	result.Launched = true
 	return nil
