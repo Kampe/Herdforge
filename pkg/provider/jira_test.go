@@ -79,3 +79,55 @@ func TestJiraProvider_GetTaskAndListTasks(t *testing.T) {
 		t.Errorf("expected clean UpdateStatus, got err: %v", err)
 	}
 }
+
+func TestJiraProvider_AddComment(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{}`))
+	}))
+	defer ts.Close()
+
+	jp := NewJiraProvider(ts.URL, "user@example.com", "token123")
+	if err := jp.AddComment(context.Background(), "100", "done"); err != nil {
+		t.Errorf("expected clean AddComment, got err: %v", err)
+	}
+}
+
+func TestJiraProvider_DoRequest_Non200(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer ts.Close()
+
+	jp := NewJiraProvider(ts.URL, "user@example.com", "token123")
+	_, err := jp.doRequest(context.Background(), "GET", "/rest/api/3/issue/999", nil)
+	if err == nil {
+		t.Fatal("expected error on 500, got nil")
+	}
+}
+
+func TestJiraProvider_GetTask_BadJSON(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{invalid`))
+	}))
+	defer ts.Close()
+
+	jp := NewJiraProvider(ts.URL, "user@example.com", "token123")
+	_, err := jp.GetTask(context.Background(), "999")
+	if err == nil {
+		t.Fatal("expected error on bad JSON, got nil")
+	}
+}
+
+func TestJiraProvider_UpdateStatus_CancelledContext(t *testing.T) {
+	jp := NewJiraProvider("http://localhost:1", "user@example.com", "token123")
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err := jp.UpdateStatus(ctx, "100", "Done")
+	if err == nil {
+		t.Fatal("expected error on cancelled context, got nil")
+	}
+}
