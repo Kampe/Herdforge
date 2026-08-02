@@ -11,10 +11,14 @@ import (
 
 const herdrCLI = "herdr"
 
+// runHerdr is overridable for crash-point / unit tests (FAC-121).
+var runHerdr = runHerdrReal
+
 type TabInfo struct {
 	ID    string
 	Label string
 	Pane  PaneInfo
+	Cwd   string // process cwd requested at tab create (empty for legacy Tab)
 }
 
 type PaneInfo struct {
@@ -22,11 +26,44 @@ type PaneInfo struct {
 	TabID string
 }
 
+// TabCreateOptions is the fail-closed tab launch contract (FAC-121).
+// Workspace and Cwd are required; unknown workspace must not fall back.
+type TabCreateOptions struct {
+	Workspace string
+	Label     string
+	Cwd       string
+	NoFocus   bool
+	Env       []string // optional KEY=VALUE pairs
+}
+
 // Tab creates a new tab in the specified workspace and returns the tab + root pane.
+// Legacy convenience without cwd — prefer TabCreate for write-capable agents.
 func Tab(workspaceID, label string, noFocus bool) (*TabInfo, error) {
-	args := []string{"tab", "create", "--workspace", workspaceID, "--label", label}
-	if noFocus {
+	return TabCreate(TabCreateOptions{
+		Workspace: workspaceID,
+		Label:     label,
+		NoFocus:   noFocus,
+	})
+}
+
+// TabCreate creates a herdr tab with explicit workspace and optional cwd.
+// When Cwd is set it is passed as --cwd so the pane process starts there
+// (prompt "cd" is not isolation). Empty Workspace fails closed.
+func TabCreate(opts TabCreateOptions) (*TabInfo, error) {
+	if strings.TrimSpace(opts.Workspace) == "" {
+		return nil, fmt.Errorf("herdr tab create: workspace is required (no hardcoded fallback)")
+	}
+	args := []string{"tab", "create", "--workspace", opts.Workspace, "--label", opts.Label}
+	if opts.Cwd != "" {
+		args = append(args, "--cwd", opts.Cwd)
+	}
+	if opts.NoFocus {
 		args = append(args, "--no-focus")
+	}
+	for _, e := range opts.Env {
+		if e != "" {
+			args = append(args, "--env", e)
+		}
 	}
 	output, err := runHerdr(args...)
 	if err != nil {
@@ -52,11 +89,26 @@ func Tab(workspaceID, label string, noFocus bool) (*TabInfo, error) {
 	return &TabInfo{
 		ID:    resp.Result.Tab.TabID,
 		Label: resp.Result.Tab.Label,
+		Cwd:   opts.Cwd,
 		Pane: PaneInfo{
 			ID:    resp.Result.RootPane.PaneID,
 			TabID: resp.Result.RootPane.TabID,
 		},
 	}, nil
+}
+
+// TabCreateForTask is the FAC-121 launch entry: requires workspace and cwd.
+// Rejects empty cwd so shared-root / unknown-directory starts cannot slip through.
+func TabCreateForTask(workspaceID, label, cwd string, noFocus bool) (*TabInfo, error) {
+	if strings.TrimSpace(cwd) == "" {
+		return nil, fmt.Errorf("herdr tab create: cwd is required for task agents")
+	}
+	return TabCreate(TabCreateOptions{
+		Workspace: workspaceID,
+		Label:     label,
+		Cwd:       cwd,
+		NoFocus:   noFocus,
+	})
 }
 
 // AgentStart starts an agent in the specified pane. Extra agentArgs are
@@ -162,7 +214,7 @@ func ResolveAgentTab(name string) (string, error) {
 	return "", fmt.Errorf("no standing agent named '%s' found", name)
 }
 
-func runHerdr(args ...string) (string, error) {
+func runHerdrReal(args ...string) (string, error) {
 	cmd := exec.Command(herdrCLI, args...)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
