@@ -1,0 +1,31 @@
+name: CI Workflow
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test:
+    name: Build & Test Suite
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          cache: true
+
+      - name: Run Preflight Check
+        run: go run ./cmd/herd preflight
+
+      - name: Run Go Unit Tests
+        run: go test -v ./...
+
+      - name: Build Binary
+        run: go build -o bin/herd ./cmd/herd
