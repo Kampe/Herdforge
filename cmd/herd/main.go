@@ -1629,6 +1629,13 @@ func runShell() {
 // exhaustion is caught explicitly instead of surfacing as agents that plan
 // but never build. Exit 1 when any lane has no healthy model.
 func runDoctorModels() {
+	fs := flag.NewFlagSet("doctor-models", flag.ExitOnError)
+	// FAC-129: --tool-probe verifies the resolved model actually EXECUTES
+	// tools, not just that it is authenticated/in-quota. A tool-incapable
+	// surface is DEAD for fleet work no matter how healthy its quota looks.
+	toolProbe := fs.Bool("tool-probe", false, "also verify each model executes tools (herd tool-probe)")
+	fs.Parse(os.Args[2:])
+
 	cfg, err := config.LoadConfig(".herd/herd.yaml")
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "doctor-models: %v\n", err)
@@ -1645,6 +1652,13 @@ func runDoctorModels() {
 				fmt.Printf("        %s: %s\n", p.Model, p.Reason)
 			}
 			continue
+		}
+		if *toolProbe {
+			if tp := herdr.ToolProbe(ctx, model); !tp.Executes {
+				deadLanes++
+				fmt.Printf("DEAD  %s -> %s — does NOT execute tools: %s\n", lane.Name, model, tp.Reason)
+				continue
+			}
 		}
 		if model == lane.Model {
 			fmt.Printf("OK    %s -> %s\n", lane.Name, model)
@@ -2209,6 +2223,14 @@ func runUnmerged() {
 }
 
 func runForge() {
+	// FAC-128: `herd forge --loop` runs the autonomous orchestration loop.
+	for _, a := range os.Args[2:] {
+		if a == "--loop" {
+			runForgeLoop()
+			return
+		}
+	}
+
 	cfg, err := config.LoadConfig(".herd/herd.yaml")
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to load config: %v\n", err)
@@ -3096,4 +3118,127 @@ func runShoot() {
 		os.Exit(1)
 	}
 	fmt.Printf("herd shoot: %s refocused -> %s\n", target, status)
+}
+
+// cliForgeDriver implements daemon.ForgeDriver by driving the herd binary and
+// herdr fleet — the real side-effecting layer for `herd forge --loop`.
+type cliForgeDriver struct {
+	cfg      *config.Config
+	maxLanes int
+}
+
+func (d *cliForgeDriver) Log(msg string) { fmt.Println(msg) }
+
+// LaneState counts live task-fac-* builder agents that are working.
+func (d *cliForgeDriver) LaneState(ctx context.Context) daemon.LaneState {
+	busy := 0
+	if agents, err := herdr.AgentList(); err == nil {
+		for _, a := range agents {
+			if strings.HasPrefix(a.Name, "task-fac-") && (a.Status == "working" || a.Status == "starting") {
+				busy++
+			}
+		}
+	}
+	return daemon.LaneState{Busy: busy, Max: d.maxLanes}
+}
+
+// Signals: a card is completed when its builder agent exists and is no longer
+// working; it is verified when herd verify passes on its worktree.
+func (d *cliForgeDriver) Signals(ctx context.Context) (map[string]bool, map[string]bool) {
+	completed := map[string]bool{}
+	verified := map[string]bool{}
+	agents, err := herdr.AgentList()
+	if err != nil {
+		return completed, verified
+	}
+	v := verifier.NewVerifier("")
+	for _, a := range agents {
+		if !strings.HasPrefix(a.Name, "task-fac-") {
+			continue
+		}
+		if a.Status == "working" || a.Status == "starting" {
+			continue
+		}
+		ref := strings.ToUpper(strings.TrimPrefix(a.Name, "task-"))
+		completed[ref] = true
+		wt := filepath.Join(".herd", "worktrees", strings.ToLower(ref))
+		if fi, err := os.Stat(wt); err == nil && fi.IsDir() {
+			c := v.CheckCompletion(ctx, wt, "go build ./...", "go test ./...")
+			if c.Passed {
+				verified[ref] = true
+			}
+		}
+	}
+	return completed, verified
+}
+
+func (d *cliForgeDriver) herd(args ...string) error {
+	self, _ := os.Executable()
+	cmd := exec.Command(self, args...)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
+}
+
+func (d *cliForgeDriver) Dispatch(ctx context.Context, t *provider.Task) error {
+	return d.herd("dispatch", t.Ref, "--lane", "worker")
+}
+
+func (d *cliForgeDriver) Review(ctx context.Context, t *provider.Task) error {
+	return d.herd("review", t.Ref, "--spawn")
+}
+
+func (d *cliForgeDriver) Approve(ctx context.Context, t *provider.Task) error {
+	// Evidence-gated board move (requires the branch to be merged on
+	// origin/main); harvest/merge stays coordinator-owned git work.
+	if err := d.herd("approve", t.Ref); err != nil {
+		return err
+	}
+	_ = herdr.CloseTabForRef(t.Ref) // FAC-111: close the finished tab
+	return nil
+}
+
+func (d *cliForgeDriver) Renudge(ctx context.Context, t *provider.Task) error {
+	agent := "task-" + strings.ToLower(t.Ref)
+	msg := "RE-NUDGE " + t.Ref + ": you reported done but herd verify FAILED (missing commits, build, or tests). " +
+		"Finish it: implement, `go build ./... && go test ./...` green, `herd verify` PASS, then commit. Do not stop until committed."
+	_, err := herdr.Shoot(agent, msg, true, 30*time.Second)
+	return err
+}
+
+// runForgeLoop wires the real driver and runs the autonomous forge loop.
+func runForgeLoop() {
+	fs := flag.NewFlagSet("forge-loop", flag.ExitOnError)
+	_ = fs.Bool("loop", true, "run the autonomous loop")
+	maxLanes := fs.Int("max-lanes", 3, "max concurrent builder lanes")
+	interval := fs.Int("interval", 15, "seconds between ticks")
+	ticks := fs.Int("ticks", 0, "stop after N ticks (0 = run until drained)")
+	stopEmpty := fs.Bool("stop-empty", true, "stop when the board is clear and no lane is busy")
+	fs.Parse(os.Args[2:])
+
+	cfg, err := config.LoadConfig(".herd/herd.yaml")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "forge --loop: %v\n", err)
+		os.Exit(1)
+	}
+	var tp provider.TaskProvider
+	switch cfg.TaskProvider.Type {
+	case "kaneo":
+		tp = provider.NewKaneoProvider(cfg.TaskProvider.APIURL, cfg.TaskProvider.ProjectID, cfg.TaskProvider.UseCLI)
+	default:
+		tp = provider.NewMemoryProvider()
+	}
+	eng := daemon.NewEngine(cfg, tp, nil, nil, worktree.NewWorktreeManager("."), nil)
+	driver := &cliForgeDriver{cfg: cfg, maxLanes: *maxLanes}
+
+	fmt.Printf("herd forge --loop: max-lanes=%d interval=%ds — driving the board autonomously\n", *maxLanes, *interval)
+	err = eng.ForgeLoop(context.Background(), driver, daemon.ForgeLoopOptions{
+		Interval:  time.Duration(*interval) * time.Second,
+		MaxTicks:  *ticks,
+		StopEmpty: *stopEmpty,
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "forge --loop: %v\n", err)
+		os.Exit(1)
+	}
 }
