@@ -141,7 +141,7 @@ func (d *Dispatcher) Dispatch(ctx context.Context, opts DispatchOptions) (*Dispa
 			return result, fmt.Errorf("worktree ready but failed to launch agent: %w", err)
 		}
 
-		if err := herdr.AgentStart(tabLabel, lane.AgentKind, tab.Pane.ID); err != nil {
+		if err := herdr.AgentStart(tabLabel, lane.AgentKind, tab.Pane.ID, herdr.LaneAgentArgs(lane.Model)...); err != nil {
 			return result, fmt.Errorf("worktree ready but agent start failed: %w", err)
 		}
 
