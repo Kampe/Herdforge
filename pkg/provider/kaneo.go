@@ -130,22 +130,33 @@ func (k *KaneoProvider) ListTasks(ctx context.Context, projectID string, status 
 	}
 
 	if k.UseCLI {
-		// ponytail: --limit 500 outruns any current board; add pagination when a board exceeds it
-		args := []string{"task", "list", "--project", projectID, "--json", "--limit", "500"}
-		if status != "" {
-			args = append(args, "--status", status)
+		// The server caps a page at 100 records regardless of --limit, so a
+		// single call silently hides everything past card 100 — including
+		// unclaimed to-do cards, which breaks pulse. Page until a short page.
+		const pageSize = 100
+		var all []kaneoTaskDTO
+		for page := 1; page <= 50; page++ { // ponytail: 5000-card ceiling, raise if a board ever gets there
+			args := []string{"task", "list", "--project", projectID, "--json",
+				"--limit", fmt.Sprint(pageSize), "--page", fmt.Sprint(page)}
+			if status != "" {
+				args = append(args, "--status", status)
+			}
+			cmd := exec.CommandContext(ctx, "kaneo", args...)
+			var out bytes.Buffer
+			cmd.Stdout = &out
+			if err := cmd.Run(); err != nil {
+				return nil, fmt.Errorf("kaneo task list (page %d): %w", page, err)
+			}
+			var dtos []kaneoTaskDTO
+			if err := json.Unmarshal(out.Bytes(), &dtos); err != nil {
+				return nil, fmt.Errorf("parsing kaneo output (page %d): %w", page, err)
+			}
+			all = append(all, dtos...)
+			if len(dtos) < pageSize {
+				break
+			}
 		}
-		cmd := exec.CommandContext(ctx, "kaneo", args...)
-		var out bytes.Buffer
-		cmd.Stdout = &out
-		if err := cmd.Run(); err != nil {
-			return nil, fmt.Errorf("kaneo task list: %w", err)
-		}
-		var dtos []kaneoTaskDTO
-		if err := json.Unmarshal(out.Bytes(), &dtos); err != nil {
-			return nil, fmt.Errorf("parsing kaneo output: %w", err)
-		}
-		return filterTasks(dtos, status), nil
+		return filterTasks(all, status), nil
 	}
 
 	url := fmt.Sprintf("%s/api/task?projectId=%s", k.APIURL, projectID)
