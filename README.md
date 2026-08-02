@@ -26,10 +26,11 @@ Herdforge runs a self-reinforcing cycle using three standing agent lanes in [her
 ```
 
 1. **`herd standing`** — Spawns all three agents as named opencode sessions in herdr (`forge-forge-smith`, `forge-worker`, `forge-reviewer`)
-2. **`herd pulse --role <role> --spawn`** — Polls the Kaneo board, claims the highest-priority task matching the role, and delivers a structured task packet to the standing agent via `herdr agent prompt`
+2. **`herd pulse --role <role> --spawn`** — Polls the Kaneo board, claims the highest-priority `to-do` matching the role, and delivers a structured task packet to the standing agent
 3. **Worker agent** — Receives ref/title/description/worktree path, implements the change, commits
-4. **Reviewer agent** — Reviews the diff, moves card to `done`
-5. **Next pulse** — Picks up the next card from `to-do`
+4. **`herd review --spawn`** — Finds `in-progress` cards, dispatches a review packet to `forge-reviewer`, moves card to `review` status
+5. **`herd approve`** — Finds `review` status cards and moves them to `done`
+6. **`herd forge`** — Runs the full cycle in one shot: pulse + review + approve
 
 Everything runs on `deepseek-v4-flash` via opencode — cheap enough to keep all three agents running continuously.
 
@@ -59,6 +60,15 @@ herd standing
 
 # Claim & dispatch a task to a standing agent
 herd pulse --role worker --spawn
+
+# Review in-progress work
+herd review --spawn
+
+# Approve reviewed work
+herd approve
+
+# Full cycle in one shot
+herd forge
 
 # Inspect agent status
 herdr agent list
@@ -114,7 +124,10 @@ lanes:
 | `herd preflight` | Check for repo-relative path violations |
 | `herd status` | Show project, provider, and lane config |
 | `herd standing` | Launch all lane agents in herdr tabs |
-| `herd pulse --role <r> --spawn` | Claim next task from board, route to standing agent with task packet |
+| `herd pulse --role <r> --spawn` | Claim next `to-do` task, route to standing agent |
+| `herd review --spawn` | Claim `in-progress` tasks for reviewer, move to `review` status |
+| `herd approve` | Move `review`-status cards to `done` |
+| `herd forge` | Full cycle: pulse + review + approve |
 | `herd up <lane-name>` | Start a single lane agent |
 | `herd selftest` | Run the self-test suite |
 
@@ -124,10 +137,12 @@ lanes:
 
 1. Cards in Kaneo with `status: to-do` are candidates
 2. `herd pulse` sorts by `priority DESC, ref ASC` and claims the top match
-3. The card is moved to `in-progress` via `kaneo task status <id> in-progress`
-4. A structured task packet (ref, title, description, worktree path, workflow steps) is delivered to the standing agent via `herdr agent prompt`
-5. The agent works the task, commits, and either moves the card forward or signals for review
-6. The next `herd pulse` picks up the next card
+3. The card is moved to `in-progress` via the task provider
+4. A structured task packet (ref, title, description, worktree path, workflow steps) is delivered to the standing agent
+5. The agent works the task, commits, and signals completion
+6. `herd review --spawn` picks up `in-progress` cards, dispatches a review packet to the reviewer agent, moves card to `review`
+7. `herd approve` finds `review`-status cards and moves them to `done`
+8. The next `herd forge` or `herd pulse` picks up the next card from `to-do`
 
 ---
 
