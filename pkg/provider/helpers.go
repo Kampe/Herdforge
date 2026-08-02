@@ -3,6 +3,7 @@ package provider
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -23,7 +24,7 @@ func DTOToTask(id, ref, title, description, status string, p Priority, projectID
 
 // ParsePriorityString maps common priority label strings to domain Priority type
 func ParsePriorityString(label string) Priority {
-	switch label {
+	switch strings.ToLower(label) {
 	case "urgent", "priority:urgent", "1":
 		return PriorityUrgent
 	case "high", "priority:high", "2":

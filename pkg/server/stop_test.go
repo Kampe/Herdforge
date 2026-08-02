@@ -31,3 +31,14 @@ func TestServer_StartStop(t *testing.T) {
 		t.Fatalf("expected stop success, got err: %v", err)
 	}
 }
+
+func TestServer_Start_BindError(t *testing.T) {
+	ctx := context.Background()
+	// A race is possible. Port 9 is the discard protocol — should be safe.
+	// Try to bind on port 1 to guarantee EACCES.
+	srv := NewControlServer("127.0.0.1:1")
+	if err := srv.Start(ctx); err == nil {
+		srv.Stop(ctx)
+		t.Fatal("expected error binding to privileged port")
+	}
+}
