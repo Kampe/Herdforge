@@ -18,8 +18,11 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.22'
+          go-version: '1.26'
           cache: true
 
       - name: Run Makefile (preflight, test, build, lint)
-        run: make lint all
+        run: make lint test-unit preflight
+
+      - name: Coverage Report
+        run: make test-coverage

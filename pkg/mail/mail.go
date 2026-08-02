@@ -79,17 +79,8 @@ func (m *Mailbox) ReadInbox(recipient string) ([]*Envelope, error) {
 	}
 
 	var res []*Envelope
-	lines := filepath.SplitList(string(data))
-	_ = lines
 
-	// Split by newline
-	strData := string(data)
-	for _, line := range filepath.SplitList(strData) {
-		_ = line
-	}
-
-	// Parse JSON lines
-	rawLines := splitLines(strData)
+	rawLines := splitLines(string(data))
 	for _, l := range rawLines {
 		if len(l) == 0 {
 			continue

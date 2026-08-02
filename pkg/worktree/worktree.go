@@ -9,6 +9,9 @@ import (
 	"strings"
 )
 
+// execCommandContext is a variable so tests can mock; defaults to exec.CommandContext
+var execCommandContext = exec.CommandContext
+
 type WorktreeManager struct {
 	RepoRoot    string
 	WorktreeDir string
@@ -35,7 +38,7 @@ type WorktreeInfo struct {
 }
 
 func (w *WorktreeManager) CreateWorktree(ctx context.Context, branch string, targetDir string) error {
-	cmd := exec.CommandContext(ctx, "git", "worktree", "add", "-b", branch, targetDir, "HEAD")
+	cmd := execCommandContext(ctx, "git", "worktree", "add", "-b", branch, targetDir, "HEAD")
 	cmd.Dir = w.RepoRoot
 	if output, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("failed to create worktree: %v, output: %s", err, string(output))
@@ -44,7 +47,7 @@ func (w *WorktreeManager) CreateWorktree(ctx context.Context, branch string, tar
 }
 
 func (w *WorktreeManager) RemoveWorktree(ctx context.Context, targetDir string) error {
-	cmd := exec.CommandContext(ctx, "git", "worktree", "remove", "--force", targetDir)
+	cmd := execCommandContext(ctx, "git", "worktree", "remove", "--force", targetDir)
 	cmd.Dir = w.RepoRoot
 	if output, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("failed to remove worktree: %v, output: %s", err, string(output))
@@ -54,7 +57,7 @@ func (w *WorktreeManager) RemoveWorktree(ctx context.Context, targetDir string) 
 
 // ListWorktrees runs git worktree list and returns structured worktree information
 func (w *WorktreeManager) ListWorktrees(ctx context.Context) ([]*WorktreeInfo, error) {
-	cmd := exec.CommandContext(ctx, "git", "worktree", "list", "--porcelain")
+	cmd := execCommandContext(ctx, "git", "worktree", "list", "--porcelain")
 	cmd.Dir = w.RepoRoot
 
 	output, err := cmd.CombinedOutput()
@@ -101,7 +104,7 @@ func (w *WorktreeManager) CreateTaskWorktree(ctx context.Context, taskRef string
 		return nil, fmt.Errorf("failed to create worktree root directory: %w", err)
 	}
 
-	cmd := exec.CommandContext(ctx, "git", "worktree", "add", "-b", branch, targetPath, "HEAD")
+	cmd := execCommandContext(ctx, "git", "worktree", "add", "-b", branch, targetPath, "HEAD")
 	cmd.Dir = w.RepoRoot
 	if output, err := cmd.CombinedOutput(); err != nil {
 		return nil, fmt.Errorf("failed to create git worktree: %v, output: %s", err, string(output))
@@ -123,11 +126,11 @@ func (w *WorktreeManager) PruneMergedWorktrees(ctx context.Context, defaultBranc
 	prunedCount := 0
 	for _, wt := range wtList {
 		if strings.HasPrefix(wt.Branch, "herd/") {
-			cmd := exec.CommandContext(ctx, "git", "branch", "--merged", defaultBranch)
+			cmd := execCommandContext(ctx, "git", "branch", "--merged", defaultBranch)
 			cmd.Dir = w.RepoRoot
 			output, err := cmd.CombinedOutput()
 			if err == nil && strings.Contains(string(output), wt.Branch) {
-				rmCmd := exec.CommandContext(ctx, "git", "worktree", "remove", "--force", wt.Path)
+				rmCmd := execCommandContext(ctx, "git", "worktree", "remove", "--force", wt.Path)
 				rmCmd.Dir = w.RepoRoot
 				if err := rmCmd.Run(); err == nil {
 					prunedCount++
