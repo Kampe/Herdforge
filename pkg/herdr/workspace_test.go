@@ -1,6 +1,10 @@
 package herdr
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/Kampe/Herdforge/pkg/config"
+)
 
 func TestPickWorkspace(t *testing.T) {
 	entries := []WorkspaceEntry{
@@ -53,5 +57,38 @@ func TestRequireWorkspace_UnknownFailsClosed(t *testing.T) {
 	_, err := RequireWorkspace("/tmp/no-such-herdforge-repo-xyz")
 	if err == nil {
 		t.Fatal("expected fail-closed error when workspace cannot be resolved")
+	}
+}
+
+func TestResolveWorkspace_EnvWins(t *testing.T) {
+	t.Setenv("HERD_WORKSPACE", "wOverride")
+	got := ResolveWorkspace("/tmp")
+	if got != "wOverride" {
+		t.Errorf("env override = %q, want wOverride", got)
+	}
+}
+
+func TestResolveWorkspaceWithConfig_WinsOverFocused(t *testing.T) {
+	// When config sets herdr_workspace and no env is set, config wins
+	// regardless of what WorkspaceList would return.
+	t.Setenv("HERD_WORKSPACE", "")
+	cfg := &config.Config{Fleet: config.FleetConfig{HerdrWorkspace: "wF"}}
+	got := ResolveWorkspaceWithConfig("some/repo", cfg)
+	if got != "wF" {
+		t.Errorf("ResolveWorkspaceWithConfig with config workspace = %q, want wF", got)
+	}
+}
+
+func TestResolveWorkspaceWithConfig_EmptyConfigFallsThrough(t *testing.T) {
+	t.Setenv("HERD_WORKSPACE", "")
+	gotNil := ResolveWorkspaceWithConfig("some/repo", nil)
+	if gotNil == "" {
+		t.Error("ResolveWorkspaceWithConfig with nil config returned empty")
+	}
+
+	cfg := &config.Config{}
+	gotEmpty := ResolveWorkspaceWithConfig("some/repo", cfg)
+	if gotEmpty == "" {
+		t.Error("ResolveWorkspaceWithConfig with empty config returned empty")
 	}
 }
