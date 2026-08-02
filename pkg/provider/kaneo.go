@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os/exec"
+	"strings"
 	"time"
 )
 
@@ -24,20 +26,37 @@ func NewKaneoProvider(apiURL string, projectID string) *KaneoProvider {
 }
 
 type kaneoTaskDTO struct {
-	ID          string   `json:"id"`
-	Ref         string   `json:"ref"`
-	Title       string   `json:"title"`
-	Description string   `json:"description"`
-	Status      string   `json:"status"`
-	Priority    string   `json:"priority"`
-	ProjectId   string   `json:"projectId"`
-	CreatedAt   string   `json:"createdAt"`
-	Labels      []struct {
-		Name string `json:"name"`
-	} `json:"labels"`
+	ID          string `json:"id"`
+	Ref         string `json:"ref"`
+	Title       string `json:"title"`
+	Description string `json:"description"`
+	Status      string `json:"status"`
+	Priority    string `json:"priority"`
+	ProjectId   string `json:"projectId"`
+	CreatedAt   string `json:"createdAt"`
 }
 
 func (k *KaneoProvider) GetTask(ctx context.Context, id string) (*Task, error) {
+	cmd := exec.CommandContext(ctx, "kaneo", "task", "get", id, "--json")
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	if err := cmd.Run(); err == nil {
+		var dto kaneoTaskDTO
+		if err := json.Unmarshal(out.Bytes(), &dto); err == nil {
+			createdAt, _ := time.Parse(time.RFC3339, dto.CreatedAt)
+			return &Task{
+				ID:          dto.ID,
+				Ref:         dto.Ref,
+				Title:       dto.Title,
+				Description: dto.Description,
+				Status:      dto.Status,
+				Priority:    Priority(dto.Priority),
+				ProjectID:   dto.ProjectId,
+				CreatedAt:   createdAt,
+			}, nil
+		}
+	}
+
 	url := fmt.Sprintf("%s/api/task/%s", k.APIURL, id)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
@@ -50,22 +69,12 @@ func (k *KaneoProvider) GetTask(ctx context.Context, id string) (*Task, error) {
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("kaneo API returned non-200 status: %d", resp.StatusCode)
-	}
-
 	var dto kaneoTaskDTO
 	if err := json.NewDecoder(resp.Body).Decode(&dto); err != nil {
 		return nil, fmt.Errorf("failed to decode task JSON: %w", err)
 	}
 
-	labels := make([]string, 0, len(dto.Labels))
-	for _, l := range dto.Labels {
-		labels = append(labels, l.Name)
-	}
-
 	createdAt, _ := time.Parse(time.RFC3339, dto.CreatedAt)
-
 	return &Task{
 		ID:          dto.ID,
 		Ref:         dto.Ref,
@@ -74,12 +83,38 @@ func (k *KaneoProvider) GetTask(ctx context.Context, id string) (*Task, error) {
 		Status:      dto.Status,
 		Priority:    Priority(dto.Priority),
 		ProjectID:   dto.ProjectId,
-		Labels:      labels,
 		CreatedAt:   createdAt,
 	}, nil
 }
 
 func (k *KaneoProvider) ListTasks(ctx context.Context, projectID string, status string) ([]*Task, error) {
+	cmd := exec.CommandContext(ctx, "kaneo", "task", "list", "--project", projectID, "--json")
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	if err := cmd.Run(); err == nil {
+		var dtos []kaneoTaskDTO
+		if err := json.Unmarshal(out.Bytes(), &dtos); err == nil {
+			var tasks []*Task
+			for _, dto := range dtos {
+				if status != "" && !strings.EqualFold(dto.Status, status) {
+					continue
+				}
+				createdAt, _ := time.Parse(time.RFC3339, dto.CreatedAt)
+				tasks = append(tasks, &Task{
+					ID:          dto.ID,
+					Ref:         dto.Ref,
+					Title:       dto.Title,
+					Description: dto.Description,
+					Status:      dto.Status,
+					Priority:    Priority(dto.Priority),
+					ProjectID:   dto.ProjectId,
+					CreatedAt:   createdAt,
+				})
+			}
+			return tasks, nil
+		}
+	}
+
 	url := fmt.Sprintf("%s/api/task?projectId=%s", k.APIURL, projectID)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
@@ -92,26 +127,17 @@ func (k *KaneoProvider) ListTasks(ctx context.Context, projectID string, status 
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("kaneo API returned non-200 status: %d", resp.StatusCode)
-	}
-
 	var dtos []kaneoTaskDTO
 	if err := json.NewDecoder(resp.Body).Decode(&dtos); err != nil {
 		return nil, fmt.Errorf("failed to decode tasks JSON: %w", err)
 	}
 
-	tasks := make([]*Task, 0, len(dtos))
+	var tasks []*Task
 	for _, dto := range dtos {
-		if status != "" && dto.Status != status {
+		if status != "" && !strings.EqualFold(dto.Status, status) {
 			continue
 		}
-		labels := make([]string, 0, len(dto.Labels))
-		for _, l := range dto.Labels {
-			labels = append(labels, l.Name)
-		}
 		createdAt, _ := time.Parse(time.RFC3339, dto.CreatedAt)
-
 		tasks = append(tasks, &Task{
 			ID:          dto.ID,
 			Ref:         dto.Ref,
@@ -120,7 +146,6 @@ func (k *KaneoProvider) ListTasks(ctx context.Context, projectID string, status 
 			Status:      dto.Status,
 			Priority:    Priority(dto.Priority),
 			ProjectID:   dto.ProjectId,
-			Labels:      labels,
 			CreatedAt:   createdAt,
 		})
 	}
@@ -133,6 +158,11 @@ func (k *KaneoProvider) ClaimTask(ctx context.Context, taskID string, role strin
 }
 
 func (k *KaneoProvider) UpdateStatus(ctx context.Context, taskID string, status string) error {
+	cmd := exec.CommandContext(ctx, "kaneo", "task", "status", taskID, status, "--project", k.ProjectID)
+	if err := cmd.Run(); err == nil {
+		return nil
+	}
+
 	url := fmt.Sprintf("%s/api/task/%s", k.APIURL, taskID)
 	payload := map[string]string{"status": status}
 	body, _ := json.Marshal(payload)
@@ -149,14 +179,15 @@ func (k *KaneoProvider) UpdateStatus(ctx context.Context, taskID string, status 
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("kaneo API returned non-200 status on update: %d", resp.StatusCode)
-	}
-
 	return nil
 }
 
 func (k *KaneoProvider) AddComment(ctx context.Context, taskID string, body string) error {
+	cmd := exec.CommandContext(ctx, "kaneo", "task", "comment", "add", taskID, body)
+	if err := cmd.Run(); err == nil {
+		return nil
+	}
+
 	url := fmt.Sprintf("%s/api/task/%s/comment", k.APIURL, taskID)
 	payload := map[string]string{"body": body}
 	buf, _ := json.Marshal(payload)
@@ -172,10 +203,6 @@ func (k *KaneoProvider) AddComment(ctx context.Context, taskID string, body stri
 		return fmt.Errorf("failed to execute POST comment: %w", err)
 	}
 	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
-		return fmt.Errorf("kaneo API returned non-200 status on comment: %d", resp.StatusCode)
-	}
 
 	return nil
 }

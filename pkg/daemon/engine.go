@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strings"
 
 	"github.com/Kampe/Herdforge/pkg/config"
 	"github.com/Kampe/Herdforge/pkg/provider"
@@ -37,11 +38,15 @@ func (e *Engine) SelectNextTask(ctx context.Context, role string) (*provider.Tas
 		return nil, fmt.Errorf("failed to list candidate tasks: %w", err)
 	}
 
-	// Filter tasks by role label matching
+	// Filter tasks by role label matching (match if no labels or label matches role)
 	var matched []*provider.Task
 	for _, task := range tasks {
+		if len(task.Labels) == 0 {
+			matched = append(matched, task)
+			continue
+		}
 		for _, label := range task.Labels {
-			if label == role {
+			if strings.EqualFold(label, role) {
 				matched = append(matched, task)
 				break
 			}
