@@ -15,35 +15,48 @@ task_provider:
   api_key_env: "KANEO_API_KEY"
   use_cli: true
 
-# Agent lanes — each lane is a herdr workspace tab running one agent
-# All lanes default to deepseek-v4-flash via opencode for cheap self-forging
+# The forge fleet — three forge-themed roles. The forge loop is the
+# forgemaster (coordinator). Each lane runs on lazer deepseek (tool-executing;
+# verified via herd tool-probe) with the free tier as fallback.
 lanes:
-  - name: "forge-smith"
+  # scout — surveys the board: ranks claimable tickets and grooms bare cards
+  # into dispatch-ready specs, feeding the forge loop what to forge next.
+  - name: "scout"
     role: "forge-smith"
     agent_kind: "opencode"
     harness: "opencode"
     prompt: ".herd/prompts/smith.md"
-    worktree: ".worktrees/smith"
-    provider: "deepseek"
-    model: "opencode/deepseek-v4-flash-free"
+    worktree: ".worktrees/scout"
+    provider: "lazer"
+    model: "litellm/lazer/deepseek-v4-flash"
+    fallback_models:
+      - "opencode/deepseek-v4-flash-free"
 
-  - name: "worker"
+  # smith — forges the code at the anvil. The forge loop dispatches one builder
+  # per card (task-fac-<ref>) using this lane's model and completion contract.
+  - name: "smith"
     role: "worker"
     agent_kind: "opencode"
     harness: "opencode"
     prompt: ".herd/prompts/worker.md"
-    worktree: ".worktrees/worker"
-    provider: "deepseek"
-    model: "opencode/deepseek-v4-flash-free"
+    worktree: ".worktrees/smith"
+    provider: "lazer"
+    model: "litellm/lazer/deepseek-v4-flash"
+    fallback_models:
+      - "opencode/deepseek-v4-flash-free"
 
-  - name: "reviewer"
+  # assayer — tests the metal: reviews the forged work, assays its quality, and
+  # returns APPROVED or a numbered rejection.
+  - name: "assayer"
     role: "reviewer"
     agent_kind: "opencode"
     harness: "opencode"
     prompt: ".herd/prompts/reviewer.md"
-    worktree: ".worktrees/reviewer"
-    provider: "deepseek"
-    model: "opencode/deepseek-v4-flash-free"
+    worktree: ".worktrees/assayer"
+    provider: "lazer"
+    model: "litellm/lazer/deepseek-v4-flash"
+    fallback_models:
+      - "opencode/deepseek-v4-flash-free"
 
 # Project Verification Suite
 verification:
