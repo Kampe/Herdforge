@@ -76,15 +76,18 @@ func (v *Verifier) CheckCompletion(ctx context.Context, worktree, buildCmd, test
 	return c
 }
 
-// runShell runs a "cmd args..." string in dir and reports success. An empty
-// command counts as passed (stage skipped).
+// runShell runs a non-shell argv string in dir and reports success. Empty or
+// malformed commands fail closed instead of silently skipping a gate.
 func runShell(ctx context.Context, dir, command string) bool {
 	command = strings.TrimSpace(command)
 	if command == "" {
-		return true
+		return false
 	}
-	fields := strings.Fields(command)
-	cmd := exec.CommandContext(ctx, fields[0], fields[1:]...)
+	argv, err := parseArgv(command)
+	if err != nil {
+		return false
+	}
+	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
 	cmd.Dir = dir
 	return cmd.Run() == nil
 }

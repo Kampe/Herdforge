@@ -23,6 +23,7 @@ func completionRepo(t *testing.T, subjects ...string) string {
 	vgit(t, dir, "init", "-q", "-b", "main")
 	vgit(t, dir, "config", "user.email", "t@h.local")
 	vgit(t, dir, "config", "user.name", "t")
+	vgit(t, dir, "config", "commit.gpgsign", "false")
 	vgit(t, dir, "commit", "--allow-empty", "-q", "-m", "base")
 	vgit(t, dir, "update-ref", "refs/remotes/origin/main", mustHead(t, dir))
 	for _, s := range subjects {
@@ -80,11 +81,11 @@ func TestCheckCompletion_TestFailFails(t *testing.T) {
 	}
 }
 
-func TestCheckCompletion_EmptyCmdsSkip(t *testing.T) {
+func TestCheckCompletion_EmptyCmdsFailClosed(t *testing.T) {
 	dir := completionRepo(t, "feat: work (FAC-1)")
 	v := NewVerifier("")
 	c := v.CheckCompletion(context.Background(), dir, "", "")
-	if !c.Passed {
-		t.Fatalf("empty build/test cmds skip as passed: %+v", c)
+	if c.Passed || c.Builds || c.TestsPass {
+		t.Fatalf("empty build/test commands must fail closed: %+v", c)
 	}
 }
