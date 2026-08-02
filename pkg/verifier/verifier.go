@@ -7,10 +7,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -32,12 +34,25 @@ const (
 	OutcomeBLOCKED Outcome = "BLOCKED"
 )
 
+// EnvironmentPolicy is explicit because a receipt must not call an ambient
+// process environment hermetic. Inherited is honest about using the caller's
+// environment; Hermetic uses the fixed allowlist in hermeticEnvironment.
+type EnvironmentPolicy string
+
+const (
+	EnvironmentPolicyInherited EnvironmentPolicy = "inherited"
+	EnvironmentPolicyHermetic  EnvironmentPolicy = "hermetic"
+)
+
+const MaxRetainedOutputBytes = 1 << 20
+
 type Result struct {
-	Passed   bool
-	Outcome  Outcome
-	Output   string
-	ExitCode int
-	Duration time.Duration
+	Passed       bool
+	Outcome      Outcome
+	Output       string
+	OutputDigest string
+	ExitCode     int
+	Duration     time.Duration
 }
 
 // MutationResult describes both the negative run and the restoration gate.
@@ -63,7 +78,7 @@ type VerificationRequest struct {
 	LeaseGeneration   string
 	CandidateSHA      string
 	BaseSHA           string
-	EnvironmentPolicy string
+	EnvironmentPolicy EnvironmentPolicy
 	Artifacts         []string
 }
 
@@ -71,34 +86,34 @@ type VerificationRequest struct {
 // Digest is SHA-256 over the canonical JSON form of the receipt with Digest
 // omitted. Output is represented by OutputDigest so receipts stay bounded.
 type Receipt struct {
-	Version           int           `json:"version"`
-	TaskRef           string        `json:"task_ref"`
-	LeaseGeneration   string        `json:"lease_generation"`
-	CandidateSHA      string        `json:"candidate_sha"`
-	BaseSHA           string        `json:"base_sha,omitempty"`
-	Command           []string      `json:"argv"`
-	ExitCode          int           `json:"exit_code"`
-	Duration          time.Duration `json:"duration_ns"`
-	EnvironmentPolicy string        `json:"environment_policy"`
-	Artifacts         []string      `json:"artifacts,omitempty"`
-	OutputDigest      string        `json:"output_digest,omitempty"`
-	Outcome           Outcome       `json:"outcome"`
-	Digest            string        `json:"digest"`
+	Version           int               `json:"version"`
+	TaskRef           string            `json:"task_ref"`
+	LeaseGeneration   string            `json:"lease_generation"`
+	CandidateSHA      string            `json:"candidate_sha"`
+	BaseSHA           string            `json:"base_sha,omitempty"`
+	Command           []string          `json:"argv"`
+	ExitCode          int               `json:"exit_code"`
+	Duration          time.Duration     `json:"duration_ns"`
+	EnvironmentPolicy EnvironmentPolicy `json:"environment_policy"`
+	Artifacts         []string          `json:"artifacts,omitempty"`
+	OutputDigest      string            `json:"output_digest,omitempty"`
+	Outcome           Outcome           `json:"outcome"`
+	Digest            string            `json:"digest"`
 }
 
 type receiptForDigest struct {
-	Version           int           `json:"version"`
-	TaskRef           string        `json:"task_ref"`
-	LeaseGeneration   string        `json:"lease_generation"`
-	CandidateSHA      string        `json:"candidate_sha"`
-	BaseSHA           string        `json:"base_sha,omitempty"`
-	Command           []string      `json:"argv"`
-	ExitCode          int           `json:"exit_code"`
-	Duration          time.Duration `json:"duration_ns"`
-	EnvironmentPolicy string        `json:"environment_policy"`
-	Artifacts         []string      `json:"artifacts,omitempty"`
-	OutputDigest      string        `json:"output_digest,omitempty"`
-	Outcome           Outcome       `json:"outcome"`
+	Version           int               `json:"version"`
+	TaskRef           string            `json:"task_ref"`
+	LeaseGeneration   string            `json:"lease_generation"`
+	CandidateSHA      string            `json:"candidate_sha"`
+	BaseSHA           string            `json:"base_sha,omitempty"`
+	Command           []string          `json:"argv"`
+	ExitCode          int               `json:"exit_code"`
+	Duration          time.Duration     `json:"duration_ns"`
+	EnvironmentPolicy EnvironmentPolicy `json:"environment_policy"`
+	Artifacts         []string          `json:"artifacts,omitempty"`
+	OutputDigest      string            `json:"output_digest,omitempty"`
+	Outcome           Outcome           `json:"outcome"`
 }
 
 type Verifier struct {
@@ -129,6 +144,10 @@ func NewVerifierArgs(argv []string) *Verifier {
 }
 
 func (v *Verifier) Execute(ctx context.Context, dir string) (*Result, error) {
+	return v.execute(ctx, dir, EnvironmentPolicyInherited)
+}
+
+func (v *Verifier) execute(ctx context.Context, dir string, policy EnvironmentPolicy) (*Result, error) {
 	if v == nil {
 		return nil, errors.New("nil verifier")
 	}
@@ -138,28 +157,35 @@ func (v *Verifier) Execute(ctx context.Context, dir string) (*Result, error) {
 	if len(v.Argv) == 0 {
 		return nil, errors.New("verification command is empty")
 	}
+	if err := validateEnvironmentPolicy(policy); err != nil {
+		return nil, err
+	}
 
 	started := time.Now()
 	cmd := exec.CommandContext(ctx, v.Argv[0], v.Argv[1:]...)
 	cmd.Dir = dir
+	if policy == EnvironmentPolicyHermetic {
+		cmd.Env = hermeticEnvironment()
+	}
 	// A canceled shell can leave grandchildren holding CombinedOutput's pipe
 	// open (for example, `sh -c 'sleep 3'`). WaitDelay bounds that wait and
 	// keeps the mutation transaction's restoration defer reachable.
 	cmd.WaitDelay = 100 * time.Millisecond
 	output, err := cmd.CombinedOutput()
 	result := &Result{
-		Passed:   err == nil,
-		Outcome:  OutcomePASS,
-		Output:   string(output),
-		ExitCode: exitCode(cmd, err),
-		Duration: time.Since(started),
+		Passed:       err == nil,
+		Outcome:      OutcomePASS,
+		Output:       boundedOutput(output),
+		OutputDigest: digestBytes(output),
+		ExitCode:     exitCode(cmd, err),
+		Duration:     time.Since(started),
 	}
 	if err != nil {
 		result.Outcome = OutcomeFAIL
 		if ctx.Err() != nil || cmd.ProcessState == nil {
 			result.Outcome = OutcomeBLOCKED
 		}
-		result.Output = fmt.Sprintf("verification failed: %v\noutput:\n%s", err, string(output))
+		result.Output = boundedOutput([]byte(fmt.Sprintf("verification failed: %v\noutput:\n%s", err, string(output))))
 	}
 	return result, nil
 }
@@ -168,6 +194,9 @@ func (v *Verifier) Execute(ctx context.Context, dir string) (*Result, error) {
 // pinned to req.CandidateSHA. A command failure is FAIL. A dirty checkout,
 // SHA mismatch, malformed execution, timeout, or cancellation is BLOCKED.
 func (v *Verifier) VerifyCandidate(ctx context.Context, dir string, req VerificationRequest) (*Receipt, error) {
+	if v == nil {
+		return nil, errors.New("nil verifier")
+	}
 	if err := validateRequest(req); err != nil {
 		return nil, err
 	}
@@ -175,7 +204,7 @@ func (v *Verifier) VerifyCandidate(ctx context.Context, dir string, req Verifica
 		return blockedReceipt(req, v.argv(), 0, nil, err), nil
 	}
 
-	result, err := v.Execute(ctx, dir)
+	result, err := v.execute(ctx, dir, req.EnvironmentPolicy)
 	if err != nil {
 		return nil, err
 	}
@@ -198,8 +227,8 @@ func (r Receipt) ValidateReceipt(ctx context.Context, dir string) error {
 	if !validSHA(r.CandidateSHA) {
 		return errors.New("receipt candidate SHA is not exact")
 	}
-	if r.Digest == "" || r.Digest != digestReceipt(r) {
-		return errors.New("receipt digest is invalid")
+	if err := r.ValidateDigest(); err != nil {
+		return err
 	}
 	if err := requireCleanCandidate(dir, r.CandidateSHA); err != nil {
 		return fmt.Errorf("receipt candidate is no longer current: %w", err)
@@ -210,9 +239,14 @@ func (r Receipt) ValidateReceipt(ctx context.Context, dir string) error {
 	return nil
 }
 
-func (r Receipt) MarshalJSON() ([]byte, error) {
-	type alias Receipt
-	return json.Marshal(alias(r))
+// ValidateDigest checks only the receipt's self-authenticating payload. It is
+// separate from candidate validation so every signed field can be tested
+// without a SHA mismatch masking a digest-coverage regression.
+func (r Receipt) ValidateDigest() error {
+	if r.Digest == "" || r.Digest != digestReceipt(r) {
+		return errors.New("receipt digest is invalid")
+	}
+	return nil
 }
 
 // DetectLanguage inspects file extensions to determine testing toolchain.
@@ -232,6 +266,9 @@ func DetectLanguage(filePath string) Language {
 }
 
 func (v *Verifier) argv() []string {
+	if v == nil {
+		return nil
+	}
 	return append([]string(nil), v.Argv...)
 }
 
@@ -242,7 +279,37 @@ func validateRequest(req VerificationRequest) error {
 	if req.BaseSHA != "" && !validSHA(req.BaseSHA) {
 		return errors.New("base SHA must be the exact 40-character commit SHA")
 	}
+	if err := validateEnvironmentPolicy(req.EnvironmentPolicy); err != nil {
+		return err
+	}
 	return nil
+}
+
+func validateEnvironmentPolicy(policy EnvironmentPolicy) error {
+	switch policy {
+	case EnvironmentPolicyInherited, EnvironmentPolicyHermetic:
+		return nil
+	default:
+		return fmt.Errorf("unsupported environment policy %q", policy)
+	}
+}
+
+func hermeticEnvironment() []string {
+	return []string{
+		"PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin",
+		"LC_ALL=C",
+		"LANG=C",
+		"TZ=UTC",
+	}
+}
+
+func boundedOutput(output []byte) string {
+	if len(output) <= MaxRetainedOutputBytes {
+		return string(output)
+	}
+	const marker = "\n[output truncated]"
+	limit := MaxRetainedOutputBytes - len(marker)
+	return string(output[:limit]) + marker
 }
 
 func validSHA(sha string) bool {
@@ -288,6 +355,10 @@ func requireCleanCandidate(dir, expectedSHA string) error {
 }
 
 func makeReceipt(req VerificationRequest, argv []string, result *Result, outcome Outcome) Receipt {
+	outputDigest := result.OutputDigest
+	if outputDigest == "" {
+		outputDigest = digestBytes([]byte(result.Output))
+	}
 	receipt := Receipt{
 		Version:           1,
 		TaskRef:           req.TaskRef,
@@ -299,7 +370,7 @@ func makeReceipt(req VerificationRequest, argv []string, result *Result, outcome
 		Duration:          result.Duration,
 		EnvironmentPolicy: req.EnvironmentPolicy,
 		Artifacts:         append([]string(nil), req.Artifacts...),
-		OutputDigest:      digestBytes([]byte(result.Output)),
+		OutputDigest:      outputDigest,
 		Outcome:           outcome,
 	}
 	receipt.Digest = digestReceipt(receipt)
@@ -419,7 +490,60 @@ func safeRelativePath(root, name string) (string, error) {
 	if clean == "." || clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
 		return "", fmt.Errorf("mutation target escapes candidate: %q", name)
 	}
-	return filepath.Join(root, clean), nil
+	parts := strings.Split(clean, string(filepath.Separator))
+	if len(parts) > 0 && parts[0] == ".git" {
+		return "", errors.New("mutation target may not enter .git")
+	}
+	resolvedRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		return "", fmt.Errorf("resolve candidate root: %w", err)
+	}
+	target := filepath.Join(resolvedRoot, clean)
+	info, err := os.Lstat(target)
+	if err != nil {
+		return "", fmt.Errorf("inspect mutation target: %w", err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+		return "", errors.New("mutation target must be an Lstat regular file")
+	}
+	resolvedTarget, err := filepath.EvalSymlinks(target)
+	if err != nil {
+		return "", fmt.Errorf("resolve mutation target: %w", err)
+	}
+	if !pathWithin(resolvedRoot, resolvedTarget) {
+		return "", errors.New("mutation target resolves outside candidate root")
+	}
+	gitDir, err := resolvedGitDir(resolvedRoot)
+	if err != nil {
+		return "", err
+	}
+	if pathWithin(gitDir, resolvedTarget) {
+		return "", errors.New("mutation target resolves into git metadata")
+	}
+	return resolvedTarget, nil
+}
+
+func pathWithin(root, target string) bool {
+	rel, err := filepath.Rel(root, target)
+	return err == nil && rel != ".." && rel != "." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) && !filepath.IsAbs(rel)
+}
+
+func resolvedGitDir(root string) (string, error) {
+	cmd := exec.Command("git", "rev-parse", "--git-dir")
+	cmd.Dir = root
+	out, err := cmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("resolve git directory: %w", err)
+	}
+	gitDir := strings.TrimSpace(string(out))
+	if !filepath.IsAbs(gitDir) {
+		gitDir = filepath.Join(root, gitDir)
+	}
+	resolved, err := filepath.EvalSymlinks(gitDir)
+	if err != nil {
+		return "", fmt.Errorf("resolve git directory path: %w", err)
+	}
+	return resolved, nil
 }
 
 // MutationRequest describes one bounded, reversible mutant application.
@@ -428,7 +552,7 @@ type MutationRequest struct {
 	LeaseGeneration   string
 	CandidateSHA      string
 	BaseSHA           string
-	EnvironmentPolicy string
+	EnvironmentPolicy EnvironmentPolicy
 	Artifacts         []string
 	TargetFile        string
 	OriginalCode      string
@@ -440,6 +564,9 @@ type MutationRequest struct {
 // have a target and replacement. It resolves the exact current candidate SHA
 // and delegates to RunMutationCheckForCandidate.
 func (v *Verifier) RunMutationCheck(ctx context.Context, dir string, targetFile string, originalCode string, mutantCode string) (*MutationResult, error) {
+	if v == nil {
+		return nil, errors.New("nil verifier")
+	}
 	sha, err := currentSHA(dir)
 	if err != nil {
 		return nil, err
@@ -459,6 +586,9 @@ func (v *Verifier) RunMutationCheck(ctx context.Context, dir string, targetFile 
 // timeout, dirty state, stale SHA, tooling errors, and restoration failures
 // are BLOCKED. A mutant that passes is FAIL.
 func (v *Verifier) RunMutationCheckForCandidate(ctx context.Context, dir string, req MutationRequest) (*MutationResult, error) {
+	if v == nil {
+		return nil, errors.New("nil verifier")
+	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -518,7 +648,7 @@ func (v *Verifier) RunMutationCheckForCandidate(ctx context.Context, dir string,
 		return result, nil
 	}
 
-	original, err := os.ReadFile(target)
+	original, info, err := readRegularFile(target)
 	if err != nil {
 		result.Output = fmt.Sprintf("read mutation target: %v", err)
 		result.Mutant = *blockedReceipt(baseReq, v.argv(), 0, nil, err)
@@ -530,11 +660,6 @@ func (v *Verifier) RunMutationCheckForCandidate(ctx context.Context, dir string,
 		result.Mutant = *blockedReceipt(baseReq, v.argv(), 0, nil, err)
 		return result, nil
 	}
-	info, err := os.Stat(target)
-	if err != nil {
-		return nil, fmt.Errorf("stat mutation target: %w", err)
-	}
-
 	defer func() {
 		if restoreErr := restoreFile(target, original, info.Mode()); restoreErr == nil {
 			result.Restored = true
@@ -542,7 +667,7 @@ func (v *Verifier) RunMutationCheckForCandidate(ctx context.Context, dir string,
 			result.Output += "\nrestore failed: " + restoreErr.Error()
 		}
 	}()
-	if err := os.WriteFile(target, []byte(req.MutantCode), info.Mode()); err != nil {
+	if err := writeRegularFile(target, []byte(req.MutantCode), info.Mode()); err != nil {
 		result.Output = fmt.Sprintf("apply mutant: %v", err)
 		return result, nil
 	}
@@ -601,8 +726,51 @@ func (v *Verifier) mutationTimeout() time.Duration {
 }
 
 func restoreFile(path string, contents []byte, mode os.FileMode) error {
-	if err := os.WriteFile(path, contents, mode); err != nil {
+	if err := writeRegularFile(path, contents, mode); err != nil {
 		return err
 	}
 	return os.Chmod(path, mode)
+}
+
+func readRegularFile(path string) ([]byte, os.FileInfo, error) {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return nil, nil, err
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+		return nil, nil, errors.New("mutation target must remain an Lstat regular file")
+	}
+	file, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer file.Close()
+	contents, err := io.ReadAll(file)
+	if err != nil {
+		return nil, nil, err
+	}
+	return contents, info, nil
+}
+
+func writeRegularFile(path string, contents []byte, mode os.FileMode) error {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return err
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+		return errors.New("refusing to write a non-regular mutation target")
+	}
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_TRUNC|syscall.O_NOFOLLOW, mode)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	written, err := file.Write(contents)
+	if err != nil {
+		return err
+	}
+	if written != len(contents) {
+		return io.ErrShortWrite
+	}
+	return nil
 }

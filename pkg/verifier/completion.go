@@ -51,8 +51,8 @@ func hasRealCommits(worktree string) bool {
 }
 
 // CheckCompletion runs the full gate against a worktree: real commits, build,
-// and tests. buildCmd/testCmd are the shell commands (e.g. "go build ./...",
-// "go test ./..."); an empty command skips that stage as passed.
+// and tests. buildCmd/testCmd are non-shell command strings (e.g. "go build
+// ./...", "go test ./..."); empty or malformed commands fail closed.
 func (v *Verifier) CheckCompletion(ctx context.Context, worktree, buildCmd, testCmd string) *CompletionCheck {
 	c := &CompletionCheck{}
 

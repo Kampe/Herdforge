@@ -93,7 +93,7 @@ func TestVerifyCandidateReceiptBindsExactSHAAndDigest(t *testing.T) {
 func TestVerifyCandidateDirtyCheckoutIsBlocked(t *testing.T) {
 	dir, candidate := verificationRepo(t)
 	writeFile(t, filepath.Join(dir, "untracked.txt"), "dirty\n")
-	receipt, err := NewVerifierArgs([]string{"./check.sh"}).VerifyCandidate(context.Background(), dir, VerificationRequest{CandidateSHA: candidate})
+	receipt, err := NewVerifierArgs([]string{"./check.sh"}).VerifyCandidate(context.Background(), dir, VerificationRequest{CandidateSHA: candidate, EnvironmentPolicy: EnvironmentPolicyInherited})
 	if err != nil {
 		t.Fatalf("dirty candidate should produce a BLOCKED receipt: %v", err)
 	}
@@ -104,7 +104,7 @@ func TestVerifyCandidateDirtyCheckoutIsBlocked(t *testing.T) {
 
 func TestVerifyCandidateCommandFailureIsFAIL(t *testing.T) {
 	dir, candidate := verificationRepo(t)
-	receipt, err := NewVerifierArgs([]string{"./always-fail.sh"}).VerifyCandidate(context.Background(), dir, VerificationRequest{CandidateSHA: candidate})
+	receipt, err := NewVerifierArgs([]string{"./always-fail.sh"}).VerifyCandidate(context.Background(), dir, VerificationRequest{CandidateSHA: candidate, EnvironmentPolicy: EnvironmentPolicyInherited})
 	if err != nil {
 		t.Fatalf("command failure should be represented by receipt: %v", err)
 	}
@@ -113,16 +113,118 @@ func TestVerifyCandidateCommandFailureIsFAIL(t *testing.T) {
 	}
 }
 
+func TestVerifyCandidateEnvironmentPolicyIsEnforced(t *testing.T) {
+	dir, candidate := verificationRepo(t)
+	t.Setenv("VERIFIER_AMBIENT_SECRET", "must-not-leak")
+	v := NewVerifierArgs([]string{"./env-check.sh"})
+
+	hermetic, err := v.VerifyCandidate(context.Background(), dir, VerificationRequest{
+		CandidateSHA:      candidate,
+		EnvironmentPolicy: EnvironmentPolicyHermetic,
+	})
+	if err != nil || hermetic.Outcome != OutcomePASS {
+		t.Fatalf("hermetic policy must exclude ambient variables: receipt=%+v err=%v", hermetic, err)
+	}
+	inherited, err := v.VerifyCandidate(context.Background(), dir, VerificationRequest{
+		CandidateSHA:      candidate,
+		EnvironmentPolicy: EnvironmentPolicyInherited,
+	})
+	if err != nil || inherited.Outcome != OutcomeFAIL {
+		t.Fatalf("inherited policy must honestly expose ambient behavior: receipt=%+v err=%v", inherited, err)
+	}
+}
+
+func TestExecuteBoundsRetainedOutput(t *testing.T) {
+	dir := t.TempDir()
+	script := filepath.Join(dir, "emit-output")
+	writeExecutable(t, script, "#!/bin/sh\nhead -c 2000000 /dev/zero\n")
+	result, err := NewVerifierArgs([]string{"./emit-output"}).Execute(context.Background(), dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Output) > MaxRetainedOutputBytes {
+		t.Fatalf("retained output exceeded bound: got %d want <= %d", len(result.Output), MaxRetainedOutputBytes)
+	}
+	if result.OutputDigest == "" {
+		t.Fatal("full output digest must remain available after truncation")
+	}
+}
+
+func TestMutationPathGuardsRejectEscapesAndMetadataWithoutOutsideWrites(t *testing.T) {
+	dir, _ := verificationRepo(t)
+	outsideDir := t.TempDir()
+	outsideFile := filepath.Join(outsideDir, "outside.txt")
+	writeFile(t, outsideFile, "outside\n")
+	gitMetadataProbe := filepath.Join(dir, ".git", "hooks", "fac122-probe")
+	writeFile(t, gitMetadataProbe, "metadata\n")
+
+	trackedLink := filepath.Join(dir, "tracked-link")
+	if err := os.Symlink(outsideFile, trackedLink); err != nil {
+		t.Fatal(err)
+	}
+	git(t, dir, "add", "tracked-link")
+	git(t, dir, "commit", "-q", "-m", "add tracked link")
+
+	gitParentLink := filepath.Join(dir, "git-parent")
+	if err := os.Symlink(".git", gitParentLink); err != nil {
+		t.Fatal(err)
+	}
+	git(t, dir, "add", "git-parent")
+	git(t, dir, "commit", "-q", "-m", "add git metadata alias")
+	candidate := gitOutput(t, dir, "rev-parse", "HEAD")
+
+	tests := []struct {
+		name   string
+		target string
+	}{
+		{name: "absolute", target: outsideFile},
+		{name: "parent", target: "../outside.txt"},
+		{name: "nested parent", target: "nested/../../outside.txt"},
+		{name: "tracked symlink", target: "tracked-link"},
+		{name: "resolved git dir", target: "git-parent/hooks/fac122-probe"},
+		{name: "git first component", target: ".git/hooks/fac122-probe"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := NewVerifierArgs([]string{"true"}).RunMutationCheckForCandidate(context.Background(), dir, MutationRequest{
+				CandidateSHA:      candidate,
+				EnvironmentPolicy: EnvironmentPolicyInherited,
+				TargetFile:        tt.target,
+				OriginalCode:      "outside\n",
+				MutantCode:        "clobbered\n",
+				Timeout:           time.Second,
+			})
+			if err == nil {
+				t.Fatal("unsafe mutation target must fail closed")
+			}
+			assertFile(t, outsideFile, "outside\n")
+			assertFile(t, gitMetadataProbe, "metadata\n")
+			assertClean(t, dir)
+		})
+	}
+}
+
+func TestVerifierNilReceiverFailsClosed(t *testing.T) {
+	var v *Verifier
+	if _, err := v.VerifyCandidate(context.Background(), t.TempDir(), VerificationRequest{}); err == nil {
+		t.Fatal("nil VerifyCandidate receiver must return an error")
+	}
+	if _, err := v.RunMutationCheck(context.Background(), t.TempDir(), "candidate.txt", "", ""); err == nil {
+		t.Fatal("nil RunMutationCheck receiver must return an error")
+	}
+}
+
 func TestRunMutationCheck_RealMutantIsKilledAndRestored(t *testing.T) {
 	dir, candidate := mutationRepo(t, false)
 	v := NewVerifierArgs([]string{"./check.sh"})
 	result, err := v.RunMutationCheckForCandidate(context.Background(), dir, MutationRequest{
-		TaskRef:      "FAC-122",
-		CandidateSHA: candidate,
-		TargetFile:   "candidate.txt",
-		OriginalCode: "original\n",
-		MutantCode:   "mutant\n",
-		Timeout:      time.Second,
+		TaskRef:           "FAC-122",
+		CandidateSHA:      candidate,
+		EnvironmentPolicy: EnvironmentPolicyInherited,
+		TargetFile:        "candidate.txt",
+		OriginalCode:      "original\n",
+		MutantCode:        "mutant\n",
+		Timeout:           time.Second,
 	})
 	if err != nil {
 		t.Fatalf("mutation check failed: %v", err)
@@ -140,11 +242,12 @@ func TestRunMutationCheck_RealMutantIsKilledAndRestored(t *testing.T) {
 func TestRunMutationCheck_VacuousSuiteFailsMutationGate(t *testing.T) {
 	dir, candidate := mutationRepo(t, false)
 	result, err := NewVerifierArgs([]string{"true"}).RunMutationCheckForCandidate(context.Background(), dir, MutationRequest{
-		CandidateSHA: candidate,
-		TargetFile:   "candidate.txt",
-		OriginalCode: "original\n",
-		MutantCode:   "mutant\n",
-		Timeout:      time.Second,
+		CandidateSHA:      candidate,
+		EnvironmentPolicy: EnvironmentPolicyInherited,
+		TargetFile:        "candidate.txt",
+		OriginalCode:      "original\n",
+		MutantCode:        "mutant\n",
+		Timeout:           time.Second,
 	})
 	if err != nil {
 		t.Fatalf("vacuous mutation check should return a FAIL result: %v", err)
@@ -160,11 +263,12 @@ func TestRunMutationCheck_TimeoutRestoresCandidate(t *testing.T) {
 	v := NewVerifierArgs([]string{"./check.sh"})
 	started := time.Now()
 	result, err := v.RunMutationCheckForCandidate(context.Background(), dir, MutationRequest{
-		CandidateSHA: candidate,
-		TargetFile:   "candidate.txt",
-		OriginalCode: "original\n",
-		MutantCode:   "mutant\n",
-		Timeout:      40 * time.Millisecond,
+		CandidateSHA:      candidate,
+		EnvironmentPolicy: EnvironmentPolicyInherited,
+		TargetFile:        "candidate.txt",
+		OriginalCode:      "original\n",
+		MutantCode:        "mutant\n",
+		Timeout:           40 * time.Millisecond,
 	})
 	if err != nil {
 		t.Fatalf("timeout should return a BLOCKED result: %v", err)
@@ -187,11 +291,12 @@ func TestRunMutationCheck_CancellationRestoresCandidate(t *testing.T) {
 		cancel()
 	}()
 	result, err := NewVerifierArgs([]string{"./check.sh"}).RunMutationCheckForCandidate(ctx, dir, MutationRequest{
-		CandidateSHA: candidate,
-		TargetFile:   "candidate.txt",
-		OriginalCode: "original\n",
-		MutantCode:   "mutant\n",
-		Timeout:      2 * time.Second,
+		CandidateSHA:      candidate,
+		EnvironmentPolicy: EnvironmentPolicyInherited,
+		TargetFile:        "candidate.txt",
+		OriginalCode:      "original\n",
+		MutantCode:        "mutant\n",
+		Timeout:           2 * time.Second,
 	})
 	if err != nil {
 		t.Fatalf("cancellation should return a BLOCKED result: %v", err)
@@ -212,6 +317,7 @@ func verificationRepo(t *testing.T) (string, string) {
 	writeFile(t, filepath.Join(dir, "candidate.txt"), "original\n")
 	writeExecutable(t, filepath.Join(dir, "check.sh"), "#!/bin/sh\n[ \"$(cat candidate.txt)\" = \"original\" ]\n")
 	writeExecutable(t, filepath.Join(dir, "always-fail.sh"), "#!/bin/sh\nexit 7\n")
+	writeExecutable(t, filepath.Join(dir, "env-check.sh"), "#!/bin/sh\n[ -z \"${VERIFIER_AMBIENT_SECRET:-}\" ]\n")
 	git(t, dir, "add", ".")
 	git(t, dir, "commit", "-q", "-m", "candidate")
 	return dir, gitOutput(t, dir, "rev-parse", "HEAD")
