@@ -55,14 +55,14 @@ func NewKaneoProvider(apiURL string, projectID string) *KaneoProvider {
 }
 
 type kaneoTaskDTO struct {
-	ID          string   `json:"id"`
-	Ref         string   `json:"ref"`
-	Title       string   `json:"title"`
-	Description string   `json:"description"`
-	Status      string   `json:"status"`
-	Priority    string   `json:"priority"`
-	ProjectId   string   `json:"projectId"`
-	CreatedAt   string   `json:"createdAt"`
+	ID          string `json:"id"`
+	Ref         string `json:"ref"`
+	Title       string `json:"title"`
+	Description string `json:"description"`
+	Status      string `json:"status"`
+	Priority    string `json:"priority"`
+	ProjectId   string `json:"projectId"`
+	CreatedAt   string `json:"createdAt"`
 	Labels      []struct {
 		Name string `json:"name"`
 	} `json:"labels"`

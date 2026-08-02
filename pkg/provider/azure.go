@@ -20,12 +20,12 @@ type AzureDevOpsProvider struct {
 type azureWorkItemDTO struct {
 	ID     int `json:"id"`
 	Fields struct {
-		Title       string    `json:"System.Title"`
-		Description string    `json:"System.Description"`
-		State       string    `json:"System.State"`
-		WorkItemType string   `json:"System.WorkItemType"`
-		Priority    int       `json:"Microsoft.VSTS.Common.Priority"`
-		CreatedDate time.Time `json:"System.CreatedDate"`
+		Title        string    `json:"System.Title"`
+		Description  string    `json:"System.Description"`
+		State        string    `json:"System.State"`
+		WorkItemType string    `json:"System.WorkItemType"`
+		Priority     int       `json:"Microsoft.VSTS.Common.Priority"`
+		CreatedDate  time.Time `json:"System.CreatedDate"`
 	} `json:"fields"`
 }
 

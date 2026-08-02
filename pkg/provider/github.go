@@ -26,14 +26,14 @@ func NewGitHubProvider(token string, owner string, repo string) *GitHubProvider 
 }
 
 type githubIssueDTO struct {
-	Number      int    `json:"number"`
-	Title       string `json:"title"`
-	Body        string `json:"body"`
-	State       string `json:"state"`
-	NodeID      string `json:"node_id"`
-	HTMLURL     string `json:"html_url"`
-	CreatedAt   string `json:"created_at"`
-	Labels      []struct {
+	Number    int    `json:"number"`
+	Title     string `json:"title"`
+	Body      string `json:"body"`
+	State     string `json:"state"`
+	NodeID    string `json:"node_id"`
+	HTMLURL   string `json:"html_url"`
+	CreatedAt string `json:"created_at"`
+	Labels    []struct {
 		Name string `json:"name"`
 	} `json:"labels"`
 }

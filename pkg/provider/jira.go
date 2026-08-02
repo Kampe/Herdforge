@@ -30,9 +30,9 @@ type jiraIssueDTO struct {
 		Priority struct {
 			Name string `json:"name"`
 		} `json:"priority"`
-		Labels    []string  `json:"labels"`
-		Created   time.Time `json:"created"`
-		Project   struct {
+		Labels  []string  `json:"labels"`
+		Created time.Time `json:"created"`
+		Project struct {
 			Key string `json:"key"`
 		} `json:"project"`
 	} `json:"fields"`

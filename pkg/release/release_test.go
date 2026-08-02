@@ -2,6 +2,8 @@ package release
 
 import (
 	"context"
+	"os/exec"
+	"strings"
 	"testing"
 )
 
@@ -22,6 +24,12 @@ func TestReleaseEngine_GenerateChangelog(t *testing.T) {
 }
 
 func TestGenerateChangelog_SpecificFromTag(t *testing.T) {
+	// Ensure we have enough history (defense against shallow clones in CI)
+	out, err := exec.Command("git", "rev-list", "--count", "HEAD~5").Output()
+	if err != nil || strings.TrimSpace(string(out)) == "0" {
+		t.Skip("shallow clone: insufficient history for HEAD~5 test")
+	}
+
 	rel := NewReleaseEngine(".")
 	notes, _, err := rel.GenerateChangelog(context.Background(), "HEAD~5", "v0.3.0")
 	if err != nil {
