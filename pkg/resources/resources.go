@@ -71,20 +71,26 @@ func swapAlertMB() int {
 	return n
 }
 
-// Verdict grades free-memory headroom. It is pure and side-effect-free: swap_mb
-// above the alert threshold => ALERT; otherwise free_pct below the warn
-// threshold => TIGHT; otherwise OK. ALERT keys on swap only (operator directive
-// 2026-07-29).
-func Verdict(freePct, swapMB int) string {
-	warn := warnFreePct()
-	alert := swapAlertMB()
-	if swapMB > alert {
+// verdict grades free-memory headroom against explicit thresholds. It is
+// the pure, side-effect-free core: swap_mb above the alert threshold =>
+// ALERT; otherwise free_pct below the warn threshold => TIGHT; otherwise
+// OK. ALERT keys on swap only (operator directive 2026-07-29).
+func verdict(freePct, swapMB, warnFreePct, swapAlertMB int) string {
+	if swapMB > swapAlertMB {
 		return VerdictAlert
 	}
-	if freePct < warn {
+	if freePct < warnFreePct {
 		return VerdictTight
 	}
 	return VerdictOK
+}
+
+// Verdict grades free-memory headroom. swap_mb above the alert threshold
+// => ALERT; otherwise free_pct below the warn threshold => TIGHT; otherwise
+// OK. Thresholds come from the ambient environment
+// (HERD_MEM_WARN_FREE_PCT / HERD_SWAP_ALERT_MB) with package defaults.
+func Verdict(freePct, swapMB int) string {
+	return verdict(freePct, swapMB, warnFreePct(), swapAlertMB())
 }
 
 // GatePasses reports whether a verdict allows heavy operations (OK or TIGHT).
@@ -241,13 +247,19 @@ func SelfTest() []SelfTestResult {
 		{"ALERT: swap above alert", 80, 2049, VerdictAlert},
 		{"ALERT wins over TIGHT", 5, 5000, VerdictAlert},
 	}
+	// Assert the pure core against the pinned defaults so the selftest is
+	// deterministic regardless of ambient env (a hostile
+	// HERD_MEM_WARN_FREE_PCT must not flip the assertions).
+	pure := func(freePct, swapMB int) string {
+		return verdict(freePct, swapMB, defaultWarnFreePct, defaultSwapAlertMB)
+	}
 	var results []SelfTestResult
 	for _, c := range cases {
-		got := Verdict(c.freePct, c.swapMB)
+		got := pure(c.freePct, c.swapMB)
 		pass := got == c.want
 		detail := ""
 		if !pass {
-			detail = fmt.Sprintf("Verdict(%d, %d) = %q, want %q", c.freePct, c.swapMB, got, c.want)
+			detail = fmt.Sprintf("verdict(%d, %d, warn=%d, alert=%d) = %q, want %q", c.freePct, c.swapMB, defaultWarnFreePct, defaultSwapAlertMB, got, c.want)
 		}
 		results = append(results, SelfTestResult{Name: c.name, Pass: pass, Detail: detail})
 	}

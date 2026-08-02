@@ -165,6 +165,24 @@ func TestSelfTest(t *testing.T) {
 	}
 }
 
+// TestSelfTest_DeterministicUnderHostileEnv is the FAC-79 regression: a
+// hostile HERD_MEM_WARN_FREE_PCT must not flip the selftest assertions.
+// The selftest pins the pure core against the default thresholds.
+func TestSelfTest_DeterministicUnderHostileEnv(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("HERD_MEM_WARN_FREE_PCT", "99")
+	t.Setenv("HERD_SWAP_ALERT_MB", "1")
+	results := SelfTest()
+	if len(results) == 0 {
+		t.Fatal("expected at least one self-test case")
+	}
+	for _, r := range results {
+		if !r.Pass {
+			t.Errorf("self-test case %q failed under hostile env: %s", r.Name, r.Detail)
+		}
+	}
+}
+
 func TestGateDecision(t *testing.T) {
 	cases := []struct {
 		name    string
