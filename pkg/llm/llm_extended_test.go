@@ -41,3 +41,21 @@ func TestGeneratePrompt_BadJSONResponse(t *testing.T) {
 		t.Fatal("expected error for bad JSON response")
 	}
 }
+
+func TestGeneratePrompt_ContextCanceled(t *testing.T) {
+	client := NewLocalLLMClient("http://127.0.0.1:1")
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := client.GeneratePrompt(ctx, "llama3", "hello")
+	if err == nil {
+		t.Fatal("expected error for canceled context")
+	}
+}
+
+func TestGeneratePrompt_ConnectionRefused(t *testing.T) {
+	client := NewLocalLLMClient("http://127.0.0.1:1")
+	_, err := client.GeneratePrompt(context.Background(), "llama3", "hello")
+	if err == nil {
+		t.Fatal("expected error when connection refused")
+	}
+}

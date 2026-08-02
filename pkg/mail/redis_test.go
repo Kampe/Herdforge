@@ -201,3 +201,57 @@ func TestNewID_HostPrefixed(t *testing.T) {
 		t.Errorf("id too short: %s", id1)
 	}
 }
+
+func TestStartSubscriber_ContextCanceled(t *testing.T) {
+	mock := newMockRedisClient()
+	tmpDir := t.TempDir()
+	mb := NewMailbox(filepath.Join(tmpDir, "mail.jsonl"))
+	broker := NewMessageBroker(mb, WithRedis(mock, "herd"))
+	broker.Close()
+}
+
+func TestStartSubscriber_BadPayload(t *testing.T) {
+	mock := newMockRedisClient()
+	tmpDir := t.TempDir()
+	mb := NewMailbox(filepath.Join(tmpDir, "mail.jsonl"))
+	broker := NewMessageBroker(mb, WithRedis(mock, "herd"))
+	defer broker.Close()
+
+	time.Sleep(50 * time.Millisecond)
+
+	mock.mu.Lock()
+	ps := mock.subs["herd.*"]
+	mock.mu.Unlock()
+
+	ps.ch <- &redis.Message{Channel: "herd.alice", Payload: "not-json"}
+
+	time.Sleep(50 * time.Millisecond)
+
+	// Should not crash, bad JSON is silently skipped
+	inbox, err := broker.ReadInbox("alice")
+	if err != nil {
+		t.Fatalf("ReadInbox failed: %v", err)
+	}
+	if len(inbox) != 0 {
+		t.Fatalf("expected 0 envelopes, got %d", len(inbox))
+	}
+}
+
+func TestStartSubscriber_ChannelClosed(t *testing.T) {
+	mock := newMockRedisClient()
+	tmpDir := t.TempDir()
+	mb := NewMailbox(filepath.Join(tmpDir, "mail.jsonl"))
+	broker := NewMessageBroker(mb, WithRedis(mock, "herd"))
+	defer broker.Close()
+
+	time.Sleep(50 * time.Millisecond)
+
+	mock.mu.Lock()
+	ps := mock.subs["herd.*"]
+	mock.mu.Unlock()
+
+	// Close the channel to simulate the subscriber goroutine seeing !ok
+	close(ps.ch)
+
+	time.Sleep(50 * time.Millisecond)
+}

@@ -10,14 +10,16 @@ import (
 )
 
 type LinearProvider struct {
-	APIKey string
-	Client *http.Client
+	APIKey  string
+	Client  *http.Client
+	BaseURL string
 }
 
 func NewLinearProvider(apiKey string) *LinearProvider {
 	return &LinearProvider{
-		APIKey: apiKey,
-		Client: &http.Client{Timeout: 10 * time.Second},
+		APIKey:  apiKey,
+		Client:  &http.Client{Timeout: 10 * time.Second},
+		BaseURL: "https://api.linear.app/graphql",
 	}
 }
 
@@ -51,7 +53,7 @@ func (l *LinearProvider) doGraphQL(ctx context.Context, query string, vars map[s
 		return fmt.Errorf("failed to marshal GraphQL request: %w", err)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://api.linear.app/graphql", bytes.NewBuffer(reqBody))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, l.BaseURL, bytes.NewBuffer(reqBody))
 	if err != nil {
 		return fmt.Errorf("failed to create GraphQL request: %w", err)
 	}

@@ -60,3 +60,124 @@ func TestKaneoProvider_UpdateStatus(t *testing.T) {
 		t.Fatalf("expected clean update, got err: %v", err)
 	}
 }
+
+func TestKaneoProvider_ListTasks(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/task" || r.URL.Query().Get("projectId") != "proj-1" {
+			t.Errorf("unexpected path or query: %s?%s", r.URL.Path, r.URL.RawQuery)
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`[
+			{"id":"t-1","ref":"FAC-1","title":"Task 1","status":"to-do","priority":"high","projectId":"proj-1","createdAt":"2026-08-01T20:00:00Z","labels":[]},
+			{"id":"t-2","ref":"FAC-2","title":"Task 2","status":"done","priority":"low","projectId":"proj-1","createdAt":"2026-08-01T20:00:00Z","labels":[]}
+		]`))
+	}))
+	defer server.Close()
+
+	kp := NewKaneoProvider(server.URL, "proj-1")
+	tasks, err := kp.ListTasks(context.Background(), "proj-1", "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(tasks) != 2 {
+		t.Fatalf("expected 2 tasks, got %d", len(tasks))
+	}
+
+	// Filter by status
+	tasks, err = kp.ListTasks(context.Background(), "proj-1", "done")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(tasks) != 1 || tasks[0].ID != "t-2" {
+		t.Fatalf("expected 1 done task, got %d", len(tasks))
+	}
+}
+
+func TestKaneoProvider_AddComment(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/api/task/task-123/comment" {
+			t.Errorf("unexpected method or path: %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		w.WriteHeader(http.StatusCreated)
+	}))
+	defer server.Close()
+
+	kp := NewKaneoProvider(server.URL, "proj-1")
+	if err := kp.AddComment(context.Background(), "task-123", "reviewed"); err != nil {
+		t.Fatalf("expected clean comment add, got err: %v", err)
+	}
+}
+
+func TestKaneoProvider_ClaimTask(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPatch || r.URL.Path != "/api/task/task-123" {
+			t.Errorf("unexpected method or path: %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	kp := NewKaneoProvider(server.URL, "proj-1")
+	if err := kp.ClaimTask(context.Background(), "task-123", "builder"); err != nil {
+		t.Fatalf("expected clean claim, got err: %v", err)
+	}
+}
+
+func TestKaneoProvider_GetTask_NotFound(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer server.Close()
+
+	kp := NewKaneoProvider(server.URL, "proj-1")
+	_, err := kp.GetTask(context.Background(), "nonexistent")
+	if err == nil {
+		t.Fatal("expected error on 404, got nil")
+	}
+}
+
+func TestKaneoProvider_UpdateStatus_Non200(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	kp := NewKaneoProvider(server.URL, "proj-1")
+	err := kp.UpdateStatus(context.Background(), "task-123", "done")
+	if err == nil {
+		t.Fatal("expected error on 500, got nil")
+	}
+}
+
+func TestKaneoProvider_ListTasks_Non200(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	kp := NewKaneoProvider(server.URL, "proj-1")
+	_, err := kp.ListTasks(context.Background(), "proj-1", "")
+	if err == nil {
+		t.Fatal("expected error on 500, got nil")
+	}
+}
+
+func TestKaneoProvider_AddComment_Non200(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	kp := NewKaneoProvider(server.URL, "proj-1")
+	err := kp.AddComment(context.Background(), "task-123", "comment")
+	if err == nil {
+		t.Fatal("expected error on 500, got nil")
+	}
+}
