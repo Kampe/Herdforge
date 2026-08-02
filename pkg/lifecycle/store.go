@@ -215,6 +215,32 @@ func (s *EventStore) AppendTx(tx *sql.Tx, ev Event) (Event, error) {
 	return ev, nil
 }
 
+// AllTaskStates returns the materialized state of every known task. Used
+// by the Reconciler to sweep for stalled tasks.
+func (s *EventStore) AllTaskStates() ([]TaskState, error) {
+	rows, err := s.db.Query(
+		`SELECT task_ref, repo, state, seq, lease_generation, branch, candidate_sha, updated_at
+		 FROM lifecycle_task_state ORDER BY task_ref ASC`,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("all task states: %w", err)
+	}
+	defer rows.Close()
+
+	var states []TaskState
+	for rows.Next() {
+		var ts TaskState
+		var branch, candidateSHA sql.NullString
+		if err := rows.Scan(&ts.TaskRef, &ts.Repo, &ts.State, &ts.Seq, &ts.LeaseGeneration, &branch, &candidateSHA, &ts.UpdatedAt); err != nil {
+			return nil, fmt.Errorf("scan task state: %w", err)
+		}
+		ts.Branch = branch.String
+		ts.CandidateSHA = candidateSHA.String
+		states = append(states, ts)
+	}
+	return states, rows.Err()
+}
+
 // EventByIdempotencyKey returns the event previously recorded under key,
 // or nil (with no error) if it has never been seen. This is what makes
 // replaying the same lifecycle command a no-op.

@@ -169,3 +169,17 @@ func TestEventStore_PersistsSchemaFields(t *testing.T) {
 		t.Errorf("expected evidence digest/provider revision to persist, got %+v", events[0])
 	}
 }
+
+func TestEventStore_AllTaskStatesReturnsEveryTask(t *testing.T) {
+	s := tempEventStore(t)
+	mustAppend(t, s, Event{TaskRef: "FAC-1", Repo: "herdforge", FromState: StateDraft, ToState: StateEligible, Actor: "a", IdempotencyKey: "k1"})
+	mustAppend(t, s, Event{TaskRef: "FAC-2", Repo: "herdforge", FromState: StateDraft, ToState: StateEligible, Actor: "a", IdempotencyKey: "k2"})
+
+	states, err := s.AllTaskStates()
+	if err != nil {
+		t.Fatalf("all task states: %v", err)
+	}
+	if len(states) != 2 {
+		t.Fatalf("expected 2 task states, got %d", len(states))
+	}
+}
