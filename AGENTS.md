@@ -12,16 +12,16 @@ This contract governs all AI agents (Claude, Gemini, Codex, Grok, Ollama) partic
 
 2. **Mutation & Test Non-Vacuity Discipline**:
    - Never write a test that passes vacuously.
-   - Any negative assertion guard **must be manually or programmatically verified failing** against a introduced regression before PR approval.
+   - Any negative assertion guard **must be manually or programmatically verified failing** against an introduced regression before PR approval.
 
 3. **Repo-Relative Path Enforcement**:
    - Never output absolute file paths (e.g. `/Users/...` or `/tmp/...`) inside configuration files, git hooks, or generated artifacts.
    - Use `./` or runtime environment variables (`$HERD_ROOT`, `$HERD_WORKTREE`) to ensure worktree portability.
 
 4. **Deterministic Task Selection**:
-   - When listing candidate tasks from Kaneo, GitHub, or Linear, candidate arrays **must be sorted deterministically**:
+   - When listing candidate tasks from Kaneo, GitHub, Linear, Jira, or Azure DevOps, candidate arrays **must be sorted deterministically**:
      $$\text{Sort Order} = (\text{Priority DESC}, \text{Ticket Number ASC})$$
-   - Agents must check that role labels match their assigned persona (`next --role <role>`) before claiming work.
+   - Agents must check that role labels match their assigned persona (`pulse --role <role>`) before claiming work.
 
 5. **Sized-to-Risk Cross-Model Review**:
    - **Mechanical/R0 (Docs, Markdown, Unit Tests)**: May be auto-merged via AST / deterministic test verification.
@@ -29,22 +29,47 @@ This contract governs all AI agents (Claude, Gemini, Codex, Grok, Ollama) partic
 
 ---
 
-## 2. Package Ownership Grid
+## 2. Complete Package Ownership Grid (30 Packages)
 
-| Package | Purpose & Scope | Primary Tests |
+| Package | Purpose & Scope | Primary Test Target |
 | :--- | :--- | :--- |
-| `cmd/herd` | CLI entry point and subcommand router | `go test ./cmd/herd/...` |
-| `pkg/config` | `herd.yaml` declarative configuration parser & validator | `go test ./pkg/config/...` |
-| `pkg/provider` | Unified Task Engine interface (Kaneo, GitHub, Linear) | `go test ./pkg/provider/...` |
-| `pkg/router` | Multi-provider LLM load balancer & 429 rate-limit fallback | `go test ./pkg/router/...` |
-| `pkg/worktree` | Git worktree creation, isolation, & auto-pruning | `go test ./pkg/worktree/...` |
-| `pkg/verifier` | Test harness runner & stack trace parser | `go test ./pkg/verifier/...` |
+| `cmd/herd` | CLI entry point & subcommand router (`init`, `preflight`, `selftest`, `status`, `pulse`, `sh`) | `go test ./cmd/herd` |
+| `pkg/budget` | Dollar ($USD) and token spend governance manager | `go test ./pkg/budget` |
+| `pkg/claim` | Atomic task claiming & mutex scope lock manager | `go test ./pkg/claim` |
+| `pkg/config` | Declarative `.herd/herd.yaml` parser & validator | `go test ./pkg/config` |
+| `pkg/conflict` | LLM semantic git merge conflict resolver | `go test ./pkg/conflict` |
+| `pkg/cron` | Distributed agent scheduled task cron engine | `go test ./pkg/cron` |
+| `pkg/daemon` | Core orchestration daemon & heartbeat engine | `go test ./pkg/daemon` |
+| `pkg/gc` | Ephemeral git worktree garbage collector | `go test ./pkg/gc` |
+| `pkg/graph` | Multi-repo workspace dependency graph engine | `go test ./pkg/graph` |
+| `pkg/harness` | Universal AI harness adapter (`claude`, `codex`, `opencode`, `grok`, `kimi`, `agy`, `pi`) | `go test ./pkg/harness` |
+| `pkg/llm` | Local Ollama and vLLM provider adapter | `go test ./pkg/llm` |
+| `pkg/mail` | Inter-agent durable JSONL mailbox protocol | `go test ./pkg/mail` |
+| `pkg/memory` | Knowledge-graph & error pattern session memory store | `go test ./pkg/memory` |
+| `pkg/metrics` | Prometheus metrics exporter (`/metrics`) | `go test ./pkg/metrics` |
+| `pkg/notifier` | Multi-platform notifier (Slack, Discord, Teams) | `go test ./pkg/notifier` |
+| `pkg/plugin` | WASM verifier plugin execution engine | `go test ./pkg/plugin` |
+| `pkg/preflight` | Workspace boundary & absolute path leak scanner | `go test ./pkg/preflight` |
+| `pkg/provider` | Pluggable task engine (Kaneo, Linear, GitHub, Jira, Azure, Memory) | `go test ./pkg/provider` |
+| `pkg/release` | Conventional commit log parser & CHANGELOG generator | `go test ./pkg/release` |
+| `pkg/review` | Adversarial risk classification & review pipeline | `go test ./pkg/review` |
+| `pkg/router` | Multi-provider LLM load balancer & 429 cooldowns | `go test ./pkg/router` |
+| `pkg/security` | Secret-scanning & credential leak guardrails | `go test ./pkg/security` |
+| `pkg/selftest` | Self-test assertion engine & boundary runner | `go test ./pkg/selftest` |
+| `pkg/server` | OpenAPI 3.0 REST control server (`/v1/status`) | `go test ./pkg/server` |
+| `pkg/skill` | WASM sandboxed dynamic skill runner | `go test ./pkg/skill` |
+| `pkg/sync` | Multi-board state reconciliation engine | `go test ./pkg/sync` |
+| `pkg/tui` | Live fleet operations dashboard & REPL shell (`herd sh`) | `go test ./pkg/tui` |
+| `pkg/verifier` | Language-agnostic test harness runner | `go test ./pkg/verifier` |
+| `pkg/webhook` | Event-driven HMAC webhook receiver engine | `go test ./pkg/webhook` |
+| `pkg/worker` | Worker lane process supervisor | `go test ./pkg/worker` |
+| `pkg/worktree` | Git worktree creation, isolation, & pruning | `go test ./pkg/worktree` |
 
 ---
 
 ## 3. Workflow for Agentic Tasks
 
-1. **Preflight**: Run `go test ./...` in your isolated worktree before editing.
+1. **Preflight**: Run `make preflight` in your isolated worktree before editing.
 2. **Implementation**: Modify files in your assigned worktree; keep changes atomic and focused on the claimed task.
-3. **Verification**: Run `go test ./...` and ensure zero test failures.
+3. **Verification**: Run `make lint all` and ensure zero test failures.
 4. **Commit**: Format commit message using Conventional Commits (`feat: ...`, `fix: ...`, `docs: ...`).

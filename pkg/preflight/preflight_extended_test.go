@@ -75,3 +75,59 @@ func TestCheckWorktreeBoundary_WalkError(t *testing.T) {
 		t.Fatal("expected walk error for nonexistent path")
 	}
 }
+
+func TestCheckWorktreeBoundary_DetectLeak(t *testing.T) {
+	tmpDir := t.TempDir()
+	goFile := filepath.Join(tmpDir, "leak.go")
+	os.WriteFile(goFile, []byte("// path: /Users/evil/secret\npackage x\n"), 0644)
+
+	err := CheckWorktreeBoundary(tmpDir)
+	if err == nil {
+		t.Fatal("expected leak detection for /Users/ path in .go file")
+	}
+}
+
+func TestCheckWorktreeBoundary_DetectHomeLeak(t *testing.T) {
+	tmpDir := t.TempDir()
+	yamlFile := filepath.Join(tmpDir, "config.yaml")
+	os.WriteFile(yamlFile, []byte("path: /home/ec2-user/secret\n"), 0644)
+
+	err := CheckWorktreeBoundary(tmpDir)
+	if err == nil {
+		t.Fatal("expected leak detection for /home/ path in .yaml file")
+	}
+}
+
+func TestCheckWorktreeBoundary_SkipsPreflightTest(t *testing.T) {
+	tmpDir := t.TempDir()
+	// File named preflight_something_test.go should be skipped even with /Users/ content
+	testFile := filepath.Join(tmpDir, "preflight_helper_test.go")
+	os.WriteFile(testFile, []byte("// path: /Users/test\n"), 0644)
+
+	err := CheckWorktreeBoundary(tmpDir)
+	if err != nil {
+		t.Fatalf("expected preflight test file to be skipped, got: %v", err)
+	}
+}
+
+func TestCheckWorktreeBoundary_SkipsAGENTSMD(t *testing.T) {
+	tmpDir := t.TempDir()
+	agentFile := filepath.Join(tmpDir, "AGENTS.md")
+	os.WriteFile(agentFile, []byte("path: /Users/something\n"), 0644)
+
+	err := CheckWorktreeBoundary(tmpDir)
+	if err != nil {
+		t.Fatalf("expected AGENTS.md to be skipped, got: %v", err)
+	}
+}
+
+func TestCheckWorktreeBoundary_SkipsPreflightSource(t *testing.T) {
+	tmpDir := t.TempDir()
+	srcFile := filepath.Join(tmpDir, "preflight.go")
+	os.WriteFile(srcFile, []byte("path: /Users/something\n"), 0644)
+
+	err := CheckWorktreeBoundary(tmpDir)
+	if err != nil {
+		t.Fatalf("expected preflight.go to be skipped, got: %v", err)
+	}
+}

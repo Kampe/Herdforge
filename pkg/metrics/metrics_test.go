@@ -22,3 +22,16 @@ func TestMetricsExporter_Handler(t *testing.T) {
 		t.Errorf("unexpected metrics output:\n%s", body)
 	}
 }
+
+func TestRecordReview_Failure(t *testing.T) {
+	exp := NewMetricsExporter()
+	exp.RecordReview(false)
+
+	req := httptest.NewRequest("GET", "/metrics", nil)
+	w := httptest.NewRecorder()
+	exp.Handler().ServeHTTP(w, req)
+	body := w.Body.String()
+	if !strings.Contains(body, `herd_review_verdicts_total{verdict="fail"} 1`) {
+		t.Errorf("expected review fail counter, got:\n%s", body)
+	}
+}

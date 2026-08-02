@@ -18,16 +18,25 @@ This document serves as the build bootstrap and routing specification for Claude
 
 ```bash
 # Build binary
-go build -o bin/herd ./cmd/herd
+make build
 
-# Run unit test suite
-go test ./...
+# Run preflight, unit tests, and build
+make all
+
+# Run self-test suite against active repository
+make self-test
+
+# Run unit tests across all 30 packages
+make test-unit
 
 # Run preflight workspace boundary check
-go run ./cmd/herd preflight
+make preflight
 
-# Execute test sweep for specific package
-go test ./pkg/daemon/...
+# Launch interactive REPL shell
+./bin/herd sh
+
+# Execute pulse task claim sweep
+./bin/herd pulse --role worker
 ```
 
 ---
@@ -36,6 +45,8 @@ go test ./pkg/daemon/...
 
 | Topic | Reference Document |
 | :--- | :--- |
-| **Agent Contracts & Standards** | [AGENTS.md](AGENTS.md) |
+| **Agent Skill & Integration Guide** | [SKILL.md](SKILL.md) / [.herd/skills/herd.md](.herd/skills/herd.md) |
+| **Agent Prompts & Contracts** | [examples/prompts/](examples/prompts/) / [.herd/prompts/](.herd/prompts/) |
+| **Agent Governance & Invariants** | [AGENTS.md](AGENTS.md) |
 | **Architecture & API Specs** | [docs/architecture/AGENT-IMPLEMENTATION-GUIDE.md](docs/architecture/AGENT-IMPLEMENTATION-GUIDE.md) |
 | **System RFC & Design** | [docs/rfcs/RFC-001-HERD-DAEMON.md](docs/rfcs/RFC-001-HERD-DAEMON.md) |

@@ -38,10 +38,32 @@ func TestExecute_FailingCommand(t *testing.T) {
 	}
 }
 
-func TestRunMutationCheck_BaselineFails(t *testing.T) {
-	v := NewVerifier("false") // baseline always fails
+func TestRunMutationCheck_BaselineFail(t *testing.T) {
+	v := NewVerifier("false")
 	_, err := v.RunMutationCheck(context.Background(), ".", "main.go", "orig", "mutant")
 	if err == nil {
-		t.Fatal("expected error when baseline test suite fails")
+		t.Fatal("expected error when baseline fails")
+	}
+}
+
+func TestRunMutationCheck_MutantPasses(t *testing.T) {
+	v := NewVerifier("true")
+	result, err := v.RunMutationCheck(context.Background(), ".", "main.go", "orig", "mutant")
+	if err != nil {
+		t.Fatalf("expected no error, got: %v", err)
+	}
+	if result.Killed {
+		t.Error("expected mutant not killed when tests pass")
+	}
+	if result.MutantID == "" {
+		t.Error("expected non-empty MutantID")
+	}
+}
+
+func TestRunMutationCheck_SecondExecFails(t *testing.T) {
+	v := &Verifier{Command: "./nonexistent-script-xyzzy"}
+	_, err := v.RunMutationCheck(context.Background(), "/nonexistent-dir", "main.go", "orig", "mutant")
+	if err == nil {
+		t.Fatal("expected error when second exec fails")
 	}
 }

@@ -8,21 +8,30 @@
 
 ---
 
-## Dependencies
-
-- **Go 1.24+** — `go.mod` requires 1.24; install via `brew install go` or `mise install go`
-- **Git** — worktree isolation and rebase-merge pipeline
-- **Redis** — distributed agent lane sync via pub/sub (`pkg/mail`); install via `brew install redis`
-- **Make** — `make all` drives preflight, lint, test, and build
-- **Optional** — Redis for distributed agent lane sync
+## Key Features
 
 - ⚙️ **Declarative Config (`herd.yaml`)**: Initialize any codebase with `herd init` and define worker roles, model providers, and task backends.
-- 🔌 **Pluggable Task Engine**: Native support for **Kaneo**, **Linear**, **GitHub Issues**, and offline **Memory** task providers.
-- 🔀 **Multi-Provider AI Router**: Dynamic load-balancing and 429 rate-limit failover across OpenAI, Anthropic, Gemini, and local Ollama/vLLM models.
+- 🔌 **Enterprise Task Engine**: Native support for **Kaneo**, **Linear**, **GitHub Issues**, **Jira Software (REST v3)**, **Azure DevOps Boards**, and offline **Memory** task providers.
+- 🔀 **Multi-Provider AI Router**: Dynamic load-balancing and 429 rate-limit failover across OpenAI, Anthropic, Gemini, local Ollama, and vLLM models.
+- ⚡ **Event-Driven Webhook Ingestion**: HMAC-signed HTTP webhook receiver (`pkg/webhook`) for sub-second real-time agent task dispatch.
+- 💰 **Agent Spend Governance**: Dollar ($USD) and token budget manager (`pkg/budget`) with automated exhaustion worker pausing.
+- 🔀 **Semantic Merge Conflict Solver**: Automated LLM git merge conflict resolver (`pkg/conflict`) for parallel agent branch reconciliation.
+- 🖥️ **Interactive REPL Shell**: Operator terminal REPL shell (`herd sh` / `pkg/tui`) for live inspection and lane steering.
+- ⏰ **Scheduled Maintenance Cron**: Native 5-field cron engine (`pkg/cron`) for recurring security scans and worktree GC.
+- 📢 **Multi-Platform Notifier**: Real-time alert notifications (`pkg/notifier`) to Slack, Discord, and Microsoft Teams.
+- 📦 **WASM Sandboxed Skills**: WASM runtime dynamic skill runner (`pkg/skill`) for isolated tool execution.
 - 🌳 **Worktree & Lane Isolation**: Ephemeral Git worktree management to isolate parallel agent lanes without workspace file collisions.
 - 🛡️ **Preflight Boundary Check**: Automatic detection of absolute path leaks to ensure worktree portability.
 - 🧪 **Mutation Verification**: Language-agnostic test harness runner (`npm`, `pytest`, `cargo`, `go test`) with mutation testing to kill vacuous agent tests.
 - 🔍 **Independent Cross-Model Review**: Risk-based code review pipeline enforcing cross-family model reviews before git rebase-merging.
+
+---
+
+## Dependencies & Requirements
+
+- **Go 1.24+** — `go.mod` requires 1.24; install via `brew install go` or `mise install go`
+- **Git** — worktree isolation and rebase-merge pipeline
+- **Make** — `make all` drives preflight, lint, test, and build
 
 ---
 
@@ -39,7 +48,7 @@ project:
   default_branch: "main"
 
 # Task / Issue Tracker integration
-# Supported types: kaneo | linear | github | memory
+# Supported types: kaneo | linear | github | jira | azure | memory
 task_provider:
   type: "kaneo"
   project_id: "b939c5jzixruza3vvywrg1hs"
@@ -49,20 +58,20 @@ task_provider:
 model_providers:
   - name: "claude-pro"
     type: "anthropic"
-    model: "claude-3-7-sonnet"
+    model: "claude-3-5-sonnet"
   - name: "gemini-flash"
     type: "google"
-    model: "gemini-2.5-flash"
+    model: "gemini-1.5-pro"
   - name: "codex-local"
     type: "openai"
     model: "gpt-4o"
 
 # Worker roles & prompt routing
 roles:
-  - name: "herd-smith"
+  - name: "worker"
     provider: "claude-pro"
     fallback_provider: "gemini-flash"
-    prompt_path: ".herd/prompts/smith.md"
+    prompt_path: ".herd/prompts/worker.md"
   - name: "reviewer"
     provider: "gemini-flash"
     fallback_provider: "codex-local"
@@ -70,13 +79,12 @@ roles:
 
 # Project-native test harness verification
 verification:
-  test_command: "make test"
-  preflight_command: "make preflight"
+  test_command: "make lint all"
 ```
 
 ---
 
-## Quickstart & Makefile Commands
+## Quickstart & Commands
 
 ```bash
 # Clone repository
@@ -86,49 +94,27 @@ cd Herdforge
 # Run Makefile (preflight, lint, tests, build)
 make all
 
+# Run self-test suite against active repo
+make self-test
+
 # Scaffold default .herd/herd.yaml in any repo
-go run ./cmd/herd init
+./bin/herd init
 
 # Execute preflight boundary verification check
-go run ./cmd/herd preflight
+./bin/herd preflight
 
-# Execute single orchestration sweep pass
-go run ./cmd/herd pulse --role herd-smith
+# Execute single orchestration pulse sweep
+./bin/herd pulse --role worker
+
+# Launch interactive REPL shell
+./bin/herd sh
 ```
 
 ---
 
-## Documentation & Agent Protocols
+## Agent Skill & Integration
 
-- **Agent Contract & Invariants**: [`AGENTS.md`](AGENTS.md)
-- **Build Bootstrap**: [`CLAUDE.md`](CLAUDE.md)
-- **Agent Implementation Guide**: [`docs/architecture/AGENT-IMPLEMENTATION-GUIDE.md`](docs/architecture/AGENT-IMPLEMENTATION-GUIDE.md)
-- **Architecture RFC**: [`docs/rfcs/RFC-001-HERD-DAEMON.md`](docs/rfcs/RFC-001-HERD-DAEMON.md)
-
----
-
-## Architecture Overview
-
-```
-                        ┌─────────────────────────────────┐
-                        │       Task Queue Provider       │
-                        │ (Kaneo / Linear / GitHub / Mem) │
-                        └────────────────┬────────────────┘
-                                         │
-                                         ▼
- ┌──────────────────────────────────────────────────────────────────────────┐
- │                            Herdforge Daemon                              │
- │                                                                          │
- │  ┌──────────────────┐    ┌──────────────────┐    ┌──────────────────┐    │
- │  │ Task Engine      │ ── │ Worktree Manager │ ── │  Model Router    │    │
- │  └──────────────────┘    └──────────────────┘    └──────────────────┘    │
- │           │                        │                       │             │
- │           ▼                        ▼                       ▼             │
- │  ┌──────────────────┐    ┌──────────────────┐    ┌──────────────────┐    │
- │  │ Test Verifier    │ ── │ Preflight Check  │ ── │ Git Rebase-Merge │    │
- │  └──────────────────┘    └──────────────────┘    └──────────────────┘    │
- └──────────────────────────────────────────────────────────────────────────┘
-```
+Herdforge includes a native agent skill file [`SKILL.md`](SKILL.md) and prompt contracts in [`examples/prompts/`](examples/prompts/) for seamless integration with AI coding agents (Claude, Codex, Gemini, OpenCode, Antigravity).
 
 ---
 
