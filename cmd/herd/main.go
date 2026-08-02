@@ -27,6 +27,7 @@ import (
 	"github.com/Kampe/Herdforge/pkg/lost"
 	"github.com/Kampe/Herdforge/pkg/next"
 	"github.com/Kampe/Herdforge/pkg/overlap"
+	"github.com/Kampe/Herdforge/pkg/park"
 	"github.com/Kampe/Herdforge/pkg/preflight"
 	"github.com/Kampe/Herdforge/pkg/process"
 	"github.com/Kampe/Herdforge/pkg/provider"
@@ -165,6 +166,9 @@ func main() {
 	case "resources":
 		runResources()
 
+	case "park":
+		runPark()
+
 	default:
 		fmt.Fprintf(os.Stderr, "unknown subcommand '%s'\nRun 'herd --help' for usage.\n", command)
 		os.Exit(1)
@@ -212,6 +216,7 @@ func printUsage() {
 	fmt.Println("  attention       List standing agents needing coordinator eyes (triage)")
 	fmt.Println("  lifecycle       Observe and act on fleet state via lifecycle engine")
 	fmt.Println("  resources       Snapshot system-resource headroom (free-mem, swap, gate verdict)")
+	fmt.Println("  park            Park a commit under refs/tags/parked/: park, list, audit, hygiene, reap")
 	fmt.Println("  --version       Show herd version")
 }
 
@@ -2568,3 +2573,156 @@ func runResolveLane() {
 		os.Exit(3)
 	}
 }
+
+func runPark() {
+	if len(os.Args) < 3 {
+		parkUsage()
+		os.Exit(1)
+	}
+
+	sub := os.Args[2]
+	ctx := context.Background()
+
+	repoRoot, err := os.Getwd()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "park: %v\n", err)
+		os.Exit(1)
+	}
+
+	switch sub {
+	case "park":
+		flags := flag.NewFlagSet("park park", flag.ExitOnError)
+		msg := flags.String("m", "", "Park message (required)")
+		sign := flags.Bool("sign-first", true, "Try signing first")
+		flags.Parse(os.Args[3:])
+
+		args := flags.Args()
+		if len(args) == 0 {
+			fmt.Fprintf(os.Stderr, "Usage: herd park park [-m <message>] <slug|commit>\n")
+			os.Exit(1)
+		}
+
+		slugOrSha := args[0]
+		slug := park.Slugify(slugOrSha)
+
+		res, err := park.Park(ctx, park.ParkOptions{RepoRoot: repoRoot, SignFirst: *sign}, slug, slugOrSha, *msg)
+		if err != nil {
+			if err == park.ErrPushFailed {
+				os.Exit(2)
+			}
+			fmt.Fprintf(os.Stderr, "park: %v\n", err)
+			os.Exit(1)
+		}
+		json.NewEncoder(os.Stdout).Encode(res)
+
+	case "list":
+		flags := flag.NewFlagSet("park list", flag.ExitOnError)
+		wantJSON := flags.Bool("json", false, "Output JSON")
+		flags.Parse(os.Args[3:])
+
+		result, err := park.List(ctx, repoRoot, park.ListOptions{})
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "park list: %v\n", err)
+			os.Exit(1)
+		}
+		if *wantJSON {
+			json.NewEncoder(os.Stdout).Encode(result)
+			return
+		}
+		for _, c := range result.Commits {
+			fmt.Printf("%s  %s  %s  %s\n", c.Date, c.Tag, c.Commit, c.Message)
+		}
+
+	case "audit":
+		flags := flag.NewFlagSet("park audit", flag.ExitOnError)
+		wantJSON := flags.Bool("json", false, "Output JSON")
+		flags.Parse(os.Args[3:])
+
+		result, err := park.Audit(ctx, repoRoot)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "park audit: %v\n", err)
+			os.Exit(1)
+		}
+		if *wantJSON {
+			json.NewEncoder(os.Stdout).Encode(result)
+			return
+		}
+		fmt.Printf("Total: %d | Durable: %d | Local: %d | Exposed: %d\n", result.Total, result.Durable, result.Local, result.Exposed)
+		for _, e := range result.Entries {
+			fmt.Printf("  %s  %-30s  %s\n", e.Durability, e.Tag, e.Date)
+		}
+		if !park.VerifyAuditExit(result) {
+			fmt.Fprintf(os.Stderr, "park audit: %d exposed tag(s) found\n", result.Exposed)
+			os.Exit(1)
+		}
+
+	case "hygiene":
+		flags := flag.NewFlagSet("park hygiene", flag.ExitOnError)
+		wantJSON := flags.Bool("json", false, "Output JSON")
+		flags.Parse(os.Args[3:])
+
+		result, err := park.Hygiene(ctx, repoRoot)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "park hygiene: %v\n", err)
+			os.Exit(1)
+		}
+		if *wantJSON {
+			json.NewEncoder(os.Stdout).Encode(result)
+			return
+		}
+		fmt.Printf("Total: %d | Active: %d | Merged: %d | Dup: %d\n", result.Total, result.Active, result.Merged, result.Dup)
+		for _, r := range result.Rows {
+			fmt.Printf("  %-16s  %-30s  %s\n", r.Status, r.Tag, r.Reason)
+		}
+		if !park.VerifyHygieneExit(result) {
+			fmt.Fprintf(os.Stderr, "park hygiene: %d merged + %d dup tag(s) need attention\n", result.Merged, result.Dup)
+			os.Exit(1)
+		}
+
+	case "reap":
+		flags := flag.NewFlagSet("park reap", flag.ExitOnError)
+		dryRun := flags.Bool("dry-run", false, "Preview only")
+		flags.Parse(os.Args[3:])
+
+		args := flags.Args()
+		if len(args) == 0 {
+			fmt.Fprintf(os.Stderr, "Usage: herd park reap [--dry-run] <tag>\n")
+			os.Exit(1)
+		}
+
+		mode := park.ReapApplied
+		if *dryRun {
+			mode = park.ReapDryRun
+		}
+
+		res, err := park.Reap(ctx, repoRoot, args[0], mode)
+		if err != nil {
+			if err == park.ErrGCNotFound {
+				fmt.Fprintf(os.Stderr, "park reap: bin/herd-gc not found\n")
+				os.Exit(1)
+			}
+			fmt.Fprintf(os.Stderr, "park reap: %v\n", err)
+			os.Exit(1)
+		}
+		json.NewEncoder(os.Stdout).Encode(res)
+
+	default:
+		parkUsage()
+		os.Exit(1)
+	}
+}
+
+func parkUsage() {
+	fmt.Fprintf(os.Stderr, `park: durable annotated tag parking in refs/tags/parked/
+
+Subcommands:
+  park         Park a commit under refs/tags/parked/<slug>/<sha>
+  list         List parked commits
+  audit        Classify parked commits by durability
+  hygiene      Classify parked commits by merge status
+  reap         Remove a parked tag
+
+Use 'herd park <subcommand> --help' for subcommand flags.
+`)
+}
+
