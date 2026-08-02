@@ -125,6 +125,9 @@ func main() {
 	case "harvest":
 		runHarvest()
 
+	case "unmerged":
+		runUnmerged()
+
 	case "attention":
 		runAttention()
 
@@ -181,6 +184,7 @@ func printUsage() {
 	fmt.Println("  next            Show highest-priority next action")
 	fmt.Println("  dispatch        Dispatch a ticket to a worktree and launch agent")
 	fmt.Println("  harvest         Sweep all worktrees for unmerged commits")
+	fmt.Println("  unmerged        Authoritative cherry-based unmerged check (herd unmerged <path> | --all)")
 	fmt.Println("  attention       List agents needing coordinator eyes")
 	fmt.Println("  process         Classify harvest targets (herd-process digest)")
 	fmt.Println("  resolve-lane    Resolve a lane to concrete provider+model (deterministic)")
@@ -1628,6 +1632,58 @@ func runHarvest() {
 	fmt.Println("herd-harvest: sweep complete. Any worktree listed above needs a review dispatch")
 	fmt.Println("  (herd review) then approval — do not assume 'working' pane")
 	fmt.Println("  status means nothing is ready to merge.")
+}
+
+// runUnmerged ports bin/herd-unmerged: patch-equivalence authority, byte-
+// distinct from herd harvest so drain-style pipelines can parse it. Exit
+// codes are contract: 0 clean-or-listed, 1 real error, 2 usage.
+func runUnmerged() {
+	const usageLine = "usage: bin/herd-unmerged <worktree-path> | --all"
+	args := os.Args[2:]
+	if len(args) == 0 {
+		fmt.Fprintln(os.Stderr, usageLine)
+		os.Exit(2)
+	}
+
+	printBlock := func(u *harvest.UnmergedWork) {
+		fmt.Printf("%s (%s):\n", u.WorktreePath, u.Branch)
+		for _, sha := range u.Unmerged {
+			fmt.Printf("  %s\n", sha)
+		}
+	}
+
+	ctx := context.Background()
+	h := harvest.NewHarvester(".")
+
+	switch args[0] {
+	case "-h", "--help":
+		fmt.Println(usageLine)
+		return
+	case "--all":
+		result, err := h.Harvest(ctx)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "herd-unmerged: %v\n", err)
+			os.Exit(1)
+		}
+		for i := range result.UnmergedWorktrees {
+			printBlock(&result.UnmergedWorktrees[i])
+		}
+		for _, e := range result.Errors {
+			fmt.Fprintf(os.Stderr, "herd-unmerged: %s\n", e)
+		}
+		if len(result.Errors) > 0 {
+			os.Exit(1)
+		}
+	default:
+		u, err := h.UnmergedFor(ctx, args[0])
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "herd-unmerged: %s: not a git worktree\n", args[0])
+			os.Exit(1)
+		}
+		if u != nil {
+			printBlock(u)
+		}
+	}
 }
 
 func runForge() {
