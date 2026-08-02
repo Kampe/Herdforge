@@ -233,7 +233,7 @@ func TestEligible(t *testing.T) {
 				mustErr(l.Record(RecordOpts{SHA: failSHA, Branch: "main", BuilderFamily: "anthropic", Reviewer: "reviewer-1"}))
 				must2(l.Verdict(VerdictOpts{SHA: failSHA, Reviewer: "reviewer-1", Verdict: VerdictFAIL, ReviewerFamily: "google"}))
 			},
-			sha: failSHA, wantEligible: false, wantErr: true,
+			sha: failSHA, wantEligible: false,
 		},
 		{
 			name: "mechanical PASS is eligible",
@@ -265,6 +265,32 @@ func TestEligible(t *testing.T) {
 				must2(l.Verdict(VerdictOpts{SHA: sameFamilySHA, Reviewer: "reviewer-1", Verdict: VerdictPASS, ReviewerFamily: "anthropic"}))
 			},
 			sha: sameFamilySHA, builderFamily: "anthropic", wantEligible: false, wantErr: true,
+		},
+		{
+			name: "same-family PASS not eligible when builderFamily query is empty",
+			setup: func(t *testing.T, l *Ledger) {
+				mustErr(l.Record(RecordOpts{SHA: passSHA, Branch: "main", BuilderFamily: "anthropic", Reviewer: "reviewer-1"}))
+				must2(l.Verdict(VerdictOpts{SHA: passSHA, Reviewer: "reviewer-1", Verdict: VerdictPASS, ReviewerFamily: "anthropic"}))
+			},
+			sha: passSHA, wantEligible: false, wantErr: true,
+		},
+		{
+			name: "PASS from cross-family + FAIL from another blocks eligibility (veto overrides PASS)",
+			setup: func(t *testing.T, l *Ledger) {
+				mustErr(l.Record(RecordOpts{SHA: passSHA, Branch: "main", BuilderFamily: "anthropic", Reviewer: "reviewer-1"}))
+				must2(l.Verdict(VerdictOpts{SHA: passSHA, Reviewer: "reviewer-1", Verdict: VerdictPASS, ReviewerFamily: "google"}))
+				mustErr(l.Record(RecordOpts{SHA: passSHA, Branch: "main", BuilderFamily: "anthropic", Reviewer: "reviewer-2"}))
+				must2(l.Verdict(VerdictOpts{SHA: passSHA, Reviewer: "reviewer-2", Verdict: VerdictFAIL, ReviewerFamily: "google"}))
+			},
+			sha: passSHA, wantEligible: false,
+		},
+		{
+			name: "BLOCKED from one reviewer blocks eligibility",
+			setup: func(t *testing.T, l *Ledger) {
+				mustErr(l.Record(RecordOpts{SHA: passSHA, Branch: "main", BuilderFamily: "anthropic", Reviewer: "reviewer-1"}))
+				must2(l.Verdict(VerdictOpts{SHA: passSHA, Reviewer: "reviewer-1", Verdict: VerdictBLOCKED, ReviewerFamily: "google"}))
+			},
+			sha: passSHA, wantEligible: false,
 		},
 		{
 			name: "consumed sha is not eligible",
@@ -506,6 +532,107 @@ func TestFamilyAllowlist(t *testing.T) {
 	}
 	if FamilyAllowlist["unicorn"] {
 		t.Error("FamilyAllowlist contains unicorn")
+	}
+}
+
+func TestRejectUnknownReviewerFamily(t *testing.T) {
+	l := newTestLedger(t)
+	_, err := l.Verdict(VerdictOpts{
+		SHA: "abc123", Reviewer: "reviewer-1",
+		Verdict:        VerdictPASS,
+		ReviewerFamily: "unicorn",
+	})
+	if err == nil {
+		t.Fatal("expected error for unknown reviewer family")
+	}
+}
+
+func TestRejectInvalidVerdict(t *testing.T) {
+	l := newTestLedger(t)
+	_, err := l.Verdict(VerdictOpts{
+		SHA: "abc123", Reviewer: "reviewer-1",
+		Verdict: "LGTM",
+	})
+	if err == nil {
+		t.Fatal("expected error for invalid verdict")
+	}
+}
+
+func TestVerdictIdempotent(t *testing.T) {
+	l := newTestLedger(t)
+	enq1, err := l.Verdict(VerdictOpts{
+		SHA: "abc123", Reviewer: "reviewer-1",
+		Verdict: VerdictPASS, ReviewerFamily: "google",
+	})
+	if err != nil {
+		t.Fatalf("first Verdict: %v", err)
+	}
+	if !enq1 {
+		t.Error("expected enqueued=true")
+	}
+	rows, _ := l.AllRows()
+	if len(rows) != 1 {
+		t.Fatalf("expected 1 row after first verdict, got %d", len(rows))
+	}
+
+	enq2, err := l.Verdict(VerdictOpts{
+		SHA: "abc123", Reviewer: "reviewer-1",
+		Verdict: VerdictPASS, ReviewerFamily: "google",
+	})
+	if err != nil {
+		t.Fatalf("second Verdict: %v", err)
+	}
+	if !enq2 {
+		t.Error("expected enqueued=true (replay returns last state)")
+	}
+	rows, _ = l.AllRows()
+	if len(rows) != 1 {
+		t.Fatalf("expected still 1 row after duplicate verdict, got %d", len(rows))
+	}
+}
+
+func TestQuarantineMalformed(t *testing.T) {
+	l := newTestLedger(t)
+	qDir := t.TempDir()
+	qPath := filepath.Join(qDir, "malformed.jsonl")
+	SetQuarantinePath(qPath)
+
+	// Write a malformed line directly.
+	f, err := os.OpenFile(l.Path, os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = f.WriteString("{borken}\n")
+	f.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rows, err := l.AllRows()
+	if err != nil {
+		t.Fatalf("AllRows: %v", err)
+	}
+	if len(rows) != 0 {
+		t.Errorf("expected 0 rows (malformed skipped), got %d", len(rows))
+	}
+
+	qData, err := os.ReadFile(qPath)
+	if err != nil {
+		t.Fatalf("quarantine file not created: %v", err)
+	}
+	if !strings.Contains(string(qData), "borken") {
+		t.Errorf("quarantine file = %q, want contains borken", string(qData))
+	}
+}
+
+func TestReadRowsFailClosed(t *testing.T) {
+	_, err := readRows("/nonexistent/path/that/does/not/exist")
+	if err != nil {
+		t.Fatalf("expected nil for non-existent path, got %v", err)
+	}
+	_, err = readRows("/tmp")
+	if err == nil {
+		t.Fatal("expected error for directory path, got nil")
 	}
 }
 

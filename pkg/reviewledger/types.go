@@ -40,26 +40,32 @@ var FamilyAllowlist = map[string]bool{
 
 // LedgerRow matches the jq-emitted JSONL row exactly (JSON tags for jq compat).
 type LedgerRow struct {
-	Timestamp      string `json:"ts"`
-	Event          string `json:"event"`
-	SHA            string `json:"sha,omitempty"`
-	Branch         string `json:"branch,omitempty"`
-	BuilderFamily  string `json:"builder_family,omitempty"`
-	ReviewerFamily string `json:"reviewer_family,omitempty"`
-	Reviewer       string `json:"reviewer,omitempty"`
-	Provider       string `json:"provider,omitempty"`
-	Model          string `json:"model,omitempty"`
-	Pane           string `json:"pane,omitempty"`
-	Pid            string `json:"pid,omitempty"`
-	Artifact       string `json:"artifact,omitempty"`
-	Gate           string `json:"gate,omitempty"`
-	Tier           string `json:"tier,omitempty"`
-	Verdict        string `json:"verdict,omitempty"`
-	RepairAuthor   string `json:"repair_author,omitempty"`
-	RepairFamily   string `json:"repair_family,omitempty"`
-	Lane           string `json:"lane,omitempty"`
-	MergeSHA       string `json:"merge_sha,omitempty"`
-	Status         string `json:"status,omitempty"`
+	Timestamp           string `json:"ts"`
+	Event               string `json:"event"`
+	SHA                 string `json:"sha,omitempty"`
+	Branch              string `json:"branch,omitempty"`
+	BuilderFamily       string `json:"builder_family,omitempty"`
+	ReviewerFamily      string `json:"reviewer_family,omitempty"`
+	Reviewer            string `json:"reviewer,omitempty"`
+	Provider            string `json:"provider,omitempty"`
+	Model               string `json:"model,omitempty"`
+	Pane                string `json:"pane,omitempty"`
+	Pid                 string `json:"pid,omitempty"`
+	Artifact            string `json:"artifact,omitempty"`
+	Gate                string `json:"gate,omitempty"`
+	Tier                string `json:"tier,omitempty"`
+	Verdict             string `json:"verdict,omitempty"`
+	RepairAuthor        string `json:"repair_author,omitempty"`
+	RepairFamily        string `json:"repair_family,omitempty"`
+	Lane                string `json:"lane,omitempty"`
+	MergeSHA            string `json:"merge_sha,omitempty"`
+	Status              string `json:"status,omitempty"`
+	Task                string `json:"task,omitempty"`
+	Lease               string `json:"lease,omitempty"`
+	PatchURL            string `json:"patch_url,omitempty"`
+	VerificationDigest  string `json:"verification_digest,omitempty"`
+	FindingsRef         string `json:"findings_ref,omitempty"`
+	CandidateSHA        string `json:"candidate_sha,omitempty"`
 }
 
 // familyResolve represents the 3-state family resolution.
