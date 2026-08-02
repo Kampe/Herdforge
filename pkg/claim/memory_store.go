@@ -206,7 +206,7 @@ func (s *InMemoryLeaseStore) ClaimCapacityRelease(_ context.Context, settlerID s
 			continue
 		}
 		c := s.capClaimLocked(id)
-		eligible := c.state == "pending" || (c.state == "in_progress" && !c.claimedAt.After(staleBefore))
+		eligible := c.state == "pending" || (c.state == "in_progress" && c.claimedAt.Before(staleBefore))
 		if !eligible {
 			continue
 		}
