@@ -23,6 +23,7 @@ import (
 	"github.com/Kampe/Herdforge/pkg/herdr"
 	"github.com/Kampe/Herdforge/pkg/kick"
 	"github.com/Kampe/Herdforge/pkg/lifecycle"
+	"github.com/Kampe/Herdforge/pkg/lost"
 	"github.com/Kampe/Herdforge/pkg/next"
 	"github.com/Kampe/Herdforge/pkg/preflight"
 	"github.com/Kampe/Herdforge/pkg/process"
@@ -128,6 +129,9 @@ func main() {
 	case "unmerged":
 		runUnmerged()
 
+	case "lost":
+		runLost()
+
 	case "attention":
 		runAttention()
 
@@ -185,6 +189,7 @@ func printUsage() {
 	fmt.Println("  dispatch        Dispatch a ticket to a worktree and launch agent")
 	fmt.Println("  harvest         Sweep all worktrees for unmerged commits")
 	fmt.Println("  unmerged        Authoritative cherry-based unmerged check (herd unmerged <path> | --all)")
+	fmt.Println("  lost            Find ownerless unmerged work on ANY branch (subject-based)")
 	fmt.Println("  attention       List agents needing coordinator eyes")
 	fmt.Println("  process         Classify harvest targets (herd-process digest)")
 	fmt.Println("  resolve-lane    Resolve a lane to concrete provider+model (deterministic)")
@@ -1632,6 +1637,55 @@ func runHarvest() {
 	fmt.Println("herd-harvest: sweep complete. Any worktree listed above needs a review dispatch")
 	fmt.Println("  (herd review) then approval — do not assume 'working' pane")
 	fmt.Println("  status means nothing is ready to merge.")
+}
+
+// runLost ports bin/herd-lost: subjects-not-patch-ids, owned-is-not-lost.
+// Exit 0 clean, 1 when an ownerless branch holds unmerged subjects, 2 usage.
+func runLost() {
+	fs := flag.NewFlagSet("lost", flag.ExitOnError)
+	quiet := fs.Bool("quiet", false, "Only status lines, no per-branch tables")
+	noFetch := fs.Bool("no-fetch", false, "Skip git fetch origin")
+	limit := fs.Int("limit", 60, "Cap subjects examined per branch")
+	fs.Parse(os.Args[2:])
+
+	f := lost.NewFinder(".")
+	f.Fetch = !*noFetch
+	f.Limit = *limit
+
+	rep, err := f.Find(context.Background())
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(2)
+	}
+
+	table := func(header string, rows []lost.BranchRow) {
+		if *quiet || len(rows) == 0 {
+			return
+		}
+		fmt.Println(header)
+		for _, r := range rows {
+			fmt.Printf("  %-40s %2d/%2d unmerged  last=%s  first-missing: %s\n",
+				r.Label, r.Unmerged, r.Total, r.Age, r.FirstMissing)
+		}
+	}
+	table("OWNERLESS (lost) — triage each: recover, or delete with a recorded reason:", rep.Lost)
+	table("DURABLE PARK (intentional review backlog):", rep.Parked)
+	table("Branches with a LIVE WORKTREE (owned, harvested by the coordinator):", rep.Owned)
+	if !*quiet && len(rep.Superseded) > 0 {
+		fmt.Printf("%d branch(es) fully superseded by origin/main — safe to delete:\n", len(rep.Superseded))
+		for _, b := range rep.Superseded {
+			fmt.Printf("  %s\n", b)
+		}
+	}
+
+	if len(rep.Lost) > 0 {
+		fmt.Printf("herd-lost: %d ownerless branch(es), %d unmerged subject(s). Triage each: recover, or delete with a recorded reason.\n",
+			len(rep.Lost), rep.LostTotal)
+		os.Exit(1)
+	}
+	if !*quiet {
+		fmt.Println("herd-lost: no ownerless branch holds unmerged work.")
+	}
 }
 
 // runUnmerged ports bin/herd-unmerged: patch-equivalence authority, byte-
