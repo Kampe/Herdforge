@@ -79,3 +79,22 @@ func Cleanup(standing map[string]bool, dryRun bool) ([]CleanupCandidate, []error
 	}
 	return cands, errs
 }
+
+// CloseTabForRef closes the herdr tab of the builder agent working a given
+// card ref (FAC-111). The forge calls this once a card reaches done, so the
+// workspace does not rot with finished one-off builders — "one agent = one
+// tab". The agent is named "task-<ref>" by the dispatcher. Returns nil when
+// no such tab exists (already closed / never launched).
+func CloseTabForRef(ref string) error {
+	agents, err := AgentList()
+	if err != nil {
+		return err
+	}
+	want := "task-" + strings.ToLower(ref)
+	for _, a := range agents {
+		if strings.EqualFold(a.Name, want) && a.TabID != "" {
+			return TabClose(a.TabID)
+		}
+	}
+	return nil
+}
