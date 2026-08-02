@@ -24,6 +24,10 @@ const (
 	ActionReview ForgeActionKind = "review"
 	// ActionDispatch: a builder lane is free — dispatch the next to-do card.
 	ActionDispatch ForgeActionKind = "dispatch"
+	// ActionRenudge: a builder reported done but FAILED the completion gate
+	// (herd verify) — re-drive it instead of routing garbage to review.
+	// FAC-116: an agent's "done" is only real once verify passes.
+	ActionRenudge ForgeActionKind = "renudge"
 	// ActionIdle: nothing to do right now.
 	ActionIdle ForgeActionKind = "idle"
 )
@@ -50,8 +54,12 @@ type LaneState struct {
 //  3. DISPATCH the next to-do card when a builder lane is free.
 //  4. IDLE.
 //
-// completed is the set of in-progress refs whose builder has called back done.
-func (e *Engine) ForgeStep(ctx context.Context, lanes LaneState, completed map[string]bool) (*ForgeAction, error) {
+// completed is the set of in-progress refs whose builder called back done;
+// verified is the subset that PASSED herd verify (real commits + build +
+// tests). A completed-but-unverified build is re-nudged, never reviewed —
+// this is the self-gate (FAC-116) that stops whiffed/stalled work from
+// reaching the reviewer.
+func (e *Engine) ForgeStep(ctx context.Context, lanes LaneState, completed, verified map[string]bool) (*ForgeAction, error) {
 	projectID := e.Config.TaskProvider.ProjectID
 
 	// 1. Approve in-review first — always finish before starting new work.
@@ -69,14 +77,24 @@ func (e *Engine) ForgeStep(ctx context.Context, lanes LaneState, completed map[s
 		if err != nil {
 			return nil, err
 		}
-		var done []*provider.Task
+		var ready, failed []*provider.Task
 		for _, t := range inProgress {
-			if completed[t.Ref] {
-				done = append(done, t)
+			if !completed[t.Ref] {
+				continue
+			}
+			if verified[t.Ref] {
+				ready = append(ready, t)
+			} else {
+				failed = append(failed, t)
 			}
 		}
-		if t := firstByPriority(done); t != nil {
+		// Verified builds go to review; unverified "done" builds get re-nudged
+		// (self-gate) — review only sees work that actually passed verify.
+		if t := firstByPriority(ready); t != nil {
 			return &ForgeAction{Kind: ActionReview, Ref: t.Ref, Task: t}, nil
+		}
+		if t := firstByPriority(failed); t != nil {
+			return &ForgeAction{Kind: ActionRenudge, Ref: t.Ref, Task: t}, nil
 		}
 	}
 
