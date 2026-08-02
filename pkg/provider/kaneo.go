@@ -130,11 +130,14 @@ func (k *KaneoProvider) ListTasks(ctx context.Context, projectID string, status 
 	}
 
 	if k.UseCLI {
-		// The server caps a page at 100 records regardless of --limit, so a
-		// single call silently hides everything past card 100 — including
-		// unclaimed to-do cards, which breaks pulse. Page until a short page.
+		// The server caps a page below the requested --limit and returns a
+		// SHORT full page (observed: 99 on a 100-card ask), so terminating on
+		// "fewer than pageSize" stops after page 1 and hides every later card
+		// — including FAC-106, which broke board-done and approve. Terminate
+		// only on an EMPTY page; dedupe by id in case page boundaries overlap.
 		const pageSize = 100
 		var all []kaneoTaskDTO
+		seen := map[string]bool{}
 		for page := 1; page <= 50; page++ { // ponytail: 5000-card ceiling, raise if a board ever gets there
 			args := []string{"task", "list", "--project", projectID, "--json",
 				"--limit", fmt.Sprint(pageSize), "--page", fmt.Sprint(page)}
@@ -151,8 +154,21 @@ func (k *KaneoProvider) ListTasks(ctx context.Context, projectID string, status 
 			if err := json.Unmarshal(out.Bytes(), &dtos); err != nil {
 				return nil, fmt.Errorf("parsing kaneo output (page %d): %w", page, err)
 			}
-			all = append(all, dtos...)
-			if len(dtos) < pageSize {
+			if len(dtos) == 0 {
+				break
+			}
+			fresh := 0
+			for _, d := range dtos {
+				if seen[d.ID] {
+					continue
+				}
+				seen[d.ID] = true
+				all = append(all, d)
+				fresh++
+			}
+			// A page that added nothing new means the server is repeating the
+			// last page (no more distinct records) — stop.
+			if fresh == 0 {
 				break
 			}
 		}
