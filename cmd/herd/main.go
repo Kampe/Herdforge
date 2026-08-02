@@ -219,7 +219,7 @@ lanes:
   - name: "worker"
     role: "worker"
     agent_kind: "opencode"
-    model: "deepseek-v4-flash"
+    model: "opencode/deepseek-v4-flash"
     prompt: ".herd/prompts/worker.md"
 
 verification:
@@ -273,7 +273,7 @@ lanes:
     prompt: ".herd/prompts/smith.md"
     worktree: ".worktrees/smith"
     provider: "deepseek"
-    model: "deepseek-v4-flash"
+    model: "opencode/deepseek-v4-flash"
 
   - name: "worker"
     role: "worker"
@@ -282,7 +282,7 @@ lanes:
     prompt: ".herd/prompts/worker.md"
     worktree: ".worktrees/worker"
     provider: "deepseek"
-    model: "deepseek-v4-flash"
+    model: "opencode/deepseek-v4-flash"
 
   - name: "reviewer"
     role: "reviewer"
@@ -291,7 +291,7 @@ lanes:
     prompt: ".herd/prompts/reviewer.md"
     worktree: ".worktrees/reviewer"
     provider: "deepseek"
-    model: "deepseek-v4-flash"
+    model: "opencode/deepseek-v4-flash"
 
 verification:
   test_command: "go test ./..."
@@ -1237,21 +1237,21 @@ func runSend() {
 		return
 	}
 
-	args := fs.Args()
-	if len(args) > 0 {
-		// allow flags after the positional target/text
-		fs.Parse(args[1:])
-		if rest := fs.Args(); len(rest) > 0 && *file == "" {
-			args = append(args[:1], rest...)
-		} else {
-			args = args[:1]
-		}
+	// Collect ALL positionals with flags interleaved anywhere: Go's flag
+	// package stops at the first positional, which let a trailing
+	// "--timeout 30" leak INTO the delivered prompt text.
+	var pos []string
+	rest := fs.Args()
+	for len(rest) > 0 {
+		pos = append(pos, rest[0])
+		fs.Parse(rest[1:])
+		rest = fs.Args()
 	}
-	if len(args) == 0 {
+	if len(pos) == 0 {
 		fmt.Fprintf(os.Stderr, "Usage: herd send <pane|name> \"<text>\" [--file path] [--no-verify] [--timeout s]\n")
 		os.Exit(2)
 	}
-	target := args[0]
+	target := pos[0]
 
 	var text string
 	switch {
@@ -1262,8 +1262,8 @@ func runSend() {
 			os.Exit(1)
 		}
 		text = strings.TrimSpace(string(data))
-	case len(args) > 1:
-		text = strings.Join(args[1:], " ")
+	case len(pos) > 1:
+		text = strings.Join(pos[1:], " ")
 	default:
 		fmt.Fprintf(os.Stderr, "herd send: no text given (positional or --file)\n")
 		os.Exit(2)
