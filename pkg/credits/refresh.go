@@ -2,6 +2,7 @@ package credits
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"math"
 	"os"
@@ -591,50 +592,104 @@ func (lc *LedgerCommands) Show() string {
 	return strings.Join(lines, "\n")
 }
 
+func normalizeProviderKey(surface string) string {
+	s := strings.ToLower(surface)
+	switch {
+	case strings.HasPrefix(s, "claude-5h"):
+		return "claude"
+	case strings.HasPrefix(s, "agy"):
+		return "antigravity"
+	default:
+		return s
+	}
+}
+
+type QuotaPool struct {
+	Key       string `json:"key"`
+	Used      *int   `json:"used"`
+	Remaining *int   `json:"remaining"`
+	ResetsIn  *int   `json:"resetsIn"`
+	Class     string `json:"class"`
+	Stale     bool   `json:"stale"`
+	Reason    string `json:"reason"`
+}
+
+type QuotaJSON struct {
+	Pools []QuotaPool `json:"pools"`
+}
+
+var quotaBinPath = func() string {
+	if q := os.Getenv("HERD_QUOTA_BIN"); q != "" {
+		return q
+	}
+	return "bin/herd-quota"
+}
+
 func (lc *LedgerCommands) Advise() string {
 	MaybeRefresh(lc.Ledger)
 
 	var out strings.Builder
 
-	now := NowEpoch()
+	// execute live quota bin
+	liveProviders := map[string]bool{}
+	liveOK := false
+
+	qBin := quotaBinPath()
+	cmd := exec.Command(qBin, "--json")
+	if liveOut, err := cmd.Output(); err == nil {
+		var qj QuotaJSON
+		if jsonErr := json.Unmarshal(liveOut, &qj); jsonErr == nil && qj.Pools != nil {
+			liveOK = true
+			for _, p := range qj.Pools {
+				if p.Key == "all" || p.Used == nil || p.Stale {
+					continue
+				}
+				if p.Reason != "ok" && p.Reason != "exhausted" {
+					continue
+				}
+				provider := normalizeProviderKey(p.Key)
+				liveProviders[provider] = true
+
+				rem := 0
+				if p.Remaining != nil {
+					rem = *p.Remaining
+				}
+				resets := 0
+				if p.ResetsIn != nil {
+					resets = *p.ResetsIn
+				}
+				out.WriteString(fmt.Sprintf("%s: %d%% used, %d remaining, %s class, resets in %d\n",
+					p.Key, *p.Used, rem, p.Class, resets))
+			}
+		}
+	}
+
+	if !liveOK {
+		out.WriteString("live quota unavailable (missing or malformed); falling back to ledger snapshots:\n")
+	}
+
+	// print ledger pace rows for surfaces without live coverage
 	surfaces := make([]string, 0)
 	for k := range lc.Ledger.All() {
 		surfaces = append(surfaces, k)
 	}
 	sort.Strings(surfaces)
 
-	fallbackFrom := ""
-	staleThreshold := int64(DefaultRefreshTTL) * 2
-	wrotePaceHeader := false
-
 	for _, s := range surfaces {
-		rec, err := lc.Ledger.Surface(s)
+		_, err := lc.Ledger.Surface(s)
 		if err != nil {
 			continue
 		}
-		if rec.UsedPct == 0 && rec.WindowDays == nil && len(rec.Accounts) == 0 && rec.Note == "" {
+		provider := normalizeProviderKey(s)
+		if liveProviders[provider] {
 			continue
 		}
-		if now-rec.Updated > staleThreshold {
-			continue
-		}
-
-		if !wrotePaceHeader {
-			out.WriteString("ledger quota snapshots (fallback when live quota unavailable):\n")
-			wrotePaceHeader = true
-		}
-		if fallbackFrom == "" {
-			fallbackFrom = s
-		}
-
 		out.WriteString(lc.Pace(s) + "\n")
 	}
 
-	if wrotePaceHeader {
-		out.WriteString("untracked surfaces: available; enter a snapshot when a quota UI or error is seen\n")
-		out.WriteString("Claude auth-account selection metadata (ledger, not routing quota):\n")
-		out.WriteString("  pool avg = sum(used)/N; pick by account headroom every launch (resets differ)\n")
-	}
+	out.WriteString("untracked surfaces: available; enter a snapshot when a quota UI or error is seen\n")
+	out.WriteString("Claude auth-account selection metadata (ledger, not routing quota):\n")
+	out.WriteString("  pool avg = sum(used)/N; pick by account headroom every launch (resets differ)\n")
 
 	active := ClaudeActiveEmail("")
 	if active == "" {
