@@ -2500,6 +2500,7 @@ func runProcess() {
 	procFlags := flag.NewFlagSet("process", flag.ExitOnError)
 	asJSON := procFlags.Bool("json", false, "Output JSON")
 	selftestFlag := procFlags.Bool("selftest", false, "Run process selftest and exit")
+	stalledFlag := procFlags.Bool("stalled", false, "Report stalled agents (done/idle with zero real commits)")
 	procFlags.Parse(os.Args[2:])
 
 	if *selftestFlag {
@@ -2509,6 +2510,14 @@ func runProcess() {
 		}
 		fmt.Println("process selftest: PASS")
 		return
+	}
+
+	if *stalledFlag {
+		// In full integration, this would call herdr.AgentList() and the
+		// real herdr CLI. For now, the selftest in the process package
+		// validates the logic via table-driven tests.
+		fmt.Fprintln(os.Stderr, "stalled: use herd process --selftest for validation; full herdr integration pending")
+		os.Exit(1)
 	}
 
 	// Read agent panes via herdr (simplified: show classify on sample text
