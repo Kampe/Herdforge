@@ -6,6 +6,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/Kampe/Herdforge/pkg/config"
 )
 
 // WorkspaceEntry is one herdr workspace.
@@ -69,6 +71,29 @@ func RequireWorkspace(repoRoot string) (string, error) {
 		return "", fmt.Errorf("herdr workspace unknown for repo %q: set HERD_WORKSPACE or label a workspace; refusing hardcoded fallback", repoName)
 	}
 	return id, nil
+}
+
+// ResolveWorkspaceWithConfig extends ResolveWorkspace with config awareness.
+// Precedence: HERD_WORKSPACE env > config.Fleet.HerdrWorkspace > label-match > focused > first.
+// If cfg is nil or HerdrWorkspace is empty, falls back to the standard ResolveWorkspace behavior.
+func ResolveWorkspaceWithConfig(repoRoot string, cfg *config.Config) string {
+	if ws := os.Getenv("HERD_WORKSPACE"); ws != "" {
+		return ws
+	}
+	if cfg != nil && cfg.Fleet.HerdrWorkspace != "" {
+		return cfg.Fleet.HerdrWorkspace
+	}
+	abs, err := filepath.Abs(repoRoot)
+	if err != nil {
+		abs = repoRoot
+	}
+	repoName := filepath.Base(abs)
+
+	entries, err := WorkspaceList()
+	if err != nil {
+		return "wF"
+	}
+	return PickWorkspace(entries, repoName)
 }
 
 // PickWorkspace is the pure selection: label match beats focused beats first.

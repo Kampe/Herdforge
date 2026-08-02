@@ -9,7 +9,10 @@ import (
 	"time"
 )
 
-const herdrCLI = "herdr"
+const (
+	herdrCLI       = "herdr"
+	herdforgeLabel = "Herdforge · "
+)
 
 // runHerdr is overridable for crash-point / unit tests (FAC-121).
 var runHerdr = runHerdrReal
@@ -38,6 +41,7 @@ type TabCreateOptions struct {
 
 // Tab creates a new tab in the specified workspace and returns the tab + root pane.
 // Legacy convenience without cwd — prefer TabCreate for write-capable agents.
+// Labels are auto-prefixed with "Herdforge · " when missing (FAC-141).
 func Tab(workspaceID, label string, noFocus bool) (*TabInfo, error) {
 	return TabCreate(TabCreateOptions{
 		Workspace: workspaceID,
@@ -49,10 +53,12 @@ func Tab(workspaceID, label string, noFocus bool) (*TabInfo, error) {
 // TabCreate creates a herdr tab with explicit workspace and optional cwd.
 // When Cwd is set it is passed as --cwd so the pane process starts there
 // (prompt "cd" is not isolation). Empty Workspace fails closed.
+// Labels lacking the "Herdforge · " prefix are auto-prefixed (FAC-141).
 func TabCreate(opts TabCreateOptions) (*TabInfo, error) {
 	if strings.TrimSpace(opts.Workspace) == "" {
 		return nil, fmt.Errorf("herdr tab create: workspace is required (no hardcoded fallback)")
 	}
+	opts.Label = EnsureHerdforgeLabel(opts.Label)
 	args := []string{"tab", "create", "--workspace", opts.Workspace, "--label", opts.Label}
 	if opts.Cwd != "" {
 		args = append(args, "--cwd", opts.Cwd)
@@ -212,6 +218,16 @@ func ResolveAgentTab(name string) (string, error) {
 		}
 	}
 	return "", fmt.Errorf("no standing agent named '%s' found", name)
+}
+
+// EnsureHerdforgeLabel prefixes the label with "Herdforge · " if it does not
+// already start with that prefix. HasPrefix (not Contains) is required so a
+// mid-string match such as "review of Herdforge · thing" still gets prefixed.
+func EnsureHerdforgeLabel(label string) string {
+	if strings.HasPrefix(label, herdforgeLabel) {
+		return label
+	}
+	return herdforgeLabel + label
 }
 
 func runHerdrReal(args ...string) (string, error) {
