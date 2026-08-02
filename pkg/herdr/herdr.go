@@ -77,15 +77,16 @@ func AgentStart(name, kind string, paneID string, agentArgs ...string) error {
 	}
 
 	output, err := runHerdr(args...)
+	// A freshly created tab's shell can take several seconds to become an
+	// available target on a loaded host (observed: dispatch launch failing
+	// with agent_pane_busy under swap pressure while the 1.5s retry gave up).
+	// Back off up to ~12s before failing.
+	for attempt := 0; err != nil && strings.Contains(string(output), "agent_pane_busy") && attempt < 6; attempt++ {
+		time.Sleep(2 * time.Second)
+		output, err = runHerdr(args...)
+	}
 	if err != nil {
-		// retry once on pane-busy
-		if strings.Contains(string(output), "agent_pane_busy") {
-			time.Sleep(1 * time.Second)
-			output, err = runHerdr(args...)
-		}
-		if err != nil {
-			return fmt.Errorf("herdr agent start: %s: %w", output, err)
-		}
+		return fmt.Errorf("herdr agent start: %s: %w", output, err)
 	}
 	return nil
 }

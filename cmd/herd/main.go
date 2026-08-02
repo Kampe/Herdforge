@@ -521,7 +521,7 @@ func runPulse() {
 		if err != nil {
 			// no standing agent — create a fresh one
 			tabLabel = fmt.Sprintf("pulse-%s-%s", lane.Name, task.Ref)
-			tab, err := herdr.Tab("wF", tabLabel, true)
+			tab, err := herdr.Tab(herdr.ResolveWorkspace("."), tabLabel, true)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "failed to create herdr tab: %v\n", err)
 				os.Exit(1)
@@ -868,7 +868,7 @@ func runStanding() {
 		tabLabel := fmt.Sprintf("forge-%s", lane.Name)
 		fmt.Printf("Launching lane '%s' as agent '%s' (kind=%s)...\n", lane.Name, tabLabel, lane.AgentKind)
 
-		tab, err := herdr.Tab("wF", tabLabel, true)
+		tab, err := herdr.Tab(herdr.ResolveWorkspace("."), tabLabel, true)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "  failed to create tab for lane %s: %v\n", lane.Name, err)
 			continue
@@ -921,7 +921,7 @@ func runUp() {
 	}
 
 	tabLabel := fmt.Sprintf("forge-%s", lane.Name)
-	tab, err := herdr.Tab("wF", tabLabel, true)
+	tab, err := herdr.Tab(herdr.ResolveWorkspace("."), tabLabel, true)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to create tab: %v\n", err)
 		os.Exit(1)
@@ -1116,7 +1116,7 @@ func runReview() {
 		tabLabel, err := herdr.ResolveAgentTab(standingName)
 		if err != nil {
 			tabLabel = fmt.Sprintf("review-%s-%s", lane.Name, task.Ref)
-			tab, tabErr := herdr.Tab("wF", tabLabel, true)
+			tab, tabErr := herdr.Tab(herdr.ResolveWorkspace("."), tabLabel, true)
 			if tabErr != nil {
 				fmt.Fprintf(os.Stderr, "failed to create herdr tab: %v\n", tabErr)
 				os.Exit(1)
@@ -1684,7 +1684,7 @@ func runForge() {
 				tabLabel, resolveErr := herdr.ResolveAgentTab(standingName)
 				if resolveErr != nil {
 					tabLabel = fmt.Sprintf("forge-%s-%s", lane.Name, task.Ref)
-					tab, tabErr := herdr.Tab("wF", tabLabel, true)
+					tab, tabErr := herdr.Tab(herdr.ResolveWorkspace("."), tabLabel, true)
 					if tabErr == nil {
 						herdr.AgentStart(tabLabel, lane.AgentKind, tab.Pane.ID, herdr.LaneAgentArgs(lane.Model)...)
 					}

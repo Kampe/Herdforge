@@ -136,7 +136,7 @@ func (d *Dispatcher) Dispatch(ctx context.Context, opts DispatchOptions) (*Dispa
 		if len(tabLabel) > 32 {
 			tabLabel = tabLabel[:32]
 		}
-		tab, err := herdr.Tab("wF", tabLabel, true)
+		tab, err := herdr.Tab(herdr.ResolveWorkspace("."), tabLabel, true)
 		if err != nil {
 			return result, fmt.Errorf("worktree ready but failed to launch agent: %w", err)
 		}
