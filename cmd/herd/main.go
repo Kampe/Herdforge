@@ -146,6 +146,9 @@ func main() {
 	case "throughput":
 		runThroughput()
 
+	case "worktrees":
+		runWorktrees()
+
 	case "overlap":
 		runOverlap()
 
@@ -212,6 +215,7 @@ func printUsage() {
 	fmt.Println("  unmerged        Authoritative cherry-based unmerged check (herd unmerged <path> | --all)")
 	fmt.Println("  lost            Find ownerless unmerged work on ANY branch (subject-based)")
 	fmt.Println("  throughput      Read-only fleet throughput KPIs from local evidence")
+	fmt.Println("  worktrees       Snapshot all worktree state + collision check")
 	fmt.Println("  overlap         Detect files/symbols edited together by 2+ unmerged branches")
 	fmt.Println("  attention       List agents needing coordinator eyes")
 	fmt.Println("  process         Classify harvest targets (herd-process digest)")
