@@ -4,6 +4,7 @@ import (
 	"errors"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/Kampe/Herdforge/pkg/outbox"
 )
@@ -118,7 +119,7 @@ func TestMachine_EnqueuesOutboxItemsAtomicallyWithTransition(t *testing.T) {
 		t.Fatalf("transition: %v", err)
 	}
 
-	pending, err := m.Outbox().Pending("provider", 10)
+	pending, err := m.Outbox().Pending("provider", 10, time.Now())
 	if err != nil {
 		t.Fatalf("pending: %v", err)
 	}

@@ -1,8 +1,10 @@
 package outbox
 
 import (
+	"errors"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func tempStore(t *testing.T) *Store {
@@ -40,24 +42,21 @@ func TestStore_EnqueueRequiresIdempotencyKeyAndKind(t *testing.T) {
 	}
 }
 
-func TestStore_DuplicateEnqueueIsIdempotentNoOp(t *testing.T) {
+func TestStore_DuplicateEnqueueWithIdenticalFieldsIsIdempotentNoOp(t *testing.T) {
 	s := tempStore(t)
 	first, err := s.Enqueue(Item{IdempotencyKey: "dup", TaskRef: "FAC-1", Kind: "herdr", Payload: "a"})
 	if err != nil {
 		t.Fatalf("enqueue: %v", err)
 	}
-	second, err := s.Enqueue(Item{IdempotencyKey: "dup", TaskRef: "FAC-1", Kind: "herdr", Payload: "b"})
+	second, err := s.Enqueue(Item{IdempotencyKey: "dup", TaskRef: "FAC-1", Kind: "herdr", Payload: "a"})
 	if err != nil {
-		t.Fatalf("re-enqueue: %v", err)
+		t.Fatalf("re-enqueue with identical fields: %v", err)
 	}
 	if second.ID != first.ID {
 		t.Errorf("expected replay to return the original item id %d, got %d", first.ID, second.ID)
 	}
-	if second.Payload != "a" {
-		t.Errorf("expected original payload to survive replay, got %q", second.Payload)
-	}
 
-	pending, err := s.Pending("", 10)
+	pending, err := s.Pending("", 10, time.Now())
 	if err != nil {
 		t.Fatalf("pending: %v", err)
 	}
@@ -66,12 +65,51 @@ func TestStore_DuplicateEnqueueIsIdempotentNoOp(t *testing.T) {
 	}
 }
 
+func TestStore_DuplicateEnqueueWithDifferentPayloadFailsClosed(t *testing.T) {
+	s := tempStore(t)
+	original, err := s.Enqueue(Item{IdempotencyKey: "dup", TaskRef: "FAC-1", Kind: "herdr", Payload: "a"})
+	if err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	_, err = s.Enqueue(Item{IdempotencyKey: "dup", TaskRef: "FAC-1", Kind: "herdr", Payload: "b"})
+	if !errors.Is(err, ErrIdempotencyConflict) {
+		t.Fatalf("expected ErrIdempotencyConflict for a differing payload, got %v", err)
+	}
+
+	got, _ := s.Get(original.ID)
+	if got.Payload != "a" {
+		t.Errorf("expected original payload to survive a rejected reuse, got %q", got.Payload)
+	}
+}
+
+func TestStore_DuplicateEnqueueWithDifferentTaskRefFailsClosed(t *testing.T) {
+	s := tempStore(t)
+	if _, err := s.Enqueue(Item{IdempotencyKey: "dup", TaskRef: "FAC-1", Kind: "herdr"}); err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	_, err := s.Enqueue(Item{IdempotencyKey: "dup", TaskRef: "FAC-2", Kind: "herdr"})
+	if !errors.Is(err, ErrIdempotencyConflict) {
+		t.Fatalf("expected ErrIdempotencyConflict for a differing task_ref, got %v", err)
+	}
+}
+
+func TestStore_DuplicateEnqueueWithDifferentKindFailsClosed(t *testing.T) {
+	s := tempStore(t)
+	if _, err := s.Enqueue(Item{IdempotencyKey: "dup", TaskRef: "FAC-1", Kind: "herdr"}); err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	_, err := s.Enqueue(Item{IdempotencyKey: "dup", TaskRef: "FAC-1", Kind: "git"})
+	if !errors.Is(err, ErrIdempotencyConflict) {
+		t.Fatalf("expected ErrIdempotencyConflict for a differing kind, got %v", err)
+	}
+}
+
 func TestStore_PendingFiltersByKind(t *testing.T) {
 	s := tempStore(t)
 	s.Enqueue(Item{IdempotencyKey: "k1", TaskRef: "FAC-1", Kind: "herdr"})
 	s.Enqueue(Item{IdempotencyKey: "k2", TaskRef: "FAC-1", Kind: "git"})
 
-	herdrOnly, err := s.Pending("herdr", 10)
+	herdrOnly, err := s.Pending("herdr", 10, time.Now())
 	if err != nil {
 		t.Fatalf("pending: %v", err)
 	}
@@ -79,7 +117,7 @@ func TestStore_PendingFiltersByKind(t *testing.T) {
 		t.Errorf("expected 1 herdr item, got %+v", herdrOnly)
 	}
 
-	all, err := s.Pending("", 10)
+	all, err := s.Pending("", 10, time.Now())
 	if err != nil {
 		t.Fatalf("pending: %v", err)
 	}
@@ -88,47 +126,102 @@ func TestStore_PendingFiltersByKind(t *testing.T) {
 	}
 }
 
-func TestStore_MarkSentRemovesFromPending(t *testing.T) {
+func TestStore_ClaimIsExclusive(t *testing.T) {
 	s := tempStore(t)
 	item, _ := s.Enqueue(Item{IdempotencyKey: "k1", TaskRef: "FAC-1", Kind: "herdr"})
-	if err := s.MarkSent(item.ID); err != nil {
-		t.Fatalf("mark sent: %v", err)
+
+	first, err := s.Claim(item.ID)
+	if err != nil {
+		t.Fatalf("first claim: %v", err)
 	}
-	pending, _ := s.Pending("", 10)
+	if first.Status != StatusInFlight {
+		t.Errorf("expected in_flight after claim, got %s", first.Status)
+	}
+
+	_, err = s.Claim(item.ID)
+	if !errors.Is(err, ErrNotClaimable) {
+		t.Fatalf("expected second concurrent claim to fail with ErrNotClaimable, got %v", err)
+	}
+
+	pending, _ := s.Pending("", 10, time.Now())
 	if len(pending) != 0 {
-		t.Errorf("expected 0 pending items after mark sent, got %d", len(pending))
+		t.Errorf("expected claimed item to disappear from Pending, got %d", len(pending))
 	}
 }
 
-func TestStore_MarkFailedIncrementsAttemptsAndRecordsError(t *testing.T) {
+func TestStore_ClaimUnknownOrAlreadyResolvedItemFails(t *testing.T) {
+	s := tempStore(t)
+	if _, err := s.Claim(999); !errors.Is(err, ErrNotClaimable) {
+		t.Fatalf("expected ErrNotClaimable for unknown id, got %v", err)
+	}
+}
+
+func TestStore_MarkSentRequiresInFlight(t *testing.T) {
 	s := tempStore(t)
 	item, _ := s.Enqueue(Item{IdempotencyKey: "k1", TaskRef: "FAC-1", Kind: "herdr"})
-	if err := s.MarkFailed(item.ID, "boom", 5); err != nil {
+
+	if err := s.MarkSent(item.ID); !errors.Is(err, ErrNotInFlight) {
+		t.Fatalf("expected ErrNotInFlight for a still-pending item, got %v", err)
+	}
+
+	claimed, _ := s.Claim(item.ID)
+	if err := s.MarkSent(claimed.ID); err != nil {
+		t.Fatalf("mark sent after claim: %v", err)
+	}
+	got, _ := s.Get(item.ID)
+	if got.Status != StatusSent {
+		t.Errorf("expected sent, got %s", got.Status)
+	}
+
+	if err := s.MarkSent(item.ID); !errors.Is(err, ErrNotInFlight) {
+		t.Fatalf("expected double mark-sent to fail closed, got %v", err)
+	}
+}
+
+func TestStore_MarkFailedRequiresInFlightAndIncrementsAttempts(t *testing.T) {
+	s := tempStore(t)
+	item, _ := s.Enqueue(Item{IdempotencyKey: "k1", TaskRef: "FAC-1", Kind: "herdr"})
+
+	if err := s.MarkFailed(item.ID, "boom", 5); !errors.Is(err, ErrNotInFlight) {
+		t.Fatalf("expected ErrNotInFlight for a still-pending item, got %v", err)
+	}
+
+	claimed, _ := s.Claim(item.ID)
+	if err := s.MarkFailed(claimed.ID, "boom", 5); err != nil {
 		t.Fatalf("mark failed: %v", err)
 	}
-	pending, _ := s.Pending("", 10)
-	if len(pending) != 1 {
-		t.Fatalf("expected item to remain pending under max attempts, got %d pending", len(pending))
+	got, _ := s.Get(item.ID)
+	if got.Attempts != 1 {
+		t.Errorf("expected attempts=1, got %d", got.Attempts)
 	}
-	if pending[0].Attempts != 1 {
-		t.Errorf("expected attempts=1, got %d", pending[0].Attempts)
+	if got.LastError != "boom" {
+		t.Errorf("expected last_error=boom, got %q", got.LastError)
 	}
-	if pending[0].LastError != "boom" {
-		t.Errorf("expected last_error=boom, got %q", pending[0].LastError)
+	if got.Status != StatusPending {
+		t.Errorf("expected status back to pending under max attempts, got %s", got.Status)
+	}
+	if got.NextAttemptAt == nil {
+		t.Fatal("expected next_attempt_at to be set on a retryable failure")
 	}
 }
 
 func TestStore_MarkFailedGivesUpAtMaxAttempts(t *testing.T) {
 	s := tempStore(t)
 	item, _ := s.Enqueue(Item{IdempotencyKey: "k1", TaskRef: "FAC-1", Kind: "herdr"})
+
 	for i := 0; i < 3; i++ {
-		if err := s.MarkFailed(item.ID, "boom", 3); err != nil {
-			t.Fatalf("mark failed: %v", err)
+		claimed, err := s.Claim(item.ID)
+		if err != nil {
+			t.Fatalf("claim attempt %d: %v", i, err)
+		}
+		if err := s.MarkFailed(claimed.ID, "boom", 3); err != nil {
+			t.Fatalf("mark failed attempt %d: %v", i, err)
 		}
 	}
-	pending, _ := s.Pending("", 10)
+
+	pending, _ := s.Pending("", 10, time.Now().Add(time.Hour))
 	if len(pending) != 0 {
-		t.Fatalf("expected item to leave pending queue after max attempts, got %d", len(pending))
+		t.Fatalf("expected item to leave the pending pool after max attempts, got %d", len(pending))
 	}
 	got, err := s.Get(item.ID)
 	if err != nil {
@@ -136,6 +229,46 @@ func TestStore_MarkFailedGivesUpAtMaxAttempts(t *testing.T) {
 	}
 	if got.Status != StatusFailed {
 		t.Errorf("expected status=failed after exhausting attempts, got %s", got.Status)
+	}
+	if got.NextAttemptAt != nil {
+		t.Errorf("expected no next_attempt_at once terminally failed, got %v", got.NextAttemptAt)
+	}
+}
+
+func TestStore_PendingExcludesItemsBeforeNextAttempt(t *testing.T) {
+	s := tempStore(t)
+	item, _ := s.Enqueue(Item{IdempotencyKey: "k1", TaskRef: "FAC-1", Kind: "herdr"})
+	claimed, _ := s.Claim(item.ID)
+	if err := s.MarkFailed(claimed.ID, "boom", 10); err != nil {
+		t.Fatalf("mark failed: %v", err)
+	}
+
+	tooSoon, err := s.Pending("", 10, time.Now())
+	if err != nil {
+		t.Fatalf("pending: %v", err)
+	}
+	if len(tooSoon) != 0 {
+		t.Fatalf("expected backoff to exclude the item immediately after failure, got %d", len(tooSoon))
+	}
+
+	due, err := s.Pending("", 10, time.Now().Add(time.Hour))
+	if err != nil {
+		t.Fatalf("pending: %v", err)
+	}
+	if len(due) != 1 {
+		t.Fatalf("expected the item to become due after its backoff elapses, got %d", len(due))
+	}
+}
+
+func TestStore_BackoffIsBoundedAndIncreasing(t *testing.T) {
+	d1 := nextAttemptDelay(1)
+	d2 := nextAttemptDelay(2)
+	d3 := nextAttemptDelay(10)
+	if d2 <= d1 {
+		t.Errorf("expected backoff to increase: attempt1=%v attempt2=%v", d1, d2)
+	}
+	if d3 > maxBackoff {
+		t.Errorf("expected backoff to stay bounded at %v, got %v for a large attempt count", maxBackoff, d3)
 	}
 }
 
@@ -152,8 +285,27 @@ func TestStore_EnqueueTxSharesTransactionWithCaller(t *testing.T) {
 	// Roll back: the item must never have been durably committed.
 	tx.Rollback()
 
-	pending, _ := s.Pending("", 10)
+	pending, _ := s.Pending("", 10, time.Now())
 	if len(pending) != 0 {
 		t.Errorf("expected rollback to discard the enqueued item, got %d pending", len(pending))
+	}
+}
+
+func TestStore_AppliesSQLiteConcurrencyContract(t *testing.T) {
+	s := tempStore(t)
+	var journalMode string
+	if err := s.DB().QueryRow("PRAGMA journal_mode").Scan(&journalMode); err != nil {
+		t.Fatalf("query journal_mode: %v", err)
+	}
+	if journalMode != "wal" {
+		t.Errorf("expected journal_mode=wal, got %s", journalMode)
+	}
+
+	var busyTimeout int
+	if err := s.DB().QueryRow("PRAGMA busy_timeout").Scan(&busyTimeout); err != nil {
+		t.Fatalf("query busy_timeout: %v", err)
+	}
+	if busyTimeout != sqliteBusyTimeoutMillis {
+		t.Errorf("expected busy_timeout=%d, got %d", sqliteBusyTimeoutMillis, busyTimeout)
 	}
 }
