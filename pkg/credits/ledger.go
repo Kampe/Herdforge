@@ -105,6 +105,14 @@ func EffectiveUsed(rec Record) float64 {
 	return float64(rec.UsedPct)
 }
 
+func PoolEffectiveCapped(rec Record) int {
+	eff := EffectiveUsed(rec)
+	if len(rec.Accounts) > 0 && eff > 94 {
+		return 94
+	}
+	return int(math.Round(eff))
+}
+
 func PoolNote(rec Record) string {
 	if len(rec.Accounts) == 0 {
 		return rec.Note
@@ -118,6 +126,23 @@ func PoolNote(rec Record) string {
 	note := fmt.Sprintf("multi-account pool N=%d effective=%.1f%%", len(rec.Accounts), effTrunc)
 	if rec.Note != "" {
 		note += "; " + rec.Note
+	}
+	return note
+}
+
+func BuildPoolNote(accounts []AccountRow, callerNote string) string {
+	if len(accounts) == 0 {
+		return callerNote
+	}
+	sum := 0.0
+	for _, a := range accounts {
+		sum += float64(a.UsedPct)
+	}
+	eff := sum / float64(len(accounts))
+	effTrunc := math.Floor(eff*10) / 10
+	note := fmt.Sprintf("multi-account pool N=%d effective=%.1f%%", len(accounts), effTrunc)
+	if callerNote != "" {
+		note += "; " + callerNote
 	}
 	return note
 }

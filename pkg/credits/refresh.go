@@ -195,7 +195,7 @@ func Refresh(ledger *Ledger, surface string, budget5h, budgetWeekly, ttl int, em
 			rec.Updated = NowEpoch()
 			rec.Source = "ccusage"
 		}
-		rec.Note = PoolNote(rec)
+		rec.Note = BuildPoolNote(rec.Accounts, "ccusage")
 		data[surface] = rec
 	})
 
@@ -330,7 +330,7 @@ func (lc *LedgerCommands) AccountSet(surface, email string, used, burnOrder int,
 			existing.UsedPct = existing.Accounts[0].UsedPct
 		}
 
-		existing.Note = note
+		existing.Note = BuildPoolNote(existing.Accounts, note)
 		data[surface] = existing
 	})
 
@@ -410,13 +410,13 @@ func (lc *LedgerCommands) Pace(surface string) string {
 		return fmt.Sprintf("%s: untracked (treat as available; watch panes for quota errors)", surface)
 	}
 
-	used := EffectiveUsed(rec)
+	nAcct := len(rec.Accounts)
+	usedI := PoolEffectiveCapped(rec)
 
 	if rec.WindowDays == nil {
 		return fmt.Sprintf("%s: exhausted -> concurrency 0", surface)
 	}
 
-	usedI := int(math.Round(used))
 	window := *rec.WindowDays
 	left := 0
 	if rec.DaysLeft != nil {
@@ -430,7 +430,6 @@ func (lc *LedgerCommands) Pace(surface string) string {
 	}
 
 	cls := PaceClassOf(usedI, elapsed, floorPct)
-	nAcct := len(rec.Accounts)
 
 	if nAcct > 0 {
 		out := fmt.Sprintf("%s: effective %d%% of %dx100%% pool, %d%% window elapsed -> %s -> concurrency %d",
@@ -438,24 +437,35 @@ func (lc *LedgerCommands) Pace(surface string) string {
 
 		SortAccountsByBurnOrder(rec.Accounts)
 		for _, a := range rec.Accounts {
-			out += fmt.Sprintf("\n  burn#%d %s used=%d%%", a.BurnOrder, a.Email, a.UsedPct)
+			until := ""
+			if a.ExhaustedUntil > NowEpoch() {
+				until = " [HOURLY-DEAD]"
+			}
+			out += fmt.Sprintf("\n  burn#%d %s used=%d%%%s", a.BurnOrder, a.Email, a.UsedPct, until)
 		}
 
-		var primary, reserve string
+		// primary = burn-order-1; check exhaustion and pause
+		var primary, reserve AccountRow
 		for _, a := range rec.Accounts {
-			if a.UsedPct >= 95 && primary == "" {
-				primary = a.Email
+			if a.BurnOrder == 1 || (a.BurnOrder == 0 && primary.Email == "") {
+				primary = a
 			}
 		}
 		for _, a := range rec.Accounts {
-			if a.UsedPct < 95 && reserve == "" {
-				reserve = a.Email
+			if a.Email != primary.Email && reserve.Email == "" {
+				reserve = a
 			}
 		}
 
-		if primary != "" && reserve != "" {
-			want := ClaudeEmailToAccount(reserve)
-			out += fmt.Sprintf("\n  SWITCH_AUTH: primary %s exhausted; reserve %s has headroom", primary, reserve)
+		primaryExhausted := primary.UsedPct >= 95 || primary.ExhaustedUntil > NowEpoch()
+		primaryPaused := strings.Contains(primary.Note, "PAUSED") || strings.Contains(primary.Note, "do-not-dispatch")
+
+		if primaryPaused {
+			out += fmt.Sprintf("\n  PAUSED: primary burn#%d %s is paused (note: %s)", primary.BurnOrder, primary.Email, primary.Note)
+		}
+		if primaryExhausted && reserve.Email != "" {
+			want := ClaudeEmailToAccount(reserve.Email)
+			out += fmt.Sprintf("\n  SWITCH_AUTH: primary %s exhausted; reserve %s has headroom", primary.Email, reserve.Email)
 			out += fmt.Sprintf("\n  ACTION: claude-account use %s", want)
 			out += "\n  (or: bin/herd-route --auto-swap-auth  when no claude session is mid-task)"
 		}
