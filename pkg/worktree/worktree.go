@@ -140,6 +140,19 @@ func (w *WorktreeManager) CreateTaskWorktree(ctx context.Context, taskRef string
 		return nil, fmt.Errorf("failed to create git worktree: %v, output: %s", err, string(output))
 	}
 
+	// Anchor commit (FAC-106): a lane's branch must carry at least one commit
+	// the moment it exists. `git worktree remove` and `git clean -fdx` of the
+	// gitignored worktree path both delete the WORKING TREE but never the
+	// branch or its commits, so any work an agent commits survives a reap — the
+	// cost of a stray reap drops to one `git worktree add <branch>`. An
+	// anchoring empty commit guarantees the branch is restorable even before
+	// the agent's first real commit lands. Best-effort: a failure here must not
+	// block the dispatch.
+	anchor := execCommandContext(ctx, "git", "-C", targetPath,
+		"commit", "--allow-empty", "-q", "-m",
+		fmt.Sprintf("chore: anchor %s worktree (FAC-106 reap-safe)", strings.ToUpper(taskRef)))
+	_ = anchor.Run()
+
 	return &WorktreeInfo{
 		Path:   targetPath,
 		Branch: branch,
