@@ -1,0 +1,150 @@
+{
+  "version": 1,
+  "note": "Herdforge lane registry: constraint sections are VERBATIM from chainseer docs/agent/lane-registry.json (the parity contract for the shell->Go swap); lanes[] is this repo standing roster (forge-smith, worker, reviewer). herd resolve-lane resolves provider+model+effort from live quota via pkg/router (herd-route port) plus these constraints. Deterministic, no LLM calls.",
+  "provider_constraints": {
+    "claude-haiku-4-5": {
+      "forbid_standing": true,
+      "floor_to": "claude-sonnet-5",
+      "reason": "claude-haiku silently launches in permission-mode default not auto, so a standing lane prompts the operator on every Bash (measured 2026-07-24 on docs-custodian: its session permissionMode never left default while every sonnet/opus lane held auto). Never route haiku to a standing/autonomous lane; floor a claude standing lane to sonnet."
+    },
+    "codex": {
+      "headless_ok": true,
+      "reason": "VERIFIED 2026-07-26: codex exec runs non-interactively (reads the prompt from argv or stdin) and `codex --model M -a never PROMPT` runs an autonomous lane with approvals disabled. codex already drives 6+ standing lanes today. The historical interactive-only rule is retired; codex is a first-class headless surface."
+    },
+    "opencode": {
+      "banned": false,
+      "forbid_backend": "lazer",
+      "reason": "operator 2026-07-28 supersedes the 2026-07-20 blanket ban: opencode is a FIRST-CLASS harness whatever LLM sits behind it. The 2026-07-20 rule was aimed at the lazer backend, not at opencode, and got recorded on the harness by mistake; `lazer` already carries last_resort under its own entry, and no code ever read this flag, so the ban was prose. What actually made opencode look second-class was two defects, both now fixed: (1) litellm's native `ollama/` adapter emulates tool calls by prompt injection and cannot parse them mid-stream, so a streaming lane emitted tool JSON as prose and harvested no artifacts, fixed in kluster 916815fc by routing all 19 entries through `openai/` + /v1; (2) the herdr state plugin mapped opencode's teardown `session.error` to `blocked`, so a run that finished clean reported a failure to the operator. Route opencode on any backend except lazer, which stays last_resort."
+    },
+    "lazer": {
+      "last_resort": true,
+      "reason": "absolute last resort for every task shape (operator 2026-07-20 / CHA-206). herd-route already enforces this: any healthy or even cap-blocked non-lazer surface wins over lazer. Encoded here so the registry is a complete record of the rule."
+    },
+    "agy": {
+      "default_pool": "gemini",
+      "reason": "the agy Claude pool is shallow and the agy Gemini Pro/Flash pool is deep; default agy work to Gemini. bin/herd-route model_for already selects gemini-* for every agy shape except architecture; the constraint records why."
+    }
+  },
+  "advisory_models": {
+    "opencode/deepseek-v4-pro": {
+      "family": "deepseek",
+      "persistent_agents": false,
+      "tool_execution": "not_verified",
+      "shape": "advisory",
+      "reason": "Direct OpenCode catalog model is reserved for text analysis until an artifact probe proves real tool execution."
+    },
+    "opencode/deepseek-v4-flash": {
+      "family": "deepseek",
+      "persistent_agents": false,
+      "tool_execution": "not_verified",
+      "shape": "bounded",
+      "reason": "Cheap DeepSeek Flash advisory route; never assign to a write-capable pane without a passing artifact probe."
+    },
+    "opencode/kimi-k3": {
+      "family": "moonshot",
+      "persistent_agents": false,
+      "tool_execution": "not_verified",
+      "shape": "qa-light",
+      "reason": "Independent Kimi critique route; persistent agent use remains fail-closed pending artifact evidence."
+    }
+  },
+  "network_capability": {
+    "note": "Whether a provider can reach the network in a given execution MODE. bin/herd-shot runs codex via `codex exec -s read-only|workspace-write`, whose sandbox disables networking by default, so a codex SHOT cannot fetch anything (verified 2026-07-26: a luna/codex research shot ran read-only with no network and honestly refused). The other providers run their real CLI with network. A task shape in shapes_requiring_network must route only to a surface that is network-capable in the current mode. This gates SHOTS: an interactive codex PANE (bin/herd-standing) keeps network and is unaffected, which is why the standing resolver does not filter on this.",
+    "shapes_requiring_network": [
+      "research",
+      "advisory"
+    ],
+    "providers": {
+      "claude": {
+        "network": true
+      },
+      "grok": {
+        "network": true
+      },
+      "agy": {
+        "network": true
+      },
+      "ollama": {
+        "network": true
+      },
+      "opencode": {
+        "network": true
+      },
+      "lazer": {
+        "network": true
+      },
+      "codex": {
+        "network": true,
+        "sandboxed_exec_network": false,
+        "reason": "codex exec (how herd-shot runs codex) sandboxes the process with networking disabled by default under both -s read-only and -s workspace-write; a shot cannot fetch. codex in an interactive pane keeps network, so this only excludes codex from network-requiring SHOTS."
+      }
+    }
+  },
+  "output_validation": {
+    "note": "A shot's exit code must not lie. A research or schema (structured) shot that returns rc=0 with an empty body, a one-line preamble, or non-JSON where JSON was required has produced garbage; bin/herd-shot validates output non-triviality for these shapes, rejects garbage (rc nonzero), and reroutes ONCE to the next eligible provider before failing. Evidence 2026-07-26: a grok research shot returned rc=0 with a one-line preamble and no report.",
+    "shapes_requiring_report": [
+      "research",
+      "advisory"
+    ],
+    "min_report_chars": 200
+  },
+  "risk_classes": {
+    "standard": {
+      "cost_tier": "market",
+      "reason": "quota-aware waterfall on the declared route_shape; no provider pin and no model floor. A soft `prefer` (if the lane declares one) is tried first and falls back to the waterfall. cost_tier is an ENFORCED CEILING (CHA-894), not a description of the pick: a lane whose waterfall choice exceeds it is demoted to the best in-tier model for its provider, and where a model_pin or a model_floor_class forbids that, it escalates with an explicit cost_ceiling reason recorded in the resolved payload. Silent escalation is impossible."
+    },
+    "deep-reasoning": {
+      "provider_pin": "claude",
+      "model_pin": "claude-opus-5",
+      "effort_floor": "high",
+      "cost_tier": "premium",
+      "reason": "board-ranking leverage and control-plane edits (scout-planner, herd-smith): operator 2026-07-21 pins these to native Claude on the otherwise mostly-idle Opus pool, with a high effort floor so a bounded shape does not undercut the judgment depth. The claude pin is dropped under HERD_NO_CLAUDE so a spent pool cannot strand the lane. cost_tier is an ENFORCED CEILING (CHA-894), not a description of the pick: a lane whose waterfall choice exceeds it is demoted to the best in-tier model for its provider, and where a model_pin or a model_floor_class forbids that, it escalates with an explicit cost_ceiling reason recorded in the resolved payload. Silent escalation is impossible."
+    },
+    "fixture-critical": {
+      "model_floor_class": "sonnet",
+      "byte_replay_review_off_claude": true,
+      "cost_tier": "market",
+      "reason": "fixtures-first / identifier-discipline load-bearing work (invariant 8). Floors at Sonnet-class or better so a cheap mechanical model never captures fixtures, and because one provider-model (luna/gpt) has a recorded fixture-fabrication incident (2026-07-23), a route to any non-Claude provider raises byte_replay_review so the coordinator re-verifies the captured bytes at harvest. cost_tier is an ENFORCED CEILING (CHA-894), not a description of the pick: a lane whose waterfall choice exceeds it is demoted to the best in-tier model for its provider, and where a model_pin or a model_floor_class forbids that, it escalates with an explicit cost_ceiling reason recorded in the resolved payload. Silent escalation is impossible."
+    },
+    "fixture-critical-pinned": {
+      "provider_pin": "claude",
+      "model_floor_class": "sonnet",
+      "cost_tier": "market",
+      "reason": "as fixture-critical, but hard-pinned to native Claude (preserves defi-crusader's historical claude pin so nothing regresses). Under HERD_NO_CLAUDE the pin drops and it behaves as fixture-critical. cost_tier is an ENFORCED CEILING (CHA-894), not a description of the pick: a lane whose waterfall choice exceeds it is demoted to the best in-tier model for its provider, and where a model_pin or a model_floor_class forbids that, it escalates with an explicit cost_ceiling reason recorded in the resolved payload. Silent escalation is impossible."
+    },
+    "orchestrator": {
+      "provider_allow": [
+        "codex",
+        "claude"
+      ],
+      "cost_tier": "premium",
+      "reason": "coordinator control plane runs on Codex SOL or native Claude Fable 5 only at medium effort (herd-route coordinator shape already limits the candidate set to codex|claude). Not used by a standing lane; recorded so the registry documents the whole routing surface. bin/herd-up owns this shape. cost_tier is an ENFORCED CEILING (CHA-894), not a description of the pick: a lane whose waterfall choice exceeds it is demoted to the best in-tier model for its provider, and where a model_pin or a model_floor_class forbids that, it escalates with an explicit cost_ceiling reason recorded in the resolved payload. Silent escalation is impossible."
+    }
+  },
+  "lanes": [
+    {
+      "id": "forge-smith",
+      "packet": ".herd/prompts/smith.md",
+      "role": "forge-smith",
+      "route_shape": "implementation",
+      "risk_class": "deep-reasoning",
+      "prefer": null
+    },
+    {
+      "id": "worker",
+      "packet": ".herd/prompts/worker.md",
+      "role": "worker",
+      "route_shape": "implementation",
+      "risk_class": "standard",
+      "prefer": null
+    },
+    {
+      "id": "reviewer",
+      "packet": ".herd/prompts/reviewer.md",
+      "role": "reviewer",
+      "route_shape": "qa",
+      "risk_class": "standard",
+      "prefer": null
+    }
+  ]
+}

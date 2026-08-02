@@ -123,6 +123,9 @@ func main() {
 	case "resolve-lane":
 		runResolveLane()
 
+	case "route":
+		runRoute()
+
 	case "kick":
 		runKick()
 
@@ -164,6 +167,7 @@ func printUsage() {
 	fmt.Println("  attention       List agents needing coordinator eyes")
 	fmt.Println("  process         Classify harvest targets (herd-process digest)")
 	fmt.Println("  resolve-lane    Resolve a lane to concrete provider+model (deterministic)")
+	fmt.Println("  route           Pick the healthy execution surface for a task shape")
 	fmt.Println("  kick            Re-engage standing or named agent lanes")
 	fmt.Println("  attention       List standing agents needing coordinator eyes (triage)")
 	fmt.Println("  lifecycle       Observe and act on fleet state via lifecycle engine")
@@ -1698,6 +1702,73 @@ func runProcess() {
 	fmt.Println("  Usage: herd process [--json] [--selftest]")
 }
 
+// liveScorer backs lane resolution with the real herd-route port over live
+// openusage quota — the same decision core the zsh fleet uses.
+func liveScorer() resolve.RouteScorer {
+	e := usage.NewQuotaEngine()
+	computed := map[string]usage.BurnState{}
+	if snap, err := usage.FetchSnapshot(); err == nil {
+		computed = e.ComputeAll(snap)
+	} else {
+		fmt.Fprintf(os.Stderr, "resolve-lane: WARN live quota unavailable (%v); routing on availability only\n", err)
+	}
+	sr := router.NewRouter(e, computed)
+	return &resolve.DefaultAdapter{
+		ScoreFn: func(shape string, preferProvider string) *resolve.RouteScore {
+			rt, err := sr.Pick(shape, preferProvider, "")
+			if err != nil {
+				return nil
+			}
+			return &resolve.RouteScore{
+				Provider:        rt.Provider,
+				Model:           rt.Model,
+				Effort:          rt.Effort,
+				QuotaPool:       rt.QuotaPool,
+				LazerLastResort: rt.LazerLastResort,
+			}
+		},
+	}
+}
+
+// runRoute is the herd-route CLI: pick a surface for a task shape.
+func runRoute() {
+	fs := flag.NewFlagSet("route", flag.ExitOnError)
+	provider := fs.String("provider", "", "Pin the candidate set to one provider")
+	excludeFamily := fs.String("exclude-family", "", "Exclude a model family (e.g. anthropic)")
+	wantJSON := fs.Bool("json", false, "Output the full route JSON")
+	fs.Parse(os.Args[2:])
+
+	shape := fs.Arg(0)
+	if len(fs.Args()) > 1 {
+		fs.Parse(fs.Args()[1:]) // allow flags after the positional shape
+	}
+	if shape == "" {
+		fmt.Fprintf(os.Stderr, "Usage: herd route <shape> [--provider P] [--exclude-family F] [--json]\n")
+		fmt.Fprintf(os.Stderr, "Shapes: coordinator, architecture, implementation, research, bounded, advisory, qa-light, qa, adversarial\n")
+		os.Exit(2)
+	}
+
+	e := usage.NewQuotaEngine()
+	computed := map[string]usage.BurnState{}
+	if snap, err := usage.FetchSnapshot(); err == nil {
+		computed = e.ComputeAll(snap)
+	}
+	sr := router.NewRouter(e, computed)
+
+	rt, err := sr.Pick(shape, *provider, *excludeFamily)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "herd route: %v\n", err)
+		os.Exit(1)
+	}
+	if *wantJSON {
+		json.NewEncoder(os.Stdout).Encode(rt)
+		return
+	}
+	fmt.Printf("%s\t%s\t%s\t%s\tpool=%s\tpressure=%d\n",
+		rt.Provider, rt.Model, rt.Effort, rt.Family, rt.QuotaPool, rt.QuotaPressure)
+	fmt.Fprintf(os.Stderr, "%s\n", rt.Reason)
+}
+
 func runResolveLane() {
 	resolveFlags := flag.NewFlagSet("resolve-lane", flag.ExitOnError)
 	all := resolveFlags.Bool("all", false, "Resolve every lane in registry order")
@@ -1758,44 +1829,7 @@ func runResolveLane() {
 		return
 	}
 
-	// Build scorer
-	now := time.Now()
-	scorer := &resolve.DefaultAdapter{
-		ScoreFn: func(shape string, preferProvider string) *resolve.RouteScore {
-			candidates := []struct {
-				name   string
-				model  string
-				effort string
-				until  time.Time
-			}{
-				{"opencode", "deepseek-v4-flash", "medium", time.Time{}},
-			}
-			if preferProvider != "" {
-				for _, c := range candidates {
-					if strings.EqualFold(c.name, preferProvider) && now.After(c.until) {
-						return &resolve.RouteScore{
-							Provider: preferProvider,
-							Model:    c.model,
-							Effort:   c.effort,
-						}
-					}
-				}
-				return nil
-			}
-			for _, c := range candidates {
-				if now.After(c.until) {
-					return &resolve.RouteScore{
-						Provider: c.name,
-						Model:    c.model,
-						Effort:   c.effort,
-					}
-				}
-			}
-			return nil
-		},
-	}
-
-	resolver := resolve.New(reg, scorer)
+	resolver := resolve.New(reg, liveScorer())
 
 	if *all {
 		results := resolver.ResolveAll()
