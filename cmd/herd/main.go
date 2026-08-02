@@ -28,6 +28,7 @@ import (
 	"github.com/Kampe/Herdforge/pkg/process"
 	"github.com/Kampe/Herdforge/pkg/provider"
 	"github.com/Kampe/Herdforge/pkg/resolve"
+	"github.com/Kampe/Herdforge/pkg/resources"
 	"github.com/Kampe/Herdforge/pkg/router"
 	"github.com/Kampe/Herdforge/pkg/selftest"
 	"github.com/Kampe/Herdforge/pkg/store"
@@ -143,6 +144,9 @@ func main() {
 	case "lifecycle":
 		runLifecycle()
 
+	case "resources":
+		runResources()
+
 	default:
 		fmt.Fprintf(os.Stderr, "unknown subcommand '%s'\nRun 'herd --help' for usage.\n", command)
 		os.Exit(1)
@@ -184,6 +188,7 @@ func printUsage() {
 	fmt.Println("  kick            Re-engage standing or named agent lanes")
 	fmt.Println("  attention       List standing agents needing coordinator eyes (triage)")
 	fmt.Println("  lifecycle       Observe and act on fleet state via lifecycle engine")
+	fmt.Println("  resources       Snapshot system-resource headroom (free-mem, swap, gate verdict)")
 	fmt.Println("  --version       Show herd version")
 }
 
@@ -1872,6 +1877,54 @@ func runLifecycle() {
 			fmt.Printf("  stale: %s owner=%s\n", sc.Ref, sc.Owner)
 		}
 	}
+}
+
+func runResources() {
+	fs := flag.NewFlagSet("resources", flag.ExitOnError)
+	asJSON := fs.Bool("json", false, "Output JSON")
+	gate := fs.Bool("gate", false, "Exit 3 on ALERT (refuses heavy ops); HERD_RESOURCES_GATE=0 disables")
+	selftest := fs.Bool("selftest", false, "Run verdict assertions and exit")
+	fs.Parse(os.Args[2:])
+
+	if *selftest {
+		results := resources.SelfTest()
+		allPass := true
+		for _, r := range results {
+			if r.Pass {
+				fmt.Printf("[PASS] %s\n", r.Name)
+			} else {
+				fmt.Printf("[FAIL] %s: %s\n", r.Name, r.Detail)
+				allPass = false
+			}
+		}
+		if !allPass {
+			os.Exit(1)
+		}
+		return
+	}
+
+	snap := resources.TakeSnapshot()
+
+	if *gate {
+		if os.Getenv("HERD_RESOURCES_GATE") == "0" {
+			if snap.Verdict == resources.VerdictAlert {
+				fmt.Fprintf(os.Stderr, "resources: ALERT (swap=%dMB) — gate disabled by HERD_RESOURCES_GATE=0\n", snap.SwapMB)
+			}
+		} else if !resources.GatePasses(snap.Verdict) {
+			fmt.Fprintf(os.Stderr, "resources: ALERT — swap used %dMB exceeds alert threshold %dMB, refusing heavy ops\n",
+				snap.SwapMB, snap.Thresholds.SwapAlertMB)
+			os.Exit(3)
+		}
+	}
+
+	if *asJSON {
+		out, _ := json.MarshalIndent(snap, "", "  ")
+		fmt.Println(string(out))
+		return
+	}
+
+	fmt.Printf("free-memory: %d%%  swap-used: %dMB  verdict: %s\n",
+		snap.FreePct, snap.SwapMB, snap.Verdict)
 }
 
 func runProcess() {
