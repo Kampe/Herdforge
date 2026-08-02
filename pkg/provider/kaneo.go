@@ -6,7 +6,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 )
@@ -17,7 +19,34 @@ type KaneoProvider struct {
 	Client    *http.Client
 }
 
+type KaneoLinkConfig struct {
+	Workspace string `json:"workspace"`
+	Project   string `json:"project"`
+}
+
+// ResolveKaneoProjectID attempts to read project ID from .herd/kaneo.json, falling back to root .kaneo.json
+func ResolveKaneoProjectID(rootDir string) string {
+	paths := []string{
+		filepath.Join(rootDir, ".herd", "kaneo.json"),
+		filepath.Join(rootDir, ".kaneo.json"),
+	}
+
+	for _, p := range paths {
+		data, err := os.ReadFile(p)
+		if err == nil {
+			var link KaneoLinkConfig
+			if err := json.Unmarshal(data, &link); err == nil && link.Project != "" {
+				return link.Project
+			}
+		}
+	}
+	return ""
+}
+
 func NewKaneoProvider(apiURL string, projectID string) *KaneoProvider {
+	if projectID == "" {
+		projectID = ResolveKaneoProjectID(".")
+	}
 	return &KaneoProvider{
 		APIURL:    apiURL,
 		ProjectID: projectID,
@@ -97,6 +126,9 @@ func (k *KaneoProvider) GetTask(ctx context.Context, id string) (*Task, error) {
 }
 
 func (k *KaneoProvider) ListTasks(ctx context.Context, projectID string, status string) ([]*Task, error) {
+	if projectID == "" {
+		projectID = k.ProjectID
+	}
 	url := fmt.Sprintf("%s/api/task?projectId=%s", k.APIURL, projectID)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err == nil {

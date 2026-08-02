@@ -181,3 +181,10 @@ func TestKaneoProvider_AddComment_Non200(t *testing.T) {
 		t.Fatal("expected error on 500, got nil")
 	}
 }
+
+func TestResolveKaneoProjectID(t *testing.T) {
+	projID := ResolveKaneoProjectID(".")
+	if projID == "" {
+		t.Log("no local kaneo link found, which is okay")
+	}
+}
