@@ -21,3 +21,12 @@ func TestClassifyRiskTier(t *testing.T) {
 		}
 	}
 }
+
+func TestSelectCrossFamilyReviewer(t *testing.T) {
+	available := []string{"anthropic/claude-3-7-sonnet", "google/gemini-2.5-flash", "openai/gpt-4o"}
+
+	reviewer, err := SelectCrossFamilyReviewer("anthropic", available)
+	if err != nil || reviewer != "google/gemini-2.5-flash" {
+		t.Errorf("expected google/gemini-2.5-flash reviewer for anthropic author, got %s (err: %v)", reviewer, err)
+	}
+}

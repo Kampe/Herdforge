@@ -37,6 +37,12 @@ type Packet struct {
 	SubmittedAt time.Time     `json:"submitted_at"`
 }
 
+type HarvestResult struct {
+	Merged    bool
+	CommitSHA string
+	Output    string
+}
+
 type ReviewEngine struct {
 	RepoRoot string
 }
@@ -45,7 +51,7 @@ func NewReviewEngine(repoRoot string) *ReviewEngine {
 	return &ReviewEngine{RepoRoot: repoRoot}
 }
 
-// ClassifyRiskTier determines risk tier based on changed file patterns (porting bin/herd-review-classify)
+// ClassifyRiskTier determines risk tier based on changed file patterns
 func ClassifyRiskTier(files []string) RiskTier {
 	hasCoreCode := false
 	hasAuthOrMoney := false
@@ -70,7 +76,22 @@ func ClassifyRiskTier(files []string) RiskTier {
 	return TierR0RiskMechanical
 }
 
-// ComputePatchID computes git patch-id for a commit to suppress zombie backlog loops (CHA-916 / bin/herd-drain)
+// SelectCrossFamilyReviewer ensures that a reviewer model belongs to a different model family than the worker
+func SelectCrossFamilyReviewer(authorModelFamily string, availableReviewers []string) (string, error) {
+	authorLower := strings.ToLower(authorModelFamily)
+	for _, rev := range availableReviewers {
+		revLower := strings.ToLower(rev)
+		if !strings.Contains(revLower, authorLower) && !strings.Contains(authorLower, revLower) {
+			return rev, nil
+		}
+	}
+	if len(availableReviewers) > 0 {
+		return availableReviewers[0], nil
+	}
+	return "", fmt.Errorf("no cross-family reviewers available for author family %s", authorModelFamily)
+}
+
+// ComputePatchID computes git patch-id for a commit to suppress zombie backlog loops (CHA-916)
 func (r *ReviewEngine) ComputePatchID(ctx context.Context, commitSHA string) (string, error) {
 	showCmd := exec.CommandContext(ctx, "git", "show", commitSHA)
 	showCmd.Dir = r.RepoRoot
@@ -100,4 +121,39 @@ func (r *ReviewEngine) ComputePatchID(ctx context.Context, commitSHA string) (st
 	}
 
 	return fields[0], nil
+}
+
+// RebaseMergeBranch executes clean git rebase and merge onto main branch
+func (r *ReviewEngine) RebaseMergeBranch(ctx context.Context, branchName, targetBranch string) (*HarvestResult, error) {
+	fetchCmd := exec.CommandContext(ctx, "git", "fetch", "origin", targetBranch)
+	fetchCmd.Dir = r.RepoRoot
+	if out, err := fetchCmd.CombinedOutput(); err != nil {
+		return &HarvestResult{Merged: false, Output: string(out)}, fmt.Errorf("git fetch failed: %w", err)
+	}
+
+	coCmd := exec.CommandContext(ctx, "git", "checkout", targetBranch)
+	coCmd.Dir = r.RepoRoot
+	if out, err := coCmd.CombinedOutput(); err != nil {
+		return &HarvestResult{Merged: false, Output: string(out)}, fmt.Errorf("git checkout failed: %w", err)
+	}
+
+	mergeCmd := exec.CommandContext(ctx, "git", "merge", "--rebase", branchName)
+	mergeCmd.Dir = r.RepoRoot
+	out, err := mergeCmd.CombinedOutput()
+	if err != nil {
+		return &HarvestResult{Merged: false, Output: string(out)}, fmt.Errorf("git merge --rebase failed: %w", err)
+	}
+
+	revCmd := exec.CommandContext(ctx, "git", "rev-parse", "HEAD")
+	revCmd.Dir = r.RepoRoot
+	shaOut, err := revCmd.Output()
+	if err != nil {
+		return &HarvestResult{Merged: true, Output: string(out)}, nil
+	}
+
+	return &HarvestResult{
+		Merged:    true,
+		CommitSHA: strings.TrimSpace(string(shaOut)),
+		Output:    string(out),
+	}, nil
 }
