@@ -347,6 +347,79 @@ func TestDispatch_Launch_SetsCwdAndProvesPrompt(t *testing.T) {
 	}
 }
 
+// TestDispatch_EmptyBranchAfterWorktreeCompensates covers the post-side-effect
+// path where CreateTaskWorktreeFrom returned a real path but empty Branch.
+// Must failWithCompensate("empty_worktree_branch") and never launch.
+func TestDispatch_EmptyBranchAfterWorktreeCompensates(t *testing.T) {
+	tmp := t.TempDir()
+	// Simulate a created worktree directory (side effect already landed).
+	wtPath := filepath.Join(tmp, ".herd", "worktrees", "fac-empty")
+	if err := os.MkdirAll(wtPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Marker file proves the side effect is real/non-vacuous (not a nil info).
+	if err := os.WriteFile(filepath.Join(wtPath, ".side-effect"), []byte("created"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	mw := &mockWorktree{
+		root: tmp,
+		info: &worktree.WorktreeInfo{
+			Path:      wtPath,
+			Branch:    "", // empty after real create — the R3 remaining branch
+			BaseSHA:   "abc123",
+			AnchorRef: worktree.AnchorRefFor("FAC-EMPTY"),
+		},
+	}
+	tp := &statusTrackingProvider{
+		mockTaskProvider: mockTaskProvider{tasks: []*provider.Task{baseTask("FAC-EMPTY")}},
+	}
+	comp := &recordingCompensator{}
+	fh := &fakeHerdr{available: true, workspace: "w1", model: "m", tabID: "must-not-create"}
+	d := &Dispatcher{
+		Config:       testCfg(),
+		TaskProvider: tp,
+		Worktree:     mw,
+		Compensator:  comp,
+		Herdr:        fh,
+	}
+
+	res, err := d.Dispatch(context.Background(), DispatchOptions{TicketRef: "FAC-EMPTY"})
+	if err == nil {
+		t.Fatal("expected empty-branch failure after worktree side effect")
+	}
+	if !strings.Contains(err.Error(), "without a Git branch") {
+		t.Fatalf("primary error missing: %v", err)
+	}
+	if !hasCompensateReason(comp.compsCopy(), "empty_worktree_branch") {
+		t.Fatalf("expected compensate empty_worktree_branch, got %v", comp.compsCopy())
+	}
+	// Side effect was observed by the service (non-vacuous inject).
+	if mw.calls != 1 {
+		t.Fatalf("expected one CreateTaskWorktreeFrom call, got %d", mw.calls)
+	}
+	if _, statErr := os.Stat(filepath.Join(wtPath, ".side-effect")); statErr != nil {
+		t.Fatalf("injected worktree side effect missing: %v", statErr)
+	}
+	// No accepted launch: no tab, no agent start, no Launched.
+	if fh.tabCwd != "" || fh.startCalls != 0 {
+		t.Fatalf("must not launch on empty branch: cwd=%q starts=%d", fh.tabCwd, fh.startCalls)
+	}
+	if res != nil && res.Launched {
+		t.Fatal("must not set Launched")
+	}
+	// Board must not advance after empty-branch failure (pre-status).
+	if len(tp.statuses) != 0 {
+		t.Fatalf("UpdateStatus must not run: %v", tp.statuses)
+	}
+	// No durable worktree step recorded under empty branch (refused before record).
+	for _, s := range comp.stepsCopy() {
+		if s.Step == StepWorktree {
+			t.Fatalf("must not RecordStep worktree with empty branch: %+v", s)
+		}
+	}
+}
+
 func TestDispatch_NilCompensatorFailsClosed(t *testing.T) {
 	_, wm := initDispatchRepo(t)
 	tp := &statusTrackingProvider{
