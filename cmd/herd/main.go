@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Kampe/Herdforge/pkg/activate"
 	"github.com/Kampe/Herdforge/pkg/attention"
 	"github.com/Kampe/Herdforge/pkg/config"
 	"github.com/Kampe/Herdforge/pkg/daemon"
@@ -108,6 +109,9 @@ func main() {
 	case "up":
 		runUp()
 
+	case "activate":
+		runActivate()
+
 	case "validate-config":
 		runValidateConfig()
 
@@ -168,6 +172,7 @@ func printUsage() {
 	fmt.Println("  usage      Show harness quota usage from OpenUsage CLI")
 	fmt.Println("  quota      Show binding headroom, pace/pressure, pool breakdown")
 	fmt.Println("  up         Start a single agent lane (herd up <lane-name>)")
+	fmt.Println("  activate   Bring up all deployables + health-check gate (compose + /v1/status)")
 	fmt.Println("  validate-config  Validate .herd/herd.yaml configuration")
 	fmt.Println("  next            Show highest-priority next action")
 	fmt.Println("  dispatch        Dispatch a ticket to a worktree and launch agent")
@@ -923,6 +928,93 @@ func runUp() {
 	}
 
 	fmt.Printf("Lane '%s' started: tab=%s pane=%s agent=%s\n", lane.Name, tab.ID, tab.Pane.ID, tabLabel)
+}
+
+func runActivate() {
+	actFlags := flag.NewFlagSet("activate", flag.ExitOnError)
+	build := actFlags.String("build", "", "Comma-separated services to rebuild before up (e.g. api,worker)")
+	noFleet := actFlags.Bool("no-fleet", false, "Activate runtime, do NOT raise/kick the standing fleet")
+	selftestFlag := actFlags.Bool("selftest", false, "Run activate predicate selftest and exit")
+	timeout := actFlags.Int("timeout", 60, "Health-check gate timeout in seconds")
+	poll := actFlags.Int("poll", 5, "Health-check poll interval in seconds")
+	apiURL := actFlags.String("api-url", "", "Override /v1/status base URL (default http://localhost:13100)")
+	webURL := actFlags.String("web-url", "", "Override web probe URL (default http://localhost:4174)")
+	actFlags.Parse(os.Args[2:])
+
+	if *selftestFlag {
+		if err := activate.Selftest(); err != nil {
+			fmt.Fprintf(os.Stderr, "activate selftest FAILED: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Println("activate selftest: PASS")
+		return
+	}
+
+	var buildServices []string
+	if *build != "" {
+		for _, s := range strings.Split(*build, ",") {
+			s = strings.TrimSpace(s)
+			if s != "" {
+				buildServices = append(buildServices, s)
+			}
+		}
+	}
+
+	// HERD_WIND_DOWN=1 sets --no-fleet (wind-down resurrection guard).
+	if os.Getenv("HERD_WIND_DOWN") == "1" {
+		*noFleet = true
+	}
+
+	opts := activate.Options{
+		BuildServices: buildServices,
+		NoFleet:       *noFleet,
+		Timeout:       time.Duration(*timeout) * time.Second,
+		PollInterval:  time.Duration(*poll) * time.Second,
+	}
+	// Env overrides feed the defaults (herd-activate:174-175): explicit
+	// flags take precedence, otherwise OV_LOCAL_API_URL / OV_LOCAL_WEB_URL.
+	if *apiURL != "" {
+		opts.APIURL = *apiURL
+	}
+	if *webURL != "" {
+		opts.WebURL = *webURL
+	}
+
+	fmt.Printf("herd-activate: up -d all deployables + health-check gate (timeout=%ds)\n", *timeout)
+	res, err := activate.Run(opts)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "herd-activate: UNHEALTHY — status=%s api_unhealthy=%s compose_not_running=%s\n",
+			overallOr(res, "unreachable"), unhealthyOr(res, "?"), notRunningOr(res, "none"))
+		fmt.Fprintf(os.Stderr, "herd-activate: check 'docker compose ps' and 'docker compose logs <svc>'\n")
+		os.Exit(1)
+	}
+	fmt.Printf("herd-activate: OK — all deployables healthy; web %s -> %d\n", opts.WebURL, res.WebCode)
+	if opts.NoFleet {
+		fmt.Println("herd-activate: --no-fleet (or HERD_WIND_DOWN) set; runtime is up, NOT raising/kicking the standing fleet")
+	} else if res.FleetKicked {
+		fmt.Println("herd-activate: kicked standing fleet (post-activation)")
+	}
+}
+
+func overallOr(res *activate.Result, fallback string) string {
+	if res == nil || res.Overall == "" {
+		return fallback
+	}
+	return res.Overall
+}
+
+func unhealthyOr(res *activate.Result, fallback string) string {
+	if res == nil || res.Unhealthy == "" {
+		return fallback
+	}
+	return res.Unhealthy
+}
+
+func notRunningOr(res *activate.Result, fallback string) string {
+	if res == nil || res.NotRunning == "" {
+		return fallback
+	}
+	return res.NotRunning
 }
 
 func runReview() {
