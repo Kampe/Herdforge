@@ -2,7 +2,6 @@ package dispatch
 
 import (
 	"context"
-	"os"
 	"strings"
 	"testing"
 
@@ -46,19 +45,26 @@ func TestFindTicket(t *testing.T) {
 			{Name: "worker", Role: "worker", Model: "deepseek-v4-flash", AgentKind: "opencode", Prompt: ".herd/prompts/worker.md"},
 		},
 	}
-	wm := worktree.NewWorktreeManager(".")
+	// Use an empty temp dir (not the real repo) so ticket lookup cannot pollute
+	// shared checkouts with herd/fac-* worktrees (FAC-121 isolation).
+	wm := worktree.NewWorktreeManager(t.TempDir())
 	d := NewDispatcher(cfg, tp, wm)
 
 	_, err := d.Dispatch(context.Background(), DispatchOptions{TicketRef: "FAC-1", NoLaunch: true})
-	if err == nil || !os.IsNotExist(err) {
-		if err != nil && strings.Contains(err.Error(), "ticket FAC-1 not found") {
-			t.Fatalf("ticket should have been found: %v", err)
-		}
+	// Ticket is found; worktree creation fails because the temp dir is not a git repo.
+	if err == nil {
+		t.Fatal("expected worktree error after finding ticket in non-repo")
+	}
+	if strings.Contains(err.Error(), "ticket FAC-1 not found") {
+		t.Fatalf("ticket should have been found: %v", err)
 	}
 
 	_, err = d.Dispatch(context.Background(), DispatchOptions{TicketRef: "FAC-NONEXIST", NoLaunch: true})
 	if err == nil {
 		t.Fatal("expected error for non-existent ticket")
+	}
+	if !strings.Contains(err.Error(), "not found") {
+		t.Fatalf("expected not-found error, got %v", err)
 	}
 }
 
@@ -92,12 +98,15 @@ func TestBuildTaskPacket(t *testing.T) {
 		Name: "worker", Role: "worker", AgentKind: "opencode",
 		Model: "deepseek-v4-flash", Prompt: ".herd/prompts/worker.md",
 	}
-	packet := buildTaskPacket(task, "/tmp/wt", "task/foo", ".herd/prompts/worker.md", lane)
+	packet := buildTaskPacket(task, "/tmp/wt", "herd/fac-33", ".herd/prompts/worker.md", lane)
 	if !strings.Contains(packet, "FAC-33") {
 		t.Error("packet should contain ticket ref")
 	}
 	if !strings.Contains(packet, "/tmp/wt") {
 		t.Error("packet should contain worktree path")
+	}
+	if !strings.Contains(packet, "herd/fac-33") {
+		t.Error("packet must carry the actual Git branch name")
 	}
 	// FAC-115: reference-based, NOT an inline spec dump — the agent reads the
 	// card itself, and the packet must be tight (context-budget fix).
