@@ -15,13 +15,14 @@ const (
 	HarnessGrok     HarnessType = "grok"
 	HarnessKimi     HarnessType = "kimi"
 	HarnessAGY      HarnessType = "agy"
+	HarnessPI       HarnessType = "pi"
 	HarnessGeneric  HarnessType = "generic"
 )
 
 type HarnessConfig struct {
-	Type        HarnessType
-	BinaryName  string
-	PromptFlag  string
+	Type           HarnessType
+	BinaryName     string
+	PromptFlag     string
 	NonInteractive bool
 }
 
@@ -40,6 +41,8 @@ func GetHarnessConfig(harness string) *HarnessConfig {
 		return &HarnessConfig{Type: HarnessKimi, BinaryName: "kimi", PromptFlag: "-p", NonInteractive: true}
 	case "agy", "antigravity":
 		return &HarnessConfig{Type: HarnessAGY, BinaryName: "antigravity-cli", PromptFlag: "-p", NonInteractive: true}
+	case "pi":
+		return &HarnessConfig{Type: HarnessPI, BinaryName: "pi", PromptFlag: "-p", NonInteractive: true}
 	default:
 		return &HarnessConfig{Type: HarnessGeneric, BinaryName: harness, PromptFlag: "-p", NonInteractive: true}
 	}

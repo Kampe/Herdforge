@@ -19,6 +19,7 @@ func TestGetHarnessConfig(t *testing.T) {
 		{"Kimi", "kimi", HarnessKimi, "kimi"},
 		{"AGY", "agy", HarnessAGY, "antigravity-cli"},
 		{"Antigravity", "antigravity", HarnessAGY, "antigravity-cli"},
+		{"PI", "pi", HarnessPI, "pi"},
 	}
 
 	for _, tt := range tests {
@@ -30,10 +31,10 @@ func TestGetHarnessConfig(t *testing.T) {
 }
 
 func TestBuildInvocation(t *testing.T) {
-	cfg := GetHarnessConfig("claude")
+	cfg := GetHarnessConfig("pi")
 	inv := cfg.BuildInvocation("do work")
 
-	expected := []string{"claude", "-p", "do work"}
+	expected := []string{"pi", "-p", "do work"}
 	if !reflect.DeepEqual(inv, expected) {
 		t.Errorf("BuildInvocation() = %v, expected %v", inv, expected)
 	}
