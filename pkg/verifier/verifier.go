@@ -162,7 +162,24 @@ func (v *Verifier) execute(ctx context.Context, dir string, policy EnvironmentPo
 	}
 
 	started := time.Now()
-	cmd := exec.CommandContext(ctx, v.Argv[0], v.Argv[1:]...)
+	commandPath := v.Argv[0]
+	var commandEnv []string
+	if policy == EnvironmentPolicyHermetic {
+		commandEnv = hermeticEnvironment()
+		var err error
+		commandPath, err = resolveHermeticExecutable(commandPath, environmentValue(commandEnv, "PATH"))
+		if err != nil {
+			output := []byte(err.Error())
+			return &Result{
+				Outcome:      OutcomeBLOCKED,
+				Output:       boundedOutput(output),
+				OutputDigest: digestBytes(output),
+				ExitCode:     -1,
+				Duration:     time.Since(started),
+			}, nil
+		}
+	}
+	cmd := exec.CommandContext(ctx, commandPath, v.Argv[1:]...)
 	cmd.Dir = dir
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Cancel = func() error {
@@ -172,7 +189,7 @@ func (v *Verifier) execute(ctx context.Context, dir string, policy EnvironmentPo
 		return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 	}
 	if policy == EnvironmentPolicyHermetic {
-		cmd.Env = hermeticEnvironment()
+		cmd.Env = commandEnv
 	}
 	// A canceled shell can leave grandchildren holding CombinedOutput's pipe
 	// open (for example, `sh -c 'sleep 3'`). WaitDelay bounds that wait and
@@ -303,11 +320,40 @@ func validateEnvironmentPolicy(policy EnvironmentPolicy) error {
 
 func hermeticEnvironment() []string {
 	return []string{
-		"PATH=/opt/homebrew/bin:/usr/local/go/bin:/go/bin:/usr/local/bin:/usr/bin:/bin",
+		"PATH=" + hermeticPathValue,
 		"LC_ALL=C",
 		"LANG=C",
 		"TZ=UTC",
 	}
+}
+
+const hermeticPathValue = "/opt/homebrew/bin:/usr/local/go/bin:/go/bin:/usr/local/bin:/usr/bin:/bin"
+
+func environmentValue(env []string, name string) string {
+	prefix := name + "="
+	for _, entry := range env {
+		if strings.HasPrefix(entry, prefix) {
+			return strings.TrimPrefix(entry, prefix)
+		}
+	}
+	return ""
+}
+
+func resolveHermeticExecutable(file, pathValue string) (string, error) {
+	if filepath.IsAbs(file) || strings.ContainsRune(file, filepath.Separator) {
+		return file, nil
+	}
+	for _, dir := range filepath.SplitList(pathValue) {
+		if dir == "" {
+			dir = "."
+		}
+		candidate := filepath.Join(dir, file)
+		info, err := os.Stat(candidate)
+		if err == nil && info.Mode().IsRegular() && info.Mode()&0111 != 0 {
+			return candidate, nil
+		}
+	}
+	return "", fmt.Errorf("executable %q not found in hermetic PATH", file)
 }
 
 func boundedOutput(output []byte) string {
