@@ -1,6 +1,6 @@
 # Herdforge Makefile
 
-.PHONY: all build test test-unit test-coverage test-mutation preflight lint clean
+.PHONY: all build test test-unit test-coverage test-mutation preflight lint self-test herd-up clean
 
 all: preflight test build
 
@@ -31,10 +31,18 @@ preflight:
 	@echo "==> Running preflight workspace boundary checks..."
 	go run ./cmd/herd preflight
 
+self-test: build
+	@echo "==> Running compiled Herdforge self-test suite against ITSELF..."
+	./bin/herd selftest
+
+herd-up: build
+	@echo "==> Spawning Herdforge autonomous software factory daemon..."
+	./bin/herd pulse --act --spawn
+
 lint:
 	@echo "==> Running go vet static analysis..."
 	go vet ./...
 
 clean:
 	@echo "==> Cleaning build artifacts..."
-	rm -rf bin .herd
+	rm -rf bin

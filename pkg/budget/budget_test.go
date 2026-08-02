@@ -34,3 +34,18 @@ func TestBudgetManager_FallbackRate(t *testing.T) {
 		t.Errorf("expected fallback cost 0.010, got %.4f", cost)
 	}
 }
+
+func TestIsExhausted_ExactLimit(t *testing.T) {
+	bm := NewBudgetManager(0.05)
+	bm.TotalCostUSD = 0.05
+	if !bm.IsExhausted() {
+		t.Error("expected IsExhausted to return true when TotalCostUSD >= MaxBudgetUSD")
+	}
+}
+
+func TestIsExhausted_NoLimit(t *testing.T) {
+	bm := NewBudgetManager(0)
+	if bm.IsExhausted() {
+		t.Error("expected IsExhausted to return false when MaxBudgetUSD <= 0")
+	}
+}

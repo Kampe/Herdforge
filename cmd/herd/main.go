@@ -11,6 +11,7 @@ import (
 	"github.com/Kampe/Herdforge/pkg/preflight"
 	"github.com/Kampe/Herdforge/pkg/provider"
 	"github.com/Kampe/Herdforge/pkg/router"
+	"github.com/Kampe/Herdforge/pkg/selftest"
 	"github.com/Kampe/Herdforge/pkg/verifier"
 	"github.com/Kampe/Herdforge/pkg/worktree"
 )
@@ -39,6 +40,9 @@ func main() {
 	case "preflight":
 		runPreflight()
 
+	case "selftest":
+		runSelfTest()
+
 	case "status":
 		runStatus()
 
@@ -58,6 +62,7 @@ func printUsage() {
 	fmt.Println("\nCommands:")
 	fmt.Println("  init       Scaffold default .herd/herd.yaml configuration file")
 	fmt.Println("  preflight  Run workspace boundary and repo-relative path verification")
+	fmt.Println("  selftest   Run core orchestration behavior self-test suite")
 	fmt.Println("  status     Display current orchestration engine status")
 	fmt.Println("  pulse      Execute one orchestration sweep pass across task queue")
 	fmt.Println("  --version  Show herd version")
@@ -119,6 +124,20 @@ func runPreflight() {
 		os.Exit(1)
 	}
 	fmt.Println("Preflight boundary check passed. Zero absolute path leaks detected.")
+}
+
+func runSelfTest() {
+	runner := selftest.NewSelfTestRunner(".")
+	results, err := runner.RunSuite(context.Background())
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Self-test failed: %v\n", err)
+		os.Exit(1)
+	}
+
+	for _, res := range results {
+		fmt.Printf("[PASS] %s\n", res.Name)
+	}
+	fmt.Println("\nAll self-test assertions passed cleanly.")
 }
 
 func runStatus() {
