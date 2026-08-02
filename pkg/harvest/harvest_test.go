@@ -14,7 +14,7 @@ func createTestGitRepo(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()
 	for _, cmd := range []string{
-		"git init",
+		"git init -b main",
 		"git config user.email test@test.com",
 		"git config user.name test",
 	} {

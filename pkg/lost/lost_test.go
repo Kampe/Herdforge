@@ -2,15 +2,29 @@ package lost
 
 import (
 	"context"
+	"os"
 	"os/exec"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 )
+
+var commitSeq int64
 
 func run(t *testing.T, dir string, args ...string) string {
 	t.Helper()
 	cmd := exec.Command("git", args...)
 	cmd.Dir = dir
+	// Unique timestamps per commit: two --allow-empty commits with the same
+	// subject, parent, and second-resolution time produce the IDENTICAL sha
+	// (no content to differ), silently collapsing test branches together.
+	// Only commit-signing salt hid this on the dev machine.
+	seq := atomic.AddInt64(&commitSeq, 1)
+	stamp := time.Unix(1_700_000_000+seq*7, 0).UTC().Format(time.RFC3339)
+	cmd.Env = append(os.Environ(),
+		"GIT_AUTHOR_DATE="+stamp, "GIT_COMMITTER_DATE="+stamp,
+		"GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_SYSTEM=/dev/null")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("git %v: %v\n%s", args, err, out)
