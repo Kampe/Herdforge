@@ -6,6 +6,17 @@ import (
 	"testing"
 )
 
+func TestOpenLedger_MalformedJSON(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "ledger.json")
+	os.WriteFile(p, []byte(`{bad json`), 0644)
+
+	_, err := OpenLedger(p)
+	if err == nil {
+		t.Fatal("expected error for malformed JSON")
+	}
+}
+
 func TestOpenLedger_New(t *testing.T) {
 	dir := t.TempDir()
 	p := filepath.Join(dir, "ledger.json")
@@ -27,6 +38,14 @@ func TestOpenLedger_New(t *testing.T) {
 	all := l.All()
 	if len(all) != 0 {
 		t.Errorf("expected empty ledger, got %d entries", len(all))
+	}
+
+	raw, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatalf("read created file: %v", err)
+	}
+	if len(raw) == 0 {
+		t.Fatal("OpenLedger did not write {} to disk for new file")
 	}
 }
 

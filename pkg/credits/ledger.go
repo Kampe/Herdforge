@@ -52,6 +52,11 @@ func OpenLedger(path string) (*Ledger, error) {
 		}
 	} else if !os.IsNotExist(err) {
 		return nil, fmt.Errorf("credits: stat ledger: %w", err)
+	} else {
+		raw := []byte("{}\n")
+		if err := os.WriteFile(path, raw, 0644); err != nil {
+			return nil, fmt.Errorf("credits: write empty ledger: %w", err)
+		}
 	}
 	return &Ledger{path: path, data: data}, nil
 }
