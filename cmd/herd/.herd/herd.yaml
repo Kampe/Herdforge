@@ -1,0 +1,26 @@
+version: "1"
+project:
+  name: "my-herd-app"
+  default_branch: "main"
+
+task_provider:
+  type: "kaneo"
+  project_id: "your-project-id"
+  api_url: "https://kanban-api.kampe.kluster"
+
+model_providers:
+  - name: "claude-pro"
+    type: "anthropic"
+    model: "claude-3-7-sonnet"
+  - name: "gemini-flash"
+    type: "google"
+    model: "gemini-2.5-flash"
+
+roles:
+  - name: "herd-smith"
+    provider: "claude-pro"
+    fallback_provider: "gemini-flash"
+    prompt_path: ".herd/prompts/smith.md"
+
+verification:
+  test_command: "go test ./..."
