@@ -5,16 +5,33 @@ import (
 	"testing"
 )
 
-func TestVerifier_Execute(t *testing.T) {
-	v := NewVerifier("echo hello")
-	res, err := v.Execute(context.Background(), ".")
-	if err != nil || !res.Passed {
-		t.Fatalf("expected pass, got err=%v, res=%v", err, res)
+func TestDetectLanguage(t *testing.T) {
+	tests := []struct {
+		path     string
+		expected Language
+	}{
+		{"main.go", LangGo},
+		{"app.ts", LangNode},
+		{"script.py", LangPython},
+		{"main.rs", LangRust},
+		{"README.md", LangUnknown},
 	}
 
-	vFail := NewVerifier("false")
-	resFail, _ := vFail.Execute(context.Background(), ".")
-	if resFail.Passed {
-		t.Fatalf("expected fail for 'false' command, got pass")
+	for _, tt := range tests {
+		got := DetectLanguage(tt.path)
+		if got != tt.expected {
+			t.Errorf("DetectLanguage(%s) = %v, expected %v", tt.path, got, tt.expected)
+		}
+	}
+}
+
+func TestVerifier_MutationCheck(t *testing.T) {
+	v := NewVerifier("echo baseline ok")
+	res, err := v.RunMutationCheck(context.Background(), ".", "config.go", "code", "mutant")
+	if err != nil {
+		t.Fatalf("expected clean mutation check execution, got err: %v", err)
+	}
+	if res.MutantID != "mutant-config.go" {
+		t.Errorf("unexpected mutant ID: %s", res.MutantID)
 	}
 }
