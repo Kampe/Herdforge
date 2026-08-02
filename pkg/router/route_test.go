@@ -377,6 +377,10 @@ func TestArgvContracts(t *testing.T) {
 		{"kimi", "", "high", []string{"kimi", "--auto"}},
 		{"agy", "claude-opus-4-6-thinking", "high",
 			[]string{"agy", "--model", "claude-opus-4-6-thinking", "--prompt-interactive"}},
+		{"ollama", "litellm/ollama/glm-5.2:cloud", "high",
+			[]string{"opencode", "--model", "litellm/ollama/glm-5.2:cloud", "--auto"}},
+		{"lazer", "litellm/lazer/grok-4.5", "xhigh",
+			[]string{"opencode", "--model", "litellm/lazer/grok-4.5", "--auto"}},
 	}
 	for _, c := range cases {
 		got := ArgvFor(c.p, c.m, c.e)

@@ -1860,11 +1860,15 @@ func runResolveLane() {
 	if *asJSON {
 		out, _ := json.MarshalIndent(result, "", "  ")
 		fmt.Println(string(out))
-		return
-	}
-	if result.Resolvable {
+	} else if result.Resolvable {
 		fmt.Printf("%s -> %s/%s (effort=%s) [%s]\n", result.Lane, result.Provider, result.Model, result.Effort, result.Reason)
 	} else {
 		fmt.Printf("%s -> UNROUTEABLE [%s]\n", result.Lane, result.Reason)
+	}
+	// zsh parity: an unroutable lane exits 3 (JSON still emitted) so a
+	// launcher chained on this command fails closed instead of launching
+	// nothing silently.
+	if !result.Resolvable {
+		os.Exit(3)
 	}
 }
