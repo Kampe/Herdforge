@@ -21,23 +21,11 @@ import (
 	"strings"
 )
 
-// StandingIDs is the canonical standing fleet roster (single source of truth
-// for kick, attention, and standing).
-var StandingIDs = []string{
-	"api-crusader",
-	"chain-indexer",
-	"defi-crusader",
-	"docs-custodian",
-	"herd-smith",
-	"nft-data-engineer",
-	"perf-cost-guard",
-	"platform-ops",
-	"qa-sentinel",
-	"review-harvest-supervisor",
-	"scout-planner",
-	"security-sentinel",
-	"ux-comber",
-}
+// The canonical standing fleet roster is derived at runtime by StandingIDs()
+// (see roster.go): every lane declared in docs/agent/lane-registry.json (or
+// .herd/lane-registry.json, then .herd/herd.yaml) is prefixed with ForgePrefix
+// to produce the live herdr agent name. There is intentionally no hardcoded
+// roster here — this repo's lanes are the source of truth.
 
 // LiveStatuses identifies statuses that mean "agent session still holds the name".
 const LiveStatuses = "working|idle|starting|done|blocked"
@@ -94,39 +82,12 @@ type EntryResult struct {
 }
 
 // KickMessage builds the re-engagement prompt for a standing lane.
-// Matches the per-lane templates from bin/herd-kick.
+// Generic role-based template: the lane id (the live forge agent name, e.g.
+// "forge-worker") is embedded so the coordinator can see which lane is being
+// asked to continue; the "Rapid turn" suffix is fixed so nudge cadence is
+// stable across all lanes.
 func KickMessage(id, reason string) string {
-	var base string
-	switch id {
-	case "scout-planner":
-		base = "STANDING KICK (scout-planner). Immediately: refresh origin/main, re-rank Kaneo forward queue, consume any open GitHub issues into tickets, note collisions with live worktrees, and report the top 5 claimable tickets with owned-paths. Do not set in-progress/done."
-	case "ux-comber":
-		base = "STANDING KICK (ux-comber). Immediately: walk consumer journeys at 1440w and 390w (auth + unauth), fix apps/web defects you own, file repro-backed tickets for backend/data bugs, commit on standing/ux-comber, report NEEDS_REVIEW with evidence. Do not self-merge."
-	case "docs-custodian":
-		base = "STANDING KICK (docs-custodian). Immediately: git fetch origin/main, rebase/reset standing branch onto origin/main, scan TOOLING-INVENTORY/PACKAGES/ENVIRONMENT/API-SURFACE-AUDIT/prompts against merged code, fix bounded R0 drift, report NEEDS_REVIEW or clean. Do not self-merge product code."
-	case "platform-ops":
-		base = "STANDING KICK (platform-ops). Immediately: guardian pass on infrastructure. Repair runtime drift within HARD BANS. Report ALERT or healthy with one-line evidence."
-	case "review-harvest-supervisor":
-		base = "STANDING KICK (review-harvest-supervisor). Immediately: run bin/herd-review-supervisor --json; if an act pass is delegated, run bin/herd-review-supervisor --act --spawn. Drain artifacts, independent reviews, and exact-SHA PASS harvests; never use force gates, claim product work, or wait for a coordinator."
-	case "security-sentinel":
-		base = "STANDING KICK (security-sentinel). Immediately: diff scan the working tree for secrets, supply-chain drift, and known CVEs affecting the deploy surface. Report any new findings or clean."
-	case "defi-crusader":
-		base = "STANDING KICK (defi-crusader). Immediately: verify position producers, check on-chain fixture coverage against current protocol state, reconcile any stale addresses. Report coverage gaps or clean."
-	case "herd-smith":
-		base = "STANDING KICK (herd-smith). Immediately: check build health on origin/main, verify no dependency drift, run make lint all across the forge. Report regressions or clean."
-	case "api-crusader":
-		base = "STANDING KICK (api-crusader). Immediately: contract-test the public API surface, check OpenAPI spec drift against implementation, verify auth boundaries on new endpoints. Report violations or clean."
-	case "chain-indexer":
-		base = "STANDING KICK (chain-indexer). Immediately: verify indexer progress, check for stalled blocks, reconcile any gaps against the chain head. Report lag or clean."
-	case "nft-data-engineer":
-		base = "STANDING KICK (nft-data-engineer). Immediately: verify NFT metadata freshness, check collection floor tracking, reconcile any stale token data. Report drift or clean."
-	case "qa-sentinel":
-		base = "STANDING KICK (qa-sentinel). Immediately: run the full test suite across all packages, check for flaky tests, verify coverage thresholds. Report failures or clean."
-	case "perf-cost-guard":
-		base = "STANDING KICK (perf-cost-guard). Immediately: profile recent deploys for latency and cost regressions, check resource utilization trends. Report anomalies or clean."
-	default:
-		base = fmt.Sprintf("STANDING KICK (%s). Continue your standing packet / task now. Report status when this pass finishes.", id)
-	}
+	base := fmt.Sprintf("STANDING KICK (%s). Continue your standing packet / lane role now. Refresh origin/main, finish or audit the current assignment, and report status when this pass finishes.", id)
 
 	var extra string
 	if reason != "" {
@@ -239,7 +200,7 @@ func ProviderDeathCheck(lane string) bool {
 
 // Selftest verifies that the package can produce messages for all standing IDs.
 func Selftest() error {
-	for _, id := range StandingIDs {
+	for _, id := range StandingIDs() {
 		msg := KickMessage(id, "")
 		if msg == "" {
 			return fmt.Errorf("empty kick message for %s", id)
@@ -256,17 +217,16 @@ func Run(opts Options) (*Result, error) {
 	// Determine target names.
 	names := opts.Names
 	if len(names) == 0 {
-		names = make([]string, len(StandingIDs))
-		copy(names, StandingIDs)
+		names = append([]string(nil), StandingIDs()...)
 	}
 
 	// Sort deterministically.
-	if !sorted(names, StandingIDs) {
+	if !sorted(names, StandingIDs()) {
 		sort.Strings(names)
 	}
 
 	// Raise missing standing agents when kicking the full default set.
-	if opts.RaiseMissing && len(names) >= len(StandingIDs) {
+	if opts.RaiseMissing && len(names) >= len(StandingIDs()) {
 		HerdStanding("--all")
 	}
 
