@@ -2,7 +2,7 @@
 
 **Herdforge** is a standalone, repo-agnostic multi-agent orchestration daemon and software factory CLI written in Go. It turns any Git repository into an autonomous agentic development environment with multi-provider AI model routing, git worktree isolation, automated verification, and independent cross-model review pipelines.
 
-[![CI Workflow](https://github.com/Kampe/Herdforge/actions/workflows/ci.yml/badge.svg)](https://github.com/Kampe/Herdforge/actions/workflows/ci.yml)
+[![CI Workflow](https://github.com/Kampe/Herdforge/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Kampe/Herdforge/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Go Reference](https://pkg.go.dev/badge/github.com/Kampe/Herdforge.svg)](https://pkg.go.dev/github.com/Kampe/Herdforge)
 
