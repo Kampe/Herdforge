@@ -1,8 +1,17 @@
 # Herdforge Makefile
 
-.PHONY: all build test test-unit test-coverage test-mutation preflight lint self-test herd-up clean
+.PHONY: all build test test-unit test-coverage test-mutation preflight lint self-test herd-up clean ci
 
 all: preflight test build
+
+# ci mirrors .github/workflows/ci.yml EXACTLY, with a hermetic git
+# environment (no user/system gitconfig) so a dev machine's config cannot
+# mask environment-dependent tests. Run this before EVERY push — if ci is
+# red here it is red on the runner.
+ci:
+	@echo "==> Running CI-equivalent gate (hermetic git env)..."
+	GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null $(MAKE) lint test-unit preflight
+	@echo "==> CI gate PASSED"
 
 build:
 	@echo "==> Building herd binary..."

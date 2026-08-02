@@ -2,6 +2,8 @@ package review
 
 import (
 	"context"
+	"os"
+	"os/exec"
 	"testing"
 )
 
@@ -60,8 +62,41 @@ func TestSelectCrossFamilyReviewer_NoReviewers(t *testing.T) {
 	}
 }
 
+// patchIDFixture builds a repo whose HEAD is a real file commit — the live
+// repo's HEAD is usually a PR merge commit, and `git show` on a merge emits
+// no diff, so testing against "." was red whenever main's tip was a merge.
+func patchIDFixture(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	for _, args := range [][]string{
+		{"init", "-q", "-b", "main"},
+		{"config", "user.email", "t@h.local"},
+		{"config", "user.name", "t"},
+	} {
+		c := exec.Command("git", args...)
+		c.Dir = dir
+		if out, err := c.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+	if err := os.WriteFile(dir+"/f.txt", []byte("content\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range [][]string{
+		{"add", "f.txt"},
+		{"commit", "-q", "-m", "feat: real diff"},
+	} {
+		c := exec.Command("git", args...)
+		c.Dir = dir
+		if out, err := c.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+	return dir
+}
+
 func TestComputePatchID(t *testing.T) {
-	r := NewReviewEngine(".")
+	r := NewReviewEngine(patchIDFixture(t))
 	id, err := r.ComputePatchID(context.Background(), "HEAD")
 	if err != nil {
 		t.Fatalf("expected valid patch ID for HEAD, got: %v", err)
@@ -80,13 +115,17 @@ func TestComputePatchID_ShowFailure(t *testing.T) {
 }
 
 func TestComputePatchID_NoOutput(t *testing.T) {
-	r := NewReviewEngine(".")
-	id, err := r.ComputePatchID(context.Background(), "HEAD")
-	if err != nil {
-		t.Fatal(err)
+	// A commit with no diff (empty commit, like a merge) must fail closed,
+	// never return an empty id that a caller could mistake for a match.
+	dir := patchIDFixture(t)
+	c := exec.Command("git", "commit", "--allow-empty", "-q", "-m", "empty: no diff")
+	c.Dir = dir
+	if out, err := c.CombinedOutput(); err != nil {
+		t.Fatalf("git commit: %v\n%s", err, out)
 	}
-	if id == "" {
-		t.Error("expected non-empty patch ID")
+	r := NewReviewEngine(dir)
+	if _, err := r.ComputePatchID(context.Background(), "HEAD"); err == nil {
+		t.Error("empty-diff commit must error, not return an empty patch id")
 	}
 }
 
