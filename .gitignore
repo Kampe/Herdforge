@@ -12,5 +12,21 @@ kaneo.json
 .DS_Store
 *.swp
 *~
+
 # Added by code-review-graph
 .code-review-graph/
+
+# AI coding agent harness configs (not repo concerns)
+.claude/
+.codebuddy/
+.gemini/
+.kiro/
+.qoder/
+.cursorrules
+.windsurfrules
+.vscode/
+CODEBUDDY.md
+GEMINI.md
+QODER.md
+.mcp.json
+opencode.jsonc
