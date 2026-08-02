@@ -1,7 +1,9 @@
 package credits
 
 import (
+	"encoding/json"
 	"os"
+	"os/exec"
 	"strings"
 )
 
@@ -51,6 +53,41 @@ func KnownAccountLookup(email string) string {
 		return "yuga"
 	}
 	return email
+}
+
+var claudeAuthStatusCmd = func(args ...string) *exec.Cmd {
+	return exec.Command("claude", args...)
+}
+
+func ClaudeActiveExpanded() string {
+	// try JSON output first
+	cmd := claudeAuthStatusCmd("auth", "status", "--json")
+	out, err := cmd.Output()
+	if err == nil {
+		var result struct {
+			Email string `json:"email"`
+		}
+		if err := json.Unmarshal(out, &result); err == nil && result.Email != "" {
+			return result.Email
+		}
+	}
+
+	// fallback: parse Email: line from text output
+	cmd = claudeAuthStatusCmd("auth", "status", "--text")
+	out, err = cmd.Output()
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "Email:") {
+			e := strings.TrimSpace(strings.TrimPrefix(line, "Email:"))
+			if e != "" {
+				return e
+			}
+		}
+	}
+	return ""
 }
 
 type CcUsageResult struct {

@@ -1,11 +1,13 @@
 package credits
 
 import (
+	"bytes"
 	"fmt"
 	"math"
 	"os"
 	"os/exec"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -56,11 +58,34 @@ func execCcUsage(args []string, timeoutSec int) string {
 	}
 	cmdLine := strings.Join(append([]string{base}, args...), " ")
 	cmd := exec.Command("sh", "-c", cmdLine)
-	out, err := cmd.Output()
-	if err != nil {
+
+	var outBuf bytes.Buffer
+	cmd.Stdout = &outBuf
+	cmd.Stderr = nil
+
+	if err := cmd.Start(); err != nil {
 		return ""
 	}
-	return strings.TrimSpace(string(out))
+
+	done := make(chan error, 1)
+	go func() {
+		done <- cmd.Wait()
+	}()
+
+	if timeoutSec <= 0 {
+		timeoutSec = DefaultCcUsageTimeout
+	}
+	select {
+	case <-time.After(time.Duration(timeoutSec) * time.Second):
+		cmd.Process.Kill()
+		return ""
+	case err := <-done:
+		if err != nil {
+			return ""
+		}
+	}
+
+	return strings.TrimSpace(outBuf.String())
 }
 
 type TokenParser func(jsonStr, jqExpr string) int
@@ -69,11 +94,40 @@ var ParseTokensFromJSON TokenParser = func(jsonStr, jqExpr string) int {
 	if jsonStr == "" {
 		return 0
 	}
-	return 0
+	cmd := exec.Command("jq", jqExpr)
+	cmd.Stdin = strings.NewReader(jsonStr)
+	out, err := cmd.Output()
+	if err != nil {
+		return 0
+	}
+	v, err := strconv.Atoi(strings.TrimSpace(string(out)))
+	if err != nil {
+		return 0
+	}
+	if v < 0 {
+		return 0
+	}
+	return v
 }
 
 var ParseRemainingMinutes func(jsonStr string) int = func(jsonStr string) int {
-	return 0
+	if jsonStr == "" {
+		return 0
+	}
+	cmd := exec.Command("jq", ".blocks[] | select(.isActive == true) | .remainingMinutes // 0")
+	cmd.Stdin = strings.NewReader(jsonStr)
+	out, err := cmd.Output()
+	if err != nil {
+		return 0
+	}
+	v, err := strconv.Atoi(strings.TrimSpace(string(out)))
+	if err != nil {
+		return 0
+	}
+	if v < 0 {
+		return 0
+	}
+	return v
 }
 
 func Refresh(ledger *Ledger, surface string, budget5h, budgetWeekly, ttl int, emails []string) *RefreshResult {
@@ -411,12 +465,30 @@ func (lc *LedgerCommands) Pace(surface string) string {
 	}
 
 	nAcct := len(rec.Accounts)
-	usedI := PoolEffectiveCapped(rec)
+
+	// surface-level pause check — force exhausted before normal classification
+	paused := false
+	if rec.Note != "" {
+		noteL := strings.ToLower(rec.Note)
+		if strings.Contains(noteL, "paused") || strings.Contains(noteL, "do not dispatch") {
+			paused = true
+		}
+	}
+
+	if paused {
+		cls := ClassExhausted
+		out := fmt.Sprintf("%s: PAUSED (note: %s) -> %s -> concurrency 0", surface, rec.Note, cls)
+		if nAcct > 0 {
+			out += fmt.Sprintf("  [%d accounts in pool]", nAcct)
+		}
+		return out
+	}
 
 	if rec.WindowDays == nil {
 		return fmt.Sprintf("%s: exhausted -> concurrency 0", surface)
 	}
 
+	trueUsed := int(math.Round(EffectiveUsed(rec)))
 	window := *rec.WindowDays
 	left := 0
 	if rec.DaysLeft != nil {
@@ -429,11 +501,16 @@ func (lc *LedgerCommands) Pace(surface string) string {
 		fmt.Sscanf(f, "%d", &floorPct)
 	}
 
-	cls := PaceClassOf(usedI, elapsed, floorPct)
+	classifyUsed := trueUsed
+	if nAcct > 0 && trueUsed >= 95 {
+		classifyUsed = 94
+	}
+
+	cls := PaceClassOf(classifyUsed, elapsed, floorPct)
 
 	if nAcct > 0 {
 		out := fmt.Sprintf("%s: effective %d%% of %dx100%% pool, %d%% window elapsed -> %s -> concurrency %d",
-			surface, usedI, nAcct, elapsed, cls, ClassConcurrency(cls))
+			surface, trueUsed, nAcct, elapsed, cls, ClassConcurrency(cls))
 
 		SortAccountsByBurnOrder(rec.Accounts)
 		for _, a := range rec.Accounts {
@@ -444,7 +521,6 @@ func (lc *LedgerCommands) Pace(surface string) string {
 			out += fmt.Sprintf("\n  burn#%d %s used=%d%%%s", a.BurnOrder, a.Email, a.UsedPct, until)
 		}
 
-		// primary = burn-order-1; check exhaustion and pause
 		var primary, reserve AccountRow
 		for _, a := range rec.Accounts {
 			if a.BurnOrder == 1 || (a.BurnOrder == 0 && primary.Email == "") {
@@ -458,7 +534,7 @@ func (lc *LedgerCommands) Pace(surface string) string {
 		}
 
 		primaryExhausted := primary.UsedPct >= 95 || primary.ExhaustedUntil > NowEpoch()
-		primaryPaused := strings.Contains(primary.Note, "PAUSED") || strings.Contains(primary.Note, "do-not-dispatch")
+		primaryPaused := strings.Contains(strings.ToLower(primary.Note), "paused") || strings.Contains(strings.ToLower(primary.Note), "do not dispatch")
 
 		if primaryPaused {
 			out += fmt.Sprintf("\n  PAUSED: primary burn#%d %s is paused (note: %s)", primary.BurnOrder, primary.Email, primary.Note)
@@ -482,7 +558,7 @@ func (lc *LedgerCommands) Pace(surface string) string {
 	}
 
 	return fmt.Sprintf("%s: %d%% used, %d%% of window elapsed -> %s -> concurrency %d",
-		surface, usedI, elapsed, cls, ClassConcurrency(cls))
+		surface, trueUsed, elapsed, cls, ClassConcurrency(cls))
 }
 
 func (lc *LedgerCommands) Show() string {
@@ -674,7 +750,3 @@ func (lc *LedgerCommands) Selftest() string {
 }
 
 func intPtr(i int) *int { return &i }
-
-func ClaudeActiveExpanded() string {
-	return ""
-}
