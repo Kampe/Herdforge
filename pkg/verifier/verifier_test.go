@@ -6,7 +6,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -237,6 +239,23 @@ func TestVerifyCandidateEnvironmentPolicyIsEnforced(t *testing.T) {
 	if err != nil || inherited.Outcome != OutcomeFAIL {
 		t.Fatalf("inherited policy must honestly expose ambient behavior: receipt=%+v err=%v", inherited, err)
 	}
+	if _, err := v.VerifyCandidate(context.Background(), dir, VerificationRequest{
+		CandidateSHA:      candidate,
+		EnvironmentPolicy: "unknown-policy",
+	}); err == nil {
+		t.Fatal("unknown environment policy must be rejected")
+	}
+}
+
+func TestHermeticEnvironmentFindsGoToolchain(t *testing.T) {
+	dir, candidate := verificationRepo(t)
+	receipt, err := NewVerifierArgs([]string{"go", "version"}).VerifyCandidate(context.Background(), dir, VerificationRequest{
+		CandidateSHA:      candidate,
+		EnvironmentPolicy: EnvironmentPolicyHermetic,
+	})
+	if err != nil || receipt.Outcome != OutcomePASS {
+		t.Fatalf("hermetic toolchain lookup failed: receipt=%+v err=%v", receipt, err)
+	}
 }
 
 func TestExecuteBoundsRetainedOutput(t *testing.T) {
@@ -252,6 +271,27 @@ func TestExecuteBoundsRetainedOutput(t *testing.T) {
 	}
 	if result.OutputDigest == "" {
 		t.Fatal("full output digest must remain available after truncation")
+	}
+}
+
+func TestReceiptUsesFullOutputDigestWithBoundedRetention(t *testing.T) {
+	dir := t.TempDir()
+	script := filepath.Join(dir, "emit-output")
+	writeExecutable(t, script, "#!/bin/sh\nhead -c 2000000 /dev/zero\n")
+	v := NewVerifierArgs([]string{"./emit-output"})
+	result, err := v.Execute(context.Background(), dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	receipt := makeReceipt(VerificationRequest{
+		CandidateSHA:      strings.Repeat("a", 40),
+		EnvironmentPolicy: EnvironmentPolicyInherited,
+	}, v.argv(), result, result.Outcome)
+	if len(result.Output) > MaxRetainedOutputBytes {
+		t.Fatalf("retained output exceeded bound: %d", len(result.Output))
+	}
+	if receipt.OutputDigest != result.OutputDigest || receipt.OutputDigest == digestBytes([]byte(result.Output)) {
+		t.Fatal("receipt must preserve the full process-output digest, not the truncated payload")
 	}
 }
 
@@ -276,6 +316,15 @@ func TestMutationPathGuardsRejectEscapesAndMetadataWithoutOutsideWrites(t *testi
 	}
 	git(t, dir, "add", "git-parent")
 	git(t, dir, "commit", "-q", "-m", "add git metadata alias")
+	outsideParent := t.TempDir()
+	outsideVictim := filepath.Join(outsideParent, "victim.txt")
+	writeFile(t, outsideVictim, "outside-parent\n")
+	outsideParentLink := filepath.Join(dir, "outside-parent")
+	if err := os.Symlink(outsideParent, outsideParentLink); err != nil {
+		t.Fatal(err)
+	}
+	git(t, dir, "add", "outside-parent")
+	git(t, dir, "commit", "-q", "-m", "add outside parent alias")
 	candidate := gitOutput(t, dir, "rev-parse", "HEAD")
 
 	tests := []struct {
@@ -289,6 +338,7 @@ func TestMutationPathGuardsRejectEscapesAndMetadataWithoutOutsideWrites(t *testi
 		{name: "tracked symlink", target: "tracked-link", expected: "Lstat regular file"},
 		{name: "resolved git dir", target: "git-parent/hooks/fac122-probe", expected: "git metadata"},
 		{name: "git first component", target: ".git/hooks/fac122-probe", expected: "may not enter .git"},
+		{name: "symlinked parent", target: "outside-parent/victim.txt", expected: "resolves outside candidate root"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -304,6 +354,7 @@ func TestMutationPathGuardsRejectEscapesAndMetadataWithoutOutsideWrites(t *testi
 				t.Fatalf("unsafe mutation target must fail with %q, got %v", tt.expected, err)
 			}
 			assertFile(t, outsideFile, "outside\n")
+			assertFile(t, outsideVictim, "outside-parent\n")
 			assertFile(t, gitMetadataProbe, "metadata\n")
 			assertClean(t, dir)
 		})
@@ -343,6 +394,77 @@ func TestRunMutationCheck_RealMutantIsKilledAndRestored(t *testing.T) {
 	}
 	assertFile(t, filepath.Join(dir, "candidate.txt"), "original\n")
 	assertClean(t, dir)
+}
+
+func TestRunMutationCheck_BaselineFailureIsNotKilled(t *testing.T) {
+	dir, candidate := verificationRepo(t)
+	result, err := NewVerifierArgs([]string{"./always-fail.sh"}).RunMutationCheckForCandidate(context.Background(), dir, MutationRequest{
+		CandidateSHA:      candidate,
+		EnvironmentPolicy: EnvironmentPolicyInherited,
+		TargetFile:        "candidate.txt",
+		OriginalCode:      "original\n",
+		MutantCode:        "mutant\n",
+		Timeout:           time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Killed || result.Outcome != OutcomeFAIL || result.Baseline.Outcome != OutcomeFAIL {
+		t.Fatalf("baseline failure must stop mutation as FAIL: %+v", result)
+	}
+	assertFile(t, filepath.Join(dir, "candidate.txt"), "original\n")
+	assertClean(t, dir)
+}
+
+func TestRunMutationCheck_MismatchedOriginalIsBlocked(t *testing.T) {
+	dir, candidate := verificationRepo(t)
+	result, err := NewVerifierArgs([]string{"true"}).RunMutationCheckForCandidate(context.Background(), dir, MutationRequest{
+		CandidateSHA:      candidate,
+		EnvironmentPolicy: EnvironmentPolicyInherited,
+		TargetFile:        "candidate.txt",
+		OriginalCode:      "not-the-candidate\n",
+		MutantCode:        "mutant\n",
+		Timeout:           time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Killed || result.Outcome != OutcomeBLOCKED || !strings.Contains(result.Output, "does not match") {
+		t.Fatalf("mismatched original bytes must block before mutation: %+v", result)
+	}
+	assertFile(t, filepath.Join(dir, "candidate.txt"), "original\n")
+	assertClean(t, dir)
+}
+
+func TestExecuteCancellationKillsProcessGroup(t *testing.T) {
+	dir := t.TempDir()
+	pidFile := filepath.Join(t.TempDir(), "child.pid")
+	writeExecutable(t, filepath.Join(dir, "spawn-child"), "#!/bin/sh\nsleep 30 &\nchild=$!\nprintf '%s\\n' \"$child\" > \"$1\"\nwait \"$child\"\n")
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	result, err := NewVerifierArgs([]string{"./spawn-child", pidFile}).Execute(ctx, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Outcome != OutcomeBLOCKED {
+		t.Fatalf("canceled process group must be BLOCKED: %+v", result)
+	}
+	data, err := os.ReadFile(pidFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if err := syscall.Kill(pid, 0); err != nil {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("canceled verifier left grandchild process %d alive", pid)
 }
 
 func TestRunMutationCheck_VacuousSuiteFailsMutationGate(t *testing.T) {

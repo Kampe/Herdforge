@@ -303,7 +303,7 @@ func validateEnvironmentPolicy(policy EnvironmentPolicy) error {
 
 func hermeticEnvironment() []string {
 	return []string{
-		"PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin",
+		"PATH=/opt/homebrew/bin:/usr/local/go/bin:/go/bin:/usr/local/bin:/usr/bin:/bin",
 		"LC_ALL=C",
 		"LANG=C",
 		"TZ=UTC",
@@ -389,6 +389,11 @@ func blockedReceipt(req VerificationRequest, argv []string, exitCode int, output
 	if output != nil {
 		result.Output += "\n" + string(output)
 	}
+	// OutputDigest always describes the complete output retained for this
+	// synthetic blocked result. Process results instead provide the digest of
+	// the complete raw process output before Result.Output is bounded.
+	result.Output = boundedOutput([]byte(result.Output))
+	result.OutputDigest = digestBytes([]byte(result.Output))
 	receipt := makeReceipt(req, argv, result, OutcomeBLOCKED)
 	return &receipt
 }
