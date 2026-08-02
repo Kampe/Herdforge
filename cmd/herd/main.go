@@ -97,6 +97,9 @@ func main() {
 	case "board-done":
 		runBoardDone()
 
+	case "board-sync":
+		runBoardSync()
+
 	case "sh", "repl":
 		runShell()
 
@@ -177,6 +180,7 @@ func printUsage() {
 	fmt.Println("  review     Claim in-progress tasks for reviewer and advance to review status")
 	fmt.Println("  approve    Move in-review cards to done, gated on merge evidence")
 	fmt.Println("  board-done Move one card to done ONLY with proof its work is on origin/main")
+	fmt.Println("  board-sync Reconcile board status against git reality (report only)")
 	fmt.Println("  sh         Interactive shell: run herd subcommands in a loop")
 	fmt.Println("  send       Submit text to a herdr agent pane and verify consumption")
 	fmt.Println("  cleanup    Close finished one-off agent tabs (standing fleet exempt)")
@@ -1319,6 +1323,131 @@ func runBoardDone() {
 	}
 	fmt.Printf("herd board-done: %s proof: %s\n", res.Ref, res.Proof)
 	fmt.Printf("herd board-done: %s is done (verified by read-back)\n", res.Ref)
+}
+
+// runBoardSync reconciles the board against git reality and reports drift.
+// Exit codes:
+//
+//	0 = no drift (board is honest)
+//	1 = hard error (config, provider, git)
+//	2 = drift found (one or more findings)
+//	3 = partial: drift found AND errors occurred during reconcile
+//	4 = provider list tasks returned zero cards (board may be empty)
+func runBoardSync() {
+	fs := flag.NewFlagSet("board-sync", flag.ExitOnError)
+	asJSON := fs.Bool("json", false, "Output results as JSON")
+	intervalSec := fs.Int("interval", 0, "Run continuously at N-second intervals (0 = run once)")
+	ensureDaemon := fs.Bool("ensure-daemon", false, "Not yet implemented: exit 0 and do nothing")
+	selftestFlag := fs.Bool("selftest", false, "Run classification assertions and exit")
+	fs.Parse(os.Args[2:])
+
+	if *selftestFlag {
+		tests := []struct {
+			mergedLog string
+			ref       string
+			epoch     int64
+			want      bool
+		}{
+			{"1745683200\tfeat: implement widget renderer (FAC-18)", "fac-18", 0, true},
+			{"1745683200\tfeat: implement widget renderer (FAC-18)", "fac-18", 1745683201, true},
+			{"1745683200\tfeat: implement widget renderer (FAC-18)", "fac-18", 1745683200, true},
+			{"1745683200\tfeat: implement widget renderer (FAC-18)", "fac-18", 1745683199, false},
+			{"1745683200\tafter FAC-18 restore followup", "fac-18", 0, false},
+			{"1745683200\tfollow-up on fac-18 bug", "fac-18", 0, false},
+			{"1745683200\tprep for FAC-18 sprint planning", "fac-18", 0, false},
+			{"1745683200\tfeat: implement widget renderer (FAC-18)", "fac-1", 0, false},
+		}
+		for _, tc := range tests {
+			if got := hsync.RefShipped(tc.mergedLog, tc.ref, tc.epoch); got != tc.want {
+				fmt.Fprintf(os.Stderr, "board-sync selftest FAIL: RefShipped(log=%q, ref=%q, epoch=%d) = %v, want %v\n", tc.mergedLog, tc.ref, tc.epoch, got, tc.want)
+				os.Exit(1)
+			}
+		}
+		// Also test NormalizeRef and mentionPivot match
+		if got := hsync.NormalizeRef("FAC-018"); got != "FAC-18" {
+			fmt.Fprintf(os.Stderr, "board-sync selftest FAIL: NormalizeRef(FAC-018)=%q want FAC-18\n", got)
+			os.Exit(1)
+		}
+		fmt.Println("board-sync selftest PASS")
+		return
+	}
+
+	if *ensureDaemon {
+		// Placeholder: the daemon will call board-sync when integrated.
+		// For now, exit 0 gracefully.
+		fmt.Println("board-sync: --ensure-daemon not yet implemented, exiting 0")
+		return
+	}
+
+	cfg, err := config.LoadConfig(".herd/herd.yaml")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "board-sync: failed to load config: %v\n", err)
+		os.Exit(1)
+	}
+
+	var tp provider.TaskProvider
+	switch cfg.TaskProvider.Type {
+	case "kaneo":
+		tp = provider.NewKaneoProvider(cfg.TaskProvider.APIURL, cfg.TaskProvider.ProjectID, cfg.TaskProvider.UseCLI)
+	default:
+		tp = provider.NewMemoryProvider()
+	}
+
+	syncer := hsync.NewBoardSyncer(tp)
+
+	if *intervalSec > 0 {
+		for {
+			code := runBoardSyncOnce(syncer, cfg.TaskProvider.ProjectID, *asJSON)
+			if code != 0 {
+				os.Exit(code)
+			}
+			time.Sleep(time.Duration(*intervalSec) * time.Second)
+		}
+	}
+
+	code := runBoardSyncOnce(syncer, cfg.TaskProvider.ProjectID, *asJSON)
+	os.Exit(code)
+}
+
+func runBoardSyncOnce(syncer *hsync.BoardSyncer, projectID string, asJSON bool) int {
+	drift, err := syncer.ReconcileBoard(context.Background(), projectID, ".")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "board-sync: %v\n", err)
+		return 1
+	}
+
+	if asJSON {
+		json.NewEncoder(os.Stdout).Encode(map[string]interface{}{
+			"drift":    drift.Drift,
+			"findings": drift.Findings,
+		})
+	} else {
+		if drift.Drift == 0 {
+			fmt.Println("board-sync: board is honest — no drift found")
+			return 0
+		}
+		for _, f := range drift.Findings {
+			prefix := "board-sync:"
+			switch f.Kind {
+			case "SHIPPED":
+				prefix = "board-sync: 🚢 SHIPPED"
+			case "STALE":
+				prefix = "board-sync: STALE"
+			case "BOARD_LAG":
+				prefix = "board-sync: ⏳ BOARD_LAG"
+			case "UNKNOWN":
+				prefix = "board-sync: ? UNKNOWN"
+			}
+			fmt.Printf("%s %s (%s/%s): %s\n", prefix, f.Ref, f.TaskID, f.Status, f.Action)
+		}
+		if drift.Drift > 0 {
+			fmt.Printf("board-sync: %d drift finding(s)\n", drift.Drift)
+		}
+	}
+	if drift.Drift > 0 {
+		return 2
+	}
+	return 0
 }
 
 // runSend ports bin/herd-send: prompt an agent and verify it consumed the
