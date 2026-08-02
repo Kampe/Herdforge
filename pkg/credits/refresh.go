@@ -259,14 +259,16 @@ func (lc *LedgerCommands) Set(surface string, used, windowDays, daysLeft int, ho
 		}
 
 		existing, exists := data[surface]
-		if exists && len(existing.Accounts) > 0 && activeEmail != "" {
+		if exists && len(existing.Accounts) > 0 {
 			rec.Accounts = make([]AccountRow, len(existing.Accounts))
 			copy(rec.Accounts, existing.Accounts)
-			for i, a := range rec.Accounts {
-				if strings.EqualFold(a.Email, activeEmail) {
-					rec.Accounts[i].UsedPct = used
-					rec.Accounts[i].Updated = NowEpoch()
-					break
+			if activeEmail != "" {
+				for i, a := range rec.Accounts {
+					if strings.EqualFold(a.Email, activeEmail) {
+						rec.Accounts[i].UsedPct = used
+						rec.Accounts[i].Updated = NowEpoch()
+						break
+					}
 				}
 			}
 		}
@@ -328,7 +330,7 @@ func (lc *LedgerCommands) AccountSet(surface, email string, used, burnOrder int,
 			existing.UsedPct = existing.Accounts[0].UsedPct
 		}
 
-		existing.Note = PoolNote(existing)
+		existing.Note = note
 		data[surface] = existing
 	})
 
