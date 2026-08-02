@@ -516,7 +516,7 @@ func runPulse() {
 				fmt.Fprintf(os.Stderr, "failed to create herdr tab: %v\n", err)
 				os.Exit(1)
 			}
-			if err := herdr.AgentStart(tabLabel, lane.AgentKind, tab.Pane.ID); err != nil {
+			if err := herdr.AgentStart(tabLabel, lane.AgentKind, tab.Pane.ID, herdr.LaneAgentArgs(lane.Model)...); err != nil {
 				fmt.Fprintf(os.Stderr, "failed to start agent: %v\n", err)
 				os.Exit(1)
 			}
@@ -864,7 +864,7 @@ func runStanding() {
 			continue
 		}
 
-		if err := herdr.AgentStart(tabLabel, lane.AgentKind, tab.Pane.ID); err != nil {
+		if err := herdr.AgentStart(tabLabel, lane.AgentKind, tab.Pane.ID, herdr.LaneAgentArgs(lane.Model)...); err != nil {
 			fmt.Fprintf(os.Stderr, "  failed to start agent for lane %s: %v\n", lane.Name, err)
 			continue
 		}
@@ -917,7 +917,7 @@ func runUp() {
 		os.Exit(1)
 	}
 
-	if err := herdr.AgentStart(tabLabel, lane.AgentKind, tab.Pane.ID); err != nil {
+	if err := herdr.AgentStart(tabLabel, lane.AgentKind, tab.Pane.ID, herdr.LaneAgentArgs(lane.Model)...); err != nil {
 		fmt.Fprintf(os.Stderr, "failed to start agent: %v\n", err)
 		os.Exit(1)
 	}
@@ -1024,7 +1024,7 @@ func runReview() {
 				fmt.Fprintf(os.Stderr, "failed to create herdr tab: %v\n", tabErr)
 				os.Exit(1)
 			}
-			if err := herdr.AgentStart(tabLabel, lane.AgentKind, tab.Pane.ID); err != nil {
+			if err := herdr.AgentStart(tabLabel, lane.AgentKind, tab.Pane.ID, herdr.LaneAgentArgs(lane.Model)...); err != nil {
 				fmt.Fprintf(os.Stderr, "failed to start agent: %v\n", err)
 				os.Exit(1)
 			}
@@ -1589,7 +1589,7 @@ func runForge() {
 					tabLabel = fmt.Sprintf("forge-%s-%s", lane.Name, task.Ref)
 					tab, tabErr := herdr.Tab("wF", tabLabel, true)
 					if tabErr == nil {
-						herdr.AgentStart(tabLabel, lane.AgentKind, tab.Pane.ID)
+						herdr.AgentStart(tabLabel, lane.AgentKind, tab.Pane.ID, herdr.LaneAgentArgs(lane.Model)...)
 					}
 				}
 				packet := fmt.Sprintf(`Task [%s]: %s\n\n%s\n\nWorktree: %s`, task.Ref, task.Title, task.Description, lane.Worktree)

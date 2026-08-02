@@ -59,25 +59,44 @@ func Tab(workspaceID, label string, noFocus bool) (*TabInfo, error) {
 	}, nil
 }
 
-// AgentStart starts an agent in the specified pane.
+// AgentStart starts an agent in the specified pane. Extra agentArgs are
+// passed through to the agent executable after `--` (e.g. --model X) — a
+// lane's configured model MUST reach the launch argv or the agent silently
+// runs on the harness default (observed: worker lane configured for
+// deepseek-v4-flash launched on the opencode default instead).
 // Newly created tabs may need a brief moment before the pane shell is ready;
 // we sleep and retry once if herdr reports agent_pane_busy.
-func AgentStart(name, kind string, paneID string) error {
+func AgentStart(name, kind string, paneID string, agentArgs ...string) error {
 	// small delay to let the pane shell initialize
 	time.Sleep(500 * time.Millisecond)
 
-	output, err := runHerdr("agent", "start", name, "--kind", kind, "--pane", paneID)
+	args := []string{"agent", "start", name, "--kind", kind, "--pane", paneID}
+	if len(agentArgs) > 0 {
+		args = append(args, "--")
+		args = append(args, agentArgs...)
+	}
+
+	output, err := runHerdr(args...)
 	if err != nil {
 		// retry once on pane-busy
 		if strings.Contains(string(output), "agent_pane_busy") {
 			time.Sleep(1 * time.Second)
-			output, err = runHerdr("agent", "start", name, "--kind", kind, "--pane", paneID)
+			output, err = runHerdr(args...)
 		}
 		if err != nil {
 			return fmt.Errorf("herdr agent start: %s: %w", output, err)
 		}
 	}
 	return nil
+}
+
+// LaneAgentArgs builds the launch args a lane's config demands: the
+// configured model, when set, always reaches the agent argv.
+func LaneAgentArgs(model string) []string {
+	if model == "" {
+		return nil
+	}
+	return []string{"--model", model}
 }
 
 // AgentPrompt sends a prompt to a running agent. If wait is true, blocks for response.
