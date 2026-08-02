@@ -68,27 +68,87 @@ func TestResolveWorkspace_EnvWins(t *testing.T) {
 	}
 }
 
-func TestResolveWorkspaceWithConfig_WinsOverFocused(t *testing.T) {
-	// When config sets herdr_workspace and no env is set, config wins
-	// regardless of what WorkspaceList would return.
+func TestResolveWorkspace_Pure_Kernel(t *testing.T) {
+	entries := []WorkspaceEntry{
+		{WorkspaceID: "wF", Label: "Herdforge", Focused: true},
+	}
+	t.Run("env_wins", func(t *testing.T) {
+		got := resolveWorkspace("wEnv", "", entries, "any")
+		if got != "wEnv" {
+			t.Errorf("want wEnv, got %q", got)
+		}
+	})
+	t.Run("config_wins", func(t *testing.T) {
+		got := resolveWorkspace("", "wConfig", entries, "any")
+		if got != "wConfig" {
+			t.Errorf("want wConfig, got %q", got)
+		}
+	})
+	t.Run("env_overrides_config", func(t *testing.T) {
+		got := resolveWorkspace("wEnv", "wConfig", entries, "any")
+		if got != "wEnv" {
+			t.Errorf("env should beat config, got %q", got)
+		}
+	})
+	t.Run("config_wins_over_focused", func(t *testing.T) {
+		// sentinel "wX" is NOT the focused workspace ID ("wF")
+		got := resolveWorkspace("", "wX", entries, "any")
+		if got != "wX" {
+			t.Errorf("config wX should beat focused wF, got %q", got)
+		}
+	})
+	t.Run("label_wins", func(t *testing.T) {
+		got := resolveWorkspace("", "", entries, "herdforge")
+		if got != "wF" {
+			t.Errorf("label match should win, got %q", got)
+		}
+	})
+	t.Run("fallback_focused", func(t *testing.T) {
+		got := resolveWorkspace("", "", entries, "unknown")
+		if got != "wF" {
+			t.Errorf("focused fallback should be wF, got %q", got)
+		}
+	})
+	t.Run("fallback_empty", func(t *testing.T) {
+		got := resolveWorkspace("", "", nil, "any")
+		if got != "wF" {
+			t.Errorf("empty fallback should be wF, got %q", got)
+		}
+	})
+}
+
+func TestResolveWorkspaceWithConfig_ConfigWinsOverFocusedAndIsolation(t *testing.T) {
+	t.Setenv("HERD_WORKSPACE", "") // ensure env is clear
+	// Sentinel that cannot coincide with PickWorkspace fallback ("wF").
+	cfg := &config.Config{Fleet: config.FleetConfig{HerdrWorkspace: "wConfigSentinel"}}
+	got := ResolveWorkspaceWithConfig("/tmp", cfg)
+	if got != "wConfigSentinel" {
+		t.Errorf("config workspace = %q, want wConfigSentinel (live focused: %q)", got, PickWorkspace(nil, ""))
+	}
+}
+
+func TestResolveWorkspaceWithConfig_NilConfigFallsThrough(t *testing.T) {
 	t.Setenv("HERD_WORKSPACE", "")
-	cfg := &config.Config{Fleet: config.FleetConfig{HerdrWorkspace: "wF"}}
-	got := ResolveWorkspaceWithConfig("some/repo", cfg)
-	if got != "wF" {
-		t.Errorf("ResolveWorkspaceWithConfig with config workspace = %q, want wF", got)
+	got := ResolveWorkspaceWithConfig("/tmp", nil)
+	if got == "" {
+		t.Error("nil config should fall through to live resolve, got empty")
 	}
 }
 
 func TestResolveWorkspaceWithConfig_EmptyConfigFallsThrough(t *testing.T) {
 	t.Setenv("HERD_WORKSPACE", "")
-	gotNil := ResolveWorkspaceWithConfig("some/repo", nil)
-	if gotNil == "" {
-		t.Error("ResolveWorkspaceWithConfig with nil config returned empty")
-	}
-
 	cfg := &config.Config{}
-	gotEmpty := ResolveWorkspaceWithConfig("some/repo", cfg)
-	if gotEmpty == "" {
-		t.Error("ResolveWorkspaceWithConfig with empty config returned empty")
+	got := ResolveWorkspaceWithConfig("/tmp", cfg)
+	if got == "" {
+		t.Error("empty config should fall through to live resolve, got empty")
+	}
+}
+
+func TestResolveWorkspaceWithConfig_EnvOverridesConfig(t *testing.T) {
+	t.Setenv("HERD_WORKSPACE", "wEnvOverride")
+	cfg := &config.Config{Fleet: config.FleetConfig{HerdrWorkspace: "wConfig"}}
+	got := ResolveWorkspaceWithConfig("/tmp", cfg)
+	if got != "wEnvOverride" {
+		t.Errorf("env should override config, got %q", got)
 	}
 }
