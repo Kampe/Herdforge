@@ -56,6 +56,7 @@ func (noopCapacity) Release(context.Context, string) error { return nil }
 type ClaimManager struct {
 	store    LeaseStore
 	capacity CapacityCoordinator
+	outbox   OutboxRecorder
 	now      func() time.Time
 	ttl      time.Duration
 }
@@ -74,10 +75,17 @@ func WithCapacityCoordinator(c CapacityCoordinator) Option {
 	return func(m *ClaimManager) { m.capacity = c }
 }
 
+// WithOutboxRecorder wires a transactional-outbox recorder into
+// claim/release intents; see integration.go. A no-op recorder is used
+// when none is supplied — no package in this repo implements one yet.
+func WithOutboxRecorder(o OutboxRecorder) Option {
+	return func(m *ClaimManager) { m.outbox = o }
+}
+
 // NewClaimManager builds a ClaimManager over store. store's lifetime is
 // owned by the caller (Close it when the manager is no longer needed).
 func NewClaimManager(store LeaseStore, opts ...Option) *ClaimManager {
-	m := &ClaimManager{store: store, capacity: noopCapacity{}, now: time.Now, ttl: 10 * time.Minute}
+	m := &ClaimManager{store: store, capacity: noopCapacity{}, outbox: noopOutbox{}, now: time.Now, ttl: 10 * time.Minute}
 	for _, opt := range opts {
 		opt(m)
 	}
@@ -144,6 +152,11 @@ func (m *ClaimManager) Claim(ctx context.Context, req ClaimRequest) (*Lease, err
 		_, _ = m.settlePendingCapacity(ctx, func(k LeaseKey) bool { return k == req.Key })
 		return nil, fmt.Errorf("claim: reserve capacity for role %s: %w", req.Role, err)
 	}
+
+	_ = m.outbox.Record(ctx, OutboxIntent{
+		IdempotencyKey: fmt.Sprintf("claim:%s/%s/%s/%s:g%d", req.Key.Repo, req.Key.Provider, req.Key.Project, req.Key.TaskRef, lease.Generation),
+		Kind:           "lease_claimed",
+	})
 	return lease, nil
 }
 
@@ -169,6 +182,10 @@ func (m *ClaimManager) Release(ctx context.Context, key LeaseKey, ownerID string
 		return err
 	}
 	_, err = m.settlePendingCapacity(ctx, func(k LeaseKey) bool { return k == key })
+	_ = m.outbox.Record(ctx, OutboxIntent{
+		IdempotencyKey: fmt.Sprintf("release:%s/%s/%s/%s:g%d", key.Repo, key.Provider, key.Project, key.TaskRef, generation),
+		Kind:           "lease_released",
+	})
 	return err
 }
 
@@ -260,3 +277,15 @@ func (m *ClaimManager) IsClaimed(ctx context.Context, key LeaseKey) (bool, error
 	}
 	return false, nil
 }
+
+// Reconcile implements Reconciler using the primitives ClaimManager
+// already exposes: sweep expiry and settle any pending capacity release.
+// This is the concrete, minimal default FAC-119's periodic reconciliation
+// sweep can drive directly; a fuller reconciliation that also cross-checks
+// outbox/provider state is FAC-119's to build on top of this.
+func (m *ClaimManager) Reconcile(ctx context.Context) error {
+	_, err := m.ExpireStale(ctx)
+	return err
+}
+
+var _ Reconciler = (*ClaimManager)(nil)
