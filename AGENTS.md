@@ -6,6 +6,11 @@ This contract governs all AI agents (Claude, Gemini, Codex, Grok, Ollama) partic
 
 ## 1. Core Engineering Invariants & Rules
 
+0. **Fleet-Only Forging (FAC-113, hard invariant)**:
+   - Herdforge forges itself with its own **herdr fleet** (opencode/deepseek agents in herdr tabs, driven by `herd dispatch`/`herd send`/`herd review`). This is the entire point of the repo: the product must be exercised on itself.
+   - **NEVER** use Claude subagents (the Agent tool: general-purpose, Explore, etc.) to build, fix, review, or audit anything in this repo. Using them defeats the dogfooding premise and stops testing the actual system.
+   - The coordinator dispatches to the fleet and owns git plumbing (harvest → PR → merge → `herd approve`). Fleet agents commit in their worktree and report; they never push or merge. When an agent stalls, the fix is a firmer packet / `herd kick` / the completion self-gate (`herd verify`), never routing around the fleet.
+
 1. **Fail-Closed Execution**:
    - All CLI tools and internal package functions **must propagate non-zero exit codes** on error (`os.Exit(1)` or non-nil `error`).
    - HTTP responses carrying `{"error": ...}` JSON bodies returned under `200 OK` **must be rejected as hard errors**.
