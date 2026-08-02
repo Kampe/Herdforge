@@ -9,7 +9,9 @@ import (
 
 func gitIn(t *testing.T, dir string, args ...string) string {
 	t.Helper()
-	cmd := exec.Command("git", args...)
+	base := []string{"-c", "commit.gpgSign=false", "-c", "gpg.x509.program=false", "-c", "gpg.format=openpgp", "-c", "tag.gpgSign=false", "-c", "user.email=test@herdforge.local", "-c", "user.name=Test Runner"}
+	gitArgs := append(base, args...)
+	cmd := exec.Command("git", gitArgs...)
 	cmd.Dir = dir
 	out, err := cmd.CombinedOutput()
 	if err != nil {
