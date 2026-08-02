@@ -33,6 +33,7 @@ type DispatchResult struct {
 	TaskPacket  string
 	Launched    bool
 	Lane        string
+	Model       string // the model that actually launched (after fallback)
 }
 
 type Dispatcher struct {
@@ -136,12 +137,25 @@ func (d *Dispatcher) Dispatch(ctx context.Context, opts DispatchOptions) (*Dispa
 		if len(tabLabel) > 32 {
 			tabLabel = tabLabel[:32]
 		}
+		// Probe the lane model (and fall over to fallback_models) BEFORE
+		// spawning: a quota-exhausted surface launches an agent that produces
+		// plans, not code, and burns the dispatch silently. Catch it here.
+		model, trail := herdr.ResolveHealthyModel(ctx, lane.Model, lane.FallbackModels)
+		if model == "" {
+			var b strings.Builder
+			for _, p := range trail {
+				fmt.Fprintf(&b, "\n  %s: %s", p.Model, p.Reason)
+			}
+			return result, fmt.Errorf("no healthy model for lane %q — every candidate is exhausted:%s", lane.Name, b.String())
+		}
+		result.Model = model
+
 		tab, err := herdr.Tab(herdr.ResolveWorkspace("."), tabLabel, true)
 		if err != nil {
 			return result, fmt.Errorf("worktree ready but failed to launch agent: %w", err)
 		}
 
-		if err := herdr.AgentStart(tabLabel, lane.AgentKind, tab.Pane.ID, herdr.LaneAgentArgs(lane.Model)...); err != nil {
+		if err := herdr.AgentStart(tabLabel, lane.AgentKind, tab.Pane.ID, herdr.LaneAgentArgs(model)...); err != nil {
 			return result, fmt.Errorf("worktree ready but agent start failed: %w", err)
 		}
 
