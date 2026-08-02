@@ -8,6 +8,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"time"
 )
 
@@ -23,16 +24,25 @@ var ErrRoleMismatch = errors.New("claim: worker role does not match task role")
 // acquired or released, so a role's capacity pool stays in lockstep with
 // its leases.
 //
-// Release must be idempotent: ClaimManager's durable settlement mechanism
-// (see settlePendingCapacity) guarantees it will call Release again for
-// the same lease if a prior attempt failed or if it cannot itself prove
-// exactly one settler won a race, so implementations must treat repeated
-// Release(role) calls for the same underlying token as safe. This is a
-// deliberate tradeoff: pkg/claim guarantees at-least-once, durable,
-// crash-safe delivery of the release call (never "forgets" a token, never
-// reports success without the coordinator having accepted it), and asks
-// the coordinator to make redundant delivery a no-op rather than building
-// a distributed exactly-once executor inside a lease package.
+// idempotencyKey is stable per (lease ID, generation, intent) — see
+// capacityKey — and is the same on every retry of the same logical
+// operation, including a retry after a crash. pkg/claim's own delivery
+// protocol (LeaseStore.ClaimCapacityRelease/AckCapacityRelease/
+// FailCapacityRelease) already guarantees at most one live settler is
+// ever calling Release for a given lease at a time — concurrent
+// double-delivery is a store-level CAS claim, not something
+// CapacityCoordinator needs to guard against itself. What
+// CapacityCoordinator alone can guard against is redelivery across a
+// crash: if a settler calls Release, the coordinator durably applies it,
+// and the settler crashes before it can Ack, pkg/claim's claim goes
+// stale and a later settler calls Release again with the *same*
+// idempotencyKey. Implementations should keep an applied-keys ledger (or
+// equivalent) and treat a repeat of the same key as a no-op, so that
+// at-least-once, crash-safe delivery from pkg/claim becomes an
+// effectively-exactly-once external effect. A coordinator that ignores
+// idempotencyKey is only safe if Release/Reserve are already naturally
+// idempotent operations (e.g. absolute pool-membership set/unset rather
+// than an increment/decrement counter).
 //
 // FAC-120/FAC-119 boundary: no package in this repo implements capacity
 // pools yet. Until FAC-119's durable lifecycle/outbox service exists to
@@ -41,14 +51,23 @@ var ErrRoleMismatch = errors.New("claim: worker role does not match task role")
 // commit (with a compensating Release on Reserve failure), not inside it.
 // A no-op coordinator is used when none is supplied.
 type CapacityCoordinator interface {
-	Reserve(ctx context.Context, role string) error
-	Release(ctx context.Context, role string) error
+	Reserve(ctx context.Context, role string, idempotencyKey string) error
+	Release(ctx context.Context, role string, idempotencyKey string) error
 }
 
 type noopCapacity struct{}
 
-func (noopCapacity) Reserve(context.Context, string) error { return nil }
-func (noopCapacity) Release(context.Context, string) error { return nil }
+func (noopCapacity) Reserve(context.Context, string, string) error { return nil }
+func (noopCapacity) Release(context.Context, string, string) error { return nil }
+
+// capacityKey derives the stable idempotency key CapacityCoordinator sees
+// for a given lease and intent ("reserve" or "release"). Bound to the
+// lease's durable ID and its generation, per the review requirement, so
+// it is identical across any number of retries/redeliveries of the same
+// logical operation and distinct across a reclaim (new generation).
+func capacityKey(intent string, l *Lease) string {
+	return fmt.Sprintf("%s:%d:g%d", intent, l.ID, l.Generation)
+}
 
 // ClaimManager enforces role-matching and drives a LeaseStore to produce
 // atomic cross-process leases with renewal, expiry, operator hold, and
@@ -59,6 +78,16 @@ type ClaimManager struct {
 	outbox   OutboxRecorder
 	now      func() time.Time
 	ttl      time.Duration
+
+	// settlerID identifies this ClaimManager instance as a capacity-
+	// release settler for LeaseStore.ClaimCapacityRelease's claim
+	// protocol. Unique per instance by default (see NewClaimManager);
+	// override with WithSettlerID for deterministic test identities.
+	settlerID string
+	// capacityClaimTimeout bounds how long a ClaimCapacityRelease claim
+	// is honored before another settler may reclaim it, i.e. how long a
+	// crashed settler's in-flight release can block recovery.
+	capacityClaimTimeout time.Duration
 }
 
 // Option configures a ClaimManager.
@@ -82,10 +111,27 @@ func WithOutboxRecorder(o OutboxRecorder) Option {
 	return func(m *ClaimManager) { m.outbox = o }
 }
 
+// WithSettlerID overrides the auto-generated settler identity this
+// ClaimManager uses to claim capacity-release work. Tests that want two
+// distinct, deterministic settlers (e.g. simulating two processes) should
+// set this explicitly; production callers normally don't need to.
+func WithSettlerID(id string) Option { return func(m *ClaimManager) { m.settlerID = id } }
+
+// WithCapacityClaimTimeout overrides how long a capacity-release claim is
+// honored before another settler may reclaim it (crash recovery bound).
+// Default 5m.
+func WithCapacityClaimTimeout(d time.Duration) Option {
+	return func(m *ClaimManager) { m.capacityClaimTimeout = d }
+}
+
 // NewClaimManager builds a ClaimManager over store. store's lifetime is
 // owned by the caller (Close it when the manager is no longer needed).
 func NewClaimManager(store LeaseStore, opts ...Option) *ClaimManager {
-	m := &ClaimManager{store: store, capacity: noopCapacity{}, outbox: noopOutbox{}, now: time.Now, ttl: 10 * time.Minute}
+	m := &ClaimManager{
+		store: store, capacity: noopCapacity{}, outbox: noopOutbox{}, now: time.Now, ttl: 10 * time.Minute,
+		capacityClaimTimeout: 5 * time.Minute,
+	}
+	m.settlerID = fmt.Sprintf("pid%d-%p-%d", os.Getpid(), m, time.Now().UnixNano())
 	for _, opt := range opts {
 		opt(m)
 	}
@@ -131,25 +177,25 @@ func (m *ClaimManager) Claim(ctx context.Context, req ClaimRequest) (*Lease, err
 		// concurrent winner; settle it regardless of our own outcome so
 		// that eviction's capacity token doesn't wait for someone else's
 		// sweep.
-		_, _ = m.settlePendingCapacity(ctx, func(k LeaseKey) bool { return k == req.Key })
+		_, _ = m.settlePendingCapacity(ctx, &req.Key)
 		return nil, err
 	}
 
 	// Acquire durably evicts (Expires) any stale prior lease for this key
 	// as part of winning the claim, which is exactly what makes that
-	// lease's row show up in PendingCapacityRelease. Settle it now, before
-	// reserving the new token, so the old owner's capacity is released
-	// before (or, if settlement itself fails, at minimum durably queued
-	// ahead of) the new reservation instead of the new claim silently
-	// stacking on top of an unreturned token. Errors are intentionally not
-	// fatal to the new claim; the pending row stays durable and retryable
-	// regardless (see settlePendingCapacity).
-	_, _ = m.settlePendingCapacity(ctx, func(k LeaseKey) bool { return k == req.Key })
+	// lease's row claimable via ClaimCapacityRelease. Settle it now,
+	// before reserving the new token, so the old owner's capacity is
+	// released before (or, if settlement itself fails, at minimum durably
+	// queued ahead of) the new reservation instead of the new claim
+	// silently stacking on top of an unreturned token. Errors are
+	// intentionally not fatal to the new claim; the pending row stays
+	// durable and retryable regardless (see settlePendingCapacity).
+	_, _ = m.settlePendingCapacity(ctx, &req.Key)
 
-	if err := m.capacity.Reserve(ctx, req.Role); err != nil {
+	if err := m.capacity.Reserve(ctx, req.Role, capacityKey("reserve", lease)); err != nil {
 		// Compensate: don't strand a durable lease with no capacity behind it.
 		_, _, _ = m.store.Release(ctx, req.Key, req.OwnerID, lease.Generation, m.now())
-		_, _ = m.settlePendingCapacity(ctx, func(k LeaseKey) bool { return k == req.Key })
+		_, _ = m.settlePendingCapacity(ctx, &req.Key)
 		return nil, fmt.Errorf("claim: reserve capacity for role %s: %w", req.Role, err)
 	}
 
@@ -181,7 +227,7 @@ func (m *ClaimManager) Release(ctx context.Context, key LeaseKey, ownerID string
 	if err != nil {
 		return err
 	}
-	_, err = m.settlePendingCapacity(ctx, func(k LeaseKey) bool { return k == key })
+	_, err = m.settlePendingCapacity(ctx, &key)
 	_ = m.outbox.Record(ctx, OutboxIntent{
 		IdempotencyKey: fmt.Sprintf("release:%s/%s/%s/%s:g%d", key.Repo, key.Provider, key.Project, key.TaskRef, generation),
 		Kind:           "lease_released",
@@ -225,32 +271,41 @@ func (m *ClaimManager) SettlePendingCapacity(ctx context.Context) ([]*Lease, err
 }
 
 // settlePendingCapacity is the single place ClaimManager calls
-// CapacityCoordinator.Release. filter == nil settles every pending lease;
-// otherwise only leases whose key matches filter. A coordinator failure
-// for one lease does not stop settlement of the others, but is reported
-// via the returned error (the first one encountered) after all pending
-// leases have been attempted.
-func (m *ClaimManager) settlePendingCapacity(ctx context.Context, filter func(LeaseKey) bool) ([]*Lease, error) {
-	pending, err := m.store.PendingCapacityRelease(ctx)
+// CapacityCoordinator.Release. key == nil settles across every key;
+// otherwise only that key's pending lease(s).
+//
+// This is the durable capacity-release delivery protocol: ClaimCapacity
+// Release atomically claims the batch this call is responsible for (the
+// store-level CAS claim, not a Go mutex, is what makes it impossible for
+// two concurrent settlers to both be attempting Release for the same
+// lease — see LeaseStore's doc comment), then for each claimed lease this
+// calls the coordinator with a stable idempotency key and only Acks
+// (durably marks done) on success. A synchronous failure immediately
+// releases the claim back to pending via FailCapacityRelease so the next
+// attempt doesn't have to wait out the stale-claim timeout; a crash here
+// (this settler dies between the coordinator call succeeding and Ack)
+// leaves the claim to go stale on its own, and a later settler retries
+// with the SAME idempotency key — an at-least-once redelivery a
+// conforming coordinator dedupes into an effectively-exactly-once effect.
+func (m *ClaimManager) settlePendingCapacity(ctx context.Context, key *LeaseKey) ([]*Lease, error) {
+	claimed, err := m.store.ClaimCapacityRelease(ctx, m.settlerID, m.capacityClaimTimeout, m.now(), key)
 	if err != nil {
-		return nil, fmt.Errorf("claim: list pending capacity release: %w", err)
+		return nil, fmt.Errorf("claim: claim capacity release batch: %w", err)
 	}
 
 	var settled []*Lease
 	var firstErr error
-	for _, l := range pending {
-		if filter != nil && !filter(l.LeaseKey) {
-			continue
-		}
-		if err := m.capacity.Release(ctx, l.Role); err != nil {
+	for _, l := range claimed {
+		if err := m.capacity.Release(ctx, l.Role, capacityKey("release", l)); err != nil {
 			if firstErr == nil {
 				firstErr = fmt.Errorf("claim: release capacity for %s (lease %d, role %s): %w", l.TaskRef, l.ID, l.Role, err)
 			}
-			continue // leave pending: durable, retryable, never marked done on failure.
+			_ = m.store.FailCapacityRelease(ctx, l.ID, m.settlerID) // durable, retryable: back to pending now, not stranded until staleAfter.
+			continue
 		}
-		if err := m.store.MarkCapacityReleased(ctx, l.ID, m.now()); err != nil {
+		if err := m.store.AckCapacityRelease(ctx, l.ID, m.settlerID, m.now()); err != nil {
 			if firstErr == nil {
-				firstErr = fmt.Errorf("claim: mark capacity released for lease %d: %w", l.ID, err)
+				firstErr = fmt.Errorf("claim: ack capacity release for lease %d: %w", l.ID, err)
 			}
 			continue
 		}

@@ -25,7 +25,7 @@ const (
 // caller holding a stale generation can be rejected on Renew/Release
 // (fencing) instead of silently acting on a claim it no longer owns.
 type Lease struct {
-	ID           int64
+	ID int64
 	LeaseKey
 	OwnerID      string
 	Role         string

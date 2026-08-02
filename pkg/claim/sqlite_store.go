@@ -72,6 +72,24 @@ func execWithRetry(ctx context.Context, db *sql.DB, query string, args ...any) (
 	return res, err
 }
 
+// queryWithRetry is execWithRetry's counterpart for statements that
+// return rows (in particular UPDATE...RETURNING, used by
+// ClaimCapacityRelease so the atomic claim and reading back exactly what
+// was claimed happen in one statement instead of a claim-then-SELECT
+// pair that would reopen a race window).
+func queryWithRetry(ctx context.Context, db *sql.DB, query string, args ...any) (*sql.Rows, error) {
+	var rows *sql.Rows
+	var err error
+	for attempt := 0; attempt < 8; attempt++ {
+		rows, err = db.QueryContext(ctx, query, args...)
+		if err == nil || !isBusyErr(err) {
+			return rows, err
+		}
+		time.Sleep(time.Duration(attempt+1) * 25 * time.Millisecond)
+	}
+	return rows, err
+}
+
 func (s *SQLiteLeaseStore) migrate() error {
 	migrations := []string{
 		`CREATE TABLE IF NOT EXISTS leases (
@@ -90,7 +108,10 @@ func (s *SQLiteLeaseStore) migrate() error {
 			renewed_at DATETIME NOT NULL,
 			expires_at DATETIME NOT NULL,
 			released_at DATETIME,
-			capacity_released_at DATETIME
+			capacity_released_at DATETIME,
+			capacity_release_state TEXT NOT NULL DEFAULT 'pending',
+			capacity_release_owner TEXT NOT NULL DEFAULT '',
+			capacity_release_claimed_at DATETIME
 		)`,
 		`CREATE UNIQUE INDEX IF NOT EXISTS idx_leases_active_key
 			ON leases(repo, provider, project, task_ref)
@@ -98,7 +119,7 @@ func (s *SQLiteLeaseStore) migrate() error {
 		`CREATE INDEX IF NOT EXISTS idx_leases_key
 			ON leases(repo, provider, project, task_ref)`,
 		`CREATE INDEX IF NOT EXISTS idx_leases_pending_capacity
-			ON leases(status)
+			ON leases(capacity_release_state, capacity_release_claimed_at)
 			WHERE capacity_released_at IS NULL`,
 	}
 	for _, m := range migrations {
@@ -170,9 +191,9 @@ var expireStaleTestHook func(candidate *Lease)
 
 // Acquire implements LeaseStore. It first expires any stale active row for
 // key (a no-op if the row is still live) — which is also what makes that
-// row's capacity token show up in PendingCapacityRelease, since it now
-// has status Expired and a still-nil CapacityReleasedAt — then attempts
-// to insert a new active row. The partial unique index on
+// row's capacity token show up as claimable via ClaimCapacityRelease,
+// since it now has status Expired and a still-nil CapacityReleasedAt —
+// then attempts to insert a new active row. The partial unique index on
 // (repo,provider,project,task_ref) WHERE status='active' is the only
 // thing that needs to be atomic here: SQLite serializes the competing
 // INSERTs itself, so exactly one succeeds regardless of how many
@@ -264,7 +285,8 @@ func (s *SQLiteLeaseStore) renewFailureError(ctx context.Context, key LeaseKey, 
 
 // Release implements LeaseStore. transitioned=true only for the call that
 // actually flips the row from active to released; capacity settlement is
-// driven separately by PendingCapacityRelease/MarkCapacityReleased (see
+// driven separately by the ClaimCapacityRelease/AckCapacityRelease
+// claim/ack protocol (see
 // ClaimManager.settlePendingCapacity), not by this boolean, so a retry
 // after a capacity-coordinator failure still finds the row pending.
 func (s *SQLiteLeaseStore) Release(ctx context.Context, key LeaseKey, ownerID string, generation int64, now time.Time) (*Lease, bool, error) {
@@ -409,39 +431,69 @@ func (s *SQLiteLeaseStore) ActiveClaims(ctx context.Context, now time.Time) ([]*
 	return leases, rows.Err()
 }
 
-// PendingCapacityRelease returns every Released/Expired lease whose
-// capacity token has not yet been durably marked returned, across all
-// keys, oldest first so a reconciliation sweep drains in FIFO order.
-func (s *SQLiteLeaseStore) PendingCapacityRelease(ctx context.Context) ([]*Lease, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT `+leaseColumns+` FROM leases
+// ClaimCapacityRelease implements LeaseStore. The UPDATE...RETURNING
+// statement is both the atomic claim and the read of exactly what got
+// claimed in one operation: SQLite executes a write statement (including
+// one that returns rows) as a single atomic unit under its single-writer
+// lock, so no other connection's write can interleave between rows of
+// this statement or between "claim" and "read back". That is the mutual
+// exclusion primitive that fixes concurrent double-delivery: two
+// settlers racing this call can never both see the same lease in their
+// claimed batch, because only one of their UPDATEs can be the one that
+// actually flips a given row's owner (the WHERE clause only matches rows
+// still pending, or in_progress with a stale claimed_at).
+func (s *SQLiteLeaseStore) ClaimCapacityRelease(ctx context.Context, settlerID string, staleAfter time.Duration, now time.Time, key *LeaseKey) ([]*Lease, error) {
+	staleBefore := now.Add(-staleAfter)
+	query := `UPDATE leases SET capacity_release_state = 'in_progress', capacity_release_owner = ?, capacity_release_claimed_at = ?
 		WHERE status IN ('released', 'expired') AND capacity_released_at IS NULL
-		ORDER BY id ASC`)
+		AND (capacity_release_state = 'pending' OR (capacity_release_state = 'in_progress' AND capacity_release_claimed_at <= ?))`
+	args := []any{settlerID, now, staleBefore}
+	if key != nil {
+		query += ` AND repo = ? AND provider = ? AND project = ? AND task_ref = ?`
+		args = append(args, key.Repo, key.Provider, key.Project, key.TaskRef)
+	}
+	query += ` RETURNING ` + leaseColumns
+
+	rows, err := queryWithRetry(ctx, s.db, query, args...)
 	if err != nil {
-		return nil, fmt.Errorf("pending capacity release: %w", err)
+		return nil, fmt.Errorf("claim capacity release: %w", err)
 	}
 	defer rows.Close()
 
-	var leases []*Lease
+	var claimed []*Lease
 	for rows.Next() {
 		l, err := scanLease(rows)
 		if err != nil {
-			return nil, fmt.Errorf("pending capacity release: scan: %w", err)
+			return nil, fmt.Errorf("claim capacity release: scan: %w", err)
 		}
-		leases = append(leases, l)
+		claimed = append(claimed, l)
 	}
-	return leases, rows.Err()
+	return claimed, rows.Err()
 }
 
-// MarkCapacityReleased durably records that leaseID's capacity token has
-// been returned. Guarded by `capacity_released_at IS NULL` so calling it
-// twice (e.g. two concurrent settlers both succeeded in calling the
-// coordinator in a narrow race) is a harmless no-op the second time
-// rather than clobbering the first timestamp.
-func (s *SQLiteLeaseStore) MarkCapacityReleased(ctx context.Context, leaseID int64, now time.Time) error {
-	_, err := execWithRetry(ctx, s.db, `UPDATE leases SET capacity_released_at = ?
-		WHERE id = ? AND capacity_released_at IS NULL`, now, leaseID)
+// AckCapacityRelease implements LeaseStore. Guarded on
+// (capacity_release_owner = settlerID AND capacity_release_state =
+// 'in_progress') so acking after a stale claim was reclaimed by a
+// different settler is a silent no-op rather than clobbering that
+// settler's in-flight claim.
+func (s *SQLiteLeaseStore) AckCapacityRelease(ctx context.Context, leaseID int64, settlerID string, now time.Time) error {
+	_, err := execWithRetry(ctx, s.db, `UPDATE leases SET capacity_release_state = 'done', capacity_released_at = ?
+		WHERE id = ? AND capacity_release_owner = ? AND capacity_release_state = 'in_progress'`,
+		now, leaseID, settlerID)
 	if err != nil {
-		return fmt.Errorf("mark capacity released: %w", err)
+		return fmt.Errorf("ack capacity release: %w", err)
+	}
+	return nil
+}
+
+// FailCapacityRelease implements LeaseStore, guarded the same way as
+// AckCapacityRelease.
+func (s *SQLiteLeaseStore) FailCapacityRelease(ctx context.Context, leaseID int64, settlerID string) error {
+	_, err := execWithRetry(ctx, s.db, `UPDATE leases SET capacity_release_state = 'pending', capacity_release_owner = '', capacity_release_claimed_at = NULL
+		WHERE id = ? AND capacity_release_owner = ? AND capacity_release_state = 'in_progress'`,
+		leaseID, settlerID)
+	if err != nil {
+		return fmt.Errorf("fail capacity release: %w", err)
 	}
 	return nil
 }

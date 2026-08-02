@@ -28,14 +28,26 @@ var (
 // contended Acquire.
 //
 // Capacity accounting is NOT tied to a single Release/ExpireStale call
-// returning "this is the one true transition" boolean anymore: a lease
-// entering Released or Expired only records that its lease lifecycle
-// ended. Whether its capacity token has been durably given back is a
-// separate fact (Lease.CapacityReleasedAt), settled via
-// PendingCapacityRelease/MarkCapacityReleased so a crash or coordinator
-// failure between "lease ended" and "capacity returned" leaves a durable,
-// retryable marker instead of silently losing the token or double-freeing
-// it. See ClaimManager.settlePendingCapacity.
+// returning "this is the one true transition" boolean: a lease entering
+// Released or Expired only records that its lease lifecycle ended.
+// Whether its capacity token has been durably given back is tracked
+// separately as a small claim/ack protocol (ClaimCapacityRelease /
+// AckCapacityRelease / FailCapacityRelease) so that:
+//
+//   - Two settlers (two processes, two goroutines, whatever) can never
+//     both be attempting the external CapacityCoordinator.Release call for
+//     the same lease at the same time -- ClaimCapacityRelease's atomic
+//     claim is the mutual-exclusion boundary, not a Go-level mutex or an
+//     assumption that the coordinator itself dedupes concurrent calls.
+//   - A crash between the external call succeeding and the local Ack
+//     leaves the claim stale (its claimed_at ages past staleAfter) rather
+//     than lost, so a later settler reclaims and retries it -- using the
+//     same stable idempotency key bound to the lease's ID/generation, so
+//     a conforming CapacityCoordinator can dedupe that at-least-once
+//     redelivery into an effectively-exactly-once external effect.
+//
+// See ClaimManager.settlePendingCapacity and CapacityCoordinator's doc
+// comment for the full protocol.
 //
 // FAC-120/FAC-119 boundary: this package ships SQLiteLeaseStore, a
 // self-contained implementation, so cross-process leases work standalone
@@ -89,18 +101,29 @@ type LeaseStore interface {
 	// ActiveClaims returns only live (Active, unexpired) leases.
 	ActiveClaims(ctx context.Context, now time.Time) ([]*Lease, error)
 
-	// PendingCapacityRelease returns every Released/Expired lease whose
-	// capacity token has not yet been durably marked returned
-	// (CapacityReleasedAt == nil), across all keys. Callers retry
-	// CapacityCoordinator.Release for each and then call
-	// MarkCapacityReleased on success; a coordinator failure must leave
-	// the row untouched so the next call retries it.
-	PendingCapacityRelease(ctx context.Context) ([]*Lease, error)
+	// ClaimCapacityRelease atomically claims a batch of leases whose
+	// capacity token still needs releasing -- either never attempted
+	// (pending) or a prior attempt looks crashed (its claim's
+	// claimed_at is older than staleAfter) -- for settlerID. If key is
+	// non-nil, only that key's leases are eligible; nil claims across
+	// every key. Implementations must make this a single atomic
+	// operation (e.g. one UPDATE...RETURNING under the store's
+	// single-writer lock) so that under concurrent callers, each
+	// eligible lease is claimed by at most one of them.
+	ClaimCapacityRelease(ctx context.Context, settlerID string, staleAfter time.Duration, now time.Time, key *LeaseKey) ([]*Lease, error)
 
-	// MarkCapacityReleased durably records that leaseID's capacity token
-	// has been returned. Idempotent: marking an already-marked lease is a
-	// no-op, not an error.
-	MarkCapacityReleased(ctx context.Context, leaseID int64, now time.Time) error
+	// AckCapacityRelease durably marks leaseID's capacity token
+	// returned, completing settlerID's claim. A no-op (not an error) if
+	// settlerID no longer holds the claim -- e.g. it went stale and a
+	// different settler reclaimed leaseID in the meantime, in which case
+	// that settler is responsible for acking it now.
+	AckCapacityRelease(ctx context.Context, leaseID int64, settlerID string, now time.Time) error
+
+	// FailCapacityRelease releases settlerID's claim on leaseID
+	// immediately back to pending (instead of waiting out staleAfter),
+	// for a synchronous, non-crash failure the settler itself observed.
+	// A no-op if settlerID no longer holds the claim.
+	FailCapacityRelease(ctx context.Context, leaseID int64, settlerID string) error
 
 	Close() error
 }

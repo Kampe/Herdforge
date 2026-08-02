@@ -17,11 +17,22 @@ type InMemoryLeaseStore struct {
 	mu     sync.Mutex
 	nextID int64
 	rows   map[int64]*Lease
+	capRel map[int64]*capacityReleaseClaim
+}
+
+// capacityReleaseClaim mirrors the SQLite store's
+// capacity_release_state/owner/claimed_at columns for the same claim/ack
+// protocol, kept out of the public Lease struct since it's private
+// bookkeeping.
+type capacityReleaseClaim struct {
+	state     string // pending | in_progress | done
+	owner     string
+	claimedAt time.Time
 }
 
 // NewInMemoryLeaseStore builds an empty InMemoryLeaseStore.
 func NewInMemoryLeaseStore() *InMemoryLeaseStore {
-	return &InMemoryLeaseStore{rows: make(map[int64]*Lease)}
+	return &InMemoryLeaseStore{rows: make(map[int64]*Lease), capRel: make(map[int64]*capacityReleaseClaim)}
 }
 
 func (s *InMemoryLeaseStore) Close() error { return nil }
@@ -168,32 +179,72 @@ func (s *InMemoryLeaseStore) ActiveClaims(_ context.Context, now time.Time) ([]*
 	return out, nil
 }
 
-func (s *InMemoryLeaseStore) PendingCapacityRelease(_ context.Context) ([]*Lease, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	var out []*Lease
-	for _, l := range s.rows {
-		if l.PendingCapacityRelease() {
-			out = append(out, cloneLease(l))
-		}
+func (s *InMemoryLeaseStore) capClaimLocked(id int64) *capacityReleaseClaim {
+	c, ok := s.capRel[id]
+	if !ok {
+		c = &capacityReleaseClaim{state: "pending"}
+		s.capRel[id] = c
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
-	return out, nil
+	return c
 }
 
-func (s *InMemoryLeaseStore) MarkCapacityReleased(_ context.Context, leaseID int64, now time.Time) error {
+// ClaimCapacityRelease implements LeaseStore. The whole scan-and-claim
+// runs under s.mu, so (matching the SQLite store's single-writer-lock
+// atomicity) no other call can observe or claim a row mid-scan: exactly
+// one caller's claim can ever win a given lease at a time.
+func (s *InMemoryLeaseStore) ClaimCapacityRelease(_ context.Context, settlerID string, staleAfter time.Duration, now time.Time, key *LeaseKey) ([]*Lease, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	l, ok := s.rows[leaseID]
-	if !ok {
-		return fmt.Errorf("%w: lease id %d", ErrNotFound, leaseID)
+	staleBefore := now.Add(-staleAfter)
+	var claimed []*Lease
+	for id, l := range s.rows {
+		if !l.PendingCapacityRelease() {
+			continue
+		}
+		if key != nil && l.LeaseKey != *key {
+			continue
+		}
+		c := s.capClaimLocked(id)
+		eligible := c.state == "pending" || (c.state == "in_progress" && !c.claimedAt.After(staleBefore))
+		if !eligible {
+			continue
+		}
+		c.state = "in_progress"
+		c.owner = settlerID
+		c.claimedAt = now
+		claimed = append(claimed, cloneLease(l))
 	}
-	if l.CapacityReleasedAt == nil {
+	sort.Slice(claimed, func(i, j int) bool { return claimed[i].ID < claimed[j].ID })
+	return claimed, nil
+}
+
+func (s *InMemoryLeaseStore) AckCapacityRelease(_ context.Context, leaseID int64, settlerID string, now time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	c, ok := s.capRel[leaseID]
+	if !ok || c.state != "in_progress" || c.owner != settlerID {
+		return nil // stale/foreign claim: no-op, matching SQLite's guarded UPDATE.
+	}
+	c.state = "done"
+	if l, ok := s.rows[leaseID]; ok && l.CapacityReleasedAt == nil {
 		t := now
 		l.CapacityReleasedAt = &t
 	}
+	return nil
+}
+
+func (s *InMemoryLeaseStore) FailCapacityRelease(_ context.Context, leaseID int64, settlerID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	c, ok := s.capRel[leaseID]
+	if !ok || c.state != "in_progress" || c.owner != settlerID {
+		return nil
+	}
+	c.state = "pending"
+	c.owner = ""
 	return nil
 }
 
