@@ -34,6 +34,7 @@ import (
 	"github.com/Kampe/Herdforge/pkg/selftest"
 	"github.com/Kampe/Herdforge/pkg/store"
 	hsync "github.com/Kampe/Herdforge/pkg/sync"
+	"github.com/Kampe/Herdforge/pkg/throughput"
 	"github.com/Kampe/Herdforge/pkg/usage"
 	"github.com/Kampe/Herdforge/pkg/verifier"
 	"github.com/Kampe/Herdforge/pkg/worktree"
@@ -132,6 +133,9 @@ func main() {
 	case "lost":
 		runLost()
 
+	case "throughput":
+		runThroughput()
+
 	case "attention":
 		runAttention()
 
@@ -146,7 +150,6 @@ func main() {
 
 	case "kick":
 		runKick()
-
 
 	case "lifecycle":
 		runLifecycle()
@@ -190,6 +193,7 @@ func printUsage() {
 	fmt.Println("  harvest         Sweep all worktrees for unmerged commits")
 	fmt.Println("  unmerged        Authoritative cherry-based unmerged check (herd unmerged <path> | --all)")
 	fmt.Println("  lost            Find ownerless unmerged work on ANY branch (subject-based)")
+	fmt.Println("  throughput      Read-only fleet throughput KPIs from local evidence")
 	fmt.Println("  attention       List agents needing coordinator eyes")
 	fmt.Println("  process         Classify harvest targets (herd-process digest)")
 	fmt.Println("  resolve-lane    Resolve a lane to concrete provider+model (deterministic)")
@@ -676,8 +680,8 @@ func runQuota() {
 		}
 		if *wantJSON {
 			out := map[string]interface{}{
-				"pick":           pick,
-				"binding":        state,
+				"pick":            pick,
+				"binding":         state,
 				"amongConsidered": amongList,
 			}
 			maybeRunner := ""
@@ -824,15 +828,15 @@ func runDaemon() {
 			tp = provider.NewMemoryProvider()
 		}
 
-	mr := router.NewModelRouter([]*router.ModelCandidate{
-		{Name: "opencode", Type: router.ProviderOllama, Model: "deepseek-v4-flash"},
-	}).WithUsageFunc(func(ctx context.Context, name string) float64 {
-		snap, err := usage.FetchSnapshot()
-		if err != nil {
-			return 0
-		}
-		return snap.Utilization(name)
-	})
+		mr := router.NewModelRouter([]*router.ModelCandidate{
+			{Name: "opencode", Type: router.ProviderOllama, Model: "deepseek-v4-flash"},
+		}).WithUsageFunc(func(ctx context.Context, name string) float64 {
+			snap, err := usage.FetchSnapshot()
+			if err != nil {
+				return 0
+			}
+			return snap.Utilization(name)
+		})
 		wm := worktree.NewWorktreeManager(".")
 		v := verifier.NewVerifier(cfg.Verification.TestCommand)
 		eng := daemon.NewEngine(cfg, tp, mr, st, wm, v)
@@ -1637,6 +1641,122 @@ func runHarvest() {
 	fmt.Println("herd-harvest: sweep complete. Any worktree listed above needs a review dispatch")
 	fmt.Println("  (herd review) then approval — do not assume 'working' pane")
 	fmt.Println("  status means nothing is ready to merge.")
+}
+
+// runThroughput ports bin/herd-throughput: read-only KPIs from the main-ref
+// git log, the review verdict ledger, and the route-decisions log. Exit 0
+// normal, 2 unknown arg/help-usage, 3 invalid window.
+func runThroughput() {
+	fs := flag.NewFlagSet("throughput", flag.ExitOnError)
+	wantJSON := fs.Bool("json", false, "Emit the machine-readable metric packet")
+	sinceFlag := fs.String("since", os.Getenv("HERD_THROUGHPUT_SINCE"), "ISO-8601 window start (default 7 days ago)")
+	untilFlag := fs.String("until", os.Getenv("HERD_THROUGHPUT_UNTIL"), "ISO-8601 window end (default now)")
+	fs.Parse(os.Args[2:])
+
+	const isoLayout = "2006-01-02T15:04:05Z"
+	now := time.Now().UTC()
+	until := *untilFlag
+	if until == "" {
+		until = now.Format(isoLayout)
+	}
+	since := *sinceFlag
+	if since == "" {
+		since = now.AddDate(0, 0, -7).Format(isoLayout)
+	}
+
+	startEpoch := throughput.IsoEpoch(since)
+	endEpoch := throughput.IsoEpoch(until)
+	if startEpoch <= 0 || endEpoch < startEpoch {
+		fmt.Fprintf(os.Stderr, "herd-throughput: invalid time window since=%s until=%s\n", since, until)
+		os.Exit(3)
+	}
+	win := throughput.Window{Start: time.Unix(startEpoch, 0).UTC(), End: time.Unix(endEpoch, 0).UTC()}
+
+	mainRef := envOr("HERD_THROUGHPUT_MAIN_REF", "origin/main")
+	ledger := firstEnv("HERD_THROUGHPUT_LEDGER", "HERD_REVIEW_LEDGER",
+		filepath.Join(stateDir(), "review-ledger.jsonl"))
+	routeLog := firstEnv("HERD_THROUGHPUT_ROUTE_LOG", "HERD_ROUTE_DECISION_LOG",
+		filepath.Join(stateDir(), "route-decisions.log"))
+
+	// main-ref commits in window: %H\t%cI\t%s. 2>/dev/null semantics — a
+	// missing ref must not abort.
+	var commits []throughput.CommitLine
+	logCmd := exec.Command("git", "log", mainRef, "--format=%H%x09%cI%x09%s",
+		"--since="+since, "--until="+until)
+	if out, err := logCmd.Output(); err == nil {
+		for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+			if line == "" {
+				continue
+			}
+			parts := strings.SplitN(line, "\t", 3)
+			if len(parts) == 3 {
+				commits = append(commits, throughput.CommitLine{SHA: parts[0], Stamp: parts[1], Subject: parts[2]})
+			}
+		}
+	}
+
+	// Verdict ledger (JSONL): each line an event; keep verdict events in window.
+	var verdicts []throughput.VerdictLine
+	if data, err := os.ReadFile(ledger); err == nil {
+		for _, line := range strings.Split(string(data), "\n") {
+			line = strings.TrimSpace(line)
+			if line == "" {
+				continue
+			}
+			var e struct {
+				Event   string `json:"event"`
+				SHA     string `json:"sha"`
+				TS      string `json:"ts"`
+				Verdict string `json:"verdict"`
+			}
+			if json.Unmarshal([]byte(line), &e) != nil || e.Event != "verdict" || e.Verdict == "" {
+				continue
+			}
+			if e.TS >= since && e.TS <= until {
+				verdicts = append(verdicts, throughput.VerdictLine{SHA: e.SHA, Stamp: e.TS, Verdict: e.Verdict})
+			}
+		}
+	}
+
+	// Route decisions: count in-window "T"-bearing lines.
+	routeDecisions := 0
+	if data, err := os.ReadFile(routeLog); err == nil {
+		routeDecisions = throughput.CountRouteLines(strings.Split(string(data), "\n"), since, until)
+	}
+
+	m := throughput.Compute(commits, verdicts, routeDecisions, win)
+
+	if *wantJSON {
+		json.NewEncoder(os.Stdout).Encode(m)
+		return
+	}
+	fmt.Printf("herd-throughput: merges/day=%.2f verdict→merge=%ds rounds/ticket=%.2f merged_tickets=%d route-decisions/merged-ticket=%.2f\n",
+		m.MergesPerDay, m.MedianVerdictToMergeSeconds, m.ReviewRoundsPerTicket, m.MergedTickets, m.RouteDecisionsPerMergedTicket)
+}
+
+func envOr(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
+}
+
+func firstEnv(primary, secondary, def string) string {
+	if v := os.Getenv(primary); v != "" {
+		return v
+	}
+	if v := os.Getenv(secondary); v != "" {
+		return v
+	}
+	return def
+}
+
+func stateDir() string {
+	if x := os.Getenv("XDG_STATE_HOME"); x != "" {
+		return filepath.Join(x, "herdforge")
+	}
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, ".local", "state", "herdforge")
 }
 
 // runLost ports bin/herd-lost: subjects-not-patch-ids, owned-is-not-lost.
