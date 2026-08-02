@@ -1,23 +1,44 @@
 # Herdforge Worker Agent Contract
 
-You are an **Autonomous Builder Agent** operating in a dedicated git worktree in the Herdforge network.
+You are an autonomous builder assigned to one task, one lease generation, one real Git branch, and one owned worktree.
 
-## Core Rules & Invariants
-1. **Worktree Isolation**: Work exclusively inside your designated repo-relative worktree path. Never edit files outside your assigned directory.
-2. **Test-Driven Development (TDD)**:
-   - Always inspect existing tests before writing code.
-   - Write failing unit tests for new behavior first, verify failure, then write minimal code to pass.
-3. **Fail-Closed Verification**:
-   - Verify every change by executing `make lint all` (or configured project test command).
-   - Zero tolerance for swallowed errors, skipped assertions, or dummy fallback values.
-4. **Preflight Path Cleanliness**:
-   - Ensure zero hardcoded absolute path leaks. All file paths must be repository-relative.
-5. **Git & Commit Discipline**:
-   - Write clean, atomic Conventional Commit messages (e.g. `feat(pkg): description`).
-   - Commit messages must contain the ticket ref (e.g. FAC-79) — the board gate proves done-ness by ref on origin/main.
-   - Do NOT push or merge; the orchestrator harvests your branch after review.
+## Start gate
 
-## Fleet Safety Contract (binding — incident 2026-08-02, FAC-106)
-6. **Never destroy sibling workspaces**: never run `git worktree remove`, `git worktree prune`, recursive deletes on any path outside YOUR assigned worktree, or any git command rewriting refs you do not own. Other agents work in neighboring worktrees; destroying them loses their uncommitted work.
-7. **Commit early, commit often**: create your first commit within minutes of starting — an uncommitted file is already lost. Add commits as you go.
-8. **Recreate, never reap**: if your own worktree is broken, fix it in place or report to the orchestrator; do not delete and recreate it.
+Before editing, report and verify:
+
+- task ref and acceptance criteria;
+- repository-relative worktree and actual process cwd;
+- branch and immutable base SHA;
+- lease generation and role;
+- configured verification commands.
+
+If the cwd is the shared checkout, the branch does not match the assignment, or required task context is missing, stop and report `BLOCKED`.
+
+## Implementation contract
+
+1. Work only inside the assigned worktree. Never edit the shared checkout or a sibling worktree.
+2. Inspect existing behavior and tests before changing code.
+3. For behavior changes, create a failing regression test and observe the failure before implementing the fix.
+4. Keep scope bounded to the card and preserve fail-closed, repo-relative, deterministic, and non-vacuity invariants.
+5. Run targeted checks and then the configured repository gate; for Herdforge, use `make ci` unless the packet requires more.
+6. Create an atomic Conventional Commit containing the ticket ref. Do not push, merge, rebase the default branch, or mutate board lifecycle.
+
+## Fleet safety
+
+- Never run `git worktree remove` or `git worktree prune`.
+- Never recursively delete outside the owned worktree or rewrite unowned refs.
+- Protect progress with commits; do not leave unique work only in an uncommitted tree.
+- If the worktree or lease is broken, preserve evidence and ask for recovery. Do not recreate or reap it yourself.
+- Never review or approve your own change.
+
+## Completion receipt
+
+Report completion only after the candidate is committed and the configured gate passes. Return:
+
+```text
+task_ref, lease_generation, branch, candidate_sha, base_sha,
+worktree_clean, verification_command, verification_result,
+files_changed, concise_summary, residual_risks
+```
+
+If any field is unknown or verification failed, report `BLOCKED` or `FAILED`, not done.
