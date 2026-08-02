@@ -42,19 +42,21 @@ func (c *clock) advance(d time.Duration) {
 }
 
 // countingCapacity records Reserve/Release calls per role so tests can
-// assert exactly-once release accounting.
+// assert exactly-once release accounting, and every idempotency key it
+// was called with so tests can assert key stability across retries.
 type countingCapacity struct {
-	mu       sync.Mutex
-	reserved map[string]int
-	released map[string]int
-	failNext bool
+	mu          sync.Mutex
+	reserved    map[string]int
+	released    map[string]int
+	releaseKeys []string
+	failNext    bool
 }
 
 func newCountingCapacity() *countingCapacity {
 	return &countingCapacity{reserved: map[string]int{}, released: map[string]int{}}
 }
 
-func (c *countingCapacity) Reserve(_ context.Context, role string) error {
+func (c *countingCapacity) Reserve(_ context.Context, role, _ string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.failNext {
@@ -65,10 +67,11 @@ func (c *countingCapacity) Reserve(_ context.Context, role string) error {
 	return nil
 }
 
-func (c *countingCapacity) Release(_ context.Context, role string) error {
+func (c *countingCapacity) Release(_ context.Context, role, idempotencyKey string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.released[role]++
+	c.releaseKeys = append(c.releaseKeys, idempotencyKey)
 	return nil
 }
 
@@ -522,14 +525,14 @@ type failNTimesCapacity struct {
 	reserveErrs int
 }
 
-func (c *failNTimesCapacity) Reserve(context.Context, string) error {
+func (c *failNTimesCapacity) Reserve(context.Context, string, string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.reserveErrs++ // reused as a reserve counter; never fails
 	return nil
 }
 
-func (c *failNTimesCapacity) Release(context.Context, string) error {
+func (c *failNTimesCapacity) Release(context.Context, string, string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.failsLeft > 0 {
