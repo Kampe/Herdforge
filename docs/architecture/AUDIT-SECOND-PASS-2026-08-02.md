@@ -8,11 +8,11 @@ This is not a request for more builder agents. The roster defined in the target 
 
 ## Snapshot and method
 
-This pass rebased onto `origin/main` at `4e6e85b`, after FAC-128 and FAC-129 were merged while the audit was running. The code-review graph was rebuilt at that revision and indexed 187 files, 1,774 nodes, and 17,862 edges. Graph results were checked against source because the graph still reports no affected cross-file flows for changes that plainly cross packages.
+This pass first rebased onto `origin/main` at `4e6e85b`, after FAC-128 and FAC-129 were merged while the audit was running, then rebased again through `8a7543a` after the CI and scoped-review changes landed. The final audit-branch graph indexed 187 files, 1,775 nodes, and 17,875 edges. Graph results were checked against source because the graph still reports no affected cross-file flows for changes that plainly cross packages.
 
 The board snapshot contained 128 cards: 92 done, 35 To Do, and 1 in progress. Every To Do card was unlabeled, 9 had no description, and 5 had no priority. Active Doing/In Review work was observed but not interrupted.
 
-`make ci` passed. GitHub CI passed for `4e6e85b`. PR #40 had no review submissions and the repository's `main` branch has no GitHub branch protection. A plain `make test-coverage` failed locally because fixture commits inherited the machine's 1Password signing configuration; the CI-equivalent hermetic Git environment avoids that failure. Coverage also reports `cmd/herd` and `pkg/lifecycle` at 0%, so the green suite does not exercise the highest-risk production wiring.
+`make ci` passed. GitHub CI passed for `4e6e85b`, `4c9b132`, and `8a7543a`. PR #40 had no review submissions and the repository's `main` branch has no GitHub branch protection. A plain `make test-coverage` failed locally because fixture commits inherited the machine's 1Password signing configuration; the CI-equivalent hermetic Git environment passed with 49.3% total statement coverage. It reports `cmd/herd` and `pkg/lifecycle` at 0%, so the green suite does not exercise the highest-risk production wiring.
 
 ## Newly confirmed gaps
 
@@ -37,7 +37,7 @@ The new loop is a real production caller of `ForgeStep`, but its driver does not
 - Dispatch, review, approve, and re-nudge errors are logged and swallowed. A bounded run can return success after every action failed.
 - The real driver has no tests. The loop tests use a fake driver and cannot expose CLI flag ordering, cwd, provider, Git, or Herdr failures.
 
-FAC-128 should remain open until a hermetic end-to-end test drives a card through an owned worktree, exact-SHA verification, independent review, serialized integration, board readback, and cleanup, including crash/retry cases.
+FAC-138 now tracks this residual implementation explicitly. It should remain open until a hermetic end-to-end test drives a card through an owned worktree, exact-SHA verification, independent review, serialized integration, board readback, and cleanup, including crash/retry cases.
 
 ### 3. Tool execution is still an optional observation, not a dispatch gate
 
@@ -71,17 +71,55 @@ The repository contains prompt contracts for orchestrator, scout-planner, verifi
 
 No additional prompt persona is required. The missing work is declarative registration and technical enforcement of the roles already documented. Blind pings would not repair these state and ownership defects, so no agent was pinged.
 
+### 8. Attempted remediation reproduced the dispatch defects
+
+After the audit, an orchestrator used the current production dispatch path to claim FAC-119 through FAC-122. The board comments claimed task worktrees and generated `task/...` branch names, but Herdr reported all four worker process cwd values as the shared repository root. Git reported the actual branches as `herd/fac-119` through `herd/fac-122`. The generated `TASK-PACKET.md` files still required `herd verify` before a commit existed.
+
+The unsafe sessions were stopped before source edits. Each worker was relaunched through Herdr's native tab and agent API only after process inspection proved that cwd equaled its exact task worktree. Corrective board comments record the real agent, author family, worktree, and branch.
+
+The same dispatch wave also claimed cards despite existing blocking relations: FAC-124 blocks FAC-119, FAC-120 blocks FAC-121, and FAC-121 blocks FAC-122. The package-local slices can be explored concurrently under explicit scopes, but this proves the current claim path does not enforce dependency eligibility.
+
+Finally, a full-suite run in the FAC-120 worktree created a nested `pkg/dispatch/.herd/worktrees/fac-1` repository artifact. That confirms the test environment is not hermetic even when the suite exits successfully; FAC-135 must make test state temporary and self-cleaning.
+
+## Kaneo actions from this pass
+
+- Added FAC-132 for task-bound acceptance receipts.
+- Added FAC-133 for least-privilege prompt-injection containment.
+- Added FAC-134 for repository-agnostic task packets and verification profiles.
+- Added FAC-135 for a hermetic compiled-binary factory conformance gate.
+- Added FAC-136 for durable health, queue-pressure, and transition SLOs.
+- Expanded FAC-138 and FAC-139 into dispatchable residual cards for the production loop and mandatory artifact probes.
+- Related and archived FAC-137 as an exact duplicate of FAC-132.
+- Verified `4c9b132` and its GitHub Actions run, then closed stale To Do card FAC-130 with implementation evidence.
+- Rewrote 16 thin or empty descriptions, assigned impact-based priorities, and attached exactly one `worker` or `forge-smith` role to every To Do card.
+- Added blocking relations from lifecycle, claim, dispatch, verification, provider, mailbox, roster, security, receipt, capability, and conformance prerequisites into FAC-138.
+
+Post-grooming board state was 139 cards: 94 done, 35 To Do, 8 in progress, and 2 archived. All 35 To Do cards had a non-empty description, an explicit priority, and exactly one dispatch role.
+
+## Critical reliability wave
+
+The first implementation wave was started under `.herd/prompts/critical-wave-coordinator.md`:
+
+| Card | Initial exclusive scope | Author family | Verified worktree branch |
+|---|---|---|---|
+| FAC-119 | lifecycle, outbox, canonical persistence schema | Anthropic | `herd/fac-119` |
+| FAC-120 | fenced lease behavior in `pkg/claim` | Anthropic | `herd/fac-120` |
+| FAC-121 | dispatch, worktree, and Herdr cwd enforcement | xAI | `herd/fac-121` |
+| FAC-122 | exact-SHA receipts and mutation execution in `pkg/verifier` | OpenAI | `herd/fac-122` |
+
+Shared CLI wiring, provider interfaces, schema reconciliation, review admission, and integration remain serialized. Every candidate is R3 and requires exact-SHA review by a different model family before merge.
+
 ## Corrected implementation order
 
-1. Replace commit-message completion with task-bound acceptance and integration receipts.
-2. Build the durable lifecycle/outbox and fenced claim service.
-3. Make dispatch atomic, immutable-base, repo-namespaced, and cwd-enforced.
-4. Make verification repository-configured, exact-SHA, non-vacuous, and hermetically tested.
+1. Build the durable lifecycle/outbox and fenced claim service.
+2. Fail-close provider adapters and make dispatch atomic, immutable-base, repo-namespaced, and cwd-enforced.
+3. Make verification repository-configured, exact-SHA, non-vacuous, and hermetically tested.
+4. Replace commit-message completion with task-bound acceptance and integration receipts.
 5. Enforce different-family review and serialized integration before board completion.
-6. Rebuild the forge loop on durable callbacks plus reconciliation; fail closed on every unknown dependency.
-7. Enforce versioned artifact capability probes at every write-capable launch.
+6. Register the existing complete fleet roster and enforce versioned artifact capability probes at every write-capable launch.
+7. Add least-privilege handling for untrusted provider content.
 8. Add the end-to-end crash/concurrency conformance harness and protected-branch policy.
-9. Add least-privilege handling for untrusted provider content.
-10. Register the existing complete fleet roster and then tune capacity for throughput.
+9. Rebuild the forge loop on durable callbacks plus reconciliation; fail closed on every unknown dependency.
+10. Add durable health/SLO reporting, then tune capacity for throughput.
 
 Until these are demonstrated, `herd forge --loop` should be treated as experimental assisted automation, not an unattended authority.
