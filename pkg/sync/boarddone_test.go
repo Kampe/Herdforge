@@ -41,6 +41,9 @@ func fixtureRepo(t *testing.T) (dir, mainSHA, strandedSHA string) {
 	run("init", "-q", "-b", "main")
 	run("config", "user.email", "test@herdforge.local")
 	run("config", "user.name", "herdforge-test")
+	// Disable GPG signing for fixture repos — 1Password SSH agent may not be available.
+	run("config", "commit.gpgsign", "false")
+	run("config", "tag.gpgsign", "false")
 	run("commit", "--allow-empty", "-q", "-m", "feat: land board-done gate (FAC-18)")
 	mainSHA = run("rev-parse", "HEAD")
 	// Simulate origin/main without a network remote.

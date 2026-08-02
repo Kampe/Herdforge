@@ -2,7 +2,7 @@
 
 **Title**: Port herd-board-sync: bi-directional Kaneo-vs-git reconciliation (FAC-61)
 **Priority**: no-priority
-**Status**: to-do
+**Status**: in-progress
 **Labels**: 
 
 ## Worktree
@@ -10,7 +10,7 @@
 **Path**: `.herd/worktrees/fac-62`
 **Branch**: `task/fac-62-port-herd-board-sync-bi-directional-kaneo-vs-git-reconciliation-fac-61`
 **Role**: worker
-**Agent**: opencode / opencode/deepseek-v4-flash-free
+**Agent**: opencode / litellm/lazer/deepseek-v4-flash
 **Assigned Worktree**: .worktrees/worker
 
 ## Description

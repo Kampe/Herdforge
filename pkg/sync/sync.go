@@ -9,6 +9,16 @@ import (
 	"github.com/Kampe/Herdforge/pkg/provider"
 )
 
+// bsyncFacts is the git-truth snapshot the classification reads (bin lines
+// 237-269). All git failures degrade to the empty/false value, exactly like
+// the zsh's `|| true` / `2>/dev/null`.
+type bsyncFacts struct {
+	branches     string // lowercased live branch names, newline joined
+	localRefs    string // lowercased ahead-of-main subject+body text
+	workInFlight bool
+	mergedLog    string // lowercased "ct<TAB>subject" entries
+}
+
 // BoardDrift is the aggregated result of reconciling a board against git
 // reality. Drift is the number of findings (a working count parallel to the
 // zsh's `drift` accumulator); Findings carries the classified findings.
@@ -53,7 +63,7 @@ func (b *BoardSyncer) ReconcileBoard(ctx context.Context, projectID, repoDir str
 		return nil, fmt.Errorf("failed to list tasks for board sync: %w", err)
 	}
 
-	facts := bsyncFacts(repoDir)
+	facts := collectFacts(repoDir)
 
 	drift := &BoardDrift{}
 	for _, t := range tasks {
@@ -69,7 +79,7 @@ func (b *BoardSyncer) ReconcileBoard(ctx context.Context, projectID, repoDir str
 			continue
 		}
 
-		f := b.classify(ctx, t, facts)
+		f := b.classify(ctx, facts, t)
 		if f != nil {
 			drift.Drift++
 			drift.Findings = append(drift.Findings, *f)
@@ -78,22 +88,12 @@ func (b *BoardSyncer) ReconcileBoard(ctx context.Context, projectID, repoDir str
 	return drift, nil
 }
 
-// bsyncFacts is the git-truth snapshot the classification reads (bin lines
-// 237-269). All git failures degrade to the empty/false value, exactly like
-// the zsh's `|| true` / `2>/dev/null`.
-type bsyncFacts struct {
-	branches     string // lowercased live branch names, newline joined
-	localRefs    string // lowercased ahead-of-main subject+body text
-	workInFlight bool
-	mergedLog    string // lowercased "ct<TAB>subject" entries
-}
-
-// bsyncFacts gathers git facts once per reconcile. `branches` comes from
+// collectFacts gathers git facts once per reconcile. `branches` comes from
 // `git worktree list --porcelain` (the `^branch refs/heads/<name>` lines,
 // stripped and lowercased); `localRefs` is the concatenation of per-worktree
 // `git -C wt log origin/main..HEAD --pretty=%s%n%b`; `work_in_flight` is
 // true when any worktree is ahead of origin/main or dirty.
-func bsyncFacts(repoDir string) *bsyncFacts {
+func collectFacts(repoDir string) *bsyncFacts {
 	f := &bsyncFacts{}
 
 	out, _ := git(repoDir, "worktree", "list", "--porcelain")
@@ -137,14 +137,14 @@ func (b *BoardSyncer) classify(ctx context.Context, facts *bsyncFacts, t *provid
 
 	// active = branch-name match OR ref named in unpushed work
 	re := regexp.MustCompile(`(?m)(` + regexp.QuoteMeta(lref) + `|` + regexp.QuoteMeta(nref) + `)([^0-9]|$)`)
-	active := re.MatchString(f.branches) || re.MatchString(f.localRefs)
+	active := re.MatchString(facts.branches) || re.MatchString(facts.localRefs)
 
 	// created = 0 disables the date gate (zero time.Time ports `created=0`).
 	var created int64
 	if !t.CreatedAt.IsZero() {
 		created = t.CreatedAt.Unix()
 	}
-	merged := RefShipped(f.mergedLog, lref, created)
+	merged := RefShipped(facts.mergedLog, lref, created)
 
 	switch t.Status {
 	case "in-progress", "in-review":
