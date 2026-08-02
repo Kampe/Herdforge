@@ -4,8 +4,6 @@ import (
 	"database/sql"
 	"fmt"
 	"time"
-
-	_ "modernc.org/sqlite"
 )
 
 // Event is the immutable, append-only record of one task-lifecycle
@@ -46,16 +44,44 @@ type TaskState struct {
 	UpdatedAt       time.Time `json:"updated_at"`
 }
 
+// AppendIntent is what a caller proposes. It deliberately has no
+// FromState field: AppendTx alone decides the prior state, by reading it
+// from inside the same transaction that will record the new event. A
+// caller cannot inject a stale or fabricated FromState.
+type AppendIntent struct {
+	TaskRef          string
+	Repo             string
+	To               State
+	Actor            string
+	IdempotencyKey   string
+	LeaseGeneration  int64
+	ProviderRevision string
+	Branch           string
+	CandidateSHA     string
+	EvidenceDigest   string
+	Payload          string
+}
+
+// AppendResult is what AppendTx produces.
+type AppendResult struct {
+	Event Event
+	// Replayed is true when IdempotencyKey had already been durably
+	// recorded (visible inside this transaction) and no new row was
+	// written.
+	Replayed bool
+}
+
 // EventStore is the canonical SQLite-backed persistence for lifecycle
 // events and their materialized task-state read model.
 type EventStore struct {
 	db *sql.DB
 }
 
-// NewEventStore opens (or creates) a SQLite database at path and applies
+// NewEventStore opens (or creates) a SQLite database at path, applies the
+// SQLite concurrency contract (see sqliteConcurrencyContract), and applies
 // the lifecycle schema.
 func NewEventStore(path string) (*EventStore, error) {
-	db, err := sql.Open("sqlite", path)
+	db, err := openSQLite(path)
 	if err != nil {
 		return nil, fmt.Errorf("open lifecycle store: %w", err)
 	}
@@ -124,7 +150,11 @@ func (s *EventStore) migrate() error {
 }
 
 // CurrentState returns the materialized state for a task, or nil (with no
-// error) if the task has no recorded events yet.
+// error) if the task has no recorded events yet. This is a plain,
+// non-transactional read for callers that only need an eventually
+// consistent view (e.g. the Reconciler's sweep, external inspection). The
+// write path (AppendTx) never trusts this — it re-reads inside its own
+// transaction.
 func (s *EventStore) CurrentState(taskRef string) (*TaskState, error) {
 	return s.currentStateQuerier(s.db, taskRef)
 }
@@ -154,31 +184,88 @@ type querier interface {
 	Exec(query string, args ...any) (sql.Result, error)
 }
 
-// AppendTx appends one event within an existing transaction, computing its
-// monotonic per-task sequence number and folding the materialized
-// lifecycle_task_state forward. Callers own commit/rollback so the append
-// can be combined atomically with an outbox enqueue (the transactional
-// outbox pattern).
-func (s *EventStore) AppendTx(tx *sql.Tx, ev Event) (Event, error) {
-	if ev.TaskRef == "" {
-		return Event{}, fmt.Errorf("append event: task_ref is required")
+// AppendTx is the ONLY path that can create a lifecycle_events row, and it
+// is the sole authority for whether one is legal. Everything it decides —
+// idempotency replay, FromState, sequence number, lease-generation
+// fencing, transition legality — is derived from reads taken inside tx,
+// never from caller-supplied state. That closes the race an outside-tx
+// check leaves open: two callers (in this process or another) can each
+// decide "the current state is X" concurrently and be wrong by the time
+// they write.
+//
+// Two independent guards make a wrong write impossible rather than just
+// unlikely:
+//   - lifecycle_events has UNIQUE(task_ref, seq): if this transaction's
+//     seq (derived from a now-stale read) was already taken by a writer
+//     that committed first, the INSERT itself fails.
+//   - lifecycle_task_state is updated with a compare-and-swap (`WHERE
+//     task_ref = ? AND seq = ?` against the seq this transaction read);
+//     zero rows affected means someone else advanced the task first, and
+//     AppendTx returns ErrConcurrentModification instead of committing a
+//     row whose FromState no longer matches reality.
+//
+// Both failure modes are caller-visible errors, not silent corruption.
+// Callers (Machine.Transition) do not auto-retry; retry means re-running
+// Transition so FromState is re-derived from fresh state.
+func (s *EventStore) AppendTx(tx *sql.Tx, intent AppendIntent) (AppendResult, error) {
+	if intent.TaskRef == "" {
+		return AppendResult{}, fmt.Errorf("append event: task_ref is required")
 	}
-	if ev.IdempotencyKey == "" {
-		return Event{}, fmt.Errorf("append event: idempotency_key is required (fail-closed)")
+	if intent.IdempotencyKey == "" {
+		return AppendResult{}, fmt.Errorf("append event: idempotency_key is required (fail-closed)")
 	}
-	if ev.Actor == "" {
-		return Event{}, fmt.Errorf("append event: actor is required")
+	if intent.Actor == "" {
+		return AppendResult{}, fmt.Errorf("append event: actor is required")
 	}
 
-	current, err := s.currentStateQuerier(tx, ev.TaskRef)
+	// Idempotency check, INSIDE this transaction: a caller retrying the
+	// exact same request sees whatever this transaction can already see.
+	if existing, err := s.eventByIdempotencyKeyQuerier(tx, intent.IdempotencyKey); err != nil {
+		return AppendResult{}, err
+	} else if existing != nil {
+		if existing.TaskRef != intent.TaskRef || existing.ToState != intent.To {
+			return AppendResult{}, fmt.Errorf("%w: key=%s", ErrIdempotencyKeyConflict, intent.IdempotencyKey)
+		}
+		return AppendResult{Event: *existing, Replayed: true}, nil
+	}
+
+	current, err := s.currentStateQuerier(tx, intent.TaskRef)
 	if err != nil {
-		return Event{}, err
+		return AppendResult{}, err
 	}
-	ev.Seq = 1
+
+	from := StateDraft
+	prevSeq := int64(0)
+	prevLeaseGeneration := int64(0)
 	if current != nil {
-		ev.Seq = current.Seq + 1
+		from = current.State
+		prevSeq = current.Seq
+		prevLeaseGeneration = current.LeaseGeneration
 	}
-	ev.CreatedAt = time.Now().UTC()
+	if intent.LeaseGeneration < prevLeaseGeneration {
+		return AppendResult{}, fmt.Errorf("%w: task=%s held=%d got=%d",
+			ErrStaleLeaseGeneration, intent.TaskRef, prevLeaseGeneration, intent.LeaseGeneration)
+	}
+	if !ValidTransition(from, intent.To) {
+		return AppendResult{}, fmt.Errorf("%w: task=%s %s -> %s", ErrInvalidTransition, intent.TaskRef, from, intent.To)
+	}
+
+	ev := Event{
+		TaskRef:          intent.TaskRef,
+		Repo:             intent.Repo,
+		Seq:              prevSeq + 1,
+		FromState:        from,
+		ToState:          intent.To,
+		ProviderRevision: intent.ProviderRevision,
+		LeaseGeneration:  intent.LeaseGeneration,
+		Branch:           intent.Branch,
+		CandidateSHA:     intent.CandidateSHA,
+		Actor:            intent.Actor,
+		EvidenceDigest:   intent.EvidenceDigest,
+		Payload:          intent.Payload,
+		IdempotencyKey:   intent.IdempotencyKey,
+		CreatedAt:        time.Now().UTC(),
+	}
 
 	res, err := tx.Exec(
 		`INSERT INTO lifecycle_events (
@@ -191,28 +278,34 @@ func (s *EventStore) AppendTx(tx *sql.Tx, ev Event) (Event, error) {
 		ev.Payload, ev.IdempotencyKey, ev.CreatedAt,
 	)
 	if err != nil {
-		return Event{}, fmt.Errorf("insert lifecycle event: %w", err)
+		return AppendResult{}, fmt.Errorf("%w: insert lifecycle event: %v", ErrConcurrentModification, err)
 	}
 	ev.ID, _ = res.LastInsertId()
 
-	_, err = tx.Exec(
-		`INSERT INTO lifecycle_task_state (task_ref, repo, state, seq, lease_generation, branch, candidate_sha, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-		 ON CONFLICT(task_ref) DO UPDATE SET
-			repo = excluded.repo,
-			state = excluded.state,
-			seq = excluded.seq,
-			lease_generation = excluded.lease_generation,
-			branch = excluded.branch,
-			candidate_sha = excluded.candidate_sha,
-			updated_at = excluded.updated_at`,
-		ev.TaskRef, ev.Repo, string(ev.ToState), ev.Seq, ev.LeaseGeneration, ev.Branch, ev.CandidateSHA, ev.CreatedAt,
-	)
+	var cas sql.Result
+	if current == nil {
+		cas, err = tx.Exec(
+			`INSERT INTO lifecycle_task_state (task_ref, repo, state, seq, lease_generation, branch, candidate_sha, updated_at)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+			ev.TaskRef, ev.Repo, string(ev.ToState), ev.Seq, ev.LeaseGeneration, ev.Branch, ev.CandidateSHA, ev.CreatedAt,
+		)
+	} else {
+		cas, err = tx.Exec(
+			`UPDATE lifecycle_task_state SET
+				repo = ?, state = ?, seq = ?, lease_generation = ?, branch = ?, candidate_sha = ?, updated_at = ?
+			 WHERE task_ref = ? AND seq = ?`,
+			ev.Repo, string(ev.ToState), ev.Seq, ev.LeaseGeneration, ev.Branch, ev.CandidateSHA, ev.CreatedAt,
+			ev.TaskRef, prevSeq,
+		)
+	}
 	if err != nil {
-		return Event{}, fmt.Errorf("upsert lifecycle task state: %w", err)
+		return AppendResult{}, fmt.Errorf("%w: upsert lifecycle task state: %v", ErrConcurrentModification, err)
+	}
+	if n, _ := cas.RowsAffected(); n != 1 {
+		return AppendResult{}, fmt.Errorf("%w: task=%s expected prior seq=%d", ErrConcurrentModification, intent.TaskRef, prevSeq)
 	}
 
-	return ev, nil
+	return AppendResult{Event: ev}, nil
 }
 
 // AllTaskStates returns the materialized state of every known task. Used
@@ -242,10 +335,14 @@ func (s *EventStore) AllTaskStates() ([]TaskState, error) {
 }
 
 // EventByIdempotencyKey returns the event previously recorded under key,
-// or nil (with no error) if it has never been seen. This is what makes
-// replaying the same lifecycle command a no-op.
+// or nil (with no error) if it has never been seen. Plain, non-tx read
+// for external inspection; AppendTx uses its own tx-scoped variant.
 func (s *EventStore) EventByIdempotencyKey(key string) (*Event, error) {
-	row := s.db.QueryRow(
+	return s.eventByIdempotencyKeyQuerier(s.db, key)
+}
+
+func (s *EventStore) eventByIdempotencyKeyQuerier(q querier, key string) (*Event, error) {
+	row := q.QueryRow(
 		`SELECT id, task_ref, repo, seq, from_state, to_state, provider_revision,
 			lease_generation, branch, candidate_sha, actor, evidence_digest,
 			payload, idempotency_key, created_at

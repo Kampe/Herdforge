@@ -1,6 +1,7 @@
 package lifecycle
 
 import (
+	"errors"
 	"path/filepath"
 	"testing"
 )
@@ -16,13 +17,13 @@ func tempEventStore(t *testing.T) *EventStore {
 	return s
 }
 
-func mustAppend(t *testing.T, s *EventStore, ev Event) Event {
+func mustAppend(t *testing.T, s *EventStore, intent AppendIntent) Event {
 	t.Helper()
 	tx, err := s.DB().Begin()
 	if err != nil {
 		t.Fatalf("begin: %v", err)
 	}
-	out, err := s.AppendTx(tx, ev)
+	out, err := s.AppendTx(tx, intent)
 	if err != nil {
 		tx.Rollback()
 		t.Fatalf("append: %v", err)
@@ -30,17 +31,20 @@ func mustAppend(t *testing.T, s *EventStore, ev Event) Event {
 	if err := tx.Commit(); err != nil {
 		t.Fatalf("commit: %v", err)
 	}
-	return out
+	return out.Event
 }
 
 func TestEventStore_FirstEventStartsTaskAtSeqOne(t *testing.T) {
 	s := tempEventStore(t)
-	ev := mustAppend(t, s, Event{
-		TaskRef: "FAC-1", Repo: "herdforge", FromState: StateDraft, ToState: StateEligible,
+	ev := mustAppend(t, s, AppendIntent{
+		TaskRef: "FAC-1", Repo: "herdforge", To: StateEligible,
 		Actor: "worker-a", IdempotencyKey: "k1",
 	})
 	if ev.Seq != 1 {
 		t.Errorf("expected seq 1, got %d", ev.Seq)
+	}
+	if ev.FromState != StateDraft {
+		t.Errorf("expected derived from_state=draft, got %s", ev.FromState)
 	}
 
 	ts, err := s.CurrentState("FAC-1")
@@ -57,38 +61,83 @@ func TestEventStore_FirstEventStartsTaskAtSeqOne(t *testing.T) {
 
 func TestEventStore_SeqIsMonotonicPerTask(t *testing.T) {
 	s := tempEventStore(t)
-	mustAppend(t, s, Event{TaskRef: "FAC-1", Repo: "herdforge", FromState: StateDraft, ToState: StateEligible, Actor: "a", IdempotencyKey: "k1"})
-	ev2 := mustAppend(t, s, Event{TaskRef: "FAC-1", Repo: "herdforge", FromState: StateEligible, ToState: StateClaimed, Actor: "a", IdempotencyKey: "k2"})
+	mustAppend(t, s, AppendIntent{TaskRef: "FAC-1", Repo: "herdforge", To: StateEligible, Actor: "a", IdempotencyKey: "k1"})
+	ev2 := mustAppend(t, s, AppendIntent{TaskRef: "FAC-1", Repo: "herdforge", To: StateClaimed, Actor: "a", IdempotencyKey: "k2"})
 	if ev2.Seq != 2 {
 		t.Errorf("expected seq 2, got %d", ev2.Seq)
 	}
 
 	// A second, unrelated task starts its own sequence at 1.
-	ev3 := mustAppend(t, s, Event{TaskRef: "FAC-2", Repo: "herdforge", FromState: StateDraft, ToState: StateEligible, Actor: "a", IdempotencyKey: "k3"})
+	ev3 := mustAppend(t, s, AppendIntent{TaskRef: "FAC-2", Repo: "herdforge", To: StateEligible, Actor: "a", IdempotencyKey: "k3"})
 	if ev3.Seq != 1 {
 		t.Errorf("expected FAC-2 to start at seq 1, got %d", ev3.Seq)
 	}
 }
 
+func TestEventStore_FromStateIsAlwaysDerivedFromPriorToState(t *testing.T) {
+	s := tempEventStore(t)
+	mustAppend(t, s, AppendIntent{TaskRef: "FAC-1", Repo: "herdforge", To: StateEligible, Actor: "a", IdempotencyKey: "k1"})
+	mustAppend(t, s, AppendIntent{TaskRef: "FAC-1", Repo: "herdforge", To: StateClaimed, Actor: "a", IdempotencyKey: "k2"})
+	mustAppend(t, s, AppendIntent{TaskRef: "FAC-1", Repo: "herdforge", To: StateDispatched, Actor: "a", IdempotencyKey: "k3"})
+
+	events, err := s.Events("FAC-1")
+	if err != nil {
+		t.Fatalf("events: %v", err)
+	}
+	if len(events) != 3 {
+		t.Fatalf("expected 3 events, got %d", len(events))
+	}
+	if events[0].FromState != StateDraft {
+		t.Errorf("expected first event from_state=draft, got %s", events[0].FromState)
+	}
+	for i := 1; i < len(events); i++ {
+		if events[i].FromState != events[i-1].ToState {
+			t.Fatalf("chain discontinuity at seq %d: prior to_state=%s but this from_state=%s",
+				events[i].Seq, events[i-1].ToState, events[i].FromState)
+		}
+	}
+}
+
+func TestEventStore_AppendTxRejectsInvalidTransitionDirectly(t *testing.T) {
+	s := tempEventStore(t)
+	tx, err := s.DB().Begin()
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	_, err = s.AppendTx(tx, AppendIntent{TaskRef: "FAC-1", Repo: "herdforge", To: StateDispatched, Actor: "a", IdempotencyKey: "k1"})
+	tx.Rollback()
+	if !errors.Is(err, ErrInvalidTransition) {
+		t.Fatalf("expected ErrInvalidTransition, got %v", err)
+	}
+
+	ts, err := s.CurrentState("FAC-1")
+	if err != nil {
+		t.Fatalf("current state: %v", err)
+	}
+	if ts != nil {
+		t.Errorf("expected no durable state from a rejected transition, got %+v", ts)
+	}
+}
+
 func TestEventStore_DuplicateIdempotencyKeyIsRejectedAtDBLevel(t *testing.T) {
 	s := tempEventStore(t)
-	mustAppend(t, s, Event{TaskRef: "FAC-1", Repo: "herdforge", FromState: StateDraft, ToState: StateEligible, Actor: "a", IdempotencyKey: "dup"})
+	mustAppend(t, s, AppendIntent{TaskRef: "FAC-1", Repo: "herdforge", To: StateEligible, Actor: "a", IdempotencyKey: "dup"})
 
 	tx, err := s.DB().Begin()
 	if err != nil {
 		t.Fatalf("begin: %v", err)
 	}
-	_, err = s.AppendTx(tx, Event{TaskRef: "FAC-1", Repo: "herdforge", FromState: StateEligible, ToState: StateClaimed, Actor: "a", IdempotencyKey: "dup"})
+	_, err = s.AppendTx(tx, AppendIntent{TaskRef: "FAC-1", Repo: "herdforge", To: StateClaimed, Actor: "a", IdempotencyKey: "dup"})
 	tx.Rollback()
-	if err == nil {
-		t.Fatal("expected duplicate idempotency key to be rejected")
+	if !errors.Is(err, ErrIdempotencyKeyConflict) {
+		t.Fatalf("expected ErrIdempotencyKeyConflict, got %v", err)
 	}
 }
 
 func TestEventStore_RequiresIdempotencyKey(t *testing.T) {
 	s := tempEventStore(t)
 	tx, _ := s.DB().Begin()
-	_, err := s.AppendTx(tx, Event{TaskRef: "FAC-1", Repo: "herdforge", FromState: StateDraft, ToState: StateEligible, Actor: "a"})
+	_, err := s.AppendTx(tx, AppendIntent{TaskRef: "FAC-1", Repo: "herdforge", To: StateEligible, Actor: "a"})
 	tx.Rollback()
 	if err == nil {
 		t.Fatal("expected empty idempotency key to be rejected")
@@ -97,7 +146,7 @@ func TestEventStore_RequiresIdempotencyKey(t *testing.T) {
 
 func TestEventStore_EventByIdempotencyKeyReturnsStoredEvent(t *testing.T) {
 	s := tempEventStore(t)
-	mustAppend(t, s, Event{TaskRef: "FAC-1", Repo: "herdforge", FromState: StateDraft, ToState: StateEligible, Actor: "a", IdempotencyKey: "k1"})
+	mustAppend(t, s, AppendIntent{TaskRef: "FAC-1", Repo: "herdforge", To: StateEligible, Actor: "a", IdempotencyKey: "k1"})
 
 	ev, err := s.EventByIdempotencyKey("k1")
 	if err != nil {
@@ -129,8 +178,8 @@ func TestEventStore_CurrentStateUnknownTaskReturnsNil(t *testing.T) {
 
 func TestEventStore_EventsReturnsInSeqOrder(t *testing.T) {
 	s := tempEventStore(t)
-	mustAppend(t, s, Event{TaskRef: "FAC-1", Repo: "herdforge", FromState: StateDraft, ToState: StateEligible, Actor: "a", IdempotencyKey: "k1"})
-	mustAppend(t, s, Event{TaskRef: "FAC-1", Repo: "herdforge", FromState: StateEligible, ToState: StateClaimed, Actor: "a", IdempotencyKey: "k2"})
+	mustAppend(t, s, AppendIntent{TaskRef: "FAC-1", Repo: "herdforge", To: StateEligible, Actor: "a", IdempotencyKey: "k1"})
+	mustAppend(t, s, AppendIntent{TaskRef: "FAC-1", Repo: "herdforge", To: StateClaimed, Actor: "a", IdempotencyKey: "k2"})
 
 	events, err := s.Events("FAC-1")
 	if err != nil {
@@ -146,8 +195,8 @@ func TestEventStore_EventsReturnsInSeqOrder(t *testing.T) {
 
 func TestEventStore_PersistsSchemaFields(t *testing.T) {
 	s := tempEventStore(t)
-	mustAppend(t, s, Event{
-		TaskRef: "FAC-1", Repo: "herdforge", FromState: StateDraft, ToState: StateEligible,
+	mustAppend(t, s, AppendIntent{
+		TaskRef: "FAC-1", Repo: "herdforge", To: StateEligible,
 		ProviderRevision: "rev-7", LeaseGeneration: 3, Branch: "task/fac-1", CandidateSHA: "abc123",
 		Actor: "worker-a", EvidenceDigest: "sha256:deadbeef", Payload: `{"note":"hi"}`,
 		IdempotencyKey: "k1",
@@ -172,8 +221,8 @@ func TestEventStore_PersistsSchemaFields(t *testing.T) {
 
 func TestEventStore_AllTaskStatesReturnsEveryTask(t *testing.T) {
 	s := tempEventStore(t)
-	mustAppend(t, s, Event{TaskRef: "FAC-1", Repo: "herdforge", FromState: StateDraft, ToState: StateEligible, Actor: "a", IdempotencyKey: "k1"})
-	mustAppend(t, s, Event{TaskRef: "FAC-2", Repo: "herdforge", FromState: StateDraft, ToState: StateEligible, Actor: "a", IdempotencyKey: "k2"})
+	mustAppend(t, s, AppendIntent{TaskRef: "FAC-1", Repo: "herdforge", To: StateEligible, Actor: "a", IdempotencyKey: "k1"})
+	mustAppend(t, s, AppendIntent{TaskRef: "FAC-2", Repo: "herdforge", To: StateEligible, Actor: "a", IdempotencyKey: "k2"})
 
 	states, err := s.AllTaskStates()
 	if err != nil {
@@ -181,5 +230,24 @@ func TestEventStore_AllTaskStatesReturnsEveryTask(t *testing.T) {
 	}
 	if len(states) != 2 {
 		t.Fatalf("expected 2 task states, got %d", len(states))
+	}
+}
+
+func TestEventStore_AppliesSQLiteConcurrencyContract(t *testing.T) {
+	s := tempEventStore(t)
+	var journalMode string
+	if err := s.DB().QueryRow("PRAGMA journal_mode").Scan(&journalMode); err != nil {
+		t.Fatalf("query journal_mode: %v", err)
+	}
+	if journalMode != "wal" {
+		t.Errorf("expected journal_mode=wal, got %s", journalMode)
+	}
+
+	var busyTimeout int
+	if err := s.DB().QueryRow("PRAGMA busy_timeout").Scan(&busyTimeout); err != nil {
+		t.Fatalf("query busy_timeout: %v", err)
+	}
+	if busyTimeout != sqliteBusyTimeoutMillis {
+		t.Errorf("expected busy_timeout=%d, got %d", sqliteBusyTimeoutMillis, busyTimeout)
 	}
 }
