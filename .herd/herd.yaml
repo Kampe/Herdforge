@@ -3,35 +3,20 @@ version: "1"
 project:
   name: "Herdforge"
   default_branch: "main"
-  repo_url: "https://github.com/Kampe/Herdforge.git"
-  verification_command: "make lint all"
 
 task_provider:
-  type: "kaneo"
-  base_url: "https://kanban-api.kampe.kluster"
-  project_id: "b939c5jzixruza3vvywrg1hs"
-  api_key_env: "KANEO_API_KEY"
+  type: "memory"
+  project_id: "herdforge-local"
 
 model_providers:
-  - name: "anthropic"
+  - name: "claude-pro"
     type: "anthropic"
-    api_key_env: "ANTHROPIC_API_KEY"
-    model: "claude-3-5-sonnet-20241022"
-  - name: "openai"
-    type: "openai"
-    api_key_env: "OPENAI_API_KEY"
-    model: "gpt-4o"
-  - name: "gemini"
-    type: "google"
-    api_key_env: "GEMINI_API_KEY"
-    model: "gemini-1.5-pro"
+    model: "claude-3-5-sonnet"
 
 roles:
   - name: "worker"
-    provider: "anthropic"
-    harness: "agy"
+    provider: "claude-pro"
     prompt_path: ".herd/prompts/worker.md"
-  - name: "reviewer"
-    provider: "openai"
-    harness: "codex"
-    prompt_path: ".herd/prompts/reviewer.md"
+
+verification:
+  test_command: "make lint all"

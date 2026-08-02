@@ -152,7 +152,7 @@ func runStatus() {
 
 func runPulse() {
 	pulseFlags := flag.NewFlagSet("pulse", flag.ExitOnError)
-	role := pulseFlags.String("role", "herd-smith", "Target role to run pulse sweep for")
+	role := pulseFlags.String("role", "worker", "Target role to run pulse sweep for")
 	pulseFlags.Parse(os.Args[2:])
 
 	cfg, err := config.LoadConfig(".herd/herd.yaml")
