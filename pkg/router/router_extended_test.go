@@ -41,3 +41,47 @@ func TestReportRateLimit_UnknownName(t *testing.T) {
 		t.Fatalf("expected 'known' still selectable, got %v (err: %v)", selected, err)
 	}
 }
+
+func TestSelectProvider_UsageFuncSkipsExhausted(t *testing.T) {
+	primary := &ModelCandidate{Name: "claude-max", Type: ProviderAnthropic, Model: "claude-3-7-sonnet"}
+	secondary := &ModelCandidate{Name: "gemini-pro", Type: ProviderGoogle, Model: "gemini-2.5-flash"}
+
+	r := NewModelRouter([]*ModelCandidate{primary, secondary})
+	r.WithUsageFunc(func(ctx context.Context, name string) float64 {
+		if name == "claude-max" {
+			return 1.0
+		}
+		return 0
+	})
+
+	selected, err := r.SelectProvider(context.Background())
+	if err != nil || selected.Name != "gemini-pro" {
+		t.Fatalf("expected fallback to gemini-pro, got %v (err: %v)", selected, err)
+	}
+}
+
+func TestSelectProvider_UsageFuncAllExhausted(t *testing.T) {
+	primary := &ModelCandidate{Name: "claude-max", Type: ProviderAnthropic, Model: "claude-3-7-sonnet"}
+	secondary := &ModelCandidate{Name: "gemini-pro", Type: ProviderGoogle, Model: "gemini-2.5-flash"}
+
+	r := NewModelRouter([]*ModelCandidate{primary, secondary})
+	r.WithUsageFunc(func(ctx context.Context, name string) float64 {
+		return 1.0
+	})
+
+	_, err := r.SelectProvider(context.Background())
+	if err == nil {
+		t.Fatal("expected error when all providers exhausted by UsageFunc")
+	}
+}
+
+func TestSelectProvider_UsageFuncNil(t *testing.T) {
+	primary := &ModelCandidate{Name: "claude-max", Type: ProviderAnthropic, Model: "claude-3-7-sonnet"}
+	r := NewModelRouter([]*ModelCandidate{primary})
+
+	// No usageFunc set — should fall back to cooldown-only behavior
+	selected, err := r.SelectProvider(context.Background())
+	if err != nil || selected.Name != "claude-max" {
+		t.Fatalf("expected claude-max, got %v (err: %v)", selected, err)
+	}
+}

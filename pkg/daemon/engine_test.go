@@ -26,7 +26,7 @@ func TestEngine_SelectNextTask_DeterministicSort(t *testing.T) {
 		TaskProvider: config.TaskProvider{ProjectID: "proj-1"},
 	}
 	kp := provider.NewKaneoProvider(server.URL, "proj-1", false)
-	engine := NewEngine(cfg, kp, nil, nil, nil)
+	engine := NewEngine(cfg, kp, nil, nil, nil, nil)
 
 	task, err := engine.SelectNextTask(context.Background(), "herd-smith")
 	if err != nil {

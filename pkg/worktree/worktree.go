@@ -95,10 +95,28 @@ func (w *WorktreeManager) ListWorktrees(ctx context.Context) ([]*WorktreeInfo, e
 	return res, nil
 }
 
-// CreateTaskWorktree spins up an isolated ephemeral worktree for a task ref
+// CreateTaskWorktree spins up an isolated ephemeral worktree for a task ref.
+// If the worktree or branch already exists, it returns the existing one instead of failing.
 func (w *WorktreeManager) CreateTaskWorktree(ctx context.Context, taskRef string) (*WorktreeInfo, error) {
 	branch := fmt.Sprintf("herd/%s", strings.ToLower(taskRef))
 	targetPath := filepath.Join(w.WorktreeDir, strings.ToLower(taskRef))
+
+	// Check if worktree already exists
+	if _, err := os.Stat(filepath.Join(targetPath, ".git")); err == nil {
+		// Worktree already exists — look up its branch
+		wtList, listErr := w.ListWorktrees(ctx)
+		if listErr == nil {
+			for _, wt := range wtList {
+				if wt.Path == targetPath {
+					return &WorktreeInfo{
+						Path:   targetPath,
+						Branch: branch,
+					}, nil
+				}
+			}
+		}
+		// Fallthrough: try the git worktree add anyway
+	}
 
 	if err := os.MkdirAll(w.WorktreeDir, 0755); err != nil {
 		return nil, fmt.Errorf("failed to create worktree root directory: %w", err)
@@ -107,6 +125,18 @@ func (w *WorktreeManager) CreateTaskWorktree(ctx context.Context, taskRef string
 	cmd := execCommandContext(ctx, "git", "worktree", "add", "-b", branch, targetPath, "HEAD")
 	cmd.Dir = w.RepoRoot
 	if output, err := cmd.CombinedOutput(); err != nil {
+		// If the error is "already exists", try to open existing worktree
+		wtList, listErr := w.ListWorktrees(ctx)
+		if listErr == nil {
+			for _, wt := range wtList {
+				if wt.Path == targetPath || wt.Branch == branch {
+					return &WorktreeInfo{
+						Path:   targetPath,
+						Branch: branch,
+					}, nil
+				}
+			}
+		}
 		return nil, fmt.Errorf("failed to create git worktree: %v, output: %s", err, string(output))
 	}
 

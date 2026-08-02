@@ -22,6 +22,7 @@ lanes:
   - name: "worker"
     role: "worker"
     agent_kind: "opencode"
+    model: "deepseek-v4-flash"
     prompt: ".herd/prompts/worker.md"
 verification:
   test_command: "go test ./..."
@@ -110,6 +111,7 @@ task_provider:
 lanes:
   - name: "bad-lane"
     role: "worker"
+    model: "deepseek-v4-flash"
     # missing agent_kind
 `
 	if err := os.WriteFile(cfgPath, []byte(content), 0644); err != nil {
@@ -119,5 +121,161 @@ lanes:
 	_, err := LoadConfig(cfgPath)
 	if err == nil {
 		t.Fatalf("expected validation error for missing agent_kind, got nil")
+	}
+}
+
+func TestLoadConfig_InvalidRouteShape(t *testing.T) {
+	tmpDir := t.TempDir()
+	cfgPath := filepath.Join(tmpDir, "herd.yaml")
+
+	content := `
+version: "1"
+project:
+  name: "test-project"
+  default_branch: "main"
+task_provider:
+  type: "kaneo"
+  project_id: "test-id"
+lanes:
+  - name: "bad-route"
+    agent_kind: "opencode"
+    model: "deepseek-v4-flash"
+    route: "nonexistent"
+`
+	if err := os.WriteFile(cfgPath, []byte(content), 0644); err != nil {
+		t.Fatalf("failed to write temp config: %v", err)
+	}
+
+	_, err := LoadConfig(cfgPath)
+	if err == nil {
+		t.Fatalf("expected validation error for invalid route shape")
+	}
+}
+
+func TestLoadConfig_InvalidRiskClass(t *testing.T) {
+	tmpDir := t.TempDir()
+	cfgPath := filepath.Join(tmpDir, "herd.yaml")
+
+	content := `
+version: "1"
+project:
+  name: "test-project"
+  default_branch: "main"
+task_provider:
+  type: "kaneo"
+  project_id: "test-id"
+lanes:
+  - name: "bad-risk"
+    agent_kind: "opencode"
+    model: "deepseek-v4-flash"
+    risk: "R5"
+`
+	if err := os.WriteFile(cfgPath, []byte(content), 0644); err != nil {
+		t.Fatalf("failed to write temp config: %v", err)
+	}
+
+	_, err := LoadConfig(cfgPath)
+	if err == nil {
+		t.Fatalf("expected validation error for invalid risk class")
+	}
+}
+
+func TestLoadConfig_InvalidNetworkCapability(t *testing.T) {
+	tmpDir := t.TempDir()
+	cfgPath := filepath.Join(tmpDir, "herd.yaml")
+
+	content := `
+version: "1"
+project:
+  name: "test-project"
+  default_branch: "main"
+task_provider:
+  type: "kaneo"
+  project_id: "test-id"
+lanes:
+  - name: "bad-network"
+    agent_kind: "opencode"
+    model: "deepseek-v4-flash"
+    network: "airgap"
+`
+	if err := os.WriteFile(cfgPath, []byte(content), 0644); err != nil {
+		t.Fatalf("failed to write temp config: %v", err)
+	}
+
+	_, err := LoadConfig(cfgPath)
+	if err == nil {
+		t.Fatalf("expected validation error for invalid network capability")
+	}
+}
+
+func TestLoadConfig_ValidRouteShape(t *testing.T) {
+	tmpDir := t.TempDir()
+	cfgPath := filepath.Join(tmpDir, "herd.yaml")
+
+	route := RouteShapeCode
+	risk := RiskR2High
+	network := NetworkLimited
+
+	content := `
+version: "1"
+project:
+  name: "test-project"
+  default_branch: "main"
+task_provider:
+  type: "kaneo"
+  project_id: "test-id"
+lanes:
+  - name: "worker"
+    agent_kind: "opencode"
+    model: "deepseek-v4-flash"
+    prompt: ".herd/prompts/worker.md"
+    provider: "deepseek"
+    route: "code"
+    risk: "R2"
+    network: "limited"
+`
+	if err := os.WriteFile(cfgPath, []byte(content), 0644); err != nil {
+		t.Fatalf("failed to write temp config: %v", err)
+	}
+
+	cfg, err := LoadConfig(cfgPath)
+	if err != nil {
+		t.Fatalf("expected valid config with route/risk/network, got error: %v", err)
+	}
+	if cfg.Lanes[0].Route == nil || *cfg.Lanes[0].Route != route {
+		t.Errorf("expected route=%s, got %v", route, cfg.Lanes[0].Route)
+	}
+	if cfg.Lanes[0].Risk == nil || *cfg.Lanes[0].Risk != risk {
+		t.Errorf("expected risk=%s, got %v", risk, cfg.Lanes[0].Risk)
+	}
+	if cfg.Lanes[0].Network == nil || *cfg.Lanes[0].Network != network {
+		t.Errorf("expected network=%s, got %v", network, cfg.Lanes[0].Network)
+	}
+}
+
+func TestLoadConfig_ModelRequired(t *testing.T) {
+	tmpDir := t.TempDir()
+	cfgPath := filepath.Join(tmpDir, "herd.yaml")
+
+	content := `
+version: "1"
+project:
+  name: "test-project"
+  default_branch: "main"
+task_provider:
+  type: "kaneo"
+  project_id: "test-id"
+lanes:
+  - name: "no-model"
+    agent_kind: "opencode"
+    # missing model
+`
+	if err := os.WriteFile(cfgPath, []byte(content), 0644); err != nil {
+		t.Fatalf("failed to write temp config: %v", err)
+	}
+
+	_, err := LoadConfig(cfgPath)
+	if err == nil {
+		t.Fatalf("expected validation error for missing model")
 	}
 }

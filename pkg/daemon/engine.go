@@ -9,6 +9,7 @@ import (
 	"github.com/Kampe/Herdforge/pkg/config"
 	"github.com/Kampe/Herdforge/pkg/provider"
 	"github.com/Kampe/Herdforge/pkg/router"
+	"github.com/Kampe/Herdforge/pkg/store"
 	"github.com/Kampe/Herdforge/pkg/verifier"
 	"github.com/Kampe/Herdforge/pkg/worktree"
 )
@@ -17,15 +18,17 @@ type Engine struct {
 	Config   *config.Config
 	TaskProv provider.TaskProvider
 	Router   *router.ModelRouter
+	Store    *store.Store
 	Worktree *worktree.WorktreeManager
 	Verifier *verifier.Verifier
 }
 
-func NewEngine(cfg *config.Config, tp provider.TaskProvider, r *router.ModelRouter, wm *worktree.WorktreeManager, v *verifier.Verifier) *Engine {
+func NewEngine(cfg *config.Config, tp provider.TaskProvider, r *router.ModelRouter, s *store.Store, wm *worktree.WorktreeManager, v *verifier.Verifier) *Engine {
 	return &Engine{
 		Config:   cfg,
 		TaskProv: tp,
 		Router:   r,
+		Store:    s,
 		Worktree: wm,
 		Verifier: v,
 	}
@@ -79,7 +82,7 @@ func (e *Engine) SelectNextTask(ctx context.Context, role string) (*provider.Tas
 	return matched[0], nil
 }
 
-// RunPulse executes one orchestration sweep pass
+// RunPulse executes one orchestration sweep pass, recording to the SQLite store.
 func (e *Engine) RunPulse(ctx context.Context, role string) (*provider.Task, error) {
 	task, err := e.SelectNextTask(ctx, role)
 	if err != nil {
@@ -91,6 +94,12 @@ func (e *Engine) RunPulse(ctx context.Context, role string) (*provider.Task, err
 
 	if err := e.TaskProv.ClaimTask(ctx, task.ID, role); err != nil {
 		return nil, fmt.Errorf("failed to claim task %s: %w", task.Ref, err)
+	}
+
+	if e.Store != nil {
+		if _, err := e.Store.RecordPulse(task.Ref, task.ID, role); err != nil {
+			return nil, fmt.Errorf("record pulse: %w", err)
+		}
 	}
 
 	return task, nil

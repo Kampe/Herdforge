@@ -39,6 +39,20 @@ func TestSelectCrossFamilyReviewer_NoMatch(t *testing.T) {
 	}
 }
 
+func TestSelectCrossFamilyReviewer_GoogleSkipsGemini(t *testing.T) {
+	reviewer, err := SelectCrossFamilyReviewer("google", []string{"gemini-2.5-flash", "claude-3-5-sonnet"})
+	if err != nil || reviewer != "claude-3-5-sonnet" {
+		t.Fatalf("expected claude-3-5-sonnet (cross-family), got %s (err: %v)", reviewer, err)
+	}
+}
+
+func TestSelectCrossFamilyReviewer_XAISkipsGrok(t *testing.T) {
+	reviewer, err := SelectCrossFamilyReviewer("xai", []string{"grok-2", "claude-3-5-sonnet"})
+	if err != nil || reviewer != "claude-3-5-sonnet" {
+		t.Fatalf("expected claude-3-5-sonnet (cross-family), got %s (err: %v)", reviewer, err)
+	}
+}
+
 func TestSelectCrossFamilyReviewer_NoReviewers(t *testing.T) {
 	_, err := SelectCrossFamilyReviewer("anthropic", nil)
 	if err == nil {

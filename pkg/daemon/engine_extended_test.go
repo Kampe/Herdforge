@@ -24,7 +24,7 @@ func TestSelectNextTask_NoRoleMatch(t *testing.T) {
 		TaskProvider: config.TaskProvider{ProjectID: "proj-1"},
 	}
 	kp := provider.NewKaneoProvider(server.URL, "proj-1", false)
-	engine := NewEngine(cfg, kp, nil, nil, nil)
+	engine := NewEngine(cfg, kp, nil, nil, nil, nil)
 
 	task, err := engine.SelectNextTask(context.Background(), "herd-smith")
 	if err != nil {
@@ -53,7 +53,7 @@ func TestRunPulse_SelectsAndClaimsTask(t *testing.T) {
 		TaskProvider: config.TaskProvider{ProjectID: "proj-1"},
 	}
 	kp := provider.NewKaneoProvider(server.URL, "proj-1", false)
-	engine := NewEngine(cfg, kp, nil, nil, nil)
+	engine := NewEngine(cfg, kp, nil, nil, nil, nil)
 
 	task, err := engine.RunPulse(context.Background(), "herd-smith")
 	if err != nil {
@@ -82,7 +82,7 @@ func TestSelectNextTask_SamePrioritySortsByRef(t *testing.T) {
 		TaskProvider: config.TaskProvider{ProjectID: "proj-1"},
 	}
 	kp := provider.NewKaneoProvider(server.URL, "proj-1", false)
-	engine := NewEngine(cfg, kp, nil, nil, nil)
+	engine := NewEngine(cfg, kp, nil, nil, nil, nil)
 
 	task, err := engine.SelectNextTask(context.Background(), "herd-smith")
 	if err != nil {
@@ -105,7 +105,7 @@ func TestRunPulse_NoTasks(t *testing.T) {
 		TaskProvider: config.TaskProvider{ProjectID: "proj-1"},
 	}
 	kp := provider.NewKaneoProvider(server.URL, "proj-1", false)
-	engine := NewEngine(cfg, kp, nil, nil, nil)
+	engine := NewEngine(cfg, kp, nil, nil, nil, nil)
 
 	task, err := engine.RunPulse(context.Background(), "herd-smith")
 	if err != nil {
@@ -134,7 +134,7 @@ func TestRunPulse_ClaimError(t *testing.T) {
 		TaskProvider: config.TaskProvider{ProjectID: "proj-1"},
 	}
 	kp := provider.NewKaneoProvider(server.URL, "proj-1", false)
-	engine := NewEngine(cfg, kp, nil, nil, nil)
+	engine := NewEngine(cfg, kp, nil, nil, nil, nil)
 
 	_, err := engine.RunPulse(context.Background(), "herd-smith")
 	if err == nil {
@@ -152,7 +152,7 @@ func TestSelectNextTask_ListError(t *testing.T) {
 		TaskProvider: config.TaskProvider{ProjectID: "proj-1"},
 	}
 	kp := provider.NewKaneoProvider(server.URL, "proj-1", false)
-	engine := NewEngine(cfg, kp, nil, nil, nil)
+	engine := NewEngine(cfg, kp, nil, nil, nil, nil)
 
 	_, err := engine.SelectNextTask(context.Background(), "herd-smith")
 	if err == nil {
@@ -170,7 +170,7 @@ func TestRunPulse_SelectNextTaskError(t *testing.T) {
 		TaskProvider: config.TaskProvider{ProjectID: "proj-1"},
 	}
 	kp := provider.NewKaneoProvider(server.URL, "proj-1", false)
-	engine := NewEngine(cfg, kp, nil, nil, nil)
+	engine := NewEngine(cfg, kp, nil, nil, nil, nil)
 
 	_, err := engine.RunPulse(context.Background(), "herd-smith")
 	if err == nil {

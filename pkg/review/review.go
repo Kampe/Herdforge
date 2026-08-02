@@ -8,6 +8,80 @@ import (
 	"time"
 )
 
+// ModelFamily maps a provider or model prefix to a canonical family name.
+type ModelFamily string
+
+const (
+	FamilyAnthropic ModelFamily = "anthropic"
+	FamilyGoogle    ModelFamily = "google"
+	FamilyOpenAI    ModelFamily = "openai"
+	FamilyGrok      ModelFamily = "grok"
+	FamilyOllama    ModelFamily = "ollama"
+	FamilyKimi      ModelFamily = "kimi"
+	FamilyCodex     ModelFamily = "codex"
+	FamilyLazer     ModelFamily = "lazer"
+	FamilyOther     ModelFamily = "other"
+)
+
+// FamilyRegistry provides deterministic model-family lookup.
+type FamilyRegistry struct {
+	// entries maps known model prefixes (e.g. "claude", "gemini", "gpt")
+	// to their canonical family.
+	entries map[string]ModelFamily
+}
+
+// NewFamilyRegistry returns a registry populated with the default known entries.
+func NewFamilyRegistry() *FamilyRegistry {
+	return &FamilyRegistry{
+		entries: map[string]ModelFamily{
+			"claude":   FamilyAnthropic,
+			"sonnet":   FamilyAnthropic,
+			"opus":     FamilyAnthropic,
+			"haiku":    FamilyAnthropic,
+			"anthropic": FamilyAnthropic,
+			"gemini":   FamilyGoogle,
+			"google":  FamilyGoogle,
+			"agy":     FamilyGoogle,
+			"gpt":      FamilyOpenAI,
+			"o1":       FamilyOpenAI,
+			"o3":       FamilyOpenAI,
+			"grok":     FamilyGrok,
+			"xai":      FamilyGrok,
+			"ollama":   FamilyOllama,
+			"llama":    FamilyOllama,
+			"kimi":     FamilyKimi,
+			"moonshot": FamilyKimi,
+			"codex":    FamilyCodex,
+			"lazer":    FamilyLazer,
+			"deepseek": FamilyLazer,
+		},
+	}
+}
+
+// Lookup returns the canonical family for a model name, falling back to Other.
+func (r *FamilyRegistry) Lookup(modelName string) ModelFamily {
+	lower := strings.ToLower(modelName)
+	for prefix, family := range r.entries {
+		if strings.Contains(lower, prefix) {
+			return family
+		}
+	}
+	return FamilyOther
+}
+
+// KnownFamilies returns all registered families.
+func (r *FamilyRegistry) KnownFamilies() []ModelFamily {
+	seen := make(map[ModelFamily]bool)
+	var result []ModelFamily
+	for _, f := range r.entries {
+		if !seen[f] {
+			seen[f] = true
+			result = append(result, f)
+		}
+	}
+	return result
+}
+
 type RiskTier string
 
 const (
@@ -76,8 +150,19 @@ func ClassifyRiskTier(files []string) RiskTier {
 	return TierR0RiskMechanical
 }
 
-// SelectCrossFamilyReviewer ensures that a reviewer model belongs to a different model family than the worker
+// SelectCrossFamilyReviewer ensures that a reviewer model belongs to a different model family than the worker,
+// using the FamilyRegistry for deterministic family lookup.
 func SelectCrossFamilyReviewer(authorModelFamily string, availableReviewers []string) (string, error) {
+	reg := NewFamilyRegistry()
+	authorFamily := reg.Lookup(authorModelFamily)
+
+	for _, rev := range availableReviewers {
+		if reg.Lookup(rev) != authorFamily {
+			return rev, nil
+		}
+	}
+
+	// Fallback: try substring matching for unknown families
 	authorLower := strings.ToLower(authorModelFamily)
 	for _, rev := range availableReviewers {
 		revLower := strings.ToLower(rev)
@@ -85,6 +170,7 @@ func SelectCrossFamilyReviewer(authorModelFamily string, availableReviewers []st
 			return rev, nil
 		}
 	}
+
 	if len(availableReviewers) > 0 {
 		return availableReviewers[0], nil
 	}

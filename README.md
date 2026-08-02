@@ -34,6 +34,22 @@ Herdforge runs a self-reinforcing cycle using three standing agent lanes in [her
 
 Everything runs on `deepseek-v4-flash` via opencode — cheap enough to keep all three agents running continuously.
 
+### Self-Replication
+
+The forge can clone itself:
+
+```bash
+herd clone https://github.com/Kampe/Herdforge.git
+cd Herdforge
+herd standing    # launches all 3 agents
+herd forge       # runs the full pulse → review → approve cycle
+```
+
+After cloning, link to your Kaneo project:
+```bash
+kaneo link -w <workspace> -p <project>
+```
+
 ---
 
 ## Requirements
@@ -52,8 +68,12 @@ Everything runs on `deepseek-v4-flash` via opencode — cheap enough to keep all
 go build ./...
 go test ./...
 
-# Seed config
-herd init
+# Clone Herdforge (self-replication)
+herd clone https://github.com/Kampe/Herdforge.git
+cd Herdforge
+
+# Or seed config in an existing repo
+herd init --full
 
 # Launch all agent lanes
 herd standing
@@ -121,6 +141,8 @@ lanes:
 | Command | Description |
 |---------|-------------|
 | `herd init` | Scaffold `.herd/herd.yaml` and lane prompts |
+| `herd init --full` | Scaffold full 3-lane forge config (smith, worker, reviewer) |
+| `herd clone <url> [dir]` | Clone a Herdforge repo and bootstrap the forge |
 | `herd preflight` | Check for repo-relative path violations |
 | `herd status` | Show project, provider, and lane config |
 | `herd standing` | Launch all lane agents in herdr tabs |

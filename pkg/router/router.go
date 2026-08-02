@@ -48,7 +48,13 @@ type ModelCandidate struct {
 type ModelRouter struct {
 	mu         sync.RWMutex
 	candidates []*ModelCandidate
+	usageFunc  UsageFunc
 }
+
+// UsageFunc is an optional hook to check quota before provider selection.
+// Return a utilization percentage (0.0–1.0) for the named provider/harness,
+// or 0 if unknown. A UsageFunc that returns >= 1.0 marks the provider as exhausted.
+type UsageFunc func(ctx context.Context, name string) float64
 
 func NewModelRouter(candidates []*ModelCandidate) *ModelRouter {
 	return &ModelRouter{
@@ -56,19 +62,32 @@ func NewModelRouter(candidates []*ModelCandidate) *ModelRouter {
 	}
 }
 
+// WithUsageFunc attaches a quota-aware usage function to the router.
+func (r *ModelRouter) WithUsageFunc(fn UsageFunc) *ModelRouter {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.usageFunc = fn
+	return r
+}
+
 // SelectProvider returns the first available model candidate not currently in rate-limit cooldown
+// and not exhausted by quota (when a UsageFunc is configured).
 func (r *ModelRouter) SelectProvider(ctx context.Context) (*ModelCandidate, error) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
 	now := time.Now()
 	for _, candidate := range r.candidates {
-		if now.After(candidate.CooldownUntil) {
-			return candidate, nil
+		if !now.After(candidate.CooldownUntil) {
+			continue
 		}
+		if r.usageFunc != nil && r.usageFunc(ctx, candidate.Name) >= 1.0 {
+			continue
+		}
+		return candidate, nil
 	}
 
-	return nil, fmt.Errorf("all AI model providers are currently in rate-limit cooldown")
+	return nil, fmt.Errorf("all AI model providers are currently exhausted or in rate-limit cooldown")
 }
 
 // ReportRateLimit triggers a cooldown period for a specific candidate (e.g. on 429 response)

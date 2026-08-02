@@ -3,16 +3,56 @@ package config
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 
 	"gopkg.in/yaml.v3"
 )
 
+type RouteShape string
+
+const (
+	RouteShapeChat      RouteShape = "chat"
+	RouteShapeCode      RouteShape = "code"
+	RouteShapeReview    RouteShape = "review"
+	RouteShapePlanning  RouteShape = "planning"
+	RouteShapeResearch  RouteShape = "research"
+)
+
+type RiskClass string
+
+const (
+	RiskR0Mechanical RiskClass = "R0"
+	RiskR1Standard   RiskClass = "R1"
+	RiskR2High       RiskClass = "R2"
+	RiskR3Critical   RiskClass = "R3"
+)
+
+type ProviderConstraint string
+
+const (
+	ProviderAny        ProviderConstraint = "any"
+	ProviderDeepSeek   ProviderConstraint = "deepseek"
+	ProviderAnthropic  ProviderConstraint = "anthropic"
+	ProviderGoogle     ProviderConstraint = "google"
+	ProviderOpenAI     ProviderConstraint = "openai"
+	ProviderXAI        ProviderConstraint = "xai"
+	ProviderOllama     ProviderConstraint = "ollama"
+)
+
+type NetworkCapability string
+
+const (
+	NetworkOnline    NetworkCapability = "online"
+	NetworkOffline   NetworkCapability = "offline"
+	NetworkLimited   NetworkCapability = "limited"
+)
+
 type Config struct {
-	Version      string        `yaml:"version"`
-	Project      ProjectConfig `yaml:"project"`
-	TaskProvider TaskProvider  `yaml:"task_provider"`
-	Lanes        []LaneConfig  `yaml:"lanes"`
-	Verification Verification  `yaml:"verification"`
+	Version      string          `yaml:"version"`
+	Project      ProjectConfig   `yaml:"project"`
+	TaskProvider TaskProvider    `yaml:"task_provider"`
+	Lanes        []LaneDef       `yaml:"lanes"`
+	Verification Verification    `yaml:"verification,omitempty"`
 }
 
 type ProjectConfig struct {
@@ -30,15 +70,20 @@ type TaskProvider struct {
 	UseCLI      bool   `yaml:"use_cli,omitempty"`
 }
 
-type LaneConfig struct {
-	Name      string `yaml:"name"`
-	Role      string `yaml:"role"`
-	AgentKind string `yaml:"agent_kind"`
-	Harness   string `yaml:"harness,omitempty"`
-	Prompt    string `yaml:"prompt"`
-	Worktree  string `yaml:"worktree,omitempty"`
-	Provider  string `yaml:"provider,omitempty"`
-	Model     string `yaml:"model,omitempty"`
+type LaneDef struct {
+	Name      string           `yaml:"name"`
+	Role      string           `yaml:"role,omitempty"`
+	AgentKind string           `yaml:"agent_kind"`
+	Harness   string           `yaml:"harness,omitempty"`
+	Prompt    string           `yaml:"prompt"`
+	Worktree  string           `yaml:"worktree,omitempty"`
+	Provider  string           `yaml:"provider,omitempty"`
+	Model     string           `yaml:"model,omitempty"`
+	Route     *RouteShape      `yaml:"route,omitempty"`
+	Risk      *RiskClass       `yaml:"risk,omitempty"`
+	MaxInput  *int             `yaml:"max_input_tokens,omitempty"`
+	MaxOutput *int             `yaml:"max_output_tokens,omitempty"`
+	Network   *NetworkCapability `yaml:"network,omitempty"`
 }
 
 type Verification struct {
@@ -79,12 +124,38 @@ func (c *Config) Validate() error {
 		if lane.Name == "" {
 			return fmt.Errorf("lanes[%d]: missing required field: name", i)
 		}
-		if lane.Role == "" {
-			return fmt.Errorf("lanes[%d]: missing required field: role", i)
-		}
 		if lane.AgentKind == "" {
 			return fmt.Errorf("lanes[%d]: missing required field: agent_kind", i)
+		}
+		if lane.Model == "" {
+			return fmt.Errorf("lanes[%d]: missing required field: model", i)
+		}
+		if lane.Route != nil {
+			switch *lane.Route {
+			case RouteShapeChat, RouteShapeCode, RouteShapeReview, RouteShapePlanning, RouteShapeResearch:
+			default:
+				return fmt.Errorf("lanes[%d]: invalid route shape %q", i, *lane.Route)
+			}
+		}
+		if lane.Risk != nil {
+			switch *lane.Risk {
+			case RiskR0Mechanical, RiskR1Standard, RiskR2High, RiskR3Critical:
+			default:
+				return fmt.Errorf("lanes[%d]: invalid risk class %q", i, *lane.Risk)
+			}
+		}
+		if lane.Network != nil {
+			switch *lane.Network {
+			case NetworkOnline, NetworkOffline, NetworkLimited:
+			default:
+				return fmt.Errorf("lanes[%d]: invalid network capability %q", i, *lane.Network)
+			}
 		}
 	}
 	return nil
 }
+
+var (
+	DefaultConfigPath = filepath.Join(".herd", "herd.yaml")
+	DefaultHerdDir    = ".herd"
+)
