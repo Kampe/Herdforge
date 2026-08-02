@@ -1,0 +1,14 @@
+# Binaries and build output
+bin/
+*.out
+
+# Local machine task provider link files
+.kaneo.json
+kaneo.json
+.herd/kaneo.json
+.herd/herd.yaml.local
+
+# OS & Editor files
+.DS_Store
+*.swp
+*~

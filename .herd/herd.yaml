@@ -36,9 +36,9 @@ model_providers:
     api_key_env: "XAI_API_KEY"
     model: "grok-2"
 
-  - name: "ollama-local"
+  - name: "litellm-proxy"
     type: "ollama"
-    api_url: "http://localhost:11434"
+    api_url: "https://litellm.kampe.kluster"
     model: "llama3.3:70b"
 
 # Worker Lane Roles & Harness Bindings
