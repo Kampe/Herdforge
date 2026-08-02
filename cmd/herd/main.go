@@ -99,6 +99,9 @@ func main() {
 	case "send":
 		runSend()
 
+	case "cleanup":
+		runCleanup()
+
 	case "forge":
 		runForge()
 
@@ -158,6 +161,7 @@ func printUsage() {
 	fmt.Println("  board-done Move one card to done ONLY with proof its work is on origin/main")
 	fmt.Println("  sh         Interactive shell: run herd subcommands in a loop")
 	fmt.Println("  send       Submit text to a herdr agent pane and verify consumption")
+	fmt.Println("  cleanup    Close finished one-off agent tabs (standing fleet exempt)")
 	fmt.Println("  forge      Full cycle: pulse worker + review + approve")
 	fmt.Println("  standing   Launch all configured agent lanes in herdr tabs")
 	fmt.Println("  daemon     Start the long-running orchestration daemon (infinite pulse loop)")
@@ -1276,6 +1280,52 @@ func runSend() {
 		os.Exit(1)
 	}
 	fmt.Printf("herd send: %s -> %s\n", target, status)
+}
+
+// runCleanup ports bin/herd-cleanup: one agent = one tab — close tabs of
+// finished one-off agents. Standing lanes, working agents, orchestrators,
+// and unnamed panes are never touched.
+func runCleanup() {
+	fs := flag.NewFlagSet("cleanup", flag.ExitOnError)
+	dryRun := fs.Bool("dry-run", false, "List what would be closed without closing")
+	asJSON := fs.Bool("json", false, "Output JSON")
+	fs.Parse(os.Args[2:])
+
+	if !herdr.IsAvailable() {
+		fmt.Fprintf(os.Stderr, "herd cleanup: herdr CLI not found\n")
+		os.Exit(1)
+	}
+
+	standing := map[string]bool{}
+	if cfg, err := config.LoadConfig(".herd/herd.yaml"); err == nil {
+		for _, lane := range cfg.Lanes {
+			standing["forge-"+lane.Name] = true
+		}
+	}
+
+	cands, errs := herdr.Cleanup(standing, *dryRun)
+	if *asJSON {
+		json.NewEncoder(os.Stdout).Encode(map[string]interface{}{
+			"dry_run": *dryRun, "candidates": cands, "errors": len(errs),
+		})
+	} else {
+		verb := "closed"
+		if *dryRun {
+			verb = "would close"
+		}
+		if len(cands) == 0 {
+			fmt.Println("herd cleanup: nothing to close")
+		}
+		for _, c := range cands {
+			fmt.Printf("herd cleanup: %s %s (tab %s) — %s\n", verb, c.Name, c.TabID, c.Reason)
+		}
+		for _, e := range errs {
+			fmt.Fprintf(os.Stderr, "herd cleanup: error — %v\n", e)
+		}
+	}
+	if len(errs) > 0 {
+		os.Exit(1)
+	}
 }
 
 // runShell is a thin interactive loop: each line is dispatched as a fresh
