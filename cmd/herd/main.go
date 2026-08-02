@@ -118,6 +118,9 @@ func main() {
 	case "validate-config":
 		runValidateConfig()
 
+	case "doctor-models":
+		runDoctorModels()
+
 	case "next":
 		runNext()
 
@@ -188,6 +191,7 @@ func printUsage() {
 	fmt.Println("  up         Start a single agent lane (herd up <lane-name>)")
 	fmt.Println("  activate   Bring up all deployables + health-check gate (compose + /v1/status)")
 	fmt.Println("  validate-config  Validate .herd/herd.yaml configuration")
+	fmt.Println("  doctor-models    Probe each lane's model (+fallbacks) for quota exhaustion")
 	fmt.Println("  next            Show highest-priority next action")
 	fmt.Println("  dispatch        Dispatch a ticket to a worktree and launch agent")
 	fmt.Println("  harvest         Sweep all worktrees for unmerged commits")
@@ -1461,6 +1465,40 @@ func runShell() {
 		_ = cmd.Run()
 		fmt.Print("herd> ")
 	}
+}
+
+// runDoctorModels probes every lane's model and fallbacks so quota
+// exhaustion is caught explicitly instead of surfacing as agents that plan
+// but never build. Exit 1 when any lane has no healthy model.
+func runDoctorModels() {
+	cfg, err := config.LoadConfig(".herd/herd.yaml")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "doctor-models: %v\n", err)
+		os.Exit(1)
+	}
+	ctx := context.Background()
+	deadLanes := 0
+	for _, lane := range cfg.Lanes {
+		model, trail := herdr.ResolveHealthyModel(ctx, lane.Model, lane.FallbackModels)
+		if model == "" {
+			deadLanes++
+			fmt.Printf("DEAD  %s — every candidate exhausted:\n", lane.Name)
+			for _, p := range trail {
+				fmt.Printf("        %s: %s\n", p.Model, p.Reason)
+			}
+			continue
+		}
+		if model == lane.Model {
+			fmt.Printf("OK    %s -> %s\n", lane.Name, model)
+		} else {
+			fmt.Printf("FELL-OVER %s -> %s (primary %s exhausted)\n", lane.Name, model, lane.Model)
+		}
+	}
+	if deadLanes > 0 {
+		fmt.Fprintf(os.Stderr, "\ndoctor-models: %d lane(s) have NO healthy model\n", deadLanes)
+		os.Exit(1)
+	}
+	fmt.Println("\ndoctor-models: every lane has a healthy model")
 }
 
 func runValidateConfig() {
