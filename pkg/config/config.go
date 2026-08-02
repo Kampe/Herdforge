@@ -52,7 +52,11 @@ func LoadConfig(path string) (*Config, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to read config file %s: %w", path, err)
 	}
+	return ParseConfig(data)
+}
 
+// ParseConfig unmarshals raw YAML bytes into Config
+func ParseConfig(data []byte) (*Config, error) {
 	var cfg Config
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
 		return nil, fmt.Errorf("invalid herd.yaml syntax: %w", err)
