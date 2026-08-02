@@ -281,9 +281,13 @@ func (d *Dispatcher) Dispatch(ctx context.Context, opts DispatchOptions) (*Dispa
 	if err := worktree.RejectSharedRoot(d.Worktree.RepoRoot(), wtInfo.Path); err != nil {
 		return nil, d.failWithCompensate(ctx, task.Ref, "shared_root_denied", err)
 	}
+	// Worktree side effect already landed (path/branch may exist on disk even
+	// when the reported branch string is empty). Empty branch is a hard failure
+	// and must compensate — never return bare after CreateTaskWorktreeFrom.
 	branch := wtInfo.Branch
 	if branch == "" {
-		return nil, fmt.Errorf("worktree created without a Git branch; refusing fictional packet branch")
+		return nil, d.failWithCompensate(ctx, task.Ref, "empty_worktree_branch",
+			fmt.Errorf("worktree created without a Git branch; refusing fictional packet branch"))
 	}
 
 	// Worktree side effect already landed — every subsequent error must compensate.
