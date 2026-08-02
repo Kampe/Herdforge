@@ -167,6 +167,20 @@ func TestVerifyAndPersistAdmissionRequiresCurrentPassingDigest(t *testing.T) {
 	}
 }
 
+func TestFileReceiptStoreRejectsDigestTraversal(t *testing.T) {
+	store, err := NewFileReceiptStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	malicious := "sha256:../" + strings.Repeat("a", 61)
+	if _, err := store.Load(context.Background(), malicious); err == nil || strings.Contains(err.Error(), "no such file") {
+		t.Fatalf("traversal digest must fail validation before filesystem lookup: %v", err)
+	}
+	if _, err := NewReceiptAdmission(store).RequireCurrentPassing(context.Background(), t.TempDir(), malicious); err == nil || strings.Contains(err.Error(), "no such file") {
+		t.Fatalf("admission traversal digest must fail validation: %v", err)
+	}
+}
+
 func TestVerifyCandidateDirtyCheckoutIsBlocked(t *testing.T) {
 	dir, candidate := verificationRepo(t)
 	writeFile(t, filepath.Join(dir, "untracked.txt"), "dirty\n")
