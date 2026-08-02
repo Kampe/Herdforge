@@ -96,10 +96,21 @@ func TestBuildTaskPacket(t *testing.T) {
 	if !strings.Contains(packet, "FAC-33") {
 		t.Error("packet should contain ticket ref")
 	}
-	if !strings.Contains(packet, "Do the thing") {
-		t.Error("packet should contain description")
-	}
 	if !strings.Contains(packet, "/tmp/wt") {
 		t.Error("packet should contain worktree path")
+	}
+	// FAC-115: reference-based, NOT an inline spec dump — the agent reads the
+	// card itself, and the packet must be tight (context-budget fix).
+	if !strings.Contains(packet, "kaneo task get FAC-33") {
+		t.Error("packet must tell the agent to read the card by reference")
+	}
+	if strings.Contains(packet, "Do the thing") {
+		t.Error("packet must NOT dump the card description inline (burns agent context)")
+	}
+	if !strings.Contains(packet, "herd verify") {
+		t.Error("packet must include the self-verify completion contract")
+	}
+	if lines := strings.Count(packet, "\n"); lines > 25 {
+		t.Errorf("packet must stay tight (<25 lines), got %d", lines)
 	}
 }

@@ -207,50 +207,36 @@ func extractIntentFromTitle(title string) string {
 	return strings.TrimSpace(strings.ToLower(title))
 }
 
+// buildTaskPacket builds a TIGHT, reference-based packet (FAC-115). It does
+// NOT dump the card's (often 150-line) spec inline — that burned the agent's
+// context to 80% before it wrote a line and was a direct cause of the
+// whiff-and-stall pattern. The agent reads the full spec itself via
+// `kaneo task get`, keeping its whole context for the actual build. The
+// packet is only the completion contract: where to work, what "done" means,
+// and how to signal it.
 func buildTaskPacket(task *provider.Task, wtPath, branch, rolePath string, lane *config.LaneDef) string {
 	var b strings.Builder
 
-	b.WriteString(fmt.Sprintf("# Task Packet: %s\n\n", task.Ref))
-	b.WriteString(fmt.Sprintf("**Title**: %s\n", task.Title))
-	b.WriteString(fmt.Sprintf("**Priority**: %s\n", task.Priority))
-	b.WriteString(fmt.Sprintf("**Status**: %s\n", task.Status))
-	b.WriteString(fmt.Sprintf("**Labels**: %s\n\n", strings.Join(task.Labels, ", ")))
+	fmt.Fprintf(&b, "BUILD %s — EXECUTE. No menus, no questions. Do not stop until "+
+		"`go build ./...`, `go vet ./...`, and `go test ./...` all pass AND you have committed.\n\n", task.Ref)
 
-	b.WriteString("## Worktree\n\n")
-	b.WriteString(fmt.Sprintf("**Path**: `%s`\n", wtPath))
-	b.WriteString(fmt.Sprintf("**Branch**: `%s`\n", branch))
+	fmt.Fprintf(&b, "Worktree: %s (branch %s). Work ONLY here — never edit files outside it.\n\n", wtPath, branch)
 
-	if lane != nil {
-		b.WriteString(fmt.Sprintf("**Role**: %s\n", lane.Role))
-		b.WriteString(fmt.Sprintf("**Agent**: %s / %s\n", lane.AgentKind, lane.Model))
-		if lane.Worktree != "" {
-			b.WriteString(fmt.Sprintf("**Assigned Worktree**: %s\n", lane.Worktree))
-		}
+	fmt.Fprintf(&b, "Read the full spec yourself (do not wait for it inline):\n")
+	fmt.Fprintf(&b, "  kaneo task get %s --full\n", task.Ref)
+	b.WriteString("  and the matching chainseer source at ~/Personal/chainseer/bin/ if this is a port.\n\n")
+
+	b.WriteString("Completion contract (self-gate, FAC-116):\n")
+	fmt.Fprintf(&b, "  1. cd %s\n", wtPath)
+	b.WriteString("  2. Implement per the spec you just read (real code + table tests).\n")
+	b.WriteString("  3. go build ./... && go vet ./... && go test ./... — ALL green.\n")
+	fmt.Fprintf(&b, "  4. Verify yourself: herd verify %s (must PASS: real commits + build + tests).\n", wtPath)
+	fmt.Fprintf(&b, "  5. git add -A && git commit -m \"<msg containing %s>\" (no AI-attribution trailers).\n", task.Ref)
+	fmt.Fprintf(&b, "  6. Final message: `BUILD COMPLETE %s` + `git rev-parse HEAD`.\n\n", task.Ref)
+
+	b.WriteString("Do NOT push, PR, or merge — the coordinator harvests your branch. Do NOT touch the root checkout.\n")
+	if lane != nil && rolePath != "" {
+		fmt.Fprintf(&b, "Role contract: %s\n", rolePath)
 	}
-
-	b.WriteString("\n## Description\n\n")
-	if task.Description != "" {
-		b.WriteString(task.Description)
-	} else {
-		b.WriteString(fmt.Sprintf("Port the %s concept to Herdforge: implement a command that %s.\n\n", extractCommandFromTitle(task.Title), extractIntentFromTitle(task.Title)))
-		b.WriteString("Look at the existing `cmd/herd/main.go` for the command entry point and\n")
-		b.WriteString("register pattern. Add a new subcommand, implement its logic, write tests,\n")
-		b.WriteString("and verify the full test suite still passes.\n")
-	}
-	b.WriteString("\n\n")
-
-	b.WriteString("## Workflow\n\n")
-	b.WriteString(fmt.Sprintf("1. Enter worktree: `cd %s`\n", wtPath))
-	b.WriteString("2. Inspect existing code and understand what needs to change\n")
-	b.WriteString("3. Write failing tests first (TDD)\n")
-	b.WriteString("4. Implement the minimal solution\n")
-	b.WriteString("5. Verify: `go test ./...` (or equivalent test command)\n")
-	b.WriteString("6. Commit with a conventional commit message\n")
-	b.WriteString("7. Signal completion by moving the card to 'in-progress' (review pipeline)\n\n")
-
-	if lane != nil {
-		b.WriteString(fmt.Sprintf("## Role Context\n\nRole prompt from: `%s`\n", rolePath))
-	}
-
 	return b.String()
 }

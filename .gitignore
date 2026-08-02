@@ -37,3 +37,4 @@ opencode.json
 
 # compiled binaries must not be tracked
 /herd
+TASK-PACKET.md
