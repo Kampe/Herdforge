@@ -33,3 +33,4 @@ opencode.jsonc
 opencode.json
 .kaneo.json
 .worktrees/
+.herd/worktrees/

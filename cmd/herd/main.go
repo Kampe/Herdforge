@@ -1027,11 +1027,11 @@ Once you signal APPROVED, the orchestrator will move this card to 'done'.`,
 		}
 	}
 
-	// Move card to "review" status after dispatching
-	if err := tp.UpdateStatus(ctx, task.ID, "review"); err != nil {
-		fmt.Fprintf(os.Stderr, "  warning: failed to move card to review status: %v\n", err)
+	// Move card to "in-review" status after dispatching
+	if err := tp.UpdateStatus(ctx, task.ID, "in-review"); err != nil {
+		fmt.Fprintf(os.Stderr, "  warning: failed to move card to in-review status: %v\n", err)
 	} else {
-		fmt.Printf("  -> moved card [%s] to 'review' status\n", task.Ref)
+		fmt.Printf("  -> moved card [%s] to 'in-review' status\n", task.Ref)
 	}
 }
 
@@ -1052,9 +1052,9 @@ func runApprove() {
 
 	ctx := context.Background()
 
-	tasks, err := tp.ListTasks(ctx, cfg.TaskProvider.ProjectID, "review")
+	tasks, err := tp.ListTasks(ctx, cfg.TaskProvider.ProjectID, "in-review")
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "failed to list review-status tasks: %v\n", err)
+		fmt.Fprintf(os.Stderr, "failed to list in-review tasks: %v\n", err)
 		os.Exit(1)
 	}
 
@@ -1326,13 +1326,13 @@ func runForge() {
 	if err == nil && len(tasks) > 0 {
 		t := tasks[0]
 		fmt.Printf("Selected [%s]: %s for review\n", t.Ref, t.Title)
-		if err := tp.UpdateStatus(ctx, t.ID, "review"); err == nil {
-			fmt.Printf("  -> moved to 'review' status\n")
+		if err := tp.UpdateStatus(ctx, t.ID, "in-review"); err == nil {
+			fmt.Printf("  -> moved to 'in-review' status\n")
 		}
 	}
 
 	fmt.Println("\n=== Forge: Approve ===")
-	reviewTasks, err := tp.ListTasks(ctx, cfg.TaskProvider.ProjectID, "review")
+	reviewTasks, err := tp.ListTasks(ctx, cfg.TaskProvider.ProjectID, "in-review")
 	if err == nil && len(reviewTasks) > 0 {
 		t := reviewTasks[0]
 		if err := tp.UpdateStatus(ctx, t.ID, "done"); err == nil {
