@@ -38,11 +38,13 @@ func (e *Engine) SelectNextTask(ctx context.Context, role string) (*provider.Tas
 		return nil, fmt.Errorf("failed to list candidate tasks: %w", err)
 	}
 
-	// Filter tasks by role label matching (match if no labels or label matches role)
+	// Filter tasks by role label matching
 	var matched []*provider.Task
 	for _, task := range tasks {
 		if len(task.Labels) == 0 {
-			matched = append(matched, task)
+			if role == "worker" || role == "herd-smith" || role == "" {
+				matched = append(matched, task)
+			}
 			continue
 		}
 		for _, label := range task.Labels {
