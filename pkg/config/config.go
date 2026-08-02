@@ -79,6 +79,11 @@ type LaneDef struct {
 	Worktree  string           `yaml:"worktree,omitempty"`
 	Provider  string           `yaml:"provider,omitempty"`
 	Model     string           `yaml:"model,omitempty"`
+	// FallbackModels are tried in order when Model probes unavailable
+	// (quota exhausted / no payment method). The first that probes healthy
+	// launches the lane, so a spent surface fails over instead of silently
+	// whiffing every build.
+	FallbackModels []string    `yaml:"fallback_models,omitempty"`
 	Route     *RouteShape      `yaml:"route,omitempty"`
 	Risk      *RiskClass       `yaml:"risk,omitempty"`
 	MaxInput  *int             `yaml:"max_input_tokens,omitempty"`

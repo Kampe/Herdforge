@@ -11,8 +11,11 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
+
+	"github.com/Kampe/Herdforge/pkg/lock"
 
 	"github.com/Kampe/Herdforge/pkg/activate"
 	"github.com/Kampe/Herdforge/pkg/attention"
@@ -25,6 +28,7 @@ import (
 	"github.com/Kampe/Herdforge/pkg/lifecycle"
 	"github.com/Kampe/Herdforge/pkg/lost"
 	"github.com/Kampe/Herdforge/pkg/next"
+	"github.com/Kampe/Herdforge/pkg/overlap"
 	"github.com/Kampe/Herdforge/pkg/preflight"
 	"github.com/Kampe/Herdforge/pkg/process"
 	"github.com/Kampe/Herdforge/pkg/provider"
@@ -121,6 +125,9 @@ func main() {
 	case "validate-config":
 		runValidateConfig()
 
+	case "doctor-models":
+		runDoctorModels()
+
 	case "next":
 		runNext()
 
@@ -138,6 +145,9 @@ func main() {
 
 	case "throughput":
 		runThroughput()
+
+	case "overlap":
+		runOverlap()
 
 	case "attention":
 		runAttention()
@@ -159,6 +169,9 @@ func main() {
 
 	case "resources":
 		runResources()
+
+	case "lock":
+		runLock()
 
 	default:
 		fmt.Fprintf(os.Stderr, "unknown subcommand '%s'\nRun 'herd --help' for usage.\n", command)
@@ -192,12 +205,14 @@ func printUsage() {
 	fmt.Println("  up         Start a single agent lane (herd up <lane-name>)")
 	fmt.Println("  activate   Bring up all deployables + health-check gate (compose + /v1/status)")
 	fmt.Println("  validate-config  Validate .herd/herd.yaml configuration")
+	fmt.Println("  doctor-models    Probe each lane's model (+fallbacks) for quota exhaustion")
 	fmt.Println("  next            Show highest-priority next action")
 	fmt.Println("  dispatch        Dispatch a ticket to a worktree and launch agent")
 	fmt.Println("  harvest         Sweep all worktrees for unmerged commits")
 	fmt.Println("  unmerged        Authoritative cherry-based unmerged check (herd unmerged <path> | --all)")
 	fmt.Println("  lost            Find ownerless unmerged work on ANY branch (subject-based)")
 	fmt.Println("  throughput      Read-only fleet throughput KPIs from local evidence")
+	fmt.Println("  overlap         Detect files/symbols edited together by 2+ unmerged branches")
 	fmt.Println("  attention       List agents needing coordinator eyes")
 	fmt.Println("  process         Classify harvest targets (herd-process digest)")
 	fmt.Println("  resolve-lane    Resolve a lane to concrete provider+model (deterministic)")
@@ -206,6 +221,7 @@ func printUsage() {
 	fmt.Println("  attention       List standing agents needing coordinator eyes (triage)")
 	fmt.Println("  lifecycle       Observe and act on fleet state via lifecycle engine")
 	fmt.Println("  resources       Snapshot system-resource headroom (free-mem, swap, gate verdict)")
+	fmt.Println("  lock           Advisory shared-checkout lock: with, acquire, release, status")
 	fmt.Println("  --version       Show herd version")
 }
 
@@ -1592,6 +1608,40 @@ func runShell() {
 	}
 }
 
+// runDoctorModels probes every lane's model and fallbacks so quota
+// exhaustion is caught explicitly instead of surfacing as agents that plan
+// but never build. Exit 1 when any lane has no healthy model.
+func runDoctorModels() {
+	cfg, err := config.LoadConfig(".herd/herd.yaml")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "doctor-models: %v\n", err)
+		os.Exit(1)
+	}
+	ctx := context.Background()
+	deadLanes := 0
+	for _, lane := range cfg.Lanes {
+		model, trail := herdr.ResolveHealthyModel(ctx, lane.Model, lane.FallbackModels)
+		if model == "" {
+			deadLanes++
+			fmt.Printf("DEAD  %s — every candidate exhausted:\n", lane.Name)
+			for _, p := range trail {
+				fmt.Printf("        %s: %s\n", p.Model, p.Reason)
+			}
+			continue
+		}
+		if model == lane.Model {
+			fmt.Printf("OK    %s -> %s\n", lane.Name, model)
+		} else {
+			fmt.Printf("FELL-OVER %s -> %s (primary %s exhausted)\n", lane.Name, model, lane.Model)
+		}
+	}
+	if deadLanes > 0 {
+		fmt.Fprintf(os.Stderr, "\ndoctor-models: %d lane(s) have NO healthy model\n", deadLanes)
+		os.Exit(1)
+	}
+	fmt.Println("\ndoctor-models: every lane has a healthy model")
+}
+
 func runValidateConfig() {
 	cfgPath := ".herd/herd.yaml"
 	if len(os.Args) > 2 {
@@ -1861,6 +1911,158 @@ func runThroughput() {
 	}
 	fmt.Printf("herd-throughput: merges/day=%.2f verdict→merge=%ds rounds/ticket=%.2f merged_tickets=%d route-decisions/merged-ticket=%.2f\n",
 		m.MergesPerDay, m.MedianVerdictToMergeSeconds, m.ReviewRoundsPerTicket, m.MergedTickets, m.RouteDecisionsPerMergedTicket)
+}
+
+// runOverlap ports bin/herd-overlap: surface files that more than one
+// unmerged branch is editing, and same-name symbols added in different
+// files, before those branches collide at merge. Exit 0 = no overlap (or a
+// --json snapshot, or selftest pass), 1 = overlap found / selftest fail,
+// 2 = unknown arg, 3 = no origin/main.
+func runOverlap() {
+	fs := flag.NewFlagSet("overlap", flag.ExitOnError)
+	quiet := fs.Bool("quiet", false, "Only the overlaps, for a pulse stage")
+	min := fs.Int("min", 2, "Only files touched by this many branches / symbols on this many tips")
+	wantJSON := fs.Bool("json", false, "Output JSON")
+	symbolsMode := fs.Bool("symbols", false, "Detect same-name additions in different files")
+	selftestMode := fs.Bool("selftest", false, "Self-test origin/main against itself")
+	fs.Parse(os.Args[2:]) // flag.ExitOnError prints usage + exits 2 on unknown arg
+
+	repoRoot := "."
+	if err := os.Chdir(repoRoot); err != nil {
+		fmt.Fprintf(os.Stderr, "failed to change dir: %v\n", err)
+		os.Exit(1)
+	}
+	o := overlap.NewOverlap(repoRoot)
+	mainRef := envOr("HERD_OVERLAP_MAIN_REF", "origin/main")
+	ctx := context.Background()
+
+	if *selftestMode {
+		runOverlapSelftest(ctx, repoRoot)
+		return
+	}
+
+	// Verify the main ref is present before any 3-dot census, matching the
+	// reference's exit-3 path.
+	if !gitRefExists(ctx, repoRoot, mainRef) {
+		fmt.Fprintln(os.Stderr, "herd-overlap: no origin/main; run git fetch origin main")
+		os.Exit(3)
+	}
+
+	if *symbolsMode {
+		hot := o.SymbolOverlaps(ctx, mainRef, *min)
+		if *wantJSON {
+			if hot == nil {
+				hot = []overlap.SymbolHot{}
+			}
+			out, _ := json.Marshal(hot)
+			fmt.Println(string(out))
+		} else if len(hot) == 0 {
+			if !*quiet {
+				fmt.Printf("herd-overlap: no symbol is being added on %d+ unmerged tips in different files\n", *min)
+			}
+		} else {
+			fmt.Printf("herd-overlap: %d symbol(s) added on %d+ unmerged tips in different files\n", len(hot), *min)
+			for _, s := range hot {
+				fmt.Printf("  %s\n", s.Symbol)
+				for _, r := range s.Refs {
+					fmt.Printf("    %s|%s\n", r.Branch, r.Location)
+				}
+			}
+		}
+		if len(hot) == 0 {
+			os.Exit(0)
+		}
+		os.Exit(1)
+	}
+
+	hot, scanned, err := o.FileOverlaps(ctx, mainRef, *min, nil)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "herd-overlap: error — %v\n", err)
+		os.Exit(1)
+	}
+
+	if *wantJSON {
+		if hot == nil {
+			hot = []overlap.FileOverlap{}
+		}
+		out, _ := json.Marshal(hot)
+		fmt.Println(string(out))
+		os.Exit(0)
+	}
+
+	if len(hot) == 0 {
+		if !*quiet {
+			fmt.Printf("herd-overlap: no file is being edited by %d+ unmerged branches (%d branch(es) scanned)\n", *min, scanned)
+		}
+		os.Exit(0)
+	}
+
+	fmt.Printf("herd-overlap: %d file(s) edited by %d+ unmerged branches (%d scanned)\n", len(hot), *min, scanned)
+	fmt.Println("  Two branches on one file is normal. Two branches on one file for days,")
+	fmt.Println("  neither able to see the other, is the same design being built twice.")
+	fmt.Println()
+
+	// Rank by branch count so the worst convergence reads first. Cap the
+	// printed list: overlap runs on every beat and a wall of output is
+	// ignored exactly as reliably as no output at all.
+	top := 12
+	if v := os.Getenv("HERD_OVERLAP_TOP"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			top = n
+		}
+	}
+	shown := 0
+	for _, fo := range hot {
+		if shown >= top {
+			break
+		}
+		shown++
+		fmt.Printf("  [%d] %s\n", len(fo.Branches), fo.File)
+		for _, b := range fo.Branches {
+			fmt.Printf("        %s\n", b)
+		}
+	}
+	if len(hot) > shown {
+		fmt.Println()
+		fmt.Printf("  ... and %d more (herd overlap --min 3, or HERD_OVERLAP_TOP=50)\n", len(hot)-shown)
+	}
+
+	// Exit 1 so a pulse stage can surface it as work to look at, matching the
+	// herd-drain convention. Not a failure of the beat.
+	os.Exit(1)
+}
+
+// runOverlapSelftest ports the reference --selftest: origin/main must exist,
+// and a branch compared against itself must contribute no changed files (so a
+// merged branch can never manufacture a phantom overlap).
+func runOverlapSelftest(ctx context.Context, repoRoot string) {
+	if !gitRefExists(ctx, repoRoot, "origin/main") {
+		fmt.Fprintln(os.Stderr, "FAIL: no origin/main")
+		os.Exit(1)
+	}
+	cmd := exec.CommandContext(ctx, "git", "diff", "--name-only", "origin/main...origin/main")
+	cmd.Dir = repoRoot
+	out, err := cmd.Output() // err tolerated: a missing ref contributes nothing
+	if err == nil {
+		n := 0
+		for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+			if line != "" {
+				n++
+			}
+		}
+		if n != 0 {
+			fmt.Fprintf(os.Stderr, "FAIL: origin/main against itself reported %d changed files\n", n)
+			os.Exit(1)
+		}
+	}
+	fmt.Println("herd-overlap --selftest PASS")
+}
+
+// gitRefExists reports whether ref resolves in repoRoot.
+func gitRefExists(ctx context.Context, repoRoot, ref string) bool {
+	cmd := exec.CommandContext(ctx, "git", "rev-parse", "--verify", "-q", ref)
+	cmd.Dir = repoRoot
+	return cmd.Run() == nil
 }
 
 func envOr(key, def string) string {
@@ -2500,4 +2702,231 @@ func runResolveLane() {
 	if !result.Resolvable {
 		os.Exit(3)
 	}
+}
+
+const lockUsage = "Usage: herd lock with [--wait N] [--reason T] -- <cmd...> | acquire | release | status"
+
+// lockDir resolves the lock directory: HERD_SHARED_LOCK_DIR when set, else
+// <canonical>/.git/herd-shared-checkout.lock.d.
+// lockDir at path, else <canonical>/.git/herd-shared-checkout.lock.d.
+func lockDir(canonical string) string {
+	if d := os.Getenv(lock.EnvLockDir); d != "" {
+		return d
+	}
+	return filepath.Join(canonical, lock.DefaultRelDir)
+}
+
+// lockCanonicalRoot resolves the shared checkout root the same way
+// herd_canonical_root does: HERD_CANONICAL_ROOT if set and a directory, else
+// the repo root (the current directory, which is where herd runs).
+func lockCanonicalRoot() string {
+	if c := os.Getenv(lock.EnvCanonicalRoot); c != "" {
+		if fi, err := os.Stat(c); err == nil && fi.IsDir() {
+			return c
+		}
+	}
+	// The root must be ABSOLUTE: a relative "." makes the lockdir relative,
+	// so the HERD_SHARED_LOCK_HELD marker and `git -C <root>` both break.
+	// Resolve symlinks to match what a zsh caller in the same checkout sees.
+	wd, err := os.Getwd()
+	if err != nil {
+		return "."
+	}
+	if resolved, err := filepath.EvalSymlinks(wd); err == nil {
+		return resolved
+	}
+	return wd
+}
+
+// lockDefaultMaxAge returns HERD_SHARED_LOCK_MAX_AGE in seconds, else 300s.
+func lockDefaultMaxAge() time.Duration {
+	if v := os.Getenv(lock.EnvMaxAge); v != "" {
+		if secs, err := strconv.Atoi(v); err == nil && secs > 0 {
+			return time.Duration(secs) * time.Second
+		}
+	}
+	return lock.DefaultMaxAge
+}
+
+// isGitMutation reports whether the joined child command contains one of the
+// tree-mutating git tokens (the same space-delimited substring test zsh does).
+func isGitMutation(cmdLine []string) bool {
+	// zsh wraps the whole arg list in spaces (`case " $* " in`), so a token
+	// at the end like `git pull` still matches " pull ". Mirror that framing.
+	joined := " " + strings.Join(cmdLine, " ") + " "
+	for _, token := range []string{"pull", "reset", "rebase", "checkout", "stash", "merge", "switch"} {
+		if strings.Contains(joined, " "+token+" ") {
+			return true
+		}
+	}
+	return false
+}
+
+// execGitCommand is a seam so tests can mock `git status --porcelain`.
+var execGitCommand = exec.CommandContext
+
+// lockGitStatus runs `git -C <canonical> status --porcelain` and returns the
+// raw output, or "" on any failure (zsh `|| true` semantics).
+func lockGitStatus(canonical string) string {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cmd := execGitCommand(ctx, "git", "-C", canonical, "status", "--porcelain")
+	out, err := cmd.Output()
+	if err != nil {
+		return ""
+	}
+	return string(out)
+}
+
+// runLock implements the `herd lock` subcommand. Parse replicates the zsh
+// wrapper: optional --wait N / --reason TEXT, literal `--` ends flags and the
+// remainder (including the terminated `--`) is treated as the command for
+// `with`.
+//
+// Exit codes are contract: acquire 0 held / 1 timed out; with 0 ok or the
+// child's rc / 2 usage / 3 dirty-refusal; status always 0; -h / no-arg prints
+// usage and exits 0; unknown mode exits 2.
+func runLock() {
+	args := os.Args[2:]
+	if len(args) == 0 {
+		fmt.Println(lockUsage)
+		return
+	}
+	mode := args[0]
+	rest := args[1:]
+
+	wait := 30
+	reason := ""
+	var child []string
+	for len(rest) > 0 {
+		switch rest[0] {
+		case "--wait":
+			if len(rest) > 1 {
+				if n, err := strconv.Atoi(rest[1]); err == nil && n >= 0 {
+					wait = n
+				}
+			}
+			rest = rest[2:]
+		case "--reason":
+			if len(rest) > 1 {
+				reason = rest[1]
+				rest = rest[2:]
+			} else {
+				rest = rest[1:]
+			}
+		case "--":
+			child = rest[1:]
+			rest = nil
+		default:
+			child = rest
+			rest = nil
+		}
+	}
+
+	canonical := lockCanonicalRoot()
+	lockdir := lockDir(canonical)
+	maxAge := lockDefaultMaxAge()
+
+	switch mode {
+	case "acquire":
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		l := lock.NewDirLock(lockdir)
+		l.SetMaxAge(maxAge)
+		if err := l.Acquire(ctx, time.Duration(wait)*time.Second, reason); err != nil {
+			fmt.Fprintf(os.Stderr, "herd lock: %v\n", err)
+			os.Exit(1)
+		}
+	case "release":
+		lock.NewDirLock(lockdir).Release()
+	case "status":
+		held, holder := lock.NewDirLock(lockdir).Status()
+		if held {
+			fmt.Printf("LOCKED [%s]\n", holder)
+		} else {
+			fmt.Println("unlocked")
+		}
+	case "with":
+		if len(child) == 0 {
+			fmt.Fprintln(os.Stderr, lockUsage)
+			os.Exit(2)
+		}
+		runLockWith(child, canonical, lockdir, wait, reason)
+	case "-h", "--help", "":
+		fmt.Println(lockUsage)
+	default:
+		fmt.Fprintf(os.Stderr, "herd lock: unknown mode '%s'\n", mode)
+		os.Exit(2)
+	}
+}
+
+// runLockWith implements the `with` mode: dirty gate, re-entrancy, acquire,
+// run child, release on every exit path.
+func runLockWith(child []string, canonical, lockdir string, wait int, reason string) {
+	// CHA-544: FAIL CLOSED on a dirty shared checkout before a tree-mutating
+	// git command. A plain WARNING was ignored and edits were destroyed
+	// twice, so this refuses with exit 3 unless HERD_SHARED_DIRTY_OK=1.
+	if os.Getenv(lock.EnvDirtyOK) != "1" && child[0] == "git" && isGitMutation(child) {
+		dirty := lockGitStatus(canonical)
+		if strings.TrimSpace(dirty) != "" {
+			fmt.Fprintln(os.Stderr, "herd lock: REFUSING tree-mutating command against a DIRTY shared checkout")
+			fmt.Fprintln(os.Stderr, "herd lock: A plain WARNING was ignored and edits were destroyed twice (CHA-544).")
+			for _, line := range strings.Split(strings.TrimSpace(dirty), "\n") {
+				fmt.Fprintf(os.Stderr, "  %s\n", line)
+			}
+			fmt.Fprintln(os.Stderr, "herd lock: fix the dirty files, then re-run; or set HERD_SHARED_DIRTY_OK=1 to override.")
+			os.Exit(3)
+		}
+	}
+
+	// Re-entrancy: an ancestor `with` already holds this lock (marked in the
+	// env) so just run the child; the outer call owns acquire/release exactly
+	// like `izsh's `$@; exit $?`.
+	if os.Getenv(lock.EnvHeld) != "" {
+		os.Exit(runLocked(child, lockdir))
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	l := lock.NewDirLock(lockdir)
+	l.SetMaxAge(lockDefaultMaxAge())
+	if err := l.Acquire(ctx, time.Duration(wait)*time.Second, reason); err != nil {
+		fmt.Fprintf(os.Stderr, "herd lock: %v\n", err)
+		os.Exit(1)
+	}
+	released := false
+	defer func() {
+		if !released {
+			l.Release()
+		}
+	}()
+	rc := runLocked(child, lockdir)
+	l.Release()
+	released = true
+	os.Exit(rc)
+}
+
+// runLocked runs child with HERD_SHARED_LOCK_HELD set to lockdir — exactly the
+// env marker zsh exported so nested calls are re-entrant — and returns the
+// child's exit code.
+func runLocked(child []string, lockdir string) int {
+	if len(child) == 0 {
+		return 0
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cmd := exec.CommandContext(ctx, child[0], child[1:]...)
+	cmd.Env = append(os.Environ(), lock.EnvHeld+"="+lockdir)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	cmd.Stdin = os.Stdin
+	err := cmd.Run()
+	if err == nil {
+		return 0
+	}
+	if ee, ok := err.(*exec.ExitError); ok {
+		return ee.ExitCode()
+	}
+	fmt.Fprintf(os.Stderr, "herd lock: %v\n", err)
+	return 1
 }
