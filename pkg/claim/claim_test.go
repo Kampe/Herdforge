@@ -366,10 +366,11 @@ func TestClaimManager_OperatorHold_PreventsExpiry(t *testing.T) {
 	ctx := context.Background()
 	key := testKey("FAC-7")
 
-	if _, err := mgr.Claim(ctx, ClaimRequest{Key: key, OwnerID: "w1", Role: "herd-smith", TaskRole: "herd-smith"}); err != nil {
+	lease, err := mgr.Claim(ctx, ClaimRequest{Key: key, OwnerID: "w1", Role: "herd-smith", TaskRole: "herd-smith"})
+	if err != nil {
 		t.Fatalf("claim: %v", err)
 	}
-	if _, err := mgr.Hold(ctx, key, true); err != nil {
+	if _, err := mgr.Hold(ctx, key, "w1", lease.Generation, true); err != nil {
 		t.Fatalf("hold: %v", err)
 	}
 
@@ -396,7 +397,7 @@ func TestClaimManager_OperatorHold_PreventsExpiry(t *testing.T) {
 		t.Fatal("expected held lease to block a competing claim")
 	}
 
-	if _, err := mgr.Hold(ctx, key, false); err != nil {
+	if _, err := mgr.Hold(ctx, key, "w1", lease.Generation, false); err != nil {
 		t.Fatalf("unhold: %v", err)
 	}
 	expired, err = mgr.ExpireStale(ctx)
@@ -405,5 +406,244 @@ func TestClaimManager_OperatorHold_PreventsExpiry(t *testing.T) {
 	}
 	if len(expired) != 1 {
 		t.Fatalf("expected unheld, past-TTL lease to expire, got %d", len(expired))
+	}
+}
+
+func TestClaimManager_Hold_RequiresCurrentOwnerAndGeneration(t *testing.T) {
+	store := newTestStore(t)
+	clk := newClock(time.Now())
+	mgr := NewClaimManager(store, WithClock(clk.now), WithTTL(time.Minute))
+	ctx := context.Background()
+	key := testKey("FAC-9")
+
+	lease, err := mgr.Claim(ctx, ClaimRequest{Key: key, OwnerID: "w1", Role: "herd-smith", TaskRole: "herd-smith"})
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+
+	if _, err := mgr.Hold(ctx, key, "someone-else", lease.Generation, true); !errors.Is(err, ErrStaleGeneration) && !errors.Is(err, ErrNotFound) {
+		t.Fatalf("expected wrong-owner Hold to be rejected, got %v", err)
+	}
+	if _, err := mgr.Hold(ctx, key, "w1", lease.Generation+1, true); !errors.Is(err, ErrStaleGeneration) && !errors.Is(err, ErrNotFound) {
+		t.Fatalf("expected wrong-generation Hold to be rejected, got %v", err)
+	}
+	if _, err := mgr.Hold(ctx, key, "w1", lease.Generation, true); err != nil {
+		t.Fatalf("expected correct owner+generation Hold to succeed, got %v", err)
+	}
+
+	// Let it expire and get reclaimed by someone else (new generation);
+	// the original owner's now-stale generation must not be able to hold
+	// or unhold the new claimant's lease.
+	if _, err := mgr.Hold(ctx, key, "w1", lease.Generation, false); err != nil {
+		t.Fatalf("unhold before reclaim: %v", err)
+	}
+	clk.advance(2 * time.Minute)
+	next, err := mgr.Claim(ctx, ClaimRequest{Key: key, OwnerID: "w2", Role: "herd-smith", TaskRole: "herd-smith"})
+	if err != nil {
+		t.Fatalf("reclaim: %v", err)
+	}
+	if _, err := mgr.Hold(ctx, key, "w1", lease.Generation, true); !errors.Is(err, ErrStaleGeneration) {
+		t.Fatalf("expected stale-generation Hold to be rejected after reclaim, got %v", err)
+	}
+	if _, err := mgr.Hold(ctx, key, "w2", next.Generation, true); err != nil {
+		t.Fatalf("expected new owner's Hold to succeed, got %v", err)
+	}
+}
+
+func TestClaimManager_Renew_RejectsExpiredLease(t *testing.T) {
+	store := newTestStore(t)
+	clk := newClock(time.Now())
+	mgr := NewClaimManager(store, WithClock(clk.now), WithTTL(time.Minute))
+	ctx := context.Background()
+	key := testKey("FAC-10")
+
+	lease, err := mgr.Claim(ctx, ClaimRequest{Key: key, OwnerID: "w1", Role: "herd-smith", TaskRole: "herd-smith"})
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+
+	// Past TTL, but nobody has swept it yet -- still status='active' in
+	// the store. Renew must still reject it instead of silently
+	// extending a dead lease's life.
+	clk.advance(2 * time.Minute)
+	if _, err := mgr.Renew(ctx, key, "w1", lease.Generation); !errors.Is(err, ErrLeaseExpired) {
+		t.Fatalf("expected ErrLeaseExpired for an unswept but past-TTL lease, got %v", err)
+	}
+
+	// A held lease never counts as expired, even well past its TTL.
+	if _, err := mgr.Hold(ctx, key, "w1", lease.Generation, true); err != nil {
+		t.Fatalf("hold: %v", err)
+	}
+	if _, err := mgr.Renew(ctx, key, "w1", lease.Generation); err != nil {
+		t.Fatalf("expected held lease to still be renewable, got %v", err)
+	}
+}
+
+// TestClaimManager_ReclaimReleasesOldCapacityBeforeReservingNew proves
+// requirement 2: when a new claim reclaims a key whose previous lease
+// expired, the old lease's capacity token is durably released before (or,
+// on failure, at minimum durably queued ahead of) the new token is
+// reserved -- never silently dropped, never double-counted.
+func TestClaimManager_ReclaimReleasesOldCapacityBeforeReservingNew(t *testing.T) {
+	store := newTestStore(t)
+	clk := newClock(time.Now())
+	capCoord := newCountingCapacity()
+	mgr := NewClaimManager(store, WithClock(clk.now), WithTTL(time.Minute), WithCapacityCoordinator(capCoord))
+	ctx := context.Background()
+	key := testKey("FAC-11")
+
+	if _, err := mgr.Claim(ctx, ClaimRequest{Key: key, OwnerID: "w1", Role: "herd-smith", TaskRole: "herd-smith"}); err != nil {
+		t.Fatalf("first claim: %v", err)
+	}
+	if r, rel := capCoord.counts("herd-smith"); r != 1 || rel != 0 {
+		t.Fatalf("expected 1 reserve / 0 release after first claim, got %d/%d", r, rel)
+	}
+
+	clk.advance(2 * time.Minute) // first lease's TTL passes, nobody has swept it
+
+	if _, err := mgr.Claim(ctx, ClaimRequest{Key: key, OwnerID: "w2", Role: "herd-smith", TaskRole: "herd-smith"}); err != nil {
+		t.Fatalf("reclaim: %v", err)
+	}
+	// The reclaim must have durably released w1's token (not just
+	// reserved a second one on top of it): exactly 2 reserves (w1, w2)
+	// and exactly 1 release (w1's, settled before/with w2's reservation).
+	if r, rel := capCoord.counts("herd-smith"); r != 2 || rel != 1 {
+		t.Fatalf("expected 2 reserves / 1 release after reclaim, got %d/%d", r, rel)
+	}
+}
+
+// failNTimesCapacity fails the first N Release calls, then succeeds, so
+// tests can prove a capacity-release failure leaves the token durably
+// pending and retryable instead of being silently treated as done.
+type failNTimesCapacity struct {
+	mu          sync.Mutex
+	failsLeft   int
+	released    int
+	reserveErrs int
+}
+
+func (c *failNTimesCapacity) Reserve(context.Context, string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.reserveErrs++ // reused as a reserve counter; never fails
+	return nil
+}
+
+func (c *failNTimesCapacity) Release(context.Context, string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.failsLeft > 0 {
+		c.failsLeft--
+		return errors.New("capacity backend unavailable")
+	}
+	c.released++
+	return nil
+}
+
+func (c *failNTimesCapacity) releasedCount() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.released
+}
+
+// TestClaimManager_CapacityReleaseFailure_DurablyPendingAndRetryable
+// proves requirement 4: a capacity.Release failure must never be
+// swallowed as if it succeeded, and a retry must actually re-attempt the
+// coordinator call (not short-circuit to nil because the lease row was
+// already marked released).
+func TestClaimManager_CapacityReleaseFailure_DurablyPendingAndRetryable(t *testing.T) {
+	store := newTestStore(t)
+	failing := &failNTimesCapacity{failsLeft: 2}
+	mgr := NewClaimManager(store, WithCapacityCoordinator(failing))
+	ctx := context.Background()
+	key := testKey("FAC-12")
+
+	lease, err := mgr.Claim(ctx, ClaimRequest{Key: key, OwnerID: "w1", Role: "herd-smith", TaskRole: "herd-smith"})
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+
+	// First release: the store transition succeeds but capacity.Release
+	// fails. Release must surface that failure, not return nil.
+	if err := mgr.Release(ctx, key, "w1", lease.Generation); err == nil {
+		t.Fatal("expected the first Release to surface the capacity failure, not return nil")
+	}
+	if got := failing.releasedCount(); got != 0 {
+		t.Fatalf("expected 0 completed releases after the first failed attempt, got %d", got)
+	}
+
+	// The lease itself is already durably released at the store layer
+	// (idempotent replay), but capacity must still be pending -- a naive
+	// "transitioned=false means already handled" implementation would
+	// return nil here without ever calling the coordinator again.
+	if err := mgr.Release(ctx, key, "w1", lease.Generation); err == nil {
+		t.Fatal("expected the second Release to retry and surface the still-failing capacity release, not return nil")
+	}
+	if got := failing.releasedCount(); got != 0 {
+		t.Fatalf("expected 0 completed releases after the second failed attempt, got %d", got)
+	}
+
+	// Third attempt: the coordinator now succeeds. This proves the retry
+	// actually re-invoked Release rather than having given up.
+	if err := mgr.Release(ctx, key, "w1", lease.Generation); err != nil {
+		t.Fatalf("expected the third Release to finally succeed, got %v", err)
+	}
+	if got := failing.releasedCount(); got != 1 {
+		t.Fatalf("expected exactly 1 completed release once the coordinator recovered, got %d", got)
+	}
+
+	// A fourth, fully-idempotent call must not re-invoke the coordinator
+	// again (nothing pending left).
+	if err := mgr.Release(ctx, key, "w1", lease.Generation); err != nil {
+		t.Fatalf("expected a fully-settled idempotent release to succeed, got %v", err)
+	}
+	if got := failing.releasedCount(); got != 1 {
+		t.Fatalf("expected capacity release to stay exactly-once after settlement, got %d completed calls", got)
+	}
+}
+
+// TestSQLiteLeaseStore_ExpireStale_RechecksHeldAtTransitionTime proves
+// requirement 5: ExpireStale's per-row UPDATE re-evaluates held/expiry at
+// transition time, not just at the earlier candidate SELECT, so an
+// operator Hold landing in that window wins the race instead of being
+// silently overridden.
+func TestSQLiteLeaseStore_ExpireStale_RechecksHeldAtTransitionTime(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	key := testKey("FAC-13")
+	claimAt := time.Now()
+
+	lease, err := store.Acquire(ctx, key, "w1", "herd-smith", "/wt", claimAt, time.Minute)
+	if err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+
+	sweepAt := claimAt.Add(2 * time.Minute) // past TTL, a real ExpireStale candidate
+
+	var holdErr error
+	expireStaleTestHook = func(candidate *Lease) {
+		// Simulate an operator Hold landing exactly between ExpireStale's
+		// candidate SELECT and its per-row UPDATE.
+		_, holdErr = store.Hold(ctx, key, "w1", lease.Generation, true, sweepAt)
+	}
+	t.Cleanup(func() { expireStaleTestHook = nil })
+
+	transitioned, err := store.ExpireStale(ctx, sweepAt)
+	if err != nil {
+		t.Fatalf("expire stale: %v", err)
+	}
+	if holdErr != nil {
+		t.Fatalf("interleaved hold: %v", holdErr)
+	}
+	if len(transitioned) != 0 {
+		t.Fatalf("expected the interleaved Hold to win the race and prevent expiry, got %d transitioned", len(transitioned))
+	}
+
+	active, err := store.currentActive(ctx, key)
+	if err != nil {
+		t.Fatalf("current active: %v", err)
+	}
+	if active == nil || active.Generation != lease.Generation || !active.Held {
+		t.Fatalf("expected the held lease to still be active and held, got %+v", active)
 	}
 }

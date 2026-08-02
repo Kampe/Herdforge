@@ -37,6 +37,15 @@ type Lease struct {
 	RenewedAt    time.Time
 	ExpiresAt    time.Time
 	ReleasedAt   *time.Time
+
+	// CapacityReleasedAt is set once the CapacityCoordinator.Release call
+	// for this lease's Reserve has durably completed. A Released/Expired
+	// lease with CapacityReleasedAt == nil is "pending capacity release":
+	// its capacity token has not yet been given back, and a retry (Release,
+	// ExpireStale, or SettlePendingCapacity) must attempt it again rather
+	// than treating the lease's own status transition as proof capacity
+	// was returned.
+	CapacityReleasedAt *time.Time
 }
 
 // Age reports how long the lease has been held as of now.
@@ -48,4 +57,11 @@ func (l *Lease) Age(now time.Time) time.Duration {
 // hold) never expire.
 func (l *Lease) Expired(now time.Time) bool {
 	return !l.Held && now.After(l.ExpiresAt)
+}
+
+// PendingCapacityRelease reports whether this lease has left its lease
+// lifecycle (released or expired) but its capacity token has not yet been
+// durably returned.
+func (l *Lease) PendingCapacityRelease() bool {
+	return (l.Status == StatusReleased || l.Status == StatusExpired) && l.CapacityReleasedAt == nil
 }
