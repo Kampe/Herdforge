@@ -27,3 +27,15 @@ func TestModelRouter_Fallback(t *testing.T) {
 		t.Fatalf("expected fallback to secondary-gemini, got %v (err: %v)", selected, err)
 	}
 }
+
+func TestModelRouter_TokenTracker(t *testing.T) {
+	primary := &ModelCandidate{Name: "claude-pro", Type: ProviderAnthropic, Model: "claude-3-7-sonnet"}
+	r := NewModelRouter([]*ModelCandidate{primary})
+
+	r.RecordTokenBurn("claude-pro", 1500, 300)
+	p, c, reqs := primary.Tracker.Stats()
+
+	if p != 1500 || c != 300 || reqs != 1 {
+		t.Errorf("unexpected token usage stats: p=%d, c=%d, reqs=%d", p, c, reqs)
+	}
+}

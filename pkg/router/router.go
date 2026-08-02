@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -16,11 +17,30 @@ const (
 	ProviderOllama    ProviderType = "ollama"
 )
 
+type TokenTracker struct {
+	TotalPromptTokens     int64
+	TotalCompletionTokens int64
+	TotalRequests         int64
+}
+
+func (t *TokenTracker) AddUsage(promptTokens, completionTokens int64) {
+	atomic.AddInt64(&t.TotalPromptTokens, promptTokens)
+	atomic.AddInt64(&t.TotalCompletionTokens, completionTokens)
+	atomic.AddInt64(&t.TotalRequests, 1)
+}
+
+func (t *TokenTracker) Stats() (int64, int64, int64) {
+	return atomic.LoadInt64(&t.TotalPromptTokens),
+		atomic.LoadInt64(&t.TotalCompletionTokens),
+		atomic.LoadInt64(&t.TotalRequests)
+}
+
 type ModelCandidate struct {
-	Name            string
-	Type            ProviderType
-	Model           string
-	CooldownUntil   time.Time
+	Name          string
+	Type          ProviderType
+	Model         string
+	CooldownUntil time.Time
+	Tracker       TokenTracker
 }
 
 type ModelRouter struct {
@@ -57,6 +77,19 @@ func (r *ModelRouter) ReportRateLimit(name string, duration time.Duration) {
 	for _, candidate := range r.candidates {
 		if candidate.Name == name {
 			candidate.CooldownUntil = time.Now().Add(duration)
+			break
+		}
+	}
+}
+
+// RecordTokenBurn records token usage stats for a specific candidate provider
+func (r *ModelRouter) RecordTokenBurn(name string, promptTokens, completionTokens int64) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	for _, candidate := range r.candidates {
+		if candidate.Name == name {
+			candidate.Tracker.AddUsage(promptTokens, completionTokens)
 			break
 		}
 	}
