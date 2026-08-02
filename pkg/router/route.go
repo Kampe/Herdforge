@@ -302,7 +302,11 @@ func ArgvFor(provider, model, effort string) []string {
 	case "kimi":
 		return []string{"kimi", "--auto"}
 	case "ollama", "opencode", "lazer":
-		return []string{"opencode", "--model", model}
+		// herd_opencode_persistent_argv contract: the launcher appends
+		// --prompt <kickoff> (spilling >800-char kickoffs to a packet file)
+		// and refuses lazer models without the HERD_LAZER_LAST_RESORT
+		// handshake set from Route.LazerLastResort.
+		return []string{"opencode", "--model", model, "--auto"}
 	}
 	return nil
 }
@@ -488,6 +492,10 @@ func (r *SurfaceRouter) available(provider, model, pool string) (bool, string) {
 		if !csvHas(forced, provider) {
 			return false, "not in forced availability set"
 		}
+		// Divergence from zsh: structurally-forced providers here also skip
+		// the quota gate (zsh only skips CLI/auth/catalog probes). This env
+		// is a test/ops seam; keep the stronger bypass until the probe suite
+		// is ported.
 		return true, "forced available"
 	}
 	if !r.Probes.CLIPresent(cliFor(provider)) {
