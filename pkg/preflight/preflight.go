@@ -3,6 +3,7 @@ package preflight
 import (
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 )
@@ -55,4 +56,80 @@ func CheckWorktreeBoundary(rootDir string) error {
 	}
 
 	return nil
+}
+
+// CheckAgentStayedInWorktree returns an error if the git working tree at
+// repoRoot contains tracked-file modifications outside worktreePath —
+// i.e., an agent editing outside its assigned worktree.
+// It runs "git status --porcelain" and flags any path not under worktreePath.
+func CheckAgentStayedInWorktree(worktreePath, repoRoot string) error {
+	out, err := gitStatusPorcelain(repoRoot)
+	if err != nil {
+		// Not a git repo or git unavailable → no enforcement possible.
+		return nil
+	}
+	if out == "" {
+		return nil
+	}
+
+	absWorktree, err := filepath.Abs(worktreePath)
+	if err != nil {
+		return fmt.Errorf("worktreePath absolute resolution: %w", err)
+	}
+
+	var leaks []string
+	for _, line := range strings.Split(out, "\n") {
+		if len(line) < 4 {
+			continue
+		}
+		path := strings.TrimSpace(line[3:])
+		if path == "" {
+			continue
+		}
+		full := filepath.Join(repoRoot, path)
+		absFull, err := filepath.Abs(full)
+		if err != nil {
+			continue
+		}
+		if isUnder(absFull, absWorktree) {
+			continue
+		}
+		leaks = append(leaks, path)
+	}
+
+	if len(leaks) > 0 {
+		return fmt.Errorf("agent wrote outside worktree boundary: %v", leaks)
+	}
+	return nil
+}
+
+// gitStatusPorcelain runs "git status --porcelain" in dir and returns stdout.
+var gitStatusPorcelain = func(dir string) (string, error) {
+	return runCmd(dir, "git", "status", "--porcelain")
+}
+
+// isUnder reports whether child is strictly inside parent (both absolute).
+func isUnder(child, parent string) bool {
+	child = filepath.Clean(child)
+	parent = filepath.Clean(parent)
+	if parent == child {
+		return true
+	}
+	parentWithSep := parent
+	if !strings.HasSuffix(parentWithSep, string(filepath.Separator)) {
+		parentWithSep += string(filepath.Separator)
+	}
+	return strings.HasPrefix(child, parentWithSep)
+}
+
+// runCmd executes a command in dir and returns trimmed stdout or an error.
+func runCmd(dir, name string, args ...string) (string, error) {
+	c := exec.Command(name, args...)
+	c.Dir = dir
+	c.Env = append(os.Environ(), "GIT_CONFIG_NOSYSTEM=1")
+	out, err := c.Output()
+	if err != nil {
+		return "", fmt.Errorf("command %s %v: %w\n%s", name, args, err, string(out))
+	}
+	return strings.TrimSpace(string(out)), nil
 }
