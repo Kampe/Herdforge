@@ -80,6 +80,7 @@ type fakeHerdr struct {
 	deliverErr  error
 	deliverRec  *herdr.PromptReceipt
 	closedTabs  []string
+	closeErr    error // TabClose failure — must not be silently discarded
 	startCalls  int
 	deliverText string
 	model       string
@@ -146,7 +147,7 @@ func (f *fakeHerdr) TabClose(tabID string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.closedTabs = append(f.closedTabs, tabID)
-	return nil
+	return f.closeErr
 }
 func (f *fakeHerdr) ResolveHealthyModel(_ context.Context, primary string, _ []string) (string, []herdr.ProbeResult) {
 	if f.model != "" {
@@ -160,17 +161,30 @@ func (f *fakeHerdr) ResolveHealthyModel(_ context.Context, primary string, _ []s
 
 type statusTrackingProvider struct {
 	mockTaskProvider
-	statuses []string
-	comments []string
+	statuses  []string
+	comments  []string
+	updateErr error
 }
 
 func (p *statusTrackingProvider) UpdateStatus(_ context.Context, _, status string) error {
+	if p.updateErr != nil {
+		return p.updateErr
+	}
 	p.statuses = append(p.statuses, status)
 	return nil
 }
 func (p *statusTrackingProvider) AddComment(_ context.Context, _, comment string) error {
 	p.comments = append(p.comments, comment)
 	return nil
+}
+
+func hasCompensateReason(comps []string, reason string) bool {
+	for _, c := range comps {
+		if strings.Contains(c, reason) {
+			return true
+		}
+	}
+	return false
 }
 
 // --- repo fixture ----------------------------------------------------------
@@ -354,17 +368,66 @@ func TestDispatch_RecordStepErrorPropagates(t *testing.T) {
 	tp := &statusTrackingProvider{
 		mockTaskProvider: mockTaskProvider{tasks: []*provider.Task{baseTask("FAC-R")}},
 	}
+	// First durable step after worktree creation is StepWorktree RecordStep.
 	comp := &recordingCompensator{recordErr: fmt.Errorf("outbox full")}
 	d := NewDispatcher(testCfg(), tp, wm)
 	d.Compensator = comp
 	d.Herdr = &fakeHerdr{available: false}
 
-	_, err := d.Dispatch(context.Background(), DispatchOptions{TicketRef: "FAC-R", NoLaunch: true})
+	res, err := d.Dispatch(context.Background(), DispatchOptions{TicketRef: "FAC-R", NoLaunch: true})
 	if err == nil {
 		t.Fatal("expected RecordStep error to fail closed")
 	}
+	if res != nil && res.Worktree != "" {
+		t.Cleanup(func() { os.RemoveAll(res.Worktree) })
+	}
+	// Primary error preserved.
 	if !strings.Contains(err.Error(), "RecordStep") && !strings.Contains(err.Error(), "outbox full") {
-		t.Fatalf("error: %v", err)
+		t.Fatalf("primary error missing: %v", err)
+	}
+	// Worktree already exists — compensation is mandatory with exact reason.
+	if !hasCompensateReason(comp.compsCopy(), "record_worktree_failed") {
+		t.Fatalf("expected compensate reason record_worktree_failed, got %v", comp.compsCopy())
+	}
+	// Board status must not advance after failed worktree RecordStep.
+	if len(tp.statuses) != 0 {
+		t.Fatalf("UpdateStatus must not run after record_worktree_failed; statuses=%v", tp.statuses)
+	}
+}
+
+func TestDispatch_UpdateStatusErrorCompensates(t *testing.T) {
+	_, wm := initDispatchRepo(t)
+	tp := &statusTrackingProvider{
+		mockTaskProvider: mockTaskProvider{tasks: []*provider.Task{baseTask("FAC-US")}},
+		updateErr:        fmt.Errorf("provider 503"),
+	}
+	comp := &recordingCompensator{}
+	d := NewDispatcher(testCfg(), tp, wm)
+	d.Compensator = comp
+	d.Herdr = &fakeHerdr{available: false}
+
+	res, err := d.Dispatch(context.Background(), DispatchOptions{TicketRef: "FAC-US", NoLaunch: true})
+	if err == nil {
+		t.Fatal("expected UpdateStatus failure")
+	}
+	if res != nil && res.Worktree != "" {
+		t.Cleanup(func() { os.RemoveAll(res.Worktree) })
+	}
+	if !strings.Contains(err.Error(), "update ticket status") && !strings.Contains(err.Error(), "provider 503") {
+		t.Fatalf("primary UpdateStatus error missing: %v", err)
+	}
+	if !hasCompensateReason(comp.compsCopy(), "board_status_failed") {
+		t.Fatalf("expected compensate board_status_failed, got %v", comp.compsCopy())
+	}
+	// Worktree step must have been durably recorded before board status failed.
+	foundWT := false
+	for _, s := range comp.stepsCopy() {
+		if s.Step == StepWorktree {
+			foundWT = true
+		}
+	}
+	if !foundWT {
+		t.Fatalf("expected StepWorktree recorded before status failure: %v", comp.stepsCopy())
 	}
 }
 
@@ -474,17 +537,58 @@ func TestDispatch_CrashPoint_AgentStartClosesOrphanTab(t *testing.T) {
 	if len(fh.closedTabs) != 1 || fh.closedTabs[0] != "orphan-tab" {
 		t.Fatalf("expected orphan tab closed, got %v", fh.closedTabs)
 	}
-	found := false
-	for _, c := range comp.compsCopy() {
-		if strings.Contains(c, "agent_start_failed") {
-			found = true
-		}
-	}
-	if !found {
+	if !hasCompensateReason(comp.compsCopy(), "agent_start_failed") {
 		t.Fatalf("expected compensate agent_start_failed, got %v", comp.compsCopy())
 	}
 	if res != nil && res.Launched {
 		t.Fatal("must not report Launched after start failure")
+	}
+}
+
+func TestDispatch_AgentStart_TabCloseErrorNotSilent(t *testing.T) {
+	_, wm := initDispatchRepo(t)
+	tp := &statusTrackingProvider{
+		mockTaskProvider: mockTaskProvider{tasks: []*provider.Task{baseTask("FAC-7C")}},
+	}
+	fh := &fakeHerdr{
+		available: true,
+		workspace: "w1",
+		model:     "m",
+		tabID:     "orphan-tab",
+		startErr:  fmt.Errorf("agent start failed"),
+		closeErr:  fmt.Errorf("herdr tab close denied"),
+	}
+	comp := &recordingCompensator{}
+	d := NewDispatcher(testCfg(), tp, wm)
+	d.Herdr = fh
+	d.Compensator = comp
+
+	res, err := d.Dispatch(context.Background(), DispatchOptions{TicketRef: "FAC-7C"})
+	if err == nil {
+		t.Fatal("expected failure when start and tab-close both fail")
+	}
+	if res != nil {
+		t.Cleanup(func() { os.RemoveAll(res.Worktree) })
+	}
+	// Primary start error preserved.
+	if !strings.Contains(err.Error(), "agent start") {
+		t.Fatalf("primary start error missing: %v", err)
+	}
+	// TabClose error must surface — orphan cannot be silently accepted.
+	if !strings.Contains(err.Error(), "tab close") || !strings.Contains(err.Error(), "denied") {
+		t.Fatalf("TabClose error must propagate: %v", err)
+	}
+	if !hasCompensateReason(comp.compsCopy(), "agent_start_failed") {
+		t.Fatalf("expected agent_start_failed: %v", comp.compsCopy())
+	}
+	if !hasCompensateReason(comp.compsCopy(), "agent_start_failed_orphan_tab_close_failed") {
+		t.Fatalf("expected orphan_tab_close_failed durable signal: %v", comp.compsCopy())
+	}
+	if len(fh.closedTabs) != 1 {
+		t.Fatalf("TabClose must still be attempted: %v", fh.closedTabs)
+	}
+	if res != nil && res.Launched {
+		t.Fatal("must not launch")
 	}
 }
 
@@ -515,14 +619,50 @@ func TestDispatch_CrashPoint_PromptFailureClosesTab(t *testing.T) {
 	if len(fh.closedTabs) != 1 || fh.closedTabs[0] != "tab-prompt" {
 		t.Fatalf("expected tab closed after prompt fail: %v", fh.closedTabs)
 	}
-	found := false
-	for _, c := range comp.compsCopy() {
-		if strings.Contains(c, "prompt_delivery_failed") {
-			found = true
-		}
-	}
-	if !found {
+	if !hasCompensateReason(comp.compsCopy(), "prompt_delivery_failed") {
 		t.Fatalf("expected prompt_delivery_failed compensate: %v", comp.compsCopy())
+	}
+}
+
+func TestDispatch_PromptFailure_TabCloseErrorNotSilent(t *testing.T) {
+	_, wm := initDispatchRepo(t)
+	tp := &statusTrackingProvider{
+		mockTaskProvider: mockTaskProvider{tasks: []*provider.Task{baseTask("FAC-8C")}},
+	}
+	fh := &fakeHerdr{
+		available:  true,
+		workspace:  "w1",
+		model:      "m",
+		tabID:      "tab-prompt",
+		deliverErr: fmt.Errorf("never confirmed consumption"),
+		closeErr:   fmt.Errorf("socket dead on close"),
+	}
+	comp := &recordingCompensator{}
+	d := NewDispatcher(testCfg(), tp, wm)
+	d.Herdr = fh
+	d.Compensator = comp
+
+	res, err := d.Dispatch(context.Background(), DispatchOptions{TicketRef: "FAC-8C"})
+	if err == nil {
+		t.Fatal("expected failure")
+	}
+	if res != nil {
+		t.Cleanup(func() { os.RemoveAll(res.Worktree) })
+	}
+	if !strings.Contains(err.Error(), "consumption") {
+		t.Fatalf("primary prompt error missing: %v", err)
+	}
+	if !strings.Contains(err.Error(), "tab close") || !strings.Contains(err.Error(), "socket dead") {
+		t.Fatalf("TabClose error must propagate: %v", err)
+	}
+	if !hasCompensateReason(comp.compsCopy(), "prompt_delivery_failed") {
+		t.Fatalf("expected prompt_delivery_failed: %v", comp.compsCopy())
+	}
+	if !hasCompensateReason(comp.compsCopy(), "prompt_delivery_failed_orphan_tab_close_failed") {
+		t.Fatalf("expected orphan close durable signal: %v", comp.compsCopy())
+	}
+	if res != nil && res.Launched {
+		t.Fatal("must not launch")
 	}
 }
 
