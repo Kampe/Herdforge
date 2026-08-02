@@ -5,14 +5,15 @@ import (
 	"errors"
 	"sync"
 	"testing"
+	"time"
 )
 
 type fakeHandler struct {
 	kind       string
 	mu         sync.Mutex
 	sent       []Item
-	failNTimes int
 	calls      int
+	failNTimes int
 }
 
 func (f *fakeHandler) Kind() string { return f.kind }
@@ -51,7 +52,7 @@ func TestRelay_DeliversPendingItemsToMatchingHandler(t *testing.T) {
 		t.Errorf("expected git handler to receive p2, got %+v", git.sent)
 	}
 
-	pending, _ := s.Pending("", 10)
+	pending, _ := s.Pending("", 10, time.Now())
 	if len(pending) != 0 {
 		t.Errorf("expected no pending items after successful relay, got %d", len(pending))
 	}
@@ -69,13 +70,13 @@ func TestRelay_LeavesItemPendingWithoutRegisteredHandler(t *testing.T) {
 	if processed != 0 {
 		t.Errorf("expected 0 processed with no handler registered, got %d", processed)
 	}
-	pending, _ := s.Pending("", 10)
+	pending, _ := s.Pending("", 10, time.Now())
 	if len(pending) != 1 {
 		t.Errorf("expected item to remain pending, got %d", len(pending))
 	}
 }
 
-func TestRelay_RetriesOnFailureThenSucceeds(t *testing.T) {
+func TestRelay_RetriesAfterBackoffThenSucceeds(t *testing.T) {
 	s := tempStore(t)
 	item, _ := s.Enqueue(Item{IdempotencyKey: "k1", TaskRef: "FAC-1", Kind: "herdr"})
 
@@ -86,21 +87,26 @@ func TestRelay_RetriesOnFailureThenSucceeds(t *testing.T) {
 	if _, err := relay.RelayOnce(context.Background()); err != nil {
 		t.Fatalf("relay once (1): %v", err)
 	}
-	pending, _ := s.Pending("", 10)
-	if len(pending) != 1 || pending[0].Attempts != 1 {
-		t.Fatalf("expected item still pending with attempts=1 after failure, got %+v", pending)
+	got, _ := s.Get(item.ID)
+	if got.Status != StatusPending || got.Attempts != 1 {
+		t.Fatalf("expected item pending with attempts=1 after failure, got %+v", got)
 	}
 
+	// Immediately relaying again must not redeliver — the item is still
+	// inside its backoff window.
+	relay.Now = func() time.Time { return got.CreatedAt }
+	if sent, err := relay.RelayOnce(context.Background()); err != nil || sent != 0 {
+		t.Fatalf("expected 0 sent while inside backoff, got sent=%d err=%v", sent, err)
+	}
+
+	// Advance past the backoff window.
+	relay.Now = func() time.Time { return time.Now().Add(time.Hour) }
 	if _, err := relay.RelayOnce(context.Background()); err != nil {
 		t.Fatalf("relay once (2): %v", err)
 	}
-	pending, _ = s.Pending("", 10)
-	if len(pending) != 0 {
-		t.Fatalf("expected item to succeed on retry, got %d pending", len(pending))
-	}
-	got, _ := s.Get(item.ID)
-	if got.Status != StatusSent {
-		t.Errorf("expected status=sent, got %s", got.Status)
+	final, _ := s.Get(item.ID)
+	if final.Status != StatusSent {
+		t.Errorf("expected status=sent, got %s", final.Status)
 	}
 }
 
@@ -113,10 +119,32 @@ func TestRelay_GivesUpAfterMaxAttempts(t *testing.T) {
 	relay.MaxAttempts = 2
 
 	for i := 0; i < relay.MaxAttempts; i++ {
+		relay.Now = func() time.Time { return time.Now().Add(time.Duration(i+1) * time.Hour) }
 		relay.RelayOnce(context.Background())
 	}
-	pending, _ := s.Pending("", 10)
+	pending, _ := s.Pending("", 10, time.Now().Add(24*time.Hour))
 	if len(pending) != 0 {
 		t.Fatalf("expected item to leave pending queue after max attempts, got %d", len(pending))
+	}
+}
+
+func TestRelay_ConcurrentRelaysNeverDoubleDeliverTheSameItem(t *testing.T) {
+	s := tempStore(t)
+	s.Enqueue(Item{IdempotencyKey: "k1", TaskRef: "FAC-1", Kind: "herdr"})
+
+	h := &fakeHandler{kind: "herdr"}
+	relayA := NewRelay(s, h)
+	relayB := NewRelay(s, h)
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() { defer wg.Done(); relayA.RelayOnce(context.Background()) }()
+	go func() { defer wg.Done(); relayB.RelayOnce(context.Background()) }()
+	wg.Wait()
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if len(h.sent) != 1 {
+		t.Fatalf("expected the handler to be invoked exactly once across two racing relays, got %d calls with %d successes", h.calls, len(h.sent))
 	}
 }

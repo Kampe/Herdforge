@@ -3,38 +3,63 @@
 // dispatch, Git operations). An Item is enqueued in the SAME database
 // transaction as the lifecycle event that caused it, so a crash between
 // "decide to act" and "durably record the intent to act" is impossible.
-// A Relay later delivers pending items to per-kind Handlers, deduplicating
-// on IdempotencyKey so replays never repeat a side effect.
+// A Relay later claims and delivers pending items to per-kind Handlers,
+// deduplicating on IdempotencyKey so replays never repeat a side effect.
 package outbox
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"time"
-
-	_ "modernc.org/sqlite"
 )
 
 type Status string
 
 const (
 	StatusPending Status = "pending"
-	StatusSent    Status = "sent"
-	StatusFailed  Status = "failed"
+	// StatusInFlight is a short-lived claim state: a Relay has taken this
+	// item and is calling its Handler. No other Relay may claim it while
+	// it's here (see Claim's CAS).
+	StatusInFlight Status = "in_flight"
+	StatusSent     Status = "sent"
+	StatusFailed   Status = "failed"
+)
+
+var (
+	// ErrIdempotencyConflict is returned when an idempotency key is reused
+	// for an item whose task, kind, or payload differs from the one
+	// originally enqueued under that key. Reuse for the SAME task/kind/
+	// payload is a legitimate replay and returns the original item with no
+	// error; anything else fails closed instead of silently keeping
+	// whichever payload happened to land first.
+	ErrIdempotencyConflict = errors.New("outbox: idempotency key reused for a different item")
+	// ErrNotClaimable is returned by Claim when the item is no longer
+	// pending (already claimed by another Relay, already sent, or already
+	// failed terminally).
+	ErrNotClaimable = errors.New("outbox: item is not claimable")
+	// ErrNotInFlight is returned by MarkSent/MarkFailed when the item
+	// wasn't in the in_flight state they expect — e.g. two Relays raced
+	// and the other one already resolved it.
+	ErrNotInFlight = errors.New("outbox: item is not in_flight")
 )
 
 // Item is one durable side-effect intent.
 type Item struct {
-	ID             int64     `json:"id"`
-	IdempotencyKey string    `json:"idempotency_key"`
-	TaskRef        string    `json:"task_ref"`
-	Kind           string    `json:"kind"`
-	Payload        string    `json:"payload,omitempty"`
-	Status         Status    `json:"status"`
-	Attempts       int       `json:"attempts"`
-	LastError      string    `json:"last_error,omitempty"`
-	CreatedAt      time.Time `json:"created_at"`
-	UpdatedAt      time.Time `json:"updated_at"`
+	ID             int64      `json:"id"`
+	IdempotencyKey string     `json:"idempotency_key"`
+	TaskRef        string     `json:"task_ref"`
+	Kind           string     `json:"kind"`
+	Payload        string     `json:"payload,omitempty"`
+	Status         Status     `json:"status"`
+	Attempts       int        `json:"attempts"`
+	LastError      string     `json:"last_error,omitempty"`
+	// NextAttemptAt gates retry: Pending never returns a pending item
+	// whose NextAttemptAt is in the future. Nil means immediately
+	// eligible (a fresh item's first attempt).
+	NextAttemptAt *time.Time `json:"next_attempt_at,omitempty"`
+	CreatedAt     time.Time  `json:"created_at"`
+	UpdatedAt     time.Time  `json:"updated_at"`
 }
 
 // Store is the SQLite-backed outbox persistence.
@@ -42,10 +67,11 @@ type Store struct {
 	db *sql.DB
 }
 
-// NewStore opens (or creates) a SQLite database at path and applies the
-// outbox schema.
+// NewStore opens (or creates) a SQLite database at path, applies the
+// SQLite concurrency contract (see openSQLite), and applies the outbox
+// schema.
 func NewStore(path string) (*Store, error) {
-	db, err := sql.Open("sqlite", path)
+	db, err := openSQLite(path)
 	if err != nil {
 		return nil, fmt.Errorf("open outbox store: %w", err)
 	}
@@ -83,6 +109,7 @@ func (s *Store) migrate() error {
 		status TEXT NOT NULL DEFAULT 'pending',
 		attempts INTEGER NOT NULL DEFAULT 0,
 		last_error TEXT,
+		next_attempt_at DATETIME,
 		created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
 		updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
 	)`)
@@ -103,9 +130,12 @@ type execer interface {
 }
 
 // EnqueueTx durably records the intent to perform one side effect, within
-// an existing transaction. If idempotency_key was already enqueued, the
-// original item is returned unchanged (idempotent no-op) — a replayed
-// lifecycle transition never enqueues a duplicate side effect.
+// an existing transaction. If idempotency_key was already enqueued for
+// the exact same task/kind/payload, the original item is returned
+// unchanged (idempotent no-op) — a replayed lifecycle transition never
+// enqueues a duplicate side effect. Reuse of the key for a DIFFERENT
+// task/kind/payload fails closed with ErrIdempotencyConflict instead of
+// silently keeping whichever one was enqueued first.
 func (s *Store) EnqueueTx(tx *sql.Tx, item Item) (Item, error) {
 	return enqueue(tx, item)
 }
@@ -139,6 +169,9 @@ func enqueue(e execer, item Item) (Item, error) {
 	if existing, err := getByKey(e, item.IdempotencyKey); err != nil {
 		return Item{}, err
 	} else if existing != nil {
+		if existing.TaskRef != item.TaskRef || existing.Kind != item.Kind || existing.Payload != item.Payload {
+			return Item{}, fmt.Errorf("%w: key=%s", ErrIdempotencyConflict, item.IdempotencyKey)
+		}
 		return *existing, nil
 	}
 
@@ -161,7 +194,7 @@ func enqueue(e execer, item Item) (Item, error) {
 
 func getByKey(e execer, key string) (*Item, error) {
 	row := e.QueryRow(
-		`SELECT id, idempotency_key, task_ref, kind, payload, status, attempts, last_error, created_at, updated_at
+		`SELECT id, idempotency_key, task_ref, kind, payload, status, attempts, last_error, next_attempt_at, created_at, updated_at
 		 FROM outbox_items WHERE idempotency_key = ?`, key,
 	)
 	item, err := scanItem(row)
@@ -177,26 +210,39 @@ func getByKey(e execer, key string) (*Item, error) {
 // Get returns one item by ID.
 func (s *Store) Get(id int64) (*Item, error) {
 	row := s.db.QueryRow(
-		`SELECT id, idempotency_key, task_ref, kind, payload, status, attempts, last_error, created_at, updated_at
+		`SELECT id, idempotency_key, task_ref, kind, payload, status, attempts, last_error, next_attempt_at, created_at, updated_at
 		 FROM outbox_items WHERE id = ?`, id,
 	)
 	return scanItem(row)
 }
 
-// Pending returns pending items, optionally filtered by kind (empty kind
-// means all kinds), oldest first.
-func (s *Store) Pending(kind string, limit int) ([]Item, error) {
+// Pending returns items that are pending AND due (NextAttemptAt is nil or
+// <= now), optionally filtered by kind (empty kind means all kinds),
+// oldest first. It does not claim them — a Relay must call Claim before
+// invoking a Handler, so two Relays racing on the same batch don't both
+// dispatch the same side effect.
+func (s *Store) Pending(kind string, limit int, now time.Time) ([]Item, error) {
+	// next_attempt_at is always stored in UTC (see MarkFailed); comparing
+	// against a non-UTC "now" would compare two differently-offset RFC3339
+	// strings lexically, which is not a valid ordering. Normalize here so
+	// callers don't have to remember.
+	now = now.UTC()
+
 	var rows *sql.Rows
 	var err error
 	if kind == "" {
 		rows, err = s.db.Query(
-			`SELECT id, idempotency_key, task_ref, kind, payload, status, attempts, last_error, created_at, updated_at
-			 FROM outbox_items WHERE status = ? ORDER BY id ASC LIMIT ?`, StatusPending, limit,
+			`SELECT id, idempotency_key, task_ref, kind, payload, status, attempts, last_error, next_attempt_at, created_at, updated_at
+			 FROM outbox_items
+			 WHERE status = ? AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
+			 ORDER BY id ASC LIMIT ?`, StatusPending, now, limit,
 		)
 	} else {
 		rows, err = s.db.Query(
-			`SELECT id, idempotency_key, task_ref, kind, payload, status, attempts, last_error, created_at, updated_at
-			 FROM outbox_items WHERE status = ? AND kind = ? ORDER BY id ASC LIMIT ?`, StatusPending, kind, limit,
+			`SELECT id, idempotency_key, task_ref, kind, payload, status, attempts, last_error, next_attempt_at, created_at, updated_at
+			 FROM outbox_items
+			 WHERE status = ? AND kind = ? AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
+			 ORDER BY id ASC LIMIT ?`, StatusPending, kind, now, limit,
 		)
 	}
 	if err != nil {
@@ -215,19 +261,57 @@ func (s *Store) Pending(kind string, limit int) ([]Item, error) {
 	return items, rows.Err()
 }
 
-// MarkSent marks an item delivered. Delivery is terminal and idempotent —
-// marking an already-sent item sent again is a no-op.
-func (s *Store) MarkSent(id int64) error {
-	_, err := s.db.Exec(
-		`UPDATE outbox_items SET status = ?, updated_at = ? WHERE id = ?`,
-		StatusSent, time.Now().UTC(), id,
+// Claim atomically moves one item from pending to in_flight. Exactly one
+// caller wins a given item: the UPDATE is conditioned on status='pending',
+// so a second Relay racing for the same row gets ErrNotClaimable and must
+// move on rather than also invoking the Handler.
+func (s *Store) Claim(id int64) (Item, error) {
+	now := time.Now().UTC()
+	res, err := s.db.Exec(
+		`UPDATE outbox_items SET status = ?, updated_at = ? WHERE id = ? AND status = ?`,
+		StatusInFlight, now, id, StatusPending,
 	)
-	return err
+	if err != nil {
+		return Item{}, fmt.Errorf("claim outbox item: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n != 1 {
+		return Item{}, fmt.Errorf("%w: id=%d", ErrNotClaimable, id)
+	}
+	item, err := s.Get(id)
+	if err != nil {
+		return Item{}, err
+	}
+	if item == nil {
+		return Item{}, fmt.Errorf("claim outbox item: id=%d vanished after claim", id)
+	}
+	return *item, nil
 }
 
-// MarkFailed records a delivery failure. Below maxAttempts the item stays
-// pending for the next relay pass; at or above maxAttempts it moves to the
-// terminal Failed status and stops being picked up by Pending.
+// MarkSent marks a claimed (in_flight) item delivered. The UPDATE is
+// conditioned on status='in_flight': if another Relay already resolved
+// this item (shouldn't happen since Claim is exclusive, but this is the
+// backstop), MarkSent fails closed with ErrNotInFlight instead of
+// silently overwriting a terminal state.
+func (s *Store) MarkSent(id int64) error {
+	res, err := s.db.Exec(
+		`UPDATE outbox_items SET status = ?, updated_at = ? WHERE id = ? AND status = ?`,
+		StatusSent, time.Now().UTC(), id, StatusInFlight,
+	)
+	if err != nil {
+		return fmt.Errorf("mark sent: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n != 1 {
+		return fmt.Errorf("%w: id=%d", ErrNotInFlight, id)
+	}
+	return nil
+}
+
+// MarkFailed records a delivery failure for a claimed (in_flight) item.
+// Below maxAttempts it returns to pending with a bounded exponential
+// backoff (see nextAttemptDelay) before Pending will offer it again; at
+// or above maxAttempts it moves to the terminal Failed status. Like
+// MarkSent, the UPDATE is conditioned on status='in_flight' and fails
+// closed with ErrNotInFlight otherwise.
 func (s *Store) MarkFailed(id int64, errMsg string, maxAttempts int) error {
 	item, err := s.Get(id)
 	if err != nil {
@@ -236,16 +320,55 @@ func (s *Store) MarkFailed(id int64, errMsg string, maxAttempts int) error {
 	if item == nil {
 		return fmt.Errorf("mark failed: outbox item %d not found", id)
 	}
+	if item.Status != StatusInFlight {
+		return fmt.Errorf("%w: id=%d", ErrNotInFlight, id)
+	}
+
 	attempts := item.Attempts + 1
 	status := StatusPending
+	now := time.Now().UTC()
+	var nextAttemptAt any
 	if maxAttempts > 0 && attempts >= maxAttempts {
 		status = StatusFailed
+		nextAttemptAt = nil
+	} else {
+		next := now.Add(nextAttemptDelay(attempts))
+		nextAttemptAt = next
 	}
-	_, err = s.db.Exec(
-		`UPDATE outbox_items SET status = ?, attempts = ?, last_error = ?, updated_at = ? WHERE id = ?`,
-		status, attempts, errMsg, time.Now().UTC(), id,
+
+	res, err := s.db.Exec(
+		`UPDATE outbox_items SET status = ?, attempts = ?, last_error = ?, next_attempt_at = ?, updated_at = ?
+		 WHERE id = ? AND status = ?`,
+		status, attempts, errMsg, nextAttemptAt, now, id, StatusInFlight,
 	)
-	return err
+	if err != nil {
+		return fmt.Errorf("mark failed: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n != 1 {
+		return fmt.Errorf("%w: id=%d", ErrNotInFlight, id)
+	}
+	return nil
+}
+
+// nextAttemptDelay is a bounded exponential backoff: 1s, 2s, 4s, 8s, ...
+// capped at maxBackoff, keyed on the attempt count AFTER this failure.
+const (
+	baseBackoff = time.Second
+	maxBackoff  = 5 * time.Minute
+)
+
+func nextAttemptDelay(attempts int) time.Duration {
+	if attempts <= 0 {
+		return baseBackoff
+	}
+	d := baseBackoff
+	for i := 0; i < attempts-1; i++ {
+		d *= 2
+		if d >= maxBackoff {
+			return maxBackoff
+		}
+	}
+	return d
 }
 
 // rowScanner is satisfied by both *sql.Row and *sql.Rows.
@@ -256,14 +379,19 @@ type rowScanner interface {
 func scanItem(row rowScanner) (*Item, error) {
 	var item Item
 	var payload, lastError sql.NullString
+	var nextAttemptAt sql.NullTime
 	err := row.Scan(
 		&item.ID, &item.IdempotencyKey, &item.TaskRef, &item.Kind, &payload,
-		&item.Status, &item.Attempts, &lastError, &item.CreatedAt, &item.UpdatedAt,
+		&item.Status, &item.Attempts, &lastError, &nextAttemptAt, &item.CreatedAt, &item.UpdatedAt,
 	)
 	if err != nil {
 		return nil, err
 	}
 	item.Payload = payload.String
 	item.LastError = lastError.String
+	if nextAttemptAt.Valid {
+		t := nextAttemptAt.Time
+		item.NextAttemptAt = &t
+	}
 	return &item, nil
 }
