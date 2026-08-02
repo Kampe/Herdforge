@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -25,6 +26,7 @@ import (
 	"github.com/Kampe/Herdforge/pkg/lifecycle"
 	"github.com/Kampe/Herdforge/pkg/lost"
 	"github.com/Kampe/Herdforge/pkg/next"
+	"github.com/Kampe/Herdforge/pkg/overlap"
 	"github.com/Kampe/Herdforge/pkg/preflight"
 	"github.com/Kampe/Herdforge/pkg/process"
 	"github.com/Kampe/Herdforge/pkg/provider"
@@ -136,6 +138,9 @@ func main() {
 	case "throughput":
 		runThroughput()
 
+	case "overlap":
+		runOverlap()
+
 	case "attention":
 		runAttention()
 
@@ -194,6 +199,7 @@ func printUsage() {
 	fmt.Println("  unmerged        Authoritative cherry-based unmerged check (herd unmerged <path> | --all)")
 	fmt.Println("  lost            Find ownerless unmerged work on ANY branch (subject-based)")
 	fmt.Println("  throughput      Read-only fleet throughput KPIs from local evidence")
+	fmt.Println("  overlap         Detect files/symbols edited together by 2+ unmerged branches")
 	fmt.Println("  attention       List agents needing coordinator eyes")
 	fmt.Println("  process         Classify harvest targets (herd-process digest)")
 	fmt.Println("  resolve-lane    Resolve a lane to concrete provider+model (deterministic)")
@@ -1732,6 +1738,158 @@ func runThroughput() {
 	}
 	fmt.Printf("herd-throughput: merges/day=%.2f verdict→merge=%ds rounds/ticket=%.2f merged_tickets=%d route-decisions/merged-ticket=%.2f\n",
 		m.MergesPerDay, m.MedianVerdictToMergeSeconds, m.ReviewRoundsPerTicket, m.MergedTickets, m.RouteDecisionsPerMergedTicket)
+}
+
+// runOverlap ports bin/herd-overlap: surface files that more than one
+// unmerged branch is editing, and same-name symbols added in different
+// files, before those branches collide at merge. Exit 0 = no overlap (or a
+// --json snapshot, or selftest pass), 1 = overlap found / selftest fail,
+// 2 = unknown arg, 3 = no origin/main.
+func runOverlap() {
+	fs := flag.NewFlagSet("overlap", flag.ExitOnError)
+	quiet := fs.Bool("quiet", false, "Only the overlaps, for a pulse stage")
+	min := fs.Int("min", 2, "Only files touched by this many branches / symbols on this many tips")
+	wantJSON := fs.Bool("json", false, "Output JSON")
+	symbolsMode := fs.Bool("symbols", false, "Detect same-name additions in different files")
+	selftestMode := fs.Bool("selftest", false, "Self-test origin/main against itself")
+	fs.Parse(os.Args[2:]) // flag.ExitOnError prints usage + exits 2 on unknown arg
+
+	repoRoot := "."
+	if err := os.Chdir(repoRoot); err != nil {
+		fmt.Fprintf(os.Stderr, "failed to change dir: %v\n", err)
+		os.Exit(1)
+	}
+	o := overlap.NewOverlap(repoRoot)
+	mainRef := envOr("HERD_OVERLAP_MAIN_REF", "origin/main")
+	ctx := context.Background()
+
+	if *selftestMode {
+		runOverlapSelftest(ctx, repoRoot)
+		return
+	}
+
+	// Verify the main ref is present before any 3-dot census, matching the
+	// reference's exit-3 path.
+	if !gitRefExists(ctx, repoRoot, mainRef) {
+		fmt.Fprintln(os.Stderr, "herd-overlap: no origin/main; run git fetch origin main")
+		os.Exit(3)
+	}
+
+	if *symbolsMode {
+		hot := o.SymbolOverlaps(ctx, mainRef, *min)
+		if *wantJSON {
+			if hot == nil {
+				hot = []overlap.SymbolHot{}
+			}
+			out, _ := json.Marshal(hot)
+			fmt.Println(string(out))
+		} else if len(hot) == 0 {
+			if !*quiet {
+				fmt.Printf("herd-overlap: no symbol is being added on %d+ unmerged tips in different files\n", *min)
+			}
+		} else {
+			fmt.Printf("herd-overlap: %d symbol(s) added on %d+ unmerged tips in different files\n", len(hot), *min)
+			for _, s := range hot {
+				fmt.Printf("  %s\n", s.Symbol)
+				for _, r := range s.Refs {
+					fmt.Printf("    %s|%s\n", r.Branch, r.Location)
+				}
+			}
+		}
+		if len(hot) == 0 {
+			os.Exit(0)
+		}
+		os.Exit(1)
+	}
+
+	hot, scanned, err := o.FileOverlaps(ctx, mainRef, *min, nil)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "herd-overlap: error — %v\n", err)
+		os.Exit(1)
+	}
+
+	if *wantJSON {
+		if hot == nil {
+			hot = []overlap.FileOverlap{}
+		}
+		out, _ := json.Marshal(hot)
+		fmt.Println(string(out))
+		os.Exit(0)
+	}
+
+	if len(hot) == 0 {
+		if !*quiet {
+			fmt.Printf("herd-overlap: no file is being edited by %d+ unmerged branches (%d branch(es) scanned)\n", *min, scanned)
+		}
+		os.Exit(0)
+	}
+
+	fmt.Printf("herd-overlap: %d file(s) edited by %d+ unmerged branches (%d scanned)\n", len(hot), *min, scanned)
+	fmt.Println("  Two branches on one file is normal. Two branches on one file for days,")
+	fmt.Println("  neither able to see the other, is the same design being built twice.")
+	fmt.Println()
+
+	// Rank by branch count so the worst convergence reads first. Cap the
+	// printed list: overlap runs on every beat and a wall of output is
+	// ignored exactly as reliably as no output at all.
+	top := 12
+	if v := os.Getenv("HERD_OVERLAP_TOP"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			top = n
+		}
+	}
+	shown := 0
+	for _, fo := range hot {
+		if shown >= top {
+			break
+		}
+		shown++
+		fmt.Printf("  [%d] %s\n", len(fo.Branches), fo.File)
+		for _, b := range fo.Branches {
+			fmt.Printf("        %s\n", b)
+		}
+	}
+	if len(hot) > shown {
+		fmt.Println()
+		fmt.Printf("  ... and %d more (herd overlap --min 3, or HERD_OVERLAP_TOP=50)\n", len(hot)-shown)
+	}
+
+	// Exit 1 so a pulse stage can surface it as work to look at, matching the
+	// herd-drain convention. Not a failure of the beat.
+	os.Exit(1)
+}
+
+// runOverlapSelftest ports the reference --selftest: origin/main must exist,
+// and a branch compared against itself must contribute no changed files (so a
+// merged branch can never manufacture a phantom overlap).
+func runOverlapSelftest(ctx context.Context, repoRoot string) {
+	if !gitRefExists(ctx, repoRoot, "origin/main") {
+		fmt.Fprintln(os.Stderr, "FAIL: no origin/main")
+		os.Exit(1)
+	}
+	cmd := exec.CommandContext(ctx, "git", "diff", "--name-only", "origin/main...origin/main")
+	cmd.Dir = repoRoot
+	out, err := cmd.Output() // err tolerated: a missing ref contributes nothing
+	if err == nil {
+		n := 0
+		for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+			if line != "" {
+				n++
+			}
+		}
+		if n != 0 {
+			fmt.Fprintf(os.Stderr, "FAIL: origin/main against itself reported %d changed files\n", n)
+			os.Exit(1)
+		}
+	}
+	fmt.Println("herd-overlap --selftest PASS")
+}
+
+// gitRefExists reports whether ref resolves in repoRoot.
+func gitRefExists(ctx context.Context, repoRoot, ref string) bool {
+	cmd := exec.CommandContext(ctx, "git", "rev-parse", "--verify", "-q", ref)
+	cmd.Dir = repoRoot
+	return cmd.Run() == nil
 }
 
 func envOr(key, def string) string {
