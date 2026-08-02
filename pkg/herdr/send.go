@@ -1,0 +1,80 @@
+package herdr
+
+import (
+	"fmt"
+	"time"
+)
+
+// Port of bin/herd-send: submit text to a herdr agent pane and confirm the
+// agent CONSUMED it (flipped to working — or done, for agents that finish the
+// ask inside the poll window). A submit that lands in a dead pane looks
+// identical to a delivered one, which is how packets silently vanished; the
+// verify loop is the point of this command.
+
+// StatusFromList extracts the agent_status for a target (name or pane id).
+// Pure so the selftest can pin extraction without a live herdr.
+func StatusFromList(agents []AgentEntry, target string) string {
+	for _, a := range agents {
+		if a.Name == target || a.PaneID == target {
+			return a.Status
+		}
+	}
+	return ""
+}
+
+func liveStatus(target string) (string, error) {
+	agents, err := AgentList()
+	if err != nil {
+		return "", err
+	}
+	st := StatusFromList(agents, target)
+	if st == "" {
+		return "", fmt.Errorf("no agent '%s' found", target)
+	}
+	return st, nil
+}
+
+// SendKeys presses keys in an agent pane (used for the single Enter nudge:
+// a stray suggestion/dialog can swallow a submit).
+func SendKeys(target, keys string) error {
+	out, err := runHerdr("agent", "send-keys", target, keys)
+	if err != nil {
+		return fmt.Errorf("herdr agent send-keys: %s: %w", out, err)
+	}
+	return nil
+}
+
+// Send submits text via `herdr agent prompt` and, when verify is set, polls
+// up to timeout for the pane to report working/done. If it never flips, it
+// presses Enter once and re-checks. Returns the final observed status; error
+// when consumption was never confirmed so a caller can escalate. It does NOT
+// answer trust/approval dialogs.
+func Send(target, text string, verify bool, timeout time.Duration) (string, error) {
+	if _, err := AgentPrompt(target, text, false); err != nil {
+		return "", err
+	}
+	if !verify {
+		return "submitted", nil
+	}
+
+	poll := 2 * time.Second
+	deadline := time.Now().Add(timeout)
+	nudged := false
+	last := "unknown"
+	for time.Now().Before(deadline) {
+		st, err := liveStatus(target)
+		if err == nil {
+			last = st
+			if st == "working" || st == "done" {
+				return st, nil
+			}
+		}
+		if !nudged && time.Now().Add(poll).After(deadline.Add(-timeout/2)) {
+			// Halfway through the window with no flip: one Enter nudge.
+			_ = SendKeys(target, "Enter")
+			nudged = true
+		}
+		time.Sleep(poll)
+	}
+	return last, fmt.Errorf("agent '%s' never confirmed consumption (last status %q)", target, last)
+}
