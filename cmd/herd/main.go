@@ -72,6 +72,9 @@ func main() {
 	case "preflight":
 		runPreflight()
 
+	case "verify":
+		runVerify()
+
 	case "selftest":
 		runSelfTest()
 
@@ -3009,5 +3012,45 @@ func runReviewLedger() {
 	default:
 		fmt.Fprintf(os.Stderr, "review-ledger: unknown mode %q\n", mode)
 		os.Exit(2)
+	}
+}
+
+// runVerify is the FAC-98/FAC-116 completion gate: `herd verify <worktree>`
+// exits 0 only when the worktree has real committed work, builds, and tests
+// pass — the check an agent must pass before reporting done, and the forge
+// runs before routing a build to review. Exit 1 on any violation (each
+// reason carries its fix), 2 on usage.
+func runVerify() {
+	fs := flag.NewFlagSet("verify", flag.ExitOnError)
+	buildCmd := fs.String("build", "go build ./...", "build command run in the worktree")
+	testCmd := fs.String("test", "go test ./...", "test command run in the worktree")
+	asJSON := fs.Bool("json", false, "emit the check as JSON")
+	fs.Parse(os.Args[2:])
+
+	wt := fs.Arg(0)
+	if wt == "" {
+		fmt.Fprintln(os.Stderr, "usage: herd verify <worktree-path> [--build CMD] [--test CMD] [--json]")
+		os.Exit(2)
+	}
+	if fi, err := os.Stat(wt); err != nil || !fi.IsDir() {
+		fmt.Fprintf(os.Stderr, "herd verify: %q is not a directory\n", wt)
+		os.Exit(2)
+	}
+
+	v := verifier.NewVerifier("")
+	c := v.CheckCompletion(context.Background(), wt, *buildCmd, *testCmd)
+
+	if *asJSON {
+		json.NewEncoder(os.Stdout).Encode(c)
+	} else if c.Passed {
+		fmt.Printf("herd verify: %s PASSED (real commits, builds, tests pass)\n", wt)
+	} else {
+		fmt.Printf("herd verify: %s FAILED\n", wt)
+		for _, r := range c.Reasons {
+			fmt.Printf("  - %s\n", r)
+		}
+	}
+	if !c.Passed {
+		os.Exit(1)
 	}
 }
