@@ -25,7 +25,7 @@ lanes:
     prompt: ".herd/prompts/smith.md"
     worktree: ".worktrees/smith"
     provider: "deepseek"
-    model: "deepseek-v4-flash"
+    model: "opencode/deepseek-v4-flash-free"
 
   - name: "worker"
     role: "worker"
@@ -34,7 +34,7 @@ lanes:
     prompt: ".herd/prompts/worker.md"
     worktree: ".worktrees/worker"
     provider: "deepseek"
-    model: "deepseek-v4-flash"
+    model: "opencode/deepseek-v4-flash-free"
 
   - name: "reviewer"
     role: "reviewer"
@@ -43,7 +43,7 @@ lanes:
     prompt: ".herd/prompts/reviewer.md"
     worktree: ".worktrees/reviewer"
     provider: "deepseek"
-    model: "deepseek-v4-flash"
+    model: "opencode/deepseek-v4-flash-free"
 
 # Project Verification Suite
 verification:
