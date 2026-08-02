@@ -14,9 +14,7 @@ func createTestGitRepo(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()
 	for _, cmd := range []string{
-		"git init -b main",
-		"git config user.email test@test.com",
-		"git config user.name test",
+		`git -c commit.gpgSign=false -c gpg.x509.program=false -c gpg.format=openpgp -c tag.gpgSign=false -c user.email=test@test.com -c user.name=test init -b main`,
 	} {
 		c := exec.Command("bash", "-c", cmd)
 		c.Dir = dir
@@ -33,12 +31,12 @@ func commitFile(t *testing.T, dir, filename, content, msg string) {
 	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
 		t.Fatalf("write %s: %v", filename, err)
 	}
-	c := exec.Command("git", "add", filename)
+	c := exec.Command("git", "-c", "commit.gpgSign=false", "-c", "gpg.format=openpgp", "add", filename)
 	c.Dir = dir
 	if out, err := c.CombinedOutput(); err != nil {
 		t.Fatalf("git add: %v\n%s", err, out)
 	}
-	c = exec.Command("git", "commit", "-m", msg)
+	c = exec.Command("git", "-c", "commit.gpgSign=false", "-c", "gpg.format=openpgp", "commit", "-m", msg)
 	c.Dir = dir
 	if out, err := c.CombinedOutput(); err != nil {
 		t.Fatalf("git commit: %v\n%s", err, out)
