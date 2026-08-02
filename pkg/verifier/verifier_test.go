@@ -265,15 +265,16 @@ func TestMutationPathGuardsRejectEscapesAndMetadataWithoutOutsideWrites(t *testi
 	candidate := gitOutput(t, dir, "rev-parse", "HEAD")
 
 	tests := []struct {
-		name   string
-		target string
+		name     string
+		target   string
+		expected string
 	}{
-		{name: "absolute", target: outsideFile},
-		{name: "parent", target: "../outside.txt"},
-		{name: "nested parent", target: "nested/../../outside.txt"},
-		{name: "tracked symlink", target: "tracked-link"},
-		{name: "resolved git dir", target: "git-parent/hooks/fac122-probe"},
-		{name: "git first component", target: ".git/hooks/fac122-probe"},
+		{name: "absolute", target: outsideFile, expected: "relative path"},
+		{name: "parent", target: "../outside.txt", expected: "escapes candidate"},
+		{name: "nested parent", target: "nested/../../outside.txt", expected: "escapes candidate"},
+		{name: "tracked symlink", target: "tracked-link", expected: "Lstat regular file"},
+		{name: "resolved git dir", target: "git-parent/hooks/fac122-probe", expected: "git metadata"},
+		{name: "git first component", target: ".git/hooks/fac122-probe", expected: "may not enter .git"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -285,8 +286,8 @@ func TestMutationPathGuardsRejectEscapesAndMetadataWithoutOutsideWrites(t *testi
 				MutantCode:        "clobbered\n",
 				Timeout:           time.Second,
 			})
-			if err == nil {
-				t.Fatal("unsafe mutation target must fail closed")
+			if err == nil || !strings.Contains(err.Error(), tt.expected) {
+				t.Fatalf("unsafe mutation target must fail with %q, got %v", tt.expected, err)
 			}
 			assertFile(t, outsideFile, "outside\n")
 			assertFile(t, gitMetadataProbe, "metadata\n")
