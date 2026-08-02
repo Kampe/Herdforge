@@ -14,7 +14,7 @@
 - **Git** — worktree isolation and rebase-merge pipeline
 - **Redis** — distributed agent lane sync via pub/sub (`pkg/mail`); install via `brew install redis`
 - **Make** — `make all` drives preflight, lint, test, and build
-- **Optional** — `openusage` + `herdr-quota` (from dotfiles) for cross-harness quota-aware routing
+- **Optional** — Redis for distributed agent lane sync
 
 - ⚙️ **Declarative Config (`herd.yaml`)**: Initialize any codebase with `herd init` and define worker roles, model providers, and task backends.
 - 🔌 **Pluggable Task Engine**: Native support for **Kaneo**, **Linear**, **GitHub Issues**, and offline **Memory** task providers.
