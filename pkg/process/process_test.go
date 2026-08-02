@@ -4,6 +4,16 @@ import (
 	"testing"
 )
 
+// mockCommitsAhead returns preset commit counts for stall detection tests.
+func mockCommitsAhead(counts map[string]int) func(string, string) int {
+	return func(agentName, repoRoot string) int {
+		if c, ok := counts[agentName]; ok {
+			return c
+		}
+		return -1
+	}
+}
+
 func TestClassify(t *testing.T) {
 	tests := []struct {
 		name  string
@@ -151,5 +161,81 @@ func TestExtractField(t *testing.T) {
 	}
 	if got := extractField("no match", "Task ID"); got != "" {
 		t.Errorf("got %q, want empty", got)
+	}
+}
+
+func TestStalledAgents(t *testing.T) {
+	tests := []struct {
+		name      string
+		agents    []herdrAgentEntry
+		repoRoot  string
+		ahead     map[string]int
+		wantCount int
+	}{
+		{
+			name: "no done agents",
+			agents: []herdrAgentEntry{
+				{Name: "agent-a", Status: "running"},
+				{Name: "agent-b", Status: "starting"},
+			},
+			ahead:     map[string]int{},
+			wantCount: 0,
+		},
+		{
+			name: "done agent with commits is not stalled",
+			agents: []herdrAgentEntry{
+				{Name: "agent-a", Status: "done"},
+			},
+			ahead:     map[string]int{"agent-a": 3},
+			wantCount: 0,
+		},
+		{
+			name: "done agent with zero commits is stalled",
+			agents: []herdrAgentEntry{
+				{Name: "agent-a", Status: "done"},
+			},
+			ahead:     map[string]int{"agent-a": 0},
+			wantCount: 1,
+		},
+		{
+			name: "idle agent with zero commits is stalled",
+			agents: []herdrAgentEntry{
+				{Name: "agent-b", Status: "idle"},
+			},
+			ahead:     map[string]int{"agent-b": 0},
+			wantCount: 1,
+		},
+		{
+			name: "mixed agents only stalled found",
+			agents: []herdrAgentEntry{
+				{Name: "agent-a", Status: "done"},
+				{Name: "agent-b", Status: "done"},
+				{Name: "agent-c", Status: "running"},
+			},
+			ahead:     map[string]int{"agent-a": 0, "agent-b": 5, "agent-c": 0},
+			wantCount: 1,
+		},
+		{
+			name: "all stalled",
+			agents: []herdrAgentEntry{
+				{Name: "agent-x", Status: "done"},
+				{Name: "agent-y", Status: "idle"},
+			},
+			ahead:     map[string]int{"agent-x": 0, "agent-y": 0},
+			wantCount: 2,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			old := execCommitsAhead
+			execCommitsAhead = mockCommitsAhead(tt.ahead)
+			defer func() { execCommitsAhead = old }()
+
+			got := StalledAgents(tt.agents, tt.repoRoot)
+			if len(got) != tt.wantCount {
+				t.Errorf("StalledAgents() returned %d agents (%v), want %d", len(got), got, tt.wantCount)
+			}
+		})
 	}
 }

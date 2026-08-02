@@ -3,6 +3,7 @@ package process
 import (
 	"encoding/json"
 	"fmt"
+	"os/exec"
 	"regexp"
 	"strings"
 )
@@ -240,4 +241,52 @@ func DigestJSON(ws string, targets []Target, multiPaneTabs []string) ([]byte, er
 		d.MultiPaneTabs = multiPaneTabs
 	}
 	return json.Marshal(d)
+}
+
+// herdrAgentEntry mirrors the fields needed from herdr.AgentEntry without
+// importing the herdr package (avoids circular dependency).
+type herdrAgentEntry struct {
+	Name   string `json:"name,omitempty"`
+	Status string `json:"agent_status,omitempty"`
+}
+
+// StalledAgents returns agent names from the provided list whose herdr status
+// is done/idle but whose worktree has zero real commits beyond origin/main.
+// An anchor/wip commit (FAC-106) does not count as real work.
+func StalledAgents(agents []herdrAgentEntry, repoRoot string) []string {
+	var stalled []string
+	for _, a := range agents {
+		if a.Status != "done" && a.Status != "idle" {
+			continue
+		}
+		if execCommitsAhead(a.Name, repoRoot) == 0 {
+			stalled = append(stalled, a.Name)
+		}
+	}
+	return stalled
+}
+
+// execCommitsAhead is a variable so tests can mock; defaults to execCommitsAheadShell.
+var execCommitsAhead = execCommitsAheadShell
+
+// execCommitsAheadShell runs git rev-list to count commits in the worktree
+// branch that are not reachable from origin/main.
+func execCommitsAheadShell(agentName, repoRoot string) int {
+	// Find the worktree directory for this agent's branch.
+	// Convention: branches are herd/<lowercase-agent-name>, worktrees live
+	// under .herd/worktrees/<lowercase-agent-name>.
+	branch := fmt.Sprintf("herd/%s", strings.ToLower(agentName))
+	wtDir := fmt.Sprintf("%s/.herd/worktrees/%s", repoRoot, strings.ToLower(agentName))
+
+	cmd := exec.Command("git", "rev-list", "--count", "origin/main.."+branch)
+	cmd.Dir = wtDir
+	out, err := cmd.Output()
+	if err != nil {
+		return -1
+	}
+	var count int
+	if _, err := fmt.Sscanf(strings.TrimSpace(string(out)), "%d", &count); err != nil {
+		return -1
+	}
+	return count
 }
