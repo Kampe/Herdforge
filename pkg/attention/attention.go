@@ -4,7 +4,7 @@
 //
 // Port of bin/herd-attention (zsh) which ran `herdr agent list` and piped
 // it through jq filtering. The Go port cross-references the live agent
-// list against the canonical standing roster (kick.StandingIDs — the
+// list against the canonical standing roster (kick.StandingIDs() — the
 // single source of truth shared with kick and standing), classifies each
 // lane by urgency, and emits a deterministic, urgency-sorted triage.
 //
@@ -327,7 +327,7 @@ func Run() (*Result, error) {
 	if err != nil {
 		return nil, fmt.Errorf("herd-attention: %w", err)
 	}
-	r := Triage(agents, kick.StandingIDs, kick.LaneHeld, kick.ProviderDeathCheck)
+	r := Triage(agents, kick.StandingIDs(), kick.LaneHeld, kick.ProviderDeathCheck)
 	return &r, nil
 }
 
