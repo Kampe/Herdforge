@@ -164,6 +164,13 @@ func (v *Verifier) execute(ctx context.Context, dir string, policy EnvironmentPo
 	started := time.Now()
 	cmd := exec.CommandContext(ctx, v.Argv[0], v.Argv[1:]...)
 	cmd.Dir = dir
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error {
+		if cmd.Process == nil {
+			return nil
+		}
+		return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+	}
 	if policy == EnvironmentPolicyHermetic {
 		cmd.Env = hermeticEnvironment()
 	}
