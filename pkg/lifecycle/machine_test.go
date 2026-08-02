@@ -128,6 +128,51 @@ func TestMachine_EnqueuesOutboxItemsAtomicallyWithTransition(t *testing.T) {
 	}
 }
 
+func TestMachine_ReplayFillsOutboxTaskRefIdenticallyToFreshAttempt(t *testing.T) {
+	m := tempMachine(t)
+	req := TransitionRequest{
+		TaskRef: "FAC-1", Repo: "herdforge", To: StateEligible,
+		Actor: "worker-a", IdempotencyKey: "k1", LeaseGeneration: 1,
+		OutboxItems: []outbox.Item{
+			// TaskRef deliberately empty: Machine must fill it in from
+			// req.TaskRef, and do so IDENTICALLY whether this is the
+			// first attempt or a replay of the same idempotency key.
+			{IdempotencyKey: "k1:board", Kind: "provider", Payload: `{"status":"eligible"}`},
+		},
+	}
+
+	first, err := m.Transition(req)
+	if err != nil {
+		t.Fatalf("first transition: %v", err)
+	}
+	if first.Replayed {
+		t.Fatal("expected the first call to not be a replay")
+	}
+
+	// Replay the exact same request. If the replay path filled TaskRef
+	// differently (e.g. left it empty) the outbox's own fail-closed
+	// idempotency check would reject this as a conflicting reuse of
+	// "k1:board" and this call would return an error.
+	second, err := m.Transition(req)
+	if err != nil {
+		t.Fatalf("replay transition: %v", err)
+	}
+	if !second.Replayed {
+		t.Fatal("expected the second call to be a replay")
+	}
+
+	pending, err := m.Outbox().Pending("provider", 10, time.Now())
+	if err != nil {
+		t.Fatalf("pending: %v", err)
+	}
+	if len(pending) != 1 {
+		t.Fatalf("expected exactly 1 outbox item after replay, got %d", len(pending))
+	}
+	if pending[0].TaskRef != "FAC-1" {
+		t.Fatalf("expected outbox item task_ref=FAC-1 filled identically on replay, got %q", pending[0].TaskRef)
+	}
+}
+
 func TestMachine_StaleLeaseGenerationRejected(t *testing.T) {
 	m := tempMachine(t)
 	if _, err := m.Transition(TransitionRequest{
