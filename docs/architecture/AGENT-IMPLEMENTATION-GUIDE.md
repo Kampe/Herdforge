@@ -99,7 +99,7 @@ When taking up a ticket in `Herdforge`, follow this step-by-step TDD protocol:
    ```
 2. **Worktree Isolation**:
    - Create your working branch off `main`: `git checkout -b feat/your-feature`.
-   - Ensure zero absolute paths (`/Users/...`, `/tmp/...`) are introduced into Go code, config files, or markdown docs.
+   - Ensure zero absolute paths are introduced into Go code, config files, or markdown docs.
 3. **Write Tests First**:
    - Every new package or method must carry a corresponding `*_test.go` file with table-driven or mock-backed assertions.
 4. **Verification Checkpoint**:

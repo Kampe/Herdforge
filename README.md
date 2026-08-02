@@ -14,7 +14,7 @@
 - 🔌 **Pluggable Task Engine**: Native support for **Kaneo**, **Linear**, **GitHub Issues**, and offline **Memory** task providers.
 - 🔀 **Multi-Provider AI Router**: Dynamic load-balancing and 429 rate-limit failover across OpenAI, Anthropic, Gemini, and local Ollama/vLLM models.
 - 🌳 **Worktree & Lane Isolation**: Ephemeral Git worktree management to isolate parallel agent lanes without workspace file collisions.
-- 🛡️ **Preflight Boundary Check**: Automatic detection of absolute path leaks (`/Users/...`) to ensure worktree portability.
+- 🛡️ **Preflight Boundary Check**: Automatic detection of absolute path leaks to ensure worktree portability.
 - 🔍 **Independent Cross-Model Review**: Risk-based code review pipeline enforcing cross-family model reviews before git rebase-merging.
 
 ---

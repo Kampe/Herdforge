@@ -8,7 +8,7 @@ This document serves as the build bootstrap and routing specification for Claude
 
 1. **Origin Main is Truth**: Development occurs in worktrees or feature branches; `main` is always clean and green.
 2. **Fail-Closed Execution**: Subcommands and API wrappers MUST exit non-zero on error. HTTP 200 responses containing `{"error": ...}` JSON bodies are hard errors.
-3. **No Absolute Paths**: Absolutely NO absolute paths (`/Users/...`, `/tmp/...`) in code, configs, or markdown. Use `./` or `$HERD_ROOT`.
+3. **No Absolute Paths**: Absolutely NO absolute paths in code, configs, or markdown. Use `./` or `$HERD_ROOT`.
 4. **Deterministic Sorting**: Candidate task queues MUST be sorted by $(\text{Priority DESC}, \text{Ticket Ref ASC})$.
 5. **No AI Trailers in Commits**: Never add `Co-Authored-By`, `Signed-off-by`, or AI attribution trailers to git commits.
 
