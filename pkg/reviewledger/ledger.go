@@ -8,7 +8,16 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
+)
+
+// quarantineSink is the package-level target for malformed JSONL lines.
+// Set via SetQuarantinePath; if empty, malformed lines are silently dropped.
+var (
+	quarantineMu     sync.Mutex
+	quarantinePath   string
+	quarantineOpened bool
 )
 
 // NewReviewLedger creates a Ledger, deriving QueuePath from ledgerPath's directory.
@@ -74,14 +83,42 @@ func (l *Ledger) appendRow(path string, row *LedgerRow) error {
 	return nil
 }
 
-// readRows reads all rows from a JSONL file. Missing/unreadable returns empty.
+// SetQuarantinePath enables quarantining of malformed JSONL lines.
+func SetQuarantinePath(path string) {
+	quarantineMu.Lock()
+	quarantinePath = path
+	quarantineOpened = false
+	quarantineMu.Unlock()
+}
+
+// quarantineLine writes a malformed line to the quarantine file.
+func quarantineLine(line string, reason error) {
+	quarantineMu.Lock()
+	defer quarantineMu.Unlock()
+	if quarantinePath == "" {
+		return
+	}
+	flag := os.O_APPEND | os.O_WRONLY
+	if !quarantineOpened {
+		flag |= os.O_CREATE
+		quarantineOpened = true
+	}
+	f, err := os.OpenFile(quarantinePath, flag, 0644)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	fmt.Fprintf(f, "# quarantine: %v\n%s\n", reason, line)
+}
+
+// readRows reads all rows from a JSONL file. Missing returns empty.
 func readRows(path string) ([]LedgerRow, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, nil
 		}
-		return nil, nil
+		return nil, fmt.Errorf("read rows: %w", err)
 	}
 	defer f.Close()
 	var rows []LedgerRow
@@ -93,6 +130,7 @@ func readRows(path string) ([]LedgerRow, error) {
 		}
 		var row LedgerRow
 		if err := json.Unmarshal([]byte(line), &row); err != nil {
+			quarantineLine(line, err)
 			continue
 		}
 		rows = append(rows, row)
@@ -131,4 +169,14 @@ func RejectCoordinatorSelfVerdict(sha, reviewer string) error {
 			"herd-review-ledger: refuse sha=%s reviewer=%s verdict=PASS",
 		sha, reviewer,
 	)
+}
+
+// ValidVerdict returns nil if v is one of the known verdict values.
+func ValidVerdict(v Verdict) error {
+	switch v {
+	case VerdictPASS, VerdictFAIL, VerdictBLOCKED:
+		return nil
+	default:
+		return fmt.Errorf("invalid verdict %q (must be PASS, FAIL, or BLOCKED)", string(v))
+	}
 }

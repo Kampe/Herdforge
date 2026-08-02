@@ -20,6 +20,8 @@ type RecordOpts struct {
 	Artifact       string
 	Gate           string
 	Tier           string
+	Task           string
+	Lease          string
 }
 
 // Record appends a record event. Validates builder family on independent gates.
@@ -50,6 +52,8 @@ func (l *Ledger) Record(opts RecordOpts) error {
 		Artifact:       opts.Artifact,
 		Gate:           opts.Gate,
 		Tier:           opts.Tier,
+		Task:           opts.Task,
+		Lease:          opts.Lease,
 	}
 	return l.appendRow(l.Path, row)
 }
@@ -80,16 +84,47 @@ type VerdictOpts struct {
 	BuilderFamily  string
 	Branch         string
 	Lane           string
+	Task           string
+	Lease          string
+	PatchURL       string
+	VfyDigest      string
+	FindingsRef    string
+	CandidateSHA   string
 }
 
 // Verdict appends a verdict event and side-writes to the queue.
+// Duplicate verdicts (same SHA+Reviewer) are idempotent — second call is a no-op.
 func (l *Ledger) Verdict(opts VerdictOpts) (enqueued bool, err error) {
+	if err := ValidVerdict(opts.Verdict); err != nil {
+		return false, err
+	}
+	if opts.ReviewerFamily != "" && !FamilyAllowlist[opts.ReviewerFamily] {
+		return false, fmt.Errorf("unknown reviewer family %q (refusing unprovable review provenance)", opts.ReviewerFamily)
+	}
+
+	// Idempotent: skip if a verdict already exists for this SHA+Reviewer.
+	rows, err := readRows(l.Path)
+	if err != nil {
+		return false, err
+	}
+	for _, r := range rows {
+		if r.Event == string(EventVerdict) && r.SHA == opts.SHA && r.Reviewer == opts.Reviewer {
+			return opts.Verdict == VerdictPASS, nil
+		}
+	}
+
 	row := &LedgerRow{
-		Event:    string(EventVerdict),
-		SHA:      opts.SHA,
-		Reviewer: opts.Reviewer,
-		Verdict:  string(opts.Verdict),
-		Artifact: opts.Artifact,
+		Event:          string(EventVerdict),
+		SHA:            opts.SHA,
+		Reviewer:       opts.Reviewer,
+		Verdict:        string(opts.Verdict),
+		Artifact:       opts.Artifact,
+		Task:           opts.Task,
+		Lease:          opts.Lease,
+		PatchURL:       opts.PatchURL,
+		VerificationDigest: opts.VfyDigest,
+		FindingsRef:    opts.FindingsRef,
+		CandidateSHA:   opts.CandidateSHA,
 	}
 	if opts.ReviewerFamily != "" {
 		row.ReviewerFamily = opts.ReviewerFamily
@@ -211,6 +246,7 @@ func resolveFamily(lbf, lrf, vbf, vrf string) familyState {
 }
 
 // Eligible returns true if sha is harvestable for the given builderFamily.
+// A SHA-level FAIL/BLOCKED veto blocks eligibility regardless of PASS from other reviewers.
 func (l *Ledger) Eligible(sha, builderFamily string) (bool, error) {
 	rows, err := readRows(l.Path)
 	if err != nil {
@@ -247,6 +283,34 @@ func (l *Ledger) Eligible(sha, builderFamily string) (bool, error) {
 	}
 
 	if done[sha] {
+		return false, nil
+	}
+
+	// SHA-level veto: any FAIL/BLOCKED from a valid reviewer blocks eligibility.
+	hasVeto := false
+	for k, verdict := range latest {
+		sparts := strings.SplitN(k, ":", 2)
+		if len(sparts) != 2 || sparts[0] != sha {
+			continue
+		}
+		reviewer := sparts[1]
+		if l.isCoordinator(reviewer) {
+			continue
+		}
+		if verdict.Verdict != string(VerdictFAIL) && verdict.Verdict != string(VerdictBLOCKED) {
+			continue
+		}
+		// Validate that the veto came from a known family.
+		launchRow, hasLaunch := launch[k]
+		if hasLaunch {
+			lbf := launchRow.BuilderFamily
+			if lbf != "" && FamilyAllowlist[lbf] {
+				hasVeto = true
+				break
+			}
+		}
+	}
+	if hasVeto {
 		return false, nil
 	}
 
@@ -290,8 +354,12 @@ func (l *Ledger) Eligible(sha, builderFamily string) (bool, error) {
 			continue
 		}
 
+		// When builderFamily is empty, only cross-family PASS counts.
 		if builderFamily == "" {
-			hasPass = true
+			if rf != "" && rf != lbf {
+				hasPass = true
+				continue
+			}
 			continue
 		}
 
