@@ -135,6 +135,12 @@ func main() {
 	case "doctor-models":
 		runDoctorModels()
 
+	case "tool-probe":
+		runToolProbe()
+
+	case "shoot":
+		runShoot()
+
 	case "next":
 		runNext()
 
@@ -3053,4 +3059,41 @@ func runVerify() {
 	if !c.Passed {
 		os.Exit(1)
 	}
+}
+
+// runToolProbe (FAC-96): `herd tool-probe <model>` exits 0 only if the model
+// actually EXECUTES a tool (creates a sentinel file), 1 if it merely talks.
+func runToolProbe() {
+	if len(os.Args) < 3 {
+		fmt.Fprintln(os.Stderr, "usage: herd tool-probe <model>")
+		os.Exit(2)
+	}
+	r := herdr.ToolProbe(context.Background(), os.Args[2])
+	if r.Executes {
+		fmt.Printf("tool-probe: %s EXECUTES tools\n", r.Model)
+		return
+	}
+	fmt.Printf("tool-probe: %s does NOT execute tools — %s\n", r.Model, r.Reason)
+	os.Exit(1)
+}
+
+// runShoot (FAC-88): `herd shoot <pane|name> <refocus msg>` interrupts a
+// stalled agent (escape) and refocuses it, without killing the pane.
+func runShoot() {
+	if len(os.Args) < 4 {
+		fmt.Fprintln(os.Stderr, "usage: herd shoot <pane|name> <refocus message>")
+		os.Exit(2)
+	}
+	if !herdr.IsAvailable() {
+		fmt.Fprintln(os.Stderr, "herd shoot: herdr CLI not found")
+		os.Exit(1)
+	}
+	target := os.Args[2]
+	msg := strings.Join(os.Args[3:], " ")
+	status, err := herdr.Shoot(target, msg, true, 30*time.Second)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "herd shoot: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Printf("herd shoot: %s refocused -> %s\n", target, status)
 }
