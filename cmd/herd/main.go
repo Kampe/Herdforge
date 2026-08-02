@@ -34,6 +34,7 @@ import (
 	"github.com/Kampe/Herdforge/pkg/provider"
 	"github.com/Kampe/Herdforge/pkg/resolve"
 	"github.com/Kampe/Herdforge/pkg/resources"
+	"github.com/Kampe/Herdforge/pkg/review"
 	"github.com/Kampe/Herdforge/pkg/router"
 	"github.com/Kampe/Herdforge/pkg/selftest"
 	"github.com/Kampe/Herdforge/pkg/store"
@@ -94,6 +95,9 @@ func main() {
 
 	case "review":
 		runReview()
+
+	case "review-ledger":
+		runReviewLedger()
 
 	case "approve":
 		runApprove()
@@ -2933,4 +2937,68 @@ func runLocked(child []string, lockdir string) int {
 	}
 	fmt.Fprintf(os.Stderr, "herd lock: %v\n", err)
 	return 1
+}
+
+// runReviewLedger surfaces the append-only review ledger (FAC-82):
+//
+//	herd review-ledger list|queued|pending   — read the ledger as JSON
+//	herd review-ledger tier <sha>            — resolved risk tier for a sha
+func runReviewLedger() {
+	ledgerPath := os.Getenv("HERD_REVIEW_LEDGER")
+	if ledgerPath == "" {
+		base := os.Getenv("XDG_STATE_HOME")
+		if base == "" {
+			home, _ := os.UserHomeDir()
+			base = filepath.Join(home, ".local", "state")
+		}
+		ledgerPath = filepath.Join(base, "herdforge", "review-ledger.jsonl")
+	}
+	l, err := review.NewReviewLedger(".", ledgerPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "review-ledger: %v\n", err)
+		os.Exit(1)
+	}
+	mode := "list"
+	if len(os.Args) > 2 {
+		mode = os.Args[2]
+	}
+	switch mode {
+	case "list":
+		rows, err := l.AllRows()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "review-ledger: %v\n", err)
+			os.Exit(1)
+		}
+		json.NewEncoder(os.Stdout).Encode(rows)
+	case "queued":
+		rows, err := l.QueueRows()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "review-ledger: %v\n", err)
+			os.Exit(1)
+		}
+		json.NewEncoder(os.Stdout).Encode(rows)
+	case "pending":
+		rows, err := l.Pending()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "review-ledger: %v\n", err)
+			os.Exit(1)
+		}
+		json.NewEncoder(os.Stdout).Encode(rows)
+	case "tier":
+		if len(os.Args) < 4 {
+			fmt.Fprintln(os.Stderr, "Usage: herd review-ledger tier <sha>")
+			os.Exit(2)
+		}
+		tier, err := l.Tier(os.Args[3])
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "review-ledger: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Println(tier)
+	case "-h", "--help":
+		fmt.Println("Usage: herd review-ledger list|queued|pending|tier <sha>")
+	default:
+		fmt.Fprintf(os.Stderr, "review-ledger: unknown mode %q\n", mode)
+		os.Exit(2)
+	}
 }
