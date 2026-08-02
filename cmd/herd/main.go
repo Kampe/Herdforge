@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Kampe/Herdforge/pkg/attention"
 	"github.com/Kampe/Herdforge/pkg/config"
 	"github.com/Kampe/Herdforge/pkg/daemon"
 	"github.com/Kampe/Herdforge/pkg/dispatch"
@@ -113,6 +114,9 @@ func main() {
 	case "kick":
 		runKick()
 
+	case "attention":
+		runAttention()
+
 	case "lifecycle":
 		runLifecycle()
 
@@ -148,6 +152,7 @@ func printUsage() {
 	fmt.Println("  process         Classify harvest targets (herd-process digest)")
 	fmt.Println("  resolve-lane    Resolve a lane to concrete provider+model (deterministic)")
 	fmt.Println("  kick            Re-engage standing or named agent lanes")
+	fmt.Println("  attention       List standing agents needing coordinator eyes (triage)")
 	fmt.Println("  lifecycle       Observe and act on fleet state via lifecycle engine")
 	fmt.Println("  --version       Show herd version")
 }
@@ -1391,6 +1396,58 @@ func runKick() {
 	}
 	if result.Failed > 0 {
 		os.Exit(1)
+	}
+}
+
+func runAttention() {
+	attFlags := flag.NewFlagSet("attention", flag.ExitOnError)
+	asJSON := attFlags.Bool("json", false, "Output JSON triage")
+	selftestFlag := attFlags.Bool("selftest", false, "Run attention selftest and exit")
+	quiet := attFlags.Bool("quiet", false, "Summary line only, no per-lane detail")
+	attFlags.Parse(os.Args[2:])
+
+	if *selftestFlag {
+		if err := attention.Selftest(); err != nil {
+			fmt.Fprintf(os.Stderr, "attention selftest FAILED: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Println("attention selftest: PASS")
+		return
+	}
+
+	result, err := attention.Run()
+	if err != nil {
+		// Fail-closed: herdr unavailable or agent list parse error is a hard
+		// error, not a silent "fleet healthy".
+		fmt.Fprintf(os.Stderr, "herd-attention: %v\n", err)
+		os.Exit(1)
+	}
+
+	if *asJSON {
+		out, err := json.MarshalIndent(result, "", "  ")
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "herd-attention: json encode: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Println(string(out))
+		return
+	}
+
+	fmt.Println(attention.Summary(*result))
+
+	if *quiet {
+		return
+	}
+
+	for _, item := range result.Items {
+		fmt.Println("  " + attention.FormatItem(item))
+	}
+
+	if result.Needing > 0 {
+		fmt.Println()
+		fmt.Println("herd-attention: triage complete. Actions: review/harvest done lanes,")
+		fmt.Println("  unblock blocked lanes, kick idle lanes (herd kick), raise missing")
+		fmt.Println("  lanes (herd standing), reroute provider-death lanes.")
 	}
 }
 
