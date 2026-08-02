@@ -247,6 +247,30 @@ func TestVerifyCandidateEnvironmentPolicyIsEnforced(t *testing.T) {
 	}
 }
 
+func TestHermeticPolicyResolvesBinaryFromPolicyPath(t *testing.T) {
+	dir, candidate := verificationRepo(t)
+	ambientDir := t.TempDir()
+	writeExecutable(t, filepath.Join(ambientDir, "ambient-only"), "#!/bin/sh\nexit 0\n")
+	t.Setenv("PATH", ambientDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	v := NewVerifierArgs([]string{"ambient-only"})
+
+	hermetic, err := v.VerifyCandidate(context.Background(), dir, VerificationRequest{
+		CandidateSHA:      candidate,
+		EnvironmentPolicy: EnvironmentPolicyHermetic,
+	})
+	if err != nil || hermetic.Outcome != OutcomeBLOCKED {
+		t.Fatalf("hermetic policy must reject an ambient-only binary: receipt=%+v err=%v", hermetic, err)
+	}
+
+	inherited, err := v.VerifyCandidate(context.Background(), dir, VerificationRequest{
+		CandidateSHA:      candidate,
+		EnvironmentPolicy: EnvironmentPolicyInherited,
+	})
+	if err != nil || inherited.Outcome != OutcomePASS {
+		t.Fatalf("inherited policy must resolve the ambient binary: receipt=%+v err=%v", inherited, err)
+	}
+}
+
 func TestHermeticEnvironmentFindsGoToolchain(t *testing.T) {
 	dir, candidate := verificationRepo(t)
 	receipt, err := NewVerifierArgs([]string{"go", "version"}).VerifyCandidate(context.Background(), dir, VerificationRequest{
