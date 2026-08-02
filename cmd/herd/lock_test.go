@@ -4,8 +4,11 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
+
+	"github.com/Kampe/Herdforge/pkg/lock"
 )
 
 // sandbox returns a temp dir that mimics a checkout: `.git` exists so the lock
@@ -20,7 +23,7 @@ func sandbox(t *testing.T) string {
 }
 
 // runHerd runs the freshly-built binary in dir with the given args/env.
-func runHerd(t *testing.B, dir string, env []string, args ...string) ([]byte, error) {
+func runHerd(t *testing.T, dir string, env []string, args ...string) ([]byte, error) {
 	t.Helper()
 	binary := buildHerd(t)
 	cmd := exec.Command(binary, args...)
@@ -61,7 +64,12 @@ func exitCode(err error) int {
 }
 
 func lockDirFor(dir string) string {
-	return filepath.Join(dir, ".git", lock.DefaultRelDir)
+	// The binary resolves the canonical root through EvalSymlinks (macOS
+	// /var -> /private/var), so resolve here too or the paths won't match.
+	if resolved, err := filepath.EvalSymlinks(dir); err == nil {
+		dir = resolved
+	}
+	return filepath.Join(dir, lock.DefaultRelDir)
 }
 
 func TestLockWithTrueReleases(t *testing.T) {
@@ -96,8 +104,11 @@ func TestLockWithChildSeesEnvHeld(t *testing.T) {
 	if err != nil {
 		t.Fatalf("with probe: %v", err)
 	}
-	if !strings.Contains(string(out), "herd-shared-checkout-lock.d") {
-		t.Fatalf("child did not see HERD_SHARED_LOCK_HELD, out=%s", out)
+	// chainseer parity: HERD_SHARED_LOCK_HELD is the full lockdir path
+	// (herd-shared-checkout-lock:114), so a zsh caller and a herd caller in
+	// the same checkout contend for the SAME directory.
+	if strings.TrimSpace(string(out)) != lockDirFor(dir) {
+		t.Fatalf("child did not see HERD_SHARED_LOCK_HELD=%s, out=%s", lockDirFor(dir), out)
 	}
 }
 
@@ -134,7 +145,7 @@ func TestLockAcquireTimeout(t *testing.T) {
 		t.Fatal(err)
 	}
 	pid := os.Getpid() // live process, so never stale
-	content := "pid=" + strconv.Itoa(pid) + "\nagent=" + username() + "\nreason=foreign\n"
+	content := "pid=" + strconv.Itoa(pid) + "\nagent=foreign-fixture\nreason=foreign\n"
 	if err := os.WriteFile(filepath.Join(holder, "holder"), []byte(content), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -249,11 +260,17 @@ func TestLockAcquireHoldsRelease(t *testing.T) {
 	if err := os.WriteFile(probe, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	out, err := runHerd(t, dir, nil, "lock", "with", "--", probe)
+	// Re-entrancy (chainseer contract, herd-shared-checkout-lock:111): a nested
+	// `with` is detected via the HERD_SHARED_LOCK_HELD env marker the outer
+	// caller exports — NOT by two independent processes. Simulate the ancestor
+	// hold with the env var; the nested `with` must run the child and NOT
+	// release the lock it does not own.
+	env := []string{lock.EnvHeld + "=" + lockDirFor(dir)}
+	out, err := runHerd(t, dir, env, "lock", "with", "--", probe)
 	if err != nil {
 		t.Fatalf("nested with over held acquire: %v (out=%s)", err, out)
 	}
-	// lock still held after nested with
+	// lock still held after nested with (the marker path is where acquire put it)
 	if _, err := os.Stat(lockDirFor(dir)); err != nil {
 		t.Fatal("outer acquire lock lost to nested with")
 	}
@@ -264,26 +281,25 @@ func TestLockAcquireHoldsRelease(t *testing.T) {
 }
 
 func TestLockEnvOverrides(t *testing.T) {
-	dir := sandbox(t)
 	custom := filepath.Join(t.TempDir(), "custom-checkout")
-	if err := os.MkdirAll(custom, 0o755); err != nil {
+	// The lockdir lives under <canonical>/.git, so the canonical checkout must
+	// have a .git directory (chainseer assumes it exists).
+	if err := os.MkdirAll(filepath.Join(custom, ".git"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	// HERD_CANONICAL_ROOT points lockdir at custom checkout even when cwd is elsewhere.
+	// HERD_CANONICAL_ROOT points lockdir at the custom checkout even when cwd
+	// is elsewhere. Use `acquire` (leaves the lock held) rather than `with`
+	// (which releases on exit, removing the lockdir before we could stat it).
 	env := []string{"HERD_CANONICAL_ROOT=" + custom}
-	probe := filepath.Join(dir, "probe.sh")
-	if err := os.WriteFile(probe, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
-		t.Fatal(err)
-	}
 	binary := buildHerd(t)
-	cmd := exec.Command(binary, "lock", "with", "--wait", "2", "--", probe)
+	cmd := exec.Command(binary, "lock", "acquire", "--wait", "2", "--reason", "override")
 	cmd.Dir = filepath.Dir(custom) // run from outside the canonical root
 	cmd.Env = append(os.Environ(), env...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		t.Fatalf("with outside canonical: %v (out=%s)", err, out)
+		t.Fatalf("acquire outside canonical: %v (out=%s)", err, out)
 	}
-	if _, statErr := os.Stat(filepath.Join(custom, ".git", "herd-shared-checkout-lock.d")); statErr != nil {
+	if _, statErr := os.Stat(filepath.Join(custom, lock.DefaultRelDir)); statErr != nil {
 		t.Fatalf("lock not placed under HERD_CANONICAL_ROOT: %v", statErr)
 	}
 }

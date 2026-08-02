@@ -2401,7 +2401,17 @@ func lockCanonicalRoot() string {
 			return c
 		}
 	}
-	return "."
+	// The root must be ABSOLUTE: a relative "." makes the lockdir relative,
+	// so the HERD_SHARED_LOCK_HELD marker and `git -C <root>` both break.
+	// Resolve symlinks to match what a zsh caller in the same checkout sees.
+	wd, err := os.Getwd()
+	if err != nil {
+		return "."
+	}
+	if resolved, err := filepath.EvalSymlinks(wd); err == nil {
+		return resolved
+	}
+	return wd
 }
 
 // lockDefaultMaxAge returns HERD_SHARED_LOCK_MAX_AGE in seconds, else 300s.
@@ -2417,7 +2427,9 @@ func lockDefaultMaxAge() time.Duration {
 // isGitMutation reports whether the joined child command contains one of the
 // tree-mutating git tokens (the same space-delimited substring test zsh does).
 func isGitMutation(cmdLine []string) bool {
-	joined := strings.Join(cmdLine, " ")
+	// zsh wraps the whole arg list in spaces (`case " $* " in`), so a token
+	// at the end like `git pull` still matches " pull ". Mirror that framing.
+	joined := " " + strings.Join(cmdLine, " ") + " "
 	for _, token := range []string{"pull", "reset", "rebase", "checkout", "stash", "merge", "switch"} {
 		if strings.Contains(joined, " "+token+" ") {
 			return true

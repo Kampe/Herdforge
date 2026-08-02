@@ -112,10 +112,13 @@ func (l *DirLock) breakIfStale() (removed bool) {
 	if err != nil {
 		return false // dir missing -> not stale
 	}
-	// dead holder pid -> stale
+	// dead/invalid holder pid -> stale. A pid is ALIVE only when kill(pid,0)
+	// returns nil or EPERM; ESRCH (gone) and EINVAL (above PID_MAX on macOS)
+	// both mean the holder can't be live.
 	if pid := l.holderPID(); pid != "" {
 		if n, err := strconv.Atoi(pid); err == nil {
-			if errors.Is(syscall.Kill(n, 0), syscall.ESRCH) {
+			kerr := syscall.Kill(n, 0)
+			if !(kerr == nil || errors.Is(kerr, syscall.EPERM)) {
 				_ = os.RemoveAll(l.dir)
 				return true
 			}

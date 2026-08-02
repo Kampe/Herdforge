@@ -2,16 +2,16 @@
 
 **Title**: Port herd-shared-checkout-lock: advisory mkdir-based serialization lock
 **Priority**: no-priority
-**Status**: to-do
+**Status**: in-progress
 **Labels**: 
 
 ## Worktree
 
 **Path**: `.herd/worktrees/fac-87`
 **Branch**: `task/fac-87-port-herd-shared-checkout-lock-advisory-mkdir-based-serialization-lock`
-**Role**: reviewer
-**Agent**: opencode / opencode/deepseek-v4-flash-free
-**Assigned Worktree**: .worktrees/reviewer
+**Role**: worker
+**Agent**: opencode / litellm/lazer/deepseek-v4-flash
+**Assigned Worktree**: .worktrees/worker
 
 ## Description
 
@@ -161,4 +161,4 @@ No `pkg/store`/`pkg/usage` involvement — this is a pure-filesystem primitive.
 
 ## Role Context
 
-Role prompt from: `.herd/prompts/reviewer.md`
+Role prompt from: `.herd/prompts/worker.md`
