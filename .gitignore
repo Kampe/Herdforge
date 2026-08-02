@@ -34,3 +34,6 @@ opencode.json
 .kaneo.json
 .worktrees/
 .herd/worktrees/
+
+# compiled binaries must not be tracked
+/herd

@@ -88,8 +88,8 @@ func TestSelectNextTask_SamePrioritySortsByRef(t *testing.T) {
 	if err != nil {
 		t.Fatalf("expected task selection, got err: %v", err)
 	}
-	if task.Ref != "FAC-10" {
-		t.Errorf("expected FAC-10 (lexical lower) for same priority, got %s", task.Ref)
+	if task.Ref != "FAC-2" {
+		t.Errorf("expected FAC-2 (numerically lower ticket) for same priority, got %s", task.Ref)
 	}
 }
 

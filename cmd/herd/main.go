@@ -1,8 +1,10 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -27,6 +29,7 @@ import (
 	"github.com/Kampe/Herdforge/pkg/router"
 	"github.com/Kampe/Herdforge/pkg/selftest"
 	"github.com/Kampe/Herdforge/pkg/store"
+	hsync "github.com/Kampe/Herdforge/pkg/sync"
 	"github.com/Kampe/Herdforge/pkg/usage"
 	"github.com/Kampe/Herdforge/pkg/verifier"
 	"github.com/Kampe/Herdforge/pkg/worktree"
@@ -86,6 +89,12 @@ func main() {
 	case "approve":
 		runApprove()
 
+	case "board-done":
+		runBoardDone()
+
+	case "sh", "repl":
+		runShell()
+
 	case "forge":
 		runForge()
 
@@ -134,7 +143,9 @@ func printUsage() {
 	fmt.Println("  status     Display current orchestration engine status")
 	fmt.Println("  pulse      Claim a task from Kaneo and optionally spawn an agent")
 	fmt.Println("  review     Claim in-progress tasks for reviewer and advance to review status")
-	fmt.Println("  approve    Approve a task in review status and move to done")
+	fmt.Println("  approve    Move in-review cards to done, gated on merge evidence")
+	fmt.Println("  board-done Move one card to done ONLY with proof its work is on origin/main")
+	fmt.Println("  sh         Interactive shell: run herd subcommands in a loop")
 	fmt.Println("  forge      Full cycle: pulse worker + review + approve")
 	fmt.Println("  standing   Launch all configured agent lanes in herdr tabs")
 	fmt.Println("  daemon     Start the long-running orchestration daemon (infinite pulse loop)")
@@ -899,6 +910,7 @@ func runReview() {
 	reviewFlags := flag.NewFlagSet("review", flag.ExitOnError)
 	spawn := reviewFlags.Bool("spawn", false, "Spawn reviewer agent in herdr")
 	reviewFlags.Parse(os.Args[2:])
+	refArg := reviewFlags.Arg(0)
 
 	cfg, err := config.LoadConfig(".herd/herd.yaml")
 	if err != nil {
@@ -923,6 +935,17 @@ func runReview() {
 		os.Exit(1)
 	}
 
+	if refArg != "" {
+		want := hsync.NormalizeRef(refArg)
+		var filtered []*provider.Task
+		for _, t := range tasks {
+			if strings.EqualFold(hsync.NormalizeRef(t.Ref), want) {
+				filtered = append(filtered, t)
+			}
+		}
+		tasks = filtered
+	}
+
 	if len(tasks) == 0 {
 		fmt.Println("No tasks in-progress to review.")
 		return
@@ -941,7 +964,7 @@ func runReview() {
 		if pi != pj {
 			return pi > pj
 		}
-		return tasks[i].Ref < tasks[j].Ref
+		return provider.CompareRefs(tasks[i].Ref, tasks[j].Ref) < 0
 	})
 
 	claimIdx := -1
@@ -1035,7 +1058,16 @@ Once you signal APPROVED, the orchestrator will move this card to 'done'.`,
 	}
 }
 
+// runApprove sweeps in-review cards and moves each to done ONLY with merge
+// evidence on origin/main (via sync.BoardDone). Cards without proof are
+// refused and stay in-review — a done card is a claim about reality.
 func runApprove() {
+	approveFlags := flag.NewFlagSet("approve", flag.ExitOnError)
+	force := approveFlags.Bool("force", false, "Approve without merge evidence (look at the diff first)")
+	evidence := approveFlags.String("evidence", "", "Proof commit SHA (only with a single <ref> argument)")
+	approveFlags.Parse(os.Args[2:])
+	refArg := approveFlags.Arg(0)
+
 	cfg, err := config.LoadConfig(".herd/herd.yaml")
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to load config: %v\n", err)
@@ -1058,22 +1090,131 @@ func runApprove() {
 		os.Exit(1)
 	}
 
+	if refArg != "" {
+		want := hsync.NormalizeRef(refArg)
+		var filtered []*provider.Task
+		for _, t := range tasks {
+			if strings.EqualFold(hsync.NormalizeRef(t.Ref), want) {
+				filtered = append(filtered, t)
+			}
+		}
+		tasks = filtered
+		if len(tasks) == 0 {
+			fmt.Fprintf(os.Stderr, "no in-review card matches %s\n", want)
+			os.Exit(1)
+		}
+	} else if *evidence != "" {
+		fmt.Fprintf(os.Stderr, "--evidence needs a single <ref> argument\n")
+		os.Exit(1)
+	}
+
 	if len(tasks) == 0 {
 		fmt.Println("No tasks in review status to approve.")
 		return
 	}
 
-	task := tasks[0]
-	if err := tp.UpdateStatus(ctx, task.ID, "done"); err != nil {
-		fmt.Fprintf(os.Stderr, "failed to approve task: %v\n", err)
+	sort.SliceStable(tasks, func(i, j int) bool {
+		return provider.CompareRefs(tasks[i].Ref, tasks[j].Ref) < 0
+	})
+
+	approved, refused, failed := 0, 0, 0
+	for _, task := range tasks {
+		res, err := hsync.BoardDone(ctx, tp, ".", cfg.TaskProvider.ProjectID, task.Ref, *evidence, *force)
+		switch {
+		case err == nil:
+			fmt.Printf("APPROVED [%s]: %s\n  proof: %s\n", res.Ref, task.Title, res.Proof)
+			approved++
+		case errors.Is(err, hsync.ErrNoEvidence):
+			fmt.Printf("REFUSED  [%s]: %s\n  %v\n", task.Ref, task.Title, err)
+			refused++
+		default:
+			fmt.Fprintf(os.Stderr, "ERROR    [%s]: %v\n", task.Ref, err)
+			failed++
+		}
+	}
+
+	fmt.Printf("\nherd approve: approved=%d refused=%d failed=%d\n", approved, refused, failed)
+	if failed > 0 {
+		os.Exit(1)
+	}
+}
+
+// runBoardDone is the strict single-card gate: exit 0 only when the card
+// provably moved to done. Port of bin/herd-board-done.
+func runBoardDone() {
+	fs := flag.NewFlagSet("board-done", flag.ExitOnError)
+	evidence := fs.String("evidence", "", "Explicit proof commit SHA (must be an ancestor of origin/main)")
+	force := fs.Bool("force", false, "Override missing evidence (look at the diff first)")
+	selftestFlag := fs.Bool("selftest", false, "Run normalization/repo assertions and exit")
+	fs.Parse(os.Args[2:])
+
+	if *selftestFlag {
+		for in, want := range map[string]string{"FAC-018": "FAC-18", "FAC-648": "FAC-648", "FAC-0648": "FAC-648"} {
+			if got := hsync.NormalizeRef(in); got != want {
+				fmt.Fprintf(os.Stderr, "board-done selftest FAIL: NormalizeRef(%s)=%s want %s\n", in, got, want)
+				os.Exit(1)
+			}
+		}
+		if _, err := hsync.MergeEvidence(".", "SELFTEST-0", ""); err != nil {
+			fmt.Fprintf(os.Stderr, "board-done selftest FAIL: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Println("board-done selftest PASS")
+		return
+	}
+
+	ref := fs.Arg(0)
+	if ref == "" {
+		fmt.Fprintf(os.Stderr, "Usage: herd board-done <ref> [--evidence <sha>] [--force]\n")
+		os.Exit(2)
+	}
+
+	cfg, err := config.LoadConfig(".herd/herd.yaml")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to load config: %v\n", err)
 		os.Exit(1)
 	}
 
-	if err := tp.AddComment(ctx, task.ID, fmt.Sprintf("Approved by forge reviewer (herd approve)")); err != nil {
-		fmt.Fprintf(os.Stderr, "  warning: failed to add approval comment: %v\n", err)
+	var tp provider.TaskProvider
+	switch cfg.TaskProvider.Type {
+	case "kaneo":
+		tp = provider.NewKaneoProvider(cfg.TaskProvider.APIURL, cfg.TaskProvider.ProjectID, cfg.TaskProvider.UseCLI)
+	default:
+		tp = provider.NewMemoryProvider()
 	}
 
-	fmt.Printf("Approved [%s]: %s -> moved to done\n", task.Ref, task.Title)
+	res, err := hsync.BoardDone(context.Background(), tp, ".", cfg.TaskProvider.ProjectID, ref, *evidence, *force)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "herd board-done: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Printf("herd board-done: %s proof: %s\n", res.Ref, res.Proof)
+	fmt.Printf("herd board-done: %s is done (verified by read-back)\n", res.Ref)
+}
+
+// runShell is a thin interactive loop: each line is dispatched as a fresh
+// `herd <line>` subprocess, so every subcommand works and errors cannot kill
+// the shell.
+func runShell() {
+	fmt.Println("herd shell — type any herd subcommand ('status', 'quota', ...), 'exit' to quit")
+	scanner := bufio.NewScanner(os.Stdin)
+	fmt.Print("herd> ")
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		switch line {
+		case "":
+			fmt.Print("herd> ")
+			continue
+		case "exit", "quit":
+			return
+		}
+		cmd := exec.Command(os.Args[0], strings.Fields(line)...)
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		cmd.Stdin = os.Stdin
+		_ = cmd.Run()
+		fmt.Print("herd> ")
+	}
 }
 
 func runValidateConfig() {
@@ -1333,10 +1474,14 @@ func runForge() {
 
 	fmt.Println("\n=== Forge: Approve ===")
 	reviewTasks, err := tp.ListTasks(ctx, cfg.TaskProvider.ProjectID, "in-review")
-	if err == nil && len(reviewTasks) > 0 {
-		t := reviewTasks[0]
-		if err := tp.UpdateStatus(ctx, t.ID, "done"); err == nil {
-			fmt.Printf("Approved [%s]: %s\n", t.Ref, t.Title)
+	if err == nil {
+		for _, t := range reviewTasks {
+			res, err := hsync.BoardDone(ctx, tp, ".", cfg.TaskProvider.ProjectID, t.Ref, "", false)
+			if err != nil {
+				fmt.Printf("Not approved [%s]: %v\n", t.Ref, err)
+				continue
+			}
+			fmt.Printf("Approved [%s]: %s (proof: %s)\n", res.Ref, t.Title, res.Proof)
 		}
 	}
 
