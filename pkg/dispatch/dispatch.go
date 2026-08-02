@@ -2,6 +2,7 @@ package dispatch
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -17,7 +18,7 @@ import (
 )
 
 // LaunchStep names a partial side-effect during dispatch (FAC-121).
-// FAC-119's transactional outbox should persist these for crash recovery.
+// FAC-119's transactional outbox must persist these for crash recovery.
 type LaunchStep string
 
 const (
@@ -29,15 +30,15 @@ const (
 	StepPrompt        LaunchStep = "prompt"
 )
 
-// LaunchRecord is the narrow compensation interface expected from FAC-119
-// (lifecycle outbox) and FAC-120 (lease fencing). Dispatch does not implement
-// the durable store; it invokes these hooks so partial launches can be
-// reconciled without stranded tabs or false in-progress cards.
+// Compensator is the mandatory durable side-effect interface for production
+// dispatch (FAC-121 R3). FAC-119 lifecycle/outbox and FAC-120 lease fencing
+// implement this. Nil is rejected fail-closed — there is no best-effort path.
 type Compensator interface {
 	// RecordStep persists a successful side-effect (idempotent by step key).
+	// Errors must propagate; callers fail closed.
 	RecordStep(ctx context.Context, rec StepRecord) error
 	// Compensate undoes or marks Recovering for partial launch state.
-	// reason should be stable for outbox replay.
+	// reason should be stable for outbox replay. Errors must propagate.
 	Compensate(ctx context.Context, ticketRef, reason string) error
 }
 
@@ -56,12 +57,13 @@ type StepRecord struct {
 }
 
 // HerdrLauncher isolates herdr operations for crash-point tests (FAC-121).
+// DeliverAndProve always requires consumption proof (no verify bypass).
 type HerdrLauncher interface {
 	Available() bool
 	RequireWorkspace(repoRoot string) (string, error)
 	TabCreateForTask(workspaceID, label, cwd string, noFocus bool) (*herdr.TabInfo, error)
 	AgentStart(name, kind, paneID string, agentArgs ...string) error
-	DeliverAndProve(target, text string, verify bool, timeout time.Duration) (*herdr.PromptReceipt, error)
+	DeliverAndProve(target, text string, timeout time.Duration) (*herdr.PromptReceipt, error)
 	TabClose(tabID string) error
 	ResolveHealthyModel(ctx context.Context, primary string, fallbacks []string) (string, []herdr.ProbeResult)
 }
@@ -79,8 +81,8 @@ func (LiveHerdr) TabCreateForTask(workspaceID, label, cwd string, noFocus bool) 
 func (LiveHerdr) AgentStart(name, kind, paneID string, agentArgs ...string) error {
 	return herdr.AgentStart(name, kind, paneID, agentArgs...)
 }
-func (LiveHerdr) DeliverAndProve(target, text string, verify bool, timeout time.Duration) (*herdr.PromptReceipt, error) {
-	return herdr.DeliverAndProve(target, text, verify, timeout)
+func (LiveHerdr) DeliverAndProve(target, text string, timeout time.Duration) (*herdr.PromptReceipt, error) {
+	return herdr.DeliverAndProve(target, text, timeout)
 }
 func (LiveHerdr) TabClose(tabID string) error { return herdr.TabClose(tabID) }
 func (LiveHerdr) ResolveHealthyModel(ctx context.Context, primary string, fallbacks []string) (string, []herdr.ProbeResult) {
@@ -95,9 +97,9 @@ type DispatchOptions struct {
 	NoLaunch  bool
 	TaskShape string
 	LaneName  string
-	// VerifyPrompt when launching: poll for consumption receipt (default true).
-	// Tests may set PromptVerifyTimeout.
-	SkipPromptVerify    bool
+	// PromptVerifyTimeout bounds DeliverAndProve polling (default 60s).
+	// Production launches always require consumption proof — there is no
+	// SkipPromptVerify bypass (FAC-121 R3 repair).
 	PromptVerifyTimeout time.Duration
 }
 
@@ -117,12 +119,35 @@ type DispatchResult struct {
 	Receipt     *herdr.PromptReceipt
 }
 
+// WorktreeService is the isolation surface Dispatch uses (FAC-121).
+// *worktree.WorktreeManager is adapted via NewDispatcher; tests must inject
+// a temp-repo manager or a mock — never a manager rooted at the package cwd
+// or shared checkout (avoids herd/fac-* pollution under pkg/dispatch/.herd).
+type WorktreeService interface {
+	CreateTaskWorktreeFrom(ctx context.Context, taskRef, defaultBranch string) (*worktree.WorktreeInfo, error)
+	// RepoRoot returns the shared repository root for shared-root denial.
+	RepoRoot() string
+}
+
+// liveWorktree adapts *worktree.WorktreeManager to WorktreeService.
+type liveWorktree struct{ m *worktree.WorktreeManager }
+
+func (l liveWorktree) CreateTaskWorktreeFrom(ctx context.Context, taskRef, defaultBranch string) (*worktree.WorktreeInfo, error) {
+	return l.m.CreateTaskWorktreeFrom(ctx, taskRef, defaultBranch)
+}
+func (l liveWorktree) RepoRoot() string {
+	if l.m == nil {
+		return ""
+	}
+	return l.m.RepoRoot
+}
+
 type Dispatcher struct {
 	Config       *config.Config
 	TaskProvider provider.TaskProvider
-	Worktree     *worktree.WorktreeManager
-	// Compensator is optional; when set, launch steps and failures are recorded
-	// for FAC-119 outbox recovery. Nil means best-effort local compensation only.
+	Worktree     WorktreeService
+	// Compensator is required for every Dispatch call (FAC-121 R3).
+	// Wire FAC-119 durable outbox / FAC-120 fenced lease compensator here.
 	Compensator Compensator
 	// Herdr is optional; defaults to LiveHerdr.
 	Herdr HerdrLauncher
@@ -134,7 +159,7 @@ func NewDispatcher(cfg *config.Config, tp provider.TaskProvider, wm *worktree.Wo
 	return &Dispatcher{
 		Config:       cfg,
 		TaskProvider: tp,
-		Worktree:     wm,
+		Worktree:     liveWorktree{m: wm},
 		Herdr:        LiveHerdr{},
 	}
 }
@@ -146,21 +171,48 @@ func (d *Dispatcher) launcher() HerdrLauncher {
 	return LiveHerdr{}
 }
 
-func (d *Dispatcher) record(ctx context.Context, rec StepRecord) {
+// requireCompensator fails closed when durable outbox hooks are missing.
+func (d *Dispatcher) requireCompensator() error {
 	if d.Compensator == nil {
-		return
+		return fmt.Errorf("dispatch compensator is required (FAC-121 fail-closed; wire FAC-119 durable outbox / FAC-120 fencing — nil compensator is not allowed on the production path)")
 	}
-	_ = d.Compensator.RecordStep(ctx, rec)
+	return nil
 }
 
-func (d *Dispatcher) compensate(ctx context.Context, ticketRef, reason string) {
-	if d.Compensator == nil {
-		return
+func (d *Dispatcher) record(ctx context.Context, rec StepRecord) error {
+	if err := d.requireCompensator(); err != nil {
+		return err
 	}
-	_ = d.Compensator.Compensate(ctx, ticketRef, reason)
+	if err := d.Compensator.RecordStep(ctx, rec); err != nil {
+		return fmt.Errorf("durable RecordStep(%s) failed: %w", rec.Step, err)
+	}
+	return nil
+}
+
+func (d *Dispatcher) compensate(ctx context.Context, ticketRef, reason string) error {
+	if err := d.requireCompensator(); err != nil {
+		return err
+	}
+	if err := d.Compensator.Compensate(ctx, ticketRef, reason); err != nil {
+		return fmt.Errorf("durable Compensate(%s) failed: %w", reason, err)
+	}
+	return nil
+}
+
+// failWithCompensate runs compensation and joins any compensate error with primary.
+func (d *Dispatcher) failWithCompensate(ctx context.Context, ticketRef, reason string, primary error) error {
+	if cErr := d.compensate(ctx, ticketRef, reason); cErr != nil {
+		return errors.Join(primary, cErr)
+	}
+	return primary
 }
 
 func (d *Dispatcher) Dispatch(ctx context.Context, opts DispatchOptions) (*DispatchResult, error) {
+	// Fail closed before any side effect when durable hooks are missing.
+	if err := d.requireCompensator(); err != nil {
+		return nil, err
+	}
+
 	// 1. Fetch ticket from Kaneo
 	tasks, err := d.TaskProvider.ListTasks(ctx, d.Config.TaskProvider.ProjectID, "")
 	if err != nil {
@@ -202,58 +254,67 @@ func (d *Dispatcher) Dispatch(ctx context.Context, opts DispatchOptions) (*Dispa
 	// 3. Create worktree from immutable origin/<defaultBranch> (FAC-121).
 	// Branch name is whatever Git actually created — never overwrite with a
 	// fictional task/<slug> packet alias.
+	if d.Worktree == nil {
+		return nil, fmt.Errorf("dispatch worktree service is required")
+	}
 	wtInfo, err := d.Worktree.CreateTaskWorktreeFrom(ctx, task.Ref, defaultBranch)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create worktree: %w", err)
 	}
-	if err := worktree.RejectSharedRoot(d.Worktree.RepoRoot, wtInfo.Path); err != nil {
-		return nil, err
+	if err := worktree.RejectSharedRoot(d.Worktree.RepoRoot(), wtInfo.Path); err != nil {
+		return nil, d.failWithCompensate(ctx, task.Ref, "shared_root_denied", err)
 	}
 	branch := wtInfo.Branch
 	if branch == "" {
 		return nil, fmt.Errorf("worktree created without a Git branch; refusing fictional packet branch")
 	}
 
-	d.record(ctx, StepRecord{
+	if err := d.record(ctx, StepRecord{
 		TicketRef: task.Ref,
 		Step:      StepWorktree,
 		Worktree:  wtInfo.Path,
 		Branch:    branch,
 		BaseSHA:   wtInfo.BaseSHA,
 		AnchorRef: wtInfo.AnchorRef,
-	})
+	}); err != nil {
+		return nil, err
+	}
 
 	// 4. Flip ticket to in-progress (partial: compensator marks Recovering on later failure)
 	if err := d.TaskProvider.UpdateStatus(ctx, task.ID, "in-progress"); err != nil {
 		return nil, fmt.Errorf("failed to update ticket status: %w", err)
 	}
-	d.record(ctx, StepRecord{
+	if err := d.record(ctx, StepRecord{
 		TicketRef: task.Ref,
 		Step:      StepBoardProgress,
 		Worktree:  wtInfo.Path,
 		Branch:    branch,
 		BaseSHA:   wtInfo.BaseSHA,
 		AnchorRef: wtInfo.AnchorRef,
-	})
+	}); err != nil {
+		return nil, d.failWithCompensate(ctx, task.Ref, "record_board_progress_failed", err)
+	}
 
 	// 5. Comment with actual Git branch + base (not a fictional name)
 	comment := fmt.Sprintf("Dispatched to worktree %s on branch %s (base %s anchor %s)",
 		wtInfo.Path, branch, wtInfo.BaseSHA, wtInfo.AnchorRef)
 	if err := d.TaskProvider.AddComment(ctx, task.ID, comment); err != nil {
-		d.compensate(ctx, task.Ref, "board_comment_failed")
-		return nil, fmt.Errorf("failed to add comment: %w", err)
+		return nil, d.failWithCompensate(ctx, task.Ref, "board_comment_failed",
+			fmt.Errorf("failed to add comment: %w", err))
 	}
-	d.record(ctx, StepRecord{
+	if err := d.record(ctx, StepRecord{
 		TicketRef: task.Ref,
 		Step:      StepBoardComment,
 		Worktree:  wtInfo.Path,
 		Branch:    branch,
-	})
+	}); err != nil {
+		return nil, d.failWithCompensate(ctx, task.Ref, "record_board_comment_failed", err)
+	}
 
 	// 6. Preflight in worktree
 	if err := preflight.CheckWorktreeBoundary(wtInfo.Path); err != nil {
-		d.compensate(ctx, task.Ref, "preflight_failed")
-		return nil, fmt.Errorf("preflight failed in worktree: %w", err)
+		return nil, d.failWithCompensate(ctx, task.Ref, "preflight_failed",
+			fmt.Errorf("preflight failed in worktree: %w", err))
 	}
 
 	// 7. Write TASK-PACKET.md — packet branch MUST equal Git branch
@@ -265,8 +326,8 @@ func (d *Dispatcher) Dispatch(ctx context.Context, opts DispatchOptions) (*Dispa
 	packet := buildTaskPacket(task, wtInfo.Path, branch, rolePath, lane)
 	packetPath := filepath.Join(wtInfo.Path, "TASK-PACKET.md")
 	if err := os.WriteFile(packetPath, []byte(packet), 0644); err != nil {
-		d.compensate(ctx, task.Ref, "task_packet_write_failed")
-		return nil, fmt.Errorf("failed to write task packet: %w", err)
+		return nil, d.failWithCompensate(ctx, task.Ref, "task_packet_write_failed",
+			fmt.Errorf("failed to write task packet: %w", err))
 	}
 
 	result := &DispatchResult{
@@ -300,16 +361,19 @@ func (d *Dispatcher) launch(
 	branch, packet string,
 	result *DispatchResult,
 ) error {
+	if err := d.requireCompensator(); err != nil {
+		return err
+	}
+
 	h := d.launcher()
 	tabLabel := fmt.Sprintf("task-%s", strings.ToLower(task.Ref))
 	if len(tabLabel) > 32 {
 		tabLabel = tabLabel[:32]
 	}
 
-	// Shared-root denial before any write-capable agent starts.
-	if err := worktree.RejectSharedRoot(d.Worktree.RepoRoot, wtInfo.Path); err != nil {
-		d.compensate(ctx, task.Ref, "shared_root_denied")
-		return err
+	// Shared-root denial before any write-capable agent starts (production guard).
+	if err := worktree.RejectSharedRoot(d.Worktree.RepoRoot(), wtInfo.Path); err != nil {
+		return d.failWithCompensate(ctx, task.Ref, "shared_root_denied", err)
 	}
 
 	model, trail := h.ResolveHealthyModel(ctx, lane.Model, lane.FallbackModels)
@@ -318,27 +382,27 @@ func (d *Dispatcher) launch(
 		for _, p := range trail {
 			fmt.Fprintf(&b, "\n  %s: %s", p.Model, p.Reason)
 		}
-		d.compensate(ctx, task.Ref, "no_healthy_model")
-		return fmt.Errorf("no healthy model for lane %q — every candidate is exhausted:%s", lane.Name, b.String())
+		return d.failWithCompensate(ctx, task.Ref, "no_healthy_model",
+			fmt.Errorf("no healthy model for lane %q — every candidate is exhausted:%s", lane.Name, b.String()))
 	}
 	result.Model = model
 
 	// Explicit workspace — never hardcoded "wF".
-	ws, err := h.RequireWorkspace(d.Worktree.RepoRoot)
+	ws, err := h.RequireWorkspace(d.Worktree.RepoRoot())
 	if err != nil {
-		d.compensate(ctx, task.Ref, "workspace_unknown")
-		return fmt.Errorf("worktree ready but herdr workspace unresolved: %w", err)
+		return d.failWithCompensate(ctx, task.Ref, "workspace_unknown",
+			fmt.Errorf("worktree ready but herdr workspace unresolved: %w", err))
 	}
 
 	// Tab with exact task worktree as process cwd.
 	tab, err := h.TabCreateForTask(ws, tabLabel, wtInfo.Path, true)
 	if err != nil {
-		d.compensate(ctx, task.Ref, "tab_create_failed")
-		return fmt.Errorf("worktree ready but failed to launch agent: %w", err)
+		return d.failWithCompensate(ctx, task.Ref, "tab_create_failed",
+			fmt.Errorf("worktree ready but failed to launch agent: %w", err))
 	}
 	result.TabID = tab.ID
 	result.AgentName = tabLabel
-	d.record(ctx, StepRecord{
+	if err := d.record(ctx, StepRecord{
 		TicketRef: task.Ref,
 		Step:      StepTab,
 		Worktree:  wtInfo.Path,
@@ -346,15 +410,18 @@ func (d *Dispatcher) launch(
 		TabID:     tab.ID,
 		PaneID:    tab.Pane.ID,
 		AgentName: tabLabel,
-	})
+	}); err != nil {
+		_ = h.TabClose(tab.ID)
+		return d.failWithCompensate(ctx, task.Ref, "record_tab_failed", err)
+	}
 
 	if err := h.AgentStart(tabLabel, lane.AgentKind, tab.Pane.ID, herdr.LaneAgentArgs(model)...); err != nil {
 		// Compensate: close orphan tab so failed start leaves no session.
 		_ = h.TabClose(tab.ID)
-		d.compensate(ctx, task.Ref, "agent_start_failed")
-		return fmt.Errorf("worktree ready but agent start failed: %w", err)
+		return d.failWithCompensate(ctx, task.Ref, "agent_start_failed",
+			fmt.Errorf("worktree ready but agent start failed: %w", err))
 	}
-	d.record(ctx, StepRecord{
+	if err := d.record(ctx, StepRecord{
 		TicketRef: task.Ref,
 		Step:      StepAgentStart,
 		Worktree:  wtInfo.Path,
@@ -362,9 +429,12 @@ func (d *Dispatcher) launch(
 		TabID:     tab.ID,
 		PaneID:    tab.Pane.ID,
 		AgentName: tabLabel,
-	})
+	}); err != nil {
+		_ = h.TabClose(tab.ID)
+		return d.failWithCompensate(ctx, task.Ref, "record_agent_start_failed", err)
+	}
 
-	verify := !opts.SkipPromptVerify
+	// Always prove consumption — no production SkipPromptVerify bypass.
 	timeout := opts.PromptVerifyTimeout
 	if timeout == 0 {
 		timeout = d.PromptVerifyTimeout
@@ -373,26 +443,36 @@ func (d *Dispatcher) launch(
 		timeout = 60 * time.Second
 	}
 
-	receipt, err := h.DeliverAndProve(tabLabel, packet, verify, timeout)
+	receipt, err := h.DeliverAndProve(tabLabel, packet, timeout)
 	result.Receipt = receipt
 	if err != nil {
 		_ = h.TabClose(tab.ID)
-		d.compensate(ctx, task.Ref, "prompt_delivery_failed")
-		return fmt.Errorf("worktree ready but prompt consumption not proven: %w", err)
+		return d.failWithCompensate(ctx, task.Ref, "prompt_delivery_failed",
+			fmt.Errorf("worktree ready but prompt consumption not proven: %w", err))
 	}
-	seq := ""
-	if receipt != nil {
-		seq = receipt.SequenceToken
+	if receipt == nil || !receipt.Consumed || !receipt.Verified {
+		_ = h.TabClose(tab.ID)
+		return d.failWithCompensate(ctx, task.Ref, "prompt_receipt_invalid",
+			fmt.Errorf("worktree ready but prompt receipt did not prove consumption"))
 	}
-	d.record(ctx, StepRecord{
+	if !herdr.ConsumptionProven(receipt.BaselineStatus, receipt.FinalStatus) {
+		_ = h.TabClose(tab.ID)
+		return d.failWithCompensate(ctx, task.Ref, "prompt_sequence_invalid",
+			fmt.Errorf("prompt receipt sequence %q is not a valid consumption proof", receipt.SequenceToken))
+	}
+
+	if err := d.record(ctx, StepRecord{
 		TicketRef: task.Ref,
 		Step:      StepPrompt,
 		Worktree:  wtInfo.Path,
 		Branch:    branch,
 		TabID:     tab.ID,
 		AgentName: tabLabel,
-		Receipt:   seq,
-	})
+		Receipt:   receipt.SequenceToken,
+	}); err != nil {
+		_ = h.TabClose(tab.ID)
+		return d.failWithCompensate(ctx, task.Ref, "record_prompt_failed", err)
+	}
 	result.Launched = true
 	return nil
 }

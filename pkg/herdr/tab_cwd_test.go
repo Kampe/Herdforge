@@ -52,31 +52,30 @@ func TestTabCreate_PassesCwdAndWorkspace(t *testing.T) {
 	}
 }
 
-func TestDeliverAndProve_UnverifiedSubmit(t *testing.T) {
-	defer func(old func(args ...string) (string, error)) { runHerdr = old }(runHerdr)
-
-	runHerdr = func(args ...string) (string, error) {
-		if len(args) >= 2 && args[0] == "agent" && args[1] == "list" {
-			return `{"result":{"agents":[{"name":"task-fac-1","agent_status":"idle","pane_id":"p1"}]}}`, nil
+func TestConsumptionProven(t *testing.T) {
+	cases := []struct {
+		baseline, observed string
+		want               bool
+	}{
+		{"idle", "working", true},
+		{"idle", "done", true},
+		{"", "working", true},
+		{"", "done", true},
+		{"working", "done", true},
+		{"done", "working", true},
+		// R3: same-state sequences are not consumption proof
+		{"working", "working", false},
+		{"done", "done", false},
+		{"idle", "idle", false},
+		{"working", "idle", false},
+		{"idle", "blocked", false},
+		{"", "idle", false},
+	}
+	for _, c := range cases {
+		got := ConsumptionProven(c.baseline, c.observed)
+		if got != c.want {
+			t.Errorf("ConsumptionProven(%q, %q) = %v, want %v", c.baseline, c.observed, got, c.want)
 		}
-		if len(args) >= 2 && args[0] == "agent" && args[1] == "prompt" {
-			return "ok", nil
-		}
-		return "", errors.New("unexpected " + strings.Join(args, " "))
-	}
-
-	rec, err := DeliverAndProve("task-fac-1", "do work", false, time.Second)
-	if err != nil {
-		t.Fatalf("DeliverAndProve: %v", err)
-	}
-	if !rec.Consumed || rec.Verified {
-		t.Fatalf("receipt: %+v", rec)
-	}
-	if rec.BaselineStatus != "idle" {
-		t.Fatalf("baseline = %q", rec.BaselineStatus)
-	}
-	if rec.SequenceToken != "idle->submitted" {
-		t.Fatalf("sequence = %q", rec.SequenceToken)
 	}
 }
 
@@ -100,12 +99,69 @@ func TestDeliverAndProve_VerifiedConsumption(t *testing.T) {
 		return "", nil
 	}
 
-	rec, err := DeliverAndProve("task-fac-1", "BUILD FAC-1", true, 5*time.Second)
+	rec, err := DeliverAndProve("task-fac-1", "BUILD FAC-1", 5*time.Second)
 	if err != nil {
 		t.Fatalf("DeliverAndProve: %v", err)
 	}
 	if !rec.Consumed || !rec.Verified || rec.FinalStatus != "working" {
 		t.Fatalf("receipt: %+v", rec)
+	}
+	if rec.SequenceToken != "idle->working" {
+		t.Fatalf("sequence = %q", rec.SequenceToken)
+	}
+}
+
+func TestDeliverAndProve_WorkingToWorkingRejected(t *testing.T) {
+	defer func(old func(args ...string) (string, error)) { runHerdr = old }(runHerdr)
+
+	runHerdr = func(args ...string) (string, error) {
+		if len(args) >= 2 && args[0] == "agent" && args[1] == "list" {
+			// Already working; stays working — cannot prove a new prompt was consumed.
+			return `{"result":{"agents":[{"name":"task-fac-1","agent_status":"working","pane_id":"p1"}]}}`, nil
+		}
+		if len(args) >= 2 && args[0] == "agent" && args[1] == "prompt" {
+			return "ok", nil
+		}
+		if len(args) >= 2 && args[0] == "agent" && args[1] == "send-keys" {
+			return "ok", nil
+		}
+		return "", nil
+	}
+
+	rec, err := DeliverAndProve("task-fac-1", "BUILD AGAIN", 3*time.Second)
+	if err == nil {
+		t.Fatal("working→working must not prove consumption")
+	}
+	if rec == nil || rec.Consumed {
+		t.Fatalf("must not claim consumed: %+v", rec)
+	}
+	if rec.BaselineStatus != "working" || rec.FinalStatus != "working" {
+		t.Fatalf("expected working→working receipt, got %+v", rec)
+	}
+	if !strings.Contains(err.Error(), "working→working") && !strings.Contains(err.Error(), "not proof") {
+		t.Fatalf("error should cite non-proof sequence: %v", err)
+	}
+}
+
+func TestDeliverAndProve_DoneToDoneRejected(t *testing.T) {
+	defer func(old func(args ...string) (string, error)) { runHerdr = old }(runHerdr)
+
+	runHerdr = func(args ...string) (string, error) {
+		if len(args) >= 2 && args[0] == "agent" && args[1] == "list" {
+			return `{"result":{"agents":[{"name":"t","agent_status":"done"}]}}`, nil
+		}
+		if len(args) >= 2 && args[0] == "agent" && args[1] == "prompt" {
+			return "ok", nil
+		}
+		if len(args) >= 2 && args[0] == "agent" && args[1] == "send-keys" {
+			return "ok", nil
+		}
+		return "", nil
+	}
+
+	rec, err := DeliverAndProve("t", "x", 3*time.Second)
+	if err == nil || rec == nil || rec.Consumed {
+		t.Fatalf("done→done must fail; rec=%+v err=%v", rec, err)
 	}
 }
 
@@ -122,7 +178,7 @@ func TestDeliverAndProve_PromptFailure(t *testing.T) {
 		return "", errors.New("unexpected")
 	}
 
-	rec, err := DeliverAndProve("t", "x", false, time.Second)
+	rec, err := DeliverAndProve("t", "x", time.Second)
 	if err == nil {
 		t.Fatal("expected prompt error")
 	}
