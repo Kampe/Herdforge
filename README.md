@@ -1,180 +1,178 @@
 # Herdforge
 
-**Herdforge** is a self-forging multi-agent orchestration daemon — it writes its own code, claims its own Kanban cards, spawns AI agents to work them, and moves them through review. Written in Go.
+Herdforge is a Go control plane for turning repository work queues into isolated implementation, deterministic verification, independent review, serialized integration, and reconciled board state. It uses Herdr as the agent execution plane and supports pluggable task providers such as Kaneo.
 
 [![CI Workflow](https://github.com/Kampe/Herdforge/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Kampe/Herdforge/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
----
+## Project status
 
-## The Loop
+Herdforge is actively self-hosting, but it is not yet an unattended merge authority. The current CLI has working primitives for provider access, deterministic selection, Herdr delivery, worktrees, verification, review evidence, fleet inspection, and board reconciliation. The durable end-to-end lifecycle is still under construction.
 
-Herdforge runs a self-reinforcing cycle using three standing agent lanes in [herdr](https://github.com/mariozechner/herdr) terminal workspaces:
+Use the current commands as assisted operations and keep integration visible to an operator. In particular, do not assume that `herd daemon` or the experimental one-shot `herd forge` command currently enforces every target gate.
 
-```
-┌─────────────┐     ┌─────────────┐     ┌─────────────┐
-│ forge-smith │────▶│   worker    │────▶│  reviewer   │
-│ (planner)   │     │ (builder)   │     │ (auditor)   │
-└─────────────┘     └─────────────┘     └─────────────┘
-       │                    │                    │
-       └──────────┬─────────┴─────────┬──────────┘
-                  ▼                   ▼
-           Kaneo Kanban         GitHub repo
-        (cards flow: to-do →   (worktrees →
-         in-progress → review →  commits → push)
-         done)
+- [Target workflow and fleet contract](docs/architecture/TARGET-WORKFLOW.md)
+- [Architecture and fleet audit — 2026-08-02](docs/architecture/AUDIT-2026-08-02.md)
+- [Technical implementation guide](docs/architecture/AGENT-IMPLEMENTATION-GUIDE.md)
+
+## The intended loop
+
+```text
+groom → claim/lease → isolated dispatch → commit → verify
+      → different-family review → serialized integration
+      → origin/main proof → board reconciliation → cleanup → backfill
 ```
 
-1. **`herd standing`** — Spawns all three agents as named opencode sessions in herdr (`forge-forge-smith`, `forge-worker`, `forge-reviewer`)
-2. **`herd pulse --role <role> --spawn`** — Polls the Kaneo board, claims the highest-priority `to-do` matching the role, and delivers a structured task packet to the standing agent
-3. **Worker agent** — Receives ref/title/description/worktree path, implements the change, commits
-4. **`herd review --spawn`** — Finds `in-progress` cards, dispatches a review packet to `forge-reviewer`, moves card to `review` status
-5. **`herd approve`** — Finds `review` status cards and moves them to `done`
-6. **`herd forge`** — Runs the full cycle in one shot: pulse + review + approve
+Every arrow is an idempotent, evidence-backed state transition. The board is an operator view, while Git revisions, verification artifacts, review ledger records, claim leases, and delivery receipts form the execution evidence.
 
-Everything runs on `deepseek-v4-flash` via opencode — cheap enough to keep all three agents running continuously.
+“No idle work” means that eligible work is backfilled immediately when safe capacity exists. It does not mean dispatching vague cards, exceeding review capacity, reusing the shared checkout, or weakening model-family independence.
 
-### Self-Replication
+## Herdforge and Herdr
 
-The forge can clone itself:
+Herdforge owns repository policy:
 
-```bash
-herd clone https://github.com/Kampe/Herdforge.git
-cd Herdforge
-herd standing    # launches all 3 agents
-herd forge       # runs the full pulse → review → approve cycle
-```
+- task eligibility, role matching, dependency checks, and deterministic order;
+- claims, leases, task worktrees, and revision identity;
+- verification, review, integration, and board reconciliation;
+- recovery policy and audit history.
 
-After cloning, link to your Kaneo project:
-```bash
-kaneo link -w <workspace> -p <project>
-```
+Herdr owns portable process mechanics:
 
----
+- agent sessions and terminal addressing;
+- prompt delivery and consumption;
+- provider/model availability and quota posture;
+- process attention, interruption, and cleanup signals.
+
+The project deliberately composes with Herdr instead of copying every Chainseer shell behavior into Go.
+
+## Fleet roles
+
+The target fleet is not a fixed three-agent conveyor belt. Control roles may be standing; task roles should normally be ephemeral and bound to one task/revision.
+
+| Role | Purpose |
+| --- | --- |
+| Orchestrator | coordinates capacity and state transitions; does not author, review, or merge |
+| Scout-planner | grooms the queue, identifies dependencies, and proposes deterministic eligible work |
+| Worker | implements a bounded task in an owned worktree |
+| Smith | handles larger or higher-risk implementation in an owned worktree |
+| Verification gate | runs deterministic checks and records evidence for an exact SHA |
+| Reviewer | performs read-only, different-family review of an exact SHA |
+| Review supervisor | moves completed candidates through verification and review queues |
+| Harvest/integration owner | serializes approved merges, reconciles the board, and cleans exact resources |
+| Recovery sentinel | detects lost callbacks, stale leases, root bleed, and stranded work |
+
+Spawn-ready prompt contracts are in `.herd/prompts/`. Runtime model selection belongs to routing policy; author and reviewer must not be pinned to the same model family for R1–R3 work.
 
 ## Requirements
 
-- **Go 1.24+**
-- **Git**
-- **herdr** — terminal workspace manager (`brew install herdr` or `npm install -g herdr`)
-- **(Optional) Kaneo** — kanban board at `kanban.kampe.kluster` for task tracking
+- Go 1.24 or newer
+- Git
+- Herdr
+- a configured task-provider CLI or API; Kaneo is the primary current adapter
 
----
-
-## Quickstart
+## Build and inspect
 
 ```bash
-# Build & test
-go build ./...
-go test ./...
+make ci
+make build
+./bin/herd status
+./bin/herd --help
+```
 
-# Clone Herdforge (self-replication)
-herd clone https://github.com/Kampe/Herdforge.git
-cd Herdforge
+`make ci` is the repository’s hermetic pre-push gate. It runs `go vet`, the full unit suite, and repo-boundary preflight without depending on user Git signing configuration.
 
-# Or seed config in an existing repo
+## Repository setup
+
+In a repository that will be managed by Herdforge:
+
+```bash
 herd init --full
+kaneo link -w <workspace-id> -p <project-id>
+herd validate-config
+herd preflight
+```
 
-# Launch all agent lanes
-herd standing
+Review the generated `.herd/herd.yaml` and prompts before launching agents. A dispatchable board card needs acceptance criteria, a role mapping, dependency state, risk information, and operator-owned priority.
 
-# Claim & dispatch a task to a standing agent
+## Assisted operation
+
+Useful read-only and bounded commands include:
+
+```bash
+herd status
+herd next
+herd attention
+herd resources
+herd throughput
+herd worktrees
+herd overlap
+herd unmerged --all
+herd board-sync
+```
+
+Task operations should be run with their help output and target evidence checked explicitly:
+
+```bash
 herd pulse --role worker --spawn
-
-# Review in-progress work
+herd dispatch FAC-123
 herd review --spawn
-
-# Approve reviewed work
-herd approve
-
-# Full cycle in one shot
-herd forge
-
-# Inspect agent status
-herdr agent list
-herdr agent read forge-worker --source recent --lines 20
+herd board-done FAC-123
 ```
 
----
+The exact command surface is evolving quickly while the Chainseer workflow is ported. `herd --help` is authoritative for the binary at the checked-out revision.
 
-## Configuration (`.herd/herd.yaml`)
+## Board lifecycle
 
-```yaml
-version: "1"
+Provider status names normalize to:
 
-project:
-  name: "Herdforge"
-  default_branch: "main"
-
-task_provider:
-  type: "kaneo"           # kaneo | memory
-  project_id: "your-project-id"
-  use_cli: true            # use kaneo CLI (no API key needed)
-
-lanes:
-  - name: "forge-smith"
-    role: "forge-smith"
-    agent_kind: "opencode"
-    prompt: ".herd/prompts/smith.md"
-    worktree: ".worktrees/smith"
-    model: "deepseek-v4-flash"
-
-  - name: "worker"
-    role: "worker"
-    agent_kind: "opencode"
-    prompt: ".herd/prompts/worker.md"
-    worktree: ".worktrees/worker"
-    model: "deepseek-v4-flash"
-
-  - name: "reviewer"
-    role: "reviewer"
-    agent_kind: "opencode"
-    prompt: ".herd/prompts/reviewer.md"
-    worktree: ".worktrees/reviewer"
-    model: "deepseek-v4-flash"
+```text
+to-do → in-progress → in-review → done
 ```
 
----
+Those columns are not sufficient evidence by themselves:
 
-## CLI Commands
+- `to-do` is eligible only after grooming and dependency checks;
+- `in-progress` means a live claim/lease, not that an agent merely received text;
+- `in-review` requires a committed candidate and passing verification receipt;
+- `done` requires proof on `origin/main` and provider readback.
 
-| Command | Description |
-|---------|-------------|
-| `herd init` | Scaffold `.herd/herd.yaml` and lane prompts |
-| `herd init --full` | Scaffold full 3-lane forge config (smith, worker, reviewer) |
-| `herd clone <url> [dir]` | Clone a Herdforge repo and bootstrap the forge |
-| `herd preflight` | Check for repo-relative path violations |
-| `herd status` | Show project, provider, and lane config |
-| `herd standing` | Launch all lane agents in herdr tabs |
-| `herd pulse --role <r> --spawn` | Claim next `to-do` task, route to standing agent |
-| `herd review --spawn` | Claim `in-progress` tasks for reviewer, move to `review` status |
-| `herd approve` | Move `review`-status cards to `done` |
-| `herd forge` | Full cycle: pulse + review + approve |
-| `herd up <lane-name>` | Start a single lane agent |
-| `herd selftest` | Run the self-test suite |
+Unknown provider state, failed delivery, stale review SHA, same-family review, dirty shared checkout, or missing merge evidence must stop the transition.
 
----
+## Configuration
 
-## How Cards Flow
+The repository-local config lives at `.herd/herd.yaml` and describes the project, task provider, lanes, routing candidates, and verification commands. Paths stored in configuration and generated artifacts must remain repository-relative.
 
-1. Cards in Kaneo with `status: to-do` are candidates
-2. `herd pulse` sorts by `priority DESC, ref ASC` and claims the top match
-3. The card is moved to `in-progress` via the task provider
-4. A structured task packet (ref, title, description, worktree path, workflow steps) is delivered to the standing agent
-5. The agent works the task, commits, and signals completion
-6. `herd review --spawn` picks up `in-progress` cards, dispatches a review packet to the reviewer agent, moves card to `review`
-7. `herd approve` finds `review`-status cards and moves them to `done`
-8. The next `herd forge` or `herd pulse` picks up the next card from `to-do`
+Do not treat the model on a lane as permanent identity. Routing must distinguish:
 
----
+- execution harness/backend;
+- provider account or quota pool;
+- concrete model;
+- model family used for review independence;
+- tool and write capability proven by probes.
 
-## Self-Forging Architecture
+Run `herd init --full` to generate a schema-compatible starting point, then review it against the checked-out binary with `herd validate-config`.
 
-Herdforge uses itself to build itself. Every package in the [ownership grid](AGENTS.md#2-complete-package-ownership-grid-30-packages) can be developed by a worker agent spawned from `herd pulse`, reviewed by a reviewer agent, and merged — all while the forge runs on cheap local inference (deepseek-v4-flash via opencode).
+## Safety invariants
 
-There are no API keys required for Kaneo when `use_cli: true` — the `kaneo` CLI handles authentication via its configured config file.
+- Agents work only in their assigned task worktree; the shared checkout is coordinator/integration-only.
+- Claims and lifecycle transitions fail closed and are idempotent.
+- Every candidate is identified by an immutable commit SHA and protected ref.
+- Verification cannot pass vacuously; required negative assertions must be shown to fail under regression.
+- R1–R3 work is reviewed by a different model family from the author.
+- Only one integration owner mutates the default branch at a time.
+- Board `done` follows `origin/main` proof, never pane or branch state.
+- Unique dirty or committed work is never removed during cleanup.
 
----
+## Development
+
+```bash
+make preflight
+make lint
+make test-unit
+make ci
+```
+
+Changes follow Conventional Commits and the binding rules in [AGENTS.md](AGENTS.md). Inspect the code graph with the `code-review-graph` CLI before broad source scanning.
 
 ## License
 

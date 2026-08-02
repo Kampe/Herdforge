@@ -1,77 +1,98 @@
-# RFC-001: Herdforge Daemon Architecture & CLI Specification
+# RFC-001: Herdforge Durable Daemon and CLI
 
-- **Status**: Draft
-- **Authors**: Kampe & Antigravity (DeepMind Advanced Agentic Coding)
-- **Target Repo**: `Herdforge`
+- Status: Draft; direction accepted, end-to-end implementation incomplete
+- Target repository: Herdforge
+- Normative detail: [Target Workflow](../architecture/TARGET-WORKFLOW.md)
 
----
+## Summary
 
-## Executive Summary
+Herdforge is a compiled, repo-agnostic control plane that advances work from a task provider through isolated implementation, deterministic verification, independent review, serialized integration, and reconciled completion. Herdr supplies agent-session execution, delivery, provider/quota visibility, and process lifecycle.
 
-Herdforge is a compiled, repo-agnostic multi-agent orchestration daemon and CLI tool (`herd`). It automates software development workflows across any Git repository by coordinating task queues (Kaneo, GitHub Issues, Linear), isolating worker execution into ephemeral Git worktrees, routing LLM requests dynamically across AI providers, executing test verification harnesses, and orchestrating independent cross-model review pipelines before git rebase-merging.
+The daemon must be a durable event and reconciliation engine. It is not merely a timer that moves cards between columns.
 
----
+## Goals
 
-## 1. System Components
+- Harvest every groomed, dependency-clear task whenever compatible capacity is safely available.
+- Prevent duplicate claims and stale callbacks across processes and restarts.
+- Bind dispatch, verification, review, and integration to an immutable candidate SHA.
+- Require different-model-family review for R1–R3 changes.
+- Recover every partial transition idempotently after crash or external failure.
+- Support multiple task providers without embedding one provider’s CLI semantics in the engine.
+- Keep the default branch and shared checkout under one serialized integration owner.
 
-### 1.1 `herd.yaml` Configuration Schema
-The root configuration file (`.herd/herd.yaml`) defines project worker roles, model providers, verification test commands, and task queue credentials.
+## Non-goals
 
-```yaml
-version: "1"
-project:
-  name: "my-app"
-  default_branch: "main"
+- Reimplementing Herdr terminal, quota, or execution-surface mechanics.
+- Porting every Chainseer script byte for byte.
+- Treating a Kanban column as the authoritative transaction log.
+- Keeping builders busy by bypassing grooming, review pressure, resource gates, or isolation.
 
-task_provider:
-  type: "kaneo" # kaneo | github | linear
-  project_id: "b939c5jzixruza3vvywrg1hs"
-  api_url: "https://kanban-api.kampe.kluster"
+## Architecture
 
-model_providers:
-  - name: "claude-pro"
-    type: "anthropic"
-    model: "claude-3-7-sonnet"
-  - name: "gemini-flash"
-    type: "google"
-    model: "gemini-2.5-flash"
-  - name: "codex-local"
-    type: "openai"
-    model: "gpt-4o"
+The daemon coordinates these durable services:
 
-roles:
-  - name: "builder"
-    provider: "claude-pro"
-    fallback_provider: "gemini-flash"
-    prompt_path: ".herd/prompts/builder.md"
-  - name: "reviewer"
-    provider: "gemini-flash"
-    fallback_provider: "codex-local"
-    prompt_path: ".herd/prompts/reviewer.md"
+1. provider normalization and eligibility planning;
+2. atomic claim leases and capacity tokens;
+3. append-only events and transactional outbox;
+4. immutable-base task worktrees and cwd-bound Herdr dispatch;
+5. completion callbacks and deterministic verification;
+6. risk classification and exact-SHA independent review;
+7. single-writer integration, post-merge gates, and origin proof;
+8. board reconciliation and exact resource cleanup;
+9. settle-driven recovery plus periodic safety reconciliation.
 
-verification:
-  test_command: "npm test"
-  preflight_command: "bin/agent-preflight"
+Each task transition carries an idempotency key and expected prior state. A provider error, error-bearing success body, failed receipt, unknown family, stale revision, or mismatched readback stops advancement.
+
+## Event model
+
+Events are append-only and sequenced per task:
+
+```text
+task.discovered
+task.eligible
+claim.acquired
+dispatch.started
+dispatch.consumed
+candidate.reported
+verification.passed | verification.failed
+review.requested
+review.passed | review.failed | review.blocked
+integration.started
+integration.passed | integration.failed
+board.reconciled
+resources.cleaned
+recovery.required | recovery.completed
 ```
 
----
+Every event includes repository, task ref, lease generation, actor role, timestamp, and the revision/evidence identities relevant to that stage. Consumers ignore duplicates and reject stale lease generations.
 
-## 2. CLI Interface (`herd`)
+## Scheduler
 
-- `herd init`: Scaffolds `.herd/herd.yaml` and default prompts.
-- `herd daemon`: Runs the background reactive event loop and state manager.
-- `herd status`: Displays the interactive Terminal UI (TUI) live fleet dashboard.
-- `herd claim`: Claims next prioritized task from the task queue.
-- `herd verify`: Runs the project-native test harness and AST checks.
-- `herd review`: Dispatches independent cross-model code review.
-- `herd harvest`: Rebase-merges approved feature branches into default branch.
+The primary trigger is an event: completion, failure, capacity release, quota change, board change, or integration. A settle-driven watcher batches noisy changes. A slower periodic sweep reconciles lost events and external drift.
 
----
+The scheduler fills verifier and reviewer capacity before creating excess builder pressure, honors resource/budget/review caps, then backfills from eligible tasks sorted by `(priority DESC, ticket number ASC)`.
 
-## 3. Core Architecture Guarantees & Engineering Contracts
+## CLI direction
 
-1. **Fail-Closed Execution**: All CLI verbs and API wrappers propagate non-zero exit codes; HTTP errors wrapped in 200 OK are rejected.
-2. **Mutation Verification**: All negative test assertions must be verified failing against a deliberately introduced regression before PR approval.
-3. **Repo-Relative Worktree Isolation**: Ephemeral Git worktree lanes strictly enforce repo-relative paths (`./`) to prevent workspace file collisions.
-4. **Deterministic Task Selection**: Task selection queries are sorted deterministically `(priority DESC, ticket_number ASC)` with explicit role-label matching.
-5. **Sized-to-Risk Independent Review**: Mechanical gates (R0) handle docs/test diffs; independent cross-model family reviews (R1-R3) gate core code merges.
+The CLI is an operator and automation interface over the same state machine. Commands such as `pulse`, `dispatch`, `verify`, `review`, `harvest`, `board-done`, and `daemon` must call shared transition services rather than implement separate lifecycle semantics.
+
+Read-only commands such as `status`, `next`, `attention`, `worktrees`, `unmerged`, `throughput`, and `board-sync` must propagate unknown/error posture accurately.
+
+The checked-out binary’s `herd --help` remains authoritative while command names stabilize.
+
+## Required guarantees
+
+1. Fail-closed exits and provider responses.
+2. Non-vacuous verification and mutation checks.
+3. Repo-relative configuration and cwd-enforced task isolation.
+4. Deterministic selection after role/dependency eligibility filtering.
+5. Cross-process claim fencing and crash recovery.
+6. Different-family exact-SHA review for R1–R3.
+7. One integration writer and post-merge verification.
+8. `origin/main` proof before board `done`.
+9. No cleanup of dirty or unique work.
+10. Callback-driven backfill with reconciliation fallback.
+
+## Acceptance
+
+This RFC is implemented only after concurrency and crash-point tests prove every guarantee, including double-claim prevention, wrong-cwd rejection, stale-review rejection, recovery after each partial mutation, and preservation of unique work during cleanup.

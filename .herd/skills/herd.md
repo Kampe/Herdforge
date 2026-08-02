@@ -1,51 +1,64 @@
 ---
 name: herd
-description: Operate the Herdforge multi-agent software factory daemon and CLI. Use for inspecting orchestration status, running self-test suites, pulse sweeps, task claiming, budget checks, and worktree lane management.
+description: Operate and inspect the Herdforge repository-local multi-agent control plane.
 ---
 
 # Herdforge Agent Skill Guide
 
-This skill equips AI agents (Claude, Codex, Gemini, OpenCode, Antigravity) to operate the compiled `herd` CLI and daemon inside any repository.
+Use `herd` for repository workflow policy and Herdr for agent-session mechanics. The target lifecycle is documented in `docs/architecture/TARGET-WORKFLOW.md`; current commands are still being integrated and should be operated with explicit evidence checks.
 
-## Commands Reference
+## Start safely
 
-### 1. Preflight Workspace Boundary Check
-Verify that no absolute file paths leak into git tracking or config files:
 ```bash
+herd --help
+herd validate-config
 herd preflight
-```
-
-### 2. Core Self-Test Suite
-Run the compiled self-test assertion suite against the active repo:
-```bash
-herd selftest
-```
-
-### 3. Orchestration Status
-Inspect the active task provider, project ID, and configured worker roles:
-```bash
 herd status
 ```
 
-### 4. Orchestration Pulse Sweep
-Execute one pulse sweep pass to list candidate tasks from Kaneo, Linear, GitHub, Jira, or Azure DevOps, claim the highest-priority task, and raise worker lanes:
+For Herdforge development, the hermetic repository gate is:
+
 ```bash
-herd pulse --role worker
+make ci
 ```
 
-### 5. Interactive REPL Shell Mode
-Launch an interactive REPL shell for live operator inspection (`status`, `lanes`, `budget`, `claim <ref>`):
+## Read-only fleet and repository inspection
+
 ```bash
-herd sh
+herd next
+herd attention
+herd resources
+herd throughput
+herd worktrees
+herd overlap
+herd unmerged --all
+herd board-sync
 ```
 
-### 6. Repository Initialization
-Scaffold a default `.herd/herd.yaml` configuration file in any new Git repository:
+Prefer these before mutation. Unknown provider, Git, review, or session state must remain unknown rather than being converted to an empty/clean result.
+
+## Task operations
+
+Use `herd <command> --help` at the checked-out revision before a mutation. Common bounded operations include:
+
 ```bash
-herd init
+herd pulse --role worker --spawn
+herd dispatch FAC-123
+herd review --spawn
+herd board-done FAC-123
 ```
 
-## Agent Worktree Invariants
-- Always run `herd preflight` before staging or committing changes.
-- Ensure every feature branch passes `make lint all` or `herd selftest`.
-- Never write hardcoded absolute user paths. All paths must be repository-relative.
+Do not treat a successful claim as successful dispatch, an `in-progress` card as worker completion, or an `in-review` card as a valid verdict. The target gates require an active lease, cwd-bound task worktree, consumed delivery receipt, committed candidate SHA, deterministic verification, different-family review, serialized integration, `origin/main` proof, and provider readback.
+
+## Agent invariants
+
+- Work only in the assigned task worktree; never implement in the shared checkout.
+- Never remove sibling worktrees or rewrite unowned refs.
+- Run the configured preflight and verification gate before reporting completion.
+- Report an immutable candidate SHA and lease generation.
+- Never author and review the same change; R1–R3 review must cross model families.
+- Only the integration owner mutates the default branch.
+- Board `done` follows `origin/main` evidence.
+- Paths in tracked configuration and generated artifacts remain repository-relative.
+
+Spawn role contracts from `.herd/prompts/`; do not replace technical enforcement with prompt instructions.
