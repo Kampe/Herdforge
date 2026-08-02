@@ -76,7 +76,7 @@ func (e *Engine) SelectNextTask(ctx context.Context, role string) (*provider.Tas
 		if pi != pj {
 			return pi > pj
 		}
-		return matched[i].Ref < matched[j].Ref
+		return provider.CompareRefs(matched[i].Ref, matched[j].Ref) < 0
 	})
 
 	return matched[0], nil

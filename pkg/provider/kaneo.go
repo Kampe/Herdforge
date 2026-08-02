@@ -130,7 +130,12 @@ func (k *KaneoProvider) ListTasks(ctx context.Context, projectID string, status 
 	}
 
 	if k.UseCLI {
-		cmd := exec.CommandContext(ctx, "kaneo", "task", "list", "--project", projectID, "--json")
+		// ponytail: --limit 500 outruns any current board; add pagination when a board exceeds it
+		args := []string{"task", "list", "--project", projectID, "--json", "--limit", "500"}
+		if status != "" {
+			args = append(args, "--status", status)
+		}
+		cmd := exec.CommandContext(ctx, "kaneo", args...)
 		var out bytes.Buffer
 		cmd.Stdout = &out
 		if err := cmd.Run(); err != nil {
@@ -140,7 +145,6 @@ func (k *KaneoProvider) ListTasks(ctx context.Context, projectID string, status 
 		if err := json.Unmarshal(out.Bytes(), &dtos); err != nil {
 			return nil, fmt.Errorf("parsing kaneo output: %w", err)
 		}
-		_ = status
 		return filterTasks(dtos, status), nil
 	}
 
