@@ -34,11 +34,25 @@ func WorkspaceList() ([]WorkspaceEntry, error) {
 
 // ResolveWorkspace ports bin/herd-ws: HERD_WORKSPACE env wins, else the
 // workspace whose label matches the repo directory name (case-insensitive),
-// else the focused workspace. The old behavior — a hardcoded "wF" at every
-// Tab call site — broke every deployment that wasn't this exact machine.
+// else the focused workspace. Legacy callers still receive "wF" when nothing
+// matches — Prefer RequireWorkspace for FAC-121 fail-closed dispatch.
 func ResolveWorkspace(repoRoot string) string {
-	if ws := os.Getenv("HERD_WORKSPACE"); ws != "" {
-		return ws
+	id, err := RequireWorkspace(repoRoot)
+	if err != nil {
+		return "wF" // ponytail: legacy fallback for pre-FAC-121 call sites only
+	}
+	return id
+}
+
+// RequireWorkspace resolves a herdr workspace or returns an error.
+// Never falls back to a hardcoded workspace ID (FAC-121). Order:
+//  1. HERD_WORKSPACE env (must be non-empty)
+//  2. label match against repo directory name
+//  3. focused workspace from the live list
+//  4. error — unknown workspace is a hard failure
+func RequireWorkspace(repoRoot string) (string, error) {
+	if ws := strings.TrimSpace(os.Getenv("HERD_WORKSPACE")); ws != "" {
+		return ws, nil
 	}
 	abs, err := filepath.Abs(repoRoot)
 	if err != nil {
@@ -48,20 +62,35 @@ func ResolveWorkspace(repoRoot string) string {
 
 	entries, err := WorkspaceList()
 	if err != nil {
-		return "wF" // ponytail: legacy fallback so a headless herdr outage degrades to old behavior
+		return "", fmt.Errorf("herdr workspace resolution failed: %w", err)
 	}
-	return PickWorkspace(entries, repoName)
+	id, ok := PickWorkspaceStrict(entries, repoName)
+	if !ok {
+		return "", fmt.Errorf("herdr workspace unknown for repo %q: set HERD_WORKSPACE or label a workspace; refusing hardcoded fallback", repoName)
+	}
+	return id, nil
 }
 
 // PickWorkspace is the pure selection: label match beats focused beats first.
+// Empty list returns the legacy "wF" for ResolveWorkspace compatibility.
 func PickWorkspace(entries []WorkspaceEntry, repoName string) string {
+	id, ok := PickWorkspaceStrict(entries, repoName)
+	if !ok {
+		return "wF"
+	}
+	return id
+}
+
+// PickWorkspaceStrict is the fail-closed pure selector (FAC-121).
+// Returns ok=false when no workspace can be identified — never invents "wF".
+func PickWorkspaceStrict(entries []WorkspaceEntry, repoName string) (string, bool) {
 	var focused, first string
 	for _, e := range entries {
 		if e.WorkspaceID == "" {
 			continue
 		}
 		if strings.EqualFold(e.Label, repoName) {
-			return e.WorkspaceID
+			return e.WorkspaceID, true
 		}
 		if e.Focused && focused == "" {
 			focused = e.WorkspaceID
@@ -71,10 +100,10 @@ func PickWorkspace(entries []WorkspaceEntry, repoName string) string {
 		}
 	}
 	if focused != "" {
-		return focused
+		return focused, true
 	}
 	if first != "" {
-		return first
+		return first, true
 	}
-	return "wF"
+	return "", false
 }
