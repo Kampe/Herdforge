@@ -20,6 +20,10 @@ func ftpdHerdWorktreesRepo(t *testing.T) string {
 
 	// Clone into the "principal" repo (this is what herd worktrees scans)
 	principal := filepath.Join(dir, "repo")
+	runGitT(t, dir, "clone", "bare.git", "repo")
+	// Empty clone lands on the git default branch (master under a clean
+	// gitconfig); force main so `push origin main` has a branch to push.
+	runGitT(t, principal, "checkout", "-b", "main")
 	runGitT(t, principal, "config", "user.email", "t@kampe.kluster")
 	runGitT(t, principal, "config", "user.name", "FAC-104 Test")
 	runGitT(t, principal, "config", "commit.gpgSign", "false")
@@ -314,6 +318,9 @@ func TestHerdWorktreesCLINoCollisions(t *testing.T) {
 
 	principal := filepath.Join(dir, "repo")
 	runGitT(t, dir, "clone", "bare.git", "repo")
+	// Empty clone lands on the git default branch (master under a clean
+	// gitconfig); force main so `push origin main` has a branch to push.
+	runGitT(t, principal, "checkout", "-b", "main")
 	runGitT(t, principal, "config", "user.email", "t@kampe.kluster")
 	runGitT(t, principal, "config", "user.name", "FAC-104 Test")
 	runGitT(t, principal, "config", "commit.gpgSign", "false")
