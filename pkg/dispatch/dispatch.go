@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 
 	"github.com/Kampe/Herdforge/pkg/config"
@@ -173,6 +174,25 @@ func slugForTask(ref, title string) string {
 	return fmt.Sprintf("%s-%s", refSlug, s)
 }
 
+func extractCommandFromTitle(title string) string {
+	title = strings.TrimSpace(title)
+	if idx := strings.Index(title, ":"); idx != -1 {
+		title = title[:idx]
+	}
+	title = strings.TrimSpace(title)
+	return strings.ToLower(title)
+}
+
+func extractIntentFromTitle(title string) string {
+	title = strings.TrimSpace(title)
+	if idx := strings.Index(title, ":"); idx != -1 {
+		title = strings.TrimSpace(title[idx+1:])
+	}
+	// Remove parenthetical references like "(FAC-59)"
+	title = regexp.MustCompile(`\s*\([A-Z]+-\d+\)`).ReplaceAllString(title, "")
+	return strings.TrimSpace(strings.ToLower(title))
+}
+
 func buildTaskPacket(task *provider.Task, wtPath, branch, rolePath string, lane *config.LaneDef) string {
 	var b strings.Builder
 
@@ -195,7 +215,14 @@ func buildTaskPacket(task *provider.Task, wtPath, branch, rolePath string, lane 
 	}
 
 	b.WriteString("\n## Description\n\n")
-	b.WriteString(task.Description)
+	if task.Description != "" {
+		b.WriteString(task.Description)
+	} else {
+		b.WriteString(fmt.Sprintf("Port the %s concept to Herdforge: implement a command that %s.\n\n", extractCommandFromTitle(task.Title), extractIntentFromTitle(task.Title)))
+		b.WriteString("Look at the existing `cmd/herd/main.go` for the command entry point and\n")
+		b.WriteString("register pattern. Add a new subcommand, implement its logic, write tests,\n")
+		b.WriteString("and verify the full test suite still passes.\n")
+	}
 	b.WriteString("\n\n")
 
 	b.WriteString("## Workflow\n\n")

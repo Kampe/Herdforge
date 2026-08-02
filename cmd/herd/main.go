@@ -114,6 +114,9 @@ func main() {
 	case "harvest":
 		runHarvest()
 
+	case "attention":
+		runAttention()
+
 	case "process":
 		runProcess()
 
@@ -123,8 +126,6 @@ func main() {
 	case "kick":
 		runKick()
 
-	case "attention":
-		runAttention()
 
 	case "lifecycle":
 		runLifecycle()
@@ -160,6 +161,7 @@ func printUsage() {
 	fmt.Println("  next            Show highest-priority next action")
 	fmt.Println("  dispatch        Dispatch a ticket to a worktree and launch agent")
 	fmt.Println("  harvest         Sweep all worktrees for unmerged commits")
+	fmt.Println("  attention       List agents needing coordinator eyes")
 	fmt.Println("  process         Classify harvest targets (herd-process digest)")
 	fmt.Println("  resolve-lane    Resolve a lane to concrete provider+model (deterministic)")
 	fmt.Println("  kick            Re-engage standing or named agent lanes")
