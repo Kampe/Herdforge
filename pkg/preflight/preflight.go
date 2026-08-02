@@ -15,10 +15,16 @@ func CheckWorktreeBoundary(rootDir string) error {
 		if err != nil {
 			return err
 		}
-		if info.IsDir() && (info.Name() == ".git" || info.Name() == "node_modules" || info.Name() == "vendor") {
+		if info.IsDir() && (info.Name() == ".git" || info.Name() == "node_modules" || info.Name() == "vendor" ||
+			info.Name() == ".gemini" || info.Name() == ".qoder" || info.Name() == ".vscode" ||
+			info.Name() == ".claude" || info.Name() == ".codebuddy" || info.Name() == ".kiro") {
 			return filepath.SkipDir
 		}
 		if info.IsDir() {
+			return nil
+		}
+
+		if info.Name() == ".mcp.json" {
 			return nil
 		}
 
@@ -32,7 +38,7 @@ func CheckWorktreeBoundary(rootDir string) error {
 			content := string(data)
 			// Check for forbidden absolute path patterns (excluding self-check logic strings)
 			isPreflightTest := strings.HasSuffix(path, "_test.go") && strings.Contains(path, "preflight")
-		if (strings.Contains(content, "/Users/") || strings.Contains(content, "/home/") || strings.Contains(content, "C:\\")) &&
+			if (strings.Contains(content, "/Users/") || strings.Contains(content, "/home/") || strings.Contains(content, "C:\\")) &&
 				!strings.HasSuffix(path, "AGENTS.md") && !strings.HasSuffix(path, "preflight.go") && !isPreflightTest {
 				absoluteLeakes = append(absoluteLeakes, path)
 			}
