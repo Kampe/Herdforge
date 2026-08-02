@@ -3,14 +3,12 @@ package conflict
 import (
 	"bufio"
 	"context"
-	"fmt"
 	"strings"
 )
 
 type ConflictChunk struct {
-	FilePath string
-	Ours     string
-	Theirs   string
+	Ours   string
+	Theirs string
 }
 
 type Resolver struct {
@@ -60,24 +58,43 @@ func ParseConflictMarkers(content string) ([]ConflictChunk, bool) {
 }
 
 func (r *Resolver) ResolveFile(ctx context.Context, content string) (string, error) {
-	chunks, hasConflicts := ParseConflictMarkers(content)
-	if !hasConflicts {
-		return content, nil
-	}
+	lines := strings.Split(content, "\n")
+	var outLines []string
 
-	// Replace conflict markers with merged union or semantic reconciliation
-	result := content
-	for _, chunk := range chunks {
-		conflictBlock := fmt.Sprintf("<<<<<<<\n%s=======\n%s>>>>>>>\n", chunk.Ours, chunk.Theirs)
-		// For deterministic fallback, prefer union of Ours + Theirs if non-duplicate
-		var merged string
-		if strings.TrimSpace(chunk.Ours) == strings.TrimSpace(chunk.Theirs) {
-			merged = chunk.Ours
-		} else {
-			merged = chunk.Ours + chunk.Theirs
+	inConflict := false
+	inTheirs := false
+	var oursLines []string
+	var theirsLines []string
+
+	for _, line := range lines {
+		if strings.HasPrefix(line, "<<<<<<<") {
+			inConflict = true
+			inTheirs = false
+			oursLines = nil
+			theirsLines = nil
+			continue
 		}
-		result = strings.Replace(result, conflictBlock, merged, 1)
+		if strings.HasPrefix(line, "=======") && inConflict {
+			inTheirs = true
+			continue
+		}
+		if strings.HasPrefix(line, ">>>>>>>") && inConflict {
+			inConflict = false
+			// Reconcile conflict block: prefer ours + theirs
+			outLines = append(outLines, oursLines...)
+			outLines = append(outLines, theirsLines...)
+			continue
+		}
+		if inConflict {
+			if inTheirs {
+				theirsLines = append(theirsLines, line)
+			} else {
+				oursLines = append(oursLines, line)
+			}
+		} else {
+			outLines = append(outLines, line)
+		}
 	}
 
-	return result, nil
+	return strings.Join(outLines, "\n"), nil
 }
