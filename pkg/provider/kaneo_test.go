@@ -188,3 +188,46 @@ func TestResolveKaneoProjectID(t *testing.T) {
 		t.Log("no local kaneo link found, which is okay")
 	}
 }
+
+func TestKaneoProvider_GetTask_BadJSON(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{invalid json`))
+	}))
+	defer server.Close()
+
+	kp := NewKaneoProvider(server.URL, "proj-1")
+	// API returns bad JSON; CLI fallback will also fail since "kaneo" isn't installed
+	_, err := kp.GetTask(context.Background(), "task-123")
+	if err == nil {
+		t.Fatal("expected error on bad JSON, got nil")
+	}
+}
+
+func TestKaneoProvider_ListTasks_BadJSON(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{invalid`))
+	}))
+	defer server.Close()
+
+	kp := NewKaneoProvider(server.URL, "proj-1")
+	_, err := kp.ListTasks(context.Background(), "proj-1", "")
+	if err == nil {
+		t.Fatal("expected error on bad JSON, got nil")
+	}
+}
+
+func TestKaneoProvider_UpdateStatus_NoContent(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	kp := NewKaneoProvider(server.URL, "proj-1")
+	if err := kp.UpdateStatus(context.Background(), "task-123", "done"); err != nil {
+		t.Fatalf("expected success on 204, got err: %v", err)
+	}
+}

@@ -1,10 +1,12 @@
 version: "1"
 
+# Chainseer / Herdforge Local Machine Orchestration Spec
 project:
-  name: "Herdforge"
+  name: "chainseer"
   default_branch: "main"
-  repo_url: "https://github.com/Kampe/Herdforge.git"
+  repo_url: "https://github.com/Kampe/chainseer.git"
 
+# Kaneo Kanban Board Integration (Kluster local deployment)
 task_provider:
   type: "kaneo"
   workspace_id: "2FeaTZjdSJDSvUVWeiKH0uKNGBhwLEld"
@@ -12,32 +14,60 @@ task_provider:
   api_url: "https://kanban-api.kampe.kluster"
   api_key_env: "KANEO_API_KEY"
 
+# Multi-Provider AI Model Routing & 429 Cooldown Failover Candidates
 model_providers:
   - name: "claude-pro"
     type: "anthropic"
     api_key_env: "ANTHROPIC_API_KEY"
-    model: "claude-3-5-sonnet"
-  - name: "gemini-flash"
-    type: "google"
-    api_key_env: "GEMINI_API_KEY"
-    model: "gemini-1.5-pro"
+    model: "claude-3-7-sonnet-20250219"
+
   - name: "codex-local"
     type: "openai"
     api_key_env: "OPENAI_API_KEY"
     model: "gpt-4o"
 
+  - name: "gemini-pro"
+    type: "google"
+    api_key_env: "GEMINI_API_KEY"
+    model: "gemini-2.5-pro"
+
+  - name: "grok-api"
+    type: "xai"
+    api_key_env: "XAI_API_KEY"
+    model: "grok-2"
+
+  - name: "ollama-local"
+    type: "ollama"
+    api_url: "http://localhost:11434"
+    model: "llama3.3:70b"
+
+# Worker Lane Roles & Harness Bindings
 roles:
+  - name: "herd-smith"
+    provider: "claude-pro"
+    fallback_provider: "gemini-pro"
+    harness: "agy"
+    prompt_path: ".herd/prompts/smith.md"
+
   - name: "worker"
     provider: "claude-pro"
-    fallback_provider: "gemini-flash"
-    harness: "agy"
+    fallback_provider: "gemini-pro"
+    harness: "opencode"
     prompt_path: ".herd/prompts/worker.md"
+
   - name: "reviewer"
-    provider: "gemini-flash"
+    provider: "gemini-pro"
     fallback_provider: "codex-local"
     harness: "codex"
     prompt_path: ".herd/prompts/reviewer.md"
 
+  - name: "harvest"
+    provider: "grok-api"
+    fallback_provider: "claude-pro"
+    harness: "pi"
+    prompt_path: ".herd/prompts/harvest.md"
+
+# Project Verification Suite & Preflight Boundary Invariants
 verification:
-  test_command: "make lint all"
-  preflight_command: "make preflight"
+  test_command: "bin/agent-preflight && bin/check-surface-tests"
+  preflight_command: "bin/agent-preflight"
