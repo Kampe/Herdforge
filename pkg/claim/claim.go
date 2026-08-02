@@ -73,11 +73,13 @@ func capacityKey(intent string, l *Lease) string {
 // atomic cross-process leases with renewal, expiry, operator hold, and
 // durable, retryable capacity settlement.
 type ClaimManager struct {
-	store    LeaseStore
-	capacity CapacityCoordinator
-	outbox   OutboxRecorder
-	now      func() time.Time
-	ttl      time.Duration
+	store       LeaseStore
+	capacity    CapacityCoordinator
+	outbox      OutboxRecorder
+	provider    ProviderCAS
+	outboxStore DurableOutbox
+	now         func() time.Time
+	ttl         time.Duration
 
 	// settlerID identifies this ClaimManager instance as a capacity-
 	// release settler for LeaseStore.ClaimCapacityRelease's claim

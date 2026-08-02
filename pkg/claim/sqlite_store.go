@@ -446,7 +446,7 @@ func (s *SQLiteLeaseStore) ClaimCapacityRelease(ctx context.Context, settlerID s
 	staleBefore := now.Add(-staleAfter)
 	query := `UPDATE leases SET capacity_release_state = 'in_progress', capacity_release_owner = ?, capacity_release_claimed_at = ?
 		WHERE status IN ('released', 'expired') AND capacity_released_at IS NULL
-		AND (capacity_release_state = 'pending' OR (capacity_release_state = 'in_progress' AND capacity_release_claimed_at <= ?))`
+		AND (capacity_release_state = 'pending' OR (capacity_release_state = 'in_progress' AND capacity_release_claimed_at < ?))`
 	args := []any{settlerID, now, staleBefore}
 	if key != nil {
 		query += ` AND repo = ? AND provider = ? AND project = ? AND task_ref = ?`
