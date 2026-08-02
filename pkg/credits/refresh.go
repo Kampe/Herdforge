@@ -594,39 +594,47 @@ func (lc *LedgerCommands) Show() string {
 func (lc *LedgerCommands) Advise() string {
 	MaybeRefresh(lc.Ledger)
 
-	quotaBin := os.Getenv("HERD_QUOTA_BIN")
-	if quotaBin == "" {
-		quotaBin = "bin/herd-quota"
-	}
-
 	var out strings.Builder
 
-	if _, err := os.Stat(quotaBin); err == nil {
-		cmd := exec.Command("sh", "-c", quotaBin+" --json 2>/dev/null || true")
-		if liveOut, err := cmd.Output(); err == nil {
-			liveStr := strings.TrimSpace(string(liveOut))
-			if liveStr != "" {
-				out.WriteString("live OpenUsage quota (authoritative for routing):\n")
-				out.WriteString(liveStr)
-				out.WriteString("\n")
-			}
-		}
-	}
-
-	out.WriteString("ledger-only fallback snapshots (used only when live quota is unavailable):\n")
+	now := NowEpoch()
 	surfaces := make([]string, 0)
 	for k := range lc.Ledger.All() {
 		surfaces = append(surfaces, k)
 	}
 	sort.Strings(surfaces)
 
+	fallbackFrom := ""
+	staleThreshold := int64(DefaultRefreshTTL) * 2
+	wrotePaceHeader := false
+
 	for _, s := range surfaces {
+		rec, err := lc.Ledger.Surface(s)
+		if err != nil {
+			continue
+		}
+		if rec.UsedPct == 0 && rec.WindowDays == nil && len(rec.Accounts) == 0 && rec.Note == "" {
+			continue
+		}
+		if now-rec.Updated > staleThreshold {
+			continue
+		}
+
+		if !wrotePaceHeader {
+			out.WriteString("ledger quota snapshots (fallback when live quota unavailable):\n")
+			wrotePaceHeader = true
+		}
+		if fallbackFrom == "" {
+			fallbackFrom = s
+		}
+
 		out.WriteString(lc.Pace(s) + "\n")
 	}
 
-	out.WriteString("untracked surfaces: available; enter a snapshot when a quota UI or error is seen\n")
-	out.WriteString("Claude auth-account selection metadata (ledger, not routing quota):\n")
-	out.WriteString("  pool avg = sum(used)/N; pick by account headroom every launch (resets differ)\n")
+	if wrotePaceHeader {
+		out.WriteString("untracked surfaces: available; enter a snapshot when a quota UI or error is seen\n")
+		out.WriteString("Claude auth-account selection metadata (ledger, not routing quota):\n")
+		out.WriteString("  pool avg = sum(used)/N; pick by account headroom every launch (resets differ)\n")
+	}
 
 	active := ClaudeActiveEmail("")
 	if active == "" {
