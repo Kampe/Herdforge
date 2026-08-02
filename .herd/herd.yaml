@@ -3,21 +3,41 @@ version: "1"
 project:
   name: "Herdforge"
   default_branch: "main"
+  repo_url: "https://github.com/Kampe/Herdforge.git"
 
 task_provider:
   type: "kaneo"
+  workspace_id: "2FeaTZjdSJDSvUVWeiKH0uKNGBhwLEld"
   project_id: "b939c5jzixruza3vvywrg1hs"
   api_url: "https://kanban-api.kampe.kluster"
+  api_key_env: "KANEO_API_KEY"
 
 model_providers:
   - name: "claude-pro"
     type: "anthropic"
+    api_key_env: "ANTHROPIC_API_KEY"
     model: "claude-3-5-sonnet"
+  - name: "gemini-flash"
+    type: "google"
+    api_key_env: "GEMINI_API_KEY"
+    model: "gemini-1.5-pro"
+  - name: "codex-local"
+    type: "openai"
+    api_key_env: "OPENAI_API_KEY"
+    model: "gpt-4o"
 
 roles:
   - name: "worker"
     provider: "claude-pro"
+    fallback_provider: "gemini-flash"
+    harness: "agy"
     prompt_path: ".herd/prompts/worker.md"
+  - name: "reviewer"
+    provider: "gemini-flash"
+    fallback_provider: "codex-local"
+    harness: "codex"
+    prompt_path: ".herd/prompts/reviewer.md"
 
 verification:
   test_command: "make lint all"
+  preflight_command: "make preflight"

@@ -20,24 +20,29 @@ type Config struct {
 type ProjectConfig struct {
 	Name          string `yaml:"name"`
 	DefaultBranch string `yaml:"default_branch"`
+	RepoURL       string `yaml:"repo_url,omitempty"`
 }
 
 type TaskProvider struct {
-	Type      string `yaml:"type"` // kaneo | github | linear
-	ProjectID string `yaml:"project_id"`
-	APIURL    string `yaml:"api_url"`
+	Type        string `yaml:"type"` // kaneo | github | linear | jira | azure | memory
+	ProjectID   string `yaml:"project_id"`
+	WorkspaceID string `yaml:"workspace_id,omitempty"`
+	APIURL      string `yaml:"api_url,omitempty"`
+	APIKeyEnv   string `yaml:"api_key_env,omitempty"`
 }
 
 type ModelProvider struct {
-	Name  string `yaml:"name"`
-	Type  string `yaml:"type"` // anthropic | google | openai | ollama
-	Model string `yaml:"model"`
+	Name      string `yaml:"name"`
+	Type      string `yaml:"type"` // anthropic | google | openai | ollama
+	Model     string `yaml:"model"`
+	APIKeyEnv string `yaml:"api_key_env,omitempty"`
 }
 
 type RoleConfig struct {
 	Name             string `yaml:"name"`
 	Provider         string `yaml:"provider"`
 	FallbackProvider string `yaml:"fallback_provider,omitempty"`
+	Harness          string `yaml:"harness,omitempty"`
 	PromptPath       string `yaml:"prompt_path"`
 }
 
