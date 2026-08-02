@@ -7,8 +7,6 @@ import (
 	"sync"
 
 	"github.com/Kampe/Herdforge/pkg/outbox"
-
-	_ "modernc.org/sqlite"
 )
 
 var (
@@ -25,6 +23,12 @@ var (
 	// reused for a transition whose target state differs from the one
 	// originally recorded under that key.
 	ErrIdempotencyKeyConflict = errors.New("lifecycle: idempotency key reused for a different transition")
+	// ErrConcurrentModification is returned when another transaction (in
+	// this process or another) committed a transition for the same task
+	// between this attempt's read and its write. The caller must retry
+	// with a fresh Machine.Transition call — never resume this one, since
+	// whatever it decided (FromState, seq) was based on stale data.
+	ErrConcurrentModification = errors.New("lifecycle: concurrent modification detected")
 )
 
 // TransitionRequest describes one attempted state change. Every mutating
@@ -50,7 +54,12 @@ type TransitionRequest struct {
 	Payload          string
 	// OutboxItems are enqueued in the SAME transaction as the event append,
 	// so the durable intent to perform a side effect (provider mutation,
-	// Herdr dispatch, Git operation) can never be lost or duplicated.
+	// Herdr dispatch, Git operation) can never be lost or duplicated. They
+	// are enqueued on BOTH a fresh transition and a replay, using the
+	// exact same TaskRef-fill logic either way (see the single loop
+	// below) — a retried caller and a first-time caller enqueue
+	// byte-identical items, so outbox.Store's own idempotency dedup is
+	// what makes the replay a no-op, not a second code path here.
 	OutboxItems []outbox.Item
 }
 
@@ -72,10 +81,11 @@ type Machine struct {
 	out    *outbox.Store
 }
 
-// NewMachine opens (or creates) a SQLite database at path and applies both
-// the lifecycle and outbox schemas to it.
+// NewMachine opens (or creates) a SQLite database at path, applies the
+// SQLite concurrency contract (see sqliteConcurrencyContract), and
+// applies both the lifecycle and outbox schemas to it.
 func NewMachine(path string) (*Machine, error) {
-	db, err := sql.Open("sqlite", path)
+	db, err := openSQLite(path)
 	if err != nil {
 		return nil, fmt.Errorf("open lifecycle machine store: %w", err)
 	}
@@ -106,14 +116,27 @@ func (m *Machine) Close() error {
 	return m.db.Close()
 }
 
-// Transition validates and durably applies one state change. It is safe
-// to call concurrently: transitions for the whole Machine are serialized,
-// and replays (matching IdempotencyKey) are idempotent no-ops.
+// Transition validates and durably applies one state change in a single
+// SQLite transaction: EventStore.AppendTx decides FromState, sequence,
+// lease fencing, and transition legality from data it reads inside that
+// same transaction (never from anything Machine computed beforehand), then
+// this method enqueues any outbox side effects in the same transaction
+// before committing.
 //
-// Cross-process mutual exclusion over WHO may attempt a transition for a
-// given task is FAC-120's lease/fencing responsibility; Machine only
-// guarantees that whatever is durably recorded is atomic, ordered, and
-// never silently duplicated or skipped.
+// The in-process mutex below serializes same-process callers as an
+// optimization (it avoids wasted transaction attempts under local
+// contention) — it is NOT what makes this safe. Correctness against
+// concurrent callers, including a second Machine on the same database
+// file from another process, comes entirely from AppendTx's tx-scoped
+// reads plus the UNIQUE/CAS guards described there. Acquiring the actual
+// right to attempt a transition for a given task across processes is
+// FAC-120's lease/fencing responsibility, via the LeaseGeneration this
+// method fences on.
+//
+// On ErrConcurrentModification, ErrStaleLeaseGeneration, or
+// ErrInvalidTransition, nothing was durably changed — callers should
+// re-read current state and retry with a fresh request rather than
+// resuming this one.
 func (m *Machine) Transition(req TransitionRequest) (TransitionResult, error) {
 	if req.TaskRef == "" {
 		return TransitionResult{}, fmt.Errorf("transition: task_ref is required")
@@ -128,58 +151,33 @@ func (m *Machine) Transition(req TransitionRequest) (TransitionResult, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	if existing, err := m.events.EventByIdempotencyKey(req.IdempotencyKey); err != nil {
-		return TransitionResult{}, err
-	} else if existing != nil {
-		if existing.TaskRef != req.TaskRef || existing.ToState != req.To {
-			return TransitionResult{}, fmt.Errorf("%w: key=%s", ErrIdempotencyKeyConflict, req.IdempotencyKey)
-		}
-		if err := m.enqueueOutboxOnly(req.OutboxItems); err != nil {
-			return TransitionResult{}, err
-		}
-		return TransitionResult{Event: *existing, Replayed: true}, nil
-	}
-
-	current, err := m.events.CurrentState(req.TaskRef)
-	if err != nil {
-		return TransitionResult{}, err
-	}
-	from := StateDraft
-	if current != nil {
-		from = current.State
-		if req.LeaseGeneration < current.LeaseGeneration {
-			return TransitionResult{}, fmt.Errorf("%w: task=%s held=%d got=%d",
-				ErrStaleLeaseGeneration, req.TaskRef, current.LeaseGeneration, req.LeaseGeneration)
-		}
-	}
-	if !ValidTransition(from, req.To) {
-		return TransitionResult{}, fmt.Errorf("%w: task=%s %s -> %s", ErrInvalidTransition, req.TaskRef, from, req.To)
-	}
-
 	tx, err := m.db.Begin()
 	if err != nil {
 		return TransitionResult{}, fmt.Errorf("transition: begin tx: %w", err)
 	}
 	defer tx.Rollback()
 
-	ev, err := m.events.AppendTx(tx, Event{
+	appended, err := m.events.AppendTx(tx, AppendIntent{
 		TaskRef:          req.TaskRef,
 		Repo:             req.Repo,
-		FromState:        from,
-		ToState:          req.To,
-		ProviderRevision: req.ProviderRevision,
+		To:               req.To,
+		Actor:            req.Actor,
+		IdempotencyKey:   req.IdempotencyKey,
 		LeaseGeneration:  req.LeaseGeneration,
+		ProviderRevision: req.ProviderRevision,
 		Branch:           req.Branch,
 		CandidateSHA:     req.CandidateSHA,
-		Actor:            req.Actor,
 		EvidenceDigest:   req.EvidenceDigest,
 		Payload:          req.Payload,
-		IdempotencyKey:   req.IdempotencyKey,
 	})
 	if err != nil {
 		return TransitionResult{}, fmt.Errorf("transition: append event: %w", err)
 	}
 
+	// Enqueue outbox side effects on BOTH a fresh append and a replay —
+	// one code path, so a retried caller's items are filled in exactly
+	// like the first attempt's. outbox.Store's own idempotency dedup
+	// makes the replay a no-op instead of a duplicate side effect.
 	for _, item := range req.OutboxItems {
 		if item.TaskRef == "" {
 			item.TaskRef = req.TaskRef
@@ -193,27 +191,5 @@ func (m *Machine) Transition(req TransitionRequest) (TransitionResult, error) {
 		return TransitionResult{}, fmt.Errorf("transition: commit: %w", err)
 	}
 
-	return TransitionResult{Event: ev}, nil
-}
-
-// enqueueOutboxOnly is used on the replay path: the event itself already
-// exists, but outbox items carry their own idempotency keys, so replaying
-// them is still safe and ensures a side effect that was decided but never
-// durably enqueued (e.g. a crash between event commit and outbox enqueue
-// in some earlier version) still gets recorded.
-func (m *Machine) enqueueOutboxOnly(items []outbox.Item) error {
-	if len(items) == 0 {
-		return nil
-	}
-	tx, err := m.db.Begin()
-	if err != nil {
-		return fmt.Errorf("enqueue outbox on replay: begin tx: %w", err)
-	}
-	defer tx.Rollback()
-	for _, item := range items {
-		if _, err := m.out.EnqueueTx(tx, item); err != nil {
-			return fmt.Errorf("enqueue outbox on replay: %w", err)
-		}
-	}
-	return tx.Commit()
+	return TransitionResult{Event: appended.Event, Replayed: appended.Replayed}, nil
 }
