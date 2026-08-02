@@ -2,6 +2,8 @@ package activate
 
 import (
 	"errors"
+	"os"
+	"os/exec"
 	"strings"
 	"testing"
 	"time"
@@ -140,10 +142,12 @@ type fakeHTTP struct {
 	body  string
 	err   error
 	calls int
+	urls  []string
 }
 
 func (f *fakeHTTP) Get(url string) (int, string, error) {
 	f.calls++
+	f.urls = append(f.urls, url)
 	return f.code, f.body, f.err
 }
 
@@ -196,6 +200,51 @@ func TestRun_MigrationFailure_RefusesToBoot(t *testing.T) {
 	}
 	if fleet.kicked {
 		t.Fatal("fleet must not be kicked on migration failure")
+	}
+}
+
+func TestRun_EnvURLOverrides(t *testing.T) {
+	// OV_LOCAL_API_URL / OV_LOCAL_WEB_URL must win over the package
+	// defaults when the option is left empty (mirror of
+	// herd-activate:174-175).
+	t.Setenv("OV_LOCAL_API_URL", "http://override-api:13100")
+	t.Setenv("OV_LOCAL_WEB_URL", "http://override-web:4174")
+
+	compose := &fakeCompose{psText: allRunningPS()}
+	mig := &fakeMigrator{}
+	http := &fakeHTTP{code: 200, body: okStatusJSON}
+	fleet := &fakeFleet{}
+
+	opts := baseOpts()
+	opts.APIURL = ""
+	opts.WebURL = ""
+	opts.Compose = compose
+	opts.Migrator = mig
+	opts.HTTP = http
+	opts.Fleet = fleet
+
+	res, err := Run(opts)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !res.Healthy {
+		t.Fatalf("expected healthy, got %+v", res)
+	}
+	// Sanity: at least one /v1/status poll hit the override URL.
+	var sawStatus, sawWeb bool
+	for _, u := range http.urls {
+		if strings.HasPrefix(u, "http://override-api:13100") {
+			sawStatus = true
+		}
+		if strings.HasPrefix(u, "http://override-web:4174") {
+			sawWeb = true
+		}
+	}
+	if !sawStatus {
+		t.Fatalf("expected /v1/status poll against override API URL, got %v", http.urls)
+	}
+	if !sawWeb {
+		t.Fatalf("expected web probe against override Web URL, got %v", http.urls)
 	}
 }
 
@@ -418,4 +467,104 @@ func allRunningPS() string {
 		b.WriteString(" running\n")
 	}
 	return b.String()
+}
+
+// --- Repo-root resolution, canonical-checkout guard, stack guard ---
+
+// TestResolveRoot_HERD_ROOT verifies the explicit $HERD_ROOT env
+// override wins over git discovery and is returned verbatim.
+func TestResolveRoot_HERD_ROOT(t *testing.T) {
+	t.Setenv("HERD_ROOT", "/tmp/herd-root-test")
+	if got := resolveRepoRoot(); got != "/tmp/herd-root-test" {
+		t.Fatalf("expected HERD_ROOT override, got %q", got)
+	}
+}
+
+// TestResolveRoot_GitDiscovery verifies git discovery still resolves a
+// non-empty root when HERD_ROOT is unset and CWD is inside a git checkout
+// (the test binary always runs inside the herd repository).
+func TestResolveRoot_GitDiscovery(t *testing.T) {
+	t.Setenv("HERD_ROOT", "")
+	if got := resolveRepoRoot(); got == "" {
+		t.Fatal("expected git discovery to resolve a repo root, got empty")
+	}
+}
+
+// TestCanonicalCheckout_WorktreeRefused deterministically proves the
+// negative guard: activation MUST refuse from a git worktree. It builds a
+// throwaway canonical repo + linked worktree, chdirs into each, and
+// asserts the guard fails at the worktree and passes at the canonical
+// root.
+func TestCanonicalCheckout_WorktreeRefused(t *testing.T) {
+	base := t.TempDir()
+	canon := base + "/canon"
+	wt := base + "/wt"
+
+	runGit := func(dir string, args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = dir
+		cmd.Env = append(os.Environ(), "GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_SYSTEM=/dev/null")
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v in %s failed: %v\n%s", args, dir, err, out)
+		}
+	}
+
+	runGit(base, "init", canon)
+	runGit(canon, "config", "user.email", "test@example.com")
+	runGit(canon, "config", "user.name", "test")
+	// A non-empty branch is required before `git worktree add` can run.
+	writeTestFile(t, canon+"/f", "x\n")
+	runGit(canon, "add", "f")
+	runGit(canon, "commit", "-m", "init")
+	runGit(canon, "worktree", "add", wt, "HEAD")
+
+	// Refuse from the linked worktree: err non-nil and names the refusal.
+	chdirTest(t, wt)
+	if err := ensureCanonicalCheckout(); err == nil {
+		t.Fatal("expected canonical-checkout refusal from a git worktree, got nil")
+	} else if !strings.Contains(err.Error(), "worktree") {
+		t.Fatalf("error should name the worktree refusal, got: %v", err)
+	}
+
+	// Pass at the canonical root: the guard is not vacuous — the refusal
+	// above only fires because the worktree path differs.
+	chdirTest(t, canon)
+	if err := ensureCanonicalCheckout(); err != nil {
+		t.Fatalf("expected canonical-checkout to pass at the canonical root, got: %v", err)
+	}
+}
+
+// TestNewDockerCompose_ExportsStackGuard proves OV_STACK_GUARD=1 is
+// exported before any compose call (mirror of herd-activate:104).
+func TestNewDockerCompose_ExportsStackGuard(t *testing.T) {
+	t.Setenv("HERD_ROOT", t.TempDir())
+	newDockerCompose()
+	if os.Getenv("OV_STACK_GUARD") != "1" {
+		t.Fatalf("expected OV_STACK_GUARD=1 after newDockerCompose, got %q", os.Getenv("OV_STACK_GUARD"))
+	}
+}
+
+// chdirTest changes the process test CWD, restoring it on test end.
+func chdirTest(t *testing.T, dir string) {
+	t.Helper()
+	prev, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd: %v", err)
+	}
+	if err := os.Chdir(dir); err != nil {
+		t.Fatalf("chdir %s: %v", dir, err)
+	}
+	t.Cleanup(func() {
+		if err := os.Chdir(prev); err != nil {
+			t.Errorf("restore cwd %s: %v", prev, err)
+		}
+	})
+}
+
+func writeTestFile(t *testing.T, path, content string) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("write %s: %v", path, err)
+	}
 }

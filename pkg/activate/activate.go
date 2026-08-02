@@ -25,6 +25,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 )
@@ -225,6 +226,12 @@ func Run(opts Options) (*Result, error) {
 		opts.Deployables = DefaultDeployables
 	}
 	if opts.APIURL == "" {
+		opts.APIURL = os.Getenv("OV_LOCAL_API_URL")
+	}
+	if opts.WebURL == "" {
+		opts.WebURL = os.Getenv("OV_LOCAL_WEB_URL")
+	}
+	if opts.APIURL == "" {
 		opts.APIURL = DefaultAPIURL
 	}
 	if opts.WebURL == "" {
@@ -237,16 +244,21 @@ func Run(opts Options) (*Result, error) {
 		opts.PollInterval = DefaultPollInterval
 	}
 	if opts.Compose == nil {
+		// Real default path: canonical-checkout guard + repo-root pinning
+		// must happen BEFORE the first compose process is spawned.
+		if _, err := prepareRealEnv(); err != nil {
+			return nil, err
+		}
 		opts.Compose = newDockerCompose()
 	}
 	if opts.Migrator == nil {
-		opts.Migrator = binMigrator{}
+		opts.Migrator = binMigrator{root: resolveRepoRoot()}
 	}
 	if opts.HTTP == nil {
 		opts.HTTP = httpGetter{client: &http.Client{Timeout: 8 * time.Second}}
 	}
 	if opts.Fleet == nil {
-		opts.Fleet = herdKickFleet{}
+		opts.Fleet = herdKickFleet{root: resolveRepoRoot()}
 	}
 
 	if len(opts.BuildServices) > 0 {
@@ -307,14 +319,103 @@ func Run(opts Options) (*Result, error) {
 		opts.Timeout, res.Overall, res.Unhealthy, res.NotRunning)
 }
 
+// resolveRepoRoot returns the canonical repo root for repo-relative
+// subprocess calls. Resolution order: $HERD_ROOT (explicit), then git
+// discovery via `git rev-parse --path-format=absolute --git-common-dir`
+// (parent of <root>/.git). Returns "" when no root is determinable and
+// does NOT fall back to the raw CWD, so subprocess calls never run
+// repo-relative paths from an arbitrary working directory.
+func resolveRepoRoot() string {
+	if r := os.Getenv("HERD_ROOT"); r != "" {
+		return r
+	}
+	out, err := exec.Command("git", "rev-parse", "--path-format=absolute", "--git-common-dir").Output()
+	if err != nil {
+		return ""
+	}
+	common := strings.TrimSpace(string(out))
+	parent := filepath.Dir(common)
+	if parent == "" || parent == "." {
+		return ""
+	}
+	return parent
+}
+
+// ensureCanonicalCheckout refuses product compose/activate from a git
+// worktree. Port of herd_require_canonical_checkout (herd-lib.zsh): the
+// canonical shared checkout is exactly the directory that owns the
+// resolved --git-common-dir (i.e. pwd -P == dirname(<root>/.git)). Any
+// other location (linked worktree, nested dir) is refused to prevent
+// forked bind mounts against an unguarded stack.
+func ensureCanonicalCheckout() error {
+	out, err := exec.Command("git", "rev-parse", "--path-format=absolute", "--git-common-dir").Output()
+	if err != nil {
+		return fmt.Errorf("herd-activate: not a git checkout (git rev-parse --git-common-dir failed): %w", err)
+	}
+	common := strings.TrimSpace(string(out))
+	canonP, err := filepath.EvalSymlinks(filepath.Dir(common))
+	if err != nil {
+		return fmt.Errorf("herd-activate: resolve canonical root from %q: %w", common, err)
+	}
+	here, err := os.Getwd()
+	if err != nil {
+		return fmt.Errorf("herd-activate: getwd: %w", err)
+	}
+	hereP, err := filepath.EvalSymlinks(here)
+	if err != nil {
+		return fmt.Errorf("herd-activate: resolve cwd %q: %w", here, err)
+	}
+	if hereP != canonP {
+		return fmt.Errorf("herd-activate: canonical shared checkout required (got %s, need %s); refuse product compose/activate from a worktree", hereP, canonP)
+	}
+	return nil
+}
+
+// prepareRealEnv pins a real activation run to the canonical checkout
+// before any subprocess spawns: it refuses worktrees, resolves and chdirs
+// into the repo root so repo-relative subprocess calls resolve, and
+// exports OV_STACK_GUARD=1 before the first compose call. Only invoked on
+// the real default path (opts.Compose == nil); tests that inject fakes
+// never touch the shared checkout.
+func prepareRealEnv() (string, error) {
+	if err := ensureCanonicalCheckout(); err != nil {
+		return "", err
+	}
+	root := resolveRepoRoot()
+	if root == "" {
+		return "", fmt.Errorf("herd-activate: cannot resolve repo root; set HERD_ROOT or run inside a git checkout")
+	}
+	if err := os.Chdir(root); err != nil {
+		return "", fmt.Errorf("herd-activate: chdir %q: %w", root, err)
+	}
+	os.Setenv("OV_STACK_GUARD", "1")
+	return root, nil
+}
+
 // --- Real default implementations (shell-out / net/http) ---
 
 // dockerCompose shells out to `docker compose` (preferred) or standalone
 // `docker-compose`, auto-detecting the colima socket when DOCKER_HOST is
 // unset. Mirrors the shell's COMPOSE transport selection.
+//
+// product compose refuses without OV_STACK_GUARD=1 (docker-compose.yml
+// x-stack-guard); newDockerCompose exports it BEFORE the first compose
+// process is spawned, mirroring herd-activate:104.
 type dockerCompose struct{ cmd []string }
 
 func newDockerCompose() ComposeClient {
+	// HARD BAN: never product-compose from a git worktree (forked bind
+	// mounts) — port of herd_require_canonical_checkout (herd-lib.zsh).
+	// Serialization under the shared-checkout advisory lock before compose
+	// mutation is not ported here — tracked as FAC-87.
+	if root := resolveRepoRoot(); root != "" {
+		os.Chdir(root)
+	}
+
+	// Export the compose stack guard before any compose call. The sanctioned
+	// path sets it here so raw `docker compose` still refuses to run.
+	os.Setenv("OV_STACK_GUARD", "1")
+
 	if path, err := exec.LookPath("docker"); err == nil {
 		_ = path
 		return dockerCompose{cmd: []string{"docker", "compose"}}
@@ -370,15 +471,25 @@ func (d dockerCompose) PsFormat(format string, services []string) (string, error
 }
 
 // binMigrator runs the asserted pre-boot migration step via
-// `bin/apply-migrations` (repo-relative). Refusing to boot on a stale
-// schema is enforced by Run, not here.
-type binMigrator struct{}
+// `bin/apply-migrations`, resolved against the repo root so it works from
+// any CWD. Refusing to boot on a stale schema is enforced by Run, not
+// here.
+type binMigrator struct {
+	root string
+}
 
-func (binMigrator) Apply() error {
-	c := exec.Command("bin/apply-migrations")
-	c.Stdout = os.Stdout
-	c.Stderr = os.Stderr
-	return c.Run()
+func (m binMigrator) Apply() error {
+	root := m.root
+	if root == "" {
+		root = resolveRepoRoot()
+	}
+	cmd := exec.Command("bin/apply-migrations")
+	if root != "" {
+		cmd.Dir = root
+	}
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
 }
 
 // httpGetter implements HTTPGetter via net/http with an 8s timeout
@@ -399,12 +510,23 @@ func (h httpGetter) Get(url string) (int, string, error) {
 }
 
 // herdKickFleet re-engages the standing fleet via the Go kick package
-// after a healthy activation. Mirrors `bin/herd-kick` invocation.
-type herdKickFleet struct{}
+// after a healthy activation. Mirrors `bin/herd-kick` invocation, run
+// against the resolved repo root so `herd kick` resolves the fleet
+// config from any CWD.
+type herdKickFleet struct {
+	root string
+}
 
-func (herdKickFleet) Kick(reason string) error {
-	c := exec.Command("herd", "kick", "--reason", reason)
-	c.Stdout = os.Stdout
-	c.Stderr = os.Stderr
-	return c.Run()
+func (f herdKickFleet) Kick(reason string) error {
+	root := f.root
+	if root == "" {
+		root = resolveRepoRoot()
+	}
+	cmd := exec.Command("herd", "kick", "--reason", reason)
+	if root != "" {
+		cmd.Dir = root
+	}
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
 }
