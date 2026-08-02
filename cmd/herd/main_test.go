@@ -11,7 +11,7 @@ import (
 func buildHerd(t *testing.T) string {
 	t.Helper()
 	binary := filepath.Join(t.TempDir(), "herd")
-	cmd := exec.Command("go", "build", "-o", binary, ".")
+	cmd := exec.Command("go", "build", "-buildvcs=false", "-o", binary, ".")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("build failed: %v, output: %s", err, out)
