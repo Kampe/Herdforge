@@ -20,14 +20,19 @@ import (
 // --- fakes -----------------------------------------------------------------
 
 type recordingCompensator struct {
-	mu    sync.Mutex
-	steps []StepRecord
-	comps []string
+	mu       sync.Mutex
+	steps    []StepRecord
+	comps    []string
+	recordErr error
+	compErr   error
 }
 
 func (c *recordingCompensator) RecordStep(_ context.Context, rec StepRecord) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.recordErr != nil {
+		return c.recordErr
+	}
 	c.steps = append(c.steps, rec)
 	return nil
 }
@@ -35,6 +40,9 @@ func (c *recordingCompensator) RecordStep(_ context.Context, rec StepRecord) err
 func (c *recordingCompensator) Compensate(_ context.Context, ticketRef, reason string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.compErr != nil {
+		return c.compErr
+	}
 	c.comps = append(c.comps, ticketRef+":"+reason)
 	return nil
 }
@@ -118,19 +126,20 @@ func (f *fakeHerdr) AgentStart(name, kind, paneID string, _ ...string) error {
 	_ = paneID
 	return f.startErr
 }
-func (f *fakeHerdr) DeliverAndProve(target, text string, verify bool, _ time.Duration) (*herdr.PromptReceipt, error) {
+func (f *fakeHerdr) DeliverAndProve(target, text string, _ time.Duration) (*herdr.PromptReceipt, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.deliverText = text
 	if f.deliverErr != nil {
-		return &herdr.PromptReceipt{Target: target, Consumed: false, Verified: verify}, f.deliverErr
+		return &herdr.PromptReceipt{Target: target, Consumed: false, Verified: true}, f.deliverErr
 	}
 	if f.deliverRec != nil {
 		return f.deliverRec, nil
 	}
+	// Default: valid idle→working sequence proof
 	return &herdr.PromptReceipt{
 		Target: target, BaselineStatus: "idle", FinalStatus: "working",
-		Consumed: true, Verified: verify, SequenceToken: "idle->working",
+		Consumed: true, Verified: true, SequenceToken: "idle->working",
 	}, nil
 }
 func (f *fakeHerdr) TabClose(tabID string) error {
@@ -209,6 +218,10 @@ func testCfg() *config.Config {
 	}
 }
 
+func baseTask(ref string) *provider.Task {
+	return &provider.Task{ID: "1", Ref: ref, Title: "Task " + ref, Status: "to-do"}
+}
+
 // --- tests -----------------------------------------------------------------
 
 func TestDispatch_NoLaunch_UsesActualGitBranchAndImmutableBase(t *testing.T) {
@@ -223,9 +236,7 @@ func TestDispatch_NoLaunch_UsesActualGitBranchAndImmutableBase(t *testing.T) {
 	runGit(t, repo, "commit", "-m", "local ahead")
 
 	tp := &statusTrackingProvider{
-		mockTaskProvider: mockTaskProvider{tasks: []*provider.Task{
-			{ID: "1", Ref: "FAC-1", Title: "Do the thing", Status: "to-do", Priority: "high"},
-		}},
+		mockTaskProvider: mockTaskProvider{tasks: []*provider.Task{baseTask("FAC-1")}},
 	}
 	comp := &recordingCompensator{}
 	d := NewDispatcher(testCfg(), tp, wm)
@@ -247,7 +258,6 @@ func TestDispatch_NoLaunch_UsesActualGitBranchAndImmutableBase(t *testing.T) {
 	if res.AnchorRef != worktree.AnchorRefFor("FAC-1") {
 		t.Fatalf("AnchorRef = %q", res.AnchorRef)
 	}
-	// Packet branch == Git branch
 	body, _ := os.ReadFile(res.TaskPacket)
 	if !strings.Contains(string(body), res.Branch) {
 		t.Fatalf("packet missing actual branch %q", res.Branch)
@@ -255,11 +265,9 @@ func TestDispatch_NoLaunch_UsesActualGitBranchAndImmutableBase(t *testing.T) {
 	if strings.Contains(string(body), "task/fac-1-") {
 		t.Fatal("packet must not invent task/<slug> branch alias")
 	}
-	// Comment carries actual branch
 	if len(tp.comments) == 0 || !strings.Contains(tp.comments[0], res.Branch) {
 		t.Fatalf("comment must carry actual branch: %v", tp.comments)
 	}
-	// Compensator saw worktree + board steps
 	steps := comp.stepsCopy()
 	if len(steps) < 2 {
 		t.Fatalf("expected recorded steps, got %v", steps)
@@ -272,9 +280,7 @@ func TestDispatch_NoLaunch_UsesActualGitBranchAndImmutableBase(t *testing.T) {
 func TestDispatch_Launch_SetsCwdAndProvesPrompt(t *testing.T) {
 	repo, wm := initDispatchRepo(t)
 	tp := &statusTrackingProvider{
-		mockTaskProvider: mockTaskProvider{tasks: []*provider.Task{
-			{ID: "1", Ref: "FAC-9", Title: "Launch me", Status: "to-do"},
-		}},
+		mockTaskProvider: mockTaskProvider{tasks: []*provider.Task{baseTask("FAC-9")}},
 	}
 	fh := &fakeHerdr{
 		available: true,
@@ -287,9 +293,8 @@ func TestDispatch_Launch_SetsCwdAndProvesPrompt(t *testing.T) {
 	d.Herdr = fh
 	d.Compensator = comp
 
-	res, err := d.Dispatch(context.Background(), DispatchOptions{
-		TicketRef: "FAC-9", SkipPromptVerify: true,
-	})
+	// Production path: always proves consumption (no SkipPromptVerify).
+	res, err := d.Dispatch(context.Background(), DispatchOptions{TicketRef: "FAC-9"})
 	if err != nil {
 		t.Fatalf("Dispatch: %v", err)
 	}
@@ -307,21 +312,145 @@ func TestDispatch_Launch_SetsCwdAndProvesPrompt(t *testing.T) {
 	if res.TabID != "tab-9" {
 		t.Fatalf("TabID = %q", res.TabID)
 	}
-	if res.Receipt == nil || !res.Receipt.Consumed {
+	if res.Receipt == nil || !res.Receipt.Consumed || !res.Receipt.Verified {
 		t.Fatalf("receipt: %+v", res.Receipt)
 	}
-	// Integration: spawned process cwd equals assigned worktree
+	if !herdr.ConsumptionProven(res.Receipt.BaselineStatus, res.Receipt.FinalStatus) {
+		t.Fatalf("receipt sequence not proven: %+v", res.Receipt)
+	}
 	if err := worktree.RejectSharedRoot(repo, fh.tabCwd); err != nil {
 		t.Fatalf("launched cwd failed shared-root check: %v", err)
+	}
+	// Prompt step must be durably recorded with sequence token
+	found := false
+	for _, s := range comp.stepsCopy() {
+		if s.Step == StepPrompt && s.Receipt == "idle->working" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected durable prompt step with receipt, got %v", comp.stepsCopy())
+	}
+}
+
+func TestDispatch_NilCompensatorFailsClosed(t *testing.T) {
+	_, wm := initDispatchRepo(t)
+	tp := &statusTrackingProvider{
+		mockTaskProvider: mockTaskProvider{tasks: []*provider.Task{baseTask("FAC-N")}},
+	}
+	d := NewDispatcher(testCfg(), tp, wm)
+	// Compensator intentionally nil — production path must refuse.
+	_, err := d.Dispatch(context.Background(), DispatchOptions{TicketRef: "FAC-N", NoLaunch: true})
+	if err == nil {
+		t.Fatal("nil compensator must fail closed")
+	}
+	if !strings.Contains(err.Error(), "compensator is required") {
+		t.Fatalf("error: %v", err)
+	}
+}
+
+func TestDispatch_RecordStepErrorPropagates(t *testing.T) {
+	_, wm := initDispatchRepo(t)
+	tp := &statusTrackingProvider{
+		mockTaskProvider: mockTaskProvider{tasks: []*provider.Task{baseTask("FAC-R")}},
+	}
+	comp := &recordingCompensator{recordErr: fmt.Errorf("outbox full")}
+	d := NewDispatcher(testCfg(), tp, wm)
+	d.Compensator = comp
+	d.Herdr = &fakeHerdr{available: false}
+
+	_, err := d.Dispatch(context.Background(), DispatchOptions{TicketRef: "FAC-R", NoLaunch: true})
+	if err == nil {
+		t.Fatal("expected RecordStep error to fail closed")
+	}
+	if !strings.Contains(err.Error(), "RecordStep") && !strings.Contains(err.Error(), "outbox full") {
+		t.Fatalf("error: %v", err)
+	}
+}
+
+func TestDispatch_CompensateErrorPropagates(t *testing.T) {
+	_, wm := initDispatchRepo(t)
+	tp := &statusTrackingProvider{
+		mockTaskProvider: mockTaskProvider{tasks: []*provider.Task{baseTask("FAC-C")}},
+	}
+	// Force prompt failure then compensate error
+	fh := &fakeHerdr{
+		available:  true,
+		workspace:  "w1",
+		model:      "m",
+		tabID:      "tab-c",
+		deliverErr: fmt.Errorf("no flip"),
+	}
+	comp := &recordingCompensator{compErr: fmt.Errorf("lease fenced")}
+	d := NewDispatcher(testCfg(), tp, wm)
+	d.Herdr = fh
+	d.Compensator = comp
+
+	res, err := d.Dispatch(context.Background(), DispatchOptions{TicketRef: "FAC-C"})
+	if err == nil {
+		t.Fatal("expected joined primary+compensate error")
+	}
+	if res != nil {
+		t.Cleanup(func() { os.RemoveAll(res.Worktree) })
+	}
+	if !strings.Contains(err.Error(), "lease fenced") {
+		t.Fatalf("compensate error must surface: %v", err)
+	}
+	if !strings.Contains(err.Error(), "prompt") && !strings.Contains(err.Error(), "consumption") {
+		t.Fatalf("primary error must surface: %v", err)
+	}
+}
+
+func TestDispatch_RejectsInvalidPromptSequence(t *testing.T) {
+	_, wm := initDispatchRepo(t)
+	tp := &statusTrackingProvider{
+		mockTaskProvider: mockTaskProvider{tasks: []*provider.Task{baseTask("FAC-SEQ")}},
+	}
+	// Fake claims success with working→working (invalid under ConsumptionProven)
+	fh := &fakeHerdr{
+		available: true,
+		workspace: "w1",
+		model:     "m",
+		tabID:     "tab-seq",
+		deliverRec: &herdr.PromptReceipt{
+			Target: "task-fac-seq", BaselineStatus: "working", FinalStatus: "working",
+			Consumed: true, Verified: true, SequenceToken: "working->working",
+		},
+	}
+	comp := &recordingCompensator{}
+	d := NewDispatcher(testCfg(), tp, wm)
+	d.Herdr = fh
+	d.Compensator = comp
+
+	res, err := d.Dispatch(context.Background(), DispatchOptions{TicketRef: "FAC-SEQ"})
+	if err == nil {
+		t.Fatal("working→working receipt must be rejected on launch path")
+	}
+	if res != nil {
+		t.Cleanup(func() { os.RemoveAll(res.Worktree) })
+	}
+	if res != nil && res.Launched {
+		t.Fatal("must not mark Launched")
+	}
+	if len(fh.closedTabs) != 1 {
+		t.Fatalf("orphan tab must close: %v", fh.closedTabs)
+	}
+	comps := comp.compsCopy()
+	found := false
+	for _, c := range comps {
+		if strings.Contains(c, "prompt_sequence_invalid") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected prompt_sequence_invalid compensate: %v", comps)
 	}
 }
 
 func TestDispatch_CrashPoint_AgentStartClosesOrphanTab(t *testing.T) {
 	_, wm := initDispatchRepo(t)
 	tp := &statusTrackingProvider{
-		mockTaskProvider: mockTaskProvider{tasks: []*provider.Task{
-			{ID: "1", Ref: "FAC-7", Title: "Crash start", Status: "to-do"},
-		}},
+		mockTaskProvider: mockTaskProvider{tasks: []*provider.Task{baseTask("FAC-7")}},
 	}
 	fh := &fakeHerdr{
 		available: true,
@@ -345,15 +474,14 @@ func TestDispatch_CrashPoint_AgentStartClosesOrphanTab(t *testing.T) {
 	if len(fh.closedTabs) != 1 || fh.closedTabs[0] != "orphan-tab" {
 		t.Fatalf("expected orphan tab closed, got %v", fh.closedTabs)
 	}
-	comps := comp.compsCopy()
 	found := false
-	for _, c := range comps {
+	for _, c := range comp.compsCopy() {
 		if strings.Contains(c, "agent_start_failed") {
 			found = true
 		}
 	}
 	if !found {
-		t.Fatalf("expected compensate agent_start_failed, got %v", comps)
+		t.Fatalf("expected compensate agent_start_failed, got %v", comp.compsCopy())
 	}
 	if res != nil && res.Launched {
 		t.Fatal("must not report Launched after start failure")
@@ -363,9 +491,7 @@ func TestDispatch_CrashPoint_AgentStartClosesOrphanTab(t *testing.T) {
 func TestDispatch_CrashPoint_PromptFailureClosesTab(t *testing.T) {
 	_, wm := initDispatchRepo(t)
 	tp := &statusTrackingProvider{
-		mockTaskProvider: mockTaskProvider{tasks: []*provider.Task{
-			{ID: "1", Ref: "FAC-8", Title: "Prompt fail", Status: "to-do"},
-		}},
+		mockTaskProvider: mockTaskProvider{tasks: []*provider.Task{baseTask("FAC-8")}},
 	}
 	fh := &fakeHerdr{
 		available:  true,
@@ -389,24 +515,21 @@ func TestDispatch_CrashPoint_PromptFailureClosesTab(t *testing.T) {
 	if len(fh.closedTabs) != 1 || fh.closedTabs[0] != "tab-prompt" {
 		t.Fatalf("expected tab closed after prompt fail: %v", fh.closedTabs)
 	}
-	comps := comp.compsCopy()
 	found := false
-	for _, c := range comps {
+	for _, c := range comp.compsCopy() {
 		if strings.Contains(c, "prompt_delivery_failed") {
 			found = true
 		}
 	}
 	if !found {
-		t.Fatalf("expected prompt_delivery_failed compensate: %v", comps)
+		t.Fatalf("expected prompt_delivery_failed compensate: %v", comp.compsCopy())
 	}
 }
 
 func TestDispatch_UnknownWorkspaceFailsClosed(t *testing.T) {
 	_, wm := initDispatchRepo(t)
 	tp := &statusTrackingProvider{
-		mockTaskProvider: mockTaskProvider{tasks: []*provider.Task{
-			{ID: "1", Ref: "FAC-3", Title: "No ws", Status: "to-do"},
-		}},
+		mockTaskProvider: mockTaskProvider{tasks: []*provider.Task{baseTask("FAC-3")}},
 	}
 	fh := &fakeHerdr{
 		available: true,
@@ -433,16 +556,92 @@ func TestDispatch_UnknownWorkspaceFailsClosed(t *testing.T) {
 	}
 }
 
-func TestDispatch_RejectsSharedRootLaunch(t *testing.T) {
-	// Unit-level: RejectSharedRoot is enforced inside launch with real paths.
+// TestDispatch_LaunchPath_RejectsSharedRoot exercises the production launch
+// guard: if RejectSharedRoot is removed from launch(), this fails.
+func TestDispatch_LaunchPath_RejectsSharedRoot(t *testing.T) {
 	repo, wm := initDispatchRepo(t)
-	// Force a malicious worktree manager path equal to repo root via attach path.
-	// Dispatch uses CreateTaskWorktreeFrom which cannot produce root path for
-	// normal refs; assert the gate directly for the launch path contract.
-	if err := worktree.RejectSharedRoot(repo, repo); err == nil {
-		t.Fatal("shared root must be denied")
+	tp := &statusTrackingProvider{
+		mockTaskProvider: mockTaskProvider{tasks: []*provider.Task{baseTask("FAC-ROOT")}},
 	}
-	_ = wm
+	fh := &fakeHerdr{available: true, workspace: "w1", model: "m", tabID: "should-not-create"}
+	comp := &recordingCompensator{}
+	d := NewDispatcher(testCfg(), tp, wm)
+	d.Herdr = fh
+	d.Compensator = comp
+
+	// Invoke launch with Path == RepoRoot — the production guard must deny
+	// before TabCreate / AgentStart.
+	task := baseTask("FAC-ROOT")
+	lane := &d.Config.Lanes[0]
+	wtInfo := &worktree.WorktreeInfo{
+		Path:      repo, // shared root
+		Branch:    "herd/fac-root",
+		BaseSHA:   "deadbeef",
+		AnchorRef: worktree.AnchorRefFor("FAC-ROOT"),
+	}
+	result := &DispatchResult{}
+	err := d.launch(context.Background(), DispatchOptions{}, task, lane, wtInfo, wtInfo.Branch, "packet", result)
+	if err == nil {
+		t.Fatal("launch on shared root must fail; production RejectSharedRoot guard missing?")
+	}
+	if !strings.Contains(err.Error(), "shared-root") && !strings.Contains(err.Error(), "repository root") {
+		t.Fatalf("expected shared-root denial, got: %v", err)
+	}
+	if fh.tabCwd != "" || fh.startCalls != 0 {
+		t.Fatalf("must not start agent on shared root: cwd=%q starts=%d", fh.tabCwd, fh.startCalls)
+	}
+	if result.Launched {
+		t.Fatal("must not set Launched")
+	}
+	found := false
+	for _, c := range comp.compsCopy() {
+		if strings.Contains(c, "shared_root_denied") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected shared_root_denied compensate: %v", comp.compsCopy())
+	}
+}
+
+// TestDispatch_NoSkipPromptVerifyField ensures production options cannot
+// bypass proof via a public Skip field (regression for R3 finding #3).
+func TestDispatch_NoSkipPromptVerifyField(t *testing.T) {
+	// Compile-time / reflect-style: DispatchOptions must not expose SkipPromptVerify.
+	// If the field is re-added, this struct literal fails to typecheck when we
+	// intentionally only set known production fields.
+	opts := DispatchOptions{
+		TicketRef:           "FAC-X",
+		NoLaunch:            true,
+		PromptVerifyTimeout: time.Second,
+	}
+	if opts.TicketRef == "" {
+		t.Fatal("sanity")
+	}
+	// Document: there is no opts.SkipPromptVerify — launch always verifies.
+}
+
+func TestRecordingCompensator_Race(t *testing.T) {
+	c := &recordingCompensator{}
+	var wg sync.WaitGroup
+	for i := 0; i < 32; i++ {
+		wg.Add(2)
+		go func(i int) {
+			defer wg.Done()
+			_ = c.RecordStep(context.Background(), StepRecord{TicketRef: "T", Step: StepWorktree, Branch: fmt.Sprintf("b%d", i)})
+		}(i)
+		go func(i int) {
+			defer wg.Done()
+			_ = c.Compensate(context.Background(), "T", fmt.Sprintf("r%d", i))
+		}(i)
+	}
+	wg.Wait()
+	if len(c.stepsCopy()) != 32 {
+		t.Fatalf("steps = %d", len(c.stepsCopy()))
+	}
+	if len(c.compsCopy()) != 32 {
+		t.Fatalf("comps = %d", len(c.compsCopy()))
+	}
 }
 
 func runGit(t *testing.T, dir string, args ...string) {

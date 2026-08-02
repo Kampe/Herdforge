@@ -6,25 +6,41 @@ import (
 )
 
 // PromptReceipt proves a prompt was submitted and the agent left its baseline
-// status (FAC-121 sequence baseline/receipt). Consumed is true only when the
-// observed final status differs from the baseline in a way that indicates the
-// agent accepted work (working/done) or, when verify is disabled, when submit
-// itself succeeded.
+// status with a prompt-correlated sequence change (FAC-121).
+// Consumed is true only when FinalStatus is a consumption state (working/done)
+// AND it differs from BaselineStatus — working→working or done→done is not proof.
 type PromptReceipt struct {
-	Target          string        `json:"target"`
-	BaselineStatus  string        `json:"baseline_status"`
-	FinalStatus     string        `json:"final_status"`
-	Consumed        bool          `json:"consumed"`
-	Verified        bool          `json:"verified"`
-	Duration        time.Duration `json:"duration"`
-	SequenceToken   string        `json:"sequence_token"` // baseline|final for outbox correlation
+	Target         string        `json:"target"`
+	BaselineStatus string        `json:"baseline_status"`
+	FinalStatus    string        `json:"final_status"`
+	Consumed       bool          `json:"consumed"`
+	Verified       bool          `json:"verified"`
+	Duration       time.Duration `json:"duration"`
+	SequenceToken  string        `json:"sequence_token"` // baseline->final for outbox correlation
 }
 
-// DeliverAndProve submits text and, when verify is true, polls until the agent
-// confirms consumption (working/done) relative to a pre-submit baseline status.
-// A submit into a dead pane that never flips status returns an error so dispatch
-// can compensate (close tab, recover task) instead of claiming success.
-func DeliverAndProve(target, text string, verify bool, timeout time.Duration) (*PromptReceipt, error) {
+// ConsumptionProven reports whether observed status proves the prompt was
+// consumed relative to the recorded baseline (FAC-121 R3 repair).
+//
+// Rules:
+//   - observed must be working or done (agent accepted work)
+//   - observed must differ from baseline (sequence change)
+//   - working→working and done→done are explicitly rejected
+func ConsumptionProven(baseline, observed string) bool {
+	if observed != "working" && observed != "done" {
+		return false
+	}
+	if observed == baseline {
+		return false
+	}
+	return true
+}
+
+// DeliverAndProve submits text and polls until the agent confirms consumption
+// via a state/sequence change from the pre-submit baseline.
+// A submit into a dead pane, or an already-working/done agent that never
+// transitions, returns an error so dispatch can compensate.
+func DeliverAndProve(target, text string, timeout time.Duration) (*PromptReceipt, error) {
 	start := time.Now()
 	baseline, _ := liveStatus(target) // empty if agent not yet listed
 
@@ -33,22 +49,10 @@ func DeliverAndProve(target, text string, verify bool, timeout time.Duration) (*
 			Target:         target,
 			BaselineStatus: baseline,
 			Consumed:       false,
-			Verified:       verify,
+			Verified:       true,
 			Duration:       time.Since(start),
 			SequenceToken:  sequenceToken(baseline, ""),
 		}, err
-	}
-
-	if !verify {
-		return &PromptReceipt{
-			Target:         target,
-			BaselineStatus: baseline,
-			FinalStatus:    "submitted",
-			Consumed:       true,
-			Verified:       false,
-			Duration:       time.Since(start),
-			SequenceToken:  sequenceToken(baseline, "submitted"),
-		}, nil
 	}
 
 	if timeout <= 0 {
@@ -62,8 +66,8 @@ func DeliverAndProve(target, text string, verify bool, timeout time.Duration) (*
 		st, err := liveStatus(target)
 		if err == nil {
 			last = st
-			if st == "working" || st == "done" {
-				rec := &PromptReceipt{
+			if ConsumptionProven(baseline, st) {
+				return &PromptReceipt{
 					Target:         target,
 					BaselineStatus: baseline,
 					FinalStatus:    st,
@@ -71,8 +75,7 @@ func DeliverAndProve(target, text string, verify bool, timeout time.Duration) (*
 					Verified:       true,
 					Duration:       time.Since(start),
 					SequenceToken:  sequenceToken(baseline, st),
-				}
-				return rec, nil
+				}, nil
 			}
 		}
 		if !nudged && time.Now().Add(poll).After(deadline.Add(-timeout/2)) {
@@ -89,7 +92,7 @@ func DeliverAndProve(target, text string, verify bool, timeout time.Duration) (*
 		Verified:       true,
 		Duration:       time.Since(start),
 		SequenceToken:  sequenceToken(baseline, last),
-	}, fmt.Errorf("agent %q never confirmed prompt consumption (baseline %q last %q)", target, baseline, last)
+	}, fmt.Errorf("agent %q never confirmed prompt-correlated consumption (baseline %q last %q; working→working/done→done is not proof)", target, baseline, last)
 }
 
 func sequenceToken(baseline, final string) string {
