@@ -99,6 +99,49 @@ func IsAvailable() bool {
 	return err == nil
 }
 
+// AgentList returns all agents managed by herdr.
+func AgentList() ([]AgentEntry, error) {
+	output, err := runHerdr("agent", "list")
+	if err != nil {
+		return nil, fmt.Errorf("herdr agent list: %w", err)
+	}
+	var resp struct {
+		Result struct {
+			Agents []AgentEntry `json:"agents"`
+			Type   string       `json:"type"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal([]byte(output), &resp); err != nil {
+		return nil, fmt.Errorf("parsing agent list: %s: %w", output, err)
+	}
+	return resp.Result.Agents, nil
+}
+
+// AgentEntry represents a single herdr-managed agent.
+type AgentEntry struct {
+	Name      string `json:"name,omitempty"`
+	Kind      string `json:"agent,omitempty"`
+	Status    string `json:"agent_status,omitempty"`
+	PaneID    string `json:"pane_id,omitempty"`
+	TabID     string `json:"tab_id,omitempty"`
+	Workspace string `json:"workspace_id,omitempty"`
+}
+
+// ResolveAgentTab finds a standing agent by name and returns its tab label.
+// Returns an error if no agent with that name exists.
+func ResolveAgentTab(name string) (string, error) {
+	agents, err := AgentList()
+	if err != nil {
+		return "", err
+	}
+	for _, a := range agents {
+		if a.Name == name {
+			return name, nil
+		}
+	}
+	return "", fmt.Errorf("no standing agent named '%s' found", name)
+}
+
 func runHerdr(args ...string) (string, error) {
 	cmd := exec.Command(herdrCLI, args...)
 	var stdout, stderr bytes.Buffer

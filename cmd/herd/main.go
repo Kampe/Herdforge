@@ -211,20 +211,27 @@ func runPulse() {
 			os.Exit(1)
 		}
 
-		tabLabel := fmt.Sprintf("pulse-%s-%s", lane.Name, task.Ref)
+		standingName := fmt.Sprintf("forge-%s", lane.Name)
+		targetLabel := standingName
 
-		tab, err := herdr.Tab("wF", tabLabel, true)
+		tabLabel, err := herdr.ResolveAgentTab(standingName)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "failed to create herdr tab: %v\n", err)
-			os.Exit(1)
+			// no standing agent — create a fresh one
+			tabLabel = fmt.Sprintf("pulse-%s-%s", lane.Name, task.Ref)
+			tab, err := herdr.Tab("wF", tabLabel, true)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "failed to create herdr tab: %v\n", err)
+				os.Exit(1)
+			}
+			if err := herdr.AgentStart(tabLabel, lane.AgentKind, tab.Pane.ID); err != nil {
+				fmt.Fprintf(os.Stderr, "failed to start agent: %v\n", err)
+				os.Exit(1)
+			}
+			fmt.Printf("Spawned agent '%s' in tab %s (pane %s)\n", tabLabel, tab.ID, tab.Pane.ID)
+		} else {
+			targetLabel = standingName
+			fmt.Printf("Using standing agent '%s' (tab %s)\n", standingName, tabLabel)
 		}
-
-		if err := herdr.AgentStart(tabLabel, lane.AgentKind, tab.Pane.ID); err != nil {
-			fmt.Fprintf(os.Stderr, "failed to start agent: %v\n", err)
-			os.Exit(1)
-		}
-
-		fmt.Printf("Spawned agent '%s' in tab %s (pane %s)\n", tabLabel, tab.ID, tab.Pane.ID)
 
 		workPacket := fmt.Sprintf(`Task [%s]: %s
 
@@ -236,18 +243,19 @@ Priority: %s
 Labels: %s
 
 Workflow:
-1. Enter your worktree and inspect existing code
+1. Enter your worktree %s and inspect existing code
 2. Write failing tests for the required change
 3. Implement the minimal solution
 4. Run 'make lint all' (or 'go test ./...')
 5. Commit with a conventional commit message
-6. Signal completion to the orchestrator`,
-			task.Ref, task.Title, task.Description, task.Status, task.Priority, strings.Join(task.Labels, ", "))
+6. Signal completion to the orchestrator (e.g. move card status)`,
+			task.Ref, task.Title, task.Description, task.Status, task.Priority, strings.Join(task.Labels, ", "),
+			lane.Worktree)
 
-		if _, err := herdr.AgentPrompt(tabLabel, workPacket, false); err != nil {
+		if _, err := herdr.AgentPrompt(targetLabel, workPacket, false); err != nil {
 			fmt.Fprintf(os.Stderr, "  warning: failed to deliver task packet: %v\n", err)
 		} else {
-			fmt.Printf("  -> delivered task packet to %s\n", tabLabel)
+			fmt.Printf("  -> delivered task packet to %s\n", targetLabel)
 		}
 	}
 }
