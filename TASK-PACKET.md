@@ -2,7 +2,7 @@
 
 **Title**: Port herd-review-ledger: append-only JSONL review attempt ledger
 **Priority**: no-priority
-**Status**: to-do
+**Status**: in-progress
 **Labels**: 
 
 ## Worktree

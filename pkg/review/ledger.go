@@ -471,6 +471,11 @@ func (l *Ledger) Eligible(sha, builderFamily string) (bool, error) {
 			rf = vrf
 		}
 
+		// Only PASS verdicts qualify
+		if verdict.Verdict != string(VerdictPASS) {
+			continue
+		}
+
 		// Now evaluate eligibility
 		if gate == "mechanical" && (reviewer == "mechanical" || rf == "mechanical") {
 			hasPass = true
