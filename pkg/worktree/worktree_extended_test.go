@@ -2,8 +2,10 @@ package worktree
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -96,13 +98,19 @@ func TestPruneMergedWorktrees(t *testing.T) {
 	}
 }
 
-// initRepo creates a minimal git repo in tmpDir for worktree operations
+// initRepo creates a minimal git repo in tmpDir for worktree operations.
+// FAC-121: also publishes origin/main so CreateTaskWorktree can pin an
+// immutable remote base rather than local HEAD.
 func initRepo(t *testing.T, tmpDir string) {
 	t.Helper()
 	cmds := [][]string{
 		{"git", "init"},
 		{"git", "config", "user.email", "test@test.com"},
 		{"git", "config", "user.name", "Test"},
+		// Hermetic: disable signing so host 1Password/gpg hooks cannot break tests.
+		{"git", "config", "commit.gpgsign", "false"},
+		{"git", "config", "tag.gpgsign", "false"},
+		{"git", "config", "gpg.format", "openpgp"},
 	}
 	for _, args := range cmds {
 		if err := runCmd(tmpDir, args[0], args[1:]...); err != nil {
@@ -119,10 +127,33 @@ func initRepo(t *testing.T, tmpDir string) {
 	if err := runCmd(tmpDir, "git", "commit", "-m", "initial"); err != nil {
 		t.Fatalf("git commit: %v", err)
 	}
+	_ = runCmd(tmpDir, "git", "branch", "-M", "main")
+	setupOriginMain(t, tmpDir)
+}
+
+// setupOriginMain creates a bare origin remote and pushes main so
+// origin/main is a resolvable immutable base for FAC-121 tests.
+func setupOriginMain(t *testing.T, tmpDir string) {
+	t.Helper()
+	bare := filepath.Join(tmpDir, ".origin.git")
+	if err := runCmd(tmpDir, "git", "init", "--bare", bare); err != nil {
+		t.Fatalf("init bare origin: %v", err)
+	}
+	if err := runCmd(tmpDir, "git", "remote", "add", "origin", bare); err != nil {
+		// remote may already exist when re-initing; force URL
+		_ = runCmd(tmpDir, "git", "remote", "set-url", "origin", bare)
+	}
+	if err := runCmd(tmpDir, "git", "push", "-u", "origin", "main"); err != nil {
+		t.Fatalf("push origin/main: %v", err)
+	}
 }
 
 func runCmd(dir, name string, args ...string) error {
 	c := execCommandContext(context.Background(), name, args...)
 	c.Dir = dir
-	return c.Run()
+	out, err := c.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("%v: %s", err, strings.TrimSpace(string(out)))
+	}
+	return nil
 }

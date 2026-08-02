@@ -129,7 +129,10 @@ func TestCreateTaskWorktree_Error_NonRepo(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error from non-repo dir")
 	}
-	if !strings.Contains(err.Error(), "failed to create git worktree") {
+	// FAC-121: failure may surface at immutable-base resolution before worktree add.
+	if !strings.Contains(err.Error(), "failed to create git worktree") &&
+		!strings.Contains(err.Error(), "immutable base") &&
+		!strings.Contains(err.Error(), "not a git repository") {
 		t.Errorf("unexpected error message: %v", err)
 	}
 }
@@ -322,7 +325,9 @@ func TestCreateTaskWorktree_MockedGitError(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error from mocked git command in CreateTaskWorktree")
 	}
-	if !strings.Contains(err.Error(), "failed to create git worktree") {
+	// FAC-121 resolves origin base first; mocked git fails there before worktree add.
+	if !strings.Contains(err.Error(), "failed to create git worktree") &&
+		!strings.Contains(err.Error(), "immutable base") {
 		t.Errorf("unexpected error message: %v", err)
 	}
 }
