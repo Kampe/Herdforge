@@ -1186,28 +1186,22 @@ func runReview() {
 			worktreeDir = ".worktrees/reviewer"
 		}
 
-		reviewPacket := fmt.Sprintf(`Review Task [%s]: %s
-
-Description:
-%s
-
-Status: %s
-Priority: %s
-Labels: %s
-
-Your worktree for review: %s
-
-Workflow:
-1. cd %s
-2. Fetch the latest committed changes from the worker (git fetch origin; git log origin/main..origin or similar)
-3. Review the changes for correctness, test coverage, security, and architecture
-4. If approved, run 'go test ./...' to verify
-5. If changes look good, signal 'APPROVED'
-6. If issues found, list them for the worker to address
-
-Once you signal APPROVED, the orchestrator will move this card to 'done'.`,
-			task.Ref, task.Title, task.Description, task.Status, task.Priority, strings.Join(task.Labels, ", "),
-			worktreeDir, worktreeDir)
+		// FAC-131: a TIGHT, SCOPED review packet — no spec dump, only the
+		// changed packages' targeted tests. Deepseek and most fleet models
+		// have a small context window and overflow when handed the full spec
+		// plus a whole-repo `go test ./...`. Scope keeps the review inside the
+		// window: review only the diff, test only what changed.
+		testCmd := scopedTestCommand(worktreeDir)
+		reviewPacket := fmt.Sprintf(`REVIEW %s — verdict ONLY, edit nothing. End with the verdict line.
+cd %s
+1. git diff origin/main..HEAD --stat  (see ONLY the changed files — review just these)
+2. %s   (targeted tests for the changed packages, not the whole repo)
+3. If a port, spot-check the changed file against ~/Personal/chainseer/bin/ for parity.
+Your FINAL line MUST be exactly one of:
+REVIEW VERDICT %s: APPROVED
+REVIEW VERDICT %s: REJECTED - <numbered fixes>
+Do not read the whole codebase. Do not run the full suite. Change nothing.`,
+			task.Ref, worktreeDir, testCmd, task.Ref, task.Ref)
 
 		if _, err := herdr.AgentPrompt(targetLabel, reviewPacket, false); err != nil {
 			fmt.Fprintf(os.Stderr, "  warning: failed to deliver review packet: %v\n", err)
@@ -3241,4 +3235,38 @@ func runForgeLoop() {
 		fmt.Fprintf(os.Stderr, "forge --loop: %v\n", err)
 		os.Exit(1)
 	}
+}
+
+// scopedTestCommand (FAC-131) derives a TARGETED go test command from a
+// worktree's diff against origin/main — only the Go packages that actually
+// changed, so a small-context reviewer runs a focused suite instead of the
+// whole repo. Falls back to `go test ./...` when the diff can't be read.
+func scopedTestCommand(worktree string) string {
+	cmd := exec.Command("git", "diff", "--name-only", "origin/main..HEAD")
+	cmd.Dir = worktree
+	out, err := cmd.Output()
+	if err != nil {
+		return "go test ./..."
+	}
+	pkgs := map[string]bool{}
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasSuffix(line, ".go") {
+			continue
+		}
+		dir := filepath.Dir(line)
+		if dir == "." || dir == "" {
+			continue
+		}
+		pkgs["./"+dir+"/"] = true
+	}
+	if len(pkgs) == 0 {
+		return "go test ./..."
+	}
+	var list []string
+	for p := range pkgs {
+		list = append(list, p)
+	}
+	sort.Strings(list)
+	return "go test -count=1 " + strings.Join(list, " ")
 }
