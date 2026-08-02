@@ -253,6 +253,70 @@ lanes:
 	}
 }
 
+func TestLoadConfig_FleetHerdrWorkspace(t *testing.T) {
+	tmpDir := t.TempDir()
+	cfgPath := filepath.Join(tmpDir, "herd.yaml")
+
+	content := `
+version: "1"
+project:
+  name: "test-project"
+  default_branch: "main"
+task_provider:
+  type: "kaneo"
+  project_id: "test-id"
+fleet:
+  herdr_workspace: "wF"
+lanes:
+  - name: "worker"
+    agent_kind: "opencode"
+    model: "deepseek-v4-flash"
+    prompt: ".herd/prompts/worker.md"
+`
+	if err := os.WriteFile(cfgPath, []byte(content), 0644); err != nil {
+		t.Fatalf("failed to write temp config: %v", err)
+	}
+
+	cfg, err := LoadConfig(cfgPath)
+	if err != nil {
+		t.Fatalf("expected valid config with fleet.herdr_workspace, got error: %v", err)
+	}
+	if cfg.Fleet.HerdrWorkspace != "wF" {
+		t.Errorf("expected fleet.herdr_workspace='wF', got %q", cfg.Fleet.HerdrWorkspace)
+	}
+}
+
+func TestLoadConfig_FleetHerdrWorkspaceDefaultEmpty(t *testing.T) {
+	tmpDir := t.TempDir()
+	cfgPath := filepath.Join(tmpDir, "herd.yaml")
+
+	content := `
+version: "1"
+project:
+  name: "test-project"
+  default_branch: "main"
+task_provider:
+  type: "kaneo"
+  project_id: "test-id"
+lanes:
+  - name: "worker"
+    agent_kind: "opencode"
+    model: "deepseek-v4-flash"
+    prompt: ".herd/prompts/worker.md"
+`
+	if err := os.WriteFile(cfgPath, []byte(content), 0644); err != nil {
+		t.Fatalf("failed to write temp config: %v", err)
+	}
+
+	cfg, err := LoadConfig(cfgPath)
+	if err != nil {
+		t.Fatalf("expected valid config without fleet, got error: %v", err)
+	}
+	if cfg.Fleet.HerdrWorkspace != "" {
+		t.Errorf("expected empty fleet.herdr_workspace by default, got %q", cfg.Fleet.HerdrWorkspace)
+	}
+}
+
 func TestLoadConfig_ModelRequired(t *testing.T) {
 	tmpDir := t.TempDir()
 	cfgPath := filepath.Join(tmpDir, "herd.yaml")

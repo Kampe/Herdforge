@@ -48,11 +48,16 @@ const (
 )
 
 type Config struct {
-	Version      string          `yaml:"version"`
-	Project      ProjectConfig   `yaml:"project"`
-	TaskProvider TaskProvider    `yaml:"task_provider"`
-	Lanes        []LaneDef       `yaml:"lanes"`
-	Verification Verification    `yaml:"verification,omitempty"`
+	Version        string          `yaml:"version"`
+	Project        ProjectConfig   `yaml:"project"`
+	TaskProvider   TaskProvider    `yaml:"task_provider"`
+	Fleet          FleetConfig     `yaml:"fleet,omitempty"`
+	Lanes          []LaneDef       `yaml:"lanes"`
+	Verification   Verification    `yaml:"verification,omitempty"`
+}
+
+type FleetConfig struct {
+	HerdrWorkspace string `yaml:"herdr_workspace,omitempty"`
 }
 
 type ProjectConfig struct {
