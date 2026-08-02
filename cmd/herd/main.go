@@ -96,6 +96,9 @@ func main() {
 	case "sh", "repl":
 		runShell()
 
+	case "send":
+		runSend()
+
 	case "forge":
 		runForge()
 
@@ -154,6 +157,7 @@ func printUsage() {
 	fmt.Println("  approve    Move in-review cards to done, gated on merge evidence")
 	fmt.Println("  board-done Move one card to done ONLY with proof its work is on origin/main")
 	fmt.Println("  sh         Interactive shell: run herd subcommands in a loop")
+	fmt.Println("  send       Submit text to a herdr agent pane and verify consumption")
 	fmt.Println("  forge      Full cycle: pulse worker + review + approve")
 	fmt.Println("  standing   Launch all configured agent lanes in herdr tabs")
 	fmt.Println("  daemon     Start the long-running orchestration daemon (infinite pulse loop)")
@@ -1201,6 +1205,77 @@ func runBoardDone() {
 	}
 	fmt.Printf("herd board-done: %s proof: %s\n", res.Ref, res.Proof)
 	fmt.Printf("herd board-done: %s is done (verified by read-back)\n", res.Ref)
+}
+
+// runSend ports bin/herd-send: prompt an agent and verify it consumed the
+// submit (working/done), with one Enter nudge before giving up.
+func runSend() {
+	fs := flag.NewFlagSet("send", flag.ExitOnError)
+	noVerify := fs.Bool("no-verify", false, "Submit without waiting for the agent to flip to working")
+	file := fs.String("file", "", "Read the text to send from a file (for long packets)")
+	timeoutSec := fs.Int("timeout", 30, "Seconds to wait for consumption confirmation")
+	selftestFlag := fs.Bool("selftest", false, "Run status-extraction assertions and exit")
+	fs.Parse(os.Args[2:])
+
+	if *selftestFlag {
+		agents := []herdr.AgentEntry{
+			{Name: "a", PaneID: "w3:p3", Status: "working"},
+			{PaneID: "w3:p9", Status: "idle"},
+		}
+		if herdr.StatusFromList(agents, "w3:p3") != "working" ||
+			herdr.StatusFromList(agents, "a") != "working" ||
+			herdr.StatusFromList(agents, "w3:p9") != "idle" ||
+			herdr.StatusFromList(agents, "ghost") != "" {
+			fmt.Fprintln(os.Stderr, "send selftest FAIL: status extraction")
+			os.Exit(1)
+		}
+		fmt.Println("send selftest PASS")
+		return
+	}
+
+	args := fs.Args()
+	if len(args) > 0 {
+		// allow flags after the positional target/text
+		fs.Parse(args[1:])
+		if rest := fs.Args(); len(rest) > 0 && *file == "" {
+			args = append(args[:1], rest...)
+		} else {
+			args = args[:1]
+		}
+	}
+	if len(args) == 0 {
+		fmt.Fprintf(os.Stderr, "Usage: herd send <pane|name> \"<text>\" [--file path] [--no-verify] [--timeout s]\n")
+		os.Exit(2)
+	}
+	target := args[0]
+
+	var text string
+	switch {
+	case *file != "":
+		data, err := os.ReadFile(*file)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "herd send: %v\n", err)
+			os.Exit(1)
+		}
+		text = strings.TrimSpace(string(data))
+	case len(args) > 1:
+		text = strings.Join(args[1:], " ")
+	default:
+		fmt.Fprintf(os.Stderr, "herd send: no text given (positional or --file)\n")
+		os.Exit(2)
+	}
+
+	if !herdr.IsAvailable() {
+		fmt.Fprintf(os.Stderr, "herd send: herdr CLI not found\n")
+		os.Exit(1)
+	}
+
+	status, err := herdr.Send(target, text, !*noVerify, time.Duration(*timeoutSec)*time.Second)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "herd send: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Printf("herd send: %s -> %s\n", target, status)
 }
 
 // runShell is a thin interactive loop: each line is dispatched as a fresh
