@@ -1,6 +1,6 @@
 version: "1"
 
-# Chainseer / Herdforge Local Machine Orchestration Spec
+# Chainseer / Herdforge SOTA Multi-Agent Orchestration Spec
 project:
   name: "chainseer"
   default_branch: "main"
@@ -14,57 +14,66 @@ task_provider:
   api_url: "https://kanban-api.kampe.kluster"
   api_key_env: "KANEO_API_KEY"
 
-# Multi-Provider AI Model Routing & 429 Cooldown Failover Candidates
+# Modern SOTA AI Model Providers with Reasoning Effort Tuning
 model_providers:
-  - name: "claude-pro"
+  - name: "claude-3-7-sonnet"
     type: "anthropic"
     api_key_env: "ANTHROPIC_API_KEY"
     model: "claude-3-7-sonnet-20250219"
+    reasoning_effort: "max"
 
-  - name: "codex-local"
-    type: "openai"
-    api_key_env: "OPENAI_API_KEY"
-    model: "gpt-4o"
-
-  - name: "gemini-pro"
+  - name: "gemini-3-6-flash"
     type: "google"
     api_key_env: "GEMINI_API_KEY"
-    model: "gemini-2.5-pro"
+    model: "gemini-3.6-flash"
+    reasoning_effort: "high"
 
-  - name: "grok-api"
+  - name: "grok-4-5"
     type: "xai"
     api_key_env: "XAI_API_KEY"
-    model: "grok-2"
+    model: "grok-4.5"
+    reasoning_effort: "high"
 
-  - name: "litellm-proxy"
+  - name: "gpt-5-sol"
+    type: "openai"
+    api_key_env: "OPENAI_API_KEY"
+    model: "gpt-5-sol"
+    reasoning_effort: "high"
+
+  - name: "litellm-fable-5"
     type: "ollama"
     api_url: "https://litellm.kampe.kluster"
-    model: "llama3.3:70b"
+    model: "fable-5"
+    reasoning_effort: "medium"
 
-# Worker Lane Roles & Harness Bindings
+# Worker Lane Roles, Reasoning Effort & Harness Bindings
 roles:
   - name: "herd-smith"
-    provider: "claude-pro"
-    fallback_provider: "gemini-pro"
+    provider: "claude-3-7-sonnet"
+    fallback_provider: "gemini-3-6-flash"
     harness: "agy"
+    reasoning_effort: "max"
     prompt_path: ".herd/prompts/smith.md"
 
   - name: "worker"
-    provider: "claude-pro"
-    fallback_provider: "gemini-pro"
+    provider: "claude-3-7-sonnet"
+    fallback_provider: "gemini-3-6-flash"
     harness: "opencode"
+    reasoning_effort: "high"
     prompt_path: ".herd/prompts/worker.md"
 
   - name: "reviewer"
-    provider: "gemini-pro"
-    fallback_provider: "codex-local"
+    provider: "gemini-3-6-flash"
+    fallback_provider: "grok-4-5"
     harness: "codex"
+    reasoning_effort: "high"
     prompt_path: ".herd/prompts/reviewer.md"
 
   - name: "harvest"
-    provider: "grok-api"
-    fallback_provider: "claude-pro"
+    provider: "grok-4-5"
+    fallback_provider: "gpt-5-sol"
     harness: "pi"
+    reasoning_effort: "medium"
     prompt_path: ".herd/prompts/harvest.md"
 
 # Project Verification Suite & Preflight Boundary Invariants

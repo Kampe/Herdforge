@@ -14,6 +14,7 @@ const (
 	ProviderAnthropic ProviderType = "anthropic"
 	ProviderGoogle    ProviderType = "google"
 	ProviderOpenAI    ProviderType = "openai"
+	ProviderXAI       ProviderType = "xai"
 	ProviderOllama    ProviderType = "ollama"
 )
 
@@ -36,11 +37,12 @@ func (t *TokenTracker) Stats() (int64, int64, int64) {
 }
 
 type ModelCandidate struct {
-	Name          string
-	Type          ProviderType
-	Model         string
-	CooldownUntil time.Time
-	Tracker       TokenTracker
+	Name            string
+	Type            ProviderType
+	Model           string
+	ReasoningEffort string // low | medium | high | max
+	CooldownUntil   time.Time
+	Tracker         TokenTracker
 }
 
 type ModelRouter struct {

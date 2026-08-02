@@ -32,10 +32,12 @@ type TaskProvider struct {
 }
 
 type ModelProvider struct {
-	Name      string `yaml:"name"`
-	Type      string `yaml:"type"` // anthropic | google | openai | ollama
-	Model     string `yaml:"model"`
-	APIKeyEnv string `yaml:"api_key_env,omitempty"`
+	Name            string `yaml:"name"`
+	Type            string `yaml:"type"` // anthropic | google | openai | xai | ollama
+	Model           string `yaml:"model"`
+	APIKeyEnv       string `yaml:"api_key_env,omitempty"`
+	APIURL          string `yaml:"api_url,omitempty"`
+	ReasoningEffort string `yaml:"reasoning_effort,omitempty"` // low | medium | high | max
 }
 
 type RoleConfig struct {
@@ -43,6 +45,7 @@ type RoleConfig struct {
 	Provider         string `yaml:"provider"`
 	FallbackProvider string `yaml:"fallback_provider,omitempty"`
 	Harness          string `yaml:"harness,omitempty"`
+	ReasoningEffort  string `yaml:"reasoning_effort,omitempty"` // low | medium | high | max
 	PromptPath       string `yaml:"prompt_path"`
 }
 
