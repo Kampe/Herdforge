@@ -8,7 +8,13 @@
 
 ---
 
-## 🛠️ Key Features
+## Dependencies
+
+- **Go 1.24+** — `go.mod` requires 1.24; install via `brew install go` or `mise install go`
+- **Git** — worktree isolation and rebase-merge pipeline
+- **Redis** — distributed agent lane sync via pub/sub (`pkg/mail`); install via `brew install redis`
+- **Make** — `make all` drives preflight, lint, test, and build
+- **Optional** — `openusage` + `herdr-quota` (from dotfiles) for cross-harness quota-aware routing
 
 - ⚙️ **Declarative Config (`herd.yaml`)**: Initialize any codebase with `herd init` and define worker roles, model providers, and task backends.
 - 🔌 **Pluggable Task Engine**: Native support for **Kaneo**, **Linear**, **GitHub Issues**, and offline **Memory** task providers.
@@ -20,7 +26,7 @@
 
 ---
 
-## 📋 Declarative Configuration Schema (`.herd/herd.yaml`)
+## Declarative Configuration Schema (`.herd/herd.yaml`)
 
 Initialize your codebase by placing a `.herd/herd.yaml` configuration file at the repository root:
 
@@ -70,7 +76,7 @@ verification:
 
 ---
 
-## 🚀 Quickstart & Makefile Commands
+## Quickstart & Makefile Commands
 
 ```bash
 # Clone repository
@@ -92,7 +98,7 @@ go run ./cmd/herd pulse --role herd-smith
 
 ---
 
-## 📚 Documentation & Agent Protocols
+## Documentation & Agent Protocols
 
 - **Agent Contract & Invariants**: [`AGENTS.md`](AGENTS.md)
 - **Build Bootstrap**: [`CLAUDE.md`](CLAUDE.md)
@@ -101,7 +107,7 @@ go run ./cmd/herd pulse --role herd-smith
 
 ---
 
-## 🏛️ Architecture Overview
+## Architecture Overview
 
 ```
                         ┌─────────────────────────────────┐
@@ -126,6 +132,6 @@ go run ./cmd/herd pulse --role herd-smith
 
 ---
 
-## 📄 License
+## License
 
 [MIT](LICENSE)
