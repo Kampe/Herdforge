@@ -11,11 +11,11 @@ import (
 type RouteShape string
 
 const (
-	RouteShapeChat      RouteShape = "chat"
-	RouteShapeCode      RouteShape = "code"
-	RouteShapeReview    RouteShape = "review"
-	RouteShapePlanning  RouteShape = "planning"
-	RouteShapeResearch  RouteShape = "research"
+	RouteShapeChat     RouteShape = "chat"
+	RouteShapeCode     RouteShape = "code"
+	RouteShapeReview   RouteShape = "review"
+	RouteShapePlanning RouteShape = "planning"
+	RouteShapeResearch RouteShape = "research"
 )
 
 type RiskClass string
@@ -30,30 +30,30 @@ const (
 type ProviderConstraint string
 
 const (
-	ProviderAny        ProviderConstraint = "any"
-	ProviderDeepSeek   ProviderConstraint = "deepseek"
-	ProviderAnthropic  ProviderConstraint = "anthropic"
-	ProviderGoogle     ProviderConstraint = "google"
-	ProviderOpenAI     ProviderConstraint = "openai"
-	ProviderXAI        ProviderConstraint = "xai"
-	ProviderOllama     ProviderConstraint = "ollama"
+	ProviderAny       ProviderConstraint = "any"
+	ProviderDeepSeek  ProviderConstraint = "deepseek"
+	ProviderAnthropic ProviderConstraint = "anthropic"
+	ProviderGoogle    ProviderConstraint = "google"
+	ProviderOpenAI    ProviderConstraint = "openai"
+	ProviderXAI       ProviderConstraint = "xai"
+	ProviderOllama    ProviderConstraint = "ollama"
 )
 
 type NetworkCapability string
 
 const (
-	NetworkOnline    NetworkCapability = "online"
-	NetworkOffline   NetworkCapability = "offline"
-	NetworkLimited   NetworkCapability = "limited"
+	NetworkOnline  NetworkCapability = "online"
+	NetworkOffline NetworkCapability = "offline"
+	NetworkLimited NetworkCapability = "limited"
 )
 
 type Config struct {
-	Version        string          `yaml:"version"`
-	Project        ProjectConfig   `yaml:"project"`
-	TaskProvider   TaskProvider    `yaml:"task_provider"`
-	Fleet          FleetConfig     `yaml:"fleet,omitempty"`
-	Lanes          []LaneDef       `yaml:"lanes"`
-	Verification   Verification    `yaml:"verification,omitempty"`
+	Version      string        `yaml:"version"`
+	Project      ProjectConfig `yaml:"project"`
+	TaskProvider TaskProvider  `yaml:"task_provider"`
+	Fleet        FleetConfig   `yaml:"fleet,omitempty"`
+	Lanes        []LaneDef     `yaml:"lanes"`
+	Verification Verification  `yaml:"verification,omitempty"`
 }
 
 type FleetConfig struct {
@@ -76,24 +76,24 @@ type TaskProvider struct {
 }
 
 type LaneDef struct {
-	Name      string           `yaml:"name"`
-	Role      string           `yaml:"role,omitempty"`
-	AgentKind string           `yaml:"agent_kind"`
-	Harness   string           `yaml:"harness,omitempty"`
-	Prompt    string           `yaml:"prompt"`
-	Worktree  string           `yaml:"worktree,omitempty"`
-	Provider  string           `yaml:"provider,omitempty"`
-	Model     string           `yaml:"model,omitempty"`
+	Name      string `yaml:"name"`
+	Role      string `yaml:"role,omitempty"`
+	AgentKind string `yaml:"agent_kind"`
+	Harness   string `yaml:"harness,omitempty"`
+	Prompt    string `yaml:"prompt"`
+	Worktree  string `yaml:"worktree,omitempty"`
+	Provider  string `yaml:"provider,omitempty"`
+	Model     string `yaml:"model,omitempty"`
 	// FallbackModels are tried in order when Model probes unavailable
 	// (quota exhausted / no payment method). The first that probes healthy
 	// launches the lane, so a spent surface fails over instead of silently
 	// whiffing every build.
-	FallbackModels []string    `yaml:"fallback_models,omitempty"`
-	Route     *RouteShape      `yaml:"route,omitempty"`
-	Risk      *RiskClass       `yaml:"risk,omitempty"`
-	MaxInput  *int             `yaml:"max_input_tokens,omitempty"`
-	MaxOutput *int             `yaml:"max_output_tokens,omitempty"`
-	Network   *NetworkCapability `yaml:"network,omitempty"`
+	FallbackModels []string           `yaml:"fallback_models,omitempty"`
+	Route          *RouteShape        `yaml:"route,omitempty"`
+	Risk           *RiskClass         `yaml:"risk,omitempty"`
+	MaxInput       *int               `yaml:"max_input_tokens,omitempty"`
+	MaxOutput      *int               `yaml:"max_output_tokens,omitempty"`
+	Network        *NetworkCapability `yaml:"network,omitempty"`
 }
 
 type Verification struct {

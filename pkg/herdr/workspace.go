@@ -34,16 +34,46 @@ func WorkspaceList() ([]WorkspaceEntry, error) {
 	return resp.Result.Workspaces, nil
 }
 
+// resolveWorkspace is the pure selection kernel (FAC-141).
+// Precedence: envVal > configVal > label-match > focused > first.
+// Empty env+config falls through to PickWorkspace (legacy "wF" when empty).
+func resolveWorkspace(envVal, configVal string, entries []WorkspaceEntry, repoName string) string {
+	if envVal != "" {
+		return envVal
+	}
+	if configVal != "" {
+		return configVal
+	}
+	return PickWorkspace(entries, repoName)
+}
+
 // ResolveWorkspace ports bin/herd-ws: HERD_WORKSPACE env wins, else the
 // workspace whose label matches the repo directory name (case-insensitive),
 // else the focused workspace. Legacy callers still receive "wF" when nothing
 // matches — Prefer RequireWorkspace for FAC-121 fail-closed dispatch.
+// Delegates to ResolveWorkspaceWithConfig with a nil config.
 func ResolveWorkspace(repoRoot string) string {
-	id, err := RequireWorkspace(repoRoot)
-	if err != nil {
-		return "wF" // ponytail: legacy fallback for pre-FAC-121 call sites only
+	return ResolveWorkspaceWithConfig(repoRoot, nil)
+}
+
+// ResolveWorkspaceWithConfig extends ResolveWorkspace with config awareness.
+// Precedence: HERD_WORKSPACE env > config.Fleet.HerdrWorkspace > label-match > focused > first.
+func ResolveWorkspaceWithConfig(repoRoot string, cfg *config.Config) string {
+	envVal := os.Getenv("HERD_WORKSPACE")
+	var configVal string
+	if cfg != nil {
+		configVal = cfg.Fleet.HerdrWorkspace
 	}
-	return id
+	abs, err := filepath.Abs(repoRoot)
+	if err != nil {
+		abs = repoRoot
+	}
+	repoName := filepath.Base(abs)
+	entries, err := WorkspaceList()
+	if err != nil {
+		entries = nil
+	}
+	return resolveWorkspace(envVal, configVal, entries, repoName)
 }
 
 // RequireWorkspace resolves a herdr workspace or returns an error.
@@ -52,6 +82,8 @@ func ResolveWorkspace(repoRoot string) string {
 //  2. label match against repo directory name
 //  3. focused workspace from the live list
 //  4. error — unknown workspace is a hard failure
+// Config fleet.herdr_workspace is intentionally not consulted here: fail-closed
+// dispatch must not silently adopt a soft config override without env/list proof.
 func RequireWorkspace(repoRoot string) (string, error) {
 	if ws := strings.TrimSpace(os.Getenv("HERD_WORKSPACE")); ws != "" {
 		return ws, nil
@@ -71,29 +103,6 @@ func RequireWorkspace(repoRoot string) (string, error) {
 		return "", fmt.Errorf("herdr workspace unknown for repo %q: set HERD_WORKSPACE or label a workspace; refusing hardcoded fallback", repoName)
 	}
 	return id, nil
-}
-
-// ResolveWorkspaceWithConfig extends ResolveWorkspace with config awareness.
-// Precedence: HERD_WORKSPACE env > config.Fleet.HerdrWorkspace > label-match > focused > first.
-// If cfg is nil or HerdrWorkspace is empty, falls back to the standard ResolveWorkspace behavior.
-func ResolveWorkspaceWithConfig(repoRoot string, cfg *config.Config) string {
-	if ws := os.Getenv("HERD_WORKSPACE"); ws != "" {
-		return ws
-	}
-	if cfg != nil && cfg.Fleet.HerdrWorkspace != "" {
-		return cfg.Fleet.HerdrWorkspace
-	}
-	abs, err := filepath.Abs(repoRoot)
-	if err != nil {
-		abs = repoRoot
-	}
-	repoName := filepath.Base(abs)
-
-	entries, err := WorkspaceList()
-	if err != nil {
-		return "wF"
-	}
-	return PickWorkspace(entries, repoName)
 }
 
 // PickWorkspace is the pure selection: label match beats focused beats first.
