@@ -6,11 +6,16 @@ on:
   pull_request:
     branches: [ main ]
 
+# Cancel a superseded run: a new push to the same PR or to main cancels the
+# older in-progress run for that ref instead of running both to completion.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  test:
+  gate:
     name: Build, Preflight & Test Suite
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
@@ -20,11 +25,26 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.26'
+          go-version: "1.26"
           cache: true
 
-      - name: Run Makefile (preflight, test, build, lint)
+      - name: Build, lint, unit tests, preflight
         run: make lint test-unit preflight
 
+  coverage:
+    name: Coverage (authoritative, main only)
+    runs-on: ubuntu-latest
+    # PR already ran the gate; only the merged main commit runs coverage, so a
+    # PR is the fast gate and main is the authoritative gate + coverage.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: gate
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+          cache: true
       - name: Coverage Report
         run: make test-coverage
