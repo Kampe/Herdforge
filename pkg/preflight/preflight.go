@@ -30,12 +30,10 @@ func CheckWorktreeBoundary(rootDir string) error {
 				return nil
 			}
 			content := string(data)
-			// Check for forbidden absolute path patterns
-			if strings.Contains(content, "/Users/") || strings.Contains(content, "/home/") || strings.Contains(content, "C:\\") {
-				// Ignore self-references in AGENTS.md contract documentation
-				if !strings.HasSuffix(path, "AGENTS.md") && !strings.HasSuffix(path, "preflight_test.go") {
-					absoluteLeakes = append(absoluteLeakes, path)
-				}
+			// Check for forbidden absolute path patterns (excluding self-check logic strings)
+			if (strings.Contains(content, "/Users/") || strings.Contains(content, "/home/") || strings.Contains(content, "C:\\")) &&
+				!strings.HasSuffix(path, "AGENTS.md") && !strings.HasSuffix(path, "preflight.go") && !strings.HasSuffix(path, "preflight_test.go") {
+				absoluteLeakes = append(absoluteLeakes, path)
 			}
 		}
 		return nil
