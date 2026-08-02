@@ -2,6 +2,7 @@ package verifier
 
 import (
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -119,7 +120,11 @@ func (s *FileReceiptStore) pathFor(digest string) (string, error) {
 	if !strings.HasPrefix(digest, "sha256:") || len(digest) != len("sha256:")+64 {
 		return "", errors.New("receipt digest must be a full sha256 digest")
 	}
-	return filepath.Join(s.Dir, strings.TrimPrefix(digest, "sha256:")+".json"), nil
+	suffix := strings.TrimPrefix(digest, "sha256:")
+	if _, err := hex.DecodeString(suffix); err != nil {
+		return "", errors.New("receipt digest must contain only hexadecimal characters")
+	}
+	return filepath.Join(s.Dir, suffix+".json"), nil
 }
 
 // VerifyAndPersist is the production-facing seam: verification produces a
