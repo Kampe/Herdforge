@@ -1,82 +1,51 @@
 version: "1"
 
-# Chainseer / Herdforge SOTA Multi-Agent Orchestration Spec
+# Herdforge — the forge that forges itself
 project:
-  name: "chainseer"
+  name: "Herdforge"
   default_branch: "main"
-  repo_url: "https://github.com/Kampe/chainseer.git"
+  repo_url: "https://github.com/Kampe/Herdforge.git"
 
-# Kaneo Kanban Board Integration (Kluster local deployment)
+# Kaneo Kanban Board (Kluster local deployment)
 task_provider:
   type: "kaneo"
   workspace_id: "2FeaTZjdSJDSvUVWeiKH0uKNGBhwLEld"
   project_id: "b939c5jzixruza3vvywrg1hs"
   api_url: "https://kanban-api.kampe.kluster"
   api_key_env: "KANEO_API_KEY"
+  use_cli: true
 
-# Modern SOTA AI Model Providers with Reasoning Effort Tuning
-model_providers:
-  - name: "claude-3-7-sonnet"
-    type: "anthropic"
-    api_key_env: "ANTHROPIC_API_KEY"
-    model: "claude-3-7-sonnet-20250219"
-    reasoning_effort: "max"
-
-  - name: "gemini-3-6-flash"
-    type: "google"
-    api_key_env: "GEMINI_API_KEY"
-    model: "gemini-3.6-flash"
-    reasoning_effort: "high"
-
-  - name: "grok-4-5"
-    type: "xai"
-    api_key_env: "XAI_API_KEY"
-    model: "grok-4.5"
-    reasoning_effort: "high"
-
-  - name: "gpt-5-sol"
-    type: "openai"
-    api_key_env: "OPENAI_API_KEY"
-    model: "gpt-5-sol"
-    reasoning_effort: "high"
-
-  - name: "litellm-fable-5"
-    type: "ollama"
-    api_url: "https://litellm.kampe.kluster"
-    model: "fable-5"
-    reasoning_effort: "medium"
-
-# Worker Lane Roles, Reasoning Effort & Harness Bindings
-roles:
-  - name: "herd-smith"
-    provider: "claude-3-7-sonnet"
-    fallback_provider: "gemini-3-6-flash"
-    harness: "agy"
-    reasoning_effort: "max"
-    prompt_path: ".herd/prompts/smith.md"
+# Agent lanes — each lane is a herdr workspace tab running one agent
+# All lanes default to deepseek-v4-flash via opencode for cheap self-forging
+lanes:
+  - name: "forge-smith"
+    role: "forge-smith"
+    agent_kind: "opencode"
+    harness: "opencode"
+    prompt: ".herd/prompts/smith.md"
+    worktree: ".worktrees/smith"
+    provider: "deepseek"
+    model: "deepseek-v4-flash"
 
   - name: "worker"
-    provider: "claude-3-7-sonnet"
-    fallback_provider: "gemini-3-6-flash"
+    role: "worker"
+    agent_kind: "opencode"
     harness: "opencode"
-    reasoning_effort: "high"
-    prompt_path: ".herd/prompts/worker.md"
+    prompt: ".herd/prompts/worker.md"
+    worktree: ".worktrees/worker"
+    provider: "deepseek"
+    model: "deepseek-v4-flash"
 
   - name: "reviewer"
-    provider: "gemini-3-6-flash"
-    fallback_provider: "grok-4-5"
-    harness: "codex"
-    reasoning_effort: "high"
-    prompt_path: ".herd/prompts/reviewer.md"
+    role: "reviewer"
+    agent_kind: "opencode"
+    harness: "opencode"
+    prompt: ".herd/prompts/reviewer.md"
+    worktree: ".worktrees/reviewer"
+    provider: "deepseek"
+    model: "deepseek-v4-flash"
 
-  - name: "harvest"
-    provider: "grok-4-5"
-    fallback_provider: "gpt-5-sol"
-    harness: "pi"
-    reasoning_effort: "medium"
-    prompt_path: ".herd/prompts/harvest.md"
-
-# Project Verification Suite & Preflight Boundary Invariants
+# Project Verification Suite
 verification:
-  test_command: "bin/agent-preflight && bin/check-surface-tests"
-  preflight_command: "bin/agent-preflight"
+  test_command: "go test ./..."
+  preflight_command: "go build ./..."

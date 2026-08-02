@@ -26,7 +26,7 @@ func RenderDashboard(cfg *config.Config, tasks []*provider.Task) string {
 		sb.WriteString(fmt.Sprintf(" Project Name : %s\n", cfg.Project.Name))
 		sb.WriteString(fmt.Sprintf(" Default Branch: %s\n", cfg.Project.DefaultBranch))
 		sb.WriteString(fmt.Sprintf(" Task Engine   : %s\n", cfg.TaskProvider.Type))
-		sb.WriteString(fmt.Sprintf(" Configured Roles: %d\n", len(cfg.Roles)))
+		sb.WriteString(fmt.Sprintf(" Configured Lanes: %d\n", len(cfg.Lanes)))
 	}
 	sb.WriteString("------------------------------------------------------------------------\n")
 	sb.WriteString(" ACTIVE TASK QUEUE                                                      \n")

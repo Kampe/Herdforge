@@ -30,7 +30,7 @@ func TestKaneoProvider_GetTask(t *testing.T) {
 	}))
 	defer server.Close()
 
-	kp := NewKaneoProvider(server.URL, "proj-1")
+	kp := NewKaneoProvider(server.URL, "proj-1", false)
 	task, err := kp.GetTask(context.Background(), "task-123")
 	if err != nil {
 		t.Fatalf("expected task, got err: %v", err)
@@ -52,7 +52,7 @@ func TestKaneoProvider_GetTask_BadJSON(t *testing.T) {
 	}))
 	defer server.Close()
 
-	kp := NewKaneoProvider(server.URL, "proj-1")
+	kp := NewKaneoProvider(server.URL, "proj-1", false)
 	_, err := kp.GetTask(context.Background(), "task-123")
 	if err == nil {
 		t.Fatal("expected error on bad JSON, got nil")
@@ -65,7 +65,7 @@ func TestKaneoProvider_GetTask_NotFound(t *testing.T) {
 	}))
 	defer server.Close()
 
-	kp := NewKaneoProvider(server.URL, "proj-1")
+	kp := NewKaneoProvider(server.URL, "proj-1", false)
 	_, err := kp.GetTask(context.Background(), "nonexistent")
 	if err == nil {
 		t.Fatal("expected error on 404, got nil")
@@ -83,7 +83,7 @@ func TestKaneoProvider_UpdateStatus(t *testing.T) {
 	}))
 	defer server.Close()
 
-	kp := NewKaneoProvider(server.URL, "proj-1")
+	kp := NewKaneoProvider(server.URL, "proj-1", false)
 	if err := kp.UpdateStatus(context.Background(), "task-123", "in-progress"); err != nil {
 		t.Fatalf("expected clean update, got err: %v", err)
 	}
@@ -95,7 +95,7 @@ func TestKaneoProvider_UpdateStatus_NoContent(t *testing.T) {
 	}))
 	defer server.Close()
 
-	kp := NewKaneoProvider(server.URL, "proj-1")
+	kp := NewKaneoProvider(server.URL, "proj-1", false)
 	if err := kp.UpdateStatus(context.Background(), "task-123", "done"); err != nil {
 		t.Fatalf("expected success on 204, got err: %v", err)
 	}
@@ -107,7 +107,7 @@ func TestKaneoProvider_UpdateStatus_Non200(t *testing.T) {
 	}))
 	defer server.Close()
 
-	kp := NewKaneoProvider(server.URL, "proj-1")
+	kp := NewKaneoProvider(server.URL, "proj-1", false)
 	err := kp.UpdateStatus(context.Background(), "task-123", "done")
 	if err == nil {
 		t.Fatal("expected error on 500, got nil")
@@ -130,7 +130,7 @@ func TestKaneoProvider_ListTasks(t *testing.T) {
 	}))
 	defer server.Close()
 
-	kp := NewKaneoProvider(server.URL, "proj-1")
+	kp := NewKaneoProvider(server.URL, "proj-1", false)
 	tasks, err := kp.ListTasks(context.Background(), "proj-1", "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -156,7 +156,7 @@ func TestKaneoProvider_ListTasks_BadJSON(t *testing.T) {
 	}))
 	defer server.Close()
 
-	kp := NewKaneoProvider(server.URL, "proj-1")
+	kp := NewKaneoProvider(server.URL, "proj-1", false)
 	_, err := kp.ListTasks(context.Background(), "proj-1", "")
 	if err == nil {
 		t.Fatal("expected error on bad JSON, got nil")
@@ -169,7 +169,7 @@ func TestKaneoProvider_ListTasks_Non200(t *testing.T) {
 	}))
 	defer server.Close()
 
-	kp := NewKaneoProvider(server.URL, "proj-1")
+	kp := NewKaneoProvider(server.URL, "proj-1", false)
 	_, err := kp.ListTasks(context.Background(), "proj-1", "")
 	if err == nil {
 		t.Fatal("expected error on 500, got nil")
@@ -187,7 +187,7 @@ func TestKaneoProvider_ListTasks_DefaultProjectID(t *testing.T) {
 	}))
 	defer server.Close()
 
-	kp := NewKaneoProvider(server.URL, "proj-default")
+	kp := NewKaneoProvider(server.URL, "proj-default", false)
 	tasks, err := kp.ListTasks(context.Background(), "", "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -208,7 +208,7 @@ func TestKaneoProvider_ClaimTask(t *testing.T) {
 	}))
 	defer server.Close()
 
-	kp := NewKaneoProvider(server.URL, "proj-1")
+	kp := NewKaneoProvider(server.URL, "proj-1", false)
 	if err := kp.ClaimTask(context.Background(), "task-123", "builder"); err != nil {
 		t.Fatalf("expected clean claim, got err: %v", err)
 	}
@@ -225,7 +225,7 @@ func TestKaneoProvider_AddComment(t *testing.T) {
 	}))
 	defer server.Close()
 
-	kp := NewKaneoProvider(server.URL, "proj-1")
+	kp := NewKaneoProvider(server.URL, "proj-1", false)
 	if err := kp.AddComment(context.Background(), "task-123", "reviewed"); err != nil {
 		t.Fatalf("expected clean comment add, got err: %v", err)
 	}
@@ -237,7 +237,7 @@ func TestKaneoProvider_AddComment_Non200(t *testing.T) {
 	}))
 	defer server.Close()
 
-	kp := NewKaneoProvider(server.URL, "proj-1")
+	kp := NewKaneoProvider(server.URL, "proj-1", false)
 	err := kp.AddComment(context.Background(), "task-123", "comment")
 	if err == nil {
 		t.Fatal("expected error on 500, got nil")
