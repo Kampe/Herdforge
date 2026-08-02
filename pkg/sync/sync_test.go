@@ -40,64 +40,31 @@ func TestReconcileBoard_ListTasksError(t *testing.T) {
 	}
 	syncer := NewBoardSyncer(ep)
 
-	_, err := syncer.ReconcileBoard(context.Background(), "proj-1")
+	_, err := syncer.ReconcileBoard(context.Background(), "proj-1", t.TempDir())
 	if err == nil {
 		t.Fatal("expected error when ListTasks fails")
 	}
+}
+
+// memoryDir returns a non-git temp dir: every git fact degrades to the
+// empty/false value (a hermetic substitute for a silent offline git).
+func memoryDir(t *testing.T) string {
+	return t.TempDir()
 }
 
 func TestReconcileBoard_EmptyTasks(t *testing.T) {
 	mp := provider.NewMemoryProvider()
 	syncer := NewBoardSyncer(mp)
 
-	report, err := syncer.ReconcileBoard(context.Background(), "proj-1")
+	drift, err := syncer.ReconcileBoard(context.Background(), "proj-1", memoryDir(t))
 	if err != nil {
 		t.Fatalf("expected no error, got: %v", err)
 	}
-	if report.TotalProcessed != 0 {
-		t.Errorf("expected 0 processed tasks, got %d", report.TotalProcessed)
+	if drift.Drift != 0 {
+		t.Errorf("expected 0 drift, got %d", drift.Drift)
 	}
-	if report.UpdatedStatus != 0 {
-		t.Errorf("expected 0 status updates, got %d", report.UpdatedStatus)
-	}
-}
-
-func TestReconcileBoard_NoInProgress(t *testing.T) {
-	mp := provider.NewMemoryProvider()
-	mp.AddTask(&provider.Task{ID: "1", Ref: "FAC-17", Title: "Done Task", Status: "done", Priority: provider.PriorityMedium, ProjectID: "proj-1"})
-	mp.AddTask(&provider.Task{ID: "2", Ref: "FAC-18", Title: "Todo Task", Status: "to-do", Priority: provider.PriorityLow, ProjectID: "proj-1"})
-
-	syncer := NewBoardSyncer(mp)
-
-	report, err := syncer.ReconcileBoard(context.Background(), "proj-1")
-	if err != nil {
-		t.Fatalf("expected no error, got: %v", err)
-	}
-	if report.TotalProcessed != 2 {
-		t.Errorf("expected 2 processed tasks, got %d", report.TotalProcessed)
-	}
-	if report.UpdatedStatus != 0 {
-		t.Errorf("expected 0 status updates (no in-progress tasks), got %d", report.UpdatedStatus)
-	}
-}
-
-func TestReconcileBoard_MultipleInProgress(t *testing.T) {
-	mp := provider.NewMemoryProvider()
-	mp.AddTask(&provider.Task{ID: "1", Ref: "FAC-19", Title: "In Progress 1", Status: "in-progress", Priority: provider.PriorityHigh, ProjectID: "proj-1"})
-	mp.AddTask(&provider.Task{ID: "2", Ref: "FAC-20", Title: "In Progress 2", Status: "in-progress", Priority: provider.PriorityMedium, ProjectID: "proj-1"})
-	mp.AddTask(&provider.Task{ID: "3", Ref: "FAC-21", Title: "Todo", Status: "to-do", Priority: provider.PriorityLow, ProjectID: "proj-1"})
-
-	syncer := NewBoardSyncer(mp)
-
-	report, err := syncer.ReconcileBoard(context.Background(), "proj-1")
-	if err != nil {
-		t.Fatalf("expected no error, got: %v", err)
-	}
-	if report.TotalProcessed != 3 {
-		t.Errorf("expected 3 processed tasks, got %d", report.TotalProcessed)
-	}
-	if report.UpdatedStatus != 2 {
-		t.Errorf("expected 2 status updates (in-progress tasks), got %d", report.UpdatedStatus)
+	if len(drift.Findings) != 0 {
+		t.Errorf("expected no findings, got %d", len(drift.Findings))
 	}
 }
 
@@ -107,12 +74,26 @@ func TestReconcileBoard_DifferentProject(t *testing.T) {
 
 	syncer := NewBoardSyncer(mp)
 
-	report, err := syncer.ReconcileBoard(context.Background(), "proj-1")
+	drift, err := syncer.ReconcileBoard(context.Background(), "proj-1", memoryDir(t))
 	if err != nil {
 		t.Fatalf("expected no error, got: %v", err)
 	}
-	if report.TotalProcessed != 0 {
-		t.Errorf("expected 0 tasks from different project, got %d", report.TotalProcessed)
+	if drift.Drift != 0 || len(drift.Findings) != 0 {
+		t.Errorf("expected empty board for other project, got drift=%d findings=%d", drift.Drift, len(drift.Findings))
+	}
+}
+
+func TestReconcileBoard_FilterStandingEpic(t *testing.T) {
+	mp := provider.NewMemoryProvider()
+	mp.AddTask(&provider.Task{ID: "1", Ref: "FAC-77", Title: "standing epic to-do list", Status: "in-progress", ProjectID: "proj-1"})
+
+	syncer := NewBoardSyncer(mp)
+	drift, err := syncer.ReconcileBoard(context.Background(), "proj-1", memoryDir(t))
+	if err != nil {
+		t.Fatalf("expected no error, got: %v", err)
+	}
+	if drift.Drift != 0 || len(drift.Findings) != 0 {
+		t.Errorf("standing epic must be skipped, got drift=%d findings=%d", drift.Drift, len(drift.Findings))
 	}
 }
 
