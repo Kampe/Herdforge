@@ -2,6 +2,8 @@ package deps
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"sort"
 	"strings"
@@ -22,6 +24,10 @@ type MemoryStore struct {
 	Capable bool
 	// CapabilityErr forces SupportsRelations to fail unknown.
 	CapabilityErr error
+	// ProviderRevisionToken is returned from SnapshotGraph (tests mutate for TOCTOU).
+	ProviderRevisionToken string
+	// mutateGen bumps on every create/delete for revision.
+	mutateGen int
 }
 
 // NewMemoryStore returns a capable empty store.
@@ -61,6 +67,7 @@ func (m *MemoryStore) SetStatus(refOrID, status string) error {
 		return fmt.Errorf("%w: %s", ErrDeletedTask, refOrID)
 	}
 	t.Status = provider.NormalizeStatus(status)
+	m.mutateGen++
 	return nil
 }
 
@@ -76,7 +83,6 @@ func (m *MemoryStore) ResolveRef(_ context.Context, ref Ref) (TaskID, error) {
 	defer m.mu.Unlock()
 	id, ok := m.byRef[string(ref)]
 	if !ok {
-		// Allow id-as-ref for fixtures.
 		if t, ok := m.tasks[string(ref)]; ok {
 			return TaskID(t.ID), nil
 		}
@@ -102,29 +108,52 @@ func (m *MemoryStore) TaskStatus(_ context.Context, ref Ref) (string, TaskID, er
 func (m *MemoryStore) ListRelations(_ context.Context, taskID TaskID) ([]DependencyEdge, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	want := string(taskID)
-	// Resolve ref → id if needed.
+	return m.listLocked(string(taskID)), nil
+}
+
+func (m *MemoryStore) listLocked(want string) []DependencyEdge {
 	if id, ok := m.byRef[want]; ok {
 		want = id
 	}
 	var out []DependencyEdge
 	for _, e := range m.relations {
 		if string(e.SourceID) == want || string(e.TargetID) == want ||
-			string(e.SourceRef) == string(taskID) || string(e.TargetRef) == string(taskID) {
+			string(e.SourceRef) == want || string(e.TargetRef) == want {
 			out = append(out, e)
 		}
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].RelationID < out[j].RelationID })
-	return out, nil
+	return out
 }
 
-func (m *MemoryStore) CreateRelation(ctx context.Context, edge DependencyEdge) (DependencyEdge, error) {
+func (m *MemoryStore) SnapshotGraph(context.Context) (*GraphSnapshot, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if edge.Type == "" {
-		edge.Type = EdgeBlocks
+	out := make([]DependencyEdge, 0, len(m.relations))
+	for _, e := range m.relations {
+		out = append(out, e)
 	}
-	// Resolve IDs from refs when missing.
+	sort.Slice(out, func(i, j int) bool { return out[i].RelationID < out[j].RelationID })
+	rev := m.ProviderRevisionToken
+	if rev == "" {
+		h := sha256.Sum256([]byte(fmt.Sprintf("mem|%d|%d", m.mutateGen, len(m.relations))))
+		rev = hex.EncodeToString(h[:])
+	}
+	return &GraphSnapshot{Edges: out, ProviderRevision: rev}, nil
+}
+
+func (m *MemoryStore) CreateRelation(_ context.Context, edge DependencyEdge) (DependencyEdge, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if !ValidEdgeType(edge.Type) {
+		if edge.Type == "" {
+			return DependencyEdge{}, fmt.Errorf("%w: empty type", ErrUnknownEdgeType)
+		}
+		return DependencyEdge{}, fmt.Errorf("%w: %q", ErrUnknownEdgeType, edge.Type)
+	}
+	edge.Type = EdgeType(strings.ToLower(string(edge.Type)))
+
 	if !edge.SourceID.Valid() && edge.SourceRef.Valid() {
 		if id, ok := m.byRef[string(edge.SourceRef)]; ok {
 			edge.SourceID = TaskID(id)
@@ -139,7 +168,6 @@ func (m *MemoryStore) CreateRelation(ctx context.Context, edge DependencyEdge) (
 			return DependencyEdge{}, fmt.Errorf("%w: target %s", ErrUnresolvedRef, edge.TargetRef)
 		}
 	}
-	// Fill refs from tasks when only IDs given.
 	if !edge.SourceRef.Valid() && edge.SourceID.Valid() {
 		if t := m.tasks[string(edge.SourceID)]; t != nil {
 			edge.SourceRef = Ref(t.Ref)
@@ -150,44 +178,78 @@ func (m *MemoryStore) CreateRelation(ctx context.Context, edge DependencyEdge) (
 			edge.TargetRef = Ref(t.Ref)
 		}
 	}
+	if edge.SourceID == edge.TargetID || edge.SourceRef == edge.TargetRef {
+		return DependencyEdge{}, ErrSelfEdge
+	}
+
+	// Idempotent reconcile: existing identical edge returned (no duplicate).
+	for _, e := range m.relations {
+		if e.SourceID == edge.SourceID && e.TargetID == edge.TargetID && e.Type == edge.Type {
+			return e, nil
+		}
+	}
+
 	m.nextRel++
+	m.mutateGen++
 	edge.RelationID = fmt.Sprintf("mem-rel-%d", m.nextRel)
 	m.relations[edge.RelationID] = edge
 
-	// Readback
-	got, ok := m.relations[edge.RelationID]
-	if !ok {
-		return DependencyEdge{}, fmt.Errorf("deps: create readback missing relation %s", edge.RelationID)
+	// Dual-end readback.
+	srcList := m.listLocked(string(edge.SourceID))
+	tgtList := m.listLocked(string(edge.TargetID))
+	if !containsRel(srcList, edge.RelationID) || !containsRel(tgtList, edge.RelationID) {
+		return DependencyEdge{}, fmt.Errorf("deps: create readback missing on source or target")
 	}
-	if got.Key() != edge.Key() {
-		return DependencyEdge{}, fmt.Errorf("deps: create readback mismatch want %s got %s", edge.Key(), got.Key())
+	got, ok := m.relations[edge.RelationID]
+	if !ok || got.CanonicalKey() != edge.CanonicalKey() {
+		return DependencyEdge{}, fmt.Errorf("deps: create readback mismatch")
 	}
 	return got, nil
 }
 
-func (m *MemoryStore) DeleteRelation(_ context.Context, relationID string) error {
+func containsRel(edges []DependencyEdge, id string) bool {
+	for _, e := range edges {
+		if e.RelationID == id {
+			return true
+		}
+	}
+	return false
+}
+
+func (m *MemoryStore) DeleteRelation(_ context.Context, relationID string, sourceID, targetID TaskID) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if _, ok := m.relations[relationID]; !ok {
+	e, ok := m.relations[relationID]
+	if !ok {
 		return fmt.Errorf("deps: relation not found: %s", relationID)
 	}
+	// Capture endpoints (authoritative from store, not caller trust alone).
+	src, tgt := e.SourceID, e.TargetID
+	if sourceID.Valid() && sourceID != src {
+		return fmt.Errorf("deps: delete endpoint mismatch source want %s got %s", src, sourceID)
+	}
+	if targetID.Valid() && targetID != tgt {
+		return fmt.Errorf("deps: delete endpoint mismatch target want %s got %s", tgt, targetID)
+	}
 	delete(m.relations, relationID)
-	if _, ok := m.relations[relationID]; ok {
-		return fmt.Errorf("deps: delete readback still present: %s", relationID)
+	m.mutateGen++
+	// Verify absence on BOTH ends.
+	if containsRel(m.listLocked(string(src)), relationID) {
+		return fmt.Errorf("%w: relation %s still on source after delete", ErrAmbiguousMutation, relationID)
+	}
+	if containsRel(m.listLocked(string(tgt)), relationID) {
+		return fmt.Errorf("%w: relation %s still on target after delete", ErrAmbiguousMutation, relationID)
 	}
 	return nil
 }
 
 // SnapshotEdges returns all relations (test helper).
 func (m *MemoryStore) SnapshotEdges() []DependencyEdge {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	out := make([]DependencyEdge, 0, len(m.relations))
-	for _, e := range m.relations {
-		out = append(out, e)
+	snap, _ := m.SnapshotGraph(context.Background())
+	if snap == nil {
+		return nil
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].RelationID < out[j].RelationID })
-	return out
+	return snap.Edges
 }
 
 // SeedBlocks is a test helper: add A blocks B by ref.
@@ -199,7 +261,7 @@ func (m *MemoryStore) SeedBlocks(sourceRef, targetRef string) (DependencyEdge, e
 	})
 }
 
-// Ensure tasks exist for refs used in fixtures.
+// EnsureTask creates a fixture task.
 func (m *MemoryStore) EnsureTask(ref, status string, priority provider.Priority) {
 	id := "id-" + strings.ToLower(ref)
 	m.AddTask(&provider.Task{

@@ -154,15 +154,25 @@ func runDepsReconcile() {
 	}
 	desired, _ := deps.ExtractProvenanceFromText(task.Description)
 	var desEdges []deps.DependencyEdge
-	if desired != nil {
-		desEdges = desired.DesiredBlocks()
+	if desired != nil && desired.Present {
+		var derr error
+		desEdges, derr = desired.DesiredBlocks()
+		if derr != nil {
+			fmt.Fprintf(os.Stderr, "provenance: %v\n", derr)
+			os.Exit(1)
+		}
 	}
-	board, lerr := store.ListRelations(context.Background(), deps.TaskID(task.ID))
+	snap, lerr := store.SnapshotGraph(context.Background())
 	if lerr != nil {
-		fmt.Fprintf(os.Stderr, "list relations: %v\n", lerr)
+		fmt.Fprintf(os.Stderr, "snapshot graph: %v\n", lerr)
 		os.Exit(1)
 	}
-	rep := deps.Reconcile(deps.Ref(ref), desEdges, board)
+	board := snap.Edges
+	rep := deps.Reconcile(deps.Ref(ref), desEdges, board, deps.ReconcileOpts{
+		FullClosure:        snap.Edges,
+		ProviderRevision:   snap.ProviderRevision,
+		RequireFullClosure: true,
+	})
 	b, err := deps.MarshalReport(rep)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "marshal: %v\n", err)

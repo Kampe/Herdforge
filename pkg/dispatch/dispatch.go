@@ -302,6 +302,10 @@ func (d *Dispatcher) Dispatch(ctx context.Context, opts DispatchOptions) (*Dispa
 		if perr != nil {
 			return nil, fmt.Errorf("dispatch dependency provenance: %w", perr)
 		}
+		// Empty/missing provenance is never OK — require versioned record.
+		if desired == nil || !desired.Present {
+			return nil, fmt.Errorf("dispatch: %w for %s (attach herd-deps-v1 fence)", deps.ErrMissingProvenance, task.Ref)
+		}
 		gate, gerr := deps.ValidateLaunch(ctx, store, deps.EntryDispatch, deps.Ref(task.Ref), desired, "")
 		if gerr != nil {
 			return nil, gerr

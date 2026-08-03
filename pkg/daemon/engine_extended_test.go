@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -36,6 +37,7 @@ func TestRunPulse_SelectsAndClaimsTask(t *testing.T) {
 	mp.AddTask(&provider.Task{
 		ID: "t-1", Ref: "FAC-99", Title: "Pulse Task", Priority: provider.PriorityUrgent,
 		Status: "to-do", ProjectID: "proj-1", Labels: []string{"herd-smith"},
+		Description: "```herd-deps-v1\n{\"version\":1,\"task_ref\":\"FAC-99\",\"edges\":[]}\n```\n",
 	})
 	cfg := &config.Config{
 		TaskProvider: config.TaskProvider{ProjectID: "proj-1"},
@@ -60,8 +62,11 @@ func TestRunPulse_SelectsAndClaimsTask(t *testing.T) {
 
 func TestSelectNextTask_SamePrioritySortsByRef(t *testing.T) {
 	mp := provider.NewMemoryProvider()
-	mp.AddTask(&provider.Task{ID: "1", Ref: "FAC-10", Title: "Same Priority 10", Priority: provider.PriorityHigh, Status: "to-do", ProjectID: "proj-1", Labels: []string{"herd-smith"}})
-	mp.AddTask(&provider.Task{ID: "2", Ref: "FAC-2", Title: "Same Priority 2", Priority: provider.PriorityHigh, Status: "to-do", ProjectID: "proj-1", Labels: []string{"herd-smith"}})
+	fence := func(ref string) string {
+		return "```herd-deps-v1\n{\"version\":1,\"task_ref\":\"" + ref + "\",\"edges\":[]}\n```\n"
+	}
+	mp.AddTask(&provider.Task{ID: "1", Ref: "FAC-10", Title: "Same Priority 10", Priority: provider.PriorityHigh, Status: "to-do", ProjectID: "proj-1", Labels: []string{"herd-smith"}, Description: fence("FAC-10")})
+	mp.AddTask(&provider.Task{ID: "2", Ref: "FAC-2", Title: "Same Priority 2", Priority: provider.PriorityHigh, Status: "to-do", ProjectID: "proj-1", Labels: []string{"herd-smith"}, Description: fence("FAC-2")})
 	cfg := &config.Config{
 		TaskProvider: config.TaskProvider{ProjectID: "proj-1"},
 	}
@@ -94,6 +99,27 @@ func TestRunPulse_NoTasks(t *testing.T) {
 
 func TestRunPulse_ClaimError(t *testing.T) {
 	// Kaneo HTTP: list/get/relations OK; patch fails (claim path).
+	// Task carries empty versioned provenance so the FAC-159 gate reaches claim.
+	type kaneoTask struct {
+		ID          string `json:"id"`
+		Ref         string `json:"ref"`
+		Title       string `json:"title"`
+		Priority    string `json:"priority"`
+		Status      string `json:"status"`
+		Labels      []struct {
+			Name string `json:"name"`
+		} `json:"labels"`
+		Description string `json:"description"`
+	}
+	task := kaneoTask{
+		ID: "t-1", Ref: "FAC-99", Title: "Fail Claim", Priority: "urgent", Status: "to-do",
+		Labels: []struct {
+			Name string `json:"name"`
+		}{{Name: "herd-smith"}},
+		Description: "```herd-deps-v1\n{\"version\":1,\"task_ref\":\"FAC-99\",\"edges\":[]}\n```\n",
+	}
+	taskJSON, _ := json.Marshal(task)
+	listJSON, _ := json.Marshal([]kaneoTask{task})
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		if r.Method == http.MethodPatch {
@@ -107,13 +133,11 @@ func TestRunPulse_ClaimError(t *testing.T) {
 		}
 		if r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/api/task/") && !strings.Contains(r.URL.RawQuery, "projectId") {
 			w.WriteHeader(http.StatusOK)
-			w.Write([]byte(`{"id":"t-1","ref":"FAC-99","title":"Fail Claim","priority":"urgent","status":"to-do","labels":[{"name":"herd-smith"}]}`))
+			w.Write(taskJSON)
 			return
 		}
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(`[
-			{"id":"t-1", "ref":"FAC-99", "title":"Fail Claim", "priority":"urgent", "status":"to-do", "labels":[{"name":"herd-smith"}]}
-		]`))
+		w.Write(listJSON)
 	}))
 	defer server.Close()
 

@@ -151,7 +151,9 @@ func (e *Engine) selectNextTaskWithRevision(ctx context.Context, role string) (*
 			// Fail closed on malformed structured provenance — never guess.
 			return nil, "", fmt.Errorf("select next task: provenance %s: %w", t.Ref, perr)
 		}
-		if p != nil && (len(p.Edges) > 0 || len(p.Holds) > 0) {
+		// Missing provenance → per-card BLOCKED inside SelectEligibleRefs
+		// (not invent empty OK). Only Present records are attached.
+		if p != nil && p.Present {
 			desiredByRef[t.Ref] = p
 		}
 	}
@@ -191,14 +193,27 @@ func (e *Engine) RunPulse(ctx context.Context, role string) (*provider.Task, err
 		return nil, nil
 	}
 
-	// TOCTOU: re-read exact task + blockers inside the claim transition.
-	// Concurrent relation addition between selection and claim MUST block.
-	if _, gerr := deps.ValidateClaim(ctx, e.depsStore(), deps.Ref(task.Ref), selectionRev); gerr != nil {
-		return nil, fmt.Errorf("pulse claim blocked (dependency TOCTOU/gate): %w", gerr)
-	}
-
-	if err := e.claimTaskBound(ctx, task.ID, role); err != nil {
-		return nil, formatProviderStepError(fmt.Sprintf("failed to claim task %s", task.Ref), err)
+	// Fenced claim: bind selection revision, claim, post-claim re-validate.
+	// Atomic graph+claim is unavailable; post-claim drift triggers compensation
+	// (status back to to-do) so TOCTOU cannot leave a false-ready card.
+	desired, _ := deps.ExtractProvenanceFromText(task.Description)
+	_, gerr := deps.FencedClaim(
+		ctx,
+		e.depsStore(),
+		deps.Ref(task.Ref),
+		deps.TaskID(task.ID),
+		desired,
+		selectionRev,
+		func(cctx context.Context) error {
+			return e.claimTaskBound(cctx, task.ID, role)
+		},
+		func(cctx context.Context, taskID deps.TaskID, reason string) error {
+			// Best-effort compensate: reverse claim to to-do.
+			return e.TaskProv.UpdateStatus(cctx, string(taskID), provider.StatusToDo)
+		},
+	)
+	if gerr != nil {
+		return nil, fmt.Errorf("pulse claim blocked (dependency fence): %w", gerr)
 	}
 
 	if e.Store != nil {

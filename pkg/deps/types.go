@@ -6,12 +6,16 @@
 package deps
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 )
 
 // SchemaVersion is the current structured dependency provenance version.
+// Unsupported versions fail closed.
 const SchemaVersion = 1
 
 // EdgeType is a provider-neutral dependency relation kind.
@@ -23,6 +27,16 @@ const (
 	EdgeBlocks  EdgeType = "blocks"
 	EdgeRelated EdgeType = "related"
 )
+
+// ValidEdgeType reports whether t is a known edge type (no silent defaulting).
+func ValidEdgeType(t EdgeType) bool {
+	switch EdgeType(strings.ToLower(strings.TrimSpace(string(t)))) {
+	case EdgeBlocks, EdgeRelated:
+		return true
+	default:
+		return false
+	}
+}
 
 // TaskID is an immutable provider task identifier (opaque board ID, not ref).
 // Empty TaskID is invalid for mutations.
@@ -55,6 +69,14 @@ type DependencyEdge struct {
 	Type      EdgeType `json:"type"`
 }
 
+// CanonicalKey is type|sourceID|targetID when IDs known, else type|sourceRef|targetRef.
+func (e DependencyEdge) CanonicalKey() string {
+	if e.SourceID.Valid() && e.TargetID.Valid() {
+		return fmt.Sprintf("%s|%s|%s", e.Type, e.SourceID, e.TargetID)
+	}
+	return fmt.Sprintf("%s|%s|%s", e.Type, e.SourceRef, e.TargetRef)
+}
+
 // Key returns a stable identity for set operations: type|sourceRef|targetRef.
 func (e DependencyEdge) Key() string {
 	return fmt.Sprintf("%s|%s|%s", e.Type, e.SourceRef, e.TargetRef)
@@ -75,14 +97,24 @@ const (
 	HoldCollisionOwnership HoldKind = "collision_ownership"
 )
 
+// ValidHoldKind reports whether k is a known hold kind.
+func ValidHoldKind(k HoldKind) bool {
+	switch HoldKind(strings.ToLower(strings.TrimSpace(string(k)))) {
+	case HoldExplicit, HoldCollisionOwnership:
+		return true
+	default:
+		return false
+	}
+}
+
 // Hold is a structured declaration that dependent must wait on blocker.
 // Holds never come from Markdown; they are versioned structured input.
 type Hold struct {
-	Kind          HoldKind `json:"kind"`
-	BlockerRef    Ref      `json:"blocker_ref"`
-	DependentRef  Ref      `json:"dependent_ref"`
-	Paths         []string `json:"paths,omitempty"`
-	Note          string   `json:"note,omitempty"`
+	Kind         HoldKind `json:"kind"`
+	BlockerRef   Ref      `json:"blocker_ref"`
+	DependentRef Ref      `json:"dependent_ref"`
+	Paths        []string `json:"paths,omitempty"`
+	Note         string   `json:"note,omitempty"`
 }
 
 // ToEdge converts a hold into a desired blocks edge (blocker → dependent).
@@ -95,44 +127,71 @@ func (h Hold) ToEdge() DependencyEdge {
 }
 
 // Provenance is versioned structured dependency authority for packets/lifecycle.
-// Never invent edges from prose. Missing provenance is explicit empty, not free-text parse.
+// Never invent edges from prose. Missing provenance is NOT eligible (Present=false).
 type Provenance struct {
-	Version   int              `json:"version"`
-	TaskRef   Ref              `json:"task_ref"`
-	TaskID    TaskID           `json:"task_id,omitempty"`
-	Edges     []DependencyEdge `json:"edges"`
-	Holds     []Hold           `json:"holds,omitempty"`
+	Version int              `json:"version"`
+	TaskRef Ref              `json:"task_ref"`
+	TaskID  TaskID           `json:"task_id,omitempty"`
+	Edges   []DependencyEdge `json:"edges"`
+	Holds   []Hold           `json:"holds,omitempty"`
 	// GraphRevision binds the provider relation snapshot used to author this record.
 	GraphRevision string    `json:"graph_revision,omitempty"`
-	RecordedAt    time.Time `json:"recorded_at,omitempty"`
+	// ProviderRevision is the provider-side revision token when available.
+	ProviderRevision string    `json:"provider_revision,omitempty"`
+	RecordedAt       time.Time `json:"recorded_at,omitempty"`
+	// Present is true only when this record was parsed from an explicit
+	// versioned fence/JSON document — never inferred from missing text.
+	Present bool `json:"-"`
 }
 
-// Normalize sets schema version and drops empty edges.
-func (p *Provenance) Normalize() {
-	if p.Version == 0 {
-		p.Version = SchemaVersion
+// Validate fails closed on missing/unsupported version and malformed edge/hold
+// values. It does NOT silently drop or default unknown types.
+func (p *Provenance) Validate() error {
+	if p == nil || !p.Present {
+		return fmt.Errorf("%w: structured provenance record required", ErrMissingProvenance)
 	}
-	out := p.Edges[:0]
+	if p.Version != SchemaVersion {
+		return fmt.Errorf("%w: version %d (want %d)", ErrUnsupportedProvenance, p.Version, SchemaVersion)
+	}
+	for i, e := range p.Edges {
+		if !ValidEdgeType(e.Type) {
+			return fmt.Errorf("deps: edge[%d]: unknown type %q (want blocks|related)", i, e.Type)
+		}
+		src := Ref(strings.TrimSpace(string(e.SourceRef)))
+		tgt := Ref(strings.TrimSpace(string(e.TargetRef)))
+		if !src.Valid() || !tgt.Valid() {
+			return fmt.Errorf("deps: edge[%d]: source_ref and target_ref required", i)
+		}
+		if src == tgt {
+			return fmt.Errorf("deps: edge[%d]: self-edge rejected (%s)", i, src)
+		}
+	}
+	for i, h := range p.Holds {
+		if !ValidHoldKind(h.Kind) {
+			return fmt.Errorf("deps: hold[%d]: unknown kind %q", i, h.Kind)
+		}
+		if !h.BlockerRef.Valid() || !h.DependentRef.Valid() {
+			return fmt.Errorf("deps: hold[%d]: blocker_ref and dependent_ref required", i)
+		}
+		if h.BlockerRef == h.DependentRef {
+			return fmt.Errorf("deps: hold[%d]: self-hold rejected", i)
+		}
+	}
+	return nil
+}
+
+// DesiredBlocks returns desired blocks edges including holds expanded to edges.
+// Caller must Validate first; unknown types are not silently skipped.
+func (p Provenance) DesiredBlocks() ([]DependencyEdge, error) {
+	if err := p.Validate(); err != nil {
+		return nil, err
+	}
+	seen := map[string]bool{}
+	var out []DependencyEdge
 	for _, e := range p.Edges {
 		e.SourceRef = Ref(strings.TrimSpace(string(e.SourceRef)))
 		e.TargetRef = Ref(strings.TrimSpace(string(e.TargetRef)))
 		e.Type = EdgeType(strings.ToLower(strings.TrimSpace(string(e.Type))))
-		if e.Type == "" {
-			e.Type = EdgeBlocks
-		}
-		if e.SourceRef.Valid() && e.TargetRef.Valid() {
-			out = append(out, e)
-		}
-	}
-	p.Edges = out
-}
-
-// DesiredBlocks returns desired blocks edges including holds expanded to edges.
-func (p Provenance) DesiredBlocks() []DependencyEdge {
-	p.Normalize()
-	seen := map[string]bool{}
-	var out []DependencyEdge
-	for _, e := range p.Edges {
 		if e.Type != EdgeBlocks {
 			continue
 		}
@@ -152,7 +211,7 @@ func (p Provenance) DesiredBlocks() []DependencyEdge {
 		seen[k] = true
 		out = append(out, e)
 	}
-	return out
+	return out, nil
 }
 
 // DriftClass is a stable reconciliation finding class.
@@ -170,29 +229,32 @@ const (
 
 // Finding is one stable reconcile finding with exact direction + IDs.
 type Finding struct {
-	Class     DriftClass     `json:"class"`
-	Edge      DependencyEdge `json:"edge"`
-	Detail    string         `json:"detail,omitempty"`
-	RelationID string        `json:"relation_id,omitempty"`
+	Class      DriftClass     `json:"class"`
+	Edge       DependencyEdge `json:"edge"`
+	Detail     string         `json:"detail,omitempty"`
+	RelationID string         `json:"relation_id,omitempty"`
 }
 
 // ReconcileReport is stable JSON describing packet vs board edge drift.
 type ReconcileReport struct {
-	TaskRef       Ref       `json:"task_ref"`
-	GraphRevision string    `json:"graph_revision"`
-	OK            bool      `json:"ok"`
-	Findings      []Finding `json:"findings"`
+	TaskRef          Ref              `json:"task_ref"`
+	GraphRevision    string           `json:"graph_revision"`
+	ProviderRevision string           `json:"provider_revision,omitempty"`
+	OK               bool             `json:"ok"`
+	Findings         []Finding        `json:"findings"`
 	// ManagedBoard is the set of blocks edges the board holds that involve TaskRef.
 	ManagedBoard []DependencyEdge `json:"managed_board"`
 	// Desired is the structured desired set (packet/holds).
 	Desired []DependencyEdge `json:"desired"`
+	// FullClosureUsed is true when cycle detection used an authoritative full graph.
+	FullClosureUsed bool `json:"full_closure_used"`
 }
 
 // BlockedError is a typed fail-closed launch block (nonzero exit).
 type BlockedError struct {
 	Ref     Ref
 	Reason  string
-	Code    string // e.g. open_blocker, capability, drift, cyclic, toctou, stale
+	Code    string // e.g. open_blocker, capability, drift, cyclic, toctou, stale, missing_provenance
 	Details []string
 	Report  *ReconcileReport
 }
@@ -209,32 +271,22 @@ func (e *BlockedError) Error() string {
 	return b.String()
 }
 
-// GraphRevision hashes a stable snapshot of edges + task status map for TOCTOU.
-func GraphRevision(edges []DependencyEdge, statusByRef map[string]string) string {
-	// Deterministic: sort keys then FNV-ish string join (no crypto needed).
-	keys := make([]string, 0, len(edges)+len(statusByRef))
+// GraphRevision computes SHA-256 over canonical immutable IDs, edge relation
+// IDs, status map, and provider revision. Weak local hashes are not used.
+func GraphRevision(edges []DependencyEdge, statusByRef map[string]string, providerRevision string) string {
+	keys := make([]string, 0, len(edges)+len(statusByRef)+1)
 	for _, e := range edges {
-		keys = append(keys, e.Key()+"#"+e.RelationID)
+		keys = append(keys, e.CanonicalKey()+"#"+e.RelationID)
 	}
 	for ref, st := range statusByRef {
 		keys = append(keys, "status|"+ref+"|"+st)
 	}
-	// Insertion sort for zero-dep small N.
-	for i := 1; i < len(keys); i++ {
-		j := i
-		for j > 0 && keys[j-1] > keys[j] {
-			keys[j-1], keys[j] = keys[j], keys[j-1]
-			j--
-		}
-	}
-	h := uint64(2166136261)
+	keys = append(keys, "provrev|"+providerRevision)
+	sort.Strings(keys)
+	h := sha256.New()
 	for _, k := range keys {
-		for i := 0; i < len(k); i++ {
-			h ^= uint64(k[i])
-			h *= 16777619
-		}
-		h ^= 0xff
-		h *= 16777619
+		_, _ = h.Write([]byte(k))
+		_, _ = h.Write([]byte{0})
 	}
-	return fmt.Sprintf("%016x", h)
+	return hex.EncodeToString(h.Sum(nil))
 }

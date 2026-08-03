@@ -11,14 +11,12 @@ import (
 
 // DriftFixture is a hermetic board snapshot for FAC-75/90/93/105 regression.
 type DriftFixture struct {
-	Name     string            `json:"name"`
-	Tasks    []FixtureTask     `json:"tasks"`
-	Board    []DependencyEdge  `json:"board"`
-	Desired  map[string][]DependencyEdge `json:"desired"` // task ref → desired blocks
-	// ExpectBlocked refs that must fail the launch gate.
-	ExpectBlocked []string `json:"expect_blocked"`
-	// ExpectOK refs that must pass (all blockers done, no drift).
-	ExpectOK []string `json:"expect_ok"`
+	Name          string                     `json:"name"`
+	Tasks         []FixtureTask              `json:"tasks"`
+	Board         []DependencyEdge           `json:"board"`
+	Desired       map[string][]DependencyEdge `json:"desired"`
+	ExpectBlocked []string                   `json:"expect_blocked"`
+	ExpectOK      []string                   `json:"expect_ok"`
 }
 
 // FixtureTask is one card in a drift fixture.
@@ -43,11 +41,9 @@ func FAC759093105Fixture() DriftFixture {
 			{ID: "id-73", Ref: "FAC-73", Status: "to-do", Priority: provider.PriorityMedium},
 			{ID: "id-117", Ref: "FAC-117", Status: "done", Priority: provider.PriorityMedium},
 		},
-		// Board intentionally missing the audit-repaired edges for FAC-75/90
-		// and missing FAC-73→FAC-105; FAC-117→FAC-93 present and done (OK).
 		Board: []DependencyEdge{
 			{RelationID: "b1", SourceRef: "FAC-117", TargetRef: "FAC-93", Type: EdgeBlocks,
-				SourceID: "id-117", TargetID: "id-93"},
+				SourceID: "id-fac-117", TargetID: "id-fac-93"},
 		},
 		Desired: map[string][]DependencyEdge{
 			"FAC-75":  {{SourceRef: "FAC-136", TargetRef: "FAC-75", Type: EdgeBlocks}},
@@ -68,11 +64,8 @@ func (f DriftFixture) LoadStore() *MemoryStore {
 		if id == "" {
 			id = "id-" + t.Ref
 		}
-		m.AddTask(&provider.Task{
-			ID: id, Ref: t.Ref, Title: t.Ref,
-			Status: provider.NormalizeStatus(t.Status),
-			Priority: t.Priority, ProjectID: "fixture",
-		})
+		// EnsureTask uses id-fac-N lowercase; align.
+		m.EnsureTask(t.Ref, t.Status, t.Priority)
 	}
 	for _, e := range f.Board {
 		_, _ = m.CreateRelation(context.Background(), e)
@@ -80,16 +73,27 @@ func (f DriftFixture) LoadStore() *MemoryStore {
 	return m
 }
 
-// RunFixture executes reconcile + gate checks. Returns non-nil error on failure
-// (nonzero exit for CLI / binary tests).
+// RunFixture executes reconcile + gate checks.
 func RunFixture(f DriftFixture) error {
 	store := f.LoadStore()
+	snap, err := store.SnapshotGraph(context.Background())
+	if err != nil {
+		return err
+	}
 	var failures []string
 
-	for ref, desired := range f.Desired {
-		rep := Reconcile(Ref(ref), desired, f.Board)
-		// Gate path also checks open blockers with store.
-		des := &Provenance{Version: SchemaVersion, TaskRef: Ref(ref), Edges: desired}
+	for ref, desiredEdges := range f.Desired {
+		rep := Reconcile(Ref(ref), desiredEdges, snap.Edges, ReconcileOpts{
+			FullClosure:        snap.Edges,
+			ProviderRevision:   snap.ProviderRevision,
+			RequireFullClosure: true,
+		})
+		des := &Provenance{
+			Version: SchemaVersion,
+			TaskRef: Ref(ref),
+			Edges:   desiredEdges,
+			Present: true,
+		}
 		_, gerr := ValidateLaunch(context.Background(), store, EntryDispatch, Ref(ref), des, "")
 
 		wantBlock := false
@@ -137,7 +141,7 @@ func joinNL(ss []string) string {
 	return out
 }
 
-// WriteFixtureJSON writes a fixture to path (relative or absolute — caller owns).
+// WriteFixtureJSON writes a fixture to path.
 func WriteFixtureJSON(path string, f DriftFixture) error {
 	b, err := json.MarshalIndent(f, "", "  ")
 	if err != nil {
@@ -146,12 +150,11 @@ func WriteFixtureJSON(path string, f DriftFixture) error {
 	return os.WriteFile(path, b, 0644)
 }
 
-// MutationControl_ReconcileRemoved is called by binary tests: if Reconcile is
-// replaced with a vacuous OK, this returns an error the harness must see.
+// MutationControl_ReconcileRemoved fails if Reconcile is vacuous.
 func MutationControl_ReconcileRemoved() error {
 	rep := Reconcile("FAC-75", []DependencyEdge{
 		{SourceRef: "FAC-136", TargetRef: "FAC-75", Type: EdgeBlocks},
-	}, nil)
+	}, nil, ReconcileOpts{FullClosure: []DependencyEdge{}, RequireFullClosure: true})
 	if rep.OK {
 		return fmt.Errorf("MUTATION CONTROL FAILED: Reconcile is vacuous (OK on missing edge)")
 	}
@@ -162,11 +165,15 @@ func MutationControl_ReconcileRemoved() error {
 func MutationControl_GateBypassed() error {
 	m := NewMemoryStore()
 	m.EnsureTask("FAC-75", "to-do", provider.PriorityHigh)
-	m.EnsureTask("FAC-136", "to-do", provider.PriorityHigh) // not done
+	m.EnsureTask("FAC-136", "to-do", provider.PriorityHigh)
 	if _, err := m.SeedBlocks("FAC-136", "FAC-75"); err != nil {
 		return err
 	}
-	_, err := ValidateLaunch(context.Background(), m, EntryDispatch, "FAC-75", nil, "")
+	des := &Provenance{
+		Version: SchemaVersion, TaskRef: "FAC-75", Present: true,
+		Edges: []DependencyEdge{{SourceRef: "FAC-136", TargetRef: "FAC-75", Type: EdgeBlocks}},
+	}
+	_, err := ValidateLaunch(context.Background(), m, EntryDispatch, "FAC-75", des, "")
 	if err == nil {
 		return fmt.Errorf("MUTATION CONTROL FAILED: gate allowed open blocker")
 	}

@@ -14,6 +14,16 @@ const (
 	RelationSubtask RelationType = "subtask"
 )
 
+// ValidRelationType reports whether t is a known provider relation type.
+func ValidRelationType(t RelationType) bool {
+	switch t {
+	case RelationBlocks, RelationRelated, RelationSubtask:
+		return true
+	default:
+		return false
+	}
+}
+
 // Relation is one provider relation row (immutable IDs).
 type Relation struct {
 	ID           string
@@ -25,9 +35,13 @@ type Relation struct {
 
 // RelationProvider is the optional dependency surface. Providers that do not
 // implement it fail the FAC-159 gate with explicit capability unsupported.
-// Kaneo implements full list/create/delete with readback.
+// Kaneo implements full list/create/delete with dual-end readback.
 type RelationProvider interface {
 	ListRelations(ctx context.Context, taskID string) ([]Relation, error)
+	// CreateRelation rejects self-edges and unknown types; readbacks both ends;
+	// reconciles ambiguous create so retries do not duplicate.
 	CreateRelation(ctx context.Context, sourceID, targetID string, typ RelationType) (*Relation, error)
-	DeleteRelation(ctx context.Context, relationID string) error
+	// DeleteRelation requires captured endpoints and verifies absence on BOTH
+	// source and target listings. Ambiguous delete/timeouts never return success.
+	DeleteRelation(ctx context.Context, relationID, sourceID, targetID string) error
 }
