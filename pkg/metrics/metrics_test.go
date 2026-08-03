@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -114,8 +115,8 @@ func TestDeadProviderCannotContradictHealthyProviderObservation(t *testing.T) {
 	if err := exp.SetSignals(FleetSignals{DeadProvider: true, LastReconciliation: now, ObservedAt: now}); err == nil {
 		t.Fatal("dead provider must not coexist with a healthy provider observation")
 	}
-	if got := exp.Signals(); got != (FleetSignals{}) {
-		t.Fatalf("contradictory signal was not rejected fail-closed: %+v", got)
+	if got := exp.Signals(); got.ObservedAt != now || got.DeadProvider {
+		t.Fatalf("contradictory signal did not leave a fenced unknown tombstone: %+v", got)
 	}
 }
 
@@ -184,8 +185,8 @@ func TestConditionCodesRemainDistinctAndEligibleIdleIsDerived(t *testing.T) {
 	if len(conditions) != 6 || conditions[0] != ConditionStalledWork || conditions[1] != ConditionDroppedCallback || conditions[2] != ConditionReviewSaturation || conditions[3] != ConditionDeadProvider || conditions[4] != ConditionIntegrationBacklog || conditions[5] != ConditionDeadLetters {
 		t.Fatalf("condition codes collapsed or reordered: %v", conditions)
 	}
-	eligible := FleetSignals{EligibleWaiting: 1, EligibleSince: eligibleSince, EligibleIdle: 10 * time.Second, LastReconciliation: now, ObservedAt: now}
-	if got := eligible.ConditionCodes(); len(got) != 1 || got[0] != ConditionEligibleIdle {
+	eligible := FleetSignals{EligibleWaiting: 1, EligibleSince: eligibleSince, LastReconciliation: now, ObservedAt: now}
+	if got := deriveSignalsAt(eligible, now).ConditionCodes(); len(got) != 1 || got[0] != ConditionEligibleIdle {
 		t.Fatalf("eligible idle condition was not distinct: %v", got)
 	}
 	contradictory := eligible
@@ -201,12 +202,12 @@ func TestTransitionSLOUsesDeterministicClockAndSeparatesFailures(t *testing.T) {
 	observed := end.Add(time.Second)
 	exp := NewMetricsExporter()
 	exp.RecordTransition(start, end, nil, observed)
-	exp.RecordTransition(start, end, errors.New("event append failed"), observed)
+	exp.RecordTransition(start, end, errors.New("event append failed"), observed.Add(time.Second))
 	_, _, slo := exp.Snapshot()
 	if slo.Attempts != 2 || slo.Completed != 1 || slo.Failed != 1 {
 		t.Fatalf("unexpected transition SLO: %+v", slo)
 	}
-	if slo.TotalLatency != 250*time.Millisecond || !slo.ObservedAt.Equal(observed) {
+	if slo.TotalLatency != 250*time.Millisecond || !slo.ObservedAt.Equal(observed.Add(time.Second)) {
 		t.Fatalf("unexpected deterministic latency/timestamp: %+v", slo)
 	}
 }
@@ -234,8 +235,8 @@ func TestFleetSignalsMatrixRejectsContradictoryAndStaleObservations(t *testing.T
 		if err := exp.SetSignals(signals); err == nil {
 			t.Fatalf("contradictory/stale signals accepted: %+v", signals)
 		}
-		if got := exp.Signals(); got != (FleetSignals{}) {
-			t.Fatalf("invalid signal did not fail closed: %+v", got)
+		if got := exp.Signals(); got.ObservedAt.IsZero() {
+			t.Fatalf("invalid signal did not leave an unknown tombstone: %+v", got)
 		}
 	}
 }
@@ -266,6 +267,7 @@ func TestMetricsStateRestartRoundTripAndStaleRestore(t *testing.T) {
 	for name, mutate := range map[string]func(*persistedState){
 		"negative latency":    func(state *persistedState) { state.SLO.TotalLatency = -time.Second },
 		"oversized latency":   func(state *persistedState) { state.SLO.TotalLatency = maxSignalAge + time.Nanosecond },
+		"future timestamp":    func(state *persistedState) { state.SLO.ObservedAt = now.Add(time.Second) },
 		"inconsistent totals": func(state *persistedState) { state.SLO.Failed++ },
 		"torn readiness":      func(state *persistedState) { state.Health.Readiness = !state.Health.Readiness },
 	} {
@@ -307,6 +309,32 @@ func TestMetricsStateRestartRoundTripAndStaleRestore(t *testing.T) {
 	}
 	if health, queue, signals := stale.Snapshot(); health.Readiness || queue.Known || stale.Signals() != (FleetSignals{}) || signals.Attempts != 0 {
 		t.Fatalf("stale restore did not remain fail-closed: health=%+v queue=%+v signals=%+v slo=%+v", health, queue, stale.Signals(), signals)
+	}
+}
+
+func TestTombstoneRoundTripRemainsUnknownAndFenced(t *testing.T) {
+	now := time.Date(2026, 8, 3, 12, 0, 0, 0, time.UTC)
+	store := &memoryStateStore{}
+	exp := NewMetricsExporterWithPersistence(store, func() time.Time { return now })
+	if err := exp.SetHealthAt(completeDependencies(), now); err != nil {
+		t.Fatal(err)
+	}
+	if err := exp.SetQueuePressureAt(QueuePressure{Depth: 0, Capacity: 1, Known: true}, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := exp.SetSignalsObservation(FleetSignals{EligibleWaiting: 1, ReviewSaturation: reviewSaturationThreshold, EligibleSince: now, LastReconciliation: now, ObservedAt: now}, 9); err == nil {
+		t.Fatal("expected invalid signal to create a tombstone")
+	}
+	if err := exp.Persist(context.Background()); err != nil {
+		t.Fatalf("tombstone was not persistable: %v", err)
+	}
+	restored := NewMetricsExporterWithPersistence(store, func() time.Time { return now })
+	if err := restored.Restore(context.Background()); err != nil {
+		t.Fatalf("tombstone restore failed: %v", err)
+	}
+	view := restored.ReadAt(now)
+	if view.Freshness.SignalsFresh || restored.Signals().Sequence != 9 {
+		t.Fatalf("restored tombstone became authoritative: view=%+v signals=%+v", view, restored.Signals())
 	}
 }
 
@@ -369,5 +397,90 @@ func TestMetricsHandlerUsesBoundedLabelsAndSafeGauges(t *testing.T) {
 	}
 	if strings.Contains(body, "herd_transition_latency_seconds") {
 		t.Fatalf("failed transitions must not export completed latency: %s", body)
+	}
+}
+
+func TestReadAtDerivesEligibleIdleFromCapturedClock(t *testing.T) {
+	base := time.Date(2026, 8, 3, 12, 0, 0, 0, time.UTC)
+	exp := NewMetricsExporterWithPersistence(nil, func() time.Time { return base })
+	if err := exp.SetSignals(FleetSignals{EligibleWaiting: 1, EligibleSince: base, LastReconciliation: base, ObservedAt: base}); err != nil {
+		t.Fatal(err)
+	}
+	first := exp.ReadAt(base.Add(10 * time.Second))
+	second := exp.ReadAt(base.Add(40 * time.Second))
+	if first.Signals.EligibleIdle != 10*time.Second || second.Signals.EligibleIdle != 40*time.Second {
+		t.Fatalf("eligible idle did not advance from ReadAt clock: first=%s second=%s", first.Signals.EligibleIdle, second.Signals.EligibleIdle)
+	}
+	if stored := exp.Signals(); stored.EligibleIdle != 0 {
+		t.Fatalf("caller-computed eligible idle was persisted: %+v", stored)
+	}
+}
+
+func TestNewerInvalidObservationsLeaveFencedTombstones(t *testing.T) {
+	now := time.Date(2026, 8, 3, 12, 0, 0, 0, time.UTC)
+	exp := NewMetricsExporterWithPersistence(nil, func() time.Time { return now })
+	if err := exp.SetHealthObservation(completeDependencies(), now, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := exp.SetHealthObservation(nil, now, 2); err == nil {
+		t.Fatal("invalid newer health observation was accepted")
+	}
+	if err := exp.SetHealthObservation(completeDependencies(), now.Add(time.Second), 1); err == nil {
+		t.Fatal("older health observation overwrote invalid tombstone")
+	}
+	if health, _, _ := exp.Snapshot(); health.Readiness || health.Sequence != 2 || !health.ObservedAt.Equal(now) {
+		t.Fatalf("health tombstone lost its fence: %+v", health)
+	}
+
+	if err := exp.SetQueuePressureObservation(QueuePressure{Depth: 1, Capacity: 2, Known: true}, now, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := exp.SetQueuePressureObservation(QueuePressure{Depth: 3, Capacity: 2, Known: true}, now, 2); err == nil {
+		t.Fatal("invalid newer queue observation was accepted")
+	}
+	if err := exp.SetQueuePressureObservation(QueuePressure{Depth: 1, Capacity: 2, Known: true}, now.Add(time.Second), 1); err == nil {
+		t.Fatal("older queue observation overwrote invalid tombstone")
+	}
+	if _, queue, _ := exp.Snapshot(); queue.Known || queue.Sequence != 2 || !queue.ObservedAt.Equal(now) {
+		t.Fatalf("queue tombstone lost its fence: %+v", queue)
+	}
+
+	if err := exp.SetSignalsObservation(FleetSignals{StalledWork: 1, LastReconciliation: now, ObservedAt: now}, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := exp.SetSignalsObservation(FleetSignals{EligibleWaiting: 1, ReviewSaturation: reviewSaturationThreshold, EligibleSince: now, LastReconciliation: now, ObservedAt: now}, 2); err == nil {
+		t.Fatal("invalid newer signal observation was accepted")
+	}
+	if err := exp.SetSignalsObservation(FleetSignals{StalledWork: 1, LastReconciliation: now.Add(time.Second), ObservedAt: now.Add(time.Second)}, 1); err == nil {
+		t.Fatal("older signal observation overwrote invalid tombstone")
+	}
+	if signals := exp.Signals(); signals.Sequence != 2 || !signals.ObservedAt.Equal(now) || signals.StalledWork != 0 {
+		t.Fatalf("signal tombstone lost its fence: %+v", signals)
+	}
+}
+
+func TestEqualObservationRequiresCanonicalPayload(t *testing.T) {
+	now := time.Date(2026, 8, 3, 12, 0, 0, 0, time.UTC)
+	exp := NewMetricsExporterWithPersistence(nil, func() time.Time { return now })
+	if err := exp.SetQueuePressureObservation(QueuePressure{Depth: 1, Capacity: 2, Known: true}, now, 4); err != nil {
+		t.Fatal(err)
+	}
+	if err := exp.SetQueuePressureObservation(QueuePressure{Depth: 1, Capacity: 2, Known: true}, now, 4); err != nil {
+		t.Fatalf("exact duplicate was not idempotent: %v", err)
+	}
+	if err := exp.SetQueuePressureObservation(QueuePressure{Depth: 2, Capacity: 2, Known: true}, now, 4); err == nil {
+		t.Fatal("equal sequence and timestamp accepted conflicting payload")
+	}
+	if err := exp.SetQueuePressureObservation(QueuePressure{Depth: 1, Capacity: 2, Known: true}, now.Add(time.Second), 4); err == nil {
+		t.Fatal("equal sequence with later timestamp accepted a conflicting observation")
+	}
+}
+
+func TestMetricsWriteFailureHasBoundedReadback(t *testing.T) {
+	exp := NewMetricsExporter()
+	exp.writeHook = func(io.Writer, string) (int, error) { return 0, errors.New("socket reset") }
+	exp.Handler().ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("GET", "/metrics", nil))
+	if err := exp.LastMetricsWriteError(); err == nil || err.Error() != "metrics response write failed" {
+		t.Fatalf("write failure was not surfaced through bounded readback: %v", err)
 	}
 }
