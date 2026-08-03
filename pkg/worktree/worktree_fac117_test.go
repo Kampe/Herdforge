@@ -381,7 +381,7 @@ func TestFAC117_Mutation_UniqueGuard(t *testing.T) {
 }
 
 func TestSalvageRefFor(t *testing.T) {
-	if got := SalvageRefFor("herd/fac-117"); got != "refs/herd/salvage/herd/fac-117" {
+	if got := SalvageRefFor("herd/fac-117"); got != "refs/herd/salvage/v1/686572642f6661632d313137" {
 		t.Fatalf("got %s", got)
 	}
 }
