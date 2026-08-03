@@ -82,6 +82,16 @@ type conformanceWaker struct {
 	fail  error
 }
 
+type unverifiedWaker struct{ conformanceWaker }
+
+func (w *unverifiedWaker) Wake(_ context.Context, r WakeRequest) (WakeReceipt, error) {
+	return WakeReceipt{MessageID: r.MessageID, Consumed: true, Verified: false, SequenceToken: "wake", Target: r.Target.Target, SessionID: r.Target.SessionID, LeaseGeneration: r.Target.LeaseGeneration}, nil
+}
+
+func (w *conformanceWaker) WakeTarget() WakeTarget {
+	return WakeTarget{Target: "worker-1", TabID: "tab-1", PaneID: "pane-1", AgentName: "worker-1", SessionID: "tab-1/pane-1", LeaseGeneration: 7}
+}
+
 type authority struct{ identity LaneIdentity }
 
 func (a authority) Resolve(context.Context, Order) (LaneIdentity, error) { return a.identity, nil }
@@ -91,7 +101,7 @@ func (w *conformanceWaker) Wake(_ context.Context, r WakeRequest) (WakeReceipt, 
 	if w.fail != nil {
 		return WakeReceipt{}, w.fail
 	}
-	return WakeReceipt{MessageID: r.MessageID, Consumed: true}, nil
+	return WakeReceipt{MessageID: r.MessageID, Consumed: true, Verified: true, SequenceToken: "wake", Target: r.Target.Target, SessionID: r.Target.SessionID, LeaseGeneration: r.Target.LeaseGeneration}, nil
 }
 
 type evidenceReader struct{ ok bool }
@@ -119,7 +129,7 @@ func evidenceFor(t *testing.T, store *outbox.Store, o Order) AckEvidence {
 	if err != nil || item == nil {
 		t.Fatalf("stored order: %v %#v", err, item)
 	}
-	return AckEvidence{IdempotencyKey: key, MessageID: item.MessageID, Sequence: item.Sequence, Repository: o.Repository, TaskRef: o.TaskRef, Lane: o.Lane, LeaseGeneration: o.LeaseGeneration, CandidateSHA: o.CandidateSHA, Kind: o.Kind, BodyDigest: digest}
+	return AckEvidence{IdempotencyKey: key, MessageID: item.MessageID, Sequence: item.Sequence, Repository: o.Repository, TaskRef: o.TaskRef, Lane: o.Lane, LeaseGeneration: o.LeaseGeneration, CandidateSHA: o.CandidateSHA, Kind: o.Kind, BodyDigest: digest, EnvelopeID: "ack-" + shortID(key)}
 }
 
 func fixtureOrder() Order {
@@ -192,6 +202,19 @@ func TestDeliveryFailClosedBeforeWakeAndStaleIdentity(t *testing.T) {
 	stale.LeaseGeneration++
 	if _, err := d.Deliver(context.Background(), stale); !errors.Is(err, ErrStaleIdentity) {
 		t.Fatalf("stale generation error = %v", err)
+	}
+}
+
+func TestUnverifiedWakeReceiptCannotAdvanceOrder(t *testing.T) {
+	store := newTestControlStore(t)
+	o := fixtureOrder()
+	d := &Delivery{Outbox: store, Sender: &conformanceSender{}, Waker: &unverifiedWaker{}, Authority: authority{o.LaneIdentity}, Owner: "unverified-owner"}
+	if _, err := d.Deliver(context.Background(), o); !errors.Is(err, ErrMissingReceipt) {
+		t.Fatalf("unverified wake accepted: %v", err)
+	}
+	item, err := store.GetByKey(func() string { key, _, _, _ := identityKey(o); return key }())
+	if err != nil || item == nil || item.Status != outbox.StatusSent {
+		t.Fatalf("order was not retained as sent: %#v %v", item, err)
 	}
 }
 
@@ -300,7 +323,9 @@ func TestStructuredEvidenceRejectsEveryBoundMismatch(t *testing.T) {
 	if _, err := d.Deliver(context.Background(), o); err != nil {
 		t.Fatal(err)
 	}
-	d.Evidence = structuredEvidence{evidence: evidenceFor(t, store, o)}
+	ev := evidenceFor(t, store, o)
+	ev.EnvelopeID = "supersede-" + shortID(ev.IdempotencyKey)
+	d.Evidence = structuredEvidence{evidence: ev}
 	if _, err := d.SupersedeEvidence(context.Background(), o); err != nil {
 		t.Fatal(err)
 	}

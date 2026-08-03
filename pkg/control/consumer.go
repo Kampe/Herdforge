@@ -18,17 +18,18 @@ import (
 )
 
 var ErrProcessingUnresolved = errors.New("control: durable processing state requires reconciliation")
+var ErrProcessorUnavailable = errors.New("control: idempotency-aware processor is required")
 
 type Consumer struct {
 	Mailbox     *mail.Mailbox
 	Identity    LaneIdentity
 	Coordinator string
-	Process     func(context.Context, Order) error
+	Process     func(context.Context, Order, string) error
 }
 
 func (c *Consumer) Consume(ctx context.Context) error {
 	if c == nil || c.Mailbox == nil || c.Process == nil {
-		return fmt.Errorf("control: consumer mailbox and processor are required")
+		return ErrProcessorUnavailable
 	}
 	if c.Coordinator == "" {
 		c.Coordinator = mail.CoordinatorInbox
@@ -55,6 +56,9 @@ func (c *Consumer) Consume(ctx context.Context) error {
 		if order.BodyDigest != digest {
 			return fmt.Errorf("control: body digest mismatch")
 		}
+		if env.Sender != c.Coordinator || env.Recipient != c.Identity.Lane || env.ID != messageID(key) || env.Subject != "control/"+string(order.Kind) || env.Sequence <= 0 {
+			return fmt.Errorf("control: control envelope identity mismatch")
+		}
 		terminal, err := c.findEvidence(ctx, key, env, order)
 		if err != nil {
 			return err
@@ -62,14 +66,27 @@ func (c *Consumer) Consume(ctx context.Context) error {
 		if terminal {
 			continue
 		}
-		if c.processingSeen(ctx, key, env) {
-			return ErrProcessingUnresolved
-		}
-		if err := c.markProcessing(ctx, key, env); err != nil {
+		processing, err := c.processingSeen(ctx, key, env)
+		if err != nil {
 			return err
 		}
-		if err := c.Process(ctx, order); err != nil {
+		applied, err := c.appliedSeen(ctx, key, env)
+		if err != nil {
+			return err
+		}
+		if applied {
+			continue
+		}
+		if !processing {
+			if err := c.markProcessing(ctx, key, env); err != nil {
+				return err
+			}
+		}
+		if err := c.Process(ctx, order, key); err != nil {
 			return fmt.Errorf("control: processor failed for %s: %w", key, err)
+		}
+		if err := c.markApplied(ctx, key, env); err != nil {
+			return err
 		}
 		if err := c.emit(ctx, "control/ack", "ack-"+shortID(key), key, env, order); err != nil {
 			return err
@@ -94,7 +111,11 @@ func (c *Consumer) findEvidence(ctx context.Context, key string, orderEnv *mail.
 			return false, fmt.Errorf("control: corrupt terminal evidence: %w", err)
 		}
 		if e.IdempotencyKey == key {
-			if e.MessageID != orderEnv.ID || e.Sequence != orderEnv.Sequence || e.Repository != o.Repository || e.TaskRef != o.TaskRef || e.Lane != o.Lane || e.LeaseGeneration != o.LeaseGeneration || e.CandidateSHA != o.CandidateSHA || e.Kind != o.Kind || e.BodyDigest != o.BodyDigest {
+			wantID := "ack-" + shortID(key)
+			if env.Subject == "control/supersede" {
+				wantID = "supersede-" + shortID(key)
+			}
+			if env.Sender != o.Lane || env.Recipient != c.Coordinator || env.ID != wantID || env.Sequence <= 0 || e.MessageID != orderEnv.ID || e.Sequence != orderEnv.Sequence || e.Repository != o.Repository || e.TaskRef != o.TaskRef || e.Lane != o.Lane || e.LeaseGeneration != o.LeaseGeneration || e.CandidateSHA != o.CandidateSHA || e.Kind != o.Kind || e.BodyDigest != o.BodyDigest {
 				return false, fmt.Errorf("control: terminal evidence identity mismatch")
 			}
 			return true, nil
@@ -103,21 +124,44 @@ func (c *Consumer) findEvidence(ctx context.Context, key string, orderEnv *mail.
 	return false, nil
 }
 
-func (c *Consumer) processingSeen(ctx context.Context, key string, orderEnv *mail.Envelope) bool {
+func (c *Consumer) processingSeen(ctx context.Context, key string, orderEnv *mail.Envelope) (bool, error) {
 	envs, err := c.Mailbox.ReadInboxContext(ctx, c.Coordinator)
 	if err != nil {
-		return true
+		return false, err
 	}
 	for _, env := range envs {
-		if env.Subject == "control/processing" && env.ID == "processing-"+shortID(key) && env.Body == orderEnv.ID {
-			return true
+		if env.Subject == "control/processing" && env.ID == "processing-"+shortID(key) {
+			if env.Sender != orderEnv.Recipient || env.Recipient != c.Coordinator || env.Body != orderEnv.ID || env.Sequence <= 0 {
+				return false, fmt.Errorf("control: processing marker identity mismatch")
+			}
+			return true, nil
 		}
 	}
-	return false
+	return false, nil
 }
 
 func (c *Consumer) markProcessing(ctx context.Context, key string, env *mail.Envelope) error {
 	return c.Mailbox.SendEnvelopeContext(ctx, &mail.Envelope{ID: "processing-" + shortID(key), Sender: c.Identity.Lane, Recipient: c.Coordinator, Subject: "control/processing", Body: env.ID})
+}
+
+func (c *Consumer) appliedSeen(ctx context.Context, key string, orderEnv *mail.Envelope) (bool, error) {
+	envs, err := c.Mailbox.ReadInboxContext(ctx, c.Coordinator)
+	if err != nil {
+		return false, err
+	}
+	for _, env := range envs {
+		if env.Subject == "control/applied" && env.ID == "applied-"+shortID(key) {
+			if env.Sender != c.Identity.Lane || env.Recipient != c.Coordinator || env.Body != orderEnv.ID || env.Sequence <= 0 {
+				return false, fmt.Errorf("control: applied marker identity mismatch")
+			}
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func (c *Consumer) markApplied(ctx context.Context, key string, env *mail.Envelope) error {
+	return c.Mailbox.SendEnvelopeContext(ctx, &mail.Envelope{ID: "applied-" + shortID(key), Sender: c.Identity.Lane, Recipient: c.Coordinator, Subject: "control/applied", Body: env.ID})
 }
 
 // Supersede is explicit and preserves why the order was not applied.
@@ -129,7 +173,7 @@ func (c *Consumer) Supersede(ctx context.Context, order Order, messageID string,
 	if order.BodyDigest == "" {
 		order.BodyDigest = digest
 	}
-	e := AckEvidence{IdempotencyKey: key, MessageID: messageID, Sequence: sequence, Repository: order.Repository, TaskRef: order.TaskRef, Lane: order.Lane, LeaseGeneration: order.LeaseGeneration, CandidateSHA: order.CandidateSHA, Kind: order.Kind, BodyDigest: order.BodyDigest, Outcome: "superseded", FailureReason: reason, Retryable: retryable}
+	e := AckEvidence{IdempotencyKey: key, MessageID: messageID, Sequence: sequence, Repository: order.Repository, TaskRef: order.TaskRef, Lane: order.Lane, LeaseGeneration: order.LeaseGeneration, CandidateSHA: order.CandidateSHA, Kind: order.Kind, BodyDigest: order.BodyDigest, Outcome: "superseded", FailureReason: reason, Retryable: retryable, EnvelopeID: "supersede-" + shortID(key)}
 	b, err := json.Marshal(e)
 	if err != nil {
 		return err
@@ -138,7 +182,7 @@ func (c *Consumer) Supersede(ctx context.Context, order Order, messageID string,
 }
 
 func (c *Consumer) emit(ctx context.Context, subject, id, key string, env *mail.Envelope, o Order) error {
-	e := AckEvidence{IdempotencyKey: key, MessageID: env.ID, Sequence: env.Sequence, Repository: o.Repository, TaskRef: o.TaskRef, Lane: o.Lane, LeaseGeneration: o.LeaseGeneration, CandidateSHA: o.CandidateSHA, Kind: o.Kind, BodyDigest: o.BodyDigest}
+	e := AckEvidence{IdempotencyKey: key, MessageID: env.ID, Sequence: env.Sequence, Repository: o.Repository, TaskRef: o.TaskRef, Lane: o.Lane, LeaseGeneration: o.LeaseGeneration, CandidateSHA: o.CandidateSHA, Kind: o.Kind, BodyDigest: o.BodyDigest, EnvelopeID: id, Outcome: "acknowledged"}
 	b, err := json.Marshal(e)
 	if err != nil {
 		return err
