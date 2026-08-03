@@ -145,13 +145,14 @@ func TestHermeticGitDoesNotLeaveDetachedWriters(t *testing.T) {
 }
 
 // TestMutationPathGuardsStressNoTempDirResidue runs the exact path-guard
-// matrix many times under this process. Pair with:
+// matrix several times in-process. Fleet acceptance stress is:
 //
-//	go test -race ./pkg/verifier -run 'TestMutationPathGuardsRejectEscapesAndMetadataWithoutOutsideWrites' -count=500
+//	go test -race ./pkg/verifier -run 'TestMutationPathGuardsRejectEscapesAndMetadataWithoutOutsideWrites$' -count=500 -parallel=2
+//	go test -race ./pkg/verifier/... -count=100
 //
-// for cross-process stress. Failures must not be masked by cleanup retries.
+// Failures must not be masked by cleanup retries.
 func TestMutationPathGuardsStressNoTempDirResidue(t *testing.T) {
-	const iterations = 50
+	const iterations = 5
 	if testing.Short() {
 		t.Skip("stress path under -short")
 	}
