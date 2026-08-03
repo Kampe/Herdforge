@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 )
 
 type LinearProvider struct {
@@ -52,6 +53,12 @@ type linearGraphQLRequest struct {
 	Variables map[string]interface{} `json:"variables,omitempty"`
 }
 
+type linearWorkflowStateDTO struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+	Type string `json:"type"`
+}
+
 type linearIssueDTO struct {
 	ID          string `json:"id"`
 	Identifier  string `json:"identifier"`
@@ -59,8 +66,14 @@ type linearIssueDTO struct {
 	Description string `json:"description"`
 	Priority    int    `json:"priority"` // 1=Urgent, 2=High, 3=Medium, 4=Low
 	State       struct {
+		ID   string `json:"id"`
 		Name string `json:"name"`
 	} `json:"state"`
+	Team struct {
+		States struct {
+			Nodes []linearWorkflowStateDTO `json:"nodes"`
+		} `json:"states"`
+	} `json:"team"`
 	Project struct {
 		ID string `json:"id"`
 	} `json:"project"`
@@ -242,9 +255,15 @@ func (l *LinearProvider) ClaimTask(ctx context.Context, taskID string, role stri
 
 func (l *LinearProvider) UpdateStatus(ctx context.Context, taskID string, status string) error {
 	canonical := NormalizeStatus(status)
+	if !isCanonicalLinearStatus(canonical) {
+		return fmt.Errorf("linear: unsupported canonical status %q", canonical)
+	}
 	dls := l.deadlines()
 	writeCtx, cancel := WithOpDeadline(ctx, dls, OpMutate)
-	writeErr := l.updateStatusOnce(writeCtx, taskID, status)
+	stateID, writeErr := l.resolveWorkflowStateID(writeCtx, taskID, canonical)
+	if writeErr == nil {
+		writeErr = l.updateStatusOnce(writeCtx, taskID, stateID)
+	}
 	cancel()
 	if writeErr != nil {
 		writeErr = AsTimeout("linear", "UpdateStatus", OpMutate, dls.For(OpMutate), writeErr)
@@ -252,7 +271,69 @@ func (l *LinearProvider) UpdateStatus(ctx context.Context, taskID string, status
 	return AfterMutation(ctx, l, dls, "linear", "UpdateStatus", taskID, canonical, writeErr)
 }
 
-func (l *LinearProvider) updateStatusOnce(ctx context.Context, taskID, status string) error {
+func (l *LinearProvider) resolveWorkflowStateID(ctx context.Context, taskID, canonical string) (string, error) {
+	query := `query ResolveIssueWorkflowStates($id: String!) { issue(id: $id) { id team { states { nodes { id name type } } } } }`
+	var res struct {
+		Data struct {
+			Issue linearIssueDTO `json:"issue"`
+		} `json:"data"`
+	}
+	if err := l.doGraphQL(ctx, query, map[string]interface{}{"id": taskID}, &res); err != nil {
+		return "", err
+	}
+	if res.Data.Issue.ID == "" {
+		return "", fmt.Errorf("linear: issue %q missing from workflow state resolution", taskID)
+	}
+
+	var exact, typed []linearWorkflowStateDTO
+	for _, state := range res.Data.Issue.Team.States.Nodes {
+		if strings.TrimSpace(state.ID) == "" {
+			continue
+		}
+		if NormalizeStatus(state.Name) == canonical {
+			exact = append(exact, state)
+		} else if linearWorkflowStateCanonical(state.Type) == canonical {
+			typed = append(typed, state)
+		}
+	}
+	if len(exact) == 1 {
+		return exact[0].ID, nil
+	}
+	if len(exact) > 1 {
+		return "", fmt.Errorf("linear: issue %q has %d workflow states matching %q", taskID, len(exact), canonical)
+	}
+	if len(typed) == 1 {
+		return typed[0].ID, nil
+	}
+	if len(typed) > 1 {
+		return "", fmt.Errorf("linear: issue %q has %d workflow states of type %q", taskID, len(typed), canonical)
+	}
+	return "", fmt.Errorf("linear: issue %q has no workflow state for %q", taskID, canonical)
+}
+
+func isCanonicalLinearStatus(status string) bool {
+	switch status {
+	case StatusToDo, StatusInProgress, StatusInReview, StatusDone:
+		return true
+	default:
+		return false
+	}
+}
+
+func linearWorkflowStateCanonical(typ string) string {
+	switch strings.ToLower(strings.TrimSpace(typ)) {
+	case "triage", "backlog", "unstarted":
+		return StatusToDo
+	case "started":
+		return StatusInProgress
+	case "completed", "canceled":
+		return StatusDone
+	default:
+		return StatusUnknown
+	}
+}
+
+func (l *LinearProvider) updateStatusOnce(ctx context.Context, taskID, stateID string) error {
 	query := `mutation UpdateIssueState($id: String!, $state: String!) { issueUpdate(id: $id, input: { stateId: $state }) { success } }`
 	var res struct {
 		Data struct {
@@ -261,7 +342,13 @@ func (l *LinearProvider) updateStatusOnce(ctx context.Context, taskID, status st
 			} `json:"issueUpdate"`
 		} `json:"data"`
 	}
-	return l.doGraphQL(ctx, query, map[string]interface{}{"id": taskID, "state": status}, &res)
+	if err := l.doGraphQL(ctx, query, map[string]interface{}{"id": taskID, "state": stateID}, &res); err != nil {
+		return err
+	}
+	if !res.Data.IssueUpdate.Success {
+		return fmt.Errorf("linear: issueUpdate reported success=false")
+	}
+	return nil
 }
 
 func (l *LinearProvider) AddComment(ctx context.Context, taskID string, body string) error {

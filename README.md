@@ -143,6 +143,19 @@ Unknown provider state, failed delivery, stale review SHA, same-family review, d
 
 The repository-local config lives at `.herd/herd.yaml` and describes the project, task provider, lanes, routing candidates, and verification commands. Paths stored in configuration and generated artifacts must remain repository-relative.
 
+### Private Linear profile
+
+Leave the checked-in Kaneo config unchanged. Copy the credential-free example into the ignored local profile, set its Linear project ID, and select it at runtime:
+
+```bash
+cp docs/examples/herd.linear.yaml .herd/herd.yaml.local
+export LINEAR_API_KEY="..."
+HERD_CONFIG_PATH=.herd/herd.yaml.local herd validate-config
+HERD_CONFIG_PATH=.herd/herd.yaml.local herd status
+```
+
+The `linear` provider requires `task_provider.api_key_env` and fails closed when that environment variable is empty; it never falls back to `KANEO_API_KEY`. Linear transitions resolve the requested canonical status to a workflow state ID for the task's team, then read the issue back after mutation. Do not commit the local profile with a token.
+
 Do not treat the model on a lane as permanent identity. Routing must distinguish:
 
 - execution harness/backend;

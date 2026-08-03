@@ -6,6 +6,36 @@ import (
 	"testing"
 )
 
+func TestRuntimeConfigPathOverride(t *testing.T) {
+	profilePath := filepath.Join(t.TempDir(), "herd.linear.yaml")
+	content := `
+version: "1"
+project:
+  name: "private-linear"
+  default_branch: "main"
+task_provider:
+  type: "linear"
+  project_id: "project-id"
+  api_key_env: "LINEAR_API_KEY"
+lanes: []
+`
+	if err := os.WriteFile(profilePath, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HERD_CONFIG_PATH", profilePath)
+
+	if got := RuntimeConfigPath(); got != profilePath {
+		t.Fatalf("RuntimeConfigPath()=%q, want %q", got, profilePath)
+	}
+	cfg, err := LoadConfig(DefaultConfigPath)
+	if err != nil {
+		t.Fatalf("LoadConfig(default): %v", err)
+	}
+	if cfg.Project.Name != "private-linear" || cfg.TaskProvider.Type != "linear" {
+		t.Fatalf("runtime profile was not loaded: %+v", cfg)
+	}
+}
+
 func TestLoadConfig_Valid(t *testing.T) {
 	tmpDir := t.TempDir()
 	cfgPath := filepath.Join(tmpDir, "herd.yaml")

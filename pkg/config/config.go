@@ -213,7 +213,20 @@ type Verification struct {
 	PreflightCommand string `yaml:"preflight_command,omitempty"`
 }
 
+// RuntimeConfigPath returns the operator-selected config profile. HERD_CONFIG_PATH
+// is intentionally runtime-only so private provider credentials and profiles do
+// not require changing the repository's default config.
+func RuntimeConfigPath() string {
+	if path := os.Getenv("HERD_CONFIG_PATH"); path != "" {
+		return path
+	}
+	return DefaultConfigPath
+}
+
 func LoadConfig(path string) (*Config, error) {
+	if path == DefaultConfigPath {
+		path = RuntimeConfigPath()
+	}
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read config file %s: %w", path, err)
