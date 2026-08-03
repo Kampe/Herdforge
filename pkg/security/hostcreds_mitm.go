@@ -22,14 +22,26 @@ import (
 	"time"
 )
 
+// BrokerReceipt is a redacted broker-side record of one authorized inject.
+// Never contains secret material — only host/method/path and inject_ok.
+type BrokerReceipt struct {
+	Host     string
+	Method   string
+	Path     string
+	InjectOK bool
+}
+
 // TLSMitmProxy is the stock-CLI transport: loopback HTTPS CONNECT MITM for
 // exact host:443 only. Secrets inject from CredentialAuthority; workers never
 // receive API keys.
 //
-// Peer policy (fail-closed):
-//   - CONNECT is denied until at least one worker PID is AllowPID-registered.
-//   - If peer PID cannot be determined, CONNECT is denied (no fail-open).
-//   - Only registered PIDs may CONNECT.
+// Peer policy (fail-closed, kernel-exact):
+//   - Primary: client source port must be AllowClientPort-registered (exclusive
+//     claim protocol). RemoteAddr().Port is kernel-visible after Accept.
+//   - Secondary (Linux only): AllowPID + /proc peer PID. Darwin has no
+//     authoritative TCP peer-PID API — lsof is not used (nondeterministic).
+//   - If neither port nor (supported) PID matches, CONNECT is denied.
+//   - Empty allowlists deny all.
 //
 // Request policy: after CONNECT+TLS, EVERY HTTP request is parsed and
 // authorized (host/method/path/action/budget/auth-strip/inject). There is no
@@ -46,16 +58,26 @@ type TLSMitmProxy struct {
 	rules   []RequestRule
 	hosts   map[string]bool
 	session string
+	// allowed PIDs (Linux secondary peer path).
 	allowed map[int]bool
-	closed  bool
+	// allowedPorts: exclusive client source ports (primary peer path).
+	allowedPorts map[int]bool
+	closed       bool
 	// reqCount counts authorized HTTP requests (not CONNECT handshakes).
 	reqCount int
 	maxReqs  int
 	// active client conns for Close.
 	conns map[net.Conn]struct{}
 
+	// Test/production dial override: host is normalized SNI; ip is pin result.
+	// When set, used instead of net.Dial to upstream :443 (local TLS origins).
+	dialHook func(host string, ip net.IP) (net.Conn, error)
+	// resolveHook overrides DNS pin (tests only).
+	resolveHook func(host string) (net.IP, error)
+
 	// Observability for tests (no secrets).
 	LastInjectHost   string
+	LastReceipt      BrokerReceipt
 	ConnectCount     int
 	RequestCount     int
 	DeniedConnects   int
@@ -112,18 +134,19 @@ func StartTLSMitmProxy(sessionID string, auth CredentialAuthority, rules []Reque
 		hosts[strings.ToLower(r.Host)] = true
 	}
 	p := &TLSMitmProxy{
-		ln:      ln,
-		addr:    ln.Addr().String(),
-		ca:      ca,
-		caPath:  caPath,
-		caDir:   "",
-		auth:    auth,
-		rules:   append([]RequestRule(nil), rules...),
-		hosts:   hosts,
-		session: sessionID,
-		allowed: map[int]bool{},
-		maxReqs: maxReqs,
-		conns:   map[net.Conn]struct{}{},
+		ln:           ln,
+		addr:         ln.Addr().String(),
+		ca:           ca,
+		caPath:       caPath,
+		caDir:        "",
+		auth:         auth,
+		rules:        append([]RequestRule(nil), rules...),
+		hosts:        hosts,
+		session:      sessionID,
+		allowed:      map[int]bool{},
+		allowedPorts: map[int]bool{},
+		maxReqs:      maxReqs,
+		conns:        map[net.Conn]struct{}{},
 	}
 	if owned {
 		p.caDir = caDir
@@ -160,6 +183,51 @@ func (p *TLSMitmProxy) AllowPID(pid int) {
 	p.mu.Unlock()
 }
 
+// AllowClientPort registers an exclusive client source port for CONNECT peer auth.
+// This is the primary production peer mechanism (kernel RemoteAddr after Accept).
+func (p *TLSMitmProxy) AllowClientPort(port int) {
+	if p == nil || port <= 0 {
+		return
+	}
+	p.mu.Lock()
+	if p.allowedPorts == nil {
+		p.allowedPorts = map[int]bool{}
+	}
+	p.allowedPorts[port] = true
+	p.mu.Unlock()
+}
+
+// ClearPeerAllowlists drops PID and port allowlists without closing the listener.
+func (p *TLSMitmProxy) ClearPeerAllowlists() {
+	if p == nil {
+		return
+	}
+	p.mu.Lock()
+	p.allowed = map[int]bool{}
+	p.allowedPorts = map[int]bool{}
+	p.mu.Unlock()
+}
+
+// SetDialHook installs a test/production upstream dial override (no secrets).
+func (p *TLSMitmProxy) SetDialHook(fn func(host string, ip net.IP) (net.Conn, error)) {
+	if p == nil {
+		return
+	}
+	p.mu.Lock()
+	p.dialHook = fn
+	p.mu.Unlock()
+}
+
+// SetResolveHook installs a test DNS pin override.
+func (p *TLSMitmProxy) SetResolveHook(fn func(host string) (net.IP, error)) {
+	if p == nil {
+		return
+	}
+	p.mu.Lock()
+	p.resolveHook = fn
+	p.mu.Unlock()
+}
+
 // Revoke drops allowlist and closes listeners/conns (session killed).
 func (p *TLSMitmProxy) Revoke() error {
 	if p == nil {
@@ -167,6 +235,7 @@ func (p *TLSMitmProxy) Revoke() error {
 	}
 	p.mu.Lock()
 	p.allowed = map[int]bool{}
+	p.allowedPorts = map[int]bool{}
 	p.mu.Unlock()
 	return p.Close()
 }
@@ -298,12 +367,26 @@ func (p *TLSMitmProxy) handle(c net.Conn) {
 		_, _ = io.WriteString(c, "HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n")
 		return
 	}
-	ip, err := resolveAndPinIP(nh)
-	if err != nil {
+	p.mu.Lock()
+	rhook := p.resolveHook
+	dhook := p.dialHook
+	p.mu.Unlock()
+	var ip net.IP
+	if rhook != nil {
+		ip, err = rhook(nh)
+	} else {
+		ip, err = resolveAndPinIP(nh)
+	}
+	if err != nil || ip == nil {
 		_, _ = io.WriteString(c, "HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n")
 		return
 	}
-	upRaw, err := net.DialTimeout("tcp", net.JoinHostPort(ip.String(), "443"), 8*time.Second)
+	var upRaw net.Conn
+	if dhook != nil {
+		upRaw, err = dhook(nh, ip)
+	} else {
+		upRaw, err = net.DialTimeout("tcp", net.JoinHostPort(ip.String(), "443"), 8*time.Second)
+	}
 	if err != nil {
 		_, _ = io.WriteString(c, "HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n")
 		return
@@ -314,12 +397,18 @@ func (p *TLSMitmProxy) handle(c net.Conn) {
 	}
 	_ = c.SetDeadline(time.Time{})
 
-	clientTLS := tls.Server(c, &tls.Config{Certificates: []tls.Certificate{*leaf}, MinVersion: tls.VersionTLS12})
+	// TLS must consume any leftover bytes in br (post-CONNECT request buffer).
+	clientTLS := tls.Server(&bufConn{Conn: c, r: br}, &tls.Config{Certificates: []tls.Certificate{*leaf}, MinVersion: tls.VersionTLS12})
 	if err := clientTLS.Handshake(); err != nil {
 		_ = upRaw.Close()
 		return
 	}
-	upTLS := tls.Client(upRaw, &tls.Config{ServerName: nh, MinVersion: tls.VersionTLS12})
+	// dialHook targets are typically local test TLS origins with non-matching SNI.
+	upTLSCfg := &tls.Config{ServerName: nh, MinVersion: tls.VersionTLS12}
+	if dhook != nil {
+		upTLSCfg.InsecureSkipVerify = true
+	}
+	upTLS := tls.Client(upRaw, upTLSCfg)
 	if err := upTLS.Handshake(); err != nil {
 		_ = clientTLS.Close()
 		_ = upRaw.Close()
@@ -387,8 +476,16 @@ func (p *TLSMitmProxy) authorizeAndForwardRequest(host string, creq *http.Reques
 	if IsDummyCredential(creq.Header.Get("Authorization")) || creq.Header.Get("Authorization") == "" {
 		return fmt.Errorf("inject failed")
 	}
+	// Redacted broker receipt only — never store Authorization value.
+	receipt := BrokerReceipt{
+		Host:     host,
+		Method:   creq.Method,
+		Path:     path,
+		InjectOK: true,
+	}
 	p.mu.Lock()
 	p.LastInjectHost = host
+	p.LastReceipt = receipt
 	p.mu.Unlock()
 
 	creq.RequestURI = ""
@@ -422,27 +519,35 @@ func (p *TLSMitmProxy) authorizeAndForwardRequest(host string, creq *http.Reques
 	return nil
 }
 
-// authorizePeer fails closed unless peer PID is known and allowlisted.
+// authorizePeer fails closed unless the client source port is allowlisted
+// (primary) or, on platforms with kernel peer-PID support, the peer PID is
+// allowlisted. Empty allowlists deny. Unknown attribution denies (no fail-open).
 func (p *TLSMitmProxy) authorizePeer(c net.Conn) error {
 	p.mu.Lock()
-	n := len(p.allowed)
+	nPID := len(p.allowed)
+	nPort := len(p.allowedPorts)
+	ports := p.allowedPorts
+	pids := p.allowed
 	p.mu.Unlock()
-	if n == 0 {
-		// No worker registered yet — deny all (fail closed).
-		return fmt.Errorf("no allowed pid")
+	if nPID == 0 && nPort == 0 {
+		return fmt.Errorf("no allowed peer")
 	}
-	pid := localPeerPID(c)
-	if pid <= 0 {
-		// Cannot attribute TCP peer — deny (no fail-open).
-		return fmt.Errorf("peer pid unknown")
+
+	// Primary: exact client source port (kernel RemoteAddr after Accept).
+	if ta, ok := c.RemoteAddr().(*net.TCPAddr); ok && ta != nil && ta.Port > 0 {
+		if nPort > 0 && ports[ta.Port] {
+			return nil
+		}
 	}
-	p.mu.Lock()
-	ok := p.allowed[pid]
-	p.mu.Unlock()
-	if !ok {
-		return fmt.Errorf("peer pid not allowed")
+
+	// Secondary: kernel peer PID (Linux /proc only; Darwin returns 0).
+	if nPID > 0 && peerPIDSupported() {
+		pid := localPeerPID(c)
+		if pid > 0 && pids[pid] {
+			return nil
+		}
 	}
-	return nil
+	return fmt.Errorf("peer not allowed")
 }
 
 // --- CA / helpers ---
@@ -614,43 +719,41 @@ func HarnessProxyEnv(mitm *TLSMitmProxy, sessionID string) []string {
 	}
 }
 
-// ProveMITMExactHost: CONNECT to denied host must 403 from a real child PID
-// (production peer binding — no test bypass).
+// ProveMITMExactHost: CONNECT to denied host must 403 from a real worker with
+// port-claim peer binding (no test bypass, no flaky lsof).
 func ProveMITMExactHost(mitm *TLSMitmProxy, deniedHost string) error {
 	if mitm == nil {
 		return fmt.Errorf("nil mitm")
 	}
-	// Child dials CONNECT; parent registers child PID.
 	return proveCONNECTFromChild(mitm, deniedHost, true)
 }
 
-// ProveMITMRequiresAllowPID: without AllowPID, CONNECT fail-closed (child dial).
+// ProveMITMRequiresAllowPID: without peer registration, CONNECT fail-closed.
+// Name retained for callers; peer auth is port-claim (and Linux PID secondary).
 func ProveMITMRequiresAllowPID(mitm *TLSMitmProxy, host string) error {
 	if mitm == nil {
 		return fmt.Errorf("nil")
 	}
-	mitm.mu.Lock()
-	mitm.allowed = map[int]bool{}
-	mitm.mu.Unlock()
-	// Child CONNECT without AllowPID — must 403.
+	mitm.ClearPeerAllowlists()
 	return proveCONNECTFromChild(mitm, host, false)
 }
 
-// proveCONNECTFromChild runs CONNECT in a subprocess so peer PID ≠ parent.
-// If registerChild, AllowPID is set after Start (race window minimized by small sleep).
+// proveCONNECTFromChild runs worker-probe CONNECT in a subprocess with claim
+// handshake. If registerChild, parent AllowClientPort after claim file appears.
 func proveCONNECTFromChild(mitm *TLSMitmProxy, host string, registerChild bool) error {
-	// Use shell one-liner via herd worker-probe deny-only path when available.
-	// Fallback: go helper process via /bin/sh + nc is flaky; use worker-probe binary.
 	dir, err := os.MkdirTemp("", "hc-conn-*")
 	if err != nil {
 		return err
 	}
 	defer os.RemoveAll(dir)
 	outPath := filepath.Join(dir, "out.json")
+	claimPath := filepath.Join(dir, "claim")
 	exe, err := findHerdOrBuild(dir)
 	if err != nil {
 		return err
 	}
+	// Exact scrubbed env — no os.Environ secret leftovers.
+	env := ExactWorkerChildEnv(HarnessProxyEnv(mitm, mitm.session))
 	cmd := exec.Command(exe, "hostcreds", "worker-probe",
 		"--proxy", mitm.ProxyURL(),
 		"--allow-host", "api.x.ai",
@@ -658,27 +761,37 @@ func proveCONNECTFromChild(mitm *TLSMitmProxy, host string, registerChild bool) 
 		"--session", mitm.session,
 		"--nonce", "00",
 		"--out", outPath,
+		"--claim", claimPath,
+		"--connect-only",
 	)
-	cmd.Env = append(os.Environ(), HarnessProxyEnv(mitm, mitm.session)...)
+	cmd.Env = env
 	if err := cmd.Start(); err != nil {
 		return err
 	}
-	if registerChild && cmd.Process != nil {
-		// Small delay so child exists; then allow. Child may retry? Probe is one-shot.
-		// Register immediately after Start.
-		mitm.AllowPID(cmd.Process.Pid)
+	if registerChild {
+		if _, err := ParentAllowClaimedPort(mitm, claimPath, 8*time.Second); err != nil {
+			_ = cmd.Process.Kill()
+			return err
+		}
+		// Linux secondary: also AllowPID when available.
+		if cmd.Process != nil {
+			mitm.AllowPID(cmd.Process.Pid)
+		}
 	}
 	_, err = WaitWorkerProbe(cmd, outPath, 12*time.Second)
+	raw, rerr := os.ReadFile(outPath)
+	if rerr != nil && !registerChild {
+		// Without allow, child may still write deny status.
+		if raw == nil {
+			return fmt.Errorf("want 403 without peer allow, err=%v", err)
+		}
+	}
 	if !registerChild {
-		// Expect deny CONNECT 403 for host (also used as deny-host).
-		raw, _ := os.ReadFile(outPath)
 		if !strings.Contains(string(raw), "403") {
 			return fmt.Errorf("want 403 without allow, got %s err=%v", raw, err)
 		}
 		return nil
 	}
-	// For denied host as deny-host, result.DenyCONNECT should be 403.
-	raw, rerr := os.ReadFile(outPath)
 	if rerr != nil {
 		return rerr
 	}
@@ -686,4 +799,51 @@ func proveCONNECTFromChild(mitm *TLSMitmProxy, host string, registerChild bool) 
 		return fmt.Errorf("want 403 for denied host, got %s", raw)
 	}
 	return nil
+}
+
+// ExactWorkerChildEnv builds a child environ with no duplicate keys and no
+// inherited secret entries. Only PATH/LANG/HOME from host (HOME forced empty
+// unless provided) plus the given overrides (last key wins).
+func ExactWorkerChildEnv(overrides ...[]string) []string {
+	base := []string{
+		"PATH=" + os.Getenv("PATH"),
+		"LANG=C",
+		"HOME=",
+		"ANTHROPIC_API_KEY=",
+		"OPENAI_API_KEY=",
+		"XAI_API_KEY=",
+		"HERD_HOST_CREDS=",
+		"HERD_HOSTCREDS_HANDLES=",
+	}
+	m := map[string]string{}
+	order := make([]string, 0, 32)
+	put := func(e string) {
+		i := strings.IndexByte(e, '=')
+		if i <= 0 {
+			return
+		}
+		k := e[:i]
+		v := e[i+1:]
+		if _, ok := m[k]; !ok {
+			order = append(order, k)
+		}
+		m[k] = v
+	}
+	for _, e := range base {
+		put(e)
+	}
+	for _, group := range overrides {
+		for _, e := range group {
+			put(e)
+		}
+	}
+	// Never allow non-empty API key / handle env.
+	for _, k := range []string{"ANTHROPIC_API_KEY", "OPENAI_API_KEY", "XAI_API_KEY", "HERD_HOST_CREDS", "HERD_HOSTCREDS_HANDLES"} {
+		m[k] = ""
+	}
+	out := make([]string, 0, len(order))
+	for _, k := range order {
+		out = append(out, k+"="+m[k])
+	}
+	return out
 }

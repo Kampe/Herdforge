@@ -3,8 +3,6 @@ package security
 import (
 	"bytes"
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -31,16 +29,20 @@ type LiveProof struct {
 	MitmTransport      bool
 	NoAPIKeysInEnv     bool
 	IsolatedHOME       string
-	BrokerReached      bool // MITM observed inject for kind host
+	BrokerReached      bool // MITM broker receipt inject for kind host
+	WorkerProbeOK      bool // real worker full-TLS + redacted receipt
 	ChildEnvProof      []string
+	CapabilityNonce    string // non-secret nonce only
 }
 
 // LiveConfig configures production live author launch.
 type LiveConfig struct {
-	Kind          string
-	SessionID     string
-	Prompt        string
-	AllowedMarker string // must NOT be embedded in prompt for echo bypass
+	Kind      string
+	SessionID string
+	Prompt    string // optional; default CapabilityPrompt (never embeds Expected)
+	// AllowedMarker is ignored for protocol — capability Expected is derived.
+	// Kept for CLI compat; if set and non-empty must equal derived Expected or BLOCKED.
+	AllowedMarker string
 	Authority     CredentialAuthority
 	WorkDir       string
 	Timeout       time.Duration
@@ -48,11 +50,11 @@ type LiveConfig struct {
 
 // StartAuthorLive launches a real hosted author non-interactively through MITM.
 //
-// Independent FAC-170: harness argv, isolated HOME, WorkerEnv without API keys,
-// MITM transport, kind allowlist. OS secret/UID boundary: FAC-169 only.
+// Wires FAC-170 Capability (non-echo marker) + worker-probe (forbidden deny +
+// allow full TLS + broker redacted receipt). OS secret/UID boundary: FAC-169 only.
 //
-// Fail-closed: missing FAC-169, missing marker in response (prompt does not
-// contain marker), missing harness binary, empty API-key plant, etc.
+// Fail-closed: missing FAC-169, missing capability in response, missing harness
+// binary, incomplete worker proof, empty API-key plant, etc.
 func StartAuthorLive(cfg LiveConfig) (*HostCredsSession, *exec.Cmd, *LiveProof, error) {
 	kind := strings.ToLower(strings.TrimSpace(cfg.Kind))
 	if kind == "opencode" || kind == "fake" || kind == "test" {
@@ -86,9 +88,7 @@ func StartAuthorLive(cfg LiveConfig) (*HostCredsSession, *exec.Cmd, *LiveProof, 
 	if auth.Class() == "test" {
 		return nil, nil, nil, &BlockedError{Reason: BlockEnvNotAuthority, Code: "test_vault_not_live", Kind: kind}
 	}
-	// HandleAuthority that already hydrated secrets same-UID is rejected for live.
 	if auth.Class() == "keychain" || auth.Class() == "op" || auth.Class() == "handle" {
-		// Still same process if created via NewHandleAuthorityFromEnv — require FAC-169 IPC adapter class.
 		if _, ok := auth.(*HandleAuthority); ok {
 			return nil, nil, nil, &BlockedError{
 				Reason: BlockEnvNotAuthority,
@@ -102,17 +102,19 @@ func StartAuthorLive(cfg LiveConfig) (*HostCredsSession, *exec.Cmd, *LiveProof, 
 	if sid == "" {
 		sid = newSessionID()
 	}
-	// Marker must not appear in the prompt (blocks echo-as-success).
-	marker := cfg.AllowedMarker
-	if marker == "" {
-		var b [8]byte
-		_, _ = rand.Read(b[:])
-		marker = "HC" + hex.EncodeToString(b[:])
+
+	// Capability: Expected never appears in prompt (blocks echo-as-success).
+	cap, err := NewCapability(sid)
+	if err != nil {
+		return nil, nil, nil, err
 	}
+	if m := strings.TrimSpace(cfg.AllowedMarker); m != "" && m != cap.Expected {
+		return nil, nil, nil, &BlockedError{Reason: BlockAbuse, Code: "marker_not_capability", Kind: kind}
+	}
+	marker := cap.Expected
 	prompt := strings.TrimSpace(cfg.Prompt)
 	if prompt == "" {
-		// Do not include marker text in the prompt.
-		prompt = "FAC-170 live non-interactive: output a single line containing only the session capability token you were configured to emit"
+		prompt = CapabilityPrompt(cap)
 	}
 	if strings.Contains(prompt, marker) {
 		return nil, nil, nil, &BlockedError{Reason: BlockAbuse, Code: "marker_in_prompt", Kind: kind}
@@ -143,13 +145,14 @@ func StartAuthorLive(cfg LiveConfig) (*HostCredsSession, *exec.Cmd, *LiveProof, 
 	inv[0] = bin
 
 	proof := &LiveProof{
-		SessionID:      sess.ID,
-		Kind:           kind,
-		Prompt:         prompt,
-		BoundaryDigest: bound.ProbeDigest(),
-		AllowedMarker:  marker,
-		MitmTransport:  sess.Mitm != nil,
-		IsolatedHOME:   homeDir,
+		SessionID:       sess.ID,
+		Kind:            kind,
+		Prompt:          prompt,
+		BoundaryDigest:  bound.ProbeDigest(),
+		AllowedMarker:   marker,
+		CapabilityNonce: cap.Nonce,
+		MitmTransport:   sess.Mitm != nil,
+		IsolatedHOME:    homeDir,
 	}
 
 	timeout := cfg.Timeout
@@ -162,14 +165,22 @@ func StartAuthorLive(cfg LiveConfig) (*HostCredsSession, *exec.Cmd, *LiveProof, 
 	if cfg.WorkDir != "" {
 		cmd.Dir = cfg.WorkDir
 	}
-	// Exact child env: only scrubbed base + WorkerEnv + isolated HOME.
-	childEnv := scrubAndMergeEnv([]string{"PATH=" + os.Getenv("PATH"), "LANG=C"}, sess.WorkerEnv())
-	childEnv = append(childEnv, "HOME="+homeDir)
-	// Force no user auth files.
-	childEnv = append(childEnv,
-		"ANTHROPIC_API_KEY=", "OPENAI_API_KEY=", "XAI_API_KEY=",
-		"CODEX_HOME="+filepath.Join(homeDir, "codex-empty"),
+	// Exact child env: scrubbed base + WorkerEnv + capability nonce + isolated HOME.
+	// No append(os.Environ()) — no secret leftovers / duplicate keys.
+	childEnv := ExactWorkerChildEnv(
+		[]string{"PATH=" + os.Getenv("PATH"), "LANG=C", "HOME=" + homeDir},
+		sess.WorkerEnv(),
+		CapabilityEnv(cap),
+		[]string{
+			"CODEX_HOME=" + filepath.Join(homeDir, "codex-empty"),
+		},
 	)
+	if err := assertExactEnvNoSecrets(childEnv); err != nil {
+		cancel()
+		_ = os.RemoveAll(homeDir)
+		_ = sess.Close()
+		return nil, nil, proof, &BlockedError{Reason: BlockSecretExposure, Code: "child_env:" + err.Error()}
+	}
 	cmd.Env = childEnv
 	proof.ChildEnvProof = append([]string(nil), childEnv...)
 
@@ -201,7 +212,6 @@ func StartAuthorLive(cfg LiveConfig) (*HostCredsSession, *exec.Cmd, *LiveProof, 
 		_ = sess.Close()
 		return nil, cmd, proof, err
 	}
-	// Prove child env list has empty keys and HOME isolated.
 	for _, e := range childEnv {
 		if strings.HasPrefix(e, "XAI_API_KEY=") && e != "XAI_API_KEY=" {
 			_ = cmd.Process.Kill()
@@ -222,22 +232,39 @@ func StartAuthorLive(cfg LiveConfig) (*HostCredsSession, *exec.Cmd, *LiveProof, 
 	cancel()
 	combined := stdout.String() + stderr.String()
 	proof.OutputSnippet = RedactSecrets(truncateLive(combined, 500))
-	// Marker must appear in output and must not be a mere prompt echo alone:
-	// require marker not substring of prompt (already) and present in output.
-	proof.ModelMarkerReached = strings.Contains(combined, marker) && !strings.Contains(prompt, marker)
+	// Non-echo: Expected not in prompt; must appear in model output.
+	proof.ModelMarkerReached = VerifyCapabilityOutput(cap, prompt, combined)
 
-	// Broker reached: MITM recorded inject for required host (if any traffic).
-	if sess.Mitm != nil {
-		required := RequiredBrokerHostsForKind(kind)
-		if len(required) > 0 && sess.Mitm.LastInjectHost == required[0] {
-			proof.BrokerReached = true
-		}
+	// Worker-executed forbidden + allow full TLS + broker redacted receipt.
+	// Not coordinator-side AttemptForbiddenCredentialAccess alone.
+	wres, werr := sess.RunWorkerForbiddenAndAllowProbe(cap.Nonce)
+	if werr == nil && wres != nil {
+		proof.ForbiddenDenied = strings.Contains(wres.DenyCONNECT, "403")
+		proof.WorkerProbeOK = wres.TLSRequestOK && proof.ForbiddenDenied
+	}
+	if !proof.ForbiddenDenied {
+		// Still record fail; do not fall back to coordinator-only deny as success.
+		proof.ForbiddenDenied = false
+		proof.WorkerProbeOK = false
 	}
 
-	// Forbidden probes on coordinator view of session policy (MITM deny).
-	// Worker-executed probe requires FAC-169 + worker tooling; until then record coordinator deny.
-	if ferr := sess.AttemptForbiddenCredentialAccess(); ferr == nil {
-		proof.ForbiddenDenied = true
+	// Broker reached: MITM redacted receipt for required host.
+	if sess.Mitm != nil {
+		required := RequiredBrokerHostsForKind(kind)
+		sess.Mitm.mu.Lock()
+		rcpt := sess.Mitm.LastReceipt
+		sess.Mitm.mu.Unlock()
+		if rcpt.InjectOK && len(required) > 0 && rcpt.Host == required[0] {
+			proof.BrokerReached = true
+		} else if rcpt.InjectOK && sess.Mitm.LastInjectHost != "" {
+			// accept inject host match
+			for _, h := range required {
+				if sess.Mitm.LastInjectHost == h {
+					proof.BrokerReached = true
+					break
+				}
+			}
+		}
 	}
 
 	if err := bound.AdversarialProbe(); err != nil {
@@ -246,15 +273,14 @@ func StartAuthorLive(cfg LiveConfig) (*HostCredsSession, *exec.Cmd, *LiveProof, 
 		return sess, cmd, proof, err
 	}
 
-	// Never succeed on bare exit 0 without marker + broker reach + argv binding.
-	if !proof.PromptInArgv || !proof.NoAPIKeysInEnv || !proof.ForbiddenDenied {
+	// Never succeed on bare exit 0 without full proof chain.
+	if !proof.PromptInArgv || !proof.NoAPIKeysInEnv || !proof.ForbiddenDenied || !proof.WorkerProbeOK {
 		_ = os.RemoveAll(homeDir)
 		_ = sess.Close()
 		return sess, cmd, proof, &BlockedError{Reason: BlockAbuse, Code: "incomplete_live_proof", Kind: kind}
 	}
 	if !proof.ModelMarkerReached {
 		_ = os.RemoveAll(homeDir)
-		// Keep session briefly? Close for safety.
 		_ = sess.Close()
 		return nil, cmd, proof, &BlockedError{Reason: BlockAbuse, Code: "marker_not_reached", Kind: kind}
 	}
@@ -267,30 +293,10 @@ func StartAuthorLive(cfg LiveConfig) (*HostCredsSession, *exec.Cmd, *LiveProof, 
 	return sess, cmd, proof, nil
 }
 
+// scrubAndMergeEnv is retained for tests that merge parent+worker; production
+// live/worker paths use ExactWorkerChildEnv (no duplicate keys, no secret append).
 func scrubAndMergeEnv(parent, worker []string) []string {
-	deny := map[string]bool{
-		"ANTHROPIC_API_KEY": true, "OPENAI_API_KEY": true, "XAI_API_KEY": true,
-		"HERD_HOST_CREDS": true, "HERD_HOSTCREDS_HANDLES": true,
-		"HOME": true, "USERPROFILE": true,
-	}
-	out := make([]string, 0, len(parent)+len(worker))
-	for _, e := range parent {
-		i := strings.IndexByte(e, '=')
-		if i <= 0 {
-			continue
-		}
-		k := e[:i]
-		if deny[k] {
-			continue
-		}
-		lk := strings.ToLower(k)
-		if lk == "http_proxy" || lk == "https_proxy" || lk == "all_proxy" {
-			continue
-		}
-		out = append(out, e)
-	}
-	out = append(out, worker...)
-	return out
+	return ExactWorkerChildEnv(parent, worker)
 }
 
 func truncateLive(s string, n int) string {

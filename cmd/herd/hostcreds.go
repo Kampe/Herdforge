@@ -67,6 +67,10 @@ func runHostCredsWorkerProbe(args []string) int {
 	session := fs.String("session", "", "session id")
 	nonce := fs.String("nonce", "", "capability nonce")
 	out := fs.String("out", "", "result JSON path")
+	claim := fs.String("claim", "", "exclusive client-port claim file path")
+	connectOnly := fs.Bool("connect-only", false, "CONNECT status only (no full TLS request)")
+	method := fs.String("method", "POST", "TLS HTTP method after CONNECT")
+	path := fs.String("path", "/v1/chat/completions", "TLS HTTP path after CONNECT")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -74,7 +78,18 @@ func runHostCredsWorkerProbe(args []string) int {
 		fmt.Fprintln(os.Stderr, "worker-probe: --proxy --allow-host --out required")
 		return 2
 	}
-	if err := security.RunWorkerProbeInProcess(*proxy, *allow, *deny, *session, *nonce, *out); err != nil {
+	if err := security.RunWorkerProbeConfig(security.WorkerProbeConfig{
+		ProxyURL:    *proxy,
+		AllowHost:   *allow,
+		DenyHost:    *deny,
+		SessionID:   *session,
+		Nonce:       *nonce,
+		OutPath:     *out,
+		ClaimPath:   *claim,
+		ConnectOnly: *connectOnly,
+		Method:      *method,
+		Path:        *path,
+	}); err != nil {
 		fmt.Fprintln(os.Stderr, err.Error())
 		return 1
 	}

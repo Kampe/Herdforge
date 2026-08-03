@@ -13,7 +13,8 @@ import (
 )
 
 // localPeerPID resolves the client PID for an accepted localhost TCP conn
-// by matching the peer's source port in /proc/net/tcp{,6}.
+// by matching the peer's source port inode in /proc/net/tcp{,6} (kernel tables).
+// Used only as a secondary peer path; primary production auth is client-port claim.
 func localPeerPID(c net.Conn) int {
 	ta, ok := c.RemoteAddr().(*net.TCPAddr)
 	if !ok || ta == nil {
@@ -29,6 +30,8 @@ func localPeerPID(c net.Conn) int {
 	return pidForTCPPortLinux(port, true)
 }
 
+func peerPIDSupported() bool { return true }
+
 func pidForTCPPortLinux(port int, v6 bool) int {
 	path := "/proc/net/tcp"
 	if v6 {
@@ -41,7 +44,6 @@ func pidForTCPPortLinux(port int, v6 bool) int {
 	defer f.Close()
 	want := fmt.Sprintf("%04X", port)
 	sc := bufio.NewScanner(f)
-	// skip header
 	if !sc.Scan() {
 		return 0
 	}
@@ -51,7 +53,6 @@ func pidForTCPPortLinux(port int, v6 bool) int {
 		if len(fields) < 10 {
 			continue
 		}
-		// local_address is fields[1] as IP:PORT hex
 		la := fields[1]
 		i := strings.IndexByte(la, ':')
 		if i < 0 {
@@ -69,7 +70,6 @@ func pidForTCPPortLinux(port int, v6 bool) int {
 	if len(inodes) == 0 {
 		return 0
 	}
-	// Map inode -> pid via /proc/*/fd
 	ents, err := os.ReadDir("/proc")
 	if err != nil {
 		return 0
@@ -96,7 +96,6 @@ func pidForTCPPortLinux(port int, v6 bool) int {
 			if err != nil {
 				continue
 			}
-			// socket:[inode]
 			if strings.HasPrefix(link, "socket:[") && strings.HasSuffix(link, "]") {
 				ino := link[len("socket:[") : len(link)-1]
 				if wantSet[ino] {
