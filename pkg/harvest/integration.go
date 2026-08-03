@@ -205,22 +205,9 @@ func NewIntegration(h *Harvester, v Verifier, d Dispatcher, l *reviewledger.Ledg
 
 // Run executes the full harvest → review-gate → merge-gate → post-merge → cleanup flow.
 func (in *Integration) Run(ctx context.Context) (*IntegrationResult, error) {
-	// Graduated disk gate before the integration pipeline touches anything —
-	// review-gate worktree ops, cherry-picks onto the shared checkout,
-	// cleanup (FAC-153). Hard pressure fails closed (never reclaiming
-	// space); the soft band sheds the candidate batch to one worktree per
-	// run so mutation volume degrades before work stops.
-	adv := preflight.AdviseDiskPressure("integration", in.RepoRoot, os.TempDir())
-	if adv.Verdict == preflight.AdviceRefuse {
-		if adv.Evidence != nil {
-			return nil, adv.Evidence
-		}
-		return nil, fmt.Errorf("integration refused: %s", adv.Detail)
-	}
+	res := &IntegrationResult{}
 
-	res := &IntegrationResult{DiskAdvice: adv.Verdict}
-
-	// Phase 1: Harvest
+	// Phase 1: Harvest (read-only: worktree list + unmerged log inspection).
 	hr, err := in.Harvester.Harvest(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("harvest: %w", err)
@@ -229,6 +216,26 @@ func (in *Integration) Run(ctx context.Context) (*IntegrationResult, error) {
 	if len(hr.UnmergedWorktrees) == 0 {
 		return res, nil
 	}
+
+	// Graduated disk gate before ANY mutation — review-gate worktree ops,
+	// cherry-picks onto the shared checkout, cleanup (FAC-153). Probes the
+	// repo, temp, and EVERY candidate worktree volume: a pool mounted on a
+	// different filesystem must not exhaust behind a healthy-looking repo
+	// volume. Hard pressure fails closed (never reclaiming space); the soft
+	// band sheds the batch to one worktree per run so mutation volume
+	// degrades before work stops.
+	diskPaths := []string{in.RepoRoot, os.TempDir()}
+	for _, uw := range hr.UnmergedWorktrees {
+		diskPaths = append(diskPaths, uw.WorktreePath)
+	}
+	adv := preflight.AdviseDiskPressure("integration", diskPaths...)
+	if adv.Verdict == preflight.AdviceRefuse {
+		if adv.Evidence != nil {
+			return nil, adv.Evidence
+		}
+		return nil, fmt.Errorf("integration refused: %s", adv.Detail)
+	}
+	res.DiskAdvice = adv.Verdict
 	if adv.Verdict == preflight.AdviceSerialize && len(hr.UnmergedWorktrees) > 1 {
 		res.ShedWorktrees = len(hr.UnmergedWorktrees) - 1
 		hr.UnmergedWorktrees = hr.UnmergedWorktrees[:1]

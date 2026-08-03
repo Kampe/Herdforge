@@ -23,9 +23,13 @@ func TestIntegrationRunRefusesUnderDiskPressure(t *testing.T) {
 	// 1 ZiB floor: any real volume reads as critically low.
 	t.Setenv(preflight.EnvDiskMinFreeGB, "1099511627776")
 
-	// nil Harvester proves ordering: the guard must refuse before phase 1
-	// ever runs, otherwise this test would panic on a nil dereference.
-	in := &Integration{RepoRoot: t.TempDir()}
+	root, _ := setupRepoWithRemote(t)
+	wt := createWorktree(t, root, "task/FAC-300-p")
+	writeFileHarvest(t, wt, "p.go", "package p")
+	addAndCommitHarvest(t, wt, "feat: FAC-300 p", "p.go")
+
+	l := setupLedger(t, root)
+	in := NewIntegration(NewHarvester(root), nil, &recordingDispatcher{}, l, root)
 	res, err := in.Run(context.Background())
 	if err == nil {
 		t.Fatal("expected fail-closed refusal under disk pressure")
@@ -35,6 +39,45 @@ func TestIntegrationRunRefusesUnderDiskPressure(t *testing.T) {
 	}
 	if res != nil {
 		t.Fatalf("expected nil result on refusal, got %+v", res)
+	}
+	// Refused before any mutation: the candidate worktree is untouched.
+	if _, statErr := os.Stat(wt); statErr != nil {
+		t.Fatalf("candidate worktree disturbed: %v", statErr)
+	}
+}
+
+func TestIntegrationRunProbesCandidateWorktreeVolumes(t *testing.T) {
+	// A pool on a different filesystem must be probed, not assumed healthy
+	// because the repo volume is. Swap the default guard for one whose
+	// prober records every probed path and assert each candidate worktree
+	// path is included in the capacity decision.
+	root, _ := setupRepoWithRemote(t)
+	wt := createWorktree(t, root, "task/FAC-301-q")
+	writeFileHarvest(t, wt, "q.go", "package q")
+	addAndCommitHarvest(t, wt, "feat: FAC-301 q", "q.go")
+
+	var probed []string
+	orig := preflight.DefaultDiskGuard
+	preflight.DefaultDiskGuard = preflight.NewDiskGuard(func(path string) (preflight.DiskStat, error) {
+		probed = append(probed, path)
+		return preflight.DiskStat{Path: path, FSID: path, TotalBytes: 1 << 40, FreeBytes: 1 << 39,
+			FreePct: 50, TotalInodes: 1 << 20, FreeInodes: 1 << 19, InodeFreePct: 50}, nil
+	})
+	defer func() { preflight.DefaultDiskGuard = orig }()
+
+	l := setupLedger(t, root)
+	in := NewIntegration(NewHarvester(root), nil, &recordingDispatcher{}, l, root, WithDryRun(true))
+	if _, err := in.Run(context.Background()); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	found := false
+	for _, p := range probed {
+		if strings.Contains(p, "FAC-301") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("candidate worktree volume never probed; probed=%v", probed)
 	}
 }
 
