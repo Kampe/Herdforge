@@ -1,9 +1,7 @@
 package security
 
 import (
-	"errors"
 	"net"
-	"os"
 	"strings"
 	"testing"
 )
