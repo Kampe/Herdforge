@@ -61,22 +61,43 @@ func NewKaneoProvider(apiURL string, projectID string, useCLI bool) *KaneoProvid
 	if projectID == "" {
 		projectID = ResolveKaneoProjectID(".")
 	}
-	// Do NOT auto-inject profile api_key into APIKey: profile credentials are
-	// origin-bound to the profile's api_url only (FAC-159 credential exfil).
-	// Explicit APIKey (factory/env) is bound to this provider's APIURL origin.
-	key := ""
-	if v := strings.TrimSpace(os.Getenv("KANEO_API_KEY")); v != "" {
-		key = v
-	}
+	// Env key is origin-bound via KANEO_API_URL or profile origin — never via
+	// repository-controlled apiURL argument (credential exfil defense).
+	key, keyOrigin := resolveOperatorKeyAndOrigin()
 	return &KaneoProvider{
-		APIURL:    apiURL,
-		ProjectID: projectID,
-		UseCLI:    useCLI,
-		APIKey:    key,
-		Client:    kaneoHTTPClient(),
-		Deadlines: DefaultDeadlines(),
-		Retry:     DefaultReadRetry(),
+		APIURL:           apiURL,
+		ProjectID:        projectID,
+		UseCLI:           useCLI,
+		APIKey:           key,
+		KeyTrustedOrigin: keyOrigin,
+		Client:           kaneoHTTPClient(),
+		Deadlines:        DefaultDeadlines(),
+		Retry:            DefaultReadRetry(),
 	}
+}
+
+// resolveOperatorKeyAndOrigin loads KANEO_API_KEY with an independent trusted
+// origin: KANEO_API_URL if set, else the selected profile's api_url origin.
+// Never uses repository task_provider.api_url as the trust anchor.
+func resolveOperatorKeyAndOrigin() (key, trustedOrigin string) {
+	key = strings.TrimSpace(os.Getenv("KANEO_API_KEY"))
+	if key == "" {
+		return "", ""
+	}
+	if u := strings.TrimSpace(os.Getenv("KANEO_API_URL")); u != "" {
+		if origin, err := canonicalizeHTTPOrigin(u); err == nil {
+			return key, origin
+		}
+		// Malformed KANEO_API_URL: key unusable for HTTP auth.
+		return "", ""
+	}
+	// Fall back to profile origin as independent operator trust anchor.
+	cred := ResolveKaneoProfileCred()
+	if cred.TrustedOrigin != "" {
+		return key, cred.TrustedOrigin
+	}
+	// Key without independent origin cannot authorize HTTP.
+	return "", ""
 }
 
 // kaneoCLIAuthConfig matches the installed kaneo CLI config schema:
@@ -234,9 +255,9 @@ func ResolveKaneoAPIKey(override string) string {
 
 // authorizeKaneo attaches Bearer auth only when the request origin exactly
 // matches a trusted origin for that credential:
-//   - explicit k.APIKey is bound to canonicalize(k.APIURL) (operator-paired)
+//   - APIKey is bound to KeyTrustedOrigin (KANEO_API_URL or profile origin)
 //   - profile key is bound only to canonicalize(profile.api_url)
-// Repo-controlled APIURL cannot pull the global profile token to a foreign host.
+// Repository-controlled APIURL is never the trust anchor for credentials.
 func (k *KaneoProvider) authorizeKaneo(req *http.Request) {
 	if k == nil || req == nil || req.URL == nil {
 		return
@@ -253,15 +274,42 @@ func (k *KaneoProvider) authorizeKaneo(req *http.Request) {
 }
 
 // credentialForRequestOrigin returns a key only if reqOrigin is trusted for it.
-// Never logs keys.
+// Never logs keys. Never infers trust from repository-controlled APIURL.
 func (k *KaneoProvider) credentialForRequestOrigin(reqOrigin string) string {
 	if reqOrigin == "" {
 		return ""
 	}
-	// 1) Explicit APIKey (env/factory): bound to provider APIURL origin only.
+	// 1) Operator APIKey: bound only to KeyTrustedOrigin (independent of APIURL).
 	if key := strings.TrimSpace(k.APIKey); key != "" {
-		apiOrigin, err := canonicalizeHTTPOrigin(k.APIURL)
-		if err != nil || apiOrigin == "" || apiOrigin != reqOrigin {
+		trusted := strings.TrimSpace(k.KeyTrustedOrigin)
+		if trusted == "" {
+			return ""
+		}
+		// KeyTrustedOrigin may already be canonical (scheme://host:port) or a URL.
+		to := trusted
+		if !strings.Contains(trusted, "://") {
+			// raw host not allowed — must be full origin/URL
+			return ""
+		}
+		if o, err := canonicalizeHTTPOrigin(trusted); err == nil {
+			to = o
+		} else if o, err := canonicalizeHTTPOrigin("https://" + trusted); err == nil {
+			// already failed; try as-is only if it looks like origin
+			_ = o
+			return ""
+		} else {
+			// If trusted is already canonical form scheme://host:port
+			to = trusted
+		}
+		// Prefer re-canonicalize when it looks like a URL with path-less origin.
+		if strings.HasPrefix(trusted, "http://") || strings.HasPrefix(trusted, "https://") {
+			if o, err := canonicalizeHTTPOrigin(trusted); err == nil {
+				to = o
+			} else {
+				return ""
+			}
+		}
+		if to != reqOrigin {
 			return ""
 		}
 		return key
@@ -275,7 +323,7 @@ func (k *KaneoProvider) credentialForRequestOrigin(reqOrigin string) string {
 }
 
 // credentialForAPIURL is used by graph preflight: can we authorize requests
-// to this provider's configured APIURL?
+// to this provider's configured APIURL (request origin must match trusted)?
 func (k *KaneoProvider) credentialForAPIURL() string {
 	if k == nil {
 		return ""
