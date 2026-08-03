@@ -47,6 +47,38 @@ const (
 	NetworkLimited NetworkCapability = "limited"
 )
 
+// Authority is a lane's repository write authority. Roles that commit,
+// merge, or otherwise mutate tracked files declare "write"; every other
+// role (routing, review, verification, observation) declares "read".
+type Authority string
+
+const (
+	AuthorityRead  Authority = "read"
+	AuthorityWrite Authority = "write"
+)
+
+// Capability names a tool/network requirement a lane needs to launch.
+// This is the vocabulary "herd status" and capability probing check a
+// lane's launch surface against before granting a spawn.
+type Capability string
+
+const (
+	CapabilityNetwork    Capability = "network"
+	CapabilityGitWrite   Capability = "git-write"
+	CapabilityFSWrite    Capability = "fs-write"
+	CapabilityBoardWrite Capability = "board-write"
+	CapabilityShellExec  Capability = "shell-exec"
+)
+
+func validCapability(c Capability) bool {
+	switch c {
+	case CapabilityNetwork, CapabilityGitWrite, CapabilityFSWrite, CapabilityBoardWrite, CapabilityShellExec:
+		return true
+	default:
+		return false
+	}
+}
+
 type Config struct {
 	Version      string        `yaml:"version"`
 	Project      ProjectConfig `yaml:"project"`
@@ -94,6 +126,22 @@ type LaneDef struct {
 	MaxInput       *int               `yaml:"max_input_tokens,omitempty"`
 	MaxOutput      *int               `yaml:"max_output_tokens,omitempty"`
 	Network        *NetworkCapability `yaml:"network,omitempty"`
+	// Standing marks this lane as a control-plane role that `herd standing`
+	// raises and keeps alive. Task roles (worker/reviewer/verification-gate,
+	// …) leave this false/omitted and are launched ephemerally per dispatch.
+	Standing bool `yaml:"standing,omitempty"`
+	// Authority is this lane's repository write authority (read|write).
+	// Optional for backward compatibility; validated when present.
+	Authority Authority `yaml:"authority,omitempty"`
+	// Capabilities are the tool/network requirements this lane's launch
+	// surface must satisfy (probe-gated); values must come from the known
+	// Capability vocabulary.
+	Capabilities []Capability `yaml:"capabilities,omitempty"`
+	// IncompatibleWith lists role labels this lane's role must never be
+	// launched as/alongside for the same task (e.g. an author role listing
+	// the reviewer role). Each value must match a role declared by some
+	// lane in this same roster.
+	IncompatibleWith []string `yaml:"incompatible_with,omitempty"`
 }
 
 type Verification struct {
@@ -130,6 +178,14 @@ func (c *Config) Validate() error {
 	if c.TaskProvider.Type == "" {
 		return fmt.Errorf("missing required field: task_provider.type")
 	}
+	roles := make(map[string]bool, len(c.Lanes))
+	for _, lane := range c.Lanes {
+		if lane.Role != "" {
+			roles[lane.Role] = true
+		}
+	}
+	standingOwners := make(map[string]string, len(c.Lanes))
+
 	for i, lane := range c.Lanes {
 		if lane.Name == "" {
 			return fmt.Errorf("lanes[%d]: missing required field: name", i)
@@ -139,6 +195,9 @@ func (c *Config) Validate() error {
 		}
 		if lane.Model == "" {
 			return fmt.Errorf("lanes[%d]: missing required field: model", i)
+		}
+		if lane.Prompt == "" {
+			return fmt.Errorf("lanes[%d]: missing required field: prompt", i)
 		}
 		if lane.Route != nil {
 			switch *lane.Route {
@@ -160,6 +219,29 @@ func (c *Config) Validate() error {
 			default:
 				return fmt.Errorf("lanes[%d]: invalid network capability %q", i, *lane.Network)
 			}
+		}
+		if lane.Authority != "" {
+			switch lane.Authority {
+			case AuthorityRead, AuthorityWrite:
+			default:
+				return fmt.Errorf("lanes[%d]: invalid authority %q", i, lane.Authority)
+			}
+		}
+		for _, capability := range lane.Capabilities {
+			if !validCapability(capability) {
+				return fmt.Errorf("lanes[%d]: unknown capability %q", i, capability)
+			}
+		}
+		for _, incompatible := range lane.IncompatibleWith {
+			if !roles[incompatible] {
+				return fmt.Errorf("lanes[%d]: incompatible_with references unknown role %q", i, incompatible)
+			}
+		}
+		if lane.Standing && lane.Role != "" {
+			if owner, ok := standingOwners[lane.Role]; ok {
+				return fmt.Errorf("lanes[%d]: duplicate standing owner for role %q (already owned by lane %q)", i, lane.Role, owner)
+			}
+			standingOwners[lane.Role] = lane.Name
 		}
 	}
 	return nil

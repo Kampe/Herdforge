@@ -56,20 +56,36 @@ func LaneIDs() []string {
 }
 
 // StandingIDs returns the canonical standing fleet roster for this repo:
-// every lane id prefixed with ForgePrefix (e.g. lane "worker" ->
-// "forge-worker"), sorted and de-duplicated. This is the roster kick,
+// the ForgePrefix-prefixed id (e.g. lane "worker" -> "forge-worker") of
+// every lane declared standing:true, sorted and de-duplicated. Ephemeral
+// task roles (standing:false/omitted — worker, reviewer, verification-gate,
+// …) are launched per dispatch, not raised here. This is the roster kick,
 // attention, and cleanup use to match live herdr agents. A test override
 // set via SetStandingOverride returns those names verbatim.
 func StandingIDs() []string {
 	if standingOverride != nil {
 		return sortedUnique(append([]string(nil), standingOverride...))
 	}
-	lanes := LaneIDs()
-	ids := make([]string, 0, len(lanes))
-	for _, id := range lanes {
-		ids = append(ids, ForgePrefix+id)
+	ids := make([]string, 0)
+	if data := readRegistry(); data != nil {
+		if reg, err := resolve.ParseRegistry(data); err == nil && len(reg.Lanes) > 0 {
+			for _, l := range reg.Lanes {
+				if l.Standing {
+					ids = append(ids, ForgePrefix+l.ID)
+				}
+			}
+			return sortedUnique(ids)
+		}
 	}
-	return sortedUnique(ids)
+	if cfg, err := config.LoadConfig(config.DefaultConfigPath); err == nil {
+		for _, l := range cfg.Lanes {
+			if l.Standing {
+				ids = append(ids, ForgePrefix+l.Name)
+			}
+		}
+		return sortedUnique(ids)
+	}
+	return nil
 }
 
 func readRegistry() []byte {

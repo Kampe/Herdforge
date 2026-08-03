@@ -41,12 +41,16 @@ func newRepoFixture(t *testing.T, registryJSON, herdYAML string) string {
 	return dir
 }
 
+// testRegistry declares a mix of standing (control-plane) and ephemeral
+// (task) lanes so StandingIDs() tests exercise real filtering: only
+// "forge-smith" and "worker" are standing here; "reviewer" is an ephemeral
+// task role and must NOT be raised by herd standing.
 const testRegistry = `{
   "version": 1,
   "lanes": [
-    {"id": "reviewer", "route_shape": "review"},
-    {"id": "worker", "route_shape": "code"},
-    {"id": "forge-smith", "route_shape": "planning"}
+    {"id": "reviewer", "route_shape": "review", "standing": false},
+    {"id": "worker", "route_shape": "code", "standing": true},
+    {"id": "forge-smith", "route_shape": "planning", "standing": true}
   ]
 }`
 
@@ -60,15 +64,19 @@ lanes:
   - name: alpha
     agent_kind: deepseek
     model: opencode/deepseek-v4
+    prompt: ".herd/prompts/worker.md"
+    standing: true
   - name: forge-smith
     agent_kind: deepseek
     model: opencode/deepseek-v4
+    prompt: ".herd/prompts/smith.md"
+    standing: false
 `
 
 func TestStandingIDs_FromRegistry(t *testing.T) {
 	newRepoFixture(t, testRegistry, "")
 	got := StandingIDs()
-	want := []string{"forge-forge-smith", "forge-reviewer", "forge-worker"}
+	want := []string{"forge-forge-smith", "forge-worker"}
 	if !equalStrings(got, want) {
 		t.Fatalf("StandingIDs() = %v, want %v", got, want)
 	}
@@ -77,7 +85,7 @@ func TestStandingIDs_FromRegistry(t *testing.T) {
 func TestStandingIDs_HerdYAMLFallback(t *testing.T) {
 	newRepoFixture(t, "", testHerdYAML)
 	got := StandingIDs()
-	want := []string{"forge-alpha", "forge-forge-smith"}
+	want := []string{"forge-alpha"}
 	if !equalStrings(got, want) {
 		t.Fatalf("StandingIDs() = %v, want %v", got, want)
 	}
@@ -86,9 +94,26 @@ func TestStandingIDs_HerdYAMLFallback(t *testing.T) {
 func TestStandingIDs_RegistryWinsOverYAML(t *testing.T) {
 	newRepoFixture(t, testRegistry, testHerdYAML)
 	got := StandingIDs()
-	want := []string{"forge-forge-smith", "forge-reviewer", "forge-worker"}
+	want := []string{"forge-forge-smith", "forge-worker"}
 	if !equalStrings(got, want) {
 		t.Fatalf("StandingIDs() = %v, want %v", got, want)
+	}
+}
+
+// TestStandingIDs_ExcludesEphemeralLanes proves the ephemeral task lane in
+// testRegistry ("reviewer", standing:false) is a ephemeral role that never
+// gets raised, not merely absent by coincidence: LaneIDs() proves it is a
+// declared lane, while StandingIDs() must still omit it.
+func TestStandingIDs_ExcludesEphemeralLanes(t *testing.T) {
+	newRepoFixture(t, testRegistry, "")
+	if lanes := LaneIDs(); !equalStrings(lanes, []string{"forge-smith", "reviewer", "worker"}) {
+		t.Fatalf("LaneIDs() = %v, want all 3 declared lanes", lanes)
+	}
+	standing := StandingIDs()
+	for _, id := range standing {
+		if id == "forge-reviewer" {
+			t.Fatalf("StandingIDs() = %v must not raise the ephemeral reviewer lane", standing)
+		}
 	}
 }
 
@@ -127,7 +152,7 @@ func TestSetStandingOverride_RestoresDerivation(t *testing.T) {
 		t.Fatal("override should pin the roster")
 	}
 	SetStandingOverride(nil)
-	if !equalStrings(StandingIDs(), []string{"forge-forge-smith", "forge-reviewer", "forge-worker"}) {
+	if !equalStrings(StandingIDs(), []string{"forge-forge-smith", "forge-worker"}) {
 		t.Fatal("nil override should restore derivation from the registry")
 	}
 }
