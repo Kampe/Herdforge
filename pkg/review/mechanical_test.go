@@ -146,6 +146,19 @@ func TestClassifyFile_WholeNewTestFileWithSmuggledCodeEscalates(t *testing.T) {
 	}
 }
 
+func TestClassifyFile_IncompleteCompactGroupedVarSmuggledInTestPath(t *testing.T) {
+	// Not standalone-parseable (unclosed braces/parens) — exercises the
+	// line-oriented heuristic fallback, not the go/parser path.
+	fc := FileChange{
+		Path:  "pkg/review/sneaky_test.go",
+		Added: []string{"var (grantAdmin = func() {"},
+	}
+	got := ClassifyFile(fc, DefaultMechanicalPolicy())
+	if got != CategoryAmbiguous {
+		t.Errorf("incomplete compact grouped function-valued var in _test.go must classify Ambiguous (escalate), got %s", got)
+	}
+}
+
 func TestClassifyFile_MethodDeclarationSmuggledInTestPath(t *testing.T) {
 	fc := FileChange{
 		Path:  "pkg/review/sneaky_test.go",
