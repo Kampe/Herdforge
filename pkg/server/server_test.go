@@ -56,11 +56,20 @@ func TestStatusSchemaReportsHealthyOnlyWithAuthoritativeSignals(t *testing.T) {
 	if err := exp.SetQueuePressureAt(metrics.QueuePressure{Depth: 1, Capacity: 2, Known: true}, now); err != nil {
 		t.Fatal(err)
 	}
+	srv := NewControlServerWithMetrics("127.0.0.1:0", exp, func() time.Time { return now })
+	w := httptest.NewRecorder()
+	srv.handleStatus(w, httptest.NewRequest("GET", "/v1/status", nil))
+	var beforeSignals ServerStatusResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &beforeSignals); err != nil {
+		t.Fatal(err)
+	}
+	if beforeSignals.Status != "degraded" {
+		t.Fatalf("missing signal authority must remain degraded: %+v", beforeSignals)
+	}
 	if err := exp.SetSignals(metrics.FleetSignals{LastReconciliation: now, ObservedAt: now}); err != nil {
 		t.Fatal(err)
 	}
-	srv := NewControlServerWithMetrics("127.0.0.1:0", exp, func() time.Time { return now })
-	w := httptest.NewRecorder()
+	w = httptest.NewRecorder()
 	srv.handleStatus(w, httptest.NewRequest("GET", "/v1/status", nil))
 	var got ServerStatusResponse
 	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {

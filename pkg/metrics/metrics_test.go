@@ -181,7 +181,12 @@ func TestMetricsStateRestartRoundTripAndStaleRestore(t *testing.T) {
 	if !health.Readiness || queue.Depth != 2 || restored.Signals() != signals || slo.Completed != 1 || restored.TotalTasksProcessed != 1 {
 		t.Fatalf("restart round-trip lost state: health=%+v queue=%+v signals=%+v slo=%+v tasks=%d", health, queue, restored.Signals(), slo, restored.TotalTasksProcessed)
 	}
-	stale := NewMetricsExporterWithPersistence(store, func() time.Time { return now.Add(25 * time.Hour) })
+	current := now
+	stale := NewMetricsExporterWithPersistence(store, func() time.Time { return current })
+	if err := stale.Restore(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	current = now.Add(25 * time.Hour)
 	if err := stale.Restore(context.Background()); err == nil {
 		t.Fatal("stale persisted observations must be rejected")
 	}
