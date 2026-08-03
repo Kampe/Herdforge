@@ -849,5 +849,3 @@ func gitOutput(t *testing.T, dir string, args ...string) string {
 	}
 	return strings.TrimSpace(string(output))
 }
-
-
