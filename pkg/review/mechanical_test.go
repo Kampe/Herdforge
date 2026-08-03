@@ -273,6 +273,70 @@ func TestEvaluateMechanical_EmptyDiffBlocks(t *testing.T) {
 	}
 }
 
+func TestClassifyFile_RenameOfProductionCodeOntoDocsPathEscalates(t *testing.T) {
+	fc := FileChange{
+		Path:    "docs/notes.md",
+		OldPath: "pkg/auth/jwt.go",
+		Added:   []string{"same content either way"},
+		Removed: []string{"same content either way"},
+	}
+	got := ClassifyFile(fc, DefaultMechanicalPolicy())
+	if got != CategoryAmbiguous {
+		t.Errorf("renaming production code onto a docs path must classify Ambiguous (escalate), got %s", got)
+	}
+}
+
+func TestClassifyFile_RenameWithinMechanicalCategoryStaysMechanical(t *testing.T) {
+	fc := FileChange{
+		Path:    "docs/new-name.md",
+		OldPath: "docs/old-name.md",
+		Added:   []string{"prose"},
+	}
+	got := ClassifyFile(fc, DefaultMechanicalPolicy())
+	if got != CategoryDocs {
+		t.Errorf("renaming docs to docs must stay Docs, got %s", got)
+	}
+}
+
+func TestClassifyFile_WhitespaceOnlyChangeInsideStringLiteralNotFormatting(t *testing.T) {
+	fc := FileChange{
+		Path:    "pkg/foo/bar.go",
+		Added:   []string{`msg := "a b"`},
+		Removed: []string{`msg := "a  b"`},
+	}
+	got := ClassifyFile(fc, DefaultMechanicalPolicy())
+	if got != CategoryCode {
+		t.Errorf("a string-literal content change must not classify Formatting, got %s", got)
+	}
+}
+
+func TestEvaluateMechanical_RenameOfProductionCodeOntoTestPathEscalates(t *testing.T) {
+	files := []FileChange{{
+		Path:    "pkg/review/moved_test.go",
+		OldPath: "pkg/auth/jwt.go",
+		Added:   []string{"func TestFoo(t *testing.T) {}"},
+	}}
+	checks := passChecks("preflight", "secret-scan", "format-lint", "tests", "non-vacuity")
+	v := EvaluateMechanical("sha1", "patch1", files, checks, DefaultMechanicalPolicy())
+	if v.Approved {
+		t.Fatal("renaming production code onto a test path must not pass R0")
+	}
+}
+
+func TestEvaluateMechanical_DuplicateCheckNameBlocksEvenIfLatestPasses(t *testing.T) {
+	files := []FileChange{{Path: "README.md", Added: []string{"doc"}}}
+	checks := []CheckResult{
+		{Name: "preflight", Status: CheckFail},
+		{Name: "preflight", Status: CheckPass}, // a later duplicate must not override the earlier failure
+		{Name: "secret-scan", Status: CheckPass},
+		{Name: "link-check", Status: CheckPass},
+	}
+	v := EvaluateMechanical("sha1", "patch1", files, checks, DefaultMechanicalPolicy())
+	if v.Approved {
+		t.Fatal("duplicate check evidence must block rather than let a later duplicate win")
+	}
+}
+
 func TestEvaluateMechanical_PolicyDisablesTestOnlyMechanical(t *testing.T) {
 	files := []FileChange{{Path: "pkg/review/mechanical_test.go", Added: []string{"func TestFoo(t *testing.T) {}"}}}
 	checks := passChecks("preflight", "secret-scan", "format-lint", "tests", "non-vacuity")
