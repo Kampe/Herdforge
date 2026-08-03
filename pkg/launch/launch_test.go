@@ -54,6 +54,14 @@ func withHooks(req *Request, hooks []harness.Hook) {
 	})
 }
 
+func installTestExecutable(t *testing.T, dir, name string) {
+	t.Helper()
+	path := filepath.Join(dir, name)
+	if err := os.WriteFile(path, []byte("#!/bin/sh\nexit 0\n"), 0700); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestValidateWorkerDecisionDoesNotPreAccept(t *testing.T) {
 	s := &MemorySink{}
 	if err := Validate(good(t), s); err != nil {
@@ -448,6 +456,17 @@ func TestOrdinaryRequestCannotBypassProductionDiscovery(t *testing.T) {
 }
 
 func TestClaudeCommandIncidentRequiresBoundHealthPolicyBeforeEffects(t *testing.T) {
+	home := t.TempDir()
+	bin := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(home, ".local", "bin"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	installTestExecutable(t, filepath.Join(home, ".local", "bin"), "moshi-hook")
+	installTestExecutable(t, bin, "moshi-hook")
+	installTestExecutable(t, bin, "python3")
+	installTestExecutable(t, bin, "bash")
+	t.Setenv("HOME", home)
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
 	settingsPath := t.TempDir() + "/settings.json"
 	settings := `{"hooks":{"SessionStart":[{"matcher":"","hooks":[{"type":"command","command":"moshi-hook --port 8790"}]}],"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"/bin/sh -c '$HOME/.local/bin/moshi-hook --port 8790'","timeout":600}]}],"UserPromptSubmit":[{"matcher":"","hooks":[{"type":"command","command":"$HOME/.local/bin/moshi-hook --port 8790"}]}],"PostToolUse":[{"matcher":"Edit","hooks":[{"type":"command","command":"python3 $HOME/.local/bin/moshi-hook --port 8790"}]}],"PostToolUseFailure":[{"matcher":"Edit","hooks":[{"type":"command","command":"bash $HOME/.local/bin/moshi-hook --port 8790"}]}],"SubagentStart":[{"matcher":"","hooks":[{"type":"command","command":"/bin/sh -c '$HOME/.local/bin/moshi-hook subagent'"}]}]}}`
 	if err := os.WriteFile(settingsPath, []byte(settings), 0600); err != nil {

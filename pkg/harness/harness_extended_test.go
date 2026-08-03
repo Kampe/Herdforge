@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -285,8 +287,27 @@ func TestDefaultDiscoveryUsesBuiltInNoHooksWhenOverrideAbsent(t *testing.T) {
 }
 
 func TestClaudeCommandIncidentBindsDigestAndChecksExecutable(t *testing.T) {
+	home := t.TempDir()
+	bin := t.TempDir()
+	moshi := filepath.Join(home, ".local", "bin", "moshi-hook")
+	if err := os.MkdirAll(filepath.Dir(moshi), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(moshi, []byte("#!/bin/sh\nexit 0\n"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HOME", home)
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	refused := listener.Addr().String()
+	if err := listener.Close(); err != nil {
+		t.Fatal(err)
+	}
 	path := t.TempDir() + "/settings.json"
-	config := `{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"/bin/sh -c 'moshi-hook --port 8790'","timeout":600}]}],"UserPromptSubmit":[{"matcher":"","hooks":[{"type":"command","command":"$HOME/.local/bin/moshi-hook --port 8790"}]}],"PostToolUse":[{"matcher":"Edit","hooks":[{"type":"command","command":"python3 $HOME/.local/bin/moshi-hook --port 8790"}]}],"PostToolUseFailure":[{"matcher":"Edit","hooks":[{"type":"command","command":"bash $HOME/.local/bin/moshi-hook --port 8790"}]}],"SubagentStart":[{"matcher":"","hooks":[{"type":"command","command":"/bin/sh -c 'moshi-hook --port 8790 subagent'"}]}]}}`
+	config := `{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"$HOME/.local/bin/moshi-hook --port 8790","timeout":600}]}],"UserPromptSubmit":[{"matcher":"","hooks":[{"type":"command","command":"/bin/sh -c 'moshi-hook --port 8790'"}]}],"PostToolUse":[{"matcher":"Edit","hooks":[{"type":"command","command":"python3 $HOME/.local/bin/moshi-hook --port 8790"}]}],"PostToolUseFailure":[{"matcher":"Edit","hooks":[{"type":"command","command":"bash $HOME/.local/bin/moshi-hook --port 8790"}]}],"SubagentStart":[{"matcher":"","hooks":[{"type":"command","command":"/bin/sh -c 'moshi-hook --port 8790 subagent'"}]}]}}`
 	if err := os.WriteFile(path, []byte(config), 0600); err != nil {
 		t.Fatal(err)
 	}
@@ -299,9 +320,14 @@ func TestClaudeCommandIncidentBindsDigestAndChecksExecutable(t *testing.T) {
 			t.Fatalf("command binding = %+v", hook)
 		}
 	}
-	report := CheckHooks(context.Background(), result.Hooks, HookIdentity{}, nil)
-	if report.RequiredHealthy {
-		t.Fatalf("command incident preflight = %+v", report)
+	policies := []HookPolicy{{HandlerDigest: result.Hooks[0].Name, Requirement: HookRequired, HealthURL: "http://" + refused + "/health"}}
+	bound, code, _ := ApplyHookPolicies(result.Hooks[:1], policies, policyRevision(policies))
+	if code != HookCodeHealthy {
+		t.Fatalf("trusted health policy binding = %s", code)
+	}
+	report := CheckHooks(context.Background(), bound, HookIdentity{PolicyRevision: policyRevision(policies)}, nil)
+	if report.RequiredHealthy || len(report.Results) != 1 || report.Results[0].Code != HookCodeUnavailable || report.Results[0].EndpointClass != EndpointLoopback || report.Results[0].Name != result.Hooks[0].Name {
+		t.Fatalf("installed command health refusal = %+v", report)
 	}
 }
 
