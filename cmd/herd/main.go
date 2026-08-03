@@ -527,7 +527,7 @@ func runPulse() {
 	mr := router.NewModelRouter([]*router.ModelCandidate{
 		{Name: "opencode", Type: router.ProviderOllama, Model: "deepseek-v4-flash"},
 	})
-	wm := worktree.NewWorktreeManager(".")
+	wm := resolveCanonicalWorktreeManager()
 	v := verifier.NewVerifier(cfg.Verification.TestCommand)
 
 	st, err := store.New(".herd/herdforge.db")
@@ -874,7 +874,7 @@ func runDaemon() {
 			}
 			return snap.Utilization(name)
 		})
-		wm := worktree.NewWorktreeManager(".")
+		wm := resolveCanonicalWorktreeManager()
 		v := verifier.NewVerifier(cfg.Verification.TestCommand)
 		eng := daemon.NewEngine(cfg, tp, mr, st, wm, v)
 
@@ -1760,7 +1760,7 @@ func runDispatch() {
 		tp = provider.NewMemoryProvider()
 	}
 
-	wm := worktree.NewWorktreeManager(".")
+	wm := resolveCanonicalWorktreeManager()
 	d := dispatch.NewDispatcher(cfg, tp, wm)
 
 	fmt.Printf("Dispatching %s to lane '%s'...\n", ticketRef, *laneName)
@@ -2107,6 +2107,24 @@ func firstEnv(primary, secondary, def string) string {
 	return def
 }
 
+// resolveCanonicalWorktreeManager builds a WorktreeManager rooted at the
+// canonical repository root, never at the process's literal cwd string
+// (FAC-152). A dispatch invoked from deep inside a task worktree — e.g.
+// <task-worktree>/pkg/dispatch — must still create its next worktree in the
+// shared canonical pool, not a pool computed relative to wherever the
+// process happened to be running; that mismatch is exactly what produced
+// the nested pkg/dispatch/.herd/worktrees/fac-1 lane. Fails closed (exits
+// non-zero) rather than silently falling back to cwd, which would defeat
+// the fix in precisely the case it exists to catch.
+func resolveCanonicalWorktreeManager() *worktree.WorktreeManager {
+	root, err := worktree.ResolveCanonicalRoot(context.Background(), ".", firstEnv("HERD_ROOT", "HERD_REPO_ROOT", ""))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "herd: cannot resolve canonical repository root (FAC-152 fail-closed): %v\n", err)
+		os.Exit(1)
+	}
+	return worktree.NewWorktreeManager(root)
+}
+
 func stateDir() string {
 	if x := os.Getenv("XDG_STATE_HOME"); x != "" {
 		return filepath.Join(x, "herdforge")
@@ -2248,7 +2266,7 @@ func runForge() {
 		}
 		return snap.Utilization(name)
 	})
-	wm := worktree.NewWorktreeManager(".")
+	wm := resolveCanonicalWorktreeManager()
 	v := verifier.NewVerifier(cfg.Verification.TestCommand)
 	st, err := store.New(".herd/herdforge.db")
 	if err != nil {
@@ -3222,7 +3240,7 @@ func runForgeLoop() {
 	default:
 		tp = provider.NewMemoryProvider()
 	}
-	eng := daemon.NewEngine(cfg, tp, nil, nil, worktree.NewWorktreeManager("."), nil)
+	eng := daemon.NewEngine(cfg, tp, nil, nil, resolveCanonicalWorktreeManager(), nil)
 	driver := &cliForgeDriver{cfg: cfg, maxLanes: *maxLanes}
 
 	fmt.Printf("herd forge --loop: max-lanes=%d interval=%ds — driving the board autonomously\n", *maxLanes, *interval)
