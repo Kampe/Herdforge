@@ -15,11 +15,21 @@ task_provider:
   api_key_env: "KANEO_API_KEY"
   use_cli: true
 
-# The forge fleet — three forge-themed roles. Soft model pins below are
-# roster defaults only. FAC-142 SurfaceRouter.Decide owns the live
+# The forge fleet — the complete role roster (FAC-127). Soft model pins below
+# are roster defaults only. FAC-142 SurfaceRouter.Decide owns the live
 # provider/model/effort/pool for every worker and reviewer launch; FAC-139
 # enforces that LaunchDecision at the tab boundary. Never pair flash
 # authors with a same-family reviewer or frontier-high re-review by default.
+#
+# Every lane below declares standing (control-plane, raised by `herd
+# standing`) vs ephemeral (task role, launched per dispatch), authority
+# (read|write), capabilities (probe-gated tool/network requirements), and
+# incompatible_with (role labels this lane must never double as). No lane
+# defaults to the shared checkout — each has its own worktree.
+#
+# .herd/prompts/critical-wave-coordinator.md is a one-off wave-specific
+# template (FAC-119..122 coordination), not a standing role contract; it is
+# intentionally NOT registered as a lane here.
 lanes:
   # scout — surveys the board: ranks claimable tickets and grooms bare cards
   # into dispatch-ready specs, feeding the forge loop what to forge next.
@@ -34,6 +44,10 @@ lanes:
     model: "litellm/lazer/deepseek-v4-flash"
     fallback_models:
       - "opencode/deepseek-v4-flash-free"
+    standing: false
+    authority: "write"
+    capabilities: ["git-write", "fs-write", "shell-exec"]
+    incompatible_with: ["reviewer"]
 
   # smith — forges the code at the anvil. The forge loop dispatches one builder
   # per card (task-fac-<ref>) using router LaunchDecision, not harness defaults.
@@ -47,6 +61,10 @@ lanes:
     model: "litellm/lazer/deepseek-v4-flash"
     fallback_models:
       - "opencode/deepseek-v4-flash-free"
+    standing: false
+    authority: "write"
+    capabilities: ["git-write", "fs-write", "shell-exec"]
+    incompatible_with: ["reviewer"]
 
   # assayer — independent review. Soft default is a DIFFERENT family from the
   # deepseek flash smiths (anthropic). Effort is always router-owned: medium
@@ -61,6 +79,108 @@ lanes:
     model: "claude-sonnet-5"
     fallback_models:
       - "grok-4.5"
+    standing: false
+    authority: "read"
+    capabilities: ["network"]
+    incompatible_with: ["worker", "forge-smith", "harvest"]
+
+  # orchestrator — fleet coordinator. Routes evidence and capacity; never
+  # implements, reviews, or merges a candidate itself (.herd/prompts/orchestrator.md).
+  - name: "orchestrator"
+    role: "orchestrator"
+    agent_kind: "claude"
+    harness: "claude"
+    prompt: ".herd/prompts/orchestrator.md"
+    worktree: ".worktrees/orchestrator"
+    provider: "claude"
+    model: "claude-opus-5"
+    standing: true
+    authority: "read"
+    capabilities: ["board-write", "network"]
+    incompatible_with: ["worker", "forge-smith", "reviewer", "harvest"]
+
+  # scout-planner — read-mostly queue groomer. Proposes risk tier, role,
+  # dependencies, and dispatch rank; never claims or implements work itself
+  # (.herd/prompts/scout-planner.md).
+  - name: "scout-planner"
+    role: "scout-planner"
+    agent_kind: "claude"
+    harness: "claude"
+    prompt: ".herd/prompts/scout-planner.md"
+    worktree: ".worktrees/scout-planner"
+    provider: "claude"
+    model: "claude-opus-5"
+    standing: true
+    authority: "read"
+    capabilities: ["board-write", "network"]
+    incompatible_with: ["worker", "forge-smith", "reviewer", "harvest"]
+
+  # verification-gate — deterministic verifier for one immutable candidate
+  # SHA. Attests evidence; never repairs the candidate or issues a review
+  # verdict (.herd/prompts/verification-gate.md).
+  - name: "verification-gate"
+    role: "verification-gate"
+    agent_kind: "opencode"
+    harness: "opencode"
+    prompt: ".herd/prompts/verification-gate.md"
+    worktree: ".worktrees/verification-gate"
+    provider: "lazer"
+    model: "litellm/lazer/deepseek-v4-flash"
+    fallback_models:
+      - "opencode/deepseek-v4-flash-free"
+    standing: false
+    authority: "read"
+    capabilities: ["shell-exec"]
+    incompatible_with: ["worker", "forge-smith"]
+
+  # review-supervisor — owns review-queue flow, not verdicts. Routes
+  # candidates through the verification gate and independent review into
+  # the single integration queue (.herd/prompts/review-supervisor.md).
+  - name: "review-supervisor"
+    role: "review-supervisor"
+    agent_kind: "claude"
+    harness: "claude"
+    prompt: ".herd/prompts/review-supervisor.md"
+    worktree: ".worktrees/review-supervisor"
+    provider: "claude"
+    model: "claude-sonnet-5"
+    standing: true
+    authority: "read"
+    capabilities: ["board-write"]
+    incompatible_with: ["worker", "forge-smith", "harvest"]
+
+  # harvest — the single-writer integration owner. Serializes reviewed
+  # candidates onto the default branch (.herd/prompts/harvest.md). Single
+  # standing owner enforced by config validation (duplicate standing role
+  # rejected).
+  - name: "harvest"
+    role: "harvest"
+    agent_kind: "claude"
+    harness: "claude"
+    prompt: ".herd/prompts/harvest.md"
+    worktree: ".worktrees/harvest"
+    provider: "claude"
+    model: "claude-sonnet-5"
+    standing: true
+    authority: "write"
+    capabilities: ["git-write", "board-write"]
+    incompatible_with: ["worker", "forge-smith", "reviewer"]
+
+  # recovery-sentinel — evidence-driven fleet recovery. Detects stranded
+  # work and restores a safe state without guessing success or destroying
+  # unique work (.herd/prompts/recovery-sentinel.md).
+  - name: "recovery-sentinel"
+    role: "recovery-sentinel"
+    agent_kind: "claude"
+    harness: "claude"
+    prompt: ".herd/prompts/recovery-sentinel.md"
+    worktree: ".worktrees/recovery-sentinel"
+    provider: "claude"
+    model: "claude-sonnet-5"
+    standing: true
+    authority: "read"
+    capabilities: ["board-write", "network"]
+    incompatible_with: ["worker", "forge-smith"]
 
 # Project Verification Suite
 verification:
