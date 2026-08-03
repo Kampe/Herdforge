@@ -614,3 +614,58 @@ func TestDiskEvidenceRedactsHostPaths(t *testing.T) {
 		t.Fatalf("unreadable evidence leaked path: %s", pe2.Error())
 	}
 }
+
+func TestDiskGuardPerVolumeHysteresisSubsetCannotClear(t *testing.T) {
+	// Temp volume (fsid b) blocks; a later Check probing only the healthy
+	// repo volume (fsid a) must NOT clear the block — ready requires a
+	// fresh positive probe of the volume that actually failed.
+	repoSt := healthyStat("/repo", "a")
+	tempSt := incidentStat("/tmpv", "b")
+	g := NewDiskGuard(fakeProber(map[string]DiskStat{"/repo": repoSt, "/tmpv": tempSt}, nil))
+	asPressureErr(t, g.Check("archive", "/repo", "/tmpv"))
+	if g.State() != DiskBlocked {
+		t.Fatalf("state = %s", g.State())
+	}
+
+	// Healthy-subset probe: still refused, evidence names the blocked vol.
+	pe := asPressureErr(t, g.Check("dispatch", "/repo"))
+	if !strings.Contains(pe.Detail, "vol-b") || !strings.Contains(pe.Detail, "fresh positive probe") {
+		t.Fatalf("evidence must name the still-blocked volume: %s", pe.Detail)
+	}
+	if g.State() != DiskBlocked {
+		t.Fatal("healthy subset cleared another volume's block")
+	}
+
+	// Temp volume recovers above the recover floor: full-scope probe clears.
+	recovered := healthyStat("/tmpv", "b")
+	g2prober := fakeProber(map[string]DiskStat{"/repo": repoSt, "/tmpv": recovered}, nil)
+	// Swap prober by reusing the same guard through a fresh probe map.
+	g.prober = g2prober
+	if err := g.Check("dispatch", "/repo", "/tmpv"); err != nil {
+		t.Fatalf("full-scope recovery refused: %v", err)
+	}
+	if g.State() != DiskOK {
+		t.Fatalf("state = %s after full recovery", g.State())
+	}
+}
+
+func TestDiskGuardUnknownScopeClearsOnlyOnFullRecovery(t *testing.T) {
+	// An unreadable probe blocks via the synthetic unknown volume; a later
+	// fully-positive probe pass (all volumes above recover) clears it.
+	failing := true
+	st := healthyStat("/repo", "a")
+	g := NewDiskGuard(func(path string) (DiskStat, error) {
+		if failing {
+			return DiskStat{}, errors.New("io error")
+		}
+		return st, nil
+	})
+	asPressureErr(t, g.Check("dispatch", "/repo"))
+	failing = false
+	if err := g.Check("dispatch", "/repo"); err != nil {
+		t.Fatalf("recovered probe refused: %v", err)
+	}
+	if g.State() != DiskOK {
+		t.Fatalf("state = %s", g.State())
+	}
+}

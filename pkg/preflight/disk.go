@@ -189,7 +189,7 @@ type DiskGuard struct {
 
 	mu           sync.Mutex
 	prober       DiskProber
-	state        DiskGuardState
+	vols         map[string]DiskGuardState // per-FSID hysteresis state
 	lastEvidence *DiskPressureError
 	// outstanding is the sum of admitted-but-unreleased capacity
 	// reservations, subtracted from observed free space so concurrent
@@ -219,7 +219,26 @@ func NewDiskGuard(prober DiskProber) *DiskGuard {
 	if prober == nil {
 		prober = realDiskStat
 	}
-	return &DiskGuard{prober: prober}
+	return &DiskGuard{prober: prober, vols: map[string]DiskGuardState{}}
+}
+
+// unknownVol is the synthetic per-FSID key for unreadable/unknown scope.
+const unknownVol = "__unknown__"
+
+// worstLocked is the overall projection across every KNOWN volume; caller
+// holds g.mu. A volume blocked by an earlier probe stays blocked until a
+// fresh positive probe of THAT volume — a healthy subset never clears it.
+func (g *DiskGuard) worstLocked() DiskGuardState {
+	worst := DiskOK
+	for _, st := range g.vols {
+		if st == DiskBlocked {
+			return DiskBlocked
+		}
+		if st == DiskRecovering {
+			worst = DiskRecovering
+		}
+	}
+	return worst
 }
 
 // DefaultDiskGuard is the process-wide guard consulted by fleet mutation
@@ -240,15 +259,13 @@ func (g *DiskGuard) Blocked() bool {
 	return s == DiskBlocked || s == DiskRecovering
 }
 
-// State returns the projection state. A fresh guard (no probe yet) reports
-// DiskOK; the first Check reconciles from a live probe.
+// State returns the overall projection: the worst state across every known
+// volume. A fresh guard (no probe yet) reports DiskOK; the first Check
+// reconciles from a live probe.
 func (g *DiskGuard) State() DiskGuardState {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	if g.state == "" {
-		return DiskOK
-	}
-	return g.state
+	return g.worstLocked()
 }
 
 // Status is the fleet/operator label, aligned with the FAC-150 provider
@@ -258,7 +275,7 @@ func (g *DiskGuard) State() DiskGuardState {
 func (g *DiskGuard) Status() string {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	switch g.state {
+	switch g.worstLocked() {
 	case DiskBlocked:
 		if g.lastEvidence != nil && g.lastEvidence.Reason == ReasonStatUnreadable {
 			return "BLOCKED(disk_stat_unreadable)"
@@ -362,9 +379,9 @@ func AdmitDiskMutation(operation string, paths ...string) (func(), error) {
 // capacity is never permission for even one mutation.
 func (g *DiskGuard) evaluate(operation string, th DiskThresholds, stats []DiskStat, unreadable *DiskPressureError) error {
 	g.mu.Lock()
-	prev := g.state
+	prev := g.worstLocked()
 	err := g.evaluateLocked(operation, th, stats, unreadable)
-	next, ev, sink := g.state, g.lastEvidence, g.sink
+	next, ev, sink := g.worstLocked(), g.lastEvidence, g.sink
 	g.mu.Unlock()
 	// Fire the projection seam only on state TRANSITIONS (including the
 	// first reconcile from ""), never on steady-state checks — bounded,
@@ -397,7 +414,10 @@ func adjustForOutstanding(stats []DiskStat, out uint64) []DiskStat {
 	return adj
 }
 
-// evaluateLocked drives the state machine; caller holds g.mu.
+// evaluateLocked drives the PER-FSID state machine; caller holds g.mu.
+// Each probed volume transitions independently; the operation is refused
+// while ANY known volume (probed now or remembered from an earlier probe)
+// is not ok. Ready requires a fresh positive probe of every known volume.
 func (g *DiskGuard) evaluateLocked(operation string, th DiskThresholds, stats []DiskStat, unreadable *DiskPressureError) error {
 	// Zero probed volumes is NOT health — an unknown volume scope fails
 	// closed exactly like an unreadable stat.
@@ -412,54 +432,100 @@ func (g *DiskGuard) evaluateLocked(operation string, th DiskThresholds, stats []
 		}
 	}
 	if unreadable != nil {
-		g.state = DiskBlocked
+		g.vols[unknownVol] = DiskBlocked
 		g.lastEvidence = unreadable
 		return unreadable
 	}
 
 	stats = adjustForOutstanding(stats, g.outstanding)
 
-	if bad := below(stats, th.blockFreeBytes(), th.MinFreePct, th.MinInodePct); bad != nil {
-		g.state = DiskBlocked
+	// Transition each probed volume independently.
+	var worstBad *DiskStat
+	var badState DiskGuardState = DiskOK
+	allClearRecover := true
+	for i := range stats {
+		st := &stats[i]
+		switch {
+		case below(stats[i:i+1], th.blockFreeBytes(), th.MinFreePct, th.MinInodePct) != nil:
+			g.vols[st.FSID] = DiskBlocked
+			allClearRecover = false
+			if badState != DiskBlocked {
+				worstBad, badState = st, DiskBlocked
+			}
+		case (g.vols[st.FSID] == DiskBlocked || g.vols[st.FSID] == DiskRecovering || g.vols[st.FSID] == "") &&
+			below(stats[i:i+1], th.RecoverFreeBytes, th.RecoverFreePct, th.MinInodePct) != nil:
+			g.vols[st.FSID] = DiskRecovering
+			allClearRecover = false
+			if badState == DiskOK {
+				worstBad, badState = st, DiskRecovering
+			}
+		default:
+			g.vols[st.FSID] = DiskOK
+		}
+	}
+	// The synthetic unknown-scope block clears only when a complete probe
+	// pass has every volume above the recover floor.
+	if allClearRecover {
+		delete(g.vols, unknownVol)
+	}
+
+	// A volume remembered blocked/recovering from an EARLIER probe keeps
+	// refusing even when the currently probed subset is healthy.
+	if badState == DiskOK {
+		for fsid, vstate := range g.vols {
+			if vstate == DiskBlocked || vstate == DiskRecovering {
+				badState = vstate
+				pe := &DiskPressureError{
+					State:      "BLOCKED",
+					Reason:     ReasonRecovering,
+					Operation:  operation,
+					Stats:      stats,
+					Thresholds: th,
+					Detail: fmt.Sprintf("volume vol-%s remains %s from an earlier probe; a fresh positive probe of that volume is required before ready",
+						fsid, vstate),
+					NextAction:               safeNextAction,
+					OutstandingReservedBytes: g.outstanding,
+				}
+				if vstate == DiskBlocked {
+					pe.Reason = ReasonDiskPressure
+				}
+				g.lastEvidence = pe
+				return pe
+			}
+		}
+	}
+
+	switch badState {
+	case DiskBlocked:
 		pe := &DiskPressureError{
-			State:                    "BLOCKED",
-			Reason:                   ReasonDiskPressure,
-			Operation:                operation,
-			Stats:                    stats,
-			Thresholds:               th,
-			OutstandingReservedBytes: g.outstanding,
+			State:      "BLOCKED",
+			Reason:     ReasonDiskPressure,
+			Operation:  operation,
+			Stats:      stats,
+			Thresholds: th,
 			Detail: fmt.Sprintf("volume %s free %.1fGiB (%.1f%%, %d free inodes) below reserve (min %.1fGiB / %.1f%%)",
-				bad.Volume, float64(bad.FreeBytes)/bytesPerGiB, bad.FreePct, bad.FreeInodes,
+				worstBad.Volume, float64(worstBad.FreeBytes)/bytesPerGiB, worstBad.FreePct, worstBad.FreeInodes,
 				float64(th.blockFreeBytes())/bytesPerGiB, th.MinFreePct),
-			NextAction: safeNextAction,
+			NextAction:               safeNextAction,
+			OutstandingReservedBytes: g.outstanding,
+		}
+		g.lastEvidence = pe
+		return pe
+	case DiskRecovering:
+		pe := &DiskPressureError{
+			State:      "BLOCKED",
+			Reason:     ReasonRecovering,
+			Operation:  operation,
+			Stats:      stats,
+			Thresholds: th,
+			Detail: fmt.Sprintf("volume %s above block floor but below recover floor (%.1fGiB / %.1f%%); holding closed until stable headroom",
+				worstBad.Volume, float64(th.RecoverFreeBytes)/bytesPerGiB, th.RecoverFreePct),
+			NextAction:               safeNextAction,
+			OutstandingReservedBytes: g.outstanding,
 		}
 		g.lastEvidence = pe
 		return pe
 	}
-
-	// The recover floor applies while blocked/recovering AND on a fresh
-	// process's first probe (state ""): a restart cannot know whether the
-	// previous process was blocked, so landing inside the recovery band
-	// reconstructs recovering conservatively instead of erasing hysteresis.
-	if g.state == DiskBlocked || g.state == DiskRecovering || g.state == "" {
-		if bad := below(stats, th.RecoverFreeBytes, th.RecoverFreePct, th.MinInodePct); bad != nil {
-			g.state = DiskRecovering
-			pe := &DiskPressureError{
-				State:                    "BLOCKED",
-				Reason:                   ReasonRecovering,
-				Operation:                operation,
-				Stats:                    stats,
-				Thresholds:               th,
-				OutstandingReservedBytes: g.outstanding,
-				Detail: fmt.Sprintf("volume %s above block floor but below recover floor (%.1fGiB / %.1f%%); holding closed until stable headroom",
-					bad.Volume, float64(th.RecoverFreeBytes)/bytesPerGiB, th.RecoverFreePct),
-				NextAction: safeNextAction,
-			}
-			g.lastEvidence = pe
-			return pe
-		}
-	}
-	g.state = DiskOK
 	g.lastEvidence = nil
 	return nil
 }
