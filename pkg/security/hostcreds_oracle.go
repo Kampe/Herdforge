@@ -67,8 +67,10 @@ type HostCredsOracle struct {
 	lastInjected    bool // true if InjectAuthorization succeeded (not the secret)
 	dialHook        func(network, addr string) (net.Conn, error)
 	resolveHook     func(host string) (net.IP, error)
-	forceHTTP       bool
-	allowLoopback   bool
+	// tlsConfig for upstream client (tests inject RootCAs for loopback TLS).
+	// Production leaves nil (system roots). Credentialed path NEVER uses plaintext HTTP.
+	upstreamTLS *tls.Config
+	allowLoopback bool
 }
 
 // OracleConfig configures a HostCredsOracle.
@@ -430,15 +432,13 @@ func (o *HostCredsOracle) forward(host, method, path string, hdr http.Header, bo
 		}
 	}
 	allowLoop := o.allowLoopback || (net.ParseIP(host) != nil && net.ParseIP(host).IsLoopback())
-	if err := validateDialIP(ip, allowLoop || o.forceHTTP); err != nil {
+	if err := validateDialIP(ip, allowLoop); err != nil {
 		return 0, "", &BlockedError{Reason: BlockAbuse, Code: "dns_rebind"}
 	}
 
-	useTLS := !o.forceHTTP && !(ip != nil && ip.IsLoopback())
+	// Credentialed traffic: TLS only, exact port 443 (loopback tests still TLS on
+	// the dialHook target — never inject Authorization over plaintext HTTP).
 	port := "443"
-	if !useTLS {
-		port = "80"
-	}
 	addr := net.JoinHostPort(ip.String(), port)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
@@ -446,6 +446,7 @@ func (o *HostCredsOracle) forward(host, method, path string, hdr http.Header, bo
 
 	var conn net.Conn
 	if o.dialHook != nil {
+		// dialHook may target a TLS test server on an ephemeral port; still TLS.
 		conn, err = o.dialHook("tcp", addr)
 	} else {
 		d := &net.Dialer{Timeout: 5 * time.Second}
@@ -456,25 +457,28 @@ func (o *HostCredsOracle) forward(host, method, path string, hdr http.Header, bo
 	}
 	defer conn.Close()
 
-	var rw io.ReadWriter = conn
-	if useTLS {
-		tlsConn := tls.Client(conn, &tls.Config{ServerName: host, MinVersion: tls.VersionTLS12})
-		if err := tlsConn.HandshakeContext(ctx); err != nil {
-			return 0, "", &BlockedError{Reason: BlockAbuse, Code: "tls_handshake"}
+	tlsCfg := &tls.Config{ServerName: host, MinVersion: tls.VersionTLS12}
+	if o.upstreamTLS != nil {
+		tlsCfg = o.upstreamTLS.Clone()
+		if tlsCfg.ServerName == "" {
+			tlsCfg.ServerName = host
 		}
-		defer tlsConn.Close()
-		rw = tlsConn
+		if tlsCfg.MinVersion == 0 {
+			tlsCfg.MinVersion = tls.VersionTLS12
+		}
 	}
+	tlsConn := tls.Client(conn, tlsCfg)
+	if err := tlsConn.HandshakeContext(ctx); err != nil {
+		return 0, "", &BlockedError{Reason: BlockAbuse, Code: "tls_handshake"}
+	}
+	defer tlsConn.Close()
+	rw := io.ReadWriter(tlsConn)
 
-	scheme := "https"
-	if !useTLS {
-		scheme = "http"
-	}
 	uPath := path
 	if !strings.HasPrefix(uPath, "/") {
 		uPath = "/" + uPath
 	}
-	req, err := http.NewRequestWithContext(ctx, method, scheme+"://"+host+uPath, strings.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, method, "https://"+host+uPath, strings.NewReader(body))
 	if err != nil {
 		return 0, "", &BlockedError{Reason: BlockAbuse, Code: "build_request"}
 	}
