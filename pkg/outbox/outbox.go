@@ -11,7 +11,6 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"strings"
 	"time"
 )
 
@@ -128,9 +127,20 @@ func (s *Store) migrate() error {
 	if err != nil {
 		return fmt.Errorf("migrate outbox schema: %w", err)
 	}
-	for _, alter := range []string{`ALTER TABLE outbox_items ADD COLUMN owner TEXT`, `ALTER TABLE outbox_items ADD COLUMN claimed_at DATETIME`, `ALTER TABLE outbox_items ADD COLUMN message_id TEXT`, `ALTER TABLE outbox_items ADD COLUMN sequence INTEGER NOT NULL DEFAULT 0`} {
-		if _, alterErr := s.db.Exec(alter); alterErr != nil && !strings.Contains(strings.ToLower(alterErr.Error()), "duplicate column") {
-			return fmt.Errorf("migrate outbox delivery columns: %w", alterErr)
+	for _, column := range []struct{ name, ddl string }{
+		{"owner", `ALTER TABLE outbox_items ADD COLUMN owner TEXT`},
+		{"claimed_at", `ALTER TABLE outbox_items ADD COLUMN claimed_at DATETIME`},
+		{"message_id", `ALTER TABLE outbox_items ADD COLUMN message_id TEXT`},
+		{"sequence", `ALTER TABLE outbox_items ADD COLUMN sequence INTEGER NOT NULL DEFAULT 0`},
+	} {
+		has, err := hasColumn(s.db, "outbox_items", column.name)
+		if err != nil {
+			return fmt.Errorf("inspect outbox schema: %w", err)
+		}
+		if !has {
+			if _, err := s.db.Exec(column.ddl); err != nil {
+				return fmt.Errorf("migrate outbox delivery columns: %w", err)
+			}
 		}
 	}
 	if _, err := s.db.Exec(`UPDATE outbox_items SET owner = 'legacy-unowned', claimed_at = CURRENT_TIMESTAMP WHERE status = ? AND claimed_at IS NULL`, StatusInFlight); err != nil {
@@ -141,6 +151,27 @@ func (s *Store) migrate() error {
 		return fmt.Errorf("migrate outbox schema: %w", err)
 	}
 	return nil
+}
+
+func hasColumn(db *sql.DB, table, wanted string) (bool, error) {
+	rows, err := db.Query(`PRAGMA table_info(` + table + `)`)
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid int
+		var name, typ string
+		var notnull, pk int
+		var defaultValue any
+		if err := rows.Scan(&cid, &name, &typ, &notnull, &defaultValue, &pk); err != nil {
+			return false, err
+		}
+		if name == wanted {
+			return true, nil
+		}
+	}
+	return false, rows.Err()
 }
 
 // execer is satisfied by both *sql.DB and *sql.Tx.

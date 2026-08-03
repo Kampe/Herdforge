@@ -870,6 +870,13 @@ func (b *MessageBroker) addOutboxEntry(env *Envelope, channel string) error {
 
 func (b *MessageBroker) addOutboxEntryContext(ctx context.Context, env *Envelope, channel string) error {
 	return b.mutateOutboxLockedContext(ctx, func(entries map[string]outboxEntry) error {
+		if existing, ok := entries[env.ID]; ok {
+			old := existing.Envelope
+			if old.Sender != env.Sender || old.Recipient != env.Recipient || old.Subject != env.Subject || old.Body != env.Body {
+				return fmt.Errorf("mailbox outbox: envelope ID %q reused with different content", env.ID)
+			}
+			return nil
+		}
 		entries[env.ID] = outboxEntry{Envelope: *env, Channel: channel}
 		return nil
 	})
