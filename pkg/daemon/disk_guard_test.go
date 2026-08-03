@@ -13,6 +13,7 @@ import (
 	"github.com/Kampe/Herdforge/pkg/config"
 	"github.com/Kampe/Herdforge/pkg/preflight"
 	"github.com/Kampe/Herdforge/pkg/provider"
+	"github.com/Kampe/Herdforge/pkg/server"
 	"github.com/Kampe/Herdforge/pkg/worktree"
 )
 
@@ -135,8 +136,11 @@ func TestForgeLoop_SerializesDispatchUnderSoftPressure(t *testing.T) {
 }
 
 func TestForgeLoop_StartsProductionControlPlane(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv(server.EnvControlToken, "test-capability")
+	t.Setenv("HERD_ROOT", root) // canonical-root override for a non-git fixture
 	tp := &timeoutProvider{failAfter: 1 << 30, tasks: []*provider.Task{}}
-	wm := worktree.NewWorktreePool(t.TempDir(), t.TempDir())
+	wm := worktree.NewWorktreePool(root, t.TempDir())
 	e := NewEngine(&config.Config{TaskProvider: config.TaskProvider{ProjectID: "p1"}}, tp, nil, nil, wm, nil)
 	logs := []string{}
 	d := &recordingDriver{
@@ -156,7 +160,10 @@ func TestForgeLoop_StartsProductionControlPlane(t *testing.T) {
 }
 
 func TestEngineStartControlPlaneServesLiveMetrics(t *testing.T) {
-	wm := worktree.NewWorktreePool(t.TempDir(), t.TempDir())
+	root := t.TempDir()
+	t.Setenv(server.EnvControlToken, "test-capability")
+	t.Setenv("HERD_ROOT", root)
+	wm := worktree.NewWorktreePool(root, t.TempDir())
 	e := NewEngine(&config.Config{TaskProvider: config.TaskProvider{ProjectID: "p1"}}, &timeoutProvider{failAfter: 1 << 30}, nil, nil, wm, nil)
 
 	cs, err := e.StartControlPlane(context.Background(), "127.0.0.1:0", func(msg string) { t.Log(msg) })
@@ -219,8 +226,11 @@ func TestForgeLoop_ConfiguredControlPlaneFailsClosed(t *testing.T) {
 	}
 	defer ln.Close()
 
+	root := t.TempDir()
+	t.Setenv(server.EnvControlToken, "test-capability")
+	t.Setenv("HERD_ROOT", root)
 	tp := &timeoutProvider{failAfter: 1 << 30, tasks: []*provider.Task{}}
-	wm := worktree.NewWorktreePool(t.TempDir(), t.TempDir())
+	wm := worktree.NewWorktreePool(root, t.TempDir())
 	e := NewEngine(&config.Config{TaskProvider: config.TaskProvider{ProjectID: "p1"}}, tp, nil, nil, wm, nil)
 	logs := []string{}
 	d := &recordingDriver{

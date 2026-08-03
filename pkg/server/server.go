@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -52,6 +53,13 @@ type ControlServer struct {
 	GC *gc.GCManager
 	// DefaultBranch for reclamation classification (default "main").
 	DefaultBranch string
+	// ControlToken is the mandatory mutation capability (falls back to
+	// HERD_CONTROL_TOKEN). It is bound to the control session when routes
+	// are built; later env changes never affect a running server. This is
+	// also the seam for the FAC-133 authenticated control identity — do
+	// not grow bespoke identity logic here.
+	ControlToken string
+	sessionToken string
 }
 
 func NewControlServer(addr string) *ControlServer {
@@ -67,6 +75,14 @@ func NewControlServer(addr string) *ControlServer {
 // worktree manager. The daemon forge loop starts this when a control
 // address is configured.
 func NewProductionControlServer(addr, repoRoot, worktreeDir, defaultBranch string) *ControlServer {
+	// Canonicalize volume paths (symlink aliases like /var vs /private/var
+	// must not split one volume into two apparent identities).
+	if resolved, err := filepath.EvalSymlinks(repoRoot); err == nil {
+		repoRoot = resolved
+	}
+	if resolved, err := filepath.EvalSymlinks(worktreeDir); err == nil {
+		worktreeDir = resolved
+	}
 	s := NewControlServer(addr)
 	s.Metrics = metrics.NewMetricsExporter()
 	s.DiskVolumes = map[string]string{
@@ -82,6 +98,16 @@ func NewProductionControlServer(addr, repoRoot, worktreeDir, defaultBranch strin
 // routes builds the mux; extracted so tests can exercise handlers without
 // binding a listener.
 func (s *ControlServer) routes() *http.ServeMux {
+	// Bind the mutation capability to this control session exactly once.
+	s.mu.Lock()
+	if s.sessionToken == "" {
+		s.sessionToken = s.ControlToken
+		if s.sessionToken == "" {
+			s.sessionToken = os.Getenv(EnvControlToken)
+		}
+	}
+	s.mu.Unlock()
+
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/v1/status", s.handleStatus)
@@ -98,6 +124,18 @@ func (s *ControlServer) routes() *http.ServeMux {
 
 func (s *ControlServer) Start(ctx context.Context) error {
 	mux := s.routes()
+
+	// A mounted mutation surface without a nonempty control capability is
+	// refused at startup: default-unconfigured loopback must never be
+	// destructive authority (FAC-153).
+	if s.GC != nil {
+		s.mu.Lock()
+		tok := s.sessionToken
+		s.mu.Unlock()
+		if tok == "" {
+			return fmt.Errorf("control capability required: set ControlToken or %s before starting a server with mutation endpoints", EnvControlToken)
+		}
+	}
 
 	srv := &http.Server{
 		Addr:    s.Addr,
@@ -269,16 +307,23 @@ func isLoopback(remoteAddr string) bool {
 // compared). A server wired to a non-loopback address therefore still
 // refuses remote reclamation.
 func (s *ControlServer) authorizeMutation(w http.ResponseWriter, r *http.Request) bool {
+	s.mu.Lock()
+	tok := s.sessionToken
+	s.mu.Unlock()
+	// Capability is MANDATORY on every mutation: no bound capability means
+	// no mutation authority at all — never default-open.
+	if tok == "" {
+		http.Error(w, "control capability not bound; mutation refused", http.StatusForbidden)
+		return false
+	}
 	if !isLoopback(r.RemoteAddr) {
 		http.Error(w, "mutation endpoints are loopback-only", http.StatusForbidden)
 		return false
 	}
-	if tok := os.Getenv(EnvControlToken); tok != "" {
-		got := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
-		if subtle.ConstantTimeCompare([]byte(got), []byte(tok)) != 1 {
-			http.Error(w, "missing or invalid control token", http.StatusUnauthorized)
-			return false
-		}
+	got := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+	if subtle.ConstantTimeCompare([]byte(got), []byte(tok)) != 1 {
+		http.Error(w, "missing or invalid control token", http.StatusUnauthorized)
+		return false
 	}
 	return true
 }

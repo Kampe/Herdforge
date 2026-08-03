@@ -72,7 +72,14 @@ func (e *Engine) StartControlPlane(ctx context.Context, addr string, logf func(s
 	if e.Config != nil {
 		defaultBranch = e.Config.Project.DefaultBranch
 	}
-	cs := server.NewProductionControlServer(addr, e.Worktree.RepoRoot, e.Worktree.WorktreeDir, defaultBranch)
+	// FAC-152 canonical volume resolution: never trust the raw configured
+	// path — resolve the true repository root (HERD_ROOT override honored)
+	// and fail closed if it cannot be established.
+	canonicalRoot, err := worktree.ResolveCanonicalRoot(ctx, e.Worktree.RepoRoot, os.Getenv("HERD_ROOT"))
+	if err != nil {
+		return nil, fmt.Errorf("canonical volume resolution failed (failing closed): %w", err)
+	}
+	cs := server.NewProductionControlServer(addr, canonicalRoot, e.Worktree.WorktreeDir, defaultBranch)
 	if logf != nil {
 		cs.OnServeError = func(err error) { logf("control server failed: " + err.Error()) }
 	}

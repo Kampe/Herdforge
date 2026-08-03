@@ -61,6 +61,7 @@ func diskFixture(t *testing.T) (repo, cleanWT, dirtyWT string) {
 
 func newDiskServer(repo string) *ControlServer {
 	s := NewControlServer("127.0.0.1:0")
+	s.ControlToken = "test-capability"
 	s.Metrics = metrics.NewMetricsExporter()
 	s.DiskVolumes = map[string]string{"repo": repo}
 	s.GC = gc.NewGCManager(repo, worktree.NewWorktreePool(repo, filepath.Join(repo, "wts")))
@@ -127,49 +128,70 @@ func TestReclamationPlanEndpointIsReadOnly(t *testing.T) {
 }
 
 
-// reclaimReq builds a loopback-local POST /v1/disk/reclaim request.
+// reclaimReq builds a loopback-local, capability-bearing POST
+// /v1/disk/reclaim request.
 func reclaimReq(body string) *http.Request {
 	req := httptest.NewRequest("POST", "/v1/disk/reclaim", strings.NewReader(body))
 	req.RemoteAddr = "127.0.0.1:9999"
+	req.Header.Set("Authorization", "Bearer test-capability")
 	return req
 }
 
 func TestReclaimEndpointAuthorization(t *testing.T) {
-	repo, _, dirtyWT := diskFixture(t)
-	_ = dirtyWT
+	repo, _, _ := diskFixture(t)
 	s := newDiskServer(repo)
 
-	// Non-loopback caller: refused outright even for eligible targets.
+	// Non-loopback caller: refused outright even with the capability.
 	rec := httptest.NewRecorder()
-	remote := httptest.NewRequest("POST", "/v1/disk/reclaim", strings.NewReader(`{"targets":["x"]}`))
+	remote := reclaimReq(`{"targets":["x"]}`)
 	remote.RemoteAddr = "192.0.2.10:4444"
 	s.routes().ServeHTTP(rec, remote)
 	if rec.Code != 403 {
 		t.Fatalf("non-loopback reclaim must 403, got %d: %s", rec.Code, rec.Body.String())
 	}
 
-	// Token configured: loopback alone is no longer sufficient.
-	t.Setenv(EnvControlToken, "sekrit")
+	// The capability is MANDATORY: loopback without a token is 401.
 	rec = httptest.NewRecorder()
-	s.routes().ServeHTTP(rec, reclaimReq(`{"targets":["x"]}`))
+	missing := reclaimReq(`{"targets":["x"]}`)
+	missing.Header.Del("Authorization")
+	s.routes().ServeHTTP(rec, missing)
 	if rec.Code != 401 {
-		t.Fatalf("missing token must 401, got %d: %s", rec.Code, rec.Body.String())
+		t.Fatalf("missing capability must 401, got %d: %s", rec.Code, rec.Body.String())
 	}
 	rec = httptest.NewRecorder()
 	bad := reclaimReq(`{"targets":["x"]}`)
 	bad.Header.Set("Authorization", "Bearer wrong")
 	s.routes().ServeHTTP(rec, bad)
 	if rec.Code != 401 {
-		t.Fatalf("wrong token must 401, got %d: %s", rec.Code, rec.Body.String())
+		t.Fatalf("wrong capability must 401, got %d: %s", rec.Code, rec.Body.String())
 	}
-	// Correct token + loopback proceeds to target validation (400: bogus target
-	// set is still refused by the exact-target contract, not by auth).
+	// Correct capability + loopback proceeds to target validation (400:
+	// empty target set refused by the exact-target contract, not by auth).
 	rec = httptest.NewRecorder()
-	good := reclaimReq(`{"targets":[]}`)
-	good.Header.Set("Authorization", "Bearer sekrit")
-	s.routes().ServeHTTP(rec, good)
+	s.routes().ServeHTTP(rec, reclaimReq(`{"targets":[]}`))
 	if rec.Code != 400 {
 		t.Fatalf("authorized empty-target reclaim must 400, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestControlServerRequiresCapabilityAtStartup(t *testing.T) {
+	// Unconfigured capability + mounted mutation surface: Start refuses,
+	// and even direct handler calls refuse mutations (never default-open).
+	repo, _, _ := diskFixture(t)
+	s := newDiskServer(repo)
+	s.ControlToken = "" // and no HERD_CONTROL_TOKEN in env
+	t.Setenv(EnvControlToken, "")
+
+	if err := s.Start(context.Background()); err == nil {
+		_ = s.Stop(context.Background())
+		t.Fatal("Start must refuse a mutation surface without a control capability")
+	}
+	rec := httptest.NewRecorder()
+	req := reclaimReq(`{"targets":["x"]}`)
+	req.Header.Del("Authorization")
+	s.routes().ServeHTTP(rec, req)
+	if rec.Code != 403 {
+		t.Fatalf("unbound capability must refuse mutations with 403, got %d: %s", rec.Code, rec.Body.String())
 	}
 }
 
@@ -220,6 +242,7 @@ func TestProductionControlServerEndToEnd(t *testing.T) {
 	t.Setenv(preflight.EnvDiskMinInodePct, "0")
 
 	repo, _, dirtyWT := diskFixture(t)
+	t.Setenv(EnvControlToken, "prod-capability")
 	s := NewProductionControlServer("127.0.0.1:0", repo, filepath.Join(repo, "wts"), "main")
 	if err := s.Start(context.Background()); err != nil {
 		t.Fatalf("Start: %v", err)
@@ -245,10 +268,12 @@ func TestProductionControlServerEndToEnd(t *testing.T) {
 		}
 	}
 
-	// Authorized (real loopback) reclaim of a dirty target: FAC-117 JIT
-	// refusal over the wire, tree preserved.
-	resp, err = http.Post(base+"/v1/disk/reclaim", "application/json",
-		strings.NewReader(`{"targets":["`+dirtyWT+`"]}`))
+	// Authorized (real loopback + capability) reclaim of a dirty target:
+	// FAC-117 JIT refusal over the wire, tree preserved.
+	reclaim, _ := http.NewRequest("POST", base+"/v1/disk/reclaim", strings.NewReader(`{"targets":["`+dirtyWT+`"]}`))
+	reclaim.Header.Set("Content-Type", "application/json")
+	reclaim.Header.Set("Authorization", "Bearer prod-capability")
+	resp, err = http.DefaultClient.Do(reclaim)
 	if err != nil {
 		t.Fatalf("POST reclaim: %v", err)
 	}
