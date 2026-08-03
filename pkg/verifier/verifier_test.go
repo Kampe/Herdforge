@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -14,6 +15,20 @@ import (
 	"testing"
 	"time"
 )
+
+// verifierStressSlots lets independent worktrees and marker inodes exercise
+// cross-run isolation concurrently without allowing unbounded process-table
+// contention under -count. Tests that replace package-level mutation seams or
+// process-wide environment do not call t.Parallel and therefore finish before
+// these tests are released.
+var verifierStressSlots = make(chan struct{}, 2)
+
+func parallelVerifierStress(t *testing.T) {
+	t.Helper()
+	t.Parallel()
+	verifierStressSlots <- struct{}{}
+	t.Cleanup(func() { <-verifierStressSlots })
+}
 
 func TestDetectLanguage(t *testing.T) {
 	tests := []struct {
@@ -43,6 +58,7 @@ func TestExecute_EmptyCommandFailsClosed(t *testing.T) {
 }
 
 func TestExecute_QuotedArgumentsRemainOneArg(t *testing.T) {
+	parallelVerifierStress(t)
 	dir := t.TempDir()
 	script := filepath.Join(dir, "assert-argv")
 	writeExecutable(t, script, `#!/bin/sh
@@ -62,6 +78,7 @@ func TestExecute_QuotedArgumentsRemainOneArg(t *testing.T) {
 }
 
 func TestVerifyCandidateReceiptBindsExactSHAAndDigest(t *testing.T) {
+	parallelVerifierStress(t)
 	dir, candidate := verificationRepo(t)
 	v := NewVerifierArgs([]string{"./check.sh"})
 	req := VerificationRequest{
@@ -129,6 +146,7 @@ func TestReceiptDigestCoversEveryReceiptField(t *testing.T) {
 }
 
 func TestVerifyAndPersistAdmissionRequiresCurrentPassingDigest(t *testing.T) {
+	parallelVerifierStress(t)
 	dir, candidate := verificationRepo(t)
 	store, err := NewFileReceiptStore(t.TempDir())
 	if err != nil {
@@ -187,6 +205,7 @@ func TestVerifyCandidateDirtyCheckoutIsBlocked(t *testing.T) {
 }
 
 func TestVerifyCandidateCommandFailureIsFAIL(t *testing.T) {
+	parallelVerifierStress(t)
 	dir, candidate := verificationRepo(t)
 	receipt, err := NewVerifierArgs([]string{"./always-fail.sh"}).VerifyCandidate(context.Background(), dir, VerificationRequest{CandidateSHA: candidate, EnvironmentPolicy: EnvironmentPolicyInherited})
 	if err != nil {
@@ -198,6 +217,7 @@ func TestVerifyCandidateCommandFailureIsFAIL(t *testing.T) {
 }
 
 func TestVerifyCandidatePostRunDirtyIsBlocked(t *testing.T) {
+	parallelVerifierStress(t)
 	dir, candidate := verificationRepo(t)
 	receipt, err := NewVerifierArgs([]string{"./dirty-check.sh"}).VerifyCandidate(context.Background(), dir, VerificationRequest{
 		CandidateSHA:      candidate,
@@ -263,6 +283,7 @@ func TestHermeticPolicyResolvesBinaryFromPolicyPath(t *testing.T) {
 }
 
 func TestHermeticEnvironmentFindsGoToolchain(t *testing.T) {
+	parallelVerifierStress(t)
 	dir, candidate := verificationRepo(t)
 	receipt, err := NewVerifierArgs([]string{"go", "version"}).VerifyCandidate(context.Background(), dir, VerificationRequest{
 		CandidateSHA:      candidate,
@@ -274,6 +295,7 @@ func TestHermeticEnvironmentFindsGoToolchain(t *testing.T) {
 }
 
 func TestExecuteBoundsRetainedOutput(t *testing.T) {
+	parallelVerifierStress(t)
 	dir := t.TempDir()
 	script := filepath.Join(dir, "emit-output")
 	writeExecutable(t, script, "#!/bin/sh\nhead -c 2000000 /dev/zero\n")
@@ -312,6 +334,7 @@ func TestReceiptUsesFullOutputDigestWithBoundedRetention(t *testing.T) {
 }
 
 func TestMutationPathGuardsRejectEscapesAndMetadataWithoutOutsideWrites(t *testing.T) {
+	parallelVerifierStress(t)
 	dir, _ := verificationRepo(t)
 	outsideDir := t.TempDir()
 	outsideFile := filepath.Join(outsideDir, "outside.txt")
@@ -338,6 +361,7 @@ func TestMutationPathGuardsRejectEscapesAndMetadataWithoutOutsideWrites(t *testi
 	git(t, dir, "add", "tracked-link", "git-parent", "outside-parent")
 	git(t, dir, "commit", "-q", "-m", "add mutation guard links")
 	candidate := gitOutput(t, dir, "rev-parse", "HEAD")
+	before := snapshotWorktree(t, dir)
 
 	tests := []struct {
 		name     string
@@ -368,9 +392,10 @@ func TestMutationPathGuardsRejectEscapesAndMetadataWithoutOutsideWrites(t *testi
 			assertFile(t, outsideFile, "outside\n")
 			assertFile(t, outsideVictim, "outside-parent\n")
 			assertFile(t, gitMetadataProbe, "metadata\n")
-			assertClean(t, dir)
+			assertWorktreeSnapshot(t, dir, before)
 		})
 	}
+	assertClean(t, dir)
 }
 
 func TestVerifierNilReceiverFailsClosed(t *testing.T) {
@@ -384,6 +409,7 @@ func TestVerifierNilReceiverFailsClosed(t *testing.T) {
 }
 
 func TestRunMutationCheck_RealMutantIsKilledAndRestored(t *testing.T) {
+	parallelVerifierStress(t)
 	dir, candidate := mutationRepo(t, false)
 	v := NewVerifierArgs([]string{"./check.sh"})
 	result, err := v.RunMutationCheckForCandidate(context.Background(), dir, MutationRequest{
@@ -409,6 +435,7 @@ func TestRunMutationCheck_RealMutantIsKilledAndRestored(t *testing.T) {
 }
 
 func TestRunMutationCheck_BaselineFailureIsNotKilled(t *testing.T) {
+	parallelVerifierStress(t)
 	dir, candidate := verificationRepo(t)
 	result, err := NewVerifierArgs([]string{"./always-fail.sh"}).RunMutationCheckForCandidate(context.Background(), dir, MutationRequest{
 		CandidateSHA:      candidate,
@@ -429,6 +456,7 @@ func TestRunMutationCheck_BaselineFailureIsNotKilled(t *testing.T) {
 }
 
 func TestRunMutationCheck_MismatchedOriginalIsBlocked(t *testing.T) {
+	parallelVerifierStress(t)
 	dir, candidate := verificationRepo(t)
 	result, err := NewVerifierArgs([]string{"true"}).RunMutationCheckForCandidate(context.Background(), dir, MutationRequest{
 		CandidateSHA:      candidate,
@@ -449,6 +477,7 @@ func TestRunMutationCheck_MismatchedOriginalIsBlocked(t *testing.T) {
 }
 
 func TestExecuteCancellationKillsProcessGroup(t *testing.T) {
+	parallelVerifierStress(t)
 	// Deterministic ownership barrier:
 	//  1. Start Execute asynchronously (context cancel is explicit, not timed).
 	//  2. Wait for child-ready signal (pid file written by the descendant).
@@ -510,6 +539,7 @@ func TestExecuteCancellationKillsProcessGroup(t *testing.T) {
 // test cannot prove a descendant existed for process-group reap. This is the
 // race×100 failure mode (missing child.pid) when cancel is timer-driven.
 func TestExecuteCancellationWithoutReadyBarrierCannotProveDescendant(t *testing.T) {
+	parallelVerifierStress(t)
 	dir := t.TempDir()
 	pidFile := filepath.Join(t.TempDir(), "child.pid")
 	writeExecutable(t, filepath.Join(dir, "spawn-child"), "#!/bin/sh\n"+
@@ -839,6 +869,7 @@ func forceKillTrackedPID(t *testing.T, pidFile string) {
 // proof: Execute of a command that exits 0 while a same-group writer remains
 // must return BLOCKED (residual owned tree) and the writer must be gone.
 func TestExecuteSuccessWithBackgroundWriterBlocksAndReaps(t *testing.T) {
+	parallelVerifierStress(t)
 	dir := t.TempDir()
 	pidFile := filepath.Join(dir, "writer.pid")
 	writeTarget := filepath.Join(dir, "residue.log")
@@ -911,6 +942,7 @@ func TestExecuteMutationOmittingFinalizeOwnedTreeReturnsTooEarly(t *testing.T) {
 // process is running: Cancel kills the live group, Wait + finalizeOwnedTree
 // prove no residual members before BLOCKED returns.
 func TestExecuteCancelAfterStartClosesProcessGroup(t *testing.T) {
+	parallelVerifierStress(t)
 	dir := t.TempDir()
 	pidFile := filepath.Join(t.TempDir(), "child.pid")
 	writeExecutable(t, filepath.Join(dir, "spawn-child"), "#!/bin/sh\n"+
@@ -991,6 +1023,7 @@ func TestOwnershipMarkerLockTracksLastInheritedHolder(t *testing.T) {
 }
 
 func TestMarkerLineageFindsSetsidChdirAwayWriter(t *testing.T) {
+	parallelVerifierStress(t)
 	if _, err := exec.LookPath("python3"); err != nil {
 		t.Skip("python3 required for marker lineage fixture")
 	}
@@ -1066,8 +1099,9 @@ while True:
 }
 
 // TestUnrelatedPathContactWithoutMarkerIsNotLineage is the negative unit
-// control: an unrelated process that opens a descendant under the candidate
-// after the marker exists must NOT appear in processesHoldingMarker.
+// control: after the parent releases the marker, an unrelated process that
+// opens a descendant must not hold the marker fixed point closed. Production
+// therefore returns before enumeration or any identity-signal path.
 func TestUnrelatedPathContactWithoutMarkerIsNotLineage(t *testing.T) {
 	if _, err := exec.LookPath("python3"); err != nil {
 		t.Skip("python3 required")
@@ -1077,43 +1111,43 @@ func TestUnrelatedPathContactWithoutMarkerIsNotLineage(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
-		_ = marker.Close()
-		_ = os.Remove(markerPath)
+		if marker != nil {
+			_ = marker.Close()
+		}
+		_ = removeMarkerPath(markerPath)
 	})
+	if err := marker.Close(); err != nil {
+		t.Fatalf("release parent marker: %v", err)
+	}
+	marker = nil
 	dir := t.TempDir()
 	pidFile := filepath.Join(dir, "unrelated.pid")
 	target := filepath.Join(dir, "descendant.log")
 	// Unrelated: opens descendant, no marker FD inherited.
 	cmd := exec.Command("python3", "-c", `
-import os, sys, time
+import os, signal, sys
 path, target = sys.argv[1], sys.argv[2]
 out = open(target, "a", encoding="utf-8")
 with open(path, "w", encoding="utf-8") as f:
     f.write("%d\n" % os.getpid())
-while True:
-    out.write("u")
-    out.flush()
-    time.sleep(0.05)
+out.write("u")
+out.flush()
+signal.pause()
 `, pidFile, target)
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() {
-		_ = cmd.Process.Kill()
-		_ = cmd.Wait()
-	})
+	t.Cleanup(func() { terminateTestProcess(t, cmd) })
 	pid, err := waitForChildReadyPID(pidFile, 5*time.Second)
 	if err != nil {
 		t.Fatalf("unrelated ready: %v", err)
 	}
-	toks, err := processesHoldingMarker(markerPath)
+	drained, err := markerLineageDrained(markerPath)
 	if err != nil {
-		t.Fatalf("processesHoldingMarker: %v", err)
+		t.Fatalf("marker fixed point: %v", err)
 	}
-	for _, tok := range toks {
-		if tok.pid == pid {
-			t.Fatalf("unrelated path-contact pid %d must not appear in marker lineage", pid)
-		}
+	if !drained {
+		t.Fatalf("unrelated path-contact pid %d held marker fixed point closed", pid)
 	}
 }
 
@@ -1140,6 +1174,7 @@ func TestResidualExcludePIDsCoversSelfAndParent(t *testing.T) {
 // setsid. Execute must BLOCKED via marker lineage and the writer must be gone
 // without test teardown.
 func TestExecuteDetachedOnlySessionWriterBlocksAndReaps(t *testing.T) {
+	parallelVerifierStress(t)
 	if _, err := exec.LookPath("python3"); err != nil {
 		t.Skip("python3 required for setsid residual writer fixture")
 	}
@@ -1168,6 +1203,7 @@ func TestExecuteDetachedOnlySessionWriterBlocksAndReaps(t *testing.T) {
 // opens a descendant under the candidate (no inherited marker) must SURVIVE,
 // while the marked setsid detached writer is reaped.
 func TestExecuteUnrelatedPathContactSurvivesMarkedWriterReaped(t *testing.T) {
+	parallelVerifierStress(t)
 	if _, err := exec.LookPath("python3"); err != nil {
 		t.Skip("python3 required for setsid residual writer fixture")
 	}
@@ -1290,6 +1326,7 @@ func TestExecuteDetachedOnlyMutationRemovingMarkerDrainLeavesWriter(t *testing.T
 // TestExecuteDetachedSessionAndBackgroundWriters covers real setsid + same-group
 // residual; production must BLOCKED and both writers gone via owned tree close.
 func TestExecuteDetachedSessionAndBackgroundWriters(t *testing.T) {
+	parallelVerifierStress(t)
 	if _, err := exec.LookPath("python3"); err != nil {
 		t.Skip("python3 required for setsid residual writer fixture")
 	}
@@ -1507,6 +1544,7 @@ func TestIsExpectedKillWaitUsesTypedWaitStatus(t *testing.T) {
 }
 
 func TestRunMutationCheck_VacuousSuiteFailsMutationGate(t *testing.T) {
+	parallelVerifierStress(t)
 	dir, candidate := mutationRepo(t, false)
 	result, err := NewVerifierArgs([]string{"true"}).RunMutationCheckForCandidate(context.Background(), dir, MutationRequest{
 		CandidateSHA:      candidate,
@@ -1526,6 +1564,7 @@ func TestRunMutationCheck_VacuousSuiteFailsMutationGate(t *testing.T) {
 }
 
 func TestRunMutationCheck_TimeoutRestoresCandidate(t *testing.T) {
+	parallelVerifierStress(t)
 	dir, candidate := mutationRepo(t, true)
 	v := NewVerifierArgs([]string{"./check.sh"})
 	started := time.Now()
@@ -1558,6 +1597,7 @@ func TestRunMutationCheck_TimeoutRestoresCandidate(t *testing.T) {
 }
 
 func TestRunMutationCheck_CancellationRestoresCandidate(t *testing.T) {
+	parallelVerifierStress(t)
 	dir, candidate := mutationRepo(t, true)
 	ctx, cancel := context.WithCancel(context.Background())
 	// Cancel after mutant bytes are on disk so Restored evidence is real.
@@ -1593,6 +1633,7 @@ func TestRunMutationCheck_CancellationRestoresCandidate(t *testing.T) {
 }
 
 func TestRunMutationCheck_RestoredCandidateFailureIsBlocked(t *testing.T) {
+	parallelVerifierStress(t)
 	dir, candidate, counter := restorationFailureRepo(t)
 	result, err := NewVerifierArgs([]string{"./check.sh", counter}).RunMutationCheckForCandidate(context.Background(), dir, MutationRequest{
 		CandidateSHA:      candidate,
@@ -1656,6 +1697,59 @@ func assertClean(t *testing.T, dir string) {
 	t.Helper()
 	if output := gitOutput(t, dir, "status", "--porcelain", "--untracked-files=all"); output != "" {
 		t.Fatalf("candidate is not clean after mutation: %q", output)
+	}
+}
+
+func snapshotWorktree(t *testing.T, root string) map[string]string {
+	t.Helper()
+	got := make(map[string]string)
+	err := filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		rel, err := filepath.Rel(root, path)
+		if err != nil {
+			return err
+		}
+		if rel == ".git" && entry.IsDir() {
+			return filepath.SkipDir
+		}
+		if rel == "." {
+			return nil
+		}
+		info, err := os.Lstat(path)
+		if err != nil {
+			return err
+		}
+		value := info.Mode().String()
+		switch {
+		case info.Mode()&os.ModeSymlink != 0:
+			target, err := os.Readlink(path)
+			if err != nil {
+				return err
+			}
+			value += "|link=" + target
+		case info.Mode().IsRegular():
+			contents, err := os.ReadFile(path)
+			if err != nil {
+				return err
+			}
+			value += "|digest=" + digestBytes(contents)
+		}
+		got[rel] = value
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("snapshot worktree: %v", err)
+	}
+	return got
+}
+
+func assertWorktreeSnapshot(t *testing.T, root string, want map[string]string) {
+	t.Helper()
+	got := snapshotWorktree(t, root)
+	if !maps.Equal(got, want) {
+		t.Fatalf("worktree changed after rejected mutation: got=%v want=%v", got, want)
 	}
 }
 

@@ -1,14 +1,16 @@
-//go:build darwin
+//go:build darwin && !cgo
 
 package verifier
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -92,7 +94,11 @@ func processesHoldingMarkerUntil(markerPath string, deadline time.Time) ([]procT
 			}
 			tok, terr := tokenOf(curPID)
 			if terr != nil {
-				if isESRCH(terr) {
+				// lsof and token lookup are separate observations. Darwin returns
+				// EIO when a listed process exits before kern.proc.pid; that
+				// incarnation has already closed every FD. The held marker lock
+				// keeps the caller in its fixed-point loop to rescan survivors.
+				if isESRCH(terr) || errors.Is(terr, syscall.EIO) {
 					continue
 				}
 				return nil, fmt.Errorf("processesHoldingMarker token %d: %w", curPID, terr)

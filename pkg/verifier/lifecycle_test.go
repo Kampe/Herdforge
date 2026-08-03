@@ -639,6 +639,7 @@ func runMutationPathGuardMatrix(t *testing.T) {
 	git(t, dir, "add", "tracked-link", "git-parent", "outside-parent")
 	git(t, dir, "commit", "-q", "-m", "add mutation guard links")
 	candidate := gitOutput(t, dir, "rev-parse", "HEAD")
+	before := snapshotWorktree(t, dir)
 
 	cases := []struct {
 		target   string
@@ -667,6 +668,7 @@ func runMutationPathGuardMatrix(t *testing.T) {
 		assertFile(t, outsideFile, "outside\n")
 		assertFile(t, outsideVictim, "outside-parent\n")
 		assertFile(t, gitMetadataProbe, "metadata\n")
-		assertClean(t, dir)
+		assertWorktreeSnapshot(t, dir, before)
 	}
+	assertClean(t, dir)
 }
