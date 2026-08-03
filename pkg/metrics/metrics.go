@@ -51,14 +51,16 @@ type QueuePressure struct {
 }
 
 type TransitionSLO struct {
-	Attempts     uint64        `json:"attempts"`
-	Completed    uint64        `json:"completed"`
-	Failed       uint64        `json:"failed"`
-	TotalLatency time.Duration `json:"total_latency"`
-	ObservedAt   time.Time     `json:"observed_at"`
-	Sequence     uint64        `json:"sequence,omitempty"`
-	LastLatency  time.Duration `json:"last_latency,omitempty"`
-	LastFailed   bool          `json:"last_failed,omitempty"`
+	Attempts      uint64        `json:"attempts"`
+	Completed     uint64        `json:"completed"`
+	Failed        uint64        `json:"failed"`
+	TotalLatency  time.Duration `json:"total_latency"`
+	ObservedAt    time.Time     `json:"observed_at"`
+	Sequence      uint64        `json:"sequence,omitempty"`
+	LastLatency   time.Duration `json:"last_latency,omitempty"`
+	LastFailed    bool          `json:"last_failed,omitempty"`
+	Invalid       bool          `json:"invalid,omitempty"`
+	InvalidReason string        `json:"invalid_reason,omitempty"`
 }
 
 type ConditionCode string
@@ -581,14 +583,19 @@ func (m *MetricsExporter) RecordTransition(start, end time.Time, transitionErr e
 }
 
 func (m *MetricsExporter) RecordTransitionObservation(start, end time.Time, transitionErr error, now time.Time, sequence uint64) error {
-	if end.Before(start) || end.Sub(start) > maxSignalAge {
-		return errors.New("transition latency is invalid or unbounded")
-	}
-	m.mu.Lock()
 	latency := end.Sub(start)
 	failed := transitionErr != nil
-	candidate := TransitionSLO{ObservedAt: now, Sequence: sequence, LastLatency: latency, LastFailed: failed}
-	decision := decideObservation(sequence, now, m.slo.Sequence, m.slo.ObservedAt, m.slo.LastLatency == candidate.LastLatency && m.slo.LastFailed == candidate.LastFailed)
+	invalidReason := ""
+	if end.Before(start) || latency > maxSignalAge {
+		invalidReason = "latency"
+	}
+	m.mu.Lock()
+	candidateLatency := latency
+	if invalidReason != "" {
+		candidateLatency = 0
+	}
+	candidate := TransitionSLO{ObservedAt: now, Sequence: sequence, LastLatency: candidateLatency, LastFailed: failed, Invalid: invalidReason != "", InvalidReason: invalidReason}
+	decision := decideObservation(sequence, now, m.slo.Sequence, m.slo.ObservedAt, m.slo.LastLatency == candidate.LastLatency && m.slo.LastFailed == candidate.LastFailed && m.slo.Invalid == candidate.Invalid && m.slo.InvalidReason == candidate.InvalidReason)
 	if decision == observationStale {
 		m.mu.Unlock()
 		return errors.New("stale transition observation")
@@ -601,14 +608,20 @@ func (m *MetricsExporter) RecordTransitionObservation(start, end time.Time, tran
 		m.mu.Unlock()
 		return errors.New("conflicting transition observation")
 	}
+	if invalidReason != "" {
+		m.slo = TransitionSLO{ObservedAt: now, Sequence: sequence, Invalid: true, InvalidReason: invalidReason}
+		m.mu.Unlock()
+		return errors.New("transition latency is invalid or unbounded")
+	}
+	if !failed && m.slo.TotalLatency > maxSignalAge-latency {
+		m.slo = TransitionSLO{ObservedAt: now, Sequence: sequence, Invalid: true, InvalidReason: "aggregate_overflow"}
+		m.mu.Unlock()
+		return errors.New("transition latency total exceeds bounded maximum")
+	}
 	m.slo.Attempts++
 	if transitionErr != nil {
 		m.slo.Failed++
 	} else if !end.Before(start) {
-		if m.slo.TotalLatency > maxSignalAge-latency {
-			m.mu.Unlock()
-			return errors.New("transition latency total exceeds bounded maximum")
-		}
 		m.slo.Completed++
 		m.slo.TotalLatency += latency
 	} else {
@@ -642,7 +655,7 @@ func (m *MetricsExporter) ReadAt(now time.Time) SnapshotView {
 	if signalsFresh {
 		signals = deriveSignalsAt(signals, now)
 	}
-	sloFresh := slo.Attempts == 0 || freshAt(slo.ObservedAt, now, m.thresholds.SLOMaxAge)
+	sloFresh := !slo.Invalid && (slo.Attempts == 0 || freshAt(slo.ObservedAt, now, m.thresholds.SLOMaxAge))
 	freshness := FreshnessState{
 		HealthFresh: healthFresh, HealthReady: healthFresh && health.Readiness,
 		QueueFresh: queueFresh, SignalsFresh: signalsFresh, SLOFresh: sloFresh, AsOf: now,
@@ -740,14 +753,20 @@ func (m *MetricsExporter) validateStateLocked(state persistedState, now time.Tim
 	if state.Signals.DeadProvider && dependencyState(state.Health, "provider") == DependencyHealthy {
 		return errors.New("metrics state contradicts provider health")
 	}
-	if state.SLO.Completed > state.SLO.Attempts || state.SLO.Failed > state.SLO.Attempts || state.SLO.Completed+state.SLO.Failed != state.SLO.Attempts {
-		return errors.New("invalid metrics transition totals")
-	}
-	if state.SLO.TotalLatency < 0 || state.SLO.Completed == 0 && state.SLO.TotalLatency != 0 || state.SLO.TotalLatency > maxSignalAge {
-		return errors.New("invalid metrics transition latency")
-	}
-	if state.SLO.Attempts > 0 && !freshAt(state.SLO.ObservedAt, now, m.thresholds.SLOMaxAge) {
-		return errors.New("invalid metrics transition timestamp")
+	if state.SLO.Invalid {
+		if state.SLO.Attempts != 0 || state.SLO.Completed != 0 || state.SLO.Failed != 0 || state.SLO.TotalLatency != 0 || (state.SLO.InvalidReason != "latency" && state.SLO.InvalidReason != "aggregate_overflow") || !freshAt(state.SLO.ObservedAt, now, m.thresholds.SLOMaxAge) {
+			return errors.New("invalid metrics transition tombstone")
+		}
+	} else {
+		if state.SLO.Attempts == 0 && !state.SLO.ObservedAt.IsZero() || state.SLO.Completed > state.SLO.Attempts || state.SLO.Failed > state.SLO.Attempts || state.SLO.Completed+state.SLO.Failed != state.SLO.Attempts {
+			return errors.New("invalid metrics transition totals")
+		}
+		if state.SLO.TotalLatency < 0 || state.SLO.Completed == 0 && state.SLO.TotalLatency != 0 || state.SLO.TotalLatency > maxSignalAge {
+			return errors.New("invalid metrics transition latency")
+		}
+		if state.SLO.Attempts > 0 && !freshAt(state.SLO.ObservedAt, now, m.thresholds.SLOMaxAge) {
+			return errors.New("invalid metrics transition timestamp")
+		}
 	}
 	return nil
 }
