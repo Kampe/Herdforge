@@ -325,3 +325,20 @@ func TestDiskGuardAdviseGraduatedShedding(t *testing.T) {
 		t.Fatalf("configured soft floor ignored: %+v", adv)
 	}
 }
+
+func TestDiskGuardAdviseUnreadableRefuses(t *testing.T) {
+	// Unknown capacity is never permission for even one mutation: an
+	// unreadable probe inside Advise refuses and blocks the guard, exactly
+	// like Check — never a softened "serialize".
+	g := NewDiskGuard(fakeProber(nil, map[string]error{"/repo": errors.New("io error")}))
+	adv := g.Advise("verifier_fanout", "/repo")
+	if adv.Verdict != AdviceRefuse {
+		t.Fatalf("unreadable probe must refuse, got: %+v", adv)
+	}
+	if adv.Evidence == nil || adv.Evidence.Reason != ReasonStatUnreadable {
+		t.Fatalf("missing unreadable evidence: %+v", adv)
+	}
+	if !g.Blocked() || g.Status() != "BLOCKED(disk_stat_unreadable)" {
+		t.Fatalf("guard not blocked after unreadable Advise: %s", g.Status())
+	}
+}

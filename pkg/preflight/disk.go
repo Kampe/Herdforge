@@ -242,18 +242,22 @@ func (g *DiskGuard) probeAll(operation string, th DiskThresholds, paths []string
 // pressure, recovery-in-progress, or an unreadable stat.
 func (g *DiskGuard) Check(operation string, paths ...string) error {
 	th := loadDiskThresholds()
-
 	stats, unreadable := g.probeAll(operation, th, paths)
-	if unreadable != nil {
-		g.mu.Lock()
-		g.state = DiskBlocked
-		g.lastEvidence = unreadable
-		g.mu.Unlock()
-		return unreadable
-	}
+	return g.evaluate(operation, th, stats, unreadable)
+}
 
+// evaluate drives the state machine from one probe result. Both Check and
+// Advise route through here, so an unreadable probe ALWAYS blocks — unknown
+// capacity is never permission for even one mutation.
+func (g *DiskGuard) evaluate(operation string, th DiskThresholds, stats []DiskStat, unreadable *DiskPressureError) error {
 	g.mu.Lock()
 	defer g.mu.Unlock()
+
+	if unreadable != nil {
+		g.state = DiskBlocked
+		g.lastEvidence = unreadable
+		return unreadable
+	}
 
 	if bad := below(stats, th.blockFreeBytes(), th.MinFreePct, th.MinInodePct); bad != nil {
 		g.state = DiskBlocked
@@ -323,26 +327,24 @@ const (
 // MaxParallel=1. Fan-out call sites (verifier/mutation testing) consume
 // this; single-mutation call sites use Check directly.
 func (g *DiskGuard) Advise(operation string, paths ...string) DiskAdvice {
-	if err := g.Check(operation, paths...); err != nil {
+	th := loadDiskThresholds()
+	// ONE probe feeds both the hard-floor state machine and the soft band:
+	// no second probe exists whose failure could be softened. An unreadable
+	// stat refuses via evaluate exactly like Check.
+	stats, unreadable := g.probeAll(operation, th, paths)
+	if err := g.evaluate(operation, th, stats, unreadable); err != nil {
 		var pe *DiskPressureError
 		errors.As(err, &pe)
 		return DiskAdvice{Verdict: AdviceRefuse, MaxParallel: 0, Evidence: pe,
 			Detail: err.Error()}
 	}
 
-	th := loadDiskThresholds()
 	softBytes := uint64(envFloat(EnvDiskSerializeFreeGB, 0) * bytesPerGiB)
 	if softBytes == 0 {
 		softBytes = 2 * th.blockFreeBytes()
 	}
 	softPct := envFloat(EnvDiskSerializeFreePct, 2*th.MinFreePct)
 
-	// Check passed, so a fresh probe here can only be a transient divergence;
-	// treat a now-unreadable stat conservatively as serialize, not proceed.
-	stats, unreadable := g.probeAll(operation, th, paths)
-	if unreadable != nil {
-		return DiskAdvice{Verdict: AdviceSerialize, MaxParallel: 1, Detail: unreadable.Detail}
-	}
 	if bad := below(stats, softBytes, softPct, 0); bad != nil {
 		return DiskAdvice{
 			Verdict:     AdviceSerialize,
