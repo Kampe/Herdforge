@@ -120,15 +120,26 @@ func (m *ClaimManager) BeginProviderTransition(ctx context.Context, key LeaseKey
 // underlying lease -- the caller still holds it and may retry with a
 // freshly-read revision.
 //
-// ownerID/generation are fenced against the CURRENT active lease TWICE:
-// once on entry, before touching the outbox at all, and again
-// immediately before the ProviderCAS call, after the outbox claim
-// succeeds -- closing the window where the lease was released, expired,
-// or reclaimed to a new generation in between (e.g. by the caller's own
-// Release racing this call, or an expiry sweep). Either check failing
-// returns ErrLeaseNotCurrent and guarantees zero ProviderCAS calls; on
-// the second check, the outbox record is also marked Failed so it does
-// not sit claimed and orphaned.
+// ownerID/generation are checked twice, but the two checks are NOT
+// equivalent and the second is not just "ask again": the first
+// (verifyCurrentLease) is a cheap read-only fast-fail before the outbox
+// is even touched. Two read-only checks cannot close a TOCTOU race --
+// whatever the second check observes can still go stale before
+// CompareAndSwap actually runs. The real fencing boundary is the second
+// check: LeaseStore.AcquireProviderLock, which verifies AND locks the
+// lease against Release/reclaim in a single atomic store operation, so
+// there is no window between "confirmed current" and "locked" for a
+// concurrent Release/reclaim to land in. The lock is held for the
+// duration of the ProviderCAS call and released (successful or not) via
+// a deferred ReleaseProviderLock, so Release/reclaim are blocked --
+// returning ErrProviderTransitionInProgress -- for exactly as long as
+// the provider call is actually in flight, not held preemptively. A
+// crash while the lock is held self-heals: Release/Acquire's reclaim
+// path stop honoring a lock once it's older than the store's fixed
+// staleness window, so a dead settler cannot block a lease forever.
+// Either check failing returns ErrLeaseNotCurrent and guarantees zero
+// ProviderCAS calls; a lock-acquisition failure also marks the outbox
+// record Failed so it does not sit claimed and orphaned.
 func (m *ClaimManager) CompleteProviderTransition(ctx context.Context, key LeaseKey, ownerID string, generation int64, taskID string, expectedRevision ProviderRevision, mutate func(ctx context.Context) error) (*OutboxRecord, error) {
 	if m.provider == nil {
 		return nil, ErrProviderNotConfigured
@@ -151,9 +162,19 @@ func (m *ClaimManager) CompleteProviderTransition(ctx context.Context, key Lease
 		return m.outboxStore.Get(ctx, idempotencyKey)
 	}
 
-	if err := m.verifyCurrentLease(ctx, key, ownerID, generation); err != nil {
+	if _, err := m.store.AcquireProviderLock(ctx, key, ownerID, generation, m.settlerID, m.providerLockTimeout, m.now()); err != nil {
 		_ = m.outboxStore.MarkFailed(ctx, idempotencyKey, m.settlerID, err.Error(), m.now())
-		return nil, err
+		return nil, fmt.Errorf("%w: %w", ErrLeaseNotCurrent, err)
+	}
+	defer func() { _ = m.store.ReleaseProviderLock(ctx, key, generation, m.settlerID) }()
+
+	if completeProviderTransitionTestHook != nil {
+		// Fires with the lock already held, immediately before the
+		// external call -- exactly the window the review's probe
+		// exploited. A test-injected Release/reclaim attempted here must
+		// fail (blocked by the lock), proving mutual exclusion actually
+		// prevents the race rather than merely re-checking after it.
+		completeProviderTransitionTestHook()
 	}
 
 	if _, casErr := m.provider.CompareAndSwap(ctx, taskID, expectedRevision, mutate); casErr != nil {
@@ -165,6 +186,15 @@ func (m *ClaimManager) CompleteProviderTransition(ctx context.Context, key Lease
 	}
 	return m.outboxStore.Get(ctx, idempotencyKey)
 }
+
+// completeProviderTransitionTestHook, when non-nil, runs once per
+// CompleteProviderTransition call, with the provider-transition lock
+// already held, immediately before the ProviderCAS call -- letting a
+// test deterministically attempt a concurrent Release/reclaim in exactly
+// the window the review's probe exploited, and assert that attempt fails
+// (blocked by the lock) rather than merely getting caught by a second
+// read that runs too late. Always nil outside tests.
+var completeProviderTransitionTestHook func()
 
 // ReconcileProviderTransitions scans every non-Applied provider_mutation
 // outbox record and asks verify whether the provider mutation it

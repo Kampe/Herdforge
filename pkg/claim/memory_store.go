@@ -14,10 +14,11 @@ import (
 // NewInMemoryClaimManager, the migration path for callers not (yet)
 // adopting SQLiteLeaseStore's cross-process durability — see compat.go.
 type InMemoryLeaseStore struct {
-	mu     sync.Mutex
-	nextID int64
-	rows   map[int64]*Lease
-	capRel map[int64]*capacityReleaseClaim
+	mu       sync.Mutex
+	nextID   int64
+	rows     map[int64]*Lease
+	capRel   map[int64]*capacityReleaseClaim
+	provLock map[int64]*providerLock
 }
 
 // capacityReleaseClaim mirrors the SQLite store's
@@ -30,9 +31,28 @@ type capacityReleaseClaim struct {
 	claimedAt time.Time
 }
 
+// providerLock mirrors the SQLite store's provider_lock_owner/
+// provider_lock_at columns.
+type providerLock struct {
+	owner    string
+	lockedAt time.Time
+}
+
 // NewInMemoryLeaseStore builds an empty InMemoryLeaseStore.
 func NewInMemoryLeaseStore() *InMemoryLeaseStore {
-	return &InMemoryLeaseStore{rows: make(map[int64]*Lease), capRel: make(map[int64]*capacityReleaseClaim)}
+	return &InMemoryLeaseStore{
+		rows: make(map[int64]*Lease), capRel: make(map[int64]*capacityReleaseClaim), provLock: make(map[int64]*providerLock),
+	}
+}
+
+// providerLockedLocked reports whether id has a live (non-stale as of
+// now) provider-transition lock held by anyone other than lockOwner.
+func (s *InMemoryLeaseStore) providerLockedLocked(id int64, lockOwner string, staleBefore time.Time) bool {
+	pl, ok := s.provLock[id]
+	if !ok || pl.owner == "" || pl.owner == lockOwner {
+		return false
+	}
+	return !pl.lockedAt.Before(staleBefore) // locked by someone else and not stale
 }
 
 func (s *InMemoryLeaseStore) Close() error { return nil }
@@ -84,9 +104,15 @@ func (s *InMemoryLeaseStore) Acquire(_ context.Context, key LeaseKey, ownerID, r
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	staleBefore := now.Add(-providerLockStaleAfter)
 	if existing := s.activeLocked(key); existing != nil {
-		if !existing.Expired(now) {
-			return nil, &ClaimConflictError{Key: key, Lease: cloneLease(existing), Reason: "active and unexpired"}
+		locked := s.providerLockedLocked(existing.ID, "", staleBefore)
+		if !existing.Expired(now) || locked {
+			reason := "active and unexpired"
+			if existing.Expired(now) {
+				reason = "expired but blocked by an in-progress provider transition"
+			}
+			return nil, &ClaimConflictError{Key: key, Lease: cloneLease(existing), Reason: reason}
 		}
 		existing.Status = StatusExpired
 	}
@@ -131,10 +157,48 @@ func (s *InMemoryLeaseStore) Release(_ context.Context, key LeaseKey, ownerID st
 	if target.Status != StatusActive {
 		return nil, false, fmt.Errorf("release: %w: generation %d is %s, not active", ErrStaleGeneration, generation, target.Status)
 	}
+	if s.providerLockedLocked(target.ID, "", now.Add(-providerLockStaleAfter)) {
+		return nil, false, fmt.Errorf("%w: %s generation %d", ErrProviderTransitionInProgress, key.TaskRef, generation)
+	}
 	target.Status = StatusReleased
 	t := now
 	target.ReleasedAt = &t
 	return cloneLease(target), true, nil
+}
+
+// AcquireProviderLock implements LeaseStore. Runs entirely under s.mu, so
+// (matching the SQLite store's single-writer-lock atomicity) the fencing
+// check and the lock acquisition cannot be interleaved by a concurrent
+// Release/Acquire.
+func (s *InMemoryLeaseStore) AcquireProviderLock(_ context.Context, key LeaseKey, ownerID string, generation int64, lockOwner string, staleAfter time.Duration, now time.Time) (*Lease, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	target := s.byGenerationLocked(key, ownerID, generation)
+	if target == nil || target.Status != StatusActive {
+		return nil, s.fencingErrorLocked(key, ownerID, generation)
+	}
+	if s.providerLockedLocked(target.ID, lockOwner, now.Add(-staleAfter)) {
+		return nil, fmt.Errorf("%w: %s generation %d", ErrProviderTransitionInProgress, key.TaskRef, generation)
+	}
+	s.provLock[target.ID] = &providerLock{owner: lockOwner, lockedAt: now}
+	return cloneLease(target), nil
+}
+
+// ReleaseProviderLock implements LeaseStore.
+func (s *InMemoryLeaseStore) ReleaseProviderLock(_ context.Context, key LeaseKey, generation int64, lockOwner string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for id, l := range s.rows {
+		if l.LeaseKey != key || l.Generation != generation {
+			continue
+		}
+		if pl, ok := s.provLock[id]; ok && pl.owner == lockOwner {
+			delete(s.provLock, id)
+		}
+	}
+	return nil
 }
 
 func (s *InMemoryLeaseStore) Hold(_ context.Context, key LeaseKey, ownerID string, generation int64, held bool, now time.Time) (*Lease, error) {

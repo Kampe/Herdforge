@@ -20,6 +20,13 @@ var (
 	// owner of record, but the lease's TTL has already passed; Renew must
 	// reject this rather than silently extending an already-dead lease.
 	ErrLeaseExpired = errors.New("claim: lease already expired")
+	// ErrProviderTransitionInProgress means a Release or a reclaiming
+	// Acquire was blocked by an active (non-stale) provider-transition
+	// lock (see AcquireProviderLock/ReleaseProviderLock) -- the lease is
+	// still genuinely current, just busy with an in-flight provider
+	// mutation. Distinct from ErrStaleGeneration/ErrAlreadyClaimed, which
+	// mean the lease has actually moved on.
+	ErrProviderTransitionInProgress = errors.New("claim: provider transition in progress for this lease")
 )
 
 // LeaseStore is the narrow durable-persistence port ClaimManager depends
@@ -64,9 +71,13 @@ type LeaseStore interface {
 	// Acquire atomically creates a new active lease for key if none is
 	// currently active and unexpired. An active-but-expired lease is
 	// transitioned to Expired as part of winning the acquire (which makes
-	// it eligible for PendingCapacityRelease — see above). Generation is
-	// monotonically increasing per key. On conflict with a live lease,
-	// returns a *ClaimConflictError wrapping ErrAlreadyClaimed.
+	// it eligible for PendingCapacityRelease — see above) UNLESS it is
+	// held by an active, non-stale provider-transition lock (see
+	// AcquireProviderLock), in which case reclaim is blocked until the
+	// lock clears or goes stale, and this returns a *ClaimConflictError
+	// same as an unexpired lease would. Generation is monotonically
+	// increasing per key. On conflict with a live lease, returns a
+	// *ClaimConflictError wrapping ErrAlreadyClaimed.
 	Acquire(ctx context.Context, key LeaseKey, ownerID, role, worktreePath string, now time.Time, ttl time.Duration) (*Lease, error)
 
 	// Renew extends an active lease's expiry, fenced by generation. A
@@ -81,8 +92,32 @@ type LeaseStore interface {
 	// already-released lease at the same generation returns the lease
 	// with transitioned=false and a nil error — callers must not treat
 	// transitioned=false as "capacity was already handled"; consult
-	// PendingCapacityRelease/Lease.CapacityReleasedAt for that.
+	// PendingCapacityRelease/Lease.CapacityReleasedAt for that. Blocked
+	// (returns ErrProviderTransitionInProgress) while an active, non-stale
+	// provider-transition lock is held on the lease -- see
+	// AcquireProviderLock.
 	Release(ctx context.Context, key LeaseKey, ownerID string, generation int64, now time.Time) (lease *Lease, transitioned bool, err error)
+
+	// AcquireProviderLock atomically verifies that (key, ownerID,
+	// generation) is still the current active lease AND locks it against
+	// Release/reclaim in the SAME statement -- the verification and the
+	// lock acquisition are not two separate steps a concurrent
+	// Release/Acquire could interleave between, which is what makes this
+	// different from (and safe where) a second plain read-only check is
+	// not: checking here IS locking. Fails with ErrLeaseNotCurrent-class
+	// errors (via the same fencing/not-found errors Release/Renew/Hold
+	// use) if the lease has moved on, or with
+	// ErrProviderTransitionInProgress if it's still current but another
+	// live (non-stale) lock already holds it. A stale lock (older than
+	// staleAfter, e.g. its holder crashed) is preempted rather than
+	// blocking forever.
+	AcquireProviderLock(ctx context.Context, key LeaseKey, ownerID string, generation int64, lockOwner string, staleAfter time.Duration, now time.Time) (*Lease, error)
+
+	// ReleaseProviderLock clears lockOwner's provider-transition lock,
+	// allowing Release/reclaim to proceed again. Idempotent: a no-op if
+	// lockOwner does not currently hold the lock (e.g. it already went
+	// stale and was preempted).
+	ReleaseProviderLock(ctx context.Context, key LeaseKey, generation int64, lockOwner string) error
 
 	// Hold sets or clears the operator-hold flag on the active lease for
 	// key, fenced by ownerID/generation exactly like Renew/Release: a
