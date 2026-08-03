@@ -141,7 +141,8 @@ func TestBuildTaskPacket(t *testing.T) {
 		Name: "worker", Role: "worker", AgentKind: "opencode",
 		Model: "deepseek-v4-flash", Prompt: ".herd/prompts/worker.md",
 	}
-	packet := buildTaskPacket(task, "/tmp/wt", "herd/fac-33", ".herd/prompts/worker.md", lane)
+	verification := config.Verification{TestCommand: "go test ./...", PreflightCommand: "go build ./..."}
+	packet := buildTaskPacket(task, "/tmp/wt", "herd/fac-33", ".herd/prompts/worker.md", lane, verification)
 	if !strings.Contains(packet, "FAC-33") {
 		t.Error("packet should contain ticket ref")
 	}
@@ -162,8 +163,64 @@ func TestBuildTaskPacket(t *testing.T) {
 	if !strings.Contains(packet, "herd verify") {
 		t.Error("packet must include the self-verify completion contract")
 	}
+	// FAC-134: packet must never carry a hardcoded, repo-specific absolute path.
+	if strings.Contains(packet, "chainseer") || strings.Contains(packet, "~/Personal") {
+		t.Error("packet must not reference a hardcoded repo-specific path")
+	}
 	if lines := strings.Count(packet, "\n"); lines > 25 {
 		t.Errorf("packet must stay tight (<25 lines), got %d", lines)
+	}
+}
+
+// TestBuildTaskPacket_RepositoryAgnosticVerification is non-vacuous: each
+// case's config drives different verify commands into the packet, and each
+// case asserts the *other* profiles' commands are ABSENT. Reintroducing a
+// hardcoded `go build`/`go test` literal (FAC-134 regression) breaks the
+// node and docs-only cases even though the go case would still pass.
+func TestBuildTaskPacket_RepositoryAgnosticVerification(t *testing.T) {
+	task := &provider.Task{Ref: "FAC-1", Title: "Task FAC-1"}
+	lane := &config.LaneDef{Name: "worker", Prompt: ".herd/prompts/worker.md"}
+
+	cases := []struct {
+		name         string
+		verification config.Verification
+		wantContains []string
+		wantAbsent   []string
+	}{
+		{
+			name:         "go profile",
+			verification: config.Verification{TestCommand: "go test ./...", PreflightCommand: "go build ./..."},
+			wantContains: []string{"go test ./...", "go build ./...", `--build "go build ./..."`, `--test "go test ./..."`},
+			wantAbsent:   []string{"npm test", "pytest", "chainseer"},
+		},
+		{
+			name:         "node profile",
+			verification: config.Verification{TestCommand: "npm test", PreflightCommand: "npm run build"},
+			wantContains: []string{"npm test", "npm run build"},
+			wantAbsent:   []string{"go test ./...", "go build ./...", "go vet"},
+		},
+		{
+			name:         "docs-only profile (no preflight command)",
+			verification: config.Verification{TestCommand: "make lint-docs"},
+			wantContains: []string{"make lint-docs", `--test "make lint-docs"`},
+			wantAbsent:   []string{"go build", "go test", "go vet", "--build", "npm"},
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			packet := buildTaskPacket(task, "/tmp/wt", "herd/fac-1", ".herd/prompts/worker.md", lane, c.verification)
+			for _, want := range c.wantContains {
+				if !strings.Contains(packet, want) {
+					t.Errorf("packet missing %q:\n%s", want, packet)
+				}
+			}
+			for _, absent := range c.wantAbsent {
+				if strings.Contains(packet, absent) {
+					t.Errorf("packet must not contain %q for this profile:\n%s", absent, packet)
+				}
+			}
+		})
 	}
 }
 
@@ -191,6 +248,7 @@ func TestDispatch_PackageCwdNotPolluted(t *testing.T) {
 		Lanes: []config.LaneDef{
 			{Name: "worker", Role: "worker", Model: "m", AgentKind: "opencode", Prompt: ".herd/prompts/worker.md"},
 		},
+		Verification: config.Verification{TestCommand: "go test ./...", PreflightCommand: "go build ./..."},
 	}
 	mw := &mockWorktree{err: fmt.Errorf("mock isolation: no ambient git")}
 	d := &Dispatcher{

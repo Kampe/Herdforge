@@ -229,6 +229,7 @@ func testCfg() *config.Config {
 		Lanes: []config.LaneDef{
 			{Name: "worker", Role: "worker", Model: "deepseek-v4-flash", AgentKind: "opencode", Prompt: ".herd/prompts/worker.md"},
 		},
+		Verification: config.Verification{TestCommand: "go test ./...", PreflightCommand: "go build ./..."},
 	}
 }
 
@@ -417,6 +418,43 @@ func TestDispatch_EmptyBranchAfterWorktreeCompensates(t *testing.T) {
 		if s.Step == StepWorktree {
 			t.Fatalf("must not RecordStep worktree with empty branch: %+v", s)
 		}
+	}
+}
+
+// TestDispatch_MissingVerificationTestCommandFailsClosed is non-vacuous:
+// deleting the fail-closed guard in Dispatch (or restoring a hardcoded
+// `go test` fallback in buildTaskPacket) makes this pass through instead of
+// erroring, and the compensate-reason assertion catches a guard that errors
+// without compensating the already-created worktree (FAC-134).
+func TestDispatch_MissingVerificationTestCommandFailsClosed(t *testing.T) {
+	_, wm := initDispatchRepo(t)
+	tp := &statusTrackingProvider{
+		mockTaskProvider: mockTaskProvider{tasks: []*provider.Task{baseTask("FAC-NOVERIFY")}},
+	}
+	cfg := testCfg()
+	cfg.Verification = config.Verification{} // no verification configured
+	comp := &recordingCompensator{}
+	d := NewDispatcher(cfg, tp, wm)
+	d.Compensator = comp
+	d.Herdr = &fakeHerdr{available: false}
+
+	res, err := d.Dispatch(context.Background(), DispatchOptions{TicketRef: "FAC-NOVERIFY", NoLaunch: true})
+	if err == nil {
+		t.Fatal("expected fail-closed error when verification.test_command is unset")
+	}
+	if !strings.Contains(err.Error(), "verification.test_command") {
+		t.Fatalf("error must name the missing config field: %v", err)
+	}
+	if res != nil && res.Worktree != "" {
+		t.Cleanup(func() { os.RemoveAll(res.Worktree) })
+	}
+	if !hasCompensateReason(comp.compsCopy(), "verification_test_command_missing") {
+		t.Fatalf("expected compensate verification_test_command_missing, got %v", comp.compsCopy())
+	}
+	// Board must have already advanced (worktree + status land before this
+	// check) — the guard must compensate, not pretend nothing happened.
+	if len(tp.statuses) == 0 {
+		t.Fatalf("expected board status to have advanced before the verification guard fired: %v", tp.statuses)
 	}
 }
 
