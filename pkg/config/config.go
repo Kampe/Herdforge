@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -105,6 +106,54 @@ type TaskProvider struct {
 	APIURL      string `yaml:"api_url,omitempty"`
 	APIKeyEnv   string `yaml:"api_key_env,omitempty"`
 	UseCLI      bool   `yaml:"use_cli,omitempty"`
+	// Deadlines are optional per-op bounds (Go duration strings, e.g. "15s").
+	// Empty fields fall back to package defaults at the provider boundary
+	// (FAC-150). FAC-155 may centralize activation; parsing lives here.
+	Deadlines OpDeadlines `yaml:"deadlines,omitempty"`
+}
+
+// OpDeadlines holds repository-configurable task-provider operation bounds.
+// Zero/empty values mean "use provider package defaults".
+type OpDeadlines struct {
+	Get      string `yaml:"get,omitempty"`
+	List     string `yaml:"list,omitempty"`
+	Mutate   string `yaml:"mutate,omitempty"`
+	Comment  string `yaml:"comment,omitempty"`
+	Readback string `yaml:"readback,omitempty"`
+}
+
+// Resolved returns parsed durations. Empty fields yield 0 (caller applies defaults).
+// Invalid non-empty strings return an error (fail-closed config).
+func (d OpDeadlines) Resolved() (get, list, mutate, comment, readback time.Duration, err error) {
+	parse := func(label, raw string) (time.Duration, error) {
+		if raw == "" {
+			return 0, nil
+		}
+		v, e := time.ParseDuration(raw)
+		if e != nil {
+			return 0, fmt.Errorf("task_provider.deadlines.%s: %w", label, e)
+		}
+		if v < 0 {
+			return 0, fmt.Errorf("task_provider.deadlines.%s: must be non-negative", label)
+		}
+		return v, nil
+	}
+	if get, err = parse("get", d.Get); err != nil {
+		return
+	}
+	if list, err = parse("list", d.List); err != nil {
+		return
+	}
+	if mutate, err = parse("mutate", d.Mutate); err != nil {
+		return
+	}
+	if comment, err = parse("comment", d.Comment); err != nil {
+		return
+	}
+	if readback, err = parse("readback", d.Readback); err != nil {
+		return
+	}
+	return
 }
 
 type LaneDef struct {
@@ -192,6 +241,9 @@ func (c *Config) Validate() error {
 	}
 	if c.TaskProvider.Type == "" {
 		return fmt.Errorf("missing required field: task_provider.type")
+	}
+	if _, _, _, _, _, err := c.TaskProvider.Deadlines.Resolved(); err != nil {
+		return err
 	}
 	roles := make(map[string]bool, len(c.Lanes))
 	for _, lane := range c.Lanes {
