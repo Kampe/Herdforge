@@ -8,7 +8,6 @@ import (
 	"io"
 	"net/http"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -19,6 +18,10 @@ type KaneoProvider struct {
 	ProjectID string
 	UseCLI    bool
 	Client    *http.Client
+	// Deadlines bound every op; zero fields resolve to DefaultDeadlines.
+	Deadlines Deadlines
+	// Retry applies to idempotent reads only (GetTask/ListTasks).
+	Retry RetryPolicy
 }
 
 type KaneoLinkConfig struct {
@@ -53,8 +56,31 @@ func NewKaneoProvider(apiURL string, projectID string, useCLI bool) *KaneoProvid
 		APIURL:    apiURL,
 		ProjectID: projectID,
 		UseCLI:    useCLI,
-		Client:    &http.Client{Timeout: 10 * time.Second},
+		Client:    defaultHTTPClient(),
+		Deadlines: DefaultDeadlines(),
+		Retry:     DefaultReadRetry(),
 	}
+}
+
+func (k *KaneoProvider) deadlines() Deadlines {
+	if k == nil {
+		return DefaultDeadlines()
+	}
+	return k.Deadlines.Normalize()
+}
+
+func (k *KaneoProvider) readRetry() RetryPolicy {
+	if k == nil {
+		return DefaultReadRetry()
+	}
+	return k.Retry.normalize()
+}
+
+func (k *KaneoProvider) httpClient() *http.Client {
+	if k != nil && k.Client != nil {
+		return k.Client
+	}
+	return defaultHTTPClient()
 }
 
 // kaneoLabel accepts both API object form {"name":"x"} and CLI string form "x".
@@ -162,14 +188,29 @@ func decodeKaneoTaskBody(statusCode int, body []byte, wantID string) (kaneoTaskD
 }
 
 func (k *KaneoProvider) GetTask(ctx context.Context, id string) (*Task, error) {
+	dls := k.deadlines()
+	ctx, cancel := WithOpDeadline(ctx, dls, OpGet)
+	defer cancel()
+
+	var task *Task
+	err := RetryRead(ctx, k.readRetry(), func(rctx context.Context) error {
+		t, e := k.getTaskOnce(rctx, id)
+		if e != nil {
+			return AsTimeout("kaneo", "GetTask", OpGet, dls.For(OpGet), e)
+		}
+		task = t
+		return nil
+	})
+	return task, err
+}
+
+func (k *KaneoProvider) getTaskOnce(ctx context.Context, id string) (*Task, error) {
 	if k.UseCLI {
-		cmd := exec.CommandContext(ctx, "kaneo", "task", "get", id, "--json")
-		var out bytes.Buffer
-		cmd.Stdout = &out
-		if err := cmd.Run(); err != nil {
+		res, err := RunCLI(ctx, "kaneo", "task", "get", id, "--json")
+		if err != nil {
 			return nil, fmt.Errorf("kaneo task get: %w", err)
 		}
-		dto, err := decodeKaneoTaskBody(http.StatusOK, out.Bytes(), id)
+		dto, err := decodeKaneoTaskBody(http.StatusOK, res.Stdout, id)
 		if err != nil {
 			if pe, ok := err.(*ProviderError); ok {
 				pe.Provider = "kaneo"
@@ -185,7 +226,7 @@ func (k *KaneoProvider) GetTask(ctx context.Context, id string) (*Task, error) {
 	if err != nil {
 		return nil, err
 	}
-	resp, err := k.Client.Do(req)
+	resp, err := k.httpClient().Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -209,7 +250,23 @@ func (k *KaneoProvider) ListTasks(ctx context.Context, projectID string, status 
 	if projectID == "" {
 		projectID = k.ProjectID
 	}
+	dls := k.deadlines()
+	ctx, cancel := WithOpDeadline(ctx, dls, OpList)
+	defer cancel()
 
+	var tasks []*Task
+	err := RetryRead(ctx, k.readRetry(), func(rctx context.Context) error {
+		t, e := k.listTasksOnce(rctx, projectID, status)
+		if e != nil {
+			return AsTimeout("kaneo", "ListTasks", OpList, dls.For(OpList), e)
+		}
+		tasks = t
+		return nil
+	})
+	return tasks, err
+}
+
+func (k *KaneoProvider) listTasksOnce(ctx context.Context, projectID, status string) ([]*Task, error) {
 	if k.UseCLI {
 		// Terminate only on EMPTY page; short pages continue. Duplicate pages
 		// and the page cap without empty termination are hard errors.
@@ -219,19 +276,20 @@ func (k *KaneoProvider) ListTasks(ctx context.Context, projectID string, status 
 		var all []kaneoTaskDTO
 		acc := NewPageAccumulator()
 		for page := 1; page <= DefaultMaxListPages; page++ {
+			if err := ctx.Err(); err != nil {
+				return nil, AsTimeout("kaneo", "ListTasks", OpList, k.deadlines().For(OpList), err)
+			}
 			args := []string{"task", "list", "--project", projectID, "--json",
 				"--limit", fmt.Sprint(pageSize), "--page", fmt.Sprint(page)}
 			if status != "" {
 				args = append(args, "--status", status)
 			}
-			cmd := exec.CommandContext(ctx, "kaneo", args...)
-			var out bytes.Buffer
-			cmd.Stdout = &out
-			if err := cmd.Run(); err != nil {
+			res, err := RunCLI(ctx, "kaneo", args...)
+			if err != nil {
 				return nil, fmt.Errorf("kaneo task list (page %d): %w", page, err)
 			}
 			var dtos []kaneoTaskDTO
-			if err := DecodeJSONBytes(http.StatusOK, out.Bytes(), &dtos); err != nil {
+			if err := DecodeJSONBytes(http.StatusOK, res.Stdout, &dtos); err != nil {
 				if pe, ok := err.(*ProviderError); ok {
 					pe.Provider = "kaneo"
 					pe.Op = "ListTasks"
@@ -262,7 +320,7 @@ func (k *KaneoProvider) ListTasks(ctx context.Context, projectID string, status 
 	if err != nil {
 		return nil, err
 	}
-	resp, err := k.Client.Do(req)
+	resp, err := k.httpClient().Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -299,18 +357,28 @@ func (k *KaneoProvider) ClaimTask(ctx context.Context, taskID string, role strin
 
 func (k *KaneoProvider) UpdateStatus(ctx context.Context, taskID string, status string) error {
 	canonical := NormalizeStatus(status)
+	dls := k.deadlines()
+	writeCtx, cancel := WithOpDeadline(ctx, dls, OpMutate)
+	writeErr := k.updateStatusOnce(writeCtx, taskID, status)
+	cancel()
+	if writeErr != nil {
+		writeErr = AsTimeout("kaneo", "UpdateStatus", OpMutate, dls.For(OpMutate), writeErr)
+	}
+	// Parent ctx (not the expired write child) for readback / reconcile.
+	return AfterMutation(ctx, k, dls, "kaneo", "UpdateStatus", taskID, canonical, writeErr)
+}
+
+func (k *KaneoProvider) updateStatusOnce(ctx context.Context, taskID, status string) error {
 	if k.UseCLI {
-		cmd := exec.CommandContext(ctx, "kaneo", "task", "status", taskID, status, "--project", k.ProjectID)
-		out, err := cmd.CombinedOutput()
+		res, err := RunCLI(ctx, "kaneo", "task", "status", taskID, status, "--project", k.ProjectID)
 		if err != nil {
-			return fmt.Errorf("kaneo task status: %s: %w", strings.TrimSpace(string(out)), err)
+			msg := cliErrMsg(res)
+			if msg != "" {
+				return fmt.Errorf("kaneo task status: %s: %w", msg, err)
+			}
+			return fmt.Errorf("kaneo task status: %w", err)
 		}
-		// Fail-closed readback: mutation is not success until read agrees.
-		got, gerr := k.GetTask(ctx, taskID)
-		if gerr != nil {
-			return fmt.Errorf("kaneo status readback after write: %w", gerr)
-		}
-		return VerifyStatusReadback(taskID, canonical, got.Status)
+		return nil
 	}
 
 	url := fmt.Sprintf("%s/api/task/%s", k.APIURL, taskID)
@@ -321,7 +389,7 @@ func (k *KaneoProvider) UpdateStatus(ctx context.Context, taskID string, status 
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := k.Client.Do(req)
+	resp, err := k.httpClient().Do(req)
 	if err != nil {
 		return err
 	}
@@ -332,19 +400,40 @@ func (k *KaneoProvider) UpdateStatus(ctx context.Context, taskID string, status 
 		}
 		return err
 	}
-	got, gerr := k.GetTask(ctx, taskID)
-	if gerr != nil {
-		return fmt.Errorf("kaneo status readback after write: %w", gerr)
-	}
-	return VerifyStatusReadback(taskID, canonical, got.Status)
+	return nil
 }
 
 func (k *KaneoProvider) AddComment(ctx context.Context, taskID string, body string) error {
+	dls := k.deadlines()
+	ctx, cancel := WithOpDeadline(ctx, dls, OpComment)
+	defer cancel()
+
+	err := k.addCommentOnce(ctx, taskID, body)
+	if err == nil {
+		return nil
+	}
+	err = AsTimeout("kaneo", "AddComment", OpComment, dls.For(OpComment), err)
+	if IsTimeout(err) {
+		// Comments are not status-reconcilable; never blind-retry.
+		return &AmbiguousMutationError{
+			Provider: "kaneo",
+			Op:       "AddComment",
+			TaskID:   taskID,
+			WriteErr: err,
+		}
+	}
+	return err
+}
+
+func (k *KaneoProvider) addCommentOnce(ctx context.Context, taskID, body string) error {
 	if k.UseCLI {
-		cmd := exec.CommandContext(ctx, "kaneo", "task", "comment", "add", taskID, body)
-		out, err := cmd.CombinedOutput()
+		res, err := RunCLI(ctx, "kaneo", "task", "comment", "add", taskID, body)
 		if err != nil {
-			return fmt.Errorf("kaneo task comment: %s: %w", strings.TrimSpace(string(out)), err)
+			msg := cliErrMsg(res)
+			if msg != "" {
+				return fmt.Errorf("kaneo task comment: %s: %w", msg, err)
+			}
+			return fmt.Errorf("kaneo task comment: %w", err)
 		}
 		return nil
 	}
@@ -357,7 +446,7 @@ func (k *KaneoProvider) AddComment(ctx context.Context, taskID string, body stri
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := k.Client.Do(req)
+	resp, err := k.httpClient().Do(req)
 	if err != nil {
 		return err
 	}
@@ -369,4 +458,22 @@ func (k *KaneoProvider) AddComment(ctx context.Context, taskID string, body stri
 		return err
 	}
 	return nil
+}
+
+func cliErrMsg(res *CLIResult) string {
+	if res == nil {
+		return ""
+	}
+	msg := strings.TrimSpace(string(res.Stderr))
+	if msg == "" {
+		msg = strings.TrimSpace(string(res.Stdout))
+	}
+	return msg
+}
+
+// defaultHTTPClient returns a client whose transport timeout is independent of
+// any single caller context — a safety net for hung bodies/connections.
+// Per-op bounds still come from WithOpDeadline on the request context.
+func defaultHTTPClient() *http.Client {
+	return &http.Client{Timeout: DefaultDeadlines().Max() + 5*time.Second}
 }
