@@ -24,18 +24,33 @@ const (
 	CallbackBlocked CallbackKind = "blocked"
 )
 
-// Callback is one agent report about a card.
+// Callback is one agent report about a card. FAC-126 binds each callback to
+// the repo, lease generation, and sender role it was raised under so a
+// CallbackConsumer can tell a stale or duplicate redelivery from real
+// progress without reaching back into the envelope that carried it; SHA
+// doubles as the candidate SHA referenced by the ticket's acceptance
+// criteria. Sequence is set by the consumer from the envelope at drain
+// time, not by the sender — it isn't meaningful until the message has
+// actually been appended to a mailbox.
 type Callback struct {
-	Ref    string       `json:"ref"`
-	Kind   CallbackKind `json:"kind"`
-	SHA    string       `json:"sha,omitempty"`
-	Detail string       `json:"detail,omitempty"`
+	Ref             string       `json:"ref"`
+	Kind            CallbackKind `json:"kind"`
+	SHA             string       `json:"sha,omitempty"`
+	Detail          string       `json:"detail,omitempty"`
+	Repo            string       `json:"repo,omitempty"`
+	LeaseGeneration int64        `json:"lease_generation,omitempty"`
+	SenderRole      string       `json:"sender_role,omitempty"`
+	Sequence        int64        `json:"sequence,omitempty"`
 }
 
 // PostCallback delivers an agent callback to the coordinator inbox. The
 // subject is the ref so a human scanning the mailbox sees what it is; the
-// body is the JSON-encoded Callback the loop parses.
+// body is the JSON-encoded Callback the loop parses. SenderRole defaults to
+// sender when the caller hasn't set it explicitly.
 func (m *Mailbox) PostCallback(sender string, cb Callback) (*Envelope, error) {
+	if cb.SenderRole == "" {
+		cb.SenderRole = sender
+	}
 	body, err := json.Marshal(cb)
 	if err != nil {
 		return nil, err
