@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"reflect"
 	"sort"
 	"strings"
 	"sync"
@@ -335,6 +334,26 @@ func decideObservation(sequence uint64, observedAt time.Time, currentSequence ui
 	return observationAccept
 }
 
+func equalHealth(a, b HealthSnapshot) bool {
+	if a.Liveness != b.Liveness || a.Readiness != b.Readiness || a.Sequence != b.Sequence || !a.ObservedAt.Equal(b.ObservedAt) || len(a.Dependencies) != len(b.Dependencies) {
+		return false
+	}
+	for i := range a.Dependencies {
+		if a.Dependencies[i] != b.Dependencies[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func equalQueue(a, b QueuePressure) bool {
+	return a.Depth == b.Depth && a.Capacity == b.Capacity && a.Known == b.Known && a.Error == b.Error && a.Sequence == b.Sequence && a.ObservedAt.Equal(b.ObservedAt)
+}
+
+func equalSignals(a, b FleetSignals) bool {
+	return a.StalledWork == b.StalledWork && a.DroppedCallbacks == b.DroppedCallbacks && a.ReviewSaturation == b.ReviewSaturation && a.DeadProvider == b.DeadProvider && a.IntegrationBacklog == b.IntegrationBacklog && a.Retries == b.Retries && a.DeadLetters == b.DeadLetters && a.MaxLeaseAge == b.MaxLeaseAge && a.MaxCallbackAge == b.MaxCallbackAge && a.EligibleIdle == b.EligibleIdle && a.EligibleWaiting == b.EligibleWaiting && a.Blocked == b.Blocked && a.Backpressured == b.Backpressured && a.EligibleSince.Equal(b.EligibleSince) && a.LastReconciliation.Equal(b.LastReconciliation) && a.ObservedAt.Equal(b.ObservedAt) && a.Sequence == b.Sequence
+}
+
 func freshAt(observedAt, now time.Time, maxAge time.Duration) bool {
 	return !observedAt.IsZero() && !observedAt.After(now) && now.Sub(observedAt) <= maxAge
 }
@@ -435,7 +454,7 @@ func (m *MetricsExporter) SetHealthObservation(dependencies []DependencyHealth, 
 	now := m.now()
 	health.ObservedAt, health.Sequence = observedAt, sequence
 	m.mu.Lock()
-	decision := decideObservation(sequence, observedAt, m.health.Sequence, m.health.ObservedAt, reflect.DeepEqual(health, m.health))
+	decision := decideObservation(sequence, observedAt, m.health.Sequence, m.health.ObservedAt, equalHealth(health, m.health))
 	if decision == observationStale {
 		m.mu.Unlock()
 		return errors.New("stale health observation")
@@ -484,7 +503,7 @@ func (m *MetricsExporter) SetQueuePressureObservation(queue QueuePressure, obser
 	}
 	queue.ObservedAt, queue.Sequence = observedAt, sequence
 	m.mu.Lock()
-	decision := decideObservation(sequence, observedAt, m.queue.Sequence, m.queue.ObservedAt, reflect.DeepEqual(queue, m.queue))
+	decision := decideObservation(sequence, observedAt, m.queue.Sequence, m.queue.ObservedAt, equalQueue(queue, m.queue))
 	if decision == observationStale {
 		m.mu.Unlock()
 		return errors.New("stale queue observation")
@@ -520,7 +539,7 @@ func (m *MetricsExporter) SetSignalsObservation(signals FleetSignals, sequence u
 	signals.EligibleIdle = 0
 	signals.Sequence = sequence
 	m.mu.Lock()
-	decision := decideObservation(sequence, signals.ObservedAt, m.signals.Sequence, m.signals.ObservedAt, reflect.DeepEqual(signals, m.signals))
+	decision := decideObservation(sequence, signals.ObservedAt, m.signals.Sequence, m.signals.ObservedAt, equalSignals(signals, m.signals))
 	if decision == observationStale {
 		m.mu.Unlock()
 		return errors.New("stale signal observation")
