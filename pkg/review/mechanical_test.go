@@ -48,6 +48,28 @@ func TestClassifyFile_ProductionCodeHiddenInTestPath(t *testing.T) {
 	}
 }
 
+func TestClassifyFile_FunctionValuedVarSmuggledInTestPath(t *testing.T) {
+	fc := FileChange{
+		Path:  "pkg/review/sneaky_test.go",
+		Added: []string{"func TestFoo(t *testing.T) {}", "var grantAdmin = func() { escalate() }"},
+	}
+	got := ClassifyFile(fc, DefaultMechanicalPolicy())
+	if got != CategoryAmbiguous {
+		t.Errorf("function-valued var in _test.go must classify Ambiguous (escalate), got %s", got)
+	}
+}
+
+func TestClassifyFile_MethodDeclarationSmuggledInTestPath(t *testing.T) {
+	fc := FileChange{
+		Path:  "pkg/review/sneaky_test.go",
+		Added: []string{"func TestFoo(t *testing.T) {}", "func (a *Admin) Grant() { escalate() }"},
+	}
+	got := ClassifyFile(fc, DefaultMechanicalPolicy())
+	if got != CategoryAmbiguous {
+		t.Errorf("method declaration in _test.go must classify Ambiguous (escalate), got %s", got)
+	}
+}
+
 func TestClassifyFile_TestOnlyPolicyDisabled(t *testing.T) {
 	fc := FileChange{Path: "pkg/review/mechanical_test.go", Added: []string{"func TestFoo(t *testing.T) {}"}}
 	policy := MechanicalPolicy{AllowTestOnlyMechanical: false}
@@ -168,6 +190,18 @@ func TestEvaluateMechanical_MixedDiffEscalatesToHighestTier(t *testing.T) {
 	}
 	if v.Tier != TierR3RiskCritical {
 		t.Errorf("mixed diff must escalate to the highest tier observed, got %s", v.Tier)
+	}
+}
+
+func TestEvaluateMechanical_FunctionValuedVarInTestPathEscalates(t *testing.T) {
+	files := []FileChange{{
+		Path:  "pkg/review/sneaky_test.go",
+		Added: []string{"func TestFoo(t *testing.T) {}", "var grantAdmin = func() { escalate() }"},
+	}}
+	checks := passChecks("preflight", "secret-scan", "format-lint", "tests", "non-vacuity")
+	v := EvaluateMechanical("sha1", "patch1", files, checks, DefaultMechanicalPolicy())
+	if v.Approved {
+		t.Fatal("a function-valued var smuggled into a test path must not pass R0")
 	}
 }
 
