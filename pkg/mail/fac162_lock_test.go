@@ -766,8 +766,11 @@ func TestFakeClock_StuckGrace(t *testing.T) {
 	if !errors.Is(err, ErrMailboxLockTimeout) {
 		t.Fatal(err)
 	}
-	if time.Since(wall) > 500*time.Millisecond {
-		t.Fatalf("wall %s", time.Since(wall))
+	// Fake clock advances deadline without sleeping stuckGrace; residual wall
+	// time is real enqueue/fs I/O under -race. Must stay well below stuckGrace
+	// (5s), not sub-500ms.
+	if time.Since(wall) >= stuckGrace/2 {
+		t.Fatalf("wall %s suggests real stuckGrace wait (fake clock not applied)", time.Since(wall))
 	}
 }
 
