@@ -107,10 +107,13 @@ var generatedMarkerRe = regexp.MustCompile(`(?i)code generated.*do not edit`)
 // varied to enumerate.
 var executableDeclRe = regexp.MustCompile(`^func\s+(?:\([^)]*\)\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*\(|^var\s+([A-Za-z_][A-Za-z0-9_]*)(?:\s+[^=]+?)?\s*=\s*func\s*\(`)
 
-// varBlockOpenRe matches the opening line of a grouped `var (` declaration
-// block, where individual specs inside don't repeat the `var` keyword and
-// may split a single spec's name/type/value across lines.
-var varBlockOpenRe = regexp.MustCompile(`^var\s*\(\s*$`)
+// varBlockOpenRe matches the start of a grouped `var (` declaration block,
+// where individual specs don't repeat the `var` keyword and may split a
+// single spec's name/type/value across lines. Group 1 captures whatever
+// follows the opening paren on this same line — empty for the common
+// `var (` -alone-on-its-line form, non-empty for the compact form
+// (`var (x = func(){})`).
+var varBlockOpenRe = regexp.MustCompile(`^var\s*\((.*)$`)
 
 // groupedVarFuncRe matches one `name [type] = func(` spec once a grouped
 // var block's lines have been joined into a single string — scoped to
@@ -251,7 +254,7 @@ func hasSmuggledProductionCodeAST(added []string) (smuggled, parsed bool) {
 // partial diff hunk). It catches the same declaration forms on a
 // best-effort basis via regex rather than a real parse.
 func hasSmuggledProductionCodeHeuristic(added []string) bool {
-	inVarBlock := false
+	depth := 0 // 0 = not in a grouped var block; >0 = its unclosed '(' count
 	var blockLines []string
 
 	flushBlock := func() bool {
@@ -268,40 +271,59 @@ func hasSmuggledProductionCodeHeuristic(added []string) bool {
 	for _, raw := range added {
 		line := strings.TrimSpace(raw)
 
-		if inVarBlock {
-			if line == ")" {
-				inVarBlock = false
-				if flushBlock() {
+		var content string
+		if depth == 0 {
+			m := varBlockOpenRe.FindStringSubmatch(line)
+			if m == nil {
+				md := executableDeclRe.FindStringSubmatch(line)
+				if md == nil {
+					continue
+				}
+				name := md[1]
+				if name == "" {
+					name = md[2]
+				}
+				if !testFuncPrefixRe.MatchString(name) {
 					return true
 				}
 				continue
 			}
-			blockLines = append(blockLines, line)
-			continue
+			depth = 1
+			content = m[1] // whatever follows "var (" on this same line, if any
+		} else {
+			content = line
 		}
 
-		if varBlockOpenRe.MatchString(line) {
-			inVarBlock = true
-			continue
+		// Track the block's own paren depth across this line's content —
+		// not just line-exact "var (" / ")" markers — so a compact
+		// single-line block (`var (x = func(){})`) and an unterminated one
+		// (missing closing paren, e.g. a partial diff hunk cut mid-block)
+		// are both handled the same way as a spread-out multi-line block.
+		// Parens inside the content (func signatures, call expressions)
+		// nest and unwind within the same scan, so they wash out net-zero.
+		if strings.TrimSpace(content) != "" {
+			blockLines = append(blockLines, content)
 		}
-
-		m := executableDeclRe.FindStringSubmatch(line)
-		if m == nil {
-			continue
+		for _, r := range content {
+			switch r {
+			case '(':
+				depth++
+			case ')':
+				depth--
+			}
 		}
-		name := m[1]
-		if name == "" {
-			name = m[2]
-		}
-		if !testFuncPrefixRe.MatchString(name) {
-			return true
+		if depth <= 0 {
+			depth = 0
+			if flushBlock() {
+				return true
+			}
 		}
 	}
 
 	// An unterminated block (its closing ")" fell outside this hunk) still
 	// has its partial content checked — a hunk boundary must not hide a
 	// violation.
-	if inVarBlock && flushBlock() {
+	if depth > 0 && flushBlock() {
 		return true
 	}
 	return false
