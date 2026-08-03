@@ -62,10 +62,16 @@ type LaneState struct {
 func (e *Engine) ForgeStep(ctx context.Context, lanes LaneState, completed, verified map[string]bool) (*ForgeAction, error) {
 	projectID := e.Config.TaskProvider.ProjectID
 
+	// BLOCKED(provider_timeout): stay responsive, claim nothing. Caller
+	// (ForgeLoop) will beginRecovery on the next tick before probing again.
+	if e.health.isBlocked() {
+		return &ForgeAction{Kind: ActionIdle, Ref: e.ProviderStatus()}, nil
+	}
+
 	// 1. Approve in-review first — always finish before starting new work.
-	inReview, err := e.TaskProv.ListTasks(ctx, projectID, "in-review")
+	inReview, err := e.listTasksBound(ctx, projectID, "in-review")
 	if err != nil {
-		return nil, err
+		return nil, formatProviderStepError("list in-review", err)
 	}
 	if t := firstByPriority(inReview); t != nil {
 		return &ForgeAction{Kind: ActionApprove, Ref: t.Ref, Task: t}, nil
@@ -73,9 +79,9 @@ func (e *Engine) ForgeStep(ctx context.Context, lanes LaneState, completed, veri
 
 	// 2. Review any completed in-progress build.
 	if len(completed) > 0 {
-		inProgress, err := e.TaskProv.ListTasks(ctx, projectID, "in-progress")
+		inProgress, err := e.listTasksBound(ctx, projectID, "in-progress")
 		if err != nil {
-			return nil, err
+			return nil, formatProviderStepError("list in-progress", err)
 		}
 		var ready, failed []*provider.Task
 		for _, t := range inProgress {
