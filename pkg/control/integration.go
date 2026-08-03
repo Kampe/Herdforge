@@ -18,6 +18,23 @@ func (a ScopedAuthority) Resolve(_ context.Context, _ Order) (LaneIdentity, erro
 	return a.Identity, nil
 }
 
+// FencedAuthority re-checks the live lease at every delivery/terminal call.
+// The identity captured when a lane was started is not authority by itself.
+type FencedAuthority struct {
+	Identity LaneIdentity
+	Check    func(context.Context, Order) error
+}
+
+func (a FencedAuthority) Resolve(ctx context.Context, o Order) (LaneIdentity, error) {
+	if a.Check == nil {
+		return LaneIdentity{}, fmt.Errorf("control: live identity check is required")
+	}
+	if err := a.Check(ctx, o); err != nil {
+		return LaneIdentity{}, err
+	}
+	return a.Identity, nil
+}
+
 // NewOwnerToken creates a unique token per delivery instance. It is never a
 // process-wide default, so an expired owner cannot mutate a later takeover.
 func NewOwnerToken() (string, error) {
@@ -62,23 +79,38 @@ func (r MailboxEvidenceReader) ReadEvidence(ctx context.Context, key string, sup
 // HerdrWaker is the only Herdr integration used by the durable adapter. Its
 // receipt proves prompt consumption only; it never acknowledges or finalizes
 // the durable order.
-type HerdrWaker struct {
-	Target  string
-	Timeout time.Duration
+type WakeTarget struct {
+	Target          string
+	TabID           string
+	PaneID          string
+	AgentName       string
+	LeaseGeneration int64
 }
 
-func (w HerdrWaker) Wake(_ context.Context, req WakeRequest) (WakeReceipt, error) {
-	if w.Target == "" {
-		return WakeReceipt{}, fmt.Errorf("control: Herdr target is required")
+type HerdrWaker struct {
+	Target   WakeTarget
+	Timeout  time.Duration
+	Validate func(context.Context, WakeTarget) error
+}
+
+func (w HerdrWaker) Wake(ctx context.Context, req WakeRequest) (WakeReceipt, error) {
+	if w.Target.Target == "" || w.Target.TabID == "" || w.Target.PaneID == "" || w.Target.AgentName == "" || w.Target.LeaseGeneration <= 0 {
+		return WakeReceipt{}, fmt.Errorf("control: exact Herdr target is required")
 	}
-	receipt, err := herdr.DeliverAndProve(w.Target, fmt.Sprintf("consume durable control envelope %s seq %d", req.MessageID, req.Sequence), w.Timeout)
+	if w.Validate == nil {
+		return WakeReceipt{}, fmt.Errorf("control: exact Herdr target validator is required")
+	}
+	if err := w.Validate(ctx, w.Target); err != nil {
+		return WakeReceipt{}, fmt.Errorf("control: Herdr target drift: %w", err)
+	}
+	receipt, err := herdr.DeliverAndProve(w.Target.Target, fmt.Sprintf("consume durable control envelope %s seq %d", req.MessageID, req.Sequence), w.Timeout)
 	if err != nil {
 		return WakeReceipt{}, err
 	}
 	if receipt == nil || !receipt.Consumed {
 		return WakeReceipt{}, ErrMissingReceipt
 	}
-	return WakeReceipt{MessageID: req.MessageID, Consumed: true}, nil
+	return WakeReceipt{MessageID: req.MessageID, Consumed: true, Verified: receipt.Verified, SequenceToken: receipt.SequenceToken, Baseline: receipt.BaselineStatus, Final: receipt.FinalStatus, Target: receipt.Target}, nil
 }
 
 // CoordinatorOrders is the production-facing order port used by dispatch,
@@ -88,6 +120,16 @@ func (w HerdrWaker) Wake(_ context.Context, req WakeRequest) (WakeReceipt, error
 type CoordinatorOrders struct {
 	Delivery *Delivery
 	Identity LaneIdentity
+	Consumer *Consumer
+}
+
+// Consume is the recipient-side production entrypoint bound to this exact
+// lane identity. The caller's standing loop invokes it after a wake.
+func (c *CoordinatorOrders) Consume(ctx context.Context) error {
+	if c == nil || c.Consumer == nil {
+		return fmt.Errorf("control: recipient consumer is required")
+	}
+	return c.Consumer.Consume(ctx)
 }
 
 func (c *CoordinatorOrders) send(ctx context.Context, kind Kind, body string) (Evidence, error) {

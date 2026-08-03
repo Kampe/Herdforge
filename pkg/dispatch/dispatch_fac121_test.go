@@ -906,7 +906,7 @@ func TestDispatch_LaunchPath_RejectsSharedRoot(t *testing.T) {
 		AnchorRef: worktree.AnchorRefFor("FAC-ROOT"),
 	}
 	result := &DispatchResult{}
-	err := d.launch(context.Background(), validLaunchOptions(t, "FAC-3"), task, lane, wtInfo, wtInfo.Branch, "packet", result)
+	err := d.launch(context.Background(), validLaunchOptions(t, "FAC-3"), task, lane, wtInfo, wtInfo.Branch, "packet", result, nil)
 	if err == nil {
 		t.Fatal("launch on shared root must fail; production RejectSharedRoot guard missing?")
 	}

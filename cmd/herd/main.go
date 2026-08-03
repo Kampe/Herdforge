@@ -1915,12 +1915,28 @@ func configureProductionControl(d *dispatch.Dispatcher, root string) (func() err
 		return nil, err
 	}
 	controlMailbox := mail.NewMailbox(filepath.Join(root, ".herd", "control-mail.jsonl"))
-	d.ControlFactory = func(_ context.Context, identity control.LaneIdentity, lane string) (*control.CoordinatorOrders, error) {
+	d.ControlFactory = func(_ context.Context, scope dispatch.ControlScope) (*control.CoordinatorOrders, error) {
 		owner, err := control.NewOwnerToken()
 		if err != nil {
 			return nil, err
 		}
-		return &control.CoordinatorOrders{Identity: identity, Delivery: &control.Delivery{Outbox: controlStore, Sender: controlMailbox, Waker: control.HerdrWaker{Target: "forge-" + lane}, Authority: control.ScopedAuthority{Identity: identity}, Evidence: control.MailboxEvidenceReader{Mailbox: controlMailbox}, Owner: owner}}, nil
+		validate := func(_ context.Context, target control.WakeTarget) error {
+			agents, err := herdr.AgentList()
+			if err != nil {
+				return err
+			}
+			for _, a := range agents {
+				if a.TabID == target.TabID && a.PaneID == target.PaneID && a.Name == target.AgentName {
+					return nil
+				}
+			}
+			return fmt.Errorf("Herdr target drifted before wake")
+		}
+		orders := &control.CoordinatorOrders{Identity: scope.Identity, Delivery: &control.Delivery{Outbox: controlStore, Sender: controlMailbox, Waker: control.HerdrWaker{Target: scope.Wake, Validate: validate}, Authority: control.FencedAuthority{Identity: scope.Identity, Check: scope.Check}, Evidence: control.MailboxEvidenceReader{Mailbox: controlMailbox}, Owner: owner}}
+		orders.Consumer = &control.Consumer{Mailbox: controlMailbox, Identity: scope.Identity, Process: func(context.Context, control.Order) error {
+			return fmt.Errorf("control: recipient processor must be supplied by the standing worker")
+		}}
+		return orders, nil
 	}
 	return controlStore.Close, nil
 }
