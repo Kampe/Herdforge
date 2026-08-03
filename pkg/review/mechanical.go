@@ -93,8 +93,12 @@ var codeSignatureRe = regexp.MustCompile(`^\s*(package\s+\w|import\s+["(]|func\s
 // convention (Go, protobuf, and most codegen tools emit a line like this).
 var generatedMarkerRe = regexp.MustCompile(`(?i)code generated.*do not edit`)
 
-// exportedFuncRe matches a top-level exported Go func declaration.
-var exportedFuncRe = regexp.MustCompile(`^func\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(`)
+// executableDeclRe matches a top-level Go executable declaration: a named
+// function, a method with a receiver, or a function-valued variable —
+// the ways Go allows code to run from package scope outside an existing
+// function body. Group 1 holds a func/method name; group 2 holds a
+// function-valued var name.
+var executableDeclRe = regexp.MustCompile(`^func\s+(?:\([^)]*\)\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*\(|^var\s+([A-Za-z_][A-Za-z0-9_]*)(?:\s+[A-Za-z_][A-Za-z0-9_.\[\]*]*)?\s*=\s*func\s*\(`)
 
 // testFuncPrefixRe matches Go's recognized test-harness function prefixes.
 var testFuncPrefixRe = regexp.MustCompile(`^(Test|Benchmark|Example|Fuzz)`)
@@ -159,15 +163,22 @@ func hasCodeSignature(added []string) bool {
 }
 
 // hasSmuggledProductionCode reports whether a test-path file's added lines
-// declare an exported, non-test-harness top-level function — a signal that
-// production logic is being smuggled in under a test path.
+// declare a non-test-harness top-level executable declaration — a func, a
+// method, or a function-valued var — a signal that production logic is
+// being smuggled in under a test path. Function-valued vars (e.g. `var
+// grantAdmin = func() { ... }`) bypass a plain `^func ` check entirely, so
+// they're matched explicitly rather than left to fall through as data.
 func hasSmuggledProductionCode(added []string) bool {
 	for _, line := range added {
-		m := exportedFuncRe.FindStringSubmatch(strings.TrimSpace(line))
+		m := executableDeclRe.FindStringSubmatch(strings.TrimSpace(line))
 		if m == nil {
 			continue
 		}
-		if !testFuncPrefixRe.MatchString(m[1]) {
+		name := m[1]
+		if name == "" {
+			name = m[2]
+		}
+		if !testFuncPrefixRe.MatchString(name) {
 			return true
 		}
 	}
