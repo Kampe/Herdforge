@@ -154,6 +154,11 @@ type IntegrationResult struct {
 	BoardCompletedRefs []string            `json:"board_completed_refs,omitempty"`
 	CleanedWorktrees   []string            `json:"cleaned_worktrees,omitempty"`
 	Errors             []string            `json:"errors,omitempty"`
+	// DiskAdvice is the graduated capacity verdict this run executed under
+	// (proceed | serialize); ShedWorktrees counts candidates deferred to a
+	// later run by soft-pressure serialization — never silently dropped.
+	DiskAdvice    string `json:"disk_advice,omitempty"`
+	ShedWorktrees int    `json:"shed_worktrees,omitempty"`
 }
 
 // ReviewGateOutcome records the result of the review gate for a SHA.
@@ -200,14 +205,20 @@ func NewIntegration(h *Harvester, v Verifier, d Dispatcher, l *reviewledger.Ledg
 
 // Run executes the full harvest → review-gate → merge-gate → post-merge → cleanup flow.
 func (in *Integration) Run(ctx context.Context) (*IntegrationResult, error) {
-	// Fail closed on critical disk pressure before the integration pipeline
-	// touches anything — review-gate worktree ops, cherry-picks onto the
-	// shared checkout, cleanup (FAC-153). Refusal never reclaims space.
-	if err := preflight.CheckDiskPressure("integration", in.RepoRoot, os.TempDir()); err != nil {
-		return nil, err
+	// Graduated disk gate before the integration pipeline touches anything —
+	// review-gate worktree ops, cherry-picks onto the shared checkout,
+	// cleanup (FAC-153). Hard pressure fails closed (never reclaiming
+	// space); the soft band sheds the candidate batch to one worktree per
+	// run so mutation volume degrades before work stops.
+	adv := preflight.AdviseDiskPressure("integration", in.RepoRoot, os.TempDir())
+	if adv.Verdict == preflight.AdviceRefuse {
+		if adv.Evidence != nil {
+			return nil, adv.Evidence
+		}
+		return nil, fmt.Errorf("integration refused: %s", adv.Detail)
 	}
 
-	res := &IntegrationResult{}
+	res := &IntegrationResult{DiskAdvice: adv.Verdict}
 
 	// Phase 1: Harvest
 	hr, err := in.Harvester.Harvest(ctx)
@@ -217,6 +228,10 @@ func (in *Integration) Run(ctx context.Context) (*IntegrationResult, error) {
 	res.HarvestResult = hr
 	if len(hr.UnmergedWorktrees) == 0 {
 		return res, nil
+	}
+	if adv.Verdict == preflight.AdviceSerialize && len(hr.UnmergedWorktrees) > 1 {
+		res.ShedWorktrees = len(hr.UnmergedWorktrees) - 1
+		hr.UnmergedWorktrees = hr.UnmergedWorktrees[:1]
 	}
 
 	// Phase 2: Review gate
