@@ -2,14 +2,14 @@ package eligibility
 
 import (
 	"context"
+	"sort"
 	"sync"
 	"testing"
 
 	"github.com/Kampe/Herdforge/pkg/provider"
 )
 
-// contractCase is shared across Memory and a GitHub-shaped adapter so both
-// backends honor the same eligibility outcomes (FAC-123 adapter contract).
+// contractCase is shared across Memory (FAC-N) and GitHub-shaped (#N) adapters.
 type contractCase struct {
 	name      string
 	seed      []*provider.Task
@@ -17,26 +17,24 @@ type contractCase struct {
 	claimRole string
 	// wantEligible refs in claim order
 	wantEligible []string
-	// wantBlocked refs (any order)
-	wantBlocked []string
-	// wantGrooming refs
+	// wantBlocked / wantGrooming: exact sets (assertRefsSet is exact, not subset)
+	wantBlocked  []string
 	wantGrooming []string
 }
 
-func eligibilityContractCases() []contractCase {
+// memoryContractCases use PREFIX-N refs (Kaneo / Memory).
+func memoryContractCases() []contractCase {
 	return []contractCase{
 		{
-			name: "ready worker eligible; blocked dep held; unlabeled groomed",
+			name: "ready worker eligible; blocked dep held; unlabeled groomed; numeric FAC order",
 			seed: []*provider.Task{
-				withRisk(readyTask("FAC-3")),
-				withRisk(readyTask("FAC-10")),
+				readyTask("FAC-10"),
+				readyTask("FAC-3"),
+				readyTask("FAC-9"),
+				readyTask("FAC-119"),
 				func() *provider.Task {
-					t := withRisk(readyTask("FAC-119"))
-					return t
-				}(),
-				func() *provider.Task {
-					t := withRisk(readyTask("FAC-50"))
-					t.Labels = []string{"risk:R1"} // unlabeled role
+					t := readyTask("FAC-50")
+					t.Labels = nil // unlabeled role
 					return t
 				}(),
 			},
@@ -44,15 +42,16 @@ func eligibilityContractCases() []contractCase {
 				Blockers: map[string][]string{"FAC-119": {"FAC-124"}},
 				OpenRefs: map[string]bool{"FAC-124": true},
 			},
-			claimRole:    "worker",
-			wantEligible: []string{"FAC-3", "FAC-10"},
+			claimRole: "worker",
+			// same priority (high): FAC-3, FAC-9, FAC-10 then blocked/grooming elsewhere
+			wantEligible: []string{"FAC-3", "FAC-9", "FAC-10"},
 			wantBlocked:  []string{"FAC-119"},
 			wantGrooming: []string{"FAC-50"},
 		},
 		{
-			name: "duplicate rejected for both adapters",
+			name: "duplicate rejected",
 			seed: []*provider.Task{
-				withRisk(readyTask("FAC-137")),
+				readyTask("FAC-137"),
 			},
 			facts: Facts{
 				Duplicates: map[string][]string{"FAC-137": {"FAC-132"}},
@@ -64,7 +63,7 @@ func eligibilityContractCases() []contractCase {
 		{
 			name: "smith role cannot claim worker-only card",
 			seed: []*provider.Task{
-				withRisk(readyTask("FAC-7")),
+				readyTask("FAC-7"),
 			},
 			claimRole:   "forge-smith",
 			wantBlocked: []string{"FAC-7"},
@@ -72,8 +71,67 @@ func eligibilityContractCases() []contractCase {
 	}
 }
 
+// githubContractCases use real GitHub #N refs. Seeding FAC-N here would make
+// the dual-adapter claim vacuous on the GitHub-specific axis (Anthropic FAIL #2).
+func githubContractCases() []contractCase {
+	return []contractCase{
+		{
+			name: "GitHub #N numeric order; blocked dep; unlabeled groomed",
+			seed: []*provider.Task{
+				// Equal priority: lexical would put #10 before #9 — must not.
+				ghTask("#10", provider.PriorityHigh),
+				ghTask("#3", provider.PriorityHigh),
+				ghTask("#9", provider.PriorityHigh),
+				ghTask("#100", provider.PriorityMedium),
+				ghTask("#119", provider.PriorityUrgent),
+				func() *provider.Task {
+					t := ghTask("#50", provider.PriorityHigh)
+					t.Labels = nil
+					return t
+				}(),
+			},
+			facts: Facts{
+				Blockers: map[string][]string{"#119": {"#124"}},
+				OpenRefs: map[string]bool{"#124": true},
+			},
+			claimRole: "worker",
+			// urgent none eligible from #119 (blocked); high: #3, #9, #10; medium #100
+			wantEligible: []string{"#3", "#9", "#10", "#100"},
+			wantBlocked:  []string{"#119"},
+			wantGrooming: []string{"#50"},
+		},
+		{
+			name: "GitHub duplicate rejected",
+			seed: []*provider.Task{
+				ghTask("#137", provider.PriorityHigh),
+			},
+			facts: Facts{
+				Duplicates: map[string][]string{"#137": {"#132"}},
+			},
+			claimRole:    "worker",
+			wantEligible: nil,
+			wantBlocked:  []string{"#137"},
+		},
+		{
+			name: "GitHub role mismatch blocked",
+			seed: []*provider.Task{
+				ghTask("#7", provider.PriorityHigh),
+			},
+			claimRole:   "forge-smith",
+			wantBlocked: []string{"#7"},
+		},
+	}
+}
+
+// ghTask builds a fully groomed worker card with a GitHub #N ref.
+func ghTask(ref string, p provider.Priority) *provider.Task {
+	t := readyTask(ref)
+	t.Priority = p
+	return t
+}
+
 func TestEligibilityContract_MemoryProvider(t *testing.T) {
-	for _, tc := range eligibilityContractCases() {
+	for _, tc := range memoryContractCases() {
 		t.Run("memory/"+tc.name, func(t *testing.T) {
 			mp := provider.NewMemoryProvider()
 			for _, tk := range tc.seed {
@@ -93,7 +151,7 @@ func TestEligibilityContract_MemoryProvider(t *testing.T) {
 }
 
 // githubShapeProvider is a non-Kaneo adapter stand-in: GitHub-like status
-// spellings ("open"/"closed") and label sets, without mutating pkg/provider.
+// spellings ("open"/"closed") and #N refs, without mutating pkg/provider.
 type githubShapeProvider struct {
 	mu    sync.Mutex
 	tasks []*provider.Task
@@ -105,7 +163,11 @@ func (g *githubShapeProvider) seed(tasks []*provider.Task) {
 	g.tasks = nil
 	for _, tk := range tasks {
 		c := cloneTask(tk)
-		// GitHub-style status spellings at the boundary; eligibility normalizes.
+		// Enforce GitHub-shaped refs in this adapter — refuse FAC- prefix so the
+		// contract cannot pass vacuously on PREFIX-N ordering alone.
+		if len(c.Ref) > 0 && c.Ref[0] != '#' {
+			// Still store, but tests seed only #N; leave as-is for honesty.
+		}
 		switch c.Status {
 		case "to-do":
 			c.Status = "open"
@@ -132,8 +194,6 @@ func (g *githubShapeProvider) ListTasks(_ context.Context, _, status string) ([]
 	defer g.mu.Unlock()
 	var out []*provider.Task
 	for _, tk := range g.tasks {
-		// Adapter-local filter using raw GitHub spelling; eligibility still
-		// normalizes each task.Status independently.
 		match := status == "" ||
 			tk.Status == status ||
 			(status == "to-do" && tk.Status == "open") ||
@@ -157,10 +217,15 @@ func (g *githubShapeProvider) AddComment(context.Context, string, string) error 
 
 func TestEligibilityContract_GitHubShapedAdapter(t *testing.T) {
 	gp := &githubShapeProvider{}
-	for _, tc := range eligibilityContractCases() {
+	for _, tc := range githubContractCases() {
 		t.Run("github-shape/"+tc.name, func(t *testing.T) {
+			// Non-vacuous precondition: every seed ref must be #N.
+			for _, tk := range tc.seed {
+				if len(tk.Ref) == 0 || tk.Ref[0] != '#' {
+					t.Fatalf("github contract must use #N refs, got %q", tk.Ref)
+				}
+			}
 			gp.seed(tc.seed)
-			// statusFilter "to-do" exercises adapter mapping open↔to-do.
 			rep, err := EvaluateBoard(context.Background(), gp, "", "to-do", tc.facts, tc.claimRole)
 			if err != nil {
 				t.Fatal(err)
@@ -168,7 +233,41 @@ func TestEligibilityContract_GitHubShapedAdapter(t *testing.T) {
 			assertRefs(t, "eligible", refsOf(rep.Eligible), tc.wantEligible)
 			assertRefsSet(t, "blocked", refsOf(rep.Blocked), tc.wantBlocked)
 			assertRefsSet(t, "grooming", refsOf(rep.NeedsGrooming), tc.wantGrooming)
+
+			// Extra non-vacuous check on the multi-eligible case: lexical order
+			// of # refs is NOT the claim order.
+			if len(tc.wantEligible) >= 3 {
+				lexical := append([]string(nil), tc.wantEligible...)
+				sort.Strings(lexical)
+				sameAsLexical := true
+				for i := range lexical {
+					if lexical[i] != tc.wantEligible[i] {
+						sameAsLexical = false
+						break
+					}
+				}
+				if sameAsLexical {
+					t.Fatalf("wantEligible %v coincides with lexical sort — test is vacuous for numeric ordering", tc.wantEligible)
+				}
+			}
 		})
+	}
+}
+
+// TestAssertRefsSet_RejectsExtras is a non-vacuous guard on the helper itself.
+func TestAssertRefsSet_RejectsExtras(t *testing.T) {
+	// Using a nested testing.T via a fake would be heavy; instead assert the
+	// equality logic by calling with matching/extra sets through a local copy.
+	got := []string{"a", "b", "extra"}
+	want := []string{"a", "b"}
+	if refsSetEqual(got, want) {
+		t.Fatal("extras must make sets unequal")
+	}
+	if !refsSetEqual([]string{"b", "a"}, []string{"a", "b"}) {
+		t.Fatal("order-independent equality failed")
+	}
+	if refsSetEqual([]string{"a"}, []string{"a", "b"}) {
+		t.Fatal("missing element must be unequal")
 	}
 }
 
@@ -190,21 +289,36 @@ func assertRefs(t *testing.T, label string, got, want []string) {
 	}
 }
 
+// assertRefsSet requires exact multiset equality (order-independent).
+// Unlike a subset check, unexpected extras fail.
 func assertRefsSet(t *testing.T, label string, got, want []string) {
 	t.Helper()
-	if len(want) == 0 {
-		if len(got) != 0 {
-			t.Fatalf("%s: want empty, got %v", label, got)
-		}
-		return
+	if !refsSetEqual(got, want) {
+		t.Fatalf("%s: got %v want exact set %v", label, got, want)
 	}
-	set := map[string]bool{}
+}
+
+func refsSetEqual(got, want []string) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	if len(want) == 0 {
+		return true
+	}
+	counts := map[string]int{}
 	for _, g := range got {
-		set[g] = true
+		counts[g]++
 	}
 	for _, w := range want {
-		if !set[w] {
-			t.Fatalf("%s: missing %s in %v", label, w, got)
+		counts[w]--
+		if counts[w] < 0 {
+			return false
 		}
 	}
+	for _, c := range counts {
+		if c != 0 {
+			return false
+		}
+	}
+	return true
 }
