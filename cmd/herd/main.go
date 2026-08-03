@@ -21,6 +21,7 @@ import (
 	"github.com/Kampe/Herdforge/pkg/attention"
 	"github.com/Kampe/Herdforge/pkg/config"
 	"github.com/Kampe/Herdforge/pkg/daemon"
+	"github.com/Kampe/Herdforge/pkg/deps"
 	"github.com/Kampe/Herdforge/pkg/dispatch"
 	"github.com/Kampe/Herdforge/pkg/harvest"
 	"github.com/Kampe/Herdforge/pkg/herdr"
@@ -147,6 +148,9 @@ func main() {
 	case "dispatch":
 		runDispatch()
 
+	case "deps":
+		runDeps()
+
 	case "harvest":
 		runHarvest()
 
@@ -224,6 +228,7 @@ func printUsage() {
 	fmt.Println("  doctor-models    Probe each lane's model (+fallbacks) for quota exhaustion")
 	fmt.Println("  next            Show highest-priority next action")
 	fmt.Println("  dispatch        Dispatch a ticket to a worktree and launch agent")
+	fmt.Println("  deps            Packet↔board dependency-graph conformance (FAC-159)")
 	fmt.Println("  harvest         Sweep all worktrees for unmerged commits")
 	fmt.Println("  unmerged        Authoritative cherry-based unmerged check (herd unmerged <path> | --all)")
 	fmt.Println("  lost            Find ownerless unmerged work on ANY branch (subject-based)")
@@ -892,6 +897,10 @@ func runDaemon() {
 }
 
 func runStanding() {
+	// FAC-159: standing launches lane agents, not task claims. Task-scoped
+	// worktrees still go through dispatch/pulse gates. Keep entrypoint linked.
+	assertDepsEntrypoint(deps.EntryStanding)
+
 	cfg, err := config.LoadConfig(".herd/herd.yaml")
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to load config: %v\n", err)
@@ -2129,7 +2138,10 @@ func stateDir() string {
 
 // runLost ports bin/herd-lost: subjects-not-patch-ids, owned-is-not-lost.
 // Exit 0 clean, 1 when an ownerless branch holds unmerged subjects, 2 usage.
+// FAC-159: recovery/rescue re-dispatch of tasks must use dispatch/pulse gates.
 func runLost() {
+	assertDepsEntrypoint(deps.EntryRescue)
+	assertDepsEntrypoint(deps.EntryRecovery)
 	fs := flag.NewFlagSet("lost", flag.ExitOnError)
 	quiet := fs.Bool("quiet", false, "Only status lines, no per-branch tables")
 	noFetch := fs.Bool("no-fetch", false, "Skip git fetch origin")
@@ -3105,7 +3117,9 @@ func runToolProbe() {
 
 // runShoot (FAC-88): `herd shoot <pane|name> <refocus msg>` interrupts a
 // stalled agent (escape) and refocuses it, without killing the pane.
+// FAC-159: shot is refocus-only; new task launches must pass the deps gate via dispatch.
 func runShoot() {
+	assertDepsEntrypoint(deps.EntryShot)
 	if len(os.Args) < 4 {
 		fmt.Fprintln(os.Stderr, "usage: herd shoot <pane|name> <refocus message>")
 		os.Exit(2)
@@ -3185,6 +3199,10 @@ func (d *cliForgeDriver) herd(args ...string) error {
 }
 
 func (d *cliForgeDriver) Dispatch(ctx context.Context, t *provider.Task) error {
+	// FAC-159: wave/forge dispatch goes through herd dispatch which runs the
+	// pre-side-effect dependency gate before any worktree/status/tab.
+	assertDepsEntrypoint(deps.EntryWave)
+	assertDepsEntrypoint(deps.EntryForge)
 	return d.herd("dispatch", t.Ref, "--lane", "worker")
 }
 

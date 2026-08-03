@@ -15,16 +15,17 @@ import (
 )
 
 type mockTaskProvider struct {
-	tasks []*provider.Task
+	tasks     []*provider.Task
+	relations []provider.Relation
 }
 
 func (m *mockTaskProvider) GetTask(_ context.Context, id string) (*provider.Task, error) {
 	for _, t := range m.tasks {
-		if t.ID == id {
+		if t.ID == id || t.Ref == id {
 			return t, nil
 		}
 	}
-	return nil, nil
+	return nil, fmt.Errorf("task not found: %s", id)
 }
 func (m *mockTaskProvider) ListTasks(_ context.Context, _, _ string) ([]*provider.Task, error) {
 	return m.tasks, nil
@@ -35,6 +36,31 @@ func (m *mockTaskProvider) UpdateStatus(_ context.Context, _, _ string) error {
 	return nil
 }
 func (m *mockTaskProvider) AddComment(_ context.Context, _, _ string) error { return nil }
+
+// RelationProvider (FAC-159) — empty board relations by default.
+func (m *mockTaskProvider) ListRelations(_ context.Context, taskID string) ([]provider.Relation, error) {
+	var out []provider.Relation
+	for _, r := range m.relations {
+		if r.SourceTaskID == taskID || r.TargetTaskID == taskID {
+			out = append(out, r)
+		}
+	}
+	return out, nil
+}
+func (m *mockTaskProvider) CreateRelation(_ context.Context, sourceID, targetID string, typ provider.RelationType) (*provider.Relation, error) {
+	r := provider.Relation{ID: "mock-rel", SourceTaskID: sourceID, TargetTaskID: targetID, Type: typ}
+	m.relations = append(m.relations, r)
+	return &r, nil
+}
+func (m *mockTaskProvider) DeleteRelation(_ context.Context, relationID string) error {
+	for i, r := range m.relations {
+		if r.ID == relationID {
+			m.relations = append(m.relations[:i], m.relations[i+1:]...)
+			return nil
+		}
+	}
+	return fmt.Errorf("relation not found: %s", relationID)
+}
 
 // mockWorktree never touches the ambient git repo or package cwd (FAC-121).
 type mockWorktree struct {

@@ -2,8 +2,6 @@ package daemon
 
 import (
 	"context"
-	"net/http"
-	"net/http/httptest"
 	"testing"
 
 	"github.com/Kampe/Herdforge/pkg/config"
@@ -11,22 +9,15 @@ import (
 )
 
 func TestEngine_SelectNextTask_DeterministicSort(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(`[
-			{"id":"1", "ref":"FAC-10", "title":"Medium 1", "priority":"medium", "status":"to-do", "labels":[{"name":"herd-smith"}]},
-			{"id":"2", "ref":"FAC-2", "title":"Urgent 1", "priority":"urgent", "status":"to-do", "labels":[{"name":"herd-smith"}]},
-			{"id":"3", "ref":"FAC-1", "title":"High 1", "priority":"high", "status":"to-do", "labels":[{"name":"herd-smith"}]}
-		]`))
-	}))
-	defer server.Close()
+	mp := provider.NewMemoryProvider()
+	mp.AddTask(&provider.Task{ID: "1", Ref: "FAC-10", Title: "Medium 1", Priority: provider.PriorityMedium, Status: "to-do", ProjectID: "proj-1", Labels: []string{"herd-smith"}})
+	mp.AddTask(&provider.Task{ID: "2", Ref: "FAC-2", Title: "Urgent 1", Priority: provider.PriorityUrgent, Status: "to-do", ProjectID: "proj-1", Labels: []string{"herd-smith"}})
+	mp.AddTask(&provider.Task{ID: "3", Ref: "FAC-1", Title: "High 1", Priority: provider.PriorityHigh, Status: "to-do", ProjectID: "proj-1", Labels: []string{"herd-smith"}})
 
 	cfg := &config.Config{
 		TaskProvider: config.TaskProvider{ProjectID: "proj-1"},
 	}
-	kp := provider.NewKaneoProvider(server.URL, "proj-1", false)
-	engine := NewEngine(cfg, kp, nil, nil, nil, nil)
+	engine := NewEngine(cfg, mp, nil, nil, nil, nil)
 
 	task, err := engine.SelectNextTask(context.Background(), "herd-smith")
 	if err != nil {
