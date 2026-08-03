@@ -142,12 +142,9 @@ func TestBuildTaskPacket(t *testing.T) {
 		Model: "deepseek-v4-flash", Prompt: ".herd/prompts/worker.md",
 	}
 	verification := config.Verification{TestCommand: "go test ./...", PreflightCommand: "go build ./..."}
-	packet := buildTaskPacket(task, "/tmp/wt", "herd/fac-33", ".herd/prompts/worker.md", lane, verification)
+	packet := buildTaskPacket(task, "herd/fac-33", ".herd/prompts/worker.md", "kaneo", lane, verification)
 	if !strings.Contains(packet, "FAC-33") {
 		t.Error("packet should contain ticket ref")
-	}
-	if !strings.Contains(packet, "/tmp/wt") {
-		t.Error("packet should contain worktree path")
 	}
 	if !strings.Contains(packet, "herd/fac-33") {
 		t.Error("packet must carry the actual Git branch name")
@@ -163,12 +160,52 @@ func TestBuildTaskPacket(t *testing.T) {
 	if !strings.Contains(packet, "herd verify") {
 		t.Error("packet must include the self-verify completion contract")
 	}
-	// FAC-134: packet must never carry a hardcoded, repo-specific absolute path.
+	// FAC-134 review finding #1: packet must never carry an absolute host
+	// path (repo-specific or otherwise) — cwd is Herdr-enforced separately.
 	if strings.Contains(packet, "chainseer") || strings.Contains(packet, "~/Personal") {
 		t.Error("packet must not reference a hardcoded repo-specific path")
 	}
+	if strings.Contains(packet, "/tmp/") {
+		t.Error("packet must not embed any absolute host path")
+	}
+	// herd verify's flags must precede the positional worktree arg: Go's
+	// flag package stops parsing at the first non-flag token, so flags
+	// placed after "." are silently ignored (FAC-134 latent bug).
+	if !strings.Contains(packet, `herd verify --build "go build ./..." --test "go test ./..." .`) {
+		t.Errorf("herd verify flags must precede the positional worktree arg:\n%s", packet)
+	}
 	if lines := strings.Count(packet, "\n"); lines > 25 {
 		t.Errorf("packet must stay tight (<25 lines), got %d", lines)
+	}
+}
+
+// TestBuildTaskPacket_ProviderNeutralTaskReference is non-vacuous: it proves
+// the "read the full spec" step only names the `kaneo` CLI when kaneo is the
+// configured task provider. A regression that unconditionally emits `kaneo
+// task get` (FAC-134 review finding #2) breaks the non-kaneo case even
+// though the kaneo case would still pass.
+func TestBuildTaskPacket_ProviderNeutralTaskReference(t *testing.T) {
+	task := &provider.Task{Ref: "FAC-2", Title: "Task FAC-2"}
+	lane := &config.LaneDef{Name: "worker", Prompt: ".herd/prompts/worker.md"}
+	verification := config.Verification{TestCommand: "go test ./..."}
+
+	t.Run("kaneo provider gets the kaneo CLI reference", func(t *testing.T) {
+		packet := buildTaskPacket(task, "herd/fac-2", ".herd/prompts/worker.md", "kaneo", lane, verification)
+		if !strings.Contains(packet, "kaneo task get FAC-2 --full") {
+			t.Errorf("kaneo provider must reference the kaneo CLI:\n%s", packet)
+		}
+	})
+
+	for _, providerType := range []string{"github", "linear", "jira", "memory", ""} {
+		t.Run(providerType+" provider does not assume kaneo", func(t *testing.T) {
+			packet := buildTaskPacket(task, "herd/fac-2", ".herd/prompts/worker.md", providerType, lane, verification)
+			if strings.Contains(packet, "kaneo task get") || strings.Contains(packet, "kaneo") {
+				t.Errorf("provider %q must not assume ambient kaneo credentials:\n%s", providerType, packet)
+			}
+			if !strings.Contains(packet, "FAC-2") {
+				t.Errorf("packet must still reference the task ref:\n%s", packet)
+			}
+		})
 	}
 }
 
@@ -209,7 +246,7 @@ func TestBuildTaskPacket_RepositoryAgnosticVerification(t *testing.T) {
 
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			packet := buildTaskPacket(task, "/tmp/wt", "herd/fac-1", ".herd/prompts/worker.md", lane, c.verification)
+			packet := buildTaskPacket(task, "herd/fac-1", ".herd/prompts/worker.md", "kaneo", lane, c.verification)
 			for _, want := range c.wantContains {
 				if !strings.Contains(packet, want) {
 					t.Errorf("packet missing %q:\n%s", want, packet)

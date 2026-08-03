@@ -353,7 +353,7 @@ func (d *Dispatcher) Dispatch(ctx context.Context, opts DispatchOptions) (*Dispa
 		rolePath = ".herd/prompts/worker.md"
 	}
 
-	packet := buildTaskPacket(task, wtInfo.Path, branch, rolePath, lane, d.Config.Verification)
+	packet := buildTaskPacket(task, branch, rolePath, d.Config.TaskProvider.Type, lane, d.Config.Verification)
 	packetPath := filepath.Join(wtInfo.Path, "TASK-PACKET.md")
 	if err := os.WriteFile(packetPath, []byte(packet), 0644); err != nil {
 		return nil, d.failWithCompensate(ctx, task.Ref, "task_packet_write_failed",
@@ -557,7 +557,16 @@ func extractIntentFromTitle(title string) string {
 // same packet works for Go, Node, Python, or docs-only repositories.
 // Callers must ensure verification.TestCommand is non-empty (Dispatch fails
 // closed before calling this).
-func buildTaskPacket(task *provider.Task, wtPath, branch, rolePath string, lane *config.LaneDef, verification config.Verification) string {
+//
+// The packet never embeds the host's absolute worktree path (portability;
+// FAC-134 review finding). Herdr already cwd-enforces the worker into the
+// worktree (TabCreateForTask), so the packet refers to it as "." / "the
+// current directory" — cwd is preserved separately from packet text, not
+// duplicated into it. Likewise, the "read the full spec" step names a
+// concrete CLI only for the task provider actually configured (kaneo); any
+// other provider gets a provider-neutral reference instead of an assumed,
+// uncredentialed `kaneo` CLI call.
+func buildTaskPacket(task *provider.Task, branch, rolePath, taskProviderType string, lane *config.LaneDef, verification config.Verification) string {
 	var b strings.Builder
 
 	verifySummary := verification.TestCommand
@@ -570,16 +579,23 @@ func buildTaskPacket(task *provider.Task, wtPath, branch, rolePath string, lane 
 	fmt.Fprintf(&b, "BUILD %s — EXECUTE. No menus, no questions. Do not stop until "+
 		"`%s` passes AND you have committed.\n\n", task.Ref, verifySummary)
 
-	fmt.Fprintf(&b, "Worktree: %s (branch %s). Work ONLY here — never edit files outside it.\n\n", wtPath, branch)
+	fmt.Fprintf(&b, "Worktree: current directory (Herdr cwd-enforced), branch %s. Work ONLY here — never edit files outside it.\n\n", branch)
 
-	fmt.Fprintf(&b, "Read the full spec yourself (do not wait for it inline):\n")
-	fmt.Fprintf(&b, "  kaneo task get %s --full\n\n", task.Ref)
+	fmt.Fprintf(&b, "Read the full spec yourself (do not wait for it inline) via the configured task provider (%s):\n", taskProviderType)
+	if taskProviderType == "kaneo" {
+		fmt.Fprintf(&b, "  kaneo task get %s --full\n\n", task.Ref)
+	} else {
+		fmt.Fprintf(&b, "  ref: %s\n\n", task.Ref)
+	}
 
 	b.WriteString("Completion contract (self-gate, FAC-116):\n")
-	fmt.Fprintf(&b, "  1. You are already in %s (Herdr cwd-enforced).\n", wtPath)
+	b.WriteString("  1. You are already in the task worktree (Herdr cwd-enforced).\n")
 	b.WriteString("  2. Implement per the spec you just read (real code + table tests).\n")
 	fmt.Fprintf(&b, "  3. `%s` — ALL green.\n", verifySummary)
-	fmt.Fprintf(&b, "  4. Verify yourself: herd verify %s %s (must PASS: real commits + build + tests).\n", wtPath, verifyFlags)
+	// Flags before the positional worktree arg: Go's flag package stops
+	// parsing at the first non-flag token, so flags placed after "." would
+	// be silently ignored.
+	fmt.Fprintf(&b, "  4. Verify yourself: herd verify %s . (must PASS: real commits + build + tests).\n", verifyFlags)
 	fmt.Fprintf(&b, "  5. git add -A && git commit -m \"<msg containing %s>\" (no AI-attribution trailers).\n", task.Ref)
 	fmt.Fprintf(&b, "  6. Final message: `BUILD COMPLETE %s` + `git rev-parse HEAD`.\n\n", task.Ref)
 
