@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "note": "Herdforge lane registry: constraint sections are VERBATIM from chainseer docs/agent/lane-registry.json (the parity contract for the shell->Go swap); lanes[] is the forge roster (scout, smith, assayer). FAC-142 SurfaceRouter.Decide owns live provider+model+effort+pool for worker and reviewer launches (never harness defaults). Deterministic, no LLM calls.",
+  "note": "Herdforge lane registry: constraint sections are VERBATIM from chainseer docs/agent/lane-registry.json (the parity contract for the shell->Go swap); lanes[] is the complete forge roster (FAC-127): scout, smith, assayer, orchestrator, scout-planner, verification-gate, review-supervisor, harvest, recovery-sentinel. FAC-142 SurfaceRouter.Decide owns live provider+model+effort+pool for worker and reviewer launches (never harness defaults). Deterministic, no LLM calls.",
   "provider_constraints": {
     "claude-haiku-4-5": {
       "forbid_standing": true,
@@ -128,7 +128,8 @@
       "role": "forge-smith",
       "route_shape": "implementation",
       "risk_class": "deep-reasoning",
-      "prefer": null
+      "prefer": null,
+      "standing": false
     },
     {
       "id": "smith",
@@ -136,7 +137,8 @@
       "role": "worker",
       "route_shape": "implementation",
       "risk_class": "standard",
-      "prefer": null
+      "prefer": null,
+      "standing": false
     },
     {
       "id": "assayer",
@@ -145,7 +147,64 @@
       "route_shape": "qa",
       "risk_class": "standard",
       "prefer": "claude",
-      "prefer_model": "claude-sonnet-5"
+      "prefer_model": "claude-sonnet-5",
+      "standing": false
+    },
+    {
+      "id": "orchestrator",
+      "packet": ".herd/prompts/orchestrator.md",
+      "role": "orchestrator",
+      "route_shape": "coordinator",
+      "risk_class": "orchestrator",
+      "prefer": null,
+      "standing": true
+    },
+    {
+      "id": "scout-planner",
+      "packet": ".herd/prompts/scout-planner.md",
+      "role": "scout-planner",
+      "route_shape": "architecture",
+      "risk_class": "deep-reasoning",
+      "prefer": null,
+      "standing": true
+    },
+    {
+      "id": "verification-gate",
+      "packet": ".herd/prompts/verification-gate.md",
+      "role": "verification-gate",
+      "route_shape": "bounded",
+      "risk_class": "standard",
+      "prefer": null,
+      "standing": false
+    },
+    {
+      "id": "review-supervisor",
+      "packet": ".herd/prompts/review-supervisor.md",
+      "role": "review-supervisor",
+      "route_shape": "coordinator",
+      "risk_class": "standard",
+      "prefer": "claude",
+      "prefer_model": "claude-sonnet-5",
+      "standing": true
+    },
+    {
+      "id": "harvest",
+      "packet": ".herd/prompts/harvest.md",
+      "role": "harvest",
+      "route_shape": "bounded",
+      "risk_class": "standard",
+      "prefer": "claude",
+      "prefer_model": "claude-sonnet-5",
+      "standing": true
+    },
+    {
+      "id": "recovery-sentinel",
+      "packet": ".herd/prompts/recovery-sentinel.md",
+      "role": "recovery-sentinel",
+      "route_shape": "bounded",
+      "risk_class": "standard",
+      "prefer": null,
+      "standing": true
     }
   ]
 }
