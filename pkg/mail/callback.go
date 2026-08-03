@@ -1,6 +1,7 @@
 package mail
 
 import (
+	"context"
 	"encoding/json"
 	"strings"
 )
@@ -48,6 +49,12 @@ type Callback struct {
 // body is the JSON-encoded Callback the loop parses. SenderRole defaults to
 // sender when the caller hasn't set it explicitly.
 func (m *Mailbox) PostCallback(sender string, cb Callback) (*Envelope, error) {
+	return m.PostCallbackContext(context.Background(), sender, cb)
+}
+
+// PostCallbackContext is PostCallback with caller-deadline inheritance on
+// the mailbox flock (SendMessageContext).
+func (m *Mailbox) PostCallbackContext(ctx context.Context, sender string, cb Callback) (*Envelope, error) {
 	if cb.SenderRole == "" {
 		cb.SenderRole = sender
 	}
@@ -56,14 +63,20 @@ func (m *Mailbox) PostCallback(sender string, cb Callback) (*Envelope, error) {
 		return nil, err
 	}
 	subject := string(cb.Kind) + ": " + cb.Ref
-	return m.SendMessage(sender, CoordinatorInbox, subject, string(body))
+	return m.SendMessageContext(ctx, sender, CoordinatorInbox, subject, string(body))
 }
 
 // DrainCallbacks reads and parses every callback in the coordinator inbox.
 // Non-callback envelopes (plain messages) are skipped, not errors — the
 // inbox is shared. Malformed callback bodies are skipped too.
 func (m *Mailbox) DrainCallbacks() ([]Callback, error) {
-	envs, err := m.ReadInbox(CoordinatorInbox)
+	return m.DrainCallbacksContext(context.Background())
+}
+
+// DrainCallbacksContext is DrainCallbacks with deadline inheritance on
+// ReadInbox quarantine lock acquisition.
+func (m *Mailbox) DrainCallbacksContext(ctx context.Context) ([]Callback, error) {
+	envs, err := m.ReadInboxContext(ctx, CoordinatorInbox)
 	if err != nil {
 		return nil, err
 	}
