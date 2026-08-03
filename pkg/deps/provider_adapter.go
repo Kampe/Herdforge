@@ -355,19 +355,86 @@ func (s *ProviderStore) SnapshotGraph(ctx context.Context) (*GraphSnapshot, erro
 	return cloneSnapshot(snap), nil
 }
 
-// RelationRevision is a cheap authoritative re-read of the project relation
-// multiset hash for final TOCTOU without re-running full gate hydration when
-// the fence already holds task maps. Still fails closed on bulk error.
+// RelationRevision returns the fence snapshot's provider revision when present.
+// It does NOT re-run N-call project fan-out (FAC-159 final TOCTOU must not
+// repeat a full storm). Use AssertIncidentEdgesFresh for post-side-effect
+// relation drift detection on the launch target.
 func (s *ProviderStore) RelationRevision(ctx context.Context) (string, error) {
-	// Force relation re-list: temporarily invalidate snap but keep task maps.
 	if fence := FenceFrom(ctx); fence != nil {
-		fence.Invalidate(false)
+		if snap := fence.GetSnap(); snap != nil && snap.ProviderRevision != "" {
+			return snap.ProviderRevision, nil
+		}
 	}
 	snap, err := s.SnapshotGraph(ctx)
 	if err != nil {
 		return "", err
 	}
 	return snap.ProviderRevision, nil
+}
+
+// AssertIncidentEdgesFresh re-lists relations for one task (O(1) provider
+// calls, not O(board)) and compares the multiset to the fenced snapshot.
+// Detects concurrent relation mutations on the launch target without
+// re-stamping the full project. Dual-end full agreement remains on the
+// initial SnapshotGraph.
+func (s *ProviderStore) AssertIncidentEdgesFresh(ctx context.Context, taskRef Ref, taskID TaskID, snap *GraphSnapshot) error {
+	if snap == nil {
+		return fmt.Errorf("deps: AssertIncidentEdgesFresh: nil snapshot")
+	}
+	rp, err := s.rel()
+	if err != nil {
+		return err
+	}
+	if !taskID.Valid() {
+		return fmt.Errorf("deps: AssertIncidentEdgesFresh: task id required")
+	}
+	s.ListRelCalls.Add(1)
+	rels, err := rp.ListRelations(ctx, string(taskID))
+	if err != nil {
+		return err
+	}
+	live := make([]DependencyEdge, 0, len(rels))
+	for _, r := range rels {
+		e, merr := s.mapEdgeStrict(ctx, r)
+		if merr != nil {
+			return merr
+		}
+		if e.Type != EdgeBlocks {
+			continue
+		}
+		live = append(live, e)
+	}
+	want := FilterInvolvingTask(snap.Edges, taskRef, taskID)
+	wantBlocks := make([]DependencyEdge, 0, len(want))
+	for _, e := range want {
+		if e.Type == EdgeBlocks {
+			wantBlocks = append(wantBlocks, e)
+		}
+	}
+	if !edgeMultisetEqualKeys(live, wantBlocks) {
+		return fmt.Errorf("%w: incident edges for %s changed since fence snapshot", ErrPostClaimDrift, taskRef)
+	}
+	return nil
+}
+
+func edgeMultisetEqualKeys(a, b []DependencyEdge) bool {
+	ca := map[string]int{}
+	cb := map[string]int{}
+	for _, e := range a {
+		ca[e.RelationID+"|"+e.Key()]++
+	}
+	for _, e := range b {
+		cb[e.RelationID+"|"+e.Key()]++
+	}
+	if len(ca) != len(cb) {
+		return false
+	}
+	for k, n := range ca {
+		if cb[k] != n {
+			return false
+		}
+	}
+	return true
 }
 
 func assembleDualEnd(byTask map[string][]provider.Relation) ([]provider.Relation, error) {

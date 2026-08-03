@@ -6,7 +6,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -59,30 +61,268 @@ func NewKaneoProvider(apiURL string, projectID string, useCLI bool) *KaneoProvid
 	if projectID == "" {
 		projectID = ResolveKaneoProjectID(".")
 	}
-	key := strings.TrimSpace(os.Getenv("KANEO_API_KEY"))
+	// Do NOT auto-inject profile api_key into APIKey: profile credentials are
+	// origin-bound to the profile's api_url only (FAC-159 credential exfil).
+	// Explicit APIKey (factory/env) is bound to this provider's APIURL origin.
+	key := ""
+	if v := strings.TrimSpace(os.Getenv("KANEO_API_KEY")); v != "" {
+		key = v
+	}
 	return &KaneoProvider{
 		APIURL:    apiURL,
 		ProjectID: projectID,
 		UseCLI:    useCLI,
 		APIKey:    key,
-		Client:    defaultHTTPClient(),
+		Client:    kaneoHTTPClient(),
 		Deadlines: DefaultDeadlines(),
 		Retry:     DefaultReadRetry(),
 	}
 }
 
-// authorizeKaneo sets Bearer auth when an API key is configured.
+// kaneoCLIAuthConfig matches the installed kaneo CLI config schema:
+//
+//	{ "profiles": { "default": { "api_key": "...", "api_url": "..." } },
+//	  "default_profile": "default" }
+//
+// Never log api_key values.
+type kaneoCLIAuthConfig struct {
+	Profiles       map[string]kaneoCLIProfile `json:"profiles"`
+	DefaultProfile string                     `json:"default_profile"`
+}
+
+type kaneoCLIProfile struct {
+	APIKey      string `json:"api_key"`
+	APIURL      string `json:"api_url"`
+	WorkspaceID string `json:"workspace_id"`
+}
+
+// kaneoOriginCred is an origin-bound HTTP credential (key never logged).
+// TrustedOrigin is scheme://host:port (canonical effective port).
+type kaneoOriginCred struct {
+	Key           string
+	TrustedOrigin string
+}
+
+// userConfigDirFn is os.UserConfigDir; tests inject a hermetic root.
+// Must return an absolute path or empty/error — never a worktree-relative dir.
+var userConfigDirFn = os.UserConfigDir
+
+// kaneoCLIConfigPath returns the canonical kaneo config.json path under
+// os.UserConfigDir (macOS: ~/Library/Application Support/kaneo/config.json,
+// Linux: ~/.config/kaneo/config.json). Refuses non-absolute roots so empty
+// HOME/XDG cannot collapse into repo-relative credential files.
+func kaneoCLIConfigPath() (string, error) {
+	dir, err := userConfigDirFn()
+	if err != nil {
+		return "", err
+	}
+	dir = strings.TrimSpace(dir)
+	if dir == "" {
+		return "", fmt.Errorf("user config dir empty")
+	}
+	if !filepath.IsAbs(dir) {
+		return "", fmt.Errorf("user config dir is not absolute (refusing worktree-relative credential path)")
+	}
+	return filepath.Join(dir, "kaneo", "config.json"), nil
+}
+
+// canonicalizeHTTPOrigin returns scheme://host:port for comparison.
+// Rejects empty/invalid URLs, userinfo, and non-http(s) schemes.
+func canonicalizeHTTPOrigin(raw string) (string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", fmt.Errorf("empty url")
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return "", err
+	}
+	return canonicalizeURLOrigin(u)
+}
+
+func canonicalizeURLOrigin(u *url.URL) (string, error) {
+	if u == nil {
+		return "", fmt.Errorf("nil url")
+	}
+	scheme := strings.ToLower(strings.TrimSpace(u.Scheme))
+	if scheme != "http" && scheme != "https" {
+		return "", fmt.Errorf("unsupported scheme %q", u.Scheme)
+	}
+	if u.User != nil {
+		return "", fmt.Errorf("userinfo not allowed in origin")
+	}
+	host := u.Hostname()
+	if host == "" {
+		return "", fmt.Errorf("empty host")
+	}
+	host = strings.ToLower(host)
+	port := u.Port()
+	if port == "" {
+		if scheme == "https" {
+			port = "443"
+		} else {
+			port = "80"
+		}
+	}
+	// Reject non-numeric / weird ports via net.JoinHostPort validation path.
+	if _, err := net.LookupPort("tcp", port); err != nil {
+		// LookupPort fails for some valid numeric ports in restricted envs;
+		// still require digits-only.
+		for _, c := range port {
+			if c < '0' || c > '9' {
+				return "", fmt.Errorf("invalid port")
+			}
+		}
+	}
+	return scheme + "://" + net.JoinHostPort(host, port), nil
+}
+
+// ResolveKaneoProfileCred loads the selected default_profile's api_key and
+// api_url together and returns an origin-bound credential. Empty TrustedOrigin
+// or Key means unusable. Never scans an arbitrary first profile; never logs the key.
+func ResolveKaneoProfileCred() kaneoOriginCred {
+	path, err := kaneoCLIConfigPath()
+	if err != nil || path == "" || !filepath.IsAbs(path) {
+		return kaneoOriginCred{}
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil || len(bytes.TrimSpace(raw)) == 0 {
+		return kaneoOriginCred{}
+	}
+	var cfg kaneoCLIAuthConfig
+	if err := json.Unmarshal(raw, &cfg); err != nil {
+		return kaneoOriginCred{}
+	}
+	name := strings.TrimSpace(cfg.DefaultProfile)
+	if name == "" || cfg.Profiles == nil {
+		return kaneoOriginCred{}
+	}
+	prof, ok := cfg.Profiles[name]
+	if !ok {
+		return kaneoOriginCred{}
+	}
+	key := strings.TrimSpace(prof.APIKey)
+	if key == "" {
+		return kaneoOriginCred{}
+	}
+	origin, err := canonicalizeHTTPOrigin(prof.APIURL)
+	if err != nil || origin == "" {
+		// Key without a trusted origin is unusable for HTTP auth.
+		return kaneoOriginCred{}
+	}
+	return kaneoOriginCred{Key: key, TrustedOrigin: origin}
+}
+
+// ResolveKaneoAPIKey is retained for tests/callers that only need a key string.
+// Prefer ResolveKaneoProfileCred + origin checks for HTTP authorization.
+// Order: explicit override → KANEO_API_KEY env → profile key (only when profile
+// has a resolvable api_url; key alone is never returned from profile without origin).
+func ResolveKaneoAPIKey(override string) string {
+	if v := strings.TrimSpace(override); v != "" {
+		return v
+	}
+	if v := strings.TrimSpace(os.Getenv("KANEO_API_KEY")); v != "" {
+		return v
+	}
+	// Profile: only surface key when origin-bound pair is complete.
+	cred := ResolveKaneoProfileCred()
+	if cred.Key != "" && cred.TrustedOrigin != "" {
+		return cred.Key
+	}
+	return ""
+}
+
+// authorizeKaneo attaches Bearer auth only when the request origin exactly
+// matches a trusted origin for that credential:
+//   - explicit k.APIKey is bound to canonicalize(k.APIURL) (operator-paired)
+//   - profile key is bound only to canonicalize(profile.api_url)
+// Repo-controlled APIURL cannot pull the global profile token to a foreign host.
 func (k *KaneoProvider) authorizeKaneo(req *http.Request) {
-	if k == nil || req == nil {
+	if k == nil || req == nil || req.URL == nil {
 		return
 	}
-	key := strings.TrimSpace(k.APIKey)
+	reqOrigin, err := canonicalizeURLOrigin(req.URL)
+	if err != nil {
+		return
+	}
+	key := k.credentialForRequestOrigin(reqOrigin)
 	if key == "" {
-		key = strings.TrimSpace(os.Getenv("KANEO_API_KEY"))
+		return
 	}
-	if key != "" {
-		req.Header.Set("Authorization", "Bearer "+key)
+	req.Header.Set("Authorization", "Bearer "+key)
+}
+
+// credentialForRequestOrigin returns a key only if reqOrigin is trusted for it.
+// Never logs keys.
+func (k *KaneoProvider) credentialForRequestOrigin(reqOrigin string) string {
+	if reqOrigin == "" {
+		return ""
 	}
+	// 1) Explicit APIKey (env/factory): bound to provider APIURL origin only.
+	if key := strings.TrimSpace(k.APIKey); key != "" {
+		apiOrigin, err := canonicalizeHTTPOrigin(k.APIURL)
+		if err != nil || apiOrigin == "" || apiOrigin != reqOrigin {
+			return ""
+		}
+		return key
+	}
+	// 2) Profile: key+api_url resolved together; exact origin match required.
+	cred := ResolveKaneoProfileCred()
+	if cred.Key != "" && cred.TrustedOrigin != "" && cred.TrustedOrigin == reqOrigin {
+		return cred.Key
+	}
+	return ""
+}
+
+// credentialForAPIURL is used by graph preflight: can we authorize requests
+// to this provider's configured APIURL?
+func (k *KaneoProvider) credentialForAPIURL() string {
+	if k == nil {
+		return ""
+	}
+	origin, err := canonicalizeHTTPOrigin(k.APIURL)
+	if err != nil {
+		return ""
+	}
+	return k.credentialForRequestOrigin(origin)
+}
+
+func (k *KaneoProvider) resolvedAPIKey() string {
+	// Deprecated for auth decisions — kept for tests that check "has any key material".
+	// Prefer credentialForAPIURL (origin-bound).
+	if k == nil {
+		return ""
+	}
+	return k.credentialForAPIURL()
+}
+
+// kaneoHTTPClient refuses cross-origin redirects so Authorization cannot hop
+// to an attacker-controlled Location after a trusted-origin first hop.
+func kaneoHTTPClient() *http.Client {
+	c := defaultHTTPClient()
+	c.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		if len(via) == 0 {
+			return http.ErrUseLastResponse
+		}
+		prev := via[len(via)-1]
+		if prev.URL == nil || req.URL == nil {
+			return fmt.Errorf("kaneo: redirect missing url")
+		}
+		from, err1 := canonicalizeURLOrigin(prev.URL)
+		to, err2 := canonicalizeURLOrigin(req.URL)
+		if err1 != nil || err2 != nil || from != to {
+			// Strip any credentials that might have been copied.
+			req.Header.Del("Authorization")
+			return fmt.Errorf("kaneo: refusing cross-origin redirect")
+		}
+		// Same origin: still drop Authorization on redirect (re-auth only via authorizeKaneo on new requests).
+		req.Header.Del("Authorization")
+		if len(via) >= 5 {
+			return fmt.Errorf("kaneo: too many redirects")
+		}
+		return nil
+	}
+	return c
 }
 
 func (k *KaneoProvider) deadlines() Deadlines {
@@ -348,6 +588,7 @@ func (k *KaneoProvider) listTasksOnce(ctx context.Context, projectID, status str
 	if err != nil {
 		return nil, err
 	}
+	k.authorizeKaneo(req)
 	resp, err := k.httpClient().Do(req)
 	if err != nil {
 		return nil, err
@@ -419,6 +660,7 @@ func (k *KaneoProvider) updateStatusOnce(ctx context.Context, taskID, status str
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	k.authorizeKaneo(req)
 	resp, err := k.httpClient().Do(req)
 	if err != nil {
 		return err
@@ -482,6 +724,7 @@ func (k *KaneoProvider) addCommentOnce(ctx context.Context, taskID, body string)
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	k.authorizeKaneo(req)
 	resp, err := k.httpClient().Do(req)
 	if err != nil {
 		return err

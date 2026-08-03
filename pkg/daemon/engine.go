@@ -213,8 +213,8 @@ func (e *Engine) RunPulse(ctx context.Context, role string) (*provider.Task, err
 		return nil, fmt.Errorf("pulse sweep refused: %s", e.ProviderStatus())
 	}
 
-	// Bulk graph fence for selection + fenced claim (one hydration / reuse).
-	ctx, snapFence := deps.WithSnapshotFence(ctx)
+	// Project graph fence for selection + fenced claim (one hydration / reuse).
+	ctx, _ = deps.WithSnapshotFence(ctx)
 
 	task, selectionRev, err := e.selectNextTaskWithRevision(ctx, role)
 	if err != nil {
@@ -254,7 +254,8 @@ func (e *Engine) RunPulse(ctx context.Context, role string) (*provider.Task, err
 
 	// Fenced claim: pre/post graph check around board ClaimTask. Compensation is
 	// generation-fenced — board to-do only when we still hold owner+generation.
-	// Invalidate fence before post-claim revalidation so TOCTOU sees fresh bulk.
+	// Post revalidation reuses the fence snapshot + O(1) incident ListRelations
+	// (no full-board re-fanout / CLI storm).
 	_, gerr := deps.FencedClaim(
 		ctx,
 		e.depsStore(),
@@ -268,13 +269,7 @@ func (e *Engine) RunPulse(ctx context.Context, role string) (*provider.Task, err
 			} else if !owns {
 				return fmt.Errorf("%w: lost lease before board claim", deps.ErrNotOwner)
 			}
-			if err := e.claimTaskBound(cctx, task.ID, role); err != nil {
-				return err
-			}
-			if snapFence != nil {
-				snapFence.Invalidate(false)
-			}
-			return nil
+			return e.claimTaskBound(cctx, task.ID, role)
 		},
 		func(cctx context.Context, taskID deps.TaskID, reason string) error {
 			// Board reverse while still owner; release only after board OK.

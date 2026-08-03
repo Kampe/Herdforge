@@ -142,15 +142,16 @@ func (d *delayedBulkProvider) GetTask(ctx context.Context, id string) (*provider
 	return d.MemoryProvider.GetTask(ctx, id)
 }
 
-// TestSnapshotGraph_166TaskBulkBoundedCallCount proves the production bulk path
-// does not sequential-stampede: with 5ms "CLI" delay, sequential would take
-// ~830ms+; bulk+fence must stay bounded and use O(1) bulk calls per fence.
-func TestSnapshotGraph_166TaskBulkBoundedCallCount(t *testing.T) {
+// TestSnapshotGraph_FenceReuse_NoSecondProjectFanout proves fence reuse:
+// one ListProjectRelations per fence; pre+post launch checks do not re-fanout
+// the board (post TOCTOU is O(1) incident ListRelations on the target).
+// Note: delayedBulkProvider is NOT Kaneo production proof — see
+// provider.TestKaneoListProjectRelations_* for real KaneoProvider paths.
+func TestSnapshotGraph_FenceReuse_NoSecondProjectFanout(t *testing.T) {
 	const n = 166
-	// 5ms per ListRelations × 166 ≈ 830ms sequential floor; bulk is one 5ms call.
 	p := newDelayedBoard(n, 5*time.Millisecond, 5*time.Millisecond, true)
 	store := NewProviderStore(p, "proj")
-	ctx, fence := WithSnapshotFence(context.Background())
+	ctx, _ := WithSnapshotFence(context.Background())
 
 	start := time.Now()
 	snap1, err := store.SnapshotGraph(ctx)
@@ -160,7 +161,6 @@ func TestSnapshotGraph_166TaskBulkBoundedCallCount(t *testing.T) {
 	if snap1 == nil || len(snap1.Edges) < 1 {
 		t.Fatalf("expected edges, got %+v", snap1)
 	}
-	// Reuse within fence — no second bulk.
 	snap2, err := store.SnapshotGraph(ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -171,27 +171,20 @@ func TestSnapshotGraph_166TaskBulkBoundedCallCount(t *testing.T) {
 	elapsed := time.Since(start)
 
 	if p.bulkCalls.Load() != 1 {
-		t.Fatalf("want 1 bulk call for fence, got %d", p.bulkCalls.Load())
-	}
-	if p.listRelCalls.Load() != 0 {
-		t.Fatalf("bulk path must not call per-task ListRelations, got %d", p.listRelCalls.Load())
+		t.Fatalf("want 1 ListProjectRelations for fence, got %d", p.bulkCalls.Load())
 	}
 	if p.listTasksCalls.Load() != 1 {
 		t.Fatalf("want 1 ListTasks hydration per fence, got %d", p.listTasksCalls.Load())
 	}
-	// Sequential would be >= 166*5ms = 830ms; allow generous headroom under 300ms.
 	if elapsed > 300*time.Millisecond {
-		t.Fatalf("bulk snapshot too slow (%v); likely sequential stampede", elapsed)
+		t.Fatalf("fence path too slow (%v)", elapsed)
 	}
-	_ = fence
 
-	// ValidateLaunch twice within fence: still one bulk.
 	headRef := Ref(fmt.Sprintf("FAC-%d", n))
 	des, err := ExtractProvenanceFromText(p.tasks[n-1].Description)
 	if err != nil || des == nil {
 		t.Fatal(err)
 	}
-	// Need task_id in fence — bind.
 	if err := des.BindAndValidate(headRef, TaskID(fmt.Sprintf("id-%d", n))); err != nil {
 		t.Fatal(err)
 	}
@@ -199,25 +192,18 @@ func TestSnapshotGraph_166TaskBulkBoundedCallCount(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Post-selection check: still one project fan-out; +incident ListRelations only.
+	relBefore := p.listRelCalls.Load()
 	_, err = RequireTaskLaunch(ctx, store, EntryDispatch, headRef, des, g1.GraphRevision)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if p.bulkCalls.Load() != 1 {
-		t.Fatalf("pre-side-effect gate reuse: want still 1 bulk, got %d", p.bulkCalls.Load())
+		t.Fatalf("post check must not re-run ListProjectRelations, got %d", p.bulkCalls.Load())
 	}
-	if p.listTasksCalls.Load() != 1 {
-		t.Fatalf("pre-side-effect: want 1 ListTasks, got %d", p.listTasksCalls.Load())
-	}
-
-	// Invalidate → fresh bulk for post TOCTOU.
-	fence.Invalidate(false)
-	_, err = RequireTaskLaunch(ctx, store, EntryDispatch, headRef, des, g1.GraphRevision)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if p.bulkCalls.Load() != 2 {
-		t.Fatalf("after Invalidate want 2 bulk calls, got %d", p.bulkCalls.Load())
+	// AssertIncidentEdgesFresh → exactly one ListRelations on the target.
+	if p.listRelCalls.Load()-relBefore != 1 {
+		t.Fatalf("want 1 incident ListRelations on post check, got delta %d", p.listRelCalls.Load()-relBefore)
 	}
 }
 
@@ -238,11 +224,12 @@ func TestSnapshotGraph_CancelStopsBulkFanout(t *testing.T) {
 	}
 }
 
-// TestSnapshotGraph_StaleRevisionRejected after fence invalidate + relation change.
-func TestSnapshotGraph_StaleRevisionRejected(t *testing.T) {
+// TestSnapshotGraph_IncidentTOCTOU_WithoutFullRefanout: mutating edges on the
+// launch target is caught by O(1) incident refresh without ListProjectRelations×2.
+func TestSnapshotGraph_IncidentTOCTOU_WithoutFullRefanout(t *testing.T) {
 	p := newDelayedBoard(20, 0, 0, true)
 	store := NewProviderStore(p, "proj")
-	ctx, fence := WithSnapshotFence(context.Background())
+	ctx, _ := WithSnapshotFence(context.Background())
 	headRef := Ref("FAC-20")
 	des, _ := ExtractProvenanceFromText(p.tasks[19].Description)
 	_ = des.BindAndValidate(headRef, "id-20")
@@ -251,23 +238,24 @@ func TestSnapshotGraph_StaleRevisionRejected(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Mutate graph: add a new open blocker edge FAC-2 (to-do) blocks FAC-20.
+	bulkAfterPre := p.bulkCalls.Load()
+	// Mutate graph: add edge FAC-2 blocks FAC-20 (incident on target).
 	if _, err := p.CreateRelation(context.Background(), "id-2", "id-20", provider.RelationBlocks); err != nil {
 		t.Fatal(err)
 	}
-	// Update desired to still only declare FAC-1 — board has extra edge → drift
-	// after fresh snapshot. Also selection rev mismatch if only edges hash changes.
-	fence.Invalidate(false)
 	_, err = RequireTaskLaunch(ctx, store, EntryDispatch, headRef, des, g1.GraphRevision)
 	if err == nil {
-		t.Fatal("expected toctou or drift after relation mutation")
+		t.Fatal("expected toctou after incident relation mutation")
 	}
 	var be *BlockedError
 	if !errors.As(err, &be) {
 		t.Fatalf("want BlockedError, got %v", err)
 	}
-	if be.Code != "toctou" && be.Code != "drift" && be.Code != "open_blocker" {
-		t.Fatalf("want toctou/drift/open_blocker, got %s: %v", be.Code, err)
+	if be.Code != "toctou" {
+		t.Fatalf("want toctou, got %s: %v", be.Code, err)
+	}
+	if p.bulkCalls.Load() != bulkAfterPre {
+		t.Fatalf("post TOCTOU must not re-run project fan-out, bulk %d→%d", bulkAfterPre, p.bulkCalls.Load())
 	}
 }
 
