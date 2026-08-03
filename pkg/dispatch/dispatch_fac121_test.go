@@ -526,6 +526,15 @@ func TestDispatch_NilCompensatorFailsClosed(t *testing.T) {
 	}
 }
 
+func TestProductionDispatcherRequiresControlFactoryBeforeHerdr(t *testing.T) {
+	d := NewProductionDispatcher(testCfg(), nil, nil)
+	d.Compensator = &recordingCompensator{}
+	_, err := d.Dispatch(context.Background(), DispatchOptions{TicketRef: "FAC-PROD", LaneName: "worker", Decision: &router.LaunchDecision{}})
+	if err == nil || !strings.Contains(err.Error(), "durable control factory") {
+		t.Fatalf("production dispatcher bypassed missing durable control factory: %v", err)
+	}
+}
+
 func TestDispatch_RecordStepErrorPropagates(t *testing.T) {
 	_, wm := initDispatchRepo(t)
 	tp := &statusTrackingProvider{

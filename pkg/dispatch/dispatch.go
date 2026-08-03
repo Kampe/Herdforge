@@ -105,19 +105,20 @@ type DispatchOptions struct {
 }
 
 type DispatchResult struct {
-	TicketRef   string
-	TicketTitle string
-	Worktree    string
-	Branch      string
-	BaseSHA     string
-	AnchorRef   string
-	TaskPacket  string
-	Launched    bool
-	Lane        string
-	Model       string // the model that actually launched (after fallback)
-	TabID       string
-	AgentName   string
-	Receipt     *herdr.PromptReceipt
+	TicketRef       string
+	TicketTitle     string
+	Worktree        string
+	Branch          string
+	BaseSHA         string
+	AnchorRef       string
+	TaskPacket      string
+	Launched        bool
+	Lane            string
+	LeaseGeneration int64
+	Model           string // the model that actually launched (after fallback)
+	TabID           string
+	AgentName       string
+	Receipt         *herdr.PromptReceipt
 }
 
 // WorktreeService is the isolation surface Dispatch uses (FAC-121).
@@ -152,7 +153,9 @@ type Dispatcher struct {
 	Compensator Compensator
 	// Orders is the durable coordinator-to-lane control port. When configured,
 	// every repair prompt is persisted before Herdr is nudged.
-	Orders *control.CoordinatorOrders
+	Orders         *control.CoordinatorOrders
+	Production     bool
+	ControlFactory func(context.Context, control.LaneIdentity, string) (*control.CoordinatorOrders, error)
 	// Herdr is optional; defaults to LiveHerdr.
 	Herdr HerdrLauncher
 	// PromptVerifyTimeout overrides the delivery poll window.
@@ -184,6 +187,12 @@ func NewDispatcher(cfg *config.Config, tp provider.TaskProvider, wm *worktree.Wo
 			provider.ApplyDeadlines(tp, provider.DefaultDeadlines())
 		}
 	}
+	return d
+}
+
+func NewProductionDispatcher(cfg *config.Config, tp provider.TaskProvider, wm *worktree.WorktreeManager) *Dispatcher {
+	d := NewDispatcher(cfg, tp, wm)
+	d.Production = true
 	return d
 }
 
@@ -257,6 +266,9 @@ func (d *Dispatcher) Dispatch(ctx context.Context, opts DispatchOptions) (*Dispa
 	// Fail closed before any side effect when durable hooks are missing.
 	if err := d.requireCompensator(); err != nil {
 		return nil, err
+	}
+	if d.Production && !opts.NoLaunch && d.ControlFactory == nil {
+		return nil, fmt.Errorf("dispatch: durable control factory is required for production launch")
 	}
 	// FAC-175: reject an under-specified worker launch before even reading or
 	// mutating provider/worktree state. --no-launch is the explicit packet-only
@@ -473,14 +485,15 @@ func (d *Dispatcher) Dispatch(ctx context.Context, opts DispatchOptions) (*Dispa
 	}
 
 	result := &DispatchResult{
-		TicketRef:   task.Ref,
-		TicketTitle: task.Title,
-		Worktree:    wtInfo.Path,
-		Branch:      branch,
-		BaseSHA:     wtInfo.BaseSHA,
-		AnchorRef:   wtInfo.AnchorRef,
-		TaskPacket:  packetPath,
-		Lane:        lane.Name,
+		TicketRef:       task.Ref,
+		TicketTitle:     task.Title,
+		Worktree:        wtInfo.Path,
+		Branch:          branch,
+		BaseSHA:         wtInfo.BaseSHA,
+		AnchorRef:       wtInfo.AnchorRef,
+		TaskPacket:      packetPath,
+		Lane:            lane.Name,
+		LeaseGeneration: tok.Generation,
 	}
 
 	// 8. Still own the lease generation; re-validate bound to pre-claim GraphRev.
@@ -651,7 +664,16 @@ func (d *Dispatcher) launch(
 		timeout = 60 * time.Second
 	}
 
-	if d.Orders != nil {
+	if d.Production {
+		identity := control.LaneIdentity{Repository: d.Worktree.RepoRoot(), TaskRef: task.Ref, Lane: lane.Name, LeaseGeneration: result.LeaseGeneration, CandidateSHA: opts.Decision.CandidateSHA}
+		orders, orderErr := d.ControlFactory(ctx, identity, lane.Name)
+		if orderErr != nil {
+			return &launchFailure{Reason: "control_factory_failed", Err: closeTabLocal(h, tab.ID, "control_factory_failed", orderErr)}
+		}
+		if _, orderErr := orders.Repair(ctx, packet); orderErr != nil {
+			return &launchFailure{Reason: "control_order_failed", Err: closeTabLocal(h, tab.ID, "control_order_failed", orderErr)}
+		}
+	} else if d.Orders != nil {
 		if _, orderErr := d.Orders.Repair(ctx, packet); orderErr != nil {
 			return &launchFailure{Reason: "control_order_failed", Err: closeTabLocal(h, tab.ID, "control_order_failed", orderErr)}
 		}
