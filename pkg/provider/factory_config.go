@@ -26,16 +26,21 @@ func NewFromHerdConfig(cfg *config.Config) (TaskProvider, error) {
 	if apiKey == "" {
 		apiKey = strings.TrimSpace(os.Getenv("KANEO_API_KEY"))
 	}
+	trustedOrigin := ""
+	if apiKey != "" {
+		trustedOrigin = resolveOperatorTrustedOrigin()
+	}
 	return NewProductionProvider(TaskConfig{
-		Type:      cfg.TaskProvider.Type,
-		APIURL:    cfg.TaskProvider.APIURL,
-		ProjectID: cfg.TaskProvider.ProjectID,
-		UseCLI:    cfg.TaskProvider.UseCLI,
-		APIKey:    apiKey,
-		Get:       g,
-		List:      l,
-		Mutate:    m,
-		Comment:   c,
-		Readback:  r,
+		Type:                cfg.TaskProvider.Type,
+		APIURL:              cfg.TaskProvider.APIURL,
+		ProjectID:           cfg.TaskProvider.ProjectID,
+		UseCLI:              cfg.TaskProvider.UseCLI,
+		APIKey:              apiKey,
+		APIKeyTrustedOrigin: trustedOrigin,
+		Get:                 g,
+		List:                l,
+		Mutate:              m,
+		Comment:             c,
+		Readback:            r,
 	})
 }
