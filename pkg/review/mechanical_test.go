@@ -207,6 +207,20 @@ func TestClassifyFile_LocalShortVarClosureNotFlagged(t *testing.T) {
 	}
 }
 
+func TestClassifyFile_LocalExistingVarFunctionAssignmentInPartialTestHunk(t *testing.T) {
+	// Not standalone-parseable (unclosed TestFoo body) — exercises the
+	// heuristic fallback. mock is reassigned, not declared, inside a body
+	// this fragment already saw opened — must not escalate.
+	fc := FileChange{
+		Path:  "pkg/review/plain_test.go",
+		Added: []string{"func TestFoo(t *testing.T) {", "mock = func() { return }"},
+	}
+	got := ClassifyFile(fc, DefaultMechanicalPolicy())
+	if got != CategoryTestOnly {
+		t.Errorf("a local existing-var function reassignment inside a confirmed-open body must stay TestOnly, got %s", got)
+	}
+}
+
 func TestClassifyFile_MethodDeclarationSmuggledInTestPath(t *testing.T) {
 	fc := FileChange{
 		Path:  "pkg/review/sneaky_test.go",
