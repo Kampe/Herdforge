@@ -3,6 +3,7 @@ package mail
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -176,7 +177,11 @@ func (m *Mailbox) markSeenLocked(id string) {
 
 // ReadInbox returns every envelope addressed to recipient (or "all"). Lines
 // that fail to parse are quarantined via quarantineLine rather than
-// silently dropped, and reading continues past them.
+// silently dropped, and reading continues past them. If the quarantine sink
+// itself fails to durably record one or more malformed lines, ReadInbox
+// still returns every successfully-parsed envelope but reports a non-nil
+// error: a malformed record that can't even be quarantined is a fail-closed
+// condition, not something to swallow the way a normal parse failure is.
 func (m *Mailbox) ReadInbox(recipient string) ([]*Envelope, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -191,6 +196,7 @@ func (m *Mailbox) ReadInbox(recipient string) ([]*Envelope, error) {
 	}
 
 	var res []*Envelope
+	var quarantineErrs []error
 
 	rawLines := splitLines(string(data))
 	for _, l := range rawLines {
@@ -199,7 +205,9 @@ func (m *Mailbox) ReadInbox(recipient string) ([]*Envelope, error) {
 		}
 		var env Envelope
 		if err := json.Unmarshal([]byte(l), &env); err != nil {
-			m.quarantineLine(l, err)
+			if qErr := m.quarantineLine(l, err); qErr != nil {
+				quarantineErrs = append(quarantineErrs, qErr)
+			}
 			continue
 		}
 		if recipient == "" || env.Recipient == recipient || env.Recipient == "all" {
@@ -207,14 +215,17 @@ func (m *Mailbox) ReadInbox(recipient string) ([]*Envelope, error) {
 		}
 	}
 
+	if len(quarantineErrs) > 0 {
+		return res, fmt.Errorf("failed to durably quarantine %d malformed record(s): %w", len(quarantineErrs), errors.Join(quarantineErrs...))
+	}
 	return res, nil
 }
 
 // quarantineLine durably records a line ReadInbox could not parse and bumps
-// the surfaced counter. Best-effort: a failure to write the quarantine file
-// does not fail the read (ReadInbox's error contract is unchanged), but the
-// in-memory counter still advances so Stats() reflects the loss.
-func (m *Mailbox) quarantineLine(line string, cause error) {
+// the surfaced counter, returning an error if the durable write itself
+// failed so the caller can fail closed instead of believing the record was
+// preserved when it wasn't.
+func (m *Mailbox) quarantineLine(line string, cause error) error {
 	m.quarantineMu.Lock()
 	m.quarantined++
 	m.quarantineMu.Unlock()
@@ -222,9 +233,9 @@ func (m *Mailbox) quarantineLine(line string, cause error) {
 	entry := QuarantineEntry{Line: line, Reason: cause.Error(), Timestamp: time.Now()}
 	data, err := json.Marshal(entry)
 	if err != nil {
-		return
+		return fmt.Errorf("failed to marshal quarantine entry: %w", err)
 	}
-	_ = m.withFileLock(func() error {
+	return m.withFileLock(func() error {
 		return appendLine(m.MailFile+".quarantine.jsonl", data)
 	})
 }
@@ -402,6 +413,7 @@ type MessageBroker struct {
 	cancel        context.CancelFunc
 	wg            sync.WaitGroup
 	errCh         chan error
+	droppedErrs   atomic.Int64
 }
 
 func NewMessageBroker(mailbox *Mailbox, opts ...MessageBrokerOption) *MessageBroker {
@@ -416,6 +428,12 @@ func NewMessageBroker(mailbox *Mailbox, opts ...MessageBrokerOption) *MessageBro
 		opt(b)
 	}
 	if b.redis != nil {
+		// A restarted process is exactly when outbox replay matters most:
+		// any envelope durably appended locally before the last crash but
+		// never confirmed published gets another chance here.
+		if _, err := b.FlushOutbox(); err != nil {
+			b.reportErr(fmt.Errorf("startup outbox replay failed: %w", err))
+		}
 		b.startSubscriber()
 	}
 	return b
@@ -432,11 +450,17 @@ func (b *MessageBroker) Close() error {
 
 // Errs surfaces publish and subscribe failures that SendMessage's return
 // value can't carry asynchronously (e.g. the subscriber goroutine's channel
-// closing). Buffered and best-effort: once full, further errors are dropped
-// rather than blocking message delivery — read it if you need visibility
-// beyond SendMessage's own returned error.
+// closing). Buffered and best-effort: once full, an error is never silently
+// discarded — it's durably appended to <MailFile>.errors.jsonl instead (see
+// reportErr), and DroppedErrCount reports how many took that path.
 func (b *MessageBroker) Errs() <-chan error {
 	return b.errCh
+}
+
+// DroppedErrCount returns how many errors overflowed Errs() and were
+// durably retained on disk instead of delivered live.
+func (b *MessageBroker) DroppedErrCount() int64 {
+	return b.droppedErrs.Load()
 }
 
 func (b *MessageBroker) reportErr(err error) {
@@ -446,27 +470,177 @@ func (b *MessageBroker) reportErr(err error) {
 	select {
 	case b.errCh <- err:
 	default:
+		// Errs() isn't being drained fast enough. Never drop this silently:
+		// retain it durably so nothing is lost just because nobody was
+		// listening at the moment it happened.
+		b.persistDroppedErr(err)
 	}
 }
 
+// persistDroppedErr durably appends an error that overflowed errCh to
+// <MailFile>.errors.jsonl. Best-effort at the disk-I/O layer (there's no
+// further fallback if the filesystem itself is failing), but every call
+// still increments droppedErrs so DroppedErrCount reflects reality even if
+// the disk write also fails.
+func (b *MessageBroker) persistDroppedErr(err error) {
+	b.droppedErrs.Add(1)
+	entry := struct {
+		Error     string    `json:"error"`
+		Timestamp time.Time `json:"timestamp"`
+	}{Error: err.Error(), Timestamp: time.Now()}
+	data, mErr := json.Marshal(entry)
+	if mErr != nil {
+		return
+	}
+	_ = b.mb.withFileLock(func() error {
+		return appendLine(b.mb.MailFile+".errors.jsonl", data)
+	})
+}
+
+// SendMessage durably appends locally first, then records a durable outbox
+// entry for the Redis fan-out BEFORE attempting to publish, so a publish
+// failure (Redis unreachable, or the process crashing before publish
+// confirms) never permanently loses the fan-out: the entry survives on
+// disk until FlushOutbox successfully replays it, including automatically
+// on the next NewMessageBroker (i.e. after a restart). A replay that
+// reaches Redis a second time for an already-published message is harmless
+// — every subscriber dedupes by envelope ID via Mailbox.appendEnvelope —
+// so at-least-once outbox delivery plus an idempotent consumer gives an
+// effectively-once result without needing a Redis-side ack (plain pub/sub
+// has none).
 func (b *MessageBroker) SendMessage(sender, recipient, subject, body string) (*Envelope, error) {
 	env, err := b.mb.SendMessage(sender, recipient, subject, body)
 	if err != nil {
 		return nil, err
 	}
-	if b.redis != nil {
-		channel := b.channelPrefix + "." + recipient
-		data, err := json.Marshal(env)
-		if err != nil {
-			return env, fmt.Errorf("failed to marshal envelope for publish: %w", err)
-		}
-		if err := b.redis.Publish(b.ctx, channel, data).Err(); err != nil {
-			pubErr := fmt.Errorf("redis publish to %s failed: %w", channel, err)
-			b.reportErr(pubErr)
-			return env, pubErr
-		}
+	if b.redis == nil {
+		return env, nil
+	}
+
+	channel := b.channelPrefix + "." + recipient
+	if err := b.addOutboxEntry(env, channel); err != nil {
+		return env, fmt.Errorf("failed to durably record outbox entry for %s: %w", env.ID, err)
+	}
+
+	if err := b.publishOne(env, channel); err != nil {
+		b.reportErr(err)
+		return env, err // still durably queued in the outbox; FlushOutbox will retry it
+	}
+	if err := b.removeOutboxEntry(env.ID); err != nil {
+		// Published successfully but couldn't clear the record: harmless —
+		// the next flush just re-publishes a message receivers already
+		// dedupe by ID.
+		b.reportErr(fmt.Errorf("outbox cleanup failed for %s: %w", env.ID, err))
 	}
 	return env, nil
+}
+
+func (b *MessageBroker) publishOne(env *Envelope, channel string) error {
+	data, err := json.Marshal(env)
+	if err != nil {
+		return fmt.Errorf("failed to marshal envelope for publish: %w", err)
+	}
+	if err := b.redis.Publish(b.ctx, channel, data).Err(); err != nil {
+		return fmt.Errorf("redis publish to %s failed: %w", channel, err)
+	}
+	return nil
+}
+
+// outboxEntry is one not-yet-confirmed-published envelope, persisted to
+// <MailFile>.outbox.json before the publish attempt.
+type outboxEntry struct {
+	Envelope Envelope `json:"envelope"`
+	Channel  string   `json:"channel"`
+}
+
+func (b *MessageBroker) outboxPath() string {
+	return b.mb.MailFile + ".outbox.json"
+}
+
+func (b *MessageBroker) loadOutboxUnlocked() (map[string]outboxEntry, error) {
+	data, err := os.ReadFile(b.outboxPath())
+	if err != nil {
+		if os.IsNotExist(err) {
+			return map[string]outboxEntry{}, nil
+		}
+		return nil, fmt.Errorf("failed to read outbox: %w", err)
+	}
+	var entries map[string]outboxEntry
+	if err := json.Unmarshal(data, &entries); err != nil {
+		return nil, fmt.Errorf("corrupt outbox file %s: %w", b.outboxPath(), err)
+	}
+	if entries == nil {
+		entries = map[string]outboxEntry{}
+	}
+	return entries, nil
+}
+
+func (b *MessageBroker) mutateOutboxLocked(fn func(map[string]outboxEntry) error) error {
+	return b.mb.withFileLock(func() error {
+		entries, err := b.loadOutboxUnlocked()
+		if err != nil {
+			return err
+		}
+		if err := fn(entries); err != nil {
+			return err
+		}
+		data, err := json.Marshal(entries)
+		if err != nil {
+			return fmt.Errorf("failed to marshal outbox: %w", err)
+		}
+		return writeFileAtomic(b.outboxPath(), data, 0644)
+	})
+}
+
+func (b *MessageBroker) addOutboxEntry(env *Envelope, channel string) error {
+	return b.mutateOutboxLocked(func(entries map[string]outboxEntry) error {
+		entries[env.ID] = outboxEntry{Envelope: *env, Channel: channel}
+		return nil
+	})
+}
+
+func (b *MessageBroker) removeOutboxEntry(id string) error {
+	return b.mutateOutboxLocked(func(entries map[string]outboxEntry) error {
+		delete(entries, id)
+		return nil
+	})
+}
+
+func (b *MessageBroker) snapshotOutbox() (map[string]outboxEntry, error) {
+	var entries map[string]outboxEntry
+	err := b.mb.withFileLock(func() error {
+		var err error
+		entries, err = b.loadOutboxUnlocked()
+		return err
+	})
+	return entries, err
+}
+
+// FlushOutbox retries publishing every entry still recorded in the durable
+// outbox — messages whose local append succeeded but whose Redis publish
+// never confirmed. Safe to call any time, including right after
+// NewMessageBroker on a freshly restarted process (where it's called
+// automatically).
+func (b *MessageBroker) FlushOutbox() (published int, err error) {
+	if b.redis == nil {
+		return 0, nil
+	}
+	entries, err := b.snapshotOutbox()
+	if err != nil {
+		return 0, err
+	}
+	for id, entry := range entries {
+		env := entry.Envelope
+		if pubErr := b.publishOne(&env, entry.Channel); pubErr != nil {
+			b.reportErr(fmt.Errorf("outbox replay publish failed for %s: %w", id, pubErr))
+			continue
+		}
+		if err := b.removeOutboxEntry(id); err != nil {
+			return published, err
+		}
+		published++
+	}
+	return published, nil
 }
 
 func (b *MessageBroker) ReadInbox(recipient string) ([]*Envelope, error) {

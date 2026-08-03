@@ -227,7 +227,7 @@ func TestBroker_RestartSeenReloadsFromDisk(t *testing.T) {
 // land on Errs() for callers monitoring asynchronously.
 func TestPublishError_PropagatesToCaller(t *testing.T) {
 	mock := newMockRedisClient()
-	mock.publishErr.Store(fmt.Errorf("redis: connection refused"))
+	mock.setPublishErr(fmt.Errorf("redis: connection refused"))
 	tmpDir := t.TempDir()
 	mb := NewMailbox(filepath.Join(tmpDir, "mail.jsonl"))
 	broker := NewMessageBroker(mb, WithRedis(mock, "herd"))
