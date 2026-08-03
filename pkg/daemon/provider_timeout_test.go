@@ -21,7 +21,12 @@ type timeoutProvider struct {
 }
 
 func (t *timeoutProvider) GetTask(ctx context.Context, id string) (*provider.Task, error) {
-	return nil, errors.New("not used")
+	for _, task := range t.tasks {
+		if task.ID == id || task.Ref == id {
+			return task, nil
+		}
+	}
+	return nil, errors.New("not found")
 }
 func (t *timeoutProvider) ListTasks(ctx context.Context, projectID, status string) ([]*provider.Task, error) {
 	n := t.listOK.Add(1)
@@ -46,6 +51,17 @@ func (t *timeoutProvider) UpdateStatus(ctx context.Context, taskID, status strin
 }
 func (t *timeoutProvider) AddComment(ctx context.Context, taskID, body string) error {
 	return nil
+}
+
+// RelationProvider (FAC-159): empty graph so selection is not capability-blocked.
+func (t *timeoutProvider) ListRelations(context.Context, string) ([]provider.Relation, error) {
+	return nil, nil
+}
+func (t *timeoutProvider) CreateRelation(context.Context, string, string, provider.RelationType) (*provider.Relation, error) {
+	return nil, errors.New("timeoutProvider: create not used")
+}
+func (t *timeoutProvider) DeleteRelation(context.Context, string) error {
+	return errors.New("timeoutProvider: delete not used")
 }
 
 func newTimeoutEngine(tp provider.TaskProvider) *Engine {

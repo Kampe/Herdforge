@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/Kampe/Herdforge/pkg/config"
+	"github.com/Kampe/Herdforge/pkg/deps"
 	"github.com/Kampe/Herdforge/pkg/herdr"
 	"github.com/Kampe/Herdforge/pkg/preflight"
 	"github.com/Kampe/Herdforge/pkg/provider"
@@ -153,6 +154,13 @@ type Dispatcher struct {
 	Herdr HerdrLauncher
 	// PromptVerifyTimeout overrides the delivery poll window.
 	PromptVerifyTimeout time.Duration
+	// Deps is the relation store for the FAC-159 pre-side-effect gate.
+	// When nil, constructed from TaskProvider via deps.StoreFor.
+	Deps deps.RelationStore
+	// SkipDepsGate is test-only escape for unit tests that intentionally
+	// exercise later steps without a relation-capable provider. Production
+	// paths must leave this false.
+	SkipDepsGate bool
 
 	// health projects BLOCKED(provider_timeout) for board calls (FAC-150).
 	health dispatchHealth
@@ -244,6 +252,7 @@ func (d *Dispatcher) Dispatch(ctx context.Context, opts DispatchOptions) (*Dispa
 	}
 
 	// 1. Fetch ticket from Kaneo (bounded context + health observe, FAC-150)
+	// READ-ONLY — no worktree/status/comment/tab yet (FAC-159).
 	tasks, err := d.listTasksBound(ctx, d.Config.TaskProvider.ProjectID, "")
 	if err != nil {
 		return nil, formatBoardErr("failed to list tasks", err)
@@ -260,7 +269,7 @@ func (d *Dispatcher) Dispatch(ctx context.Context, opts DispatchOptions) (*Dispa
 		return nil, fmt.Errorf("ticket %s not found", opts.TicketRef)
 	}
 
-	// 2. Determine lane
+	// 2. Determine lane (still no side effects).
 	laneName := opts.LaneName
 	if laneName == "" {
 		laneName = "worker"
@@ -279,6 +288,27 @@ func (d *Dispatcher) Dispatch(ctx context.Context, opts DispatchOptions) (*Dispa
 	defaultBranch := d.Config.Project.DefaultBranch
 	if defaultBranch == "" {
 		defaultBranch = worktree.DefaultBranch
+	}
+
+	// 2b. FAC-159 PRE-SIDE-EFFECT gate: packet↔board dependency conformance.
+	// Must run BEFORE worktree create, status flip, comment, or tab.
+	var depProv *deps.Provenance
+	if !d.SkipDepsGate {
+		store := d.Deps
+		if store == nil {
+			store = deps.StoreFor(d.TaskProvider, d.Config.TaskProvider.ProjectID)
+		}
+		desired, perr := deps.ExtractProvenanceFromText(task.Description)
+		if perr != nil {
+			return nil, fmt.Errorf("dispatch dependency provenance: %w", perr)
+		}
+		gate, gerr := deps.ValidateLaunch(ctx, store, deps.EntryDispatch, deps.Ref(task.Ref), desired, "")
+		if gerr != nil {
+			return nil, gerr
+		}
+		if gate != nil {
+			depProv = gate.Provenance
+		}
 	}
 
 	// 3. Create worktree from immutable origin/<defaultBranch> (FAC-121).
@@ -367,6 +397,9 @@ func (d *Dispatcher) Dispatch(ctx context.Context, opts DispatchOptions) (*Dispa
 	}
 
 	packet := buildTaskPacket(task, branch, rolePath, d.Config.TaskProvider.Type, lane, d.Config.Verification)
+	if depProv != nil {
+		packet = packet + "\n" + deps.PacketSection(depProv)
+	}
 	packetPath := filepath.Join(wtInfo.Path, "TASK-PACKET.md")
 	if err := os.WriteFile(packetPath, []byte(packet), 0644); err != nil {
 		return nil, d.failWithCompensate(ctx, task.Ref, "task_packet_write_failed",
