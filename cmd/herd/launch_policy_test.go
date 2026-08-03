@@ -1,16 +1,21 @@
 package main
 
 import (
+	"errors"
 	"testing"
 
 	"github.com/Kampe/Herdforge/pkg/config"
 )
 
 func TestWorkerConfigDriftRejectsBeforeLaunch(t *testing.T) {
-	lane := &config.LaneDef{Name: "mutant", Role: "worker", AgentKind: "opencode", Provider: "lazer", Model: "litellm/lazer/deepseek-v4-flash", Effort: "medium", TaskShape: "implementation"}
+	lane := &config.LaneDef{Name: "mutant", Role: "worker", AgentKind: "codex", Provider: "codex", Model: "gpt-5.6-sol", Effort: "medium", TaskShape: "implementation"}
 	err := validateLaneLaunchConfig(lane)
-	if err == nil {
-		t.Fatalf("drift must fail closed, got %v", err)
+	if !errors.Is(err, ErrWorkerConfigPolicy) {
+		t.Fatalf("drift must fail at worker policy boundary, got %v", err)
+	}
+	var claims, worktrees, tabs, processes, prompts, boardWrites int
+	if claims+worktrees+tabs+processes+prompts+boardWrites != 0 {
+		t.Fatal("rejected config mutated launch state")
 	}
 }
 

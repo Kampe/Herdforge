@@ -2488,7 +2488,7 @@ func laneLaunchDecision(ctx context.Context, lane *config.LaneDef, task *provide
 		return nil, fmt.Errorf("lane %q has no authoritative task_shape", lane.Name)
 	}
 	provider := lane.Provider
-	request := router.LaunchRequest{Role: role, Shape: shape, RequestedProvider: provider, RequestedModel: lane.Model, Risk: classify.TierR1}
+	request := router.LaunchRequest{Role: role, Shape: shape, RequestedProvider: provider, RequestedModel: lane.Model, RequestedEffort: lane.Effort, Risk: classify.TierR1}
 	if role == router.RoleReviewer || role == router.RoleAssayer {
 		if task == nil {
 			return nil, fmt.Errorf("review launch requires candidate provenance")
@@ -2540,11 +2540,13 @@ func validateLaneLaunchConfig(lane *config.LaneDef) error {
 	}
 	if role == launch.WorkerRole || role == launch.ForgeSmithRole || role == launch.RecoveryRole {
 		if lane.AgentKind != launch.WorkerProvider || lane.Provider != launch.WorkerProvider || lane.Model != launch.WorkerModel || lane.Effort != launch.WorkerEffort {
-			return fmt.Errorf("lane %q worker/recovery policy must explicitly be codex/gpt-5.6-luna/medium", lane.Name)
+			return fmt.Errorf("%w: lane %q must explicitly be codex/gpt-5.6-luna/medium", ErrWorkerConfigPolicy, lane.Name)
 		}
 	}
 	return nil
 }
+
+var ErrWorkerConfigPolicy = errors.New("launch.policy.config_worker_tuple_mismatch")
 
 func validateDecisionBeforeSideEffect(decision *router.LaunchDecision, taskRef string) error {
 	if decision == nil {

@@ -8,7 +8,7 @@ import (
 )
 
 func good() Request {
-	d, err := router.NewRouter(nil, nil).Decide(router.LaunchRequest{Role: router.RoleWorker, Shape: Implementation, RequestedProvider: WorkerProvider, RequestedModel: WorkerModel, ProbeResults: map[string]bool{router.ProbeKey(WorkerProvider, WorkerModel): true}})
+	d, err := router.NewRouter(nil, nil).Decide(router.LaunchRequest{Role: router.RoleWorker, Shape: Implementation, RequestedProvider: WorkerProvider, RequestedModel: WorkerModel, RequestedEffort: WorkerEffort, ProbeResults: map[string]bool{router.ProbeKey(WorkerProvider, WorkerModel): true}})
 	if err != nil {
 		panic(err)
 	}
@@ -71,7 +71,7 @@ func TestValidateNormalizesAllowedAliases(t *testing.T) {
 }
 
 func TestRecoveryDecisionUsesSameWorkerBoundary(t *testing.T) {
-	d, err := router.NewRouter(nil, nil).Decide(router.LaunchRequest{Role: router.RoleRecovery, Shape: Implementation, RequestedProvider: WorkerProvider, RequestedModel: WorkerModel, ProbeResults: map[string]bool{router.ProbeKey(WorkerProvider, WorkerModel): true}})
+	d, err := router.NewRouter(nil, nil).Decide(router.LaunchRequest{Role: router.RoleRecovery, Shape: Implementation, RequestedProvider: WorkerProvider, RequestedModel: WorkerModel, RequestedEffort: WorkerEffort, ProbeResults: map[string]bool{router.ProbeKey(WorkerProvider, WorkerModel): true}})
 	if err != nil {
 		t.Fatal(err)
 	}
