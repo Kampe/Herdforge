@@ -56,18 +56,37 @@ func NewKaneoProvider(apiURL string, projectID string, useCLI bool) *KaneoProvid
 	}
 }
 
-type kaneoTaskDTO struct {
-	ID          string `json:"id"`
-	Ref         string `json:"ref"`
-	Title       string `json:"title"`
-	Description string `json:"description"`
-	Status      string `json:"status"`
-	Priority    string `json:"priority"`
-	ProjectId   string `json:"projectId"`
-	CreatedAt   string `json:"createdAt"`
-	Labels      []struct {
+// kaneoLabel accepts both API object form {"name":"x"} and CLI string form "x".
+type kaneoLabel struct {
+	Name string
+}
+
+func (l *kaneoLabel) UnmarshalJSON(b []byte) error {
+	var s string
+	if err := json.Unmarshal(b, &s); err == nil {
+		l.Name = s
+		return nil
+	}
+	var obj struct {
 		Name string `json:"name"`
-	} `json:"labels"`
+	}
+	if err := json.Unmarshal(b, &obj); err != nil {
+		return err
+	}
+	l.Name = obj.Name
+	return nil
+}
+
+type kaneoTaskDTO struct {
+	ID          string       `json:"id"`
+	Ref         string       `json:"ref"`
+	Title       string       `json:"title"`
+	Description string       `json:"description"`
+	Status      string       `json:"status"`
+	Priority    string       `json:"priority"`
+	ProjectId   string       `json:"projectId"`
+	CreatedAt   string       `json:"createdAt"`
+	Labels      []kaneoLabel `json:"labels"`
 }
 
 func dtoToTask(dto kaneoTaskDTO) *Task {
