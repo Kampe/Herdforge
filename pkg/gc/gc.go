@@ -2,12 +2,15 @@ package gc
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os/exec"
 	"strings"
 
 	"github.com/Kampe/Herdforge/pkg/worktree"
 )
+
+var errGlobalAutoReapDisabled = errors.New("global auto-reap disabled")
 
 type OverlapReport struct {
 	OverlappingFiles map[string][]string // filepath -> list of branches touching it
@@ -60,5 +63,12 @@ func (g *GCManager) ScanOverlap(ctx context.Context, minTips int) (*OverlapRepor
 
 // PruneStaleWorktrees cleans up merged or orphaned worktree directories (porting bin/herd-gc)
 func (g *GCManager) PruneStaleWorktrees(ctx context.Context) (int, error) {
-	return g.WM.PruneMergedWorktrees(ctx, "main")
+	// This package-level entry point has no way to supply exact targets,
+	// lease/session fencing, integration/board evidence, or an explicit action
+	// policy. It is intentionally report-only and therefore cannot remove a
+	// worktree from the caller's repository.
+	if g == nil || g.WM == nil {
+		return 0, fmt.Errorf("gc: worktree manager is required")
+	}
+	return 0, fmt.Errorf("gc: %w; exact targets and action evidence are required", errGlobalAutoReapDisabled)
 }

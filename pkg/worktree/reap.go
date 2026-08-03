@@ -37,6 +37,31 @@ const SalvageRefPrefix = "refs/herd/salvage/"
 // Leave nil when no lease subsystem is wired; GC then relies on Git evidence only.
 type LeaseProbe func(ctx context.Context, path, branch string) (active bool, err error)
 
+// LeaseGenerationProbe returns the current lease/session generation for an
+// exact worktree. A missing generation is not evidence that removal is safe.
+// The generation is carried into the action fence and checked immediately
+// before removal.
+type LeaseGenerationProbe func(ctx context.Context, path, branch string) (generation string, err error)
+
+// BoardEvidenceProbe reads the current integration/action evidence for an
+// exact target from the board or integration provider.
+type BoardEvidenceProbe func(ctx context.Context, path, branch string) (evidence string, err error)
+
+// ReapReceiptSink durably records one portable per-target outcome. The sink
+// receives no filesystem path, so its output can be moved between worktrees.
+type ReapReceiptSink func(ReapReceipt) error
+
+// ReapEvidence is the immutable evidence bundle required for destructive
+// reap. These values are deliberately opaque to this package: the integration
+// and board providers own their meaning, while GC binds them to every target.
+type ReapEvidence struct {
+	IntegrationSHA  string
+	BoardEvidence   string
+	LeaseGeneration string
+	PolicyDigest    string
+	Actor           string
+}
+
 // ReapPolicy controls planning and optional automatic removal (FAC-117).
 // Default zero-value is report/dry-run only (AutoReap=false).
 type ReapPolicy struct {
@@ -49,22 +74,39 @@ type ReapPolicy struct {
 	TargetPaths []string
 	// LeaseProbe is optional active-lease fencing.
 	LeaseProbe LeaseProbe
+	// LeaseGenerationProbe is required for destructive action. LeaseProbe
+	// answers active/inactive; this probe supplies the generation fence.
+	LeaseGenerationProbe LeaseGenerationProbe
+	BoardEvidenceProbe   BoardEvidenceProbe
+	ReceiptSink          ReapReceiptSink
+	// Evidence is required for destructive action and is copied into each
+	// candidate's action binding.
+	Evidence ReapEvidence
+	// ActionPolicy is the one explicit policy decision. The zero value is
+	// report-only; destructive action requires exactly "remove".
+	ActionPolicy string
 }
 
 // ReapCandidate is one classified worktree with evidence and preservation guidance.
 type ReapCandidate struct {
-	Path           string
-	Branch         string
-	HEAD           string
-	Class          ReapClass
-	UniqueSHAs     []string
-	Reason         string
-	PreserveAction string
-	SalvageRef     string
-	SalvageOK      bool
-	Integration    string // resolved integration base used for git cherry
-	// Eligible is true only when Class is content-merged and salvage is verified
-	// (or will be verified immediately before removal).
+	Path            string
+	Branch          string
+	HEAD            string
+	Class           ReapClass
+	UniqueSHAs      []string
+	Reason          string
+	PreserveAction  string
+	SalvageRef      string
+	SalvageOK       bool
+	Integration     string // resolved integration base used for git cherry
+	IntegrationSHA  string
+	LeaseGeneration string
+	PolicyDigest    string
+	BoardEvidence   string
+	ActionPolicy    string
+	Actor           string
+	// Eligible is true only when Class is content-merged; salvage is created and
+	// verified immediately before destructive removal, never during planning.
 	Eligible bool
 }
 
@@ -78,6 +120,36 @@ type ReapReport struct {
 	// Errors are non-fatal per-candidate classification issues already reflected
 	// as ReapClassUnknown; a hard list failure is returned as error from Plan/Reap.
 	Errors []string
+	// Receipts are portable outcomes. Target is a branch or stable role label,
+	// never an absolute filesystem path.
+	Receipts []ReapReceipt
+}
+
+type ReapReceipt struct {
+	Target          string `json:"target"`
+	Branch          string `json:"branch"`
+	Outcome         string `json:"outcome"`
+	Reason          string `json:"reason"`
+	IntegrationSHA  string `json:"integration_sha"`
+	LeaseGeneration string `json:"lease_generation"`
+	PolicyDigest    string `json:"policy_digest"`
+	BoardEvidence   string `json:"board_evidence"`
+	ActionPolicy    string `json:"action_policy"`
+	Actor           string `json:"actor"`
+	SalvageRef      string `json:"salvage_ref"`
+}
+
+func reapReceipt(c ReapCandidate, outcome, reason string) ReapReceipt {
+	target := c.Branch
+	if target == "" {
+		target = "root"
+	}
+	return ReapReceipt{
+		Target: target, Branch: c.Branch, Outcome: outcome, Reason: reason,
+		IntegrationSHA: c.IntegrationSHA, LeaseGeneration: c.LeaseGeneration,
+		PolicyDigest: c.PolicyDigest, BoardEvidence: c.BoardEvidence,
+		ActionPolicy: c.ActionPolicy, Actor: c.Actor, SalvageRef: c.SalvageRef,
+	}
 }
 
 // PlanReap classifies every worktree under fail-closed rules without removing
@@ -123,6 +195,11 @@ func (w *WorktreeManager) PlanReap(ctx context.Context, policy ReapPolicy) (*Rea
 		} else {
 			report.Refused = append(report.Refused, c)
 		}
+		outcome := "refused"
+		if c.Eligible {
+			outcome = "planned"
+		}
+		report.Receipts = append(report.Receipts, reapReceipt(c, outcome, c.Reason))
 		if c.Class == ReapClassUnknown && c.Reason != "" {
 			report.Errors = append(report.Errors, fmt.Sprintf("%s: %s", c.Path, c.Reason))
 		}
@@ -145,12 +222,26 @@ func (w *WorktreeManager) PlanReap(ctx context.Context, policy ReapPolicy) (*Rea
 // eligible set after just-in-time revalidation. Unique, dirty, protected, root,
 // and unknown worktrees are never removed.
 func (w *WorktreeManager) Reap(ctx context.Context, policy ReapPolicy) (*ReapReport, error) {
+	if policy.AutoReap {
+		if err := validateDestructivePolicy(policy); err != nil {
+			return nil, err
+		}
+	}
 	report, err := w.PlanReap(ctx, policy)
 	if err != nil {
 		return nil, err
 	}
 	if !policy.AutoReap {
 		return report, nil
+	}
+	seen := make(map[string]bool, len(report.Candidates))
+	for _, candidate := range report.Candidates {
+		seen[normalizePath(candidate.Path)] = true
+	}
+	for _, target := range policy.TargetPaths {
+		if !seen[normalizePath(target)] {
+			return report, fmt.Errorf("reap action refused: exact target is not a registered worktree")
+		}
 	}
 
 	// Snapshot eligible paths from the precomputed set; revalidate each one
@@ -174,52 +265,126 @@ func (w *WorktreeManager) Reap(ctx context.Context, policy ReapPolicy) (*ReapRep
 		}
 		integration, ierr := w.resolveIntegrationBase(ctx, policy.DefaultBranch)
 		reclass := w.classifyOne(ctx, current, policy, integration, ierr)
+		if !sameReapBinding(planned, reclass) {
+			reclass.Class = ReapClassUnknown
+			reclass.Eligible = false
+			reclass.Reason = "action binding changed since plan"
+			reclass.PreserveAction = "keep worktree; re-plan with current evidence"
+		}
 		if !reclass.Eligible {
 			report.Refused = append(report.Refused, reclass)
+			if err := w.recordReceipt(report, policy, reapReceipt(reclass, "refused", reclass.Reason)); err != nil {
+				return report, err
+			}
 			report.Errors = append(report.Errors,
 				fmt.Sprintf("%s: JIT revalidation refused reap: %s (%s)", reclass.Path, reclass.Class, reclass.Reason))
 			continue
 		}
+		if policy.LeaseGenerationProbe != nil {
+			generation, gerr := policy.LeaseGenerationProbe(ctx, reclass.Path, reclass.Branch)
+			if gerr != nil || generation == "" || generation != policy.Evidence.LeaseGeneration {
+				reclass.Class = ReapClassUnknown
+				reclass.Eligible = false
+				reclass.Reason = "lease generation changed or unavailable"
+				reclass.PreserveAction = "keep worktree until the lease fence is revalidated"
+				report.Refused = append(report.Refused, reclass)
+				if sinkErr := w.recordReceipt(report, policy, reapReceipt(reclass, "refused", reclass.Reason)); sinkErr != nil {
+					return report, sinkErr
+				}
+				continue
+			}
+		}
+
+		// Persist the exact action binding before salvage-ref creation or any
+		// removal mutation. A sink failure here is fail-closed by construction.
+		if err := w.recordReceipt(report, policy, reapReceipt(reclass, "remove-intent", "validated removal intent")); err != nil {
+			return report, err
+		}
 
 		// Ensure durable salvage ref points at the tip and verifies before remove.
 		if err := w.ensureSalvageRef(ctx, reclass.SalvageRef, reclass.HEAD); err != nil {
-			report.Refused = append(report.Refused, ReapCandidate{
-				Path:           reclass.Path,
-				Branch:         reclass.Branch,
-				HEAD:           reclass.HEAD,
-				Class:          ReapClassUnknown,
-				Reason:         err.Error(),
-				PreserveAction: "keep worktree; salvage ref verification failed",
-				SalvageRef:     reclass.SalvageRef,
-			})
+			refused := reclass
+			refused.Class = ReapClassUnknown
+			refused.Eligible = false
+			refused.Reason = err.Error()
+			refused.PreserveAction = "keep worktree; salvage ref verification failed"
+			report.Refused = append(report.Refused, refused)
 			report.Errors = append(report.Errors, fmt.Sprintf("%s: salvage: %v", reclass.Path, err))
+			if sinkErr := w.recordReceipt(report, policy, reapReceipt(refused, "refused", "salvage ref verification failed")); sinkErr != nil {
+				return report, sinkErr
+			}
 			continue
 		}
 
 		if err := w.RemoveWorktree(ctx, reclass.Path); err != nil {
 			report.Errors = append(report.Errors, fmt.Sprintf("%s: remove: %v", reclass.Path, err))
+			failed := reclass
+			failed.Class = ReapClassUnknown
+			failed.Eligible = false
+			failed.Reason = "removal failed"
+			if sinkErr := w.recordReceipt(report, policy, reapReceipt(failed, "refused", "removal failed")); sinkErr != nil {
+				return report, sinkErr
+			}
 			continue
 		}
 		report.Reaped = append(report.Reaped, reclass.Path)
+		if err := w.recordReceipt(report, policy, reapReceipt(reclass, "removed", "explicit removal completed")); err != nil {
+			return report, err
+		}
 	}
 	return report, nil
 }
 
+func (w *WorktreeManager) recordReceipt(report *ReapReport, policy ReapPolicy, receipt ReapReceipt) error {
+	report.Receipts = append(report.Receipts, receipt)
+	if policy.ReceiptSink == nil {
+		return fmt.Errorf("reap receipt sink: not configured")
+	}
+	if err := policy.ReceiptSink(receipt); err != nil {
+		return fmt.Errorf("reap receipt sink: %w", err)
+	}
+	return nil
+}
+
+func validateDestructivePolicy(policy ReapPolicy) error {
+	if len(policy.TargetPaths) == 0 {
+		return fmt.Errorf("reap action refused: exact TargetPaths are required")
+	}
+	if policy.LeaseProbe == nil || policy.LeaseGenerationProbe == nil || policy.BoardEvidenceProbe == nil || policy.ReceiptSink == nil {
+		return fmt.Errorf("reap action refused: lease/session probes are required")
+	}
+	if strings.TrimSpace(policy.Evidence.IntegrationSHA) == "" ||
+		strings.TrimSpace(policy.Evidence.BoardEvidence) == "" ||
+		strings.TrimSpace(policy.Evidence.LeaseGeneration) == "" ||
+		strings.TrimSpace(policy.Evidence.PolicyDigest) == "" ||
+		strings.TrimSpace(policy.Evidence.Actor) == "" {
+		return fmt.Errorf("reap action refused: integration, board, lease, and policy evidence are required")
+	}
+	if strings.TrimSpace(policy.ActionPolicy) != "remove" {
+		return fmt.Errorf("reap action refused: explicit remove action policy is required")
+	}
+	return nil
+}
+
+func sameReapBinding(a, b ReapCandidate) bool {
+	return sameWorktreePath(a.Path, b.Path) && a.Branch == b.Branch &&
+		a.HEAD == b.HEAD && a.IntegrationSHA == b.IntegrationSHA &&
+		a.LeaseGeneration == b.LeaseGeneration &&
+		a.PolicyDigest == b.PolicyDigest && a.BoardEvidence == b.BoardEvidence &&
+		a.ActionPolicy == b.ActionPolicy && a.Actor == b.Actor && a.SalvageRef == b.SalvageRef
+}
+
 // PruneMergedWorktrees is the historical auto-reap entry point used by pkg/gc.
-// FAC-117: it only removes worktrees that classify as content-merged under
-// fail-closed rules (dirty/unique/unknown/root/protected are refused).
+// It is retained only as a fail-closed compatibility boundary.
 func (w *WorktreeManager) PruneMergedWorktrees(ctx context.Context, defaultBranch string) (int, error) {
+	// Historical callers have no exact target, lease/session fence, board
+	// evidence, or explicit action policy. Keep this compatibility wrapper
+	// report-only; destructive callers must use Reap with a fully populated
+	// ReapPolicy.
 	if defaultBranch == "" {
 		defaultBranch = DefaultBranch
 	}
-	report, err := w.Reap(ctx, ReapPolicy{
-		DefaultBranch: defaultBranch,
-		AutoReap:      true,
-	})
-	if err != nil {
-		return 0, err
-	}
-	return len(report.Reaped), nil
+	return 0, fmt.Errorf("worktree auto-reap disabled: use Reap with exact targets and action evidence")
 }
 
 func (w *WorktreeManager) classifyOne(
@@ -230,9 +395,15 @@ func (w *WorktreeManager) classifyOne(
 	integrationErr error,
 ) ReapCandidate {
 	c := ReapCandidate{
-		Path:   wt.Path,
-		Branch: wt.Branch,
-		HEAD:   wt.Commit,
+		Path:            wt.Path,
+		Branch:          wt.Branch,
+		HEAD:            wt.Commit,
+		Integration:     integration,
+		LeaseGeneration: policy.Evidence.LeaseGeneration,
+		PolicyDigest:    policy.Evidence.PolicyDigest,
+		BoardEvidence:   policy.Evidence.BoardEvidence,
+		ActionPolicy:    policy.ActionPolicy,
+		Actor:           policy.Evidence.Actor,
 	}
 
 	// Resolve HEAD if list porcelain omitted it.
@@ -284,6 +455,38 @@ func (w *WorktreeManager) classifyOne(
 			return c
 		}
 	}
+	if policy.LeaseGenerationProbe != nil {
+		generation, err := policy.LeaseGenerationProbe(ctx, wt.Path, branch)
+		if err != nil || strings.TrimSpace(generation) == "" {
+			c.Class = ReapClassUnknown
+			c.Reason = "lease generation unavailable"
+			c.PreserveAction = "keep worktree until lease generation is known"
+			return c
+		}
+		c.LeaseGeneration = generation
+		if policy.Evidence.LeaseGeneration != "" && generation != policy.Evidence.LeaseGeneration {
+			c.Class = ReapClassUnknown
+			c.Reason = "lease generation does not match action evidence"
+			c.PreserveAction = "keep worktree until the action is replanned"
+			return c
+		}
+	}
+	if policy.BoardEvidenceProbe != nil {
+		evidence, err := policy.BoardEvidenceProbe(ctx, wt.Path, branch)
+		if err != nil || strings.TrimSpace(evidence) == "" {
+			c.Class = ReapClassUnknown
+			c.Reason = "board/action evidence unavailable"
+			c.PreserveAction = "keep worktree until board evidence is readable"
+			return c
+		}
+		c.BoardEvidence = evidence
+		if policy.Evidence.BoardEvidence != "" && evidence != policy.Evidence.BoardEvidence {
+			c.Class = ReapClassUnknown
+			c.Reason = "board/action evidence does not match action evidence"
+			c.PreserveAction = "keep worktree until the action is replanned"
+			return c
+		}
+	}
 
 	// Dirty working tree → refuse.
 	dirty, derr := w.isDirty(ctx, wt.Path)
@@ -312,6 +515,20 @@ func (w *WorktreeManager) classifyOne(
 		return c
 	}
 	c.Integration = integration
+	actualIntegrationSHA, shaErr := w.revParse(ctx, integration)
+	if shaErr != nil {
+		c.Class = ReapClassUnknown
+		c.Reason = "integration SHA could not be independently resolved"
+		c.PreserveAction = "keep worktree until integration ref can be read"
+		return c
+	}
+	c.IntegrationSHA = actualIntegrationSHA
+	if policy.Evidence.IntegrationSHA != "" && actualIntegrationSHA != policy.Evidence.IntegrationSHA {
+		c.Class = ReapClassUnknown
+		c.Reason = "integration SHA does not match action evidence"
+		c.PreserveAction = "keep worktree until integration evidence is refreshed"
+		return c
+	}
 
 	// Unique commits via git cherry (patch-id), never rev-list --count (FAC-117).
 	unique, uerr := w.uniqueCommits(ctx, wt.Path, integration, branch)
@@ -329,13 +546,6 @@ func (w *WorktreeManager) classifyOne(
 			"do not reap; preserve branch %s and salvage ref %s; integrate or park unique work first",
 			branch, c.SalvageRef,
 		)
-		// Best-effort pin salvage at tip so unique work has a durable name even
-		// while the worktree stays (preservation, not removal precondition).
-		if c.HEAD != "" {
-			if err := w.ensureSalvageRef(ctx, c.SalvageRef, c.HEAD); err == nil {
-				c.SalvageOK = true
-			}
-		}
 		return c
 	}
 
@@ -350,15 +560,8 @@ func (w *WorktreeManager) classifyOne(
 		c.Eligible = false
 		return c
 	}
-	// Verify (or create) salvage during classification so dry-run reports the
-	// same eligibility gate that action will require.
-	if err := w.ensureSalvageRef(ctx, c.SalvageRef, c.HEAD); err != nil {
-		c.Class = ReapClassUnknown
-		c.Reason = fmt.Sprintf("salvage ref error: %v", err)
-		c.PreserveAction = "keep worktree until salvage ref verifies"
-		return c
-	}
-	c.SalvageOK = true
+	// Planning is report-only: it neither reads nor writes salvage refs. The
+	// action path creates and verifies salvage immediately before removal.
 	c.Eligible = true
 	return c
 }

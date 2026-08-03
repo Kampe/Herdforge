@@ -88,13 +88,9 @@ func TestPruneMergedWorktrees(t *testing.T) {
 	initRepo(t, tmpDir)
 
 	wm := NewWorktreeManager(tmpDir)
-	// No herd/ branches to prune: should return 0 without error
-	count, err := wm.PruneMergedWorktrees(context.Background(), "main")
-	if err != nil {
-		t.Fatalf("expected clean prune, got err: %v", err)
-	}
-	if count != 0 {
-		t.Errorf("expected 0 pruned, got %d", count)
+	// Historical global pruning is permanently fail-closed.
+	if _, err := wm.PruneMergedWorktrees(context.Background(), "main"); err == nil {
+		t.Fatal("expected global auto-reap refusal")
 	}
 }
 
