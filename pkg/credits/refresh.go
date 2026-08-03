@@ -390,32 +390,36 @@ func NewLedgerCommands(ledger *Ledger) *LedgerCommands {
 }
 
 func (lc *LedgerCommands) Set(surface string, used, windowDays, daysLeft int, hourly bool, note string) (string, error) {
-	activeEmail := ClaudeActiveEmail("")
+	// Identity is Claude-surface gated: the binding never consults Claude
+	// auth for non-Claude surfaces. Sidecar first, then claude auth status.
+	activeEmail := ""
+	if surface == "claude" {
+		activeEmail = ClaudeActiveEmail("")
+		if activeEmail == "" {
+			activeEmail = ClaudeActiveExpanded()
+		}
+	}
 
 	mutationErr := lc.Ledger.WriteMutation(func(m *map[string]Record) {
 		data := *m
+		// Binding merge: (.[$s] // {}) + {...} — preserve unspecified
+		// top-level metadata (source, accounts) instead of rebuilding.
+		rec := data[surface]
 		wd := windowDays
 		dl := daysLeft
-		rec := Record{
-			UsedPct:    used,
-			WindowDays: &wd,
-			DaysLeft:   &dl,
-			Hourly:     hourly,
-			Note:       note,
-			Updated:    NowEpoch(),
-		}
+		rec.UsedPct = used
+		rec.WindowDays = &wd
+		rec.DaysLeft = &dl
+		rec.Hourly = hourly
+		rec.Note = note
+		rec.Updated = NowEpoch()
 
-		existing, exists := data[surface]
-		if exists && len(existing.Accounts) > 0 {
-			rec.Accounts = make([]AccountRow, len(existing.Accounts))
-			copy(rec.Accounts, existing.Accounts)
-			if activeEmail != "" {
-				for i, a := range rec.Accounts {
-					if strings.EqualFold(a.Email, activeEmail) {
-						rec.Accounts[i].UsedPct = used
-						rec.Accounts[i].Updated = NowEpoch()
-						break
-					}
+		if activeEmail != "" && rec.Accounts != nil {
+			for i, a := range rec.Accounts {
+				if strings.EqualFold(a.Email, activeEmail) {
+					rec.Accounts[i].UsedPct = used
+					rec.Accounts[i].Updated = NowEpoch()
+					break
 				}
 			}
 		}
@@ -723,12 +727,14 @@ func normalizeProviderKey(surface string) string {
 }
 
 type QuotaPoolEntry struct {
-	Used      interface{} `json:"used"`
-	Remaining interface{} `json:"remaining"`
-	ResetsIn  interface{} `json:"resetsIn"`
-	Class     string      `json:"class"`
-	Stale     bool        `json:"stale"`
-	Reason    string      `json:"reason"`
+	Used                interface{} `json:"used"`
+	Remaining           interface{} `json:"remaining"`
+	ResetsIn            interface{} `json:"resetsIn"`
+	Class               string      `json:"class"`
+	Stale               bool        `json:"stale"`
+	Reason              string      `json:"reason"`
+	ExhaustsBeforeReset *bool       `json:"exhaustsBeforeReset"`
+	RunwayMinutes       *float64    `json:"runwayMinutes"`
 }
 
 type QuotaProvider struct {
@@ -795,7 +801,12 @@ func (lc *LedgerCommands) Advise() string {
 					if poolKey == "all" || p.Used == nil || p.Stale {
 						continue
 					}
-					if p.Reason != "ok" && p.Reason != "exhausted" {
+					// binding: reason defaults to "ok" when absent
+					reason := p.Reason
+					if reason == "" {
+						reason = "ok"
+					}
+					if reason != "ok" && reason != "exhausted" {
 						continue
 					}
 					used, usedOK := parseQuotaInt(p.Used)
@@ -813,16 +824,38 @@ func (lc *LedgerCommands) Advise() string {
 					}
 					liveProviders[normalizeProviderKey(prov)] = true
 
-					resetsStr := ""
+					class := p.Class
+					if class == "" {
+						class = "untracked"
+					}
+					resetsStr := "?"
 					if p.ResetsIn != nil {
-						if s, ok := p.ResetsIn.(string); ok {
+						if s, ok := p.ResetsIn.(string); ok && s != "" {
 							resetsStr = s
 						} else if n, ok := parseQuotaInt(p.ResetsIn); ok {
 							resetsStr = fmt.Sprintf("%d", n)
 						}
 					}
-					out.WriteString(fmt.Sprintf("  %s/%s: %d%% used, %d%% left, %s, reset %s\n",
-						prov, poolKey, used, left, p.Class, resetsStr))
+
+					// binding branch suffix
+					suffix := ""
+					switch {
+					case class == "exhausted":
+						suffix = ", exhausted until reset"
+					case p.ExhaustsBeforeReset == nil:
+						suffix = ", exhaustion runway unknown"
+					case *p.ExhaustsBeforeReset:
+						runwayH := 0
+						if p.RunwayMinutes != nil {
+							runwayH = int(math.Floor(*p.RunwayMinutes / 60))
+						}
+						suffix = fmt.Sprintf(", projected runway %dh", runwayH)
+					default:
+						suffix = ", safe through reset at current burn"
+					}
+
+					out.WriteString(fmt.Sprintf("  %s/%s: %d%% used, %d%% left, %s, reset %s%s\n",
+						prov, poolKey, used, left, class, resetsStr, suffix))
 				}
 			}
 		}

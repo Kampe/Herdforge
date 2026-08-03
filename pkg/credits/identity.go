@@ -63,8 +63,8 @@ var claudeAuthStatusCmd = func(args ...string) *exec.Cmd {
 }
 
 func ClaudeActiveExpanded() string {
-	// try JSON output first
-	cmd := claudeAuthStatusCmd("auth", "status", "--json")
+	// Binding: `claude auth status` parsed as JSON first
+	cmd := claudeAuthStatusCmd("auth", "status")
 	out, err := cmd.Output()
 	if err == nil {
 		var result struct {

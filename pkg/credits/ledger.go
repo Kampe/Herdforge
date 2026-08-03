@@ -84,6 +84,14 @@ func (l *Ledger) WriteMutation(fn func(*map[string]Record)) error {
 	// the copy is swapped in only after the rename succeeds.
 	working := make(map[string]Record, len(l.data))
 	for k, v := range l.data {
+		if v.WindowDays != nil {
+			wd := *v.WindowDays
+			v.WindowDays = &wd
+		}
+		if v.DaysLeft != nil {
+			dl := *v.DaysLeft
+			v.DaysLeft = &dl
+		}
 		if v.Accounts != nil {
 			accts := make([]AccountRow, len(v.Accounts))
 			copy(accts, v.Accounts)

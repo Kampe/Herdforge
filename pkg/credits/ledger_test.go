@@ -149,7 +149,7 @@ func TestWriteMutation_RenameFailureRollsBack(t *testing.T) {
 
 	l, _ := OpenLedger(p)
 	err := l.WriteMutation(func(m *map[string]Record) {
-		(*m)["claude"] = Record{UsedPct: 42}
+		(*m)["claude"] = Record{UsedPct: 42, WindowDays: intPtr(7), DaysLeft: intPtr(5)}
 	})
 	if err != nil {
 		t.Fatalf("seed WriteMutation: %v", err)
@@ -170,19 +170,27 @@ func TestWriteMutation_RenameFailureRollsBack(t *testing.T) {
 		data := *m
 		rec := data["claude"]
 		rec.UsedPct = 77
+		*rec.DaysLeft = 1
 		data["claude"] = rec
 	})
 	if err == nil {
 		t.Fatal("expected rename failure error")
 	}
 
-	// committed state must not expose the unpersisted mutation
+	// committed state must not expose the unpersisted mutation — including
+	// through aliased WindowDays/DaysLeft pointers
 	rec, serr := l.Surface("claude")
 	if serr != nil {
 		t.Fatalf("Surface after failed mutation: %v", serr)
 	}
 	if rec.UsedPct != 42 {
 		t.Errorf("failed mutation must not change committed state: got %d, want 42", rec.UsedPct)
+	}
+	if rec.DaysLeft == nil || *rec.DaysLeft != 5 {
+		t.Errorf("failed mutation must not change committed DaysLeft: got %v, want 5", rec.DaysLeft)
+	}
+	if rec.WindowDays == nil || *rec.WindowDays != 7 {
+		t.Errorf("failed mutation must not change committed WindowDays: got %v, want 7", rec.WindowDays)
 	}
 
 	// tmp artifact must be removed
