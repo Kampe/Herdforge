@@ -40,6 +40,56 @@ func TestRecordPulse(t *testing.T) {
 	}
 }
 
+func TestBlockedSelectionHistory(t *testing.T) {
+	s := tempStore(t)
+	if _, err := s.RecordBlockedSelection("FAC-7", "task-7", "pulse", "drift", "cycle detected", "graph-1", "provider-1"); err != nil {
+		t.Fatalf("record blocked selection: %v", err)
+	}
+	history, err := s.BlockedSelectionHistory(10)
+	if err != nil {
+		t.Fatalf("blocked selection history: %v", err)
+	}
+	if len(history) != 1 || history[0].Ref != "FAC-7" || history[0].TaskID != "task-7" || history[0].Code != "drift" || history[0].Reason != "cycle detected" {
+		t.Fatalf("unexpected blocked history: %+v", history)
+	}
+}
+
+func TestBlockedSelectionIdentityIsIdempotentAndRevisionSensitive(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "restart.db")
+	s, err := New(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := s.RecordBlockedSelection("FAC-7", "task-7", "pulse", "drift", "old reason", "graph-1", "provider-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	repeat, err := s.RecordBlockedSelection("FAC-7", "task-7", "pulse", "drift", "old reason", "graph-1", "provider-1")
+	if err != nil || repeat.ID != first.ID {
+		t.Fatalf("same blocked identity must be idempotent: first=%+v repeat=%+v err=%v", first, repeat, err)
+	}
+	changed, err := s.RecordBlockedSelection("FAC-7", "task-7", "pulse", "drift", "new reason", "graph-2", "provider-1")
+	if err != nil || changed.ID == first.ID {
+		t.Fatalf("changed revision must create new evidence: first=%+v changed=%+v err=%v", first, changed, err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	s, err = New(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	history, err := s.BlockedSelectionHistory(10)
+	if err != nil || len(history) != 2 {
+		t.Fatalf("restart must retain idempotent history: history=%+v err=%v", history, err)
+	}
+	if history[0].Reason != "new reason" || history[1].Reason != "old reason" {
+		t.Fatalf("changed evidence readback order/content wrong: %+v", history)
+	}
+}
+
 func TestCompletePulse(t *testing.T) {
 	s := tempStore(t)
 	rec, _ := s.RecordPulse("FAC-1", "t-1", "worker")

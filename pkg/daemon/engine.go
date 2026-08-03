@@ -161,17 +161,38 @@ func (e *Engine) selectNextTaskWithRevision(ctx context.Context, role string) (*
 			desiredByRef[t.Ref] = p
 		}
 	}
-	eligible, revisions, _, gerr := deps.SelectEligibleRefs(ctx, store, deps.EntryPulse, matched, desiredByRef)
+	eligible, revisions, blocked, gerr := deps.SelectEligibleRefs(ctx, store, deps.EntryPulse, matched, desiredByRef)
 	if gerr != nil {
 		// Capability / hard store failures are fail-closed (not "no candidates").
 		return nil, "", fmt.Errorf("select next task: dependency gate: %w", gerr)
 	}
+	if len(blocked) > 0 && e.Store == nil {
+		return nil, "", fmt.Errorf("select next task: durable dependency BLOCKED evidence unavailable: store is nil")
+	}
+	if e.Store != nil {
+		for _, br := range blocked {
+			if _, berr := e.Store.RecordBlockedSelection(string(br.Ref), string(br.TaskID), string(br.Entrypoint), br.Code, br.Reason, br.GraphRevision, br.ProviderRevision); berr != nil {
+				return nil, "", fmt.Errorf("select next task: record dependency block: %w", berr)
+			}
+		}
+	}
 	if len(eligible) == 0 {
+		if len(blocked) > 0 {
+			return nil, "", fmt.Errorf("select next task: all candidates blocked: %s", summarizeBlocked(blocked))
+		}
 		return nil, "", nil
 	}
 	// eligible preserves input order (already priority DESC / ref ASC).
 	head := eligible[0]
 	return head, revisions[head.Ref], nil
+}
+
+func summarizeBlocked(blocked []deps.GateResult) string {
+	parts := make([]string, 0, len(blocked))
+	for _, br := range blocked {
+		parts = append(parts, fmt.Sprintf("%s (%s: %s)", br.Ref, br.Code, br.Reason))
+	}
+	return strings.Join(parts, "; ")
 }
 
 func (e *Engine) depsStore() deps.RelationStore {
