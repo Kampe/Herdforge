@@ -36,6 +36,7 @@ type HealthSnapshot struct {
 	Readiness    bool               `json:"readiness"`
 	Dependencies []DependencyHealth `json:"dependencies"`
 	ObservedAt   time.Time          `json:"observed_at,omitempty"`
+	Sequence     uint64             `json:"sequence,omitempty"`
 }
 
 // QueuePressure keeps probe failures separate from numeric measurements.
@@ -46,6 +47,7 @@ type QueuePressure struct {
 	Known      bool      `json:"known"`
 	Error      string    `json:"error,omitempty"`
 	ObservedAt time.Time `json:"observed_at,omitempty"`
+	Sequence   uint64    `json:"sequence,omitempty"`
 }
 
 type TransitionSLO struct {
@@ -54,6 +56,51 @@ type TransitionSLO struct {
 	Failed       uint64        `json:"failed"`
 	TotalLatency time.Duration `json:"total_latency"`
 	ObservedAt   time.Time     `json:"observed_at"`
+	Sequence     uint64        `json:"sequence,omitempty"`
+}
+
+type ConditionCode string
+
+const (
+	ConditionStalledWork        ConditionCode = "stalled_work"
+	ConditionDroppedCallback    ConditionCode = "dropped_callback"
+	ConditionReviewSaturation   ConditionCode = "review_saturation"
+	ConditionDeadProvider       ConditionCode = "dead_provider"
+	ConditionIntegrationBacklog ConditionCode = "integration_backlog"
+	ConditionDeadLetters        ConditionCode = "dead_letters"
+	ConditionEligibleIdle       ConditionCode = "eligible_idle"
+)
+
+type FreshnessConfig struct {
+	HealthMaxAge  time.Duration `json:"health_max_age"`
+	QueueMaxAge   time.Duration `json:"queue_max_age"`
+	SignalsMaxAge time.Duration `json:"signals_max_age"`
+	SLOMaxAge     time.Duration `json:"slo_max_age"`
+}
+
+var DefaultFreshnessConfig = FreshnessConfig{
+	HealthMaxAge:  5 * time.Minute,
+	QueueMaxAge:   5 * time.Minute,
+	SignalsMaxAge: 5 * time.Minute,
+	SLOMaxAge:     5 * time.Minute,
+}
+
+type FreshnessState struct {
+	HealthFresh  bool      `json:"health_fresh"`
+	QueueFresh   bool      `json:"queue_fresh"`
+	SignalsFresh bool      `json:"signals_fresh"`
+	SLOFresh     bool      `json:"slo_fresh"`
+	Ready        bool      `json:"ready"`
+	AsOf         time.Time `json:"as_of"`
+}
+
+type SnapshotView struct {
+	Health     HealthSnapshot  `json:"health"`
+	Queue      QueuePressure   `json:"queue"`
+	SLO        TransitionSLO   `json:"transition_slo"`
+	Signals    FleetSignals    `json:"signals"`
+	Freshness  FreshnessState  `json:"freshness"`
+	Conditions []ConditionCode `json:"condition_codes"`
 }
 
 // FleetSignals is a bounded, aggregate-only observation. It deliberately has
@@ -69,8 +116,13 @@ type FleetSignals struct {
 	MaxLeaseAge        time.Duration `json:"max_lease_age"`
 	MaxCallbackAge     time.Duration `json:"max_callback_age"`
 	EligibleIdle       time.Duration `json:"eligible_idle"`
+	EligibleWaiting    uint64        `json:"eligible_waiting"`
+	Blocked            bool          `json:"blocked"`
+	Backpressured      bool          `json:"backpressured"`
+	EligibleSince      time.Time     `json:"eligible_since,omitempty"`
 	LastReconciliation time.Time     `json:"last_reconciliation"`
 	ObservedAt         time.Time     `json:"observed_at"`
+	Sequence           uint64        `json:"sequence,omitempty"`
 }
 
 const (
@@ -206,7 +258,72 @@ func (s FleetSignals) Validate(now time.Time, maxAge time.Duration) error {
 			return errors.New("signal age is outside bounded range")
 		}
 	}
+	if s.EligibleWaiting == 0 {
+		if !s.EligibleSince.IsZero() || s.EligibleIdle != 0 {
+			return errors.New("eligible idle requires eligible waiting work")
+		}
+	} else {
+		if s.EligibleSince.IsZero() || s.EligibleSince.After(now) {
+			return errors.New("eligible waiting work requires a valid start time")
+		}
+		if s.Blocked || s.Backpressured {
+			if s.EligibleIdle != 0 {
+				return errors.New("blocked or backpressured work cannot be eligible idle")
+			}
+		} else if expected := now.Sub(s.EligibleSince); s.EligibleIdle != expected {
+			return errors.New("eligible idle does not match eligible waiting age")
+		}
+		if (s.ReviewSaturation == 100 || s.IntegrationBacklog > 0) && !s.Backpressured {
+			return errors.New("eligible work contradicts saturation or integration backlog")
+		}
+	}
 	return nil
+}
+
+func validateFreshnessConfig(config FreshnessConfig) error {
+	for _, age := range []time.Duration{config.HealthMaxAge, config.QueueMaxAge, config.SignalsMaxAge, config.SLOMaxAge} {
+		if age <= 0 || age > maxSignalAge {
+			return errors.New("freshness thresholds must be positive and bounded")
+		}
+	}
+	return nil
+}
+
+func observationNewer(sequence uint64, observedAt time.Time, currentSequence uint64, currentAt time.Time) bool {
+	if sequence > 0 || currentSequence > 0 {
+		return sequence > currentSequence
+	}
+	return currentAt.IsZero() || !observedAt.Before(currentAt)
+}
+
+func freshAt(observedAt, now time.Time, maxAge time.Duration) bool {
+	return !observedAt.IsZero() && !observedAt.After(now) && now.Sub(observedAt) <= maxAge
+}
+
+func (s FleetSignals) ConditionCodes() []ConditionCode {
+	conditions := make([]ConditionCode, 0, 7)
+	if s.StalledWork > 0 {
+		conditions = append(conditions, ConditionStalledWork)
+	}
+	if s.DroppedCallbacks > 0 {
+		conditions = append(conditions, ConditionDroppedCallback)
+	}
+	if s.ReviewSaturation >= 80 {
+		conditions = append(conditions, ConditionReviewSaturation)
+	}
+	if s.DeadProvider {
+		conditions = append(conditions, ConditionDeadProvider)
+	}
+	if s.IntegrationBacklog > 0 {
+		conditions = append(conditions, ConditionIntegrationBacklog)
+	}
+	if s.DeadLetters > 0 {
+		conditions = append(conditions, ConditionDeadLetters)
+	}
+	if s.EligibleWaiting > 0 && !s.Blocked && !s.Backpressured && s.EligibleIdle > 0 {
+		conditions = append(conditions, ConditionEligibleIdle)
+	}
+	return conditions
 }
 
 type MetricsExporter struct {
@@ -221,6 +338,7 @@ type MetricsExporter struct {
 	signals             FleetSignals
 	store               StateStore
 	now                 func() time.Time
+	thresholds          FreshnessConfig
 }
 
 func NewMetricsExporter() *MetricsExporter {
@@ -228,14 +346,22 @@ func NewMetricsExporter() *MetricsExporter {
 }
 
 func NewMetricsExporterWithPersistence(store StateStore, now func() time.Time) *MetricsExporter {
+	return NewMetricsExporterWithConfig(store, now, DefaultFreshnessConfig)
+}
+
+func NewMetricsExporterWithConfig(store StateStore, now func() time.Time, thresholds FreshnessConfig) *MetricsExporter {
 	if now == nil {
 		now = time.Now
 	}
+	if validateFreshnessConfig(thresholds) != nil {
+		thresholds = DefaultFreshnessConfig
+	}
 	return &MetricsExporter{
-		health: UnknownHealthSnapshot(),
-		queue:  QueuePressure{Known: false, Error: "not observed"},
-		store:  store,
-		now:    now,
+		health:     UnknownHealthSnapshot(),
+		queue:      QueuePressure{Known: false, Error: "not observed"},
+		store:      store,
+		now:        now,
+		thresholds: thresholds,
 	}
 }
 
@@ -244,9 +370,18 @@ func (m *MetricsExporter) SetHealth(dependencies []DependencyHealth) error {
 }
 
 func (m *MetricsExporter) SetHealthAt(dependencies []DependencyHealth, observedAt time.Time) error {
+	return m.SetHealthObservation(dependencies, observedAt, 0)
+}
+
+func (m *MetricsExporter) SetHealthObservation(dependencies []DependencyHealth, observedAt time.Time, sequence uint64) error {
 	health, err := BuildHealthSnapshot(dependencies)
-	if err != nil || !observationFresh(observedAt, m.now()) {
-		m.mu.Lock()
+	now := m.now()
+	m.mu.Lock()
+	if !observationNewer(sequence, observedAt, m.health.Sequence, m.health.ObservedAt) {
+		m.mu.Unlock()
+		return errors.New("stale health observation")
+	}
+	if err != nil || !freshAt(observedAt, now, m.thresholds.HealthMaxAge) {
 		m.health = UnknownHealthSnapshot()
 		m.mu.Unlock()
 		if err == nil {
@@ -255,12 +390,12 @@ func (m *MetricsExporter) SetHealthAt(dependencies []DependencyHealth, observedA
 		return err
 	}
 	health.ObservedAt = observedAt
-	m.mu.Lock()
 	if m.signals.DeadProvider && dependencyState(health, "provider") == DependencyHealthy {
 		m.health = UnknownHealthSnapshot()
 		m.mu.Unlock()
 		return errors.New("healthy provider contradicts dead-provider signal")
 	}
+	health.Sequence = sequence
 	m.health = health
 	m.mu.Unlock()
 	return nil
@@ -271,39 +406,58 @@ func (m *MetricsExporter) SetQueuePressure(queue QueuePressure) error {
 }
 
 func (m *MetricsExporter) SetQueuePressureAt(queue QueuePressure, observedAt time.Time) error {
-	if err := queue.Validate(); err != nil || (!queue.ObservedAt.IsZero() && !queue.ObservedAt.Equal(observedAt)) || !observationFresh(observedAt, m.now()) {
-		m.mu.Lock()
+	return m.SetQueuePressureObservation(queue, observedAt, queue.Sequence)
+}
+
+func (m *MetricsExporter) SetQueuePressureObservation(queue QueuePressure, observedAt time.Time, sequence uint64) error {
+	now := m.now()
+	validationErr := queue.Validate()
+	if validationErr == nil && (!queue.ObservedAt.IsZero() && !queue.ObservedAt.Equal(observedAt) || !freshAt(observedAt, now, m.thresholds.QueueMaxAge)) {
+		validationErr = errors.New("queue observation is stale or invalid")
+	}
+	m.mu.Lock()
+	if !observationNewer(sequence, observedAt, m.queue.Sequence, m.queue.ObservedAt) {
+		m.mu.Unlock()
+		return errors.New("stale queue observation")
+	}
+	if validationErr != nil {
 		m.queue = QueuePressure{Known: false, Error: "not observed"}
 		m.mu.Unlock()
-		if err == nil {
-			err = errors.New("queue observation is stale or invalid")
-		}
-		return err
+		return validationErr
 	}
 	queue.ObservedAt = observedAt
-	m.mu.Lock()
+	queue.Sequence = sequence
 	m.queue = queue
 	m.mu.Unlock()
 	return nil
 }
 
 func observationFresh(observedAt, now time.Time) bool {
-	return !observedAt.IsZero() && !observedAt.After(now) && now.Sub(observedAt) <= maxSignalAge
+	return freshAt(observedAt, now, maxSignalAge)
 }
 
 func (m *MetricsExporter) SetSignals(signals FleetSignals) error {
-	if err := signals.Validate(m.now(), maxSignalAge); err != nil {
-		m.mu.Lock()
+	return m.SetSignalsObservation(signals, signals.Sequence)
+}
+
+func (m *MetricsExporter) SetSignalsObservation(signals FleetSignals, sequence uint64) error {
+	now := m.now()
+	m.mu.Lock()
+	if !observationNewer(sequence, signals.ObservedAt, m.signals.Sequence, m.signals.ObservedAt) {
+		m.mu.Unlock()
+		return errors.New("stale signal observation")
+	}
+	if err := signals.Validate(now, m.thresholds.SignalsMaxAge); err != nil {
 		m.signals = FleetSignals{}
 		m.mu.Unlock()
 		return err
 	}
-	m.mu.Lock()
 	if signals.DeadProvider && dependencyState(m.health, "provider") == DependencyHealthy {
 		m.signals = FleetSignals{}
 		m.mu.Unlock()
 		return errors.New("dead-provider signal contradicts healthy provider")
 	}
+	signals.Sequence = sequence
 	m.signals = signals
 	m.mu.Unlock()
 	return nil
@@ -318,19 +472,37 @@ func dependencyState(health HealthSnapshot, name string) DependencyState {
 	return DependencyUnknown
 }
 
-func (m *MetricsExporter) RecordTransition(start, end time.Time, transitionErr error, now time.Time) {
+func (m *MetricsExporter) RecordTransition(start, end time.Time, transitionErr error, now time.Time) error {
+	return m.RecordTransitionObservation(start, end, transitionErr, now, 0)
+}
+
+func (m *MetricsExporter) RecordTransitionObservation(start, end time.Time, transitionErr error, now time.Time, sequence uint64) error {
+	if end.Before(start) || end.Sub(start) > maxSignalAge {
+		return errors.New("transition latency is invalid or unbounded")
+	}
 	m.mu.Lock()
+	if !observationNewer(sequence, now, m.slo.Sequence, m.slo.ObservedAt) {
+		m.mu.Unlock()
+		return errors.New("stale transition observation")
+	}
 	m.slo.Attempts++
 	if transitionErr != nil {
 		m.slo.Failed++
 	} else if !end.Before(start) {
+		latency := end.Sub(start)
+		if m.slo.TotalLatency > maxSignalAge-latency {
+			m.mu.Unlock()
+			return errors.New("transition latency total exceeds bounded maximum")
+		}
 		m.slo.Completed++
-		m.slo.TotalLatency += end.Sub(start)
+		m.slo.TotalLatency += latency
 	} else {
 		m.slo.Failed++
 	}
 	m.slo.ObservedAt = now
+	m.slo.Sequence = sequence
 	m.mu.Unlock()
+	return nil
 }
 
 func (m *MetricsExporter) Snapshot() (HealthSnapshot, QueuePressure, TransitionSLO) {
@@ -343,6 +515,25 @@ func (m *MetricsExporter) Signals() FleetSignals {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return m.signals
+}
+
+func (m *MetricsExporter) ReadAt(now time.Time) SnapshotView {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	health, queue, slo, signals := m.health, m.queue, m.slo, m.signals
+	freshness := FreshnessState{
+		HealthFresh:  health.Readiness && freshAt(health.ObservedAt, now, m.thresholds.HealthMaxAge),
+		QueueFresh:   queue.Known && queue.Error == "" && freshAt(queue.ObservedAt, now, m.thresholds.QueueMaxAge),
+		SignalsFresh: signals.Validate(now, m.thresholds.SignalsMaxAge) == nil,
+		SLOFresh:     slo.Attempts == 0 || freshAt(slo.ObservedAt, now, m.thresholds.SLOMaxAge),
+		AsOf:         now,
+	}
+	freshness.Ready = freshness.HealthFresh && freshness.QueueFresh && freshness.SignalsFresh && freshness.SLOFresh
+	view := SnapshotView{Health: health, Queue: queue, SLO: slo, Signals: signals, Freshness: freshness}
+	if freshness.SignalsFresh {
+		view.Conditions = signals.ConditionCodes()
+	}
+	return view
 }
 
 func (m *MetricsExporter) resetUnsafeState() {
@@ -362,17 +553,23 @@ func (m *MetricsExporter) Persist(ctx context.Context) error {
 	if m.store == nil {
 		return errors.New("metrics state store is not configured")
 	}
-	health, queue, slo := m.Snapshot()
+	now := m.now()
+	m.mu.RLock()
 	state := persistedState{
 		Version:             1,
 		TotalTasksProcessed: atomic.LoadUint64(&m.TotalTasksProcessed),
 		TotalTokensBurned:   atomic.LoadUint64(&m.TotalTokensBurned),
 		TotalReviewPasses:   atomic.LoadUint64(&m.TotalReviewPasses),
 		TotalReviewFails:    atomic.LoadUint64(&m.TotalReviewFails),
-		Health:              health,
-		Queue:               queue,
-		SLO:                 slo,
-		Signals:             m.Signals(),
+		Health:              m.health,
+		Queue:               m.queue,
+		SLO:                 m.slo,
+		Signals:             m.signals,
+	}
+	validationErr := m.validateStateLocked(state, now)
+	m.mu.RUnlock()
+	if validationErr != nil {
+		return validationErr
 	}
 	payload, err := json.Marshal(state)
 	if err != nil {
@@ -380,6 +577,35 @@ func (m *MetricsExporter) Persist(ctx context.Context) error {
 	}
 	if err := m.store.Save(ctx, payload); err != nil {
 		return fmt.Errorf("save metrics state: %w", err)
+	}
+	return nil
+}
+
+func (m *MetricsExporter) validateStateLocked(state persistedState, now time.Time) error {
+	if state.Version != 1 {
+		return fmt.Errorf("unsupported metrics state version %d", state.Version)
+	}
+	rebuiltHealth, err := BuildHealthSnapshot(state.Health.Dependencies)
+	if err != nil || !state.Health.Liveness || state.Health.Readiness != rebuiltHealth.Readiness || !freshAt(state.Health.ObservedAt, now, m.thresholds.HealthMaxAge) {
+		return errors.New("invalid metrics health state")
+	}
+	if err := state.Queue.Validate(); err != nil || !freshAt(state.Queue.ObservedAt, now, m.thresholds.QueueMaxAge) {
+		return errors.New("invalid metrics queue state")
+	}
+	if err := state.Signals.Validate(now, m.thresholds.SignalsMaxAge); err != nil {
+		return fmt.Errorf("invalid metrics signals: %w", err)
+	}
+	if state.Signals.DeadProvider && dependencyState(state.Health, "provider") == DependencyHealthy {
+		return errors.New("metrics state contradicts provider health")
+	}
+	if state.SLO.Completed > state.SLO.Attempts || state.SLO.Failed > state.SLO.Attempts || state.SLO.Completed+state.SLO.Failed != state.SLO.Attempts {
+		return errors.New("invalid metrics transition totals")
+	}
+	if state.SLO.TotalLatency < 0 || state.SLO.Completed == 0 && state.SLO.TotalLatency != 0 || state.SLO.TotalLatency > maxSignalAge {
+		return errors.New("invalid metrics transition latency")
+	}
+	if state.SLO.Attempts > 0 && !freshAt(state.SLO.ObservedAt, now, m.thresholds.SLOMaxAge) {
+		return errors.New("invalid metrics transition timestamp")
 	}
 	return nil
 }
@@ -406,101 +632,99 @@ func (m *MetricsExporter) Restore(ctx context.Context) error {
 	if err := decoder.Decode(&trailing); err != io.EOF {
 		return invalidRestore(errors.New("metrics state has trailing data"))
 	}
-	if state.Version != 1 {
-		return invalidRestore(fmt.Errorf("unsupported metrics state version %d", state.Version))
-	}
-	rebuiltHealth, healthErr := BuildHealthSnapshot(state.Health.Dependencies)
-	if healthErr != nil || !observationFresh(state.Health.ObservedAt, m.now()) || !state.Health.Liveness || state.Health.Readiness != rebuiltHealth.Readiness {
-		return invalidRestore(errors.New("invalid persisted health state"))
-	}
-	if err := state.Queue.Validate(); err != nil || !observationFresh(state.Queue.ObservedAt, m.now()) {
-		return invalidRestore(errors.New("invalid persisted queue state"))
-	}
-	if err := state.Signals.Validate(m.now(), maxSignalAge); err != nil {
-		return invalidRestore(fmt.Errorf("invalid persisted signals: %w", err))
-	}
-	if state.Signals.DeadProvider && dependencyState(state.Health, "provider") == DependencyHealthy {
-		return invalidRestore(errors.New("persisted dead-provider signal contradicts healthy provider"))
-	}
-	if state.SLO.Completed > state.SLO.Attempts || state.SLO.Failed > state.SLO.Attempts || state.SLO.Completed+state.SLO.Failed != state.SLO.Attempts {
-		return invalidRestore(errors.New("invalid persisted transition totals"))
+	now := m.now()
+	m.mu.RLock()
+	validationErr := m.validateStateLocked(state, now)
+	m.mu.RUnlock()
+	if validationErr != nil {
+		return invalidRestore(validationErr)
 	}
 	m.mu.Lock()
 	m.health, m.queue, m.slo, m.signals = state.Health, state.Queue, state.SLO, state.Signals
-	m.mu.Unlock()
 	atomic.StoreUint64(&m.TotalTasksProcessed, state.TotalTasksProcessed)
 	atomic.StoreUint64(&m.TotalTokensBurned, state.TotalTokensBurned)
 	atomic.StoreUint64(&m.TotalReviewPasses, state.TotalReviewPasses)
 	atomic.StoreUint64(&m.TotalReviewFails, state.TotalReviewFails)
+	m.mu.Unlock()
 	return nil
 }
 
 func (m *MetricsExporter) RecordTaskProcessed() {
+	m.mu.Lock()
 	atomic.AddUint64(&m.TotalTasksProcessed, 1)
+	m.mu.Unlock()
 }
 
 func (m *MetricsExporter) RecordTokens(tokens uint64) {
+	m.mu.Lock()
 	atomic.AddUint64(&m.TotalTokensBurned, tokens)
+	m.mu.Unlock()
 }
 
 func (m *MetricsExporter) RecordReview(passed bool) {
+	m.mu.Lock()
 	if passed {
 		atomic.AddUint64(&m.TotalReviewPasses, 1)
 	} else {
 		atomic.AddUint64(&m.TotalReviewFails, 1)
 	}
+	m.mu.Unlock()
 }
 
 // Handler returns HTTP handler for Prometheus scraping (/metrics)
 func (m *MetricsExporter) Handler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; version=0.0.4")
-		fmt.Fprintf(w, "# HELP herd_tasks_processed_total Total tasks processed by Herdforge\n")
-		fmt.Fprintf(w, "# TYPE herd_tasks_processed_total counter\n")
-		fmt.Fprintf(w, "herd_tasks_processed_total %d\n\n", atomic.LoadUint64(&m.TotalTasksProcessed))
+		now := m.now()
+		view := m.ReadAt(now)
+		health, queue, slo, signals := view.Health, view.Queue, view.SLO, view.Signals
+		m.mu.RLock()
+		tasks, tokens := atomic.LoadUint64(&m.TotalTasksProcessed), atomic.LoadUint64(&m.TotalTokensBurned)
+		passes, fails := atomic.LoadUint64(&m.TotalReviewPasses), atomic.LoadUint64(&m.TotalReviewFails)
+		m.mu.RUnlock()
+		var body strings.Builder
+		fmt.Fprintf(&body, "# HELP herd_tasks_processed_total Total tasks processed by Herdforge\n# TYPE herd_tasks_processed_total counter\nherd_tasks_processed_total %d\n\n", tasks)
 
-		fmt.Fprintf(w, "# HELP herd_tokens_burned_total Total LLM tokens burned\n")
-		fmt.Fprintf(w, "# TYPE herd_tokens_burned_total counter\n")
-		fmt.Fprintf(w, "herd_tokens_burned_total %d\n\n", atomic.LoadUint64(&m.TotalTokensBurned))
+		fmt.Fprintf(&body, "# HELP herd_tokens_burned_total Total LLM tokens burned\n# TYPE herd_tokens_burned_total counter\nherd_tokens_burned_total %d\n\n", tokens)
 
-		fmt.Fprintf(w, "# HELP herd_review_verdicts_total Total code review verdicts\n")
-		fmt.Fprintf(w, "# TYPE herd_review_verdicts_total counter\n")
-		fmt.Fprintf(w, "herd_review_verdicts_total{verdict=\"pass\"} %d\n", atomic.LoadUint64(&m.TotalReviewPasses))
-		fmt.Fprintf(w, "herd_review_verdicts_total{verdict=\"fail\"} %d\n", atomic.LoadUint64(&m.TotalReviewFails))
-
-		health, queue, slo := m.Snapshot()
+		fmt.Fprintf(&body, "# HELP herd_review_verdicts_total Total code review verdicts\n# TYPE herd_review_verdicts_total counter\nherd_review_verdicts_total{verdict=\"pass\"} %d\nherd_review_verdicts_total{verdict=\"fail\"} %d\n", passes, fails)
 		ready := 0
-		if health.Readiness {
+		if view.Freshness.Ready {
 			ready = 1
 		}
-		fmt.Fprintf(w, "\n# HELP herd_readiness_ready Whether critical dependencies are ready\n# TYPE herd_readiness_ready gauge\nherd_readiness_ready %d\n", ready)
+		fmt.Fprintf(&body, "\n# HELP herd_readiness_ready Whether critical dependencies and observations are ready\n# TYPE herd_readiness_ready gauge\nherd_readiness_ready %d\n", ready)
 		known := 0
-		if queue.Known && queue.Error == "" {
+		if view.Freshness.QueueFresh {
 			known = 1
 		}
-		fmt.Fprintf(w, "# HELP herd_queue_pressure_known Whether queue pressure is a valid observation\n# TYPE herd_queue_pressure_known gauge\nherd_queue_pressure_known %d\n", known)
-		fmt.Fprintf(w, "# HELP herd_transitions_total Transition attempts by outcome\n# TYPE herd_transitions_total counter\nherd_transitions_total{outcome=\"completed\"} %d\nherd_transitions_total{outcome=\"failed\"} %d\n", slo.Completed, slo.Failed)
-
-		signals := m.Signals()
+		fmt.Fprintf(&body, "# HELP herd_queue_pressure_known Whether queue pressure is a fresh valid observation\n# TYPE herd_queue_pressure_known gauge\nherd_queue_pressure_known %d\n", known)
+		if known == 1 {
+			fmt.Fprintf(&body, "# HELP herd_queue_depth Current queue depth\n# TYPE herd_queue_depth gauge\nherd_queue_depth %d\n# HELP herd_queue_capacity Current queue capacity\n# TYPE herd_queue_capacity gauge\nherd_queue_capacity %d\n", queue.Depth, queue.Capacity)
+		}
+		fmt.Fprintf(&body, "# HELP herd_transitions_total Transition attempts by outcome\n# TYPE herd_transitions_total counter\nherd_transitions_total{outcome=\"completed\"} %d\nherd_transitions_total{outcome=\"failed\"} %d\n", slo.Completed, slo.Failed)
+		if view.Freshness.SLOFresh && slo.Completed > 0 {
+			fmt.Fprintf(&body, "# HELP herd_transition_latency_seconds Average completed transition latency\n# TYPE herd_transition_latency_seconds gauge\nherd_transition_latency_seconds %.6f\n", slo.TotalLatency.Seconds()/float64(slo.Completed))
+		}
 		signalsKnown := 0
-		if !signals.ObservedAt.IsZero() {
+		if view.Freshness.SignalsFresh {
 			signalsKnown = 1
 		}
-		fmt.Fprintf(w, "# HELP herd_liveness_alive Whether the process is alive\n# TYPE herd_liveness_alive gauge\nherd_liveness_alive %d\n", boolGauge(health.Liveness))
-		fmt.Fprintf(w, "# HELP herd_fleet_signals_known Whether aggregate fleet signals are authoritative\n# TYPE herd_fleet_signals_known gauge\nherd_fleet_signals_known %d\n", signalsKnown)
+		fmt.Fprintf(&body, "# HELP herd_liveness_alive Whether the process is alive\n# TYPE herd_liveness_alive gauge\nherd_liveness_alive %d\n", boolGauge(health.Liveness))
+		fmt.Fprintf(&body, "# HELP herd_fleet_signals_known Whether aggregate fleet signals are fresh and authoritative\n# TYPE herd_fleet_signals_known gauge\nherd_fleet_signals_known %d\n", signalsKnown)
 		if signalsKnown == 1 {
-			fmt.Fprintf(w, "# HELP herd_stalled_work_total Distinct aggregate stalled work\n# TYPE herd_stalled_work_total gauge\nherd_stalled_work_total %d\n", signals.StalledWork)
-			fmt.Fprintf(w, "# HELP herd_dropped_callbacks_total Dropped callback count\n# TYPE herd_dropped_callbacks_total counter\nherd_dropped_callbacks_total %d\n", signals.DroppedCallbacks)
-			fmt.Fprintf(w, "# HELP herd_review_saturation_ratio Review saturation ratio\n# TYPE herd_review_saturation_ratio gauge\nherd_review_saturation_ratio %.2f\n", float64(signals.ReviewSaturation)/100)
-			fmt.Fprintf(w, "# HELP herd_dead_provider Whether a provider is considered dead\n# TYPE herd_dead_provider gauge\nherd_dead_provider %d\n", boolGauge(signals.DeadProvider))
-			fmt.Fprintf(w, "# HELP herd_integration_backlog Integration backlog\n# TYPE herd_integration_backlog gauge\nherd_integration_backlog %d\n", signals.IntegrationBacklog)
-			fmt.Fprintf(w, "# HELP herd_retries_total Retry count\n# TYPE herd_retries_total counter\nherd_retries_total %d\n", signals.Retries)
-			fmt.Fprintf(w, "# HELP herd_dead_letters_total Dead-letter count\n# TYPE herd_dead_letters_total counter\nherd_dead_letters_total %d\n", signals.DeadLetters)
-			fmt.Fprintf(w, "# HELP herd_max_lease_age_seconds Maximum lease age\n# TYPE herd_max_lease_age_seconds gauge\nherd_max_lease_age_seconds %.6f\n", signals.MaxLeaseAge.Seconds())
-			fmt.Fprintf(w, "# HELP herd_max_callback_age_seconds Maximum callback age\n# TYPE herd_max_callback_age_seconds gauge\nherd_max_callback_age_seconds %.6f\n", signals.MaxCallbackAge.Seconds())
-			fmt.Fprintf(w, "# HELP herd_eligible_idle_seconds Eligible idle time excluding blocked or backpressured work\n# TYPE herd_eligible_idle_seconds gauge\nherd_eligible_idle_seconds %.6f\n", signals.EligibleIdle.Seconds())
-			fmt.Fprintf(w, "# HELP herd_last_reconciliation_timestamp_seconds Last reconciliation timestamp\n# TYPE herd_last_reconciliation_timestamp_seconds gauge\nherd_last_reconciliation_timestamp_seconds %.6f\n", float64(signals.LastReconciliation.UnixNano())/1e9)
+			fmt.Fprintf(&body, "# HELP herd_stalled_work Distinct aggregate stalled work\n# TYPE herd_stalled_work gauge\nherd_stalled_work %d\n", signals.StalledWork)
+			fmt.Fprintf(&body, "# HELP herd_dropped_callbacks Dropped callback count\n# TYPE herd_dropped_callbacks gauge\nherd_dropped_callbacks %d\n", signals.DroppedCallbacks)
+			fmt.Fprintf(&body, "# HELP herd_review_saturation_ratio Review saturation ratio\n# TYPE herd_review_saturation_ratio gauge\nherd_review_saturation_ratio %.2f\n", float64(signals.ReviewSaturation)/100)
+			fmt.Fprintf(&body, "# HELP herd_dead_provider Whether a provider is considered dead\n# TYPE herd_dead_provider gauge\nherd_dead_provider %d\n", boolGauge(signals.DeadProvider))
+			fmt.Fprintf(&body, "# HELP herd_integration_backlog Integration backlog\n# TYPE herd_integration_backlog gauge\nherd_integration_backlog %d\n", signals.IntegrationBacklog)
+			fmt.Fprintf(&body, "# HELP herd_retries Retry count\n# TYPE herd_retries gauge\nherd_retries %d\n", signals.Retries)
+			fmt.Fprintf(&body, "# HELP herd_dead_letters Dead-letter count\n# TYPE herd_dead_letters gauge\nherd_dead_letters %d\n", signals.DeadLetters)
+			fmt.Fprintf(&body, "# HELP herd_max_lease_age_seconds Maximum lease age\n# TYPE herd_max_lease_age_seconds gauge\nherd_max_lease_age_seconds %.6f\n", signals.MaxLeaseAge.Seconds())
+			fmt.Fprintf(&body, "# HELP herd_max_callback_age_seconds Maximum callback age\n# TYPE herd_max_callback_age_seconds gauge\nherd_max_callback_age_seconds %.6f\n", signals.MaxCallbackAge.Seconds())
+			fmt.Fprintf(&body, "# HELP herd_eligible_idle_seconds Eligible idle time excluding blocked or backpressured work\n# TYPE herd_eligible_idle_seconds gauge\nherd_eligible_idle_seconds %.6f\n", signals.EligibleIdle.Seconds())
+			fmt.Fprintf(&body, "# HELP herd_last_reconciliation_timestamp_seconds Last reconciliation timestamp\n# TYPE herd_last_reconciliation_timestamp_seconds gauge\nherd_last_reconciliation_timestamp_seconds %.6f\n", float64(signals.LastReconciliation.UnixNano())/1e9)
 		}
+		_, _ = io.WriteString(w, body.String())
 	})
 }
 
