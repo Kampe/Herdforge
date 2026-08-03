@@ -34,6 +34,11 @@ const (
 	EnvDiskMinInodePct    = "HERD_DISK_MIN_INODE_PCT"
 	EnvDiskRecoverFreeGB  = "HERD_DISK_RECOVER_FREE_GB"
 	EnvDiskRecoverFreePct = "HERD_DISK_RECOVER_FREE_PCT"
+	// EnvDiskBuildHeadroomGB is extra reserve REQUIRED ON TOP of the free
+	// floor before a mutation is allowed: expected temp/build expansion
+	// (git object writes, race binaries, archives). Default 0 (opt-in) so
+	// held packages' test shims stay valid; operators set it fleet-wide.
+	EnvDiskBuildHeadroomGB = "HERD_DISK_BUILD_HEADROOM_GB"
 
 	defaultDiskMinFreeGB   = 15.0
 	defaultDiskMinFreePct  = 2.0
@@ -64,6 +69,15 @@ type DiskThresholds struct {
 	MinInodePct      float64 `json:"min_inode_pct"`
 	RecoverFreeBytes uint64  `json:"recover_free_bytes"`
 	RecoverFreePct   float64 `json:"recover_free_pct"`
+	// HeadroomBytes is required temp/build expansion room, added on top of
+	// MinFreeBytes when deciding capacity (block floor = min + headroom).
+	HeadroomBytes uint64 `json:"headroom_bytes,omitempty"`
+}
+
+// blockFreeBytes is the effective byte floor: reserve plus required
+// temp/build headroom.
+func (t DiskThresholds) blockFreeBytes() uint64 {
+	return t.MinFreeBytes + t.HeadroomBytes
 }
 
 // DiskPressureError is the structured BLOCKED evidence emitted when a fleet
@@ -226,7 +240,7 @@ func (g *DiskGuard) Check(operation string, paths ...string) error {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 
-	if bad := below(stats, th.MinFreeBytes, th.MinFreePct, th.MinInodePct); bad != nil {
+	if bad := below(stats, th.blockFreeBytes(), th.MinFreePct, th.MinInodePct); bad != nil {
 		g.state = DiskBlocked
 		pe := &DiskPressureError{
 			State:      "BLOCKED",
@@ -236,7 +250,7 @@ func (g *DiskGuard) Check(operation string, paths ...string) error {
 			Thresholds: th,
 			Detail: fmt.Sprintf("volume %s (%s) free %.1fGiB (%.1f%%, %d free inodes) below reserve (min %.1fGiB / %.1f%%)",
 				bad.Path, bad.FSID, float64(bad.FreeBytes)/bytesPerGiB, bad.FreePct, bad.FreeInodes,
-				float64(th.MinFreeBytes)/bytesPerGiB, th.MinFreePct),
+				float64(th.blockFreeBytes())/bytesPerGiB, th.MinFreePct),
 			NextAction: safeNextAction,
 		}
 		g.lastEvidence = pe
@@ -286,12 +300,16 @@ func below(stats []DiskStat, minFreeBytes uint64, minFreePct, minInodePct float6
 func loadDiskThresholds() DiskThresholds {
 	minGB := envFloat(EnvDiskMinFreeGB, defaultDiskMinFreeGB)
 	minPct := envFloat(EnvDiskMinFreePct, defaultDiskMinFreePct)
+	headGB := envFloat(EnvDiskBuildHeadroomGB, 0)
 	th := DiskThresholds{
-		MinFreeBytes:     uint64(minGB * bytesPerGiB),
-		MinFreePct:       minPct,
-		MinInodePct:      envFloat(EnvDiskMinInodePct, defaultDiskMinInodePct),
-		RecoverFreeBytes: uint64(envFloat(EnvDiskRecoverFreeGB, minGB*recoverFactor) * bytesPerGiB),
+		MinFreeBytes: uint64(minGB * bytesPerGiB),
+		MinFreePct:   minPct,
+		MinInodePct:  envFloat(EnvDiskMinInodePct, defaultDiskMinInodePct),
+		// Recover floor defaults scale from the EFFECTIVE block floor
+		// (reserve + headroom) so hysteresis still clears above headroom.
+		RecoverFreeBytes: uint64(envFloat(EnvDiskRecoverFreeGB, (minGB+headGB)*recoverFactor) * bytesPerGiB),
 		RecoverFreePct:   envFloat(EnvDiskRecoverFreePct, minPct*recoverFactor),
+		HeadroomBytes:    uint64(headGB * bytesPerGiB),
 	}
 	return th
 }

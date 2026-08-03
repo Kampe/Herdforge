@@ -255,3 +255,28 @@ func TestDiskGuardRestartReconciliation(t *testing.T) {
 		t.Fatalf("fresh guard state = %s", fresh.State())
 	}
 }
+
+func TestDiskGuardBuildHeadroomIncludedInDecision(t *testing.T) {
+	// 13GiB free clears a 10GiB reserve alone, but not 10GiB + 8GiB
+	// required temp/build headroom.
+	t.Setenv(EnvDiskMinFreeGB, "10")
+	t.Setenv(EnvDiskMinFreePct, "0")
+	st := incidentStat("/repo", "a") // 13GiB free
+	st.FreePct = 50                  // isolate the bytes axis
+
+	g := NewDiskGuard(fakeProber(map[string]DiskStat{"/repo": st}, nil))
+	if err := g.Check("dispatch", "/repo"); err != nil {
+		t.Fatalf("without headroom 13GiB > 10GiB must pass: %v", err)
+	}
+
+	t.Setenv(EnvDiskBuildHeadroomGB, "8")
+	g2 := NewDiskGuard(fakeProber(map[string]DiskStat{"/repo": st}, nil))
+	pe := asPressureErr(t, g2.Check("dispatch", "/repo"))
+	if pe.Thresholds.HeadroomBytes != 8<<30 {
+		t.Fatalf("headroom missing from evidence: %+v", pe.Thresholds)
+	}
+	// Recover floor scales from the effective floor: (10+8)*1.25 = 22.5GiB.
+	if got := pe.Thresholds.RecoverFreeBytes; got != uint64(22.5*float64(1<<30)) {
+		t.Fatalf("recover floor = %d, want 22.5GiB", got)
+	}
+}
