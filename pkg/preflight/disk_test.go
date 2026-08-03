@@ -1,9 +1,11 @@
 package preflight
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -575,5 +577,40 @@ func TestDiskGuardSoftFloorSaturates(t *testing.T) {
 	adv := g.Advise("dispatch", "/repo")
 	if adv.Verdict != AdviceRefuse {
 		t.Fatalf("saturated floors must refuse, got %+v", adv)
+	}
+}
+
+func TestDiskEvidenceRedactsHostPaths(t *testing.T) {
+	g := NewDiskGuard(fakeProber(map[string]DiskStat{
+		"/Users/someone/secret-project/repo": incidentStat("/Users/someone/secret-project/repo", "abc123"),
+	}, nil))
+	pe := asPressureErr(t, g.Check("dispatch", "/Users/someone/secret-project/repo"))
+
+	raw, err := json.Marshal(pe)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), "secret-project") || strings.Contains(string(raw), "/Users/") {
+		t.Fatalf("host path leaked into persisted evidence: %s", raw)
+	}
+	if !strings.Contains(string(raw), `"volume":"vol-abc123"`) {
+		t.Fatalf("bounded volume label missing: %s", raw)
+	}
+	// The full rendered error (what could reach Kaneo) is clean too.
+	if strings.Contains(pe.Error(), "secret-project") {
+		t.Fatalf("host path leaked into error string: %s", pe.Error())
+	}
+	// Path stays available process-local on the struct.
+	if pe.Stats[0].Path == "" {
+		t.Fatal("process-local path lost from struct")
+	}
+
+	// Unreadable-probe evidence redacts the path inside the os error.
+	g2 := NewDiskGuard(func(path string) (DiskStat, error) {
+		return DiskStat{}, &os.PathError{Op: "statfs", Path: path, Err: errors.New("io error")}
+	})
+	pe2 := asPressureErr(t, g2.Check("dispatch", "/Users/someone/secret-project/repo"))
+	if strings.Contains(pe2.Error(), "secret-project") {
+		t.Fatalf("unreadable evidence leaked path: %s", pe2.Error())
 	}
 }

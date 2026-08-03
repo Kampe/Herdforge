@@ -63,9 +63,12 @@ const (
 	bytesPerGiB = float64(1 << 30)
 )
 
-// DiskStat is one volume's observed capacity headroom.
+// DiskStat is one volume's observed capacity headroom. Path is
+// process-local only (json:"-"): persisted evidence carries the bounded
+// Volume label plus FSID/values, never absolute host paths.
 type DiskStat struct {
-	Path         string  `json:"path"`
+	Path         string  `json:"-"`
+	Volume       string  `json:"volume"`
 	FSID         string  `json:"fsid"`
 	TotalBytes   uint64  `json:"total_bytes"`
 	FreeBytes    uint64  `json:"free_bytes"`
@@ -293,7 +296,7 @@ func (g *DiskGuard) probeAll(operation string, th DiskThresholds, paths []string
 				Reason:     ReasonStatUnreadable,
 				Operation:  operation,
 				Thresholds: th,
-				Detail:     fmt.Sprintf("cannot stat volume for %q (failing closed): %v", p, err),
+				Detail:     fmt.Sprintf("cannot stat a scoped volume (failing closed): %v", redactErr(err)),
 				NextAction: safeNextAction,
 			}
 		}
@@ -301,6 +304,7 @@ func (g *DiskGuard) probeAll(operation string, th DiskThresholds, paths []string
 			continue
 		}
 		seen[st.FSID] = true
+		st.Volume = "vol-" + st.FSID
 		stats = append(stats, st)
 	}
 	return stats, nil
@@ -424,8 +428,8 @@ func (g *DiskGuard) evaluateLocked(operation string, th DiskThresholds, stats []
 			Stats:                    stats,
 			Thresholds:               th,
 			OutstandingReservedBytes: g.outstanding,
-			Detail: fmt.Sprintf("volume %s (%s) free %.1fGiB (%.1f%%, %d free inodes) below reserve (min %.1fGiB / %.1f%%)",
-				bad.Path, bad.FSID, float64(bad.FreeBytes)/bytesPerGiB, bad.FreePct, bad.FreeInodes,
+			Detail: fmt.Sprintf("volume %s free %.1fGiB (%.1f%%, %d free inodes) below reserve (min %.1fGiB / %.1f%%)",
+				bad.Volume, float64(bad.FreeBytes)/bytesPerGiB, bad.FreePct, bad.FreeInodes,
 				float64(th.blockFreeBytes())/bytesPerGiB, th.MinFreePct),
 			NextAction: safeNextAction,
 		}
@@ -448,7 +452,7 @@ func (g *DiskGuard) evaluateLocked(operation string, th DiskThresholds, stats []
 				Thresholds:               th,
 				OutstandingReservedBytes: g.outstanding,
 				Detail: fmt.Sprintf("volume %s above block floor but below recover floor (%.1fGiB / %.1f%%); holding closed until stable headroom",
-					bad.Path, float64(th.RecoverFreeBytes)/bytesPerGiB, th.RecoverFreePct),
+					bad.Volume, float64(th.RecoverFreeBytes)/bytesPerGiB, th.RecoverFreePct),
 				NextAction: safeNextAction,
 			}
 			g.lastEvidence = pe
@@ -515,7 +519,7 @@ func (g *DiskGuard) Advise(operation string, paths ...string) DiskAdvice {
 			MaxParallel: 1,
 			Stats:       stats,
 			Detail: fmt.Sprintf("volume %s free %.1fGiB (%.1f%%) inside soft band (< %.1fGiB / %.1f%%): serializing mutation fan-out before refusing work",
-				bad.Path, float64(bad.FreeBytes)/bytesPerGiB, bad.FreePct,
+				bad.Volume, float64(bad.FreeBytes)/bytesPerGiB, bad.FreePct,
 				float64(softBytes)/bytesPerGiB, softPct),
 		}
 	}
@@ -525,6 +529,16 @@ func (g *DiskGuard) Advise(operation string, paths ...string) DiskAdvice {
 // AdviseDiskPressure is Advise on the process-wide default guard.
 func AdviseDiskPressure(operation string, paths ...string) DiskAdvice {
 	return DefaultDiskGuard.Advise(operation, paths...)
+}
+
+// redactErr strips path context from probe errors so persisted evidence
+// never carries absolute host paths (raw paths stay process-local).
+func redactErr(err error) error {
+	var pe *os.PathError
+	if errors.As(err, &pe) {
+		return fmt.Errorf("%s: %w", pe.Op, pe.Err)
+	}
+	return err
 }
 
 // below returns the first stat under any enabled floor (zero disables an
