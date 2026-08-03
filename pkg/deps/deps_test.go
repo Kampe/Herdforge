@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -27,6 +28,7 @@ func prov(ref string, edges ...DependencyEdge) *Provenance {
 	return &Provenance{
 		Version: SchemaVersion,
 		TaskRef: Ref(ref),
+		TaskID:  TaskID("id-" + strings.ToLower(ref)),
 		Edges:   edges,
 		Present: true,
 	}
@@ -70,7 +72,7 @@ func TestMigrate_DryRunAndApply(t *testing.T) {
 	mp := provider.NewMemoryProvider()
 	mp.AddTask(&provider.Task{ID: "t1", Ref: "FAC-1", Status: "to-do", ProjectID: "p", Title: "a"})
 	mp.AddTask(&provider.Task{ID: "t2", Ref: "FAC-2", Status: "to-do", ProjectID: "p", Title: "b",
-		Description: "```herd-deps-v1\n{\"version\":1,\"task_ref\":\"FAC-2\",\"edges\":[]}\n```\n"})
+		Description: "```herd-deps-v1\n{\"version\":1,\"task_ref\":\"FAC-2\",\"task_id\":\"t2\",\"edges\":[]}\n```\n"})
 	store := StoreFor(mp, "p")
 	plan, err := PlanMigration(context.Background(), store, mp, "p")
 	if err != nil {
@@ -81,19 +83,26 @@ func TestMigrate_DryRunAndApply(t *testing.T) {
 		switch it.Action {
 		case "write_empty", "write_from_board":
 			wrote++
-		case "skip_has_fence":
+		case "skip_fresh":
 			skipped++
 		}
 	}
 	if wrote < 1 || skipped < 1 {
 		t.Fatalf("plan items=%+v wrote=%d skipped=%d", plan.Items, wrote, skipped)
 	}
-	applied, err := ApplyMigration(context.Background(), store, mp, "p", MemoryDescriptionWriter{MP: mp})
+	jdir := t.TempDir()
+	applied, err := ApplyMigration(context.Background(), store, mp, "p", MemoryDescriptionWriter{MP: mp}, jdir)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !applied.OK {
 		t.Fatalf("apply not ok: %+v", applied)
+	}
+	if applied.Mode != "apply-description" {
+		t.Fatalf("mode want apply-description got %s", applied.Mode)
+	}
+	if applied.JournalPath == "" {
+		t.Fatal("expected journal path")
 	}
 	// FAC-1 now launchable with empty provenance.
 	t1, _ := mp.GetTask(context.Background(), "t1")
@@ -103,6 +112,80 @@ func TestMigrate_DryRunAndApply(t *testing.T) {
 	}
 	if err := p.BindAndValidate("FAC-1", "t1"); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestEdgeMultisetEqual_CountsDuplicates(t *testing.T) {
+	e := DependencyEdge{SourceRef: "A", TargetRef: "B", SourceID: "a", TargetID: "b", Type: EdgeBlocks}
+	// Set semantics would treat [e,e] == [e]; multiset must not.
+	if EdgeMultisetEqual([]DependencyEdge{e, e}, []DependencyEdge{e}) {
+		t.Fatal("duplicate edges must not hide under set equality")
+	}
+	if !EdgeMultisetEqual([]DependencyEdge{e, e}, []DependencyEdge{e, e}) {
+		t.Fatal("equal multisets should match")
+	}
+}
+
+func TestLeaseOwnership_TwoIndependentManagers_ExactlyOneWinner(t *testing.T) {
+	db := filepath.Join(t.TempDir(), "launch.db")
+	wins, conflicts, err := TwoIndependentManagersClaim(
+		context.Background(), db, "herd", "memory", "p", "FAC-1", "rev-abc",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if wins != 1 || conflicts != 1 {
+		t.Fatalf("want 1 win + 1 conflict, got wins=%d conflicts=%d", wins, conflicts)
+	}
+}
+
+func TestLeaseOwnership_CompensateRefusesStaleGeneration(t *testing.T) {
+	db := filepath.Join(t.TempDir(), "launch.db")
+	a, err := OpenLeaseOwnership(db, "herd", "memory", "p")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	b, err := OpenLeaseOwnership(db, "herd", "memory", "p")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+
+	tokA, err := a.ClaimExclusive(context.Background(), "id1", "FAC-1", "launch", "rev1", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Release A, re-claim with B so generation advances.
+	if err := a.CompensateIfOwner(context.Background(), tokA, "done"); err != nil {
+		t.Fatal(err)
+	}
+	tokB, err := b.ClaimExclusive(context.Background(), "id1", "FAC-1", "launch", "rev1", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Stale token A must not release B's lease.
+	if err := a.CompensateIfOwner(context.Background(), tokA, "stale"); !errors.Is(err, ErrNotOwner) {
+		t.Fatalf("want ErrNotOwner for stale gen, got %v", err)
+	}
+	owns, err := b.StillOwns(context.Background(), tokB)
+	if err != nil || !owns {
+		t.Fatalf("B should still own: owns=%v err=%v", owns, err)
+	}
+}
+
+func TestMigrate_RepairStaleMissingTaskID(t *testing.T) {
+	mp := provider.NewMemoryProvider()
+	// Fence present but missing required task_id → repair_stale, not skip.
+	mp.AddTask(&provider.Task{ID: "t1", Ref: "FAC-1", Status: "to-do", ProjectID: "p",
+		Description: "```herd-deps-v1\n{\"version\":1,\"task_ref\":\"FAC-1\",\"edges\":[]}\n```\n"})
+	store := StoreFor(mp, "p")
+	plan, err := PlanMigration(context.Background(), store, mp, "p")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.Items) != 1 || plan.Items[0].Action != "repair_stale" {
+		t.Fatalf("want repair_stale for missing task_id, got %+v", plan.Items)
 	}
 }
 
@@ -250,7 +333,7 @@ func TestGate_UnknownStatusFailClosed(t *testing.T) {
 
 func TestGate_TOCTOU_RevisionMismatch(t *testing.T) {
 	m := seedBoard(t)
-	des := EmptyProvenance("FAC-75")
+	des := EmptyProvenanceBound("FAC-75", "id-fac-75")
 	gr, err := ValidateLaunch(context.Background(), m, EntryPulse, "FAC-75", des, "")
 	if err != nil {
 		t.Fatal(err)
@@ -267,7 +350,7 @@ func TestGate_TOCTOU_RevisionMismatch(t *testing.T) {
 
 func TestGate_ClaimFenceRequired(t *testing.T) {
 	m := seedBoard(t)
-	_, err := ValidateClaim(context.Background(), m, "FAC-75", EmptyProvenance("FAC-75"), "")
+	_, err := ValidateClaim(context.Background(), m, "FAC-75", EmptyProvenanceBound("FAC-75", "id-fac-75"), "")
 	if err == nil {
 		t.Fatal("empty selection revision must fail fence")
 	}
@@ -282,6 +365,7 @@ func TestGate_DesiredMissingOnBoard(t *testing.T) {
 	des := &Provenance{
 		Version: SchemaVersion,
 		TaskRef: "FAC-75",
+		TaskID:  "id-fac-75",
 		Present: true,
 		Holds: []Hold{{
 			Kind:         HoldCollisionOwnership,
@@ -332,7 +416,7 @@ func TestProvenance_FenceAuthoritative(t *testing.T) {
 	if !p.Present {
 		t.Fatal("fence must be Present")
 	}
-	if err := p.BindAndValidate("FAC-75", "id-fac-75"); err != nil {
+	if err := func() error { p.TaskID="id-fac-75"; return p.BindAndValidate("FAC-75", "id-fac-75") }(); err != nil {
 		t.Fatal(err)
 	}
 	blocks, err := p.DesiredBlocks()
@@ -404,9 +488,9 @@ func TestSelectEligible_PreservesPriorityOrder(t *testing.T) {
 		{ID: "id-fac-10", Ref: "FAC-10", Status: "to-do", Priority: provider.PriorityMedium},
 	}
 	desired := map[string]*Provenance{
-		"FAC-2":  EmptyProvenance("FAC-2"),
-		"FAC-3":  EmptyProvenance("FAC-3"),
-		"FAC-10": EmptyProvenance("FAC-10"),
+		"FAC-2":  EmptyProvenanceBound("FAC-2", "id-fac-2"),
+		"FAC-3":  EmptyProvenanceBound("FAC-3", "id-fac-3"),
+		"FAC-10": EmptyProvenanceBound("FAC-10", "id-fac-10"),
 	}
 	// Block FAC-2 with open blocker
 	if _, err := m.SeedBlocks("FAC-10", "FAC-2"); err != nil {
@@ -501,7 +585,7 @@ func TestMutationControl_ReconcileNotVacuouslyOK(t *testing.T) {
 
 func TestFencedClaim_CompensatesOnPostDrift(t *testing.T) {
 	m := seedBoard(t)
-	des := EmptyProvenance("FAC-75")
+	des := EmptyProvenanceBound("FAC-75", "id-fac-75")
 	pre, err := ValidateLaunch(context.Background(), m, EntryPulse, "FAC-75", des, "")
 	if err != nil {
 		t.Fatal(err)

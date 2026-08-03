@@ -54,9 +54,20 @@ func TestProductionLaunchWiring_GateBeforeSideEffects(t *testing.T) {
 	if !strings.Contains(runPulse, "FencedClaim") || !strings.Contains(runPulse, "claimTaskBound") {
 		t.Fatal("RunPulse must use FencedClaim wrapping claimTaskBound")
 	}
-	if strings.Index(runPulse, "FencedClaim") > strings.Index(runPulse, "claimTaskBound") {
-		// claimTaskBound is inside the closure after FencedClaim call — both must exist.
-		// FencedClaim text appears first; claimTaskBound appears later in body — ok either way if both present.
+	if !strings.Contains(runPulse, "ClaimExclusive") || !strings.Contains(runPulse, "CompensateIfOwner") {
+		t.Fatal("RunPulse must acquire durable claim lease (ClaimExclusive) and generation-fenced CompensateIfOwner")
+	}
+	if !strings.Contains(dispatchFn, "OpenLeaseOwnership") && !strings.Contains(dispatchFn, "ownershipClaimer") {
+		t.Fatal("Dispatch must use ownershipClaimer / OpenLeaseOwnership (not process-local map)")
+	}
+	if strings.Contains(dispatchFn, "LoadProvenance") || strings.Contains(dispatchFn, "WriteSidecar") || strings.Contains(dispatchFn, "apply-sidecar") {
+		t.Fatal("Dispatch must not load sidecar provenance (description fence only)")
+	}
+	if !strings.Contains(dispatchFn, "ExtractProvenanceFromText") {
+		t.Fatal("Dispatch must extract provenance from description text only")
+	}
+	if strings.Contains(string(mustRead(t, filepath.Join(root, "cmd/herd/deps.go"))), "apply-sidecar") {
+		t.Fatal("cmd/herd migrate must not offer apply-sidecar")
 	}
 
 	// No theater: blank-identifier assignment of ValidateLaunch must not appear in cmd/herd.
@@ -98,6 +109,15 @@ func TestProductionLaunchWiring_GateBeforeSideEffects(t *testing.T) {
 	if calls < 2 {
 		t.Fatalf("ast: Dispatch must call RequireTaskLaunch >=2 times, got %d", calls)
 	}
+}
+
+func mustRead(t *testing.T, path string) []byte {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
 }
 
 func extractFuncBody(src, prefix string) string {

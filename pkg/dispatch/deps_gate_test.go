@@ -17,13 +17,13 @@ func TestDispatch_DepsGateBlocksBeforeWorktree(t *testing.T) {
 	mp.AddTask(&provider.Task{
 		ID: "b1", Ref: "FAC-136", Title: "blocker", Status: "to-do",
 		Priority: provider.PriorityHigh, ProjectID: "test",
-		Description: emptyDepsFence("FAC-136"),
+		Description: emptyDepsFence("FAC-136", "b1"),
 	})
 	mp.AddTask(&provider.Task{
 		ID: "t1", Ref: "FAC-75", Title: "dependent", Status: "to-do",
 		Priority: provider.PriorityHigh, ProjectID: "test",
 		Description: "```herd-deps-v1\n" +
-			`{"version":1,"task_ref":"FAC-75","edges":[{"source_ref":"FAC-136","target_ref":"FAC-75","type":"blocks"}]}` +
+			`{"version":1,"task_ref":"FAC-75","task_id":"t1","edges":[{"source_ref":"FAC-136","target_ref":"FAC-75","type":"blocks"}]}` +
 			"\n```\n",
 	})
 	if _, err := mp.CreateRelation(context.Background(), "b1", "t1", provider.RelationBlocks); err != nil {
@@ -95,13 +95,13 @@ func TestDispatch_DepsGateAllowsWhenBlockerDone(t *testing.T) {
 	mp.AddTask(&provider.Task{
 		ID: "b1", Ref: "FAC-136", Title: "blocker", Status: "done",
 		Priority: provider.PriorityHigh, ProjectID: "test",
-		Description: emptyDepsFence("FAC-136"),
+		Description: emptyDepsFence("FAC-136", "b1"),
 	})
 	mp.AddTask(&provider.Task{
 		ID: "t1", Ref: "FAC-75", Title: "dependent", Status: "to-do",
 		Priority: provider.PriorityHigh, ProjectID: "test",
 		Description: "```herd-deps-v1\n" +
-			`{"version":1,"task_ref":"FAC-75","edges":[{"source_ref":"FAC-136","target_ref":"FAC-75","type":"blocks"}]}` +
+			`{"version":1,"task_ref":"FAC-75","task_id":"t1","edges":[{"source_ref":"FAC-136","target_ref":"FAC-75","type":"blocks"}]}` +
 			"\n```\n",
 	})
 	if _, err := mp.CreateRelation(context.Background(), "b1", "t1", provider.RelationBlocks); err != nil {
@@ -117,14 +117,14 @@ func TestDispatch_DepsGateAllowsWhenBlockerDone(t *testing.T) {
 		Verification: config.Verification{TestCommand: "go test ./..."},
 	}
 	mw := &mockWorktree{err: context.Canceled} // fail after gate
-	d := &Dispatcher{
+	d := withTestLease(t, &Dispatcher{
 		Config:       cfg,
 		TaskProvider: mp,
 		Worktree:     mw,
 		Compensator:  &recordingCompensator{},
 		Herdr:        &fakeHerdr{available: false},
 		Deps:         deps.StoreFor(mp, "test"),
-	}
+	})
 
 	_, err := d.Dispatch(context.Background(), DispatchOptions{TicketRef: "FAC-75", NoLaunch: true})
 	if mw.calls != 1 {

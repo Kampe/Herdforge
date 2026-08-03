@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -24,6 +25,9 @@ type Engine struct {
 	Verifier *verifier.Verifier
 	// Deps is the FAC-159 relation store; when nil, derived from TaskProv.
 	Deps deps.RelationStore
+	// Ownership is the durable cross-process launch lease (pkg/claim SQLite).
+	// When nil, OpenLeaseOwnership under .herd/launch-claims.db is used.
+	Ownership deps.OwnershipClaimer
 
 	// health projects BLOCKED(provider_timeout)/recovering for the control plane.
 	health providerHealth
@@ -177,8 +181,32 @@ func (e *Engine) depsStore() deps.RelationStore {
 	return deps.StoreFor(e.TaskProv, e.Config.TaskProvider.ProjectID)
 }
 
+func (e *Engine) ownershipClaimer() (deps.OwnershipClaimer, error) {
+	if e.Ownership != nil {
+		return e.Ownership, nil
+	}
+	root := "."
+	if e.Worktree != nil && e.Worktree.RepoRoot != "" {
+		root = e.Worktree.RepoRoot
+	}
+	repo := "herd"
+	providerType := "memory"
+	project := ""
+	if e.Config != nil {
+		if e.Config.Project.Name != "" {
+			repo = e.Config.Project.Name
+		}
+		if e.Config.TaskProvider.Type != "" {
+			providerType = e.Config.TaskProvider.Type
+		}
+		project = e.Config.TaskProvider.ProjectID
+	}
+	return deps.OpenLeaseOwnership(deps.ResolveLaunchLeasePath(root), repo, providerType, project)
+}
+
 // RunPulse executes one orchestration sweep pass, recording to the SQLite store.
-// FAC-159: re-validates dependency graph immediately before claim (TOCTOU close).
+// FAC-159: durable claim lease (pkg/claim) + revision-fenced graph check before
+// board claim; post-claim drift compensates only while owner+generation match.
 func (e *Engine) RunPulse(ctx context.Context, role string) (*provider.Task, error) {
 	// BLOCKED: do not claim more work; surface status and stay responsive.
 	if e.health.isBlocked() {
@@ -193,10 +221,36 @@ func (e *Engine) RunPulse(ctx context.Context, role string) (*provider.Task, err
 		return nil, nil
 	}
 
-	// Fenced claim: bind selection revision, claim, post-claim re-validate.
-	// Atomic graph+claim is unavailable; post-claim drift triggers compensation
-	// (status back to to-do) so TOCTOU cannot leave a false-ready card.
-	desired, _ := deps.ExtractProvenanceFromText(task.Description)
+	desired, perr := deps.ExtractProvenanceFromText(task.Description)
+	if perr != nil {
+		return nil, fmt.Errorf("pulse provenance: %w", perr)
+	}
+	if desired == nil || !desired.Present {
+		return nil, fmt.Errorf("pulse: %w for %s", deps.ErrMissingProvenance, task.Ref)
+	}
+	if berr := desired.BindAndValidate(deps.Ref(task.Ref), deps.TaskID(task.ID)); berr != nil {
+		return nil, fmt.Errorf("pulse provenance bind: %w", berr)
+	}
+	if strings.TrimSpace(selectionRev) == "" {
+		return nil, fmt.Errorf("pulse: %w; empty selection revision", deps.ErrClaimFence)
+	}
+
+	// Durable cross-process lease BEFORE board status mutation (not process-local).
+	own, oerr := e.ownershipClaimer()
+	if oerr != nil {
+		return nil, fmt.Errorf("pulse lease store: %w", oerr)
+	}
+	claimRole := role
+	if claimRole == "" {
+		claimRole = "pulse"
+	}
+	tok, cerr := own.ClaimExclusive(ctx, deps.TaskID(task.ID), deps.Ref(task.Ref), claimRole, selectionRev, "", "")
+	if cerr != nil {
+		return nil, fmt.Errorf("pulse lease claim: %w", cerr)
+	}
+
+	// Fenced claim: pre/post graph check around board ClaimTask. Compensation is
+	// generation-fenced — board to-do only when we still hold owner+generation.
 	_, gerr := deps.FencedClaim(
 		ctx,
 		e.depsStore(),
@@ -205,14 +259,38 @@ func (e *Engine) RunPulse(ctx context.Context, role string) (*provider.Task, err
 		desired,
 		selectionRev,
 		func(cctx context.Context) error {
+			if owns, err := own.StillOwns(cctx, tok); err != nil {
+				return err
+			} else if !owns {
+				return fmt.Errorf("%w: lost lease before board claim", deps.ErrNotOwner)
+			}
 			return e.claimTaskBound(cctx, task.ID, role)
 		},
 		func(cctx context.Context, taskID deps.TaskID, reason string) error {
-			// Best-effort compensate: reverse claim to to-do.
-			return e.TaskProv.UpdateStatus(cctx, string(taskID), provider.StatusToDo)
+			owns, err := own.StillOwns(cctx, tok)
+			if err != nil {
+				return err
+			}
+			if !owns {
+				return fmt.Errorf("%w: refuse board compensate (%s)", deps.ErrNotOwner, reason)
+			}
+			var boardErr error
+			if e.TaskProv != nil {
+				boardErr = e.TaskProv.UpdateStatus(cctx, string(taskID), provider.StatusToDo)
+			}
+			leaseErr := own.CompensateIfOwner(cctx, tok, reason)
+			if leaseErr != nil && errors.Is(leaseErr, deps.ErrNotOwner) {
+				leaseErr = nil
+			}
+			return errors.Join(boardErr, leaseErr)
 		},
 	)
 	if gerr != nil {
+		// If FencedClaim failed before/without compensate (e.g. claimFn error),
+		// release lease only while we still own it.
+		if cErr := own.CompensateIfOwner(ctx, tok, "pulse_claim_failed"); cErr != nil && !errors.Is(cErr, deps.ErrNotOwner) {
+			gerr = errors.Join(gerr, cErr)
+		}
 		return nil, fmt.Errorf("pulse claim blocked (dependency fence): %w", gerr)
 	}
 

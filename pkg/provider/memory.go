@@ -63,6 +63,8 @@ func (m *MemoryProvider) ListTasks(ctx context.Context, projectID string, status
 }
 
 func (m *MemoryProvider) ClaimTask(ctx context.Context, taskID string, role string) error {
+	// Board status is not the cross-process fence (pkg/claim SQLite lease is).
+	// FAC-147 will add provider CAS; until then this remains a plain transition.
 	return m.UpdateStatus(ctx, taskID, StatusInProgress)
 }
 
@@ -234,4 +236,3 @@ func (m *MemoryProvider) resolveIDLocked(idOrRef string) string {
 	}
 	return ""
 }
-

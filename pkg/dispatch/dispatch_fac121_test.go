@@ -235,7 +235,7 @@ func testCfg() *config.Config {
 
 func baseTask(ref string) *provider.Task {
 	// FAC-159: launch requires a Present versioned provenance fence (empty edges OK).
-	fence := "```herd-deps-v1\n{\"version\":1,\"task_ref\":\"" + ref + "\",\"edges\":[]}\n```\n"
+	fence := "```herd-deps-v1\n{\"version\":1,\"task_ref\":\"" + ref + "\",\"task_id\":\"1\",\"edges\":[]}\n```\n"
 	return &provider.Task{ID: "1", Ref: ref, Title: "Task " + ref, Status: "to-do", Description: fence}
 }
 
@@ -379,13 +379,13 @@ func TestDispatch_EmptyBranchAfterWorktreeCompensates(t *testing.T) {
 	}
 	comp := &recordingCompensator{}
 	fh := &fakeHerdr{available: true, workspace: "w1", model: "m", tabID: "must-not-create"}
-	d := &Dispatcher{
+	d := withTestLease(t, &Dispatcher{
 		Config:       testCfg(),
 		TaskProvider: tp,
 		Worktree:     mw,
 		Compensator:  comp,
 		Herdr:        fh,
-	}
+	})
 
 	res, err := d.Dispatch(context.Background(), DispatchOptions{TicketRef: "FAC-EMPTY"})
 	if err == nil {

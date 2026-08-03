@@ -157,6 +157,9 @@ type Dispatcher struct {
 	// Deps is the relation store for the FAC-159 pre-side-effect gate.
 	// When nil, constructed from TaskProvider via deps.StoreFor.
 	Deps deps.RelationStore
+	// Ownership is a durable cross-process lease claimer (claim.ClaimManager +
+	// SQLite). When nil, opened at .herd/launch-claims.db under RepoRoot.
+	Ownership deps.OwnershipClaimer
 
 	// health projects BLOCKED(provider_timeout) for board calls (FAC-150).
 	health dispatchHealth
@@ -179,6 +182,31 @@ func NewDispatcher(cfg *config.Config, tp provider.TaskProvider, wm *worktree.Wo
 		}
 	}
 	return d
+}
+
+func (d *Dispatcher) ownershipClaimer() (deps.OwnershipClaimer, error) {
+	if d.Ownership != nil {
+		return d.Ownership, nil
+	}
+	root := ""
+	if d.Worktree != nil {
+		root = d.Worktree.RepoRoot()
+	}
+	if root == "" {
+		root = "."
+	}
+	repo := ""
+	providerType := "memory"
+	project := ""
+	if d.Config != nil {
+		repo = d.Config.Project.Name
+		if repo == "" {
+			repo = "herd"
+		}
+		providerType = d.Config.TaskProvider.Type
+		project = d.Config.TaskProvider.ProjectID
+	}
+	return deps.OpenLeaseOwnership(deps.ResolveLaunchLeasePath(root), repo, providerType, project)
 }
 
 func (d *Dispatcher) launcher() HerdrLauncher {
@@ -287,56 +315,75 @@ func (d *Dispatcher) Dispatch(ctx context.Context, opts DispatchOptions) (*Dispa
 	}
 
 	// 2b. FAC-159 PRE-SIDE-EFFECT fence: selection → re-read bound to revision
-	// BEFORE any worktree/status/comment/tab. No empty-revision optional path.
+	// → exclusive ownership claim BEFORE any worktree/status/comment/tab.
 	var depProv *deps.Provenance
-	var launchRev string
 	store := d.Deps
 	if store == nil {
 		store = deps.StoreFor(d.TaskProvider, d.Config.TaskProvider.ProjectID)
 	}
+	// Provenance authority is description fence only (no sidecar / second store).
 	desired, perr := deps.ExtractProvenanceFromText(task.Description)
 	if perr != nil {
 		return nil, fmt.Errorf("dispatch dependency provenance: %w", perr)
 	}
 	if desired == nil || !desired.Present {
-		return nil, fmt.Errorf("dispatch: %w for %s (attach herd-deps-v1 fence or run herd deps migrate)", deps.ErrMissingProvenance, task.Ref)
+		return nil, fmt.Errorf("dispatch: %w for %s (attach herd-deps-v1 description fence or coordinator-run herd deps migrate --apply)", deps.ErrMissingProvenance, task.Ref)
 	}
-	// Selection snapshot (captures graph/provider revision).
+	if berr := desired.BindAndValidate(deps.Ref(task.Ref), deps.TaskID(task.ID)); berr != nil {
+		return nil, fmt.Errorf("dispatch provenance bind: %w", berr)
+	}
 	sel, serr := deps.RequireTaskLaunch(ctx, store, deps.EntryDispatch, deps.Ref(task.Ref), desired, "")
 	if serr != nil {
 		return nil, serr
 	}
-	// Re-read immediately before first side effect; concurrent relation must block.
 	pre, perr2 := deps.RequireTaskLaunch(ctx, store, deps.EntryDispatch, deps.Ref(task.Ref), desired, sel.GraphRevision)
 	if perr2 != nil {
 		return nil, perr2
 	}
 	depProv = pre.Provenance
-	launchRev = pre.GraphRevision
+
+	// 2c. Durable cross-process lease BEFORE first side effect (pkg/claim SQLite).
+	// Generation-fenced; not a process-local map. Provider board CAS is FAC-147.
+	own, oerr := d.ownershipClaimer()
+	if oerr != nil {
+		return nil, fmt.Errorf("dispatch lease store: %w", oerr)
+	}
+	claimRole := "launch"
+	if lane.Role != "" {
+		claimRole = lane.Role
+	} else if lane.Name != "" {
+		claimRole = lane.Name
+	}
+	tok, cerr := own.ClaimExclusive(ctx, pre.TaskID, deps.Ref(task.Ref), claimRole, pre.GraphRevision, pre.ProviderRevision, "")
+	if cerr != nil {
+		return nil, fmt.Errorf("dispatch lease claim: %w", cerr)
+	}
+	// Token-conditional lease release + durable compensator. Never release if
+	// owner+generation no longer match (another process owns the card).
+	failOwned := func(reason string, primary error) error {
+		if cErr := own.CompensateIfOwner(ctx, tok, reason); cErr != nil && !errors.Is(cErr, deps.ErrNotOwner) {
+			primary = errors.Join(primary, cErr)
+		}
+		return d.failWithCompensate(ctx, task.Ref, reason, primary)
+	}
 
 	// 3. Create worktree from immutable origin/<defaultBranch> (FAC-121).
-	// Branch name is whatever Git actually created — never overwrite with a
-	// fictional task/<slug> packet alias.
 	if d.Worktree == nil {
-		return nil, fmt.Errorf("dispatch worktree service is required")
+		return nil, failOwned("worktree_service_missing", fmt.Errorf("dispatch worktree service is required"))
 	}
 	wtInfo, err := d.Worktree.CreateTaskWorktreeFrom(ctx, task.Ref, defaultBranch)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create worktree: %w", err)
+		return nil, failOwned("worktree_create_failed", fmt.Errorf("failed to create worktree: %w", err))
 	}
 	if err := worktree.RejectSharedRoot(d.Worktree.RepoRoot(), wtInfo.Path); err != nil {
-		return nil, d.failWithCompensate(ctx, task.Ref, "shared_root_denied", err)
+		return nil, failOwned("shared_root_denied", err)
 	}
-	// Worktree side effect already landed (path/branch may exist on disk even
-	// when the reported branch string is empty). Empty branch is a hard failure
-	// and must compensate — never return bare after CreateTaskWorktreeFrom.
 	branch := wtInfo.Branch
 	if branch == "" {
-		return nil, d.failWithCompensate(ctx, task.Ref, "empty_worktree_branch",
+		return nil, failOwned("empty_worktree_branch",
 			fmt.Errorf("worktree created without a Git branch; refusing fictional packet branch"))
 	}
 
-	// Worktree side effect already landed — every subsequent error must compensate.
 	if err := d.record(ctx, StepRecord{
 		TicketRef: task.Ref,
 		Step:      StepWorktree,
@@ -345,13 +392,15 @@ func (d *Dispatcher) Dispatch(ctx context.Context, opts DispatchOptions) (*Dispa
 		BaseSHA:   wtInfo.BaseSHA,
 		AnchorRef: wtInfo.AnchorRef,
 	}); err != nil {
-		return nil, d.failWithCompensate(ctx, task.Ref, "record_worktree_failed", err)
+		return nil, failOwned("record_worktree_failed", err)
 	}
 
-	// 4. Flip ticket to in-progress (partial: compensator marks Recovering on later failure)
+	// 4. Flip board status only while we still hold the lease generation.
+	if owns, _ := own.StillOwns(ctx, tok); !owns {
+		return nil, failOwned("lease_lost_before_status", fmt.Errorf("lease owner+generation lost before board status"))
+	}
 	if err := d.updateStatusBound(ctx, task.ID, "in-progress"); err != nil {
-		return nil, d.failWithCompensate(ctx, task.Ref, "board_status_failed",
-			formatBoardErr("failed to update ticket status", err))
+		return nil, failOwned("board_status_failed", formatBoardErr("failed to update ticket status", err))
 	}
 	if err := d.record(ctx, StepRecord{
 		TicketRef: task.Ref,
@@ -361,15 +410,14 @@ func (d *Dispatcher) Dispatch(ctx context.Context, opts DispatchOptions) (*Dispa
 		BaseSHA:   wtInfo.BaseSHA,
 		AnchorRef: wtInfo.AnchorRef,
 	}); err != nil {
-		return nil, d.failWithCompensate(ctx, task.Ref, "record_board_progress_failed", err)
+		return nil, failOwned("record_board_progress_failed", err)
 	}
 
 	// 5. Comment with actual Git branch + base (not a fictional name)
-	comment := fmt.Sprintf("Dispatched to worktree %s on branch %s (base %s anchor %s)",
-		wtInfo.Path, branch, wtInfo.BaseSHA, wtInfo.AnchorRef)
+	comment := fmt.Sprintf("Dispatched to worktree %s on branch %s (base %s anchor %s lease g%d owner %s)",
+		wtInfo.Path, branch, wtInfo.BaseSHA, wtInfo.AnchorRef, tok.Generation, tok.OwnerID)
 	if err := d.addCommentBound(ctx, task.ID, comment); err != nil {
-		return nil, d.failWithCompensate(ctx, task.Ref, "board_comment_failed",
-			formatBoardErr("failed to add comment", err))
+		return nil, failOwned("board_comment_failed", formatBoardErr("failed to add comment", err))
 	}
 	if err := d.record(ctx, StepRecord{
 		TicketRef: task.Ref,
@@ -377,20 +425,17 @@ func (d *Dispatcher) Dispatch(ctx context.Context, opts DispatchOptions) (*Dispa
 		Worktree:  wtInfo.Path,
 		Branch:    branch,
 	}); err != nil {
-		return nil, d.failWithCompensate(ctx, task.Ref, "record_board_comment_failed", err)
+		return nil, failOwned("record_board_comment_failed", err)
 	}
 
 	// 6. Preflight in worktree
 	if err := preflight.CheckWorktreeBoundary(wtInfo.Path); err != nil {
-		return nil, d.failWithCompensate(ctx, task.Ref, "preflight_failed",
-			fmt.Errorf("preflight failed in worktree: %w", err))
+		return nil, failOwned("preflight_failed", fmt.Errorf("preflight failed in worktree: %w", err))
 	}
 
 	// 7. Write TASK-PACKET.md — packet branch MUST equal Git branch
-	// Fail closed rather than silently falling back to a hardcoded `go test`
-	// (FAC-134): every repo must declare its own verification contract.
 	if d.Config.Verification.TestCommand == "" {
-		return nil, d.failWithCompensate(ctx, task.Ref, "verification_test_command_missing",
+		return nil, failOwned("verification_test_command_missing",
 			fmt.Errorf("verification.test_command is required in .herd/herd.yaml (FAC-134 fail-closed; no hardcoded go test fallback)"))
 	}
 
@@ -405,8 +450,7 @@ func (d *Dispatcher) Dispatch(ctx context.Context, opts DispatchOptions) (*Dispa
 	}
 	packetPath := filepath.Join(wtInfo.Path, "TASK-PACKET.md")
 	if err := os.WriteFile(packetPath, []byte(packet), 0644); err != nil {
-		return nil, d.failWithCompensate(ctx, task.Ref, "task_packet_write_failed",
-			fmt.Errorf("failed to write task packet: %w", err))
+		return nil, failOwned("task_packet_write_failed", fmt.Errorf("failed to write task packet: %w", err))
 	}
 
 	result := &DispatchResult{
@@ -420,16 +464,21 @@ func (d *Dispatcher) Dispatch(ctx context.Context, opts DispatchOptions) (*Dispa
 		Lane:        lane.Name,
 	}
 
-	// 8. Post-side-effect graph re-validation bound to launchRev. Drift → compensate.
-	if _, postErr := deps.RequireTaskLaunch(ctx, store, deps.EntryDispatch, deps.Ref(task.Ref), desired, launchRev); postErr != nil {
-		return result, d.failWithCompensate(ctx, task.Ref, "post_dispatch_graph_drift", postErr)
+	// 8. Still own the lease generation; re-validate relation graph bound to
+	// pre-claim GraphRev (excludes target status — board flip must not mismatch).
+	owns, oerr := own.StillOwns(ctx, tok)
+	if oerr != nil || !owns {
+		return result, failOwned("lease_lost", fmt.Errorf("dispatch lease lost during side effects: owns=%v err=%v", owns, oerr))
+	}
+	if _, postErr := deps.RequireTaskLaunch(ctx, store, deps.EntryDispatch, deps.Ref(task.Ref), desired, tok.GraphRev); postErr != nil {
+		return result, failOwned("post_dispatch_graph_drift", postErr)
 	}
 
 	// 9. Optionally launch agent with explicit cwd + proven prompt consumption
 	h := d.launcher()
 	if !opts.NoLaunch && h.Available() {
 		if err := d.launch(ctx, opts, task, lane, wtInfo, branch, packet, result); err != nil {
-			return result, err
+			return result, failOwned("agent_launch_failed", err)
 		}
 	}
 
