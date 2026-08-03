@@ -278,19 +278,35 @@ func skipBalancedParen(toks []goTok, open int) int {
 // two token sequences a real declaration produces regardless of grouping,
 // spacing, or line-splitting:
 //
-//   - FUNC [ '(' ... ')' ] IDENT '('   — a func or method declaration
-//   - IDENT? '=' FUNC '('              — a var spec's value is a func
-//     literal. There's no name check here: unlike a func declaration, a
-//     var has no Test/Benchmark/Example/Fuzz discovery convention that
-//     would make any name "safe", so any top-level func-valued var is
-//     flagged regardless of its name. ':=' is the distinct DEFINE token,
-//     not ASSIGN, so an ordinary local `mock := func(){}` closure — the
-//     common, legitimate test-mocking idiom — never matches this.
+//   - FUNC [ '(' ... ')' ] IDENT '('   — a func or method declaration.
+//     Go doesn't allow a named func declaration inside a function body
+//     (only anonymous literals), so this is unambiguously top-level
+//     wherever it appears — no depth tracking needed.
+//   - IDENT '=' FUNC '('               — a var's value is a func literal,
+//     but ONLY at brace-depth <= 0 (never confirmed-nested). Package
+//     scope is exited only by '{' / '}' — not '(' / ')' — so a var block's
+//     own parens don't count. depth <= 0 (not strictly == 0) so a
+//     fragment that opens mid-body (its own opening brace outside this
+//     hunk, net depth goes negative) still fails closed rather than
+//     assuming it's safely local. A local reassignment inside a
+//     confirmed-open body (`mock = func(){}` after a `{` this fragment
+//     did see) is depth > 0 and is left alone — the common, legitimate
+//     test-mocking idiom. There's no Test/Benchmark/Example/Fuzz name
+//     exemption here: unlike a func declaration, a var has no such
+//     discovery convention, so any depth<=0 func-valued var is flagged
+//     regardless of its name. ':=' is the distinct DEFINE token, not
+//     ASSIGN, so a local `mock := func(){}` closure never matches either
+//     way.
 func hasSmuggledProductionCodeHeuristic(added []string) bool {
 	toks := tokenizeGo(strings.Join(added, "\n"))
 
+	braceDepth := 0
 	for i, t := range toks {
 		switch t.tok {
+		case token.LBRACE:
+			braceDepth++
+		case token.RBRACE:
+			braceDepth--
 		case token.FUNC:
 			j := i + 1
 			if j < len(toks) && toks[j].tok == token.LPAREN {
@@ -303,7 +319,8 @@ func hasSmuggledProductionCodeHeuristic(added []string) bool {
 				}
 			}
 		case token.ASSIGN:
-			if i+2 < len(toks) && toks[i+1].tok == token.FUNC && toks[i+2].tok == token.LPAREN {
+			if braceDepth <= 0 &&
+				i+2 < len(toks) && toks[i+1].tok == token.FUNC && toks[i+2].tok == token.LPAREN {
 				return true
 			}
 		}
