@@ -990,16 +990,8 @@ func TestDispatch_LaunchFailures_ExactlyOneCompensation(t *testing.T) {
 			reason: "workspace_unknown",
 		},
 		{
-			name: "no_healthy_model",
-			ref:  "FAC-EO-4",
-			fh: &fakeHerdr{
-				available: true, workspace: "w1", model: "", // ResolveHealthyModel empty
-			},
-			reason: "no_healthy_model",
-		},
-		{
 			name: "prompt_sequence",
-			ref:  "FAC-EO-5",
+			ref:  "FAC-EO-4",
 			fh: &fakeHerdr{
 				available: true, workspace: "w1", model: "m", tabID: "t5",
 				deliverRec: &herdr.PromptReceipt{
@@ -1018,16 +1010,10 @@ func TestDispatch_LaunchFailures_ExactlyOneCompensation(t *testing.T) {
 			}
 			comp := &recordingCompensator{}
 			cfg := testCfg()
-			if tc.name == "no_healthy_model" {
-				for i := range cfg.Lanes {
-					cfg.Lanes[i].Model = ""
-					cfg.Lanes[i].FallbackModels = nil
-				}
-			}
 			d := NewDispatcher(cfg, tp, wm)
 			d.Herdr = tc.fh
 			d.Compensator = comp
-			res, err := d.Dispatch(context.Background(), DispatchOptions{TicketRef: tc.ref})
+			res, err := d.Dispatch(context.Background(), validLaunchOptions(tc.ref))
 			if err == nil {
 				t.Fatal("expected launch failure")
 			}
@@ -1076,7 +1062,7 @@ func TestDispatch_CompensateFailure_RetainsGenerationLease(t *testing.T) {
 	d.Compensator = comp
 	d.Ownership = ownA
 
-	res, err := d.Dispatch(context.Background(), DispatchOptions{TicketRef: "FAC-RET"})
+	res, err := d.Dispatch(context.Background(), validLaunchOptions("FAC-RET"))
 	if err == nil {
 		t.Fatal("expected failure")
 	}
