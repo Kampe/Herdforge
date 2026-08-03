@@ -38,7 +38,7 @@ func TestGCManager_GlobalAutoReapIsContained(t *testing.T) {
 	// The disposable fixture includes every protection class. Planning is
 	// permitted, but the active lease must be preserved and no path outside an
 	// explicit target set may enter an action plan.
-	report, err := wm.PlanReap(context.Background(), worktree.ReapPolicy{
+	reapReport, err := wm.PlanReap(context.Background(), worktree.ReapPolicy{
 		DefaultBranch: "master",
 		LeaseProbe: func(_ context.Context, _ string, branch string) (bool, error) {
 			return branch == "herd/active", nil
@@ -47,7 +47,7 @@ func TestGCManager_GlobalAutoReapIsContained(t *testing.T) {
 	if err != nil {
 		t.Fatalf("isolated fixture plan: %v", err)
 	}
-	for _, candidate := range report.Candidates {
+	for _, candidate := range reapReport.Candidates {
 		if candidate.Branch == "herd/active" && candidate.Eligible {
 			t.Fatal("active lease fixture was eligible")
 		}
