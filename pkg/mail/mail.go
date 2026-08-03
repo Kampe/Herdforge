@@ -12,7 +12,6 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -30,11 +29,6 @@ const (
 	// maxSeenIDs bounds the in-memory dedup set so a long-lived broker never
 	// grows unbounded; oldest IDs are evicted FIFO.
 	maxSeenIDs = 4096
-	// lockTimeout bounds how long a writer waits for the cross-process file
-	// lock before failing closed.
-	lockTimeout = 5 * time.Second
-	// lockPollInterval is how often a blocked writer retries the lock.
-	lockPollInterval = 10 * time.Millisecond
 )
 
 type Envelope struct {
@@ -69,16 +63,41 @@ type Mailbox struct {
 
 	quarantineMu sync.Mutex
 	quarantined  int
+
+	// lockTimeoutNs, when non-zero, overrides stuckGrace for fail-closed
+	// no-progress detection (atomic; safe under concurrent readers).
+	// Zero means default stuckGrace. Intended for tests and tight ceilings.
+	lockTimeoutNs atomic.Int64
 }
 
 func NewMailbox(mailFile string) *Mailbox {
 	return &Mailbox{MailFile: mailFile, seen: make(map[string]struct{})}
 }
 
+// SetLockTimeout overrides the no-progress stuck bound with a fixed duration.
+// d <= 0 restores stuckGrace. Safe for concurrent use (atomic store).
+func (m *Mailbox) SetLockTimeout(d time.Duration) {
+	if m == nil {
+		return
+	}
+	if d <= 0 {
+		m.lockTimeoutNs.Store(0)
+		return
+	}
+	m.lockTimeoutNs.Store(int64(d))
+}
+
 // SendMessage appends a freshly-minted envelope to the mailbox.
 func (m *Mailbox) SendMessage(sender, recipient, subject, body string) (*Envelope, error) {
+	return m.SendMessageContext(context.Background(), sender, recipient, subject, body)
+}
+
+// SendMessageContext is SendMessage with caller-deadline propagation: when
+// ctx carries a deadline, lock acquisition fails closed at that deadline
+// (typed BLOCKED) instead of using the adaptive wall-clock policy.
+func (m *Mailbox) SendMessageContext(ctx context.Context, sender, recipient, subject, body string) (*Envelope, error) {
 	env := newEnvelope(sender, recipient, subject, body)
-	if err := m.appendEnvelope(env); err != nil {
+	if err := m.appendEnvelopeContext(ctx, env); err != nil {
 		return nil, err
 	}
 	return env, nil
@@ -103,6 +122,13 @@ func newEnvelope(sender, recipient, subject, body string) *Envelope {
 // redelivery is idempotent: appendEnvelope is the single write path shared
 // by SendMessage and the Redis relay subscriber.
 func (m *Mailbox) appendEnvelope(env *Envelope) error {
+	return m.appendEnvelopeContext(context.Background(), env)
+}
+
+func (m *Mailbox) appendEnvelopeContext(ctx context.Context, env *Envelope) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -111,7 +137,7 @@ func (m *Mailbox) appendEnvelope(env *Envelope) error {
 		return nil
 	}
 
-	err := m.withFileLock(func() error {
+	err := m.withFileLockContext(ctx, func() error {
 		seq, err := m.nextSequenceLocked()
 		if err != nil {
 			return err
@@ -218,6 +244,15 @@ func (m *Mailbox) markSeenLocked(id string) {
 // error: a malformed record that can't even be quarantined is a fail-closed
 // condition, not something to swallow the way a normal parse failure is.
 func (m *Mailbox) ReadInbox(recipient string) ([]*Envelope, error) {
+	return m.ReadInboxContext(context.Background(), recipient)
+}
+
+// ReadInboxContext is ReadInbox with deadline inheritance for quarantine
+// lock acquisition (same fail-closed quarantine semantics).
+func (m *Mailbox) ReadInboxContext(ctx context.Context, recipient string) ([]*Envelope, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
@@ -240,7 +275,7 @@ func (m *Mailbox) ReadInbox(recipient string) ([]*Envelope, error) {
 		}
 		var env Envelope
 		if err := json.Unmarshal([]byte(l), &env); err != nil {
-			if qErr := m.quarantineLine(l, err); qErr != nil {
+			if qErr := m.quarantineLineContext(ctx, l, err); qErr != nil {
 				quarantineErrs = append(quarantineErrs, qErr)
 			}
 			continue
@@ -261,6 +296,10 @@ func (m *Mailbox) ReadInbox(recipient string) ([]*Envelope, error) {
 // failed so the caller can fail closed instead of believing the record was
 // preserved when it wasn't.
 func (m *Mailbox) quarantineLine(line string, cause error) error {
+	return m.quarantineLineContext(context.Background(), line, cause)
+}
+
+func (m *Mailbox) quarantineLineContext(ctx context.Context, line string, cause error) error {
 	m.quarantineMu.Lock()
 	m.quarantined++
 	m.quarantineMu.Unlock()
@@ -270,7 +309,7 @@ func (m *Mailbox) quarantineLine(line string, cause error) error {
 	if err != nil {
 		return fmt.Errorf("failed to marshal quarantine entry: %w", err)
 	}
-	return m.withFileLock(func() error {
+	return m.withFileLockContext(ctx, func() error {
 		return appendLine(m.MailFile+".quarantine.jsonl", data)
 	})
 }
@@ -310,40 +349,9 @@ func newID() string {
 	if host == "" {
 		host = "unknown"
 	}
-	return fmt.Sprintf("%s-%d", host, n)
-}
-
-// withFileLock runs fn while holding an exclusive, cross-process advisory
-// lock on <MailFile>.lock. It fails closed: if the lock cannot be acquired
-// within lockTimeout, it returns an error instead of proceeding unlocked, so
-// concurrent multi-process writers can never interleave or corrupt records.
-func (m *Mailbox) withFileLock(fn func() error) error {
-	dir := filepath.Dir(m.MailFile)
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		return fmt.Errorf("failed to create mail directory: %w", err)
-	}
-
-	lockPath := m.MailFile + ".lock"
-	f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0644)
-	if err != nil {
-		return fmt.Errorf("failed to open mailbox lock file: %w", err)
-	}
-	defer f.Close()
-
-	fd := int(f.Fd())
-	deadline := time.Now().Add(lockTimeout)
-	for {
-		if err := syscall.Flock(fd, syscall.LOCK_EX|syscall.LOCK_NB); err == nil {
-			break
-		}
-		if time.Now().After(deadline) {
-			return fmt.Errorf("mailbox lock %s: timed out after %s", lockPath, lockTimeout)
-		}
-		time.Sleep(lockPollInterval)
-	}
-	defer syscall.Flock(fd, syscall.LOCK_UN)
-
-	return fn()
+	// Include PID so concurrent processes cannot mint colliding IDs (the
+	// per-process counter alone restarts from the same UnixMilli seed).
+	return fmt.Sprintf("%s-%d-%d", host, os.Getpid(), n)
 }
 
 // nextSequenceLocked reserves and durably persists the next monotonic
@@ -384,18 +392,18 @@ func (m *Mailbox) nextSequenceLocked() (int64, error) {
 func appendLine(path string, data []byte) error {
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 	if err != nil {
-		return fmt.Errorf("failed to open %s: %w", path, err)
+		return fmt.Errorf("failed to open mail artifact: %w", err)
 	}
 	if _, err := f.Write(append(data, '\n')); err != nil {
 		f.Close()
-		return fmt.Errorf("failed to write %s: %w", path, err)
+		return fmt.Errorf("failed to write mail artifact: %w", err)
 	}
-	if err := f.Sync(); err != nil {
+	if err := fileSyncFn(f); err != nil {
 		f.Close()
-		return fmt.Errorf("failed to fsync %s: %w", path, err)
+		return fmt.Errorf("failed to fsync mail artifact: %w", err)
 	}
 	if err := f.Close(); err != nil {
-		return fmt.Errorf("failed to close %s: %w", path, err)
+		return fmt.Errorf("failed to close mail artifact: %w", err)
 	}
 	return syncDirFn(path)
 }
@@ -406,6 +414,15 @@ func appendLine(path string, data []byte) error {
 // directory so the rename itself (which repoints the directory entry) is
 // crash-durable too, not just the file content it points at.
 func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
+	return writeFileAtomicFn(path, data, perm)
+}
+
+// writeFileAtomicFn is the production implementation; tests may override to
+// inject a post-dead-letter state-save failure without chmod tricks that
+// also break the ticket queue.
+var writeFileAtomicFn = writeFileAtomicImpl
+
+func writeFileAtomicImpl(path string, data []byte, perm os.FileMode) error {
 	tmp := path + ".tmp"
 	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, perm)
 	if err != nil {
@@ -415,7 +432,7 @@ func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
 		f.Close()
 		return err
 	}
-	if err := f.Sync(); err != nil {
+	if err := fileSyncFn(f); err != nil {
 		f.Close()
 		return err
 	}
@@ -428,9 +445,13 @@ func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
 	return syncDirFn(path)
 }
 
-// syncDirFn is overridden by tests to inject a directory-fsync failure and
-// prove it propagates instead of being silently ignored.
-var syncDirFn = syncDir
+// fileSyncFn / syncDirFn are overridable hooks for mutation probes that
+// prove fsync is invoked (count calls) or must fail closed (inject error).
+// Production uses real *os.File.Sync and directory Sync.
+var (
+	fileSyncFn = func(f *os.File) error { return f.Sync() }
+	syncDirFn  = syncDir
+)
 
 // syncDir fsyncs the directory containing path. Opening a directory and
 // calling Sync on it is the standard way to durably commit directory-entry
@@ -439,11 +460,11 @@ func syncDir(path string) error {
 	dir := filepath.Dir(path)
 	f, err := os.Open(dir)
 	if err != nil {
-		return fmt.Errorf("failed to open directory %s for fsync: %w", dir, err)
+		return fmt.Errorf("failed to open directory for fsync: %w", err)
 	}
 	defer f.Close()
 	if err := f.Sync(); err != nil {
-		return fmt.Errorf("failed to fsync directory %s: %w", dir, err)
+		return fmt.Errorf("failed to fsync directory: %w", err)
 	}
 	return nil
 }
@@ -570,7 +591,7 @@ func (b *MessageBroker) persistDroppedErr(err error) {
 		b.recordPersistFailure(mErr)
 		return
 	}
-	writeErr := b.mb.withFileLock(func() error {
+	writeErr := b.mb.withFileLockContext(b.ctx, func() error {
 		return appendLine(b.mb.MailFile+".errors.jsonl", data)
 	})
 	if writeErr != nil {
@@ -626,18 +647,27 @@ func (b *MessageBroker) LastPersistenceError() error {
 // delivery plus an idempotent consumer gives an effectively-once result
 // without needing a Redis-side ack (plain pub/sub has none).
 func (b *MessageBroker) SendMessage(sender, recipient, subject, body string) (*Envelope, error) {
+	return b.SendMessageContext(b.ctx, sender, recipient, subject, body)
+}
+
+// SendMessageContext is SendMessage with caller-deadline inheritance on
+// outbox mutation and local mailbox append (both take the mailbox flock).
+func (b *MessageBroker) SendMessageContext(ctx context.Context, sender, recipient, subject, body string) (*Envelope, error) {
+	if ctx == nil {
+		ctx = b.ctx
+	}
 	if b.redis == nil {
-		return b.mb.SendMessage(sender, recipient, subject, body)
+		return b.mb.SendMessageContext(ctx, sender, recipient, subject, body)
 	}
 
 	env := newEnvelope(sender, recipient, subject, body)
 	channel := b.channelPrefix + "." + recipient
 
-	if err := b.addOutboxEntry(env, channel); err != nil {
+	if err := b.addOutboxEntryContext(ctx, env, channel); err != nil {
 		return nil, fmt.Errorf("failed to durably record outbox entry for %s: %w", env.ID, err)
 	}
 
-	if err := b.mb.appendEnvelope(env); err != nil {
+	if err := b.mb.appendEnvelopeContext(ctx, env); err != nil {
 		// The outbox entry is already durable, so the message isn't lost —
 		// FlushOutbox (or this broker's own subscription self-echo once
 		// publish succeeds) will still deliver it into the local mailbox.
@@ -650,7 +680,7 @@ func (b *MessageBroker) SendMessage(sender, recipient, subject, body string) (*E
 		b.reportErr(err)
 		return env, err // still durably queued in the outbox; FlushOutbox will retry it
 	}
-	if err := b.removeOutboxEntry(env.ID); err != nil {
+	if err := b.removeOutboxEntryContext(ctx, env.ID); err != nil {
 		// Published successfully but couldn't clear the record: harmless —
 		// the next flush just re-publishes a message receivers already
 		// dedupe by ID.
@@ -691,7 +721,8 @@ func (b *MessageBroker) loadOutboxUnlocked() (map[string]outboxEntry, error) {
 	}
 	var entries map[string]outboxEntry
 	if err := json.Unmarshal(data, &entries); err != nil {
-		return nil, fmt.Errorf("corrupt outbox file %s: %w", b.outboxPath(), err)
+		// Redact absolute outbox path from error surface.
+		return nil, fmt.Errorf("corrupt outbox file %s: %w", filepath.Base(b.outboxPath()), err)
 	}
 	if entries == nil {
 		entries = map[string]outboxEntry{}
@@ -700,7 +731,11 @@ func (b *MessageBroker) loadOutboxUnlocked() (map[string]outboxEntry, error) {
 }
 
 func (b *MessageBroker) mutateOutboxLocked(fn func(map[string]outboxEntry) error) error {
-	return b.mb.withFileLock(func() error {
+	return b.mutateOutboxLockedContext(context.Background(), fn)
+}
+
+func (b *MessageBroker) mutateOutboxLockedContext(ctx context.Context, fn func(map[string]outboxEntry) error) error {
+	return b.mb.withFileLockContext(ctx, func() error {
 		entries, err := b.loadOutboxUnlocked()
 		if err != nil {
 			return err
@@ -717,22 +752,34 @@ func (b *MessageBroker) mutateOutboxLocked(fn func(map[string]outboxEntry) error
 }
 
 func (b *MessageBroker) addOutboxEntry(env *Envelope, channel string) error {
-	return b.mutateOutboxLocked(func(entries map[string]outboxEntry) error {
+	return b.addOutboxEntryContext(context.Background(), env, channel)
+}
+
+func (b *MessageBroker) addOutboxEntryContext(ctx context.Context, env *Envelope, channel string) error {
+	return b.mutateOutboxLockedContext(ctx, func(entries map[string]outboxEntry) error {
 		entries[env.ID] = outboxEntry{Envelope: *env, Channel: channel}
 		return nil
 	})
 }
 
 func (b *MessageBroker) removeOutboxEntry(id string) error {
-	return b.mutateOutboxLocked(func(entries map[string]outboxEntry) error {
+	return b.removeOutboxEntryContext(context.Background(), id)
+}
+
+func (b *MessageBroker) removeOutboxEntryContext(ctx context.Context, id string) error {
+	return b.mutateOutboxLockedContext(ctx, func(entries map[string]outboxEntry) error {
 		delete(entries, id)
 		return nil
 	})
 }
 
 func (b *MessageBroker) snapshotOutbox() (map[string]outboxEntry, error) {
+	return b.snapshotOutboxContext(b.ctx)
+}
+
+func (b *MessageBroker) snapshotOutboxContext(ctx context.Context) (map[string]outboxEntry, error) {
 	var entries map[string]outboxEntry
-	err := b.mb.withFileLock(func() error {
+	err := b.mb.withFileLockContext(ctx, func() error {
 		var err error
 		entries, err = b.loadOutboxUnlocked()
 		return err
@@ -746,10 +793,19 @@ func (b *MessageBroker) snapshotOutbox() (map[string]outboxEntry, error) {
 // NewMessageBroker on a freshly restarted process (where it's called
 // automatically).
 func (b *MessageBroker) FlushOutbox() (published int, err error) {
+	return b.FlushOutboxContext(b.ctx)
+}
+
+// FlushOutboxContext is FlushOutbox with deadline inheritance on outbox
+// snapshot/remove lock acquisitions.
+func (b *MessageBroker) FlushOutboxContext(ctx context.Context) (published int, err error) {
 	if b.redis == nil {
 		return 0, nil
 	}
-	entries, err := b.snapshotOutbox()
+	if ctx == nil {
+		ctx = b.ctx
+	}
+	entries, err := b.snapshotOutboxContext(ctx)
 	if err != nil {
 		return 0, err
 	}
@@ -759,7 +815,7 @@ func (b *MessageBroker) FlushOutbox() (published int, err error) {
 			b.reportErr(fmt.Errorf("outbox replay publish failed for %s: %w", id, pubErr))
 			continue
 		}
-		if err := b.removeOutboxEntry(id); err != nil {
+		if err := b.removeOutboxEntryContext(ctx, id); err != nil {
 			return published, err
 		}
 		published++
@@ -768,7 +824,13 @@ func (b *MessageBroker) FlushOutbox() (published int, err error) {
 }
 
 func (b *MessageBroker) ReadInbox(recipient string) ([]*Envelope, error) {
-	return b.mb.ReadInbox(recipient)
+	return b.ReadInboxContext(b.ctx, recipient)
+}
+
+// ReadInboxContext is ReadInbox with deadline inheritance for quarantine
+// paths inside the local mailbox.
+func (b *MessageBroker) ReadInboxContext(ctx context.Context, recipient string) ([]*Envelope, error) {
+	return b.mb.ReadInboxContext(ctx, recipient)
 }
 
 // startSubscriber relays messages from other hosts into the local mailbox
@@ -802,7 +864,7 @@ func (b *MessageBroker) startSubscriber() {
 					b.reportErr(fmt.Errorf("discarding malformed redis payload on %s: %w", msg.Channel, err))
 					continue
 				}
-				if err := b.mb.appendEnvelope(&env); err != nil {
+				if err := b.mb.appendEnvelopeContext(b.ctx, &env); err != nil {
 					b.reportErr(fmt.Errorf("failed to relay redis message %s into local mailbox: %w", env.ID, err))
 				}
 			}

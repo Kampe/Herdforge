@@ -1,6 +1,7 @@
 package mail
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -117,11 +118,15 @@ func (c *CallbackConsumer) load() error {
 // saveLocked persists state under the mailbox's cross-process file lock.
 // Caller must hold c.mu.
 func (c *CallbackConsumer) saveLocked() error {
+	return c.saveLockedContext(context.Background())
+}
+
+func (c *CallbackConsumer) saveLockedContext(ctx context.Context) error {
 	data, err := json.Marshal(c.state)
 	if err != nil {
 		return fmt.Errorf("failed to marshal callback consumer state: %w", err)
 	}
-	return c.mb.withFileLock(func() error {
+	return c.mb.withFileLockContext(ctx, func() error {
 		return writeFileAtomic(c.statePath, data, 0644)
 	})
 }
@@ -139,7 +144,16 @@ func (c *CallbackConsumer) saveLocked() error {
 //     to the dead-letter file and permanently dropped — never silently
 //     lost, never retried forever.
 func (c *CallbackConsumer) Drain() ([]DrainedCallback, error) {
-	envs, err := c.mb.ReadInbox(CoordinatorInbox)
+	return c.DrainContext(context.Background())
+}
+
+// DrainContext is Drain with deadline inheritance on ReadInbox, dead-letter
+// append, and durable state save (all mailbox flock consumers).
+func (c *CallbackConsumer) DrainContext(ctx context.Context) ([]DrainedCallback, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	envs, err := c.mb.ReadInboxContext(ctx, CoordinatorInbox)
 	if err != nil {
 		return nil, err
 	}
@@ -203,7 +217,7 @@ func (c *CallbackConsumer) Drain() ([]DrainedCallback, error) {
 	// worst a crash here can do is a duplicate dead-letter entry on retry,
 	// never a silent loss or a reset counter.
 	if len(deadLettered) > 0 {
-		if err := c.appendDeadLetters(deadLettered); err != nil {
+		if err := c.appendDeadLettersContext(ctx, deadLettered); err != nil {
 			return out, err
 		}
 		for _, id := range settledIDs {
@@ -211,7 +225,7 @@ func (c *CallbackConsumer) Drain() ([]DrainedCallback, error) {
 		}
 	}
 
-	if err := c.saveLocked(); err != nil {
+	if err := c.saveLockedContext(ctx); err != nil {
 		return nil, err
 	}
 	return out, nil
@@ -224,6 +238,14 @@ func (c *CallbackConsumer) Drain() ([]DrainedCallback, error) {
 // slipped through as pending before a fresher one was acked) is a no-op on
 // the mark — it still clears the pending entry, but can never regress state.
 func (c *CallbackConsumer) Ack(envelopeID string) error {
+	return c.AckContext(context.Background(), envelopeID)
+}
+
+// AckContext is Ack with deadline inheritance on durable state save.
+func (c *CallbackConsumer) AckContext(ctx context.Context, envelopeID string) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -239,7 +261,7 @@ func (c *CallbackConsumer) Ack(envelopeID string) error {
 		c.state.Acked[key] = ackMark{LeaseGeneration: pending.Callback.LeaseGeneration, Sequence: pending.Sequence}
 	}
 	delete(c.state.Pending, envelopeID)
-	return c.saveLocked()
+	return c.saveLockedContext(ctx)
 }
 
 // appendDeadLetters durably (fsync'd, one write per record) appends every
@@ -248,7 +270,11 @@ func (c *CallbackConsumer) Ack(envelopeID string) error {
 // record — a dead-lettered callback that can't even be written down is a
 // fail-closed condition, not something to swallow.
 func (c *CallbackConsumer) appendDeadLetters(cbs []Callback) error {
-	return c.mb.withFileLock(func() error {
+	return c.appendDeadLettersContext(context.Background(), cbs)
+}
+
+func (c *CallbackConsumer) appendDeadLettersContext(ctx context.Context, cbs []Callback) error {
+	return c.mb.withFileLockContext(ctx, func() error {
 		for _, cb := range cbs {
 			data, err := json.Marshal(cb)
 			if err != nil {

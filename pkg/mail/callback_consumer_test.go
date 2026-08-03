@@ -1,6 +1,7 @@
 package mail
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -297,13 +298,20 @@ func TestCallbackConsumer_DeadLetterDurableBeforeStateSave_CrashConsistency(t *t
 	if err := os.WriteFile(deadPath, nil, 0644); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Chmod(tmpDir, 0555); err != nil {
-		t.Fatal(err)
+	// Inject state-save failure without chmod'ing the mail dir (that would
+	// also break the ticket queue's token create/dirsync and is not a
+	// valid production degrade path). Only callback-state.json fails.
+	origWFA := writeFileAtomicFn
+	writeFileAtomicFn = func(path string, data []byte, perm os.FileMode) error {
+		if strings.Contains(filepath.Base(path), "callback-state") {
+			return fmt.Errorf("injected callback-state save failure")
+		}
+		return writeFileAtomicImpl(path, data, perm)
 	}
-	t.Cleanup(func() { os.Chmod(tmpDir, 0755) })
+	t.Cleanup(func() { writeFileAtomicFn = origWFA })
 
 	// Attempt 2 pushes attempts past maxRetries -> dead-letter path; the
-	// state save that follows is forced to fail by the read-only directory.
+	// state save that follows is forced to fail by the injector.
 	_, err = c.Drain()
 	if err == nil {
 		t.Fatal("expected Drain to surface the forced state-save failure")
@@ -317,7 +325,7 @@ func TestCallbackConsumer_DeadLetterDurableBeforeStateSave_CrashConsistency(t *t
 		t.Fatal("dead-letter record must be durable even when the subsequent state save fails")
 	}
 
-	os.Chmod(tmpDir, 0755)
+	writeFileAtomicFn = origWFA
 
 	// A fresh consumer ("restart") loads the last successfully-saved state
 	// (from attempt 1, since attempt 2's save never completed) — it must

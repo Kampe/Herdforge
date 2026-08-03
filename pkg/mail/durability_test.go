@@ -24,8 +24,9 @@ func TestConcurrentWriters_NoInterleaveNoDuplicate(t *testing.T) {
 	tmpDir := t.TempDir()
 	mailFile := filepath.Join(tmpDir, "herd-mail.jsonl")
 
-	const writers = 8
-	const perWriter = 25
+	// FAC-162: ticket-queue fairness under same-mailbox contention.
+	const writers = 16
+	const perWriter = 15
 	const total = writers * perWriter
 
 	var wg sync.WaitGroup
