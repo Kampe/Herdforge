@@ -17,6 +17,7 @@ type AccountRow struct {
 	Note           string `json:"note"`
 	Updated        int64  `json:"updated"`
 	ExhaustedUntil int64  `json:"exhausted_until,omitempty"`
+	Source         string `json:"source,omitempty"`
 }
 
 type Record struct {
@@ -79,19 +80,34 @@ func (l *Ledger) Surface(name string) (Record, error) {
 }
 
 func (l *Ledger) WriteMutation(fn func(*map[string]Record)) error {
-	fn(&l.data)
+	// Deep-copy committed state so fn cannot mutate it before persistence;
+	// the copy is swapped in only after the rename succeeds.
+	working := make(map[string]Record, len(l.data))
+	for k, v := range l.data {
+		if v.Accounts != nil {
+			accts := make([]AccountRow, len(v.Accounts))
+			copy(accts, v.Accounts)
+			v.Accounts = accts
+		}
+		working[k] = v
+	}
 
-	tmp := l.path + ".tmp"
-	raw, err := json.MarshalIndent(l.data, "", "  ")
+	fn(&working)
+
+	raw, err := json.MarshalIndent(working, "", "  ")
 	if err != nil {
 		return fmt.Errorf("credits: marshal ledger: %w", err)
 	}
+	tmp := l.path + ".tmp"
 	if err := os.WriteFile(tmp, raw, 0644); err != nil {
+		os.Remove(tmp)
 		return fmt.Errorf("credits: write tmp ledger: %w", err)
 	}
 	if err := os.Rename(tmp, l.path); err != nil {
+		os.Remove(tmp)
 		return fmt.Errorf("credits: rename ledger: %w", err)
 	}
+	l.data = working
 	return nil
 }
 

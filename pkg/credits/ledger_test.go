@@ -3,6 +3,7 @@ package credits
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -139,5 +140,125 @@ func TestSortAccountsByBurnOrder(t *testing.T) {
 	}
 	if rows[2].Email != "c" {
 		t.Errorf("expected 'c' third, got %s", rows[2].Email)
+	}
+}
+
+func TestWriteMutation_RenameFailureRollsBack(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "ledger.json")
+
+	l, _ := OpenLedger(p)
+	err := l.WriteMutation(func(m *map[string]Record) {
+		(*m)["claude"] = Record{UsedPct: 42}
+	})
+	if err != nil {
+		t.Fatalf("seed WriteMutation: %v", err)
+	}
+
+	// replace the ledger file with a directory of the same name so rename fails
+	if err := os.Remove(p); err != nil {
+		t.Fatalf("remove ledger: %v", err)
+	}
+	if err := os.Mkdir(p, 0755); err != nil {
+		t.Fatalf("mkdir collision: %v", err)
+	}
+	defer func() {
+		os.Remove(p) // remove the directory so TempDir cleanup works
+	}()
+
+	err = l.WriteMutation(func(m *map[string]Record) {
+		data := *m
+		rec := data["claude"]
+		rec.UsedPct = 77
+		data["claude"] = rec
+	})
+	if err == nil {
+		t.Fatal("expected rename failure error")
+	}
+
+	// committed state must not expose the unpersisted mutation
+	rec, serr := l.Surface("claude")
+	if serr != nil {
+		t.Fatalf("Surface after failed mutation: %v", serr)
+	}
+	if rec.UsedPct != 42 {
+		t.Errorf("failed mutation must not change committed state: got %d, want 42", rec.UsedPct)
+	}
+
+	// tmp artifact must be removed
+	if _, statErr := os.Stat(p + ".tmp"); !os.IsNotExist(statErr) {
+		t.Errorf("tmp file must be removed after failed mutation, stat err: %v", statErr)
+	}
+}
+
+func TestWriteMutation_WriteFailureRollsBack(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "ledger.json")
+
+	l, _ := OpenLedger(p)
+	err := l.WriteMutation(func(m *map[string]Record) {
+		(*m)["claude"] = Record{UsedPct: 42}
+	})
+	if err != nil {
+		t.Fatalf("seed WriteMutation: %v", err)
+	}
+
+	// make the ledger directory read-only so the tmp write fails
+	if err := os.Chmod(dir, 0555); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	defer os.Chmod(dir, 0755)
+
+	err = l.WriteMutation(func(m *map[string]Record) {
+		data := *m
+		rec := data["claude"]
+		rec.UsedPct = 77
+		data["claude"] = rec
+	})
+	if err == nil {
+		t.Fatal("expected write failure error")
+	}
+
+	rec, serr := l.Surface("claude")
+	if serr != nil {
+		t.Fatalf("Surface after failed mutation: %v", serr)
+	}
+	if rec.UsedPct != 42 {
+		t.Errorf("failed mutation must not change committed state: got %d, want 42", rec.UsedPct)
+	}
+
+	if _, statErr := os.Stat(p + ".tmp"); !os.IsNotExist(statErr) {
+		t.Errorf("tmp file must be removed after failed mutation, stat err: %v", statErr)
+	}
+}
+
+func TestWriteMutation_PreservesAccountSourceRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "ledger.json")
+
+	// shell-produced ledger shape with per-account source
+	os.WriteFile(p, []byte(`{"claude":{"used_pct":50,"accounts":[{"email":"a@x","used_pct":50,"burn_order":1,"note":"","updated":1,"source":"ccusage"}]}}`), 0644)
+
+	l, err := OpenLedger(p)
+	if err != nil {
+		t.Fatalf("OpenLedger: %v", err)
+	}
+
+	rec, _ := l.Surface("claude")
+	if len(rec.Accounts) != 1 || rec.Accounts[0].Source != "ccusage" {
+		t.Fatalf("source field must decode, got %+v", rec.Accounts)
+	}
+
+	// no-op mutation must not drop the field on re-encode
+	if err := l.WriteMutation(func(m *map[string]Record) {}); err != nil {
+		t.Fatalf("no-op WriteMutation: %v", err)
+	}
+
+	raw, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatalf("read re-encoded ledger: %v", err)
+	}
+	if !strings.Contains(string(raw), `"source":"ccusage"`) && !strings.Contains(string(raw), `"source": "ccusage"`) {
+		t.Errorf("source field must survive re-encode, got: %s", string(raw))
 	}
 }
