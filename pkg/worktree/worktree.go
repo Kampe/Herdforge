@@ -349,28 +349,3 @@ func (w *WorktreeManager) attachExisting(ctx context.Context, path, expectedBran
 	}, nil
 }
 
-// PruneMergedWorktrees automatically removes worktree paths whose branches have landed on default branch
-func (w *WorktreeManager) PruneMergedWorktrees(ctx context.Context, defaultBranch string) (int, error) {
-	wtList, err := w.ListWorktrees(ctx)
-	if err != nil {
-		return 0, err
-	}
-
-	prunedCount := 0
-	for _, wt := range wtList {
-		if strings.HasPrefix(wt.Branch, "herd/") {
-			cmd := execCommandContext(ctx, "git", "branch", "--merged", defaultBranch)
-			cmd.Dir = w.RepoRoot
-			output, err := cmd.CombinedOutput()
-			if err == nil && strings.Contains(string(output), wt.Branch) {
-				rmCmd := execCommandContext(ctx, "git", "worktree", "remove", "--force", wt.Path)
-				rmCmd.Dir = w.RepoRoot
-				if err := rmCmd.Run(); err == nil {
-					prunedCount++
-				}
-			}
-		}
-	}
-
-	return prunedCount, nil
-}
