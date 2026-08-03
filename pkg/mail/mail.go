@@ -372,7 +372,11 @@ func (m *Mailbox) nextSequenceLocked() (int64, error) {
 }
 
 // appendLine appends data plus a trailing newline to path, fsync'ing before
-// returning so the write survives a crash immediately after this call.
+// returning so the write survives a crash immediately after this call, then
+// fsyncs the containing directory too — the directory entry created by the
+// first write to a new file is separate metadata from the file's own data
+// and needs its own durability barrier, or a crash can leave the fsync'd
+// data on disk but unreachable because the directory forgot it exists.
 func appendLine(path string, data []byte) error {
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 	if err != nil {
@@ -386,12 +390,17 @@ func appendLine(path string, data []byte) error {
 		f.Close()
 		return fmt.Errorf("failed to fsync %s: %w", path, err)
 	}
-	return f.Close()
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("failed to close %s: %w", path, err)
+	}
+	return syncDirFn(path)
 }
 
 // writeFileAtomic writes data to a temp file, fsyncs it, then renames it
 // over path — so a reader never observes a torn write and a crash mid-write
-// leaves the previous, valid contents in place.
+// leaves the previous, valid contents in place — then fsyncs the containing
+// directory so the rename itself (which repoints the directory entry) is
+// crash-durable too, not just the file content it points at.
 func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
 	tmp := path + ".tmp"
 	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, perm)
@@ -409,7 +418,30 @@ func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
 	if err := f.Close(); err != nil {
 		return err
 	}
-	return os.Rename(tmp, path)
+	if err := os.Rename(tmp, path); err != nil {
+		return err
+	}
+	return syncDirFn(path)
+}
+
+// syncDirFn is overridden by tests to inject a directory-fsync failure and
+// prove it propagates instead of being silently ignored.
+var syncDirFn = syncDir
+
+// syncDir fsyncs the directory containing path. Opening a directory and
+// calling Sync on it is the standard way to durably commit directory-entry
+// metadata (file creation, rename) on the platforms this package supports.
+func syncDir(path string) error {
+	dir := filepath.Dir(path)
+	f, err := os.Open(dir)
+	if err != nil {
+		return fmt.Errorf("failed to open directory %s for fsync: %w", dir, err)
+	}
+	defer f.Close()
+	if err := f.Sync(); err != nil {
+		return fmt.Errorf("failed to fsync directory %s: %w", dir, err)
+	}
+	return nil
 }
 
 // RedisClient defines the Redis surface we consume.
