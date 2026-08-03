@@ -568,6 +568,7 @@ func TestIntegrationAlreadyMerged(t *testing.T) {
 func TestIntegrationVerifierFails(t *testing.T) {
 	ctx := context.Background()
 	root, _ := setupRepoWithRemote(t)
+	originalRemote := gitInHarvest(t, root, "rev-parse", "origin/main")
 
 	wt := createWorktree(t, root, "task/FAC-107-verifier")
 	writeFileHarvest(t, wt, "feat.go", "package verifier")
@@ -608,11 +609,153 @@ func TestIntegrationVerifierFails(t *testing.T) {
 		t.Errorf("expected no board-complete calls, got %d", len(fd.calls))
 	}
 
-	// Root main should be reset back to origin/main (no cherry-pick residue).
-	// The cherry-pick was applied, verifier failed, then reset --hard origin/main.
+	// Replay state is preserved for explicit recovery; verifier failure never
+	// resets or aborts the destination and never publishes downstream state.
 	headMsg, _ := gitOutput(ctx, root, "log", "--oneline", "-1")
-	if strings.Contains(headMsg, "FAC-107") {
-		t.Errorf("expected FAC-107 to be reset from main, but HEAD is %s", headMsg)
+	if !strings.Contains(headMsg, "FAC-107") {
+		t.Errorf("expected replay head to be preserved for recovery, got %s", headMsg)
+	}
+	if got := gitInHarvest(t, root, "rev-parse", "origin/main"); got != originalRemote {
+		t.Errorf("verifier failure unexpectedly pushed: %s != %s", got, originalRemote)
+	}
+	if len(res.CleanedWorktrees) != 0 || len(res.BoardCompletedRefs) != 0 {
+		t.Fatalf("verifier failure performed downstream mutation: %+v", res)
+	}
+	rows, rowErr := l.AllRows()
+	if rowErr != nil {
+		t.Fatal(rowErr)
+	}
+	for _, row := range rows {
+		if row.Event == "consumed" {
+			t.Fatalf("verifier failure consumed ledger row: %+v", row)
+		}
+	}
+	paths, globErr := filepath.Glob(filepath.Join(root, ".herd", "replay-blocked-*.jsonl"))
+	if globErr != nil || len(paths) != 1 {
+		t.Fatalf("expected one durable blocked evidence file: %v %v", paths, globErr)
+	}
+	evidence, readErr := os.ReadFile(paths[0])
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if !strings.Contains(string(evidence), "verifier_failed") || strings.Contains(string(evidence), "passed") {
+		t.Fatalf("unsafe or missing verifier evidence: %s", evidence)
+	}
+}
+
+func TestIntegrationBatchConflictPublishesNoPrefix(t *testing.T) {
+	ctx := context.Background()
+	root, _ := setupRepoWithRemote(t)
+	writeFileHarvest(t, root, "shared.txt", "base")
+	gitInHarvest(t, root, "add", "shared.txt")
+	gitInHarvest(t, root, "commit", "-q", "-m", "batch base")
+	gitInHarvest(t, root, "push", "-q", "origin", "main")
+	wt := createWorktree(t, root, "task/FAC-181-batch-conflict")
+	writeFileHarvest(t, wt, "first.txt", "first")
+	first := addAndCommitHarvest(t, wt, "batch first", "first.txt")
+	writeFileHarvest(t, wt, "shared.txt", "base\nsource")
+	second := addAndCommitHarvest(t, wt, "batch second conflict", "shared.txt")
+	writeFileHarvest(t, root, "shared.txt", "base\ndestination")
+	gitInHarvest(t, root, "add", "shared.txt")
+	gitInHarvest(t, root, "commit", "-q", "-m", "batch destination conflict")
+	gitInHarvest(t, root, "push", "-q", "origin", "main")
+	originalRemote := gitInHarvest(t, root, "rev-parse", "origin/main")
+	l := setupLedger(t, root)
+	recordPass(t, l, first, "FAC-181")
+	recordPass(t, l, second, "FAC-181")
+	fd := &recordingDispatcher{}
+	in := NewIntegration(NewHarvester(root), nil, fd, l, root, withAdmit("FAC-181"))
+	res, err := in.Run(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.MergedSHAs) != 0 || len(res.BoardCompletedRefs) != 0 || len(res.CleanedWorktrees) != 0 {
+		t.Fatalf("batch conflict published downstream state: %+v", res)
+	}
+	if got := gitInHarvest(t, root, "rev-parse", "origin/main"); got != originalRemote {
+		t.Fatalf("batch conflict pushed a prefix: %s != %s", got, originalRemote)
+	}
+	rows, rowErr := l.AllRows()
+	if rowErr != nil {
+		t.Fatal(rowErr)
+	}
+	for _, row := range rows {
+		if row.Event == "consumed" {
+			t.Fatalf("batch conflict consumed %s", row.SHA)
+		}
+	}
+	if _, statErr := os.Stat(filepath.Join(root, ".git", "CHERRY_PICK_HEAD")); statErr != nil {
+		t.Fatalf("batch conflict did not preserve sequencer evidence: %v", statErr)
+	}
+	repoID, repoIDErr := canonicalRepoIdentity(ctx, root)
+	if repoIDErr != nil {
+		t.Fatal(repoIDErr)
+	}
+	stateRel, evidenceRel, pathErr := replayArtifactPaths(ReplayRequest{
+		TaskID: "FAC-181", RepoID: repoID,
+		Generation: "integration/FAC-181/" + first, ExpectedHead: originalRemote,
+	}, digestSources([]string{first, second}))
+	if pathErr != nil {
+		t.Fatal(pathErr)
+	}
+	state, stateErr := loadReplayState(root, stateRel)
+	if stateErr != nil {
+		t.Fatal(stateErr)
+	}
+	if state == nil || len(state.Items) != 2 {
+		t.Fatalf("batch conflict checkpoint did not retain complete ordered boundary: %+v", state)
+	}
+	if state.Items[0].Source != first || state.Items[0].Classification != ReplayAppliedExact || state.Items[0].Matched == "" {
+		t.Fatalf("batch conflict lost first exact mapping: %+v", state.Items[0])
+	}
+	if state.Items[1].Source != second || state.Items[1].Classification != ReplayUnresolved {
+		t.Fatalf("batch conflict lost unresolved second mapping: %+v", state.Items[1])
+	}
+	evidence, evidenceErr := os.ReadFile(filepath.Join(root, evidenceRel))
+	if evidenceErr != nil || !strings.Contains(string(evidence), second) || !strings.Contains(string(evidence), "unresolved") {
+		t.Fatalf("batch conflict evidence lacks unresolved second source: %q %v", evidence, evidenceErr)
+	}
+}
+
+func TestIntegrationLaterProofFailureHasNoDownstreamEffects(t *testing.T) {
+	ctx := context.Background()
+	root, _ := setupRepoWithRemote(t)
+	wt := createWorktree(t, root, "task/FAC-181-proof-failure")
+	writeFileHarvest(t, wt, "one.txt", "one")
+	first := addAndCommitHarvest(t, wt, "proof first", "one.txt")
+	writeFileHarvest(t, wt, "two.txt", "two")
+	second := addAndCommitHarvest(t, wt, "proof second", "two.txt")
+	l := setupLedger(t, root)
+	recordPass(t, l, first, "FAC-181")
+	recordPass(t, l, second, "FAC-181")
+	fd := &recordingDispatcher{}
+	in := NewIntegration(NewHarvester(root), nil, fd, l, root, withAdmit("FAC-181"))
+	proofCalls := 0
+	in.readback = func(_ context.Context, _, _ string, sha string) (string, error) {
+		proofCalls++
+		if proofCalls == 1 && sha != "" {
+			return "verified-first", nil
+		}
+		return "", fmt.Errorf("forced final readback failure for %s", sha)
+	}
+	res, err := in.Run(ctx)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if proofCalls != 2 {
+		t.Fatalf("expected first proof to pass and second proof to fail, calls=%d", proofCalls)
+	}
+	if len(fd.calls) != 0 || len(res.BoardCompletedRefs) != 0 || len(res.CleanedWorktrees) != 0 {
+		t.Fatalf("later proof failure performed downstream effects: result=%+v board=%+v", res, fd.calls)
+	}
+	rows, rowErr := l.AllRows()
+	if rowErr != nil {
+		t.Fatal(rowErr)
+	}
+	for _, row := range rows {
+		if row.Event == "consumed" {
+			t.Fatalf("later proof failure consumed ledger row: %+v", row)
+		}
 	}
 }
 
