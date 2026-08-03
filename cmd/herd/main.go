@@ -7,6 +7,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -14,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/Kampe/Herdforge/pkg/lock"
 
@@ -101,6 +103,9 @@ func main() {
 
 	case "review-ledger":
 		runReviewLedger()
+
+	case "drain":
+		runDrain()
 
 	case "approve":
 		runApprove()
@@ -211,6 +216,7 @@ func printUsage() {
 	fmt.Println("  pulse      Claim a task from Kaneo and optionally spawn an agent")
 	fmt.Println("  review     Claim in-progress tasks for reviewer and advance to review status")
 	fmt.Println("  approve    Move in-review cards to done, gated on merge evidence")
+	fmt.Println("  drain      Report coordinator review pile (optional bounded --act)")
 	fmt.Println("  board-done Move one card to done ONLY with proof its work is on origin/main")
 	fmt.Println("  board-sync Reconcile board status against git reality (report only)")
 	fmt.Println("  sh         Interactive shell: run herd subcommands in a loop")
@@ -3073,6 +3079,396 @@ func runReviewLedger() {
 	}
 }
 
+func drainLedgerPath() string {
+	if path := strings.TrimSpace(os.Getenv("HERD_REVIEW_LEDGER")); path != "" {
+		return path
+	}
+	base := strings.TrimSpace(os.Getenv("HERD_STATE_DIR"))
+	if base == "" {
+		base = strings.TrimSpace(os.Getenv("XDG_STATE_HOME"))
+	}
+	if base == "" {
+		if home, err := os.UserHomeDir(); err == nil {
+			base = filepath.Join(home, ".local", "state")
+		}
+	}
+	return filepath.Join(base, "chainseer", "herd", "review-ledger.jsonl")
+}
+
+// runDrain computes one coordinator review-pile beat. All report modes use
+// the same precomputed report; --act is deliberately bounded and dry-run
+// first so an unknown ledger/board state cannot become a mutation.
+func runDrain() {
+	os.Exit(runDrainCommand(os.Args[2:], os.Stdout, os.Stderr))
+}
+
+func runDrainCommand(args []string, out, errOut io.Writer) int {
+	fs := flag.NewFlagSet("drain", flag.ContinueOnError)
+	fs.SetOutput(errOut)
+	quiet := fs.Bool("quiet", false, "Show counts and pressure only")
+	asJSON := fs.Bool("json", false, "Output the fixed drain JSON packet")
+	commands := fs.Bool("commands", false, "Print suggested commands without executing them")
+	act := fs.Bool("act", false, "Run bounded automation (dry-run first)")
+	maxReview := fs.Int("max-review", 2, "Maximum review launches")
+	maxHarvest := fs.Int("max-harvest", 1, "Maximum harvest actions")
+	maxRelaunch := fs.Int("max-relaunch", drainIntEnv("HERD_DRAIN_MAX_RELAUNCH", 8), "Maximum ledger-backed relaunches")
+	autoTiers := fs.String("auto-harvest-tiers", "", "Comma-separated recorded tiers allowed for harvest")
+	selftest := fs.Bool("selftest", false, "Verify drain integration seams")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if *selftest {
+		return runDrainSelftest()
+	}
+	_ = *autoTiers // retained for report/commands compatibility until FAC-184 adapters land
+	if *maxReview < 0 || *maxHarvest < 0 || *maxRelaunch < 0 {
+		fmt.Fprintln(errOut, "herd-drain: max bounds must be non-negative")
+		return 2
+	}
+
+	ledgerPath := drainLedgerPath()
+	cap := drainIntEnv("HERD_IN_REVIEW_CAP", 8)
+	stale := drainIntEnv("HERD_DRAIN_STALE_BEHIND", 20)
+	root := "."
+	var tp provider.TaskProvider
+	if cfg, err := config.LoadConfig(filepath.Join(root, ".herd", "herd.yaml")); err == nil {
+		// The action gate accepts only configured standing lane identities.
+		// Evidence is never upgraded into a standing lane by shape alone.
+		tp, err = loadTaskProvider(cfg)
+		if err != nil && !*asJSON {
+			fmt.Fprintf(errOut, "herd-drain: UNKNOWN Kaneo review-cap posture: %v\n", err)
+		}
+	} else if !*asJSON {
+		fmt.Fprintf(errOut, "herd-drain: UNKNOWN Kaneo review-cap posture: %v\n", err)
+	}
+	h := harvest.NewHarvester(root)
+	harvestResult, err := h.Harvest(context.Background())
+	if err != nil {
+		fmt.Fprintf(errOut, "herd-drain: %v\n", err)
+		return 1
+	}
+	harvestErrors := len(harvestResult.Errors) > 0
+	for _, harvestErr := range harvestResult.Errors {
+		fmt.Fprintf(errOut, "herd-drain: UNKNOWN harvest input: %s\n", harvestErr)
+	}
+	d := review.Drain{RepoRoot: root, StateDir: os.Getenv("HERD_STATE_DIR"), LedgerPath: ledgerPath, Cap: cap, StaleBehind: stale, Provider: tp}
+	report, err := d.Scan(context.Background(), harvestResult.UnmergedWorktrees)
+	if err != nil {
+		fmt.Fprintf(errOut, "herd-drain: %v\n", err)
+		return 1
+	}
+	if cfg, err := config.LoadConfig(filepath.Join(root, ".herd", "herd.yaml")); err == nil {
+		for _, lane := range cfg.Lanes {
+			if lane.Standing {
+				report.StandingLanes = append(report.StandingLanes, lane.Name)
+			}
+		}
+		sort.Strings(report.StandingLanes)
+	}
+	if harvestErrors {
+		report.Errors = append(report.Errors, "harvest input errors; action projection is fail-closed")
+	}
+	if *asJSON {
+		if err := json.NewEncoder(out).Encode(report); err != nil {
+			fmt.Fprintf(errOut, "herd-drain: encode JSON: %v\n", err)
+			return 1
+		}
+		return 0
+	}
+	if *quiet {
+		fmt.Fprintf(out, "herd-drain: pressure=%s pending=%d queue=%d harvestable=%d rebase_needed=%d need_review=%d in_review=%d cap=%d parks=%d wind=%t skips7d=%d passes=%d\n", report.Pressure, report.Pending, report.HarvestQueue, report.Harvestable, report.RebaseNeeded, report.NeedReview, report.KaneoInReview, report.Cap, report.ParkBranches, report.WindDown, report.Skips7d, report.LedgerPass)
+		printDrainErrors(out, report)
+		return drainExitCode(report)
+	}
+	printDrainReportTo(out, report)
+	if *commands || *act {
+		printDrainCommandsTo(out, report)
+	}
+	if *act {
+		fmt.Fprintln(out, "herd-drain: REFUSED --act: FAC-184 compiled review/ledger/harvest/cap adapters are unavailable; FAC-182 durable control-envelope delivery is blocked")
+		return 1
+	}
+	return drainExitCode(report)
+}
+
+func drainIntEnv(name string, fallback int) int {
+	if v, err := strconv.Atoi(strings.TrimSpace(os.Getenv(name))); err == nil && v >= 0 {
+		return v
+	}
+	return fallback
+}
+func minDrain(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func printDrainReport(r *review.DrainReport) {
+	printDrainReportTo(os.Stdout, r)
+}
+
+func printDrainReportTo(out io.Writer, r *review.DrainReport) {
+	fmt.Fprintf(out, "=== server faster: review pile ===\nposture: pressure=%s pending=%d queue=%d harvestable=%d need_review=%d harvest_ready=%d in_review=%d cap=%d\n", r.Pressure, r.Pending, r.HarvestQueue, r.Harvestable, r.NeedReview, r.HarvestReady, r.KaneoInReview, r.Cap)
+	if r.RefactoringCount < 0 {
+		fmt.Fprintln(out, "refactoring=UNKNOWN")
+	} else {
+		fmt.Fprintf(out, "refactoring=%d\n", r.RefactoringCount)
+	}
+	fmt.Fprintln(out, "=== server faster: harvest queue & pending ===")
+	fmt.Fprintf(out, "pending=%d queue=%d\n", r.Pending, r.HarvestQueue)
+	fmt.Fprintln(out, "=== server faster: harvestable ===")
+	pins := make(map[string]review.PinFreshness, len(r.Pins))
+	for _, pin := range r.Pins {
+		pins[pin.SHA] = pin
+	}
+	if len(r.Shas.Harvestable) == 0 {
+		fmt.Fprintln(out, "(none)")
+	} else {
+		for _, sha := range r.Shas.Harvestable {
+			p := pins[sha]
+			fmt.Fprintf(out, "%s %s behind=%d %s\n", p.SHA, p.Branch, p.Behind, p.Note)
+		}
+	}
+	fmt.Fprintln(out, "=== server faster: unmerged tips needing review ===")
+	if len(r.Shas.NeedReview) == 0 {
+		fmt.Fprintln(out, "(none)")
+	} else {
+		for _, sha := range r.Shas.NeedReview {
+			fmt.Fprintln(out, sha)
+		}
+	}
+	fmt.Fprintln(out, "=== server faster: board×git matrix ===")
+	if !r.KaneoOK {
+		fmt.Fprintf(out, "UNKNOWN: %s\n", r.KaneoError)
+	} else {
+		fmt.Fprintf(out, "in-review=%d\n", r.KaneoInReview)
+		for _, row := range r.BoardGit {
+			fmt.Fprintf(out, "ref=%s title=%s main=%t tip=%s park=%t\n", row.Ref, row.Title, row.Main, row.Tip, row.Park)
+		}
+	}
+	printDrainErrors(out, r)
+}
+
+func printDrainCommands(r *review.DrainReport) {
+	printDrainCommandsTo(os.Stdout, r)
+}
+
+func printDrainCommandsTo(out io.Writer, r *review.DrainReport) {
+	evidence := make(map[string]drainActionEvidence, len(r.ActionEvidence))
+	for _, item := range r.ActionEvidence {
+		evidence[item.SHA] = item
+	}
+	for _, sha := range r.Shas.HarvestReady {
+		e := evidence[sha]
+		if !e.TierRecorded || !review.LedgerFamilyAllowlist[strings.ToLower(e.BuilderFamily)] {
+			fmt.Fprintf(out, "# REFUSED harvest %s: recorded tier and builder family evidence required\n", sha)
+			continue
+		}
+		fmt.Fprintf(out, "# REFUSED harvest %s: FAC-184 compiled adapter unavailable (lane=%s tier=%s sha=%s)\n", sha, e.Lane, e.Tier, sha)
+	}
+	for _, sha := range r.Shas.NeedReview {
+		e := evidence[sha]
+		switch {
+		case e.Vetoed:
+			fmt.Fprintf(out, "# REFUSED review %s: vetoed SHA\n", sha)
+		case strings.TrimSpace(e.BuilderFamily) == "" || !review.LedgerFamilyAllowlist[strings.ToLower(e.BuilderFamily)]:
+			fmt.Fprintf(out, "# REFUSED review %s: unknown builder family\n", sha)
+		case drainForbiddenBranch(e.Branch):
+			fmt.Fprintf(out, "# REFUSED review %s: forbidden branch %s\n", sha, e.Branch)
+		default:
+			fmt.Fprintf(out, "# REFUSED review %s: FAC-184 compiled adapter unavailable (branch=%s family=%s pin=%s)\n", sha, e.Branch, e.BuilderFamily, sha)
+		}
+	}
+}
+
+func printDrainErrors(out io.Writer, r *review.DrainReport) {
+	for _, errText := range r.Errors {
+		fmt.Fprintf(out, "UNKNOWN: %s\n", errText)
+	}
+}
+
+func drainExitCode(r *review.DrainReport) int {
+	if !r.KaneoOK || len(r.Errors) > 0 || r.Pending+r.HarvestQueue+r.Harvestable+r.NeedReview > 0 || r.KaneoInReview >= r.Cap {
+		return 1
+	}
+	return 0
+}
+
+type drainActionEvidence = review.DrainActionEvidence
+
+type drainActionHooks struct {
+	launchReview func(context.Context, drainActionEvidence) error
+	dryRun       func(context.Context, drainActionEvidence) error
+	harvest      func(context.Context, drainActionEvidence) error
+}
+
+type drainActionResult struct {
+	Reviews, Harvests, DryRuns, Refusals int
+	Failed                               bool
+}
+
+func defaultDrainActionHooks() drainActionHooks {
+	return drainActionHooks{
+		launchReview: func(context.Context, drainActionEvidence) error {
+			return errors.New("FAC-184 compiled review adapter unavailable")
+		},
+		dryRun: func(context.Context, drainActionEvidence) error {
+			return errors.New("FAC-184 compiled harvest dry-run adapter unavailable")
+		},
+		harvest: func(context.Context, drainActionEvidence) error {
+			return errors.New("FAC-184 compiled harvest adapter unavailable")
+		},
+	}
+}
+
+func drainAllowedTiers(raw string) map[string]bool {
+	allowed := make(map[string]bool)
+	for _, tier := range strings.Split(raw, ",") {
+		tier = strings.ToUpper(strings.TrimSpace(tier))
+		if tier != "" {
+			allowed[tier] = true
+		}
+	}
+	return allowed
+}
+
+func drainForbiddenBranch(branch string) bool {
+	for _, segment := range strings.Split(strings.ToLower(strings.TrimSpace(branch)), "/") {
+		if segment == "review" || segment == "park" || segment == "parked" || segment == "harvest" || segment == "harvested" {
+			return true
+		}
+	}
+	return false
+}
+
+func validDrainStandingLane(r *review.DrainReport, lane string) bool {
+	if lane == "" || strings.ContainsAny(lane, "/") || strings.IndexFunc(lane, unicode.IsSpace) >= 0 {
+		return false
+	}
+	for _, configured := range r.StandingLanes {
+		if lane == configured {
+			return true
+		}
+	}
+	return false
+}
+
+func executeDrainActions(ctx context.Context, r *review.DrainReport, evidence []drainActionEvidence, maxReview, maxHarvest, maxRelaunch int, autoTiers string, out io.Writer, hooks drainActionHooks) drainActionResult {
+	result := drainActionResult{}
+	if hooks.launchReview == nil || hooks.harvest == nil {
+		fmt.Fprintln(out, "herd-drain: REFUSED unknown action seam")
+		result.Failed = true
+		result.Refusals++
+		return result
+	}
+	allowed := drainAllowedTiers(autoTiers)
+	reviewCount, harvestCount, harvestAttempts, relaunchCount := 0, 0, 0, 0
+	seenBranches := make(map[string]bool)
+	for _, e := range evidence {
+		if e.RebaseNeeded && os.Getenv("HERD_DRAIN_REBASE_MAIL") != "0" {
+			if !validDrainStandingLane(r, e.Lane) {
+				fmt.Fprintf(out, "REFUSED rebase-mail %s: invalid standing lane identity %q\n", e.SHA, e.Lane)
+				result.Failed = true
+				result.Refusals++
+			} else if relaunchCount < maxRelaunch {
+				fmt.Fprintf(out, "REFUSED rebase-mail %s: FAC-182 durable control-envelope delivery is unavailable; OPERATOR_RESOLUTION_REQUIRED ticket=rebase-mail/%s/%s\n", e.SHA, e.Lane, e.SHA[:minDrain(12, len(e.SHA))])
+				result.Failed = true
+				result.Refusals++
+				relaunchCount++
+			} else {
+				fmt.Fprintf(out, "REFUSED rebase-mail %s: max relaunch bound reached\n", e.SHA)
+				result.Refusals++
+			}
+		}
+		if e.HarvestReady && harvestAttempts < maxHarvest {
+			harvestAttempts++
+			if hooks.dryRun == nil {
+				fmt.Fprintf(out, "REFUSED harvest %s: missing dry-run seam\n", e.SHA)
+				result.Failed = true
+				result.Refusals++
+				continue
+			}
+			fmt.Fprintf(out, "DRY-RUN harvest lane=%s sha=%s tier=%s\n", e.Lane, e.SHA, e.Tier)
+			if err := hooks.dryRun(ctx, e); err != nil {
+				fmt.Fprintf(out, "REFUSED harvest %s: %v\n", e.SHA, err)
+				result.Failed = true
+				result.Refusals++
+				continue
+			}
+			result.DryRuns++
+			if !e.TierRecorded || !allowed[strings.ToUpper(e.Tier)] {
+				fmt.Fprintf(out, "REFUSED harvest %s: dry-run recorded; auto-harvest tier is not explicitly allowed\n", e.SHA)
+				result.Refusals++
+				continue
+			}
+			if !review.LedgerFamilyAllowlist[strings.ToLower(e.BuilderFamily)] {
+				fmt.Fprintf(out, "REFUSED harvest %s: unknown builder family\n", e.SHA)
+				result.Refusals++
+				continue
+			}
+			if err := hooks.harvest(ctx, e); err != nil {
+				fmt.Fprintf(out, "REFUSED harvest %s: %v\n", e.SHA, err)
+				result.Failed = true
+				result.Refusals++
+			} else {
+				harvestCount++
+				result.Harvests++
+			}
+		}
+		if !containsDrainSHA(r.Shas.NeedReview, e.SHA) || reviewCount >= maxReview {
+			continue
+		}
+		if e.Vetoed {
+			fmt.Fprintf(out, "REFUSED review %s: vetoed SHA\n", e.SHA)
+			result.Refusals++
+			continue
+		}
+		if drainForbiddenBranch(e.Branch) {
+			fmt.Fprintf(out, "REFUSED review %s: forbidden branch %s\n", e.SHA, e.Branch)
+			result.Refusals++
+			continue
+		}
+		if e.Pending || seenBranches[e.Branch] {
+			fmt.Fprintf(out, "REFUSED review %s: duplicate pending prefix\n", e.SHA)
+			result.Refusals++
+			continue
+		}
+		if strings.TrimSpace(e.BuilderFamily) == "" || !review.LedgerFamilyAllowlist[strings.ToLower(e.BuilderFamily)] {
+			fmt.Fprintf(out, "REFUSED review %s: unknown builder family\n", e.SHA)
+			result.Refusals++
+			continue
+		}
+		if r.KaneoInReview < 0 || r.KaneoInReview+reviewCount >= r.Cap {
+			fmt.Fprintf(out, "REFUSED review %s: review cap unknown or exceeded\n", e.SHA)
+			result.Refusals++
+			continue
+		}
+		fmt.Fprintf(out, "DRY-RUN review branch=%s family=%s sha=%s\n", e.Branch, e.BuilderFamily, e.SHA)
+		if err := hooks.launchReview(ctx, e); err != nil {
+			fmt.Fprintf(out, "REFUSED review %s: %v\n", e.SHA, err)
+			result.Failed = true
+			result.Refusals++
+			continue
+		}
+		seenBranches[e.Branch] = true
+		reviewCount++
+		relaunchCount++
+		result.Reviews++
+	}
+	fmt.Fprintf(out, "act_reviews=%d act_harvests=%d dry_runs=%d rebase_mail=0 refusals=%d\n", result.Reviews, result.Harvests, result.DryRuns, result.Refusals)
+	return result
+}
+
+func containsDrainSHA(shas []string, want string) bool {
+	for _, sha := range shas {
+		if sha == want {
+			return true
+		}
+	}
+	return false
+}
+
 // runVerify is the FAC-98/FAC-116 completion gate: `herd verify <worktree>`
 // exits 0 only when the worktree has real committed work, builds, and tests
 // pass — the check an agent must pass before reporting done, and the forge
@@ -3313,4 +3709,21 @@ func scopedTestCommand(worktree string) string {
 	}
 	sort.Strings(list)
 	return "go test -count=1 " + strings.Join(list, " ")
+}
+func runDrainSelftest() int {
+	failed := false
+	for _, tool := range []string{"git", "herdr"} {
+		if _, err := exec.LookPath(tool); err != nil {
+			fmt.Printf("herd-drain selftest FAIL: missing tool %s\n", tool)
+			failed = true
+		}
+	}
+	fmt.Println("herd-drain selftest FAIL: FAC-184 compiled review/ledger/harvest/cap adapters are not installed")
+	fmt.Println("herd-drain selftest FAIL: FAC-182 durable control-envelope delivery is blocked")
+	failed = true
+	if failed {
+		fmt.Println("herd-drain selftest: FAIL (fail-closed prerequisite check)")
+		return 1
+	}
+	return 0
 }

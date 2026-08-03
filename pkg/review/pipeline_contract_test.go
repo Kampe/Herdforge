@@ -119,7 +119,7 @@ func setupPipelineRepo(t *testing.T) (root, lane string) {
 func addPass(t *testing.T, root, sha, branch string) {
 	t.Helper()
 	l := OpenLedger(filepath.Join(root, "ledger.jsonl"))
-	writeJSONL(t, l.Path, LedgerRow{Event: "record", SHA: sha, Branch: branch, Tier: "R1"}, LedgerRow{Event: "verdict", SHA: sha, Reviewer: "reviewer", Verdict: "PASS"})
+	writeJSONL(t, l.Path, LedgerRow{Event: "record", SHA: sha, Branch: branch, Tier: "R1", BuilderFamily: "anthropic"}, LedgerRow{Event: "verdict", SHA: sha, Reviewer: "reviewer", Verdict: "PASS"})
 }
 
 func TestPipelineContract_RequiredStates(t *testing.T) {
@@ -142,6 +142,9 @@ func TestPipelineContract_RequiredStates(t *testing.T) {
 		}
 		if r.HarvestReady != 0 || r.Harvestable != 1 || len(r.Shas.RebaseNeeded) != 1 || r.Pins[0].Behind <= 20 || r.Pins[0].Lane != "lane" {
 			t.Fatalf("stale report=%+v", r)
+		}
+		if len(r.ActionEvidence) != 1 || r.ActionEvidence[0].BuilderFamily != "anthropic" || r.ActionEvidence[0].Tier != "R1" || !r.ActionEvidence[0].TierRecorded || !r.ActionEvidence[0].RebaseNeeded {
+			t.Fatalf("stale action evidence=%+v", r.ActionEvidence)
 		}
 	})
 	t.Run("duplicate SHA is one pin", func(t *testing.T) {
