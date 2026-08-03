@@ -10,6 +10,7 @@ import (
 	"github.com/Kampe/Herdforge/pkg/herdr"
 	"github.com/Kampe/Herdforge/pkg/launch"
 	"github.com/Kampe/Herdforge/pkg/router"
+	"github.com/Kampe/Herdforge/pkg/usage"
 )
 
 func testLaunchRouter(t *testing.T) *router.SurfaceRouter {
@@ -86,6 +87,52 @@ func TestLaunchAdmissionPassesExactDecisionToLifecycle(t *testing.T) {
 	})
 	if err != nil || got != valid || rec.decision != valid {
 		t.Fatalf("decision identity was not preserved: got=%p err=%v recorded=%p", got, err, rec.decision)
+	}
+}
+
+func TestWorkerFinalTupleRejectsSparkFallbackBeforeAnySideEffect(t *testing.T) {
+	roles := []string{launch.WorkerRole, launch.ForgeSmithRole, launch.RecoveryRole}
+	for _, role := range roles {
+		t.Run(role, func(t *testing.T) {
+			t.Setenv("HERDR_ROUTE_STATE_DIR", t.TempDir())
+			lane := config.LaneDef{Name: role, Role: role, AgentKind: launch.WorkerProvider, Provider: launch.WorkerProvider, Model: launch.WorkerModel, Effort: launch.WorkerEffort, TaskShape: launch.Implementation}
+			cfg := &config.Config{Lanes: []config.LaneDef{lane}}
+			r := router.NewRouter(usage.NewQuotaEngine(), map[string]usage.BurnState{
+				"codex": {
+					Available: false,
+					Reason:    "exhausted",
+					Pools: map[string]usage.BurnState{
+						"spark": {Available: true},
+					},
+				},
+			})
+			r.Probes = &router.Probes{CLIPresent: func(cli string) bool { return cli == launch.WorkerProvider }, Now: func() time.Time { return time.Unix(1_800_000_000, 0) }}
+			rec := &fakeLaunchLifecycle{}
+			decision, err := launchAdmissionWithLifecycle(rec, cfg, role, true, func(lane *config.LaneDef) (*router.LaunchDecision, error) {
+				return r.Decide(router.LaunchRequest{
+					Role:              router.Role(role),
+					Shape:             launch.Implementation,
+					RequestedProvider: launch.WorkerProvider,
+					RequestedModel:    launch.WorkerModel,
+					RequestedEffort:   launch.WorkerEffort,
+					TaskRef:           lane.Name,
+					Scope:             router.ScopeLane,
+					ProbeResults:      map[string]bool{router.ProbeKey(launch.WorkerProvider, "gpt-5.3-codex-spark"): true},
+				})
+			}, func(*router.LaunchDecision) error {
+				t.Fatal("forbidden Spark fallback reached lifecycle side effects")
+				return nil
+			})
+			if decision != nil {
+				t.Fatalf("rejected final tuple must not produce a LaunchDecision: %+v", decision)
+			}
+			if !errors.Is(err, router.ErrWorkerPolicy) {
+				t.Fatalf("Spark fallback must fail with ErrWorkerPolicy: %v", err)
+			}
+			if *rec != (fakeLaunchLifecycle{}) {
+				t.Fatalf("rejected final tuple caused side effects: %+v", rec)
+			}
+		})
 	}
 }
 
