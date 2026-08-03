@@ -65,7 +65,7 @@ func TestLateWriterIntoGitRequiresExplicitReap(t *testing.T) {
 		t.Fatalf("seal tree: %v", err)
 	}
 
-	// PRE-FIX: hard assertion — real os.RemoveAll must fail (not ignored).
+	// PRE-FIX: hard assertion — real os.RemoveAll must fail (never ignored).
 	preErr := os.RemoveAll(root)
 	if preErr == nil {
 		_ = unsealGitDirAfterReap(gitDir)
@@ -79,19 +79,23 @@ func TestLateWriterIntoGitRequiresExplicitReap(t *testing.T) {
 		t.Fatalf("unreaped writer must remain live after failed RemoveAll: %v", err)
 	}
 
-	// FIX: reap process group, unseal, then RemoveAll must succeed.
+	// FIX path: reap + wait + unseal, then real RemoveAll must succeed.
 	reapProcessGroup(pgid)
-	_ = cmd.Wait()
+	waitErr := cmd.Wait()
+	if waitErr != nil && !strings.Contains(waitErr.Error(), "signal") && !strings.Contains(waitErr.Error(), "kill") {
+		// Reaped shells often exit non-zero; only unexpected wait errors matter.
+		t.Logf("wait after reap: %v", waitErr)
+	}
 	if err := waitForPIDGone(pgid, 2*time.Second); err != nil {
 		_ = unsealGitDirAfterReap(gitDir)
 		t.Fatalf("after process-group reap, leader must be gone: %v", err)
 	}
 	if err := unsealGitDirAfterReap(gitDir); err != nil {
-		// Tree may be partially gone; still try cleanup.
-		t.Logf("unseal after reap: %v", err)
+		t.Fatalf("post-fix: unseal after reap must succeed: %v", err)
 	}
-	if err := os.RemoveAll(root); err != nil {
-		t.Fatalf("post-fix: os.RemoveAll must succeed after reap+unseal: %v", err)
+	postErr := os.RemoveAll(root)
+	if postErr != nil {
+		t.Fatalf("post-fix: os.RemoveAll must succeed after reap+wait+unseal: %v", postErr)
 	}
 	if err := syscall.Kill(pgid, 0); err == nil {
 		t.Fatalf("process group %d still live after reap+Wait", pgid)
@@ -135,15 +139,15 @@ func TestLateWriterCleanupMutationOmittingReapStillFails(t *testing.T) {
 		t.Fatal("control: sealed unreaped tree must make RemoveAll fail")
 	}
 
-	// MUTATION: omit reapProcessGroup, Wait, and unseal — cleanup must still fail.
-	// (This is what a vacuous test would skip asserting.)
+	// MUTATION of the fix path: delete reapProcessGroup, cmd.Wait, and unseal.
+	// Under that mutant, os.RemoveAll must still fail — if this assertion were
+	// removed, the test would not prove reap/wait are required.
 	mutErr := os.RemoveAll(root)
 	if mutErr == nil {
-		t.Fatal("mutation: omitting reap+unseal must leave RemoveAll failing; got nil (guard deleted)")
+		t.Fatal("mutation: removing reap/wait/unseal must leave os.RemoveAll failing; got nil")
 	}
-	// Writer still live — ownership never closed.
 	if err := syscall.Kill(pgid, 0); err != nil {
-		t.Fatalf("mutation path: writer should still be live without reap: %v", err)
+		t.Fatalf("mutation path: writer must still be live without reap: %v", err)
 	}
 }
 
@@ -177,7 +181,7 @@ func TestProcessGroupReapAllowsTempDirCleanup(t *testing.T) {
 		_ = unsealGitDirAfterReap(gitDir)
 		reapProcessGroup(pgid)
 		_ = cmd.Wait()
-		t.Fatal("cleanup must fail before reap while sealed")
+		t.Fatal("pre-reap: os.RemoveAll must fail while sealed")
 	}
 	reapProcessGroup(pgid)
 	_ = cmd.Wait()
@@ -186,10 +190,10 @@ func TestProcessGroupReapAllowsTempDirCleanup(t *testing.T) {
 		t.Fatalf("reaped writer still live: %v", err)
 	}
 	if err := unsealGitDirAfterReap(gitDir); err != nil {
-		t.Logf("unseal: %v", err)
+		t.Fatalf("unseal after reap: %v", err)
 	}
 	if err := os.RemoveAll(root); err != nil {
-		t.Fatalf("reaped+unsealed tree must clean up: %v", err)
+		t.Fatalf("post-reap: os.RemoveAll must succeed: %v", err)
 	}
 }
 
