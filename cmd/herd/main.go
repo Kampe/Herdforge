@@ -327,6 +327,10 @@ func main() {
 	case "command":
 		runCommand()
 
+	case "hostcreds":
+		// FAC-170 production caller (independent of FAC-133 WIP).
+		runHostCreds()
+
 	default:
 		fmt.Fprintf(os.Stderr, "unknown subcommand '%s'\nRun 'herd --help' for usage.\n", command)
 		os.Exit(1)
@@ -412,6 +416,7 @@ func printUsage() {
 	fmt.Println("  reset-safe     Reset a feature worktree after preserving unique commits")
 	fmt.Println("  signer-boundary  OS signing boundary: serve | establish | status | prove | sign (FAC-169)")
 	fmt.Println("  command         Run a root-authorized command under a durable attempt budget")
+	fmt.Println("  hostcreds       HostCreds oracle: diagnose|session|selftest (FAC-170; no OpenCode)")
 	fmt.Println("  --version       Show herd version")
 }
 
