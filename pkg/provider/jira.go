@@ -16,6 +16,8 @@ type JiraProvider struct {
 	APIToken   string
 	UserEmail  string
 	HTTPClient *http.Client
+	Deadlines  Deadlines
+	Retry      RetryPolicy
 }
 
 type jiraIssueDTO struct {
@@ -47,8 +49,31 @@ func NewJiraProvider(baseURL, userEmail, apiToken string) *JiraProvider {
 		BaseURL:    baseURL,
 		UserEmail:  userEmail,
 		APIToken:   apiToken,
-		HTTPClient: &http.Client{Timeout: 10 * time.Second},
+		HTTPClient: defaultHTTPClient(),
+		Deadlines:  DefaultDeadlines(),
+		Retry:      DefaultReadRetry(),
 	}
+}
+
+func (j *JiraProvider) deadlines() Deadlines {
+	if j == nil {
+		return DefaultDeadlines()
+	}
+	return j.Deadlines.Normalize()
+}
+
+func (j *JiraProvider) readRetry() RetryPolicy {
+	if j == nil {
+		return DefaultReadRetry()
+	}
+	return j.Retry.normalize()
+}
+
+func (j *JiraProvider) client() *http.Client {
+	if j != nil && j.HTTPClient != nil {
+		return j.HTTPClient
+	}
+	return defaultHTTPClient()
 }
 
 func (j *JiraProvider) doRequest(ctx context.Context, method, urlPath string, body interface{}) ([]byte, error) {
@@ -70,7 +95,7 @@ func (j *JiraProvider) doRequest(ctx context.Context, method, urlPath string, bo
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
 
-	resp, err := j.HTTPClient.Do(req)
+	resp, err := j.client().Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -114,6 +139,22 @@ func (j *JiraProvider) mapJiraToTask(issue *jiraIssueDTO) *Task {
 }
 
 func (j *JiraProvider) GetTask(ctx context.Context, id string) (*Task, error) {
+	dls := j.deadlines()
+	ctx, cancel := WithOpDeadline(ctx, dls, OpGet)
+	defer cancel()
+	var task *Task
+	err := RetryRead(ctx, j.readRetry(), func(rctx context.Context) error {
+		t, e := j.getTaskOnce(rctx, id)
+		if e != nil {
+			return AsTimeout("jira", "GetTask", OpGet, dls.For(OpGet), e)
+		}
+		task = t
+		return nil
+	})
+	return task, err
+}
+
+func (j *JiraProvider) getTaskOnce(ctx context.Context, id string) (*Task, error) {
 	data, err := j.doRequest(ctx, "GET", fmt.Sprintf("/rest/api/3/issue/%s", id), nil)
 	if err != nil {
 		return nil, fmt.Errorf("jira GetTask failed: %w", err)
@@ -128,6 +169,22 @@ func (j *JiraProvider) GetTask(ctx context.Context, id string) (*Task, error) {
 }
 
 func (j *JiraProvider) ListTasks(ctx context.Context, projectID string, status string) ([]*Task, error) {
+	dls := j.deadlines()
+	ctx, cancel := WithOpDeadline(ctx, dls, OpList)
+	defer cancel()
+	var tasks []*Task
+	err := RetryRead(ctx, j.readRetry(), func(rctx context.Context) error {
+		ts, e := j.listTasksOnce(rctx, projectID, status)
+		if e != nil {
+			return AsTimeout("jira", "ListTasks", OpList, dls.For(OpList), e)
+		}
+		tasks = ts
+		return nil
+	})
+	return tasks, err
+}
+
+func (j *JiraProvider) listTasksOnce(ctx context.Context, projectID string, status string) ([]*Task, error) {
 	jql := fmt.Sprintf("project = '%s'", projectID)
 	if status != "" {
 		jql = fmt.Sprintf("%s AND status = '%s'", jql, status)
@@ -158,6 +215,17 @@ func (j *JiraProvider) ClaimTask(ctx context.Context, taskID string, role string
 
 func (j *JiraProvider) UpdateStatus(ctx context.Context, taskID string, status string) error {
 	canonical := NormalizeStatus(status)
+	dls := j.deadlines()
+	writeCtx, cancel := WithOpDeadline(ctx, dls, OpMutate)
+	writeErr := j.updateStatusOnce(writeCtx, taskID, status)
+	cancel()
+	if writeErr != nil {
+		writeErr = AsTimeout("jira", "UpdateStatus", OpMutate, dls.For(OpMutate), writeErr)
+	}
+	return AfterMutation(ctx, j, dls, "jira", "UpdateStatus", taskID, canonical, writeErr)
+}
+
+func (j *JiraProvider) updateStatusOnce(ctx context.Context, taskID, status string) error {
 	payload := map[string]interface{}{
 		"transition": map[string]string{
 			"name": status,
@@ -167,14 +235,13 @@ func (j *JiraProvider) UpdateStatus(ctx context.Context, taskID string, status s
 	if err != nil {
 		return fmt.Errorf("jira UpdateStatus failed: %w", err)
 	}
-	got, gerr := j.GetTask(ctx, taskID)
-	if gerr != nil {
-		return fmt.Errorf("jira status readback after write: %w", gerr)
-	}
-	return VerifyStatusReadback(taskID, canonical, got.Status)
+	return nil
 }
 
 func (j *JiraProvider) AddComment(ctx context.Context, taskID string, body string) error {
+	dls := j.deadlines()
+	ctx, cancel := WithOpDeadline(ctx, dls, OpComment)
+	defer cancel()
 	reqPayload := map[string]interface{}{
 		"body": map[string]interface{}{
 			"type":    "doc",
@@ -195,7 +262,12 @@ func (j *JiraProvider) AddComment(ctx context.Context, taskID string, body strin
 
 	_, err := j.doRequest(ctx, "POST", fmt.Sprintf("/rest/api/3/issue/%s/comment", taskID), reqPayload)
 	if err != nil {
-		return fmt.Errorf("jira AddComment failed: %w", err)
+		err = fmt.Errorf("jira AddComment failed: %w", err)
+		err = AsTimeout("jira", "AddComment", OpComment, dls.For(OpComment), err)
+		if IsTimeout(err) {
+			return &AmbiguousMutationError{Provider: "jira", Op: "AddComment", TaskID: taskID, WriteErr: err}
+		}
+		return err
 	}
 	return nil
 }

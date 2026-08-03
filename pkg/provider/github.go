@@ -10,19 +10,44 @@ import (
 )
 
 type GitHubProvider struct {
-	Token  string
-	Owner  string
-	Repo   string
-	Client *http.Client
+	Token     string
+	Owner     string
+	Repo      string
+	Client    *http.Client
+	Deadlines Deadlines
+	Retry     RetryPolicy
 }
 
 func NewGitHubProvider(token string, owner string, repo string) *GitHubProvider {
 	return &GitHubProvider{
-		Token:  token,
-		Owner:  owner,
-		Repo:   repo,
-		Client: &http.Client{Timeout: 10 * time.Second},
+		Token:     token,
+		Owner:     owner,
+		Repo:      repo,
+		Client:    defaultHTTPClient(),
+		Deadlines: DefaultDeadlines(),
+		Retry:     DefaultReadRetry(),
 	}
+}
+
+func (g *GitHubProvider) deadlines() Deadlines {
+	if g == nil {
+		return DefaultDeadlines()
+	}
+	return g.Deadlines.Normalize()
+}
+
+func (g *GitHubProvider) readRetry() RetryPolicy {
+	if g == nil {
+		return DefaultReadRetry()
+	}
+	return g.Retry.normalize()
+}
+
+func (g *GitHubProvider) httpClient() *http.Client {
+	if g != nil && g.Client != nil {
+		return g.Client
+	}
+	return defaultHTTPClient()
 }
 
 type githubIssueDTO struct {
@@ -67,6 +92,23 @@ func (g *GitHubProvider) mapIssue(dto githubIssueDTO) *Task {
 }
 
 func (g *GitHubProvider) GetTask(ctx context.Context, id string) (*Task, error) {
+	dls := g.deadlines()
+	ctx, cancel := WithOpDeadline(ctx, dls, OpGet)
+	defer cancel()
+
+	var task *Task
+	err := RetryRead(ctx, g.readRetry(), func(rctx context.Context) error {
+		t, e := g.getTaskOnce(rctx, id)
+		if e != nil {
+			return AsTimeout("github", "GetTask", OpGet, dls.For(OpGet), e)
+		}
+		task = t
+		return nil
+	})
+	return task, err
+}
+
+func (g *GitHubProvider) getTaskOnce(ctx context.Context, id string) (*Task, error) {
 	url := fmt.Sprintf("https://api.github.com/repos/%s/%s/issues/%s", g.Owner, g.Repo, id)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
@@ -78,7 +120,7 @@ func (g *GitHubProvider) GetTask(ctx context.Context, id string) (*Task, error) 
 		req.Header.Set("Authorization", "token "+g.Token)
 	}
 
-	resp, err := g.Client.Do(req)
+	resp, err := g.httpClient().Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("failed to execute GET GitHub issue: %w", err)
 	}
@@ -95,6 +137,23 @@ func (g *GitHubProvider) GetTask(ctx context.Context, id string) (*Task, error) 
 }
 
 func (g *GitHubProvider) ListTasks(ctx context.Context, projectID string, status string) ([]*Task, error) {
+	dls := g.deadlines()
+	ctx, cancel := WithOpDeadline(ctx, dls, OpList)
+	defer cancel()
+
+	var tasks []*Task
+	err := RetryRead(ctx, g.readRetry(), func(rctx context.Context) error {
+		t, e := g.listTasksOnce(rctx, projectID, status)
+		if e != nil {
+			return AsTimeout("github", "ListTasks", OpList, dls.For(OpList), e)
+		}
+		tasks = t
+		return nil
+	})
+	return tasks, err
+}
+
+func (g *GitHubProvider) listTasksOnce(ctx context.Context, projectID string, status string) ([]*Task, error) {
 	stateQuery := "open"
 	ns := NormalizeStatus(status)
 	if ns == StatusDone || ns == StatusArchived || status == "closed" {
@@ -107,6 +166,9 @@ func (g *GitHubProvider) ListTasks(ctx context.Context, projectID string, status
 	acc := NewPageAccumulator()
 	var tasks []*Task
 	for page := 1; page <= DefaultMaxListPages; page++ {
+		if err := ctx.Err(); err != nil {
+			return nil, AsTimeout("github", "ListTasks", OpList, g.deadlines().For(OpList), err)
+		}
 		url := fmt.Sprintf("https://api.github.com/repos/%s/%s/issues?state=%s&per_page=%d&page=%d",
 			g.Owner, g.Repo, stateQuery, pageSize, page)
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
@@ -119,7 +181,7 @@ func (g *GitHubProvider) ListTasks(ctx context.Context, projectID string, status
 			req.Header.Set("Authorization", "token "+g.Token)
 		}
 
-		resp, err := g.Client.Do(req)
+		resp, err := g.httpClient().Do(req)
 		if err != nil {
 			return nil, fmt.Errorf("failed to execute GET GitHub issues: %w", err)
 		}
@@ -158,13 +220,29 @@ func (g *GitHubProvider) ClaimTask(ctx context.Context, taskID string, role stri
 }
 
 func (g *GitHubProvider) UpdateStatus(ctx context.Context, taskID string, status string) error {
-	url := fmt.Sprintf("https://api.github.com/repos/%s/%s/issues/%s", g.Owner, g.Repo, taskID)
 	canonical := NormalizeStatus(status)
 	state := "open"
 	if canonical == StatusDone || canonical == StatusArchived {
 		state = "closed"
 	}
+	// GitHub only exposes open/closed; map expectation to that surface for readback.
+	want := StatusToDo
+	if state == "closed" {
+		want = StatusDone
+	}
 
+	dls := g.deadlines()
+	writeCtx, cancel := WithOpDeadline(ctx, dls, OpMutate)
+	writeErr := g.updateStatusOnce(writeCtx, taskID, state)
+	cancel()
+	if writeErr != nil {
+		writeErr = AsTimeout("github", "UpdateStatus", OpMutate, dls.For(OpMutate), writeErr)
+	}
+	return AfterMutation(ctx, g, dls, "github", "UpdateStatus", taskID, want, writeErr)
+}
+
+func (g *GitHubProvider) updateStatusOnce(ctx context.Context, taskID, state string) error {
+	url := fmt.Sprintf("https://api.github.com/repos/%s/%s/issues/%s", g.Owner, g.Repo, taskID)
 	payload := map[string]string{"state": state}
 	body, _ := json.Marshal(payload)
 
@@ -179,7 +257,7 @@ func (g *GitHubProvider) UpdateStatus(ctx context.Context, taskID string, status
 	}
 	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := g.Client.Do(req)
+	resp, err := g.httpClient().Do(req)
 	if err != nil {
 		return fmt.Errorf("failed to execute PATCH GitHub issue: %w", err)
 	}
@@ -190,20 +268,31 @@ func (g *GitHubProvider) UpdateStatus(ctx context.Context, taskID string, status
 		}
 		return err
 	}
-
-	got, gerr := g.GetTask(ctx, taskID)
-	if gerr != nil {
-		return fmt.Errorf("github status readback after write: %w", gerr)
-	}
-	// GitHub only exposes open/closed; map expectation to that surface.
-	want := StatusToDo
-	if state == "closed" {
-		want = StatusDone
-	}
-	return VerifyStatusReadback(taskID, want, got.Status)
+	return nil
 }
 
 func (g *GitHubProvider) AddComment(ctx context.Context, taskID string, body string) error {
+	dls := g.deadlines()
+	ctx, cancel := WithOpDeadline(ctx, dls, OpComment)
+	defer cancel()
+
+	err := g.addCommentOnce(ctx, taskID, body)
+	if err == nil {
+		return nil
+	}
+	err = AsTimeout("github", "AddComment", OpComment, dls.For(OpComment), err)
+	if IsTimeout(err) {
+		return &AmbiguousMutationError{
+			Provider: "github",
+			Op:       "AddComment",
+			TaskID:   taskID,
+			WriteErr: err,
+		}
+	}
+	return err
+}
+
+func (g *GitHubProvider) addCommentOnce(ctx context.Context, taskID, body string) error {
 	url := fmt.Sprintf("https://api.github.com/repos/%s/%s/issues/%s/comments", g.Owner, g.Repo, taskID)
 	payload := map[string]string{"body": body}
 	buf, _ := json.Marshal(payload)
@@ -219,7 +308,7 @@ func (g *GitHubProvider) AddComment(ctx context.Context, taskID string, body str
 	}
 	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := g.Client.Do(req)
+	resp, err := g.httpClient().Do(req)
 	if err != nil {
 		return fmt.Errorf("failed to execute POST GitHub comment: %w", err)
 	}

@@ -6,21 +6,45 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"time"
 )
 
 type LinearProvider struct {
-	APIKey  string
-	Client  *http.Client
-	BaseURL string
+	APIKey    string
+	Client    *http.Client
+	BaseURL   string
+	Deadlines Deadlines
+	Retry     RetryPolicy
 }
 
 func NewLinearProvider(apiKey string) *LinearProvider {
 	return &LinearProvider{
-		APIKey:  apiKey,
-		Client:  &http.Client{Timeout: 10 * time.Second},
-		BaseURL: "https://api.linear.app/graphql",
+		APIKey:    apiKey,
+		Client:    defaultHTTPClient(),
+		BaseURL:   "https://api.linear.app/graphql",
+		Deadlines: DefaultDeadlines(),
+		Retry:     DefaultReadRetry(),
 	}
+}
+
+func (l *LinearProvider) deadlines() Deadlines {
+	if l == nil {
+		return DefaultDeadlines()
+	}
+	return l.Deadlines.Normalize()
+}
+
+func (l *LinearProvider) readRetry() RetryPolicy {
+	if l == nil {
+		return DefaultReadRetry()
+	}
+	return l.Retry.normalize()
+}
+
+func (l *LinearProvider) httpClient() *http.Client {
+	if l != nil && l.Client != nil {
+		return l.Client
+	}
+	return defaultHTTPClient()
 }
 
 type linearGraphQLRequest struct {
@@ -60,7 +84,7 @@ func (l *LinearProvider) doGraphQL(ctx context.Context, query string, vars map[s
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", l.APIKey)
 
-	resp, err := l.Client.Do(req)
+	resp, err := l.httpClient().Do(req)
 	if err != nil {
 		return fmt.Errorf("failed to execute GraphQL request: %w", err)
 	}
@@ -78,6 +102,22 @@ func (l *LinearProvider) doGraphQL(ctx context.Context, query string, vars map[s
 }
 
 func (l *LinearProvider) GetTask(ctx context.Context, id string) (*Task, error) {
+	dls := l.deadlines()
+	ctx, cancel := WithOpDeadline(ctx, dls, OpGet)
+	defer cancel()
+	var task *Task
+	err := RetryRead(ctx, l.readRetry(), func(rctx context.Context) error {
+		t, e := l.getTaskOnce(rctx, id)
+		if e != nil {
+			return AsTimeout("linear", "GetTask", OpGet, dls.For(OpGet), e)
+		}
+		task = t
+		return nil
+	})
+	return task, err
+}
+
+func (l *LinearProvider) getTaskOnce(ctx context.Context, id string) (*Task, error) {
 	query := `query GetIssue($id: String!) { issue(id: $id) { id identifier title description priority state { name } project { id } labels { nodes { name } } } }`
 	var res struct {
 		Data struct {
@@ -120,6 +160,22 @@ func (l *LinearProvider) GetTask(ctx context.Context, id string) (*Task, error) 
 }
 
 func (l *LinearProvider) ListTasks(ctx context.Context, projectID string, status string) ([]*Task, error) {
+	dls := l.deadlines()
+	ctx, cancel := WithOpDeadline(ctx, dls, OpList)
+	defer cancel()
+	var tasks []*Task
+	err := RetryRead(ctx, l.readRetry(), func(rctx context.Context) error {
+		ts, e := l.listTasksOnce(rctx, projectID, status)
+		if e != nil {
+			return AsTimeout("linear", "ListTasks", OpList, dls.For(OpList), e)
+		}
+		tasks = ts
+		return nil
+	})
+	return tasks, err
+}
+
+func (l *LinearProvider) listTasksOnce(ctx context.Context, projectID string, status string) ([]*Task, error) {
 	query := `query { issues { nodes { id identifier title description priority state { name } project { id } labels { nodes { name } } } } }`
 	var res struct {
 		Data struct {
@@ -186,6 +242,17 @@ func (l *LinearProvider) ClaimTask(ctx context.Context, taskID string, role stri
 
 func (l *LinearProvider) UpdateStatus(ctx context.Context, taskID string, status string) error {
 	canonical := NormalizeStatus(status)
+	dls := l.deadlines()
+	writeCtx, cancel := WithOpDeadline(ctx, dls, OpMutate)
+	writeErr := l.updateStatusOnce(writeCtx, taskID, status)
+	cancel()
+	if writeErr != nil {
+		writeErr = AsTimeout("linear", "UpdateStatus", OpMutate, dls.For(OpMutate), writeErr)
+	}
+	return AfterMutation(ctx, l, dls, "linear", "UpdateStatus", taskID, canonical, writeErr)
+}
+
+func (l *LinearProvider) updateStatusOnce(ctx context.Context, taskID, status string) error {
 	query := `mutation UpdateIssueState($id: String!, $state: String!) { issueUpdate(id: $id, input: { stateId: $state }) { success } }`
 	var res struct {
 		Data struct {
@@ -194,17 +261,13 @@ func (l *LinearProvider) UpdateStatus(ctx context.Context, taskID string, status
 			} `json:"issueUpdate"`
 		} `json:"data"`
 	}
-	if err := l.doGraphQL(ctx, query, map[string]interface{}{"id": taskID, "state": status}, &res); err != nil {
-		return err
-	}
-	got, gerr := l.GetTask(ctx, taskID)
-	if gerr != nil {
-		return fmt.Errorf("linear status readback after write: %w", gerr)
-	}
-	return VerifyStatusReadback(taskID, canonical, got.Status)
+	return l.doGraphQL(ctx, query, map[string]interface{}{"id": taskID, "state": status}, &res)
 }
 
 func (l *LinearProvider) AddComment(ctx context.Context, taskID string, body string) error {
+	dls := l.deadlines()
+	ctx, cancel := WithOpDeadline(ctx, dls, OpComment)
+	defer cancel()
 	query := `mutation CreateComment($issueId: String!, $body: String!) { commentCreate(input: { issueId: $issueId, body: $body }) { success } }`
 	var res struct {
 		Data struct {
@@ -213,5 +276,13 @@ func (l *LinearProvider) AddComment(ctx context.Context, taskID string, body str
 			} `json:"commentCreate"`
 		} `json:"data"`
 	}
-	return l.doGraphQL(ctx, query, map[string]interface{}{"issueId": taskID, "body": body}, &res)
+	err := l.doGraphQL(ctx, query, map[string]interface{}{"issueId": taskID, "body": body}, &res)
+	if err == nil {
+		return nil
+	}
+	err = AsTimeout("linear", "AddComment", OpComment, dls.For(OpComment), err)
+	if IsTimeout(err) {
+		return &AmbiguousMutationError{Provider: "linear", Op: "AddComment", TaskID: taskID, WriteErr: err}
+	}
+	return err
 }

@@ -15,6 +15,8 @@ type AzureDevOpsProvider struct {
 	Project    string
 	PAT        string
 	HTTPClient *http.Client
+	Deadlines  Deadlines
+	Retry      RetryPolicy
 }
 
 type azureWorkItemDTO struct {
@@ -40,8 +42,31 @@ func NewAzureDevOpsProvider(orgURL, project, pat string) *AzureDevOpsProvider {
 		OrgURL:     orgURL,
 		Project:    project,
 		PAT:        pat,
-		HTTPClient: &http.Client{Timeout: 10 * time.Second},
+		HTTPClient: defaultHTTPClient(),
+		Deadlines:  DefaultDeadlines(),
+		Retry:      DefaultReadRetry(),
 	}
+}
+
+func (a *AzureDevOpsProvider) deadlines() Deadlines {
+	if a == nil {
+		return DefaultDeadlines()
+	}
+	return a.Deadlines.Normalize()
+}
+
+func (a *AzureDevOpsProvider) readRetry() RetryPolicy {
+	if a == nil {
+		return DefaultReadRetry()
+	}
+	return a.Retry.normalize()
+}
+
+func (a *AzureDevOpsProvider) client() *http.Client {
+	if a != nil && a.HTTPClient != nil {
+		return a.HTTPClient
+	}
+	return defaultHTTPClient()
 }
 
 func (a *AzureDevOpsProvider) doRequest(ctx context.Context, method, urlPath string, body interface{}, contentType string) ([]byte, error) {
@@ -65,7 +90,7 @@ func (a *AzureDevOpsProvider) doRequest(ctx context.Context, method, urlPath str
 	}
 	req.Header.Set("Content-Type", contentType)
 
-	resp, err := a.HTTPClient.Do(req)
+	resp, err := a.client().Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -118,6 +143,22 @@ func (a *AzureDevOpsProvider) mapAzureToTask(wi *azureWorkItemDTO) *Task {
 }
 
 func (a *AzureDevOpsProvider) GetTask(ctx context.Context, id string) (*Task, error) {
+	dls := a.deadlines()
+	ctx, cancel := WithOpDeadline(ctx, dls, OpGet)
+	defer cancel()
+	var task *Task
+	err := RetryRead(ctx, a.readRetry(), func(rctx context.Context) error {
+		t, e := a.getTaskOnce(rctx, id)
+		if e != nil {
+			return AsTimeout("azure", "GetTask", OpGet, dls.For(OpGet), e)
+		}
+		task = t
+		return nil
+	})
+	return task, err
+}
+
+func (a *AzureDevOpsProvider) getTaskOnce(ctx context.Context, id string) (*Task, error) {
 	data, err := a.doRequest(ctx, "GET", fmt.Sprintf("/_apis/wit/workitems/%s?api-version=7.0", id), nil, "")
 	if err != nil {
 		return nil, fmt.Errorf("azure GetTask failed: %w", err)
@@ -132,6 +173,22 @@ func (a *AzureDevOpsProvider) GetTask(ctx context.Context, id string) (*Task, er
 }
 
 func (a *AzureDevOpsProvider) ListTasks(ctx context.Context, projectID string, status string) ([]*Task, error) {
+	dls := a.deadlines()
+	ctx, cancel := WithOpDeadline(ctx, dls, OpList)
+	defer cancel()
+	var tasks []*Task
+	err := RetryRead(ctx, a.readRetry(), func(rctx context.Context) error {
+		ts, e := a.listTasksOnce(rctx, projectID, status)
+		if e != nil {
+			return AsTimeout("azure", "ListTasks", OpList, dls.For(OpList), e)
+		}
+		tasks = ts
+		return nil
+	})
+	return tasks, err
+}
+
+func (a *AzureDevOpsProvider) listTasksOnce(ctx context.Context, projectID string, status string) ([]*Task, error) {
 	query := fmt.Sprintf("SELECT [System.Id] FROM WorkItems WHERE [System.TeamProject] = '%s'", a.Project)
 	if status != "" {
 		query = fmt.Sprintf("%s AND [System.State] = '%s'", query, status)
@@ -150,7 +207,8 @@ func (a *AzureDevOpsProvider) ListTasks(ctx context.Context, projectID string, s
 
 	var tasks []*Task
 	for _, item := range wiqlResp.WorkItems {
-		t, err := a.GetTask(ctx, fmt.Sprintf("%d", item.ID))
+		// Use getTaskOnce to avoid nested outer Get deadlines under list.
+		t, err := a.getTaskOnce(ctx, fmt.Sprintf("%d", item.ID))
 		if err != nil {
 			// Fail-closed: partial hydration is not success.
 			return nil, fmt.Errorf("azure ListTasks hydrate work item %d: %w", item.ID, err)
@@ -167,6 +225,17 @@ func (a *AzureDevOpsProvider) ClaimTask(ctx context.Context, taskID string, role
 
 func (a *AzureDevOpsProvider) UpdateStatus(ctx context.Context, taskID string, status string) error {
 	canonical := NormalizeStatus(status)
+	dls := a.deadlines()
+	writeCtx, cancel := WithOpDeadline(ctx, dls, OpMutate)
+	writeErr := a.updateStatusOnce(writeCtx, taskID, status)
+	cancel()
+	if writeErr != nil {
+		writeErr = AsTimeout("azure", "UpdateStatus", OpMutate, dls.For(OpMutate), writeErr)
+	}
+	return AfterMutation(ctx, a, dls, "azure", "UpdateStatus", taskID, canonical, writeErr)
+}
+
+func (a *AzureDevOpsProvider) updateStatusOnce(ctx context.Context, taskID, status string) error {
 	patchBody := []map[string]interface{}{
 		{
 			"op":    "add",
@@ -178,14 +247,13 @@ func (a *AzureDevOpsProvider) UpdateStatus(ctx context.Context, taskID string, s
 	if err != nil {
 		return fmt.Errorf("azure UpdateStatus failed: %w", err)
 	}
-	got, gerr := a.GetTask(ctx, taskID)
-	if gerr != nil {
-		return fmt.Errorf("azure status readback after write: %w", gerr)
-	}
-	return VerifyStatusReadback(taskID, canonical, got.Status)
+	return nil
 }
 
 func (a *AzureDevOpsProvider) AddComment(ctx context.Context, taskID string, body string) error {
+	dls := a.deadlines()
+	ctx, cancel := WithOpDeadline(ctx, dls, OpComment)
+	defer cancel()
 	patchBody := []map[string]interface{}{
 		{
 			"op":    "add",
@@ -195,7 +263,12 @@ func (a *AzureDevOpsProvider) AddComment(ctx context.Context, taskID string, bod
 	}
 	_, err := a.doRequest(ctx, "PATCH", fmt.Sprintf("/_apis/wit/workitems/%s?api-version=7.0", taskID), patchBody, "application/json-patch+json")
 	if err != nil {
-		return fmt.Errorf("azure AddComment failed: %w", err)
+		err = fmt.Errorf("azure AddComment failed: %w", err)
+		err = AsTimeout("azure", "AddComment", OpComment, dls.For(OpComment), err)
+		if IsTimeout(err) {
+			return &AmbiguousMutationError{Provider: "azure", Op: "AddComment", TaskID: taskID, WriteErr: err}
+		}
+		return err
 	}
 	return nil
 }
