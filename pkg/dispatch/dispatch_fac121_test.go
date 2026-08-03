@@ -234,7 +234,9 @@ func testCfg() *config.Config {
 }
 
 func baseTask(ref string) *provider.Task {
-	return &provider.Task{ID: "1", Ref: ref, Title: "Task " + ref, Status: "to-do"}
+	// FAC-159: launch requires a Present versioned provenance fence (empty edges OK).
+	fence := "```herd-deps-v1\n{\"version\":1,\"task_ref\":\"" + ref + "\",\"edges\":[]}\n```\n"
+	return &provider.Task{ID: "1", Ref: ref, Title: "Task " + ref, Status: "to-do", Description: fence}
 }
 
 // --- tests -----------------------------------------------------------------

@@ -79,7 +79,8 @@ func TestPulse_TimeoutProjectsBlockedAndRefusesClaim(t *testing.T) {
 	tp := &timeoutProvider{
 		failAfter: 0, // first list times out
 		tasks: []*provider.Task{
-			{ID: "1", Ref: "FAC-1", Status: "to-do", Priority: provider.PriorityUrgent},
+			{ID: "1", Ref: "FAC-1", Status: "to-do", Priority: provider.PriorityUrgent,
+				Description: "```herd-deps-v1\n{\"version\":1,\"task_ref\":\"FAC-1\",\"edges\":[]}\n```\n"},
 		},
 	}
 	e := newTimeoutEngine(tp)
@@ -112,7 +113,7 @@ func TestForgeLoop_TimeoutBlockedRecoveringOK(t *testing.T) {
 	tp := &timeoutProvider{
 		failAfter: 0,
 		tasks: []*provider.Task{
-			{ID: "1", Ref: "FAC-1", Status: "to-do", Priority: provider.PriorityUrgent},
+			{ID: "1", Ref: "FAC-1", Status: "to-do", Priority: provider.PriorityUrgent, Description: "```herd-deps-v1\n{\"version\":1,\"task_ref\":\"FAC-1\",\"edges\":[]}\n```\n"},
 		},
 	}
 	e := newTimeoutEngine(tp)

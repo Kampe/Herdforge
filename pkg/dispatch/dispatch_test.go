@@ -52,7 +52,7 @@ func (m *mockTaskProvider) CreateRelation(_ context.Context, sourceID, targetID 
 	m.relations = append(m.relations, r)
 	return &r, nil
 }
-func (m *mockTaskProvider) DeleteRelation(_ context.Context, relationID string) error {
+func (m *mockTaskProvider) DeleteRelation(_ context.Context, relationID, sourceID, targetID string) error {
 	for i, r := range m.relations {
 		if r.ID == relationID {
 			m.relations = append(m.relations[:i], m.relations[i+1:]...)
@@ -89,11 +89,15 @@ func (m *mockWorktree) RepoRoot() string {
 	return "/nonexistent-mock-repo-root"
 }
 
+func emptyDepsFence(ref string) string {
+	return "```herd-deps-v1\n{\"version\":1,\"task_ref\":\"" + ref + "\",\"edges\":[]}\n```\n"
+}
+
 func TestFindTicket(t *testing.T) {
 	tp := &mockTaskProvider{
 		tasks: []*provider.Task{
-			{ID: "1", Ref: "FAC-1", Title: "First task", Status: "to-do", Priority: "high"},
-			{ID: "2", Ref: "FAC-2", Title: "Second task", Status: "to-do", Priority: "medium"},
+			{ID: "1", Ref: "FAC-1", Title: "First task", Status: "to-do", Priority: "high", Description: emptyDepsFence("FAC-1")},
+			{ID: "2", Ref: "FAC-2", Title: "Second task", Status: "to-do", Priority: "medium", Description: emptyDepsFence("FAC-2")},
 		},
 	}
 	cfg := &config.Config{
@@ -302,7 +306,7 @@ func TestDispatch_PackageCwdNotPolluted(t *testing.T) {
 
 	tp := &mockTaskProvider{
 		tasks: []*provider.Task{
-			{ID: "1", Ref: "FAC-1", Title: "First task", Status: "to-do", Priority: "high"},
+			{ID: "1", Ref: "FAC-1", Title: "First task", Status: "to-do", Priority: "high", Description: emptyDepsFence("FAC-1")},
 		},
 	}
 	cfg := &config.Config{

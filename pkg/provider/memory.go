@@ -134,7 +134,7 @@ func (m *MemoryProvider) ListRelations(ctx context.Context, taskID string) ([]Re
 	return out, nil
 }
 
-// CreateRelation implements RelationProvider with readback.
+// CreateRelation implements RelationProvider with dual-end readback.
 func (m *MemoryProvider) CreateRelation(ctx context.Context, sourceID, targetID string, typ RelationType) (*Relation, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -146,8 +146,21 @@ func (m *MemoryProvider) CreateRelation(ctx context.Context, sourceID, targetID 
 	if tgt == "" {
 		return nil, fmt.Errorf("task not found: %s", targetID)
 	}
+	if src == tgt {
+		return nil, fmt.Errorf("memory CreateRelation: self-edge rejected")
+	}
 	if typ == "" {
-		typ = RelationBlocks
+		return nil, fmt.Errorf("memory CreateRelation: type required")
+	}
+	if !ValidRelationType(typ) {
+		return nil, fmt.Errorf("memory CreateRelation: unknown type %q", typ)
+	}
+	// Idempotent: return existing.
+	for _, r := range m.relations {
+		if r.SourceTaskID == src && r.TargetTaskID == tgt && r.Type == typ {
+			cp := r
+			return &cp, nil
+		}
 	}
 	m.nextRel++
 	r := Relation{
@@ -158,25 +171,56 @@ func (m *MemoryProvider) CreateRelation(ctx context.Context, sourceID, targetID 
 		CreatedAt:    time.Now().UTC(),
 	}
 	m.relations[r.ID] = r
-	got, ok := m.relations[r.ID]
-	if !ok {
-		return nil, fmt.Errorf("memory CreateRelation readback missing")
+	// Dual-end presence check.
+	if !m.relOnTaskLocked(src, r.ID) || !m.relOnTaskLocked(tgt, r.ID) {
+		return nil, fmt.Errorf("memory CreateRelation dual readback failed")
 	}
+	got := m.relations[r.ID]
 	return &got, nil
 }
 
-// DeleteRelation implements RelationProvider with absence verification.
-func (m *MemoryProvider) DeleteRelation(ctx context.Context, relationID string) error {
+// DeleteRelation implements RelationProvider with dual-end absence verification.
+func (m *MemoryProvider) DeleteRelation(ctx context.Context, relationID, sourceID, targetID string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if _, ok := m.relations[relationID]; !ok {
-		return fmt.Errorf("relation not found: %s", relationID)
+	r, ok := m.relations[relationID]
+	if !ok {
+		// Already gone: verify both ends absent.
+		src := m.resolveIDLocked(sourceID)
+		tgt := m.resolveIDLocked(targetID)
+		if src != "" && m.relOnTaskLocked(src, relationID) {
+			return fmt.Errorf("memory DeleteRelation: missing map but present on source")
+		}
+		if tgt != "" && m.relOnTaskLocked(tgt, relationID) {
+			return fmt.Errorf("memory DeleteRelation: missing map but present on target")
+		}
+		return nil
+	}
+	src, tgt := r.SourceTaskID, r.TargetTaskID
+	if sourceID != "" {
+		if s := m.resolveIDLocked(sourceID); s != "" && s != src {
+			return fmt.Errorf("memory DeleteRelation: source endpoint mismatch")
+		}
+	}
+	if targetID != "" {
+		if t := m.resolveIDLocked(targetID); t != "" && t != tgt {
+			return fmt.Errorf("memory DeleteRelation: target endpoint mismatch")
+		}
 	}
 	delete(m.relations, relationID)
-	if _, ok := m.relations[relationID]; ok {
-		return fmt.Errorf("memory DeleteRelation readback still present")
+	if m.relOnTaskLocked(src, relationID) || m.relOnTaskLocked(tgt, relationID) {
+		return fmt.Errorf("memory DeleteRelation: still present after delete")
 	}
 	return nil
+}
+
+func (m *MemoryProvider) relOnTaskLocked(taskID, relationID string) bool {
+	for _, r := range m.relations {
+		if r.ID == relationID && (r.SourceTaskID == taskID || r.TargetTaskID == taskID) {
+			return true
+		}
+	}
+	return false
 }
 
 func (m *MemoryProvider) resolveIDLocked(idOrRef string) string {

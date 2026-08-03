@@ -6,22 +6,35 @@ import (
 	"strings"
 )
 
+// ReconcileOpts carries the authoritative full graph for cycle detection.
+type ReconcileOpts struct {
+	// FullClosure is the project-wide blocks graph. When nil, cycle detection
+	// is marked incomplete and Reconcile fails closed with unresolved cycle proof.
+	FullClosure []DependencyEdge
+	// ProviderRevision binds the snapshot used for GraphRevision.
+	ProviderRevision string
+	// RequireFullClosure when true (default for launch) fails if FullClosure is nil.
+	RequireFullClosure bool
+}
+
 // Reconcile compares desired structured edges against managed board edges for
-// a dependent task. Board edges that are blocks where target == taskRef are
-// inbound prerequisites; outbound blocks (task blocks others) are also managed
-// when present in desired.
+// a dependent task.
 //
-// Findings are sorted stably by (class, source_ref, target_ref, detail).
-func Reconcile(taskRef Ref, desired, board []DependencyEdge) *ReconcileReport {
+// Live extra managed edges are ALWAYS findings — even when desired is empty
+// (empty desired means "no declared deps", not "ignore board edges").
+//
+// Cycle detection requires opts.FullClosure (authoritative project snapshot);
+// a single-task listing cannot prove global acyclicity.
+func Reconcile(taskRef Ref, desired, board []DependencyEdge, opts ReconcileOpts) *ReconcileReport {
 	taskRef = Ref(strings.TrimSpace(string(taskRef)))
 	rep := &ReconcileReport{
-		TaskRef:  taskRef,
-		Desired:  compactEdges(desired),
-		ManagedBoard: compactEdges(filterInvolving(board, taskRef)),
-		OK:       true,
+		TaskRef:          taskRef,
+		Desired:          compactEdges(desired),
+		ManagedBoard:     compactEdges(filterInvolving(board, taskRef)),
+		ProviderRevision: opts.ProviderRevision,
+		OK:               true,
 	}
 
-	// Index board blocks by key; track duplicates and unresolved.
 	boardByKey := map[string][]DependencyEdge{}
 	boardBlocks := []DependencyEdge{}
 	for _, e := range rep.ManagedBoard {
@@ -60,7 +73,6 @@ func Reconcile(taskRef Ref, desired, board []DependencyEdge) *ReconcileReport {
 		}
 	}
 
-	// Desired blocks must exist on board (exact direction).
 	desiredByKey := map[string]DependencyEdge{}
 	for _, e := range rep.Desired {
 		if e.Type != EdgeBlocks {
@@ -93,7 +105,6 @@ func Reconcile(taskRef Ref, desired, board []DependencyEdge) *ReconcileReport {
 		}
 		desiredByKey[k] = e
 		if _, ok := boardByKey[k]; !ok {
-			// Reversed present?
 			if rev, rok := boardByKey[e.ReverseKey()]; rok && len(rev) > 0 {
 				rep.Findings = append(rep.Findings, Finding{
 					Class:      DriftReversed,
@@ -111,44 +122,50 @@ func Reconcile(taskRef Ref, desired, board []DependencyEdge) *ReconcileReport {
 		}
 	}
 
-	// Board blocks involving task that are not in desired (when desired non-empty)
-	// are "extra" managed edges needing matching provenance.
-	if len(desiredByKey) > 0 {
-		for _, e := range boardBlocks {
-			if _, ok := desiredByKey[e.Key()]; !ok {
-				// Skip if it's the reverse of a desired (already reported reversed).
-				if _, rev := desiredByKey[e.ReverseKey()]; rev {
-					continue
-				}
-				rep.Findings = append(rep.Findings, Finding{
-					Class:      DriftExtra,
-					Edge:       e,
-					Detail:     fmt.Sprintf("board blocks %s→%s has no structured provenance", e.SourceRef, e.TargetRef),
-					RelationID: e.RelationID,
-				})
+	// ALWAYS flag live managed edges lacking structured provenance — including
+	// when desired is empty (empty desired ≠ "accept all board edges").
+	for _, e := range boardBlocks {
+		if _, ok := desiredByKey[e.Key()]; !ok {
+			if _, rev := desiredByKey[e.ReverseKey()]; rev {
+				continue
 			}
+			rep.Findings = append(rep.Findings, Finding{
+				Class:      DriftExtra,
+				Edge:       e,
+				Detail:     fmt.Sprintf("board blocks %s→%s has no structured provenance", e.SourceRef, e.TargetRef),
+				RelationID: e.RelationID,
+			})
 		}
 	}
 
-	// Cycles among the union of desired + full board blocks (not only edges
-	// involving taskRef — cycles may close through third-party nodes).
-	allBoardBlocks := make([]DependencyEdge, 0, len(board))
-	for _, e := range board {
-		if e.Type == EdgeBlocks {
-			allBoardBlocks = append(allBoardBlocks, e)
-		}
-	}
-	if cycle := detectCycle(append(append([]DependencyEdge{}, allBoardBlocks...), edgesFromMap(desiredByKey)...)); cycle != "" {
+	// Global cycle detection requires full project closure.
+	if opts.RequireFullClosure && opts.FullClosure == nil {
 		rep.Findings = append(rep.Findings, Finding{
-			Class:  DriftCyclic,
-			Edge:   DependencyEdge{Type: EdgeBlocks, SourceRef: Ref(cycle), TargetRef: taskRef},
-			Detail: "cycle: " + cycle,
+			Class:  DriftUnresolved,
+			Edge:   DependencyEdge{Type: EdgeBlocks, TargetRef: taskRef},
+			Detail: "full graph snapshot required for cycle detection; single-task listing is insufficient",
 		})
+		rep.FullClosureUsed = false
+	} else if opts.FullClosure != nil {
+		rep.FullClosureUsed = true
+		all := append(append([]DependencyEdge{}, opts.FullClosure...), edgesFromMap(desiredByKey)...)
+		if cycle := detectCycle(all); cycle != "" {
+			rep.Findings = append(rep.Findings, Finding{
+				Class:  DriftCyclic,
+				Edge:   DependencyEdge{Type: EdgeBlocks, SourceRef: Ref(cycle), TargetRef: taskRef},
+				Detail: "cycle: " + cycle,
+			})
+		}
 	}
 
 	sortFindings(rep.Findings)
 	rep.OK = len(rep.Findings) == 0
-	rep.GraphRevision = GraphRevision(boardBlocks, nil)
+	// Revision over managed board + full closure IDs when available.
+	revEdges := boardBlocks
+	if opts.FullClosure != nil {
+		revEdges = opts.FullClosure
+	}
+	rep.GraphRevision = GraphRevision(revEdges, nil, opts.ProviderRevision)
 	return rep
 }
 
@@ -208,8 +225,6 @@ func sortFindings(f []Finding) {
 }
 
 // detectCycle returns a human cycle path string or "" if acyclic.
-// Edges are directed Source → Target meaning Source blocks Target
-// (edge direction for DFS: Target depends on Source, walk Source→Target).
 func detectCycle(edges []DependencyEdge) string {
 	adj := map[string][]string{}
 	nodes := map[string]bool{}
@@ -218,6 +233,10 @@ func detectCycle(edges []DependencyEdge) string {
 			continue
 		}
 		s, t := string(e.SourceRef), string(e.TargetRef)
+		if s == "" || t == "" {
+			// Prefer immutable IDs when refs missing.
+			s, t = string(e.SourceID), string(e.TargetID)
+		}
 		if s == "" || t == "" {
 			continue
 		}
@@ -253,7 +272,6 @@ func detectCycle(edges []DependencyEdge) string {
 		color[u] = black
 		return false
 	}
-	// Stable node order.
 	var order []string
 	for n := range nodes {
 		order = append(order, n)
@@ -262,7 +280,6 @@ func detectCycle(edges []DependencyEdge) string {
 	for _, n := range order {
 		if color[n] == white {
 			if dfs(n) {
-				// Extract cycle from stack.
 				idx := 0
 				for i, s := range stack {
 					if s == cycleStart {

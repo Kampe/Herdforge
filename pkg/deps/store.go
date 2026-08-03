@@ -18,6 +18,35 @@ var ErrUnresolvedRef = errors.New("deps: unresolved task ref")
 // ErrDeletedTask means a referenced task is missing/deleted on the board.
 var ErrDeletedTask = errors.New("deps: referenced task deleted or missing")
 
+// ErrMissingProvenance means launch was attempted without a versioned provenance record.
+var ErrMissingProvenance = errors.New("deps: missing structured provenance")
+
+// ErrUnsupportedProvenance means provenance version is not SchemaVersion.
+var ErrUnsupportedProvenance = errors.New("deps: unsupported provenance version")
+
+// ErrSelfEdge means create rejected a self-edge.
+var ErrSelfEdge = errors.New("deps: self-edge rejected")
+
+// ErrUnknownEdgeType means create saw an unknown relation type.
+var ErrUnknownEdgeType = errors.New("deps: unknown edge type")
+
+// ErrAmbiguousMutation means create/delete timed out or left indeterminate state;
+// callers must enter reconciliation and never treat as success.
+var ErrAmbiguousMutation = errors.New("deps: ambiguous relation mutation")
+
+// ErrClaimFence means ValidateClaim lacked a bound selection/provider revision.
+var ErrClaimFence = errors.New("deps: claim fence revision required")
+
+// ErrPostClaimDrift means the graph changed after the claim mutation.
+var ErrPostClaimDrift = errors.New("deps: post-claim graph drift (compensation required)")
+
+// GraphSnapshot is the authoritative full relation closure for cycle detection
+// and SHA-256 revision binding.
+type GraphSnapshot struct {
+	Edges            []DependencyEdge
+	ProviderRevision string
+}
+
 // RelationStore is the provider-neutral dependency surface.
 // Implementations must support list/create/delete with readback after mutation.
 // Providers without relation APIs must return ErrCapabilityUnsupported explicitly
@@ -31,12 +60,20 @@ type RelationStore interface {
 	// taskID is the immutable provider id (or ref when the adapter accepts refs).
 	ListRelations(ctx context.Context, taskID TaskID) ([]DependencyEdge, error)
 
-	// CreateRelation creates a directed edge and MUST read it back.
-	// Returns the edge with RelationID populated.
+	// SnapshotGraph returns the authoritative FULL relation closure for the
+	// project (not a single-task listing). Required for global cycle detection.
+	SnapshotGraph(ctx context.Context) (*GraphSnapshot, error)
+
+	// CreateRelation creates a directed edge and MUST read it back on both ends.
+	// Rejects self-edges and unknown types. Ambiguous create errors must be
+	// reconciled (existing edge returned) so retries cannot duplicate.
 	CreateRelation(ctx context.Context, edge DependencyEdge) (DependencyEdge, error)
 
-	// DeleteRelation deletes by provider relation id and verifies absence.
-	DeleteRelation(ctx context.Context, relationID string) error
+	// DeleteRelation deletes by provider relation id. Implementations MUST
+	// capture endpoints, delete, and verify absence on BOTH source and target
+	// list readbacks. Ambiguous delete/timeouts return ErrAmbiguousMutation
+	// (never success).
+	DeleteRelation(ctx context.Context, relationID string, sourceID, targetID TaskID) error
 
 	// ResolveRef maps a ticket ref to an immutable TaskID. Missing => ErrUnresolvedRef / ErrDeletedTask.
 	ResolveRef(ctx context.Context, ref Ref) (TaskID, error)
