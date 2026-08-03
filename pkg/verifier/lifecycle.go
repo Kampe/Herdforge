@@ -2,29 +2,110 @@ package verifier
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"strings"
 	"syscall"
+	"time"
 )
 
 // processGroupKiller SIGKILLs every member of a process group. The argument is
-// the group id (leader pid when Setpgid:true). Production Cancel uses this
-// while the leader is live; tests may replace it to mutation-prove that
-// group-wide reap (not leader-only kill) is required.
+// the group id (leader pid when Setpgid:true). Production Cancel and
+// ReapOwnedCmd use this; tests may replace it to mutation-prove that
+// group-wide kill (not leader-only) is required.
 var processGroupKiller = killProcessGroup
 
 func killProcessGroup(pgid int) error {
 	if pgid <= 0 {
+		return fmt.Errorf("kill process group: invalid pgid %d", pgid)
+	}
+	err := syscall.Kill(-pgid, syscall.SIGKILL)
+	if err == nil || isESRCH(err) {
 		return nil
 	}
-	return syscall.Kill(-pgid, syscall.SIGKILL)
+	return err
 }
 
-// reapProcessGroup SIGKILLs the entire process group via processGroupKiller.
+// KillProcessGroup is the production group-wide SIGKILL primitive. It returns
+// nil when the group is already gone (ESRCH).
+func KillProcessGroup(pgid int) error {
+	return processGroupKiller(pgid)
+}
+
+// processGroupGoneBound is how long ReapOwnedCmd polls for the process group
+// to empty after SIGKILL+Wait. Orphaned zombies can keep kill(-pgid,0)==nil
+// until init reaps them; this bound is a fail-closed ownership gate, not a
+// cancel/cleanup sleep.
+const processGroupGoneBound = 2 * time.Second
+
+// ReapOwnedCmd is the production ownership close for a started verification
+// subprocess: full process-group SIGKILL, Wait on the leader, then verify the
+// group has no remaining members (grandchildren included). Errors are returned
+// and must not be ignored by callers.
+//
+// Cancel paths that run under cmd.Wait must only call KillProcessGroup (not
+// this function) to avoid double-Wait; ReapOwnedCmd is for fail-safe close
+// when the caller owns the Wait (e.g. ctx already done after Start).
+func ReapOwnedCmd(cmd *exec.Cmd) error {
+	if cmd == nil || cmd.Process == nil {
+		return errors.New("reap owned cmd: nil process")
+	}
+	pgid := cmd.Process.Pid
+	if err := processGroupKiller(pgid); err != nil {
+		return fmt.Errorf("reap owned cmd: kill process group %d: %w", pgid, err)
+	}
+	waitErr := cmd.Wait()
+	if cmd.ProcessState == nil {
+		return fmt.Errorf("reap owned cmd: wait returned without ProcessState: %v", waitErr)
+	}
+	// Group-wide liveness: any remaining member (including grandchildren) keeps
+	// kill(-pgid, 0) succeeding. Leader-only kill fails this check. Poll until
+	// the group is empty so transient zombies after SIGKILL do not false-fail
+	// a correct group kill; a surviving live member fails closed at the bound.
+	deadline := time.Now().Add(processGroupGoneBound)
+	var lastProbe error
+	for {
+		lastProbe = syscall.Kill(-pgid, 0)
+		if lastProbe != nil && isESRCH(lastProbe) {
+			break
+		}
+		if time.Now().After(deadline) {
+			_ = processGroupKiller(pgid)
+			if lastProbe == nil {
+				return fmt.Errorf("reap owned cmd: process group %d still has live members after kill+wait", pgid)
+			}
+			return fmt.Errorf("reap owned cmd: probe process group %d: %w", pgid, lastProbe)
+		}
+		// Re-signal in case a late fork raced the first group kill.
+		_ = processGroupKiller(pgid)
+		time.Sleep(time.Millisecond)
+	}
+	if waitErr != nil && !isExpectedKillWait(waitErr) {
+		return fmt.Errorf("reap owned cmd: wait after group kill: %w", waitErr)
+	}
+	return nil
+}
+
+// reapProcessGroup is a best-effort kill used only where Wait is owned
+// elsewhere (CommandContext Cancel). Prefer ReapOwnedCmd when the caller
+// owns Wait. Errors are discarded only at this thin adapter; production
+// Cancel surfaces KillProcessGroup errors via the Cancel return value.
 func reapProcessGroup(pgid int) {
 	_ = processGroupKiller(pgid)
+}
+
+func isESRCH(err error) bool {
+	return err != nil && (errors.Is(err, syscall.ESRCH) || err == syscall.ESRCH)
+}
+
+func isExpectedKillWait(err error) bool {
+	if err == nil {
+		return true
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "signal") || strings.Contains(msg, "kill") || strings.Contains(msg, "killed")
 }
 
 // hermeticGitConfig is prepended to every git argv. These flags stop git from
@@ -75,7 +156,7 @@ func hermeticGitEnv() []string {
 // hermeticGitCommand builds a git subprocess that:
 //   - cannot inherit ambient global/system config writers
 //   - cannot auto-detach gc/maintenance/fsmonitor into dir/.git
-//   - runs in its own process group so Cancel can reap the group
+//   - runs in its own process group so Cancel/ReapOwnedCmd can reap the group
 func hermeticGitCommand(dir string, args ...string) *exec.Cmd {
 	full := make([]string, 0, len(hermeticGitConfig)+len(args))
 	full = append(full, hermeticGitConfig...)

@@ -2,7 +2,6 @@ package verifier
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -82,6 +81,7 @@ func startLateWriterFixture(t *testing.T) *lateWriterFixture {
 }
 
 // shutdown is leak-safe cleanup for all paths (including early Fatal via t.Cleanup).
+// Uses production ReapOwnedCmd so test cleanup cannot ignore kill/Wait/group errors.
 func (f *lateWriterFixture) shutdown() {
 	if f == nil {
 		return
@@ -92,20 +92,18 @@ func (f *lateWriterFixture) shutdown() {
 		}
 		f.sealed = false
 	}
-	if f.started && !f.reaped && f.pgid > 0 {
-		if err := processGroupKiller(f.pgid); err != nil && !isESRCH(err) {
-			f.t.Errorf("shutdown reap pgid %d: %v", f.pgid, err)
-		}
-		if f.cmd != nil && f.cmd.Process != nil {
-			if err := f.cmd.Wait(); err != nil && !isExpectedKillWait(err) {
-				f.t.Errorf("shutdown wait: %v (stderr=%q)", err, f.stderr.String())
+	if f.started && !f.reaped {
+		if err := ReapOwnedCmd(f.cmd); err != nil {
+			// Last-resort group kill if production reap failed mid-path.
+			if f.pgid > 0 {
+				_ = killProcessGroup(f.pgid)
 			}
+			f.t.Errorf("shutdown ReapOwnedCmd: %v (stderr=%q)", err, f.stderr.String())
 		}
 		f.reaped = true
 	}
 	if f.root != "" {
 		if err := os.RemoveAll(f.root); err != nil && !os.IsNotExist(err) {
-			// Unseal once more if still sealed permission issues.
 			_ = unsealGitDirAfterReap(f.gitDir)
 			if err2 := os.RemoveAll(f.root); err2 != nil && !os.IsNotExist(err2) {
 				f.t.Errorf("shutdown RemoveAll: %v", err2)
@@ -122,26 +120,18 @@ func (f *lateWriterFixture) seal() {
 	f.sealed = true
 }
 
+// reapAndWait closes ownership via production ReapOwnedCmd (full-group kill +
+// Wait + group-gone probe). Errors are never ignored.
 func (f *lateWriterFixture) reapAndWait() {
 	f.t.Helper()
 	if f.reaped {
 		return
 	}
-	if err := processGroupKiller(f.pgid); err != nil && !isESRCH(err) {
-		f.t.Fatalf("reap process group %d: %v", f.pgid, err)
+	if err := ReapOwnedCmd(f.cmd); err != nil {
+		f.t.Fatalf("production ReapOwnedCmd: %v (stderr=%q)", err, f.stderr.String())
 	}
-	if f.cmd == nil || f.cmd.Process == nil {
-		f.t.Fatal("reap: nil process")
-	}
-	waitErr := f.cmd.Wait()
-	if waitErr != nil && !isExpectedKillWait(waitErr) {
-		f.t.Fatalf("wait after reap: %v (stderr=%q)", waitErr, f.stderr.String())
-	}
-	if f.cmd.ProcessState == nil {
-		f.t.Fatal("wait after reap: missing ProcessState")
-	}
-	if err := waitForPIDGone(f.pgid, 2*time.Second); err != nil {
-		f.t.Fatalf("pgid %d still present after reap+wait: %v", f.pgid, err)
+	if err := waitForProcessGroupGone(f.pgid, 2*time.Second); err != nil {
+		f.t.Fatalf("process group %d still live after ReapOwnedCmd: %v", f.pgid, err)
 	}
 	f.reaped = true
 }
@@ -154,17 +144,23 @@ func (f *lateWriterFixture) unseal() {
 	f.sealed = false
 }
 
-func isESRCH(err error) bool {
-	return err != nil && errors.Is(err, syscall.ESRCH)
-}
-
-func isExpectedKillWait(err error) bool {
-	if err == nil {
-		return true
+// waitForProcessGroupGone proves no member of the process group remains
+// (grandchildren included). Leader-only ESRCH is not sufficient.
+func waitForProcessGroupGone(pgid int, bound time.Duration) error {
+	deadline := time.Now().Add(bound)
+	for {
+		err := syscall.Kill(-pgid, 0)
+		if err != nil && isESRCH(err) {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			if err == nil {
+				return fmt.Errorf("process group %d still has live members after diagnostic bound", pgid)
+			}
+			return fmt.Errorf("process group %d probe after bound: %w", pgid, err)
+		}
+		time.Sleep(time.Millisecond)
 	}
-	// SIGKILL / signal: killed are expected after process-group reap.
-	msg := err.Error()
-	return strings.Contains(msg, "signal") || strings.Contains(msg, "kill") || strings.Contains(msg, "killed")
 }
 
 // waitForWriterReady is an explicit boundary handshake on readyPath contents.
@@ -189,7 +185,8 @@ func waitForWriterReady(readyPath string, pgid int, bound time.Duration) error {
 }
 
 // TestLateWriterIntoGitRequiresExplicitReap: hard pre-reap RemoveAll failure,
-// post-reap success, explicit ready handshake, no ignored kill/Wait/RemoveAll.
+// post-reap success via production ReapOwnedCmd, ready handshake, no ignored
+// kill/Wait/RemoveAll errors.
 func TestLateWriterIntoGitRequiresExplicitReap(t *testing.T) {
 	f := startLateWriterFixture(t)
 
@@ -200,24 +197,24 @@ func TestLateWriterIntoGitRequiresExplicitReap(t *testing.T) {
 	if preErr == nil {
 		t.Fatal("pre-fix: os.RemoveAll must return an error while sealed under unreaped ownership")
 	}
-	if err := syscall.Kill(f.pgid, 0); err != nil {
-		t.Fatalf("unreaped writer must remain live after failed RemoveAll: %v (stderr=%q)", err, f.stderr.String())
+	if err := syscall.Kill(-f.pgid, 0); err != nil {
+		t.Fatalf("unreaped process group must remain live after failed RemoveAll: %v (stderr=%q)", err, f.stderr.String())
 	}
 
-	// FIX: reap + wait + unseal, then RemoveAll must succeed.
+	// FIX: production ReapOwnedCmd + unseal, then RemoveAll must succeed.
 	f.reapAndWait()
 	f.unseal()
 	if err := os.RemoveAll(f.root); err != nil {
-		t.Fatalf("post-fix: os.RemoveAll must succeed after reap+wait+unseal: %v", err)
+		t.Fatalf("post-fix: os.RemoveAll must succeed after ReapOwnedCmd+unseal: %v", err)
 	}
-	if err := syscall.Kill(f.pgid, 0); err == nil {
-		t.Fatalf("process group %d still live after reap+Wait", f.pgid)
+	if err := syscall.Kill(-f.pgid, 0); err == nil {
+		t.Fatalf("process group %d still live after production ReapOwnedCmd", f.pgid)
 	}
 	// Root is gone; prevent shutdown RemoveAll noise.
 	f.root = ""
 }
 
-// TestLateWriterCleanupMutationOmittingReapStillFails: omit reap/wait/unseal
+// TestLateWriterCleanupMutationOmittingReapStillFails: omit ReapOwnedCmd/unseal
 // and assert RemoveAll still fails (non-vacuous negative guard).
 func TestLateWriterCleanupMutationOmittingReapStillFails(t *testing.T) {
 	f := startLateWriterFixture(t)
@@ -227,18 +224,18 @@ func TestLateWriterCleanupMutationOmittingReapStillFails(t *testing.T) {
 		t.Fatal("control: sealed unreaped tree must make os.RemoveAll fail")
 	}
 
-	// MUTATION of the fix path: no reapAndWait, no unseal.
+	// MUTATION of the fix path: no ReapOwnedCmd, no unseal.
 	mutErr := os.RemoveAll(f.root)
 	if mutErr == nil {
-		t.Fatal("mutation: omitting reap/wait/unseal must leave os.RemoveAll failing; got nil")
+		t.Fatal("mutation: omitting ReapOwnedCmd/unseal must leave os.RemoveAll failing; got nil")
 	}
-	if err := syscall.Kill(f.pgid, 0); err != nil {
-		t.Fatalf("mutation: writer must still be live without reap: %v", err)
+	if err := syscall.Kill(-f.pgid, 0); err != nil {
+		t.Fatalf("mutation: process group must still be live without reap: %v", err)
 	}
-	// Fixture cleanup via t.Cleanup reaps/unseals/removes — no leak.
+	// Fixture cleanup via t.Cleanup → ReapOwnedCmd/unseal/RemoveAll — no leak.
 }
 
-// TestProcessGroupReapAllowsTempDirCleanup: seal fail → reap+unseal success.
+// TestProcessGroupReapAllowsTempDirCleanup: seal fail → ReapOwnedCmd+unseal success.
 func TestProcessGroupReapAllowsTempDirCleanup(t *testing.T) {
 	f := startLateWriterFixture(t)
 	f.seal()
@@ -251,6 +248,112 @@ func TestProcessGroupReapAllowsTempDirCleanup(t *testing.T) {
 		t.Fatalf("post-reap: os.RemoveAll must succeed: %v", err)
 	}
 	f.root = ""
+}
+
+// grandchildGroupScript: leader backgrounds a real nested sh (not a shell
+// function — $$ in functions is the parent shell on bash/zsh) that writes its
+// own pid then parks. Production ReapOwnedCmd must kill leader + grandchild.
+const grandchildGroupScript = `sh -c 'printf "%s\n" "$$" > "$1"; exec sleep 3600' grandchild "$1" & wait`
+
+// startGrandchildGroup starts a Setpgid shell with a live grandchild and
+// returns (cmd, leaderPgid, grandchildPid). Caller must ReapOwnedCmd or kill.
+func startGrandchildGroup(t *testing.T) (cmd *exec.Cmd, pgid int, grandchild int) {
+	t.Helper()
+	ready := filepath.Join(t.TempDir(), "grandchild.pid")
+	cmd = exec.Command("sh", "-c", grandchildGroupScript, "group-leader", ready)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start grandchild group: %v", err)
+	}
+	pgid = cmd.Process.Pid
+	t.Cleanup(func() {
+		// Leak-safe: production reap if still unreaped.
+		if cmd.ProcessState == nil && cmd.Process != nil {
+			if err := ReapOwnedCmd(cmd); err != nil {
+				_ = killProcessGroup(pgid)
+				t.Errorf("cleanup ReapOwnedCmd: %v", err)
+			}
+		} else if pgid > 0 {
+			_ = killProcessGroup(pgid)
+		}
+	})
+	gc, err := waitForChildReadyPID(ready, 5*time.Second)
+	if err != nil {
+		t.Fatalf("grandchild ready: %v", err)
+	}
+	if err := syscall.Kill(gc, 0); err != nil {
+		t.Fatalf("grandchild %d not live after ready: %v", gc, err)
+	}
+	if err := syscall.Kill(-pgid, 0); err != nil {
+		t.Fatalf("process group %d not live after ready: %v", pgid, err)
+	}
+	return cmd, pgid, gc
+}
+
+// TestReapOwnedCmdKillsGrandchildren is the production-load-bearing positive
+// proof: ReapOwnedCmd (kill process group + Wait + group-gone probe) must
+// extinguish the leader and a ready grandchild. This is not a fake cleaner —
+// it exercises the same primitive execute() uses after Start when ctx is done.
+func TestReapOwnedCmdKillsGrandchildren(t *testing.T) {
+	cmd, pgid, grandchild := startGrandchildGroup(t)
+
+	if err := ReapOwnedCmd(cmd); err != nil {
+		t.Fatalf("production ReapOwnedCmd: %v", err)
+	}
+	if err := waitForProcessGroupGone(pgid, 2*time.Second); err != nil {
+		t.Fatalf("after ReapOwnedCmd: %v", err)
+	}
+	if err := syscall.Kill(grandchild, 0); err == nil {
+		t.Fatalf("grandchild %d still live after production ReapOwnedCmd", grandchild)
+	}
+	if cmd.ProcessState == nil {
+		t.Fatal("ReapOwnedCmd must Wait the leader (ProcessState set)")
+	}
+}
+
+// TestReapOwnedCmdLeaderOnlyMutationFailsClosed is production-load-bearing:
+// injecting a leader-only killer must make ReapOwnedCmd return a non-nil error
+// because the group-gone probe sees the surviving grandchild. A leader-only
+// liveness check would falsely pass.
+func TestReapOwnedCmdLeaderOnlyMutationFailsClosed(t *testing.T) {
+	cmd, pgid, grandchild := startGrandchildGroup(t)
+
+	prev := processGroupKiller
+	processGroupKiller = func(id int) error {
+		if id <= 0 {
+			return fmt.Errorf("kill process group: invalid pgid %d", id)
+		}
+		// MUTATION: kill leader only — leaves grandchildren in the group.
+		return syscall.Kill(id, syscall.SIGKILL)
+	}
+	t.Cleanup(func() { processGroupKiller = prev })
+
+	reapErr := ReapOwnedCmd(cmd)
+	if reapErr == nil {
+		// If the OS reaped the grandchild with the leader (unlikely), the
+		// mutation cannot load-bear; force-fail so the test is non-vacuous.
+		if err := syscall.Kill(grandchild, 0); err == nil {
+			t.Fatal("mutation: ReapOwnedCmd returned nil while grandchild still live")
+		}
+		t.Fatal("mutation: leader-only kill must make ReapOwnedCmd fail closed (group still live or probe error); got nil")
+	}
+	if !strings.Contains(reapErr.Error(), "still has live members") &&
+		!strings.Contains(reapErr.Error(), "process group") {
+		t.Fatalf("mutation: want group-liveness failure, got %v", reapErr)
+	}
+
+	// Grandchild must still be alive — proves leader-only is insufficient.
+	if err := syscall.Kill(grandchild, 0); err != nil {
+		t.Fatalf("mutation expected grandchild %d to survive leader-only kill: %v", grandchild, err)
+	}
+	// Production killer restored for cleanup; extinguish orphaned members.
+	processGroupKiller = prev
+	if err := killProcessGroup(pgid); err != nil && !isESRCH(err) {
+		t.Fatalf("post-mutation group kill: %v", err)
+	}
+	if err := waitForProcessGroupGone(pgid, 2*time.Second); err != nil {
+		t.Fatalf("post-mutation cleanup: %v", err)
+	}
 }
 
 // TestHermeticGitConfigFlagsReachGit is the non-vacuous coverage for

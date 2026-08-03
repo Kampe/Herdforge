@@ -593,12 +593,18 @@ func TestExecuteCancellationRequiresProcessGroupReap(t *testing.T) {
 		t.Fatal(out.err)
 	}
 	// Leader-only kill leaves the descendant alive — mutation proof.
+	// Group probe would also see survivors; leader ESRCH alone is insufficient.
 	if err := syscall.Kill(pid, 0); err != nil {
 		t.Fatalf("mutation expected descendant %d to survive leader-only kill; got %v", pid, err)
 	}
-	// Explicit test-side reap of the orphaned group member so TempDir cleanup
-	// does not race a live writer (production path uses group kill).
-	_ = syscall.Kill(pid, syscall.SIGKILL)
+	// Explicit kill of the orphaned descendant so TempDir cleanup does not race
+	// a live writer. (pid is the descendant, not the process-group id.)
+	if err := syscall.Kill(pid, syscall.SIGKILL); err != nil && !isESRCH(err) {
+		t.Fatalf("mutation cleanup kill descendant %d: %v", pid, err)
+	}
+	if err := waitForPIDGone(pid, 2*time.Second); err != nil {
+		t.Fatalf("mutation cleanup: descendant %d still live: %v", pid, err)
+	}
 }
 
 // TestExecuteCancellationReadyBarrierSelectorRuns proves waitForChildReadyPID

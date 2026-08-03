@@ -184,15 +184,15 @@ func (v *Verifier) execute(ctx context.Context, dir string, policy EnvironmentPo
 	cmd := exec.CommandContext(ctx, commandPath, v.Argv[1:]...)
 	cmd.Dir = dir
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	// Cancel reaps the whole process group while the leader is still live.
-	// Group-wide kill is required: leader-only kill leaves shell grandchildren
-	// running (see TestExecuteCancellationRequiresProcessGroupReap).
-	// No post-Wait kill: that re-introduces PID-reuse hazard; Cancel is enough.
+	// Cancel only SIGKILLs the full process group while Wait is in flight.
+	// Group-wide kill is required (leader-only leaves grandchildren).
+	// ReapOwnedCmd (kill+Wait) is used for fail-safe close after Start when
+	// the caller owns Wait — never double-Wait inside Cancel.
 	cmd.Cancel = func() error {
 		if cmd.Process == nil {
 			return nil
 		}
-		return processGroupKiller(cmd.Process.Pid)
+		return KillProcessGroup(cmd.Process.Pid)
 	}
 	if policy == EnvironmentPolicyHermetic {
 		cmd.Env = commandEnv
@@ -213,6 +213,23 @@ func (v *Verifier) execute(ctx context.Context, dir string, policy EnvironmentPo
 		// Result, not a bare error — RunMutationCheckForCandidate relies on
 		// (result, nil) so the restore defer still records Restored evidence.
 		output := []byte(err.Error())
+		return &Result{
+			Outcome:      OutcomeBLOCKED,
+			Output:       boundedOutput(output),
+			OutputDigest: digestBytes(output),
+			ExitCode:     -1,
+			Duration:     time.Since(started),
+		}, nil
+	}
+	// Immediate fail-safe: if ctx is already done after Start, close ownership
+	// with production ReapOwnedCmd (full-group kill + Wait) before returning.
+	if ctx.Err() != nil {
+		reapErr := ReapOwnedCmd(cmd)
+		msg := ctx.Err().Error()
+		if reapErr != nil {
+			msg += "\n" + reapErr.Error()
+		}
+		output := []byte(msg)
 		return &Result{
 			Outcome:      OutcomeBLOCKED,
 			Output:       boundedOutput(output),
