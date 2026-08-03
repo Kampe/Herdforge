@@ -306,6 +306,7 @@ func Refresh(ledger *Ledger, surface string, budget5h, budgetWeekly, ttl int, em
 				if strings.EqualFold(a.Email, activeEmail) {
 					rec.Accounts[i].UsedPct = pctWeek
 					rec.Accounts[i].Updated = NowEpoch()
+					rec.Accounts[i].Source = "ccusage"
 					if hourlyDead == 1 {
 						rec.Accounts[i].ExhaustedUntil = untilEpoch
 					} else {
@@ -322,6 +323,7 @@ func Refresh(ledger *Ledger, surface string, budget5h, budgetWeekly, ttl int, em
 					UsedPct:   pctWeek,
 					BurnOrder: bo,
 					Updated:   NowEpoch(),
+					Source:    "ccusage",
 				}
 				if hourlyDead == 1 {
 					acct.ExhaustedUntil = untilEpoch
@@ -796,13 +798,21 @@ func (lc *LedgerCommands) Advise() string {
 					if p.Reason != "ok" && p.Reason != "exhausted" {
 						continue
 					}
+					used, usedOK := parseQuotaInt(p.Used)
+					if !usedOK {
+						// invalid live data must not suppress the fail-closed fallback
+						continue
+					}
+					if p.Remaining == nil {
+						// remaining is required for a live row
+						continue
+					}
+					left, remOK := parseQuotaInt(p.Remaining)
+					if !remOK {
+						continue
+					}
 					liveProviders[normalizeProviderKey(prov)] = true
 
-					used, _ := parseQuotaInt(p.Used)
-					left := 100 - used
-					if left < 0 {
-						left = 0
-					}
 					resetsStr := ""
 					if p.ResetsIn != nil {
 						if s, ok := p.ResetsIn.(string); ok {
@@ -877,6 +887,10 @@ func (lc *LedgerCommands) Advise() string {
 	return out.String()
 }
 
+func jqNumber(f float64) string {
+	return strconv.FormatFloat(f, 'f', -1, 64)
+}
+
 func (lc *LedgerCommands) AccountList(surface string) string {
 	rec, err := lc.Ledger.Surface(surface)
 	if err != nil {
@@ -889,7 +903,7 @@ func (lc *LedgerCommands) AccountList(surface string) string {
 	SortAccountsByBurnOrder(rec.Accounts)
 	var out strings.Builder
 	eff := EffectiveUsed(rec)
-	out.WriteString(fmt.Sprintf("%s: multi-account N=%d effective=%.0f%%\n", surface, len(rec.Accounts), eff))
+	out.WriteString(fmt.Sprintf("%s: multi-account N=%d effective=%s%%\n", surface, len(rec.Accounts), jqNumber(eff)))
 
 	for _, a := range rec.Accounts {
 		untilStr := ""
