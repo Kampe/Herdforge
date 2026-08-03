@@ -58,6 +58,8 @@ type StepRecord struct {
 	PaneID    string
 	AgentName string
 	Receipt   string // prompt sequence token when step is prompt
+	MessageID string // durable control envelope identity
+	Sequence  int64  // durable mailbox sequence
 }
 
 // HerdrLauncher isolates herdr operations for crash-point tests (FAC-121).
@@ -91,6 +93,21 @@ func (LiveHerdr) DeliverAndProve(target, text string, timeout time.Duration) (*h
 func (LiveHerdr) TabClose(tabID string) error { return herdr.TabClose(tabID) }
 func (LiveHerdr) ResolveHealthyModel(ctx context.Context, primary string, fallbacks []string) (string, []herdr.ProbeResult) {
 	return herdr.ResolveHealthyModel(ctx, primary, fallbacks)
+}
+
+// ValidateControlTarget binds a wake to the exact tab/pane/agent returned by
+// AgentStart.  A label alone is not a stable Herdr destination.
+func (LiveHerdr) ValidateControlTarget(target control.WakeTarget) error {
+	agents, err := herdr.AgentList()
+	if err != nil {
+		return err
+	}
+	for _, a := range agents {
+		if a.TabID == target.TabID && a.PaneID == target.PaneID && a.Name == target.AgentName {
+			return nil
+		}
+	}
+	return fmt.Errorf("launched Herdr tab/pane/agent is no longer current")
 }
 
 type DispatchOptions struct {
@@ -155,7 +172,7 @@ type Dispatcher struct {
 	// every repair prompt is persisted before Herdr is nudged.
 	Orders         *control.CoordinatorOrders
 	Production     bool
-	ControlFactory func(context.Context, control.LaneIdentity, string) (*control.CoordinatorOrders, error)
+	ControlFactory func(context.Context, ControlScope) (*control.CoordinatorOrders, error)
 	// Herdr is optional; defaults to LiveHerdr.
 	Herdr HerdrLauncher
 	// PromptVerifyTimeout overrides the delivery poll window.
@@ -169,6 +186,14 @@ type Dispatcher struct {
 
 	// health projects BLOCKED(provider_timeout) for board calls (FAC-150).
 	health dispatchHealth
+}
+
+// ControlScope is constructed after AgentStart, so each order is bound to the
+// exact task-scoped lease and launched Herdr identity.
+type ControlScope struct {
+	Identity control.LaneIdentity
+	Wake     control.WakeTarget
+	Check    func(context.Context, control.Order) error
 }
 
 func NewDispatcher(cfg *config.Config, tp provider.TaskProvider, wm *worktree.WorktreeManager) *Dispatcher {
@@ -512,7 +537,7 @@ func (d *Dispatcher) Dispatch(ctx context.Context, opts DispatchOptions) (*Dispa
 	// once via failOwned while the generation lease is still held.
 	h := d.launcher()
 	if !opts.NoLaunch && h.Available() {
-		if err := d.launch(ctx, opts, task, lane, wtInfo, branch, packet, result); err != nil {
+		if err := d.launch(ctx, opts, task, lane, wtInfo, branch, packet, result, tok); err != nil {
 			reason := "agent_launch_failed"
 			var lf *launchFailure
 			if errors.As(err, &lf) && lf.Reason != "" {
@@ -567,6 +592,7 @@ func (d *Dispatcher) launch(
 	wtInfo *worktree.WorktreeInfo,
 	branch, packet string,
 	result *DispatchResult,
+	tok *deps.OwnershipToken,
 ) error {
 	// Launch does not own shared lifecycle compensation. requireCompensator is
 	// enforced by Dispatch before side effects; record() still needs the hook.
@@ -664,23 +690,78 @@ func (d *Dispatcher) launch(
 		timeout = 60 * time.Second
 	}
 
-	if d.Production {
-		identity := control.LaneIdentity{Repository: d.Worktree.RepoRoot(), TaskRef: task.Ref, Lane: lane.Name, LeaseGeneration: result.LeaseGeneration, CandidateSHA: opts.Decision.CandidateSHA}
-		orders, orderErr := d.ControlFactory(ctx, identity, lane.Name)
-		if orderErr != nil {
-			return &launchFailure{Reason: "control_factory_failed", Err: closeTabLocal(h, tab.ID, "control_factory_failed", orderErr)}
+	repository := ""
+	if d.Config != nil {
+		repository = d.Config.Project.Name
+	}
+	identity := control.LaneIdentity{Repository: repository, TaskRef: task.Ref, Lane: lane.Name, LeaseGeneration: result.LeaseGeneration, CandidateSHA: wtInfo.BaseSHA}
+	if identity.Repository == "" || identity.CandidateSHA == "" {
+		identity.Repository = repository
+		identity.CandidateSHA = opts.Decision.CandidateSHA
+	}
+	wakeTarget := control.WakeTarget{Target: tabLabel, TabID: tab.ID, PaneID: tab.Pane.ID, AgentName: tabLabel, LeaseGeneration: result.LeaseGeneration}
+	check := func(checkCtx context.Context, o control.Order) error {
+		if o.LaneIdentity != identity {
+			return control.ErrStaleIdentity
 		}
-		if _, orderErr := orders.Repair(ctx, packet); orderErr != nil {
+		if d.Ownership == nil {
+			return fmt.Errorf("control: live ownership authority is required")
+		}
+		owned, err := d.Ownership.StillOwns(checkCtx, tok)
+		if err != nil {
+			return err
+		}
+		if !owned {
+			return control.ErrStaleIdentity
+		}
+		return nil
+	}
+	if verifier, ok := h.(interface {
+		ValidateControlTarget(control.WakeTarget) error
+	}); ok {
+		if err := verifier.ValidateControlTarget(wakeTarget); err != nil && d.Production {
+			return &launchFailure{Reason: "control_target_drift", Err: closeTabLocal(h, tab.ID, "control_target_drift", err)}
+		}
+	} else if d.Production {
+		return &launchFailure{Reason: "control_target_unverifiable", Err: closeTabLocal(h, tab.ID, "control_target_unverifiable", fmt.Errorf("Herdr launcher cannot verify exact target"))}
+	}
+	var evidence control.Evidence
+	if d.Production {
+		orders, factoryErr := d.ControlFactory(ctx, ControlScope{Identity: identity, Wake: wakeTarget, Check: check})
+		if factoryErr != nil {
+			return &launchFailure{Reason: "control_factory_failed", Err: closeTabLocal(h, tab.ID, "control_factory_failed", factoryErr)}
+		}
+		if orders == nil {
+			return &launchFailure{Reason: "control_factory_failed", Err: fmt.Errorf("nil control orders")}
+		}
+		var orderErr error
+		evidence, orderErr = orders.Repair(ctx, packet)
+		if orderErr != nil {
 			return &launchFailure{Reason: "control_order_failed", Err: closeTabLocal(h, tab.ID, "control_order_failed", orderErr)}
 		}
 	} else if d.Orders != nil {
-		if _, orderErr := d.Orders.Repair(ctx, packet); orderErr != nil {
+		if e, orderErr := d.Orders.Repair(ctx, packet); orderErr != nil {
 			return &launchFailure{Reason: "control_order_failed", Err: closeTabLocal(h, tab.ID, "control_order_failed", orderErr)}
+		} else {
+			evidence = e
 		}
 	}
-	receipt, err := h.DeliverAndProve(tabLabel, packet, timeout)
+	var receipt *herdr.PromptReceipt
+	var receiptErr error
+	if evidence.MessageID != "" {
+		// Delivery already performed the one Herdr wake and returned its actual
+		// receipt. Never nudge the same order again from this outer layer.
+		if !evidence.Wake.Consumed || !evidence.Wake.Verified {
+			return &launchFailure{Reason: "prompt_receipt_invalid", Err: closeTabLocal(h, tab.ID, "prompt_receipt_invalid", fmt.Errorf("durable control wake did not prove consumption"))}
+		}
+		receipt = &herdr.PromptReceipt{Target: evidence.Wake.Target, Consumed: evidence.Wake.Consumed, Verified: evidence.Wake.Verified, BaselineStatus: evidence.Wake.Baseline, FinalStatus: evidence.Wake.Final, SequenceToken: evidence.Wake.SequenceToken}
+	} else {
+		// Explicit non-production test mode has no durable control port; it still
+		// sends only a fixed wake reference, never the task packet.
+		receipt, receiptErr = h.DeliverAndProve(tabLabel, fmt.Sprintf("consume durable control envelope task %s", task.Ref), timeout)
+	}
 	result.Receipt = receipt
-	if err != nil {
+	if receiptErr != nil {
 		return &launchFailure{
 			Reason: "prompt_delivery_failed",
 			Err: closeTabLocal(h, tab.ID, "prompt_delivery_failed",
@@ -710,6 +791,8 @@ func (d *Dispatcher) launch(
 		TabID:     tab.ID,
 		AgentName: tabLabel,
 		Receipt:   receipt.SequenceToken,
+		MessageID: evidence.MessageID,
+		Sequence:  evidence.Sequence,
 	}); err != nil {
 		return &launchFailure{
 			Reason: "record_prompt_failed",

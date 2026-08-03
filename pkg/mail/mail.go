@@ -228,10 +228,10 @@ func (m *Mailbox) loadEnvelopeIdentityLocked(env *Envelope) error {
 	for _, line := range splitLines(string(data)) {
 		var existing Envelope
 		if json.Unmarshal([]byte(line), &existing) == nil && existing.ID == env.ID {
+			env.Sequence, env.Timestamp = existing.Sequence, existing.Timestamp
 			if existing.Sender != env.Sender || existing.Recipient != env.Recipient || existing.Subject != env.Subject || existing.Body != env.Body {
 				return fmt.Errorf("mailbox: envelope ID %q reused with different content", env.ID)
 			}
-			env.Sequence, env.Timestamp = existing.Sequence, existing.Timestamp
 			return nil
 		}
 	}

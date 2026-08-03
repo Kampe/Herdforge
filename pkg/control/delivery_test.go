@@ -162,8 +162,8 @@ func TestDeliveryConformance_FileAndRedisModes(t *testing.T) {
 			if first.IdempotencyKey != second.IdempotencyKey || first.MessageID != second.MessageID {
 				t.Fatalf("identity changed across retry: %#v %#v", first, second)
 			}
-			if waker.calls != 2 {
-				t.Fatalf("wake retry count = %d, want 2 (wake is not durable storage)", waker.calls)
+			if waker.calls != 1 {
+				t.Fatalf("wake retry count = %d, want one durable-order wake", waker.calls)
 			}
 			envs, err := mailbox.ReadInbox(o.Lane)
 			if err != nil || len(envs) != 1 || envs[0].ID != first.MessageID || envs[0].Body == "" {

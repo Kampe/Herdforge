@@ -6,6 +6,7 @@ package control
 import (
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -48,8 +49,13 @@ type WakeRequest struct {
 }
 
 type WakeReceipt struct {
-	MessageID string
-	Consumed  bool
+	MessageID     string `json:"message_id"`
+	Consumed      bool   `json:"consumed"`
+	Verified      bool   `json:"verified"`
+	SequenceToken string `json:"sequence_token"`
+	Baseline      string `json:"baseline_status"`
+	Final         string `json:"final_status"`
+	Target        string `json:"target"`
 }
 
 // Sender is implemented by both mail.Mailbox and mail.MessageBroker through
@@ -80,6 +86,9 @@ type AckEvidence struct {
 	CandidateSHA    string `json:"candidate_sha"`
 	Kind            Kind   `json:"kind"`
 	BodyDigest      string `json:"body_digest"`
+	Outcome         string `json:"outcome,omitempty"`
+	FailureReason   string `json:"failure_reason,omitempty"`
+	Retryable       bool   `json:"retryable,omitempty"`
 }
 
 type IdentityAuthority interface {
@@ -92,6 +101,7 @@ type Evidence struct {
 	Sequence       int64         `json:"sequence"`
 	IdempotencyKey string        `json:"idempotency_key"`
 	State          outbox.Status `json:"state"`
+	Wake           WakeReceipt   `json:"wake"`
 }
 
 var (
@@ -183,6 +193,12 @@ func (d *Delivery) Deliver(ctx context.Context, o Order) (Evidence, error) {
 		return Evidence{}, err
 	}
 	e := Evidence{ItemID: item.ID, MessageID: messageID(key), IdempotencyKey: key, State: item.Status}
+	if wake, ok, err := loadWake(d.Outbox.DB(), item.ID); err != nil {
+		return e, err
+	} else if ok {
+		e.MessageID, e.Sequence, e.Wake, e.State = item.MessageID, item.Sequence, wake, outbox.StatusSent
+		return e, nil
+	}
 	if item.Status == outbox.StatusAcknowledged || item.Status == outbox.StatusSuperseded {
 		return e, nil
 	}
@@ -191,6 +207,14 @@ func (d *Delivery) Deliver(ctx context.Context, o Order) (Evidence, error) {
 			return e, ErrMissingReceipt
 		}
 		e.MessageID, e.Sequence = item.MessageID, item.Sequence
+		if d.Evidence != nil {
+			if _, err := d.Evidence.ReadEvidence(ctx, key, false); err == nil {
+				return e, nil
+			}
+			if _, err := d.Evidence.ReadEvidence(ctx, key, true); err == nil {
+				return e, nil
+			}
+		}
 		return d.wake(ctx, o, e, digest)
 	}
 	owner := d.Owner
@@ -220,6 +244,11 @@ func (d *Delivery) Deliver(ctx context.Context, o Order) (Evidence, error) {
 }
 
 func (d *Delivery) wake(ctx context.Context, o Order, e Evidence, _ string) (Evidence, error) {
+	// Re-read live authority immediately before the only wake. This closes the
+	// window where a lease/candidate can drift after persistence.
+	if err := d.validate(ctx, o); err != nil {
+		return e, err
+	}
 	r, err := d.Waker.Wake(ctx, WakeRequest{Order: o, MessageID: e.MessageID, Sequence: e.Sequence})
 	if err != nil {
 		return e, fmt.Errorf("control wake failed (order retained for retry): %w", err)
@@ -227,7 +256,47 @@ func (d *Delivery) wake(ctx context.Context, o Order, e Evidence, _ string) (Evi
 	if r.MessageID != e.MessageID || !r.Consumed {
 		return e, ErrMissingReceipt
 	}
+	e.Wake = r
+	if err := saveWake(d.Outbox.DB(), e.ItemID, r); err != nil {
+		return e, err
+	}
 	return e, nil
+}
+
+func ensureWakeTable(db *sql.DB) error {
+	_, err := db.Exec(`CREATE TABLE IF NOT EXISTS control_wake_receipts (item_id INTEGER PRIMARY KEY, receipt_json TEXT NOT NULL)`)
+	return err
+}
+
+func saveWake(db *sql.DB, itemID int64, receipt WakeReceipt) error {
+	if err := ensureWakeTable(db); err != nil {
+		return fmt.Errorf("control: wake receipt schema: %w", err)
+	}
+	b, err := json.Marshal(receipt)
+	if err != nil {
+		return err
+	}
+	_, err = db.Exec(`INSERT INTO control_wake_receipts(item_id, receipt_json) VALUES(?, ?) ON CONFLICT(item_id) DO UPDATE SET receipt_json=excluded.receipt_json`, itemID, string(b))
+	return err
+}
+
+func loadWake(db *sql.DB, itemID int64) (WakeReceipt, bool, error) {
+	if err := ensureWakeTable(db); err != nil {
+		return WakeReceipt{}, false, err
+	}
+	var raw string
+	err := db.QueryRow(`SELECT receipt_json FROM control_wake_receipts WHERE item_id = ?`, itemID).Scan(&raw)
+	if err == sql.ErrNoRows {
+		return WakeReceipt{}, false, nil
+	}
+	if err != nil {
+		return WakeReceipt{}, false, err
+	}
+	var r WakeReceipt
+	if err := json.Unmarshal([]byte(raw), &r); err != nil {
+		return WakeReceipt{}, false, fmt.Errorf("control: corrupt wake receipt: %w", err)
+	}
+	return r, true, nil
 }
 
 func (d *Delivery) Acknowledge(o Order) error {
@@ -251,6 +320,33 @@ func (d *Delivery) AcknowledgeEvidence(ctx context.Context, o Order) (Evidence, 
 }
 func (d *Delivery) SupersedeEvidence(ctx context.Context, o Order) (Evidence, error) {
 	return d.terminal(ctx, o, true)
+}
+
+// Reconcile is the coordinator restart path. It never creates an order and
+// never infers terminal state from a wake; only structured ack or supersede
+// evidence can drive the terminal CAS.
+func (d *Delivery) Reconcile(ctx context.Context, o Order) (Evidence, error) {
+	if d == nil || d.Outbox == nil || d.Evidence == nil {
+		return Evidence{}, fmt.Errorf("control: reconciliation requires outbox and evidence reader")
+	}
+	key, _, _, err := identityKey(o)
+	if err != nil {
+		return Evidence{}, err
+	}
+	item, err := d.Outbox.GetByKey(key)
+	if err != nil {
+		return Evidence{}, err
+	}
+	if item == nil {
+		return Evidence{}, fmt.Errorf("control: no durable order for %s", key)
+	}
+	if item.Status == outbox.StatusAcknowledged || item.Status == outbox.StatusSuperseded {
+		return Evidence{ItemID: item.ID, MessageID: item.MessageID, Sequence: item.Sequence, IdempotencyKey: key, State: item.Status}, nil
+	}
+	if ev, err := d.AcknowledgeEvidence(ctx, o); err == nil {
+		return ev, nil
+	}
+	return d.SupersedeEvidence(ctx, o)
 }
 func (d *Delivery) terminal(ctx context.Context, o Order, supersede bool) (Evidence, error) {
 	if d == nil || d.Outbox == nil || d.Evidence == nil || d.Authority == nil {
@@ -277,14 +373,15 @@ func (d *Delivery) terminal(ctx context.Context, o Order, supersede bool) (Evide
 	if err := json.Unmarshal([]byte(item.Payload), &stored); err != nil {
 		return Evidence{}, fmt.Errorf("control: corrupt stored order: %w", err)
 	}
-	_, digest, _, err := identityKey(o)
+	_, digest, _, err := identityKey(stored)
 	if err != nil {
 		return Evidence{}, err
 	}
-	if o.BodyDigest == "" {
-		o.BodyDigest = digest
+	canonical := o
+	if canonical.BodyDigest == "" {
+		canonical.BodyDigest = digest
 	}
-	if stored != o || item.MessageID == "" || item.Sequence <= 0 {
+	if stored != canonical || item.MessageID == "" || item.Sequence <= 0 {
 		return Evidence{}, fmt.Errorf("control: stored order identity mismatch")
 	}
 	evidence, err := d.Evidence.ReadEvidence(ctx, key, supersede)
