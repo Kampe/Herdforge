@@ -9,8 +9,8 @@ import (
 )
 
 // NewFromHerdConfig activates the configured task provider with FAC-150
-// deadlines. Only Kaneo (and explicit memory) are activated; other types
-// error out for FAC-155.
+// deadlines. Linear credentials are read only from its configured api_key_env;
+// it never falls back to Kaneo's ambient credential.
 func NewFromHerdConfig(cfg *config.Config) (TaskProvider, error) {
 	if cfg == nil {
 		return nil, fmt.Errorf("nil config")
@@ -19,19 +19,33 @@ func NewFromHerdConfig(cfg *config.Config) (TaskProvider, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	providerType := strings.ToLower(strings.TrimSpace(cfg.TaskProvider.Type))
 	apiKey := ""
-	if env := strings.TrimSpace(cfg.TaskProvider.APIKeyEnv); env != "" {
-		apiKey = strings.TrimSpace(os.Getenv(env))
-	}
-	if apiKey == "" {
-		apiKey = strings.TrimSpace(os.Getenv("KANEO_API_KEY"))
-	}
 	trustedOrigin := ""
-	if apiKey != "" {
-		trustedOrigin = resolveOperatorTrustedOrigin()
+	switch providerType {
+	case "linear":
+		env := strings.TrimSpace(cfg.TaskProvider.APIKeyEnv)
+		if env == "" {
+			return nil, fmt.Errorf("linear task_provider.api_key_env is required")
+		}
+		apiKey = strings.TrimSpace(os.Getenv(env))
+		if apiKey == "" {
+			return nil, fmt.Errorf("linear task provider credential is missing from %s", env)
+		}
+	case "kaneo":
+		if env := strings.TrimSpace(cfg.TaskProvider.APIKeyEnv); env != "" {
+			apiKey = strings.TrimSpace(os.Getenv(env))
+		}
+		if apiKey == "" {
+			apiKey = strings.TrimSpace(os.Getenv("KANEO_API_KEY"))
+		}
+		if apiKey != "" {
+			trustedOrigin = resolveOperatorTrustedOrigin()
+		}
 	}
 	return NewProductionProvider(TaskConfig{
-		Type:                cfg.TaskProvider.Type,
+		Type:                providerType,
 		APIURL:              cfg.TaskProvider.APIURL,
 		ProjectID:           cfg.TaskProvider.ProjectID,
 		UseCLI:              cfg.TaskProvider.UseCLI,

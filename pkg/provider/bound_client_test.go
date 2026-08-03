@@ -89,16 +89,24 @@ func (s *staticInner) UpdateStatus(context.Context, string, string) error {
 }
 func (s *staticInner) AddComment(context.Context, string, string) error { return nil }
 
-func TestNewProductionProvider_KaneoOnly(t *testing.T) {
+func TestNewProductionProvider_ActivatesOnlyConfiguredProviders(t *testing.T) {
 	_, err := NewProductionProvider(TaskConfig{Type: "github"})
-	if err == nil || !strings.Contains(err.Error(), "FAC-155") {
-		t.Fatalf("non-kaneo must refuse: %v", err)
+	if err == nil {
+		t.Fatal("unsupported provider must refuse activation")
 	}
-	tp, err := NewProductionProvider(TaskConfig{Type: "kaneo", ProjectID: "p", List: time.Second})
-	if err != nil {
-		t.Fatal(err)
+	for _, tc := range []TaskConfig{
+		{Type: "kaneo", ProjectID: "p", List: time.Second},
+		{Type: "linear", APIKey: "linear-test-key", List: time.Second},
+	} {
+		tp, err := NewProductionProvider(tc)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, ok := tp.(*BoundClient); !ok {
+			t.Fatalf("want BoundClient, got %T", tp)
+		}
 	}
-	if _, ok := tp.(*BoundClient); !ok {
-		t.Fatalf("want BoundClient, got %T", tp)
+	if _, err := NewProductionProvider(TaskConfig{Type: "linear"}); err == nil {
+		t.Fatal("linear without an explicit credential must fail")
 	}
 }

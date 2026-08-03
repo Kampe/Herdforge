@@ -1,0 +1,23 @@
+# Copy to .herd/herd.yaml.local, fill only project_id, then select it with
+# HERD_CONFIG_PATH=.herd/herd.yaml.local. Keep LINEAR_API_KEY outside Git.
+version: "1"
+project:
+  name: "private-linear-herd"
+  default_branch: "main"
+
+task_provider:
+  type: "linear"
+  project_id: "replace-with-linear-project-id"
+  api_key_env: "LINEAR_API_KEY"
+
+lanes:
+  - name: "worker"
+    role: "worker"
+    agent_kind: "opencode"
+    harness: "opencode"
+    prompt: ".herd/prompts/worker.md"
+    worktree: ".worktrees/worker"
+    model: "replace-with-approved-worker-model"
+
+verification:
+  test_command: "make ci"

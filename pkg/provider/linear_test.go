@@ -2,8 +2,10 @@ package provider
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -126,13 +128,15 @@ func TestLinearProvider_UpdateStatus(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		n++
-		if n == 1 {
-			// mutation
+		switch n {
+		case 1:
+			w.Write([]byte(`{"data":{"issue":{"id":"lin-1","team":{"states":{"nodes":[{"id":"progress-state","name":"In Progress","type":"started"}]}}}}}`))
+		case 2:
 			w.Write([]byte(`{"data": {"issueUpdate": {"success": true}}}`))
-			return
+		default:
+			// readback GetTask
+			w.Write([]byte(`{"data":{"issue":{"id":"lin-1","identifier":"LIN-1","title":"t","description":"","priority":2,"state":{"name":"In Progress"},"project":{"id":"p1"},"labels":{"nodes":[]}}}}`))
 		}
-		// readback GetTask
-		w.Write([]byte(`{"data":{"issue":{"id":"lin-1","identifier":"LIN-1","title":"t","description":"","priority":2,"state":{"name":"In Progress"},"project":{"id":"p1"},"labels":{"nodes":[]}}}}`))
 	}))
 	defer server.Close()
 
@@ -143,6 +147,44 @@ func TestLinearProvider_UpdateStatus(t *testing.T) {
 	err := lp.UpdateStatus(context.Background(), "lin-1", "In Progress")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestLinearProvider_UpdateStatus_ResolvesWorkflowStateIDAndReadsBack(t *testing.T) {
+	var calls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		var request linearGraphQLRequest
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case strings.Contains(request.Query, "ResolveIssueWorkflowStates"):
+			w.Write([]byte(`{"data":{"issue":{"id":"lin-1","team":{"states":{"nodes":[{"id":"todo-state","name":"Todo","type":"unstarted"},{"id":"progress-state","name":"In Progress","type":"started"}]}}}}}`))
+		case strings.Contains(request.Query, "mutation UpdateIssueState"):
+			if got := request.Variables["state"]; got != "progress-state" {
+				t.Errorf("mutation state=%q, want resolved workflow state ID", got)
+			}
+			w.Write([]byte(`{"data":{"issueUpdate":{"success":true}}}`))
+		case strings.Contains(request.Query, "query GetIssue"):
+			w.Write([]byte(`{"data":{"issue":{"id":"lin-1","identifier":"LIN-1","title":"t","description":"","priority":2,"state":{"name":"In Progress"},"project":{"id":"p1"},"labels":{"nodes":[]}}}}`))
+		default:
+			t.Errorf("unexpected GraphQL query: %s", request.Query)
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+	}))
+	defer server.Close()
+
+	lp := NewLinearProvider("mock-api-key")
+	lp.Client = server.Client()
+	lp.BaseURL = server.URL
+
+	if err := lp.UpdateStatus(context.Background(), "lin-1", StatusInProgress); err != nil {
+		t.Fatalf("UpdateStatus: %v", err)
+	}
+	if calls != 3 {
+		t.Fatalf("calls=%d, want state resolution + mutation + readback", calls)
 	}
 }
 
@@ -170,16 +212,18 @@ func TestLinearProvider_ClaimTask(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		n++
-		if n == 1 {
+		w.WriteHeader(http.StatusOK)
+		switch n {
+		case 1:
+			w.Write([]byte(`{"data":{"issue":{"id":"lin-1","team":{"states":{"nodes":[{"id":"progress-state","name":"In Progress","type":"started"}]}}}}}`))
+		case 2:
 			buf := make([]byte, r.ContentLength)
 			r.Body.Read(buf)
 			capturedBody = string(buf)
-			w.WriteHeader(http.StatusOK)
 			w.Write([]byte(`{"data": {"issueUpdate": {"success": true}}}`))
-			return
+		default:
+			w.Write([]byte(`{"data":{"issue":{"id":"lin-1","identifier":"LIN-1","title":"t","description":"","priority":2,"state":{"name":"In Progress"},"project":{"id":"p1"},"labels":{"nodes":[]}}}}`))
 		}
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(`{"data":{"issue":{"id":"lin-1","identifier":"LIN-1","title":"t","description":"","priority":2,"state":{"name":"In Progress"},"project":{"id":"p1"},"labels":{"nodes":[]}}}}`))
 	}))
 	defer server.Close()
 

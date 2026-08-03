@@ -4,6 +4,8 @@ import (
 	"context"
 	"testing"
 	"time"
+
+	"github.com/Kampe/Herdforge/pkg/config"
 )
 
 func TestApplyDeadlines_Kaneo(t *testing.T) {
@@ -21,6 +23,33 @@ func TestBoundOp_Fires(t *testing.T) {
 	case <-ctx.Done():
 	case <-time.After(time.Second):
 		t.Fatal("Bound op deadline did not fire")
+	}
+}
+
+func TestNewFromHerdConfig_LinearUsesOnlyConfiguredCredentialEnv(t *testing.T) {
+	cfg := &config.Config{TaskProvider: config.TaskProvider{
+		Type:      "linear",
+		APIKeyEnv: "LINEAR_API_KEY",
+	}}
+	t.Setenv("LINEAR_API_KEY", "linear-test-key")
+	t.Setenv("KANEO_API_KEY", "must-not-be-used")
+
+	tp, err := NewFromHerdConfig(cfg)
+	if err != nil {
+		t.Fatalf("NewFromHerdConfig: %v", err)
+	}
+	bound, ok := tp.(*BoundClient)
+	if !ok {
+		t.Fatalf("provider=%T, want *BoundClient", tp)
+	}
+	linear, ok := bound.Inner.(*LinearProvider)
+	if !ok || linear.APIKey != "linear-test-key" {
+		t.Fatalf("linear provider=%#v", bound.Inner)
+	}
+
+	t.Setenv("LINEAR_API_KEY", "")
+	if _, err := NewFromHerdConfig(cfg); err == nil {
+		t.Fatal("linear must not fall back to KANEO_API_KEY")
 	}
 }
 
