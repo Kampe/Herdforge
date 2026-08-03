@@ -29,6 +29,17 @@ type fakeDriver struct {
 	rejectErr    func(ref string) error
 }
 
+type observingDriver struct {
+	*fakeDriver
+	observations int
+}
+
+func (d *observingDriver) ObserveReconciliation(context.Context) error {
+	d.observations++
+	return nil
+}
+
+
 func TestForgeLoop_ReconciliationFailureStopsBeforeDriverActions(t *testing.T) {
 	e := forgeEngine(t)
 	e.ControlReconciler = &control.CoordinatorLoop{}
@@ -230,4 +241,19 @@ func (h *happyDriver) Dispatch(ctx context.Context, t *provider.Task) error {
 	h.completed = map[string]bool{t.Ref: true}
 	h.verified = map[string]bool{t.Ref: true}
 	return nil
+}
+
+func TestForgeLoopRunsObserveReconciliationAtStartupAndPeriodically(t *testing.T) {
+	e := forgeEngine(t)
+	// Control reconciler is required on production engines; a nil one would
+	// fail closed before observe ticks. Tests that exercise the observe path
+	// only need a no-op reconciler when ControlRequired is set — leave default.
+	d := &observingDriver{fakeDriver: &fakeDriver{lanes: LaneState{Max: 1}, completed: map[string]bool{}, verified: map[string]bool{}}}
+	if err := e.ForgeLoop(context.Background(), d, ForgeLoopOptions{Interval: time.Millisecond, MaxTicks: 1}); err != nil {
+		t.Fatal(err)
+	}
+	// startup observe + one periodic observe per tick
+	if d.observations != 2 {
+		t.Fatalf("observe calls=%d, want startup+periodic", d.observations)
+	}
 }

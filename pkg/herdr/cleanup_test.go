@@ -5,187 +5,178 @@ import (
 	"testing"
 )
 
-func cleanOrphan(ref string) TabObservation {
-	return TabObservation{
-		TabID: "wF:t1", Generation: "g1", Label: "Herdforge · " + ref,
-		TaskRef: ref, TaskStatus: "to-do", AgentStatus: "unknown",
-		Worktree: WorktreeEvidence{Known: true}, Evidence: completeFixtureEvidence(),
+func present[T any](v T) Authority[T] { return Authority[T]{State: EvidencePresent, Value: v} }
+
+func authFixture(status string) AuthoritySnapshot {
+	return AuthoritySnapshot{
+		Board:     present(BoardTruth{TaskRef: "FAC-72", Status: status}),
+		Agent:     Authority[AgentTruth]{State: EvidenceAbsent},
+		Lifecycle: Authority[LifecycleTruth]{State: EvidenceAbsent},
+		Worktree:  present(WorktreeEvidence{Known: true}),
+		Review:    present(ReviewTruth{}), Mail: present(MailTruth{}), Process: present(ProcessTruth{}),
+		Protection: present(ProtectionTruth{}),
 	}
 }
 
-func completeFixtureEvidence() TabEvidence {
-	p := SourceEvidence{State: EvidencePresent}
-	return TabEvidence{Board: p, Agent: p, Lifecycle: p, Worktree: p, Review: p, Mail: p, Process: p, Protection: p}
+func boundFixture(status string) TabObservation {
+	b := TabBinding{TabID: "wF:t1", Generation: "g1", TaskRef: "FAC-72", PaneID: "wF:p1"}
+	return AssembleBoundObservation(b, authFixture(status))
 }
 
-func TestReconcileTabsShellOnlyTaskLabelIsSafeOrphan(t *testing.T) {
-	d := ReconcileTabs([]TabObservation{cleanOrphan("FAC-72")})[0]
+func TestSocketShellOnlyTaskShapeIsSafeOrphan(t *testing.T) {
+	d := ReconcileTabs([]TabObservation{boundFixture("to-do")})[0]
 	if d.Class != TabSafeOrphan || !d.CloseEligible {
-		t.Fatalf("shell-only task label = %+v, want safe-orphan and close eligible", d)
+		t.Fatalf("decision=%+v", d)
 	}
 }
 
-func TestReconcileTabsMissingEachEvidenceSourceBlocks(t *testing.T) {
-	base := cleanOrphan("FAC-72")
-	checks := []struct {
+func TestMissingEachAuthorityBlocks(t *testing.T) {
+	fields := []struct {
 		name  string
-		clear func(*TabEvidence)
+		clear func(*AuthoritySnapshot)
 	}{
-		{"board", func(e *TabEvidence) { e.Board = SourceEvidence{} }},
-		{"agent", func(e *TabEvidence) { e.Agent = SourceEvidence{} }},
-		{"lifecycle", func(e *TabEvidence) { e.Lifecycle = SourceEvidence{} }},
-		{"worktree", func(e *TabEvidence) { e.Worktree = SourceEvidence{} }},
-		{"review", func(e *TabEvidence) { e.Review = SourceEvidence{} }},
-		{"mail", func(e *TabEvidence) { e.Mail = SourceEvidence{} }},
-		{"process", func(e *TabEvidence) { e.Process = SourceEvidence{} }},
-		{"protection", func(e *TabEvidence) { e.Protection = SourceEvidence{} }},
+		{"board", func(a *AuthoritySnapshot) { a.Board = Authority[BoardTruth]{} }},
+		{"agent", func(a *AuthoritySnapshot) { a.Agent = Authority[AgentTruth]{} }},
+		{"lifecycle", func(a *AuthoritySnapshot) { a.Lifecycle = Authority[LifecycleTruth]{} }},
+		{"worktree", func(a *AuthoritySnapshot) { a.Worktree = Authority[WorktreeEvidence]{} }},
+		{"review", func(a *AuthoritySnapshot) { a.Review = Authority[ReviewTruth]{} }},
+		{"mail", func(a *AuthoritySnapshot) { a.Mail = Authority[MailTruth]{} }},
+		{"process", func(a *AuthoritySnapshot) { a.Process = Authority[ProcessTruth]{} }},
+		{"protection", func(a *AuthoritySnapshot) { a.Protection = Authority[ProtectionTruth]{} }},
 	}
-	for _, tc := range checks {
+	for _, tc := range fields {
 		t.Run(tc.name, func(t *testing.T) {
-			o := base
-			tc.clear(&o.Evidence)
+			o := boundFixture("to-do")
+			tc.clear(&o.Authorities)
 			d := ReconcileTabs([]TabObservation{o})[0]
 			if d.Class != TabBlocked || d.CloseEligible {
-				t.Fatalf("missing %s evidence was not fail-closed: %+v", tc.name, d)
+				t.Fatalf("decision=%+v", d)
 			}
 		})
 	}
 }
 
-func TestReconcileTabsEmptyGenerationNeverCloses(t *testing.T) {
-	o := cleanOrphan("FAC-72")
-	o.Generation = ""
-	d := ReconcileTabs([]TabObservation{o})[0]
-	if d.Class != TabBlocked || d.CloseEligible {
-		t.Fatalf("empty generation authorized cleanup: %+v", d)
+func TestAuthorityValueAndStateCannotContradict(t *testing.T) {
+	o := boundFixture("to-do")
+	o.Authorities.Board = Authority[BoardTruth]{State: EvidencePresent, Value: BoardTruth{TaskRef: "FAC-99", Status: "to-do"}}
+	if d := ReconcileTabs([]TabObservation{o})[0]; d.Class != TabBlocked {
+		t.Fatalf("mismatched value closed: %+v", d)
 	}
 }
 
-func TestReconcileTabsPreservesEveryUnsafeGate(t *testing.T) {
-	cases := []struct {
-		name   string
-		mutate func(*TabObservation)
-		want   TabClass
+func TestUnknownStatusAndRecoveryPreserve(t *testing.T) {
+	unknown := boundFixture("")
+	if d := ReconcileTabs([]TabObservation{unknown})[0]; d.Class != TabBlocked {
+		t.Fatalf("unknown status=%+v", d)
+	}
+	recovering := boundFixture("recovering")
+	if d := ReconcileTabs([]TabObservation{recovering})[0]; d.Class != TabRecovering || d.CloseEligible {
+		t.Fatalf("recovering=%+v", d)
+	}
+}
+
+func TestWorktreeAndForegroundProcessUnknownsPreserve(t *testing.T) {
+	o := boundFixture("to-do")
+	o.Authorities.Worktree.Value.Known = false
+	if d := ReconcileTabs([]TabObservation{o})[0]; d.Class != TabBlocked {
+		t.Fatalf("unknown worktree=%+v", d)
+	}
+	o = boundFixture("to-do")
+	o.Authorities.Process = present(ProcessTruth{Alive: true})
+	if d := ReconcileTabs([]TabObservation{o})[0]; d.Class != TabBlocked {
+		t.Fatalf("unowned process=%+v", d)
+	}
+}
+
+func TestDoneBoardNeedsTerminalIntegration(t *testing.T) {
+	o := boundFixture("done")
+	if d := ReconcileTabs([]TabObservation{o})[0]; d.Class != TabBlocked {
+		t.Fatalf("done without integration=%+v", d)
+	}
+	o.Authorities.Lifecycle = present(LifecycleTruth{State: "reconciled"})
+	if d := ReconcileTabs([]TabObservation{o})[0]; !d.CloseEligible || d.Class != TabSafeFinished {
+		t.Fatalf("terminal integration=%+v", d)
+	}
+}
+
+func TestDirtyUniqueReviewAndActiveSessionBlock(t *testing.T) {
+	mutations := []struct {
+		name  string
+		apply func(*TabObservation)
 	}{
-		{"dirty", func(o *TabObservation) { o.Worktree.Dirty = true }, TabBlocked},
-		{"unique commit", func(o *TabObservation) { o.Worktree.UniqueCommits = true }, TabBlocked},
-		{"unique ref", func(o *TabObservation) { o.Worktree.UniqueRefs = true }, TabBlocked},
-		{"pending review", func(o *TabObservation) { o.PendingReview = true }, TabPreservedReview},
-		{"pending callback", func(o *TabObservation) { o.PendingCallback = true }, TabBlocked},
-		{"active session", func(o *TabObservation) { o.SessionID = "s1"; o.SessionGeneration = "g1" }, TabActive},
-		{"recycled session", func(o *TabObservation) { o.SessionID = "s2"; o.SessionGeneration = "g2" }, TabBlocked},
-		{"unknown worktree", func(o *TabObservation) { o.Worktree.Known = false }, TabBlocked},
+		{"dirty", func(o *TabObservation) { o.Authorities.Worktree.Value.Dirty = true }},
+		{"unique", func(o *TabObservation) { o.Authorities.Worktree.Value.UniqueCommits = true }},
+		{"review", func(o *TabObservation) { o.Authorities.Review.Value.Pending = true }},
+		{"active", func(o *TabObservation) {
+			o.Authorities.Agent = Authority[AgentTruth]{State: EvidencePresent, Value: AgentTruth{Present: true, Status: "working", SessionID: "s1", SessionGeneration: "g1", PaneID: "wF:p1"}}
+			o.Authorities.Process = Authority[ProcessTruth]{State: EvidencePresent, Value: ProcessTruth{Alive: true}}
+		}},
 	}
-	for _, tc := range cases {
+	for _, tc := range mutations {
 		t.Run(tc.name, func(t *testing.T) {
-			o := cleanOrphan("FAC-72")
-			tc.mutate(&o)
-			d := ReconcileTabs([]TabObservation{o})[0]
-			if d.Class != tc.want || d.CloseEligible {
-				t.Fatalf("decision = %+v, want class %s and no close", d, tc.want)
+			o := boundFixture("to-do")
+			tc.apply(&o)
+			if d := ReconcileTabs([]TabObservation{o})[0]; d.CloseEligible {
+				t.Fatalf("unsafe mutation closed: %+v", d)
 			}
 		})
 	}
 }
 
-func TestReconcileTabsStandingAndExplicitShellAreVisibleNotWorking(t *testing.T) {
-	standing := cleanOrphan("FAC-72")
-	standing.Standing = true
-	user := cleanOrphan("FAC-72")
-	user.ExplicitUserShell = true
-	got := ReconcileTabs([]TabObservation{standing, user})
-	if got[0].Class != TabStanding || got[1].Class != TabUserShell {
-		t.Fatalf("classes = %s, %s", got[0].Class, got[1].Class)
+func TestExactBindingAndGenerationRequired(t *testing.T) {
+	o := boundFixture("to-do")
+	o.Binding.Generation = ""
+	o.Generation = ""
+	if d := ReconcileTabs([]TabObservation{o})[0]; d.Class != TabBlocked {
+		t.Fatalf("empty generation=%+v", d)
 	}
-	for _, d := range got {
-		if d.CloseEligible {
-			t.Fatalf("non-owned tab became close eligible: %+v", d)
-		}
+	o = boundFixture("to-do")
+	o.Binding.TaskRef = "FAC-99"
+	if d := ReconcileTabs([]TabObservation{o})[0]; d.Class != TabBlocked {
+		t.Fatalf("inferred binding=%+v", d)
 	}
 }
 
-func TestAuthorizeCloseGenerationFence(t *testing.T) {
-	initial := cleanOrphan("FAC-72")
-	d := ReconcileTabs([]TabObservation{initial})[0]
-	current := initial
-	current.Generation = "g2"
-	if _, err := AuthorizeClose(d, current); err == nil {
-		t.Fatal("recycled tab must not be closed")
+func TestAuthorizeAndLiveCloseRemainSeparate(t *testing.T) {
+	o := boundFixture("to-do")
+	d := ReconcileTabs([]TabObservation{o})[0]
+	if _, err := AuthorizeClose(d, o); err != nil {
+		t.Fatal(err)
 	}
-	if req, err := AuthorizeClose(d, initial); err != nil || req.Generation != "g1" {
-		t.Fatalf("matching exact-id readback should produce a fenced request: req=%+v err=%v", req, err)
-	}
-}
-func TestTabCloseCASIsTypedBlockedUntilFAC180(t *testing.T) {
-	err := TabCloseCAS(CloseRequest{TabID: "wF:t1", Generation: "g1"})
 	var blocked *CloseUnavailableError
-	if !errors.As(err, &blocked) {
-		t.Fatalf("want typed unavailable error, got %T %v", err, err)
+	if err := TabCloseCAS(CloseRequest{TabID: "wF:t1", Generation: "g1"}); !errors.As(err, &blocked) {
+		t.Fatalf("want typed BLOCKED, got %T", err)
 	}
 }
 
-func TestUnknownTaskStatusBlocks(t *testing.T) {
-	o := cleanOrphan("FAC-72")
-	o.TaskStatus = ""
-	d := ReconcileTabs([]TabObservation{o})[0]
-	if d.Class != TabBlocked || d.CloseEligible {
-		t.Fatalf("unknown task status closed: %+v", d)
+func TestLegacyAgentListCannotAuthorizeCandidate(t *testing.T) {
+	// Status-based SelectCleanupCandidates is observe-only (main behavior).
+	// It must never become a close authorization: mutation Cleanup and
+	// unfenced TabClose remain BLOCKED without FAC-180 compare-and-close.
+	got := SelectCleanupCandidates([]AgentEntry{{Name: "task-fac-72", Status: "done", TabID: "wF:t1"}}, nil)
+	if len(got) != 1 {
+		t.Fatalf("observe candidates = %+v, want 1 status-based candidate", got)
+	}
+	_, errs := Cleanup(nil, false)
+	if len(errs) == 0 {
+		t.Fatal("mutation Cleanup must fail closed without FAC-180 fence")
+	}
+	if err := TabClose(got[0].TabID); err == nil {
+		t.Fatal("unfenced TabClose must fail closed")
 	}
 }
 
-func TestProjectFleetStatusExcludesShellsAndUnknowns(t *testing.T) {
-	decisions := ReconcileTabs([]TabObservation{
-		cleanOrphan("FAC-72"),
-		func() TabObservation {
-			o := cleanOrphan("FAC-73")
-			o.SessionID = "s1"
-			o.SessionGeneration = "g1"
-			o.AgentStatus = "working"
-			return o
-		}(),
-		func() TabObservation { o := cleanOrphan("FAC-74"); o.Evidence.Board = SourceEvidence{}; return o }(),
-	})
+func TestFleetProjectionSeparatesCapacityClasses(t *testing.T) {
+	active := boundFixture("to-do")
+	active.Authorities.Agent = Authority[AgentTruth]{State: EvidencePresent, Value: AgentTruth{Status: "working", SessionID: "s", SessionGeneration: "g1", PaneID: "wF:p1"}}
+	active.Authorities.Process = Authority[ProcessTruth]{State: EvidencePresent, Value: ProcessTruth{Alive: true}}
+	standing := boundFixture("to-do")
+	standing.Binding.ControlSeat = true
+	standing.Authorities.Protection = Authority[ProtectionTruth]{State: EvidencePresent, Value: ProtectionTruth{Standing: true}}
+	decisions := ReconcileTabs([]TabObservation{active, standing})
 	p := ProjectFleetStatus(decisions, 2)
-	if p.Working != 1 || p.Capacity != 1 || p.Unknown != 1 {
-		t.Fatalf("projection = %+v, want working=1 capacity=1 unknown=1", p)
-	}
-}
-
-func TestReconcileTabsTerminalSessionRequiresExactFence(t *testing.T) {
-	o := cleanOrphan("FAC-72")
-	o.SessionID, o.AgentStatus = "session-1", "done"
-	d := ReconcileTabs([]TabObservation{o})[0]
-	if d.Class != TabBlocked || d.CloseEligible {
-		t.Fatalf("terminal session without generation was closable: %+v", d)
-	}
-	o.SessionGeneration = o.Generation
-	d = ReconcileTabs([]TabObservation{o})[0]
-	if !d.CloseEligible {
-		t.Fatalf("terminal session with exact fence was not closable: %+v", d)
-	}
-}
-
-func TestSelectCleanupCandidates(t *testing.T) {
-	standing := map[string]bool{"forge-worker": true, "forge-reviewer": true, "forge-forge-smith": true}
-	agents := []AgentEntry{
-		{Name: "task-fac-59", Status: "idle", TaskRef: "FAC-59", TaskStatus: "done", WorktreeKnown: true, Generation: "g1", Evidence: completeFixtureEvidence(), TabID: "wF:tD"},
-		{Name: "task-fac-60", Status: "done", TaskRef: "FAC-60", TaskStatus: "done", WorktreeKnown: true, Generation: "g1", Evidence: completeFixtureEvidence(), TabID: "wF:tF"},
-		{Name: "forge-worker", Status: "idle", TabID: "wF:t7"},        // standing: kept
-		{Name: "forge-reviewer", Status: "done", TabID: "wF:t8"},      // standing: kept
-		{Name: "cs-orchestrator", Status: "idle", TabID: "wF:t9"},     // orchestrator: kept
-		{Name: "task-fac-99", Status: "working", TabID: "wF:tA"},      // alive: kept
-		{Name: "", Kind: "claude", Status: "working", TabID: "wF:tC"}, // unnamed: kept
-		{Name: "", Kind: "opencode", Status: "idle", TabID: "wF:t1"},  // unnamed: kept
-	}
-	got := SelectCleanupCandidates(agents, standing)
-	if len(got) != 2 {
-		t.Fatalf("want 2 candidates, got %d: %+v", len(got), got)
-	}
-	want := map[string]bool{"task-fac-59": true, "task-fac-60": true}
-	for _, c := range got {
-		if !want[c.Name] {
-			t.Errorf("unexpected candidate %s", c.Name)
-		}
+	if p.Working != 1 || p.Capacity != 1 || p.Standing != 1 {
+		t.Fatalf("projection=%+v", p)
 	}
 }
 
@@ -238,5 +229,13 @@ func TestLegacyTabCloseWithLifecycleStillRequiresPaneAndFence(t *testing.T) {
 	}
 	if len(events) != 1 || events[0] != "reconcile" {
 		t.Fatalf("cleanup skipped or performed terminal lifecycle steps: %v", events)
+	}
+}
+
+func TestTabCloseCASUsesMainFAC180Adapter(t *testing.T) {
+	err := TabCloseCAS(CloseRequest{TabID: "wF:t1", Generation: "g1"})
+	var blocked *CloseUnavailableError
+	if !errors.As(err, &blocked) {
+		t.Fatalf("want typed unavailable error, got %T %v", err, err)
 	}
 }

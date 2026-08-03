@@ -2,8 +2,9 @@ package herdr
 
 import (
 	"fmt"
-	"github.com/Kampe/Herdforge/pkg/toolchild"
 	"strings"
+
+	"github.com/Kampe/Herdforge/pkg/toolchild"
 )
 
 // Port of bin/herd-cleanup: close finished / orphan herdr tabs so the
@@ -34,6 +35,7 @@ const (
 	TabUserShell       TabClass = "user-shell"
 	TabSafeFinished    TabClass = "safe-finished"
 	TabSafeOrphan      TabClass = "safe-orphan"
+	TabRecovering      TabClass = "recovering"
 	TabBlocked         TabClass = "unknown/BLOCKED"
 )
 
@@ -48,13 +50,52 @@ const (
 	EvidenceError   EvidenceState = "error"
 )
 
-type SourceEvidence struct {
-	State  EvidenceState `json:"state"`
-	Detail string        `json:"detail,omitempty"`
+// Authority is a value-bearing read result. The state and value are carried
+// together so callers cannot claim Present while supplying an unrelated
+// default value. Unknown and Error are never eligible for cleanup.
+type Authority[T any] struct {
+	State  EvidenceState
+	Value  T
+	Detail string
 }
 
-type TabEvidence struct {
-	Board, Agent, Lifecycle, Worktree, Review, Mail, Process, Protection SourceEvidence
+type TabBinding struct {
+	TabID       string
+	Workspace   string
+	Generation  string
+	TaskRef     string
+	PaneID      string
+	Label       string
+	Role        string
+	ControlSeat bool
+}
+
+type BoardTruth struct{ TaskRef, Status string }
+type AgentTruth struct {
+	Present                                      bool
+	Status, SessionID, SessionGeneration, PaneID string
+}
+type LifecycleTruth struct{ State string }
+type ReviewTruth struct{ Pending, Active, UnsupersededVerdict bool }
+type MailTruth struct{ PendingOutbox, PendingCallback bool }
+type ProcessTruth struct {
+	Alive bool
+	PID   int
+}
+type ProtectionTruth struct {
+	Standing, UserShell, Protected bool
+	Role                           string
+}
+
+type AuthoritySnapshot struct {
+	Board      Authority[BoardTruth]
+	Agent      Authority[AgentTruth]
+	Lifecycle  Authority[LifecycleTruth]
+	Worktree   Authority[WorktreeEvidence]
+	Review     Authority[ReviewTruth]
+	Mail       Authority[MailTruth]
+	Process    Authority[ProcessTruth]
+	Protection Authority[ProtectionTruth]
 }
 
 // WorktreeEvidence is the minimum local evidence needed before a tab may be
@@ -71,26 +112,11 @@ type WorktreeEvidence struct {
 // lifecycle, review/mail, and git evidence. It is deliberately independent
 // of the live socket so fixtures can exercise the policy hermetically.
 type TabObservation struct {
-	TabID               string
-	Generation          string
-	Label               string
-	AgentName           string
-	AgentStatus         string
-	SessionID           string
-	SessionGeneration   string
-	TaskRef             string
-	TaskStatus          string
-	Standing            bool
-	ExplicitUserShell   bool
-	PendingReview       bool
-	PendingOutbox       bool
-	PendingCallback     bool
-	ActiveReview        bool
-	UnsupersededVerdict bool
-	Protected           bool
-	ProviderError       string
-	Worktree            WorktreeEvidence
-	Evidence            TabEvidence
+	TabID       string
+	Generation  string
+	Label       string
+	Binding     TabBinding
+	Authorities AuthoritySnapshot
 }
 
 // TabDecision is durable, structured reconciliation evidence. CloseEligible
@@ -102,6 +128,7 @@ type TabDecision struct {
 	CloseEligible bool     `json:"close_eligible"`
 	Evidence      []string `json:"evidence"`
 }
+
 
 func NormalizeTaskStatus(status string) string {
 	switch strings.ToLower(strings.TrimSpace(status)) {
@@ -122,33 +149,15 @@ func NormalizeTaskStatus(status string) string {
 	}
 }
 
-// AssembleTabObservation binds the independent source readbacks into the
-// policy input. Callers must supply explicit Evidence states; omitted source
-// results remain Unknown and therefore BLOCKED.
-func AssembleTabObservation(tab TabInfo, agent AgentEntry, evidence TabEvidence) TabObservation {
-	ref := agent.TaskRef
-	if ref == "" && strings.HasPrefix(strings.ToLower(agent.Name), "task-") {
-		ref = strings.ToUpper(strings.TrimPrefix(strings.ToLower(agent.Name), "task-"))
-	}
-	return TabObservation{
-		TabID: tab.ID, Generation: tab.Generation, Label: tab.Label,
-		AgentName: agent.Name, AgentStatus: agent.Status, SessionID: agent.SessionID,
-		SessionGeneration: agent.SessionGeneration, TaskRef: ref, TaskStatus: NormalizeTaskStatus(agent.TaskStatus),
-		Standing: false, ExplicitUserShell: agent.ExplicitUserShell,
-		PendingReview: agent.PendingReview, PendingOutbox: agent.PendingOutbox,
-		PendingCallback: agent.PendingCallback, ActiveReview: agent.ActiveReview,
-		UnsupersededVerdict: agent.UnsupersededVerdict, Protected: agent.Protected,
-		Evidence: evidence,
-		Worktree: WorktreeEvidence{Known: agent.WorktreeKnown, Dirty: agent.Dirty,
-			UniqueCommits: agent.UniqueCommits, UniqueRefs: agent.UniqueRefs},
-	}
-}
-
 type FleetStatus struct {
-	Working  int
-	Capacity int
-	Unknown  int
-	Classes  map[TabClass]int
+	Working      int
+	Capacity     int
+	Unknown      int
+	Standing     int
+	Preserved    int
+	Recovering   int
+	ControlSeats int
+	Classes      map[TabClass]int
 }
 
 // ProjectFleetStatus excludes user shells, standing tabs, and BLOCKED tabs
@@ -163,32 +172,166 @@ func ProjectFleetStatus(decisions []TabDecision, maxLanes int) FleetStatus {
 		if d.Class == TabBlocked {
 			p.Unknown++
 		}
+		if d.Class == TabStanding {
+			p.Standing++
+		}
+		if d.Class == TabPreservedReview {
+			p.Preserved++
+		}
+		if d.Class == TabRecovering {
+			p.Recovering++
+		}
+		if d.Class == TabUserShell {
+			p.ControlSeats++
+		}
 	}
-	p.Capacity = maxLanes - p.Working
+	p.Capacity = maxLanes - p.Working - p.Recovering
 	if p.Capacity < 0 {
 		p.Capacity = 0
 	}
 	return p
 }
 
-func completeEvidence(e TabEvidence) (bool, string) {
+
+func authorityReady[T any](a Authority[T]) bool {
+	return a.State == EvidenceAbsent || a.State == EvidencePresent
+}
+
+func reconcileBoundTab(tab TabObservation) TabDecision {
+	d := TabDecision{TabID: tab.Binding.TabID, Generation: tab.Binding.Generation}
+	blocked := func(reason string) TabDecision {
+		d.Class = TabBlocked
+		d.Evidence = append(d.Evidence, "BLOCKED: "+reason)
+		return d
+	}
+	if tab.Binding.TabID == "" || tab.Binding.TabID != tab.TabID {
+		return blocked("exact tab binding missing")
+	}
+	if tab.Binding.Generation == "" {
+		return blocked("missing immutable tab generation")
+	}
+	a := tab.Authorities
 	checks := []struct {
-		name   string
-		source SourceEvidence
+		name  string
+		state EvidenceState
 	}{
-		{"board", e.Board}, {"agent", e.Agent}, {"lifecycle", e.Lifecycle},
-		{"worktree", e.Worktree}, {"review", e.Review}, {"mail", e.Mail},
-		{"process", e.Process}, {"protection", e.Protection},
+		{"board", a.Board.State}, {"agent", a.Agent.State}, {"lifecycle", a.Lifecycle.State},
+		{"worktree", a.Worktree.State}, {"review", a.Review.State}, {"mail", a.Mail.State},
+		{"process", a.Process.State}, {"protection", a.Protection.State},
 	}
 	for _, c := range checks {
-		if c.source.State == EvidenceError {
-			return false, c.name + " source error"
+		if c.state == EvidenceError {
+			return blocked(c.name + " source error")
 		}
-		if c.source.State != EvidenceAbsent && c.source.State != EvidencePresent {
-			return false, c.name + " source was not authoritatively read"
+		if c.state != EvidenceAbsent && c.state != EvidencePresent {
+			return blocked(c.name + " source was not authoritatively read")
 		}
 	}
-	return true, ""
+	if a.Board.State == EvidencePresent {
+		if a.Board.Value.TaskRef == "" || a.Board.Value.TaskRef != tab.Binding.TaskRef {
+			return blocked("board/task binding mismatch")
+		}
+	} else if tab.Binding.TaskRef != "" {
+		return blocked("task binding has no authoritative board record")
+	}
+	if a.Lifecycle.State == EvidencePresent && a.Board.State == EvidencePresent {
+		boardStatus := NormalizeTaskStatus(a.Board.Value.Status)
+		lifecycleStatus := NormalizeTaskStatus(a.Lifecycle.Value.State)
+		if !(boardStatus == "done" && isTerminalIntegrationState(a.Lifecycle.Value.State)) && lifecycleStatus != boardStatus {
+			return blocked("board/lifecycle status mismatch")
+		}
+	}
+	if a.Agent.State == EvidencePresent {
+		if a.Agent.Value.PaneID != "" && tab.Binding.PaneID != "" && a.Agent.Value.PaneID != tab.Binding.PaneID {
+			return blocked("agent pane binding mismatch")
+		}
+		if a.Agent.Value.SessionID != "" && (a.Agent.Value.SessionGeneration == "" || a.Agent.Value.SessionGeneration != tab.Binding.Generation) {
+			return blocked("session generation mismatch")
+		}
+	}
+	if a.Process.State == EvidencePresent && a.Agent.State == EvidencePresent && a.Agent.Value.SessionID != "" && !a.Process.Value.Alive {
+		return blocked("agent session process is not alive")
+	}
+	if a.Process.State == EvidencePresent && a.Process.Value.Alive && a.Agent.State != EvidencePresent {
+		return blocked("foreground process has no matching agent session")
+	}
+	if a.Worktree.State == EvidencePresent && !a.Worktree.Value.Known {
+		return blocked("worktree authority did not establish known state")
+	}
+	if a.Worktree.Value.Dirty || a.Worktree.Value.UniqueCommits || a.Worktree.Value.UniqueRefs {
+		return blocked("dirty or unique work exists")
+	}
+	if a.Review.State == EvidencePresent && (a.Review.Value.Pending || a.Review.Value.Active || a.Review.Value.UnsupersededVerdict) {
+		d.Class, d.Evidence = TabPreservedReview, []string{"review evidence is still live"}
+		return d
+	}
+	if a.Mail.State == EvidencePresent && (a.Mail.Value.PendingOutbox || a.Mail.Value.PendingCallback) {
+		return blocked("pending mailbox/outbox callback")
+	}
+	if a.Board.State == EvidencePresent && NormalizeTaskStatus(a.Board.Value.Status) == "recovering" {
+		d.Class, d.Evidence = TabRecovering, []string{"authoritative recovering task; preserved"}
+		return d
+	}
+	if a.Protection.State == EvidencePresent && (a.Protection.Value.Protected || a.Protection.Value.Standing || a.Protection.Value.UserShell || tab.Binding.ControlSeat) {
+		if a.Protection.Value.UserShell {
+			d.Class = TabUserShell
+		} else if a.Protection.Value.Standing || tab.Binding.ControlSeat {
+			d.Class = TabStanding
+		} else {
+			return blocked("protected incident or audit marker")
+		}
+		d.Evidence = []string{"protected control or user seat"}
+		return d
+	}
+	if a.Agent.State == EvidencePresent && (a.Agent.Value.Status == "working" || a.Agent.Value.Status == "starting" || a.Agent.Value.SessionID != "") {
+		if a.Agent.Value.Status != "done" {
+			d.Class = TabActive
+			d.Evidence = []string{"matching active session"}
+			return d
+		}
+		if a.Board.State != EvidencePresent || NormalizeTaskStatus(a.Board.Value.Status) != "done" || a.Lifecycle.State != EvidencePresent || !isTerminalIntegrationState(a.Lifecycle.Value.State) {
+			return blocked("terminal session lacks terminal board/lifecycle proof")
+		}
+	}
+	if a.Board.State == EvidencePresent && NormalizeTaskStatus(a.Board.Value.Status) == "done" {
+		if a.Lifecycle.State != EvidencePresent || !isTerminalIntegrationState(a.Lifecycle.Value.State) {
+			return blocked("done board lacks terminal integration truth")
+		}
+		d.Class = TabSafeFinished
+		d.Evidence = []string{"authoritative done board/lifecycle, no active session, clean worktree"}
+		d.CloseEligible = true
+		return d
+	}
+	if a.Board.State == EvidencePresent && NormalizeTaskStatus(a.Board.Value.Status) == "to-do" && tab.Binding.TaskRef != "" {
+		d.Class = TabSafeOrphan
+		d.Evidence = []string{"exact task binding, authoritative to-do board, no active session, clean worktree"}
+		d.CloseEligible = true
+		return d
+	}
+	if tab.Binding.TaskRef == "" {
+		d.Class, d.Evidence = TabUserShell, []string{"unowned tab registry record"}
+		return d
+	}
+	return blocked("task status is unknown or recoverable")
+}
+
+func isTerminalIntegrationState(state string) bool {
+	switch NormalizeTaskStatus(state) {
+	case "done":
+		return true
+	}
+	switch strings.ToLower(strings.TrimSpace(state)) {
+	case "integrated", "reconciled", "cleaned":
+		return true
+	default:
+		return false
+	}
+}
+
+// AssembleBoundObservation is the only production assembly path. TaskRef is
+// supplied by the tab registry binding, never inferred from labels or names.
+func AssembleBoundObservation(tab TabBinding, authorities AuthoritySnapshot) TabObservation {
+	return TabObservation{TabID: tab.TabID, Generation: tab.Generation, Label: tab.Label, Binding: tab, Authorities: authorities}
 }
 
 // ReconcileTabs classifies every supplied tab. It never uses label text or a
@@ -196,99 +339,7 @@ func completeEvidence(e TabEvidence) (bool, string) {
 func ReconcileTabs(tabs []TabObservation) []TabDecision {
 	out := make([]TabDecision, 0, len(tabs))
 	for _, tab := range tabs {
-		d := TabDecision{TabID: tab.TabID, Generation: tab.Generation}
-		blocked := func(reason string) {
-			d.Class = TabBlocked
-			d.Evidence = append(d.Evidence, "BLOCKED: "+reason)
-		}
-		if strings.TrimSpace(tab.TabID) == "" {
-			blocked("missing exact tab id")
-			out = append(out, d)
-			continue
-		}
-		if ok, reason := completeEvidence(tab.Evidence); !ok {
-			blocked(reason)
-			out = append(out, d)
-			continue
-		}
-		if tab.ProviderError != "" {
-			blocked("provider error: " + tab.ProviderError)
-			out = append(out, d)
-			continue
-		}
-		if tab.Protected {
-			blocked("protected incident or audit marker")
-			out = append(out, d)
-			continue
-		}
-		if tab.ExplicitUserShell {
-			d.Class = TabUserShell
-			d.Evidence = append(d.Evidence, "explicit user-shell marker")
-			out = append(out, d)
-			continue
-		}
-		if tab.Standing {
-			d.Class = TabStanding
-			d.Evidence = append(d.Evidence, "standing role")
-			out = append(out, d)
-			continue
-		}
-		if tab.PendingReview || tab.ActiveReview || tab.UnsupersededVerdict {
-			d.Class = TabPreservedReview
-			d.Evidence = append(d.Evidence, "review evidence is still live")
-			out = append(out, d)
-			continue
-		}
-		if tab.PendingOutbox || tab.PendingCallback {
-			blocked("pending mailbox/outbox callback")
-			out = append(out, d)
-			continue
-		}
-		if tab.AgentStatus == "working" || tab.AgentStatus == "starting" || (tab.SessionID != "" && tab.AgentStatus != "done") {
-			if tab.SessionID == "" || tab.SessionGeneration == "" || tab.Generation == "" || tab.SessionGeneration != tab.Generation {
-				blocked("active or recycled session lacks matching generation")
-			} else {
-				d.Class = TabActive
-				d.Evidence = append(d.Evidence, "matching active session")
-			}
-			out = append(out, d)
-			continue
-		}
-		if !tab.Worktree.Known {
-			blocked("worktree evidence is unknown")
-			out = append(out, d)
-			continue
-		}
-		if tab.SessionID != "" && (tab.SessionGeneration == "" || tab.Generation == "" || tab.SessionGeneration != tab.Generation) {
-			blocked("terminal session lacks exact session-generation fence")
-			out = append(out, d)
-			continue
-		}
-		if tab.Worktree.Dirty || tab.Worktree.UniqueCommits || tab.Worktree.UniqueRefs {
-			blocked("dirty or unique work exists")
-			out = append(out, d)
-			continue
-		}
-		if tab.Generation == "" {
-			blocked("missing immutable tab generation")
-			out = append(out, d)
-			continue
-		}
-		status := NormalizeTaskStatus(tab.TaskStatus)
-		if tab.TaskRef != "" && status == "done" {
-			d.Class = TabSafeFinished
-			d.Evidence = append(d.Evidence, "done task, no session, clean worktree, no pending evidence")
-		} else if tab.TaskRef != "" && status == "to-do" {
-			d.Class = TabSafeOrphan
-			d.Evidence = append(d.Evidence, "task-shaped orphan with no matching session and no preserved work")
-		} else if tab.TaskRef == "" {
-			d.Class = TabUserShell
-			d.Evidence = append(d.Evidence, "unowned shell")
-		} else {
-			blocked("task lifecycle/board status is not terminal or orphanable")
-		}
-		d.CloseEligible = d.Class == TabSafeFinished || d.Class == TabSafeOrphan
-		out = append(out, d)
+		out = append(out, reconcileBoundTab(tab))
 	}
 	return out
 }
@@ -309,13 +360,20 @@ func AuthorizeClose(decision TabDecision, current TabObservation) (CloseRequest,
 	if !currentDecision.CloseEligible || currentDecision.Class != decision.Class {
 		return CloseRequest{}, fmt.Errorf("tab %s: readback no longer proves safe close", decision.TabID)
 	}
-	return CloseRequest{TabID: current.TabID, Generation: current.Generation,
-		SessionID: current.SessionID, SessionGeneration: current.SessionGeneration}, nil
+	request := CloseRequest{TabID: current.TabID, Generation: current.Generation}
+	if current.Authorities.Agent.State == EvidencePresent {
+		request.SessionID = current.Authorities.Agent.Value.SessionID
+		request.SessionGeneration = current.Authorities.Agent.Value.SessionGeneration
+	}
+	return request, nil
 }
 
 // SelectCleanupCandidates is the pure policy: named, non-standing,
 // non-orchestrator agents whose status is done or idle (a finished one-off
 // builder that will never be re-kicked). Pure so tests pin the policy.
+// Observe-only: candidates are not a close authorization. Actual close still
+// requires FAC-180 TabCloseCAS with a durable generation fence (Cleanup and
+// TabClose fail closed without it).
 func SelectCleanupCandidates(agents []AgentEntry, standing map[string]bool) []CleanupCandidate {
 	var out []CleanupCandidate
 	for _, a := range agents {
@@ -328,31 +386,16 @@ func SelectCleanupCandidates(agents []AgentEntry, standing map[string]bool) []Cl
 		if strings.Contains(strings.ToLower(a.Name), "orchestrator") {
 			continue
 		}
-		ref := a.TaskRef
-		if ref == "" && strings.HasPrefix(strings.ToLower(a.Name), "task-") {
-			ref = strings.ToUpper(strings.TrimPrefix(strings.ToLower(a.Name), "task-"))
+		if a.Status != "done" && a.Status != "idle" {
+			continue // working/starting agents are alive
 		}
-		status := a.TaskStatus
-		if status == "" && a.Status == "done" {
-			status = "done"
-		}
-		decision := ReconcileTabs([]TabObservation{{
-			TabID: a.TabID, Generation: a.Generation, Label: a.Name,
-			AgentName: a.Name, AgentStatus: a.Status, SessionID: a.SessionID,
-			SessionGeneration: a.SessionGeneration, TaskRef: ref, TaskStatus: status,
-			Standing: standing[a.Name], ExplicitUserShell: a.ExplicitUserShell,
-			PendingReview: a.PendingReview, PendingOutbox: a.PendingOutbox,
-			PendingCallback: a.PendingCallback, ActiveReview: a.ActiveReview,
-			UnsupersededVerdict: a.UnsupersededVerdict, Protected: a.Protected,
-			Evidence: a.Evidence,
-			Worktree: WorktreeEvidence{Known: a.WorktreeKnown, Dirty: a.Dirty,
-				UniqueCommits: a.UniqueCommits, UniqueRefs: a.UniqueRefs},
-		}})[0]
-		if !decision.CloseEligible {
-			continue
-		}
-		out = append(out, CleanupCandidate{Name: a.Name, TabID: a.TabID, PaneID: a.PaneID,
-			Status: a.Status, Reason: strings.Join(decision.Evidence, "; ")})
+		out = append(out, CleanupCandidate{
+			Name:   a.Name,
+			TabID:  a.TabID,
+			PaneID: a.PaneID,
+			Status: a.Status,
+			Reason: fmt.Sprintf("named one-off agent with status %s (one agent = one tab)", a.Status),
+		})
 	}
 	return out
 }

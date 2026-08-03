@@ -771,6 +771,17 @@ func runStatus() {
 		os.Exit(1)
 	}
 	fmt.Println(line)
+	observer := &herdr.ProductionReconciliationObserver{Workspace: cfg.Fleet.HerdrWorkspace,
+		Reader: herdr.SocketAuthorityReader{}, Record: (&herdr.JSONLRecorder{Path: ".herd/reconciliation.jsonl"}).Record}
+	if err := observer.ObserveReconciliation(context.Background()); err != nil {
+		fleet := herdr.ProjectFleetStatus(observer.Decisions(), len(cfg.Lanes))
+		fmt.Printf("Reconciliation: BLOCKED (%v)\nFleet: working=%d capacity=%d standing=%d preserved=%d recovering=%d control=%d unknown=%d\n",
+			err, fleet.Working, fleet.Capacity, fleet.Standing, fleet.Preserved, fleet.Recovering, fleet.ControlSeats, fleet.Unknown)
+	} else {
+		fleet := herdr.ProjectFleetStatus(observer.Decisions(), len(cfg.Lanes))
+		fmt.Printf("Reconciliation: observed\nFleet: working=%d capacity=%d standing=%d preserved=%d recovering=%d control=%d unknown=%d\n",
+			fleet.Working, fleet.Capacity, fleet.Standing, fleet.Preserved, fleet.Recovering, fleet.ControlSeats, fleet.Unknown)
+	}
 }
 
 // loadTaskProvider activates the configured board provider with FAC-150
@@ -4974,17 +4985,37 @@ func runShoot() {
 // cliForgeDriver implements daemon.ForgeDriver by driving the herd binary and
 // herdr fleet — the real side-effecting layer for `herd forge --loop`.
 type cliForgeDriver struct {
-	cfg      *config.Config
-	maxLanes int
+	cfg              *config.Config
+	maxLanes         int
+	observer         *herdr.ProductionReconciliationObserver
+	fleet            herdr.FleetStatus
+	reconcileBlocked bool
 }
 
 func (d *cliForgeDriver) Log(msg string) { fmt.Println(msg) }
 
+func (d *cliForgeDriver) ObserveReconciliation(ctx context.Context) error {
+	if d.observer == nil {
+		d.reconcileBlocked = true
+		return fmt.Errorf("reconciliation observer unavailable")
+	}
+	err := d.observer.ObserveReconciliation(ctx)
+	d.fleet = herdr.ProjectFleetStatus(d.observer.Decisions(), d.maxLanes)
+	d.reconcileBlocked = err != nil || d.fleet.Unknown > 0
+	return err
+}
+
 // LaneState counts live task-fac-* builder agents that are working. A herdr
-// read failure is UNKNOWN capacity, not free capacity (FAC-138) — reporting
-// zero busy lanes on a failed list backfilled every lane the coordinator had
-// just lost sight of.
+// read failure is UNKNOWN capacity, not free capacity (FAC-138). When the
+// FAC-158 reconciliation observer has a projection, prefer it; when that
+// projection is BLOCKED/unknown, refuse free capacity by reporting full busy.
 func (d *cliForgeDriver) LaneState(ctx context.Context) (daemon.LaneState, error) {
+	if d.reconcileBlocked {
+		return daemon.LaneState{Busy: d.maxLanes, Max: d.maxLanes}, nil
+	}
+	if d.observer != nil && len(d.observer.Decisions()) > 0 {
+		return daemon.LaneState{Busy: d.fleet.Working + d.fleet.Recovering, Max: d.maxLanes}, nil
+	}
 	agents, err := herdr.AgentList()
 	if err != nil {
 		return daemon.LaneState{}, fmt.Errorf("herdr agent list: %w", err)
@@ -5344,7 +5375,14 @@ func forgeLoopMain() int {
 	// looking composed. Do not reopen this gate without task-scoped order
 	// listing and a test that fails when the composition is removed.
 	eng := daemon.NewEngineWithControl(cfg, tp, nil, st, resolveCanonicalWorktreeManager(), nil, nil)
-	driver := &cliForgeDriver{cfg: cfg, maxLanes: *maxLanes}
+	driver := &cliForgeDriver{
+		cfg: cfg, maxLanes: *maxLanes,
+		observer: &herdr.ProductionReconciliationObserver{
+			Workspace: cfg.Fleet.HerdrWorkspace,
+			Reader:    herdr.SocketAuthorityReader{},
+			Record:    (&herdr.JSONLRecorder{Path: ".herd/reconciliation.jsonl"}).Record,
+		},
+	}
 
 	fmt.Printf("herd forge --loop: max-lanes=%d interval=%ds — driving the board autonomously\n", *maxLanes, *interval)
 	err = eng.ForgeLoop(ctx, driver, daemon.ForgeLoopOptions{
