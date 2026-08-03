@@ -3,6 +3,7 @@ package router
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"os"
 	"sort"
@@ -75,6 +76,7 @@ type LaunchRequest struct {
 	RequestedProvider string
 	// RequestedModel pins the configured model when a lane policy requires it.
 	RequestedModel  string
+	RequestedEffort string
 	TaskRef         string
 	LeaseGeneration int64
 	// ExcludedFamily is an extra family filter (reviewers also exclude AuthorFamily).
@@ -116,6 +118,20 @@ type LaunchDecision struct {
 }
 
 const decisionProofDomain = "herdforge-fac-175-launch-decision-v1"
+
+var ErrWorkerPolicy = errors.New("launch.policy.worker_tuple_mismatch")
+var ErrRolePolicy = errors.New("launch.policy.unknown_role")
+
+func knownRole(role Role) bool {
+	switch role {
+	case RoleWorker, RoleForgeSmith, RoleRecovery, RoleReviewer, RoleAssayer,
+		RoleOrchestrator, RoleScoutPlanner, RoleVerificationGate, RoleReviewSupervisor,
+		RoleHarvest, RoleRecoverySentinel:
+		return true
+	default:
+		return false
+	}
+}
 
 func decisionProof(d LaunchDecision) string {
 	norm := func(v string) string {
@@ -390,6 +406,14 @@ func (r *SurfaceRouter) Decide(req LaunchRequest) (*LaunchDecision, error) {
 	}
 	if req.Role == "" {
 		return nil, fmt.Errorf("herd-route: launch decision requires role")
+	}
+	if !knownRole(req.Role) {
+		return nil, fmt.Errorf("%w: %s", ErrRolePolicy, req.Role)
+	}
+	if req.Role == RoleWorker || req.Role == RoleForgeSmith || req.Role == RoleRecovery {
+		if req.Shape != "implementation" || req.RequestedProvider != "codex" || req.RequestedModel != "gpt-5.6-luna" || req.RequestedEffort != "medium" {
+			return nil, fmt.Errorf("%w: worker/forge-smith/recovery requires codex/gpt-5.6-luna/medium implementation", ErrWorkerPolicy)
+		}
 	}
 
 	shape := req.Shape

@@ -1,6 +1,7 @@
 package router
 
 import (
+	"errors"
 	"strings"
 	"testing"
 
@@ -65,13 +66,45 @@ func TestModelRequiresProbeLunaAndDeepseek(t *testing.T) {
 
 func TestPinnedProbeMustMatchExactRequestedModel(t *testing.T) {
 	clearRouteEnv(t)
-	request := LaunchRequest{Role: RoleWorker, Shape: "implementation", RequestedProvider: "lazer", RequestedModel: "opencode/deepseek-v4-flash", ProbeResults: map[string]bool{ProbeKey("lazer", "litellm/lazer/gpt-5.6-sol"): true}}
-	if _, err := NewRouter(nil, nil).Decide(request); err == nil {
-		t.Fatal("probe for default model must not authorize a different pinned model")
+	cases := map[string]LaunchRequest{
+		"provider":       {Role: RoleWorker, Shape: "implementation", RequestedProvider: "lazer", RequestedModel: "gpt-5.6-luna", RequestedEffort: "medium", ProbeResults: map[string]bool{ProbeKey("lazer", "gpt-5.6-luna"): true}},
+		"deepseek-model": {Role: RoleForgeSmith, Shape: "implementation", RequestedProvider: "codex", RequestedModel: "opencode/deepseek-v4-flash", RequestedEffort: "medium", ProbeResults: map[string]bool{ProbeKey("codex", "opencode/deepseek-v4-flash"): true}},
+		"spark-model":    {Role: RoleRecovery, Shape: "implementation", RequestedProvider: "codex", RequestedModel: "gpt-5.3-codex-spark", RequestedEffort: "medium", ProbeResults: map[string]bool{ProbeKey("codex", "gpt-5.3-codex-spark"): true}},
+		"sol-model":      {Role: RoleRecovery, Shape: "implementation", RequestedProvider: "codex", RequestedModel: "gpt-5.6-sol", RequestedEffort: "medium"},
+		"fable-model":    {Role: RoleWorker, Shape: "implementation", RequestedProvider: "claude", RequestedModel: "claude-fable-5", RequestedEffort: "medium"},
+		"shape":          {Role: RoleWorker, Shape: "bounded", RequestedProvider: "codex", RequestedModel: "gpt-5.6-luna", RequestedEffort: "medium", ProbeResults: map[string]bool{ProbeKey("codex", "gpt-5.6-luna"): true}},
 	}
-	request.ProbeResults[ProbeKey("lazer", "opencode/deepseek-v4-flash")] = true
-	if _, err := NewRouter(nil, nil).Decide(request); err != nil {
-		t.Fatalf("exact pinned probe should authorize routing: %v", err)
+	for name, bad := range cases {
+		t.Run(name, func(t *testing.T) {
+			if _, err := NewRouter(nil, nil).Decide(bad); !errors.Is(err, ErrWorkerPolicy) {
+				t.Fatalf("forbidden worker route error = %v", err)
+			}
+		})
+	}
+	good := LaunchRequest{Role: RoleWorker, Shape: "implementation", RequestedProvider: "codex", RequestedModel: "gpt-5.6-luna", RequestedEffort: "medium", ProbeResults: map[string]bool{ProbeKey("codex", "gpt-5.6-luna"): true}}
+	if _, err := NewRouter(nil, nil).Decide(good); err != nil {
+		t.Fatalf("approved Luna route rejected: %v", err)
+	}
+}
+
+func TestWorkerPolicyRequiresExplicitMediumEffort(t *testing.T) {
+	base := LaunchRequest{Role: RoleWorker, Shape: "implementation", RequestedProvider: "codex", RequestedModel: "gpt-5.6-luna"}
+	for name, effort := range map[string]string{"missing": "", "wrong": "high"} {
+		base.RequestedEffort = effort
+		if _, err := NewRouter(nil, nil).Decide(base); !errors.Is(err, ErrWorkerPolicy) {
+			t.Fatalf("%s effort error = %v", name, err)
+		}
+	}
+	base.RequestedEffort = "medium"
+	base.ProbeResults = map[string]bool{ProbeKey("codex", "gpt-5.6-luna"): true}
+	if _, err := NewRouter(nil, nil).Decide(base); err != nil {
+		t.Fatalf("explicit medium rejected: %v", err)
+	}
+}
+
+func TestUnknownRoleRejectedBeforeSignedDecision(t *testing.T) {
+	if _, err := NewRouter(nil, nil).Decide(LaunchRequest{Role: Role("not-configured"), Shape: "implementation"}); !errors.Is(err, ErrRolePolicy) {
+		t.Fatalf("unknown role error = %v", err)
 	}
 }
 
@@ -163,9 +196,11 @@ func TestDecideWorkerPicksModelAndEffort(t *testing.T) {
 	clearRouteEnv(t)
 	r := testRouter(nil, "claude", "grok", "codex", "opencode", "agy", "kimi")
 	d, err := r.Decide(LaunchRequest{
-		Role:  RoleWorker,
-		Shape: "implementation",
-		Risk:  classify.TierR2,
+		Role:              RoleWorker,
+		Shape:             "implementation",
+		Risk:              classify.TierR2,
+		RequestedProvider: "codex", RequestedModel: "gpt-5.6-luna", RequestedEffort: "medium",
+		ProbeResults: map[string]bool{ProbeKey("codex", "gpt-5.6-luna"): true},
 	})
 	if err != nil {
 		t.Fatalf("Decide: %v", err)
@@ -276,9 +311,10 @@ func TestDecideQuotaHeadroomPick(t *testing.T) {
 	}
 	r := testRouter(computed, "claude", "grok", "codex", "opencode", "agy", "kimi")
 	d, err := r.Decide(LaunchRequest{
-		Role:  RoleWorker,
-		Shape: "implementation",
-		Risk:  classify.TierR2,
+		Role:         RoleReviewer,
+		Shape:        "implementation",
+		Risk:         classify.TierR2,
+		AuthorFamily: "unrelated",
 	})
 	if err != nil {
 		t.Fatalf("Decide: %v", err)
@@ -300,9 +336,10 @@ func TestDecideWeeklyCapSkip(t *testing.T) {
 	}
 	r := testRouter(computed, "claude", "grok", "codex", "opencode", "agy", "kimi")
 	d, err := r.Decide(LaunchRequest{
-		Role:  RoleWorker,
-		Shape: "implementation",
-		Risk:  classify.TierR1,
+		Role:         RoleReviewer,
+		Shape:        "implementation",
+		Risk:         classify.TierR1,
+		AuthorFamily: "unrelated",
 	})
 	if err != nil {
 		t.Fatalf("Decide: %v", err)
@@ -352,9 +389,10 @@ func TestDecideWeeklyCapSoleCandidateFailsClosed(t *testing.T) {
 	}
 	r := testRouter(computed, "claude")
 	_, err := r.Decide(LaunchRequest{
-		Role:              RoleWorker,
+		Role:              RoleReviewer,
 		Shape:             "implementation",
 		Risk:              classify.TierR1,
+		AuthorFamily:      "unrelated",
 		RequestedProvider: "claude",
 	})
 	if err == nil {
@@ -394,9 +432,10 @@ func TestDecideLunaRequiresProbePass(t *testing.T) {
 	r := testRouter(nil, "codex", "grok")
 	// Only codex+grok: codex luna skipped without probe → grok wins.
 	d, err := r.Decide(LaunchRequest{
-		Role:              RoleWorker,
+		Role:              RoleReviewer,
 		Shape:             "implementation",
 		Risk:              classify.TierR2,
+		AuthorFamily:      "unrelated",
 		RequestedProvider: "",
 	})
 	if err != nil {
@@ -413,8 +452,8 @@ func TestDecideLunaRequiresProbePass(t *testing.T) {
 		Role:              RoleWorker,
 		Shape:             "implementation",
 		Risk:              classify.TierR2,
-		RequestedProvider: "codex",
-		ProbeResults:      map[string]bool{key: true},
+		RequestedProvider: "codex", RequestedModel: "gpt-5.6-luna", RequestedEffort: "medium",
+		ProbeResults: map[string]bool{key: true},
 	})
 	if err != nil {
 		t.Fatalf("Decide with probe: %v", err)
@@ -433,7 +472,7 @@ func TestDecideLunaUnknownProbeFailsClosed(t *testing.T) {
 	_, err := r.Decide(LaunchRequest{
 		Role:              RoleWorker,
 		Shape:             "implementation",
-		RequestedProvider: "codex",
+		RequestedProvider: "codex", RequestedModel: "gpt-5.6-luna", RequestedEffort: "medium",
 		// ProbeResults nil → unknown → fail closed
 	})
 	if err == nil {
@@ -512,7 +551,7 @@ func TestDecideWeeklyCapIsLoadBearing(t *testing.T) {
 	}
 	r := testRouter(computed, "claude", "grok", "codex", "opencode", "agy", "kimi")
 	// Preferential shape: implementation lists claude first.
-	d, err := r.Decide(LaunchRequest{Role: RoleWorker, Shape: "implementation"})
+	d, err := r.Decide(LaunchRequest{Role: RoleReviewer, Shape: "implementation", AuthorFamily: "unrelated"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -525,7 +564,7 @@ func TestDecideWeeklyCapIsLoadBearing(t *testing.T) {
 		"grok":   {Available: true, Pressure: 80},
 	}
 	r2 := testRouter(healthy, "claude", "grok", "codex", "opencode", "agy", "kimi")
-	d2, err := r2.Decide(LaunchRequest{Role: RoleWorker, Shape: "implementation"})
+	d2, err := r2.Decide(LaunchRequest{Role: RoleReviewer, Shape: "implementation", AuthorFamily: "unrelated"})
 	if err != nil {
 		t.Fatal(err)
 	}
