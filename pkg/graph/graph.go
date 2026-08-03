@@ -1,3 +1,7 @@
+// Package graph provides multi-repo workspace dependency analysis and
+// deterministic targeted test planning from a change set (FAC-94 /
+// herd-tests-for). Plan() is pure: graph evidence is injected by the caller
+// (code-review-graph or fixtures). Missing edges never invent coverage.
 package graph
 
 import (
