@@ -667,12 +667,16 @@ func waitForChildReadyPID(path string, bound time.Duration) (int, error) {
 	}
 }
 
-// waitForPIDGone waits until kill(pid,0) returns an error (ESRCH), proving the
-// OS no longer tracks the process (including after zombie reaping).
+// waitForPIDGone waits until the pid is gone or a reaped/zombie non-target,
+// proving it can no longer mutate (matches production waitHandleGone policy).
 func waitForPIDGone(pid int, bound time.Duration) error {
 	deadline := time.Now().Add(bound)
 	for {
 		if err := syscall.Kill(pid, 0); err != nil {
+			return nil
+		}
+		// Zombie: reparented residual already SIGKILL'd; cannot mutate.
+		if processIsZombie(pid) {
 			return nil
 		}
 		if time.Now().After(deadline) {

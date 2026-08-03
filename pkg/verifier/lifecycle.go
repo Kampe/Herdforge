@@ -409,6 +409,11 @@ func (o *ownedSubprocess) drainResidualsWhileLeaderLive() error {
 	if err := killProcessGroupMembersExcept(pgid, o.leader); err != nil {
 		return fmt.Errorf("drain residuals group members: %w", err)
 	}
+	// Fail-closed: original pgid must have no live non-leader members before
+	// we release the supervisor (same-group residual writers).
+	if err := waitProcessGroupEmptyExcept(pgid, o.leader, processGroupGoneBound); err != nil {
+		return fmt.Errorf("drain residuals group empty: %w", err)
+	}
 	// One more causal sample+kill pass for late forks still in the owned tree.
 	if err := o.sample(); err != nil {
 		return fmt.Errorf("drain residuals re-sample: %w", err)
@@ -418,6 +423,7 @@ func (o *ownedSubprocess) drainResidualsWhileLeaderLive() error {
 	}
 	// Marker lineage residual: processes that still hold the inherited
 	// ownership marker FD. Authority is the marker, not path/start-time.
+	// Loop until no live marked holders remain (or bound) — fail closed.
 	if err := o.adoptAndKillMarkedResiduals(); err != nil {
 		return err
 	}
@@ -426,33 +432,92 @@ func (o *ownedSubprocess) drainResidualsWhileLeaderLive() error {
 
 // adoptAndKillMarkedResiduals discovers processes that still hold the
 // inherited ownership marker open and identity-kills them via start-time
-// tokens. Self, ancestors, and the ownership supervisor leader are excluded.
+// tokens, repeating until none remain or the bound elapses (fail closed).
+// Self, ancestors, and the ownership supervisor leader are excluded.
 // Unrelated processes that merely open a descendant under the candidate —
 // without the marker — are never adopted (worktree isolation).
 func (o *ownedSubprocess) adoptAndKillMarkedResiduals() error {
 	if o == nil || o.markerPath == "" {
 		return nil
 	}
-	toks, err := processesHoldingMarker(o.markerPath)
-	if err != nil {
-		return fmt.Errorf("drain residuals marker lineage: %w", err)
-	}
-	toks = filterResidualTokens(toks, o.leader)
-	for _, tok := range toks {
-		if tok.pid <= 1 || tok.pid == o.leader || tok.pid == os.Getpid() {
-			continue
+	deadline := time.Now().Add(processGroupGoneBound)
+	for {
+		// Leader must still be live for safe Darwin drain window.
+		o.mu.Lock()
+		leaderH, ok := o.handles[o.leader]
+		o.mu.Unlock()
+		if !ok || !leaderH.tok.stillSame() {
+			return fmt.Errorf("drain residuals marker lineage: supervisor leader not live")
 		}
-		if err := o.noteCausal(tok); err != nil {
-			if !tok.stillSame() {
+		toks, err := processesHoldingMarker(o.markerPath)
+		if err != nil {
+			return fmt.Errorf("drain residuals marker lineage: %w", err)
+		}
+		toks = filterResidualTokens(toks, o.leader)
+		live := make([]procToken, 0, len(toks))
+		for _, tok := range toks {
+			if tok.pid <= 1 || tok.pid == o.leader || tok.pid == os.Getpid() {
 				continue
 			}
-			return fmt.Errorf("drain residuals note marker lineage pid %d: %w", tok.pid, err)
+			if !tok.isLiveTarget() {
+				continue
+			}
+			live = append(live, tok)
 		}
+		if len(live) == 0 {
+			return nil
+		}
+		for _, tok := range live {
+			if err := o.noteCausal(tok); err != nil {
+				if !tok.stillSame() {
+					continue
+				}
+				return fmt.Errorf("drain residuals note marker lineage pid %d: %w", tok.pid, err)
+			}
+		}
+		if err := o.killTracked(false); err != nil {
+			return fmt.Errorf("drain residuals kill marker lineage: %w", err)
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("%w: marked residual still live after %s (n=%d)",
+				ErrResidualOwnedTree, processGroupGoneBound, len(live))
+		}
+		time.Sleep(time.Millisecond)
 	}
-	if err := o.killTracked(false); err != nil {
-		return fmt.Errorf("drain residuals kill marker lineage: %w", err)
+}
+
+// waitProcessGroupEmptyExcept repeatedly membership-kills and probes until
+// pgid has no live members other than exceptPID, or the bound elapses.
+func waitProcessGroupEmptyExcept(pgid, exceptPID int, bound time.Duration) error {
+	if pgid <= 0 {
+		return fmt.Errorf("wait process group empty: invalid pgid %d", pgid)
 	}
-	return nil
+	deadline := time.Now().Add(bound)
+	for {
+		snap, err := snapshotProcesses()
+		if err != nil {
+			return fmt.Errorf("wait process group empty: snapshot: %w", err)
+		}
+		live := 0
+		for _, tok := range snap.membersOfGroup(pgid) {
+			if exceptPID > 0 && tok.pid == exceptPID {
+				continue
+			}
+			if tok.isLiveTarget() {
+				live++
+			}
+		}
+		if live == 0 {
+			return nil
+		}
+		if err := killProcessGroupMembersExcept(pgid, exceptPID); err != nil {
+			return err
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("process group %d still has %d live non-leader members after %s", pgid, live, bound)
+		}
+		time.Sleep(time.Millisecond)
+	}
 }
 
 func (o *ownedSubprocess) noteCausal(tok procToken) error {
