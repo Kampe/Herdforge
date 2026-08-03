@@ -695,31 +695,42 @@ while [ ! -s "$1" ]; do :; done
 exit 0
 `
 
-// productionDetachedOnlyScript: adversarial double-fork writer. Intermediate
-// parents exit immediately (no keep-alive). Grandchild stays in the supervisor
-// process group (no setsid) so residual membership kill at "done" owns it.
+// productionDetachedOnlyScript: adversarial setsid + double-fork residual writer.
+// Intermediate parents exit immediately (no keep-alive). The grandchild calls
+// os.setsid() so it is NOT a member of the original process group — membership
+// kill alone cannot own it. Production must discover it via candidate-path
+// residual ownership (open FD on writetarget) and identity-kill by token.
 //
 // $1=writerPid $2=writetarget
 const productionDetachedOnlyScript = `
 python3 -c '
 import os, sys
 path, target = sys.argv[1], sys.argv[2]
-# Double-fork: parent exits immediately; grandchild reparents but keeps pgid.
+# First fork + setsid: leave the original process group / session.
 if os.fork() > 0:
     os._exit(0)
+os.setsid()
+# Second fork: intermediate session leader exits; grandchild is reparented
+# outside the original pgid and is not a session leader wait-edge.
 if os.fork() > 0:
     os._exit(0)
+# Open a descendant file under the candidate FIRST, then chdir AWAY so
+# directory-inode-only residual discovery cannot see cwd. Path residual must
+# find the open descendant FD (non-vacuous proof).
+out = open(target, "a", encoding="utf-8")
+os.chdir("/")
 with open(path, "w", encoding="utf-8") as f:
     f.write("%d\n" % os.getpid())
 while True:
-    with open(target, "a", encoding="utf-8") as f:
-        f.write("w")
+    out.write("w")
+    out.flush()
 ' "$1" "$2" </dev/null >/dev/null 2>&1
 while [ ! -s "$1" ]; do :; done
 exit 0
 `
 
-// productionDetachedSessionScript: same-group background + double-fork residual.
+// productionDetachedSessionScript: same-group background + real setsid residual
+// that chdirs away while retaining an open descendant FD under the candidate.
 // $1=sessionPid $2=writetarget $3=groupPid
 const productionDetachedSessionScript = `
 sh -c 'printf "%s\n" "$$" > "$1"; while true; do printf g >> "$2"; done' grpwriter "$3" "$2" </dev/null >/dev/null 2>&1 &
@@ -728,13 +739,16 @@ import os, sys
 path, target = sys.argv[1], sys.argv[2]
 if os.fork() > 0:
     os._exit(0)
+os.setsid()
 if os.fork() > 0:
     os._exit(0)
+out = open(target, "a", encoding="utf-8")
+os.chdir("/")
 with open(path, "w", encoding="utf-8") as f:
     f.write("%d\n" % os.getpid())
 while True:
-    with open(target, "a", encoding="utf-8") as f:
-        f.write("w")
+    out.write("w")
+    out.flush()
 ' "$1" "$2" </dev/null >/dev/null 2>&1
 while [ ! -s "$3" ]; do :; done
 while [ ! -s "$1" ]; do :; done
@@ -916,13 +930,110 @@ func TestExecuteCancelAfterStartClosesProcessGroup(t *testing.T) {
 	}
 }
 
+// TestProcessesTouchingDirFindsChdirAwayOpenDescendant is the non-vacuous unit
+// proof that path residual ownership discovers a setsid writer that chdir'd
+// away from the candidate while retaining an open descendant file FD — not
+// directory-inode/cwd-only discovery.
+func TestProcessesTouchingDirFindsChdirAwayOpenDescendant(t *testing.T) {
+	if _, err := exec.LookPath("python3"); err != nil {
+		t.Skip("python3 required for chdir-away residual fixture")
+	}
+	dir := t.TempDir()
+	pidFile := filepath.Join(dir, "writer.pid")
+	target := filepath.Join(dir, "nested", "residue.log")
+	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Adversarial: setsid + double-fork, open descendant, chdir to /.
+	cmd := exec.Command("python3", "-c", `
+import os, sys, time
+path, target = sys.argv[1], sys.argv[2]
+if os.fork() > 0:
+    os._exit(0)
+os.setsid()
+if os.fork() > 0:
+    os._exit(0)
+out = open(target, "a", encoding="utf-8")
+os.chdir("/")
+with open(path, "w", encoding="utf-8") as f:
+    f.write("%d\n" % os.getpid())
+while True:
+    out.write("w")
+    out.flush()
+    time.sleep(0.05)
+`, pidFile, target)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+		forceKillTrackedPID(t, pidFile)
+	})
+	pid, err := waitForChildReadyPID(pidFile, 5*time.Second)
+	if err != nil {
+		t.Fatalf("writer ready: %v", err)
+	}
+	// Writer cwd is / — directory-inode-only residual would miss it.
+	if cwd, cerr := exec.Command("ps", "-o", "cwd=", "-p", strconv.Itoa(pid)).Output(); cerr == nil {
+		cwdS := strings.TrimSpace(string(cwd))
+		if cwdS != "" && cwdS != "/" && !strings.HasSuffix(cwdS, ":/") {
+			// Best-effort: some ps builds lack cwd=; do not fail the test.
+			t.Logf("writer cwd observed as %q (expected /)", cwdS)
+		}
+	}
+	toks, err := processesTouchingDir(dir)
+	if err != nil {
+		t.Fatalf("processesTouchingDir: %v", err)
+	}
+	toks = filterResidualTokens(toks, -1)
+	found := false
+	for _, tok := range toks {
+		if tok.pid == pid {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("path residual must find chdir-away writer pid %d holding open descendant under candidate; got %v", pid, toks)
+	}
+	// Control plane must never appear in residual kill set.
+	excl := residualExcludePIDs()
+	for _, tok := range toks {
+		if _, bad := excl[tok.pid]; bad {
+			t.Fatalf("path residual must not include control-plane pid %d", tok.pid)
+		}
+		if tok.pid == os.Getpid() {
+			t.Fatalf("path residual must not include verifier self pid %d", tok.pid)
+		}
+	}
+}
+
+// TestResidualExcludePIDsCoversSelfAndParent is a non-vacuous guard that the
+// control-plane exclusion set always contains the verifier and its parent.
+func TestResidualExcludePIDsCoversSelfAndParent(t *testing.T) {
+	excl := residualExcludePIDs()
+	self := os.Getpid()
+	if _, ok := excl[self]; !ok {
+		t.Fatalf("residualExcludePIDs must include self %d", self)
+	}
+	ppid := os.Getppid()
+	if ppid > 1 {
+		if _, ok := excl[ppid]; !ok {
+			t.Fatalf("residualExcludePIDs must include parent %d", ppid)
+		}
+	}
+}
+
 // TestExecuteDetachedOnlySessionWriterBlocksAndReaps is the production-path
-// proof for adversarial double-fork residual writers (intermediate parents
-// exit immediately; no Python keep-alive). Execute must BLOCKED and the
-// writer must be gone without test-side teardown kill.
+// proof for adversarial setsid+double-fork residual writers that chdir away
+// while retaining an open descendant FD. Intermediate parents exit immediately;
+// grandchild leaves the original process group via setsid. Execute must BLOCKED
+// via path residual ownership and the writer must be gone without test teardown.
 func TestExecuteDetachedOnlySessionWriterBlocksAndReaps(t *testing.T) {
 	if _, err := exec.LookPath("python3"); err != nil {
-		t.Skip("python3 required for double-fork residual writer fixture")
+		t.Skip("python3 required for setsid residual writer fixture")
 	}
 	dir := t.TempDir()
 	pidFile := filepath.Join(dir, "session.pid")
@@ -944,11 +1055,11 @@ func TestExecuteDetachedOnlySessionWriterBlocksAndReaps(t *testing.T) {
 }
 
 // TestExecuteDetachedOnlyMutationOmittingFinalizeLeavesWriter proves the
-// double-fork residual fixture fails the incomplete ownership shape
+// setsid residual fixture fails the incomplete ownership shape
 // (PASS + live writer) when drain+finalize are muted.
 func TestExecuteDetachedOnlyMutationOmittingFinalizeLeavesWriter(t *testing.T) {
 	if _, err := exec.LookPath("python3"); err != nil {
-		t.Skip("python3 required for double-fork residual writer fixture")
+		t.Skip("python3 required for setsid residual writer fixture")
 	}
 	dir := t.TempDir()
 	pidFile := filepath.Join(dir, "session.pid")
@@ -995,11 +1106,11 @@ func TestExecuteDetachedOnlyMutationOmittingFinalizeLeavesWriter(t *testing.T) {
 	}
 }
 
-// TestExecuteDetachedSessionAndBackgroundWriters covers double-fork + same-group
+// TestExecuteDetachedSessionAndBackgroundWriters covers real setsid + same-group
 // residual; production must BLOCKED and both writers gone via owned tree close.
 func TestExecuteDetachedSessionAndBackgroundWriters(t *testing.T) {
 	if _, err := exec.LookPath("python3"); err != nil {
-		t.Skip("python3 required for double-fork residual writer fixture")
+		t.Skip("python3 required for setsid residual writer fixture")
 	}
 	dir := t.TempDir()
 	sessionPidFile := filepath.Join(dir, "session.pid")
@@ -1109,7 +1220,7 @@ func TestOwnedNeverReplacesTokenOnPIDReuse(t *testing.T) {
 		_ = cmd.Process.Kill()
 		_ = cmd.Wait()
 	})
-	owned, err := adoptOwnedCmd(cmd, nil, nil)
+	owned, err := adoptOwnedCmd(cmd, nil, nil, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1143,7 +1254,7 @@ func TestOwnedFreezeRejectsPostLeaderGroupAdoption(t *testing.T) {
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
-	owned, err := adoptOwnedCmd(cmd, nil, nil)
+	owned, err := adoptOwnedCmd(cmd, nil, nil, "")
 	if err != nil {
 		t.Fatal(err)
 	}

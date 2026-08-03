@@ -11,9 +11,9 @@ import (
 )
 
 // processesTouchingDir returns causal tokens for processes that still hold the
-// candidate directory open (cwd or any FD path under root). This is structural
-// residual ownership: setsid/double-fork cannot hide a writer that mutates the
-// candidate. Snapshot/path errors fail closed.
+// candidate open via cwd or any open FD path under root (including after
+// chdir-away). Control-plane PIDs (self + ancestors) are excluded. Fail-closed
+// on unrecoverable /proc errors.
 func processesTouchingDir(root string) ([]procToken, error) {
 	abs, err := filepath.Abs(root)
 	if err != nil {
@@ -33,7 +33,7 @@ func processesTouchingDir(root string) ([]procToken, error) {
 	if err != nil {
 		return nil, fmt.Errorf("processesTouchingDir /proc: %w", err)
 	}
-	self := os.Getpid()
+	excl := residualExcludePIDs()
 	var out []procToken
 	seen := map[int]struct{}{}
 	for _, e := range entries {
@@ -41,7 +41,10 @@ func processesTouchingDir(root string) ([]procToken, error) {
 			continue
 		}
 		pid, err := strconv.Atoi(e.Name())
-		if err != nil || pid <= 1 || pid == self {
+		if err != nil || pid <= 1 {
+			continue
+		}
+		if _, skip := excl[pid]; skip {
 			continue
 		}
 		if touches, terr := linuxPIDTouchesDir(pid, abs); terr != nil {
@@ -74,7 +77,7 @@ func processesTouchingDir(root string) ([]procToken, error) {
 }
 
 func linuxPIDTouchesDir(pid int, root string) (bool, error) {
-	// cwd
+	// cwd under root counts (writer still rooted in candidate).
 	if cwd, err := os.Readlink(fmt.Sprintf("/proc/%d/cwd", pid)); err == nil {
 		if pathUnderRoot(cwd, root) {
 			return true, nil
@@ -82,7 +85,7 @@ func linuxPIDTouchesDir(pid int, root string) (bool, error) {
 	} else if !os.IsNotExist(err) && !isESRCH(err) && !os.IsPermission(err) {
 		// keep scanning fds; permission on cwd alone is not fatal
 	}
-	// open fds
+	// open fds — includes descendant files after chdir-away.
 	fdDir := fmt.Sprintf("/proc/%d/fd", pid)
 	fds, err := os.ReadDir(fdDir)
 	if err != nil {

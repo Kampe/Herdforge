@@ -11,11 +11,15 @@ import (
 	"strings"
 )
 
-// processesTouchingDir returns causal tokens for processes that hold open the
-// candidate directory (cwd or any open path under root), discovered via lsof.
-// This is structural residual ownership for Darwin (no PID namespace/subreaper):
-// a setsid/double-fork writer that still mutates the candidate remains visible.
-// lsof / parse failures fail closed.
+// processesTouchingDir returns causal tokens for processes that still hold any
+// path under the candidate root open (cwd OR any open descendant file FD).
+// Discovery uses a full open-file table filtered by path-under-root — not
+// directory-inode-only — so a setsid writer that chdir's away but keeps a
+// descendant file open remains visible. Control-plane PIDs (self + ancestors)
+// are excluded so residual ownership never targets the verifier/daemon.
+//
+// Fail-closed: lsof binary/tool failure with no parseable stdout is an error.
+// lsof exit 1 with empty stdout means no match (empty residual set).
 func processesTouchingDir(root string) ([]procToken, error) {
 	abs, err := filepath.Abs(root)
 	if err != nil {
@@ -32,19 +36,25 @@ func processesTouchingDir(root string) ([]procToken, error) {
 	abs = filepath.Clean(abs)
 	privateAbs = filepath.Clean(privateAbs)
 
-	// -n: no host resolution; -F pn: machine parseable pid + name fields.
-	// No +D (slow recursive); we filter paths under root ourselves.
+	// Full open-file table, filtered by path-under-root. This is O(open files
+	// on host) rather than O(tree size); it finds descendant FDs after chdir.
+	// -n: no host resolution; -F pn: machine-parseable pid + name fields.
 	cmd := exec.Command("lsof", "-n", "-F", "pn")
 	out, err := cmd.Output()
 	if err != nil {
-		// lsof returns 1 when it finds no matches or partial; still parse stdout.
-		if ee, ok := err.(*exec.ExitError); ok && len(ee.Stderr) == 0 && len(out) > 0 {
-			// fall through with partial output
+		if ee, ok := err.(*exec.ExitError); ok {
+			if len(out) == 0 {
+				// No open files matched anything lsof could report.
+				_ = ee
+				return nil, nil
+			}
+			// Partial output: parse what we got.
 		} else if len(out) == 0 {
 			return nil, fmt.Errorf("processesTouchingDir lsof: %w", err)
 		}
 	}
-	self := os.Getpid()
+
+	excl := residualExcludePIDs()
 	var (
 		curPID int
 		outTok []procToken
@@ -63,10 +73,17 @@ func processesTouchingDir(root string) ([]procToken, error) {
 			}
 			curPID = pid
 		case 'n':
-			if curPID <= 1 || curPID == self {
+			if curPID <= 1 {
+				continue
+			}
+			if _, skip := excl[curPID]; skip {
 				continue
 			}
 			name := line[1:]
+			// lsof may append (mount flags) etc.; take the path token.
+			if i := strings.IndexByte(name, ' '); i >= 0 {
+				name = name[:i]
+			}
 			if !pathUnderRootDarwin(name, abs) && !pathUnderRootDarwin(name, privateAbs) {
 				continue
 			}

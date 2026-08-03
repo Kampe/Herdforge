@@ -227,7 +227,7 @@ func (v *Verifier) execute(ctx context.Context, dir string, policy EnvironmentPo
 	_ = statusW.Close()
 	_ = ackR.Close()
 
-	owned, adoptErr := adoptOwnedCmd(cmd, statusR, ackW)
+	owned, adoptErr := adoptOwnedCmd(cmd, statusR, ackW, dir)
 	if adoptErr != nil {
 		var parts []string
 		parts = append(parts, "adopt owned cmd: "+adoptErr.Error())
