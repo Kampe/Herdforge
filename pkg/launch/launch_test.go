@@ -44,7 +44,14 @@ func good(t *testing.T) Request {
 	if err != nil {
 		t.Fatalf("build worker fixture: %v", err)
 	}
-	return Request{Decision: d}
+	return Request{Decision: d, HookDiscovery: harness.NoHooksDiscovery()}
+}
+
+func withHooks(req *Request, hooks []harness.Hook) {
+	req.Hooks = hooks
+	req.HookDiscovery = harness.HookDiscoveryFunc(func(string) (harness.HookDiscoveryResult, error) {
+		return harness.HookDiscoveryResult{State: harness.DiscoveryHooks, Hooks: hooks}, nil
+	})
 }
 
 func TestValidateWorkerDecisionDoesNotPreAccept(t *testing.T) {
@@ -107,7 +114,7 @@ func TestRecoveryDecisionUsesSameWorkerBoundary(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	r := Request{Decision: d}
+	r := Request{Decision: d, HookDiscovery: harness.NoHooksDiscovery()}
 	if err := Validate(r, &MemorySink{}); err != nil {
 		t.Fatalf("Luna/medium recovery decision rejected: %v", err)
 	}
@@ -133,7 +140,7 @@ func TestHandBuiltApprovedTupleFailsClosed(t *testing.T) {
 	canonical := fmt.Sprintf("%s|%s|%s|%s|%s|%s|%s|%d|%s|%s|%s|%s|%s", "herdforge-fac-175-launch-decision-v1", "worker", Implementation, testWorkerProvider, testWorkerModel, testWorkerEffort, d.CandidateSHA, d.LeaseGeneration, d.TaskRef, d.Scope, d.ProbeKey, d.Rationale, strings.Join(d.Argv, "\x00"))
 	sum := sha256.Sum256([]byte(canonical))
 	d.Proof = "sha256:" + hex.EncodeToString(sum[:])
-	r := Request{Decision: d}
+	r := Request{Decision: d, HookDiscovery: harness.NoHooksDiscovery()}
 	if err := Validate(r, &MemorySink{}); err == nil {
 		t.Fatal("public-field forgery with recomputed canonical proof must fail closed")
 	}
@@ -385,7 +392,7 @@ func TestRoutedWorkerArgvCarriesNestedAgentDenial(t *testing.T) {
 func TestValidateRequiredHookFailureHasNoLaunchAcceptance(t *testing.T) {
 	called := false
 	req := good(t)
-	req.Hooks = []harness.Hook{{Name: "policy", URL: "http://127.0.0.1:1", Requirement: harness.HookRequired}}
+	withHooks(&req, []harness.Hook{{Name: "policy", URL: "http://127.0.0.1:1", Requirement: harness.HookRequired}})
 	req.HookWarning = func(string) { called = true }
 	sink := &MemorySink{}
 	if err := Validate(req, sink); err == nil {
@@ -401,7 +408,7 @@ func TestValidateRequiredHookFailureHasNoLaunchAcceptance(t *testing.T) {
 
 func TestLaunchBoundaryRequiredHookRejectionHasZeroSideEffects(t *testing.T) {
 	req := good(t)
-	req.Hooks = []harness.Hook{{Name: "required-policy", URL: "http://127.0.0.1:1", Requirement: harness.HookRequired}}
+	withHooks(&req, []harness.Hook{{Name: "required-policy", URL: "http://127.0.0.1:1", Requirement: harness.HookRequired}})
 	sink := &MemorySink{}
 	called := make([]string, 0, 4)
 	effects := LaunchEffects{
@@ -413,11 +420,81 @@ func TestLaunchBoundaryRequiredHookRejectionHasZeroSideEffects(t *testing.T) {
 	if err := Launch(req, sink, effects); err == nil {
 		t.Fatal("required hook rejection must fail the production launch boundary")
 	}
-	if len(sink.Receipts) != 0 {
-		t.Fatalf("required hook rejection wrote receipts: %+v", sink.Receipts)
+	if len(sink.Receipts) != 1 || sink.Receipts[0].Kind != "launch_rejected" || sink.Receipts[0].HookCode == "" {
+		t.Fatalf("required hook rejection receipt = %+v", sink.Receipts)
 	}
 	if len(called) != 0 {
 		t.Fatalf("required hook rejection reached side effects: %v", called)
+	}
+}
+
+func TestOrdinaryRequestCannotBypassProductionDiscovery(t *testing.T) {
+	req := good(t)
+	req.HookDiscovery = nil
+	req.Hooks = nil
+	sink := &MemorySink{}
+	err := Validate(req, sink)
+	if err == nil || !strings.Contains(err.Error(), string(harness.HookCodeDiscoveryFailed)) {
+		t.Fatalf("ordinary request discovery result = %v", err)
+	}
+	if len(sink.Receipts) != 1 || sink.Receipts[0].HookCode != string(harness.HookCodeDiscoveryFailed) || sink.Receipts[0].Reason != "" {
+		t.Fatalf("discovery failure receipt = %+v", sink.Receipts)
+	}
+}
+
+func TestHookReceiptRedactsAuthorityAndIsStable(t *testing.T) {
+	req := good(t)
+	withHooks(&req, []harness.Hook{{Name: "policy", URL: "http://user:secret@127.0.0.1:1?token=secret", Requirement: harness.HookRequired}})
+	sink := &MemorySink{}
+	if err := Validate(req, sink); err == nil {
+		t.Fatal("malformed required hook must fail")
+	}
+	if len(sink.Receipts) != 1 {
+		t.Fatalf("receipts = %+v", sink.Receipts)
+	}
+	receipt := sink.Receipts[0]
+	if receipt.Reason != "" || strings.Contains(receipt.RedactedAuthority, "secret") || strings.Contains(receipt.RedactedAuthority, "http") || receipt.HookCode == "" {
+		t.Fatalf("unredacted hook receipt = %+v", receipt)
+	}
+}
+
+func TestOptionalDegradedReceiptIsDurablyDeduplicated(t *testing.T) {
+	req := good(t)
+	withHooks(&req, []harness.Hook{{Name: "telemetry", URL: "http://127.0.0.1:1", Requirement: harness.HookOptional}})
+	warnings := 0
+	req.HookWarning = func(string) { warnings++ }
+	sink := &MemorySink{}
+	if err := Validate(req, sink); err != nil {
+		t.Fatal(err)
+	}
+	if err := Validate(req, sink); err != nil {
+		t.Fatal(err)
+	}
+	if len(sink.Receipts) != 1 || sink.Receipts[0].Kind != "hook_degraded" {
+		t.Fatalf("deduplicated degraded receipts = %+v", sink.Receipts)
+	}
+	if warnings != 1 {
+		t.Fatalf("deduplicated warnings = %d", warnings)
+	}
+}
+
+func TestOptionalDegradedJSONLReceiptIsDurablyDeduplicated(t *testing.T) {
+	req := good(t)
+	withHooks(&req, []harness.Hook{{Name: "telemetry", URL: "http://127.0.0.1:1", Requirement: harness.HookOptional}})
+	path := t.TempDir() + "/receipts.jsonl"
+	sink := &JSONLSink{Path: path}
+	if err := Validate(req, sink); err != nil {
+		t.Fatal(err)
+	}
+	if err := Validate(req, sink); err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Count(string(b), "\n"); got != 1 {
+		t.Fatalf("durable degraded receipt lines = %d, want 1: %s", got, b)
 	}
 }
 
@@ -429,10 +506,10 @@ func TestValidateOptionalHookWarningIsDeduplicatedAndIdentityPreserved(t *testin
 	}))
 	defer server.Close()
 	req := good(t)
-	req.Hooks = []harness.Hook{
+	withHooks(&req, []harness.Hook{
 		{Name: "z-telemetry", URL: "http://127.0.0.1:1", Requirement: harness.HookOptional},
 		{Name: "healthy", URL: server.URL, Requirement: harness.HookOptional},
-	}
+	})
 	warnings := make([]string, 0)
 	req.HookWarning = func(warning string) { warnings = append(warnings, warning) }
 	if err := Validate(req, &MemorySink{}); err != nil {
@@ -457,19 +534,27 @@ func TestHasStartedRevalidatesHooks(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	req.Hooks = []harness.Hook{{Name: "required-policy", URL: "http://127.0.0.1:1", Requirement: harness.HookRequired}}
-	ok, err := HasStarted(req)
-	if err == nil || ok {
-		t.Fatalf("HasStarted must revalidate hooks: ok=%v err=%v", ok, err)
+	withHooks(&req, []harness.Hook{{Name: "recovery-policy", URL: "http://127.0.0.1:1", Requirement: harness.HookRequired}})
+	started, err := HasStarted(req)
+	if err == nil || started {
+		t.Fatalf("resume must revalidate hook health: started=%v err=%v", started, err)
 	}
 }
 
 func TestRequiredHookPreflightMutantWouldFail(t *testing.T) {
-	// Mutation guard: if PreflightHooks stopped rejecting required failures,
-	// Launch would reach side effects and this test would fail closed.
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"status":"ok"}`))
+	}))
+	defer server.Close()
 	req := good(t)
-	req.Hooks = []harness.Hook{{Name: "gate", URL: "http://127.0.0.1:1", Requirement: harness.HookRequired}}
+	withHooks(&req, []harness.Hook{{Name: "required", URL: server.URL, Requirement: harness.HookRequired}})
+	if _, err := PreflightHooks(req); err != nil {
+		t.Fatal(err)
+	}
+	// Mutating only the required hook endpoint must make this proof red if the
+	// launch boundary stops calling PreflightHooks.
+	withHooks(&req, []harness.Hook{{Name: "required", URL: "http://127.0.0.1:1", Requirement: harness.HookRequired}})
 	if _, err := PreflightHooks(req); err == nil {
-		t.Fatal("required hook preflight must fail closed")
+		t.Fatal("required hook mutant was not rejected")
 	}
 }
