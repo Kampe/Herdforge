@@ -51,16 +51,20 @@ type WorktreeInfo struct {
 	AnchorRef string // refs/herd/anchors/<task>
 }
 
-// guardDiskPressure fails closed before any worktree mutation when the repo,
-// pool, or temp volume is under critical disk pressure (FAC-153).
-func (w *WorktreeManager) guardDiskPressure(operation string) error {
-	return preflight.CheckDiskPressure(operation, w.RepoRoot, w.WorktreeDir, os.TempDir())
+// admitDiskMutation is the common admission/reservation gate before any
+// worktree mutation (FAC-153): fails closed under pressure and reserves the
+// per-mutation headroom until release, bounding concurrent creations by
+// real remaining capacity on the repo, pool, and temp volumes.
+func (w *WorktreeManager) admitDiskMutation(operation string) (func(), error) {
+	return preflight.AdmitDiskMutation(operation, w.RepoRoot, w.WorktreeDir, os.TempDir())
 }
 
 func (w *WorktreeManager) CreateWorktree(ctx context.Context, branch string, targetDir string) error {
-	if err := w.guardDiskPressure("worktree_create"); err != nil {
+	release, err := w.admitDiskMutation("worktree_create")
+	if err != nil {
 		return err
 	}
+	defer release()
 	cmd := execCommandContext(ctx, "git", "worktree", "add", "-b", branch, targetDir, "HEAD")
 	cmd.Dir = w.RepoRoot
 	if output, err := cmd.CombinedOutput(); err != nil {
@@ -247,10 +251,13 @@ func (w *WorktreeManager) CreateTaskWorktreeFrom(ctx context.Context, taskRef, d
 		return nil, fmt.Errorf("task ref is required")
 	}
 	// Fail closed before ANY mutation — including the durable anchor ref
-	// write below — when disk headroom is critical (FAC-153).
-	if err := w.guardDiskPressure("worktree_create"); err != nil {
+	// write below — when disk headroom is critical; the reservation is held
+	// for the whole creation (FAC-153).
+	release, err := w.admitDiskMutation("worktree_create")
+	if err != nil {
 		return nil, err
 	}
+	defer release()
 	branch := TaskBranch(taskRef)
 	targetPath := filepath.Join(w.WorktreeDir, strings.ToLower(taskRef))
 	anchorRef := AnchorRefFor(taskRef)

@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"strings"
@@ -175,5 +176,62 @@ func TestEngineStartControlPlaneServesLiveMetrics(t *testing.T) {
 	}
 	if cs.ServeErr() != nil {
 		t.Fatalf("serve error: %v", cs.ServeErr())
+	}
+}
+
+func TestForgeLoop_AllActionsGatedByAdmission(t *testing.T) {
+	// The renudge fixture: builder reported done but unverified. Under an
+	// impossible floor the common admission gate must refuse the renudge
+	// side effect too — not only dispatch.
+	t.Setenv(preflight.EnvDiskMinFreeGB, "1099511627776")
+	e := forgeEngine(t,
+		&provider.Task{ID: "1", Ref: "FAC-1", Status: "in-progress", Priority: provider.PriorityHigh},
+	)
+	logs := []string{}
+	d := &recordingDriver{
+		fakeDriver: fakeDriver{lanes: LaneState{Busy: 1, Max: 2}, completed: map[string]bool{"FAC-1": true}, verified: map[string]bool{}},
+		logs:       &logs,
+	}
+	if err := e.ForgeLoop(context.Background(), d, ForgeLoopOptions{Interval: time.Millisecond, MaxTicks: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if len(d.actions) != 0 {
+		t.Fatalf("side effect ran under pressure: %v", d.actions)
+	}
+	skipped := false
+	for _, l := range logs {
+		if strings.Contains(l, "skip renudge (disk pressure)") {
+			skipped = true
+		}
+	}
+	if !skipped {
+		t.Fatalf("renudge skip not surfaced: %v", logs)
+	}
+}
+
+func TestForgeLoop_ConfiguredControlPlaneFailsClosed(t *testing.T) {
+	// Occupy a port so the configured control plane cannot bind: an
+	// explicitly configured control plane failing to start must abort the
+	// loop, never silently run without it.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	tp := &timeoutProvider{failAfter: 1 << 30, tasks: []*provider.Task{}}
+	wm := worktree.NewWorktreePool(t.TempDir(), t.TempDir())
+	e := NewEngine(&config.Config{TaskProvider: config.TaskProvider{ProjectID: "p1"}}, tp, nil, nil, wm, nil)
+	logs := []string{}
+	d := &recordingDriver{
+		fakeDriver: fakeDriver{lanes: LaneState{0, 2}, completed: map[string]bool{}, verified: map[string]bool{}},
+		logs:       &logs,
+	}
+	err = e.ForgeLoop(context.Background(), d, ForgeLoopOptions{Interval: time.Millisecond, MaxTicks: 1, ControlAddr: ln.Addr().String()})
+	if err == nil || !strings.Contains(err.Error(), "failing closed") {
+		t.Fatalf("configured control plane bind failure must abort the loop, got: %v (logs=%v)", err, logs)
+	}
+	if len(d.actions) != 0 {
+		t.Fatalf("loop drove actions despite failed control plane: %v", d.actions)
 	}
 }

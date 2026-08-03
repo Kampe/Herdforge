@@ -67,22 +67,43 @@ type ForgeLoopOptions struct {
 // FAC-150: when the task provider times out, health becomes
 // BLOCKED(provider_timeout). The next tick transitions to recovering and
 // re-probes without claiming work until a successful bound call returns ok.
-func (e *Engine) ForgeLoop(ctx context.Context, d ForgeDriver, opts ForgeLoopOptions) error {
+func (e *Engine) ForgeLoop(ctx context.Context, d ForgeDriver, opts ForgeLoopOptions) (retErr error) {
 	interval := opts.Interval
 	if interval <= 0 {
 		interval = 5 * time.Second
 	}
 
 	// Production control plane (FAC-153): live disk metrics + authorized
-	// exact-target reclamation for the lifetime of the loop.
+	// exact-target reclamation for the lifetime of the loop. EXPLICITLY
+	// configured means fail closed: the loop must not silently run without
+	// the promised health/control plane, and a teardown failure is a real
+	// error, not a discarded one.
 	if addr := cmpOr(opts.ControlAddr, os.Getenv(EnvControlAddr)); addr != "" {
 		cs, err := e.StartControlPlane(ctx, addr, d.Log)
 		if err != nil {
-			d.Log("forge: control server failed to start: " + err.Error())
-		} else {
-			d.Log("forge: control server on " + cs.BoundAddr())
-			defer func() { _ = cs.Stop(context.Background()) }()
+			return fmt.Errorf("forge: configured control plane failed to start (failing closed): %w", err)
 		}
+		d.Log("forge: control server on " + cs.BoundAddr())
+		defer func() {
+			if stopErr := cs.Stop(context.Background()); stopErr != nil {
+				d.Log("forge: control server stop failed: " + stopErr.Error())
+				if retErr == nil {
+					retErr = fmt.Errorf("control server stop: %w", stopErr)
+				}
+			}
+		}()
+	}
+
+	// admitAction is the common disk admission/reservation gate for every
+	// disk-growing side effect the loop drives (FAC-153). The reservation
+	// is held for the duration of the action.
+	admitAction := func(op string) (func(), bool) {
+		release, err := preflight.AdmitDiskMutation(op, e.diskPaths()...)
+		if err != nil {
+			d.Log("forge: " + e.DiskStatus() + " — skip " + op + " (disk pressure)")
+			return nil, false
+		}
+		return release, true
 	}
 
 	for tick := 0; opts.MaxTicks == 0 || tick < opts.MaxTicks; tick++ {
@@ -111,20 +132,35 @@ func (e *Engine) ForgeLoop(ctx context.Context, d ForgeDriver, opts ForgeLoopOpt
 
 		switch action.Kind {
 		case ActionApprove:
+			release, ok := admitAction("approve")
+			if !ok {
+				break
+			}
 			d.Log("forge: approve " + action.Ref)
 			if err := d.Approve(ctx, action.Task); err != nil {
 				d.Log(fmt.Sprintf("forge: approve %s failed: %v", action.Ref, err))
 			}
+			release()
 		case ActionReview:
+			release, ok := admitAction("review")
+			if !ok {
+				break
+			}
 			d.Log("forge: review " + action.Ref)
 			if err := d.Review(ctx, action.Task); err != nil {
 				d.Log(fmt.Sprintf("forge: review %s failed: %v", action.Ref, err))
 			}
+			release()
 		case ActionRenudge:
+			release, ok := admitAction("renudge")
+			if !ok {
+				break
+			}
 			d.Log("forge: re-nudge " + action.Ref + " (reported done but failed verify)")
 			if err := d.Renudge(ctx, action.Task); err != nil {
 				d.Log(fmt.Sprintf("forge: renudge %s failed: %v", action.Ref, err))
 			}
+			release()
 		case ActionDispatch:
 			if e.health.isBlocked() {
 				d.Log("forge: " + e.ProviderStatus() + " — skip dispatch")
@@ -143,10 +179,15 @@ func (e *Engine) ForgeLoop(ctx context.Context, d ForgeDriver, opts ForgeLoopOpt
 				d.Log(fmt.Sprintf("forge: disk soft pressure — serializing dispatch (%d lane(s) busy)", lanes.Busy))
 				break
 			}
+			release, ok := admitAction("dispatch")
+			if !ok {
+				break
+			}
 			d.Log("forge: dispatch " + action.Ref)
 			if err := d.Dispatch(ctx, action.Task); err != nil {
 				d.Log(fmt.Sprintf("forge: dispatch %s failed: %v", action.Ref, err))
 			}
+			release()
 		case ActionIdle:
 			if st := e.ProviderStatus(); strings.HasPrefix(st, "BLOCKED") || st == "recovering" {
 				d.Log("forge: idle under " + st)

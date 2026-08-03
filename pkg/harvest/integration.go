@@ -240,6 +240,14 @@ func (in *Integration) Run(ctx context.Context) (*IntegrationResult, error) {
 		res.ShedWorktrees = len(hr.UnmergedWorktrees) - 1
 		hr.UnmergedWorktrees = hr.UnmergedWorktrees[:1]
 	}
+	// Common admission/reservation: hold the per-mutation headroom for the
+	// whole review/merge/cleanup pipeline so concurrent integrations are
+	// bounded by real remaining capacity (FAC-153).
+	release, admitErr := preflight.AdmitDiskMutation("integration", diskPaths...)
+	if admitErr != nil {
+		return nil, admitErr
+	}
+	defer release()
 
 	// Phase 2: Review gate
 	for _, uw := range hr.UnmergedWorktrees {
