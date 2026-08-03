@@ -1,6 +1,7 @@
 package mail
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -153,11 +154,41 @@ func (m *Mailbox) ensureSeenLoadedLocked() {
 	}
 }
 
+// alreadySeenLocked reports whether id has already been durably appended.
+// The in-memory seen cache is a bounded FIFO window (maxSeenIDs), not the
+// authority on dedup — once an ID falls out of that window, a cache miss
+// does not mean "never seen". It falls back to the mailbox file itself,
+// which retains every envelope ever durably appended, so redelivery of an
+// ID older than the cache window still dedupes correctly instead of
+// silently writing a duplicate record. Caller must hold m.mu.
 func (m *Mailbox) alreadySeenLocked(id string) bool {
 	m.seenMu.Lock()
-	defer m.seenMu.Unlock()
 	_, ok := m.seen[id]
-	return ok
+	m.seenMu.Unlock()
+	if ok {
+		return true
+	}
+	if !m.fileHasID(id) {
+		return false
+	}
+	// Bring it back into the cache so a burst of repeated redelivery for
+	// this same old ID doesn't rescan the file every time.
+	m.markSeenLocked(id)
+	return true
+}
+
+// fileHasID scans the durable mailbox file for id. Only reached on a
+// seen-cache miss, i.e. a genuine redelivery older than the cache window,
+// not the common case.
+// ponytail: linear scan over the whole file; add an on-disk index if
+// mailbox files start seeing high-volume old-ID redelivery.
+func (m *Mailbox) fileHasID(id string) bool {
+	data, err := os.ReadFile(m.MailFile)
+	if err != nil {
+		return false
+	}
+	needle := []byte(`"id":"` + id + `"`)
+	return bytes.Contains(data, needle)
 }
 
 func (m *Mailbox) markSeenLocked(id string) {
