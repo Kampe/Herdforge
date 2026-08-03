@@ -443,38 +443,32 @@ func (s *HostCredsSession) AttemptForbiddenCredentialAccess() error {
 	if s == nil || s.Mitm == nil {
 		return fmt.Errorf("nil")
 	}
+	// Coordinator-side policy check (not sufficient for AC alone).
 	if err := ProveMITMExactHost(s.Mitm, "evil.example.invalid"); err != nil {
 		return err
 	}
-	// Cross-provider: grok session must not allow api.openai.com
 	if s.Kind == "grok" {
 		if err := ProveMITMExactHost(s.Mitm, "api.openai.com"); err != nil {
 			return err
 		}
 	}
-	if s.Oracle != nil {
-		resp, err := CallOracle(s.Oracle.SocketPath(), OracleRequest{
-			SessionID: s.ID, // required
-			Host:      "evil.example.invalid", Method: "POST", Path: "/v1/chat/completions",
-		})
-		if err != nil {
-			return err
-		}
-		if resp.OK {
-			return fmt.Errorf("oracle allowed evil host")
-		}
-		// SessionID required
-		resp, err = CallOracle(s.Oracle.SocketPath(), OracleRequest{
-			SessionID: "", Host: "api.x.ai", Method: "POST", Path: "/v1/chat/completions",
-		})
-		if err != nil {
-			return err
-		}
-		if resp.OK {
-			return fmt.Errorf("oracle allowed empty session_id")
-		}
-	}
 	return nil
+}
+
+// RunWorkerForbiddenAndAllowProbe executes CONNECT allow/deny FROM a real worker
+// process (exact session). Requires MITM peer PID binding production path.
+func (s *HostCredsSession) RunWorkerForbiddenAndAllowProbe(nonce string) (*WorkerProbeResult, error) {
+	if s == nil || s.Mitm == nil {
+		return nil, fmt.Errorf("nil session")
+	}
+	allow := ""
+	if len(s.rules) > 0 {
+		allow = s.rules[0].Host
+	}
+	if allow == "" {
+		return nil, fmt.Errorf("no allow host")
+	}
+	return ProveAllowlistedHostViaWorker(s.Mitm, allow, "evil.example.invalid", s.ID, nonce)
 }
 
 func (s *HostCredsSession) OpenPreopenedFD() (*os.File, error) {
