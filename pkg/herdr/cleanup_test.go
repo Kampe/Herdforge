@@ -128,7 +128,7 @@ func TestDirtyUniqueReviewAndActiveSessionBlock(t *testing.T) {
 		{"review", func(o *TabObservation) { o.Authorities.Review.Value.Pending = true }},
 		{"active", func(o *TabObservation) {
 			o.Authorities.Agent = Authority[AgentTruth]{State: EvidencePresent, Value: AgentTruth{Status: "working", SessionID: "s1", SessionGeneration: "g1", PaneID: "wF:p1"}}
-			o.Authorities.Process = Authority[ProcessTruth]{State: EvidencePresent, Value: ProcessTruth{Alive: true}}
+			o.Authorities.Process = Authority[ProcessTruth]{State: EvidencePresent, Value: ProcessTruth{Alive: true, SessionID: "s1", SessionGeneration: "g1"}}
 		}},
 	}
 	for _, tc := range mutations {
@@ -188,7 +188,7 @@ func TestLegacyAgentListCannotAuthorizeCandidate(t *testing.T) {
 func TestFleetProjectionSeparatesCapacityClasses(t *testing.T) {
 	active := boundFixture("to-do")
 	active.Authorities.Agent = Authority[AgentTruth]{State: EvidencePresent, Value: AgentTruth{Status: "working", SessionID: "s", SessionGeneration: "g1", PaneID: "wF:p1"}}
-	active.Authorities.Process = Authority[ProcessTruth]{State: EvidencePresent, Value: ProcessTruth{Alive: true}}
+	active.Authorities.Process = Authority[ProcessTruth]{State: EvidencePresent, Value: ProcessTruth{Alive: true, SessionID: "s", SessionGeneration: "g1"}}
 	standing := boundFixture("to-do")
 	standing.Binding.ControlSeat = true
 	standing.Authorities.Protection = Authority[ProtectionTruth]{State: EvidencePresent, Value: ProtectionTruth{Standing: true}}
@@ -263,5 +263,48 @@ func TestFleetProjectionFailsClosedOnUnknown(t *testing.T) {
 	p := ProjectFleetStatus([]TabDecision{{Class: TabBlocked}}, 4)
 	if p.Unknown != 1 || p.Capacity != 0 {
 		t.Fatalf("unknown fleet was treated as available: %+v", p)
+	}
+}
+
+func TestActiveProjectionRequiresExactSessionProcessAndPane(t *testing.T) {
+	tests := []struct {
+		name  string
+		apply func(*TabObservation)
+	}{
+		{"no session", func(o *TabObservation) {
+			o.Authorities.Agent = present(AgentTruth{Status: "working", PaneID: "wF:p1"})
+			o.Authorities.Process = present(ProcessTruth{Alive: true})
+		}},
+		{"no process", func(o *TabObservation) {
+			o.Authorities.Agent = present(AgentTruth{Status: "working", SessionID: "s1", SessionGeneration: "g1", PaneID: "wF:p1"})
+		}},
+		{"missing pane", func(o *TabObservation) {
+			o.Authorities.Agent = present(AgentTruth{Status: "working", SessionID: "s1", SessionGeneration: "g1"})
+			o.Authorities.Process = present(ProcessTruth{Alive: true, SessionID: "s1", SessionGeneration: "g1"})
+		}},
+		{"mismatched session process", func(o *TabObservation) {
+			o.Authorities.Agent = present(AgentTruth{Status: "working", SessionID: "s1", SessionGeneration: "g1", PaneID: "wF:p1"})
+			o.Authorities.Process = present(ProcessTruth{Alive: true, SessionID: "s2", SessionGeneration: "g1"})
+		}},
+		{"mismatched pane", func(o *TabObservation) {
+			o.Authorities.Agent = present(AgentTruth{Status: "working", SessionID: "s1", SessionGeneration: "g1", PaneID: "wF:p2"})
+			o.Authorities.Process = present(ProcessTruth{Alive: true, SessionID: "s1", SessionGeneration: "g1"})
+		}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			o := boundFixture("to-do")
+			tc.apply(&o)
+			if d := ReconcileTabs([]TabObservation{o})[0]; d.Class == TabActive || d.CloseEligible {
+				t.Fatalf("unsafe active projection=%+v", d)
+			}
+		})
+	}
+
+	o := boundFixture("to-do")
+	o.Authorities.Agent = present(AgentTruth{Status: "in-progress", SessionID: "s1", SessionGeneration: "g1", PaneID: "wF:p1"})
+	o.Authorities.Process = present(ProcessTruth{Alive: true, SessionID: "s1", SessionGeneration: "g1"})
+	if d := ReconcileTabs([]TabObservation{o})[0]; d.Class != TabActive || d.CloseEligible {
+		t.Fatalf("valid active projection=%+v", d)
 	}
 }

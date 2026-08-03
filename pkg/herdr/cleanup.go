@@ -78,8 +78,9 @@ type LifecycleTruth struct{ State string }
 type ReviewTruth struct{ Pending, Active, UnsupersededVerdict bool }
 type MailTruth struct{ PendingOutbox, PendingCallback bool }
 type ProcessTruth struct {
-	Alive bool
-	PID   int
+	Alive                        bool
+	PID                          int
+	SessionID, SessionGeneration string
 }
 type ProtectionTruth struct {
 	Standing, UserShell, Protected bool
@@ -254,7 +255,7 @@ func reconcileBoundTab(tab TabObservation) TabDecision {
 	if a.Process.State == EvidencePresent && a.Agent.State == EvidencePresent && a.Agent.Value.SessionID != "" && !a.Process.Value.Alive {
 		return blocked("agent session process is not alive")
 	}
-	if a.Process.State == EvidencePresent && a.Process.Value.Alive && (a.Agent.State != EvidencePresent || a.Agent.Value.SessionID == "") {
+	if a.Process.State == EvidencePresent && a.Process.Value.Alive && (a.Agent.State != EvidencePresent || a.Agent.Value.SessionID == "" || a.Process.Value.SessionID != a.Agent.Value.SessionID || a.Process.Value.SessionGeneration != a.Agent.Value.SessionGeneration) {
 		return blocked("foreground process has no matching agent session")
 	}
 	if a.Worktree.State == EvidencePresent && !a.Worktree.Value.Known {
@@ -292,6 +293,12 @@ func reconcileBoundTab(tab TabObservation) TabDecision {
 				return blocked("terminal agent lacks terminal board/lifecycle proof")
 			}
 		case "in-progress":
+			if a.Agent.Value.SessionID == "" || a.Agent.Value.SessionGeneration == "" || a.Agent.Value.SessionGeneration != tab.Binding.Generation || a.Agent.Value.PaneID == "" || tab.Binding.PaneID == "" || a.Agent.Value.PaneID != tab.Binding.PaneID {
+				return blocked("active agent lacks exact session and pane identity")
+			}
+			if a.Process.State != EvidencePresent || !a.Process.Value.Alive || a.Process.Value.SessionID != a.Agent.Value.SessionID || a.Process.Value.SessionGeneration != tab.Binding.Generation {
+				return blocked("active agent lacks authoritative live process bound to session")
+			}
 			d.Class = TabActive
 			d.Evidence = []string{"matching active session"}
 			return d
