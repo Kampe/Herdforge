@@ -432,12 +432,17 @@ func TestOrdinaryRequestCannotBypassProductionDiscovery(t *testing.T) {
 	req := good(t)
 	req.HookDiscovery = nil
 	req.Hooks = nil
+	path := t.TempDir() + "/hooks.json"
+	if err := os.WriteFile(path, []byte(`{"providers":{"codex":{"hooks":[{"name":"policy","url":"http://127.0.0.1:1","requirement":"required"}]}}}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HERD_HARNESS_HOOKS_FILE", path)
 	sink := &MemorySink{}
 	err := Validate(req, sink)
-	if err == nil || !strings.Contains(err.Error(), string(harness.HookCodeDiscoveryFailed)) {
+	if err == nil || !strings.Contains(err.Error(), string(harness.HookCodeUnavailable)) {
 		t.Fatalf("ordinary request discovery result = %v", err)
 	}
-	if len(sink.Receipts) != 1 || sink.Receipts[0].HookCode != string(harness.HookCodeDiscoveryFailed) || sink.Receipts[0].Reason != "" {
+	if len(sink.Receipts) != 1 || sink.Receipts[0].HookCode != string(harness.HookCodeUnavailable) || sink.Receipts[0].Reason != "" {
 		t.Fatalf("discovery failure receipt = %+v", sink.Receipts)
 	}
 }
@@ -498,6 +503,57 @@ func TestOptionalDegradedJSONLReceiptIsDurablyDeduplicated(t *testing.T) {
 	}
 }
 
+func TestDegradedReceiptDoesNotInvalidateStartedResume(t *testing.T) {
+	path := t.TempDir() + "/receipts.jsonl"
+	t.Setenv("HERD_LAUNCH_RECEIPTS", path)
+	req := good(t)
+	req.TaskRef, req.Name, req.PaneID, req.LeaseGeneration = "FAC-177", "worker", "pane-1", 7
+	withHooks(&req, []harness.Hook{{Name: "telemetry", URL: "http://127.0.0.1:1", Requirement: harness.HookOptional}})
+	sink := &JSONLSink{Path: path}
+	if _, err := PreflightHooks(req); err != nil {
+		t.Fatal(err)
+	}
+	if err := RecordStarted(req, sink); err != nil {
+		t.Fatal(err)
+	}
+	started, err := HasStarted(req)
+	if err != nil || !started {
+		t.Fatalf("degraded receipt must not revoke started identity: started=%v err=%v", started, err)
+	}
+	status, err := ReadDegradedStatus(path)
+	if err != nil || len(status) != 1 || status[0].HookName == "" || strings.Contains(status[0].HookName, "telemetry") {
+		t.Fatalf("degraded status projection = %+v, err=%v", status, err)
+	}
+}
+
+func TestDegradedThenHealthyProjectionRecovers(t *testing.T) {
+	path := t.TempDir() + "/receipts.jsonl"
+	t.Setenv("HERD_LAUNCH_RECEIPTS", path)
+	req := good(t)
+	hooks := []harness.Hook{{Name: "telemetry", URL: "http://127.0.0.1:1", Requirement: harness.HookOptional}}
+	withHooks(&req, hooks)
+	sink := &JSONLSink{Path: path}
+	if err := Validate(req, sink); err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"status":"ok"}`))
+	}))
+	defer server.Close()
+	withHooks(&req, []harness.Hook{{Name: "telemetry", URL: server.URL, Requirement: harness.HookOptional}})
+	if err := Validate(req, sink); err != nil {
+		t.Fatal(err)
+	}
+	status, err := ReadDegradedStatus(path)
+	if err != nil || len(status) != 0 {
+		t.Fatalf("healthy revalidation left stale degraded status: %+v, err=%v", status, err)
+	}
+	b, err := os.ReadFile(path)
+	if err != nil || !strings.Contains(string(b), `"kind":"hook_degraded"`) || !strings.Contains(string(b), `"kind":"hook_recovered"`) {
+		t.Fatalf("historical lifecycle evidence missing: %s, err=%v", b, err)
+	}
+}
+
 func TestValidateOptionalHookWarningIsDeduplicatedAndIdentityPreserved(t *testing.T) {
 	var headers http.Header
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -508,14 +564,14 @@ func TestValidateOptionalHookWarningIsDeduplicatedAndIdentityPreserved(t *testin
 	req := good(t)
 	withHooks(&req, []harness.Hook{
 		{Name: "z-telemetry", URL: "http://127.0.0.1:1", Requirement: harness.HookOptional},
-		{Name: "healthy", URL: server.URL, Requirement: harness.HookOptional},
+		{Name: "healthy", URL: server.URL, HealthURL: server.URL, Requirement: harness.HookOptional},
 	})
 	warnings := make([]string, 0)
 	req.HookWarning = func(warning string) { warnings = append(warnings, warning) }
 	if err := Validate(req, &MemorySink{}); err != nil {
 		t.Fatal(err)
 	}
-	if len(warnings) != 1 || warnings[0] != "optional harness hooks degraded: z-telemetry=unavailable" {
+	if len(warnings) != 1 || !strings.Contains(warnings[0], "unavailable") || strings.Contains(warnings[0], "z-telemetry") {
 		t.Fatalf("warnings = %v", warnings)
 	}
 	if headers.Get("X-Herd-Provider") != req.Decision.Provider || headers.Get("X-Herd-Model") != req.Decision.Model || headers.Get("X-Herd-Effort") != req.Decision.Effort {
@@ -548,13 +604,54 @@ func TestRequiredHookPreflightMutantWouldFail(t *testing.T) {
 	defer server.Close()
 	req := good(t)
 	withHooks(&req, []harness.Hook{{Name: "required", URL: server.URL, Requirement: harness.HookRequired}})
-	if _, err := PreflightHooks(req); err != nil {
+	var effects int
+	if err := Launch(req, &MemorySink{}, LaunchEffects{Tab: func() error { effects++; return nil }}); err != nil {
 		t.Fatal(err)
 	}
-	// Mutating only the required hook endpoint must make this proof red if the
-	// launch boundary stops calling PreflightHooks.
+	if effects != 1 {
+		t.Fatalf("healthy launch effects = %d, want 1", effects)
+	}
+	// Mutating only the required hook endpoint must make this production-boundary
+	// proof red if Launch stops calling Validate/PreflightHooks.
 	withHooks(&req, []harness.Hook{{Name: "required", URL: "http://127.0.0.1:1", Requirement: harness.HookRequired}})
-	if _, err := PreflightHooks(req); err == nil {
-		t.Fatal("required hook mutant was not rejected")
+	effects = 0
+	sink := &MemorySink{}
+	if err := Launch(req, sink, LaunchEffects{Tab: func() error { effects++; return nil }}); err == nil {
+		t.Fatal("required hook boundary mutant was not rejected")
+	}
+	if effects != 0 || len(sink.Receipts) != 1 || sink.Receipts[0].Kind != "launch_rejected" {
+		t.Fatalf("boundary rejection effects=%d receipts=%+v", effects, sink.Receipts)
+	}
+}
+
+func TestHookReceiptBoundsUntrustedIdentityMaterial(t *testing.T) {
+	name := "configured-name-SECRET-" + strings.Repeat("sensitive-name-", 80)
+	matcher := "matcher-SECRET-" + strings.Repeat("sensitive-matcher-", 80)
+	pathSecret := "path-SECRET-" + strings.Repeat("private-", 40)
+	querySecret := "query-SECRET-" + strings.Repeat("token-", 40)
+	settings := `{"hooks":{"PreToolUse":[{"matcher":"` + matcher + `","hooks":[{"type":"http","name":"` + name + `","url":"http://127.0.0.1:1/` + pathSecret + `?token=` + querySecret + `"}]}]}}`
+	settingsPath := t.TempDir() + "/settings.json"
+	if err := os.WriteFile(settingsPath, []byte(settings), 0600); err != nil {
+		t.Fatal(err)
+	}
+	req := good(t)
+	req.HookDiscovery = harness.ClaudeDiscovery{Paths: []string{settingsPath}}
+	path := t.TempDir() + "/receipts.jsonl"
+	sink := &JSONLSink{Path: path}
+	if err := Validate(req, sink); err == nil {
+		t.Fatal("unavailable discovered required hook must reject")
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	receipts := string(b)
+	for _, secret := range []string{name, matcher, pathSecret, querySecret} {
+		if strings.Contains(receipts, secret) {
+			t.Fatalf("receipt leaked untrusted hook material %q", secret)
+		}
+	}
+	if len(receipts) > 2048 || strings.Contains(receipts, "http://") || strings.Contains(receipts, "?") {
+		t.Fatalf("receipt evidence is not bounded/redacted: %s", receipts)
 	}
 }
