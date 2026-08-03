@@ -155,6 +155,30 @@ func TestLedgerContract_MissingSHAIsHardError(t *testing.T) {
 	}
 }
 
+func TestLedgerContract_DrainConsumersRejectMissingSHA(t *testing.T) {
+	for _, consumer := range []string{"PASSes", "Vetoed", "Verdicts"} {
+		t.Run(consumer, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "ledger.jsonl")
+			writeJSONL(t, path, LedgerRow{Event: "verdict", Reviewer: "r", Verdict: "PASS"})
+			l := OpenLedger(path)
+			ctx := context.Background()
+			var err error
+			switch consumer {
+			case "PASSes":
+				_, err = l.PASSes(ctx)
+			case "Vetoed":
+				_, err = l.Vetoed(ctx)
+			case "Verdicts":
+				_, err = l.Verdicts(ctx)
+			}
+			if err == nil {
+				t.Fatalf("%s accepted verdict with missing sha", consumer)
+			}
+		})
+	}
+}
+
 func TestLedgerContract_QueueConsumeAndLaterRecordRecovery(t *testing.T) {
 	dir := t.TempDir()
 	l := OpenLedger(filepath.Join(dir, "ledger.jsonl"))

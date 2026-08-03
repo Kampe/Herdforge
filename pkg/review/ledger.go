@@ -102,24 +102,12 @@ type LedgerSnapshot struct {
 }
 
 func (l *Ledger) Snapshot() (LedgerSnapshot, error) {
-	rows, err := readRowsStrict(l.Path)
+	rows, err := readDrainRows(context.Background(), l.Path)
 	if err != nil {
 		return LedgerSnapshot{}, err
 	}
-	queue, err := readRowsStrict(l.QueuePath)
+	queue, err := readDrainRows(context.Background(), l.QueuePath)
 	if err != nil {
-		return LedgerSnapshot{}, err
-	}
-	if err := validateLedgerRows(l.Path, rows); err != nil {
-		return LedgerSnapshot{}, err
-	}
-	if err := validateLedgerRows(l.QueuePath, queue); err != nil {
-		return LedgerSnapshot{}, err
-	}
-	if _, err := orderedEvents(rows); err != nil {
-		return LedgerSnapshot{}, err
-	}
-	if _, err := orderedEvents(queue); err != nil {
 		return LedgerSnapshot{}, err
 	}
 	return LedgerSnapshot{Rows: rows, Queue: queue}, nil
@@ -131,11 +119,7 @@ func (l *Ledger) Verdicts(ctx context.Context) ([]VerdictRecord, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	rows, err := readRowsStrict(l.Path)
-	if err != nil {
-		return nil, err
-	}
-	events, err := orderedEvents(rows)
+	events, err := readDrainEvents(ctx, l.Path)
 	if err != nil {
 		return nil, err
 	}
@@ -157,14 +141,8 @@ func (l *Ledger) Verdicts(ctx context.Context) ([]VerdictRecord, error) {
 // PASSes returns PASS SHA -> recorded tier. A tier is taken from the verdict
 // only when present, otherwise from the latest record for that SHA.
 func (l *Ledger) PASSes(ctx context.Context) (map[string]string, error) {
-	rows, err := readRowsStrict(l.Path)
+	rows, err := readDrainRows(ctx, l.Path)
 	if err != nil {
-		return nil, err
-	}
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	if _, err := orderedEvents(rows); err != nil {
 		return nil, err
 	}
 	return l.passMap(rows), nil
@@ -172,14 +150,7 @@ func (l *Ledger) PASSes(ctx context.Context) (map[string]string, error) {
 
 // Vetoed returns SHAs whose latest verdict for any reviewer is FAIL/BLOCKED.
 func (l *Ledger) Vetoed(ctx context.Context) (map[string]bool, error) {
-	rows, err := readRowsStrict(l.Path)
-	if err != nil {
-		return nil, err
-	}
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	rows, err = orderedRows(rows)
+	rows, err := readDrainRows(ctx, l.Path)
 	if err != nil {
 		return nil, err
 	}
@@ -201,13 +172,17 @@ func (l *Ledger) Vetoed(ctx context.Context) (map[string]bool, error) {
 // TierProp resolves the latest recorded tier for a SHA, or empty when the
 // ledger has no recorded tier. It deliberately does not infer a tier.
 func (l *Ledger) TierProp(ctx context.Context, sha string) string {
-	rows, err := readRowsStrict(l.Path)
-	if err != nil || ctx.Err() != nil {
-		return ""
-	}
-	rows, err = orderedRows(rows)
+	tier, _ := l.TierPropErr(ctx, sha)
+	return tier
+}
+
+// TierPropErr is the fail-closed drain-facing tier lookup. Callers that make
+// an automation decision must retain the error instead of treating empty as a
+// recorded tier.
+func (l *Ledger) TierPropErr(ctx context.Context, sha string) (string, error) {
+	rows, err := readDrainRows(ctx, l.Path)
 	if err != nil {
-		return ""
+		return "", err
 	}
 	var tier string
 	for _, row := range rows {
@@ -215,7 +190,7 @@ func (l *Ledger) TierProp(ctx context.Context, sha string) string {
 			tier = row.Tier
 		}
 	}
-	return tier
+	return tier, nil
 }
 
 func (l *Ledger) passMap(rows []LedgerRow) map[string]string {
@@ -431,6 +406,36 @@ func validateLedgerRows(path string, rows []LedgerRow) error {
 		}
 	}
 	return nil
+}
+
+func readDrainEvents(ctx context.Context, path string) ([]orderedLedgerRow, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	rows, err := readRowsStrict(path)
+	if err != nil {
+		return nil, err
+	}
+	if err := validateLedgerRows(path, rows); err != nil {
+		return nil, err
+	}
+	events, err := orderedEvents(rows)
+	if err != nil {
+		return nil, err
+	}
+	return events, nil
+}
+
+func readDrainRows(ctx context.Context, path string) ([]LedgerRow, error) {
+	events, err := readDrainEvents(ctx, path)
+	if err != nil {
+		return nil, err
+	}
+	rows := make([]LedgerRow, len(events))
+	for i, event := range events {
+		rows[i] = event.row
+	}
+	return rows, nil
 }
 
 // newestBy groups rows by key and keeps the last (newest) per key.
