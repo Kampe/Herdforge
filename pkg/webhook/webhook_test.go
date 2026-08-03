@@ -11,6 +11,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -391,6 +393,64 @@ func TestServeHTTP_DuplicateValidDelivery_Idempotent(t *testing.T) {
 	}
 	if ev.Attempts != 0 {
 		t.Errorf("expected no failed attempts recorded for a clean duplicate, got %d", ev.Attempts)
+	}
+}
+
+// TestServeHTTP_ConcurrentSameDelivery_HandlerRunsOnce is the regression
+// test for the race a reviewer caught at SHA 4450fb6: Store.Record and
+// the later Store.MarkProcessed were two separate, non-atomic steps, so
+// two simultaneous requests for the same fresh delivery id could both
+// observe the row as not-yet-processed and both dispatch handlers. The
+// handler sleeps to hold its claim open long enough that concurrent
+// Claim attempts from the other goroutines land while it is still
+// in-flight, exercising the exact window the bug lived in. Against the
+// pre-fix code this test fails with calls > 1.
+func TestServeHTTP_ConcurrentSameDelivery_HandlerRunsOnce(t *testing.T) {
+	r, store := newTestReceiver(t, testSecret, nil)
+	var calls int32
+	r.RegisterHandler(func(*WebhookEvent) error {
+		atomic.AddInt32(&calls, 1)
+		time.Sleep(50 * time.Millisecond)
+		return nil
+	})
+
+	body := []byte(`{"provider":"kaneo","type":"task.created","task_ref":"FAC-1","project_id":"p1","payload":{}}`)
+
+	const n = 10
+	var wg sync.WaitGroup
+	codes := make([]int, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			req := newValidRequest(testSecret, "d1", body)
+			w := httptest.NewRecorder()
+			r.ServeHTTP(w, req)
+			codes[i] = w.Code
+		}(i)
+	}
+	wg.Wait()
+
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Fatalf("expected the handler to run exactly once across %d concurrent identical deliveries, got %d", n, got)
+	}
+
+	for _, c := range codes {
+		if c != http.StatusOK && c != http.StatusServiceUnavailable {
+			t.Errorf("expected only 200 (won the claim / duplicate-of-processed) or 503 (lost the claim, in flight) responses, got codes=%v", codes)
+			break
+		}
+	}
+
+	ev, err := store.Get("d1")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if ev.Status != StatusProcessed {
+		t.Errorf("expected the delivery to end up Processed, got %q", ev.Status)
+	}
+	if ev.Attempts != 0 {
+		t.Errorf("expected no handler failures among the concurrent deliveries, got attempts=%d", ev.Attempts)
 	}
 }
 

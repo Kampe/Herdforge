@@ -3,6 +3,8 @@ package webhook
 import (
 	"errors"
 	"path/filepath"
+	"sync"
+	"sync/atomic"
 	"testing"
 )
 
@@ -17,18 +19,18 @@ func newTestStore(t *testing.T) *Store {
 	return s
 }
 
-func TestStore_Record_New(t *testing.T) {
+func TestStore_Claim_New(t *testing.T) {
 	s := newTestStore(t)
 
-	ev, existed, err := s.Record("d1", "kaneo", "task.created", "FAC-1", "proj", `{"a":1}`)
+	ev, claimed, err := s.Claim("d1", "kaneo", "task.created", "FAC-1", "proj", `{"a":1}`)
 	if err != nil {
-		t.Fatalf("Record: %v", err)
+		t.Fatalf("Claim: %v", err)
 	}
-	if existed {
-		t.Error("expected existed=false for a brand new delivery id")
+	if !claimed {
+		t.Error("expected claimed=true for a brand new delivery id")
 	}
-	if ev.Status != StatusPending {
-		t.Errorf("expected StatusPending, got %q", ev.Status)
+	if ev.Status != StatusInFlight {
+		t.Errorf("expected StatusInFlight, got %q", ev.Status)
 	}
 	if ev.ID == 0 {
 		t.Error("expected a non-zero row id")
@@ -46,26 +48,28 @@ func TestStore_Record_New(t *testing.T) {
 	}
 }
 
-func TestStore_Record_DuplicateSamePayload_Idempotent(t *testing.T) {
+func TestStore_Claim_WhileInFlight_NotClaimed(t *testing.T) {
 	s := newTestStore(t)
 
-	first, _, err := s.Record("d1", "kaneo", "task.created", "FAC-1", "proj", `{"a":1}`)
-	if err != nil {
-		t.Fatalf("first Record: %v", err)
+	if _, claimed, err := s.Claim("d1", "kaneo", "task.created", "FAC-1", "proj", `{"a":1}`); err != nil || !claimed {
+		t.Fatalf("first Claim: claimed=%v err=%v", claimed, err)
 	}
 
-	second, existed, err := s.Record("d1", "kaneo", "task.created", "FAC-1", "proj", `{"a":1}`)
+	// A second Claim for the same delivery id while the first is still
+	// in flight (not yet MarkProcessed/MarkFailed) must NOT also be
+	// granted — this is the exact race a mutant that drops the CAS
+	// would reintroduce.
+	ev, claimed, err := s.Claim("d1", "kaneo", "task.created", "FAC-1", "proj", `{"a":1}`)
 	if err != nil {
-		t.Fatalf("second Record: %v", err)
+		t.Fatalf("second Claim: %v", err)
 	}
-	if !existed {
-		t.Error("expected existed=true for a repeated delivery id with identical payload")
+	if claimed {
+		t.Error("expected the second concurrent Claim to be refused while the delivery is in flight")
 	}
-	if second.ID != first.ID {
-		t.Errorf("expected the same row to be returned, got id=%d want id=%d", second.ID, first.ID)
+	if ev.Status != StatusInFlight {
+		t.Errorf("expected the reported status to be InFlight, got %q", ev.Status)
 	}
 
-	// Only one row must exist — a mutant that always inserts would leave two.
 	var count int
 	if err := s.db.QueryRow(`SELECT COUNT(*) FROM webhook_events WHERE delivery_id = ?`, "d1").Scan(&count); err != nil {
 		t.Fatalf("count query: %v", err)
@@ -75,30 +79,57 @@ func TestStore_Record_DuplicateSamePayload_Idempotent(t *testing.T) {
 	}
 }
 
-func TestStore_Record_DuplicateDifferentPayload_Conflict(t *testing.T) {
+func TestStore_Claim_Concurrent_OnlyOneWinner(t *testing.T) {
 	s := newTestStore(t)
 
-	if _, _, err := s.Record("d1", "kaneo", "task.created", "FAC-1", "proj", `{"a":1}`); err != nil {
-		t.Fatalf("first Record: %v", err)
+	const n = 20
+	var wg sync.WaitGroup
+	var claims int32
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, claimed, err := s.Claim("d1", "kaneo", "task.created", "FAC-1", "proj", `{"a":1}`)
+			if err != nil {
+				t.Errorf("Claim: %v", err)
+				return
+			}
+			if claimed {
+				atomic.AddInt32(&claims, 1)
+			}
+		}()
+	}
+	wg.Wait()
+
+	if got := atomic.LoadInt32(&claims); got != 1 {
+		t.Errorf("expected exactly one of %d concurrent Claim calls to win, got %d", n, got)
+	}
+}
+
+func TestStore_Claim_DuplicateDifferentPayload_Conflict(t *testing.T) {
+	s := newTestStore(t)
+
+	if _, _, err := s.Claim("d1", "kaneo", "task.created", "FAC-1", "proj", `{"a":1}`); err != nil {
+		t.Fatalf("first Claim: %v", err)
 	}
 
-	_, _, err := s.Record("d1", "kaneo", "task.created", "FAC-1", "proj", `{"a":2}`)
+	_, _, err := s.Claim("d1", "kaneo", "task.created", "FAC-1", "proj", `{"a":2}`)
 	if !errors.Is(err, ErrPayloadConflict) {
 		t.Errorf("expected ErrPayloadConflict for a reused delivery id with a different payload, got %v", err)
 	}
 }
 
-func TestStore_Record_EmptyDeliveryID_Rejected(t *testing.T) {
+func TestStore_Claim_EmptyDeliveryID_Rejected(t *testing.T) {
 	s := newTestStore(t)
-	if _, _, err := s.Record("", "kaneo", "task.created", "FAC-1", "proj", `{}`); err == nil {
-		t.Error("expected Record to reject an empty delivery id (fail-closed)")
+	if _, _, err := s.Claim("", "kaneo", "task.created", "FAC-1", "proj", `{}`); err == nil {
+		t.Error("expected Claim to reject an empty delivery id (fail-closed)")
 	}
 }
 
 func TestStore_MarkProcessed(t *testing.T) {
 	s := newTestStore(t)
-	if _, _, err := s.Record("d1", "kaneo", "task.created", "FAC-1", "proj", `{}`); err != nil {
-		t.Fatalf("Record: %v", err)
+	if _, _, err := s.Claim("d1", "kaneo", "task.created", "FAC-1", "proj", `{}`); err != nil {
+		t.Fatalf("Claim: %v", err)
 	}
 	if err := s.MarkProcessed("d1"); err != nil {
 		t.Fatalf("MarkProcessed: %v", err)
@@ -117,21 +148,28 @@ func TestStore_MarkProcessed(t *testing.T) {
 	}
 }
 
-func TestStore_Record_DuplicateAfterProcessed_ReturnsProcessed(t *testing.T) {
+func TestStore_MarkProcessed_NotInFlight_Errors(t *testing.T) {
 	s := newTestStore(t)
-	if _, _, err := s.Record("d1", "kaneo", "task.created", "FAC-1", "proj", `{"a":1}`); err != nil {
-		t.Fatalf("Record: %v", err)
+	if err := s.MarkProcessed("missing"); err == nil {
+		t.Error("expected MarkProcessed to error for a delivery that was never claimed")
+	}
+}
+
+func TestStore_Claim_DuplicateAfterProcessed_ReturnsProcessedNotClaimed(t *testing.T) {
+	s := newTestStore(t)
+	if _, _, err := s.Claim("d1", "kaneo", "task.created", "FAC-1", "proj", `{"a":1}`); err != nil {
+		t.Fatalf("Claim: %v", err)
 	}
 	if err := s.MarkProcessed("d1"); err != nil {
 		t.Fatalf("MarkProcessed: %v", err)
 	}
 
-	ev, existed, err := s.Record("d1", "kaneo", "task.created", "FAC-1", "proj", `{"a":1}`)
+	ev, claimed, err := s.Claim("d1", "kaneo", "task.created", "FAC-1", "proj", `{"a":1}`)
 	if err != nil {
-		t.Fatalf("duplicate Record: %v", err)
+		t.Fatalf("duplicate Claim: %v", err)
 	}
-	if !existed {
-		t.Error("expected existed=true for a duplicate of a processed delivery")
+	if claimed {
+		t.Error("expected a duplicate of a processed delivery to NOT be claimed (already done)")
 	}
 	if ev.Status != StatusProcessed {
 		t.Errorf("expected the returned event to report StatusProcessed, got %q", ev.Status)
@@ -140,8 +178,8 @@ func TestStore_Record_DuplicateAfterProcessed_ReturnsProcessed(t *testing.T) {
 
 func TestStore_MarkFailed_LeavesRowPendingForRetry(t *testing.T) {
 	s := newTestStore(t)
-	if _, _, err := s.Record("d1", "kaneo", "task.created", "FAC-1", "proj", `{}`); err != nil {
-		t.Fatalf("Record: %v", err)
+	if _, _, err := s.Claim("d1", "kaneo", "task.created", "FAC-1", "proj", `{}`); err != nil {
+		t.Fatalf("Claim: %v", err)
 	}
 	if err := s.MarkFailed("d1", "handler exploded"); err != nil {
 		t.Fatalf("MarkFailed: %v", err)
@@ -151,13 +189,34 @@ func TestStore_MarkFailed_LeavesRowPendingForRetry(t *testing.T) {
 		t.Fatalf("Get: %v", err)
 	}
 	if got.Status != StatusPending {
-		t.Errorf("expected a failed delivery to remain StatusPending for retry, got %q", got.Status)
+		t.Errorf("expected a failed delivery to return to StatusPending for retry, got %q", got.Status)
 	}
 	if got.Attempts != 1 {
 		t.Errorf("expected attempts=1, got %d", got.Attempts)
 	}
 	if got.LastError != "handler exploded" {
 		t.Errorf("expected last_error to be recorded, got %q", got.LastError)
+	}
+}
+
+func TestStore_Claim_AfterFailed_Reclaimable(t *testing.T) {
+	s := newTestStore(t)
+	if _, _, err := s.Claim("d1", "kaneo", "task.created", "FAC-1", "proj", `{}`); err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	if err := s.MarkFailed("d1", "boom"); err != nil {
+		t.Fatalf("MarkFailed: %v", err)
+	}
+
+	ev, claimed, err := s.Claim("d1", "kaneo", "task.created", "FAC-1", "proj", `{}`)
+	if err != nil {
+		t.Fatalf("retry Claim: %v", err)
+	}
+	if !claimed {
+		t.Error("expected a delivery left pending by a handler failure to be re-claimable")
+	}
+	if ev.Status != StatusInFlight {
+		t.Errorf("expected StatusInFlight after re-claiming, got %q", ev.Status)
 	}
 }
 

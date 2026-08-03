@@ -12,11 +12,18 @@ import (
 type Status string
 
 const (
-	// StatusPending is a durably persisted delivery whose handlers have
-	// not yet all completed successfully. A retried delivery under the
-	// same DeliveryID while pending re-runs handlers rather than being
-	// treated as an already-processed duplicate.
+	// StatusPending is a durably persisted delivery that has not yet
+	// been claimed for processing, or whose most recent claim's
+	// handlers failed. A later Claim under the same DeliveryID while
+	// pending re-runs handlers rather than being treated as an
+	// already-processed duplicate.
 	StatusPending Status = "pending"
+	// StatusInFlight is a short-lived claim state: exactly one caller
+	// has Claim'd this delivery and is running its handlers. No other
+	// caller may claim it while it's here (see Claim's CAS) — this is
+	// what makes two concurrent requests for the same delivery id
+	// dispatch handlers at most once between them, not twice.
+	StatusInFlight Status = "in_flight"
 	// StatusProcessed is a delivery whose handlers all completed. A
 	// later delivery reusing the same DeliveryID is a legitimate
 	// duplicate (provider retry) and is acknowledged without
@@ -24,10 +31,10 @@ const (
 	StatusProcessed Status = "processed"
 )
 
-// ErrPayloadConflict is returned by Record when DeliveryID was already
+// ErrPayloadConflict is returned by Claim when DeliveryID was already
 // recorded for a payload with a different hash. A signature check should
 // normally prevent this (the attacker would need the secret to forge a
-// valid signature over a different payload), but Record fails closed
+// valid signature over a different payload), but Claim fails closed
 // instead of silently keeping whichever payload happened to land first.
 var ErrPayloadConflict = errors.New("webhook: delivery id reused for a different payload")
 
@@ -107,17 +114,34 @@ func hashPayload(payload string) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// Record durably persists the intent to process deliveryID, or returns
-// the already-recorded Event if this exact deliveryID/payload pair was
-// seen before (existed=true). Reuse of deliveryID for a DIFFERENT
-// payload fails closed with ErrPayloadConflict. The whole check-then-
-// insert runs inside one transaction; combined with the single-
-// connection pool from openSQLite, SQLite serializes concurrent callers
-// so two goroutines racing on the same new deliveryID cannot both
-// insert.
-func (s *Store) Record(deliveryID, provider, eventType, taskRef, projectID, payload string) (event Event, existed bool, err error) {
+// Claim atomically persists deliveryID (if new) and grants exclusive
+// ownership of running its handlers, or reports that it could not
+// (claimed=false). This single method — rather than a separate
+// "record" step followed later by a separate "mark in-flight" step —
+// is what closes the race between two concurrent requests for the same
+// delivery id: the decision "do I get to run handlers" is made and
+// committed atomically with the persistence write, inside one
+// transaction. Combined with the single-connection pool from
+// openSQLite, SQLite serializes concurrent callers, so a second Begin()
+// for the same deliveryID cannot observe the row until the first
+// transaction has committed.
+//
+//   - Unknown deliveryID: inserted as StatusInFlight directly and
+//     claimed=true — this caller owns it.
+//   - Known deliveryID, same payload, StatusPending (a previous claim's
+//     handlers failed): CAS to StatusInFlight, claimed=true — this
+//     caller retries the handlers.
+//   - Known deliveryID, same payload, StatusInFlight (another caller is
+//     mid-handler right now): claimed=false, event.Status=InFlight —
+//     the caller must NOT run handlers; it lost the race.
+//   - Known deliveryID, same payload, StatusProcessed: claimed=false,
+//     event.Status=Processed — a legitimate duplicate delivery,
+//     already fully handled.
+//   - Known deliveryID, DIFFERENT payload (any status): fails closed
+//     with ErrPayloadConflict.
+func (s *Store) Claim(deliveryID, provider, eventType, taskRef, projectID, payload string) (event Event, claimed bool, err error) {
 	if deliveryID == "" {
-		return Event{}, false, fmt.Errorf("record webhook event: delivery_id is required (fail-closed)")
+		return Event{}, false, fmt.Errorf("claim webhook event: delivery_id is required (fail-closed)")
 	}
 
 	tx, err := s.db.Begin()
@@ -127,71 +151,96 @@ func (s *Store) Record(deliveryID, provider, eventType, taskRef, projectID, payl
 	defer tx.Rollback()
 
 	hash := hashPayload(payload)
+	now := time.Now().UTC()
 
-	if existing, gerr := getByDeliveryID(tx, deliveryID); gerr != nil {
+	existing, gerr := getByDeliveryID(tx, deliveryID)
+	if gerr != nil {
 		return Event{}, false, gerr
-	} else if existing != nil {
-		if existing.PayloadHash != hash {
-			return Event{}, false, fmt.Errorf("%w: delivery_id=%s", ErrPayloadConflict, deliveryID)
+	}
+
+	if existing == nil {
+		res, err := tx.Exec(
+			`INSERT INTO webhook_events (delivery_id, provider, event_type, task_ref, project_id, payload, payload_hash, status, attempts, created_at, updated_at)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)`,
+			deliveryID, provider, eventType, taskRef, projectID, payload, hash, StatusInFlight, now, now,
+		)
+		if err != nil {
+			return Event{}, false, fmt.Errorf("insert webhook event: %w", err)
 		}
 		if err := tx.Commit(); err != nil {
 			return Event{}, false, fmt.Errorf("commit: %w", err)
 		}
-		return *existing, true, nil
+		id, _ := res.LastInsertId()
+		return Event{
+			ID: id, DeliveryID: deliveryID, Provider: provider, Type: eventType,
+			TaskRef: taskRef, ProjectID: projectID, Payload: payload, PayloadHash: hash,
+			Status: StatusInFlight, CreatedAt: now, UpdatedAt: now,
+		}, true, nil
 	}
 
-	now := time.Now().UTC()
+	if existing.PayloadHash != hash {
+		return Event{}, false, fmt.Errorf("%w: delivery_id=%s", ErrPayloadConflict, deliveryID)
+	}
+
+	if existing.Status != StatusPending {
+		// StatusInFlight (lost the race) or StatusProcessed (duplicate
+		// of completed work): report the current state, claim nothing.
+		if err := tx.Commit(); err != nil {
+			return Event{}, false, fmt.Errorf("commit: %w", err)
+		}
+		return *existing, false, nil
+	}
+
 	res, err := tx.Exec(
-		`INSERT INTO webhook_events (delivery_id, provider, event_type, task_ref, project_id, payload, payload_hash, status, attempts, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)`,
-		deliveryID, provider, eventType, taskRef, projectID, payload, hash, StatusPending, now, now,
+		`UPDATE webhook_events SET status = ?, updated_at = ? WHERE delivery_id = ? AND status = ?`,
+		StatusInFlight, now, deliveryID, StatusPending,
 	)
 	if err != nil {
-		return Event{}, false, fmt.Errorf("insert webhook event: %w", err)
+		return Event{}, false, fmt.Errorf("claim webhook event: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n != 1 {
+		return Event{}, false, fmt.Errorf("claim webhook event: delivery_id=%s not pending", deliveryID)
 	}
 	if err := tx.Commit(); err != nil {
 		return Event{}, false, fmt.Errorf("commit: %w", err)
 	}
-
-	id, _ := res.LastInsertId()
-	return Event{
-		ID: id, DeliveryID: deliveryID, Provider: provider, Type: eventType,
-		TaskRef: taskRef, ProjectID: projectID, Payload: payload, PayloadHash: hash,
-		Status: StatusPending, CreatedAt: now, UpdatedAt: now,
-	}, false, nil
+	existing.Status = StatusInFlight
+	existing.UpdatedAt = now
+	return *existing, true, nil
 }
 
-// MarkProcessed marks a pending delivery as having had all handlers
-// complete successfully. Conditioned on the row's current state being
-// pending, so a delivery that was somehow already marked processed
-// cannot be re-marked and lose its original attempts/last_error.
+// MarkProcessed marks a claimed (in-flight) delivery as having had all
+// handlers complete successfully. Conditioned on the row's current
+// state being in_flight, so it can only be called by whichever caller
+// actually won the Claim.
 func (s *Store) MarkProcessed(deliveryID string) error {
 	res, err := s.db.Exec(
 		`UPDATE webhook_events SET status = ?, updated_at = ? WHERE delivery_id = ? AND status = ?`,
-		StatusProcessed, time.Now().UTC(), deliveryID, StatusPending,
+		StatusProcessed, time.Now().UTC(), deliveryID, StatusInFlight,
 	)
 	if err != nil {
 		return fmt.Errorf("mark processed: %w", err)
 	}
 	if n, _ := res.RowsAffected(); n != 1 {
-		return fmt.Errorf("mark processed: delivery_id=%s not pending", deliveryID)
+		return fmt.Errorf("mark processed: delivery_id=%s not in flight", deliveryID)
 	}
 	return nil
 }
 
-// MarkFailed records a handler failure for a pending delivery, leaving
-// it pending so a retried delivery (or a future reconciler) tries
-// handlers again rather than being silently dropped.
+// MarkFailed records a handler failure for a claimed (in-flight)
+// delivery, returning it to StatusPending so a retried delivery (or a
+// future reconciler) can Claim and try handlers again rather than the
+// event being silently dropped.
 func (s *Store) MarkFailed(deliveryID, errMsg string) error {
 	res, err := s.db.Exec(
-		`UPDATE webhook_events SET attempts = attempts + 1, last_error = ?, updated_at = ? WHERE delivery_id = ? AND status = ?`,
-		errMsg, time.Now().UTC(), deliveryID, StatusPending,
+		`UPDATE webhook_events SET status = ?, attempts = attempts + 1, last_error = ?, updated_at = ? WHERE delivery_id = ? AND status = ?`,
+		StatusPending, errMsg, time.Now().UTC(), deliveryID, StatusInFlight,
 	)
 	if err != nil {
 		return fmt.Errorf("mark failed: %w", err)
 	}
 	if n, _ := res.RowsAffected(); n != 1 {
-		return fmt.Errorf("mark failed: delivery_id=%s not pending", deliveryID)
+		return fmt.Errorf("mark failed: delivery_id=%s not in flight", deliveryID)
 	}
 	return nil
 }

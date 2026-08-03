@@ -198,7 +198,7 @@ func (r *Receiver) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	rec, existed, err := r.store.Record(deliveryID, event.Provider, string(event.Type), event.TaskRef, event.ProjectID, string(body))
+	rec, claimed, err := r.store.Claim(deliveryID, event.Provider, string(event.Type), event.TaskRef, event.ProjectID, string(body))
 	if err != nil {
 		if errors.Is(err, ErrPayloadConflict) {
 			http.Error(w, "delivery id reused for a different payload", http.StatusConflict)
@@ -208,14 +208,22 @@ func (r *Receiver) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	// A duplicate of an already-processed delivery (provider retry) is
-	// acknowledged without re-dispatching handlers — exactly one
-	// successful dispatch per delivery id. A duplicate that is still
-	// pending (a prior attempt's handler failed) falls through and
-	// retries handlers below.
-	if existed && rec.Status == StatusProcessed {
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{"status":"duplicate"}`))
+	if !claimed {
+		// A duplicate of an already-processed delivery (provider retry)
+		// is acknowledged without re-dispatching handlers — exactly one
+		// successful dispatch per delivery id.
+		if rec.Status == StatusProcessed {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"status":"duplicate"}`))
+			return
+		}
+		// rec.Status == StatusInFlight: another concurrent request for
+		// this exact delivery id is running handlers right now. This
+		// caller must not also run them — that would be the double
+		// dispatch this Claim/CAS exists to prevent. Respond retryable
+		// so the provider tries again once the in-flight attempt has
+		// resolved to pending (retry) or processed (duplicate ack).
+		http.Error(w, "delivery is already being processed", http.StatusServiceUnavailable)
 		return
 	}
 
