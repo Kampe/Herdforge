@@ -1,6 +1,8 @@
 package server
 
 import (
+	"context"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -207,5 +209,61 @@ func TestReclaimEndpointExactTargetsOnly(t *testing.T) {
 	}
 	if _, err := os.Stat(dirtyWT); err != nil {
 		t.Fatalf("sibling dirty worktree disturbed: %v", err)
+	}
+}
+
+func TestProductionControlServerEndToEnd(t *testing.T) {
+	// Compiled production constructor, real listener, real loopback HTTP —
+	// not direct handler invocation.
+	t.Setenv(preflight.EnvDiskMinFreeGB, "0")
+	t.Setenv(preflight.EnvDiskMinFreePct, "0")
+	t.Setenv(preflight.EnvDiskMinInodePct, "0")
+
+	repo, _, dirtyWT := diskFixture(t)
+	s := NewProductionControlServer("127.0.0.1:0", repo, filepath.Join(repo, "wts"), "main")
+	if err := s.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer func() { _ = s.Stop(context.Background()) }()
+	base := "http://" + s.BoundAddr()
+
+	// Live metrics over real HTTP: repo/pool/temp roles present.
+	resp, err := http.Get(base + "/metrics")
+	if err != nil {
+		t.Fatalf("GET /metrics: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	for _, want := range []string{
+		`herd_disk_pressure_state{state="ok"} 1`,
+		`herd_disk_free_bytes{volume="repo"}`,
+		`herd_disk_free_bytes{volume="pool"}`,
+		`herd_disk_free_bytes{volume="temp"}`,
+	} {
+		if !strings.Contains(string(body), want) {
+			t.Fatalf("missing %q over production HTTP:\n%s", want, body)
+		}
+	}
+
+	// Authorized (real loopback) reclaim of a dirty target: FAC-117 JIT
+	// refusal over the wire, tree preserved.
+	resp, err = http.Post(base+"/v1/disk/reclaim", "application/json",
+		strings.NewReader(`{"targets":["`+dirtyWT+`"]}`))
+	if err != nil {
+		t.Fatalf("POST reclaim: %v", err)
+	}
+	body, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("reclaim status %d: %s", resp.StatusCode, body)
+	}
+	if !strings.Contains(string(body), "dirty") {
+		t.Fatalf("expected dirty refusal evidence over the wire: %s", body)
+	}
+	if _, statErr := os.Stat(dirtyWT); statErr != nil {
+		t.Fatalf("dirty tree disturbed via production path: %v", statErr)
+	}
+	if s.ServeErr() != nil {
+		t.Fatalf("runtime serve error: %v", s.ServeErr())
 	}
 }

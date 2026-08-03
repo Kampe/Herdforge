@@ -84,3 +84,78 @@ func TestPressureReclamationPlanIsReadOnlyAndExact(t *testing.T) {
 		}
 	}
 }
+
+func TestReclaimExactRefusesEmptyTargets(t *testing.T) {
+	repo, _ := initPressureFixture(t)
+	gcm := NewGCManager(repo, worktree.NewWorktreePool(repo, filepath.Join(repo, "wts")))
+	if _, err := gcm.ReclaimExact(context.Background(), "main", nil); err == nil {
+		t.Fatal("empty target set must be refused — no broad cleanup path")
+	}
+}
+
+func TestReclaimExactJITRevalidationAndPreservation(t *testing.T) {
+	repo, dirtyWT := initPressureFixture(t)
+	cleanWT := filepath.Join(repo, "wts", "herd-done")
+	run(t, repo, "git", "worktree", "add", "-b", "herd/done", cleanWT, "HEAD")
+	if resolved, err := filepath.EvalSymlinks(cleanWT); err == nil {
+		cleanWT = resolved
+	}
+	gcm := NewGCManager(repo, worktree.NewWorktreePool(repo, filepath.Join(repo, "wts")))
+
+	// Plan says herd/done is eligible…
+	plan, err := gcm.PressureReclamationPlan(context.Background(), "main")
+	if err != nil {
+		t.Fatalf("plan: %v", err)
+	}
+	eligible := false
+	for _, e := range plan.Eligible {
+		if e.Path == cleanWT {
+			eligible = true
+		}
+	}
+	if !eligible {
+		t.Fatalf("fixture not eligible in plan: %+v", plan.Candidates)
+	}
+
+	// …but it becomes dirty AFTER planning: just-in-time revalidation at
+	// execution must refuse the stale plan and preserve the tree.
+	staleFile := filepath.Join(cleanWT, "late-work.txt")
+	if err := os.WriteFile(staleFile, []byte("appeared after plan"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	report, err := gcm.ReclaimExact(context.Background(), "main", []string{cleanWT})
+	if err != nil {
+		t.Fatalf("reclaim: %v", err)
+	}
+	if len(report.Reaped) != 0 {
+		t.Fatalf("stale-plan target reaped despite new dirty state: %v", report.Reaped)
+	}
+	if data, rerr := os.ReadFile(staleFile); rerr != nil || string(data) != "appeared after plan" {
+		t.Fatalf("late work not preserved: %q err=%v", data, rerr)
+	}
+
+	// Cleaned again: reclamation succeeds AND the tip survives behind the
+	// durable salvage ref (preservation proof, FAC-117).
+	if err := os.Remove(staleFile); err != nil {
+		t.Fatal(err)
+	}
+	report, err = gcm.ReclaimExact(context.Background(), "main", []string{cleanWT})
+	if err != nil {
+		t.Fatalf("reclaim after cleanup: %v", err)
+	}
+	if len(report.Reaped) != 1 {
+		t.Fatalf("expected exactly one reaped target, got %+v / refused=%+v", report.Reaped, report.Refused)
+	}
+	if _, statErr := os.Stat(cleanWT); !os.IsNotExist(statErr) {
+		t.Fatal("reaped worktree still present")
+	}
+	cmd := exec.Command("git", "rev-parse", "--verify", "refs/herd/salvage/herd/done")
+	cmd.Dir = repo
+	if out, verr := cmd.CombinedOutput(); verr != nil {
+		t.Fatalf("salvage ref missing after reap: %v\n%s", verr, out)
+	}
+	// Sibling dirty tree untouched through both attempts.
+	if data, rerr := os.ReadFile(filepath.Join(dirtyWT, "precious.txt")); rerr != nil || string(data) != "unrecoverable" {
+		t.Fatalf("sibling dirty content disturbed: %q err=%v", data, rerr)
+	}
+}
