@@ -369,6 +369,74 @@ func TestPlan_AbsolutePathsDropped(t *testing.T) {
 	}
 }
 
+func TestNormalizeRepoPath_RejectsTraversalAndEscape(t *testing.T) {
+	// Regression for reviewer FAIL at d46b643: ../ traversal and cleaned
+	// paths that escape the repo root must be rejected (return "").
+	cases := []struct {
+		in   string
+		want string
+	}{
+		{"pkg/graph/graph.go", "pkg/graph/graph.go"},
+		{"./pkg/graph/graph.go", "pkg/graph/graph.go"},
+		{"pkg/graph/../config/config.go", "pkg/config/config.go"}, // intra-repo rewrite OK
+		{"../pkg/graph/graph.go", ""},
+		{"..", ""},
+		{"./..", ""},
+		{"foo/../../outside.go", ""},
+		{"pkg/graph/../../../etc/passwd", ""},
+		{"pkg/../../secret.go", ""},
+		{"a/b/../../c/d.go", "c/d.go"}, // cleans inside repo
+		{"a/b/../../../x.go", ""},      // escapes
+		{string([]byte{'/'}) + "abs/path.go", ""},
+		{"", ""},
+		{".", ""},
+		{"pkg\\graph\\graph.go", "pkg/graph/graph.go"},
+	}
+	for _, tc := range cases {
+		got := normalizeRepoPath(tc.in)
+		if got != tc.want {
+			t.Errorf("normalizeRepoPath(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+func TestPlan_TraversalPathsDropped(t *testing.T) {
+	// Plan must not surface traversal paths or packages derived from them.
+	in := baseInput(
+		"../evil/escape.go",
+		"pkg/../../outside.go",
+		"pkg/graph/../../../secret.go",
+		"pkg/config/config.go",
+	)
+	// Also inject a graph hit that tries to escape via file_path.
+	in.Graph.Hits = []GraphHit{
+		{Kind: "tests_for", Target: "x", FilePath: "../outside/escape_test.go"},
+		{Kind: "importers_of", Target: "x", FilePath: "pkg/../../daemon/x.go"},
+	}
+	plan, err := Plan(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range plan.ChangedPaths {
+		if strings.Contains(p, "..") || strings.HasPrefix(p, "/") {
+			t.Fatalf("traversal/escape path in plan.ChangedPaths: %q", p)
+		}
+	}
+	if !reflect.DeepEqual(plan.ChangedPackages, []string{"./pkg/config"}) {
+		t.Fatalf("packages = %v, want only ./pkg/config", plan.ChangedPackages)
+	}
+	for _, c := range plan.Commands {
+		for _, arg := range c.Argv {
+			// Reject ".." as a path segment only (go's "./..." is fine).
+			for _, seg := range strings.Split(strings.ReplaceAll(arg, "\\", "/"), "/") {
+				if seg == ".." {
+					t.Fatalf("command argv contains traversal segment: %#v", c.Argv)
+				}
+			}
+		}
+	}
+}
+
 func TestPlan_ValidFor(t *testing.T) {
 	in := baseInput("pkg/graph/graph.go")
 	plan, err := Plan(in)
