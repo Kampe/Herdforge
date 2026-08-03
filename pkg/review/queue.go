@@ -14,22 +14,21 @@ func queuePins(s LedgerSnapshot, pass map[string]string, veto map[string]bool) [
 			records[row.SHA] = row.Branch
 		}
 	}
-	consumed := map[string]bool{}
-	for _, row := range s.Queue {
-		if row.Event == string(EventConsumed) {
-			consumed[row.SHA] = true
-		}
-	}
 	result := map[string]queuePin{}
 	for _, row := range s.Queue {
-		if row.Event != string(EventEnqueue) || consumed[row.SHA] || veto[row.SHA] {
-			continue
+		switch row.Event {
+		case string(EventEnqueue):
+			if veto[row.SHA] {
+				continue
+			}
+			branch := row.Branch
+			if branch == "" {
+				branch = records[row.SHA]
+			}
+			result[row.SHA] = queuePin{row.SHA, branch}
+		case string(EventConsumed), string(EventRevoked):
+			delete(result, row.SHA)
 		}
-		branch := row.Branch
-		if branch == "" {
-			branch = records[row.SHA]
-		}
-		result[row.SHA] = queuePin{row.SHA, branch}
 	}
 	out := make([]queuePin, 0, len(result))
 	for _, pin := range result {
