@@ -55,6 +55,15 @@ func (s *InMemoryLeaseStore) providerLockedLocked(id int64, lockOwner string, st
 	return !pl.lockedAt.Before(staleBefore) // locked by someone else and not stale
 }
 
+// providerLockHeldAtAllLocked reports whether id has ANY provider-
+// transition lock held, regardless of staleness -- what Acquire, Release,
+// and ExpireStale use, deliberately not staleness-aware (see their
+// comments and PeekStaleProviderLock's).
+func (s *InMemoryLeaseStore) providerLockHeldAtAllLocked(id int64) bool {
+	pl, ok := s.provLock[id]
+	return ok && pl.owner != ""
+}
+
 func (s *InMemoryLeaseStore) Close() error { return nil }
 
 func cloneLease(l *Lease) *Lease {
@@ -104,9 +113,8 @@ func (s *InMemoryLeaseStore) Acquire(_ context.Context, key LeaseKey, ownerID, r
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	staleBefore := now.Add(-providerLockStaleAfter)
 	if existing := s.activeLocked(key); existing != nil {
-		locked := s.providerLockedLocked(existing.ID, "", staleBefore)
+		locked := s.providerLockHeldAtAllLocked(existing.ID)
 		if !existing.Expired(now) || locked {
 			reason := "active and unexpired"
 			if existing.Expired(now) {
@@ -157,7 +165,7 @@ func (s *InMemoryLeaseStore) Release(_ context.Context, key LeaseKey, ownerID st
 	if target.Status != StatusActive {
 		return nil, false, fmt.Errorf("release: %w: generation %d is %s, not active", ErrStaleGeneration, generation, target.Status)
 	}
-	if s.providerLockedLocked(target.ID, "", now.Add(-providerLockStaleAfter)) {
+	if s.providerLockHeldAtAllLocked(target.ID) {
 		return nil, false, fmt.Errorf("%w: %s generation %d", ErrProviderTransitionInProgress, key.TaskRef, generation)
 	}
 	target.Status = StatusReleased
@@ -201,6 +209,60 @@ func (s *InMemoryLeaseStore) ReleaseProviderLock(_ context.Context, key LeaseKey
 	return nil
 }
 
+// PeekStaleProviderLock implements LeaseStore.
+func (s *InMemoryLeaseStore) PeekStaleProviderLock(_ context.Context, key LeaseKey, now time.Time) (*Lease, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	l := s.activeLocked(key)
+	if l == nil {
+		return nil, nil
+	}
+	pl, ok := s.provLock[l.ID]
+	if !ok || pl.owner == "" {
+		return nil, nil
+	}
+	staleBefore := now.Add(-providerLockStaleAfter)
+	if pl.lockedAt.Before(staleBefore) {
+		return cloneLease(l), nil
+	}
+	return nil, nil
+}
+
+// PeekAllStaleProviderLocks implements LeaseStore.
+func (s *InMemoryLeaseStore) PeekAllStaleProviderLocks(_ context.Context, now time.Time) ([]*Lease, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	staleBefore := now.Add(-providerLockStaleAfter)
+	var out []*Lease
+	for id, l := range s.rows {
+		if l.Status != StatusActive {
+			continue
+		}
+		pl, ok := s.provLock[id]
+		if !ok || pl.owner == "" || !pl.lockedAt.Before(staleBefore) {
+			continue
+		}
+		out = append(out, cloneLease(l))
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out, nil
+}
+
+// ForceReleaseProviderLock implements LeaseStore.
+func (s *InMemoryLeaseStore) ForceReleaseProviderLock(_ context.Context, key LeaseKey, generation int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for id, l := range s.rows {
+		if l.LeaseKey == key && l.Generation == generation {
+			delete(s.provLock, id)
+		}
+	}
+	return nil
+}
+
 func (s *InMemoryLeaseStore) Hold(_ context.Context, key LeaseKey, ownerID string, generation int64, held bool, now time.Time) (*Lease, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -214,17 +276,15 @@ func (s *InMemoryLeaseStore) Hold(_ context.Context, key LeaseKey, ownerID strin
 	return cloneLease(l), nil
 }
 
-// ExpireStale also respects an active, non-stale provider-transition
-// lock exactly like Release and Acquire's reclaim path do -- see the
+// ExpireStale never preempts a provider lock by time alone -- see the
 // matching comment on SQLiteLeaseStore.ExpireStale.
 func (s *InMemoryLeaseStore) ExpireStale(_ context.Context, now time.Time) ([]*Lease, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	staleBefore := now.Add(-providerLockStaleAfter)
 	var out []*Lease
 	for id, l := range s.rows {
-		if l.Status == StatusActive && !l.Held && !now.Before(l.ExpiresAt) && !s.providerLockedLocked(id, "", staleBefore) {
+		if l.Status == StatusActive && !l.Held && !now.Before(l.ExpiresAt) && !s.providerLockHeldAtAllLocked(id) {
 			l.Status = StatusExpired
 			out = append(out, cloneLease(l))
 		}

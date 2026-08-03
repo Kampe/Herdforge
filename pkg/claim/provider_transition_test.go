@@ -892,14 +892,17 @@ func TestClaimManager_ExpireStale_BlockedDuringInFlightCAS(t *testing.T) {
 	}
 }
 
-// TestSQLiteLeaseStore_ExpireStale_HonorsProviderLockStaleness proves the
-// review's explicit "do not reintroduce a five-minute live-call hole"
-// requirement is satisfied deliberately, not accidentally: a
-// provider-transition lock that has itself gone stale (its holder
-// crashed mid-call and never released it) must NOT block ExpireStale
-// forever -- it self-heals exactly like a stale capacity-release or
-// outbox claim does elsewhere in this package.
-func TestSQLiteLeaseStore_ExpireStale_HonorsProviderLockStaleness(t *testing.T) {
+// TestSQLiteLeaseStore_StoreLayer_NeverPreemptsProviderLockByTimeAlone
+// proves the store layer's half of the fix for the review's
+// "provider/local partial failure" finding: Release/Acquire/ExpireStale
+// no longer have any staleness carve-out of their own at all -- a
+// provider lock unconditionally blocks them, live or stale, full stop.
+// (Whether a stale lock is safe to clear is a decision only
+// ClaimManager can make, since only it knows whether a ProviderCAS is
+// configured and can durably confirm a fence advance first -- see
+// TestClaimManager_ExpireStale_RequiresFenceAdvanceBeforePreemptingStaleLock
+// for that half.)
+func TestSQLiteLeaseStore_StoreLayer_NeverPreemptsProviderLockByTimeAlone(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
 	key := testKey("FAC-46")
@@ -909,34 +912,119 @@ func TestSQLiteLeaseStore_ExpireStale_HonorsProviderLockStaleness(t *testing.T) 
 	if err != nil {
 		t.Fatalf("acquire: %v", err)
 	}
-	// Simulate a settler that acquired the provider lock and then crashed
-	// mid-call, never releasing it.
 	if _, err := store.AcquireProviderLock(ctx, key, "w1", lease.Generation, "crashed-settler", time.Minute, claimAt); err != nil {
 		t.Fatalf("acquire provider lock: %v", err)
 	}
 
-	// Well past the lease's own TTL, but the crashed lock is still fresh
-	// (under providerLockStaleAfter): ExpireStale must NOT expire it.
-	tooSoon := claimAt.Add(2 * time.Minute)
-	notYetExpired, err := store.ExpireStale(ctx, tooSoon)
+	// Arbitrarily far past both the TTL and providerLockStaleAfter: the
+	// store must still refuse to touch it -- no matter how much time
+	// passes, ExpireStale/Acquire never unilaterally decide a stale lock
+	// is safe to clear.
+	farFuture := claimAt.Add(24 * time.Hour)
+
+	notExpired, err := store.ExpireStale(ctx, farFuture)
 	if err != nil {
-		t.Fatalf("expire stale (lock still fresh): %v", err)
+		t.Fatalf("expire stale: %v", err)
 	}
-	if len(notYetExpired) != 0 {
-		t.Fatalf("expected the fresh (non-stale) crashed lock to still block expiry, got %+v", notYetExpired)
+	if len(notExpired) != 0 {
+		t.Fatalf("expected the store to never preempt a provider lock by time alone, got %+v", notExpired)
 	}
 
-	// Well past BOTH the TTL and providerLockStaleAfter: the crashed
-	// lock must now be treated as abandoned, and expiry proceeds.
-	longAfter := claimAt.Add(providerLockStaleAfter + time.Minute)
-	nowExpired, err := store.ExpireStale(ctx, longAfter)
+	if _, err := store.Acquire(ctx, key, "w2", "herd-smith", "/wt", farFuture, time.Minute); err == nil {
+		t.Fatal("expected a reclaim attempt to still be blocked by the provider lock no matter how much time passed")
+	}
+
+	// Only ForceReleaseProviderLock (reserved for ClaimManager's
+	// orchestration, after a confirmed fence advance) can clear it.
+	if err := store.ForceReleaseProviderLock(ctx, key, lease.Generation); err != nil {
+		t.Fatalf("force release provider lock: %v", err)
+	}
+	nowExpired, err := store.ExpireStale(ctx, farFuture)
 	if err != nil {
-		t.Fatalf("expire stale (lock stale): %v", err)
+		t.Fatalf("expire stale after force release: %v", err)
 	}
 	if len(nowExpired) != 1 || nowExpired[0].Generation != lease.Generation {
-		t.Fatalf("expected the lease to expire once the crashed lock itself went stale, got %+v", nowExpired)
+		t.Fatalf("expected the lease to expire once the lock was explicitly cleared, got %+v", nowExpired)
 	}
 }
+
+// TestClaimManager_ExpireStale_RequiresFenceAdvanceBeforePreemptingStaleLock
+// is the ClaimManager half: proves the review's "do not reintroduce a
+// five-minute live-call hole" requirement is satisfied deliberately, not
+// accidentally, AND that a crashed settler's lock still self-heals once
+// the provider is reachable again -- exactly like a stale
+// capacity-release or outbox claim does elsewhere in this package, just
+// gated on a durable fence advance succeeding first.
+func TestClaimManager_ExpireStale_RequiresFenceAdvanceBeforePreemptingStaleLock(t *testing.T) {
+	store := newTestStore(t)
+	outbox := newTestOutbox(t)
+	provider := newFakeProviderCAS()
+	provider.seed("FAC-46", "to-do", 1)
+	failing := &advanceFenceFailer{provider: provider, failNext: true}
+	ctx := context.Background()
+	key := testKey("FAC-46")
+	claimAt := time.Now()
+
+	lease, err := store.Acquire(ctx, key, "w1", "herd-smith", "/wt", claimAt, time.Minute)
+	if err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	if _, err := store.AcquireProviderLock(ctx, key, "w1", lease.Generation, "crashed-settler", time.Minute, claimAt); err != nil {
+		t.Fatalf("acquire provider lock: %v", err)
+	}
+
+	farFuture := claimAt.Add(24 * time.Hour)
+	unblockedNow := func() time.Time { return farFuture }
+	mgr := NewClaimManager(store, WithProviderCAS(failing), WithDurableOutbox(outbox), WithClock(unblockedNow))
+
+	// First sweep: AdvanceFence fails (provider "unreachable"). The lock
+	// must be left in place -- not cleared, not the lease expired.
+	if _, err := mgr.ExpireStale(ctx); err == nil {
+		t.Fatal("expected ExpireStale to surface the fence-advance failure, not swallow it")
+	}
+	stillLocked, err := store.PeekStaleProviderLock(ctx, key, farFuture)
+	if err != nil {
+		t.Fatalf("peek stale provider lock: %v", err)
+	}
+	if stillLocked == nil {
+		t.Fatal("expected the lock to remain in place after a failed fence-advance attempt")
+	}
+
+	// Recovery: the provider becomes reachable again. A later sweep
+	// retries the SAME durable fence-advance record and succeeds.
+	failing.failNext = false
+	expired, err := mgr.ExpireStale(ctx)
+	if err != nil {
+		t.Fatalf("expire stale after recovery: %v", err)
+	}
+	if len(expired) != 1 || expired[0].Generation != lease.Generation {
+		t.Fatalf("expected the lease to expire once fence-advance recovered, got %+v", expired)
+	}
+	if provider.fenceRejectionCount() != 0 {
+		t.Fatalf("sanity: expected no fence rejections in this test, got %d", provider.fenceRejectionCount())
+	}
+}
+
+// advanceFenceFailer wraps a fakeProviderCAS and can be told to fail the
+// next AdvanceFence call, to test durable retry after an initial
+// failure.
+type advanceFenceFailer struct {
+	provider *fakeProviderCAS
+	failNext bool
+}
+
+func (f *advanceFenceFailer) CompareAndSwap(ctx context.Context, taskID string, expected ProviderRevision, fenceToken int64, mutate func(ctx context.Context) error) (ProviderRevision, error) {
+	return f.provider.CompareAndSwap(ctx, taskID, expected, fenceToken, mutate)
+}
+
+func (f *advanceFenceFailer) AdvanceFence(ctx context.Context, taskID string, fenceToken int64) error {
+	if f.failNext {
+		return fmt.Errorf("provider unavailable")
+	}
+	return f.provider.AdvanceFence(ctx, taskID, fenceToken)
+}
+
+var _ ProviderCAS = (*advanceFenceFailer)(nil)
 
 // TestClaimManager_ProviderFencing_RejectsStaleCASAfterSixMinutePause is
 // the review's exact scenario, reproduced precisely: a settler holds the
@@ -1030,5 +1118,106 @@ func TestClaimManager_ProviderFencing_RejectsStaleCASAfterSixMinutePause(t *test
 	}
 	if got := provider.fenceRejectionCount(); got != 1 {
 		t.Fatalf("expected exactly 1 fence rejection, got %d", got)
+	}
+}
+
+// TestClaimManager_Claim_RejectsReclaimWhenFenceAdvanceFails_ThenRecoversSafely
+// reproduces the review's exact follow-up finding: Claim previously
+// called AdvanceFence only AFTER local generation 2 was already durably
+// acquired, then ignored its error -- so new local ownership was exposed
+// to the rest of the system with the provider never told about it.
+// Independent deterministic probe: pause generation 1's CAS, expire/
+// reclaim generation 2 while AdvanceFence returns "provider unavailable",
+// resume generation 1's CAS -- outcome replacement_generation=2
+// complete_err=<nil> advance_calls=1 provider_calls=1 mutated=true.
+//
+// This test drives Claim itself (not a manual store dance) through both
+// halves the review demanded: (1) a failed AdvanceFence must make Claim
+// itself fail -- no local reclaim exposed without it -- and (2) a later
+// retry, once the provider recovers, must complete the reclaim safely.
+func TestClaimManager_Claim_RejectsReclaimWhenFenceAdvanceFails_ThenRecoversSafely(t *testing.T) {
+	store := newTestStore(t)
+	outbox := newTestOutbox(t)
+	provider := newFakeProviderCAS()
+	provider.seed("FAC-48", "to-do", 1)
+	failing := &advanceFenceFailer{provider: provider, failNext: true}
+	clk := newClock(time.Now())
+	mgr := NewClaimManager(store, WithProviderCAS(failing), WithDurableOutbox(outbox), WithClock(clk.now), WithTTL(time.Minute))
+	ctx := context.Background()
+	key := testKey("FAC-48")
+
+	lease, err := mgr.Claim(ctx, ClaimRequest{Key: key, OwnerID: "w1", Role: "herd-smith", TaskRole: "herd-smith"})
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	rec, err := mgr.BeginProviderTransition(ctx, key, "w1", lease.Generation, "provider_mutation")
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+
+	// Pause generation 1's CAS immediately before it would call the
+	// provider: manually claim the outbox record and the provider lock,
+	// exactly as CompleteProviderTransition would have at that point.
+	pauseAt := clk.now()
+	if _, err := outbox.Claim(ctx, rec.IdempotencyKey, "paused-settler", mgr.providerLockTimeout, pauseAt); err != nil {
+		t.Fatalf("manual outbox claim: %v", err)
+	}
+	if _, err := store.AcquireProviderLock(ctx, key, "w1", lease.Generation, "paused-settler", mgr.providerLockTimeout, pauseAt); err != nil {
+		t.Fatalf("acquire provider lock: %v", err)
+	}
+
+	// Six minutes pass: the lock is now stale.
+	clk.advance(providerLockStaleAfter + time.Minute)
+
+	// Attempt to reclaim while the provider is "unavailable" for fence
+	// advancement. This MUST fail -- no local generation 2, no exposure.
+	if _, err := mgr.Claim(ctx, ClaimRequest{Key: key, OwnerID: "w2", Role: "herd-smith", TaskRole: "herd-smith"}); err == nil {
+		t.Fatal("expected Claim to fail when the provider fence advance fails, not silently reclaim")
+	}
+
+	// Nothing changed locally: still generation 1, still active, still
+	// locked.
+	current, err := store.currentActive(ctx, key)
+	if err != nil {
+		t.Fatalf("current active: %v", err)
+	}
+	if current == nil || current.Generation != lease.Generation || current.OwnerID != "w1" {
+		t.Fatalf("expected generation %d still active and untouched after the failed reclaim attempt, got %+v", lease.Generation, current)
+	}
+
+	// The "paused" CAS finally resumes. Since no reclaim ever actually
+	// succeeded, generation 1 is still the legitimate, current owner --
+	// this completion is NOT stale, and must succeed normally.
+	_, casErr := provider.CompareAndSwap(ctx, "FAC-48", "1", lease.Generation, func(ctx context.Context) error {
+		provider.setStatus("FAC-48", "claimed-by-legitimate-generation-1")
+		return nil
+	})
+	if casErr != nil {
+		t.Fatalf("expected generation 1's own (non-stale) completion to succeed, got %v", casErr)
+	}
+	if got := provider.fenceRejectionCount(); got != 0 {
+		t.Fatalf("expected zero fence rejections (nothing was ever wrongly superseded), got %d", got)
+	}
+
+	// Recovery: the provider becomes reachable again. A retried Claim now
+	// succeeds, safely, via the same durable fence-advance record.
+	failing.failNext = false
+	replacement, err := mgr.Claim(ctx, ClaimRequest{Key: key, OwnerID: "w2", Role: "herd-smith", TaskRole: "herd-smith"})
+	if err != nil {
+		t.Fatalf("reclaim after recovery: %v", err)
+	}
+	if replacement.Generation != lease.Generation+1 {
+		t.Fatalf("expected generation %d after recovery, got %d", lease.Generation+1, replacement.Generation)
+	}
+
+	// And NOW a stale call carrying the old (generation 1) fence token is
+	// correctly rejected -- proving recovery didn't just complete the
+	// reclaim, it completed it SAFELY, with the fence genuinely advanced.
+	_, staleErr := provider.CompareAndSwap(ctx, "FAC-48", provider.revisionOf("FAC-48"), lease.Generation, func(ctx context.Context) error {
+		t.Fatal("mutate must not run for a fence-rejected call")
+		return nil
+	})
+	if !errors.Is(staleErr, ErrProviderFenceRejected) {
+		t.Fatalf("expected a post-recovery stale-generation call to be fence-rejected, got %v", staleErr)
 	}
 }
