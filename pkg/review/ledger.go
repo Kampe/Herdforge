@@ -82,7 +82,7 @@ type VerdictRecord struct {
 	Branch        string
 	Tier          string
 	BuilderFamily string
-	At            int64
+	At            int64 // Unix nanoseconds; zero means an omitted timestamp.
 	Index         int
 }
 
@@ -108,6 +108,18 @@ func (l *Ledger) Snapshot() (LedgerSnapshot, error) {
 	if err != nil {
 		return LedgerSnapshot{}, err
 	}
+	if err := validateLedgerRows(l.Path, rows); err != nil {
+		return LedgerSnapshot{}, err
+	}
+	if err := validateLedgerRows(l.QueuePath, queue); err != nil {
+		return LedgerSnapshot{}, err
+	}
+	if _, err := orderedEvents(rows); err != nil {
+		return LedgerSnapshot{}, err
+	}
+	if _, err := orderedEvents(queue); err != nil {
+		return LedgerSnapshot{}, err
+	}
 	return LedgerSnapshot{Rows: rows, Queue: queue}, nil
 }
 
@@ -121,16 +133,21 @@ func (l *Ledger) Verdicts(ctx context.Context) ([]VerdictRecord, error) {
 	if err != nil {
 		return nil, err
 	}
+	events, err := orderedEvents(rows)
+	if err != nil {
+		return nil, err
+	}
 	result := make([]VerdictRecord, 0)
-	for i, row := range rows {
+	for _, event := range events {
+		row := event.row
 		if row.Event != string(EventVerdict) {
 			continue
 		}
 		at := int64(0)
-		if ts, e := time.Parse(time.RFC3339Nano, row.Timestamp); e == nil {
-			at = ts.Unix()
+		if ts, e := parseRowTime(row.Timestamp); e == nil {
+			at = ts.UnixNano()
 		}
-		result = append(result, VerdictRecord{SHA: row.SHA, Verdict: row.Verdict, Branch: row.Branch, Tier: row.Tier, BuilderFamily: row.BuilderFamily, At: at, Index: i})
+		result = append(result, VerdictRecord{SHA: row.SHA, Verdict: row.Verdict, Branch: row.Branch, Tier: row.Tier, BuilderFamily: row.BuilderFamily, At: at, Index: event.index})
 	}
 	return result, nil
 }
@@ -145,6 +162,9 @@ func (l *Ledger) PASSes(ctx context.Context) (map[string]string, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	if _, err := orderedEvents(rows); err != nil {
+		return nil, err
+	}
 	return l.passMap(rows), nil
 }
 
@@ -155,6 +175,10 @@ func (l *Ledger) Vetoed(ctx context.Context) (map[string]bool, error) {
 		return nil, err
 	}
 	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	rows, err = orderedRows(rows)
+	if err != nil {
 		return nil, err
 	}
 	latest := make(map[string]LedgerRow)
@@ -179,9 +203,13 @@ func (l *Ledger) TierProp(ctx context.Context, sha string) string {
 	if err != nil || ctx.Err() != nil {
 		return ""
 	}
+	rows, err = orderedRows(rows)
+	if err != nil {
+		return ""
+	}
 	var tier string
 	for _, row := range rows {
-		if row.Event == string(EventRecord) && row.SHA == sha && row.Tier != "" {
+		if row.Event == string(EventRecord) && row.SHA == sha {
 			tier = row.Tier
 		}
 	}
@@ -189,14 +217,17 @@ func (l *Ledger) TierProp(ctx context.Context, sha string) string {
 }
 
 func (l *Ledger) passMap(rows []LedgerRow) map[string]string {
+	ordered, err := orderedRows(rows)
+	if err != nil {
+		return map[string]string{}
+	}
+	rows = ordered
 	recordTier := make(map[string]string)
 	latest := make(map[string]LedgerRow)
 	for _, row := range rows {
 		switch row.Event {
 		case string(EventRecord):
-			if row.Tier != "" {
-				recordTier[row.SHA] = row.Tier
-			}
+			recordTier[row.SHA] = row.Tier
 		case string(EventVerdict):
 			latest[row.SHA+"\x00"+row.Reviewer] = row
 		}
@@ -204,14 +235,53 @@ func (l *Ledger) passMap(rows []LedgerRow) map[string]string {
 	result := make(map[string]string)
 	for _, row := range latest {
 		if row.Verdict == string(VerdictPASS) {
-			tier := row.Tier
-			if tier == "" {
-				tier = recordTier[row.SHA]
-			}
-			result[row.SHA] = tier
+			result[row.SHA] = recordTier[row.SHA]
 		}
 	}
 	return result
+}
+
+func parseRowTime(raw string) (time.Time, error) {
+	if strings.TrimSpace(raw) == "" {
+		return time.Time{}, nil
+	}
+	return time.Parse(time.RFC3339Nano, raw)
+}
+
+func orderedRows(rows []LedgerRow) ([]LedgerRow, error) {
+	items, err := orderedEvents(rows)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]LedgerRow, len(items))
+	for i, item := range items {
+		out[i] = item.row
+	}
+	return out, nil
+}
+
+type orderedLedgerRow struct {
+	row   LedgerRow
+	index int
+	at    time.Time
+}
+
+func orderedEvents(rows []LedgerRow) ([]orderedLedgerRow, error) {
+	items := make([]orderedLedgerRow, 0, len(rows))
+	for i, row := range rows {
+		at, err := parseRowTime(row.Timestamp)
+		if err != nil {
+			return nil, fmt.Errorf("invalid event timestamp at JSONL index %d: %w", i, err)
+		}
+		items = append(items, orderedLedgerRow{row: row, index: i, at: at})
+	}
+	sort.SliceStable(items, func(i, j int) bool {
+		if items[i].at.Equal(items[j].at) {
+			return items[i].index < items[j].index
+		}
+		return items[i].at.Before(items[j].at)
+	})
+	return items, nil
 }
 
 // familyResolve carries the 3-state resolution so null!=empty maps to a bit.
@@ -347,6 +417,18 @@ func readRowsStrict(path string) ([]LedgerRow, error) {
 		return nil, fmt.Errorf("read ledger %s: %w", path, err)
 	}
 	return rows, nil
+}
+
+func validateLedgerRows(path string, rows []LedgerRow) error {
+	for i, row := range rows {
+		switch row.Event {
+		case string(EventRecord), string(EventVerdict), string(EventEnqueue), string(EventRevoked), string(EventConsumed), string(EventRepair):
+			if strings.TrimSpace(row.SHA) == "" {
+				return fmt.Errorf("read ledger %s: JSONL index %d event %q is missing sha", path, i, row.Event)
+			}
+		}
+	}
+	return nil
 }
 
 // newestBy groups rows by key and keeps the last (newest) per key.
