@@ -7,46 +7,43 @@ import (
 	"strings"
 )
 
-// DiagnoseKindAuthReadiness performs bounded, non-leaking checks for whether
-// a hosted author kind can start non-interactively through HostCreds.
-// It does not spawn agents and never emits secret material.
+// DiagnoseKindAuthReadiness performs bounded, non-leaking checks.
+// Production brokerable requires handle-backed authority presence (not raw env keys).
+// Optional auth parameter: when nil, uses handles from HERD_HOSTCREDS_HANDLES only.
 func DiagnoseKindAuthReadiness(kind string) KindAuthDiagnosis {
+	return DiagnoseKindAuthReadinessWith(kind, nil)
+}
+
+// DiagnoseKindAuthReadinessWith uses an explicit authority when provided.
+func DiagnoseKindAuthReadinessWith(kind string, auth CredentialAuthority) KindAuthDiagnosis {
 	kind = strings.ToLower(strings.TrimSpace(kind))
 	d := KindAuthDiagnosis{
-		Kind:          kind,
-		RequiredHosts: RequiredBrokerHostsForKind(kind),
-		Class:         KindAuthExternal,
+		Kind:           kind,
+		RequiredHosts:  RequiredBrokerHostsForKind(kind),
+		Class:          KindAuthExternal,
+		AuthorityClass: "none",
 	}
 
 	if ok, reason := PlatformHostCredsStatus(); !ok {
 		d.Class = KindAuthPlatform
 		d.Brokerable = false
-		d.Reason = reason
-		d.Blocker = fmt.Sprintf("FAC-170 BLOCKED: platform unsupported for HostCreds broker (%s)", reason)
+		d.ReasonCode = "platform_unsupported"
+		d.Blocker = "FAC-170 BLOCKED: platform unsupported for HostCreds oracle"
 		d.RecommendedAction = "run HostCreds broker on a supported unix-like coordinator host"
+		_ = reason
 		return d
 	}
 
 	if len(d.RequiredHosts) == 0 {
 		d.Class = KindAuthConfig
 		d.Brokerable = false
-		d.Reason = "unknown or out-of-scope harness kind — no RequiredBrokerHosts mapping"
-		d.Blocker = fmt.Sprintf("FAC-170 BLOCKED: kind %q has no HostCreds host mapping (OpenCode/Ollama out of scope)", kind)
-		d.RecommendedAction = "use grok, claude, or codex with API-key HostCreds"
+		d.ReasonCode = "unknown_kind"
+		d.Blocker = fmt.Sprintf("FAC-170 BLOCKED: kind %q has no HostCreds mapping (OpenCode out of scope)", kind)
+		d.RecommendedAction = "use grok, claude, or codex with handle-backed HostCreds"
 		return d
 	}
 
-	creds := CoordinatorHostCredsFromEnv()
-	d.HostCredsPresent = HostsPresent(creds)
-
-	missing := []string{}
-	for _, h := range d.RequiredHosts {
-		if !hostCredPresent(creds, h) {
-			missing = append(missing, h)
-		}
-	}
-
-	// Host-side auth file presence (no content). Used to distinguish OAuth vs missing API key.
+	// Host-side auth file hints (no content).
 	home, _ := os.UserHomeDir()
 	switch kind {
 	case AuthorKindCodex:
@@ -60,58 +57,85 @@ func DiagnoseKindAuthReadiness(kind string) KindAuthDiagnosis {
 			d.HostAuthFileHint = "host_codex_auth:absent"
 		}
 	case AuthorKindClaude:
-		d.HostAuthFileHint = "host_claude_creds:api_key_path"
+		d.HostAuthFileHint = "host_claude_creds:handle_path"
 	case AuthorKindGrok:
-		d.HostAuthFileHint = "host_grok_creds:api_key_path"
+		d.HostAuthFileHint = "host_grok_creds:handle_path"
 	}
 
-	if len(missing) == 0 {
-		// Codex chatgpt OAuth cannot be brokered as an API-key oracle path.
-		if kind == AuthorKindCodex && d.HostAuthModeHint == "chatgpt" && !hostCredPresent(creds, "api.openai.com") {
-			d.Class = KindAuthExternal
-			d.Brokerable = false
-			d.Reason = "codex host auth_mode=chatgpt (OAuth); HostCreds oracle attaches API keys only"
-			d.Blocker = "FAC-170 BLOCKED: codex requires OPENAI_API_KEY HostCreds in API-key mode — OAuth not brokerable"
-			d.RecommendedAction = "export OPENAI_API_KEY for API-key codex; interactive browser login is forbidden"
+	// Raw env keys are NOT production authority.
+	if EnvRawAPIKeysPresent() {
+		d.ReasonCode = "env_not_production_authority"
+		// Continue — handles may still make us brokerable.
+	}
+
+	if auth == nil {
+		// Presence from handles env without resolving secrets when possible.
+		handles := ParseHandlesEnv(os.Getenv(envHostCredsHandles))
+		var present []string
+		for _, h := range d.RequiredHosts {
+			if _, ok := handles[h]; ok {
+				present = append(present, h)
+			}
+		}
+		d.HostCredsPresent = sortHosts(present)
+		if len(handles) > 0 {
+			d.AuthorityClass = "handle"
+		}
+		// Try resolve only if handles cover required hosts (may fail offline).
+		if len(present) == len(d.RequiredHosts) && len(d.RequiredHosts) > 0 {
+			ha, err := NewHandleAuthorityFromEnv()
+			if err == nil && authorityCovers(ha, d.RequiredHosts) {
+				auth = ha
+			}
+		}
+	}
+
+	if auth != nil {
+		d.AuthorityClass = auth.Class()
+		d.HostCredsPresent = auth.Hosts()
+		if authorityCovers(auth, d.RequiredHosts) {
+			if kind == AuthorKindCodex && d.HostAuthModeHint == "chatgpt" && !auth.Has("api.openai.com") {
+				d.Class = KindAuthExternal
+				d.Brokerable = false
+				d.ReasonCode = "codex_oauth_unbrokerable"
+				d.Blocker = "FAC-170 BLOCKED: codex OAuth not brokerable; need API-key handle"
+				d.RecommendedAction = "install OPENAI API key via keychain:/op:// handle; no browser login"
+				return d
+			}
+			d.Class = KindAuthOK
+			d.Brokerable = true
+			d.ReasonCode = "ok"
+			d.Blocker = ""
+			d.RecommendedAction = ""
 			return d
 		}
-		// If openai key present even with chatgpt mode, API-key oracle path is brokerable.
-		d.Class = KindAuthOK
-		d.Brokerable = true
-		d.Reason = "HostCreds present for required API hosts"
-		d.Blocker = ""
-		d.RecommendedAction = ""
-		return d
 	}
 
 	d.Class = KindAuthExternal
 	d.Brokerable = false
-	d.Reason = fmt.Sprintf(
-		"missing HostCreds for hosts %v (OPENAI_API_KEY/ANTHROPIC_API_KEY/XAI_API_KEY/HERD_HOST_CREDS unset in coordinator env)",
-		missing,
-	)
+	if d.ReasonCode == "" {
+		d.ReasonCode = "missing_handle_creds"
+	}
 	d.Blocker = fmt.Sprintf(
-		"FAC-170 BLOCKED: external credential state — kind=%s missing HostCreds hosts=%v; "+
-			"worker HOME is scrubbed so host harness login files are unavailable; no interactive login UI",
-		kind, missing,
+		"FAC-170 BLOCKED: kind=%s missing handle-backed HostCreds hosts=%v; raw env keys are not production authority",
+		kind, d.RequiredHosts,
 	)
-	d.RecommendedAction = "export coordinator API keys into HostCreds out-of-band store (env) before live harness proof; worker never receives real keys"
+	d.RecommendedAction = "set HERD_HOSTCREDS_HANDLES to keychain: or op:// handles; never export raw API keys for workers"
 	return d
 }
 
-func hostCredPresent(creds map[string]string, host string) bool {
-	if strings.TrimSpace(creds[host]) != "" {
-		return true
+func authorityCovers(auth CredentialAuthority, required []string) bool {
+	if auth == nil {
+		return false
 	}
-	for kh, v := range creds {
-		if strings.EqualFold(kh, host) && strings.TrimSpace(v) != "" {
-			return true
+	for _, h := range required {
+		if !auth.Has(h) {
+			return false
 		}
 	}
-	return false
+	return true
 }
 
-// sniffCodexAuthMode returns auth_mode if it is a short non-secret enum string.
 func sniffCodexAuthMode(path string) string {
 	b, err := os.ReadFile(path)
 	if err != nil || len(b) == 0 {
@@ -122,8 +146,7 @@ func sniffCodexAuthMode(path string) string {
 	if i < 0 {
 		return ""
 	}
-	rest := string(b[i+len(key):])
-	rest = strings.TrimSpace(rest)
+	rest := strings.TrimSpace(string(b[i+len(key):]))
 	if !strings.HasPrefix(rest, ":") {
 		return ""
 	}
@@ -140,7 +163,7 @@ func sniffCodexAuthMode(path string) string {
 	case "chatgpt", "api", "apikey", "api_key", "None", "none":
 		return mode
 	default:
-		if len(mode) <= 16 && mode != "" {
+		if len(mode) <= 16 {
 			return mode
 		}
 		return ""
@@ -150,26 +173,23 @@ func sniffCodexAuthMode(path string) string {
 // FormatKindAuthBlocker is a single-line coordinator packet (no secrets).
 func FormatKindAuthBlocker(d KindAuthDiagnosis) string {
 	return fmt.Sprintf(
-		"%s class=%s brokerable=%v hosts_required=%v hosts_creds=%v auth_file=%s auth_mode=%s action=%s",
+		"%s class=%s brokerable=%v hosts_required=%v hosts_creds=%v authority=%s reason_code=%s auth_file=%s action=%s",
 		d.Blocker, d.Class, d.Brokerable, d.RequiredHosts, d.HostCredsPresent,
-		d.HostAuthFileHint, d.HostAuthModeHint, d.RecommendedAction,
+		d.AuthorityClass, d.ReasonCode, d.HostAuthFileHint, d.RecommendedAction,
 	)
 }
 
-// RedactSecrets strips known secret patterns from a diagnostic string.
-// Used as a belt-and-suspenders guard on diagnosis packets.
+// RedactSecrets strips bearer/sk patterns from diagnostic strings.
 func RedactSecrets(s string) string {
 	var b strings.Builder
 	b.Grow(len(s))
 	lower := strings.ToLower(s)
 	for i := 0; i < len(s); {
-		// Bearer <token>
 		if i+7 <= len(s) && lower[i:i+7] == "bearer " {
 			j := i + 7
-			for j < len(s) && s[j] != ' ' && s[j] != '\t' && s[j] != '\n' && s[j] != '\r' && s[j] != '"' && s[j] != '\'' && s[j] != '`' {
+			for j < len(s) && s[j] != ' ' && s[j] != '\t' && s[j] != '\n' && s[j] != '\r' && s[j] != '"' && s[j] != '\'' {
 				j++
 			}
-			// Skip already-redacted placeholders.
 			token := s[i+7 : j]
 			if token == "[REDACTED]" {
 				b.WriteString(s[i:j])
@@ -180,11 +200,9 @@ func RedactSecrets(s string) string {
 			i = j
 			continue
 		}
-		// sk-... API key shape
 		if i+3 <= len(s) && s[i:i+3] == "sk-" {
 			j := i + 3
 			if j < len(s) && s[j] == '[' {
-				// already sk-[REDACTED]
 				b.WriteByte(s[i])
 				i++
 				continue

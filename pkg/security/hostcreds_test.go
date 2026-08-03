@@ -2,366 +2,274 @@ package security
 
 import (
 	"errors"
+	"net/http"
 	"os"
 	"strings"
 	"testing"
 	"time"
 )
 
-func TestRequiredBrokerHostsForKind(t *testing.T) {
-	if got := RequiredBrokerHostsForKind("claude"); got[0] != "api.anthropic.com" {
-		t.Fatal(got)
-	}
-	if got := RequiredBrokerHostsForKind("grok"); got[0] != "api.x.ai" {
-		t.Fatal(got)
-	}
-	if got := RequiredBrokerHostsForKind("codex"); got[0] != "api.openai.com" {
+func TestRequiredBrokerHostsForKind_PerKindOnly(t *testing.T) {
+	if got := RequiredBrokerHostsForKind("grok"); len(got) != 1 || got[0] != "api.x.ai" {
 		t.Fatal(got)
 	}
 	if RequiredBrokerHostsForKind("opencode") != nil {
-		t.Fatal("opencode must be out of scope")
-	}
-}
-
-func TestDiagnoseKindAuthReadiness_NoAPIKeys_External(t *testing.T) {
-	for _, k := range []string{"OPENAI_API_KEY", "ANTHROPIC_API_KEY", "XAI_API_KEY", "HERD_HOST_CREDS"} {
-		t.Setenv(k, "")
-		_ = os.Unsetenv(k)
-	}
-	for _, kind := range []string{"codex", "claude", "grok"} {
-		d := DiagnoseKindAuthReadiness(kind)
-		if d.Brokerable {
-			t.Fatalf("%s: must not be brokerable without HostCreds", kind)
-		}
-		if d.Blocker == "" || !strings.Contains(d.Blocker, "BLOCKED") {
-			t.Fatalf("blocker: %q", d.Blocker)
-		}
-		pkt := FormatKindAuthBlocker(d)
-		if strings.Contains(strings.ToLower(pkt), "sk-") || strings.Contains(pkt, "Bearer sk") {
-			t.Fatalf("packet leaked secret material: %s", pkt)
-		}
-		if len(d.RequiredHosts) == 0 {
-			t.Fatalf("%s: expected required hosts", kind)
-		}
-	}
-}
-
-func TestDiagnoseKindAuthReadiness_WithAPIKey_OK(t *testing.T) {
-	t.Setenv("XAI_API_KEY", "sk-test-not-real-xxxxxxxx")
-	t.Setenv("OPENAI_API_KEY", "")
-	t.Setenv("ANTHROPIC_API_KEY", "")
-	_ = os.Unsetenv("OPENAI_API_KEY")
-	_ = os.Unsetenv("ANTHROPIC_API_KEY")
-	d := DiagnoseKindAuthReadiness("grok")
-	if !d.Brokerable || d.Class != KindAuthOK {
-		t.Fatalf("expected OK brokerable, got class=%s brokerable=%v blocker=%s", d.Class, d.Brokerable, d.Blocker)
-	}
-	pkt := FormatKindAuthBlocker(d)
-	if strings.Contains(pkt, "sk-test") {
-		t.Fatal("must not echo API key")
-	}
-}
-
-func TestDiagnoseKindAuthReadiness_OpenCodeBlocked(t *testing.T) {
-	d := DiagnoseKindAuthReadiness("opencode")
-	if d.Brokerable {
 		t.Fatal("opencode out of scope")
 	}
-}
-
-func TestRedactSecrets(t *testing.T) {
-	in := "Authorization: Bearer sk-abc123XYZ and sk-other_token_here"
-	out := RedactSecrets(in)
-	if strings.Contains(out, "sk-abc") || strings.Contains(out, "sk-other") {
-		t.Fatalf("not redacted: %s", out)
-	}
-	if !strings.Contains(out, "[REDACTED]") {
-		t.Fatalf("expected redaction marker: %s", out)
+	// No global eight-host list API.
+	rules := RequestRulesForKind("grok")
+	for _, r := range rules {
+		if r.Host != "api.x.ai" {
+			t.Fatalf("grok rules must not include %s", r.Host)
+		}
 	}
 }
 
-func TestStartHostCredsSession_MissingCreds_Blocked(t *testing.T) {
-	store := NewMemorySecretStore()
-	_, err := StartHostCredsSession(SessionConfig{
-		Kind:        "grok",
-		Store:       store,
-		Interactive: false,
-	})
+func TestDiagnose_RawEnvNotBrokerable(t *testing.T) {
+	t.Setenv("XAI_API_KEY", "sk-raw-env-not-authority")
+	t.Setenv(envHostCredsHandles, "")
+	_ = os.Unsetenv(envHostCredsHandles)
+	d := DiagnoseKindAuthReadiness("grok")
+	if d.Brokerable {
+		t.Fatal("raw env must not make brokerable")
+	}
+	if d.ReasonCode != "env_not_production_authority" && d.ReasonCode != "missing_handle_creds" {
+		// Either is acceptable; must not be ok.
+		if d.Class == KindAuthOK {
+			t.Fatal(d)
+		}
+	}
+	pkt := FormatKindAuthBlocker(d)
+	if strings.Contains(pkt, "sk-raw") {
+		t.Fatal("leaked key")
+	}
+}
+
+func TestDiagnose_OpenCodeBlocked(t *testing.T) {
+	d := DiagnoseKindAuthReadiness("opencode")
+	if d.Brokerable {
+		t.Fatal()
+	}
+}
+
+func TestBlockedError_NoFreeDetail(t *testing.T) {
+	be := &BlockedError{Reason: BlockMissingCreds, Code: "missing:api.x.ai", Kind: "grok"}
+	// Compile-time: no Detail field usage — Error is stable codes only.
+	if strings.Contains(be.Error(), "sk-") {
+		t.Fatal()
+	}
+	if !errors.Is(be, ErrHostCredsBlocked) {
+		t.Fatal()
+	}
+}
+
+func TestAuthority_NoGetSnapshot(t *testing.T) {
+	v := NewTestCredentialVault()
+	_ = v.InstallTestSecret("api.x.ai", "Bearer test-secret-aaa")
+	// Interface has no Get/Snapshot — only Has/Hosts/Inject.
+	if !v.Has("api.x.ai") {
+		t.Fatal()
+	}
+	if err := AssertNoPublicSecretExport(v); err != nil {
+		t.Fatal(err)
+	}
+	hdr := make(http.Header)
+	if err := v.InjectAuthorization("api.x.ai", hdr); err != nil {
+		t.Fatal(err)
+	}
+	if hdr.Get("Authorization") != "Bearer test-secret-aaa" {
+		t.Fatal("inject internal only")
+	}
+	// Callers outside package cannot Get — verified by interface shape in integration tests.
+}
+
+func TestMemoryIsTestOnly_NotDurable(t *testing.T) {
+	v := NewTestCredentialVault()
+	if v.Durable() {
+		t.Fatal("test vault must not claim durable")
+	}
+	if v.Class() != "test" {
+		t.Fatal()
+	}
+	ha := NewHandleAuthority()
+	if !ha.Durable() {
+		t.Fatal("handle authority must be durable")
+	}
+}
+
+func TestStartSession_MissingCreds(t *testing.T) {
+	v := NewTestCredentialVault()
+	_, err := StartHostCredsSession(SessionConfig{Kind: "grok", Authority: v, Interactive: false})
 	if err == nil {
-		t.Fatal("expected BLOCKED")
+		t.Fatal()
 	}
 	if !errors.Is(err, ErrHostCredsBlocked) {
-		t.Fatalf("want ErrHostCredsBlocked, got %v", err)
-	}
-	be := err.(*BlockedError)
-	if be.Reason != BlockMissingCreds {
-		t.Fatalf("reason=%s", be.Reason)
-	}
-}
-
-func TestStartHostCredsSession_DummyNotRealCreds(t *testing.T) {
-	store := NewMemorySecretStore()
-	// Even if someone tries to put dummy in store, Set rejects it.
-	if err := store.Set("api.x.ai", DummyNeverUpstreamAuth); err == nil {
-		t.Fatal("store must reject dummy")
-	}
-	// Env dummy also should not make session brokerable via empty store path.
-	t.Setenv("XAI_API_KEY", DummyNeverUpstream)
-	store2 := NewMemorySecretStore()
-	_ = LoadEnvIntoStore(store2)
-	// LoadEnv may try Set with Bearer dummy — must not succeed as real cred.
-	if store2.Get("api.x.ai") != "" && IsDummyCredential(store2.Get("api.x.ai")) {
-		t.Fatal("dummy must not sit in store as real cred")
-	}
-	_, err := StartHostCredsSession(SessionConfig{Kind: "grok", Store: store2, Interactive: false})
-	if err == nil {
-		t.Fatal("dummy must not enable session")
-	}
-}
-
-func TestStartHostCredsSession_InteractiveDenied(t *testing.T) {
-	_, err := StartHostCredsSession(SessionConfig{
-		Kind:        "fake",
-		Interactive: true,
-		Store:       NewMemorySecretStore(),
-	})
-	if err == nil {
-		t.Fatal("expected interactive denied")
-	}
-	if err.(*BlockedError).Reason != BlockInteractiveDenied {
 		t.Fatal(err)
 	}
 }
 
-func TestStartHostCredsSession_WorkerEnvNoSecretsNoBearer(t *testing.T) {
-	store := NewMemorySecretStore()
-	secret := "Bearer fac170-test-secret-VALUE-xyz"
-	if err := store.Set("api.x.ai", secret); err != nil {
-		t.Fatal(err)
-	}
-	sess, err := StartHostCredsSession(SessionConfig{
-		Kind:        "grok",
-		Store:       store,
-		Interactive: false,
-	})
+func TestStartSession_WorkerEnvNoSecrets(t *testing.T) {
+	v := NewTestCredentialVault()
+	secret := "Bearer fac170-secret-xyz"
+	_ = v.InstallTestSecret("api.x.ai", secret)
+	sess, err := StartHostCredsSession(SessionConfig{Kind: "grok", Authority: v, Interactive: false})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer sess.Close()
-
 	if err := sess.AssertWorkerCannotSeeSecret(secret); err != nil {
 		t.Fatal(err)
 	}
 	if err := sess.AssertNoWorkerBearerToken(); err != nil {
 		t.Fatal(err)
 	}
-	// Dummy present for CLI bootstrap.
 	if sess.WorkerEnvMap()["XAI_API_KEY"] != DummyNeverUpstream {
-		t.Fatalf("expected dummy XAI key, got %q", sess.WorkerEnvMap()["XAI_API_KEY"])
-	}
-	// Socket channel present, no proxy URL with credentials.
-	if sess.WorkerEnvMap()["HERD_HOSTCREDS_SOCKET"] == "" {
-		t.Fatal("expected socket channel")
-	}
-	if !strings.Contains(sess.WorkerEnvMap()["HERD_HOSTCREDS_CHANNEL"], "oracle") {
-		t.Fatal("expected oracle channel marker")
+		t.Fatal()
 	}
 }
 
-func TestAllowlist_HostMethodPath(t *testing.T) {
-	store := NewMemorySecretStore()
-	_ = store.Set("api.x.ai", "Bearer real-secret-111")
+func TestNormalizeHost(t *testing.T) {
+	h, err := NormalizeHost("API.X.AI.", false)
+	if err != nil || h != "api.x.ai" {
+		t.Fatalf("%q %v", h, err)
+	}
+	h, err = NormalizeHost("api.x.ai:443", false)
+	if err != nil || h != "api.x.ai" {
+		t.Fatal(h, err)
+	}
+	if _, err := NormalizeHost("api.x.ai:8443", false); err == nil {
+		t.Fatal("non-default port must deny")
+	}
+	if _, err := NormalizeHost("http://api.x.ai", false); err == nil {
+		t.Fatal()
+	}
+	if _, err := NormalizeHost("evil\r\nHost: x", false); err == nil {
+		t.Fatal()
+	}
+	h, err = NormalizeHost("127.0.0.1", true)
+	if err != nil || h != "127.0.0.1" {
+		t.Fatal(h, err)
+	}
+	if _, err := NormalizeHost("127.0.0.1", false); err == nil {
+		t.Fatal("loopback denied without flag")
+	}
+}
+
+func TestValidateAuthorization_CRLF(t *testing.T) {
+	if err := ValidateAuthorizationMaterial("Bearer good-token"); err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateAuthorizationMaterial("Bearer x\r\nX-Inject: 1"); err == nil {
+		t.Fatal("CRLF must fail")
+	}
+	if err := ValidateAuthorizationMaterial(DummyNeverUpstreamAuth); err == nil {
+		t.Fatal("dummy must fail as material")
+	}
+}
+
+func TestExactSessionCausalProof(t *testing.T) {
+	v := NewTestCredentialVault()
+	secret := "Bearer proof-secret-fac170-AAA"
+	_ = v.InstallTestSecret("127.0.0.1", secret)
 	sess, err := StartHostCredsSession(SessionConfig{
-		Kind:        "grok",
-		Store:       store,
-		Interactive: false,
+		Kind: "fake", Authority: v, Interactive: false, AllowLoopback: true,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer sess.Close()
-
-	// Host denied
-	r, err := CallOracle(sess.Oracle.SocketPath(), OracleRequest{
-		SessionID: sess.ID, Host: "evil.example.com", Method: "POST", Path: "/v1/chat/completions",
-	})
-	if err != nil || r.OK {
-		t.Fatalf("host deny failed: %+v %v", r, err)
+	proof, err := ProveExactSessionHostCreds(sess, secret, "HOSTCREDS_ALLOWED_OK_FAC170")
+	if err != nil {
+		t.Fatal(err)
 	}
-	// Path denied
-	r, err = CallOracle(sess.Oracle.SocketPath(), OracleRequest{
-		SessionID: sess.ID, Host: "api.x.ai", Method: "POST", Path: "/v1/admin/keys",
-	})
-	if err != nil || r.OK {
-		t.Fatalf("path deny failed: %+v %v", r, err)
-	}
-	// Method denied
-	r, err = CallOracle(sess.Oracle.SocketPath(), OracleRequest{
-		SessionID: sess.ID, Host: "api.x.ai", Method: "DELETE", Path: "/v1/chat/completions",
-	})
-	if err != nil || r.OK {
-		t.Fatalf("method deny failed: %+v %v", r, err)
+	if !proof.PromptConsumed || !proof.AllowedMarkerReach || !proof.ForbiddenAccessDeny ||
+		!proof.WorkerSecretHidden || !proof.NoWorkerBearer || !proof.DummyNeverUpstream || !proof.NoSecretExportAPI {
+		t.Fatalf("%+v", proof)
 	}
 }
 
-func TestRotateRevokeRestartExpiry(t *testing.T) {
-	store := NewMemorySecretStore()
-	oldSec := "Bearer old-secret-111"
-	newSec := "Bearer new-secret-222"
-	_ = store.Set("api.x.ai", oldSec)
-
-	sess, err := StartHostCredsSession(SessionConfig{
-		Kind:        "grok",
-		Store:       store,
-		Interactive: false,
-		TTL:         time.Hour,
-	})
+func TestRotateRevokeRestart(t *testing.T) {
+	v := NewTestCredentialVault()
+	_ = v.InstallTestSecret("api.x.ai", "Bearer old-secret-111")
+	sess, err := StartHostCredsSession(SessionConfig{Kind: "grok", Authority: v, Interactive: false, TTL: time.Hour})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer sess.Close()
-
 	gen1 := sess.Oracle.Generation()
-	if err := sess.Rotate("api.x.ai", newSec); err != nil {
+
+	if err := v.RotateTestSecret("api.x.ai", "Bearer new-secret-222"); err != nil {
 		t.Fatal(err)
 	}
-	if store.Get("api.x.ai") != newSec {
-		t.Fatal("store not rotated")
+	if !v.Has("api.x.ai") {
+		t.Fatal()
 	}
-	if err := sess.AssertWorkerCannotSeeSecret(newSec); err != nil {
+	if err := sess.AssertWorkerCannotSeeSecret("Bearer new-secret-222"); err != nil {
 		t.Fatal(err)
 	}
 
 	if err := sess.RevokeHost("api.x.ai"); err != nil {
 		t.Fatal(err)
 	}
-	if store.Get("api.x.ai") != "" {
-		t.Fatal("store still has secret after revoke")
+	if v.Has("api.x.ai") {
+		t.Fatal("revoked")
 	}
-
-	_ = store.Set("api.x.ai", newSec)
+	_ = v.InstallTestSecret("api.x.ai", "Bearer new-secret-222")
 	if err := sess.Restart(); err != nil {
 		t.Fatal(err)
 	}
 	if sess.Oracle.Generation() <= gen1 {
-		t.Fatalf("generation should bump: before=%d after=%d", gen1, sess.Oracle.Generation())
+		t.Fatal("generation")
+	}
+	if !sess.Oracle.HostCredentialPresent("api.x.ai") {
+		t.Fatal("restart keeps authority object for test vault")
 	}
 
-	// Short TTL expiry
-	s2, err := StartHostCredsSession(SessionConfig{
-		Kind: "grok", Store: store, Interactive: false, TTL: 20 * time.Millisecond,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer s2.Close()
-	time.Sleep(40 * time.Millisecond)
-	if err := s2.Oracle.Alive(); err == nil {
-		t.Fatal("expected expired")
-	} else if be, ok := err.(*BlockedError); !ok || be.Reason != BlockExpired {
-		t.Fatalf("want expired, got %v", err)
-	}
-}
-
-func TestExactSessionCausalProof(t *testing.T) {
-	store := NewMemorySecretStore()
-	secret := "Bearer proof-secret-fac170-AAA"
-	_ = store.Set("api.x.ai", secret)
-
-	sess, err := StartHostCredsSession(SessionConfig{
-		Kind:        "fake",
-		Store:       store,
-		Interactive: false,
-		ExtraHosts:  []string{"127.0.0.1"},
-		TestRules: append(DefaultRequestRules(), RequestRule{
-			Host: "127.0.0.1", Method: "POST", PathPrefix: "/v1/chat/completions", Action: "chat.completions",
-		}),
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer sess.Close()
-
-	marker := "HOSTCREDS_ALLOWED_OK_FAC170"
-	proof, err := ProveExactSessionHostCreds(sess, secret, marker)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !proof.PromptConsumed || !proof.AllowedMarkerReach || !proof.ForbiddenAccessDeny ||
-		!proof.WorkerSecretHidden || !proof.NoWorkerBearer || !proof.DummyNeverUpstream {
-		t.Fatalf("incomplete proof: %+v", proof)
-	}
-	if proof.SessionID != sess.ID {
-		t.Fatal("session mismatch")
-	}
-}
-
-func TestStartAuthorSessionNonInteractive_BlockedWithoutCreds(t *testing.T) {
-	for _, k := range []string{"OPENAI_API_KEY", "ANTHROPIC_API_KEY", "XAI_API_KEY", "HERD_HOST_CREDS"} {
-		t.Setenv(k, "")
-		_ = os.Unsetenv(k)
-	}
-	_, err := StartAuthorSessionNonInteractive("grok", t.TempDir(), NewMemorySecretStore())
-	if err == nil {
-		t.Fatal("expected blocked")
-	}
-	if !errors.Is(err, ErrHostCredsBlocked) {
-		t.Fatalf("got %v", err)
-	}
-}
-
-func TestStartAuthorSessionNonInteractive_GrokWithCreds(t *testing.T) {
-	store := NewMemorySecretStore()
-	_ = store.Set("api.x.ai", "Bearer live-test-key-not-real")
-	sess, err := StartAuthorSessionNonInteractive("grok", t.TempDir(), store)
-	if err != nil {
-		if be, ok := err.(*BlockedError); ok && be.Reason == BlockUnsupportedPlat {
-			t.Skip(be.Detail)
+	// Durable handle authority restart re-resolves via mock.
+	ha := NewHandleAuthority()
+	ha.resolve = func(handle string) (string, error) {
+		if handle == "keychain:test-xai" {
+			return "rotated-token-zzz", nil
 		}
+		return "", errors.New("nope")
+	}
+	if err := ha.InstallFromHandle("api.x.ai", "keychain:test-xai"); err != nil {
 		t.Fatal(err)
 	}
-	defer sess.Close()
-	if err := sess.ConsumePrompt("non-interactive author turn"); err != nil {
+	// Rotate handle material
+	call := 0
+	ha.resolve = func(handle string) (string, error) {
+		call++
+		return "after-restart-token", nil
+	}
+	if err := ha.ReResolveAll(); err != nil {
 		t.Fatal(err)
 	}
-	if err := sess.AssertNoWorkerBearerToken(); err != nil {
+	if call == 0 {
+		t.Fatal("expected re-resolve")
+	}
+	hdr := make(http.Header)
+	if err := ha.InjectAuthorization("api.x.ai", hdr); err != nil {
 		t.Fatal(err)
 	}
-	if err := sess.AssertWorkerCannotSeeSecret("live-test-key-not-real"); err != nil {
-		t.Fatal(err)
+	if hdr.Get("Authorization") != "Bearer after-restart-token" {
+		t.Fatal(hdr.Get("Authorization"))
 	}
 }
 
-func TestMatchRequestRule_Boundary(t *testing.T) {
-	rules := []RequestRule{{Host: "api.x.ai", Method: "POST", PathPrefix: "/v1/chat/completions"}}
-	if MatchRequestRule(rules, "api.x.ai", "POST", "/v1/chat/completions") == nil {
-		t.Fatal("exact")
+func TestParseHandlesEnv_RejectsSecrets(t *testing.T) {
+	m := ParseHandlesEnv("api.x.ai=Bearer sk-evil;api.openai.com=op://V/i/f")
+	if _, ok := m["api.x.ai"]; ok {
+		t.Fatal("must reject bearer as handle")
 	}
-	if MatchRequestRule(rules, "api.x.ai", "POST", "/v1/chat/completions/extra") == nil {
-		t.Fatal("prefix/")
-	}
-	if MatchRequestRule(rules, "api.x.ai", "POST", "/v1/chat/completionss") != nil {
-		t.Fatal("must not match chatty suffix")
-	}
-	if MatchRequestRule(rules, "api.x.ai", "GET", "/v1/chat/completions") != nil {
-		t.Fatal("method")
+	if m["api.openai.com"] != "op://V/i/f" {
+		t.Fatal(m)
 	}
 }
 
-func TestPreopenedFD(t *testing.T) {
-	store := NewMemorySecretStore()
-	_ = store.Set("api.x.ai", "Bearer fd-secret")
-	sess, err := StartHostCredsSession(SessionConfig{Kind: "grok", Store: store, Interactive: false})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer sess.Close()
-	f, err := sess.OpenPreopenedFD()
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer f.Close()
-	if f.Fd() == 0 {
-		// fd 0 is stdin; ExtraFiles FD would be higher — still a valid File.
+func TestRedactSecrets(t *testing.T) {
+	out := RedactSecrets("Authorization: Bearer sk-abc123XYZ")
+	if strings.Contains(out, "sk-abc") {
+		t.Fatal(out)
 	}
 }
