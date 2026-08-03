@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -37,6 +38,37 @@ func TestFAC178_AmbientDotGuardRejectsRootMutation(t *testing.T) {
 	}
 	if removals != 0 {
 		t.Fatalf("ambient-dot guard reached removal %d times", removals)
+	}
+}
+
+func TestFAC178_DryRunReceiptOutcomesMatchEligibility(t *testing.T) {
+	root := t.TempDir()
+	initRepo(t, root)
+	wm := NewWorktreeManager(root)
+	merged, err := wm.CreateTaskWorktree(context.Background(), "FAC-178-DRY-MERGED")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dirty, err := wm.CreateTaskWorktree(context.Background(), "FAC-178-DRY-DIRTY")
+	if err != nil {
+		t.Fatal(err)
+	}
+	runCmd(root, "git", "checkout", "main")
+	runCmd(root, "git", "merge", "--no-ff", "-m", "merge dry receipt fixture", merged.Branch)
+	runCmd(root, "git", "push", "origin", "main")
+	if err := os.WriteFile(filepath.Join(dirty.Path, "dirty.txt"), []byte("dirty"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	report, err := wm.Reap(context.Background(), ReapPolicy{DefaultBranch: "main"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	byTarget := map[string]ReapReceipt{}
+	for _, receipt := range report.Receipts {
+		byTarget[receipt.Branch] = receipt
+	}
+	if byTarget["main"].Outcome != "refused" || byTarget[dirty.Branch].Outcome != "refused" || byTarget[merged.Branch].Outcome != "planned" {
+		t.Fatalf("dry-run receipt outcomes do not match eligibility: %+v", byTarget)
 	}
 }
 
@@ -153,10 +185,80 @@ func TestFAC178_ReceiptsSerializePortableEvidence(t *testing.T) {
 	if err := json.Unmarshal(lines[len(lines)-1], &receipt); err != nil {
 		t.Fatal(err)
 	}
-	if receipt.Outcome != "removed" || receipt.Actor == "" || receipt.ActionPolicy != "remove" ||
+	if receipt.Outcome != "removed" || receipt.HEAD == "" || receipt.Actor == "" || receipt.ActionPolicy != "remove" ||
 		receipt.BoardEvidence == "" || receipt.LeaseGeneration == "" ||
-		receipt.IntegrationSHA == "" || receipt.PolicyDigest == "" || receipt.SalvageRef == "" {
+		receipt.IntegrationSHA == "" || receipt.PolicyDigest == "" || receipt.SalvageRef == "" || !receipt.EvidenceObserved {
 		t.Fatalf("incomplete durable receipt: %+v", receipt)
+	}
+}
+
+func TestFAC178_InitialRefusalSinkPrecedesEligibleMutation(t *testing.T) {
+	root := t.TempDir()
+	initRepo(t, root)
+	wm := NewWorktreeManager(root)
+	merged, err := wm.CreateTaskWorktree(context.Background(), "FAC-178-INITIAL-MERGED")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dirty, err := wm.CreateTaskWorktree(context.Background(), "FAC-178-INITIAL-DIRTY")
+	if err != nil {
+		t.Fatal(err)
+	}
+	runCmd(root, "git", "checkout", "main")
+	runCmd(root, "git", "merge", "--no-ff", "-m", "merge initial fixture", merged.Branch)
+	runCmd(root, "git", "push", "origin", "main")
+	if err := os.WriteFile(filepath.Join(dirty.Path, "dirty.txt"), []byte("dirty"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	removals := 0
+	wm.RemoveWorktreeFunc = func(context.Context, string) error { removals++; return nil }
+	policy := fac178Policy(t, wm, merged.Path)
+	policy.TargetPaths = []string{merged.Path, dirty.Path}
+	policy.ReceiptSink = func(receipt ReapReceipt) error {
+		if receipt.Outcome == "refused" {
+			return errors.New("initial refusal sink unavailable")
+		}
+		return nil
+	}
+	if _, err := wm.Reap(context.Background(), policy); err == nil {
+		t.Fatal("initial refusal sink failure must be hard")
+	}
+	if removals != 0 {
+		t.Fatalf("eligible target mutated after initial refusal sink failure: %d", removals)
+	}
+}
+
+func TestFAC178_RefusalReceiptRedactsProbePaths(t *testing.T) {
+	root := t.TempDir()
+	initRepo(t, root)
+	wm := NewWorktreeManager(root)
+	wi, err := wm.CreateTaskWorktree(context.Background(), "FAC-178-REDACT")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var durable bytes.Buffer
+	policy := fac178Policy(t, wm, wi.Path)
+	policy.LeaseProbe = func(context.Context, string, string) (bool, error) {
+		return false, fmt.Errorf("lease read failed at %s", root)
+	}
+	policy.ReceiptSink = func(receipt ReapReceipt) error {
+		return json.NewEncoder(&durable).Encode(receipt)
+	}
+	if _, err := wm.Reap(context.Background(), policy); err != nil {
+		t.Fatal(err)
+	}
+	serialized := durable.String()
+	if strings.Contains(serialized, root) || strings.Contains(serialized, "lease read failed") {
+		t.Fatalf("portable refusal leaked diagnostic path/text: %q", serialized)
+	}
+	var receipt ReapReceipt
+	if err := json.Unmarshal(bytes.TrimSpace(durable.Bytes()), &receipt); err != nil {
+		t.Fatal(err)
+	}
+	if receipt.Branch != wi.Branch || receipt.HEAD == "" || receipt.ReasonCode != "unknown-evidence" || receipt.Actor == "" ||
+		receipt.IntegrationSHA != "" || receipt.BoardEvidence != "" || receipt.LeaseGeneration != "" || receipt.EvidenceObserved {
+		t.Fatalf("refusal receipt lost exact portable evidence: %+v", receipt)
 	}
 }
 
@@ -197,8 +299,9 @@ func TestFAC178_ReceiptIntentPrecedesMutationAndSinkFailureFailsClosed(t *testin
 	// then terminal outcome. The injected removal seam makes this assertion
 	// independent of filesystem deletion.
 	events = nil
-	wm.RemoveWorktreeFunc = func(context.Context, string) error {
+	wm.RemoveWorktreeFunc = func(_ context.Context, path string) error {
 		events = append(events, "remove")
+		runCmd(root, "git", "worktree", "remove", "--force", path)
 		return nil
 	}
 	policy.ReceiptSink = func(receipt ReapReceipt) error {
@@ -211,6 +314,122 @@ func TestFAC178_ReceiptIntentPrecedesMutationAndSinkFailureFailsClosed(t *testin
 	if got, want := strings.Join(events, ","), "remove-intent,remove,removed"; got != want {
 		t.Fatalf("mutation ordering=%q want %q", got, want)
 	}
+}
+
+func TestFAC178_NoOpRemoveCannotProduceRemoved(t *testing.T) {
+	root := t.TempDir()
+	initRepo(t, root)
+	wm := NewWorktreeManager(root)
+	wi, err := wm.CreateTaskWorktree(context.Background(), "FAC-178-NOOP")
+	if err != nil {
+		t.Fatal(err)
+	}
+	runCmd(root, "git", "checkout", "main")
+	runCmd(root, "git", "merge", "--no-ff", "-m", "merge noop fixture", wi.Branch)
+	runCmd(root, "git", "push", "origin", "main")
+
+	var outcomes []string
+	policy := fac178Policy(t, wm, wi.Path)
+	wm.RemoveWorktreeFunc = func(context.Context, string) error { return nil }
+	policy.ReceiptSink = func(receipt ReapReceipt) error {
+		outcomes = append(outcomes, receipt.Outcome)
+		return nil
+	}
+	if _, err := wm.Reap(context.Background(), policy); err == nil {
+		t.Fatal("no-op remove must not report success")
+	}
+	if containsString(outcomes, "removed") || !containsString(outcomes, "unverified") {
+		t.Fatalf("no-op remove fabricated terminal success: %v", outcomes)
+	}
+}
+
+func TestFAC178_FinalFenceRejectsCommitAfterIntent(t *testing.T) {
+	root := t.TempDir()
+	initRepo(t, root)
+	wm := NewWorktreeManager(root)
+	wi, err := wm.CreateTaskWorktree(context.Background(), "FAC-178-LATE-HEAD")
+	if err != nil {
+		t.Fatal(err)
+	}
+	runCmd(root, "git", "checkout", "main")
+	runCmd(root, "git", "merge", "--no-ff", "-m", "merge late HEAD fixture", wi.Branch)
+	runCmd(root, "git", "push", "origin", "main")
+
+	removals := 0
+	wm.RemoveWorktreeFunc = func(context.Context, string) error { removals++; return nil }
+	policy := fac178Policy(t, wm, wi.Path)
+	var outcomes []string
+	policy.ReceiptSink = func(receipt ReapReceipt) error {
+		outcomes = append(outcomes, receipt.Outcome)
+		if receipt.Outcome == "remove-intent" {
+			runCmd(wi.Path, "git", "commit", "--allow-empty", "-m", "late intent commit")
+		}
+		return nil
+	}
+	report, err := wm.Reap(context.Background(), policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if removals != 0 || len(report.Reaped) != 0 || !containsString(outcomes, "refused") {
+		t.Fatalf("late HEAD crossed final fence: removals=%d reaped=%v outcomes=%v", removals, report.Reaped, outcomes)
+	}
+	if !containsReason(report.Refused, "final action binding changed after intent") {
+		t.Fatalf("missing final HEAD refusal: %+v", report.Refused)
+	}
+}
+
+func TestFAC178_FinalFenceRejectsLeaseChangeAfterIntent(t *testing.T) {
+	root := t.TempDir()
+	initRepo(t, root)
+	wm := NewWorktreeManager(root)
+	wi, err := wm.CreateTaskWorktree(context.Background(), "FAC-178-LATE-LEASE")
+	if err != nil {
+		t.Fatal(err)
+	}
+	runCmd(root, "git", "checkout", "main")
+	runCmd(root, "git", "merge", "--no-ff", "-m", "merge late lease fixture", wi.Branch)
+	runCmd(root, "git", "push", "origin", "main")
+
+	removals, active := 0, false
+	wm.RemoveWorktreeFunc = func(context.Context, string) error { removals++; return nil }
+	policy := fac178Policy(t, wm, wi.Path)
+	var outcomes []string
+	policy.LeaseProbe = func(context.Context, string, string) (bool, error) { return active, nil }
+	policy.ReceiptSink = func(receipt ReapReceipt) error {
+		outcomes = append(outcomes, receipt.Outcome)
+		if receipt.Outcome == "remove-intent" {
+			active = true
+		}
+		return nil
+	}
+	report, err := wm.Reap(context.Background(), policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if removals != 0 || len(report.Reaped) != 0 || !containsString(outcomes, "refused") {
+		t.Fatalf("late lease crossed final fence: removals=%d reaped=%v outcomes=%v", removals, report.Reaped, outcomes)
+	}
+	if !containsReason(report.Refused, "final action fence refused removal") {
+		t.Fatalf("missing final lease refusal: %+v", report.Refused)
+	}
+}
+
+func containsString(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
+}
+
+func containsReason(candidates []ReapCandidate, want string) bool {
+	for _, candidate := range candidates {
+		if strings.Contains(candidate.Reason, want) {
+			return true
+		}
+	}
+	return false
 }
 
 func fac178Policy(t *testing.T, wm *WorktreeManager, target string) ReapPolicy {
