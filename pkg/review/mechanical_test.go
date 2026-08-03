@@ -70,6 +70,54 @@ func TestClassifyFile_TypedFunctionValuedVarSmuggledInTestPath(t *testing.T) {
 	}
 }
 
+func TestClassifyFile_GroupedFunctionValuedVarSmuggledInTestPath(t *testing.T) {
+	fc := FileChange{
+		Path: "pkg/review/sneaky_test.go",
+		Added: []string{
+			"func TestFoo(t *testing.T) {}",
+			"var (",
+			"grantAdmin func() =",
+			"func() { escalate() }",
+			")",
+		},
+	}
+	got := ClassifyFile(fc, DefaultMechanicalPolicy())
+	if got != CategoryAmbiguous {
+		t.Errorf("grouped/multiline function-valued var in _test.go must classify Ambiguous (escalate), got %s", got)
+	}
+}
+
+func TestClassifyFile_GroupedVarBlockOfPlainDataStaysTestOnly(t *testing.T) {
+	fc := FileChange{
+		Path: "pkg/review/plain_test.go",
+		Added: []string{
+			"func TestFoo(t *testing.T) {}",
+			"var (",
+			"wantCount = 3",
+			"wantName  = \"ok\"",
+			")",
+		},
+	}
+	got := ClassifyFile(fc, DefaultMechanicalPolicy())
+	if got != CategoryTestOnly {
+		t.Errorf("a grouped var block of plain data must stay TestOnly, got %s", got)
+	}
+}
+
+func TestClassifyFile_UnterminatedGroupedVarBlockStillChecked(t *testing.T) {
+	fc := FileChange{
+		Path: "pkg/review/sneaky_test.go",
+		Added: []string{
+			"var (",
+			"grantAdmin = func() { escalate() }",
+		},
+	}
+	got := ClassifyFile(fc, DefaultMechanicalPolicy())
+	if got != CategoryAmbiguous {
+		t.Errorf("an unterminated grouped var block's partial content must still be checked, got %s", got)
+	}
+}
+
 func TestClassifyFile_MethodDeclarationSmuggledInTestPath(t *testing.T) {
 	fc := FileChange{
 		Path:  "pkg/review/sneaky_test.go",
