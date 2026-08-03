@@ -21,11 +21,18 @@ func run(args []string, out, errOut io.Writer, discovery harness.HookDiscovery) 
 	if err := fs.Parse(args); err != nil || fs.NArg() != 0 {
 		return 2
 	}
-	result, err := discovery.Discover(strings.TrimSpace(*provider))
-	if err != nil || result.State == harness.DiscoveryFailed {
+	providerName := strings.TrimSpace(*provider)
+	if !supportedProvider(providerName) {
+		return 1
+	}
+	result, err := discovery.Discover(providerName)
+	if err != nil {
 		if err != nil {
 			_, _ = fmt.Fprintln(errOut, err)
 		}
+		return 1
+	}
+	if !authoritativeState(result) {
 		return 1
 	}
 	if *validate && result.PolicyRequired {
@@ -50,4 +57,24 @@ func run(args []string, out, errOut io.Writer, discovery harness.HookDiscovery) 
 		return 1
 	}
 	return 0
+}
+
+func supportedProvider(provider string) bool {
+	switch strings.ToLower(strings.TrimSpace(provider)) {
+	case "claude", "codex", "grok", "kimi", "agy", "antigravity", "pi", "opencode":
+		return true
+	default:
+		return false
+	}
+}
+
+func authoritativeState(result harness.HookDiscoveryResult) bool {
+	switch result.State {
+	case harness.DiscoveryNoHooks:
+		return len(result.Hooks) == 0
+	case harness.DiscoveryHooks:
+		return len(result.Hooks) > 0
+	default:
+		return false
+	}
 }
