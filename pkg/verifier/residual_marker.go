@@ -13,11 +13,10 @@ import (
 // lock probe below.
 var markerLineageDrainedFn = markerLineageDrained
 
-// createOwnershipMarker creates a private, mode-0600 file used as an
-// unforgeable inherited lineage marker. The open file is passed to the
-// ownership wrapper as ExtraFiles FD5; descendants that retain the FD are
-// causally owned. The path is random under the process temp dir — unrelated
-// processes do not open it.
+// createOwnershipMarker creates a private, mode-0600 file used as an inherited
+// locked lineage marker. The open file is passed to the ownership wrapper as
+// ExtraFiles FD5; descendants that retain the FD are causally owned. The path
+// is random under the process temp dir and is never candidate-path authority.
 //
 // Caller owns the returned *os.File and must Close+Remove it (Close on
 // ownedSubprocess does this).

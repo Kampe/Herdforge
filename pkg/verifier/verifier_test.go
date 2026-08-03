@@ -702,8 +702,9 @@ exit 0
 // productionDetachedOnlyScript: adversarial setsid + double-fork residual writer.
 // Intermediate parents exit immediately (no keep-alive). The grandchild calls
 // os.setsid() so it is NOT a member of the original process group — membership
-// kill alone cannot own it. Production must discover it via candidate-path
-// residual ownership (open FD on writetarget) and identity-kill by token.
+// kill alone cannot own it. Production must discover it via the inherited
+// locked marker FD and identity-kill by token; the open writetarget is
+// corroboration only.
 //
 // $1=writerPid $2=writetarget
 // Optional $3=startedPath $4=releasePath provides an explicit ordering gate
@@ -1366,8 +1367,8 @@ func TestProcTokenIdentityBoundRefusesStalePID(t *testing.T) {
 	h.close()
 }
 
-// TestKillProcessGroupMembersNeverUsesNegativePGID is a non-vacuous guard:
-// processGroupKiller must reap via positive PIDs (identity), not kill(-pgid).
+// TestKillProcessGroupMembersRejectsHostPGIDsBeforeSnapshot proves pgid 0/1
+// fail before enumeration. It never invokes a real signal with either value.
 func TestKillProcessGroupMembersRejectsHostPGIDsBeforeSnapshot(t *testing.T) {
 	previous := processGroupSnapshotter
 	snapshotCalls := 0
@@ -1387,6 +1388,8 @@ func TestKillProcessGroupMembersRejectsHostPGIDsBeforeSnapshot(t *testing.T) {
 	}
 }
 
+// TestKillProcessGroupMembersNeverUsesNegativePGID is a non-vacuous guard:
+// processGroupKiller must reap via positive PIDs (identity), not kill(-pgid).
 func TestKillProcessGroupMembersNeverUsesNegativePGID(t *testing.T) {
 	cmd := exec.Command("sleep", "30")
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
