@@ -823,6 +823,40 @@ type PaneInfo struct {
 	TabID string
 }
 
+// TabRecord is the exact Herdr tab-list socket read model. It intentionally
+// contains no task/generation/role fields; those belong to a separate durable
+// launch-receipt binding authority.
+type TabRecord struct {
+	TabID       string `json:"tab_id"`
+	WorkspaceID string `json:"workspace_id"`
+	Label       string `json:"label"`
+	Number      int    `json:"number"`
+	PaneCount   int    `json:"pane_count"`
+	Focused     bool   `json:"focused"`
+	AgentStatus string `json:"agent_status"`
+}
+
+// TabList reads durable tab metadata. It is read-only and deliberately does
+// not fall back to labels, panes, or process guesses when fields are absent.
+func TabList(workspace string) ([]TabRecord, error) {
+	if strings.TrimSpace(workspace) == "" {
+		return nil, fmt.Errorf("herdr tab list: workspace is required")
+	}
+	out, err := runHerdr("tab", "list", "--workspace", workspace)
+	if err != nil {
+		return nil, fmt.Errorf("herdr tab list: %w", err)
+	}
+	var resp struct {
+		Result struct {
+			Tabs []TabRecord `json:"tabs"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal([]byte(out), &resp); err != nil {
+		return nil, fmt.Errorf("parsing tab list: %w", err)
+	}
+	return resp.Result.Tabs, nil
+}
+
 // TabCreateOptions is the fail-closed tab launch contract (FAC-121).
 // Workspace and Cwd are required; unknown workspace must not fall back.
 type TabCreateOptions struct {
@@ -1289,25 +1323,6 @@ type AgentEntry struct {
 	Session        AgentSession `json:"agent_session,omitempty"`
 	Revision       uint64       `json:"revision,omitempty"`
 	StateChangeSeq uint64       `json:"state_change_seq,omitempty"`
-
-	// FAC-158 reconciliation observation (fixture / authority-filled).
-	SessionID           string      `json:"session_id,omitempty"`
-	Generation          string      `json:"generation,omitempty"`
-	SessionGeneration   string      `json:"session_generation,omitempty"`
-	TaskRef             string      `json:"task_ref,omitempty"`
-	TaskStatus          string      `json:"task_status,omitempty"`
-	WorktreeKnown       bool        `json:"worktree_known,omitempty"`
-	Dirty               bool        `json:"dirty,omitempty"`
-	UniqueCommits       bool        `json:"unique_commits,omitempty"`
-	UniqueRefs          bool        `json:"unique_refs,omitempty"`
-	PendingReview       bool        `json:"pending_review,omitempty"`
-	PendingOutbox       bool        `json:"pending_outbox,omitempty"`
-	PendingCallback     bool        `json:"pending_callback,omitempty"`
-	ActiveReview        bool        `json:"active_review,omitempty"`
-	UnsupersededVerdict bool        `json:"unsuperseded_verdict,omitempty"`
-	Protected           bool        `json:"protected,omitempty"`
-	ExplicitUserShell   bool        `json:"explicit_user_shell,omitempty"`
-	Evidence            TabEvidence `json:"evidence,omitempty"`
 }
 
 type PaneProcess struct {

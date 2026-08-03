@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/Kampe/Herdforge/pkg/config"
+	"github.com/Kampe/Herdforge/pkg/herdr"
 	"github.com/Kampe/Herdforge/pkg/provider"
 )
 
@@ -14,9 +15,16 @@ type DashboardState struct {
 	ProviderType string
 	ActiveTasks  []*provider.Task
 	LastUpdated  time.Time
+	Fleet        herdr.FleetStatus
 }
 
 func RenderDashboard(cfg *config.Config, tasks []*provider.Task) string {
+	// No live reconciliation snapshot was supplied; surface UNKNOWN instead
+	// of rendering a false idle/capacity-success projection.
+	return RenderDashboardWithFleet(cfg, tasks, herdr.FleetStatus{Unknown: 1})
+}
+
+func RenderDashboardWithFleet(cfg *config.Config, tasks []*provider.Task, fleet herdr.FleetStatus) string {
 	var sb strings.Builder
 
 	sb.WriteString("========================================================================\n")
@@ -28,6 +36,8 @@ func RenderDashboard(cfg *config.Config, tasks []*provider.Task) string {
 		sb.WriteString(fmt.Sprintf(" Task Engine   : %s\n", cfg.TaskProvider.Type))
 		sb.WriteString(fmt.Sprintf(" Configured Lanes: %d\n", len(cfg.Lanes)))
 	}
+	sb.WriteString(fmt.Sprintf(" Fleet Lanes   : working=%d capacity=%d standing=%d preserved=%d recovering=%d control=%d unknown=%d\n",
+		fleet.Working, fleet.Capacity, fleet.Standing, fleet.Preserved, fleet.Recovering, fleet.ControlSeats, fleet.Unknown))
 	sb.WriteString("------------------------------------------------------------------------\n")
 	sb.WriteString(" ACTIVE TASK QUEUE                                                      \n")
 	sb.WriteString("------------------------------------------------------------------------\n")
