@@ -1,6 +1,7 @@
 package security
 
 import (
+	"crypto/tls"
 	"fmt"
 	"io"
 	"net"
@@ -58,7 +59,8 @@ func ProveExactSessionHostCreds(sess *HostCredsSession, secret, allowedMarker st
 
 	var sawAuth atomic.Value
 	sawAuth.Store("")
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	// TLS-only upstream (credentialed path must never use plaintext HTTP).
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		auth := r.Header.Get("Authorization")
 		sawAuth.Store(auth)
 		if IsDummyCredential(auth) {
@@ -73,13 +75,18 @@ func ProveExactSessionHostCreds(sess *HostCredsSession, secret, allowedMarker st
 	}))
 	defer upstream.Close()
 
-	_, upPort, err := net.SplitHostPort(strings.TrimPrefix(upstream.URL, "http://"))
+	upHost := strings.TrimPrefix(upstream.URL, "https://")
+	_, upPort, err := net.SplitHostPort(upHost)
 	if err != nil {
 		return proof, err
 	}
-	sess.Oracle.forceHTTP = true
 	sess.Oracle.allowLoopback = true
 	sess.Oracle.CaptureInjected = true
+	sess.Oracle.upstreamTLS = &tls.Config{
+		InsecureSkipVerify: true, // test server self-signed; production uses system roots
+		MinVersion:         tls.VersionTLS12,
+		ServerName:         "127.0.0.1",
+	}
 	sess.Oracle.dialHook = func(network, addr string) (net.Conn, error) {
 		return net.Dial("tcp", net.JoinHostPort("127.0.0.1", upPort))
 	}

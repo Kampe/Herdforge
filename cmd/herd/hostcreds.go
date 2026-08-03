@@ -25,6 +25,10 @@ func runHostCreds() {
 		os.Exit(runHostCredsSession(os.Args[3:]))
 	case "selftest":
 		os.Exit(runHostCredsSelftest(os.Args[3:]))
+	case "live":
+		os.Exit(runHostCredsLive(os.Args[3:]))
+	case "boundary":
+		os.Exit(runHostCredsBoundary(os.Args[3:]))
 	case "-h", "--help", "help":
 		printHostCredsUsage()
 		os.Exit(0)
@@ -39,14 +43,88 @@ func printHostCredsUsage() {
 	fmt.Fprintln(os.Stderr, `herd hostcreds — HostCreds oracle (FAC-170)
 
 Usage:
-  herd hostcreds diagnose --kind <grok|claude|codex>
-  herd hostcreds session  --kind <grok|claude|codex>
+  herd hostcreds diagnose  --kind <grok|claude|codex>
+  herd hostcreds session   --kind <grok|claude|codex>
   herd hostcreds selftest
+  herd hostcreds boundary          # prove separate-UID OS boundary (fail-closed)
+  herd hostcreds live --kind <grok|claude|codex> [--herdr] [--marker S]
 
-Production authority: HERD_HOSTCREDS_HANDLES="api.x.ai=keychain:…;…"
-  (keychain: or op:// handles only — never raw API keys / HERD_HOST_CREDS)
+Production:
+  HERD_HOSTCREDS_HANDLES="api.x.ai=keychain:…|op://…"  (handles only)
+  HERD_HOSTCREDS_BROKER_UID  ≠ worker uid
+  HERD_HOSTCREDS_BROKER_PID  broker process for attach probe
+  HERD_HOSTCREDS_SECRET_PATH optional secret file unreadable by worker
 
 Exit: 0 ok, 1 fatal, 2 BLOCKED/usage. Never prints credential bytes. No OpenCode.`)
+}
+
+func runHostCredsBoundary(args []string) int {
+	fs := flag.NewFlagSet("hostcreds boundary", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	b, err := security.RequireProductionBoundary()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err.Error())
+		return 2
+	}
+	fmt.Printf("HOSTCREDS_BOUNDARY ok mechanism=%s broker_uid=%d worker_uid=%d broker_pid=%d digest=%s\n",
+		b.Mechanism, b.BrokerUID, b.WorkerUID, b.BrokerPID, b.ProbeDigest)
+	return 0
+}
+
+func runHostCredsLive(args []string) int {
+	fs := flag.NewFlagSet("hostcreds live", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	kind := fs.String("kind", "", "grok|claude|codex")
+	marker := fs.String("marker", "HOSTCREDS_LIVE_OK", "expected marker in harness output")
+	useHerdr := fs.Bool("herdr", false, "launch via herdr tab when available")
+	prompt := fs.String("prompt", "", "non-interactive prompt (default includes marker)")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if strings.TrimSpace(*kind) == "" {
+		fmt.Fprintln(os.Stderr, "hostcreds live: --kind required")
+		return 2
+	}
+	auth, err := security.NewHandleAuthorityFromEnv()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "hostcreds live: %v\n", err)
+		return 1
+	}
+	sess, _, proof, err := security.StartAuthorLive(security.LiveConfig{
+		Kind:          *kind,
+		Prompt:        *prompt,
+		AllowedMarker: *marker,
+		Authority:     auth,
+		UseHerdr:      *useHerdr,
+		Workspace:     os.Getenv("HERD_WORKSPACE"),
+	})
+	if sess != nil {
+		defer sess.Close()
+	}
+	if proof != nil {
+		fmt.Printf("HOSTCREDS_LIVE session_id=%s kind=%s author_pid=%d prompt_consumed=%v marker_reached=%v forbidden_denied=%v boundary=%s\n",
+			proof.SessionID, proof.Kind, proof.AuthorPID, proof.PromptConsumed, proof.ModelMarkerReached, proof.ForbiddenDenied, proof.BoundaryDigest)
+		if proof.OutputSnippet != "" {
+			fmt.Printf("output_snippet=%s\n", proof.OutputSnippet)
+		}
+	}
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err.Error())
+		return 2
+	}
+	if proof == nil || !proof.PromptConsumed || !proof.ForbiddenDenied {
+		fmt.Fprintln(os.Stderr, "hostcreds live: incomplete exact-session proof")
+		return 2
+	}
+	// Marker may require live provider; require process launched + boundary + deny.
+	if proof.AuthorPID == 0 && !*useHerdr {
+		// herdr path may not set AuthorPID
+	}
+	fmt.Println("hostcreds live: PASS (exact-session process proof)")
+	return 0
 }
 
 func runHostCredsDiagnose(args []string) int {

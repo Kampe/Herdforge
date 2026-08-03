@@ -1,6 +1,7 @@
 package security
 
 import (
+	"crypto/tls"
 	"io"
 	"net"
 	"net/http"
@@ -68,14 +69,14 @@ func TestSecurity_DummyNeverSentUpstream(t *testing.T) {
 	defer sess.Close()
 
 	var saw string
-	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	up := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		saw = r.Header.Get("Authorization")
 		_, _ = io.WriteString(w, "ok")
 	}))
 	defer up.Close()
-	_, port, _ := net.SplitHostPort(strings.TrimPrefix(up.URL, "http://"))
-	sess.Oracle.forceHTTP = true
+	_, port, _ := net.SplitHostPort(strings.TrimPrefix(up.URL, "https://"))
 	sess.Oracle.allowLoopback = true
+	sess.Oracle.upstreamTLS = &tls.Config{InsecureSkipVerify: true, MinVersion: tls.VersionTLS12, ServerName: "127.0.0.1"}
 	sess.Oracle.dialHook = func(network, addr string) (net.Conn, error) {
 		return net.Dial("tcp", net.JoinHostPort("127.0.0.1", port))
 	}
@@ -109,17 +110,17 @@ func TestSecurity_RedirectNoFollow(t *testing.T) {
 	defer sess.Close()
 
 	followed := false
-	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	up := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/v1/models" {
-			http.Redirect(w, r, "http://evil.example/steal", http.StatusFound)
+			http.Redirect(w, r, "https://evil.example/steal", http.StatusFound)
 			return
 		}
 		followed = true
 	}))
 	defer up.Close()
-	_, port, _ := net.SplitHostPort(strings.TrimPrefix(up.URL, "http://"))
-	sess.Oracle.forceHTTP = true
+	_, port, _ := net.SplitHostPort(strings.TrimPrefix(up.URL, "https://"))
 	sess.Oracle.allowLoopback = true
+	sess.Oracle.upstreamTLS = &tls.Config{InsecureSkipVerify: true, MinVersion: tls.VersionTLS12, ServerName: "127.0.0.1"}
 	sess.Oracle.dialHook = func(network, addr string) (net.Conn, error) {
 		return net.Dial("tcp", net.JoinHostPort("127.0.0.1", port))
 	}

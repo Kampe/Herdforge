@@ -27,4 +27,10 @@ package security
 // Compiled production caller: herd hostcreds diagnose|session|selftest
 
 // IntegrationAPIVersion is bumped on breaking HostCreds API changes.
-const IntegrationAPIVersion = 2
+const IntegrationAPIVersion = 3
+
+// Live entry (FAC-170 production caller):
+//   herd hostcreds live --kind grok
+// requires HERD_HOSTCREDS_BROKER_UID ≠ worker, HERD_HOSTCREDS_BROKER_PID,
+// handle-backed authority, and harness/herdr. Same-UID theater is BLOCKED.
+// FAC-133 after rebase should call security.StartAuthorLive (not fake httptest).
