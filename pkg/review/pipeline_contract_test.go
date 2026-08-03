@@ -255,15 +255,21 @@ func TestPipelineContract_JSONTypesAndOperationalState(t *testing.T) {
 	tree := strings.TrimSpace(gitDrain(t, root, "write-tree"))
 	parkOne := strings.TrimSpace(gitDrain(t, root, "commit-tree", tree, "-p", "HEAD", "-m", "FAC-1 park"))
 	parkTwo := strings.TrimSpace(gitDrain(t, root, "commit-tree", tree, "-p", "HEAD", "-m", "FAC-1 parked"))
+	parkThree := strings.TrimSpace(gitDrain(t, root, "commit-tree", tree, "-p", "HEAD", "-m", "FAC-1 extra"))
+	parkFour := strings.TrimSpace(gitDrain(t, root, "commit-tree", tree, "-p", "HEAD", "-m", "FAC-2 park"))
+	parkFive := strings.TrimSpace(gitDrain(t, root, "commit-tree", tree, "-p", "HEAD", "-m", "FAC-2 parked"))
 	gitDrain(t, root, "update-ref", "refs/heads/park/foo", parkOne)
 	gitDrain(t, root, "update-ref", "refs/heads/parked/foo", parkTwo)
+	gitDrain(t, root, "update-ref", "refs/heads/park/bar", parkThree)
+	gitDrain(t, root, "update-ref", "refs/heads/park/baz", parkFour)
+	gitDrain(t, root, "update-ref", "refs/heads/parked/baz", parkFive)
 	gitDrain(t, root, "update-ref", "refs/remotes/origin/park/foo", strings.TrimSpace(gitDrain(t, root, "rev-parse", "HEAD")))
 	t.Setenv("HERD_WIND_DOWN", "1")
 	r, e := NewPipeline(Drain{RepoRoot: root, LedgerPath: filepath.Join(root, "ledger.jsonl")}).Scan(context.Background(), nil)
 	if e != nil {
 		t.Fatal(e)
 	}
-	if !r.WindDown || r.ParkBranches != 2 || r.ParkCHAWithDups != 1 {
+	if !r.WindDown || r.ParkBranches != 5 || r.ParkCHAWithDups != 2 {
 		t.Fatalf("state=%+v", r)
 	}
 	raw, _ := json.Marshal(r)
@@ -278,6 +284,9 @@ func TestPipelineContract_JSONTypesAndOperationalState(t *testing.T) {
 func TestPipelineContract_BoardGitRows(t *testing.T) {
 	root, _ := setupPipelineRepo(t)
 	gitDrain(t, root, "branch", "task/FAC-65")
+	gitDrain(t, root, "branch", "task/FAC-650")
+	gitDrain(t, root, "branch", "park/FAC-650")
+	gitDrain(t, root, "branch", "task/spark/FAC-65")
 	board := provider.NewMemoryProvider()
 	board.AddTask(&provider.Task{ID: "1", Ref: "FAC-65", Title: "A long review task", Status: provider.StatusInReview, ProjectID: "project"})
 	r, err := NewPipeline(Drain{RepoRoot: root, LedgerPath: filepath.Join(root, "ledger.jsonl"), Provider: board, KaneoProject: "project"}).Scan(context.Background(), nil)
@@ -290,6 +299,33 @@ func TestPipelineContract_BoardGitRows(t *testing.T) {
 	row := boardGitRow(context.Background(), root, "FAC-65", strings.Repeat("界", 60), nil)
 	if len([]rune(row.Title)) != 50 {
 		t.Fatalf("title rune length=%d", len([]rune(row.Title)))
+	}
+	negative := boardGitRow(context.Background(), root, "FAC-65", "title", []PinFreshness{{SHA: "sha650", Branch: "task/FAC-650"}})
+	if negative.Tip != "" {
+		t.Fatalf("ticket boundary false positive=%+v", negative)
+	}
+	negativePath := boardGitRow(context.Background(), root, "FAC-65", "title", []PinFreshness{{SHA: "sha650", Branch: "task/fac/650"}})
+	if negativePath.Tip != "" {
+		t.Fatalf("slash ticket boundary false positive=%+v", negativePath)
+	}
+	positive := boardGitRow(context.Background(), root, "FAC-65", "title", []PinFreshness{{SHA: "sha65", Branch: "task/FAC-65"}})
+	if positive.Tip != "sha65" {
+		t.Fatalf("ticket boundary positive miss=%+v", positive)
+	}
+	parkRoot, _ := setupPipelineRepo(t)
+	gitDrain(t, parkRoot, "branch", "task/spark/FAC-65")
+	spark := boardGitRow(context.Background(), parkRoot, "FAC-65", "title", nil)
+	if spark.Park {
+		t.Fatalf("spark branch falsely parked=%+v", spark)
+	}
+	gitDrain(t, parkRoot, "branch", "park/FAC-65")
+	parked := boardGitRow(context.Background(), parkRoot, "FAC-65", "title", nil)
+	if !parked.Park {
+		t.Fatalf("park branch not detected=%+v", parked)
+	}
+	pathPositive := boardGitRow(context.Background(), root, "FAC-65", "title", []PinFreshness{{SHA: "sha65", Branch: "task/fac/65"}})
+	if pathPositive.Tip != "sha65" {
+		t.Fatalf("slash ticket positive miss=%+v", pathPositive)
 	}
 }
 
@@ -313,6 +349,39 @@ func TestPipelineContract_QueuePreservesLaneEvidence(t *testing.T) {
 	pins := queuePins(s, nil, nil)
 	if len(pins) != 1 || pins[0].lane != "standing-reviewer" {
 		t.Fatalf("queue lane=%+v", pins)
+	}
+}
+
+func TestPipelineContract_QueueStandingFallback(t *testing.T) {
+	s := LedgerSnapshot{Rows: []LedgerRow{{Event: "record", SHA: "q", Branch: "standing/chain-indexer"}}, Queue: []LedgerRow{{Event: "enqueue", SHA: "q"}}}
+	pins := queuePins(s, nil, nil)
+	if len(pins) != 1 || pins[0].lane != "chain-indexer" {
+		t.Fatalf("standing fallback lane=%+v", pins)
+	}
+}
+
+func TestPipelineContract_UnreadableProbesAreUnknownSentinels(t *testing.T) {
+	root := t.TempDir()
+	stateFile := filepath.Join(root, "state-file")
+	artifactFile := filepath.Join(root, "artifact-file")
+	if err := os.WriteFile(stateFile, []byte("x"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(artifactFile, []byte("x"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	r, e := NewPipeline(Drain{RepoRoot: root, LedgerPath: filepath.Join(root, "ledger.jsonl"), StateDir: stateFile, ArtifactDir: artifactFile}).Scan(context.Background(), nil)
+	if e != nil {
+		t.Fatal(e)
+	}
+	if r.ParkBranches != -1 || r.Skips7d != -1 || r.Rejected != -1 || len(r.Errors) < 3 {
+		t.Fatalf("unreadable probe projection=%+v", r)
+	}
+	raw, _ := json.Marshal(r)
+	var m map[string]json.RawMessage
+	json.Unmarshal(raw, &m)
+	if string(m["park_branches"]) != "-1" || string(m["review_gate_skips_7d"]) != "-1" || string(m["review_artifacts_rejected"]) != "-1" {
+		t.Fatalf("unknown sentinels not in JSON: %s", raw)
 	}
 }
 

@@ -30,10 +30,7 @@ func queuePins(s LedgerSnapshot, pass map[string]string, veto map[string]bool) [
 			}
 			lane := row.Lane
 			if lane == "" {
-				lane = branch
-				if i := strings.Index(lane, "#standing/"); i >= 0 {
-					lane = lane[i+len("#standing/"):]
-				}
+				lane = normalizeQueueLane(branch)
 			}
 			result[row.SHA] = queuePin{row.SHA, branch, lane}
 		case string(EventConsumed), string(EventRevoked):
@@ -46,4 +43,15 @@ func queuePins(s LedgerSnapshot, pass map[string]string, veto map[string]bool) [
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].sha < out[j].sha })
 	return out
+}
+
+func normalizeQueueLane(branch string) string {
+	branch = strings.TrimSpace(branch)
+	if i := strings.Index(branch, "#standing/"); i >= 0 {
+		return branch[i+len("#standing/"):]
+	}
+	if strings.HasPrefix(branch, "standing/") {
+		return strings.TrimPrefix(branch, "standing/")
+	}
+	return branch
 }
