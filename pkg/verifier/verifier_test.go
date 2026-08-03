@@ -1077,6 +1077,9 @@ while True:
 	}
 	toks, err := processesHoldingMarker(markerPath)
 	if err != nil {
+		if errors.Is(err, syscall.EPERM) || errors.Is(err, syscall.EACCES) {
+			t.Skipf("host-wide libproc diagnostic unavailable: %v", err)
+		}
 		t.Fatalf("processesHoldingMarker: %v", err)
 	}
 	toks = filterResidualTokens(toks, -1)
