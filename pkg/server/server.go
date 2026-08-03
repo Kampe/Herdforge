@@ -3,11 +3,14 @@ package server
 import (
 	"bytes"
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
 	"net/http"
+	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -228,12 +231,48 @@ type reclaimRequest struct {
 	Targets []string `json:"targets"`
 }
 
+// EnvControlToken, when set, is additionally required as a Bearer token on
+// mutation endpoints.
+const EnvControlToken = "HERD_CONTROL_TOKEN"
+
+func isLoopback(remoteAddr string) bool {
+	host, _, err := net.SplitHostPort(remoteAddr)
+	if err != nil {
+		return false
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+// authorizeMutation gates destructive endpoints: safe-GC eligibility is
+// necessary but NOT authorization. Callers must be loopback-local, and when
+// HERD_CONTROL_TOKEN is set, present it as a Bearer token (constant-time
+// compared). A server wired to a non-loopback address therefore still
+// refuses remote reclamation.
+func (s *ControlServer) authorizeMutation(w http.ResponseWriter, r *http.Request) bool {
+	if !isLoopback(r.RemoteAddr) {
+		http.Error(w, "mutation endpoints are loopback-only", http.StatusForbidden)
+		return false
+	}
+	if tok := os.Getenv(EnvControlToken); tok != "" {
+		got := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		if subtle.ConstantTimeCompare([]byte(got), []byte(tok)) != 1 {
+			http.Error(w, "missing or invalid control token", http.StatusUnauthorized)
+			return false
+		}
+	}
+	return true
+}
+
 // handleReclaim executes exact-target reclamation through the FAC-117 Reap
 // contract (just-in-time revalidation, salvage refs). Empty target sets are
 // refused — there is no broad-cleanup mode on this endpoint.
 func (s *ControlServer) handleReclaim(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if !s.authorizeMutation(w, r) {
 		return
 	}
 	var req reclaimRequest

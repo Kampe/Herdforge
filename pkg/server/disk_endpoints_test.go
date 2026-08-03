@@ -1,6 +1,7 @@
 package server
 
 import (
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"os/exec"
@@ -123,21 +124,67 @@ func TestReclamationPlanEndpointIsReadOnly(t *testing.T) {
 	}
 }
 
+
+// reclaimReq builds a loopback-local POST /v1/disk/reclaim request.
+func reclaimReq(body string) *http.Request {
+	req := httptest.NewRequest("POST", "/v1/disk/reclaim", strings.NewReader(body))
+	req.RemoteAddr = "127.0.0.1:9999"
+	return req
+}
+
+func TestReclaimEndpointAuthorization(t *testing.T) {
+	repo, _, dirtyWT := diskFixture(t)
+	_ = dirtyWT
+	s := newDiskServer(repo)
+
+	// Non-loopback caller: refused outright even for eligible targets.
+	rec := httptest.NewRecorder()
+	remote := httptest.NewRequest("POST", "/v1/disk/reclaim", strings.NewReader(`{"targets":["x"]}`))
+	remote.RemoteAddr = "192.0.2.10:4444"
+	s.routes().ServeHTTP(rec, remote)
+	if rec.Code != 403 {
+		t.Fatalf("non-loopback reclaim must 403, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	// Token configured: loopback alone is no longer sufficient.
+	t.Setenv(EnvControlToken, "sekrit")
+	rec = httptest.NewRecorder()
+	s.routes().ServeHTTP(rec, reclaimReq(`{"targets":["x"]}`))
+	if rec.Code != 401 {
+		t.Fatalf("missing token must 401, got %d: %s", rec.Code, rec.Body.String())
+	}
+	rec = httptest.NewRecorder()
+	bad := reclaimReq(`{"targets":["x"]}`)
+	bad.Header.Set("Authorization", "Bearer wrong")
+	s.routes().ServeHTTP(rec, bad)
+	if rec.Code != 401 {
+		t.Fatalf("wrong token must 401, got %d: %s", rec.Code, rec.Body.String())
+	}
+	// Correct token + loopback proceeds to target validation (400: bogus target
+	// set is still refused by the exact-target contract, not by auth).
+	rec = httptest.NewRecorder()
+	good := reclaimReq(`{"targets":[]}`)
+	good.Header.Set("Authorization", "Bearer sekrit")
+	s.routes().ServeHTTP(rec, good)
+	if rec.Code != 400 {
+		t.Fatalf("authorized empty-target reclaim must 400, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
 func TestReclaimEndpointExactTargetsOnly(t *testing.T) {
 	repo, cleanWT, dirtyWT := diskFixture(t)
 	s := newDiskServer(repo)
 
 	// Empty target set: refused — no broad cleanup mode exists.
 	rec := httptest.NewRecorder()
-	s.routes().ServeHTTP(rec, httptest.NewRequest("POST", "/v1/disk/reclaim", strings.NewReader(`{"targets":[]}`)))
+	s.routes().ServeHTTP(rec, reclaimReq(`{"targets":[]}`))
 	if rec.Code != 400 {
 		t.Fatalf("empty targets must 400, got %d: %s", rec.Code, rec.Body.String())
 	}
 
 	// Exact dirty target: FAC-117 refuses it and the tree survives intact.
 	rec = httptest.NewRecorder()
-	s.routes().ServeHTTP(rec, httptest.NewRequest("POST", "/v1/disk/reclaim",
-		strings.NewReader(`{"targets":["`+dirtyWT+`"]}`)))
+	s.routes().ServeHTTP(rec, reclaimReq(`{"targets":["`+dirtyWT+`"]}`))
 	if rec.Code != 200 {
 		t.Fatalf("dirty-target reclaim status %d: %s", rec.Code, rec.Body.String())
 	}
@@ -151,8 +198,7 @@ func TestReclaimEndpointExactTargetsOnly(t *testing.T) {
 	// Exact content-merged target: reclaimed through the contract, sibling
 	// dirty tree untouched.
 	rec = httptest.NewRecorder()
-	s.routes().ServeHTTP(rec, httptest.NewRequest("POST", "/v1/disk/reclaim",
-		strings.NewReader(`{"targets":["`+cleanWT+`"]}`)))
+	s.routes().ServeHTTP(rec, reclaimReq(`{"targets":["`+cleanWT+`"]}`))
 	if rec.Code != 200 {
 		t.Fatalf("clean-target reclaim status %d: %s", rec.Code, rec.Body.String())
 	}
