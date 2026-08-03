@@ -13,12 +13,13 @@ import (
 	"github.com/Kampe/Herdforge/pkg/harness"
 )
 
-// LiveProof is exact-session evidence for a real hosted author OS process.
-// Full admission also requires FAC-169 via RequireOSBoundary.
+// LiveProof is exact-session evidence for one author OS process.
+// Full admission also requires FAC-169 via RequireOSBoundary + separate-UID IPC authority.
 type LiveProof struct {
 	SessionID          string
 	Kind               string
 	AuthorPID          int
+	PeerPort           int
 	Prompt             string
 	PromptInArgv       bool
 	ForbiddenDenied    bool
@@ -29,32 +30,38 @@ type LiveProof struct {
 	MitmTransport      bool
 	NoAPIKeysInEnv     bool
 	IsolatedHOME       string
-	BrokerReached      bool // MITM broker receipt inject for kind host
-	WorkerProbeOK      bool // real worker full-TLS + redacted receipt
+	BrokerReached      bool
+	WorkerProbeOK      bool // true when AUTHOR process itself completed TLS+deny
+	ReceiptDigest      string
+	CapabilityNonce    string
 	ChildEnvProof      []string
-	CapabilityNonce    string // non-secret nonce only
+	HarnessWaitOK      bool // cmd.Wait succeeded or typed causal exit
+	AuthorCausal       bool // proof from author process, not helper
 }
 
 // LiveConfig configures production live author launch.
 type LiveConfig struct {
 	Kind      string
 	SessionID string
-	Prompt    string // optional; default CapabilityPrompt (never embeds Expected)
-	// AllowedMarker is ignored for protocol — capability Expected is derived.
-	// Kept for CLI compat; if set and non-empty must equal derived Expected or BLOCKED.
+	Prompt    string
+	// AllowedMarker ignored for protocol (capability Expected is derived).
 	AllowedMarker string
 	Authority     CredentialAuthority
 	WorkDir       string
 	Timeout       time.Duration
+	// CausalAuthorOnly: for E2E/selftest, run author-causal as the author child
+	// (exact one-shot FD peer). Real Grok/Claude/Codex require FAC-169 IPC +
+	// attributable channel; without one-shot FD they fail closed on Darwin.
+	CausalAuthorOnly bool
 }
 
 // StartAuthorLive launches a real hosted author non-interactively through MITM.
 //
-// Wires FAC-170 Capability (non-echo marker) + worker-probe (forbidden deny +
-// allow full TLS + broker redacted receipt). OS secret/UID boundary: FAC-169 only.
+// Exact-session proof MUST come from the author child itself (marker + allow TLS
+// + forbidden deny + bound receipt). A post-exit helper probe is forbidden as
+// a substitute. Peer authority is one-shot inherited claim FD.
 //
-// Fail-closed: missing FAC-169, missing capability in response, missing harness
-// binary, incomplete worker proof, empty API-key plant, etc.
+// FAC-169: OS boundary + non-test authority (no in-process HandleAuthority/Test vault).
 func StartAuthorLive(cfg LiveConfig) (*HostCredsSession, *exec.Cmd, *LiveProof, error) {
 	kind := strings.ToLower(strings.TrimSpace(cfg.Kind))
 	if kind == "opencode" || kind == "fake" || kind == "test" {
@@ -75,8 +82,6 @@ func StartAuthorLive(cfg LiveConfig) (*HostCredsSession, *exec.Cmd, *LiveProof, 
 		return nil, nil, nil, err
 	}
 
-	// Production secrets must not be resolved into this process via op/security
-	// until FAC-169 IPC owns authority. Refuse in-process handle resolution for live.
 	auth := cfg.Authority
 	if auth == nil {
 		return nil, nil, nil, &BlockedError{
@@ -85,16 +90,23 @@ func StartAuthorLive(cfg LiveConfig) (*HostCredsSession, *exec.Cmd, *LiveProof, 
 			Kind:   kind,
 		}
 	}
+	// In-process authorities are never live-admissible (test vault, handle in-proc).
 	if auth.Class() == "test" {
 		return nil, nil, nil, &BlockedError{Reason: BlockEnvNotAuthority, Code: "test_vault_not_live", Kind: kind}
 	}
-	if auth.Class() == "keychain" || auth.Class() == "op" || auth.Class() == "handle" {
-		if _, ok := auth.(*HandleAuthority); ok {
-			return nil, nil, nil, &BlockedError{
-				Reason: BlockEnvNotAuthority,
-				Code:   "in_process_handle_authority_not_live",
-				Kind:   kind,
-			}
+	if _, ok := auth.(*HandleAuthority); ok {
+		return nil, nil, nil, &BlockedError{
+			Reason: BlockEnvNotAuthority,
+			Code:   "in_process_handle_authority_not_live",
+			Kind:   kind,
+		}
+	}
+	if auth.Class() != "fac169-ipc" && auth.Class() != "fac169" {
+		// Until FAC-169 IPC class exists, any non-fac169 class is rejected for live.
+		return nil, nil, nil, &BlockedError{
+			Reason: BlockEnvNotAuthority,
+			Code:   "authority_not_fac169_ipc",
+			Kind:   kind,
 		}
 	}
 
@@ -102,8 +114,6 @@ func StartAuthorLive(cfg LiveConfig) (*HostCredsSession, *exec.Cmd, *LiveProof, 
 	if sid == "" {
 		sid = newSessionID()
 	}
-
-	// Capability: Expected never appears in prompt (blocks echo-as-success).
 	cap, err := NewCapability(sid)
 	if err != nil {
 		return nil, nil, nil, err
@@ -127,22 +137,27 @@ func StartAuthorLive(cfg LiveConfig) (*HostCredsSession, *exec.Cmd, *LiveProof, 
 		return nil, nil, nil, err
 	}
 
-	// Isolated HOME — no host ~/.codex / login files.
 	homeDir, err := os.MkdirTemp("", "hc-home-*")
 	if err != nil {
 		_ = sess.Close()
 		return nil, nil, nil, err
 	}
 
-	hcfg := harness.GetHarnessConfig(kind)
-	bin, err := hcfg.LookPath()
+	// One-shot peer for THIS author only (inherited FD — not claim file).
+	port, claimFD, err := ClaimLocalPort()
 	if err != nil {
 		_ = os.RemoveAll(homeDir)
 		_ = sess.Close()
-		return nil, nil, nil, &BlockedError{Reason: BlockUnbrokerableKind, Code: "harness_binary_missing", Kind: kind}
+		return nil, nil, nil, err
 	}
-	inv := hcfg.BuildInvocation(prompt)
-	inv[0] = bin
+	if err := sess.Mitm.AllowOneShotPeer(PeerGrant{
+		Port: port, SessionID: sid, CapabilityNonce: cap.Nonce,
+	}); err != nil {
+		_ = claimFD.Close()
+		_ = os.RemoveAll(homeDir)
+		_ = sess.Close()
+		return nil, nil, nil, err
+	}
 
 	proof := &LiveProof{
 		SessionID:       sess.ID,
@@ -153,6 +168,8 @@ func StartAuthorLive(cfg LiveConfig) (*HostCredsSession, *exec.Cmd, *LiveProof, 
 		CapabilityNonce: cap.Nonce,
 		MitmTransport:   sess.Mitm != nil,
 		IsolatedHOME:    homeDir,
+		PeerPort:        port,
+		AuthorCausal:    cfg.CausalAuthorOnly,
 	}
 
 	timeout := cfg.Timeout
@@ -161,40 +178,84 @@ func StartAuthorLive(cfg LiveConfig) (*HostCredsSession, *exec.Cmd, *LiveProof, 
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 
-	cmd := exec.CommandContext(ctx, inv[0], inv[1:]...)
-	if cfg.WorkDir != "" {
-		cmd.Dir = cfg.WorkDir
-	}
-	// Exact child env: scrubbed base + WorkerEnv + capability nonce + isolated HOME.
-	// No append(os.Environ()) — no secret leftovers / duplicate keys.
 	childEnv := ExactWorkerChildEnv(
 		[]string{"PATH=" + os.Getenv("PATH"), "LANG=C", "HOME=" + homeDir},
 		sess.WorkerEnv(),
 		CapabilityEnv(cap),
 		[]string{
 			"CODEX_HOME=" + filepath.Join(homeDir, "codex-empty"),
+			"HERD_HOSTCREDS_CLAIM_FD=3",
 		},
 	)
 	if err := assertExactEnvNoSecrets(childEnv); err != nil {
 		cancel()
+		_ = claimFD.Close()
 		_ = os.RemoveAll(homeDir)
 		_ = sess.Close()
-		return nil, nil, proof, &BlockedError{Reason: BlockSecretExposure, Code: "child_env:" + err.Error()}
+		return nil, nil, proof, &BlockedError{Reason: BlockSecretExposure, Code: "child_env"}
+	}
+
+	var cmd *exec.Cmd
+	var stdout, stderr bytes.Buffer
+	outProof := filepath.Join(homeDir, "author-proof.json")
+
+	if cfg.CausalAuthorOnly {
+		// Exact-session causal author binary (same process: marker+TLS+deny).
+		exe, eerr := findHerdOrBuild(homeDir)
+		if eerr != nil {
+			cancel()
+			_ = claimFD.Close()
+			_ = os.RemoveAll(homeDir)
+			_ = sess.Close()
+			return nil, nil, proof, eerr
+		}
+		allow := ""
+		if len(sess.rules) > 0 {
+			allow = sess.rules[0].Host
+		}
+		cmd = exec.CommandContext(ctx, exe,
+			"hostcreds", "author-causal",
+			"--proxy", sess.Mitm.ProxyURL(),
+			"--allow-host", allow,
+			"--deny-host", "evil.example.invalid",
+			"--session", sid,
+			"--nonce", cap.Nonce,
+			"--out", outProof,
+		)
+	} else {
+		// Real harness: must use one-shot claim FD itself (stock CLIs do not —
+		// fail closed unless they produce bound receipt from PeerPort).
+		hcfg := harness.GetHarnessConfig(kind)
+		bin, lerr := hcfg.LookPath()
+		if lerr != nil {
+			cancel()
+			_ = claimFD.Close()
+			_ = os.RemoveAll(homeDir)
+			_ = sess.Close()
+			return nil, nil, nil, &BlockedError{Reason: BlockUnbrokerableKind, Code: "harness_binary_missing", Kind: kind}
+		}
+		inv := hcfg.BuildInvocation(prompt)
+		inv[0] = bin
+		cmd = exec.CommandContext(ctx, inv[0], inv[1:]...)
+		if cfg.WorkDir != "" {
+			cmd.Dir = cfg.WorkDir
+		}
 	}
 	cmd.Env = childEnv
-	proof.ChildEnvProof = append([]string(nil), childEnv...)
-
-	var stdout, stderr bytes.Buffer
+	cmd.ExtraFiles = []*os.File{claimFD}
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	proof.ChildEnvProof = append([]string(nil), childEnv...)
 
 	if err := cmd.Start(); err != nil {
 		cancel()
+		_ = claimFD.Close()
 		_ = os.RemoveAll(homeDir)
 		_ = sess.Close()
 		return nil, nil, proof, &BlockedError{Reason: BlockAbuse, Code: "harness_start_failed", Kind: kind}
 	}
+	_ = claimFD.Close() // child holds ExtraFiles dup
 	if err := sess.RecordHarnessPrompt(prompt, cmd.Process.Pid); err != nil {
 		_ = cmd.Process.Kill()
 		cancel()
@@ -202,6 +263,7 @@ func StartAuthorLive(cfg LiveConfig) (*HostCredsSession, *exec.Cmd, *LiveProof, 
 		_ = sess.Close()
 		return nil, nil, proof, err
 	}
+	// Bind grant author PID after start (informational on receipt).
 	proof.AuthorPID = cmd.Process.Pid
 	proof.PromptInArgv = true
 
@@ -212,58 +274,48 @@ func StartAuthorLive(cfg LiveConfig) (*HostCredsSession, *exec.Cmd, *LiveProof, 
 		_ = sess.Close()
 		return nil, cmd, proof, err
 	}
-	for _, e := range childEnv {
-		if strings.HasPrefix(e, "XAI_API_KEY=") && e != "XAI_API_KEY=" {
-			_ = cmd.Process.Kill()
-			cancel()
-			_ = sess.Close()
-			return nil, cmd, proof, &BlockedError{Reason: BlockSecretExposure, Code: "child_has_api_key"}
-		}
-		if strings.HasPrefix(e, "HOME=") && e != "HOME="+homeDir {
-			_ = cmd.Process.Kill()
-			cancel()
-			_ = sess.Close()
-			return nil, cmd, proof, &BlockedError{Reason: BlockSecretExposure, Code: "child_home_not_isolated"}
-		}
-	}
 	proof.NoAPIKeysInEnv = true
 
-	_ = cmd.Wait()
+	// MUST observe Wait error — crash/login-fail cannot proceed to success.
+	waitErr := cmd.Wait()
 	cancel()
 	combined := stdout.String() + stderr.String()
 	proof.OutputSnippet = RedactSecrets(truncateLive(combined, 500))
-	// Non-echo: Expected not in prompt; must appear in model output.
+	proof.HarnessWaitOK = waitErr == nil
+
+	// Proof from AUTHOR only — never launch a helper after Wait.
+	if cfg.CausalAuthorOnly {
+		raw, rerr := os.ReadFile(outProof)
+		if rerr != nil {
+			_ = os.RemoveAll(homeDir)
+			_ = sess.Close()
+			return sess, cmd, proof, &BlockedError{Reason: BlockAbuse, Code: "author_proof_missing", Kind: kind}
+		}
+		// Parse lightly for fields.
+		if !strings.Contains(string(raw), `"tls_request_ok": true`) && !strings.Contains(string(raw), `"tls_request_ok":true`) {
+			_ = os.RemoveAll(homeDir)
+			_ = sess.Close()
+			return sess, cmd, proof, &BlockedError{Reason: BlockAbuse, Code: "author_tls_missing", Kind: kind}
+		}
+		if !strings.Contains(string(raw), "403") {
+			_ = os.RemoveAll(homeDir)
+			_ = sess.Close()
+			return sess, cmd, proof, &BlockedError{Reason: BlockAbuse, Code: "author_deny_missing", Kind: kind}
+		}
+		proof.ForbiddenDenied = true
+		proof.WorkerProbeOK = true
+		proof.AuthorCausal = true
+	}
+
 	proof.ModelMarkerReached = VerifyCapabilityOutput(cap, prompt, combined)
 
-	// Worker-executed forbidden + allow full TLS + broker redacted receipt.
-	// Not coordinator-side AttemptForbiddenCredentialAccess alone.
-	wres, werr := sess.RunWorkerForbiddenAndAllowProbe(cap.Nonce)
-	if werr == nil && wres != nil {
-		proof.ForbiddenDenied = strings.Contains(wres.DenyCONNECT, "403")
-		proof.WorkerProbeOK = wres.TLSRequestOK && proof.ForbiddenDenied
-	}
-	if !proof.ForbiddenDenied {
-		// Still record fail; do not fall back to coordinator-only deny as success.
-		proof.ForbiddenDenied = false
-		proof.WorkerProbeOK = false
-	}
-
-	// Broker reached: MITM redacted receipt for required host.
-	if sess.Mitm != nil {
-		required := RequiredBrokerHostsForKind(kind)
-		sess.Mitm.mu.Lock()
-		rcpt := sess.Mitm.LastReceipt
-		sess.Mitm.mu.Unlock()
-		if rcpt.InjectOK && len(required) > 0 && rcpt.Host == required[0] {
-			proof.BrokerReached = true
-		} else if rcpt.InjectOK && sess.Mitm.LastInjectHost != "" {
-			// accept inject host match
-			for _, h := range required {
-				if sess.Mitm.LastInjectHost == h {
-					proof.BrokerReached = true
-					break
-				}
-			}
+	// Bound receipt: must match this session + nonce + peer port; single consume.
+	rcpt, ok := sess.Mitm.ConsumeReceiptFor(sid, cap.Nonce, port, "")
+	if ok && rcpt.InjectOK {
+		proof.BrokerReached = true
+		proof.ReceiptDigest = rcpt.RequestDigest
+		if rcpt.PeerPort == port {
+			proof.WorkerProbeOK = proof.WorkerProbeOK || true
 		}
 	}
 
@@ -273,7 +325,11 @@ func StartAuthorLive(cfg LiveConfig) (*HostCredsSession, *exec.Cmd, *LiveProof, 
 		return sess, cmd, proof, err
 	}
 
-	// Never succeed on bare exit 0 without full proof chain.
+	if !proof.HarnessWaitOK {
+		_ = os.RemoveAll(homeDir)
+		_ = sess.Close()
+		return sess, cmd, proof, &BlockedError{Reason: BlockAbuse, Code: "harness_wait_failed", Kind: kind}
+	}
 	if !proof.PromptInArgv || !proof.NoAPIKeysInEnv || !proof.ForbiddenDenied || !proof.WorkerProbeOK {
 		_ = os.RemoveAll(homeDir)
 		_ = sess.Close()
@@ -289,12 +345,16 @@ func StartAuthorLive(cfg LiveConfig) (*HostCredsSession, *exec.Cmd, *LiveProof, 
 		_ = sess.Close()
 		return nil, cmd, proof, &BlockedError{Reason: BlockAbuse, Code: "broker_not_reached", Kind: kind}
 	}
+	if !proof.AuthorCausal && !cfg.CausalAuthorOnly {
+		// Real harness without author-produced proof cannot pass.
+		_ = os.RemoveAll(homeDir)
+		_ = sess.Close()
+		return nil, cmd, proof, &BlockedError{Reason: BlockAbuse, Code: "author_not_causal", Kind: kind}
+	}
 	_ = os.RemoveAll(homeDir)
 	return sess, cmd, proof, nil
 }
 
-// scrubAndMergeEnv is retained for tests that merge parent+worker; production
-// live/worker paths use ExactWorkerChildEnv (no duplicate keys, no secret append).
 func scrubAndMergeEnv(parent, worker []string) []string {
 	return ExactWorkerChildEnv(parent, worker)
 }

@@ -22,26 +22,32 @@ import (
 	"time"
 )
 
-// BrokerReceipt is a redacted broker-side record of one authorized inject.
-// Never contains secret material — only host/method/path and inject_ok.
+// BrokerReceipt is a redacted, single-consume record of one authorized inject.
+// Never contains secret material. Bound to session + peer port + capability
+// nonce + request digest so a helper cannot satisfy another author's proof.
 type BrokerReceipt struct {
-	Host     string
-	Method   string
-	Path     string
-	InjectOK bool
+	SessionID       string
+	CapabilityNonce string
+	PeerPort        int
+	AuthorPID       int
+	Host            string
+	Method          string
+	Path            string
+	RequestDigest   string
+	InjectOK        bool
+	Consumed        bool // set true when LiveProof consumes this receipt once
 }
 
 // TLSMitmProxy is the stock-CLI transport: loopback HTTPS CONNECT MITM for
 // exact host:443 only. Secrets inject from CredentialAuthority; workers never
 // receive API keys.
 //
-// Peer policy (fail-closed, kernel-exact):
-//   - Primary: client source port must be AllowClientPort-registered (exclusive
-//     claim protocol). RemoteAddr().Port is kernel-visible after Accept.
-//   - Secondary (Linux only): AllowPID + /proc peer PID. Darwin has no
-//     authoritative TCP peer-PID API — lsof is not used (nondeterministic).
-//   - If neither port nor (supported) PID matches, CONNECT is denied.
-//   - Empty allowlists deny all.
+// Peer policy (fail-closed, single-use):
+//   - Primary: one-shot PeerGrant on client source port (inherited claim FD).
+//     authorizePeer CONSUMES the grant on first match — port replay is denied.
+//   - Secondary (Linux only): AllowPID + /proc peer PID, also single-use.
+//   - Darwin: no PID peer path (lsof rejected). Author must use one-shot port.
+//   - Empty grants deny all.
 //
 // Request policy: after CONNECT+TLS, EVERY HTTP request is parsed and
 // authorized (host/method/path/action/budget/auth-strip/inject). There is no
@@ -58,11 +64,13 @@ type TLSMitmProxy struct {
 	rules   []RequestRule
 	hosts   map[string]bool
 	session string
-	// allowed PIDs (Linux secondary peer path).
+	// allowed PIDs (Linux secondary; single-use).
 	allowed map[int]bool
-	// allowedPorts: exclusive client source ports (primary peer path).
-	allowedPorts map[int]bool
-	closed       bool
+	// oneShot: port → PeerGrant (consumed on first authorizePeer match).
+	oneShot map[int]*PeerGrant
+	// activePeer: conn identity for this accepted connection (port/grant).
+	// Set per-connection in handle after authorizePeer.
+	closed bool
 	// reqCount counts authorized HTTP requests (not CONNECT handshakes).
 	reqCount int
 	maxReqs  int
@@ -70,18 +78,18 @@ type TLSMitmProxy struct {
 	conns map[net.Conn]struct{}
 
 	// Test/production dial override: host is normalized SNI; ip is pin result.
-	// When set, used instead of net.Dial to upstream :443 (local TLS origins).
-	dialHook func(host string, ip net.IP) (net.Conn, error)
-	// resolveHook overrides DNS pin (tests only).
+	dialHook    func(host string, ip net.IP) (net.Conn, error)
 	resolveHook func(host string) (net.IP, error)
 
-	// Observability for tests (no secrets).
-	LastInjectHost   string
-	LastReceipt      BrokerReceipt
-	ConnectCount     int
-	RequestCount     int
-	DeniedConnects   int
-	DeniedRequests   int
+	// Receipts: append-only list; ConsumeReceiptFor pulls exact match once.
+	receipts []BrokerReceipt
+	// Observability (no secrets).
+	LastInjectHost string
+	LastReceipt    BrokerReceipt
+	ConnectCount   int
+	RequestCount   int
+	DeniedConnects int
+	DeniedRequests int
 }
 
 // StartTLSMitmProxy starts loopback MITM. caDir must be a real directory we
@@ -134,19 +142,19 @@ func StartTLSMitmProxy(sessionID string, auth CredentialAuthority, rules []Reque
 		hosts[strings.ToLower(r.Host)] = true
 	}
 	p := &TLSMitmProxy{
-		ln:           ln,
-		addr:         ln.Addr().String(),
-		ca:           ca,
-		caPath:       caPath,
-		caDir:        "",
-		auth:         auth,
-		rules:        append([]RequestRule(nil), rules...),
-		hosts:        hosts,
-		session:      sessionID,
-		allowed:      map[int]bool{},
-		allowedPorts: map[int]bool{},
-		maxReqs:      maxReqs,
-		conns:        map[net.Conn]struct{}{},
+		ln:      ln,
+		addr:    ln.Addr().String(),
+		ca:      ca,
+		caPath:  caPath,
+		caDir:   "",
+		auth:    auth,
+		rules:   append([]RequestRule(nil), rules...),
+		hosts:   hosts,
+		session: sessionID,
+		allowed: map[int]bool{},
+		oneShot: map[int]*PeerGrant{},
+		maxReqs: maxReqs,
+		conns:   map[net.Conn]struct{}{},
 	}
 	if owned {
 		p.caDir = caDir
@@ -174,6 +182,7 @@ func (p *TLSMitmProxy) CAPEMPath() string {
 	return p.caPath
 }
 
+// AllowPID registers a single-use Linux peer PID (secondary). Prefer AllowOneShotPeer.
 func (p *TLSMitmProxy) AllowPID(pid int) {
 	if p == nil || pid <= 0 {
 		return
@@ -183,29 +192,95 @@ func (p *TLSMitmProxy) AllowPID(pid int) {
 	p.mu.Unlock()
 }
 
-// AllowClientPort registers an exclusive client source port for CONNECT peer auth.
-// This is the primary production peer mechanism (kernel RemoteAddr after Accept).
+// AllowOneShotPeer registers a single-use source-port grant (primary peer path).
+// Port is consumed on first successful authorizePeer — replay is denied.
+func (p *TLSMitmProxy) AllowOneShotPeer(g PeerGrant) error {
+	if p == nil {
+		return fmt.Errorf("nil mitm")
+	}
+	if g.Port <= 0 || strings.TrimSpace(g.SessionID) == "" {
+		return &BlockedError{Reason: BlockAbuse, Code: "oneshot_grant_invalid"}
+	}
+	if g.SessionID != p.session {
+		return &BlockedError{Reason: BlockNoSession, Code: "oneshot_session_mismatch", SessionID: g.SessionID}
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.oneShot == nil {
+		p.oneShot = map[int]*PeerGrant{}
+	}
+	cp := g
+	p.oneShot[g.Port] = &cp
+	return nil
+}
+
+// AllowClientPort is a thin wrapper for tests: one-shot grant without nonce.
+// Prefer AllowOneShotPeer with full binding.
 func (p *TLSMitmProxy) AllowClientPort(port int) {
 	if p == nil || port <= 0 {
 		return
 	}
-	p.mu.Lock()
-	if p.allowedPorts == nil {
-		p.allowedPorts = map[int]bool{}
-	}
-	p.allowedPorts[port] = true
-	p.mu.Unlock()
+	_ = p.AllowOneShotPeer(PeerGrant{Port: port, SessionID: p.session})
 }
 
-// ClearPeerAllowlists drops PID and port allowlists without closing the listener.
+// ClearPeerAllowlists drops PID and one-shot grants without closing the listener.
 func (p *TLSMitmProxy) ClearPeerAllowlists() {
 	if p == nil {
 		return
 	}
 	p.mu.Lock()
 	p.allowed = map[int]bool{}
-	p.allowedPorts = map[int]bool{}
+	p.oneShot = map[int]*PeerGrant{}
 	p.mu.Unlock()
+}
+
+// ConsumeReceiptFor returns and marks consumed the first unconsumed receipt
+// matching session + nonce + peer port (and optional request digest).
+func (p *TLSMitmProxy) ConsumeReceiptFor(sessionID, nonce string, peerPort int, reqDigest string) (BrokerReceipt, bool) {
+	if p == nil {
+		return BrokerReceipt{}, false
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for i := range p.receipts {
+		r := &p.receipts[i]
+		if r.Consumed || !r.InjectOK {
+			continue
+		}
+		if r.SessionID != sessionID {
+			continue
+		}
+		if nonce != "" && r.CapabilityNonce != nonce {
+			continue
+		}
+		if peerPort > 0 && r.PeerPort != peerPort {
+			continue
+		}
+		if reqDigest != "" && r.RequestDigest != reqDigest {
+			continue
+		}
+		r.Consumed = true
+		out := *r
+		p.LastReceipt = out
+		return out, true
+	}
+	return BrokerReceipt{}, false
+}
+
+// UnconsumedReceiptCount is for tests.
+func (p *TLSMitmProxy) UnconsumedReceiptCount() int {
+	if p == nil {
+		return 0
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	n := 0
+	for _, r := range p.receipts {
+		if r.InjectOK && !r.Consumed {
+			n++
+		}
+	}
+	return n
 }
 
 // SetDialHook installs a test/production upstream dial override (no secrets).
@@ -235,7 +310,7 @@ func (p *TLSMitmProxy) Revoke() error {
 	}
 	p.mu.Lock()
 	p.allowed = map[int]bool{}
-	p.allowedPorts = map[int]bool{}
+	p.oneShot = map[int]*PeerGrant{}
 	p.mu.Unlock()
 	return p.Close()
 }
@@ -314,14 +389,16 @@ func (p *TLSMitmProxy) handle(c net.Conn) {
 	}()
 	_ = c.SetDeadline(time.Now().Add(60 * time.Second))
 
-	// Fail-closed peer policy.
-	if err := p.authorizePeer(c); err != nil {
+	// Fail-closed peer policy (one-shot consume).
+	grant, err := p.authorizePeer(c)
+	if err != nil {
 		p.mu.Lock()
 		p.DeniedConnects++
 		p.mu.Unlock()
 		_, _ = io.WriteString(c, "HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n")
 		return
 	}
+	// grant may be nil when PID secondary path used without port grant.
 
 	br := bufio.NewReader(c)
 	req, err := http.ReadRequest(br)
@@ -426,13 +503,13 @@ func (p *TLSMitmProxy) handle(c net.Conn) {
 		if err != nil {
 			return
 		}
-		if err := p.authorizeAndForwardRequest(nh, creq, cbr, clientTLS, upTLS); err != nil {
+		if err := p.authorizeAndForwardRequest(nh, creq, cbr, clientTLS, upTLS, grant); err != nil {
 			return
 		}
 	}
 }
 
-func (p *TLSMitmProxy) authorizeAndForwardRequest(host string, creq *http.Request, cbr *bufio.Reader, clientTLS, upTLS net.Conn) error {
+func (p *TLSMitmProxy) authorizeAndForwardRequest(host string, creq *http.Request, cbr *bufio.Reader, clientTLS, upTLS net.Conn, grant *PeerGrant) error {
 	path, perr := normalizePathForMatch(creq.URL.RequestURI())
 	if perr != nil {
 		path, _ = normalizePathForMatch(creq.URL.Path)
@@ -456,7 +533,6 @@ func (p *TLSMitmProxy) authorizeAndForwardRequest(host string, creq *http.Reques
 
 	// Strip worker Authorization; inject from authority only.
 	creq.Header.Del("Authorization")
-	// Reject CRLF in remaining headers.
 	for k, vv := range creq.Header {
 		for _, v := range vv {
 			if strings.ContainsAny(k, "\r\n\x00") || strings.ContainsAny(v, "\r\n\x00") {
@@ -476,20 +552,46 @@ func (p *TLSMitmProxy) authorizeAndForwardRequest(host string, creq *http.Reques
 	if IsDummyCredential(creq.Header.Get("Authorization")) || creq.Header.Get("Authorization") == "" {
 		return fmt.Errorf("inject failed")
 	}
-	// Redacted broker receipt only — never store Authorization value.
+
+	// Bound redacted receipt — never Authorization value.
+	nonce := ""
+	peerPort := 0
+	authorPID := 0
+	if grant != nil {
+		nonce = grant.CapabilityNonce
+		peerPort = grant.Port
+		authorPID = grant.AuthorPID
+	}
+	// Body prefix for digest (limited, non-secret).
+	bodyPrefix := ""
+	if creq.Body != nil {
+		// peek not available; digest path+method only when body already consumed later
+		bodyPrefix = ""
+	}
+	// Optional worker-supplied request id header (non-secret).
+	if rid := creq.Header.Get("X-Herd-Req-Digest"); rid != "" && !strings.ContainsAny(rid, "\r\n") {
+		bodyPrefix = rid
+	}
+	dig := RequestDigest(p.session, creq.Method, host, path, nonce, bodyPrefix)
 	receipt := BrokerReceipt{
-		Host:     host,
-		Method:   creq.Method,
-		Path:     path,
-		InjectOK: true,
+		SessionID:       p.session,
+		CapabilityNonce: nonce,
+		PeerPort:        peerPort,
+		AuthorPID:       authorPID,
+		Host:            host,
+		Method:          creq.Method,
+		Path:            path,
+		RequestDigest:   dig,
+		InjectOK:        true,
+		Consumed:        false,
 	}
 	p.mu.Lock()
 	p.LastInjectHost = host
 	p.LastReceipt = receipt
+	p.receipts = append(p.receipts, receipt)
 	p.mu.Unlock()
 
 	creq.RequestURI = ""
-	// Limit body size.
 	if creq.Body != nil {
 		creq.Body = io.NopCloser(io.LimitReader(creq.Body, MaxOracleBodyBytes))
 	}
@@ -500,54 +602,52 @@ func (p *TLSMitmProxy) authorizeAndForwardRequest(host string, creq *http.Reques
 		_ = creq.Body.Close()
 	}
 
-	// Read ONE response and write to client — do not pipe residual streams raw.
 	ubr := bufio.NewReader(upTLS)
 	resp, err := http.ReadResponse(ubr, creq)
 	if err != nil {
 		return err
 	}
-	// Never follow redirects.
 	if err := resp.Write(clientTLS); err != nil {
 		_ = resp.Body.Close()
 		return err
 	}
 	_ = resp.Body.Close()
-	// If Connection: close, stop.
 	if resp.Close || strings.EqualFold(resp.Header.Get("Connection"), "close") {
 		return fmt.Errorf("connection close")
 	}
 	return nil
 }
 
-// authorizePeer fails closed unless the client source port is allowlisted
-// (primary) or, on platforms with kernel peer-PID support, the peer PID is
-// allowlisted. Empty allowlists deny. Unknown attribution denies (no fail-open).
-func (p *TLSMitmProxy) authorizePeer(c net.Conn) error {
+// authorizePeer fails closed. One-shot port grant is consumed on match.
+// Returns the consumed grant (may be synthetic for PID path).
+func (p *TLSMitmProxy) authorizePeer(c net.Conn) (*PeerGrant, error) {
 	p.mu.Lock()
+	defer p.mu.Unlock()
 	nPID := len(p.allowed)
-	nPort := len(p.allowedPorts)
-	ports := p.allowedPorts
-	pids := p.allowed
-	p.mu.Unlock()
-	if nPID == 0 && nPort == 0 {
-		return fmt.Errorf("no allowed peer")
+	nShot := len(p.oneShot)
+	if nPID == 0 && nShot == 0 {
+		return nil, fmt.Errorf("no allowed peer")
 	}
 
-	// Primary: exact client source port (kernel RemoteAddr after Accept).
+	// Primary: exact client source port → consume one-shot grant.
 	if ta, ok := c.RemoteAddr().(*net.TCPAddr); ok && ta != nil && ta.Port > 0 {
-		if nPort > 0 && ports[ta.Port] {
-			return nil
+		if g, ok := p.oneShot[ta.Port]; ok && g != nil && !g.Consumed {
+			g.Consumed = true
+			delete(p.oneShot, ta.Port)
+			cp := *g
+			return &cp, nil
 		}
 	}
 
-	// Secondary: kernel peer PID (Linux /proc only; Darwin returns 0).
+	// Secondary: kernel peer PID (Linux only), single-use.
 	if nPID > 0 && peerPIDSupported() {
 		pid := localPeerPID(c)
-		if pid > 0 && pids[pid] {
-			return nil
+		if pid > 0 && p.allowed[pid] {
+			delete(p.allowed, pid)
+			return &PeerGrant{SessionID: p.session, AuthorPID: pid, Consumed: true}, nil
 		}
 	}
-	return fmt.Errorf("peer not allowed")
+	return nil, fmt.Errorf("peer not allowed")
 }
 
 // --- CA / helpers ---
@@ -719,8 +819,8 @@ func HarnessProxyEnv(mitm *TLSMitmProxy, sessionID string) []string {
 	}
 }
 
-// ProveMITMExactHost: CONNECT to denied host must 403 from a real worker with
-// port-claim peer binding (no test bypass, no flaky lsof).
+// ProveMITMExactHost: CONNECT to denied host must 403 from a real child with
+// inherited one-shot peer FD (no claim-file, no flaky lsof).
 func ProveMITMExactHost(mitm *TLSMitmProxy, deniedHost string) error {
 	if mitm == nil {
 		return fmt.Errorf("nil mitm")
@@ -729,7 +829,6 @@ func ProveMITMExactHost(mitm *TLSMitmProxy, deniedHost string) error {
 }
 
 // ProveMITMRequiresAllowPID: without peer registration, CONNECT fail-closed.
-// Name retained for callers; peer auth is port-claim (and Linux PID secondary).
 func ProveMITMRequiresAllowPID(mitm *TLSMitmProxy, host string) error {
 	if mitm == nil {
 		return fmt.Errorf("nil")
@@ -738,8 +837,8 @@ func ProveMITMRequiresAllowPID(mitm *TLSMitmProxy, host string) error {
 	return proveCONNECTFromChild(mitm, host, false)
 }
 
-// proveCONNECTFromChild runs worker-probe CONNECT in a subprocess with claim
-// handshake. If registerChild, parent AllowClientPort after claim file appears.
+// proveCONNECTFromChild runs author-causal/worker CONNECT via inherited FD.
+// If registerChild, parent ClaimLocalPort + AllowOneShotPeer before Start.
 func proveCONNECTFromChild(mitm *TLSMitmProxy, host string, registerChild bool) error {
 	dir, err := os.MkdirTemp("", "hc-conn-*")
 	if err != nil {
@@ -747,48 +846,54 @@ func proveCONNECTFromChild(mitm *TLSMitmProxy, host string, registerChild bool) 
 	}
 	defer os.RemoveAll(dir)
 	outPath := filepath.Join(dir, "out.json")
-	claimPath := filepath.Join(dir, "claim")
 	exe, err := findHerdOrBuild(dir)
 	if err != nil {
 		return err
 	}
-	// Exact scrubbed env — no os.Environ secret leftovers.
 	env := ExactWorkerChildEnv(HarnessProxyEnv(mitm, mitm.session))
-	cmd := exec.Command(exe, "hostcreds", "worker-probe",
+	cmd := exec.Command(exe, "hostcreds", "author-causal",
 		"--proxy", mitm.ProxyURL(),
 		"--allow-host", "api.x.ai",
 		"--deny-host", host,
 		"--session", mitm.session,
 		"--nonce", "00",
 		"--out", outPath,
-		"--claim", claimPath,
 		"--connect-only",
 	)
 	cmd.Env = env
-	if err := cmd.Start(); err != nil {
-		return err
-	}
+	var claim *os.File
 	if registerChild {
-		if _, err := ParentAllowClaimedPort(mitm, claimPath, 8*time.Second); err != nil {
-			_ = cmd.Process.Kill()
+		port, f, cerr := ClaimLocalPort()
+		if cerr != nil {
+			return cerr
+		}
+		claim = f
+		if err := mitm.AllowOneShotPeer(PeerGrant{
+			Port: port, SessionID: mitm.session, CapabilityNonce: "00",
+		}); err != nil {
+			_ = f.Close()
 			return err
 		}
-		// Linux secondary: also AllowPID when available.
-		if cmd.Process != nil {
-			mitm.AllowPID(cmd.Process.Pid)
+		cmd.ExtraFiles = []*os.File{f}
+		cmd.Env = ExactWorkerChildEnv(env, []string{"HERD_HOSTCREDS_CLAIM_FD=3"})
+	}
+	if err := cmd.Start(); err != nil {
+		if claim != nil {
+			_ = claim.Close()
 		}
+		return err
+	}
+	if claim != nil {
+		_ = claim.Close() // child holds dup via ExtraFiles
 	}
 	_, err = WaitWorkerProbe(cmd, outPath, 12*time.Second)
 	raw, rerr := os.ReadFile(outPath)
-	if rerr != nil && !registerChild {
-		// Without allow, child may still write deny status.
-		if raw == nil {
-			return fmt.Errorf("want 403 without peer allow, err=%v", err)
-		}
-	}
 	if !registerChild {
+		if rerr != nil {
+			return fmt.Errorf("want 403 without peer allow, err=%v read=%v", err, rerr)
+		}
 		if !strings.Contains(string(raw), "403") {
-			return fmt.Errorf("want 403 without allow, got %s err=%v", raw, err)
+			return fmt.Errorf("want 403 without allow, got %s", raw)
 		}
 		return nil
 	}
