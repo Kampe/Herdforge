@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/Kampe/Herdforge/pkg/config"
+	"github.com/Kampe/Herdforge/pkg/herdr"
 	"github.com/Kampe/Herdforge/pkg/launch"
 	"github.com/Kampe/Herdforge/pkg/router"
 )
@@ -104,6 +105,18 @@ func TestTaskLaunchRequestCarriesExactReboundGeneration(t *testing.T) {
 				t.Fatal("zero or mismatched generation must fail before lifecycle seams")
 			}
 		})
+	}
+}
+
+func TestStandingIdentityMismatchCreatesEphemeralTaskAgent(t *testing.T) {
+	if !shouldCreateEphemeralTaskAgent(herdr.ErrAgentIdentityMismatch) {
+		t.Fatal("standing identity mismatch must be treated as non-reusable")
+	}
+	if !shouldCreateEphemeralTaskAgent(herdr.ErrAgentNotFound) {
+		t.Fatal("missing standing agent must create ephemeral task agent")
+	}
+	if shouldCreateEphemeralTaskAgent(errors.New("herdr unavailable")) {
+		t.Fatal("unrelated standing failure must remain fail-closed")
 	}
 }
 
