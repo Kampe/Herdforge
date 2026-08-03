@@ -27,6 +27,13 @@ task_provider:
 # incompatible_with (role labels this lane must never double as). No lane
 # defaults to the shared checkout — each has its own worktree.
 #
+# SCOPE: authority/capabilities/incompatible_with are DECLARATIVE metadata
+# (FAC-127) — a registry contract, not a launch-time gate. Nothing in this
+# repo yet blocks a launch that violates them. FAC-139 ("routed launch
+# enforcement") owns the executable launch-boundary API that must read
+# these fields and enforce probe-gated capabilities, family separation,
+# and single-owner integration at the moment a lane spawns.
+#
 # .herd/prompts/critical-wave-coordinator.md is a one-off wave-specific
 # template (FAC-119..122 coordination), not a standing role contract; it is
 # intentionally NOT registered as a lane here.
