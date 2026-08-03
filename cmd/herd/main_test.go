@@ -146,6 +146,25 @@ func TestStatusInitialized(t *testing.T) {
 	}
 }
 
+func TestStatusEvidenceFailureExitsNonZero(t *testing.T) {
+	binary := buildHerd(t)
+	tmpDir := t.TempDir()
+	initCmd := exec.Command(binary, "init")
+	initCmd.Dir = tmpDir
+	if out, err := initCmd.CombinedOutput(); err != nil {
+		t.Fatalf("init failed: %v, output: %s", err, out)
+	}
+	if err := os.Mkdir(filepath.Join(tmpDir, ".herd", "herdforge.db"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(binary, "status")
+	cmd.Dir = tmpDir
+	out, err := cmd.CombinedOutput()
+	if err == nil || !strings.Contains(string(out), "Dependency evidence") {
+		t.Fatalf("status evidence failure must exit nonzero: err=%v output=%s", err, out)
+	}
+}
+
 func TestNoArgs(t *testing.T) {
 	binary := buildHerd(t)
 	out, err := exec.Command(binary).CombinedOutput()

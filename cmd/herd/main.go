@@ -506,14 +506,14 @@ func runStatus() {
 		cfg.Project.Name, cfg.TaskProvider.Type, len(cfg.Lanes))
 	st, err := store.New(".herd/herdforge.db")
 	if err != nil {
-		fmt.Printf("Dependency evidence: UNAVAILABLE (%v)\n", err)
-		return
+		fmt.Fprintf(os.Stderr, "Dependency evidence: UNAVAILABLE (%v)\n", err)
+		os.Exit(1)
 	}
 	defer st.Close()
 	blocked, err := st.BlockedSelectionHistory(10)
 	if err != nil {
-		fmt.Printf("Dependency evidence: UNREADABLE (%v)\n", err)
-		return
+		fmt.Fprintf(os.Stderr, "Dependency evidence: UNREADABLE (%v)\n", err)
+		os.Exit(1)
 	}
 	fmt.Printf("Dependency BLOCKED evidence: %d recent\n", len(blocked))
 	for _, record := range blocked {

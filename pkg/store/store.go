@@ -50,6 +50,18 @@ type BlockedRecord struct {
 	RecordedAt       time.Time `json:"recorded_at"`
 }
 
+// BlockedSelection is an attention item produced by dependency selection.
+// Empty Ref/TaskID identify a global hard-selection failure.
+type BlockedSelection struct {
+	Ref              string
+	TaskID           string
+	Entrypoint       string
+	Code             string
+	Reason           string
+	GraphRevision    string
+	ProviderRevision string
+}
+
 type Store struct {
 	db *sql.DB
 }
@@ -116,42 +128,102 @@ func (s *Store) migrate() error {
 			return fmt.Errorf("migrate: %w", err)
 		}
 	}
+	rows, err := s.db.Query(`PRAGMA table_info(blocked_selection_history)`)
+	if err != nil {
+		return fmt.Errorf("inspect blocked selection schema: %w", err)
+	}
+	hasRecency := false
+	for rows.Next() {
+		var cid int
+		var name, typ string
+		var notNull, pk int
+		var defaultValue interface{}
+		if err := rows.Scan(&cid, &name, &typ, &notNull, &defaultValue, &pk); err != nil {
+			rows.Close()
+			return fmt.Errorf("scan blocked selection schema: %w", err)
+		}
+		if name == "recency_seq" {
+			hasRecency = true
+		}
+	}
+	if err := rows.Close(); err != nil {
+		return fmt.Errorf("close blocked selection schema: %w", err)
+	}
+	if !hasRecency {
+		if _, err := s.db.Exec(`ALTER TABLE blocked_selection_history ADD COLUMN recency_seq INTEGER NOT NULL DEFAULT 0`); err != nil {
+			return fmt.Errorf("add blocked selection recency: %w", err)
+		}
+	}
 	return nil
 }
 
-// RecordBlockedSelection persists every per-card blocked result from the
-// production selection path. A write failure is returned to preserve evidence.
+// RecordBlockedSelection persists one selection attention item transactionally.
 func (s *Store) RecordBlockedSelection(ref, taskID, entrypoint, code, reason, graphRevision, providerRevision string) (*BlockedRecord, error) {
-	res, err := s.db.Exec(`INSERT OR IGNORE INTO blocked_selection_history
-		(ref, task_id, entrypoint, code, reason, graph_revision, provider_revision)
-		VALUES (?, ?, ?, ?, ?, ?, ?)`, ref, taskID, entrypoint, code, reason, graphRevision, providerRevision)
+	records, err := s.RecordBlockedSelections([]BlockedSelection{{
+		Ref: ref, TaskID: taskID, Entrypoint: entrypoint, Code: code, Reason: reason,
+		GraphRevision: graphRevision, ProviderRevision: providerRevision,
+	}})
 	if err != nil {
-		return nil, fmt.Errorf("record blocked selection: %w", err)
+		return nil, err
 	}
-	id, err := res.LastInsertId()
+	return &records[0], nil
+}
+
+// RecordBlockedSelections atomically upserts all attention items. Same-identity
+// reason changes update the persisted row, so callers never receive content
+// that differs from durable evidence. A failed transaction preserves prior
+// rows and writes none of the current batch.
+func (s *Store) RecordBlockedSelections(items []BlockedSelection) ([]BlockedRecord, error) {
+	if len(items) == 0 {
+		return nil, nil
+	}
+	tx, err := s.db.Begin()
 	if err != nil {
-		return nil, fmt.Errorf("record blocked selection id: %w", err)
+		return nil, fmt.Errorf("begin blocked selection transaction: %w", err)
 	}
-	inserted, err := res.RowsAffected()
-	if err != nil {
-		return nil, fmt.Errorf("record blocked selection rows: %w", err)
-	}
-	if inserted == 0 {
-		err = s.db.QueryRow(`SELECT id FROM blocked_selection_history WHERE ref=? AND task_id=? AND entrypoint=? AND code=? AND graph_revision=? AND provider_revision=?`, ref, taskID, entrypoint, code, graphRevision, providerRevision).Scan(&id)
+	defer tx.Rollback()
+	for _, item := range items {
+		var recencySeq int64
+		if err := tx.QueryRow(`SELECT COALESCE(MAX(recency_seq), 0) + 1 FROM blocked_selection_history`).Scan(&recencySeq); err != nil {
+			return nil, fmt.Errorf("allocate blocked selection recency: %w", err)
+		}
+		_, err := tx.Exec(`INSERT INTO blocked_selection_history
+			(ref, task_id, entrypoint, code, reason, graph_revision, provider_revision, recency_seq)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+			ON CONFLICT(ref, task_id, entrypoint, code, graph_revision, provider_revision)
+			DO UPDATE SET reason=excluded.reason, recorded_at=CURRENT_TIMESTAMP, recency_seq=excluded.recency_seq`,
+			item.Ref, item.TaskID, item.Entrypoint, item.Code, item.Reason,
+			item.GraphRevision, item.ProviderRevision, recencySeq)
 		if err != nil {
-			return nil, fmt.Errorf("read blocked selection identity: %w", err)
+			return nil, fmt.Errorf("record blocked selection: %w", err)
 		}
 	}
-	return &BlockedRecord{ID: id, Ref: ref, TaskID: taskID, Entrypoint: entrypoint,
-		Code: code, Reason: reason, GraphRevision: graphRevision,
-		ProviderRevision: providerRevision, RecordedAt: time.Now()}, nil
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("commit blocked selection transaction: %w", err)
+	}
+
+	records := make([]BlockedRecord, 0, len(items))
+	for _, item := range items {
+		var record BlockedRecord
+		err := s.db.QueryRow(`SELECT id, ref, task_id, entrypoint, code, reason,
+			graph_revision, provider_revision, recorded_at
+			FROM blocked_selection_history WHERE ref=? AND task_id=? AND entrypoint=? AND code=? AND graph_revision=? AND provider_revision=?`,
+			item.Ref, item.TaskID, item.Entrypoint, item.Code, item.GraphRevision, item.ProviderRevision).
+			Scan(&record.ID, &record.Ref, &record.TaskID, &record.Entrypoint, &record.Code,
+				&record.Reason, &record.GraphRevision, &record.ProviderRevision, &record.RecordedAt)
+		if err != nil {
+			return nil, fmt.Errorf("read persisted blocked selection: %w", err)
+		}
+		records = append(records, record)
+	}
+	return records, nil
 }
 
 // BlockedSelectionHistory returns durable dependency holds newest first.
 func (s *Store) BlockedSelectionHistory(limit int) ([]BlockedRecord, error) {
 	rows, err := s.db.Query(`SELECT id, ref, task_id, entrypoint, code, reason,
 		graph_revision, provider_revision, recorded_at FROM blocked_selection_history
-		ORDER BY id DESC LIMIT ?`, limit)
+		ORDER BY recency_seq DESC, id DESC LIMIT ?`, limit)
 	if err != nil {
 		return nil, err
 	}
