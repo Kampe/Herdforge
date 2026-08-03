@@ -27,9 +27,10 @@ type MetricsExporter struct {
 	TotalReviewPasses   uint64
 	TotalReviewFails    uint64
 
-	mu          sync.Mutex
-	diskState   string
-	diskVolumes map[string]diskVolumeMetric
+	mu             sync.Mutex
+	diskState      string
+	diskVolumes    map[string]diskVolumeMetric
+	diskUnreadable map[string]bool
 }
 
 func NewMetricsExporter() *MetricsExporter {
@@ -79,6 +80,25 @@ func (m *MetricsExporter) SetDiskVolume(role string, freeBytes uint64, freePct f
 		m.diskVolumes = make(map[string]diskVolumeMetric, 4)
 	}
 	m.diskVolumes[role] = diskVolumeMetric{FreeBytes: freeBytes, FreePct: freePct}
+	if m.diskUnreadable == nil {
+		m.diskUnreadable = make(map[string]bool, 4)
+	}
+	m.diskUnreadable[role] = false
+}
+
+// SetDiskVolumeUnreadable marks a bounded role's probe as failed. An
+// unreadable volume must be visible — never silently absent while the
+// process looks healthy.
+func (m *MetricsExporter) SetDiskVolumeUnreadable(role string) {
+	if !diskRoles[role] {
+		role = "other"
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.diskUnreadable == nil {
+		m.diskUnreadable = make(map[string]bool, 4)
+	}
+	m.diskUnreadable[role] = true
 }
 
 // writeDiskMetrics renders the bounded disk gauges (one-hot state plus
@@ -90,9 +110,13 @@ func (m *MetricsExporter) writeDiskMetrics(w http.ResponseWriter) {
 	for k, v := range m.diskVolumes {
 		volumes[k] = v
 	}
+	unreadable := make(map[string]bool, len(m.diskUnreadable))
+	for k, v := range m.diskUnreadable {
+		unreadable[k] = v
+	}
 	m.mu.Unlock()
 
-	if state == "" && len(volumes) == 0 {
+	if state == "" && len(volumes) == 0 && len(unreadable) == 0 {
 		return // never probed; emit nothing rather than a fake ok
 	}
 
@@ -122,6 +146,23 @@ func (m *MetricsExporter) writeDiskMetrics(w http.ResponseWriter) {
 	fmt.Fprintf(w, "# TYPE herd_disk_free_pct gauge\n")
 	for _, r := range roles {
 		fmt.Fprintf(w, "herd_disk_free_pct{volume=%q} %.2f\n", r, volumes[r].FreePct)
+	}
+
+	if len(unreadable) > 0 {
+		uroles := make([]string, 0, len(unreadable))
+		for r := range unreadable {
+			uroles = append(uroles, r)
+		}
+		sort.Strings(uroles)
+		fmt.Fprintf(w, "\n# HELP herd_disk_volume_unreadable Volume probe failed on last scrape (fail-closed signal)\n")
+		fmt.Fprintf(w, "# TYPE herd_disk_volume_unreadable gauge\n")
+		for _, r := range uroles {
+			v := 0
+			if unreadable[r] {
+				v = 1
+			}
+			fmt.Fprintf(w, "herd_disk_volume_unreadable{volume=%q} %d\n", r, v)
+		}
 	}
 }
 

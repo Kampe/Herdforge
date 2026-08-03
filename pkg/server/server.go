@@ -1,8 +1,10 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -26,6 +28,13 @@ type ControlServer struct {
 	Addr      string
 	StartTime time.Time
 	httpSrv   *http.Server
+	boundAddr string
+	serveErr  error
+
+	// OnServeError, when set, receives any runtime Serve failure so the
+	// owning loop can surface it — a dead control plane must never look
+	// healthy by silence.
+	OnServeError func(error)
 
 	// Metrics, when set, mounts /metrics with LIVE disk observation: each
 	// scrape probes DiskVolumes and reads the DefaultDiskGuard projection
@@ -80,12 +89,39 @@ func (s *ControlServer) Start(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("failed to listen on %s: %w", s.Addr, err)
 	}
+	s.mu.Lock()
+	s.boundAddr = listener.Addr().String()
+	s.mu.Unlock()
 
 	go func() {
-		_ = srv.Serve(listener)
+		// A runtime Serve failure is recorded and surfaced — never
+		// discarded while the process appears healthy.
+		if err := srv.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			s.mu.Lock()
+			s.serveErr = err
+			cb := s.OnServeError
+			s.mu.Unlock()
+			if cb != nil {
+				cb(err)
+			}
+		}
 	}()
 
 	return nil
+}
+
+// BoundAddr returns the actual listen address (useful with ":0").
+func (s *ControlServer) BoundAddr() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.boundAddr
+}
+
+// ServeErr returns any recorded runtime Serve failure.
+func (s *ControlServer) ServeErr() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.serveErr
 }
 
 func (s *ControlServer) Stop(ctx context.Context) error {
@@ -98,15 +134,30 @@ func (s *ControlServer) Stop(ctx context.Context) error {
 	return nil
 }
 
-func (s *ControlServer) handleStatus(w http.ResponseWriter, r *http.Request) {
+// writeJSON encodes to a buffer first so an encode failure becomes an
+// explicit 500 instead of a silently truncated 200 body.
+func writeJSON(w http.ResponseWriter, v any) {
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(v); err != nil {
+		http.Error(w, "encode: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
+	_, _ = w.Write(buf.Bytes())
+}
+
+func (s *ControlServer) handleStatus(w http.ResponseWriter, r *http.Request) {
+	status := "healthy"
+	if err := s.ServeErr(); err != nil {
+		status = "degraded: " + err.Error()
+	}
 	resp := ServerStatusResponse{
-		Status:    "healthy",
+		Status:    status,
 		Version:   "v0.1.0",
 		UptimeSec: time.Since(s.StartTime).Seconds(),
 		Timestamp: time.Now(),
 	}
-	_ = json.NewEncoder(w).Encode(resp)
+	writeJSON(w, resp)
 }
 
 func (s *ControlServer) handleOpenAPI(w http.ResponseWriter, r *http.Request) {
@@ -128,7 +179,7 @@ func (s *ControlServer) handleOpenAPI(w http.ResponseWriter, r *http.Request) {
 			},
 		},
 	}
-	_ = json.NewEncoder(w).Encode(openAPISpec)
+	writeJSON(w, openAPISpec)
 }
 
 // handleMetrics refreshes live disk observations (FAC-153) then delegates
@@ -147,7 +198,11 @@ func (s *ControlServer) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	for role, p := range s.DiskVolumes {
 		st, err := preflight.ProbeDisk(p)
 		if err != nil {
-			continue // unreadable volumes surface via the state gauge, not fake numbers
+			// An unreadable volume is surfaced explicitly — the state gauge
+			// (fail-closed check above) plus a per-role unreadable gauge —
+			// never a silently absent series.
+			s.Metrics.SetDiskVolumeUnreadable(role)
+			continue
 		}
 		s.Metrics.SetDiskVolume(role, st.FreeBytes, st.FreePct)
 	}
@@ -166,8 +221,7 @@ func (s *ControlServer) handleReclamationPlan(w http.ResponseWriter, r *http.Req
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(report)
+	writeJSON(w, report)
 }
 
 type reclaimRequest struct {
@@ -192,6 +246,5 @@ func (s *ControlServer) handleReclaim(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(report)
+	writeJSON(w, report)
 }
