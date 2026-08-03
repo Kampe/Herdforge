@@ -12,10 +12,10 @@ import (
 	"time"
 )
 
-// sealGitDirForCleanupFailure makes os.RemoveAll of the candidate root fail
-// deterministically (permission denied while walking .git). This models a tree
-// that cannot be TempDir-cleaned while ownership is still open — not a flaky
-// concurrent-walk race and not an ignored RemoveAll result.
+// sealGitDirForCleanupFailure makes real os.RemoveAll(root) fail deterministically
+// by clearing all mode bits on .git (permission denied while walking). This is
+// the pre-fix TempDir cleanup barrier — not a flaky concurrent-walk race and
+// not an ignored RemoveAll result.
 func sealGitDirForCleanupFailure(gitDir string) error {
 	return os.Chmod(gitDir, 0)
 }
@@ -24,27 +24,32 @@ func unsealGitDirAfterReap(gitDir string) error {
 	return os.Chmod(gitDir, 0o755)
 }
 
+// lateWriterParkScript creates one residue file under .git/objects then parks
+// in the process group. It does NOT rely on recreating removed parents after
+// RemoveAll (that path is vacuous when RemoveAll wins). Parking keeps the
+// unreaped group live through the sealed RemoveAll failure.
+const lateWriterParkScript = `mkdir -p "$1/objects" && printf x > "$1/objects/late-0" && exec sleep 3600`
+
 // TestLateWriterIntoGitRequiresExplicitReap is the FAC-151 deterministic
 // pre-fix / post-fix cleanup barrier:
 //
-//  1. Unreaped process-group writer creates residue under .git.
-//  2. Tree is sealed so real os.RemoveAll hard-fails (must assert err != nil).
-//  3. After process-group reap + unseal, os.RemoveAll must succeed.
-//
-// No ignored cleanup errors. No sleep-based mitigation.
+//  1. Unreaped process-group writer creates .git residue and parks.
+//  2. Seal .git so real os.RemoveAll hard-fails (assert err != nil — never ignored).
+//  3. After process-group reap + wait + unseal, os.RemoveAll must succeed.
 func TestLateWriterIntoGitRequiresExplicitReap(t *testing.T) {
 	root, err := os.MkdirTemp("", "verifier-late-writer-*")
 	if err != nil {
 		t.Fatal(err)
 	}
 	gitDir := filepath.Join(root, ".git")
-	objects := filepath.Join(gitDir, "objects")
-	if err := os.MkdirAll(objects, 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Join(gitDir, "objects"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 
-	cmd := exec.Command("sh", "-c", `i=0; while :; do i=$((i+1)); mkdir -p "$1/objects" && printf x > "$1/objects/late-$i"; done`, "late-writer", gitDir)
+	cmd := exec.Command("sh", "-c", lateWriterParkScript, "late-writer", gitDir)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	var writerErr strings.Builder
+	cmd.Stderr = &writerErr
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
@@ -52,40 +57,34 @@ func TestLateWriterIntoGitRequiresExplicitReap(t *testing.T) {
 	if err := waitForLateObject(gitDir, pgid); err != nil {
 		reapProcessGroup(pgid)
 		_ = cmd.Wait()
-		t.Fatal(err)
+		t.Fatalf("writer failed to create residue: %v (stderr=%q)", err, writerErr.String())
 	}
 	if err := syscall.Kill(pgid, 0); err != nil {
 		t.Fatalf("unreaped writer must be live after creating residue: %v", err)
 	}
 
-	// Deterministic barrier: seal .git so real RemoveAll cannot complete.
 	if err := sealGitDirForCleanupFailure(gitDir); err != nil {
 		reapProcessGroup(pgid)
 		_ = cmd.Wait()
 		t.Fatalf("seal tree: %v", err)
 	}
 
-	// PRE-FIX: hard assertion — real os.RemoveAll must fail (never ignored).
+	// PRE-FIX: real os.RemoveAll must fail. Never `_ = os.RemoveAll`.
 	preErr := os.RemoveAll(root)
 	if preErr == nil {
 		_ = unsealGitDirAfterReap(gitDir)
 		reapProcessGroup(pgid)
 		_ = cmd.Wait()
-		t.Fatal("pre-fix: os.RemoveAll must return an error while unreaped ownership seals the tree")
+		t.Fatal("pre-fix: os.RemoveAll must return an error while the tree is sealed under unreaped ownership")
 	}
-	// Writer still live under unreaped ownership.
 	if err := syscall.Kill(pgid, 0); err != nil {
 		_ = unsealGitDirAfterReap(gitDir)
-		t.Fatalf("unreaped writer must remain live after failed RemoveAll: %v", err)
+		t.Fatalf("unreaped writer must remain live after failed RemoveAll: %v (stderr=%q)", err, writerErr.String())
 	}
 
-	// FIX path: reap + wait + unseal, then real RemoveAll must succeed.
+	// FIX: reap + wait + unseal, then RemoveAll succeeds.
 	reapProcessGroup(pgid)
-	waitErr := cmd.Wait()
-	if waitErr != nil && !strings.Contains(waitErr.Error(), "signal") && !strings.Contains(waitErr.Error(), "kill") {
-		// Reaped shells often exit non-zero; only unexpected wait errors matter.
-		t.Logf("wait after reap: %v", waitErr)
-	}
+	_ = cmd.Wait()
 	if err := waitForPIDGone(pgid, 2*time.Second); err != nil {
 		_ = unsealGitDirAfterReap(gitDir)
 		t.Fatalf("after process-group reap, leader must be gone: %v", err)
@@ -93,18 +92,17 @@ func TestLateWriterIntoGitRequiresExplicitReap(t *testing.T) {
 	if err := unsealGitDirAfterReap(gitDir); err != nil {
 		t.Fatalf("post-fix: unseal after reap must succeed: %v", err)
 	}
-	postErr := os.RemoveAll(root)
-	if postErr != nil {
-		t.Fatalf("post-fix: os.RemoveAll must succeed after reap+wait+unseal: %v", postErr)
+	if err := os.RemoveAll(root); err != nil {
+		t.Fatalf("post-fix: os.RemoveAll must succeed after reap+wait+unseal: %v", err)
 	}
 	if err := syscall.Kill(pgid, 0); err == nil {
 		t.Fatalf("process group %d still live after reap+Wait", pgid)
 	}
 }
 
-// TestLateWriterCleanupMutationOmittingReapStillFails proves that skipping
-// reap+unseal leaves cleanup failing — deleting those steps from the fix path
-// makes the post-fix success assertion fail (non-vacuous mutation).
+// TestLateWriterCleanupMutationOmittingReapStillFails proves that deleting
+// reap/wait/unseal from the fix path leaves os.RemoveAll failing — the
+// negative guard is non-vacuous.
 func TestLateWriterCleanupMutationOmittingReapStillFails(t *testing.T) {
 	root, err := os.MkdirTemp("", "verifier-late-writer-mut-*")
 	if err != nil {
@@ -115,13 +113,12 @@ func TestLateWriterCleanupMutationOmittingReapStillFails(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	cmd := exec.Command("sh", "-c", `i=0; while :; do i=$((i+1)); mkdir -p "$1/objects" && printf x > "$1/objects/late-$i"; done`, "late-writer", gitDir)
+	cmd := exec.Command("sh", "-c", lateWriterParkScript, "late-writer", gitDir)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
 	pgid := cmd.Process.Pid
-	// Always finish ownership for TempDir hygiene after assertions.
 	t.Cleanup(func() {
 		reapProcessGroup(pgid)
 		_ = cmd.Wait()
@@ -136,12 +133,10 @@ func TestLateWriterCleanupMutationOmittingReapStillFails(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := os.RemoveAll(root); err == nil {
-		t.Fatal("control: sealed unreaped tree must make RemoveAll fail")
+		t.Fatal("control: sealed unreaped tree must make os.RemoveAll fail")
 	}
 
-	// MUTATION of the fix path: delete reapProcessGroup, cmd.Wait, and unseal.
-	// Under that mutant, os.RemoveAll must still fail — if this assertion were
-	// removed, the test would not prove reap/wait are required.
+	// MUTATION: omit reapProcessGroup, Wait, and unseal.
 	mutErr := os.RemoveAll(root)
 	if mutErr == nil {
 		t.Fatal("mutation: removing reap/wait/unseal must leave os.RemoveAll failing; got nil")
@@ -151,7 +146,7 @@ func TestLateWriterCleanupMutationOmittingReapStillFails(t *testing.T) {
 	}
 }
 
-// TestProcessGroupReapAllowsTempDirCleanup: seal → fail, reap+unseal → succeed.
+// TestProcessGroupReapAllowsTempDirCleanup: seal → RemoveAll fails; reap+unseal → succeeds.
 func TestProcessGroupReapAllowsTempDirCleanup(t *testing.T) {
 	root, err := os.MkdirTemp("", "verifier-reaped-writer-*")
 	if err != nil {
@@ -161,7 +156,7 @@ func TestProcessGroupReapAllowsTempDirCleanup(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(gitDir, "objects"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	cmd := exec.Command("sh", "-c", `i=0; while :; do i=$((i+1)); mkdir -p "$1/objects" && printf x > "$1/objects/late-$i"; done`, "late-writer", gitDir)
+	cmd := exec.Command("sh", "-c", lateWriterParkScript, "late-writer", gitDir)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
