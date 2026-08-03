@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/Kampe/Herdforge/pkg/agentpolicy"
@@ -147,6 +148,61 @@ type Receipt struct {
 	ReceiptKey        string `json:"receipt_key,omitempty"`
 }
 
+type DegradedStatus struct {
+	TaskRef           string
+	LeaseGeneration   int64
+	DecisionDigest    string
+	HookCode          string
+	HookName          string
+	EndpointClass     string
+	RedactedAuthority string
+}
+
+// ReadDegradedStatus projects durable optional-hook receipts for status
+// consumers without claiming process acceptance or revocation semantics.
+func ReadDegradedStatus(path string) ([]DegradedStatus, error) {
+	f, err := os.Open(path)
+	if os.IsNotExist(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	type lifecycle struct {
+		status DegradedStatus
+		kind   string
+	}
+	lifecycles := make(map[string]lifecycle)
+	order := make([]string, 0)
+	dec := json.NewDecoder(f)
+	for {
+		var receipt Receipt
+		if err := dec.Decode(&receipt); err != nil {
+			if err == io.EOF {
+				break
+			}
+			return nil, err
+		}
+		if receipt.Kind != "hook_degraded" && receipt.Kind != "hook_recovered" {
+			continue
+		}
+		key := fmt.Sprintf("%s|%d|%s", receipt.TaskRef, receipt.LeaseGeneration, receipt.DecisionDigest)
+		if _, exists := lifecycles[key]; !exists {
+			order = append(order, key)
+		}
+		lifecycles[key] = lifecycle{status: DegradedStatus{TaskRef: receipt.TaskRef, LeaseGeneration: receipt.LeaseGeneration, DecisionDigest: receipt.DecisionDigest, HookCode: receipt.HookCode, HookName: receipt.HookName, EndpointClass: receipt.EndpointClass, RedactedAuthority: receipt.RedactedAuthority}, kind: receipt.Kind}
+	}
+	result := make([]DegradedStatus, 0, len(order))
+	for _, key := range order {
+		entry := lifecycles[key]
+		if entry.kind == "hook_degraded" {
+			result = append(result, entry.status)
+		}
+	}
+	return result, nil
+}
+
 // Sink makes receipt durability injectable without making process tests touch
 // the host filesystem.
 type Sink interface{ Write(Receipt) error }
@@ -154,6 +210,10 @@ type Sink interface{ Write(Receipt) error }
 type deduplicatingSink interface {
 	Sink
 	WriteOnce(Receipt) (bool, error)
+}
+
+type degradedHistory interface {
+	HasDegraded(Request) (bool, error)
 }
 
 type JSONLSink struct {
@@ -170,7 +230,22 @@ func (s *JSONLSink) Write(r Receipt) error {
 	if err := os.MkdirAll(filepath.Dir(s.Path), 0755); err != nil {
 		return fmt.Errorf("create launch receipt directory: %w", err)
 	}
-	return s.appendLocked(r)
+	return s.withFileLock(func() error {
+		return s.appendLocked(r)
+	})
+}
+
+func (s *JSONLSink) withFileLock(fn func() error) error {
+	lock, err := os.OpenFile(s.Path+".lock", os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		return fmt.Errorf("open launch receipt lock: %w", err)
+	}
+	defer lock.Close()
+	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX); err != nil {
+		return fmt.Errorf("lock launch receipts: %w", err)
+	}
+	defer syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
+	return fn()
 }
 
 func (s *JSONLSink) appendLocked(r Receipt) error {
@@ -195,31 +270,73 @@ func (s *JSONLSink) WriteOnce(r Receipt) (bool, error) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if r.ReceiptKey != "" {
-		f, err := os.Open(s.Path)
-		if err == nil {
-			defer f.Close()
-			dec := json.NewDecoder(f)
-			for {
-				var existing Receipt
-				if err := dec.Decode(&existing); err != nil {
-					if err == io.EOF {
-						break
-					}
-					return false, fmt.Errorf("read launch receipts: %w", err)
-				}
-				if existing.ReceiptKey == r.ReceiptKey {
-					return false, nil
-				}
-			}
-		} else if !os.IsNotExist(err) {
-			return false, fmt.Errorf("open launch receipts: %w", err)
-		}
-	}
 	if err := os.MkdirAll(filepath.Dir(s.Path), 0755); err != nil {
 		return false, fmt.Errorf("create launch receipt directory: %w", err)
 	}
-	return true, s.appendLocked(r)
+	written := false
+	err := s.withFileLock(func() error {
+		if r.ReceiptKey != "" {
+			f, err := os.Open(s.Path)
+			if err == nil {
+				defer f.Close()
+				dec := json.NewDecoder(f)
+				for {
+					var existing Receipt
+					if err := dec.Decode(&existing); err != nil {
+						if err == io.EOF {
+							break
+						}
+						return fmt.Errorf("read launch receipts: %w", err)
+					}
+					if existing.ReceiptKey == r.ReceiptKey {
+						return nil
+					}
+				}
+			} else if !os.IsNotExist(err) {
+				return fmt.Errorf("open launch receipts: %w", err)
+			}
+		}
+		if err := s.appendLocked(r); err != nil {
+			return err
+		}
+		written = true
+		return nil
+	})
+	return written, err
+}
+
+func (s *JSONLSink) HasDegraded(req Request) (bool, error) {
+	if s == nil || strings.TrimSpace(s.Path) == "" {
+		return false, fmt.Errorf("launch receipt path is required")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	found := false
+	err := s.withFileLock(func() error {
+		f, err := os.Open(s.Path)
+		if os.IsNotExist(err) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+		dec := json.NewDecoder(f)
+		for {
+			var receipt Receipt
+			if err := dec.Decode(&receipt); err != nil {
+				if err == io.EOF {
+					return nil
+				}
+				return err
+			}
+			if receipt.Kind == "hook_degraded" && receipt.TaskRef == req.TaskRef && receipt.LeaseGeneration == req.LeaseGeneration && receipt.DecisionDigest == DecisionDigest(req.Decision) {
+				found = true
+				return nil
+			}
+		}
+	})
+	return found, err
 }
 
 type MemorySink struct {
@@ -246,6 +363,18 @@ func (s *MemorySink) WriteOnce(r Receipt) (bool, error) {
 	}
 	s.Receipts = append(s.Receipts, r)
 	return true, nil
+}
+
+func (s *MemorySink) HasDegraded(req Request) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	digest := DecisionDigest(req.Decision)
+	for _, receipt := range s.Receipts {
+		if receipt.Kind == "hook_degraded" && receipt.TaskRef == req.TaskRef && receipt.LeaseGeneration == req.LeaseGeneration && receipt.DecisionDigest == digest {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func DefaultSink() Sink {
@@ -320,7 +449,9 @@ func RecordStarted(req Request, sink Sink) error {
 	}
 	role, shape, provider, model, effort, digest, argv := fields(req)
 	fd, fa, ff, fs := fleetReceiptFields(req)
-	return sink.Write(receiptFrom(req, role, shape, provider, model, effort, digest, argv, true, "process started", fd, fa, ff, fs))
+	r := receiptFrom(req, role, shape, provider, model, effort, digest, argv, true, "process started", fd, fa, ff, fs)
+	r.Kind = "process_started"
+	return sink.Write(r)
 }
 
 func RecordRejected(req Request, sink Sink, reason string) error { return reject(req, sink, reason) }
@@ -368,6 +499,13 @@ func HasStarted(req Request) (bool, error) {
 				break
 			}
 			return false, err
+		}
+		if r.TaskRef == req.TaskRef && r.LeaseGeneration == req.LeaseGeneration && r.DecisionDigest == digest && (r.Kind == "hook_degraded" || r.Kind == "launch_rejected") {
+			if r.Kind == "hook_degraded" {
+				continue
+			}
+			invalidated = true
+			continue
 		}
 		if r.TaskRef != req.TaskRef || r.Name != req.Name || r.PaneID != req.PaneID || r.LeaseGeneration != req.LeaseGeneration || r.SessionGeneration != req.SessionGeneration {
 			continue
@@ -591,7 +729,7 @@ func preflightHooks(req Request, sink Sink) (harness.HookReport, error) {
 	}
 	discovery := req.HookDiscovery
 	if discovery == nil {
-		discovery = harness.FileDiscovery{}
+		discovery = harness.DefaultDiscovery{}
 	}
 	result, err := discovery.Discover(req.Decision.Provider)
 	if err != nil || result.State == harness.DiscoveryFailed {
@@ -624,24 +762,29 @@ func preflightHooks(req Request, sink Sink) (harness.HookReport, error) {
 	if !report.RequiredHealthy {
 		return report, recordFirstHookFailure(req, sink, report)
 	}
+	if report.DegradedWarning == "" {
+		if err := recordHookRecovered(req, sink); err != nil {
+			return report, err
+		}
+	}
 	return report, nil
 }
 
 func recordFirstHookFailure(req Request, sink Sink, report harness.HookReport) error {
 	for _, result := range report.Results {
-		if result.Hook.Requirement == harness.HookRequired && result.Status != harness.HookHealthy {
-			return recordHookFailure(req, sink, result.Code, result.Hook.Name, result.EndpointClass, result.RedactedAuthority)
+		if result.Status != harness.HookHealthy && (result.Requirement == harness.HookRequired || harness.IsPolicyCode(result.Code)) {
+			return recordHookFailure(req, sink, result.Code, result.Name, result.EndpointClass, result.RedactedAuthority)
 		}
 	}
 	return fmt.Errorf("launch hook preflight failed: %s", harness.HookCodeMalformed)
 }
 
 func hookReceiptKey(req Request, code harness.HookCode, name string) string {
-	return fmt.Sprintf("hook|%s|%s|%s|%d|%s|%s", req.TaskRef, req.Name, req.PaneID, req.LeaseGeneration, DecisionDigest(req.Decision), string(code)+"|"+name)
+	return fmt.Sprintf("hook|%s|%d|%s|%s|%s", req.TaskRef, req.LeaseGeneration, DecisionDigest(req.Decision), name, string(code))
 }
 
 func recordHookFailure(req Request, sink Sink, code harness.HookCode, name string, endpoint harness.EndpointClass, authority string) error {
-	receipt := Receipt{CreatedAt: time.Now().UTC(), Kind: "launch_rejected", TaskRef: req.TaskRef, Name: req.Name, PaneID: req.PaneID, LeaseGeneration: req.LeaseGeneration, HookCode: string(code), HookName: name, EndpointClass: string(endpoint), RedactedAuthority: authority, ReceiptKey: hookReceiptKey(req, code, name)}
+	receipt := Receipt{CreatedAt: time.Now().UTC(), Kind: "launch_rejected", TaskRef: req.TaskRef, LeaseGeneration: req.LeaseGeneration, DecisionDigest: DecisionDigest(req.Decision), HookCode: string(code), HookName: name, EndpointClass: string(endpoint), RedactedAuthority: authority, ReceiptKey: hookReceiptKey(req, code, name)}
 	if _, err := writeOnce(sink, receipt); err != nil {
 		return fmt.Errorf("launch hook preflight failed: %s", code)
 	}
@@ -653,8 +796,8 @@ func recordHookDegraded(req Request, sink Sink, report harness.HookReport) (bool
 	authorities := make([]string, 0)
 	classes := make([]string, 0)
 	for _, result := range report.Results {
-		if result.Hook.Requirement == harness.HookOptional && result.Status != harness.HookHealthy {
-			names = append(names, result.Hook.Name)
+		if result.Requirement == harness.HookOptional && result.Status != harness.HookHealthy && !harness.IsPolicyCode(result.Code) {
+			names = append(names, result.Name)
 			authorities = append(authorities, result.RedactedAuthority)
 			classes = append(classes, string(result.EndpointClass))
 		}
@@ -662,12 +805,31 @@ func recordHookDegraded(req Request, sink Sink, report harness.HookReport) (bool
 	if len(names) == 0 {
 		return false, nil
 	}
-	receipt := Receipt{CreatedAt: time.Now().UTC(), Kind: "hook_degraded", TaskRef: req.TaskRef, Name: req.Name, PaneID: req.PaneID, LeaseGeneration: req.LeaseGeneration, HookCode: string(harness.HookCodeDegraded), HookName: strings.Join(names, ","), EndpointClass: strings.Join(classes, ","), RedactedAuthority: strings.Join(authorities, ","), ReceiptKey: hookReceiptKey(req, harness.HookCodeDegraded, strings.Join(names, ","))}
+	receipt := Receipt{CreatedAt: time.Now().UTC(), Kind: "hook_degraded", TaskRef: req.TaskRef, LeaseGeneration: req.LeaseGeneration, DecisionDigest: DecisionDigest(req.Decision), HookCode: string(harness.HookCodeDegraded), HookName: strings.Join(names, ","), EndpointClass: strings.Join(classes, ","), RedactedAuthority: strings.Join(authorities, ","), ReceiptKey: hookReceiptKey(req, harness.HookCodeDegraded, strings.Join(names, ","))}
 	written, err := writeOnce(sink, receipt)
 	if err != nil {
 		return false, fmt.Errorf("launch hook preflight failed: %s", harness.HookCodeDegraded)
 	}
 	return written, nil
+}
+
+func recordHookRecovered(req Request, sink Sink) error {
+	if sink == nil {
+		sink = DefaultSink()
+	}
+	history, ok := sink.(degradedHistory)
+	if !ok {
+		return nil
+	}
+	hasDegraded, err := history.HasDegraded(req)
+	if err != nil || !hasDegraded {
+		return err
+	}
+	receipt := Receipt{CreatedAt: time.Now().UTC(), Kind: "hook_recovered", TaskRef: req.TaskRef, LeaseGeneration: req.LeaseGeneration, DecisionDigest: DecisionDigest(req.Decision), HookCode: "hook.recovered", HookName: "all", EndpointClass: "local", ReceiptKey: hookReceiptKey(req, harness.HookCode("hook.recovered"), "all")}
+	if _, err := writeOnce(sink, receipt); err != nil {
+		return fmt.Errorf("launch hook preflight failed: hook.recovered")
+	}
+	return nil
 }
 
 func argvCarriesEffort(provider string, argv []string, effort string) bool {
