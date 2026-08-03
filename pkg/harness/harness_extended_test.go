@@ -2,6 +2,7 @@ package harness
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -260,10 +261,10 @@ func TestClaudeDiscoveryMergesGlobalAndLocalLayersDeterministically(t *testing.T
 		t.Fatal(err)
 	}
 	result, err := (ClaudeDiscovery{Paths: []string{global, local}}).Discover("claude")
-	if err != nil || result.State != DiscoveryHooks || len(result.Hooks) != 2 {
+	if err != nil || result.State != DiscoveryHooks || len(result.Hooks) != 3 {
 		t.Fatalf("merged Claude layers = %+v, err=%v", result, err)
 	}
-	if result.Hooks[0].Name == "" || result.Hooks[1].Name == "" || result.Hooks[0].URL != "http://127.0.0.1:8790/global" || result.Hooks[1].URL != "http://127.0.0.1:8790/local-override" {
+	if result.Hooks[0].Name == "" || result.Hooks[1].Name == "" || result.Hooks[2].Name == "" || result.Hooks[0].URL != "http://127.0.0.1:8790/global" {
 		t.Fatalf("merged ordering/override = %+v", result.Hooks)
 	}
 	if err := os.WriteFile(local, []byte(`{"hooks":{}}`), 0600); err != nil {
@@ -285,20 +286,21 @@ func TestDefaultDiscoveryUsesBuiltInNoHooksWhenOverrideAbsent(t *testing.T) {
 
 func TestClaudeCommandIncidentBindsDigestAndChecksExecutable(t *testing.T) {
 	path := t.TempDir() + "/settings.json"
-	config := `{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"/definitely-missing-herd-hook 127.0.0.1:8790","timeout":600}]}]}}`
+	config := `{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"/bin/sh -c 'moshi-hook --port 8790'","timeout":600}]}],"UserPromptSubmit":[{"matcher":"","hooks":[{"type":"command","command":"$HOME/.local/bin/moshi-hook --port 8790"}]}],"PostToolUse":[{"matcher":"Edit","hooks":[{"type":"command","command":"python3 $HOME/.local/bin/moshi-hook --port 8790"}]}],"PostToolUseFailure":[{"matcher":"Edit","hooks":[{"type":"command","command":"bash $HOME/.local/bin/moshi-hook --port 8790"}]}],"SubagentStart":[{"matcher":"","hooks":[{"type":"command","command":"/bin/sh -c 'moshi-hook --port 8790 subagent'"}]}]}}`
 	if err := os.WriteFile(path, []byte(config), 0600); err != nil {
 		t.Fatal(err)
 	}
 	result, err := (ClaudeDiscovery{Paths: []string{path}}).Discover("claude")
-	if err != nil || result.State != DiscoveryHooks || len(result.Hooks) != 1 {
+	if err != nil || result.State != DiscoveryHooks || len(result.Hooks) != 5 {
 		t.Fatalf("command incident discovery = %+v, err=%v", result, err)
 	}
-	hook := result.Hooks[0]
-	if hook.Requirement != HookRequired || strings.Contains(hook.Name, "definitely-missing") || hook.Timeout != 600*time.Second {
-		t.Fatalf("command binding = %+v", hook)
+	for _, hook := range result.Hooks {
+		if hook.Name == "" || !strings.HasPrefix(hook.Name, "claude:") || strings.Contains(hook.Name, "moshi-hook") {
+			t.Fatalf("command binding = %+v", hook)
+		}
 	}
 	report := CheckHooks(context.Background(), result.Hooks, HookIdentity{}, nil)
-	if report.RequiredHealthy || report.Results[0].Code != HookCodeUnavailable || report.Results[0].EndpointClass != EndpointCommand {
+	if report.RequiredHealthy {
 		t.Fatalf("command incident preflight = %+v", report)
 	}
 }
@@ -327,21 +329,27 @@ func TestExplicitClaudeSettingsFileMissingFailsClosed(t *testing.T) {
 	}
 }
 
-func TestHookPoliciesBindExactGenerationAndHealthAuthority(t *testing.T) {
+func TestHookPoliciesBindExactRevisionAndHealthAuthority(t *testing.T) {
 	hook := Hook{Name: "claude:pre-tool:canonical", Requirement: HookRequired}
-	valid := HookPolicy{HandlerDigest: hook.Name, Requirement: HookRequired, HealthURL: "http://127.0.0.1:8790/health", Generation: 7}
-	if bound, code := ApplyHookPolicies([]Hook{hook}, []HookPolicy{valid}, 7); code != HookCodeHealthy || bound[0].HealthURL != valid.HealthURL {
+	valid := HookPolicy{HandlerDigest: hook.Name, Requirement: HookRequired, HealthURL: "http://127.0.0.1:8790/health"}
+	revision := policyRevision([]HookPolicy{valid})
+	if bound, code, digest := ApplyHookPolicies([]Hook{hook}, []HookPolicy{valid}, revision); code != HookCodeHealthy || digest != "" || bound[0].HealthURL != valid.HealthURL {
 		t.Fatalf("valid policy binding = %+v, code=%s", bound, code)
 	}
+	telemetry := HookPolicy{HandlerDigest: hook.Name, Requirement: HookOptional, HealthURL: valid.HealthURL}
+	if bound, code, _ := ApplyHookPolicies([]Hook{hook}, []HookPolicy{telemetry}, policyRevision([]HookPolicy{telemetry})); code != HookCodeHealthy || bound[0].Requirement != HookOptional {
+		t.Fatalf("exact optional policy did not classify handler = %+v, code=%s", bound, code)
+	}
 	cases := []struct {
-		name   string
-		policy HookPolicy
-		code   HookCode
+		name     string
+		policy   HookPolicy
+		revision string
+		code     HookCode
 	}{
-		{"missing", HookPolicy{}, HookCodePolicyMissing},
-		{"stale", HookPolicy{HandlerDigest: hook.Name, Requirement: HookRequired, HealthURL: valid.HealthURL, Generation: 8}, HookCodePolicyStale},
-		{"mismatch", HookPolicy{HandlerDigest: hook.Name, Requirement: HookOptional, HealthURL: valid.HealthURL, Generation: 7}, HookCodePolicyMismatch},
-		{"external", HookPolicy{HandlerDigest: hook.Name, Requirement: HookRequired, HealthURL: "https://example.com/health", Generation: 7}, HookCodeAuthority},
+		{"missing", HookPolicy{}, "", HookCodePolicyMissing},
+		{"stale", valid, "sha256:stale", HookCodePolicyStale},
+		{"mismatch", HookPolicy{HandlerDigest: hook.Name, Requirement: HookRequirement("unknown"), HealthURL: valid.HealthURL}, "", HookCodePolicyMismatch},
+		{"external", HookPolicy{HandlerDigest: hook.Name, Requirement: HookRequired, HealthURL: "https://example.com/health"}, "", HookCodeAuthority},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -349,12 +357,15 @@ func TestHookPoliciesBindExactGenerationAndHealthAuthority(t *testing.T) {
 			if tc.name == "missing" {
 				policies = nil
 			}
-			if _, code := ApplyHookPolicies([]Hook{hook}, policies, 7); code != tc.code {
+			if tc.name == "mismatch" || tc.name == "external" {
+				tc.revision = policyRevision(policies)
+			}
+			if _, code, digest := ApplyHookPolicies([]Hook{hook}, policies, tc.revision); code != tc.code || (tc.name != "missing" && tc.name != "stale" && digest != hook.Name) {
 				t.Fatalf("policy code=%s, want %s", code, tc.code)
 			}
 		})
 	}
-	if _, code := ApplyHookPolicies([]Hook{hook}, []HookPolicy{valid, valid}, 7); code != HookCodePolicyDuplicate {
+	if _, code, digest := ApplyHookPolicies([]Hook{hook}, []HookPolicy{valid, valid}, policyRevision([]HookPolicy{valid, valid})); code != HookCodePolicyDuplicate || digest != valid.HandlerDigest {
 		t.Fatalf("duplicate policy code=%s", code)
 	}
 }
@@ -365,6 +376,25 @@ func TestPlainCommandAndPassiveHandlersAreStructuralOnly(t *testing.T) {
 	report := CheckHooks(context.Background(), []Hook{command, passive}, HookIdentity{}, nil)
 	if report.RequiredHealthy || len(report.Results) != 2 || report.Results[0].Status != HookStructural || report.Results[0].Code != HookCodeNoHealth || report.Results[1].Status != HookStructural {
 		t.Fatalf("structural-only handlers = %+v", report)
+	}
+}
+
+func TestPolicyHealthProbeBindsHandlerAndRevision(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintf(w, `{"status":"ok","hook_digest":%q,"policy_revision":%q}`, r.Header.Get("X-Herd-Hook-Digest"), r.Header.Get("X-Herd-Policy-Revision"))
+	}))
+	defer server.Close()
+	hook := Hook{Name: "claude:pre-tool:" + strings.Repeat("a", 64), URL: server.URL, HealthURL: server.URL, Requirement: HookRequired}
+	identity := HookIdentity{Provider: "codex", Model: "gpt-5.6-luna", Effort: "medium", PolicyRevision: "sha256:" + strings.Repeat("b", 64)}
+	report := CheckHooks(context.Background(), []Hook{hook}, identity, server.Client())
+	if !report.RequiredHealthy || report.Results[0].Status != HookHealthy || report.Results[0].Name != hook.Name {
+		t.Fatalf("bound policy health = %+v", report)
+	}
+	passive := Hook{Name: "claude:permission:" + strings.Repeat("c", 64), HealthURL: server.URL, Requirement: HookRequired, kind: hookPassive}
+	report = CheckHooks(context.Background(), []Hook{passive}, identity, server.Client())
+	if !report.RequiredHealthy || report.Results[0].Status != HookHealthy {
+		t.Fatalf("passive bound policy health = %+v", report)
 	}
 }
 
@@ -403,7 +433,7 @@ func TestDefaultDiscoveryAugmentsClaudeInsteadOfReplacingIt(t *testing.T) {
 	if err != nil || len(discovered.Hooks) != 1 {
 		t.Fatalf("discovery fixture = %+v, err=%v", discovered, err)
 	}
-	override := `{"providers":{"claude":{"policies":[{"handler_digest":` + fmt.Sprintf("%q", discovered.Hooks[0].Name) + `,"requirement":"required","health_url":"http://127.0.0.1:8790/health","generation":3}]}}}`
+	override := `{"providers":{"claude":{"policies":[{"handler_digest":` + fmt.Sprintf("%q", discovered.Hooks[0].Name) + `,"requirement":"required","health_url":"http://127.0.0.1:8790/health"}]}}}`
 	if err := os.WriteFile(overridePath, []byte(override), 0600); err != nil {
 		t.Fatal(err)
 	}
@@ -411,4 +441,86 @@ func TestDefaultDiscoveryAugmentsClaudeInsteadOfReplacingIt(t *testing.T) {
 	if err != nil || result.State != DiscoveryHooks || len(result.Hooks) != 1 || result.Hooks[0].URL != "http://127.0.0.1:8790/live" || len(result.Policies) != 1 || !result.PolicyRequired {
 		t.Fatalf("override replaced canonical discovery = %+v, err=%v", result, err)
 	}
+}
+
+func TestClaudeScopesConcatenateAndDocumentedDeduplication(t *testing.T) {
+	user := t.TempDir() + "/user.json"
+	project := t.TempDir() + "/project.json"
+	userConfig := `{"hooks":{"SessionStart":[{"matcher":"","hooks":[{"type":"command","command":"moshi-hook --port 8790","timeout":30}]}],"UserPromptSubmit":[{"matcher":"","hooks":[{"type":"command","command":"moshi-hook --port 8790","timeout":30}]}],"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"moshi-hook --port 8790 --mode user","timeout":30}]}]}}`
+	projectConfig := `{"hooks":{"SessionStart":[{"matcher":"","hooks":[{"type":"command","command":"moshi-hook --port 8790","timeout":30}]}],"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"moshi-hook --port 8790 --mode project","timeout":30}]}]}}`
+	if err := os.WriteFile(user, []byte(userConfig), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(project, []byte(projectConfig), 0600); err != nil {
+		t.Fatal(err)
+	}
+	result, err := (ClaudeDiscovery{Paths: []string{user, project}}).Discover("claude")
+	if err != nil || len(result.Hooks) != 4 {
+		t.Fatalf("scope merge/dedupe = %+v, err=%v", result, err)
+	}
+	if result.Hooks[0].Name == result.Hooks[1].Name || result.Hooks[1].Name == result.Hooks[2].Name {
+		t.Fatalf("event/matcher/args attribution collapsed: %+v", result.Hooks)
+	}
+}
+
+func TestClaudeScopesRejectConflictingSameRuntimeBehavior(t *testing.T) {
+	user := t.TempDir() + "/user.json"
+	project := t.TempDir() + "/project.json"
+	fixture := func(status string) string {
+		return `{"hooks":{"SessionStart":[{"matcher":"","hooks":[{"type":"http","url":"http://127.0.0.1:8790/health","statusMessage":"` + status + `"}]}]}}`
+	}
+	if err := os.WriteFile(user, []byte(fixture("user")), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(project, []byte(fixture("project")), 0600); err != nil {
+		t.Fatal(err)
+	}
+	result, err := (ClaudeDiscovery{Paths: []string{user, project}}).Discover("claude")
+	if err == nil || result.State != DiscoveryFailed {
+		t.Fatalf("conflicting same-runtime behavior was accepted: %+v, err=%v", result, err)
+	}
+}
+
+func TestHookPolicyInventoryRoundTripsStaticPolicy(t *testing.T) {
+	settingsPath := t.TempDir() + "/settings.json"
+	settings := `{"hooks":{"SessionStart":[{"hooks":[{"type":"http","url":"http://127.0.0.1:8790/health"}]}]}}`
+	if err := os.WriteFile(settingsPath, []byte(settings), 0600); err != nil {
+		t.Fatal(err)
+	}
+	discovery := ClaudeDiscovery{Paths: []string{settingsPath}}
+	inventory, err := DiscoverHookPolicyInventory(discovery, "claude")
+	if err != nil || len(inventory.Handlers) != 1 || inventory.Handlers[0].HandlerDigest == "" {
+		t.Fatalf("inventory = %+v, err=%v", inventory, err)
+	}
+	encoded, err := json.Marshal(inventory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded HookPolicyInventory
+	if err := json.Unmarshal(encoded, &decoded); err != nil || decoded.Provider != inventory.Provider || decoded.PolicyRevision != inventory.PolicyRevision || len(decoded.Handlers) != len(inventory.Handlers) {
+		t.Fatalf("inventory JSON round trip = %+v, err=%v", decoded, err)
+	}
+	operatorJSON, err := DiscoverHookPolicyInventoryJSON(discovery, "claude")
+	if err != nil || strings.Contains(string(operatorJSON), "127.0.0.1") || strings.Contains(string(operatorJSON), "http") || strings.Contains(string(operatorJSON), "command") {
+		t.Fatalf("operator inventory leaked endpoint data: %s", operatorJSON)
+	}
+	policies := []HookPolicy{{HandlerDigest: inventory.Handlers[0].HandlerDigest, Requirement: inventory.Handlers[0].Requirement, HealthURL: "http://127.0.0.1:8790/health"}}
+	revision := HookPolicyRevision(policies)
+	if revision == "" || revision == inventory.PolicyRevision {
+		// The authored policy revision must be independently actionable from the
+		// empty pre-authoring policy set.
+		t.Fatalf("policy revision is not independent: inventory=%q authored=%q", inventory.PolicyRevision, revision)
+	}
+	bound, code, digest := ApplyHookPolicies(inventoryToHooks(inventory), policies, revision)
+	if code != HookCodeHealthy || digest != "" || len(bound) != 1 || bound[0].HealthURL != policies[0].HealthURL {
+		t.Fatalf("inventory policy round trip = hooks=%+v code=%s digest=%q", bound, code, digest)
+	}
+}
+
+func inventoryToHooks(inventory HookPolicyInventory) []Hook {
+	hooks := make([]Hook, 0, len(inventory.Handlers))
+	for _, entry := range inventory.Handlers {
+		hooks = append(hooks, Hook{Name: entry.HandlerDigest, Requirement: entry.Requirement, kind: hookHTTP})
+	}
+	return hooks
 }

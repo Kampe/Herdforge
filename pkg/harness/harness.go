@@ -98,14 +98,15 @@ const (
 )
 
 type Hook struct {
-	Name        string
-	URL         string
-	HealthURL   string
-	Requirement HookRequirement
-	Timeout     time.Duration
-	kind        hookKind
-	executable  string
-	mergeKey    string
+	Name           string
+	URL            string
+	HealthURL      string
+	Requirement    HookRequirement
+	Timeout        time.Duration
+	kind           hookKind
+	executable     string
+	runtimeKey     string
+	behaviorDigest string
 }
 
 // HookPolicy is trusted Herdforge metadata for one discovered handler. The
@@ -115,7 +116,18 @@ type HookPolicy struct {
 	HandlerDigest string          `json:"handler_digest"`
 	Requirement   HookRequirement `json:"requirement"`
 	HealthURL     string          `json:"health_url"`
-	Generation    int64           `json:"generation"`
+}
+
+type HookPolicyInventory struct {
+	Provider       string                     `json:"provider"`
+	PolicyRevision string                     `json:"policy_revision"`
+	Handlers       []HookPolicyInventoryEntry `json:"handlers"`
+}
+
+type HookPolicyInventoryEntry struct {
+	HandlerDigest string          `json:"handler_digest"`
+	Requirement   HookRequirement `json:"requirement"`
+	NeedsHealth   bool            `json:"needs_health"`
 }
 
 type hookKind string
@@ -176,11 +188,13 @@ const (
 )
 
 type HookDiscoveryResult struct {
-	State               DiscoveryState
-	Hooks               []Hook
-	ApprovedAuthorities []string
-	Policies            []HookPolicy
-	PolicyRequired      bool
+	State                  DiscoveryState
+	Hooks                  []Hook
+	ApprovedAuthorities    []string
+	Policies               []HookPolicy
+	PolicyRequired         bool
+	PolicyRevision         string
+	ExpectedPolicyRevision string
 }
 
 type HookDiscovery interface {
@@ -220,6 +234,7 @@ func (d FileDiscovery) Discover(provider string) (HookDiscoveryResult, error) {
 			Hooks               []Hook       `json:"hooks"`
 			ApprovedAuthorities []string     `json:"approved_local_authorities"`
 			Policies            []HookPolicy `json:"policies"`
+			Revision            string       `json:"revision"`
 		} `json:"providers"`
 	}
 	decoder := json.NewDecoder(bytes.NewReader(b))
@@ -235,7 +250,11 @@ func (d FileDiscovery) Discover(provider string) (HookDiscoveryResult, error) {
 	if len(entry.Hooks) == 0 {
 		state = DiscoveryNoHooks
 	}
-	return HookDiscoveryResult{State: state, Hooks: entry.Hooks, ApprovedAuthorities: entry.ApprovedAuthorities, Policies: entry.Policies, PolicyRequired: len(entry.Policies) > 0}, nil
+	revision := policyRevision(entry.Policies)
+	if entry.Revision != "" && entry.Revision != revision {
+		return HookDiscoveryResult{State: DiscoveryFailed}, fmt.Errorf("hook discovery failed")
+	}
+	return HookDiscoveryResult{State: state, Hooks: entry.Hooks, ApprovedAuthorities: entry.ApprovedAuthorities, Policies: entry.Policies, PolicyRequired: len(entry.Policies) > 0, PolicyRevision: revision, ExpectedPolicyRevision: entry.Revision}, nil
 }
 
 // DefaultDiscovery resolves a repo policy override when present and otherwise
@@ -272,6 +291,8 @@ func (d DefaultDiscovery) Discover(provider string) (HookDiscoveryResult, error)
 			return result, err
 		}
 		result.Policies = override.Policies
+		result.PolicyRevision = override.PolicyRevision
+		result.ExpectedPolicyRevision = override.PolicyRevision
 		return result, nil
 	}
 	if hasOverride {
@@ -286,8 +307,10 @@ func (d DefaultDiscovery) Discover(provider string) (HookDiscoveryResult, error)
 }
 
 type ClaudeDiscovery struct {
-	Paths    []string
-	Policies []HookPolicy
+	Paths                  []string
+	Policies               []HookPolicy
+	PolicyRevision         string
+	ExpectedPolicyRevision string
 }
 
 func (d ClaudeDiscovery) Discover(string) (HookDiscoveryResult, error) {
@@ -306,8 +329,8 @@ func (d ClaudeDiscovery) Discover(string) (HookDiscoveryResult, error) {
 			paths = []string{filepath.Join(home, ".claude", "settings.json"), ".claude/settings.json", ".claude/settings.local.json"}
 		}
 	}
-	merged := make(map[string]Hook)
-	order := make([]string, 0)
+	merged := make([]Hook, 0)
+	byRuntime := make(map[string]Hook)
 	found := false
 	for _, path := range paths {
 		b, err := os.ReadFile(path)
@@ -325,31 +348,33 @@ func (d ClaudeDiscovery) Discover(string) (HookDiscoveryResult, error) {
 		if err != nil {
 			return HookDiscoveryResult{State: DiscoveryFailed}, fmt.Errorf("hook discovery failed")
 		}
-		layerKeys := make(map[string]struct{}, len(hooks))
 		for _, hook := range hooks {
-			key := hook.mergeKey
+			key := hook.runtimeKey
 			if key == "" {
-				key = strings.ToLower(strings.TrimSpace(hook.Name))
+				key = hook.Name
 			}
-			if _, duplicate := layerKeys[key]; duplicate {
-				return HookDiscoveryResult{State: DiscoveryFailed}, fmt.Errorf("hook discovery failed")
+			if existing, exists := byRuntime[key]; exists {
+				if existing.behaviorDigest != hook.behaviorDigest {
+					return HookDiscoveryResult{State: DiscoveryFailed}, fmt.Errorf("hook discovery failed")
+				}
+				continue
 			}
-			layerKeys[key] = struct{}{}
-			if _, exists := merged[key]; !exists {
-				order = append(order, key)
-			}
-			merged[key] = hook
+			byRuntime[key] = hook
+			merged = append(merged, hook)
 		}
 	}
 	if !found || len(merged) == 0 {
 		return HookDiscoveryResult{State: DiscoveryNoHooks}, nil
 	}
-	result := make([]Hook, 0, len(order))
-	for _, key := range order {
-		result = append(result, merged[key])
+	result := append([]Hook(nil), merged...)
+	revision := d.PolicyRevision
+	if revision == "" {
+		revision = policyRevision(d.Policies)
 	}
-	sort.Slice(result, func(i, j int) bool { return result[i].Name < result[j].Name })
-	return HookDiscoveryResult{State: DiscoveryHooks, Hooks: result, Policies: d.Policies, PolicyRequired: true}, nil
+	if d.ExpectedPolicyRevision != "" && d.ExpectedPolicyRevision != revision {
+		return HookDiscoveryResult{State: DiscoveryFailed}, fmt.Errorf("hook discovery failed")
+	}
+	return HookDiscoveryResult{State: DiscoveryHooks, Hooks: result, Policies: d.Policies, PolicyRequired: true, PolicyRevision: revision, ExpectedPolicyRevision: d.ExpectedPolicyRevision}, nil
 }
 
 func parseClaudeHooks(data []byte) ([]Hook, error) {
@@ -395,7 +420,8 @@ func parseClaudeHooks(data []byte) ([]Hook, error) {
 					if err := json.Unmarshal(fields["command"], &command); err != nil || strings.TrimSpace(command) == "" {
 						return nil, fmt.Errorf("invalid claude command hook")
 					}
-					hook := Hook{Name: claudeHookIdentityWithMaterial(event, entry.Matcher, "", "", index, command), Requirement: claudeHookRequirement(event), Timeout: defaultHookTimeout, kind: hookCommand, executable: commandExecutable(command), mergeKey: claudeHookMergeKey(event, entry.Matcher, "", index)}
+					behavior := claudeCommandBehaviorDigest(fields)
+					hook := Hook{Name: claudeHookIdentityWithMaterial(event, entry.Matcher, "", "", index, behavior), Requirement: claudeHookRequirement(event), Timeout: defaultHookTimeout, kind: hookCommand, executable: commandExecutable(command), runtimeKey: claudeRuntimeKey("command", event, entry.Matcher, command), behaviorDigest: behavior}
 					if len(fields["timeout"]) > 0 {
 						parsed, err := parseHookTimeout(fields["timeout"])
 						if err != nil {
@@ -407,7 +433,8 @@ func parseClaudeHooks(data []byte) ([]Hook, error) {
 				case "mcp_tool", "prompt", "agent":
 					// Valid standard handlers are bound only by a digest. Their
 					// tool, prompt, and agent bodies are never retained or inspected.
-					result = append(result, Hook{Name: claudeHookIdentityWithMaterial(event, entry.Matcher, "", "", index, string(rawItem)), Requirement: claudeHookRequirement(event), Timeout: defaultHookTimeout, kind: hookPassive, mergeKey: claudeHookMergeKey(event, entry.Matcher, "", index)})
+					behavior := claudeCommandBehaviorDigest(fields)
+					result = append(result, Hook{Name: claudeHookIdentityWithMaterial(event, entry.Matcher, "", "", index, behavior), Requirement: claudeHookRequirement(event), Timeout: defaultHookTimeout, kind: hookPassive, runtimeKey: claudeRuntimeKey(kind, event, entry.Matcher, string(rawItem)), behaviorDigest: behavior})
 				case "http":
 					var item struct {
 						Type           string            `json:"type"`
@@ -423,7 +450,8 @@ func parseClaudeHooks(data []byte) ([]Hook, error) {
 					if err := decodeStrict(rawItem, &item); err != nil || strings.TrimSpace(item.URL) == "" {
 						return nil, fmt.Errorf("invalid claude http hook")
 					}
-					hook := Hook{Name: claudeHookIdentityWithMaterial(event, entry.Matcher, item.Name, item.URL, index, claudeHTTPBehaviorDigest(item.URL, item.Headers, item.AllowedEnvVars, item.If, item.StatusMessage, item.Once, item.Timeout)), URL: item.URL, Requirement: claudeHookRequirement(event), Timeout: defaultHookTimeout, kind: hookHTTP, mergeKey: claudeHookMergeKey(event, entry.Matcher, item.Name, index)}
+					behavior := claudeHTTPBehaviorDigest(item.URL, item.Headers, item.AllowedEnvVars, item.If, item.StatusMessage, item.Once, item.Timeout)
+					hook := Hook{Name: claudeHookIdentityWithMaterial(event, entry.Matcher, item.Name, item.URL, index, behavior), URL: item.URL, Requirement: claudeHookRequirement(event), Timeout: defaultHookTimeout, kind: hookHTTP, runtimeKey: claudeRuntimeKey("http", event, entry.Matcher, item.URL), behaviorDigest: behavior}
 					if len(item.Timeout) > 0 {
 						parsed, err := parseHookTimeout(item.Timeout)
 						if err != nil {
@@ -463,9 +491,9 @@ func claudeHookIdentity(event, matcher, name, endpoint string, index int) string
 	return claudeHookIdentityWithMaterial(event, matcher, name, endpoint, index, "")
 }
 
-func claudeHookMergeKey(event, matcher, name string, index int) string {
-	sum := sha256.Sum256([]byte(event + "\x00" + matcher + "\x00" + name + fmt.Sprintf("\x00%d", index)))
-	return fmt.Sprintf("merge:%x", sum[:8])
+func claudeRuntimeKey(kind, event, matcher, value string) string {
+	sum := sha256.Sum256([]byte(kind + "\x00" + event + "\x00" + matcher + "\x00" + value))
+	return fmt.Sprintf("runtime:%x", sum[:])
 }
 
 func claudeHookIdentityWithMaterial(event, matcher, name, endpoint string, index int, materialExtra string) string {
@@ -479,7 +507,13 @@ func claudeHookIdentityWithMaterial(event, matcher, name, endpoint string, index
 		material += "\x00" + authority + fmt.Sprintf("\x00%d", index)
 	}
 	sum := sha256.Sum256([]byte(material))
-	return fmt.Sprintf("claude:%s:%x", claudeEventClass(event), sum[:8])
+	return fmt.Sprintf("claude:%s:%x", claudeEventClass(event), sum[:])
+}
+
+func claudeCommandBehaviorDigest(fields map[string]json.RawMessage) string {
+	canonical, _ := json.Marshal(fields)
+	sum := sha256.Sum256(canonical)
+	return fmt.Sprintf("command-behavior:%x", sum[:])
 }
 
 func claudeHTTPBehaviorDigest(endpoint string, headers map[string]string, allowedEnv []string, condition, statusMessage string, once bool, timeout json.RawMessage) string {
@@ -493,7 +527,7 @@ func claudeHTTPBehaviorDigest(endpoint string, headers map[string]string, allowe
 		Timeout    json.RawMessage   `json:"timeout"`
 	}{endpoint, headers, append([]string(nil), allowedEnv...), condition, statusMessage, once, timeout})
 	sum := sha256.Sum256(material)
-	return fmt.Sprintf("http-behavior:%x", sum[:8])
+	return fmt.Sprintf("http-behavior:%x", sum[:])
 }
 
 func claudeEventClass(event string) string {
@@ -556,9 +590,10 @@ type HookReport struct {
 }
 
 type HookIdentity struct {
-	Provider string
-	Model    string
-	Effort   string
+	Provider       string
+	Model          string
+	Effort         string
+	PolicyRevision string
 }
 
 type HookCode string
@@ -664,17 +699,65 @@ func IsPolicyCode(code HookCode) bool {
 	}
 }
 
+func policyRevision(policies []HookPolicy) string {
+	ordered := append([]HookPolicy(nil), policies...)
+	sort.Slice(ordered, func(i, j int) bool { return ordered[i].HandlerDigest < ordered[j].HandlerDigest })
+	canonical, _ := json.Marshal(ordered)
+	sum := sha256.Sum256(canonical)
+	return fmt.Sprintf("sha256:%x", sum[:])
+}
+
+// HookPolicyRevision returns the full immutable revision for an authored
+// policy set. It is safe to print and store; it contains no handler content.
+func HookPolicyRevision(policies []HookPolicy) string { return policyRevision(policies) }
+
+// DiscoverHookPolicyInventory exposes only bounded canonical digests and the
+// immutable policy revision needed to author trusted metadata.
+func DiscoverHookPolicyInventory(discovery HookDiscovery, provider string) (HookPolicyInventory, error) {
+	result, err := discovery.Discover(provider)
+	if err != nil {
+		return HookPolicyInventory{}, err
+	}
+	entries := make([]HookPolicyInventoryEntry, 0, len(result.Hooks))
+	for _, hook := range result.Hooks {
+		entries = append(entries, HookPolicyInventoryEntry{HandlerDigest: hook.Name, Requirement: hook.Requirement, NeedsHealth: hook.Requirement == HookRequired})
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].HandlerDigest < entries[j].HandlerDigest })
+	return HookPolicyInventory{Provider: provider, PolicyRevision: result.PolicyRevision, Handlers: entries}, nil
+}
+
+// DiscoverHookPolicyInventoryJSON is the compiled read-only operator surface.
+// It emits only full handler digests, requirement classifications, and the
+// immutable policy revision; it never emits command text or endpoint data.
+func DiscoverHookPolicyInventoryJSON(discovery HookDiscovery, provider string) ([]byte, error) {
+	inventory, err := DiscoverHookPolicyInventory(discovery, provider)
+	if err != nil {
+		return nil, err
+	}
+	return json.Marshal(inventory)
+}
+
+func (d DefaultDiscovery) PolicyInventory(provider string) (HookPolicyInventory, error) {
+	return DiscoverHookPolicyInventory(d, provider)
+}
+
 // ApplyHookPolicies binds trusted metadata to canonical discovered handlers.
 // It rejects drift before any network probe. Only discoveries marked as
 // policy-required should call this function.
-func ApplyHookPolicies(hooks []Hook, policies []HookPolicy, generation int64) ([]Hook, HookCode) {
+func ApplyHookPolicies(hooks []Hook, policies []HookPolicy, revision string) ([]Hook, HookCode, string) {
+	if len(policies) == 0 {
+		return nil, HookCodePolicyMissing, firstHookDigest(hooks)
+	}
+	if strings.TrimSpace(revision) == "" || revision != policyRevision(policies) {
+		return nil, HookCodePolicyStale, firstHookDigest(hooks)
+	}
 	byDigest := make(map[string]HookPolicy, len(policies))
 	for _, policy := range policies {
 		if strings.TrimSpace(policy.HandlerDigest) == "" {
-			return nil, HookCodePolicyMismatch
+			return nil, HookCodePolicyMismatch, policy.HandlerDigest
 		}
 		if _, exists := byDigest[policy.HandlerDigest]; exists {
-			return nil, HookCodePolicyDuplicate
+			return nil, HookCodePolicyDuplicate, policy.HandlerDigest
 		}
 		byDigest[policy.HandlerDigest] = policy
 	}
@@ -685,34 +768,44 @@ func ApplyHookPolicies(hooks []Hook, policies []HookPolicy, generation int64) ([
 		policy, exists := byDigest[hook.Name]
 		if !exists {
 			if hook.Requirement == HookRequired || hook.Requirement == HookRequirement("unknown") {
-				return nil, HookCodePolicyMissing
+				return nil, HookCodePolicyMissing, hook.Name
 			}
 			continue
 		}
 		matched[hook.Name] = struct{}{}
-		if policy.Generation != generation {
-			return nil, HookCodePolicyStale
-		}
 		if policy.Requirement != hook.Requirement || (policy.Requirement != HookRequired && policy.Requirement != HookOptional) {
-			return nil, HookCodePolicyMismatch
+			if policy.Requirement != HookRequired && policy.Requirement != HookOptional {
+				return nil, HookCodePolicyMismatch, hook.Name
+			}
 		}
+		// The exact current digest and immutable policy revision make the
+		// trusted policy, rather than the event default, authoritative. This
+		// permits an explicitly classified telemetry hook on a critical event.
+		hook.Requirement = policy.Requirement
 		if strings.TrimSpace(policy.HealthURL) == "" {
 			if hook.Requirement == HookRequired {
-				return nil, HookCodeNoHealth
+				return nil, HookCodeNoHealth, hook.Name
 			}
 			continue
 		}
 		if !validHealthAuthority(policy.HealthURL) {
-			return nil, HookCodeAuthority
+			return nil, HookCodeAuthority, hook.Name
 		}
 		hook.HealthURL = policy.HealthURL
 	}
 	for digest := range byDigest {
 		if _, exists := matched[digest]; !exists {
-			return nil, HookCodePolicyMismatch
+			return nil, HookCodePolicyMismatch, digest
 		}
 	}
-	return bound, HookCodeHealthy
+	return bound, HookCodeHealthy, ""
+}
+
+func firstHookDigest(hooks []Hook) string {
+	if len(hooks) == 0 {
+		return ""
+	}
+	return hooks[0].Name
 }
 
 func validHealthAuthority(raw string) bool {
@@ -724,7 +817,7 @@ func validHealthAuthority(raw string) bool {
 }
 
 func checkHook(parent context.Context, hook Hook, identity HookIdentity, client *http.Client, approved []string, seen map[string]struct{}) HookResult {
-	result := HookResult{Name: stableHookName(hook.Name), Requirement: hook.Requirement}
+	result := HookResult{Name: hookResultName(hook.Name), Requirement: hook.Requirement}
 	result.Code = HookCodeMalformed
 	result.EndpointClass = EndpointInvalid
 	if strings.TrimSpace(hook.Name) == "" {
@@ -772,8 +865,11 @@ func checkHook(parent context.Context, hook Hook, identity HookIdentity, client 
 		return probeHealthURL(ctx, hook, identity, client, approved, result)
 	}
 	if hook.kind == hookPassive {
-		result.Status, result.Code, result.EndpointClass = HookStructural, HookCodeNoHealth, EndpointCommand
-		return result
+		if strings.TrimSpace(hook.HealthURL) == "" {
+			result.Status, result.Code, result.EndpointClass = HookStructural, HookCodeNoHealth, EndpointCommand
+			return result
+		}
+		return probeHealthURL(ctx, hook, identity, client, approved, result)
 	}
 	u, err := url.Parse(strings.TrimSpace(hook.URL))
 	if err == nil && u != nil {
@@ -792,6 +888,13 @@ func checkHook(parent context.Context, hook Hook, identity HookIdentity, client 
 		return probeHealthURL(ctx, hook, identity, client, approved, result)
 	}
 	return probeReachability(ctx, u, result)
+}
+
+func hookResultName(name string) string {
+	if strings.HasPrefix(name, "claude:") && len(name) >= len("claude:")+64 {
+		return name
+	}
+	return stableHookName(name)
 }
 
 func expandHomeExecutable(raw string) string {
@@ -856,6 +959,8 @@ func probeHealthURL(ctx context.Context, hook Hook, identity HookIdentity, clien
 	req.Header.Set("X-Herd-Provider", identity.Provider)
 	req.Header.Set("X-Herd-Model", identity.Model)
 	req.Header.Set("X-Herd-Effort", identity.Effort)
+	req.Header.Set("X-Herd-Hook-Digest", hook.Name)
+	req.Header.Set("X-Herd-Policy-Revision", identity.PolicyRevision)
 	probeClient := *client
 	probeClient.CheckRedirect = func(*http.Request, []*http.Request) error { return errRedirectRejected }
 	resp, err := probeClient.Do(req)
@@ -876,9 +981,11 @@ func probeHealthURL(ctx context.Context, hook Hook, identity HookIdentity, clien
 		return result
 	}
 	var healthResponse struct {
-		Status string `json:"status"`
+		Status         string `json:"status"`
+		HookDigest     string `json:"hook_digest"`
+		PolicyRevision string `json:"policy_revision"`
 	}
-	if err := json.Unmarshal(body, &healthResponse); err != nil || (healthResponse.Status != "ok" && healthResponse.Status != "healthy") {
+	if err := json.Unmarshal(body, &healthResponse); err != nil || (healthResponse.Status != "ok" && healthResponse.Status != "healthy") || (identity.PolicyRevision != "" && (healthResponse.HookDigest != hook.Name || healthResponse.PolicyRevision != identity.PolicyRevision)) {
 		result.Status, result.Code = HookMalformed, HookCodeHealthMalformed
 		return result
 	}
@@ -888,7 +995,7 @@ func probeHealthURL(ctx context.Context, hook Hook, identity HookIdentity, clien
 
 func stableHookName(name string) string {
 	sum := sha256.Sum256([]byte(strings.TrimSpace(name)))
-	return fmt.Sprintf("hook:%x", sum[:8])
+	return fmt.Sprintf("hook:%x", sum[:])
 }
 
 var errRedirectRejected = errors.New("hook redirect rejected")

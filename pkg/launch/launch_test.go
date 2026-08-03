@@ -449,30 +449,44 @@ func TestOrdinaryRequestCannotBypassProductionDiscovery(t *testing.T) {
 
 func TestClaudeCommandIncidentRequiresBoundHealthPolicyBeforeEffects(t *testing.T) {
 	settingsPath := t.TempDir() + "/settings.json"
-	settings := `{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"/bin/sh -c '$HOME/.local/bin/moshi-hook --port 8790'","timeout":600}]}],"PostToolUse":[{"hooks":[{"type":"command","command":"/bin/sh -c '$HOME/.local/bin/moshi-hook post'"}]}],"PostToolUseFailure":[{"hooks":[{"type":"command","command":"/bin/sh -c '$HOME/.local/bin/moshi-hook failure'"}]}],"SubagentStart":[{"hooks":[{"type":"command","command":"/bin/sh -c '$HOME/.local/bin/moshi-hook subagent'"}]}]}}`
+	settings := `{"hooks":{"SessionStart":[{"matcher":"","hooks":[{"type":"command","command":"moshi-hook --port 8790"}]}],"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"/bin/sh -c '$HOME/.local/bin/moshi-hook --port 8790'","timeout":600}]}],"UserPromptSubmit":[{"matcher":"","hooks":[{"type":"command","command":"$HOME/.local/bin/moshi-hook --port 8790"}]}],"PostToolUse":[{"matcher":"Edit","hooks":[{"type":"command","command":"python3 $HOME/.local/bin/moshi-hook --port 8790"}]}],"PostToolUseFailure":[{"matcher":"Edit","hooks":[{"type":"command","command":"bash $HOME/.local/bin/moshi-hook --port 8790"}]}],"SubagentStart":[{"matcher":"","hooks":[{"type":"command","command":"/bin/sh -c '$HOME/.local/bin/moshi-hook subagent'"}]}]}}`
 	if err := os.WriteFile(settingsPath, []byte(settings), 0600); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("HERD_CLAUDE_SETTINGS_FILE", settingsPath)
 	discovered, err := (harness.ClaudeDiscovery{}).Discover("claude")
-	if err != nil || len(discovered.Hooks) != 4 {
+	if err != nil || len(discovered.Hooks) != 6 {
 		t.Fatalf("realistic Claude command discovery = %+v, err=%v", discovered, err)
 	}
 	req := good(t)
 	var policies []harness.HookPolicy
 	for _, hook := range discovered.Hooks {
-		policies = append(policies, harness.HookPolicy{HandlerDigest: hook.Name, Requirement: harness.HookRequired, HealthURL: "http://127.0.0.1:1/health", Generation: req.LeaseGeneration})
+		policies = append(policies, harness.HookPolicy{HandlerDigest: hook.Name, Requirement: hook.Requirement, HealthURL: "http://127.0.0.1:8790/health"})
+	}
+	policyDiscovery, err := (harness.ClaudeDiscovery{Paths: []string{settingsPath}, Policies: policies}).Discover("claude")
+	if err != nil {
+		t.Fatal(err)
 	}
 	req.HookDiscovery = harness.HookDiscoveryFunc(func(string) (harness.HookDiscoveryResult, error) {
-		return harness.HookDiscoveryResult{State: harness.DiscoveryHooks, Hooks: discovered.Hooks, Policies: policies, PolicyRequired: true}, nil
+		return harness.HookDiscoveryResult{State: harness.DiscoveryHooks, Hooks: discovered.Hooks, Policies: policies, PolicyRequired: true, PolicyRevision: policyDiscovery.PolicyRevision}, nil
 	})
 	sink := &MemorySink{}
 	effects := 0
 	if err := Launch(req, sink, LaunchEffects{Tab: func() error { effects++; return nil }, Process: func() error { effects++; return nil }, Prompt: func() error { effects++; return nil }, Board: func() error { effects++; return nil }}); err == nil {
 		t.Fatal("refused command health endpoint must reject")
 	}
-	if effects != 0 || len(sink.Receipts) != 1 || sink.Receipts[0].Kind != "launch_rejected" || sink.Receipts[0].HookCode != string(harness.HookCodeUnavailable) {
+	if effects != 0 || len(sink.Receipts) < 1 {
 		t.Fatalf("command incident rejection effects=%d receipts=%+v", effects, sink.Receipts)
+	}
+	var rejection Receipt
+	for _, receipt := range sink.Receipts {
+		if receipt.Kind == "launch_rejected" {
+			rejection = receipt
+			break
+		}
+	}
+	if rejection.Kind != "launch_rejected" || rejection.HookCode != string(harness.HookCodeUnavailable) || !strings.HasPrefix(rejection.HookName, "claude:") || len(rejection.HookName) < len("claude:")+64 || rejection.PolicyRevision == "" {
+		t.Fatalf("rejection attribution lost full digest/revision: %+v", sink.Receipts)
 	}
 }
 
