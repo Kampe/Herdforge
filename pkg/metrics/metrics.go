@@ -609,12 +609,16 @@ func (m *MetricsExporter) RecordTransitionObservation(start, end time.Time, tran
 		return errors.New("conflicting transition observation")
 	}
 	if invalidReason != "" {
-		m.slo = TransitionSLO{ObservedAt: now, Sequence: sequence, Invalid: true, InvalidReason: invalidReason}
+		m.slo.ObservedAt, m.slo.Sequence = now, sequence
+		m.slo.LastLatency, m.slo.LastFailed = 0, false
+		m.slo.Invalid, m.slo.InvalidReason = true, invalidReason
 		m.mu.Unlock()
 		return errors.New("transition latency is invalid or unbounded")
 	}
 	if !failed && m.slo.TotalLatency > maxSignalAge-latency {
-		m.slo = TransitionSLO{ObservedAt: now, Sequence: sequence, Invalid: true, InvalidReason: "aggregate_overflow"}
+		m.slo.ObservedAt, m.slo.Sequence = now, sequence
+		m.slo.LastLatency, m.slo.LastFailed = 0, false
+		m.slo.Invalid, m.slo.InvalidReason = true, "aggregate_overflow"
 		m.mu.Unlock()
 		return errors.New("transition latency total exceeds bounded maximum")
 	}
@@ -753,18 +757,18 @@ func (m *MetricsExporter) validateStateLocked(state persistedState, now time.Tim
 	if state.Signals.DeadProvider && dependencyState(state.Health, "provider") == DependencyHealthy {
 		return errors.New("metrics state contradicts provider health")
 	}
+	if state.SLO.Completed > state.SLO.Attempts || state.SLO.Failed > state.SLO.Attempts || state.SLO.Completed+state.SLO.Failed != state.SLO.Attempts {
+		return errors.New("invalid metrics transition totals")
+	}
+	if state.SLO.TotalLatency < 0 || state.SLO.Completed == 0 && state.SLO.TotalLatency != 0 || state.SLO.TotalLatency > maxSignalAge {
+		return errors.New("invalid metrics transition latency")
+	}
 	if state.SLO.Invalid {
-		if state.SLO.Attempts != 0 || state.SLO.Completed != 0 || state.SLO.Failed != 0 || state.SLO.TotalLatency != 0 || (state.SLO.InvalidReason != "latency" && state.SLO.InvalidReason != "aggregate_overflow") || !freshAt(state.SLO.ObservedAt, now, m.thresholds.SLOMaxAge) {
+		if (state.SLO.InvalidReason != "latency" && state.SLO.InvalidReason != "aggregate_overflow") || !freshAt(state.SLO.ObservedAt, now, m.thresholds.SLOMaxAge) {
 			return errors.New("invalid metrics transition tombstone")
 		}
 	} else {
-		if state.SLO.Attempts == 0 && !state.SLO.ObservedAt.IsZero() || state.SLO.Completed > state.SLO.Attempts || state.SLO.Failed > state.SLO.Attempts || state.SLO.Completed+state.SLO.Failed != state.SLO.Attempts {
-			return errors.New("invalid metrics transition totals")
-		}
-		if state.SLO.TotalLatency < 0 || state.SLO.Completed == 0 && state.SLO.TotalLatency != 0 || state.SLO.TotalLatency > maxSignalAge {
-			return errors.New("invalid metrics transition latency")
-		}
-		if state.SLO.Attempts > 0 && !freshAt(state.SLO.ObservedAt, now, m.thresholds.SLOMaxAge) {
+		if state.SLO.Attempts == 0 && !state.SLO.ObservedAt.IsZero() || state.SLO.Attempts > 0 && !freshAt(state.SLO.ObservedAt, now, m.thresholds.SLOMaxAge) {
 			return errors.New("invalid metrics transition timestamp")
 		}
 	}
