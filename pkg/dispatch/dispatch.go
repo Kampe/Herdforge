@@ -153,15 +153,28 @@ type Dispatcher struct {
 	Herdr HerdrLauncher
 	// PromptVerifyTimeout overrides the delivery poll window.
 	PromptVerifyTimeout time.Duration
+
+	// health projects BLOCKED(provider_timeout) for board calls (FAC-150).
+	health dispatchHealth
 }
 
 func NewDispatcher(cfg *config.Config, tp provider.TaskProvider, wm *worktree.WorktreeManager) *Dispatcher {
-	return &Dispatcher{
+	d := &Dispatcher{
 		Config:       cfg,
 		TaskProvider: tp,
 		Worktree:     liveWorktree{m: wm},
 		Herdr:        LiveHerdr{},
+		health:       dispatchHealth{state: ProviderOK},
 	}
+	if tp != nil && cfg != nil {
+		g, l, m, c, r, err := cfg.TaskProvider.Deadlines.Resolved()
+		if err == nil {
+			provider.ApplyDeadlines(tp, provider.DeadlinesFromParts(g, l, m, c, r))
+		} else {
+			provider.ApplyDeadlines(tp, provider.DefaultDeadlines())
+		}
+	}
+	return d
 }
 
 func (d *Dispatcher) launcher() HerdrLauncher {
@@ -230,10 +243,10 @@ func (d *Dispatcher) Dispatch(ctx context.Context, opts DispatchOptions) (*Dispa
 		return nil, err
 	}
 
-	// 1. Fetch ticket from Kaneo
-	tasks, err := d.TaskProvider.ListTasks(ctx, d.Config.TaskProvider.ProjectID, "")
+	// 1. Fetch ticket from Kaneo (bounded context + health observe, FAC-150)
+	tasks, err := d.listTasksBound(ctx, d.Config.TaskProvider.ProjectID, "")
 	if err != nil {
-		return nil, fmt.Errorf("failed to list tasks: %w", err)
+		return nil, formatBoardErr("failed to list tasks", err)
 	}
 
 	var task *provider.Task
@@ -303,9 +316,9 @@ func (d *Dispatcher) Dispatch(ctx context.Context, opts DispatchOptions) (*Dispa
 	}
 
 	// 4. Flip ticket to in-progress (partial: compensator marks Recovering on later failure)
-	if err := d.TaskProvider.UpdateStatus(ctx, task.ID, "in-progress"); err != nil {
+	if err := d.updateStatusBound(ctx, task.ID, "in-progress"); err != nil {
 		return nil, d.failWithCompensate(ctx, task.Ref, "board_status_failed",
-			fmt.Errorf("failed to update ticket status: %w", err))
+			formatBoardErr("failed to update ticket status", err))
 	}
 	if err := d.record(ctx, StepRecord{
 		TicketRef: task.Ref,
@@ -321,9 +334,9 @@ func (d *Dispatcher) Dispatch(ctx context.Context, opts DispatchOptions) (*Dispa
 	// 5. Comment with actual Git branch + base (not a fictional name)
 	comment := fmt.Sprintf("Dispatched to worktree %s on branch %s (base %s anchor %s)",
 		wtInfo.Path, branch, wtInfo.BaseSHA, wtInfo.AnchorRef)
-	if err := d.TaskProvider.AddComment(ctx, task.ID, comment); err != nil {
+	if err := d.addCommentBound(ctx, task.ID, comment); err != nil {
 		return nil, d.failWithCompensate(ctx, task.Ref, "board_comment_failed",
-			fmt.Errorf("failed to add comment: %w", err))
+			formatBoardErr("failed to add comment", err))
 	}
 	if err := d.record(ctx, StepRecord{
 		TicketRef: task.Ref,
