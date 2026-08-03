@@ -731,7 +731,11 @@ func (r *SurfaceRouter) Decide(req LaunchRequest) (*LaunchDecision, error) {
 			best.probeKey = ProbeKey(best.provider, model)
 		}
 	}
-
+	if req.Role == RoleWorker || req.Role == RoleForgeSmith || req.Role == RoleRecovery {
+		if best.provider != "codex" || model != "gpt-5.6-luna" || effort != "medium" || shape != "implementation" {
+			return nil, fmt.Errorf("%w: worker/forge-smith/recovery final tuple must remain codex/gpt-5.6-luna/medium implementation", ErrWorkerPolicy)
+		}
+	}
 	// Final coherence re-check (mutation-safe).
 	if isReviewer {
 		if best.family == "" || best.family == req.AuthorFamily {
