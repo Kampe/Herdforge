@@ -153,13 +153,14 @@ func (k *KaneoProvider) ListTasks(ctx context.Context, projectID string, status 
 	}
 
 	if k.UseCLI {
-		// Terminate only on EMPTY page (or duplicate page); short pages continue.
+		// Terminate only on EMPTY page; short pages continue. Duplicate pages
+		// and the page cap without empty termination are hard errors.
 		// Server may cap below --limit (observed 99/100), so short-page stop
 		// hides later cards (FAC-106 / board-done regressions).
 		const pageSize = 100
 		var all []kaneoTaskDTO
 		acc := NewPageAccumulator()
-		for page := 1; page <= 50; page++ { // ponytail: 5000-card ceiling
+		for page := 1; page <= DefaultMaxListPages; page++ {
 			args := []string{"task", "list", "--project", projectID, "--json",
 				"--limit", fmt.Sprint(pageSize), "--page", fmt.Sprint(page)}
 			if status != "" {
@@ -187,12 +188,15 @@ func (k *KaneoProvider) ListTasks(ctx context.Context, projectID string, status 
 				all = append(all, d)
 				fresh++
 			}
-			switch DecidePagination(len(dtos), fresh) {
-			case PageStopEmpty, PageStopDuplicate:
+			dec := DecidePagination(len(dtos), fresh)
+			switch dec {
+			case PageStopEmpty:
 				return filterTasks(all, status), nil
+			case PageStopDuplicate:
+				return nil, fmt.Errorf("kaneo task list (page %d): %w", page, ErrDuplicatePage)
 			}
 		}
-		return filterTasks(all, status), nil
+		return nil, fmt.Errorf("kaneo task list: %w (maxPages=%d)", ErrPaginationCap, DefaultMaxListPages)
 	}
 
 	url := fmt.Sprintf("%s/api/task?projectId=%s", k.APIURL, projectID)

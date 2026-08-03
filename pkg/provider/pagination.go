@@ -2,8 +2,14 @@ package provider
 
 import "fmt"
 
+// DefaultMaxListPages is the safety ceiling for multi-page listing loops.
+// Hitting this cap without observing an empty page is a hard error.
+const DefaultMaxListPages = 50
+
 // PageDecision is the pagination control signal for multi-page listing.
 // Termination is EMPTY-page based: a short-but-nonempty page must continue.
+// Successful listing requires PageStopEmpty; PageStopDuplicate and the page
+// cap are hard errors (incomplete enumeration is not success).
 type PageDecision int
 
 const (
@@ -12,14 +18,15 @@ const (
 	// PageStopEmpty means the page had zero items — definitive end of listing.
 	PageStopEmpty
 	// PageStopDuplicate means the page added no new IDs (server repeating a page).
+	// Callers must treat this as ErrDuplicatePage, not a successful soft stop.
 	PageStopDuplicate
 )
 
 // DecidePagination chooses the next pagination action for a received page.
 //
 // Rules (fail-closed listing completeness):
-//   - empty page (pageLen == 0) → stop; never treat short page as terminal
-//   - page with only already-seen IDs (freshCount == 0) → stop (duplicate page)
+//   - empty page (pageLen == 0) → PageStopEmpty (only successful termination)
+//   - page with only already-seen IDs (freshCount == 0) → PageStopDuplicate (hard error)
 //   - otherwise continue, even when pageLen < pageSize
 func DecidePagination(pageLen, freshCount int) PageDecision {
 	if pageLen == 0 {
@@ -29,6 +36,20 @@ func DecidePagination(pageLen, freshCount int) PageDecision {
 		return PageStopDuplicate
 	}
 	return PageContinue
+}
+
+// PaginationTerminalError maps a page decision to a hard error when listing
+// must not succeed. PageStopEmpty returns nil (success). PageStopDuplicate
+// returns ErrDuplicatePage. PageContinue returns nil so the caller loops.
+func PaginationTerminalError(d PageDecision) error {
+	switch d {
+	case PageStopEmpty:
+		return nil
+	case PageStopDuplicate:
+		return ErrDuplicatePage
+	default:
+		return nil
+	}
 }
 
 // PageAccumulator deduplicates items across pages by ID and reports how many
@@ -81,7 +102,10 @@ func (a *PageAccumulator) IngestPage(ids []string) (fresh int, decision PageDeci
 	return fresh, DecidePagination(len(ids), fresh)
 }
 
-// ErrDuplicatePage is returned when a full page contributes zero new IDs and
-// the caller elects to treat that as a hard anomaly rather than soft stop.
-// Soft stop (PageStopDuplicate without error) is the default for listing.
-var ErrDuplicatePage = fmt.Errorf("provider pagination: duplicate page with no new items")
+// ErrDuplicatePage is returned when a non-empty page contributes zero new IDs
+// without empty-page termination — incomplete listing, fail closed.
+var ErrDuplicatePage = fmt.Errorf("provider pagination: non-empty duplicate page without empty-page termination")
+
+// ErrPaginationCap is returned when DefaultMaxListPages (or the caller's cap)
+// is exhausted without observing an empty page.
+var ErrPaginationCap = fmt.Errorf("provider pagination: page cap reached without empty-page termination")

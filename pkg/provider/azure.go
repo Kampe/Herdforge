@@ -151,9 +151,11 @@ func (a *AzureDevOpsProvider) ListTasks(ctx context.Context, projectID string, s
 	var tasks []*Task
 	for _, item := range wiqlResp.WorkItems {
 		t, err := a.GetTask(ctx, fmt.Sprintf("%d", item.ID))
-		if err == nil {
-			tasks = append(tasks, t)
+		if err != nil {
+			// Fail-closed: partial hydration is not success.
+			return nil, fmt.Errorf("azure ListTasks hydrate work item %d: %w", item.ID, err)
 		}
+		tasks = append(tasks, t)
 	}
 
 	return tasks, nil

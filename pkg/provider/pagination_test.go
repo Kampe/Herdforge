@@ -1,6 +1,7 @@
 package provider
 
 import (
+	"errors"
 	"fmt"
 	"testing"
 )
@@ -26,6 +27,22 @@ func TestDecidePagination_EmptyNotShort(t *testing.T) {
 	// server-capped page of 99 would hide the tail. Prove short != empty.
 	if DecidePagination(99, 99) == PageStopEmpty {
 		t.Fatal("short page must not equal empty-page termination")
+	}
+}
+
+func TestPaginationTerminalError_FailClosed(t *testing.T) {
+	if err := PaginationTerminalError(PageStopEmpty); err != nil {
+		t.Fatalf("empty termination must succeed: %v", err)
+	}
+	if err := PaginationTerminalError(PageStopDuplicate); !errors.Is(err, ErrDuplicatePage) {
+		t.Fatalf("duplicate must hard-error: %v", err)
+	}
+	if err := PaginationTerminalError(PageContinue); err != nil {
+		t.Fatalf("continue is not terminal: %v", err)
+	}
+	// Non-vacuity: success path is only empty, not "any stop".
+	if PaginationTerminalError(PageStopDuplicate) == nil {
+		t.Fatal("duplicate must not be treated as successful termination")
 	}
 }
 

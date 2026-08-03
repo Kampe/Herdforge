@@ -101,11 +101,12 @@ func (g *GitHubProvider) ListTasks(ctx context.Context, projectID string, status
 		stateQuery = "closed"
 	}
 
-	// Paginate until empty page (GitHub default page size 30; short page continues).
+	// Paginate until empty page (short page continues). Duplicate page or
+	// page-cap without empty termination is a hard error.
 	const pageSize = 100
 	acc := NewPageAccumulator()
 	var tasks []*Task
-	for page := 1; page <= 50; page++ {
+	for page := 1; page <= DefaultMaxListPages; page++ {
 		url := fmt.Sprintf("https://api.github.com/repos/%s/%s/issues?state=%s&per_page=%d&page=%d",
 			g.Owner, g.Repo, stateQuery, pageSize, page)
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
@@ -141,12 +142,15 @@ func (g *GitHubProvider) ListTasks(ctx context.Context, projectID string, status
 			tasks = append(tasks, g.mapIssue(dto))
 			fresh++
 		}
-		switch DecidePagination(len(dtos), fresh) {
-		case PageStopEmpty, PageStopDuplicate:
+		dec := DecidePagination(len(dtos), fresh)
+		switch dec {
+		case PageStopEmpty:
 			return tasks, nil
+		case PageStopDuplicate:
+			return nil, fmt.Errorf("github ListTasks (page %d): %w", page, ErrDuplicatePage)
 		}
 	}
-	return tasks, nil
+	return nil, fmt.Errorf("github ListTasks: %w (maxPages=%d)", ErrPaginationCap, DefaultMaxListPages)
 }
 
 func (g *GitHubProvider) ClaimTask(ctx context.Context, taskID string, role string) error {

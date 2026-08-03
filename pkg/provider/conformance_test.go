@@ -356,3 +356,125 @@ exit 0
 		t.Fatalf("expected *ProviderError in chain, got %T: %v", err, err)
 	}
 }
+
+// Review reject FAC-124 #1: non-empty duplicate page must hard-fail (not soft success).
+func TestConformance_Pagination_DuplicatePageHardError(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("PATH shell-stub test is POSIX-only")
+	}
+	dir := t.TempDir()
+	// Page 1: one task. Page 2+: same task again (non-empty, zero fresh).
+	stub := `#!/bin/sh
+echo '[{"id":"id-1","ref":"FAC-1","title":"t","status":"to-do","priority":"low","projectId":"p1","labels":[]}]'
+`
+	if err := os.WriteFile(filepath.Join(dir, "kaneo"), []byte(stub), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	kp := NewKaneoProvider("", "p1", true)
+	tasks, err := kp.ListTasks(context.Background(), "p1", "")
+	if err == nil {
+		t.Fatalf("duplicate non-empty page must hard-fail, got %d tasks", len(tasks))
+	}
+	if !errors.Is(err, ErrDuplicatePage) {
+		t.Fatalf("want ErrDuplicatePage, got %v", err)
+	}
+	// Non-vacuity: empty-terminated listing still succeeds.
+	emptyOK := `#!/bin/sh
+page=1
+prev=""
+for a in "$@"; do
+  if [ "$prev" = "--page" ]; then page="$a"; fi
+  prev="$a"
+done
+if [ "$page" = "1" ]; then
+  echo '[{"id":"id-1","ref":"FAC-1","title":"t","status":"to-do","priority":"low","projectId":"p1","labels":[]}]'
+else
+  echo '[]'
+fi
+`
+	if err := os.WriteFile(filepath.Join(dir, "kaneo"), []byte(emptyOK), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	tasks, err = kp.ListTasks(context.Background(), "p1", "")
+	if err != nil || len(tasks) != 1 {
+		t.Fatalf("empty termination must succeed: tasks=%d err=%v", len(tasks), err)
+	}
+}
+
+// Review reject FAC-124 #1: page cap without empty termination must hard-fail.
+func TestConformance_Pagination_CapWithoutEmptyHardError(t *testing.T) {
+	// GitHub: every page returns a unique issue → never empty within DefaultMaxListPages.
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		page := r.URL.Query().Get("page")
+		if page == "" {
+			page = "1"
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		// Unique number per page so freshCount > 0 always.
+		fmt.Fprintf(w, `[{"number":%s,"title":"t","body":"","state":"open","labels":[],"created_at":"2026-08-01T12:00:00Z"}]`, page)
+	}))
+	defer server.Close()
+
+	u, _ := url.Parse(server.URL)
+	gp := NewGitHubProvider("tok", "o", "r")
+	gp.Client = &http.Client{Transport: &customTripper{targetURL: u}}
+
+	tasks, err := gp.ListTasks(context.Background(), "", "open")
+	if err == nil {
+		t.Fatalf("page cap without empty must hard-fail, got %d tasks", len(tasks))
+	}
+	if !errors.Is(err, ErrPaginationCap) {
+		t.Fatalf("want ErrPaginationCap, got %v", err)
+	}
+	// Non-vacuity: empty on page 2 still succeeds (see TestConformance_GitHub_PaginationEmptyPage).
+}
+
+// Review reject FAC-124 #2: Azure ListTasks must not swallow GetTask hydration errors.
+func TestConformance_Azure_ListTasksHydrationErrorPropagates(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.URL.Path == "/org/proj/_apis/wit/wiql":
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte(`{"workItems":[{"id":1},{"id":2}]}`))
+		case r.URL.Path == "/org/proj/_apis/wit/workitems/1":
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte(`{
+				"id": 1,
+				"fields": {
+					"System.Title": "ok",
+					"System.Description": "",
+					"System.State": "Active",
+					"System.WorkItemType": "Task",
+					"Microsoft.VSTS.Common.Priority": 2,
+					"System.CreatedDate": "2026-08-01T12:00:00Z"
+				}
+			}`))
+		case r.URL.Path == "/org/proj/_apis/wit/workitems/2":
+			// Hydration failure for second item.
+			w.WriteHeader(http.StatusInternalServerError)
+			w.Write([]byte(`{"error":"boom"}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer ts.Close()
+
+	ap := NewAzureDevOpsProvider(ts.URL+"/org", "proj", "pat")
+	tasks, err := ap.ListTasks(context.Background(), "proj", "")
+	if err == nil {
+		t.Fatalf("partial hydration must fail, got %d tasks", len(tasks))
+	}
+	if !strings.Contains(err.Error(), "hydrate") && !strings.Contains(err.Error(), "2") {
+		t.Logf("error: %v", err)
+	}
+	// Non-vacuity: when all items hydrate, ListTasks succeeds (covered by
+	// TestAzureDevOpsProvider_GetTaskAndListTasks). Prove we don't return the
+	// partial first item on error.
+	if len(tasks) != 0 {
+		t.Fatalf("on hydrate error must return nil tasks, got %d", len(tasks))
+	}
+}
