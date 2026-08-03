@@ -114,6 +114,8 @@ func ValidateLaunch(
 	}
 
 	// Authoritative full project closure for cycle detection + revision.
+	// Fence reuses the first snapshot; post-side-effect checks do NOT re-fanout
+	// the whole board (AssertIncidentEdgesFresh is O(1) on the target).
 	snap, err := store.SnapshotGraph(ctx)
 	if err != nil {
 		return nil, &BlockedError{
@@ -125,6 +127,18 @@ func ValidateLaunch(
 		return nil, &BlockedError{
 			Ref: taskRef, Code: "stale",
 			Reason: "full graph snapshot returned nil",
+		}
+	}
+
+	// Post-selection TOCTOU on the launch target: one ListRelations, not N.
+	if selectionRevision != "" {
+		if ps, ok := store.(*ProviderStore); ok {
+			if ferr := ps.AssertIncidentEdgesFresh(ctx, taskRef, taskID, snap); ferr != nil {
+				return nil, &BlockedError{
+					Ref: taskRef, Code: "toctou",
+					Reason: ferr.Error(),
+				}
+			}
 		}
 	}
 

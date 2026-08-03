@@ -4,10 +4,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
-	"os"
 	"sort"
 	"strings"
 	"sync"
@@ -58,9 +58,10 @@ func (k *KaneoProvider) ListRelations(ctx context.Context, taskID string) ([]Rel
 }
 
 func (k *KaneoProvider) listRelationsOnce(ctx context.Context, taskID string) ([]Relation, error) {
-	// Prefer HTTP when API is configured (bulk snapshot fan-out). UseCLI single
-	// calls still go through CLI for ordinary per-task ops unless forceHTTP.
-	if k.UseCLI && !k.preferHTTPForRelations() {
+	// Per-task ListRelations: CLI when UseCLI (single-card ops are fine).
+	// Project graph snapshot NEVER uses this CLI path for N-way fan-out —
+	// ListProjectRelations requires HTTP credentials and fails closed without them.
+	if k.UseCLI {
 		args := []string{"task", "rel", "list", taskID, "--json"}
 		if k.ProjectID != "" {
 			args = append(args, "--project", k.ProjectID)
@@ -73,7 +74,6 @@ func (k *KaneoProvider) listRelationsOnce(ctx context.Context, taskID string) ([
 			}
 			return nil, fmt.Errorf("kaneo task rel list: %w", err)
 		}
-		// Reject 200-shaped error objects even when CLI exits 0.
 		if pe := kaneoRelationErrorBody(res.Stdout); pe != nil {
 			pe.Provider = "kaneo"
 			pe.Op = "ListRelations"
@@ -94,67 +94,30 @@ func (k *KaneoProvider) listRelationsOnce(ctx context.Context, taskID string) ([
 		return out, nil
 	}
 
-	// Live Kaneo path: GET /api/task-relation/{taskId}
-	url := fmt.Sprintf("%s/api/task-relation/%s", strings.TrimRight(k.APIURL, "/"), taskID)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		return nil, err
-	}
-	k.authorizeKaneo(req)
-	resp, err := k.httpClient().Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
-	}
-	if pe := kaneoRelationErrorBody(body); pe != nil {
-		pe.Provider = "kaneo"
-		pe.Op = "ListRelations"
-		pe.StatusCode = resp.StatusCode
-		return nil, pe
-	}
-	// Synthesize a Response-like decode via DecodeJSONBytes (status + body).
-	var dtos []kaneoRelationDTO
-	if err := DecodeJSONBytes(resp.StatusCode, body, &dtos); err != nil {
-		if pe, ok := err.(*ProviderError); ok {
-			pe.Provider = "kaneo"
-			pe.Op = "ListRelations"
-		}
-		return nil, err
-	}
-	out := make([]Relation, 0, len(dtos))
-	for _, d := range dtos {
-		out = append(out, d.toRelation())
-	}
-	return out, nil
+	// HTTP mode: GET /api/task-relation/{taskId}
+	return k.listRelationsHTTPOnly(ctx, taskID)
 }
 
-// preferHTTPForRelations is true when bulk/HTTP credentials are available.
-// Project graph snapshots force HTTP fan-out via listRelationsHTTPOnly.
+// preferHTTPForRelations is true when origin-bound HTTP credentials exist for
+// this provider's APIURL (profile origin match or explicit key bound to APIURL).
+// Project graph snapshot requires this — CLI fan-out is never used silently.
 func (k *KaneoProvider) preferHTTPForRelations() bool {
 	if k == nil || strings.TrimSpace(k.APIURL) == "" {
 		return false
 	}
-	key := strings.TrimSpace(k.APIKey)
-	if key == "" {
-		key = strings.TrimSpace(os.Getenv("KANEO_API_KEY"))
-	}
-	return key != ""
+	return k.credentialForAPIURL() != ""
 }
 
+// ErrGraphCredentialsRequired is returned when ListProjectRelations would
+// otherwise fall through to N CLI subprocesses (use_cli without API key).
+var ErrGraphCredentialsRequired = errors.New("kaneo: project graph snapshot requires HTTP credentials (KANEO_API_KEY or kaneo profile api_key); refusing silent CLI relation fan-out")
+
 func (k *KaneoProvider) listRelationsHTTPOnly(ctx context.Context, taskID string) ([]Relation, error) {
-	// Temporarily treat as non-CLI for this call by using HTTP path directly.
-	saved := k.UseCLI
-	// UseHTTP path: preferHTTPForRelations or explicit bulk.
-	if !k.preferHTTPForRelations() {
-		// Concurrent CLI fallback (still bounded by caller semaphore).
-		return k.listRelationsOnce(ctx, taskID)
+	// Single-task HTTP list: credentials optional (authorize when present).
+	// Project fan-out credentials are enforced in ListProjectRelations only.
+	if k == nil || strings.TrimSpace(k.APIURL) == "" {
+		return nil, fmt.Errorf("kaneo listRelationsHTTP: api_url required")
 	}
-	// Force HTTP: call with UseCLI false without mutating shared state races —
-	// use dedicated HTTP body.
 	url := fmt.Sprintf("%s/api/task-relation/%s", strings.TrimRight(k.APIURL, "/"), taskID)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
@@ -184,20 +147,26 @@ func (k *KaneoProvider) listRelationsHTTPOnly(ctx context.Context, taskID string
 	for _, d := range dtos {
 		out = append(out, d.toRelation())
 	}
-	_ = saved
 	return out, nil
 }
 
-// ListProjectRelations is the bulk project graph snapshot (FAC-159).
-// One ListTasks for IDs + bounded concurrent relation fetches (HTTP when
-// credentials exist, concurrent CLI otherwise). Dual-end agreement required.
-// Cancels outstanding workers on first error or ctx cancel.
+// ListProjectRelations builds the project relation multiset for SnapshotGraph.
+//
+// This is NOT an O(1) single-RPC bulk endpoint (Kaneo has none). It is a
+// credentialed, deadline-bounded concurrent HTTP fan-out to
+// /api/task-relation/{id} with dual-end agreement. Without HTTP credentials it
+// FAILS CLOSED — never silently spawns N kaneo CLI subprocesses (FAC-159
+// audit vr8a7lvxx21e6shmb1z02atj).
 func (k *KaneoProvider) ListProjectRelations(ctx context.Context, projectID string) ([]Relation, error) {
 	if projectID == "" {
 		projectID = k.ProjectID
 	}
 	if projectID == "" {
 		return nil, fmt.Errorf("kaneo ListProjectRelations: project id required")
+	}
+	// Credential preflight BEFORE any ListTasks / fan-out work.
+	if !k.preferHTTPForRelations() {
+		return nil, fmt.Errorf("%w (use_cli=%v api_url=%q)", ErrGraphCredentialsRequired, k.UseCLI, k.APIURL)
 	}
 	dls := k.deadlines()
 	ctx, cancel := WithOpDeadline(ctx, dls, OpList)
@@ -535,6 +504,7 @@ func (k *KaneoProvider) createRelationOnce(ctx context.Context, sourceID, target
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	k.authorizeKaneo(req)
 	resp, err := k.httpClient().Do(req)
 	if err != nil {
 		return nil, err
@@ -684,6 +654,7 @@ func (k *KaneoProvider) deleteRelationOnce(ctx context.Context, relationID strin
 	if err != nil {
 		return err
 	}
+	k.authorizeKaneo(req)
 	resp, err := k.httpClient().Do(req)
 	if err != nil {
 		return err
