@@ -34,16 +34,16 @@ import (
 //     protection and session teardown (only after Consumed readback).
 
 type Integration struct {
-	Harvester        *Harvester
-	Verifier         Verifier                // optional; nil skips test gate
-	Dispatcher       Dispatcher              // required for board-complete
-	Ledger           *reviewledger.Ledger    // required for Admit review gate
-	AdmissionSource  AdmissionSource         // required; supplies caller-asserted Admit opts
-	SessionManager   SessionManager          // optional; nil skips session teardown
-	RepoRoot         string
-	LockDir          string
-	MaxMergeAge      time.Duration
-	DryRun           bool
+	Harvester       *Harvester
+	Verifier        Verifier             // optional; nil skips test gate
+	Dispatcher      Dispatcher           // required for board-complete
+	Ledger          *reviewledger.Ledger // required for Admit review gate
+	AdmissionSource AdmissionSource      // required; supplies caller-asserted Admit opts
+	SessionManager  SessionManager       // optional; nil skips session teardown
+	RepoRoot        string
+	LockDir         string
+	MaxMergeAge     time.Duration
+	DryRun          bool
 }
 
 // AdmissionContext is the caller-asserted merge context bound into
