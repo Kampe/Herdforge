@@ -77,7 +77,15 @@ func NewMailbox(mailFile string) *Mailbox {
 
 // SendMessage appends a freshly-minted envelope to the mailbox.
 func (m *Mailbox) SendMessage(sender, recipient, subject, body string) (*Envelope, error) {
-	env := &Envelope{
+	env := newEnvelope(sender, recipient, subject, body)
+	if err := m.appendEnvelope(env); err != nil {
+		return nil, err
+	}
+	return env, nil
+}
+
+func newEnvelope(sender, recipient, subject, body string) *Envelope {
+	return &Envelope{
 		ID:        newID(),
 		Sender:    sender,
 		Recipient: recipient,
@@ -86,10 +94,6 @@ func (m *Mailbox) SendMessage(sender, recipient, subject, body string) (*Envelop
 		Read:      false,
 		Timestamp: time.Now(),
 	}
-	if err := m.appendEnvelope(env); err != nil {
-		return nil, err
-	}
-	return env, nil
 }
 
 // appendEnvelope reserves the next monotonic sequence number for this
@@ -469,14 +473,16 @@ func WithRedis(client RedisClient, channelPrefix string) MessageBrokerOption {
 
 // MessageBroker wraps a local Mailbox with optional Redis pub/sub syncing.
 type MessageBroker struct {
-	mb            *Mailbox
-	redis         RedisClient
-	channelPrefix string
-	ctx           context.Context
-	cancel        context.CancelFunc
-	wg            sync.WaitGroup
-	errCh         chan error
-	droppedErrs   atomic.Int64
+	mb             *Mailbox
+	redis          RedisClient
+	channelPrefix  string
+	ctx            context.Context
+	cancel         context.CancelFunc
+	wg             sync.WaitGroup
+	errCh          chan error
+	droppedErrs    atomic.Int64
+	persistFails   atomic.Int64
+	lastPersistErr atomic.Value // holds error; see PersistenceFailed
 }
 
 func NewMessageBroker(mailbox *Mailbox, opts ...MessageBrokerOption) *MessageBroker {
@@ -491,13 +497,19 @@ func NewMessageBroker(mailbox *Mailbox, opts ...MessageBrokerOption) *MessageBro
 		opt(b)
 	}
 	if b.redis != nil {
+		// Subscribe before replaying the outbox: an entry that never made it
+		// to the local mailbox before the last crash (see SendMessage) can
+		// only be recovered via this broker's own self-echo, so the pattern
+		// subscription must already be registered before FlushOutbox
+		// publishes it — otherwise the replay publish has no listener and
+		// the message is lost a second time.
+		b.startSubscriber()
 		// A restarted process is exactly when outbox replay matters most:
 		// any envelope durably appended locally before the last crash but
 		// never confirmed published gets another chance here.
 		if _, err := b.FlushOutbox(); err != nil {
 			b.reportErr(fmt.Errorf("startup outbox replay failed: %w", err))
 		}
-		b.startSubscriber()
 	}
 	return b
 }
@@ -541,10 +553,12 @@ func (b *MessageBroker) reportErr(err error) {
 }
 
 // persistDroppedErr durably appends an error that overflowed errCh to
-// <MailFile>.errors.jsonl. Best-effort at the disk-I/O layer (there's no
-// further fallback if the filesystem itself is failing), but every call
-// still increments droppedErrs so DroppedErrCount reflects reality even if
-// the disk write also fails.
+// <MailFile>.errors.jsonl. There's no further fallback if the filesystem
+// itself is failing, but that failure is never swallowed: it's recorded in
+// a durable, observable fail-closed health state (see PersistenceFailed) so
+// a caller can tell "the error was retained on disk" apart from "the error
+// and its retention record are both gone" instead of silently assuming the
+// former.
 func (b *MessageBroker) persistDroppedErr(err error) {
 	b.droppedErrs.Add(1)
 	entry := struct {
@@ -553,36 +567,83 @@ func (b *MessageBroker) persistDroppedErr(err error) {
 	}{Error: err.Error(), Timestamp: time.Now()}
 	data, mErr := json.Marshal(entry)
 	if mErr != nil {
+		b.recordPersistFailure(mErr)
 		return
 	}
-	_ = b.mb.withFileLock(func() error {
+	writeErr := b.mb.withFileLock(func() error {
 		return appendLine(b.mb.MailFile+".errors.jsonl", data)
 	})
+	if writeErr != nil {
+		b.recordPersistFailure(writeErr)
+	}
 }
 
-// SendMessage durably appends locally first, then records a durable outbox
-// entry for the Redis fan-out BEFORE attempting to publish, so a publish
-// failure (Redis unreachable, or the process crashing before publish
-// confirms) never permanently loses the fan-out: the entry survives on
-// disk until FlushOutbox successfully replays it, including automatically
-// on the next NewMessageBroker (i.e. after a restart). A replay that
-// reaches Redis a second time for an already-published message is harmless
-// — every subscriber dedupes by envelope ID via Mailbox.appendEnvelope —
-// so at-least-once outbox delivery plus an idempotent consumer gives an
-// effectively-once result without needing a Redis-side ack (plain pub/sub
-// has none).
+func (b *MessageBroker) recordPersistFailure(err error) {
+	b.persistFails.Add(1)
+	b.lastPersistErr.Store(persistErrHolder{err: err})
+}
+
+// persistErrHolder lets lastPersistErr be stored in an atomic.Value: the
+// stored type must be consistent and non-nil, so a bare error interface
+// (which can be nil) doesn't work directly.
+type persistErrHolder struct{ err error }
+
+// PersistenceFailed reports whether an error dropped by Errs() has ever
+// failed to be durably retained on disk — the fail-closed signal that
+// error data has actually been lost, not just delayed.
+func (b *MessageBroker) PersistenceFailed() bool {
+	return b.persistFails.Load() > 0
+}
+
+// PersistenceFailureCount returns how many times persistDroppedErr's own
+// durable write has failed.
+func (b *MessageBroker) PersistenceFailureCount() int64 {
+	return b.persistFails.Load()
+}
+
+// LastPersistenceError returns the most recent error encountered while
+// trying to durably retain a dropped error, or nil if persistence has never
+// failed.
+func (b *MessageBroker) LastPersistenceError() error {
+	h, _ := b.lastPersistErr.Load().(persistErrHolder)
+	return h.err
+}
+
+// SendMessage records a durable outbox entry for the Redis fan-out BEFORE
+// the local mailbox append, and the local append BEFORE attempting to
+// publish. This ordering closes the crash window a mailbox-first write left
+// open: if mailbox append happened first and a crash landed before the
+// outbox entry was written, the message was visible locally but its record
+// of needing Redis fan-out was gone forever — no restart could recover it.
+// With the outbox written first, a crash between the two durable writes
+// still leaves a durable outbox entry, and this broker's own PSubscribe
+// pattern includes its own publishes: FlushOutbox (retried automatically on
+// the next NewMessageBroker, i.e. after a restart) republishes it, the
+// self-echo lands back on b.mb.appendEnvelope, and the message is
+// recovered into the local mailbox — idempotently, since every subscriber
+// dedupes by envelope ID. A replay that reaches Redis a second time for an
+// already-published message is likewise harmless, so at-least-once outbox
+// delivery plus an idempotent consumer gives an effectively-once result
+// without needing a Redis-side ack (plain pub/sub has none).
 func (b *MessageBroker) SendMessage(sender, recipient, subject, body string) (*Envelope, error) {
-	env, err := b.mb.SendMessage(sender, recipient, subject, body)
-	if err != nil {
-		return nil, err
-	}
 	if b.redis == nil {
-		return env, nil
+		return b.mb.SendMessage(sender, recipient, subject, body)
 	}
 
+	env := newEnvelope(sender, recipient, subject, body)
 	channel := b.channelPrefix + "." + recipient
+
 	if err := b.addOutboxEntry(env, channel); err != nil {
-		return env, fmt.Errorf("failed to durably record outbox entry for %s: %w", env.ID, err)
+		return nil, fmt.Errorf("failed to durably record outbox entry for %s: %w", env.ID, err)
+	}
+
+	if err := b.mb.appendEnvelope(env); err != nil {
+		// The outbox entry is already durable, so the message isn't lost —
+		// FlushOutbox (or this broker's own subscription self-echo once
+		// publish succeeds) will still deliver it into the local mailbox.
+		// Still surface the immediate local-append failure to the caller.
+		b.reportErr(fmt.Errorf("local mailbox append failed for %s (outbox retains it): %w", env.ID, err))
+		return env, err
 	}
 
 	if err := b.publishOne(env, channel); err != nil {
@@ -714,13 +775,17 @@ func (b *MessageBroker) ReadInbox(recipient string) ([]*Envelope, error) {
 // via Mailbox.appendEnvelope, the same durable, deduplicating write path
 // SendMessage uses — so a broker's own publish echoing back through its
 // pattern subscription is a no-op, not a duplicate, and a message relayed
-// twice (Redis redelivery) is idempotent.
+// twice (Redis redelivery) is idempotent. PSubscribe is called synchronously
+// here, before startSubscriber returns, so a caller that calls FlushOutbox
+// immediately afterward (NewMessageBroker's startup replay) is guaranteed
+// the pattern is already registered and won't publish into the void.
 func (b *MessageBroker) startSubscriber() {
+	pattern := b.channelPrefix + ".*"
+	sub := b.redis.PSubscribe(b.ctx, pattern)
+
 	b.wg.Add(1)
 	go func() {
 		defer b.wg.Done()
-		pattern := b.channelPrefix + ".*"
-		sub := b.redis.PSubscribe(b.ctx, pattern)
 		defer sub.Close()
 		ch := sub.Channel()
 		for {
