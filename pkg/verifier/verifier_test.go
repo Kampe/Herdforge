@@ -706,6 +706,8 @@ const productionDetachedOnlyScript = `
 python3 -c '
 import os, sys
 path, target = sys.argv[1], sys.argv[2]
+# Ownership wrapper leaves FD5 open as the inherited lineage marker.
+# Do not close FD5 across setsid/double-fork — that is kill authority.
 # First fork + setsid: leave the original process group / session.
 if os.fork() > 0:
     os._exit(0)
@@ -714,9 +716,8 @@ os.setsid()
 # outside the original pgid and is not a session leader wait-edge.
 if os.fork() > 0:
     os._exit(0)
-# Open a descendant file under the candidate FIRST, then chdir AWAY so
-# directory-inode-only residual discovery cannot see cwd. Path residual must
-# find the open descendant FD (non-vacuous proof).
+# Open a descendant file under the candidate (path corroboration only),
+# then chdir away. Marker FD5 remains the lineage authority.
 out = open(target, "a", encoding="utf-8")
 os.chdir("/")
 with open(path, "w", encoding="utf-8") as f:
@@ -730,13 +731,14 @@ exit 0
 `
 
 // productionDetachedSessionScript: same-group background + real setsid residual
-// that chdirs away while retaining an open descendant FD under the candidate.
+// that retains FD5 marker lineage and chdirs away with an open descendant FD.
 // $1=sessionPid $2=writetarget $3=groupPid
 const productionDetachedSessionScript = `
 sh -c 'printf "%s\n" "$$" > "$1"; while true; do printf g >> "$2"; done' grpwriter "$3" "$2" </dev/null >/dev/null 2>&1 &
 python3 -c '
 import os, sys
 path, target = sys.argv[1], sys.argv[2]
+# Keep FD5 (inherited ownership marker) open across setsid/double-fork.
 if os.fork() > 0:
     os._exit(0)
 os.setsid()
@@ -930,29 +932,38 @@ func TestExecuteCancelAfterStartClosesProcessGroup(t *testing.T) {
 	}
 }
 
-// TestProcessesTouchingDirFindsChdirAwayOpenDescendant is the non-vacuous unit
-// proof that path residual ownership discovers a setsid writer that chdir'd
-// away from the candidate while retaining an open descendant file FD — not
-// directory-inode/cwd-only discovery.
-func TestProcessesTouchingDirFindsChdirAwayOpenDescendant(t *testing.T) {
+// TestMarkerLineageFindsSetsidChdirAwayWriter proves processesHoldingMarker
+// discovers a setsid writer that inherited the ownership marker FD, chdir'd
+// away, and still mutates a descendant file — lineage authority, not path.
+func TestMarkerLineageFindsSetsidChdirAwayWriter(t *testing.T) {
 	if _, err := exec.LookPath("python3"); err != nil {
-		t.Skip("python3 required for chdir-away residual fixture")
+		t.Skip("python3 required for marker lineage fixture")
 	}
+	marker, markerPath, err := createOwnershipMarker()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = marker.Close()
+		_ = os.Remove(markerPath)
+	})
 	dir := t.TempDir()
 	pidFile := filepath.Join(dir, "writer.pid")
 	target := filepath.Join(dir, "nested", "residue.log")
 	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	// Adversarial: setsid + double-fork, open descendant, chdir to /.
+	// Inherit marker as FD3 (ExtraFiles[0]); keep it open across setsid.
 	cmd := exec.Command("python3", "-c", `
 import os, sys, time
 path, target = sys.argv[1], sys.argv[2]
+# ExtraFiles[0] is FD 3 in the child — do not close it (lineage marker).
 if os.fork() > 0:
     os._exit(0)
 os.setsid()
 if os.fork() > 0:
     os._exit(0)
+# Retain marker FD (lineage) + open descendant (path corroboration only).
 out = open(target, "a", encoding="utf-8")
 os.chdir("/")
 with open(path, "w", encoding="utf-8") as f:
@@ -962,6 +973,7 @@ while True:
     out.flush()
     time.sleep(0.05)
 `, pidFile, target)
+	cmd.ExtraFiles = []*os.File{marker}
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
@@ -975,17 +987,9 @@ while True:
 	if err != nil {
 		t.Fatalf("writer ready: %v", err)
 	}
-	// Writer cwd is / — directory-inode-only residual would miss it.
-	if cwd, cerr := exec.Command("ps", "-o", "cwd=", "-p", strconv.Itoa(pid)).Output(); cerr == nil {
-		cwdS := strings.TrimSpace(string(cwd))
-		if cwdS != "" && cwdS != "/" && !strings.HasSuffix(cwdS, ":/") {
-			// Best-effort: some ps builds lack cwd=; do not fail the test.
-			t.Logf("writer cwd observed as %q (expected /)", cwdS)
-		}
-	}
-	toks, err := processesTouchingDir(dir)
+	toks, err := processesHoldingMarker(markerPath)
 	if err != nil {
-		t.Fatalf("processesTouchingDir: %v", err)
+		t.Fatalf("processesHoldingMarker: %v", err)
 	}
 	toks = filterResidualTokens(toks, -1)
 	found := false
@@ -996,16 +1000,64 @@ while True:
 		}
 	}
 	if !found {
-		t.Fatalf("path residual must find chdir-away writer pid %d holding open descendant under candidate; got %v", pid, toks)
+		t.Fatalf("marker lineage must find setsid writer pid %d holding inherited marker; got %v", pid, toks)
 	}
-	// Control plane must never appear in residual kill set.
 	excl := residualExcludePIDs()
 	for _, tok := range toks {
 		if _, bad := excl[tok.pid]; bad {
-			t.Fatalf("path residual must not include control-plane pid %d", tok.pid)
+			t.Fatalf("marker lineage must not include control-plane pid %d", tok.pid)
 		}
-		if tok.pid == os.Getpid() {
-			t.Fatalf("path residual must not include verifier self pid %d", tok.pid)
+	}
+}
+
+// TestUnrelatedPathContactWithoutMarkerIsNotLineage is the negative unit
+// control: an unrelated process that opens a descendant under the candidate
+// after the marker exists must NOT appear in processesHoldingMarker.
+func TestUnrelatedPathContactWithoutMarkerIsNotLineage(t *testing.T) {
+	if _, err := exec.LookPath("python3"); err != nil {
+		t.Skip("python3 required")
+	}
+	marker, markerPath, err := createOwnershipMarker()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = marker.Close()
+		_ = os.Remove(markerPath)
+	})
+	dir := t.TempDir()
+	pidFile := filepath.Join(dir, "unrelated.pid")
+	target := filepath.Join(dir, "descendant.log")
+	// Unrelated: opens descendant, no marker FD inherited.
+	cmd := exec.Command("python3", "-c", `
+import os, sys, time
+path, target = sys.argv[1], sys.argv[2]
+out = open(target, "a", encoding="utf-8")
+with open(path, "w", encoding="utf-8") as f:
+    f.write("%d\n" % os.getpid())
+while True:
+    out.write("u")
+    out.flush()
+    time.sleep(0.05)
+`, pidFile, target)
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+	})
+	pid, err := waitForChildReadyPID(pidFile, 5*time.Second)
+	if err != nil {
+		t.Fatalf("unrelated ready: %v", err)
+	}
+	toks, err := processesHoldingMarker(markerPath)
+	if err != nil {
+		t.Fatalf("processesHoldingMarker: %v", err)
+	}
+	for _, tok := range toks {
+		if tok.pid == pid {
+			t.Fatalf("unrelated path-contact pid %d must not appear in marker lineage", pid)
 		}
 	}
 }
@@ -1028,9 +1080,10 @@ func TestResidualExcludePIDsCoversSelfAndParent(t *testing.T) {
 
 // TestExecuteDetachedOnlySessionWriterBlocksAndReaps is the production-path
 // proof for adversarial setsid+double-fork residual writers that chdir away
-// while retaining an open descendant FD. Intermediate parents exit immediately;
-// grandchild leaves the original process group via setsid. Execute must BLOCKED
-// via path residual ownership and the writer must be gone without test teardown.
+// while retaining the inherited marker FD and an open descendant. Intermediate
+// parents exit immediately; grandchild leaves the original process group via
+// setsid. Execute must BLOCKED via marker lineage and the writer must be gone
+// without test teardown.
 func TestExecuteDetachedOnlySessionWriterBlocksAndReaps(t *testing.T) {
 	if _, err := exec.LookPath("python3"); err != nil {
 		t.Skip("python3 required for setsid residual writer fixture")
@@ -1052,6 +1105,60 @@ func TestExecuteDetachedOnlySessionWriterBlocksAndReaps(t *testing.T) {
 	}
 	// Production must have reaped the residual writer — no test teardown kill.
 	assertWriterGone(t, pidFile)
+}
+
+// TestExecuteUnrelatedPathContactSurvivesMarkedWriterReaped is the production
+// negative control: an unrelated process that starts after Execute begins and
+// opens a descendant under the candidate (no inherited marker) must SURVIVE,
+// while the marked setsid detached writer is reaped.
+func TestExecuteUnrelatedPathContactSurvivesMarkedWriterReaped(t *testing.T) {
+	if _, err := exec.LookPath("python3"); err != nil {
+		t.Skip("python3 required for setsid residual writer fixture")
+	}
+	dir := t.TempDir()
+	markedPidFile := filepath.Join(dir, "marked.pid")
+	unrelatedPidFile := filepath.Join(dir, "unrelated.pid")
+	writeTarget := filepath.Join(dir, "residue.log")
+	unrelatedTarget := filepath.Join(dir, "unrelated.log")
+	writeExecutable(t, filepath.Join(dir, "leave-detached-only"), "#!/bin/sh\n"+productionDetachedOnlyScript)
+
+	// Unrelated path-contact process: no marker, opens a descendant under dir.
+	unrelated := exec.Command("python3", "-c", `
+import os, sys, time
+path, target = sys.argv[1], sys.argv[2]
+out = open(target, "a", encoding="utf-8")
+with open(path, "w", encoding="utf-8") as f:
+    f.write("%d\n" % os.getpid())
+while True:
+    out.write("u")
+    out.flush()
+    time.sleep(0.05)
+`, unrelatedPidFile, unrelatedTarget)
+	if err := unrelated.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = unrelated.Process.Kill()
+		_ = unrelated.Wait()
+	})
+	unrelatedPID, err := waitForChildReadyPID(unrelatedPidFile, 5*time.Second)
+	if err != nil {
+		t.Fatalf("unrelated ready: %v", err)
+	}
+
+	result, err := NewVerifierArgs([]string{"./leave-detached-only", markedPidFile, writeTarget}).Execute(context.Background(), dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Outcome != OutcomeBLOCKED {
+		t.Fatalf("marked detached writer must BLOCKED, got %+v", result)
+	}
+	assertWriterGone(t, markedPidFile)
+
+	// Unrelated must still be live — path contact is not kill authority.
+	if err := syscall.Kill(unrelatedPID, 0); err != nil {
+		t.Fatalf("unrelated path-contact pid %d must survive Execute residual drain: %v", unrelatedPID, err)
+	}
 }
 
 // TestExecuteDetachedOnlyMutationOmittingFinalizeLeavesWriter proves the
@@ -1220,7 +1327,7 @@ func TestOwnedNeverReplacesTokenOnPIDReuse(t *testing.T) {
 		_ = cmd.Process.Kill()
 		_ = cmd.Wait()
 	})
-	owned, err := adoptOwnedCmd(cmd, nil, nil, "")
+	owned, err := adoptOwnedCmd(cmd, nil, nil, "", "", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1254,7 +1361,7 @@ func TestOwnedFreezeRejectsPostLeaderGroupAdoption(t *testing.T) {
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
-	owned, err := adoptOwnedCmd(cmd, nil, nil, "")
+	owned, err := adoptOwnedCmd(cmd, nil, nil, "", "", nil)
 	if err != nil {
 		t.Fatal(err)
 	}

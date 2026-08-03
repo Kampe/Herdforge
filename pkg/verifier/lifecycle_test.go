@@ -532,7 +532,7 @@ func TestFinalizeOwnedTreeMutationLeavesGrandchildAlive(t *testing.T) {
 		}
 	})
 
-	owned, err := adoptOwnedCmd(cmd, nil, nil, "")
+	owned, err := adoptOwnedCmd(cmd, nil, nil, "", "", nil)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -5,6 +5,6 @@ package verifier
 import "syscall"
 
 // applyOwnershipContainment is a no-op outside Linux. Darwin has no PID
-// namespace / subreaper equivalent; residual ownership uses candidate-path
-// open-file discovery (see processesTouchingDir) plus live-group drain.
+// namespace / subreaper equivalent; escaped-descendant residual ownership uses
+// the inherited marker FD (see processesHoldingMarker) plus live-group drain.
 func applyOwnershipContainment(attr *syscall.SysProcAttr) {}

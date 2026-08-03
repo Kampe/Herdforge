@@ -187,7 +187,8 @@ func (v *Verifier) execute(ctx context.Context, dir string, policy EnvironmentPo
 	}
 	// Two-phase ownership supervisor: start/done handshake + residual drain
 	// while the supervisor still owns the process group, then ack to exit.
-	cmd, statusR, statusW, ackR, ackW, prepErr := prepareOwnedCommand(ctx, commandPath, v.Argv[1:], dir, env)
+	// Marker FD (ExtraFiles FD5) is the unforgeable lineage for escaped writers.
+	cmd, statusR, statusW, ackR, ackW, marker, markerPath, prepErr := prepareOwnedCommand(ctx, commandPath, v.Argv[1:], dir, env)
 	if prepErr != nil {
 		output := []byte(prepErr.Error())
 		return &Result{
@@ -214,6 +215,10 @@ func (v *Verifier) execute(ctx context.Context, dir string, policy EnvironmentPo
 		_ = statusW.Close()
 		_ = ackR.Close()
 		_ = ackW.Close()
+		if marker != nil {
+			_ = marker.Close()
+			_ = os.Remove(markerPath)
+		}
 		output := []byte(err.Error())
 		return &Result{
 			Outcome:      OutcomeBLOCKED,
@@ -223,11 +228,11 @@ func (v *Verifier) execute(ctx context.Context, dir string, policy EnvironmentPo
 			Duration:     time.Since(started),
 		}, nil
 	}
-	// Parent keeps statusR + ackW; close child ends in parent.
+	// Parent keeps statusR + ackW + marker; close child-only ends in parent.
 	_ = statusW.Close()
 	_ = ackR.Close()
 
-	owned, adoptErr := adoptOwnedCmd(cmd, statusR, ackW, dir)
+	owned, adoptErr := adoptOwnedCmd(cmd, statusR, ackW, dir, markerPath, marker)
 	if adoptErr != nil {
 		var parts []string
 		parts = append(parts, "adopt owned cmd: "+adoptErr.Error())
@@ -236,6 +241,10 @@ func (v *Verifier) execute(ctx context.Context, dir string, policy EnvironmentPo
 		}
 		_, _ = io.WriteString(ackW, "go\n")
 		_ = ackW.Close()
+		if marker != nil {
+			_ = marker.Close()
+			_ = os.Remove(markerPath)
+		}
 		waitErr := cmd.Wait()
 		if waitErr != nil {
 			parts = append(parts, "wait: "+waitErr.Error())

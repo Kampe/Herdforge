@@ -100,19 +100,21 @@ func killProcessGroupIfLive(pgid int) error {
 //  1. Wrapper starts user command, writes "start <pid>" on FD3, waits for user.
 //  2. On user exit, wrapper writes "done <ec>" on FD3 and BLOCKS reading FD4.
 //  3. Parent, while wrapper is still alive (process group still owned), samples
-//     the causal tree + live original pgid members, kills residuals (including
-//     candidate-path residual discovery for setsid escapes), freezes.
+//     the causal tree + live original pgid members, kills residuals that still
+//     hold the inherited ownership marker FD (setsid/double-fork lineage), freezes.
 //  4. Parent writes "go" on FD4; wrapper exits; parent Wait returns.
 //
 // Discovery never replaces a recorded incarnation. After freeze, no new PIDs
-// are adopted from numeric pgid membership. Path residual ownership is
-// structural: any process still holding the candidate open is causally
-// attributable regardless of setsid/double-fork reparenting.
+// are adopted from numeric pgid membership. Escaped-descendant kill authority
+// is the unforgeable inherited marker FD (ExtraFiles FD5), not path contact or
+// start-time ordering. Path contact may only corroborate.
 type ownedSubprocess struct {
 	cmd          *exec.Cmd
 	leader       int
 	pgid         int
-	candidateDir string // verification root for path residual ownership
+	candidateDir string // verification root (corroboration / diagnostics only)
+	markerPath   string // private ownership marker path (lineage authority)
+	markerFile   *os.File
 
 	mu       sync.Mutex
 	handles  map[int]ownedHandle
@@ -131,20 +133,22 @@ type ownedSubprocess struct {
 // ownershipWrapperScript: pre-exec cont barrier + two-phase residual drain.
 //
 // FD3 → parent (start/done). FD4 ← parent (cont, then go).
+// FD5 = inherited ownership marker (must stay open across user exec).
 //
 // The user command is launched under a subshell that blocks on FD4 before
-// exec. The parent opens causal handles and samples, then writes "cont" so
-// user code can run. This closes the race where the user could fork/setsid/
-// double-fork before the first snapshot. After the user exits, the supervisor
-// writes "done" and blocks on FD4 again so residual drain runs while the
-// original process group is still owned by a live supervisor.
+// exec. Control pipes FD3/FD4 are closed into the user tree so writers cannot
+// steal "go"; FD5 remains open as the unforgeable lineage marker. After the
+// user exits, the supervisor writes "done" and blocks on FD4 so residual
+// drain runs while the original process group is still owned by a live
+// supervisor.
 const ownershipWrapperScript = `
 user_path="$1"
 shift
 (
   # Block before exec until parent has recorded causal handles (pre-fork barrier).
   IFS= read -r _cont <&4 || exit 1
-  # Do not leak control FDs into the user process tree (writers must not steal "go").
+  # Close control FDs so user writers cannot steal protocol lines.
+  # Keep FD5 open — inherited ownership marker for escaped-descendant lineage.
   exec 3>&- 4>&-
   exec "$user_path" "$@"
 ) &
@@ -158,19 +162,27 @@ IFS= read -r _ack <&4 || true
 exit "$ec"
 `
 
-// prepareOwnedCommand builds a Setpgid supervisor with status+ack pipes.
-// On Linux, also applies PID/user namespace containment when the kernel allows
-// it so setsid/double-fork descendants remain kernel-owned by the supervisor.
-func prepareOwnedCommand(ctx context.Context, path string, args []string, dir string, env []string) (cmd *exec.Cmd, statusR, statusW, ackR, ackW *os.File, err error) {
+// prepareOwnedCommand builds a Setpgid supervisor with status+ack pipes and an
+// inherited ownership marker FD. On Linux, also applies PID/user namespace
+// containment when the kernel allows it.
+func prepareOwnedCommand(ctx context.Context, path string, args []string, dir string, env []string) (cmd *exec.Cmd, statusR, statusW, ackR, ackW, marker *os.File, markerPath string, err error) {
 	statusR, statusW, err = os.Pipe()
 	if err != nil {
-		return nil, nil, nil, nil, nil, fmt.Errorf("status pipe: %w", err)
+		return nil, nil, nil, nil, nil, nil, "", fmt.Errorf("status pipe: %w", err)
 	}
 	ackR, ackW, err = os.Pipe()
 	if err != nil {
 		_ = statusR.Close()
 		_ = statusW.Close()
-		return nil, nil, nil, nil, nil, fmt.Errorf("ack pipe: %w", err)
+		return nil, nil, nil, nil, nil, nil, "", fmt.Errorf("ack pipe: %w", err)
+	}
+	marker, markerPath, err = createOwnershipMarker()
+	if err != nil {
+		_ = statusR.Close()
+		_ = statusW.Close()
+		_ = ackR.Close()
+		_ = ackW.Close()
+		return nil, nil, nil, nil, nil, nil, "", fmt.Errorf("ownership marker: %w", err)
 	}
 	wrapArgs := append([]string{"-c", ownershipWrapperScript, "owned-wrap", path}, args...)
 	cmd = exec.CommandContext(ctx, "sh", wrapArgs...)
@@ -181,16 +193,16 @@ func prepareOwnedCommand(ctx context.Context, path string, args []string, dir st
 	attr := &syscall.SysProcAttr{Setpgid: true}
 	applyOwnershipContainment(attr)
 	cmd.SysProcAttr = attr
-	// ExtraFiles: child FD3=statusW, FD4=ackR
-	cmd.ExtraFiles = []*os.File{statusW, ackR}
-	return cmd, statusR, statusW, ackR, ackW, nil
+	// ExtraFiles: child FD3=statusW, FD4=ackR, FD5=marker
+	cmd.ExtraFiles = []*os.File{statusW, ackR, marker}
+	return cmd, statusR, statusW, ackR, ackW, marker, markerPath, nil
 }
 
 // adoptOwnedCmd records the leader and prepares for the two-phase protocol.
 // handshake pipes: statusR reads start/done; ackW writes go.
-// candidateDir is the verification root used for structural path residual
-// ownership (processes still holding that tree open after user exit).
-func adoptOwnedCmd(cmd *exec.Cmd, statusR, ackW *os.File, candidateDir string) (*ownedSubprocess, error) {
+// marker/markerPath are the inherited lineage marker (kill authority for
+// escaped descendants). candidateDir is corroboration-only.
+func adoptOwnedCmd(cmd *exec.Cmd, statusR, ackW *os.File, candidateDir, markerPath string, marker *os.File) (*ownedSubprocess, error) {
 	if cmd == nil || cmd.Process == nil {
 		return nil, errors.New("adopt owned cmd: nil process")
 	}
@@ -208,6 +220,8 @@ func adoptOwnedCmd(cmd *exec.Cmd, statusR, ackW *os.File, candidateDir string) (
 		leader:       leader,
 		pgid:         leader,
 		candidateDir: candidateDir,
+		markerPath:   markerPath,
+		markerFile:   marker,
 		handles:      map[int]ownedHandle{leader: h},
 		statusR:      statusR,
 		ackW:         ackW,
@@ -373,13 +387,12 @@ func isBenignPipeErr(err error) bool {
 
 // drainResidualsWhileLeaderLive kills non-leader owned handles and live original
 // pgid members while the supervisor incarnation is still alive, then adopts
-// structural candidate-path residuals (setsid/double-fork escapes that left
-// the original process group but still mutate the candidate). Fail-closed.
+// marker-lineage residuals (setsid/double-fork escapes that still hold the
+// inherited ownership marker FD). Path contact is never kill authority.
 func (o *ownedSubprocess) drainResidualsWhileLeaderLive() error {
 	o.mu.Lock()
 	leaderH, ok := o.handles[o.leader]
 	pgid := o.pgid
-	dir := o.candidateDir
 	o.mu.Unlock()
 	if !ok || !leaderH.tok.stillSame() {
 		return fmt.Errorf("drain residuals: supervisor leader not live")
@@ -403,26 +416,26 @@ func (o *ownedSubprocess) drainResidualsWhileLeaderLive() error {
 	if err := o.killTracked(false); err != nil {
 		return fmt.Errorf("drain residuals re-kill: %w", err)
 	}
-	// Structural path residual: processes that still hold the candidate open
-	// (setsid/new-session writers that left the original process group).
-	// Causal attribution via open-file/cwd ownership of the candidate root —
-	// not a time-window heuristic. Single scan after tree drain.
-	if dir != "" {
-		if err := o.adoptAndKillPathResiduals(dir); err != nil {
-			return err
-		}
+	// Marker lineage residual: processes that still hold the inherited
+	// ownership marker FD. Authority is the marker, not path/start-time.
+	if err := o.adoptAndKillMarkedResiduals(); err != nil {
+		return err
 	}
 	return nil
 }
 
-// adoptAndKillPathResiduals discovers processes still touching the candidate
-// (cwd or any open descendant file FD) and identity-kills them via start-time
-// tokens. Self, ancestors, and the ownership supervisor leader are excluded —
-// never broad unrelated-process killing of the control plane.
-func (o *ownedSubprocess) adoptAndKillPathResiduals(dir string) error {
-	toks, err := processesTouchingDir(dir)
+// adoptAndKillMarkedResiduals discovers processes that still hold the
+// inherited ownership marker open and identity-kills them via start-time
+// tokens. Self, ancestors, and the ownership supervisor leader are excluded.
+// Unrelated processes that merely open a descendant under the candidate —
+// without the marker — are never adopted (worktree isolation).
+func (o *ownedSubprocess) adoptAndKillMarkedResiduals() error {
+	if o == nil || o.markerPath == "" {
+		return nil
+	}
+	toks, err := processesHoldingMarker(o.markerPath)
 	if err != nil {
-		return fmt.Errorf("drain residuals path residual: %w", err)
+		return fmt.Errorf("drain residuals marker lineage: %w", err)
 	}
 	toks = filterResidualTokens(toks, o.leader)
 	for _, tok := range toks {
@@ -433,11 +446,11 @@ func (o *ownedSubprocess) adoptAndKillPathResiduals(dir string) error {
 			if !tok.stillSame() {
 				continue
 			}
-			return fmt.Errorf("drain residuals note path residual pid %d: %w", tok.pid, err)
+			return fmt.Errorf("drain residuals note marker lineage pid %d: %w", tok.pid, err)
 		}
 	}
 	if err := o.killTracked(false); err != nil {
-		return fmt.Errorf("drain residuals kill path residual: %w", err)
+		return fmt.Errorf("drain residuals kill marker lineage: %w", err)
 	}
 	return nil
 }
@@ -674,6 +687,14 @@ func (o *ownedSubprocess) Close() error {
 		_ = o.ackW.Close()
 		o.ackW = nil
 	}
+	if o.markerFile != nil {
+		_ = o.markerFile.Close()
+		o.markerFile = nil
+	}
+	if o.markerPath != "" {
+		_ = os.Remove(o.markerPath)
+		o.markerPath = ""
+	}
 	if len(killErrs) > 0 {
 		return fmt.Errorf("close owned: %w", errors.Join(killErrs...))
 	}
@@ -746,13 +767,14 @@ func (o *ownedSubprocess) Reap() error {
 	return nil
 }
 
-// ReapOwnedCmd adopts without pipes (fixture path).
+// ReapOwnedCmd adopts without pipes/marker (fixture path). Lineage residual
+// drain requires the production marker FD from prepareOwnedCommand.
 func ReapOwnedCmd(cmd *exec.Cmd) error {
 	dir := ""
 	if cmd != nil {
 		dir = cmd.Dir
 	}
-	owned, err := adoptOwnedCmd(cmd, nil, nil, dir)
+	owned, err := adoptOwnedCmd(cmd, nil, nil, dir, "", nil)
 	if err != nil {
 		return err
 	}
