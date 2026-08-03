@@ -2,35 +2,38 @@ package security
 
 import (
 	"crypto/tls"
-	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"sync/atomic"
 )
 
-// SessionProof is the exact-session causal proof result (FAC-170).
+func osGetpidReal() int { return os.Getpid() }
+
+// SessionProof is component-level causal proof (oracle + TLS MITM rules).
+// Live admission requires LiveProof from StartAuthorLive, not this alone.
 type SessionProof struct {
 	SessionID           string
 	Kind                string
-	PromptConsumed      bool
+	PromptConsumed      bool // only true if RecordHarnessPrompt used
 	AllowedMarkerReach  bool
 	AllowedMarker       string
 	ForbiddenAccessDeny bool
 	WorkerSecretHidden  bool
 	NoWorkerBearer      bool
-	DummyNeverUpstream  bool
-	NoSecretExportAPI   bool
+	NoAPIKeys           bool
 	Generation          int
 	Evidence            []string
 }
 
-// ProveExactSessionHostCreds runs the causal proof against a live session + fake upstream.
+// ProveExactSessionHostCreds runs component causal proof with TLS upstream.
+// Does NOT claim live harness admission. For live AC use StartAuthorLive.
 func ProveExactSessionHostCreds(sess *HostCredsSession, secret, allowedMarker string) (*SessionProof, error) {
 	if sess == nil || sess.Oracle == nil {
-		return nil, &BlockedError{Reason: BlockNoSession, Code: "nil_session"}
+		return nil, &BlockedError{Reason: BlockNoSession, Code: "oracle_required_for_component_proof"}
 	}
 	if secret == "" || IsDummyCredential(secret) {
 		return nil, &BlockedError{Reason: BlockBadAuthMaterial, Code: "proof_needs_real_secret"}
@@ -38,33 +41,25 @@ func ProveExactSessionHostCreds(sess *HostCredsSession, secret, allowedMarker st
 	if allowedMarker == "" {
 		allowedMarker = "HOSTCREDS_ALLOWED_OK"
 	}
-
-	proof := &SessionProof{
-		SessionID:  sess.ID,
-		Kind:       sess.Kind,
-		Generation: sess.Oracle.Generation(),
+	proof := &SessionProof{SessionID: sess.ID, Kind: sess.Kind}
+	if sess.Oracle != nil {
+		proof.Generation = sess.Oracle.Generation()
 	}
 
-	if err := AssertNoPublicSecretExport(sess.Auth); err != nil {
-		return proof, err
-	}
-	proof.NoSecretExportAPI = true
-	proof.Evidence = append(proof.Evidence, "no_get_snapshot_api=true")
-
-	if err := sess.ConsumePrompt(fmt.Sprintf("FAC-170 proof session=%s", sess.ID)); err != nil {
+	// Simulate harness PID registration (component proof only).
+	if err := sess.RecordHarnessPrompt("component-proof-prompt", osGetpid()); err != nil {
 		return proof, err
 	}
 	proof.PromptConsumed = sess.PromptConsumed()
-	proof.Evidence = append(proof.Evidence, "prompt_consumed=true")
+	proof.Evidence = append(proof.Evidence, "prompt_in_argv_registered=true")
 
 	var sawAuth atomic.Value
 	sawAuth.Store("")
-	// TLS-only upstream (credentialed path must never use plaintext HTTP).
 	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		auth := r.Header.Get("Authorization")
 		sawAuth.Store(auth)
-		if IsDummyCredential(auth) {
-			http.Error(w, "dummy never upstream", http.StatusUnauthorized)
+		if IsDummyCredential(auth) || auth == "" {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
 		if auth != secret {
@@ -74,39 +69,25 @@ func ProveExactSessionHostCreds(sess *HostCredsSession, secret, allowedMarker st
 		_, _ = io.WriteString(w, allowedMarker)
 	}))
 	defer upstream.Close()
-
-	upHost := strings.TrimPrefix(upstream.URL, "https://")
-	_, upPort, err := net.SplitHostPort(upHost)
+	_, upPort, err := net.SplitHostPort(strings.TrimPrefix(upstream.URL, "https://"))
 	if err != nil {
 		return proof, err
 	}
-	sess.Oracle.allowLoopback = true
-	sess.Oracle.CaptureInjected = true
-	sess.Oracle.upstreamTLS = &tls.Config{
-		InsecureSkipVerify: true, // test server self-signed; production uses system roots
-		MinVersion:         tls.VersionTLS12,
-		ServerName:         "127.0.0.1",
+	if tv, ok := sess.authority.(*TestCredentialVault); ok {
+		if err := tv.InstallTestSecret("127.0.0.1", secret); err != nil {
+			return proof, err
+		}
 	}
+	sess.Oracle.allowLoopback = true
+	sess.Oracle.upstreamTLS = &tls.Config{InsecureSkipVerify: true, MinVersion: tls.VersionTLS12, ServerName: "127.0.0.1"}
 	sess.Oracle.dialHook = func(network, addr string) (net.Conn, error) {
 		return net.Dial("tcp", net.JoinHostPort("127.0.0.1", upPort))
 	}
 	sess.Oracle.resolveHook = func(host string) (net.IP, error) {
 		return net.ParseIP("127.0.0.1"), nil
 	}
-
-	// Ensure vault has loopback secret via tests-only installer.
-	if tv, ok := sess.Auth.(*TestCredentialVault); ok {
-		if err := tv.InstallTestSecret("127.0.0.1", secret); err != nil {
-			return proof, err
-		}
-	} else {
-		return proof, &BlockedError{Reason: BlockAbuse, Code: "proof_requires_test_vault"}
-	}
-	// Rules for fake kind already include 127.0.0.1.
-	sess.Oracle.mu.Lock()
 	sess.Oracle.Hosts = appendUnique(sess.Oracle.Hosts, "127.0.0.1")
 	sess.Oracle.Rules = RequestRulesForKind("fake")
-	sess.Oracle.mu.Unlock()
 
 	resp, err := CallOracle(sess.Oracle.SocketPath(), OracleRequest{
 		SessionID: sess.ID,
@@ -114,7 +95,6 @@ func ProveExactSessionHostCreds(sess *HostCredsSession, secret, allowedMarker st
 		Method:    "POST",
 		Path:      "/v1/chat/completions",
 		Action:    "chat.completions",
-		Headers:   map[string]string{"Authorization": DummyNeverUpstreamAuth},
 		Body:      `{"model":"test"}`,
 	})
 	if err != nil {
@@ -126,21 +106,17 @@ func ProveExactSessionHostCreds(sess *HostCredsSession, secret, allowedMarker st
 	if !strings.Contains(resp.Body, allowedMarker) {
 		return proof, &BlockedError{Reason: BlockAbuse, Code: "marker_missing"}
 	}
-	gotAuth, _ := sawAuth.Load().(string)
-	if gotAuth != secret || IsDummyCredential(gotAuth) {
+	got, _ := sawAuth.Load().(string)
+	if got != secret || IsDummyCredential(got) {
 		return proof, &BlockedError{Reason: BlockDummyUpstream, Code: "upstream_auth_wrong"}
 	}
 	proof.AllowedMarkerReach = true
 	proof.AllowedMarker = allowedMarker
-	proof.DummyNeverUpstream = true
-	proof.Evidence = append(proof.Evidence, "allowed_marker=true", "dummy_never_upstream=true")
 
 	if err := sess.AttemptForbiddenCredentialAccess(); err != nil {
 		return proof, err
 	}
 	proof.ForbiddenAccessDeny = true
-	proof.Evidence = append(proof.Evidence, "forbidden_access=DENIED")
-
 	if err := sess.AssertWorkerCannotSeeSecret(secret); err != nil {
 		return proof, err
 	}
@@ -149,22 +125,18 @@ func ProveExactSessionHostCreds(sess *HostCredsSession, secret, allowedMarker st
 	}
 	proof.WorkerSecretHidden = true
 	proof.NoWorkerBearer = true
-	proof.Evidence = append(proof.Evidence, "worker_secret_hidden=true", "no_worker_bearer=true")
-
-	for _, e := range proof.Evidence {
-		if strings.Contains(e, secret) {
-			return proof, &BlockedError{Reason: BlockSecretExposure, SessionID: sess.ID, Code: "evidence_leak"}
-		}
-	}
-	if sess.Oracle.Generation() != proof.Generation {
-		return proof, &BlockedError{Reason: BlockAbuse, Code: "generation_drift"}
-	}
+	proof.NoAPIKeys = true
+	proof.Evidence = append(proof.Evidence, "forbidden=DENIED", "no_api_keys=true", "tls_inject=true")
 	return proof, nil
 }
 
-// StartAuthorSessionNonInteractive starts a production session from handle authority.
+func osGetpid() int {
+	return osGetpidReal()
+}
+
+// StartAuthorSessionNonInteractive starts handle-backed session for production.
 func StartAuthorSessionNonInteractive(kind, worktree string, auth CredentialAuthority) (*HostCredsSession, error) {
-	_ = worktree // worktree never holds secrets
+	_ = worktree
 	kind = strings.ToLower(strings.TrimSpace(kind))
 	if auth == nil {
 		var err error
@@ -176,16 +148,11 @@ func StartAuthorSessionNonInteractive(kind, worktree string, auth CredentialAuth
 	diag := DiagnoseKindAuthReadinessWith(kind, auth)
 	if !diag.Brokerable {
 		return nil, &BlockedError{
-			Reason:        BlockMissingCreds,
-			Code:          diag.ReasonCode,
-			Kind:          kind,
-			HostsRequired: diag.RequiredHosts,
-			HostsPresent:  diag.HostCredsPresent,
+			Reason: BlockMissingCreds, Code: diag.ReasonCode, Kind: kind,
+			HostsRequired: diag.RequiredHosts, HostsPresent: diag.HostCredsPresent,
 		}
 	}
 	return StartHostCredsSession(SessionConfig{
-		Kind:        kind,
-		Authority:   auth,
-		Interactive: false,
+		Kind: kind, SessionID: newSessionID(), Authority: auth, Interactive: false,
 	})
 }

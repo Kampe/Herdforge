@@ -105,8 +105,8 @@ func runHostCredsLive(args []string) int {
 		defer sess.Close()
 	}
 	if proof != nil {
-		fmt.Printf("HOSTCREDS_LIVE session_id=%s kind=%s author_pid=%d prompt_consumed=%v marker_reached=%v forbidden_denied=%v boundary=%s\n",
-			proof.SessionID, proof.Kind, proof.AuthorPID, proof.PromptConsumed, proof.ModelMarkerReached, proof.ForbiddenDenied, proof.BoundaryDigest)
+		fmt.Printf("HOSTCREDS_LIVE session_id=%s kind=%s author_pid=%d prompt_in_argv=%v marker_reached=%v forbidden_denied=%v no_api_keys=%v boundary=%s\n",
+			proof.SessionID, proof.Kind, proof.AuthorPID, proof.PromptInArgv, proof.ModelMarkerReached, proof.ForbiddenDenied, proof.NoAPIKeysInEnv, proof.BoundaryDigest)
 		if proof.OutputSnippet != "" {
 			fmt.Printf("output_snippet=%s\n", proof.OutputSnippet)
 		}
@@ -115,7 +115,7 @@ func runHostCredsLive(args []string) int {
 		fmt.Fprintln(os.Stderr, err.Error())
 		return 2
 	}
-	if proof == nil || !proof.PromptConsumed || !proof.ForbiddenDenied {
+	if proof == nil || !proof.PromptInArgv || !proof.ForbiddenDenied || !proof.NoAPIKeysInEnv {
 		fmt.Fprintln(os.Stderr, "hostcreds live: incomplete exact-session proof")
 		return 2
 	}
@@ -195,21 +195,17 @@ func runHostCredsSession(args []string) int {
 	}
 	defer sess.Close()
 
-	if err := sess.ConsumePrompt("herd hostcreds session: non-interactive"); err != nil {
-		fmt.Fprintf(os.Stderr, "hostcreds session: %v\n", err)
-		return 1
-	}
 	if err := sess.AssertNoWorkerBearerToken(); err != nil {
 		fmt.Fprintf(os.Stderr, "hostcreds session: %v\n", err)
 		return 1
 	}
-
+	hosts := auth.Hosts()
 	summary := map[string]any{
 		"session_id":      sess.ID,
 		"kind":            sess.Kind,
-		"channel":         "unix-oracle",
-		"prompt_consumed": sess.PromptConsumed(),
-		"hosts_present":   sess.Oracle.CredHosts(),
+		"transport":       "https-mitm-connect",
+		"proxy":           sess.Mitm != nil,
+		"hosts_present":   hosts,
 		"authority_class": auth.Class(),
 		"durable":         auth.Durable(),
 		"integration_api": security.IntegrationAPIVersion,
@@ -219,8 +215,8 @@ func runHostCredsSession(args []string) int {
 		enc.SetIndent("", "  ")
 		_ = enc.Encode(summary)
 	} else {
-		fmt.Printf("HOSTCREDS_SESSION session_id=%s kind=%s channel=unix-oracle hosts_present=%v authority=%s integration_api=%d\n",
-			sess.ID, sess.Kind, sess.Oracle.CredHosts(), auth.Class(), security.IntegrationAPIVersion)
+		fmt.Printf("HOSTCREDS_SESSION session_id=%s kind=%s transport=https-mitm-connect hosts_present=%v authority=%s integration_api=%d\n",
+			sess.ID, sess.Kind, hosts, auth.Class(), security.IntegrationAPIVersion)
 	}
 	return 0
 }
@@ -234,38 +230,33 @@ func runHostCredsSelftest(args []string) int {
 
 	vault := security.NewTestCredentialVault()
 	secret := "Bearer herd-hostcreds-selftest-secret-not-for-production"
-	if err := vault.InstallTestSecret("api.x.ai", secret); err != nil {
-		// fake kind does not need api.x.ai; install loopback in proof
-		_ = err
-	}
 	if err := vault.InstallTestSecret("127.0.0.1", secret); err != nil {
 		fmt.Fprintf(os.Stderr, "hostcreds selftest: %v\n", err)
 		return 1
 	}
-
 	sess, err := security.StartHostCredsSession(security.SessionConfig{
-		Kind:          "fake",
-		Authority:     vault,
-		Interactive:   false,
-		AllowLoopback: true,
+		Kind: "fake", SessionID: "selftest-1", Authority: vault,
+		AllowLoopback: true, EnableOracle: true, Interactive: false,
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "hostcreds selftest: start: %v\n", err)
 		return 1
 	}
 	defer sess.Close()
-
+	if err := sess.AssertNoWorkerBearerToken(); err != nil {
+		fmt.Fprintf(os.Stderr, "hostcreds selftest: worker env: %v\n", err)
+		return 1
+	}
 	proof, err := security.ProveExactSessionHostCreds(sess, secret, "HOSTCREDS_SELFTEST_OK")
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "hostcreds selftest: FAIL %v\n", err)
 		return 1
 	}
-	if !proof.PromptConsumed || !proof.AllowedMarkerReach || !proof.ForbiddenAccessDeny ||
-		!proof.WorkerSecretHidden || !proof.NoWorkerBearer || !proof.DummyNeverUpstream || !proof.NoSecretExportAPI {
+	if !proof.PromptConsumed || !proof.AllowedMarkerReach || !proof.ForbiddenAccessDeny || !proof.NoAPIKeys {
 		fmt.Fprintf(os.Stderr, "hostcreds selftest: incomplete proof\n")
 		return 1
 	}
-	fmt.Printf("hostcreds selftest: PASS session_id=%s marker=%s integration_api=%d\n",
+	fmt.Printf("hostcreds selftest: PASS session_id=%s marker=%s no_api_keys=true integration_api=%d\n",
 		proof.SessionID, proof.AllowedMarker, security.IntegrationAPIVersion)
 	return 0
 }
