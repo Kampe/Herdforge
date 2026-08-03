@@ -3,39 +3,45 @@ package harvest
 import (
 	"bytes"
 	"context"
-	"errors"
 	"fmt"
-	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/Kampe/Herdforge/pkg/lock"
+	"github.com/Kampe/Herdforge/pkg/review"
+	hsync "github.com/Kampe/Herdforge/pkg/sync"
 )
 
 // Integration implements the README contract: a serialized merge pipeline
-// that consumes a Harvester (exact-SHA), Verifier (test gate), and Dispatcher
-// (board-complete) as dependencies. It is the coordinator-level entry point
-// for the exact-SHA harvest → review-gate → merge-gate → post-merge flow.
+// that consumes a Harvester (exact-SHA), Verifier (test gate), review.Ledger
+// (review gate), and Dispatcher (board-complete) as dependencies.
 //
 // Phases:
-//
 //  1. Harvest — list worktrees, check unmerged commits via git cherry.
-//  2. Review gate — for each unmerged worktree, verify via pkg/review.Ledger
-//     that the SHA has a qualifying PASS verdict.
-//  3. Merge gate — acquire DirLock, fetch origin/main, cherry-pick each
-//     unique commit, detect conflict markers.
-//  4. Post-merge — push, proof-readback via sync.MergeEvidence, board-complete
-//     via sync.BoardDone, ledger Consumed.
-//  5. Cleanup — session + worktree removal with dirty/unique-work protection.
+//  2. Review gate — for each unmerged SHA, call review.Ledger.Eligible to
+//     verify a qualifying PASS verdict exists. The commit message is NOT
+//     parsed for the gate decision.
+//  3. Merge gate — acquire lock.DirLock (PID-liveness, not timer-only),
+//     checkout main, fetch origin/main, ff-only merge, cherry-pick, test
+//     gate, push with race retry.
+//  4. Post-merge — proof-readback via sync.MergeEvidence, board-complete
+//     via Dispatcher, ledger.Consumed.
+//  5. Cleanup — remove fully-merged worktrees with dirty/unique-work
+//     protection and session teardown.
 
 type Integration struct {
-	Harvester   *Harvester
-	Verifier    Verifier
-	Dispatcher  Dispatcher
-	RepoRoot    string
-	LockDir     string
-	MaxMergeAge time.Duration
-	DryRun      bool
+	Harvester      *Harvester
+	Verifier       Verifier       // optional; nil skips test gate
+	Dispatcher     Dispatcher     // required for board-complete
+	Ledger         *review.Ledger // required for review gate
+	SessionManager SessionManager // optional; nil skips session teardown
+	RepoRoot       string
+	LockDir        string
+	MaxMergeAge    time.Duration
+	DryRun         bool
+	BuilderFamily  string // filter for ledger eligibility; empty = no filter
 }
 
 // Verifier is the consumed contract for test-gate verification.
@@ -52,6 +58,11 @@ type VerifyResult struct {
 // Dispatcher is the consumed contract for board-complete dispatch.
 type Dispatcher interface {
 	BoardComplete(ctx context.Context, ref string, evidenceSHA string) error
+}
+
+// SessionManager is the consumed contract for agent session teardown.
+type SessionManager interface {
+	Stop(ctx context.Context, branch string) error
 }
 
 // IntegrationOption configures an Integration.
@@ -72,44 +83,54 @@ func WithMaxMergeAge(d time.Duration) IntegrationOption {
 	return func(i *Integration) { i.MaxMergeAge = d }
 }
 
+// WithBuilderFamily sets the builder family filter for ledger eligibility.
+func WithBuilderFamily(f string) IntegrationOption {
+	return func(i *Integration) { i.BuilderFamily = f }
+}
+
+// WithSessionManager sets the session manager for cleanup.
+func WithSessionManager(sm SessionManager) IntegrationOption {
+	return func(i *Integration) { i.SessionManager = sm }
+}
+
 // IntegrationResult carries the outcome of the full pipeline for one harvest.
 type IntegrationResult struct {
-	HarvestResult     *HarvestResult       `json:"harvest_result"`
-	ReviewGatedSHAs   []ReviewGateOutcome  `json:"review_gated_shas,omitempty"`
-	MergedSHAs        []MergeOutcome       `json:"merged_shas,omitempty"`
-	BoardCompletedRef string               `json:"board_completed_ref,omitempty"`
-	Errors            []string             `json:"errors,omitempty"`
+	HarvestResult      *HarvestResult      `json:"harvest_result"`
+	ReviewGatedSHAs    []ReviewGateOutcome `json:"review_gated_shas,omitempty"`
+	MergedSHAs         []MergeOutcome      `json:"merged_shas,omitempty"`
+	BoardCompletedRefs []string            `json:"board_completed_refs,omitempty"`
+	CleanedWorktrees   []string            `json:"cleaned_worktrees,omitempty"`
+	Errors             []string            `json:"errors,omitempty"`
 }
 
 // ReviewGateOutcome records the result of the review gate for a SHA.
 type ReviewGateOutcome struct {
-	SHA        string `json:"sha"`
-	Branch     string `json:"branch"`
-	Worktree   string `json:"worktree"`
-	Classification    Classification `json:"classification"`
-	Eligible   bool   `json:"eligible"`
-	Err        string `json:"err,omitempty"`
+	SHA      string `json:"sha"`
+	Branch   string `json:"branch"`
+	Worktree string `json:"worktree"`
+	Eligible bool   `json:"eligible"`
+	Err      string `json:"err,omitempty"`
 }
 
 // MergeOutcome records the result of the merge gate for a SHA.
 type MergeOutcome struct {
-	SHA        string `json:"sha"`
-	Branch     string `json:"branch"`
-	CherryPicked bool `json:"cherry_picked"`
-	Conflict   bool   `json:"conflict"`
-	Pushed     bool   `json:"pushed"`
-	Err        string `json:"err,omitempty"`
-	MergeSHA   string `json:"merge_sha,omitempty"`
+	SHA           string `json:"sha"`
+	Branch        string `json:"branch"`
+	CherryPicked  bool   `json:"cherry_picked"`
+	Conflict      bool   `json:"conflict"`
+	Pushed        bool   `json:"pushed"`
+	AlreadyMerged bool   `json:"already_merged,omitempty"`
+	Err           string `json:"err,omitempty"`
+	MergeSHA      string `json:"merge_sha,omitempty"`
 }
 
 // NewIntegration creates an Integration with sensible defaults.
-// The Verifier can be nil (skips test-gate), but Dispatcher must be non-nil
-// for board-complete.
-func NewIntegration(h *Harvester, v Verifier, d Dispatcher, repoRoot string, opts ...IntegrationOption) *Integration {
+func NewIntegration(h *Harvester, v Verifier, d Dispatcher, l *review.Ledger, repoRoot string, opts ...IntegrationOption) *Integration {
 	i := &Integration{
 		Harvester:   h,
 		Verifier:    v,
 		Dispatcher:  d,
+		Ledger:      l,
 		RepoRoot:    repoRoot,
 		LockDir:     filepath.Join(repoRoot, ".git", "herd-shared-checkout.lock.d"),
 		MaxMergeAge: 5 * time.Minute,
@@ -120,7 +141,7 @@ func NewIntegration(h *Harvester, v Verifier, d Dispatcher, repoRoot string, opt
 	return i
 }
 
-// Run executes the full harvest → review-gate → merge-gate → post-merge flow.
+// Run executes the full harvest → review-gate → merge-gate → post-merge → cleanup flow.
 func (in *Integration) Run(ctx context.Context) (*IntegrationResult, error) {
 	res := &IntegrationResult{}
 
@@ -130,12 +151,11 @@ func (in *Integration) Run(ctx context.Context) (*IntegrationResult, error) {
 		return nil, fmt.Errorf("harvest: %w", err)
 	}
 	res.HarvestResult = hr
-
 	if len(hr.UnmergedWorktrees) == 0 {
 		return res, nil
 	}
 
-	// Phase 2: Review gate for each worktree
+	// Phase 2: Review gate
 	for _, uw := range hr.UnmergedWorktrees {
 		for _, sha := range uw.Unmerged {
 			outcome := in.runReviewGate(ctx, sha, uw)
@@ -143,9 +163,19 @@ func (in *Integration) Run(ctx context.Context) (*IntegrationResult, error) {
 		}
 	}
 
-	// Phase 3 & 4: Merge gate + post-merge for each eligible SHA
+	// Track per-worktree merge counts for cleanup eligibility.
+	mergedByWorktree := make(map[string]int)
+	totalByWorktree := make(map[string]int)
+	for _, uw := range hr.UnmergedWorktrees {
+		totalByWorktree[uw.WorktreePath] = len(uw.Unmerged)
+	}
+
+	// Phase 3+4: Merge gate + post-merge
 	for _, rg := range res.ReviewGatedSHAs {
 		if !rg.Eligible {
+			continue
+		}
+		if in.DryRun {
 			continue
 		}
 		mo, err := in.runMergeGate(ctx, rg)
@@ -155,13 +185,56 @@ func (in *Integration) Run(ctx context.Context) (*IntegrationResult, error) {
 		}
 		res.MergedSHAs = append(res.MergedSHAs, *mo)
 
+		if mo.AlreadyMerged {
+			mergedByWorktree[rg.Worktree]++
+			continue
+		}
+
 		if mo.Pushed && mo.MergeSHA != "" {
-			// Phase 5: Board-complete via dispatcher
-			if err := in.Dispatcher.BoardComplete(ctx, branchToRef(rg.Branch), mo.MergeSHA); err != nil {
-				res.Errors = append(res.Errors, fmt.Sprintf("board-complete %s: %v", rg.Branch, err))
+			ref := hsync.NormalizeRef(branchToRef(rg.Branch))
+
+			// Phase 4b: Proof readback via MergeEvidence
+			proof, err := hsync.MergeEvidence(in.RepoRoot, ref, mo.MergeSHA)
+			if err != nil {
+				res.Errors = append(res.Errors, fmt.Sprintf("merge evidence %s: %v", ref, err))
 				continue
 			}
-			res.BoardCompletedRef = branchToRef(rg.Branch)
+			if proof == "" {
+				res.Errors = append(res.Errors, fmt.Sprintf("no merge evidence for %s", ref))
+				continue
+			}
+
+			// Phase 4c: Board-complete
+			if in.Dispatcher != nil {
+				if err := in.Dispatcher.BoardComplete(ctx, ref, mo.MergeSHA); err != nil {
+					res.Errors = append(res.Errors, fmt.Sprintf("board-complete %s: %v", ref, err))
+					continue
+				}
+				res.BoardCompletedRefs = append(res.BoardCompletedRefs, ref)
+			}
+
+			// Phase 4d: Ledger consumed
+			if in.Ledger != nil {
+				if err := in.Ledger.Consumed(rg.SHA, mo.MergeSHA); err != nil {
+					res.Errors = append(res.Errors, fmt.Sprintf("ledger consumed %s: %v", rg.SHA, err))
+				}
+			}
+
+			mergedByWorktree[rg.Worktree]++
+		}
+	}
+
+	// Phase 5: Cleanup — only for worktrees where ALL SHAs were merged.
+	for _, uw := range hr.UnmergedWorktrees {
+		if totalByWorktree[uw.WorktreePath] > 0 && mergedByWorktree[uw.WorktreePath] == totalByWorktree[uw.WorktreePath] {
+			cleaned, err := in.runCleanup(ctx, uw)
+			if err != nil {
+				res.Errors = append(res.Errors, fmt.Sprintf("cleanup %s: %v", uw.WorktreePath, err))
+				continue
+			}
+			if cleaned {
+				res.CleanedWorktrees = append(res.CleanedWorktrees, uw.WorktreePath)
+			}
 		}
 	}
 
@@ -175,35 +248,18 @@ func (in *Integration) runReviewGate(ctx context.Context, sha string, uw Unmerge
 		Worktree: uw.WorktreePath,
 	}
 
-	// Classify the worktree's latest commit message for the review gate.
-	msg, err := commitMessage(ctx, uw.WorktreePath, sha)
-	if err != nil {
-		outcome.Err = fmt.Sprintf("commit message: %v", err)
+	if in.Ledger == nil {
+		outcome.Err = "no review ledger configured"
 		return outcome
 	}
 
-	outcome.Classification = ClassifyText(msg)
-
-	// The review gate passes when the classification allows merge.
-	switch outcome.Classification {
-	case ClassificationPass, ClassificationComplete:
-		outcome.Eligible = true
-	case ClassificationNeedsReview:
-		// Needs explicit review — check if verifier passes as proxy.
-		if in.Verifier != nil {
-			vr, vErr := in.Verifier.Execute(ctx, uw.WorktreePath)
-			if vErr != nil {
-				outcome.Err = fmt.Sprintf("verifier error: %v", vErr)
-				return outcome
-			}
-			outcome.Eligible = vr.Passed
-		}
-	case ClassificationFail, ClassificationBlocked, ClassificationQuota:
+	eligible, err := in.Ledger.Eligible(sha, in.BuilderFamily)
+	if err != nil {
+		outcome.Err = err.Error()
 		outcome.Eligible = false
-	case ClassificationUnconsumed, ClassificationUnknown:
-		outcome.Eligible = false
+		return outcome
 	}
-
+	outcome.Eligible = eligible
 	return outcome
 }
 
@@ -218,63 +274,161 @@ func (in *Integration) runMergeGate(ctx context.Context, rg ReviewGateOutcome) (
 		return mo, nil
 	}
 
-	// Acquire merge lock
-	dl := lockFor(in.LockDir)
+	dl := lock.NewDirLock(in.LockDir)
 	if err := dl.Acquire(ctx, in.MaxMergeAge, fmt.Sprintf("merge %s/%s", rg.Branch, rg.SHA)); err != nil {
 		return nil, fmt.Errorf("lock acquire: %w", err)
 	}
 	defer dl.Release()
 
-	// Fetch latest origin/main
-	if err := runGit(ctx, in.RepoRoot, "fetch", "-q", "origin", "main"); err != nil {
-		return nil, fmt.Errorf("fetch: %w", err)
+	if err := in.prepareMain(ctx); err != nil {
+		return nil, fmt.Errorf("prepare main: %w", err)
 	}
 
-	// Check if SHA is already on origin/main (already merged)
-	if err := runGit(ctx, in.RepoRoot, "merge-base", "--is-ancestor", rg.SHA, "origin/main"); err == nil {
-		mo.CherryPicked = true
-		mo.MergeSHA = rg.SHA
-		return mo, nil
-	}
-
-	// Cherry-pick onto main
-	var stderr bytes.Buffer
-	cherryCmd := exec.CommandContext(ctx, "git", "cherry-pick", rg.SHA)
-	cherryCmd.Dir = in.RepoRoot
-	cherryCmd.Stderr = &stderr
-	if err := cherryCmd.Run(); err != nil {
-		stripped := stderr.String()
-		if strings.Contains(stripped, "conflict") || hasConflictMarkers(in.RepoRoot) {
-			mo.Conflict = true
-			// Abort the cherry-pick so the working tree is clean
-			_ = runGit(ctx, in.RepoRoot, "cherry-pick", "--abort")
-			return nil, fmt.Errorf("cherry-pick conflict for %s", rg.SHA)
+	const maxAttempts = 3
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		mergeSHA, conflict, err := in.cherryPick(ctx, rg.SHA)
+		if err != nil {
+			if conflict {
+				mo.Conflict = true
+				return nil, fmt.Errorf("cherry-pick conflict for %s: %w", rg.SHA, err)
+			}
+			return nil, fmt.Errorf("cherry-pick attempt %d: %w", attempt+1, err)
 		}
-		return nil, fmt.Errorf("cherry-pick: %w\n%s", err, stripped)
-	}
-	mo.CherryPicked = true
 
-	// Verify no conflict markers remain
-	if hasConflictMarkers(in.RepoRoot) {
-		mo.Conflict = true
-		_ = runGit(ctx, in.RepoRoot, "cherry-pick", "--abort")
-		return nil, fmt.Errorf("conflict markers detected after cherry-pick %s", rg.SHA)
+		// Empty cherry-pick means the patch is already applied.
+		if mergeSHA == "" {
+			mo.CherryPicked = true
+			mo.AlreadyMerged = true
+			head, _ := gitOutput(ctx, in.RepoRoot, "rev-parse", "origin/main")
+			mo.MergeSHA = strings.TrimSpace(head)
+			return mo, nil
+		}
+
+		mo.MergeSHA = mergeSHA
+
+		// Test gate after cherry-pick, before push.
+		if in.Verifier != nil {
+			vr, vErr := in.Verifier.Execute(ctx, in.RepoRoot)
+			if vErr != nil {
+				_ = runGit(ctx, in.RepoRoot, "reset", "--hard", "origin/main")
+				return nil, fmt.Errorf("verifier error: %w", vErr)
+			}
+			if vr != nil && !vr.Passed {
+				_ = runGit(ctx, in.RepoRoot, "reset", "--hard", "origin/main")
+				return nil, fmt.Errorf("verifier failed: %s", vr.Output)
+			}
+		}
+
+		// Push
+		if pushErr := runGit(ctx, in.RepoRoot, "push", "origin", "main"); pushErr == nil {
+			mo.CherryPicked = true
+			mo.Pushed = true
+			return mo, nil
+		}
+
+		// Push failed — fetch and check if our commit made it upstream.
+		_ = runGit(ctx, in.RepoRoot, "fetch", "-q", "origin", "main")
+		if err := runGit(ctx, in.RepoRoot, "merge-base", "--is-ancestor", mergeSHA, "origin/main"); err == nil {
+			mo.CherryPicked = true
+			mo.AlreadyMerged = true
+			return mo, nil
+		}
+
+		// Someone else pushed. Reset to origin/main and retry.
+		if err := runGit(ctx, in.RepoRoot, "reset", "--hard", "origin/main"); err != nil {
+			return nil, fmt.Errorf("reset after push race: %w", err)
+		}
 	}
 
-	// Get the resulting merge SHA
-	mergeSHA, err := gitOutput(ctx, in.RepoRoot, "rev-parse", "HEAD")
+	return nil, fmt.Errorf("push failed after %d attempts for %s", maxAttempts, rg.SHA)
+}
+
+func (in *Integration) prepareMain(ctx context.Context) error {
+	current, err := gitOutput(ctx, in.RepoRoot, "rev-parse", "--abbrev-ref", "HEAD")
 	if err != nil {
-		return nil, fmt.Errorf("rev-parse HEAD: %w", err)
+		return fmt.Errorf("rev-parse HEAD: %w", err)
 	}
-	mo.MergeSHA = strings.TrimSpace(mergeSHA)
-
-	// Push to origin/main
-	if pushErr := runGit(ctx, in.RepoRoot, "push", "origin", "main"); pushErr != nil {
-		return nil, fmt.Errorf("push: %w", pushErr)
+	if strings.TrimSpace(current) != "main" {
+		if err := runGit(ctx, in.RepoRoot, "checkout", "main"); err != nil {
+			return fmt.Errorf("checkout main: %w", err)
+		}
 	}
-	mo.Pushed = true
+	if err := runGit(ctx, in.RepoRoot, "fetch", "-q", "origin", "main"); err != nil {
+		return fmt.Errorf("fetch: %w", err)
+	}
+	if err := runGit(ctx, in.RepoRoot, "merge", "--ff-only", "origin/main"); err != nil {
+		return fmt.Errorf("ff-only merge: %w", err)
+	}
+	return nil
+}
 
-	return mo, nil
+func (in *Integration) cherryPick(ctx context.Context, sha string) (mergeSHA string, conflict bool, err error) {
+	var stderr bytes.Buffer
+	cmd := exec.CommandContext(ctx, "git", "cherry-pick", sha)
+	cmd.Dir = in.RepoRoot
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		stderrStr := stderr.String()
+		if strings.Contains(stderrStr, "nothing to commit") || strings.Contains(stderrStr, "empty") {
+			_ = runGit(ctx, in.RepoRoot, "cherry-pick", "--abort")
+			return "", false, nil
+		}
+		if hasUnmergedPaths(ctx, in.RepoRoot) {
+			_ = runGit(ctx, in.RepoRoot, "cherry-pick", "--abort")
+			return "", true, fmt.Errorf("conflict: %s", stderrStr)
+		}
+		return "", false, fmt.Errorf("cherry-pick: %w\n%s", err, stderrStr)
+	}
+
+	if hasUnmergedPaths(ctx, in.RepoRoot) {
+		_ = runGit(ctx, in.RepoRoot, "cherry-pick", "--abort")
+		return "", true, fmt.Errorf("unmerged paths after cherry-pick")
+	}
+
+	head, err := gitOutput(ctx, in.RepoRoot, "rev-parse", "HEAD")
+	if err != nil {
+		return "", false, fmt.Errorf("rev-parse HEAD: %w", err)
+	}
+	return strings.TrimSpace(head), false, nil
+}
+
+func (in *Integration) runCleanup(ctx context.Context, uw UnmergedWork) (bool, error) {
+	// Refuse if the worktree is dirty.
+	statusOut, err := gitOutput(ctx, uw.WorktreePath, "status", "--porcelain")
+	if err != nil {
+		return false, fmt.Errorf("status: %w", err)
+	}
+	if strings.TrimSpace(statusOut) != "" {
+		return false, fmt.Errorf("worktree %s is dirty, refusing cleanup", uw.WorktreePath)
+	}
+
+	// Refuse if the worktree still has unique unmerged commits.
+	cherryOut, err := gitOutput(ctx, uw.WorktreePath, "cherry", "origin/main", uw.Branch)
+	if err != nil {
+		return false, nil
+	}
+	for _, line := range strings.Split(cherryOut, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "+ ") {
+			return false, fmt.Errorf("worktree %s has unique unmerged commits, refusing cleanup", uw.WorktreePath)
+		}
+	}
+
+	// Session teardown.
+	if in.SessionManager != nil {
+		if err := in.SessionManager.Stop(ctx, uw.Branch); err != nil {
+			return false, fmt.Errorf("session stop: %w", err)
+		}
+	}
+
+	// Remove the worktree.
+	if err := runGit(ctx, in.RepoRoot, "worktree", "remove", uw.WorktreePath); err != nil {
+		return false, fmt.Errorf("worktree remove: %w", err)
+	}
+
+	// Delete the branch.
+	_ = runGit(ctx, in.RepoRoot, "branch", "-D", uw.Branch)
+
+	return true, nil
 }
 
 // -- helpers --
@@ -299,75 +453,15 @@ func gitOutput(ctx context.Context, dir string, args ...string) (string, error) 
 	return string(out), nil
 }
 
-func commitMessage(ctx context.Context, worktree, sha string) (string, error) {
-	cmd := exec.CommandContext(ctx, "git", "log", "-1", "--format=%s%n%b", sha)
-	cmd.Dir = worktree
-	out, err := cmd.Output()
-	if err != nil {
-		return "", fmt.Errorf("git log: %w", err)
-	}
-	return string(out), nil
-}
-
-func hasConflictMarkers(dir string) bool {
-	cmd := exec.Command("git", "diff", "--check")
+// hasUnmergedPaths returns true when the working tree has files with
+// unresolved merge conflicts. Uses git diff --diff-filter=U which lists
+// unmerged paths only — NOT git diff --check (which catches whitespace
+// errors, not conflict markers).
+func hasUnmergedPaths(ctx context.Context, dir string) bool {
+	cmd := exec.CommandContext(ctx, "git", "diff", "--name-only", "--diff-filter=U")
 	cmd.Dir = dir
 	out, _ := cmd.Output()
-	// git diff --check exits non-zero and outputs filenames with conflict markers.
-	// A clean diff exits 0 with no output.
-	return len(out) > 0
-}
-
-// lockFor creates a DirLock for the given directory path.
-// We inline the minimal lock API to avoid importing pkg/lock (READ-ONLY constraint).
-func lockFor(dir string) *mergeLock {
-	return &mergeLock{dir: dir, holder: filepath.Join(dir, "holder")}
-}
-
-// mergeLock is a minimal advisory mkdir-based lock for merge serialization.
-type mergeLock struct {
-	dir    string
-	holder string
-}
-
-func (l *mergeLock) Acquire(ctx context.Context, wait time.Duration, reason string) error {
-	waited := 0
-	waitSecs := int(wait.Seconds())
-	for {
-		l.breakIfStale()
-		if err := os.Mkdir(l.dir, 0o755); err == nil {
-			l.writeHolder(reason)
-			return nil
-		}
-		if waited >= waitSecs {
-			return fmt.Errorf("locked, waited %ds", waitSecs)
-		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(time.Second):
-		}
-		waited++
-	}
-}
-
-func (l *mergeLock) Release() {
-	_ = os.RemoveAll(l.dir)
-}
-
-func (l *mergeLock) breakIfStale() {
-	info, err := os.Stat(l.dir)
-	if err != nil {
-		return
-	}
-	if time.Since(info.ModTime()) > 5*time.Minute {
-		_ = os.RemoveAll(l.dir)
-	}
-}
-
-func (l *mergeLock) writeHolder(reason string) {
-	content := fmt.Sprintf("pid=%d\nreason=%s\n", os.Getpid(), reason)
-	_ = os.WriteFile(l.holder, []byte(content), 0o644)
+	return strings.TrimSpace(string(out)) != ""
 }
 
 // branchToRef attempts to extract a ticket ref from a branch name.
@@ -378,15 +472,12 @@ func branchToRef(branch string) string {
 	}
 	parts := strings.SplitN(branch, "/", 2)
 	if len(parts) == 2 {
-		// Try to extract ref from the slug
 		slug := parts[1]
 		if idx := strings.Index(slug, "-"); idx > 0 {
-			// Grab up to the second hyphen for the ref
 			candidate := slug[:idx]
 			if len(candidate) > 3 && candidate == strings.ToUpper(candidate) {
 				return candidate
 			}
-			// Try e.g. FAC-18
 			rest := slug[idx+1:]
 			splitAt := strings.IndexFunc(rest, func(r rune) bool { return r < '0' || r > '9' })
 			if splitAt > 0 {
@@ -396,11 +487,3 @@ func branchToRef(branch string) string {
 	}
 	return branch
 }
-
-// Standard sentinel errors for the integration pipeline.
-var (
-	ErrReviewRejected  = errors.New("review gate rejected")
-	ErrMergeConflict   = errors.New("merge conflict detected")
-	ErrLockHeld        = errors.New("merge lock held")
-	ErrBoardRefused    = errors.New("board refused to mark complete")
-)
