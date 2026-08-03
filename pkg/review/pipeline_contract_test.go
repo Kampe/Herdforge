@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Kampe/Herdforge/pkg/harvest"
 	"github.com/Kampe/Herdforge/pkg/provider"
@@ -139,7 +140,7 @@ func TestPipelineContract_RequiredStates(t *testing.T) {
 		if e != nil {
 			t.Fatal(e)
 		}
-		if r.HarvestReady != 0 || len(r.Shas.RebaseNeeded) != 1 || r.Pins[0].Behind <= 20 {
+		if r.HarvestReady != 0 || r.Harvestable != 1 || len(r.Shas.RebaseNeeded) != 1 || r.Pins[0].Behind <= 20 || r.Pins[0].Lane != "lane" {
 			t.Fatalf("stale report=%+v", r)
 		}
 	})
@@ -173,6 +174,39 @@ func TestPipelineContract_RequiredStates(t *testing.T) {
 			t.Fatalf("pressure=%s", r.Pressure)
 		}
 	})
+}
+
+func TestPipelineContract_PendingUsesOrderedEventIndex(t *testing.T) {
+	s := LedgerSnapshot{Rows: []LedgerRow{{Timestamp: "2025-01-01T00:00:02Z", Event: "verdict", SHA: "same", Reviewer: "r", Verdict: "PASS"}, {Timestamp: "2025-01-01T00:00:02Z", Event: "record", SHA: "same", Reviewer: "r"}}}
+	if got := s.Pending(); len(got) != 1 || got[0].Event != "record" {
+		t.Fatalf("same-timestamp record-after-verdict pending=%+v", got)
+	}
+}
+
+func TestPipelineContract_SelfCertificationAndArtifactCounts(t *testing.T) {
+	root, _ := setupPipelineRepo(t)
+	state := filepath.Join(root, "state")
+	if err := os.MkdirAll(state, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(root, "artifacts", "rejected"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(state, "review-gate-skips.log"), []byte(time.Now().UTC().Format("2006-01-02")+" skip\n2000-01-01 old\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "artifacts", "rejected", "x.md"), []byte("x"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	l := OpenLedger(filepath.Join(root, "ledger.jsonl"))
+	writeJSONL(t, l.Path, LedgerRow{Event: "verdict", SHA: "a", Reviewer: "r", Verdict: "PASS"}, LedgerRow{Event: "verdict", SHA: "a", Reviewer: "r", Verdict: "PASS"})
+	r, e := NewPipeline(Drain{RepoRoot: root, LedgerPath: l.Path, StateDir: state, ArtifactDir: filepath.Join(root, "artifacts")}).Scan(context.Background(), nil)
+	if e != nil {
+		t.Fatal(e)
+	}
+	if r.Skips7d != 1 || r.Rejected != 1 || r.LedgerPass != 2 {
+		t.Fatalf("self-cert counts=%+v", r)
+	}
 }
 
 func TestPipelineContract_UnknownEvidenceFailsClosed(t *testing.T) {
@@ -213,12 +247,14 @@ func TestPipelineContract_ConflictEvidenceIsRebaseNeeded(t *testing.T) {
 func TestPipelineContract_JSONTypesAndOperationalState(t *testing.T) {
 	root, _ := setupPipelineRepo(t)
 	gitDrain(t, root, "branch", "park/foo")
+	gitDrain(t, root, "branch", "parked/foo")
+	gitDrain(t, root, "update-ref", "refs/remotes/origin/park/foo", strings.TrimSpace(gitDrain(t, root, "rev-parse", "HEAD")))
 	t.Setenv("HERD_WIND_DOWN", "1")
 	r, e := NewPipeline(Drain{RepoRoot: root, LedgerPath: filepath.Join(root, "ledger.jsonl")}).Scan(context.Background(), nil)
 	if e != nil {
 		t.Fatal(e)
 	}
-	if !r.WindDown || r.ParkBranches < 1 {
+	if !r.WindDown || r.ParkBranches != 2 || r.ParkCHAWithDups != 1 {
 		t.Fatalf("state=%+v", r)
 	}
 	raw, _ := json.Marshal(r)
