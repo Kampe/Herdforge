@@ -177,10 +177,22 @@ func edgesFromMap(m map[string]DependencyEdge) []DependencyEdge {
 	return out
 }
 
+// filterInvolving returns edges that involve task by ref OR by immutable TaskID
+// when filterTaskID is non-empty. Prefer FilterInvolvingTask for launch paths.
 func filterInvolving(edges []DependencyEdge, task Ref) []DependencyEdge {
+	return FilterInvolvingTask(edges, task, "")
+}
+
+// FilterInvolvingTask includes edges where source/target ref OR id matches.
+// Unresolved edges with only IDs are retained when id matches (audit #6).
+func FilterInvolvingTask(edges []DependencyEdge, task Ref, taskID TaskID) []DependencyEdge {
 	var out []DependencyEdge
 	for _, e := range edges {
-		if e.SourceRef == task || e.TargetRef == task {
+		if task.Valid() && (e.SourceRef == task || e.TargetRef == task) {
+			out = append(out, e)
+			continue
+		}
+		if taskID.Valid() && (e.SourceID == taskID || e.TargetID == taskID) {
 			out = append(out, e)
 		}
 	}

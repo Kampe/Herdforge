@@ -96,12 +96,6 @@ func ValidateLaunch(
 			Reason: ErrMissingProvenance.Error() + "; attach versioned herd-deps-v1 record",
 		}
 	}
-	if err := desired.Validate(); err != nil {
-		return nil, &BlockedError{
-			Ref: taskRef, Code: "missing_provenance",
-			Reason: err.Error(),
-		}
-	}
 
 	status, taskID, err := store.TaskStatus(ctx, taskRef)
 	if err != nil {
@@ -111,6 +105,14 @@ func ValidateLaunch(
 		}
 	}
 	_ = status
+
+	// Bind fence to this exact task (reject replay of another card's fence).
+	if err := desired.BindAndValidate(taskRef, taskID); err != nil {
+		return nil, &BlockedError{
+			Ref: taskRef, Code: "missing_provenance",
+			Reason: err.Error(),
+		}
+	}
 
 	// Authoritative full project closure for cycle detection + revision.
 	snap, err := store.SnapshotGraph(ctx)
@@ -127,16 +129,8 @@ func ValidateLaunch(
 		}
 	}
 
-	// Per-task board edges from the full snapshot (not a separate incomplete list).
-	board := filterInvolving(snap.Edges, taskRef)
-	// Also include edges matched by immutable task ID.
-	for _, e := range snap.Edges {
-		if e.SourceID == taskID || e.TargetID == taskID {
-			if e.SourceRef != taskRef && e.TargetRef != taskRef {
-				board = append(board, e)
-			}
-		}
-	}
+	// Per-task board edges by ref AND immutable ID (never drop ID-only matches).
+	board := FilterInvolvingTask(snap.Edges, taskRef, taskID)
 
 	desiredEdges, derr := desired.DesiredBlocks()
 	if derr != nil {
@@ -256,6 +250,7 @@ type ClaimCompensateFunc func(ctx context.Context, taskID TaskID, reason string)
 // FencedClaim runs pre-claim gate, claimFn, then post-claim re-validation.
 // On post-claim drift, compensateFn is invoked (fail-closed if compensation fails).
 // Atomic claim+graph is unavailable on most providers; this is the TOCTOU close.
+// selectionRevision is REQUIRED (no optional/no-op fence).
 func FencedClaim(
 	ctx context.Context,
 	store RelationStore,
@@ -266,12 +261,21 @@ func FencedClaim(
 	claimFn func(ctx context.Context) error,
 	compensateFn ClaimCompensateFunc,
 ) (*GateResult, error) {
+	if strings.TrimSpace(selectionRevision) == "" {
+		return nil, &BlockedError{
+			Ref: taskRef, Code: "toctou",
+			Reason: ErrClaimFence.Error() + "; selection revision required",
+		}
+	}
+	if claimFn == nil {
+		return nil, fmt.Errorf("deps: claimFn required")
+	}
+	if compensateFn == nil {
+		return nil, fmt.Errorf("deps: compensateFn required (no no-op fence)")
+	}
 	pre, err := ValidateClaim(ctx, store, taskRef, desired, selectionRevision)
 	if err != nil {
 		return pre, err
-	}
-	if claimFn == nil {
-		return pre, fmt.Errorf("deps: claimFn required")
 	}
 	if err := claimFn(ctx); err != nil {
 		return pre, err
@@ -280,14 +284,75 @@ func FencedClaim(
 	post, perr := ValidateClaim(ctx, store, taskRef, desired, pre.GraphRevision)
 	if perr != nil {
 		reason := "post_claim_graph_drift"
-		if compensateFn != nil {
-			if cErr := compensateFn(ctx, taskID, reason); cErr != nil {
-				return post, fmt.Errorf("%w: %v; compensate failed: %w", ErrPostClaimDrift, perr, cErr)
-			}
+		if cErr := compensateFn(ctx, taskID, reason); cErr != nil {
+			return post, fmt.Errorf("%w: %v; compensate failed: %w", ErrPostClaimDrift, perr, cErr)
 		}
 		return post, fmt.Errorf("%w: %v", ErrPostClaimDrift, perr)
 	}
 	return post, nil
+}
+
+// FencedLaunch binds selection→side-effect→post-check for dispatch (and any
+// path that mutates worktree/status without a separate claim lease).
+//
+//  1. ValidateLaunch (selection) → revision R
+//  2. ValidateLaunch with R (re-read before first side effect)
+//  3. sideEffectFn
+//  4. ValidateLaunch with R again; on drift run compensateFn
+//
+// selectionRevision may be empty on step 1; step 2 always binds R. No optional fence.
+func FencedLaunch(
+	ctx context.Context,
+	store RelationStore,
+	entrypoint LaunchEntrypoint,
+	taskRef Ref,
+	taskID TaskID,
+	desired *Provenance,
+	sideEffectFn func(ctx context.Context, pre *GateResult) error,
+	compensateFn ClaimCompensateFunc,
+) (*GateResult, error) {
+	if sideEffectFn == nil {
+		return nil, fmt.Errorf("deps: sideEffectFn required")
+	}
+	if compensateFn == nil {
+		return nil, fmt.Errorf("deps: compensateFn required (no no-op fence)")
+	}
+	// Selection snapshot.
+	sel, err := ValidateLaunch(ctx, store, entrypoint, taskRef, desired, "")
+	if err != nil {
+		return sel, err
+	}
+	// Re-read immediately before first side effect, bound to selection revision.
+	pre, err := ValidateLaunch(ctx, store, entrypoint, taskRef, desired, sel.GraphRevision)
+	if err != nil {
+		return pre, err
+	}
+	if err := sideEffectFn(ctx, pre); err != nil {
+		_ = compensateFn(ctx, taskID, "side_effect_failed")
+		return pre, err
+	}
+	post, perr := ValidateLaunch(ctx, store, entrypoint, taskRef, desired, pre.GraphRevision)
+	if perr != nil {
+		if cErr := compensateFn(ctx, taskID, "post_launch_graph_drift"); cErr != nil {
+			return post, fmt.Errorf("%w: %v; compensate failed: %w", ErrPostClaimDrift, perr, cErr)
+		}
+		return post, fmt.Errorf("%w: %v", ErrPostClaimDrift, perr)
+	}
+	return post, nil
+}
+
+// RequireTaskLaunch is the ONLY public production entry for task-scoped launch
+// eligibility checks used by cmd/herd entrypoints. It is a thin alias so
+// standing/shot/lost cannot "pass" by blank-identifier assignment.
+func RequireTaskLaunch(
+	ctx context.Context,
+	store RelationStore,
+	entrypoint LaunchEntrypoint,
+	taskRef Ref,
+	desired *Provenance,
+	selectionRevision string,
+) (*GateResult, error) {
+	return ValidateLaunch(ctx, store, entrypoint, taskRef, desired, selectionRevision)
 }
 
 // SelectEligibleRefs filters candidates by the launch gate, preserving

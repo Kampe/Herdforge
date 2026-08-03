@@ -1,6 +1,7 @@
 package deps
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -11,17 +12,22 @@ import (
 // authoritative — free-text "depends on FAC-X" is never parsed as authority.
 const ProvenanceFence = "herd-deps-v1"
 
-// ParseProvenanceJSON unmarshals versioned structured dependency provenance.
-// Rejects unknown versions and malformed edges/holds (no silent drops).
-// Empty input is missing provenance (Present=false), not OK.
+// ParseProvenanceJSON unmarshals with DisallowUnknownFields. Rejects unknown
+// versions, missing task_ref, and malformed edges/holds. Empty input is missing.
 func ParseProvenanceJSON(raw []byte) (*Provenance, error) {
-	raw = []byte(strings.TrimSpace(string(raw)))
+	raw = bytes.TrimSpace(raw)
 	if len(raw) == 0 {
 		return &Provenance{Present: false}, fmt.Errorf("%w", ErrMissingProvenance)
 	}
+	// Reject trailing garbage after one JSON value + unknown fields.
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.DisallowUnknownFields()
 	var p Provenance
-	if err := json.Unmarshal(raw, &p); err != nil {
+	if err := dec.Decode(&p); err != nil {
 		return nil, fmt.Errorf("deps: structured provenance JSON invalid: %w", err)
+	}
+	if dec.More() {
+		return nil, fmt.Errorf("deps: trailing JSON after provenance record")
 	}
 	p.Present = true
 	if p.Version == 0 {
@@ -33,19 +39,33 @@ func ParseProvenanceJSON(raw []byte) (*Provenance, error) {
 	return &p, nil
 }
 
-// ExtractProvenanceFromText finds a fenced ```herd-deps-v1 JSON block.
-// Does NOT scan free prose for FAC-N mentions.
+// ExtractProvenanceFromText finds exactly one fenced ```herd-deps-v1 JSON block.
+// Multiple fences, conflicting content, or trailing junk after the fence fail closed.
 // No fence => Present=false (missing) — never invent empty OK provenance.
 func ExtractProvenanceFromText(text string) (*Provenance, error) {
 	const open = "```" + ProvenanceFence
-	idx := strings.Index(text, open)
-	if idx < 0 {
+	// Count openings.
+	count := 0
+	search := text
+	for {
+		i := strings.Index(search, open)
+		if i < 0 {
+			break
+		}
+		count++
+		search = search[i+len(open):]
+	}
+	if count == 0 {
 		trim := strings.TrimSpace(text)
 		if strings.HasPrefix(trim, "{") && strings.Contains(trim, `"version"`) && strings.Contains(trim, `"edges"`) {
 			return ParseProvenanceJSON([]byte(trim))
 		}
 		return &Provenance{Present: false}, nil
 	}
+	if count > 1 {
+		return nil, fmt.Errorf("deps: multiple %s fences (want exactly one)", ProvenanceFence)
+	}
+	idx := strings.Index(text, open)
 	rest := text[idx+len(open):]
 	rest = strings.TrimPrefix(rest, "\n")
 	rest = strings.TrimPrefix(rest, "\r\n")
@@ -53,11 +73,21 @@ func ExtractProvenanceFromText(text string) (*Provenance, error) {
 	if end < 0 {
 		return nil, fmt.Errorf("deps: unclosed %s fence", ProvenanceFence)
 	}
-	return ParseProvenanceJSON([]byte(rest[:end]))
+	body := rest[:end]
+	// After closing fence, only whitespace is allowed (no second JSON payload).
+	after := strings.TrimSpace(rest[end+3:])
+	if after != "" && strings.Contains(after, "```"+ProvenanceFence) {
+		return nil, fmt.Errorf("deps: multiple %s fences", ProvenanceFence)
+	}
+	// Reject a second bare JSON object after the fence (conflicting authority).
+	if strings.HasPrefix(after, "{") && strings.Contains(after, `"edges"`) {
+		return nil, fmt.Errorf("deps: conflicting provenance after fence (trailing JSON)")
+	}
+	return ParseProvenanceJSON([]byte(body))
 }
 
 // EmptyProvenance returns an explicit versioned empty record (Present=true)
-// for tasks with zero declared dependencies. Still requires board extras check.
+// for tasks with zero declared dependencies. task_ref is required.
 func EmptyProvenance(taskRef Ref) *Provenance {
 	return &Provenance{
 		Version: SchemaVersion,
@@ -67,8 +97,27 @@ func EmptyProvenance(taskRef Ref) *Provenance {
 	}
 }
 
-// FormatProvenanceFence renders provenance as a fenced authoritative block
-// suitable for TASK-PACKET.md and lifecycle records.
+// BindAndValidate requires Present provenance, exact task_ref match, and when
+// taskID is known, optional task_id must match (prevents fence replay across cards).
+func (p *Provenance) BindAndValidate(taskRef Ref, taskID TaskID) error {
+	if err := p.Validate(); err != nil {
+		return err
+	}
+	want := Ref(strings.TrimSpace(string(taskRef)))
+	got := Ref(strings.TrimSpace(string(p.TaskRef)))
+	if !got.Valid() {
+		return fmt.Errorf("deps: provenance task_ref required")
+	}
+	if !strings.EqualFold(string(got), string(want)) {
+		return fmt.Errorf("deps: provenance task_ref %q does not bind to task %q (replay rejected)", got, want)
+	}
+	if p.TaskID.Valid() && taskID.Valid() && p.TaskID != taskID {
+		return fmt.Errorf("deps: provenance task_id %q does not bind to immutable id %q", p.TaskID, taskID)
+	}
+	return nil
+}
+
+// FormatProvenanceFence renders provenance as a fenced authoritative block.
 func FormatProvenanceFence(p *Provenance) string {
 	if p == nil {
 		p = EmptyProvenance("")
@@ -76,7 +125,6 @@ func FormatProvenanceFence(p *Provenance) string {
 	if p.RecordedAt.IsZero() {
 		p.RecordedAt = time.Now().UTC()
 	}
-	// Do not call Validate here for marshaling output we authored.
 	b, err := json.MarshalIndent(struct {
 		Version          int              `json:"version"`
 		TaskRef          Ref              `json:"task_ref"`
@@ -104,4 +152,36 @@ func PacketSection(p *Provenance) string {
 	b.WriteString("Machine-readable only. Markdown prose is display-only and is never eligibility authority.\n\n")
 	b.WriteString(FormatProvenanceFence(p))
 	return b.String()
+}
+
+// AppendOrReplaceFence replaces an existing herd-deps-v1 fence or appends one.
+// Used by migration apply. Does not parse free-text dependencies.
+func AppendOrReplaceFence(description string, p *Provenance) (string, error) {
+	if p == nil || !p.Present {
+		return "", fmt.Errorf("%w", ErrMissingProvenance)
+	}
+	if err := p.Validate(); err != nil {
+		return "", err
+	}
+	fence := FormatProvenanceFence(p)
+	const open = "```" + ProvenanceFence
+	idx := strings.Index(description, open)
+	if idx < 0 {
+		base := strings.TrimRight(description, "\n")
+		if base == "" {
+			return fence, nil
+		}
+		return base + "\n\n" + fence, nil
+	}
+	rest := description[idx+len(open):]
+	endRel := strings.Index(rest, "```")
+	if endRel < 0 {
+		return "", fmt.Errorf("deps: unclosed fence while replacing")
+	}
+	end := idx + len(open) + endRel + 3
+	// Consume trailing newline after fence.
+	for end < len(description) && (description[end] == '\n' || description[end] == '\r') {
+		end++
+	}
+	return description[:idx] + fence + description[end:], nil
 }

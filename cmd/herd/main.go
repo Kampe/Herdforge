@@ -21,7 +21,6 @@ import (
 	"github.com/Kampe/Herdforge/pkg/attention"
 	"github.com/Kampe/Herdforge/pkg/config"
 	"github.com/Kampe/Herdforge/pkg/daemon"
-	"github.com/Kampe/Herdforge/pkg/deps"
 	"github.com/Kampe/Herdforge/pkg/dispatch"
 	"github.com/Kampe/Herdforge/pkg/harvest"
 	"github.com/Kampe/Herdforge/pkg/herdr"
@@ -897,9 +896,9 @@ func runDaemon() {
 }
 
 func runStanding() {
-	// FAC-159: standing launches lane agents, not task claims. Task-scoped
-	// worktrees still go through dispatch/pulse gates. Keep entrypoint linked.
-	assertDepsEntrypoint(deps.EntryStanding)
+	// FAC-159: standing raises fleet tabs only — it does not claim tasks or
+	// create task worktrees. Task-scoped launches must go through
+	// herd dispatch / herd pulse (RequireTaskLaunch / FencedClaim). No theater.
 
 	cfg, err := config.LoadConfig(".herd/herd.yaml")
 	if err != nil {
@@ -2138,10 +2137,9 @@ func stateDir() string {
 
 // runLost ports bin/herd-lost: subjects-not-patch-ids, owned-is-not-lost.
 // Exit 0 clean, 1 when an ownerless branch holds unmerged subjects, 2 usage.
-// FAC-159: recovery/rescue re-dispatch of tasks must use dispatch/pulse gates.
+// FAC-159: lost is diagnostic only. Re-dispatch of recovered work must go
+// through herd dispatch (RequireTaskLaunch + fenced post-check).
 func runLost() {
-	assertDepsEntrypoint(deps.EntryRescue)
-	assertDepsEntrypoint(deps.EntryRecovery)
 	fs := flag.NewFlagSet("lost", flag.ExitOnError)
 	quiet := fs.Bool("quiet", false, "Only status lines, no per-branch tables")
 	noFetch := fs.Bool("no-fetch", false, "Skip git fetch origin")
@@ -3117,9 +3115,8 @@ func runToolProbe() {
 
 // runShoot (FAC-88): `herd shoot <pane|name> <refocus msg>` interrupts a
 // stalled agent (escape) and refocuses it, without killing the pane.
-// FAC-159: shot is refocus-only; new task launches must pass the deps gate via dispatch.
+// FAC-159: shot is refocus-only; new task launches must pass RequireTaskLaunch via dispatch.
 func runShoot() {
-	assertDepsEntrypoint(deps.EntryShot)
 	if len(os.Args) < 4 {
 		fmt.Fprintln(os.Stderr, "usage: herd shoot <pane|name> <refocus message>")
 		os.Exit(2)
@@ -3199,10 +3196,9 @@ func (d *cliForgeDriver) herd(args ...string) error {
 }
 
 func (d *cliForgeDriver) Dispatch(ctx context.Context, t *provider.Task) error {
-	// FAC-159: wave/forge dispatch goes through herd dispatch which runs the
-	// pre-side-effect dependency gate before any worktree/status/tab.
-	assertDepsEntrypoint(deps.EntryWave)
-	assertDepsEntrypoint(deps.EntryForge)
+	// FAC-159: wave/forge always route through `herd dispatch`, which runs
+	// RequireTaskLaunch (selection + re-read) before worktree/status/tab and
+	// post-validates with compensation on graph drift.
 	return d.herd("dispatch", t.Ref, "--lane", "worker")
 }
 
