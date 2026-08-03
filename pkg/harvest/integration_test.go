@@ -1228,3 +1228,72 @@ func assertNeverMerged(t *testing.T, res *IntegrationResult, fd *recordingDispat
 		}
 	}
 }
+
+// TestRunReviewGate_CandidateNotOnCurrentIntegrationTreeRefuses is the
+// mutation-proof gate for ensureCandidateOnBranch (FAC-149 acceptance:
+// current-integration-tree guard must not be vacuous).
+//
+// Setup: a fully valid Admit-satisfying PASS exists for candidateSHA, and
+// the caller asserts correct task/lease/session provenance — so Admit
+// alone WOULD admit. The worktree HEAD has then advanced past that
+// commit (reset to origin/main), so candidateSHA is no longer on the
+// current integration tree.
+//
+// Deleting the ensureCandidateOnBranch call in runReviewGate turns this
+// test red: the gate would fall through to Admit and report Eligible=true.
+func TestRunReviewGate_CandidateNotOnCurrentIntegrationTreeRefuses(t *testing.T) {
+	ctx := context.Background()
+	root, _ := setupRepoWithRemote(t)
+
+	wt := createWorktree(t, root, "task/FAC-149-off-tree")
+	writeFileHarvest(t, wt, "feat.go", "package offtree")
+	candidateSHA := addAndCommitHarvest(t, wt, "feat: FAC-149 off-tree candidate", "feat.go")
+
+	l := setupLedger(t, root)
+	// Full valid receipt — Admit would pass if the tree guard were absent.
+	recordPass(t, l, candidateSHA, "FAC-149")
+
+	// Advance the worktree off the candidate: HEAD is now origin/main, so
+	// candidateSHA is a real object but NOT an ancestor of HEAD.
+	gitInHarvest(t, wt, "reset", "--hard", "origin/main")
+	head := gitInHarvest(t, wt, "rev-parse", "HEAD")
+	if head == candidateSHA {
+		t.Fatal("reset left HEAD on candidate; cannot exercise off-tree guard")
+	}
+	// Object still resolvable (no gc) but not on current branch.
+	if _, err := gitOutput(ctx, wt, "rev-parse", "--verify", "-q", candidateSHA+"^{commit}"); err != nil {
+		t.Fatalf("candidate object must still resolve for the guard to distinguish 'missing' from 'off-tree': %v", err)
+	}
+	if err := runGit(ctx, wt, "merge-base", "--is-ancestor", candidateSHA, "HEAD"); err == nil {
+		t.Fatal("candidate must not be ancestor of HEAD after reset")
+	}
+
+	h := NewHarvester(root)
+	in := NewIntegration(h, nil, &recordingDispatcher{}, l, root, withAdmit("FAC-149"))
+	uw := UnmergedWork{
+		WorktreePath: wt,
+		Branch:       "task/FAC-149-off-tree",
+		Unmerged:     []string{candidateSHA},
+	}
+	outcome := in.runReviewGate(ctx, candidateSHA, uw)
+
+	if outcome.Eligible {
+		t.Fatalf("off-tree candidate with valid Admit receipt must not be eligible; got %+v\n"+
+			"(if this fails only after deleting ensureCandidateOnBranch, the guard was vacuous — keep the test)",
+			outcome)
+	}
+	if outcome.Reason != "candidate not current on integration tree" {
+		t.Fatalf("reason = %q, want %q (err=%q)", outcome.Reason, "candidate not current on integration tree", outcome.Err)
+	}
+	if outcome.SHA != candidateSHA {
+		t.Fatalf("outcome SHA = %s, want %s", outcome.SHA, candidateSHA)
+	}
+
+	// Control: the SAME receipt admits when the candidate IS on HEAD again.
+	// Proves we are not accidentally failing Admit for other reasons.
+	gitInHarvest(t, wt, "reset", "--hard", candidateSHA)
+	onTree := in.runReviewGate(ctx, candidateSHA, uw)
+	if !onTree.Eligible {
+		t.Fatalf("control: candidate on HEAD with valid receipt must admit, got %+v", onTree)
+	}
+}
