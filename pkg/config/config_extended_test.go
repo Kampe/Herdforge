@@ -37,6 +37,19 @@ func TestValidate_MissingTaskProviderType(t *testing.T) {
 	}
 }
 
+func TestValidate_LinearRequiresNonBlankProjectID(t *testing.T) {
+	for _, projectID := range []string{"", " \t "} {
+		cfg := &Config{
+			Version:      "1",
+			Project:      ProjectConfig{Name: "test"},
+			TaskProvider: TaskProvider{Type: "linear", ProjectID: projectID},
+		}
+		if err := cfg.Validate(); err == nil {
+			t.Fatalf("project_id=%q: expected validation error", projectID)
+		}
+	}
+}
+
 func TestLoadConfig_InvalidYAML(t *testing.T) {
 	tmpDir := t.TempDir()
 	cfgPath := filepath.Join(tmpDir, "herd.yaml")

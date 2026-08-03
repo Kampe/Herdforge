@@ -2,6 +2,7 @@ package provider
 
 import (
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -38,13 +39,17 @@ func NewProductionProvider(tc TaskConfig) (TaskProvider, error) {
 		ApplyDeadlines(k, dls)
 		return NewBoundClient(k, dls), nil
 	case "linear":
-		if tc.APIKey == "" {
+		if strings.TrimSpace(tc.APIKey) == "" {
 			return nil, fmt.Errorf("task_provider.api_key_env is required for linear")
 		}
-		l := NewLinearProvider(tc.APIKey)
-		if tc.APIURL != "" {
-			l.BaseURL = tc.APIURL
+		projectID := strings.TrimSpace(tc.ProjectID)
+		if projectID == "" {
+			return nil, fmt.Errorf("linear task_provider.project_id is required")
 		}
+		// Linear's endpoint is fixed. Never accept repository-controlled api_url
+		// here: doing so would send the operator's Linear credential to that URL.
+		l := NewLinearProvider(strings.TrimSpace(tc.APIKey))
+		l.ProjectID = projectID
 		ApplyDeadlines(l, dls)
 		return NewBoundClient(l, dls), nil
 	case "memory":

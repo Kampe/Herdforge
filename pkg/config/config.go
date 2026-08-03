@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -256,6 +257,9 @@ func (c *Config) Validate() error {
 	}
 	if c.TaskProvider.Type == "" {
 		return fmt.Errorf("missing required field: task_provider.type")
+	}
+	if strings.EqualFold(strings.TrimSpace(c.TaskProvider.Type), "linear") && strings.TrimSpace(c.TaskProvider.ProjectID) == "" {
+		return fmt.Errorf("missing required field: task_provider.project_id for linear")
 	}
 	if _, _, _, _, _, err := c.TaskProvider.Deadlines.Resolved(); err != nil {
 		return err
