@@ -276,7 +276,11 @@ func (g *DiskGuard) evaluate(operation string, th DiskThresholds, stats []DiskSt
 		return pe
 	}
 
-	if g.state == DiskBlocked || g.state == DiskRecovering {
+	// The recover floor applies while blocked/recovering AND on a fresh
+	// process's first probe (state ""): a restart cannot know whether the
+	// previous process was blocked, so landing inside the recovery band
+	// reconstructs recovering conservatively instead of erasing hysteresis.
+	if g.state == DiskBlocked || g.state == DiskRecovering || g.state == "" {
 		if bad := below(stats, th.RecoverFreeBytes, th.RecoverFreePct, th.MinInodePct); bad != nil {
 			g.state = DiskRecovering
 			pe := &DiskPressureError{

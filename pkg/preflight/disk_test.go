@@ -234,9 +234,9 @@ func TestDiskGuardUnreadableStatusLabel(t *testing.T) {
 }
 
 func TestDiskGuardRestartReconciliation(t *testing.T) {
-	// Old process blocked; a NEW guard (restart) with healthy disk goes
-	// straight to ok on first probe — no persisted pressure to replay, and
-	// no recover-floor requirement applies to a fresh process.
+	// Old process blocked; a restart must NOT erase hysteresis. A fresh
+	// guard whose first probe lands inside the recovery band (above block,
+	// below recover floor) reconstructs recovering and keeps refusing.
 	t.Setenv(EnvDiskMinFreeGB, "15")
 	old := NewDiskGuard(fakeProber(map[string]DiskStat{"/repo": incidentStat("/repo", "a")}, nil))
 	_ = old.Check("dispatch", "/repo")
@@ -248,11 +248,23 @@ func TestDiskGuardRestartReconciliation(t *testing.T) {
 	st.FreeBytes = 16 << 30 // above block floor (15GiB), below recover floor (18.75GiB)
 	st.FreePct = 50
 	fresh := NewDiskGuard(fakeProber(map[string]DiskStat{"/repo": st}, nil))
-	if err := fresh.Check("dispatch", "/repo"); err != nil {
-		t.Fatalf("fresh guard must reconcile from live probe, got: %v", err)
+	err := fresh.Check("dispatch", "/repo")
+	if err == nil {
+		t.Fatal("fresh guard in the recovery band must refuse, not resume")
 	}
-	if fresh.State() != DiskOK {
-		t.Fatalf("fresh guard state = %s", fresh.State())
+	pe := asPressureErr(t, err)
+	if pe.Reason != ReasonRecovering || fresh.State() != DiskRecovering {
+		t.Fatalf("expected reconstructed recovering, got reason=%s state=%s", pe.Reason, fresh.State())
+	}
+
+	// Above the recover floor, a fresh process reconciles straight to ok.
+	st2 := healthyStat("/repo", "a")
+	fresh2 := NewDiskGuard(fakeProber(map[string]DiskStat{"/repo": st2}, nil))
+	if err := fresh2.Check("dispatch", "/repo"); err != nil {
+		t.Fatalf("fresh guard above recover floor must be ok: %v", err)
+	}
+	if fresh2.State() != DiskOK {
+		t.Fatalf("fresh guard state = %s", fresh2.State())
 	}
 }
 
