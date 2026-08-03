@@ -115,7 +115,7 @@ type LaunchDecision struct {
 	Proof           string         `json:"proof"`
 }
 
-const decisionProofKey = "herdforge-fac-175-launch-decision-v1"
+const decisionProofDomain = "herdforge-fac-175-launch-decision-v1"
 
 func decisionProof(d LaunchDecision) string {
 	norm := func(v string) string {
@@ -125,7 +125,7 @@ func decisionProof(d LaunchDecision) string {
 		}
 		return v
 	}
-	canonical := fmt.Sprintf("%s|%s|%s|%s|%s|%s|%s|%d|%s|%s|%s|%s", decisionProofKey, norm(string(d.Role)), norm(d.Shape), norm(d.Provider), norm(d.Model), norm(d.Effort), d.CandidateSHA, d.LeaseGeneration, d.TaskRef, d.ProbeKey, d.Rationale, strings.Join(d.Argv, "\x00"))
+	canonical := fmt.Sprintf("%s|%s|%s|%s|%s|%s|%s|%d|%s|%s|%s|%s", decisionProofDomain, norm(string(d.Role)), norm(d.Shape), norm(d.Provider), norm(d.Model), norm(d.Effort), d.CandidateSHA, d.LeaseGeneration, d.TaskRef, d.ProbeKey, d.Rationale, strings.Join(d.Argv, "\x00"))
 	sum := sha256.Sum256([]byte(canonical))
 	return "sha256:" + hex.EncodeToString(sum[:])
 }
