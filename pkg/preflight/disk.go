@@ -25,6 +25,7 @@ import (
 	"strconv"
 	"sync"
 	"syscall"
+	"time"
 )
 
 // Env-configurable reserve thresholds. Zero disables that axis.
@@ -149,6 +150,7 @@ const (
 	ReasonStatUnreadable = "disk_stat_unreadable"
 	ReasonRecovering     = "disk_pressure_recovering"
 	ReasonScopeUnknown   = "disk_scope_unknown"
+	ReasonLedgerError    = "disk_ledger_unreadable"
 )
 
 const safeNextAction = "refusing new fleet mutations; nothing was deleted — reclaim space only via the safe-GC contract (never ad-hoc force removal), then retry after a fresh probe shows headroom above the recover threshold"
@@ -191,11 +193,7 @@ type DiskGuard struct {
 	prober       DiskProber
 	vols         map[string]DiskGuardState // per-FSID hysteresis state
 	lastEvidence *DiskPressureError
-	// outstanding is the sum of admitted-but-unreleased capacity
-	// reservations, subtracted from observed free space so concurrent
-	// fan-out is bounded by real remaining headroom.
-	outstanding uint64
-	sink        DiskEvidenceSink
+	sink         DiskEvidenceSink
 }
 
 // DiskEvidenceSink receives structured pressure state TRANSITIONS for
@@ -341,8 +339,9 @@ func (g *DiskGuard) Check(operation string, paths ...string) error {
 // (worktree create, dispatch/launch, review/approve/renudge side effects,
 // archive/integration, future verifier fan-out). Probe + state transition
 // run serialized; on admission the configured per-mutation headroom is
-// reserved and subtracted from every concurrent caller's view until the
-// returned release func runs. Release is idempotent.
+// reserved in the HOST-WIDE cross-process ledger for every involved
+// filesystem identity, heartbeat-refreshed until the idempotent release
+// runs. A crashed owner stops heartbeating and its reservation expires.
 func (g *DiskGuard) Admit(operation string, paths ...string) (func(), error) {
 	g.opMu.Lock()
 	defer g.opMu.Unlock()
@@ -351,22 +350,102 @@ func (g *DiskGuard) Admit(operation string, paths ...string) (func(), error) {
 	if err := g.evaluate(operation, th, stats, unreadable); err != nil {
 		return nil, err
 	}
-	res := th.HeadroomBytes
-	g.mu.Lock()
-	g.outstanding += res
-	g.mu.Unlock()
+	entries, err := reserveOnAll(stats, th.HeadroomBytes, operation, "", envInt(EnvDiskLeaseTTLSec, defaultLeaseTTLSec))
+	if err != nil {
+		return nil, err
+	}
+	stop := make(chan struct{})
+	if len(entries) > 0 {
+		go heartbeatLoop(entries, stop)
+	}
 	var once sync.Once
 	return func() {
 		once.Do(func() {
-			g.mu.Lock()
-			if g.outstanding >= res {
-				g.outstanding -= res
-			} else {
-				g.outstanding = 0
+			close(stop)
+			var l diskLedger
+			for _, e := range entries {
+				l.release(e.FSID, e.ID)
 			}
-			g.mu.Unlock()
 		})
 	}, nil
+}
+
+// reserveOnAll writes one ledger entry per distinct filesystem identity;
+// on any failure it rolls back what it wrote and fails closed.
+func reserveOnAll(stats []DiskStat, bytes uint64, operation, session string, ttlSec int64) ([]ledgerEntry, error) {
+	if bytes == 0 {
+		return nil, nil
+	}
+	var l diskLedger
+	now := time.Now()
+	var entries []ledgerEntry
+	for _, st := range stats {
+		e := ledgerEntry{
+			ID: newLedgerID(), FSID: st.FSID, Bytes: bytes, Operation: operation,
+			Session: session, PID: os.Getpid(), CreatedAt: now, HeartbeatAt: now, TTLSec: ttlSec,
+		}
+		if err := l.reserve(e); err != nil {
+			for _, w := range entries {
+				l.release(w.FSID, w.ID)
+			}
+			return nil, &DiskPressureError{
+				State: "BLOCKED", Reason: ReasonLedgerError, Operation: operation,
+				Detail:     "cannot record cross-process reservation (failing closed): " + redactErr(err).Error(),
+				NextAction: safeNextAction,
+			}
+		}
+		entries = append(entries, e)
+	}
+	return entries, nil
+}
+
+func heartbeatLoop(entries []ledgerEntry, stop <-chan struct{}) {
+	ttl := time.Duration(envInt(EnvDiskLeaseTTLSec, defaultLeaseTTLSec)) * time.Second
+	t := time.NewTicker(ttl / 3)
+	defer t.Stop()
+	var l diskLedger
+	for {
+		select {
+		case <-stop:
+			return
+		case <-t.C:
+			for _, e := range entries {
+				l.heartbeat(e.FSID, e.ID)
+			}
+		}
+	}
+}
+
+// AcquireTaskDiskLease admits and then binds a capacity lease to a TASK
+// SESSION (e.g. its ref) rather than this process: the ledger entries
+// survive process exit, covering the high-growth worktree+build+verify
+// interval, until ReleaseTaskDiskLease or wall-clock TTL expiry. Re-
+// acquiring for the same session first releases the previous lease
+// (idempotent, no double-count).
+func AcquireTaskDiskLease(operation, session string, paths ...string) error {
+	return DefaultDiskGuard.AcquireTaskLease(operation, session, paths...)
+}
+
+func (g *DiskGuard) AcquireTaskLease(operation, session string, paths ...string) error {
+	if session == "" {
+		return fmt.Errorf("task disk lease requires a session key")
+	}
+	g.opMu.Lock()
+	defer g.opMu.Unlock()
+	var l diskLedger
+	l.releaseSession(session)
+	th := loadDiskThresholds()
+	stats, unreadable := g.probeAll(operation, th, paths)
+	if err := g.evaluate(operation, th, stats, unreadable); err != nil {
+		return err
+	}
+	_, err := reserveOnAll(stats, th.HeadroomBytes, operation, session, envInt(EnvDiskTaskLeaseTTLSec, defaultTaskLeaseTTLSec))
+	return err
+}
+
+// ReleaseTaskDiskLease releases every ledger entry bound to session.
+func ReleaseTaskDiskLease(session string) {
+	diskLedger{}.releaseSession(session)
 }
 
 // AdmitDiskMutation is Admit on the process-wide default guard.
@@ -378,9 +457,21 @@ func AdmitDiskMutation(operation string, paths ...string) (func(), error) {
 // Advise route through here, so an unreadable probe ALWAYS blocks — unknown
 // capacity is never permission for even one mutation.
 func (g *DiskGuard) evaluate(operation string, th DiskThresholds, stats []DiskStat, unreadable *DiskPressureError) error {
+	outMap, ledgerErr := outstandingFor(stats)
+	if ledgerErr != nil && unreadable == nil {
+		unreadable = &DiskPressureError{
+			State:      "BLOCKED",
+			Reason:     ReasonLedgerError,
+			Operation:  operation,
+			Thresholds: th,
+			Detail:     "cross-process reservation ledger unreadable (failing closed): " + redactErr(ledgerErr).Error(),
+			NextAction: safeNextAction,
+		}
+	}
+
 	g.mu.Lock()
 	prev := g.worstLocked()
-	err := g.evaluateLocked(operation, th, stats, unreadable)
+	err := g.evaluateLocked(operation, th, stats, unreadable, outMap)
 	next, ev, sink := g.worstLocked(), g.lastEvidence, g.sink
 	g.mu.Unlock()
 	// Fire the projection seam only on state TRANSITIONS (including the
@@ -392,18 +483,50 @@ func (g *DiskGuard) evaluate(operation string, th DiskThresholds, stats []DiskSt
 	return err
 }
 
-// adjustForOutstanding subtracts admitted-but-unreleased reservations from
-// observed free space so concurrent fan-out is bounded by real remaining
+// outstandingFor reads live cross-process reservations for every probed
+// filesystem identity from the host ledger.
+func outstandingFor(stats []DiskStat) (map[string]uint64, error) {
+	out := make(map[string]uint64, len(stats))
+	var l diskLedger
+	for _, st := range stats {
+		n, err := l.outstanding(st.FSID)
+		if err != nil {
+			return nil, err
+		}
+		out[st.FSID] = n
+	}
+	return out, nil
+}
+
+func sumOutstanding(stats []DiskStat, out map[string]uint64) uint64 {
+	var sum uint64
+	seen := map[string]bool{}
+	for _, st := range stats {
+		if !seen[st.FSID] {
+			seen[st.FSID] = true
+			sum = satAdd(sum, out[st.FSID])
+		}
+	}
+	return sum
+}
+
+// adjustForOutstanding subtracts admitted-but-unreleased reservations
+// (per filesystem identity, host-wide) from observed free space so
+// concurrent fan-out across PROCESSES is bounded by real remaining
 // headroom, not N copies of the same snapshot.
-func adjustForOutstanding(stats []DiskStat, out uint64) []DiskStat {
-	if out == 0 {
+func adjustForOutstanding(stats []DiskStat, out map[string]uint64) []DiskStat {
+	if len(out) == 0 {
 		return stats
 	}
 	adj := make([]DiskStat, len(stats))
 	copy(adj, stats)
 	for i := range adj {
-		if adj[i].FreeBytes > out {
-			adj[i].FreeBytes -= out
+		o := out[adj[i].FSID]
+		if o == 0 {
+			continue
+		}
+		if adj[i].FreeBytes > o {
+			adj[i].FreeBytes -= o
 		} else {
 			adj[i].FreeBytes = 0
 		}
@@ -418,7 +541,7 @@ func adjustForOutstanding(stats []DiskStat, out uint64) []DiskStat {
 // Each probed volume transitions independently; the operation is refused
 // while ANY known volume (probed now or remembered from an earlier probe)
 // is not ok. Ready requires a fresh positive probe of every known volume.
-func (g *DiskGuard) evaluateLocked(operation string, th DiskThresholds, stats []DiskStat, unreadable *DiskPressureError) error {
+func (g *DiskGuard) evaluateLocked(operation string, th DiskThresholds, stats []DiskStat, unreadable *DiskPressureError, outMap map[string]uint64) error {
 	// Zero probed volumes is NOT health — an unknown volume scope fails
 	// closed exactly like an unreadable stat.
 	if unreadable == nil && len(stats) == 0 {
@@ -437,7 +560,8 @@ func (g *DiskGuard) evaluateLocked(operation string, th DiskThresholds, stats []
 		return unreadable
 	}
 
-	stats = adjustForOutstanding(stats, g.outstanding)
+	stats = adjustForOutstanding(stats, outMap)
+	outstandingSum := sumOutstanding(stats, outMap)
 
 	// Transition each probed volume independently.
 	var worstBad *DiskStat
@@ -484,7 +608,7 @@ func (g *DiskGuard) evaluateLocked(operation string, th DiskThresholds, stats []
 					Detail: fmt.Sprintf("volume vol-%s remains %s from an earlier probe; a fresh positive probe of that volume is required before ready",
 						fsid, vstate),
 					NextAction:               safeNextAction,
-					OutstandingReservedBytes: g.outstanding,
+					OutstandingReservedBytes: outstandingSum,
 				}
 				if vstate == DiskBlocked {
 					pe.Reason = ReasonDiskPressure
@@ -507,7 +631,7 @@ func (g *DiskGuard) evaluateLocked(operation string, th DiskThresholds, stats []
 				worstBad.Volume, float64(worstBad.FreeBytes)/bytesPerGiB, worstBad.FreePct, worstBad.FreeInodes,
 				float64(th.blockFreeBytes())/bytesPerGiB, th.MinFreePct),
 			NextAction:               safeNextAction,
-			OutstandingReservedBytes: g.outstanding,
+			OutstandingReservedBytes: outstandingSum,
 		}
 		g.lastEvidence = pe
 		return pe
@@ -521,7 +645,7 @@ func (g *DiskGuard) evaluateLocked(operation string, th DiskThresholds, stats []
 			Detail: fmt.Sprintf("volume %s above block floor but below recover floor (%.1fGiB / %.1f%%); holding closed until stable headroom",
 				worstBad.Volume, float64(th.RecoverFreeBytes)/bytesPerGiB, th.RecoverFreePct),
 			NextAction:               safeNextAction,
-			OutstandingReservedBytes: g.outstanding,
+			OutstandingReservedBytes: outstandingSum,
 		}
 		g.lastEvidence = pe
 		return pe

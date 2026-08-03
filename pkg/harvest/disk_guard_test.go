@@ -16,7 +16,16 @@ func TestMain(m *testing.M) {
 	os.Setenv(preflight.EnvDiskMinFreeGB, "0")
 	os.Setenv(preflight.EnvDiskMinFreePct, "0")
 	os.Setenv(preflight.EnvDiskMinInodePct, "0")
-	os.Exit(m.Run())
+	// Isolate the cross-process reservation ledger: tests must never read
+	// from or release into the host's real ledger.
+	dir, err := os.MkdirTemp("", "herd-disk-ledger-test-")
+	if err != nil {
+		panic(err)
+	}
+	os.Setenv(preflight.EnvDiskLedgerDir, dir)
+	code := m.Run()
+	os.RemoveAll(dir)
+	os.Exit(code)
 }
 
 func TestIntegrationRunRefusesUnderDiskPressure(t *testing.T) {

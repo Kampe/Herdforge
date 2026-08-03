@@ -251,13 +251,15 @@ func (w *WorktreeManager) CreateTaskWorktreeFrom(ctx context.Context, taskRef, d
 		return nil, fmt.Errorf("task ref is required")
 	}
 	// Fail closed before ANY mutation — including the durable anchor ref
-	// write below — when disk headroom is critical; the reservation is held
-	// for the whole creation (FAC-153).
-	release, err := w.admitDiskMutation("worktree_create")
-	if err != nil {
+	// write below — when disk headroom is critical. The capacity lease is
+	// bound to the TASK SESSION, not this process: it survives process
+	// exit across the high-growth worktree+build+verify interval, until
+	// harvest cleanup releases it or the task-lease TTL expires (FAC-153).
+	session := strings.ToLower(taskRef)
+	if err := preflight.AcquireTaskDiskLease("worktree_create", session,
+		w.RepoRoot, w.WorktreeDir, os.TempDir()); err != nil {
 		return nil, err
 	}
-	defer release()
 	branch := TaskBranch(taskRef)
 	targetPath := filepath.Join(w.WorktreeDir, strings.ToLower(taskRef))
 	anchorRef := AnchorRefFor(taskRef)

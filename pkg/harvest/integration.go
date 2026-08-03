@@ -579,6 +579,11 @@ func (in *Integration) runCleanup(ctx context.Context, uw UnmergedWork) (bool, e
 	// Delete the branch.
 	_ = runGit(ctx, in.RepoRoot, "branch", "-D", uw.Branch)
 
+	// Task completed and its lane is gone: release the task-session disk
+	// lease acquired at worktree creation (FAC-153). Session key is the
+	// worktree basename (lowercased task ref by construction).
+	preflight.ReleaseTaskDiskLease(filepath.Base(uw.WorktreePath))
+
 	return true, nil
 }
 

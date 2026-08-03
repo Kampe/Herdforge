@@ -10,6 +10,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func fakeProber(stats map[string]DiskStat, errs map[string]error) DiskProber {
@@ -430,6 +431,7 @@ func TestDiskGuardAdmitReservationsBoundConcurrentFanOut(t *testing.T) {
 	// 20GiB free above a 10GiB floor with a 4GiB per-mutation reservation:
 	// only 2 concurrent admissions fit ((20-10-4)/4 + 1); the rest refuse
 	// against reservation-adjusted free space, not N stale snapshots.
+	t.Setenv(EnvDiskLedgerDir, t.TempDir())
 	t.Setenv(EnvDiskMinFreeGB, "10")
 	t.Setenv(EnvDiskMinFreePct, "0")
 	t.Setenv(EnvDiskMinInodePct, "0")
@@ -667,5 +669,107 @@ func TestDiskGuardUnknownScopeClearsOnlyOnFullRecovery(t *testing.T) {
 	}
 	if g.State() != DiskOK {
 		t.Fatalf("state = %s", g.State())
+	}
+}
+
+func TestDiskLedgerCrossProcessAccounting(t *testing.T) {
+	t.Setenv(EnvDiskLedgerDir, t.TempDir())
+	t.Setenv(EnvDiskMinFreeGB, "10")
+	t.Setenv(EnvDiskMinFreePct, "0")
+	t.Setenv(EnvDiskMinInodePct, "0")
+	t.Setenv(EnvDiskBuildHeadroomGB, "4")
+	t.Setenv(EnvDiskRecoverFreeGB, "0.001")
+
+	st := healthyStat("/repo", "a")
+	st.FreeBytes = 20 << 30
+
+	// Two INDEPENDENT guards simulate two processes sharing the ledger:
+	// process 1 admits (holds 4GiB), process 2 sees only the remainder.
+	g1 := NewDiskGuard(fakeProber(map[string]DiskStat{"/repo": st}, nil))
+	g2 := NewDiskGuard(fakeProber(map[string]DiskStat{"/repo": st}, nil))
+	rel1, err := g1.Admit("worktree_create", "/repo")
+	if err != nil {
+		t.Fatalf("p1 admit: %v", err)
+	}
+	rel2, err := g2.Admit("worktree_create", "/repo")
+	if err != nil {
+		t.Fatalf("p2 admit (16GiB effective > 14 floor): %v", err)
+	}
+	g3 := NewDiskGuard(fakeProber(map[string]DiskStat{"/repo": st}, nil))
+	if _, err := g3.Admit("worktree_create", "/repo"); err == nil {
+		t.Fatal("p3 must be refused: 12GiB effective < 14GiB floor across processes")
+	}
+	rel1()
+	rel2()
+	if _, err := g3.Admit("worktree_create", "/repo"); err != nil {
+		t.Fatalf("after exact release p3 must admit: %v", err)
+	}
+}
+
+func TestDiskLedgerCrashExpiry(t *testing.T) {
+	t.Setenv(EnvDiskLedgerDir, t.TempDir())
+	// A reservation owned by a dead pid with a stale heartbeat is expired
+	// and pruned, freeing its capacity.
+	var l diskLedger
+	e := ledgerEntry{
+		ID: "dead", FSID: "a", Bytes: 8 << 30, Operation: "worktree_create",
+		PID: 999999999, CreatedAt: time.Now().Add(-time.Hour),
+		HeartbeatAt: time.Now().Add(-time.Hour), TTLSec: 300,
+	}
+	if err := l.reserve(e); err != nil {
+		t.Fatal(err)
+	}
+	sum, err := l.outstanding("a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sum != 0 {
+		t.Fatalf("dead owner's reservation still counted: %d", sum)
+	}
+	// A live-owner fresh-heartbeat entry counts.
+	e2 := ledgerEntry{
+		ID: "live", FSID: "a", Bytes: 4 << 30, Operation: "x",
+		PID: os.Getpid(), CreatedAt: time.Now(), HeartbeatAt: time.Now(), TTLSec: 300,
+	}
+	if err := l.reserve(e2); err != nil {
+		t.Fatal(err)
+	}
+	if sum, _ = l.outstanding("a"); sum != 4<<30 {
+		t.Fatalf("live reservation lost: %d", sum)
+	}
+}
+
+func TestTaskDiskLeaseSpansProcessesUntilReleased(t *testing.T) {
+	t.Setenv(EnvDiskLedgerDir, t.TempDir())
+	t.Setenv(EnvDiskMinFreeGB, "10")
+	t.Setenv(EnvDiskMinFreePct, "0")
+	t.Setenv(EnvDiskMinInodePct, "0")
+	t.Setenv(EnvDiskBuildHeadroomGB, "6")
+	t.Setenv(EnvDiskRecoverFreeGB, "0.001")
+
+	st := healthyStat("/repo", "a")
+	st.FreeBytes = 20 << 30
+	g := NewDiskGuard(fakeProber(map[string]DiskStat{"/repo": st}, nil))
+
+	// Task lease binds to the session, not this process: a fresh guard
+	// ("another process") still sees the held 6GiB through the whole
+	// worktree+build+verify interval.
+	if err := g.AcquireTaskLease("worktree_create", "fac-999", "/repo"); err != nil {
+		t.Fatalf("task lease: %v", err)
+	}
+	other := NewDiskGuard(fakeProber(map[string]DiskStat{"/repo": st}, nil))
+	if _, err := other.Admit("dispatch", "/repo"); err == nil {
+		t.Fatal("second admit must be refused: 20-6=14 effective, floor 10+6=16")
+	}
+	// Re-acquiring the same session does not double-count.
+	if err := g.AcquireTaskLease("worktree_create", "fac-999", "/repo"); err != nil {
+		t.Fatalf("idempotent re-acquire: %v", err)
+	}
+	// Completion releases by session key; capacity returns.
+	ReleaseTaskDiskLease("fac-999")
+	if rel, err := other.Admit("dispatch", "/repo"); err != nil {
+		t.Fatalf("post-release admit: %v", err)
+	} else {
+		rel()
 	}
 }
