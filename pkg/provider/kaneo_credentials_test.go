@@ -12,6 +12,8 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+
+	"github.com/Kampe/Herdforge/pkg/config"
 )
 
 func writeKaneoConfig(t *testing.T, root string, cfg kaneoCLIAuthConfig) string {
@@ -340,9 +342,9 @@ func TestAuthorizeKaneo_ProfileKeyNotExfiltratedToMaliciousRepoURL(t *testing.T)
 	}
 }
 
-// TestAuthorizeKaneo_ExplicitKeyBoundToProviderAPIURL only.
-func TestAuthorizeKaneo_ExplicitKeyBoundToProviderAPIURL(t *testing.T) {
-	t.Setenv("KANEO_API_KEY", "")
+// TestAuthorizeKaneo_EnvKeyBoundToOperatorOrigin proves repository APIURL
+// mutation cannot move a global environment key to a different origin.
+func TestAuthorizeKaneo_EnvKeyBoundToOperatorOrigin(t *testing.T) {
 	withUserConfigDir(t, t.TempDir())
 
 	var sawAuth atomic.Bool
@@ -364,27 +366,62 @@ func TestAuthorizeKaneo_ExplicitKeyBoundToProviderAPIURL(t *testing.T) {
 	t.Cleanup(evil.Close)
 
 	const key = "explicit-operator-key"
+	t.Setenv("KANEO_API_KEY", key)
+	t.Setenv("KANEO_API_URL", good.URL)
 	k := NewKaneoProvider(good.URL, "proj", false)
-	k.APIKey = key
 	if k.credentialForAPIURL() != key {
-		t.Fatal("explicit key must bind to provider APIURL origin")
+		t.Fatal("env key must authorize the independently trusted operator origin")
 	}
 	_, _ = k.listRelationsHTTPOnly(context.Background(), "t1")
 	if !sawAuth.Load() {
 		t.Fatal("good origin must receive Authorization for explicit key")
 	}
 
-	// Same key material must not authorize a different origin request.
+	// Repository mutation cannot move the already-bound environment key.
 	k.APIURL = evil.URL
-	// APIKey still set but bound to... credentialForRequestOrigin uses k.APIURL
-	// so after APIURL change, evil origin matches APIURL and WOULD authorize.
-	// That is correct: operator moved APIURL with the key. Exfil case is profile.
-	// Reset: provider with good URL key, request to evil.
-	k2 := &KaneoProvider{APIURL: good.URL, APIKey: key, Client: kaneoHTTPClient()}
+	if k.credentialForAPIURL() != "" {
+		t.Fatal("repository APIURL mutation must not move operator key authority")
+	}
+	_, _ = k.listRelationsHTTPOnly(context.Background(), "t1")
+
+	// Direct foreign-origin authorization also remains empty.
+	k2 := &KaneoProvider{
+		APIURL: good.URL, APIKey: key, KeyTrustedOrigin: good.URL, Client: kaneoHTTPClient(),
+	}
 	req, _ := http.NewRequest(http.MethodGet, evil.URL+"/api/x", nil)
 	k2.authorizeKaneo(req)
 	if req.Header.Get("Authorization") != "" {
 		t.Fatal("explicit key must not authorize foreign request origin")
+	}
+}
+
+func TestNewFromHerdConfig_CustomKeyEnvUsesOperatorOrigin(t *testing.T) {
+	withUserConfigDir(t, t.TempDir())
+	t.Setenv("FAC159_TEST_KANEO_KEY", "custom-env-key")
+	t.Setenv("KANEO_API_KEY", "")
+	t.Setenv("KANEO_API_URL", "https://operator.example.test")
+
+	tp, err := NewFromHerdConfig(&config.Config{TaskProvider: config.TaskProvider{
+		Type: "kaneo", ProjectID: "proj", UseCLI: true,
+		APIURL: "https://repo-controlled.example.test", APIKeyEnv: "FAC159_TEST_KANEO_KEY",
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bound, ok := tp.(*BoundClient)
+	if !ok {
+		t.Fatalf("want BoundClient, got %T", tp)
+	}
+	k, ok := bound.Inner.(*KaneoProvider)
+	if !ok {
+		t.Fatalf("want KaneoProvider, got %T", bound.Inner)
+	}
+	wantOrigin, _ := canonicalizeHTTPOrigin("https://operator.example.test")
+	if k.APIKey != "custom-env-key" || k.KeyTrustedOrigin != wantOrigin {
+		t.Fatalf("custom env key/origin binding mismatch: key=%v origin=%q", k.APIKey != "", k.KeyTrustedOrigin)
+	}
+	if k.credentialForAPIURL() != "" {
+		t.Fatal("repo-controlled APIURL must not be authorized by custom env key")
 	}
 }
 

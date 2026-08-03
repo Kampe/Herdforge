@@ -15,6 +15,9 @@ type TaskConfig struct {
 	UseCLI    bool
 	// APIKey for HTTP bulk graph fan-out (even when UseCLI is true).
 	APIKey string
+	// APIKeyTrustedOrigin is operator-controlled (KANEO_API_URL or selected
+	// profile origin). It must never be inferred from repository APIURL.
+	APIKeyTrustedOrigin string
 	// Optional resolved deadline parts (0 = package default).
 	Get, List, Mutate, Comment, Readback time.Duration
 }
@@ -30,6 +33,9 @@ func NewProductionProvider(tc TaskConfig) (TaskProvider, error) {
 		k := NewKaneoProvider(tc.APIURL, tc.ProjectID, tc.UseCLI)
 		if tc.APIKey != "" {
 			k.APIKey = tc.APIKey
+			// Always assign, including empty, so a direct/custom key cannot inherit
+			// the trust origin resolved for different ambient key material.
+			k.KeyTrustedOrigin = tc.APIKeyTrustedOrigin
 		}
 		ApplyDeadlines(k, dls)
 		return NewBoundClient(k, dls), nil

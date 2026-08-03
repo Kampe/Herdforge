@@ -79,6 +79,7 @@ func TestKaneoListProjectRelations_WithKey_HTTPFanoutNotCLI(t *testing.T) {
 	var httpRels atomic.Int64
 	var cliRel atomic.Int64
 	var cliList atomic.Int64
+	var cliPages []string
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -114,11 +115,20 @@ func TestKaneoListProjectRelations_WithKey_HTTPFanoutNotCLI(t *testing.T) {
 					page = args[i+1]
 				}
 			}
-			if page != "1" {
+			cliPages = append(cliPages, page)
+			start, end := 0, 0
+			switch page {
+			case "1":
+				start, end = 1, 100
+			case "2":
+				start, end = 101, n
+			case "3":
 				return &CLIResult{Stdout: []byte(`[]`)}, nil
+			default:
+				t.Fatalf("unexpected task-list page %s", page)
 			}
 			var tasks []map[string]string
-			for i := 1; i <= n; i++ {
+			for i := start; i <= end; i++ {
 				tasks = append(tasks, map[string]string{
 					"id": fmt.Sprintf("id-%d", i), "ref": fmt.Sprintf("FAC-%d", i),
 					"status": "to-do", "title": "t", "projectId": "proj",
@@ -137,10 +147,11 @@ func TestKaneoListProjectRelations_WithKey_HTTPFanoutNotCLI(t *testing.T) {
 
 	// Isolate profile resolver; credentials come only from explicit APIKey.
 	withUserConfigDir(t, t.TempDir())
-	t.Setenv("KANEO_API_KEY", "")
+	const key = "test-key-not-for-prod"
+	t.Setenv("KANEO_API_KEY", key)
+	t.Setenv("KANEO_API_URL", server.URL)
 
 	k := NewKaneoProvider(server.URL, "proj", true) // use_cli true — production shape
-	k.APIKey = "test-key-not-for-prod"
 	k.BulkConcurrency = 16
 	k.Deadlines = Deadlines{List: DefaultListDeadline}
 
@@ -156,8 +167,8 @@ func TestKaneoListProjectRelations_WithKey_HTTPFanoutNotCLI(t *testing.T) {
 	if cliRel.Load() != 0 {
 		t.Fatalf("must not use CLI rel list when HTTP credentials present, got %d", cliRel.Load())
 	}
-	if cliList.Load() < 1 {
-		t.Fatal("expected ListTasks via CLI under use_cli")
+	if cliList.Load() != 3 || strings.Join(cliPages, ",") != "1,2,3" {
+		t.Fatalf("want real 100+66+empty pagination pages 1,2,3; calls=%d pages=%v", cliList.Load(), cliPages)
 	}
 	// One HTTP GET per task id (fan-out), not sequential CLI.
 	if httpRels.Load() != int64(n) {
@@ -172,13 +183,66 @@ func TestKaneoListProjectRelations_WithKey_HTTPFanoutNotCLI(t *testing.T) {
 	}
 }
 
-// TestKaneoListProjectRelations_DeadlineCancel proves cancel bounds work mid-fanout.
-func TestKaneoListProjectRelations_DeadlineCancel(t *testing.T) {
+// TestKaneoListRelations_UseCLITrustedOriginUsesHTTP proves the exact closure
+// read surface avoids relation CLI subprocesses when use_cli=true and an
+// independently trusted HTTP origin is available.
+func TestKaneoListRelations_UseCLITrustedOriginUsesHTTP(t *testing.T) {
+	var httpCalls atomic.Int64
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		time.Sleep(50 * time.Millisecond)
+		httpCalls.Add(1)
+		if got := r.Header.Get("Authorization"); got != "Bearer closure-key" {
+			t.Errorf("missing origin-bound bearer auth: %q", got)
+		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(`[]`))
+		_, _ = w.Write([]byte(`[]`))
+	}))
+	t.Cleanup(server.Close)
+
+	var cliCalls atomic.Int64
+	old := kaneoRunCLI
+	kaneoRunCLI = func(context.Context, string, ...string) (*CLIResult, error) {
+		cliCalls.Add(1)
+		return &CLIResult{Stdout: []byte(`[]`)}, nil
+	}
+	t.Cleanup(func() { kaneoRunCLI = old })
+
+	withUserConfigDir(t, t.TempDir())
+	t.Setenv("KANEO_API_KEY", "closure-key")
+	t.Setenv("KANEO_API_URL", server.URL)
+	k := NewKaneoProvider(server.URL, "proj", true)
+	if _, err := k.ListRelations(context.Background(), "task-1"); err != nil {
+		t.Fatal(err)
+	}
+	if httpCalls.Load() != 1 {
+		t.Fatalf("want one HTTP closure read, got %d", httpCalls.Load())
+	}
+	if cliCalls.Load() != 0 {
+		t.Fatalf("want zero relation CLI calls under use_cli=true, got %d", cliCalls.Load())
+	}
+}
+
+// TestKaneoListProjectRelations_DeadlineCancel proves the internal production
+// deadline returns a timeout, bounds wall time, and cancels every live handler.
+func TestKaneoListProjectRelations_DeadlineCancel(t *testing.T) {
+	const fallback = 300 * time.Millisecond
+	var started atomic.Int64
+	var canceled atomic.Int64
+	var completed atomic.Int64
+	canceledCh := make(chan struct{}, 8)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		started.Add(1)
+		select {
+		case <-r.Context().Done():
+			canceled.Add(1)
+			canceledCh <- struct{}{}
+			return
+		case <-time.After(fallback):
+			completed.Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`[]`))
+		}
 	}))
 	t.Cleanup(server.Close)
 
@@ -190,11 +254,14 @@ func TestKaneoListProjectRelations_DeadlineCancel(t *testing.T) {
 				page = args[i+1]
 			}
 		}
-		if page != "1" {
+		if page == "2" {
 			return &CLIResult{Stdout: []byte(`[]`)}, nil
 		}
+		if page != "1" {
+			t.Fatalf("unexpected page %s", page)
+		}
 		var tasks []map[string]string
-		for i := 1; i <= 40; i++ {
+		for i := 1; i <= 8; i++ {
 			tasks = append(tasks, map[string]string{
 				"id": fmt.Sprintf("id-%d", i), "ref": fmt.Sprintf("FAC-%d", i),
 				"status": "to-do", "title": "t", "projectId": "proj",
@@ -206,26 +273,39 @@ func TestKaneoListProjectRelations_DeadlineCancel(t *testing.T) {
 	t.Cleanup(func() { kaneoRunCLI = old })
 
 	withUserConfigDir(t, t.TempDir())
-	t.Setenv("KANEO_API_KEY", "")
+	t.Setenv("KANEO_API_KEY", "cancel-key")
+	t.Setenv("KANEO_API_URL", server.URL)
 	k := NewKaneoProvider(server.URL, "proj", true)
-	k.APIKey = "k"
 	k.BulkConcurrency = 4
-	k.Deadlines = Deadlines{List: 80 * time.Millisecond}
+	k.Deadlines = Deadlines{List: 60 * time.Millisecond}
 
-	ctx := context.Background()
 	start := time.Now()
-	_, err := k.ListProjectRelations(ctx, "proj")
+	_, err := k.ListProjectRelations(context.Background(), "proj")
+	elapsed := time.Since(start)
 	if err == nil {
-		// May succeed if all GETs finish under deadline on fast host — require
-		// either error or success; if success, elapsed must still be < 1s.
-		if time.Since(start) > time.Second {
-			t.Fatalf("unexpected long success: %v", time.Since(start))
-		}
-		return
+		t.Fatal("deadline path must return a timeout error, never success")
 	}
-	// Cancel/timeout path
-	if time.Since(start) > 500*time.Millisecond {
-		t.Fatalf("deadline did not bound fan-out: %v err=%v", time.Since(start), err)
+	if !IsTimeout(err) && !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("want timeout classification, got %T %v", err, err)
+	}
+	if elapsed > 200*time.Millisecond {
+		t.Fatalf("deadline did not bound fan-out: %v err=%v", elapsed, err)
+	}
+	wantCanceled := started.Load()
+	if wantCanceled == 0 || wantCanceled > int64(k.BulkConcurrency) {
+		t.Fatalf("want 1..%d started handlers, got %d", k.BulkConcurrency, wantCanceled)
+	}
+	for i := int64(0); i < wantCanceled; i++ {
+		select {
+		case <-canceledCh:
+		case <-time.After(200 * time.Millisecond):
+			t.Fatalf("handler cancellation missing: started=%d canceled=%d", wantCanceled, canceled.Load())
+		}
+	}
+	if canceled.Load() != wantCanceled {
+		t.Fatalf("every started handler must be canceled: started=%d canceled=%d", wantCanceled, canceled.Load())
+	}
+	if completed.Load() != 0 {
+		t.Fatalf("no handler may complete normally after deadline, got %d", completed.Load())
 	}
 }
-

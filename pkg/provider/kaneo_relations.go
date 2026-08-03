@@ -58,10 +58,11 @@ func (k *KaneoProvider) ListRelations(ctx context.Context, taskID string) ([]Rel
 }
 
 func (k *KaneoProvider) listRelationsOnce(ctx context.Context, taskID string) ([]Relation, error) {
-	// Per-task ListRelations: CLI when UseCLI (single-card ops are fine).
-	// Project graph snapshot NEVER uses this CLI path for N-way fan-out —
-	// ListProjectRelations requires HTTP credentials and fails closed without them.
-	if k.UseCLI {
+	// Closure refreshes call this per-task surface after the graph credential
+	// preflight. Prefer exact-origin HTTP whenever authorized, even with
+	// use_cli=true, so post-fence closure proof never incurs 4s CLI subprocesses.
+	// Single-card callers without authorized HTTP retain the CLI fallback.
+	if k.UseCLI && !k.preferHTTPForRelations() {
 		args := []string{"task", "rel", "list", taskID, "--json"}
 		if k.ProjectID != "" {
 			args = append(args, "--project", k.ProjectID)
