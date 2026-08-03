@@ -12,21 +12,18 @@ import (
 	"time"
 )
 
-// --- Event types for the durable ledger ---
-
 type EventType string
 
 const (
-	EventCompletion EventType = "completion" // builder finished, candidate ingested
-	EventReview     EventType = "review"     // review launched
-	EventVerdict    EventType = "verdict"    // reviewer returned PASS/FAIL/BLOCKED
-	EventSupersede  EventType = "supersede"  // new commit replaces old one
-	EventEvict      EventType = "evict"      // stale candidate evicted
-	EventHarvest    EventType = "harvest"    // enqueued for integration
-	EventCapacity   EventType = "capacity"   // reviewer capacity changed
+	EventCompletion EventType = "completion"
+	EventReview     EventType = "review"
+	EventVerdict    EventType = "verdict"
+	EventSupersede  EventType = "supersede"
+	EventEvict      EventType = "evict"
+	EventHarvest    EventType = "harvest"
+	EventCapacity   EventType = "capacity"
 )
 
-// Verdict values.
 type Verdict string
 
 const (
@@ -35,7 +32,6 @@ const (
 	VerdictBLOCKED Verdict = "BLOCKED"
 )
 
-// RiskTier values.
 type RiskTier string
 
 const (
@@ -45,72 +41,68 @@ const (
 	TierR3 RiskTier = "R3"
 )
 
-// --- Durable ledger row ---
-
 type Row struct {
-	Timestamp    string   `json:"ts"`
-	Event        string   `json:"event"`
-	SHA          string   `json:"sha"`
-	Branch       string   `json:"branch,omitempty"`
-	PatchID      string   `json:"patch_id,omitempty"`
-	AuthorModel  string   `json:"author_model,omitempty"`
-	AuthorFamily string   `json:"author_family,omitempty"`
-	Reviewer     string   `json:"reviewer,omitempty"`
-	ReviewFamily string   `json:"review_family,omitempty"`
-	Tier         string   `json:"tier,omitempty"`
-	Verdict      string   `json:"verdict,omitempty"`
-	Reason       string   `json:"reason,omitempty"`
-	PrevSHA      string   `json:"prev_sha,omitempty"`
-	Harvested    bool     `json:"harvested,omitempty"`
-	Capacity     int      `json:"capacity,omitempty"`
-	Attempts     int      `json:"attempts,omitempty"`
-	IngestedAt   string   `json:"ingested_at,omitempty"`
+	Timestamp    string `json:"ts"`
+	Event        string `json:"event"`
+	SHA          string `json:"sha"`
+	Branch       string `json:"branch,omitempty"`
+	PatchID      string `json:"patch_id,omitempty"`
+	AuthorModel  string `json:"author_model,omitempty"`
+	AuthorFamily string `json:"author_family,omitempty"`
+	Reviewer     string `json:"reviewer,omitempty"`
+	ReviewFamily string `json:"review_family,omitempty"`
+	Tier         string `json:"tier,omitempty"`
+	Verdict      string `json:"verdict,omitempty"`
+	Reason       string `json:"reason,omitempty"`
+	PrevSHA      string `json:"prev_sha,omitempty"`
+	Harvested    bool   `json:"harvested,omitempty"`
+	Capacity     int    `json:"capacity,omitempty"`
+	Attempts     int    `json:"attempts,omitempty"`
+	IngestedAt   string `json:"ingested_at,omitempty"`
 }
-
-// --- In-memory mutable state reconstructed from ledger ---
 
 type CandidateState string
 
 const (
-	StatePending   CandidateState = "pending"    // ingested, awaiting review
-	StateReviewing CandidateState = "reviewing"  // review in flight
-	StatePass      CandidateState = "pass"       // PASS verdict
-	StateFail      CandidateState = "fail"       // FAIL verdict (returned to builder)
-	StateBlocked   CandidateState = "blocked"    // BLOCKED with reason preserved
-	StateHarvested CandidateState = "harvested"  // enqueued for integration
-	StateEvicted   CandidateState = "evicted"    // superseded or expired
+	StatePending   CandidateState = "pending"
+	StateReviewing CandidateState = "reviewing"
+	StatePass      CandidateState = "pass"
+	StateFail      CandidateState = "fail"
+	StateBlocked   CandidateState = "blocked"
+	StateHarvested CandidateState = "harvested"
+	StateEvicted   CandidateState = "evicted"
 )
 
 type Candidate struct {
-	SHA          string
-	Branch       string
-	PatchID      string
-	AuthorModel  string
-	AuthorFamily string
-	Tier         RiskTier
-	State        CandidateState
-	Verdict      Verdict
+	SHA           string
+	Branch        string
+	PatchID       string
+	AuthorModel   string
+	AuthorFamily  string
+	Tier          RiskTier
+	State         CandidateState
+	Verdict       Verdict
 	VerdictReason string
-	Reviewer     string
-	ReviewFamily string
-	Attempts     int
-	IngestedAt   time.Time
-	UpdatedAt    time.Time
+	Reviewer      string
+	ReviewFamily  string
+	Attempts      int
+	IngestedAt    time.Time
+	UpdatedAt     time.Time
+	LeaseID       string
+	LeaseExpiry   time.Time
 }
-
-// --- ModelFamily registry (inline, no import from pkg/review) ---
 
 type ModelFamily string
 
 const (
-	FamilyLazer ModelFamily = "lazer"
-	FamilyAnt   ModelFamily = "anthropic"
+	FamilyLazer  ModelFamily = "lazer"
+	FamilyAnt    ModelFamily = "anthropic"
 	FamilyGoogle ModelFamily = "google"
 	FamilyOpenAI ModelFamily = "openai"
-	FamilyGrok  ModelFamily = "grok"
-	FamilyKimi  ModelFamily = "kimi"
-	FamilyCodex ModelFamily = "codex"
-	FamilyOther ModelFamily = "other"
+	FamilyGrok   ModelFamily = "grok"
+	FamilyKimi   ModelFamily = "kimi"
+	FamilyCodex  ModelFamily = "codex"
+	FamilyOther  ModelFamily = "other"
 )
 
 func lookupFamily(model string) ModelFamily {
@@ -131,28 +123,24 @@ func lookupFamily(model string) ModelFamily {
 	return FamilyOther
 }
 
-// CrossFamilyOK returns true if the two model families are different.
 func CrossFamilyOK(authorFamily, reviewFamily ModelFamily) bool {
 	return authorFamily != reviewFamily
 }
 
-// RequireCrossFamily returns true for R1-R3 tiers; R0 (mechanical) may use same family.
 func RequireCrossFamily(tier RiskTier) bool {
 	return tier == TierR1 || tier == TierR2 || tier == TierR3
 }
 
-// --- Config ---
-
 type Config struct {
 	LedgerPath        string
 	QueuePath         string
-	MaxPendingReviews int           // max concurrent in-flight reviews
-	StaleDuration     time.Duration // candidate considered stale after this
-	RetryLimit        int           // max review attempts before BLOCKED
+	MaxPendingReviews int
+	StaleDuration     time.Duration
+	RetryLimit        int
+	LeaseDuration     time.Duration
 	Now               func() time.Time
 }
 
-// DefaultConfig returns a reasonable production config.
 func DefaultConfig(ledgerDir string) Config {
 	return Config{
 		LedgerPath:        filepath.Join(ledgerDir, "supervisor-ledger.jsonl"),
@@ -160,19 +148,18 @@ func DefaultConfig(ledgerDir string) Config {
 		MaxPendingReviews: 3,
 		StaleDuration:     24 * time.Hour,
 		RetryLimit:        3,
+		LeaseDuration:     30 * time.Minute,
 		Now:               time.Now,
 	}
 }
-
-// --- ReviewSupervisor ---
 
 type ReviewSupervisor struct {
 	mu sync.RWMutex
 
 	cfg    Config
-	cands  map[string]*Candidate // keyed by SHA
-	shaIdx map[string]string     // patchID -> latest SHA; tracks supersession
-	evrows []Row                 // replay buffer for Evict stale scan
+	cands  map[string]*Candidate
+	shaIdx map[string]string
+	evrows []Row
 
 	pendingCount int
 }
@@ -189,13 +176,9 @@ func New(cfg Config) *ReviewSupervisor {
 	return sv
 }
 
-// nowISO returns the current UTC timestamp.
 func (sv *ReviewSupervisor) nowISO() string { return sv.cfg.Now().UTC().Format(time.RFC3339) }
 
-// timestamp returns the current time.
 func (sv *ReviewSupervisor) now() time.Time { return sv.cfg.Now().UTC() }
-
-// --- Ledger I/O ---
 
 func (sv *ReviewSupervisor) appendRow(r *Row) error {
 	r.Timestamp = sv.nowISO()
@@ -209,10 +192,12 @@ func (sv *ReviewSupervisor) appendRow(r *Row) error {
 	}
 	defer f.Close()
 	if _, err := f.Write(data); err != nil {
-		return err
+		return fmt.Errorf("write ledger: %w", err)
 	}
-	_, err = f.WriteString("\n")
-	return err
+	if _, err := f.WriteString("\n"); err != nil {
+		return fmt.Errorf("write ledger newline: %w", err)
+	}
+	return nil
 }
 
 func (sv *ReviewSupervisor) appendQueue(r *Row) error {
@@ -227,10 +212,12 @@ func (sv *ReviewSupervisor) appendQueue(r *Row) error {
 	}
 	defer f.Close()
 	if _, err := f.Write(data); err != nil {
-		return err
+		return fmt.Errorf("write queue: %w", err)
 	}
-	_, err = f.WriteString("\n")
-	return err
+	if _, err := f.WriteString("\n"); err != nil {
+		return fmt.Errorf("write queue newline: %w", err)
+	}
+	return nil
 }
 
 func readRows(path string) ([]Row, error) {
@@ -239,7 +226,7 @@ func readRows(path string) ([]Row, error) {
 		if os.IsNotExist(err) {
 			return nil, nil
 		}
-		return nil, nil
+		return nil, fmt.Errorf("read rows open: %w", err)
 	}
 	defer f.Close()
 	var rows []Row
@@ -258,20 +245,15 @@ func readRows(path string) ([]Row, error) {
 	return rows, sc.Err()
 }
 
-// --- Ingestion ---
-
-// CompletionCallback is what the builder sends when work is done.
 type CompletionCallback struct {
 	SHA         string
 	Branch      string
 	PatchID     string
 	AuthorModel string
 	Tier        RiskTier
-	Files       []string // for tier reclassification
+	Files       []string
 }
 
-// Ingest receives a completion callback. Returns (accepted, staleSHA, error).
-// If a newer commit supersedes this one, staleSHA is set.
 func (sv *ReviewSupervisor) Ingest(cb CompletionCallback) (accepted bool, staleSHA string, err error) {
 	sv.mu.Lock()
 	defer sv.mu.Unlock()
@@ -280,27 +262,32 @@ func (sv *ReviewSupervisor) Ingest(cb CompletionCallback) (accepted bool, staleS
 		return false, "", fmt.Errorf("reviewsup: empty SHA in completion callback")
 	}
 
-	// Check for existing candidate with same SHA (duplicate callback).
 	if _, ok := sv.cands[cb.SHA]; ok {
 		return false, "", nil
 	}
 
-	// Check supersession: same patchID but newer SHA replaces old.
 	if cb.PatchID != "" {
 		if prevSHA, ok := sv.shaIdx[cb.PatchID]; ok {
 			if prevCand, ok := sv.cands[prevSHA]; ok {
-				// Mark old candidate as evicted.
+				pState := prevCand.State
+				pWasPending := (pState == StatePending || pState == StateReviewing || pState == StatePass)
 				prevCand.State = StateEvicted
 				prevCand.UpdatedAt = sv.now()
-				sv.appendRow(&Row{
+				if pWasPending {
+					sv.pendingCount--
+				}
+				if err := sv.appendRow(&Row{
 					Event:   string(EventSupersede),
 					SHA:     cb.SHA,
 					PrevSHA: prevSHA,
 					PatchID: cb.PatchID,
 					Reason:  "newer commit supersedes",
-				})
-				if prevCand.State == StatePending || prevCand.State == StateReviewing || prevCand.State == StatePass {
-					sv.pendingCount--
+				}); err != nil {
+					prevCand.State = pState
+					if pWasPending {
+						sv.pendingCount++
+					}
+					return false, "", fmt.Errorf("reviewsup: append supersede row: %w", err)
 				}
 				staleSHA = prevSHA
 			}
@@ -319,13 +306,7 @@ func (sv *ReviewSupervisor) Ingest(cb CompletionCallback) (accepted bool, staleS
 		UpdatedAt:    sv.now(),
 	}
 
-	sv.cands[cb.SHA] = cand
-	if cb.PatchID != "" {
-		sv.shaIdx[cb.PatchID] = cb.SHA
-	}
-	sv.pendingCount++
-
-	sv.appendRow(&Row{
+	if err := sv.appendRow(&Row{
 		Event:        string(EventCompletion),
 		SHA:          cb.SHA,
 		Branch:       cb.Branch,
@@ -334,21 +315,24 @@ func (sv *ReviewSupervisor) Ingest(cb CompletionCallback) (accepted bool, staleS
 		AuthorFamily: cand.AuthorFamily,
 		Tier:         string(cb.Tier),
 		IngestedAt:   sv.nowISO(),
-	})
+	}); err != nil {
+		return false, "", fmt.Errorf("reviewsup: append completion row: %w", err)
+	}
+
+	sv.cands[cb.SHA] = cand
+	if cb.PatchID != "" {
+		sv.shaIdx[cb.PatchID] = cb.SHA
+	}
+	sv.pendingCount++
 
 	return true, staleSHA, nil
 }
 
-// --- Reviewer selection ---
-
-// ReviewerPool is the set of available reviewer identities, each tagged with its model family.
 type ReviewerEntry struct {
 	Name  string
 	Model string
 }
 
-// SelectReviewer picks a cross-family reviewer from the pool for a candidate.
-// Returns ("", nil) if no reviewer is available (backpressure).
 func (sv *ReviewSupervisor) SelectReviewer(candidateSHA string, pool []ReviewerEntry) (*ReviewerEntry, error) {
 	sv.mu.RLock()
 	cand, ok := sv.cands[candidateSHA]
@@ -359,7 +343,7 @@ func (sv *ReviewSupervisor) SelectReviewer(candidateSHA string, pool []ReviewerE
 	}
 
 	if cand.State != StatePending {
-		return nil, nil
+		return nil, fmt.Errorf("reviewsup: candidate %s is not pending (state=%s)", candidateSHA, cand.State)
 	}
 
 	authorFamily := lookupFamily(cand.AuthorModel)
@@ -373,14 +357,9 @@ func (sv *ReviewSupervisor) SelectReviewer(candidateSHA string, pool []ReviewerE
 		return &r, nil
 	}
 
-	// Backpressure: no suitable reviewer available.
 	return nil, nil
 }
 
-// --- Launch review (transition pending -> reviewing) ---
-
-// LaunchReview transitions a candidate to reviewing state. Returns error if the
-// candidate is not in the right state or doesn't exist.
 func (sv *ReviewSupervisor) LaunchReview(candidateSHA, reviewer, reviewModel string) error {
 	sv.mu.Lock()
 	defer sv.mu.Unlock()
@@ -393,66 +372,95 @@ func (sv *ReviewSupervisor) LaunchReview(candidateSHA, reviewer, reviewModel str
 		return fmt.Errorf("reviewsup: candidate %s is not pending (state=%s)", candidateSHA, cand.State)
 	}
 
-	reviewFamily := string(lookupFamily(reviewModel))
+	reviewFamily := lookupFamily(reviewModel)
+	authorFamily := lookupFamily(cand.AuthorModel)
+	needsCross := RequireCrossFamily(cand.Tier)
+
+	if needsCross && !CrossFamilyOK(authorFamily, reviewFamily) {
+		return fmt.Errorf("reviewsup: candidate %s requires cross-family review (author=%s, reviewer=%s)", candidateSHA, authorFamily, reviewFamily)
+	}
+
 	cand.State = StateReviewing
 	cand.Reviewer = reviewer
-	cand.ReviewFamily = reviewFamily
+	cand.ReviewFamily = string(reviewFamily)
 	cand.UpdatedAt = sv.now()
 	cand.Attempts++
 
-	sv.appendRow(&Row{
+	if err := sv.appendRow(&Row{
 		Event:        string(EventReview),
 		SHA:          candidateSHA,
 		Reviewer:     reviewer,
-		ReviewFamily: reviewFamily,
+		ReviewFamily: string(reviewFamily),
 		Tier:         string(cand.Tier),
 		Attempts:     cand.Attempts,
-	})
+	}); err != nil {
+		cand.State = StatePending
+		cand.Reviewer = ""
+		cand.ReviewFamily = ""
+		cand.Attempts--
+		cand.UpdatedAt = sv.now()
+		return fmt.Errorf("reviewsup: append review row: %w", err)
+	}
 
 	return nil
 }
 
-// --- Verdict ingestion ---
-
-// ReviewVerdict is what a reviewer returns.
 type ReviewVerdict struct {
-	SHA     string
+	SHA      string
 	Reviewer string
-	Verdict Verdict
-	Reason  string
+	Verdict  Verdict
+	Reason   string
 }
 
-// SubmitVerdict processes a reviewer's verdict. On non-PASS, the candidate is
-// returned to pending for re-review or marked blocked. On PASS, it enters the
-// evidence queue.
 func (sv *ReviewSupervisor) SubmitVerdict(v ReviewVerdict) (newState CandidateState, err error) {
 	sv.mu.Lock()
 	defer sv.mu.Unlock()
+
+	if v.SHA == "" {
+		return "", fmt.Errorf("reviewsup: empty SHA in verdict")
+	}
 
 	cand, ok := sv.cands[v.SHA]
 	if !ok {
 		return "", fmt.Errorf("reviewsup: unknown candidate %s", v.SHA)
 	}
 
+	if cand.State != StateReviewing {
+		return "", fmt.Errorf("reviewsup: candidate %s is not reviewing (state=%s)", v.SHA, cand.State)
+	}
+
+	if v.Reviewer != cand.Reviewer {
+		return "", fmt.Errorf("reviewsup: verdict reviewer %q does not match assigned reviewer %q", v.Reviewer, cand.Reviewer)
+	}
+
+	reviewFamily := lookupFamily(cand.ReviewModel())
+	authorFamily := lookupFamily(cand.AuthorModel)
+	needsCross := RequireCrossFamily(cand.Tier)
+	if needsCross && !CrossFamilyOK(authorFamily, reviewFamily) {
+		return "", fmt.Errorf("reviewsup: candidate %s received verdict from same-family reviewer (author=%s, reviewer=%s)", v.SHA, authorFamily, reviewFamily)
+	}
+
 	cand.Verdict = v.Verdict
 	cand.VerdictReason = v.Reason
 	cand.UpdatedAt = sv.now()
 
-	sv.appendRow(&Row{
+	if err := sv.appendRow(&Row{
 		Event:    string(EventVerdict),
 		SHA:      v.SHA,
 		Reviewer: v.Reviewer,
 		Verdict:  string(v.Verdict),
 		Reason:   v.Reason,
-	})
+	}); err != nil {
+		cand.Verdict = ""
+		cand.VerdictReason = ""
+		cand.UpdatedAt = sv.now()
+		return "", fmt.Errorf("reviewsup: append verdict row: %w", err)
+	}
 
 	switch v.Verdict {
 	case VerdictPASS:
-		cand.State = StatePass
 		sv.pendingCount--
-
-		// Enqueue for harvest.
-		sv.appendQueue(&Row{
+		if err := sv.appendQueue(&Row{
 			Event:        string(EventHarvest),
 			SHA:          v.SHA,
 			Reviewer:     v.Reviewer,
@@ -460,7 +468,13 @@ func (sv *ReviewSupervisor) SubmitVerdict(v ReviewVerdict) (newState CandidateSt
 			ReviewFamily: cand.ReviewFamily,
 			Tier:         string(cand.Tier),
 			Attempts:     cand.Attempts,
-		})
+		}); err != nil {
+			sv.pendingCount++
+			cand.Verdict = ""
+			cand.VerdictReason = ""
+			cand.UpdatedAt = sv.now()
+			return "", fmt.Errorf("reviewsup: append harvest row: %w", err)
+		}
 		cand.State = StateHarvested
 
 	case VerdictFAIL:
@@ -469,7 +483,6 @@ func (sv *ReviewSupervisor) SubmitVerdict(v ReviewVerdict) (newState CandidateSt
 			cand.State = StateBlocked
 			cand.Verdict = VerdictBLOCKED
 		} else {
-			// Return to pending for re-review.
 			cand.State = StatePending
 			cand.Reviewer = ""
 			cand.ReviewFamily = ""
@@ -484,23 +497,18 @@ func (sv *ReviewSupervisor) SubmitVerdict(v ReviewVerdict) (newState CandidateSt
 	return cand.State, nil
 }
 
-// --- Capacity / Backpressure ---
-
-// PendingCount returns the number of candidates awaiting or undergoing review.
 func (sv *ReviewSupervisor) PendingCount() int {
 	sv.mu.RLock()
 	defer sv.mu.RUnlock()
 	return sv.pendingCount
 }
 
-// AtCapacity returns true when pending count >= configured max.
 func (sv *ReviewSupervisor) AtCapacity() bool {
 	sv.mu.RLock()
 	defer sv.mu.RUnlock()
 	return sv.pendingCount >= sv.cfg.MaxPendingReviews
 }
 
-// AvailableCapacity returns how many more reviews can be launched.
 func (sv *ReviewSupervisor) AvailableCapacity() int {
 	sv.mu.RLock()
 	defer sv.mu.RUnlock()
@@ -511,19 +519,16 @@ func (sv *ReviewSupervisor) AvailableCapacity() int {
 	return free
 }
 
-// --- Queue management ---
-
-// HarvestCandidate is an evidence bundle ready for integration.
 type HarvestCandidate struct {
 	SHA          string
 	AuthorFamily string
 	ReviewFamily string
 	Tier         RiskTier
 	Attempts     int
+	Findings     string
 	HarvestedAt  time.Time
 }
 
-// ReadyForHarvest returns candidates with PASS verdicts, sorted oldest-first.
 func (sv *ReviewSupervisor) ReadyForHarvest(max int) ([]HarvestCandidate, error) {
 	sv.mu.RLock()
 	defer sv.mu.RUnlock()
@@ -533,7 +538,6 @@ func (sv *ReviewSupervisor) ReadyForHarvest(max int) ([]HarvestCandidate, error)
 		return nil, err
 	}
 
-	// Group by SHA, keep newest.
 	type qe struct {
 		row   Row
 		order int
@@ -557,6 +561,7 @@ func (sv *ReviewSupervisor) ReadyForHarvest(max int) ([]HarvestCandidate, error)
 			ReviewFamily: eq.row.ReviewFamily,
 			Tier:         RiskTier(eq.row.Tier),
 			Attempts:     eq.row.Attempts,
+			Findings:     cand.VerdictReason,
 			HarvestedAt:  sv.cfg.Now(),
 		})
 	}
@@ -572,7 +577,6 @@ func (sv *ReviewSupervisor) ReadyForHarvest(max int) ([]HarvestCandidate, error)
 	return result, nil
 }
 
-// MarkHarvested marks a candidate as consumed from the queue.
 func (sv *ReviewSupervisor) MarkHarvested(sha string) error {
 	sv.mu.Lock()
 	defer sv.mu.Unlock()
@@ -582,7 +586,6 @@ func (sv *ReviewSupervisor) MarkHarvested(sha string) error {
 		cand.UpdatedAt = sv.now()
 	}
 
-	// Re-read and rewrite queue, marking matching rows harvested.
 	qrows, err := readRows(sv.cfg.QueuePath)
 	if err != nil {
 		return err
@@ -611,9 +614,6 @@ func (sv *ReviewSupervisor) MarkHarvested(sha string) error {
 	return nil
 }
 
-// --- Eviction / Staleness ---
-
-// EvictStale transitions candidates past the staleness duration to evicted.
 func (sv *ReviewSupervisor) EvictStale() (int, error) {
 	sv.mu.Lock()
 	defer sv.mu.Unlock()
@@ -625,26 +625,30 @@ func (sv *ReviewSupervisor) EvictStale() (int, error) {
 			continue
 		}
 		if cand.IngestedAt.Before(cutoff) {
-			cand.State = StateEvicted
-			cand.UpdatedAt = sv.now()
-			if cand.State == StatePending || cand.State == StateReviewing {
+			pWasPending := (cand.State == StatePending || cand.State == StateReviewing)
+			oldState := cand.State
+			if pWasPending {
 				sv.pendingCount--
 			}
-			sv.appendRow(&Row{
+			cand.State = StateEvicted
+			cand.UpdatedAt = sv.now()
+			if err := sv.appendRow(&Row{
 				Event:  string(EventEvict),
 				SHA:    sha,
 				Reason: "stale",
-			})
+			}); err != nil {
+				cand.State = oldState
+				if pWasPending {
+					sv.pendingCount++
+				}
+				return evicted, fmt.Errorf("reviewsup: append evict row: %w", err)
+			}
 			evicted++
 		}
 	}
 	return evicted, nil
 }
 
-// --- Reconstruct from ledger ---
-
-// Reconstruct rebuilds in-memory state from the durable ledger. Must be called
-// at startup before any mutations. Returns count of candidates recovered.
 func (sv *ReviewSupervisor) Reconstruct() (int, error) {
 	sv.mu.Lock()
 	defer sv.mu.Unlock()
@@ -726,26 +730,26 @@ func (sv *ReviewSupervisor) Reconstruct() (int, error) {
 
 		case EventSupersede:
 			if cand, ok := sv.cands[r.PrevSHA]; ok {
+				pWasPending := (cand.State == StatePending || cand.State == StateReviewing || cand.State == StatePass)
 				cand.State = StateEvicted
-				if cand.State == StatePending || cand.State == StateReviewing || cand.State == StatePass {
+				if pWasPending {
 					sv.pendingCount--
 				}
 			}
 
 		case EventEvict:
 			if cand, ok := sv.cands[r.SHA]; ok {
+				pWasPending := (cand.State == StatePending || cand.State == StateReviewing)
 				cand.State = StateEvicted
-				if cand.State == StatePending || cand.State == StateReviewing {
+				if pWasPending {
 					sv.pendingCount--
 				}
 			}
 
 		case EventCapacity:
-			// Informational: capacity changes are read from config.
 		}
 	}
 
-	// Check queue for harvested entries.
 	qrows, err := readRows(sv.cfg.QueuePath)
 	if err == nil {
 		for _, r := range qrows {
@@ -759,8 +763,6 @@ func (sv *ReviewSupervisor) Reconstruct() (int, error) {
 
 	return len(sv.cands), nil
 }
-
-// --- Status ---
 
 type Status struct {
 	Config         Config
@@ -797,7 +799,6 @@ func (sv *ReviewSupervisor) Status() *Status {
 	return s
 }
 
-// Candidate returns a single candidate by SHA, or nil.
 func (sv *ReviewSupervisor) Candidate(sha string) *Candidate {
 	sv.mu.RLock()
 	defer sv.mu.RUnlock()
@@ -807,4 +808,8 @@ func (sv *ReviewSupervisor) Candidate(sha string) *Candidate {
 	}
 	cp := *c
 	return &cp
+}
+
+func (c *Candidate) ReviewModel() string {
+	return c.Reviewer
 }

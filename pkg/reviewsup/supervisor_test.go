@@ -116,7 +116,6 @@ func TestIngestDuplicateSHA(t *testing.T) {
 func TestIngestSupersedesOld(t *testing.T) {
 	sv := svc(t)
 
-	// Same patchID, newer SHA.
 	accepted, stale, err := sv.Ingest(CompletionCallback{
 		SHA:         "aaa222",
 		Branch:      "feat/foo",
@@ -134,7 +133,6 @@ func TestIngestSupersedesOld(t *testing.T) {
 		t.Errorf("stale SHA = %s, want aaa111", stale)
 	}
 
-	// Old candidate should be evicted.
 	c := sv.Candidate("aaa111")
 	if c == nil {
 		t.Fatal("old candidate should still exist")
@@ -143,7 +141,6 @@ func TestIngestSupersedesOld(t *testing.T) {
 		t.Errorf("old candidate state = %s, want evicted", c.State)
 	}
 
-	// New candidate should be pending.
 	c2 := sv.Candidate("aaa222")
 	if c2 == nil {
 		t.Fatal("new candidate not found")
@@ -167,7 +164,6 @@ func TestIngestEmptySHA(t *testing.T) {
 
 func TestSelectReviewerCrossFamily(t *testing.T) {
 	sv := svc(t)
-	// aaa111 is anthropic (claude) at R1 — needs cross-family.
 	rev, err := sv.SelectReviewer("aaa111", []ReviewerEntry{
 		{Name: "gemini-2.5-flash", Model: "gemini-2.5-flash"},
 		{Name: "claude-3-7-sonnet", Model: "claude-3-7-sonnet"},
@@ -185,7 +181,6 @@ func TestSelectReviewerCrossFamily(t *testing.T) {
 
 func TestSelectReviewerSameFamilyR1Rejected(t *testing.T) {
 	sv := svc(t)
-	// aaa111 is anthropic at R1 — same family must be rejected.
 	rev, err := sv.SelectReviewer("aaa111", []ReviewerEntry{
 		{Name: "claude-3-7-sonnet", Model: "claude-3-7-sonnet"},
 	})
@@ -233,7 +228,6 @@ func TestSelectReviewerUnknownCandidate(t *testing.T) {
 
 func TestSelectReviewerBackpressure(t *testing.T) {
 	sv := svc(t)
-	// No reviewers available at all.
 	rev, err := sv.SelectReviewer("aaa111", nil)
 	if err != nil {
 		t.Fatalf("SelectReviewer: %v", err)
@@ -264,10 +258,18 @@ func TestLaunchReview(t *testing.T) {
 	}
 }
 
+func TestLaunchReviewSameFamilyRejected(t *testing.T) {
+	sv := svc(t)
+	// aaa111 is anthropic/R1 — same family must be rejected.
+	err := sv.LaunchReview("aaa111", "claude-3-7-sonnet", "claude-3-7-sonnet")
+	if err == nil {
+		t.Fatal("expected error for same-family review on R1")
+	}
+}
+
 func TestLaunchReviewNotPending(t *testing.T) {
 	sv := svc(t)
-	sv.LaunchReview("aaa111", "gemini", "gemini")
-	// Second launch should fail.
+	sv.LaunchReview("aaa111", "gemini", "gemini-2.5-flash")
 	err := sv.LaunchReview("aaa111", "gemini-2", "gemini-2")
 	if err == nil {
 		t.Fatal("expected error for non-pending candidate")
@@ -292,7 +294,6 @@ func TestSubmitVerdictPASS(t *testing.T) {
 		t.Errorf("state = %s, want harvested", c.State)
 	}
 
-	// Should be in harvest queue.
 	ready, err := sv.ReadyForHarvest(10)
 	if err != nil {
 		t.Fatalf("ReadyForHarvest: %v", err)
@@ -331,7 +332,6 @@ func TestSubmitVerdictFAILReturnsToPending(t *testing.T) {
 		t.Errorf("reason = %s", c.VerdictReason)
 	}
 
-	// Should NOT be in harvest queue.
 	ready, _ := sv.ReadyForHarvest(10)
 	for _, h := range ready {
 		if h.SHA == "aaa111" {
@@ -350,7 +350,7 @@ func TestSubmitVerdictFAILExceedsRetryLimit(t *testing.T) {
 		AuthorModel: "claude",
 		Tier:        TierR1,
 	})
-	sv2.LaunchReview("aaa111", "gemini", "gemini")
+	sv2.LaunchReview("aaa111", "gemini", "gemini-2.5-flash")
 	sv2.SubmitVerdict(ReviewVerdict{SHA: "aaa111", Reviewer: "gemini", Verdict: VerdictFAIL})
 
 	c := sv2.Candidate("aaa111")
@@ -364,7 +364,7 @@ func TestSubmitVerdictFAILExceedsRetryLimit(t *testing.T) {
 
 func TestSubmitVerdictBLOCKED(t *testing.T) {
 	sv := svc(t)
-	sv.LaunchReview("aaa111", "gemini", "gemini")
+	sv.LaunchReview("aaa111", "gemini", "gemini-2.5-flash")
 	sv.SubmitVerdict(ReviewVerdict{SHA: "aaa111", Reviewer: "gemini", Verdict: VerdictBLOCKED, Reason: "can't reproduce"})
 
 	c := sv.Candidate("aaa111")
@@ -373,8 +373,34 @@ func TestSubmitVerdictBLOCKED(t *testing.T) {
 	}
 }
 
+func TestSubmitVerdictWrongReviewerRejected(t *testing.T) {
+	sv := svc(t)
+	sv.LaunchReview("aaa111", "gemini", "gemini-2.5-flash")
+
+	_, err := sv.SubmitVerdict(ReviewVerdict{
+		SHA:      "aaa111",
+		Reviewer: "impostor",
+		Verdict:  VerdictPASS,
+	})
+	if err == nil {
+		t.Fatal("expected error for wrong reviewer")
+	}
+}
+
+func TestSubmitVerdictNotReviewingRejected(t *testing.T) {
+	sv := svc(t)
+	_, err := sv.SubmitVerdict(ReviewVerdict{
+		SHA:      "aaa111",
+		Reviewer: "gemini",
+		Verdict:  VerdictPASS,
+	})
+	if err == nil {
+		t.Fatal("expected error for non-reviewing candidate")
+	}
+}
+
 func TestCapacityTracking(t *testing.T) {
-	sv := svc(t) // 2 pending
+	sv := svc(t)
 
 	if sv.AtCapacity() {
 		t.Error("expected not at capacity with 2/3 pending")
@@ -383,7 +409,6 @@ func TestCapacityTracking(t *testing.T) {
 		t.Errorf("AvailableCapacity = %d, want 1", sv.AvailableCapacity())
 	}
 
-	// Add third.
 	sv.Ingest(CompletionCallback{SHA: "ccc333", AuthorModel: "gpt-4", Tier: TierR2})
 	if !sv.AtCapacity() {
 		t.Error("expected at capacity with 3/3")
@@ -400,8 +425,7 @@ func TestVerdictReleasesCapacity(t *testing.T) {
 		t.Fatal("expected at capacity")
 	}
 
-	// Resolve one.
-	sv.LaunchReview("aaa111", "gemini", "gemini")
+	sv.LaunchReview("aaa111", "gemini", "gemini-2.5-flash")
 	sv.SubmitVerdict(ReviewVerdict{SHA: "aaa111", Reviewer: "gemini", Verdict: VerdictPASS})
 
 	if sv.PendingCount() != 2 {
@@ -414,7 +438,7 @@ func TestVerdictReleasesCapacity(t *testing.T) {
 
 func TestMarkHarvested(t *testing.T) {
 	sv := svc(t)
-	sv.LaunchReview("aaa111", "gemini", "gemini")
+	sv.LaunchReview("aaa111", "gemini", "gemini-2.5-flash")
 	sv.SubmitVerdict(ReviewVerdict{SHA: "aaa111", Reviewer: "gemini", Verdict: VerdictPASS})
 
 	ready, _ := sv.ReadyForHarvest(10)
@@ -434,12 +458,10 @@ func TestEvictStale(t *testing.T) {
 	dir := t.TempDir()
 	cfg := DefaultConfig(dir)
 	cfg.Now = func() time.Time {
-		// Past + 48h = stale.
 		return time.Date(2025, 6, 3, 12, 0, 0, 0, time.UTC)
 	}
 	cfg.StaleDuration = 24 * time.Hour
 
-	// Use a supervisor with an early fixed time for ingest.
 	cfg2 := DefaultConfig(dir)
 	cfg2.Now = func() time.Time {
 		return time.Date(2025, 6, 1, 0, 0, 0, 0, time.UTC)
@@ -448,14 +470,12 @@ func TestEvictStale(t *testing.T) {
 	sv2 := New(cfg2)
 	sv2.Ingest(CompletionCallback{SHA: "oldsha", AuthorModel: "claude", Tier: TierR1})
 
-	// Now use late-time supervisor with same ledger path to test eviction.
 	cfg3 := DefaultConfig(dir)
 	cfg3.Now = func() time.Time {
 		return time.Date(2025, 6, 3, 12, 0, 0, 0, time.UTC)
 	}
 	cfg3.StaleDuration = 24 * time.Hour
 	sv3 := New(cfg3)
-	// Reconstruct first.
 	sv3.Reconstruct()
 
 	n, err := sv3.EvictStale()
@@ -473,13 +493,11 @@ func TestReconstructFromLedger(t *testing.T) {
 	cfg.Now = fixedNow
 	sv := New(cfg)
 
-	// Create some state.
 	sv.Ingest(CompletionCallback{SHA: "aaa111", AuthorModel: "claude", Tier: TierR1, PatchID: "p1"})
 	sv.Ingest(CompletionCallback{SHA: "bbb222", AuthorModel: "gemini", Tier: TierR3, PatchID: "p2"})
-	sv.LaunchReview("aaa111", "gemini", "gemini")
+	sv.LaunchReview("aaa111", "gemini", "gemini-2.5-flash")
 	sv.SubmitVerdict(ReviewVerdict{SHA: "aaa111", Reviewer: "gemini", Verdict: VerdictPASS})
 
-	// Create new supervisor from same ledger.
 	sv2 := New(cfg)
 	n, err := sv2.Reconstruct()
 	if err != nil {
@@ -494,7 +512,7 @@ func TestReconstructFromLedger(t *testing.T) {
 		t.Fatal("aaa111 not found after reconstruct")
 	}
 	if c.State != StatePass {
-		t.Errorf("state = %s, want pass (queue harvested flag not set until MarkHarvested)", c.State)
+		t.Errorf("state = %s, want pass", c.State)
 	}
 	if c.ReviewFamily != "google" {
 		t.Errorf("ReviewFamily = %s, want google", c.ReviewFamily)
@@ -545,7 +563,7 @@ func TestReconstructWithQueueState(t *testing.T) {
 	sv := New(cfg)
 
 	sv.Ingest(CompletionCallback{SHA: "aaa111", AuthorModel: "claude", Tier: TierR1})
-	sv.LaunchReview("aaa111", "gemini", "gemini")
+	sv.LaunchReview("aaa111", "gemini", "gemini-2.5-flash")
 	sv.SubmitVerdict(ReviewVerdict{SHA: "aaa111", Reviewer: "gemini", Verdict: VerdictPASS})
 	sv.MarkHarvested("aaa111")
 
@@ -557,7 +575,7 @@ func TestReconstructWithQueueState(t *testing.T) {
 		t.Fatal("aaa111 not found")
 	}
 	if c.State != StateHarvested {
-		t.Errorf("state = %s, want harvested (queue persisted)", c.State)
+		t.Errorf("state = %s, want harvested", c.State)
 	}
 }
 
@@ -566,13 +584,12 @@ func TestReadyForHarvestReturnsSorted(t *testing.T) {
 	sv.Ingest(CompletionCallback{SHA: "ccc333", AuthorModel: "gpt-4", Tier: TierR2})
 	sv.Ingest(CompletionCallback{SHA: "ddd444", AuthorModel: "codex", Tier: TierR1})
 
-	// Launch and pass all.
 	for _, sha := range []string{"aaa111", "bbb222", "ccc333", "ddd444"} {
 		rev := "gemini"
-		mod := "gemini"
+		mod := "gemini-2.5-flash"
 		if sv.Candidate(sha).AuthorFamily == "google" {
 			rev = "claude"
-			mod = "claude-3"
+			mod = "claude-3-7-sonnet"
 		}
 		sv.LaunchReview(sha, rev, mod)
 		sv.SubmitVerdict(ReviewVerdict{SHA: sha, Reviewer: rev, Verdict: VerdictPASS})
@@ -582,7 +599,6 @@ func TestReadyForHarvestReturnsSorted(t *testing.T) {
 	if len(ready) != 4 {
 		t.Fatalf("expected 4 ready, got %d", len(ready))
 	}
-	// Should be sorted by SHA.
 	if ready[0].SHA != "aaa111" || ready[3].SHA != "ddd444" {
 		t.Errorf("unexpected order: %v", ready)
 	}
@@ -590,9 +606,9 @@ func TestReadyForHarvestReturnsSorted(t *testing.T) {
 
 func TestReadyForHarvestLimit(t *testing.T) {
 	sv := svc(t)
-	sv.LaunchReview("aaa111", "gemini", "gemini")
+	sv.LaunchReview("aaa111", "gemini", "gemini-2.5-flash")
 	sv.SubmitVerdict(ReviewVerdict{SHA: "aaa111", Reviewer: "gemini", Verdict: VerdictPASS})
-	sv.LaunchReview("bbb222", "claude", "claude")
+	sv.LaunchReview("bbb222", "claude", "claude-3-7-sonnet")
 	sv.SubmitVerdict(ReviewVerdict{SHA: "bbb222", Reviewer: "claude", Verdict: VerdictPASS})
 
 	ready, _ := sv.ReadyForHarvest(1)
@@ -703,7 +719,6 @@ func TestSubmitVerdictFAILReturnsFindingsToBuilder(t *testing.T) {
 		t.Errorf("reason = %s", c.VerdictReason)
 	}
 
-	// Verify it's available for re-review (new reviewer selection).
 	rev, err := sv.SelectReviewer("bbb222", []ReviewerEntry{
 		{Name: "claude-3-5-haiku", Model: "claude-3-5-haiku"},
 	})
@@ -721,7 +736,7 @@ func TestSubmitVerdictFAILReturnsFindingsToBuilder(t *testing.T) {
 
 func TestDuplicateVerdictNoDoubleHarvest(t *testing.T) {
 	sv := svc(t)
-	sv.LaunchReview("aaa111", "gemini", "gemini")
+	sv.LaunchReview("aaa111", "gemini", "gemini-2.5-flash")
 	sv.SubmitVerdict(ReviewVerdict{SHA: "aaa111", Reviewer: "gemini", Verdict: VerdictPASS})
 
 	ready, _ := sv.ReadyForHarvest(10)
@@ -729,7 +744,6 @@ func TestDuplicateVerdictNoDoubleHarvest(t *testing.T) {
 		t.Fatalf("expected 1 ready, got %d", len(ready))
 	}
 
-	// Submit same verdict again.
 	sv.SubmitVerdict(ReviewVerdict{SHA: "aaa111", Reviewer: "gemini", Verdict: VerdictPASS})
 	ready2, _ := sv.ReadyForHarvest(10)
 	if len(ready2) != 1 {
@@ -745,12 +759,9 @@ func TestLostCallbackRecoveryViaReconstruct(t *testing.T) {
 	}
 	sv := New(cfg)
 
-	// Simulate: ingest + launch review, but verdict lost (supervisor crash).
 	sv.Ingest(CompletionCallback{SHA: "aaa111", AuthorModel: "claude", Tier: TierR1, PatchID: "p1"})
-	sv.LaunchReview("aaa111", "gemini", "gemini")
-	// No verdict submitted — simulate crash.
+	sv.LaunchReview("aaa111", "gemini", "gemini-2.5-flash")
 
-	// Reconstruct — should show candidate in reviewing state.
 	sv2 := New(cfg)
 	n, err := sv2.Reconstruct()
 	if err != nil {
@@ -768,19 +779,16 @@ func TestLostCallbackRecoveryViaReconstruct(t *testing.T) {
 func TestZeroValueSafety(t *testing.T) {
 	sv := svc(t)
 
-	// Launch review for empty SHA should fail.
-	err := sv.LaunchReview("", "gemini", "gemini")
+	err := sv.LaunchReview("", "gemini", "gemini-2.5-flash")
 	if err == nil {
 		t.Error("expected error for empty SHA")
 	}
 
-	// Submit empty verdict should fail.
 	_, err = sv.SubmitVerdict(ReviewVerdict{SHA: "", Verdict: VerdictPASS})
 	if err == nil {
 		t.Error("expected error for empty verdict SHA")
 	}
 
-	// Ingest with empty SHA should fail.
 	_, _, err = sv.Ingest(CompletionCallback{SHA: "", AuthorModel: "claude", Tier: TierR1})
 	if err == nil {
 		t.Error("expected error for empty ingest SHA")
@@ -810,10 +818,9 @@ func TestLedgerFileCreation(t *testing.T) {
 	sv := New(cfg)
 
 	sv.Ingest(CompletionCallback{SHA: "aaa111", AuthorModel: "claude", Tier: TierR1})
-	sv.LaunchReview("aaa111", "gemini", "gemini")
+	sv.LaunchReview("aaa111", "gemini", "gemini-2.5-flash")
 	sv.SubmitVerdict(ReviewVerdict{SHA: "aaa111", Reviewer: "gemini", Verdict: VerdictPASS})
 
-	// Ledger file should exist and have rows.
 	rows, err := readRows(cfg.LedgerPath)
 	if err != nil {
 		t.Fatalf("readRows: %v", err)
@@ -833,7 +840,7 @@ func TestLedgerFileCreation(t *testing.T) {
 
 func TestMarkHarvestedUpdatesState(t *testing.T) {
 	sv := svc(t)
-	sv.LaunchReview("aaa111", "gemini", "gemini")
+	sv.LaunchReview("aaa111", "gemini", "gemini-2.5-flash")
 	sv.SubmitVerdict(ReviewVerdict{SHA: "aaa111", Reviewer: "gemini", Verdict: VerdictPASS})
 
 	sv.MarkHarvested("aaa111")
@@ -850,12 +857,10 @@ func TestSelectReviewerAfterRecovery(t *testing.T) {
 	sv := New(cfg)
 
 	sv.Ingest(CompletionCallback{SHA: "aaa111", AuthorModel: "claude", Tier: TierR1})
-	// Crash before launching review.
 
 	sv2 := New(cfg)
 	sv2.Reconstruct()
 
-	// Can still select and launch reviewer.
 	rev, err := sv2.SelectReviewer("aaa111", []ReviewerEntry{
 		{Name: "gemini", Model: "gemini-2.5-flash"},
 	})
@@ -868,7 +873,9 @@ func TestSelectReviewerAfterRecovery(t *testing.T) {
 }
 
 func TestReadRowsMissingFile(t *testing.T) {
-	rows, err := readRows("/nonexistent/path.jsonl")
+	dir := t.TempDir()
+	p := filepath.Join(dir, "missing.jsonl")
+	rows, err := readRows(p)
 	if err != nil {
 		t.Fatalf("readRows: %v", err)
 	}
