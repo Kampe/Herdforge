@@ -3,6 +3,9 @@ package review
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"path"
 	"path/filepath"
 	"regexp"
@@ -179,10 +182,75 @@ func hasCodeSignature(added []string) bool {
 
 // hasSmuggledProductionCode reports whether a test-path file's added lines
 // declare a non-test-harness top-level executable declaration — a func, a
-// method, a function-valued var, or one inside a grouped `var ( ... )`
-// block (whose specs don't repeat `var` and may split across lines) — a
-// signal that production logic is being smuggled in under a test path.
+// method, or a function-valued var, however it's spelled (grouped or not,
+// single- or multi-line, compact or not) — a signal that production logic
+// is being smuggled in under a test path.
+//
+// Go has too many equivalent ways to spell "a var holding a func literal"
+// for line-oriented regex matching to enumerate reliably, so when the
+// added lines form a standalone-parseable Go source fragment, they're
+// parsed for real with go/parser and walked as an AST — immune to
+// whitespace/grouping/line-splitting by construction. Most real test-only
+// diffs are partial (e.g. one added assertion inside an existing Test
+// func) and won't parse standalone; hasSmuggledProductionCodeHeuristic
+// covers that case.
 func hasSmuggledProductionCode(added []string) bool {
+	if smuggled, parsed := hasSmuggledProductionCodeAST(added); parsed {
+		return smuggled
+	}
+	return hasSmuggledProductionCodeHeuristic(added)
+}
+
+// hasSmuggledProductionCodeAST parses added as a standalone Go source file
+// and reports whether any top-level declaration is a non-test-harness
+// func, method, or function-valued var. The second return value is false
+// when added doesn't parse as a standalone file — the caller falls back
+// to the line-oriented heuristic in that case.
+func hasSmuggledProductionCodeAST(added []string) (smuggled, parsed bool) {
+	src := "package p\n" + strings.Join(added, "\n")
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "", src, parser.SkipObjectResolution)
+	if err != nil {
+		return false, false
+	}
+	for _, decl := range file.Decls {
+		switch d := decl.(type) {
+		case *ast.FuncDecl:
+			if !testFuncPrefixRe.MatchString(d.Name.Name) {
+				return true, true
+			}
+		case *ast.GenDecl:
+			if d.Tok != token.VAR {
+				continue
+			}
+			for _, spec := range d.Specs {
+				vs, ok := spec.(*ast.ValueSpec)
+				if !ok {
+					continue
+				}
+				for i, val := range vs.Values {
+					if _, isFuncLit := val.(*ast.FuncLit); !isFuncLit {
+						continue
+					}
+					name := "_"
+					if i < len(vs.Names) {
+						name = vs.Names[i].Name
+					}
+					if !testFuncPrefixRe.MatchString(name) {
+						return true, true
+					}
+				}
+			}
+		}
+	}
+	return false, true
+}
+
+// hasSmuggledProductionCodeHeuristic is the line-oriented fallback used
+// when added doesn't parse as a standalone Go file (the common case for a
+// partial diff hunk). It catches the same declaration forms on a
+// best-effort basis via regex rather than a real parse.
+func hasSmuggledProductionCodeHeuristic(added []string) bool {
 	inVarBlock := false
 	var blockLines []string
 
