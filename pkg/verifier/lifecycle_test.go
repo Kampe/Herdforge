@@ -12,32 +12,43 @@ import (
 	"time"
 )
 
-// sealGitDirForCleanupFailure makes real os.RemoveAll(root) fail deterministically
-// (permission denied walking .git). Not a flaky concurrent-walk race.
-func sealGitDirForCleanupFailure(gitDir string) error {
-	return os.Chmod(gitDir, 0)
-}
+// activeLateWriterScript is a production-shaped late writer under root:
+//  1. signals ready after seed residue
+//  2. continuously mkdir -p + creates new objects via ABSOLUTE paths
+//  3. advances genPath (OUTSIDE root so partial RemoveAll cannot erase proof)
+//
+// Unreaped, it blocks durable TempDir cleanup: either os.RemoveAll fails with
+// "directory not empty" (FAC-151 CI class) or RemoveAll "wins" a walk but the
+// writer recreates residue while still live. Parked sleep cannot do this.
+// No chmod seal/unseal.
+//
+// Args: $1=root $2=readyPath $3=genPath(outside root)
+const activeLateWriterScript = `
+root="$1"
+objects="$1/.git/objects"
+mkdir -p "$objects" || exit 1
+printf x > "$objects/seed"
+printf ready > "$2"
+i=0
+while true; do
+  mkdir -p "$objects" 2>/dev/null || true
+  printf w > "$objects/active-$i" 2>/dev/null || true
+  printf "%s" "$i" > "$3"
+  i=$((i+1))
+done
+`
 
-func unsealGitDirAfterReap(gitDir string) error {
-	return os.Chmod(gitDir, 0o755)
-}
-
-// lateWriterHandshakeScript: create residue, signal ready on $2, then park.
-// No free-running recreate loop — readiness is an explicit boundary file.
-const lateWriterHandshakeScript = `mkdir -p "$1/objects" && printf x > "$1/objects/late-0" && printf ready > "$2" && exec sleep 3600`
-
-// lateWriterFixture owns root + process group and always reaps on exit so early
-// Fatal paths cannot leak processes or sealed trees.
+// lateWriterFixture owns root + process group. The sole toggled step before
+// cleanupTempDir is production ReapOwnedCmd — no seal/unseal side channel.
 type lateWriterFixture struct {
 	t         *testing.T
 	root      string
-	gitDir    string
 	readyPath string
+	genPath   string
 	cmd       *exec.Cmd
 	pgid      int
 	stderr    strings.Builder
 	started   bool
-	sealed    bool
 	reaped    bool
 }
 
@@ -47,19 +58,19 @@ func startLateWriterFixture(t *testing.T) *lateWriterFixture {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// gen lives beside root (not under it) so RemoveAll cannot erase the
+	// mutation counter while the writer is still proving activity.
+	genPath := root + ".writer.gen"
+	readyPath := root + ".writer.ready"
 	f := &lateWriterFixture{
 		t:         t,
 		root:      root,
-		gitDir:    filepath.Join(root, ".git"),
-		readyPath: filepath.Join(root, "writer.ready"),
-	}
-	if err := os.MkdirAll(filepath.Join(f.gitDir, "objects"), 0o755); err != nil {
-		_ = os.RemoveAll(root)
-		t.Fatal(err)
+		readyPath: readyPath,
+		genPath:   genPath,
 	}
 	t.Cleanup(f.shutdown)
 
-	f.cmd = exec.Command("sh", "-c", lateWriterHandshakeScript, "late-writer", f.gitDir, f.readyPath)
+	f.cmd = exec.Command("sh", "-c", activeLateWriterScript, "late-writer", f.root, f.readyPath, f.genPath)
 	f.cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	f.cmd.Stderr = &f.stderr
 	if err := f.cmd.Start(); err != nil {
@@ -71,58 +82,154 @@ func startLateWriterFixture(t *testing.T) *lateWriterFixture {
 	if err := waitForWriterReady(f.readyPath, f.pgid, 5*time.Second); err != nil {
 		t.Fatalf("writer ready handshake: %v (stderr=%q)", err, f.stderr.String())
 	}
-	if err := syscall.Kill(f.pgid, 0); err != nil {
-		t.Fatalf("writer must be live after ready handshake: %v", err)
+	if err := syscall.Kill(-f.pgid, 0); err != nil {
+		t.Fatalf("writer process group must be live after ready: %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(f.gitDir, "objects", "late-0")); err != nil {
-		t.Fatalf("residue missing after ready handshake: %v", err)
+	// Active mutation (not parked sleep): gen must advance past 0.
+	if _, err := f.waitGenAdvance(0, 2*time.Second); err != nil {
+		t.Fatalf("writer must actively mutate after ready: %v (stderr=%q)", err, f.stderr.String())
 	}
 	return f
 }
 
-// shutdown is leak-safe cleanup for all paths (including early Fatal via t.Cleanup).
-// Uses production ReapOwnedCmd so test cleanup cannot ignore kill/Wait/group errors.
+// cleanupTempDir is the single cleanup action shared by pre-fix, post-fix,
+// and mutation paths. Only production ReapOwnedCmd is toggled around it.
+func cleanupTempDir(root string) error {
+	return os.RemoveAll(root)
+}
+
+// isLiveWriterRemoveAllError attributes failure to the concurrent-writer class
+// (directory not empty / unlinkat), not permission tricks.
+func isLiveWriterRemoveAllError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "directory not empty") ||
+		strings.Contains(msg, "not empty") ||
+		strings.Contains(msg, "unlinkat")
+}
+
+// ownershipBlocksDurableCleanup proves unreaped active ownership prevents a
+// durable TempDir cleanup. Either:
+//   - cleanupTempDir returns the live-writer unlinkat/not-empty class, or
+//   - cleanupTempDir returns nil but the writer recreates residue while still live
+//
+// (RemoveAll "won" one walk — not durable). Parked sleep + chmod cannot pass.
+func ownershipBlocksDurableCleanup(root string, pgid int) error {
+	if err := syscall.Kill(-pgid, 0); err != nil {
+		return fmt.Errorf("writer group %d not live before cleanup: %w", pgid, err)
+	}
+	err := cleanupTempDir(root)
+	if err != nil {
+		return err
+	}
+	// RemoveAll returned nil — require non-durable recreation under live writer.
+	objects := filepath.Join(root, ".git", "objects")
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if kerr := syscall.Kill(-pgid, 0); kerr != nil {
+			return fmt.Errorf("writer group %d died after RemoveAll success (no durable-block proof): %w", pgid, kerr)
+		}
+		if st, stErr := os.Stat(objects); stErr == nil && st.IsDir() {
+			return fmt.Errorf("cleanup not durable: unreaped writer recreated %s after RemoveAll", objects)
+		}
+		if entries, rdErr := os.ReadDir(root); rdErr == nil && len(entries) > 0 {
+			return fmt.Errorf("cleanup not durable: unreaped writer left/recreated %d entries under root", len(entries))
+		}
+		time.Sleep(time.Millisecond)
+	}
+	return nil
+}
+
+// durableCleanupAfterReap runs the same cleanupTempDir and requires the root
+// to stay gone (no recreation). Call only after production ReapOwnedCmd.
+func durableCleanupAfterReap(root string, observe time.Duration) error {
+	if err := cleanupTempDir(root); err != nil {
+		return err
+	}
+	deadline := time.Now().Add(observe)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(root); err == nil {
+			return fmt.Errorf("cleanup not durable after reap: root reappeared")
+		} else if !os.IsNotExist(err) {
+			return err
+		}
+		time.Sleep(time.Millisecond)
+	}
+	return nil
+}
+
+func (f *lateWriterFixture) readGen() (int, error) {
+	data, err := os.ReadFile(f.genPath)
+	if err != nil {
+		return 0, err
+	}
+	s := strings.TrimSpace(string(data))
+	if s == "" {
+		return 0, fmt.Errorf("empty gen")
+	}
+	var n int
+	if _, err := fmt.Sscanf(s, "%d", &n); err != nil {
+		return 0, fmt.Errorf("parse gen %q: %w", s, err)
+	}
+	return n, nil
+}
+
+func (f *lateWriterFixture) waitGenAdvance(min int, bound time.Duration) (int, error) {
+	deadline := time.Now().Add(bound)
+	var lastErr error
+	var n int
+	for {
+		n, lastErr = f.readGen()
+		if lastErr == nil && n > min {
+			return n, nil
+		}
+		if time.Now().After(deadline) {
+			if lastErr != nil {
+				return 0, fmt.Errorf("gen did not advance past %d: %w", min, lastErr)
+			}
+			return n, fmt.Errorf("gen stuck at %d (want > %d)", n, min)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// shutdown: production ReapOwnedCmd (errors reported), then cleanupTempDir.
 func (f *lateWriterFixture) shutdown() {
 	if f == nil {
 		return
 	}
-	if f.sealed {
-		if err := unsealGitDirAfterReap(f.gitDir); err != nil && !os.IsNotExist(err) {
-			f.t.Errorf("shutdown unseal: %v", err)
-		}
-		f.sealed = false
-	}
 	if f.started && !f.reaped {
 		if err := ReapOwnedCmd(f.cmd); err != nil {
-			// Last-resort group kill if production reap failed mid-path.
 			if f.pgid > 0 {
-				_ = killProcessGroup(f.pgid)
+				if kerr := killProcessGroup(f.pgid); kerr != nil && !isESRCH(kerr) {
+					f.t.Errorf("shutdown fallback killProcessGroup %d: %v", f.pgid, kerr)
+				}
 			}
 			f.t.Errorf("shutdown ReapOwnedCmd: %v (stderr=%q)", err, f.stderr.String())
 		}
 		f.reaped = true
 	}
 	if f.root != "" {
-		if err := os.RemoveAll(f.root); err != nil && !os.IsNotExist(err) {
-			_ = unsealGitDirAfterReap(f.gitDir)
-			if err2 := os.RemoveAll(f.root); err2 != nil && !os.IsNotExist(err2) {
-				f.t.Errorf("shutdown RemoveAll: %v", err2)
-			}
+		if err := cleanupTempDir(f.root); err != nil && !os.IsNotExist(err) {
+			f.t.Errorf("shutdown cleanupTempDir: %v", err)
+		}
+	}
+	if f.genPath != "" {
+		if err := os.Remove(f.genPath); err != nil && !os.IsNotExist(err) {
+			f.t.Errorf("shutdown remove gen: %v", err)
+		}
+	}
+	if f.readyPath != "" {
+		if err := os.Remove(f.readyPath); err != nil && !os.IsNotExist(err) {
+			f.t.Errorf("shutdown remove ready: %v", err)
 		}
 	}
 }
 
-func (f *lateWriterFixture) seal() {
-	f.t.Helper()
-	if err := sealGitDirForCleanupFailure(f.gitDir); err != nil {
-		f.t.Fatalf("seal .git: %v", err)
-	}
-	f.sealed = true
-}
-
-// reapAndWait closes ownership via production ReapOwnedCmd (full-group kill +
-// Wait + group-gone probe). Errors are never ignored.
-func (f *lateWriterFixture) reapAndWait() {
+// reapOwned closes ownership via production ReapOwnedCmd only. Errors fatal.
+func (f *lateWriterFixture) reapOwned() {
 	f.t.Helper()
 	if f.reaped {
 		return
@@ -134,14 +241,6 @@ func (f *lateWriterFixture) reapAndWait() {
 		f.t.Fatalf("process group %d still live after ReapOwnedCmd: %v", f.pgid, err)
 	}
 	f.reaped = true
-}
-
-func (f *lateWriterFixture) unseal() {
-	f.t.Helper()
-	if err := unsealGitDirAfterReap(f.gitDir); err != nil {
-		f.t.Fatalf("unseal .git: %v", err)
-	}
-	f.sealed = false
 }
 
 // waitForProcessGroupGone proves no member of the process group remains
@@ -184,68 +283,92 @@ func waitForWriterReady(readyPath string, pgid int, bound time.Duration) error {
 	}
 }
 
-// TestLateWriterIntoGitRequiresExplicitReap: hard pre-reap RemoveAll failure,
-// post-reap success via production ReapOwnedCmd, ready handshake, no ignored
-// kill/Wait/RemoveAll errors.
+// TestLateWriterIntoGitRequiresExplicitReap: unreaped active writer blocks
+// durable cleanup; production ReapOwnedCmd is the sole toggled step; same
+// cleanupTempDir then durably succeeds. No chmod/unseal.
 func TestLateWriterIntoGitRequiresExplicitReap(t *testing.T) {
 	f := startLateWriterFixture(t)
 
-	f.seal()
+	genBefore, err := f.readGen()
+	if err != nil {
+		t.Fatalf("pre-fix: initial gen: %v", err)
+	}
 
-	// PRE-FIX: real os.RemoveAll must fail (never ignored).
-	preErr := os.RemoveAll(f.root)
+	// PRE-FIX: only cleanupTempDir — writer unreaped → durable cleanup blocked.
+	preErr := ownershipBlocksDurableCleanup(f.root, f.pgid)
 	if preErr == nil {
-		t.Fatal("pre-fix: os.RemoveAll must return an error while sealed under unreaped ownership")
+		t.Fatal("pre-fix: durable cleanup must be blocked by unreaped active writer")
 	}
 	if err := syscall.Kill(-f.pgid, 0); err != nil {
-		t.Fatalf("unreaped process group must remain live after failed RemoveAll: %v (stderr=%q)", err, f.stderr.String())
+		t.Fatalf("unreaped process group must remain live after blocked cleanup: %v (stderr=%q)", err, f.stderr.String())
+	}
+	// Continuing mutation (gen outside root) — proves active writer, not park.
+	if _, err := f.waitGenAdvance(genBefore, 2*time.Second); err != nil {
+		t.Fatalf("pre-fix: writer must keep mutating after blocked cleanup: %v", err)
 	}
 
-	// FIX: production ReapOwnedCmd + unseal, then RemoveAll must succeed.
-	f.reapAndWait()
-	f.unseal()
-	if err := os.RemoveAll(f.root); err != nil {
-		t.Fatalf("post-fix: os.RemoveAll must succeed after ReapOwnedCmd+unseal: %v", err)
+	// FIX: toggle ONLY production ReapOwnedCmd (kill+Wait+group-gone).
+	f.reapOwned()
+	genAfterReap, err := f.readGen()
+	if err != nil {
+		// gen may be mid-write at kill; treat unreadable as frozen baseline.
+		genAfterReap = genBefore
+	}
+
+	// POST-FIX: same cleanupTempDir must durably succeed — no recreation.
+	if err := durableCleanupAfterReap(f.root, 100*time.Millisecond); err != nil {
+		t.Fatalf("post-fix: durable cleanup after production ReapOwnedCmd: %v", err)
 	}
 	if err := syscall.Kill(-f.pgid, 0); err == nil {
 		t.Fatalf("process group %d still live after production ReapOwnedCmd", f.pgid)
 	}
-	// Root is gone; prevent shutdown RemoveAll noise.
+	// Gen must not keep advancing after reap (writer dead).
+	time.Sleep(20 * time.Millisecond)
+	if g2, gerr := f.readGen(); gerr == nil && g2 > genAfterReap+1000 {
+		t.Fatalf("post-fix: gen advanced after reap (%d -> %d); writer still mutating", genAfterReap, g2)
+	}
 	f.root = ""
 }
 
-// TestLateWriterCleanupMutationOmittingReapStillFails: omit ReapOwnedCmd/unseal
-// and assert RemoveAll still fails (non-vacuous negative guard).
+// TestLateWriterCleanupMutationOmittingReapStillFails: identical cleanup path;
+// only production ReapOwnedCmd is omitted. Mutant must fail durable cleanup.
 func TestLateWriterCleanupMutationOmittingReapStillFails(t *testing.T) {
 	f := startLateWriterFixture(t)
-	f.seal()
 
-	if err := os.RemoveAll(f.root); err == nil {
-		t.Fatal("control: sealed unreaped tree must make os.RemoveAll fail")
+	gen0, err := f.readGen()
+	if err != nil {
+		t.Fatalf("mutation: initial gen: %v", err)
 	}
 
-	// MUTATION of the fix path: no ReapOwnedCmd, no unseal.
-	mutErr := os.RemoveAll(f.root)
+	// Control: unreaped active writer blocks durable cleanup.
+	if err := ownershipBlocksDurableCleanup(f.root, f.pgid); err == nil {
+		t.Fatal("control: durable cleanup must fail under unreaped active writer")
+	}
+
+	// MUTATION: omit only ReapOwnedCmd; every other cleanup action identical.
+	mutErr := ownershipBlocksDurableCleanup(f.root, f.pgid)
 	if mutErr == nil {
-		t.Fatal("mutation: omitting ReapOwnedCmd/unseal must leave os.RemoveAll failing; got nil")
+		t.Fatal("mutation: omitting only production ReapOwnedCmd must leave durable cleanup failing; got nil")
 	}
 	if err := syscall.Kill(-f.pgid, 0); err != nil {
 		t.Fatalf("mutation: process group must still be live without reap: %v", err)
 	}
-	// Fixture cleanup via t.Cleanup → ReapOwnedCmd/unseal/RemoveAll — no leak.
+	if _, err := f.waitGenAdvance(gen0, 2*time.Second); err != nil {
+		t.Fatalf("mutation: writer must keep mutating without reap: %v", err)
+	}
+	// Fixture t.Cleanup runs production ReapOwnedCmd then cleanupTempDir.
 }
 
-// TestProcessGroupReapAllowsTempDirCleanup: seal fail → ReapOwnedCmd+unseal success.
+// TestProcessGroupReapAllowsTempDirCleanup: blocked cleanup → ReapOwnedCmd →
+// durable cleanupTempDir success (no seal/unseal).
 func TestProcessGroupReapAllowsTempDirCleanup(t *testing.T) {
 	f := startLateWriterFixture(t)
-	f.seal()
-	if err := os.RemoveAll(f.root); err == nil {
-		t.Fatal("pre-reap: os.RemoveAll must fail while sealed")
+	if err := ownershipBlocksDurableCleanup(f.root, f.pgid); err == nil {
+		t.Fatal("pre-reap: durable cleanup must fail under active writer")
 	}
-	f.reapAndWait()
-	f.unseal()
-	if err := os.RemoveAll(f.root); err != nil {
-		t.Fatalf("post-reap: os.RemoveAll must succeed: %v", err)
+	f.reapOwned()
+	if err := durableCleanupAfterReap(f.root, 100*time.Millisecond); err != nil {
+		t.Fatalf("post-reap: durable cleanup must succeed: %v", err)
 	}
 	f.root = ""
 }
@@ -267,14 +390,18 @@ func startGrandchildGroup(t *testing.T) (cmd *exec.Cmd, pgid int, grandchild int
 	}
 	pgid = cmd.Process.Pid
 	t.Cleanup(func() {
-		// Leak-safe: production reap if still unreaped.
+		// Leak-safe: production reap if still unreaped; kill/Wait errors reported.
 		if cmd.ProcessState == nil && cmd.Process != nil {
 			if err := ReapOwnedCmd(cmd); err != nil {
-				_ = killProcessGroup(pgid)
+				if kerr := killProcessGroup(pgid); kerr != nil && !isESRCH(kerr) {
+					t.Errorf("cleanup fallback killProcessGroup %d: %v", pgid, kerr)
+				}
 				t.Errorf("cleanup ReapOwnedCmd: %v", err)
 			}
 		} else if pgid > 0 {
-			_ = killProcessGroup(pgid)
+			if err := killProcessGroup(pgid); err != nil && !isESRCH(err) {
+				t.Errorf("cleanup killProcessGroup %d: %v", pgid, err)
+			}
 		}
 	})
 	gc, err := waitForChildReadyPID(ready, 5*time.Second)

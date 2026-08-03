@@ -38,7 +38,9 @@ func KillProcessGroup(pgid int) error {
 // to empty after SIGKILL+Wait. Orphaned zombies can keep kill(-pgid,0)==nil
 // until init reaps them; this bound is a fail-closed ownership gate, not a
 // cancel/cleanup sleep.
-const processGroupGoneBound = 2 * time.Second
+// Bound covers zombie reaping after SIGKILL; live descendants fail closed at
+// this bound (leader-only kill mutation). Kept short enough for stress matrices.
+const processGroupGoneBound = 500 * time.Millisecond
 
 // ReapOwnedCmd is the production ownership close for a started verification
 // subprocess: full process-group SIGKILL, Wait on the leader, then verify the
