@@ -184,11 +184,12 @@ func TestPruneMergedWorktrees_WithHerbBranchMerged(t *testing.T) {
 	}
 	t.Cleanup(func() { os.RemoveAll(wi.Path) })
 
-	// The worktree sits on a herd/ branch. Merge it into main.
+	// Merge into main and publish to origin so git cherry sees content-merged.
 	runCmd(tmpDir, "git", "checkout", "main")
 	runCmd(tmpDir, "git", "merge", "--no-ff", "herd/ftr-42")
+	runCmd(tmpDir, "git", "push", "origin", "main")
 
-	// Prune should find the herd/ worktree, check it's merged, and remove it.
+	// Prune should classify content-merged + clean and remove the worktree.
 	count, err := wm.PruneMergedWorktrees(context.Background(), "main")
 	if err != nil {
 		t.Fatalf("expected no error, got: %v", err)
@@ -196,9 +197,10 @@ func TestPruneMergedWorktrees_WithHerbBranchMerged(t *testing.T) {
 	if count != 1 {
 		t.Errorf("expected 1 pruned worktree, got %d", count)
 	}
+	_ = wi
 }
 
-func TestPruneMergedWorktrees_RemoveFailureIgnored(t *testing.T) {
+func TestPruneMergedWorktrees_RemoveFailureNotCounted(t *testing.T) {
 	tmpDir := t.TempDir()
 	initRepo(t, tmpDir)
 	runCmd(tmpDir, "git", "branch", "-m", "main")
@@ -210,21 +212,25 @@ func TestPruneMergedWorktrees_RemoveFailureIgnored(t *testing.T) {
 	}
 	t.Cleanup(func() { os.RemoveAll(wi.Path) })
 
-	// Merge the herd branch into main so it shows as merged
+	// Content-merge onto origin/main so classification is eligible.
 	runCmd(tmpDir, "git", "checkout", "main")
 	runCmd(tmpDir, "git", "merge", "--no-ff", "herd/stale-99")
+	runCmd(tmpDir, "git", "push", "origin", "main")
 
-	// Mock git worktree remove to fail
+	// Mock git worktree remove to fail (FAC-117: do not count as reaped).
 	defer func(old func(context.Context, string, ...string) *exec.Cmd) {
 		execCommandContext = old
 	}(execCommandContext)
 
 	execCommandContext = func(ctx context.Context, name string, args ...string) *exec.Cmd {
-		if len(args) >= 3 && args[0] == "worktree" && args[1] == "remove" {
-			cmd := exec.CommandContext(ctx, "false")
-			return cmd
+		// Match both `git worktree remove` and remove via RemoveWorktree.
+		if name == "git" {
+			for i := 0; i+1 < len(args); i++ {
+				if args[i] == "worktree" && args[i+1] == "remove" {
+					return exec.CommandContext(ctx, "false")
+				}
+			}
 		}
-		// Pass through other commands (branch --merged, etc.)
 		cmd := exec.CommandContext(ctx, name, args...)
 		cmd.Dir = tmpDir
 		return cmd
@@ -232,13 +238,15 @@ func TestPruneMergedWorktrees_RemoveFailureIgnored(t *testing.T) {
 
 	count, err := wm.PruneMergedWorktrees(context.Background(), "main")
 	if err != nil {
-		t.Fatalf("expected no error (failure is silently ignored), got: %v", err)
+		t.Fatalf("expected no hard error (remove failure is per-candidate), got: %v", err)
 	}
 	if count != 0 {
 		t.Errorf("expected 0 pruned (remove failed), got %d", count)
 	}
 
 	// Clean up the worktree manually since prune's remove was mocked away
+	// Restore real exec for cleanup.
+	execCommandContext = exec.CommandContext
 	runCmd(tmpDir, "git", "worktree", "remove", "--force", wi.Path)
 }
 
