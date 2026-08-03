@@ -3,6 +3,7 @@ package preflight
 import (
 	"errors"
 	"fmt"
+	"math"
 	"strings"
 	"testing"
 )
@@ -394,5 +395,29 @@ func TestDiskGuardAbsurdFloorSaturatesFailClosed(t *testing.T) {
 	}
 	if pe.Thresholds.MinFreeBytes != maxDiskFloorBytes {
 		t.Fatalf("floor not saturated: %d", pe.Thresholds.MinFreeBytes)
+	}
+}
+
+func TestDiskGuardNonFiniteThresholdsFailClosed(t *testing.T) {
+	// NaN parses fine and NaN < x is always false: without rejection, a
+	// NaN floor silently disables the gate (fails OPEN). All non-finite
+	// values must fall back to the protective defaults, keeping the
+	// incident volume refused — mutation-sensitive proof, not just parse.
+	for _, hostile := range []string{"NaN", "nan", "+Inf", "-Inf", "Infinity"} {
+		t.Run(hostile, func(t *testing.T) {
+			t.Setenv(EnvDiskMinFreeGB, hostile)
+			t.Setenv(EnvDiskMinFreePct, hostile)
+			t.Setenv(EnvDiskMinInodePct, hostile)
+			t.Setenv(EnvDiskRecoverFreeGB, hostile)
+			t.Setenv(EnvDiskBuildHeadroomGB, hostile)
+			g := NewDiskGuard(fakeProber(map[string]DiskStat{"/repo": incidentStat("/repo", "a")}, nil))
+			pe := asPressureErr(t, g.Check("dispatch", "/repo"))
+			if pe.Thresholds.MinFreeBytes != gbToBytes(defaultDiskMinFreeGB) {
+				t.Fatalf("floor not restored to default: %+v", pe.Thresholds)
+			}
+			if math.IsNaN(pe.Thresholds.MinFreePct) || math.IsInf(pe.Thresholds.MinFreePct, 0) {
+				t.Fatalf("non-finite pct floor leaked: %+v", pe.Thresholds)
+			}
+		})
 	}
 }

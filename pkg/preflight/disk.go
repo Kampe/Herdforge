@@ -19,6 +19,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -434,7 +435,10 @@ func envFloat(key string, def float64) float64 {
 		return def
 	}
 	n, err := strconv.ParseFloat(v, 64)
-	if err != nil || n < 0 {
+	// NaN/±Inf parse successfully and NaN < 0 is false — a NaN floor makes
+	// every "below" comparison false and silently disables the gate. All
+	// non-finite values fail closed to the protective default.
+	if err != nil || n < 0 || math.IsNaN(n) || math.IsInf(n, 0) {
 		return def
 	}
 	return n
