@@ -8,20 +8,21 @@ import (
 
 // RecordOpts carries optional fields for Record.
 type RecordOpts struct {
-	SHA            string
-	Branch         string
-	BuilderFamily  string
-	ReviewerFamily string
-	Reviewer       string
-	Provider       string
-	Model          string
-	Pane           string
-	Pid            string
-	Artifact       string
-	Gate           string
-	Tier           string
-	Task           string
-	Lease          string
+	SHA             string
+	Branch          string
+	BuilderFamily   string
+	BuilderIdentity string
+	ReviewerFamily  string
+	Reviewer        string
+	Provider        string
+	Model           string
+	Pane            string
+	Pid             string
+	Artifact        string
+	Gate            string
+	Tier            string
+	Task            string
+	Lease           string
 }
 
 // Record appends a record event. Validates builder family on independent gates.
@@ -39,21 +40,22 @@ func (l *Ledger) Record(opts RecordOpts) error {
 		}
 	}
 	row := &LedgerRow{
-		Event:          string(EventRecord),
-		SHA:            opts.SHA,
-		Branch:         opts.Branch,
-		BuilderFamily:  opts.BuilderFamily,
-		ReviewerFamily: opts.ReviewerFamily,
-		Reviewer:       opts.Reviewer,
-		Provider:       opts.Provider,
-		Model:          opts.Model,
-		Pane:           opts.Pane,
-		Pid:            opts.Pid,
-		Artifact:       opts.Artifact,
-		Gate:           opts.Gate,
-		Tier:           opts.Tier,
-		Task:           opts.Task,
-		Lease:          opts.Lease,
+		Event:           string(EventRecord),
+		SHA:             opts.SHA,
+		Branch:          opts.Branch,
+		BuilderFamily:   opts.BuilderFamily,
+		BuilderIdentity: opts.BuilderIdentity,
+		ReviewerFamily:  opts.ReviewerFamily,
+		Reviewer:        opts.Reviewer,
+		Provider:        opts.Provider,
+		Model:           opts.Model,
+		Pane:            opts.Pane,
+		Pid:             opts.Pid,
+		Artifact:        opts.Artifact,
+		Gate:            opts.Gate,
+		Tier:            opts.Tier,
+		Task:            opts.Task,
+		Lease:           opts.Lease,
 	}
 	return l.appendRow(l.Path, row)
 }
@@ -114,17 +116,17 @@ func (l *Ledger) Verdict(opts VerdictOpts) (enqueued bool, err error) {
 	}
 
 	row := &LedgerRow{
-		Event:          string(EventVerdict),
-		SHA:            opts.SHA,
-		Reviewer:       opts.Reviewer,
-		Verdict:        string(opts.Verdict),
-		Artifact:       opts.Artifact,
-		Task:           opts.Task,
-		Lease:          opts.Lease,
-		PatchURL:       opts.PatchURL,
+		Event:              string(EventVerdict),
+		SHA:                opts.SHA,
+		Reviewer:           opts.Reviewer,
+		Verdict:            string(opts.Verdict),
+		Artifact:           opts.Artifact,
+		Task:               opts.Task,
+		Lease:              opts.Lease,
+		PatchURL:           opts.PatchURL,
 		VerificationDigest: opts.VfyDigest,
-		FindingsRef:    opts.FindingsRef,
-		CandidateSHA:   opts.CandidateSHA,
+		FindingsRef:        opts.FindingsRef,
+		CandidateSHA:       opts.CandidateSHA,
 	}
 	if opts.ReviewerFamily != "" {
 		row.ReviewerFamily = opts.ReviewerFamily
