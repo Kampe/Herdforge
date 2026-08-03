@@ -1,7 +1,9 @@
 package mail
 
 import (
+	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -253,5 +255,94 @@ func TestCallbackConsumer_AckUnknownEnvelope(t *testing.T) {
 	}
 	if err := c.Ack("does-not-exist"); err == nil {
 		t.Fatal("expected an error acking an unknown envelope")
+	}
+}
+
+// TestCallbackConsumer_DeadLetterDurableBeforeStateSave_CrashConsistency is
+// the FAC-126 review-rejection regression for finding 3: Drain must write
+// the dead-letter record BEFORE clearing/saving the pending entry, so a
+// crash or failure in between never silently loses the callback and never
+// resets its attempt count back to 1 on the next Drain (which would let a
+// perpetually-retrying callback dodge maxRetries forever).
+//
+// The state file's directory is made read-only after the dead-letter file
+// is pre-created, so writeFileAtomic's temp-file creation for
+// callback-state.json fails (needs a new directory entry) while appending
+// to the already-existing dead-letter file still succeeds (appending to an
+// existing file needs no directory write permission) — isolating exactly
+// the failure window the fix targets.
+func TestCallbackConsumer_DeadLetterDurableBeforeStateSave_CrashConsistency(t *testing.T) {
+	tmpDir := t.TempDir()
+	mailFile := filepath.Join(tmpDir, "mail.jsonl")
+	mb := NewMailbox(mailFile)
+	if _, err := mb.PostCallback("agent-1", Callback{Ref: "FAC-6", Kind: CallbackBlocked, Detail: "stuck"}); err != nil {
+		t.Fatal(err)
+	}
+
+	const maxRetries = 1
+	c, err := NewCallbackConsumer(mb, maxRetries)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	first, err := c.Drain()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(first) != 1 || first[0].Attempt != 1 {
+		t.Fatalf("expected attempt 1, got %+v", first)
+	}
+
+	deadPath := mailFile + ".dead-letters.jsonl"
+	if err := os.WriteFile(deadPath, nil, 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(tmpDir, 0555); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(tmpDir, 0755) })
+
+	// Attempt 2 pushes attempts past maxRetries -> dead-letter path; the
+	// state save that follows is forced to fail by the read-only directory.
+	_, err = c.Drain()
+	if err == nil {
+		t.Fatal("expected Drain to surface the forced state-save failure")
+	}
+
+	data, rErr := os.ReadFile(deadPath)
+	if rErr != nil {
+		t.Fatalf("expected the dead-letter file to still exist: %v", rErr)
+	}
+	if len(strings.TrimSpace(string(data))) == 0 {
+		t.Fatal("dead-letter record must be durable even when the subsequent state save fails")
+	}
+
+	os.Chmod(tmpDir, 0755)
+
+	// A fresh consumer ("restart") loads the last successfully-saved state
+	// (from attempt 1, since attempt 2's save never completed) — it must
+	// still see the callback as pending, continuing the count from where
+	// the disk left off, never resetting to a fresh attempt 1.
+	c2, err := NewCallbackConsumer(mb, maxRetries)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := c2.Drain()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(second) != 0 {
+		t.Fatalf("expected the retried-and-exceeded callback to dead-letter again, not redeliver as fresh: %+v", second)
+	}
+
+	stats, err := c2.Stats()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.DeadLetters < 1 {
+		t.Fatalf("expected the durable dead-letter record to have survived the crash, got %d", stats.DeadLetters)
+	}
+	if stats.PendingCount != 0 {
+		t.Fatalf("expected pending cleared once the restart-drain's dead-letter+save succeeded, got %d", stats.PendingCount)
 	}
 }
