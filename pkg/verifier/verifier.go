@@ -281,6 +281,14 @@ func (v *Verifier) VerifyCandidate(ctx context.Context, dir string, req Verifica
 
 	result, err := v.execute(ctx, dir, req.EnvironmentPolicy)
 	if err != nil {
+		// Never surface cancellation as a bare VerifyCandidate error.
+		if isContextDone(err) || (ctx != nil && ctx.Err() != nil) {
+			cause := err
+			if ctx != nil && ctx.Err() != nil {
+				cause = ctx.Err()
+			}
+			return blockedReceipt(req, v.argv(), -1, nil, cause), nil
+		}
 		return nil, err
 	}
 	outcome := result.Outcome
@@ -749,6 +757,18 @@ func (v *Verifier) RunMutationCheckForCandidate(ctx context.Context, dir string,
 
 	baseline, err := v.VerifyCandidate(ctx, dir, baseReq)
 	if err != nil {
+		// Cancellation during baseline must not escape as a bare error — the
+		// contract is BLOCKED with a result (no mutant applied yet).
+		if isContextDone(err) || ctx.Err() != nil {
+			cause := err
+			if ctx.Err() != nil {
+				cause = ctx.Err()
+			}
+			result.Output = cause.Error()
+			result.Baseline = *blockedReceipt(baseReq, v.argv(), -1, nil, cause)
+			result.Outcome = OutcomeBLOCKED
+			return result, nil
+		}
 		return nil, err
 	}
 	result.Baseline = *baseline
@@ -787,6 +807,20 @@ func (v *Verifier) RunMutationCheckForCandidate(ctx context.Context, dir string,
 	mutantContextErr := mutantCtx.Err()
 	cancel()
 	if execErr != nil {
+		// No race window: cancellation/timeout from Execute is always a
+		// BLOCKED MutationResult so the restore defer still records Restored.
+		if isContextDone(execErr) || mutantContextErr != nil || ctx.Err() != nil {
+			cause := execErr
+			if mutantContextErr != nil {
+				cause = mutantContextErr
+			} else if ctx.Err() != nil {
+				cause = ctx.Err()
+			}
+			result.Output = cause.Error()
+			result.Mutant = *blockedReceipt(baseReq, v.argv(), -1, nil, cause)
+			result.Outcome = OutcomeBLOCKED
+			return result, nil
+		}
 		return nil, execErr
 	}
 	mutantReq := baseReq
@@ -815,6 +849,15 @@ func (v *Verifier) RunMutationCheckForCandidate(ctx context.Context, dir string,
 	result.Restored = true
 	final, err := v.VerifyCandidate(ctx, dir, baseReq)
 	if err != nil {
+		if isContextDone(err) || ctx.Err() != nil {
+			cause := err
+			if ctx.Err() != nil {
+				cause = ctx.Err()
+			}
+			result.Output += "\n" + cause.Error()
+			result.Outcome = OutcomeBLOCKED
+			return result, nil
+		}
 		return nil, err
 	}
 	result.Final = *final
@@ -833,6 +876,12 @@ func (v *Verifier) mutationTimeout() time.Duration {
 		return v.Timeout
 	}
 	return 30 * time.Second
+}
+
+// isContextDone reports whether err is context cancellation or deadline.
+// Mutation cancel paths must map these to BLOCKED results, never bare errors.
+func isContextDone(err error) bool {
+	return err != nil && (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded))
 }
 
 func restoreFile(path string, contents []byte, mode os.FileMode) error {
