@@ -19,7 +19,7 @@ func TestInventorySuccessIsJSONAndSecretSafe(t *testing.T) {
 	var out, errOut bytes.Buffer
 	digest := "claude:pre-tool:" + strings.Repeat("a", 64)
 	d := inventoryDiscovery(nil, "sha256:"+strings.Repeat("b", 64))
-	if code := run(nil, &out, &errOut, d); code != 0 || !strings.Contains(out.String(), `"handler_digest":"`+digest+`"`) || strings.Contains(out.String(), "http") || errOut.Len() != 0 {
+	if code := runInventoryCommand(nil, &out, &errOut, d); code != 0 || !strings.Contains(out.String(), `"handler_digest":"`+digest+`"`) || strings.Contains(out.String(), "http") || errOut.Len() != 0 {
 		t.Fatalf("inventory code=%d out=%q err=%q", code, out.String(), errOut.String())
 	}
 }
@@ -29,7 +29,7 @@ func TestValidationSuccessAndPolicyFailuresAreNonVacuous(t *testing.T) {
 	policy := harness.HookPolicy{HandlerDigest: digest, Requirement: harness.HookRequired, HealthURL: "http://127.0.0.1:8790/health"}
 	revision := harness.HookPolicyRevision([]harness.HookPolicy{policy})
 	var out, errOut bytes.Buffer
-	if code := run([]string{"--validate"}, &out, &errOut, inventoryDiscovery([]harness.HookPolicy{policy}, revision)); code != 0 || !strings.Contains(out.String(), `"valid":true`) {
+	if code := runInventoryCommand([]string{"--validate"}, &out, &errOut, inventoryDiscovery([]harness.HookPolicy{policy}, revision)); code != 0 || !strings.Contains(out.String(), `"valid":true`) {
 		t.Fatalf("validation success code=%d out=%q err=%q", code, out.String(), errOut.String())
 	}
 	for _, tc := range []struct {
@@ -42,7 +42,7 @@ func TestValidationSuccessAndPolicyFailuresAreNonVacuous(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			out.Reset()
 			errOut.Reset()
-			if code := run([]string{"--validate"}, &out, &errOut, inventoryDiscovery(tc.policies, tc.rev)); code != 1 || errOut.Len() == 0 {
+			if code := runInventoryCommand([]string{"--validate"}, &out, &errOut, inventoryDiscovery(tc.policies, tc.rev)); code != 1 || errOut.Len() == 0 {
 				t.Fatalf("failure code=%d out=%q err=%q", code, out.String(), errOut.String())
 			}
 		})
@@ -51,10 +51,10 @@ func TestValidationSuccessAndPolicyFailuresAreNonVacuous(t *testing.T) {
 
 func TestStrictArgumentsReturnUsageExit(t *testing.T) {
 	var out, errOut bytes.Buffer
-	if code := run([]string{"--unknown"}, &out, &errOut, inventoryDiscovery(nil, "")); code != 2 {
+	if code := runInventoryCommand([]string{"--unknown"}, &out, &errOut, inventoryDiscovery(nil, "")); code != 2 {
 		t.Fatalf("unknown flag exit=%d out=%q err=%q", code, out.String(), errOut.String())
 	}
-	if code := run([]string{"claude"}, &out, &errOut, inventoryDiscovery(nil, "")); code != 2 {
+	if code := runInventoryCommand([]string{"claude"}, &out, &errOut, inventoryDiscovery(nil, "")); code != 2 {
 		t.Fatalf("positional argument exit=%d", code)
 	}
 }
@@ -78,7 +78,7 @@ func TestInventoryRejectsUnknownBlankAndNonAuthoritativeDiscovery(t *testing.T) 
 		t.Run(tc.name, func(t *testing.T) {
 			var out, errOut bytes.Buffer
 			d := harness.HookDiscoveryFunc(func(string) (harness.HookDiscoveryResult, error) { return tc.result, tc.err })
-			if code := run(tc.args, &out, &errOut, d); code != 1 || out.Len() != 0 {
+			if code := runInventoryCommand(tc.args, &out, &errOut, d); code != 1 || out.Len() != 0 {
 				t.Fatalf("code=%d stdout=%q stderr=%q", code, out.String(), errOut.String())
 			}
 		})

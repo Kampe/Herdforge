@@ -11,9 +11,11 @@ import (
 	"github.com/Kampe/Herdforge/pkg/harness"
 )
 
-func main() { os.Exit(run(os.Args[1:], os.Stdout, os.Stderr, harness.DefaultDiscovery{})) }
+func main() {
+	os.Exit(runInventoryCommand(os.Args[1:], os.Stdout, os.Stderr, harness.DefaultDiscovery{}))
+}
 
-func run(args []string, out, errOut io.Writer, discovery harness.HookDiscovery) int {
+func runInventoryCommand(args []string, out, errOut io.Writer, discovery harness.HookDiscovery) int {
 	fs := flag.NewFlagSet("herd-hook-inventory", flag.ContinueOnError)
 	fs.SetOutput(errOut)
 	provider := fs.String("provider", "claude", "provider to inspect")
