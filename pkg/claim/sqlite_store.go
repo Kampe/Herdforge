@@ -446,10 +446,21 @@ func (s *SQLiteLeaseStore) Hold(ctx context.Context, key LeaseKey, ownerID strin
 // id instead of expiring a lease that was, in the same instant, renewed
 // or held. Guarded by `WHERE status = 'active'` too, so a lease already
 // flipped by a concurrent ExpireStale (in this or another process) is
-// skipped rather than double-counted.
+// skipped rather than double-counted. Also respects an active,
+// non-stale provider-transition lock (see AcquireProviderLock) exactly
+// like Release and Acquire's reclaim path do: a lease genuinely past its
+// TTL but mid an in-flight ProviderCAS call must not be expired (and
+// thus become reclaimable at a new generation) out from under that call
+// -- expiring a locked lease would let a concurrent Acquire hand the key
+// to a new owner while the old CompleteProviderTransition is still
+// running, which is exactly as unsafe as Release racing it. A stale
+// (crashed settler) lock is not honored, so this self-heals the same
+// way Release/Acquire's reclaim path does.
 func (s *SQLiteLeaseStore) ExpireStale(ctx context.Context, now time.Time) ([]*Lease, error) {
+	staleBefore := now.Add(-providerLockStaleAfter)
 	rows, err := s.db.QueryContext(ctx, `SELECT `+leaseColumns+` FROM leases
-		WHERE status = 'active' AND held = 0 AND expires_at <= ?`, now)
+		WHERE status = 'active' AND held = 0 AND expires_at <= ?
+		AND (provider_lock_owner = '' OR provider_lock_at <= ?)`, now, staleBefore)
 	if err != nil {
 		return nil, fmt.Errorf("expire stale: candidates: %w", err)
 	}
@@ -473,7 +484,8 @@ func (s *SQLiteLeaseStore) ExpireStale(ctx context.Context, now time.Time) ([]*L
 			expireStaleTestHook(l)
 		}
 		res, err := execWithRetry(ctx, s.db, `UPDATE leases SET status = 'expired'
-			WHERE id = ? AND status = 'active' AND held = 0 AND expires_at <= ?`, l.ID, now)
+			WHERE id = ? AND status = 'active' AND held = 0 AND expires_at <= ?
+			AND (provider_lock_owner = '' OR provider_lock_at <= ?)`, l.ID, now, staleBefore)
 		if err != nil {
 			return nil, fmt.Errorf("expire stale: transition %d: %w", l.ID, err)
 		}

@@ -214,13 +214,17 @@ func (s *InMemoryLeaseStore) Hold(_ context.Context, key LeaseKey, ownerID strin
 	return cloneLease(l), nil
 }
 
+// ExpireStale also respects an active, non-stale provider-transition
+// lock exactly like Release and Acquire's reclaim path do -- see the
+// matching comment on SQLiteLeaseStore.ExpireStale.
 func (s *InMemoryLeaseStore) ExpireStale(_ context.Context, now time.Time) ([]*Lease, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	staleBefore := now.Add(-providerLockStaleAfter)
 	var out []*Lease
-	for _, l := range s.rows {
-		if l.Status == StatusActive && !l.Held && !now.Before(l.ExpiresAt) {
+	for id, l := range s.rows {
+		if l.Status == StatusActive && !l.Held && !now.Before(l.ExpiresAt) && !s.providerLockedLocked(id, "", staleBefore) {
 			l.Status = StatusExpired
 			out = append(out, cloneLease(l))
 		}
