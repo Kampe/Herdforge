@@ -31,6 +31,8 @@ func runHostCreds() {
 		os.Exit(runHostCredsBoundary(os.Args[3:]))
 	case "worker-probe":
 		os.Exit(runHostCredsWorkerProbe(os.Args[3:]))
+	case "author-causal":
+		os.Exit(runHostCredsAuthorCausal(os.Args[3:]))
 	case "-h", "--help", "help":
 		printHostCredsUsage()
 		os.Exit(0)
@@ -50,15 +52,49 @@ Usage:
   herd hostcreds selftest
   herd hostcreds boundary          # reports FAC-169 dependency status
   herd hostcreds live --kind <grok|claude|codex>
-  herd hostcreds worker-probe --proxy URL --allow-host H --deny-host D --session S --nonce N --out FILE
+  herd hostcreds worker-probe  ... (deprecated helper; not live admission)
+  herd hostcreds author-causal --proxy URL --allow-host H --deny-host D --session S --nonce N --out FILE
+       # exact author child: inherited HERD_HOSTCREDS_CLAIM_FD=3 one-shot peer
 
-Production secrets: HERD_HOSTCREDS_HANDLES (or FAC-169 IPC after merge)
+Production secrets: FAC-169 IPC authority after merge (not in-process test vault)
 OS isolation: FAC-169 (hard blocker). Live waits for FAC-169 + RequireOSBoundary.
 
 Exit: 0 ok, 1 fatal, 2 BLOCKED/usage. Never prints credential bytes. No OpenCode.`)
 }
 
+func runHostCredsAuthorCausal(args []string) int {
+	fs := flag.NewFlagSet("hostcreds author-causal", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	proxy := fs.String("proxy", "", "HTTP proxy URL")
+	allow := fs.String("allow-host", "", "allowlisted host")
+	deny := fs.String("deny-host", "evil.example.invalid", "forbidden host")
+	session := fs.String("session", "", "session id")
+	nonce := fs.String("nonce", "", "capability nonce")
+	out := fs.String("out", "", "result JSON path")
+	connectOnly := fs.Bool("connect-only", false, "CONNECT only")
+	method := fs.String("method", "POST", "TLS method")
+	path := fs.String("path", "/v1/chat/completions", "TLS path")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if *proxy == "" || *allow == "" || *out == "" {
+		fmt.Fprintln(os.Stderr, "author-causal: --proxy --allow-host --out required")
+		return 2
+	}
+	if err := security.RunAuthorCausalInProcess(security.AuthorCausalConfig{
+		ProxyURL: *proxy, AllowHost: *allow, DenyHost: *deny,
+		SessionID: *session, Nonce: *nonce, OutPath: *out,
+		ConnectOnly: *connectOnly, Method: *method, Path: *path,
+	}); err != nil {
+		fmt.Fprintln(os.Stderr, err.Error())
+		return 1
+	}
+	return 0
+}
+
 func runHostCredsWorkerProbe(args []string) int {
+	// Deprecated: helper split is not exact-session admission. Still available
+	// for low-level CONNECT checks via author-causal --connect-only preferred.
 	fs := flag.NewFlagSet("hostcreds worker-probe", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
 	proxy := fs.String("proxy", "", "HTTP proxy URL")
@@ -67,8 +103,7 @@ func runHostCredsWorkerProbe(args []string) int {
 	session := fs.String("session", "", "session id")
 	nonce := fs.String("nonce", "", "capability nonce")
 	out := fs.String("out", "", "result JSON path")
-	claim := fs.String("claim", "", "exclusive client-port claim file path")
-	connectOnly := fs.Bool("connect-only", false, "CONNECT status only (no full TLS request)")
+	connectOnly := fs.Bool("connect-only", false, "CONNECT status only")
 	method := fs.String("method", "POST", "TLS HTTP method after CONNECT")
 	path := fs.String("path", "/v1/chat/completions", "TLS HTTP path after CONNECT")
 	if err := fs.Parse(args); err != nil {
@@ -78,17 +113,11 @@ func runHostCredsWorkerProbe(args []string) int {
 		fmt.Fprintln(os.Stderr, "worker-probe: --proxy --allow-host --out required")
 		return 2
 	}
-	if err := security.RunWorkerProbeConfig(security.WorkerProbeConfig{
-		ProxyURL:    *proxy,
-		AllowHost:   *allow,
-		DenyHost:    *deny,
-		SessionID:   *session,
-		Nonce:       *nonce,
-		OutPath:     *out,
-		ClaimPath:   *claim,
-		ConnectOnly: *connectOnly,
-		Method:      *method,
-		Path:        *path,
+	// Route to author-causal body (inherited FD) — claim-file path removed.
+	if err := security.RunAuthorCausalInProcess(security.AuthorCausalConfig{
+		ProxyURL: *proxy, AllowHost: *allow, DenyHost: *deny,
+		SessionID: *session, Nonce: *nonce, OutPath: *out,
+		ConnectOnly: *connectOnly, Method: *method, Path: *path,
 	}); err != nil {
 		fmt.Fprintln(os.Stderr, err.Error())
 		return 1

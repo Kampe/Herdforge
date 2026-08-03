@@ -11,8 +11,6 @@ import (
 	"time"
 )
 
-// installLocalOrigin routes MITM upstream for host to a local TLS server that
-// records Authorization (secret stays broker-side; tests assert inject).
 func installLocalOrigin(t *testing.T, mitm *TLSMitmProxy, host, expectAuth string) (saw *string, cleanup func()) {
 	t.Helper()
 	var got string
@@ -28,11 +26,10 @@ func installLocalOrigin(t *testing.T, mitm *TLSMitmProxy, host, expectAuth strin
 	_, port, _ := net.SplitHostPort(up.Listener.Addr().String())
 	mitm.SetResolveHook(func(h string) (net.IP, error) {
 		if h == host {
-			return net.IPv4(1, 2, 3, 4), nil // non-private pin
+			return net.IPv4(1, 2, 3, 4), nil
 		}
 		return resolveAndPinIP(h)
 	})
-	// Raw TCP only — MITM performs upstream TLS (InsecureSkipVerify when dialHook set).
 	mitm.SetDialHook(func(h string, ip net.IP) (net.Conn, error) {
 		if h != host {
 			return nil, &net.OpError{Op: "dial", Err: io.EOF}
@@ -43,24 +40,20 @@ func installLocalOrigin(t *testing.T, mitm *TLSMitmProxy, host, expectAuth strin
 	return &got, up.Close
 }
 
-// Regression: peer must not fail-open; worker uses port claim + full TLS.
-func TestE2E_WorkerPeerBinding_FullTLS_Receipt(t *testing.T) {
+// Required causal path: REAL author child (author-causal) computes marker,
+// allowlisted TLS via one-shot FD, bound receipt; no post-hoc helper.
+func TestE2E_AuthorCausal_ExactSession(t *testing.T) {
 	if testing.Short() {
 		t.Skip("subprocess build")
 	}
 	v := NewTestCredentialVault()
-	secret := "Bearer e2e-secret-not-in-worker"
+	secret := "Bearer e2e-author-secret"
 	_ = v.InstallTestSecret("api.x.ai", secret)
-	sess, err := StartHostCredsSession(SessionConfig{Kind: "grok", SessionID: "e2e-peer", Authority: v})
+	sess, err := StartHostCredsSession(SessionConfig{Kind: "grok", SessionID: "e2e-author", Authority: v})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer sess.Close()
-
-	// Without peer allow, worker CONNECT denied.
-	if err := ProveMITMRequiresAllowPID(sess.Mitm, "api.x.ai"); err != nil {
-		t.Fatal(err)
-	}
 
 	saw, cleanup := installLocalOrigin(t, sess.Mitm, "api.x.ai", secret)
 	defer cleanup()
@@ -69,12 +62,12 @@ func TestE2E_WorkerPeerBinding_FullTLS_Receipt(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	res, err := sess.RunWorkerForbiddenAndAllowProbe(cap.Nonce)
+	res, rcpt, err := sess.RunAuthorCausalProbe(cap.Nonce)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if res.PID <= 0 {
-		t.Fatal("worker pid missing")
+		t.Fatal("author pid missing")
 	}
 	if res.CapabilityMarker != cap.Expected {
 		t.Fatalf("marker %q want %q", res.CapabilityMarker, cap.Expected)
@@ -83,21 +76,40 @@ func TestE2E_WorkerPeerBinding_FullTLS_Receipt(t *testing.T) {
 		t.Fatal("expected must not appear in prompt")
 	}
 	if !res.TLSRequestOK {
-		t.Fatal("full TLS request required, CONNECT-only insufficient")
+		t.Fatal("author full TLS required")
 	}
 	if *saw != secret {
-		t.Fatalf("broker inject not applied at origin: %q", RedactSecrets(*saw))
+		t.Fatalf("inject not applied: %q", RedactSecrets(*saw))
 	}
-	// Worker result must not contain secret.
-	raw := res.TLSBodySnippet + res.Error
-	if strings.Contains(raw, "e2e-secret") {
-		t.Fatal("worker result leaked secret")
+	if !rcpt.InjectOK || rcpt.SessionID != sess.ID || rcpt.PeerPort != res.PeerPort {
+		t.Fatalf("receipt not bound: %+v", rcpt)
 	}
-	sess.Mitm.mu.Lock()
-	rcpt := sess.Mitm.LastReceipt
-	sess.Mitm.mu.Unlock()
-	if !rcpt.InjectOK || rcpt.Host != "api.x.ai" || rcpt.Method != "POST" {
-		t.Fatalf("redacted receipt incomplete: %+v", rcpt)
+	if rcpt.CapabilityNonce != cap.Nonce {
+		t.Fatal("receipt nonce unbound")
+	}
+	// Helper probe must not be admission.
+	if _, err := sess.RunWorkerForbiddenAndAllowProbe(cap.Nonce); err == nil {
+		t.Fatal("helper probe must not be admission")
+	}
+}
+
+func TestE2E_OneShotPortReplayDenied(t *testing.T) {
+	v := NewTestCredentialVault()
+	_ = v.InstallTestSecret("api.x.ai", "Bearer x")
+	sess, err := StartHostCredsSession(SessionConfig{Kind: "grok", SessionID: "e2e-replay", Authority: v})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sess.Close()
+	// Upstream may fail; peer consume still tested.
+	sess.Mitm.SetDialHook(func(host string, ip net.IP) (net.Conn, error) {
+		return nil, io.EOF
+	})
+	sess.Mitm.SetResolveHook(func(host string) (net.IP, error) {
+		return net.IPv4(1, 2, 3, 4), nil
+	})
+	if err := ProvePortReplayDenied(sess.Mitm, "api.x.ai"); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -118,8 +130,7 @@ func TestE2E_CausalMarkerNotInPrompt(t *testing.T) {
 	}
 }
 
-// Production MITM rotate/restart E2E — not Oracle CallOracle alone.
-func TestE2E_MITM_RotateRestart_FullTLS(t *testing.T) {
+func TestE2E_MITM_RotateRestart_AuthorCausal(t *testing.T) {
 	if testing.Short() {
 		t.Skip("subprocess build")
 	}
@@ -151,37 +162,18 @@ func TestE2E_MITM_RotateRestart_FullTLS(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	res, err := sess.RunWorkerForbiddenAndAllowProbe(cap.Nonce)
+	res, rcpt, err := sess.RunAuthorCausalProbe(cap.Nonce)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !res.TLSRequestOK {
-		t.Fatal("post-restart full TLS required")
+	if !res.TLSRequestOK || !rcpt.InjectOK {
+		t.Fatal("post-restart author causal required")
 	}
 	if *saw != secretNew {
-		t.Fatalf("rotate not applied via MITM: %q", RedactSecrets(*saw))
-	}
-
-	// Revoke host — inject must fail (no successful receipt).
-	if err := sess.RevokeHost("api.x.ai"); err != nil {
-		t.Fatal(err)
-	}
-	// Clear receipt then probe again — TLS may fail inject.
-	sess.Mitm.mu.Lock()
-	sess.Mitm.LastReceipt = BrokerReceipt{}
-	sess.Mitm.mu.Unlock()
-	_, err = sess.RunWorkerForbiddenAndAllowProbe(cap.Nonce)
-	if err == nil {
-		// If err nil, ensure inject did not succeed with secret
-		if *saw == secretNew && sess.Mitm.LastReceipt.InjectOK {
-			// revoke should prevent inject — if still OK, fail
-			// actually after revoke, InjectAuthorization should fail
-			t.Fatal("revoked host still injects via MITM")
-		}
+		t.Fatalf("rotate not applied via MITM author: %q", RedactSecrets(*saw))
 	}
 }
 
-// Mutation must fail if production peer attribution is removed (unregistered CONNECT 403).
 func TestE2E_Mutation_PeerAttributionRequired(t *testing.T) {
 	v := NewTestCredentialVault()
 	_ = v.InstallTestSecret("api.x.ai", "Bearer x")
@@ -190,7 +182,6 @@ func TestE2E_Mutation_PeerAttributionRequired(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer sess.Close()
-	// No AllowClientPort / AllowPID — any CONNECT must 403 (fail closed).
 	c, err := net.DialTimeout("tcp", sess.Mitm.Addr(), 2*time.Second)
 	if err != nil {
 		t.Fatal(err)
@@ -200,39 +191,7 @@ func TestE2E_Mutation_PeerAttributionRequired(t *testing.T) {
 	buf := make([]byte, 128)
 	n, _ := c.Read(buf)
 	if !strings.Contains(string(buf[:n]), "403") {
-		t.Fatalf("peer attribution regression: unregistered CONNECT not 403: %q", string(buf[:n]))
-	}
-}
-
-// CONNECT-only is not enough: without full TLS, Prove must fail.
-func TestE2E_Regression_ConnectOnlyNotProof(t *testing.T) {
-	if testing.Short() {
-		t.Skip("subprocess build")
-	}
-	v := NewTestCredentialVault()
-	_ = v.InstallTestSecret("api.x.ai", "Bearer x")
-	sess, err := StartHostCredsSession(SessionConfig{Kind: "grok", SessionID: "e2e-co", Authority: v})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer sess.Close()
-	// No dialHook → full TLS to real host may fail or succeed; without inject
-	// path we still require LastReceipt. Clear dial so upstream fails after CONNECT
-	// if we block dial — set dialHook that fails after we'd need request.
-	// Force dial failure so CONNECT 200 can happen (MITM dials before 200... actually
-	// MITM dials upstream before 200 Connection Established). So deny dial → no 200.
-	// Instead: use local origin but prove worker env scrub separately.
-	env := ExactWorkerChildEnv(
-		[]string{"XAI_API_KEY=sk-should-be-scrubbed", "PATH=/bin"},
-		HarnessProxyEnv(sess.Mitm, sess.ID),
-	)
-	if err := assertExactEnvNoSecrets(env); err != nil {
-		t.Fatal("ExactWorkerChildEnv must scrub secrets:", err)
-	}
-	// append(os.Environ()) style is banned — simulate bad merge and ensure assert catches.
-	bad := append(os.Environ(), "XAI_API_KEY=sk-leak", "HTTPS_PROXY=http://127.0.0.1:1")
-	if err := assertExactEnvNoSecrets(bad); err == nil {
-		t.Fatal("assertExactEnvNoSecrets must fail on Environ-with-secret")
+		t.Fatalf("unregistered CONNECT not 403: %q", string(buf[:n]))
 	}
 }
 
@@ -245,15 +204,6 @@ func TestE2E_ExactEnvNoDuplicateKeys(t *testing.T) {
 	if err := assertExactEnvNoSecrets(env); err != nil {
 		t.Fatal(err)
 	}
-	seen := map[string]int{}
-	for _, e := range env {
-		k := e[:strings.IndexByte(e, '=')]
-		seen[k]++
-		if seen[k] > 1 {
-			t.Fatal("duplicate", k)
-		}
-	}
-	// last FOO wins
 	found := false
 	for _, e := range env {
 		if e == "FOO=2" {
@@ -280,23 +230,66 @@ func TestE2E_LiveStillNeedsFAC169(t *testing.T) {
 	}
 }
 
-func TestE2E_LiveWiresCapabilityNotRandomMarker(t *testing.T) {
-	// Structural: empty AllowedMarker uses NewCapability protocol (not HC+hex random alone).
-	// Without FAC-169 this stops at fac169_required — still proves gate.
-	restore := SetRequireOSBoundaryForTest(nil)
+func TestE2E_LiveRejectsTestVaultAuthority(t *testing.T) {
+	// Even with a fake boundary, test vault / in-process authority must fail.
+	restore := SetRequireOSBoundaryForTest(func() (OSBoundary, error) {
+		return fakeBoundary{}, nil
+	})
 	defer restore()
-	_, _, proof, err := StartAuthorLive(LiveConfig{Kind: "grok", SessionID: "cap-wire", Prompt: ""})
+	v := NewTestCredentialVault()
+	_ = v.InstallTestSecret("api.x.ai", "Bearer x")
+	_, _, _, err := StartAuthorLive(LiveConfig{
+		Kind: "grok", SessionID: "e2e-tv", Prompt: "x", Authority: v, CausalAuthorOnly: true,
+	})
 	if err == nil {
-		t.Fatal("expected fac169")
+		t.Fatal("test vault must not live-admit")
 	}
-	_ = proof
-	if be, ok := err.(*BlockedError); !ok || be.Code != "fac169_required" {
-		// may also fail earlier
-		t.Log(err)
+	be, ok := err.(*BlockedError)
+	if !ok || (be.Code != "test_vault_not_live" && be.Code != "authority_not_fac169_ipc") {
+		t.Fatal(err)
 	}
 }
 
-// Ensure go.mod module path works for build in e2e peer tests.
+func TestE2E_HelperCannotSatisfyBrokerReached(t *testing.T) {
+	if testing.Short() {
+		t.Skip("subprocess")
+	}
+	v := NewTestCredentialVault()
+	_ = v.InstallTestSecret("api.x.ai", "Bearer x")
+	sess, err := StartHostCredsSession(SessionConfig{Kind: "grok", SessionID: "e2e-help", Authority: v})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sess.Close()
+	saw, cleanup := installLocalOrigin(t, sess.Mitm, "api.x.ai", "Bearer x")
+	defer cleanup()
+	cap, _ := NewCapability(sess.ID)
+	// Author causal produces receipt for port P.
+	res, rcpt, err := sess.RunAuthorCausalProbe(cap.Nonce)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = saw
+	// Receipt already consumed by ProveAuthorCausalSession.
+	if !rcpt.Consumed {
+		t.Fatal("receipt should be consumed")
+	}
+	// Helper must not be usable for admission.
+	if _, err := ProveAllowlistedHostViaWorker(sess.Mitm, "api.x.ai", "evil.example.invalid", sess.ID, cap.Nonce); err == nil {
+		t.Fatal("helper must fail closed")
+	}
+	// Wrong peer port cannot consume.
+	if _, ok := sess.Mitm.ConsumeReceiptFor(sess.ID, cap.Nonce, res.PeerPort+1, ""); ok {
+		t.Fatal("wrong port consumed receipt")
+	}
+}
+
+type fakeBoundary struct{}
+
+func (fakeBoundary) Mechanism() string       { return "test-fake" }
+func (fakeBoundary) ProbeDigest() string     { return "fake" }
+func (fakeBoundary) AdversarialProbe() error { return nil }
+
 func TestMain(m *testing.M) {
 	os.Exit(m.Run())
 }

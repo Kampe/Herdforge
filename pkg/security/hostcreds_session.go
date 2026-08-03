@@ -455,20 +455,27 @@ func (s *HostCredsSession) AttemptForbiddenCredentialAccess() error {
 	return nil
 }
 
-// RunWorkerForbiddenAndAllowProbe executes CONNECT allow/deny FROM a real worker
-// process (exact session). Requires MITM peer PID binding production path.
-func (s *HostCredsSession) RunWorkerForbiddenAndAllowProbe(nonce string) (*WorkerProbeResult, error) {
+// RunAuthorCausalProbe executes marker+deny+allow TLS FROM the author child
+// (inherited one-shot FD). Must not be used as a post-hoc substitute after a
+// different harness has already exited — StartAuthorLive embeds the author.
+func (s *HostCredsSession) RunAuthorCausalProbe(nonce string) (*AuthorCausalResult, BrokerReceipt, error) {
 	if s == nil || s.Mitm == nil {
-		return nil, fmt.Errorf("nil session")
+		return nil, BrokerReceipt{}, fmt.Errorf("nil session")
 	}
 	allow := ""
 	if len(s.rules) > 0 {
 		allow = s.rules[0].Host
 	}
 	if allow == "" {
-		return nil, fmt.Errorf("no allow host")
+		return nil, BrokerReceipt{}, fmt.Errorf("no allow host")
 	}
-	return ProveAllowlistedHostViaWorker(s.Mitm, allow, "evil.example.invalid", s.ID, nonce)
+	return ProveAuthorCausalSession(s.Mitm, allow, "evil.example.invalid", s.ID, nonce)
+}
+
+// RunWorkerForbiddenAndAllowProbe is deprecated for live admission (helper
+// split). Kept for narrow CONNECT isolation tests; prefer RunAuthorCausalProbe.
+func (s *HostCredsSession) RunWorkerForbiddenAndAllowProbe(nonce string) (*WorkerProbeResult, error) {
+	return nil, &BlockedError{Reason: BlockAbuse, Code: "helper_probe_not_admission", SessionID: s.ID}
 }
 
 func (s *HostCredsSession) OpenPreopenedFD() (*os.File, error) {

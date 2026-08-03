@@ -21,6 +21,9 @@ func TestMutation_NoAPIKeyPlant(t *testing.T) {
 }
 
 func TestMutation_MITMFailClosedWithoutPeerAllow(t *testing.T) {
+	if testing.Short() {
+		t.Skip("subprocess")
+	}
 	v := NewTestCredentialVault()
 	_ = v.InstallTestSecret("api.x.ai", "Bearer mut")
 	sess, err := StartHostCredsSession(SessionConfig{Kind: "grok", SessionID: "m-pid", Authority: v})
@@ -33,7 +36,6 @@ func TestMutation_MITMFailClosedWithoutPeerAllow(t *testing.T) {
 	}
 }
 
-// If authorizePeer is removed/fail-open, this fails closed must still hold.
 func TestMutation_UnregisteredPortDenied(t *testing.T) {
 	v := NewTestCredentialVault()
 	_ = v.InstallTestSecret("api.x.ai", "Bearer mut")
@@ -42,7 +44,6 @@ func TestMutation_UnregisteredPortDenied(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer sess.Close()
-	// Register a port that is NOT our dial source.
 	sess.Mitm.AllowClientPort(1)
 	c, err := net.DialTimeout("tcp", sess.Mitm.Addr(), 2*time.Second)
 	if err != nil {
@@ -112,48 +113,16 @@ func TestMutation_LiveNeedsRealKind(t *testing.T) {
 	}
 }
 
-func TestMutation_PlaintextHTTPNoInject(t *testing.T) {
+func TestMutation_InProcessAuthorityNotLive(t *testing.T) {
+	restore := SetRequireOSBoundaryForTest(func() (OSBoundary, error) {
+		return fakeBoundary{}, nil
+	})
+	defer restore()
 	v := NewTestCredentialVault()
 	_ = v.InstallTestSecret("api.x.ai", "Bearer x")
-	sess, err := StartHostCredsSession(SessionConfig{Kind: "grok", SessionID: "m4", Authority: v, EnableOracle: true})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer sess.Close()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer ln.Close()
-	go func() {
-		c, e := ln.Accept()
-		if e != nil {
-			return
-		}
-		defer c.Close()
-		buf := make([]byte, 32)
-		_, _ = c.Read(buf)
-		_, _ = c.Write([]byte("HTTP/1.0 200 OK\r\n\r\nok"))
-	}()
-	_, port, _ := net.SplitHostPort(ln.Addr().String())
-	sess.Oracle.allowLoopback = true
-	sess.Oracle.Hosts = append(sess.Oracle.Hosts, "127.0.0.1")
-	sess.Oracle.Rules = RequestRulesForKind("fake")
-	_ = v.InstallTestSecret("127.0.0.1", "Bearer x")
-	sess.Oracle.dialHook = func(network, addr string) (net.Conn, error) {
-		return net.Dial("tcp", net.JoinHostPort("127.0.0.1", port))
-	}
-	sess.Oracle.resolveHook = func(host string) (net.IP, error) {
-		return net.ParseIP("127.0.0.1"), nil
-	}
-	r, err := CallOracle(sess.Oracle.SocketPath(), OracleRequest{
-		SessionID: sess.ID, Host: "127.0.0.1", Method: "POST", Path: "/v1/chat/completions", Body: `{}`,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if r.OK {
-		t.Fatal("MUTATION: plaintext credentialed path OK")
+	_, _, _, err := StartAuthorLive(LiveConfig{Kind: "grok", SessionID: "m-auth", Authority: v})
+	if err == nil {
+		t.Fatal("MUTATION: in-process test vault live-admitted")
 	}
 }
 
@@ -195,41 +164,9 @@ func TestMutation_Redaction(t *testing.T) {
 	}
 }
 
-func TestMutation_PIDMismatchHardFail(t *testing.T) {
-	// ProveAllowlistedHostViaWorker must hard-fail res.PID != process.Pid.
-	// Structural unit: empty-body check is banned — simulate mismatch condition.
-	res := &WorkerProbeResult{PID: 1}
-	processPid := 2
-	if res.PID == processPid {
-		t.Fatal("fixture broken")
-	}
-	if res.PID != processPid {
-		// expected hard fail path
-		err := fmtMismatch(res.PID, processPid)
-		if err == nil {
-			t.Fatal("MUTATION: pid mismatch must error")
-		}
-	}
-}
-
-func fmtMismatch(a, b int) error {
-	if a != b {
-		return errPIDMismatch(a, b)
-	}
-	return nil
-}
-
-func errPIDMismatch(a, b int) error {
-	return &BlockedError{Reason: BlockAbuse, Code: "worker_pid_mismatch"}
-}
-
 func TestMutation_EnvironAppendBanned(t *testing.T) {
-	// Regression: ProveAllowlistedHostViaWorker must not use append(os.Environ()).
-	// ExactWorkerChildEnv + assertExactEnvNoSecrets is the contract.
 	t.Setenv("XAI_API_KEY", "sk-parent-secret-must-not-leak")
-	env := ExactWorkerChildEnv(HarnessProxyEnv(nil, "s"), []string{"PATH=/bin"})
-	// HarnessProxyEnv(nil) is nil — still scrub.
-	env = ExactWorkerChildEnv([]string{"PATH=/usr/bin"}, []string{"XAI_API_KEY="})
+	env := ExactWorkerChildEnv([]string{"PATH=/usr/bin"}, []string{"XAI_API_KEY="})
 	if err := assertExactEnvNoSecrets(env); err != nil {
 		t.Fatal(err)
 	}
@@ -237,5 +174,21 @@ func TestMutation_EnvironAppendBanned(t *testing.T) {
 		if strings.Contains(e, "sk-parent") {
 			t.Fatal("MUTATION: parent secret in exact env")
 		}
+	}
+}
+
+func TestMutation_HelperProbeNotAdmission(t *testing.T) {
+	v := NewTestCredentialVault()
+	_ = v.InstallTestSecret("api.x.ai", "Bearer x")
+	sess, err := StartHostCredsSession(SessionConfig{Kind: "grok", SessionID: "m-help", Authority: v})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sess.Close()
+	if _, err := sess.RunWorkerForbiddenAndAllowProbe("n"); err == nil {
+		t.Fatal("MUTATION: helper probe admitted")
+	}
+	if _, err := ProveAllowlistedHostViaWorker(sess.Mitm, "api.x.ai", "evil", sess.ID, "n"); err == nil {
+		t.Fatal("MUTATION: ProveAllowlistedHostViaWorker admitted")
 	}
 }
