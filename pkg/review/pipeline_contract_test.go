@@ -181,6 +181,10 @@ func TestPipelineContract_PendingUsesOrderedEventIndex(t *testing.T) {
 	if got := s.Pending(); len(got) != 1 || got[0].Event != "record" {
 		t.Fatalf("same-timestamp record-after-verdict pending=%+v", got)
 	}
+	s = LedgerSnapshot{Rows: []LedgerRow{{Timestamp: "2025-01-01T00:00:02Z", Event: "record", SHA: "first", Reviewer: "r"}, {Timestamp: "2025-01-01T00:00:02Z", Event: "record", SHA: "second", Reviewer: "r"}}}
+	if got := s.Pending(); len(got) != 2 || got[0].SHA != "first" || got[1].SHA != "second" {
+		t.Fatalf("equal-timestamp pending order=%+v", got)
+	}
 }
 
 func TestPipelineContract_SelfCertificationAndArtifactCounts(t *testing.T) {
@@ -248,6 +252,11 @@ func TestPipelineContract_JSONTypesAndOperationalState(t *testing.T) {
 	root, _ := setupPipelineRepo(t)
 	gitDrain(t, root, "branch", "park/foo")
 	gitDrain(t, root, "branch", "parked/foo")
+	tree := strings.TrimSpace(gitDrain(t, root, "write-tree"))
+	parkOne := strings.TrimSpace(gitDrain(t, root, "commit-tree", tree, "-p", "HEAD", "-m", "FAC-1 park"))
+	parkTwo := strings.TrimSpace(gitDrain(t, root, "commit-tree", tree, "-p", "HEAD", "-m", "FAC-1 parked"))
+	gitDrain(t, root, "update-ref", "refs/heads/park/foo", parkOne)
+	gitDrain(t, root, "update-ref", "refs/heads/parked/foo", parkTwo)
 	gitDrain(t, root, "update-ref", "refs/remotes/origin/park/foo", strings.TrimSpace(gitDrain(t, root, "rev-parse", "HEAD")))
 	t.Setenv("HERD_WIND_DOWN", "1")
 	r, e := NewPipeline(Drain{RepoRoot: root, LedgerPath: filepath.Join(root, "ledger.jsonl")}).Scan(context.Background(), nil)
@@ -268,14 +277,19 @@ func TestPipelineContract_JSONTypesAndOperationalState(t *testing.T) {
 
 func TestPipelineContract_BoardGitRows(t *testing.T) {
 	root, _ := setupPipelineRepo(t)
+	gitDrain(t, root, "branch", "task/FAC-65")
 	board := provider.NewMemoryProvider()
 	board.AddTask(&provider.Task{ID: "1", Ref: "FAC-65", Title: "A long review task", Status: provider.StatusInReview, ProjectID: "project"})
 	r, err := NewPipeline(Drain{RepoRoot: root, LedgerPath: filepath.Join(root, "ledger.jsonl"), Provider: board, KaneoProject: "project"}).Scan(context.Background(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !r.KaneoOK || len(r.BoardGit) != 1 || r.BoardGit[0].Ref != "FAC-65" {
+	if !r.KaneoOK || len(r.BoardGit) != 1 || r.BoardGit[0].Ref != "FAC-65" || r.BoardGit[0].Tip != "" || r.BoardGit[0].Park {
 		t.Fatalf("board×git rows=%+v", r.BoardGit)
+	}
+	row := boardGitRow(context.Background(), root, "FAC-65", strings.Repeat("界", 60), nil)
+	if len([]rune(row.Title)) != 50 {
+		t.Fatalf("title rune length=%d", len([]rune(row.Title)))
 	}
 }
 
@@ -291,6 +305,14 @@ func TestPipelineContract_QueueReenqueueAfterConsume(t *testing.T) {
 	pins := queuePins(s, nil, map[string]bool{})
 	if len(pins) != 1 || pins[0].branch != "new" {
 		t.Fatalf("re-enqueue state=%+v", pins)
+	}
+}
+
+func TestPipelineContract_QueuePreservesLaneEvidence(t *testing.T) {
+	s := LedgerSnapshot{Rows: []LedgerRow{{Event: "record", SHA: "q", Branch: "feature/q"}}, Queue: []LedgerRow{{Event: "enqueue", SHA: "q", Branch: "feature/q", Lane: "standing-reviewer"}}}
+	pins := queuePins(s, nil, nil)
+	if len(pins) != 1 || pins[0].lane != "standing-reviewer" {
+		t.Fatalf("queue lane=%+v", pins)
 	}
 }
 

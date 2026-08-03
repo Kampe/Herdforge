@@ -91,13 +91,21 @@ func (s LedgerSnapshot) Pending() []LedgerRow {
 			verdictIndex[key] = i
 		}
 	}
-	out := make([]LedgerRow, 0)
+	type pendingRow struct {
+		index int
+		row   LedgerRow
+	}
+	ordered := make([]pendingRow, 0)
 	for key, index := range recordIndex {
 		if verdict, ok := verdictIndex[key]; !ok || verdict < index {
-			out = append(out, s.Rows[index])
+			ordered = append(ordered, pendingRow{index: index, row: s.Rows[index]})
 		}
 	}
-	sort.SliceStable(out, func(i, j int) bool { return out[i].Timestamp < out[j].Timestamp })
+	sort.Slice(ordered, func(i, j int) bool { return ordered[i].index < ordered[j].index })
+	out := make([]LedgerRow, len(ordered))
+	for i, item := range ordered {
+		out[i] = item.row
+	}
 	return out
 }
 
@@ -176,6 +184,7 @@ func (d *Drain) Scan(ctx context.Context, unmerged []harvest.UnmergedWork) (*Dra
 	veto := snap.Vetoed()
 	queued := queuePins(snap, pass, veto)
 	pending := snap.Pending()
+	queueLanes := map[string]string{}
 	seen := map[string]bool{}
 	tips := make([]harvest.UnmergedWork, 0)
 	for _, u := range unmerged {
@@ -187,6 +196,7 @@ func (d *Drain) Scan(ctx context.Context, unmerged []harvest.UnmergedWork) (*Dra
 		}
 	}
 	for _, q := range queued {
+		queueLanes[q.sha] = q.lane
 		if !seen[q.sha] {
 			seen[q.sha] = true
 			tips = append(tips, harvest.UnmergedWork{Branch: q.branch, Unmerged: []string{q.sha}})
@@ -196,6 +206,7 @@ func (d *Drain) Scan(ctx context.Context, unmerged []harvest.UnmergedWork) (*Dra
 	var parkErr error
 	r.ParkBranches, r.ParkCHAWithDups, parkErr = parkStats(ctx, d.RepoRoot)
 	if parkErr != nil {
+		r.ParkBranches, r.ParkCHAWithDups = -1, -1
 		r.Errors = append(r.Errors, parkErr.Error())
 	}
 	for _, row := range snap.Rows {
@@ -203,8 +214,17 @@ func (d *Drain) Scan(ctx context.Context, unmerged []harvest.UnmergedWork) (*Dra
 			r.LedgerPass++
 		}
 	}
-	r.Skips7d = recentCount(filepath.Join(d.StateDir, "review-gate-skips.log"), time.Now().Add(-7*24*time.Hour))
-	r.Rejected = rejectedCount(d.ArtifactDir)
+	var countErr error
+	r.Skips7d, countErr = recentCount(filepath.Join(d.StateDir, "review-gate-skips.log"), time.Now().Add(-7*24*time.Hour))
+	if countErr != nil {
+		r.Skips7d = -1
+		r.Errors = append(r.Errors, countErr.Error())
+	}
+	r.Rejected, countErr = rejectedCount(d.ArtifactDir)
+	if countErr != nil {
+		r.Rejected = -1
+		r.Errors = append(r.Errors, countErr.Error())
+	}
 	for sha := range pass {
 		r.Shas.ReviewPass = append(r.Shas.ReviewPass, sha)
 	}
@@ -213,6 +233,9 @@ func (d *Drain) Scan(ctx context.Context, unmerged []harvest.UnmergedWork) (*Dra
 	for _, u := range tips {
 		sha := u.Unmerged[0]
 		pin := d.freshness(ctx, sha, u.Branch, u.WorktreePath)
+		if u.WorktreePath == "" && queueLanes[sha] != "" {
+			pin.Lane = queueLanes[sha]
+		}
 		r.Pins = append(r.Pins, pin)
 		merged, probeErr := harvest.ContentMerged(ctx, d.RepoRoot, "origin/main", sha)
 		if probeErr != nil {
@@ -267,7 +290,7 @@ func (d *Drain) Scan(ctx context.Context, unmerged []harvest.UnmergedWork) (*Dra
 			r.KaneoInReview = len(tasks)
 			for _, task := range tasks {
 				if task != nil {
-					r.BoardGit = append(r.BoardGit, boardGitRow(ctx, d.RepoRoot, task.Ref, task.Title))
+					r.BoardGit = append(r.BoardGit, boardGitRow(ctx, d.RepoRoot, task.Ref, task.Title, r.Pins))
 				}
 			}
 			sort.Slice(r.BoardGit, func(i, j int) bool { return r.BoardGit[i].Ref < r.BoardGit[j].Ref })
@@ -281,10 +304,10 @@ func (d *Drain) Scan(ctx context.Context, unmerged []harvest.UnmergedWork) (*Dra
 	return r, nil
 }
 
-func boardGitRow(ctx context.Context, repo, ref, title string) BoardGitRow {
+func boardGitRow(ctx context.Context, repo, ref, title string, pins []PinFreshness) BoardGitRow {
 	row := BoardGitRow{Ref: ref, Title: title}
-	if len(row.Title) > 50 {
-		row.Title = row.Title[:50]
+	if runes := []rune(row.Title); len(runes) > 50 {
+		row.Title = string(runes[:50])
 	}
 	if out, err := gitOut(ctx, repo, "log", "origin/main", "--format=%s"); err == nil {
 		pattern := regexp.MustCompile(`(?i)(^|[^a-z0-9])` + regexp.QuoteMeta(ref) + `([^a-z0-9]|$)`)
@@ -295,18 +318,21 @@ func boardGitRow(ctx context.Context, repo, ref, title string) BoardGitRow {
 			}
 		}
 	}
-	if out, err := gitOut(ctx, repo, "for-each-ref", "--format=%(refname:short)", "refs/heads", "refs/remotes"); err == nil {
+	for _, pin := range pins {
+		low := strings.ToLower(pin.Branch)
+		needle := strings.ToLower(strings.ReplaceAll(ref, "-", "/"))
+		if strings.Contains(low, strings.ToLower(ref)) || strings.Contains(low, needle) {
+			row.Tip = pin.SHA
+			break
+		}
+	}
+	if out, err := gitOut(ctx, repo, "for-each-ref", "--format=%(refname:short)", "refs/heads"); err == nil {
 		for _, branch := range strings.Split(out, "\n") {
 			low := strings.ToLower(branch)
 			needle := strings.ToLower(strings.ReplaceAll(ref, "-", "/"))
 			matches := strings.Contains(low, strings.ToLower(ref)) || strings.Contains(low, needle)
 			if strings.Contains(low, "park") && matches {
 				row.Park = true
-			}
-			if matches && row.Tip == "" {
-				if sha, e := gitOut(ctx, repo, "rev-parse", "--short=12", strings.TrimSpace(branch)); e == nil {
-					row.Tip = strings.TrimSpace(sha)
-				}
 			}
 		}
 	}
@@ -315,7 +341,7 @@ func boardGitRow(ctx context.Context, repo, ref, title string) BoardGitRow {
 
 func (d *Drain) freshness(ctx context.Context, sha, branch, worktree string) PinFreshness {
 	lane := strings.TrimSpace(branch)
-	if lane == "" {
+	if worktree != "" {
 		lane = filepath.Base(strings.TrimRight(worktree, string(filepath.Separator)))
 	}
 	p := PinFreshness{SHA: sha, Lane: lane, Branch: branch, WorktreePath: worktree, Conflict: ConflictUnknown, Behind: -1, Note: "conflict=unknown"}
@@ -381,13 +407,16 @@ func parkStats(ctx context.Context, repo string) (int, int, error) {
 	}
 	count := 0
 	seen := map[string]int{}
+	ticket := regexp.MustCompile(`(?i)\b(?:FAC|CHA)-[0-9]+\b`)
 	for _, raw := range strings.Split(out, "\n") {
 		name := strings.ToLower(strings.TrimSpace(raw))
 		if strings.Contains(name, "/park/") || strings.HasPrefix(name, "park/") || strings.HasPrefix(name, "parked/") || strings.Contains(name, "/parked/") {
 			count++
-			parts := strings.FieldsFunc(name, func(r rune) bool { return r == '/' })
-			if len(parts) > 1 {
-				key := parts[len(parts)-1]
+			subject, e := gitOut(ctx, repo, "log", "-1", "--format=%s", strings.TrimSpace(raw))
+			if e != nil {
+				return count, 0, fmt.Errorf("park subject probe %s: %w", raw, e)
+			}
+			if key := strings.ToUpper(ticket.FindString(subject)); key != "" {
 				seen[key]++
 			}
 		}
@@ -401,10 +430,13 @@ func parkStats(ctx context.Context, repo string) (int, int, error) {
 	return count, dups, nil
 }
 
-func recentCount(path string, since time.Time) int {
+func recentCount(path string, since time.Time) (int, error) {
 	f, err := os.Open(path)
 	if err != nil {
-		return 0
+		if os.IsNotExist(err) {
+			return 0, nil
+		}
+		return 0, fmt.Errorf("skip log probe: %w", err)
 	}
 	defer f.Close()
 	n := 0
@@ -417,15 +449,21 @@ func recentCount(path string, since time.Time) int {
 			}
 		}
 	}
-	return n
+	if err := sc.Err(); err != nil {
+		return 0, fmt.Errorf("skip log probe: %w", err)
+	}
+	return n, nil
 }
-func rejectedCount(dir string) int {
+func rejectedCount(dir string) (int, error) {
 	if dir == "" {
-		return 0
+		return 0, nil
 	}
 	entries, err := os.ReadDir(filepath.Join(dir, "rejected"))
 	if err != nil {
-		return 0
+		if os.IsNotExist(err) {
+			return 0, nil
+		}
+		return 0, fmt.Errorf("rejected artifact probe: %w", err)
 	}
 	n := 0
 	for _, e := range entries {
@@ -433,7 +471,7 @@ func rejectedCount(dir string) int {
 			n++
 		}
 	}
-	return n
+	return n, nil
 }
 
 // ResolveKaneoProject follows the explicit operator context order used by
