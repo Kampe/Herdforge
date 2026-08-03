@@ -6,11 +6,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"sort"
 	"strings"
 )
 
 type LinearProvider struct {
 	APIKey    string
+	ProjectID string
 	Client    *http.Client
 	BaseURL   string
 	Deadlines Deadlines
@@ -173,6 +175,13 @@ func (l *LinearProvider) getTaskOnce(ctx context.Context, id string) (*Task, err
 }
 
 func (l *LinearProvider) ListTasks(ctx context.Context, projectID string, status string) ([]*Task, error) {
+	projectID = strings.TrimSpace(projectID)
+	if projectID == "" && l != nil {
+		projectID = strings.TrimSpace(l.ProjectID)
+	}
+	if projectID == "" {
+		return nil, fmt.Errorf("linear: project id is required")
+	}
 	dls := l.deadlines()
 	ctx, cancel := WithOpDeadline(ctx, dls, OpList)
 	defer cancel()
@@ -189,64 +198,124 @@ func (l *LinearProvider) ListTasks(ctx context.Context, projectID string, status
 }
 
 func (l *LinearProvider) listTasksOnce(ctx context.Context, projectID string, status string) ([]*Task, error) {
-	query := `query { issues { nodes { id identifier title description priority state { name } project { id } labels { nodes { name } } } } }`
-	var res struct {
-		Data struct {
-			Issues struct {
-				Nodes []linearIssueDTO `json:"nodes"`
-			} `json:"issues"`
-		} `json:"data"`
-	}
-
-	if err := l.doGraphQL(ctx, query, nil, &res); err != nil {
-		return nil, err
-	}
+	const pageSize = 100
+	const query = `query ListIssues($projectID: String!, $after: String) {
+		issues(first: 100, after: $after, filter: { project: { id: { eq: $projectID } } }) {
+			nodes { id identifier title description priority state { name } project { id } labels { nodes { name } } }
+			pageInfo { hasNextPage endCursor }
+		}
+	}`
 
 	want := ""
 	if status != "" {
 		want = NormalizeStatus(status)
 	}
 
+	acc := NewPageAccumulator()
+	seenCursors := make(map[string]struct{})
 	var tasks []*Task
-	for _, dto := range res.Data.Issues.Nodes {
-		if projectID != "" && dto.Project.ID != projectID {
-			continue
+	var after interface{}
+	for page := 1; page <= DefaultMaxListPages; page++ {
+		if err := ctx.Err(); err != nil {
+			return nil, AsTimeout("linear", "ListTasks", OpList, l.deadlines().For(OpList), err)
 		}
-		canon := NormalizeStatus(dto.State.Name)
-		if want != "" && canon != want {
-			continue
+		var res struct {
+			Data struct {
+				Issues struct {
+					Nodes    []linearIssueDTO `json:"nodes"`
+					PageInfo struct {
+						HasNextPage bool   `json:"hasNextPage"`
+						EndCursor   string `json:"endCursor"`
+					} `json:"pageInfo"`
+				} `json:"issues"`
+			} `json:"data"`
 		}
-
-		labels := make([]string, 0, len(dto.Labels.Nodes))
-		for _, node := range dto.Labels.Nodes {
-			labels = append(labels, node.Name)
-		}
-
-		p := PriorityMedium
-		switch dto.Priority {
-		case 1:
-			p = PriorityUrgent
-		case 2:
-			p = PriorityHigh
-		case 3:
-			p = PriorityMedium
-		case 4:
-			p = PriorityLow
+		vars := map[string]interface{}{"projectID": projectID, "after": after}
+		if err := l.doGraphQL(ctx, query, vars, &res); err != nil {
+			return nil, fmt.Errorf("linear ListTasks (page %d): %w", page, err)
 		}
 
-		tasks = append(tasks, &Task{
-			ID:          dto.ID,
-			Ref:         dto.Identifier,
-			Title:       dto.Title,
-			Description: dto.Description,
-			Status:      canon,
-			Priority:    p,
-			ProjectID:   dto.Project.ID,
-			Labels:      labels,
-		})
+		fresh := 0
+		for _, dto := range res.Data.Issues.Nodes {
+			if dto.Project.ID != projectID {
+				return nil, fmt.Errorf("linear ListTasks (page %d): unexpected project %q", page, dto.Project.ID)
+			}
+			if !acc.Add(dto.ID) {
+				continue
+			}
+			fresh++
+			canon := NormalizeStatus(dto.State.Name)
+			if want != "" && canon != want {
+				continue
+			}
+			tasks = append(tasks, linearIssueToTask(dto, canon))
+		}
+		if len(res.Data.Issues.Nodes) > 0 && fresh == 0 {
+			return nil, fmt.Errorf("linear ListTasks (page %d): %w", page, ErrDuplicatePage)
+		}
+		if !res.Data.Issues.PageInfo.HasNextPage {
+			sortLinearTasks(tasks)
+			return tasks, nil
+		}
+
+		nextCursor := strings.TrimSpace(res.Data.Issues.PageInfo.EndCursor)
+		if nextCursor == "" {
+			return nil, fmt.Errorf("linear ListTasks (page %d): next page missing cursor", page)
+		}
+		if _, seen := seenCursors[nextCursor]; seen {
+			return nil, fmt.Errorf("linear ListTasks (page %d): repeated cursor %q: %w", page, nextCursor, ErrDuplicatePage)
+		}
+		seenCursors[nextCursor] = struct{}{}
+		after = nextCursor
+	}
+	return nil, fmt.Errorf("linear ListTasks: %w (maxPages=%d pageSize=%d)", ErrPaginationCap, DefaultMaxListPages, pageSize)
+}
+
+func linearIssueToTask(dto linearIssueDTO, status string) *Task {
+	labels := make([]string, 0, len(dto.Labels.Nodes))
+	for _, node := range dto.Labels.Nodes {
+		labels = append(labels, node.Name)
 	}
 
-	return tasks, nil
+	p := PriorityMedium
+	switch dto.Priority {
+	case 1:
+		p = PriorityUrgent
+	case 2:
+		p = PriorityHigh
+	case 3:
+		p = PriorityMedium
+	case 4:
+		p = PriorityLow
+	}
+	return &Task{
+		ID:          dto.ID,
+		Ref:         dto.Identifier,
+		Title:       dto.Title,
+		Description: dto.Description,
+		Status:      status,
+		Priority:    p,
+		ProjectID:   dto.Project.ID,
+		Labels:      labels,
+	}
+}
+
+func sortLinearTasks(tasks []*Task) {
+	priorityRank := map[Priority]int{
+		PriorityUrgent: 4,
+		PriorityHigh:   3,
+		PriorityMedium: 2,
+		PriorityLow:    1,
+	}
+	sort.Slice(tasks, func(i, j int) bool {
+		if priorityRank[tasks[i].Priority] != priorityRank[tasks[j].Priority] {
+			return priorityRank[tasks[i].Priority] > priorityRank[tasks[j].Priority]
+		}
+		if refOrder := CompareRefs(tasks[i].Ref, tasks[j].Ref); refOrder != 0 {
+			return refOrder < 0
+		}
+		return tasks[i].ID < tasks[j].ID
+	})
 }
 
 func (l *LinearProvider) ClaimTask(ctx context.Context, taskID string, role string) error {
@@ -326,7 +395,7 @@ func linearWorkflowStateCanonical(typ string) string {
 		return StatusToDo
 	case "started":
 		return StatusInProgress
-	case "completed", "canceled":
+	case "completed":
 		return StatusDone
 	default:
 		return StatusUnknown
@@ -365,6 +434,9 @@ func (l *LinearProvider) AddComment(ctx context.Context, taskID string, body str
 	}
 	err := l.doGraphQL(ctx, query, map[string]interface{}{"issueId": taskID, "body": body}, &res)
 	if err == nil {
+		if !res.Data.CommentCreate.Success {
+			return fmt.Errorf("linear: commentCreate reported success=false")
+		}
 		return nil
 	}
 	err = AsTimeout("linear", "AddComment", OpComment, dls.For(OpComment), err)

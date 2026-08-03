@@ -96,7 +96,7 @@ func TestNewProductionProvider_ActivatesOnlyConfiguredProviders(t *testing.T) {
 	}
 	for _, tc := range []TaskConfig{
 		{Type: "kaneo", ProjectID: "p", List: time.Second},
-		{Type: "linear", APIKey: "linear-test-key", List: time.Second},
+		{Type: "linear", APIKey: "linear-test-key", ProjectID: "linear-project", List: time.Second},
 	} {
 		tp, err := NewProductionProvider(tc)
 		if err != nil {
@@ -108,5 +108,8 @@ func TestNewProductionProvider_ActivatesOnlyConfiguredProviders(t *testing.T) {
 	}
 	if _, err := NewProductionProvider(TaskConfig{Type: "linear"}); err == nil {
 		t.Fatal("linear without an explicit credential must fail")
+	}
+	if _, err := NewProductionProvider(TaskConfig{Type: "linear", APIKey: "linear-test-key", ProjectID: " \t "}); err == nil {
+		t.Fatal("linear without a non-blank project ID must fail")
 	}
 }
