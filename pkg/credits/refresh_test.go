@@ -97,6 +97,120 @@ func TestLedgerCommands_SetAndPace(t *testing.T) {
 	}
 }
 
+func TestLedgerCommands_Set_PreservesTopLevelSource(t *testing.T) {
+	l, _ := OpenLedger(filepath.Join(t.TempDir(), "ledger.json"))
+	l.data["claude"] = Record{
+		UsedPct:    10,
+		WindowDays: intPtr(7),
+		DaysLeft:   intPtr(6),
+		Note:       "ccusage",
+		Source:     "ccusage",
+		Updated:    NowEpoch(),
+	}
+	lc := NewLedgerCommands(l)
+
+	if _, err := lc.Set("claude", 77, 7, 5, false, "manual"); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+
+	rec, _ := l.Surface("claude")
+	if rec.Source != "ccusage" {
+		t.Errorf("Set merge must preserve top-level source, got %q", rec.Source)
+	}
+	if rec.UsedPct != 77 {
+		t.Errorf("Set must update used_pct, got %d", rec.UsedPct)
+	}
+	if rec.Note != "manual" {
+		t.Errorf("Set must update note, got %q", rec.Note)
+	}
+
+	// and it must persist
+	l2, _ := OpenLedger(l.Path())
+	rec2, _ := l2.Surface("claude")
+	if rec2.Source != "ccusage" {
+		t.Errorf("preserved source must persist to disk, got %q after reopen", rec2.Source)
+	}
+}
+
+func TestLedgerCommands_Set_AuthStatusFallbackUpdatesPoolAccount(t *testing.T) {
+	dir := t.TempDir()
+	// no sidecar anywhere
+	t.Setenv("HERD_CLAUDE_ACCOUNTS_DIR", filepath.Join(dir, "no-accounts"))
+	t.Setenv("HOME", filepath.Join(dir, "no-home"))
+
+	orig := claudeAuthStatusCmd
+	defer func() { claudeAuthStatusCmd = orig }()
+	claudeAuthStatusCmd = func(args ...string) *exec.Cmd {
+		return exec.Command("sh", "-c", `echo '{"email":"auth@example.com"}'`)
+	}
+
+	l, _ := OpenLedger(filepath.Join(dir, "ledger.json"))
+	l.data["claude"] = Record{
+		UsedPct:    10,
+		WindowDays: intPtr(7),
+		DaysLeft:   intPtr(5),
+		Accounts: []AccountRow{
+			{Email: "auth@example.com", UsedPct: 10, BurnOrder: 1},
+			{Email: "other@example.com", UsedPct: 20, BurnOrder: 2},
+		},
+	}
+	lc := NewLedgerCommands(l)
+
+	out, err := lc.Set("claude", 77, 7, 5, false, "manual")
+	if err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+	if !strings.Contains(out, "herd-credits: claude active account auth@example.com used=77%") {
+		t.Errorf("Set must print active-account line via auth-status fallback, got: %s", out)
+	}
+
+	rec, _ := l.Surface("claude")
+	if rec.UsedPct != 77 {
+		t.Errorf("top-level used must be 77, got %d", rec.UsedPct)
+	}
+	for _, a := range rec.Accounts {
+		if a.Email == "auth@example.com" && a.UsedPct != 77 {
+			t.Errorf("matching pool account must be updated to 77, got %d", a.UsedPct)
+		}
+		if a.Email == "other@example.com" && a.UsedPct != 20 {
+			t.Errorf("non-matching pool account must stay 20, got %d", a.UsedPct)
+		}
+	}
+}
+
+func TestLedgerCommands_Set_NonClaudeSurfaceIgnoresClaudeIdentity(t *testing.T) {
+	dir := t.TempDir()
+	// claude sidecar present — must NOT be consulted for non-claude surfaces
+	t.Setenv("HERD_CLAUDE_ACCOUNTS_DIR", dir)
+	os.WriteFile(filepath.Join(dir, "active.email"), []byte("sidecar@example.com\n"), 0644)
+
+	l, _ := OpenLedger(filepath.Join(dir, "ledger.json"))
+	l.data["agy"] = Record{
+		UsedPct:    10,
+		WindowDays: intPtr(7),
+		DaysLeft:   intPtr(5),
+		Accounts: []AccountRow{
+			{Email: "sidecar@example.com", UsedPct: 10, BurnOrder: 1},
+		},
+	}
+	lc := NewLedgerCommands(l)
+
+	out, err := lc.Set("agy", 66, 7, 5, false, "manual")
+	if err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+	if strings.Contains(out, "active account") {
+		t.Errorf("non-claude surface must not print claude active-account line, got: %s", out)
+	}
+
+	rec, _ := l.Surface("agy")
+	for _, a := range rec.Accounts {
+		if a.UsedPct != 10 {
+			t.Errorf("non-claude surface must not update accounts from claude identity, got %d", a.UsedPct)
+		}
+	}
+}
+
 func TestLedgerCommands_Pace_Unknown(t *testing.T) {
 	l, _ := OpenLedger(filepath.Join(t.TempDir(), "ledger.json"))
 	lc := NewLedgerCommands(l)
@@ -144,16 +258,84 @@ func TestLedgerCommands_AccountSet(t *testing.T) {
 	if err != nil {
 		t.Fatalf("AccountSet: %v", err)
 	}
-	if out == "" {
-		t.Fatal("AccountSet returned empty")
+	if out != "herd-credits: claude account a@x used=33% burn_order=1" {
+		t.Errorf("exact output mismatch, got: %q", out)
 	}
 
 	rec, _ := l.Surface("claude")
 	if len(rec.Accounts) != 1 {
 		t.Fatalf("expected 1 account, got %d", len(rec.Accounts))
 	}
-	if rec.Accounts[0].Email != "a@x" {
-		t.Errorf("expected a@x, got %s", rec.Accounts[0].Email)
+	a := rec.Accounts[0]
+	if a.Email != "a@x" || a.UsedPct != 33 || a.BurnOrder != 1 || a.Note != "manual" {
+		t.Errorf("account row mismatch: %+v", a)
+	}
+	// primary UsedPct propagation
+	if rec.UsedPct != 33 {
+		t.Errorf("top-level UsedPct must propagate from primary, got %d", rec.UsedPct)
+	}
+	// exact one-decimal generated pool note
+	if rec.Note != "multi-account pool N=1 effective=33.0%; manual" {
+		t.Errorf("pool note mismatch, got %q", rec.Note)
+	}
+
+	// disk persistence
+	l2, err := OpenLedger(l.Path())
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	rec2, _ := l2.Surface("claude")
+	if len(rec2.Accounts) != 1 || rec2.Accounts[0].UsedPct != 33 {
+		t.Errorf("AccountSet must persist to disk, got %+v after reopen", rec2.Accounts)
+	}
+}
+
+func TestLedgerCommands_AccountSet_CaseInsensitiveReplace(t *testing.T) {
+	l, _ := OpenLedger(filepath.Join(t.TempDir(), "ledger.json"))
+	l.data["claude"] = Record{
+		Accounts: []AccountRow{
+			{Email: "A@X", UsedPct: 50, BurnOrder: 1, Note: "old"},
+		},
+		WindowDays: intPtr(7),
+		DaysLeft:   intPtr(5),
+	}
+	lc := NewLedgerCommands(l)
+
+	_, err := lc.AccountSet("claude", "a@x", 10, 2, "new")
+	if err != nil {
+		t.Fatalf("AccountSet replace: %v", err)
+	}
+
+	rec, _ := l.Surface("claude")
+	if len(rec.Accounts) != 1 {
+		t.Fatalf("case-insensitive replace must keep 1 account, got %d", len(rec.Accounts))
+	}
+	if rec.Accounts[0].UsedPct != 10 || rec.Accounts[0].BurnOrder != 2 || rec.Accounts[0].Note != "new" {
+		t.Errorf("replaced account mismatch: %+v", rec.Accounts[0])
+	}
+}
+
+func TestLedgerCommands_AccountSet_BurnOrdering(t *testing.T) {
+	l, _ := OpenLedger(filepath.Join(t.TempDir(), "ledger.json"))
+	lc := NewLedgerCommands(l)
+
+	if _, err := lc.AccountSet("claude", "second@x", 20, 2, ""); err != nil {
+		t.Fatalf("AccountSet: %v", err)
+	}
+	if _, err := lc.AccountSet("claude", "first@x", 40, 1, ""); err != nil {
+		t.Fatalf("AccountSet: %v", err)
+	}
+
+	rec, _ := l.Surface("claude")
+	if len(rec.Accounts) != 2 {
+		t.Fatalf("expected 2 accounts, got %d", len(rec.Accounts))
+	}
+	if rec.Accounts[0].Email != "first@x" || rec.Accounts[1].Email != "second@x" {
+		t.Errorf("accounts must be sorted by burn order, got %+v", rec.Accounts)
+	}
+	// primary (min burn order) UsedPct propagates to top level
+	if rec.UsedPct != 40 {
+		t.Errorf("top-level UsedPct must be primary 40, got %d", rec.UsedPct)
 	}
 }
 
@@ -237,19 +419,53 @@ func TestLedgerCommands_AccountExhausted_NoEmail(t *testing.T) {
 
 func TestLedgerCommands_Exhausted(t *testing.T) {
 	l, _ := OpenLedger(filepath.Join(t.TempDir(), "ledger.json"))
+	l.data["claude"] = Record{
+		UsedPct:    40,
+		WindowDays: intPtr(7),
+		DaysLeft:   intPtr(5),
+		Accounts: []AccountRow{
+			{Email: "a@x", UsedPct: 40, BurnOrder: 1},
+			{Email: "b@y", UsedPct: 10, BurnOrder: 2},
+		},
+	}
 	lc := NewLedgerCommands(l)
 
 	out, err := lc.Exhausted("claude", 4)
 	if err != nil {
 		t.Fatalf("Exhausted: %v", err)
 	}
-	if out == "" {
-		t.Fatal("expected output")
+	if out != "herd-credits: claude marked exhausted (~4h). Also set a herd-route cooldown for the hard gate." {
+		t.Errorf("exact output mismatch, got: %q", out)
 	}
 
 	rec, _ := l.Surface("claude")
 	if rec.UsedPct != 100 {
-		t.Errorf("expected 100, got %d", rec.UsedPct)
+		t.Errorf("expected UsedPct=100, got %d", rec.UsedPct)
+	}
+	if rec.WindowDays != nil {
+		t.Errorf("window_days must be null after exhaustion, got %v", *rec.WindowDays)
+	}
+	if rec.DaysLeft != nil {
+		t.Errorf("days_left must be null after exhaustion, got %v", *rec.DaysLeft)
+	}
+	if rec.Note != "exhausted, resets in ~4h" {
+		t.Errorf("exact exhaustion note mismatch, got %q", rec.Note)
+	}
+	// account propagation
+	for _, a := range rec.Accounts {
+		if a.UsedPct != 100 {
+			t.Errorf("all accounts must propagate to 100, got %+v", a)
+		}
+	}
+
+	// disk persistence
+	l2, err := OpenLedger(l.Path())
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	rec2, _ := l2.Surface("claude")
+	if rec2.UsedPct != 100 || rec2.WindowDays != nil {
+		t.Errorf("Exhausted must persist to disk, got %+v after reopen", rec2)
 	}
 }
 
@@ -333,7 +549,7 @@ func TestLedgerCommands_Advise_LiveCoversProvider(t *testing.T) {
 	dir := t.TempDir()
 	script := filepath.Join(dir, "herd-quota")
 	os.WriteFile(script, []byte(`#!/bin/sh
-echo '{"claude":{"used":42.7,"pools":{"claude-5h":{"used":42.7,"remaining":57.3,"resetsIn":"3h 0m","class":"onpace","stale":false,"reason":"ok"},"all":{"used":42,"stale":false,"reason":"ok"}}}}'`), 0755)
+echo '{"claude":{"used":42.7,"pools":{"claude-5h":{"used":42.7,"remaining":57.3,"resetsIn":"3h 0m","class":"onpace","stale":false,"reason":"ok","exhaustsBeforeReset":false},"all":{"used":42,"stale":false,"reason":"ok"}}}}'`), 0755)
 
 	orig := quotaBinPath
 	defer func() { quotaBinPath = orig }()
@@ -351,8 +567,8 @@ echo '{"claude":{"used":42.7,"pools":{"claude-5h":{"used":42.7,"remaining":57.3,
 	if !strings.Contains(out, "live OpenUsage quota") {
 		t.Errorf("expected live OpenUsage header, got: %s", out)
 	}
-	if !strings.Contains(out, "  claude/claude-5h: 42% used, 57% left, onpace, reset 3h 0m") {
-		t.Errorf("expected binding-format live row (independent floor of used/remaining), got: %s", out)
+	if !strings.Contains(out, "  claude/claude-5h: 42% used, 57% left, onpace, reset 3h 0m, safe through reset at current burn\n") {
+		t.Errorf("expected full binding row incl. safe-through-reset suffix, got: %s", out)
 	}
 	if !strings.Contains(out, "ledger-only fallback snapshots") {
 		t.Errorf("expected ledger-only fallback header on live success, got: %s", out)
@@ -360,6 +576,30 @@ echo '{"claude":{"used":42.7,"pools":{"claude-5h":{"used":42.7,"remaining":57.3,
 	// claude should NOT get a ledger pace row because live covers it (by provider)
 	if strings.Contains(out, "claude: 50% used") {
 		t.Errorf("ledger pace row for claude should be suppressed when live covers provider, got: %s", out)
+	}
+}
+
+func TestLedgerCommands_Advise_RunwayBranches(t *testing.T) {
+	dir := t.TempDir()
+	script := filepath.Join(dir, "herd-quota")
+	os.WriteFile(script, []byte(`#!/bin/sh
+echo '{"claude":{"pools":{"claude-5h":{"used":96,"remaining":4,"resetsIn":"2h","class":"exhausted","stale":false,"reason":"exhausted","exhaustsBeforeReset":true,"runwayMinutes":30}}},"antigravity":{"pools":{"agy":{"used":80,"remaining":20,"resetsIn":"1d","class":"overpace","stale":false,"reason":"ok","exhaustsBeforeReset":true,"runwayMinutes":150}}},"openai":{"pools":{"codex":{"used":50,"remaining":50,"resetsIn":"5h","class":"onpace","stale":false,"reason":"ok"}}}}'`), 0755)
+
+	orig := quotaBinPath
+	defer func() { quotaBinPath = orig }()
+	quotaBinPath = func() string { return script }
+
+	l, _ := OpenLedger(filepath.Join(t.TempDir(), "ledger.json"))
+	lc := NewLedgerCommands(l)
+	out := lc.Advise()
+	if !strings.Contains(out, "  claude/claude-5h: 96% used, 4% left, exhausted, reset 2h, exhausted until reset\n") {
+		t.Errorf("expected exhausted-until-reset branch, got: %s", out)
+	}
+	if !strings.Contains(out, "  antigravity/agy: 80% used, 20% left, overpace, reset 1d, projected runway 2h\n") {
+		t.Errorf("expected projected-runway branch (150min -> 2h), got: %s", out)
+	}
+	if !strings.Contains(out, "  openai/codex: 50% used, 50% left, onpace, reset 5h, exhaustion runway unknown\n") {
+		t.Errorf("expected unknown-runway branch (exhaustsBeforeReset absent), got: %s", out)
 	}
 }
 
@@ -472,8 +712,8 @@ echo '{"claude":{"pools":{"claude-5h":{"used":42,"remaining":58,"stale":true,"re
 		t.Errorf("stale pool should not appear in live rows, got: %s", out)
 	}
 	// antigravity has a valid live pool (reason=exhausted, stale=false) -> live row shown
-	if !strings.Contains(out, "  antigravity/agy: 10% used, 90% left, onpace, reset 5d") {
-		t.Errorf("expected binding-format live row for antigravity/agy, got: %s", out)
+	if !strings.Contains(out, "  antigravity/agy: 10% used, 90% left, onpace, reset 5d, exhaustion runway unknown\n") {
+		t.Errorf("expected full binding row for antigravity/agy, got: %s", out)
 	}
 	// agy ledger surface normalizes to antigravity, which has live coverage -> suppressed
 	if strings.Contains(out, "agy: 10% used, 28% of window") {
@@ -1082,18 +1322,66 @@ echo 'not json'`), 0755)
 	}
 }
 
-func TestCcUsageBase_PATHFallback(t *testing.T) {
-	// This test verifies CcUsageBase returns "ccusage" if it's on PATH,
-	// or "npx" if only npx is available, or error if neither.
-	// We can't easily manipulate PATH in-process, so we test the contract
-	// by calling it and checking it returns one of the expected values.
+func TestCcUsageBase_PATHCcusageWins(t *testing.T) {
+	dir := t.TempDir()
+	os.WriteFile(filepath.Join(dir, "ccusage"), []byte("#!/bin/sh\n"), 0755)
+	os.WriteFile(filepath.Join(dir, "npx"), []byte("#!/bin/sh\n"), 0755)
+	t.Setenv("PATH", dir)
+
 	base, err := CcUsageBase()
 	if err != nil {
-		// neither ccusage nor npx on PATH — that's a valid result
-		return
+		t.Fatalf("unexpected err: %v", err)
 	}
-	if base != "ccusage" && base != "npx" {
-		t.Errorf("CcUsageBase returned unexpected value: %q", base)
+	if base != "ccusage" {
+		t.Errorf("installed ccusage must win over npx, got %q", base)
+	}
+}
+
+func TestCcUsageBase_NpxFallback(t *testing.T) {
+	dir := t.TempDir()
+	os.WriteFile(filepath.Join(dir, "npx"), []byte("#!/bin/sh\n"), 0755)
+	t.Setenv("PATH", dir)
+
+	base, err := CcUsageBase()
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if base != "npx" {
+		t.Errorf("npx must be selected when it is the only option, got %q", base)
+	}
+}
+
+func TestCcUsageBase_NeitherErrors(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("PATH", dir)
+
+	_, err := CcUsageBase()
+	if err == nil {
+		t.Fatal("expected error when neither ccusage nor npx is on PATH")
+	}
+}
+
+func TestCcUsageArgs_NpxPrefix(t *testing.T) {
+	got := ccUsageArgs("npx", []string{"claude", "blocks", "--json"})
+	want := []string{"--yes", "ccusage@latest", "claude", "blocks", "--json"}
+	if len(got) != len(want) {
+		t.Fatalf("ccUsageArgs len = %d, want %d: %v", len(got), len(want), got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("ccUsageArgs[%d] = %q, want %q", i, got[i], want[i])
+		}
+	}
+
+	got = ccUsageArgs("ccusage", []string{"claude", "blocks", "--json"})
+	want = []string{"claude", "blocks", "--json"}
+	if len(got) != len(want) {
+		t.Fatalf("ccUsageArgs len = %d, want %d: %v", len(got), len(want), got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("ccUsageArgs[%d] = %q, want %q", i, got[i], want[i])
+		}
 	}
 }
 
