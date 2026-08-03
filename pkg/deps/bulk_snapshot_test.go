@@ -17,7 +17,7 @@ import (
 // logical op + bounded internal work). Memory tests without bulk would hide
 // the sequential stampede.
 type delayedBulkProvider struct {
-	provider.MemoryProvider
+	*provider.MemoryProvider
 	tasks []*provider.Task
 
 	listTasksDelay time.Duration
@@ -39,7 +39,7 @@ type delayedBulkProvider struct {
 func newDelayedBoard(n int, listRelDelay, bulkDelay time.Duration, useBulk bool) *delayedBulkProvider {
 	mp := provider.NewMemoryProvider()
 	d := &delayedBulkProvider{
-		MemoryProvider: *mp,
+		MemoryProvider: mp,
 		listRelDelay:   listRelDelay,
 		bulkDelay:      bulkDelay,
 		useBulk:        useBulk,
