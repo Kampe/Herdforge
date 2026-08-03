@@ -319,9 +319,7 @@ func boardGitRow(ctx context.Context, repo, ref, title string, pins []PinFreshne
 		}
 	}
 	for _, pin := range pins {
-		low := strings.ToLower(pin.Branch)
-		needle := strings.ToLower(strings.ReplaceAll(ref, "-", "/"))
-		if strings.Contains(low, strings.ToLower(ref)) || strings.Contains(low, needle) {
+		if ticketTokenMatch(pin.Branch, ref) {
 			row.Tip = pin.SHA
 			break
 		}
@@ -329,14 +327,32 @@ func boardGitRow(ctx context.Context, repo, ref, title string, pins []PinFreshne
 	if out, err := gitOut(ctx, repo, "for-each-ref", "--format=%(refname:short)", "refs/heads"); err == nil {
 		for _, branch := range strings.Split(out, "\n") {
 			low := strings.ToLower(branch)
-			needle := strings.ToLower(strings.ReplaceAll(ref, "-", "/"))
-			matches := strings.Contains(low, strings.ToLower(ref)) || strings.Contains(low, needle)
-			if strings.Contains(low, "park") && matches {
+			if isParkBranch(low) && ticketTokenMatch(branch, ref) {
 				row.Park = true
 			}
 		}
 	}
 	return row
+}
+
+func isParkBranch(name string) bool {
+	for _, segment := range strings.Split(strings.ToLower(strings.TrimSpace(name)), "/") {
+		if segment == "park" || segment == "parked" {
+			return true
+		}
+	}
+	return false
+}
+
+func ticketTokenMatch(value, ref string) bool {
+	parts := strings.SplitN(strings.TrimSpace(ref), "-", 2)
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return false
+	}
+	canonical := regexp.QuoteMeta(parts[0] + "-" + parts[1])
+	slash := regexp.QuoteMeta(parts[0] + "/" + parts[1])
+	pattern := regexp.MustCompile(`(?i)(^|[^a-z0-9])(?:` + canonical + `|` + slash + `)([^a-z0-9]|$)`)
+	return pattern.MatchString(value)
 }
 
 func (d *Drain) freshness(ctx context.Context, sha, branch, worktree string) PinFreshness {
@@ -410,7 +426,7 @@ func parkStats(ctx context.Context, repo string) (int, int, error) {
 	ticket := regexp.MustCompile(`(?i)\b(?:FAC|CHA)-[0-9]+\b`)
 	for _, raw := range strings.Split(out, "\n") {
 		name := strings.ToLower(strings.TrimSpace(raw))
-		if strings.Contains(name, "/park/") || strings.HasPrefix(name, "park/") || strings.HasPrefix(name, "parked/") || strings.Contains(name, "/parked/") {
+		if isParkBranch(name) {
 			count++
 			subject, e := gitOut(ctx, repo, "log", "-1", "--format=%s", strings.TrimSpace(raw))
 			if e != nil {
@@ -424,7 +440,7 @@ func parkStats(ctx context.Context, repo string) (int, int, error) {
 	dups := 0
 	for _, n := range seen {
 		if n > 1 {
-			dups += n - 1
+			dups++
 		}
 	}
 	return count, dups, nil
