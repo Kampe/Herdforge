@@ -155,6 +155,10 @@ func effortValid(e string) bool {
 
 // EffortFor mirrors effort_for: shape-tracked ladder with HERD_EFFORT_<SHAPE>
 // overrides (invalid overrides warned and ignored).
+//
+// Worker launches use this shape ladder via EffortForRequest. Reviewer
+// launches do NOT use shape defaults for effort — they go through
+// EffortForRequest (medium by default; high only for final/critical R2/R3).
 func EffortFor(shape string) string {
 	key := "HERD_EFFORT_" + strings.ToUpper(strings.ReplaceAll(shape, "-", "_"))
 	if ov := os.Getenv(key); ov != "" {
@@ -652,12 +656,19 @@ func (r *SurfaceRouter) Pick(shape, requestedProvider, excludedFamily string) (*
 			continue
 		}
 
-		pressure := 50 // untracked default
+		// FAC-142: surface at/over weekly cap loses to a healthy alternative.
 		var st usage.BurnState
 		var haveQuota bool
-		if st, haveQuota = r.quotaState(provider, pool); haveQuota && st.Reason != "no-quota-data" {
-			pressure = int(st.Pressure)
+		st, haveQuota = r.quotaState(provider, pool)
+		if haveQuota && weeklyAtOrOverCap(st) {
+			continue
 		}
+		// Non-v4 deepseek is never a valid pick.
+		if ForbiddenDeepSeek(model) {
+			continue
+		}
+
+		pressure := effectivePressure(st, haveQuota)
 
 		fit := pref
 		if shape == "coordinator" {

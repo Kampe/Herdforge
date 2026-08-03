@@ -1,0 +1,498 @@
+package router
+
+import (
+	"strings"
+	"testing"
+
+	"github.com/Kampe/Herdforge/pkg/classify"
+	"github.com/Kampe/Herdforge/pkg/usage"
+)
+
+func TestCapabilityOfTable(t *testing.T) {
+	cases := []struct {
+		model string
+		want  CapabilityTier
+	}{
+		{"", CapUnknown},
+		{"opencode/deepseek-v4-flash", CapFlash},
+		{"claude-haiku-4-5", CapFlash},
+		{"gpt-5.3-codex-spark", CapFlash},
+		{"claude-sonnet-5", CapStandard},
+		{"gpt-5.6-luna", CapStandard},
+		{"grok-4.5", CapStandard},
+		{"claude-opus-5", CapFrontier},
+		{"claude-fable-5", CapFrontier},
+		{"gpt-5.6-sol", CapFrontier},
+		{"gpt-5.6-terra", CapFrontier},
+		{"totally-unknown-xyz", CapUnknown},
+	}
+	for _, c := range cases {
+		if got := CapabilityOf(c.model); got != c.want {
+			t.Errorf("CapabilityOf(%q) = %q, want %q", c.model, got, c.want)
+		}
+	}
+}
+
+func TestForbiddenDeepSeek(t *testing.T) {
+	if ForbiddenDeepSeek("opencode/deepseek-v4-flash") {
+		t.Fatal("v4 flash must be allowed")
+	}
+	if ForbiddenDeepSeek("opencode/deepseek-v4-pro") {
+		t.Fatal("v4 pro must be allowed")
+	}
+	if !ForbiddenDeepSeek("deepseek-v3-chat") {
+		t.Fatal("non-v4 deepseek must be forbidden")
+	}
+	if !ForbiddenDeepSeek("opencode/deepseek-chat") {
+		t.Fatal("unversioned deepseek must be forbidden")
+	}
+	if ForbiddenDeepSeek("claude-sonnet-5") {
+		t.Fatal("non-deepseek must not trip the gate")
+	}
+}
+
+func TestModelRequiresProbeLunaAndDeepseek(t *testing.T) {
+	if !ModelRequiresProbe("gpt-5.6-luna") {
+		t.Fatal("luna must require tool-probe")
+	}
+	if !ModelRequiresProbe("opencode/deepseek-v4-flash") {
+		t.Fatal("deepseek must require tool-probe")
+	}
+	if ModelRequiresProbe("claude-sonnet-5") {
+		t.Fatal("sonnet must not require probe by default")
+	}
+}
+
+func TestEffortLadderReviewer(t *testing.T) {
+	clearRouteEnv(t)
+	cases := []struct {
+		name string
+		req  LaunchRequest
+		want string
+	}{
+		{
+			name: "normal review medium",
+			req:  LaunchRequest{Role: RoleReviewer, Risk: classify.TierR1},
+			want: "medium",
+		},
+		{
+			name: "small delta stays medium",
+			req: LaunchRequest{
+				Role: RoleReviewer, Risk: classify.TierR2,
+				SmallDelta: true, RiskChanged: false,
+			},
+			want: "medium",
+		},
+		{
+			name: "final pass R2 high",
+			req: LaunchRequest{
+				Role: RoleReviewer, Risk: classify.TierR2, FinalPass: true,
+			},
+			want: "high",
+		},
+		{
+			name: "critical R3 high",
+			req: LaunchRequest{
+				Role: RoleReviewer, Risk: classify.TierR3, Critical: true,
+			},
+			want: "high",
+		},
+		{
+			name: "final pass R0 stays medium",
+			req: LaunchRequest{
+				Role: RoleReviewer, Risk: classify.TierR0, FinalPass: true,
+			},
+			want: "medium",
+		},
+		{
+			name: "small delta with risk change into critical final → high",
+			req: LaunchRequest{
+				Role: RoleReviewer, Risk: classify.TierR3,
+				SmallDelta: true, RiskChanged: true, FinalPass: true,
+			},
+			want: "high",
+		},
+		{
+			name: "worker uses shape ladder",
+			req:  LaunchRequest{Role: RoleWorker, Shape: "implementation"},
+			want: "high",
+		},
+		{
+			name: "worker bounded low",
+			req:  LaunchRequest{Role: RoleWorker, Shape: "bounded"},
+			want: "low",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := EffortForRequest(c.req); got != c.want {
+				t.Fatalf("EffortForRequest = %q, want %q", got, c.want)
+			}
+		})
+	}
+}
+
+func TestFlashFrontierHighForbidden(t *testing.T) {
+	if !FlashFrontierHighForbidden(CapFlash, CapFrontier, "high") {
+		t.Fatal("flash+frontier+high must be forbidden")
+	}
+	if FlashFrontierHighForbidden(CapFlash, CapFrontier, "medium") {
+		t.Fatal("flash+frontier+medium is coherent enough to allow")
+	}
+	if FlashFrontierHighForbidden(CapStandard, CapFrontier, "high") {
+		t.Fatal("standard author + frontier high is allowed")
+	}
+	if FlashFrontierHighForbidden(CapFlash, CapStandard, "high") {
+		t.Fatal("flash author + standard high is allowed")
+	}
+}
+
+func TestDecideWorkerPicksModelAndEffort(t *testing.T) {
+	clearRouteEnv(t)
+	r := testRouter(nil, "claude", "grok", "codex", "opencode", "agy", "kimi")
+	d, err := r.Decide(LaunchRequest{
+		Role:  RoleWorker,
+		Shape: "implementation",
+		Risk:  classify.TierR2,
+	})
+	if err != nil {
+		t.Fatalf("Decide: %v", err)
+	}
+	if d.Provider == "" || d.Model == "" || d.Effort == "" || d.Family == "" {
+		t.Fatalf("LaunchDecision incomplete: %+v", d)
+	}
+	if d.CapabilityTier == CapUnknown {
+		t.Fatal("capability must be known")
+	}
+	if d.Pool == "" {
+		t.Fatal("pool required")
+	}
+	if d.Rationale == "" {
+		t.Fatal("rationale required")
+	}
+	if d.Role != RoleWorker {
+		t.Fatalf("role = %s", d.Role)
+	}
+	// Effort must come from router policy, not harness default empty.
+	if d.Effort != EffortFor("implementation") {
+		t.Fatalf("worker effort = %q, want shape ladder %q", d.Effort, EffortFor("implementation"))
+	}
+	if len(d.Argv) == 0 {
+		t.Fatal("argv must be populated from decision")
+	}
+}
+
+func TestDecideReviewerFamilyDisjoint(t *testing.T) {
+	clearRouteEnv(t)
+	r := testRouter(nil, "claude", "grok", "codex", "opencode", "agy", "kimi")
+	d, err := r.Decide(LaunchRequest{
+		Role:         RoleReviewer,
+		Shape:        "qa",
+		Risk:         classify.TierR1,
+		AuthorFamily: "anthropic",
+	})
+	if err != nil {
+		t.Fatalf("Decide: %v", err)
+	}
+	if d.Family == "anthropic" {
+		t.Fatalf("reviewer must not share author family, got %+v", d)
+	}
+	if d.Effort != "medium" {
+		t.Fatalf("normal review effort = %q, want medium", d.Effort)
+	}
+	if !strings.Contains(d.Rationale, "author_family=anthropic") {
+		t.Fatalf("rationale must record author family: %s", d.Rationale)
+	}
+}
+
+func TestDecideReviewerMissingAuthorFamilyFailsClosed(t *testing.T) {
+	clearRouteEnv(t)
+	r := testRouter(nil, "claude", "grok")
+	_, err := r.Decide(LaunchRequest{Role: RoleReviewer, Shape: "qa", Risk: classify.TierR1})
+	if err == nil {
+		t.Fatal("missing author_family must fail closed")
+	}
+}
+
+func TestDecideFlashAuthorFrontierHighRejected(t *testing.T) {
+	clearRouteEnv(t)
+	// Force only frontier reviewers (claude qa → opus-5 frontier) with high effort
+	// and a flash author — must fail closed when no coherent alternative exists.
+	r := testRouter(nil, "claude")
+	_, err := r.Decide(LaunchRequest{
+		Role:             RoleReviewer,
+		Shape:            "qa",
+		Risk:             classify.TierR3,
+		FinalPass:        true, // effort high
+		AuthorFamily:     "deepseek",
+		AuthorModel:      "opencode/deepseek-v4-flash",
+		AuthorCapability: CapFlash,
+		RequestedProvider: "claude",
+	})
+	if err == nil {
+		t.Fatal("flash author + frontier-high reviewer must be rejected")
+	}
+	if !strings.Contains(err.Error(), "no healthy") && !strings.Contains(err.Error(), "frontier") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestDecideFlashAuthorFrontierMediumAllowed(t *testing.T) {
+	clearRouteEnv(t)
+	r := testRouter(nil, "claude", "grok")
+	d, err := r.Decide(LaunchRequest{
+		Role:         RoleReviewer,
+		Shape:        "qa",
+		Risk:         classify.TierR1, // medium effort
+		AuthorFamily: "deepseek",
+		AuthorModel:  "opencode/deepseek-v4-flash",
+	})
+	if err != nil {
+		t.Fatalf("medium effort frontier reviewer should be allowed: %v", err)
+	}
+	if d.Effort != "medium" {
+		t.Fatalf("effort = %s", d.Effort)
+	}
+}
+
+func TestDecideQuotaHeadroomPick(t *testing.T) {
+	clearRouteEnv(t)
+	// claude exhausted → grok wins (headroom).
+	computed := map[string]usage.BurnState{
+		"claude": {Available: false, Reason: "exhausted", Pressure: 100},
+		"grok":   {Available: true, Pressure: 12, Window: "5h", Used: 12},
+	}
+	r := testRouter(computed, "claude", "grok", "codex", "opencode", "agy", "kimi")
+	d, err := r.Decide(LaunchRequest{
+		Role:  RoleWorker,
+		Shape: "implementation",
+		Risk:  classify.TierR2,
+	})
+	if err != nil {
+		t.Fatalf("Decide: %v", err)
+	}
+	if d.Provider != "grok" {
+		t.Fatalf("quota headroom must prefer grok over exhausted claude, got %s", d.Provider)
+	}
+}
+
+func TestDecideWeeklyCapSkip(t *testing.T) {
+	clearRouteEnv(t)
+	// claude binding weekly at/over cap → skip; grok healthy wins.
+	computed := map[string]usage.BurnState{
+		"claude": {
+			Available: true, Pressure: 10, Window: "weekly",
+			WindowSeconds: usage.WindowWeekly, Used: 96, Class: usage.BurnExhausted,
+		},
+		"grok": {Available: true, Pressure: 20, Window: "5h", Used: 20},
+	}
+	r := testRouter(computed, "claude", "grok", "codex", "opencode", "agy", "kimi")
+	d, err := r.Decide(LaunchRequest{
+		Role:  RoleWorker,
+		Shape: "implementation",
+		Risk:  classify.TierR1,
+	})
+	if err != nil {
+		t.Fatalf("Decide: %v", err)
+	}
+	if d.Provider == "claude" {
+		t.Fatal("weekly-capped surface must lose to healthy alternative")
+	}
+	if d.Provider != "grok" {
+		t.Fatalf("want grok after weekly-cap skip, got %s", d.Provider)
+	}
+}
+
+func TestPickWeeklyCapSkip(t *testing.T) {
+	clearRouteEnv(t)
+	computed := map[string]usage.BurnState{
+		"claude": {
+			Available: true, Pressure: 5, Window: "weekly",
+			WindowSeconds: usage.WindowWeekly, Used: 97, Class: usage.BurnExhausted,
+		},
+		"grok": {Available: true, Pressure: 30},
+	}
+	r := testRouter(computed, "claude", "grok", "codex", "opencode", "agy", "kimi")
+	route, err := r.Pick("implementation", "", "")
+	if err != nil {
+		t.Fatalf("Pick: %v", err)
+	}
+	if route.Provider == "claude" {
+		t.Fatal("Pick must also skip weekly-capped surfaces")
+	}
+}
+
+func TestDecideLunaRequiresProbePass(t *testing.T) {
+	clearRouteEnv(t)
+	// codex implementation → gpt-5.6-luna (probe-gated). Without probe PASS, skip to next.
+	r := testRouter(nil, "codex", "grok")
+	// Only codex+grok: codex luna skipped without probe → grok wins.
+	d, err := r.Decide(LaunchRequest{
+		Role:              RoleWorker,
+		Shape:             "implementation",
+		Risk:              classify.TierR2,
+		RequestedProvider: "",
+	})
+	if err != nil {
+		t.Fatalf("Decide: %v", err)
+	}
+	if d.Provider == "codex" && strings.Contains(d.Model, "luna") {
+		t.Fatal("luna without probe pass must not be selected")
+	}
+
+	// With probe PASS, codex luna is eligible and preferred (waterfall: claude absent → grok before codex? implementation: claude, grok, codex...)
+	// Request codex only with probe.
+	key := ProbeKey("codex", "gpt-5.6-luna")
+	d2, err := r.Decide(LaunchRequest{
+		Role:              RoleWorker,
+		Shape:             "implementation",
+		Risk:              classify.TierR2,
+		RequestedProvider: "codex",
+		ProbeResults:      map[string]bool{key: true},
+	})
+	if err != nil {
+		t.Fatalf("Decide with probe: %v", err)
+	}
+	if d2.Provider != "codex" || d2.Model != "gpt-5.6-luna" {
+		t.Fatalf("want codex/luna with probe pass, got %+v", d2)
+	}
+	if !d2.ProbeRequired || d2.ProbeKey != key {
+		t.Fatalf("probe fields incomplete: %+v", d2)
+	}
+}
+
+func TestDecideLunaUnknownProbeFailsClosed(t *testing.T) {
+	clearRouteEnv(t)
+	r := testRouter(nil, "codex")
+	_, err := r.Decide(LaunchRequest{
+		Role:              RoleWorker,
+		Shape:             "implementation",
+		RequestedProvider: "codex",
+		// ProbeResults nil → unknown → fail closed
+	})
+	if err == nil {
+		t.Fatal("luna with unknown probe must fail closed when sole candidate")
+	}
+}
+
+func TestDecideNoCandidateFailsClosed(t *testing.T) {
+	clearRouteEnv(t)
+	r := testRouter(map[string]usage.BurnState{
+		"claude": {Available: false, Reason: "exhausted", Pressure: 100},
+		"grok":   {Available: false, Reason: "exhausted", Pressure: 100},
+	}, "claude", "grok")
+	_, err := r.Decide(LaunchRequest{
+		Role:              RoleWorker,
+		Shape:             "implementation",
+		RequestedProvider: "claude",
+	})
+	if err == nil {
+		t.Fatal("exhausted sole candidate must fail closed")
+	}
+}
+
+func TestDecideReviewerFinalPassEffortInDecision(t *testing.T) {
+	clearRouteEnv(t)
+	r := testRouter(nil, "claude", "grok", "codex", "opencode", "agy", "kimi")
+	d, err := r.Decide(LaunchRequest{
+		Role:         RoleReviewer,
+		Shape:        "qa",
+		Risk:         classify.TierR3,
+		FinalPass:    true,
+		AuthorFamily: "xai",
+	})
+	if err != nil {
+		t.Fatalf("Decide: %v", err)
+	}
+	if d.Effort != "high" {
+		t.Fatalf("final R3 review effort = %q, want high", d.Effort)
+	}
+	// Ensure argv carries the decided effort for claude surfaces.
+	if d.Provider == "claude" {
+		joined := strings.Join(d.Argv, " ")
+		if !strings.Contains(joined, "high") {
+			t.Fatalf("argv must embed decided effort, got %v", d.Argv)
+		}
+	}
+}
+
+func TestDecideStrictQuotaMissingFailsClosed(t *testing.T) {
+	clearRouteEnv(t)
+	// No computed quota rows; StrictQuota must refuse.
+	r := testRouter(nil, "claude", "grok")
+	_, err := r.Decide(LaunchRequest{
+		Role:              RoleWorker,
+		Shape:             "implementation",
+		RequestedProvider: "claude",
+		StrictQuota:       true,
+	})
+	if err == nil {
+		t.Fatal("StrictQuota with missing ledger must fail closed")
+	}
+}
+
+// Mutation-style negative: if weekly cap check were removed, weekly-capped
+// claude would win on preference. Assert the skip is load-bearing.
+func TestDecideWeeklyCapIsLoadBearing(t *testing.T) {
+	clearRouteEnv(t)
+	computed := map[string]usage.BurnState{
+		"claude": {
+			Available: true, Pressure: 1, Window: "weekly",
+			WindowSeconds: usage.WindowWeekly, Used: 99, Class: usage.BurnExhausted,
+		},
+		"grok": {Available: true, Pressure: 80},
+	}
+	r := testRouter(computed, "claude", "grok", "codex", "opencode", "agy", "kimi")
+	// Preferential shape: implementation lists claude first.
+	d, err := r.Decide(LaunchRequest{Role: RoleWorker, Shape: "implementation"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.Provider == "claude" {
+		t.Fatal("REGRESSION: weekly-capped preferred provider was selected")
+	}
+	// Control: without weekly exhaustion, claude wins.
+	healthy := map[string]usage.BurnState{
+		"claude": {Available: true, Pressure: 1, Window: "5h", Used: 1},
+		"grok":   {Available: true, Pressure: 80},
+	}
+	r2 := testRouter(healthy, "claude", "grok", "codex", "opencode", "agy", "kimi")
+	d2, err := r2.Decide(LaunchRequest{Role: RoleWorker, Shape: "implementation"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d2.Provider != "claude" {
+		t.Fatalf("control: healthy claude must win, got %s", d2.Provider)
+	}
+}
+
+func TestProbeKeyStable(t *testing.T) {
+	if ProbeKey("codex", "gpt-5.6-luna") != "codex|gpt-5.6-luna" {
+		t.Fatal("probe key format drift")
+	}
+}
+
+func TestLaunchDecisionFieldsComplete(t *testing.T) {
+	clearRouteEnv(t)
+	r := testRouter(nil, "grok", "claude")
+	d, err := r.Decide(LaunchRequest{
+		Role:         RoleReviewer,
+		Shape:        "qa",
+		Risk:         classify.TierR2,
+		AuthorFamily: "deepseek",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Acceptance: provider, model, effort, pool, role, risk, family,
+	// capability tier, probe key (may be empty if not required), rationale.
+	if d.Provider == "" || d.Model == "" || d.Effort == "" || d.Pool == "" {
+		t.Fatalf("missing core fields: %+v", d)
+	}
+	if d.Role == "" || d.Family == "" || d.CapabilityTier == "" || d.Rationale == "" {
+		t.Fatalf("missing policy fields: %+v", d)
+	}
+	if d.Risk != classify.TierR2 {
+		t.Fatalf("risk not plumbed: %s", d.Risk)
+	}
+}
