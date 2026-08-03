@@ -25,6 +25,9 @@ type WorktreeManager struct {
 	// Production managers leave it nil and use Git; tests can fail closed
 	// before any filesystem mutation is attempted.
 	RemoveWorktreeFunc func(context.Context, string) error
+	// BeforeRemoveFunc is a deterministic final-boundary seam used by the
+	// reap tests to inject a late dirty write or HEAD advance.
+	BeforeRemoveFunc func(context.Context, string) error
 }
 
 func NewWorktreeManager(repoRoot string) *WorktreeManager {
@@ -70,6 +73,21 @@ func (w *WorktreeManager) RemoveWorktree(ctx context.Context, targetDir string) 
 	cmd.Dir = w.RepoRoot
 	if output, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("failed to remove worktree: %v, output: %s", err, string(output))
+	}
+	return nil
+}
+
+// RemoveWorktreeSafely removes only a clean worktree. Unlike the historical
+// RemoveWorktree helper, this path never uses --force and is reserved for the
+// exact-bound reap action.
+func (w *WorktreeManager) RemoveWorktreeSafely(ctx context.Context, targetDir string) error {
+	if w.RemoveWorktreeFunc != nil {
+		return w.RemoveWorktreeFunc(ctx, targetDir)
+	}
+	cmd := execCommandContext(ctx, "git", "worktree", "remove", targetDir)
+	cmd.Dir = w.RepoRoot
+	if output, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("failed to safely remove worktree: %v, output: %s", err, string(output))
 	}
 	return nil
 }

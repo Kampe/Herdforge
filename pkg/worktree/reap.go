@@ -416,8 +416,34 @@ func (w *WorktreeManager) Reap(ctx context.Context, policy ReapPolicy) (*ReapRep
 			}
 			continue
 		}
+		if w.BeforeRemoveFunc != nil {
+			if hookErr := w.BeforeRemoveFunc(ctx, reclass.Path); hookErr != nil {
+				late := reclass
+				late.Class = ReapClassUnknown
+				late.Eligible = false
+				late.Reason = "removal boundary hook refused action"
+				late.PreserveAction = "keep worktree; late mutation was detected"
+				report.Refused = append(report.Refused, late)
+				if sinkErr := w.recordReceipt(report, policy, reapReceipt(late, "refused", late.Reason)); sinkErr != nil {
+					return report, sinkErr
+				}
+				continue
+			}
+		}
+		if err := w.verifyBoundWorktree(ctx, reclass.Path, reclass.Branch, reclass.HEAD); err != nil {
+			late := reclass
+			late.Class = ReapClassUnknown
+			late.Eligible = false
+			late.Reason = "bound HEAD changed immediately before removal"
+			late.PreserveAction = "keep worktree; late HEAD drift was detected"
+			report.Refused = append(report.Refused, late)
+			if sinkErr := w.recordReceipt(report, policy, reapReceipt(late, "refused", late.Reason)); sinkErr != nil {
+				return report, sinkErr
+			}
+			continue
+		}
 
-		if err := w.RemoveWorktree(ctx, reclass.Path); err != nil {
+		if err := w.RemoveWorktreeSafely(ctx, reclass.Path); err != nil {
 			report.Errors = append(report.Errors, fmt.Sprintf("%s: remove: %v", reclass.Path, err))
 			failed := reclass
 			failed.Class = ReapClassUnknown
@@ -453,12 +479,37 @@ func (w *WorktreeManager) Reap(ctx context.Context, policy ReapPolicy) (*ReapRep
 			}
 			return report, fmt.Errorf("reap: removal outcome unverified for target")
 		}
+		boundRef, boundRefErr := w.revParse(ctx, reclass.Branch)
+		if boundRefErr != nil || boundRef != reclass.HEAD {
+			unverified := reclass
+			unverified.Class = ReapClassUnknown
+			unverified.Eligible = false
+			unverified.Reason = "branch HEAD changed after removal"
+			unverified.PreserveAction = "recover from salvage ref; removal was not verified"
+			report.Refused = append(report.Refused, unverified)
+			if sinkErr := w.recordReceipt(report, policy, reapReceipt(unverified, "unverified", unverified.Reason)); sinkErr != nil {
+				return report, sinkErr
+			}
+			return report, fmt.Errorf("reap: branch HEAD unverified after removal")
+		}
 		report.Reaped = append(report.Reaped, reclass.Path)
 		if err := w.recordReceipt(report, policy, reapReceipt(reclass, "removed", "explicit removal completed")); err != nil {
 			return report, err
 		}
 	}
 	return report, nil
+}
+
+func (w *WorktreeManager) verifyBoundWorktree(ctx context.Context, path, branch, head string) error {
+	gotHead, err := w.headAt(ctx, path)
+	if err != nil || gotHead != head {
+		return fmt.Errorf("worktree HEAD drift: got %s want %s", gotHead, head)
+	}
+	gotBranch, err := w.currentBranchAt(ctx, path)
+	if err != nil || gotBranch != branch {
+		return fmt.Errorf("worktree branch drift: got %s want %s", gotBranch, branch)
+	}
+	return nil
 }
 
 func (w *WorktreeManager) recordReceipt(report *ReapReport, policy ReapPolicy, receipt ReapReceipt) error {
@@ -734,8 +785,9 @@ func (w *WorktreeManager) classifyOne(
 
 // SalvageRefFor returns the durable salvage ref for a branch name.
 func SalvageRefFor(branch string) string {
-	b := strings.TrimPrefix(strings.ToLower(branch), "refs/heads/")
-	b = strings.ReplaceAll(b, " ", "-")
+	// Valid Git refnames are already portable path components. Preserve their
+	// exact spelling: lowercasing would alias herd/FAC-1 and herd/fac-1.
+	b := strings.TrimPrefix(branch, "refs/heads/")
 	return SalvageRefPrefix + b
 }
 
@@ -794,8 +846,19 @@ func (w *WorktreeManager) ensureSalvageRef(ctx context.Context, ref, sha string)
 	if ref == "" || sha == "" {
 		return fmt.Errorf("salvage ref and sha are required")
 	}
-	if err := w.updateRef(ctx, ref, sha); err != nil {
-		return err
+	if got, err := w.revParse(ctx, ref); err == nil {
+		if got != sha {
+			return fmt.Errorf("salvage ref %s already protects a different HEAD", ref)
+		}
+		return nil
+	}
+	// Create only when absent. The all-zero old value makes this conditional;
+	// a concurrent creator cannot be overwritten by a stale reap action.
+	zero := strings.Repeat("0", 40)
+	cmd := execCommandContext(ctx, "git", "update-ref", ref, sha, zero)
+	cmd.Dir = w.RepoRoot
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("create salvage ref %s: %v (%s)", ref, err, strings.TrimSpace(string(out)))
 	}
 	got, err := w.revParse(ctx, ref)
 	if err != nil {

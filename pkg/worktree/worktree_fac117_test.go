@@ -386,6 +386,59 @@ func TestSalvageRefFor(t *testing.T) {
 	}
 }
 
+func TestSalvageRefFor_IsInjectiveAcrossCase(t *testing.T) {
+	upper := SalvageRefFor("herd/FAC-1")
+	lower := SalvageRefFor("herd/fac-1")
+	if upper == lower {
+		t.Fatalf("case-distinct branches collided at %s", upper)
+	}
+}
+
+func TestSalvageRef_ReusesOnlySameHEAD(t *testing.T) {
+	tmpDir := t.TempDir()
+	initRepo(t, tmpDir)
+	wm := NewWorktreeManager(tmpDir)
+	first := gitOut(t, tmpDir, "rev-parse", "HEAD")
+	runCmd(tmpDir, "git", "commit", "--allow-empty", "-m", "second salvage tip")
+	second := gitOut(t, tmpDir, "rev-parse", "HEAD")
+	ref := SalvageRefFor("herd/reuse")
+	if err := wm.ensureSalvageRef(context.Background(), ref, first); err != nil {
+		t.Fatal(err)
+	}
+	if err := wm.ensureSalvageRef(context.Background(), ref, second); err == nil {
+		t.Fatal("different HEAD must not overwrite an existing salvage ref")
+	}
+	if got, err := wm.revParse(context.Background(), ref); err != nil || got != first {
+		t.Fatalf("existing salvage tip changed: got=%s err=%v want=%s", got, err, first)
+	}
+}
+
+func TestSalvageRefs_TwoCaseDistinctBranchesRemainRecoverable(t *testing.T) {
+	tmpDir := t.TempDir()
+	initRepo(t, tmpDir)
+	wm := NewWorktreeManager(tmpDir)
+	first := gitOut(t, tmpDir, "rev-parse", "HEAD")
+	runCmd(tmpDir, "git", "commit", "--allow-empty", "-m", "second case tip")
+	second := gitOut(t, tmpDir, "rev-parse", "HEAD")
+	upper := SalvageRefFor("herd/FAC-1")
+	lower := SalvageRefFor("herd/fac-1")
+	if upper == lower {
+		t.Fatal("fixture branches unexpectedly share a salvage ref")
+	}
+	if err := wm.ensureSalvageRef(context.Background(), upper, first); err != nil {
+		t.Fatal(err)
+	}
+	if err := wm.ensureSalvageRef(context.Background(), lower, second); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := wm.revParse(context.Background(), upper); got != first {
+		t.Fatalf("upper-case salvage tip lost: got=%s want=%s", got, first)
+	}
+	if got, _ := wm.revParse(context.Background(), lower); got != second {
+		t.Fatalf("lower-case salvage tip lost: got=%s want=%s", got, second)
+	}
+}
+
 func keysOf(m map[string]ReapCandidate) []string {
 	out := make([]string, 0, len(m))
 	for k := range m {
