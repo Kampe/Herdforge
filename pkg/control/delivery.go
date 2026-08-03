@@ -57,6 +57,11 @@ type WakeReceipt struct {
 	Baseline        string `json:"baseline_status"`
 	Final           string `json:"final_status"`
 	Target          string `json:"target"`
+	Workspace       string `json:"workspace"`
+	TabID           string `json:"tab_id"`
+	PaneID          string `json:"pane_id"`
+	AgentName       string `json:"agent_name"`
+	Provider        string `json:"provider"`
 	SessionID       string `json:"session_id"`
 	LeaseGeneration int64  `json:"lease_generation"`
 }
@@ -70,6 +75,7 @@ type Sender interface {
 
 type Waker interface {
 	WakeTarget() WakeTarget
+	ReadTarget(context.Context) (WakeTarget, error)
 	Wake(context.Context, WakeRequest) (WakeReceipt, error)
 }
 
@@ -206,7 +212,9 @@ func (d *Delivery) Deliver(ctx context.Context, o Order) (Evidence, error) {
 	if wake, ok, err := loadWake(d.Outbox.DB(), item.ID); err != nil {
 		return e, err
 	} else if ok {
-		if !wake.Consumed || !wake.Verified || wake.MessageID != item.MessageID || wake.SequenceToken == "" || wake.Target == "" || wake.SessionID == "" || wake.LeaseGeneration != o.LeaseGeneration {
+		current, readErr := d.Waker.ReadTarget(ctx)
+		target := d.Waker.WakeTarget()
+		if readErr != nil || current != target || !wake.Consumed || !wake.Verified || wake.MessageID != item.MessageID || wake.SequenceToken == "" || wake.Target != current.Target || wake.Workspace != current.Workspace || wake.TabID != current.TabID || wake.PaneID != current.PaneID || wake.AgentName != current.AgentName || wake.Provider != current.Provider || wake.SessionID != current.SessionID || wake.LeaseGeneration != current.LeaseGeneration || wake.LeaseGeneration != o.LeaseGeneration {
 			return e, ErrMissingReceipt
 		}
 		e.MessageID, e.Sequence, e.Wake, e.State = item.MessageID, item.Sequence, wake, outbox.StatusSent
@@ -266,7 +274,7 @@ func (d *Delivery) wake(ctx context.Context, o Order, e Evidence, _ string) (Evi
 	if err != nil {
 		return e, fmt.Errorf("control wake failed (order retained for retry): %w", err)
 	}
-	if r.MessageID != e.MessageID || !r.Consumed || !r.Verified || r.Target != target.Target || r.SessionID != target.SessionID || r.LeaseGeneration != target.LeaseGeneration || target.LeaseGeneration != o.LeaseGeneration {
+	if r.MessageID != e.MessageID || !r.Consumed || !r.Verified || r.Target != target.Target || r.Workspace != target.Workspace || r.TabID != target.TabID || r.PaneID != target.PaneID || r.AgentName != target.AgentName || r.Provider != target.Provider || r.SessionID != target.SessionID || r.LeaseGeneration != target.LeaseGeneration || target.LeaseGeneration != o.LeaseGeneration {
 		return e, ErrMissingReceipt
 	}
 	e.Wake = r
@@ -411,6 +419,12 @@ func (d *Delivery) terminal(ctx context.Context, o Order, supersede bool) (Evide
 	}
 	if evidence.IdempotencyKey != key || evidence.EnvelopeID != wantEnvelopeID || evidence.MessageID != item.MessageID || evidence.Sequence != item.Sequence || evidence.Repository != o.Repository || evidence.TaskRef != o.TaskRef || evidence.Lane != o.Lane || evidence.LeaseGeneration != o.LeaseGeneration || evidence.CandidateSHA != o.CandidateSHA || evidence.Kind != o.Kind || evidence.BodyDigest != digest {
 		return Evidence{}, fmt.Errorf("control: corrupt or mismatched durable acknowledgement evidence")
+	}
+	if supersede && (evidence.Outcome != "superseded" || strings.TrimSpace(evidence.FailureReason) == "") {
+		return Evidence{}, fmt.Errorf("control: supersession requires outcome and failure reason")
+	}
+	if !supersede && evidence.Outcome != "acknowledged" {
+		return Evidence{}, fmt.Errorf("control: acknowledgement outcome mismatch")
 	}
 	if supersede {
 		if item.Status == outbox.StatusSuperseded {

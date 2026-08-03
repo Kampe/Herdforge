@@ -65,6 +65,11 @@ func (e *Engine) ForgeLoop(ctx context.Context, d ForgeDriver, opts ForgeLoopOpt
 			return ctx.Err()
 		default:
 		}
+		if e.ControlReconciler != nil {
+			if err := e.ControlReconciler.RunOnce(ctx); err != nil {
+				d.Log(fmt.Sprintf("forge: control reconciliation failed: %v", err))
+			}
+		}
 
 		// timeout → BLOCKED → recovering (probe) → ok on success.
 		if e.health.isBlocked() {

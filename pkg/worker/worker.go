@@ -3,6 +3,7 @@ package worker
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/Kampe/Herdforge/pkg/control"
 	"github.com/Kampe/Herdforge/pkg/harness"
@@ -20,9 +21,13 @@ type WorkerLane struct {
 // ReceiveControlOnce is the standing-lane production receive entrypoint. The
 // processor is task-scoped and idempotency-aware; a lane cannot consume mail
 // through a label-only or coordinator-owned shortcut.
-func (s *LaneSupervisor) ReceiveControlOnce(ctx context.Context, laneID string, loop *control.RecipientLoop) error {
+func (s *LaneSupervisor) ReceiveControlOnce(ctx context.Context, laneID string, identity control.LaneIdentity, loop *control.RecipientLoop) error {
 	if s == nil || s.Lanes[laneID] == nil {
 		return fmt.Errorf("lane %s not found", laneID)
+	}
+	lane := s.Lanes[laneID]
+	if identity.Lane != laneID || identity.Repository == "" || identity.TaskRef == "" || identity.LeaseGeneration <= 0 || identity.CandidateSHA == "" || lane.ActiveTask == nil || string(lane.ActiveTask.Ref) != identity.TaskRef {
+		return control.ErrStaleIdentity
 	}
 	if loop == nil {
 		return control.ErrProcessorUnavailable
@@ -33,6 +38,24 @@ func (s *LaneSupervisor) ReceiveControlOnce(ctx context.Context, laneID string, 
 type LaneSupervisor struct {
 	RepoRoot string
 	Lanes    map[string]*WorkerLane
+}
+
+// RunStandingLane is the long-running worker receive path. Its caller binds a
+// task-scoped identity and idempotent processor before entering the loop.
+func (s *LaneSupervisor) RunStandingLane(ctx context.Context, laneID string, identity control.LaneIdentity, loop *control.RecipientLoop, interval time.Duration) error {
+	if interval <= 0 {
+		interval = time.Second
+	}
+	for {
+		if err := s.ReceiveControlOnce(ctx, laneID, identity, loop); err != nil {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(interval):
+		}
+	}
 }
 
 func NewLaneSupervisor(repoRoot string) *LaneSupervisor {

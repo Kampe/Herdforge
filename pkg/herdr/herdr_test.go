@@ -30,6 +30,24 @@ func TestIsAvailable(t *testing.T) {
 	}
 }
 
+func TestAgentListDecodesExactSessionValue(t *testing.T) {
+	old := runHerdr
+	defer func() { runHerdr = old }()
+	runHerdr = func(args ...string) (string, error) {
+		if len(args) != 2 || args[0] != "agent" || args[1] != "list" {
+			t.Fatalf("unexpected args: %v", args)
+		}
+		return `{"result":{"agents":[{"name":"forge-worker","agent":"gpt-5.6-luna","agent_status":"working","pane_id":"pane-1","tab_id":"tab-1","workspace_id":"wF","agent_session":{"value":"session-actual"}}]}}`, nil
+	}
+	agents, err := AgentList()
+	if err != nil || len(agents) != 1 {
+		t.Fatalf("AgentList: %#v %v", agents, err)
+	}
+	if agents[0].Session.Value != "session-actual" {
+		t.Fatalf("session=%q", agents[0].Session.Value)
+	}
+}
+
 func TestHerdrCLINotFound(t *testing.T) {
 	// Verify that the error path works when herdr is missing
 	// by temporarily modifying PATH

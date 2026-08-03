@@ -9,6 +9,7 @@ import (
 	"sync"
 
 	"github.com/Kampe/Herdforge/pkg/config"
+	"github.com/Kampe/Herdforge/pkg/control"
 	"github.com/Kampe/Herdforge/pkg/deps"
 	"github.com/Kampe/Herdforge/pkg/provider"
 	"github.com/Kampe/Herdforge/pkg/router"
@@ -29,6 +30,9 @@ type Engine struct {
 	// Ownership is the durable cross-process launch lease (pkg/claim SQLite).
 	// When nil, OpenLeaseOwnership under .herd/launch-claims.db is used.
 	Ownership deps.OwnershipClaimer
+	// ControlReconciler is the production coordinator restart/pulse hook.
+	// When configured, RunPulse reconciles durable control orders before claims.
+	ControlReconciler *control.CoordinatorLoop
 
 	// health projects BLOCKED(provider_timeout)/recovering for the control plane.
 	health              providerHealth
@@ -298,6 +302,11 @@ func (e *Engine) ownershipClaimer() (deps.OwnershipClaimer, error) {
 // FAC-159: durable claim lease (pkg/claim) + revision-fenced graph check before
 // board claim; post-claim drift compensates only while owner+generation match.
 func (e *Engine) RunPulse(ctx context.Context, role string) (*provider.Task, error) {
+	if e.ControlReconciler != nil {
+		if err := e.ControlReconciler.RunOnce(ctx); err != nil {
+			return nil, fmt.Errorf("pulse control reconciliation: %w", err)
+		}
+	}
 	// BLOCKED: do not claim more work; surface status and stay responsive.
 	if e.health.isBlocked() {
 		return nil, fmt.Errorf("pulse sweep refused: %s", e.ProviderStatus())

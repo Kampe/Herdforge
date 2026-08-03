@@ -97,17 +97,18 @@ func (LiveHerdr) ResolveHealthyModel(ctx context.Context, primary string, fallba
 
 // ValidateControlTarget binds a wake to the exact tab/pane/agent returned by
 // AgentStart.  A label alone is not a stable Herdr destination.
-func (LiveHerdr) ValidateControlTarget(target control.WakeTarget) error {
+func (LiveHerdr) ReadControlTarget(target control.WakeTarget) (control.WakeTarget, error) {
 	agents, err := herdr.AgentList()
 	if err != nil {
-		return err
+		return control.WakeTarget{}, err
 	}
 	for _, a := range agents {
-		if a.TabID == target.TabID && a.PaneID == target.PaneID && a.Name == target.AgentName && target.SessionID == target.TabID+"/"+target.PaneID {
-			return nil
+		if a.TabID == target.TabID && a.PaneID == target.PaneID && a.Name == target.AgentName && a.Workspace == target.Workspace && a.Kind == target.Provider && a.Session.Value != "" {
+			target.SessionID = a.Session.Value
+			return target, nil
 		}
 	}
-	return fmt.Errorf("launched Herdr tab/pane/agent is no longer current")
+	return control.WakeTarget{}, fmt.Errorf("launched Herdr tab/pane/agent/session is no longer current")
 }
 
 type DispatchOptions struct {
@@ -699,7 +700,7 @@ func (d *Dispatcher) launch(
 		identity.Repository = repository
 		identity.CandidateSHA = opts.Decision.CandidateSHA
 	}
-	wakeTarget := control.WakeTarget{Target: tabLabel, TabID: tab.ID, PaneID: tab.Pane.ID, AgentName: tabLabel, SessionID: tab.ID + "/" + tab.Pane.ID, LeaseGeneration: result.LeaseGeneration}
+	wakeTarget := control.WakeTarget{Target: tabLabel, Workspace: ws, TabID: tab.ID, PaneID: tab.Pane.ID, AgentName: tabLabel, Provider: request.Decision.Provider, LeaseGeneration: result.LeaseGeneration}
 	check := func(checkCtx context.Context, o control.Order) error {
 		if o.LaneIdentity != identity {
 			return control.ErrStaleIdentity
@@ -717,10 +718,14 @@ func (d *Dispatcher) launch(
 		return nil
 	}
 	if verifier, ok := h.(interface {
-		ValidateControlTarget(control.WakeTarget) error
+		ReadControlTarget(control.WakeTarget) (control.WakeTarget, error)
 	}); ok {
-		if err := verifier.ValidateControlTarget(wakeTarget); err != nil && d.Production {
+		actual, err := verifier.ReadControlTarget(wakeTarget)
+		if err != nil && d.Production {
 			return &launchFailure{Reason: "control_target_drift", Err: closeTabLocal(h, tab.ID, "control_target_drift", err)}
+		}
+		if err == nil {
+			wakeTarget = actual
 		}
 	} else if d.Production {
 		return &launchFailure{Reason: "control_target_unverifiable", Err: closeTabLocal(h, tab.ID, "control_target_unverifiable", fmt.Errorf("Herdr launcher cannot verify exact target"))}

@@ -269,6 +269,9 @@ type AgentEntry struct {
 	PaneID    string `json:"pane_id,omitempty"`
 	TabID     string `json:"tab_id,omitempty"`
 	Workspace string `json:"workspace_id,omitempty"`
+	Session   struct {
+		Value string `json:"value,omitempty"`
+	} `json:"agent_session,omitempty"`
 }
 
 var (
