@@ -97,31 +97,6 @@ var codeSignatureRe = regexp.MustCompile(`^\s*(package\s+\w|import\s+["(]|func\s
 // convention (Go, protobuf, and most codegen tools emit a line like this).
 var generatedMarkerRe = regexp.MustCompile(`(?i)code generated.*do not edit`)
 
-// executableDeclRe matches a top-level Go executable declaration: a named
-// function, a method with a receiver, or a function-valued variable —
-// the ways Go allows code to run from package scope outside an existing
-// function body. Group 1 holds a func/method name; group 2 holds a
-// function-valued var name. The var alternative's optional type segment is
-// `[^=]+?` (any type expression, not just a bare identifier) so an
-// explicitly-typed declaration like `var grantAdmin func() = func() {...}`
-// still matches — Go type syntax (func(), []T, map[K]V, generics) is too
-// varied to enumerate.
-var executableDeclRe = regexp.MustCompile(`^func\s+(?:\([^)]*\)\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*\(|^var\s+([A-Za-z_][A-Za-z0-9_]*)(?:\s+[^=]+?)?\s*=\s*func\s*\(`)
-
-// varBlockOpenRe matches the start of a grouped `var (` declaration block,
-// where individual specs don't repeat the `var` keyword and may split a
-// single spec's name/type/value across lines. Group 1 captures whatever
-// follows the opening paren on this same line — empty for the common
-// `var (` -alone-on-its-line form, non-empty for the compact form
-// (`var (x = func(){})`).
-var varBlockOpenRe = regexp.MustCompile(`^var\s*\((.*)$`)
-
-// groupedVarFuncRe matches one `name [type] = func(` spec once a grouped
-// var block's lines have been joined into a single string — scoped to
-// content already known to be inside a top-level `var ( ... )` block, so
-// it can't mistake a local `x := func(){}` test closure for one of these.
-var groupedVarFuncRe = regexp.MustCompile(`\b([A-Za-z_][A-Za-z0-9_]*)\s+(?:[^=]+?)?=\s*func\s*\(`)
-
 // testFuncPrefixRe matches Go's recognized test-harness function prefixes.
 var testFuncPrefixRe = regexp.MustCompile(`^(Test|Benchmark|Example|Fuzz)`)
 
@@ -250,107 +225,88 @@ func hasSmuggledProductionCodeAST(added []string) (smuggled, parsed bool) {
 	return false, true
 }
 
-// parenDelta returns the net change in parenthesis depth in s, counting
-// only real '(' / ')' tokens as go/scanner sees them — string, rune, and
-// comment content is opaque to it, so a ')' inside "safe = \")\"" or a //
-// comment can't be mistaken for a real one. The scanner tokenizes leniently
-// (no error handler), so unterminated fragments (a diff hunk cut mid-line)
-// don't panic; they just stop yielding tokens at EOF.
-func parenDelta(s string) int {
-	if strings.TrimSpace(s) == "" {
-		return 0
-	}
+// goTok is one token from a single go/scanner pass.
+type goTok struct {
+	tok token.Token
+	lit string
+}
+
+// tokenizeGo lexes src in one continuous go/scanner pass and returns every
+// non-EOF token. Scanning the whole fragment at once — not line by line —
+// is what makes a multiline raw string or block comment resolve to a
+// single opaque token no matter how many "added" lines it spans; per-line
+// scanning can't see that continuity and mistakes a delimiter inside one
+// for a real one. The scanner has no error handler, so a lexically
+// unterminated fragment (a diff hunk cut mid-token) doesn't panic — it
+// just stops yielding tokens at EOF.
+func tokenizeGo(src string) []goTok {
 	fset := token.NewFileSet()
-	file := fset.AddFile("", fset.Base(), len(s))
+	file := fset.AddFile("", fset.Base(), len(src))
 	var sc scanner.Scanner
-	sc.Init(file, []byte(s), nil, 0)
-	delta := 0
+	sc.Init(file, []byte(src), nil, 0)
+	var out []goTok
 	for {
-		_, tok, _ := sc.Scan()
+		_, tok, lit := sc.Scan()
 		if tok == token.EOF {
-			return delta
+			return out
 		}
-		switch tok {
-		case token.LPAREN:
-			delta++
-		case token.RPAREN:
-			delta--
-		}
+		out = append(out, goTok{tok, lit})
 	}
 }
 
-// hasSmuggledProductionCodeHeuristic is the line-oriented fallback used
-// when added doesn't parse as a standalone Go file (the common case for a
-// partial diff hunk). It catches the same declaration forms on a
-// best-effort basis via regex rather than a real parse.
-func hasSmuggledProductionCodeHeuristic(added []string) bool {
-	depth := 0 // 0 = not in a grouped var block; >0 = its unclosed '(' count
-	var blockLines []string
-
-	flushBlock := func() bool {
-		defer func() { blockLines = nil }()
-		joined := strings.Join(blockLines, " ")
-		for _, m := range groupedVarFuncRe.FindAllStringSubmatch(joined, -1) {
-			if !testFuncPrefixRe.MatchString(m[1]) {
-				return true
-			}
+// skipBalancedParen, given the index of an LPAREN, returns the index just
+// past its matching RPAREN (or len(toks) if unterminated).
+func skipBalancedParen(toks []goTok, open int) int {
+	depth := 1
+	i := open + 1
+	for i < len(toks) && depth > 0 {
+		switch toks[i].tok {
+		case token.LPAREN:
+			depth++
+		case token.RPAREN:
+			depth--
 		}
-		return false
+		i++
 	}
+	return i
+}
 
-	for _, raw := range added {
-		line := strings.TrimSpace(raw)
+// hasSmuggledProductionCodeHeuristic is the fallback used when added
+// doesn't parse as a standalone Go file (the common case for a partial
+// diff hunk — e.g. one added assertion inside an existing Test func). It
+// tokenizes the fragment once with go/scanner (see tokenizeGo) and matches
+// two token sequences a real declaration produces regardless of grouping,
+// spacing, or line-splitting:
+//
+//   - FUNC [ '(' ... ')' ] IDENT '('   — a func or method declaration
+//   - IDENT? '=' FUNC '('              — a var spec's value is a func
+//     literal. There's no name check here: unlike a func declaration, a
+//     var has no Test/Benchmark/Example/Fuzz discovery convention that
+//     would make any name "safe", so any top-level func-valued var is
+//     flagged regardless of its name. ':=' is the distinct DEFINE token,
+//     not ASSIGN, so an ordinary local `mock := func(){}` closure — the
+//     common, legitimate test-mocking idiom — never matches this.
+func hasSmuggledProductionCodeHeuristic(added []string) bool {
+	toks := tokenizeGo(strings.Join(added, "\n"))
 
-		var content string
-		if depth == 0 {
-			m := varBlockOpenRe.FindStringSubmatch(line)
-			if m == nil {
-				md := executableDeclRe.FindStringSubmatch(line)
-				if md == nil {
-					continue
-				}
-				name := md[1]
-				if name == "" {
-					name = md[2]
-				}
-				if !testFuncPrefixRe.MatchString(name) {
+	for i, t := range toks {
+		switch t.tok {
+		case token.FUNC:
+			j := i + 1
+			if j < len(toks) && toks[j].tok == token.LPAREN {
+				j = skipBalancedParen(toks, j) // skip a method's receiver group
+			}
+			if j < len(toks) && toks[j].tok == token.IDENT &&
+				j+1 < len(toks) && toks[j+1].tok == token.LPAREN {
+				if !testFuncPrefixRe.MatchString(toks[j].lit) {
 					return true
 				}
-				continue
 			}
-			depth = 1
-			content = m[1] // whatever follows "var (" on this same line, if any
-		} else {
-			content = line
-		}
-
-		// Track the block's own paren depth across this line's content —
-		// not just line-exact "var (" / ")" markers — so a compact
-		// single-line block (`var (x = func(){})`) and an unterminated one
-		// (missing closing paren, e.g. a partial diff hunk cut mid-block)
-		// are both handled the same way as a spread-out multi-line block.
-		// Parens inside the content (func signatures, call expressions)
-		// nest and unwind within the same scan, so they wash out net-zero.
-		// parenDelta only counts real '(' / ')' tokens — a ')' inside a
-		// string/rune literal or a comment can't masquerade as one and
-		// prematurely close the block, hiding whatever comes after it.
-		if strings.TrimSpace(content) != "" {
-			blockLines = append(blockLines, content)
-		}
-		depth += parenDelta(content)
-		if depth <= 0 {
-			depth = 0
-			if flushBlock() {
+		case token.ASSIGN:
+			if i+2 < len(toks) && toks[i+1].tok == token.FUNC && toks[i+2].tok == token.LPAREN {
 				return true
 			}
 		}
-	}
-
-	// An unterminated block (its closing ")" fell outside this hunk) still
-	// has its partial content checked — a hunk boundary must not hide a
-	// violation.
-	if depth > 0 && flushBlock() {
-		return true
 	}
 	return false
 }
