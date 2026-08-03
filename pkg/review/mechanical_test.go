@@ -59,6 +59,17 @@ func TestClassifyFile_FunctionValuedVarSmuggledInTestPath(t *testing.T) {
 	}
 }
 
+func TestClassifyFile_TypedFunctionValuedVarSmuggledInTestPath(t *testing.T) {
+	fc := FileChange{
+		Path:  "pkg/review/sneaky_test.go",
+		Added: []string{"func TestFoo(t *testing.T) {}", "var grantAdmin func() = func() { escalate() }"},
+	}
+	got := ClassifyFile(fc, DefaultMechanicalPolicy())
+	if got != CategoryAmbiguous {
+		t.Errorf("explicitly-typed function-valued var in _test.go must classify Ambiguous (escalate), got %s", got)
+	}
+}
+
 func TestClassifyFile_MethodDeclarationSmuggledInTestPath(t *testing.T) {
 	fc := FileChange{
 		Path:  "pkg/review/sneaky_test.go",
