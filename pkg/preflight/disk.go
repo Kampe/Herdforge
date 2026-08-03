@@ -97,13 +97,29 @@ func (e *DiskPressureError) Error() string {
 // DiskProber probes the volume containing path. Injectable for tests.
 type DiskProber func(path string) (DiskStat, error)
 
+// DiskGuardState is the control-plane projection of the guard, mirroring
+// the FAC-150 provider-lane pattern (ok | blocked | recovering).
+type DiskGuardState string
+
+const (
+	// DiskOK — headroom above every enabled floor; mutations proceed.
+	DiskOK DiskGuardState = "ok"
+	// DiskBlocked — pressure or unreadable stat; all fleet mutations refused.
+	DiskBlocked DiskGuardState = "blocked"
+	// DiskRecovering — above the block floor but below the recover floor;
+	// still refusing until a fresh probe shows stable headroom (hysteresis).
+	DiskRecovering DiskGuardState = "recovering"
+)
+
 // DiskGuard holds hysteresis state: once blocked, it stays blocked until a
 // fresh probe clears the (higher) recover thresholds. State is in-process
-// only — after a restart the first probe reconciles state from scratch.
+// only — after a restart the first Check reconciles state from a fresh
+// probe (there is nothing stale to persist or replay).
 type DiskGuard struct {
-	mu      sync.Mutex
-	prober  DiskProber
-	blocked bool
+	mu           sync.Mutex
+	prober       DiskProber
+	state        DiskGuardState
+	lastEvidence *DiskPressureError
 }
 
 // NewDiskGuard returns a guard using prober, or the real statfs prober when
@@ -126,11 +142,51 @@ func CheckDiskPressure(operation string, paths ...string) error {
 	return DefaultDiskGuard.Check(operation, paths...)
 }
 
-// Blocked reports whether the guard is currently in the blocked state.
+// Blocked reports whether the guard currently refuses fleet mutations
+// (blocked or still inside the recovery hysteresis window).
 func (g *DiskGuard) Blocked() bool {
+	s := g.State()
+	return s == DiskBlocked || s == DiskRecovering
+}
+
+// State returns the projection state. A fresh guard (no probe yet) reports
+// DiskOK; the first Check reconciles from a live probe.
+func (g *DiskGuard) State() DiskGuardState {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	return g.blocked
+	if g.state == "" {
+		return DiskOK
+	}
+	return g.state
+}
+
+// Status is the fleet/operator label, aligned with the FAC-150 provider
+// style: ok | recovering | BLOCKED(disk_pressure) |
+// BLOCKED(disk_stat_unreadable). Pressure is never mapped to zero work or
+// success — a blocked guard is always visibly BLOCKED.
+func (g *DiskGuard) Status() string {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	switch g.state {
+	case DiskBlocked:
+		if g.lastEvidence != nil && g.lastEvidence.Reason == ReasonStatUnreadable {
+			return "BLOCKED(disk_stat_unreadable)"
+		}
+		return "BLOCKED(disk_pressure)"
+	case DiskRecovering:
+		return "recovering"
+	default:
+		return "ok"
+	}
+}
+
+// LastEvidence returns the structured evidence from the most recent refusal,
+// or nil when the guard is ok. The pointer is the same struct returned as
+// the Check error; treat it as read-only.
+func (g *DiskGuard) LastEvidence() *DiskPressureError {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.lastEvidence
 }
 
 // Check probes every distinct volume under paths and fails closed on
@@ -146,10 +202,7 @@ func (g *DiskGuard) Check(operation string, paths ...string) error {
 		}
 		st, err := g.prober(p)
 		if err != nil {
-			g.mu.Lock()
-			g.blocked = true
-			g.mu.Unlock()
-			return &DiskPressureError{
+			pe := &DiskPressureError{
 				State:      "BLOCKED",
 				Reason:     ReasonStatUnreadable,
 				Operation:  operation,
@@ -157,6 +210,11 @@ func (g *DiskGuard) Check(operation string, paths ...string) error {
 				Detail:     fmt.Sprintf("cannot stat volume for %q (failing closed): %v", p, err),
 				NextAction: safeNextAction,
 			}
+			g.mu.Lock()
+			g.state = DiskBlocked
+			g.lastEvidence = pe
+			g.mu.Unlock()
+			return pe
 		}
 		if seen[st.FSID] {
 			continue
@@ -169,8 +227,8 @@ func (g *DiskGuard) Check(operation string, paths ...string) error {
 	defer g.mu.Unlock()
 
 	if bad := below(stats, th.MinFreeBytes, th.MinFreePct, th.MinInodePct); bad != nil {
-		g.blocked = true
-		return &DiskPressureError{
+		g.state = DiskBlocked
+		pe := &DiskPressureError{
 			State:      "BLOCKED",
 			Reason:     ReasonDiskPressure,
 			Operation:  operation,
@@ -181,11 +239,14 @@ func (g *DiskGuard) Check(operation string, paths ...string) error {
 				float64(th.MinFreeBytes)/bytesPerGiB, th.MinFreePct),
 			NextAction: safeNextAction,
 		}
+		g.lastEvidence = pe
+		return pe
 	}
 
-	if g.blocked {
+	if g.state == DiskBlocked || g.state == DiskRecovering {
 		if bad := below(stats, th.RecoverFreeBytes, th.RecoverFreePct, th.MinInodePct); bad != nil {
-			return &DiskPressureError{
+			g.state = DiskRecovering
+			pe := &DiskPressureError{
 				State:      "BLOCKED",
 				Reason:     ReasonRecovering,
 				Operation:  operation,
@@ -195,9 +256,12 @@ func (g *DiskGuard) Check(operation string, paths ...string) error {
 					bad.Path, float64(th.RecoverFreeBytes)/bytesPerGiB, th.RecoverFreePct),
 				NextAction: safeNextAction,
 			}
+			g.lastEvidence = pe
+			return pe
 		}
-		g.blocked = false
 	}
+	g.state = DiskOK
+	g.lastEvidence = nil
 	return nil
 }
 

@@ -185,3 +185,73 @@ func TestRealDiskStatReadsThisVolume(t *testing.T) {
 		t.Fatalf("ancestor walk landed on wrong volume: %q vs %q", st2.FSID, st.FSID)
 	}
 }
+
+func TestDiskGuardStateProjection(t *testing.T) {
+	current := incidentStat("/repo", "a")
+	g := NewDiskGuard(func(string) (DiskStat, error) { return current, nil })
+
+	// Fresh guard (as after restart): no stale state, projects ok.
+	if g.State() != DiskOK || g.Status() != "ok" || g.LastEvidence() != nil {
+		t.Fatalf("fresh guard: state=%s status=%s", g.State(), g.Status())
+	}
+
+	// Pressure → BLOCKED(disk_pressure), evidence exposed for projection.
+	_ = g.Check("dispatch", "/repo")
+	if g.State() != DiskBlocked || g.Status() != "BLOCKED(disk_pressure)" {
+		t.Fatalf("blocked: state=%s status=%s", g.State(), g.Status())
+	}
+	if ev := g.LastEvidence(); ev == nil || ev.Reason != ReasonDiskPressure {
+		t.Fatalf("evidence not exposed: %+v", g.LastEvidence())
+	}
+
+	// Hysteresis window → recovering label, still refusing.
+	t.Setenv(EnvDiskMinFreePct, "0")
+	current.FreeBytes = 16 << 30
+	if err := g.Check("dispatch", "/repo"); err == nil {
+		t.Fatal("recovering window must still refuse")
+	}
+	if g.State() != DiskRecovering || g.Status() != "recovering" || !g.Blocked() {
+		t.Fatalf("recovering: state=%s status=%s blocked=%v", g.State(), g.Status(), g.Blocked())
+	}
+
+	// Stable headroom → ok, evidence cleared. Pressure never projected as
+	// success while refusing; ok only after an allowing probe.
+	current.FreeBytes = 30 << 30
+	if err := g.Check("dispatch", "/repo"); err != nil {
+		t.Fatalf("recovered: %v", err)
+	}
+	if g.State() != DiskOK || g.Status() != "ok" || g.LastEvidence() != nil {
+		t.Fatalf("ok: state=%s status=%s", g.State(), g.Status())
+	}
+}
+
+func TestDiskGuardUnreadableStatusLabel(t *testing.T) {
+	g := NewDiskGuard(fakeProber(nil, map[string]error{"/repo": errors.New("io error")}))
+	_ = g.Check("dispatch", "/repo")
+	if g.Status() != "BLOCKED(disk_stat_unreadable)" {
+		t.Fatalf("status = %q", g.Status())
+	}
+}
+
+func TestDiskGuardRestartReconciliation(t *testing.T) {
+	// Old process blocked; a NEW guard (restart) with healthy disk goes
+	// straight to ok on first probe — no persisted pressure to replay, and
+	// no recover-floor requirement applies to a fresh process.
+	t.Setenv(EnvDiskMinFreeGB, "15")
+	old := NewDiskGuard(fakeProber(map[string]DiskStat{"/repo": incidentStat("/repo", "a")}, nil))
+	_ = old.Check("dispatch", "/repo")
+	if !old.Blocked() {
+		t.Fatal("old process should be blocked")
+	}
+
+	st := healthyStat("/repo", "a")
+	st.FreeBytes = 16 << 30 // above block floor (15GiB), below recover floor (18.75GiB)
+	st.FreePct = 50
+	fresh := NewDiskGuard(fakeProber(map[string]DiskStat{"/repo": st}, nil))
+	if err := fresh.Check("dispatch", "/repo"); err != nil {
+		t.Fatalf("fresh guard must reconcile from live probe, got: %v", err)
+	}
+	if fresh.State() != DiskOK {
+		t.Fatalf("fresh guard state = %s", fresh.State())
+	}
+}
