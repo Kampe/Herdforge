@@ -3,14 +3,30 @@
 package verifier
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"syscall"
 	"testing"
 	"time"
 )
+
+func TestNativeDeadlineCallsitesReturnPropagatedErrno(t *testing.T) {
+	_, testFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed")
+	}
+	source, err := os.ReadFile(filepath.Join(filepath.Dir(testFile), "residual_marker_darwin_cgo.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := bytes.Count(source, []byte("return deadline_error;")); got != 2 {
+		t.Fatalf("native deadline callsites returning deadline_error = %d, want 2", got)
+	}
+}
 
 func TestLibprocInspectionSeamPreservesVanishedSkip(t *testing.T) {
 	previous := markerHoldersFn
@@ -58,6 +74,22 @@ func TestCompiledLibprocCapacityAndIdentityDecisions(t *testing.T) {
 	}
 	if got := libprocClockFailureForTest(syscall.EACCES); got != syscall.EACCES {
 		t.Fatalf("clock errno must be preserved: %v", got)
+	}
+	for _, tc := range []struct {
+		name  string
+		errno syscall.Errno
+	}{
+		{name: "clock EIO", errno: syscall.EIO},
+		{name: "clock EACCES", errno: syscall.EACCES},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := libprocDeadlineResultForTest(tc.errno); got != tc.errno {
+				t.Fatalf("deadline native error = %v, want injected %v", got, tc.errno)
+			}
+		})
+	}
+	if got := libprocDeadlineResultForTest(0); got != syscall.EIO {
+		t.Fatalf("errno-zero deadline failure must become EIO: %v", got)
 	}
 	const retry = 1
 	if decision, attempts := markerCapacityDecisionForTest(8, 8, 0, 0); decision != retry || attempts != 1 {

@@ -63,6 +63,10 @@ static int marker_clock_failure_for_test(int saved_errno) {
 	return marker_errno_or_eio(saved_errno);
 }
 
+static int marker_deadline_result_for_test(int injected_errno) {
+	return marker_errno_or_eio(injected_errno);
+}
+
 static int marker_output_decision(int has_holders, int holder_count) {
 	return holder_count >= 0 &&
 		((holder_count == 0 && !has_holders) || (holder_count > 0 && has_holders));
@@ -196,7 +200,7 @@ static int marker_holders(const char *path, int64_t budget_ns,
 			free(fds);
 			free(pids);
 			free(holders);
-			return ETIMEDOUT;
+			return deadline_error;
 		}
 		int pid = pids[i];
 		if (pid <= 1) {
@@ -299,7 +303,7 @@ static int marker_holders(const char *path, int64_t budget_ns,
 				free(fds);
 				free(pids);
 				free(holders);
-				return ETIMEDOUT;
+				return deadline_error;
 			}
 			if (fds[j].proc_fdtype != PROX_FDTYPE_VNODE) {
 				continue;
@@ -431,6 +435,10 @@ func libprocErrnoOrEIOForTest(errno syscall.Errno) syscall.Errno {
 
 func libprocClockFailureForTest(errno syscall.Errno) syscall.Errno {
 	return syscall.Errno(C.marker_clock_failure_for_test(C.int(errno)))
+}
+
+func libprocDeadlineResultForTest(errno syscall.Errno) syscall.Errno {
+	return syscall.Errno(C.marker_deadline_result_for_test(C.int(errno)))
 }
 
 func markerOutputDecisionForTest(hasHolders bool, holderCount int) bool {
