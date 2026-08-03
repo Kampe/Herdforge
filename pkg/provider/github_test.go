@@ -66,6 +66,11 @@ func TestGitHubProvider_ListTasks(t *testing.T) {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
+		// Empty termination required: only page 1 has items.
+		if r.URL.Query().Get("page") != "" && r.URL.Query().Get("page") != "1" {
+			w.Write([]byte(`[]`))
+			return
+		}
 		w.Write([]byte(`[
 			{"number":1,"title":"Issue 1","body":"Body 1","state":"open","created_at":"2026-08-01T20:00:00Z","labels":[{"name":"priority:high"}]},
 			{"number":2,"title":"Issue 2","body":"Body 2","state":"closed","created_at":"2026-08-01T20:00:00Z","labels":[]}
