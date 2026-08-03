@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "note": "Herdforge lane registry: constraint sections are VERBATIM from chainseer docs/agent/lane-registry.json (the parity contract for the shell->Go swap); lanes[] is the complete forge roster (FAC-127): scout, smith, assayer, orchestrator, scout-planner, verification-gate, review-supervisor, harvest, recovery-sentinel. FAC-142 SurfaceRouter.Decide owns live provider+model+effort+pool for worker and reviewer launches (never harness defaults). Deterministic, no LLM calls.",
+  "note": "Herdforge lane registry: constraint sections are VERBATIM from chainseer docs/agent/lane-registry.json (the parity contract for the shell->Go swap); lanes[] is the complete forge roster (FAC-127): scout, smith, assayer, orchestrator, scout-planner, verification-gate, review-supervisor, harvest, recovery-sentinel. FAC-142 SurfaceRouter.Decide owns live provider+model+effort+pool for worker and reviewer launches (never harness defaults). Deterministic, no LLM calls. The standing field here and the authority/capabilities/incompatible_with fields in .herd/herd.yaml are DECLARATIVE (FAC-127) — FAC-139 owns the executable launch-boundary that enforces them.",
   "provider_constraints": {
     "claude-haiku-4-5": {
       "forbid_standing": true,
