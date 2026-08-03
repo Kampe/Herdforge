@@ -10,22 +10,27 @@ import (
 	"time"
 )
 
-// fakeProviderTask models one task's revision/status in a fake provider
-// board, e.g. a Kaneo card.
+// fakeProviderTask models one task's revision/status/highest-accepted
+// fence token in a fake provider board, e.g. a Kaneo card.
 type fakeProviderTask struct {
-	revision int
-	status   string
+	revision  int
+	status    string
+	fenceHigh int64 // highest fence token ever accepted or advanced to
 }
 
-// fakeProviderCAS is a realistic revision-fenced test double: CompareAndSwap
-// checks the current revision against expected, calls mutate only on a
-// match, and bumps the revision -- optimistic concurrency exactly like a
-// real provider's ETag/updatedAt-based CAS. It counts every call so tests
-// can assert how many times the external mutation actually ran.
+// fakeProviderCAS is a realistic revision-AND-fence-checked test double:
+// CompareAndSwap checks the current revision against expected (optimistic
+// concurrency, like a real provider's ETag/updatedAt-based CAS) AND
+// fenceToken against the highest fence ever seen for that taskID
+// (monotonic fencing, per ProviderCAS's contract), calling mutate only if
+// both hold. It counts every call so tests can assert how many times the
+// external mutation actually ran, and separately tracks whether a call
+// was rejected specifically for staleness vs fencing.
 type fakeProviderCAS struct {
-	mu       sync.Mutex
-	tasks    map[string]*fakeProviderTask
-	casCalls int
+	mu              sync.Mutex
+	tasks           map[string]*fakeProviderTask
+	casCalls        int
+	fenceRejections int
 }
 
 func newFakeProviderCAS() *fakeProviderCAS {
@@ -74,13 +79,36 @@ func (f *fakeProviderCAS) callCount() int {
 	return f.casCalls
 }
 
-func (f *fakeProviderCAS) CompareAndSwap(ctx context.Context, taskID string, expected ProviderRevision, mutate func(ctx context.Context) error) (ProviderRevision, error) {
+func (f *fakeProviderCAS) fenceRejectionCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.fenceRejections
+}
+
+// CompareAndSwap implements ProviderCAS, enforcing fenceToken exactly as
+// the interface's contract requires: a fenceToken lower than the highest
+// ever accepted/advanced-to for taskID is rejected with
+// ErrProviderFenceRejected, no mutation applied, no revision bump --
+// regardless of whether expected matches the current revision. This is
+// checked BEFORE the revision check and BEFORE mutate is ever called, so
+// a fenced-out call has zero effect no matter what mutate would have
+// done.
+func (f *fakeProviderCAS) CompareAndSwap(ctx context.Context, taskID string, expected ProviderRevision, fenceToken int64, mutate func(ctx context.Context) error) (ProviderRevision, error) {
 	f.mu.Lock()
 	f.casCalls++
 	t, ok := f.tasks[taskID]
 	if !ok {
 		t = &fakeProviderTask{}
 		f.tasks[taskID] = t
+	}
+	if fenceToken < t.fenceHigh {
+		f.fenceRejections++
+		cur := ProviderRevision(fmt.Sprintf("%d", t.revision))
+		f.mu.Unlock()
+		return cur, fmt.Errorf("%w: fence token %d is behind %d for %s", ErrProviderFenceRejected, fenceToken, t.fenceHigh, taskID)
+	}
+	if fenceToken > t.fenceHigh {
+		t.fenceHigh = fenceToken
 	}
 	cur := ProviderRevision(fmt.Sprintf("%d", t.revision))
 	if cur != expected {
@@ -100,6 +128,21 @@ func (f *fakeProviderCAS) CompareAndSwap(ctx context.Context, taskID string, exp
 	}
 	t.revision++
 	return ProviderRevision(fmt.Sprintf("%d", t.revision)), nil
+}
+
+// AdvanceFence implements ProviderCAS.
+func (f *fakeProviderCAS) AdvanceFence(ctx context.Context, taskID string, fenceToken int64) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	t, ok := f.tasks[taskID]
+	if !ok {
+		t = &fakeProviderTask{}
+		f.tasks[taskID] = t
+	}
+	if fenceToken > t.fenceHigh {
+		t.fenceHigh = fenceToken
+	}
+	return nil
 }
 
 var _ ProviderCAS = (*fakeProviderCAS)(nil)
@@ -269,7 +312,7 @@ func TestClaimManager_ProviderSuccessLocalFailure_ReconciliationClosesWithoutRep
 	if claimed == nil {
 		t.Fatal("expected the manual claim to succeed")
 	}
-	if _, err := provider.CompareAndSwap(ctx, "FAC-32", "1", func(ctx context.Context) error {
+	if _, err := provider.CompareAndSwap(ctx, "FAC-32", "1", lease.Generation, func(ctx context.Context) error {
 		provider.setStatus("FAC-32", "in-progress")
 		return nil
 	}); err != nil {
@@ -892,5 +935,100 @@ func TestSQLiteLeaseStore_ExpireStale_HonorsProviderLockStaleness(t *testing.T) 
 	}
 	if len(nowExpired) != 1 || nowExpired[0].Generation != lease.Generation {
 		t.Fatalf("expected the lease to expire once the crashed lock itself went stale, got %+v", nowExpired)
+	}
+}
+
+// TestClaimManager_ProviderFencing_RejectsStaleCASAfterSixMinutePause is
+// the review's exact scenario, reproduced precisely: a settler holds the
+// provider-transition lock and pauses mid-CAS (simulating a slow or
+// GC-stalled in-flight external call -- NOT a context we can cancel,
+// since from another process's perspective it may as well be a crash).
+// The fake clock advances six minutes -- past the lock's five-minute
+// staleness window -- expiry sweeps the now-genuinely-abandoned lease,
+// and a new owner reclaims it (generation 2). ONLY THEN does the
+// "paused" CompareAndSwap call finally resume and reach the provider,
+// carrying the OLD generation (1) as its fence token.
+//
+// A local lock timeout cannot prove that external call has stopped --
+// that's exactly the review's point, and this test does not pretend
+// otherwise: the reclaim happens, and the stale call genuinely reaches
+// CompareAndSwap. Safety instead comes from the provider itself: because
+// ClaimManager.Claim called AdvanceFence(taskID, 2) as part of the
+// reclaim, the provider's highest-accepted fence for this taskID is now
+// 2, and the resumed call's fence token of 1 is rejected --
+// unconditionally, before revision is even checked, before mutate is
+// ever invoked -- with zero effect on provider state. Liveness is
+// preserved throughout: the lease was NOT blocked forever (reclaimed
+// after the bounded 5-minute window, not indefinitely).
+func TestClaimManager_ProviderFencing_RejectsStaleCASAfterSixMinutePause(t *testing.T) {
+	store := newTestStore(t)
+	outbox := newTestOutbox(t)
+	provider := newFakeProviderCAS()
+	provider.seed("FAC-47", "to-do", 1)
+	clk := newClock(time.Now())
+	mgr := NewClaimManager(store, WithProviderCAS(provider), WithDurableOutbox(outbox), WithClock(clk.now), WithTTL(time.Minute))
+	ctx := context.Background()
+	key := testKey("FAC-47")
+
+	lease, err := mgr.Claim(ctx, ClaimRequest{Key: key, OwnerID: "w1", Role: "herd-smith", TaskRole: "herd-smith"})
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	rec, err := mgr.BeginProviderTransition(ctx, key, "w1", lease.Generation, "provider_mutation")
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+
+	claimAt := clk.now()
+	claimedOutbox, err := outbox.Claim(ctx, rec.IdempotencyKey, "paused-settler", mgr.providerLockTimeout, claimAt)
+	if err != nil {
+		t.Fatalf("manual outbox claim: %v", err)
+	}
+	if claimedOutbox == nil {
+		t.Fatal("expected the manual outbox claim to succeed")
+	}
+	if _, err := store.AcquireProviderLock(ctx, key, "w1", lease.Generation, "paused-settler", mgr.providerLockTimeout, claimAt); err != nil {
+		t.Fatalf("acquire provider lock: %v", err)
+	}
+	// The provider-transition lock is now held, exactly as if
+	// CompleteProviderTransition were paused immediately before its
+	// ProviderCAS call.
+
+	// Six minutes pass: past both the 1-minute TTL and the 5-minute
+	// provider-lock staleness window.
+	clk.advance(providerLockStaleAfter + time.Minute)
+
+	expired, err := mgr.ExpireStale(ctx)
+	if err != nil {
+		t.Fatalf("expire stale: %v", err)
+	}
+	if len(expired) != 1 || expired[0].Generation != lease.Generation {
+		t.Fatalf("expected the lease to expire once the lock itself went stale (liveness preserved), got %+v", expired)
+	}
+
+	replacement, err := mgr.Claim(ctx, ClaimRequest{Key: key, OwnerID: "w2", Role: "herd-smith", TaskRole: "herd-smith"})
+	if err != nil {
+		t.Fatalf("reclaim: %v", err)
+	}
+	if replacement.Generation != lease.Generation+1 {
+		t.Fatalf("expected the replacement to be generation %d, got %d", lease.Generation+1, replacement.Generation)
+	}
+
+	// The paused CAS finally "resumes": it reaches the provider carrying
+	// the OLD generation as its fence token, with the revision it
+	// originally read before pausing.
+	_, casErr := provider.CompareAndSwap(ctx, "FAC-47", "1", lease.Generation, func(ctx context.Context) error {
+		provider.setStatus("FAC-47", "mutated-by-stale-generation-1-call")
+		return nil
+	})
+
+	if !errors.Is(casErr, ErrProviderFenceRejected) {
+		t.Fatalf("expected the resumed stale-generation call to be rejected with ErrProviderFenceRejected, got %v", casErr)
+	}
+	if status := provider.statusOf("FAC-47"); status != "to-do" {
+		t.Fatalf("expected zero stale provider effect (status unchanged from seed), got %q", status)
+	}
+	if got := provider.fenceRejectionCount(); got != 1 {
+		t.Fatalf("expected exactly 1 fence rejection, got %d", got)
 	}
 }

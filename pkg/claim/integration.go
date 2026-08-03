@@ -1,12 +1,23 @@
 package claim
 
-import "context"
+import (
+	"context"
+	"errors"
+)
 
 // ProviderRevision is an opaque, provider-supplied compare-and-swap token
 // (e.g. Kaneo's updatedAt, GitHub's ETag/SHA, Jira's version). pkg/claim
 // does not interpret this string; it is plumbing for whoever mutates the
 // provider board on the strength of a lease.
 type ProviderRevision string
+
+// ErrProviderFenceRejected is the sentinel a ProviderCAS implementation
+// should wrap when it rejects a CompareAndSwap call because fenceToken is
+// stale (lower than the highest fence token it has already accepted or
+// been advanced to for that taskID) -- distinct from
+// ErrProviderRevisionStale, which is about the task's own business-state
+// revision, not lease ownership.
+var ErrProviderFenceRejected = errors.New("claim: provider rejected a stale fencing token")
 
 // ProviderCAS is the narrow hook a lifecycle/outbox integration supplies
 // to make provider board mutations revision-checked (optimistic
@@ -15,19 +26,59 @@ type ProviderRevision string
 // not call a provider itself (see LeaseStore's boundary comment on why
 // pkg/provider was decoupled from this package) — this interface exists
 // so FAC-119's lifecycle service and pkg/claim agree on the contract
-// shape ahead of that wiring landing, not because anything here invokes
-// it yet.
+// shape ahead of that wiring landing.
 //
-// FAC-120 does not implement or call ProviderCAS: defining the interface
-// without wiring it is a deliberate, incomplete step toward FAC-119
-// integration, not a claim that provider CAS is handled.
+// # Why a fencing token, not just a local lock
+//
+// pkg/claim's AcquireProviderLock/ReleaseProviderLock give a lease
+// exclusive local rights to attempt a provider mutation, but a LOCAL
+// lock -- even one with a staleness timeout for crash recovery -- can
+// never prove an in-flight external CompareAndSwap call has actually
+// stopped. A settler that appears crashed (its lock timed out) may still
+// have a request in flight to the provider, arbitrarily delayed by the
+// network or a GC pause, that lands after a new generation has already
+// reclaimed the lease. A local timeout is a liveness bound (the LEASE
+// becomes reclaimable again), never a safety proof (the OLD call is
+// done) -- those are different properties and conflating them is exactly
+// the classic distributed-lock-with-timeout hazard (see e.g. Kleppmann's
+// "How to do distributed locking").
+//
+// The only sound fix is fencing at the resource itself: fenceToken must
+// be a value that only increases across the lifetime of a taskID (pkg/
+// claim always passes the lease generation). Implementations MUST
+// durably record the highest fenceToken ever accepted or advanced to
+// for taskID, and MUST reject -- without calling mutate, without
+// applying any effect -- any CompareAndSwap whose fenceToken is lower
+// than that recorded value, wrapping ErrProviderFenceRejected. This is
+// what makes a stale call from a superseded generation harmless no
+// matter how late it arrives: rejection happens at the provider, not by
+// pkg/claim guessing whether enough time has passed.
+//
+// FAC-120 does not implement a real ProviderCAS against Kaneo/GitHub/etc
+// -- that's still FAC-119's to build -- but pkg/claim's own test double
+// (fakeProviderCAS) implements this contract for real and is what the
+// package's fencing-safety tests exercise.
 type ProviderCAS interface {
-	// CompareAndSwap applies mutate only if the task's current revision
-	// still equals expected; returns the task's new revision on success.
-	// Implementations should make a revision mismatch distinguishable
-	// (e.g. a sentinel error) so callers can re-read and retry instead of
-	// silently overwriting a concurrent change.
-	CompareAndSwap(ctx context.Context, taskID string, expected ProviderRevision, mutate func(ctx context.Context) error) (ProviderRevision, error)
+	// CompareAndSwap applies mutate only if BOTH the task's current
+	// revision equals expected AND fenceToken is not stale (see above).
+	// Returns the task's new revision on success. A revision mismatch
+	// should be distinguishable from a fencing rejection (e.g. via
+	// ErrProviderRevisionStale vs ErrProviderFenceRejected) so callers
+	// can tell "someone else changed the task" from "my lease is gone"
+	// apart, though pkg/claim currently treats any CompareAndSwap error
+	// the same way (mark the outbox intent Failed).
+	CompareAndSwap(ctx context.Context, taskID string, expected ProviderRevision, fenceToken int64, mutate func(ctx context.Context) error) (ProviderRevision, error)
+
+	// AdvanceFence durably records fenceToken as the new minimum accepted
+	// fence for taskID if fenceToken is greater than what's currently
+	// recorded; a no-op (not an error) if it's not greater. Applies no
+	// business-state mutation. pkg/claim calls this whenever a lease
+	// reclaims to a new generation (see ClaimManager.Claim), specifically
+	// so that a superseded generation's CompareAndSwap is rejected even
+	// if the NEW generation never itself calls CompareAndSwap -- without
+	// this, a fence check alone cannot protect a reclaim that the new
+	// owner never engages the provider for.
+	AdvanceFence(ctx context.Context, taskID string, fenceToken int64) error
 }
 
 // OutboxIntent is one durable, idempotent side effect a lease transition

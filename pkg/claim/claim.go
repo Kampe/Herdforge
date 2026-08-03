@@ -197,6 +197,21 @@ func (m *ClaimManager) Claim(ctx context.Context, req ClaimRequest) (*Lease, err
 		return nil, err
 	}
 
+	// Reclaim (generation > 1): tell the provider about the new
+	// generation as early as possible, before anything else, so a
+	// superseded generation's ProviderCAS call -- however late it
+	// eventually arrives -- gets rejected by the provider's own fencing
+	// check rather than relying on a local lock's staleness timeout to
+	// prove the old call has stopped (it can't; see ProviderCAS's doc
+	// comment). Best-effort: a failure here does not block the claim
+	// (liveness), but does leave a narrow residual window where a stale
+	// call could still land if the new generation itself never calls
+	// CompleteProviderTransition (which would otherwise also advance the
+	// fence via its own fenceToken).
+	if m.provider != nil && lease.Generation > 1 {
+		_ = m.provider.AdvanceFence(ctx, req.Key.TaskRef, lease.Generation)
+	}
+
 	// Acquire durably evicts (Expires) any stale prior lease for this key
 	// as part of winning the claim, which is exactly what makes that
 	// lease's row claimable via ClaimCapacityRelease. Settle it now,

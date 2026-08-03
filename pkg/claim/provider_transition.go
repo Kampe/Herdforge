@@ -120,26 +120,29 @@ func (m *ClaimManager) BeginProviderTransition(ctx context.Context, key LeaseKey
 // underlying lease -- the caller still holds it and may retry with a
 // freshly-read revision.
 //
-// ownerID/generation are checked twice, but the two checks are NOT
-// equivalent and the second is not just "ask again": the first
-// (verifyCurrentLease) is a cheap read-only fast-fail before the outbox
-// is even touched. Two read-only checks cannot close a TOCTOU race --
-// whatever the second check observes can still go stale before
-// CompareAndSwap actually runs. The real fencing boundary is the second
-// check: LeaseStore.AcquireProviderLock, which verifies AND locks the
-// lease against Release/reclaim in a single atomic store operation, so
-// there is no window between "confirmed current" and "locked" for a
-// concurrent Release/reclaim to land in. The lock is held for the
-// duration of the ProviderCAS call and released (successful or not) via
-// a deferred ReleaseProviderLock, so Release/reclaim are blocked --
-// returning ErrProviderTransitionInProgress -- for exactly as long as
-// the provider call is actually in flight, not held preemptively. A
-// crash while the lock is held self-heals: Release/Acquire's reclaim
-// path stop honoring a lock once it's older than the store's fixed
-// staleness window, so a dead settler cannot block a lease forever.
-// Either check failing returns ErrLeaseNotCurrent and guarantees zero
-// ProviderCAS calls; a lock-acquisition failure also marks the outbox
-// record Failed so it does not sit claimed and orphaned.
+// ownerID/generation are checked twice: verifyCurrentLease is a cheap
+// read-only fast-fail before the outbox is even touched, then
+// LeaseStore.AcquireProviderLock verifies AND locks the lease against
+// Release/reclaim in a single atomic store operation, held for the
+// ProviderCAS call's duration via a deferred ReleaseProviderLock.
+//
+// IMPORTANT: the lock alone is a LIVENESS mechanism, not a safety proof.
+// It stops Release and a live reclaim attempt from racing a live
+// in-flight call, and it stops wasteful concurrent CompareAndSwap
+// attempts -- but its staleness timeout (crash recovery, so a dead
+// settler cannot block a lease forever) is explicitly NOT trusted to
+// prove the old call has actually stopped: a settler that looks crashed
+// may still have a request in flight to the provider. Safety against
+// THAT case -- a stale call from a superseded generation eventually
+// landing -- comes from generation as an unforgeable fencing token
+// passed to ProviderCAS.CompareAndSwap, which conforming implementations
+// must durably reject once superseded (see ProviderCAS's doc comment),
+// combined with ClaimManager.Claim calling AdvanceFence on every reclaim
+// so the provider knows a generation is superseded even if the new
+// owner never itself calls CompareAndSwap. Either check failing before
+// this point returns ErrLeaseNotCurrent and guarantees zero ProviderCAS
+// calls; a lock-acquisition failure also marks the outbox record Failed
+// so it does not sit claimed and orphaned.
 func (m *ClaimManager) CompleteProviderTransition(ctx context.Context, key LeaseKey, ownerID string, generation int64, taskID string, expectedRevision ProviderRevision, mutate func(ctx context.Context) error) (*OutboxRecord, error) {
 	if m.provider == nil {
 		return nil, ErrProviderNotConfigured
@@ -177,7 +180,7 @@ func (m *ClaimManager) CompleteProviderTransition(ctx context.Context, key Lease
 		completeProviderTransitionTestHook()
 	}
 
-	if _, casErr := m.provider.CompareAndSwap(ctx, taskID, expectedRevision, mutate); casErr != nil {
+	if _, casErr := m.provider.CompareAndSwap(ctx, taskID, expectedRevision, generation, mutate); casErr != nil {
 		_ = m.outboxStore.MarkFailed(ctx, idempotencyKey, m.settlerID, casErr.Error(), m.now())
 		return m.outboxStore.Get(ctx, idempotencyKey)
 	}
