@@ -1,6 +1,7 @@
 package reviewsup
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -1109,5 +1110,117 @@ func TestIngestStaleSHAGenerationRejected_RepairProbe(t *testing.T) {
 	}
 	if sv.Candidate("sha-a").State != StateEvicted {
 		t.Error("original candidate must be evicted after a valid newer-generation supersede")
+	}
+}
+
+// TestBuilderHandoffDurableRoundTrip_RepairProbe: a FAIL/BLOCKED verdict must
+// leave a durable, queryable handoff for the owning builder — not just an
+// in-memory state transition — and MarkBuilderDelivered must ack it so it is
+// not redelivered.
+func TestBuilderHandoffDurableRoundTrip_RepairProbe(t *testing.T) {
+	sv := svc(t)
+	sv.LaunchReview("bbb222", "claude", "claude-3-7-sonnet")
+	if _, err := sv.SubmitVerdict(ReviewVerdict{
+		SHA:      "bbb222",
+		Reviewer: "claude",
+		Verdict:  VerdictFAIL,
+		Reason:   "off-by-one in calc()",
+	}); err != nil {
+		t.Fatalf("SubmitVerdict: %v", err)
+	}
+
+	handoffs, err := sv.ReadyForBuilder(10)
+	if err != nil {
+		t.Fatalf("ReadyForBuilder: %v", err)
+	}
+	if len(handoffs) != 1 {
+		t.Fatalf("expected 1 pending builder handoff, got %d", len(handoffs))
+	}
+	if handoffs[0].SHA != "bbb222" || handoffs[0].Findings != "off-by-one in calc()" {
+		t.Errorf("unexpected handoff: %+v", handoffs[0])
+	}
+
+	if err := sv.MarkBuilderDelivered("bbb222"); err != nil {
+		t.Fatalf("MarkBuilderDelivered: %v", err)
+	}
+
+	handoffs2, err := sv.ReadyForBuilder(10)
+	if err != nil {
+		t.Fatalf("ReadyForBuilder after ack: %v", err)
+	}
+	if len(handoffs2) != 0 {
+		t.Errorf("expected 0 pending handoffs after ack, got %d", len(handoffs2))
+	}
+}
+
+// TestBuilderHandoffDurableOnDirectBlocked_RepairProbe covers the explicit
+// VerdictBLOCKED submission path (a reviewer directly blocking, as opposed
+// to a FAIL exhausting the retry limit) — a separate code branch that must
+// also durably hand off findings to the builder.
+func TestBuilderHandoffDurableOnDirectBlocked_RepairProbe(t *testing.T) {
+	sv := svc(t)
+	sv.LaunchReview("bbb222", "claude", "claude-3-7-sonnet")
+	if _, err := sv.SubmitVerdict(ReviewVerdict{
+		SHA:      "bbb222",
+		Reviewer: "claude",
+		Verdict:  VerdictBLOCKED,
+		Reason:   "unsafe pattern, do not retry",
+	}); err != nil {
+		t.Fatalf("SubmitVerdict: %v", err)
+	}
+
+	handoffs, err := sv.ReadyForBuilder(10)
+	if err != nil {
+		t.Fatalf("ReadyForBuilder: %v", err)
+	}
+	if len(handoffs) != 1 {
+		t.Fatalf("expected 1 pending builder handoff for direct BLOCKED, got %d", len(handoffs))
+	}
+	if handoffs[0].Verdict != VerdictBLOCKED || handoffs[0].Findings != "unsafe pattern, do not retry" {
+		t.Errorf("unexpected handoff: %+v", handoffs[0])
+	}
+}
+
+// TestReconstructBackfillsMissingBuilderCallback_RepairProbe: a ledger
+// written by an older version that recorded a terminal FAIL/BLOCKED verdict
+// without the durable builder_callback event must have one backfilled on
+// replay, so the handoff is never silently lost.
+func TestReconstructBackfillsMissingBuilderCallback_RepairProbe(t *testing.T) {
+	dir := t.TempDir()
+	cfg := DefaultConfig(dir)
+	cfg.Now = fixedNow
+	cfg.RetryLimit = 1 // FAIL on first attempt goes straight to BLOCKED
+
+	rows := []Row{
+		{Event: string(EventCompletion), SHA: "sha1", AuthorModel: "claude", AuthorFamily: "anthropic", Tier: string(TierR1)},
+		{Event: string(EventReview), SHA: "sha1", Reviewer: "gemini", ReviewFamily: "google", Tier: string(TierR1), Attempts: 1},
+		{Event: string(EventVerdict), SHA: "sha1", Reviewer: "gemini", Verdict: string(VerdictBLOCKED), Reason: "critical bug"},
+	}
+	f, err := os.Create(cfg.LedgerPath)
+	if err != nil {
+		t.Fatalf("create ledger: %v", err)
+	}
+	enc := json.NewEncoder(f)
+	for _, r := range rows {
+		if err := enc.Encode(r); err != nil {
+			t.Fatalf("encode row: %v", err)
+		}
+	}
+	f.Close()
+
+	sv := New(cfg)
+	if _, err := sv.Reconstruct(); err != nil {
+		t.Fatalf("Reconstruct: %v", err)
+	}
+
+	handoffs, err := sv.ReadyForBuilder(10)
+	if err != nil {
+		t.Fatalf("ReadyForBuilder: %v", err)
+	}
+	if len(handoffs) != 1 {
+		t.Fatalf("expected backfilled handoff for sha1, got %d", len(handoffs))
+	}
+	if handoffs[0].Findings != "critical bug" {
+		t.Errorf("backfilled findings = %q, want %q", handoffs[0].Findings, "critical bug")
 	}
 }

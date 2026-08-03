@@ -15,13 +15,15 @@ import (
 type EventType string
 
 const (
-	EventCompletion EventType = "completion"
-	EventReview     EventType = "review"
-	EventVerdict    EventType = "verdict"
-	EventSupersede  EventType = "supersede"
-	EventEvict      EventType = "evict"
-	EventHarvest    EventType = "harvest"
-	EventCapacity   EventType = "capacity"
+	EventCompletion      EventType = "completion"
+	EventReview          EventType = "review"
+	EventVerdict         EventType = "verdict"
+	EventSupersede       EventType = "supersede"
+	EventEvict           EventType = "evict"
+	EventHarvest         EventType = "harvest"
+	EventCapacity        EventType = "capacity"
+	EventBuilderCallback EventType = "builder_callback"
+	EventBuilderAck      EventType = "builder_ack"
 )
 
 type Verdict string
@@ -526,8 +528,28 @@ func (sv *ReviewSupervisor) SubmitVerdict(v ReviewVerdict) (newState CandidateSt
 		cand.State = StateHarvested
 
 	case VerdictFAIL:
-		sv.pendingCount--
+		effective := VerdictFAIL
 		if cand.Attempts >= sv.cfg.RetryLimit {
+			effective = VerdictBLOCKED
+		}
+		sv.pendingCount--
+		// Durable handoff of findings to the owning builder. Written before
+		// any state transition so a crash cannot lose the repair packet.
+		if err := sv.appendRow(&Row{
+			Event:    string(EventBuilderCallback),
+			SHA:      v.SHA,
+			Reviewer: v.Reviewer,
+			Verdict:  string(effective),
+			Reason:   v.Reason,
+			Attempts: cand.Attempts,
+		}); err != nil {
+			sv.pendingCount++
+			cand.Verdict = ""
+			cand.VerdictReason = ""
+			cand.UpdatedAt = sv.now()
+			return "", fmt.Errorf("reviewsup: append builder callback row: %w", err)
+		}
+		if effective == VerdictBLOCKED {
 			cand.State = StateBlocked
 			cand.Verdict = VerdictBLOCKED
 		} else {
@@ -538,8 +560,23 @@ func (sv *ReviewSupervisor) SubmitVerdict(v ReviewVerdict) (newState CandidateSt
 		}
 
 	case VerdictBLOCKED:
-		cand.State = StateBlocked
 		sv.pendingCount--
+		// Durable handoff of findings to the owning builder (terminal).
+		if err := sv.appendRow(&Row{
+			Event:    string(EventBuilderCallback),
+			SHA:      v.SHA,
+			Reviewer: v.Reviewer,
+			Verdict:  string(VerdictBLOCKED),
+			Reason:   v.Reason,
+			Attempts: cand.Attempts,
+		}); err != nil {
+			sv.pendingCount++
+			cand.Verdict = ""
+			cand.VerdictReason = ""
+			cand.UpdatedAt = sv.now()
+			return "", fmt.Errorf("reviewsup: append builder callback row: %w", err)
+		}
+		cand.State = StateBlocked
 	}
 
 	return cand.State, nil
@@ -662,6 +699,92 @@ func (sv *ReviewSupervisor) MarkHarvested(sha string) error {
 	return nil
 }
 
+// BuilderHandoff is a durable repair packet returned to the owning builder
+// after a FAIL or BLOCKED verdict.
+type BuilderHandoff struct {
+	SHA      string
+	Reviewer string
+	Verdict  Verdict
+	Findings string
+	Attempts int
+}
+
+// ReadyForBuilder returns undelivered builder handoffs for candidates still
+// owned by the builder flow (pending repair or terminally blocked).
+func (sv *ReviewSupervisor) ReadyForBuilder(max int) ([]BuilderHandoff, error) {
+	sv.mu.RLock()
+	defer sv.mu.RUnlock()
+
+	rows, err := readRows(sv.cfg.LedgerPath)
+	if err != nil {
+		return nil, err
+	}
+
+	// Latest un-acked callback per SHA wins; an ack clears all earlier ones.
+	pending := make(map[string]Row)
+	var order []string
+	for _, r := range rows {
+		switch EventType(r.Event) {
+		case EventBuilderCallback:
+			if _, seen := pending[r.SHA]; !seen {
+				order = append(order, r.SHA)
+			}
+			pending[r.SHA] = r
+		case EventBuilderAck:
+			delete(pending, r.SHA)
+		}
+	}
+
+	var result []BuilderHandoff
+	for _, sha := range order {
+		r, ok := pending[sha]
+		if !ok {
+			continue
+		}
+		cand, ok := sv.cands[sha]
+		if !ok {
+			continue
+		}
+		if cand.State != StatePending && cand.State != StateBlocked {
+			continue
+		}
+		result = append(result, BuilderHandoff{
+			SHA:      sha,
+			Reviewer: r.Reviewer,
+			Verdict:  Verdict(r.Verdict),
+			Findings: r.Reason,
+			Attempts: r.Attempts,
+		})
+	}
+
+	sort.Slice(result, func(i, j int) bool {
+		return result[i].SHA < result[j].SHA
+	})
+
+	if max > 0 && len(result) > max {
+		result = result[:max]
+	}
+
+	return result, nil
+}
+
+// MarkBuilderDelivered durably acks a builder handoff for the given SHA.
+func (sv *ReviewSupervisor) MarkBuilderDelivered(sha string) error {
+	sv.mu.Lock()
+	defer sv.mu.Unlock()
+
+	if _, ok := sv.cands[sha]; !ok {
+		return fmt.Errorf("reviewsup: unknown candidate %s", sha)
+	}
+	if err := sv.appendRow(&Row{
+		Event: string(EventBuilderAck),
+		SHA:   sha,
+	}); err != nil {
+		return fmt.Errorf("reviewsup: append builder ack row: %w", err)
+	}
+	return nil
+}
+
 func (sv *ReviewSupervisor) EvictStale() (int, error) {
 	sv.mu.Lock()
 	defer sv.mu.Unlock()
@@ -712,7 +835,15 @@ func (sv *ReviewSupervisor) Reconstruct() (int, error) {
 	sv.pendingCount = 0
 	sv.evrows = nil
 
-	for _, r := range rows {
+	// Track terminal FAIL/BLOCKED verdicts and builder handoff rows by ledger
+	// position so missing handoffs (written by older versions) can be
+	// backfilled after replay.
+	lastVerdictRow := make(map[string]Row)
+	lastVerdictAt := make(map[string]int)
+	lastCallbackAt := make(map[string]int)
+	lastAckAt := make(map[string]int)
+
+	for i, r := range rows {
 		sv.evrows = append(sv.evrows, r)
 
 		switch EventType(r.Event) {
@@ -770,15 +901,20 @@ func (sv *ReviewSupervisor) Reconstruct() (int, error) {
 					cand.State = StatePass
 					sv.pendingCount--
 				case VerdictFAIL:
+					lastVerdictAt[r.SHA] = i
+					lastVerdictRow[r.SHA] = r
 					sv.pendingCount--
 					if cand.Attempts >= sv.cfg.RetryLimit {
 						cand.State = StateBlocked
+						cand.Verdict = VerdictBLOCKED
 					} else {
 						cand.State = StatePending
 						cand.Reviewer = ""
 						cand.ReviewFamily = ""
 					}
 				case VerdictBLOCKED:
+					lastVerdictAt[r.SHA] = i
+					lastVerdictRow[r.SHA] = r
 					cand.State = StateBlocked
 					sv.pendingCount--
 				}
@@ -802,6 +938,12 @@ func (sv *ReviewSupervisor) Reconstruct() (int, error) {
 				}
 			}
 
+		case EventBuilderCallback:
+			lastCallbackAt[r.SHA] = i
+
+		case EventBuilderAck:
+			lastAckAt[r.SHA] = i
+
 		case EventCapacity:
 		}
 	}
@@ -816,6 +958,39 @@ func (sv *ReviewSupervisor) Reconstruct() (int, error) {
 			if cand, ok := sv.cands[r.SHA]; ok {
 				cand.State = StateHarvested
 			}
+		}
+	}
+
+	// Terminal-event backfill: candidates stuck at a FAIL/BLOCKED terminal
+	// verdict without a durable builder handoff get one appended now.
+	for sha, vIdx := range lastVerdictAt {
+		cand, ok := sv.cands[sha]
+		if !ok {
+			continue
+		}
+		if cand.State != StateBlocked && !(cand.State == StatePending && cand.Verdict == VerdictFAIL) {
+			continue
+		}
+		if cbIdx, ok := lastCallbackAt[sha]; ok && cbIdx > vIdx {
+			continue
+		}
+		if ackIdx, ok := lastAckAt[sha]; ok && ackIdx > vIdx {
+			continue
+		}
+		vr := lastVerdictRow[sha]
+		bv := VerdictFAIL
+		if cand.Verdict == VerdictBLOCKED || vr.Verdict == string(VerdictBLOCKED) {
+			bv = VerdictBLOCKED
+		}
+		if err := sv.appendRow(&Row{
+			Event:    string(EventBuilderCallback),
+			SHA:      sha,
+			Reviewer: vr.Reviewer,
+			Verdict:  string(bv),
+			Reason:   vr.Reason,
+			Attempts: cand.Attempts,
+		}); err != nil {
+			return 0, fmt.Errorf("reviewsup: backfill builder callback for %s: %w", sha, err)
 		}
 	}
 
@@ -867,4 +1042,3 @@ func (sv *ReviewSupervisor) Candidate(sha string) *Candidate {
 	cp := *c
 	return &cp
 }
-
