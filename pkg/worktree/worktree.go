@@ -275,6 +275,18 @@ func (w *WorktreeManager) CreateTaskWorktreeFrom(ctx context.Context, taskRef, d
 		return nil, fmt.Errorf("failed to create worktree root directory: %w", err)
 	}
 
+	// Containment gate (FAC-152): refuse to create a new registered worktree
+	// nested inside another registered worktree — the shape observed at
+	// pkg/dispatch/.herd/worktrees/fac-1 nested inside the FAC-64 task
+	// worktree. Runs once, before either git worktree add path below.
+	registered, err := w.ListWorktrees(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to verify worktree containment: %w", err)
+	}
+	if err := RejectContainedDestination(w.RepoRoot, targetPath, registered); err != nil {
+		return nil, err
+	}
+
 	// Branch exists without worktree: reattach with git worktree add (no -b).
 	if w.branchExists(ctx, branch) {
 		cmd := execCommandContext(ctx, "git", "worktree", "add", targetPath, branch)
