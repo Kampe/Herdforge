@@ -582,3 +582,78 @@ func TestTransitionAggregateOverflowFencesOlderReplayWithoutIncrementingAttempts
 		t.Fatalf("restored aggregate history changed: %+v", restoredSLO)
 	}
 }
+
+func configureReadyMetrics(t *testing.T, exp *MetricsExporter, now time.Time) {
+	t.Helper()
+	if err := exp.SetHealthAt(completeDependencies(), now); err != nil {
+		t.Fatal(err)
+	}
+	if err := exp.SetQueuePressureAt(QueuePressure{Depth: 0, Capacity: 1, Known: true}, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := exp.SetSignals(FleetSignals{LastReconciliation: now, ObservedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestInvalidTransitionRecoversAndClearsInvalidState(t *testing.T) {
+	now := time.Date(2026, 8, 3, 12, 0, 0, 0, time.UTC)
+	exp := NewMetricsExporterWithPersistence(nil, func() time.Time { return now })
+	configureReadyMetrics(t, exp, now)
+	if err := exp.RecordTransitionObservation(now.Add(time.Second), now, errors.New("callback failed"), now, 2); err == nil {
+		t.Fatal("invalid failed latency was accepted")
+	}
+	if view := exp.ReadAt(now); view.Freshness.SLOFresh || view.Freshness.Ready {
+		t.Fatalf("invalid SLO was reported fresh or ready: %+v", view.Freshness)
+	}
+	if err := exp.RecordTransitionObservation(now, now.Add(time.Second), nil, now.Add(time.Second), 3); err != nil {
+		t.Fatal(err)
+	}
+	_, _, slo := exp.Snapshot()
+	if slo.Invalid || slo.InvalidReason != "" || slo.Attempts != 1 || slo.Completed != 1 || slo.Sequence != 3 {
+		t.Fatalf("valid recovery did not clear invalid state while preserving history: %+v", slo)
+	}
+	if view := exp.ReadAt(now.Add(time.Second)); !view.Freshness.SLOFresh || !view.Freshness.Ready {
+		t.Fatalf("valid recovery did not restore SLO freshness/readiness: %+v", view.Freshness)
+	}
+}
+
+func TestPersistedInvalidTransitionRecoversAfterRestore(t *testing.T) {
+	now := time.Date(2026, 8, 3, 12, 0, 0, 0, time.UTC)
+	store := &memoryStateStore{}
+	exp := NewMetricsExporterWithPersistence(store, func() time.Time { return now })
+	configureReadyMetrics(t, exp, now)
+	if err := exp.RecordTransitionObservation(now.Add(time.Second), now, nil, now, 2); err == nil {
+		t.Fatal("invalid latency was accepted")
+	}
+	if err := exp.Persist(context.Background()); err != nil {
+		t.Fatalf("invalid SLO was not persisted: %v", err)
+	}
+	restored := NewMetricsExporterWithPersistence(store, func() time.Time { return now })
+	if err := restored.Restore(context.Background()); err != nil {
+		t.Fatalf("invalid SLO did not restore: %v", err)
+	}
+	if err := restored.RecordTransitionObservation(now, now.Add(2*time.Second), nil, now.Add(time.Second), 3); err != nil {
+		t.Fatal(err)
+	}
+	_, _, slo := restored.Snapshot()
+	if slo.Invalid || slo.InvalidReason != "" || slo.Attempts != 1 || slo.Completed != 1 || slo.Sequence != 3 {
+		t.Fatalf("restored valid recovery did not clear invalid state: %+v", slo)
+	}
+}
+
+func TestInvalidFailedTransitionRetryIsCanonicalIdempotent(t *testing.T) {
+	now := time.Date(2026, 8, 3, 12, 0, 0, 0, time.UTC)
+	exp := NewMetricsExporterWithPersistence(nil, func() time.Time { return now })
+	failure := errors.New("callback failed")
+	if err := exp.RecordTransitionObservation(now.Add(time.Second), now, failure, now, 7); err == nil {
+		t.Fatal("invalid failed transition was accepted")
+	}
+	if err := exp.RecordTransitionObservation(now.Add(time.Second), now, errors.New("same wire failure"), now, 7); err != nil {
+		t.Fatalf("exact invalid failed retry was not idempotent: %v", err)
+	}
+	_, _, slo := exp.Snapshot()
+	if !slo.Invalid || slo.InvalidReason != "latency" || !slo.LastFailed || slo.Attempts != 0 {
+		t.Fatalf("invalid failed retry changed canonical tombstone: %+v", slo)
+	}
+}

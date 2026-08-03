@@ -610,7 +610,7 @@ func (m *MetricsExporter) RecordTransitionObservation(start, end time.Time, tran
 	}
 	if invalidReason != "" {
 		m.slo.ObservedAt, m.slo.Sequence = now, sequence
-		m.slo.LastLatency, m.slo.LastFailed = 0, false
+		m.slo.LastLatency, m.slo.LastFailed = 0, failed
 		m.slo.Invalid, m.slo.InvalidReason = true, invalidReason
 		m.mu.Unlock()
 		return errors.New("transition latency is invalid or unbounded")
@@ -633,6 +633,7 @@ func (m *MetricsExporter) RecordTransitionObservation(start, end time.Time, tran
 	}
 	m.slo.ObservedAt, m.slo.Sequence = now, sequence
 	m.slo.LastLatency, m.slo.LastFailed = latency, failed
+	m.slo.Invalid, m.slo.InvalidReason = false, ""
 	m.mu.Unlock()
 	return nil
 }
