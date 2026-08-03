@@ -165,6 +165,9 @@ func (q QueuePressure) Validate() error {
 	if q.Depth < 0 || q.Capacity < 0 {
 		return errors.New("queue pressure cannot be negative")
 	}
+	if q.Known && q.Depth > q.Capacity {
+		return errors.New("queue depth cannot exceed capacity")
+	}
 	if !q.Known && (q.Depth != 0 || q.Capacity != 0) {
 		return errors.New("unknown queue pressure cannot carry measurements")
 	}
@@ -253,6 +256,11 @@ func (m *MetricsExporter) SetHealthAt(dependencies []DependencyHealth, observedA
 	}
 	health.ObservedAt = observedAt
 	m.mu.Lock()
+	if m.signals.DeadProvider && dependencyState(health, "provider") == DependencyHealthy {
+		m.health = UnknownHealthSnapshot()
+		m.mu.Unlock()
+		return errors.New("healthy provider contradicts dead-provider signal")
+	}
 	m.health = health
 	m.mu.Unlock()
 	return nil
@@ -291,9 +299,23 @@ func (m *MetricsExporter) SetSignals(signals FleetSignals) error {
 		return err
 	}
 	m.mu.Lock()
+	if signals.DeadProvider && dependencyState(m.health, "provider") == DependencyHealthy {
+		m.signals = FleetSignals{}
+		m.mu.Unlock()
+		return errors.New("dead-provider signal contradicts healthy provider")
+	}
 	m.signals = signals
 	m.mu.Unlock()
 	return nil
+}
+
+func dependencyState(health HealthSnapshot, name string) DependencyState {
+	for _, dependency := range health.Dependencies {
+		if dependency.Name == name {
+			return dependency.State
+		}
+	}
+	return DependencyUnknown
 }
 
 func (m *MetricsExporter) RecordTransition(start, end time.Time, transitionErr error, now time.Time) {
@@ -387,7 +409,8 @@ func (m *MetricsExporter) Restore(ctx context.Context) error {
 	if state.Version != 1 {
 		return invalidRestore(fmt.Errorf("unsupported metrics state version %d", state.Version))
 	}
-	if _, err := BuildHealthSnapshot(state.Health.Dependencies); err != nil || !observationFresh(state.Health.ObservedAt, m.now()) {
+	rebuiltHealth, healthErr := BuildHealthSnapshot(state.Health.Dependencies)
+	if healthErr != nil || !observationFresh(state.Health.ObservedAt, m.now()) || !state.Health.Liveness || state.Health.Readiness != rebuiltHealth.Readiness {
 		return invalidRestore(errors.New("invalid persisted health state"))
 	}
 	if err := state.Queue.Validate(); err != nil || !observationFresh(state.Queue.ObservedAt, m.now()) {
@@ -395,6 +418,9 @@ func (m *MetricsExporter) Restore(ctx context.Context) error {
 	}
 	if err := state.Signals.Validate(m.now(), maxSignalAge); err != nil {
 		return invalidRestore(fmt.Errorf("invalid persisted signals: %w", err))
+	}
+	if state.Signals.DeadProvider && dependencyState(state.Health, "provider") == DependencyHealthy {
+		return invalidRestore(errors.New("persisted dead-provider signal contradicts healthy provider"))
 	}
 	if state.SLO.Completed > state.SLO.Attempts || state.SLO.Failed > state.SLO.Attempts || state.SLO.Completed+state.SLO.Failed != state.SLO.Attempts {
 		return invalidRestore(errors.New("invalid persisted transition totals"))
