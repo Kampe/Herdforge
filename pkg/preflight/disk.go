@@ -17,6 +17,7 @@ package preflight
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -39,6 +40,11 @@ const (
 	// (git object writes, race binaries, archives). Default 0 (opt-in) so
 	// held packages' test shims stay valid; operators set it fleet-wide.
 	EnvDiskBuildHeadroomGB = "HERD_DISK_BUILD_HEADROOM_GB"
+	// Soft (serialize) floors: below these but above the block floor,
+	// mutation fan-out must drop to serial before any work is refused.
+	// Defaults: 2x the effective block floor / 2x the percent floor.
+	EnvDiskSerializeFreeGB  = "HERD_DISK_SERIALIZE_FREE_GB"
+	EnvDiskSerializeFreePct = "HERD_DISK_SERIALIZE_FREE_PCT"
 
 	defaultDiskMinFreeGB   = 15.0
 	defaultDiskMinFreePct  = 2.0
@@ -203,11 +209,9 @@ func (g *DiskGuard) LastEvidence() *DiskPressureError {
 	return g.lastEvidence
 }
 
-// Check probes every distinct volume under paths and fails closed on
-// pressure, recovery-in-progress, or an unreadable stat.
-func (g *DiskGuard) Check(operation string, paths ...string) error {
-	th := loadDiskThresholds()
-
+// probeAll probes every distinct volume under paths (deduped by fs
+// identity). An unreadable stat returns fail-closed BLOCKED evidence.
+func (g *DiskGuard) probeAll(operation string, th DiskThresholds, paths []string) ([]DiskStat, *DiskPressureError) {
 	var stats []DiskStat
 	seen := map[string]bool{}
 	for _, p := range paths {
@@ -216,7 +220,7 @@ func (g *DiskGuard) Check(operation string, paths ...string) error {
 		}
 		st, err := g.prober(p)
 		if err != nil {
-			pe := &DiskPressureError{
+			return nil, &DiskPressureError{
 				State:      "BLOCKED",
 				Reason:     ReasonStatUnreadable,
 				Operation:  operation,
@@ -224,17 +228,28 @@ func (g *DiskGuard) Check(operation string, paths ...string) error {
 				Detail:     fmt.Sprintf("cannot stat volume for %q (failing closed): %v", p, err),
 				NextAction: safeNextAction,
 			}
-			g.mu.Lock()
-			g.state = DiskBlocked
-			g.lastEvidence = pe
-			g.mu.Unlock()
-			return pe
 		}
 		if seen[st.FSID] {
 			continue
 		}
 		seen[st.FSID] = true
 		stats = append(stats, st)
+	}
+	return stats, nil
+}
+
+// Check probes every distinct volume under paths and fails closed on
+// pressure, recovery-in-progress, or an unreadable stat.
+func (g *DiskGuard) Check(operation string, paths ...string) error {
+	th := loadDiskThresholds()
+
+	stats, unreadable := g.probeAll(operation, th, paths)
+	if unreadable != nil {
+		g.mu.Lock()
+		g.state = DiskBlocked
+		g.lastEvidence = unreadable
+		g.mu.Unlock()
+		return unreadable
 	}
 
 	g.mu.Lock()
@@ -277,6 +292,73 @@ func (g *DiskGuard) Check(operation string, paths ...string) error {
 	g.state = DiskOK
 	g.lastEvidence = nil
 	return nil
+}
+
+// DiskAdvice is the graduated capacity decision: proceed at full
+// parallelism, serialize mutation fan-out, or refuse (fail closed).
+type DiskAdvice struct {
+	// Verdict is "proceed", "serialize", or "refuse".
+	Verdict string `json:"verdict"`
+	// MaxParallel is the advised mutation fan-out: 0 = no cap (proceed),
+	// 1 = fully serialized, and refuse means no new work at all.
+	MaxParallel int         `json:"max_parallel"`
+	Detail      string      `json:"detail,omitempty"`
+	Stats       []DiskStat  `json:"stats,omitempty"`
+	// Evidence is the structured refusal; non-nil only when Verdict is
+	// "refuse" (it is the same error Check would return).
+	Evidence *DiskPressureError `json:"evidence,omitempty"`
+}
+
+const (
+	AdviceProceed   = "proceed"
+	AdviceSerialize = "serialize"
+	AdviceRefuse    = "refuse"
+)
+
+// Advise is the graduated form of Check: serialize or reduce mutation
+// parallelism BEFORE rejecting all work. Below the block floor (or on an
+// unreadable stat) it refuses exactly like Check, driving the same state
+// machine; in the soft band (below 2x the effective floor by default,
+// configurable via HERD_DISK_SERIALIZE_FREE_GB/_PCT) it advises
+// MaxParallel=1. Fan-out call sites (verifier/mutation testing) consume
+// this; single-mutation call sites use Check directly.
+func (g *DiskGuard) Advise(operation string, paths ...string) DiskAdvice {
+	if err := g.Check(operation, paths...); err != nil {
+		var pe *DiskPressureError
+		errors.As(err, &pe)
+		return DiskAdvice{Verdict: AdviceRefuse, MaxParallel: 0, Evidence: pe,
+			Detail: err.Error()}
+	}
+
+	th := loadDiskThresholds()
+	softBytes := uint64(envFloat(EnvDiskSerializeFreeGB, 0) * bytesPerGiB)
+	if softBytes == 0 {
+		softBytes = 2 * th.blockFreeBytes()
+	}
+	softPct := envFloat(EnvDiskSerializeFreePct, 2*th.MinFreePct)
+
+	// Check passed, so a fresh probe here can only be a transient divergence;
+	// treat a now-unreadable stat conservatively as serialize, not proceed.
+	stats, unreadable := g.probeAll(operation, th, paths)
+	if unreadable != nil {
+		return DiskAdvice{Verdict: AdviceSerialize, MaxParallel: 1, Detail: unreadable.Detail}
+	}
+	if bad := below(stats, softBytes, softPct, 0); bad != nil {
+		return DiskAdvice{
+			Verdict:     AdviceSerialize,
+			MaxParallel: 1,
+			Stats:       stats,
+			Detail: fmt.Sprintf("volume %s free %.1fGiB (%.1f%%) inside soft band (< %.1fGiB / %.1f%%): serializing mutation fan-out before refusing work",
+				bad.Path, float64(bad.FreeBytes)/bytesPerGiB, bad.FreePct,
+				float64(softBytes)/bytesPerGiB, softPct),
+		}
+	}
+	return DiskAdvice{Verdict: AdviceProceed, Stats: stats}
+}
+
+// AdviseDiskPressure is Advise on the process-wide default guard.
+func AdviseDiskPressure(operation string, paths ...string) DiskAdvice {
+	return DefaultDiskGuard.Advise(operation, paths...)
 }
 
 // below returns the first stat under any enabled floor (zero disables an

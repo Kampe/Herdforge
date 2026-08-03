@@ -280,3 +280,48 @@ func TestDiskGuardBuildHeadroomIncludedInDecision(t *testing.T) {
 		t.Fatalf("recover floor = %d, want 22.5GiB", got)
 	}
 }
+
+func TestDiskGuardAdviseGraduatedShedding(t *testing.T) {
+	t.Setenv(EnvDiskMinFreeGB, "15")
+	t.Setenv(EnvDiskMinFreePct, "0")
+	st := healthyStat("/repo", "a")
+	g := NewDiskGuard(fakeProber(map[string]DiskStat{"/repo": st}, nil))
+
+	// Ample headroom (500GiB >> 2x15GiB soft floor): full parallelism.
+	adv := g.Advise("verifier_fanout", "/repo")
+	if adv.Verdict != AdviceProceed || adv.MaxParallel != 0 {
+		t.Fatalf("proceed expected: %+v", adv)
+	}
+
+	// Soft band: 20GiB is above the 15GiB block floor but below the 30GiB
+	// default soft floor — serialize before refusing any work.
+	st.FreeBytes = 20 << 30
+	g2 := NewDiskGuard(fakeProber(map[string]DiskStat{"/repo": st}, nil))
+	adv = g2.Advise("verifier_fanout", "/repo")
+	if adv.Verdict != AdviceSerialize || adv.MaxParallel != 1 {
+		t.Fatalf("serialize expected: %+v", adv)
+	}
+	if g2.Blocked() {
+		t.Fatal("serialize band must not mark the guard blocked")
+	}
+
+	// Below the block floor: refuse with the same structured evidence.
+	st.FreeBytes = 10 << 30
+	g3 := NewDiskGuard(fakeProber(map[string]DiskStat{"/repo": st}, nil))
+	adv = g3.Advise("verifier_fanout", "/repo")
+	if adv.Verdict != AdviceRefuse || adv.Evidence == nil || adv.Evidence.Reason != ReasonDiskPressure {
+		t.Fatalf("refuse expected: %+v", adv)
+	}
+	if !g3.Blocked() {
+		t.Fatal("refuse must drive the same state machine as Check")
+	}
+
+	// Soft floor is configurable: shrink it below 20GiB and the same
+	// volume proceeds at full parallelism.
+	t.Setenv(EnvDiskSerializeFreeGB, "16")
+	st.FreeBytes = 20 << 30
+	g4 := NewDiskGuard(fakeProber(map[string]DiskStat{"/repo": st}, nil))
+	if adv = g4.Advise("verifier_fanout", "/repo"); adv.Verdict != AdviceProceed {
+		t.Fatalf("configured soft floor ignored: %+v", adv)
+	}
+}
