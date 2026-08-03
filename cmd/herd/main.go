@@ -1920,17 +1920,18 @@ func configureProductionControl(d *dispatch.Dispatcher, root string) (func() err
 		if err != nil {
 			return nil, err
 		}
-		validate := func(_ context.Context, target control.WakeTarget) error {
+		validate := func(_ context.Context, target control.WakeTarget) (control.WakeTarget, error) {
 			agents, err := herdr.AgentList()
 			if err != nil {
-				return err
+				return control.WakeTarget{}, err
 			}
 			for _, a := range agents {
-				if a.TabID == target.TabID && a.PaneID == target.PaneID && a.Name == target.AgentName {
-					return nil
+				if a.TabID == target.TabID && a.PaneID == target.PaneID && a.Name == target.AgentName && a.Workspace == target.Workspace && a.Kind == target.Provider && a.Session.Value != "" {
+					target.SessionID = a.Session.Value
+					return target, nil
 				}
 			}
-			return fmt.Errorf("Herdr target drifted before wake")
+			return control.WakeTarget{}, fmt.Errorf("Herdr target/session drifted before wake")
 		}
 		orders := &control.CoordinatorOrders{Identity: scope.Identity, Delivery: &control.Delivery{Outbox: controlStore, Sender: controlMailbox, Waker: control.HerdrWaker{Target: scope.Wake, Validate: validate}, Authority: control.FencedAuthority{Identity: scope.Identity, Check: scope.Check}, Evidence: control.MailboxEvidenceReader{Mailbox: controlMailbox}, Owner: owner}}
 		return orders, nil

@@ -88,9 +88,11 @@ func (r MailboxEvidenceReader) ReadEvidence(ctx context.Context, key string, sup
 // the durable order.
 type WakeTarget struct {
 	Target          string
+	Workspace       string
 	TabID           string
 	PaneID          string
 	AgentName       string
+	Provider        string
 	LeaseGeneration int64
 	SessionID       string
 }
@@ -98,23 +100,41 @@ type WakeTarget struct {
 type HerdrWaker struct {
 	Target   WakeTarget
 	Timeout  time.Duration
-	Validate func(context.Context, WakeTarget) error
+	Validate func(context.Context, WakeTarget) (WakeTarget, error)
 }
 
 func (w HerdrWaker) WakeTarget() WakeTarget { return w.Target }
+
+func (w HerdrWaker) ReadTarget(ctx context.Context) (WakeTarget, error) {
+	if w.Validate == nil {
+		return WakeTarget{}, fmt.Errorf("control: exact Herdr target validator is required")
+	}
+	actual, err := w.Validate(ctx, w.Target)
+	if err != nil {
+		return WakeTarget{}, err
+	}
+	if actual != w.Target {
+		return WakeTarget{}, ErrStaleIdentity
+	}
+	return actual, nil
+}
 
 func (w HerdrWaker) Wake(ctx context.Context, req WakeRequest) (WakeReceipt, error) {
 	if req.Target != w.Target {
 		return WakeReceipt{}, ErrStaleIdentity
 	}
-	if w.Target.Target == "" || w.Target.TabID == "" || w.Target.PaneID == "" || w.Target.AgentName == "" || w.Target.SessionID == "" || w.Target.LeaseGeneration <= 0 {
+	if w.Target.Target == "" || w.Target.Workspace == "" || w.Target.TabID == "" || w.Target.PaneID == "" || w.Target.AgentName == "" || w.Target.Provider == "" || w.Target.SessionID == "" || w.Target.LeaseGeneration <= 0 {
 		return WakeReceipt{}, fmt.Errorf("control: exact Herdr target is required")
 	}
 	if w.Validate == nil {
 		return WakeReceipt{}, fmt.Errorf("control: exact Herdr target validator is required")
 	}
-	if err := w.Validate(ctx, w.Target); err != nil {
+	actual, err := w.Validate(ctx, w.Target)
+	if err != nil {
 		return WakeReceipt{}, fmt.Errorf("control: Herdr target drift: %w", err)
+	}
+	if actual != w.Target {
+		return WakeReceipt{}, ErrStaleIdentity
 	}
 	receipt, err := herdr.DeliverAndProve(w.Target.Target, fmt.Sprintf("consume durable control envelope %s seq %d", req.MessageID, req.Sequence), w.Timeout)
 	if err != nil {
@@ -123,7 +143,7 @@ func (w HerdrWaker) Wake(ctx context.Context, req WakeRequest) (WakeReceipt, err
 	if receipt == nil || !receipt.Consumed || !receipt.Verified || receipt.Target != w.Target.Target {
 		return WakeReceipt{}, ErrMissingReceipt
 	}
-	return WakeReceipt{MessageID: req.MessageID, Consumed: receipt.Consumed, Verified: receipt.Verified, SequenceToken: receipt.SequenceToken, Baseline: receipt.BaselineStatus, Final: receipt.FinalStatus, Target: receipt.Target, SessionID: w.Target.SessionID, LeaseGeneration: w.Target.LeaseGeneration}, nil
+	return WakeReceipt{MessageID: req.MessageID, Consumed: receipt.Consumed, Verified: receipt.Verified, SequenceToken: receipt.SequenceToken, Baseline: receipt.BaselineStatus, Final: receipt.FinalStatus, Target: receipt.Target, Workspace: actual.Workspace, TabID: actual.TabID, PaneID: actual.PaneID, AgentName: actual.AgentName, Provider: actual.Provider, SessionID: actual.SessionID, LeaseGeneration: actual.LeaseGeneration}, nil
 }
 
 // CoordinatorOrders is the production-facing order port used by dispatch,

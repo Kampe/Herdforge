@@ -85,11 +85,22 @@ type conformanceWaker struct {
 type unverifiedWaker struct{ conformanceWaker }
 
 func (w *unverifiedWaker) Wake(_ context.Context, r WakeRequest) (WakeReceipt, error) {
-	return WakeReceipt{MessageID: r.MessageID, Consumed: true, Verified: false, SequenceToken: "wake", Target: r.Target.Target, SessionID: r.Target.SessionID, LeaseGeneration: r.Target.LeaseGeneration}, nil
+	return WakeReceipt{MessageID: r.MessageID, Consumed: true, Verified: false, SequenceToken: "wake", Target: r.Target.Target, Workspace: r.Target.Workspace, TabID: r.Target.TabID, PaneID: r.Target.PaneID, AgentName: r.Target.AgentName, Provider: r.Target.Provider, SessionID: r.Target.SessionID, LeaseGeneration: r.Target.LeaseGeneration}, nil
 }
 
 func (w *conformanceWaker) WakeTarget() WakeTarget {
-	return WakeTarget{Target: "worker-1", TabID: "tab-1", PaneID: "pane-1", AgentName: "worker-1", SessionID: "tab-1/pane-1", LeaseGeneration: 7}
+	return WakeTarget{Target: "worker-1", Workspace: "workspace-1", TabID: "tab-1", PaneID: "pane-1", AgentName: "worker-1", Provider: "provider-1", SessionID: "session-1", LeaseGeneration: 7}
+}
+func (w *conformanceWaker) ReadTarget(context.Context) (WakeTarget, error) {
+	return w.WakeTarget(), nil
+}
+
+type replayDriftWaker struct{ conformanceWaker }
+
+func (w *replayDriftWaker) ReadTarget(context.Context) (WakeTarget, error) {
+	target := w.WakeTarget()
+	target.SessionID = "recycled-session"
+	return target, nil
 }
 
 type authority struct{ identity LaneIdentity }
@@ -101,7 +112,7 @@ func (w *conformanceWaker) Wake(_ context.Context, r WakeRequest) (WakeReceipt, 
 	if w.fail != nil {
 		return WakeReceipt{}, w.fail
 	}
-	return WakeReceipt{MessageID: r.MessageID, Consumed: true, Verified: true, SequenceToken: "wake", Target: r.Target.Target, SessionID: r.Target.SessionID, LeaseGeneration: r.Target.LeaseGeneration}, nil
+	return WakeReceipt{MessageID: r.MessageID, Consumed: true, Verified: true, SequenceToken: "wake", Target: r.Target.Target, Workspace: r.Target.Workspace, TabID: r.Target.TabID, PaneID: r.Target.PaneID, AgentName: r.Target.AgentName, Provider: r.Target.Provider, SessionID: r.Target.SessionID, LeaseGeneration: r.Target.LeaseGeneration}, nil
 }
 
 type evidenceReader struct{ ok bool }
@@ -129,7 +140,7 @@ func evidenceFor(t *testing.T, store *outbox.Store, o Order) AckEvidence {
 	if err != nil || item == nil {
 		t.Fatalf("stored order: %v %#v", err, item)
 	}
-	return AckEvidence{IdempotencyKey: key, MessageID: item.MessageID, Sequence: item.Sequence, Repository: o.Repository, TaskRef: o.TaskRef, Lane: o.Lane, LeaseGeneration: o.LeaseGeneration, CandidateSHA: o.CandidateSHA, Kind: o.Kind, BodyDigest: digest, EnvelopeID: "ack-" + shortID(key)}
+	return AckEvidence{IdempotencyKey: key, MessageID: item.MessageID, Sequence: item.Sequence, Repository: o.Repository, TaskRef: o.TaskRef, Lane: o.Lane, LeaseGeneration: o.LeaseGeneration, CandidateSHA: o.CandidateSHA, Kind: o.Kind, BodyDigest: digest, Outcome: "acknowledged", EnvelopeID: "ack-" + shortID(key)}
 }
 
 func fixtureOrder() Order {
@@ -215,6 +226,23 @@ func TestUnverifiedWakeReceiptCannotAdvanceOrder(t *testing.T) {
 	item, err := store.GetByKey(func() string { key, _, _, _ := identityKey(o); return key }())
 	if err != nil || item == nil || item.Status != outbox.StatusSent {
 		t.Fatalf("order was not retained as sent: %#v %v", item, err)
+	}
+}
+
+func TestStoredWakeReplayFailsClosedOnSessionDrift(t *testing.T) {
+	store := newTestControlStore(t)
+	o := fixtureOrder()
+	w := &conformanceWaker{}
+	d := &Delivery{Outbox: store, Sender: &conformanceSender{}, Waker: w, Authority: authority{o.LaneIdentity}, Owner: "replay-owner"}
+	if _, err := d.Deliver(context.Background(), o); err != nil {
+		t.Fatal(err)
+	}
+	d.Waker = &replayDriftWaker{}
+	if _, err := d.Deliver(context.Background(), o); !errors.Is(err, ErrMissingReceipt) {
+		t.Fatalf("stale wake replay accepted: %v", err)
+	}
+	if d.Waker.(*replayDriftWaker).calls != 0 {
+		t.Fatal("replay drift triggered a second wake")
 	}
 }
 
@@ -325,6 +353,8 @@ func TestStructuredEvidenceRejectsEveryBoundMismatch(t *testing.T) {
 	}
 	ev := evidenceFor(t, store, o)
 	ev.EnvelopeID = "supersede-" + shortID(ev.IdempotencyKey)
+	ev.Outcome = "superseded"
+	ev.FailureReason = "test supersession"
 	d.Evidence = structuredEvidence{evidence: ev}
 	if _, err := d.SupersedeEvidence(context.Background(), o); err != nil {
 		t.Fatal(err)
