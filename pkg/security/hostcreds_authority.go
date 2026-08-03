@@ -444,6 +444,20 @@ func resolveSecretHandle(handle string) (string, error) {
 	}
 }
 
+// AssertNoPublicSecretExport checks Hosts() never looks like secret material.
+// Get/Snapshot are not on CredentialAuthority (compile-time seal).
+func AssertNoPublicSecretExport(auth CredentialAuthority) error {
+	if auth == nil {
+		return fmt.Errorf("nil authority")
+	}
+	for _, h := range auth.Hosts() {
+		if strings.Contains(h, "Bearer ") || strings.HasPrefix(h, "sk-") {
+			return &BlockedError{Reason: BlockSecretExposure, Code: "hosts_look_like_secrets"}
+		}
+	}
+	return nil
+}
+
 func sortHosts(in []string) []string {
 	out := append([]string(nil), in...)
 	for i := 0; i < len(out); i++ {

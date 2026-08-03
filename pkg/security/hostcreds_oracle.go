@@ -324,7 +324,11 @@ func (o *HostCredsOracle) Execute(req OracleRequest) OracleResponse {
 	if err := o.Alive(); err != nil {
 		return oracleErr(err)
 	}
-	if req.SessionID != "" && req.SessionID != o.SessionID {
+	// Exact-session binding: SessionID required and must match (no defaulting).
+	if strings.TrimSpace(req.SessionID) == "" {
+		return oracleErr(&BlockedError{Reason: BlockAbuse, SessionID: o.SessionID, Code: "session_id_required"})
+	}
+	if req.SessionID != o.SessionID {
 		return oracleErr(&BlockedError{Reason: BlockAbuse, SessionID: o.SessionID, Code: "session_mismatch"})
 	}
 
@@ -357,19 +361,12 @@ func (o *HostCredsOracle) Execute(req OracleRequest) OracleResponse {
 		return oracleErr(&BlockedError{Reason: BlockAbuse, SessionID: o.SessionID, Code: "body_too_large"})
 	}
 
-	// Worker Authorization: only dummy sentinel allowed.
+	// Worker must not supply Authorization at all (no real, no dummy).
 	if req.Headers != nil {
 		for k, v := range req.Headers {
-			if strings.EqualFold(k, "Authorization") {
-				if v != "" && !IsDummyCredential(v) {
-					return oracleErr(&BlockedError{Reason: BlockWorkerAuthInject, SessionID: o.SessionID, Code: "worker_auth"})
-				}
-				// Reject CRLF even on dummy path if malformed.
-				if strings.ContainsAny(v, "\r\n\x00") {
-					return oracleErr(&BlockedError{Reason: BlockBadAuthMaterial, SessionID: o.SessionID, Code: "auth_header_injection"})
-				}
+			if strings.EqualFold(k, "Authorization") && strings.TrimSpace(v) != "" {
+				return oracleErr(&BlockedError{Reason: BlockWorkerAuthInject, SessionID: o.SessionID, Code: "worker_auth"})
 			}
-			// Header injection via any worker header name/value.
 			if strings.ContainsAny(k, "\r\n\x00") || strings.ContainsAny(v, "\r\n\x00") {
 				return oracleErr(&BlockedError{Reason: BlockAbuse, SessionID: o.SessionID, Code: "header_injection"})
 			}
@@ -404,9 +401,18 @@ func (o *HostCredsOracle) Execute(req OracleRequest) OracleResponse {
 	if ferr != nil {
 		return OracleResponse{OK: false, SessionID: o.SessionID, Error: blockCode(ferr)}
 	}
-	// Redact any accidental secret echo in body without knowing the secret:
-	// strip Bearer tokens shape.
 	body = RedactSecrets(body)
+	// Fail closed on HTTP errors and JSON {"error":...} bodies (never OK=true).
+	if status >= 400 || jsonBodyHasError(body) {
+		return OracleResponse{
+			OK:         false,
+			StatusCode: status,
+			Body:       body,
+			Error:      "upstream_error",
+			Action:     rule.Action,
+			SessionID:  o.SessionID,
+		}
+	}
 	return OracleResponse{
 		OK:         true,
 		StatusCode: status,
@@ -414,6 +420,21 @@ func (o *HostCredsOracle) Execute(req OracleRequest) OracleResponse {
 		Action:     rule.Action,
 		SessionID:  o.SessionID,
 	}
+}
+
+func jsonBodyHasError(body string) bool {
+	// Minimal detect of OpenAI/Anthropic-style error envelopes without full parse.
+	b := strings.TrimSpace(body)
+	if b == "" {
+		return false
+	}
+	if strings.Contains(b, `"error"`) && (strings.Contains(b, `"message"`) || strings.Contains(b, `"type"`) || strings.Contains(b, `"code"`)) {
+		// Avoid flagging successful payloads that merely mention the word error in content.
+		if strings.HasPrefix(b, "{") && (strings.Contains(b, `"error":{`) || strings.Contains(b, `"error": {`) || strings.Contains(b, `"error": "`)) {
+			return true
+		}
+	}
+	return false
 }
 
 func (o *HostCredsOracle) forward(host, method, path string, hdr http.Header, body string) (int, string, error) {
@@ -567,9 +588,7 @@ func (o *HostCredsOracle) handleConn(c net.Conn) {
 		writeJSON(400, OracleResponse{OK: false, Error: "bad_json", SessionID: o.SessionID})
 		return
 	}
-	if req.SessionID == "" {
-		req.SessionID = o.SessionID
-	}
+	// Do not default SessionID — Execute requires exact match.
 	resp := o.Execute(req)
 	code := 200
 	if !resp.OK {

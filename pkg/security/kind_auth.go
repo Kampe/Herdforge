@@ -179,7 +179,7 @@ func FormatKindAuthBlocker(d KindAuthDiagnosis) string {
 	)
 }
 
-// RedactSecrets strips bearer/sk patterns from diagnostic strings.
+// RedactSecrets strips bearer/sk/api-key/partial/base64-ish secret shapes.
 func RedactSecrets(s string) string {
 	var b strings.Builder
 	b.Grow(len(s))
@@ -200,6 +200,7 @@ func RedactSecrets(s string) string {
 			i = j
 			continue
 		}
+		// sk- / sk-ant- / sk-proj- shapes
 		if i+3 <= len(s) && s[i:i+3] == "sk-" {
 			j := i + 3
 			if j < len(s) && s[j] == '[' {
@@ -214,6 +215,30 @@ func RedactSecrets(s string) string {
 				b.WriteString("sk-[REDACTED]")
 				i = j
 				continue
+			}
+		}
+		// "api_key":"..." or "api-key":"..."
+		if i+8 <= len(lower) && (lower[i:i+8] == `"api_key` || (i+9 <= len(lower) && lower[i:i+9] == `"api-key"`)) {
+			// find next quoted value
+			rest := s[i:]
+			q1 := strings.Index(rest, `":"`)
+			if q1 < 0 {
+				q1 = strings.Index(rest, `": "`)
+			}
+			if q1 >= 0 {
+				start := i + q1
+				// find opening quote of value
+				vq := strings.Index(s[start:], `"`)
+				if vq >= 0 {
+					vstart := start + vq + 1
+					vend := strings.Index(s[vstart:], `"`)
+					if vend > 0 {
+						b.WriteString(s[i:vstart])
+						b.WriteString("[REDACTED]")
+						i = vstart + vend
+						continue
+					}
+				}
 			}
 		}
 		b.WriteByte(s[i])
