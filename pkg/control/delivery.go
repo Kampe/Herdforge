@@ -46,16 +46,19 @@ type WakeRequest struct {
 	Order     Order
 	MessageID string
 	Sequence  int64
+	Target    WakeTarget
 }
 
 type WakeReceipt struct {
-	MessageID     string `json:"message_id"`
-	Consumed      bool   `json:"consumed"`
-	Verified      bool   `json:"verified"`
-	SequenceToken string `json:"sequence_token"`
-	Baseline      string `json:"baseline_status"`
-	Final         string `json:"final_status"`
-	Target        string `json:"target"`
+	MessageID       string `json:"message_id"`
+	Consumed        bool   `json:"consumed"`
+	Verified        bool   `json:"verified"`
+	SequenceToken   string `json:"sequence_token"`
+	Baseline        string `json:"baseline_status"`
+	Final           string `json:"final_status"`
+	Target          string `json:"target"`
+	SessionID       string `json:"session_id"`
+	LeaseGeneration int64  `json:"lease_generation"`
 }
 
 // Sender is implemented by both mail.Mailbox and mail.MessageBroker through
@@ -66,6 +69,7 @@ type Sender interface {
 }
 
 type Waker interface {
+	WakeTarget() WakeTarget
 	Wake(context.Context, WakeRequest) (WakeReceipt, error)
 }
 
@@ -89,6 +93,7 @@ type AckEvidence struct {
 	Outcome         string `json:"outcome,omitempty"`
 	FailureReason   string `json:"failure_reason,omitempty"`
 	Retryable       bool   `json:"retryable,omitempty"`
+	EnvelopeID      string `json:"envelope_id"`
 }
 
 type IdentityAuthority interface {
@@ -105,8 +110,9 @@ type Evidence struct {
 }
 
 var (
-	ErrStaleIdentity  = errors.New("control: stale lane identity")
-	ErrMissingReceipt = errors.New("control: missing or corrupt wake receipt")
+	ErrStaleIdentity    = errors.New("control: stale lane identity")
+	ErrMissingReceipt   = errors.New("control: missing or corrupt wake receipt")
+	ErrEvidenceNotFound = errors.New("control: durable evidence not found")
 )
 
 type Delivery struct {
@@ -193,13 +199,17 @@ func (d *Delivery) Deliver(ctx context.Context, o Order) (Evidence, error) {
 		return Evidence{}, err
 	}
 	e := Evidence{ItemID: item.ID, MessageID: messageID(key), IdempotencyKey: key, State: item.Status}
+	if item.Status == outbox.StatusAcknowledged || item.Status == outbox.StatusSuperseded {
+		e.MessageID, e.Sequence = item.MessageID, item.Sequence
+		return e, nil
+	}
 	if wake, ok, err := loadWake(d.Outbox.DB(), item.ID); err != nil {
 		return e, err
 	} else if ok {
+		if !wake.Consumed || !wake.Verified || wake.MessageID != item.MessageID || wake.SequenceToken == "" || wake.Target == "" || wake.SessionID == "" || wake.LeaseGeneration != o.LeaseGeneration {
+			return e, ErrMissingReceipt
+		}
 		e.MessageID, e.Sequence, e.Wake, e.State = item.MessageID, item.Sequence, wake, outbox.StatusSent
-		return e, nil
-	}
-	if item.Status == outbox.StatusAcknowledged || item.Status == outbox.StatusSuperseded {
 		return e, nil
 	}
 	if item.Status == outbox.StatusSent {
@@ -249,11 +259,14 @@ func (d *Delivery) wake(ctx context.Context, o Order, e Evidence, _ string) (Evi
 	if err := d.validate(ctx, o); err != nil {
 		return e, err
 	}
-	r, err := d.Waker.Wake(ctx, WakeRequest{Order: o, MessageID: e.MessageID, Sequence: e.Sequence})
+	// Waker implementations must validate this freshly-authorized target, not
+	// rely on a target captured when the factory was constructed.
+	target := d.Waker.WakeTarget()
+	r, err := d.Waker.Wake(ctx, WakeRequest{Order: o, MessageID: e.MessageID, Sequence: e.Sequence, Target: target})
 	if err != nil {
 		return e, fmt.Errorf("control wake failed (order retained for retry): %w", err)
 	}
-	if r.MessageID != e.MessageID || !r.Consumed {
+	if r.MessageID != e.MessageID || !r.Consumed || !r.Verified || r.Target != target.Target || r.SessionID != target.SessionID || r.LeaseGeneration != target.LeaseGeneration || target.LeaseGeneration != o.LeaseGeneration {
 		return e, ErrMissingReceipt
 	}
 	e.Wake = r
@@ -343,8 +356,12 @@ func (d *Delivery) Reconcile(ctx context.Context, o Order) (Evidence, error) {
 	if item.Status == outbox.StatusAcknowledged || item.Status == outbox.StatusSuperseded {
 		return Evidence{ItemID: item.ID, MessageID: item.MessageID, Sequence: item.Sequence, IdempotencyKey: key, State: item.Status}, nil
 	}
-	if ev, err := d.AcknowledgeEvidence(ctx, o); err == nil {
+	ev, ackErr := d.AcknowledgeEvidence(ctx, o)
+	if ackErr == nil {
 		return ev, nil
+	}
+	if !errors.Is(ackErr, ErrEvidenceNotFound) {
+		return Evidence{}, ackErr
 	}
 	return d.SupersedeEvidence(ctx, o)
 }
@@ -388,7 +405,11 @@ func (d *Delivery) terminal(ctx context.Context, o Order, supersede bool) (Evide
 	if err != nil {
 		return Evidence{}, err
 	}
-	if evidence.IdempotencyKey != key || evidence.MessageID != item.MessageID || evidence.Sequence != item.Sequence || evidence.Repository != o.Repository || evidence.TaskRef != o.TaskRef || evidence.Lane != o.Lane || evidence.LeaseGeneration != o.LeaseGeneration || evidence.CandidateSHA != o.CandidateSHA || evidence.Kind != o.Kind || evidence.BodyDigest != digest {
+	wantEnvelopeID := "ack-" + shortID(key)
+	if supersede {
+		wantEnvelopeID = "supersede-" + shortID(key)
+	}
+	if evidence.IdempotencyKey != key || evidence.EnvelopeID != wantEnvelopeID || evidence.MessageID != item.MessageID || evidence.Sequence != item.Sequence || evidence.Repository != o.Repository || evidence.TaskRef != o.TaskRef || evidence.Lane != o.Lane || evidence.LeaseGeneration != o.LeaseGeneration || evidence.CandidateSHA != o.CandidateSHA || evidence.Kind != o.Kind || evidence.BodyDigest != digest {
 		return Evidence{}, fmt.Errorf("control: corrupt or mismatched durable acknowledgement evidence")
 	}
 	if supersede {

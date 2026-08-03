@@ -103,7 +103,7 @@ func (LiveHerdr) ValidateControlTarget(target control.WakeTarget) error {
 		return err
 	}
 	for _, a := range agents {
-		if a.TabID == target.TabID && a.PaneID == target.PaneID && a.Name == target.AgentName {
+		if a.TabID == target.TabID && a.PaneID == target.PaneID && a.Name == target.AgentName && target.SessionID == target.TabID+"/"+target.PaneID {
 			return nil
 		}
 	}
@@ -699,7 +699,7 @@ func (d *Dispatcher) launch(
 		identity.Repository = repository
 		identity.CandidateSHA = opts.Decision.CandidateSHA
 	}
-	wakeTarget := control.WakeTarget{Target: tabLabel, TabID: tab.ID, PaneID: tab.Pane.ID, AgentName: tabLabel, LeaseGeneration: result.LeaseGeneration}
+	wakeTarget := control.WakeTarget{Target: tabLabel, TabID: tab.ID, PaneID: tab.Pane.ID, AgentName: tabLabel, SessionID: tab.ID + "/" + tab.Pane.ID, LeaseGeneration: result.LeaseGeneration}
 	check := func(checkCtx context.Context, o control.Order) error {
 		if o.LaneIdentity != identity {
 			return control.ErrStaleIdentity

@@ -65,15 +65,22 @@ func (r MailboxEvidenceReader) ReadEvidence(ctx context.Context, key string, sup
 		if env.Subject != want {
 			continue
 		}
+		if env.Sender == "" || env.Recipient != mail.CoordinatorInbox || env.ID == "" || env.Sequence <= 0 {
+			return AckEvidence{}, fmt.Errorf("control: malformed durable evidence envelope")
+		}
 		var evidence AckEvidence
 		if err := json.Unmarshal([]byte(env.Body), &evidence); err != nil {
 			return AckEvidence{}, fmt.Errorf("control: corrupt durable evidence: %w", err)
 		}
 		if evidence.IdempotencyKey == key {
+			if env.Sender != evidence.Lane || env.Recipient != mail.CoordinatorInbox || env.ID != "ack-"+shortID(key) && env.ID != "supersede-"+shortID(key) {
+				return AckEvidence{}, fmt.Errorf("control: durable evidence envelope identity mismatch")
+			}
+			evidence.EnvelopeID = env.ID
 			return evidence, nil
 		}
 	}
-	return AckEvidence{}, fmt.Errorf("control: durable evidence %s not found", key)
+	return AckEvidence{}, fmt.Errorf("%w: %s", ErrEvidenceNotFound, key)
 }
 
 // HerdrWaker is the only Herdr integration used by the durable adapter. Its
@@ -85,6 +92,7 @@ type WakeTarget struct {
 	PaneID          string
 	AgentName       string
 	LeaseGeneration int64
+	SessionID       string
 }
 
 type HerdrWaker struct {
@@ -93,8 +101,13 @@ type HerdrWaker struct {
 	Validate func(context.Context, WakeTarget) error
 }
 
+func (w HerdrWaker) WakeTarget() WakeTarget { return w.Target }
+
 func (w HerdrWaker) Wake(ctx context.Context, req WakeRequest) (WakeReceipt, error) {
-	if w.Target.Target == "" || w.Target.TabID == "" || w.Target.PaneID == "" || w.Target.AgentName == "" || w.Target.LeaseGeneration <= 0 {
+	if req.Target != w.Target {
+		return WakeReceipt{}, ErrStaleIdentity
+	}
+	if w.Target.Target == "" || w.Target.TabID == "" || w.Target.PaneID == "" || w.Target.AgentName == "" || w.Target.SessionID == "" || w.Target.LeaseGeneration <= 0 {
 		return WakeReceipt{}, fmt.Errorf("control: exact Herdr target is required")
 	}
 	if w.Validate == nil {
@@ -107,10 +120,10 @@ func (w HerdrWaker) Wake(ctx context.Context, req WakeRequest) (WakeReceipt, err
 	if err != nil {
 		return WakeReceipt{}, err
 	}
-	if receipt == nil || !receipt.Consumed {
+	if receipt == nil || !receipt.Consumed || !receipt.Verified || receipt.Target != w.Target.Target {
 		return WakeReceipt{}, ErrMissingReceipt
 	}
-	return WakeReceipt{MessageID: req.MessageID, Consumed: true, Verified: receipt.Verified, SequenceToken: receipt.SequenceToken, Baseline: receipt.BaselineStatus, Final: receipt.FinalStatus, Target: receipt.Target}, nil
+	return WakeReceipt{MessageID: req.MessageID, Consumed: receipt.Consumed, Verified: receipt.Verified, SequenceToken: receipt.SequenceToken, Baseline: receipt.BaselineStatus, Final: receipt.FinalStatus, Target: receipt.Target, SessionID: w.Target.SessionID, LeaseGeneration: w.Target.LeaseGeneration}, nil
 }
 
 // CoordinatorOrders is the production-facing order port used by dispatch,
@@ -129,7 +142,14 @@ func (c *CoordinatorOrders) Consume(ctx context.Context) error {
 	if c == nil || c.Consumer == nil {
 		return fmt.Errorf("control: recipient consumer is required")
 	}
-	return c.Consumer.Consume(ctx)
+	return (RecipientLoop{Consumer: c.Consumer}).RunOnce(ctx)
+}
+
+func (c *CoordinatorOrders) Reconcile(ctx context.Context, orders func(context.Context) ([]Order, error)) error {
+	if c == nil {
+		return ErrMissingReceipt
+	}
+	return (CoordinatorLoop{Delivery: c.Delivery, Orders: orders}).RunOnce(ctx)
 }
 
 func (c *CoordinatorOrders) send(ctx context.Context, kind Kind, body string) (Evidence, error) {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/Kampe/Herdforge/pkg/control"
 	"github.com/Kampe/Herdforge/pkg/harness"
 	"github.com/Kampe/Herdforge/pkg/provider"
 )
@@ -14,6 +15,19 @@ type WorkerLane struct {
 	HarnessCfg  *harness.HarnessConfig
 	ActiveTask  *provider.Task
 	WorktreeDir string
+}
+
+// ReceiveControlOnce is the standing-lane production receive entrypoint. The
+// processor is task-scoped and idempotency-aware; a lane cannot consume mail
+// through a label-only or coordinator-owned shortcut.
+func (s *LaneSupervisor) ReceiveControlOnce(ctx context.Context, laneID string, loop *control.RecipientLoop) error {
+	if s == nil || s.Lanes[laneID] == nil {
+		return fmt.Errorf("lane %s not found", laneID)
+	}
+	if loop == nil {
+		return control.ErrProcessorUnavailable
+	}
+	return loop.RunOnce(ctx)
 }
 
 type LaneSupervisor struct {

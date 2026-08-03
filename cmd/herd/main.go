@@ -1933,9 +1933,6 @@ func configureProductionControl(d *dispatch.Dispatcher, root string) (func() err
 			return fmt.Errorf("Herdr target drifted before wake")
 		}
 		orders := &control.CoordinatorOrders{Identity: scope.Identity, Delivery: &control.Delivery{Outbox: controlStore, Sender: controlMailbox, Waker: control.HerdrWaker{Target: scope.Wake, Validate: validate}, Authority: control.FencedAuthority{Identity: scope.Identity, Check: scope.Check}, Evidence: control.MailboxEvidenceReader{Mailbox: controlMailbox}, Owner: owner}}
-		orders.Consumer = &control.Consumer{Mailbox: controlMailbox, Identity: scope.Identity, Process: func(context.Context, control.Order) error {
-			return fmt.Errorf("control: recipient processor must be supplied by the standing worker")
-		}}
 		return orders, nil
 	}
 	return controlStore.Close, nil
