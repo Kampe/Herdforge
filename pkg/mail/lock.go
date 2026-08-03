@@ -104,6 +104,12 @@ var hooks atomic.Pointer[clockHooks]
 // false; tests toggle it to prove fairness is causal.
 var skipWaitForTurn atomic.Bool
 
+// recordCSTicket is a test-only seam: when set, withFileLockContext invokes
+// it with the holder's ticket number at critical-section entry (after the
+// data flock is held, before fn). Production stays nil. Used to prove CS
+// order equals ticket FIFO order (not mere "each entered once").
+var recordCSTicket atomic.Pointer[func(ticket int64)]
+
 // removeTokenFn / tokenDirSyncFn are mutation seams for cleanup durability.
 var (
 	removeTokenFn = os.Remove
@@ -168,9 +174,14 @@ func (m *Mailbox) withFileLockContext(ctx context.Context, fn func() error) erro
 	// Fail-closed: enqueueWaiter errors never silently degrade to unordered
 	// data-flock-only. Corrupt counters, fsync/dirsync/token failures, and
 	// permission errors all surface as hard errors so FIFO/durability cannot
-	// be bypassed by discarding qerr.
-	ticket, tokenPath, _, qerr := m.enqueueWaiter()
+	// be bypassed by discarding qerr. qmeta acquisition is nonblocking and
+	// bound/ctx-aware — a wedged qmeta owner cannot hang past the deadline.
+	ticket, tokenPath, _, qerr := m.enqueueWaiterContext(ctx, start, bound, reason, mailboxID)
 	if qerr != nil {
+		// Timeouts already carry durable diagnostics; wrap other enqueue errors.
+		if errors.Is(qerr, ErrMailboxLockTimeout) {
+			return redactErr(qerr)
+		}
 		return redactErr(fmt.Errorf("mailbox lock enqueue failed for %s: %w", mailboxID, qerr))
 	}
 
@@ -187,7 +198,8 @@ func (m *Mailbox) withFileLockContext(ctx context.Context, fn func() error) erro
 
 	// Re-check deadline after becoming head: waitForTurn returns immediately
 	// when already head, so an expired ctx must still fail closed here before
-	// any uncontended flock + mutate.
+	// any uncontended flock + mutate. lastProgress=now keeps stuckGrace
+	// progress-based; ctx.Err() still fails closed on expired deadlines.
 	if err := m.checkWaitLimits(ctx, start, hookNow(), bound, reason, lockPath, mailboxID, 1, 1); err != nil {
 		return finishQueue(err)
 	}
@@ -250,6 +262,8 @@ func (m *Mailbox) withFileLockContext(ctx context.Context, fn func() error) erro
 	}
 
 	// Final deadline gate after exclusive flock, before any mutation.
+	// ctx.Err() is the fail-closed path for expired deadlines; lastProgress
+	// is now so stuckGrace does not become an absolute wall mid-handoff.
 	if err := m.checkWaitLimits(ctx, start, hookNow(), bound, reason, lockPath, mailboxID, 1, 1); err != nil {
 		unlockErr := hookFlock(fd, syscall.LOCK_UN)
 		closeErr := f.Close()
@@ -264,6 +278,11 @@ func (m *Mailbox) withFileLockContext(ctx context.Context, fn func() error) erro
 			unlockErr,
 			closeErr,
 		))
+	}
+
+	// CS entry: record ticket for FIFO e2e / mutation probes (test seam).
+	if rec := recordCSTicket.Load(); rec != nil && *rec != nil {
+		(*rec)(ticket)
 	}
 
 	fnErr := fn()
@@ -344,26 +363,85 @@ func (m *Mailbox) ticketPath() string { return m.MailFile + ".lock.ticket" }
 func (m *Mailbox) qmetaPath() string  { return m.MailFile + ".lock.qmeta" }
 func (m *Mailbox) waiterDir() string  { return m.MailFile + ".lock.waiters" }
 
-// enqueueWaiter issues a crash-safe monotonic ticket and O_EXCL token.
-// Counter lives in .lock.ticket (atomic rename+dirsync); meta flock is a
-// separate inode (.lock.qmeta) so truncate-crash cannot reset tickets.
+// enqueueWaiter is the background-context form used by tests that do not
+// need an explicit deadline. Production lock acquisition uses
+// enqueueWaiterContext so qmeta waits honor the caller bound.
 func (m *Mailbox) enqueueWaiter() (ticket int64, tokenPath string, depth int, err error) {
+	id := mailboxIdentity("")
+	if m != nil {
+		id = mailboxIdentity(m.MailFile)
+	}
+	return m.enqueueWaiterContext(context.Background(), hookNow(), stuckGrace, "stuck_grace", id)
+}
+
+// acquireQmetaExclusive opens .lock.qmeta and takes LOCK_EX via nonblocking
+// poll, failing closed under caller deadline / fixed override / max wait.
+// A live wedged qmeta holder must never hang SendMessageContext forever.
+//
+// Unlike the data-lock path, qmeta has no owner-progress signal. When the
+// policy is pure stuckGrace (no ctx deadline), the absolute cap is
+// maxLockWait so multi-writer enqueue contention does not false-timeout at
+// 5s. Caller context deadlines and SetLockTimeout overrides still bind
+// tightly and fail closed with typed BLOCKED + durable diagnostics.
+func (m *Mailbox) acquireQmetaExclusive(ctx context.Context, start time.Time, bound time.Duration, reason, mailboxID string) (*os.File, error) {
+	lockPath := m.MailFile + ".lock"
+	meta, err := os.OpenFile(m.qmetaPath(), os.O_CREATE|os.O_RDWR, 0644)
+	if err != nil {
+		return nil, fmt.Errorf("open qmeta: %w", err)
+	}
+	qBound, qReason := bound, reason
+	if reason == "stuck_grace" {
+		qBound = maxLockWait
+		qReason = "qmeta_max_wait"
+	}
+	for {
+		err := hookFlock(int(meta.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+		if err == nil {
+			return meta, nil
+		}
+		if !isLockBusy(err) {
+			closeErr := meta.Close()
+			return nil, errors.Join(fmt.Errorf("qmeta flock: %w", err), closeErr)
+		}
+		// Absolute from start: ctx.Err() still trips first on expired deadlines.
+		if err := m.checkWaitLimits(ctx, start, start, qBound, qReason, lockPath, mailboxID, 0, 0); err != nil {
+			closeErr := meta.Close()
+			return nil, errors.Join(err, closeErr)
+		}
+		hookSleep(lockPollInterval)
+	}
+}
+
+// rollbackPublishedToken removes a final ticket name that was already
+// linked into the waiter directory and dirsyncs so a crash cannot resurrect
+// a live-looking ghost head after a failed enqueue. Always preferred over
+// bare removeTokenFn for post-publication rollback paths.
+func (m *Mailbox) rollbackPublishedToken(tokenPath string) error {
+	if tokenPath == "" {
+		return nil
+	}
+	return m.removeTokenDurable(tokenPath)
+}
+
+// enqueueWaiterContext issues a crash-safe monotonic ticket and O_EXCL token
+// under a bounded, context-aware qmeta flock. Counter lives in .lock.ticket
+// (atomic rename+dirsync); meta flock is a separate inode (.lock.qmeta) so
+// truncate-crash cannot reset tickets.
+func (m *Mailbox) enqueueWaiterContext(ctx context.Context, start time.Time, bound time.Duration, reason, mailboxID string) (ticket int64, tokenPath string, depth int, err error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	qdir := m.waiterDir()
 	if err := os.MkdirAll(qdir, 0755); err != nil {
 		return 0, "", 0, fmt.Errorf("waiter dir: %w", err)
 	}
 
-	meta, err := os.OpenFile(m.qmetaPath(), os.O_CREATE|os.O_RDWR, 0644)
+	meta, err := m.acquireQmetaExclusive(ctx, start, bound, reason, mailboxID)
 	if err != nil {
-		return 0, "", 0, fmt.Errorf("open qmeta: %w", err)
+		return 0, "", 0, err
 	}
 	metaUnlock := func() error { return hookFlock(int(meta.Fd()), syscall.LOCK_UN) }
 	metaClose := func() error { return meta.Close() }
-
-	if err := hookFlock(int(meta.Fd()), syscall.LOCK_EX); err != nil {
-		closeErr := metaClose()
-		return 0, "", 0, errors.Join(fmt.Errorf("qmeta flock: %w", err), closeErr)
-	}
 
 	// Reap only confidently-dead tokens under the meta lock.
 	if err := m.reapDeadWaiters(); err != nil {
@@ -434,33 +512,35 @@ func (m *Mailbox) enqueueWaiter() (ticket int64, tokenPath string, depth int, er
 		}
 		return 0, "", 0, errors.Join(fmt.Errorf("token publish O_EXCL link: %w", err), rmStage, uerr, cerr)
 	}
+	// From here the final name is published. Every failure path MUST use
+	// rollbackPublishedToken (remove + waiter dirsync) so a crash cannot
+	// leave a live-looking ghost head.
 	// Staging hard-link peer removed; final name alone remains.
 	if rmStage := removeTokenFn(stagePath); rmStage != nil && !os.IsNotExist(rmStage) {
-		// Final is published; try to roll it back so we don't leave a live
-		// head we failed to finish cleanly, and surface every error.
-		rmTok := removeTokenFn(tokenPath)
+		rbErr := m.rollbackPublishedToken(tokenPath)
 		uerr, cerr := metaUnlock(), metaClose()
-		return 0, "", 0, errors.Join(fmt.Errorf("token stage unlink: %w", rmStage), rmTok, uerr, cerr)
+		return 0, "", 0, errors.Join(fmt.Errorf("token stage unlink: %w", rmStage), rbErr, uerr, cerr)
 	}
 	if err := syncDirFn(tokenPath); err != nil {
-		// Published name exists; try to remove to avoid a stuck live head,
-		// but surface both errors fail-closed.
-		rmErr := removeTokenFn(tokenPath)
+		rbErr := m.rollbackPublishedToken(tokenPath)
 		uerr, cerr := metaUnlock(), metaClose()
-		return 0, "", 0, errors.Join(fmt.Errorf("token dirsync: %w", err), rmErr, uerr, cerr)
+		return 0, "", 0, errors.Join(fmt.Errorf("token dirsync: %w", err), rbErr, uerr, cerr)
 	}
 
 	// Count live under meta lock without a second reap pass that races us.
 	depth, err = m.countTicketTokens()
+	if err != nil {
+		rbErr := m.rollbackPublishedToken(tokenPath)
+		uerr, cerr := metaUnlock(), metaClose()
+		return 0, "", 0, errors.Join(err, rbErr, uerr, cerr)
+	}
 	uerr := metaUnlock()
 	cerr := metaClose()
-	if err != nil {
-		rmErr := removeTokenFn(tokenPath)
-		return 0, "", 0, errors.Join(err, rmErr, uerr, cerr)
-	}
 	if uerr != nil || cerr != nil {
-		rmErr := removeTokenFn(tokenPath)
-		return 0, "", 0, errors.Join(uerr, cerr, rmErr)
+		// Unlock/close failed after publish: still roll back so a subsequent
+		// process cannot observe a half-owned live head after crash.
+		rbErr := m.rollbackPublishedToken(tokenPath)
+		return 0, "", 0, errors.Join(uerr, cerr, rbErr)
 	}
 	return ticket, tokenPath, depth, nil
 }

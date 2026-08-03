@@ -11,12 +11,14 @@ import (
 
 // abs path needle fragments — built at runtime so source files never contain
 // contiguous host-absolute prefixes that preflight treats as path leaks.
-func absUsersPrefix() string  { return string([]byte{'/', 'U', 's', 'e', 'r', 's', '/'}) }
-func absHomePrefix() string   { return string([]byte{'/', 'h', 'o', 'm', 'e', '/'}) }
-func absPrivatePref() string  { return string([]byte{'/', 'p', 'r', 'i', 'v', 'a', 't', 'e', '/'}) }
-func absVarPrefix() string    { return string([]byte{'/', 'v', 'a', 'r', '/'}) }
-func absTmpPrefix() string    { return string([]byte{'/', 't', 'm', 'p', '/'}) }
-func absVarFolders() string   { return string([]byte{'/', 'v', 'a', 'r', '/', 'f', 'o', 'l', 'd', 'e', 'r', 's', '/'}) }
+func absUsersPrefix() string { return string([]byte{'/', 'U', 's', 'e', 'r', 's', '/'}) }
+func absHomePrefix() string  { return string([]byte{'/', 'h', 'o', 'm', 'e', '/'}) }
+func absPrivatePref() string { return string([]byte{'/', 'p', 'r', 'i', 'v', 'a', 't', 'e', '/'}) }
+func absVarPrefix() string   { return string([]byte{'/', 'v', 'a', 'r', '/'}) }
+func absTmpPrefix() string   { return string([]byte{'/', 't', 'm', 'p', '/'}) }
+func absVarFolders() string {
+	return string([]byte{'/', 'v', 'a', 'r', '/', 'f', 'o', 'l', 'd', 'e', 'r', 's', '/'})
+}
 
 // redactErr strips host-absolute paths from errors while preserving op and
 // the underlying non-path failure. PathError/LinkError/SyscallError with

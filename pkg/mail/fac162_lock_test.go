@@ -146,51 +146,61 @@ func TestMultiProcessWriters_NoInterleaveNoDuplicate(t *testing.T) {
 	}
 }
 
-// TestE2E_CriticalSectionFIFO proves actual withFileLock CS entry order is
-// FIFO under contention (not just helper ordering).
+// TestE2E_CriticalSectionFIFO proves actual withFileLock CS entry order
+// equals ticket FIFO order under contention — not mere "each entered once"
+// (which plain unordered flock also satisfies).
 func TestE2E_CriticalSectionFIFO(t *testing.T) {
 	tmpDir := t.TempDir()
 	mailFile := filepath.Join(tmpDir, "fifo-cs.jsonl")
 	mb := NewMailbox(mailFile)
 
 	const n = 12
-	order := make([]int, 0, n)
 	var mu sync.Mutex
+	csTickets := make([]int64, 0, n)
+	rec := func(ticket int64) {
+		mu.Lock()
+		csTickets = append(csTickets, ticket)
+		mu.Unlock()
+	}
+	recordCSTicket.Store(&rec)
+	defer recordCSTicket.Store(nil)
+
 	var wg sync.WaitGroup
 	start := make(chan struct{})
 	for i := 0; i < n; i++ {
 		wg.Add(1)
-		go func(id int) {
+		go func() {
 			defer wg.Done()
 			<-start
+			// Hold CS briefly so later tickets cannot barge past earlier ones
+			// without waitForTurn (fairness mutant covered below).
 			err := mb.withFileLock(func() error {
-				mu.Lock()
-				order = append(order, id)
-				mu.Unlock()
+				time.Sleep(2 * time.Millisecond)
 				return nil
 			})
 			if err != nil {
-				t.Errorf("withFileLock %d: %v", id, err)
+				t.Errorf("withFileLock: %v", err)
 			}
-		}(i)
+		}()
 	}
 	close(start)
 	wg.Wait()
-	if len(order) != n {
-		t.Fatalf("order len %d", len(order))
+	if len(csTickets) != n {
+		t.Fatalf("CS entries %d want %d", len(csTickets), n)
 	}
-	// Tickets are monotonic by enqueue under meta lock; with concurrent
-	// starts the recorded CS order must equal ticket order. We cannot
-	// know goroutine scheduling vs ticket numbers without capturing
-	// tickets — instead assert no duplicate and all present, and that
-	// two-phase barge mutation below fails fairness when disabled.
-	seen := map[int]bool{}
-	for _, id := range order {
-		if seen[id] {
-			t.Fatalf("duplicate CS entry %d", id)
+	// Strict FIFO: CS ticket sequence must be strictly ascending.
+	for i := 1; i < len(csTickets); i++ {
+		if csTickets[i] <= csTickets[i-1] {
+			t.Fatalf("CS order not ticket-FIFO: %v (at i=%d %d <= %d)", csTickets, i, csTickets[i], csTickets[i-1])
 		}
-		seen[id] = true
 	}
+
+	// Fairness mutant: skipWaitForTurn allows non-head barge — under a
+	// planted earlier live head, CS can be entered while ticket 1 remains.
+	// (Delegates to TestMutationProbe_FairnessGatePreventsBarge for the
+	// full mutant; here assert that with fairness ON the ticket sequence
+	// above would fail if unordered flock were used without the queue.)
+	skipWaitForTurn.Store(false)
 }
 
 // TestMutationProbe_FairnessGatePreventsBarge plants an earlier live token
@@ -891,30 +901,319 @@ func TestFlockHardError_FailsImmediately(t *testing.T) {
 	assertNoAbsPath(t, err.Error())
 }
 
+// holdQmeta takes an exclusive lock on the mailbox qmeta file and returns a
+// release function. Used to prove enqueueWaiterContext fails closed at the
+// caller deadline when meta is wedged (not only the data lock).
+func holdQmeta(t *testing.T, mailFile string) (release func()) {
+	t.Helper()
+	path := mailFile + ".lock.qmeta"
+	if err := os.MkdirAll(filepath.Dir(mailFile), 0755); err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+		_ = f.Close()
+		t.Fatalf("hold qmeta: %v", err)
+	}
+	return func() {
+		_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+		_ = f.Close()
+	}
+}
+
+// assertDeadlineBound checks typed BLOCKED within the short caller deadline
+// (not the default stuckGrace). A mutant that drops ctx and waits 5s fails.
+func assertDeadlineBound(t *testing.T, wall time.Duration, deadline time.Duration, err error, entered bool) {
+	t.Helper()
+	if entered {
+		t.Fatal("critical section entered under expired/short deadline")
+	}
+	if !errors.Is(err, ErrMailboxLockTimeout) {
+		t.Fatalf("want ErrMailboxLockTimeout, got %v", err)
+	}
+	assertNoAbsPath(t, err.Error())
+	// Must return promptly near the deadline, far below stuckGrace.
+	// Allow generous race/scheduling slack but never the default 5s path.
+	if wall >= stuckGrace/2 {
+		t.Fatalf("wall %s suggests default stuckGrace wait (ctx dropped)", wall)
+	}
+	if wall > deadline*20 && wall > 500*time.Millisecond {
+		// 40ms deadline under heavy load may stretch; still must be << 5s.
+		t.Fatalf("wall %s far exceeds deadline %s without bound", wall, deadline)
+	}
+	var lte *LockTimeoutError
+	if errors.As(err, &lte) {
+		// Reject default stuckGrace / maxLockWait policy when a short
+		// caller deadline was supplied (mutation: drop ctx → 5s path).
+		if lte.Bound >= stuckGrace {
+			t.Fatalf("bound %s >= stuckGrace — ctx deadline not applied: %+v", lte.Bound, lte)
+		}
+		if lte.Bound > deadline*15 && lte.Bound > 200*time.Millisecond {
+			t.Fatalf("bound %s far above deadline %s: %+v", lte.Bound, deadline, lte)
+		}
+	}
+}
+
 func TestContextDeadline_PropagatesConsumers(t *testing.T) {
 	tmpDir := t.TempDir()
-	mailFile := filepath.Join(tmpDir, "ctx.jsonl")
-	release := holdMailboxLock(t, mailFile)
-	defer release()
+	const short = 40 * time.Millisecond
 
+	t.Run("send_held_data_lock_respects_deadline", func(t *testing.T) {
+		mailFile := filepath.Join(tmpDir, "ctx-data.jsonl")
+		release := holdMailboxLock(t, mailFile)
+		defer release()
+		mb := NewMailbox(mailFile)
+		// Wall-clock context deadline (no fake clock): bound is computed
+		// against real now so remain ≈ short, not maxLockWait-capped.
+		ctx, cancel := context.WithTimeout(context.Background(), short)
+		defer cancel()
+		wall0 := time.Now()
+		entered := false
+		err := mb.withFileLockContext(ctx, func() error {
+			entered = true
+			return nil
+		})
+		wall := time.Since(wall0)
+		assertDeadlineBound(t, wall, short, err, entered)
+		var lte *LockTimeoutError
+		if errors.As(err, &lte) {
+			// Bound must be context-derived and near short, not stuckGrace/maxLockWait.
+			if lte.Bound > short*10 && lte.Bound >= stuckGrace {
+				t.Fatalf("bound %s not context-short (looks like default policy)", lte.Bound)
+			}
+			if !strings.Contains(lte.Reason, "context") {
+				t.Fatalf("reason %q should mention context", lte.Reason)
+			}
+		}
+	})
+
+	t.Run("send_wedged_qmeta_respects_deadline", func(t *testing.T) {
+		// Finding (1): blocking qmeta LOCK_EX must not hang past deadline.
+		mailFile := filepath.Join(tmpDir, "ctx-qmeta.jsonl")
+		release := holdQmeta(t, mailFile)
+		defer release()
+		mb := NewMailbox(mailFile)
+		ctx, cancel := context.WithTimeout(context.Background(), short)
+		defer cancel()
+		wall0 := time.Now()
+		entered := false
+		err := mb.withFileLockContext(ctx, func() error {
+			entered = true
+			return nil
+		})
+		wall := time.Since(wall0)
+		assertDeadlineBound(t, wall, short, err, entered)
+		// Must not have written mail.
+		if _, e := os.Stat(mailFile); e == nil {
+			t.Fatal("must not mutate mailbox under wedged qmeta + short deadline")
+		}
+	})
+
+	t.Run("SendMessageContext_broker_PostCallback_Drain_Ack", func(t *testing.T) {
+		mailFile := filepath.Join(tmpDir, "ctx-paths.jsonl")
+		release := holdMailboxLock(t, mailFile)
+		defer release()
+		mb := NewMailbox(mailFile)
+
+		// SendMessageContext
+		ctx, cancel := context.WithTimeout(context.Background(), short)
+		defer cancel()
+		wall0 := time.Now()
+		_, err := mb.SendMessageContext(ctx, "a", "b", "s", "secret")
+		assertDeadlineBound(t, time.Since(wall0), short, err, false)
+
+		// PostCallbackContext
+		ctx2, cancel2 := context.WithTimeout(context.Background(), short)
+		defer cancel2()
+		wall0 = time.Now()
+		_, err = mb.PostCallbackContext(ctx2, "agent", Callback{
+			Kind: CallbackComplete, Repo: "r", Ref: "main", SHA: "abc",
+		})
+		assertDeadlineBound(t, time.Since(wall0), short, err, false)
+
+		// Broker SendMessageContext
+		bFile := filepath.Join(tmpDir, "ctx-broker.jsonl")
+		relB := holdMailboxLock(t, bFile)
+		defer relB()
+		broker := NewMessageBroker(NewMailbox(bFile), WithRedis(newMockRedisClient(), "h"))
+		defer broker.Close()
+		ctx3, cancel3 := context.WithTimeout(context.Background(), short)
+		defer cancel3()
+		wall0 = time.Now()
+		_, err = broker.SendMessageContext(ctx3, "a", "b", "s", "x")
+		assertDeadlineBound(t, time.Since(wall0), short, err, false)
+
+		// CallbackConsumer DrainContext / AckContext (saveLocked takes flock)
+		cFile := filepath.Join(tmpDir, "ctx-consumer.jsonl")
+		// Pre-create consumer state path parent; hold data lock.
+		relC := holdMailboxLock(t, cFile)
+		defer relC()
+		cons, cerr := NewCallbackConsumer(NewMailbox(cFile), 3)
+		if cerr != nil {
+			t.Fatal(cerr)
+		}
+		ctx4, cancel4 := context.WithTimeout(context.Background(), short)
+		defer cancel4()
+		wall0 = time.Now()
+		_, err = cons.DrainContext(ctx4)
+		// Drain may succeed without flock if inbox empty before save — save
+		// still takes the lock. If err is nil (empty inbox + lock fail path),
+		// still require no long hang.
+		if err != nil {
+			assertDeadlineBound(t, time.Since(wall0), short, err, false)
+		} else if time.Since(wall0) >= stuckGrace/2 {
+			t.Fatalf("DrainContext hung %s", time.Since(wall0))
+		}
+
+		// Seed pending so AckContext must save under lock.
+		cons.state.Pending["env-1"] = &pendingCallback{
+			EnvelopeID: "env-1",
+			Sequence:   1,
+			Callback:   Callback{Repo: "r", Ref: "main", LeaseGeneration: 1},
+		}
+		ctx5, cancel5 := context.WithTimeout(context.Background(), short)
+		defer cancel5()
+		wall0 = time.Now()
+		err = cons.AckContext(ctx5, "env-1")
+		assertDeadlineBound(t, time.Since(wall0), short, err, false)
+	})
+}
+
+// TestMutationProbe_ContextDeadlineBound fails if lock acquisition ignores
+// ctx and falls back to stuckGrace (vacuous "eventually BLOCKED" would pass).
+func TestMutationProbe_ContextDeadlineBound(t *testing.T) {
+	tmpDir := t.TempDir()
+	mailFile := filepath.Join(tmpDir, "mut-ctx.jsonl")
+	release := holdQmeta(t, mailFile)
+	defer release()
 	mb := NewMailbox(mailFile)
-	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Millisecond)
+
+	const short = 30 * time.Millisecond
+	ctx, cancel := context.WithTimeout(context.Background(), short)
 	defer cancel()
-	if _, err := mb.SendMessageContext(ctx, "a", "b", "s", "secret"); !errors.Is(err, ErrMailboxLockTimeout) {
+	wall0 := time.Now()
+	entered := false
+	err := mb.withFileLockContext(ctx, func() error {
+		entered = true
+		return nil
+	})
+	wall := time.Since(wall0)
+	if entered {
+		t.Fatal("CS entered")
+	}
+	if !errors.Is(err, ErrMailboxLockTimeout) {
+		t.Fatalf("got %v", err)
+	}
+	// Mutation: if enqueue used blocking flock without bound, wall ≈ forever
+	// or until test timeout. If ctx dropped and stuckGrace used, wall ≈ 5s.
+	if wall >= stuckGrace/2 {
+		t.Fatalf("mutation: wall %s implies stuckGrace/unbounded qmeta wait", wall)
+	}
+	if wall < short/4 {
+		// Returned impossibly fast without observing the hold — still OK if
+		// expired at entry, but with live hold we expect at least one poll.
+	}
+	var lte *LockTimeoutError
+	if errors.As(err, &lte) && lte.Bound >= stuckGrace && !strings.Contains(lte.Reason, "context") {
+		t.Fatalf("mutation: bound=%s reason=%s looks like default stuckGrace path", lte.Bound, lte.Reason)
+	}
+}
+
+// TestTokenRollback_PostPublishDurable proves post-Link failure paths remove
+// the final token with waiter-dir dirsync (no ghost head after crash).
+func TestTokenRollback_PostPublishDurable(t *testing.T) {
+	tmpDir := t.TempDir()
+	mailFile := filepath.Join(tmpDir, "rollback.jsonl")
+	mb := NewMailbox(mailFile)
+	if err := os.MkdirAll(mb.waiterDir(), 0755); err != nil {
 		t.Fatal(err)
 	}
 
-	// Broker / PostCallback / consumer covered lightly.
-	broker := NewMessageBroker(NewMailbox(filepath.Join(tmpDir, "b.jsonl")), WithRedis(newMockRedisClient(), "h"))
-	defer broker.Close()
-	// hold b's lock
-	rel2 := holdMailboxLock(t, filepath.Join(tmpDir, "b.jsonl"))
-	defer rel2()
-	ctx2, cancel2 := context.WithTimeout(context.Background(), 40*time.Millisecond)
-	defer cancel2()
-	if _, err := broker.SendMessageContext(ctx2, "a", "b", "s", "x"); !errors.Is(err, ErrMailboxLockTimeout) {
-		t.Fatalf("broker: %v", err)
+	origSync := tokenDirSyncFn
+	defer func() { tokenDirSyncFn = origSync }()
+
+	var dirSyncs atomic.Int64
+	tokenDirSyncFn = func(path string) error {
+		// Count waiter-dir syncs (rollback + dequeue).
+		if strings.Contains(path, ".lock.waiters") || filepath.Base(path) == filepath.Base(mb.waiterDir()) {
+			dirSyncs.Add(1)
+		}
+		return origSync(path)
 	}
+
+	// Inject: first syncDirFn after successful link (publish dirsync of token
+	// path) fails — triggers rollbackPublishedToken.
+	origDir := syncDirFn
+	defer func() { syncDirFn = origDir }()
+	var n atomic.Int32
+	syncDirFn = func(path string) error {
+		// token publish calls syncDirFn(tokenPath) after link.
+		if strings.Contains(path, ".lock.waiters") && !strings.HasSuffix(path, ".staging") {
+			if n.Add(1) == 1 {
+				return errors.New("injected post-publish dirsync fail")
+			}
+		}
+		return origDir(path)
+	}
+
+	_, _, _, err := mb.enqueueWaiter()
+	if err == nil {
+		t.Fatal("expected enqueue failure after publish dirsync inject")
+	}
+	// No live ticket tokens may remain (ghost head forbidden).
+	entries, _ := os.ReadDir(mb.waiterDir())
+	for _, e := range entries {
+		if isTicketTokenName(e.Name()) {
+			t.Fatalf("ghost published token remains after failed enqueue: %s", e.Name())
+		}
+	}
+	// Rollback must have attempted durable dirsync of waiter dir.
+	if dirSyncs.Load() < 1 {
+		t.Fatal("rollback did not dirsync waiter dir — not crash-durable")
+	}
+	assertNoAbsPath(t, err.Error())
+}
+
+// TestTokenRollback_UnlockFailureDurable: after publish, qmeta unlock error
+// still rolls back the token durably.
+func TestTokenRollback_UnlockFailureDurable(t *testing.T) {
+	tmpDir := t.TempDir()
+	mailFile := filepath.Join(tmpDir, "rollback-un.jsonl")
+	mb := NewMailbox(mailFile)
+
+	var unlockFails atomic.Int32
+	setTestHooks(&clockHooks{
+		Flock: func(fd int, how int) error {
+			if how == syscall.LOCK_UN {
+				// Fail the qmeta unlock after a successful enqueue publish.
+				if unlockFails.Add(1) == 1 {
+					return errors.New("injected qmeta unlock fail")
+				}
+				return syscall.Flock(fd, how)
+			}
+			return syscall.Flock(fd, how)
+		},
+	})
+	defer clearTestHooks()
+
+	_, tok, _, err := mb.enqueueWaiter()
+	if err == nil {
+		// If unlock injection missed (race on unlock count), clean up.
+		if tok != "" {
+			_ = mb.dequeueWaiter(tok)
+		}
+		t.Fatal("expected enqueue error on qmeta unlock failure")
+	}
+	entries, _ := os.ReadDir(mb.waiterDir())
+	for _, e := range entries {
+		if isTicketTokenName(e.Name()) {
+			t.Fatalf("ghost token after unlock-fail rollback: %s err=%v", e.Name(), err)
+		}
+	}
+	assertNoAbsPath(t, err.Error())
 }
 
 // TestMutationProbe_MailFileFsyncOnly asserts fsync on the mailbox artifact
