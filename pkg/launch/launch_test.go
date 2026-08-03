@@ -447,6 +447,35 @@ func TestOrdinaryRequestCannotBypassProductionDiscovery(t *testing.T) {
 	}
 }
 
+func TestClaudeCommandIncidentRequiresBoundHealthPolicyBeforeEffects(t *testing.T) {
+	settingsPath := t.TempDir() + "/settings.json"
+	settings := `{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"/bin/sh -c '$HOME/.local/bin/moshi-hook --port 8790'","timeout":600}]}],"PostToolUse":[{"hooks":[{"type":"command","command":"/bin/sh -c '$HOME/.local/bin/moshi-hook post'"}]}],"PostToolUseFailure":[{"hooks":[{"type":"command","command":"/bin/sh -c '$HOME/.local/bin/moshi-hook failure'"}]}],"SubagentStart":[{"hooks":[{"type":"command","command":"/bin/sh -c '$HOME/.local/bin/moshi-hook subagent'"}]}]}}`
+	if err := os.WriteFile(settingsPath, []byte(settings), 0600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HERD_CLAUDE_SETTINGS_FILE", settingsPath)
+	discovered, err := (harness.ClaudeDiscovery{}).Discover("claude")
+	if err != nil || len(discovered.Hooks) != 4 {
+		t.Fatalf("realistic Claude command discovery = %+v, err=%v", discovered, err)
+	}
+	req := good(t)
+	var policies []harness.HookPolicy
+	for _, hook := range discovered.Hooks {
+		policies = append(policies, harness.HookPolicy{HandlerDigest: hook.Name, Requirement: harness.HookRequired, HealthURL: "http://127.0.0.1:1/health", Generation: req.LeaseGeneration})
+	}
+	req.HookDiscovery = harness.HookDiscoveryFunc(func(string) (harness.HookDiscoveryResult, error) {
+		return harness.HookDiscoveryResult{State: harness.DiscoveryHooks, Hooks: discovered.Hooks, Policies: policies, PolicyRequired: true}, nil
+	})
+	sink := &MemorySink{}
+	effects := 0
+	if err := Launch(req, sink, LaunchEffects{Tab: func() error { effects++; return nil }, Process: func() error { effects++; return nil }, Prompt: func() error { effects++; return nil }, Board: func() error { effects++; return nil }}); err == nil {
+		t.Fatal("refused command health endpoint must reject")
+	}
+	if effects != 0 || len(sink.Receipts) != 1 || sink.Receipts[0].Kind != "launch_rejected" || sink.Receipts[0].HookCode != string(harness.HookCodeUnavailable) {
+		t.Fatalf("command incident rejection effects=%d receipts=%+v", effects, sink.Receipts)
+	}
+}
+
 func TestHookReceiptRedactsAuthorityAndIsStable(t *testing.T) {
 	req := good(t)
 	withHooks(&req, []harness.Hook{{Name: "policy", URL: "http://user:secret@127.0.0.1:1?token=secret", Requirement: harness.HookRequired}})

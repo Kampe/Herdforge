@@ -747,6 +747,13 @@ func preflightHooks(req Request, sink Sink) (harness.HookReport, error) {
 	if result.State == harness.DiscoveryHooks && len(result.Hooks) == 0 {
 		return report, recordHookFailure(req, sink, harness.HookCodeDiscoveryFailed, "", harness.EndpointInvalid, "")
 	}
+	if result.PolicyRequired {
+		bound, code := harness.ApplyHookPolicies(result.Hooks, result.Policies, req.LeaseGeneration)
+		if code != harness.HookCodeHealthy {
+			return report, recordHookFailure(req, sink, code, "", harness.EndpointInvalid, "")
+		}
+		result.Hooks = bound
+	}
 	req.Hooks = result.Hooks
 	identity := harness.HookIdentity{Provider: req.Decision.Provider, Model: req.Decision.Model, Effort: req.Decision.Effort}
 	report = harness.CheckHooksWithOptions(context.Background(), result.Hooks, identity, req.HookClient, harness.HookCheckOptions{ApprovedAuthorities: result.ApprovedAuthorities})

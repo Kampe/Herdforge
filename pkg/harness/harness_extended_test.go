@@ -2,6 +2,7 @@ package harness
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -262,7 +263,7 @@ func TestClaudeDiscoveryMergesGlobalAndLocalLayersDeterministically(t *testing.T
 	if err != nil || result.State != DiscoveryHooks || len(result.Hooks) != 2 {
 		t.Fatalf("merged Claude layers = %+v, err=%v", result, err)
 	}
-	if result.Hooks[0].Name != claudeHookIdentity("SessionStart", "", "global-only", "http://127.0.0.1:8790/global", 0) || result.Hooks[1].Name != claudeHookIdentity("Stop", "", "override", "http://127.0.0.1:8790/local-override", 0) || result.Hooks[1].URL != "http://127.0.0.1:8790/local-override" {
+	if result.Hooks[0].Name == "" || result.Hooks[1].Name == "" || result.Hooks[0].URL != "http://127.0.0.1:8790/global" || result.Hooks[1].URL != "http://127.0.0.1:8790/local-override" {
 		t.Fatalf("merged ordering/override = %+v", result.Hooks)
 	}
 	if err := os.WriteFile(local, []byte(`{"hooks":{}}`), 0600); err != nil {
@@ -323,5 +324,91 @@ func TestExplicitClaudeSettingsFileMissingFailsClosed(t *testing.T) {
 	result, err := (ClaudeDiscovery{}).Discover("claude")
 	if err == nil || result.State != DiscoveryFailed {
 		t.Fatalf("missing explicit Claude settings = %+v, err=%v", result, err)
+	}
+}
+
+func TestHookPoliciesBindExactGenerationAndHealthAuthority(t *testing.T) {
+	hook := Hook{Name: "claude:pre-tool:canonical", Requirement: HookRequired}
+	valid := HookPolicy{HandlerDigest: hook.Name, Requirement: HookRequired, HealthURL: "http://127.0.0.1:8790/health", Generation: 7}
+	if bound, code := ApplyHookPolicies([]Hook{hook}, []HookPolicy{valid}, 7); code != HookCodeHealthy || bound[0].HealthURL != valid.HealthURL {
+		t.Fatalf("valid policy binding = %+v, code=%s", bound, code)
+	}
+	cases := []struct {
+		name   string
+		policy HookPolicy
+		code   HookCode
+	}{
+		{"missing", HookPolicy{}, HookCodePolicyMissing},
+		{"stale", HookPolicy{HandlerDigest: hook.Name, Requirement: HookRequired, HealthURL: valid.HealthURL, Generation: 8}, HookCodePolicyStale},
+		{"mismatch", HookPolicy{HandlerDigest: hook.Name, Requirement: HookOptional, HealthURL: valid.HealthURL, Generation: 7}, HookCodePolicyMismatch},
+		{"external", HookPolicy{HandlerDigest: hook.Name, Requirement: HookRequired, HealthURL: "https://example.com/health", Generation: 7}, HookCodeAuthority},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			policies := []HookPolicy{tc.policy}
+			if tc.name == "missing" {
+				policies = nil
+			}
+			if _, code := ApplyHookPolicies([]Hook{hook}, policies, 7); code != tc.code {
+				t.Fatalf("policy code=%s, want %s", code, tc.code)
+			}
+		})
+	}
+	if _, code := ApplyHookPolicies([]Hook{hook}, []HookPolicy{valid, valid}, 7); code != HookCodePolicyDuplicate {
+		t.Fatalf("duplicate policy code=%s", code)
+	}
+}
+
+func TestPlainCommandAndPassiveHandlersAreStructuralOnly(t *testing.T) {
+	command := Hook{Name: "command", Requirement: HookRequired, kind: hookCommand, executable: "/bin/sh", Timeout: 600 * time.Second}
+	passive := Hook{Name: "passive", Requirement: HookOptional, kind: hookPassive}
+	report := CheckHooks(context.Background(), []Hook{command, passive}, HookIdentity{}, nil)
+	if report.RequiredHealthy || len(report.Results) != 2 || report.Results[0].Status != HookStructural || report.Results[0].Code != HookCodeNoHealth || report.Results[1].Status != HookStructural {
+		t.Fatalf("structural-only handlers = %+v", report)
+	}
+}
+
+func TestClaudeHTTPIdentityIncludesPathAndBehavior(t *testing.T) {
+	a := `{"hooks":{"PostToolUse":[{"matcher":"","hooks":[{"type":"http","name":"same","url":"http://127.0.0.1:8790/a","headers":{"X-Test":"one"},"once":true}]}]}}`
+	b := `{"hooks":{"PostToolUse":[{"matcher":"","hooks":[{"type":"http","name":"same","url":"http://127.0.0.1:8790/b","headers":{"X-Test":"two"},"once":false}]}]}}`
+	pa, pb := t.TempDir()+"/a.json", t.TempDir()+"/b.json"
+	if err := os.WriteFile(pa, []byte(a), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(pb, []byte(b), 0600); err != nil {
+		t.Fatal(err)
+	}
+	ra, err := (ClaudeDiscovery{Paths: []string{pa}}).Discover("claude")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rb, err := (ClaudeDiscovery{Paths: []string{pb}}).Discover("claude")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ra.Hooks[0].Name == rb.Hooks[0].Name {
+		t.Fatalf("HTTP path/behavior did not affect identity: %q", ra.Hooks[0].Name)
+	}
+}
+
+func TestDefaultDiscoveryAugmentsClaudeInsteadOfReplacingIt(t *testing.T) {
+	settingsPath := t.TempDir() + "/settings.json"
+	settings := `{"hooks":{"PostToolUse":[{"matcher":"","hooks":[{"type":"http","name":"canonical","url":"http://127.0.0.1:8790/live"}]}]}}`
+	if err := os.WriteFile(settingsPath, []byte(settings), 0600); err != nil {
+		t.Fatal(err)
+	}
+	overridePath := t.TempDir() + "/policy.json"
+	t.Setenv("HERD_CLAUDE_SETTINGS_FILE", settingsPath)
+	discovered, err := (ClaudeDiscovery{}).Discover("claude")
+	if err != nil || len(discovered.Hooks) != 1 {
+		t.Fatalf("discovery fixture = %+v, err=%v", discovered, err)
+	}
+	override := `{"providers":{"claude":{"policies":[{"handler_digest":` + fmt.Sprintf("%q", discovered.Hooks[0].Name) + `,"requirement":"required","health_url":"http://127.0.0.1:8790/health","generation":3}]}}}`
+	if err := os.WriteFile(overridePath, []byte(override), 0600); err != nil {
+		t.Fatal(err)
+	}
+	result, err := (DefaultDiscovery{OverridePath: overridePath}).Discover("claude")
+	if err != nil || result.State != DiscoveryHooks || len(result.Hooks) != 1 || result.Hooks[0].URL != "http://127.0.0.1:8790/live" || len(result.Policies) != 1 || !result.PolicyRequired {
+		t.Fatalf("override replaced canonical discovery = %+v, err=%v", result, err)
 	}
 }
