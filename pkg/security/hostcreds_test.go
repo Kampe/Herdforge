@@ -191,12 +191,15 @@ func TestParseHandles_RejectSecrets(t *testing.T) {
 	}
 }
 
-func TestLive_RefusesWithoutBoundary(t *testing.T) {
-	_ = os.Unsetenv(EnvBrokerUID)
-	_ = os.Unsetenv(EnvAllowSameUIDTest)
+func TestLive_RefusesWithoutFAC169(t *testing.T) {
+	restore := SetRequireOSBoundaryForTest(nil)
+	defer restore()
 	_, _, _, err := StartAuthorLive(LiveConfig{Kind: "grok", SessionID: "L1", Prompt: "x"})
 	if err == nil {
 		t.Fatal()
+	}
+	if be, ok := err.(*BlockedError); !ok || be.Code != "fac169_required" {
+		t.Fatal(err)
 	}
 }
 

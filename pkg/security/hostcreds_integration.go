@@ -1,36 +1,35 @@
 package security
 
-// FAC-133 integration contract (FAC-170 lands first; FAC-133 rebases after).
+// Dependency and integration contract for FAC-170 HostCreds.
 //
-// Do not cherry-pick FAC-133 WIP into FAC-170. Do not copy FAC-133 netbroker files.
+// ---------------------------------------------------------------------------
+// FAC-169 (hard blocker for live admission)
+// ---------------------------------------------------------------------------
 //
-// Exact later FAC-133 integration point:
-//   pkg/herdr/live_harness_proof.go → proveLiveHarness
+// Do NOT copy or reimplement FAC-169 separate-UID / attach / proc-mem proofs
+// in this package. After FAC-169 merges to main, rebase FAC-170 and set:
 //
-//  1) auth := security.DiagnoseKindAuthReadinessWith(kind, auth)
-//     if !auth.Brokerable { BLOCKED via FormatKindAuthBlocker }
+//	security.RequireOSBoundary = /* adapter over merged FAC-169 API */
 //
-//  2) Production authority (NOT raw env keys):
-//       a := security.NewHandleAuthorityFromEnv() // HERD_HOSTCREDS_HANDLES only
-//       // or construct HandleAuthority and InstallFromHandle per host
+// Until then RequireOSBoundary defaults to BLOCKED code=fac169_required.
+// No BUILD COMPLETE / review until that rebase + live proof under FAC-169.
 //
-//  3) sess, err := security.StartAuthorSessionNonInteractive(kind, worktree, a)
-//     defer sess.Close()
-//     env := sess.WorkerEnv() // dummy sentinels + socket path only
-//     fd, err := sess.OpenPreopenedFD() // preferred
+// ---------------------------------------------------------------------------
+// FAC-133 (after FAC-170 + FAC-169)
+// ---------------------------------------------------------------------------
 //
-//  4) Sandbox: deny DirectProviderHostsForKind(kind); allow only oracle FD/socket.
+// Exact wire-up: pkg/herdr/live_harness_proof.go → proveLiveHarness
 //
-//  5) CredentialAuthority has NO Get/Snapshot. Injection only via
-//     InjectAuthorization inside the oracle.
+//  1) DiagnoseKindAuthReadinessWith(kind, auth)
+//  2) HandleAuthority from HERD_HOSTCREDS_HANDLES (not raw env keys)
+//  3) StartAuthorLive or StartAuthorSessionNonInteractive + WorkerEnv (MITM)
+//  4) Deny DirectProviderHostsForKind(kind) outside MITM
+//  5) No Get/Snapshot on CredentialAuthority
 //
-// Compiled production caller: herd hostcreds diagnose|session|selftest
+// Independent FAC-170 surface (no FAC-169 required for unit selftest):
+//   herd hostcreds diagnose|session|selftest
+// Live:
+//   herd hostcreds live --kind grok   // gated on FAC-169
 
 // IntegrationAPIVersion is bumped on breaking HostCreds API changes.
-const IntegrationAPIVersion = 3
-
-// Live entry (FAC-170 production caller):
-//   herd hostcreds live --kind grok
-// requires HERD_HOSTCREDS_BROKER_UID ≠ worker, HERD_HOSTCREDS_BROKER_PID,
-// handle-backed authority, and harness/herdr. Same-UID theater is BLOCKED.
-// FAC-133 after rebase should call security.StartAuthorLive (not fake httptest).
+const IntegrationAPIVersion = 4

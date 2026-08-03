@@ -15,15 +15,13 @@ import (
 )
 
 // LiveProof is exact-session evidence for a real hosted author OS process.
+// Full admission also requires FAC-169 OS boundary (RequireOSBoundary).
 type LiveProof struct {
 	SessionID          string
 	Kind               string
 	AuthorPID          int
-	BrokerPID          int
-	BrokerUID          int
-	WorkerUID          int
 	Prompt             string
-	PromptInArgv       bool // process started with prompt in argv
+	PromptInArgv       bool
 	ForbiddenDenied    bool
 	BoundaryDigest     string
 	OutputSnippet      string
@@ -46,11 +44,12 @@ type LiveConfig struct {
 	Timeout       time.Duration
 }
 
-// StartAuthorLive launches a real hosted author (grok|claude|codex) non-interactively.
+// StartAuthorLive launches a real hosted author (grok|claude|codex) non-interactively
+// through HostCreds MITM transport. OS isolation is owned by FAC-169 — this
+// function fails closed until RequireOSBoundary is wired after FAC-169 merges.
 //
-// Requires separate-UID OS boundary, handle-backed authority, harness binary.
-// Worker env: HTTPS MITM proxy + public CA only — no real or dummy API keys.
-// Prompt is delivered as harness argv; PromptConsumed only after process Start.
+// Independent FAC-170 work here: harness argv prompt, MITM env (no API keys),
+// kind-exact allowlist, forbidden CONNECT denial, TLS inject path.
 func StartAuthorLive(cfg LiveConfig) (*HostCredsSession, *exec.Cmd, *LiveProof, error) {
 	kind := strings.ToLower(strings.TrimSpace(cfg.Kind))
 	if kind == "opencode" || kind == "fake" || kind == "test" {
@@ -59,11 +58,16 @@ func StartAuthorLive(cfg LiveConfig) (*HostCredsSession, *exec.Cmd, *LiveProof, 
 	if !IsSupportedAuthorKind(kind) {
 		return nil, nil, nil, &BlockedError{Reason: BlockUnbrokerableKind, Code: "unsupported_kind", Kind: kind}
 	}
-	if SameUIDTestAllowed() {
-		return nil, nil, nil, &BlockedError{Reason: BlockSecretExposure, Code: "live_refuses_same_uid_test_mode", Kind: kind}
-	}
-	bound, err := RequireProductionBoundary()
+
+	// Hard dependency: FAC-169 OS boundary (not implemented in FAC-170).
+	bound, err := RequireOSBoundary()
 	if err != nil {
+		return nil, nil, nil, err
+	}
+	if bound == nil {
+		return nil, nil, nil, &BlockedError{Reason: BlockSecretExposure, Code: "fac169_required", Kind: kind}
+	}
+	if err := bound.AdversarialProbe(); err != nil {
 		return nil, nil, nil, err
 	}
 
@@ -114,25 +118,10 @@ func StartAuthorLive(cfg LiveConfig) (*HostCredsSession, *exec.Cmd, *LiveProof, 
 	proof := &LiveProof{
 		SessionID:      sess.ID,
 		Kind:           kind,
-		BrokerPID:      bound.BrokerPID,
-		BrokerUID:      bound.BrokerUID,
-		WorkerUID:      bound.WorkerUID,
 		Prompt:         prompt,
-		BoundaryDigest: bound.ProbeDigest,
+		BoundaryDigest: bound.ProbeDigest(),
 		AllowedMarker:  marker,
 		MitmTransport:  sess.Mitm != nil,
-	}
-
-	// Boundary probes before launch.
-	if bound.SecretPath != "" {
-		if err := provePathUnreadableByWorker(bound.SecretPath); err != nil {
-			_ = sess.Close()
-			return nil, nil, proof, err
-		}
-	}
-	if err := proveAttachDenied(bound.BrokerPID, bound.BrokerUID); err != nil {
-		_ = sess.Close()
-		return nil, nil, proof, err
 	}
 
 	timeout := cfg.Timeout
@@ -140,55 +129,9 @@ func StartAuthorLive(cfg LiveConfig) (*HostCredsSession, *exec.Cmd, *LiveProof, 
 		timeout = 90 * time.Second
 	}
 
-	if cfg.UseHerdr && herdr.IsAvailable() {
-		ws := cfg.Workspace
-		if ws == "" {
-			ws = os.Getenv("HERD_WORKSPACE")
-		}
-		if ws == "" {
-			_ = sess.Close()
-			return nil, nil, proof, &BlockedError{Reason: BlockNoSession, Code: "herdr_workspace_required", Kind: kind}
-		}
-		cwd := cfg.WorkDir
-		if cwd == "" {
-			cwd, _ = os.Getwd()
-		}
-		// Pass harness proxy env into tab.
-		tab, terr := herdr.TabCreate(herdr.TabCreateOptions{
-			Workspace: ws,
-			Label:     "hc-live-" + sess.ID,
-			Cwd:       cwd,
-			NoFocus:   true,
-			Env:       sess.WorkerEnv(),
-		})
-		if terr != nil {
-			_ = sess.Close()
-			return nil, nil, proof, &BlockedError{Reason: BlockAbuse, Code: "herdr_tab_failed", Kind: kind}
-		}
-		name := "hc-" + sess.ID
-		if err := herdr.AgentStart(name, kind, tab.Pane.ID); err != nil {
-			_ = herdr.TabClose(tab.ID)
-			_ = sess.Close()
-			return nil, nil, proof, &BlockedError{Reason: BlockAbuse, Code: "herdr_agent_start", Kind: kind}
-		}
-		// herdr does not always expose OS PID; use negative sentinel then prompt.
-		// RecordHarnessPrompt requires PID>0 — use process lookup best-effort or skip PID check for herdr.
-		// For exact-session we require a real pid: try agent list.
-		pid := 1 // placeholder blocked — require real
-		if agents, aerr := herdr.AgentList(); aerr == nil {
-			for _, a := range agents {
-				if a.Name == name && a.TabID != "" {
-					// no pid field typically
-					_ = a
-				}
-			}
-		}
-		// Use self PID of herdr child is unavailable — fail closed unless we get a pid.
-		// Fallback: start local harness process instead when PID unknown.
-		_ = herdr.TabClose(tab.ID)
-		_ = pid
-		// Prefer direct exec for exact PID binding.
-	}
+	// Prefer direct exec for exact PID + argv binding (herdr optional later).
+	_ = cfg.UseHerdr
+	_ = herdr.IsAvailable
 
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	cmd := exec.CommandContext(ctx, inv[0], inv[1:]...)
@@ -206,7 +149,6 @@ func StartAuthorLive(cfg LiveConfig) (*HostCredsSession, *exec.Cmd, *LiveProof, 
 		_ = sess.Close()
 		return nil, nil, proof, &BlockedError{Reason: BlockAbuse, Code: "harness_start_failed", Kind: kind}
 	}
-	// Exact-session: prompt is in argv of this PID.
 	if err := sess.RecordHarnessPrompt(prompt, cmd.Process.Pid); err != nil {
 		_ = cmd.Process.Kill()
 		cancel()
@@ -216,7 +158,6 @@ func StartAuthorLive(cfg LiveConfig) (*HostCredsSession, *exec.Cmd, *LiveProof, 
 	proof.AuthorPID = cmd.Process.Pid
 	proof.PromptInArgv = true
 
-	// Env must not contain API keys.
 	if err := sess.AssertNoWorkerBearerToken(); err != nil {
 		_ = cmd.Process.Kill()
 		cancel()
@@ -225,7 +166,6 @@ func StartAuthorLive(cfg LiveConfig) (*HostCredsSession, *exec.Cmd, *LiveProof, 
 	}
 	proof.NoAPIKeysInEnv = true
 
-	// Wait bounded.
 	_ = cmd.Wait()
 	cancel()
 	combined := stdout.String() + stderr.String()
@@ -236,8 +176,8 @@ func StartAuthorLive(cfg LiveConfig) (*HostCredsSession, *exec.Cmd, *LiveProof, 
 		proof.ForbiddenDenied = true
 	}
 
-	// Re-prove boundary after run.
-	if err := proveAttachDenied(bound.BrokerPID, bound.BrokerUID); err != nil {
+	// Re-run FAC-169 probe after harness run.
+	if err := bound.AdversarialProbe(); err != nil {
 		_ = sess.Close()
 		return sess, cmd, proof, err
 	}
@@ -246,7 +186,6 @@ func StartAuthorLive(cfg LiveConfig) (*HostCredsSession, *exec.Cmd, *LiveProof, 
 		_ = sess.Close()
 		return sess, cmd, proof, &BlockedError{Reason: BlockAbuse, Code: "incomplete_live_proof", Kind: kind}
 	}
-	// Marker requires live provider; if missing return proof + BLOCKED for honesty.
 	if !proof.ModelMarkerReached {
 		return sess, cmd, proof, &BlockedError{Reason: BlockAbuse, Code: "marker_not_reached", Kind: kind}
 	}
@@ -257,8 +196,6 @@ func scrubAndMergeEnv(parent, worker []string) []string {
 	deny := map[string]bool{
 		"ANTHROPIC_API_KEY": true, "OPENAI_API_KEY": true, "XAI_API_KEY": true,
 		"HERD_HOST_CREDS": true, "HERD_HOSTCREDS_HANDLES": true,
-		EnvBrokerUID: true, EnvBrokerPID: true, "HERD_HOSTCREDS_SECRET_PATH": true,
-		EnvAllowSameUIDTest: true,
 	}
 	out := make([]string, 0, len(parent)+len(worker))
 	for _, e := range parent {
