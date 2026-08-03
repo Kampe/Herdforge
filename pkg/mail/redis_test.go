@@ -3,6 +3,7 @@ package mail
 import (
 	"context"
 	"encoding/json"
+	"path"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
@@ -56,27 +57,31 @@ func (m *mockRedisClient) Publish(_ context.Context, channel string, message int
 	msg := publishedMsg{Channel: channel, Data: string(data)}
 	m.mu.Lock()
 	m.published = append(m.published, msg)
-	// also deliver to matching subs
 	if err := m.publishErr.Load(); err != nil {
 		m.mu.Unlock()
 		return redis.NewIntResult(0, err.(error))
 	}
-	if ps, ok := m.subs[channel]; ok {
-		ps.ch <- &redis.Message{Channel: channel, Payload: string(data)}
+	// Real Redis PSUBSCRIBE delivers a publish to every matching pattern,
+	// including the publisher's own subscription — simulate that here so
+	// tests exercise the broker's self-echo dedup, not mask it.
+	for pattern, ps := range m.subs {
+		if ok, _ := path.Match(pattern, channel); ok {
+			ps.ch <- &redis.Message{Channel: channel, Payload: string(data)}
+		}
 	}
 	m.mu.Unlock()
 	return redis.NewIntResult(1, nil)
 }
 
-func (m *mockRedisClient) Subscribe(_ context.Context, channels ...string) Subscription {
+func (m *mockRedisClient) PSubscribe(_ context.Context, patterns ...string) Subscription {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	for _, ch := range channels {
-		if _, ok := m.subs[ch]; !ok {
-			m.subs[ch] = newMockPubSub()
+	for _, p := range patterns {
+		if _, ok := m.subs[p]; !ok {
+			m.subs[p] = newMockPubSub()
 		}
 	}
-	return m.subs[channels[0]]
+	return m.subs[patterns[0]]
 }
 
 func (m *mockRedisClient) Close() error {
