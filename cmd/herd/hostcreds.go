@@ -40,20 +40,18 @@ func runHostCreds() {
 }
 
 func printHostCredsUsage() {
-	fmt.Fprintln(os.Stderr, `herd hostcreds — HostCreds oracle (FAC-170)
+	fmt.Fprintln(os.Stderr, `herd hostcreds — HostCreds (FAC-170)
 
 Usage:
   herd hostcreds diagnose  --kind <grok|claude|codex>
   herd hostcreds session   --kind <grok|claude|codex>
   herd hostcreds selftest
-  herd hostcreds boundary          # prove separate-UID OS boundary (fail-closed)
-  herd hostcreds live --kind <grok|claude|codex> [--herdr] [--marker S]
+  herd hostcreds boundary          # reports FAC-169 dependency status
+  herd hostcreds live --kind <grok|claude|codex> [--marker S]
 
-Production:
-  HERD_HOSTCREDS_HANDLES="api.x.ai=keychain:…|op://…"  (handles only)
-  HERD_HOSTCREDS_BROKER_UID  ≠ worker uid
-  HERD_HOSTCREDS_BROKER_PID  broker process for attach probe
-  HERD_HOSTCREDS_SECRET_PATH optional secret file unreadable by worker
+Production secrets: HERD_HOSTCREDS_HANDLES (keychain:|op:// only)
+OS isolation: FAC-169 (hard blocker) — FAC-170 does not reimplement it.
+Live admission waits for FAC-169 merge + RequireOSBoundary wiring.
 
 Exit: 0 ok, 1 fatal, 2 BLOCKED/usage. Never prints credential bytes. No OpenCode.`)
 }
@@ -64,13 +62,13 @@ func runHostCredsBoundary(args []string) int {
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
-	b, err := security.RequireProductionBoundary()
+	b, err := security.RequireOSBoundary()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err.Error())
+		fmt.Fprintln(os.Stderr, "hostcreds: OS boundary is owned by FAC-169; do not invent a FAC-170 duplicate")
 		return 2
 	}
-	fmt.Printf("HOSTCREDS_BOUNDARY ok mechanism=%s broker_uid=%d worker_uid=%d broker_pid=%d digest=%s\n",
-		b.Mechanism, b.BrokerUID, b.WorkerUID, b.BrokerPID, b.ProbeDigest)
+	fmt.Printf("HOSTCREDS_BOUNDARY ok mechanism=%s digest=%s\n", b.Mechanism(), b.ProbeDigest())
 	return 0
 }
 

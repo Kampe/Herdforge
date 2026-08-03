@@ -35,17 +35,16 @@ func TestMutation_PerKindIsolation(t *testing.T) {
 	}
 }
 
-func TestMutation_LiveNeedsBoundary(t *testing.T) {
-	_ = os.Unsetenv(EnvBrokerUID)
-	_ = os.Unsetenv(EnvAllowSameUIDTest)
+func TestMutation_LiveNeedsFAC169Boundary(t *testing.T) {
+	restore := SetRequireOSBoundaryForTest(nil)
+	defer restore()
 	_, _, _, err := StartAuthorLive(LiveConfig{Kind: "grok", SessionID: "m3", Prompt: "hi"})
 	if err == nil {
-		t.Fatal("MUTATION: live without boundary")
+		t.Fatal("MUTATION: live without FAC-169 boundary")
 	}
-	if !errors.Is(err, ErrHostCredsBlocked) {
-		if _, ok := err.(*BlockedError); !ok {
-			t.Fatal(err)
-		}
+	be, ok := err.(*BlockedError)
+	if !ok || be.Code != "fac169_required" {
+		t.Fatalf("want fac169_required, got %v", err)
 	}
 }
 
