@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -29,15 +30,15 @@ const (
 
 // GateResult is the authoritative pre-side-effect decision for one task.
 type GateResult struct {
-	Ref              Ref              `json:"ref"`
-	TaskID           TaskID           `json:"task_id"`
-	Entrypoint       LaunchEntrypoint `json:"entrypoint"`
-	OK               bool             `json:"ok"`
-	BlockedBy        []string         `json:"blocked_by,omitempty"`
-	GraphRevision    string           `json:"graph_revision"`
-	ProviderRevision string           `json:"provider_revision,omitempty"`
-	Report           *ReconcileReport `json:"report,omitempty"`
-	Provenance       *Provenance      `json:"provenance,omitempty"`
+	Ref              Ref               `json:"ref"`
+	TaskID           TaskID            `json:"task_id"`
+	Entrypoint       LaunchEntrypoint  `json:"entrypoint"`
+	OK               bool              `json:"ok"`
+	BlockedBy        []string          `json:"blocked_by,omitempty"`
+	GraphRevision    string            `json:"graph_revision"`
+	ProviderRevision string            `json:"provider_revision,omitempty"`
+	Report           *ReconcileReport  `json:"report,omitempty"`
+	Provenance       *Provenance       `json:"provenance,omitempty"`
 	StatusByBlocker  map[string]string `json:"status_by_blocker,omitempty"`
 }
 
@@ -173,27 +174,56 @@ func ValidateLaunch(
 			}
 	}
 
-	blockers := InboundBlockers(board, taskRef)
+	// Eligibility is transitive: every ancestor in the full inbound blocks
+	// closure must be authoritatively Done. Checking only the task's direct
+	// incident edges lets A(to-do) -> B(done) -> T launch T incorrectly.
+	closure := prerequisiteClosureNodes(snap.Edges, taskRef, taskID)
+	blockers := make([]closureNode, 0, len(closure))
+	for _, n := range closure {
+		isLaunchTask := (taskID.Valid() && n.id == taskID) || (taskRef.Valid() && n.ref == taskRef)
+		if isLaunchTask {
+			continue
+		}
+		if !n.ref.Valid() {
+			return nil, &BlockedError{
+				Ref: taskRef, Code: "unresolved",
+				Reason: fmt.Sprintf("prerequisite %s has no provider ref", n.id),
+			}
+		}
+		blockers = append(blockers, n)
+	}
+	sort.Slice(blockers, func(i, j int) bool {
+		if blockers[i].ref != blockers[j].ref {
+			return blockers[i].ref < blockers[j].ref
+		}
+		return blockers[i].id < blockers[j].id
+	})
 	statusBy := map[string]string{}
 	var open []string
 	var details []string
 	for _, b := range blockers {
-		st, bid, berr := store.TaskStatus(ctx, b)
+		st, bid, berr := store.TaskStatus(ctx, b.ref)
 		if berr != nil {
 			return nil, &BlockedError{
 				Ref: taskRef, Code: "stale",
-				Reason: fmt.Sprintf("blocker %s unreadable: %v", b, berr),
+				Reason: fmt.Sprintf("prerequisite %s unreadable: %v", b.ref, berr),
+			}
+		}
+		if !bid.Valid() || (b.id.Valid() && bid != b.id) {
+			return nil, &BlockedError{
+				Ref: taskRef, Code: "stale",
+				Reason: fmt.Sprintf("prerequisite %s identity changed: snapshot=%s readback=%s", b.ref, b.id, bid),
 			}
 		}
 		st = provider.NormalizeStatus(st)
-		statusBy[string(b)] = st
+		statusBy[string(b.ref)] = st
 		if st != provider.StatusDone {
-			open = append(open, string(b))
-			details = append(details, fmt.Sprintf("blocker %s status=%s id=%s (need done)", b, st, bid))
+			open = append(open, string(b.ref))
+			details = append(details, fmt.Sprintf("prerequisite %s status=%s id=%s (need done)", b.ref, st, bid))
 		}
 	}
 
-	// Relation-graph revision only (edges + blocker statuses). Target task
+	// Relation-graph revision only (edges + transitive prerequisite statuses). Target task
 	// status is ownership via claim lease generation — including ToDo→InProgress
 	// here would make every successful post-claim check mismatch deterministically.
 	_ = status
@@ -207,10 +237,10 @@ func ValidateLaunch(
 				Ref: taskRef, TaskID: taskID, Entrypoint: entrypoint,
 				OK: false, Report: rep, GraphRevision: rev,
 				ProviderRevision: snap.ProviderRevision,
-				BlockedBy: open, StatusByBlocker: statusBy,
+				BlockedBy:        open, StatusByBlocker: statusBy,
 			}, &BlockedError{
 				Ref: taskRef, Code: "toctou",
-				Reason: fmt.Sprintf("graph revision changed since selection (was %s now %s); concurrent relation mutation", selectionRevision, rev),
+				Reason:  fmt.Sprintf("graph revision changed since selection (was %s now %s); concurrent prerequisite graph/status mutation", selectionRevision, rev),
 				Details: details,
 				Report:  rep,
 			}
@@ -221,7 +251,7 @@ func ValidateLaunch(
 				Ref: taskRef, TaskID: taskID, Entrypoint: entrypoint,
 				OK: false, Report: rep, GraphRevision: rev,
 				ProviderRevision: snap.ProviderRevision,
-				BlockedBy: open, StatusByBlocker: statusBy,
+				BlockedBy:        open, StatusByBlocker: statusBy,
 			}, &BlockedError{
 				Ref: taskRef, Code: "open_blocker",
 				Reason:  fmt.Sprintf("blocked by non-done prerequisites: %s", strings.Join(open, ", ")),
@@ -246,7 +276,7 @@ func ValidateLaunch(
 		Ref: taskRef, TaskID: taskID, Entrypoint: entrypoint,
 		OK: true, Report: rep, GraphRevision: rev,
 		ProviderRevision: snap.ProviderRevision,
-		Provenance: prov, StatusByBlocker: statusBy,
+		Provenance:       prov, StatusByBlocker: statusBy,
 	}, nil
 }
 

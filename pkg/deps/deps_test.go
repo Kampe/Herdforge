@@ -382,6 +382,70 @@ func TestGate_OpenBlockerBlocks(t *testing.T) {
 	}
 }
 
+func transitiveStatusFixture(t *testing.T, ancestorStatus string) (*MemoryStore, *Provenance) {
+	t.Helper()
+	m := NewMemoryStore()
+	// Keep the relation-provider revision stable across status mutations. The
+	// proof must depend on transitive status reads, not synthetic revision churn.
+	m.ProviderRevisionToken = "fixed-relation-revision"
+	m.EnsureTask("FAC-A", ancestorStatus, provider.PriorityHigh)
+	m.EnsureTask("FAC-B", provider.StatusDone, provider.PriorityHigh)
+	m.EnsureTask("FAC-T", provider.StatusToDo, provider.PriorityUrgent)
+	if _, err := m.SeedBlocks("FAC-A", "FAC-B"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.SeedBlocks("FAC-B", "FAC-T"); err != nil {
+		t.Fatal(err)
+	}
+	return m, prov("FAC-T", DependencyEdge{
+		SourceRef: "FAC-B", TargetRef: "FAC-T", Type: EdgeBlocks,
+	})
+}
+
+func TestGate_IndirectPrerequisiteNonDoneBlocks(t *testing.T) {
+	m, desired := transitiveStatusFixture(t, provider.StatusToDo)
+	result, err := ValidateLaunch(context.Background(), m, EntryDispatch, "FAC-T", desired, "")
+	if err == nil {
+		t.Fatal("indirect prerequisite FAC-A is to-do; launch must fail closed")
+	}
+	var blocked *BlockedError
+	if !errors.As(err, &blocked) || blocked.Code != "open_blocker" {
+		t.Fatalf("want open_blocker for indirect prerequisite, got %v", err)
+	}
+	if result == nil || len(result.BlockedBy) != 1 || result.BlockedBy[0] != "FAC-A" {
+		t.Fatalf("want only indirect FAC-A blocked, got %+v", result)
+	}
+	if got := result.StatusByBlocker["FAC-A"]; got != provider.StatusToDo {
+		t.Fatalf("want FAC-A status %q, got %q", provider.StatusToDo, got)
+	}
+}
+
+func TestFencedClaim_IndirectPrerequisiteStatusMutationCompensatesOnce(t *testing.T) {
+	m, desired := transitiveStatusFixture(t, provider.StatusDone)
+	pre, err := ValidateLaunch(context.Background(), m, EntryClaim, "FAC-T", desired, "")
+	if err != nil {
+		t.Fatalf("all transitive prerequisites start done: %v", err)
+	}
+
+	compensations := 0
+	_, err = FencedClaim(
+		context.Background(), m, "FAC-T", "id-fac-t", desired, pre.GraphRevision,
+		func(context.Context) error {
+			return m.SetStatus("FAC-A", provider.StatusToDo)
+		},
+		func(context.Context, TaskID, string) error {
+			compensations++
+			return nil
+		},
+	)
+	if err == nil || !errors.Is(err, ErrPostClaimDrift) {
+		t.Fatalf("want post-claim drift for indirect status mutation, got %v", err)
+	}
+	if compensations != 1 {
+		t.Fatalf("want exactly one compensation, got %d", compensations)
+	}
+}
+
 func TestGate_UnknownStatusFailClosed(t *testing.T) {
 	m := NewMemoryStore()
 	m.EnsureTask("FAC-1", "to-do", provider.PriorityUrgent)
@@ -486,7 +550,7 @@ func TestProvenance_FenceAuthoritative(t *testing.T) {
 	if !p.Present {
 		t.Fatal("fence must be Present")
 	}
-	if err := func() error { p.TaskID="id-fac-75"; return p.BindAndValidate("FAC-75", "id-fac-75") }(); err != nil {
+	if err := func() error { p.TaskID = "id-fac-75"; return p.BindAndValidate("FAC-75", "id-fac-75") }(); err != nil {
 		t.Fatal(err)
 	}
 	blocks, err := p.DesiredBlocks()
