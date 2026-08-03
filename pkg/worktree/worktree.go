@@ -7,6 +7,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+
+	"github.com/Kampe/Herdforge/pkg/preflight"
 )
 
 // execCommandContext is a variable so tests can mock; defaults to exec.CommandContext
@@ -49,7 +51,16 @@ type WorktreeInfo struct {
 	AnchorRef string // refs/herd/anchors/<task>
 }
 
+// guardDiskPressure fails closed before any worktree mutation when the repo,
+// pool, or temp volume is under critical disk pressure (FAC-153).
+func (w *WorktreeManager) guardDiskPressure(operation string) error {
+	return preflight.CheckDiskPressure(operation, w.RepoRoot, w.WorktreeDir, os.TempDir())
+}
+
 func (w *WorktreeManager) CreateWorktree(ctx context.Context, branch string, targetDir string) error {
+	if err := w.guardDiskPressure("worktree_create"); err != nil {
+		return err
+	}
 	cmd := execCommandContext(ctx, "git", "worktree", "add", "-b", branch, targetDir, "HEAD")
 	cmd.Dir = w.RepoRoot
 	if output, err := cmd.CombinedOutput(); err != nil {
@@ -234,6 +245,11 @@ func (w *WorktreeManager) CreateTaskWorktree(ctx context.Context, taskRef string
 func (w *WorktreeManager) CreateTaskWorktreeFrom(ctx context.Context, taskRef, defaultBranch string) (*WorktreeInfo, error) {
 	if strings.TrimSpace(taskRef) == "" {
 		return nil, fmt.Errorf("task ref is required")
+	}
+	// Fail closed before ANY mutation — including the durable anchor ref
+	// write below — when disk headroom is critical (FAC-153).
+	if err := w.guardDiskPressure("worktree_create"); err != nil {
+		return nil, err
 	}
 	branch := TaskBranch(taskRef)
 	targetPath := filepath.Join(w.WorktreeDir, strings.ToLower(taskRef))
