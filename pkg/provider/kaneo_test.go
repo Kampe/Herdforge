@@ -294,6 +294,36 @@ func TestResolveKaneoProjectID_FromEnv(t *testing.T) {
 	}
 }
 
+func TestKaneoGetTask_ArrayBody(t *testing.T) {
+	// Cross-package mocks and some Kaneo shapes return a JSON array for get.
+	// Readback after claim must still decode (CI: pkg/daemon pulse).
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`[{"id":"t-1","ref":"FAC-99","title":"Pulse","status":"in-progress","priority":"urgent","projectId":"p","labels":[{"name":"herd-smith"}]}]`))
+	}))
+	defer server.Close()
+
+	kp := NewKaneoProvider(server.URL, "p", false)
+	task, err := kp.GetTask(context.Background(), "t-1")
+	if err != nil {
+		t.Fatalf("array body GetTask: %v", err)
+	}
+	if task.Ref != "FAC-99" || task.Status != StatusInProgress {
+		t.Fatalf("unexpected task: %+v", task)
+	}
+	// Non-vacuity: empty array fails closed.
+	empty := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`[]`))
+	}))
+	defer empty.Close()
+	kp2 := NewKaneoProvider(empty.URL, "p", false)
+	if _, err := kp2.GetTask(context.Background(), "t-1"); err == nil {
+		t.Fatal("empty array must fail")
+	}
+}
+
 func TestKaneoLabel_DualShape(t *testing.T) {
 	// CLI form: labels as strings
 	var cli kaneoTaskDTO
