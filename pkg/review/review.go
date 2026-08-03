@@ -6,6 +6,8 @@ import (
 	"os/exec"
 	"strings"
 	"time"
+
+	"github.com/Kampe/Herdforge/pkg/control"
 )
 
 // ModelFamily maps a provider or model prefix to a canonical family name.
@@ -34,26 +36,26 @@ type FamilyRegistry struct {
 func NewFamilyRegistry() *FamilyRegistry {
 	return &FamilyRegistry{
 		entries: map[string]ModelFamily{
-			"claude":   FamilyAnthropic,
-			"sonnet":   FamilyAnthropic,
-			"opus":     FamilyAnthropic,
-			"haiku":    FamilyAnthropic,
+			"claude":    FamilyAnthropic,
+			"sonnet":    FamilyAnthropic,
+			"opus":      FamilyAnthropic,
+			"haiku":     FamilyAnthropic,
 			"anthropic": FamilyAnthropic,
-			"gemini":   FamilyGoogle,
-			"google":  FamilyGoogle,
-			"agy":     FamilyGoogle,
-			"gpt":      FamilyOpenAI,
-			"o1":       FamilyOpenAI,
-			"o3":       FamilyOpenAI,
-			"grok":     FamilyGrok,
-			"xai":      FamilyGrok,
-			"ollama":   FamilyOllama,
-			"llama":    FamilyOllama,
-			"kimi":     FamilyKimi,
-			"moonshot": FamilyKimi,
-			"codex":    FamilyCodex,
-			"lazer":    FamilyLazer,
-			"deepseek": FamilyLazer,
+			"gemini":    FamilyGoogle,
+			"google":    FamilyGoogle,
+			"agy":       FamilyGoogle,
+			"gpt":       FamilyOpenAI,
+			"o1":        FamilyOpenAI,
+			"o3":        FamilyOpenAI,
+			"grok":      FamilyGrok,
+			"xai":       FamilyGrok,
+			"ollama":    FamilyOllama,
+			"llama":     FamilyOllama,
+			"kimi":      FamilyKimi,
+			"moonshot":  FamilyKimi,
+			"codex":     FamilyCodex,
+			"lazer":     FamilyLazer,
+			"deepseek":  FamilyLazer,
 		},
 	}
 }
@@ -119,6 +121,7 @@ type HarvestResult struct {
 
 type ReviewEngine struct {
 	RepoRoot string
+	Orders   *control.CoordinatorOrders
 }
 
 func NewReviewEngine(repoRoot string) *ReviewEngine {
@@ -235,6 +238,11 @@ func (r *ReviewEngine) RebaseMergeBranch(ctx context.Context, branchName, target
 	shaOut, err := revCmd.Output()
 	if err != nil {
 		return &HarvestResult{Merged: true, Output: string(out)}, nil
+	}
+	if r.Orders != nil {
+		if _, orderErr := r.Orders.Rebase(ctx, fmt.Sprintf("rebase %s onto %s -> %s", branchName, targetBranch, strings.TrimSpace(string(shaOut)))); orderErr != nil {
+			return &HarvestResult{Merged: false, Output: string(out)}, fmt.Errorf("durable rebase order: %w", orderErr)
+		}
 	}
 
 	return &HarvestResult{

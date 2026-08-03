@@ -2,6 +2,7 @@ package review
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -10,6 +11,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/Kampe/Herdforge/pkg/control"
 )
 
 // LedgerEvent types.
@@ -272,10 +275,10 @@ type VerdictOpts struct {
 // Verdict appends a verdict event and side-writes to the queue.
 func (l *Ledger) Verdict(opts VerdictOpts) (enqueued bool, err error) {
 	row := &LedgerRow{
-		Event:   string(EventVerdict),
-		SHA:     opts.SHA,
+		Event:    string(EventVerdict),
+		SHA:      opts.SHA,
 		Reviewer: opts.Reviewer,
-		Verdict: string(opts.Verdict),
+		Verdict:  string(opts.Verdict),
 		Artifact: opts.Artifact,
 	}
 	if opts.ReviewerFamily != "" {
@@ -314,6 +317,7 @@ type RepairOpts struct {
 	RepairAuthor string
 	Branch       string
 	RepairFamily string
+	Orders       *control.CoordinatorOrders
 }
 
 // Repair appends a repair event.
@@ -327,7 +331,14 @@ func (l *Ledger) Repair(opts RepairOpts) error {
 	if opts.RepairFamily != "" {
 		row.RepairFamily = opts.RepairFamily
 	}
-	return l.appendRow(l.Path, row)
+	if err := l.appendRow(l.Path, row); err != nil {
+		return err
+	}
+	if opts.Orders != nil {
+		_, err := opts.Orders.Repair(context.Background(), fmt.Sprintf("repair candidate %s on %s", opts.SHA, opts.Branch))
+		return err
+	}
+	return nil
 }
 
 // Consumed marks a sha as consumed in both ledger and queue.

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/Kampe/Herdforge/pkg/config"
+	"github.com/Kampe/Herdforge/pkg/control"
 	"github.com/Kampe/Herdforge/pkg/deps"
 	"github.com/Kampe/Herdforge/pkg/herdr"
 	"github.com/Kampe/Herdforge/pkg/launch"
@@ -149,6 +150,9 @@ type Dispatcher struct {
 	// Compensator is required for every Dispatch call (FAC-121 R3).
 	// Wire FAC-119 durable outbox / FAC-120 fenced lease compensator here.
 	Compensator Compensator
+	// Orders is the durable coordinator-to-lane control port. When configured,
+	// every repair prompt is persisted before Herdr is nudged.
+	Orders *control.CoordinatorOrders
 	// Herdr is optional; defaults to LiveHerdr.
 	Herdr HerdrLauncher
 	// PromptVerifyTimeout overrides the delivery poll window.
@@ -647,6 +651,11 @@ func (d *Dispatcher) launch(
 		timeout = 60 * time.Second
 	}
 
+	if d.Orders != nil {
+		if _, orderErr := d.Orders.Repair(ctx, packet); orderErr != nil {
+			return &launchFailure{Reason: "control_order_failed", Err: closeTabLocal(h, tab.ID, "control_order_failed", orderErr)}
+		}
+	}
 	receipt, err := h.DeliverAndProve(tabLabel, packet, timeout)
 	result.Receipt = receipt
 	if err != nil {

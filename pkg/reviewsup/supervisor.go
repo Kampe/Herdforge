@@ -2,6 +2,7 @@ package reviewsup
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -10,6 +11,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/Kampe/Herdforge/pkg/control"
 )
 
 type EventType string
@@ -149,6 +152,7 @@ type Config struct {
 	RetryLimit        int
 	LeaseDuration     time.Duration
 	Now               func() time.Time
+	Orders            *control.CoordinatorOrders
 }
 
 func DefaultConfig(ledgerDir string) Config {
@@ -431,7 +435,6 @@ func (sv *ReviewSupervisor) LaunchReview(candidateSHA, reviewer, reviewModel str
 	cand.ReviewFamily = string(reviewFamily)
 	cand.UpdatedAt = sv.now()
 	cand.Attempts++
-
 	if err := sv.appendRow(&Row{
 		Event:        string(EventReview),
 		SHA:          candidateSHA,
@@ -446,6 +449,16 @@ func (sv *ReviewSupervisor) LaunchReview(candidateSHA, reviewer, reviewModel str
 		cand.Attempts--
 		cand.UpdatedAt = sv.now()
 		return fmt.Errorf("reviewsup: append review row: %w", err)
+	}
+	if sv.cfg.Orders != nil {
+		if _, err := sv.cfg.Orders.ReviewCorrection(context.Background(), fmt.Sprintf("review candidate %s by %s", candidateSHA, reviewer)); err != nil {
+			cand.State = StatePending
+			cand.Reviewer = ""
+			cand.ReviewFamily = ""
+			cand.Attempts--
+			cand.UpdatedAt = sv.now()
+			return fmt.Errorf("reviewsup: durable review correction order: %w", err)
+		}
 	}
 
 	return nil
@@ -696,6 +709,11 @@ func (sv *ReviewSupervisor) MarkHarvested(sha string) error {
 			return err
 		}
 	}
+	if sv.cfg.Orders != nil {
+		if _, err := sv.cfg.Orders.Callback(context.Background(), fmt.Sprintf("builder callback acknowledgement for %s", sha)); err != nil {
+			return fmt.Errorf("reviewsup: durable callback order: %w", err)
+		}
+	}
 	return nil
 }
 
@@ -781,6 +799,11 @@ func (sv *ReviewSupervisor) MarkBuilderDelivered(sha string) error {
 		SHA:   sha,
 	}); err != nil {
 		return fmt.Errorf("reviewsup: append builder ack row: %w", err)
+	}
+	if sv.cfg.Orders != nil {
+		if _, err := sv.cfg.Orders.Callback(context.Background(), fmt.Sprintf("builder callback acknowledgement for %s", sha)); err != nil {
+			return fmt.Errorf("reviewsup: durable callback order: %w", err)
+		}
 	}
 	return nil
 }

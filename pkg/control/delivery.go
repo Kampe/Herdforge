@@ -277,15 +277,15 @@ func (d *Delivery) terminal(ctx context.Context, o Order, supersede bool) (Evide
 	if err := json.Unmarshal([]byte(item.Payload), &stored); err != nil {
 		return Evidence{}, fmt.Errorf("control: corrupt stored order: %w", err)
 	}
-	if stored != o || item.MessageID == "" || item.Sequence <= 0 {
-		return Evidence{}, fmt.Errorf("control: stored order identity mismatch")
-	}
 	_, digest, _, err := identityKey(o)
 	if err != nil {
 		return Evidence{}, err
 	}
 	if o.BodyDigest == "" {
 		o.BodyDigest = digest
+	}
+	if stored != o || item.MessageID == "" || item.Sequence <= 0 {
+		return Evidence{}, fmt.Errorf("control: stored order identity mismatch")
 	}
 	evidence, err := d.Evidence.ReadEvidence(ctx, key, supersede)
 	if err != nil {
