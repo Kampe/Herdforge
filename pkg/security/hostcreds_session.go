@@ -291,7 +291,11 @@ func (s *HostCredsSession) Revoke() error {
 	}
 	s.mu.Lock()
 	s.closed = true
+	mitm := s.Mitm
 	s.mu.Unlock()
+	if mitm != nil {
+		_ = mitm.Revoke()
+	}
 	return s.Close()
 }
 
