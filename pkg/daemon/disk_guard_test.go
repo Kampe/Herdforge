@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -322,5 +323,53 @@ func TestForgeLoop_RuntimeControlPlaneDeathCancelsLoop(t *testing.T) {
 	}
 	if !blocked {
 		t.Fatalf("death not projected in logs: %v", d.snapshot())
+	}
+}
+
+func TestDiskProjectionPersistsRedactedTransitionsWithReadback(t *testing.T) {
+	root := t.TempDir()
+	// Fresh default guard: per-FSID state left by other tests must not
+	// swallow this test's transitions.
+	orig := preflight.DefaultDiskGuard
+	preflight.DefaultDiskGuard = preflight.NewDiskGuard(nil)
+	t.Cleanup(func() { preflight.DefaultDiskGuard = orig })
+
+	tp := &timeoutProvider{failAfter: 1 << 30, tasks: []*provider.Task{}}
+	e := NewEngine(&config.Config{TaskProvider: config.TaskProvider{ProjectID: "p1"}}, tp, nil, nil,
+		worktree.NewWorktreePool(root, filepath.Join(root, "wts")), nil)
+	_ = e
+
+	// blocked -> ready via real guard transitions on real volumes.
+	t.Setenv(preflight.EnvDiskMinFreeGB, "1099511627776")
+	_, _ = e.RunPulse(context.Background(), "worker") // refused: records BLOCKED
+	t.Setenv(preflight.EnvDiskMinFreeGB, "0")
+	_ = preflight.CheckDiskPressure("claim", e.diskPaths()...) // records ready
+
+	recs, err := ReadDiskProjection(root)
+	if err != nil {
+		t.Fatalf("readback: %v", err)
+	}
+	if len(recs) < 2 {
+		t.Fatalf("expected >=2 transitions, got %+v", recs)
+	}
+	first, last := recs[0], recs[len(recs)-1]
+	if first.Status != "BLOCKED(disk_pressure)" || first.Reason != preflight.ReasonDiskPressure {
+		t.Fatalf("first transition: %+v", first)
+	}
+	if last.Status != "ready" || last.State != string(preflight.DiskOK) {
+		t.Fatalf("last transition: %+v", last)
+	}
+	// Durable evidence is path-redacted: bounded volume labels only.
+	raw, err := os.ReadFile(DiskProjectionPath(root))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, banned := range []string{root, os.TempDir(), "/Users/", "/private/"} {
+		if banned != "" && strings.Contains(string(raw), banned) {
+			t.Fatalf("host path %q leaked into durable projection:\n%s", banned, raw)
+		}
+	}
+	if !strings.Contains(string(raw), `"volume":"vol-`) {
+		t.Fatalf("bounded volume labels missing:\n%s", raw)
 	}
 }

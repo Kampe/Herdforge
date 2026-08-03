@@ -43,6 +43,11 @@ func NewEngine(cfg *config.Config, tp provider.TaskProvider, r *router.ModelRout
 		health:   providerHealth{state: ProviderOK},
 	}
 	applyConfiguredDeadlines(cfg, tp)
+	// Production disk-pressure projection (FAC-153): persist BLOCKED ->
+	// recovering -> ready transitions durably for readback.
+	if wm != nil {
+		InstallDiskProjection(wm.RepoRoot)
+	}
 	return e
 }
 
