@@ -11,6 +11,7 @@ import (
 	"github.com/Kampe/Herdforge/pkg/preflight"
 	"github.com/Kampe/Herdforge/pkg/provider"
 	"github.com/Kampe/Herdforge/pkg/router"
+	"github.com/Kampe/Herdforge/pkg/server"
 	"github.com/Kampe/Herdforge/pkg/store"
 	"github.com/Kampe/Herdforge/pkg/verifier"
 	"github.com/Kampe/Herdforge/pkg/worktree"
@@ -53,6 +54,32 @@ func (e *Engine) ProviderHealth() ProviderHealth {
 // ProviderStatus is the fleet label: ok | recovering | BLOCKED(provider_timeout).
 func (e *Engine) ProviderStatus() string {
 	return e.ProviderHealth().String()
+}
+
+// EnvControlAddr configures the production control-plane listen address
+// for the forge loop (e.g. "127.0.0.1:7643"). Empty disables it.
+const EnvControlAddr = "HERD_CONTROL_ADDR"
+
+// StartControlPlane starts the production control server (live disk
+// metrics + authorized exact-target reclamation) wired to this engine's
+// canonical repo and worktree pool. Runtime Serve failures are surfaced
+// through logf — a dead control plane never fails silently.
+func (e *Engine) StartControlPlane(ctx context.Context, addr string, logf func(string)) (*server.ControlServer, error) {
+	if e.Worktree == nil {
+		return nil, fmt.Errorf("control plane requires a worktree manager")
+	}
+	defaultBranch := ""
+	if e.Config != nil {
+		defaultBranch = e.Config.Project.DefaultBranch
+	}
+	cs := server.NewProductionControlServer(addr, e.Worktree.RepoRoot, e.Worktree.WorktreeDir, defaultBranch)
+	if logf != nil {
+		cs.OnServeError = func(err error) { logf("control server failed: " + err.Error()) }
+	}
+	if err := cs.Start(ctx); err != nil {
+		return nil, err
+	}
+	return cs, nil
 }
 
 // DiskStatus is the disk-capacity fleet label (FAC-153):

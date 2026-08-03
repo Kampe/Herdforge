@@ -17,6 +17,7 @@ import (
 	"github.com/Kampe/Herdforge/pkg/gc"
 	"github.com/Kampe/Herdforge/pkg/metrics"
 	"github.com/Kampe/Herdforge/pkg/preflight"
+	"github.com/Kampe/Herdforge/pkg/worktree"
 )
 
 type ServerStatusResponse struct {
@@ -58,6 +59,24 @@ func NewControlServer(addr string) *ControlServer {
 		Addr:      addr,
 		StartTime: time.Now(),
 	}
+}
+
+// NewProductionControlServer is the production constructor (FAC-153): live
+// disk metrics over the repo/pool/temp volumes plus the authorized
+// exact-target reclamation control path, all wired to the canonical
+// worktree manager. The daemon forge loop starts this when a control
+// address is configured.
+func NewProductionControlServer(addr, repoRoot, worktreeDir, defaultBranch string) *ControlServer {
+	s := NewControlServer(addr)
+	s.Metrics = metrics.NewMetricsExporter()
+	s.DiskVolumes = map[string]string{
+		"repo": repoRoot,
+		"pool": worktreeDir,
+		"temp": os.TempDir(),
+	}
+	s.GC = gc.NewGCManager(repoRoot, worktree.NewWorktreePool(repoRoot, worktreeDir))
+	s.DefaultBranch = defaultBranch
+	return s
 }
 
 // routes builds the mux; extracted so tests can exercise handlers without

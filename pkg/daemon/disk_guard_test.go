@@ -2,6 +2,8 @@ package daemon
 
 import (
 	"context"
+	"io"
+	"net/http"
 	"os"
 	"strings"
 	"testing"
@@ -10,6 +12,7 @@ import (
 	"github.com/Kampe/Herdforge/pkg/config"
 	"github.com/Kampe/Herdforge/pkg/preflight"
 	"github.com/Kampe/Herdforge/pkg/provider"
+	"github.com/Kampe/Herdforge/pkg/worktree"
 )
 
 // TestMain disables the disk-pressure floors so the package's existing
@@ -127,5 +130,50 @@ func TestForgeLoop_SerializesDispatchUnderSoftPressure(t *testing.T) {
 	}
 	if !dispatched {
 		t.Fatalf("soft pressure stopped work entirely (actions=%v logs=%v)", idle.actions, logs2)
+	}
+}
+
+func TestForgeLoop_StartsProductionControlPlane(t *testing.T) {
+	tp := &timeoutProvider{failAfter: 1 << 30, tasks: []*provider.Task{}}
+	wm := worktree.NewWorktreePool(t.TempDir(), t.TempDir())
+	e := NewEngine(&config.Config{TaskProvider: config.TaskProvider{ProjectID: "p1"}}, tp, nil, nil, wm, nil)
+	logs := []string{}
+	d := &recordingDriver{
+		fakeDriver: fakeDriver{lanes: LaneState{0, 2}, completed: map[string]bool{}, verified: map[string]bool{}},
+		logs:       &logs,
+	}
+	_ = e.ForgeLoop(context.Background(), d, ForgeLoopOptions{Interval: time.Millisecond, MaxTicks: 1, ControlAddr: "127.0.0.1:0"})
+	started := false
+	for _, l := range logs {
+		if strings.Contains(l, "control server on 127.0.0.1:") {
+			started = true
+		}
+	}
+	if !started {
+		t.Fatalf("production control plane not started: %v", logs)
+	}
+}
+
+func TestEngineStartControlPlaneServesLiveMetrics(t *testing.T) {
+	wm := worktree.NewWorktreePool(t.TempDir(), t.TempDir())
+	e := NewEngine(&config.Config{TaskProvider: config.TaskProvider{ProjectID: "p1"}}, &timeoutProvider{failAfter: 1 << 30}, nil, nil, wm, nil)
+
+	cs, err := e.StartControlPlane(context.Background(), "127.0.0.1:0", func(msg string) { t.Log(msg) })
+	if err != nil {
+		t.Fatalf("StartControlPlane: %v", err)
+	}
+	defer func() { _ = cs.Stop(context.Background()) }()
+
+	resp, err := http.Get("http://" + cs.BoundAddr() + "/metrics")
+	if err != nil {
+		t.Fatalf("GET /metrics: %v", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != 200 || !strings.Contains(string(body), "herd_disk_pressure_state") {
+		t.Fatalf("live metrics missing (status %d):\n%s", resp.StatusCode, body)
+	}
+	if cs.ServeErr() != nil {
+		t.Fatalf("serve error: %v", cs.ServeErr())
 	}
 }

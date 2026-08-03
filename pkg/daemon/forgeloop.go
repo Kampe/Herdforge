@@ -3,12 +3,21 @@ package daemon
 import (
 	"context"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
 	"github.com/Kampe/Herdforge/pkg/preflight"
 	"github.com/Kampe/Herdforge/pkg/provider"
 )
+
+// cmpOr returns the first non-empty string.
+func cmpOr(a, b string) string {
+	if a != "" {
+		return a
+	}
+	return b
+}
 
 // FAC-128: the RUNNING forge loop. ForgeStep decides the next action; this
 // driver executes it and repeats, turning the built primitives into an
@@ -45,6 +54,10 @@ type ForgeLoopOptions struct {
 	Interval  time.Duration // pause between ticks (default 5s)
 	MaxTicks  int           // 0 = run until ctx cancelled or board drained
 	StopEmpty bool          // stop once the board is clear and no lane is busy
+	// ControlAddr starts the production control plane (live disk metrics +
+	// authorized reclamation) for the loop's lifetime. Empty falls back to
+	// HERD_CONTROL_ADDR; both empty disables it.
+	ControlAddr string
 }
 
 // ForgeLoop runs the async orchestration cycle: each tick it reads lane state
@@ -58,6 +71,18 @@ func (e *Engine) ForgeLoop(ctx context.Context, d ForgeDriver, opts ForgeLoopOpt
 	interval := opts.Interval
 	if interval <= 0 {
 		interval = 5 * time.Second
+	}
+
+	// Production control plane (FAC-153): live disk metrics + authorized
+	// exact-target reclamation for the lifetime of the loop.
+	if addr := cmpOr(opts.ControlAddr, os.Getenv(EnvControlAddr)); addr != "" {
+		cs, err := e.StartControlPlane(ctx, addr, d.Log)
+		if err != nil {
+			d.Log("forge: control server failed to start: " + err.Error())
+		} else {
+			d.Log("forge: control server on " + cs.BoundAddr())
+			defer func() { _ = cs.Stop(context.Background()) }()
+		}
 	}
 
 	for tick := 0; opts.MaxTicks == 0 || tick < opts.MaxTicks; tick++ {
