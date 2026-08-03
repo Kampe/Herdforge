@@ -76,9 +76,8 @@ func runHostCredsLive(args []string) int {
 	fs := flag.NewFlagSet("hostcreds live", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
 	kind := fs.String("kind", "", "grok|claude|codex")
-	marker := fs.String("marker", "HOSTCREDS_LIVE_OK", "expected marker in harness output")
-	useHerdr := fs.Bool("herdr", false, "launch via herdr tab when available")
-	prompt := fs.String("prompt", "", "non-interactive prompt (default includes marker)")
+	marker := fs.String("marker", "", "expected marker (must NOT appear in prompt; default random)")
+	prompt := fs.String("prompt", "", "non-interactive prompt (must not contain marker)")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -86,18 +85,13 @@ func runHostCredsLive(args []string) int {
 		fmt.Fprintln(os.Stderr, "hostcreds live: --kind required")
 		return 2
 	}
-	auth, err := security.NewHandleAuthorityFromEnv()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "hostcreds live: %v\n", err)
-		return 1
-	}
+	// Live refuses in-process HandleAuthority; requires FAC-169 IPC authority + boundary.
 	sess, _, proof, err := security.StartAuthorLive(security.LiveConfig{
 		Kind:          *kind,
 		Prompt:        *prompt,
 		AllowedMarker: *marker,
-		Authority:     auth,
-		UseHerdr:      *useHerdr,
-		Workspace:     os.Getenv("HERD_WORKSPACE"),
+		// Authority must come from FAC-169 IPC after merge — nil triggers fac169/authority gates.
+		Authority: nil,
 	})
 	if sess != nil {
 		defer sess.Close()
@@ -113,13 +107,9 @@ func runHostCredsLive(args []string) int {
 		fmt.Fprintln(os.Stderr, err.Error())
 		return 2
 	}
-	if proof == nil || !proof.PromptInArgv || !proof.ForbiddenDenied || !proof.NoAPIKeysInEnv {
+	if proof == nil || !proof.PromptInArgv || !proof.ForbiddenDenied || !proof.NoAPIKeysInEnv || !proof.ModelMarkerReached || !proof.BrokerReached {
 		fmt.Fprintln(os.Stderr, "hostcreds live: incomplete exact-session proof")
 		return 2
-	}
-	// Marker may require live provider; require process launched + boundary + deny.
-	if proof.AuthorPID == 0 && !*useHerdr {
-		// herdr path may not set AuthorPID
 	}
 	fmt.Println("hostcreds live: PASS (exact-session process proof)")
 	return 0

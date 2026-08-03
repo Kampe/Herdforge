@@ -4,6 +4,7 @@ import (
 	"net"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestMutation_NoAPIKeyPlant(t *testing.T) {
@@ -16,6 +17,36 @@ func TestMutation_NoAPIKeyPlant(t *testing.T) {
 	defer sess.Close()
 	if err := sess.AssertNoWorkerBearerToken(); err != nil {
 		t.Fatal("MUTATION: API keys or proxy bearer planted:", err)
+	}
+}
+
+func TestMutation_MITMFailClosedWithoutAllowPID(t *testing.T) {
+	v := NewTestCredentialVault()
+	_ = v.InstallTestSecret("api.x.ai", "Bearer mut")
+	sess, err := StartHostCredsSession(SessionConfig{Kind: "grok", SessionID: "m-pid", Authority: v})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sess.Close()
+	if err := ProveMITMRequiresAllowPID(sess.Mitm, "api.x.ai"); err != nil {
+		t.Fatal("MUTATION: CONNECT allowed without PID:", err)
+	}
+}
+
+func TestMutation_RevokeKillsMITM(t *testing.T) {
+	v := NewTestCredentialVault()
+	_ = v.InstallTestSecret("api.x.ai", "Bearer mut")
+	sess, err := StartHostCredsSession(SessionConfig{Kind: "grok", SessionID: "m-rev", Authority: v})
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := sess.Mitm.Addr()
+	_ = sess.Revoke()
+	// Dial should fail after revoke/close.
+	c, err := net.DialTimeout("tcp", addr, time.Second)
+	if err == nil {
+		_ = c.Close()
+		t.Fatal("MUTATION: MITM still accepting after revoke")
 	}
 }
 
