@@ -1,10 +1,13 @@
 package review
 
-import "sort"
+import (
+	"sort"
+	"strings"
+)
 
 // queuePin is ledger-owned queue recovery evidence. The enqueue row may omit
 // branch; the later record row is authoritative for reconstructing it.
-type queuePin struct{ sha, branch string }
+type queuePin struct{ sha, branch, lane string }
 
 func queuePins(s LedgerSnapshot, pass map[string]string, veto map[string]bool) []queuePin {
 	_ = pass
@@ -25,7 +28,14 @@ func queuePins(s LedgerSnapshot, pass map[string]string, veto map[string]bool) [
 			if branch == "" {
 				branch = records[row.SHA]
 			}
-			result[row.SHA] = queuePin{row.SHA, branch}
+			lane := row.Lane
+			if lane == "" {
+				lane = branch
+				if i := strings.Index(lane, "#standing/"); i >= 0 {
+					lane = lane[i+len("#standing/"):]
+				}
+			}
+			result[row.SHA] = queuePin{row.SHA, branch, lane}
 		case string(EventConsumed), string(EventRevoked):
 			delete(result, row.SHA)
 		}
