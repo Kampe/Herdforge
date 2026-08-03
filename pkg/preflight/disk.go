@@ -362,7 +362,7 @@ func (g *DiskGuard) Advise(operation string, paths ...string) DiskAdvice {
 			Detail: err.Error()}
 	}
 
-	softBytes := uint64(envFloat(EnvDiskSerializeFreeGB, 0) * bytesPerGiB)
+	softBytes := gbToBytes(envFloat(EnvDiskSerializeFreeGB, 0))
 	if softBytes == 0 {
 		softBytes = 2 * th.blockFreeBytes()
 	}
