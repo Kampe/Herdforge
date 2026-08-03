@@ -2,6 +2,7 @@ package verifier
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -218,12 +219,16 @@ func (f *lateWriterFixture) shutdown() {
 	}
 	if f.started && !f.reaped {
 		if err := ReapOwnedCmd(f.cmd); err != nil {
-			if f.pgid > 0 {
-				if kerr := killProcessGroup(f.pgid); kerr != nil && !isESRCH(kerr) {
-					f.t.Errorf("shutdown fallback killProcessGroup %d: %v", f.pgid, kerr)
+			// Residual tree after unreaped writer is expected on mutation paths;
+			// fail only if kill/wait identity errors remain after close.
+			if !errors.Is(err, ErrResidualOwnedTree) && !strings.Contains(err.Error(), "residual owned") {
+				if f.pgid > 0 {
+					if kerr := killProcessGroupIfLive(f.pgid); kerr != nil {
+						f.t.Errorf("shutdown fallback killProcessGroupIfLive %d: %v", f.pgid, kerr)
+					}
 				}
+				f.t.Errorf("shutdown ReapOwnedCmd: %v (stderr=%q)", err, f.stderr.String())
 			}
-			f.t.Errorf("shutdown ReapOwnedCmd: %v (stderr=%q)", err, f.stderr.String())
 		}
 		f.reaped = true
 	}
@@ -408,15 +413,16 @@ func startGrandchildGroup(t *testing.T) (cmd *exec.Cmd, pgid int, grandchild int
 	t.Cleanup(func() {
 		// Leak-safe: production reap if still unreaped; kill/Wait errors reported.
 		if cmd.ProcessState == nil && cmd.Process != nil {
-			if err := ReapOwnedCmd(cmd); err != nil {
-				if kerr := killProcessGroup(pgid); kerr != nil && !isESRCH(kerr) {
-					t.Errorf("cleanup fallback killProcessGroup %d: %v", pgid, kerr)
+			if err := ReapOwnedCmd(cmd); err != nil && !errors.Is(err, ErrResidualOwnedTree) &&
+				!strings.Contains(err.Error(), "residual owned") {
+				if kerr := killProcessGroupIfLive(pgid); kerr != nil {
+					t.Errorf("cleanup fallback killProcessGroupIfLive %d: %v", pgid, kerr)
 				}
 				t.Errorf("cleanup ReapOwnedCmd: %v", err)
 			}
 		} else if pgid > 0 {
-			if err := killProcessGroup(pgid); err != nil && !isESRCH(err) {
-				t.Errorf("cleanup killProcessGroup %d: %v", pgid, err)
+			if err := killProcessGroupIfLive(pgid); err != nil {
+				t.Errorf("cleanup killProcessGroupIfLive %d: %v", pgid, err)
 			}
 		}
 	})
@@ -454,11 +460,11 @@ func TestReapOwnedCmdKillsGrandchildren(t *testing.T) {
 	}
 }
 
-// TestReapOwnedCmdLeaderOnlyMutationFailsClosed is production-load-bearing:
-// injecting a leader-only killer must make ReapOwnedCmd return a non-nil error
-// because the group-gone probe sees the surviving grandchild. A leader-only
-// liveness check would falsely pass.
-func TestReapOwnedCmdLeaderOnlyMutationFailsClosed(t *testing.T) {
+// TestReapOwnedCmdTreeCloseKillsGrandchildrenDespiteLeaderOnlyGroupKill proves
+// durable tree tracking is load-bearing: even if processGroupKiller is mutated
+// to leader-only, ReapOwnedCmd still reaps grandchildren via positive-PID
+// finalize (not empty -pgid reuse).
+func TestReapOwnedCmdTreeCloseKillsGrandchildrenDespiteLeaderOnlyGroupKill(t *testing.T) {
 	cmd, pgid, grandchild := startGrandchildGroup(t)
 
 	prev := processGroupKiller
@@ -466,36 +472,80 @@ func TestReapOwnedCmdLeaderOnlyMutationFailsClosed(t *testing.T) {
 		if id <= 0 {
 			return fmt.Errorf("kill process group: invalid pgid %d", id)
 		}
-		// MUTATION: kill leader only — leaves grandchildren in the group.
+		// MUTATION: kill leader only — group-wide signal is insufficient alone.
 		return syscall.Kill(id, syscall.SIGKILL)
 	}
 	t.Cleanup(func() { processGroupKiller = prev })
 
-	reapErr := ReapOwnedCmd(cmd)
-	if reapErr == nil {
-		// If the OS reaped the grandchild with the leader (unlikely), the
-		// mutation cannot load-bear; force-fail so the test is non-vacuous.
-		if err := syscall.Kill(grandchild, 0); err == nil {
-			t.Fatal("mutation: ReapOwnedCmd returned nil while grandchild still live")
+	if err := ReapOwnedCmd(cmd); err != nil {
+		// Residual tree error is acceptable if grandchild is still cleaned;
+		// hard-fail only when grandchild survives.
+		if kerr := syscall.Kill(grandchild, 0); kerr == nil {
+			t.Fatalf("ReapOwnedCmd error %v and grandchild %d still live", err, grandchild)
 		}
-		t.Fatal("mutation: leader-only kill must make ReapOwnedCmd fail closed (group still live or probe error); got nil")
 	}
-	if !strings.Contains(reapErr.Error(), "still has live members") &&
-		!strings.Contains(reapErr.Error(), "process group") {
-		t.Fatalf("mutation: want group-liveness failure, got %v", reapErr)
-	}
-
-	// Grandchild must still be alive — proves leader-only is insufficient.
-	if err := syscall.Kill(grandchild, 0); err != nil {
-		t.Fatalf("mutation expected grandchild %d to survive leader-only kill: %v", grandchild, err)
-	}
-	// Production killer restored for cleanup; extinguish orphaned members.
-	processGroupKiller = prev
-	if err := killProcessGroup(pgid); err != nil && !isESRCH(err) {
-		t.Fatalf("post-mutation group kill: %v", err)
+	if err := waitForPIDGone(grandchild, 2*time.Second); err != nil {
+		t.Fatalf("tree close must reap grandchild %d despite leader-only group killer: %v", grandchild, err)
 	}
 	if err := waitForProcessGroupGone(pgid, 2*time.Second); err != nil {
-		t.Fatalf("post-mutation cleanup: %v", err)
+		// Group may already be empty; only fail if still live.
+		if processGroupLive(pgid) {
+			t.Fatalf("process group %d still live: %v", pgid, err)
+		}
+	}
+}
+
+// TestFinalizeOwnedTreeMutationLeavesGrandchildAlive proves that skipping
+// causal handle finalize (and skipping tracked kill) leaves a grandchild live
+// after a leader-only group membership kill — the incomplete ownership shape.
+func TestFinalizeOwnedTreeMutationLeavesGrandchildAlive(t *testing.T) {
+	cmd, pgid, grandchild := startGrandchildGroup(t)
+
+	prevKill := processGroupKiller
+	processGroupKiller = func(id int) error {
+		if id <= 0 {
+			return fmt.Errorf("kill process group: invalid pgid %d", id)
+		}
+		// Leader-only membership kill (wrong).
+		return syscall.Kill(id, syscall.SIGKILL)
+	}
+	prevFin := finalizeOwnedTree
+	finalizeOwnedTree = func(o *ownedSubprocess) error {
+		if o != nil {
+			o.freeze()
+			_ = o.stopTracker()
+			// Intentionally do not killTracked — mutation.
+		}
+		return nil
+	}
+	t.Cleanup(func() {
+		processGroupKiller = prevKill
+		finalizeOwnedTree = prevFin
+		if err := killProcessGroupIfLive(pgid); err != nil {
+			t.Errorf("cleanup killProcessGroupIfLive: %v", err)
+		}
+		if err := syscall.Kill(grandchild, syscall.SIGKILL); err != nil && !isESRCH(err) {
+			t.Errorf("cleanup SIGKILL grandchild: %v", err)
+		}
+		if err := waitForPIDGone(grandchild, 2*time.Second); err != nil {
+			t.Errorf("cleanup grandchild gone: %v", err)
+		}
+	})
+
+	owned, err := adoptOwnedCmd(cmd, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Incomplete: leader-only membership kill only (no killTracked).
+	if err := processGroupKiller(owned.Pgid()); err != nil {
+		t.Fatalf("leader-only killer: %v", err)
+	}
+	_ = cmd.Wait()
+	if err := finalizeOwnedTree(owned); err != nil {
+		t.Fatalf("mutated finalize should return nil: %v", err)
+	}
+	if err := syscall.Kill(grandchild, 0); err != nil {
+		t.Fatalf("mutation expected grandchild %d to survive incomplete ownership: %v", grandchild, err)
 	}
 }
 

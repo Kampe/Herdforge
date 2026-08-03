@@ -181,25 +181,33 @@ func (v *Verifier) execute(ctx context.Context, dir string, policy EnvironmentPo
 			}, nil
 		}
 	}
-	cmd := exec.CommandContext(ctx, commandPath, v.Argv[1:]...)
-	cmd.Dir = dir
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	// Cancel only SIGKILLs the full process group while Wait is in flight.
-	// Group-wide kill is required (leader-only leaves grandchildren).
-	// ReapOwnedCmd (kill+Wait) is used for fail-safe close after Start when
-	// the caller owns Wait — never double-Wait inside Cancel.
+	var env []string
+	if policy == EnvironmentPolicyHermetic {
+		env = commandEnv
+	}
+	// Ownership wrapper: Setpgid supervisor + FD3 child-PID handshake so
+	// fork+setsid cannot race an unsynchronized sample loop.
+	cmd, handshakeR, handshakeW, prepErr := prepareOwnedCommand(ctx, commandPath, v.Argv[1:], dir, env)
+	if prepErr != nil {
+		output := []byte(prepErr.Error())
+		return &Result{
+			Outcome:      OutcomeBLOCKED,
+			Output:       boundedOutput(output),
+			OutputDigest: digestBytes(output),
+			ExitCode:     -1,
+			Duration:     time.Since(started),
+		}, nil
+	}
+	// Cancel uses only cmd.Process.Pid (set before watchCtx) — identity-kill
+	// current members of that live group; never empty -pgid.
 	cmd.Cancel = func() error {
 		if cmd.Process == nil {
 			return nil
 		}
-		return KillProcessGroup(cmd.Process.Pid)
-	}
-	if policy == EnvironmentPolicyHermetic {
-		cmd.Env = commandEnv
+		return killProcessGroupIfLive(cmd.Process.Pid)
 	}
 	// A canceled shell can leave grandchildren holding stdout/stderr pipes
-	// open (for example, `sh -c 'sleep 3'`). WaitDelay bounds that wait and
-	// keeps the mutation transaction's restoration defer reachable.
+	// open. WaitDelay bounds that wait and keeps restoration reachable.
 	cmd.WaitDelay = 100 * time.Millisecond
 
 	// concurrentCombinedWriter serializes Writes from the stdout and stderr
@@ -209,9 +217,8 @@ func (v *Verifier) execute(ctx context.Context, dir string, policy EnvironmentPo
 	cmd.Stdout = &combined
 	cmd.Stderr = &combined
 	if err := cmd.Start(); err != nil {
-		// Cancellation (and other Start failures) must surface as BLOCKED
-		// Result, not a bare error — RunMutationCheckForCandidate relies on
-		// (result, nil) so the restore defer still records Restored evidence.
+		_ = handshakeR.Close()
+		_ = handshakeW.Close()
 		output := []byte(err.Error())
 		return &Result{
 			Outcome:      OutcomeBLOCKED,
@@ -221,11 +228,32 @@ func (v *Verifier) execute(ctx context.Context, dir string, policy EnvironmentPo
 			Duration:     time.Since(started),
 		}, nil
 	}
-	// Immediate fail-safe: if ctx is already done after Start, close ownership
-	// with production ReapOwnedCmd (full-group kill + Wait + group-gone) before
-	// returning — caller owns Wait on this path.
+	// Parent must close its write end so the child handshake can complete EOF.
+	_ = handshakeW.Close()
+
+	owned, adoptErr := adoptOwnedCmd(cmd, handshakeR)
+	if adoptErr != nil {
+		var parts []string
+		parts = append(parts, "adopt owned cmd: "+adoptErr.Error())
+		if kerr := killProcessGroupIfLive(cmd.Process.Pid); kerr != nil {
+			parts = append(parts, "kill group members: "+kerr.Error())
+		}
+		waitErr := cmd.Wait()
+		if waitErr != nil {
+			parts = append(parts, "wait: "+waitErr.Error())
+		}
+		output := []byte(strings.Join(parts, "\n"))
+		return &Result{
+			Outcome:      OutcomeBLOCKED,
+			Output:       boundedOutput(output),
+			OutputDigest: digestBytes(output),
+			ExitCode:     exitCode(cmd, waitErr),
+			Duration:     time.Since(started),
+		}, nil
+	}
+	// Immediate fail-safe: ctx already done after Start.
 	if ctx.Err() != nil {
-		reapErr := ReapOwnedCmd(cmd)
+		reapErr := owned.Reap()
 		msg := ctx.Err().Error()
 		if reapErr != nil {
 			msg += "\n" + reapErr.Error()
@@ -239,15 +267,18 @@ func (v *Verifier) execute(ctx context.Context, dir string, policy EnvironmentPo
 			Duration:     time.Since(started),
 		}, nil
 	}
-	// Wait reaps the leader and joins stdout/stderr copy goroutines (WaitDelay
-	// bounds pipe hold from residual grandchildren). Ownership is not closed
-	// until afterWaitOwnership proves the full process group is gone.
+	// Wait for the ownership wrapper (and thus the user command). Do not
+	// pre-Wait drain on the success path — that would SIGKILL a healthy
+	// command. Residual writers are reaped only after Wait via Close on the
+	// frozen causal handle set (no post-Wait numeric pgid adoption).
 	waitErr := cmd.Wait()
-	ownErr := afterWaitOwnership(cmd)
+	// Freeze discovery before Close so post-Wait sampling cannot adopt a
+	// reused numeric process group.
+	owned.freeze()
+	ownErr := finalizeOwnedTree(owned)
 	output := combined.bytes()
 
-	// Residual same-group writers (background jobs that outlived the leader)
-	// or a failed group close always BLOCKED — never PASS while owned
+	// Residual owned-tree writers always BLOCKED — never PASS while tracked
 	// descendants may still mutate the tree (TempDir RemoveAll race class).
 	if ownErr != nil {
 		msg := fmt.Sprintf("verification ownership close: %v\noutput:\n%s", ownErr, string(output))
@@ -274,8 +305,8 @@ func (v *Verifier) execute(ctx context.Context, dir string, policy EnvironmentPo
 	}
 	if waitErr != nil {
 		result.Outcome = OutcomeFAIL
-		// Cancellation/deadline after Start: Cancel killed the group; Wait
-		// returns a signaled ExitError (typed WaitStatus via isExpectedKillWait).
+		// Cancellation/deadline after Start: Cancel killed the live group; Wait
+		// returns a signaled ExitError (typed WaitStatus).
 		if ctx.Err() != nil || cmd.ProcessState == nil {
 			result.Outcome = OutcomeBLOCKED
 		}
