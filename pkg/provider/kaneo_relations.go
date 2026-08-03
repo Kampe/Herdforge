@@ -166,21 +166,20 @@ func (k *KaneoProvider) CreateRelation(ctx context.Context, sourceID, targetID s
 
 	dls := k.deadlines()
 
-	// Fresh bounded pre-check on source: existing edge → return (idempotent).
-	if existing, err := k.findRelationFresh(ctx, dls, sourceID, targetID, typ); err != nil {
+	// Fresh dual-end pre-check: existing edge on BOTH ends → return (idempotent).
+	if existing, err := k.findRelationBothEnds(ctx, dls, sourceID, targetID, typ); err != nil {
 		return nil, err
 	} else if existing != nil {
 		return existing, nil
 	}
 
 	writeCtx, cancel := WithOpDeadline(ctx, dls, OpMutate)
-	created, writeErr := k.createRelationOnce(writeCtx, sourceID, targetID, typ)
+	_, writeErr := k.createRelationOnce(writeCtx, sourceID, targetID, typ)
 	cancel()
 	if writeErr != nil {
 		writeErr = AsTimeout("kaneo", "CreateRelation", OpMutate, dls.For(OpMutate), writeErr)
 		if IsTimeout(writeErr) || IsAmbiguous(writeErr) {
-			// Reconcile: if the edge landed, return it; else ambiguous.
-			if existing, ferr := k.findRelationFresh(ctx, dls, sourceID, targetID, typ); ferr == nil && existing != nil {
+			if existing, ferr := k.findRelationBothEnds(ctx, dls, sourceID, targetID, typ); ferr == nil && existing != nil {
 				return existing, nil
 			}
 			return nil, &AmbiguousMutationError{
@@ -190,43 +189,45 @@ func (k *KaneoProvider) CreateRelation(ctx context.Context, sourceID, targetID s
 				WriteErr: writeErr,
 			}
 		}
-		// Non-timeout: still reconcile races where create failed because exists.
-		if existing, ferr := k.findRelationFresh(ctx, dls, sourceID, targetID, typ); ferr == nil && existing != nil {
+		if existing, ferr := k.findRelationBothEnds(ctx, dls, sourceID, targetID, typ); ferr == nil && existing != nil {
 			return existing, nil
 		}
 		return nil, writeErr
 	}
 
-	// Dual-end readback with separate fresh bounded contexts.
-	srcRel, err := k.findRelationFresh(ctx, dls, sourceID, targetID, typ)
+	// Dual-end readback (separate fresh contexts inside findRelationBothEnds).
+	srcRel, err := k.findRelationBothEnds(ctx, dls, sourceID, targetID, typ)
 	if err != nil {
-		return nil, fmt.Errorf("kaneo CreateRelation source readback: %w", err)
-	}
-	tgtRel, err := k.findRelationFresh(ctx, dls, targetID, sourceID, typ) // list target side
-	if err != nil {
-		return nil, fmt.Errorf("kaneo CreateRelation target readback: %w", err)
-	}
-	// Target listing may include the same edge (source→target); search both.
-	var fromTarget *Relation
-	if tgtRel != nil && tgtRel.SourceTaskID == sourceID && tgtRel.TargetTaskID == targetID {
-		fromTarget = tgtRel
-	} else {
-		// Re-list target and scan for our directed edge.
-		fromTarget, err = k.findRelationOnTask(ctx, dls, targetID, sourceID, targetID, typ)
-		if err != nil {
-			return nil, fmt.Errorf("kaneo CreateRelation target list: %w", err)
-		}
+		return nil, fmt.Errorf("kaneo CreateRelation dual readback: %w", err)
 	}
 	if srcRel == nil {
-		return nil, fmt.Errorf("kaneo CreateRelation readback: edge missing on source after create")
-	}
-	if fromTarget == nil {
-		return nil, fmt.Errorf("kaneo CreateRelation readback: edge missing on target after create")
-	}
-	if created != nil && created.ID != "" && srcRel.ID != "" && created.ID != srcRel.ID {
-		// Prefer list readback.
+		return nil, fmt.Errorf("kaneo CreateRelation readback: edge missing on source or target after create")
 	}
 	return srcRel, nil
+}
+
+// findRelationBothEnds proves the directed edge on both endpoint listings with
+// matching fields. Fresh OpList deadline per list.
+func (k *KaneoProvider) findRelationBothEnds(ctx context.Context, dls Deadlines, sourceID, targetID string, typ RelationType) (*Relation, error) {
+	fromSrc, err := k.findRelationOnTask(ctx, dls, sourceID, sourceID, targetID, typ)
+	if err != nil {
+		return nil, err
+	}
+	if fromSrc == nil {
+		return nil, nil
+	}
+	fromTgt, err := k.findRelationOnTask(ctx, dls, targetID, sourceID, targetID, typ)
+	if err != nil {
+		return nil, err
+	}
+	if fromTgt == nil {
+		return nil, fmt.Errorf("kaneo: edge visible on source but not target")
+	}
+	if fromSrc.ID != fromTgt.ID || fromSrc.SourceTaskID != fromTgt.SourceTaskID ||
+		fromSrc.TargetTaskID != fromTgt.TargetTaskID || fromSrc.Type != fromTgt.Type {
+		return nil, fmt.Errorf("kaneo: relation field disagreement between endpoints")
+	}
+	return fromSrc, nil
 }
 
 func (k *KaneoProvider) findRelationFresh(ctx context.Context, dls Deadlines, listTaskID, otherID string, typ RelationType) (*Relation, error) {
@@ -315,9 +316,9 @@ func (k *KaneoProvider) createRelationOnce(ctx context.Context, sourceID, target
 	return &r, nil
 }
 
-// DeleteRelation deletes a relation and verifies absence on BOTH source and target.
-// sourceID and targetID are the captured endpoints (required).
-// Ambiguous delete/timeouts return AmbiguousMutationError — never success.
+// DeleteRelation deletes a relation and verifies absence on BOTH true endpoints.
+// Caller endpoints are a hint; authoritative source/target/type are captured from
+// readback before delete. Ambiguous delete/timeouts never succeed.
 func (k *KaneoProvider) DeleteRelation(ctx context.Context, relationID, sourceID, targetID string) error {
 	if strings.TrimSpace(relationID) == "" {
 		return fmt.Errorf("kaneo DeleteRelation: empty relation id")
@@ -327,21 +328,26 @@ func (k *KaneoProvider) DeleteRelation(ctx context.Context, relationID, sourceID
 	}
 	dls := k.deadlines()
 
-	// Capture: confirm relation is visible on source before delete (endpoint truth).
-	pre, err := k.relationPresentFresh(ctx, dls, sourceID, relationID)
+	// Capture actual relation endpoints/type from source listing (not trust alone).
+	captured, err := k.captureRelationFresh(ctx, dls, sourceID, relationID)
 	if err != nil {
 		return fmt.Errorf("kaneo DeleteRelation pre-capture source: %w", err)
 	}
-	if !pre {
-		// Maybe already gone — verify target too; if absent both, treat as success (idempotent).
-		onTgt, terr := k.relationPresentFresh(ctx, dls, targetID, relationID)
-		if terr != nil {
-			return fmt.Errorf("kaneo DeleteRelation pre-capture target: %w", terr)
+	if captured == nil {
+		// Try target side.
+		captured, err = k.captureRelationFresh(ctx, dls, targetID, relationID)
+		if err != nil {
+			return fmt.Errorf("kaneo DeleteRelation pre-capture target: %w", err)
 		}
-		if !onTgt {
-			return nil // already deleted
+		if captured == nil {
+			// Absent both ends already.
+			return nil
 		}
-		// Present only on target — still delete by id.
+	}
+	// Authoritative endpoints from readback.
+	trueSrc, trueTgt := captured.SourceTaskID, captured.TargetTaskID
+	if trueSrc == "" || trueTgt == "" {
+		return fmt.Errorf("kaneo DeleteRelation: captured relation missing endpoints")
 	}
 
 	writeCtx, cancel := WithOpDeadline(ctx, dls, OpMutate)
@@ -350,9 +356,8 @@ func (k *KaneoProvider) DeleteRelation(ctx context.Context, relationID, sourceID
 	if writeErr != nil {
 		writeErr = AsTimeout("kaneo", "DeleteRelation", OpMutate, dls.For(OpMutate), writeErr)
 		if IsTimeout(writeErr) || IsAmbiguous(writeErr) {
-			// Reconcile: if absent both ends, success; else ambiguous.
-			onSrc, e1 := k.relationPresentFresh(ctx, dls, sourceID, relationID)
-			onTgt, e2 := k.relationPresentFresh(ctx, dls, targetID, relationID)
+			onSrc, e1 := k.relationPresentFresh(ctx, dls, trueSrc, relationID)
+			onTgt, e2 := k.relationPresentFresh(ctx, dls, trueTgt, relationID)
 			if e1 == nil && e2 == nil && !onSrc && !onTgt {
 				return nil
 			}
@@ -366,12 +371,11 @@ func (k *KaneoProvider) DeleteRelation(ctx context.Context, relationID, sourceID
 		return writeErr
 	}
 
-	// Dual-end absence verification with fresh contexts.
-	onSrc, e1 := k.relationPresentFresh(ctx, dls, sourceID, relationID)
+	onSrc, e1 := k.relationPresentFresh(ctx, dls, trueSrc, relationID)
 	if e1 != nil {
 		return fmt.Errorf("kaneo DeleteRelation source absence readback: %w", e1)
 	}
-	onTgt, e2 := k.relationPresentFresh(ctx, dls, targetID, relationID)
+	onTgt, e2 := k.relationPresentFresh(ctx, dls, trueTgt, relationID)
 	if e2 != nil {
 		return fmt.Errorf("kaneo DeleteRelation target absence readback: %w", e2)
 	}
@@ -386,19 +390,28 @@ func (k *KaneoProvider) DeleteRelation(ctx context.Context, relationID, sourceID
 	return nil
 }
 
-func (k *KaneoProvider) relationPresentFresh(ctx context.Context, dls Deadlines, taskID, relationID string) (bool, error) {
+func (k *KaneoProvider) captureRelationFresh(ctx context.Context, dls Deadlines, taskID, relationID string) (*Relation, error) {
 	readCtx, cancel := WithOpDeadline(ctx, dls, OpList)
 	defer cancel()
 	rels, err := k.ListRelations(readCtx, taskID)
 	if err != nil {
-		return false, AsTimeout("kaneo", "ListRelations", OpList, dls.For(OpList), err)
+		return nil, AsTimeout("kaneo", "ListRelations", OpList, dls.For(OpList), err)
 	}
-	for _, r := range rels {
-		if r.ID == relationID {
-			return true, nil
+	for i := range rels {
+		if rels[i].ID == relationID {
+			r := rels[i]
+			return &r, nil
 		}
 	}
-	return false, nil
+	return nil, nil
+}
+
+func (k *KaneoProvider) relationPresentFresh(ctx context.Context, dls Deadlines, taskID, relationID string) (bool, error) {
+	r, err := k.captureRelationFresh(ctx, dls, taskID, relationID)
+	if err != nil {
+		return false, err
+	}
+	return r != nil, nil
 }
 
 func (k *KaneoProvider) deleteRelationOnce(ctx context.Context, relationID string) error {

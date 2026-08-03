@@ -7,12 +7,16 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"sync"
 
 	"github.com/Kampe/Herdforge/pkg/provider"
 )
 
 // ProviderStore adapts a TaskProvider (+ optional RelationProvider) to RelationStore.
+// Cache is mutex-protected and refreshed on every SnapshotGraph / hydrateFresh
+// so concurrent gates cannot race and deleted/new tasks are not frozen forever.
 type ProviderStore struct {
+	mu        sync.Mutex
 	TP        provider.TaskProvider
 	ProjectID string
 	refCache  map[string]*provider.Task
@@ -49,27 +53,44 @@ func (s *ProviderStore) rel() (provider.RelationProvider, error) {
 	return rp, nil
 }
 
-func (s *ProviderStore) hydrate(ctx context.Context) error {
-	if len(s.refCache) > 0 {
-		return nil
-	}
+// hydrateFresh always re-lists the full project and rebuilds maps.
+// Duplicate ref→id or id→ref mappings fail the snapshot (stale/capability).
+func (s *ProviderStore) hydrateFresh(ctx context.Context) error {
 	tasks, err := s.TP.ListTasks(ctx, s.ProjectID, "")
 	if err != nil {
 		return err
 	}
+	refCache := map[string]*provider.Task{}
+	idCache := map[string]*provider.Task{}
 	for _, t := range tasks {
 		if t == nil {
 			continue
 		}
+		if t.ID == "" {
+			return fmt.Errorf("deps: task missing immutable id (ref=%q)", t.Ref)
+		}
+		if t.Ref == "" {
+			return fmt.Errorf("deps: task missing ref (id=%q)", t.ID)
+		}
+		if prev, ok := idCache[t.ID]; ok && prev.Ref != t.Ref {
+			return fmt.Errorf("deps: duplicate task id %q maps to %q and %q", t.ID, prev.Ref, t.Ref)
+		}
+		if prev, ok := refCache[t.Ref]; ok && prev.ID != t.ID {
+			return fmt.Errorf("deps: duplicate task ref %q maps to %q and %q", t.Ref, prev.ID, t.ID)
+		}
 		cp := *t
-		s.refCache[t.Ref] = &cp
-		s.idCache[t.ID] = &cp
+		refCache[t.Ref] = &cp
+		idCache[t.ID] = &cp
 	}
+	s.refCache = refCache
+	s.idCache = idCache
 	return nil
 }
 
 func (s *ProviderStore) ResolveRef(ctx context.Context, ref Ref) (TaskID, error) {
-	if err := s.hydrate(ctx); err != nil {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.hydrateFresh(ctx); err != nil {
 		return "", err
 	}
 	if t, ok := s.refCache[string(ref)]; ok {
@@ -79,19 +100,22 @@ func (s *ProviderStore) ResolveRef(ctx context.Context, ref Ref) (TaskID, error)
 	if err != nil || t == nil {
 		return "", fmt.Errorf("%w: %s", ErrUnresolvedRef, ref)
 	}
-	s.refCache[t.Ref] = t
-	s.idCache[t.ID] = t
 	return TaskID(t.ID), nil
 }
 
 func (s *ProviderStore) TaskStatus(ctx context.Context, ref Ref) (string, TaskID, error) {
-	if err := s.hydrate(ctx); err != nil {
+	s.mu.Lock()
+	if err := s.hydrateFresh(ctx); err != nil {
+		s.mu.Unlock()
 		return "", "", err
 	}
 	id := string(ref)
 	if t, ok := s.refCache[string(ref)]; ok {
 		id = t.ID
 	}
+	s.mu.Unlock()
+
+	// Fresh Get outside lock (provider I/O).
 	fresh, err := s.TP.GetTask(ctx, id)
 	if err != nil || fresh == nil {
 		return "", "", fmt.Errorf("%w: %s", ErrDeletedTask, ref)
@@ -100,32 +124,60 @@ func (s *ProviderStore) TaskStatus(ctx context.Context, ref Ref) (string, TaskID
 	if st == provider.StatusUnknown || strings.HasPrefix(st, "unknown:") {
 		return "", TaskID(fresh.ID), fmt.Errorf("deps: task %s has unreadable status %q", ref, fresh.Status)
 	}
+	s.mu.Lock()
 	s.refCache[fresh.Ref] = fresh
 	s.idCache[fresh.ID] = fresh
+	s.mu.Unlock()
 	return st, TaskID(fresh.ID), nil
 }
 
-func (s *ProviderStore) mapEdge(ctx context.Context, r provider.Relation) (DependencyEdge, error) {
+func (s *ProviderStore) mapEdgeStrict(ctx context.Context, r provider.Relation) (DependencyEdge, error) {
+	if r.ID == "" {
+		return DependencyEdge{}, fmt.Errorf("deps: relation missing id")
+	}
+	if r.SourceTaskID == "" || r.TargetTaskID == "" {
+		return DependencyEdge{}, fmt.Errorf("deps: relation %s missing endpoint id", r.ID)
+	}
+	typ := mapRelTypeStrict(r.Type)
+	if !ValidEdgeType(typ) {
+		return DependencyEdge{}, fmt.Errorf("%w: relation %s type %q", ErrUnknownEdgeType, r.ID, r.Type)
+	}
 	e := DependencyEdge{
 		RelationID: r.ID,
 		SourceID:   TaskID(r.SourceTaskID),
 		TargetID:   TaskID(r.TargetTaskID),
-		Type:       mapRelType(r.Type),
+		Type:       typ,
 	}
-	// Listing accepts provider types (subtask etc.); mutations still reject unknowns.
-	if t := s.idCache[r.SourceTaskID]; t != nil {
-		e.SourceRef = Ref(t.Ref)
-	} else if t, gerr := s.TP.GetTask(ctx, r.SourceTaskID); gerr == nil && t != nil {
-		e.SourceRef = Ref(t.Ref)
+	s.mu.Lock()
+	srcT := s.idCache[r.SourceTaskID]
+	tgtT := s.idCache[r.TargetTaskID]
+	s.mu.Unlock()
+	if srcT == nil {
+		t, gerr := s.TP.GetTask(ctx, r.SourceTaskID)
+		if gerr != nil || t == nil {
+			return DependencyEdge{}, fmt.Errorf("deps: relation %s source %s unreadable: %w", r.ID, r.SourceTaskID, ErrDeletedTask)
+		}
+		srcT = t
+		s.mu.Lock()
 		s.idCache[t.ID] = t
 		s.refCache[t.Ref] = t
+		s.mu.Unlock()
 	}
-	if t := s.idCache[r.TargetTaskID]; t != nil {
-		e.TargetRef = Ref(t.Ref)
-	} else if t, gerr := s.TP.GetTask(ctx, r.TargetTaskID); gerr == nil && t != nil {
-		e.TargetRef = Ref(t.Ref)
+	if tgtT == nil {
+		t, gerr := s.TP.GetTask(ctx, r.TargetTaskID)
+		if gerr != nil || t == nil {
+			return DependencyEdge{}, fmt.Errorf("deps: relation %s target %s unreadable: %w", r.ID, r.TargetTaskID, ErrDeletedTask)
+		}
+		tgtT = t
+		s.mu.Lock()
 		s.idCache[t.ID] = t
 		s.refCache[t.Ref] = t
+		s.mu.Unlock()
+	}
+	e.SourceRef = Ref(srcT.Ref)
+	e.TargetRef = Ref(tgtT.Ref)
+	if !e.SourceRef.Valid() || !e.TargetRef.Valid() {
+		return DependencyEdge{}, fmt.Errorf("deps: relation %s missing endpoint refs", r.ID)
 	}
 	return e, nil
 }
@@ -135,16 +187,19 @@ func (s *ProviderStore) ListRelations(ctx context.Context, taskID TaskID) ([]Dep
 	if err != nil {
 		return nil, err
 	}
-	if err := s.hydrate(ctx); err != nil {
+	s.mu.Lock()
+	if err := s.hydrateFresh(ctx); err != nil {
+		s.mu.Unlock()
 		return nil, err
 	}
+	s.mu.Unlock()
 	rels, err := rp.ListRelations(ctx, string(taskID))
 	if err != nil {
 		return nil, err
 	}
 	out := make([]DependencyEdge, 0, len(rels))
 	for _, r := range rels {
-		e, merr := s.mapEdge(ctx, r)
+		e, merr := s.mapEdgeStrict(ctx, r)
 		if merr != nil {
 			return nil, merr
 		}
@@ -153,41 +208,91 @@ func (s *ProviderStore) ListRelations(ctx context.Context, taskID TaskID) ([]Dep
 	return out, nil
 }
 
-// SnapshotGraph walks every project task and unions relation listings.
-// This is the authoritative full closure — not a single-task listing.
+// SnapshotGraph rebuilds the full task set, lists relations per task, and
+// requires every relation to be visible with identical fields on BOTH endpoints.
 func (s *ProviderStore) SnapshotGraph(ctx context.Context) (*GraphSnapshot, error) {
 	rp, err := s.rel()
 	if err != nil {
 		return nil, err
 	}
-	if err := s.hydrate(ctx); err != nil {
+	s.mu.Lock()
+	if err := s.hydrateFresh(ctx); err != nil {
+		s.mu.Unlock()
 		return nil, err
 	}
-	seen := map[string]DependencyEdge{}
-	var ids []string
+	ids := make([]string, 0, len(s.idCache))
 	for id := range s.idCache {
 		ids = append(ids, id)
 	}
+	s.mu.Unlock()
 	sort.Strings(ids)
+
+	// Collect listings per task.
+	byTask := map[string][]provider.Relation{}
 	for _, id := range ids {
 		rels, lerr := rp.ListRelations(ctx, id)
 		if lerr != nil {
 			return nil, fmt.Errorf("deps: snapshot list %s: %w", id, lerr)
 		}
-		for _, r := range rels {
-			e, merr := s.mapEdge(ctx, r)
-			if merr != nil {
-				return nil, merr
+		byTask[id] = rels
+	}
+
+	// Index by relation ID with dual-end agreement.
+	type acc struct {
+		srcSide *provider.Relation
+		tgtSide *provider.Relation
+	}
+	accs := map[string]*acc{}
+	for taskID, rels := range byTask {
+		for i := range rels {
+			r := rels[i]
+			if r.ID == "" {
+				return nil, fmt.Errorf("deps: snapshot: empty relation id on task %s", taskID)
 			}
-			key := e.RelationID
-			if key == "" {
-				key = e.CanonicalKey()
+			a := accs[r.ID]
+			if a == nil {
+				a = &acc{}
+				accs[r.ID] = a
 			}
-			seen[key] = e
+			if r.SourceTaskID == taskID {
+				if a.srcSide != nil && !relationEqual(*a.srcSide, r) {
+					return nil, fmt.Errorf("deps: snapshot: relation %s inconsistent on source listings", r.ID)
+				}
+				cp := r
+				a.srcSide = &cp
+			}
+			if r.TargetTaskID == taskID {
+				if a.tgtSide != nil && !relationEqual(*a.tgtSide, r) {
+					return nil, fmt.Errorf("deps: snapshot: relation %s inconsistent on target listings", r.ID)
+				}
+				cp := r
+				a.tgtSide = &cp
+			}
+			// If listed on a third task id, still require field agreement with first.
+			if r.SourceTaskID != taskID && r.TargetTaskID != taskID {
+				return nil, fmt.Errorf("deps: snapshot: relation %s listed on unrelated task %s", r.ID, taskID)
+			}
 		}
 	}
-	out := make([]DependencyEdge, 0, len(seen))
-	for _, e := range seen {
+
+	out := make([]DependencyEdge, 0, len(accs))
+	var keys []string
+	for id := range accs {
+		keys = append(keys, id)
+	}
+	sort.Strings(keys)
+	for _, id := range keys {
+		a := accs[id]
+		if a.srcSide == nil || a.tgtSide == nil {
+			return nil, fmt.Errorf("deps: snapshot: relation %s not visible on both endpoints (one-sided)", id)
+		}
+		if !relationEqual(*a.srcSide, *a.tgtSide) {
+			return nil, fmt.Errorf("deps: snapshot: relation %s field disagreement between source and target listings", id)
+		}
+		e, merr := s.mapEdgeStrict(ctx, *a.srcSide)
+		if merr != nil {
+			return nil, merr
+		}
 		out = append(out, e)
 	}
 	sort.Slice(out, func(i, j int) bool {
@@ -196,7 +301,6 @@ func (s *ProviderStore) SnapshotGraph(ctx context.Context) (*GraphSnapshot, erro
 		}
 		return out[i].CanonicalKey() < out[j].CanonicalKey()
 	})
-	// Provider revision: SHA-256 of sorted relation IDs + canonical keys.
 	h := sha256.New()
 	for _, e := range out {
 		_, _ = h.Write([]byte(e.RelationID + "|" + e.CanonicalKey()))
@@ -206,6 +310,11 @@ func (s *ProviderStore) SnapshotGraph(ctx context.Context) (*GraphSnapshot, erro
 		Edges:            out,
 		ProviderRevision: hex.EncodeToString(h.Sum(nil)),
 	}, nil
+}
+
+func relationEqual(a, b provider.Relation) bool {
+	return a.ID == b.ID && a.SourceTaskID == b.SourceTaskID &&
+		a.TargetTaskID == b.TargetTaskID && a.Type == b.Type
 }
 
 func (s *ProviderStore) CreateRelation(ctx context.Context, edge DependencyEdge) (DependencyEdge, error) {
@@ -248,14 +357,12 @@ func (s *ProviderStore) CreateRelation(ctx context.Context, edge DependencyEdge)
 	rel, err := rp.CreateRelation(ctx, src, tgt, typ)
 	if err != nil {
 		if provider.IsAmbiguous(err) || provider.IsTimeout(err) {
-			// Reconcile: if edge already exists, return it (no duplicate).
-			if existing, ferr := s.findEdge(ctx, src, tgt, typ); ferr == nil && existing != nil {
+			if existing, ferr := s.findEdgeBothEnds(ctx, src, tgt, typ); ferr == nil && existing != nil {
 				return *existing, nil
 			}
 			return DependencyEdge{}, fmt.Errorf("%w: %v", ErrAmbiguousMutation, err)
 		}
-		// Non-timeout create failure: still try reconcile for already-exists races.
-		if existing, ferr := s.findEdge(ctx, src, tgt, typ); ferr == nil && existing != nil {
+		if existing, ferr := s.findEdgeBothEnds(ctx, src, tgt, typ); ferr == nil && existing != nil {
 			return *existing, nil
 		}
 		return DependencyEdge{}, err
@@ -263,34 +370,53 @@ func (s *ProviderStore) CreateRelation(ctx context.Context, edge DependencyEdge)
 	if rel == nil {
 		return DependencyEdge{}, fmt.Errorf("deps: create returned nil relation")
 	}
-	out, merr := s.mapEdge(ctx, *rel)
+	out, merr := s.mapEdgeStrict(ctx, *rel)
 	if merr != nil {
 		return DependencyEdge{}, merr
 	}
-	out.SourceRef = edge.SourceRef
-	out.TargetRef = edge.TargetRef
 	return out, nil
 }
 
-func (s *ProviderStore) findEdge(ctx context.Context, src, tgt string, typ provider.RelationType) (*DependencyEdge, error) {
+func (s *ProviderStore) findEdgeBothEnds(ctx context.Context, src, tgt string, typ provider.RelationType) (*DependencyEdge, error) {
 	rp, err := s.rel()
 	if err != nil {
 		return nil, err
 	}
-	rels, err := rp.ListRelations(ctx, src)
+	srcRels, err := rp.ListRelations(ctx, src)
 	if err != nil {
 		return nil, err
 	}
-	for _, r := range rels {
+	tgtRels, err := rp.ListRelations(ctx, tgt)
+	if err != nil {
+		return nil, err
+	}
+	var fromSrc *provider.Relation
+	for i := range srcRels {
+		r := &srcRels[i]
 		if r.SourceTaskID == src && r.TargetTaskID == tgt && r.Type == typ {
-			e, merr := s.mapEdge(ctx, r)
-			if merr != nil {
-				return nil, merr
-			}
-			return &e, nil
+			fromSrc = r
+			break
 		}
 	}
-	return nil, nil
+	if fromSrc == nil {
+		return nil, nil
+	}
+	foundTgt := false
+	for i := range tgtRels {
+		r := &tgtRels[i]
+		if r.ID == fromSrc.ID && relationEqual(*r, *fromSrc) {
+			foundTgt = true
+			break
+		}
+	}
+	if !foundTgt {
+		return nil, fmt.Errorf("deps: edge visible on source but not target (or fields disagree)")
+	}
+	e, merr := s.mapEdgeStrict(ctx, *fromSrc)
+	if merr != nil {
+		return nil, merr
+	}
+	return &e, nil
 }
 
 func (s *ProviderStore) DeleteRelation(ctx context.Context, relationID string, sourceID, targetID TaskID) error {
@@ -298,8 +424,8 @@ func (s *ProviderStore) DeleteRelation(ctx context.Context, relationID string, s
 	if err != nil {
 		return err
 	}
+	// Prefer capture from snapshot when endpoints incomplete.
 	if !sourceID.Valid() || !targetID.Valid() {
-		// Capture endpoints from snapshot if caller omitted them.
 		snap, serr := s.SnapshotGraph(ctx)
 		if serr != nil {
 			return fmt.Errorf("deps: delete cannot capture endpoints: %w", serr)
@@ -325,16 +451,14 @@ func (s *ProviderStore) DeleteRelation(ctx context.Context, relationID string, s
 	return nil
 }
 
-func mapRelType(t provider.RelationType) EdgeType {
+func mapRelTypeStrict(t provider.RelationType) EdgeType {
 	switch t {
 	case provider.RelationRelated:
 		return EdgeRelated
 	case provider.RelationBlocks:
 		return EdgeBlocks
-	case provider.RelationSubtask:
-		// Subtask is not eligibility-authoritative; map fails ValidEdgeType for deps mutations.
-		return EdgeType("subtask")
 	default:
+		// Unknown/subtask fail ValidEdgeType — snapshot fails closed.
 		return EdgeType(strings.ToLower(string(t)))
 	}
 }

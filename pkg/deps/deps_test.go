@@ -32,6 +32,80 @@ func prov(ref string, edges ...DependencyEdge) *Provenance {
 	}
 }
 
+func TestProviderStore_ConcurrentSnapshotAndNewTask(t *testing.T) {
+	mp := provider.NewMemoryProvider()
+	mp.AddTask(&provider.Task{ID: "a", Ref: "FAC-1", Status: "to-do", ProjectID: "p"})
+	store := NewProviderStore(mp, "p")
+	done := make(chan error, 8)
+	for i := 0; i < 4; i++ {
+		go func() {
+			_, err := store.SnapshotGraph(context.Background())
+			done <- err
+		}()
+	}
+	// Concurrent add
+	go func() {
+		mp.AddTask(&provider.Task{ID: "b", Ref: "FAC-2", Status: "to-do", ProjectID: "p"})
+		done <- nil
+	}()
+	for i := 0; i < 5; i++ {
+		if err := <-done; err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Fresh snapshot must be able to see FAC-2 after add.
+	mp.AddTask(&provider.Task{ID: "c", Ref: "FAC-3", Status: "to-do", ProjectID: "p"})
+	snap, err := store.SnapshotGraph(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Empty graph edges ok; resolve FAC-3.
+	id, err := store.ResolveRef(context.Background(), "FAC-3")
+	if err != nil || id != "c" {
+		t.Fatalf("new task not resolved: id=%s err=%v snap=%v", id, err, snap != nil)
+	}
+}
+
+func TestMigrate_DryRunAndApply(t *testing.T) {
+	mp := provider.NewMemoryProvider()
+	mp.AddTask(&provider.Task{ID: "t1", Ref: "FAC-1", Status: "to-do", ProjectID: "p", Title: "a"})
+	mp.AddTask(&provider.Task{ID: "t2", Ref: "FAC-2", Status: "to-do", ProjectID: "p", Title: "b",
+		Description: "```herd-deps-v1\n{\"version\":1,\"task_ref\":\"FAC-2\",\"edges\":[]}\n```\n"})
+	store := StoreFor(mp, "p")
+	plan, err := PlanMigration(context.Background(), store, mp, "p")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wrote, skipped int
+	for _, it := range plan.Items {
+		switch it.Action {
+		case "write_empty", "write_from_board":
+			wrote++
+		case "skip_has_fence":
+			skipped++
+		}
+	}
+	if wrote < 1 || skipped < 1 {
+		t.Fatalf("plan items=%+v wrote=%d skipped=%d", plan.Items, wrote, skipped)
+	}
+	applied, err := ApplyMigration(context.Background(), store, mp, "p", MemoryDescriptionWriter{MP: mp})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !applied.OK {
+		t.Fatalf("apply not ok: %+v", applied)
+	}
+	// FAC-1 now launchable with empty provenance.
+	t1, _ := mp.GetTask(context.Background(), "t1")
+	p, err := ExtractProvenanceFromText(t1.Description)
+	if err != nil || !p.Present {
+		t.Fatalf("after migrate FAC-1 fence missing: %v", err)
+	}
+	if err := p.BindAndValidate("FAC-1", "t1"); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestReconcile_FAC75MissingEdge(t *testing.T) {
 	desired := []DependencyEdge{
 		{SourceRef: "FAC-136", TargetRef: "FAC-75", Type: EdgeBlocks},
@@ -258,9 +332,50 @@ func TestProvenance_FenceAuthoritative(t *testing.T) {
 	if !p.Present {
 		t.Fatal("fence must be Present")
 	}
+	if err := p.BindAndValidate("FAC-75", "id-fac-75"); err != nil {
+		t.Fatal(err)
+	}
 	blocks, err := p.DesiredBlocks()
 	if err != nil || len(blocks) != 1 {
 		t.Fatalf("want 1 edge: %v %+v", err, blocks)
+	}
+}
+
+func TestProvenance_RejectsReplayWrongTaskRef(t *testing.T) {
+	p := prov("FAC-75", DependencyEdge{SourceRef: "FAC-136", TargetRef: "FAC-75", Type: EdgeBlocks})
+	if err := p.BindAndValidate("FAC-90", "id-fac-90"); err == nil {
+		t.Fatal("wrong task_ref must fail bind")
+	}
+}
+
+func TestProvenance_RejectsMultipleFences(t *testing.T) {
+	raw := "```herd-deps-v1\n" +
+		`{"version":1,"task_ref":"FAC-75","edges":[]}` +
+		"\n```\n```herd-deps-v1\n" +
+		`{"version":1,"task_ref":"FAC-75","edges":[]}` +
+		"\n```\n"
+	if _, err := ExtractProvenanceFromText(raw); err == nil {
+		t.Fatal("multiple fences must fail")
+	}
+}
+
+func TestProvenance_RejectsUnknownJSONFields(t *testing.T) {
+	_, err := ParseProvenanceJSON([]byte(`{"version":1,"task_ref":"FAC-1","edges":[],"nope":true}`))
+	if err == nil {
+		t.Fatal("unknown fields must fail")
+	}
+}
+
+func TestProvenance_RejectsDuplicateEdges(t *testing.T) {
+	p := &Provenance{
+		Version: 1, TaskRef: "FAC-1", Present: true,
+		Edges: []DependencyEdge{
+			{SourceRef: "A", TargetRef: "FAC-1", Type: EdgeBlocks},
+			{SourceRef: "A", TargetRef: "FAC-1", Type: EdgeBlocks},
+		},
+	}
+	if err := p.Validate(); err == nil {
+		t.Fatal("duplicate edges must fail Validate")
 	}
 }
 

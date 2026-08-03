@@ -157,10 +157,6 @@ type Dispatcher struct {
 	// Deps is the relation store for the FAC-159 pre-side-effect gate.
 	// When nil, constructed from TaskProvider via deps.StoreFor.
 	Deps deps.RelationStore
-	// SkipDepsGate is test-only escape for unit tests that intentionally
-	// exercise later steps without a relation-capable provider. Production
-	// paths must leave this false.
-	SkipDepsGate bool
 
 	// health projects BLOCKED(provider_timeout) for board calls (FAC-150).
 	health dispatchHealth
@@ -290,30 +286,33 @@ func (d *Dispatcher) Dispatch(ctx context.Context, opts DispatchOptions) (*Dispa
 		defaultBranch = worktree.DefaultBranch
 	}
 
-	// 2b. FAC-159 PRE-SIDE-EFFECT gate: packet↔board dependency conformance.
-	// Must run BEFORE worktree create, status flip, comment, or tab.
+	// 2b. FAC-159 PRE-SIDE-EFFECT fence: selection → re-read bound to revision
+	// BEFORE any worktree/status/comment/tab. No empty-revision optional path.
 	var depProv *deps.Provenance
-	if !d.SkipDepsGate {
-		store := d.Deps
-		if store == nil {
-			store = deps.StoreFor(d.TaskProvider, d.Config.TaskProvider.ProjectID)
-		}
-		desired, perr := deps.ExtractProvenanceFromText(task.Description)
-		if perr != nil {
-			return nil, fmt.Errorf("dispatch dependency provenance: %w", perr)
-		}
-		// Empty/missing provenance is never OK — require versioned record.
-		if desired == nil || !desired.Present {
-			return nil, fmt.Errorf("dispatch: %w for %s (attach herd-deps-v1 fence)", deps.ErrMissingProvenance, task.Ref)
-		}
-		gate, gerr := deps.ValidateLaunch(ctx, store, deps.EntryDispatch, deps.Ref(task.Ref), desired, "")
-		if gerr != nil {
-			return nil, gerr
-		}
-		if gate != nil {
-			depProv = gate.Provenance
-		}
+	var launchRev string
+	store := d.Deps
+	if store == nil {
+		store = deps.StoreFor(d.TaskProvider, d.Config.TaskProvider.ProjectID)
 	}
+	desired, perr := deps.ExtractProvenanceFromText(task.Description)
+	if perr != nil {
+		return nil, fmt.Errorf("dispatch dependency provenance: %w", perr)
+	}
+	if desired == nil || !desired.Present {
+		return nil, fmt.Errorf("dispatch: %w for %s (attach herd-deps-v1 fence or run herd deps migrate)", deps.ErrMissingProvenance, task.Ref)
+	}
+	// Selection snapshot (captures graph/provider revision).
+	sel, serr := deps.RequireTaskLaunch(ctx, store, deps.EntryDispatch, deps.Ref(task.Ref), desired, "")
+	if serr != nil {
+		return nil, serr
+	}
+	// Re-read immediately before first side effect; concurrent relation must block.
+	pre, perr2 := deps.RequireTaskLaunch(ctx, store, deps.EntryDispatch, deps.Ref(task.Ref), desired, sel.GraphRevision)
+	if perr2 != nil {
+		return nil, perr2
+	}
+	depProv = pre.Provenance
+	launchRev = pre.GraphRevision
 
 	// 3. Create worktree from immutable origin/<defaultBranch> (FAC-121).
 	// Branch name is whatever Git actually created — never overwrite with a
@@ -421,7 +420,12 @@ func (d *Dispatcher) Dispatch(ctx context.Context, opts DispatchOptions) (*Dispa
 		Lane:        lane.Name,
 	}
 
-	// 8. Optionally launch agent with explicit cwd + proven prompt consumption
+	// 8. Post-side-effect graph re-validation bound to launchRev. Drift → compensate.
+	if _, postErr := deps.RequireTaskLaunch(ctx, store, deps.EntryDispatch, deps.Ref(task.Ref), desired, launchRev); postErr != nil {
+		return result, d.failWithCompensate(ctx, task.Ref, "post_dispatch_graph_drift", postErr)
+	}
+
+	// 9. Optionally launch agent with explicit cwd + proven prompt consumption
 	h := d.launcher()
 	if !opts.NoLaunch && h.Available() {
 		if err := d.launch(ctx, opts, task, lane, wtInfo, branch, packet, result); err != nil {

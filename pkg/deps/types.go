@@ -145,7 +145,8 @@ type Provenance struct {
 }
 
 // Validate fails closed on missing/unsupported version and malformed edge/hold
-// values. It does NOT silently drop or default unknown types.
+// values. It does NOT silently drop or default unknown types. Duplicate desired
+// edges are rejected here so Reconcile always sees authority failures.
 func (p *Provenance) Validate() error {
 	if p == nil || !p.Present {
 		return fmt.Errorf("%w: structured provenance record required", ErrMissingProvenance)
@@ -153,6 +154,10 @@ func (p *Provenance) Validate() error {
 	if p.Version != SchemaVersion {
 		return fmt.Errorf("%w: version %d (want %d)", ErrUnsupportedProvenance, p.Version, SchemaVersion)
 	}
+	if !Ref(strings.TrimSpace(string(p.TaskRef))).Valid() {
+		return fmt.Errorf("deps: provenance task_ref required")
+	}
+	seen := map[string]int{}
 	for i, e := range p.Edges {
 		if !ValidEdgeType(e.Type) {
 			return fmt.Errorf("deps: edge[%d]: unknown type %q (want blocks|related)", i, e.Type)
@@ -165,6 +170,15 @@ func (p *Provenance) Validate() error {
 		if src == tgt {
 			return fmt.Errorf("deps: edge[%d]: self-edge rejected (%s)", i, src)
 		}
+		// Normalize for keying without mutating caller's slice permanently.
+		ne := e
+		ne.SourceRef, ne.TargetRef = src, tgt
+		ne.Type = EdgeType(strings.ToLower(strings.TrimSpace(string(e.Type))))
+		k := ne.Key()
+		if prev, ok := seen[k]; ok {
+			return fmt.Errorf("deps: edge[%d]: duplicate of edge[%d] %s", i, prev, k)
+		}
+		seen[k] = i
 	}
 	for i, h := range p.Holds {
 		if !ValidHoldKind(h.Kind) {
@@ -176,17 +190,22 @@ func (p *Provenance) Validate() error {
 		if h.BlockerRef == h.DependentRef {
 			return fmt.Errorf("deps: hold[%d]: self-hold rejected", i)
 		}
+		e := h.ToEdge()
+		k := e.Key()
+		if prev, ok := seen[k]; ok {
+			return fmt.Errorf("deps: hold[%d]: duplicate of edge/hold[%d] %s", i, prev, k)
+		}
+		seen[k] = i
 	}
 	return nil
 }
 
 // DesiredBlocks returns desired blocks edges including holds expanded to edges.
-// Caller must Validate first; unknown types are not silently skipped.
+// Caller must Validate first. Does NOT deduplicate — Validate already rejects dups.
 func (p Provenance) DesiredBlocks() ([]DependencyEdge, error) {
 	if err := p.Validate(); err != nil {
 		return nil, err
 	}
-	seen := map[string]bool{}
 	var out []DependencyEdge
 	for _, e := range p.Edges {
 		e.SourceRef = Ref(strings.TrimSpace(string(e.SourceRef)))
@@ -195,21 +214,10 @@ func (p Provenance) DesiredBlocks() ([]DependencyEdge, error) {
 		if e.Type != EdgeBlocks {
 			continue
 		}
-		k := e.Key()
-		if seen[k] {
-			continue
-		}
-		seen[k] = true
 		out = append(out, e)
 	}
 	for _, h := range p.Holds {
-		e := h.ToEdge()
-		k := e.Key()
-		if seen[k] {
-			continue
-		}
-		seen[k] = true
-		out = append(out, e)
+		out = append(out, h.ToEdge())
 	}
 	return out, nil
 }
