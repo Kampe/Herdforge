@@ -3,20 +3,22 @@ package deps
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/Kampe/Herdforge/pkg/provider"
 )
 
 // DriftFixture is a hermetic board snapshot for FAC-75/90/93/105 regression.
 type DriftFixture struct {
-	Name          string                     `json:"name"`
-	Tasks         []FixtureTask              `json:"tasks"`
-	Board         []DependencyEdge           `json:"board"`
+	Name          string                      `json:"name"`
+	Tasks         []FixtureTask               `json:"tasks"`
+	Board         []DependencyEdge            `json:"board"`
 	Desired       map[string][]DependencyEdge `json:"desired"`
-	ExpectBlocked []string                   `json:"expect_blocked"`
-	ExpectOK      []string                   `json:"expect_ok"`
+	ExpectBlocked []string                    `json:"expect_blocked"`
+	ExpectOK      []string                    `json:"expect_ok"`
 }
 
 // FixtureTask is one card in a drift fixture.
@@ -32,14 +34,14 @@ func FAC759093105Fixture() DriftFixture {
 	return DriftFixture{
 		Name: "fac-75-90-93-105-relation-drift",
 		Tasks: []FixtureTask{
-			{ID: "id-75", Ref: "FAC-75", Status: "to-do", Priority: provider.PriorityHigh},
-			{ID: "id-90", Ref: "FAC-90", Status: "to-do", Priority: provider.PriorityHigh},
-			{ID: "id-93", Ref: "FAC-93", Status: "to-do", Priority: provider.PriorityUrgent},
-			{ID: "id-105", Ref: "FAC-105", Status: "to-do", Priority: provider.PriorityHigh},
-			{ID: "id-136", Ref: "FAC-136", Status: "done", Priority: provider.PriorityHigh},
-			{ID: "id-69", Ref: "FAC-69", Status: "to-do", Priority: provider.PriorityHigh},
-			{ID: "id-73", Ref: "FAC-73", Status: "to-do", Priority: provider.PriorityMedium},
-			{ID: "id-117", Ref: "FAC-117", Status: "done", Priority: provider.PriorityMedium},
+			{ID: "id-fac-75", Ref: "FAC-75", Status: "to-do", Priority: provider.PriorityHigh},
+			{ID: "id-fac-90", Ref: "FAC-90", Status: "to-do", Priority: provider.PriorityHigh},
+			{ID: "id-fac-93", Ref: "FAC-93", Status: "to-do", Priority: provider.PriorityUrgent},
+			{ID: "id-fac-105", Ref: "FAC-105", Status: "to-do", Priority: provider.PriorityHigh},
+			{ID: "id-fac-136", Ref: "FAC-136", Status: "done", Priority: provider.PriorityHigh},
+			{ID: "id-fac-69", Ref: "FAC-69", Status: "to-do", Priority: provider.PriorityHigh},
+			{ID: "id-fac-73", Ref: "FAC-73", Status: "to-do", Priority: provider.PriorityMedium},
+			{ID: "id-fac-117", Ref: "FAC-117", Status: "done", Priority: provider.PriorityMedium},
 		},
 		Board: []DependencyEdge{
 			{RelationID: "b1", SourceRef: "FAC-117", TargetRef: "FAC-93", Type: EdgeBlocks,
@@ -60,12 +62,14 @@ func FAC759093105Fixture() DriftFixture {
 func (f DriftFixture) LoadStore() *MemoryStore {
 	m := NewMemoryStore()
 	for _, t := range f.Tasks {
-		id := t.ID
+		id := strings.TrimSpace(t.ID)
 		if id == "" {
-			id = "id-" + t.Ref
+			id = "id-" + strings.ToLower(t.Ref)
 		}
-		// EnsureTask uses id-fac-N lowercase; align.
-		m.EnsureTask(t.Ref, t.Status, t.Priority)
+		m.AddTask(&provider.Task{
+			ID: id, Ref: t.Ref, Title: t.Ref, Status: provider.NormalizeStatus(t.Status),
+			Priority: t.Priority, ProjectID: "fixture",
+		})
 	}
 	for _, e := range f.Board {
 		_, _ = m.CreateRelation(context.Background(), e)
@@ -83,6 +87,11 @@ func RunFixture(f DriftFixture) error {
 	var failures []string
 
 	for ref, desiredEdges := range f.Desired {
+		taskID, rerr := store.ResolveRef(context.Background(), Ref(ref))
+		if rerr != nil {
+			failures = append(failures, fmt.Sprintf("%s: resolve immutable identity: %v", ref, rerr))
+			continue
+		}
 		rep := Reconcile(Ref(ref), desiredEdges, snap.Edges, ReconcileOpts{
 			FullClosure:        snap.Edges,
 			ProviderRevision:   snap.ProviderRevision,
@@ -91,6 +100,7 @@ func RunFixture(f DriftFixture) error {
 		des := &Provenance{
 			Version: SchemaVersion,
 			TaskRef: Ref(ref),
+			TaskID:  taskID,
 			Edges:   desiredEdges,
 			Present: true,
 		}
@@ -170,12 +180,13 @@ func MutationControl_GateBypassed() error {
 		return err
 	}
 	des := &Provenance{
-		Version: SchemaVersion, TaskRef: "FAC-75", Present: true,
+		Version: SchemaVersion, TaskRef: "FAC-75", TaskID: "id-fac-75", Present: true,
 		Edges: []DependencyEdge{{SourceRef: "FAC-136", TargetRef: "FAC-75", Type: EdgeBlocks}},
 	}
 	_, err := ValidateLaunch(context.Background(), m, EntryDispatch, "FAC-75", des, "")
-	if err == nil {
-		return fmt.Errorf("MUTATION CONTROL FAILED: gate allowed open blocker")
+	var blocked *BlockedError
+	if err == nil || !errors.As(err, &blocked) || blocked.Code != "open_blocker" {
+		return fmt.Errorf("MUTATION CONTROL FAILED: gate did not reach open blocker: %v", err)
 	}
 	return nil
 }
