@@ -7,12 +7,13 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"time"
 )
 
 // processesHoldingMarker returns tokens for processes whose open FDs still
 // reference the ownership marker inode. Lineage authority only — not path
 // contact under the candidate.
-func processesHoldingMarker(markerPath string) ([]procToken, error) {
+func processesHoldingMarkerUntil(markerPath string, deadline time.Time) ([]procToken, error) {
 	if markerPath == "" {
 		return nil, nil
 	}
@@ -40,6 +41,9 @@ func processesHoldingMarker(markerPath string) ([]procToken, error) {
 	var out []procToken
 	seen := map[int]struct{}{}
 	for _, e := range entries {
+		if !time.Now().Before(deadline) {
+			return nil, fmt.Errorf("processesHoldingMarker: deadline exceeded")
+		}
 		if !e.IsDir() {
 			continue
 		}

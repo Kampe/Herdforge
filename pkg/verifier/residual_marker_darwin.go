@@ -3,12 +3,13 @@
 package verifier
 
 import (
+	"context"
 	"fmt"
-	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // processesHoldingMarker returns tokens for processes that still hold the
@@ -16,7 +17,7 @@ import (
 // inherited (and retained) the marker FD appear here. Unrelated editors /
 // watchers / fleet lanes that open candidate files without the marker are
 // invisible to this scan.
-func processesHoldingMarker(markerPath string) ([]procToken, error) {
+func processesHoldingMarkerUntil(markerPath string, deadline time.Time) ([]procToken, error) {
 	if markerPath == "" {
 		return nil, nil
 	}
@@ -38,14 +39,16 @@ func processesHoldingMarker(markerPath string) ([]procToken, error) {
 	if privateAbs != abs {
 		args = append(args, privateAbs)
 	}
-	cmd := exec.Command("lsof", args...)
+	ctx, cancel := context.WithDeadline(context.Background(), deadline)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "lsof", args...)
 	out, err := cmd.Output()
+	if ctx.Err() != nil {
+		return nil, fmt.Errorf("processesHoldingMarker lsof deadline: %w", ctx.Err())
+	}
 	if err != nil {
-		if ee, ok := err.(*exec.ExitError); ok {
-			if len(out) == 0 {
-				_ = ee
-				return nil, nil
-			}
+		if _, ok := err.(*exec.ExitError); ok && len(out) == 0 {
+			return nil, nil
 		} else if len(out) == 0 {
 			return nil, fmt.Errorf("processesHoldingMarker lsof: %w", err)
 		}
@@ -98,8 +101,5 @@ func processesHoldingMarker(markerPath string) ([]procToken, error) {
 			outTok = append(outTok, tok)
 		}
 	}
-	// Parent also holds the marker open (we keep markerFile in the parent).
-	// filterResidualTokens / leader / self exclusion drops control plane.
-	_ = os.Getpid()
 	return outTok, nil
 }

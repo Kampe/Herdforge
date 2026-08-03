@@ -2,10 +2,13 @@
 
 package verifier
 
-import "fmt"
+import (
+	"fmt"
+	"time"
+)
 
 // processesHoldingMarker is unsupported: fail closed so we never claim
 // marker lineage residual ownership is complete.
-func processesHoldingMarker(markerPath string) ([]procToken, error) {
+func processesHoldingMarkerUntil(markerPath string, _ time.Time) ([]procToken, error) {
 	return nil, fmt.Errorf("processesHoldingMarker: unsupported platform for marker %q", markerPath)
 }

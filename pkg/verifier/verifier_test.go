@@ -706,7 +706,13 @@ exit 0
 // residual ownership (open FD on writetarget) and identity-kill by token.
 //
 // $1=writerPid $2=writetarget
+// Optional $3=startedPath $4=releasePath provides an explicit ordering gate
+// for tests that must launch an unrelated holder after this command starts.
 const productionDetachedOnlyScript = `
+if [ "$#" -ge 4 ]; then
+  printf "%s\n" "$$" > "$3" || exit 1
+  while [ ! -e "$4" ]; do :; done
+fi
 python3 -c '
 import os, sys
 path, target = sys.argv[1], sys.argv[2]
@@ -773,6 +779,19 @@ func assertWriterGone(t *testing.T, pidFile string) {
 	}
 	if err := waitForPIDGone(pid, 2*time.Second); err != nil {
 		t.Fatalf("production left writer pid %d live: %v", pid, err)
+	}
+}
+
+func terminateTestProcess(t *testing.T, cmd *exec.Cmd) {
+	t.Helper()
+	if cmd == nil || cmd.Process == nil || cmd.ProcessState != nil {
+		return
+	}
+	if err := cmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+		t.Errorf("cleanup kill pid %d: %v", cmd.Process.Pid, err)
+	}
+	if err := cmd.Wait(); err != nil && !isExpectedKillWait(err) {
+		t.Errorf("cleanup wait pid %d: %v", cmd.Process.Pid, err)
 	}
 }
 
@@ -939,6 +958,50 @@ func TestExecuteCancelAfterStartClosesProcessGroup(t *testing.T) {
 // TestMarkerLineageFindsSetsidChdirAwayWriter proves processesHoldingMarker
 // discovers a setsid writer that inherited the ownership marker FD, chdir'd
 // away, and still mutates a descendant file — lineage authority, not path.
+func TestOwnershipMarkerLockTracksLastInheritedHolder(t *testing.T) {
+	marker, markerPath, err := createOwnershipMarker()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if marker != nil {
+			if err := marker.Close(); err != nil {
+				t.Errorf("cleanup marker close: %v", err)
+			}
+		}
+		if err := removeMarkerPath(markerPath); err != nil {
+			t.Errorf("cleanup marker path: %v", err)
+		}
+	})
+
+	cmd := exec.Command("sleep", "30")
+	cmd.ExtraFiles = []*os.File{marker}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { terminateTestProcess(t, cmd) })
+	if err := marker.Close(); err != nil {
+		t.Fatalf("close parent marker: %v", err)
+	}
+	marker = nil
+
+	drained, err := markerLineageDrained(markerPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if drained {
+		t.Fatal("marker fixed point reported drained while inherited holder was live")
+	}
+	terminateTestProcess(t, cmd)
+	drained, err = markerLineageDrained(markerPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !drained {
+		t.Fatal("marker fixed point remained held after last inherited holder exited")
+	}
+}
+
 func TestMarkerLineageFindsSetsidChdirAwayWriter(t *testing.T) {
 	if _, err := exec.LookPath("python3"); err != nil {
 		t.Skip("python3 required for marker lineage fixture")
@@ -1096,6 +1159,7 @@ func TestExecuteDetachedOnlySessionWriterBlocksAndReaps(t *testing.T) {
 	pidFile := filepath.Join(dir, "session.pid")
 	writeTarget := filepath.Join(dir, "residue.log")
 	writeExecutable(t, filepath.Join(dir, "leave-detached-only"), "#!/bin/sh\n"+productionDetachedOnlyScript)
+	t.Cleanup(func() { forceKillTrackedPID(t, pidFile) })
 
 	result, err := NewVerifierArgs([]string{"./leave-detached-only", pidFile, writeTarget}).Execute(context.Background(), dir)
 	if err != nil {
@@ -1124,38 +1188,69 @@ func TestExecuteUnrelatedPathContactSurvivesMarkedWriterReaped(t *testing.T) {
 	unrelatedPidFile := filepath.Join(dir, "unrelated.pid")
 	writeTarget := filepath.Join(dir, "residue.log")
 	unrelatedTarget := filepath.Join(dir, "unrelated.log")
+	startedFile := filepath.Join(dir, "command-started.pid")
+	releaseFile := filepath.Join(dir, "release-marked-writer")
 	writeExecutable(t, filepath.Join(dir, "leave-detached-only"), "#!/bin/sh\n"+productionDetachedOnlyScript)
+	t.Cleanup(func() { forceKillTrackedPID(t, markedPidFile) })
 
-	// Unrelated path-contact process: no marker, opens a descendant under dir.
+	ctx, cancel := context.WithCancel(context.Background())
+	type executeOutcome struct {
+		result *Result
+		err    error
+	}
+	executeDone := make(chan executeOutcome, 1)
+	executeFinished := make(chan struct{})
+	go func() {
+		defer close(executeFinished)
+		result, err := NewVerifierArgs([]string{
+			"./leave-detached-only", markedPidFile, writeTarget, startedFile, releaseFile,
+		}).Execute(ctx, dir)
+		executeDone <- executeOutcome{result: result, err: err}
+	}()
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case <-executeFinished:
+		case <-time.After(5 * time.Second):
+			t.Errorf("cleanup: Execute did not stop after cancellation")
+		}
+	})
+	if _, err := waitForChildReadyPID(startedFile, 5*time.Second); err != nil {
+		t.Fatalf("verification command start gate: %v", err)
+	}
+
+	// Start only after the supervised command's explicit gate. This process
+	// opens a descendant but inherits no marker FD.
 	unrelated := exec.Command("python3", "-c", `
-import os, sys, time
+import os, signal, sys
 path, target = sys.argv[1], sys.argv[2]
 out = open(target, "a", encoding="utf-8")
 with open(path, "w", encoding="utf-8") as f:
     f.write("%d\n" % os.getpid())
-while True:
-    out.write("u")
-    out.flush()
-    time.sleep(0.05)
+signal.pause()
 `, unrelatedPidFile, unrelatedTarget)
 	if err := unrelated.Start(); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() {
-		_ = unrelated.Process.Kill()
-		_ = unrelated.Wait()
-	})
+	t.Cleanup(func() { terminateTestProcess(t, unrelated) })
 	unrelatedPID, err := waitForChildReadyPID(unrelatedPidFile, 5*time.Second)
 	if err != nil {
 		t.Fatalf("unrelated ready: %v", err)
 	}
-
-	result, err := NewVerifierArgs([]string{"./leave-detached-only", markedPidFile, writeTarget}).Execute(context.Background(), dir)
-	if err != nil {
-		t.Fatal(err)
+	if err := os.WriteFile(releaseFile, []byte("release\n"), 0o600); err != nil {
+		t.Fatalf("release marked writer: %v", err)
 	}
-	if result.Outcome != OutcomeBLOCKED {
-		t.Fatalf("marked detached writer must BLOCKED, got %+v", result)
+	var outcome executeOutcome
+	select {
+	case outcome = <-executeDone:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Execute exceeded bounded later-holder proof")
+	}
+	if outcome.err != nil {
+		t.Fatal(outcome.err)
+	}
+	if outcome.result.Outcome != OutcomeBLOCKED {
+		t.Fatalf("marked detached writer must BLOCKED, got %+v", outcome.result)
 	}
 	assertWriterGone(t, markedPidFile)
 
@@ -1165,10 +1260,10 @@ while True:
 	}
 }
 
-// TestExecuteDetachedOnlyMutationOmittingFinalizeLeavesWriter proves the
-// setsid residual fixture fails the incomplete ownership shape
-// (PASS + live writer) when drain+finalize are muted.
-func TestExecuteDetachedOnlyMutationOmittingFinalizeLeavesWriter(t *testing.T) {
+// TestExecuteDetachedOnlyMutationRemovingMarkerDrainLeavesWriter toggles only
+// the marker fixed-point proof. The production positive test must fail under
+// this mutation because the detached marked writer survives.
+func TestExecuteDetachedOnlyMutationRemovingMarkerDrainLeavesWriter(t *testing.T) {
 	if _, err := exec.LookPath("python3"); err != nil {
 		t.Skip("python3 required for setsid residual writer fixture")
 	}
@@ -1177,23 +1272,10 @@ func TestExecuteDetachedOnlyMutationOmittingFinalizeLeavesWriter(t *testing.T) {
 	writeTarget := filepath.Join(dir, "residue.log")
 	writeExecutable(t, filepath.Join(dir, "leave-detached-only"), "#!/bin/sh\n"+productionDetachedOnlyScript)
 
-	prevFin := finalizeOwnedTree
-	prevDrain := residualDrainFn
-	residualDrainFn = func(o *ownedSubprocess) error {
-		if o != nil {
-			o.freeze()
-		}
-		return nil
-	}
-	finalizeOwnedTree = func(o *ownedSubprocess) error {
-		if o != nil {
-			_ = o.stopTracker()
-		}
-		return nil
-	}
+	previous := markerLineageDrainedFn
+	markerLineageDrainedFn = func(string) (bool, error) { return true, nil }
 	t.Cleanup(func() {
-		finalizeOwnedTree = prevFin
-		residualDrainFn = prevDrain
+		markerLineageDrainedFn = previous
 		forceKillTrackedPID(t, pidFile)
 	})
 
@@ -1202,7 +1284,7 @@ func TestExecuteDetachedOnlyMutationOmittingFinalizeLeavesWriter(t *testing.T) {
 		t.Fatal(err)
 	}
 	if result.Outcome != OutcomePASS {
-		t.Fatalf("mutation: detached-only without residual drain should PASS; got %+v", result)
+		t.Fatalf("mutation: detached-only without marker drain should PASS; got %+v", result)
 	}
 	data, err := os.ReadFile(pidFile)
 	if err != nil {
@@ -1286,6 +1368,25 @@ func TestProcTokenIdentityBoundRefusesStalePID(t *testing.T) {
 
 // TestKillProcessGroupMembersNeverUsesNegativePGID is a non-vacuous guard:
 // processGroupKiller must reap via positive PIDs (identity), not kill(-pgid).
+func TestKillProcessGroupMembersRejectsHostPGIDsBeforeSnapshot(t *testing.T) {
+	previous := processGroupSnapshotter
+	snapshotCalls := 0
+	processGroupSnapshotter = func() (processSnapshot, error) {
+		snapshotCalls++
+		return processSnapshot{}, nil
+	}
+	t.Cleanup(func() { processGroupSnapshotter = previous })
+
+	for _, pgid := range []int{0, 1} {
+		if err := killProcessGroupMembersExcept(pgid, -1); err == nil {
+			t.Fatalf("host-wide pgid %d must be rejected", pgid)
+		}
+	}
+	if snapshotCalls != 0 {
+		t.Fatalf("invalid host pgids reached process enumeration %d time(s)", snapshotCalls)
+	}
+}
+
 func TestKillProcessGroupMembersNeverUsesNegativePGID(t *testing.T) {
 	cmd := exec.Command("sleep", "30")
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}

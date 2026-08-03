@@ -21,6 +21,10 @@ import (
 // Never signals -pgid. Tests may replace it for mutation proofs.
 var processGroupKiller = killProcessGroupMembers
 
+// processGroupSnapshotter is isolated so the host-signal guard can prove that
+// pgid 0/1 are rejected before any process enumeration or signal path.
+var processGroupSnapshotter = snapshotProcesses
+
 // finalizeOwnedTree is the production ownership close after residual drain.
 var finalizeOwnedTree = (*ownedSubprocess).Close
 
@@ -53,10 +57,10 @@ func killProcessGroupMembers(pgid int) error {
 // killProcessGroupMembersExcept identity-kills live members of pgid except
 // exceptPID (the supervisor leader must not kill itself mid-drain).
 func killProcessGroupMembersExcept(pgid, exceptPID int) error {
-	if pgid <= 0 {
+	if pgid <= 1 {
 		return fmt.Errorf("kill process group members: invalid pgid %d", pgid)
 	}
-	snap, err := snapshotProcesses()
+	snap, err := processGroupSnapshotter()
 	if err != nil {
 		return fmt.Errorf("kill process group members: snapshot: %w", err)
 	}
@@ -106,8 +110,9 @@ func killProcessGroupIfLive(pgid int) error {
 //
 // Discovery never replaces a recorded incarnation. After freeze, no new PIDs
 // are adopted from numeric pgid membership. Escaped-descendant kill authority
-// is the unforgeable inherited marker FD (ExtraFiles FD5), not path contact or
-// start-time ordering. Path contact may only corroborate.
+// is the inherited locked marker FD (ExtraFiles FD5), not path contact or
+// start-time ordering. Path contact may only corroborate; the kernel lock is
+// the fixed-point proof that the final marked holder has exited.
 type ownedSubprocess struct {
 	cmd          *exec.Cmd
 	leader       int
@@ -153,6 +158,9 @@ shift
   exec "$user_path" "$@"
 ) &
 child=$!
+# The background child inherited the locked FD5. Drop the supervisor's copy so
+# lock release later means the user tree has no marked holder left.
+exec 5>&- || exit 1
 printf 'start %s\n' "$child" >&3
 wait "$child"
 ec=$?
@@ -303,6 +311,13 @@ func (o *ownedSubprocess) RunProtocol() (userExitHint int, err error) {
 		_ = killProcessGroupIfLive(o.leader)
 		return -1, fmt.Errorf("ownership sample after start (pre-cont): %w", serr)
 	}
+	// The wrapper already dropped its marker copy after forking the blocked
+	// child. Drop the verifier copy now so the inherited lock is held only by
+	// the user tree and becomes an exact last-holder completion signal.
+	if merr := o.releaseParentMarker(); merr != nil {
+		_ = killProcessGroupIfLive(o.leader)
+		return -1, merr
+	}
 	// Release pre-exec barrier only after causal handles are open.
 	if err := o.writeAckLine("cont"); err != nil {
 		_ = killProcessGroupIfLive(o.leader)
@@ -346,6 +361,26 @@ func (o *ownedSubprocess) writeAckLine(line string) error {
 	}
 	_, err := io.WriteString(o.ackW, line+"\n")
 	return err
+}
+
+// releaseParentMarker closes the verifier's inherited-lock reference after
+// the pre-exec child is recorded. From that point, only the user tree can keep
+// the marker lock held; the marker path remains for identity-targeted scans.
+func (o *ownedSubprocess) releaseParentMarker() error {
+	if o == nil {
+		return errors.New("release parent marker: nil")
+	}
+	o.mu.Lock()
+	marker := o.markerFile
+	o.markerFile = nil
+	o.mu.Unlock()
+	if marker == nil {
+		return errors.New("release parent marker: missing marker file")
+	}
+	if err := marker.Close(); err != nil {
+		return fmt.Errorf("release parent marker: %w", err)
+	}
+	return nil
 }
 
 // releaseSupervisor unblocks the ownership wrapper's post-done FD4 read.
@@ -441,6 +476,7 @@ func (o *ownedSubprocess) adoptAndKillMarkedResiduals() error {
 		return nil
 	}
 	deadline := time.Now().Add(processGroupGoneBound)
+	lastLive := 0
 	for {
 		// Leader must still be live for safe Darwin drain window.
 		o.mu.Lock()
@@ -449,7 +485,18 @@ func (o *ownedSubprocess) adoptAndKillMarkedResiduals() error {
 		if !ok || !leaderH.tok.stillSame() {
 			return fmt.Errorf("drain residuals marker lineage: supervisor leader not live")
 		}
-		toks, err := processesHoldingMarker(o.markerPath)
+		drained, err := markerLineageDrainedFn(o.markerPath)
+		if err != nil {
+			return fmt.Errorf("drain residuals marker fixed point: %w", err)
+		}
+		if drained {
+			return nil
+		}
+		if !time.Now().Before(deadline) {
+			return fmt.Errorf("%w: marked residual lock held after %s (last discovered=%d)",
+				ErrResidualOwnedTree, processGroupGoneBound, lastLive)
+		}
+		toks, err := processesHoldingMarkerUntil(o.markerPath, deadline)
 		if err != nil {
 			return fmt.Errorf("drain residuals marker lineage: %w", err)
 		}
@@ -464,9 +511,7 @@ func (o *ownedSubprocess) adoptAndKillMarkedResiduals() error {
 			}
 			live = append(live, tok)
 		}
-		if len(live) == 0 {
-			return nil
-		}
+		lastLive = len(live)
 		for _, tok := range live {
 			if err := o.noteCausal(tok); err != nil {
 				if !tok.stillSame() {
@@ -478,18 +523,15 @@ func (o *ownedSubprocess) adoptAndKillMarkedResiduals() error {
 		if err := o.killTracked(false); err != nil {
 			return fmt.Errorf("drain residuals kill marker lineage: %w", err)
 		}
-		if time.Now().After(deadline) {
-			return fmt.Errorf("%w: marked residual still live after %s (n=%d)",
-				ErrResidualOwnedTree, processGroupGoneBound, len(live))
-		}
-		time.Sleep(time.Millisecond)
+		// No sleep/stability window: immediately repeat discovery until the
+		// kernel lock proves the last inherited FD is gone or the bound expires.
 	}
 }
 
 // waitProcessGroupEmptyExcept repeatedly membership-kills and probes until
 // pgid has no live members other than exceptPID, or the bound elapses.
 func waitProcessGroupEmptyExcept(pgid, exceptPID int, bound time.Duration) error {
-	if pgid <= 0 {
+	if pgid <= 1 {
 		return fmt.Errorf("wait process group empty: invalid pgid %d", pgid)
 	}
 	deadline := time.Now().Add(bound)
@@ -516,7 +558,6 @@ func waitProcessGroupEmptyExcept(pgid, exceptPID int, bound time.Duration) error
 		if time.Now().After(deadline) {
 			return fmt.Errorf("process group %d still has %d live non-leader members after %s", pgid, live, bound)
 		}
-		time.Sleep(time.Millisecond)
 	}
 }
 
@@ -749,15 +790,21 @@ func (o *ownedSubprocess) Close() error {
 		h.close()
 	}
 	if o.ackW != nil {
-		_ = o.ackW.Close()
+		if err := o.ackW.Close(); err != nil && !isBenignPipeErr(err) {
+			killErrs = append(killErrs, fmt.Errorf("ack close: %w", err))
+		}
 		o.ackW = nil
 	}
 	if o.markerFile != nil {
-		_ = o.markerFile.Close()
+		if err := o.markerFile.Close(); err != nil {
+			killErrs = append(killErrs, fmt.Errorf("marker close: %w", err))
+		}
 		o.markerFile = nil
 	}
 	if o.markerPath != "" {
-		_ = os.Remove(o.markerPath)
+		if err := removeMarkerPath(o.markerPath); err != nil {
+			killErrs = append(killErrs, err)
+		}
 		o.markerPath = ""
 	}
 	if len(killErrs) > 0 {
