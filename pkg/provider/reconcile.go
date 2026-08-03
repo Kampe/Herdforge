@@ -85,7 +85,8 @@ type StatusReader interface {
 //   - read fails → *AmbiguousMutationError with ReadErr
 //
 // want is normalized before comparison. This never issues a second write.
-func ReconcileStatus(ctx context.Context, r StatusReader, provider, op, taskID, want string, writeErr error) error {
+// deadlines bound the reconciliation GetTask (defaults applied for zero fields).
+func ReconcileStatus(ctx context.Context, r StatusReader, deadlines Deadlines, provider, op, taskID, want string, writeErr error) error {
 	if r == nil {
 		return &AmbiguousMutationError{
 			Provider: provider,
@@ -100,7 +101,7 @@ func ReconcileStatus(ctx context.Context, r StatusReader, provider, op, taskID, 
 		ctx = context.Background()
 	}
 	// Always bound the reconciliation read independently of a dead write ctx.
-	dctx, cancel := WithOpDeadline(ctx, DefaultDeadlines(), OpReadback)
+	dctx, cancel := WithOpDeadline(ctx, deadlines, OpReadback)
 	defer cancel()
 
 	got, err := r.GetTask(dctx, taskID)
@@ -155,7 +156,7 @@ func AfterMutation(
 	}
 	if writeErr != nil {
 		// Ambiguous timeout path: reconcile only.
-		return ReconcileStatus(parent, r, provider, op, taskID, want, writeErr)
+		return ReconcileStatus(parent, r, deadlines, provider, op, taskID, want, writeErr)
 	}
 	// Clean write: fail-closed readback.
 	dctx, cancel := WithOpDeadline(parent, deadlines, OpReadback)

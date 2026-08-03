@@ -43,7 +43,7 @@ func (c *countingWriter) UpdateStatus(ctx context.Context, taskID, status string
 func TestReconcileStatus_WriteLanded(t *testing.T) {
 	r := &stubReader{task: &Task{ID: "t1", Status: StatusInProgress}}
 	writeErr := &TimeoutError{Provider: "kaneo", Op: "UpdateStatus", Cause: context.DeadlineExceeded}
-	err := ReconcileStatus(context.Background(), r, "kaneo", "UpdateStatus", "t1", StatusInProgress, writeErr)
+	err := ReconcileStatus(context.Background(), r, DefaultDeadlines(), "kaneo", "UpdateStatus", "t1", StatusInProgress, writeErr)
 	if err != nil {
 		t.Fatalf("landed write should reconcile clean: %v", err)
 	}
@@ -55,7 +55,7 @@ func TestReconcileStatus_WriteLanded(t *testing.T) {
 func TestReconcileStatus_WriteDidNotLand(t *testing.T) {
 	r := &stubReader{task: &Task{ID: "t1", Status: StatusToDo}}
 	writeErr := &TimeoutError{Cause: context.DeadlineExceeded}
-	err := ReconcileStatus(context.Background(), r, "kaneo", "UpdateStatus", "t1", StatusInProgress, writeErr)
+	err := ReconcileStatus(context.Background(), r, DefaultDeadlines(), "kaneo", "UpdateStatus", "t1", StatusInProgress, writeErr)
 	if !IsAmbiguous(err) {
 		t.Fatalf("want AmbiguousMutationError, got %T %v", err, err)
 	}
@@ -73,7 +73,7 @@ func TestReconcileStatus_WriteDidNotLand(t *testing.T) {
 func TestReconcileStatus_ReadAlsoFails(t *testing.T) {
 	r := &stubReader{err: errors.New("board down")}
 	writeErr := &TimeoutError{Cause: context.Canceled}
-	err := ReconcileStatus(context.Background(), r, "kaneo", "UpdateStatus", "t1", StatusDone, writeErr)
+	err := ReconcileStatus(context.Background(), r, DefaultDeadlines(), "kaneo", "UpdateStatus", "t1", StatusDone, writeErr)
 	if !IsAmbiguous(err) {
 		t.Fatalf("want ambiguous, got %v", err)
 	}
