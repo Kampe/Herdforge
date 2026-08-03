@@ -72,7 +72,6 @@ type TabBinding struct {
 
 type BoardTruth struct{ TaskRef, Status string }
 type AgentTruth struct {
-	Present                                      bool
 	Status, SessionID, SessionGeneration, PaneID string
 }
 type LifecycleTruth struct{ State string }
@@ -134,7 +133,7 @@ func NormalizeTaskStatus(status string) string {
 	switch strings.ToLower(strings.TrimSpace(status)) {
 	case "to-do", "todo", "to do":
 		return "to-do"
-	case "in-progress", "in progress", "working":
+	case "in-progress", "in progress", "working", "starting":
 		return "in-progress"
 	case "in-review", "in review", "reviewing":
 		return "in-review"
@@ -186,6 +185,9 @@ func ProjectFleetStatus(decisions []TabDecision, maxLanes int) FleetStatus {
 		}
 	}
 	p.Capacity = maxLanes - p.Working - p.Recovering
+	if p.Unknown > 0 {
+		p.Capacity = 0
+	}
 	if p.Capacity < 0 {
 		p.Capacity = 0
 	}
@@ -252,7 +254,7 @@ func reconcileBoundTab(tab TabObservation) TabDecision {
 	if a.Process.State == EvidencePresent && a.Agent.State == EvidencePresent && a.Agent.Value.SessionID != "" && !a.Process.Value.Alive {
 		return blocked("agent session process is not alive")
 	}
-	if a.Process.State == EvidencePresent && a.Process.Value.Alive && a.Agent.State != EvidencePresent {
+	if a.Process.State == EvidencePresent && a.Process.Value.Alive && (a.Agent.State != EvidencePresent || a.Agent.Value.SessionID == "") {
 		return blocked("foreground process has no matching agent session")
 	}
 	if a.Worktree.State == EvidencePresent && !a.Worktree.Value.Known {
@@ -283,14 +285,18 @@ func reconcileBoundTab(tab TabObservation) TabDecision {
 		d.Evidence = []string{"protected control or user seat"}
 		return d
 	}
-	if a.Agent.State == EvidencePresent && (a.Agent.Value.Status == "working" || a.Agent.Value.Status == "starting" || a.Agent.Value.SessionID != "") {
-		if a.Agent.Value.Status != "done" {
+	if a.Agent.State == EvidencePresent {
+		switch NormalizeTaskStatus(a.Agent.Value.Status) {
+		case "done":
+			if a.Board.State != EvidencePresent || NormalizeTaskStatus(a.Board.Value.Status) != "done" || a.Lifecycle.State != EvidencePresent || !isTerminalIntegrationState(a.Lifecycle.Value.State) {
+				return blocked("terminal agent lacks terminal board/lifecycle proof")
+			}
+		case "in-progress":
 			d.Class = TabActive
 			d.Evidence = []string{"matching active session"}
 			return d
-		}
-		if a.Board.State != EvidencePresent || NormalizeTaskStatus(a.Board.Value.Status) != "done" || a.Lifecycle.State != EvidencePresent || !isTerminalIntegrationState(a.Lifecycle.Value.State) {
-			return blocked("terminal session lacks terminal board/lifecycle proof")
+		default:
+			return blocked("present agent has nonterminal or unknown status")
 		}
 	}
 	if a.Board.State == EvidencePresent && NormalizeTaskStatus(a.Board.Value.Status) == "done" {

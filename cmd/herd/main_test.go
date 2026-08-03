@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -25,6 +26,20 @@ func TestMain(m *testing.M) {
 		_ = os.RemoveAll(dir)
 	}
 	os.Exit(code)
+}
+
+func TestForgeDriverBlocksCapacityWhenReconciliationUnavailable(t *testing.T) {
+	d := &cliForgeDriver{maxLanes: 3}
+	if err := d.ObserveReconciliation(context.Background()); err == nil {
+		t.Fatal("missing observer must block")
+	}
+	state, err := d.LaneState(context.Background())
+	if err != nil {
+		t.Fatalf("LaneState under blocked reconciliation: %v", err)
+	}
+	if state.Busy != 3 || state.Max != 3 {
+		t.Fatalf("blocked reconciliation exposed capacity: %+v", state)
+	}
 }
 
 func buildHerd(t *testing.T) string {
