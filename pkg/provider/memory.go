@@ -3,6 +3,7 @@ package provider
 import (
 	"context"
 	"fmt"
+	"sort"
 	"sync"
 	"time"
 )
@@ -109,6 +110,32 @@ func (m *MemoryProvider) AddComment(ctx context.Context, taskID string, body str
 		return fmt.Errorf("task not found: %s", taskID)
 	}
 	return nil
+}
+
+// ListProjectRelations implements BulkRelationProvider — O(edges) in-memory.
+func (m *MemoryProvider) ListProjectRelations(ctx context.Context, projectID string) ([]Relation, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]Relation, 0, len(m.relations))
+	for _, r := range m.relations {
+		// Optional project filter when tasks carry ProjectID.
+		if projectID != "" {
+			src := m.tasks[r.SourceTaskID]
+			tgt := m.tasks[r.TargetTaskID]
+			if src != nil && src.ProjectID != "" && src.ProjectID != projectID {
+				continue
+			}
+			if tgt != nil && tgt.ProjectID != "" && tgt.ProjectID != projectID {
+				continue
+			}
+		}
+		out = append(out, r)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out, nil
 }
 
 // ListRelations implements RelationProvider (FAC-159).
