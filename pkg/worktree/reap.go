@@ -89,22 +89,23 @@ type ReapPolicy struct {
 
 // ReapCandidate is one classified worktree with evidence and preservation guidance.
 type ReapCandidate struct {
-	Path            string
-	Branch          string
-	HEAD            string
-	Class           ReapClass
-	UniqueSHAs      []string
-	Reason          string
-	PreserveAction  string
-	SalvageRef      string
-	SalvageOK       bool
-	Integration     string // resolved integration base used for git cherry
-	IntegrationSHA  string
-	LeaseGeneration string
-	PolicyDigest    string
-	BoardEvidence   string
-	ActionPolicy    string
-	Actor           string
+	Path             string
+	Branch           string
+	HEAD             string
+	Class            ReapClass
+	UniqueSHAs       []string
+	Reason           string
+	PreserveAction   string
+	SalvageRef       string
+	SalvageOK        bool
+	Integration      string // resolved integration base used for git cherry
+	IntegrationSHA   string
+	LeaseGeneration  string
+	PolicyDigest     string
+	BoardEvidence    string
+	ActionPolicy     string
+	Actor            string
+	EvidenceObserved bool
 	// Eligible is true only when Class is content-merged; salvage is created and
 	// verified immediately before destructive removal, never during planning.
 	Eligible bool
@@ -126,29 +127,66 @@ type ReapReport struct {
 }
 
 type ReapReceipt struct {
-	Target          string `json:"target"`
-	Branch          string `json:"branch"`
-	Outcome         string `json:"outcome"`
-	Reason          string `json:"reason"`
-	IntegrationSHA  string `json:"integration_sha"`
-	LeaseGeneration string `json:"lease_generation"`
-	PolicyDigest    string `json:"policy_digest"`
-	BoardEvidence   string `json:"board_evidence"`
-	ActionPolicy    string `json:"action_policy"`
-	Actor           string `json:"actor"`
-	SalvageRef      string `json:"salvage_ref"`
+	Target           string `json:"target"`
+	Branch           string `json:"branch"`
+	HEAD             string `json:"head"`
+	Outcome          string `json:"outcome"`
+	ReasonCode       string `json:"reason_code"`
+	Reason           string `json:"reason"`
+	IntegrationSHA   string `json:"integration_sha"`
+	LeaseGeneration  string `json:"lease_generation"`
+	PolicyDigest     string `json:"policy_digest"`
+	BoardEvidence    string `json:"board_evidence"`
+	ActionPolicy     string `json:"action_policy"`
+	Actor            string `json:"actor"`
+	EvidenceObserved bool   `json:"evidence_observed"`
+	SalvageRef       string `json:"salvage_ref"`
 }
 
-func reapReceipt(c ReapCandidate, outcome, reason string) ReapReceipt {
+func reapReceipt(c ReapCandidate, outcome, _ string) ReapReceipt {
 	target := c.Branch
 	if target == "" {
 		target = "root"
 	}
 	return ReapReceipt{
-		Target: target, Branch: c.Branch, Outcome: outcome, Reason: reason,
+		Target: target, Branch: c.Branch, HEAD: c.HEAD, Outcome: outcome,
+		ReasonCode: reapReasonCode(c, outcome), Reason: "reap outcome: " + reapReasonCode(c, outcome),
 		IntegrationSHA: c.IntegrationSHA, LeaseGeneration: c.LeaseGeneration,
 		PolicyDigest: c.PolicyDigest, BoardEvidence: c.BoardEvidence,
-		ActionPolicy: c.ActionPolicy, Actor: c.Actor, SalvageRef: c.SalvageRef,
+		ActionPolicy: c.ActionPolicy, Actor: c.Actor, EvidenceObserved: c.EvidenceObserved,
+		SalvageRef: c.SalvageRef,
+	}
+}
+
+func reapReasonCode(c ReapCandidate, outcome string) string {
+	switch outcome {
+	case "remove-intent":
+		return "removal-intent"
+	case "removed":
+		return "removed-verified"
+	case "unverified":
+		return "removal-unverified"
+	case "already-absent":
+		return "target-already-absent"
+	case "refused":
+		if c.Class == ReapClassRoot {
+			return "protected-root"
+		}
+		if c.Class == ReapClassDirty {
+			return "dirty-worktree"
+		}
+		if c.Class == ReapClassUnique {
+			return "unique-commits"
+		}
+		if c.Class == ReapClassProtected {
+			return "protected-worktree"
+		}
+		return "unknown-evidence"
+	default:
+		if c.Eligible {
+			return "eligible"
+		}
+		return "unknown-outcome"
 	}
 }
 
@@ -195,11 +233,6 @@ func (w *WorktreeManager) PlanReap(ctx context.Context, policy ReapPolicy) (*Rea
 		} else {
 			report.Refused = append(report.Refused, c)
 		}
-		outcome := "refused"
-		if c.Eligible {
-			outcome = "planned"
-		}
-		report.Receipts = append(report.Receipts, reapReceipt(c, outcome, c.Reason))
 		if c.Class == ReapClassUnknown && c.Reason != "" {
 			report.Errors = append(report.Errors, fmt.Sprintf("%s: %s", c.Path, c.Reason))
 		}
@@ -232,7 +265,21 @@ func (w *WorktreeManager) Reap(ctx context.Context, policy ReapPolicy) (*ReapRep
 		return nil, err
 	}
 	if !policy.AutoReap {
+		for _, candidate := range report.Candidates {
+			outcome := "refused"
+			if candidate.Eligible {
+				outcome = "planned"
+			}
+			report.Receipts = append(report.Receipts, reapReceipt(candidate, outcome, candidate.Reason))
+		}
 		return report, nil
+	}
+	// Initial refusals are durable action outcomes and must be persisted before
+	// the first eligible target can reach intent, salvage, or removal.
+	for _, refused := range report.Refused {
+		if err := w.recordReceipt(report, policy, reapReceipt(refused, "refused", refused.Reason)); err != nil {
+			return report, err
+		}
 	}
 	seen := make(map[string]bool, len(report.Candidates))
 	for _, candidate := range report.Candidates {
@@ -260,7 +307,15 @@ func (w *WorktreeManager) Reap(ctx context.Context, policy ReapPolicy) (*ReapRep
 			}
 		}
 		if current == nil {
-			// Already gone — treat as not reaped by us.
+			absent := planned
+			absent.Class = ReapClassUnknown
+			absent.Eligible = false
+			absent.Reason = "target disappeared before JIT action"
+			absent.PreserveAction = "record already-absent outcome; do not retry blindly"
+			report.Refused = append(report.Refused, absent)
+			if sinkErr := w.recordReceipt(report, policy, reapReceipt(absent, "already-absent", absent.Reason)); sinkErr != nil {
+				return report, sinkErr
+			}
 			continue
 		}
 		integration, ierr := w.resolveIntegrationBase(ctx, policy.DefaultBranch)
@@ -316,6 +371,52 @@ func (w *WorktreeManager) Reap(ctx context.Context, policy ReapPolicy) (*ReapRep
 			continue
 		}
 
+		// Final fence: the intent sink is a deterministic late-race hook. Re-read
+		// every bound immediately after salvage persistence and before removal.
+		finalList, finalListErr := w.ListWorktrees(ctx)
+		var finalCurrent *WorktreeInfo
+		if finalListErr == nil {
+			for _, wt := range finalList {
+				if wt != nil && sameWorktreePath(wt.Path, planned.Path) {
+					finalCurrent = wt
+					break
+				}
+			}
+		}
+		if finalListErr != nil || finalCurrent == nil {
+			absent := planned
+			absent.Class = ReapClassUnknown
+			absent.Eligible = false
+			absent.Reason = "target disappeared before final action fence"
+			absent.PreserveAction = "record already-absent outcome; do not retry blindly"
+			report.Refused = append(report.Refused, absent)
+			if finalListErr != nil {
+				report.Errors = append(report.Errors, fmt.Sprintf("%s: final list: %v", planned.Path, finalListErr))
+			}
+			if sinkErr := w.recordReceipt(report, policy, reapReceipt(absent, "already-absent", absent.Reason)); sinkErr != nil {
+				return report, sinkErr
+			}
+			continue
+		}
+		finalIntegration, finalIntegrationErr := w.resolveIntegrationBase(ctx, policy.DefaultBranch)
+		final := w.classifyOne(ctx, finalCurrent, policy, finalIntegration, finalIntegrationErr)
+		if !final.Eligible || !sameReapBinding(planned, final) {
+			finalLeaseBlocked := final.Class == ReapClassProtected && strings.Contains(final.Reason, "active lease")
+			final.Class = ReapClassUnknown
+			final.Eligible = false
+			if sameReapBinding(planned, final) || finalLeaseBlocked {
+				final.Reason = "final action fence refused removal"
+			} else {
+				final.Reason = "final action binding changed after intent"
+			}
+			final.PreserveAction = "keep worktree; final action fence refused removal"
+			report.Refused = append(report.Refused, final)
+			if sinkErr := w.recordReceipt(report, policy, reapReceipt(final, "refused", final.Reason)); sinkErr != nil {
+				return report, sinkErr
+			}
+			continue
+		}
+
 		if err := w.RemoveWorktree(ctx, reclass.Path); err != nil {
 			report.Errors = append(report.Errors, fmt.Sprintf("%s: remove: %v", reclass.Path, err))
 			failed := reclass
@@ -327,6 +428,31 @@ func (w *WorktreeManager) Reap(ctx context.Context, policy ReapPolicy) (*ReapRep
 			}
 			continue
 		}
+		postList, postListErr := w.ListWorktrees(ctx)
+		stillRegistered := false
+		if postListErr == nil {
+			for _, wt := range postList {
+				if wt != nil && sameWorktreePath(wt.Path, reclass.Path) {
+					stillRegistered = true
+					break
+				}
+			}
+		}
+		if postListErr != nil || stillRegistered {
+			unverified := reclass
+			unverified.Class = ReapClassUnknown
+			unverified.Eligible = false
+			unverified.Reason = "removal outcome unverified"
+			unverified.PreserveAction = "keep evidence; removal must be independently verified"
+			report.Refused = append(report.Refused, unverified)
+			if postListErr != nil {
+				report.Errors = append(report.Errors, fmt.Sprintf("%s: post-remove list: %v", reclass.Path, postListErr))
+			}
+			if sinkErr := w.recordReceipt(report, policy, reapReceipt(unverified, "unverified", unverified.Reason)); sinkErr != nil {
+				return report, sinkErr
+			}
+			return report, fmt.Errorf("reap: removal outcome unverified for target")
+		}
 		report.Reaped = append(report.Reaped, reclass.Path)
 		if err := w.recordReceipt(report, policy, reapReceipt(reclass, "removed", "explicit removal completed")); err != nil {
 			return report, err
@@ -336,13 +462,13 @@ func (w *WorktreeManager) Reap(ctx context.Context, policy ReapPolicy) (*ReapRep
 }
 
 func (w *WorktreeManager) recordReceipt(report *ReapReport, policy ReapPolicy, receipt ReapReceipt) error {
-	report.Receipts = append(report.Receipts, receipt)
 	if policy.ReceiptSink == nil {
 		return fmt.Errorf("reap receipt sink: not configured")
 	}
 	if err := policy.ReceiptSink(receipt); err != nil {
 		return fmt.Errorf("reap receipt sink: %w", err)
 	}
+	report.Receipts = append(report.Receipts, receipt)
 	return nil
 }
 
@@ -363,6 +489,24 @@ func validateDestructivePolicy(policy ReapPolicy) error {
 	if strings.TrimSpace(policy.ActionPolicy) != "remove" {
 		return fmt.Errorf("reap action refused: explicit remove action policy is required")
 	}
+	for name, value := range map[string]string{
+		"integration SHA":  policy.Evidence.IntegrationSHA,
+		"board evidence":   policy.Evidence.BoardEvidence,
+		"lease generation": policy.Evidence.LeaseGeneration,
+		"policy digest":    policy.Evidence.PolicyDigest,
+		"actor":            policy.Evidence.Actor,
+	} {
+		if err := validatePortableField(name, value); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validatePortableField(name, value string) error {
+	if strings.ContainsAny(value, "\x00\r\n") || filepath.IsAbs(value) {
+		return fmt.Errorf("reap action refused: %s is not portable", name)
+	}
 	return nil
 }
 
@@ -371,7 +515,8 @@ func sameReapBinding(a, b ReapCandidate) bool {
 		a.HEAD == b.HEAD && a.IntegrationSHA == b.IntegrationSHA &&
 		a.LeaseGeneration == b.LeaseGeneration &&
 		a.PolicyDigest == b.PolicyDigest && a.BoardEvidence == b.BoardEvidence &&
-		a.ActionPolicy == b.ActionPolicy && a.Actor == b.Actor && a.SalvageRef == b.SalvageRef
+		a.ActionPolicy == b.ActionPolicy && a.Actor == b.Actor &&
+		a.EvidenceObserved == b.EvidenceObserved && a.SalvageRef == b.SalvageRef
 }
 
 // PruneMergedWorktrees is the historical auto-reap entry point used by pkg/gc.
@@ -395,15 +540,13 @@ func (w *WorktreeManager) classifyOne(
 	integrationErr error,
 ) ReapCandidate {
 	c := ReapCandidate{
-		Path:            wt.Path,
-		Branch:          wt.Branch,
-		HEAD:            wt.Commit,
-		Integration:     integration,
-		LeaseGeneration: policy.Evidence.LeaseGeneration,
-		PolicyDigest:    policy.Evidence.PolicyDigest,
-		BoardEvidence:   policy.Evidence.BoardEvidence,
-		ActionPolicy:    policy.ActionPolicy,
-		Actor:           policy.Evidence.Actor,
+		Path:         wt.Path,
+		Branch:       wt.Branch,
+		HEAD:         wt.Commit,
+		Integration:  integration,
+		PolicyDigest: policy.Evidence.PolicyDigest,
+		ActionPolicy: policy.ActionPolicy,
+		Actor:        policy.Evidence.Actor,
 	}
 
 	// Resolve HEAD if list porcelain omitted it.
@@ -464,6 +607,13 @@ func (w *WorktreeManager) classifyOne(
 			return c
 		}
 		c.LeaseGeneration = generation
+		if err := validatePortableField("observed lease generation", generation); err != nil {
+			c.LeaseGeneration = ""
+			c.Class = ReapClassUnknown
+			c.Reason = "lease generation is not portable"
+			c.PreserveAction = "keep worktree until lease evidence is portable"
+			return c
+		}
 		if policy.Evidence.LeaseGeneration != "" && generation != policy.Evidence.LeaseGeneration {
 			c.Class = ReapClassUnknown
 			c.Reason = "lease generation does not match action evidence"
@@ -480,6 +630,13 @@ func (w *WorktreeManager) classifyOne(
 			return c
 		}
 		c.BoardEvidence = evidence
+		if err := validatePortableField("observed board evidence", evidence); err != nil {
+			c.BoardEvidence = ""
+			c.Class = ReapClassUnknown
+			c.Reason = "board evidence is not portable"
+			c.PreserveAction = "keep worktree until board evidence is portable"
+			return c
+		}
 		if policy.Evidence.BoardEvidence != "" && evidence != policy.Evidence.BoardEvidence {
 			c.Class = ReapClassUnknown
 			c.Reason = "board/action evidence does not match action evidence"
@@ -487,23 +644,9 @@ func (w *WorktreeManager) classifyOne(
 			return c
 		}
 	}
-
-	// Dirty working tree → refuse.
-	dirty, derr := w.isDirty(ctx, wt.Path)
-	if derr != nil {
-		c.Class = ReapClassUnknown
-		c.Reason = fmt.Sprintf("status error: %v", derr)
-		c.PreserveAction = "keep worktree until status can be read"
-		return c
-	}
-	if dirty {
-		c.Class = ReapClassDirty
-		c.Reason = "uncommitted changes present"
-		c.PreserveAction = fmt.Sprintf("commit or stash dirty files; durable tip ref %s", c.SalvageRef)
-		return c
-	}
-
-	// Integration base required for unique-commit detection.
+	// Integration evidence is observed only after the lease/session and board
+	// probes succeed. Early refusals intentionally keep observed fields empty;
+	// ReapEvidence remains the separate requested/policy context.
 	if integrationErr != nil || integration == "" {
 		c.Class = ReapClassUnknown
 		if integrationErr != nil {
@@ -523,10 +666,33 @@ func (w *WorktreeManager) classifyOne(
 		return c
 	}
 	c.IntegrationSHA = actualIntegrationSHA
+	if err := validatePortableField("observed integration SHA", actualIntegrationSHA); err != nil {
+		c.IntegrationSHA = ""
+		c.Class = ReapClassUnknown
+		c.Reason = "integration evidence is not portable"
+		c.PreserveAction = "keep worktree until integration evidence is portable"
+		return c
+	}
 	if policy.Evidence.IntegrationSHA != "" && actualIntegrationSHA != policy.Evidence.IntegrationSHA {
 		c.Class = ReapClassUnknown
 		c.Reason = "integration SHA does not match action evidence"
 		c.PreserveAction = "keep worktree until integration evidence is refreshed"
+		return c
+	}
+	c.EvidenceObserved = true
+
+	// Dirty working tree → refuse.
+	dirty, derr := w.isDirty(ctx, wt.Path)
+	if derr != nil {
+		c.Class = ReapClassUnknown
+		c.Reason = fmt.Sprintf("status error: %v", derr)
+		c.PreserveAction = "keep worktree until status can be read"
+		return c
+	}
+	if dirty {
+		c.Class = ReapClassDirty
+		c.Reason = "uncommitted changes present"
+		c.PreserveAction = fmt.Sprintf("commit or stash dirty files; durable tip ref %s", c.SalvageRef)
 		return c
 	}
 
