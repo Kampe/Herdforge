@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"reflect"
 	"sort"
 	"strings"
 	"sync"
@@ -57,6 +58,8 @@ type TransitionSLO struct {
 	TotalLatency time.Duration `json:"total_latency"`
 	ObservedAt   time.Time     `json:"observed_at"`
 	Sequence     uint64        `json:"sequence,omitempty"`
+	LastLatency  time.Duration `json:"last_latency,omitempty"`
+	LastFailed   bool          `json:"last_failed,omitempty"`
 }
 
 type ConditionCode string
@@ -69,7 +72,15 @@ const (
 	ConditionIntegrationBacklog ConditionCode = "integration_backlog"
 	ConditionDeadLetters        ConditionCode = "dead_letters"
 	ConditionEligibleIdle       ConditionCode = "eligible_idle"
+	ReasonHealthStale           ConditionCode = "health_stale"
+	ReasonHealthUnready         ConditionCode = "health_unready"
+	ReasonQueueUnknown          ConditionCode = "queue_unknown"
+	ReasonQueueStale            ConditionCode = "queue_stale"
+	ReasonSignalsStale          ConditionCode = "signals_stale"
+	ReasonSLOStale              ConditionCode = "slo_stale"
 )
+
+const reviewSaturationThreshold uint8 = 80
 
 type FreshnessConfig struct {
 	HealthMaxAge  time.Duration `json:"health_max_age"`
@@ -86,12 +97,14 @@ var DefaultFreshnessConfig = FreshnessConfig{
 }
 
 type FreshnessState struct {
-	HealthFresh  bool      `json:"health_fresh"`
-	QueueFresh   bool      `json:"queue_fresh"`
-	SignalsFresh bool      `json:"signals_fresh"`
-	SLOFresh     bool      `json:"slo_fresh"`
-	Ready        bool      `json:"ready"`
-	AsOf         time.Time `json:"as_of"`
+	HealthFresh  bool            `json:"health_fresh"`
+	HealthReady  bool            `json:"health_ready"`
+	QueueFresh   bool            `json:"queue_fresh"`
+	SignalsFresh bool            `json:"signals_fresh"`
+	SLOFresh     bool            `json:"slo_fresh"`
+	Ready        bool            `json:"ready"`
+	AsOf         time.Time       `json:"as_of"`
+	Reasons      []ConditionCode `json:"reasons,omitempty"`
 }
 
 type SnapshotView struct {
@@ -258,6 +271,9 @@ func (s FleetSignals) Validate(now time.Time, maxAge time.Duration) error {
 			return errors.New("signal age is outside bounded range")
 		}
 	}
+	if s.EligibleIdle != 0 {
+		return errors.New("eligible idle is derived at read time")
+	}
 	if s.EligibleWaiting == 0 {
 		if !s.EligibleSince.IsZero() || s.EligibleIdle != 0 {
 			return errors.New("eligible idle requires eligible waiting work")
@@ -266,14 +282,7 @@ func (s FleetSignals) Validate(now time.Time, maxAge time.Duration) error {
 		if s.EligibleSince.IsZero() || s.EligibleSince.After(now) {
 			return errors.New("eligible waiting work requires a valid start time")
 		}
-		if s.Blocked || s.Backpressured {
-			if s.EligibleIdle != 0 {
-				return errors.New("blocked or backpressured work cannot be eligible idle")
-			}
-		} else if expected := now.Sub(s.EligibleSince); s.EligibleIdle != expected {
-			return errors.New("eligible idle does not match eligible waiting age")
-		}
-		if (s.ReviewSaturation == 100 || s.IntegrationBacklog > 0) && !s.Backpressured {
+		if (s.ReviewSaturation >= reviewSaturationThreshold || s.IntegrationBacklog > 0) && !s.Backpressured {
 			return errors.New("eligible work contradicts saturation or integration backlog")
 		}
 	}
@@ -289,11 +298,41 @@ func validateFreshnessConfig(config FreshnessConfig) error {
 	return nil
 }
 
-func observationNewer(sequence uint64, observedAt time.Time, currentSequence uint64, currentAt time.Time) bool {
-	if sequence > 0 || currentSequence > 0 {
-		return sequence > currentSequence
+type observationDecision uint8
+
+const (
+	observationAccept observationDecision = iota
+	observationIdempotent
+	observationStale
+	observationConflict
+)
+
+func decideObservation(sequence uint64, observedAt time.Time, currentSequence uint64, currentAt time.Time, same bool) observationDecision {
+	if currentAt.IsZero() && currentSequence == 0 {
+		return observationAccept
 	}
-	return currentAt.IsZero() || !observedAt.Before(currentAt)
+	if sequence > 0 || currentSequence > 0 {
+		if sequence < currentSequence || sequence == 0 && currentSequence > 0 {
+			return observationStale
+		}
+		if sequence == currentSequence {
+			if observedAt.Equal(currentAt) && same {
+				return observationIdempotent
+			}
+			return observationConflict
+		}
+		return observationAccept
+	}
+	if observedAt.Before(currentAt) {
+		return observationStale
+	}
+	if observedAt.Equal(currentAt) {
+		if same {
+			return observationIdempotent
+		}
+		return observationConflict
+	}
+	return observationAccept
 }
 
 func freshAt(observedAt, now time.Time, maxAge time.Duration) bool {
@@ -308,7 +347,7 @@ func (s FleetSignals) ConditionCodes() []ConditionCode {
 	if s.DroppedCallbacks > 0 {
 		conditions = append(conditions, ConditionDroppedCallback)
 	}
-	if s.ReviewSaturation >= 80 {
+	if s.ReviewSaturation >= reviewSaturationThreshold {
 		conditions = append(conditions, ConditionReviewSaturation)
 	}
 	if s.DeadProvider {
@@ -326,6 +365,14 @@ func (s FleetSignals) ConditionCodes() []ConditionCode {
 	return conditions
 }
 
+func deriveSignalsAt(signals FleetSignals, now time.Time) FleetSignals {
+	signals.EligibleIdle = 0
+	if signals.EligibleWaiting > 0 && !signals.Blocked && !signals.Backpressured && signals.ReviewSaturation < reviewSaturationThreshold && signals.IntegrationBacklog == 0 {
+		signals.EligibleIdle = now.Sub(signals.EligibleSince)
+	}
+	return signals
+}
+
 type MetricsExporter struct {
 	mu                  sync.RWMutex
 	TotalTasksProcessed uint64
@@ -339,6 +386,8 @@ type MetricsExporter struct {
 	store               StateStore
 	now                 func() time.Time
 	thresholds          FreshnessConfig
+	writeHook           func(io.Writer, string) (int, error)
+	lastWriteErr        error
 }
 
 func NewMetricsExporter() *MetricsExporter {
@@ -362,7 +411,15 @@ func NewMetricsExporterWithConfig(store StateStore, now func() time.Time, thresh
 		store:      store,
 		now:        now,
 		thresholds: thresholds,
+		writeHook:  func(w io.Writer, body string) (int, error) { return io.WriteString(w, body) },
 	}
+}
+
+// LastMetricsWriteError reports the last bounded scrape write failure.
+func (m *MetricsExporter) LastMetricsWriteError() error {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.lastWriteErr
 }
 
 func (m *MetricsExporter) SetHealth(dependencies []DependencyHealth) error {
@@ -376,26 +433,36 @@ func (m *MetricsExporter) SetHealthAt(dependencies []DependencyHealth, observedA
 func (m *MetricsExporter) SetHealthObservation(dependencies []DependencyHealth, observedAt time.Time, sequence uint64) error {
 	health, err := BuildHealthSnapshot(dependencies)
 	now := m.now()
+	health.ObservedAt, health.Sequence = observedAt, sequence
 	m.mu.Lock()
-	if !observationNewer(sequence, observedAt, m.health.Sequence, m.health.ObservedAt) {
+	decision := decideObservation(sequence, observedAt, m.health.Sequence, m.health.ObservedAt, reflect.DeepEqual(health, m.health))
+	if decision == observationStale {
 		m.mu.Unlock()
 		return errors.New("stale health observation")
 	}
+	if decision == observationIdempotent {
+		m.mu.Unlock()
+		return nil
+	}
+	if decision == observationConflict {
+		m.mu.Unlock()
+		return errors.New("conflicting health observation")
+	}
 	if err != nil || !freshAt(observedAt, now, m.thresholds.HealthMaxAge) {
 		m.health = UnknownHealthSnapshot()
+		m.health.ObservedAt, m.health.Sequence = observedAt, sequence
 		m.mu.Unlock()
 		if err == nil {
 			err = errors.New("health observation is stale or invalid")
 		}
 		return err
 	}
-	health.ObservedAt = observedAt
 	if m.signals.DeadProvider && dependencyState(health, "provider") == DependencyHealthy {
 		m.health = UnknownHealthSnapshot()
+		m.health.ObservedAt, m.health.Sequence = observedAt, sequence
 		m.mu.Unlock()
 		return errors.New("healthy provider contradicts dead-provider signal")
 	}
-	health.Sequence = sequence
 	m.health = health
 	m.mu.Unlock()
 	return nil
@@ -415,18 +482,26 @@ func (m *MetricsExporter) SetQueuePressureObservation(queue QueuePressure, obser
 	if validationErr == nil && (!queue.ObservedAt.IsZero() && !queue.ObservedAt.Equal(observedAt) || !freshAt(observedAt, now, m.thresholds.QueueMaxAge)) {
 		validationErr = errors.New("queue observation is stale or invalid")
 	}
+	queue.ObservedAt, queue.Sequence = observedAt, sequence
 	m.mu.Lock()
-	if !observationNewer(sequence, observedAt, m.queue.Sequence, m.queue.ObservedAt) {
+	decision := decideObservation(sequence, observedAt, m.queue.Sequence, m.queue.ObservedAt, reflect.DeepEqual(queue, m.queue))
+	if decision == observationStale {
 		m.mu.Unlock()
 		return errors.New("stale queue observation")
 	}
+	if decision == observationIdempotent {
+		m.mu.Unlock()
+		return nil
+	}
+	if decision == observationConflict {
+		m.mu.Unlock()
+		return errors.New("conflicting queue observation")
+	}
 	if validationErr != nil {
-		m.queue = QueuePressure{Known: false, Error: "not observed"}
+		m.queue = QueuePressure{Known: false, Error: "invalid observation", ObservedAt: observedAt, Sequence: sequence}
 		m.mu.Unlock()
 		return validationErr
 	}
-	queue.ObservedAt = observedAt
-	queue.Sequence = sequence
 	m.queue = queue
 	m.mu.Unlock()
 	return nil
@@ -442,22 +517,32 @@ func (m *MetricsExporter) SetSignals(signals FleetSignals) error {
 
 func (m *MetricsExporter) SetSignalsObservation(signals FleetSignals, sequence uint64) error {
 	now := m.now()
+	signals.EligibleIdle = 0
+	signals.Sequence = sequence
 	m.mu.Lock()
-	if !observationNewer(sequence, signals.ObservedAt, m.signals.Sequence, m.signals.ObservedAt) {
+	decision := decideObservation(sequence, signals.ObservedAt, m.signals.Sequence, m.signals.ObservedAt, reflect.DeepEqual(signals, m.signals))
+	if decision == observationStale {
 		m.mu.Unlock()
 		return errors.New("stale signal observation")
 	}
+	if decision == observationIdempotent {
+		m.mu.Unlock()
+		return nil
+	}
+	if decision == observationConflict {
+		m.mu.Unlock()
+		return errors.New("conflicting signal observation")
+	}
 	if err := signals.Validate(now, m.thresholds.SignalsMaxAge); err != nil {
-		m.signals = FleetSignals{}
+		m.signals = FleetSignals{ObservedAt: signals.ObservedAt, Sequence: sequence}
 		m.mu.Unlock()
 		return err
 	}
 	if signals.DeadProvider && dependencyState(m.health, "provider") == DependencyHealthy {
-		m.signals = FleetSignals{}
+		m.signals = FleetSignals{ObservedAt: signals.ObservedAt, Sequence: sequence}
 		m.mu.Unlock()
 		return errors.New("dead-provider signal contradicts healthy provider")
 	}
-	signals.Sequence = sequence
 	m.signals = signals
 	m.mu.Unlock()
 	return nil
@@ -481,15 +566,26 @@ func (m *MetricsExporter) RecordTransitionObservation(start, end time.Time, tran
 		return errors.New("transition latency is invalid or unbounded")
 	}
 	m.mu.Lock()
-	if !observationNewer(sequence, now, m.slo.Sequence, m.slo.ObservedAt) {
+	latency := end.Sub(start)
+	failed := transitionErr != nil
+	candidate := TransitionSLO{ObservedAt: now, Sequence: sequence, LastLatency: latency, LastFailed: failed}
+	decision := decideObservation(sequence, now, m.slo.Sequence, m.slo.ObservedAt, m.slo.LastLatency == candidate.LastLatency && m.slo.LastFailed == candidate.LastFailed)
+	if decision == observationStale {
 		m.mu.Unlock()
 		return errors.New("stale transition observation")
+	}
+	if decision == observationIdempotent {
+		m.mu.Unlock()
+		return nil
+	}
+	if decision == observationConflict {
+		m.mu.Unlock()
+		return errors.New("conflicting transition observation")
 	}
 	m.slo.Attempts++
 	if transitionErr != nil {
 		m.slo.Failed++
 	} else if !end.Before(start) {
-		latency := end.Sub(start)
 		if m.slo.TotalLatency > maxSignalAge-latency {
 			m.mu.Unlock()
 			return errors.New("transition latency total exceeds bounded maximum")
@@ -499,8 +595,8 @@ func (m *MetricsExporter) RecordTransitionObservation(start, end time.Time, tran
 	} else {
 		m.slo.Failed++
 	}
-	m.slo.ObservedAt = now
-	m.slo.Sequence = sequence
+	m.slo.ObservedAt, m.slo.Sequence = now, sequence
+	m.slo.LastLatency, m.slo.LastFailed = latency, failed
 	m.mu.Unlock()
 	return nil
 }
@@ -521,18 +617,41 @@ func (m *MetricsExporter) ReadAt(now time.Time) SnapshotView {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	health, queue, slo, signals := m.health, m.queue, m.slo, m.signals
-	freshness := FreshnessState{
-		HealthFresh:  health.Readiness && freshAt(health.ObservedAt, now, m.thresholds.HealthMaxAge),
-		QueueFresh:   queue.Known && queue.Error == "" && freshAt(queue.ObservedAt, now, m.thresholds.QueueMaxAge),
-		SignalsFresh: signals.Validate(now, m.thresholds.SignalsMaxAge) == nil,
-		SLOFresh:     slo.Attempts == 0 || freshAt(slo.ObservedAt, now, m.thresholds.SLOMaxAge),
-		AsOf:         now,
+	healthFresh := freshAt(health.ObservedAt, now, m.thresholds.HealthMaxAge)
+	queueFresh := queue.Known && queue.Error == "" && freshAt(queue.ObservedAt, now, m.thresholds.QueueMaxAge)
+	signalsFresh := signals.Validate(now, m.thresholds.SignalsMaxAge) == nil
+	if signalsFresh {
+		signals = deriveSignalsAt(signals, now)
 	}
-	freshness.Ready = freshness.HealthFresh && freshness.QueueFresh && freshness.SignalsFresh && freshness.SLOFresh
+	sloFresh := slo.Attempts == 0 || freshAt(slo.ObservedAt, now, m.thresholds.SLOMaxAge)
+	freshness := FreshnessState{
+		HealthFresh: healthFresh, HealthReady: healthFresh && health.Readiness,
+		QueueFresh: queueFresh, SignalsFresh: signalsFresh, SLOFresh: sloFresh, AsOf: now,
+	}
+	if !healthFresh {
+		freshness.Reasons = append(freshness.Reasons, ReasonHealthStale)
+	} else if !health.Readiness {
+		freshness.Reasons = append(freshness.Reasons, ReasonHealthUnready)
+	}
+	if !queueFresh {
+		if queue.ObservedAt.IsZero() || !queue.Known || queue.Error != "" {
+			freshness.Reasons = append(freshness.Reasons, ReasonQueueUnknown)
+		} else {
+			freshness.Reasons = append(freshness.Reasons, ReasonQueueStale)
+		}
+	}
+	if !signalsFresh {
+		freshness.Reasons = append(freshness.Reasons, ReasonSignalsStale)
+	}
+	if !sloFresh {
+		freshness.Reasons = append(freshness.Reasons, ReasonSLOStale)
+	}
 	view := SnapshotView{Health: health, Queue: queue, SLO: slo, Signals: signals, Freshness: freshness}
 	if freshness.SignalsFresh {
 		view.Conditions = signals.ConditionCodes()
 	}
+	freshness.Ready = freshness.HealthReady && freshness.QueueFresh && freshness.SignalsFresh && freshness.SLOFresh && len(view.Conditions) == 0
+	view.Freshness = freshness
 	return view
 }
 
@@ -592,7 +711,11 @@ func (m *MetricsExporter) validateStateLocked(state persistedState, now time.Tim
 	if err := state.Queue.Validate(); err != nil || !freshAt(state.Queue.ObservedAt, now, m.thresholds.QueueMaxAge) {
 		return errors.New("invalid metrics queue state")
 	}
-	if err := state.Signals.Validate(now, m.thresholds.SignalsMaxAge); err != nil {
+	if state.Signals.LastReconciliation.IsZero() {
+		if state.Signals.ObservedAt.IsZero() || state.Signals.StalledWork != 0 || state.Signals.DroppedCallbacks != 0 || state.Signals.ReviewSaturation != 0 || state.Signals.DeadProvider || state.Signals.IntegrationBacklog != 0 || state.Signals.Retries != 0 || state.Signals.DeadLetters != 0 || state.Signals.MaxLeaseAge != 0 || state.Signals.MaxCallbackAge != 0 || state.Signals.EligibleIdle != 0 || state.Signals.EligibleWaiting != 0 || state.Signals.Blocked || state.Signals.Backpressured || !state.Signals.EligibleSince.IsZero() {
+			return errors.New("invalid metrics signal tombstone")
+		}
+	} else if err := state.Signals.Validate(now, m.thresholds.SignalsMaxAge); err != nil {
 		return fmt.Errorf("invalid metrics signals: %w", err)
 	}
 	if state.Signals.DeadProvider && dependencyState(state.Health, "provider") == DependencyHealthy {
@@ -724,7 +847,20 @@ func (m *MetricsExporter) Handler() http.Handler {
 			fmt.Fprintf(&body, "# HELP herd_eligible_idle_seconds Eligible idle time excluding blocked or backpressured work\n# TYPE herd_eligible_idle_seconds gauge\nherd_eligible_idle_seconds %.6f\n", signals.EligibleIdle.Seconds())
 			fmt.Fprintf(&body, "# HELP herd_last_reconciliation_timestamp_seconds Last reconciliation timestamp\n# TYPE herd_last_reconciliation_timestamp_seconds gauge\nherd_last_reconciliation_timestamp_seconds %.6f\n", float64(signals.LastReconciliation.UnixNano())/1e9)
 		}
-		_, _ = io.WriteString(w, body.String())
+		m.mu.RLock()
+		writeHook := m.writeHook
+		m.mu.RUnlock()
+		if writeHook == nil {
+			writeHook = func(writer io.Writer, payload string) (int, error) { return io.WriteString(writer, payload) }
+		}
+		written, err := writeHook(w, body.String())
+		m.mu.Lock()
+		if err != nil || written != body.Len() {
+			m.lastWriteErr = errors.New("metrics response write failed")
+		} else {
+			m.lastWriteErr = nil
+		}
+		m.mu.Unlock()
 	})
 }
 

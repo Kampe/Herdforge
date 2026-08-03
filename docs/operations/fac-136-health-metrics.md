@@ -12,7 +12,7 @@ event wiring and persistence-store selection remain a later integration stage.
 | `herd_queue_pressure_known` | `0` for 2m | `0` for 10m | Queue depth/capacity is unavailable; do not infer free capacity. |
 | `herd_stalled_work` | `>0` for 10m | `>0` for 30m | Aggregate stalled work exists; investigate state age and blocked/backpressured causes. |
 | `herd_dropped_callbacks` | Any increase | Any increase for 5m | Callback delivery is losing events; inspect the event path and durable store. |
-| `herd_review_saturation_ratio` | `>= 0.80` | `>= 0.95` | Review capacity is saturated; do not treat blocked work as eligible idle. |
+| `herd_review_saturation_ratio` | `>= 0.80` | `>= 0.80` | The single saturation boundary is 80%; do not treat saturated work as eligible idle. |
 | `herd_dead_provider` | `1` for 2m | `1` for 10m | A provider is dead; readiness must remain false until authority is restored. |
 | `herd_integration_backlog` | `>0` for 10m | `>0` for 30m | Verified work is waiting for serialized integration. |
 | `herd_retries` | Increase over 5m | Increase over 15m | Repeated delivery or transition failures need diagnosis. |
@@ -33,7 +33,9 @@ observations is five minutes; callers may inject shorter bounded thresholds.
    `health.liveness` is true and inspect `health.readiness` independently.
 2. If readiness or queue authority is unknown, stop capacity claims. Do not
    convert missing observations, provider errors, or callback errors to zero.
-3. Check `signals.observed_at` and
+3. A current unhealthy dependency is fresh evidence but is still not ready:
+   inspect `freshness.health_fresh`, `freshness.health_ready`, and bounded
+   `freshness.reasons` separately. Check `signals.observed_at` and
    `herd_last_reconciliation_timestamp_seconds`. A stale observation is a
    fail-closed condition, not proof of a healthy fleet.
 4. Check the bounded `condition_codes` for stalled work, dropped callbacks,
@@ -51,6 +53,9 @@ methods. `Persist` and `Restore` are explicit operations so callers can choose
 a durable implementation without this slice inventing production wiring.
 Restore rejects unsupported schemas, malformed data, contradictory totals,
 stale timestamps, and out-of-range values, resetting the exporter to an
-unknown state. Eligible idle is derived from `eligible_waiting`,
-`eligible_since`, and explicit `blocked`/`backpressured` state; a caller cannot
-claim idle time that contradicts saturation or integration backlog.
+unknown state. Eligible idle is derived at each read from `read_at -
+eligible_since` only when eligible waiting is positive and work is not blocked,
+backpressured, review-saturated at the 80% boundary, or integration-blocked.
+A caller cannot persist or claim idle time that contradicts those conditions.
+Newer invalid observations leave bounded unknown tombstones carrying their
+sequence and observed time, fencing older authority.
