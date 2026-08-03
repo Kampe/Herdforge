@@ -2,6 +2,7 @@ package credits
 
 import (
 	"fmt"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -29,14 +30,28 @@ func TestRefresh_SkipNonClaude(t *testing.T) {
 	if r.Err != nil {
 		t.Fatalf("unexpected err: %v", r.Err)
 	}
+	if r.Output != "herd-credits: refresh only wired for claude (ccusage has no data for openai)" {
+		t.Errorf("exact non-claude skip message mismatch, got: %q", r.Output)
+	}
+	if _, err := l.Surface("openai"); err == nil {
+		t.Error("non-claude skip must not create a ledger record")
+	}
 }
 
 func TestRefresh_SkipNoRefreshEnv(t *testing.T) {
 	t.Setenv("HERD_CREDITS_NO_REFRESH", "1")
 	l, _ := OpenLedger(filepath.Join(t.TempDir(), "ledger.json"))
+	l.data["claude"] = Record{UsedPct: 42, Note: "manual"}
 	r := Refresh(l, "claude", 0, 0, 0, nil)
 	if r.Err != nil {
 		t.Fatalf("unexpected err: %v", r.Err)
+	}
+	if r.Output != "herd-credits: refresh skipped (HERD_CREDITS_NO_REFRESH=1)" {
+		t.Errorf("exact NO_REFRESH skip message mismatch, got: %q", r.Output)
+	}
+	rec, _ := l.Surface("claude")
+	if rec.UsedPct != 42 || rec.Note != "manual" {
+		t.Errorf("NO_REFRESH skip must leave state unchanged, got %+v", rec)
 	}
 }
 
@@ -54,6 +69,39 @@ func TestLedgerCommands_Show_Empty(t *testing.T) {
 	out := lc.Show()
 	if out != "" {
 		t.Errorf("expected empty output, got %q", out)
+	}
+}
+
+func TestLedgerCommands_Show_SingleRow(t *testing.T) {
+	l, _ := OpenLedger(filepath.Join(t.TempDir(), "ledger.json"))
+	l.data["claude"] = Record{
+		UsedPct:    42,
+		WindowDays: intPtr(7),
+		DaysLeft:   intPtr(5),
+		Note:       "manual",
+	}
+	lc := NewLedgerCommands(l)
+	out := lc.Show()
+	want := "claude: 42% used, 5/7d left  [manual]"
+	if out != want {
+		t.Errorf("exact single Show row mismatch:\n got: %q\nwant: %q", out, want)
+	}
+}
+
+func TestLedgerCommands_Show_MultiRow(t *testing.T) {
+	l, _ := OpenLedger(filepath.Join(t.TempDir(), "ledger.json"))
+	l.data["claude"] = Record{
+		Accounts: []AccountRow{
+			{Email: "a@x", UsedPct: 33, BurnOrder: 1},
+			{Email: "b@y", UsedPct: 0, BurnOrder: 2},
+		},
+		Note: "pool note",
+	}
+	lc := NewLedgerCommands(l)
+	out := lc.Show()
+	want := "claude: multi N=2 effective=16%  [pool note]"
+	if out != want {
+		t.Errorf("exact multi Show row mismatch:\n got: %q\nwant: %q", out, want)
 	}
 }
 
@@ -907,12 +955,39 @@ func TestClaudeActiveExpanded_TextEmailTrimmed(t *testing.T) {
 
 func TestRefresh_NoActiveEmail(t *testing.T) {
 	dir := t.TempDir()
-	os.Unsetenv("HERD_CREDITS_NO_REFRESH")
+	t.Setenv("HERD_CREDITS_NO_REFRESH", "")
+	// pin identity lookups to empty locations
+	t.Setenv("HERD_CLAUDE_ACCOUNTS_DIR", filepath.Join(dir, "no-accounts"))
+	t.Setenv("HOME", filepath.Join(dir, "no-home"))
+
+	// auth status fails too — no identity source exists
+	origCmd := claudeAuthStatusCmd
+	defer func() { claudeAuthStatusCmd = origCmd }()
+	claudeAuthStatusCmd = func(args ...string) *exec.Cmd {
+		return exec.Command("sh", "-c", "exit 1")
+	}
+
+	// ccusage must never be reached: fail loudly if it is
+	origBase := CcUsageBase
+	defer func() { CcUsageBase = origBase }()
+	CcUsageBase = func() (string, error) {
+		return "", fmt.Errorf("ccusage must not be invoked without an active account")
+	}
 
 	l, _ := OpenLedger(filepath.Join(dir, "ledger.json"))
+	l.data["claude"] = Record{UsedPct: 42, Note: "manual", Updated: NowEpoch()}
+
 	r := Refresh(l, "claude", 0, 0, 0, nil)
 	if r.Err != nil {
 		t.Fatalf("unexpected err: %v", r.Err)
+	}
+	if r.Output != "herd-credits: refresh skipped (no active claude account known)" {
+		t.Errorf("exact no-active line mismatch, got: %q", r.Output)
+	}
+
+	rec, _ := l.Surface("claude")
+	if rec.UsedPct != 42 || rec.Note != "manual" {
+		t.Errorf("ledger must be unchanged on no-active skip, got %+v", rec)
 	}
 }
 
@@ -1020,6 +1095,15 @@ func TestParseQuotaInt(t *testing.T) {
 		{42, 42, true},
 		{nil, 0, false},
 		{"not a number", 0, false},
+		{"NaN", 0, false},
+		{"Inf", 0, false},
+		{"+Inf", 0, false},
+		{"-Inf", 0, false},
+		{math.NaN(), 0, false},
+		{math.Inf(1), 0, false},
+		{math.Inf(-1), 0, false},
+		{"9e300", 0, false},
+		{1e300, 0, false},
 	}
 	for _, tt := range tests {
 		got, ok := parseQuotaInt(tt.in)
@@ -1288,8 +1372,7 @@ fi`, blocksJSON, dailyJSON)), 0755)
 	}
 }
 
-func TestRefresh_MalformedJSONLeavesManualSnapshot(t *testing.T) {
-	dir := t.TempDir()
+func TestRefresh_MalformedJSONLeavesManualSnapshot(t *testing.T) {	dir := t.TempDir()
 	t.Setenv("HERD_CREDITS_NO_REFRESH", "")
 	t.Setenv("HERD_CLAUDE_ACCOUNTS_DIR", dir)
 	os.WriteFile(filepath.Join(dir, "active.email"), []byte("test@example.com\n"), 0644)
@@ -1319,6 +1402,148 @@ echo 'not json'`), 0755)
 	}
 	if rec.Note != "manual" {
 		t.Errorf("manual note should be preserved, got %q", rec.Note)
+	}
+}
+
+func TestRefresh_EmptyAccountsArrayAppendsActive(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("HERD_CREDITS_NO_REFRESH", "")
+	t.Setenv("HERD_CLAUDE_ACCOUNTS_DIR", dir)
+	os.WriteFile(filepath.Join(dir, "active.email"), []byte("test@example.com\n"), 0644)
+
+	mockScript := filepath.Join(dir, "ccusage")
+	blocksJSON := `{"blocks":[{"isActive":true,"totalTokens":1000000,"projection":{"remainingMinutes":120}}]}`
+	dailyJSON := `{"totals":{"totalTokens":50000000}}`
+	os.WriteFile(mockScript, []byte(fmt.Sprintf(`#!/bin/sh
+if echo "$*" | grep -q "blocks"; then
+  echo '%s'
+else
+  echo '%s'
+fi`, blocksJSON, dailyJSON)), 0755)
+
+	origBase := CcUsageBase
+	defer func() { CcUsageBase = origBase }()
+	CcUsageBase = func() (string, error) { return mockScript, nil }
+
+	// shell-shaped ledger with an explicitly configured EMPTY pool
+	ledgerPath := filepath.Join(dir, "ledger.json")
+	os.WriteFile(ledgerPath, []byte(`{"claude":{"used_pct":10,"window_days":7,"days_left":5,"note":"pool","updated":1,"accounts":[]}}`), 0644)
+	l, err := OpenLedger(ledgerPath)
+	if err != nil {
+		t.Fatalf("OpenLedger: %v", err)
+	}
+
+	r := Refresh(l, "claude", 0, 0, 0, nil)
+	if r.Err != nil {
+		t.Fatalf("Refresh: %v", r.Err)
+	}
+
+	rec, _ := l.Surface("claude")
+	if len(rec.Accounts) != 1 {
+		t.Fatalf("empty pool must gain the active account, got %d accounts", len(rec.Accounts))
+	}
+	a := rec.Accounts[0]
+	if a.Email != "test@example.com" || a.UsedPct != 50 || a.BurnOrder != 99 || a.Source != "ccusage" {
+		t.Errorf("appended account mismatch: %+v", a)
+	}
+	if rec.UsedPct != 50 {
+		t.Errorf("appended account must become primary (used=50), got %d", rec.UsedPct)
+	}
+	if rec.Source == "ccusage" {
+		t.Errorf("accounts branch must not write top-level source, got %q", rec.Source)
+	}
+}
+
+func TestAdvise_ReadySwap_FalsePositiveGuard(t *testing.T) {
+	orig := quotaBinPath
+	defer func() { quotaBinPath = orig }()
+	quotaBinPath = func() string { return "/nonexistent/herd-quota" }
+
+	l, _ := OpenLedger(filepath.Join(t.TempDir(), "ledger.json"))
+	l.data["claude"] = Record{
+		UsedPct: 10,
+		Accounts: []AccountRow{
+			{Email: "primary@x", UsedPct: 10, BurnOrder: 1},
+			{Email: "reserve@y", UsedPct: 100, BurnOrder: 2},
+		},
+		WindowDays: intPtr(7),
+		DaysLeft:   intPtr(5),
+		Updated:    NowEpoch(),
+	}
+	lc := NewLedgerCommands(l)
+	out := lc.Advise()
+	if strings.Contains(out, "READY SWAP") {
+		t.Errorf("exhausted burn#2 with healthy burn#1 must NOT print READY SWAP, got: %s", out)
+	}
+}
+
+func TestAdvise_ReadySwap_TruePositive(t *testing.T) {
+	orig := quotaBinPath
+	defer func() { quotaBinPath = orig }()
+	quotaBinPath = func() string { return "/nonexistent/herd-quota" }
+
+	l, _ := OpenLedger(filepath.Join(t.TempDir(), "ledger.json"))
+	l.data["claude"] = Record{
+		UsedPct: 96,
+		Accounts: []AccountRow{
+			{Email: "blindside328@gmail.com", UsedPct: 96, BurnOrder: 1},
+			{Email: "nick.kampe@yugalabs.io", UsedPct: 10, BurnOrder: 2},
+		},
+		WindowDays: intPtr(7),
+		DaysLeft:   intPtr(5),
+		Updated:    NowEpoch(),
+	}
+	lc := NewLedgerCommands(l)
+	out := lc.Advise()
+	if !strings.Contains(out, "READY SWAP (primary exhausted): claude-account use yuga") {
+		t.Errorf("exhausted burn#1 must print READY SWAP with reserve account, got: %s", out)
+	}
+}
+
+func TestLedgerCommands_Advise_NaNUsedDoesNotSuppressFallback(t *testing.T) {
+	dir := t.TempDir()
+	script := filepath.Join(dir, "herd-quota")
+	os.WriteFile(script, []byte(`#!/bin/sh
+echo '{"claude":{"pools":{"claude-5h":{"used":"NaN","remaining":57.3,"resetsIn":"3h","class":"onpace","stale":false,"reason":"ok"}}}}'`), 0755)
+
+	orig := quotaBinPath
+	defer func() { quotaBinPath = orig }()
+	quotaBinPath = func() string { return script }
+
+	l, _ := OpenLedger(filepath.Join(t.TempDir(), "ledger.json"))
+	l.data["claude"] = Record{UsedPct: 50, WindowDays: intPtr(7), DaysLeft: intPtr(5), Updated: NowEpoch()}
+	lc := NewLedgerCommands(l)
+	out := lc.Advise()
+	if strings.Contains(out, "claude/claude-5h:") {
+		t.Errorf("NaN used must not render a live row, got: %s", out)
+	}
+	if !strings.Contains(out, "claude: 50% used") {
+		t.Errorf("NaN used must not suppress the ledger fallback, got: %s", out)
+	}
+}
+
+func TestLedgerCommands_Advise_TrueRunwayWithoutMinutesFallsThrough(t *testing.T) {
+	dir := t.TempDir()
+	script := filepath.Join(dir, "herd-quota")
+	os.WriteFile(script, []byte(`#!/bin/sh
+echo '{"claude":{"pools":{"claude-5h":{"used":80,"remaining":20,"resetsIn":"3h","class":"overpace","stale":false,"reason":"ok","exhaustsBeforeReset":true}}}}'`), 0755)
+
+	orig := quotaBinPath
+	defer func() { quotaBinPath = orig }()
+	quotaBinPath = func() string { return script }
+
+	l, _ := OpenLedger(filepath.Join(t.TempDir(), "ledger.json"))
+	l.data["claude"] = Record{UsedPct: 50, WindowDays: intPtr(7), DaysLeft: intPtr(5), Updated: NowEpoch()}
+	lc := NewLedgerCommands(l)
+	out := lc.Advise()
+	if strings.Contains(out, "claude/claude-5h:") {
+		t.Errorf("exhaustsBeforeReset:true with absent runwayMinutes must not render, got: %s", out)
+	}
+	if strings.Contains(out, "projected runway 0h") {
+		t.Errorf("must not fabricate projected runway 0h, got: %s", out)
+	}
+	if !strings.Contains(out, "claude: 50% used") {
+		t.Errorf("malformed runway row must fall through to ledger, got: %s", out)
 	}
 }
 
@@ -1478,6 +1703,17 @@ func TestClaudeActiveEmail_EnvOverride(t *testing.T) {
 	email := ClaudeActiveEmail("")
 	if email != "override@example.com" {
 		t.Errorf("expected HERD_CLAUDE_ACCOUNTS_DIR sidecar, got %q", email)
+	}
+}
+
+func TestClaudeActiveEmail_FirstLineOnly(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("HERD_CLAUDE_ACCOUNTS_DIR", dir)
+	os.WriteFile(filepath.Join(dir, "active.email"), []byte("first@example.com\nstale@example.com\n"), 0644)
+
+	email := ClaudeActiveEmail("")
+	if email != "first@example.com" {
+		t.Errorf("sidecar must read only the first line (head -1), got %q", email)
 	}
 }
 

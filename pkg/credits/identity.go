@@ -17,7 +17,12 @@ func ClaudeActiveEmail(accountsDir string) string {
 	sidecar := accountsDir + "/active.email"
 	raw, err := os.ReadFile(sidecar)
 	if err == nil {
-		e := strings.TrimSpace(string(raw))
+		// Binding: head -1 — read only the first line, then trim
+		line := string(raw)
+		if idx := strings.IndexByte(line, '\n'); idx >= 0 {
+			line = line[:idx]
+		}
+		e := strings.TrimSpace(line)
 		if e != "" {
 			return e
 		}

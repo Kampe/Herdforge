@@ -45,8 +45,17 @@ func TestOpenLedger_New(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read created file: %v", err)
 	}
-	if len(raw) == 0 {
-		t.Fatal("OpenLedger did not write {} to disk for new file")
+	if string(raw) != "{}\n" {
+		t.Fatalf("missing-ledger init must write exactly {}\\n, got %q", string(raw))
+	}
+
+	// and it must reopen as an empty object ledger
+	l2, err := OpenLedger(p)
+	if err != nil {
+		t.Fatalf("reopen after init: %v", err)
+	}
+	if len(l2.All()) != 0 {
+		t.Errorf("reopened ledger must be empty, got %d entries", len(l2.All()))
 	}
 }
 

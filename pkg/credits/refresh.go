@@ -300,7 +300,10 @@ func Refresh(ledger *Ledger, surface string, budget5h, budgetWeekly, ttl int, em
 			}
 		}
 
-		if len(rec.Accounts) > 0 {
+		// Binding distinction is accounts != null, not len > 0: an explicitly
+		// configured empty pool ("accounts":[]) still appends the active
+		// account at burn order 99 and makes it the primary.
+		if rec.Accounts != nil {
 			found := false
 			for i, a := range rec.Accounts {
 				if strings.EqualFold(a.Email, activeEmail) {
@@ -746,12 +749,16 @@ type QuotaJSON map[string]QuotaProvider
 func parseQuotaInt(v interface{}) (int, bool) {
 	switch val := v.(type) {
 	case float64:
+		if math.IsNaN(val) || math.IsInf(val, 0) || val > math.MaxInt64 || val < math.MinInt64 {
+			return 0, false
+		}
 		return int(val), true
 	case string:
-		if f, err := strconv.ParseFloat(val, 64); err == nil {
-			return int(f), true
+		f, err := strconv.ParseFloat(val, 64)
+		if err != nil || math.IsNaN(f) || math.IsInf(f, 0) || f > math.MaxInt64 || f < math.MinInt64 {
+			return 0, false
 		}
-		return 0, false
+		return int(f), true
 	case int:
 		return val, true
 	default:
@@ -820,6 +827,12 @@ func (lc *LedgerCommands) Advise() string {
 					}
 					left, remOK := parseQuotaInt(p.Remaining)
 					if !remOK {
+						continue
+					}
+					if p.ExhaustsBeforeReset != nil && *p.ExhaustsBeforeReset && p.RunwayMinutes == nil {
+						// internally inconsistent live row: claims exhaustion
+						// runway but carries no runway data — reject instead
+						// of fabricating "projected runway 0h"
 						continue
 					}
 					liveProviders[normalizeProviderKey(prov)] = true
@@ -900,20 +913,21 @@ func (lc *LedgerCommands) Advise() string {
 
 	if rec, err := lc.Ledger.Surface("claude"); err == nil && len(rec.Accounts) > 0 {
 		SortAccountsByBurnOrder(rec.Accounts)
-		var primary, reserve string
-		for _, a := range rec.Accounts {
-			if a.UsedPct >= 95 && primary == "" {
-				primary = a.Email
+		// Binding: primary is sorted account 0 (min burn order) only; an
+		// exhausted account elsewhere in the pool is not an exhausted primary.
+		primary := rec.Accounts[0]
+		if primary.UsedPct >= 95 {
+			reserve := ""
+			for _, a := range rec.Accounts {
+				if a.UsedPct < 95 {
+					reserve = a.Email
+					break
+				}
 			}
-		}
-		for _, a := range rec.Accounts {
-			if a.UsedPct < 95 && reserve == "" {
-				reserve = a.Email
+			if reserve != "" {
+				want := ClaudeEmailToAccount(reserve)
+				out.WriteString(fmt.Sprintf("READY SWAP (primary exhausted): claude-account use %s\n", want))
 			}
-		}
-		if primary != "" && reserve != "" {
-			want := ClaudeEmailToAccount(reserve)
-			out.WriteString(fmt.Sprintf("READY SWAP (primary exhausted): claude-account use %s\n", want))
 		}
 	}
 
