@@ -1,7 +1,9 @@
 package herdr
 
 import (
+	"errors"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/Kampe/Herdforge/pkg/launch"
@@ -87,5 +89,63 @@ func TestAgentStartBoundaryRejectsRawAndRequiresDecision(t *testing.T) {
 	want := []string{"agent", "start", "worker", "--kind", "codex", "--pane", "pane", "--", "--model", launch.WorkerModel, "-c", "model_reasoning_effort=medium", "-a", "never"}
 	if !reflect.DeepEqual(calls, [][]string{want}) {
 		t.Fatalf("argv calls = %v, want %v", calls, [][]string{want})
+	}
+}
+
+func TestResumeUsesDurableClientIdentityNotHerdrMetadata(t *testing.T) {
+	t.Setenv("HERD_LAUNCH_RECEIPTS", t.TempDir()+"/receipts.jsonl")
+	d, err := router.NewRouter(nil, nil).Decide(router.LaunchRequest{Role: router.RoleWorker, Shape: launch.Implementation, RequestedProvider: launch.WorkerProvider, RequestedModel: launch.WorkerModel, ProbeResults: map[string]bool{router.ProbeKey(launch.WorkerProvider, launch.WorkerModel): true}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := launch.Request{Decision: d, TaskRef: "FAC-175", Name: "standing-worker", PaneID: "pane-1"}
+	if err := launch.RecordStarted(req, nil); err != nil {
+		t.Fatal(err)
+	}
+	old := runHerdr
+	defer func() { runHerdr = old }()
+	runHerdr = func(args ...string) (string, error) {
+		if len(args) >= 2 && args[0] == "agent" && args[1] == "list" {
+			return `{"result":{"agents":[{"name":"standing-worker","pane_id":"pane-1","tab_id":"tab-1"}]}}`, nil
+		}
+		return "{}", nil
+	}
+	if got, err := ResolveAgentTabWithDecision("standing-worker", launch.Request{Decision: d, TaskRef: "FAC-175"}, 0); err != nil || got != "standing-worker" {
+		t.Fatalf("durable resume failed: %q %v", got, err)
+	}
+	if _, err := ResolveAgentTabWithDecision("standing-worker", launch.Request{Decision: d, TaskRef: "other"}, 0); !errors.Is(err, ErrAgentIdentityMismatch) {
+		t.Fatalf("expected typed identity mismatch, got %v", err)
+	}
+	if _, err := ResolveAgentTabWithDecision("missing", launch.Request{Decision: d, TaskRef: "FAC-175"}, 0); !errors.Is(err, ErrAgentNotFound) {
+		t.Fatalf("expected typed not-found, got %v", err)
+	}
+}
+
+func TestReceiptFailureClosesAndVerifiesExactTab(t *testing.T) {
+	t.Setenv("HERD_LAUNCH_RECEIPTS", "/dev/null/launch-receipts.jsonl")
+	d, err := router.NewRouter(nil, nil).Decide(router.LaunchRequest{Role: router.RoleWorker, Shape: launch.Implementation, RequestedProvider: launch.WorkerProvider, RequestedModel: launch.WorkerModel, ProbeResults: map[string]bool{router.ProbeKey(launch.WorkerProvider, launch.WorkerModel): true}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := runHerdr
+	defer func() { runHerdr = old }()
+	listCalls := 0
+	var calls [][]string
+	runHerdr = func(args ...string) (string, error) {
+		calls = append(calls, append([]string(nil), args...))
+		if len(args) >= 2 && args[0] == "agent" && args[1] == "list" {
+			listCalls++
+			if listCalls == 1 {
+				return `{"result":{"agents":[{"name":"worker","pane_id":"pane","tab_id":"tab"}]}}`, nil
+			}
+			return `{"result":{"agents":[]}}`, nil
+		}
+		return "{}", nil
+	}
+	if err := AgentStartWithDecision("worker", "codex", "pane", launch.Request{Decision: d}); err == nil || !strings.Contains(err.Error(), "process stopped") {
+		t.Fatalf("receipt failure must be hard and compensated: %v", err)
+	}
+	if len(calls) < 4 || !reflect.DeepEqual(calls[2], []string{"tab", "close", "tab"}) {
+		t.Fatalf("cleanup calls = %v", calls)
 	}
 }
