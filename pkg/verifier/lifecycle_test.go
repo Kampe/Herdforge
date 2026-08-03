@@ -33,7 +33,9 @@ i=0
 while true; do
   mkdir -p "$objects" 2>/dev/null || true
   printf w > "$objects/active-$i" 2>/dev/null || true
-  printf "%s" "$i" > "$3"
+  # Atomic-ish gen publish: avoid empty-file reads mid-truncate under -race.
+  printf "%s" "$i" > "$3.tmp" 2>/dev/null || true
+  mv -f "$3.tmp" "$3" 2>/dev/null || printf "%s" "$i" > "$3"
   i=$((i+1))
 done
 `
@@ -161,19 +163,33 @@ func durableCleanupAfterReap(root string, observe time.Duration) error {
 }
 
 func (f *lateWriterFixture) readGen() (int, error) {
-	data, err := os.ReadFile(f.genPath)
-	if err != nil {
-		return 0, err
+	// Brief re-read on empty: concurrent truncate/replace can yield "" once.
+	var last error
+	for attempt := 0; attempt < 50; attempt++ {
+		data, err := os.ReadFile(f.genPath)
+		if err != nil {
+			last = err
+			time.Sleep(time.Millisecond)
+			continue
+		}
+		s := strings.TrimSpace(string(data))
+		if s == "" {
+			last = fmt.Errorf("empty gen")
+			time.Sleep(time.Millisecond)
+			continue
+		}
+		var n int
+		if _, err := fmt.Sscanf(s, "%d", &n); err != nil {
+			last = fmt.Errorf("parse gen %q: %w", s, err)
+			time.Sleep(time.Millisecond)
+			continue
+		}
+		return n, nil
 	}
-	s := strings.TrimSpace(string(data))
-	if s == "" {
-		return 0, fmt.Errorf("empty gen")
+	if last == nil {
+		last = fmt.Errorf("gen unreadable")
 	}
-	var n int
-	if _, err := fmt.Sscanf(s, "%d", &n); err != nil {
-		return 0, fmt.Errorf("parse gen %q: %w", s, err)
-	}
-	return n, nil
+	return 0, last
 }
 
 func (f *lateWriterFixture) waitGenAdvance(min int, bound time.Duration) (int, error) {

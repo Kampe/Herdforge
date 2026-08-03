@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -656,6 +657,217 @@ func waitForPIDGone(pid int, bound time.Duration) error {
 			return fmt.Errorf("pid %d still exists after diagnostic bound", pid)
 		}
 		time.Sleep(time.Millisecond)
+	}
+}
+
+// productionLeaveWriterScript: leader backgrounds a same-group active writer
+// (stdio detached so Wait is not pipe-blocked), waits until the writer pid
+// file exists (explicit handshake, not a sleep proof), then exits 0.
+// Production afterWaitOwnership must BLOCK and reap the residual group.
+//
+// $1=pidfile $2=writetarget (absolute path under verification dir)
+const productionLeaveWriterScript = `
+sh -c 'printf "%s\n" "$$" > "$1"; while true; do printf w >> "$2"; done' writer "$1" "$2" </dev/null >/dev/null 2>&1 &
+# Handshake: do not exit until the writer has published its pid.
+while [ ! -s "$1" ]; do :; done
+exit 0
+`
+
+// productionDetachedSessionScript: leader starts a new-session (setsid) writer
+// that leaves the process group AND a same-group background writer. Both have
+// stdio detached. Leader waits for the same-group pid handshake then exits 0.
+// Production afterWaitOwnership must BLOCKED on residual same-group writer.
+//
+// $1=sessionPid $2=writetarget $3=groupPid
+// Note: sh -c positional params are $1/$2 relative to args after the command name.
+const productionDetachedSessionScript = `
+sh -c 'printf "%s\n" "$$" > "$1"; while true; do printf g >> "$2"; done' grpwriter "$3" "$2" </dev/null >/dev/null 2>&1 &
+if command -v setsid >/dev/null 2>&1; then
+  setsid sh -c 'printf "%s\n" "$$" > "$1"; while true; do printf w >> "$2"; done' sesswriter "$1" "$2" </dev/null >/dev/null 2>&1 &
+else
+  printf "no-setsid\n" > "$1"
+fi
+while [ ! -s "$3" ]; do :; done
+exit 0
+`
+
+// TestExecuteSuccessWithBackgroundWriterBlocksAndReaps is the production-path
+// proof: Execute of a command that exits 0 while a same-group writer remains
+// must return BLOCKED (residual process group) and the writer must be gone.
+func TestExecuteSuccessWithBackgroundWriterBlocksAndReaps(t *testing.T) {
+	dir := t.TempDir()
+	pidFile := filepath.Join(dir, "writer.pid")
+	writeTarget := filepath.Join(dir, "residue.log")
+	writeExecutable(t, filepath.Join(dir, "leave-writer"), "#!/bin/sh\n"+productionLeaveWriterScript)
+
+	result, err := NewVerifierArgs([]string{"./leave-writer", pidFile, writeTarget}).Execute(context.Background(), dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Outcome != OutcomeBLOCKED {
+		t.Fatalf("exit-0 with residual same-group writer must BLOCKED, got %+v", result)
+	}
+	if !strings.Contains(result.Output, "residual process group") &&
+		!strings.Contains(result.Output, "ownership") {
+		t.Fatalf("BLOCKED output must name ownership/residual close: %q", result.Output)
+	}
+	// Writer pid was recorded before leader exited; after ownership close it must be gone.
+	data, readErr := os.ReadFile(pidFile)
+	if readErr == nil {
+		if pid, convErr := strconv.Atoi(strings.TrimSpace(string(data))); convErr == nil && pid > 0 {
+			if err := waitForPIDGone(pid, 2*time.Second); err != nil {
+				t.Fatalf("production Execute left writer pid %d live: %v", pid, err)
+			}
+		}
+	}
+}
+
+// TestExecuteMutationOmittingAfterWaitOwnershipReturnsTooEarly mutation-proves
+// production afterWaitOwnership is load-bearing: when it is a no-op, Execute
+// returns PASS while the background writer is still live.
+func TestExecuteMutationOmittingAfterWaitOwnershipReturnsTooEarly(t *testing.T) {
+	dir := t.TempDir()
+	pidFile := filepath.Join(dir, "writer.pid")
+	writeTarget := filepath.Join(dir, "residue.log")
+	writeExecutable(t, filepath.Join(dir, "leave-writer"), "#!/bin/sh\n"+productionLeaveWriterScript)
+
+	prev := afterWaitOwnership
+	afterWaitOwnership = func(cmd *exec.Cmd) error { return nil } // MUTATION: skip residual reap
+	t.Cleanup(func() {
+		afterWaitOwnership = prev
+		// Reap any orphan left by the mutation path.
+		if data, err := os.ReadFile(pidFile); err == nil {
+			if pid, convErr := strconv.Atoi(strings.TrimSpace(string(data))); convErr == nil && pid > 0 {
+				_ = syscall.Kill(pid, syscall.SIGKILL)
+				_ = waitForPIDGone(pid, 2*time.Second)
+			}
+		}
+	})
+
+	result, err := NewVerifierArgs([]string{"./leave-writer", pidFile, writeTarget}).Execute(context.Background(), dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Old execute shape: PASS (leader exit 0) with writer still live.
+	if result.Outcome != OutcomePASS {
+		t.Fatalf("mutation: omitting afterWaitOwnership should return PASS on exit 0; got %+v", result)
+	}
+	data, readErr := os.ReadFile(pidFile)
+	if readErr != nil {
+		t.Fatalf("mutation: writer pid file: %v", readErr)
+	}
+	pid, convErr := strconv.Atoi(strings.TrimSpace(string(data)))
+	if convErr != nil || pid <= 0 {
+		t.Fatalf("mutation: bad writer pid %q", data)
+	}
+	if err := syscall.Kill(pid, 0); err != nil {
+		t.Fatalf("mutation expected writer %d to survive without afterWaitOwnership: %v", pid, err)
+	}
+}
+
+// TestExecuteCancelAfterStartClosesProcessGroup covers cancellation after the
+// process is running: Cancel kills the group, Wait + afterWaitOwnership prove
+// no residual members before BLOCKED returns.
+func TestExecuteCancelAfterStartClosesProcessGroup(t *testing.T) {
+	dir := t.TempDir()
+	pidFile := filepath.Join(t.TempDir(), "child.pid")
+	writeExecutable(t, filepath.Join(dir, "spawn-child"), "#!/bin/sh\n"+
+		"sh -c 'printf \"%s\\n\" \"$$\" > \"$1\"; exec sleep 30' childpid \"$1\" &\n"+
+		"wait\n")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan execOutOrErr, 1)
+	go func() {
+		r, e := NewVerifierArgs([]string{"./spawn-child", pidFile}).Execute(ctx, dir)
+		done <- execOutOrErr{r, e}
+	}()
+	pid, err := waitForChildReadyPID(pidFile, 5*time.Second)
+	if err != nil {
+		cancel()
+		<-done
+		t.Fatalf("child-ready: %v", err)
+	}
+	cancel()
+	out := <-done
+	if out.err != nil {
+		t.Fatal(out.err)
+	}
+	if out.result == nil || out.result.Outcome != OutcomeBLOCKED {
+		t.Fatalf("cancel after Start must BLOCKED: %+v", out.result)
+	}
+	if err := waitForPIDGone(pid, 2*time.Second); err != nil {
+		t.Fatalf("cancel path left descendant %d live after ownership close: %v", pid, err)
+	}
+}
+
+// TestExecuteDetachedSessionAndBackgroundWriters covers a command that exits 0
+// after starting both a setsid (new-session) writer and a same-group writer.
+// Production must BLOCKED on residual same-group ownership and reap that
+// group; the setsid writer is cleaned by test teardown if still live.
+func TestExecuteDetachedSessionAndBackgroundWriters(t *testing.T) {
+	dir := t.TempDir()
+	sessionPidFile := filepath.Join(dir, "session.pid")
+	groupPidFile := filepath.Join(dir, "group.pid")
+	writeTarget := filepath.Join(dir, "residue.log")
+	writeExecutable(t, filepath.Join(dir, "leave-detached"), "#!/bin/sh\n"+productionDetachedSessionScript)
+
+	result, err := NewVerifierArgs([]string{
+		"./leave-detached", sessionPidFile, writeTarget, groupPidFile,
+	}).Execute(context.Background(), dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Same-group residual forces BLOCKED under production afterWaitOwnership.
+	if result.Outcome != OutcomeBLOCKED {
+		// no-setsid path still has same-group writer → must BLOCKED
+		t.Fatalf("detached+background leave-writer must BLOCKED on residual group, got %+v", result)
+	}
+	if data, readErr := os.ReadFile(groupPidFile); readErr == nil {
+		if pid, convErr := strconv.Atoi(strings.TrimSpace(string(data))); convErr == nil && pid > 0 {
+			if err := waitForPIDGone(pid, 2*time.Second); err != nil {
+				t.Fatalf("same-group writer %d still live after Execute: %v", pid, err)
+			}
+		}
+	}
+	// Session writer may escape process-group kill; tear down if present.
+	if data, readErr := os.ReadFile(sessionPidFile); readErr == nil {
+		s := strings.TrimSpace(string(data))
+		if s != "" && s != "no-setsid" {
+			if pid, convErr := strconv.Atoi(s); convErr == nil && pid > 0 {
+				if err := syscall.Kill(pid, syscall.SIGKILL); err != nil && !isESRCH(err) {
+					t.Errorf("teardown setsid writer %d: %v", pid, err)
+				}
+				_ = waitForPIDGone(pid, 2*time.Second)
+			}
+		}
+	}
+}
+
+// TestIsExpectedKillWaitUsesTypedWaitStatus proves signal classification does
+// not use substring matching on error text.
+func TestIsExpectedKillWaitUsesTypedWaitStatus(t *testing.T) {
+	if isExpectedKillWait(nil) != true {
+		t.Fatal("nil wait err is expected")
+	}
+	if isExpectedKillWait(errors.New("signal: killed")) {
+		t.Fatal("plain error with kill substring must NOT match (typed WaitStatus only)")
+	}
+	// Real signaled exit: kill a short-lived process group member via Wait.
+	cmd := exec.Command("sleep", "30")
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	if err := syscall.Kill(cmd.Process.Pid, syscall.SIGKILL); err != nil {
+		t.Fatal(err)
+	}
+	waitErr := cmd.Wait()
+	if waitErr == nil {
+		t.Fatal("expected wait error after SIGKILL")
+	}
+	if !isExpectedKillWait(waitErr) {
+		t.Fatalf("typed WaitStatus SIGKILL must be expected, got %v (%T)", waitErr, waitErr)
 	}
 }
 

@@ -222,7 +222,8 @@ func (v *Verifier) execute(ctx context.Context, dir string, policy EnvironmentPo
 		}, nil
 	}
 	// Immediate fail-safe: if ctx is already done after Start, close ownership
-	// with production ReapOwnedCmd (full-group kill + Wait) before returning.
+	// with production ReapOwnedCmd (full-group kill + Wait + group-gone) before
+	// returning — caller owns Wait on this path.
 	if ctx.Err() != nil {
 		reapErr := ReapOwnedCmd(cmd)
 		msg := ctx.Err().Error()
@@ -238,23 +239,47 @@ func (v *Verifier) execute(ctx context.Context, dir string, policy EnvironmentPo
 			Duration:     time.Since(started),
 		}, nil
 	}
+	// Wait reaps the leader and joins stdout/stderr copy goroutines (WaitDelay
+	// bounds pipe hold from residual grandchildren). Ownership is not closed
+	// until afterWaitOwnership proves the full process group is gone.
 	waitErr := cmd.Wait()
+	ownErr := afterWaitOwnership(cmd)
 	output := combined.bytes()
-	err := waitErr
+
+	// Residual same-group writers (background jobs that outlived the leader)
+	// or a failed group close always BLOCKED — never PASS while owned
+	// descendants may still mutate the tree (TempDir RemoveAll race class).
+	if ownErr != nil {
+		msg := fmt.Sprintf("verification ownership close: %v\noutput:\n%s", ownErr, string(output))
+		if waitErr != nil {
+			msg = fmt.Sprintf("verification failed: %v\nownership: %v\noutput:\n%s", waitErr, ownErr, string(output))
+		}
+		out := []byte(msg)
+		return &Result{
+			Outcome:      OutcomeBLOCKED,
+			Output:       boundedOutput(out),
+			OutputDigest: digestBytes(out),
+			ExitCode:     exitCode(cmd, waitErr),
+			Duration:     time.Since(started),
+		}, nil
+	}
+
 	result := &Result{
-		Passed:       err == nil,
+		Passed:       waitErr == nil,
 		Outcome:      OutcomePASS,
 		Output:       boundedOutput(output),
 		OutputDigest: digestBytes(output),
-		ExitCode:     exitCode(cmd, err),
+		ExitCode:     exitCode(cmd, waitErr),
 		Duration:     time.Since(started),
 	}
-	if err != nil {
+	if waitErr != nil {
 		result.Outcome = OutcomeFAIL
+		// Cancellation/deadline after Start: Cancel killed the group; Wait
+		// returns a signaled ExitError (typed WaitStatus via isExpectedKillWait).
 		if ctx.Err() != nil || cmd.ProcessState == nil {
 			result.Outcome = OutcomeBLOCKED
 		}
-		result.Output = boundedOutput([]byte(fmt.Sprintf("verification failed: %v\noutput:\n%s", err, string(output))))
+		result.Output = boundedOutput([]byte(fmt.Sprintf("verification failed: %v\noutput:\n%s", waitErr, string(output))))
 	}
 	return result, nil
 }
