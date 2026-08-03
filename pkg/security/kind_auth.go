@@ -66,16 +66,16 @@ func DiagnoseKindAuthReadiness(kind string) KindAuthDiagnosis {
 	}
 
 	if len(missing) == 0 {
-		// Codex chatgpt OAuth cannot be MITM'd as Bearer API key.
+		// Codex chatgpt OAuth cannot be brokered as an API-key oracle path.
 		if kind == AuthorKindCodex && d.HostAuthModeHint == "chatgpt" && !hostCredPresent(creds, "api.openai.com") {
 			d.Class = KindAuthExternal
 			d.Brokerable = false
-			d.Reason = "codex host auth_mode=chatgpt (OAuth); HostCreds MITM injects API keys only"
+			d.Reason = "codex host auth_mode=chatgpt (OAuth); HostCreds oracle attaches API keys only"
 			d.Blocker = "FAC-170 BLOCKED: codex requires OPENAI_API_KEY HostCreds in API-key mode — OAuth not brokerable"
 			d.RecommendedAction = "export OPENAI_API_KEY for API-key codex; interactive browser login is forbidden"
 			return d
 		}
-		// If openai key present even with chatgpt mode, API-key MITM is brokerable.
+		// If openai key present even with chatgpt mode, API-key oracle path is brokerable.
 		d.Class = KindAuthOK
 		d.Brokerable = true
 		d.Reason = "HostCreds present for required API hosts"
@@ -95,7 +95,7 @@ func DiagnoseKindAuthReadiness(kind string) KindAuthDiagnosis {
 			"worker HOME is scrubbed so host harness login files are unavailable; no interactive login UI",
 		kind, missing,
 	)
-	d.RecommendedAction = "export coordinator API keys for HostCreds MITM before live harness proof"
+	d.RecommendedAction = "export coordinator API keys into HostCreds out-of-band store (env) before live harness proof; worker never receives real keys"
 	return d
 }
 
