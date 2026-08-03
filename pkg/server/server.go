@@ -157,13 +157,7 @@ func (s *ControlServer) Start(ctx context.Context) error {
 		// A runtime Serve failure is recorded and surfaced — never
 		// discarded while the process appears healthy.
 		if err := srv.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			s.mu.Lock()
-			s.serveErr = err
-			cb := s.OnServeError
-			s.mu.Unlock()
-			if cb != nil {
-				cb(err)
-			}
+			s.RecordServeFailure(err)
 		}
 	}()
 
@@ -175,6 +169,19 @@ func (s *ControlServer) BoundAddr() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.boundAddr
+}
+
+// RecordServeFailure records a runtime serve failure (internal Serve exit,
+// tests, or an external supervisor). Consumers polling ServeErr — e.g. the
+// forge loop — treat it as control-plane death and fail closed.
+func (s *ControlServer) RecordServeFailure(err error) {
+	s.mu.Lock()
+	s.serveErr = err
+	cb := s.OnServeError
+	s.mu.Unlock()
+	if cb != nil {
+		cb(err)
+	}
 }
 
 // ServeErr returns any recorded runtime Serve failure.

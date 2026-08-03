@@ -6,6 +6,7 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"sync/atomic"
 
 	"github.com/Kampe/Herdforge/pkg/config"
 	"github.com/Kampe/Herdforge/pkg/preflight"
@@ -27,6 +28,8 @@ type Engine struct {
 
 	// health projects BLOCKED(provider_timeout)/recovering for the control plane.
 	health providerHealth
+
+	controlPlane atomic.Pointer[server.ControlServer]
 }
 
 func NewEngine(cfg *config.Config, tp provider.TaskProvider, r *router.ModelRouter, s *store.Store, wm *worktree.WorktreeManager, v *verifier.Verifier) *Engine {
@@ -86,7 +89,14 @@ func (e *Engine) StartControlPlane(ctx context.Context, addr string, logf func(s
 	if err := cs.Start(ctx); err != nil {
 		return nil, err
 	}
+	e.controlPlane.Store(cs)
 	return cs, nil
+}
+
+// ControlPlane returns the most recently started control server (nil if
+// none); exposed for supervision and tests.
+func (e *Engine) ControlPlane() *server.ControlServer {
+	return e.controlPlane.Load()
 }
 
 // DiskStatus is the disk-capacity fleet label (FAC-153):

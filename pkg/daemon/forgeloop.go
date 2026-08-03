@@ -9,6 +9,7 @@ import (
 
 	"github.com/Kampe/Herdforge/pkg/preflight"
 	"github.com/Kampe/Herdforge/pkg/provider"
+	"github.com/Kampe/Herdforge/pkg/server"
 )
 
 // cmpOr returns the first non-empty string.
@@ -78,8 +79,10 @@ func (e *Engine) ForgeLoop(ctx context.Context, d ForgeDriver, opts ForgeLoopOpt
 	// configured means fail closed: the loop must not silently run without
 	// the promised health/control plane, and a teardown failure is a real
 	// error, not a discarded one.
+	var cs *server.ControlServer
 	if addr := cmpOr(opts.ControlAddr, os.Getenv(EnvControlAddr)); addr != "" {
-		cs, err := e.StartControlPlane(ctx, addr, d.Log)
+		var err error
+		cs, err = e.StartControlPlane(ctx, addr, d.Log)
 		if err != nil {
 			return fmt.Errorf("forge: configured control plane failed to start (failing closed): %w", err)
 		}
@@ -111,6 +114,16 @@ func (e *Engine) ForgeLoop(ctx context.Context, d ForgeDriver, opts ForgeLoopOpt
 		case <-ctx.Done():
 			return ctx.Err()
 		default:
+		}
+
+		// A configured mandatory control plane that died at runtime blocks
+		// the loop immediately — mutations must not continue while the
+		// promised health/control surface is gone (FAC-153).
+		if cs != nil {
+			if serveErr := cs.ServeErr(); serveErr != nil {
+				d.Log("forge: BLOCKED(control_plane_dead) — cancelling loop")
+				return fmt.Errorf("forge: BLOCKED(control_plane_dead): configured control plane failed at runtime (failing closed): %w", serveErr)
+			}
 		}
 
 		// timeout → BLOCKED → recovering (probe) → ok on success.

@@ -2,7 +2,9 @@ package daemon
 
 import (
 	"context"
+	"errors"
 	"io"
+	"sync"
 	"net"
 	"net/http"
 	"os"
@@ -252,5 +254,73 @@ func TestForgeLoop_ConfiguredControlPlaneFailsClosed(t *testing.T) {
 	}
 	if len(d.actions) != 0 {
 		t.Fatalf("loop drove actions despite failed control plane: %v", d.actions)
+	}
+}
+
+// lockedDriver is a goroutine-safe recording driver: the control plane's
+// OnServeError callback logs from a different goroutine than the loop.
+type lockedDriver struct {
+	fakeDriver
+	mu      sync.Mutex
+	logLine []string
+}
+
+func (l *lockedDriver) Log(msg string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.logLine = append(l.logLine, msg)
+}
+
+func (l *lockedDriver) snapshot() []string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return append([]string(nil), l.logLine...)
+}
+
+func TestForgeLoop_RuntimeControlPlaneDeathCancelsLoop(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv(server.EnvControlToken, "test-capability")
+	t.Setenv("HERD_ROOT", root)
+	tp := &timeoutProvider{failAfter: 1 << 30, tasks: []*provider.Task{
+		{ID: "1", Ref: "FAC-1", Status: "to-do", Priority: provider.PriorityUrgent},
+	}}
+	e := NewEngine(&config.Config{TaskProvider: config.TaskProvider{ProjectID: "p1"}}, tp, nil, nil, worktree.NewWorktreePool(root, t.TempDir()), nil)
+	d := &lockedDriver{
+		fakeDriver: fakeDriver{lanes: LaneState{Busy: 2, Max: 2}, completed: map[string]bool{}, verified: map[string]bool{}},
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- e.ForgeLoop(context.Background(), d, ForgeLoopOptions{Interval: 5 * time.Millisecond, MaxTicks: 1000, ControlAddr: "127.0.0.1:0"})
+	}()
+	// Wait for the control plane, then kill it at runtime.
+	var cs *server.ControlServer
+	for i := 0; i < 200; i++ {
+		if cs = e.ControlPlane(); cs != nil && cs.BoundAddr() != "" {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if cs == nil {
+		t.Fatal("control plane never started")
+	}
+	cs.RecordServeFailure(errors.New("listener died"))
+
+	select {
+	case err := <-done:
+		if err == nil || !strings.Contains(err.Error(), "control_plane_dead") {
+			t.Fatalf("loop must cancel BLOCKED(control_plane_dead), got: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("loop kept running after control plane death")
+	}
+	blocked := false
+	for _, l := range d.snapshot() {
+		if strings.Contains(l, "BLOCKED(control_plane_dead)") {
+			blocked = true
+		}
+	}
+	if !blocked {
+		t.Fatalf("death not projected in logs: %v", d.snapshot())
 	}
 }
