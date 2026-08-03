@@ -440,6 +440,12 @@ func envFloat(key string, def float64) float64 {
 	return n
 }
 
+// ProbeDisk exposes the real statfs probe for read-only observation
+// surfaces (metrics, status). It never mutates guard state.
+func ProbeDisk(path string) (DiskStat, error) {
+	return realDiskStat(path)
+}
+
 // realDiskStat probes the volume containing path via statfs. If path does
 // not exist yet (e.g. a worktree pool about to be created), it walks up to
 // the nearest existing ancestor so a first-ever run is probed, not refused.

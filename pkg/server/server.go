@@ -8,6 +8,10 @@ import (
 	"net/http"
 	"sync"
 	"time"
+
+	"github.com/Kampe/Herdforge/pkg/gc"
+	"github.com/Kampe/Herdforge/pkg/metrics"
+	"github.com/Kampe/Herdforge/pkg/preflight"
 )
 
 type ServerStatusResponse struct {
@@ -22,6 +26,19 @@ type ControlServer struct {
 	Addr      string
 	StartTime time.Time
 	httpSrv   *http.Server
+
+	// Metrics, when set, mounts /metrics with LIVE disk observation: each
+	// scrape probes DiskVolumes and reads the DefaultDiskGuard projection
+	// (FAC-153) — never manually seeded values.
+	Metrics *metrics.MetricsExporter
+	// DiskVolumes maps bounded roles (repo|pool|temp) to probe paths.
+	DiskVolumes map[string]string
+	// GC, when set, mounts the pressure-reclamation control path:
+	// GET /v1/disk/reclamation-plan (read-only exact-target proof) and
+	// POST /v1/disk/reclaim (exact targets only; broad cleanup refused).
+	GC *gc.GCManager
+	// DefaultBranch for reclamation classification (default "main").
+	DefaultBranch string
 }
 
 func NewControlServer(addr string) *ControlServer {
@@ -31,16 +48,33 @@ func NewControlServer(addr string) *ControlServer {
 	}
 }
 
-func (s *ControlServer) Start(ctx context.Context) error {
+// routes builds the mux; extracted so tests can exercise handlers without
+// binding a listener.
+func (s *ControlServer) routes() *http.ServeMux {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/v1/status", s.handleStatus)
 	mux.HandleFunc("/openapi.json", s.handleOpenAPI)
+	if s.Metrics != nil {
+		mux.HandleFunc("/metrics", s.handleMetrics)
+	}
+	if s.GC != nil {
+		mux.HandleFunc("/v1/disk/reclamation-plan", s.handleReclamationPlan)
+		mux.HandleFunc("/v1/disk/reclaim", s.handleReclaim)
+	}
+	return mux
+}
 
-	s.httpSrv = &http.Server{
+func (s *ControlServer) Start(ctx context.Context) error {
+	mux := s.routes()
+
+	srv := &http.Server{
 		Addr:    s.Addr,
 		Handler: mux,
 	}
+	s.mu.Lock()
+	s.httpSrv = srv
+	s.mu.Unlock()
 
 	listener, err := net.Listen("tcp", s.Addr)
 	if err != nil {
@@ -48,15 +82,18 @@ func (s *ControlServer) Start(ctx context.Context) error {
 	}
 
 	go func() {
-		_ = s.httpSrv.Serve(listener)
+		_ = srv.Serve(listener)
 	}()
 
 	return nil
 }
 
 func (s *ControlServer) Stop(ctx context.Context) error {
-	if s.httpSrv != nil {
-		return s.httpSrv.Shutdown(ctx)
+	s.mu.Lock()
+	srv := s.httpSrv
+	s.mu.Unlock()
+	if srv != nil {
+		return srv.Shutdown(ctx)
 	}
 	return nil
 }
@@ -92,4 +129,69 @@ func (s *ControlServer) handleOpenAPI(w http.ResponseWriter, r *http.Request) {
 		},
 	}
 	_ = json.NewEncoder(w).Encode(openAPISpec)
+}
+
+// handleMetrics refreshes live disk observations (FAC-153) then delegates
+// to the exporter: guard state comes from a fresh DefaultDiskGuard check
+// over the configured volumes (also driving BLOCKED → recovering → ok),
+// and per-role gauges come from real probes — never manually seeded.
+func (s *ControlServer) handleMetrics(w http.ResponseWriter, r *http.Request) {
+	paths := make([]string, 0, len(s.DiskVolumes))
+	for _, p := range s.DiskVolumes {
+		paths = append(paths, p)
+	}
+	if len(paths) > 0 {
+		_ = preflight.CheckDiskPressure("metrics_scrape", paths...)
+	}
+	s.Metrics.SetDiskState(string(preflight.DefaultDiskGuard.State()))
+	for role, p := range s.DiskVolumes {
+		st, err := preflight.ProbeDisk(p)
+		if err != nil {
+			continue // unreadable volumes surface via the state gauge, not fake numbers
+		}
+		s.Metrics.SetDiskVolume(role, st.FreeBytes, st.FreePct)
+	}
+	s.Metrics.Handler().ServeHTTP(w, r)
+}
+
+// handleReclamationPlan returns the read-only compiled safe-GC proof:
+// exact eligible targets with per-target evidence. Nothing is removed.
+func (s *ControlServer) handleReclamationPlan(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	report, err := s.GC.PressureReclamationPlan(r.Context(), s.DefaultBranch)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(report)
+}
+
+type reclaimRequest struct {
+	Targets []string `json:"targets"`
+}
+
+// handleReclaim executes exact-target reclamation through the FAC-117 Reap
+// contract (just-in-time revalidation, salvage refs). Empty target sets are
+// refused — there is no broad-cleanup mode on this endpoint.
+func (s *ControlServer) handleReclaim(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req reclaimRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid request body: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	report, err := s.GC.ReclaimExact(r.Context(), s.DefaultBranch, req.Targets)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(report)
 }
