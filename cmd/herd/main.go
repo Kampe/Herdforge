@@ -87,7 +87,10 @@ func main() {
 		runPulse()
 
 	case "standing":
-		runStanding()
+		if err := runStandingE(); err != nil {
+			fmt.Fprintf(os.Stderr, "standing failed: %v\n", err)
+			os.Exit(1)
+		}
 
 	case "daemon":
 		runDaemon()
@@ -123,7 +126,10 @@ func main() {
 		runCleanup()
 
 	case "forge":
-		runForge()
+		if err := runForgeE(); err != nil {
+			fmt.Fprintf(os.Stderr, "forge failed: %v\n", err)
+			os.Exit(1)
+		}
 
 	case "up":
 		runUp()
@@ -542,20 +548,26 @@ func runPulse() {
 	}
 	var pulseLane *config.LaneDef
 	var pulseDecision *router.LaunchDecision
+	var tp provider.TaskProvider
+	var tpErr error
 	if *spawn {
 		pulseLane = findLaneForRole(cfg, *role)
 		if pulseLane == nil {
 			fmt.Fprintf(os.Stderr, "no lane configured for role '%s'\n", *role)
 			os.Exit(1)
 		}
-		pulseDecision, err = launchAdmission(cfg, *role, herdr.IsAvailable(), routedLaneDecision(context.Background(), nil))
+		pulseDecision, err = launchAdmissionWithLifecycle(liveLaunchLifecycle{}, cfg, *role, herdr.IsAvailable(), routedLaneDecision(context.Background(), nil), func(_ *router.LaunchDecision) error {
+			tp, tpErr = loadTaskProvider(cfg)
+			return tpErr
+		})
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "launch route rejected before provider/claim: %v\n", err)
 			os.Exit(1)
 		}
+	} else {
+		tp, tpErr = loadTaskProvider(cfg)
 	}
 
-	tp, tpErr := loadTaskProvider(cfg)
 	if tpErr != nil {
 		fmt.Fprintf(os.Stderr, "task provider: %v\n", tpErr)
 		os.Exit(1)
@@ -921,73 +933,74 @@ func runDaemon() {
 	}
 }
 
-func runStanding() {
-	// FAC-159: standing raises fleet tabs only — it does not claim tasks or
-	// create task worktrees. Task-scoped launches must go through
-	// herd dispatch / herd pulse (RequireTaskLaunch / FencedClaim). No theater.
-
+func runStandingE() error {
 	cfg, err := config.LoadConfig(".herd/herd.yaml")
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "failed to load config: %v\n", err)
-		os.Exit(1)
+		return fmt.Errorf("load config: %w", err)
+	}
+	return runStandingConfig(cfg, herdr.IsAvailable())
+}
+
+func runStandingConfig(cfg *config.Config, herdrAvailable bool) error {
+	if !herdrAvailable {
+		return errors.New("herdr CLI not found — install herdr first")
 	}
 
-	if !herdr.IsAvailable() {
-		fmt.Fprintf(os.Stderr, "herdr CLI not found — install herdr first\n")
-		os.Exit(1)
-	}
-
+	var failures []error
 	for _, lane := range cfg.Lanes {
 		if !lane.Standing {
 			continue
 		}
-		decision, routeErr := launchAdmission(cfg, lane.Role, true, routedLaneDecision(context.Background(), nil))
+		decision, routeErr := launchAdmissionWithLifecycle(liveLaunchLifecycle{}, cfg, lane.Role, true, routedLaneDecision(context.Background(), nil), func(_ *router.LaunchDecision) error { return prepareStandingWorktree(&lane) })
 		if routeErr != nil {
 			fmt.Fprintf(os.Stderr, "  launch route rejected for lane %s: %v\n", lane.Name, routeErr)
+			failures = append(failures, fmt.Errorf("lane %s: %w", lane.Name, routeErr))
 			continue
 		}
 		if err := validateDecisionBeforeSideEffect(decision, lane.Name); err != nil {
 			fmt.Fprintf(os.Stderr, "  launch decision rejected for lane %s: %v\n", lane.Name, err)
+			failures = append(failures, fmt.Errorf("lane %s: %w", lane.Name, err))
 			continue
 		}
-		if lane.Worktree != "" {
-			wtPath := filepath.Join(".", lane.Worktree)
-			if _, err := os.Stat(wtPath); os.IsNotExist(err) {
-				fmt.Printf("Creating worktree %s for lane %s...\n", lane.Worktree, lane.Name)
-				wtBranch := fmt.Sprintf("wt/%s", lane.Name)
-				cmd := exec.Command("git", "worktree", "add", "-b", wtBranch, lane.Worktree, "origin/main")
-				cmd.Stderr = os.Stderr
-				if err := cmd.Run(); err != nil {
-					fmt.Fprintf(os.Stderr, "  warning: failed to create worktree (non-fatal): %v\n", err)
-				}
-			}
-		}
-
 		tabLabel := fmt.Sprintf("forge-%s", lane.Name)
 		fmt.Printf("Launching lane '%s' as agent '%s' (kind=%s)...\n", lane.Name, tabLabel, lane.AgentKind)
 
 		tab, err := herdr.Tab(herdr.ResolveWorkspace("."), tabLabel, true)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "  failed to create tab for lane %s: %v\n", lane.Name, err)
+			failures = append(failures, fmt.Errorf("lane %s create tab: %w", lane.Name, err))
 			continue
 		}
 
 		if err := herdr.AgentStartWithDecision(tabLabel, decision.Provider, tab.Pane.ID, launch.Request{Decision: decision, TaskRef: lane.Name}); err != nil {
 			fmt.Fprintf(os.Stderr, "  failed to start agent for lane %s: %v\n", lane.Name, err)
+			failures = append(failures, fmt.Errorf("lane %s start agent: %w", lane.Name, err))
 			continue
 		}
 
 		if lane.Prompt != "" {
-			if promptData, err := os.ReadFile(lane.Prompt); err == nil {
-				promptText := strings.TrimSpace(string(promptData))
-				if _, promptErr := herdr.AgentPrompt(tabLabel, promptText, false); promptErr != nil {
-					fmt.Fprintf(os.Stderr, "  prompt failed for lane %s: %v\n", lane.Name, promptErr)
-					continue
-				}
+			promptData, readErr := os.ReadFile(lane.Prompt)
+			if readErr != nil {
+				failures = append(failures, fmt.Errorf("lane %s read prompt: %w", lane.Name, readErr))
+				continue
+			}
+			promptText := strings.TrimSpace(string(promptData))
+			if _, promptErr := herdr.AgentPrompt(tabLabel, promptText, false); promptErr != nil {
+				fmt.Fprintf(os.Stderr, "  prompt failed for lane %s: %v\n", lane.Name, promptErr)
+				failures = append(failures, fmt.Errorf("lane %s prompt: %w", lane.Name, promptErr))
+				continue
 			}
 		}
 
 		fmt.Printf("  -> tab=%s pane=%s agent=%s running\n", tab.ID, tab.Pane.ID, tabLabel)
+	}
+	return errors.Join(failures...)
+}
+
+func runStanding() {
+	if err := runStandingE(); err != nil {
+		fmt.Fprintf(os.Stderr, "standing failed: %v\n", err)
+		os.Exit(1)
 	}
 }
 
@@ -1020,7 +1033,12 @@ func runUp() {
 		fmt.Fprintf(os.Stderr, "herdr CLI not found\n")
 		os.Exit(1)
 	}
-	decision, err := launchAdmission(cfg, lane.Role, true, routedLaneDecision(context.Background(), nil))
+	var tab *herdr.TabInfo
+	decision, err := launchAdmissionWithLifecycle(liveLaunchLifecycle{}, cfg, lane.Role, true, routedLaneDecision(context.Background(), nil), func(_ *router.LaunchDecision) error {
+		var tabErr error
+		tab, tabErr = herdr.Tab(herdr.ResolveWorkspace("."), fmt.Sprintf("forge-%s", lane.Name), true)
+		return tabErr
+	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "launch route rejected before tab creation: %v\n", err)
 		os.Exit(1)
@@ -1031,11 +1049,6 @@ func runUp() {
 	}
 
 	tabLabel := fmt.Sprintf("forge-%s", lane.Name)
-	tab, err := herdr.Tab(herdr.ResolveWorkspace("."), tabLabel, true)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "failed to create tab: %v\n", err)
-		os.Exit(1)
-	}
 
 	if err := herdr.AgentStartWithDecision(tabLabel, decision.Provider, tab.Pane.ID, launch.Request{Decision: decision, TaskRef: lane.Name}); err != nil {
 		fmt.Fprintf(os.Stderr, "failed to start agent: %v\n", err)
@@ -1217,7 +1230,10 @@ func runReview() {
 			fmt.Fprintf(os.Stderr, "no lane configured for role 'reviewer'\n")
 			os.Exit(1)
 		}
-		decision, err := launchAdmission(cfg, lane.Role, true, routedLaneDecision(context.Background(), task))
+		decision, err := launchAdmissionWithLifecycle(liveLaunchLifecycle{}, cfg, lane.Role, true, routedLaneDecision(context.Background(), task), func(_ *router.LaunchDecision) error {
+			_, listErr := herdr.AgentList()
+			return listErr
+		})
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "review launch route rejected before tab creation: %v\n", err)
 			os.Exit(1)
@@ -1829,13 +1845,18 @@ func runDispatch() {
 	wm := resolveCanonicalWorktreeManager()
 	d := dispatch.NewDispatcher(cfg, tp, wm)
 	var decision *router.LaunchDecision
+	var dispatchResult *dispatch.DispatchResult
 	if !*noLaunch {
 		lane := findLaneByName(cfg, *laneName)
 		if lane == nil {
 			fmt.Fprintf(os.Stderr, "lane '%s' not found\n", *laneName)
 			os.Exit(1)
 		}
-		decision, err = launchAdmission(cfg, lane.Role, true, routedLaneDecision(context.Background(), nil))
+		decision, err = launchAdmissionWithLifecycle(liveLaunchLifecycle{}, cfg, lane.Role, true, routedLaneDecision(context.Background(), nil), func(admitted *router.LaunchDecision) error {
+			var dispatchErr error
+			dispatchResult, dispatchErr = d.Dispatch(context.Background(), dispatch.DispatchOptions{TicketRef: ticketRef, NoLaunch: *noLaunch, LaneName: *laneName, Decision: admitted})
+			return dispatchErr
+		})
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "launch route rejected before dispatch: %v\n", err)
 			os.Exit(1)
@@ -1848,10 +1869,10 @@ func runDispatch() {
 
 	fmt.Printf("Dispatching %s to lane '%s'...\n", ticketRef, *laneName)
 
-	result, err := d.Dispatch(context.Background(), dispatch.DispatchOptions{
-		TicketRef: ticketRef, NoLaunch: *noLaunch, LaneName: *laneName,
-		Decision: decision,
-	})
+	result := dispatchResult
+	if *noLaunch {
+		result, err = d.Dispatch(context.Background(), dispatch.DispatchOptions{TicketRef: ticketRef, NoLaunch: true, LaneName: *laneName, Decision: decision})
+	}
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "dispatch failed: %v\n", err)
 		os.Exit(1)
@@ -2318,25 +2339,23 @@ func runUnmerged() {
 	}
 }
 
-func runForge() {
+func runForgeE() error {
 	// FAC-128: `herd forge --loop` runs the autonomous orchestration loop.
 	for _, a := range os.Args[2:] {
 		if a == "--loop" {
 			runForgeLoop()
-			return
+			return nil
 		}
 	}
 
 	cfg, err := config.LoadConfig(".herd/herd.yaml")
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "failed to load config: %v\n", err)
-		os.Exit(1)
+		return fmt.Errorf("load config: %w", err)
 	}
 
 	tp, tpErr := loadTaskProvider(cfg)
 	if tpErr != nil {
-		fmt.Fprintf(os.Stderr, "task provider: %v\n", tpErr)
-		os.Exit(1)
+		return fmt.Errorf("task provider: %w", tpErr)
 	}
 
 	mr := router.NewModelRouter([]*router.ModelCandidate{
@@ -2362,26 +2381,26 @@ func runForge() {
 	fmt.Println("=== Forge: Pulse ===")
 	var forgeLane *config.LaneDef
 	var forgeDecision *router.LaunchDecision
+	var task *provider.Task
 	if !herdr.IsAvailable() {
-		fmt.Fprintln(os.Stderr, "herdr CLI not found — refusing launch-required forge claim")
-		os.Exit(1)
+		return errors.New("herdr CLI not found — refusing launch-required forge claim")
 	}
 	forgeLane = findLaneForRole(cfg, "worker")
 	if forgeLane == nil {
-		fmt.Println("No worker lane configured; refusing forge claim")
-		return
+		return errors.New("no worker lane configured; refusing forge claim")
 	}
-	forgeDecision, err = launchAdmission(cfg, forgeLane.Role, true, routedLaneDecision(ctx, nil))
+	forgeDecision, err = forgeLaunchAdmission(cfg, forgeLane, ctx, func(_ *router.LaunchDecision) error {
+		var claimErr error
+		task, claimErr = eng.RunPulse(ctx, "worker")
+		return claimErr
+	})
 	if err != nil {
-		fmt.Printf("Launch route rejected before forge claim: %v\n", err)
-		return
+		return fmt.Errorf("launch route rejected before forge claim: %w", err)
 	}
 	if err := validateDecisionBeforeSideEffect(forgeDecision, "forge"); err != nil {
-		fmt.Printf("Launch decision rejected before forge claim: %v\n", err)
-		return
+		return fmt.Errorf("launch decision rejected before forge claim: %w", err)
 	}
 
-	task, err := eng.RunPulse(ctx, "worker")
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "pulse failed: %v\n", err)
 		os.Exit(1)
@@ -2401,16 +2420,16 @@ func runForge() {
 				tabLabel, resolveErr := herdr.ResolveAgentTabWithDecision(standingName, launch.Request{Decision: decision, TaskRef: task.Ref}, 0)
 				if resolveErr != nil {
 					if !errors.Is(resolveErr, herdr.ErrAgentNotFound) {
-						fmt.Fprintf(os.Stderr, "standing forge agent %s blocked: %v\n", standingName, resolveErr)
-						return
+						return fmt.Errorf("standing forge agent %s blocked: %w", standingName, resolveErr)
 					}
 					tabLabel = fmt.Sprintf("forge-%s-%s", lane.Name, task.Ref)
 					tab, tabErr := herdr.Tab(herdr.ResolveWorkspace("."), tabLabel, true)
 					if tabErr == nil {
 						if err := herdr.AgentStartWithDecision(tabLabel, decision.Provider, tab.Pane.ID, launch.Request{Decision: decision, TaskRef: task.Ref}); err != nil {
-							fmt.Printf("Launch failed: %v\n", err)
-							return
+							return fmt.Errorf("launch failed: %w", err)
 						}
+					} else {
+						return fmt.Errorf("create forge tab: %w", tabErr)
 					}
 				}
 				packet := fmt.Sprintf(`Task [%s]: %s\n\n%s\n\nWorktree: %s`, task.Ref, task.Title, task.Description, lane.Worktree)
@@ -2446,6 +2465,11 @@ func runForge() {
 	}
 
 	fmt.Println("\n=== Forge cycle complete ===")
+	return nil
+}
+
+func forgeLaunchAdmission(cfg *config.Config, lane *config.LaneDef, ctx context.Context, effect func(*router.LaunchDecision) error) (*router.LaunchDecision, error) {
+	return launchAdmissionWithLifecycle(liveLaunchLifecycle{}, cfg, lane.Role, true, routedLaneDecision(ctx, nil), effect)
 }
 
 func findLaneForRole(cfg *config.Config, role string) *config.LaneDef {
@@ -2461,6 +2485,29 @@ func findLaneByName(cfg *config.Config, name string) *config.LaneDef {
 	for i := range cfg.Lanes {
 		if cfg.Lanes[i].Name == name {
 			return &cfg.Lanes[i]
+		}
+	}
+	return nil
+}
+
+func prepareStandingWorktree(lane *config.LaneDef) error {
+	return prepareStandingWorktreeWith(lane, func(path, branch string) error {
+		cmd := exec.Command("git", "worktree", "add", "-b", branch, path, "origin/main")
+		cmd.Stderr = os.Stderr
+		return cmd.Run()
+	})
+}
+
+func prepareStandingWorktreeWith(lane *config.LaneDef, add func(path, branch string) error) error {
+	if lane.Worktree == "" {
+		return nil
+	}
+	wtPath := filepath.Join(".", lane.Worktree)
+	if _, err := os.Stat(wtPath); os.IsNotExist(err) {
+		fmt.Printf("Creating worktree %s for lane %s...\n", lane.Worktree, lane.Name)
+		branch := fmt.Sprintf("wt/%s", lane.Name)
+		if err := add(lane.Worktree, branch); err != nil {
+			return fmt.Errorf("create standing worktree %s: %w", lane.Name, err)
 		}
 	}
 	return nil
@@ -2554,6 +2601,27 @@ func validateDecisionBeforeSideEffect(decision *router.LaunchDecision, taskRef s
 // entrypoints. The continuation is deliberately after config, availability,
 // router authority, and decision validation; tests inject real lifecycle seams
 // into it to prove rejected lanes cannot claim or spawn.
+type launchLifecycle interface {
+	Run(*router.LaunchDecision, func(*router.LaunchDecision) error) error
+}
+
+type liveLaunchLifecycle struct{}
+
+func (liveLaunchLifecycle) Run(decision *router.LaunchDecision, effect func(*router.LaunchDecision) error) error {
+	return effect(decision)
+}
+
+func launchAdmissionWithLifecycle(lc launchLifecycle, cfg *config.Config, role string, herdrAvailable bool, route func(*config.LaneDef) (*router.LaunchDecision, error), effect func(*router.LaunchDecision) error) (*router.LaunchDecision, error) {
+	decision, err := launchAdmission(cfg, role, herdrAvailable, route)
+	if err != nil {
+		return nil, err
+	}
+	if err := lc.Run(decision, effect); err != nil {
+		return nil, err
+	}
+	return decision, nil
+}
+
 func launchAdmission(cfg *config.Config, role string, herdrAvailable bool, route func(*config.LaneDef) (*router.LaunchDecision, error)) (*router.LaunchDecision, error) {
 	lane := findLaneForRole(cfg, role)
 	if lane == nil {

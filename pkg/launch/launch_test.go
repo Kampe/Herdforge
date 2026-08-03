@@ -1,6 +1,7 @@
 package launch
 
 import (
+	"os"
 	"strings"
 	"testing"
 
@@ -98,6 +99,65 @@ func TestHandBuiltApprovedTupleFailsClosed(t *testing.T) {
 	r := Request{Decision: &router.LaunchDecision{Role: router.RoleWorker, Shape: Implementation, Provider: WorkerProvider, Model: WorkerModel, Effort: WorkerEffort, Argv: []string{"codex", "--model", WorkerModel, "-c", "model_reasoning_effort=medium", "-a", "never"}}}
 	if err := Validate(r, &MemorySink{}); err == nil {
 		t.Fatal("hand-built approved tuple must require router proof")
+	}
+}
+
+func TestHasStartedRejectsConflictingPersistedTupleDespiteMatchingDigest(t *testing.T) {
+	t.Setenv("HERD_LAUNCH_RECEIPTS", t.TempDir()+"/receipts.jsonl")
+	req := good()
+	req.TaskRef, req.Name, req.PaneID, req.LeaseGeneration = "FAC-175", "worker", "pane-1", 7
+	if err := (&JSONLSink{Path: os.Getenv("HERD_LAUNCH_RECEIPTS")}).Write(Receipt{
+		TaskRef: req.TaskRef, Name: req.Name, PaneID: req.PaneID, LeaseGeneration: req.LeaseGeneration,
+		Role: WorkerRole, TaskShape: Implementation, Provider: WorkerProvider,
+		// The digest claims the current Luna decision, while persisted identity
+		// fields and argv claim the forbidden coordinator-tier session.
+		Model: WorkerModel, Effort: "ultra", DecisionDigest: DecisionDigest(req.Decision),
+		Argv: []string{"codex", "--model", "gpt-5.6-sol", "-c", "model_reasoning_effort=ultra", "-a", "never"}, Accepted: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	started, err := HasStarted(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if started {
+		t.Fatal("conflicting persisted Sol/Ultra tuple must not authorize resume")
+	}
+}
+
+func TestHasStartedRejectsConflictingAcceptedAndRevokedRecords(t *testing.T) {
+	t.Setenv("HERD_LAUNCH_RECEIPTS", t.TempDir()+"/receipts.jsonl")
+	req := good()
+	req.TaskRef, req.Name, req.PaneID, req.LeaseGeneration = "FAC-175", "worker", "pane-1", 7
+	sink := &JSONLSink{Path: os.Getenv("HERD_LAUNCH_RECEIPTS")}
+	role, shape, provider, model, effort, digest, argv := fields(req)
+	accepted := Receipt{TaskRef: req.TaskRef, Name: req.Name, PaneID: req.PaneID, LeaseGeneration: req.LeaseGeneration, Role: role, TaskShape: shape, Provider: provider, Model: model, Effort: effort, DecisionDigest: digest, Argv: argv, Accepted: true}
+	if err := sink.Write(accepted); err != nil {
+		t.Fatal(err)
+	}
+	if err := sink.Write(Receipt{TaskRef: req.TaskRef, Name: req.Name, PaneID: req.PaneID, LeaseGeneration: req.LeaseGeneration, Accepted: false, Reason: "revoked"}); err != nil {
+		t.Fatal(err)
+	}
+	started, err := HasStarted(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if started {
+		t.Fatal("revoked or conflicting session must not remain resumable")
+	}
+}
+
+func TestHasStartedRejectsMalformedReceiptData(t *testing.T) {
+	path := t.TempDir() + "/receipts.jsonl"
+	t.Setenv("HERD_LAUNCH_RECEIPTS", path)
+	if err := os.WriteFile(path, []byte("{not-json}\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	req := good()
+	req.TaskRef, req.Name, req.PaneID = "FAC-175", "worker", "pane-1"
+	started, err := HasStarted(req)
+	if err == nil || started {
+		t.Fatalf("malformed durable evidence must fail closed: started=%v err=%v", started, err)
 	}
 }
 

@@ -168,6 +168,9 @@ func RecordRejected(req Request, sink Sink, reason string) error { return reject
 // HasStarted proves a resumable identity from the client-owned lifecycle
 // store; Herdr's agent list does not carry routing metadata.
 func HasStarted(req Request) (bool, error) {
+	if req.Decision == nil || req.TaskRef == "" || req.Name == "" || req.PaneID == "" {
+		return false, nil
+	}
 	p := os.Getenv("HERD_LAUNCH_RECEIPTS")
 	if p == "" {
 		p = ".herd/launch-receipts.jsonl"
@@ -180,6 +183,10 @@ func HasStarted(req Request) (bool, error) {
 		return false, err
 	}
 	defer f.Close()
+	role, shape, provider, model, effort, digest, argv := fields(req)
+	role, shape, provider, model, effort = normalized(role), normalized(shape), normalized(provider), normalized(model), normalized(effort)
+	matched := false
+	invalidated := false
 	dec := json.NewDecoder(f)
 	for {
 		var r Receipt
@@ -189,11 +196,37 @@ func HasStarted(req Request) (bool, error) {
 			}
 			return false, err
 		}
-		if r.Accepted && r.DecisionDigest == DecisionDigest(req.Decision) && r.TaskRef == req.TaskRef && r.Name == req.Name && r.PaneID == req.PaneID && r.LeaseGeneration == req.LeaseGeneration {
-			return true, nil
+		if r.TaskRef != req.TaskRef || r.Name != req.Name || r.PaneID != req.PaneID || r.LeaseGeneration != req.LeaseGeneration {
+			continue
+		}
+		// Every record for this session generation participates in the decision:
+		// a rejection or conflicting accepted record must not leave an older match
+		// resumable.
+		if !r.Accepted {
+			invalidated = true
+			continue
+		}
+		receiptTuplePresent := r.Role != "" && r.TaskShape != "" && r.Provider != "" && r.Model != "" && r.Effort != "" && len(r.Argv) > 0
+		receiptTupleMatches := receiptTuplePresent && normalized(r.Role) == role && normalized(r.TaskShape) == shape && normalized(r.Provider) == provider && normalized(r.Model) == model && normalized(r.Effort) == effort && r.DecisionDigest == digest && equalStrings(r.Argv, argv)
+		if !receiptTupleMatches {
+			invalidated = true
+			continue
+		}
+		matched = true
+	}
+	return matched && !invalidated, nil
+}
+
+func equalStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
 		}
 	}
-	return false, nil
+	return true
 }
 
 // Validate checks all launch identity fields before any tab, process, prompt,
