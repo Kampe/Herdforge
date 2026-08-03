@@ -276,6 +276,67 @@ func TestLaunchReviewNotPending(t *testing.T) {
 	}
 }
 
+// TestSelectReviewerUnknownFamilyRejected_RepairProbe: an unrecognized model
+// family must never satisfy the cross-family requirement for R1-R3 — it must
+// not be treated as automatically cross-family from every known family.
+func TestSelectReviewerUnknownFamilyRejected_RepairProbe(t *testing.T) {
+	sv := svc(t)
+	rev, err := sv.SelectReviewer("aaa111", []ReviewerEntry{
+		{Name: "mystery-bot", Model: "totally-unrecognized-model-xyz"},
+	})
+	if err != nil {
+		t.Fatalf("SelectReviewer: %v", err)
+	}
+	if rev != nil {
+		t.Errorf("expected nil (unknown family must not satisfy cross-family), got %s", rev.Name)
+	}
+}
+
+func TestLaunchReviewUnknownFamilyRejected_RepairProbe(t *testing.T) {
+	sv := svc(t)
+	err := sv.LaunchReview("aaa111", "mystery-bot", "totally-unrecognized-model-xyz")
+	if err == nil {
+		t.Fatal("expected error: unknown-family reviewer must not launch on R1-R3 candidate")
+	}
+}
+
+// TestSubmitVerdictUsesStoredReviewFamily_RepairProbe guards against
+// re-deriving the review family from the reviewer's free-text label at
+// verdict time. A reviewer label can accidentally contain another family's
+// keyword (e.g. a label mentioning the author's family) even though the
+// actual review model — recorded in cand.ReviewFamily at LaunchReview time —
+// is genuinely cross-family. SubmitVerdict must trust the stored family, not
+// re-guess it from the label, or a valid cross-family review gets rejected
+// (or worse, a same-family one could slip through under a misleading label).
+func TestSubmitVerdictUsesStoredReviewFamily_RepairProbe(t *testing.T) {
+	sv, _ := newTestSupervisor(t)
+	_, _, err := sv.Ingest(CompletionCallback{
+		SHA:         "sha1",
+		AuthorModel: "gpt-4", // openai family
+		Tier:        TierR1,
+	})
+	if err != nil {
+		t.Fatalf("Ingest: %v", err)
+	}
+
+	// Real review model is anthropic (genuinely cross-family vs openai), but
+	// the reviewer's label deliberately contains "gpt" — the author's family
+	// keyword — to probe whether verdict-time logic re-derives family from
+	// the label instead of the model recorded at launch.
+	if err := sv.LaunchReview("sha1", "gpt-shadow-reviewer", "claude-3-7-sonnet"); err != nil {
+		t.Fatalf("LaunchReview: %v", err)
+	}
+
+	_, err = sv.SubmitVerdict(ReviewVerdict{
+		SHA:      "sha1",
+		Reviewer: "gpt-shadow-reviewer",
+		Verdict:  VerdictPASS,
+	})
+	if err != nil {
+		t.Fatalf("SubmitVerdict: %v (verdict gate must trust cand.ReviewFamily, not the reviewer label)", err)
+	}
+}
+
 func TestSubmitVerdictPASS(t *testing.T) {
 	sv := svc(t)
 	sv.LaunchReview("aaa111", "gemini", "gemini-2.5-flash")
@@ -661,6 +722,15 @@ func TestCrossFamilyOK(t *testing.T) {
 	}
 	if CrossFamilyOK(FamilyAnt, FamilyAnt) {
 		t.Error("same family should NOT be cross-family")
+	}
+	if CrossFamilyOK(FamilyAnt, FamilyOther) {
+		t.Error("unknown reviewer family should NOT satisfy cross-family against a known author family")
+	}
+	if CrossFamilyOK(FamilyOther, FamilyGoogle) {
+		t.Error("unknown author family should NOT satisfy cross-family against a known reviewer family")
+	}
+	if CrossFamilyOK(FamilyOther, FamilyOther) {
+		t.Error("two unknown families should NOT satisfy cross-family")
 	}
 }
 
