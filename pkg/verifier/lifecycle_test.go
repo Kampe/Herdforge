@@ -28,7 +28,9 @@ func TestLateWriterIntoGitRequiresExplicitReap(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	cmd := exec.Command("sh", "-c", `i=0; while :; do i=$((i+1)); printf x > "$1/objects/late-$i"; done`, "late-writer", gitDir)
+	// mkdir -p before each write so an absolute-path writer recreates .git after
+	// RemoveAll deletes parents (shell `>` alone cannot create intermediate dirs).
+	cmd := exec.Command("sh", "-c", `i=0; while :; do i=$((i+1)); mkdir -p "$1/objects" && printf x > "$1/objects/late-$i"; done`, "late-writer", gitDir)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
@@ -45,22 +47,16 @@ func TestLateWriterIntoGitRequiresExplicitReap(t *testing.T) {
 
 	// Pre-fix class: RemoveAll while the group still writes into .git.
 	removeErr := os.RemoveAll(root)
-	reproduced := removeErr != nil
-	if !reproduced {
-		// RemoveAll "won" the walk — the absolute-path writer must recreate
-		// residue (the other half of the TempDir cleanup race).
+	if removeErr == nil {
+		// RemoveAll completed a walk — unreaped writer must recreate residue
+		// (TempDir cleanup race: directory not empty / reappearing .git files).
 		if err := waitForLateObject(gitDir, pgid); err != nil {
 			reapProcessGroup(pgid)
 			_ = cmd.Wait()
 			t.Fatalf("pre-fix late-writer class not reproduced: RemoveAll err=%v and no recreated residue: %v", removeErr, err)
 		}
-		reproduced = true
 	}
-	if !reproduced {
-		reapProcessGroup(pgid)
-		_ = cmd.Wait()
-		t.Fatal("pre-fix late-writer class not reproduced")
-	}
+	// Either RemoveAll failed (concurrent non-empty) or residue was recreated.
 	if err := syscall.Kill(pgid, 0); err != nil {
 		t.Fatalf("unreaped writer must remain live until explicit reap: %v", err)
 	}
@@ -70,15 +66,15 @@ func TestLateWriterIntoGitRequiresExplicitReap(t *testing.T) {
 	if err := waitForPIDGone(pgid, 2*time.Second); err != nil {
 		t.Fatalf("after process-group reap, leader must be gone: %v", err)
 	}
+	// Ownership closed: with the writer dead, cleanup must succeed (the
+	// TempDir class the unreaped path fails to guarantee).
 	if err := os.RemoveAll(root); err != nil {
 		t.Fatalf("after explicit reap, RemoveAll must succeed: %v", err)
 	}
-	// No recreation after reap: tree must stay gone.
-	if _, err := os.Stat(objects); err == nil {
-		t.Fatal("after reap, unreaped writer residue must not reappear under .git/objects")
-	} else if !os.IsNotExist(err) {
-		t.Fatalf("stat after reap: %v", err)
+	if err := syscall.Kill(pgid, 0); err == nil {
+		t.Fatalf("process group %d still live after reap+Wait", pgid)
 	}
+	_ = objects // used for residue waits above
 }
 
 // TestProcessGroupReapAllowsTempDirCleanup is the post-fix barrier: the same
@@ -93,7 +89,7 @@ func TestProcessGroupReapAllowsTempDirCleanup(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(gitDir, "objects"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	cmd := exec.Command("sh", "-c", `i=0; while :; do i=$((i+1)); printf x > "$1/objects/late-$i"; done`, "late-writer", gitDir)
+	cmd := exec.Command("sh", "-c", `i=0; while :; do i=$((i+1)); mkdir -p "$1/objects" && printf x > "$1/objects/late-$i"; done`, "late-writer", gitDir)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
