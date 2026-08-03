@@ -9,10 +9,19 @@ import (
 )
 
 func TestJiraProvider_GetTaskAndListTasks(t *testing.T) {
+	statusName := "In Progress"
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch {
-		case strings.HasPrefix(r.URL.Path, "/rest/api/3/issue/JIRA-100"):
+		case strings.Contains(r.URL.Path, "/transitions"):
+			statusName = "Done"
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte(`{}`))
+		case strings.Contains(r.URL.Path, "/comment"):
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte(`{}`))
+		case strings.HasPrefix(r.URL.Path, "/rest/api/3/issue/"):
+			// Supports both key (JIRA-100) and id (100) for readback after UpdateStatus.
 			w.WriteHeader(http.StatusOK)
 			w.Write([]byte(`{
 				"id": "100",
@@ -20,7 +29,7 @@ func TestJiraProvider_GetTaskAndListTasks(t *testing.T) {
 				"fields": {
 					"summary": "Fix auth vulnerability",
 					"description": "Fix OAuth token validation",
-					"status": {"name": "In Progress"},
+					"status": {"name": "` + statusName + `"},
 					"priority": {"name": "high"},
 					"labels": ["security"],
 					"created": "2026-08-01T12:00:00Z",
@@ -46,9 +55,6 @@ func TestJiraProvider_GetTaskAndListTasks(t *testing.T) {
 					}
 				]
 			}`))
-		case strings.Contains(r.URL.Path, "/transitions"), strings.Contains(r.URL.Path, "/comment"):
-			w.WriteHeader(http.StatusOK)
-			w.Write([]byte(`{}`))
 		default:
 			w.WriteHeader(http.StatusOK)
 			w.Write([]byte(`{}`))
@@ -64,6 +70,9 @@ func TestJiraProvider_GetTaskAndListTasks(t *testing.T) {
 
 	if task.Ref != "JIRA-100" || task.Priority != PriorityHigh {
 		t.Errorf("unexpected task fields: %+v", task)
+	}
+	if task.Status != StatusInProgress {
+		t.Errorf("expected normalized in-progress status, got %q", task.Status)
 	}
 
 	tasks, err := jp.ListTasks(context.Background(), "PROJ", "In Progress")

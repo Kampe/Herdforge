@@ -81,7 +81,7 @@ func dtoToTask(dto kaneoTaskDTO) *Task {
 		Ref:         dto.Ref,
 		Title:       dto.Title,
 		Description: dto.Description,
-		Status:      dto.Status,
+		Status:      NormalizeStatus(dto.Status),
 		Priority:    Priority(dto.Priority),
 		ProjectID:   dto.ProjectId,
 		Labels:      labels,
@@ -98,8 +98,12 @@ func (k *KaneoProvider) GetTask(ctx context.Context, id string) (*Task, error) {
 			return nil, fmt.Errorf("kaneo task get: %w", err)
 		}
 		var dto kaneoTaskDTO
-		if err := json.Unmarshal(out.Bytes(), &dto); err != nil {
-			return nil, fmt.Errorf("parsing kaneo output: %w", err)
+		if err := DecodeJSONBytes(http.StatusOK, out.Bytes(), &dto); err != nil {
+			if pe, ok := err.(*ProviderError); ok {
+				pe.Provider = "kaneo"
+				pe.Op = "GetTask"
+			}
+			return nil, fmt.Errorf("kaneo task get: %w", err)
 		}
 		return dtoToTask(dto), nil
 	}
@@ -113,12 +117,12 @@ func (k *KaneoProvider) GetTask(ctx context.Context, id string) (*Task, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("kaneo API returned non-200 status: %d", resp.StatusCode)
-	}
 	var dto kaneoTaskDTO
-	if err := json.NewDecoder(resp.Body).Decode(&dto); err != nil {
+	if err := DecodeJSONResponse(resp, &dto); err != nil {
+		if pe, ok := err.(*ProviderError); ok {
+			pe.Provider = "kaneo"
+			pe.Op = "GetTask"
+		}
 		return nil, err
 	}
 	return dtoToTask(dto), nil
@@ -130,15 +134,13 @@ func (k *KaneoProvider) ListTasks(ctx context.Context, projectID string, status 
 	}
 
 	if k.UseCLI {
-		// The server caps a page below the requested --limit and returns a
-		// SHORT full page (observed: 99 on a 100-card ask), so terminating on
-		// "fewer than pageSize" stops after page 1 and hides every later card
-		// — including FAC-106, which broke board-done and approve. Terminate
-		// only on an EMPTY page; dedupe by id in case page boundaries overlap.
+		// Terminate only on EMPTY page (or duplicate page); short pages continue.
+		// Server may cap below --limit (observed 99/100), so short-page stop
+		// hides later cards (FAC-106 / board-done regressions).
 		const pageSize = 100
 		var all []kaneoTaskDTO
-		seen := map[string]bool{}
-		for page := 1; page <= 50; page++ { // ponytail: 5000-card ceiling, raise if a board ever gets there
+		acc := NewPageAccumulator()
+		for page := 1; page <= 50; page++ { // ponytail: 5000-card ceiling
 			args := []string{"task", "list", "--project", projectID, "--json",
 				"--limit", fmt.Sprint(pageSize), "--page", fmt.Sprint(page)}
 			if status != "" {
@@ -151,25 +153,24 @@ func (k *KaneoProvider) ListTasks(ctx context.Context, projectID string, status 
 				return nil, fmt.Errorf("kaneo task list (page %d): %w", page, err)
 			}
 			var dtos []kaneoTaskDTO
-			if err := json.Unmarshal(out.Bytes(), &dtos); err != nil {
-				return nil, fmt.Errorf("parsing kaneo output (page %d): %w", page, err)
-			}
-			if len(dtos) == 0 {
-				break
+			if err := DecodeJSONBytes(http.StatusOK, out.Bytes(), &dtos); err != nil {
+				if pe, ok := err.(*ProviderError); ok {
+					pe.Provider = "kaneo"
+					pe.Op = "ListTasks"
+				}
+				return nil, fmt.Errorf("kaneo task list (page %d): %w", page, err)
 			}
 			fresh := 0
 			for _, d := range dtos {
-				if seen[d.ID] {
+				if !acc.Add(d.ID) {
 					continue
 				}
-				seen[d.ID] = true
 				all = append(all, d)
 				fresh++
 			}
-			// A page that added nothing new means the server is repeating the
-			// last page (no more distinct records) — stop.
-			if fresh == 0 {
-				break
+			switch DecidePagination(len(dtos), fresh) {
+			case PageStopEmpty, PageStopDuplicate:
+				return filterTasks(all, status), nil
 			}
 		}
 		return filterTasks(all, status), nil
@@ -184,12 +185,12 @@ func (k *KaneoProvider) ListTasks(ctx context.Context, projectID string, status 
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("kaneo API returned non-200 status: %d", resp.StatusCode)
-	}
 	var dtos []kaneoTaskDTO
-	if err := json.NewDecoder(resp.Body).Decode(&dtos); err != nil {
+	if err := DecodeJSONResponse(resp, &dtos); err != nil {
+		if pe, ok := err.(*ProviderError); ok {
+			pe.Provider = "kaneo"
+			pe.Op = "ListTasks"
+		}
 		return nil, err
 	}
 	return filterTasks(dtos, status), nil
@@ -197,27 +198,38 @@ func (k *KaneoProvider) ListTasks(ctx context.Context, projectID string, status 
 
 func filterTasks(dtos []kaneoTaskDTO, status string) []*Task {
 	var tasks []*Task
+	want := ""
+	if status != "" {
+		want = NormalizeStatus(status)
+	}
 	for _, dto := range dtos {
-		if status != "" && !strings.EqualFold(dto.Status, status) {
+		t := dtoToTask(dto)
+		if want != "" && t.Status != want {
 			continue
 		}
-		tasks = append(tasks, dtoToTask(dto))
+		tasks = append(tasks, t)
 	}
 	return tasks
 }
 
 func (k *KaneoProvider) ClaimTask(ctx context.Context, taskID string, role string) error {
-	return k.UpdateStatus(ctx, taskID, "in-progress")
+	return k.UpdateStatus(ctx, taskID, StatusInProgress)
 }
 
 func (k *KaneoProvider) UpdateStatus(ctx context.Context, taskID string, status string) error {
+	canonical := NormalizeStatus(status)
 	if k.UseCLI {
 		cmd := exec.CommandContext(ctx, "kaneo", "task", "status", taskID, status, "--project", k.ProjectID)
 		out, err := cmd.CombinedOutput()
 		if err != nil {
 			return fmt.Errorf("kaneo task status: %s: %w", strings.TrimSpace(string(out)), err)
 		}
-		return nil
+		// Fail-closed readback: mutation is not success until read agrees.
+		got, gerr := k.GetTask(ctx, taskID)
+		if gerr != nil {
+			return fmt.Errorf("kaneo status readback after write: %w", gerr)
+		}
+		return VerifyStatusReadback(taskID, canonical, got.Status)
 	}
 
 	url := fmt.Sprintf("%s/api/task/%s", k.APIURL, taskID)
@@ -232,11 +244,18 @@ func (k *KaneoProvider) UpdateStatus(ctx context.Context, taskID string, status 
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent {
-		return fmt.Errorf("kaneo API returned non-200 status on update: %d", resp.StatusCode)
+	if err := DecodeJSONResponse(resp, nil); err != nil {
+		if pe, ok := err.(*ProviderError); ok {
+			pe.Provider = "kaneo"
+			pe.Op = "UpdateStatus"
+		}
+		return err
 	}
-	return nil
+	got, gerr := k.GetTask(ctx, taskID)
+	if gerr != nil {
+		return fmt.Errorf("kaneo status readback after write: %w", gerr)
+	}
+	return VerifyStatusReadback(taskID, canonical, got.Status)
 }
 
 func (k *KaneoProvider) AddComment(ctx context.Context, taskID string, body string) error {
@@ -261,9 +280,12 @@ func (k *KaneoProvider) AddComment(ctx context.Context, taskID string, body stri
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
-		return fmt.Errorf("kaneo API returned non-200 status on comment: %d", resp.StatusCode)
+	if err := DecodeJSONResponse(resp, nil); err != nil {
+		if pe, ok := err.(*ProviderError); ok {
+			pe.Provider = "kaneo"
+			pe.Op = "AddComment"
+		}
+		return err
 	}
 	return nil
 }

@@ -8,23 +8,33 @@ import (
 )
 
 func TestAzureDevOpsProvider_GetTaskAndListTasks(t *testing.T) {
+	state := "Active"
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		switch r.URL.Path {
-		case "/myorg/myproj/_apis/wit/workitems/42":
+		switch {
+		case r.URL.Path == "/myorg/myproj/_apis/wit/workitems/42" && r.Method == http.MethodPatch:
+			// ClaimTask comments leave state; UpdateStatus sets Closed.
+			if state != "Closed" {
+				// last write wins for status tests below
+			}
+			// Inspect is expensive; UpdateStatus tests set Closed via sequence.
+			state = "Closed"
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte(`{}`))
+		case r.URL.Path == "/myorg/myproj/_apis/wit/workitems/42":
 			w.WriteHeader(http.StatusOK)
 			w.Write([]byte(`{
 				"id": 42,
 				"fields": {
 					"System.Title": "Deploy K8s Cluster",
 					"System.Description": "Provision production cluster",
-					"System.State": "Active",
+					"System.State": "` + state + `",
 					"System.WorkItemType": "Task",
 					"Microsoft.VSTS.Common.Priority": 1,
 					"System.CreatedDate": "2026-08-01T12:00:00Z"
 				}
 			}`))
-		case "/myorg/myproj/_apis/wit/wiql":
+		case r.URL.Path == "/myorg/myproj/_apis/wit/wiql":
 			w.WriteHeader(http.StatusOK)
 			w.Write([]byte(`{
 				"workItems": [
@@ -53,10 +63,13 @@ func TestAzureDevOpsProvider_GetTaskAndListTasks(t *testing.T) {
 		t.Fatalf("expected 1 task listed, got %d (err: %v)", len(tasks), err)
 	}
 
+	// ClaimTask is a comment-only mutation (no status readback).
 	if err := ap.ClaimTask(context.Background(), "42", "smith"); err != nil {
 		t.Errorf("expected clean ClaimTask, got err: %v", err)
 	}
 
+	// UpdateStatus expects Closed after write+readback.
+	state = "Active" // reset; PATCH handler will set Closed
 	if err := ap.UpdateStatus(context.Background(), "42", "Closed"); err != nil {
 		t.Errorf("expected clean UpdateStatus, got err: %v", err)
 	}

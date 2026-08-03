@@ -42,12 +42,7 @@ func (m *MemoryProvider) ListTasks(ctx context.Context, projectID string, status
 }
 
 func (m *MemoryProvider) ClaimTask(ctx context.Context, taskID string, role string) error {
-	t, ok := m.tasks[taskID]
-	if !ok {
-		return fmt.Errorf("task not found: %s", taskID)
-	}
-	t.Status = "in-progress"
-	return nil
+	return m.UpdateStatus(ctx, taskID, StatusInProgress)
 }
 
 func (m *MemoryProvider) UpdateStatus(ctx context.Context, taskID string, status string) error {
@@ -55,8 +50,14 @@ func (m *MemoryProvider) UpdateStatus(ctx context.Context, taskID string, status
 	if !ok {
 		return fmt.Errorf("task not found: %s", taskID)
 	}
-	t.Status = status
-	return nil
+	canonical := NormalizeStatus(status)
+	t.Status = canonical
+	// In-memory readback: re-load and verify (fail if map drift / missing).
+	got, err := m.GetTask(ctx, taskID)
+	if err != nil {
+		return fmt.Errorf("memory status readback after write: %w", err)
+	}
+	return VerifyStatusReadback(taskID, canonical, got.Status)
 }
 
 func (m *MemoryProvider) AddComment(ctx context.Context, taskID string, body string) error {

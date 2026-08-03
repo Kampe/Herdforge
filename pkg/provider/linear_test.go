@@ -121,10 +121,18 @@ func TestLinearProvider_ListTasks(t *testing.T) {
 }
 
 func TestLinearProvider_UpdateStatus(t *testing.T) {
+	n := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(`{"data": {"issueUpdate": {"success": true}}}`))
+		n++
+		if n == 1 {
+			// mutation
+			w.Write([]byte(`{"data": {"issueUpdate": {"success": true}}}`))
+			return
+		}
+		// readback GetTask
+		w.Write([]byte(`{"data":{"issue":{"id":"lin-1","identifier":"LIN-1","title":"t","description":"","priority":2,"state":{"name":"In Progress"},"project":{"id":"p1"},"labels":{"nodes":[]}}}}`))
 	}))
 	defer server.Close()
 
@@ -158,14 +166,20 @@ func TestLinearProvider_AddComment(t *testing.T) {
 
 func TestLinearProvider_ClaimTask(t *testing.T) {
 	var capturedBody string
+	n := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		// capture request body to verify it contains "In Progress"
-		buf := make([]byte, r.ContentLength)
-		r.Body.Read(buf)
-		capturedBody = string(buf)
+		n++
+		if n == 1 {
+			buf := make([]byte, r.ContentLength)
+			r.Body.Read(buf)
+			capturedBody = string(buf)
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte(`{"data": {"issueUpdate": {"success": true}}}`))
+			return
+		}
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(`{"data": {"issueUpdate": {"success": true}}}`))
+		w.Write([]byte(`{"data":{"issue":{"id":"lin-1","identifier":"LIN-1","title":"t","description":"","priority":2,"state":{"name":"In Progress"},"project":{"id":"p1"},"labels":{"nodes":[]}}}}`))
 	}))
 	defer server.Close()
 

@@ -81,8 +81,18 @@ func (j *JiraProvider) doRequest(ctx context.Context, method, urlPath string, bo
 		return nil, err
 	}
 
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("jira API error HTTP %d: %s", resp.StatusCode, string(respData))
+	// Fail-closed: non-2xx and 2xx bodies carrying structured error payloads.
+	if err := DecodeJSONBytes(resp.StatusCode, respData, nil); err != nil {
+		if pe, ok := err.(*ProviderError); ok {
+			pe.Provider = "jira"
+			if pe.Message == fmt.Sprintf("HTTP %d", resp.StatusCode) || pe.Body == "" {
+				// Preserve body snippet for non-JSON error pages.
+				if pe.Body == "" {
+					pe.Body = truncate(string(respData), 256)
+				}
+			}
+		}
+		return nil, err
 	}
 
 	return respData, nil
@@ -95,7 +105,7 @@ func (j *JiraProvider) mapJiraToTask(issue *jiraIssueDTO) *Task {
 		issue.Key,
 		issue.Fields.Summary,
 		issue.Fields.Description,
-		issue.Fields.Status.Name,
+		NormalizeStatus(issue.Fields.Status.Name),
 		p,
 		issue.Fields.Project.Key,
 		issue.Fields.Labels,
@@ -147,6 +157,7 @@ func (j *JiraProvider) ClaimTask(ctx context.Context, taskID string, role string
 }
 
 func (j *JiraProvider) UpdateStatus(ctx context.Context, taskID string, status string) error {
+	canonical := NormalizeStatus(status)
 	payload := map[string]interface{}{
 		"transition": map[string]string{
 			"name": status,
@@ -156,7 +167,11 @@ func (j *JiraProvider) UpdateStatus(ctx context.Context, taskID string, status s
 	if err != nil {
 		return fmt.Errorf("jira UpdateStatus failed: %w", err)
 	}
-	return nil
+	got, gerr := j.GetTask(ctx, taskID)
+	if gerr != nil {
+		return fmt.Errorf("jira status readback after write: %w", gerr)
+	}
+	return VerifyStatusReadback(taskID, canonical, got.Status)
 }
 
 func (j *JiraProvider) AddComment(ctx context.Context, taskID string, body string) error {

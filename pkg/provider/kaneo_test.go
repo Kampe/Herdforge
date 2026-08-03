@@ -73,13 +73,25 @@ func TestKaneoProvider_GetTask_NotFound(t *testing.T) {
 }
 
 func TestKaneoProvider_UpdateStatus(t *testing.T) {
+	status := "to-do"
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPatch || r.URL.Path != "/api/task/task-123" {
-			t.Errorf("unexpected method or path: %s %s", r.Method, r.URL.Path)
+		if r.URL.Path != "/api/task/task-123" {
+			t.Errorf("unexpected path: %s", r.URL.Path)
 			w.WriteHeader(http.StatusBadRequest)
 			return
 		}
-		w.WriteHeader(http.StatusOK)
+		switch r.Method {
+		case http.MethodPatch:
+			status = "in-progress"
+			w.WriteHeader(http.StatusOK)
+		case http.MethodGet:
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte(`{"id":"task-123","ref":"FAC-1","title":"t","status":"` + status + `","priority":"high","projectId":"proj-1","labels":[]}`))
+		default:
+			t.Errorf("unexpected method: %s", r.Method)
+			w.WriteHeader(http.StatusBadRequest)
+		}
 	}))
 	defer server.Close()
 
@@ -90,8 +102,19 @@ func TestKaneoProvider_UpdateStatus(t *testing.T) {
 }
 
 func TestKaneoProvider_UpdateStatus_NoContent(t *testing.T) {
+	status := "to-do"
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusNoContent)
+		switch r.Method {
+		case http.MethodPatch:
+			status = "done"
+			w.WriteHeader(http.StatusNoContent)
+		case http.MethodGet:
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte(`{"id":"task-123","ref":"FAC-1","title":"t","status":"` + status + `","priority":"high","projectId":"proj-1","labels":[]}`))
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
 	}))
 	defer server.Close()
 
@@ -198,13 +221,24 @@ func TestKaneoProvider_ListTasks_DefaultProjectID(t *testing.T) {
 }
 
 func TestKaneoProvider_ClaimTask(t *testing.T) {
+	status := "to-do"
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPatch || r.URL.Path != "/api/task/task-123" {
-			t.Errorf("unexpected method or path: %s %s", r.Method, r.URL.Path)
+		if r.URL.Path != "/api/task/task-123" {
+			t.Errorf("unexpected path: %s", r.URL.Path)
 			w.WriteHeader(http.StatusBadRequest)
 			return
 		}
-		w.WriteHeader(http.StatusOK)
+		switch r.Method {
+		case http.MethodPatch:
+			status = "in-progress"
+			w.WriteHeader(http.StatusOK)
+		case http.MethodGet:
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte(`{"id":"task-123","ref":"FAC-1","title":"t","status":"` + status + `","priority":"high","projectId":"proj-1","labels":[]}`))
+		default:
+			w.WriteHeader(http.StatusBadRequest)
+		}
 	}))
 	defer server.Close()
 

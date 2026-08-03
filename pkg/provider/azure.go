@@ -76,8 +76,15 @@ func (a *AzureDevOpsProvider) doRequest(ctx context.Context, method, urlPath str
 		return nil, err
 	}
 
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("azure DevOps API error HTTP %d: %s", resp.StatusCode, string(respData))
+	// Fail-closed: non-2xx and 2xx bodies carrying structured error payloads.
+	if err := DecodeJSONBytes(resp.StatusCode, respData, nil); err != nil {
+		if pe, ok := err.(*ProviderError); ok {
+			pe.Provider = "azure"
+			if pe.Body == "" {
+				pe.Body = truncate(string(respData), 256)
+			}
+		}
+		return nil, err
 	}
 
 	return respData, nil
@@ -102,7 +109,7 @@ func (a *AzureDevOpsProvider) mapAzureToTask(wi *azureWorkItemDTO) *Task {
 		ref,
 		wi.Fields.Title,
 		wi.Fields.Description,
-		wi.Fields.State,
+		NormalizeStatus(wi.Fields.State),
 		p,
 		a.Project,
 		[]string{wi.Fields.WorkItemType},
@@ -157,6 +164,7 @@ func (a *AzureDevOpsProvider) ClaimTask(ctx context.Context, taskID string, role
 }
 
 func (a *AzureDevOpsProvider) UpdateStatus(ctx context.Context, taskID string, status string) error {
+	canonical := NormalizeStatus(status)
 	patchBody := []map[string]interface{}{
 		{
 			"op":    "add",
@@ -168,7 +176,11 @@ func (a *AzureDevOpsProvider) UpdateStatus(ctx context.Context, taskID string, s
 	if err != nil {
 		return fmt.Errorf("azure UpdateStatus failed: %w", err)
 	}
-	return nil
+	got, gerr := a.GetTask(ctx, taskID)
+	if gerr != nil {
+		return fmt.Errorf("azure status readback after write: %w", gerr)
+	}
+	return VerifyStatusReadback(taskID, canonical, got.Status)
 }
 
 func (a *AzureDevOpsProvider) AddComment(ctx context.Context, taskID string, body string) error {
