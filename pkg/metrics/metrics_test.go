@@ -119,6 +119,82 @@ func TestDeadProviderCannotContradictHealthyProviderObservation(t *testing.T) {
 	}
 }
 
+func TestObservationSequenceFencesOlderHealthQueueSignalsAndSLO(t *testing.T) {
+	now := time.Date(2026, 8, 3, 12, 0, 0, 0, time.UTC)
+	exp := NewMetricsExporterWithPersistence(nil, func() time.Time { return now })
+	if err := exp.SetHealthObservation(completeDependencies(), now, 2); err != nil {
+		t.Fatal(err)
+	}
+	if err := exp.SetHealthObservation(completeDependencies(), now.Add(time.Minute), 1); err == nil {
+		t.Fatal("older health sequence was accepted")
+	}
+	if err := exp.SetQueuePressureObservation(QueuePressure{Depth: 2, Capacity: 3, Known: true}, now, 2); err != nil {
+		t.Fatal(err)
+	}
+	if err := exp.SetQueuePressureObservation(QueuePressure{Depth: 1, Capacity: 3, Known: true}, now.Add(time.Minute), 1); err == nil {
+		t.Fatal("older queue sequence was accepted")
+	}
+	signals := FleetSignals{StalledWork: 2, LastReconciliation: now, ObservedAt: now}
+	if err := exp.SetSignalsObservation(signals, 2); err != nil {
+		t.Fatal(err)
+	}
+	signals.StalledWork = 1
+	signals.ObservedAt = now.Add(-10 * time.Minute)
+	if err := exp.SetSignalsObservation(signals, 1); err == nil {
+		t.Fatal("older signal sequence was accepted")
+	}
+	if err := exp.RecordTransitionObservation(now, now.Add(time.Second), nil, now, 2); err != nil {
+		t.Fatal(err)
+	}
+	if err := exp.RecordTransitionObservation(now, now.Add(2*time.Second), nil, now.Add(time.Minute), 1); err == nil {
+		t.Fatal("older SLO sequence was accepted")
+	}
+	if got := exp.Signals().StalledWork; got != 2 {
+		t.Fatalf("older signal overwrote authority: %d", got)
+	}
+}
+
+func TestReadAtReevaluatesMinuteScaleFreshness(t *testing.T) {
+	base := time.Date(2026, 8, 3, 12, 0, 0, 0, time.UTC)
+	config := FreshnessConfig{HealthMaxAge: time.Minute, QueueMaxAge: time.Minute, SignalsMaxAge: time.Minute, SLOMaxAge: time.Minute}
+	exp := NewMetricsExporterWithConfig(nil, func() time.Time { return base }, config)
+	if err := exp.SetHealthAt(completeDependencies(), base); err != nil {
+		t.Fatal(err)
+	}
+	if err := exp.SetQueuePressureAt(QueuePressure{Depth: 1, Capacity: 2, Known: true}, base); err != nil {
+		t.Fatal(err)
+	}
+	if err := exp.SetSignals(FleetSignals{LastReconciliation: base, ObservedAt: base}); err != nil {
+		t.Fatal(err)
+	}
+	view := exp.ReadAt(base.Add(2 * time.Minute))
+	if view.Freshness.Ready || view.Freshness.HealthFresh || view.Freshness.QueueFresh || view.Freshness.SignalsFresh {
+		t.Fatalf("stale observations became healthy: %+v", view.Freshness)
+	}
+}
+
+func TestConditionCodesRemainDistinctAndEligibleIdleIsDerived(t *testing.T) {
+	now := time.Date(2026, 8, 3, 12, 0, 0, 0, time.UTC)
+	eligibleSince := now.Add(-10 * time.Second)
+	idle := FleetSignals{StalledWork: 1, DroppedCallbacks: 1, ReviewSaturation: 80, DeadProvider: true, IntegrationBacklog: 1, DeadLetters: 1, EligibleWaiting: 1, EligibleSince: eligibleSince, Backpressured: true, LastReconciliation: now, ObservedAt: now}
+	if err := idle.Validate(now, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	conditions := idle.ConditionCodes()
+	if len(conditions) != 6 || conditions[0] != ConditionStalledWork || conditions[1] != ConditionDroppedCallback || conditions[2] != ConditionReviewSaturation || conditions[3] != ConditionDeadProvider || conditions[4] != ConditionIntegrationBacklog || conditions[5] != ConditionDeadLetters {
+		t.Fatalf("condition codes collapsed or reordered: %v", conditions)
+	}
+	eligible := FleetSignals{EligibleWaiting: 1, EligibleSince: eligibleSince, EligibleIdle: 10 * time.Second, LastReconciliation: now, ObservedAt: now}
+	if got := eligible.ConditionCodes(); len(got) != 1 || got[0] != ConditionEligibleIdle {
+		t.Fatalf("eligible idle condition was not distinct: %v", got)
+	}
+	contradictory := eligible
+	contradictory.ReviewSaturation = 100
+	if err := contradictory.Validate(now, time.Minute); err == nil {
+		t.Fatal("eligible idle was accepted while saturated without backpressure")
+	}
+}
+
 func TestTransitionSLOUsesDeterministicClockAndSeparatesFailures(t *testing.T) {
 	start := time.Date(2026, 8, 3, 12, 0, 0, 0, time.UTC)
 	end := start.Add(250 * time.Millisecond)
@@ -174,7 +250,7 @@ func TestMetricsStateRestartRoundTripAndStaleRestore(t *testing.T) {
 	if err := exp.SetQueuePressureAt(QueuePressure{Depth: 2, Capacity: 10, Known: true}, now); err != nil {
 		t.Fatal(err)
 	}
-	signals := FleetSignals{StalledWork: 3, DroppedCallbacks: 2, ReviewSaturation: 75, IntegrationBacklog: 4, Retries: 5, DeadLetters: 1, MaxLeaseAge: time.Minute, MaxCallbackAge: 2 * time.Minute, EligibleIdle: 3 * time.Minute, LastReconciliation: now, ObservedAt: now}
+	signals := FleetSignals{StalledWork: 3, DroppedCallbacks: 2, ReviewSaturation: 75, IntegrationBacklog: 4, Retries: 5, DeadLetters: 1, MaxLeaseAge: time.Minute, MaxCallbackAge: 2 * time.Minute, EligibleWaiting: 1, EligibleSince: now, Backpressured: true, LastReconciliation: now, ObservedAt: now}
 	if err := exp.SetSignals(signals); err != nil {
 		t.Fatal(err)
 	}
@@ -187,6 +263,31 @@ func TestMetricsStateRestartRoundTripAndStaleRestore(t *testing.T) {
 	if err := json.Unmarshal(store.payload, &persisted); err != nil || persisted.Version != 1 {
 		t.Fatalf("invalid persisted schema: err=%v state=%+v", err, persisted)
 	}
+	for name, mutate := range map[string]func(*persistedState){
+		"negative latency":    func(state *persistedState) { state.SLO.TotalLatency = -time.Second },
+		"oversized latency":   func(state *persistedState) { state.SLO.TotalLatency = maxSignalAge + time.Nanosecond },
+		"inconsistent totals": func(state *persistedState) { state.SLO.Failed++ },
+		"torn readiness":      func(state *persistedState) { state.Health.Readiness = !state.Health.Readiness },
+	} {
+		t.Run(name, func(t *testing.T) {
+			candidate := persisted
+			mutate(&candidate)
+			payload, err := json.Marshal(candidate)
+			if err != nil {
+				t.Fatal(err)
+			}
+			store.payload = payload
+			invalid := NewMetricsExporterWithPersistence(store, func() time.Time { return now })
+			if err := invalid.Restore(context.Background()); err == nil {
+				t.Fatal("invalid persisted state was accepted")
+			}
+		})
+	}
+	payload, err := json.Marshal(persisted)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.payload = payload
 	restored := NewMetricsExporterWithPersistence(store, func() time.Time { return now })
 	if err := restored.Restore(context.Background()); err != nil {
 		t.Fatal(err)
@@ -244,7 +345,10 @@ func TestMetricsHandlerUsesBoundedLabelsAndSafeGauges(t *testing.T) {
 	now := time.Unix(12, 0)
 	exp = NewMetricsExporterWithPersistence(nil, func() time.Time { return now })
 	exp.RecordTransition(time.Unix(10, 0), time.Unix(11, 0), errors.New("git unavailable"), now)
-	if err := exp.SetSignals(FleetSignals{StalledWork: 2, DroppedCallbacks: 1, ReviewSaturation: 50, DeadProvider: true, IntegrationBacklog: 3, Retries: 4, DeadLetters: 1, MaxLeaseAge: time.Second, MaxCallbackAge: 2 * time.Second, EligibleIdle: 3 * time.Second, LastReconciliation: now, ObservedAt: now}); err != nil {
+	if err := exp.SetQueuePressureAt(QueuePressure{Depth: 2, Capacity: 3, Known: true}, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := exp.SetSignals(FleetSignals{StalledWork: 2, DroppedCallbacks: 1, ReviewSaturation: 50, DeadProvider: true, IntegrationBacklog: 3, Retries: 4, DeadLetters: 1, MaxLeaseAge: time.Second, MaxCallbackAge: 2 * time.Second, EligibleWaiting: 1, EligibleSince: now, Backpressured: true, LastReconciliation: now, ObservedAt: now}); err != nil {
 		t.Fatal(err)
 	}
 	w := httptest.NewRecorder()
@@ -255,12 +359,15 @@ func TestMetricsHandlerUsesBoundedLabelsAndSafeGauges(t *testing.T) {
 			t.Fatalf("metrics contains unbounded or raw-error label %q:\n%s", forbidden, body)
 		}
 	}
-	if !strings.Contains(body, "herd_readiness_ready 0") || !strings.Contains(body, "herd_queue_pressure_known 0") || !strings.Contains(body, `herd_transitions_total{outcome="failed"} 1`) {
+	if !strings.Contains(body, "herd_readiness_ready 0") || !strings.Contains(body, "herd_queue_pressure_known 1") || !strings.Contains(body, `herd_transitions_total{outcome="failed"} 1`) {
 		t.Fatalf("metrics lost safe health/SLO signals:\n%s", body)
 	}
-	for _, expected := range []string{"herd_stalled_work_total 2", "herd_dropped_callbacks_total 1", "herd_review_saturation_ratio 0.50", "herd_dead_provider 1", "herd_integration_backlog 3", "herd_retries_total 4", "herd_dead_letters_total 1", "herd_eligible_idle_seconds 3.000000"} {
+	for _, expected := range []string{"# TYPE herd_stalled_work gauge", "herd_stalled_work 2", "# TYPE herd_dropped_callbacks gauge", "herd_dropped_callbacks 1", "herd_review_saturation_ratio 0.50", "herd_dead_provider 1", "herd_integration_backlog 3", "herd_retries 4", "herd_dead_letters 1", "herd_eligible_idle_seconds 0.000000", "herd_queue_depth 2", "herd_queue_capacity 3"} {
 		if !strings.Contains(body, expected) {
 			t.Fatalf("metrics missing bounded signal %q:\n%s", expected, body)
 		}
+	}
+	if strings.Contains(body, "herd_transition_latency_seconds") {
+		t.Fatalf("failed transitions must not export completed latency: %s", body)
 	}
 }
