@@ -2,6 +2,35 @@
 // provider tasks: at most one owner can hold an active lease per
 // (repo, provider, project, task_ref) at a time, even across restarts and
 // concurrent Herdforge processes on the same box.
+//
+// # Verified scope (FAC-120) vs. residual (FAC-147)
+//
+// Everything in this package -- Acquire/Renew/Release/Hold/ExpireStale,
+// the capacity-release delivery protocol, and the provider-transition
+// safety design (ProviderCAS's fencing-token contract, AdvanceFence,
+// DurableOutbox, BeginProviderTransition/CompleteProviderTransition/
+// ReconcileProviderTransitions, and the store-level provider-lock
+// exclusion that makes fence-advance a durable prerequisite for reclaim)
+// -- is real, adversarially tested against deterministic race and
+// crash-recovery scenarios, and safe to depend on as an internal
+// package. fakeProviderCAS (test-only) proves the ProviderCAS contract
+// is sound and enforceable end to end.
+//
+// What this package does NOT provide, and what no code outside pkg/claim
+// currently calls WithProviderCAS/AdvanceFence/BeginProviderTransition/
+// CompleteProviderTransition to obtain: a concrete ProviderCAS
+// implementation against a real provider (Kaneo, GitHub, etc.), and its
+// wiring into cmd/herd's production mutation paths (dispatch, review,
+// approve, board-sync). Those paths call pkg/provider's TaskProvider
+// interface directly today, with no revision-based CAS and no
+// generation-fencing-token enforcement -- a real Kaneo card cannot yet
+// be protected by anything this package builds. That is deliberately
+// out of scope for FAC-120 (whose worktree was restricted from cmd/herd
+// and pkg/lifecycle to avoid colliding with FAC-119, the durable
+// lifecycle/event-log/outbox epic this is designed as the claim
+// component of) and is tracked as FAC-147, blocked on both FAC-119 (the
+// intended home for the mutation call sites) and this package (which
+// supplies the contract FAC-147 implements against).
 package claim
 
 import (
