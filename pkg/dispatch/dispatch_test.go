@@ -155,6 +155,19 @@ func TestFindTicket(t *testing.T) {
 	}
 }
 
+func TestDispatchRejectsMissingDecisionBeforeAnyProviderOrWorktreeMutation(t *testing.T) {
+	t.Setenv("HERD_LAUNCH_RECEIPTS", filepath.Join(t.TempDir(), "receipts.jsonl"))
+	tp := &mockTaskProvider{tasks: []*provider.Task{{ID: "1", Ref: "FAC-175"}}}
+	mw := &mockWorktree{err: fmt.Errorf("must not be called")}
+	d := &Dispatcher{Config: &config.Config{TaskProvider: config.TaskProvider{ProjectID: "p"}, Lanes: []config.LaneDef{{Name: "worker"}}}, TaskProvider: tp, Worktree: mw, Compensator: &recordingCompensator{}}
+	if _, err := d.Dispatch(context.Background(), DispatchOptions{TicketRef: "FAC-175"}); err == nil {
+		t.Fatal("missing routed decision must fail closed")
+	}
+	if mw.calls != 0 {
+		t.Fatalf("rejected launch created worktree: %d", mw.calls)
+	}
+}
+
 func TestSlugForTask(t *testing.T) {
 	cases := []struct {
 		ref   string
@@ -378,11 +391,11 @@ func TestDispatch_PackageCwdNotPolluted(t *testing.T) {
 }
 
 type ambientSnap struct {
-	worktreeList string
-	branchFac1   bool
-	anchorFac1   bool
+	worktreeList  string
+	branchFac1    bool
+	anchorFac1    bool
 	pkgHerdExists bool
-	dirty        string
+	dirty         string
 }
 
 func snapshotAmbientGit(t *testing.T, ambientRoot, pkgDir string) ambientSnap {

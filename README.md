@@ -151,6 +151,10 @@ Do not treat the model on a lane as permanent identity. Routing must distinguish
 - model family used for review independence;
 - tool and write capability proven by probes.
 
+### Worker launch policy (FAC-175)
+
+Every implementation, repair, and recovery worker launch must carry one complete routed decision: role, task shape, provider, model, effort, provenance, and argv. The compiled launch boundary accepts only `codex --model gpt-5.6-luna -c model_reasoning_effort=medium -a never` for worker/forge-smith/recovery roles. Bare launches, coordinator shapes, `gpt-5.6-sol`, `claude-fable-5`, missing effort, and missing provenance fail before tab/process/prompt or board/worktree mutation. Rejections are recorded in the repo-relative `.herd/launch-receipts.jsonl` (override with `HERD_LAUNCH_RECEIPTS`).
+
 Run `herd init --full` to generate a schema-compatible starting point, then review it against the checked-out binary with `herd validate-config`.
 
 ## Safety invariants

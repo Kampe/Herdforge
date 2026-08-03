@@ -3,10 +3,13 @@ package herdr
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os/exec"
 	"strings"
 	"time"
+
+	"github.com/Kampe/Herdforge/pkg/launch"
 )
 
 const (
@@ -125,6 +128,69 @@ func TabCreateForTask(workspaceID, label, cwd string, noFocus bool) (*TabInfo, e
 // Newly created tabs may need a brief moment before the pane shell is ready;
 // we sleep and retry once if herdr reports agent_pane_busy.
 func AgentStart(name, kind string, paneID string, agentArgs ...string) error {
+	// Raw starts are the incident path. There is no trustworthy role, shape,
+	// provider, effort, or decision provenance in this API, so it can never
+	// create a process. The failed receipt records the attempted raw request.
+	return launch.Validate(launch.Request{}, nil)
+}
+
+// AgentStartWithDecision is the direct Herdr adapter. Validation happens
+// before the process API is invoked, including for recovery/rescue callers.
+func AgentStartWithDecision(name, kind, paneID string, req launch.Request) error {
+	req.Name, req.PaneID = name, paneID
+	if err := launch.Validate(req, nil); err != nil {
+		return err
+	}
+	if req.Decision == nil || strings.TrimSpace(kind) != strings.TrimSpace(req.Decision.Provider) {
+		return launch.RecordRejected(req, nil, fmt.Sprintf("herdr kind %q does not match decision provider", kind))
+	}
+	if req.Decision == nil || len(req.Decision.Argv) == 0 {
+		return fmt.Errorf("launch decision argv is empty")
+	}
+	if err := agentStartProcess(name, kind, paneID, req.Decision.Argv[1:]...); err != nil {
+		_ = launch.RecordRejected(req, nil, err.Error())
+		return err
+	}
+	if err := launch.RecordStarted(req, nil); err != nil {
+		cleanupErr := compensateStartedProcess(name)
+		if cleanupErr != nil {
+			return fmt.Errorf("launch receipt failed: %w; compensating unaccounted process failed: %v", err, cleanupErr)
+		}
+		return fmt.Errorf("launch receipt failed: %w; process stopped", err)
+	}
+	return nil
+}
+
+func compensateStartedProcess(name string) error {
+	agents, err := AgentList()
+	if err != nil {
+		return err
+	}
+	for _, a := range agents {
+		if a.Name != name {
+			continue
+		}
+		if a.TabID == "" {
+			return fmt.Errorf("cannot compensate launch %q: missing tab id", name)
+		}
+		if err := TabClose(a.TabID); err != nil {
+			return err
+		}
+		remaining, err := AgentList()
+		if err != nil {
+			return fmt.Errorf("verify compensated launch %q: %w", name, err)
+		}
+		for _, live := range remaining {
+			if live.Name == name {
+				return fmt.Errorf("compensated launch %q remains present", name)
+			}
+		}
+		return nil
+	}
+	return fmt.Errorf("cannot compensate launch %q: %w", name, ErrAgentNotFound)
+}
+
+func agentStartProcess(name, kind, paneID string, agentArgs ...string) error {
 	// small delay to let the pane shell initialize
 	time.Sleep(500 * time.Millisecond)
 
@@ -205,6 +271,11 @@ type AgentEntry struct {
 	Workspace string `json:"workspace_id,omitempty"`
 }
 
+var (
+	ErrAgentNotFound         = errors.New("herdr agent not found")
+	ErrAgentIdentityMismatch = errors.New("herdr agent identity mismatch")
+)
+
 // ResolveAgentTab finds a standing agent by name and returns its tab label.
 // Returns an error if no agent with that name exists.
 func ResolveAgentTab(name string) (string, error) {
@@ -217,7 +288,38 @@ func ResolveAgentTab(name string) (string, error) {
 			return name, nil
 		}
 	}
-	return "", fmt.Errorf("no standing agent named '%s' found", name)
+	return "", fmt.Errorf("no standing agent named '%s' found: %w", name, ErrAgentNotFound)
+}
+
+// ResolveAgentTabWithDecision is the standing/resume trust boundary. A newly
+// computed route never proves an existing process: herdr must report the same
+// durable role, task identity, lease, provider, model, effort, and shape.
+func ResolveAgentTabWithDecision(name string, req launch.Request, leaseGeneration int64) (string, error) {
+	if err := launch.Validate(req, nil); err != nil {
+		return "", err
+	}
+	if req.Decision == nil {
+		return "", fmt.Errorf("resume requires a routed decision")
+	}
+	agents, err := AgentList()
+	if err != nil {
+		return "", err
+	}
+	for _, a := range agents {
+		if a.Name != name {
+			continue
+		}
+		req.Name, req.PaneID, req.LeaseGeneration = name, a.PaneID, leaseGeneration
+		ok, err := launch.HasStarted(req)
+		if err != nil {
+			return "", fmt.Errorf("resume lifecycle lookup: %w", err)
+		}
+		if !ok {
+			return "", fmt.Errorf("standing agent %q has no matching durable launch identity: %w", name, ErrAgentIdentityMismatch)
+		}
+		return name, nil
+	}
+	return "", fmt.Errorf("no standing agent named '%s' found: %w", name, ErrAgentNotFound)
 }
 
 // EnsureHerdforgeLabel prefixes the label with "Herdforge · " if it does not

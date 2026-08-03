@@ -165,6 +165,8 @@ type LaneDef struct {
 	Worktree  string `yaml:"worktree,omitempty"`
 	Provider  string `yaml:"provider,omitempty"`
 	Model     string `yaml:"model,omitempty"`
+	Effort    string `yaml:"effort,omitempty"`
+	TaskShape string `yaml:"task_shape,omitempty"`
 	// FallbackModels are tried in order when Model probes unavailable
 	// (quota exhausted / no payment method). The first that probes healthy
 	// launches the lane, so a spent surface fails over instead of silently

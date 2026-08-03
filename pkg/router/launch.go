@@ -1,6 +1,8 @@
 package router
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"sort"
@@ -15,10 +17,17 @@ import (
 type Role string
 
 const (
-	RoleWorker     Role = "worker"
-	RoleReviewer   Role = "reviewer"
-	RoleForgeSmith Role = "forge-smith"
-	RoleAssayer    Role = "assayer"
+	RoleWorker           Role = "worker"
+	RoleReviewer         Role = "reviewer"
+	RoleForgeSmith       Role = "forge-smith"
+	RoleAssayer          Role = "assayer"
+	RoleRecovery         Role = "recovery"
+	RoleOrchestrator     Role = "orchestrator"
+	RoleScoutPlanner     Role = "scout-planner"
+	RoleVerificationGate Role = "verification-gate"
+	RoleReviewSupervisor Role = "review-supervisor"
+	RoleHarvest          Role = "harvest"
+	RoleRecoverySentinel Role = "recovery-sentinel"
 )
 
 // CapabilityTier is the coarse model capability class used for coherence
@@ -51,6 +60,7 @@ type LaunchRequest struct {
 	// coherence. If AuthorModel is set, CapabilityOf(AuthorModel) wins.
 	AuthorModel      string
 	AuthorCapability CapabilityTier
+	CandidateSHA     string
 	// FinalPass marks final verification of a candidate SHA.
 	FinalPass bool
 	// Critical marks security, concurrency, auth, infrastructure, or
@@ -63,6 +73,10 @@ type LaunchRequest struct {
 	RiskChanged bool
 	// RequestedProvider pins a single provider (tests / operator override).
 	RequestedProvider string
+	// RequestedModel pins the configured model when a lane policy requires it.
+	RequestedModel  string
+	TaskRef         string
+	LeaseGeneration int64
 	// ExcludedFamily is an extra family filter (reviewers also exclude AuthorFamily).
 	ExcludedFamily string
 	// ProbeResults maps ProbeKey(provider, model) → PASS. Missing keys for
@@ -83,6 +97,8 @@ type LaunchDecision struct {
 	Effort          string         `json:"effort"`
 	Pool            string         `json:"quota_pool"`
 	Role            Role           `json:"role"`
+	Shape           string         `json:"task_shape"`
+	CandidateSHA    string         `json:"candidate_sha,omitempty"`
 	Risk            classify.Tier  `json:"risk,omitempty"`
 	Family          string         `json:"family"`
 	CapabilityTier  CapabilityTier `json:"capability_tier"`
@@ -94,6 +110,39 @@ type LaunchDecision struct {
 	Score           int            `json:"score"`
 	LazerLastResort bool           `json:"lazer_last_resort"`
 	Argv            []string       `json:"argv,omitempty"`
+	TaskRef         string         `json:"task_ref,omitempty"`
+	LeaseGeneration int64          `json:"lease_generation,omitempty"`
+	Proof           string         `json:"proof"`
+}
+
+const decisionProofKey = "herdforge-fac-175-launch-decision-v1"
+
+func decisionProof(d LaunchDecision) string {
+	norm := func(v string) string {
+		v = strings.ToLower(strings.TrimSpace(v))
+		for _, prefix := range []string{"codex/", "openai/", "litellm/codex/", "litellm/openai/"} {
+			v = strings.TrimPrefix(v, prefix)
+		}
+		return v
+	}
+	canonical := fmt.Sprintf("%s|%s|%s|%s|%s|%s|%s|%d|%s|%s|%s|%s", decisionProofKey, norm(string(d.Role)), norm(d.Shape), norm(d.Provider), norm(d.Model), norm(d.Effort), d.CandidateSHA, d.LeaseGeneration, d.TaskRef, d.ProbeKey, d.Rationale, strings.Join(d.Argv, "\x00"))
+	sum := sha256.Sum256([]byte(canonical))
+	return "sha256:" + hex.EncodeToString(sum[:])
+}
+
+// VerifyDecision proves that Decide issued the decision and that its signed
+// canonical fields have not been edited.
+func VerifyDecision(d *LaunchDecision, taskRef string, leaseGeneration int64) error {
+	if d == nil || d.Proof == "" {
+		return fmt.Errorf("missing router-issued launch proof")
+	}
+	if d.TaskRef != "" && (d.TaskRef != taskRef || d.LeaseGeneration != leaseGeneration) {
+		return fmt.Errorf("launch proof task/lease context mismatch")
+	}
+	if decisionProof(*d) != d.Proof {
+		return fmt.Errorf("launch decision proof mismatch")
+	}
+	return nil
 }
 
 // ProbeKey returns the stable probe identity for a provider/model tuple.
@@ -201,6 +250,11 @@ func EffortForRequest(req LaunchRequest) string {
 	switch req.Role {
 	case RoleReviewer, RoleAssayer:
 		return reviewerEffort(req)
+	case RoleWorker, RoleForgeSmith, RoleRecovery:
+		if req.Shape == "" || req.Shape == "implementation" {
+			return "medium"
+		}
+		return EffortFor(req.Shape)
 	default:
 		shape := req.Shape
 		if shape == "" {
@@ -242,8 +296,10 @@ func defaultShapeForRole(role Role) string {
 		return "qa"
 	case RoleForgeSmith:
 		return "implementation"
-	default:
+	case RoleWorker, RoleRecovery:
 		return "implementation"
+	default:
+		return "coordinator"
 	}
 }
 
@@ -389,6 +445,9 @@ func (r *SurfaceRouter) Decide(req LaunchRequest) (*LaunchDecision, error) {
 
 	for pref, provider := range candidates {
 		model := ModelFor(provider, shape)
+		if req.RequestedModel != "" {
+			model = req.RequestedModel
+		}
 		// Spark / AGY fallbacks reuse Pick's available() + overrides.
 		family := FamilyFor(provider, model)
 		pool := QuotaPoolFor(provider, model)
@@ -590,12 +649,14 @@ func (r *SurfaceRouter) Decide(req LaunchRequest) (*LaunchDecision, error) {
 		rationale = "no-claude; " + rationale
 	}
 
-	return &LaunchDecision{
+	d := &LaunchDecision{
 		Provider:        best.provider,
 		Model:           model,
 		Effort:          effort,
 		Pool:            best.pool,
 		Role:            req.Role,
+		Shape:           shape,
+		CandidateSHA:    req.CandidateSHA,
 		Risk:            req.Risk,
 		Family:          best.family,
 		CapabilityTier:  best.cap,
@@ -607,7 +668,10 @@ func (r *SurfaceRouter) Decide(req LaunchRequest) (*LaunchDecision, error) {
 		Score:           best.rank,
 		LazerLastResort: best.provider == "lazer",
 		Argv:            ArgvFor(best.provider, model, effort),
-	}, nil
+		TaskRef:         req.TaskRef, LeaseGeneration: req.LeaseGeneration,
+	}
+	d.Proof = decisionProof(*d)
+	return d, nil
 }
 
 // candidateProviders mirrors Pick's candidate construction.

@@ -128,6 +128,11 @@
       "role": "forge-smith",
       "route_shape": "implementation",
       "risk_class": "deep-reasoning",
+      "agent_kind": "codex",
+      "provider": "codex",
+      "model": "gpt-5.6-luna",
+      "effort": "medium",
+      "task_shape": "implementation",
       "prefer": null,
       "standing": false
     },
@@ -137,6 +142,11 @@
       "role": "worker",
       "route_shape": "implementation",
       "risk_class": "standard",
+      "agent_kind": "codex",
+      "provider": "codex",
+      "model": "gpt-5.6-luna",
+      "effort": "medium",
+      "task_shape": "implementation",
       "prefer": null,
       "standing": false
     },
@@ -148,6 +158,11 @@
       "risk_class": "standard",
       "prefer": "claude",
       "prefer_model": "claude-sonnet-5",
+      "agent_kind": "claude",
+      "provider": "claude",
+      "model": "claude-sonnet-5",
+      "effort": "medium",
+      "task_shape": "qa",
       "standing": false
     },
     {
@@ -157,6 +172,11 @@
       "route_shape": "coordinator",
       "risk_class": "orchestrator",
       "prefer": null,
+      "agent_kind": "claude",
+      "provider": "claude",
+      "model": "claude-opus-5",
+      "effort": "medium",
+      "task_shape": "coordinator",
       "standing": true
     },
     {
@@ -166,6 +186,11 @@
       "route_shape": "architecture",
       "risk_class": "deep-reasoning",
       "prefer": null,
+      "agent_kind": "claude",
+      "provider": "claude",
+      "model": "claude-opus-5",
+      "effort": "medium",
+      "task_shape": "architecture",
       "standing": true
     },
     {
@@ -175,6 +200,11 @@
       "route_shape": "bounded",
       "risk_class": "standard",
       "prefer": null,
+      "agent_kind": "opencode",
+      "provider": "opencode",
+      "model": "opencode/kimi-k3",
+      "effort": "medium",
+      "task_shape": "bounded",
       "standing": false
     },
     {
@@ -185,6 +215,11 @@
       "risk_class": "standard",
       "prefer": "claude",
       "prefer_model": "claude-sonnet-5",
+      "agent_kind": "claude",
+      "provider": "claude",
+      "model": "claude-sonnet-5",
+      "effort": "medium",
+      "task_shape": "coordinator",
       "standing": true
     },
     {
@@ -195,6 +230,11 @@
       "risk_class": "standard",
       "prefer": "claude",
       "prefer_model": "claude-sonnet-5",
+      "agent_kind": "claude",
+      "provider": "claude",
+      "model": "claude-sonnet-5",
+      "effort": "medium",
+      "task_shape": "bounded",
       "standing": true
     },
     {
@@ -204,6 +244,11 @@
       "route_shape": "bounded",
       "risk_class": "standard",
       "prefer": null,
+      "agent_kind": "claude",
+      "provider": "claude",
+      "model": "claude-sonnet-5",
+      "effort": "medium",
+      "task_shape": "bounded",
       "standing": true
     }
   ]
