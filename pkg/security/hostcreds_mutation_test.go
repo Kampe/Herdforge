@@ -2,6 +2,7 @@ package security
 
 import (
 	"net"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -190,5 +191,93 @@ func TestMutation_HelperProbeNotAdmission(t *testing.T) {
 	}
 	if _, err := ProveAllowlistedHostViaWorker(sess.Mitm, "api.x.ai", "evil", sess.ID, "n"); err == nil {
 		t.Fatal("MUTATION: ProveAllowlistedHostViaWorker admitted")
+	}
+}
+
+// RecordHarnessPrompt must not open a PID peer grant (two-process / ephemeral
+// dial bypass of one-shot port).
+func TestMutation_RecordHarnessPromptNoPIDPeer(t *testing.T) {
+	v := NewTestCredentialVault()
+	_ = v.InstallTestSecret("api.x.ai", "Bearer x")
+	sess, err := StartHostCredsSession(SessionConfig{Kind: "grok", SessionID: "m-rhp", Authority: v})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sess.Close()
+	if err := sess.RecordHarnessPrompt("prompt", os.Getpid()); err != nil {
+		t.Fatal(err)
+	}
+	// This process dials without one-shot port — must 403 even though we
+	// recorded our own PID (AllowPID must not have been called).
+	c, err := net.DialTimeout("tcp", sess.Mitm.Addr(), 2*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	_, _ = c.Write([]byte("CONNECT api.x.ai:443 HTTP/1.1\r\nHost: api.x.ai:443\r\n\r\n"))
+	buf := make([]byte, 128)
+	n, _ := c.Read(buf)
+	if !strings.Contains(string(buf[:n]), "403") {
+		t.Fatalf("MUTATION: RecordHarnessPrompt granted peer via PID: %q", string(buf[:n]))
+	}
+}
+
+// Two-process anti-pattern: helper after a no-op "author" must not satisfy
+// admission for that author peer port.
+func TestMutation_TwoProcessHelperNotCausal(t *testing.T) {
+	if testing.Short() {
+		t.Skip("subprocess")
+	}
+	v := NewTestCredentialVault()
+	_ = v.InstallTestSecret("api.x.ai", "Bearer x")
+	sess, err := StartHostCredsSession(SessionConfig{Kind: "grok", SessionID: "m-2p", Authority: v})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sess.Close()
+
+	// Claimed port for "author A" — keep FD so port stays exclusive; A never dials.
+	portA, fA, err := ClaimLocalPort()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fA.Close()
+	if err := sess.Mitm.AllowOneShotPeer(PeerGrant{
+		Port: portA, SessionID: sess.ID, CapabilityNonce: "nonce-a", AuthorPID: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Helper B does full causal with a DIFFERENT port (new claim FD inside probe).
+	saw, cleanup := installLocalOrigin(t, sess.Mitm, "api.x.ai", "Bearer x")
+	defer cleanup()
+	_ = saw
+	cap, err := NewCapability(sess.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, rcpt, err := sess.RunAuthorCausalProbe(cap.Nonce)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.PeerPort == portA {
+		t.Fatal("helper unexpectedly used author A port")
+	}
+	// Helper receipt cannot be consumed under author A's port/nonce.
+	if _, ok := sess.Mitm.ConsumeReceiptFor(sess.ID, "nonce-a", portA, ""); ok {
+		t.Fatal("MUTATION: helper receipt satisfied author A port")
+	}
+	if !rcpt.Consumed {
+		t.Fatal("expected helper receipt consumed")
+	}
+	if sess.Mitm.LastReceipt.PeerPort == portA && sess.Mitm.LastReceipt.InjectOK {
+		t.Fatal("MUTATION: receipt claimed for unused author A port")
+	}
+	// Author A grant must still be unconsumed (A never connected).
+	sess.Mitm.mu.Lock()
+	g := sess.Mitm.oneShot[portA]
+	sess.Mitm.mu.Unlock()
+	if g == nil || g.Consumed {
+		t.Fatal("MUTATION: author A one-shot grant lost/consumed by helper")
 	}
 }

@@ -217,8 +217,11 @@ func (s *HostCredsSession) RecordHarnessPrompt(prompt string, authorPID int) err
 	s.prompt = prompt
 	s.promptInArgv = true
 	s.authorPID = authorPID
+	// Do NOT AllowPID here. Peer attribution is one-shot claim FD only.
+	// Auto-AllowPID would let the author dial any ephemeral port on Linux
+	// (/proc peer), bypassing single-use port grants and Darwin fail-closed.
 	if s.Mitm != nil {
-		s.Mitm.AllowPID(authorPID)
+		s.Mitm.BindOneShotAuthorPID(authorPID)
 	}
 	return nil
 }
@@ -337,12 +340,10 @@ func (s *HostCredsSession) Restart() error {
 	if err != nil {
 		return err // old still running
 	}
-	// Swap then close old.
+	// Swap then close old. Do not re-AllowPID — peer grants must be re-issued
+	// as one-shot ports for the next author connection.
 	s.mu.Lock()
 	s.Mitm = newMitm
-	if s.authorPID > 0 {
-		newMitm.AllowPID(s.authorPID)
-	}
 	s.mu.Unlock()
 	if oldMitm != nil {
 		_ = oldMitm.Close()
