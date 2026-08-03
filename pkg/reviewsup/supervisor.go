@@ -241,14 +241,18 @@ func readRows(path string) ([]Row, error) {
 	defer f.Close()
 	var rows []Row
 	sc := bufio.NewScanner(f)
+	lineNo := 0
 	for sc.Scan() {
+		lineNo++
 		line := strings.TrimSpace(sc.Text())
 		if line == "" {
 			continue
 		}
 		var r Row
 		if err := json.Unmarshal([]byte(line), &r); err != nil {
-			continue
+			// Fail closed: a corrupted evidence file must surface as a hard
+			// error, never silently drop replayable events.
+			return nil, fmt.Errorf("read rows %s: malformed JSON at line %d: %w", path, lineNo, err)
 		}
 		rows = append(rows, r)
 	}
@@ -803,12 +807,14 @@ func (sv *ReviewSupervisor) Reconstruct() (int, error) {
 	}
 
 	qrows, err := readRows(sv.cfg.QueuePath)
-	if err == nil {
-		for _, r := range qrows {
-			if r.Event == string(EventHarvest) && r.Harvested {
-				if cand, ok := sv.cands[r.SHA]; ok {
-					cand.State = StateHarvested
-				}
+	if err != nil {
+		// Fail closed: an unreadable evidence queue hides harvest state.
+		return 0, fmt.Errorf("reviewsup: read queue: %w", err)
+	}
+	for _, r := range qrows {
+		if r.Event == string(EventHarvest) && r.Harvested {
+			if cand, ok := sv.cands[r.SHA]; ok {
+				cand.State = StateHarvested
 			}
 		}
 	}
