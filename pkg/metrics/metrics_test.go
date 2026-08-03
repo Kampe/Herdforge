@@ -294,6 +294,18 @@ func TestMetricsStateRestartRoundTripAndStaleRestore(t *testing.T) {
 	if err := restored.Restore(context.Background()); err != nil {
 		t.Fatal(err)
 	}
+	if err := restored.SetHealthObservation(completeDependencies(), now, 0); err != nil {
+		t.Fatalf("same health wire observation after restore was not idempotent: %v", err)
+	}
+	if err := restored.SetQueuePressureObservation(QueuePressure{Depth: 2, Capacity: 10, Known: true}, now, 0); err != nil {
+		t.Fatalf("same queue wire observation after restore was not idempotent: %v", err)
+	}
+	if err := restored.SetSignalsObservation(signals, 0); err != nil {
+		t.Fatalf("same signals wire observation after restore was not idempotent: %v", err)
+	}
+	if err := restored.RecordTransitionObservation(now.Add(-time.Second), now, nil, now, 0); err != nil {
+		t.Fatalf("same SLO wire observation after restore was not idempotent: %v", err)
+	}
 	health, queue, slo := restored.Snapshot()
 	if !health.Readiness || queue.Depth != 2 || restored.Signals() != signals || slo.Completed != 1 || restored.TotalTasksProcessed != 1 {
 		t.Fatalf("restart round-trip lost state: health=%+v queue=%+v signals=%+v slo=%+v tasks=%d", health, queue, restored.Signals(), slo, restored.TotalTasksProcessed)
