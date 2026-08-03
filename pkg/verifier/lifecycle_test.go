@@ -2,6 +2,7 @@ package verifier
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -13,9 +14,7 @@ import (
 )
 
 // sealGitDirForCleanupFailure makes real os.RemoveAll(root) fail deterministically
-// by clearing all mode bits on .git (permission denied while walking). This is
-// the pre-fix TempDir cleanup barrier — not a flaky concurrent-walk race and
-// not an ignored RemoveAll result.
+// (permission denied walking .git). Not a flaky concurrent-walk race.
 func sealGitDirForCleanupFailure(gitDir string) error {
 	return os.Chmod(gitDir, 0)
 }
@@ -24,172 +23,234 @@ func unsealGitDirAfterReap(gitDir string) error {
 	return os.Chmod(gitDir, 0o755)
 }
 
-// lateWriterParkScript creates one residue file under .git/objects then parks
-// in the process group. It does NOT rely on recreating removed parents after
-// RemoveAll (that path is vacuous when RemoveAll wins). Parking keeps the
-// unreaped group live through the sealed RemoveAll failure.
-const lateWriterParkScript = `mkdir -p "$1/objects" && printf x > "$1/objects/late-0" && exec sleep 3600`
+// lateWriterHandshakeScript: create residue, signal ready on $2, then park.
+// No free-running recreate loop — readiness is an explicit boundary file.
+const lateWriterHandshakeScript = `mkdir -p "$1/objects" && printf x > "$1/objects/late-0" && printf ready > "$2" && exec sleep 3600`
 
-// TestLateWriterIntoGitRequiresExplicitReap is the FAC-151 deterministic
-// pre-fix / post-fix cleanup barrier:
-//
-//  1. Unreaped process-group writer creates .git residue and parks.
-//  2. Seal .git so real os.RemoveAll hard-fails (assert err != nil — never ignored).
-//  3. After process-group reap + wait + unseal, os.RemoveAll must succeed.
-func TestLateWriterIntoGitRequiresExplicitReap(t *testing.T) {
+// lateWriterFixture owns root + process group and always reaps on exit so early
+// Fatal paths cannot leak processes or sealed trees.
+type lateWriterFixture struct {
+	t         *testing.T
+	root      string
+	gitDir    string
+	readyPath string
+	cmd       *exec.Cmd
+	pgid      int
+	stderr    strings.Builder
+	started   bool
+	sealed    bool
+	reaped    bool
+}
+
+func startLateWriterFixture(t *testing.T) *lateWriterFixture {
+	t.Helper()
 	root, err := os.MkdirTemp("", "verifier-late-writer-*")
 	if err != nil {
 		t.Fatal(err)
 	}
-	gitDir := filepath.Join(root, ".git")
-	if err := os.MkdirAll(filepath.Join(gitDir, "objects"), 0o755); err != nil {
+	f := &lateWriterFixture{
+		t:         t,
+		root:      root,
+		gitDir:    filepath.Join(root, ".git"),
+		readyPath: filepath.Join(root, "writer.ready"),
+	}
+	if err := os.MkdirAll(filepath.Join(f.gitDir, "objects"), 0o755); err != nil {
+		_ = os.RemoveAll(root)
 		t.Fatal(err)
 	}
+	t.Cleanup(f.shutdown)
 
-	cmd := exec.Command("sh", "-c", lateWriterParkScript, "late-writer", gitDir)
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	var writerErr strings.Builder
-	cmd.Stderr = &writerErr
-	if err := cmd.Start(); err != nil {
-		t.Fatal(err)
+	f.cmd = exec.Command("sh", "-c", lateWriterHandshakeScript, "late-writer", f.gitDir, f.readyPath)
+	f.cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	f.cmd.Stderr = &f.stderr
+	if err := f.cmd.Start(); err != nil {
+		t.Fatalf("start late writer: %v", err)
 	}
-	pgid := cmd.Process.Pid
-	if err := waitForLateObject(gitDir, pgid); err != nil {
-		reapProcessGroup(pgid)
-		_ = cmd.Wait()
-		t.Fatalf("writer failed to create residue: %v (stderr=%q)", err, writerErr.String())
-	}
-	if err := syscall.Kill(pgid, 0); err != nil {
-		t.Fatalf("unreaped writer must be live after creating residue: %v", err)
-	}
+	f.started = true
+	f.pgid = f.cmd.Process.Pid
 
-	if err := sealGitDirForCleanupFailure(gitDir); err != nil {
-		reapProcessGroup(pgid)
-		_ = cmd.Wait()
-		t.Fatalf("seal tree: %v", err)
+	if err := waitForWriterReady(f.readyPath, f.pgid, 5*time.Second); err != nil {
+		t.Fatalf("writer ready handshake: %v (stderr=%q)", err, f.stderr.String())
 	}
+	if err := syscall.Kill(f.pgid, 0); err != nil {
+		t.Fatalf("writer must be live after ready handshake: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(f.gitDir, "objects", "late-0")); err != nil {
+		t.Fatalf("residue missing after ready handshake: %v", err)
+	}
+	return f
+}
 
-	// PRE-FIX: real os.RemoveAll must fail. Never `_ = os.RemoveAll`.
-	preErr := os.RemoveAll(root)
-	if preErr == nil {
-		_ = unsealGitDirAfterReap(gitDir)
-		reapProcessGroup(pgid)
-		_ = cmd.Wait()
-		t.Fatal("pre-fix: os.RemoveAll must return an error while the tree is sealed under unreaped ownership")
+// shutdown is leak-safe cleanup for all paths (including early Fatal via t.Cleanup).
+func (f *lateWriterFixture) shutdown() {
+	if f == nil {
+		return
 	}
-	if err := syscall.Kill(pgid, 0); err != nil {
-		_ = unsealGitDirAfterReap(gitDir)
-		t.Fatalf("unreaped writer must remain live after failed RemoveAll: %v (stderr=%q)", err, writerErr.String())
+	if f.sealed {
+		if err := unsealGitDirAfterReap(f.gitDir); err != nil && !os.IsNotExist(err) {
+			f.t.Errorf("shutdown unseal: %v", err)
+		}
+		f.sealed = false
 	}
-
-	// FIX: reap + wait + unseal, then RemoveAll succeeds.
-	reapProcessGroup(pgid)
-	_ = cmd.Wait()
-	if err := waitForPIDGone(pgid, 2*time.Second); err != nil {
-		_ = unsealGitDirAfterReap(gitDir)
-		t.Fatalf("after process-group reap, leader must be gone: %v", err)
+	if f.started && !f.reaped && f.pgid > 0 {
+		if err := processGroupKiller(f.pgid); err != nil && !isESRCH(err) {
+			f.t.Errorf("shutdown reap pgid %d: %v", f.pgid, err)
+		}
+		if f.cmd != nil && f.cmd.Process != nil {
+			if err := f.cmd.Wait(); err != nil && !isExpectedKillWait(err) {
+				f.t.Errorf("shutdown wait: %v (stderr=%q)", err, f.stderr.String())
+			}
+		}
+		f.reaped = true
 	}
-	if err := unsealGitDirAfterReap(gitDir); err != nil {
-		t.Fatalf("post-fix: unseal after reap must succeed: %v", err)
-	}
-	if err := os.RemoveAll(root); err != nil {
-		t.Fatalf("post-fix: os.RemoveAll must succeed after reap+wait+unseal: %v", err)
-	}
-	if err := syscall.Kill(pgid, 0); err == nil {
-		t.Fatalf("process group %d still live after reap+Wait", pgid)
+	if f.root != "" {
+		if err := os.RemoveAll(f.root); err != nil && !os.IsNotExist(err) {
+			// Unseal once more if still sealed permission issues.
+			_ = unsealGitDirAfterReap(f.gitDir)
+			if err2 := os.RemoveAll(f.root); err2 != nil && !os.IsNotExist(err2) {
+				f.t.Errorf("shutdown RemoveAll: %v", err2)
+			}
+		}
 	}
 }
 
-// TestLateWriterCleanupMutationOmittingReapStillFails proves that deleting
-// reap/wait/unseal from the fix path leaves os.RemoveAll failing — the
-// negative guard is non-vacuous.
+func (f *lateWriterFixture) seal() {
+	f.t.Helper()
+	if err := sealGitDirForCleanupFailure(f.gitDir); err != nil {
+		f.t.Fatalf("seal .git: %v", err)
+	}
+	f.sealed = true
+}
+
+func (f *lateWriterFixture) reapAndWait() {
+	f.t.Helper()
+	if f.reaped {
+		return
+	}
+	if err := processGroupKiller(f.pgid); err != nil && !isESRCH(err) {
+		f.t.Fatalf("reap process group %d: %v", f.pgid, err)
+	}
+	if f.cmd == nil || f.cmd.Process == nil {
+		f.t.Fatal("reap: nil process")
+	}
+	waitErr := f.cmd.Wait()
+	if waitErr != nil && !isExpectedKillWait(waitErr) {
+		f.t.Fatalf("wait after reap: %v (stderr=%q)", waitErr, f.stderr.String())
+	}
+	if f.cmd.ProcessState == nil {
+		f.t.Fatal("wait after reap: missing ProcessState")
+	}
+	if err := waitForPIDGone(f.pgid, 2*time.Second); err != nil {
+		f.t.Fatalf("pgid %d still present after reap+wait: %v", f.pgid, err)
+	}
+	f.reaped = true
+}
+
+func (f *lateWriterFixture) unseal() {
+	f.t.Helper()
+	if err := unsealGitDirAfterReap(f.gitDir); err != nil {
+		f.t.Fatalf("unseal .git: %v", err)
+	}
+	f.sealed = false
+}
+
+func isESRCH(err error) bool {
+	return err != nil && errors.Is(err, syscall.ESRCH)
+}
+
+func isExpectedKillWait(err error) bool {
+	if err == nil {
+		return true
+	}
+	// SIGKILL / signal: killed are expected after process-group reap.
+	msg := err.Error()
+	return strings.Contains(msg, "signal") || strings.Contains(msg, "kill") || strings.Contains(msg, "killed")
+}
+
+// waitForWriterReady is an explicit boundary handshake on readyPath contents.
+// Diagnostic bound only — not a cancel/cleanup sleep.
+func waitForWriterReady(readyPath string, pgid int, bound time.Duration) error {
+	deadline := time.Now().Add(bound)
+	for {
+		data, err := os.ReadFile(readyPath)
+		if err == nil && strings.TrimSpace(string(data)) == "ready" {
+			return nil
+		}
+		if pgid > 0 {
+			if killErr := syscall.Kill(pgid, 0); killErr != nil {
+				return fmt.Errorf("writer pgid %d exited before ready handshake: %w", pgid, killErr)
+			}
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("diagnostic ready bound exceeded waiting for %s", filepath.Base(readyPath))
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// TestLateWriterIntoGitRequiresExplicitReap: hard pre-reap RemoveAll failure,
+// post-reap success, explicit ready handshake, no ignored kill/Wait/RemoveAll.
+func TestLateWriterIntoGitRequiresExplicitReap(t *testing.T) {
+	f := startLateWriterFixture(t)
+
+	f.seal()
+
+	// PRE-FIX: real os.RemoveAll must fail (never ignored).
+	preErr := os.RemoveAll(f.root)
+	if preErr == nil {
+		t.Fatal("pre-fix: os.RemoveAll must return an error while sealed under unreaped ownership")
+	}
+	if err := syscall.Kill(f.pgid, 0); err != nil {
+		t.Fatalf("unreaped writer must remain live after failed RemoveAll: %v (stderr=%q)", err, f.stderr.String())
+	}
+
+	// FIX: reap + wait + unseal, then RemoveAll must succeed.
+	f.reapAndWait()
+	f.unseal()
+	if err := os.RemoveAll(f.root); err != nil {
+		t.Fatalf("post-fix: os.RemoveAll must succeed after reap+wait+unseal: %v", err)
+	}
+	if err := syscall.Kill(f.pgid, 0); err == nil {
+		t.Fatalf("process group %d still live after reap+Wait", f.pgid)
+	}
+	// Root is gone; prevent shutdown RemoveAll noise.
+	f.root = ""
+}
+
+// TestLateWriterCleanupMutationOmittingReapStillFails: omit reap/wait/unseal
+// and assert RemoveAll still fails (non-vacuous negative guard).
 func TestLateWriterCleanupMutationOmittingReapStillFails(t *testing.T) {
-	root, err := os.MkdirTemp("", "verifier-late-writer-mut-*")
-	if err != nil {
-		t.Fatal(err)
-	}
-	gitDir := filepath.Join(root, ".git")
-	if err := os.MkdirAll(filepath.Join(gitDir, "objects"), 0o755); err != nil {
-		t.Fatal(err)
-	}
+	f := startLateWriterFixture(t)
+	f.seal()
 
-	cmd := exec.Command("sh", "-c", lateWriterParkScript, "late-writer", gitDir)
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	if err := cmd.Start(); err != nil {
-		t.Fatal(err)
-	}
-	pgid := cmd.Process.Pid
-	t.Cleanup(func() {
-		reapProcessGroup(pgid)
-		_ = cmd.Wait()
-		_ = unsealGitDirAfterReap(gitDir)
-		_ = os.RemoveAll(root)
-	})
-
-	if err := waitForLateObject(gitDir, pgid); err != nil {
-		t.Fatal(err)
-	}
-	if err := sealGitDirForCleanupFailure(gitDir); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.RemoveAll(root); err == nil {
+	if err := os.RemoveAll(f.root); err == nil {
 		t.Fatal("control: sealed unreaped tree must make os.RemoveAll fail")
 	}
 
-	// MUTATION: omit reapProcessGroup, Wait, and unseal.
-	mutErr := os.RemoveAll(root)
+	// MUTATION of the fix path: no reapAndWait, no unseal.
+	mutErr := os.RemoveAll(f.root)
 	if mutErr == nil {
-		t.Fatal("mutation: removing reap/wait/unseal must leave os.RemoveAll failing; got nil")
+		t.Fatal("mutation: omitting reap/wait/unseal must leave os.RemoveAll failing; got nil")
 	}
-	if err := syscall.Kill(pgid, 0); err != nil {
-		t.Fatalf("mutation path: writer must still be live without reap: %v", err)
+	if err := syscall.Kill(f.pgid, 0); err != nil {
+		t.Fatalf("mutation: writer must still be live without reap: %v", err)
 	}
+	// Fixture cleanup via t.Cleanup reaps/unseals/removes — no leak.
 }
 
-// TestProcessGroupReapAllowsTempDirCleanup: seal → RemoveAll fails; reap+unseal → succeeds.
+// TestProcessGroupReapAllowsTempDirCleanup: seal fail → reap+unseal success.
 func TestProcessGroupReapAllowsTempDirCleanup(t *testing.T) {
-	root, err := os.MkdirTemp("", "verifier-reaped-writer-*")
-	if err != nil {
-		t.Fatal(err)
-	}
-	gitDir := filepath.Join(root, ".git")
-	if err := os.MkdirAll(filepath.Join(gitDir, "objects"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	cmd := exec.Command("sh", "-c", lateWriterParkScript, "late-writer", gitDir)
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	if err := cmd.Start(); err != nil {
-		t.Fatal(err)
-	}
-	pgid := cmd.Process.Pid
-	if err := waitForLateObject(gitDir, pgid); err != nil {
-		reapProcessGroup(pgid)
-		_ = cmd.Wait()
-		t.Fatal(err)
-	}
-	if err := sealGitDirForCleanupFailure(gitDir); err != nil {
-		reapProcessGroup(pgid)
-		_ = cmd.Wait()
-		t.Fatal(err)
-	}
-	if err := os.RemoveAll(root); err == nil {
-		_ = unsealGitDirAfterReap(gitDir)
-		reapProcessGroup(pgid)
-		_ = cmd.Wait()
+	f := startLateWriterFixture(t)
+	f.seal()
+	if err := os.RemoveAll(f.root); err == nil {
 		t.Fatal("pre-reap: os.RemoveAll must fail while sealed")
 	}
-	reapProcessGroup(pgid)
-	_ = cmd.Wait()
-	if err := waitForPIDGone(pgid, 2*time.Second); err != nil {
-		_ = unsealGitDirAfterReap(gitDir)
-		t.Fatalf("reaped writer still live: %v", err)
-	}
-	if err := unsealGitDirAfterReap(gitDir); err != nil {
-		t.Fatalf("unseal after reap: %v", err)
-	}
-	if err := os.RemoveAll(root); err != nil {
+	f.reapAndWait()
+	f.unseal()
+	if err := os.RemoveAll(f.root); err != nil {
 		t.Fatalf("post-reap: os.RemoveAll must succeed: %v", err)
 	}
+	f.root = ""
 }
 
 // TestHermeticGitConfigFlagsReachGit is the non-vacuous coverage for
@@ -200,7 +261,11 @@ func TestHermeticGitConfigFlagsReachGit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = os.RemoveAll(root) })
+	t.Cleanup(func() {
+		if err := os.RemoveAll(root); err != nil && !os.IsNotExist(err) {
+			t.Errorf("cleanup hermetic root: %v", err)
+		}
+	})
 
 	if _, err := runGit(root, "init", "-q", "-b", "main"); err != nil {
 		t.Fatal(err)
@@ -311,29 +376,5 @@ func runMutationPathGuardMatrix(t *testing.T) {
 		assertFile(t, outsideVictim, "outside-parent\n")
 		assertFile(t, gitMetadataProbe, "metadata\n")
 		assertClean(t, dir)
-	}
-}
-
-func waitForLateObject(gitDir string, pgid int) error {
-	objects := filepath.Join(gitDir, "objects")
-	deadline := time.Now().Add(5 * time.Second)
-	for {
-		entries, err := os.ReadDir(objects)
-		if err == nil {
-			for _, e := range entries {
-				if strings.HasPrefix(e.Name(), "late-") {
-					return nil
-				}
-			}
-		}
-		if pgid > 0 {
-			if err := syscall.Kill(pgid, 0); err != nil {
-				return fmt.Errorf("late writer process group %d exited before creating residue: %w", pgid, err)
-			}
-		}
-		if time.Now().After(deadline) {
-			return fmt.Errorf("late writer never created a residual file under .git/objects")
-		}
-		time.Sleep(time.Millisecond)
 	}
 }
