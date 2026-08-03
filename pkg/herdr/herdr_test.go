@@ -36,11 +36,21 @@ func TestEnsureHerdforgeLabel_AlreadyPrefixed(t *testing.T) {
 	}
 }
 
-func TestEnsureHerdforgeLabel_ContainsPrefix(t *testing.T) {
-	// Ensures that a label containing the prefix as a substring (not
-	// necessarily at the start) is also left unchanged.
+func TestEnsureHerdforgeLabel_PrefixWithSuffix(t *testing.T) {
+	// Already starts with the prefix; extra suffix must not re-prefix.
 	got := EnsureHerdforgeLabel("Herdforge · worker (FAC-141)")
 	if got != "Herdforge · worker (FAC-141)" {
-		t.Errorf("label containing prefix was modified: %q", got)
+		t.Errorf("label starting with prefix was modified: %q", got)
+	}
+}
+
+func TestEnsureHerdforgeLabel_MidStringStillPrefixed(t *testing.T) {
+	// Non-vacuous HasPrefix contract: mid-string "Herdforge · " must NOT
+	// count as already-prefixed. Mutation of HasPrefix→Contains fails this.
+	in := "review of Herdforge · thing"
+	got := EnsureHerdforgeLabel(in)
+	want := "Herdforge · review of Herdforge · thing"
+	if got != want {
+		t.Errorf("EnsureHerdforgeLabel(%q) = %q, want %q", in, got, want)
 	}
 }
