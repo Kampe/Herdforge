@@ -34,6 +34,9 @@ type GateResult struct {
 	TaskID           TaskID            `json:"task_id"`
 	Entrypoint       LaunchEntrypoint  `json:"entrypoint"`
 	OK               bool              `json:"ok"`
+	Code             string            `json:"code,omitempty"`
+	Reason           string            `json:"reason,omitempty"`
+	Details          []string          `json:"details,omitempty"`
 	BlockedBy        []string          `json:"blocked_by,omitempty"`
 	GraphRevision    string            `json:"graph_revision"`
 	ProviderRevision string            `json:"provider_revision,omitempty"`
@@ -162,12 +165,19 @@ func ValidateLaunch(
 		RequireFullClosure: true,
 	})
 	if !rep.OK {
+		code := "drift"
+		for _, finding := range rep.Findings {
+			if finding.Class == DriftCyclic {
+				code = "cyclic"
+				break
+			}
+		}
 		return &GateResult{
 				Ref: taskRef, TaskID: taskID, Entrypoint: entrypoint,
 				OK: false, Report: rep, GraphRevision: rep.GraphRevision,
 				ProviderRevision: snap.ProviderRevision,
 			}, &BlockedError{
-				Ref: taskRef, Code: "drift",
+				Ref: taskRef, Code: code,
 				Reason:  "packet↔board dependency drift",
 				Report:  rep,
 				Details: findingDetails(rep),
@@ -447,9 +457,15 @@ func SelectEligibleRefs(
 					return nil, nil, blocked, gerr
 				}
 				if gr != nil {
+					gr.Code = be.Code
+					gr.Reason = blockedReason(be)
+					gr.Details = append([]string(nil), be.Details...)
 					blocked = append(blocked, *gr)
 				} else {
-					blocked = append(blocked, GateResult{Ref: Ref(t.Ref), OK: false})
+					blocked = append(blocked, GateResult{
+						Ref: Ref(t.Ref), TaskID: TaskID(t.ID), Entrypoint: entrypoint,
+						OK: false, Code: be.Code, Reason: blockedReason(be), Details: append([]string(nil), be.Details...),
+					})
 				}
 				continue
 			}
@@ -457,6 +473,9 @@ func SelectEligibleRefs(
 		}
 		if gr == nil || !gr.OK {
 			if gr != nil {
+				if gr.Code == "" {
+					gr.Code = "blocked"
+				}
 				blocked = append(blocked, *gr)
 			}
 			continue
@@ -465,6 +484,16 @@ func SelectEligibleRefs(
 		revisions[t.Ref] = gr.GraphRevision
 	}
 	return eligible, revisions, blocked, nil
+}
+
+func blockedReason(be *BlockedError) string {
+	if be == nil {
+		return "dependency gate blocked"
+	}
+	if len(be.Details) == 0 {
+		return be.Reason
+	}
+	return be.Reason + ": " + strings.Join(be.Details, "; ")
 }
 
 func boardBlocksOnly(board []DependencyEdge) []DependencyEdge {

@@ -504,8 +504,22 @@ func runStatus() {
 	}
 	fmt.Printf("Status: Active\nProject: %s\nProvider: %s\nLanes: %d configured\n",
 		cfg.Project.Name, cfg.TaskProvider.Type, len(cfg.Lanes))
+	st, err := store.New(".herd/herdforge.db")
+	if err != nil {
+		fmt.Printf("Dependency evidence: UNAVAILABLE (%v)\n", err)
+		return
+	}
+	defer st.Close()
+	blocked, err := st.BlockedSelectionHistory(10)
+	if err != nil {
+		fmt.Printf("Dependency evidence: UNREADABLE (%v)\n", err)
+		return
+	}
+	fmt.Printf("Dependency BLOCKED evidence: %d recent\n", len(blocked))
+	for _, record := range blocked {
+		fmt.Printf("  BLOCKED %s [%s] %s\n", record.Ref, record.Code, record.Reason)
+	}
 }
-
 
 // loadTaskProvider activates the configured board provider with FAC-150
 // deadlines via provider.NewFromHerdConfig. Non-Kaneo types error (FAC-155).
@@ -539,10 +553,10 @@ func runPulse() {
 
 	st, err := store.New(".herd/herdforge.db")
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "warning: store init failed (pulse continues without persistence): %v\n", err)
-	} else {
-		defer st.Close()
+		fmt.Fprintf(os.Stderr, "store init failed — pulse requires durable dependency BLOCKED evidence: %v\n", err)
+		os.Exit(1)
 	}
+	defer st.Close()
 
 	eng := daemon.NewEngine(cfg, tp, mr, st, wm, v)
 
@@ -845,10 +859,10 @@ func runDaemon() {
 
 	st, err := store.New(".herd/herdforge.db")
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "daemon: warning — store init failed, running without persistence: %v\n", err)
-	} else {
-		defer st.Close()
+		fmt.Fprintf(os.Stderr, "daemon: store init failed — durable dependency BLOCKED evidence is required: %v\n", err)
+		os.Exit(1)
 	}
+	defer st.Close()
 
 	ctx := context.Background()
 	pulseInterval := time.Duration(*interval) * time.Second
@@ -2272,8 +2286,10 @@ func runForge() {
 	v := verifier.NewVerifier(cfg.Verification.TestCommand)
 	st, err := store.New(".herd/herdforge.db")
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "warning: store init failed (forge continues without persistence): %v\n", err)
+		fmt.Fprintf(os.Stderr, "store init failed — forge requires durable dependency BLOCKED evidence: %v\n", err)
+		os.Exit(1)
 	}
+	defer st.Close()
 	eng := daemon.NewEngine(cfg, tp, mr, st, wm, v)
 
 	ctx := context.Background()
@@ -3244,7 +3260,13 @@ func runForgeLoop() {
 		fmt.Fprintf(os.Stderr, "task provider: %v\n", tpErr)
 		os.Exit(1)
 	}
-	eng := daemon.NewEngine(cfg, tp, nil, nil, resolveCanonicalWorktreeManager(), nil)
+	st, err := store.New(".herd/herdforge.db")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "forge --loop: store init failed — durable dependency BLOCKED evidence is required: %v\n", err)
+		os.Exit(1)
+	}
+	defer st.Close()
+	eng := daemon.NewEngine(cfg, tp, nil, st, resolveCanonicalWorktreeManager(), nil)
 	driver := &cliForgeDriver{cfg: cfg, maxLanes: *maxLanes}
 
 	fmt.Printf("herd forge --loop: max-lanes=%d interval=%ds — driving the board autonomously\n", *maxLanes, *interval)
