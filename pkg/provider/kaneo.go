@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"os/exec"
@@ -108,6 +109,45 @@ func dtoToTask(dto kaneoTaskDTO) *Task {
 	}
 }
 
+// decodeKaneoTaskBody accepts a single task object or a JSON array of tasks.
+// Cross-package mocks and some Kaneo/CLI shapes return a one-element list for
+// get/readback; fail-closed empty or multi-match without a wanted id.
+func decodeKaneoTaskBody(statusCode int, body []byte, wantID string) (kaneoTaskDTO, error) {
+	// Shared fail-closed gate for non-2xx and structured error payloads.
+	if err := DecodeJSONBytes(statusCode, body, nil); err != nil {
+		return kaneoTaskDTO{}, err
+	}
+	trimmed := bytes.TrimSpace(body)
+	if len(trimmed) == 0 {
+		return kaneoTaskDTO{}, fmt.Errorf("empty task body")
+	}
+	if trimmed[0] == '[' {
+		var dtos []kaneoTaskDTO
+		if err := json.Unmarshal(trimmed, &dtos); err != nil {
+			return kaneoTaskDTO{}, fmt.Errorf("decode JSON: %w", err)
+		}
+		if len(dtos) == 0 {
+			return kaneoTaskDTO{}, fmt.Errorf("kaneo task not found: empty list")
+		}
+		if wantID != "" {
+			for _, d := range dtos {
+				if d.ID == wantID || d.Ref == wantID || strings.EqualFold(d.Ref, wantID) {
+					return d, nil
+				}
+			}
+		}
+		if len(dtos) == 1 {
+			return dtos[0], nil
+		}
+		return kaneoTaskDTO{}, fmt.Errorf("kaneo task %q not found in list of %d", wantID, len(dtos))
+	}
+	var dto kaneoTaskDTO
+	if err := json.Unmarshal(trimmed, &dto); err != nil {
+		return kaneoTaskDTO{}, fmt.Errorf("decode JSON: %w", err)
+	}
+	return dto, nil
+}
+
 func (k *KaneoProvider) GetTask(ctx context.Context, id string) (*Task, error) {
 	if k.UseCLI {
 		cmd := exec.CommandContext(ctx, "kaneo", "task", "get", id, "--json")
@@ -116,8 +156,8 @@ func (k *KaneoProvider) GetTask(ctx context.Context, id string) (*Task, error) {
 		if err := cmd.Run(); err != nil {
 			return nil, fmt.Errorf("kaneo task get: %w", err)
 		}
-		var dto kaneoTaskDTO
-		if err := DecodeJSONBytes(http.StatusOK, out.Bytes(), &dto); err != nil {
+		dto, err := decodeKaneoTaskBody(http.StatusOK, out.Bytes(), id)
+		if err != nil {
 			if pe, ok := err.(*ProviderError); ok {
 				pe.Provider = "kaneo"
 				pe.Op = "GetTask"
@@ -136,8 +176,13 @@ func (k *KaneoProvider) GetTask(ctx context.Context, id string) (*Task, error) {
 	if err != nil {
 		return nil, err
 	}
-	var dto kaneoTaskDTO
-	if err := DecodeJSONResponse(resp, &dto); err != nil {
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	dto, err := decodeKaneoTaskBody(resp.StatusCode, body, id)
+	if err != nil {
 		if pe, ok := err.(*ProviderError); ok {
 			pe.Provider = "kaneo"
 			pe.Op = "GetTask"

@@ -36,16 +36,27 @@ func TestSelectNextTask_NoRoleMatch(t *testing.T) {
 }
 
 func TestRunPulse_SelectsAndClaimsTask(t *testing.T) {
+	// Claim (UpdateStatus) writes then readbacks GetTask; list and get shapes
+	// differ, and post-claim status must match for fail-closed readback.
+	status := "to-do"
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		if r.URL.Path == "/api/task" && r.Method == "POST" {
+		switch {
+		case r.Method == http.MethodPatch:
+			status = "in-progress"
 			w.WriteHeader(http.StatusOK)
-			return
+		case r.Method == http.MethodGet && r.URL.Path == "/api/task/t-1":
+			// Single-task readback (object). Also accepted as one-element array
+			// by provider.decodeKaneoTaskBody — exercise object form here.
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte(`{"id":"t-1","ref":"FAC-99","title":"Pulse Task","priority":"urgent","status":"` + status + `","labels":[{"name":"herd-smith"}]}`))
+		default:
+			// ListTasks path
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte(`[
+				{"id":"t-1", "ref":"FAC-99", "title":"Pulse Task", "priority":"urgent", "status":"` + status + `", "labels":[{"name":"herd-smith"}]}
+			]`))
 		}
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(`[
-			{"id":"t-1", "ref":"FAC-99", "title":"Pulse Task", "priority":"urgent", "status":"to-do", "labels":[{"name":"herd-smith"}]}
-		]`))
 	}))
 	defer server.Close()
 
