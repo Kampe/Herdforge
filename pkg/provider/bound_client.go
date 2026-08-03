@@ -114,5 +114,72 @@ func DeadlinesFromResolved(get, list, mutate, comment, readback time.Duration, e
 	return DeadlinesFromParts(get, list, mutate, comment, readback)
 }
 
-// Ensure BoundClient implements TaskProvider.
-var _ TaskProvider = (*BoundClient)(nil)
+// --- RelationProvider / BulkRelationProvider delegation (FAC-159) ------------
+
+func (b *BoundClient) ListRelations(ctx context.Context, taskID string) ([]Relation, error) {
+	rp, err := b.relationProvider()
+	if err != nil {
+		return nil, err
+	}
+	opCtx, cancel := BoundOp(ctx, b.deadlines(), OpList)
+	defer cancel()
+	rels, e := rp.ListRelations(opCtx, taskID)
+	return rels, b.wrap("ListRelations", OpList, e)
+}
+
+func (b *BoundClient) CreateRelation(ctx context.Context, sourceID, targetID string, typ RelationType) (*Relation, error) {
+	rp, err := b.relationProvider()
+	if err != nil {
+		return nil, err
+	}
+	opCtx, cancel := BoundOp(ctx, b.deadlines(), OpMutate)
+	defer cancel()
+	rel, e := rp.CreateRelation(opCtx, sourceID, targetID, typ)
+	return rel, b.wrap("CreateRelation", OpMutate, e)
+}
+
+func (b *BoundClient) DeleteRelation(ctx context.Context, relationID, sourceID, targetID string) error {
+	rp, err := b.relationProvider()
+	if err != nil {
+		return err
+	}
+	opCtx, cancel := BoundOp(ctx, b.deadlines(), OpMutate)
+	defer cancel()
+	return b.wrap("DeleteRelation", OpMutate, rp.DeleteRelation(opCtx, relationID, sourceID, targetID))
+}
+
+func (b *BoundClient) ListProjectRelations(ctx context.Context, projectID string) ([]Relation, error) {
+	if b == nil || b.Inner == nil {
+		return nil, fmt.Errorf("ListProjectRelations: nil provider")
+	}
+	bp, ok := b.Inner.(BulkRelationProvider)
+	if !ok {
+		// Fall through: if Inner is BoundClient-nested, unwrap once.
+		if inner, ok2 := b.Inner.(*BoundClient); ok2 {
+			return inner.ListProjectRelations(ctx, projectID)
+		}
+		return nil, fmt.Errorf("%w: inner does not implement BulkRelationProvider", errCapability)
+	}
+	opCtx, cancel := BoundOp(ctx, b.deadlines(), OpList)
+	defer cancel()
+	rels, e := bp.ListProjectRelations(opCtx, projectID)
+	return rels, b.wrap("ListProjectRelations", OpList, e)
+}
+
+func (b *BoundClient) relationProvider() (RelationProvider, error) {
+	if b == nil || b.Inner == nil {
+		return nil, fmt.Errorf("relation provider: nil")
+	}
+	if rp, ok := b.Inner.(RelationProvider); ok {
+		return rp, nil
+	}
+	return nil, fmt.Errorf("%w: inner does not implement RelationProvider", errCapability)
+}
+
+// errCapability is a local sentinel for missing relation capability on BoundClient.
+var errCapability = fmt.Errorf("provider relation capability unsupported")
+
+// Ensure BoundClient implements TaskProvider + relation surfaces when Inner does.
+var (
+	_ TaskProvider = (*BoundClient)(nil)
+)

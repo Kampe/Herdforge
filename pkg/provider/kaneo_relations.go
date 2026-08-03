@@ -7,7 +7,10 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"sort"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -55,7 +58,9 @@ func (k *KaneoProvider) ListRelations(ctx context.Context, taskID string) ([]Rel
 }
 
 func (k *KaneoProvider) listRelationsOnce(ctx context.Context, taskID string) ([]Relation, error) {
-	if k.UseCLI {
+	// Prefer HTTP when API is configured (bulk snapshot fan-out). UseCLI single
+	// calls still go through CLI for ordinary per-task ops unless forceHTTP.
+	if k.UseCLI && !k.preferHTTPForRelations() {
 		args := []string{"task", "rel", "list", taskID, "--json"}
 		if k.ProjectID != "" {
 			args = append(args, "--project", k.ProjectID)
@@ -89,11 +94,13 @@ func (k *KaneoProvider) listRelationsOnce(ctx context.Context, taskID string) ([
 		return out, nil
 	}
 
-	url := fmt.Sprintf("%s/api/task/%s/relations", k.APIURL, taskID)
+	// Live Kaneo path: GET /api/task-relation/{taskId}
+	url := fmt.Sprintf("%s/api/task-relation/%s", strings.TrimRight(k.APIURL, "/"), taskID)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, err
 	}
+	k.authorizeKaneo(req)
 	resp, err := k.httpClient().Do(req)
 	if err != nil {
 		return nil, err
@@ -123,6 +130,238 @@ func (k *KaneoProvider) listRelationsOnce(ctx context.Context, taskID string) ([
 		out = append(out, d.toRelation())
 	}
 	return out, nil
+}
+
+// preferHTTPForRelations is true when bulk/HTTP credentials are available.
+// Project graph snapshots force HTTP fan-out via listRelationsHTTPOnly.
+func (k *KaneoProvider) preferHTTPForRelations() bool {
+	if k == nil || strings.TrimSpace(k.APIURL) == "" {
+		return false
+	}
+	key := strings.TrimSpace(k.APIKey)
+	if key == "" {
+		key = strings.TrimSpace(os.Getenv("KANEO_API_KEY"))
+	}
+	return key != ""
+}
+
+func (k *KaneoProvider) listRelationsHTTPOnly(ctx context.Context, taskID string) ([]Relation, error) {
+	// Temporarily treat as non-CLI for this call by using HTTP path directly.
+	saved := k.UseCLI
+	// UseHTTP path: preferHTTPForRelations or explicit bulk.
+	if !k.preferHTTPForRelations() {
+		// Concurrent CLI fallback (still bounded by caller semaphore).
+		return k.listRelationsOnce(ctx, taskID)
+	}
+	// Force HTTP: call with UseCLI false without mutating shared state races —
+	// use dedicated HTTP body.
+	url := fmt.Sprintf("%s/api/task-relation/%s", strings.TrimRight(k.APIURL, "/"), taskID)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	k.authorizeKaneo(req)
+	resp, err := k.httpClient().Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	if pe := kaneoRelationErrorBody(body); pe != nil {
+		pe.Provider = "kaneo"
+		pe.Op = "ListProjectRelations"
+		pe.StatusCode = resp.StatusCode
+		return nil, pe
+	}
+	var dtos []kaneoRelationDTO
+	if err := DecodeJSONBytes(resp.StatusCode, body, &dtos); err != nil {
+		return nil, err
+	}
+	out := make([]Relation, 0, len(dtos))
+	for _, d := range dtos {
+		out = append(out, d.toRelation())
+	}
+	_ = saved
+	return out, nil
+}
+
+// ListProjectRelations is the bulk project graph snapshot (FAC-159).
+// One ListTasks for IDs + bounded concurrent relation fetches (HTTP when
+// credentials exist, concurrent CLI otherwise). Dual-end agreement required.
+// Cancels outstanding workers on first error or ctx cancel.
+func (k *KaneoProvider) ListProjectRelations(ctx context.Context, projectID string) ([]Relation, error) {
+	if projectID == "" {
+		projectID = k.ProjectID
+	}
+	if projectID == "" {
+		return nil, fmt.Errorf("kaneo ListProjectRelations: project id required")
+	}
+	dls := k.deadlines()
+	ctx, cancel := WithOpDeadline(ctx, dls, OpList)
+	defer cancel()
+
+	tasks, err := k.ListTasks(ctx, projectID, "")
+	if err != nil {
+		return nil, fmt.Errorf("kaneo ListProjectRelations list tasks: %w", err)
+	}
+	ids := make([]string, 0, len(tasks))
+	idSet := map[string]struct{}{}
+	for _, t := range tasks {
+		if t == nil || t.ID == "" {
+			continue
+		}
+		if _, ok := idSet[t.ID]; ok {
+			continue
+		}
+		idSet[t.ID] = struct{}{}
+		ids = append(ids, t.ID)
+	}
+	sort.Strings(ids)
+
+	conc := k.BulkConcurrency
+	if conc <= 0 {
+		conc = DefaultBulkRelationConcurrency
+	}
+	if conc > len(ids) && len(ids) > 0 {
+		conc = len(ids)
+	}
+
+	type result struct {
+		taskID string
+		rels   []Relation
+		err    error
+	}
+	jobs := make(chan string)
+	outCh := make(chan result, conc)
+	var wg sync.WaitGroup
+	workerCtx, workerCancel := context.WithCancel(ctx)
+	defer workerCancel()
+
+	worker := func() {
+		defer wg.Done()
+		for id := range jobs {
+			if workerCtx.Err() != nil {
+				outCh <- result{taskID: id, err: workerCtx.Err()}
+				return
+			}
+			rels, e := k.listRelationsHTTPOnly(workerCtx, id)
+			if e != nil {
+				outCh <- result{taskID: id, err: AsTimeout("kaneo", "ListProjectRelations", OpList, dls.For(OpList), e)}
+				workerCancel()
+				return
+			}
+			outCh <- result{taskID: id, rels: rels}
+		}
+	}
+	for i := 0; i < conc; i++ {
+		wg.Add(1)
+		go worker()
+	}
+	go func() {
+		defer close(jobs)
+		for _, id := range ids {
+			select {
+			case <-workerCtx.Done():
+				return
+			case jobs <- id:
+			}
+		}
+	}()
+	go func() {
+		wg.Wait()
+		close(outCh)
+	}()
+
+	byTask := map[string][]Relation{}
+	for r := range outCh {
+		if r.err != nil {
+			// Drain remaining without blocking forever.
+			workerCancel()
+			return nil, fmt.Errorf("kaneo ListProjectRelations task %s: %w", r.taskID, r.err)
+		}
+		byTask[r.taskID] = r.rels
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, AsTimeout("kaneo", "ListProjectRelations", OpList, dls.For(OpList), err)
+	}
+
+	// Dual-end agreement: every relation id must appear with identical fields
+	// on both source and target listings when both endpoints are in-project.
+	type acc struct {
+		src *Relation
+		tgt *Relation
+	}
+	accs := map[string]*acc{}
+	for taskID, rels := range byTask {
+		for i := range rels {
+			rel := rels[i]
+			if rel.ID == "" {
+				return nil, fmt.Errorf("kaneo ListProjectRelations: empty relation id on task %s", taskID)
+			}
+			a := accs[rel.ID]
+			if a == nil {
+				a = &acc{}
+				accs[rel.ID] = a
+			}
+			if rel.SourceTaskID == taskID {
+				if a.src != nil && !relationFieldsEqual(*a.src, rel) {
+					return nil, fmt.Errorf("kaneo ListProjectRelations: relation %s inconsistent on source", rel.ID)
+				}
+				cp := rel
+				a.src = &cp
+			}
+			if rel.TargetTaskID == taskID {
+				if a.tgt != nil && !relationFieldsEqual(*a.tgt, rel) {
+					return nil, fmt.Errorf("kaneo ListProjectRelations: relation %s inconsistent on target", rel.ID)
+				}
+				cp := rel
+				a.tgt = &cp
+			}
+		}
+	}
+	out := make([]Relation, 0, len(accs))
+	var keys []string
+	for id := range accs {
+		keys = append(keys, id)
+	}
+	sort.Strings(keys)
+	for _, id := range keys {
+		a := accs[id]
+		if a.src == nil || a.tgt == nil {
+			// Endpoint outside project set: require at least one side and
+			// accept if the missing end is not in idSet.
+			if a.src == nil && a.tgt == nil {
+				return nil, fmt.Errorf("kaneo ListProjectRelations: relation %s missing both ends", id)
+			}
+			var r Relation
+			if a.src != nil {
+				r = *a.src
+			} else {
+				r = *a.tgt
+			}
+			_, srcIn := idSet[r.SourceTaskID]
+			_, tgtIn := idSet[r.TargetTaskID]
+			if srcIn && tgtIn {
+				return nil, fmt.Errorf("kaneo ListProjectRelations: relation %s not dual-listed for in-project endpoints", id)
+			}
+			out = append(out, r)
+			continue
+		}
+		if !relationFieldsEqual(*a.src, *a.tgt) {
+			return nil, fmt.Errorf("kaneo ListProjectRelations: relation %s field disagreement", id)
+		}
+		out = append(out, *a.src)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out, nil
+}
+
+func relationFieldsEqual(a, b Relation) bool {
+	return a.ID == b.ID && a.SourceTaskID == b.SourceTaskID &&
+		a.TargetTaskID == b.TargetTaskID && a.Type == b.Type
 }
 
 // kaneoRelationErrorBody detects {"error":"..."} under HTTP-equivalent 200 CLI output.

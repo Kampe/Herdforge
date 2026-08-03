@@ -13,6 +13,8 @@ type TaskConfig struct {
 	APIURL    string
 	ProjectID string
 	UseCLI    bool
+	// APIKey for HTTP bulk graph fan-out (even when UseCLI is true).
+	APIKey string
 	// Optional resolved deadline parts (0 = package default).
 	Get, List, Mutate, Comment, Readback time.Duration
 }
@@ -26,6 +28,9 @@ func NewProductionProvider(tc TaskConfig) (TaskProvider, error) {
 	switch tc.Type {
 	case "kaneo":
 		k := NewKaneoProvider(tc.APIURL, tc.ProjectID, tc.UseCLI)
+		if tc.APIKey != "" {
+			k.APIKey = tc.APIKey
+		}
 		ApplyDeadlines(k, dls)
 		return NewBoundClient(k, dls), nil
 	case "memory":

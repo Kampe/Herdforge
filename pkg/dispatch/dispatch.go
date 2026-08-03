@@ -297,6 +297,9 @@ func (d *Dispatcher) Dispatch(ctx context.Context, opts DispatchOptions) (*Dispa
 
 	// 2b. FAC-159 PRE-SIDE-EFFECT fence: selection → re-read bound to revision
 	// → exclusive ownership claim BEFORE any worktree/status/comment/tab.
+	// SnapshotFence: one bulk graph hydration + immutable reuse for pre checks;
+	// Invalidate before post-side-effect TOCTOU (no long-lived unsafe cache).
+	ctx, snapFence := deps.WithSnapshotFence(ctx)
 	var depProv *deps.Provenance
 	store := d.Deps
 	if store == nil {
@@ -322,6 +325,7 @@ func (d *Dispatcher) Dispatch(ctx context.Context, opts DispatchOptions) (*Dispa
 		return nil, perr2
 	}
 	depProv = pre.Provenance
+	_ = snapFence
 
 	// 2c. Durable cross-process lease BEFORE first side effect (pkg/claim SQLite).
 	// Generation-fenced; not a process-local map. Provider board CAS is FAC-147.
@@ -461,9 +465,13 @@ func (d *Dispatcher) Dispatch(ctx context.Context, opts DispatchOptions) (*Dispa
 
 	// 8. Still own the lease generation; re-validate relation graph bound to
 	// pre-claim GraphRev (excludes target status — board flip must not mismatch).
+	// Force a fresh bulk snapshot for post TOCTOU (invalidate fence reuse).
 	owns, oerr := own.StillOwns(ctx, tok)
 	if oerr != nil || !owns {
 		return result, failOwned("lease_lost", fmt.Errorf("dispatch lease lost during side effects: owns=%v err=%v", owns, oerr))
+	}
+	if snapFence != nil {
+		snapFence.Invalidate(false)
 	}
 	if _, postErr := deps.RequireTaskLaunch(ctx, store, deps.EntryDispatch, deps.Ref(task.Ref), desired, tok.GraphRev); postErr != nil {
 		return result, failOwned("post_dispatch_graph_drift", postErr)

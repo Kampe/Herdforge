@@ -17,11 +17,18 @@ type KaneoProvider struct {
 	APIURL    string
 	ProjectID string
 	UseCLI    bool
-	Client    *http.Client
+	// APIKey authenticates HTTP calls (Bearer). Loaded from api_key_env / KANEO_API_KEY.
+	// Bulk project graph snapshots prefer HTTP fan-out even when UseCLI is true
+	// to avoid N CLI subprocesses (FAC-159 live-path stampede).
+	APIKey string
+	Client *http.Client
 	// Deadlines bound every op; zero fields resolve to DefaultDeadlines.
 	Deadlines Deadlines
 	// Retry applies to idempotent reads only (GetTask/ListTasks).
 	Retry RetryPolicy
+	// BulkConcurrency bounds concurrent relation fetches in ListProjectRelations.
+	// Zero => DefaultBulkRelationConcurrency.
+	BulkConcurrency int
 }
 
 type KaneoLinkConfig struct {
@@ -52,13 +59,29 @@ func NewKaneoProvider(apiURL string, projectID string, useCLI bool) *KaneoProvid
 	if projectID == "" {
 		projectID = ResolveKaneoProjectID(".")
 	}
+	key := strings.TrimSpace(os.Getenv("KANEO_API_KEY"))
 	return &KaneoProvider{
 		APIURL:    apiURL,
 		ProjectID: projectID,
 		UseCLI:    useCLI,
+		APIKey:    key,
 		Client:    defaultHTTPClient(),
 		Deadlines: DefaultDeadlines(),
 		Retry:     DefaultReadRetry(),
+	}
+}
+
+// authorizeKaneo sets Bearer auth when an API key is configured.
+func (k *KaneoProvider) authorizeKaneo(req *http.Request) {
+	if k == nil || req == nil {
+		return
+	}
+	key := strings.TrimSpace(k.APIKey)
+	if key == "" {
+		key = strings.TrimSpace(os.Getenv("KANEO_API_KEY"))
+	}
+	if key != "" {
+		req.Header.Set("Authorization", "Bearer "+key)
 	}
 }
 
@@ -230,6 +253,7 @@ func (k *KaneoProvider) getTaskOnce(ctx context.Context, id string) (*Task, erro
 	if err != nil {
 		return nil, err
 	}
+	k.authorizeKaneo(req)
 	resp, err := k.httpClient().Do(req)
 	if err != nil {
 		return nil, err

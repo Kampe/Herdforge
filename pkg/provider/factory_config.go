@@ -2,6 +2,8 @@ package provider
 
 import (
 	"fmt"
+	"os"
+	"strings"
 
 	"github.com/Kampe/Herdforge/pkg/config"
 )
@@ -17,11 +19,19 @@ func NewFromHerdConfig(cfg *config.Config) (TaskProvider, error) {
 	if err != nil {
 		return nil, err
 	}
+	apiKey := ""
+	if env := strings.TrimSpace(cfg.TaskProvider.APIKeyEnv); env != "" {
+		apiKey = strings.TrimSpace(os.Getenv(env))
+	}
+	if apiKey == "" {
+		apiKey = strings.TrimSpace(os.Getenv("KANEO_API_KEY"))
+	}
 	return NewProductionProvider(TaskConfig{
 		Type:      cfg.TaskProvider.Type,
 		APIURL:    cfg.TaskProvider.APIURL,
 		ProjectID: cfg.TaskProvider.ProjectID,
 		UseCLI:    cfg.TaskProvider.UseCLI,
+		APIKey:    apiKey,
 		Get:       g,
 		List:      l,
 		Mutate:    m,

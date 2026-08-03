@@ -8,19 +8,31 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/Kampe/Herdforge/pkg/provider"
 )
 
 // ProviderStore adapts a TaskProvider (+ optional RelationProvider) to RelationStore.
-// Cache is mutex-protected and refreshed on every SnapshotGraph / hydrateFresh
-// so concurrent gates cannot race and deleted/new tasks are not frozen forever.
+//
+// Live-path rules (FAC-159 audit cruhqfqizmzmmaa51i9cmigi):
+//   - SnapshotGraph prefers BulkRelationProvider.ListProjectRelations (bounded
+//     concurrent fan-out / single bulk RPC) — never sequential per-task CLI.
+//   - One ListTasks hydration per SnapshotFence (not per TaskStatus).
+//   - Immutable snapshot reuse within a fence; Invalidate for final TOCTOU.
+//   - No long-lived unsafe cache across fences.
 type ProviderStore struct {
 	mu        sync.Mutex
 	TP        provider.TaskProvider
 	ProjectID string
 	refCache  map[string]*provider.Task
 	idCache   map[string]*provider.Task
+
+	// Test counters (optional observability for bounded-call tests).
+	ListTasksCalls     atomic.Int64
+	ListRelCalls       atomic.Int64 // per-task ListRelations
+	BulkRelCalls       atomic.Int64 // ListProjectRelations
+	SnapshotGraphCalls atomic.Int64
 }
 
 // NewProviderStore wraps a TaskProvider. Relation capability is explicit.
@@ -42,6 +54,7 @@ func (s *ProviderStore) SupportsRelations(ctx context.Context) (bool, error) {
 	if _, ok := s.TP.(provider.RelationProvider); ok {
 		return true, nil
 	}
+	// BoundClient may wrap a RelationProvider — try type assert only.
 	return false, nil
 }
 
@@ -53,9 +66,33 @@ func (s *ProviderStore) rel() (provider.RelationProvider, error) {
 	return rp, nil
 }
 
+func (s *ProviderStore) bulk() (provider.BulkRelationProvider, bool) {
+	bp, ok := s.TP.(provider.BulkRelationProvider)
+	return bp, ok && bp != nil
+}
+
 // hydrateFresh always re-lists the full project and rebuilds maps.
 // Duplicate ref→id or id→ref mappings fail the snapshot (stale/capability).
+// When a SnapshotFence is present and already hydrated, reuses fence maps
+// (one hydration per fence). Thread-safe: takes s.mu for map swaps.
+// Caller must NOT hold s.mu.
 func (s *ProviderStore) hydrateFresh(ctx context.Context) error {
+	if fence := FenceFrom(ctx); fence != nil {
+		fence.mu.Lock()
+		if fence.hydrated && len(fence.tasksByID) > 0 {
+			ref := cloneTaskMap(fence.tasksByRef)
+			id := cloneTaskMap(fence.tasksByID)
+			fence.mu.Unlock()
+			s.mu.Lock()
+			s.refCache = ref
+			s.idCache = id
+			s.mu.Unlock()
+			return nil
+		}
+		fence.mu.Unlock()
+	}
+
+	s.ListTasksCalls.Add(1)
 	tasks, err := s.TP.ListTasks(ctx, s.ProjectID, "")
 	if err != nil {
 		return err
@@ -82,40 +119,62 @@ func (s *ProviderStore) hydrateFresh(ctx context.Context) error {
 		refCache[t.Ref] = &cp
 		idCache[t.ID] = &cp
 	}
+	s.mu.Lock()
 	s.refCache = refCache
 	s.idCache = idCache
+	s.mu.Unlock()
+
+	if fence := FenceFrom(ctx); fence != nil {
+		fence.mu.Lock()
+		fence.tasksByRef = cloneTaskMap(refCache)
+		fence.tasksByID = cloneTaskMap(idCache)
+		fence.hydrated = true
+		fence.mu.Unlock()
+	}
 	return nil
 }
 
+func cloneTaskMap(in map[string]*provider.Task) map[string]*provider.Task {
+	out := make(map[string]*provider.Task, len(in))
+	for k, v := range in {
+		if v == nil {
+			continue
+		}
+		cp := *v
+		out[k] = &cp
+	}
+	return out
+}
+
 func (s *ProviderStore) ResolveRef(ctx context.Context, ref Ref) (TaskID, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	if err := s.hydrateFresh(ctx); err != nil {
 		return "", err
 	}
-	if t, ok := s.refCache[string(ref)]; ok {
+	s.mu.Lock()
+	t, ok := s.refCache[string(ref)]
+	s.mu.Unlock()
+	if ok {
 		return TaskID(t.ID), nil
 	}
-	t, err := s.TP.GetTask(ctx, string(ref))
-	if err != nil || t == nil {
+	got, err := s.TP.GetTask(ctx, string(ref))
+	if err != nil || got == nil {
 		return "", fmt.Errorf("%w: %s", ErrUnresolvedRef, ref)
 	}
-	return TaskID(t.ID), nil
+	return TaskID(got.ID), nil
 }
 
 func (s *ProviderStore) TaskStatus(ctx context.Context, ref Ref) (string, TaskID, error) {
-	s.mu.Lock()
 	if err := s.hydrateFresh(ctx); err != nil {
-		s.mu.Unlock()
 		return "", "", err
 	}
+	s.mu.Lock()
 	id := string(ref)
 	if t, ok := s.refCache[string(ref)]; ok {
 		id = t.ID
 	}
 	s.mu.Unlock()
 
-	// Fresh Get outside lock (provider I/O).
+	// Fresh Get outside lock — live status for Done check (not a full re-list).
 	fresh, err := s.TP.GetTask(ctx, id)
 	if err != nil || fresh == nil {
 		return "", "", fmt.Errorf("%w: %s", ErrDeletedTask, ref)
@@ -128,6 +187,12 @@ func (s *ProviderStore) TaskStatus(ctx context.Context, ref Ref) (string, TaskID
 	s.refCache[fresh.Ref] = fresh
 	s.idCache[fresh.ID] = fresh
 	s.mu.Unlock()
+	if fence := FenceFrom(ctx); fence != nil {
+		fence.mu.Lock()
+		fence.tasksByRef[fresh.Ref] = fresh
+		fence.tasksByID[fresh.ID] = fresh
+		fence.mu.Unlock()
+	}
 	return st, TaskID(fresh.ID), nil
 }
 
@@ -187,12 +252,10 @@ func (s *ProviderStore) ListRelations(ctx context.Context, taskID TaskID) ([]Dep
 	if err != nil {
 		return nil, err
 	}
-	s.mu.Lock()
 	if err := s.hydrateFresh(ctx); err != nil {
-		s.mu.Unlock()
 		return nil, err
 	}
-	s.mu.Unlock()
+	s.ListRelCalls.Add(1)
 	rels, err := rp.ListRelations(ctx, string(taskID))
 	if err != nil {
 		return nil, err
@@ -208,88 +271,61 @@ func (s *ProviderStore) ListRelations(ctx context.Context, taskID TaskID) ([]Dep
 	return out, nil
 }
 
-// SnapshotGraph rebuilds the full task set, lists relations per task, and
-// requires every relation to be visible with identical fields on BOTH endpoints.
+// SnapshotGraph returns the authoritative full relation closure.
+// Prefers BulkRelationProvider; reuses an immutable fence snapshot when present
+// and not invalidated. Never sequential per-task ListRelations over the board.
 func (s *ProviderStore) SnapshotGraph(ctx context.Context) (*GraphSnapshot, error) {
+	s.SnapshotGraphCalls.Add(1)
+	if fence := FenceFrom(ctx); fence != nil {
+		if snap := fence.GetSnap(); snap != nil {
+			return snap, nil
+		}
+	}
+
 	rp, err := s.rel()
 	if err != nil {
 		return nil, err
 	}
-	s.mu.Lock()
 	if err := s.hydrateFresh(ctx); err != nil {
-		s.mu.Unlock()
 		return nil, err
 	}
+	// Copy id set under lock for non-bulk fallback.
+	s.mu.Lock()
 	ids := make([]string, 0, len(s.idCache))
 	for id := range s.idCache {
 		ids = append(ids, id)
 	}
 	s.mu.Unlock()
-	sort.Strings(ids)
 
-	// Collect listings per task.
-	byTask := map[string][]provider.Relation{}
-	for _, id := range ids {
-		rels, lerr := rp.ListRelations(ctx, id)
-		if lerr != nil {
-			return nil, fmt.Errorf("deps: snapshot list %s: %w", id, lerr)
+	var rels []provider.Relation
+	if bp, ok := s.bulk(); ok {
+		s.BulkRelCalls.Add(1)
+		rels, err = bp.ListProjectRelations(ctx, s.ProjectID)
+		if err != nil {
+			return nil, fmt.Errorf("deps: bulk project relations: %w", err)
 		}
-		byTask[id] = rels
-	}
-
-	// Index by relation ID with dual-end agreement.
-	type acc struct {
-		srcSide *provider.Relation
-		tgtSide *provider.Relation
-	}
-	accs := map[string]*acc{}
-	for taskID, rels := range byTask {
-		for i := range rels {
-			r := rels[i]
-			if r.ID == "" {
-				return nil, fmt.Errorf("deps: snapshot: empty relation id on task %s", taskID)
+	} else {
+		// Fallback for partial adapters: still dual-end assemble. Live Kaneo
+		// implements BulkRelationProvider — do not use this for production boards.
+		sort.Strings(ids)
+		byTask := map[string][]provider.Relation{}
+		for _, id := range ids {
+			s.ListRelCalls.Add(1)
+			lr, lerr := rp.ListRelations(ctx, id)
+			if lerr != nil {
+				return nil, fmt.Errorf("deps: snapshot list %s: %w", id, lerr)
 			}
-			a := accs[r.ID]
-			if a == nil {
-				a = &acc{}
-				accs[r.ID] = a
-			}
-			if r.SourceTaskID == taskID {
-				if a.srcSide != nil && !relationEqual(*a.srcSide, r) {
-					return nil, fmt.Errorf("deps: snapshot: relation %s inconsistent on source listings", r.ID)
-				}
-				cp := r
-				a.srcSide = &cp
-			}
-			if r.TargetTaskID == taskID {
-				if a.tgtSide != nil && !relationEqual(*a.tgtSide, r) {
-					return nil, fmt.Errorf("deps: snapshot: relation %s inconsistent on target listings", r.ID)
-				}
-				cp := r
-				a.tgtSide = &cp
-			}
-			// If listed on a third task id, still require field agreement with first.
-			if r.SourceTaskID != taskID && r.TargetTaskID != taskID {
-				return nil, fmt.Errorf("deps: snapshot: relation %s listed on unrelated task %s", r.ID, taskID)
-			}
+			byTask[id] = lr
+		}
+		rels, err = assembleDualEnd(byTask)
+		if err != nil {
+			return nil, err
 		}
 	}
 
-	out := make([]DependencyEdge, 0, len(accs))
-	var keys []string
-	for id := range accs {
-		keys = append(keys, id)
-	}
-	sort.Strings(keys)
-	for _, id := range keys {
-		a := accs[id]
-		if a.srcSide == nil || a.tgtSide == nil {
-			return nil, fmt.Errorf("deps: snapshot: relation %s not visible on both endpoints (one-sided)", id)
-		}
-		if !relationEqual(*a.srcSide, *a.tgtSide) {
-			return nil, fmt.Errorf("deps: snapshot: relation %s field disagreement between source and target listings", id)
-		}
-		e, merr := s.mapEdgeStrict(ctx, *a.srcSide)
+	out := make([]DependencyEdge, 0, len(rels))
+	for _, r := range rels {
+		e, merr := s.mapEdgeStrict(ctx, r)
 		if merr != nil {
 			return nil, merr
 		}
@@ -306,10 +342,87 @@ func (s *ProviderStore) SnapshotGraph(ctx context.Context) (*GraphSnapshot, erro
 		_, _ = h.Write([]byte(e.RelationID + "|" + e.CanonicalKey()))
 		_, _ = h.Write([]byte{0})
 	}
-	return &GraphSnapshot{
+	if out == nil {
+		out = []DependencyEdge{}
+	}
+	snap := &GraphSnapshot{
 		Edges:            out,
 		ProviderRevision: hex.EncodeToString(h.Sum(nil)),
-	}, nil
+	}
+	if fence := FenceFrom(ctx); fence != nil {
+		fence.setSnap(snap)
+	}
+	return cloneSnapshot(snap), nil
+}
+
+// RelationRevision is a cheap authoritative re-read of the project relation
+// multiset hash for final TOCTOU without re-running full gate hydration when
+// the fence already holds task maps. Still fails closed on bulk error.
+func (s *ProviderStore) RelationRevision(ctx context.Context) (string, error) {
+	// Force relation re-list: temporarily invalidate snap but keep task maps.
+	if fence := FenceFrom(ctx); fence != nil {
+		fence.Invalidate(false)
+	}
+	snap, err := s.SnapshotGraph(ctx)
+	if err != nil {
+		return "", err
+	}
+	return snap.ProviderRevision, nil
+}
+
+func assembleDualEnd(byTask map[string][]provider.Relation) ([]provider.Relation, error) {
+	type acc struct {
+		src *provider.Relation
+		tgt *provider.Relation
+	}
+	accs := map[string]*acc{}
+	for taskID, rels := range byTask {
+		for i := range rels {
+			r := rels[i]
+			if r.ID == "" {
+				return nil, fmt.Errorf("deps: snapshot: empty relation id on task %s", taskID)
+			}
+			a := accs[r.ID]
+			if a == nil {
+				a = &acc{}
+				accs[r.ID] = a
+			}
+			if r.SourceTaskID == taskID {
+				if a.src != nil && !relationEqual(*a.src, r) {
+					return nil, fmt.Errorf("deps: snapshot: relation %s inconsistent on source listings", r.ID)
+				}
+				cp := r
+				a.src = &cp
+			}
+			if r.TargetTaskID == taskID {
+				if a.tgt != nil && !relationEqual(*a.tgt, r) {
+					return nil, fmt.Errorf("deps: snapshot: relation %s inconsistent on target listings", r.ID)
+				}
+				cp := r
+				a.tgt = &cp
+			}
+			if r.SourceTaskID != taskID && r.TargetTaskID != taskID {
+				return nil, fmt.Errorf("deps: snapshot: relation %s listed on unrelated task %s", r.ID, taskID)
+			}
+		}
+	}
+	out := make([]provider.Relation, 0, len(accs))
+	var keys []string
+	for id := range accs {
+		keys = append(keys, id)
+	}
+	sort.Strings(keys)
+	for _, id := range keys {
+		a := accs[id]
+		if a.src == nil || a.tgt == nil {
+			return nil, fmt.Errorf("deps: snapshot: relation %s not visible on both endpoints (one-sided)", id)
+		}
+		if !relationEqual(*a.src, *a.tgt) {
+			return nil, fmt.Errorf("deps: snapshot: relation %s field disagreement between source and target listings", id)
+		}
+		out = append(out, *a.src)
+	}
+	return out, nil
 }
 
 func relationEqual(a, b provider.Relation) bool {
@@ -354,6 +467,10 @@ func (s *ProviderStore) CreateRelation(ctx context.Context, edge DependencyEdge)
 	if edge.Type == EdgeRelated {
 		typ = provider.RelationRelated
 	}
+	// Mutations invalidate fence so next snapshot is fresh.
+	if fence := FenceFrom(ctx); fence != nil {
+		fence.Invalidate(false)
+	}
 	rel, err := rp.CreateRelation(ctx, src, tgt, typ)
 	if err != nil {
 		if provider.IsAmbiguous(err) || provider.IsTimeout(err) {
@@ -382,10 +499,12 @@ func (s *ProviderStore) findEdgeBothEnds(ctx context.Context, src, tgt string, t
 	if err != nil {
 		return nil, err
 	}
+	s.ListRelCalls.Add(1)
 	srcRels, err := rp.ListRelations(ctx, src)
 	if err != nil {
 		return nil, err
 	}
+	s.ListRelCalls.Add(1)
 	tgtRels, err := rp.ListRelations(ctx, tgt)
 	if err != nil {
 		return nil, err
@@ -424,7 +543,6 @@ func (s *ProviderStore) DeleteRelation(ctx context.Context, relationID string, s
 	if err != nil {
 		return err
 	}
-	// Prefer capture from snapshot when endpoints incomplete.
 	if !sourceID.Valid() || !targetID.Valid() {
 		snap, serr := s.SnapshotGraph(ctx)
 		if serr != nil {
@@ -442,6 +560,9 @@ func (s *ProviderStore) DeleteRelation(ctx context.Context, relationID string, s
 			return fmt.Errorf("deps: delete relation %s not found for endpoint capture", relationID)
 		}
 	}
+	if fence := FenceFrom(ctx); fence != nil {
+		fence.Invalidate(false)
+	}
 	if err := rp.DeleteRelation(ctx, relationID, string(sourceID), string(targetID)); err != nil {
 		if provider.IsAmbiguous(err) || provider.IsTimeout(err) {
 			return fmt.Errorf("%w: %v", ErrAmbiguousMutation, err)
@@ -458,7 +579,6 @@ func mapRelTypeStrict(t provider.RelationType) EdgeType {
 	case provider.RelationBlocks:
 		return EdgeBlocks
 	default:
-		// Unknown/subtask fail ValidEdgeType — snapshot fails closed.
 		return EdgeType(strings.ToLower(string(t)))
 	}
 }

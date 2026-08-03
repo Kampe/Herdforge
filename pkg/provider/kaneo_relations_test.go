@@ -41,7 +41,7 @@ func TestConformance_Kaneo_CreateRelation_ErrorBodyIn200(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch {
-		case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "relations"):
+		case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "task-relation") || strings.Contains(r.URL.Path, "relations"):
 			w.WriteHeader(http.StatusOK)
 			w.Write([]byte(`[]`))
 		case r.Method == http.MethodPost:
@@ -92,7 +92,7 @@ func TestConformance_Kaneo_CreateRelation_IdempotentNoDuplicate(t *testing.T) {
 	}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		if r.Method == http.MethodGet && strings.Contains(r.URL.Path, "relations") {
+		if r.Method == http.MethodGet && strings.Contains(r.URL.Path, "task-relation") || strings.Contains(r.URL.Path, "relations") {
 			b, _ := json.Marshal([]kaneoRelationDTO{{
 				ID: existing.ID, SourceTaskID: existing.SourceTaskID,
 				TargetTaskID: existing.TargetTaskID, RelationType: string(existing.Type),
