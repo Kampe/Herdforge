@@ -224,22 +224,25 @@ func Refresh(ledger *Ledger, surface string, budget5h, budgetWeekly, ttl int, em
 		Blocks []struct {
 			IsActive    bool `json:"isActive"`
 			TotalTokens int  `json:"totalTokens"`
+			Projection  struct {
+				RemainingMinutes int `json:"remainingMinutes"`
+			} `json:"projection"`
 		} `json:"blocks"`
 	}
 	if blocksOK {
-		if !parseJSONOrFail(blocksJSON, &blocksDoc) {
+		if !parseJSONOrFail(blocksJSON, &blocksDoc) || blocksDoc.Blocks == nil {
 			return &RefreshResult{Output: "herd-credits: ccusage returned malformed blocks JSON, manual snapshot unchanged"}
 		}
 	}
 
 	dailyOK := dailyJSON != ""
 	var dailyDoc struct {
-		Totals struct {
+		Totals *struct {
 			TotalTokens int `json:"totalTokens"`
 		} `json:"totals"`
 	}
 	if dailyOK {
-		if !parseJSONOrFail(dailyJSON, &dailyDoc) {
+		if !parseJSONOrFail(dailyJSON, &dailyDoc) || dailyDoc.Totals == nil {
 			return &RefreshResult{Output: "herd-credits: ccusage returned malformed daily JSON, manual snapshot unchanged"}
 		}
 	}
@@ -303,7 +306,6 @@ func Refresh(ledger *Ledger, surface string, budget5h, budgetWeekly, ttl int, em
 				if strings.EqualFold(a.Email, activeEmail) {
 					rec.Accounts[i].UsedPct = pctWeek
 					rec.Accounts[i].Updated = NowEpoch()
-					rec.Accounts[i].Note = "ccusage"
 					if hourlyDead == 1 {
 						rec.Accounts[i].ExhaustedUntil = untilEpoch
 					} else {
@@ -320,7 +322,6 @@ func Refresh(ledger *Ledger, surface string, budget5h, budgetWeekly, ttl int, em
 					UsedPct:   pctWeek,
 					BurnOrder: bo,
 					Updated:   NowEpoch(),
-					Note:      "ccusage",
 				}
 				if hourlyDead == 1 {
 					acct.ExhaustedUntil = untilEpoch
@@ -336,7 +337,6 @@ func Refresh(ledger *Ledger, surface string, budget5h, budgetWeekly, ttl int, em
 			rec.Updated = NowEpoch()
 			rec.Source = "ccusage"
 		}
-		rec.Note = BuildPoolNote(rec.Accounts, "ccusage")
 		data[surface] = rec
 	})
 
@@ -579,7 +579,7 @@ func (lc *LedgerCommands) Pace(surface string) string {
 		return fmt.Sprintf("%s: exhausted -> concurrency 0", surface)
 	}
 
-	trueUsed := int(math.Round(EffectiveUsed(rec)))
+	trueUsed := int(math.Floor(EffectiveUsed(rec)))
 	window := *rec.WindowDays
 	left := 0
 	if rec.DaysLeft != nil {
@@ -729,7 +729,9 @@ type QuotaPoolEntry struct {
 	Reason    string      `json:"reason"`
 }
 
-type QuotaProvider map[string]QuotaPoolEntry
+type QuotaProvider struct {
+	Pools map[string]QuotaPoolEntry `json:"pools"`
+}
 
 type QuotaJSON map[string]QuotaProvider
 
@@ -779,7 +781,7 @@ func (lc *LedgerCommands) Advise() string {
 			sort.Strings(providers)
 
 			for _, prov := range providers {
-				pools := qj[prov]
+				pools := qj[prov].Pools
 				poolKeys := make([]string, 0, len(pools))
 				for pk := range pools {
 					poolKeys = append(poolKeys, pk)
@@ -794,14 +796,23 @@ func (lc *LedgerCommands) Advise() string {
 					if p.Reason != "ok" && p.Reason != "exhausted" {
 						continue
 					}
-					normProvider := normalizeProviderKey(poolKey)
-					liveProviders[normProvider] = true
+					liveProviders[normalizeProviderKey(prov)] = true
 
 					used, _ := parseQuotaInt(p.Used)
-					rem, _ := parseQuotaInt(p.Remaining)
-					resets, _ := parseQuotaInt(p.ResetsIn)
-					out.WriteString(fmt.Sprintf("%s/%s: %d%% used, %d remaining, %s class, resets in %d\n",
-						prov, poolKey, used, rem, p.Class, resets))
+					left := 100 - used
+					if left < 0 {
+						left = 0
+					}
+					resetsStr := ""
+					if p.ResetsIn != nil {
+						if s, ok := p.ResetsIn.(string); ok {
+							resetsStr = s
+						} else if n, ok := parseQuotaInt(p.ResetsIn); ok {
+							resetsStr = fmt.Sprintf("%d", n)
+						}
+					}
+					out.WriteString(fmt.Sprintf("  %s/%s: %d%% used, %d%% left, %s, reset %s\n",
+						prov, poolKey, used, left, p.Class, resetsStr))
 				}
 			}
 		}
@@ -809,6 +820,8 @@ func (lc *LedgerCommands) Advise() string {
 
 	if !liveOK {
 		out.WriteString("live quota unavailable (missing or malformed); falling back to ledger snapshots:\n")
+	} else {
+		out.WriteString("ledger-only fallback snapshots (used only when live quota is unavailable):\n")
 	}
 
 	// print ledger pace rows for surfaces without live coverage

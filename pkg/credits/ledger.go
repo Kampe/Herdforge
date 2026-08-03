@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 )
 
 type AccountRow struct {
@@ -45,10 +46,18 @@ func OpenLedger(path string) (*Ledger, error) {
 		if err != nil {
 			return nil, fmt.Errorf("credits: read ledger: %w", err)
 		}
-		if len(raw) > 0 {
-			if err := json.Unmarshal(raw, &data); err != nil {
-				return nil, fmt.Errorf("credits: parse ledger: %w", err)
-			}
+		if len(raw) == 0 {
+			return nil, fmt.Errorf("credits: ledger file is empty (zero bytes)")
+		}
+		trimmed := strings.TrimSpace(string(raw))
+		if trimmed == "null" {
+			return nil, fmt.Errorf("credits: ledger file contains JSON null")
+		}
+		if err := json.Unmarshal(raw, &data); err != nil {
+			return nil, fmt.Errorf("credits: parse ledger: %w", err)
+		}
+		if data == nil {
+			return nil, fmt.Errorf("credits: ledger file did not contain a JSON object")
 		}
 	} else if !os.IsNotExist(err) {
 		return nil, fmt.Errorf("credits: stat ledger: %w", err)

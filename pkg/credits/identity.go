@@ -9,6 +9,9 @@ import (
 
 func ClaudeActiveEmail(accountsDir string) string {
 	if accountsDir == "" {
+		accountsDir = os.Getenv("HERD_CLAUDE_ACCOUNTS_DIR")
+	}
+	if accountsDir == "" {
 		accountsDir = os.Getenv("HOME") + "/.claude/accounts"
 	}
 	sidecar := accountsDir + "/active.email"
@@ -30,9 +33,9 @@ func ClaudeEmailToAccount(email string) string {
 		return "yuga"
 	default:
 		if idx := strings.Index(email, "@"); idx >= 0 {
-			return email[:idx]
+			return strings.ToLower(email[:idx])
 		}
-		return email
+		return strings.ToLower(email)
 	}
 }
 
