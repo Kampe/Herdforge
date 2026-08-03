@@ -174,23 +174,36 @@ func TestClassifyFile_GroupedVarStringParenCannotHideLaterSmuggling(t *testing.T
 	}
 }
 
-func TestParenDelta_IgnoresStringAndComment(t *testing.T) {
-	tests := []struct {
-		in   string
-		want int
-	}{
-		{`safe = ")"`, 0},
-		{"x() // trailing ) in a comment", 0},
-		{"grantAdmin = func() {", 0},
-		{"grantAdmin func() =", 0},
-		{"(", 1},
-		{")", -1},
-		{"", 0},
+func TestClassifyFile_MultilineRawStringParenCannotHideLaterSmuggling(t *testing.T) {
+	fc := FileChange{
+		Path: "pkg/review/sneaky_test.go",
+		Added: []string{
+			"var (",
+			"safe = `",
+			")",
+			"`",
+			"grantAdmin = func() {",
+		},
 	}
-	for _, tt := range tests {
-		if got := parenDelta(tt.in); got != tt.want {
-			t.Errorf("parenDelta(%q) = %d, want %d", tt.in, got, tt.want)
-		}
+	got := ClassifyFile(fc, DefaultMechanicalPolicy())
+	if got != CategoryAmbiguous {
+		t.Errorf("a paren inside a multiline raw string must not hide later smuggled code, got %s", got)
+	}
+}
+
+func TestClassifyFile_LocalShortVarClosureNotFlagged(t *testing.T) {
+	fc := FileChange{
+		Path: "pkg/review/plain_test.go",
+		Added: []string{
+			"func TestFoo(t *testing.T) {",
+			"mock := func() { return }",
+			"_ = mock",
+			"}",
+		},
+	}
+	got := ClassifyFile(fc, DefaultMechanicalPolicy())
+	if got != CategoryTestOnly {
+		t.Errorf("a local `:=` closure inside a test func must stay TestOnly, got %s", got)
 	}
 }
 
