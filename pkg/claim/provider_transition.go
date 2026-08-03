@@ -19,6 +19,42 @@ var (
 	ErrOutboxNotConfigured   = errors.New("claim: no DurableOutbox configured (see WithDurableOutbox)")
 )
 
+// ErrLeaseNotCurrent is returned by BeginProviderTransition/
+// CompleteProviderTransition when the caller's (key, ownerID, generation)
+// does not match the currently active lease: no active lease at all
+// (released, or expired and not yet reclaimed), a wrong owner, or a
+// generation superseded by a reclaim. A provider mutation must never be
+// attempted on behalf of a lease the caller no longer (or never did)
+// hold.
+var ErrLeaseNotCurrent = errors.New("claim: key/owner/generation is not the current active lease")
+
+// verifyCurrentLease fences a provider-transition attempt against live
+// lease state: only the exact current owner at the exact current
+// generation may enqueue or complete a provider mutation for key. Reads
+// via ActiveClaims, so it naturally rejects released and (once expired
+// and evicted by an Acquire/ExpireStale) expired leases the same way it
+// rejects a wrong owner or a stale generation -- all of those simply
+// mean "the given identity is not in the active-claims set right now".
+func (m *ClaimManager) verifyCurrentLease(ctx context.Context, key LeaseKey, ownerID string, generation int64) error {
+	claims, err := m.store.ActiveClaims(ctx, m.now())
+	if err != nil {
+		return fmt.Errorf("claim: verify current lease: %w", err)
+	}
+	for _, l := range claims {
+		if l.LeaseKey != key {
+			continue
+		}
+		if l.OwnerID != ownerID {
+			return fmt.Errorf("%w: %s is held by %s, not %s", ErrLeaseNotCurrent, key.TaskRef, l.OwnerID, ownerID)
+		}
+		if l.Generation != generation {
+			return fmt.Errorf("%w: %s active generation is %d, caller had %d", ErrLeaseNotCurrent, key.TaskRef, l.Generation, generation)
+		}
+		return nil
+	}
+	return fmt.Errorf("%w: no active lease for %s", ErrLeaseNotCurrent, key.TaskRef)
+}
+
 // ProviderTransitionVerifier checks whether the provider mutation an
 // OutboxRecord represents has already taken effect, so
 // ReconcileProviderTransitions can close out a record left ambiguous by
@@ -45,14 +81,23 @@ func providerIntentKey(key LeaseKey, generation int64) string {
 }
 
 // BeginProviderTransition durably records the intent to mutate the
-// provider board for an already-claimed lease (key/generation), before
-// attempting the mutation. Idempotent: calling it again for the same
+// provider board for an already-claimed lease, before attempting the
+// mutation. ownerID/generation must match the CURRENT active lease for
+// key exactly -- a released, expired-and-reclaimed (superseded
+// generation), wrong-owner, or entirely absent lease is rejected with
+// ErrLeaseNotCurrent and never reaches the outbox, so a stale caller can
+// never even record intent to mutate the provider, let alone attempt it.
+//
+// Idempotent for a valid caller: calling it again for the same
 // lease/generation returns the existing record unchanged -- a retry
 // after a crash before the mutation was ever attempted just re-reads the
 // same pending intent instead of creating a duplicate.
-func (m *ClaimManager) BeginProviderTransition(ctx context.Context, key LeaseKey, generation int64, kind string) (*OutboxRecord, error) {
+func (m *ClaimManager) BeginProviderTransition(ctx context.Context, key LeaseKey, ownerID string, generation int64, kind string) (*OutboxRecord, error) {
 	if m.outboxStore == nil {
 		return nil, ErrOutboxNotConfigured
+	}
+	if err := m.verifyCurrentLease(ctx, key, ownerID, generation); err != nil {
+		return nil, err
 	}
 	return m.outboxStore.Enqueue(ctx, OutboxIntent{IdempotencyKey: providerIntentKey(key, generation), Kind: kind})
 }
@@ -74,14 +119,28 @@ func (m *ClaimManager) BeginProviderTransition(ctx context.Context, key LeaseKey
 // the record Failed with the error recorded, and does NOT touch the
 // underlying lease -- the caller still holds it and may retry with a
 // freshly-read revision.
-func (m *ClaimManager) CompleteProviderTransition(ctx context.Context, idempotencyKey, taskID string, expectedRevision ProviderRevision, mutate func(ctx context.Context) error) (*OutboxRecord, error) {
+//
+// ownerID/generation are fenced against the CURRENT active lease TWICE:
+// once on entry, before touching the outbox at all, and again
+// immediately before the ProviderCAS call, after the outbox claim
+// succeeds -- closing the window where the lease was released, expired,
+// or reclaimed to a new generation in between (e.g. by the caller's own
+// Release racing this call, or an expiry sweep). Either check failing
+// returns ErrLeaseNotCurrent and guarantees zero ProviderCAS calls; on
+// the second check, the outbox record is also marked Failed so it does
+// not sit claimed and orphaned.
+func (m *ClaimManager) CompleteProviderTransition(ctx context.Context, key LeaseKey, ownerID string, generation int64, taskID string, expectedRevision ProviderRevision, mutate func(ctx context.Context) error) (*OutboxRecord, error) {
 	if m.provider == nil {
 		return nil, ErrProviderNotConfigured
 	}
 	if m.outboxStore == nil {
 		return nil, ErrOutboxNotConfigured
 	}
+	if err := m.verifyCurrentLease(ctx, key, ownerID, generation); err != nil {
+		return nil, err
+	}
 
+	idempotencyKey := providerIntentKey(key, generation)
 	rec, err := m.outboxStore.Claim(ctx, idempotencyKey, m.settlerID, m.capacityClaimTimeout, m.now())
 	if err != nil {
 		return nil, fmt.Errorf("claim: claim provider transition: %w", err)
@@ -90,6 +149,11 @@ func (m *ClaimManager) CompleteProviderTransition(ctx context.Context, idempoten
 		// Not ours to attempt right now (already Applied, or another
 		// settler currently owns the claim) -- report current state.
 		return m.outboxStore.Get(ctx, idempotencyKey)
+	}
+
+	if err := m.verifyCurrentLease(ctx, key, ownerID, generation); err != nil {
+		_ = m.outboxStore.MarkFailed(ctx, idempotencyKey, m.settlerID, err.Error(), m.now())
+		return nil, err
 	}
 
 	if _, casErr := m.provider.CompareAndSwap(ctx, taskID, expectedRevision, mutate); casErr != nil {
