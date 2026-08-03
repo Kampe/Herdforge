@@ -101,10 +101,27 @@ func gbToBytes(gb float64) uint64 {
 	return uint64(b)
 }
 
+// satAdd adds with saturation — floor arithmetic must never wrap toward a
+// tiny (fail-open) value.
+func satAdd(a, b uint64) uint64 {
+	if a > math.MaxUint64-b {
+		return math.MaxUint64
+	}
+	return a + b
+}
+
+// satMul2 doubles with saturation.
+func satMul2(a uint64) uint64 {
+	if a > math.MaxUint64/2 {
+		return math.MaxUint64
+	}
+	return 2 * a
+}
+
 // blockFreeBytes is the effective byte floor: reserve plus required
-// temp/build headroom. Both terms are ≤ 2^62 so the sum cannot wrap.
+// temp/build headroom, saturating.
 func (t DiskThresholds) blockFreeBytes() uint64 {
-	return t.MinFreeBytes + t.HeadroomBytes
+	return satAdd(t.MinFreeBytes, t.HeadroomBytes)
 }
 
 // DiskPressureError is the structured BLOCKED evidence emitted when a fleet
@@ -128,6 +145,7 @@ const (
 	ReasonDiskPressure   = "disk_pressure"
 	ReasonStatUnreadable = "disk_stat_unreadable"
 	ReasonRecovering     = "disk_pressure_recovering"
+	ReasonScopeUnknown   = "disk_scope_unknown"
 )
 
 const safeNextAction = "refusing new fleet mutations; nothing was deleted — reclaim space only via the safe-GC contract (never ad-hoc force removal), then retry after a fresh probe shows headroom above the recover threshold"
@@ -377,6 +395,18 @@ func adjustForOutstanding(stats []DiskStat, out uint64) []DiskStat {
 
 // evaluateLocked drives the state machine; caller holds g.mu.
 func (g *DiskGuard) evaluateLocked(operation string, th DiskThresholds, stats []DiskStat, unreadable *DiskPressureError) error {
+	// Zero probed volumes is NOT health — an unknown volume scope fails
+	// closed exactly like an unreadable stat.
+	if unreadable == nil && len(stats) == 0 {
+		unreadable = &DiskPressureError{
+			State:      "BLOCKED",
+			Reason:     ReasonScopeUnknown,
+			Operation:  operation,
+			Thresholds: th,
+			Detail:     "no volumes probed (empty or blank path scope); unknown capacity is never permission to mutate",
+			NextAction: safeNextAction,
+		}
+	}
 	if unreadable != nil {
 		g.state = DiskBlocked
 		g.lastEvidence = unreadable
@@ -475,7 +505,7 @@ func (g *DiskGuard) Advise(operation string, paths ...string) DiskAdvice {
 
 	softBytes := gbToBytes(envFloat(EnvDiskSerializeFreeGB, 0))
 	if softBytes == 0 {
-		softBytes = 2 * th.blockFreeBytes()
+		softBytes = satMul2(th.blockFreeBytes())
 	}
 	softPct := envFloat(EnvDiskSerializeFreePct, 2*th.MinFreePct)
 

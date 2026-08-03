@@ -548,3 +548,32 @@ func TestDiskGuardEvidenceSinkTransitionsOnly(t *testing.T) {
 		t.Fatalf("ok must carry nil evidence, got %+v", sink.evs[2])
 	}
 }
+
+func TestDiskGuardEmptyScopeFailsClosed(t *testing.T) {
+	g := NewDiskGuard(fakeProber(map[string]DiskStat{}, nil))
+	for _, paths := range [][]string{nil, {}, {""}} {
+		err := g.Check("dispatch", paths...)
+		pe := asPressureErr(t, err)
+		if pe.Reason != ReasonScopeUnknown {
+			t.Fatalf("reason = %q, want %q", pe.Reason, ReasonScopeUnknown)
+		}
+	}
+	if _, err := g.Admit("dispatch"); err == nil {
+		t.Fatal("empty-scope Admit must refuse")
+	}
+	if adv := g.Advise("dispatch"); adv.Verdict != AdviceRefuse {
+		t.Fatalf("empty-scope Advise must refuse: %+v", adv)
+	}
+}
+
+func TestDiskGuardSoftFloorSaturates(t *testing.T) {
+	// Both reserve and headroom saturated: 2x the block floor must clamp,
+	// not wrap to a tiny soft floor.
+	t.Setenv(EnvDiskMinFreeGB, "1099511627776")
+	t.Setenv(EnvDiskBuildHeadroomGB, "1099511627776")
+	g := NewDiskGuard(fakeProber(map[string]DiskStat{"/repo": healthyStat("/repo", "a")}, nil))
+	adv := g.Advise("dispatch", "/repo")
+	if adv.Verdict != AdviceRefuse {
+		t.Fatalf("saturated floors must refuse, got %+v", adv)
+	}
+}
