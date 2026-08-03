@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Kampe/Herdforge/pkg/preflight"
 	"github.com/Kampe/Herdforge/pkg/provider"
 )
 
@@ -102,6 +103,12 @@ func (e *Engine) ForgeLoop(ctx context.Context, d ForgeDriver, opts ForgeLoopOpt
 		case ActionDispatch:
 			if e.health.isBlocked() {
 				d.Log("forge: " + e.ProviderStatus() + " — skip dispatch")
+				break
+			}
+			// Fresh disk probe each tick: refuses under pressure and also
+			// drives BLOCKED → recovering → ok as headroom returns (FAC-153).
+			if err := preflight.CheckDiskPressure("dispatch", e.diskPaths()...); err != nil {
+				d.Log("forge: " + e.DiskStatus() + " — skip dispatch (disk pressure)")
 				break
 			}
 			d.Log("forge: dispatch " + action.Ref)

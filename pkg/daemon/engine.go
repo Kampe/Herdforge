@@ -3,10 +3,12 @@ package daemon
 import (
 	"context"
 	"fmt"
+	"os"
 	"sort"
 	"strings"
 
 	"github.com/Kampe/Herdforge/pkg/config"
+	"github.com/Kampe/Herdforge/pkg/preflight"
 	"github.com/Kampe/Herdforge/pkg/provider"
 	"github.com/Kampe/Herdforge/pkg/router"
 	"github.com/Kampe/Herdforge/pkg/store"
@@ -51,6 +53,22 @@ func (e *Engine) ProviderHealth() ProviderHealth {
 // ProviderStatus is the fleet label: ok | recovering | BLOCKED(provider_timeout).
 func (e *Engine) ProviderStatus() string {
 	return e.ProviderHealth().String()
+}
+
+// DiskStatus is the disk-capacity fleet label (FAC-153):
+// ok | recovering | BLOCKED(disk_pressure) | BLOCKED(disk_stat_unreadable).
+func (e *Engine) DiskStatus() string {
+	return preflight.DefaultDiskGuard.Status()
+}
+
+// diskPaths are the volumes a claim/dispatch would mutate: temp always,
+// plus canonical repo and worktree pool when wired.
+func (e *Engine) diskPaths() []string {
+	paths := []string{os.TempDir()}
+	if e.Worktree != nil {
+		paths = append(paths, e.Worktree.RepoRoot, e.Worktree.WorktreeDir)
+	}
+	return paths
 }
 
 func (e *Engine) deadlines() provider.Deadlines {
@@ -136,6 +154,12 @@ func (e *Engine) RunPulse(ctx context.Context, role string) (*provider.Task, err
 	// BLOCKED: do not claim more work; surface status and stay responsive.
 	if e.health.isBlocked() {
 		return nil, fmt.Errorf("pulse sweep refused: %s", e.ProviderStatus())
+	}
+	// Critical disk pressure prevents a new claim before any board mutation
+	// (FAC-153). A refusal is an explicit BLOCKED error, never nil,nil —
+	// pressure must not read as "no work available".
+	if err := preflight.CheckDiskPressure("claim", e.diskPaths()...); err != nil {
+		return nil, fmt.Errorf("pulse sweep refused: %w", err)
 	}
 
 	task, err := e.SelectNextTask(ctx, role)
