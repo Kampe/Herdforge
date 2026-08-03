@@ -5,6 +5,8 @@ import (
 	"testing"
 
 	"github.com/Kampe/Herdforge/pkg/config"
+	"github.com/Kampe/Herdforge/pkg/launch"
+	"github.com/Kampe/Herdforge/pkg/router"
 )
 
 func TestWorkerConfigDriftRejectsBeforeLaunch(t *testing.T) {
@@ -13,9 +15,41 @@ func TestWorkerConfigDriftRejectsBeforeLaunch(t *testing.T) {
 	if !errors.Is(err, ErrWorkerConfigPolicy) {
 		t.Fatalf("drift must fail at worker policy boundary, got %v", err)
 	}
-	var claims, worktrees, tabs, processes, prompts, boardWrites int
-	if claims+worktrees+tabs+processes+prompts+boardWrites != 0 {
-		t.Fatal("rejected config mutated launch state")
+}
+
+type launchAdmissionRecorder struct{ providerList, claim, status, comment, worktree, tab, process, prompt int }
+
+func (r *launchAdmissionRecorder) all(decision *router.LaunchDecision) error {
+	if decision == nil {
+		return errors.New("missing decision")
+	}
+	r.providerList++
+	r.claim++
+	r.status++
+	r.comment++
+	r.worktree++
+	r.tab++
+	r.process++
+	r.prompt++
+	return nil
+}
+
+func TestLaunchAdmissionRejectsBeforeCompiledLifecycleSeams(t *testing.T) {
+	cfg := &config.Config{Lanes: []config.LaneDef{{Name: "mutant", Role: "worker", AgentKind: "codex", Provider: "codex", Model: "gpt-5.6-sol", Effort: "medium", TaskShape: "implementation"}}}
+	rec := &launchAdmissionRecorder{}
+	valid, err := router.NewRouter(nil, nil).Decide(router.LaunchRequest{Role: router.RoleWorker, Shape: launch.Implementation, RequestedProvider: launch.WorkerProvider, RequestedModel: launch.WorkerModel, RequestedEffort: launch.WorkerEffort, ProbeResults: map[string]bool{router.ProbeKey(launch.WorkerProvider, launch.WorkerModel): true}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	decision, err := launchAdmission(cfg, "worker", true, func(*config.LaneDef) (*router.LaunchDecision, error) { return valid, nil })
+	if !errors.Is(err, ErrWorkerConfigPolicy) {
+		t.Fatalf("config must reject before lifecycle seams: %v", err)
+	}
+	if err == nil {
+		_ = rec.all(decision)
+	}
+	if *rec != (launchAdmissionRecorder{}) {
+		t.Fatalf("rejected launch invoked lifecycle seams: %+v", rec)
 	}
 }
 

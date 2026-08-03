@@ -73,7 +73,8 @@ lanes:
     incompatible_with: ["reviewer"]
 
   # assayer — independent review. Soft default is a DIFFERENT family from the
-  # deepseek flash smiths (anthropic). Effort is always router-owned: medium
+  # Reviewer independence is enforced from candidate provenance. Worker and
+  # forge-smith lanes use the explicit Codex/Luna/medium policy above.
   # by default; high only for final-pass/critical R2/R3 (FAC-142).
   - name: "assayer"
     role: "reviewer"
