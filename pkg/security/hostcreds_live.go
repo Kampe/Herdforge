@@ -309,14 +309,18 @@ func StartAuthorLive(cfg LiveConfig) (*HostCredsSession, *exec.Cmd, *LiveProof, 
 
 	proof.ModelMarkerReached = VerifyCapabilityOutput(cap, prompt, combined)
 
-	// Bound receipt: must match this session + nonce + peer port; single consume.
+	// Bound receipt: must match this session + nonce + claimed peer port;
+	// single consume. Receipt from a different peer (helper) cannot satisfy.
 	rcpt, ok := sess.Mitm.ConsumeReceiptFor(sid, cap.Nonce, port, "")
-	if ok && rcpt.InjectOK {
+	switch {
+	case !ok || !rcpt.InjectOK || rcpt.PeerPort != port || rcpt.SessionID != sid:
+		proof.BrokerReached = false
+	case rcpt.AuthorPID != 0 && proof.AuthorPID != 0 && rcpt.AuthorPID != proof.AuthorPID:
+		// Receipt stamped for a different process — reject.
+		proof.BrokerReached = false
+	default:
 		proof.BrokerReached = true
 		proof.ReceiptDigest = rcpt.RequestDigest
-		if rcpt.PeerPort == port {
-			proof.WorkerProbeOK = proof.WorkerProbeOK || true
-		}
 	}
 
 	if err := bound.AdversarialProbe(); err != nil {

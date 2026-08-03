@@ -295,12 +295,15 @@ func ProveAuthorCausalSession(mitm *TLSMitmProxy, allowHost, denyHost, sessionID
 	return &res, rcpt, nil
 }
 
-// ProvePortReplayDenied: after one-shot grant is consumed, rebinding the same
-// port number must not authorize CONNECT.
+// ProvePortReplayDenied: after one-shot grant is consumed, CONNECT from any
+// client (including rebinding the same source port) must 403 without a new grant.
 func ProvePortReplayDenied(mitm *TLSMitmProxy, host string) error {
 	if mitm == nil {
 		return fmt.Errorf("nil")
 	}
+	// Ensure no PID fail-open path during this proof.
+	mitm.ClearPeerAllowlists()
+
 	port, f, err := ClaimLocalPort()
 	if err != nil {
 		return err
@@ -319,47 +322,43 @@ func ProvePortReplayDenied(mitm *TLSMitmProxy, host string) error {
 	buf := make([]byte, 128)
 	n, _ := c1.Read(buf)
 	_ = c1.Close()
-	if !strings.Contains(string(buf[:n]), "200") {
-		// May 502 if upstream fails after peer OK — peer was accepted if not 403.
-		if strings.Contains(string(buf[:n]), "403") {
-			return fmt.Errorf("first connect peer denied: %q", string(buf[:n]))
-		}
+	first := string(buf[:n])
+	if strings.Contains(first, "403") {
+		return fmt.Errorf("first connect peer denied: %q", first)
 	}
-	// Release port; bind same port if possible and CONNECT again — must 403.
-	// Re-claim: try bind fixed port.
-	fd, err := syscallSocketBindPort(port)
-	if err != nil {
-		// Port may still be in TIME_WAIT — use fresh port with stale grant (already consumed).
-		// Re-register is not done; dial from new port must 403.
-		c2, err2 := net.DialTimeout("tcp", mitm.Addr(), 2*time.Second)
-		if err2 != nil {
-			return err2
-		}
-		defer c2.Close()
-		_, _ = fmt.Fprintf(c2, "CONNECT %s:443 HTTP/1.1\r\nHost: %s:443\r\n\r\n", host, host)
-		n2, _ := c2.Read(buf)
-		if !strings.Contains(string(buf[:n2]), "403") {
-			return fmt.Errorf("post-consume unattributed CONNECT not 403: %q", string(buf[:n2]))
-		}
-		return nil
+	// Peer was accepted (200 or later 502 from upstream) — grant must be gone.
+	mitm.mu.Lock()
+	_, still := mitm.oneShot[port]
+	mitm.mu.Unlock()
+	if still {
+		return fmt.Errorf("oneshot grant not consumed for port %d", port)
 	}
-	f2 := os.NewFile(uintptr(fd), "replay")
-	c2, err := ConnectClaimed(f2, mitm.Addr())
-	_ = f2.Close()
+
+	// (1) Unattributed dial must 403.
+	c2, err := net.DialTimeout("tcp", mitm.Addr(), 2*time.Second)
 	if err != nil {
 		return err
 	}
-	defer c2.Close()
 	_, _ = fmt.Fprintf(c2, "CONNECT %s:443 HTTP/1.1\r\nHost: %s:443\r\n\r\n", host, host)
 	n2, _ := c2.Read(buf)
+	_ = c2.Close()
 	if !strings.Contains(string(buf[:n2]), "403") {
-		return fmt.Errorf("port replay not denied: %q", string(buf[:n2]))
+		return fmt.Errorf("post-consume unattributed CONNECT not 403: %q", string(buf[:n2]))
+	}
+
+	// (2) Rebind same port if kernel allows — must still 403 (grant consumed).
+	if fd, berr := bindExactPort(port); berr == nil {
+		f2 := os.NewFile(uintptr(fd), "replay")
+		c3, cerr := ConnectClaimed(f2, mitm.Addr())
+		_ = f2.Close()
+		if cerr == nil {
+			_, _ = fmt.Fprintf(c3, "CONNECT %s:443 HTTP/1.1\r\nHost: %s:443\r\n\r\n", host, host)
+			n3, _ := c3.Read(buf)
+			_ = c3.Close()
+			if !strings.Contains(string(buf[:n3]), "403") {
+				return fmt.Errorf("port %d replay not denied: %q", port, string(buf[:n3]))
+			}
+		}
 	}
 	return nil
-}
-
-func syscallSocketBindPort(port int) (int, error) {
-	// Use ClaimLocalPort path: if we can bind exact port, return fd.
-	// Implemented via raw socket in peer_bind style.
-	return bindExactPort(port)
 }

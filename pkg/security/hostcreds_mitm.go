@@ -182,7 +182,9 @@ func (p *TLSMitmProxy) CAPEMPath() string {
 	return p.caPath
 }
 
-// AllowPID registers a single-use Linux peer PID (secondary). Prefer AllowOneShotPeer.
+// AllowPID registers a single-use Linux peer PID (secondary, tests only).
+// Production live path must NOT call this — use AllowOneShotPeer + inherited FD.
+// RecordHarnessPrompt intentionally does not call AllowPID.
 func (p *TLSMitmProxy) AllowPID(pid int) {
 	if p == nil || pid <= 0 {
 		return
@@ -212,6 +214,21 @@ func (p *TLSMitmProxy) AllowOneShotPeer(g PeerGrant) error {
 	cp := g
 	p.oneShot[g.Port] = &cp
 	return nil
+}
+
+// BindOneShotAuthorPID stamps AuthorPID onto all unconsumed one-shot grants
+// (after child Start). Does not grant peer access by PID.
+func (p *TLSMitmProxy) BindOneShotAuthorPID(pid int) {
+	if p == nil || pid <= 0 {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, g := range p.oneShot {
+		if g != nil && !g.Consumed {
+			g.AuthorPID = pid
+		}
+	}
 }
 
 // AllowClientPort is a thin wrapper for tests: one-shot grant without nonce.
