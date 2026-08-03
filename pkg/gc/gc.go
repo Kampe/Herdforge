@@ -81,3 +81,22 @@ func (g *GCManager) PressureReclamationPlan(ctx context.Context, defaultBranch s
 	}
 	return g.WM.PlanReap(ctx, worktree.ReapPolicy{DefaultBranch: defaultBranch})
 }
+
+// ReclaimExact executes reclamation for an EXPLICIT exact-target set through
+// the FAC-117 Reap contract: per-target just-in-time revalidation, salvage
+// refs before removal, and hard refusal of dirty/unique/unknown/protected/
+// root trees. An empty target set is refused outright — there is no broad
+// or automatic cleanup through this path (FAC-153).
+func (g *GCManager) ReclaimExact(ctx context.Context, defaultBranch string, targets []string) (*worktree.ReapReport, error) {
+	if len(targets) == 0 {
+		return nil, fmt.Errorf("reclaim requires explicit exact targets from a reclamation plan; broad cleanup is forbidden (FAC-153)")
+	}
+	if defaultBranch == "" {
+		defaultBranch = "main"
+	}
+	return g.WM.Reap(ctx, worktree.ReapPolicy{
+		DefaultBranch: defaultBranch,
+		AutoReap:      true,
+		TargetPaths:   targets,
+	})
+}
