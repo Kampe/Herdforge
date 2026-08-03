@@ -2,6 +2,7 @@ package claim
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"sync"
@@ -128,7 +129,7 @@ func TestClaimManager_ProviderTransition_HappyPath(t *testing.T) {
 		t.Fatalf("claim: %v", err)
 	}
 
-	rec, err := mgr.BeginProviderTransition(ctx, key, lease.Generation, "provider_mutation")
+	rec, err := mgr.BeginProviderTransition(ctx, key, "w1", lease.Generation, "provider_mutation")
 	if err != nil {
 		t.Fatalf("begin: %v", err)
 	}
@@ -136,7 +137,7 @@ func TestClaimManager_ProviderTransition_HappyPath(t *testing.T) {
 		t.Fatalf("expected pending, got %s", rec.Status)
 	}
 
-	rec, err = mgr.CompleteProviderTransition(ctx, rec.IdempotencyKey, "FAC-30", "1", func(ctx context.Context) error {
+	rec, err = mgr.CompleteProviderTransition(ctx, key, "w1", lease.Generation, "FAC-30", "1", func(ctx context.Context) error {
 		provider.setStatus("FAC-30", "in-progress")
 		return nil
 	})
@@ -155,7 +156,7 @@ func TestClaimManager_ProviderTransition_HappyPath(t *testing.T) {
 
 	// Idempotent replay of an already-applied intent must not re-invoke
 	// CompareAndSwap.
-	rec, err = mgr.CompleteProviderTransition(ctx, rec.IdempotencyKey, "FAC-30", "1", func(ctx context.Context) error {
+	rec, err = mgr.CompleteProviderTransition(ctx, key, "w1", lease.Generation, "FAC-30", "1", func(ctx context.Context) error {
 		t.Fatal("mutate should not run again for an already-applied intent")
 		return nil
 	})
@@ -183,13 +184,13 @@ func TestClaimManager_ProviderTransition_StaleRevision_LeaseUntouched(t *testing
 	if err != nil {
 		t.Fatalf("claim: %v", err)
 	}
-	rec, err := mgr.BeginProviderTransition(ctx, key, lease.Generation, "provider_mutation")
+	rec, err := mgr.BeginProviderTransition(ctx, key, "w1", lease.Generation, "provider_mutation")
 	if err != nil {
 		t.Fatalf("begin: %v", err)
 	}
 
 	// Attempt with a stale expected revision ("1" instead of the real "5").
-	rec, err = mgr.CompleteProviderTransition(ctx, rec.IdempotencyKey, "FAC-31", "1", func(ctx context.Context) error {
+	rec, err = mgr.CompleteProviderTransition(ctx, key, "w1", lease.Generation, "FAC-31", "1", func(ctx context.Context) error {
 		t.Fatal("mutate must not run on a revision mismatch")
 		return nil
 	})
@@ -211,7 +212,7 @@ func TestClaimManager_ProviderTransition_StaleRevision_LeaseUntouched(t *testing
 	}
 
 	// Corrected retry with the real current revision succeeds.
-	rec, err = mgr.CompleteProviderTransition(ctx, rec.IdempotencyKey, "FAC-31", provider.revisionOf("FAC-31"), func(ctx context.Context) error {
+	rec, err = mgr.CompleteProviderTransition(ctx, key, "w1", lease.Generation, "FAC-31", provider.revisionOf("FAC-31"), func(ctx context.Context) error {
 		provider.setStatus("FAC-31", "claimed")
 		return nil
 	})
@@ -253,7 +254,7 @@ func TestClaimManager_ProviderSuccessLocalFailure_ReconciliationClosesWithoutRep
 	if err != nil {
 		t.Fatalf("claim: %v", err)
 	}
-	rec, err := mgr.BeginProviderTransition(ctx, key, lease.Generation, "provider_mutation")
+	rec, err := mgr.BeginProviderTransition(ctx, key, "w1", lease.Generation, "provider_mutation")
 	if err != nil {
 		t.Fatalf("begin: %v", err)
 	}
@@ -332,13 +333,13 @@ func TestClaimManager_LocalSuccessProviderFailure_RetrySucceedsNoDoubleClaim(t *
 	if err != nil {
 		t.Fatalf("claim: %v", err)
 	}
-	rec, err := mgr.BeginProviderTransition(ctx, key, lease.Generation, "provider_mutation")
+	rec, err := mgr.BeginProviderTransition(ctx, key, "w1", lease.Generation, "provider_mutation")
 	if err != nil {
 		t.Fatalf("begin: %v", err)
 	}
 
 	transientErr := fmt.Errorf("network timeout talking to provider")
-	rec, err = mgr.CompleteProviderTransition(ctx, rec.IdempotencyKey, "FAC-33", "1", func(ctx context.Context) error {
+	rec, err = mgr.CompleteProviderTransition(ctx, key, "w1", lease.Generation, "FAC-33", "1", func(ctx context.Context) error {
 		return transientErr
 	})
 	if err != nil {
@@ -361,7 +362,7 @@ func TestClaimManager_LocalSuccessProviderFailure_RetrySucceedsNoDoubleClaim(t *
 	}
 
 	// A real retry (as a driver with the real mutate closure would do).
-	rec, err = mgr.CompleteProviderTransition(ctx, rec.IdempotencyKey, "FAC-33", provider.revisionOf("FAC-33"), func(ctx context.Context) error {
+	rec, err = mgr.CompleteProviderTransition(ctx, key, "w1", lease.Generation, "FAC-33", provider.revisionOf("FAC-33"), func(ctx context.Context) error {
 		provider.setStatus("FAC-33", "claimed")
 		return nil
 	})
@@ -480,7 +481,7 @@ func TestClaimManager_ConcurrentProviderTransition_OnlyOneCASCall(t *testing.T) 
 	if err != nil {
 		t.Fatalf("claim: %v", err)
 	}
-	rec, err := mgrA.BeginProviderTransition(ctx, key, lease.Generation, "provider_mutation")
+	rec, err := mgrA.BeginProviderTransition(ctx, key, "w1", lease.Generation, "provider_mutation")
 	if err != nil {
 		t.Fatalf("begin: %v", err)
 	}
@@ -489,14 +490,14 @@ func TestClaimManager_ConcurrentProviderTransition_OnlyOneCASCall(t *testing.T) 
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		_, _ = mgrA.CompleteProviderTransition(ctx, rec.IdempotencyKey, "FAC-34", "1", func(ctx context.Context) error {
+		_, _ = mgrA.CompleteProviderTransition(ctx, key, "w1", lease.Generation, "FAC-34", "1", func(ctx context.Context) error {
 			provider.setStatus("FAC-34", "claimed-by-A")
 			return nil
 		})
 	}()
 	go func() {
 		defer wg.Done()
-		_, _ = mgrB.CompleteProviderTransition(ctx, rec.IdempotencyKey, "FAC-34", "1", func(ctx context.Context) error {
+		_, _ = mgrB.CompleteProviderTransition(ctx, key, "w1", lease.Generation, "FAC-34", "1", func(ctx context.Context) error {
 			provider.setStatus("FAC-34", "claimed-by-B")
 			return nil
 		})
@@ -514,4 +515,137 @@ func TestClaimManager_ConcurrentProviderTransition_OnlyOneCASCall(t *testing.T) 
 	if final.Status != OutboxApplied {
 		t.Fatalf("expected the intent applied exactly once, got %s", final.Status)
 	}
+}
+
+// assertProviderTransitionFenced is the shared assertion for every
+// negative fencing test below: BeginProviderTransition must reject with
+// ErrLeaseNotCurrent and create no outbox record, and
+// CompleteProviderTransition (called independently, as a driver would if
+// it somehow still had a stale idempotency key) must also reject with
+// ErrLeaseNotCurrent and make zero ProviderCAS calls.
+func assertProviderTransitionFenced(t *testing.T, mgr *ClaimManager, outbox *SQLiteOutbox, provider *fakeProviderCAS, key LeaseKey, ownerID string, generation int64, taskID string) {
+	t.Helper()
+	ctx := context.Background()
+	idempotencyKey := providerIntentKey(key, generation)
+
+	_, err := mgr.BeginProviderTransition(ctx, key, ownerID, generation, "provider_mutation")
+	if !errors.Is(err, ErrLeaseNotCurrent) {
+		t.Fatalf("expected BeginProviderTransition to reject with ErrLeaseNotCurrent, got %v", err)
+	}
+	rec, getErr := outbox.Get(ctx, idempotencyKey)
+	if getErr != nil {
+		t.Fatalf("outbox get: %v", getErr)
+	}
+	if rec != nil {
+		t.Fatalf("expected no outbox intent created for a rejected Begin, got %+v", rec)
+	}
+
+	callsBefore := provider.callCount()
+	_, err = mgr.CompleteProviderTransition(ctx, key, ownerID, generation, taskID, provider.revisionOf(taskID), func(ctx context.Context) error {
+		t.Fatal("mutate must never run for a fenced-out CompleteProviderTransition call")
+		return nil
+	})
+	if !errors.Is(err, ErrLeaseNotCurrent) {
+		t.Fatalf("expected CompleteProviderTransition to reject with ErrLeaseNotCurrent, got %v", err)
+	}
+	if calls := provider.callCount(); calls != callsBefore {
+		t.Fatalf("expected zero additional ProviderCAS calls from a fenced-out Complete, calls before=%d after=%d", callsBefore, calls)
+	}
+}
+
+// TestClaimManager_ProviderTransition_RejectsReleasedGeneration is the
+// exact scenario the independent OpenAI probe found: claim generation 1,
+// release it, then attempt a provider transition against that now-dead
+// generation. Must be rejected -- no outbox intent, no ProviderCAS call.
+func TestClaimManager_ProviderTransition_RejectsReleasedGeneration(t *testing.T) {
+	store := newTestStore(t)
+	outbox := newTestOutbox(t)
+	provider := newFakeProviderCAS()
+	provider.seed("FAC-40", "to-do", 1)
+	mgr := NewClaimManager(store, WithProviderCAS(provider), WithDurableOutbox(outbox))
+	ctx := context.Background()
+	key := testKey("FAC-40")
+
+	lease, err := mgr.Claim(ctx, ClaimRequest{Key: key, OwnerID: "w1", Role: "herd-smith", TaskRole: "herd-smith"})
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	if err := mgr.Release(ctx, key, "w1", lease.Generation); err != nil {
+		t.Fatalf("release: %v", err)
+	}
+
+	assertProviderTransitionFenced(t, mgr, outbox, provider, key, "w1", lease.Generation, "FAC-40")
+}
+
+// TestClaimManager_ProviderTransition_RejectsPriorGenerationAfterReclaim
+// covers the expiry/reclaim direction: generation 1 expires and is
+// reclaimed by a different owner at generation 2. A caller still holding
+// generation 1 must be fenced out even though ITS ownerID is technically
+// "correct" for that old generation -- the active lease has moved on.
+func TestClaimManager_ProviderTransition_RejectsPriorGenerationAfterReclaim(t *testing.T) {
+	store := newTestStore(t)
+	outbox := newTestOutbox(t)
+	provider := newFakeProviderCAS()
+	provider.seed("FAC-41", "to-do", 1)
+	clk := newClock(time.Now())
+	mgr := NewClaimManager(store, WithProviderCAS(provider), WithDurableOutbox(outbox), WithClock(clk.now), WithTTL(time.Minute))
+	ctx := context.Background()
+	key := testKey("FAC-41")
+
+	lease, err := mgr.Claim(ctx, ClaimRequest{Key: key, OwnerID: "w1", Role: "herd-smith", TaskRole: "herd-smith"})
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	clk.advance(2 * time.Minute) // past TTL, nobody has swept it yet
+	next, err := mgr.Claim(ctx, ClaimRequest{Key: key, OwnerID: "w2", Role: "herd-smith", TaskRole: "herd-smith"})
+	if err != nil {
+		t.Fatalf("reclaim: %v", err)
+	}
+	if next.Generation == lease.Generation {
+		t.Fatalf("expected the reclaim to produce a new generation, both were %d", lease.Generation)
+	}
+
+	assertProviderTransitionFenced(t, mgr, outbox, provider, key, "w1", lease.Generation, "FAC-41")
+}
+
+// TestClaimManager_ProviderTransition_RejectsWrongOwner covers a caller
+// that guesses the correct, still-active generation but is not its owner.
+func TestClaimManager_ProviderTransition_RejectsWrongOwner(t *testing.T) {
+	store := newTestStore(t)
+	outbox := newTestOutbox(t)
+	provider := newFakeProviderCAS()
+	provider.seed("FAC-42", "to-do", 1)
+	mgr := NewClaimManager(store, WithProviderCAS(provider), WithDurableOutbox(outbox))
+	ctx := context.Background()
+	key := testKey("FAC-42")
+
+	lease, err := mgr.Claim(ctx, ClaimRequest{Key: key, OwnerID: "w1", Role: "herd-smith", TaskRole: "herd-smith"})
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+
+	assertProviderTransitionFenced(t, mgr, outbox, provider, key, "definitely-not-w1", lease.Generation, "FAC-42")
+
+	// Sanity: the real owner at the real generation still works, proving
+	// the rejection above was specifically about the wrong owner.
+	rec, err := mgr.BeginProviderTransition(ctx, key, "w1", lease.Generation, "provider_mutation")
+	if err != nil {
+		t.Fatalf("expected the real owner to still be able to begin a transition, got %v", err)
+	}
+	if rec == nil {
+		t.Fatal("expected a record")
+	}
+}
+
+// TestClaimManager_ProviderTransition_RejectsNoLease covers a key that
+// was never claimed at all.
+func TestClaimManager_ProviderTransition_RejectsNoLease(t *testing.T) {
+	store := newTestStore(t)
+	outbox := newTestOutbox(t)
+	provider := newFakeProviderCAS()
+	provider.seed("FAC-43", "to-do", 1)
+	mgr := NewClaimManager(store, WithProviderCAS(provider), WithDurableOutbox(outbox))
+	key := testKey("FAC-43")
+
+	assertProviderTransitionFenced(t, mgr, outbox, provider, key, "w1", 1, "FAC-43")
 }
