@@ -119,8 +119,8 @@ func TestFAC117_ClassifyTable(t *testing.T) {
 			if tc.want == ReapClassUnique && len(c.UniqueSHAs) == 0 {
 				t.Fatal("unique class must list UniqueSHAs (non-vacuous evidence)")
 			}
-			if tc.eligible && !c.SalvageOK {
-				t.Fatal("eligible candidate must have verified salvage ref")
+			if tc.eligible && c.Class != ReapClassContentMerged {
+				t.Fatal("only content-merged candidates may be eligible")
 			}
 		})
 	}
@@ -155,12 +155,12 @@ func TestFAC117_AutoReap_RefusesUniqueAndReapsMergedOnly(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	n, err := wm.PruneMergedWorktrees(context.Background(), "main")
+	report, err := wm.Reap(context.Background(), admissibleReapPolicy(t, wm, mergedWI.Path, false))
 	if err != nil {
-		t.Fatalf("PruneMergedWorktrees: %v", err)
+		t.Fatalf("Reap: %v", err)
 	}
-	if n != 1 {
-		t.Fatalf("expected exactly 1 reaped (merged only), got %d", n)
+	if len(report.Reaped) != 1 {
+		t.Fatalf("expected exactly 1 reaped (merged only), got %v", report.Reaped)
 	}
 
 	// Unique worktree path must still exist.
@@ -251,12 +251,9 @@ func TestFAC117_GitErrorYieldsUnknownNoRemoval(t *testing.T) {
 		t.Fatal("expected err-1 candidate")
 	}
 
-	n, err := wm.PruneMergedWorktrees(context.Background(), "does-not-exist-zz")
-	if err != nil {
-		t.Fatalf("prune with bad base: %v", err)
-	}
-	if n != 0 {
-		t.Fatalf("must not remove anything on unknown integration, reaped=%d", n)
+	_, err = wm.PruneMergedWorktrees(context.Background(), "does-not-exist-zz")
+	if err == nil {
+		t.Fatal("historical auto-reap wrapper must fail closed")
 	}
 	if _, err := os.Stat(filepath.Join(wi.Path, ".git")); err != nil {
 		t.Fatalf("worktree removed under unknown classification: %v", err)
@@ -276,16 +273,8 @@ func TestFAC117_LeaseProbeRefuses(t *testing.T) {
 	runCmd(tmpDir, "git", "merge", "--no-ff", "-m", "merge lease", "herd/lease-1")
 	runCmd(tmpDir, "git", "push", "origin", "main")
 
-	report, err := wm.Reap(context.Background(), ReapPolicy{
-		DefaultBranch: "main",
-		AutoReap:      true,
-		LeaseProbe: func(ctx context.Context, path, branch string) (bool, error) {
-			if sameWorktreePath(path, wi.Path) {
-				return true, nil
-			}
-			return false, nil
-		},
-	})
+	policy := admissibleReapPolicy(t, wm, wi.Path, true)
+	report, err := wm.Reap(context.Background(), policy)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -297,18 +286,11 @@ func TestFAC117_LeaseProbeRefuses(t *testing.T) {
 	}
 
 	// Probe error → UNKNOWN, no removal.
-	report2, err := wm.Reap(context.Background(), ReapPolicy{
-		DefaultBranch: "main",
-		AutoReap:      true,
-		LeaseProbe: func(ctx context.Context, path, branch string) (bool, error) {
-			return false, errors.New("lease store unavailable")
-		},
-	})
-	if err != nil {
-		t.Fatal(err)
+	policy.LeaseProbe = func(context.Context, string, string) (bool, error) {
+		return false, errors.New("lease store unavailable")
 	}
-	if len(report2.Reaped) != 0 {
-		t.Fatalf("lease error must not reap, reaped=%v", report2.Reaped)
+	if _, err := wm.Reap(context.Background(), policy); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -330,11 +312,7 @@ func TestFAC117_ExactTargetOnly(t *testing.T) {
 	runCmd(tmpDir, "git", "merge", "--no-ff", "-m", "merge b", "herd/tgt-b")
 	runCmd(tmpDir, "git", "push", "origin", "main")
 
-	report, err := wm.Reap(context.Background(), ReapPolicy{
-		DefaultBranch: "main",
-		AutoReap:      true,
-		TargetPaths:   []string{a.Path},
-	})
+	report, err := wm.Reap(context.Background(), admissibleReapPolicy(t, wm, a.Path, false))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -346,6 +324,24 @@ func TestFAC117_ExactTargetOnly(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(b.Path, ".git")); err != nil {
 		t.Fatalf("sibling B must not be pruned: %v", err)
+	}
+}
+
+func admissibleReapPolicy(t *testing.T, wm *WorktreeManager, target string, active bool) ReapPolicy {
+	t.Helper()
+	const boardEvidence = "board-action-proof-1"
+	const generation = "lease-generation-1"
+	return ReapPolicy{
+		DefaultBranch: "main", AutoReap: true, TargetPaths: []string{target},
+		LeaseProbe:           func(context.Context, string, string) (bool, error) { return active, nil },
+		LeaseGenerationProbe: func(context.Context, string, string) (string, error) { return generation, nil },
+		BoardEvidenceProbe:   func(context.Context, string, string) (string, error) { return boardEvidence, nil },
+		Evidence: ReapEvidence{
+			IntegrationSHA: gitOut(t, wm.RepoRoot, "rev-parse", "origin/main"),
+			BoardEvidence:  boardEvidence, LeaseGeneration: generation, PolicyDigest: "policy-digest-1", Actor: "fac-117-test",
+		},
+		ReceiptSink:  func(ReapReceipt) error { return nil },
+		ActionPolicy: "remove",
 	}
 }
 

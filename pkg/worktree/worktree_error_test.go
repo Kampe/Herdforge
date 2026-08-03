@@ -189,13 +189,12 @@ func TestPruneMergedWorktrees_WithHerbBranchMerged(t *testing.T) {
 	runCmd(tmpDir, "git", "merge", "--no-ff", "herd/ftr-42")
 	runCmd(tmpDir, "git", "push", "origin", "main")
 
-	// Prune should classify content-merged + clean and remove the worktree.
-	count, err := wm.PruneMergedWorktrees(context.Background(), "main")
-	if err != nil {
-		t.Fatalf("expected no error, got: %v", err)
+	// The historical wrapper cannot prove exact target and lease evidence.
+	if _, err := wm.PruneMergedWorktrees(context.Background(), "main"); err == nil {
+		t.Fatal("expected global auto-reap refusal")
 	}
-	if count != 1 {
-		t.Errorf("expected 1 pruned worktree, got %d", count)
+	if _, err := os.Stat(filepath.Join(wi.Path, ".git")); err != nil {
+		t.Fatalf("fail-closed wrapper removed worktree: %v", err)
 	}
 	_ = wi
 }
@@ -236,12 +235,8 @@ func TestPruneMergedWorktrees_RemoveFailureNotCounted(t *testing.T) {
 		return cmd
 	}
 
-	count, err := wm.PruneMergedWorktrees(context.Background(), "main")
-	if err != nil {
-		t.Fatalf("expected no hard error (remove failure is per-candidate), got: %v", err)
-	}
-	if count != 0 {
-		t.Errorf("expected 0 pruned (remove failed), got %d", count)
+	if _, err := wm.PruneMergedWorktrees(context.Background(), "main"); err == nil {
+		t.Fatal("expected global auto-reap refusal before remove seam")
 	}
 
 	// Clean up the worktree manually since prune's remove was mocked away

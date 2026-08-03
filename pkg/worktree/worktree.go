@@ -21,6 +21,10 @@ const AnchorRefPrefix = "refs/herd/anchors/"
 type WorktreeManager struct {
 	RepoRoot    string
 	WorktreeDir string
+	// RemoveWorktreeFunc is an optional mutation seam for hermetic callers.
+	// Production managers leave it nil and use Git; tests can fail closed
+	// before any filesystem mutation is attempted.
+	RemoveWorktreeFunc func(context.Context, string) error
 }
 
 func NewWorktreeManager(repoRoot string) *WorktreeManager {
@@ -59,6 +63,9 @@ func (w *WorktreeManager) CreateWorktree(ctx context.Context, branch string, tar
 }
 
 func (w *WorktreeManager) RemoveWorktree(ctx context.Context, targetDir string) error {
+	if w.RemoveWorktreeFunc != nil {
+		return w.RemoveWorktreeFunc(ctx, targetDir)
+	}
 	cmd := execCommandContext(ctx, "git", "worktree", "remove", "--force", targetDir)
 	cmd.Dir = w.RepoRoot
 	if output, err := cmd.CombinedOutput(); err != nil {
@@ -360,4 +367,3 @@ func (w *WorktreeManager) attachExisting(ctx context.Context, path, expectedBran
 		AnchorRef: anchorRef,
 	}, nil
 }
-
