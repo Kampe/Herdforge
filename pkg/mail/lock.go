@@ -204,6 +204,10 @@ func (m *Mailbox) withFileLockContext(ctx context.Context, fn func() error) erro
 		return finishQueue(err)
 	}
 
+	// Data exclusion is nonblocking flock + ticket FIFO only. Do not insert a
+	// blocking sync.Mutex here: on this host a second open+LOCK_EX|NB of the
+	// same path returns EWOULDBLOCK while the first holder is live, and any
+	// unbounded mutex would bypass FAC-162 context/stuckGrace deadlines.
 	f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0644)
 	if err != nil {
 		return finishQueue(fmt.Errorf("failed to open mailbox lock for %s: %w", mailboxID, err))
@@ -211,7 +215,9 @@ func (m *Mailbox) withFileLockContext(ctx context.Context, fn func() error) erro
 
 	fd := int(f.Fd())
 	lastProgress := hookNow()
-	lastOwner := readLockOwnerPID(lockPath)
+	// Progress = owner-identity fingerprint change only (not mere liveness).
+	// A live-but-wedged holder keeps the same fingerprint and still hits stuckGrace.
+	lastOwnerFP := readLockOwnerFingerprint(lockPath)
 	for {
 		err := hookFlock(fd, syscall.LOCK_EX|syscall.LOCK_NB)
 		if err == nil {
@@ -249,9 +255,8 @@ func (m *Mailbox) withFileLockContext(ctx context.Context, fn func() error) erro
 				closeErr,
 			))
 		}
-		owner := readLockOwnerPID(lockPath)
-		if owner != lastOwner {
-			lastOwner = owner
+		if fp := readLockOwnerFingerprint(lockPath); fp != lastOwnerFP {
+			lastOwnerFP = fp
 			lastProgress = hookNow()
 		}
 		if err := m.checkWaitLimits(ctx, start, lastProgress, bound, reason, lockPath, mailboxID, depthNow, pos); err != nil {
@@ -375,41 +380,65 @@ func (m *Mailbox) enqueueWaiter() (ticket int64, tokenPath string, depth int, er
 }
 
 // acquireQmetaExclusive opens .lock.qmeta and takes LOCK_EX via nonblocking
-// poll, failing closed under caller deadline / fixed override / max wait.
-// A live wedged qmeta holder must never hang SendMessageContext forever.
+// poll, failing closed under the same bound/ctx policy as data-lock waits
+// (stuckGrace progress-based — NOT maxLockWait inflation). A wedged qmeta
+// holder must not hang SendMessageContext past stuckGrace without progress.
 //
-// Unlike the data-lock path, qmeta has no owner-progress signal. When the
-// policy is pure stuckGrace (no ctx deadline), the absolute cap is
-// maxLockWait so multi-writer enqueue contention does not false-timeout at
-// 5s. Caller context deadlines and SetLockTimeout overrides still bind
-// tightly and fail closed with typed BLOCKED + durable diagnostics.
+// Progress signals (reset lastProgress): qmeta owner-identity fingerprint
+// change, or ticket-counter file content change. Mere process liveness is
+// diagnostic-only — a live-but-wedged holder must still hit stuckGrace.
+// Diagnostics use reason prefix "qmeta_" and OwnerPID from the owner record.
 func (m *Mailbox) acquireQmetaExclusive(ctx context.Context, start time.Time, bound time.Duration, reason, mailboxID string) (*os.File, error) {
-	lockPath := m.MailFile + ".lock"
-	meta, err := os.OpenFile(m.qmetaPath(), os.O_CREATE|os.O_RDWR, 0644)
+	qmetaPath := m.qmetaPath()
+	meta, err := os.OpenFile(qmetaPath, os.O_CREATE|os.O_RDWR, 0644)
 	if err != nil {
 		return nil, fmt.Errorf("open qmeta: %w", err)
 	}
-	qBound, qReason := bound, reason
-	if reason == "stuck_grace" {
-		qBound = maxLockWait
-		qReason = "qmeta_max_wait"
-	}
+	qReason := "qmeta_" + reason
+	lastProgress := start
+	lastOwnerFP := readLockOwnerFingerprint(qmetaPath)
+	lastTicketSnap := m.ticketCounterSnapshot()
 	for {
 		err := hookFlock(int(meta.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
 		if err == nil {
+			// Record owner so waiters observe identity handoffs / diagnostics.
+			if werr := writeLockOwnerPID(meta); werr != nil {
+				unlockErr := hookFlock(int(meta.Fd()), syscall.LOCK_UN)
+				closeErr := meta.Close()
+				return nil, errors.Join(fmt.Errorf("qmeta owner record: %w", werr), unlockErr, closeErr)
+			}
 			return meta, nil
 		}
 		if !isLockBusy(err) {
 			closeErr := meta.Close()
 			return nil, errors.Join(fmt.Errorf("qmeta flock: %w", err), closeErr)
 		}
-		// Absolute from start: ctx.Err() still trips first on expired deadlines.
-		if err := m.checkWaitLimits(ctx, start, start, qBound, qReason, lockPath, mailboxID, 0, 0); err != nil {
+		if fp := readLockOwnerFingerprint(qmetaPath); fp != lastOwnerFP {
+			lastOwnerFP = fp
+			lastProgress = hookNow()
+		}
+		if snap := m.ticketCounterSnapshot(); snap != lastTicketSnap {
+			lastTicketSnap = snap
+			lastProgress = hookNow()
+		}
+		// Never inflate stuckGrace to maxLockWait — diagnostics keep qmeta_ reason.
+		if err := m.checkWaitLimits(ctx, start, lastProgress, bound, qReason, qmetaPath, mailboxID, 0, 0); err != nil {
 			closeErr := meta.Close()
 			return nil, errors.Join(err, closeErr)
 		}
 		hookSleep(lockPollInterval)
 	}
+}
+
+// ticketCounterSnapshot is a progress signal for qmeta waiters: content of
+// the ticket sequence file (or empty if missing). Advancing tickets means
+// another enqueuer completed under qmeta.
+func (m *Mailbox) ticketCounterSnapshot() string {
+	data, err := os.ReadFile(m.ticketPath())
+	if err != nil {
+		return ""
+	}
+	return string(data)
 }
 
 // rollbackPublishedToken removes a final ticket name that was already
@@ -440,7 +469,13 @@ func (m *Mailbox) enqueueWaiterContext(ctx context.Context, start time.Time, bou
 	if err != nil {
 		return 0, "", 0, err
 	}
-	metaUnlock := func() error { return hookFlock(int(meta.Fd()), syscall.LOCK_UN) }
+	metaUnlock := func() error {
+		// Clear owner before unlock so waiters observe fingerprint change.
+		// clear + unlock errors are joined (never discarded).
+		clearErr := clearLockOwnerPID(meta)
+		unlockErr := hookFlock(int(meta.Fd()), syscall.LOCK_UN)
+		return errors.Join(clearErr, unlockErr)
+	}
 	metaClose := func() error { return meta.Close() }
 
 	// Reap only confidently-dead tokens under the meta lock.
@@ -847,7 +882,11 @@ func (m *Mailbox) queuePosition(ticket int64) (head bool, position int, depth in
 
 func (m *Mailbox) waitForTurn(ctx context.Context, ticket int64, tokenPath string, start time.Time, bound time.Duration, reason, mailboxID string) error {
 	lockPath := m.MailFile + ".lock"
-	lastProgress := start
+	// lastProgress measures queue/handoff progress during the wait, NOT the
+	// overall withFileLock start. Enqueue/qmeta time must not consume the
+	// stuckGrace budget before we even observe the queue (that false-fired
+	// BLOCKED at position=1 after a slow enqueue under multi-writer load).
+	lastProgress := hookNow()
 	lastPos := int(^uint(0) >> 1)
 	lastMin := int64(0)
 	lastDepth := int(^uint(0) >> 1)
@@ -864,7 +903,8 @@ func (m *Mailbox) waitForTurn(ctx context.Context, ticket int64, tokenPath strin
 			return fmt.Errorf("mailbox lock queue inspect failed for %s: %w", mailboxID, err)
 		}
 		if head {
-			// Head of line: still honor deadline before returning to mutate.
+			// Head of line: ctx/fixed ceilings still use start via checkWaitLimits
+			// (maxLockWait / ctx.Err); stuckGrace uses lastProgress from this wait.
 			if err := m.checkWaitLimits(ctx, start, lastProgress, bound, reason, lockPath, mailboxID, depth, pos); err != nil {
 				return err
 			}
@@ -937,6 +977,8 @@ func (m *Mailbox) checkWaitLimits(ctx context.Context, start, lastProgress time.
 }
 
 func (m *Mailbox) newLockTimeout(lockPath, mailboxID string, waited, bound time.Duration, depth, pos int, reason string) error {
+	// For qmeta waits lockPath is the qmeta file; owner evidence is still
+	// the lock-file owner record (pid+start). Basename-only in diagnostics.
 	owner := readLockOwnerPID(lockPath)
 	if mailboxID == "" {
 		mailboxID = mailboxIdentity(m.MailFile)
@@ -944,6 +986,7 @@ func (m *Mailbox) newLockTimeout(lockPath, mailboxID string, waited, bound time.
 	if strings.Contains(mailboxID, "/") || strings.Contains(mailboxID, "\\") {
 		mailboxID = filepath.Base(mailboxID)
 	}
+	// Never put absolute lockPath into reason/mailbox id.
 	lte := &LockTimeoutError{
 		MailboxID:  mailboxID,
 		Waited:     waited,
@@ -1051,7 +1094,12 @@ func clearLockOwnerPID(f *os.File) error {
 	if err := f.Truncate(0); err != nil {
 		return err
 	}
-	return fileSyncFn(f)
+	// Intentionally no fsync: owner clear is diagnostic, not a durability
+	// boundary. Fsync here under multi-writer disk saturation extends the
+	// empty-owner-while-still-holding-flock window and false-triggers
+	// stuckGrace for waiters (owner_pid=0, bound=stuckGrace). Crash releases
+	// flock via fd close regardless of the on-disk owner record.
+	return nil
 }
 
 func readLockOwnerPID(lockPath string) int {
@@ -1070,6 +1118,18 @@ func readLockOwnerPID(lockPath string) int {
 		return 0
 	}
 	return pid
+}
+
+// readLockOwnerFingerprint returns the durable owner record body used as a
+// progress signal. Any change (including clear→set→clear handoff) is
+// progress; an unchanged body for stuckGrace means a wedged holder even if
+// the PID is still live. Liveness is diagnostic-only (OwnerPID field).
+func readLockOwnerFingerprint(lockPath string) string {
+	data, err := os.ReadFile(lockPath)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(data))
 }
 
 func processAlive(pid int) bool {

@@ -50,6 +50,66 @@ func assertNoAbsPath(t *testing.T, s string) {
 	}
 }
 
+// TestFlock_HostSameProcessSecondOpenBlocks mutation-proves production host
+// flock semantics: two separate opens of the same path in one process, the
+// second LOCK_EX|LOCK_NB must return EWOULDBLOCK while the first holds EX.
+// Uses real syscall.Flock (not hookFlock) so a fake hook cannot bless a lie.
+func TestFlock_HostSameProcessSecondOpenBlocks(t *testing.T) {
+	tmpDir := t.TempDir()
+	path := filepath.Join(tmpDir, "host-flock.lock")
+	a, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	if err := syscall.Flock(int(a.Fd()), syscall.LOCK_EX); err != nil {
+		t.Fatalf("first LOCK_EX: %v", err)
+	}
+	defer syscall.Flock(int(a.Fd()), syscall.LOCK_UN)
+
+	b, err := os.OpenFile(path, os.O_RDWR, 0644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	err = syscall.Flock(int(b.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+	if err == nil {
+		_ = syscall.Flock(int(b.Fd()), syscall.LOCK_UN)
+		t.Fatal("second LOCK_EX|LOCK_NB succeeded — host flock would not serialize same-process opens")
+	}
+	if !errors.Is(err, syscall.EWOULDBLOCK) && !errors.Is(err, syscall.EAGAIN) {
+		t.Fatalf("want EWOULDBLOCK/EAGAIN, got %v", err)
+	}
+}
+
+// TestMutationProbe_NoUnboundedInProcessMutex: withFileLockContext must not
+// introduce a blocking sync.Mutex before the nonblocking flock loop — a
+// canceled context must still fail closed while another holder has the data lock.
+func TestMutationProbe_NoUnboundedInProcessMutex(t *testing.T) {
+	tmpDir := t.TempDir()
+	mailFile := filepath.Join(tmpDir, "no-mu.jsonl")
+	release := holdMailboxLock(t, mailFile)
+	defer release()
+	mb := NewMailbox(mailFile)
+
+	ctx, cancel, h := withCancelOnPoll(2)
+	defer cancel()
+	setTestHooks(h)
+	defer clearTestHooks()
+
+	entered := false
+	err := mb.withFileLockContext(ctx, func() error {
+		entered = true
+		return nil
+	})
+	if entered {
+		t.Fatal("CS entered under cancel")
+	}
+	if !errors.Is(err, ErrMailboxLockTimeout) {
+		t.Fatalf("want BLOCKED from nonblocking protocol, got %v (unbounded mutex would hang)", err)
+	}
+}
+
 func TestConcurrentWriters_100Plus(t *testing.T) {
 	tmpDir := t.TempDir()
 	mailFile := filepath.Join(tmpDir, "herd-mail.jsonl")
@@ -901,9 +961,10 @@ func TestFlockHardError_FailsImmediately(t *testing.T) {
 	assertNoAbsPath(t, err.Error())
 }
 
-// holdQmeta takes an exclusive lock on the mailbox qmeta file and returns a
-// release function. Used to prove enqueueWaiterContext fails closed at the
-// caller deadline when meta is wedged (not only the data lock).
+// holdQmeta takes an exclusive lock on the mailbox qmeta file with a
+// writeLockOwnerPID-compatible owner record (pid+start_ns(+boot)), matching
+// production holders. Bare "1\n" is not a complete identity and must not be
+// used as a wedged-owner fixture.
 func holdQmeta(t *testing.T, mailFile string) (release func()) {
 	t.Helper()
 	path := mailFile + ".lock.qmeta"
@@ -918,172 +979,254 @@ func holdQmeta(t *testing.T, mailFile string) (release func()) {
 		_ = f.Close()
 		t.Fatalf("hold qmeta: %v", err)
 	}
+	if err := writeLockOwnerPID(f); err != nil {
+		_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+		_ = f.Close()
+		t.Fatalf("write qmeta owner: %v", err)
+	}
 	return func() {
+		_ = clearLockOwnerPID(f)
 		_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
 		_ = f.Close()
 	}
 }
 
-// assertDeadlineBound checks typed BLOCKED within the short caller deadline
-// (not the default stuckGrace). A mutant that drops ctx and waits 5s fails.
-func assertDeadlineBound(t *testing.T, wall time.Duration, deadline time.Duration, err error, entered bool) {
+// withCancelOnPoll returns a context canceled after n Sleep hook calls —
+// deterministic deadline propagation without wall-clock flake.
+func withCancelOnPoll(n int32) (context.Context, context.CancelFunc, *clockHooks) {
+	ctx, cancel := context.WithCancel(context.Background())
+	var polls atomic.Int32
+	h := &clockHooks{
+		Sleep: func(d time.Duration) {
+			if polls.Add(1) >= n {
+				cancel()
+			}
+		},
+	}
+	return ctx, cancel, h
+}
+
+func assertBlockedNoCS(t *testing.T, err error, entered bool, wantReasonSubstr string) {
 	t.Helper()
 	if entered {
-		t.Fatal("critical section entered under expired/short deadline")
+		t.Fatal("critical section entered under fail-closed deadline")
 	}
 	if !errors.Is(err, ErrMailboxLockTimeout) {
 		t.Fatalf("want ErrMailboxLockTimeout, got %v", err)
 	}
 	assertNoAbsPath(t, err.Error())
-	// Must return promptly near the deadline, far below stuckGrace.
-	// Allow generous race/scheduling slack but never the default 5s path.
-	if wall >= stuckGrace/2 {
-		t.Fatalf("wall %s suggests default stuckGrace wait (ctx dropped)", wall)
-	}
-	if wall > deadline*20 && wall > 500*time.Millisecond {
-		// 40ms deadline under heavy load may stretch; still must be << 5s.
-		t.Fatalf("wall %s far exceeds deadline %s without bound", wall, deadline)
-	}
 	var lte *LockTimeoutError
-	if errors.As(err, &lte) {
-		// Reject default stuckGrace / maxLockWait policy when a short
-		// caller deadline was supplied (mutation: drop ctx → 5s path).
-		if lte.Bound >= stuckGrace {
-			t.Fatalf("bound %s >= stuckGrace — ctx deadline not applied: %+v", lte.Bound, lte)
-		}
-		if lte.Bound > deadline*15 && lte.Bound > 200*time.Millisecond {
-			t.Fatalf("bound %s far above deadline %s: %+v", lte.Bound, deadline, lte)
+	if errors.As(err, &lte) && wantReasonSubstr != "" {
+		if !strings.Contains(lte.Reason, wantReasonSubstr) {
+			t.Fatalf("reason %q want substring %q", lte.Reason, wantReasonSubstr)
 		}
 	}
 }
 
 func TestContextDeadline_PropagatesConsumers(t *testing.T) {
 	tmpDir := t.TempDir()
-	const short = 40 * time.Millisecond
 
-	t.Run("send_held_data_lock_respects_deadline", func(t *testing.T) {
+	t.Run("data_lock_cancel_on_poll", func(t *testing.T) {
 		mailFile := filepath.Join(tmpDir, "ctx-data.jsonl")
 		release := holdMailboxLock(t, mailFile)
 		defer release()
 		mb := NewMailbox(mailFile)
-		// Wall-clock context deadline (no fake clock): bound is computed
-		// against real now so remain ≈ short, not maxLockWait-capped.
-		ctx, cancel := context.WithTimeout(context.Background(), short)
+		ctx, cancel, h := withCancelOnPoll(2)
 		defer cancel()
-		wall0 := time.Now()
+		setTestHooks(h)
+		defer clearTestHooks()
 		entered := false
 		err := mb.withFileLockContext(ctx, func() error {
 			entered = true
 			return nil
 		})
-		wall := time.Since(wall0)
-		assertDeadlineBound(t, wall, short, err, entered)
-		var lte *LockTimeoutError
-		if errors.As(err, &lte) {
-			// Bound must be context-derived and near short, not stuckGrace/maxLockWait.
-			if lte.Bound > short*10 && lte.Bound >= stuckGrace {
-				t.Fatalf("bound %s not context-short (looks like default policy)", lte.Bound)
-			}
-			if !strings.Contains(lte.Reason, "context") {
-				t.Fatalf("reason %q should mention context", lte.Reason)
-			}
-		}
+		assertBlockedNoCS(t, err, entered, "context")
 	})
 
-	t.Run("send_wedged_qmeta_respects_deadline", func(t *testing.T) {
-		// Finding (1): blocking qmeta LOCK_EX must not hang past deadline.
+	t.Run("wedged_qmeta_cancel_on_poll", func(t *testing.T) {
 		mailFile := filepath.Join(tmpDir, "ctx-qmeta.jsonl")
+		// holdQmeta writes a complete pid+start owner token (not bare "1\n").
 		release := holdQmeta(t, mailFile)
 		defer release()
 		mb := NewMailbox(mailFile)
-		ctx, cancel := context.WithTimeout(context.Background(), short)
+		ctx, cancel, h := withCancelOnPoll(2)
 		defer cancel()
-		wall0 := time.Now()
+		setTestHooks(h)
+		defer clearTestHooks()
 		entered := false
 		err := mb.withFileLockContext(ctx, func() error {
 			entered = true
 			return nil
 		})
-		wall := time.Since(wall0)
-		assertDeadlineBound(t, wall, short, err, entered)
-		// Must not have written mail.
+		assertBlockedNoCS(t, err, entered, "context")
 		if _, e := os.Stat(mailFile); e == nil {
-			t.Fatal("must not mutate mailbox under wedged qmeta + short deadline")
+			t.Fatal("must not mutate under wedged qmeta")
 		}
 	})
 
-	t.Run("SendMessageContext_broker_PostCallback_Drain_Ack", func(t *testing.T) {
+	t.Run("qmeta_stuckGrace_not_maxLockWait", func(t *testing.T) {
+		// Default stuckGrace, no context: complete live owner held on qmeta,
+		// unchanged fingerprint + no ticket advance → timeout at stuckGrace
+		// (not maxLockWait). Mere liveness must not refresh progress.
+		mailFile := filepath.Join(tmpDir, "ctx-qmeta-grace.jsonl")
+		release := holdQmeta(t, mailFile)
+		defer release()
+		// Prove fixture is a complete owner identity (writeLockOwnerPID shape).
+		raw, err := os.ReadFile(mailFile + ".lock.qmeta")
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, complete, perr := parseTokenBody(raw)
+		if perr != nil || !complete || body.PID <= 0 || body.StartNS <= 0 {
+			t.Fatalf("holdQmeta must plant complete owner token, got complete=%v body=%+v err=%v", complete, body, perr)
+		}
+		if classifyToken(body, complete) != tokenLive {
+			t.Fatal("planted owner must be live — liveness alone must not prevent stuckGrace")
+		}
+		mb := NewMailbox(mailFile)
+		var mu sync.Mutex
+		now := time.Unix(1_700_000_000, 0)
+		setTestHooks(&clockHooks{
+			Now: func() time.Time {
+				mu.Lock()
+				defer mu.Unlock()
+				return now
+			},
+			Sleep: func(d time.Duration) {
+				mu.Lock()
+				now = now.Add(d)
+				mu.Unlock()
+			},
+		})
+		defer clearTestHooks()
+		wall0 := time.Now()
+		entered := false
+		// No context, no SetLockTimeout → pure stuckGrace policy.
+		err = mb.withFileLock(func() error {
+			entered = true
+			return nil
+		})
+		if entered {
+			t.Fatal("CS entered")
+		}
+		if !errors.Is(err, ErrMailboxLockTimeout) {
+			t.Fatalf("got %v", err)
+		}
+		var lte *LockTimeoutError
+		if !errors.As(err, &lte) {
+			t.Fatal("want LockTimeoutError")
+		}
+		if lte.Bound != stuckGrace {
+			t.Fatalf("qmeta bound=%s want stuckGrace (not maxLockWait inflation)", lte.Bound)
+		}
+		if !strings.Contains(lte.Reason, "qmeta") {
+			t.Fatalf("reason %q should identify qmeta wait", lte.Reason)
+		}
+		if lte.OwnerPID != body.PID {
+			t.Fatalf("OwnerPID diagnostic=%d want planted %d", lte.OwnerPID, body.PID)
+		}
+		if time.Since(wall0) >= stuckGrace/2 {
+			t.Fatalf("wall %s suggests real stuckGrace sleep (fake clock unused)", time.Since(wall0))
+		}
+	})
+
+	t.Run("SendMessage_PostCallback_Broker_Drain_Ack", func(t *testing.T) {
 		mailFile := filepath.Join(tmpDir, "ctx-paths.jsonl")
 		release := holdMailboxLock(t, mailFile)
 		defer release()
 		mb := NewMailbox(mailFile)
 
-		// SendMessageContext
-		ctx, cancel := context.WithTimeout(context.Background(), short)
+		ctx, cancel, h := withCancelOnPoll(2)
 		defer cancel()
-		wall0 := time.Now()
-		_, err := mb.SendMessageContext(ctx, "a", "b", "s", "secret")
-		assertDeadlineBound(t, time.Since(wall0), short, err, false)
+		setTestHooks(h)
+		defer clearTestHooks()
 
-		// PostCallbackContext
-		ctx2, cancel2 := context.WithTimeout(context.Background(), short)
+		_, err := mb.SendMessageContext(ctx, "a", "b", "s", "secret")
+		assertBlockedNoCS(t, err, false, "context")
+
+		ctx2, cancel2, h2 := withCancelOnPoll(2)
 		defer cancel2()
-		wall0 = time.Now()
+		setTestHooks(h2)
 		_, err = mb.PostCallbackContext(ctx2, "agent", Callback{
 			Kind: CallbackComplete, Repo: "r", Ref: "main", SHA: "abc",
 		})
-		assertDeadlineBound(t, time.Since(wall0), short, err, false)
+		assertBlockedNoCS(t, err, false, "context")
 
-		// Broker SendMessageContext
 		bFile := filepath.Join(tmpDir, "ctx-broker.jsonl")
 		relB := holdMailboxLock(t, bFile)
 		defer relB()
 		broker := NewMessageBroker(NewMailbox(bFile), WithRedis(newMockRedisClient(), "h"))
 		defer broker.Close()
-		ctx3, cancel3 := context.WithTimeout(context.Background(), short)
+		ctx3, cancel3, h3 := withCancelOnPoll(2)
 		defer cancel3()
-		wall0 = time.Now()
+		setTestHooks(h3)
 		_, err = broker.SendMessageContext(ctx3, "a", "b", "s", "x")
-		assertDeadlineBound(t, time.Since(wall0), short, err, false)
+		assertBlockedNoCS(t, err, false, "context")
+		clearTestHooks()
 
-		// CallbackConsumer DrainContext / AckContext (saveLocked takes flock)
+		// Consumer: post a real callback first (uncontended), then hold lock
+		// and require fail-closed Drain/Ack with unchanged durable state.
 		cFile := filepath.Join(tmpDir, "ctx-consumer.jsonl")
-		// Pre-create consumer state path parent; hold data lock.
+		cmb := NewMailbox(cFile)
+		env, err := cmb.PostCallback("agent", Callback{
+			Kind: CallbackComplete, Repo: "r", Ref: "main", SHA: "s", LeaseGeneration: 1,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		cons, err := NewCallbackConsumer(cmb, 3)
+		if err != nil {
+			t.Fatal(err)
+		}
+		drained, err := cons.Drain()
+		if err != nil || len(drained) != 1 {
+			t.Fatalf("setup drain: %v %#v", err, drained)
+		}
+		pendingBefore := len(cons.state.Pending)
+		if pendingBefore != 1 {
+			t.Fatalf("pending before=%d", pendingBefore)
+		}
+
 		relC := holdMailboxLock(t, cFile)
 		defer relC()
-		cons, cerr := NewCallbackConsumer(NewMailbox(cFile), 3)
-		if cerr != nil {
-			t.Fatal(cerr)
-		}
-		ctx4, cancel4 := context.WithTimeout(context.Background(), short)
+
+		ctx4, cancel4, h4 := withCancelOnPoll(2)
 		defer cancel4()
-		wall0 = time.Now()
+		setTestHooks(h4)
 		_, err = cons.DrainContext(ctx4)
-		// Drain may succeed without flock if inbox empty before save — save
-		// still takes the lock. If err is nil (empty inbox + lock fail path),
-		// still require no long hang.
-		if err != nil {
-			assertDeadlineBound(t, time.Since(wall0), short, err, false)
-		} else if time.Since(wall0) >= stuckGrace/2 {
-			t.Fatalf("DrainContext hung %s", time.Since(wall0))
+		if err == nil {
+			t.Fatal("DrainContext must fail closed under held lock (save requires flock)")
+		}
+		if !errors.Is(err, ErrMailboxLockTimeout) {
+			t.Fatalf("DrainContext: want BLOCKED, got %v", err)
+		}
+		if len(cons.state.Pending) != pendingBefore {
+			t.Fatalf("Drain failed but Pending mutated: got %d want %d", len(cons.state.Pending), pendingBefore)
 		}
 
-		// Seed pending so AckContext must save under lock.
-		cons.state.Pending["env-1"] = &pendingCallback{
-			EnvelopeID: "env-1",
-			Sequence:   1,
-			Callback:   Callback{Repo: "r", Ref: "main", LeaseGeneration: 1},
-		}
-		ctx5, cancel5 := context.WithTimeout(context.Background(), short)
+		ctx5, cancel5, h5 := withCancelOnPoll(2)
 		defer cancel5()
-		wall0 = time.Now()
-		err = cons.AckContext(ctx5, "env-1")
-		assertDeadlineBound(t, time.Since(wall0), short, err, false)
+		setTestHooks(h5)
+		err = cons.AckContext(ctx5, drained[0].EnvelopeID)
+		if err == nil {
+			t.Fatal("AckContext must fail closed under held lock")
+		}
+		if !errors.Is(err, ErrMailboxLockTimeout) {
+			t.Fatalf("AckContext: want BLOCKED, got %v", err)
+		}
+		if _, ok := cons.state.Pending[drained[0].EnvelopeID]; !ok {
+			t.Fatal("Ack failed but Pending entry was removed (non-transactional)")
+		}
+		if _, ok := cons.state.Acked[ackKey("r", "main")]; ok {
+			t.Fatal("Ack failed but Acked advanced (non-transactional)")
+		}
+		_ = env
+		clearTestHooks()
 	})
 }
 
 // TestMutationProbe_ContextDeadlineBound fails if lock acquisition ignores
-// ctx and falls back to stuckGrace (vacuous "eventually BLOCKED" would pass).
+// ctx (cancel) and waits the full stuckGrace — vacuous "eventually BLOCKED".
 func TestMutationProbe_ContextDeadlineBound(t *testing.T) {
 	tmpDir := t.TempDir()
 	mailFile := filepath.Join(tmpDir, "mut-ctx.jsonl")
@@ -1091,34 +1234,29 @@ func TestMutationProbe_ContextDeadlineBound(t *testing.T) {
 	defer release()
 	mb := NewMailbox(mailFile)
 
-	const short = 30 * time.Millisecond
-	ctx, cancel := context.WithTimeout(context.Background(), short)
+	ctx, cancel, h := withCancelOnPoll(1)
 	defer cancel()
+	setTestHooks(h)
+	defer clearTestHooks()
+
 	wall0 := time.Now()
 	entered := false
 	err := mb.withFileLockContext(ctx, func() error {
 		entered = true
 		return nil
 	})
-	wall := time.Since(wall0)
 	if entered {
 		t.Fatal("CS entered")
 	}
 	if !errors.Is(err, ErrMailboxLockTimeout) {
 		t.Fatalf("got %v", err)
 	}
-	// Mutation: if enqueue used blocking flock without bound, wall ≈ forever
-	// or until test timeout. If ctx dropped and stuckGrace used, wall ≈ 5s.
-	if wall >= stuckGrace/2 {
-		t.Fatalf("mutation: wall %s implies stuckGrace/unbounded qmeta wait", wall)
-	}
-	if wall < short/4 {
-		// Returned impossibly fast without observing the hold — still OK if
-		// expired at entry, but with live hold we expect at least one poll.
+	if time.Since(wall0) >= stuckGrace/2 {
+		t.Fatalf("mutation: wall %s implies stuckGrace wait (ctx cancel not honored)", time.Since(wall0))
 	}
 	var lte *LockTimeoutError
-	if errors.As(err, &lte) && lte.Bound >= stuckGrace && !strings.Contains(lte.Reason, "context") {
-		t.Fatalf("mutation: bound=%s reason=%s looks like default stuckGrace path", lte.Bound, lte.Reason)
+	if errors.As(err, &lte) && !strings.Contains(lte.Reason, "context") {
+		t.Fatalf("mutation: reason=%s missing context (propagation dropped?)", lte.Reason)
 	}
 }
 
