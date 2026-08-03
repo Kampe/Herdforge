@@ -10,13 +10,13 @@ event wiring and persistence-store selection remain a later integration stage.
 | --- | ---: | ---: | --- |
 | `herd_readiness_ready` | `0` for 5m | `0` for 15m | Critical dependencies are not authoritative and ready. Liveness is separate. |
 | `herd_queue_pressure_known` | `0` for 2m | `0` for 10m | Queue depth/capacity is unavailable; do not infer free capacity. |
-| `herd_stalled_work_total` | `>0` for 10m | `>0` for 30m | Aggregate stalled work exists; investigate state age and blocked/backpressured causes. |
-| `herd_dropped_callbacks_total` | Any increase | Any increase for 5m | Callback delivery is losing events; inspect the event path and durable store. |
+| `herd_stalled_work` | `>0` for 10m | `>0` for 30m | Aggregate stalled work exists; investigate state age and blocked/backpressured causes. |
+| `herd_dropped_callbacks` | Any increase | Any increase for 5m | Callback delivery is losing events; inspect the event path and durable store. |
 | `herd_review_saturation_ratio` | `>= 0.80` | `>= 0.95` | Review capacity is saturated; do not treat blocked work as eligible idle. |
 | `herd_dead_provider` | `1` for 2m | `1` for 10m | A provider is dead; readiness must remain false until authority is restored. |
 | `herd_integration_backlog` | `>0` for 10m | `>0` for 30m | Verified work is waiting for serialized integration. |
-| `herd_retries_total` | Increase over 5m | Increase over 15m | Repeated delivery or transition failures need diagnosis. |
-| `herd_dead_letters_total` | Any increase | Any non-zero value for 10m | Failed work requires explicit operator recovery. |
+| `herd_retries` | Increase over 5m | Increase over 15m | Repeated delivery or transition failures need diagnosis. |
+| `herd_dead_letters` | Any increase | Any non-zero value for 10m | Failed work requires explicit operator recovery. |
 | `herd_max_lease_age_seconds` | `>900` | `>1800` | Lease ownership may be stale or a worker may be stalled. |
 | `herd_max_callback_age_seconds` | `>300` | `>900` | Callback acknowledgement is older than the operational bound. |
 | `herd_eligible_idle_seconds` | `>600` | `>1800` | Eligible, non-blocked, non-backpressured work is idle. |
@@ -24,6 +24,8 @@ event wiring and persistence-store selection remain a later integration stage.
 
 These are starting alert thresholds for the bounded foundation, not measured
 SLO commitments. Tune them only with evidence from the eventual event wiring.
+The default freshness window for health, queue, signals, and transition SLO
+observations is five minutes; callers may inject shorter bounded thresholds.
 
 ## Runbook
 
@@ -34,8 +36,9 @@ SLO commitments. Tune them only with evidence from the eventual event wiring.
 3. Check `signals.observed_at` and
    `herd_last_reconciliation_timestamp_seconds`. A stale observation is a
    fail-closed condition, not proof of a healthy fleet.
-4. Check the aggregate stalled, callback, review, provider, integration,
-   retry, and dead-letter signals. Use bounded aggregate evidence only; this
+4. Check the bounded `condition_codes` for stalled work, dropped callbacks,
+   review saturation, dead provider, integration backlog, dead letters, and
+   eligible idle. Use bounded aggregate evidence only; this
    foundation intentionally does not expose task, ref, model, or raw-error
    labels.
 5. After an operator-approved recovery, verify a fresh reconciliation and
@@ -48,4 +51,6 @@ methods. `Persist` and `Restore` are explicit operations so callers can choose
 a durable implementation without this slice inventing production wiring.
 Restore rejects unsupported schemas, malformed data, contradictory totals,
 stale timestamps, and out-of-range values, resetting the exporter to an
-unknown state.
+unknown state. Eligible idle is derived from `eligible_waiting`,
+`eligible_since`, and explicit `blocked`/`backpressured` state; a caller cannot
+claim idle time that contradicts saturation or integration backlog.
