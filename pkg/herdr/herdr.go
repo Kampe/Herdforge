@@ -811,10 +811,11 @@ func reconcileRecoveredToolChild(tabID, event string, generation int64) error {
 }
 
 type TabInfo struct {
-	ID    string
-	Label string
-	Pane  PaneInfo
-	Cwd   string // process cwd requested at tab create (empty for legacy Tab)
+	ID         string
+	Label      string
+	Generation string
+	Pane       PaneInfo
+	Cwd        string // process cwd requested at tab create (empty for legacy Tab)
 }
 
 type PaneInfo struct {
@@ -1264,7 +1265,6 @@ func AgentList() ([]AgentEntry, error) {
 	return resp.Result.Agents, nil
 }
 
-// AgentEntry represents a single herdr-managed agent.
 // AgentSession is optional provenance. Grok never reports it; claude/opencode
 // fill it only after boot (after launch-time control bind).
 type AgentSession struct {
@@ -1275,7 +1275,9 @@ type AgentSession struct {
 }
 
 // AgentEntry matches live herdr 0.7.x agent list rows. Real counters are
-// Revision and StateChangeSeq — there is no generation field.
+// Revision and StateChangeSeq — the wire has no generation field. Optional
+// FAC-158 observation fields are filled by authority adapters / fixtures,
+// never invented from the raw agent list.
 type AgentEntry struct {
 	Name           string       `json:"name,omitempty"`
 	Kind           string       `json:"agent,omitempty"`
@@ -1287,6 +1289,25 @@ type AgentEntry struct {
 	Session        AgentSession `json:"agent_session,omitempty"`
 	Revision       uint64       `json:"revision,omitempty"`
 	StateChangeSeq uint64       `json:"state_change_seq,omitempty"`
+
+	// FAC-158 reconciliation observation (fixture / authority-filled).
+	SessionID           string      `json:"session_id,omitempty"`
+	Generation          string      `json:"generation,omitempty"`
+	SessionGeneration   string      `json:"session_generation,omitempty"`
+	TaskRef             string      `json:"task_ref,omitempty"`
+	TaskStatus          string      `json:"task_status,omitempty"`
+	WorktreeKnown       bool        `json:"worktree_known,omitempty"`
+	Dirty               bool        `json:"dirty,omitempty"`
+	UniqueCommits       bool        `json:"unique_commits,omitempty"`
+	UniqueRefs          bool        `json:"unique_refs,omitempty"`
+	PendingReview       bool        `json:"pending_review,omitempty"`
+	PendingOutbox       bool        `json:"pending_outbox,omitempty"`
+	PendingCallback     bool        `json:"pending_callback,omitempty"`
+	ActiveReview        bool        `json:"active_review,omitempty"`
+	UnsupersededVerdict bool        `json:"unsuperseded_verdict,omitempty"`
+	Protected           bool        `json:"protected,omitempty"`
+	ExplicitUserShell   bool        `json:"explicit_user_shell,omitempty"`
+	Evidence            TabEvidence `json:"evidence,omitempty"`
 }
 
 type PaneProcess struct {

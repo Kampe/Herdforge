@@ -54,6 +54,13 @@ type ForgeDriver interface {
 	Log(msg string)
 }
 
+// ReconciliationObserver is an observe-only safety sweep. Implementations
+// assemble complete source evidence and may persist structured observations,
+// but must not close tabs; FAC-180 owns atomic compare-and-close.
+type ReconciliationObserver interface {
+	ObserveReconciliation(ctx context.Context) error
+}
+
 // ForgeLoopOptions tunes the loop.
 type ForgeLoopOptions struct {
 	Interval  time.Duration // pause between ticks (default 5s)
@@ -106,6 +113,15 @@ func (e *Engine) ForgeLoop(ctx context.Context, d ForgeDriver, opts ForgeLoopOpt
 		}
 		delete(failures, key)
 	}
+	observe := func() {
+		if r, ok := d.(ReconciliationObserver); ok {
+			if err := r.ObserveReconciliation(ctx); err != nil {
+				d.Log(fmt.Sprintf("forge: reconciliation observe BLOCKED: %v", err))
+			}
+		}
+	}
+	// Startup recovery is observe-only and fail-visible.
+	observe()
 
 	for tick := 0; opts.MaxTicks == 0 || tick < opts.MaxTicks; tick++ {
 		select {
@@ -125,6 +141,8 @@ func (e *Engine) ForgeLoop(ctx context.Context, d ForgeDriver, opts ForgeLoopOpt
 				return fmt.Errorf("forge: control reconciliation failed before lane/board actions: %w", err)
 			}
 		}
+		// Periodic reconciliation is the safety net for lost callbacks.
+		observe()
 
 		// timeout → BLOCKED → recovering (probe) → ok on success.
 		if e.health.isBlocked() {
@@ -166,6 +184,9 @@ func (e *Engine) ForgeLoop(ctx context.Context, d ForgeDriver, opts ForgeLoopOpt
 		case ActionApprove:
 			d.Log("forge: approve " + action.Ref)
 			act("approve", action.Ref, func() error { return d.Approve(ctx, action.Task) })
+			// Post-merge board/session/worktree truth is observed before the
+			// next capacity decision; no cleanup mutation occurs here.
+			observe()
 		case ActionReview:
 			d.Log("forge: review " + action.Ref)
 			act("review", action.Ref, func() error { return d.Review(ctx, action.Task) })
