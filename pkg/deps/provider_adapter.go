@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/Kampe/Herdforge/pkg/provider"
 )
@@ -356,9 +357,8 @@ func (s *ProviderStore) SnapshotGraph(ctx context.Context) (*GraphSnapshot, erro
 }
 
 // RelationRevision returns the fence snapshot's provider revision when present.
-// It does NOT re-run N-call project fan-out (FAC-159 final TOCTOU must not
-// repeat a full storm). Use AssertIncidentEdgesFresh for post-side-effect
-// relation drift detection on the launch target.
+// It does NOT re-run O(board) project fan-out. Post-side-effect TOCTOU uses
+// AssertPrerequisiteClosureFresh (closure-scoped re-read, not full board).
 func (s *ProviderStore) RelationRevision(ctx context.Context) (string, error) {
 	if fence := FenceFrom(ctx); fence != nil {
 		if snap := fence.GetSnap(); snap != nil && snap.ProviderRevision != "" {
@@ -372,59 +372,264 @@ func (s *ProviderStore) RelationRevision(ctx context.Context) (string, error) {
 	return snap.ProviderRevision, nil
 }
 
-// AssertIncidentEdgesFresh re-lists relations for one task (O(1) provider
-// calls, not O(board)) and compares the multiset to the fenced snapshot.
-// Detects concurrent relation mutations on the launch target without
-// re-stamping the full project. Dual-end full agreement remains on the
-// initial SnapshotGraph.
-func (s *ProviderStore) AssertIncidentEdgesFresh(ctx context.Context, taskRef Ref, taskID TaskID, snap *GraphSnapshot) error {
+// Closure refresh budget: re-read only the launch task's prerequisite closure
+// (not unrelated board components). Live Kaneo has no project-relation RPC;
+// cold SnapshotGraph remains honest O(board) concurrent HTTP under list deadline.
+const (
+	// DefaultClosureRefreshMaxRequests caps ListRelations during post-fence TOCTOU.
+	DefaultClosureRefreshMaxRequests = 64
+	// DefaultClosureRefreshTimeout bounds wall time for closure re-read.
+	DefaultClosureRefreshTimeout = 8 * time.Second
+)
+
+// AssertPrerequisiteClosureFresh re-lists relations for the frozen prerequisite
+// closure of the launch task (transitive inbound blocks ancestors + the task),
+// expanding to a fixed point when live listings reveal new incident nodes.
+// Compares the closure edge multiset to the fenced snapshot. Unrelated board
+// components are not re-read. Fails closed on budget exhaustion or drift.
+//
+// AssertIncidentEdgesFresh is an alias kept for older call sites.
+func (s *ProviderStore) AssertPrerequisiteClosureFresh(ctx context.Context, taskRef Ref, taskID TaskID, snap *GraphSnapshot) error {
 	if snap == nil {
-		return fmt.Errorf("deps: AssertIncidentEdgesFresh: nil snapshot")
+		return fmt.Errorf("deps: AssertPrerequisiteClosureFresh: nil snapshot")
 	}
 	rp, err := s.rel()
 	if err != nil {
 		return err
 	}
-	if !taskID.Valid() {
-		return fmt.Errorf("deps: AssertIncidentEdgesFresh: task id required")
+	if !taskID.Valid() && !taskRef.Valid() {
+		return fmt.Errorf("deps: AssertPrerequisiteClosureFresh: task identity required")
 	}
-	s.ListRelCalls.Add(1)
-	rels, err := rp.ListRelations(ctx, string(taskID))
-	if err != nil {
-		return err
+
+	// Frozen prerequisite node set from snapshot (fixed point on inbound blocks).
+	frozenNodes := prerequisiteClosureNodes(snap.Edges, taskRef, taskID)
+	if len(frozenNodes) == 0 {
+		return fmt.Errorf("deps: AssertPrerequisiteClosureFresh: empty closure")
 	}
-	live := make([]DependencyEdge, 0, len(rels))
-	for _, r := range rels {
-		e, merr := s.mapEdgeStrict(ctx, r)
-		if merr != nil {
-			return merr
+	frozenEdges := closureRelevantEdges(snap.Edges, frozenNodes)
+
+	// Budgeted live re-read + expand when new prereq nodes appear.
+	deadline := DefaultClosureRefreshTimeout
+	if dl, ok := ctx.Deadline(); ok {
+		if rem := time.Until(dl); rem > 0 && rem < deadline {
+			deadline = rem
 		}
+	}
+	rctx, cancel := context.WithTimeout(ctx, deadline)
+	defer cancel()
+
+	// Work queue: task IDs to ListRelations (prefer immutable ids).
+	type node struct {
+		id  TaskID
+		ref Ref
+	}
+	var queue []node
+	seenID := map[TaskID]bool{}
+	seenRef := map[Ref]bool{}
+	enqueue := func(id TaskID, ref Ref) {
+		if id.Valid() {
+			if seenID[id] {
+				return
+			}
+			seenID[id] = true
+		} else if ref.Valid() {
+			if seenRef[ref] {
+				return
+			}
+			seenRef[ref] = true
+		} else {
+			return
+		}
+		queue = append(queue, node{id: id, ref: ref})
+	}
+	for _, nk := range frozenNodes {
+		enqueue(nk.id, nk.ref)
+	}
+
+	liveByKey := map[string]DependencyEdge{}
+	listedID := map[TaskID]bool{}
+	requests := 0
+	maxReq := DefaultClosureRefreshMaxRequests
+
+	for len(queue) > 0 {
+		if err := rctx.Err(); err != nil {
+			return fmt.Errorf("%w: prerequisite closure refresh budget exceeded: %v", ErrPostClaimDrift, err)
+		}
+		if requests >= maxReq {
+			return fmt.Errorf("%w: prerequisite closure refresh exceeded max requests %d", ErrPostClaimDrift, maxReq)
+		}
+		cur := queue[0]
+		queue = queue[1:]
+		listID := cur.id
+		if !listID.Valid() {
+			// Resolve ref → id via fence/store cache when possible.
+			if cur.ref.Valid() {
+				if id, rerr := s.ResolveRef(rctx, cur.ref); rerr == nil {
+					listID = id
+				}
+			}
+		}
+		if !listID.Valid() {
+			return fmt.Errorf("%w: cannot list closure node %s", ErrPostClaimDrift, cur.ref)
+		}
+		if listedID[listID] {
+			continue
+		}
+		listedID[listID] = true
+		requests++
+		s.ListRelCalls.Add(1)
+		rels, lerr := rp.ListRelations(rctx, string(listID))
+		if lerr != nil {
+			return fmt.Errorf("%w: list relations %s: %v", ErrPostClaimDrift, listID, lerr)
+		}
+		for _, r := range rels {
+			e, merr := s.mapEdgeStrict(rctx, r)
+			if merr != nil {
+				return merr
+			}
+			if e.Type != EdgeBlocks {
+				continue
+			}
+			// Record all blocks edges seen; filter to closure-relevant below.
+			liveByKey[edgeAuthKey(e)] = e
+			// Fixed-point expand: new source that blocks a node already in the
+			// live/frozen closure becomes a prerequisite that must be re-read.
+			if e.TargetID == listID || (cur.ref.Valid() && e.TargetRef == cur.ref) ||
+				nodeInClosure(frozenNodes, e.TargetID, e.TargetRef) || listedID[e.TargetID] {
+				if e.SourceID.Valid() && !listedID[e.SourceID] {
+					enqueue(e.SourceID, e.SourceRef)
+					// Grow frozenNodes identity set for relevance filtering.
+					frozenNodes = append(frozenNodes, closureNode{id: e.SourceID, ref: e.SourceRef})
+				}
+			}
+		}
+	}
+
+	// Live relevant edges: blocks edges whose target is in the (possibly expanded) closure.
+	liveRelevant := make([]DependencyEdge, 0, len(liveByKey))
+	for _, e := range liveByKey {
+		if nodeInClosure(frozenNodes, e.TargetID, e.TargetRef) ||
+			nodeInClosure(frozenNodes, e.SourceID, e.SourceRef) && nodeInClosure(frozenNodes, e.TargetID, e.TargetRef) {
+			// Inbound to any closure node, or both ends in closure.
+			if nodeInClosure(frozenNodes, e.TargetID, e.TargetRef) {
+				liveRelevant = append(liveRelevant, e)
+			}
+		}
+	}
+
+	if !edgeMultisetEqualKeys(liveRelevant, frozenEdges) {
+		return fmt.Errorf("%w: prerequisite closure edges for %s changed since fence snapshot (requests=%d)", ErrPostClaimDrift, taskRef, requests)
+	}
+	return nil
+}
+
+// AssertIncidentEdgesFresh is the historical name; it now validates the full
+// prerequisite closure (not only the launch task's incident multiset).
+func (s *ProviderStore) AssertIncidentEdgesFresh(ctx context.Context, taskRef Ref, taskID TaskID, snap *GraphSnapshot) error {
+	return s.AssertPrerequisiteClosureFresh(ctx, taskRef, taskID, snap)
+}
+
+type closureNode struct {
+	id  TaskID
+	ref Ref
+}
+
+func nodeKey(id TaskID, ref Ref) string {
+	if id.Valid() {
+		return "id:" + string(id)
+	}
+	return "ref:" + string(ref)
+}
+
+func nodeInClosure(nodes []closureNode, id TaskID, ref Ref) bool {
+	for _, n := range nodes {
+		if id.Valid() && n.id.Valid() && n.id == id {
+			return true
+		}
+		if ref.Valid() && n.ref.Valid() && n.ref == ref {
+			return true
+		}
+	}
+	return false
+}
+
+// prerequisiteClosureNodes returns launch + transitive inbound blockers (sources
+// of blocks edges targeting the growing set) from a frozen snapshot.
+func prerequisiteClosureNodes(edges []DependencyEdge, taskRef Ref, taskID TaskID) []closureNode {
+	var nodes []closureNode
+	seen := map[string]bool{}
+	add := func(id TaskID, ref Ref) {
+		k := nodeKey(id, ref)
+		if k == "id:" || k == "ref:" || seen[k] {
+			return
+		}
+		// Also de-dupe when both id and ref present under either key.
+		if id.Valid() && seen["id:"+string(id)] {
+			return
+		}
+		if ref.Valid() && seen["ref:"+string(ref)] {
+			return
+		}
+		seen[k] = true
+		if id.Valid() {
+			seen["id:"+string(id)] = true
+		}
+		if ref.Valid() {
+			seen["ref:"+string(ref)] = true
+		}
+		nodes = append(nodes, closureNode{id: id, ref: ref})
+	}
+	add(taskID, taskRef)
+	changed := true
+	for changed {
+		changed = false
+		for _, e := range edges {
+			if e.Type != EdgeBlocks {
+				continue
+			}
+			if !nodeInClosure(nodes, e.TargetID, e.TargetRef) {
+				continue
+			}
+			before := len(nodes)
+			add(e.SourceID, e.SourceRef)
+			if len(nodes) > before {
+				changed = true
+			}
+		}
+	}
+	return nodes
+}
+
+// closureRelevantEdges are blocks edges whose target is in the prerequisite
+// closure (inbound edges that determine reachability to the launch task).
+func closureRelevantEdges(edges []DependencyEdge, nodes []closureNode) []DependencyEdge {
+	var out []DependencyEdge
+	for _, e := range edges {
 		if e.Type != EdgeBlocks {
 			continue
 		}
-		live = append(live, e)
-	}
-	want := FilterInvolvingTask(snap.Edges, taskRef, taskID)
-	wantBlocks := make([]DependencyEdge, 0, len(want))
-	for _, e := range want {
-		if e.Type == EdgeBlocks {
-			wantBlocks = append(wantBlocks, e)
+		if nodeInClosure(nodes, e.TargetID, e.TargetRef) {
+			out = append(out, e)
 		}
 	}
-	if !edgeMultisetEqualKeys(live, wantBlocks) {
-		return fmt.Errorf("%w: incident edges for %s changed since fence snapshot", ErrPostClaimDrift, taskRef)
+	return out
+}
+
+func edgeAuthKey(e DependencyEdge) string {
+	if e.RelationID != "" {
+		return e.RelationID + "|" + e.Key()
 	}
-	return nil
+	return e.Key()
 }
 
 func edgeMultisetEqualKeys(a, b []DependencyEdge) bool {
 	ca := map[string]int{}
 	cb := map[string]int{}
 	for _, e := range a {
-		ca[e.RelationID+"|"+e.Key()]++
+		ca[edgeAuthKey(e)]++
 	}
 	for _, e := range b {
-		cb[e.RelationID+"|"+e.Key()]++
+		cb[edgeAuthKey(e)]++
 	}
 	if len(ca) != len(cb) {
 		return false

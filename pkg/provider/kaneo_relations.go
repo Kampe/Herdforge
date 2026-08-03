@@ -152,11 +152,11 @@ func (k *KaneoProvider) listRelationsHTTPOnly(ctx context.Context, taskID string
 
 // ListProjectRelations builds the project relation multiset for SnapshotGraph.
 //
-// This is NOT an O(1) single-RPC bulk endpoint (Kaneo has none). It is a
-// credentialed, deadline-bounded concurrent HTTP fan-out to
-// /api/task-relation/{id} with dual-end agreement. Without HTTP credentials it
-// FAILS CLOSED — never silently spawns N kaneo CLI subprocesses (FAC-159
-// audit vr8a7lvxx21e6shmb1z02atj).
+// Honest budget (Kaneo 0.11.x / upstream): only GET task-relation/:taskId exists.
+// This is O(board) concurrent HTTP fan-out (not O(1) bulk), measured ~4s for
+// ~164 IDs at concurrency 16 — fits DefaultListDeadline (30s) when credentialed.
+// Without origin-bound HTTP credentials it FAILS CLOSED before any fan-out
+// (never silent CLI N-way stampede).
 func (k *KaneoProvider) ListProjectRelations(ctx context.Context, projectID string) ([]Relation, error) {
 	if projectID == "" {
 		projectID = k.ProjectID
