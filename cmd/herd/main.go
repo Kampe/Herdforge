@@ -983,7 +983,7 @@ func runStandingConfig(cfg *config.Config, herdrAvailable bool) error {
 			continue
 		}
 
-		if err := herdr.AgentStartWithDecision(tabLabel, decision.Provider, tab.Pane.ID, launch.Request{Decision: decision, TaskRef: lane.Name}); err != nil {
+		if err := herdr.AgentStartWithDecision(tabLabel, decision.Provider, tab.Pane.ID, launch.Request{Decision: decision, TaskRef: lane.Name, Scope: router.ScopeLane}); err != nil {
 			fmt.Fprintf(os.Stderr, "  failed to start agent for lane %s: %v\n", lane.Name, err)
 			failures = append(failures, fmt.Errorf("lane %s start agent: %w", lane.Name, err))
 			continue
@@ -1061,7 +1061,7 @@ func runUp() {
 
 	tabLabel := fmt.Sprintf("forge-%s", lane.Name)
 
-	if err := herdr.AgentStartWithDecision(tabLabel, decision.Provider, tab.Pane.ID, launch.Request{Decision: decision, TaskRef: lane.Name}); err != nil {
+	if err := herdr.AgentStartWithDecision(tabLabel, decision.Provider, tab.Pane.ID, launch.Request{Decision: decision, TaskRef: lane.Name, Scope: router.ScopeLane}); err != nil {
 		fmt.Fprintf(os.Stderr, "failed to start agent: %v\n", err)
 		os.Exit(1)
 	}
@@ -2556,7 +2556,14 @@ func laneLaunchDecision(ctx context.Context, lane *config.LaneDef, task *provide
 	if task != nil {
 		contextRef = task.Ref
 	}
-	request := router.LaunchRequest{Role: role, Shape: shape, RequestedProvider: provider, RequestedModel: lane.Model, RequestedEffort: lane.Effort, TaskRef: contextRef, Risk: classify.TierR1}
+	scope := router.ScopeLane
+	if task != nil {
+		scope = router.ScopeTask
+		if role == router.RoleReviewer || role == router.RoleAssayer {
+			scope = router.ScopeCandidate
+		}
+	}
+	request := router.LaunchRequest{Role: role, Shape: shape, RequestedProvider: provider, RequestedModel: lane.Model, RequestedEffort: lane.Effort, TaskRef: contextRef, Scope: scope, Risk: classify.TierR1}
 	if role == router.RoleReviewer || role == router.RoleAssayer {
 		if task == nil {
 			return nil, fmt.Errorf("review launch requires candidate provenance")
@@ -2620,7 +2627,7 @@ func validateDecisionBeforeSideEffect(decision *router.LaunchDecision, taskRef s
 	if decision == nil {
 		return fmt.Errorf("missing routed launch decision")
 	}
-	return launch.Validate(launch.Request{Decision: decision, TaskRef: taskRef, LeaseGeneration: decision.LeaseGeneration}, nil)
+	return launch.Validate(launch.Request{Decision: decision, TaskRef: taskRef, LeaseGeneration: decision.LeaseGeneration, Scope: decision.Scope}, nil)
 }
 
 func rebindDecisionForTask(decision *router.LaunchDecision, taskRef string, leaseGeneration int64) (*router.LaunchDecision, error) {
@@ -2638,7 +2645,7 @@ func taskLaunchRequest(decision *router.LaunchDecision, taskRef string) launch.R
 	if decision == nil {
 		return launch.Request{TaskRef: taskRef}
 	}
-	return launch.Request{Decision: decision, TaskRef: taskRef, LeaseGeneration: decision.LeaseGeneration}
+	return launch.Request{Decision: decision, TaskRef: taskRef, LeaseGeneration: decision.LeaseGeneration, Scope: decision.Scope}
 }
 
 func shouldCreateEphemeralTaskAgent(err error) bool {

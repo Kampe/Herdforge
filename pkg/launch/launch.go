@@ -41,6 +41,7 @@ type Request struct {
 	Name            string
 	PaneID          string
 	LeaseGeneration int64
+	Scope           string
 }
 
 // Receipt is durable evidence for one launch attempt. Validation does not
@@ -237,7 +238,7 @@ func Validate(req Request, sink Sink) error {
 	if role == "" || shape == "" || provider == "" || model == "" || effort == "" || len(argv) == 0 {
 		return reject(req, sink, "an actual compiled LaunchDecision with role, task shape, provider, model, effort, and argv is required")
 	}
-	if err := router.VerifyDecision(req.Decision, req.TaskRef, req.LeaseGeneration); err != nil {
+	if err := router.VerifyDecisionForScope(req.Decision, req.TaskRef, req.LeaseGeneration, req.Scope); err != nil {
 		return reject(req, sink, err.Error())
 	}
 	role, shape, provider, model, effort = normalized(role), normalized(shape), normalized(provider), normalized(model), normalized(effort)

@@ -695,9 +695,9 @@ func workerRequest(opts DispatchOptions, taskRef string) (launch.Request, error)
 	}
 	d := opts.Decision
 	if d.Provider == "" || d.Model == "" || d.Effort == "" || d.Role == "" || d.Shape == "" || len(d.Argv) == 0 {
-		return launch.Request{Decision: d, TaskRef: taskRef, LeaseGeneration: d.LeaseGeneration}, fmt.Errorf("compiled LaunchDecision fields are required; defaults are forbidden")
+		return launch.Request{Decision: d, TaskRef: taskRef, LeaseGeneration: d.LeaseGeneration, Scope: d.Scope}, fmt.Errorf("compiled LaunchDecision fields are required; defaults are forbidden")
 	}
-	return launch.Request{Decision: d, TaskRef: taskRef, LeaseGeneration: d.LeaseGeneration}, nil
+	return launch.Request{Decision: d, TaskRef: taskRef, LeaseGeneration: d.LeaseGeneration, Scope: d.Scope}, nil
 }
 
 func validateWorkerLaunchRequest(opts DispatchOptions) (launch.Request, error) {

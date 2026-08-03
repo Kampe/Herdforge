@@ -105,6 +105,7 @@ func TestAgentStartRequiresExactClaimGenerationBeforeProcess(t *testing.T) {
 		Role: router.RoleWorker, Shape: launch.Implementation,
 		RequestedProvider: launch.WorkerProvider, RequestedModel: launch.WorkerModel,
 		RequestedEffort: launch.WorkerEffort, TaskRef: "FAC-178", LeaseGeneration: 7,
+		Scope:        router.ScopeTask,
 		ProbeResults: map[string]bool{router.ProbeKey(launch.WorkerProvider, launch.WorkerModel): true},
 	})
 	if err != nil {
@@ -113,7 +114,7 @@ func TestAgentStartRequiresExactClaimGenerationBeforeProcess(t *testing.T) {
 	for name, generation := range map[string]int64{"zero": 0, "mismatch": 6} {
 		t.Run(name, func(t *testing.T) {
 			before := len(calls)
-			err := AgentStartWithDecision("worker", launch.WorkerProvider, "pane", launch.Request{Decision: d, TaskRef: "FAC-178", LeaseGeneration: generation})
+			err := AgentStartWithDecision("worker", launch.WorkerProvider, "pane", launch.Request{Decision: d, TaskRef: "FAC-178", LeaseGeneration: generation, Scope: router.ScopeTask})
 			if err == nil {
 				t.Fatal("zero or mismatched generation must fail before process seam")
 			}
@@ -123,7 +124,7 @@ func TestAgentStartRequiresExactClaimGenerationBeforeProcess(t *testing.T) {
 		})
 	}
 	before := len(calls)
-	if err := AgentStartWithDecision("worker", launch.WorkerProvider, "pane", launch.Request{Decision: d, TaskRef: "FAC-178", LeaseGeneration: 7}); err != nil {
+	if err := AgentStartWithDecision("worker", launch.WorkerProvider, "pane", launch.Request{Decision: d, TaskRef: "FAC-178", LeaseGeneration: 7, Scope: router.ScopeTask}); err != nil {
 		t.Fatalf("exact generation must reach injected process seam: %v", err)
 	}
 	if len(calls) != before+1 {
@@ -137,11 +138,11 @@ func TestResumeUsesDurableClientIdentityNotHerdrMetadata(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	d, err = router.RebindDecision(d, "FAC-175", 0)
+	d, err = router.RebindDecision(d, "FAC-175", 7)
 	if err != nil {
 		t.Fatal(err)
 	}
-	req := launch.Request{Decision: d, TaskRef: "FAC-175", Name: "standing-worker", PaneID: "pane-1"}
+	req := launch.Request{Decision: d, TaskRef: "FAC-175", Name: "standing-worker", PaneID: "pane-1", LeaseGeneration: 7, Scope: router.ScopeTask}
 	if err := launch.RecordStarted(req, nil); err != nil {
 		t.Fatal(err)
 	}
@@ -153,13 +154,13 @@ func TestResumeUsesDurableClientIdentityNotHerdrMetadata(t *testing.T) {
 		}
 		return "{}", nil
 	}
-	if got, err := ResolveAgentTabWithDecision("standing-worker", launch.Request{Decision: d, TaskRef: "FAC-175", LeaseGeneration: d.LeaseGeneration}); err != nil || got != "standing-worker" {
+	if got, err := ResolveAgentTabWithDecision("standing-worker", launch.Request{Decision: d, TaskRef: "FAC-175", LeaseGeneration: d.LeaseGeneration, Scope: router.ScopeTask}); err != nil || got != "standing-worker" {
 		t.Fatalf("durable resume failed: %q %v", got, err)
 	}
-	if _, err := ResolveAgentTabWithDecision("standing-worker", launch.Request{Decision: d, TaskRef: "other", LeaseGeneration: d.LeaseGeneration}); err == nil {
+	if _, err := ResolveAgentTabWithDecision("standing-worker", launch.Request{Decision: d, TaskRef: "other", LeaseGeneration: d.LeaseGeneration, Scope: router.ScopeTask}); err == nil {
 		t.Fatal("different task identity must fail closed before resume")
 	}
-	if _, err := ResolveAgentTabWithDecision("missing", launch.Request{Decision: d, TaskRef: "FAC-175", LeaseGeneration: d.LeaseGeneration}); !errors.Is(err, ErrAgentNotFound) {
+	if _, err := ResolveAgentTabWithDecision("missing", launch.Request{Decision: d, TaskRef: "FAC-175", LeaseGeneration: d.LeaseGeneration, Scope: router.ScopeTask}); !errors.Is(err, ErrAgentNotFound) {
 		t.Fatalf("expected typed not-found, got %v", err)
 	}
 }
@@ -171,6 +172,7 @@ func TestStandingReceiptCannotAuthorizeClaimedTaskAssignment(t *testing.T) {
 		Role: router.RoleWorker, Shape: launch.Implementation,
 		RequestedProvider: launch.WorkerProvider, RequestedModel: launch.WorkerModel,
 		RequestedEffort: launch.WorkerEffort, TaskRef: "worker",
+		Scope:        router.ScopeLane,
 		ProbeResults: map[string]bool{router.ProbeKey(launch.WorkerProvider, launch.WorkerModel): true},
 	})
 	if err != nil {
@@ -200,7 +202,7 @@ func TestStandingReceiptCannotAuthorizeClaimedTaskAssignment(t *testing.T) {
 				t.Fatal(err)
 			}
 			before := len(calls)
-			_, err = ResolveAgentTabWithDecision("forge-worker", launch.Request{Decision: decision, TaskRef: tc.ref, LeaseGeneration: tc.gen})
+			_, err = ResolveAgentTabWithDecision("forge-worker", launch.Request{Decision: decision, TaskRef: tc.ref, LeaseGeneration: tc.gen, Scope: router.ScopeTask})
 			if !errors.Is(err, ErrAgentIdentityMismatch) {
 				t.Fatalf("lane receipt must not authorize %s/g%d: %v", tc.ref, tc.gen, err)
 			}
@@ -234,7 +236,7 @@ func TestResumeRejectsStoredCoordinatorTierDecisionWithoutPrompt(t *testing.T) {
 		calls = append(calls, append([]string(nil), args...))
 		return `{"result":{"agents":[{"name":"stored-worker","pane_id":"pane-1","tab_id":"tab-1"}]}}`, nil
 	}
-	_, err = ResolveAgentTabWithDecision("stored-worker", launch.Request{Decision: d, TaskRef: "FAC-175", Name: "stored-worker", PaneID: "pane-1", LeaseGeneration: d.LeaseGeneration})
+	_, err = ResolveAgentTabWithDecision("stored-worker", launch.Request{Decision: d, TaskRef: "FAC-175", Name: "stored-worker", PaneID: "pane-1", LeaseGeneration: d.LeaseGeneration, Scope: router.ScopeTask})
 	if !errors.Is(err, ErrAgentIdentityMismatch) {
 		t.Fatalf("stored Sol/Ultra session must be blocked by durable identity mismatch, got %v", err)
 	}
@@ -249,7 +251,7 @@ func TestResumePreservesMalformedCurrentDecisionError(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	d, err = router.RebindDecision(d, "FAC-175", 0)
+	d, err = router.RebindDecision(d, "FAC-175", 7)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -261,7 +263,7 @@ func TestResumePreservesMalformedCurrentDecisionError(t *testing.T) {
 		calls++
 		return `{}`, nil
 	}
-	_, err = ResolveAgentTabWithDecision("stored-worker", launch.Request{Decision: d, TaskRef: "FAC-175", Name: "stored-worker", PaneID: "pane-1", LeaseGeneration: d.LeaseGeneration})
+	_, err = ResolveAgentTabWithDecision("stored-worker", launch.Request{Decision: d, TaskRef: "FAC-175", Name: "stored-worker", PaneID: "pane-1", LeaseGeneration: d.LeaseGeneration, Scope: router.ScopeTask})
 	if err == nil || errors.Is(err, ErrAgentIdentityMismatch) {
 		t.Fatalf("malformed current decision must preserve validation error: %v", err)
 	}
@@ -309,7 +311,7 @@ func TestResumeRejectsMissingAndStaleReceiptsWithoutProcessOrPrompt(t *testing.T
 				calls = append(calls, append([]string(nil), args...))
 				return `{"result":{"agents":[{"name":"stored-worker","pane_id":"pane-1","tab_id":"tab-1"}]}}`, nil
 			}
-			_, err = ResolveAgentTabWithDecision("stored-worker", launch.Request{Decision: d, TaskRef: "FAC-175", Name: "stored-worker", PaneID: "pane-1", LeaseGeneration: d.LeaseGeneration})
+			_, err = ResolveAgentTabWithDecision("stored-worker", launch.Request{Decision: d, TaskRef: "FAC-175", Name: "stored-worker", PaneID: "pane-1", LeaseGeneration: d.LeaseGeneration, Scope: router.ScopeTask})
 			if !errors.Is(err, ErrAgentIdentityMismatch) {
 				t.Fatalf("%s receipt must be blocked, got %v", tc.name, err)
 			}

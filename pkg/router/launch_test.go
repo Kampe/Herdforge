@@ -609,6 +609,7 @@ func TestVerifyDecisionRequiresRouterIssuanceAndExactContext(t *testing.T) {
 	d, err := NewRouter(nil, nil).Decide(LaunchRequest{
 		Role: RoleWorker, Shape: "implementation", RequestedProvider: "codex",
 		RequestedModel: "gpt-5.6-luna", RequestedEffort: "medium", TaskRef: "FAC-A",
+		Scope:        ScopeLane,
 		ProbeResults: map[string]bool{ProbeKey("codex", "gpt-5.6-luna"): true},
 	})
 	if err != nil {
@@ -619,6 +620,9 @@ func TestVerifyDecisionRequiresRouterIssuanceAndExactContext(t *testing.T) {
 	}
 	if err := VerifyDecision(d, "FAC-A", 0); err != nil {
 		t.Fatalf("router-issued decision should verify for exact context: %v", err)
+	}
+	if _, err := RebindDecision(d, "FAC-B", 0); err == nil {
+		t.Fatal("zero-generation task assignment must fail closed")
 	}
 	bound, err := RebindDecision(d, "FAC-B", 7)
 	if err != nil {
@@ -637,5 +641,34 @@ func TestVerifyDecisionRejectsPublicCanonicalForgery(t *testing.T) {
 	forged.Proof = decisionProof(*forged)
 	if err := VerifyDecision(forged, "", 0); err == nil {
 		t.Fatal("recomputed public canonical proof must not establish router issuance")
+	}
+}
+
+func TestTaskDecisionCannotBeIssuedWithoutPositiveLease(t *testing.T) {
+	clearRouteEnv(t)
+	_, err := NewRouter(nil, nil).Decide(LaunchRequest{
+		Role: RoleWorker, Shape: "implementation", RequestedProvider: "codex",
+		RequestedModel: "gpt-5.6-luna", RequestedEffort: "medium", TaskRef: "FAC-175",
+		Scope: ScopeTask, LeaseGeneration: 0,
+		ProbeResults: map[string]bool{ProbeKey("codex", "gpt-5.6-luna"): true},
+	})
+	if err == nil {
+		t.Fatal("task decision with zero lease generation must fail closed")
+	}
+}
+
+func TestDecisionProofBindsExplicitScope(t *testing.T) {
+	clearRouteEnv(t)
+	d, err := NewRouter(nil, nil).Decide(LaunchRequest{
+		Role: RoleWorker, Shape: "implementation", RequestedProvider: "codex",
+		RequestedModel: "gpt-5.6-luna", RequestedEffort: "medium",
+		ProbeResults: map[string]bool{ProbeKey("codex", "gpt-5.6-luna"): true},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	d.Scope, d.TaskRef = ScopeLane, "worker"
+	if err := VerifyDecision(d, "worker", 0); err == nil {
+		t.Fatal("changing lane/task scope without reissuance must fail proof verification")
 	}
 }
