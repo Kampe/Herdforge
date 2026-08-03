@@ -38,9 +38,26 @@ type mockRedisClient struct {
 	mu         sync.Mutex
 	published  []publishedMsg
 	subs       map[string]*mockPubSub
-	publishErr atomic.Value
+	publishErr atomic.Value // holds *errHolder; never a bare nil (atomic.Value panics on that)
 	closeErr   error
 	closed     atomic.Bool
+}
+
+// errHolder lets the mock clear a previously-set publish error: atomic.Value
+// panics if Store is ever given a nil interface, so "no error" is a
+// non-nil *errHolder wrapping a nil err rather than storing nil directly.
+type errHolder struct{ err error }
+
+func (m *mockRedisClient) setPublishErr(err error) {
+	m.publishErr.Store(&errHolder{err: err})
+}
+
+func (m *mockRedisClient) loadPublishErr() error {
+	v, _ := m.publishErr.Load().(*errHolder)
+	if v == nil {
+		return nil
+	}
+	return v.err
 }
 
 type publishedMsg struct {
@@ -57,9 +74,9 @@ func (m *mockRedisClient) Publish(_ context.Context, channel string, message int
 	msg := publishedMsg{Channel: channel, Data: string(data)}
 	m.mu.Lock()
 	m.published = append(m.published, msg)
-	if err := m.publishErr.Load(); err != nil {
+	if err := m.loadPublishErr(); err != nil {
 		m.mu.Unlock()
-		return redis.NewIntResult(0, err.(error))
+		return redis.NewIntResult(0, err)
 	}
 	// Real Redis PSUBSCRIBE delivers a publish to every matching pattern,
 	// including the publisher's own subscription — simulate that here so
