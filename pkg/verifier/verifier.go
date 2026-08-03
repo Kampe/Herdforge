@@ -1,6 +1,7 @@
 package verifier
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -183,23 +184,40 @@ func (v *Verifier) execute(ctx context.Context, dir string, policy EnvironmentPo
 	cmd.Dir = dir
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	// Cancel reaps the whole process group while the leader is still live.
-	// Never SIGKILL a pgid after Wait: the leader PID can be reused under
-	// high process churn (race × count), and a post-Wait kill would target
-	// an unrelated process.
+	// Group-wide kill is required: leader-only kill leaves shell grandchildren
+	// running (see TestExecuteCancellationRequiresProcessGroupReap).
 	cmd.Cancel = func() error {
 		if cmd.Process == nil {
 			return nil
 		}
-		return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		return processGroupKiller(cmd.Process.Pid)
 	}
 	if policy == EnvironmentPolicyHermetic {
 		cmd.Env = commandEnv
 	}
-	// A canceled shell can leave grandchildren holding CombinedOutput's pipe
+	// A canceled shell can leave grandchildren holding stdout/stderr pipes
 	// open (for example, `sh -c 'sleep 3'`). WaitDelay bounds that wait and
 	// keeps the mutation transaction's restoration defer reachable.
 	cmd.WaitDelay = 100 * time.Millisecond
-	output, err := cmd.CombinedOutput()
+
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Start(); err != nil {
+		return nil, err
+	}
+	// Capture the session process-group id at start (Setpgid ⇒ pgid == pid).
+	// Used for residual group reap after Wait when ctx cancelled — kill(-pgid)
+	// targets remaining group members, not a reused leader PID identity.
+	pgid := cmd.Process.Pid
+	waitErr := cmd.Wait()
+	if ctx.Err() != nil {
+		// Explicit reap completion: residual group members may outlive Wait
+		// even after Cancel. Re-signal the captured process group.
+		reapProcessGroup(pgid)
+	}
+	output := append(stdout.Bytes(), stderr.Bytes()...)
+	err := waitErr
 	result := &Result{
 		Passed:       err == nil,
 		Outcome:      OutcomePASS,

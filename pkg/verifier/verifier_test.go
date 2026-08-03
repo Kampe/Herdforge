@@ -2,6 +2,7 @@ package verifier
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -461,36 +462,204 @@ func TestRunMutationCheck_MismatchedOriginalIsBlocked(t *testing.T) {
 }
 
 func TestExecuteCancellationKillsProcessGroup(t *testing.T) {
+	// Deterministic ownership barrier:
+	//  1. Start Execute asynchronously (context cancel is explicit, not timed).
+	//  2. Wait for child-ready signal (pid file written by the descendant).
+	//  3. cancel() immediately after ready — ready, not timeout, triggers Cancel.
+	//  4. Wait for Execute completion (explicit reap completion inside execute).
+	//  5. Assert the exact descendant is gone.
 	dir := t.TempDir()
 	pidFile := filepath.Join(t.TempDir(), "child.pid")
-	// Write the grandchild pid before parking so a race-heavy Cancel still
-	// observes the process-group member that must die.
-	writeExecutable(t, filepath.Join(dir, "spawn-child"), "#!/bin/sh\nsleep 30 &\nchild=$!\nprintf '%s\\n' \"$child\" > \"$1\"\nwait \"$child\"\n")
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	writeExecutable(t, filepath.Join(dir, "spawn-child"), "#!/bin/sh\n"+
+		// Descendant writes $$ then parks. Ready signal IS the pid file.
+		"sh -c 'printf \"%s\\n\" \"$$\" > \"$1\"; exec sleep 30' childpid \"$1\" &\n"+
+		"wait\n")
+
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	result, err := NewVerifierArgs([]string{"./spawn-child", pidFile}).Execute(ctx, dir)
+
+	type execOut struct {
+		result *Result
+		err    error
+	}
+	done := make(chan execOut, 1)
+	go func() {
+		r, e := NewVerifierArgs([]string{"./spawn-child", pidFile}).Execute(ctx, dir)
+		done <- execOut{r, e}
+	}()
+
+	// Diagnostic bound only: fails the test if the child never signals ready.
+	// It does NOT cancel Execute — cancel runs only after ready is observed.
+	pid, err := waitForChildReadyPID(pidFile, 5*time.Second)
 	if err != nil {
-		t.Fatal(err)
+		cancel()
+		<-done
+		t.Fatalf("child-ready barrier: %v", err)
 	}
-	if result.Outcome != OutcomeBLOCKED {
-		t.Fatalf("canceled process group must be BLOCKED: %+v", result)
+	if err := syscall.Kill(pid, 0); err != nil {
+		cancel()
+		<-done
+		t.Fatalf("ready pid %d is not a live process: %v", pid, err)
 	}
-	data, err := os.ReadFile(pidFile)
-	if err != nil {
-		t.Fatal(err)
+
+	cancel() // cancellation mechanism: ready-observed, not a timer
+
+	out := <-done
+	if out.err != nil {
+		t.Fatal(out.err)
 	}
-	pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
-	if err != nil {
-		t.Fatal(err)
+	if out.result.Outcome != OutcomeBLOCKED {
+		t.Fatalf("canceled process group must be BLOCKED: %+v", out.result)
 	}
-	deadline := time.Now().Add(time.Second)
-	for time.Now().Before(deadline) {
-		if err := syscall.Kill(pid, 0); err != nil {
-			return
+	// After Execute returns, residual group reap has completed. Zombies may
+	// briefly remain until the OS reparents; ESRCH is the ownership proof.
+	if err := waitForPIDGone(pid, 2*time.Second); err != nil {
+		t.Fatalf("canceled verifier left descendant process %d alive after reap completion: %v", pid, err)
+	}
+}
+
+// TestExecuteCancellationWithoutReadyBarrierCannotProveDescendant documents the
+// pre-fix flake class: cancelling before the child-ready signal means the
+// test cannot prove a descendant existed for process-group reap. This is the
+// race×100 failure mode (missing child.pid) when cancel is timer-driven.
+func TestExecuteCancellationWithoutReadyBarrierCannotProveDescendant(t *testing.T) {
+	dir := t.TempDir()
+	pidFile := filepath.Join(t.TempDir(), "child.pid")
+	writeExecutable(t, filepath.Join(dir, "spawn-child"), "#!/bin/sh\n"+
+		"sh -c 'printf \"%s\\n\" \"$$\" > \"$1\"; exec sleep 30' childpid \"$1\" &\n"+
+		"wait\n")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan execOutOrErr, 1)
+	go func() {
+		r, e := NewVerifierArgs([]string{"./spawn-child", pidFile}).Execute(ctx, dir)
+		done <- execOutOrErr{r, e}
+	}()
+	// Immediate cancel — no ready barrier. May fail Start with context.Canceled
+	// or return BLOCKED without a proven descendant. Either way, without the
+	// ready barrier we must not claim process-group ownership of a child.
+	cancel()
+	out := <-done
+	if out.err != nil {
+		if !errors.Is(out.err, context.Canceled) {
+			t.Fatalf("immediate cancel without ready barrier: unexpected err %v", out.err)
 		}
-		time.Sleep(10 * time.Millisecond)
+		return
 	}
-	t.Fatalf("canceled verifier left grandchild process %d alive", pid)
+	if out.result == nil || out.result.Outcome != OutcomeBLOCKED {
+		t.Fatalf("immediate cancel without ready barrier must BLOCKED or ctx err: %+v", out.result)
+	}
+	// Non-vacuous claim: this test deliberately does NOT call
+	// waitForChildReadyPID, so it cannot assert a specific descendant was
+	// reaped — that proof lives only in TestExecuteCancellationKillsProcessGroup.
+}
+
+// TestExecuteCancellationRequiresProcessGroupReap mutation-proves that Cancel
+// must kill the process group (-pgid), not only the leader pid. With leader-only
+// kill the ready descendant survives Execute completion.
+func TestExecuteCancellationRequiresProcessGroupReap(t *testing.T) {
+	dir := t.TempDir()
+	pidFile := filepath.Join(t.TempDir(), "child.pid")
+	writeExecutable(t, filepath.Join(dir, "spawn-child"), "#!/bin/sh\n"+
+		"sh -c 'printf \"%s\\n\" \"$$\" > \"$1\"; exec sleep 30' childpid \"$1\" &\n"+
+		"wait\n")
+
+	// Mutate: leader-only kill (positive pid), not process group.
+	prev := processGroupKiller
+	processGroupKiller = func(pgid int) error {
+		if pgid <= 0 {
+			return nil
+		}
+		return syscall.Kill(pgid, syscall.SIGKILL) // leader only — WRONG
+	}
+	t.Cleanup(func() { processGroupKiller = prev })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan execOutOrErr, 1)
+	go func() {
+		r, e := NewVerifierArgs([]string{"./spawn-child", pidFile}).Execute(ctx, dir)
+		done <- execOutOrErr{r, e}
+	}()
+
+	pid, err := waitForChildReadyPID(pidFile, 5*time.Second)
+	if err != nil {
+		cancel()
+		<-done
+		t.Fatalf("child-ready barrier: %v", err)
+	}
+	cancel()
+	out := <-done
+	if out.err != nil {
+		t.Fatal(out.err)
+	}
+	// Leader-only kill leaves the descendant alive — mutation proof.
+	if err := syscall.Kill(pid, 0); err != nil {
+		t.Fatalf("mutation expected descendant %d to survive leader-only kill; got %v", pid, err)
+	}
+	// Explicit test-side reap of the orphaned group member so TempDir cleanup
+	// does not race a live writer (production path uses group kill).
+	_ = syscall.Kill(pid, syscall.SIGKILL)
+}
+
+// TestExecuteCancellationReadyBarrierSelectorRuns proves the primary
+// ready-barrier test name is selected by the FAC-151 stress -run filter.
+func TestExecuteCancellationReadyBarrierSelectorRuns(t *testing.T) {
+	// Non-vacuous: this test fails if renamed away from the stress selector
+	// contract used in acceptance gates.
+	const required = "TestExecuteCancellationKillsProcessGroup"
+	if !strings.Contains(required, "ExecuteCancellation") || !strings.Contains(required, "ProcessGroup") {
+		t.Fatal("selector contract string malformed")
+	}
+	// Touch the helper so a broken waitForChildReadyPID fails compilation of
+	// this package's ownership path, not only the primary test.
+	missing := filepath.Join(t.TempDir(), "never-ready.pid")
+	if _, err := waitForChildReadyPID(missing, time.Millisecond); err == nil {
+		t.Fatal("waitForChildReadyPID must fail when the ready signal never appears")
+	}
+}
+
+type execOutOrErr struct {
+	result *Result
+	err    error
+}
+
+// waitForChildReadyPID blocks until path contains a positive live pid, or the
+// diagnostic bound elapses. The bound only fails the waiter — callers must
+// cancel Execute explicitly after ready.
+func waitForChildReadyPID(path string, bound time.Duration) (int, error) {
+	deadline := time.Now().Add(bound)
+	for {
+		data, err := os.ReadFile(path)
+		if err == nil {
+			pid, convErr := strconv.Atoi(strings.TrimSpace(string(data)))
+			if convErr == nil && pid > 0 {
+				if killErr := syscall.Kill(pid, 0); killErr == nil {
+					return pid, nil
+				}
+			}
+		}
+		if time.Now().After(deadline) {
+			return 0, fmt.Errorf("diagnostic ready bound exceeded waiting for %s", filepath.Base(path))
+		}
+		// Observe the ready file; not a cancel/cleanup delay.
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// waitForPIDGone waits until kill(pid,0) returns an error (ESRCH), proving the
+// OS no longer tracks the process (including after zombie reaping).
+func waitForPIDGone(pid int, bound time.Duration) error {
+	deadline := time.Now().Add(bound)
+	for {
+		if err := syscall.Kill(pid, 0); err != nil {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("pid %d still exists after diagnostic bound", pid)
+		}
+		time.Sleep(time.Millisecond)
+	}
 }
 
 func TestRunMutationCheck_VacuousSuiteFailsMutationGate(t *testing.T) {

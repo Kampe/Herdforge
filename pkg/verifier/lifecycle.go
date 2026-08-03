@@ -47,15 +47,22 @@ func (l *lifecycle) reap() {
 	}
 }
 
-// reapProcessGroup SIGKILLs the entire process group. After cmd.Wait the
-// leader is already reaped; residual grandchildren (shells that double-forked
-// without setsid) may still hold directories open. Immediate kill of the group
-// is the deterministic barrier — not a delayed retry.
-func reapProcessGroup(pgid int) {
+// processGroupKiller SIGKILLs every member of a process group. The argument is
+// the group id (leader pid when Setpgid:true). Production Cancel uses this
+// while the leader is live; tests may replace it to mutation-prove that
+// group-wide reap (not leader-only kill) is required.
+var processGroupKiller = killProcessGroup
+
+func killProcessGroup(pgid int) error {
 	if pgid <= 0 {
-		return
+		return nil
 	}
-	_ = syscall.Kill(-pgid, syscall.SIGKILL)
+	return syscall.Kill(-pgid, syscall.SIGKILL)
+}
+
+// reapProcessGroup SIGKILLs the entire process group via processGroupKiller.
+func reapProcessGroup(pgid int) {
+	_ = processGroupKiller(pgid)
 }
 
 // observeStarted records the process group of a started command whose
