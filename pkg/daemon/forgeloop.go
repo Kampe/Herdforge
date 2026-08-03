@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/Kampe/Herdforge/pkg/provider"
@@ -48,6 +49,10 @@ type ForgeLoopOptions struct {
 // ForgeLoop runs the async orchestration cycle: each tick it reads lane state
 // and completion signals, asks ForgeStep for the next action, and executes it
 // through the driver. It keeps lanes saturated and drains the board.
+//
+// FAC-150: when the task provider times out, health becomes
+// BLOCKED(provider_timeout). The next tick transitions to recovering and
+// re-probes without claiming work until a successful bound call returns ok.
 func (e *Engine) ForgeLoop(ctx context.Context, d ForgeDriver, opts ForgeLoopOptions) error {
 	interval := opts.Interval
 	if interval <= 0 {
@@ -61,12 +66,19 @@ func (e *Engine) ForgeLoop(ctx context.Context, d ForgeDriver, opts ForgeLoopOpt
 		default:
 		}
 
+		// timeout → BLOCKED → recovering (probe) → ok on success.
+		if e.health.isBlocked() {
+			d.Log("forge: " + e.ProviderStatus() + " — not claiming work")
+			e.health.beginRecovery()
+			d.Log("forge: " + e.ProviderStatus() + " — probing board")
+		}
+
 		lanes := d.LaneState(ctx)
 		completed, verified := d.Signals(ctx)
 
 		action, err := e.ForgeStep(ctx, lanes, completed, verified)
 		if err != nil {
-			d.Log(fmt.Sprintf("forge: step error: %v", err))
+			d.Log(fmt.Sprintf("forge: step error (%s): %v", e.ProviderStatus(), err))
 			sleep(ctx, interval)
 			continue
 		}
@@ -88,12 +100,19 @@ func (e *Engine) ForgeLoop(ctx context.Context, d ForgeDriver, opts ForgeLoopOpt
 				d.Log(fmt.Sprintf("forge: renudge %s failed: %v", action.Ref, err))
 			}
 		case ActionDispatch:
+			if e.health.isBlocked() {
+				d.Log("forge: " + e.ProviderStatus() + " — skip dispatch")
+				break
+			}
 			d.Log("forge: dispatch " + action.Ref)
 			if err := d.Dispatch(ctx, action.Task); err != nil {
 				d.Log(fmt.Sprintf("forge: dispatch %s failed: %v", action.Ref, err))
 			}
 		case ActionIdle:
-			if opts.StopEmpty && lanes.Busy == 0 {
+			if st := e.ProviderStatus(); strings.HasPrefix(st, "BLOCKED") || st == "recovering" {
+				d.Log("forge: idle under " + st)
+			}
+			if opts.StopEmpty && lanes.Busy == 0 && e.ProviderHealth().State == ProviderOK {
 				d.Log("forge: board clear and no lane busy — loop complete")
 				return nil
 			}

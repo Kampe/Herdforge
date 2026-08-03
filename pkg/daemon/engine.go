@@ -21,24 +21,73 @@ type Engine struct {
 	Store    *store.Store
 	Worktree *worktree.WorktreeManager
 	Verifier *verifier.Verifier
+
+	// health projects BLOCKED(provider_timeout)/recovering for the control plane.
+	health providerHealth
 }
 
 func NewEngine(cfg *config.Config, tp provider.TaskProvider, r *router.ModelRouter, s *store.Store, wm *worktree.WorktreeManager, v *verifier.Verifier) *Engine {
-	return &Engine{
+	e := &Engine{
 		Config:   cfg,
 		TaskProv: tp,
 		Router:   r,
 		Store:    s,
 		Worktree: wm,
 		Verifier: v,
+		health:   providerHealth{state: ProviderOK},
 	}
+	applyConfiguredDeadlines(cfg, tp)
+	return e
+}
+
+// ProviderHealth returns the current board-lane health projection.
+func (e *Engine) ProviderHealth() ProviderHealth {
+	if e == nil {
+		return ProviderHealth{State: ProviderOK}
+	}
+	return e.health.snapshot()
+}
+
+// ProviderStatus is the fleet label: ok | recovering | BLOCKED(provider_timeout).
+func (e *Engine) ProviderStatus() string {
+	return e.ProviderHealth().String()
+}
+
+func (e *Engine) deadlines() provider.Deadlines {
+	return engineDeadlines(e.Config)
+}
+
+// listTasksBound is the production ListTasks path: configurable deadline + health observe.
+func (e *Engine) listTasksBound(ctx context.Context, projectID, status string) ([]*provider.Task, error) {
+	dls := e.deadlines()
+	opCtx, cancel := provider.BoundOp(ctx, dls, provider.OpList)
+	defer cancel()
+	tasks, err := e.TaskProv.ListTasks(opCtx, projectID, status)
+	e.health.observe(err)
+	return tasks, err
+}
+
+// claimTaskBound is the production ClaimTask path.
+func (e *Engine) claimTaskBound(ctx context.Context, taskID, role string) error {
+	dls := e.deadlines()
+	opCtx, cancel := provider.BoundOp(ctx, dls, provider.OpMutate)
+	defer cancel()
+	err := e.TaskProv.ClaimTask(opCtx, taskID, role)
+	e.health.observe(err)
+	return err
 }
 
 // SelectNextTask sorts candidate tasks deterministically by Priority DESC, Ticket Ref ASC
 func (e *Engine) SelectNextTask(ctx context.Context, role string) (*provider.Task, error) {
-	tasks, err := e.TaskProv.ListTasks(ctx, e.Config.TaskProvider.ProjectID, "to-do")
+	// While BLOCKED, refuse to select/claim — stay responsive without board spam
+	// until beginRecovery (ForgeLoop tick) moves us to recovering.
+	if e.health.isBlocked() {
+		return nil, fmt.Errorf("select next task: %s", e.ProviderStatus())
+	}
+
+	tasks, err := e.listTasksBound(ctx, e.Config.TaskProvider.ProjectID, "to-do")
 	if err != nil {
-		return nil, fmt.Errorf("failed to list candidate tasks: %w", err)
+		return nil, formatProviderStepError("failed to list candidate tasks", err)
 	}
 
 	// Filter tasks by role label matching
@@ -84,6 +133,11 @@ func (e *Engine) SelectNextTask(ctx context.Context, role string) (*provider.Tas
 
 // RunPulse executes one orchestration sweep pass, recording to the SQLite store.
 func (e *Engine) RunPulse(ctx context.Context, role string) (*provider.Task, error) {
+	// BLOCKED: do not claim more work; surface status and stay responsive.
+	if e.health.isBlocked() {
+		return nil, fmt.Errorf("pulse sweep refused: %s", e.ProviderStatus())
+	}
+
 	task, err := e.SelectNextTask(ctx, role)
 	if err != nil {
 		return nil, fmt.Errorf("pulse sweep failed: %w", err)
@@ -92,8 +146,8 @@ func (e *Engine) RunPulse(ctx context.Context, role string) (*provider.Task, err
 		return nil, nil
 	}
 
-	if err := e.TaskProv.ClaimTask(ctx, task.ID, role); err != nil {
-		return nil, fmt.Errorf("failed to claim task %s: %w", task.Ref, err)
+	if err := e.claimTaskBound(ctx, task.ID, role); err != nil {
+		return nil, formatProviderStepError(fmt.Sprintf("failed to claim task %s", task.Ref), err)
 	}
 
 	if e.Store != nil {
