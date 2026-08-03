@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "note": "Herdforge lane registry: constraint sections are VERBATIM from chainseer docs/agent/lane-registry.json (the parity contract for the shell->Go swap); lanes[] is this repo standing roster (forge-smith, worker, reviewer). herd resolve-lane resolves provider+model+effort from live quota via pkg/router (herd-route port) plus these constraints. Deterministic, no LLM calls.",
+  "note": "Herdforge lane registry: constraint sections are VERBATIM from chainseer docs/agent/lane-registry.json (the parity contract for the shell->Go swap); lanes[] is the forge roster (scout, smith, assayer). FAC-142 SurfaceRouter.Decide owns live provider+model+effort+pool for worker and reviewer launches (never harness defaults). Deterministic, no LLM calls.",
   "provider_constraints": {
     "claude-haiku-4-5": {
       "forbid_standing": true,
@@ -123,7 +123,7 @@
   },
   "lanes": [
     {
-      "id": "forge-smith",
+      "id": "scout",
       "packet": ".herd/prompts/smith.md",
       "role": "forge-smith",
       "route_shape": "implementation",
@@ -131,7 +131,7 @@
       "prefer": null
     },
     {
-      "id": "worker",
+      "id": "smith",
       "packet": ".herd/prompts/worker.md",
       "role": "worker",
       "route_shape": "implementation",
@@ -139,12 +139,13 @@
       "prefer": null
     },
     {
-      "id": "reviewer",
+      "id": "assayer",
       "packet": ".herd/prompts/reviewer.md",
       "role": "reviewer",
       "route_shape": "qa",
       "risk_class": "standard",
-      "prefer": null
+      "prefer": "claude",
+      "prefer_model": "claude-sonnet-5"
     }
   ]
 }
