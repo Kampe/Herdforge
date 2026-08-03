@@ -540,7 +540,17 @@ func TestInvalidTransitionLatencyFencesOlderReplayAndRestoresUnknown(t *testing.
 
 func TestTransitionAggregateOverflowFencesOlderReplayWithoutIncrementingAttempts(t *testing.T) {
 	now := time.Date(2026, 8, 3, 12, 0, 0, 0, time.UTC)
-	exp := NewMetricsExporterWithPersistence(nil, func() time.Time { return now })
+	store := &memoryStateStore{}
+	exp := NewMetricsExporterWithPersistence(store, func() time.Time { return now })
+	if err := exp.SetHealthAt(completeDependencies(), now); err != nil {
+		t.Fatal(err)
+	}
+	if err := exp.SetQueuePressureAt(QueuePressure{Depth: 0, Capacity: 1, Known: true}, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := exp.SetSignals(FleetSignals{LastReconciliation: now, ObservedAt: now}); err != nil {
+		t.Fatal(err)
+	}
 	if err := exp.RecordTransitionObservation(now.Add(-maxSignalAge), now, nil, now, 1); err != nil {
 		t.Fatal(err)
 	}
@@ -551,7 +561,24 @@ func TestTransitionAggregateOverflowFencesOlderReplayWithoutIncrementingAttempts
 		t.Fatal("older replay overwrote aggregate overflow tombstone")
 	}
 	_, _, slo := exp.Snapshot()
-	if slo.Attempts != 0 || !slo.Invalid || slo.InvalidReason != "aggregate_overflow" || slo.Sequence != 2 {
+	if slo.Attempts != 1 || slo.Completed != 1 || slo.Failed != 0 || slo.TotalLatency != maxSignalAge || !slo.Invalid || slo.InvalidReason != "aggregate_overflow" || slo.Sequence != 2 {
 		t.Fatalf("aggregate overflow mutated or failed to fence SLO: %+v", slo)
+	}
+	if view := exp.ReadAt(now); view.Freshness.SLOFresh || view.Freshness.Ready {
+		t.Fatalf("aggregate overflow was reported fresh or ready: %+v", view.Freshness)
+	}
+	if err := exp.Persist(context.Background()); err != nil {
+		t.Fatalf("aggregate overflow history was not persisted: %v", err)
+	}
+	restored := NewMetricsExporterWithPersistence(store, func() time.Time { return now })
+	if err := restored.Restore(context.Background()); err != nil {
+		t.Fatalf("aggregate overflow history did not restore: %v", err)
+	}
+	if err := restored.RecordTransitionObservation(now.Add(-maxSignalAge), now, nil, now, 1); err == nil {
+		t.Fatal("older replay overwrote restored aggregate overflow tombstone")
+	}
+	_, _, restoredSLO := restored.Snapshot()
+	if restoredSLO.Attempts != 1 || restoredSLO.Completed != 1 || restoredSLO.TotalLatency != maxSignalAge || !restoredSLO.Invalid || restoredSLO.Sequence != 2 {
+		t.Fatalf("restored aggregate history changed: %+v", restoredSLO)
 	}
 }
