@@ -33,6 +33,9 @@ type Engine struct {
 	// ControlReconciler is the production coordinator restart/pulse hook.
 	// When configured, RunPulse reconciles durable control orders before claims.
 	ControlReconciler *control.CoordinatorLoop
+	// ControlRequired marks a wake-capable production engine. It prevents a
+	// missing composition from silently falling back to direct board/lane work.
+	ControlRequired bool
 
 	// health projects BLOCKED(provider_timeout)/recovering for the control plane.
 	health              providerHealth
@@ -64,6 +67,17 @@ func NewEngine(cfg *config.Config, tp provider.TaskProvider, r *router.ModelRout
 		health:   providerHealth{state: ProviderOK},
 	}
 	applyConfiguredDeadlines(cfg, tp)
+	return e
+}
+
+// NewEngineWithControl is the production composition boundary. It marks the
+// engine wake-capable even when the authoritative loop is unavailable, so the
+// caller fails closed before any board or lane action rather than bypassing
+// durable control.
+func NewEngineWithControl(cfg *config.Config, tp provider.TaskProvider, r *router.ModelRouter, s *store.Store, wm *worktree.WorktreeManager, v *verifier.Verifier, reconciler *control.CoordinatorLoop) *Engine {
+	e := NewEngine(cfg, tp, r, s, wm, v)
+	e.ControlReconciler = reconciler
+	e.ControlRequired = true
 	return e
 }
 
