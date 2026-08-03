@@ -280,7 +280,7 @@ func (e *BlockedError) Error() string {
 }
 
 // GraphRevision computes SHA-256 over canonical immutable IDs, edge relation
-// IDs, status map, and provider revision. Weak local hashes are not used.
+// IDs, status map (including the target task), and provider revision.
 func GraphRevision(edges []DependencyEdge, statusByRef map[string]string, providerRevision string) string {
 	keys := make([]string, 0, len(edges)+len(statusByRef)+1)
 	for _, e := range edges {
@@ -297,4 +297,24 @@ func GraphRevision(edges []DependencyEdge, statusByRef map[string]string, provid
 		_, _ = h.Write([]byte{0})
 	}
 	return hex.EncodeToString(h.Sum(nil))
+}
+
+// GraphRevisionWithTarget includes the target task's immutable id + status so
+// claim ownership state is part of the fenced revision (not relation-only).
+func GraphRevisionWithTarget(edges []DependencyEdge, statusByRef map[string]string, providerRevision string, targetID TaskID, targetRef Ref, targetStatus string) string {
+	if statusByRef == nil {
+		statusByRef = map[string]string{}
+	}
+	// Copy so caller map is not mutated.
+	cp := make(map[string]string, len(statusByRef)+2)
+	for k, v := range statusByRef {
+		cp[k] = v
+	}
+	if targetRef.Valid() {
+		cp[string(targetRef)] = targetStatus
+	}
+	if targetID.Valid() {
+		cp["id:"+string(targetID)] = targetStatus
+	}
+	return GraphRevision(edges, cp, providerRevision)
 }

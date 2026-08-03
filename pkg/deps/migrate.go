@@ -2,43 +2,74 @@ package deps
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/Kampe/Herdforge/pkg/provider"
 )
 
-// DescriptionWriter updates task descriptions (migration apply). Optional on providers.
+// DescriptionWriter updates task descriptions. Coordinator-run migrate --apply
+// uses this; workers must never invoke apply against live Kaneo.
 type DescriptionWriter interface {
 	SetDescription(ctx context.Context, taskID, description string) error
+	GetDescription(ctx context.Context, taskID string) (string, error)
 }
 
 // MigratePlan is the dry-run/apply report for herd-deps-v1 backfill.
+// Authority remains description fences + Kaneo relations only (no sidecar).
 type MigratePlan struct {
-	ProjectID string             `json:"project_id"`
-	Items     []MigrateItem      `json:"items"`
-	OK        bool               `json:"ok"`
-	Errors    []string           `json:"errors,omitempty"`
+	ProjectID        string        `json:"project_id"`
+	ProviderRevision string        `json:"provider_revision"`
+	Items            []MigrateItem `json:"items"`
+	OK               bool          `json:"ok"`
+	Errors           []string      `json:"errors,omitempty"`
+	Mode             string        `json:"mode"` // dry-run | apply-description
+	JournalPath      string        `json:"journal_path,omitempty"`
 }
 
 // MigrateItem is one task's planned provenance backfill.
 type MigrateItem struct {
-	Ref           string `json:"ref"`
-	TaskID        string `json:"task_id"`
-	Status        string `json:"status"`
-	Action        string `json:"action"` // skip_has_fence | write_empty | write_from_board | error
-	AlreadyPresent bool  `json:"already_present"`
-	EdgeCount     int    `json:"edge_count"`
-	Detail        string `json:"detail,omitempty"`
-	Applied       bool   `json:"applied,omitempty"`
-	ReadbackOK    bool   `json:"readback_ok,omitempty"`
+	Ref            string           `json:"ref"`
+	TaskID         string           `json:"task_id"`
+	Status         string           `json:"status"`
+	Action         string           `json:"action"` // skip_fresh | repair_stale | write_empty | write_from_board | error
+	AlreadyPresent bool             `json:"already_present"`
+	EdgeCount      int              `json:"edge_count"`
+	IntendedEdges  []DependencyEdge `json:"intended_edges,omitempty"`
+	Detail         string           `json:"detail,omitempty"`
+	Applied        bool             `json:"applied,omitempty"`
+	ReadbackOK     bool             `json:"readback_ok,omitempty"`
+	SnapshotRev    string           `json:"snapshot_rev,omitempty"`
+	RolledBack     bool             `json:"rolled_back,omitempty"`
 }
 
-// PlanMigration builds a dry-run plan: every active (non-done) task gets an
-// explicit versioned fence (from board blocks or empty). No Markdown inference.
+// JournalEntry is a before-image for coordinator rollback after partial apply.
+type JournalEntry struct {
+	TaskID      string `json:"task_id"`
+	Ref         string `json:"ref"`
+	BeforeDesc  string `json:"before_description"`
+	AfterDesc   string `json:"after_description,omitempty"`
+	AppliedAt   string `json:"applied_at,omitempty"`
+	RolledBack  bool   `json:"rolled_back,omitempty"`
+}
+
+// Journal is the per-apply rollback log (coordinator-owned file under .herd/).
+type Journal struct {
+	ProviderRevision string         `json:"provider_revision"`
+	StartedAt        string         `json:"started_at"`
+	Entries          []JournalEntry `json:"entries"`
+}
+
+// PlanMigration builds a revision-fenced dry-run from a fresh snapshot.
+// Description fences + board relations only. Stale fences (missing task_id,
+// edge multiset mismatch) are repair_stale, not skip.
 func PlanMigration(ctx context.Context, store RelationStore, tp provider.TaskProvider, projectID string) (*MigratePlan, error) {
-	plan := &MigratePlan{ProjectID: projectID, OK: true}
+	plan := &MigratePlan{ProjectID: projectID, OK: true, Mode: "dry-run"}
 	if store == nil || tp == nil {
 		return nil, fmt.Errorf("deps migrate: store and task provider required")
 	}
@@ -50,6 +81,7 @@ func PlanMigration(ctx context.Context, store RelationStore, tp provider.TaskPro
 	if err != nil {
 		return nil, fmt.Errorf("deps migrate: snapshot: %w", err)
 	}
+	plan.ProviderRevision = snap.ProviderRevision
 	tasks, err := tp.ListTasks(ctx, projectID, "")
 	if err != nil {
 		return nil, err
@@ -65,128 +97,257 @@ func PlanMigration(ctx context.Context, store RelationStore, tp provider.TaskPro
 		if st == provider.StatusDone || st == provider.StatusArchived {
 			continue
 		}
-		item := MigrateItem{Ref: t.Ref, TaskID: t.ID, Status: st}
-		existing, xerr := ExtractProvenanceFromText(t.Description)
-		if xerr != nil {
-			item.Action = "error"
-			item.Detail = xerr.Error()
+		item := planOne(t, snap)
+		if item.Action == "error" {
 			plan.OK = false
-			plan.Errors = append(plan.Errors, t.Ref+": "+xerr.Error())
-			plan.Items = append(plan.Items, item)
-			continue
-		}
-		if existing != nil && existing.Present {
-			if berr := existing.BindAndValidate(Ref(t.Ref), TaskID(t.ID)); berr != nil {
-				item.Action = "error"
-				item.Detail = "present fence fails bind: " + berr.Error()
-				plan.OK = false
-				plan.Errors = append(plan.Errors, t.Ref+": "+item.Detail)
-			} else {
-				item.Action = "skip_has_fence"
-				item.AlreadyPresent = true
-			}
-			plan.Items = append(plan.Items, item)
-			continue
-		}
-		// Build from board blocks involving this task (authoritative, not prose).
-		involving := FilterInvolvingTask(snap.Edges, Ref(t.Ref), TaskID(t.ID))
-		var edges []DependencyEdge
-		for _, e := range involving {
-			if e.Type == EdgeBlocks {
-				edges = append(edges, DependencyEdge{
-					SourceRef: e.SourceRef, TargetRef: e.TargetRef,
-					SourceID: e.SourceID, TargetID: e.TargetID,
-					Type: EdgeBlocks, RelationID: e.RelationID,
-				})
-			}
-		}
-		item.EdgeCount = len(edges)
-		if len(edges) == 0 {
-			item.Action = "write_empty"
-		} else {
-			item.Action = "write_from_board"
+			plan.Errors = append(plan.Errors, t.Ref+": "+item.Detail)
 		}
 		plan.Items = append(plan.Items, item)
 	}
 	return plan, nil
 }
 
-// ApplyMigration writes fences for planned items and readbacks each mutation.
-// writer must implement DescriptionWriter (or *MemoryProvider via adapter).
-func ApplyMigration(ctx context.Context, store RelationStore, tp provider.TaskProvider, projectID string, writer DescriptionWriter) (*MigratePlan, error) {
-	if writer == nil {
-		return nil, fmt.Errorf("deps migrate apply: DescriptionWriter required")
+func planOne(t *provider.Task, snap *GraphSnapshot) MigrateItem {
+	item := MigrateItem{
+		Ref: t.Ref, TaskID: t.ID, Status: provider.NormalizeStatus(t.Status),
+		SnapshotRev: snap.ProviderRevision,
 	}
-	plan, err := PlanMigration(ctx, store, tp, projectID)
+	intended := intendedBoardEdges(snap.Edges, Ref(t.Ref), TaskID(t.ID))
+	item.IntendedEdges = intended
+	item.EdgeCount = len(intended)
+
+	existing, xerr := ExtractProvenanceFromText(t.Description)
+	if xerr != nil {
+		item.Action = "repair_stale"
+		item.Detail = xerr.Error()
+		return item
+	}
+	if existing != nil && existing.Present {
+		if berr := existing.BindAndValidate(Ref(t.Ref), TaskID(t.ID)); berr != nil {
+			item.Action = "repair_stale"
+			item.Detail = "bind: " + berr.Error()
+			return item
+		}
+		got, gerr := existing.DesiredBlocks()
+		if gerr != nil {
+			item.Action = "repair_stale"
+			item.Detail = gerr.Error()
+			return item
+		}
+		if !EdgeMultisetEqual(got, intended) {
+			item.Action = "repair_stale"
+			item.Detail = "fence edge multiset != current board blocks"
+			return item
+		}
+		item.Action = "skip_fresh"
+		item.AlreadyPresent = true
+		return item
+	}
+	if len(intended) == 0 {
+		item.Action = "write_empty"
+	} else {
+		item.Action = "write_from_board"
+	}
+	return item
+}
+
+func intendedBoardEdges(all []DependencyEdge, ref Ref, id TaskID) []DependencyEdge {
+	var edges []DependencyEdge
+	for _, e := range FilterInvolvingTask(all, ref, id) {
+		if e.Type == EdgeBlocks {
+			edges = append(edges, DependencyEdge{
+				SourceRef: e.SourceRef, TargetRef: e.TargetRef,
+				SourceID: e.SourceID, TargetID: e.TargetID,
+				Type: EdgeBlocks, RelationID: e.RelationID,
+			})
+		}
+	}
+	return edges
+}
+
+// EdgeMultisetEqual compares blocks edges as a multiset (counts duplicates).
+// Set semantics are intentionally rejected — duplicate authority must not hide.
+func EdgeMultisetEqual(a, b []DependencyEdge) bool {
+	ca := edgeCounts(a)
+	cb := edgeCounts(b)
+	if len(ca) != len(cb) {
+		return false
+	}
+	for k, n := range ca {
+		if cb[k] != n {
+			return false
+		}
+	}
+	return true
+}
+
+func edgeCounts(edges []DependencyEdge) map[string]int {
+	m := map[string]int{}
+	for _, e := range edges {
+		if e.Type != EdgeBlocks {
+			continue
+		}
+		m[e.Key()]++
+	}
+	return m
+}
+
+// ApplyMigration is coordinator-run only. Per-card: fresh snapshot, journal
+// before-image, write description fence, semantic multiset readback; on
+// failure after write, restore before-image from journal. Workers must not
+// invoke this against live Kaneo (CLI refuses apply without HERD_DEPS_MIGRATE_APPLY=1
+// from the coordinator harness; tests use memory DescriptionWriter).
+func ApplyMigration(ctx context.Context, store RelationStore, tp provider.TaskProvider, projectID string, writer DescriptionWriter, journalDir string) (*MigratePlan, error) {
+	if writer == nil {
+		return nil, fmt.Errorf("deps migrate apply: DescriptionWriter required (description fences are authority; no sidecar)")
+	}
+	plan := &MigratePlan{ProjectID: projectID, OK: true, Mode: "apply-description"}
+	base, err := PlanMigration(ctx, store, tp, projectID)
 	if err != nil {
 		return nil, err
 	}
-	snap, err := store.SnapshotGraph(ctx)
-	if err != nil {
-		return plan, err
+	plan.ProviderRevision = base.ProviderRevision
+
+	journal := Journal{
+		ProviderRevision: base.ProviderRevision,
+		StartedAt:        time.Now().UTC().Format(time.RFC3339Nano),
 	}
-	for i := range plan.Items {
-		item := &plan.Items[i]
-		if item.Action != "write_empty" && item.Action != "write_from_board" {
+	if journalDir == "" {
+		journalDir = filepath.Join(".herd", "migrate-journal")
+	}
+	if err := os.MkdirAll(journalDir, 0o755); err != nil {
+		return nil, err
+	}
+	jPath := filepath.Join(journalDir, fmt.Sprintf("apply-%d.json", time.Now().UnixNano()))
+	plan.JournalPath = jPath
+
+	for _, planned := range base.Items {
+		item := planned
+		if item.Action != "write_empty" && item.Action != "write_from_board" && item.Action != "repair_stale" {
+			plan.Items = append(plan.Items, item)
 			continue
+		}
+		// Fresh snapshot per card (revision fence).
+		snap, serr := store.SnapshotGraph(ctx)
+		if serr != nil {
+			item.Action = "error"
+			item.Detail = "fresh snapshot: " + serr.Error()
+			plan.OK = false
+			plan.Errors = append(plan.Errors, item.Ref+": "+item.Detail)
+			plan.Items = append(plan.Items, item)
+			continue
+		}
+		if plan.ProviderRevision != "" && snap.ProviderRevision != plan.ProviderRevision {
+			item.Detail = "provider revision moved mid-apply; re-planned from fresh snapshot"
 		}
 		t, gerr := tp.GetTask(ctx, item.TaskID)
 		if gerr != nil || t == nil {
+			item.Action = "error"
 			item.Detail = "get task failed"
 			plan.OK = false
+			plan.Items = append(plan.Items, item)
 			continue
 		}
-		involving := FilterInvolvingTask(snap.Edges, Ref(t.Ref), TaskID(t.ID))
-		var edges []DependencyEdge
-		for _, e := range involving {
-			if e.Type == EdgeBlocks {
-				edges = append(edges, DependencyEdge{
-					SourceRef: e.SourceRef, TargetRef: e.TargetRef,
-					SourceID: e.SourceID, TargetID: e.TargetID,
-					Type: EdgeBlocks,
-				})
-			}
+		before, berr := writer.GetDescription(ctx, t.ID)
+		if berr != nil {
+			// Fallback to task description field.
+			before = t.Description
 		}
+		intended := intendedBoardEdges(snap.Edges, Ref(t.Ref), TaskID(t.ID))
 		p := &Provenance{
-			Version: SchemaVersion,
-			TaskRef: Ref(t.Ref),
-			TaskID:  TaskID(t.ID),
-			Edges:   edges,
-			Present: true,
+			Version:          SchemaVersion,
+			TaskRef:          Ref(t.Ref),
+			TaskID:           TaskID(t.ID),
+			Edges:            intended,
+			Present:          true,
+			ProviderRevision: snap.ProviderRevision,
+			GraphRevision:    GraphRevision(snap.Edges, nil, snap.ProviderRevision),
 		}
-		newDesc, aerr := AppendOrReplaceFence(t.Description, p)
+		item.IntendedEdges = intended
+		item.EdgeCount = len(intended)
+		item.SnapshotRev = snap.ProviderRevision
+
+		newDesc, aerr := AppendOrReplaceFence(before, p)
 		if aerr != nil {
+			item.Action = "error"
 			item.Detail = aerr.Error()
 			plan.OK = false
+			plan.Items = append(plan.Items, item)
 			continue
 		}
+
+		// Journal before-image before mutation.
+		je := JournalEntry{TaskID: t.ID, Ref: t.Ref, BeforeDesc: before}
+		journal.Entries = append(journal.Entries, je)
+		_ = writeJournal(jPath, journal)
+
 		if err := writer.SetDescription(ctx, t.ID, newDesc); err != nil {
+			item.Action = "error"
 			item.Detail = "set description: " + err.Error()
 			plan.OK = false
+			plan.Errors = append(plan.Errors, item.Ref+": "+item.Detail)
+			plan.Items = append(plan.Items, item)
 			continue
 		}
 		item.Applied = true
-		// Readback.
-		fresh, ferr := tp.GetTask(ctx, t.ID)
-		if ferr != nil || fresh == nil {
-			item.Detail = "readback get failed"
-			plan.OK = false
-			continue
+		journal.Entries[len(journal.Entries)-1].AfterDesc = newDesc
+		journal.Entries[len(journal.Entries)-1].AppliedAt = time.Now().UTC().Format(time.RFC3339Nano)
+		_ = writeJournal(jPath, journal)
+
+		// Semantic readback: Present + bind + exact multiset edges.
+		after, rerr := writer.GetDescription(ctx, t.ID)
+		if rerr != nil {
+			after = ""
 		}
-		got, xerr := ExtractProvenanceFromText(fresh.Description)
-		if xerr != nil || got == nil || !got.Present {
-			item.Detail = "readback extract failed"
-			plan.OK = false
-			continue
+		if after == "" {
+			// re-get task
+			if fresh, ferr := tp.GetTask(ctx, t.ID); ferr == nil && fresh != nil {
+				after = fresh.Description
+			}
 		}
-		if berr := got.BindAndValidate(Ref(t.Ref), TaskID(t.ID)); berr != nil {
-			item.Detail = "readback bind failed: " + berr.Error()
-			plan.OK = false
-			continue
+		got, xerr := ExtractProvenanceFromText(after)
+		okRB := false
+		if xerr != nil {
+			item.Detail = "readback extract: " + xerr.Error()
+		} else if got == nil || !got.Present {
+			item.Detail = "readback missing fence"
+		} else if berr := got.BindAndValidate(Ref(t.Ref), TaskID(t.ID)); berr != nil {
+			item.Detail = "readback bind: " + berr.Error()
+		} else if gotEdges, gerr := got.DesiredBlocks(); gerr != nil {
+			item.Detail = "readback desired: " + gerr.Error()
+		} else if !EdgeMultisetEqual(gotEdges, intended) {
+			item.Detail = "readback edge multiset != intended board edges"
+		} else {
+			okRB = true
+			item.ReadbackOK = true
 		}
-		item.ReadbackOK = true
+		if !okRB {
+			// Rollback this card from journal before-image.
+			if rbErr := writer.SetDescription(ctx, t.ID, before); rbErr != nil {
+				item.Detail += "; rollback failed: " + rbErr.Error()
+			} else {
+				item.RolledBack = true
+				journal.Entries[len(journal.Entries)-1].RolledBack = true
+				_ = writeJournal(jPath, journal)
+			}
+			plan.OK = false
+			plan.Errors = append(plan.Errors, item.Ref+": "+item.Detail)
+		}
+		plan.Items = append(plan.Items, item)
 	}
 	return plan, nil
+}
+
+func writeJournal(path string, j Journal) error {
+	b, err := json.MarshalIndent(j, "", "  ")
+	if err != nil {
+		return err
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, append(b, '\n'), 0o644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
 }
 
 // MemoryDescriptionWriter adapts MemoryProvider for tests.
@@ -202,11 +363,8 @@ func (w MemoryDescriptionWriter) SetDescription(ctx context.Context, taskID, des
 	if err != nil {
 		return err
 	}
-	// MemoryProvider stores by ID; mutate via UpdateStatus path is insufficient.
-	// Use a small reflection-free approach: re-AddTask with new description.
 	t.Description = description
 	w.MP.AddTask(t)
-	// Readback.
 	got, err := w.MP.GetTask(ctx, taskID)
 	if err != nil {
 		return err
@@ -217,7 +375,18 @@ func (w MemoryDescriptionWriter) SetDescription(ctx context.Context, taskID, des
 	return nil
 }
 
-// KaneoDescriptionWriter updates description via kaneo CLI.
+func (w MemoryDescriptionWriter) GetDescription(ctx context.Context, taskID string) (string, error) {
+	if w.MP == nil {
+		return "", fmt.Errorf("nil memory provider")
+	}
+	t, err := w.MP.GetTask(ctx, taskID)
+	if err != nil {
+		return "", err
+	}
+	return t.Description, nil
+}
+
+// KaneoDescriptionWriter updates description via kaneo CLI (coordinator only).
 type KaneoDescriptionWriter struct {
 	ProjectID string
 	Run       func(ctx context.Context, name string, args ...string) ([]byte, error)
@@ -240,4 +409,27 @@ func (w KaneoDescriptionWriter) SetDescription(ctx context.Context, taskID, desc
 	}
 	_, err := run(ctx, "kaneo", args...)
 	return err
+}
+
+func (w KaneoDescriptionWriter) GetDescription(ctx context.Context, taskID string) (string, error) {
+	// Caller should use TaskProvider.GetTask; this is a minimal CLI get.
+	run := w.Run
+	if run == nil {
+		return "", fmt.Errorf("kaneo get description: no runner; use TaskProvider.GetTask")
+	}
+	args := []string{"task", "get", taskID, "--json"}
+	if strings.TrimSpace(w.ProjectID) != "" {
+		args = append(args, "--project", w.ProjectID)
+	}
+	out, err := run(ctx, "kaneo", args...)
+	if err != nil {
+		return "", err
+	}
+	var dto struct {
+		Description string `json:"description"`
+	}
+	if err := json.Unmarshal(out, &dto); err != nil {
+		return "", err
+	}
+	return dto.Description, nil
 }

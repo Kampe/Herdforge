@@ -87,7 +87,8 @@ func ExtractProvenanceFromText(text string) (*Provenance, error) {
 }
 
 // EmptyProvenance returns an explicit versioned empty record (Present=true)
-// for tasks with zero declared dependencies. task_ref is required.
+// for tasks with zero declared dependencies. task_ref and task_id are required
+// for launch bind (use EmptyProvenanceBound).
 func EmptyProvenance(taskRef Ref) *Provenance {
 	return &Provenance{
 		Version: SchemaVersion,
@@ -97,8 +98,15 @@ func EmptyProvenance(taskRef Ref) *Provenance {
 	}
 }
 
-// BindAndValidate requires Present provenance, exact task_ref match, and when
-// taskID is known, optional task_id must match (prevents fence replay across cards).
+// EmptyProvenanceBound includes immutable task_id for launch/migration records.
+func EmptyProvenanceBound(taskRef Ref, taskID TaskID) *Provenance {
+	p := EmptyProvenance(taskRef)
+	p.TaskID = taskID
+	return p
+}
+
+// BindAndValidate requires Present provenance, exact task_ref match, and a
+// non-empty immutable task_id that matches the live card (replay defense).
 func (p *Provenance) BindAndValidate(taskRef Ref, taskID TaskID) error {
 	if err := p.Validate(); err != nil {
 		return err
@@ -111,7 +119,13 @@ func (p *Provenance) BindAndValidate(taskRef Ref, taskID TaskID) error {
 	if !strings.EqualFold(string(got), string(want)) {
 		return fmt.Errorf("deps: provenance task_ref %q does not bind to task %q (replay rejected)", got, want)
 	}
-	if p.TaskID.Valid() && taskID.Valid() && p.TaskID != taskID {
+	if !p.TaskID.Valid() {
+		return fmt.Errorf("deps: provenance task_id required (immutable identity)")
+	}
+	if !taskID.Valid() {
+		return fmt.Errorf("deps: live task id required for bind")
+	}
+	if p.TaskID != taskID {
 		return fmt.Errorf("deps: provenance task_id %q does not bind to immutable id %q", p.TaskID, taskID)
 	}
 	return nil

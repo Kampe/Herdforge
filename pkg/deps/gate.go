@@ -104,9 +104,8 @@ func ValidateLaunch(
 			Reason: "task unreadable: " + err.Error(),
 		}
 	}
-	_ = status
 
-	// Bind fence to this exact task (reject replay of another card's fence).
+	// Bind fence to this exact task (reject replay; require immutable task_id).
 	if err := desired.BindAndValidate(taskRef, taskID); err != nil {
 		return nil, &BlockedError{
 			Ref: taskRef, Code: "missing_provenance",
@@ -178,6 +177,11 @@ func ValidateLaunch(
 		}
 	}
 
+	// Relation-graph revision only (edges + blocker statuses). Target task
+	// status is ownership via claim lease generation — including ToDo→InProgress
+	// here would make every successful post-claim check mismatch deterministically.
+	_ = status
+	_ = taskID
 	rev := GraphRevision(snap.Edges, statusBy, snap.ProviderRevision)
 	rep.GraphRevision = rev
 	rep.ProviderRevision = snap.ProviderRevision
@@ -328,7 +332,9 @@ func FencedLaunch(
 		return pre, err
 	}
 	if err := sideEffectFn(ctx, pre); err != nil {
-		_ = compensateFn(ctx, taskID, "side_effect_failed")
+		if cErr := compensateFn(ctx, taskID, "side_effect_failed"); cErr != nil {
+			return pre, errors.Join(err, fmt.Errorf("compensate failed: %w", cErr))
+		}
 		return pre, err
 	}
 	post, perr := ValidateLaunch(ctx, store, entrypoint, taskRef, desired, pre.GraphRevision)

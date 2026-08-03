@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/Kampe/Herdforge/pkg/config"
@@ -26,7 +27,7 @@ func runDeps() {
   selftest           Run FAC-75/90/93/105 drift fixtures + mutation controls
   check <ref>        Pre-side-effect launch gate for ref (read-only)
   reconcile <ref>    Emit stable JSON reconcile report for ref
-  migrate [--apply]  Dry-run/apply herd-deps-v1 backfill`)
+  migrate            Revision-fenced dry-run (default); --apply is coordinator-only`)
 		os.Exit(2)
 	}
 	switch os.Args[2] {
@@ -45,7 +46,7 @@ Commands:
   selftest           Hermetic FAC-75/90/93/105 drift fixtures + mutation controls
   check <ref>        Validate launch eligibility without side effects
   reconcile <ref>    Print stable JSON (missing/extra/duplicate/reversed/...)
-  migrate            Dry-run/apply herd-deps-v1 backfill (no Markdown inference)`)
+  migrate            Dry-run description fence plan; --apply requires HERD_DEPS_MIGRATE_APPLY=1 (coordinator)`)
 		os.Exit(0)
 	default:
 		fmt.Fprintf(os.Stderr, "herd deps: unknown subcommand %q\n", os.Args[2])
@@ -201,8 +202,9 @@ func runDepsReconcile() {
 
 func runDepsMigrate() {
 	fs := flag.NewFlagSet("deps migrate", flag.ExitOnError)
-	apply := fs.Bool("apply", false, "Apply backfill (default: dry-run only)")
+	apply := fs.Bool("apply", false, "Coordinator-only: write description fences (requires HERD_DEPS_MIGRATE_APPLY=1)")
 	asJSON := fs.Bool("json", false, "JSON plan output")
+	journalDir := fs.String("journal", filepath.Join(".herd", "migrate-journal"), "Per-apply before-image journal dir (repo-relative)")
 	_ = fs.Parse(os.Args[3:])
 
 	cfg, err := config.LoadConfig(".herd/herd.yaml")
@@ -218,6 +220,7 @@ func runDepsMigrate() {
 	store := deps.StoreFor(tp, cfg.TaskProvider.ProjectID)
 	ctx := context.Background()
 
+	// Default path: revision-fenced dry-run. Workers ship this; they never apply live.
 	if !*apply {
 		plan, perr := deps.PlanMigration(ctx, store, tp, cfg.TaskProvider.ProjectID)
 		if perr != nil {
@@ -228,7 +231,7 @@ func runDepsMigrate() {
 			b, _ := json.MarshalIndent(plan, "", "  ")
 			fmt.Println(string(b))
 		} else {
-			fmt.Printf("herd deps migrate dry-run: %d active tasks\n", len(plan.Items))
+			fmt.Printf("herd deps migrate dry-run: %d active tasks (description fences + Kaneo relations only)\n", len(plan.Items))
 			for _, it := range plan.Items {
 				fmt.Printf("  %s action=%s edges=%d %s\n", it.Ref, it.Action, it.EdgeCount, it.Detail)
 			}
@@ -239,21 +242,35 @@ func runDepsMigrate() {
 		return
 	}
 
-	// Apply requires a description writer.
-	var writer deps.DescriptionWriter
-	switch strings.ToLower(cfg.TaskProvider.Type) {
-	case "kaneo":
-		writer = deps.KaneoDescriptionWriter{ProjectID: cfg.TaskProvider.ProjectID}
-	case "memory":
-		if mp, ok := tp.(*provider.MemoryProvider); ok {
-			writer = deps.MemoryDescriptionWriter{MP: mp}
-		}
-	}
-	if writer == nil {
-		fmt.Fprintf(os.Stderr, "migrate apply: no DescriptionWriter for provider type %q\n", cfg.TaskProvider.Type)
+	// Coordinator-run apply only. Sequence after candidate review PASS:
+	//   dry-run at exact SHA → HERD_DEPS_MIGRATE_APPLY=1 migrate --apply →
+	//   per-card journal + multiset readback → then merge/enable gate.
+	// Workers must never set the env gate against live Kaneo.
+	if os.Getenv("HERD_DEPS_MIGRATE_APPLY") != "1" {
+		fmt.Fprintln(os.Stderr, `herd deps migrate --apply refused: coordinator-only
+set HERD_DEPS_MIGRATE_APPLY=1 after review PASS + revision-fenced dry-run
+workers write/test this command; they never apply live (no sidecar authority)`)
 		os.Exit(1)
 	}
-	plan, perr := deps.ApplyMigration(ctx, store, tp, cfg.TaskProvider.ProjectID, writer)
+
+	var writer deps.DescriptionWriter
+	switch strings.ToLower(strings.TrimSpace(cfg.TaskProvider.Type)) {
+	case "memory":
+		mp, ok := tp.(*provider.MemoryProvider)
+		if !ok {
+			fmt.Fprintln(os.Stderr, "migrate apply: memory provider type mismatch")
+			os.Exit(1)
+		}
+		writer = deps.MemoryDescriptionWriter{MP: mp}
+	case "kaneo", "":
+		// Description fences are the only write surface (no unsigned sidecar).
+		writer = deps.KaneoDescriptionWriter{ProjectID: cfg.TaskProvider.ProjectID}
+	default:
+		fmt.Fprintf(os.Stderr, "migrate apply: provider %q has no DescriptionWriter (description fences only)\n", cfg.TaskProvider.Type)
+		os.Exit(1)
+	}
+
+	plan, perr := deps.ApplyMigration(ctx, store, tp, cfg.TaskProvider.ProjectID, writer, *journalDir)
 	if perr != nil {
 		fmt.Fprintf(os.Stderr, "migrate apply: %v\n", perr)
 		os.Exit(1)
@@ -262,15 +279,13 @@ func runDepsMigrate() {
 		b, _ := json.MarshalIndent(plan, "", "  ")
 		fmt.Println(string(b))
 	} else {
-		fmt.Printf("herd deps migrate apply: %d items\n", len(plan.Items))
+		fmt.Printf("herd deps migrate apply-description: %d items journal=%s\n", len(plan.Items), plan.JournalPath)
 		for _, it := range plan.Items {
-			fmt.Printf("  %s action=%s applied=%v readback=%v %s\n",
-				it.Ref, it.Action, it.Applied, it.ReadbackOK, it.Detail)
+			fmt.Printf("  %s action=%s applied=%v readback=%v rolled_back=%v %s\n",
+				it.Ref, it.Action, it.Applied, it.ReadbackOK, it.RolledBack, it.Detail)
 		}
 	}
 	if !plan.OK {
 		os.Exit(1)
 	}
 }
-
-

@@ -206,22 +206,26 @@ func (k *KaneoProvider) CreateRelation(ctx context.Context, sourceID, targetID s
 	return srcRel, nil
 }
 
-// findRelationBothEnds proves the directed edge on both endpoint listings with
-// matching fields. Fresh OpList deadline per list.
+// findRelationBothEnds lists BOTH endpoints independently first. One-sided
+// visibility (source-only OR target-only) is a hard error (never silent nil
+// that would allow a duplicate create). Matching fields on both ends required.
 func (k *KaneoProvider) findRelationBothEnds(ctx context.Context, dls Deadlines, sourceID, targetID string, typ RelationType) (*Relation, error) {
 	fromSrc, err := k.findRelationOnTask(ctx, dls, sourceID, sourceID, targetID, typ)
 	if err != nil {
 		return nil, err
 	}
-	if fromSrc == nil {
-		return nil, nil
-	}
 	fromTgt, err := k.findRelationOnTask(ctx, dls, targetID, sourceID, targetID, typ)
 	if err != nil {
 		return nil, err
 	}
-	if fromTgt == nil {
-		return nil, fmt.Errorf("kaneo: edge visible on source but not target")
+	if fromSrc == nil && fromTgt == nil {
+		return nil, nil
+	}
+	if fromSrc == nil && fromTgt != nil {
+		return nil, fmt.Errorf("kaneo: one-sided relation (target-only) %s -[%s]-> %s", sourceID, typ, targetID)
+	}
+	if fromSrc != nil && fromTgt == nil {
+		return nil, fmt.Errorf("kaneo: one-sided relation (source-only) %s -[%s]-> %s", sourceID, typ, targetID)
 	}
 	if fromSrc.ID != fromTgt.ID || fromSrc.SourceTaskID != fromTgt.SourceTaskID ||
 		fromSrc.TargetTaskID != fromTgt.TargetTaskID || fromSrc.Type != fromTgt.Type {

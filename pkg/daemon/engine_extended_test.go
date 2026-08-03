@@ -5,10 +5,12 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/Kampe/Herdforge/pkg/config"
+	"github.com/Kampe/Herdforge/pkg/deps"
 	"github.com/Kampe/Herdforge/pkg/provider"
 )
 
@@ -37,12 +39,18 @@ func TestRunPulse_SelectsAndClaimsTask(t *testing.T) {
 	mp.AddTask(&provider.Task{
 		ID: "t-1", Ref: "FAC-99", Title: "Pulse Task", Priority: provider.PriorityUrgent,
 		Status: "to-do", ProjectID: "proj-1", Labels: []string{"herd-smith"},
-		Description: "```herd-deps-v1\n{\"version\":1,\"task_ref\":\"FAC-99\",\"edges\":[]}\n```\n",
+		Description: "```herd-deps-v1\n{\"version\":1,\"task_ref\":\"FAC-99\",\"task_id\":\"t-1\",\"edges\":[]}\n```\n",
 	})
 	cfg := &config.Config{
 		TaskProvider: config.TaskProvider{ProjectID: "proj-1"},
 	}
 	engine := NewEngine(cfg, mp, nil, nil, nil, nil)
+	own, oerr := deps.OpenLeaseOwnership(filepath.Join(t.TempDir(), "lease.db"), "herd", "memory", "proj-1")
+	if oerr != nil {
+		t.Fatal(oerr)
+	}
+	defer own.Close()
+	engine.Ownership = own
 
 	task, err := engine.RunPulse(context.Background(), "herd-smith")
 	if err != nil {
@@ -62,11 +70,11 @@ func TestRunPulse_SelectsAndClaimsTask(t *testing.T) {
 
 func TestSelectNextTask_SamePrioritySortsByRef(t *testing.T) {
 	mp := provider.NewMemoryProvider()
-	fence := func(ref string) string {
-		return "```herd-deps-v1\n{\"version\":1,\"task_ref\":\"" + ref + "\",\"edges\":[]}\n```\n"
+	fence := func(ref, id string) string {
+		return "```herd-deps-v1\n{\"version\":1,\"task_ref\":\"" + ref + "\",\"task_id\":\"" + id + "\",\"edges\":[]}\n```\n"
 	}
-	mp.AddTask(&provider.Task{ID: "1", Ref: "FAC-10", Title: "Same Priority 10", Priority: provider.PriorityHigh, Status: "to-do", ProjectID: "proj-1", Labels: []string{"herd-smith"}, Description: fence("FAC-10")})
-	mp.AddTask(&provider.Task{ID: "2", Ref: "FAC-2", Title: "Same Priority 2", Priority: provider.PriorityHigh, Status: "to-do", ProjectID: "proj-1", Labels: []string{"herd-smith"}, Description: fence("FAC-2")})
+	mp.AddTask(&provider.Task{ID: "1", Ref: "FAC-10", Title: "Same Priority 10", Priority: provider.PriorityHigh, Status: "to-do", ProjectID: "proj-1", Labels: []string{"herd-smith"}, Description: fence("FAC-10", "1")})
+	mp.AddTask(&provider.Task{ID: "2", Ref: "FAC-2", Title: "Same Priority 2", Priority: provider.PriorityHigh, Status: "to-do", ProjectID: "proj-1", Labels: []string{"herd-smith"}, Description: fence("FAC-2", "2")})
 	cfg := &config.Config{
 		TaskProvider: config.TaskProvider{ProjectID: "proj-1"},
 	}
@@ -116,7 +124,7 @@ func TestRunPulse_ClaimError(t *testing.T) {
 		Labels: []struct {
 			Name string `json:"name"`
 		}{{Name: "herd-smith"}},
-		Description: "```herd-deps-v1\n{\"version\":1,\"task_ref\":\"FAC-99\",\"edges\":[]}\n```\n",
+		Description: "```herd-deps-v1\n{\"version\":1,\"task_ref\":\"FAC-99\",\"task_id\":\"t-1\",\"edges\":[]}\n```\n",
 	}
 	taskJSON, _ := json.Marshal(task)
 	listJSON, _ := json.Marshal([]kaneoTask{task})
@@ -146,6 +154,12 @@ func TestRunPulse_ClaimError(t *testing.T) {
 	}
 	kp := provider.NewKaneoProvider(server.URL, "proj-1", false)
 	engine := NewEngine(cfg, kp, nil, nil, nil, nil)
+	own, oerr := deps.OpenLeaseOwnership(filepath.Join(t.TempDir(), "lease.db"), "herd", "kaneo", "proj-1")
+	if oerr != nil {
+		t.Fatal(oerr)
+	}
+	defer own.Close()
+	engine.Ownership = own
 
 	_, err := engine.RunPulse(context.Background(), "herd-smith")
 	if err == nil {

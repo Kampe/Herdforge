@@ -10,12 +10,12 @@ import (
 
 func TestEngine_SelectNextTask_DeterministicSort(t *testing.T) {
 	mp := provider.NewMemoryProvider()
-	fence := func(ref string) string {
-		return "```herd-deps-v1\n{\"version\":1,\"task_ref\":\"" + ref + "\",\"edges\":[]}\n```\n"
+	fence := func(ref, id string) string {
+		return "```herd-deps-v1\n{\"version\":1,\"task_ref\":\"" + ref + "\",\"task_id\":\"" + id + "\",\"edges\":[]}\n```\n"
 	}
-	mp.AddTask(&provider.Task{ID: "1", Ref: "FAC-10", Title: "Medium 1", Priority: provider.PriorityMedium, Status: "to-do", ProjectID: "proj-1", Labels: []string{"herd-smith"}, Description: fence("FAC-10")})
-	mp.AddTask(&provider.Task{ID: "2", Ref: "FAC-2", Title: "Urgent 1", Priority: provider.PriorityUrgent, Status: "to-do", ProjectID: "proj-1", Labels: []string{"herd-smith"}, Description: fence("FAC-2")})
-	mp.AddTask(&provider.Task{ID: "3", Ref: "FAC-1", Title: "High 1", Priority: provider.PriorityHigh, Status: "to-do", ProjectID: "proj-1", Labels: []string{"herd-smith"}, Description: fence("FAC-1")})
+	mp.AddTask(&provider.Task{ID: "1", Ref: "FAC-10", Title: "Medium 1", Priority: provider.PriorityMedium, Status: "to-do", ProjectID: "proj-1", Labels: []string{"herd-smith"}, Description: fence("FAC-10", "1")})
+	mp.AddTask(&provider.Task{ID: "2", Ref: "FAC-2", Title: "Urgent 1", Priority: provider.PriorityUrgent, Status: "to-do", ProjectID: "proj-1", Labels: []string{"herd-smith"}, Description: fence("FAC-2", "2")})
+	mp.AddTask(&provider.Task{ID: "3", Ref: "FAC-1", Title: "High 1", Priority: provider.PriorityHigh, Status: "to-do", ProjectID: "proj-1", Labels: []string{"herd-smith"}, Description: fence("FAC-1", "3")})
 
 	cfg := &config.Config{
 		TaskProvider: config.TaskProvider{ProjectID: "proj-1"},

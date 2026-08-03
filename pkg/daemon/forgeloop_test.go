@@ -50,7 +50,7 @@ func (f *fakeDriver) Log(string) {}
 
 func TestForgeLoop_DrivesActionsPerStep(t *testing.T) {
 	e := forgeEngine(t,
-		&provider.Task{ID: "1", Ref: "FAC-1", Status: "to-do", Priority: provider.PriorityUrgent, Description: "```herd-deps-v1\n{\"version\":1,\"task_ref\":\"FAC-1\",\"edges\":[]}\n```\n"},
+		&provider.Task{ID: "1", Ref: "FAC-1", Status: "to-do", Priority: provider.PriorityUrgent, Description: "```herd-deps-v1\n{\"version\":1,\"task_ref\":\"FAC-1\",\"task_id\":\"1\",\"edges\":[]}\n```\n"},
 	)
 	d := &fakeDriver{lanes: LaneState{Busy: 0, Max: 2}, completed: map[string]bool{}, verified: map[string]bool{}}
 	// One tick: nothing in-review/completed, a free lane and one to-do → dispatch.
@@ -64,7 +64,7 @@ func TestForgeLoop_DrivesActionsPerStep(t *testing.T) {
 
 func TestForgeLoop_RenudgesUnverified(t *testing.T) {
 	e := forgeEngine(t,
-		&provider.Task{ID: "1", Ref: "FAC-1", Status: "in-progress", Priority: provider.PriorityHigh, Description: "```herd-deps-v1\n{\"version\":1,\"task_ref\":\"FAC-1\",\"edges\":[]}\n```\n"},
+		&provider.Task{ID: "1", Ref: "FAC-1", Status: "in-progress", Priority: provider.PriorityHigh, Description: "```herd-deps-v1\n{\"version\":1,\"task_ref\":\"FAC-1\",\"task_id\":\"1\",\"edges\":[]}\n```\n"},
 	)
 	// Builder reported done but NOT verified → the loop must re-nudge, never review.
 	d := &fakeDriver{lanes: LaneState{Busy: 1, Max: 2}, completed: map[string]bool{"FAC-1": true}, verified: map[string]bool{}}
@@ -78,7 +78,7 @@ func TestForgeLoop_RenudgesUnverified(t *testing.T) {
 
 func TestForgeLoop_StopsWhenBoardClear(t *testing.T) {
 	e := forgeEngine(t,
-		&provider.Task{ID: "1", Ref: "FAC-1", Status: "done", Priority: provider.PriorityHigh, Description: "```herd-deps-v1\n{\"version\":1,\"task_ref\":\"FAC-1\",\"edges\":[]}\n```\n"},
+		&provider.Task{ID: "1", Ref: "FAC-1", Status: "done", Priority: provider.PriorityHigh, Description: "```herd-deps-v1\n{\"version\":1,\"task_ref\":\"FAC-1\",\"task_id\":\"1\",\"edges\":[]}\n```\n"},
 	)
 	d := &fakeDriver{lanes: LaneState{Busy: 0, Max: 2}, completed: map[string]bool{}, verified: map[string]bool{}}
 	// StopEmpty: clear board + no busy lane → loop returns nil promptly.

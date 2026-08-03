@@ -10,9 +10,23 @@ import (
 	"testing"
 
 	"github.com/Kampe/Herdforge/pkg/config"
+	"github.com/Kampe/Herdforge/pkg/deps"
 	"github.com/Kampe/Herdforge/pkg/provider"
 	"github.com/Kampe/Herdforge/pkg/worktree"
 )
+
+// withTestLease injects a durable SQLite launch lease (temp path) so Dispatch
+// never opens the mock RepoRoot (/nonexistent-...).
+func withTestLease(t *testing.T, d *Dispatcher) *Dispatcher {
+	t.Helper()
+	own, err := deps.OpenLeaseOwnership(filepath.Join(t.TempDir(), "launch.db"), "herd", "memory", "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = own.Close() })
+	d.Ownership = own
+	return d
+}
 
 type mockTaskProvider struct {
 	tasks     []*provider.Task
@@ -89,15 +103,15 @@ func (m *mockWorktree) RepoRoot() string {
 	return "/nonexistent-mock-repo-root"
 }
 
-func emptyDepsFence(ref string) string {
-	return "```herd-deps-v1\n{\"version\":1,\"task_ref\":\"" + ref + "\",\"edges\":[]}\n```\n"
+func emptyDepsFence(ref, id string) string {
+	return "```herd-deps-v1\n{\"version\":1,\"task_ref\":\"" + ref + "\",\"task_id\":\"" + id + "\",\"edges\":[]}\n```\n"
 }
 
 func TestFindTicket(t *testing.T) {
 	tp := &mockTaskProvider{
 		tasks: []*provider.Task{
-			{ID: "1", Ref: "FAC-1", Title: "First task", Status: "to-do", Priority: "high", Description: emptyDepsFence("FAC-1")},
-			{ID: "2", Ref: "FAC-2", Title: "Second task", Status: "to-do", Priority: "medium", Description: emptyDepsFence("FAC-2")},
+			{ID: "1", Ref: "FAC-1", Title: "First task", Status: "to-do", Priority: "high", Description: emptyDepsFence("FAC-1", "1")},
+			{ID: "2", Ref: "FAC-2", Title: "Second task", Status: "to-do", Priority: "medium", Description: emptyDepsFence("FAC-2", "2")},
 		},
 	}
 	cfg := &config.Config{
@@ -108,13 +122,13 @@ func TestFindTicket(t *testing.T) {
 	}
 	// Fully mocked worktree: no git, no package-cwd .herd/worktrees pollution.
 	mw := &mockWorktree{err: fmt.Errorf("mock: refuse real worktree creation")}
-	d := &Dispatcher{
+	d := withTestLease(t, &Dispatcher{
 		Config:       cfg,
 		TaskProvider: tp,
 		Worktree:     mw,
 		Compensator:  &recordingCompensator{},
 		Herdr:        &fakeHerdr{available: false},
-	}
+	})
 
 	_, err := d.Dispatch(context.Background(), DispatchOptions{TicketRef: "FAC-1", NoLaunch: true})
 	// Ticket is found; mock worktree fails after lookup.
@@ -306,7 +320,7 @@ func TestDispatch_PackageCwdNotPolluted(t *testing.T) {
 
 	tp := &mockTaskProvider{
 		tasks: []*provider.Task{
-			{ID: "1", Ref: "FAC-1", Title: "First task", Status: "to-do", Priority: "high", Description: emptyDepsFence("FAC-1")},
+			{ID: "1", Ref: "FAC-1", Title: "First task", Status: "to-do", Priority: "high", Description: emptyDepsFence("FAC-1", "1")},
 		},
 	}
 	cfg := &config.Config{
@@ -318,11 +332,11 @@ func TestDispatch_PackageCwdNotPolluted(t *testing.T) {
 		Verification: config.Verification{TestCommand: "go test ./...", PreflightCommand: "go build ./..."},
 	}
 	mw := &mockWorktree{err: fmt.Errorf("mock isolation: no ambient git")}
-	d := &Dispatcher{
+	d := withTestLease(t, &Dispatcher{
 		Config: cfg, TaskProvider: tp, Worktree: mw,
 		Compensator: &recordingCompensator{},
 		Herdr:       &fakeHerdr{available: false},
-	}
+	})
 	_, _ = d.Dispatch(context.Background(), DispatchOptions{TicketRef: "FAC-1", NoLaunch: true})
 
 	// Also exercise temp-repo path used by integration tests (must not leak to ambient).
