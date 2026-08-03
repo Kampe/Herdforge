@@ -496,3 +496,62 @@ func TestMetricsWriteFailureHasBoundedReadback(t *testing.T) {
 		t.Fatalf("write failure was not surfaced through bounded readback: %v", err)
 	}
 }
+
+func TestInvalidTransitionLatencyFencesOlderReplayAndRestoresUnknown(t *testing.T) {
+	now := time.Date(2026, 8, 3, 12, 0, 0, 0, time.UTC)
+	store := &memoryStateStore{}
+	exp := NewMetricsExporterWithPersistence(store, func() time.Time { return now })
+	if err := exp.SetHealthAt(completeDependencies(), now); err != nil {
+		t.Fatal(err)
+	}
+	if err := exp.SetQueuePressureAt(QueuePressure{Depth: 0, Capacity: 1, Known: true}, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := exp.SetSignals(FleetSignals{LastReconciliation: now, ObservedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	if err := exp.RecordTransitionObservation(now.Add(time.Second), now, nil, now, 2); err == nil {
+		t.Fatal("invalid latency was accepted")
+	}
+	if err := exp.RecordTransitionObservation(now, now.Add(time.Second), nil, now, 1); err == nil {
+		t.Fatal("older transition replay overwrote invalid latency tombstone")
+	}
+	_, _, slo := exp.Snapshot()
+	if slo.Attempts != 0 || !slo.Invalid || slo.InvalidReason != "latency" || slo.Sequence != 2 || !slo.ObservedAt.Equal(now) {
+		t.Fatalf("invalid latency did not leave a truthful tombstone: %+v", slo)
+	}
+	if view := exp.ReadAt(now); view.Freshness.SLOFresh || view.Freshness.Ready {
+		t.Fatalf("invalid SLO was reported fresh or ready: %+v", view.Freshness)
+	}
+	if err := exp.Persist(context.Background()); err != nil {
+		t.Fatalf("invalid latency tombstone was not persisted: %v", err)
+	}
+	restored := NewMetricsExporterWithPersistence(store, func() time.Time { return now })
+	if err := restored.Restore(context.Background()); err != nil {
+		t.Fatalf("invalid latency tombstone did not restore: %v", err)
+	}
+	if err := restored.RecordTransitionObservation(now, now.Add(time.Second), nil, now, 1); err == nil {
+		t.Fatal("older replay overwrote restored invalid latency tombstone")
+	}
+	if _, _, got := restored.Snapshot(); !got.Invalid || got.Sequence != 2 || got.Attempts != 0 {
+		t.Fatalf("restored latency tombstone changed: %+v", got)
+	}
+}
+
+func TestTransitionAggregateOverflowFencesOlderReplayWithoutIncrementingAttempts(t *testing.T) {
+	now := time.Date(2026, 8, 3, 12, 0, 0, 0, time.UTC)
+	exp := NewMetricsExporterWithPersistence(nil, func() time.Time { return now })
+	if err := exp.RecordTransitionObservation(now.Add(-maxSignalAge), now, nil, now, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := exp.RecordTransitionObservation(now, now.Add(time.Nanosecond), nil, now, 2); err == nil {
+		t.Fatal("aggregate overflow was accepted")
+	}
+	if err := exp.RecordTransitionObservation(now.Add(-maxSignalAge), now, nil, now, 1); err == nil {
+		t.Fatal("older replay overwrote aggregate overflow tombstone")
+	}
+	_, _, slo := exp.Snapshot()
+	if slo.Attempts != 0 || !slo.Invalid || slo.InvalidReason != "aggregate_overflow" || slo.Sequence != 2 {
+		t.Fatalf("aggregate overflow mutated or failed to fence SLO: %+v", slo)
+	}
+}
