@@ -64,13 +64,17 @@ func (l *LinearProvider) doGraphQL(ctx context.Context, query string, vars map[s
 	if err != nil {
 		return fmt.Errorf("failed to execute GraphQL request: %w", err)
 	}
-	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("linear API returned non-200 status: %d", resp.StatusCode)
+	// DecodeJSONResponse rejects non-2xx and 200 bodies with errors/error keys
+	// (GraphQL commonly returns HTTP 200 with {"errors":[...]}).
+	if err := DecodeJSONResponse(resp, out); err != nil {
+		if pe, ok := err.(*ProviderError); ok {
+			pe.Provider = "linear"
+			pe.Op = "graphql"
+		}
+		return err
 	}
-
-	return json.NewDecoder(resp.Body).Decode(out)
+	return nil
 }
 
 func (l *LinearProvider) GetTask(ctx context.Context, id string) (*Task, error) {
@@ -108,7 +112,7 @@ func (l *LinearProvider) GetTask(ctx context.Context, id string) (*Task, error) 
 		Ref:         dto.Identifier,
 		Title:       dto.Title,
 		Description: dto.Description,
-		Status:      dto.State.Name,
+		Status:      NormalizeStatus(dto.State.Name),
 		Priority:    p,
 		ProjectID:   dto.Project.ID,
 		Labels:      labels,
@@ -129,12 +133,18 @@ func (l *LinearProvider) ListTasks(ctx context.Context, projectID string, status
 		return nil, err
 	}
 
+	want := ""
+	if status != "" {
+		want = NormalizeStatus(status)
+	}
+
 	var tasks []*Task
 	for _, dto := range res.Data.Issues.Nodes {
 		if projectID != "" && dto.Project.ID != projectID {
 			continue
 		}
-		if status != "" && dto.State.Name != status {
+		canon := NormalizeStatus(dto.State.Name)
+		if want != "" && canon != want {
 			continue
 		}
 
@@ -160,7 +170,7 @@ func (l *LinearProvider) ListTasks(ctx context.Context, projectID string, status
 			Ref:         dto.Identifier,
 			Title:       dto.Title,
 			Description: dto.Description,
-			Status:      dto.State.Name,
+			Status:      canon,
 			Priority:    p,
 			ProjectID:   dto.Project.ID,
 			Labels:      labels,
@@ -171,10 +181,11 @@ func (l *LinearProvider) ListTasks(ctx context.Context, projectID string, status
 }
 
 func (l *LinearProvider) ClaimTask(ctx context.Context, taskID string, role string) error {
-	return l.UpdateStatus(ctx, taskID, "In Progress")
+	return l.UpdateStatus(ctx, taskID, StatusInProgress)
 }
 
 func (l *LinearProvider) UpdateStatus(ctx context.Context, taskID string, status string) error {
+	canonical := NormalizeStatus(status)
 	query := `mutation UpdateIssueState($id: String!, $state: String!) { issueUpdate(id: $id, input: { stateId: $state }) { success } }`
 	var res struct {
 		Data struct {
@@ -183,7 +194,14 @@ func (l *LinearProvider) UpdateStatus(ctx context.Context, taskID string, status
 			} `json:"issueUpdate"`
 		} `json:"data"`
 	}
-	return l.doGraphQL(ctx, query, map[string]interface{}{"id": taskID, "state": status}, &res)
+	if err := l.doGraphQL(ctx, query, map[string]interface{}{"id": taskID, "state": status}, &res); err != nil {
+		return err
+	}
+	got, gerr := l.GetTask(ctx, taskID)
+	if gerr != nil {
+		return fmt.Errorf("linear status readback after write: %w", gerr)
+	}
+	return VerifyStatusReadback(taskID, canonical, got.Status)
 }
 
 func (l *LinearProvider) AddComment(ctx context.Context, taskID string, body string) error {

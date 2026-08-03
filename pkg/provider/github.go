@@ -38,6 +38,34 @@ type githubIssueDTO struct {
 	} `json:"labels"`
 }
 
+func (g *GitHubProvider) mapIssue(dto githubIssueDTO) *Task {
+	labels := make([]string, 0, len(dto.Labels))
+	p := PriorityMedium
+	for _, l := range dto.Labels {
+		labels = append(labels, l.Name)
+		switch l.Name {
+		case "priority:urgent", "urgent":
+			p = PriorityUrgent
+		case "priority:high", "high":
+			p = PriorityHigh
+		case "priority:low", "low":
+			p = PriorityLow
+		}
+	}
+	createdAt, _ := time.Parse(time.RFC3339, dto.CreatedAt)
+	return &Task{
+		ID:          fmt.Sprintf("%d", dto.Number),
+		Ref:         fmt.Sprintf("#%d", dto.Number),
+		Title:       dto.Title,
+		Description: dto.Body,
+		Status:      NormalizeStatus(dto.State),
+		Priority:    p,
+		ProjectID:   fmt.Sprintf("%s/%s", g.Owner, g.Repo),
+		Labels:      labels,
+		CreatedAt:   createdAt,
+	}
+}
+
 func (g *GitHubProvider) GetTask(ctx context.Context, id string) (*Task, error) {
 	url := fmt.Sprintf("https://api.github.com/repos/%s/%s/issues/%s", g.Owner, g.Repo, id)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
@@ -54,109 +82,70 @@ func (g *GitHubProvider) GetTask(ctx context.Context, id string) (*Task, error) 
 	if err != nil {
 		return nil, fmt.Errorf("failed to execute GET GitHub issue: %w", err)
 	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("GitHub API returned non-200 status: %d", resp.StatusCode)
-	}
 
 	var dto githubIssueDTO
-	if err := json.NewDecoder(resp.Body).Decode(&dto); err != nil {
-		return nil, fmt.Errorf("failed to decode GitHub issue JSON: %w", err)
-	}
-
-	labels := make([]string, 0, len(dto.Labels))
-	p := PriorityMedium
-	for _, l := range dto.Labels {
-		labels = append(labels, l.Name)
-		switch l.Name {
-		case "priority:urgent", "urgent":
-			p = PriorityUrgent
-		case "priority:high", "high":
-			p = PriorityHigh
-		case "priority:low", "low":
-			p = PriorityLow
+	if err := DecodeJSONResponse(resp, &dto); err != nil {
+		if pe, ok := err.(*ProviderError); ok {
+			pe.Provider = "github"
+			pe.Op = "GetTask"
 		}
+		return nil, err
 	}
-
-	createdAt, _ := time.Parse(time.RFC3339, dto.CreatedAt)
-
-	return &Task{
-		ID:          fmt.Sprintf("%d", dto.Number),
-		Ref:         fmt.Sprintf("#%d", dto.Number),
-		Title:       dto.Title,
-		Description: dto.Body,
-		Status:      dto.State,
-		Priority:    p,
-		ProjectID:   fmt.Sprintf("%s/%s", g.Owner, g.Repo),
-		Labels:      labels,
-		CreatedAt:   createdAt,
-	}, nil
+	return g.mapIssue(dto), nil
 }
 
 func (g *GitHubProvider) ListTasks(ctx context.Context, projectID string, status string) ([]*Task, error) {
 	stateQuery := "open"
-	if status == "closed" || status == "done" {
+	ns := NormalizeStatus(status)
+	if ns == StatusDone || ns == StatusArchived || status == "closed" {
 		stateQuery = "closed"
 	}
 
-	url := fmt.Sprintf("https://api.github.com/repos/%s/%s/issues?state=%s", g.Owner, g.Repo, stateQuery)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create GitHub request: %w", err)
-	}
-
-	req.Header.Set("Accept", "application/vnd.github.v3+json")
-	if g.Token != "" {
-		req.Header.Set("Authorization", "token "+g.Token)
-	}
-
-	resp, err := g.Client.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("failed to execute GET GitHub issues: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("GitHub API returned non-200 status: %d", resp.StatusCode)
-	}
-
-	var dtos []githubIssueDTO
-	if err := json.NewDecoder(resp.Body).Decode(&dtos); err != nil {
-		return nil, fmt.Errorf("failed to decode GitHub issues JSON: %w", err)
-	}
-
-	tasks := make([]*Task, 0, len(dtos))
-	for _, dto := range dtos {
-		labels := make([]string, 0, len(dto.Labels))
-		p := PriorityMedium
-		for _, l := range dto.Labels {
-			labels = append(labels, l.Name)
-			switch l.Name {
-			case "priority:urgent", "urgent":
-				p = PriorityUrgent
-			case "priority:high", "high":
-				p = PriorityHigh
-			case "priority:low", "low":
-				p = PriorityLow
-			}
+	// Paginate until empty page (GitHub default page size 30; short page continues).
+	const pageSize = 100
+	acc := NewPageAccumulator()
+	var tasks []*Task
+	for page := 1; page <= 50; page++ {
+		url := fmt.Sprintf("https://api.github.com/repos/%s/%s/issues?state=%s&per_page=%d&page=%d",
+			g.Owner, g.Repo, stateQuery, pageSize, page)
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create GitHub request: %w", err)
 		}
 
-		createdAt, _ := time.Parse(time.RFC3339, dto.CreatedAt)
+		req.Header.Set("Accept", "application/vnd.github.v3+json")
+		if g.Token != "" {
+			req.Header.Set("Authorization", "token "+g.Token)
+		}
 
-		tasks = append(tasks, &Task{
-			ID:          fmt.Sprintf("%d", dto.Number),
-			Ref:         fmt.Sprintf("#%d", dto.Number),
-			Title:       dto.Title,
-			Description: dto.Body,
-			Status:      dto.State,
-			Priority:    p,
-			ProjectID:   fmt.Sprintf("%s/%s", g.Owner, g.Repo),
-			Labels:      labels,
-			CreatedAt:   createdAt,
-		})
+		resp, err := g.Client.Do(req)
+		if err != nil {
+			return nil, fmt.Errorf("failed to execute GET GitHub issues: %w", err)
+		}
+
+		var dtos []githubIssueDTO
+		if err := DecodeJSONResponse(resp, &dtos); err != nil {
+			if pe, ok := err.(*ProviderError); ok {
+				pe.Provider = "github"
+				pe.Op = "ListTasks"
+			}
+			return nil, err
+		}
+
+		fresh := 0
+		for _, dto := range dtos {
+			id := fmt.Sprintf("%d", dto.Number)
+			if !acc.Add(id) {
+				continue
+			}
+			tasks = append(tasks, g.mapIssue(dto))
+			fresh++
+		}
+		switch DecidePagination(len(dtos), fresh) {
+		case PageStopEmpty, PageStopDuplicate:
+			return tasks, nil
+		}
 	}
-
 	return tasks, nil
 }
 
@@ -166,8 +155,9 @@ func (g *GitHubProvider) ClaimTask(ctx context.Context, taskID string, role stri
 
 func (g *GitHubProvider) UpdateStatus(ctx context.Context, taskID string, status string) error {
 	url := fmt.Sprintf("https://api.github.com/repos/%s/%s/issues/%s", g.Owner, g.Repo, taskID)
+	canonical := NormalizeStatus(status)
 	state := "open"
-	if status == "closed" || status == "done" {
+	if canonical == StatusDone || canonical == StatusArchived {
 		state = "closed"
 	}
 
@@ -189,13 +179,24 @@ func (g *GitHubProvider) UpdateStatus(ctx context.Context, taskID string, status
 	if err != nil {
 		return fmt.Errorf("failed to execute PATCH GitHub issue: %w", err)
 	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("GitHub API returned non-200 status on update: %d", resp.StatusCode)
+	if err := DecodeJSONResponse(resp, nil); err != nil {
+		if pe, ok := err.(*ProviderError); ok {
+			pe.Provider = "github"
+			pe.Op = "UpdateStatus"
+		}
+		return err
 	}
 
-	return nil
+	got, gerr := g.GetTask(ctx, taskID)
+	if gerr != nil {
+		return fmt.Errorf("github status readback after write: %w", gerr)
+	}
+	// GitHub only exposes open/closed; map expectation to that surface.
+	want := StatusToDo
+	if state == "closed" {
+		want = StatusDone
+	}
+	return VerifyStatusReadback(taskID, want, got.Status)
 }
 
 func (g *GitHubProvider) AddComment(ctx context.Context, taskID string, body string) error {
@@ -218,11 +219,12 @@ func (g *GitHubProvider) AddComment(ctx context.Context, taskID string, body str
 	if err != nil {
 		return fmt.Errorf("failed to execute POST GitHub comment: %w", err)
 	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
-		return fmt.Errorf("GitHub API returned non-200 status on comment: %d", resp.StatusCode)
+	if err := DecodeJSONResponse(resp, nil); err != nil {
+		if pe, ok := err.(*ProviderError); ok {
+			pe.Provider = "github"
+			pe.Op = "AddComment"
+		}
+		return err
 	}
-
 	return nil
 }

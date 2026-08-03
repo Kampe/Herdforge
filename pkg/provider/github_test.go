@@ -119,14 +119,25 @@ func TestGitHubProvider_ListTasks_Closed(t *testing.T) {
 }
 
 func TestGitHubProvider_UpdateStatus(t *testing.T) {
+	state := "open"
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPatch || r.URL.Path != "/repos/testowner/testrepo/issues/42" {
-			t.Errorf("unexpected method or path: %s %s", r.Method, r.URL.Path)
+		if r.URL.Path != "/repos/testowner/testrepo/issues/42" {
+			t.Errorf("unexpected path: %s", r.URL.Path)
 			w.WriteHeader(http.StatusBadRequest)
 			return
 		}
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(`{}`))
+		switch r.Method {
+		case http.MethodPatch:
+			state = "closed"
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte(`{}`))
+		case http.MethodGet:
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte(`{"number":42,"title":"t","body":"","state":"` + state + `","labels":[],"created_at":"2026-08-01T12:00:00Z"}`))
+		default:
+			w.WriteHeader(http.StatusBadRequest)
+		}
 	}))
 	defer server.Close()
 
@@ -143,16 +154,23 @@ func TestGitHubProvider_UpdateStatus(t *testing.T) {
 
 func TestGitHubProvider_UpdateStatus_Open(t *testing.T) {
 	var capturedBody string
+	state := "closed"
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPatch {
+		switch r.Method {
+		case http.MethodPatch:
+			buf := make([]byte, r.ContentLength)
+			r.Body.Read(buf)
+			capturedBody = string(buf)
+			state = "open"
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte(`{}`))
+		case http.MethodGet:
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte(`{"number":42,"title":"t","body":"","state":"` + state + `","labels":[],"created_at":"2026-08-01T12:00:00Z"}`))
+		default:
 			w.WriteHeader(http.StatusBadRequest)
-			return
 		}
-		buf := make([]byte, r.ContentLength)
-		r.Body.Read(buf)
-		capturedBody = string(buf)
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(`{}`))
 	}))
 	defer server.Close()
 
