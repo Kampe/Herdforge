@@ -149,6 +149,7 @@ func (c *CallbackConsumer) Drain() ([]DrainedCallback, error) {
 
 	var out []DrainedCallback
 	var deadLettered []Callback
+	var settledIDs []string
 
 	for _, e := range envs {
 		if !isCallbackSubject(e.Subject) {
@@ -180,7 +181,7 @@ func (c *CallbackConsumer) Drain() ([]DrainedCallback, error) {
 
 		if pending.Attempts > c.maxRetries {
 			deadLettered = append(deadLettered, cb)
-			delete(c.state.Pending, e.ID)
+			settledIDs = append(settledIDs, e.ID)
 			continue
 		}
 
@@ -192,13 +193,26 @@ func (c *CallbackConsumer) Drain() ([]DrainedCallback, error) {
 		})
 	}
 
-	if err := c.saveLocked(); err != nil {
-		return nil, err
-	}
+	// Order matters for crash consistency: the durable dead-letter record
+	// must land before the pending entry is ever forgotten. If we saved
+	// state (clearing pending) first and then crashed or failed before the
+	// dead-letter append, the callback would vanish with no record of it
+	// anywhere — and worse, the next Drain would treat the still-in-the-
+	// inbox envelope as brand new and reset its attempt count, silently
+	// defeating maxRetries. Writing the dead-letter record first means the
+	// worst a crash here can do is a duplicate dead-letter entry on retry,
+	// never a silent loss or a reset counter.
 	if len(deadLettered) > 0 {
 		if err := c.appendDeadLetters(deadLettered); err != nil {
 			return out, err
 		}
+		for _, id := range settledIDs {
+			delete(c.state.Pending, id)
+		}
+	}
+
+	if err := c.saveLocked(); err != nil {
+		return nil, err
 	}
 	return out, nil
 }
@@ -228,23 +242,23 @@ func (c *CallbackConsumer) Ack(envelopeID string) error {
 	return c.saveLocked()
 }
 
+// appendDeadLetters durably (fsync'd, one write per record) appends every
+// cb to the dead-letter file under the mailbox's cross-process lock. A
+// marshal failure aborts and propagates instead of silently skipping that
+// record — a dead-lettered callback that can't even be written down is a
+// fail-closed condition, not something to swallow.
 func (c *CallbackConsumer) appendDeadLetters(cbs []Callback) error {
 	return c.mb.withFileLock(func() error {
-		f, err := os.OpenFile(c.deadPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
-		if err != nil {
-			return fmt.Errorf("failed to open dead-letter file: %w", err)
-		}
-		defer f.Close()
 		for _, cb := range cbs {
 			data, err := json.Marshal(cb)
 			if err != nil {
-				continue
+				return fmt.Errorf("failed to marshal dead-lettered callback %s: %w", cb.Ref, err)
 			}
-			if _, err := f.Write(append(data, '\n')); err != nil {
+			if err := appendLine(c.deadPath, data); err != nil {
 				return err
 			}
 		}
-		return f.Sync()
+		return nil
 	})
 }
 
