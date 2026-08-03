@@ -5,10 +5,22 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Kampe/Herdforge/pkg/launch"
 	"github.com/Kampe/Herdforge/pkg/router"
 )
+
+func testLaunchRouter(t *testing.T) *router.SurfaceRouter {
+	t.Helper()
+	t.Setenv("HERDR_ROUTE_STATE_DIR", t.TempDir())
+	r := router.NewRouter(nil, nil)
+	r.Probes = &router.Probes{
+		CLIPresent: func(cli string) bool { return cli == launch.WorkerProvider },
+		Now:        func() time.Time { return time.Unix(1_800_000_000, 0) },
+	}
+	return r
+}
 
 func TestIsAvailable(t *testing.T) {
 	// On this machine, herdr should be installed
@@ -78,7 +90,7 @@ func TestAgentStartBoundaryRejectsRawAndRequiresDecision(t *testing.T) {
 	if len(calls) != 0 {
 		t.Fatalf("raw rejection invoked process API: %v", calls)
 	}
-	d, err := router.NewRouter(nil, nil).Decide(router.LaunchRequest{Role: router.RoleWorker, Shape: launch.Implementation, RequestedProvider: launch.WorkerProvider, RequestedModel: launch.WorkerModel, RequestedEffort: launch.WorkerEffort, ProbeResults: map[string]bool{router.ProbeKey(launch.WorkerProvider, launch.WorkerModel): true}})
+	d, err := testLaunchRouter(t).Decide(router.LaunchRequest{Role: router.RoleWorker, Shape: launch.Implementation, RequestedProvider: launch.WorkerProvider, RequestedModel: launch.WorkerModel, RequestedEffort: launch.WorkerEffort, ProbeResults: map[string]bool{router.ProbeKey(launch.WorkerProvider, launch.WorkerModel): true}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -101,7 +113,7 @@ func TestAgentStartRequiresExactClaimGenerationBeforeProcess(t *testing.T) {
 		calls = append(calls, append([]string(nil), args...))
 		return "{}", nil
 	}
-	d, err := router.NewRouter(nil, nil).Decide(router.LaunchRequest{
+	d, err := testLaunchRouter(t).Decide(router.LaunchRequest{
 		Role: router.RoleWorker, Shape: launch.Implementation,
 		RequestedProvider: launch.WorkerProvider, RequestedModel: launch.WorkerModel,
 		RequestedEffort: launch.WorkerEffort, TaskRef: "FAC-178", LeaseGeneration: 7,
@@ -134,7 +146,7 @@ func TestAgentStartRequiresExactClaimGenerationBeforeProcess(t *testing.T) {
 
 func TestResumeUsesDurableClientIdentityNotHerdrMetadata(t *testing.T) {
 	t.Setenv("HERD_LAUNCH_RECEIPTS", t.TempDir()+"/receipts.jsonl")
-	d, err := router.NewRouter(nil, nil).Decide(router.LaunchRequest{Role: router.RoleWorker, Shape: launch.Implementation, RequestedProvider: launch.WorkerProvider, RequestedModel: launch.WorkerModel, RequestedEffort: launch.WorkerEffort, ProbeResults: map[string]bool{router.ProbeKey(launch.WorkerProvider, launch.WorkerModel): true}})
+	d, err := testLaunchRouter(t).Decide(router.LaunchRequest{Role: router.RoleWorker, Shape: launch.Implementation, RequestedProvider: launch.WorkerProvider, RequestedModel: launch.WorkerModel, RequestedEffort: launch.WorkerEffort, ProbeResults: map[string]bool{router.ProbeKey(launch.WorkerProvider, launch.WorkerModel): true}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -168,7 +180,7 @@ func TestResumeUsesDurableClientIdentityNotHerdrMetadata(t *testing.T) {
 func TestStandingReceiptCannotAuthorizeClaimedTaskAssignment(t *testing.T) {
 	receiptPath := t.TempDir() + "/receipts.jsonl"
 	t.Setenv("HERD_LAUNCH_RECEIPTS", receiptPath)
-	standing, err := router.NewRouter(nil, nil).Decide(router.LaunchRequest{
+	standing, err := testLaunchRouter(t).Decide(router.LaunchRequest{
 		Role: router.RoleWorker, Shape: launch.Implementation,
 		RequestedProvider: launch.WorkerProvider, RequestedModel: launch.WorkerModel,
 		RequestedEffort: launch.WorkerEffort, TaskRef: "worker",
@@ -216,7 +228,7 @@ func TestStandingReceiptCannotAuthorizeClaimedTaskAssignment(t *testing.T) {
 func TestResumeRejectsStoredCoordinatorTierDecisionWithoutPrompt(t *testing.T) {
 	receiptPath := t.TempDir() + "/receipts.jsonl"
 	t.Setenv("HERD_LAUNCH_RECEIPTS", receiptPath)
-	d, err := router.NewRouter(nil, nil).Decide(router.LaunchRequest{Role: router.RoleWorker, Shape: launch.Implementation, RequestedProvider: launch.WorkerProvider, RequestedModel: launch.WorkerModel, RequestedEffort: launch.WorkerEffort, ProbeResults: map[string]bool{router.ProbeKey(launch.WorkerProvider, launch.WorkerModel): true}})
+	d, err := testLaunchRouter(t).Decide(router.LaunchRequest{Role: router.RoleWorker, Shape: launch.Implementation, RequestedProvider: launch.WorkerProvider, RequestedModel: launch.WorkerModel, RequestedEffort: launch.WorkerEffort, ProbeResults: map[string]bool{router.ProbeKey(launch.WorkerProvider, launch.WorkerModel): true}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -247,7 +259,7 @@ func TestResumeRejectsStoredCoordinatorTierDecisionWithoutPrompt(t *testing.T) {
 
 func TestResumePreservesMalformedCurrentDecisionError(t *testing.T) {
 	t.Setenv("HERD_LAUNCH_RECEIPTS", t.TempDir()+"/receipts.jsonl")
-	d, err := router.NewRouter(nil, nil).Decide(router.LaunchRequest{Role: router.RoleWorker, Shape: launch.Implementation, RequestedProvider: launch.WorkerProvider, RequestedModel: launch.WorkerModel, RequestedEffort: launch.WorkerEffort, ProbeResults: map[string]bool{router.ProbeKey(launch.WorkerProvider, launch.WorkerModel): true}})
+	d, err := testLaunchRouter(t).Decide(router.LaunchRequest{Role: router.RoleWorker, Shape: launch.Implementation, RequestedProvider: launch.WorkerProvider, RequestedModel: launch.WorkerModel, RequestedEffort: launch.WorkerEffort, ProbeResults: map[string]bool{router.ProbeKey(launch.WorkerProvider, launch.WorkerModel): true}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -279,7 +291,7 @@ func TestResumeRejectsMissingAndStaleReceiptsWithoutProcessOrPrompt(t *testing.T
 	}{
 		{name: "missing", populate: func(string) error { return nil }},
 		{name: "lease-mismatch", populate: func(path string) error {
-			d, err := router.NewRouter(nil, nil).Decide(router.LaunchRequest{Role: router.RoleWorker, Shape: launch.Implementation, RequestedProvider: launch.WorkerProvider, RequestedModel: launch.WorkerModel, RequestedEffort: launch.WorkerEffort, ProbeResults: map[string]bool{router.ProbeKey(launch.WorkerProvider, launch.WorkerModel): true}})
+			d, err := testLaunchRouter(t).Decide(router.LaunchRequest{Role: router.RoleWorker, Shape: launch.Implementation, RequestedProvider: launch.WorkerProvider, RequestedModel: launch.WorkerModel, RequestedEffort: launch.WorkerEffort, ProbeResults: map[string]bool{router.ProbeKey(launch.WorkerProvider, launch.WorkerModel): true}})
 			if err != nil {
 				return err
 			}
@@ -296,7 +308,7 @@ func TestResumeRejectsMissingAndStaleReceiptsWithoutProcessOrPrompt(t *testing.T
 			if err := tc.populate(path); err != nil {
 				t.Fatal(err)
 			}
-			d, err := router.NewRouter(nil, nil).Decide(router.LaunchRequest{Role: router.RoleWorker, Shape: launch.Implementation, RequestedProvider: launch.WorkerProvider, RequestedModel: launch.WorkerModel, RequestedEffort: launch.WorkerEffort, ProbeResults: map[string]bool{router.ProbeKey(launch.WorkerProvider, launch.WorkerModel): true}})
+			d, err := testLaunchRouter(t).Decide(router.LaunchRequest{Role: router.RoleWorker, Shape: launch.Implementation, RequestedProvider: launch.WorkerProvider, RequestedModel: launch.WorkerModel, RequestedEffort: launch.WorkerEffort, ProbeResults: map[string]bool{router.ProbeKey(launch.WorkerProvider, launch.WorkerModel): true}})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -324,7 +336,7 @@ func TestResumeRejectsMissingAndStaleReceiptsWithoutProcessOrPrompt(t *testing.T
 
 func TestReceiptFailureClosesAndVerifiesExactTab(t *testing.T) {
 	t.Setenv("HERD_LAUNCH_RECEIPTS", "/dev/null/launch-receipts.jsonl")
-	d, err := router.NewRouter(nil, nil).Decide(router.LaunchRequest{Role: router.RoleWorker, Shape: launch.Implementation, RequestedProvider: launch.WorkerProvider, RequestedModel: launch.WorkerModel, RequestedEffort: launch.WorkerEffort, ProbeResults: map[string]bool{router.ProbeKey(launch.WorkerProvider, launch.WorkerModel): true}})
+	d, err := testLaunchRouter(t).Decide(router.LaunchRequest{Role: router.RoleWorker, Shape: launch.Implementation, RequestedProvider: launch.WorkerProvider, RequestedModel: launch.WorkerModel, RequestedEffort: launch.WorkerEffort, ProbeResults: map[string]bool{router.ProbeKey(launch.WorkerProvider, launch.WorkerModel): true}})
 	if err != nil {
 		t.Fatal(err)
 	}

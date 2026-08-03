@@ -4,12 +4,24 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/Kampe/Herdforge/pkg/config"
 	"github.com/Kampe/Herdforge/pkg/herdr"
 	"github.com/Kampe/Herdforge/pkg/launch"
 	"github.com/Kampe/Herdforge/pkg/router"
 )
+
+func testLaunchRouter(t *testing.T) *router.SurfaceRouter {
+	t.Helper()
+	t.Setenv("HERDR_ROUTE_STATE_DIR", t.TempDir())
+	r := router.NewRouter(nil, nil)
+	r.Probes = &router.Probes{
+		CLIPresent: func(cli string) bool { return cli == launch.WorkerProvider },
+		Now:        func() time.Time { return time.Unix(1_800_000_000, 0) },
+	}
+	return r
+}
 
 func TestWorkerConfigDriftRejectsBeforeLaunch(t *testing.T) {
 	lane := &config.LaneDef{Name: "mutant", Role: "worker", AgentKind: "codex", Provider: "codex", Model: "gpt-5.6-sol", Effort: "medium", TaskShape: "implementation"}
@@ -40,7 +52,7 @@ func (r *fakeLaunchLifecycle) Run(decision *router.LaunchDecision, effect func(*
 func TestLaunchAdmissionRejectsBeforeCompiledLifecycleSeams(t *testing.T) {
 	cfg := &config.Config{Lanes: []config.LaneDef{{Name: "mutant", Role: "worker", AgentKind: "codex", Provider: "codex", Model: "gpt-5.6-sol", Effort: "medium", TaskShape: "implementation"}}}
 	rec := &fakeLaunchLifecycle{}
-	valid, err := router.NewRouter(nil, nil).Decide(router.LaunchRequest{Role: router.RoleWorker, Shape: launch.Implementation, RequestedProvider: launch.WorkerProvider, RequestedModel: launch.WorkerModel, RequestedEffort: launch.WorkerEffort, TaskRef: "worker", Scope: router.ScopeLane, ProbeResults: map[string]bool{router.ProbeKey(launch.WorkerProvider, launch.WorkerModel): true}})
+	valid, err := testLaunchRouter(t).Decide(router.LaunchRequest{Role: router.RoleWorker, Shape: launch.Implementation, RequestedProvider: launch.WorkerProvider, RequestedModel: launch.WorkerModel, RequestedEffort: launch.WorkerEffort, TaskRef: "worker", Scope: router.ScopeLane, ProbeResults: map[string]bool{router.ProbeKey(launch.WorkerProvider, launch.WorkerModel): true}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -61,7 +73,7 @@ func TestLaunchAdmissionRejectsBeforeCompiledLifecycleSeams(t *testing.T) {
 func TestLaunchAdmissionPassesExactDecisionToLifecycle(t *testing.T) {
 	lane := config.LaneDef{Name: "worker", Role: "worker", AgentKind: "codex", Provider: "codex", Model: "gpt-5.6-luna", Effort: "medium", TaskShape: "implementation"}
 	cfg := &config.Config{Lanes: []config.LaneDef{lane}}
-	valid, err := router.NewRouter(nil, nil).Decide(router.LaunchRequest{Role: router.RoleWorker, Shape: launch.Implementation, RequestedProvider: launch.WorkerProvider, RequestedModel: launch.WorkerModel, RequestedEffort: launch.WorkerEffort, TaskRef: "worker", Scope: router.ScopeLane, ProbeResults: map[string]bool{router.ProbeKey(launch.WorkerProvider, launch.WorkerModel): true}})
+	valid, err := testLaunchRouter(t).Decide(router.LaunchRequest{Role: router.RoleWorker, Shape: launch.Implementation, RequestedProvider: launch.WorkerProvider, RequestedModel: launch.WorkerModel, RequestedEffort: launch.WorkerEffort, TaskRef: "worker", Scope: router.ScopeLane, ProbeResults: map[string]bool{router.ProbeKey(launch.WorkerProvider, launch.WorkerModel): true}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -78,7 +90,7 @@ func TestLaunchAdmissionPassesExactDecisionToLifecycle(t *testing.T) {
 }
 
 func TestTaskLaunchRequestCarriesExactReboundGeneration(t *testing.T) {
-	d, err := router.NewRouter(nil, nil).Decide(router.LaunchRequest{
+	d, err := testLaunchRouter(t).Decide(router.LaunchRequest{
 		Role: router.RoleWorker, Shape: launch.Implementation,
 		RequestedProvider: launch.WorkerProvider, RequestedModel: launch.WorkerModel,
 		RequestedEffort: launch.WorkerEffort, TaskRef: "FAC-B", LeaseGeneration: 7,

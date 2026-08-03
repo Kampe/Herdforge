@@ -7,27 +7,40 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Kampe/Herdforge/pkg/router"
 )
 
-func good() Request {
-	d, err := router.NewRouter(nil, nil).Decide(router.LaunchRequest{Role: router.RoleWorker, Shape: Implementation, RequestedProvider: WorkerProvider, RequestedModel: WorkerModel, RequestedEffort: WorkerEffort, ProbeResults: map[string]bool{router.ProbeKey(WorkerProvider, WorkerModel): true}})
+func testRouter(t *testing.T) *router.SurfaceRouter {
+	t.Helper()
+	t.Setenv("HERDR_ROUTE_STATE_DIR", t.TempDir())
+	r := router.NewRouter(nil, nil)
+	r.Probes = &router.Probes{
+		CLIPresent: func(cli string) bool { return cli == WorkerProvider },
+		Now:        func() time.Time { return time.Unix(1_800_000_000, 0) },
+	}
+	return r
+}
+
+func good(t *testing.T) Request {
+	t.Helper()
+	d, err := testRouter(t).Decide(router.LaunchRequest{Role: router.RoleWorker, Shape: Implementation, RequestedProvider: WorkerProvider, RequestedModel: WorkerModel, RequestedEffort: WorkerEffort, ProbeResults: map[string]bool{router.ProbeKey(WorkerProvider, WorkerModel): true}})
 	if err != nil {
-		panic(err)
+		t.Fatalf("build worker fixture: %v", err)
 	}
 	return Request{Decision: d}
 }
 
 func TestValidateWorkerDecisionDoesNotPreAccept(t *testing.T) {
 	s := &MemorySink{}
-	if err := Validate(good(), s); err != nil {
+	if err := Validate(good(t), s); err != nil {
 		t.Fatal(err)
 	}
 	if len(s.Receipts) != 0 {
 		t.Fatalf("validation must not imply process launch: %+v", s.Receipts)
 	}
-	if err := RecordStarted(good(), s); err != nil {
+	if err := RecordStarted(good(t), s); err != nil {
 		t.Fatal(err)
 	}
 	if len(s.Receipts) != 1 || !s.Receipts[0].Accepted {
@@ -48,7 +61,7 @@ func TestValidateRejectsEveryMissingLaunchFieldAndRecords(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			req := good()
+			req := good(t)
 			tc.mutate(&req)
 			s := &MemorySink{}
 			err := Validate(req, s)
@@ -66,7 +79,7 @@ func TestValidateRejectsEveryMissingLaunchFieldAndRecords(t *testing.T) {
 }
 
 func TestValidateNormalizesAllowedAliases(t *testing.T) {
-	r := good()
+	r := good(t)
 	r.Decision.Provider = " CODEX "
 	r.Decision.Model = "openai/GPT-5.6-LUNA"
 	if err := Validate(r, &MemorySink{}); err != nil {
@@ -75,7 +88,7 @@ func TestValidateNormalizesAllowedAliases(t *testing.T) {
 }
 
 func TestRecoveryDecisionUsesSameWorkerBoundary(t *testing.T) {
-	d, err := router.NewRouter(nil, nil).Decide(router.LaunchRequest{Role: router.RoleRecovery, Shape: Implementation, RequestedProvider: WorkerProvider, RequestedModel: WorkerModel, RequestedEffort: WorkerEffort, ProbeResults: map[string]bool{router.ProbeKey(WorkerProvider, WorkerModel): true}})
+	d, err := testRouter(t).Decide(router.LaunchRequest{Role: router.RoleRecovery, Shape: Implementation, RequestedProvider: WorkerProvider, RequestedModel: WorkerModel, RequestedEffort: WorkerEffort, ProbeResults: map[string]bool{router.ProbeKey(WorkerProvider, WorkerModel): true}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -90,7 +103,7 @@ func TestRecoveryDecisionUsesSameWorkerBoundary(t *testing.T) {
 }
 
 func TestDecisionDigestBindsReceiptToDecision(t *testing.T) {
-	a, b := good(), good()
+	a, b := good(t), good(t)
 	b.Decision.Argv = append([]string(nil), b.Decision.Argv...)
 	b.Decision.Argv[3] = "-x"
 	if DecisionDigest(a.Decision) == DecisionDigest(b.Decision) {
@@ -113,7 +126,7 @@ func TestHandBuiltApprovedTupleFailsClosed(t *testing.T) {
 
 func TestHasStartedRejectsConflictingPersistedTupleDespiteMatchingDigest(t *testing.T) {
 	t.Setenv("HERD_LAUNCH_RECEIPTS", t.TempDir()+"/receipts.jsonl")
-	req := good()
+	req := good(t)
 	req.TaskRef, req.Name, req.PaneID, req.LeaseGeneration = "FAC-175", "worker", "pane-1", 7
 	if err := (&JSONLSink{Path: os.Getenv("HERD_LAUNCH_RECEIPTS")}).Write(Receipt{
 		TaskRef: req.TaskRef, Name: req.Name, PaneID: req.PaneID, LeaseGeneration: req.LeaseGeneration,
@@ -136,7 +149,7 @@ func TestHasStartedRejectsConflictingPersistedTupleDespiteMatchingDigest(t *test
 
 func TestHasStartedRejectsConflictingAcceptedAndRevokedRecords(t *testing.T) {
 	t.Setenv("HERD_LAUNCH_RECEIPTS", t.TempDir()+"/receipts.jsonl")
-	req := good()
+	req := good(t)
 	req.TaskRef, req.Name, req.PaneID, req.LeaseGeneration = "FAC-175", "worker", "pane-1", 7
 	sink := &JSONLSink{Path: os.Getenv("HERD_LAUNCH_RECEIPTS")}
 	role, shape, provider, model, effort, digest, argv := fields(req)
@@ -162,7 +175,7 @@ func TestHasStartedRejectsMalformedReceiptData(t *testing.T) {
 	if err := os.WriteFile(path, []byte("{not-json}\n"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	req := good()
+	req := good(t)
 	req.TaskRef, req.Name, req.PaneID = "FAC-175", "worker", "pane-1"
 	started, err := HasStarted(req)
 	if err == nil || started {
@@ -171,7 +184,7 @@ func TestHasStartedRejectsMalformedReceiptData(t *testing.T) {
 }
 
 func TestEditedRouterDecisionFailsProof(t *testing.T) {
-	r := good()
+	r := good(t)
 	r.Decision.Effort = "high"
 	if err := Validate(r, &MemorySink{}); err == nil {
 		t.Fatal("edited routed decision must fail proof verification")
