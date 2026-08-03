@@ -343,6 +343,66 @@ func TestFAC178_NoOpRemoveCannotProduceRemoved(t *testing.T) {
 	}
 }
 
+func TestFAC178_NonForceRemovalRefusesLateDirtyWrite(t *testing.T) {
+	root := t.TempDir()
+	initRepo(t, root)
+	wm := NewWorktreeManager(root)
+	wi, err := wm.CreateTaskWorktree(context.Background(), "FAC-178-LATE-DIRTY")
+	if err != nil {
+		t.Fatal(err)
+	}
+	runCmd(root, "git", "checkout", "main")
+	runCmd(root, "git", "merge", "--no-ff", "-m", "merge late dirty fixture", wi.Branch)
+	runCmd(root, "git", "push", "origin", "main")
+	var outcomes []string
+	policy := fac178Policy(t, wm, wi.Path)
+	policy.ReceiptSink = func(receipt ReapReceipt) error { outcomes = append(outcomes, receipt.Outcome); return nil }
+	wm.BeforeRemoveFunc = func(context.Context, string) error {
+		return os.WriteFile(filepath.Join(wi.Path, "late-dirty.txt"), []byte("late"), 0644)
+	}
+	if _, err := wm.Reap(context.Background(), policy); err != nil {
+		// Removal failure is a durable refusal, not a successful reap.
+		if !containsString(outcomes, "refused") {
+			t.Fatalf("late dirty failure lacked refusal receipt: %v", outcomes)
+		}
+	}
+	if containsString(outcomes, "removed") {
+		t.Fatalf("late dirty write fabricated removed outcome: %v", outcomes)
+	}
+	if _, err := os.Stat(filepath.Join(wi.Path, ".git")); err != nil {
+		t.Fatalf("late dirty worktree was destroyed: %v", err)
+	}
+}
+
+func TestFAC178_FinalBoundHEADRefusesLateCommit(t *testing.T) {
+	root := t.TempDir()
+	initRepo(t, root)
+	wm := NewWorktreeManager(root)
+	wi, err := wm.CreateTaskWorktree(context.Background(), "FAC-178-BOUND-HEAD")
+	if err != nil {
+		t.Fatal(err)
+	}
+	runCmd(root, "git", "checkout", "main")
+	runCmd(root, "git", "merge", "--no-ff", "-m", "merge bound HEAD fixture", wi.Branch)
+	runCmd(root, "git", "push", "origin", "main")
+	var outcomes []string
+	policy := fac178Policy(t, wm, wi.Path)
+	policy.ReceiptSink = func(receipt ReapReceipt) error { outcomes = append(outcomes, receipt.Outcome); return nil }
+	wm.BeforeRemoveFunc = func(context.Context, string) error {
+		runCmd(wi.Path, "git", "commit", "--allow-empty", "-m", "late bound HEAD")
+		return nil
+	}
+	if _, err := wm.Reap(context.Background(), policy); err != nil {
+		t.Fatal(err)
+	}
+	if containsString(outcomes, "removed") || !containsString(outcomes, "refused") {
+		t.Fatalf("late HEAD drift was not refused: %v", outcomes)
+	}
+	if _, err := os.Stat(filepath.Join(wi.Path, ".git")); err != nil {
+		t.Fatalf("late HEAD worktree was destroyed: %v", err)
+	}
+}
+
 func TestFAC178_FinalFenceRejectsCommitAfterIntent(t *testing.T) {
 	root := t.TempDir()
 	initRepo(t, root)
