@@ -746,16 +746,33 @@ type QuotaProvider struct {
 
 type QuotaJSON map[string]QuotaProvider
 
+// Float64 boundary: float64(math.MaxInt64) rounds UP to 2^63, so comparing
+// against math.MaxInt64 accepts exactly 2^63. Compare against the exact
+// representable boundary instead: reject f >= 2^63 (and f < -2^63).
+const (
+	maxIntBoundaryFloat = 9223372036854775808.0  // 2^63
+	minIntBoundaryFloat = -9223372036854775808.0 // -2^63, exactly representable
+)
+
 func parseQuotaInt(v interface{}) (int, bool) {
 	switch val := v.(type) {
 	case float64:
-		if math.IsNaN(val) || math.IsInf(val, 0) || val > math.MaxInt64 || val < math.MinInt64 {
+		if math.IsNaN(val) || math.IsInf(val, 0) || val >= maxIntBoundaryFloat || val < minIntBoundaryFloat {
 			return 0, false
 		}
 		return int(val), true
 	case string:
-		f, err := strconv.ParseFloat(val, 64)
-		if err != nil || math.IsNaN(f) || math.IsInf(f, 0) || f > math.MaxInt64 || f < math.MinInt64 {
+		s := strings.TrimSpace(val)
+		// Exact integer strings (including MaxInt64/MinInt64) parse without
+		// float rounding; out-of-range integer strings fail here.
+		if n, err := strconv.Atoi(s); err == nil {
+			return n, true
+		}
+		// Fractional fallback: anything that reaches this arm and lands on
+		// either boundary came from an out-of-range or fractional string —
+		// reject at the boundary inclusively on both sides.
+		f, err := strconv.ParseFloat(s, 64)
+		if err != nil || math.IsNaN(f) || math.IsInf(f, 0) || f >= maxIntBoundaryFloat || f <= minIntBoundaryFloat {
 			return 0, false
 		}
 		return int(f), true

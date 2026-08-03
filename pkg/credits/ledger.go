@@ -31,6 +31,24 @@ type Record struct {
 	Accounts  []AccountRow `json:"accounts,omitempty"`
 }
 
+// MarshalJSON preserves the binding's accounts != null distinction: a
+// configured empty pool ("accounts":[]) must survive re-encoding, while a
+// scalar record (nil Accounts) keeps omitting the field entirely.
+func (r Record) MarshalJSON() ([]byte, error) {
+	type recordAlias Record
+	if r.Accounts == nil {
+		return json.Marshal(recordAlias(r))
+	}
+	aux := struct {
+		recordAlias
+		Accounts []AccountRow `json:"accounts"`
+	}{
+		recordAlias: recordAlias(r),
+		Accounts:    r.Accounts,
+	}
+	return json.Marshal(aux)
+}
+
 type Ledger struct {
 	path  string
 	data  map[string]Record

@@ -1104,6 +1104,15 @@ func TestParseQuotaInt(t *testing.T) {
 		{math.Inf(-1), 0, false},
 		{"9e300", 0, false},
 		{1e300, 0, false},
+		// adjacent int boundary cases: float64(math.MaxInt64) rounds to 2^63
+		{"9223372036854775807", math.MaxInt64, true},
+		{"9223372036854775808", 0, false},
+		{"-9223372036854775808", math.MinInt64, true},
+		{"-9223372036854775809", 0, false},
+		{"9223372036854775808.0", 0, false},
+		{9223372036854775808.0, 0, false},
+		{-9223372036854775808.0, math.MinInt64, true},
+		{9223372036854775807.0, 0, false}, // untyped constant == 2^63 as float64
 	}
 	for _, tt := range tests {
 		got, ok := parseQuotaInt(tt.in)
@@ -1497,6 +1506,31 @@ func TestAdvise_ReadySwap_TruePositive(t *testing.T) {
 	out := lc.Advise()
 	if !strings.Contains(out, "READY SWAP (primary exhausted): claude-account use yuga") {
 		t.Errorf("exhausted burn#1 must print READY SWAP with reserve account, got: %s", out)
+	}
+}
+
+func TestLedgerCommands_Advise_BoundaryUsedDoesNotSuppressFallback(t *testing.T) {
+	dir := t.TempDir()
+	script := filepath.Join(dir, "herd-quota")
+	os.WriteFile(script, []byte(`#!/bin/sh
+echo '{"claude":{"pools":{"claude-5h":{"used":"9223372036854775808","remaining":57.3,"resetsIn":"3h","class":"onpace","stale":false,"reason":"ok"}}}}'`), 0755)
+
+	orig := quotaBinPath
+	defer func() { quotaBinPath = orig }()
+	quotaBinPath = func() string { return script }
+
+	l, _ := OpenLedger(filepath.Join(t.TempDir(), "ledger.json"))
+	l.data["claude"] = Record{UsedPct: 50, WindowDays: intPtr(7), DaysLeft: intPtr(5), Updated: NowEpoch()}
+	lc := NewLedgerCommands(l)
+	out := lc.Advise()
+	if strings.Contains(out, "claude/claude-5h:") {
+		t.Errorf("out-of-range used must not render a live row, got: %s", out)
+	}
+	if strings.Contains(out, "9223372036854775807% used") {
+		t.Errorf("boundary rounding must not produce MaxInt64 live row, got: %s", out)
+	}
+	if !strings.Contains(out, "claude: 50% used") {
+		t.Errorf("out-of-range used must not suppress the ledger fallback, got: %s", out)
 	}
 }
 
