@@ -185,6 +185,14 @@ func isFormattingOnly(added, removed []string) bool {
 		return false
 	}
 	for i := range added {
+		// A line carrying a quote character may differ only inside a string
+		// (or rune/backtick) literal, where whitespace is semantic, not
+		// cosmetic — strings.Fields can't tell those apart, so fail closed
+		// and refuse to call it formatting-only rather than risk collapsing
+		// a real content change (e.g. "a  b" -> "a b").
+		if strings.ContainsAny(added[i], "\"'`") || strings.ContainsAny(removed[i], "\"'`") {
+			return false
+		}
 		a := strings.Join(strings.Fields(added[i]), " ")
 		r := strings.Join(strings.Fields(removed[i]), " ")
 		if a != r || a == "" {
@@ -210,23 +218,13 @@ func isExecutableMode(mode string) bool {
 	return false
 }
 
-// ClassifyFile deterministically categorizes one changed file by inspecting
-// both its path and its parsed content — never by filename alone. On any
-// ambiguity it returns CategoryAmbiguous, which is never R0-eligible.
-func ClassifyFile(fc FileChange, policy MechanicalPolicy) FileCategory {
-	p := filepath.ToSlash(fc.Path)
+// namingCategory classifies a path by its own name/location alone — no diff
+// content, no mode. Used for both the current path and (on a rename) the
+// old path, since a rename that moves production code onto a docs/test
+// path must not slip past R0 just because the destination name looks inert.
+func namingCategory(p string) FileCategory {
 	base := path.Base(p)
 	ext := strings.ToLower(path.Ext(base))
-
-	// Generated content always escalates — codegen output is exactly the
-	// kind of change a mechanical gate must not rubber-stamp.
-	if looksGenerated(p, fc.Added) {
-		return CategoryGenerated
-	}
-
-	if isExecutableMode(fc.Mode) && fc.Mode != fc.OldMode {
-		return CategoryExecutable
-	}
 
 	if strings.Contains(p, ".github/workflows/") {
 		return CategoryWorkflow
@@ -240,8 +238,48 @@ func ClassifyFile(fc FileChange, policy MechanicalPolicy) FileCategory {
 	if configBasenames[base] || configExt[ext] {
 		return CategoryConfig
 	}
-
 	if isTestPath(p) {
+		return CategoryTestOnly
+	}
+	if docsExt[ext] || strings.HasPrefix(p, "docs/") {
+		return CategoryDocs
+	}
+	if metadataBasenames[base] {
+		return CategoryMetadata
+	}
+	return CategoryCode
+}
+
+// ClassifyFile deterministically categorizes one changed file by inspecting
+// both its path and its parsed content — never by filename alone. On any
+// ambiguity it returns CategoryAmbiguous, which is never R0-eligible.
+func ClassifyFile(fc FileChange, policy MechanicalPolicy) FileCategory {
+	p := filepath.ToSlash(fc.Path)
+
+	// Generated content always escalates — codegen output is exactly the
+	// kind of change a mechanical gate must not rubber-stamp.
+	if looksGenerated(p, fc.Added) {
+		return CategoryGenerated
+	}
+
+	if isExecutableMode(fc.Mode) && fc.Mode != fc.OldMode {
+		return CategoryExecutable
+	}
+
+	// A rename must be judged on both endpoints: a production file renamed
+	// onto a docs/test-looking path is still a production change, and must
+	// not inherit the destination's inert-looking category.
+	if fc.OldPath != "" {
+		oldP := filepath.ToSlash(fc.OldPath)
+		if oldP != p && !mechanicalCategories[namingCategory(oldP)] {
+			return CategoryAmbiguous
+		}
+	}
+
+	switch cat := namingCategory(p); cat {
+	case CategoryWorkflow, CategoryHook, CategoryDependency, CategoryConfig, CategoryMetadata:
+		return cat
+	case CategoryTestOnly:
 		if hasSmuggledProductionCode(fc.Added) {
 			return CategoryAmbiguous
 		}
@@ -249,26 +287,19 @@ func ClassifyFile(fc FileChange, policy MechanicalPolicy) FileCategory {
 			return CategoryCode
 		}
 		return CategoryTestOnly
-	}
-
-	if docsExt[ext] || strings.HasPrefix(p, "docs/") {
+	case CategoryDocs:
 		if hasCodeSignature(fc.Added) {
 			return CategoryAmbiguous
 		}
 		return CategoryDocs
+	default:
+		// A source-looking file whose diff is a pure whitespace/token-order
+		// rewrite of itself is a formatting change.
+		if isFormattingOnly(fc.Added, fc.Removed) {
+			return CategoryFormatting
+		}
+		return CategoryCode
 	}
-
-	if metadataBasenames[base] {
-		return CategoryMetadata
-	}
-
-	// A source-looking file whose diff is a pure whitespace/token-order
-	// rewrite of itself is a formatting change.
-	if isFormattingOnly(fc.Added, fc.Removed) {
-		return CategoryFormatting
-	}
-
-	return CategoryCode
 }
 
 // RequiredChecks returns the set of verification command names a candidate
@@ -386,10 +417,20 @@ func EvaluateMechanical(sha, patchID string, files []FileChange, checks []CheckR
 
 	required := RequiredChecks(files, policy)
 	byName := make(map[string]CheckResult, len(checks))
+	duplicate := false
 	for _, c := range checks {
+		if _, exists := byName[c.Name]; exists {
+			// Duplicate evidence for the same check is malformed: whichever
+			// result "wins" would depend on ordering, and a caller could
+			// smuggle a passing duplicate in behind a failing one. Reject
+			// outright rather than pick a winner.
+			v.Reasons = append(v.Reasons, "duplicate check result for: "+c.Name+" — malformed evidence")
+			duplicate = true
+			continue
+		}
 		byName[c.Name] = c
 	}
-	allPass := len(required) > 0
+	allPass := len(required) > 0 && !duplicate
 	for _, name := range required {
 		c, ok := byName[name]
 		if !ok {
