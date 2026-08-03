@@ -69,10 +69,20 @@ type DrainReport struct {
 	ParkBranches                                                                                                                                                int    `json:"park_branches"`
 	ParkCHAWithDups                                                                                                                                             int    `json:"park_cha_with_dups"`
 	Skips7d, LedgerPass, Rejected                                                                                                                               int
-	Shas                                                                                                                                                        DrainShas      `json:"-"`
-	Pins                                                                                                                                                        []PinFreshness `json:"-"`
-	BoardGit                                                                                                                                                    []BoardGitRow  `json:"-"`
-	Errors                                                                                                                                                      []string       `json:"-"`
+	Shas                                                                                                                                                        DrainShas             `json:"-"`
+	Pins                                                                                                                                                        []PinFreshness        `json:"-"`
+	BoardGit                                                                                                                                                    []BoardGitRow         `json:"-"`
+	Errors                                                                                                                                                      []string              `json:"-"`
+	ActionEvidence                                                                                                                                              []DrainActionEvidence `json:"-"`
+	StandingLanes                                                                                                                                               []string              `json:"-"`
+}
+
+// DrainActionEvidence is projected from the same ordered ledger snapshot as
+// the report. It is intentionally excluded from the fixed JSON packet.
+type DrainActionEvidence struct {
+	SHA, Branch, Lane, BuilderFamily, Tier string
+	TierRecorded, Pending, Vetoed          bool
+	HarvestReady, RebaseNeeded             bool
 }
 
 type BoardGitRow struct {
@@ -184,6 +194,16 @@ func (d *Drain) Scan(ctx context.Context, unmerged []harvest.UnmergedWork) (*Dra
 	veto := snap.Vetoed()
 	queued := queuePins(snap, pass, veto)
 	pending := snap.Pending()
+	records := map[string]LedgerRow{}
+	for _, row := range snap.Rows {
+		if row.Event == string(EventRecord) {
+			records[row.SHA] = row
+		}
+	}
+	pendingSHA := map[string]bool{}
+	for _, row := range pending {
+		pendingSHA[row.SHA] = true
+	}
 	queueLanes := map[string]string{}
 	seen := map[string]bool{}
 	tips := make([]harvest.UnmergedWork, 0)
@@ -202,7 +222,10 @@ func (d *Drain) Scan(ctx context.Context, unmerged []harvest.UnmergedWork) (*Dra
 			tips = append(tips, harvest.UnmergedWork{Branch: q.branch, Unmerged: []string{q.sha}})
 		}
 	}
-	r := &DrainReport{Pending: len(pending), HarvestQueue: len(queued), Cap: d.Cap, StaleBehindMax: d.StaleBehind, KaneoOK: false, KaneoInReview: -1, Shas: DrainShas{}, WindDown: d.WindDown || envWindDown()}
+	// The legacy packet key is retained, but this coordinator has no
+	// authoritative refactoring probe. -1 is explicit unknown, never a count
+	// inferred from the unmerged worktree list.
+	r := &DrainReport{Pending: len(pending), HarvestQueue: len(queued), Cap: d.Cap, RefactoringCount: -1, StaleBehindMax: d.StaleBehind, KaneoOK: false, KaneoInReview: -1, Shas: DrainShas{}, WindDown: d.WindDown || envWindDown()}
 	var parkErr error
 	r.ParkBranches, r.ParkCHAWithDups, parkErr = parkStats(ctx, d.RepoRoot)
 	if parkErr != nil {
@@ -237,6 +260,8 @@ func (d *Drain) Scan(ctx context.Context, unmerged []harvest.UnmergedWork) (*Dra
 			pin.Lane = queueLanes[sha]
 		}
 		r.Pins = append(r.Pins, pin)
+		record := records[sha]
+		r.ActionEvidence = append(r.ActionEvidence, DrainActionEvidence{SHA: sha, Branch: pin.Branch, Lane: pin.Lane, BuilderFamily: strings.ToLower(strings.TrimSpace(record.BuilderFamily)), Tier: record.Tier, TierRecorded: strings.TrimSpace(record.Tier) != "", Pending: pendingSHA[sha], Vetoed: veto[sha]})
 		merged, probeErr := harvest.ContentMerged(ctx, d.RepoRoot, "origin/main", sha)
 		if probeErr != nil {
 			return nil, fmt.Errorf("content-merge probe for %s: %w", sha, probeErr)
@@ -259,6 +284,13 @@ func (d *Drain) Scan(ctx context.Context, unmerged []harvest.UnmergedWork) (*Dra
 		} else {
 			r.Shas.NeedReview = append(r.Shas.NeedReview, sha)
 		}
+		evidence := &r.ActionEvidence[len(r.ActionEvidence)-1]
+		if containsSHA(r.Shas.HarvestReady, sha) {
+			evidence.HarvestReady = true
+		}
+		if containsSHA(r.Shas.RebaseNeeded, sha) {
+			evidence.RebaseNeeded = true
+		}
 	}
 	for _, p := range [][]string{r.Shas.Harvestable, r.Shas.NeedReview, r.Shas.ContentMerged, r.Shas.HarvestReady, r.Shas.RebaseNeeded} {
 		sort.Strings(p)
@@ -268,6 +300,7 @@ func (d *Drain) Scan(ctx context.Context, unmerged []harvest.UnmergedWork) (*Dra
 	r.ContentMerged = len(r.Shas.ContentMerged)
 	r.HarvestReady = len(r.Shas.HarvestReady)
 	r.RebaseNeeded = len(r.Shas.RebaseNeeded)
+	sort.Slice(r.ActionEvidence, func(i, j int) bool { return r.ActionEvidence[i].SHA < r.ActionEvidence[j].SHA })
 	r.Pressure = "ok"
 	if r.KaneoInReview >= r.Cap {
 		r.Pressure = "OVER_CAP"
@@ -302,6 +335,15 @@ func (d *Drain) Scan(ctx context.Context, unmerged []harvest.UnmergedWork) (*Dra
 		r.KaneoError = "provider unavailable"
 	}
 	return r, nil
+}
+
+func containsSHA(shas []string, want string) bool {
+	for _, sha := range shas {
+		if sha == want {
+			return true
+		}
+	}
+	return false
 }
 
 func boardGitRow(ctx context.Context, repo, ref, title string, pins []PinFreshness) BoardGitRow {
