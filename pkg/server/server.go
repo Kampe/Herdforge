@@ -8,13 +8,18 @@ import (
 	"net/http"
 	"sync"
 	"time"
+
+	"github.com/Kampe/Herdforge/pkg/metrics"
 )
 
 type ServerStatusResponse struct {
-	Status    string    `json:"status"`
-	Version   string    `json:"version"`
-	UptimeSec float64   `json:"uptime_sec"`
-	Timestamp time.Time `json:"timestamp"`
+	Status    string                 `json:"status"`
+	Version   string                 `json:"version"`
+	UptimeSec float64                `json:"uptime_sec"`
+	Timestamp time.Time              `json:"timestamp"`
+	Health    metrics.HealthSnapshot `json:"health"`
+	Queue     metrics.QueuePressure  `json:"queue"`
+	SLO       metrics.TransitionSLO  `json:"transition_slo"`
 }
 
 type ControlServer struct {
@@ -22,13 +27,27 @@ type ControlServer struct {
 	Addr      string
 	StartTime time.Time
 	httpSrv   *http.Server
+	metrics   *metrics.MetricsExporter
+	now       func() time.Time
 }
 
 func NewControlServer(addr string) *ControlServer {
 	return &ControlServer{
 		Addr:      addr,
 		StartTime: time.Now(),
+		metrics:   metrics.NewMetricsExporter(),
+		now:       time.Now,
 	}
+}
+
+func NewControlServerWithMetrics(addr string, exporter *metrics.MetricsExporter, now func() time.Time) *ControlServer {
+	if exporter == nil {
+		exporter = metrics.NewMetricsExporter()
+	}
+	if now == nil {
+		now = time.Now
+	}
+	return &ControlServer{Addr: addr, StartTime: now(), metrics: exporter, now: now}
 }
 
 func (s *ControlServer) Start(ctx context.Context) error {
@@ -63,11 +82,19 @@ func (s *ControlServer) Stop(ctx context.Context) error {
 
 func (s *ControlServer) handleStatus(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
+	health, queue, slo := s.metrics.Snapshot()
+	status := "healthy"
+	if !health.Readiness || !queue.Known || queue.Error != "" {
+		status = "degraded"
+	}
 	resp := ServerStatusResponse{
-		Status:    "healthy",
+		Status:    status,
 		Version:   "v0.1.0",
-		UptimeSec: time.Since(s.StartTime).Seconds(),
-		Timestamp: time.Now(),
+		UptimeSec: s.now().Sub(s.StartTime).Seconds(),
+		Timestamp: s.now(),
+		Health:    health,
+		Queue:     queue,
+		SLO:       slo,
 	}
 	_ = json.NewEncoder(w).Encode(resp)
 }
