@@ -204,9 +204,13 @@ func (k *KaneoProvider) GetTask(ctx context.Context, id string) (*Task, error) {
 	return task, err
 }
 
+// kaneoRunCLI is the CLI runner for Kaneo production UseCLI mode. Tests may
+// swap it for a hermetic counter; production uses process-group RunCLI.
+var kaneoRunCLI = RunCLI
+
 func (k *KaneoProvider) getTaskOnce(ctx context.Context, id string) (*Task, error) {
 	if k.UseCLI {
-		res, err := RunCLI(ctx, "kaneo", "task", "get", id, "--json")
+		res, err := kaneoRunCLI(ctx, "kaneo", "task", "get", id, "--json")
 		if err != nil {
 			return nil, fmt.Errorf("kaneo task get: %w", err)
 		}
@@ -284,7 +288,7 @@ func (k *KaneoProvider) listTasksOnce(ctx context.Context, projectID, status str
 			if status != "" {
 				args = append(args, "--status", status)
 			}
-			res, err := RunCLI(ctx, "kaneo", args...)
+			res, err := kaneoRunCLI(ctx, "kaneo", args...)
 			if err != nil {
 				return nil, fmt.Errorf("kaneo task list (page %d): %w", page, err)
 			}
@@ -356,10 +360,12 @@ func (k *KaneoProvider) ClaimTask(ctx context.Context, taskID string, role strin
 }
 
 func (k *KaneoProvider) UpdateStatus(ctx context.Context, taskID string, status string) error {
+	// Write the canonical lifecycle status so readback compares like-for-like
+	// against dtoToTask/NormalizeStatus (production Kaneo CLI + HTTP).
 	canonical := NormalizeStatus(status)
 	dls := k.deadlines()
 	writeCtx, cancel := WithOpDeadline(ctx, dls, OpMutate)
-	writeErr := k.updateStatusOnce(writeCtx, taskID, status)
+	writeErr := k.updateStatusOnce(writeCtx, taskID, canonical)
 	cancel()
 	if writeErr != nil {
 		writeErr = AsTimeout("kaneo", "UpdateStatus", OpMutate, dls.For(OpMutate), writeErr)
@@ -370,7 +376,7 @@ func (k *KaneoProvider) UpdateStatus(ctx context.Context, taskID string, status 
 
 func (k *KaneoProvider) updateStatusOnce(ctx context.Context, taskID, status string) error {
 	if k.UseCLI {
-		res, err := RunCLI(ctx, "kaneo", "task", "status", taskID, status, "--project", k.ProjectID)
+		res, err := kaneoRunCLI(ctx, "kaneo", "task", "status", taskID, status, "--project", k.ProjectID)
 		if err != nil {
 			msg := cliErrMsg(res)
 			if msg != "" {
@@ -427,7 +433,13 @@ func (k *KaneoProvider) AddComment(ctx context.Context, taskID string, body stri
 
 func (k *KaneoProvider) addCommentOnce(ctx context.Context, taskID, body string) error {
 	if k.UseCLI {
-		res, err := RunCLI(ctx, "kaneo", "task", "comment", "add", taskID, body)
+		// Production Kaneo is multi-project; pin --project when configured
+		// (matches status/list CLI paths).
+		args := []string{"task", "comment", "add", taskID, body}
+		if k.ProjectID != "" {
+			args = append(args, "--project", k.ProjectID)
+		}
+		res, err := kaneoRunCLI(ctx, "kaneo", args...)
 		if err != nil {
 			msg := cliErrMsg(res)
 			if msg != "" {
