@@ -10,18 +10,39 @@ import (
 	"testing"
 )
 
+// gitTestArgs prefixes every fixture git invocation with a hermetic author
+// and GPG-off flags so tests never depend on global git identity (CI runners
+// have none). Same pattern as gitIn / gitInHarvest in sibling test files.
+func gitTestArgs(args ...string) []string {
+	base := []string{
+		"-c", "commit.gpgSign=false",
+		"-c", "gpg.x509.program=false",
+		"-c", "gpg.format=openpgp",
+		"-c", "tag.gpgSign=false",
+		"-c", "user.email=test@herdforge.local",
+		"-c", "user.name=Test Runner",
+	}
+	return append(base, args...)
+}
+
+func gitInTest(t *testing.T, dir string, args ...string) {
+	t.Helper()
+	cmd := exec.Command("git", gitTestArgs(args...)...)
+	cmd.Dir = dir
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git %v: %v\n%s", args, err, out)
+	}
+}
+
 func createTestGitRepo(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()
-	for _, cmd := range []string{
-		`git -c commit.gpgSign=false -c gpg.x509.program=false -c gpg.format=openpgp -c tag.gpgSign=false -c user.email=test@test.com -c user.name=test init -b main`,
-	} {
-		c := exec.Command("bash", "-c", cmd)
-		c.Dir = dir
-		if out, err := c.CombinedOutput(); err != nil {
-			t.Fatalf("%s: %v\n%s", cmd, err, out)
-		}
-	}
+	gitInTest(t, dir, "init", "-q", "-b", "main")
+	// Local identity so any bare `git commit` in this fixture (and code
+	// under test that commits without -c) also works without global config.
+	gitInTest(t, dir, "config", "user.email", "test@herdforge.local")
+	gitInTest(t, dir, "config", "user.name", "Test Runner")
+	gitInTest(t, dir, "config", "commit.gpgSign", "false")
 	return dir
 }
 
@@ -31,43 +52,23 @@ func commitFile(t *testing.T, dir, filename, content, msg string) {
 	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
 		t.Fatalf("write %s: %v", filename, err)
 	}
-	c := exec.Command("git", "-c", "commit.gpgSign=false", "-c", "gpg.format=openpgp", "add", filename)
-	c.Dir = dir
-	if out, err := c.CombinedOutput(); err != nil {
-		t.Fatalf("git add: %v\n%s", err, out)
-	}
-	c = exec.Command("git", "-c", "commit.gpgSign=false", "-c", "gpg.format=openpgp", "commit", "-m", msg)
-	c.Dir = dir
-	if out, err := c.CombinedOutput(); err != nil {
-		t.Fatalf("git commit: %v\n%s", err, out)
-	}
+	gitInTest(t, dir, "add", filename)
+	gitInTest(t, dir, "commit", "-q", "-m", msg)
 }
 
 func createBranch(t *testing.T, dir, name string) {
 	t.Helper()
-	c := exec.Command("git", "checkout", "-b", name)
-	c.Dir = dir
-	if out, err := c.CombinedOutput(); err != nil {
-		t.Fatalf("git checkout -b %s: %v\n%s", name, err, out)
-	}
+	gitInTest(t, dir, "checkout", "-b", name)
 }
 
 func checkoutBranch(t *testing.T, dir, name string) {
 	t.Helper()
-	c := exec.Command("git", "checkout", name)
-	c.Dir = dir
-	if out, err := c.CombinedOutput(); err != nil {
-		t.Fatalf("git checkout %s: %v\n%s", name, err, out)
-	}
+	gitInTest(t, dir, "checkout", name)
 }
 
 func addWorktree(t *testing.T, repoDir, worktreePath, branch string) {
 	t.Helper()
-	c := exec.Command("git", "worktree", "add", "-b", branch, worktreePath)
-	c.Dir = repoDir
-	if out, err := c.CombinedOutput(); err != nil {
-		t.Fatalf("git worktree add: %v\n%s", err, out)
-	}
+	gitInTest(t, repoDir, "worktree", "add", "-b", branch, worktreePath)
 }
 
 func TestHarvesterListsWorktrees(t *testing.T) {
