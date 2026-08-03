@@ -324,6 +324,71 @@ func TestKaneoGetTask_ArrayBody(t *testing.T) {
 	}
 }
 
+func TestDecodeKaneoTaskBody_MismatchFailsClosed(t *testing.T) {
+	// Singleton array whose sole element is a different task must NOT succeed
+	// (would let status readback confirm the wrong card).
+	_, err := decodeKaneoTaskBody(http.StatusOK, []byte(
+		`[{"id":"other","ref":"FAC-1","title":"x","status":"done","priority":"low","projectId":"p","labels":[]}]`,
+	), "t-wanted")
+	if err == nil {
+		t.Fatal("sole nonmatching array element must fail")
+	}
+	// Non-vacuity: same array shape succeeds when id matches.
+	dto, err := decodeKaneoTaskBody(http.StatusOK, []byte(
+		`[{"id":"t-wanted","ref":"FAC-99","title":"x","status":"in-progress","priority":"low","projectId":"p","labels":[]}]`,
+	), "t-wanted")
+	if err != nil || dto.ID != "t-wanted" || dto.Status != "in-progress" {
+		t.Fatalf("matching singleton array: dto=%+v err=%v", dto, err)
+	}
+
+	// Object form for a different task must fail (exact id/ref match required).
+	_, err = decodeKaneoTaskBody(http.StatusOK, []byte(
+		`{"id":"wrong","ref":"FAC-2","title":"y","status":"done","priority":"low","projectId":"p","labels":[]}`,
+	), "t-wanted")
+	if err == nil {
+		t.Fatal("object id mismatch must fail")
+	}
+	// Non-vacuity: matching object succeeds (by id or by ref).
+	dto, err = decodeKaneoTaskBody(http.StatusOK, []byte(
+		`{"id":"t-wanted","ref":"FAC-99","title":"y","status":"to-do","priority":"low","projectId":"p","labels":[]}`,
+	), "t-wanted")
+	if err != nil || dto.Ref != "FAC-99" {
+		t.Fatalf("matching object by id: dto=%+v err=%v", dto, err)
+	}
+	dto, err = decodeKaneoTaskBody(http.StatusOK, []byte(
+		`{"id":"internal-uuid","ref":"FAC-99","title":"y","status":"to-do","priority":"low","projectId":"p","labels":[]}`,
+	), "FAC-99")
+	if err != nil || dto.ID != "internal-uuid" {
+		t.Fatalf("matching object by ref: dto=%+v err=%v", dto, err)
+	}
+}
+
+func TestKaneoGetTask_ObjectMismatch(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		// Server returns a different task than requested.
+		w.Write([]byte(`{"id":"someone-else","ref":"FAC-0","title":"nope","status":"done","priority":"low","projectId":"p","labels":[]}`))
+	}))
+	defer server.Close()
+	kp := NewKaneoProvider(server.URL, "p", false)
+	if _, err := kp.GetTask(context.Background(), "t-1"); err == nil {
+		t.Fatal("GetTask must reject object for a different task")
+	}
+	// Non-vacuity: when body matches, GetTask succeeds.
+	ok := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"id":"t-1","ref":"FAC-1","title":"ok","status":"to-do","priority":"low","projectId":"p","labels":[]}`))
+	}))
+	defer ok.Close()
+	kp2 := NewKaneoProvider(ok.URL, "p", false)
+	task, err := kp2.GetTask(context.Background(), "t-1")
+	if err != nil || task.ID != "t-1" {
+		t.Fatalf("matching GetTask: task=%+v err=%v", task, err)
+	}
+}
+
 func TestKaneoLabel_DualShape(t *testing.T) {
 	// CLI form: labels as strings
 	var cli kaneoTaskDTO
