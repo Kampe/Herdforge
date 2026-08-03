@@ -150,6 +150,22 @@ func TestParseRegistry_EmptyLanes(t *testing.T) {
 	}
 }
 
+func TestLaneDef_Standing(t *testing.T) {
+	reg := mustParseRegistry(t, `{"version":1,"lanes":[
+		{"id":"harvest","route_shape":"bounded","risk_class":"standard","standing":true},
+		{"id":"worker","route_shape":"code","risk_class":"standard"}
+	]}`)
+	if len(reg.Lanes) != 2 {
+		t.Fatalf("len(Lanes) = %d, want 2", len(reg.Lanes))
+	}
+	if !reg.Lanes[0].Standing {
+		t.Errorf("lane %q: Standing = false, want true", reg.Lanes[0].ID)
+	}
+	if reg.Lanes[1].Standing {
+		t.Errorf("lane %q: Standing = true, want false (field omitted defaults to ephemeral)", reg.Lanes[1].ID)
+	}
+}
+
 func TestLaneIDs(t *testing.T) {
 	reg := mustParseRegistry(t, testRegistryJSON)
 	resolver := New(reg, &mockScorer{providers: []string{"claude"}})
@@ -528,15 +544,15 @@ func TestProviderModelWithinRank(t *testing.T) {
 
 func TestRationaleLine_Resolvable(t *testing.T) {
 	res := &ResolvedLane{
-		Lane:         "platform-ops",
-		RouteShape:   "implementation",
-		RiskClass:    "standard",
-		Provider:     "claude",
-		Model:        "claude-sonnet-5",
-		Effort:       "medium",
-		CostTier:     "market",
-		Constraints:  []string{"none"},
-		Resolvable:   true,
+		Lane:        "platform-ops",
+		RouteShape:  "implementation",
+		RiskClass:   "standard",
+		Provider:    "claude",
+		Model:       "claude-sonnet-5",
+		Effort:      "medium",
+		CostTier:    "market",
+		Constraints: []string{"none"},
+		Resolvable:  true,
 	}
 	line := res.RationaleLine()
 	if !strings.Contains(line, "resolve platform-ops") {
@@ -549,13 +565,13 @@ func TestRationaleLine_Resolvable(t *testing.T) {
 
 func TestRationaleLine_Unrouteable(t *testing.T) {
 	res := &ResolvedLane{
-		Lane:       "bogus",
-		RouteShape: "implementation",
-		RiskClass:  "standard",
-		Effort:     "medium",
+		Lane:        "bogus",
+		RouteShape:  "implementation",
+		RiskClass:   "standard",
+		Effort:      "medium",
 		Constraints: []string{"none"},
-		Resolvable: false,
-		Reason:     "no healthy provider",
+		Resolvable:  false,
+		Reason:      "no healthy provider",
 	}
 	line := res.RationaleLine()
 	if !strings.Contains(line, "UNROUTABLE") {

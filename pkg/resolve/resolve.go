@@ -33,13 +33,13 @@ func (a *DefaultAdapter) Score(shape string, preferProvider string) *RouteScore 
 
 // LaneRegistry is the top-level JSON structure of lane-registry.json.
 type LaneRegistry struct {
-	Version              int                             `json:"version"`
-	ProviderConstraints  map[string]ProviderConstraint   `json:"provider_constraints"`
-	RiskClasses          map[string]RiskClass            `json:"risk_classes"`
-	Lanes                []LaneDef                       `json:"lanes"`
-	AdvisoryModels       map[string]AdvisoryModel        `json:"advisory_models,omitempty"`
-	NetworkCapability    NetworkCapability               `json:"network_capability,omitempty"`
-	OutputValidation     OutputValidation                `json:"output_validation,omitempty"`
+	Version             int                           `json:"version"`
+	ProviderConstraints map[string]ProviderConstraint `json:"provider_constraints"`
+	RiskClasses         map[string]RiskClass          `json:"risk_classes"`
+	Lanes               []LaneDef                     `json:"lanes"`
+	AdvisoryModels      map[string]AdvisoryModel      `json:"advisory_models,omitempty"`
+	NetworkCapability   NetworkCapability             `json:"network_capability,omitempty"`
+	OutputValidation    OutputValidation              `json:"output_validation,omitempty"`
 }
 
 // ProviderConstraint encodes operational rules for a specific provider.
@@ -56,25 +56,29 @@ type ProviderConstraint struct {
 
 // RiskClass encodes the constraint profile for a risk category.
 type RiskClass struct {
-	ProviderPin               string `json:"provider_pin,omitempty"`
-	ModelPin                  string `json:"model_pin,omitempty"`
-	EffortFloor               string `json:"effort_floor,omitempty"`
-	ModelFloorClass           string `json:"model_floor_class,omitempty"`
-	ByteReplayReviewOffClaude *bool  `json:"byte_replay_review_off_claude,omitempty"`
-	CostTier                  string `json:"cost_tier,omitempty"`
+	ProviderPin               string   `json:"provider_pin,omitempty"`
+	ModelPin                  string   `json:"model_pin,omitempty"`
+	EffortFloor               string   `json:"effort_floor,omitempty"`
+	ModelFloorClass           string   `json:"model_floor_class,omitempty"`
+	ByteReplayReviewOffClaude *bool    `json:"byte_replay_review_off_claude,omitempty"`
+	CostTier                  string   `json:"cost_tier,omitempty"`
 	ProviderAllow             []string `json:"provider_allow,omitempty"`
-	Reason                    string `json:"reason,omitempty"`
+	Reason                    string   `json:"reason,omitempty"`
 }
 
-// LaneDef defines one standing lane.
+// LaneDef defines one lane the registry knows how to route.
 type LaneDef struct {
-	ID           string `json:"id"`
-	Packet       string `json:"packet,omitempty"`
-	Role         string `json:"role,omitempty"`
-	RouteShape   string `json:"route_shape"`
-	RiskClass    string `json:"risk_class"`
-	Prefer       string `json:"prefer,omitempty"`
-	PreferModel  string `json:"prefer_model,omitempty"`
+	ID          string `json:"id"`
+	Packet      string `json:"packet,omitempty"`
+	Role        string `json:"role,omitempty"`
+	RouteShape  string `json:"route_shape"`
+	RiskClass   string `json:"risk_class"`
+	Prefer      string `json:"prefer,omitempty"`
+	PreferModel string `json:"prefer_model,omitempty"`
+	// Standing marks this lane as a control-plane role `herd standing`
+	// raises and keeps alive; false/omitted means the lane is an ephemeral
+	// task role launched per dispatch. Read by pkg/kick's roster derivation.
+	Standing bool `json:"standing,omitempty"`
 }
 
 // AdvisoryModel documents model capability notes.
@@ -88,7 +92,7 @@ type AdvisoryModel struct {
 
 // NetworkCapability documents per-provider network access in execution modes.
 type NetworkCapability struct {
-	ShapesRequiringNetwork []string            `json:"shapes_requiring_network,omitempty"`
+	ShapesRequiringNetwork []string                      `json:"shapes_requiring_network,omitempty"`
 	Providers              map[string]NetworkProviderCap `json:"providers,omitempty"`
 }
 
@@ -106,28 +110,28 @@ type OutputValidation struct {
 
 // ResolvedLane is the immutable result of resolving a lane.
 type ResolvedLane struct {
-	Lane           string   `json:"lane"`
-	RouteShape     string   `json:"route_shape"`
-	RiskClass      string   `json:"risk_class"`
-	Provider       string   `json:"provider,omitempty"`
-	Model          string   `json:"model,omitempty"`
-	Effort         string   `json:"effort"`
-	CostTier       string   `json:"cost_tier"`
-	ByteReplayReview bool   `json:"byte_replay_review"`
-	Constraints    []string `json:"constraints"`
-	Resolvable     bool     `json:"resolvable"`
-	Reason         string   `json:"reason,omitempty"`
+	Lane             string   `json:"lane"`
+	RouteShape       string   `json:"route_shape"`
+	RiskClass        string   `json:"risk_class"`
+	Provider         string   `json:"provider,omitempty"`
+	Model            string   `json:"model,omitempty"`
+	Effort           string   `json:"effort"`
+	CostTier         string   `json:"cost_tier"`
+	ByteReplayReview bool     `json:"byte_replay_review"`
+	Constraints      []string `json:"constraints"`
+	Resolvable       bool     `json:"resolvable"`
+	Reason           string   `json:"reason,omitempty"`
 }
 
 // RouteScore is what a routing/scoring function returns for a candidate provider.
 type RouteScore struct {
-	Provider       string `json:"provider"`
-	Model          string `json:"model"`
-	Effort         string `json:"effort"`
-	Credits        string `json:"credits,omitempty"`
-	QuotaPressure  string `json:"quota_pressure,omitempty"`
-	QuotaPool      string `json:"quota_pool,omitempty"`
-	LazerLastResort bool  `json:"lazer_last_resort,omitempty"`
+	Provider        string `json:"provider"`
+	Model           string `json:"model"`
+	Effort          string `json:"effort"`
+	Credits         string `json:"credits,omitempty"`
+	QuotaPressure   string `json:"quota_pressure,omitempty"`
+	QuotaPool       string `json:"quota_pool,omitempty"`
+	LazerLastResort bool   `json:"lazer_last_resort,omitempty"`
 }
 
 // RouteScorer is the interface the resolver calls to rank candidates.
@@ -165,8 +169,8 @@ func ParseRegistry(data []byte) (*LaneRegistry, error) {
 // Resolve resolves a single lane.
 func (r *LaneResolver) Resolve(laneID string, dropPrefer bool) *ResolvedLane {
 	result := &ResolvedLane{
-		Lane: laneID,
-		Effort: "medium",
+		Lane:       laneID,
+		Effort:     "medium",
 		Resolvable: true,
 	}
 
@@ -530,17 +534,17 @@ func (r *ResolvedLane) RationaleLine() string {
 func (r *LaneResolver) ResolveAllJSON() (string, error) {
 	results := r.ResolveAll()
 	type jsonRow struct {
-		Lane            string   `json:"lane"`
-		RouteShape      string   `json:"route_shape"`
-		RiskClass       string   `json:"risk_class"`
-		Provider        *string  `json:"provider"`
-		Model           *string  `json:"model"`
-		Effort          string   `json:"effort"`
-		CostTier        string   `json:"cost_tier"`
-		ByteReplayReview bool    `json:"byte_replay_review"`
-		Constraints     []string `json:"constraints"`
-		Resolvable      bool     `json:"resolvable"`
-		Reason          *string  `json:"reason"`
+		Lane             string   `json:"lane"`
+		RouteShape       string   `json:"route_shape"`
+		RiskClass        string   `json:"risk_class"`
+		Provider         *string  `json:"provider"`
+		Model            *string  `json:"model"`
+		Effort           string   `json:"effort"`
+		CostTier         string   `json:"cost_tier"`
+		ByteReplayReview bool     `json:"byte_replay_review"`
+		Constraints      []string `json:"constraints"`
+		Resolvable       bool     `json:"resolvable"`
+		Reason           *string  `json:"reason"`
 	}
 
 	rows := make([]jsonRow, 0, len(results))
