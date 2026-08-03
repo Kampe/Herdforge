@@ -354,7 +354,7 @@ func TestDispatch_Launch_SetsCwdAndProvesPrompt(t *testing.T) {
 
 // TestDispatch_EmptyBranchAfterWorktreeCompensates covers the post-side-effect
 // path where CreateTaskWorktreeFrom returned a real path but empty Branch.
-// Must failWithCompensate("empty_worktree_branch") and never launch.
+// Must failOwned("empty_worktree_branch") exactly once and never launch.
 func TestDispatch_EmptyBranchAfterWorktreeCompensates(t *testing.T) {
 	tmp := t.TempDir()
 	// Simulate a created worktree directory (side effect already landed).

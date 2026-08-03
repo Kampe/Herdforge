@@ -244,30 +244,11 @@ func (d *Dispatcher) compensate(ctx context.Context, ticketRef, reason string) e
 	return nil
 }
 
-// failWithCompensate runs compensation and joins any compensate error with primary.
-// Primary is always preserved; compensation errors never replace it.
-func (d *Dispatcher) failWithCompensate(ctx context.Context, ticketRef, reason string, primary error) error {
-	if cErr := d.compensate(ctx, ticketRef, reason); cErr != nil {
-		return errors.Join(primary, cErr)
-	}
-	return primary
-}
-
-// rollbackTab closes a partial-launch tab then runs durable compensation.
-// TabClose errors are never discarded: they are joined into primary and
-// additionally compensated under reason+"_orphan_tab_close_failed" so an
-// orphan session cannot be silently accepted (FAC-121 R3).
-func (d *Dispatcher) rollbackTab(ctx context.Context, h HerdrLauncher, tabID, ticketRef, reason string, primary error) error {
-	if tabID != "" && h != nil {
-		if closeErr := h.TabClose(tabID); closeErr != nil {
-			primary = errors.Join(primary, fmt.Errorf("tab close %q during %s: %w", tabID, reason, closeErr))
-			if cErr := d.compensate(ctx, ticketRef, reason+"_orphan_tab_close_failed"); cErr != nil {
-				primary = errors.Join(primary, cErr)
-			}
-		}
-	}
-	return d.failWithCompensate(ctx, ticketRef, reason, primary)
-}
+// Durable shared-lifecycle compensation for launch failures is owned exclusively
+// by Dispatch.failOwned (StillOwns → exactly-one compensate → ReleaseIfOwner).
+// Do not reintroduce failWithCompensate/rollbackTab helpers that compensate
+// without a generation lease or double-fire with outer failOwned
+// (audit h5d6pay5vamxvv277qtt5qmk).
 
 func (d *Dispatcher) Dispatch(ctx context.Context, opts DispatchOptions) (*DispatchResult, error) {
 	// Fail closed before any side effect when durable hooks are missing.
