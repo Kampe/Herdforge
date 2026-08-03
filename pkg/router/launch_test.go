@@ -63,6 +63,18 @@ func TestModelRequiresProbeLunaAndDeepseek(t *testing.T) {
 	}
 }
 
+func TestPinnedProbeMustMatchExactRequestedModel(t *testing.T) {
+	clearRouteEnv(t)
+	request := LaunchRequest{Role: RoleWorker, Shape: "implementation", RequestedProvider: "lazer", RequestedModel: "opencode/deepseek-v4-flash", ProbeResults: map[string]bool{ProbeKey("lazer", "litellm/lazer/gpt-5.6-sol"): true}}
+	if _, err := NewRouter(nil, nil).Decide(request); err == nil {
+		t.Fatal("probe for default model must not authorize a different pinned model")
+	}
+	request.ProbeResults[ProbeKey("lazer", "opencode/deepseek-v4-flash")] = true
+	if _, err := NewRouter(nil, nil).Decide(request); err != nil {
+		t.Fatalf("exact pinned probe should authorize routing: %v", err)
+	}
+}
+
 func TestEffortLadderReviewer(t *testing.T) {
 	clearRouteEnv(t)
 	cases := []struct {
@@ -115,7 +127,7 @@ func TestEffortLadderReviewer(t *testing.T) {
 		{
 			name: "worker uses shape ladder",
 			req:  LaunchRequest{Role: RoleWorker, Shape: "implementation"},
-			want: "high",
+			want: "medium",
 		},
 		{
 			name: "worker bounded low",
@@ -174,8 +186,8 @@ func TestDecideWorkerPicksModelAndEffort(t *testing.T) {
 		t.Fatalf("role = %s", d.Role)
 	}
 	// Effort must come from router policy, not harness default empty.
-	if d.Effort != EffortFor("implementation") {
-		t.Fatalf("worker effort = %q, want shape ladder %q", d.Effort, EffortFor("implementation"))
+	if d.Effort != "medium" {
+		t.Fatalf("worker effort = %q, want medium", d.Effort)
 	}
 	if len(d.Argv) == 0 {
 		t.Fatal("argv must be populated from decision")

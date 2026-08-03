@@ -15,16 +15,18 @@ import (
 	"github.com/Kampe/Herdforge/pkg/config"
 	"github.com/Kampe/Herdforge/pkg/deps"
 	"github.com/Kampe/Herdforge/pkg/herdr"
+	"github.com/Kampe/Herdforge/pkg/launch"
 	"github.com/Kampe/Herdforge/pkg/provider"
+	"github.com/Kampe/Herdforge/pkg/router"
 	"github.com/Kampe/Herdforge/pkg/worktree"
 )
 
 // --- fakes -----------------------------------------------------------------
 
 type recordingCompensator struct {
-	mu       sync.Mutex
-	steps    []StepRecord
-	comps    []string
+	mu        sync.Mutex
+	steps     []StepRecord
+	comps     []string
 	recordErr error
 	compErr   error
 }
@@ -120,7 +122,7 @@ func (f *fakeHerdr) TabCreateForTask(workspaceID, label, cwd string, _ bool) (*h
 		Pane: herdr.PaneInfo{ID: pane, TabID: id},
 	}, nil
 }
-func (f *fakeHerdr) AgentStart(name, kind, paneID string, _ ...string) error {
+func (f *fakeHerdr) AgentStart(_ launch.Request, name, kind, paneID string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.startCalls++
@@ -128,6 +130,14 @@ func (f *fakeHerdr) AgentStart(name, kind, paneID string, _ ...string) error {
 	_ = kind
 	_ = paneID
 	return f.startErr
+}
+
+func validLaunchOptions(ref string) DispatchOptions {
+	d, err := router.NewRouter(nil, nil).Decide(router.LaunchRequest{Role: router.RoleWorker, Shape: launch.Implementation, RequestedProvider: launch.WorkerProvider, RequestedModel: launch.WorkerModel, ProbeResults: map[string]bool{router.ProbeKey(launch.WorkerProvider, launch.WorkerModel): true}})
+	if err != nil {
+		panic(err)
+	}
+	return DispatchOptions{TicketRef: ref, Decision: d}
 }
 func (f *fakeHerdr) DeliverAndProve(target, text string, _ time.Duration) (*herdr.PromptReceipt, error) {
 	f.mu.Lock()
@@ -313,7 +323,7 @@ func TestDispatch_Launch_SetsCwdAndProvesPrompt(t *testing.T) {
 	d.Compensator = comp
 
 	// Production path: always proves consumption (no SkipPromptVerify).
-	res, err := d.Dispatch(context.Background(), DispatchOptions{TicketRef: "FAC-9"})
+	res, err := d.Dispatch(context.Background(), validLaunchOptions("FAC-9"))
 	if err != nil {
 		t.Fatalf("Dispatch: %v", err)
 	}
@@ -389,7 +399,7 @@ func TestDispatch_EmptyBranchAfterWorktreeCompensates(t *testing.T) {
 		Herdr:        fh,
 	})
 
-	res, err := d.Dispatch(context.Background(), DispatchOptions{TicketRef: "FAC-EMPTY"})
+	res, err := d.Dispatch(context.Background(), validLaunchOptions("FAC-EMPTY"))
 	if err == nil {
 		t.Fatal("expected empty-branch failure after worktree side effect")
 	}
@@ -564,7 +574,7 @@ func TestDispatch_CompensateErrorPropagates(t *testing.T) {
 	d.Herdr = fh
 	d.Compensator = comp
 
-	res, err := d.Dispatch(context.Background(), DispatchOptions{TicketRef: "FAC-C"})
+	res, err := d.Dispatch(context.Background(), validLaunchOptions("FAC-C"))
 	if err == nil {
 		t.Fatal("expected joined primary+compensate error")
 	}
@@ -607,7 +617,7 @@ func TestDispatch_RejectsInvalidPromptSequence(t *testing.T) {
 	d.Herdr = fh
 	d.Compensator = comp
 
-	res, err := d.Dispatch(context.Background(), DispatchOptions{TicketRef: "FAC-SEQ"})
+	res, err := d.Dispatch(context.Background(), validLaunchOptions("FAC-SEQ"))
 	if err == nil {
 		t.Fatal("working→working receipt must be rejected on launch path")
 	}
@@ -649,7 +659,7 @@ func TestDispatch_CrashPoint_AgentStartClosesOrphanTab(t *testing.T) {
 	d.Herdr = fh
 	d.Compensator = comp
 
-	res, err := d.Dispatch(context.Background(), DispatchOptions{TicketRef: "FAC-7"})
+	res, err := d.Dispatch(context.Background(), validLaunchOptions("FAC-7"))
 	if err == nil {
 		t.Fatal("expected agent start failure")
 	}
@@ -685,7 +695,7 @@ func TestDispatch_AgentStart_TabCloseErrorNotSilent(t *testing.T) {
 	d.Herdr = fh
 	d.Compensator = comp
 
-	res, err := d.Dispatch(context.Background(), DispatchOptions{TicketRef: "FAC-7C"})
+	res, err := d.Dispatch(context.Background(), validLaunchOptions("FAC-7C"))
 	if err == nil {
 		t.Fatal("expected failure when start and tab-close both fail")
 	}
@@ -735,7 +745,7 @@ func TestDispatch_CrashPoint_PromptFailureClosesTab(t *testing.T) {
 	d.Herdr = fh
 	d.Compensator = comp
 
-	res, err := d.Dispatch(context.Background(), DispatchOptions{TicketRef: "FAC-8"})
+	res, err := d.Dispatch(context.Background(), validLaunchOptions("FAC-8"))
 	if err == nil {
 		t.Fatal("expected prompt failure")
 	}
@@ -768,7 +778,7 @@ func TestDispatch_PromptFailure_TabCloseErrorNotSilent(t *testing.T) {
 	d.Herdr = fh
 	d.Compensator = comp
 
-	res, err := d.Dispatch(context.Background(), DispatchOptions{TicketRef: "FAC-8C"})
+	res, err := d.Dispatch(context.Background(), validLaunchOptions("FAC-8C"))
 	if err == nil {
 		t.Fatal("expected failure")
 	}
@@ -810,7 +820,7 @@ func TestDispatch_UnknownWorkspaceFailsClosed(t *testing.T) {
 	d.Herdr = fh
 	d.Compensator = comp
 
-	res, err := d.Dispatch(context.Background(), DispatchOptions{TicketRef: "FAC-3"})
+	res, err := d.Dispatch(context.Background(), validLaunchOptions("FAC-3"))
 	if err == nil {
 		t.Fatal("expected workspace failure")
 	}
@@ -849,7 +859,7 @@ func TestDispatch_LaunchPath_RejectsSharedRoot(t *testing.T) {
 		AnchorRef: worktree.AnchorRefFor("FAC-ROOT"),
 	}
 	result := &DispatchResult{}
-	err := d.launch(context.Background(), DispatchOptions{}, task, lane, wtInfo, wtInfo.Branch, "packet", result)
+	err := d.launch(context.Background(), validLaunchOptions("FAC-3"), task, lane, wtInfo, wtInfo.Branch, "packet", result)
 	if err == nil {
 		t.Fatal("launch on shared root must fail; production RejectSharedRoot guard missing?")
 	}

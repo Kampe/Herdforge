@@ -19,12 +19,14 @@ import (
 
 	"github.com/Kampe/Herdforge/pkg/activate"
 	"github.com/Kampe/Herdforge/pkg/attention"
+	"github.com/Kampe/Herdforge/pkg/classify"
 	"github.com/Kampe/Herdforge/pkg/config"
 	"github.com/Kampe/Herdforge/pkg/daemon"
 	"github.com/Kampe/Herdforge/pkg/dispatch"
 	"github.com/Kampe/Herdforge/pkg/harvest"
 	"github.com/Kampe/Herdforge/pkg/herdr"
 	"github.com/Kampe/Herdforge/pkg/kick"
+	"github.com/Kampe/Herdforge/pkg/launch"
 	"github.com/Kampe/Herdforge/pkg/lifecycle"
 	"github.com/Kampe/Herdforge/pkg/lost"
 	"github.com/Kampe/Herdforge/pkg/next"
@@ -559,6 +561,28 @@ func runPulse() {
 	defer st.Close()
 
 	eng := daemon.NewEngine(cfg, tp, mr, st, wm, v)
+	var pulseLane *config.LaneDef
+	var pulseDecision *router.LaunchDecision
+	if *spawn {
+		pulseLane = findLaneForRole(cfg, *role)
+		if pulseLane == nil {
+			fmt.Fprintf(os.Stderr, "no lane configured for role '%s'\n", *role)
+			os.Exit(1)
+		}
+		if !herdr.IsAvailable() {
+			fmt.Fprintf(os.Stderr, "herdr CLI not found — cannot claim launch-required pulse\n")
+			os.Exit(1)
+		}
+		pulseDecision, err = laneLaunchDecision(context.Background(), pulseLane, nil)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "launch route rejected before pulse claim: %v\n", err)
+			os.Exit(1)
+		}
+		if err := validateDecisionBeforeSideEffect(pulseDecision, "pulse"); err != nil {
+			fmt.Fprintf(os.Stderr, "launch decision rejected before pulse claim: %v\n", err)
+			os.Exit(1)
+		}
+	}
 
 	task, err := eng.RunPulse(context.Background(), *role)
 	if err != nil {
@@ -574,22 +598,18 @@ func runPulse() {
 	fmt.Printf("Pulse sweep claimed task [%s]: %s\n", task.Ref, task.Title)
 
 	if *spawn {
-		if !herdr.IsAvailable() {
-			fmt.Fprintf(os.Stderr, "herdr CLI not found — cannot spawn agent\n")
-			os.Exit(1)
-		}
-
-		lane := findLaneForRole(cfg, *role)
-		if lane == nil {
-			fmt.Fprintf(os.Stderr, "no lane configured for role '%s'\n", *role)
-			os.Exit(1)
-		}
+		lane := pulseLane
+		decision := pulseDecision
 
 		standingName := fmt.Sprintf("forge-%s", lane.Name)
 		targetLabel := standingName
 
-		tabLabel, err := herdr.ResolveAgentTab(standingName)
+		tabLabel, err := herdr.ResolveAgentTabWithDecision(standingName, launch.Request{Decision: decision, TaskRef: task.Ref}, 0)
 		if err != nil {
+			if !errors.Is(err, herdr.ErrAgentNotFound) {
+				fmt.Fprintf(os.Stderr, "standing agent %s blocked: %v\n", standingName, err)
+				os.Exit(1)
+			}
 			// no standing agent — create a fresh one
 			tabLabel = fmt.Sprintf("pulse-%s-%s", lane.Name, task.Ref)
 			tab, err := herdr.Tab(herdr.ResolveWorkspace("."), tabLabel, true)
@@ -597,7 +617,7 @@ func runPulse() {
 				fmt.Fprintf(os.Stderr, "failed to create herdr tab: %v\n", err)
 				os.Exit(1)
 			}
-			if err := herdr.AgentStart(tabLabel, lane.AgentKind, tab.Pane.ID, herdr.LaneAgentArgs(lane.Model)...); err != nil {
+			if err := herdr.AgentStartWithDecision(tabLabel, decision.Provider, tab.Pane.ID, launch.Request{Decision: decision, TaskRef: task.Ref}); err != nil {
 				fmt.Fprintf(os.Stderr, "failed to start agent: %v\n", err)
 				os.Exit(1)
 			}
@@ -627,7 +647,8 @@ Workflow:
 			lane.Worktree)
 
 		if _, err := herdr.AgentPrompt(targetLabel, workPacket, false); err != nil {
-			fmt.Fprintf(os.Stderr, "  warning: failed to deliver task packet: %v\n", err)
+			fmt.Fprintf(os.Stderr, "failed to deliver task packet: %v\n", err)
+			os.Exit(1)
 		} else {
 			fmt.Printf("  -> delivered task packet to %s\n", targetLabel)
 		}
@@ -926,6 +947,18 @@ func runStanding() {
 	}
 
 	for _, lane := range cfg.Lanes {
+		if !lane.Standing {
+			continue
+		}
+		decision, routeErr := laneLaunchDecision(context.Background(), &lane, nil)
+		if routeErr != nil {
+			fmt.Fprintf(os.Stderr, "  launch route rejected for lane %s: %v\n", lane.Name, routeErr)
+			continue
+		}
+		if err := validateDecisionBeforeSideEffect(decision, lane.Name); err != nil {
+			fmt.Fprintf(os.Stderr, "  launch decision rejected for lane %s: %v\n", lane.Name, err)
+			continue
+		}
 		if lane.Worktree != "" {
 			wtPath := filepath.Join(".", lane.Worktree)
 			if _, err := os.Stat(wtPath); os.IsNotExist(err) {
@@ -948,7 +981,7 @@ func runStanding() {
 			continue
 		}
 
-		if err := herdr.AgentStart(tabLabel, lane.AgentKind, tab.Pane.ID, herdr.LaneAgentArgs(lane.Model)...); err != nil {
+		if err := herdr.AgentStartWithDecision(tabLabel, decision.Provider, tab.Pane.ID, launch.Request{Decision: decision, TaskRef: lane.Name}); err != nil {
 			fmt.Fprintf(os.Stderr, "  failed to start agent for lane %s: %v\n", lane.Name, err)
 			continue
 		}
@@ -956,7 +989,10 @@ func runStanding() {
 		if lane.Prompt != "" {
 			if promptData, err := os.ReadFile(lane.Prompt); err == nil {
 				promptText := strings.TrimSpace(string(promptData))
-				herdr.AgentPrompt(tabLabel, promptText, false)
+				if _, promptErr := herdr.AgentPrompt(tabLabel, promptText, false); promptErr != nil {
+					fmt.Fprintf(os.Stderr, "  prompt failed for lane %s: %v\n", lane.Name, promptErr)
+					continue
+				}
 			}
 		}
 
@@ -993,6 +1029,15 @@ func runUp() {
 		fmt.Fprintf(os.Stderr, "herdr CLI not found\n")
 		os.Exit(1)
 	}
+	decision, err := laneLaunchDecision(context.Background(), lane, nil)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "launch route rejected before tab creation: %v\n", err)
+		os.Exit(1)
+	}
+	if err := validateDecisionBeforeSideEffect(decision, lane.Name); err != nil {
+		fmt.Fprintf(os.Stderr, "launch decision rejected before tab creation: %v\n", err)
+		os.Exit(1)
+	}
 
 	tabLabel := fmt.Sprintf("forge-%s", lane.Name)
 	tab, err := herdr.Tab(herdr.ResolveWorkspace("."), tabLabel, true)
@@ -1001,7 +1046,7 @@ func runUp() {
 		os.Exit(1)
 	}
 
-	if err := herdr.AgentStart(tabLabel, lane.AgentKind, tab.Pane.ID, herdr.LaneAgentArgs(lane.Model)...); err != nil {
+	if err := herdr.AgentStartWithDecision(tabLabel, decision.Provider, tab.Pane.ID, launch.Request{Decision: decision, TaskRef: lane.Name}); err != nil {
 		fmt.Fprintf(os.Stderr, "failed to start agent: %v\n", err)
 		os.Exit(1)
 	}
@@ -1181,19 +1226,32 @@ func runReview() {
 			fmt.Fprintf(os.Stderr, "no lane configured for role 'reviewer'\n")
 			os.Exit(1)
 		}
+		decision, err := laneLaunchDecision(context.Background(), lane, task)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "review launch route rejected before tab creation: %v\n", err)
+			os.Exit(1)
+		}
+		if err := validateDecisionBeforeSideEffect(decision, task.Ref); err != nil {
+			fmt.Fprintf(os.Stderr, "review launch decision rejected before tab creation: %v\n", err)
+			os.Exit(1)
+		}
 
 		standingName := fmt.Sprintf("forge-%s", lane.Name)
 		targetLabel := standingName
 
-		tabLabel, err := herdr.ResolveAgentTab(standingName)
+		tabLabel, err := herdr.ResolveAgentTabWithDecision(standingName, launch.Request{Decision: decision, TaskRef: task.Ref}, 0)
 		if err != nil {
+			if !errors.Is(err, herdr.ErrAgentNotFound) {
+				fmt.Fprintf(os.Stderr, "standing reviewer %s blocked: %v\n", standingName, err)
+				os.Exit(1)
+			}
 			tabLabel = fmt.Sprintf("review-%s-%s", lane.Name, task.Ref)
 			tab, tabErr := herdr.Tab(herdr.ResolveWorkspace("."), tabLabel, true)
 			if tabErr != nil {
 				fmt.Fprintf(os.Stderr, "failed to create herdr tab: %v\n", tabErr)
 				os.Exit(1)
 			}
-			if err := herdr.AgentStart(tabLabel, lane.AgentKind, tab.Pane.ID, herdr.LaneAgentArgs(lane.Model)...); err != nil {
+			if err := herdr.AgentStartWithDecision(tabLabel, decision.Provider, tab.Pane.ID, launch.Request{Decision: decision, TaskRef: task.Ref}); err != nil {
 				fmt.Fprintf(os.Stderr, "failed to start agent: %v\n", err)
 				os.Exit(1)
 			}
@@ -1226,7 +1284,8 @@ Do not read the whole codebase. Do not run the full suite. Change nothing.`,
 			task.Ref, worktreeDir, testCmd, task.Ref, task.Ref)
 
 		if _, err := herdr.AgentPrompt(targetLabel, reviewPacket, false); err != nil {
-			fmt.Fprintf(os.Stderr, "  warning: failed to deliver review packet: %v\n", err)
+			fmt.Fprintf(os.Stderr, "failed to deliver review packet: %v\n", err)
+			os.Exit(1)
 		} else {
 			fmt.Printf("  -> delivered review packet to %s\n", targetLabel)
 		}
@@ -1778,13 +1837,29 @@ func runDispatch() {
 
 	wm := resolveCanonicalWorktreeManager()
 	d := dispatch.NewDispatcher(cfg, tp, wm)
+	var decision *router.LaunchDecision
+	if !*noLaunch {
+		lane := findLaneByName(cfg, *laneName)
+		if lane == nil {
+			fmt.Fprintf(os.Stderr, "lane '%s' not found\n", *laneName)
+			os.Exit(1)
+		}
+		decision, err = laneLaunchDecision(context.Background(), lane, nil)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "launch route rejected before dispatch: %v\n", err)
+			os.Exit(1)
+		}
+		if err := validateDecisionBeforeSideEffect(decision, ticketRef); err != nil {
+			fmt.Fprintf(os.Stderr, "launch decision rejected before dispatch: %v\n", err)
+			os.Exit(1)
+		}
+	}
 
 	fmt.Printf("Dispatching %s to lane '%s'...\n", ticketRef, *laneName)
 
 	result, err := d.Dispatch(context.Background(), dispatch.DispatchOptions{
-		TicketRef: ticketRef,
-		NoLaunch:  *noLaunch,
-		LaneName:  *laneName,
+		TicketRef: ticketRef, NoLaunch: *noLaunch, LaneName: *laneName,
+		Decision: decision,
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "dispatch failed: %v\n", err)
@@ -2294,6 +2369,26 @@ func runForge() {
 
 	ctx := context.Background()
 	fmt.Println("=== Forge: Pulse ===")
+	var forgeLane *config.LaneDef
+	var forgeDecision *router.LaunchDecision
+	if !herdr.IsAvailable() {
+		fmt.Fprintln(os.Stderr, "herdr CLI not found — refusing launch-required forge claim")
+		os.Exit(1)
+	}
+	forgeLane = findLaneForRole(cfg, "worker")
+	if forgeLane == nil {
+		fmt.Println("No worker lane configured; refusing forge claim")
+		return
+	}
+	forgeDecision, err = laneLaunchDecision(ctx, forgeLane, nil)
+	if err != nil {
+		fmt.Printf("Launch route rejected before forge claim: %v\n", err)
+		return
+	}
+	if err := validateDecisionBeforeSideEffect(forgeDecision, "forge"); err != nil {
+		fmt.Printf("Launch decision rejected before forge claim: %v\n", err)
+		return
+	}
 
 	task, err := eng.RunPulse(ctx, "worker")
 	if err != nil {
@@ -2306,21 +2401,32 @@ func runForge() {
 	} else {
 		fmt.Printf("Claimed [%s]: %s\n", task.Ref, task.Title)
 
-		// Spawn worker if herdr available
+		// Spawn worker only after the pre-claim route and availability checks.
 		if herdr.IsAvailable() {
-			lane := findLaneForRole(cfg, "worker")
+			lane := forgeLane
 			if lane != nil {
+				decision := forgeDecision
 				standingName := fmt.Sprintf("forge-%s", lane.Name)
-				tabLabel, resolveErr := herdr.ResolveAgentTab(standingName)
+				tabLabel, resolveErr := herdr.ResolveAgentTabWithDecision(standingName, launch.Request{Decision: decision, TaskRef: task.Ref}, 0)
 				if resolveErr != nil {
+					if !errors.Is(resolveErr, herdr.ErrAgentNotFound) {
+						fmt.Fprintf(os.Stderr, "standing forge agent %s blocked: %v\n", standingName, resolveErr)
+						return
+					}
 					tabLabel = fmt.Sprintf("forge-%s-%s", lane.Name, task.Ref)
 					tab, tabErr := herdr.Tab(herdr.ResolveWorkspace("."), tabLabel, true)
 					if tabErr == nil {
-						herdr.AgentStart(tabLabel, lane.AgentKind, tab.Pane.ID, herdr.LaneAgentArgs(lane.Model)...)
+						if err := herdr.AgentStartWithDecision(tabLabel, decision.Provider, tab.Pane.ID, launch.Request{Decision: decision, TaskRef: task.Ref}); err != nil {
+							fmt.Printf("Launch failed: %v\n", err)
+							return
+						}
 					}
 				}
 				packet := fmt.Sprintf(`Task [%s]: %s\n\n%s\n\nWorktree: %s`, task.Ref, task.Title, task.Description, lane.Worktree)
-				herdr.AgentPrompt(tabLabel, packet, false)
+				if _, promptErr := herdr.AgentPrompt(tabLabel, packet, false); promptErr != nil {
+					fmt.Fprintf(os.Stderr, "forge prompt failed: %v\n", promptErr)
+					os.Exit(1)
+				}
 			}
 		}
 	}
@@ -2358,6 +2464,93 @@ func findLaneForRole(cfg *config.Config, role string) *config.LaneDef {
 		}
 	}
 	return nil
+}
+
+func findLaneByName(cfg *config.Config, name string) *config.LaneDef {
+	for i := range cfg.Lanes {
+		if cfg.Lanes[i].Name == name {
+			return &cfg.Lanes[i]
+		}
+	}
+	return nil
+}
+
+func laneLaunchDecision(ctx context.Context, lane *config.LaneDef, task *provider.Task) (*router.LaunchDecision, error) {
+	if lane == nil {
+		return nil, fmt.Errorf("launch route requires a configured lane")
+	}
+	if err := validateLaneLaunchConfig(lane); err != nil {
+		return nil, err
+	}
+	role := router.Role(lane.Role)
+	shape := strings.TrimSpace(lane.TaskShape)
+	if shape == "" {
+		return nil, fmt.Errorf("lane %q has no authoritative task_shape", lane.Name)
+	}
+	provider := lane.Provider
+	request := router.LaunchRequest{Role: role, Shape: shape, RequestedProvider: provider, RequestedModel: lane.Model, Risk: classify.TierR1}
+	if role == router.RoleReviewer || role == router.RoleAssayer {
+		if task == nil {
+			return nil, fmt.Errorf("review launch requires candidate provenance")
+		}
+		for _, label := range task.Labels {
+			if strings.HasPrefix(label, "author-family:") {
+				request.AuthorFamily = strings.TrimPrefix(label, "author-family:")
+			}
+			if strings.HasPrefix(label, "author-model:") {
+				request.AuthorModel = strings.TrimPrefix(label, "author-model:")
+			}
+			if strings.HasPrefix(label, "candidate-sha:") {
+				request.CandidateSHA = strings.TrimPrefix(label, "candidate-sha:")
+			}
+		}
+		if request.AuthorFamily == "" || request.AuthorModel == "" || request.CandidateSHA == "" {
+			return nil, fmt.Errorf("review launch requires author family, author model, and candidate SHA provenance")
+		}
+	}
+	model := lane.Model
+	if router.ModelRequiresProbe(model) {
+		probe := herdr.ProbeModel(ctx, model)
+		request.ProbeResults = map[string]bool{router.ProbeKey(provider, model): probe.Available}
+	}
+	decision, err := router.NewRouter(nil, nil).Decide(request)
+	if err != nil {
+		return nil, err
+	}
+	if decision.Provider != lane.Provider || decision.Model != lane.Model || decision.Effort != lane.Effort || decision.Shape != lane.TaskShape {
+		return nil, fmt.Errorf("lane %q routed decision drift: configured %s/%s/%s/%s, got %s/%s/%s/%s", lane.Name, lane.Provider, lane.Model, lane.Effort, lane.TaskShape, decision.Provider, decision.Model, decision.Effort, decision.Shape)
+	}
+	if err := validateDecisionBeforeSideEffect(decision, lane.Name); err != nil {
+		return nil, err
+	}
+	return decision, nil
+}
+
+func validateLaneLaunchConfig(lane *config.LaneDef) error {
+	role := strings.TrimSpace(lane.Role)
+	if role == "" || strings.TrimSpace(lane.AgentKind) == "" || strings.TrimSpace(lane.Provider) == "" || strings.TrimSpace(lane.Model) == "" || strings.TrimSpace(lane.Effort) == "" || strings.TrimSpace(lane.TaskShape) == "" {
+		return fmt.Errorf("lane %q has incomplete launch authority", lane.Name)
+	}
+	expectedShapes := map[string]string{launch.WorkerRole: "implementation", launch.ForgeSmithRole: "implementation", launch.RecoveryRole: "implementation", launch.ReviewerRole: "qa", launch.OrchestratorRole: "coordinator", launch.ScoutPlannerRole: "architecture", launch.VerificationGateRole: "bounded", launch.ReviewSupervisorRole: "coordinator", launch.HarvestRole: "bounded", launch.RecoverySentinelRole: "bounded"}
+	if expected, ok := expectedShapes[role]; !ok || lane.TaskShape != expected {
+		return fmt.Errorf("lane %q has invalid task_shape %q for role %q", lane.Name, lane.TaskShape, role)
+	}
+	if strings.TrimSpace(lane.AgentKind) != strings.TrimSpace(lane.Provider) {
+		return fmt.Errorf("lane %q agent kind %q does not match provider %q", lane.Name, lane.AgentKind, lane.Provider)
+	}
+	if role == launch.WorkerRole || role == launch.ForgeSmithRole || role == launch.RecoveryRole {
+		if lane.AgentKind != launch.WorkerProvider || lane.Provider != launch.WorkerProvider || lane.Model != launch.WorkerModel || lane.Effort != launch.WorkerEffort {
+			return fmt.Errorf("lane %q worker/recovery policy must explicitly be codex/gpt-5.6-luna/medium", lane.Name)
+		}
+	}
+	return nil
+}
+
+func validateDecisionBeforeSideEffect(decision *router.LaunchDecision, taskRef string) error {
+	if decision == nil {
+		return fmt.Errorf("missing routed launch decision")
+	}
+	return launch.Validate(launch.Request{Decision: decision, TaskRef: taskRef}, nil)
 }
 
 func runKick() {

@@ -13,8 +13,10 @@ import (
 	"github.com/Kampe/Herdforge/pkg/config"
 	"github.com/Kampe/Herdforge/pkg/deps"
 	"github.com/Kampe/Herdforge/pkg/herdr"
+	"github.com/Kampe/Herdforge/pkg/launch"
 	"github.com/Kampe/Herdforge/pkg/preflight"
 	"github.com/Kampe/Herdforge/pkg/provider"
+	"github.com/Kampe/Herdforge/pkg/router"
 	"github.com/Kampe/Herdforge/pkg/worktree"
 )
 
@@ -63,7 +65,7 @@ type HerdrLauncher interface {
 	Available() bool
 	RequireWorkspace(repoRoot string) (string, error)
 	TabCreateForTask(workspaceID, label, cwd string, noFocus bool) (*herdr.TabInfo, error)
-	AgentStart(name, kind, paneID string, agentArgs ...string) error
+	AgentStart(req launch.Request, name, kind, paneID string) error
 	DeliverAndProve(target, text string, timeout time.Duration) (*herdr.PromptReceipt, error)
 	TabClose(tabID string) error
 	ResolveHealthyModel(ctx context.Context, primary string, fallbacks []string) (string, []herdr.ProbeResult)
@@ -79,8 +81,8 @@ func (LiveHerdr) RequireWorkspace(repoRoot string) (string, error) {
 func (LiveHerdr) TabCreateForTask(workspaceID, label, cwd string, noFocus bool) (*herdr.TabInfo, error) {
 	return herdr.TabCreateForTask(workspaceID, label, cwd, noFocus)
 }
-func (LiveHerdr) AgentStart(name, kind, paneID string, agentArgs ...string) error {
-	return herdr.AgentStart(name, kind, paneID, agentArgs...)
+func (LiveHerdr) AgentStart(req launch.Request, name, kind, paneID string) error {
+	return herdr.AgentStartWithDecision(name, kind, paneID, req)
 }
 func (LiveHerdr) DeliverAndProve(target, text string, timeout time.Duration) (*herdr.PromptReceipt, error) {
 	return herdr.DeliverAndProve(target, text, timeout)
@@ -92,11 +94,8 @@ func (LiveHerdr) ResolveHealthyModel(ctx context.Context, primary string, fallba
 
 type DispatchOptions struct {
 	TicketRef string
-	Provider  string
-	Model     string
-	Role      string
+	Decision  *router.LaunchDecision
 	NoLaunch  bool
-	TaskShape string
 	LaneName  string
 	// PromptVerifyTimeout bounds DeliverAndProve polling (default 60s).
 	// Production launches always require consumption proof — there is no
@@ -254,6 +253,14 @@ func (d *Dispatcher) Dispatch(ctx context.Context, opts DispatchOptions) (*Dispa
 	// Fail closed before any side effect when durable hooks are missing.
 	if err := d.requireCompensator(); err != nil {
 		return nil, err
+	}
+	// FAC-175: reject an under-specified worker launch before even reading or
+	// mutating provider/worktree state. --no-launch is the explicit packet-only
+	// mode and therefore has no launch boundary to validate.
+	if !opts.NoLaunch {
+		if _, err := validateWorkerLaunchRequest(opts); err != nil {
+			return nil, err
+		}
 	}
 
 	// 1. Fetch ticket from Kaneo (bounded context + health observe, FAC-150)
@@ -551,17 +558,17 @@ func (d *Dispatcher) launch(
 		return &launchFailure{Reason: "shared_root_denied", Err: err}
 	}
 
-	model, trail := h.ResolveHealthyModel(ctx, lane.Model, lane.FallbackModels)
-	if model == "" {
-		var b strings.Builder
-		for _, p := range trail {
-			fmt.Fprintf(&b, "\n  %s: %s", p.Model, p.Reason)
-		}
-		return &launchFailure{
-			Reason: "no_healthy_model",
-			Err:    fmt.Errorf("no healthy model for lane %q — every candidate is exhausted:%s", lane.Name, b.String()),
-		}
+	// FAC-175: implementation workers have one explicit routed tier. Validate
+	// before workspace/tab/process/prompt side effects; no lane default or
+	// provider fallback may substitute a coordinator model.
+	request, err := workerRequest(opts, task.Ref)
+	if err != nil {
+		return &launchFailure{Reason: "launch_policy_rejected", Err: err}
 	}
+	if err := launch.Validate(request, nil); err != nil {
+		return &launchFailure{Reason: "launch_policy_rejected", Err: err}
+	}
+	model := request.Decision.Model
 	result.Model = model
 
 	// Explicit workspace — never hardcoded "wF".
@@ -598,7 +605,7 @@ func (d *Dispatcher) launch(
 		}
 	}
 
-	if err := h.AgentStart(tabLabel, lane.AgentKind, tab.Pane.ID, herdr.LaneAgentArgs(model)...); err != nil {
+	if err := h.AgentStart(request, tabLabel, request.Decision.Provider, tab.Pane.ID); err != nil {
 		// Local orphan-tab cleanup only — outer failOwned owns durable compensate.
 		return &launchFailure{
 			Reason: "agent_start_failed",
@@ -670,6 +677,28 @@ func (d *Dispatcher) launch(
 	}
 	result.Launched = true
 	return nil
+}
+
+func workerRequest(opts DispatchOptions, taskRef string) (launch.Request, error) {
+	if opts.Decision == nil {
+		return launch.Request{TaskRef: taskRef}, fmt.Errorf("compiled LaunchDecision is required; defaults are forbidden")
+	}
+	d := opts.Decision
+	if d.Provider == "" || d.Model == "" || d.Effort == "" || d.Role == "" || d.Shape == "" || len(d.Argv) == 0 {
+		return launch.Request{Decision: d, TaskRef: taskRef}, fmt.Errorf("compiled LaunchDecision fields are required; defaults are forbidden")
+	}
+	return launch.Request{Decision: d, TaskRef: taskRef}, nil
+}
+
+func validateWorkerLaunchRequest(opts DispatchOptions) (launch.Request, error) {
+	req, err := workerRequest(opts, opts.TicketRef)
+	if err != nil {
+		return req, launch.Validate(req, nil)
+	}
+	if err := launch.Validate(req, nil); err != nil {
+		return req, err
+	}
+	return req, nil
 }
 
 func slugForTask(ref, title string) string {

@@ -37,8 +37,8 @@ func (t *timeoutBoard) AddComment(context.Context, string, string) error { retur
 
 type noopComp struct{}
 
-func (noopComp) RecordStep(context.Context, StepRecord) error          { return nil }
-func (noopComp) Compensate(context.Context, string, string) error      { return nil }
+func (noopComp) RecordStep(context.Context, StepRecord) error     { return nil }
+func (noopComp) Compensate(context.Context, string, string) error { return nil }
 
 func TestDispatch_ListTimeout_ProjectsBlocked(t *testing.T) {
 	board := &timeoutBoard{hangList: true}
@@ -54,7 +54,7 @@ func TestDispatch_ListTimeout_ProjectsBlocked(t *testing.T) {
 	d := NewDispatcher(cfg, board, nil)
 	d.Compensator = noopComp{}
 	// Worktree nil will fail later — but list happens first.
-	_, err := d.Dispatch(context.Background(), DispatchOptions{TicketRef: "FAC-1", LaneName: "worker"})
+	_, err := d.Dispatch(context.Background(), validLaunchOptions("FAC-1"))
 	if err == nil {
 		t.Fatal("expected list timeout error")
 	}
