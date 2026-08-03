@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Kampe/Herdforge/pkg/control"
 	"github.com/Kampe/Herdforge/pkg/provider"
 )
 
@@ -17,6 +18,30 @@ type fakeDriver struct {
 	actions   []string
 	onApprove func(ref string)
 	onReview  func(ref string)
+}
+
+func TestForgeLoop_ReconciliationFailureStopsBeforeDriverActions(t *testing.T) {
+	e := forgeEngine(t)
+	e.ControlReconciler = &control.CoordinatorLoop{}
+	d := &fakeDriver{lanes: LaneState{Max: 1}}
+	if err := e.ForgeLoop(context.Background(), d, ForgeLoopOptions{MaxTicks: 1}); err == nil {
+		t.Fatal("reconciliation failure was ignored")
+	}
+	if len(d.actions) != 0 {
+		t.Fatalf("driver actions ran after reconciliation failure: %v", d.actions)
+	}
+}
+
+func TestForgeLoop_MissingProductionCompositionFailsClosed(t *testing.T) {
+	e := forgeEngine(t)
+	e.ControlRequired = true
+	d := &fakeDriver{lanes: LaneState{Max: 1}}
+	if err := e.ForgeLoop(context.Background(), d, ForgeLoopOptions{MaxTicks: 1}); err == nil {
+		t.Fatal("missing durable composition was accepted")
+	}
+	if len(d.actions) != 0 {
+		t.Fatalf("driver actions ran without durable composition: %v", d.actions)
+	}
 }
 
 func (f *fakeDriver) LaneState(context.Context) LaneState { return f.lanes }

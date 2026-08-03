@@ -3643,7 +3643,11 @@ func runForgeLoop() {
 		os.Exit(1)
 	}
 	defer st.Close()
-	eng := daemon.NewEngine(cfg, tp, nil, st, resolveCanonicalWorktreeManager(), nil)
+	// The forge loop is wake-capable: it must be composed with a durable
+	// coordinator reconciler. Until the authoritative task-scoped composition
+	// is available, NewEngineWithControl makes the command fail closed before
+	// any board or lane action rather than falling back to direct dispatch.
+	eng := daemon.NewEngineWithControl(cfg, tp, nil, st, resolveCanonicalWorktreeManager(), nil, nil)
 	driver := &cliForgeDriver{cfg: cfg, maxLanes: *maxLanes}
 
 	fmt.Printf("herd forge --loop: max-lanes=%d interval=%ds — driving the board autonomously\n", *maxLanes, *interval)

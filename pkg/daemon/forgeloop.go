@@ -65,9 +65,13 @@ func (e *Engine) ForgeLoop(ctx context.Context, d ForgeDriver, opts ForgeLoopOpt
 			return ctx.Err()
 		default:
 		}
+		if e.ControlRequired && e.ControlReconciler == nil {
+			return fmt.Errorf("forge: durable control reconciler is required before board or lane actions")
+		}
 		if e.ControlReconciler != nil {
 			if err := e.ControlReconciler.RunOnce(ctx); err != nil {
 				d.Log(fmt.Sprintf("forge: control reconciliation failed: %v", err))
+				return fmt.Errorf("forge: control reconciliation failed before lane/board actions: %w", err)
 			}
 		}
 
