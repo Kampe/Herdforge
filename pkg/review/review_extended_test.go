@@ -72,6 +72,7 @@ func patchIDFixture(t *testing.T) string {
 		{"init", "-q", "-b", "main"},
 		{"config", "user.email", "t@h.local"},
 		{"config", "user.name", "t"},
+		{"config", "commit.gpgsign", "false"},
 	} {
 		c := exec.Command("git", args...)
 		c.Dir = dir
