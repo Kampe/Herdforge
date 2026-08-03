@@ -341,12 +341,19 @@ func (d *Dispatcher) Dispatch(ctx context.Context, opts DispatchOptions) (*Dispa
 	}
 
 	// 7. Write TASK-PACKET.md — packet branch MUST equal Git branch
+	// Fail closed rather than silently falling back to a hardcoded `go test`
+	// (FAC-134): every repo must declare its own verification contract.
+	if d.Config.Verification.TestCommand == "" {
+		return nil, d.failWithCompensate(ctx, task.Ref, "verification_test_command_missing",
+			fmt.Errorf("verification.test_command is required in .herd/herd.yaml (FAC-134 fail-closed; no hardcoded go test fallback)"))
+	}
+
 	rolePath := lane.Prompt
 	if rolePath == "" {
 		rolePath = ".herd/prompts/worker.md"
 	}
 
-	packet := buildTaskPacket(task, wtInfo.Path, branch, rolePath, lane)
+	packet := buildTaskPacket(task, wtInfo.Path, branch, rolePath, lane, d.Config.Verification)
 	packetPath := filepath.Join(wtInfo.Path, "TASK-PACKET.md")
 	if err := os.WriteFile(packetPath, []byte(packet), 0644); err != nil {
 		return nil, d.failWithCompensate(ctx, task.Ref, "task_packet_write_failed",
@@ -543,23 +550,36 @@ func extractIntentFromTitle(title string) string {
 //
 // FAC-121: branch in the packet is the actual Git branch; cwd is technical
 // (Herdr --cwd), not merely a prompt instruction.
-func buildTaskPacket(task *provider.Task, wtPath, branch, rolePath string, lane *config.LaneDef) string {
+//
+// FAC-134: verification commands come from the repo's own config
+// (verification.preflight_command / verification.test_command in
+// .herd/herd.yaml) — never a hardcoded `go build`/`go test` literal — so the
+// same packet works for Go, Node, Python, or docs-only repositories.
+// Callers must ensure verification.TestCommand is non-empty (Dispatch fails
+// closed before calling this).
+func buildTaskPacket(task *provider.Task, wtPath, branch, rolePath string, lane *config.LaneDef, verification config.Verification) string {
 	var b strings.Builder
 
+	verifySummary := verification.TestCommand
+	verifyFlags := fmt.Sprintf("--test %q", verification.TestCommand)
+	if verification.PreflightCommand != "" {
+		verifySummary = verification.PreflightCommand + " && " + verification.TestCommand
+		verifyFlags = fmt.Sprintf("--build %q %s", verification.PreflightCommand, verifyFlags)
+	}
+
 	fmt.Fprintf(&b, "BUILD %s — EXECUTE. No menus, no questions. Do not stop until "+
-		"`go build ./...`, `go vet ./...`, and `go test ./...` all pass AND you have committed.\n\n", task.Ref)
+		"`%s` passes AND you have committed.\n\n", task.Ref, verifySummary)
 
 	fmt.Fprintf(&b, "Worktree: %s (branch %s). Work ONLY here — never edit files outside it.\n\n", wtPath, branch)
 
 	fmt.Fprintf(&b, "Read the full spec yourself (do not wait for it inline):\n")
-	fmt.Fprintf(&b, "  kaneo task get %s --full\n", task.Ref)
-	b.WriteString("  and the matching chainseer source at ~/Personal/chainseer/bin/ if this is a port.\n\n")
+	fmt.Fprintf(&b, "  kaneo task get %s --full\n\n", task.Ref)
 
 	b.WriteString("Completion contract (self-gate, FAC-116):\n")
 	fmt.Fprintf(&b, "  1. You are already in %s (Herdr cwd-enforced).\n", wtPath)
 	b.WriteString("  2. Implement per the spec you just read (real code + table tests).\n")
-	b.WriteString("  3. go build ./... && go vet ./... && go test ./... — ALL green.\n")
-	fmt.Fprintf(&b, "  4. Verify yourself: herd verify %s (must PASS: real commits + build + tests).\n", wtPath)
+	fmt.Fprintf(&b, "  3. `%s` — ALL green.\n", verifySummary)
+	fmt.Fprintf(&b, "  4. Verify yourself: herd verify %s %s (must PASS: real commits + build + tests).\n", wtPath, verifyFlags)
 	fmt.Fprintf(&b, "  5. git add -A && git commit -m \"<msg containing %s>\" (no AI-attribution trailers).\n", task.Ref)
 	fmt.Fprintf(&b, "  6. Final message: `BUILD COMPLETE %s` + `git rev-parse HEAD`.\n\n", task.Ref)
 
