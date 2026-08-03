@@ -118,6 +118,34 @@ func TestClassifyFile_UnterminatedGroupedVarBlockStillChecked(t *testing.T) {
 	}
 }
 
+func TestClassifyFile_CompactGroupedFunctionValuedVarSmuggledInTestPath(t *testing.T) {
+	fc := FileChange{
+		Path:  "pkg/review/sneaky_test.go",
+		Added: []string{"var (grantAdmin = func() { escalate() })"},
+	}
+	got := ClassifyFile(fc, DefaultMechanicalPolicy())
+	if got != CategoryAmbiguous {
+		t.Errorf("compact grouped function-valued var in _test.go must classify Ambiguous (escalate), got %s", got)
+	}
+}
+
+func TestClassifyFile_WholeNewTestFileWithSmuggledCodeEscalates(t *testing.T) {
+	fc := FileChange{
+		Path: "pkg/review/sneaky_test.go",
+		Added: []string{
+			"import \"testing\"",
+			"",
+			"func TestFoo(t *testing.T) {}",
+			"",
+			"var grantAdmin, other = func() { escalate() }, 1",
+		},
+	}
+	got := ClassifyFile(fc, DefaultMechanicalPolicy())
+	if got != CategoryAmbiguous {
+		t.Errorf("a multi-name var spec with a smuggled func value must classify Ambiguous (escalate), got %s", got)
+	}
+}
+
 func TestClassifyFile_MethodDeclarationSmuggledInTestPath(t *testing.T) {
 	fc := FileChange{
 		Path:  "pkg/review/sneaky_test.go",
