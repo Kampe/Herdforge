@@ -967,3 +967,129 @@ func TestReadRowsMalformed(t *testing.T) {
 		t.Errorf("expected 1 valid row, got %d", len(rows))
 	}
 }
+
+// TestIngestDirtyWorktreeRejected_RepairProbe: a completion callback for a
+// dirty worktree describes a tree state that doesn't match the recorded SHA
+// and must never be accepted for review.
+func TestIngestDirtyWorktreeRejected_RepairProbe(t *testing.T) {
+	sv, _ := newTestSupervisor(t)
+	accepted, _, err := sv.Ingest(CompletionCallback{
+		SHA:           "dirty1",
+		AuthorModel:   "claude",
+		Tier:          TierR1,
+		DirtyWorktree: true,
+	})
+	if err == nil {
+		t.Fatal("expected error for dirty-worktree completion callback")
+	}
+	if accepted {
+		t.Error("dirty-worktree callback must not be accepted")
+	}
+	if sv.Candidate("dirty1") != nil {
+		t.Error("dirty-worktree callback must not create a candidate")
+	}
+}
+
+// TestIngestStaleLeaseGenerationRejected_RepairProbe: a callback carrying a
+// lease must present a strictly newer generation than any previously
+// accepted callback for that lease, or it is a stale/replayed callback.
+func TestIngestStaleLeaseGenerationRejected_RepairProbe(t *testing.T) {
+	sv, _ := newTestSupervisor(t)
+	_, _, err := sv.Ingest(CompletionCallback{
+		SHA:         "sha-gen2",
+		AuthorModel: "claude",
+		Tier:        TierR1,
+		LeaseID:     "lease-1",
+		Generation:  2,
+	})
+	if err != nil {
+		t.Fatalf("Ingest gen 2: %v", err)
+	}
+
+	// Same generation replayed for the same lease must be rejected.
+	accepted, _, err := sv.Ingest(CompletionCallback{
+		SHA:         "sha-gen2-replay",
+		AuthorModel: "claude",
+		Tier:        TierR1,
+		LeaseID:     "lease-1",
+		Generation:  2,
+	})
+	if err == nil {
+		t.Fatal("expected error for stale (non-increasing) lease generation")
+	}
+	if accepted {
+		t.Error("stale lease generation must not be accepted")
+	}
+
+	// An older generation for the same lease must also be rejected.
+	_, _, err = sv.Ingest(CompletionCallback{
+		SHA:         "sha-gen1",
+		AuthorModel: "claude",
+		Tier:        TierR1,
+		LeaseID:     "lease-1",
+		Generation:  1,
+	})
+	if err == nil {
+		t.Fatal("expected error for older lease generation")
+	}
+
+	// A strictly newer generation for the same lease must succeed.
+	_, _, err = sv.Ingest(CompletionCallback{
+		SHA:         "sha-gen3",
+		AuthorModel: "claude",
+		Tier:        TierR1,
+		LeaseID:     "lease-1",
+		Generation:  3,
+	})
+	if err != nil {
+		t.Fatalf("expected newer lease generation to be accepted: %v", err)
+	}
+}
+
+// TestIngestStaleSHAGenerationRejected_RepairProbe: exact stale-SHA
+// validation — when superseding a candidate that shares a PatchID, the new
+// commit's generation must be newer than the one it replaces.
+func TestIngestStaleSHAGenerationRejected_RepairProbe(t *testing.T) {
+	sv, _ := newTestSupervisor(t)
+	_, _, err := sv.Ingest(CompletionCallback{
+		SHA:         "sha-a",
+		PatchID:     "patch-x",
+		AuthorModel: "claude",
+		Tier:        TierR1,
+		Generation:  5,
+	})
+	if err != nil {
+		t.Fatalf("Ingest sha-a: %v", err)
+	}
+
+	accepted, _, err := sv.Ingest(CompletionCallback{
+		SHA:         "sha-b-stale",
+		PatchID:     "patch-x",
+		AuthorModel: "claude",
+		Tier:        TierR1,
+		Generation:  5,
+	})
+	if err == nil {
+		t.Fatal("expected error: same-generation SHA for the same patch is stale")
+	}
+	if accepted {
+		t.Error("stale-generation superseding SHA must not be accepted")
+	}
+	if sv.Candidate("sha-a").State != StatePending {
+		t.Error("original candidate must remain pending after a rejected stale supersede")
+	}
+
+	_, _, err = sv.Ingest(CompletionCallback{
+		SHA:         "sha-c-fresh",
+		PatchID:     "patch-x",
+		AuthorModel: "claude",
+		Tier:        TierR1,
+		Generation:  6,
+	})
+	if err != nil {
+		t.Fatalf("expected newer-generation supersede to succeed: %v", err)
+	}
+	if sv.Candidate("sha-a").State != StateEvicted {
+		t.Error("original candidate must be evicted after a valid newer-generation supersede")
+	}
+}
