@@ -104,6 +104,17 @@ var generatedMarkerRe = regexp.MustCompile(`(?i)code generated.*do not edit`)
 // varied to enumerate.
 var executableDeclRe = regexp.MustCompile(`^func\s+(?:\([^)]*\)\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*\(|^var\s+([A-Za-z_][A-Za-z0-9_]*)(?:\s+[^=]+?)?\s*=\s*func\s*\(`)
 
+// varBlockOpenRe matches the opening line of a grouped `var (` declaration
+// block, where individual specs inside don't repeat the `var` keyword and
+// may split a single spec's name/type/value across lines.
+var varBlockOpenRe = regexp.MustCompile(`^var\s*\(\s*$`)
+
+// groupedVarFuncRe matches one `name [type] = func(` spec once a grouped
+// var block's lines have been joined into a single string — scoped to
+// content already known to be inside a top-level `var ( ... )` block, so
+// it can't mistake a local `x := func(){}` test closure for one of these.
+var groupedVarFuncRe = regexp.MustCompile(`\b([A-Za-z_][A-Za-z0-9_]*)\s+(?:[^=]+?)?=\s*func\s*\(`)
+
 // testFuncPrefixRe matches Go's recognized test-harness function prefixes.
 var testFuncPrefixRe = regexp.MustCompile(`^(Test|Benchmark|Example|Fuzz)`)
 
@@ -168,13 +179,45 @@ func hasCodeSignature(added []string) bool {
 
 // hasSmuggledProductionCode reports whether a test-path file's added lines
 // declare a non-test-harness top-level executable declaration — a func, a
-// method, or a function-valued var — a signal that production logic is
-// being smuggled in under a test path. Function-valued vars (e.g. `var
-// grantAdmin = func() { ... }`) bypass a plain `^func ` check entirely, so
-// they're matched explicitly rather than left to fall through as data.
+// method, a function-valued var, or one inside a grouped `var ( ... )`
+// block (whose specs don't repeat `var` and may split across lines) — a
+// signal that production logic is being smuggled in under a test path.
 func hasSmuggledProductionCode(added []string) bool {
-	for _, line := range added {
-		m := executableDeclRe.FindStringSubmatch(strings.TrimSpace(line))
+	inVarBlock := false
+	var blockLines []string
+
+	flushBlock := func() bool {
+		defer func() { blockLines = nil }()
+		joined := strings.Join(blockLines, " ")
+		for _, m := range groupedVarFuncRe.FindAllStringSubmatch(joined, -1) {
+			if !testFuncPrefixRe.MatchString(m[1]) {
+				return true
+			}
+		}
+		return false
+	}
+
+	for _, raw := range added {
+		line := strings.TrimSpace(raw)
+
+		if inVarBlock {
+			if line == ")" {
+				inVarBlock = false
+				if flushBlock() {
+					return true
+				}
+				continue
+			}
+			blockLines = append(blockLines, line)
+			continue
+		}
+
+		if varBlockOpenRe.MatchString(line) {
+			inVarBlock = true
+			continue
+		}
+
+		m := executableDeclRe.FindStringSubmatch(line)
 		if m == nil {
 			continue
 		}
@@ -185,6 +228,13 @@ func hasSmuggledProductionCode(added []string) bool {
 		if !testFuncPrefixRe.MatchString(name) {
 			return true
 		}
+	}
+
+	// An unterminated block (its closing ")" fell outside this hunk) still
+	// has its partial content checked — a hunk boundary must not hide a
+	// violation.
+	if inVarBlock && flushBlock() {
+		return true
 	}
 	return false
 }
