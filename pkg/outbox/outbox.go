@@ -11,6 +11,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -21,9 +22,11 @@ const (
 	// StatusInFlight is a short-lived claim state: a Relay has taken this
 	// item and is calling its Handler. No other Relay may claim it while
 	// it's here (see Claim's CAS).
-	StatusInFlight Status = "in_flight"
-	StatusSent     Status = "sent"
-	StatusFailed   Status = "failed"
+	StatusInFlight     Status = "in_flight"
+	StatusSent         Status = "sent"
+	StatusFailed       Status = "failed"
+	StatusAcknowledged Status = "acknowledged"
+	StatusSuperseded   Status = "superseded"
 )
 
 var (
@@ -42,24 +45,29 @@ var (
 	// wasn't in the in_flight state they expect — e.g. two Relays raced
 	// and the other one already resolved it.
 	ErrNotInFlight = errors.New("outbox: item is not in_flight")
+	ErrNotSent     = errors.New("outbox: item is not sent")
 )
 
 // Item is one durable side-effect intent.
 type Item struct {
-	ID             int64      `json:"id"`
-	IdempotencyKey string     `json:"idempotency_key"`
-	TaskRef        string     `json:"task_ref"`
-	Kind           string     `json:"kind"`
-	Payload        string     `json:"payload,omitempty"`
-	Status         Status     `json:"status"`
-	Attempts       int        `json:"attempts"`
-	LastError      string     `json:"last_error,omitempty"`
+	ID             int64  `json:"id"`
+	IdempotencyKey string `json:"idempotency_key"`
+	TaskRef        string `json:"task_ref"`
+	Kind           string `json:"kind"`
+	Payload        string `json:"payload,omitempty"`
+	Status         Status `json:"status"`
+	Attempts       int    `json:"attempts"`
+	LastError      string `json:"last_error,omitempty"`
 	// NextAttemptAt gates retry: Pending never returns a pending item
 	// whose NextAttemptAt is in the future. Nil means immediately
 	// eligible (a fresh item's first attempt).
 	NextAttemptAt *time.Time `json:"next_attempt_at,omitempty"`
 	CreatedAt     time.Time  `json:"created_at"`
 	UpdatedAt     time.Time  `json:"updated_at"`
+	Owner         string     `json:"owner,omitempty"`
+	ClaimedAt     *time.Time `json:"claimed_at,omitempty"`
+	MessageID     string     `json:"message_id,omitempty"`
+	Sequence      int64      `json:"sequence,omitempty"`
 }
 
 // Store is the SQLite-backed outbox persistence.
@@ -111,10 +119,22 @@ func (s *Store) migrate() error {
 		last_error TEXT,
 		next_attempt_at DATETIME,
 		created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-		updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+		updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		owner TEXT,
+		claimed_at DATETIME,
+		message_id TEXT,
+		sequence INTEGER NOT NULL DEFAULT 0
 	)`)
 	if err != nil {
 		return fmt.Errorf("migrate outbox schema: %w", err)
+	}
+	for _, alter := range []string{`ALTER TABLE outbox_items ADD COLUMN owner TEXT`, `ALTER TABLE outbox_items ADD COLUMN claimed_at DATETIME`, `ALTER TABLE outbox_items ADD COLUMN message_id TEXT`, `ALTER TABLE outbox_items ADD COLUMN sequence INTEGER NOT NULL DEFAULT 0`} {
+		if _, alterErr := s.db.Exec(alter); alterErr != nil && !strings.Contains(strings.ToLower(alterErr.Error()), "duplicate column") {
+			return fmt.Errorf("migrate outbox delivery columns: %w", alterErr)
+		}
+	}
+	if _, err := s.db.Exec(`UPDATE outbox_items SET owner = 'legacy-unowned', claimed_at = CURRENT_TIMESTAMP WHERE status = ? AND claimed_at IS NULL`, StatusInFlight); err != nil {
+		return fmt.Errorf("migrate legacy claims: %w", err)
 	}
 	_, err = s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_outbox_items_status_kind ON outbox_items(status, kind)`)
 	if err != nil {
@@ -158,6 +178,11 @@ func (s *Store) Enqueue(item Item) (Item, error) {
 	return out, nil
 }
 
+// GetByKey returns the existing durable item without creating one. Terminal
+// acknowledgement paths use this lookup so a forged receipt cannot create a
+// phantom order that was never durably delivered.
+func (s *Store) GetByKey(key string) (*Item, error) { return getByKey(s.db, key) }
+
 func enqueue(e execer, item Item) (Item, error) {
 	if item.IdempotencyKey == "" {
 		return Item{}, fmt.Errorf("enqueue outbox item: idempotency_key is required (fail-closed)")
@@ -194,7 +219,7 @@ func enqueue(e execer, item Item) (Item, error) {
 
 func getByKey(e execer, key string) (*Item, error) {
 	row := e.QueryRow(
-		`SELECT id, idempotency_key, task_ref, kind, payload, status, attempts, last_error, next_attempt_at, created_at, updated_at
+		`SELECT id, idempotency_key, task_ref, kind, payload, status, attempts, last_error, next_attempt_at, created_at, updated_at, owner, claimed_at, message_id, sequence
 		 FROM outbox_items WHERE idempotency_key = ?`, key,
 	)
 	item, err := scanItem(row)
@@ -210,7 +235,7 @@ func getByKey(e execer, key string) (*Item, error) {
 // Get returns one item by ID.
 func (s *Store) Get(id int64) (*Item, error) {
 	row := s.db.QueryRow(
-		`SELECT id, idempotency_key, task_ref, kind, payload, status, attempts, last_error, next_attempt_at, created_at, updated_at
+		`SELECT id, idempotency_key, task_ref, kind, payload, status, attempts, last_error, next_attempt_at, created_at, updated_at, owner, claimed_at, message_id, sequence
 		 FROM outbox_items WHERE id = ?`, id,
 	)
 	return scanItem(row)
@@ -232,14 +257,14 @@ func (s *Store) Pending(kind string, limit int, now time.Time) ([]Item, error) {
 	var err error
 	if kind == "" {
 		rows, err = s.db.Query(
-			`SELECT id, idempotency_key, task_ref, kind, payload, status, attempts, last_error, next_attempt_at, created_at, updated_at
+			`SELECT id, idempotency_key, task_ref, kind, payload, status, attempts, last_error, next_attempt_at, created_at, updated_at, owner, claimed_at, message_id, sequence
 			 FROM outbox_items
 			 WHERE status = ? AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
 			 ORDER BY id ASC LIMIT ?`, StatusPending, now, limit,
 		)
 	} else {
 		rows, err = s.db.Query(
-			`SELECT id, idempotency_key, task_ref, kind, payload, status, attempts, last_error, next_attempt_at, created_at, updated_at
+			`SELECT id, idempotency_key, task_ref, kind, payload, status, attempts, last_error, next_attempt_at, created_at, updated_at, owner, claimed_at, message_id, sequence
 			 FROM outbox_items
 			 WHERE status = ? AND kind = ? AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
 			 ORDER BY id ASC LIMIT ?`, StatusPending, kind, now, limit,
@@ -267,9 +292,38 @@ func (s *Store) Pending(kind string, limit int, now time.Time) ([]Item, error) {
 // move on rather than also invoking the Handler.
 func (s *Store) Claim(id int64) (Item, error) {
 	now := time.Now().UTC()
+	res, err := s.db.Exec(`UPDATE outbox_items SET status = ?, updated_at = ? WHERE id = ? AND status = ?`, StatusInFlight, now, id, StatusPending)
+	if err != nil {
+		return Item{}, fmt.Errorf("claim outbox item: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n != 1 {
+		return Item{}, fmt.Errorf("%w: id=%d", ErrNotClaimable, id)
+	}
+	item, err := s.Get(id)
+	if err != nil {
+		return Item{}, err
+	}
+	if item == nil {
+		return Item{}, fmt.Errorf("claim outbox item: id=%d vanished after claim", id)
+	}
+	return *item, nil
+}
+
+// ClaimOwned takes a pending item, or atomically takes over an in-flight item
+// whose claim has expired. The owner and timestamp are changed in the same
+// CAS, so a live claimant cannot be reset by reconciliation.
+func (s *Store) ClaimOwned(id int64, owner string, staleAfter time.Duration, now time.Time) (Item, error) {
+	if owner == "" {
+		return Item{}, fmt.Errorf("claim outbox item: owner is required")
+	}
+	if staleAfter <= 0 {
+		return Item{}, fmt.Errorf("claim outbox item: positive staleAfter is required")
+	}
+	cutoff := now.UTC().Add(-staleAfter)
 	res, err := s.db.Exec(
-		`UPDATE outbox_items SET status = ?, updated_at = ? WHERE id = ? AND status = ?`,
-		StatusInFlight, now, id, StatusPending,
+		`UPDATE outbox_items SET status = ?, owner = ?, claimed_at = ?, updated_at = ?
+		 WHERE id = ? AND (status = ? OR (status = ? AND claimed_at IS NOT NULL AND claimed_at <= ?))`,
+		StatusInFlight, owner, now.UTC(), now.UTC(), id, StatusPending, StatusInFlight, cutoff,
 	)
 	if err != nil {
 		return Item{}, fmt.Errorf("claim outbox item: %w", err)
@@ -287,6 +341,23 @@ func (s *Store) Claim(id int64) (Item, error) {
 	return *item, nil
 }
 
+// RecordDelivery persists the authoritative stable mailbox identity while
+// the item is still owned and in flight. A restart can therefore resume with
+// the original sequence instead of inventing a zero or a new message.
+func (s *Store) RecordDelivery(id int64, owner, messageID string, sequence int64) error {
+	if owner == "" || messageID == "" || sequence <= 0 {
+		return fmt.Errorf("outbox: complete delivery identity is required")
+	}
+	res, err := s.db.Exec(`UPDATE outbox_items SET message_id = ?, sequence = ?, updated_at = ? WHERE id = ? AND status = ? AND owner = ?`, messageID, sequence, time.Now().UTC(), id, StatusInFlight, owner)
+	if err != nil {
+		return fmt.Errorf("record delivery: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n != 1 {
+		return fmt.Errorf("%w: id=%d owner=%s", ErrNotInFlight, id, owner)
+	}
+	return nil
+}
+
 // MarkSent marks a claimed (in_flight) item delivered. The UPDATE is
 // conditioned on status='in_flight': if another Relay already resolved
 // this item (shouldn't happen since Claim is exclusive, but this is the
@@ -302,6 +373,43 @@ func (s *Store) MarkSent(id int64) error {
 	}
 	if n, _ := res.RowsAffected(); n != 1 {
 		return fmt.Errorf("%w: id=%d", ErrNotInFlight, id)
+	}
+	return nil
+}
+
+func (s *Store) MarkSentOwned(id int64, owner string) error {
+	res, err := s.db.Exec(`UPDATE outbox_items SET status = ?, updated_at = ? WHERE id = ? AND status = ? AND owner = ?`, StatusSent, time.Now().UTC(), id, StatusInFlight, owner)
+	if err != nil {
+		return fmt.Errorf("mark sent: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n != 1 {
+		return fmt.Errorf("%w: id=%d owner=%s", ErrNotInFlight, id, owner)
+	}
+	return nil
+}
+
+// MarkAcknowledged and MarkSuperseded are terminal protocol evidence.  They
+// are deliberately separate from StatusSent: a Herdr prompt is only a wake
+// hint, while the recipient's acknowledgement (or an explicit supersession)
+// is what permits a coordinator to finalize an order.
+func (s *Store) MarkAcknowledged(id int64) error {
+	return s.markTerminal(id, StatusAcknowledged)
+}
+
+func (s *Store) MarkSuperseded(id int64) error {
+	return s.markTerminal(id, StatusSuperseded)
+}
+
+func (s *Store) markTerminal(id int64, status Status) error {
+	res, err := s.db.Exec(
+		`UPDATE outbox_items SET status = ?, updated_at = ? WHERE id = ? AND status = ?`,
+		status, time.Now().UTC(), id, StatusSent,
+	)
+	if err != nil {
+		return fmt.Errorf("mark %s: %w", status, err)
+	}
+	if n, _ := res.RowsAffected(); n != 1 {
+		return fmt.Errorf("%w: id=%d", ErrNotSent, id)
 	}
 	return nil
 }
@@ -378,17 +486,24 @@ type rowScanner interface {
 
 func scanItem(row rowScanner) (*Item, error) {
 	var item Item
-	var payload, lastError sql.NullString
+	var payload, lastError, owner, messageID sql.NullString
 	var nextAttemptAt sql.NullTime
+	var claimedAt sql.NullTime
 	err := row.Scan(
 		&item.ID, &item.IdempotencyKey, &item.TaskRef, &item.Kind, &payload,
-		&item.Status, &item.Attempts, &lastError, &nextAttemptAt, &item.CreatedAt, &item.UpdatedAt,
+		&item.Status, &item.Attempts, &lastError, &nextAttemptAt, &item.CreatedAt, &item.UpdatedAt, &owner, &claimedAt, &messageID, &item.Sequence,
 	)
 	if err != nil {
 		return nil, err
 	}
 	item.Payload = payload.String
 	item.LastError = lastError.String
+	item.Owner = owner.String
+	item.MessageID = messageID.String
+	if claimedAt.Valid {
+		t := claimedAt.Time
+		item.ClaimedAt = &t
+	}
 	if nextAttemptAt.Valid {
 		t := nextAttemptAt.Time
 		item.NextAttemptAt = &t
