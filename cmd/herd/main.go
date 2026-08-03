@@ -620,7 +620,7 @@ func runPulse() {
 
 		tabLabel, err := herdr.ResolveAgentTabWithDecision(standingName, taskLaunchRequest(decision, task.Ref))
 		if err != nil {
-			if !errors.Is(err, herdr.ErrAgentNotFound) {
+			if !shouldCreateEphemeralTaskAgent(err) {
 				fmt.Fprintf(os.Stderr, "standing agent %s blocked: %v\n", standingName, err)
 				os.Exit(1)
 			}
@@ -1259,7 +1259,7 @@ func runReview() {
 
 		tabLabel, err := herdr.ResolveAgentTabWithDecision(standingName, taskLaunchRequest(decision, task.Ref))
 		if err != nil {
-			if !errors.Is(err, herdr.ErrAgentNotFound) {
+			if !shouldCreateEphemeralTaskAgent(err) {
 				fmt.Fprintf(os.Stderr, "standing reviewer %s blocked: %v\n", standingName, err)
 				os.Exit(1)
 			}
@@ -2441,7 +2441,7 @@ func runForgeE() error {
 				standingName := fmt.Sprintf("forge-%s", lane.Name)
 				tabLabel, resolveErr := herdr.ResolveAgentTabWithDecision(standingName, taskLaunchRequest(decision, task.Ref))
 				if resolveErr != nil {
-					if !errors.Is(resolveErr, herdr.ErrAgentNotFound) {
+					if !shouldCreateEphemeralTaskAgent(resolveErr) {
 						return fmt.Errorf("standing forge agent %s blocked: %w", standingName, resolveErr)
 					}
 					tabLabel = fmt.Sprintf("forge-%s-%s", lane.Name, task.Ref)
@@ -2639,6 +2639,10 @@ func taskLaunchRequest(decision *router.LaunchDecision, taskRef string) launch.R
 		return launch.Request{TaskRef: taskRef}
 	}
 	return launch.Request{Decision: decision, TaskRef: taskRef, LeaseGeneration: decision.LeaseGeneration}
+}
+
+func shouldCreateEphemeralTaskAgent(err error) bool {
+	return errors.Is(err, herdr.ErrAgentNotFound) || errors.Is(err, herdr.ErrAgentIdentityMismatch)
 }
 
 // launchAdmission is the compiled pre-side-effect gate shared by launch-capable

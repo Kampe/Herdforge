@@ -164,6 +164,53 @@ func TestResumeUsesDurableClientIdentityNotHerdrMetadata(t *testing.T) {
 	}
 }
 
+func TestStandingReceiptCannotAuthorizeClaimedTaskAssignment(t *testing.T) {
+	receiptPath := t.TempDir() + "/receipts.jsonl"
+	t.Setenv("HERD_LAUNCH_RECEIPTS", receiptPath)
+	standing, err := router.NewRouter(nil, nil).Decide(router.LaunchRequest{
+		Role: router.RoleWorker, Shape: launch.Implementation,
+		RequestedProvider: launch.WorkerProvider, RequestedModel: launch.WorkerModel,
+		RequestedEffort: launch.WorkerEffort, TaskRef: "worker",
+		ProbeResults: map[string]bool{router.ProbeKey(launch.WorkerProvider, launch.WorkerModel): true},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := launch.RecordStarted(launch.Request{Decision: standing, TaskRef: "worker", Name: "forge-worker", PaneID: "pane-1", LeaseGeneration: 0}, nil); err != nil {
+		t.Fatal(err)
+	}
+	old := runHerdr
+	defer func() { runHerdr = old }()
+	var calls [][]string
+	runHerdr = func(args ...string) (string, error) {
+		calls = append(calls, append([]string(nil), args...))
+		return `{"result":{"agents":[{"name":"forge-worker","pane_id":"pane-1","tab_id":"tab-1"}]}}`, nil
+	}
+	for _, tc := range []struct {
+		name string
+		ref  string
+		gen  int64
+	}{
+		{name: "FAC-A", ref: "FAC-A", gen: 7},
+		{name: "FAC-B", ref: "FAC-B", gen: 8},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			decision, err := router.RebindDecision(standing, tc.ref, tc.gen)
+			if err != nil {
+				t.Fatal(err)
+			}
+			before := len(calls)
+			_, err = ResolveAgentTabWithDecision("forge-worker", launch.Request{Decision: decision, TaskRef: tc.ref, LeaseGeneration: tc.gen})
+			if !errors.Is(err, ErrAgentIdentityMismatch) {
+				t.Fatalf("lane receipt must not authorize %s/g%d: %v", tc.ref, tc.gen, err)
+			}
+			if len(calls) != before+1 || calls[before][0] != "agent" || calls[before][1] != "list" {
+				t.Fatalf("assignment rejection must inspect only the live agent: %v", calls[before:])
+			}
+		})
+	}
+}
+
 func TestResumeRejectsStoredCoordinatorTierDecisionWithoutPrompt(t *testing.T) {
 	receiptPath := t.TempDir() + "/receipts.jsonl"
 	t.Setenv("HERD_LAUNCH_RECEIPTS", receiptPath)
