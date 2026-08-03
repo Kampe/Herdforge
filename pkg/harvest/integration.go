@@ -1,9 +1,9 @@
 package harvest
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -28,8 +28,8 @@ import (
 //     Prose, author-family self-verdicts, stale SHAs, and missing
 //     structured receipts never admit. The commit message is NOT parsed.
 //  3. Merge gate — acquire lock.DirLock (PID-liveness, not timer-only),
-//     checkout main, fetch origin/main, ff-only merge, cherry-pick, test
-//     gate, push with race retry.
+//     checkout main, fetch origin/main, fail-closed serialized Replay,
+//     test gate, push after complete ordered batch.
 //  4. Post-merge — proof-readback via sync.MergeEvidence, board-complete
 //     via Dispatcher, ledger.Consumed (exactly-once admission spent).
 //  5. Cleanup — remove fully-merged worktrees with dirty/unique-work
@@ -47,6 +47,7 @@ type Integration struct {
 	MaxMergeAge     time.Duration
 	DryRun          bool
 	DiskAdmission   resources.DiskAdmission
+	readback        func(context.Context, string, string, string) (string, error)
 }
 
 // AdmissionContext is the caller-asserted merge context bound into
@@ -167,6 +168,7 @@ type IntegrationResult struct {
 // Eligible is the sole merge-authority signal.
 type ReviewGateOutcome struct {
 	SHA      string `json:"sha"`
+	Task     string `json:"task,omitempty"`
 	Branch   string `json:"branch"`
 	Worktree string `json:"worktree"`
 	Eligible bool   `json:"eligible"`
@@ -240,58 +242,66 @@ func (in *Integration) Run(ctx context.Context) (*IntegrationResult, error) {
 		totalByWorktree[uw.WorktreePath] = len(uw.Unmerged)
 	}
 
-	// Phase 3+4: Merge gate + post-merge
-	for _, rg := range res.ReviewGatedSHAs {
-		if !rg.Eligible {
+	// Phase 3+4: one serialized replay/verification/publish transaction per
+	// worktree. A worktree is never split into singleton publications.
+	groups := make([][]ReviewGateOutcome, 0, len(hr.UnmergedWorktrees))
+	for _, uw := range hr.UnmergedWorktrees {
+		group := make([]ReviewGateOutcome, 0, len(uw.Unmerged))
+		for _, rg := range res.ReviewGatedSHAs {
+			if rg.Worktree == uw.WorktreePath {
+				group = append(group, rg)
+			}
+		}
+		if len(group) > 0 {
+			groups = append(groups, group)
+		}
+	}
+	for _, group := range groups {
+		if len(group) == 0 || !allEligible(group) || in.DryRun {
 			continue
 		}
-		if in.DryRun {
-			continue
-		}
-		mo, err := in.runMergeGate(ctx, rg)
+		mos, err := in.runMergeBatch(ctx, group)
 		if err != nil {
-			res.Errors = append(res.Errors, fmt.Sprintf("merge %s: %v", rg.SHA, err))
+			res.Errors = append(res.Errors, fmt.Sprintf("merge batch %s: %v", group[0].Task, err))
 			continue
 		}
-		res.MergedSHAs = append(res.MergedSHAs, *mo)
-
-		if mo.AlreadyMerged {
-			mergedByWorktree[rg.Worktree]++
+		res.MergedSHAs = append(res.MergedSHAs, mos...)
+		ref := hsync.NormalizeRef(branchToRef(group[0].Branch))
+		finalHead := mos[len(mos)-1].MergeSHA
+		batchOK := true
+		for i, mo := range mos {
+			proof, proofErr := in.mergeReadback(ctx, ref, mo.MergeSHA)
+			if proofErr != nil || proof == "" {
+				batchOK = false
+				res.Errors = append(res.Errors, fmt.Sprintf("merge evidence %s order=%d: %v", ref, i, proofErr))
+			}
+		}
+		if err := ensureRemoteReplayHead(ctx, in.RepoRoot, finalHead); err != nil {
+			batchOK = false
+			res.Errors = append(res.Errors, err.Error())
+		}
+		if !batchOK {
 			continue
 		}
-
-		if mo.Pushed && mo.MergeSHA != "" {
-			ref := hsync.NormalizeRef(branchToRef(rg.Branch))
-
-			// Phase 4b: Proof readback via MergeEvidence
-			proof, err := hsync.MergeEvidence(in.RepoRoot, ref, mo.MergeSHA)
-			if err != nil {
-				res.Errors = append(res.Errors, fmt.Sprintf("merge evidence %s: %v", ref, err))
-				continue
-			}
-			if proof == "" {
-				res.Errors = append(res.Errors, fmt.Sprintf("no merge evidence for %s", ref))
-				continue
-			}
-
-			// Phase 4c: Board-complete
-			if in.Dispatcher != nil {
-				if err := in.Dispatcher.BoardComplete(ctx, ref, mo.MergeSHA); err != nil {
-					res.Errors = append(res.Errors, fmt.Sprintf("board-complete %s: %v", ref, err))
-					continue
-				}
-				res.BoardCompletedRefs = append(res.BoardCompletedRefs, ref)
-			}
-
-			// Phase 4d: Ledger consumed
-			if in.Ledger != nil {
-				if err := in.Ledger.Consumed(rg.SHA, mo.MergeSHA); err != nil {
-					res.Errors = append(res.Errors, fmt.Sprintf("ledger consumed %s: %v", rg.SHA, err))
+		if in.Ledger != nil {
+			for i, mo := range mos {
+				if ledgerErr := in.Ledger.Consumed(group[i].SHA, mo.MergeSHA); ledgerErr != nil {
+					batchOK = false
+					res.Errors = append(res.Errors, fmt.Sprintf("ledger consumed %s: %v", group[i].SHA, ledgerErr))
 				}
 			}
-
-			mergedByWorktree[rg.Worktree]++
 		}
+		if !batchOK {
+			continue
+		}
+		if in.Dispatcher != nil {
+			if boardErr := in.Dispatcher.BoardComplete(ctx, ref, finalHead); boardErr != nil {
+				res.Errors = append(res.Errors, fmt.Sprintf("board-complete %s: %v", ref, boardErr))
+				continue
+			}
+			res.BoardCompletedRefs = append(res.BoardCompletedRefs, ref)
+		}
+		mergedByWorktree[group[0].Worktree] = len(group)
 	}
 
 	// Phase 5: Cleanup — only for worktrees where ALL SHAs were merged.
@@ -345,6 +355,7 @@ func (in *Integration) runReviewGate(ctx context.Context, sha string, uw Unmerge
 		outcome.Reason = "admission context resolution failed"
 		return outcome
 	}
+	outcome.Task = adm.Task
 
 	result, err := in.Ledger.Admit(reviewledger.AdmissionOpts{
 		CandidateSHA:   sha,
@@ -391,86 +402,106 @@ func ensureCandidateOnBranch(ctx context.Context, worktreePath, sha string) erro
 }
 
 func (in *Integration) runMergeGate(ctx context.Context, rg ReviewGateOutcome) (*MergeOutcome, error) {
-	mo := &MergeOutcome{
-		SHA:    rg.SHA,
-		Branch: rg.Branch,
+	// Singleton path delegates to the compiled Replay authority via runMergeBatch.
+	// Replay is invoked there so ordered batch and singleton share one publish gate.
+	mos, err := in.runMergeBatch(ctx, []ReviewGateOutcome{rg})
+	if err != nil {
+		return nil, err
 	}
+	if len(mos) != 1 {
+		return nil, fmt.Errorf("singleton merge gate received batch cardinality %d", len(mos))
+	}
+	return &mos[0], nil
+}
 
-	if in.DryRun {
-		mo.CherryPicked = true
-		return mo, nil
+func allEligible(group []ReviewGateOutcome) bool {
+	for _, rg := range group {
+		if !rg.Eligible || rg.Task == "" {
+			return false
+		}
 	}
-	if err := in.admitMergeDisk(rg.Worktree); err != nil {
+	return true
+}
+
+func (in *Integration) mergeReadback(ctx context.Context, ref, sha string) (string, error) {
+	if in.readback != nil {
+		return in.readback(ctx, in.RepoRoot, ref, sha)
+	}
+	return hsync.MergeEvidence(in.RepoRoot, ref, sha)
+}
+
+func (in *Integration) runMergeBatch(ctx context.Context, group []ReviewGateOutcome) ([]MergeOutcome, error) {
+	if len(group) == 0 || in.DryRun {
+		return nil, nil
+	}
+	if err := in.admitMergeDisk(group[0].Worktree); err != nil {
 		return nil, err
 	}
 
 	dl := lock.NewDirLock(in.LockDir)
-	if err := dl.Acquire(ctx, in.MaxMergeAge, fmt.Sprintf("merge %s/%s", rg.Branch, rg.SHA)); err != nil {
+	if err := dl.Acquire(ctx, in.MaxMergeAge, fmt.Sprintf("merge batch %s/%s", group[0].Branch, group[0].SHA)); err != nil {
 		return nil, fmt.Errorf("lock acquire: %w", err)
 	}
 	defer dl.Release()
 
 	if err := in.prepareMain(ctx); err != nil {
-		return nil, fmt.Errorf("prepare main: %w", err)
+		return nil, fmt.Errorf("prepare current main: %w", err)
 	}
-
-	const maxAttempts = 3
-	for attempt := 0; attempt < maxAttempts; attempt++ {
-		mergeSHA, conflict, err := in.cherryPick(ctx, rg.SHA)
-		if err != nil {
-			if conflict {
-				mo.Conflict = true
-				return nil, fmt.Errorf("cherry-pick conflict for %s: %w", rg.SHA, err)
-			}
-			return nil, fmt.Errorf("cherry-pick attempt %d: %w", attempt+1, err)
+	expected, err := gitOutput(ctx, in.RepoRoot, "rev-parse", "HEAD")
+	if err != nil {
+		return nil, err
+	}
+	repoID, err := canonicalRepoIdentity(ctx, in.RepoRoot)
+	if err != nil {
+		return nil, fmt.Errorf("resolve portable repository identity: %w", err)
+	}
+	task := group[0].Task
+	sources := make([]string, len(group))
+	for i, rg := range group {
+		if rg.Task != task {
+			return nil, errors.New("replay batch mixes task identities")
 		}
-
-		// Empty cherry-pick means the patch is already applied.
-		if mergeSHA == "" {
-			mo.CherryPicked = true
-			mo.AlreadyMerged = true
-			head, _ := gitOutput(ctx, in.RepoRoot, "rev-parse", "origin/main")
-			mo.MergeSHA = strings.TrimSpace(head)
-			return mo, nil
+		sources[i] = rg.SHA
+	}
+	replayReq := ReplayRequest{RepoRoot: in.RepoRoot, TaskID: task, RepoID: repoID, ExpectedHead: strings.TrimSpace(expected), Generation: "integration/" + task + "/" + group[0].SHA, SourceCommits: sources}
+	replay, err := Replay(ctx, replayReq)
+	if err != nil {
+		return nil, err
+	}
+	if replay == nil || !replay.Completed || len(replay.Items) != len(group) {
+		return nil, fmt.Errorf("replay did not complete the ordered batch")
+	}
+	mos := make([]MergeOutcome, len(group))
+	for i, item := range replay.Items {
+		if item.Source != group[i].SHA || item.Classification == ReplayUnresolved || item.DestinationHead == "" || item.Matched == "" {
+			return nil, fmt.Errorf("replay mapping incomplete at order %d", i)
 		}
-
-		mo.MergeSHA = mergeSHA
-
-		// Test gate after cherry-pick, before push.
-		if in.Verifier != nil {
-			vr, vErr := in.Verifier.Execute(ctx, in.RepoRoot)
-			if vErr != nil {
-				_ = runGit(ctx, in.RepoRoot, "reset", "--hard", "origin/main")
-				return nil, fmt.Errorf("verifier error: %w", vErr)
-			}
-			if vr != nil && !vr.Passed {
-				_ = runGit(ctx, in.RepoRoot, "reset", "--hard", "origin/main")
-				return nil, fmt.Errorf("verifier failed: %s", vr.Output)
-			}
+		mos[i] = MergeOutcome{SHA: group[i].SHA, Branch: group[i].Branch, CherryPicked: item.Classification == ReplayAppliedExact, AlreadyMerged: item.Classification != ReplayAppliedExact, MergeSHA: item.DestinationHead}
+	}
+	if err := ensureReplayHead(ctx, in.RepoRoot, replay.FinalHead); err != nil {
+		return nil, err
+	}
+	if in.Verifier != nil {
+		vr, vErr := in.Verifier.Execute(ctx, in.RepoRoot)
+		if vErr != nil {
+			blocked := RecordReplayBlocked(ctx, replayReq, "verifier error: "+vErr.Error())
+			return nil, errors.Join(fmt.Errorf("verifier error: %w", vErr), blocked)
 		}
-
-		// Push
-		if pushErr := runGit(ctx, in.RepoRoot, "push", "origin", "main"); pushErr == nil {
-			mo.CherryPicked = true
-			mo.Pushed = true
-			return mo, nil
-		}
-
-		// Push failed — fetch and check if our commit made it upstream.
-		_ = runGit(ctx, in.RepoRoot, "fetch", "-q", "origin", "main")
-		if err := runGit(ctx, in.RepoRoot, "merge-base", "--is-ancestor", mergeSHA, "origin/main"); err == nil {
-			mo.CherryPicked = true
-			mo.AlreadyMerged = true
-			return mo, nil
-		}
-
-		// Someone else pushed. Reset to origin/main and retry.
-		if err := runGit(ctx, in.RepoRoot, "reset", "--hard", "origin/main"); err != nil {
-			return nil, fmt.Errorf("reset after push race: %w", err)
+		if vr != nil && !vr.Passed {
+			blocked := RecordReplayBlocked(ctx, replayReq, "verifier failed: "+vr.Output)
+			return nil, errors.Join(fmt.Errorf("verifier failed: %s", vr.Output), blocked)
 		}
 	}
-
-	return nil, fmt.Errorf("push failed after %d attempts for %s", maxAttempts, rg.SHA)
+	if err := ensureReplayHead(ctx, in.RepoRoot, replay.FinalHead); err != nil {
+		return nil, err
+	}
+	if err := runGit(ctx, in.RepoRoot, "push", "origin", "main"); err != nil {
+		return nil, fmt.Errorf("push after complete replay batch: %w", err)
+	}
+	for i := range mos {
+		mos[i].Pushed = true
+	}
+	return mos, nil
 }
 
 func (in *Integration) admitMergeDisk(worktreePath string) error {
@@ -516,47 +547,53 @@ func (in *Integration) prepareMain(ctx context.Context) error {
 		return fmt.Errorf("rev-parse HEAD: %w", err)
 	}
 	if strings.TrimSpace(current) != "main" {
-		if err := runGit(ctx, in.RepoRoot, "checkout", "main"); err != nil {
-			return fmt.Errorf("checkout main: %w", err)
-		}
+		// Fail closed for the serialized replay authority: never silently
+		// switch checkouts under a completed mapping. Operators must land
+		// on main before publishing a batch.
+		return fmt.Errorf("integration checkout is %q, want main", strings.TrimSpace(current))
 	}
 	if err := runGit(ctx, in.RepoRoot, "fetch", "-q", "origin", "main"); err != nil {
 		return fmt.Errorf("fetch: %w", err)
 	}
-	if err := runGit(ctx, in.RepoRoot, "merge", "--ff-only", "origin/main"); err != nil {
-		return fmt.Errorf("ff-only merge: %w", err)
+	local, err := gitOutput(ctx, in.RepoRoot, "rev-parse", "HEAD")
+	if err != nil {
+		return err
+	}
+	remote, err := gitOutput(ctx, in.RepoRoot, "rev-parse", "origin/main")
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(local) != strings.TrimSpace(remote) {
+		if err := runGit(ctx, in.RepoRoot, "merge", "--ff-only", "origin/main"); err != nil {
+			return fmt.Errorf("stale destination head cannot be fast-forwarded safely: local=%s origin/main=%s: %w", strings.TrimSpace(local), strings.TrimSpace(remote), err)
+		}
 	}
 	return nil
 }
 
-func (in *Integration) cherryPick(ctx context.Context, sha string) (mergeSHA string, conflict bool, err error) {
-	var stderr bytes.Buffer
-	cmd := execCommandContext(ctx, "git", "cherry-pick", sha)
-	cmd.Dir = in.RepoRoot
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		stderrStr := stderr.String()
-		if strings.Contains(stderrStr, "nothing to commit") || strings.Contains(stderrStr, "empty") {
-			_ = runGit(ctx, in.RepoRoot, "cherry-pick", "--abort")
-			return "", false, nil
-		}
-		if hasUnmergedPaths(ctx, in.RepoRoot) {
-			_ = runGit(ctx, in.RepoRoot, "cherry-pick", "--abort")
-			return "", true, fmt.Errorf("conflict: %s", stderrStr)
-		}
-		return "", false, fmt.Errorf("cherry-pick: %w\n%s", err, stderrStr)
-	}
-
-	if hasUnmergedPaths(ctx, in.RepoRoot) {
-		_ = runGit(ctx, in.RepoRoot, "cherry-pick", "--abort")
-		return "", true, fmt.Errorf("unmerged paths after cherry-pick")
-	}
-
-	head, err := gitOutput(ctx, in.RepoRoot, "rev-parse", "HEAD")
+func ensureReplayHead(ctx context.Context, repo, want string) error {
+	head, err := gitOutput(ctx, repo, "rev-parse", "HEAD")
 	if err != nil {
-		return "", false, fmt.Errorf("rev-parse HEAD: %w", err)
+		return err
 	}
-	return strings.TrimSpace(head), false, nil
+	if strings.TrimSpace(head) != strings.TrimSpace(want) {
+		return fmt.Errorf("destination head changed after complete replay: got=%s want=%s", strings.TrimSpace(head), strings.TrimSpace(want))
+	}
+	return nil
+}
+
+func ensureRemoteReplayHead(ctx context.Context, repo, want string) error {
+	if err := runGit(ctx, repo, "fetch", "-q", "origin", "main"); err != nil {
+		return fmt.Errorf("remote readback fetch: %w", err)
+	}
+	head, err := gitOutput(ctx, repo, "rev-parse", "origin/main")
+	if err != nil {
+		return fmt.Errorf("remote readback head: %w", err)
+	}
+	if strings.TrimSpace(head) != strings.TrimSpace(want) {
+		return fmt.Errorf("remote readback head mismatch: got=%s want=%s", strings.TrimSpace(head), strings.TrimSpace(want))
+	}
+	return nil
 }
 
 func (in *Integration) runCleanup(ctx context.Context, uw UnmergedWork) (bool, error) {
@@ -618,17 +655,6 @@ func gitOutput(ctx context.Context, dir string, args ...string) (string, error) 
 		return "", fmt.Errorf("git %v: %w", args, err)
 	}
 	return string(out), nil
-}
-
-// hasUnmergedPaths returns true when the working tree has files with
-// unresolved merge conflicts. Uses git diff --diff-filter=U which lists
-// unmerged paths only — NOT git diff --check (which catches whitespace
-// errors, not conflict markers).
-func hasUnmergedPaths(ctx context.Context, dir string) bool {
-	cmd := execCommandContext(ctx, "git", "diff", "--name-only", "--diff-filter=U")
-	cmd.Dir = dir
-	out, _ := cmd.Output()
-	return strings.TrimSpace(string(out)) != ""
 }
 
 // branchToRef attempts to extract a ticket ref from a branch name.
