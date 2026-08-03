@@ -105,10 +105,17 @@ func (e *Engine) ForgeLoop(ctx context.Context, d ForgeDriver, opts ForgeLoopOpt
 				d.Log("forge: " + e.ProviderStatus() + " — skip dispatch")
 				break
 			}
-			// Fresh disk probe each tick: refuses under pressure and also
-			// drives BLOCKED → recovering → ok as headroom returns (FAC-153).
-			if err := preflight.CheckDiskPressure("dispatch", e.diskPaths()...); err != nil {
+			// Fresh graduated disk probe each tick (FAC-153): refuse under
+			// hard pressure (also drives BLOCKED → recovering → ok as
+			// headroom returns); in the soft band, serialize — dispatch only
+			// when no lane is busy, so fan-out degrades before work stops.
+			adv := preflight.AdviseDiskPressure("dispatch", e.diskPaths()...)
+			if adv.Verdict == preflight.AdviceRefuse {
 				d.Log("forge: " + e.DiskStatus() + " — skip dispatch (disk pressure)")
+				break
+			}
+			if adv.Verdict == preflight.AdviceSerialize && lanes.Busy > 0 {
+				d.Log(fmt.Sprintf("forge: disk soft pressure — serializing dispatch (%d lane(s) busy)", lanes.Busy))
 				break
 			}
 			d.Log("forge: dispatch " + action.Ref)

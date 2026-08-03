@@ -78,3 +78,54 @@ func TestForgeLoop_NoDispatchUnderDiskPressure(t *testing.T) {
 		t.Fatalf("skip was not surfaced as BLOCKED(disk_pressure): %v", logs)
 	}
 }
+
+func TestForgeLoop_SerializesDispatchUnderSoftPressure(t *testing.T) {
+	// Reserve floors stay zeroed (TestMain) so the hard gate passes on any
+	// host; a saturated soft floor puts every real volume in the soft band.
+	t.Setenv(preflight.EnvDiskSerializeFreeGB, "1099511627776")
+
+	tp := &timeoutProvider{failAfter: 1 << 30, tasks: []*provider.Task{
+		{ID: "1", Ref: "FAC-1", Status: "to-do", Priority: provider.PriorityUrgent},
+	}}
+	e := NewEngine(&config.Config{TaskProvider: config.TaskProvider{ProjectID: "p1"}}, tp, nil, nil, nil, nil)
+
+	// Busy lanes: serialized fan-out must NOT dispatch more work.
+	logs := []string{}
+	busy := &recordingDriver{
+		fakeDriver: fakeDriver{lanes: LaneState{Busy: 2, Max: 4}, completed: map[string]bool{}, verified: map[string]bool{}},
+		logs:       &logs,
+	}
+	_ = e.ForgeLoop(context.Background(), busy, ForgeLoopOptions{Interval: time.Millisecond, MaxTicks: 2})
+	for _, a := range busy.actions {
+		if strings.HasPrefix(a, "dispatch:") {
+			t.Fatalf("dispatched with busy lanes under soft pressure: %v", busy.actions)
+		}
+	}
+	serialized := false
+	for _, l := range logs {
+		if strings.Contains(l, "serializing dispatch") {
+			serialized = true
+		}
+	}
+	if !serialized {
+		t.Fatalf("serialization not surfaced: %v", logs)
+	}
+
+	// Idle lanes: serialized fan-out still allows exactly the next dispatch —
+	// soft pressure degrades parallelism, it does not stop work.
+	logs2 := []string{}
+	idle := &recordingDriver{
+		fakeDriver: fakeDriver{lanes: LaneState{Busy: 0, Max: 4}, completed: map[string]bool{}, verified: map[string]bool{}},
+		logs:       &logs2,
+	}
+	_ = e.ForgeLoop(context.Background(), idle, ForgeLoopOptions{Interval: time.Millisecond, MaxTicks: 1})
+	dispatched := false
+	for _, a := range idle.actions {
+		if strings.HasPrefix(a, "dispatch:") {
+			dispatched = true
+		}
+	}
+	if !dispatched {
+		t.Fatalf("soft pressure stopped work entirely (actions=%v logs=%v)", idle.actions, logs2)
+	}
+}
