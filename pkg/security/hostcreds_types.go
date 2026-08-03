@@ -9,29 +9,20 @@ import (
 
 // FAC-170: Broker HostCreds for non-interactive sandboxed harness author sessions.
 //
-// Guardrails (root early):
-//   - Upstream secrets live ONLY in the coordinator/broker process (out-of-band store).
-//   - Workers NEVER receive model secrets, proxy bearer tokens, control tokens, or
-//     same-UID-readable proxy configs that act as delegated credentials.
-//   - The broker is a session-bound request ORACLE (signing authority): worker
-//     submits host+method+path intent over a least-authority channel (Unix socket
-//     and/or pre-opened FD). Broker attaches Authorization and forwards.
-//   - Allowlists: host + method + path (+ action). Deny-by-default.
-//   - Expiry + revocation are mandatory; expired/revoked sessions fail closed.
-//   - Direct provider network from the worker is out of policy (broker is the only path).
-//   - Dummy CLI bootstrap keys (for tools that refuse to start without an env key)
-//     are public sentinels and MUST NEVER be accepted as upstream Authorization.
-//   - No OpenCode/Ollama-local kinds. No interactive browser/login UI.
-//   - Abuse: broker must refuse arbitrary provider requests and must not exfiltrate
-//     auth via redirects, DNS rebinding, CONNECT tunnels, logs, or error bodies.
+// Rejected designs (do not reintroduce):
+//   - CoordinatorHostCredsFromEnv / HERD_HOST_CREDS as production authority
+//     (same-UID workers can read parent env/proc; scrub is not a kernel boundary)
+//   - Public Get/Snapshot returning Authorization material (exfiltration APIs)
+//   - MemorySecretStore as production durability (tests-only vault only)
+//   - Global multi-provider host allowlists (per-kind exact host+method+path+action)
+//   - Free-form BlockedError.Detail (stable codes only)
 
-// ErrHostCredsBlocked is the typed fail-closed signal for missing, revoked,
-// unbrokerable, or platform-unsupported HostCreds paths.
+// ErrHostCredsBlocked is the typed fail-closed signal.
 var ErrHostCredsBlocked = errors.New("FAC-170 BLOCKED: HostCreds")
 
-// DummyNeverUpstream is the public CLI bootstrap sentinel.
-// Harness CLIs that refuse to start without an API key env var may be given this
-// value. It is NOT a secret. The oracle MUST strip it and NEVER send it upstream.
+// DummyNeverUpstream is the public CLI bootstrap sentinel (NOT a secret).
+// CLIs that refuse to start without an API key may receive this value.
+// The oracle MUST strip it and NEVER send it upstream.
 const DummyNeverUpstream = "herd-dummy-never-upstream-fac170"
 
 // DummyNeverUpstreamAuth is the Authorization form of the sentinel.
@@ -57,16 +48,22 @@ const (
 	BlockWorkerAuthInject  HostCredsBlockReason = "worker_auth_injection_denied"
 	BlockAbuse             HostCredsBlockReason = "oracle_abuse_denied"
 	BlockDirectNetwork     HostCredsBlockReason = "direct_provider_network_denied"
+	BlockBadHost           HostCredsBlockReason = "host_invalid"
+	BlockBadAuthMaterial   HostCredsBlockReason = "auth_material_invalid"
+	BlockEnvNotAuthority   HostCredsBlockReason = "env_not_production_authority"
+	BlockHandleUnresolved  HostCredsBlockReason = "secret_handle_unresolved"
+	BlockNotDurable        HostCredsBlockReason = "authority_not_durable"
 )
 
-// BlockedError is a typed BLOCKED outcome (fail-closed, non-secret).
+// BlockedError is fail-closed and non-secret. No free-form Detail field.
+// Code is a stable machine subcode (e.g. "host:api.x.ai"); never raw secrets.
 type BlockedError struct {
-	Reason        HostCredsBlockReason
-	Kind          string
-	SessionID     string
-	HostsRequired []string
-	HostsCreds    []string // hosts only — never values
-	Detail        string   // redacted free-text
+	Reason        HostCredsBlockReason `json:"reason"`
+	Code          string               `json:"code,omitempty"`
+	Kind          string               `json:"kind,omitempty"`
+	SessionID     string               `json:"session_id,omitempty"`
+	HostsRequired []string             `json:"hosts_required,omitempty"`
+	HostsPresent  []string             `json:"hosts_present,omitempty"` // names only
 }
 
 func (e *BlockedError) Error() string {
@@ -74,8 +71,8 @@ func (e *BlockedError) Error() string {
 		return "FAC-170 BLOCKED"
 	}
 	return fmt.Sprintf(
-		"FAC-170 BLOCKED: reason=%s kind=%s session=%s hosts_required=%v hosts_creds=%v %s",
-		e.Reason, e.Kind, e.SessionID, e.HostsRequired, e.HostsCreds, RedactSecrets(e.Detail),
+		"FAC-170 BLOCKED: reason=%s code=%s kind=%s session=%s hosts_required=%v hosts_present=%v",
+		e.Reason, e.Code, e.Kind, e.SessionID, e.HostsRequired, e.HostsPresent,
 	)
 }
 
@@ -83,8 +80,7 @@ func (e *BlockedError) Is(target error) bool {
 	return target == ErrHostCredsBlocked
 }
 
-// KindAuthClass classifies whether a harness kind can complete a model turn
-// under scrubbed worker env + HostCreds-oracle containment (no secrets).
+// KindAuthClass classifies harness kind readiness (no secrets).
 type KindAuthClass string
 
 const (
@@ -94,66 +90,42 @@ const (
 	KindAuthPlatform KindAuthClass = "platform_unsupported"
 )
 
-// KindAuthDiagnosis is a non-secret evidence packet for coordinator routing.
-// Never contains credential bytes.
+// KindAuthDiagnosis is a non-secret evidence packet.
 type KindAuthDiagnosis struct {
 	Kind              string        `json:"kind"`
 	Class             KindAuthClass `json:"class"`
 	Brokerable        bool          `json:"brokerable"`
 	RequiredHosts     []string      `json:"required_hosts"`
-	HostCredsPresent  []string      `json:"host_creds_present"` // hosts only
+	HostCredsPresent  []string      `json:"host_creds_present"` // names only
+	AuthorityClass    string        `json:"authority_class"`    // keychain|op|test|none
 	HostAuthFileHint  string        `json:"host_auth_file_hint,omitempty"`
 	HostAuthModeHint  string        `json:"host_auth_mode_hint,omitempty"`
-	Reason            string        `json:"reason"`
-	Blocker           string        `json:"blocker"`
+	ReasonCode        string        `json:"reason_code"`
+	Blocker           string        `json:"blocker"` // stable template, no secrets
 	RecommendedAction string        `json:"recommended_action"`
 }
 
-// Supported hosted author kinds for HostCreds brokering (OpenCode/Ollama out of scope).
 const (
 	AuthorKindGrok   = "grok"
 	AuthorKindClaude = "claude"
 	AuthorKindCodex  = "codex"
 )
 
-// RequestRule is one allowlisted (host, method, path-prefix, action) tuple.
-// Action is an opaque label for audit (e.g. "chat.completions").
+// RequestRule is exact allowlisted host + method + path + action (deny-by-default).
+// Path is exact (not a global prefix family): optional trailing path segments
+// only when PathExact is false and PathPrefix is set with boundary rules.
 type RequestRule struct {
-	Host       string // exact host (lowercased)
-	Method     string // exact HTTP method (uppercased); empty = any method on path
-	PathPrefix string // required path prefix; must start with /
-	Action     string // optional action label
-}
-
-// DefaultHostAllowlist is the production host set for hosted author APIs.
-// Loopback is NOT included by default.
-func DefaultHostAllowlist() []string {
-	return []string{
-		"api.openai.com",
-		"api.anthropic.com",
-		"api.x.ai",
-	}
-}
-
-// DefaultRequestRules is the least-privilege method/path allowlist for hosted authors.
-// Deny-by-default: anything not matching a rule is refused by the oracle.
-func DefaultRequestRules() []RequestRule {
-	return []RequestRule{
-		{Host: "api.x.ai", Method: "POST", PathPrefix: "/v1/chat/completions", Action: "chat.completions"},
-		{Host: "api.x.ai", Method: "POST", PathPrefix: "/v1/messages", Action: "messages"},
-		{Host: "api.x.ai", Method: "GET", PathPrefix: "/v1/models", Action: "models.list"},
-		{Host: "api.anthropic.com", Method: "POST", PathPrefix: "/v1/messages", Action: "messages"},
-		{Host: "api.anthropic.com", Method: "GET", PathPrefix: "/v1/models", Action: "models.list"},
-		{Host: "api.openai.com", Method: "POST", PathPrefix: "/v1/chat/completions", Action: "chat.completions"},
-		{Host: "api.openai.com", Method: "POST", PathPrefix: "/v1/responses", Action: "responses"},
-		{Host: "api.openai.com", Method: "GET", PathPrefix: "/v1/models", Action: "models.list"},
-	}
+	Host       string // exact normalized host
+	Method     string // exact HTTP method
+	PathExact  string // if non-empty, path must equal this (query stripped)
+	PathPrefix string // if PathExact empty: boundary-safe prefix
+	Action     string // required action label when non-empty on request
 }
 
 // DefaultSessionTTL is the maximum lifetime of a HostCreds session.
 const DefaultSessionTTL = 30 * time.Minute
 
-// RequiredBrokerHostsForKind returns upstream hosts HostCreds must cover.
+// RequiredBrokerHostsForKind returns the exact host(s) for one kind — not a global list.
 func RequiredBrokerHostsForKind(kind string) []string {
 	switch strings.ToLower(strings.TrimSpace(kind)) {
 	case AuthorKindClaude:
@@ -167,14 +139,47 @@ func RequiredBrokerHostsForKind(kind string) []string {
 	}
 }
 
-// IsSupportedAuthorKind reports whether kind is a HostCreds-brokered hosted author.
-// OpenCode and Ollama-local kinds are explicitly out of scope.
+// RequestRulesForKind returns exact method/path/action rules for one kind only.
+func RequestRulesForKind(kind string) []RequestRule {
+	switch strings.ToLower(strings.TrimSpace(kind)) {
+	case AuthorKindGrok:
+		return []RequestRule{
+			{Host: "api.x.ai", Method: "POST", PathExact: "/v1/chat/completions", Action: "chat.completions"},
+			{Host: "api.x.ai", Method: "GET", PathExact: "/v1/models", Action: "models.list"},
+		}
+	case AuthorKindClaude:
+		return []RequestRule{
+			{Host: "api.anthropic.com", Method: "POST", PathExact: "/v1/messages", Action: "messages"},
+			{Host: "api.anthropic.com", Method: "GET", PathExact: "/v1/models", Action: "models.list"},
+		}
+	case AuthorKindCodex:
+		return []RequestRule{
+			{Host: "api.openai.com", Method: "POST", PathExact: "/v1/chat/completions", Action: "chat.completions"},
+			{Host: "api.openai.com", Method: "POST", PathExact: "/v1/responses", Action: "responses"},
+			{Host: "api.openai.com", Method: "GET", PathExact: "/v1/models", Action: "models.list"},
+		}
+	case "fake", "test":
+		// Deterministic proof only — loopback exact path.
+		return []RequestRule{
+			{Host: "127.0.0.1", Method: "POST", PathExact: "/v1/chat/completions", Action: "chat.completions"},
+			{Host: "127.0.0.1", Method: "GET", PathExact: "/v1/models", Action: "models.list"},
+		}
+	default:
+		return nil
+	}
+}
+
+// DirectProviderHostsForKind is the worker direct-network deny set for one kind.
+func DirectProviderHostsForKind(kind string) []string {
+	return RequiredBrokerHostsForKind(kind)
+}
+
+// IsSupportedAuthorKind reports hosted author kinds (OpenCode out of scope).
 func IsSupportedAuthorKind(kind string) bool {
 	return len(RequiredBrokerHostsForKind(kind)) > 0
 }
 
-// IsDummyCredential reports whether v is the public CLI bootstrap sentinel
-// (or Authorization form of it). Dummy material must never go upstream.
+// IsDummyCredential reports public CLI bootstrap sentinel material.
 func IsDummyCredential(v string) bool {
 	v = strings.TrimSpace(v)
 	if v == "" {
@@ -183,26 +188,22 @@ func IsDummyCredential(v string) bool {
 	if v == DummyNeverUpstream || v == DummyNeverUpstreamAuth {
 		return true
 	}
-	// Bearer <dummy>
 	if strings.HasPrefix(strings.ToLower(v), "bearer ") {
-		tok := strings.TrimSpace(v[7:])
-		return tok == DummyNeverUpstream
+		return strings.TrimSpace(v[7:]) == DummyNeverUpstream
 	}
 	return false
 }
 
-// MatchRequestRule returns the matching rule or nil if denied.
+// MatchRequestRule returns the matching rule or nil (deny).
 func MatchRequestRule(rules []RequestRule, host, method, path string) *RequestRule {
 	host = strings.ToLower(strings.TrimSpace(host))
 	method = strings.ToUpper(strings.TrimSpace(method))
 	if path == "" {
 		path = "/"
 	}
-	// Reject path traversal / scheme smuggling in path.
 	if strings.Contains(path, "..") || strings.Contains(path, "://") || strings.ContainsAny(path, "\r\n\x00") {
 		return nil
 	}
-	// Strip query for prefix match; rejections still apply to full path smuggling above.
 	pathOnly := path
 	if i := strings.IndexByte(pathOnly, '?'); i >= 0 {
 		pathOnly = pathOnly[:i]
@@ -212,15 +213,19 @@ func MatchRequestRule(rules []RequestRule, host, method, path string) *RequestRu
 		if strings.ToLower(r.Host) != host {
 			continue
 		}
-		if r.Method != "" && strings.ToUpper(r.Method) != method {
+		if strings.ToUpper(r.Method) != method {
+			continue
+		}
+		if r.PathExact != "" {
+			if pathOnly == r.PathExact {
+				return r
+			}
 			continue
 		}
 		prefix := r.PathPrefix
 		if prefix == "" {
-			prefix = "/"
+			continue
 		}
-		// Exact or boundary-safe prefix: /v1/chat matches /v1/chat and /v1/chat/...
-		// but not /v1/chatty.
 		if pathOnly == prefix || strings.HasPrefix(pathOnly, prefix+"/") {
 			return r
 		}

@@ -34,78 +34,73 @@ type OracleRequest struct {
 }
 
 // OracleResponse is returned to the worker. Never includes upstream secrets.
+// Error is a stable reason code string only (not free-form secret material).
 type OracleResponse struct {
 	OK         bool   `json:"ok"`
 	StatusCode int    `json:"status_code,omitempty"`
 	Body       string `json:"body,omitempty"`
-	Error      string `json:"error,omitempty"` // redacted
+	Error      string `json:"error,omitempty"` // stable code only
 	Action     string `json:"action,omitempty"`
 	SessionID  string `json:"session_id,omitempty"`
 }
 
 // HostCredsOracle is the session-bound signing authority.
-//
-// Channel: Unix domain socket (mode 0600 under a private dir). Preferred
-// production binding is a pre-opened FD inherited by the worker (ExtraFiles);
-// the socket path is not a shared multi-worker credential.
-//
-// There is NO worker-visible proxy bearer token. Same-UID path readability is
-// mitigated by session id binding + expiry + single-session ownership + FD mode.
+// Secrets are injected only via CredentialAuthority.InjectAuthorization.
 type HostCredsOracle struct {
 	SessionID string
 	Kind      string
 	Rules     []RequestRule
-	Hosts     []string // host allowlist derived from rules + extras
+	Hosts     []string
 	ExpiresAt time.Time
 
-	mu        sync.Mutex
-	store     SecretStore // out-of-band; never worker-readable
-	revoked   bool
-	closed    bool
-	ln        net.Listener
-	sockPath  string
-	sockDir   string
+	mu         sync.Mutex
+	authority  CredentialAuthority
+	revoked    bool
+	closed     bool
+	ln         net.Listener
+	sockPath   string
+	sockDir    string
 	generation int
-	// lastUpstreamAuth is test-only capture of what would be sent (never worker).
-	// Only set when CaptureUpstreamAuth is true (tests).
-	CaptureUpstreamAuth bool
-	lastUpstreamAuth    string
-	// dialHook allows tests to intercept upstream dials (loopback fake).
-	// When set, network/addr may be ignored; hook must dial the fake upstream.
-	dialHook func(network, addr string) (net.Conn, error)
-	// resolveHook allows tests to pin DNS.
-	resolveHook func(host string) (net.IP, error)
-	// forceHTTP disables TLS for loopback test upstreams.
-	forceHTTP bool
+
+	// Test hooks only.
+	CaptureInjected bool
+	lastInjected    bool // true if InjectAuthorization succeeded (not the secret)
+	dialHook        func(network, addr string) (net.Conn, error)
+	resolveHook     func(host string) (net.IP, error)
+	forceHTTP       bool
+	allowLoopback   bool
 }
 
 // OracleConfig configures a HostCredsOracle.
 type OracleConfig struct {
-	SessionID  string
-	Kind       string
-	Store      SecretStore
-	Rules      []RequestRule
-	TTL        time.Duration
-	SocketDir  string // private dir for unix socket; created 0700
-	// ExtraHosts for test loopback only (must also have matching Rules).
-	ExtraHosts []string
+	SessionID     string
+	Kind          string
+	Authority     CredentialAuthority
+	Rules         []RequestRule
+	TTL           time.Duration
+	SocketDir     string
+	AllowLoopback bool // tests only
 }
 
-// StartHostCredsOracle creates a session-bound oracle listening on a Unix socket.
+// StartHostCredsOracle creates a session-bound oracle on a Unix socket.
 func StartHostCredsOracle(cfg OracleConfig) (*HostCredsOracle, error) {
 	if err := platformSupportsHostCredsBroker(); err != nil {
 		return nil, err
 	}
-	if cfg.Store == nil {
-		return nil, fmt.Errorf("oracle: out-of-band SecretStore required")
+	if cfg.Authority == nil {
+		return nil, &BlockedError{Reason: BlockMissingCreds, Code: "authority_required"}
 	}
 	sid := strings.TrimSpace(cfg.SessionID)
 	if sid == "" {
 		sid = newSessionID()
 	}
+	kind := strings.ToLower(strings.TrimSpace(cfg.Kind))
 	rules := cfg.Rules
 	if len(rules) == 0 {
-		rules = DefaultRequestRules()
+		rules = RequestRulesForKind(kind)
+	}
+	if len(rules) == 0 {
+		return nil, &BlockedError{Reason: BlockUnbrokerableKind, Code: "no_rules", Kind: kind}
 	}
 	ttl := cfg.TTL
 	if ttl <= 0 {
@@ -114,11 +109,10 @@ func StartHostCredsOracle(cfg OracleConfig) (*HostCredsOracle, error) {
 
 	sockDir := cfg.SocketDir
 	if sockDir == "" {
-		// Keep path short: macOS sun_path is ~104 bytes.
 		var err error
 		sockDir, err = os.MkdirTemp("", "hc-*")
 		if err != nil {
-			return nil, fmt.Errorf("oracle sock dir: %w", err)
+			return nil, err
 		}
 	} else {
 		if err := os.MkdirAll(sockDir, 0o700); err != nil {
@@ -126,11 +120,8 @@ func StartHostCredsOracle(cfg OracleConfig) (*HostCredsOracle, error) {
 		}
 		_ = os.Chmod(sockDir, 0o700)
 	}
-
-	// Short socket name (path length limits). Session binding is in protocol, not filename.
 	sockPath := filepath.Join(sockDir, "o.sock")
 	_ = os.Remove(sockPath)
-
 	ln, err := net.Listen("unix", sockPath)
 	if err != nil {
 		return nil, fmt.Errorf("oracle unix listen: %w", err)
@@ -138,31 +129,23 @@ func StartHostCredsOracle(cfg OracleConfig) (*HostCredsOracle, error) {
 	_ = os.Chmod(sockPath, 0o600)
 
 	hosts := hostSetFromRules(rules)
-	for _, h := range cfg.ExtraHosts {
-		h = strings.ToLower(strings.TrimSpace(h))
-		if h != "" {
-			hosts = appendUnique(hosts, h)
-		}
-	}
-
 	o := &HostCredsOracle{
-		SessionID:  sid,
-		Kind:       strings.ToLower(strings.TrimSpace(cfg.Kind)),
-		Rules:      append([]RequestRule(nil), rules...),
-		Hosts:      hosts,
-		ExpiresAt:  time.Now().Add(ttl),
-		store:      cfg.Store,
-		ln:         ln,
-		sockPath:   sockPath,
-		sockDir:    sockDir,
-		generation: 1,
+		SessionID:     sid,
+		Kind:          kind,
+		Rules:         append([]RequestRule(nil), rules...),
+		Hosts:         hosts,
+		ExpiresAt:     time.Now().Add(ttl),
+		authority:     cfg.Authority,
+		ln:            ln,
+		sockPath:      sockPath,
+		sockDir:       sockDir,
+		generation:    1,
+		allowLoopback: cfg.AllowLoopback,
 	}
 	go o.serve()
 	return o, nil
 }
 
-// SocketPath returns the Unix socket path (session-private). This is a channel
-// endpoint, not a bearer credential. Prefer File() / pre-opened FD for spawn.
 func (o *HostCredsOracle) SocketPath() string {
 	if o == nil {
 		return ""
@@ -170,26 +153,20 @@ func (o *HostCredsOracle) SocketPath() string {
 	return o.sockPath
 }
 
-// File returns a *os.File connected to the oracle for pre-opened FD inheritance.
-// Caller should pass via cmd.ExtraFiles and close its copy after Start.
-// Preferred production binding: worker speaks only on this FD.
 func (o *HostCredsOracle) File() (*os.File, error) {
 	if o == nil || o.ln == nil {
 		return nil, fmt.Errorf("oracle not listening")
 	}
-	// Dial our own socket to produce a connected FD for the worker side.
 	c, err := net.DialTimeout("unix", o.sockPath, 2*time.Second)
 	if err != nil {
 		return nil, err
 	}
-	// Convert to *os.File for ExtraFiles. On Unix, UnixConn supports File().
 	if uc, ok := c.(*net.UnixConn); ok {
 		f, err := uc.File()
 		if err != nil {
 			_ = c.Close()
 			return nil, err
 		}
-		// File() duplicates; close the conn copy.
 		_ = c.Close()
 		return f, nil
 	}
@@ -197,7 +174,6 @@ func (o *HostCredsOracle) File() (*os.File, error) {
 	return nil, fmt.Errorf("oracle: unix conn File() unavailable")
 }
 
-// Generation returns restart generation counter.
 func (o *HostCredsOracle) Generation() int {
 	if o == nil {
 		return 0
@@ -207,36 +183,24 @@ func (o *HostCredsOracle) Generation() int {
 	return o.generation
 }
 
-// LastUpstreamAuth returns the last Authorization the oracle attached (test only).
-func (o *HostCredsOracle) LastUpstreamAuth() string {
-	if o == nil {
-		return ""
-	}
-	o.mu.Lock()
-	defer o.mu.Unlock()
-	return o.lastUpstreamAuth
-}
-
-// Alive reports whether the session is usable (not closed/revoked/expired).
 func (o *HostCredsOracle) Alive() error {
 	if o == nil {
-		return &BlockedError{Reason: BlockNoSession, Detail: "nil oracle"}
+		return &BlockedError{Reason: BlockNoSession, Code: "nil_oracle"}
 	}
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	if o.closed {
-		return &BlockedError{Reason: BlockNoSession, SessionID: o.SessionID, Detail: "oracle closed"}
+		return &BlockedError{Reason: BlockNoSession, SessionID: o.SessionID, Code: "closed"}
 	}
 	if o.revoked {
-		return &BlockedError{Reason: BlockRevoked, SessionID: o.SessionID, Detail: "session revoked"}
+		return &BlockedError{Reason: BlockRevoked, SessionID: o.SessionID, Code: "revoked"}
 	}
 	if time.Now().After(o.ExpiresAt) {
-		return &BlockedError{Reason: BlockExpired, SessionID: o.SessionID, Detail: "session expired"}
+		return &BlockedError{Reason: BlockExpired, SessionID: o.SessionID, Code: "expired"}
 	}
 	return nil
 }
 
-// Revoke immediately invalidates the session (fails closed for further requests).
 func (o *HostCredsOracle) Revoke() error {
 	if o == nil {
 		return nil
@@ -247,46 +211,34 @@ func (o *HostCredsOracle) Revoke() error {
 	return o.Close()
 }
 
-// RotateHostCredential updates the out-of-band store (never worker-visible).
-func (o *HostCredsOracle) RotateHostCredential(host, authorization string) error {
-	if o == nil || o.store == nil {
-		return fmt.Errorf("nil oracle/store")
+func (o *HostCredsOracle) RotateFromHandle(host, handle string) error {
+	if o == nil || o.authority == nil {
+		return &BlockedError{Reason: BlockNoSession, Code: "nil_oracle"}
 	}
-	if IsDummyCredential(authorization) {
-		return &BlockedError{Reason: BlockDummyUpstream, Detail: "cannot store dummy as real HostCreds"}
-	}
-	host = strings.ToLower(strings.TrimSpace(host))
-	if !o.hostAllowed(host) {
-		return &BlockedError{Reason: BlockHostDenied, SessionID: o.SessionID, Detail: "host not allowlisted"}
-	}
-	return o.store.Set(host, authorization)
+	return o.authority.RotateFromHandle(host, handle)
 }
 
-// RevokeHostCredential removes host creds from the out-of-band store.
-func (o *HostCredsOracle) RevokeHostCredential(host string) error {
-	if o == nil || o.store == nil {
-		return fmt.Errorf("nil oracle/store")
+func (o *HostCredsOracle) RevokeHost(host string) error {
+	if o == nil || o.authority == nil {
+		return &BlockedError{Reason: BlockNoSession, Code: "nil_oracle"}
 	}
-	return o.store.Delete(host)
+	return o.authority.Revoke(host)
 }
 
-// HostCredentialPresent reports presence only (no value).
 func (o *HostCredsOracle) HostCredentialPresent(host string) bool {
-	if o == nil || o.store == nil {
+	if o == nil || o.authority == nil {
 		return false
 	}
-	return strings.TrimSpace(o.store.Get(host)) != ""
+	return o.authority.Has(host)
 }
 
-// CredHosts returns host names with credentials (never values).
 func (o *HostCredsOracle) CredHosts() []string {
-	if o == nil || o.store == nil {
+	if o == nil || o.authority == nil {
 		return nil
 	}
-	return o.store.Hosts()
+	return o.authority.Hosts()
 }
 
-// Close shuts down the oracle and removes the socket.
 func (o *HostCredsOracle) Close() error {
 	if o == nil {
 		return nil
@@ -313,27 +265,36 @@ func (o *HostCredsOracle) Close() error {
 	return first
 }
 
-// Restart re-listens on a new socket generation; secrets re-seed from store only.
+// Restart re-binds the channel and re-resolves durable handles when available.
 func (o *HostCredsOracle) Restart() error {
 	if o == nil {
-		return fmt.Errorf("nil oracle")
+		return &BlockedError{Reason: BlockNoSession, Code: "nil_oracle"}
 	}
 	o.mu.Lock()
 	if o.revoked {
 		o.mu.Unlock()
-		return &BlockedError{Reason: BlockRevoked, SessionID: o.SessionID, Detail: "cannot restart revoked session"}
+		return &BlockedError{Reason: BlockRevoked, SessionID: o.SessionID, Code: "revoked"}
 	}
 	if time.Now().After(o.ExpiresAt) {
 		o.mu.Unlock()
-		return &BlockedError{Reason: BlockExpired, SessionID: o.SessionID, Detail: "cannot restart expired session"}
+		return &BlockedError{Reason: BlockExpired, SessionID: o.SessionID, Code: "expired"}
 	}
 	oldLn := o.ln
 	oldPath := o.sockPath
 	dir := o.sockDir
-	sid := o.SessionID
 	o.generation++
 	gen := o.generation
+	auth := o.authority
 	o.mu.Unlock()
+
+	// Durable authorities re-resolve from handles (secret never from worker).
+	if auth != nil && auth.Durable() {
+		if ha, ok := auth.(*HandleAuthority); ok {
+			if err := ha.ReResolveAll(); err != nil {
+				return err
+			}
+		}
+	}
 
 	if oldLn != nil {
 		_ = oldLn.Close()
@@ -341,9 +302,7 @@ func (o *HostCredsOracle) Restart() error {
 	if oldPath != "" {
 		_ = os.Remove(oldPath)
 	}
-	// Short path for AF_UNIX sun_path limits (macOS ~104 bytes).
 	sockPath := filepath.Join(dir, fmt.Sprintf("o%d.sock", gen))
-	_ = sid // session binding is protocol-level, not path-level
 	ln, err := net.Listen("unix", sockPath)
 	if err != nil {
 		return err
@@ -358,99 +317,94 @@ func (o *HostCredsOracle) Restart() error {
 	return nil
 }
 
-// Execute handles one oracle request in-process (used by tests and FD clients).
-// This is the sole signing path: validate → attach secret → forward → redact errors.
+// Execute is the sole signing path.
 func (o *HostCredsOracle) Execute(req OracleRequest) OracleResponse {
 	if err := o.Alive(); err != nil {
 		return oracleErr(err)
 	}
-	// Session binding: request session_id must match oracle (empty allowed only
-	// on pre-opened exclusive FD channels where the FD itself binds the session).
 	if req.SessionID != "" && req.SessionID != o.SessionID {
-		return oracleErr(&BlockedError{
-			Reason: BlockAbuse, SessionID: o.SessionID,
-			Detail: "session_id mismatch",
-		})
+		return oracleErr(&BlockedError{Reason: BlockAbuse, SessionID: o.SessionID, Code: "session_mismatch"})
 	}
-	host := strings.ToLower(strings.TrimSpace(req.Host))
+
+	host, err := NormalizeHost(req.Host, o.allowLoopback)
+	if err != nil {
+		return oracleErr(err)
+	}
 	method := strings.ToUpper(strings.TrimSpace(req.Method))
-	path := req.Path
-	if path == "" {
-		path = "/"
+	path, err := normalizePathForMatch(req.Path)
+	if err != nil {
+		return oracleErr(err)
 	}
 	if !o.hostAllowed(host) {
-		return oracleErr(&BlockedError{
-			Reason: BlockHostDenied, SessionID: o.SessionID,
-			Detail: "host not allowlisted",
-		})
+		return oracleErr(&BlockedError{Reason: BlockHostDenied, SessionID: o.SessionID, Code: "host:" + host})
 	}
 	rule := MatchRequestRule(o.Rules, host, method, path)
 	if rule == nil {
-		// Distinguish method vs path denial for clearer BLOCKED packets.
 		if hostMethodAllowed(o.Rules, host, method) {
-			return oracleErr(&BlockedError{Reason: BlockPathDenied, SessionID: o.SessionID, Detail: "path not allowlisted"})
+			return oracleErr(&BlockedError{Reason: BlockPathDenied, SessionID: o.SessionID, Code: "path"})
 		}
 		if hostPathAllowed(o.Rules, host, path) {
-			return oracleErr(&BlockedError{Reason: BlockMethodDenied, SessionID: o.SessionID, Detail: "method not allowlisted"})
+			return oracleErr(&BlockedError{Reason: BlockMethodDenied, SessionID: o.SessionID, Code: "method"})
 		}
-		return oracleErr(&BlockedError{Reason: BlockActionDenied, SessionID: o.SessionID, Detail: "request not allowlisted"})
+		return oracleErr(&BlockedError{Reason: BlockActionDenied, SessionID: o.SessionID, Code: "rule"})
 	}
 	if req.Action != "" && rule.Action != "" && req.Action != rule.Action {
-		return oracleErr(&BlockedError{Reason: BlockActionDenied, SessionID: o.SessionID, Detail: "action mismatch"})
+		return oracleErr(&BlockedError{Reason: BlockActionDenied, SessionID: o.SessionID, Code: "action"})
 	}
 	if len(req.Body) > MaxOracleBodyBytes {
-		return oracleErr(&BlockedError{Reason: BlockAbuse, SessionID: o.SessionID, Detail: "body too large"})
+		return oracleErr(&BlockedError{Reason: BlockAbuse, SessionID: o.SessionID, Code: "body_too_large"})
 	}
 
-	// Worker Authorization handling: only dummy sentinel allowed; real secrets
-	// from worker are rejected (injection / confused-deputy).
-	workerAuth := ""
+	// Worker Authorization: only dummy sentinel allowed.
 	if req.Headers != nil {
 		for k, v := range req.Headers {
 			if strings.EqualFold(k, "Authorization") {
-				workerAuth = v
-				break
+				if v != "" && !IsDummyCredential(v) {
+					return oracleErr(&BlockedError{Reason: BlockWorkerAuthInject, SessionID: o.SessionID, Code: "worker_auth"})
+				}
+				// Reject CRLF even on dummy path if malformed.
+				if strings.ContainsAny(v, "\r\n\x00") {
+					return oracleErr(&BlockedError{Reason: BlockBadAuthMaterial, SessionID: o.SessionID, Code: "auth_header_injection"})
+				}
+			}
+			// Header injection via any worker header name/value.
+			if strings.ContainsAny(k, "\r\n\x00") || strings.ContainsAny(v, "\r\n\x00") {
+				return oracleErr(&BlockedError{Reason: BlockAbuse, SessionID: o.SessionID, Code: "header_injection"})
 			}
 		}
 	}
-	if workerAuth != "" && !IsDummyCredential(workerAuth) {
-		return oracleErr(&BlockedError{
-			Reason: BlockWorkerAuthInject, SessionID: o.SessionID,
-			Detail: "worker must not supply real Authorization; use dummy sentinel only",
-		})
-	}
 
-	// Resolve out-of-band secret. Dummy must never be used upstream.
-	secret := strings.TrimSpace(o.store.Get(host))
-	if secret == "" {
-		return oracleErr(&BlockedError{
-			Reason: BlockMissingCreds, SessionID: o.SessionID,
-			HostsRequired: []string{host}, HostsCreds: o.CredHosts(),
-			Detail: "no HostCreds for host in out-of-band store",
-		})
+	// Build upstream headers; inject via authority (never returns secret).
+	upHdr := make(http.Header)
+	if err := o.authority.InjectAuthorization(host, upHdr); err != nil {
+		return oracleErr(err)
 	}
-	if IsDummyCredential(secret) {
-		return oracleErr(&BlockedError{
-			Reason: BlockDummyUpstream, SessionID: o.SessionID,
-			Detail: "store contains dummy sentinel — refusing upstream",
-		})
-	}
-
-	if o.CaptureUpstreamAuth {
+	if o.CaptureInjected {
 		o.mu.Lock()
-		o.lastUpstreamAuth = secret
+		o.lastInjected = upHdr.Get("Authorization") != ""
 		o.mu.Unlock()
 	}
 
-	// Forward without following redirects; pin DNS; never put secret in errors.
-	status, body, err := o.forward(host, method, path, secret, req.Headers, req.Body)
-	if err != nil {
-		return OracleResponse{
-			OK:        false,
-			SessionID: o.SessionID,
-			Error:     RedactSecrets(err.Error()),
+	// Copy safe worker headers (never Authorization).
+	for k, v := range req.Headers {
+		kl := strings.ToLower(k)
+		switch kl {
+		case "authorization", "proxy-authorization", "cookie", "set-cookie", "host":
+			continue
+		default:
+			if strings.TrimSpace(v) != "" {
+				upHdr.Set(k, v)
+			}
 		}
 	}
+
+	status, body, ferr := o.forward(host, method, path, upHdr, req.Body)
+	if ferr != nil {
+		return OracleResponse{OK: false, SessionID: o.SessionID, Error: blockCode(ferr)}
+	}
+	// Redact any accidental secret echo in body without knowing the secret:
+	// strip Bearer tokens shape.
+	body = RedactSecrets(body)
 	return OracleResponse{
 		OK:         true,
 		StatusCode: status,
@@ -460,8 +414,7 @@ func (o *HostCredsOracle) Execute(req OracleRequest) OracleResponse {
 	}
 }
 
-func (o *HostCredsOracle) forward(host, method, path, authorization string, headers map[string]string, body string) (int, string, error) {
-	// DNS pin — reject private/rebind for non-loopback hosts.
+func (o *HostCredsOracle) forward(host, method, path string, hdr http.Header, body string) (int, string, error) {
 	var ip net.IP
 	var err error
 	if o.resolveHook != nil {
@@ -470,20 +423,17 @@ func (o *HostCredsOracle) forward(host, method, path, authorization string, head
 		ip, err = resolveAndPinIP(host)
 	}
 	if err != nil {
-		// Allow explicit loopback only when host is a loopback IP string and allowlisted.
-		if parsed := net.ParseIP(host); parsed != nil && parsed.IsLoopback() && o.hostAllowed(host) {
+		if parsed := net.ParseIP(host); parsed != nil && parsed.IsLoopback() && o.allowLoopback {
 			ip = parsed
 		} else {
-			return 0, "", fmt.Errorf("dns denied")
+			return 0, "", &BlockedError{Reason: BlockAbuse, Code: "dns_denied"}
 		}
 	}
-	// Always validate resolved IP (hooks cannot smuggle private/rebind targets).
-	allowLoop := net.ParseIP(host) != nil && net.ParseIP(host).IsLoopback()
+	allowLoop := o.allowLoopback || (net.ParseIP(host) != nil && net.ParseIP(host).IsLoopback())
 	if err := validateDialIP(ip, allowLoop || o.forceHTTP); err != nil {
-		return 0, "", fmt.Errorf("dns rebind denied")
+		return 0, "", &BlockedError{Reason: BlockAbuse, Code: "dns_rebind"}
 	}
 
-	// Prefer HTTPS to real providers; loopback tests use HTTP via dialHook/forceHTTP.
 	useTLS := !o.forceHTTP && !(ip != nil && ip.IsLoopback())
 	port := "443"
 	if !useTLS {
@@ -502,79 +452,58 @@ func (o *HostCredsOracle) forward(host, method, path, authorization string, head
 		conn, err = d.DialContext(ctx, "tcp", addr)
 	}
 	if err != nil {
-		return 0, "", fmt.Errorf("upstream dial failed")
+		return 0, "", &BlockedError{Reason: BlockAbuse, Code: "upstream_dial"}
 	}
 	defer conn.Close()
 
 	var rw io.ReadWriter = conn
 	if useTLS {
-		tlsConn := tls.Client(conn, &tls.Config{
-			ServerName: host,
-			MinVersion: tls.VersionTLS12,
-		})
+		tlsConn := tls.Client(conn, &tls.Config{ServerName: host, MinVersion: tls.VersionTLS12})
 		if err := tlsConn.HandshakeContext(ctx); err != nil {
-			return 0, "", fmt.Errorf("tls handshake failed")
+			return 0, "", &BlockedError{Reason: BlockAbuse, Code: "tls_handshake"}
 		}
 		defer tlsConn.Close()
 		rw = tlsConn
 	}
 
-	// Build request: NEVER copy worker Authorization.
-	uPath := path
-	if !strings.HasPrefix(uPath, "/") {
-		uPath = "/" + uPath
-	}
 	scheme := "https"
 	if !useTLS {
 		scheme = "http"
 	}
+	uPath := path
+	if !strings.HasPrefix(uPath, "/") {
+		uPath = "/" + uPath
+	}
 	req, err := http.NewRequestWithContext(ctx, method, scheme+"://"+host+uPath, strings.NewReader(body))
 	if err != nil {
-		return 0, "", fmt.Errorf("build request failed")
+		return 0, "", &BlockedError{Reason: BlockAbuse, Code: "build_request"}
 	}
 	req.Host = host
-	req.Header.Set("Authorization", authorization)
-	req.Header.Set("Content-Type", "application/json")
-	// Copy safe worker headers only (no Authorization, no Cookie, no Proxy-*).
-	for k, v := range headers {
-		kl := strings.ToLower(k)
-		switch kl {
-		case "authorization", "proxy-authorization", "cookie", "set-cookie", "host":
-			continue
-		default:
-			if strings.TrimSpace(v) != "" {
-				req.Header.Set(k, v)
-			}
-		}
+	req.Header = hdr.Clone()
+	// Ensure Content-Type default for JSON APIs.
+	if req.Header.Get("Content-Type") == "" && body != "" {
+		req.Header.Set("Content-Type", "application/json")
 	}
 
-	// Manual write/read so we can refuse redirects without following them.
 	if err := req.Write(rw); err != nil {
-		return 0, "", fmt.Errorf("upstream write failed")
+		return 0, "", &BlockedError{Reason: BlockAbuse, Code: "upstream_write"}
 	}
 	br := bufio.NewReader(rw)
 	resp, err := http.ReadResponse(br, req)
 	if err != nil {
-		return 0, "", fmt.Errorf("upstream read failed")
+		return 0, "", &BlockedError{Reason: BlockAbuse, Code: "upstream_read"}
 	}
 	defer resp.Body.Close()
 
-	// Do NOT follow redirects — Location could point at attacker with Authorization
-	// re-sent by a naive client. Strip sensitive headers from any error path.
+	// Do NOT follow redirects — prevents auth exfil via Location.
 	if resp.StatusCode >= 300 && resp.StatusCode < 400 {
-		// Return status without Location body that might echo secrets.
 		return resp.StatusCode, "", nil
 	}
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, MaxOracleBodyBytes))
 	if err != nil {
-		return 0, "", fmt.Errorf("upstream body read failed")
+		return 0, "", &BlockedError{Reason: BlockAbuse, Code: "upstream_body"}
 	}
-	// Never return bodies that echo Authorization (paranoid redaction).
-	out := RedactSecrets(string(raw))
-	if strings.Contains(out, authorization) {
-		out = strings.ReplaceAll(out, authorization, "[REDACTED]")
-	}
-	return resp.StatusCode, out, nil
+	return resp.StatusCode, string(raw), nil
 }
 
 func (o *HostCredsOracle) hostAllowed(host string) bool {
@@ -606,11 +535,9 @@ func (o *HostCredsOracle) serve() {
 func (o *HostCredsOracle) handleConn(c net.Conn) {
 	defer c.Close()
 	_ = c.SetDeadline(time.Now().Add(20 * time.Second))
-	// HTTP/1.1 over the Unix socket — single request, no persistent proxy semantics.
 	br := bufio.NewReader(c)
 	httpReq, err := http.ReadRequest(br)
 	if err != nil {
-		// Also accept raw JSON line (length-prefixed free form for FD clients).
 		return
 	}
 	writeJSON := func(code int, v any) {
@@ -622,23 +549,20 @@ func (o *HostCredsOracle) handleConn(c net.Conn) {
 		_, _ = fmt.Fprintf(c, "HTTP/1.1 %d %s\r\nContent-Type: application/json\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s",
 			code, status, len(raw), raw)
 	}
-
-	// Only the oracle endpoint is served. No CONNECT. No arbitrary proxying.
 	if httpReq.Method != http.MethodPost || httpReq.URL.Path != "/v1/oracle" {
-		writeJSON(403, OracleResponse{OK: false, Error: "only POST /v1/oracle allowed", SessionID: o.SessionID})
+		writeJSON(403, OracleResponse{OK: false, Error: "only_post_oracle", SessionID: o.SessionID})
 		return
 	}
 	raw, err := io.ReadAll(io.LimitReader(httpReq.Body, MaxOracleBodyBytes+1024))
 	if err != nil {
-		writeJSON(400, OracleResponse{OK: false, Error: "bad body", SessionID: o.SessionID})
+		writeJSON(400, OracleResponse{OK: false, Error: "bad_body", SessionID: o.SessionID})
 		return
 	}
 	var req OracleRequest
 	if err := json.Unmarshal(raw, &req); err != nil {
-		writeJSON(400, OracleResponse{OK: false, Error: "bad json", SessionID: o.SessionID})
+		writeJSON(400, OracleResponse{OK: false, Error: "bad_json", SessionID: o.SessionID})
 		return
 	}
-	// Default session bind when omitted on exclusive socket.
 	if req.SessionID == "" {
 		req.SessionID = o.SessionID
 	}
@@ -650,8 +574,7 @@ func (o *HostCredsOracle) handleConn(c net.Conn) {
 	writeJSON(code, resp)
 }
 
-// CallOracle is a helper for tests/clients: POST intent over the Unix socket.
-// No bearer token is used — channel access is the authority boundary.
+// CallOracle POSTs intent over the Unix socket (no bearer token).
 func CallOracle(sockPath string, req OracleRequest) (OracleResponse, error) {
 	c, err := net.DialTimeout("unix", sockPath, 2*time.Second)
 	if err != nil {
@@ -674,20 +597,30 @@ func CallOracle(sockPath string, req OracleRequest) (OracleResponse, error) {
 	body, _ := io.ReadAll(httpResp.Body)
 	var out OracleResponse
 	if err := json.Unmarshal(body, &out); err != nil {
-		return OracleResponse{}, fmt.Errorf("oracle response: %w", err)
+		return OracleResponse{}, fmt.Errorf("oracle response decode")
 	}
 	return out, nil
 }
 
 func oracleErr(err error) OracleResponse {
+	return OracleResponse{OK: false, Error: blockCode(err), SessionID: sessionOf(err)}
+}
+
+func blockCode(err error) string {
 	if be, ok := err.(*BlockedError); ok {
-		return OracleResponse{
-			OK:        false,
-			SessionID: be.SessionID,
-			Error:     RedactSecrets(be.Error()),
+		if be.Code != "" {
+			return string(be.Reason) + ":" + be.Code
 		}
+		return string(be.Reason)
 	}
-	return OracleResponse{OK: false, Error: RedactSecrets(err.Error())}
+	return "error"
+}
+
+func sessionOf(err error) string {
+	if be, ok := err.(*BlockedError); ok {
+		return be.SessionID
+	}
+	return ""
 }
 
 func hostSetFromRules(rules []RequestRule) []string {
@@ -709,7 +642,7 @@ func appendUnique(ss []string, v string) []string {
 
 func hostMethodAllowed(rules []RequestRule, host, method string) bool {
 	for _, r := range rules {
-		if strings.EqualFold(r.Host, host) && (r.Method == "" || strings.EqualFold(r.Method, method)) {
+		if strings.EqualFold(r.Host, host) && strings.EqualFold(r.Method, method) {
 			return true
 		}
 	}
@@ -721,31 +654,14 @@ func hostPathAllowed(rules []RequestRule, host, path string) bool {
 		if !strings.EqualFold(r.Host, host) {
 			continue
 		}
-		prefix := r.PathPrefix
-		if path == prefix || strings.HasPrefix(path, prefix+"/") || strings.HasPrefix(path, prefix+"?") {
+		if r.PathExact != "" && path == r.PathExact {
+			return true
+		}
+		if r.PathPrefix != "" && (path == r.PathPrefix || strings.HasPrefix(path, r.PathPrefix+"/")) {
 			return true
 		}
 	}
 	return false
-}
-
-func sanitizeSessionFile(sid string) string {
-	var b strings.Builder
-	for _, r := range sid {
-		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '_' {
-			b.WriteRune(r)
-		} else {
-			b.WriteByte('_')
-		}
-	}
-	s := b.String()
-	if s == "" {
-		return "sess"
-	}
-	if len(s) > 64 {
-		s = s[:64]
-	}
-	return s
 }
 
 func newSessionID() string {
@@ -754,10 +670,4 @@ func newSessionID() string {
 		return fmt.Sprintf("sess-%d", os.Getpid())
 	}
 	return "sess-" + hex.EncodeToString(b[:])
-}
-
-// DirectProviderHosts is the set of hosts the worker must not reach directly.
-// Coordinator sandbox policy should deny these in the worker network namespace.
-func DirectProviderHosts() []string {
-	return DefaultHostAllowlist()
 }
