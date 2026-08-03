@@ -115,7 +115,6 @@ func (s *ControlServer) handleStatus(w http.ResponseWriter, r *http.Request) {
 	} else if !view.Freshness.Ready {
 		status = "degraded"
 	}
-	health.Readiness = health.Readiness && view.Freshness.Ready
 	resp := ServerStatusResponse{
 		Status:     status,
 		Version:    "v0.1.0",
@@ -155,6 +154,7 @@ func (s *ControlServer) handleOpenAPI(w http.ResponseWriter, r *http.Request) {
 					"responses": map[string]interface{}{
 						"200": map[string]string{"description": "Status is served even when readiness is degraded"},
 					},
+					"x-bounded-condition-codes": []string{"stalled_work", "dropped_callback", "review_saturation", "dead_provider", "integration_backlog", "dead_letters", "eligible_idle"},
 				},
 			},
 			"/metrics": map[string]interface{}{
