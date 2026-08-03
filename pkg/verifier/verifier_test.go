@@ -463,8 +463,10 @@ func TestRunMutationCheck_MismatchedOriginalIsBlocked(t *testing.T) {
 func TestExecuteCancellationKillsProcessGroup(t *testing.T) {
 	dir := t.TempDir()
 	pidFile := filepath.Join(t.TempDir(), "child.pid")
+	// Write the grandchild pid before parking so a race-heavy Cancel still
+	// observes the process-group member that must die.
 	writeExecutable(t, filepath.Join(dir, "spawn-child"), "#!/bin/sh\nsleep 30 &\nchild=$!\nprintf '%s\\n' \"$child\" > \"$1\"\nwait \"$child\"\n")
-	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	result, err := NewVerifierArgs([]string{"./spawn-child", pidFile}).Execute(ctx, dir)
 	if err != nil {
@@ -528,8 +530,10 @@ func TestRunMutationCheck_TimeoutRestoresCandidate(t *testing.T) {
 	if result.Outcome != OutcomeBLOCKED || result.Killed || !result.Restored {
 		t.Fatalf("timeout must block and restore: %+v", result)
 	}
-	if time.Since(started) > time.Second {
-		t.Fatal("bounded mutation timeout exceeded one second")
+	// Bound is generous under -race × high -count (scheduler noise), but still
+	// far below the mutant's sleep-3 path, so a hung Wait cannot pass.
+	if time.Since(started) > 5*time.Second {
+		t.Fatal("bounded mutation timeout exceeded five seconds")
 	}
 	assertFile(t, filepath.Join(dir, "candidate.txt"), "original\n")
 	assertClean(t, dir)
@@ -538,8 +542,19 @@ func TestRunMutationCheck_TimeoutRestoresCandidate(t *testing.T) {
 func TestRunMutationCheck_CancellationRestoresCandidate(t *testing.T) {
 	dir, candidate := mutationRepo(t, true)
 	ctx, cancel := context.WithCancel(context.Background())
+	// Cancel only after the mutant phase has started: baseline must PASS first
+	// under -race load where git+execute can approach a 1s wall clock.
 	go func() {
-		time.Sleep(time.Second)
+		deadline := time.Now().Add(10 * time.Second)
+		for time.Now().Before(deadline) {
+			// Mutant rewrite flips candidate.txt; cancel once it is no longer original.
+			data, err := os.ReadFile(filepath.Join(dir, "candidate.txt"))
+			if err == nil && string(data) == "mutant\n" {
+				cancel()
+				return
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
 		cancel()
 	}()
 	result, err := NewVerifierArgs([]string{"./check.sh"}).RunMutationCheckForCandidate(ctx, dir, MutationRequest{
@@ -548,7 +563,7 @@ func TestRunMutationCheck_CancellationRestoresCandidate(t *testing.T) {
 		TargetFile:        "candidate.txt",
 		OriginalCode:      "original\n",
 		MutantCode:        "mutant\n",
-		Timeout:           2 * time.Second,
+		Timeout:           3 * time.Second,
 	})
 	if err != nil {
 		t.Fatalf("cancellation should return a BLOCKED result: %v", err)

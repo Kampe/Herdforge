@@ -11,13 +11,13 @@ import (
 	"syscall"
 )
 
-// lifecycle owns subprocess process-groups for one explicit session (tests or a
-// single mutation transaction). Production helpers reap their own process group
-// after Wait without sharing mutable session state across goroutines.
+// lifecycle owns subprocess process-groups for one explicit session (tests that
+// inject late writers, or a caller that tracks live children before Wait).
+// Production execute/runGit set Setpgid and reap only from Cancel while the
+// leader is live — never SIGKILL after Wait (PID-reuse hazard under churn).
 //
 // Detached git auto-gc / maintenance / fsmonitor writers are prevented at the
-// source by hermeticGitCommand; residual group members from canceled shells
-// are reaped explicitly. No sleeps or RemoveAll retries.
+// source by hermeticGitCommand. No sleeps or RemoveAll retries.
 type lifecycle struct {
 	mu    sync.Mutex
 	pgids []int
@@ -145,24 +145,19 @@ func hermeticGitCommand(dir string, args ...string) *exec.Cmd {
 	return cmd
 }
 
-// runGit runs hermetic git, waits for the leader, then reaps residual process
-// group members. Concurrent callers do not share session state.
+// runGit runs hermetic git and waits for the leader. Process-group membership
+// is set so a caller with a live Cancel path can reap the group; we do not
+// SIGKILL after Wait (PID-reuse hazard under high churn). Detached git writers
+// are prevented by hermeticGitConfig instead.
 func runGit(dir string, args ...string) ([]byte, error) {
 	cmd := hermeticGitCommand(dir, args...)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
-	if err := cmd.Start(); err != nil {
-		return nil, err
-	}
-	waitErr := cmd.Wait()
-	if cmd.Process != nil {
-		reapProcessGroup(cmd.Process.Pid)
-	}
-	if waitErr != nil {
+	if err := cmd.Run(); err != nil {
 		msg := strings.TrimSpace(stderr.String())
 		if msg == "" {
-			msg = waitErr.Error()
+			msg = err.Error()
 		}
 		return stdout.Bytes(), fmt.Errorf("git %s: %s", strings.Join(args, " "), msg)
 	}

@@ -89,18 +89,12 @@ func runShell(ctx context.Context, dir, command string) bool {
 	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
 	cmd.Dir = dir
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	// Reap the live process group on cancel only — never after Wait.
 	cmd.Cancel = func() error {
 		if cmd.Process == nil {
 			return nil
 		}
 		return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 	}
-	if err := cmd.Start(); err != nil {
-		return false
-	}
-	err = cmd.Wait()
-	if cmd.Process != nil {
-		reapProcessGroup(cmd.Process.Pid)
-	}
-	return err == nil
+	return cmd.Run() == nil
 }

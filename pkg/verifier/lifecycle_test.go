@@ -33,17 +33,16 @@ func TestLateWriterIntoGitFailsCleanupWithoutReap(t *testing.T) {
 	}
 
 	// Child process group: keep creating files under .git so concurrent
-	// RemoveAll races on a non-empty directory.
-	script := filepath.Join(root, "late-writer.sh")
-	writeExecutable(t, script, "#!/bin/sh\ni=0\nwhile :; do\n  i=$((i+1))\n  printf 'x' > \"$1/objects/late-$i\"\ndone\n")
-	cmd := exec.Command(script, gitDir)
+	// RemoveAll races on a non-empty directory. Use sh -c (not a shebang
+	// script) so race-instrumented starts cannot miss an executable bit race.
+	cmd := exec.Command("sh", "-c", `i=0; while :; do i=$((i+1)); printf x > "$1/objects/late-$i"; done`, "late-writer", gitDir)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
 	pgid := cmd.Process.Pid
 	// Ensure at least one late object exists before RemoveAll.
-	if err := waitForLateObject(gitDir); err != nil {
+	if err := waitForLateObject(gitDir, pgid); err != nil {
 		reapProcessGroup(pgid)
 		_ = cmd.Wait()
 		t.Fatal(err)
@@ -82,18 +81,15 @@ func TestProcessGroupReapAllowsTempDirCleanup(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(gitDir, "objects"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	script := filepath.Join(root, "late-writer.sh")
-	writeExecutable(t, script, "#!/bin/sh\ni=0\nwhile :; do\n  i=$((i+1))\n  printf 'x' > \"$1/objects/late-$i\"\ndone\n")
-
 	life := &lifecycle{}
-	cmd := exec.Command(script, gitDir)
+	cmd := exec.Command("sh", "-c", `i=0; while :; do i=$((i+1)); printf x > "$1/objects/late-$i"; done`, "late-writer", gitDir)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
 	life.observeStarted(cmd)
 
-	if err := waitForLateObject(gitDir); err != nil {
+	if err := waitForLateObject(gitDir, cmd.Process.Pid); err != nil {
 		life.reap()
 		_ = cmd.Wait()
 		t.Fatal(err)
@@ -225,9 +221,9 @@ func runMutationPathGuardMatrix(t *testing.T) {
 	}
 }
 
-func waitForLateObject(gitDir string) error {
+func waitForLateObject(gitDir string, pgid int) error {
 	objects := filepath.Join(gitDir, "objects")
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(5 * time.Second)
 	for {
 		entries, err := os.ReadDir(objects)
 		if err == nil {
@@ -235,6 +231,11 @@ func waitForLateObject(gitDir string) error {
 				if strings.HasPrefix(e.Name(), "late-") {
 					return nil
 				}
+			}
+		}
+		if pgid > 0 {
+			if err := syscall.Kill(pgid, 0); err != nil {
+				return fmt.Errorf("late writer process group %d exited before creating residue: %w", pgid, err)
 			}
 		}
 		if time.Now().After(deadline) {

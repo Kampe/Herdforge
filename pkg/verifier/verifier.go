@@ -1,7 +1,6 @@
 package verifier
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -183,6 +182,10 @@ func (v *Verifier) execute(ctx context.Context, dir string, policy EnvironmentPo
 	cmd := exec.CommandContext(ctx, commandPath, v.Argv[1:]...)
 	cmd.Dir = dir
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	// Cancel reaps the whole process group while the leader is still live.
+	// Never SIGKILL a pgid after Wait: the leader PID can be reused under
+	// high process churn (race × count), and a post-Wait kill would target
+	// an unrelated process.
 	cmd.Cancel = func() error {
 		if cmd.Process == nil {
 			return nil
@@ -196,22 +199,7 @@ func (v *Verifier) execute(ctx context.Context, dir string, policy EnvironmentPo
 	// open (for example, `sh -c 'sleep 3'`). WaitDelay bounds that wait and
 	// keeps the mutation transaction's restoration defer reachable.
 	cmd.WaitDelay = 100 * time.Millisecond
-
-	// Own the process group explicitly so residual writers cannot outlive the
-	// mutation boundary and race testing.TempDir RemoveAll on dir/.git.
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-	startErr := cmd.Start()
-	if startErr != nil {
-		return nil, startErr
-	}
-	waitErr := cmd.Wait()
-	if cmd.Process != nil {
-		reapProcessGroup(cmd.Process.Pid)
-	}
-	output := append(stdout.Bytes(), stderr.Bytes()...)
-	err := waitErr
+	output, err := cmd.CombinedOutput()
 	result := &Result{
 		Passed:       err == nil,
 		Outcome:      OutcomePASS,
