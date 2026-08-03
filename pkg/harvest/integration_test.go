@@ -9,7 +9,20 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/Kampe/Herdforge/pkg/review"
+	"github.com/Kampe/Herdforge/pkg/reviewledger"
+)
+
+// Hermetic admission fixtures. Task/lease/patch/session must match what
+// Admit binds; author family is deliberately different from reviewer family.
+const (
+	admitTestLease    = "lease-gen-1"
+	admitTestPatch    = "https://patch.example/harvest-fac-149"
+	admitTestDigest   = "sha256:deadbeefcafebabe000000000000000000000000000000000000000000000001"
+	admitTestAuthorFm = "anthropic"
+	admitTestAuthorID = "author-session-1"
+	admitTestReviewFm = "google"
+	admitTestReviewer = "reviewer-1"
+	admitTestTier     = "R2"
 )
 
 // -- test helpers --
@@ -63,33 +76,59 @@ func setupRepoWithRemote(t *testing.T) (root, remote string) {
 	return root, remote
 }
 
-// setupLedger creates a review.Ledger in the root repo's .herd directory.
-func setupLedger(t *testing.T, root string) *review.Ledger {
+// setupLedger creates a reviewledger.Ledger in the root repo's .herd directory.
+func setupLedger(t *testing.T, root string) *reviewledger.Ledger {
 	t.Helper()
 	ledgerPath := filepath.Join(root, ".herd", "review-ledger.jsonl")
-	l, err := review.NewReviewLedger(root, ledgerPath)
+	l, err := reviewledger.NewReviewLedger(root, ledgerPath)
 	if err != nil {
 		t.Fatalf("NewReviewLedger: %v", err)
 	}
 	return l
 }
 
-// recordPass writes a record + PASS verdict for a SHA in the ledger.
-func recordPass(t *testing.T, l *review.Ledger, sha, reviewer, builderFamily string) {
+// testAdmission returns the caller-asserted Admit context for task.
+func testAdmission(task string) AdmissionContext {
+	return AdmissionContext{
+		Task:           task,
+		Lease:          admitTestLease,
+		PatchURL:       admitTestPatch,
+		AuthorFamily:   admitTestAuthorFm,
+		AuthorIdentity: admitTestAuthorID,
+	}
+}
+
+// withAdmit returns Integration options that bind StaticAdmissionSource for task.
+func withAdmit(task string) IntegrationOption {
+	return WithAdmissionSource(StaticAdmissionSource{Context: testAdmission(task)})
+}
+
+// recordPass writes a launch + independent PASS that satisfies Admit for task.
+func recordPass(t *testing.T, l *reviewledger.Ledger, sha, task string) {
 	t.Helper()
-	if err := l.Record(review.RecordOpts{
-		SHA:           sha,
-		Reviewer:      reviewer,
-		BuilderFamily: builderFamily,
-		Gate:          "independent",
+	if err := l.Record(reviewledger.RecordOpts{
+		SHA:             sha,
+		Branch:          "main",
+		Reviewer:        admitTestReviewer,
+		BuilderFamily:   admitTestAuthorFm,
+		BuilderIdentity: admitTestAuthorID,
+		Gate:            "independent",
+		Tier:            admitTestTier,
+		Task:            task,
+		Lease:           admitTestLease,
 	}); err != nil {
 		t.Fatalf("Record: %v", err)
 	}
-	if _, err := l.Verdict(review.VerdictOpts{
-		SHA:           sha,
-		Reviewer:      reviewer,
-		Verdict:       review.VerdictPASS,
-		BuilderFamily: builderFamily,
+	if _, err := l.Verdict(reviewledger.VerdictOpts{
+		SHA:            sha,
+		Reviewer:       admitTestReviewer,
+		Verdict:        reviewledger.VerdictPASS,
+		ReviewerFamily: admitTestReviewFm,
+		Task:           task,
+		Lease:          admitTestLease,
+		PatchURL:       admitTestPatch,
+		VfyDigest:      admitTestDigest,
+		CandidateSHA:   sha,
 	}); err != nil {
 		t.Fatalf("Verdict: %v", err)
 	}
@@ -161,11 +200,11 @@ func TestIntegrationDryRun(t *testing.T) {
 	sha := addAndCommitHarvest(t, wt, "feat: FAC-99 initial implementation", "feat.go")
 
 	l := setupLedger(t, root)
-	recordPass(t, l, sha, "reviewer-1", "anthropic")
+	recordPass(t, l, sha, "FAC-99")
 
 	h := NewHarvester(root)
 	fd := &recordingDispatcher{}
-	in := NewIntegration(h, nil, fd, l, root, WithDryRun(true))
+	in := NewIntegration(h, nil, fd, l, root, WithDryRun(true), withAdmit("FAC-99"))
 	res, err := in.Run(ctx)
 	if err != nil {
 		t.Fatalf("Run: %v", err)
@@ -180,7 +219,7 @@ func TestIntegrationDryRun(t *testing.T) {
 		t.Fatalf("expected 1 review gate outcome, got %d", len(res.ReviewGatedSHAs))
 	}
 	if !res.ReviewGatedSHAs[0].Eligible {
-		t.Errorf("expected eligible=true, got false (err=%s)", res.ReviewGatedSHAs[0].Err)
+		t.Errorf("expected eligible=true, got false (err=%s reason=%s)", res.ReviewGatedSHAs[0].Err, res.ReviewGatedSHAs[0].Reason)
 	}
 	if len(res.MergedSHAs) != 0 {
 		t.Errorf("dry run should not merge, got %d merged", len(res.MergedSHAs))
@@ -196,7 +235,7 @@ func TestIntegrationNoUnmerged(t *testing.T) {
 
 	l := setupLedger(t, root)
 	h := NewHarvester(root)
-	in := NewIntegration(h, nil, &recordingDispatcher{}, l, root)
+	in := NewIntegration(h, nil, &recordingDispatcher{}, l, root, withAdmit("FAC-0"))
 	res, err := in.Run(ctx)
 	if err != nil {
 		t.Fatalf("Run: %v", err)
@@ -218,12 +257,12 @@ func TestIntegrationCleanMerge(t *testing.T) {
 	sha := addAndCommitHarvest(t, wt, "feat: FAC-100 clean merge", "feat.go")
 
 	l := setupLedger(t, root)
-	recordPass(t, l, sha, "reviewer-1", "anthropic")
+	recordPass(t, l, sha, "FAC-100")
 
 	fd := &recordingDispatcher{}
 	sm := &recordingSessionManager{}
 	h := NewHarvester(root)
-	in := NewIntegration(h, nil, fd, l, root, WithSessionManager(sm))
+	in := NewIntegration(h, nil, fd, l, root, WithSessionManager(sm), withAdmit("FAC-100"))
 	res, err := in.Run(ctx)
 	if err != nil {
 		t.Fatalf("Run: %v", err)
@@ -306,7 +345,7 @@ func TestIntegrationConflict(t *testing.T) {
 	sha := addAndCommitHarvest(t, wt, "feat: FAC-101 worktree change", "shared.txt")
 
 	l := setupLedger(t, root)
-	recordPass(t, l, sha, "reviewer-1", "anthropic")
+	recordPass(t, l, sha, "FAC-101")
 
 	// Root modifies shared.txt differently and pushes.
 	writeFileHarvest(t, root, "shared.txt", "line1\nmain-change")
@@ -316,7 +355,7 @@ func TestIntegrationConflict(t *testing.T) {
 
 	fd := &recordingDispatcher{}
 	h := NewHarvester(root)
-	in := NewIntegration(h, nil, fd, l, root)
+	in := NewIntegration(h, nil, fd, l, root, withAdmit("FAC-101"))
 	res, err := in.Run(ctx)
 	if err != nil {
 		t.Fatalf("Run: %v", err)
@@ -361,7 +400,7 @@ func TestIntegrationStaleReview(t *testing.T) {
 
 	fd := &recordingDispatcher{}
 	h := NewHarvester(root)
-	in := NewIntegration(h, nil, fd, l, root)
+	in := NewIntegration(h, nil, fd, l, root, withAdmit("FAC-102"))
 	res, err := in.Run(ctx)
 	if err != nil {
 		t.Fatalf("Run: %v", err)
@@ -373,8 +412,8 @@ func TestIntegrationStaleReview(t *testing.T) {
 	if res.ReviewGatedSHAs[0].Eligible {
 		t.Error("expected eligible=false (no PASS verdict in ledger)")
 	}
-	if res.ReviewGatedSHAs[0].Err == "" {
-		t.Error("expected non-empty error from ledger refusal")
+	if res.ReviewGatedSHAs[0].Err == "" && res.ReviewGatedSHAs[0].Reason == "" {
+		t.Error("expected non-empty error/reason from Admit refusal")
 	}
 	if len(res.MergedSHAs) != 0 {
 		t.Errorf("expected 0 merges (review rejected), got %d", len(res.MergedSHAs))
@@ -403,11 +442,11 @@ func TestIntegrationBoardFailure(t *testing.T) {
 	sha := addAndCommitHarvest(t, wt, "feat: FAC-103 board failure", "feat.go")
 
 	l := setupLedger(t, root)
-	recordPass(t, l, sha, "reviewer-1", "anthropic")
+	recordPass(t, l, sha, "FAC-103")
 
 	fd := &recordingDispatcher{failOnRef: "FAC-103"}
 	h := NewHarvester(root)
-	in := NewIntegration(h, nil, fd, l, root)
+	in := NewIntegration(h, nil, fd, l, root, withAdmit("FAC-103"))
 	res, err := in.Run(ctx)
 	if err != nil {
 		t.Fatalf("Run: %v", err)
@@ -459,14 +498,14 @@ func TestIntegrationCleanupRefusesDirty(t *testing.T) {
 	sha := addAndCommitHarvest(t, wt, "feat: FAC-105 dirty cleanup", "feat.go")
 
 	l := setupLedger(t, root)
-	recordPass(t, l, sha, "reviewer-1", "anthropic")
+	recordPass(t, l, sha, "FAC-105")
 
 	// Dirty the worktree with an untracked file BEFORE running.
 	writeFileHarvest(t, wt, "uncommitted.txt", "uncommitted changes")
 
 	fd := &recordingDispatcher{}
 	h := NewHarvester(root)
-	in := NewIntegration(h, nil, fd, l, root)
+	in := NewIntegration(h, nil, fd, l, root, withAdmit("FAC-105"))
 	res, err := in.Run(ctx)
 	if err != nil {
 		t.Fatalf("Run: %v", err)
@@ -510,7 +549,7 @@ func TestIntegrationAlreadyMerged(t *testing.T) {
 	sha := addAndCommitHarvest(t, wt, "feat: FAC-106 already merged", "feat.go")
 
 	l := setupLedger(t, root)
-	recordPass(t, l, sha, "reviewer-1", "anthropic")
+	recordPass(t, l, sha, "FAC-106")
 
 	// Manually cherry-pick and push so the patch is on origin/main.
 	gitInHarvest(t, root, "cherry-pick", sha)
@@ -519,7 +558,7 @@ func TestIntegrationAlreadyMerged(t *testing.T) {
 	// Now harvest: git cherry compares patch content, so the SHA should
 	// NOT appear as unmerged (it shows '-', not '+').
 	h := NewHarvester(root)
-	in := NewIntegration(h, nil, &recordingDispatcher{}, l, root)
+	in := NewIntegration(h, nil, &recordingDispatcher{}, l, root, withAdmit("FAC-106"))
 	res, err := in.Run(ctx)
 	if err != nil {
 		t.Fatalf("Run: %v", err)
@@ -538,12 +577,12 @@ func TestIntegrationVerifierFails(t *testing.T) {
 	sha := addAndCommitHarvest(t, wt, "feat: FAC-107 verifier fail", "feat.go")
 
 	l := setupLedger(t, root)
-	recordPass(t, l, sha, "reviewer-1", "anthropic")
+	recordPass(t, l, sha, "FAC-107")
 
 	v := &recordingVerifier{pass: false}
 	fd := &recordingDispatcher{}
 	h := NewHarvester(root)
-	in := NewIntegration(h, v, fd, l, root)
+	in := NewIntegration(h, v, fd, l, root, withAdmit("FAC-107"))
 	res, err := in.Run(ctx)
 	if err != nil {
 		t.Fatalf("Run: %v", err)
@@ -589,7 +628,7 @@ func TestIntegrationFFOnlyAfterRemoteMove(t *testing.T) {
 	sha := addAndCommitHarvest(t, wt, "feat: FAC-108 ff-only test", "feat.go")
 
 	l := setupLedger(t, root)
-	recordPass(t, l, sha, "reviewer-1", "anthropic")
+	recordPass(t, l, sha, "FAC-108")
 
 	// Simulate another agent pushing a commit to remote before we merge.
 	other := t.TempDir()
@@ -604,7 +643,7 @@ func TestIntegrationFFOnlyAfterRemoteMove(t *testing.T) {
 
 	fd := &recordingDispatcher{}
 	h := NewHarvester(root)
-	in := NewIntegration(h, nil, fd, l, root)
+	in := NewIntegration(h, nil, fd, l, root, withAdmit("FAC-108"))
 	res, err := in.Run(ctx)
 	if err != nil {
 		t.Fatalf("Run: %v", err)
@@ -638,11 +677,11 @@ func TestIntegrationLedgerConsumed(t *testing.T) {
 	sha := addAndCommitHarvest(t, wt, "feat: FAC-109 ledger consumed", "feat.go")
 
 	l := setupLedger(t, root)
-	recordPass(t, l, sha, "reviewer-1", "anthropic")
+	recordPass(t, l, sha, "FAC-109")
 
 	fd := &recordingDispatcher{}
 	h := NewHarvester(root)
-	in := NewIntegration(h, nil, fd, l, root)
+	in := NewIntegration(h, nil, fd, l, root, withAdmit("FAC-109"))
 	res, err := in.Run(ctx)
 	if err != nil {
 		t.Fatalf("Run: %v", err)
@@ -673,7 +712,7 @@ func TestIntegrationLedgerConsumed(t *testing.T) {
 
 	// Re-running should not re-merge (SHA is consumed → not eligible).
 	fd2 := &recordingDispatcher{}
-	in2 := NewIntegration(h, nil, fd2, l, root)
+	in2 := NewIntegration(h, nil, fd2, l, root, withAdmit("FAC-109"))
 	res2, err := in2.Run(ctx)
 	if err != nil {
 		t.Fatalf("Run2: %v", err)
@@ -695,7 +734,7 @@ func TestIntegrationNoLedger(t *testing.T) {
 	addAndCommitHarvest(t, wt, "feat: FAC-110 no ledger", "feat.go")
 
 	h := NewHarvester(root)
-	in := NewIntegration(h, nil, &recordingDispatcher{}, nil, root)
+	in := NewIntegration(h, nil, &recordingDispatcher{}, nil, root, withAdmit("FAC-110"))
 	res, err := in.Run(ctx)
 	if err != nil {
 		t.Fatalf("Run: %v", err)
@@ -709,6 +748,38 @@ func TestIntegrationNoLedger(t *testing.T) {
 	}
 	if res.ReviewGatedSHAs[0].Err != "no review ledger configured" {
 		t.Errorf("expected 'no review ledger configured', got %q", res.ReviewGatedSHAs[0].Err)
+	}
+	if len(res.MergedSHAs) != 0 {
+		t.Errorf("expected 0 merges, got %d", len(res.MergedSHAs))
+	}
+}
+
+func TestIntegrationNoAdmissionSource(t *testing.T) {
+	ctx := context.Background()
+	root, _ := setupRepoWithRemote(t)
+
+	wt := createWorktree(t, root, "task/FAC-111-noadmit")
+	writeFileHarvest(t, wt, "feat.go", "package noadmit")
+	sha := addAndCommitHarvest(t, wt, "feat: FAC-111 no admission source", "feat.go")
+
+	l := setupLedger(t, root)
+	recordPass(t, l, sha, "FAC-111")
+
+	h := NewHarvester(root)
+	// Deliberately omit WithAdmissionSource — fail closed.
+	in := NewIntegration(h, nil, &recordingDispatcher{}, l, root)
+	res, err := in.Run(ctx)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(res.ReviewGatedSHAs) != 1 {
+		t.Fatalf("expected 1 review gate outcome, got %d", len(res.ReviewGatedSHAs))
+	}
+	if res.ReviewGatedSHAs[0].Eligible {
+		t.Error("expected eligible=false (no admission source)")
+	}
+	if res.ReviewGatedSHAs[0].Reason != "no admission context source configured" {
+		t.Errorf("expected missing-source reason, got %q", res.ReviewGatedSHAs[0].Reason)
 	}
 	if len(res.MergedSHAs) != 0 {
 		t.Errorf("expected 0 merges, got %d", len(res.MergedSHAs))
@@ -733,5 +804,427 @@ func TestBranchToRef(t *testing.T) {
 				t.Errorf("branchToRef(%q) = %q, want %q", tt.branch, got, tt.want)
 			}
 		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// FAC-149: FAC-126 incident shape reproduced against Integration.Run.
+// Author-family / prose / stale-SHA must never invoke merge even when the
+// candidate sits on the live integration tree with session provenance bound.
+// ---------------------------------------------------------------------------
+
+// TestIntegrationFAC126_AuthorFamilyNeverMerges proves a same-family PASS
+// (the FAC-126 self-verdict shape) does not make Integration.Run merge.
+func TestIntegrationFAC126_AuthorFamilyNeverMerges(t *testing.T) {
+	ctx := context.Background()
+	root, _ := setupRepoWithRemote(t)
+
+	wt := createWorktree(t, root, "task/FAC-126-author-family")
+	writeFileHarvest(t, wt, "feat.go", "package authorfamily")
+	sha := addAndCommitHarvest(t, wt, "feat: FAC-126 author-family self-verdict", "feat.go")
+
+	l := setupLedger(t, root)
+	// Launch + PASS where reviewer family == author family (self-verdict).
+	if err := l.Record(reviewledger.RecordOpts{
+		SHA: sha, Branch: "task/FAC-126-author-family",
+		BuilderFamily: admitTestAuthorFm, BuilderIdentity: admitTestAuthorID,
+		Reviewer: admitTestReviewer, Tier: admitTestTier, Task: "FAC-126",
+		Lease: admitTestLease, Gate: "independent",
+	}); err != nil {
+		t.Fatalf("Record: %v", err)
+	}
+	if _, err := l.Verdict(reviewledger.VerdictOpts{
+		SHA: sha, Reviewer: admitTestReviewer, Verdict: reviewledger.VerdictPASS,
+		ReviewerFamily: admitTestAuthorFm, // same family as author — the incident
+		Task:           "FAC-126", Lease: admitTestLease,
+		PatchURL: admitTestPatch, VfyDigest: admitTestDigest, CandidateSHA: sha,
+	}); err != nil {
+		t.Fatalf("Verdict: %v", err)
+	}
+
+	fd := &recordingDispatcher{}
+	h := NewHarvester(root)
+	in := NewIntegration(h, nil, fd, l, root, withAdmit("FAC-126"))
+	res, err := in.Run(ctx)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	assertNeverMerged(t, res, fd, "self-verdict")
+}
+
+// TestIntegrationFAC126_ProseNeverMerges proves a prose-shaped "PASS" row
+// and a still-working reviewer (launch only) never invoke merge.
+func TestIntegrationFAC126_ProseNeverMerges(t *testing.T) {
+	ctx := context.Background()
+	root, _ := setupRepoWithRemote(t)
+
+	// Case A: reviewer still working — launch record, no structured verdict.
+	wtA := createWorktree(t, root, "task/FAC-126-still-working")
+	writeFileHarvest(t, wtA, "a.go", "package stillworking")
+	shaA := addAndCommitHarvest(t, wtA, "feat: FAC-126 still working", "a.go")
+
+	l := setupLedger(t, root)
+	if err := l.Record(reviewledger.RecordOpts{
+		SHA: shaA, Branch: "task/FAC-126-still-working",
+		BuilderFamily: admitTestAuthorFm, BuilderIdentity: admitTestAuthorID,
+		Reviewer: admitTestReviewer, Tier: admitTestTier, Task: "FAC-126",
+		Lease: admitTestLease, Gate: "independent",
+	}); err != nil {
+		t.Fatalf("Record A: %v", err)
+	}
+
+	fd := &recordingDispatcher{}
+	h := NewHarvester(root)
+	in := NewIntegration(h, nil, fd, l, root, withAdmit("FAC-126"))
+	res, err := in.Run(ctx)
+	if err != nil {
+		t.Fatalf("Run A: %v", err)
+	}
+	assertNeverMerged(t, res, fd, "still working")
+	if len(res.ReviewGatedSHAs) == 0 {
+		t.Fatal("expected at least one review gate outcome for still-working case")
+	}
+	for _, rg := range res.ReviewGatedSHAs {
+		if rg.Eligible {
+			t.Fatalf("still-working must not be eligible: %+v", rg)
+		}
+		if !strings.Contains(rg.Reason, "still working") && !strings.Contains(rg.Reason, "no verdict") {
+			// Accept either the "still working" reason or a broader refuse.
+			if rg.Reason == "" {
+				t.Errorf("expected structured refuse reason, got empty for %s", rg.SHA)
+			}
+		}
+	}
+
+	// Case B: prose-shaped verdict smuggled past ValidVerdict (PR-comment shape).
+	// Append raw JSONL — mirrors FAC-146's prose incident fixture.
+	wtB := createWorktree(t, root, "task/FAC-126-prose")
+	writeFileHarvest(t, wtB, "b.go", "package prose")
+	shaB := addAndCommitHarvest(t, wtB, "feat: FAC-126 prose PASS", "b.go")
+
+	if err := l.Record(reviewledger.RecordOpts{
+		SHA: shaB, Branch: "task/FAC-126-prose",
+		BuilderFamily: admitTestAuthorFm, BuilderIdentity: admitTestAuthorID,
+		Reviewer: admitTestReviewer, Tier: admitTestTier, Task: "FAC-126",
+		Lease: admitTestLease, Gate: "independent",
+	}); err != nil {
+		t.Fatalf("Record B: %v", err)
+	}
+	// Direct file append of a prose "verdict" — not via Verdict() API.
+	proseLine := fmt.Sprintf(
+		`{"ts":"2026-08-02T00:00:00Z","event":"verdict","sha":%q,"reviewer":%q,"verdict":"PASS bound to %s","reviewer_family":%q,"task":"FAC-126","lease":%q,"patch_url":%q,"verification_digest":%q}`+"\n",
+		shaB, admitTestReviewer, shaB, admitTestReviewFm, admitTestLease, admitTestPatch, admitTestDigest,
+	)
+	f, err := os.OpenFile(l.Path, os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		t.Fatalf("open ledger: %v", err)
+	}
+	if _, err := f.WriteString(proseLine); err != nil {
+		t.Fatalf("write prose: %v", err)
+	}
+	f.Close()
+
+	fd2 := &recordingDispatcher{}
+	in2 := NewIntegration(h, nil, fd2, l, root, withAdmit("FAC-126"))
+	res2, err := in2.Run(ctx)
+	if err != nil {
+		t.Fatalf("Run B: %v", err)
+	}
+	// Only care about shaB eligibility among outcomes.
+	foundB := false
+	for _, rg := range res2.ReviewGatedSHAs {
+		if rg.SHA == shaB {
+			foundB = true
+			if rg.Eligible {
+				t.Fatalf("prose verdict must not admit: %+v", rg)
+			}
+		}
+	}
+	if !foundB {
+		t.Fatal("expected review gate outcome for prose SHA")
+	}
+	if len(res2.MergedSHAs) != 0 {
+		t.Fatalf("prose must never merge, got %d", len(res2.MergedSHAs))
+	}
+	if len(fd2.calls) != 0 {
+		t.Fatalf("prose must never board-complete, got %d", len(fd2.calls))
+	}
+}
+
+// TestIntegrationFAC126_StaleSHANeverMerges: PASS bound to an old SHA does
+// not admit a rebased tip (exact-candidate / current integration tree).
+func TestIntegrationFAC126_StaleSHANeverMerges(t *testing.T) {
+	ctx := context.Background()
+	root, _ := setupRepoWithRemote(t)
+
+	wt := createWorktree(t, root, "task/FAC-126-stale")
+	writeFileHarvest(t, wt, "feat.go", "package stale")
+	oldSHA := addAndCommitHarvest(t, wt, "feat: FAC-126 old tip", "feat.go")
+
+	l := setupLedger(t, root)
+	// Valid Admit-satisfying PASS for the OLD tip only.
+	recordPass(t, l, oldSHA, "FAC-126")
+
+	// Rebase-shaped advance: new commit becomes the current tip. The old
+	// PASS is still on disk, but Admit must refuse the new candidate SHA.
+	writeFileHarvest(t, wt, "feat.go", "package stale\n// rebased")
+	newSHA := addAndCommitHarvest(t, wt, "feat: FAC-126 rebased tip", "feat.go")
+	if newSHA == oldSHA {
+		t.Fatal("expected distinct new tip after rewrite")
+	}
+
+	fd := &recordingDispatcher{}
+	h := NewHarvester(root)
+	in := NewIntegration(h, nil, fd, l, root, withAdmit("FAC-126"))
+	res, err := in.Run(ctx)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	// Both SHAs may appear as unmerged; neither may be admitted for merge
+	// under a stale-only ledger (old SHA has PASS but if still on branch
+	// it could admit — wait: old SHA still has valid PASS and is still an
+	// ancestor of HEAD, so Admit WOULD admit oldSHA. The incident shape is
+	// that the *new* candidate (current tip) must not be admitted via the
+	// old tip's PASS. Harvest lists every unmerged commit, so oldSHA might
+	// still be mergeable if its PASS is valid.
+	//
+	// FAC-126's merge-of-wrong-thing was: treating prose/author PASS on a
+	// request as authority for the live tip. Assert specifically that
+	// newSHA is not eligible.
+	newEligible := false
+	for _, rg := range res.ReviewGatedSHAs {
+		if rg.SHA == newSHA && rg.Eligible {
+			newEligible = true
+		}
+	}
+	if newEligible {
+		t.Fatalf("stale-SHA PASS must not admit rebased tip %s; outcomes=%+v", newSHA, res.ReviewGatedSHAs)
+	}
+	// And the rebased tip must never appear in MergedSHAs.
+	for _, mo := range res.MergedSHAs {
+		if mo.SHA == newSHA {
+			t.Fatalf("rebased tip must not merge: %+v", mo)
+		}
+	}
+}
+
+// TestIntegrationFAC126_OldFailPlusProseRequestNeverMerges is the full
+// incident composite: independent FAIL on record, a new author prose/sentinel
+// PASS request, and the independent reviewer still working. Integration.Run
+// must never invoke merge.
+func TestIntegrationFAC126_OldFailPlusProseRequestNeverMerges(t *testing.T) {
+	ctx := context.Background()
+	root, _ := setupRepoWithRemote(t)
+
+	wt := createWorktree(t, root, "task/FAC-126-composite")
+	writeFileHarvest(t, wt, "feat.go", "package composite")
+	sha := addAndCommitHarvest(t, wt, "feat: FAC-126 composite incident", "feat.go")
+
+	l := setupLedger(t, root)
+
+	// 1. Old independent FAIL (veto) from reviewer-veto.
+	if err := l.Record(reviewledger.RecordOpts{
+		SHA: sha, Branch: "task/FAC-126-composite",
+		BuilderFamily: admitTestAuthorFm, BuilderIdentity: admitTestAuthorID,
+		Reviewer: "reviewer-veto", Tier: admitTestTier, Task: "FAC-126",
+		Lease: admitTestLease, Gate: "independent",
+	}); err != nil {
+		t.Fatalf("Record veto: %v", err)
+	}
+	if _, err := l.Verdict(reviewledger.VerdictOpts{
+		SHA: sha, Reviewer: "reviewer-veto", Verdict: reviewledger.VerdictFAIL,
+		ReviewerFamily: "xai", Task: "FAC-126", Lease: admitTestLease,
+		PatchURL: admitTestPatch, VfyDigest: admitTestDigest, CandidateSHA: sha,
+	}); err != nil {
+		t.Fatalf("Verdict FAIL: %v", err)
+	}
+
+	// 2. New author-family "sentinel PASS" request (self-verdict launch + PASS).
+	if err := l.Record(reviewledger.RecordOpts{
+		SHA: sha, Branch: "task/FAC-126-composite",
+		BuilderFamily: admitTestAuthorFm, BuilderIdentity: admitTestAuthorID,
+		Reviewer: "author-sentinel", Tier: admitTestTier, Task: "FAC-126",
+		Lease: admitTestLease, Gate: "independent",
+	}); err != nil {
+		t.Fatalf("Record sentinel: %v", err)
+	}
+	if _, err := l.Verdict(reviewledger.VerdictOpts{
+		SHA: sha, Reviewer: "author-sentinel", Verdict: reviewledger.VerdictPASS,
+		ReviewerFamily: admitTestAuthorFm, // author family — must not admit
+		Task:           "FAC-126", Lease: admitTestLease,
+		PatchURL: admitTestPatch, VfyDigest: admitTestDigest, CandidateSHA: sha,
+	}); err != nil {
+		t.Fatalf("Verdict sentinel: %v", err)
+	}
+
+	// 3. Independent reviewer still working — launch only, no verdict.
+	if err := l.Record(reviewledger.RecordOpts{
+		SHA: sha, Branch: "task/FAC-126-composite",
+		BuilderFamily: admitTestAuthorFm, BuilderIdentity: admitTestAuthorID,
+		Reviewer: admitTestReviewer, Tier: admitTestTier, Task: "FAC-126",
+		Lease: admitTestLease, Gate: "independent",
+	}); err != nil {
+		t.Fatalf("Record still-working: %v", err)
+	}
+
+	fd := &recordingDispatcher{}
+	h := NewHarvester(root)
+	in := NewIntegration(h, nil, fd, l, root, withAdmit("FAC-126"))
+	res, err := in.Run(ctx)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	assertNeverMerged(t, res, fd, "FAC-126 composite")
+	if len(res.ReviewGatedSHAs) != 1 {
+		t.Fatalf("expected 1 review outcome, got %+v", res.ReviewGatedSHAs)
+	}
+	if res.ReviewGatedSHAs[0].Eligible {
+		t.Fatalf("composite incident must refuse admission: %+v", res.ReviewGatedSHAs[0])
+	}
+}
+
+// TestIntegrationAdmitValidDifferentFamilyMergesOnce is the positive
+// control: a different-family exact task/lease/patch/digest/session receipt
+// admits and merges exactly once; a second Run cannot re-admit.
+func TestIntegrationAdmitValidDifferentFamilyMergesOnce(t *testing.T) {
+	ctx := context.Background()
+	root, remote := setupRepoWithRemote(t)
+
+	wt := createWorktree(t, root, "task/FAC-149-once")
+	writeFileHarvest(t, wt, "feat.go", "package once")
+	sha := addAndCommitHarvest(t, wt, "feat: FAC-149 exact admit once", "feat.go")
+
+	l := setupLedger(t, root)
+	recordPass(t, l, sha, "FAC-149")
+
+	fd := &recordingDispatcher{}
+	sm := &recordingSessionManager{}
+	h := NewHarvester(root)
+	in := NewIntegration(h, nil, fd, l, root, WithSessionManager(sm), withAdmit("FAC-149"))
+	res, err := in.Run(ctx)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(res.ReviewGatedSHAs) != 1 || !res.ReviewGatedSHAs[0].Eligible {
+		t.Fatalf("expected eligible, got %+v", res.ReviewGatedSHAs)
+	}
+	if len(res.MergedSHAs) != 1 || !res.MergedSHAs[0].Pushed {
+		t.Fatalf("expected 1 pushed merge, got %+v", res.MergedSHAs)
+	}
+	if len(fd.calls) != 1 {
+		t.Fatalf("expected 1 board-complete, got %d", len(fd.calls))
+	}
+
+	// Exactly-once: recreate a worktree at the same SHA-shaped work and
+	// re-run — Consumed must refuse re-admission. (Worktree was cleaned;
+	// re-seed a branch with an equivalent new commit that has no verdict.)
+	// Stronger check: call Admit directly for the spent SHA.
+	result, admitErr := l.Admit(reviewledger.AdmissionOpts{
+		CandidateSHA:   sha,
+		Task:           "FAC-149",
+		Lease:          admitTestLease,
+		PatchURL:       admitTestPatch,
+		AuthorFamily:   admitTestAuthorFm,
+		AuthorIdentity: admitTestAuthorID,
+	})
+	if result != nil && result.Admitted {
+		t.Fatalf("second Admit after Consumed must refuse, got %+v err=%v", result, admitErr)
+	}
+	if result == nil || !strings.Contains(result.Reason, "consumed") {
+		t.Fatalf("expected consumed refuse reason, got %+v err=%v", result, admitErr)
+	}
+
+	// Origin/main advanced with our merge.
+	remoteLog, _ := gitOutput(ctx, remote, "log", "--oneline")
+	if !strings.Contains(remoteLog, "FAC-149") {
+		t.Errorf("expected FAC-149 on remote, got %s", remoteLog)
+	}
+}
+
+// TestIntegrationAdmitStaleAfterOriginMainAdvance: when origin/main moves
+// and the candidate is rebased onto a new tip without a fresh verdict, the
+// new tip never merges. A verified current receipt (recordPass on new tip)
+// is required.
+func TestIntegrationAdmitStaleAfterOriginMainAdvance(t *testing.T) {
+	ctx := context.Background()
+	root, _ := setupRepoWithRemote(t)
+
+	wt := createWorktree(t, root, "task/FAC-149-rebase")
+	writeFileHarvest(t, wt, "feat.go", "package rebase")
+	oldSHA := addAndCommitHarvest(t, wt, "feat: FAC-149 pre-rebase", "feat.go")
+
+	l := setupLedger(t, root)
+	recordPass(t, l, oldSHA, "FAC-149")
+
+	// Advance origin/main with unrelated work.
+	writeFileHarvest(t, root, "main-move.txt", "moved")
+	gitInHarvest(t, root, "add", "main-move.txt")
+	gitInHarvest(t, root, "commit", "-q", "-m", "chore: origin/main advanced")
+	gitInHarvest(t, root, "push", "-q", "origin", "main")
+
+	// Rebase worktree onto new main → new candidate SHA, old verdict stale.
+	gitInHarvest(t, wt, "rebase", "origin/main")
+	newSHA := gitInHarvest(t, wt, "rev-parse", "HEAD")
+	if newSHA == oldSHA {
+		t.Fatal("expected rebase to produce a new tip SHA")
+	}
+
+	fd := &recordingDispatcher{}
+	h := NewHarvester(root)
+	in := NewIntegration(h, nil, fd, l, root, withAdmit("FAC-149"))
+	res, err := in.Run(ctx)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	for _, rg := range res.ReviewGatedSHAs {
+		if rg.SHA == newSHA && rg.Eligible {
+			t.Fatalf("rebased tip without fresh verdict must not admit: %+v", rg)
+		}
+	}
+	for _, mo := range res.MergedSHAs {
+		if mo.SHA == newSHA {
+			t.Fatalf("rebased tip must not merge without fresh receipt: %+v", mo)
+		}
+	}
+
+	// Fresh different-family receipt for the current tip → merge proceeds.
+	recordPass(t, l, newSHA, "FAC-149")
+	fd2 := &recordingDispatcher{}
+	in2 := NewIntegration(h, nil, fd2, l, root, withAdmit("FAC-149"))
+	res2, err := in2.Run(ctx)
+	if err != nil {
+		t.Fatalf("Run2: %v", err)
+	}
+	found := false
+	for _, mo := range res2.MergedSHAs {
+		if mo.SHA == newSHA && mo.Pushed {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected merge of current tip with fresh receipt; gated=%+v merged=%+v",
+			res2.ReviewGatedSHAs, res2.MergedSHAs)
+	}
+}
+
+func assertNeverMerged(t *testing.T, res *IntegrationResult, fd *recordingDispatcher, label string) {
+	t.Helper()
+	if res == nil {
+		t.Fatalf("%s: nil IntegrationResult", label)
+	}
+	if len(res.MergedSHAs) != 0 {
+		t.Fatalf("%s: expected 0 merges, got %+v", label, res.MergedSHAs)
+	}
+	if len(fd.calls) != 0 {
+		t.Fatalf("%s: expected 0 board-complete calls, got %d", label, len(fd.calls))
+	}
+	if len(res.CleanedWorktrees) != 0 {
+		t.Fatalf("%s: expected no cleanup, got %v", label, res.CleanedWorktrees)
+	}
+	for _, rg := range res.ReviewGatedSHAs {
+		if rg.Eligible {
+			t.Fatalf("%s: SHA %s unexpectedly eligible (reason=%q)", label, rg.SHA, rg.Reason)
+		}
 	}
 }

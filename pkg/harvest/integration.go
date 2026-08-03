@@ -10,38 +10,88 @@ import (
 	"time"
 
 	"github.com/Kampe/Herdforge/pkg/lock"
-	"github.com/Kampe/Herdforge/pkg/review"
+	"github.com/Kampe/Herdforge/pkg/reviewledger"
 	hsync "github.com/Kampe/Herdforge/pkg/sync"
 )
 
 // Integration implements the README contract: a serialized merge pipeline
-// that consumes a Harvester (exact-SHA), Verifier (test gate), review.Ledger
-// (review gate), and Dispatcher (board-complete) as dependencies.
+// that consumes a Harvester (exact-SHA), Verifier (test gate),
+// reviewledger.Ledger via Admit (review gate), and Dispatcher
+// (board-complete) as dependencies.
 //
 // Phases:
 //  1. Harvest — list worktrees, check unmerged commits via git cherry.
-//  2. Review gate — for each unmerged SHA, call review.Ledger.Eligible to
-//     verify a qualifying PASS verdict exists. The commit message is NOT
-//     parsed for the gate decision.
+//  2. Review gate — for each unmerged SHA, resolve live AdmissionContext
+//     (task/lease/patch/session provenance) and call reviewledger.Admit.
+//     Prose, author-family self-verdicts, stale SHAs, and missing
+//     structured receipts never admit. The commit message is NOT parsed.
 //  3. Merge gate — acquire lock.DirLock (PID-liveness, not timer-only),
 //     checkout main, fetch origin/main, ff-only merge, cherry-pick, test
 //     gate, push with race retry.
 //  4. Post-merge — proof-readback via sync.MergeEvidence, board-complete
-//     via Dispatcher, ledger.Consumed.
+//     via Dispatcher, ledger.Consumed (exactly-once admission spent).
 //  5. Cleanup — remove fully-merged worktrees with dirty/unique-work
-//     protection and session teardown.
+//     protection and session teardown (only after Consumed readback).
 
 type Integration struct {
-	Harvester      *Harvester
-	Verifier       Verifier       // optional; nil skips test gate
-	Dispatcher     Dispatcher     // required for board-complete
-	Ledger         *review.Ledger // required for review gate
-	SessionManager SessionManager // optional; nil skips session teardown
-	RepoRoot       string
-	LockDir        string
-	MaxMergeAge    time.Duration
-	DryRun         bool
-	BuilderFamily  string // filter for ledger eligibility; empty = no filter
+	Harvester        *Harvester
+	Verifier         Verifier                // optional; nil skips test gate
+	Dispatcher       Dispatcher              // required for board-complete
+	Ledger           *reviewledger.Ledger    // required for Admit review gate
+	AdmissionSource  AdmissionSource         // required; supplies caller-asserted Admit opts
+	SessionManager   SessionManager          // optional; nil skips session teardown
+	RepoRoot         string
+	LockDir          string
+	MaxMergeAge      time.Duration
+	DryRun           bool
+}
+
+// AdmissionContext is the caller-asserted merge context bound into
+// reviewledger.Admit. Every field must match a validated ledger verdict
+// for the exact candidate SHA; empty fields fail closed inside Admit.
+// This is session/claim provenance, never free text from a PR comment.
+type AdmissionContext struct {
+	Task           string
+	Lease          string
+	PatchURL       string
+	AuthorFamily   string
+	AuthorIdentity string
+}
+
+// AdmissionSource resolves live claim/lease/session provenance for a
+// candidate about to pass the review gate. A nil source or a resolution
+// error fails closed — no merge without asserted context.
+type AdmissionSource interface {
+	ForCandidate(ctx context.Context, sha string, uw UnmergedWork) (AdmissionContext, error)
+}
+
+// StaticAdmissionSource returns the same AdmissionContext for every
+// candidate. Used by single-candidate runs and hermetic tests.
+type StaticAdmissionSource struct {
+	Context AdmissionContext
+}
+
+// ForCandidate implements AdmissionSource.
+func (s StaticAdmissionSource) ForCandidate(_ context.Context, _ string, _ UnmergedWork) (AdmissionContext, error) {
+	return s.Context, nil
+}
+
+// MapAdmissionSource resolves per-SHA context. Missing keys fail closed.
+type MapAdmissionSource map[string]AdmissionContext
+
+// ForCandidate implements AdmissionSource.
+func (m MapAdmissionSource) ForCandidate(_ context.Context, sha string, _ UnmergedWork) (AdmissionContext, error) {
+	if c, ok := m[sha]; ok {
+		return c, nil
+	}
+	// Also try full-length matches when harvest listed a short SHA and
+	// the map was keyed by the full object id (or vice versa).
+	for k, c := range m {
+		if strings.HasPrefix(k, sha) || strings.HasPrefix(sha, k) {
+			return c, nil
+		}
+	}
+	return AdmissionContext{}, fmt.Errorf("no admission context for candidate sha %s", sha)
 }
 
 // Verifier is the consumed contract for test-gate verification.
@@ -83,9 +133,10 @@ func WithMaxMergeAge(d time.Duration) IntegrationOption {
 	return func(i *Integration) { i.MaxMergeAge = d }
 }
 
-// WithBuilderFamily sets the builder family filter for ledger eligibility.
-func WithBuilderFamily(f string) IntegrationOption {
-	return func(i *Integration) { i.BuilderFamily = f }
+// WithAdmissionSource sets the source of caller-asserted Admit context
+// (task, lease generation, patch id, author session provenance).
+func WithAdmissionSource(src AdmissionSource) IntegrationOption {
+	return func(i *Integration) { i.AdmissionSource = src }
 }
 
 // WithSessionManager sets the session manager for cleanup.
@@ -104,11 +155,14 @@ type IntegrationResult struct {
 }
 
 // ReviewGateOutcome records the result of the review gate for a SHA.
+// Reason is the structured Admit rejection reason (diagnostic only);
+// Eligible is the sole merge-authority signal.
 type ReviewGateOutcome struct {
 	SHA      string `json:"sha"`
 	Branch   string `json:"branch"`
 	Worktree string `json:"worktree"`
 	Eligible bool   `json:"eligible"`
+	Reason   string `json:"reason,omitempty"`
 	Err      string `json:"err,omitempty"`
 }
 
@@ -125,7 +179,8 @@ type MergeOutcome struct {
 }
 
 // NewIntegration creates an Integration with sensible defaults.
-func NewIntegration(h *Harvester, v Verifier, d Dispatcher, l *review.Ledger, repoRoot string, opts ...IntegrationOption) *Integration {
+// l must be a reviewledger.Ledger; merge admission always goes through Admit.
+func NewIntegration(h *Harvester, v Verifier, d Dispatcher, l *reviewledger.Ledger, repoRoot string, opts ...IntegrationOption) *Integration {
 	i := &Integration{
 		Harvester:   h,
 		Verifier:    v,
@@ -250,17 +305,74 @@ func (in *Integration) runReviewGate(ctx context.Context, sha string, uw Unmerge
 
 	if in.Ledger == nil {
 		outcome.Err = "no review ledger configured"
+		outcome.Reason = "no review ledger configured"
+		return outcome
+	}
+	if in.AdmissionSource == nil {
+		outcome.Err = "no admission context source configured"
+		outcome.Reason = "no admission context source configured"
 		return outcome
 	}
 
-	eligible, err := in.Ledger.Eligible(sha, in.BuilderFamily)
-	if err != nil {
+	// Exact-current-candidate gate at the integration tree: the SHA harvest
+	// listed must still be a real commit on the worktree branch. A rebase
+	// that advanced HEAD to a new object invalidates any prior verdict
+	// bound to the old SHA (FAC-126 stale-SHA shape).
+	if err := ensureCandidateOnBranch(ctx, uw.WorktreePath, sha); err != nil {
 		outcome.Err = err.Error()
-		outcome.Eligible = false
+		outcome.Reason = "candidate not current on integration tree"
 		return outcome
 	}
-	outcome.Eligible = eligible
+
+	adm, err := in.AdmissionSource.ForCandidate(ctx, sha, uw)
+	if err != nil {
+		outcome.Err = err.Error()
+		outcome.Reason = "admission context resolution failed"
+		return outcome
+	}
+
+	result, err := in.Ledger.Admit(reviewledger.AdmissionOpts{
+		CandidateSHA:   sha,
+		Task:           adm.Task,
+		Lease:          adm.Lease,
+		PatchURL:       adm.PatchURL,
+		AuthorFamily:   adm.AuthorFamily,
+		AuthorIdentity: adm.AuthorIdentity,
+	})
+	// Fail closed: I/O/parse errors never look like "no verdict".
+	// Policy refusals return a non-nil result with Admitted=false plus a
+	// structured Reason; callers gate solely on Admitted.
+	if result != nil && result.Admitted {
+		outcome.Eligible = true
+		outcome.Reason = result.Reason
+		return outcome
+	}
+	outcome.Eligible = false
+	if result != nil && result.Reason != "" {
+		outcome.Reason = result.Reason
+		outcome.Err = result.Reason
+	} else if err != nil {
+		outcome.Err = err.Error()
+		outcome.Reason = err.Error()
+	} else {
+		outcome.Err = "admission refused"
+		outcome.Reason = "admission refused"
+	}
 	return outcome
+}
+
+// ensureCandidateOnBranch fails closed when sha is not a commit reachable
+// from the worktree HEAD. That is the "current integration tree" check:
+// advancing/rebasing the branch to a new tip without a fresh verdict
+// cannot smuggle an old SHA past the gate via a stale harvest snapshot.
+func ensureCandidateOnBranch(ctx context.Context, worktreePath, sha string) error {
+	if _, err := gitOutput(ctx, worktreePath, "rev-parse", "--verify", "-q", sha+"^{commit}"); err != nil {
+		return fmt.Errorf("candidate sha %s is not a commit in worktree: %w", sha, err)
+	}
+	if err := runGit(ctx, worktreePath, "merge-base", "--is-ancestor", sha, "HEAD"); err != nil {
+		return fmt.Errorf("candidate sha %s is not on current branch HEAD (stale integration tip)", sha)
+	}
+	return nil
 }
 
 func (in *Integration) runMergeGate(ctx context.Context, rg ReviewGateOutcome) (*MergeOutcome, error) {
