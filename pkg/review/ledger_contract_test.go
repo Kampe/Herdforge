@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 )
 
@@ -42,7 +43,7 @@ func TestLedgerContract_StrictAndOrdering(t *testing.T) {
 			{Event: "verdict", SHA: "c", Reviewer: "r", Verdict: "PASS", Tier: "R0"},
 			{Event: "verdict", SHA: "d", Reviewer: "one", Verdict: "FAIL"},
 			{Event: "verdict", SHA: "d", Reviewer: "two", Verdict: "PASS"},
-		}, wantPass: map[string]string{"a": "R2", "b": "", "c": "R0", "d": ""}, wantVeto: map[string]bool{"d": true}},
+		}, wantPass: map[string]string{"a": "R2", "b": "", "c": "R1", "d": ""}, wantVeto: map[string]bool{"d": true}},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -54,10 +55,8 @@ func TestLedgerContract_StrictAndOrdering(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			for sha, want := range tc.wantPass {
-				if got := passes[sha]; got != want {
-					t.Errorf("PASSes[%s]=%q want %q", sha, got, want)
-				}
+			if !reflect.DeepEqual(passes, tc.wantPass) {
+				t.Fatalf("PASSes=%v want exact %v", passes, tc.wantPass)
 			}
 			veto, err := l.Vetoed(context.Background())
 			if err != nil {
@@ -75,6 +74,57 @@ func TestLedgerContract_StrictAndOrdering(t *testing.T) {
 	}
 }
 
+func TestLedgerContract_TimestampOrderingAndRecordTierAuthority(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "ledger.jsonl")
+	rows := []LedgerRow{
+		{Timestamp: "2025-01-01T00:00:03.000000000Z", Event: "verdict", SHA: "physical", Reviewer: "r", Verdict: "PASS"},
+		{Timestamp: "2025-01-01T00:00:02.000000000Z", Event: "verdict", SHA: "physical", Reviewer: "r", Verdict: "FAIL"},
+		{Timestamp: "2025-01-01T00:00:02.000000001Z", Event: "verdict", SHA: "nano", Reviewer: "r", Verdict: "FAIL"},
+		{Timestamp: "2025-01-01T00:00:02.000000002Z", Event: "verdict", SHA: "nano", Reviewer: "r", Verdict: "PASS"},
+		{Timestamp: "2025-01-01T00:00:01Z", Event: "record", SHA: "tier", Tier: "R1"},
+		{Timestamp: "2025-01-01T00:00:04Z", Event: "verdict", SHA: "tier", Reviewer: "r", Verdict: "PASS", Tier: "R0"},
+		{Timestamp: "2025-01-01T00:00:05Z", Event: "record", SHA: "tier", Tier: ""},
+		{Timestamp: "2025-01-01T00:00:06Z", Event: "verdict", SHA: "tier", Reviewer: "r", Verdict: "PASS"},
+		{Timestamp: "2025-01-01T00:00:02Z", Event: "verdict", SHA: "blocked", Reviewer: "r", Verdict: "PASS"},
+		{Timestamp: "2025-01-01T00:00:03Z", Event: "verdict", SHA: "blocked", Reviewer: "r", Verdict: "FAIL"},
+	}
+	writeJSONL(t, path, rows...)
+	l := OpenLedger(path)
+	passes, err := l.PASSes(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantPass := map[string]string{"physical": "", "nano": "", "tier": ""}
+	if !reflect.DeepEqual(passes, wantPass) {
+		t.Fatalf("timestamp/tier PASSes=%v want %v", passes, wantPass)
+	}
+	veto, err := l.Vetoed(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantVeto := map[string]bool{"blocked": true}
+	if !reflect.DeepEqual(veto, wantVeto) {
+		t.Fatalf("timestamp Vetoed=%v want %v", veto, wantVeto)
+	}
+	verdicts, err := l.Verdicts(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(verdicts) != 8 || verdicts[0].SHA != "physical" || verdicts[0].Verdict != "FAIL" || verdicts[0].Index != 1 || verdicts[1].SHA != "blocked" || verdicts[1].At >= verdicts[2].At {
+		t.Fatalf("verdict ordering=%+v", verdicts)
+	}
+}
+
+func TestLedgerContract_MalformedTimestampFailsClosed(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "ledger.jsonl")
+	writeJSONL(t, path, LedgerRow{Timestamp: "not-a-time", Event: "verdict", SHA: "x", Reviewer: "r", Verdict: "PASS"})
+	if _, err := OpenLedger(path).PASSes(context.Background()); err == nil {
+		t.Fatal("malformed timestamp must fail closed")
+	}
+}
+
 func TestLedgerContract_MalformedJSONLIsHardError(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "ledger.jsonl")
@@ -85,6 +135,23 @@ not-json
 	}
 	if _, err := OpenLedger(path).Snapshot(); err == nil {
 		t.Fatal("malformed ledger must fail closed")
+	}
+}
+
+func TestLedgerContract_MissingSHAIsHardError(t *testing.T) {
+	for _, event := range []string{"record", "verdict", "enqueue", "consumed"} {
+		t.Run(event, func(t *testing.T) {
+			dir := t.TempDir()
+			l := OpenLedger(filepath.Join(dir, "ledger.jsonl"))
+			if event == "enqueue" || event == "consumed" {
+				writeJSONL(t, l.QueuePath, LedgerRow{Event: event})
+			} else {
+				writeJSONL(t, l.Path, LedgerRow{Event: event})
+			}
+			if _, err := l.Snapshot(); err == nil {
+				t.Fatalf("%s without sha must fail closed", event)
+			}
+		})
 	}
 }
 
