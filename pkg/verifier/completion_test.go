@@ -2,17 +2,14 @@ package verifier
 
 import (
 	"context"
-	"os/exec"
 	"strings"
 	"testing"
 )
 
 func vgit(t *testing.T, dir string, args ...string) {
 	t.Helper()
-	cmd := exec.Command("git", args...)
-	cmd.Dir = dir
-	if out, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("git %v: %v\n%s", args, err, out)
+	if _, err := runGit(dir, args...); err != nil {
+		t.Fatalf("git %v: %v", args, err)
 	}
 }
 
@@ -20,6 +17,7 @@ func vgit(t *testing.T, dir string, args ...string) {
 // commits are controllable per test.
 func completionRepo(t *testing.T, subjects ...string) string {
 	dir := t.TempDir()
+	registerTempDirLifecycleBarrier(t, dir)
 	vgit(t, dir, "init", "-q", "-b", "main")
 	vgit(t, dir, "config", "user.email", "t@h.local")
 	vgit(t, dir, "config", "user.name", "t")
@@ -33,9 +31,8 @@ func completionRepo(t *testing.T, subjects ...string) string {
 }
 
 func mustHead(t *testing.T, dir string) string {
-	cmd := exec.Command("git", "rev-parse", "HEAD")
-	cmd.Dir = dir
-	out, err := cmd.Output()
+	t.Helper()
+	out, err := runGit(dir, "rev-parse", "HEAD")
 	if err != nil {
 		t.Fatal(err)
 	}

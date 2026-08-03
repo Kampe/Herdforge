@@ -4,6 +4,7 @@ import (
 	"context"
 	"os/exec"
 	"strings"
+	"syscall"
 )
 
 // FAC-98 / FAC-116: the worktree completion gate. An agent's work is only
@@ -22,9 +23,7 @@ type CompletionCheck struct {
 }
 
 func gitOut(dir string, args ...string) (string, error) {
-	cmd := exec.Command("git", args...)
-	cmd.Dir = dir
-	out, err := cmd.Output()
+	out, err := runGit(dir, args...)
 	return strings.TrimSpace(string(out)), err
 }
 
@@ -89,5 +88,19 @@ func runShell(ctx context.Context, dir, command string) bool {
 	}
 	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
 	cmd.Dir = dir
-	return cmd.Run() == nil
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error {
+		if cmd.Process == nil {
+			return nil
+		}
+		return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+	}
+	if err := cmd.Start(); err != nil {
+		return false
+	}
+	err = cmd.Wait()
+	if cmd.Process != nil {
+		reapProcessGroup(cmd.Process.Pid)
+	}
+	return err == nil
 }

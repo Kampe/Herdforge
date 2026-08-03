@@ -1,6 +1,7 @@
 package verifier
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -195,7 +196,22 @@ func (v *Verifier) execute(ctx context.Context, dir string, policy EnvironmentPo
 	// open (for example, `sh -c 'sleep 3'`). WaitDelay bounds that wait and
 	// keeps the mutation transaction's restoration defer reachable.
 	cmd.WaitDelay = 100 * time.Millisecond
-	output, err := cmd.CombinedOutput()
+
+	// Own the process group explicitly so residual writers cannot outlive the
+	// mutation boundary and race testing.TempDir RemoveAll on dir/.git.
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	startErr := cmd.Start()
+	if startErr != nil {
+		return nil, startErr
+	}
+	waitErr := cmd.Wait()
+	if cmd.Process != nil {
+		reapProcessGroup(cmd.Process.Pid)
+	}
+	output := append(stdout.Bytes(), stderr.Bytes()...)
+	err := waitErr
 	result := &Result{
 		Passed:       err == nil,
 		Outcome:      OutcomePASS,
@@ -374,9 +390,7 @@ func validSHA(sha string) bool {
 }
 
 func currentSHA(dir string) (string, error) {
-	cmd := exec.Command("git", "rev-parse", "--verify", "HEAD^{commit}")
-	cmd.Dir = dir
-	out, err := cmd.Output()
+	out, err := runGit(dir, "rev-parse", "--verify", "HEAD^{commit}")
 	if err != nil {
 		return "", fmt.Errorf("read candidate SHA: %w", err)
 	}
@@ -395,9 +409,7 @@ func requireCleanCandidate(dir, expectedSHA string) error {
 	if actual != expectedSHA {
 		return fmt.Errorf("candidate SHA %s does not match expected %s", actual, expectedSHA)
 	}
-	cmd := exec.Command("git", "status", "--porcelain", "--untracked-files=all")
-	cmd.Dir = dir
-	out, err := cmd.Output()
+	out, err := runGit(dir, "status", "--porcelain", "--untracked-files=all")
 	if err != nil {
 		return fmt.Errorf("read candidate status: %w", err)
 	}
@@ -587,9 +599,7 @@ func pathWithin(root, target string) bool {
 }
 
 func resolvedGitDir(root string) (string, error) {
-	cmd := exec.Command("git", "rev-parse", "--git-dir")
-	cmd.Dir = root
-	out, err := cmd.Output()
+	out, err := runGit(root, "rev-parse", "--git-dir")
 	if err != nil {
 		return "", fmt.Errorf("resolve git directory: %w", err)
 	}
@@ -643,6 +653,10 @@ func (v *Verifier) RunMutationCheck(ctx context.Context, dir string, targetFile 
 // original bytes in a defer, and PASS again after restoration. Cancellation,
 // timeout, dirty state, stale SHA, tooling errors, and restoration failures
 // are BLOCKED. A mutant that passes is FAIL.
+//
+// On every return path the owned subprocess process-groups are reaped before
+// the function returns so callers (including tests using t.TempDir) never
+// race a late writer under dir/.git during cleanup.
 func (v *Verifier) RunMutationCheckForCandidate(ctx context.Context, dir string, req MutationRequest) (*MutationResult, error) {
 	if v == nil {
 		return nil, errors.New("nil verifier")
@@ -650,6 +664,9 @@ func (v *Verifier) RunMutationCheckForCandidate(ctx context.Context, dir string,
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	// Each owned subprocess reaps its own process group after Wait. Path-guard
+	// failures never start Execute; successful mutations still return only
+	// after baseline/mutant/final commands and git inspections have reaped.
 	if err := validateRequest(VerificationRequest{
 		CandidateSHA:      req.CandidateSHA,
 		BaseSHA:           req.BaseSHA,

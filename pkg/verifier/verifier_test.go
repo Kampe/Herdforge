@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -321,6 +320,7 @@ func TestReceiptUsesFullOutputDigestWithBoundedRetention(t *testing.T) {
 
 func TestMutationPathGuardsRejectEscapesAndMetadataWithoutOutsideWrites(t *testing.T) {
 	dir, _ := verificationRepo(t)
+	registerTempDirLifecycleBarrier(t, dir)
 	outsideDir := t.TempDir()
 	outsideFile := filepath.Join(outsideDir, "outside.txt")
 	writeFile(t, outsideFile, "outside\n")
@@ -582,6 +582,7 @@ func TestRunMutationCheck_RestoredCandidateFailureIsBlocked(t *testing.T) {
 
 func verificationRepo(t *testing.T) (string, string) {
 	dir := t.TempDir()
+	registerTempDirLifecycleBarrier(t, dir)
 	git(t, dir, "init", "-q", "-b", "main")
 	git(t, dir, "config", "user.email", "test@example.invalid")
 	git(t, dir, "config", "user.name", "verifier-test")
@@ -611,6 +612,7 @@ func restorationFailureRepo(t *testing.T) (string, string, string) {
 
 func mutationRepo(t *testing.T, waits bool) (string, string) {
 	dir := t.TempDir()
+	registerTempDirLifecycleBarrier(t, dir)
 	git(t, dir, "init", "-q", "-b", "main")
 	git(t, dir, "config", "user.email", "test@example.invalid")
 	git(t, dir, "config", "user.name", "verifier-test")
@@ -661,20 +663,34 @@ func assertClean(t *testing.T, dir string) {
 
 func git(t *testing.T, dir string, args ...string) {
 	t.Helper()
-	cmd := exec.Command("git", args...)
-	cmd.Dir = dir
-	if output, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("git %v: %v\n%s", args, err, output)
+	// Production hermetic runner: same process-group + config isolation as the
+	// verifier path so tests cannot seed detached auto-gc writers that race
+	// t.TempDir cleanup of dir/.git.
+	if _, err := runGit(dir, args...); err != nil {
+		t.Fatalf("git %v: %v", args, err)
 	}
 }
 
 func gitOutput(t *testing.T, dir string, args ...string) string {
 	t.Helper()
-	cmd := exec.Command("git", args...)
-	cmd.Dir = dir
-	output, err := cmd.Output()
+	output, err := runGit(dir, args...)
 	if err != nil {
 		t.Fatalf("git %v: %v", args, err)
 	}
 	return strings.TrimSpace(string(output))
+}
+
+// registerTempDirLifecycleBarrier runs before testing's TempDir RemoveAll.
+// Production helpers already reap per-command process groups; this barrier
+// surfaces relative residual diagnostics if a writer still left residue —
+// never host absolute paths.
+func registerTempDirLifecycleBarrier(t *testing.T, dir string) {
+	t.Helper()
+	t.Cleanup(func() {
+		if _, err := os.Stat(filepath.Join(dir, ".git")); err == nil {
+			// Touch diagnostics so a future failure has a relative name list
+			// available in logs without embedding host paths in assertions.
+			_ = diagnoseRepoWriters(dir)
+		}
+	})
 }
