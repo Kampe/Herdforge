@@ -135,6 +135,117 @@ func TestSelectNextTask_BlockedFailsClosedWithoutEvidenceStore(t *testing.T) {
 	}
 }
 
+func TestSelectNextTask_HardAfterSoftPersistsBothTransactionally(t *testing.T) {
+	const project = "proj-159"
+	mp := provider.NewMemoryProvider()
+	graph := deps.NewMemoryStore()
+	soft := &provider.Task{ID: "soft", Ref: "FAC-1", Priority: provider.PriorityHigh, Status: provider.StatusToDo, ProjectID: project, Labels: []string{"herd-smith"}}
+	hard := &provider.Task{ID: "hard", Ref: "FAC-2", Priority: provider.PriorityHigh, Status: provider.StatusToDo, ProjectID: project, Labels: []string{"herd-smith"}, Description: dependencyFence("FAC-2", "hard")}
+	mp.AddTask(soft)
+	mp.AddTask(hard)
+	graph.AddTask(soft) // FAC-2 is absent from the relation snapshot: stale/unresolved hard stop.
+	local, err := store.New(filepath.Join(t.TempDir(), "attention.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer local.Close()
+	e := NewEngine(&config.Config{TaskProvider: config.TaskProvider{ProjectID: project}}, mp, nil, local, nil, nil)
+	e.Deps = graph
+	_, err = e.SelectNextTask(context.Background(), "herd-smith")
+	if err == nil || !strings.Contains(err.Error(), "dependency gate") {
+		t.Fatalf("hard selection failure must return error: %v", err)
+	}
+	history, err := local.BlockedSelectionHistory(10)
+	if err != nil || len(history) != 2 {
+		t.Fatalf("soft and hard evidence must commit together: history=%+v err=%v", history, err)
+	}
+	codes := map[string]bool{}
+	for _, item := range history {
+		codes[item.Code] = true
+	}
+	if !codes["missing_provenance"] || !codes["stale"] {
+		t.Fatalf("missing soft/hard evidence: %+v", history)
+	}
+}
+
+func TestSelectNextTask_CapabilityFailurePersistsGlobalAttention(t *testing.T) {
+	const project = "proj-159"
+	mp := provider.NewMemoryProvider()
+	task := &provider.Task{ID: "id-1", Ref: "FAC-1", Priority: provider.PriorityHigh, Status: provider.StatusToDo, ProjectID: project, Labels: []string{"herd-smith"}, Description: dependencyFence("FAC-1", "id-1")}
+	mp.AddTask(task)
+	graph := deps.NewMemoryStore()
+	graph.AddTask(task)
+	graph.Capable = false
+	local, err := store.New(filepath.Join(t.TempDir(), "attention.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer local.Close()
+	e := NewEngine(&config.Config{TaskProvider: config.TaskProvider{ProjectID: project}}, mp, nil, local, nil, nil)
+	e.Deps = graph
+	_, err = e.SelectNextTask(context.Background(), "herd-smith")
+	if err == nil || !strings.Contains(err.Error(), "dependency gate") {
+		t.Fatalf("capability failure must return error: %v", err)
+	}
+	history, err := local.BlockedSelectionHistory(10)
+	if err != nil || len(history) != 1 || history[0].Code != "capability" || history[0].Ref != "" || history[0].Reason == "" {
+		t.Fatalf("global capability attention missing: history=%+v err=%v", history, err)
+	}
+}
+
+func TestSelectNextTask_UnresolvedPersistsPerTaskAttention(t *testing.T) {
+	const project = "proj-159"
+	mp := provider.NewMemoryProvider()
+	broken := &provider.Task{ID: "id-unresolved", Ref: "", Priority: provider.PriorityHigh, Status: provider.StatusToDo, ProjectID: project, Labels: []string{"herd-smith"}}
+	mp.AddTask(broken)
+	local, err := store.New(filepath.Join(t.TempDir(), "attention.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer local.Close()
+	e := NewEngine(&config.Config{TaskProvider: config.TaskProvider{ProjectID: project}}, mp, nil, local, nil, nil)
+	e.Deps = deps.NewMemoryStore()
+	_, err = e.SelectNextTask(context.Background(), "herd-smith")
+	if err == nil || !strings.Contains(err.Error(), "dependency gate") {
+		t.Fatalf("unresolved task must return error: %v", err)
+	}
+	history, err := local.BlockedSelectionHistory(10)
+	if err != nil || len(history) != 1 || history[0].Code != "unresolved" || history[0].TaskID != "id-unresolved" {
+		t.Fatalf("unresolved attention missing: history=%+v err=%v", history, err)
+	}
+}
+
+func TestSelectNextTask_MalformedAndEvidenceWriteFailureFailClosed(t *testing.T) {
+	const project = "proj-159"
+	mp := provider.NewMemoryProvider()
+	task := &provider.Task{ID: "id-1", Ref: "FAC-1", Priority: provider.PriorityHigh, Status: provider.StatusToDo, ProjectID: project, Labels: []string{"herd-smith"}, Description: "```herd-deps-v1\n{bad\n```"}
+	mp.AddTask(task)
+	graph := deps.NewMemoryStore()
+	graph.AddTask(task)
+	local, err := store.New(filepath.Join(t.TempDir(), "attention.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	e := NewEngine(&config.Config{TaskProvider: config.TaskProvider{ProjectID: project}}, mp, nil, local, nil, nil)
+	e.Deps = graph
+	if _, err := e.SelectNextTask(context.Background(), "herd-smith"); err == nil || !strings.Contains(err.Error(), "provenance") {
+		t.Fatalf("malformed provenance must fail closed: %v", err)
+	}
+	history, err := local.BlockedSelectionHistory(10)
+	if err != nil || len(history) != 1 || history[0].Code != "malformed_provenance" {
+		t.Fatalf("malformed provenance attention missing: history=%+v err=%v", history, err)
+	}
+	if err := local.Close(); err != nil {
+		t.Fatal(err)
+	}
+	// A later blocked selection must report evidence-write failure, never act idle.
+	task.Description = ""
+	mp.AddTask(task)
+	if _, err := e.SelectNextTask(context.Background(), "herd-smith"); err == nil || !strings.Contains(err.Error(), "record dependency BLOCKED evidence") {
+		t.Fatalf("closed evidence store must fail closed: %v", err)
+	}
+}
+
 func TestSelectNextTask_NoRoleMatch(t *testing.T) {
 	mp := provider.NewMemoryProvider()
 	mp.AddTask(&provider.Task{

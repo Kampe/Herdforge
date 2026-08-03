@@ -153,7 +153,11 @@ func (e *Engine) selectNextTaskWithRevision(ctx context.Context, role string) (*
 		p, perr := deps.ExtractProvenanceFromText(t.Description)
 		if perr != nil {
 			// Fail closed on malformed structured provenance — never guess.
-			return nil, "", fmt.Errorf("select next task: provenance %s: %w", t.Ref, perr)
+			selectionErr := fmt.Errorf("select next task: provenance %s: %w", t.Ref, perr)
+			if evidenceErr := e.persistSelectionEvidence(nil, &deps.BlockedError{Ref: deps.Ref(t.Ref), Code: "malformed_provenance", Reason: perr.Error()}); evidenceErr != nil {
+				return nil, "", errors.Join(selectionErr, evidenceErr)
+			}
+			return nil, "", selectionErr
 		}
 		// Missing provenance → per-card BLOCKED inside SelectEligibleRefs
 		// (not invent empty OK). Only Present records are attached.
@@ -163,18 +167,16 @@ func (e *Engine) selectNextTaskWithRevision(ctx context.Context, role string) (*
 	}
 	eligible, revisions, blocked, gerr := deps.SelectEligibleRefs(ctx, store, deps.EntryPulse, matched, desiredByRef)
 	if gerr != nil {
-		// Capability / hard store failures are fail-closed (not "no candidates").
-		return nil, "", fmt.Errorf("select next task: dependency gate: %w", gerr)
-	}
-	if len(blocked) > 0 && e.Store == nil {
-		return nil, "", fmt.Errorf("select next task: durable dependency BLOCKED evidence unavailable: store is nil")
-	}
-	if e.Store != nil {
-		for _, br := range blocked {
-			if _, berr := e.Store.RecordBlockedSelection(string(br.Ref), string(br.TaskID), string(br.Entrypoint), br.Code, br.Reason, br.GraphRevision, br.ProviderRevision); berr != nil {
-				return nil, "", fmt.Errorf("select next task: record dependency block: %w", berr)
-			}
+		// Capability / hard store failures are fail-closed, but their attention
+		// evidence and any earlier soft blocks must be durable before returning.
+		selectionErr := fmt.Errorf("select next task: dependency gate: %w", gerr)
+		if evidenceErr := e.persistSelectionEvidence(blocked, gerr); evidenceErr != nil {
+			return nil, "", errors.Join(selectionErr, evidenceErr)
 		}
+		return nil, "", selectionErr
+	}
+	if evidenceErr := e.persistSelectionEvidence(blocked, nil); evidenceErr != nil {
+		return nil, "", evidenceErr
 	}
 	if len(eligible) == 0 {
 		if len(blocked) > 0 {
@@ -185,6 +187,57 @@ func (e *Engine) selectNextTaskWithRevision(ctx context.Context, role string) (*
 	// eligible preserves input order (already priority DESC / ref ASC).
 	head := eligible[0]
 	return head, revisions[head.Ref], nil
+}
+
+func (e *Engine) persistSelectionEvidence(blocked []deps.GateResult, selectionErr error) error {
+	if e.Store == nil {
+		if len(blocked) == 0 && selectionErr == nil {
+			return nil
+		}
+		return fmt.Errorf("select next task: durable dependency BLOCKED evidence unavailable: store is nil")
+	}
+	items := make([]store.BlockedSelection, 0, len(blocked)+1)
+	for _, br := range blocked {
+		items = append(items, store.BlockedSelection{
+			Ref: string(br.Ref), TaskID: string(br.TaskID), Entrypoint: string(br.Entrypoint),
+			Code: br.Code, Reason: br.Reason, GraphRevision: br.GraphRevision, ProviderRevision: br.ProviderRevision,
+		})
+	}
+	if selectionErr != nil {
+		var be *deps.BlockedError
+		if errors.As(selectionErr, &be) {
+			duplicate := false
+			for _, item := range items {
+				if item.Ref == string(be.Ref) && item.Code == be.Code {
+					duplicate = true
+					break
+				}
+			}
+			if !duplicate {
+				items = append(items, store.BlockedSelection{
+					Ref: string(be.Ref), Entrypoint: string(deps.EntryPulse), Code: be.Code,
+					Reason: blockedErrorReason(be),
+				})
+			}
+		}
+	}
+	if len(items) == 0 {
+		return nil
+	}
+	if _, err := e.Store.RecordBlockedSelections(items); err != nil {
+		return fmt.Errorf("select next task: record dependency BLOCKED evidence: %w", err)
+	}
+	return nil
+}
+
+func blockedErrorReason(be *deps.BlockedError) string {
+	if be == nil || len(be.Details) == 0 {
+		if be == nil {
+			return "dependency gate blocked"
+		}
+		return be.Reason
+	}
+	return be.Reason + ": " + strings.Join(be.Details, "; ")
 }
 
 func summarizeBlocked(blocked []deps.GateResult) string {

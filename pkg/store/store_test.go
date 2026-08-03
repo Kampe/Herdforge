@@ -65,8 +65,8 @@ func TestBlockedSelectionIdentityIsIdempotentAndRevisionSensitive(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	repeat, err := s.RecordBlockedSelection("FAC-7", "task-7", "pulse", "drift", "old reason", "graph-1", "provider-1")
-	if err != nil || repeat.ID != first.ID {
+	repeat, err := s.RecordBlockedSelection("FAC-7", "task-7", "pulse", "drift", "changed reason", "graph-1", "provider-1")
+	if err != nil || repeat.ID != first.ID || repeat.Reason != "changed reason" {
 		t.Fatalf("same blocked identity must be idempotent: first=%+v repeat=%+v err=%v", first, repeat, err)
 	}
 	changed, err := s.RecordBlockedSelection("FAC-7", "task-7", "pulse", "drift", "new reason", "graph-2", "provider-1")
@@ -85,8 +85,32 @@ func TestBlockedSelectionIdentityIsIdempotentAndRevisionSensitive(t *testing.T) 
 	if err != nil || len(history) != 2 {
 		t.Fatalf("restart must retain idempotent history: history=%+v err=%v", history, err)
 	}
-	if history[0].Reason != "new reason" || history[1].Reason != "old reason" {
+	if history[0].Reason != "new reason" || history[1].Reason != "changed reason" {
 		t.Fatalf("changed evidence readback order/content wrong: %+v", history)
+	}
+}
+
+func TestBlockedSelectionHistoryRefreshIsMostRecent(t *testing.T) {
+	s := tempStore(t)
+	if _, err := s.RecordBlockedSelection("FAC-old", "old", "pulse", "drift", "initial", "graph-old", "provider"); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 12; i++ {
+		ref := fmt.Sprintf("FAC-new-%02d", i)
+		if _, err := s.RecordBlockedSelection(ref, ref, "pulse", "drift", "new", ref, "provider"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	refreshed, err := s.RecordBlockedSelection("FAC-old", "old", "pulse", "drift", "refreshed", "graph-old", "provider")
+	if err != nil || refreshed.Reason != "refreshed" {
+		t.Fatalf("refresh must return persisted current content: %+v err=%v", refreshed, err)
+	}
+	history, err := s.BlockedSelectionHistory(10)
+	if err != nil || len(history) != 10 {
+		t.Fatalf("status history limit failed: len=%d err=%v", len(history), err)
+	}
+	if history[0].Ref != "FAC-old" || history[0].Reason != "refreshed" {
+		t.Fatalf("refreshed identity must be first/current: %+v", history)
 	}
 }
 

@@ -454,6 +454,12 @@ func SelectEligibleRefs(
 			var be *BlockedError
 			if errors.As(gerr, &be) {
 				if hardSelectionCodes[be.Code] {
+					// Preserve the per-task hard stop before returning the whole
+					// selection error; the caller must persist it with earlier soft blocks.
+					blocked = append(blocked, GateResult{
+						Ref: Ref(t.Ref), TaskID: TaskID(t.ID), Entrypoint: entrypoint,
+						OK: false, Code: be.Code, Reason: blockedReason(be), Details: append([]string(nil), be.Details...),
+					})
 					return nil, nil, blocked, gerr
 				}
 				if gr != nil {
