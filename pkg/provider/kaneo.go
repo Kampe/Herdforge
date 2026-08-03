@@ -109,13 +109,26 @@ func dtoToTask(dto kaneoTaskDTO) *Task {
 	}
 }
 
+// kaneoTaskMatches reports whether dto is exactly the requested task by id or ref.
+// Fail-closed: empty wantID never matches (callers must request a concrete id).
+func kaneoTaskMatches(dto kaneoTaskDTO, wantID string) bool {
+	if wantID == "" {
+		return false
+	}
+	return dto.ID == wantID || dto.Ref == wantID
+}
+
 // decodeKaneoTaskBody accepts a single task object or a JSON array of tasks.
-// Cross-package mocks and some Kaneo/CLI shapes return a one-element list for
-// get/readback; fail-closed empty or multi-match without a wanted id.
+// Both shapes require an exact match on the requested id or ref — a sole
+// nonmatching array element or an object for a different task is a hard error
+// so status readback cannot confirm the wrong card.
 func decodeKaneoTaskBody(statusCode int, body []byte, wantID string) (kaneoTaskDTO, error) {
 	// Shared fail-closed gate for non-2xx and structured error payloads.
 	if err := DecodeJSONBytes(statusCode, body, nil); err != nil {
 		return kaneoTaskDTO{}, err
+	}
+	if wantID == "" {
+		return kaneoTaskDTO{}, fmt.Errorf("kaneo task decode: requested id is required")
 	}
 	trimmed := bytes.TrimSpace(body)
 	if len(trimmed) == 0 {
@@ -129,21 +142,21 @@ func decodeKaneoTaskBody(statusCode int, body []byte, wantID string) (kaneoTaskD
 		if len(dtos) == 0 {
 			return kaneoTaskDTO{}, fmt.Errorf("kaneo task not found: empty list")
 		}
-		if wantID != "" {
-			for _, d := range dtos {
-				if d.ID == wantID || d.Ref == wantID || strings.EqualFold(d.Ref, wantID) {
-					return d, nil
-				}
+		for _, d := range dtos {
+			if kaneoTaskMatches(d, wantID) {
+				return d, nil
 			}
 		}
-		if len(dtos) == 1 {
-			return dtos[0], nil
-		}
+		// Sole nonmatching element is still a hard error (not implicit accept).
 		return kaneoTaskDTO{}, fmt.Errorf("kaneo task %q not found in list of %d", wantID, len(dtos))
 	}
 	var dto kaneoTaskDTO
 	if err := json.Unmarshal(trimmed, &dto); err != nil {
 		return kaneoTaskDTO{}, fmt.Errorf("decode JSON: %w", err)
+	}
+	if !kaneoTaskMatches(dto, wantID) {
+		return kaneoTaskDTO{}, fmt.Errorf("kaneo task id mismatch: requested %q got id=%q ref=%q",
+			wantID, dto.ID, dto.Ref)
 	}
 	return dto, nil
 }
