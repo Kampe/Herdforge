@@ -540,6 +540,20 @@ func runPulse() {
 		fmt.Fprintf(os.Stderr, "failed to load config: %v\n", err)
 		os.Exit(1)
 	}
+	var pulseLane *config.LaneDef
+	var pulseDecision *router.LaunchDecision
+	if *spawn {
+		pulseLane = findLaneForRole(cfg, *role)
+		if pulseLane == nil {
+			fmt.Fprintf(os.Stderr, "no lane configured for role '%s'\n", *role)
+			os.Exit(1)
+		}
+		pulseDecision, err = launchAdmission(cfg, *role, herdr.IsAvailable(), routedLaneDecision(context.Background(), nil))
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "launch route rejected before provider/claim: %v\n", err)
+			os.Exit(1)
+		}
+	}
 
 	tp, tpErr := loadTaskProvider(cfg)
 	if tpErr != nil {
@@ -561,29 +575,6 @@ func runPulse() {
 	defer st.Close()
 
 	eng := daemon.NewEngine(cfg, tp, mr, st, wm, v)
-	var pulseLane *config.LaneDef
-	var pulseDecision *router.LaunchDecision
-	if *spawn {
-		pulseLane = findLaneForRole(cfg, *role)
-		if pulseLane == nil {
-			fmt.Fprintf(os.Stderr, "no lane configured for role '%s'\n", *role)
-			os.Exit(1)
-		}
-		if !herdr.IsAvailable() {
-			fmt.Fprintf(os.Stderr, "herdr CLI not found — cannot claim launch-required pulse\n")
-			os.Exit(1)
-		}
-		pulseDecision, err = laneLaunchDecision(context.Background(), pulseLane, nil)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "launch route rejected before pulse claim: %v\n", err)
-			os.Exit(1)
-		}
-		if err := validateDecisionBeforeSideEffect(pulseDecision, "pulse"); err != nil {
-			fmt.Fprintf(os.Stderr, "launch decision rejected before pulse claim: %v\n", err)
-			os.Exit(1)
-		}
-	}
-
 	task, err := eng.RunPulse(context.Background(), *role)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "pulse sweep failed: %v\n", err)
@@ -950,7 +941,7 @@ func runStanding() {
 		if !lane.Standing {
 			continue
 		}
-		decision, routeErr := laneLaunchDecision(context.Background(), &lane, nil)
+		decision, routeErr := launchAdmission(cfg, lane.Role, true, routedLaneDecision(context.Background(), nil))
 		if routeErr != nil {
 			fmt.Fprintf(os.Stderr, "  launch route rejected for lane %s: %v\n", lane.Name, routeErr)
 			continue
@@ -1029,7 +1020,7 @@ func runUp() {
 		fmt.Fprintf(os.Stderr, "herdr CLI not found\n")
 		os.Exit(1)
 	}
-	decision, err := laneLaunchDecision(context.Background(), lane, nil)
+	decision, err := launchAdmission(cfg, lane.Role, true, routedLaneDecision(context.Background(), nil))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "launch route rejected before tab creation: %v\n", err)
 		os.Exit(1)
@@ -1226,7 +1217,7 @@ func runReview() {
 			fmt.Fprintf(os.Stderr, "no lane configured for role 'reviewer'\n")
 			os.Exit(1)
 		}
-		decision, err := laneLaunchDecision(context.Background(), lane, task)
+		decision, err := launchAdmission(cfg, lane.Role, true, routedLaneDecision(context.Background(), task))
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "review launch route rejected before tab creation: %v\n", err)
 			os.Exit(1)
@@ -1844,7 +1835,7 @@ func runDispatch() {
 			fmt.Fprintf(os.Stderr, "lane '%s' not found\n", *laneName)
 			os.Exit(1)
 		}
-		decision, err = laneLaunchDecision(context.Background(), lane, nil)
+		decision, err = launchAdmission(cfg, lane.Role, true, routedLaneDecision(context.Background(), nil))
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "launch route rejected before dispatch: %v\n", err)
 			os.Exit(1)
@@ -2380,7 +2371,7 @@ func runForge() {
 		fmt.Println("No worker lane configured; refusing forge claim")
 		return
 	}
-	forgeDecision, err = laneLaunchDecision(ctx, forgeLane, nil)
+	forgeDecision, err = launchAdmission(cfg, forgeLane.Role, true, routedLaneDecision(ctx, nil))
 	if err != nil {
 		fmt.Printf("Launch route rejected before forge claim: %v\n", err)
 		return
@@ -2475,6 +2466,10 @@ func findLaneByName(cfg *config.Config, name string) *config.LaneDef {
 	return nil
 }
 
+func routedLaneDecision(ctx context.Context, task *provider.Task) func(*config.LaneDef) (*router.LaunchDecision, error) {
+	return func(lane *config.LaneDef) (*router.LaunchDecision, error) { return laneLaunchDecision(ctx, lane, task) }
+}
+
 func laneLaunchDecision(ctx context.Context, lane *config.LaneDef, task *provider.Task) (*router.LaunchDecision, error) {
 	if lane == nil {
 		return nil, fmt.Errorf("launch route requires a configured lane")
@@ -2553,6 +2548,31 @@ func validateDecisionBeforeSideEffect(decision *router.LaunchDecision, taskRef s
 		return fmt.Errorf("missing routed launch decision")
 	}
 	return launch.Validate(launch.Request{Decision: decision, TaskRef: taskRef}, nil)
+}
+
+// launchAdmission is the compiled pre-side-effect gate shared by launch-capable
+// entrypoints. The continuation is deliberately after config, availability,
+// router authority, and decision validation; tests inject real lifecycle seams
+// into it to prove rejected lanes cannot claim or spawn.
+func launchAdmission(cfg *config.Config, role string, herdrAvailable bool, route func(*config.LaneDef) (*router.LaunchDecision, error)) (*router.LaunchDecision, error) {
+	lane := findLaneForRole(cfg, role)
+	if lane == nil {
+		return nil, fmt.Errorf("no lane configured for role %q", role)
+	}
+	if !herdrAvailable {
+		return nil, fmt.Errorf("herdr unavailable for launch-required role %q", role)
+	}
+	if err := validateLaneLaunchConfig(lane); err != nil {
+		return nil, err
+	}
+	decision, err := route(lane)
+	if err != nil {
+		return nil, err
+	}
+	if err := validateDecisionBeforeSideEffect(decision, lane.Name); err != nil {
+		return nil, err
+	}
+	return decision, nil
 }
 
 func runKick() {
