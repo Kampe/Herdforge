@@ -102,7 +102,7 @@ func TestHandBuiltApprovedTupleFailsClosed(t *testing.T) {
 	d := &router.LaunchDecision{Role: router.RoleWorker, Shape: Implementation, Provider: WorkerProvider, Model: WorkerModel, Effort: WorkerEffort, Argv: []string{"codex", "--model", WorkerModel, "-c", "model_reasoning_effort=medium", "-a", "never"}}
 	// This is an exact public-field forgery: recompute the production
 	// canonical digest byte-for-byte instead of merely omitting Proof.
-	canonical := fmt.Sprintf("%s|%s|%s|%s|%s|%s|%s|%d|%s|%s|%s|%s", "herdforge-fac-175-launch-decision-v1", "worker", Implementation, WorkerProvider, WorkerModel, WorkerEffort, d.CandidateSHA, d.LeaseGeneration, d.TaskRef, d.ProbeKey, d.Rationale, strings.Join(d.Argv, "\x00"))
+	canonical := fmt.Sprintf("%s|%s|%s|%s|%s|%s|%s|%d|%s|%s|%s|%s|%s", "herdforge-fac-175-launch-decision-v1", "worker", Implementation, WorkerProvider, WorkerModel, WorkerEffort, d.CandidateSHA, d.LeaseGeneration, d.TaskRef, d.Scope, d.ProbeKey, d.Rationale, strings.Join(d.Argv, "\x00"))
 	sum := sha256.Sum256([]byte(canonical))
 	d.Proof = "sha256:" + hex.EncodeToString(sum[:])
 	r := Request{Decision: d}

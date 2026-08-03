@@ -43,6 +43,16 @@ const (
 	CapUnknown  CapabilityTier = "unknown"
 )
 
+// Launch scopes distinguish a standing lane identity from a concrete task
+// assignment. Scope is part of the public integrity digest; it is not inferred
+// from the shape of a task reference.
+const (
+	ScopeGeneric   = ""
+	ScopeLane      = "lane"
+	ScopeTask      = "task"
+	ScopeCandidate = "candidate"
+)
+
 // LaunchRequest is the input to SurfaceRouter.Decide. All policy fields that
 // affect effort or coherence must be set by the caller; missing probe proof
 // for probe-gated models fails closed.
@@ -80,6 +90,7 @@ type LaunchRequest struct {
 	RequestedEffort string
 	TaskRef         string
 	LeaseGeneration int64
+	Scope           string
 	// ExcludedFamily is an extra family filter (reviewers also exclude AuthorFamily).
 	ExcludedFamily string
 	// ProbeResults maps ProbeKey(provider, model) → PASS. Missing keys for
@@ -115,6 +126,7 @@ type LaunchDecision struct {
 	Argv            []string       `json:"argv,omitempty"`
 	TaskRef         string         `json:"task_ref,omitempty"`
 	LeaseGeneration int64          `json:"lease_generation,omitempty"`
+	Scope           string         `json:"scope,omitempty"`
 	Proof           string         `json:"proof"`
 	issuanceToken   [32]byte
 }
@@ -143,7 +155,7 @@ func decisionProof(d LaunchDecision) string {
 		}
 		return v
 	}
-	canonical := fmt.Sprintf("%s|%s|%s|%s|%s|%s|%s|%d|%s|%s|%s|%s", decisionProofDomain, norm(string(d.Role)), norm(d.Shape), norm(d.Provider), norm(d.Model), norm(d.Effort), d.CandidateSHA, d.LeaseGeneration, d.TaskRef, d.ProbeKey, d.Rationale, strings.Join(d.Argv, "\x00"))
+	canonical := fmt.Sprintf("%s|%s|%s|%s|%s|%s|%s|%d|%s|%s|%s|%s|%s", decisionProofDomain, norm(string(d.Role)), norm(d.Shape), norm(d.Provider), norm(d.Model), norm(d.Effort), d.CandidateSHA, d.LeaseGeneration, d.TaskRef, norm(d.Scope), d.ProbeKey, d.Rationale, strings.Join(d.Argv, "\x00"))
 	sum := sha256.Sum256([]byte(canonical))
 	return "sha256:" + hex.EncodeToString(sum[:])
 }
@@ -151,11 +163,44 @@ func decisionProof(d LaunchDecision) string {
 // VerifyDecision proves that Decide issued the decision and that its signed
 // canonical fields have not been edited.
 func VerifyDecision(d *LaunchDecision, taskRef string, leaseGeneration int64) error {
+	if d == nil {
+		return fmt.Errorf("missing router-issued launch proof")
+	}
+	return VerifyDecisionForScope(d, taskRef, leaseGeneration, d.Scope)
+}
+
+// VerifyDecisionForScope verifies both the router capability and the caller's
+// declared identity scope. Task assignments always require a positive,
+// durable lease generation; standing lanes intentionally remain generation 0.
+func VerifyDecisionForScope(d *LaunchDecision, taskRef string, leaseGeneration int64, scope string) error {
 	if d == nil || d.Proof == "" {
 		return fmt.Errorf("missing router-issued launch proof")
 	}
 	if d.issuanceToken == ([32]byte{}) {
 		return fmt.Errorf("missing router issuance capability")
+	}
+	if d.Scope != scope {
+		return fmt.Errorf("launch proof scope mismatch")
+	}
+	switch scope {
+	case ScopeTask:
+		if leaseGeneration <= 0 {
+			return fmt.Errorf("task launch requires a positive lease generation")
+		}
+	case ScopeLane:
+		if leaseGeneration != 0 {
+			return fmt.Errorf("lane launch cannot carry a task lease generation")
+		}
+	case ScopeCandidate:
+		if strings.TrimSpace(taskRef) == "" || leaseGeneration < 0 {
+			return fmt.Errorf("candidate launch requires a valid candidate context")
+		}
+	case ScopeGeneric:
+		if taskRef != "" || leaseGeneration != 0 {
+			return fmt.Errorf("generic launch cannot carry task context")
+		}
+	default:
+		return fmt.Errorf("unknown launch scope %q", scope)
 	}
 	if d.TaskRef != "" || taskRef != "" {
 		if d.TaskRef == "" || taskRef == "" || d.TaskRef != taskRef || d.LeaseGeneration != leaseGeneration {
@@ -182,9 +227,13 @@ func RebindDecision(d *LaunchDecision, taskRef string, leaseGeneration int64) (*
 	if strings.TrimSpace(taskRef) == "" {
 		return nil, fmt.Errorf("launch decision task context is required")
 	}
+	if leaseGeneration <= 0 {
+		return nil, fmt.Errorf("task assignment requires a positive lease generation")
+	}
 	bound := *d
 	bound.TaskRef = taskRef
 	bound.LeaseGeneration = leaseGeneration
+	bound.Scope = ScopeTask
 	if _, err := cryptorand.Read(bound.issuanceToken[:]); err != nil {
 		return nil, fmt.Errorf("issue rebound launch capability: %w", err)
 	}
@@ -437,6 +486,18 @@ func (r *SurfaceRouter) Decide(req LaunchRequest) (*LaunchDecision, error) {
 	}
 	if req.Role == "" {
 		return nil, fmt.Errorf("herd-route: launch decision requires role")
+	}
+	if req.Scope != ScopeGeneric && req.Scope != ScopeLane && req.Scope != ScopeTask && req.Scope != ScopeCandidate {
+		return nil, fmt.Errorf("herd-route: unknown launch scope %q", req.Scope)
+	}
+	if req.Scope == ScopeTask && req.LeaseGeneration <= 0 {
+		return nil, fmt.Errorf("herd-route: task launch requires a positive lease generation")
+	}
+	if req.Scope == ScopeLane && req.LeaseGeneration != 0 {
+		return nil, fmt.Errorf("herd-route: lane launch cannot carry a task lease generation")
+	}
+	if (req.Scope == ScopeLane || req.Scope == ScopeTask || req.Scope == ScopeCandidate) && strings.TrimSpace(req.TaskRef) == "" {
+		return nil, fmt.Errorf("herd-route: scoped launch requires context")
 	}
 	if !knownRole(req.Role) {
 		return nil, fmt.Errorf("%w: %s", ErrRolePolicy, req.Role)
@@ -723,7 +784,7 @@ func (r *SurfaceRouter) Decide(req LaunchRequest) (*LaunchDecision, error) {
 		Score:           best.rank,
 		LazerLastResort: best.provider == "lazer",
 		Argv:            ArgvFor(best.provider, model, effort),
-		TaskRef:         req.TaskRef, LeaseGeneration: req.LeaseGeneration,
+		TaskRef:         req.TaskRef, LeaseGeneration: req.LeaseGeneration, Scope: req.Scope,
 	}
 	if _, err := cryptorand.Read(d.issuanceToken[:]); err != nil {
 		return nil, fmt.Errorf("issue launch capability: %w", err)
