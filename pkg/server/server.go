@@ -14,14 +14,16 @@ import (
 )
 
 type ServerStatusResponse struct {
-	Status    string                 `json:"status"`
-	Version   string                 `json:"version"`
-	UptimeSec float64                `json:"uptime_sec"`
-	Timestamp time.Time              `json:"timestamp"`
-	Health    metrics.HealthSnapshot `json:"health"`
-	Queue     metrics.QueuePressure  `json:"queue"`
-	SLO       metrics.TransitionSLO  `json:"transition_slo"`
-	Signals   metrics.FleetSignals   `json:"signals"`
+	Status     string                  `json:"status"`
+	Version    string                  `json:"version"`
+	UptimeSec  float64                 `json:"uptime_sec"`
+	Timestamp  time.Time               `json:"timestamp"`
+	Health     metrics.HealthSnapshot  `json:"health"`
+	Queue      metrics.QueuePressure   `json:"queue"`
+	SLO        metrics.TransitionSLO   `json:"transition_slo"`
+	Signals    metrics.FleetSignals    `json:"signals"`
+	Freshness  metrics.FreshnessState  `json:"freshness"`
+	Conditions []metrics.ConditionCode `json:"condition_codes"`
 }
 
 type ControlServer struct {
@@ -104,21 +106,27 @@ func (s *ControlServer) Stop(ctx context.Context) error {
 
 func (s *ControlServer) handleStatus(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-	health, queue, slo := s.metrics.Snapshot()
-	signals := s.metrics.Signals()
+	now := s.now()
+	view := s.metrics.ReadAt(now)
+	health, queue, slo, signals := view.Health, view.Queue, view.SLO, view.Signals
 	status := "healthy"
-	if !health.Readiness || !queue.Known || queue.Error != "" || signals.ObservedAt.IsZero() {
+	if !health.Liveness {
+		status = "unhealthy"
+	} else if !view.Freshness.Ready {
 		status = "degraded"
 	}
+	health.Readiness = health.Readiness && view.Freshness.Ready
 	resp := ServerStatusResponse{
-		Status:    status,
-		Version:   "v0.1.0",
-		UptimeSec: s.now().Sub(s.StartTime).Seconds(),
-		Timestamp: s.now(),
-		Health:    health,
-		Queue:     queue,
-		SLO:       slo,
-		Signals:   signals,
+		Status:     status,
+		Version:    "v0.1.0",
+		UptimeSec:  now.Sub(s.StartTime).Seconds(),
+		Timestamp:  now,
+		Health:     health,
+		Queue:      queue,
+		SLO:        slo,
+		Signals:    signals,
+		Freshness:  view.Freshness,
+		Conditions: view.Conditions,
 	}
 	payload, err := json.Marshal(resp)
 	if err != nil {
@@ -143,13 +151,28 @@ func (s *ControlServer) handleOpenAPI(w http.ResponseWriter, r *http.Request) {
 		"paths": map[string]interface{}{
 			"/v1/status": map[string]interface{}{
 				"get": map[string]interface{}{
-					"summary": "Get Herdforge daemon status",
+					"summary": "Get liveness, readiness, freshness, and bounded fleet conditions",
 					"responses": map[string]interface{}{
-						"200": map[string]string{"description": "Healthy daemon status"},
+						"200": map[string]string{"description": "Status is served even when readiness is degraded"},
 					},
+				},
+			},
+			"/metrics": map[string]interface{}{
+				"get": map[string]interface{}{
+					"summary":   "Prometheus metrics with bounded labels and freshness gates",
+					"responses": map[string]string{"200": "Metrics text", "500": "Encoding or serving failure"},
 				},
 			},
 		},
 	}
-	_ = json.NewEncoder(w).Encode(openAPISpec)
+	payload, err := json.Marshal(openAPISpec)
+	if err != nil {
+		http.Error(w, "openapi encoding failed", http.StatusInternalServerError)
+		return
+	}
+	if _, err := w.Write(payload); err != nil {
+		s.mu.Lock()
+		s.serveErr = fmt.Errorf("openapi response write: %w", err)
+		s.mu.Unlock()
+	}
 }

@@ -39,6 +39,9 @@ func TestStatusSchemaPreservesLivenessReadinessAndUnknownPressure(t *testing.T) 
 	if got.UptimeSec != 3 || !got.Timestamp.Equal(now) {
 		t.Fatalf("fake clock not reflected in schema: %+v", got)
 	}
+	if clockCalls != 2 || got.Freshness.AsOf != now {
+		t.Fatalf("status did not use one captured clock sample: calls=%d freshness=%+v", clockCalls, got.Freshness)
+	}
 }
 
 func TestStatusSchemaReportsHealthyOnlyWithAuthoritativeSignals(t *testing.T) {
