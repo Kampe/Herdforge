@@ -555,9 +555,10 @@ func TestExecuteCancellationWithoutReadyBarrierCannotProveDescendant(t *testing.
 }
 
 // TestExecuteCancellationRequiresProcessGroupReap mutation-proves the incomplete
-// ownership shape: leader-only Cancel kill PLUS muted finalizeOwnedTree leaves
-// the ready descendant alive. Production pairs live-group Cancel with positive-PID
-// tree finalize so the descendant does not survive.
+// ownership shape: leader-only Cancel kill PLUS muted residual drain and
+// finalizeOwnedTree leaves the ready descendant alive. Production pairs
+// live-group Cancel with done-phase residual drain + finalize so the
+// descendant does not survive.
 func TestExecuteCancellationRequiresProcessGroupReap(t *testing.T) {
 	dir := t.TempDir()
 	pidFile := filepath.Join(t.TempDir(), "child.pid")
@@ -573,15 +574,29 @@ func TestExecuteCancellationRequiresProcessGroupReap(t *testing.T) {
 		return syscall.Kill(pgid, syscall.SIGKILL) // leader only — WRONG
 	}
 	prevFin := finalizeOwnedTree
+	prevDrain := residualDrainFn
+	// MUTATION: skip residual drain and finalize kill (incomplete ownership).
+	residualDrainFn = func(o *ownedSubprocess) error {
+		if o != nil {
+			o.freeze()
+		}
+		return nil
+	}
 	finalizeOwnedTree = func(o *ownedSubprocess) error {
 		if o != nil {
-			o.stopTracker()
+			_ = o.stopTracker()
 		}
 		return nil
 	}
 	t.Cleanup(func() {
 		processGroupKiller = prevKill
 		finalizeOwnedTree = prevFin
+		residualDrainFn = prevDrain
+		if data, err := os.ReadFile(pidFile); err == nil {
+			if p, conv := strconv.Atoi(strings.TrimSpace(string(data))); conv == nil && p > 0 {
+				_ = syscall.Kill(p, syscall.SIGKILL)
+			}
+		}
 	})
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -605,7 +620,7 @@ func TestExecuteCancellationRequiresProcessGroupReap(t *testing.T) {
 	}
 	// Incomplete ownership leaves the descendant alive — mutation proof.
 	if err := syscall.Kill(pid, 0); err != nil {
-		t.Fatalf("mutation expected descendant %d to survive leader-only+no-finalize: %v", pid, err)
+		t.Fatalf("mutation expected descendant %d to survive leader-only+no-drain+no-finalize: %v", pid, err)
 	}
 	if err := syscall.Kill(pid, syscall.SIGKILL); err != nil && !isESRCH(err) {
 		t.Fatalf("mutation cleanup kill descendant %d: %v", pid, err)
@@ -680,52 +695,47 @@ while [ ! -s "$1" ]; do :; done
 exit 0
 `
 
-// productionDetachedOnlyScript: ONLY a new-session (setsid) writer — no
-// same-group residual that alone would trip pgid liveness. Leader handshakes
-// on the session pid file then exits 0. The python parent stays alive (PPID
-// edge) so the tree tracker can sample the setsid child; production reaps by
-// positive PID. pgid-only close after Wait would leave the setsid writer live.
-// Uses python3 os.setsid (macOS has no setsid(1)).
+// productionDetachedOnlyScript: adversarial double-fork writer. Intermediate
+// parents exit immediately (no keep-alive). Grandchild stays in the supervisor
+// process group (no setsid) so residual membership kill at "done" owns it.
 //
-// $1=sessionPid $2=writetarget
+// $1=writerPid $2=writetarget
 const productionDetachedOnlyScript = `
 python3 -c '
 import os, sys
 path, target = sys.argv[1], sys.argv[2]
-pid = os.fork()
-if pid == 0:
-    os.setsid()
-    with open(path, "w", encoding="utf-8") as f:
-        f.write("%d\n" % os.getpid())
-    while True:
-        with open(target, "a", encoding="utf-8") as f:
-            f.write("w")
-# Parent stays alive so parent→child edge remains for tree sampling until reaped.
+# Double-fork: parent exits immediately; grandchild reparents but keeps pgid.
+if os.fork() > 0:
+    os._exit(0)
+if os.fork() > 0:
+    os._exit(0)
+with open(path, "w", encoding="utf-8") as f:
+    f.write("%d\n" % os.getpid())
 while True:
-    pass
-' "$1" "$2" </dev/null >/dev/null 2>&1 &
+    with open(target, "a", encoding="utf-8") as f:
+        f.write("w")
+' "$1" "$2" </dev/null >/dev/null 2>&1
 while [ ! -s "$1" ]; do :; done
 exit 0
 `
 
-// productionDetachedSessionScript: setsid writer AND same-group writer.
+// productionDetachedSessionScript: same-group background + double-fork residual.
 // $1=sessionPid $2=writetarget $3=groupPid
 const productionDetachedSessionScript = `
 sh -c 'printf "%s\n" "$$" > "$1"; while true; do printf g >> "$2"; done' grpwriter "$3" "$2" </dev/null >/dev/null 2>&1 &
 python3 -c '
 import os, sys
 path, target = sys.argv[1], sys.argv[2]
-pid = os.fork()
-if pid == 0:
-    os.setsid()
-    with open(path, "w", encoding="utf-8") as f:
-        f.write("%d\n" % os.getpid())
-    while True:
-        with open(target, "a", encoding="utf-8") as f:
-            f.write("w")
+if os.fork() > 0:
+    os._exit(0)
+if os.fork() > 0:
+    os._exit(0)
+with open(path, "w", encoding="utf-8") as f:
+    f.write("%d\n" % os.getpid())
 while True:
-    pass
-' "$1" "$2" </dev/null >/dev/null 2>&1 &
+    with open(target, "a", encoding="utf-8") as f:
+        f.write("w")
+' "$1" "$2" </dev/null >/dev/null 2>&1
 while [ ! -s "$3" ]; do :; done
 while [ ! -s "$1" ]; do :; done
 exit 0
@@ -829,16 +839,24 @@ func TestExecuteMutationOmittingFinalizeOwnedTreeReturnsTooEarly(t *testing.T) {
 	writeTarget := filepath.Join(dir, "residue.log")
 	writeExecutable(t, filepath.Join(dir, "leave-writer"), "#!/bin/sh\n"+productionLeaveWriterScript)
 
-	prev := finalizeOwnedTree
-	finalizeOwnedTree = func(o *ownedSubprocess) error {
-		// MUTATION: stop tracker but do not reap tracked PIDs.
+	prevFin := finalizeOwnedTree
+	prevDrain := residualDrainFn
+	// MUTATION: skip done-phase residual drain and finalize kill.
+	residualDrainFn = func(o *ownedSubprocess) error {
 		if o != nil {
-			o.stopTracker()
+			o.freeze()
+		}
+		return nil
+	}
+	finalizeOwnedTree = func(o *ownedSubprocess) error {
+		if o != nil {
+			_ = o.stopTracker()
 		}
 		return nil
 	}
 	t.Cleanup(func() {
-		finalizeOwnedTree = prev
+		finalizeOwnedTree = prevFin
+		residualDrainFn = prevDrain
 		forceKillTrackedPID(t, pidFile)
 	})
 
@@ -847,7 +865,7 @@ func TestExecuteMutationOmittingFinalizeOwnedTreeReturnsTooEarly(t *testing.T) {
 		t.Fatal(err)
 	}
 	if result.Outcome != OutcomePASS {
-		t.Fatalf("mutation: omitting finalizeOwnedTree reap should return PASS on exit 0; got %+v", result)
+		t.Fatalf("mutation: omitting residual drain should return PASS on exit 0; got %+v", result)
 	}
 	data, readErr := os.ReadFile(pidFile)
 	if readErr != nil {
@@ -899,12 +917,12 @@ func TestExecuteCancelAfterStartClosesProcessGroup(t *testing.T) {
 }
 
 // TestExecuteDetachedOnlySessionWriterBlocksAndReaps is the production-path
-// proof for process-group escape: ONLY a setsid/new-session writer (no
-// same-group residual). Execute must BLOCKED and the writer must be gone
-// without test-side teardown kill. Mutation omitting finalizeOwnedTree fails.
+// proof for adversarial double-fork residual writers (intermediate parents
+// exit immediately; no Python keep-alive). Execute must BLOCKED and the
+// writer must be gone without test-side teardown kill.
 func TestExecuteDetachedOnlySessionWriterBlocksAndReaps(t *testing.T) {
 	if _, err := exec.LookPath("python3"); err != nil {
-		t.Skip("python3 required for os.setsid detached writer fixture")
+		t.Skip("python3 required for double-fork residual writer fixture")
 	}
 	dir := t.TempDir()
 	pidFile := filepath.Join(dir, "session.pid")
@@ -916,35 +934,44 @@ func TestExecuteDetachedOnlySessionWriterBlocksAndReaps(t *testing.T) {
 		t.Fatal(err)
 	}
 	if result.Outcome != OutcomeBLOCKED {
-		t.Fatalf("detached-only setsid writer must BLOCKED (owned tree residual), got %+v", result)
+		t.Fatalf("detached-only double-fork writer must BLOCKED (owned tree residual), got %+v", result)
 	}
 	if !strings.Contains(result.Output, "residual") && !strings.Contains(result.Output, "ownership") {
 		t.Fatalf("BLOCKED output must name ownership close: %q", result.Output)
 	}
-	// Production must have reaped the setsid writer — no test teardown kill.
+	// Production must have reaped the residual writer — no test teardown kill.
 	assertWriterGone(t, pidFile)
 }
 
 // TestExecuteDetachedOnlyMutationOmittingFinalizeLeavesWriter proves the
-// detached-only fixture fails the old execute shape (PASS + live writer).
+// double-fork residual fixture fails the incomplete ownership shape
+// (PASS + live writer) when drain+finalize are muted.
 func TestExecuteDetachedOnlyMutationOmittingFinalizeLeavesWriter(t *testing.T) {
 	if _, err := exec.LookPath("python3"); err != nil {
-		t.Skip("python3 required for os.setsid detached writer fixture")
+		t.Skip("python3 required for double-fork residual writer fixture")
 	}
 	dir := t.TempDir()
 	pidFile := filepath.Join(dir, "session.pid")
 	writeTarget := filepath.Join(dir, "residue.log")
 	writeExecutable(t, filepath.Join(dir, "leave-detached-only"), "#!/bin/sh\n"+productionDetachedOnlyScript)
 
-	prev := finalizeOwnedTree
+	prevFin := finalizeOwnedTree
+	prevDrain := residualDrainFn
+	residualDrainFn = func(o *ownedSubprocess) error {
+		if o != nil {
+			o.freeze()
+		}
+		return nil
+	}
 	finalizeOwnedTree = func(o *ownedSubprocess) error {
 		if o != nil {
-			o.stopTracker()
+			_ = o.stopTracker()
 		}
 		return nil
 	}
 	t.Cleanup(func() {
-		finalizeOwnedTree = prev
+		finalizeOwnedTree = prevFin
+		residualDrainFn = prevDrain
 		forceKillTrackedPID(t, pidFile)
 	})
 
@@ -953,7 +980,7 @@ func TestExecuteDetachedOnlyMutationOmittingFinalizeLeavesWriter(t *testing.T) {
 		t.Fatal(err)
 	}
 	if result.Outcome != OutcomePASS {
-		t.Fatalf("mutation: detached-only without finalize reap should PASS; got %+v", result)
+		t.Fatalf("mutation: detached-only without residual drain should PASS; got %+v", result)
 	}
 	data, err := os.ReadFile(pidFile)
 	if err != nil {
@@ -964,15 +991,15 @@ func TestExecuteDetachedOnlyMutationOmittingFinalizeLeavesWriter(t *testing.T) {
 		t.Fatalf("mutation: bad session pid %q", data)
 	}
 	if err := syscall.Kill(pid, 0); err != nil {
-		t.Fatalf("mutation expected setsid writer %d to survive: %v", pid, err)
+		t.Fatalf("mutation expected double-fork writer %d to survive: %v", pid, err)
 	}
 }
 
-// TestExecuteDetachedSessionAndBackgroundWriters covers setsid + same-group
+// TestExecuteDetachedSessionAndBackgroundWriters covers double-fork + same-group
 // residual; production must BLOCKED and both writers gone via owned tree close.
 func TestExecuteDetachedSessionAndBackgroundWriters(t *testing.T) {
 	if _, err := exec.LookPath("python3"); err != nil {
-		t.Skip("python3 required for os.setsid detached writer fixture")
+		t.Skip("python3 required for double-fork residual writer fixture")
 	}
 	dir := t.TempDir()
 	sessionPidFile := filepath.Join(dir, "session.pid")
@@ -1082,7 +1109,7 @@ func TestOwnedNeverReplacesTokenOnPIDReuse(t *testing.T) {
 		_ = cmd.Process.Kill()
 		_ = cmd.Wait()
 	})
-	owned, err := adoptOwnedCmd(cmd, nil)
+	owned, err := adoptOwnedCmd(cmd, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1116,7 +1143,7 @@ func TestOwnedFreezeRejectsPostLeaderGroupAdoption(t *testing.T) {
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
-	owned, err := adoptOwnedCmd(cmd, nil)
+	owned, err := adoptOwnedCmd(cmd, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

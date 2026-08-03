@@ -16,25 +16,24 @@ import (
 	"time"
 )
 
-// processGroupKiller reaps process-group members for Cancel-time use only
-// while the original leader is still live. It identity-kills members of pgid
-// that are causally under the owned tree when called from KillGroupLive.
-// Tests may replace it with a leader-only killer for mutation proofs.
+// processGroupKiller identity-kills current members of a process group.
+// Used only while the original supervisor leader is still live.
+// Never signals -pgid. Tests may replace it for mutation proofs.
 var processGroupKiller = killProcessGroupMembers
 
-// finalizeOwnedTree is the production ownership close after Wait.
+// finalizeOwnedTree is the production ownership close after residual drain.
 var finalizeOwnedTree = (*ownedSubprocess).Close
 
-// processGroupGoneBound is the fail-closed deadline for tracker stop and
-// post-kill liveness polls.
-const processGroupGoneBound = 500 * time.Millisecond
+// residualDrainFn drains residual writers while the supervisor is still live.
+// Tests may replace it to mutation-prove that omitting the done-phase drain
+// leaves residual writers alive (PASS-with-writer regression).
+var residualDrainFn = (*ownedSubprocess).drainResidualsWhileLeaderLive
 
-// trackSampleInterval is the background tracker cadence (native snapshot only).
-const trackSampleInterval = 5 * time.Millisecond
-
-// handshakeReadBound is how long adopt waits for the ownership wrapper to
-// report the user-command child PID on the control pipe.
-const handshakeReadBound = 2 * time.Second
+const (
+	processGroupGoneBound = 500 * time.Millisecond
+	trackSampleInterval   = 5 * time.Millisecond
+	handshakeReadBound    = 5 * time.Second
+)
 
 // ErrResidualOwnedTree means live owned writers existed at close.
 var ErrResidualOwnedTree = errors.New("residual owned process tree members after leader wait")
@@ -42,10 +41,13 @@ var ErrResidualOwnedTree = errors.New("residual owned process tree members after
 // ErrResidualProcessGroup aliases residual for older tests.
 var ErrResidualProcessGroup = ErrResidualOwnedTree
 
-// killProcessGroupMembers identity-kills current members of pgid discovered
-// via a single native snapshot. Used only while the original leader is live
-// (Cancel / pre-Wait drain). Never signals -pgid.
 func killProcessGroupMembers(pgid int) error {
+	return killProcessGroupMembersExcept(pgid, -1)
+}
+
+// killProcessGroupMembersExcept identity-kills live members of pgid except
+// exceptPID (the supervisor leader must not kill itself mid-drain).
+func killProcessGroupMembersExcept(pgid, exceptPID int) error {
 	if pgid <= 0 {
 		return fmt.Errorf("kill process group members: invalid pgid %d", pgid)
 	}
@@ -55,9 +57,11 @@ func killProcessGroupMembers(pgid int) error {
 	}
 	var errs []error
 	for _, tok := range snap.membersOfGroup(pgid) {
+		if exceptPID > 0 && tok.pid == exceptPID {
+			continue
+		}
 		h, herr := openHandle(tok)
 		if herr != nil {
-			// Gone between snapshot and open — not an error.
 			continue
 		}
 		if _, kerr := h.kill(); kerr != nil {
@@ -76,71 +80,97 @@ func KillProcessGroup(pgid int) error {
 	return processGroupKiller(pgid)
 }
 
-// killProcessGroupIfLive is the Cancel-safe name: identity-kill current members.
 func killProcessGroupIfLive(pgid int) error {
 	return processGroupKiller(pgid)
 }
 
-// ownedSubprocess tracks causally discovered process handles for one
-// verification command. Sampling freezes when the leader dies; tokens are
-// never replaced; Close kills only the frozen handle set.
+// ownedSubprocess is causal process-tree ownership for one verification run.
+//
+// Protocol (two-phase handshake with the ownership wrapper):
+//  1. Wrapper starts user command, writes "start <pid>" on FD3, waits for user.
+//  2. On user exit, wrapper writes "done <ec>" on FD3 and BLOCKS reading FD4.
+//  3. Parent, while wrapper is still alive (process group still owned), samples
+//     the causal tree + live original pgid members, kills residuals, freezes.
+//  4. Parent writes "go" on FD4; wrapper exits; parent Wait returns.
+//
+// Discovery never replaces a recorded incarnation. After freeze, no new PIDs
+// are adopted from numeric pgid membership.
 type ownedSubprocess struct {
 	cmd    *exec.Cmd
 	leader int
 	pgid   int
 
 	mu       sync.Mutex
-	handles  map[int]ownedHandle // pid -> handle at first causal discovery
-	frozen   bool                // no further discovery after leader death / pre-Wait freeze
+	handles  map[int]ownedHandle
+	frozen   bool
 	trackErr error
-	hadLive  bool // set if any non-leader was live at kill time
+	hadLive  bool
 
-	// handshakeR is the read end of the ownership pipe (optional).
-	handshakeR *os.File
+	statusR *os.File // FD3 from child (start/done lines)
+	ackW    *os.File // FD4 to child (go)
 
 	stop     chan struct{}
 	stopped  chan struct{}
 	stopOnce sync.Once
 }
 
-// ownershipWrapperScript runs the user command as a child, reports the child
-// PID on FD 3 (ExtraFiles[0]), then waits. This is a synchronized pre-exec
-// containment handshake — not a polling race with fork+setsid.
+// ownershipWrapperScript: pre-exec cont barrier + two-phase residual drain.
 //
-//	$1 = user path; remaining args are user argv.
+// FD3 → parent (start/done). FD4 ← parent (cont, then go).
+//
+// The user command is launched under a subshell that blocks on FD4 before
+// exec. The parent opens causal handles and samples, then writes "cont" so
+// user code can run. This closes the race where the user could fork/setsid/
+// double-fork before the first snapshot. After the user exits, the supervisor
+// writes "done" and blocks on FD4 again so residual drain runs while the
+// original process group is still owned by a live supervisor.
 const ownershipWrapperScript = `
 user_path="$1"
 shift
-"$user_path" "$@" &
+(
+  # Block before exec until parent has recorded causal handles (pre-fork barrier).
+  IFS= read -r _cont <&4 || exit 1
+  # Do not leak control FDs into the user process tree (writers must not steal "go").
+  exec 3>&- 4>&-
+  exec "$user_path" "$@"
+) &
 child=$!
-# Report child PID before wait so the parent can open a causal handle.
-printf '%s\n' "$child" >&3
+printf 'start %s\n' "$child" >&3
 wait "$child"
 ec=$?
+printf 'done %s\n' "$ec" >&3
+# Hold the process group open until parent finishes residual drain.
+IFS= read -r _ack <&4 || true
 exit "$ec"
 `
 
-// prepareOwnedCommand builds a Setpgid command under the ownership wrapper
-// with a control pipe for the child-PID handshake.
-func prepareOwnedCommand(ctx context.Context, path string, args []string, dir string, env []string) (*exec.Cmd, *os.File, *os.File, error) {
-	pr, pw, err := os.Pipe()
+// prepareOwnedCommand builds a Setpgid supervisor with status+ack pipes.
+func prepareOwnedCommand(ctx context.Context, path string, args []string, dir string, env []string) (cmd *exec.Cmd, statusR, statusW, ackR, ackW *os.File, err error) {
+	statusR, statusW, err = os.Pipe()
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("ownership pipe: %w", err)
+		return nil, nil, nil, nil, nil, fmt.Errorf("status pipe: %w", err)
+	}
+	ackR, ackW, err = os.Pipe()
+	if err != nil {
+		_ = statusR.Close()
+		_ = statusW.Close()
+		return nil, nil, nil, nil, nil, fmt.Errorf("ack pipe: %w", err)
 	}
 	wrapArgs := append([]string{"-c", ownershipWrapperScript, "owned-wrap", path}, args...)
-	cmd := exec.CommandContext(ctx, "sh", wrapArgs...)
+	cmd = exec.CommandContext(ctx, "sh", wrapArgs...)
 	cmd.Dir = dir
 	if env != nil {
 		cmd.Env = env
 	}
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	cmd.ExtraFiles = []*os.File{pw}
-	return cmd, pr, pw, nil
+	// ExtraFiles: child FD3=statusW, FD4=ackR
+	cmd.ExtraFiles = []*os.File{statusW, ackR}
+	return cmd, statusR, statusW, ackR, ackW, nil
 }
 
-// adoptOwnedCmd begins ownership: records leader handle, reads handshake child,
-// then tracks only BFS descendants of causally owned PIDs while leader is live.
-func adoptOwnedCmd(cmd *exec.Cmd, handshakeR *os.File) (*ownedSubprocess, error) {
+// adoptOwnedCmd records the leader and prepares for the two-phase protocol.
+// handshake pipes: statusR reads start/done; ackW writes go.
+func adoptOwnedCmd(cmd *exec.Cmd, statusR, ackW *os.File) (*ownedSubprocess, error) {
 	if cmd == nil || cmd.Process == nil {
 		return nil, errors.New("adopt owned cmd: nil process")
 	}
@@ -154,81 +184,163 @@ func adoptOwnedCmd(cmd *exec.Cmd, handshakeR *os.File) (*ownedSubprocess, error)
 		return nil, fmt.Errorf("adopt owned cmd: leader handle: %w", err)
 	}
 	o := &ownedSubprocess{
-		cmd:        cmd,
-		leader:     leader,
-		pgid:       leader,
-		handles:    map[int]ownedHandle{leader: h},
-		handshakeR: handshakeR,
-		stop:       make(chan struct{}),
-		stopped:    make(chan struct{}),
-	}
-	// Synchronized handshake: child PID reported by wrapper before wait.
-	var handshakeChild int
-	if handshakeR != nil {
-		var herr error
-		handshakeChild, herr = o.readHandshakeChild(handshakeReadBound)
-		if herr != nil {
-			o.trackErr = herr
-		}
-	}
-	// Causal sample while the handshake child is still live so grandchildren
-	// (background/setsid writers) are discovered before reparent-on-exit.
-	_ = o.sample()
-	if handshakeChild > 1 {
-		o.followUntilExit(handshakeChild, handshakeReadBound)
+		cmd:     cmd,
+		leader:  leader,
+		pgid:    leader,
+		handles: map[int]ownedHandle{leader: h},
+		statusR: statusR,
+		ackW:    ackW,
+		stop:    make(chan struct{}),
+		stopped: make(chan struct{}),
 	}
 	go o.trackLoop()
 	return o, nil
 }
 
-// followUntilExit repeatedly samples the causal tree until childPid exits or
-// the bound elapses. This is a synchronized follow of a handshake-owned PID,
-// not a free-running cleanup sleep.
-func (o *ownedSubprocess) followUntilExit(childPid int, bound time.Duration) {
-	deadline := time.Now().Add(bound)
-	for time.Now().Before(deadline) {
-		_ = o.sample()
-		o.mu.Lock()
-		h, ok := o.handles[childPid]
-		o.mu.Unlock()
-		if !ok || !h.tok.stillSame() {
-			// Final sample after exit to catch last-moment forks.
-			_ = o.sample()
-			return
+// RunProtocol drives start→cont→done→drain→go. Fail-closed on protocol,
+// sample, and drain errors (never silent continue).
+func (o *ownedSubprocess) RunProtocol() (userExitHint int, err error) {
+	if o == nil {
+		return -1, errors.New("run protocol: nil")
+	}
+	userExitHint = -1
+	if o.statusR == nil {
+		// No handshake (ReapOwnedCmd path): sample once and return.
+		if serr := o.sample(); serr != nil {
+			return -1, serr
 		}
-		time.Sleep(time.Millisecond)
+		return -1, nil
 	}
-}
-
-// readHandshakeChild returns the user-command PID from the ownership pipe.
-func (o *ownedSubprocess) readHandshakeChild(bound time.Duration) (int, error) {
-	if o.handshakeR == nil {
-		return 0, nil
-	}
+	// Always release ack pipe lines on return so Wait cannot hang forever.
+	// contSent tracks whether the pre-exec barrier was released.
+	contSent := false
 	defer func() {
-		_ = o.handshakeR.Close()
-		o.handshakeR = nil
+		if !contSent {
+			// Unblock pre-exec reader (if still waiting) then post-done reader.
+			_ = o.writeAckLine("cont")
+		}
+		o.releaseSupervisor()
+		if o.statusR != nil {
+			_ = o.statusR.Close()
+			o.statusR = nil
+		}
 	}()
-	_ = o.handshakeR.SetReadDeadline(time.Now().Add(bound))
-	line, err := bufio.NewReader(o.handshakeR).ReadString('\n')
-	if err != nil && !errors.Is(err, io.EOF) {
-		return 0, fmt.Errorf("ownership handshake read: %w", err)
-	}
-	pid, err := strconv.Atoi(strings.TrimSpace(line))
-	if err != nil || pid <= 1 {
-		return 0, fmt.Errorf("ownership handshake bad pid %q", strings.TrimSpace(line))
-	}
-	tok, err := tokenOf(pid)
+
+	// Phase 1: start <pid> — child is blocked on FD4 before user exec.
+	_ = o.statusR.SetReadDeadline(time.Now().Add(handshakeReadBound))
+	br := bufio.NewReader(o.statusR)
+	line, err := br.ReadString('\n')
 	if err != nil {
-		return 0, fmt.Errorf("ownership handshake token: %w", err)
+		return -1, fmt.Errorf("ownership start handshake: %w", err)
+	}
+	fields := strings.Fields(line)
+	if len(fields) != 2 || fields[0] != "start" {
+		return -1, fmt.Errorf("ownership start handshake bad line %q", strings.TrimSpace(line))
+	}
+	childPid, err := strconv.Atoi(fields[1])
+	if err != nil || childPid <= 1 {
+		return -1, fmt.Errorf("ownership start handshake bad pid %q", fields[1])
+	}
+	tok, err := tokenOf(childPid)
+	if err != nil {
+		_ = killProcessGroupIfLive(o.leader)
+		return -1, fmt.Errorf("ownership start handshake token: %w", err)
 	}
 	if err := o.noteCausal(tok); err != nil {
-		return pid, err
+		_ = killProcessGroupIfLive(o.leader)
+		return -1, fmt.Errorf("ownership start handshake note: %w", err)
 	}
-	return pid, nil
+	// Sample while child is still blocked pre-exec so discovery cannot race fork.
+	if serr := o.sample(); serr != nil {
+		_ = killProcessGroupIfLive(o.leader)
+		return -1, fmt.Errorf("ownership sample after start (pre-cont): %w", serr)
+	}
+	// Release pre-exec barrier only after causal handles are open.
+	if err := o.writeAckLine("cont"); err != nil {
+		_ = killProcessGroupIfLive(o.leader)
+		return -1, fmt.Errorf("ownership cont: %w", err)
+	}
+	contSent = true
+
+	// Phase 2: done <ec> — no short deadline; Cancel kills supervisor → EOF.
+	_ = o.statusR.SetReadDeadline(time.Time{}) // clear
+	line, err = br.ReadString('\n')
+	if err != nil {
+		// EOF/cancel/supervisor death before done: fail closed.
+		return -1, fmt.Errorf("ownership done handshake: %w", err)
+	}
+	fields = strings.Fields(line)
+	if len(fields) != 2 || fields[0] != "done" {
+		return -1, fmt.Errorf("ownership done handshake bad line %q", strings.TrimSpace(line))
+	}
+	if ec, eerr := strconv.Atoi(fields[1]); eerr == nil {
+		userExitHint = ec
+	}
+
+	// Residual drain WHILE supervisor (leader) is still live.
+	if serr := o.sample(); serr != nil {
+		return userExitHint, fmt.Errorf("ownership sample at done: %w", serr)
+	}
+	if derr := residualDrainFn(o); derr != nil {
+		return userExitHint, derr
+	}
+	o.freeze()
+	// releaseSupervisor (go) runs via defer.
+	return userExitHint, nil
 }
 
-// noteCausal records a process only if not already tracked (never replaces).
+// writeAckLine writes one line on the parent→child ack pipe without closing it.
+func (o *ownedSubprocess) writeAckLine(line string) error {
+	if o == nil || o.ackW == nil {
+		return errors.New("ack pipe closed")
+	}
+	_, err := io.WriteString(o.ackW, line+"\n")
+	return err
+}
+
+// releaseSupervisor unblocks the ownership wrapper's post-done FD4 read.
+func (o *ownedSubprocess) releaseSupervisor() {
+	if o == nil || o.ackW == nil {
+		return
+	}
+	_, _ = io.WriteString(o.ackW, "go\n")
+	_ = o.ackW.Close()
+	o.ackW = nil
+}
+
+// drainResidualsWhileLeaderLive kills non-leader owned handles and live original
+// pgid members while the supervisor incarnation is still alive. This is the
+// Darwin-safe window (no post-Wait numeric kill). Fail-closed on sample errors.
+func (o *ownedSubprocess) drainResidualsWhileLeaderLive() error {
+	o.mu.Lock()
+	leaderH, ok := o.handles[o.leader]
+	pgid := o.pgid
+	o.mu.Unlock()
+	if !ok || !leaderH.tok.stillSame() {
+		return fmt.Errorf("drain residuals: supervisor leader not live")
+	}
+	// Final sample: BFS + live original pgid members (leader still owns group).
+	if err := o.sample(); err != nil {
+		return fmt.Errorf("drain residuals sample: %w", err)
+	}
+	if err := o.killTracked(false); err != nil {
+		return fmt.Errorf("drain residuals kill tracked: %w", err)
+	}
+	// Identity-kill remaining live members of the original pgid while leader
+	// live — never kill the supervisor itself.
+	if err := killProcessGroupMembersExcept(pgid, o.leader); err != nil {
+		return fmt.Errorf("drain residuals group members: %w", err)
+	}
+	// One more sample+kill pass for races with late forks before freeze.
+	if err := o.sample(); err != nil {
+		return fmt.Errorf("drain residuals re-sample: %w", err)
+	}
+	if err := o.killTracked(false); err != nil {
+		return fmt.Errorf("drain residuals re-kill: %w", err)
+	}
+	return nil
+}
+
 func (o *ownedSubprocess) noteCausal(tok procToken) error {
 	o.mu.Lock()
 	defer o.mu.Unlock()
@@ -236,8 +348,7 @@ func (o *ownedSubprocess) noteCausal(tok procToken) error {
 		return nil
 	}
 	if _, exists := o.handles[tok.pid]; exists {
-		// Never replace an observed incarnation.
-		return nil
+		return nil // never replace
 	}
 	h, err := openHandle(tok)
 	if err != nil {
@@ -265,9 +376,9 @@ func (o *ownedSubprocess) trackLoop() {
 	}
 }
 
-// sample discovers children of already-owned live processes only.
-// It never seeds from current numeric pgid membership (reuse is not causal).
-// When the leader is no longer the original incarnation, sampling freezes.
+// sample: while leader live, adopt (1) BFS children of owned live PIDs and
+// (2) current members of the original pgid (causal: leader still owns group).
+// Never replace tokens. Freeze when leader dies. Sample errors return to caller.
 func (o *ownedSubprocess) sample() error {
 	o.mu.Lock()
 	if o.frozen {
@@ -275,6 +386,7 @@ func (o *ownedSubprocess) sample() error {
 		return nil
 	}
 	leaderH, ok := o.handles[o.leader]
+	pgid := o.pgid
 	o.mu.Unlock()
 	if !ok || !leaderH.tok.stillSame() {
 		o.mu.Lock()
@@ -291,7 +403,18 @@ func (o *ownedSubprocess) sample() error {
 	if o.frozen {
 		return nil
 	}
-	// BFS only from currently owned PIDs whose incarnation is still live.
+	// While supervisor owns the process group, its members are causal.
+	for _, tok := range snap.membersOfGroup(pgid) {
+		if _, exists := o.handles[tok.pid]; exists {
+			continue
+		}
+		h, herr := openHandle(tok)
+		if herr != nil {
+			continue
+		}
+		o.handles[tok.pid] = h
+	}
+	// BFS children of owned live processes (setsid path before reparent).
 	queue := make([]int, 0, len(o.handles))
 	for pid, h := range o.handles {
 		if h.tok.stillSame() {
@@ -302,7 +425,7 @@ func (o *ownedSubprocess) sample() error {
 		pid := queue[i]
 		for _, c := range snap.childrenOf(pid) {
 			if _, exists := o.handles[c]; exists {
-				continue // never replace
+				continue
 			}
 			tok, ok := snap.token(c)
 			if !ok {
@@ -326,9 +449,7 @@ func (o *ownedSubprocess) freeze() {
 }
 
 func (o *ownedSubprocess) stopTracker() error {
-	o.stopOnce.Do(func() {
-		close(o.stop)
-	})
+	o.stopOnce.Do(func() { close(o.stop) })
 	select {
 	case <-o.stopped:
 		return nil
@@ -337,19 +458,18 @@ func (o *ownedSubprocess) stopTracker() error {
 	}
 }
 
-// KillGroupLive drains causally owned non-leader processes and the live group
-// of the original leader while the leader is still live (Cancel / pre-Wait).
+// KillGroupLive is Cancel-path drain while leader may be live.
 func (o *ownedSubprocess) KillGroupLive() error {
 	if o == nil {
-		return errors.New("kill group live: nil owned subprocess")
+		return errors.New("kill group live: nil")
 	}
-	// Final sample while leader may still be live.
-	_ = o.sample()
+	if err := o.sample(); err != nil {
+		return err
+	}
 	var errs []error
 	if err := o.killTracked(false); err != nil {
 		errs = append(errs, err)
 	}
-	// While leader is live, also membership-kill original pgid (Cancel path).
 	o.mu.Lock()
 	leaderH, ok := o.handles[o.leader]
 	pgid := o.pgid
@@ -365,7 +485,6 @@ func (o *ownedSubprocess) KillGroupLive() error {
 	return nil
 }
 
-// killTracked signals every causally owned handle except optionally the leader.
 func (o *ownedSubprocess) killTracked(includeLeader bool) error {
 	o.mu.Lock()
 	handles := make([]ownedHandle, 0, len(o.handles))
@@ -393,18 +512,6 @@ func (o *ownedSubprocess) killTracked(includeLeader bool) error {
 	return nil
 }
 
-// DrainBeforeWait freezes discovery and kills non-leader owned processes while
-// the leader is still unreaped (Darwin-safe window; Linux uses pidfd).
-func (o *ownedSubprocess) DrainBeforeWait() error {
-	if o == nil {
-		return errors.New("drain before wait: nil")
-	}
-	_ = o.sample()
-	o.freeze()
-	return o.killTracked(false)
-}
-
-// Pgid returns the process group id recorded at Start.
 func (o *ownedSubprocess) Pgid() int {
 	if o == nil {
 		return 0
@@ -412,14 +519,15 @@ func (o *ownedSubprocess) Pgid() int {
 	return o.pgid
 }
 
-// Close freezes discovery, kills only causally owned handles (no numeric
-// group re-adoption), and closes pidfds. Never signals -pgid.
+// Close freezes, kills only frozen causal handles, closes pidfds.
+// No numeric group re-adoption after freeze.
 func (o *ownedSubprocess) Close() error {
 	if o == nil {
 		return errors.New("close owned: nil")
 	}
 	o.freeze()
 	stopErr := o.stopTracker()
+	// Kill remaining tracked (leader included if still live).
 	if err := o.killTracked(true); err != nil && stopErr == nil {
 		stopErr = err
 	}
@@ -451,6 +559,10 @@ func (o *ownedSubprocess) Close() error {
 		}
 		h.close()
 	}
+	if o.ackW != nil {
+		_ = o.ackW.Close()
+		o.ackW = nil
+	}
 	if len(killErrs) > 0 {
 		return fmt.Errorf("close owned: %w", errors.Join(killErrs...))
 	}
@@ -460,21 +572,39 @@ func (o *ownedSubprocess) Close() error {
 	return nil
 }
 
-// Reap freezes discovery, kills every causally owned handle (including the
-// leader) while identities are still valid, Waits the leader, then Close.
+// Reap for non-protocol cmds (fixtures): kill all owned, Wait, Close.
 func (o *ownedSubprocess) Reap() error {
 	if o == nil || o.cmd == nil {
 		return errors.New("reap owned: nil")
 	}
+	// If protocol pipes present, try protocol first.
+	if o.statusR != nil {
+		_, perr := o.RunProtocol()
+		waitErr := o.cmd.Wait()
+		closeErr := finalizeOwnedTree(o)
+		if perr != nil {
+			return fmt.Errorf("reap owned protocol: %w (wait=%v close=%v)", perr, waitErr, closeErr)
+		}
+		if waitErr != nil && !isExpectedKillWait(waitErr) {
+			if closeErr != nil && !errors.Is(closeErr, ErrResidualOwnedTree) {
+				return fmt.Errorf("reap owned: wait: %w; close: %v", waitErr, closeErr)
+			}
+			return fmt.Errorf("reap owned: wait: %w", waitErr)
+		}
+		if closeErr != nil && !errors.Is(closeErr, ErrResidualOwnedTree) {
+			return closeErr
+		}
+		return nil
+	}
 	_ = o.sample()
 	o.freeze()
-	// Kill entire owned set before Wait so Wait cannot hang on a live leader.
 	killErr := o.killTracked(true)
-	if leaderH, ok := o.handles[o.leader]; ok && leaderH.tok.stillSame() {
-		// Membership kill only while original leader incarnation is live.
-		if err := processGroupKiller(o.pgid); err != nil && killErr == nil {
-			killErr = err
-		} else if err != nil {
+	o.mu.Lock()
+	leaderH, ok := o.handles[o.leader]
+	pgid := o.pgid
+	o.mu.Unlock()
+	if ok && leaderH.tok.stillSame() {
+		if err := processGroupKiller(pgid); err != nil {
 			killErr = errors.Join(killErr, err)
 		}
 	}
@@ -498,9 +628,9 @@ func (o *ownedSubprocess) Reap() error {
 	return nil
 }
 
-// ReapOwnedCmd adopts without handshake (caller already started cmd).
+// ReapOwnedCmd adopts without pipes (fixture path).
 func ReapOwnedCmd(cmd *exec.Cmd) error {
-	owned, err := adoptOwnedCmd(cmd, nil)
+	owned, err := adoptOwnedCmd(cmd, nil, nil)
 	if err != nil {
 		return err
 	}
@@ -508,17 +638,12 @@ func ReapOwnedCmd(cmd *exec.Cmd) error {
 }
 
 func closeOwnedAfterWait(cmd *exec.Cmd) error {
-	if cmd == nil || cmd.Process == nil {
-		return errors.New("close owned after wait: nil process")
+	if cmd == nil || cmd.Process == nil || cmd.ProcessState == nil {
+		return errors.New("close owned after wait: invalid cmd")
 	}
-	if cmd.ProcessState == nil {
-		return errors.New("close owned after wait: ProcessState nil")
-	}
-	// After Wait the leader is dead — only kill handles we open from the
-	// leader token if still same (usually not). No numeric group adoption.
 	tok, err := tokenOf(cmd.Process.Pid)
 	if err != nil {
-		return nil // leader gone
+		return nil
 	}
 	owned := &ownedSubprocess{
 		cmd:     cmd,
@@ -644,7 +769,6 @@ func waitStatusSignaled(state *os.ProcessState) (syscall.Signal, bool) {
 	return status.Signal(), true
 }
 
-// hermeticGitConfig is prepended to every git argv.
 var hermeticGitConfig = []string{
 	"-c", "gc.auto=0",
 	"-c", "gc.autoDetach=false",

@@ -185,9 +185,9 @@ func (v *Verifier) execute(ctx context.Context, dir string, policy EnvironmentPo
 	if policy == EnvironmentPolicyHermetic {
 		env = commandEnv
 	}
-	// Ownership wrapper: Setpgid supervisor + FD3 child-PID handshake so
-	// fork+setsid cannot race an unsynchronized sample loop.
-	cmd, handshakeR, handshakeW, prepErr := prepareOwnedCommand(ctx, commandPath, v.Argv[1:], dir, env)
+	// Two-phase ownership supervisor: start/done handshake + residual drain
+	// while the supervisor still owns the process group, then ack to exit.
+	cmd, statusR, statusW, ackR, ackW, prepErr := prepareOwnedCommand(ctx, commandPath, v.Argv[1:], dir, env)
 	if prepErr != nil {
 		output := []byte(prepErr.Error())
 		return &Result{
@@ -198,27 +198,22 @@ func (v *Verifier) execute(ctx context.Context, dir string, policy EnvironmentPo
 			Duration:     time.Since(started),
 		}, nil
 	}
-	// Cancel uses only cmd.Process.Pid (set before watchCtx) — identity-kill
-	// current members of that live group; never empty -pgid.
 	cmd.Cancel = func() error {
 		if cmd.Process == nil {
 			return nil
 		}
 		return killProcessGroupIfLive(cmd.Process.Pid)
 	}
-	// A canceled shell can leave grandchildren holding stdout/stderr pipes
-	// open. WaitDelay bounds that wait and keeps restoration reachable.
 	cmd.WaitDelay = 100 * time.Millisecond
 
-	// concurrentCombinedWriter serializes Writes from the stdout and stderr
-	// pipe-copy goroutines. A bare bytes.Buffer races under -race when both
-	// streams are attached (same shape as exec.CombinedOutput, but locked).
 	var combined concurrentCombinedWriter
 	cmd.Stdout = &combined
 	cmd.Stderr = &combined
 	if err := cmd.Start(); err != nil {
-		_ = handshakeR.Close()
-		_ = handshakeW.Close()
+		_ = statusR.Close()
+		_ = statusW.Close()
+		_ = ackR.Close()
+		_ = ackW.Close()
 		output := []byte(err.Error())
 		return &Result{
 			Outcome:      OutcomeBLOCKED,
@@ -228,16 +223,19 @@ func (v *Verifier) execute(ctx context.Context, dir string, policy EnvironmentPo
 			Duration:     time.Since(started),
 		}, nil
 	}
-	// Parent must close its write end so the child handshake can complete EOF.
-	_ = handshakeW.Close()
+	// Parent keeps statusR + ackW; close child ends in parent.
+	_ = statusW.Close()
+	_ = ackR.Close()
 
-	owned, adoptErr := adoptOwnedCmd(cmd, handshakeR)
+	owned, adoptErr := adoptOwnedCmd(cmd, statusR, ackW)
 	if adoptErr != nil {
 		var parts []string
 		parts = append(parts, "adopt owned cmd: "+adoptErr.Error())
 		if kerr := killProcessGroupIfLive(cmd.Process.Pid); kerr != nil {
 			parts = append(parts, "kill group members: "+kerr.Error())
 		}
+		_, _ = io.WriteString(ackW, "go\n")
+		_ = ackW.Close()
 		waitErr := cmd.Wait()
 		if waitErr != nil {
 			parts = append(parts, "wait: "+waitErr.Error())
@@ -251,7 +249,6 @@ func (v *Verifier) execute(ctx context.Context, dir string, policy EnvironmentPo
 			Duration:     time.Since(started),
 		}, nil
 	}
-	// Immediate fail-safe: ctx already done after Start.
 	if ctx.Err() != nil {
 		reapErr := owned.Reap()
 		msg := ctx.Err().Error()
@@ -267,19 +264,21 @@ func (v *Verifier) execute(ctx context.Context, dir string, policy EnvironmentPo
 			Duration:     time.Since(started),
 		}, nil
 	}
-	// Wait for the ownership wrapper (and thus the user command). Do not
-	// pre-Wait drain on the success path — that would SIGKILL a healthy
-	// command. Residual writers are reaped only after Wait via Close on the
-	// frozen causal handle set (no post-Wait numeric pgid adoption).
+
+	// Protocol: start → (sample while running) → done → drain while supervisor
+	// live → freeze → ack → Wait. Fail-closed on protocol/sample errors.
+	_, protoErr := owned.RunProtocol()
 	waitErr := cmd.Wait()
-	// Freeze discovery before Close so post-Wait sampling cannot adopt a
-	// reused numeric process group.
-	owned.freeze()
 	ownErr := finalizeOwnedTree(owned)
+	if protoErr != nil {
+		if ownErr != nil {
+			ownErr = fmt.Errorf("%v; protocol: %w", ownErr, protoErr)
+		} else {
+			ownErr = protoErr
+		}
+	}
 	output := combined.bytes()
 
-	// Residual owned-tree writers always BLOCKED — never PASS while tracked
-	// descendants may still mutate the tree (TempDir RemoveAll race class).
 	if ownErr != nil {
 		msg := fmt.Sprintf("verification ownership close: %v\noutput:\n%s", ownErr, string(output))
 		if waitErr != nil {
@@ -305,8 +304,6 @@ func (v *Verifier) execute(ctx context.Context, dir string, policy EnvironmentPo
 	}
 	if waitErr != nil {
 		result.Outcome = OutcomeFAIL
-		// Cancellation/deadline after Start: Cancel killed the live group; Wait
-		// returns a signaled ExitError (typed WaitStatus).
 		if ctx.Err() != nil || cmd.ProcessState == nil {
 			result.Outcome = OutcomeBLOCKED
 		}

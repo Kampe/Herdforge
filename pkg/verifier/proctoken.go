@@ -109,8 +109,12 @@ func openHandle(tok procToken) (ownedHandle, error) {
 }
 
 // kill signals the owned incarnation only.
-// Linux: pidfd_send_signal (no PID reuse).
-// Darwin: SIGKILL only if stillSame (no kernel handle; prefer pre-Wait drain).
+// Linux: pidfd_send_signal (kernel-bound; no PID reuse).
+// Darwin: no pidfd — re-check token immediately before each SIGKILL and never
+// signal when the incarnation no longer matches. Residual TOCTOU remains on
+// Darwin without a kernel handle; production mitigates by draining residuals
+// while the supervisor leader is still live (pre-Wait), then freezing so
+// post-Wait Close never adopts a new numeric pgid.
 func (h ownedHandle) kill() (signaled bool, err error) {
 	if !h.tok.valid() {
 		return false, nil
@@ -124,18 +128,29 @@ func (h ownedHandle) kill() (signaled bool, err error) {
 		}
 		return true, nil
 	}
-	// Darwin / token-only path.
-	if !h.tok.isLiveTarget() {
-		return false, nil
-	}
-	if err := killPID(h.tok.pid, syscallSIGKILL()); err != nil {
-		if isESRCH(err) {
-			return false, nil
+	// Darwin / token-only path: tight check-then-kill; refuse if token drifts.
+	signaledAny := false
+	for attempt := 0; attempt < 2; attempt++ {
+		if !h.tok.isLiveTarget() {
+			return signaledAny, nil
 		}
+		if err := killPID(h.tok.pid, syscallSIGKILL()); err != nil {
+			if isESRCH(err) {
+				return signaledAny, nil
+			}
+			if !h.tok.stillSame() {
+				// Incarnation gone or replaced between check and kill — do not
+				// escalate; never signal a different start-time identity.
+				return signaledAny, nil
+			}
+			return signaledAny, fmt.Errorf("SIGKILL pid %d: %w", h.tok.pid, err)
+		}
+		signaledAny = true
+		// If the same incarnation is still live, retry once; if token no
+		// longer matches, stop (PID may have been reused — do not re-signal).
 		if !h.tok.stillSame() {
-			return false, nil
+			return true, nil
 		}
-		return false, fmt.Errorf("SIGKILL pid %d: %w", h.tok.pid, err)
 	}
-	return true, nil
+	return signaledAny, nil
 }
