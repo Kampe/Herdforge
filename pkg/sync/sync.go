@@ -60,6 +60,10 @@ func (b *BoardSyncer) ReconcileBoard(ctx context.Context, projectID, repoDir str
 
 	tasks, err := b.Provider.ListTasks(ctx, projectID, "")
 	if err != nil {
+		// Fail closed: never report zero-drift success on provider timeout (FAC-150).
+		if provider.IsTimeout(err) || provider.IsAmbiguous(err) {
+			return nil, fmt.Errorf("failed to list tasks for board sync: BLOCKED(provider_timeout): %w", err)
+		}
 		return nil, fmt.Errorf("failed to list tasks for board sync: %w", err)
 	}
 

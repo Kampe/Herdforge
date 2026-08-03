@@ -53,7 +53,10 @@ func NewNextPicker(cfg *config.Config, tp provider.TaskProvider) *NextPicker {
 }
 
 func (p *NextPicker) Eval(ctx context.Context) (*NextAction, error) {
-	actions := p.evalAll(ctx)
+	actions, err := p.evalAll(ctx)
+	if err != nil {
+		return nil, err
+	}
 	if len(actions) == 0 {
 		return &NextAction{Type: ActionNone, Description: "No action needed."}, nil
 	}
@@ -63,15 +66,20 @@ func (p *NextPicker) Eval(ctx context.Context) (*NextAction, error) {
 	return actions[0], nil
 }
 
-func (p *NextPicker) EvalAll(ctx context.Context) []*NextAction {
-	actions := p.evalAll(ctx)
+// EvalAll returns ranked next actions. Provider timeout/ambiguous failures
+// return an error — never an empty "claim free capacity" success (FAC-150).
+func (p *NextPicker) EvalAll(ctx context.Context) ([]*NextAction, error) {
+	actions, err := p.evalAll(ctx)
+	if err != nil {
+		return nil, err
+	}
 	sort.Slice(actions, func(i, j int) bool {
 		return actions[i].Priority < actions[j].Priority
 	})
-	return actions
+	return actions, nil
 }
 
-func (p *NextPicker) evalAll(ctx context.Context) []*NextAction {
+func (p *NextPicker) evalAll(ctx context.Context) ([]*NextAction, error) {
 	var actions []*NextAction
 
 	// Priority 1: Pending verdict artifacts
@@ -86,7 +94,10 @@ func (p *NextPicker) evalAll(ctx context.Context) []*NextAction {
 	}
 
 	// Priority 2: Harvest-ready or rebase-needed from drain state
-	harvestReady, rebaseNeeded, _, _, _ := drainSummary(ctx, p.TaskProvider, p.Config)
+	harvestReady, rebaseNeeded, _, _, _, err := drainSummary(ctx, p.TaskProvider, p.Config)
+	if err != nil {
+		return nil, err
+	}
 	if harvestReady > 0 {
 		actions = append(actions, &NextAction{
 			Type:        ActionHarvest,
@@ -107,7 +118,10 @@ func (p *NextPicker) evalAll(ctx context.Context) []*NextAction {
 	}
 
 	// Priority 4-5: Review pipeline
-	inReview, needReview := reviewPipelineCounts(ctx, p.TaskProvider, p.Config)
+	inReview, needReview, err := reviewPipelineCounts(ctx, p.TaskProvider, p.Config)
+	if err != nil {
+		return nil, err
+	}
 	reviewCap := 3
 	if inReview >= reviewCap {
 		actions = append(actions, &NextAction{
@@ -137,7 +151,7 @@ func (p *NextPicker) evalAll(ctx context.Context) []*NextAction {
 		AutoSafe:    false,
 	})
 
-	return actions
+	return actions, nil
 }
 
 func (p *NextPicker) pendingVerdicts() []string {
@@ -154,10 +168,11 @@ func (p *NextPicker) pendingVerdicts() []string {
 	return verdicts
 }
 
-func drainSummary(ctx context.Context, tp provider.TaskProvider, cfg *config.Config) (harvestReady int, rebaseNeeded int, inReview int, needReview int, total int) {
+func drainSummary(ctx context.Context, tp provider.TaskProvider, cfg *config.Config) (harvestReady int, rebaseNeeded int, inReview int, needReview int, total int, err error) {
 	tasks, err := tp.ListTasks(ctx, cfg.TaskProvider.ProjectID, "")
 	if err != nil {
-		return 0, 0, 0, 0, 0
+		// Fail closed: never map provider timeout to zero free capacity (FAC-150).
+		return 0, 0, 0, 0, 0, err
 	}
 	for _, t := range tasks {
 		total++
@@ -168,13 +183,13 @@ func drainSummary(ctx context.Context, tp provider.TaskProvider, cfg *config.Con
 			needReview++
 		}
 	}
-	return harvestReady, rebaseNeeded, inReview, needReview, total
+	return harvestReady, rebaseNeeded, inReview, needReview, total, nil
 }
 
-func reviewPipelineCounts(ctx context.Context, tp provider.TaskProvider, cfg *config.Config) (inReview int, needReview int) {
+func reviewPipelineCounts(ctx context.Context, tp provider.TaskProvider, cfg *config.Config) (inReview int, needReview int, err error) {
 	tasks, err := tp.ListTasks(ctx, cfg.TaskProvider.ProjectID, "")
 	if err != nil {
-		return 0, 0
+		return 0, 0, err
 	}
 	for _, t := range tasks {
 		switch t.Status {
@@ -184,7 +199,7 @@ func reviewPipelineCounts(ctx context.Context, tp provider.TaskProvider, cfg *co
 			needReview++
 		}
 	}
-	return inReview, needReview
+	return inReview, needReview, nil
 }
 
 func (a *NextAction) String() string {

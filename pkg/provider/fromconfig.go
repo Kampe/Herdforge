@@ -22,6 +22,9 @@ func DeadlinesFromParts(get, list, mutate, comment, readback time.Duration) Dead
 func ApplyDeadlines(tp TaskProvider, d Deadlines) {
 	d = d.Normalize()
 	switch p := tp.(type) {
+	case *BoundClient:
+		p.Deadlines = d
+		ApplyDeadlines(p.Inner, d)
 	case *KaneoProvider:
 		p.Deadlines = d
 	case *GitHubProvider:
