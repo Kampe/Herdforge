@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -20,6 +21,7 @@ type ServerStatusResponse struct {
 	Health    metrics.HealthSnapshot `json:"health"`
 	Queue     metrics.QueuePressure  `json:"queue"`
 	SLO       metrics.TransitionSLO  `json:"transition_slo"`
+	Signals   metrics.FleetSignals   `json:"signals"`
 }
 
 type ControlServer struct {
@@ -29,6 +31,7 @@ type ControlServer struct {
 	httpSrv   *http.Server
 	metrics   *metrics.MetricsExporter
 	now       func() time.Time
+	serveErr  error
 }
 
 func NewControlServer(addr string) *ControlServer {
@@ -55,11 +58,15 @@ func (s *ControlServer) Start(ctx context.Context) error {
 
 	mux.HandleFunc("/v1/status", s.handleStatus)
 	mux.HandleFunc("/openapi.json", s.handleOpenAPI)
+	mux.Handle("/metrics", s.metrics.Handler())
 
-	s.httpSrv = &http.Server{
+	httpSrv := &http.Server{
 		Addr:    s.Addr,
 		Handler: mux,
 	}
+	s.mu.Lock()
+	s.httpSrv = httpSrv
+	s.mu.Unlock()
 
 	listener, err := net.Listen("tcp", s.Addr)
 	if err != nil {
@@ -67,15 +74,30 @@ func (s *ControlServer) Start(ctx context.Context) error {
 	}
 
 	go func() {
-		_ = s.httpSrv.Serve(listener)
+		if err := httpSrv.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			s.mu.Lock()
+			s.serveErr = err
+			s.mu.Unlock()
+		}
 	}()
 
 	return nil
 }
 
+// ServeError exposes asynchronous listener failures without inventing a
+// successful server state. It is nil until Serve reports an error.
+func (s *ControlServer) ServeError() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.serveErr
+}
+
 func (s *ControlServer) Stop(ctx context.Context) error {
-	if s.httpSrv != nil {
-		return s.httpSrv.Shutdown(ctx)
+	s.mu.Lock()
+	httpSrv := s.httpSrv
+	s.mu.Unlock()
+	if httpSrv != nil {
+		return httpSrv.Shutdown(ctx)
 	}
 	return nil
 }
@@ -83,8 +105,9 @@ func (s *ControlServer) Stop(ctx context.Context) error {
 func (s *ControlServer) handleStatus(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	health, queue, slo := s.metrics.Snapshot()
+	signals := s.metrics.Signals()
 	status := "healthy"
-	if !health.Readiness || !queue.Known || queue.Error != "" {
+	if !health.Readiness || !queue.Known || queue.Error != "" || signals.ObservedAt.IsZero() {
 		status = "degraded"
 	}
 	resp := ServerStatusResponse{
@@ -95,8 +118,18 @@ func (s *ControlServer) handleStatus(w http.ResponseWriter, r *http.Request) {
 		Health:    health,
 		Queue:     queue,
 		SLO:       slo,
+		Signals:   signals,
 	}
-	_ = json.NewEncoder(w).Encode(resp)
+	payload, err := json.Marshal(resp)
+	if err != nil {
+		http.Error(w, "status encoding failed", http.StatusInternalServerError)
+		return
+	}
+	if _, err := w.Write(payload); err != nil {
+		s.mu.Lock()
+		s.serveErr = fmt.Errorf("status response write: %w", err)
+		s.mu.Unlock()
+	}
 }
 
 func (s *ControlServer) handleOpenAPI(w http.ResponseWriter, r *http.Request) {
