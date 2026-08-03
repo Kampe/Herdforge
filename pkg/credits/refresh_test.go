@@ -286,7 +286,7 @@ func TestLedgerCommands_Advise_LiveCoversProvider(t *testing.T) {
 	dir := t.TempDir()
 	script := filepath.Join(dir, "herd-quota")
 	os.WriteFile(script, []byte(`#!/bin/sh
-echo '{"claude":{"claude-5h":{"used":42,"remaining":58000,"resetsIn":180,"class":"onpace","stale":false,"reason":"ok"},"all":{"used":42,"stale":false,"reason":"ok"}}}'`), 0755)
+echo '{"claude":{"used":42,"pools":{"claude-5h":{"used":42,"remaining":58000,"resetsIn":"3h 0m","class":"onpace","stale":false,"reason":"ok"},"all":{"used":42,"stale":false,"reason":"ok"}}}}'`), 0755)
 
 	orig := quotaBinPath
 	defer func() { quotaBinPath = orig }()
@@ -304,24 +304,15 @@ echo '{"claude":{"claude-5h":{"used":42,"remaining":58000,"resetsIn":180,"class"
 	if !strings.Contains(out, "live OpenUsage quota") {
 		t.Errorf("expected live OpenUsage header, got: %s", out)
 	}
-	if !strings.Contains(out, "claude/claude-5h:") {
-		t.Errorf("expected live pool row for claude/claude-5h, got: %s", out)
+	if !strings.Contains(out, "  claude/claude-5h: 42% used, 58% left, onpace, reset 3h 0m") {
+		t.Errorf("expected binding-format live row for claude/claude-5h, got: %s", out)
 	}
-	if !strings.Contains(out, "42% used") {
-		t.Errorf("expected used=42 in live row, got: %s", out)
+	if !strings.Contains(out, "ledger-only fallback snapshots") {
+		t.Errorf("expected ledger-only fallback header on live success, got: %s", out)
 	}
-	if !strings.Contains(out, "58000 remaining") {
-		t.Errorf("expected remaining=58000, got: %s", out)
-	}
-	if !strings.Contains(out, "onpace class") {
-		t.Errorf("expected onpace class, got: %s", out)
-	}
-	if !strings.Contains(out, "resets in 180") {
-		t.Errorf("expected resetsIn=180, got: %s", out)
-	}
-	// claude should NOT get a ledger pace row because live covers it
+	// claude should NOT get a ledger pace row because live covers it (by provider)
 	if strings.Contains(out, "claude: 50% used") {
-		t.Errorf("ledger pace row for claude should be suppressed when live covers it, got: %s", out)
+		t.Errorf("ledger pace row for claude should be suppressed when live covers provider, got: %s", out)
 	}
 }
 
@@ -356,7 +347,7 @@ func TestLedgerCommands_Advise_LiveFiltersStalePools(t *testing.T) {
 	dir := t.TempDir()
 	script := filepath.Join(dir, "herd-quota")
 	os.WriteFile(script, []byte(`#!/bin/sh
-echo '{"claude":{"claude-5h":{"used":42,"stale":true,"reason":"ok"}},"antigravity":{"agy":{"used":10,"stale":false,"reason":"exhausted"}}}'`), 0755)
+echo '{"claude":{"pools":{"claude-5h":{"used":42,"stale":true,"reason":"ok"}}},"antigravity":{"pools":{"agy":{"used":10,"resetsIn":"5d","class":"onpace","stale":false,"reason":"exhausted"}}}}'`), 0755)
 
 	orig := quotaBinPath
 	defer func() { quotaBinPath = orig }()
@@ -371,14 +362,17 @@ echo '{"claude":{"claude-5h":{"used":42,"stale":true,"reason":"ok"}},"antigravit
 	if strings.Contains(out, "claude/claude-5h:") {
 		t.Errorf("stale pool should not appear in live rows, got: %s", out)
 	}
-	// agy is valid (reason=exhausted, stale=false) so it should appear as live row
-	// but agy maps to antigravity, so the "agy" ledger surface should NOT be suppressed
-	// because "agy" normalizes to "antigravity" which IS covered
-	if !strings.Contains(out, "antigravity/agy:") {
-		t.Errorf("expected live row for antigravity/agy, got: %s", out)
+	// antigravity has a valid live pool (reason=exhausted, stale=false) -> live row shown
+	if !strings.Contains(out, "  antigravity/agy: 10% used, 90% left, onpace, reset 5d") {
+		t.Errorf("expected binding-format live row for antigravity/agy, got: %s", out)
 	}
+	// agy ledger surface normalizes to antigravity, which has live coverage -> suppressed
 	if strings.Contains(out, "agy: 10% used, 28% of window") {
-		t.Errorf("agy ledger pace should be suppressed when live covers antigravity, got: %s", out)
+		t.Errorf("agy ledger pace should be suppressed when live covers antigravity provider, got: %s", out)
+	}
+	// claude has no valid live pool (only stale) -> ledger pace still shown
+	if !strings.Contains(out, "claude: 20% used") {
+		t.Errorf("claude ledger pace should appear when its only pool is stale, got: %s", out)
 	}
 }
 
@@ -690,18 +684,9 @@ func TestParseQuotaInt(t *testing.T) {
 }
 
 func TestRefresh_HappyPath(t *testing.T) {
-	if _, err := exec.LookPath("jq"); err != nil {
-		t.Skip("jq not on PATH")
-	}
-
 	dir := t.TempDir()
-	os.Setenv("HERD_CREDITS_NO_REFRESH", "")
-	defer os.Unsetenv("HERD_CREDITS_NO_REFRESH")
-
-	// mock sidecar to return an active email
-	origAccountsDir := os.Getenv("HERD_CLAUDE_ACCOUNTS_DIR")
-	os.Setenv("HERD_CLAUDE_ACCOUNTS_DIR", dir)
-	defer func() { os.Setenv("HERD_CLAUDE_ACCOUNTS_DIR", origAccountsDir) }()
+	t.Setenv("HERD_CREDITS_NO_REFRESH", "")
+	t.Setenv("HERD_CLAUDE_ACCOUNTS_DIR", dir)
 	os.WriteFile(filepath.Join(dir, "active.email"), []byte("test@example.com\n"), 0644)
 
 	// mock ccusage to return valid JSON
@@ -737,14 +722,224 @@ fi`, blocksJSON, dailyJSON)), 0755)
 	}
 }
 
+func TestRefresh_PreservesOperatorNotes(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("HERD_CREDITS_NO_REFRESH", "")
+	t.Setenv("HERD_CLAUDE_ACCOUNTS_DIR", dir)
+	os.WriteFile(filepath.Join(dir, "active.email"), []byte("a@x\n"), 0644)
+
+	mockScript := filepath.Join(dir, "ccusage")
+	blocksJSON := `{"blocks":[{"isActive":true,"totalTokens":1000000,"projection":{"remainingMinutes":120}}]}`
+	dailyJSON := `{"totals":{"totalTokens":50000000}}`
+	os.WriteFile(mockScript, []byte(fmt.Sprintf(`#!/bin/sh
+if echo "$*" | grep -q "blocks"; then
+  echo '%s'
+else
+  echo '%s'
+fi`, blocksJSON, dailyJSON)), 0755)
+
+	origBase := CcUsageBase
+	defer func() { CcUsageBase = origBase }()
+	CcUsageBase = func() (string, error) { return mockScript, nil }
+
+	l, _ := OpenLedger(filepath.Join(dir, "ledger.json"))
+	l.data["claude"] = Record{
+		UsedPct:    10,
+		WindowDays: intPtr(7),
+		DaysLeft:   intPtr(5),
+		Note:       "PAUSED do-not-dispatch",
+		Updated:    NowEpoch(),
+		Accounts: []AccountRow{
+			{Email: "a@x", UsedPct: 10, BurnOrder: 1, Note: "operator parked"},
+		},
+	}
+
+	r := Refresh(l, "claude", 0, 0, 0, nil)
+	if r.Err != nil {
+		t.Fatalf("Refresh: %v", r.Err)
+	}
+
+	rec, _ := l.Surface("claude")
+	if rec.Note != "PAUSED do-not-dispatch" {
+		t.Errorf("surface note must be preserved through refresh, got %q", rec.Note)
+	}
+	if len(rec.Accounts) != 1 {
+		t.Fatalf("expected 1 account, got %d", len(rec.Accounts))
+	}
+	if rec.Accounts[0].Note != "operator parked" {
+		t.Errorf("account note must be preserved through refresh, got %q", rec.Accounts[0].Note)
+	}
+	if rec.Accounts[0].UsedPct != 50 {
+		t.Errorf("account used should be updated to 50%%, got %d%%", rec.Accounts[0].UsedPct)
+	}
+}
+
+func TestRefresh_WrongShapeJSONLeavesSnapshot(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("HERD_CREDITS_NO_REFRESH", "")
+	t.Setenv("HERD_CLAUDE_ACCOUNTS_DIR", dir)
+	os.WriteFile(filepath.Join(dir, "active.email"), []byte("test@example.com\n"), 0644)
+
+	// valid JSON but wrong shape: {} for both calls
+	mockScript := filepath.Join(dir, "ccusage")
+	os.WriteFile(mockScript, []byte(`#!/bin/sh
+echo '{}'`), 0755)
+
+	origBase := CcUsageBase
+	defer func() { CcUsageBase = origBase }()
+	CcUsageBase = func() (string, error) { return mockScript, nil }
+
+	l, _ := OpenLedger(filepath.Join(dir, "ledger.json"))
+	l.data["claude"] = Record{UsedPct: 42, Note: "manual", Updated: NowEpoch()}
+
+	r := Refresh(l, "claude", 0, 0, 0, nil)
+	if r.Err != nil {
+		t.Fatalf("unexpected err: %v", r.Err)
+	}
+	if !strings.Contains(r.Output, "malformed") {
+		t.Errorf("expected malformed notice for wrong-shaped JSON, got: %s", r.Output)
+	}
+
+	rec, _ := l.Surface("claude")
+	if rec.UsedPct != 42 {
+		t.Errorf("wrong-shaped JSON must leave snapshot untouched, got used=%d%%", rec.UsedPct)
+	}
+	if rec.Note != "manual" {
+		t.Errorf("wrong-shaped JSON must leave note untouched, got %q", rec.Note)
+	}
+	if rec.Source == "ccusage" {
+		t.Errorf("wrong-shaped JSON must not set source=ccusage")
+	}
+}
+
+func TestRefresh_WeeklyClamp(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("HERD_CREDITS_NO_REFRESH", "")
+	t.Setenv("HERD_CLAUDE_ACCOUNTS_DIR", dir)
+	os.WriteFile(filepath.Join(dir, "active.email"), []byte("test@example.com\n"), 0644)
+
+	mockScript := filepath.Join(dir, "ccusage")
+	blocksJSON := `{"blocks":[{"isActive":true,"totalTokens":1000000,"projection":{"remainingMinutes":120}}]}`
+	dailyJSON := `{"totals":{"totalTokens":250000000}}` // 250% of 100M budget
+	os.WriteFile(mockScript, []byte(fmt.Sprintf(`#!/bin/sh
+if echo "$*" | grep -q "blocks"; then
+  echo '%s'
+else
+  echo '%s'
+fi`, blocksJSON, dailyJSON)), 0755)
+
+	origBase := CcUsageBase
+	defer func() { CcUsageBase = origBase }()
+	CcUsageBase = func() (string, error) { return mockScript, nil }
+
+	l, _ := OpenLedger(filepath.Join(dir, "ledger.json"))
+	r := Refresh(l, "claude", 0, 0, 0, nil)
+	if r.Err != nil {
+		t.Fatalf("Refresh: %v", r.Err)
+	}
+
+	rec, _ := l.Surface("claude")
+	if rec.UsedPct != 100 {
+		t.Errorf("weekly pct must clamp at 100, got %d%%", rec.UsedPct)
+	}
+}
+
+func TestRefresh_HourlyDeadTiming(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("HERD_CREDITS_NO_REFRESH", "")
+	t.Setenv("HERD_CLAUDE_ACCOUNTS_DIR", dir)
+	os.WriteFile(filepath.Join(dir, "active.email"), []byte("a@x\n"), 0644)
+
+	mockScript := filepath.Join(dir, "ccusage")
+	// 19M of 20M 5h budget = 95% -> hourly dead; remainingMinutes=120 -> hold 2h
+	blocksJSON := `{"blocks":[{"isActive":true,"totalTokens":19000000,"projection":{"remainingMinutes":120}}]}`
+	dailyJSON := `{"totals":{"totalTokens":10000000}}`
+	os.WriteFile(mockScript, []byte(fmt.Sprintf(`#!/bin/sh
+if echo "$*" | grep -q "blocks"; then
+  echo '%s'
+else
+  echo '%s'
+fi`, blocksJSON, dailyJSON)), 0755)
+
+	origBase := CcUsageBase
+	defer func() { CcUsageBase = origBase }()
+	CcUsageBase = func() (string, error) { return mockScript, nil }
+
+	l, _ := OpenLedger(filepath.Join(dir, "ledger.json"))
+	l.data["claude"] = Record{
+		Accounts: []AccountRow{{Email: "a@x", UsedPct: 10, BurnOrder: 1}},
+	}
+
+	before := NowEpoch()
+	r := Refresh(l, "claude", 0, 0, 0, nil)
+	if r.Err != nil {
+		t.Fatalf("Refresh: %v", r.Err)
+	}
+	if !strings.Contains(r.Output, "hourly-dead") {
+		t.Errorf("expected hourly-dead in output, got: %s", r.Output)
+	}
+
+	rec, _ := l.Surface("claude")
+	if len(rec.Accounts) != 1 {
+		t.Fatalf("expected 1 account, got %d", len(rec.Accounts))
+	}
+	dead := rec.Accounts[0].ExhaustedUntil
+	if dead < before+7100 || dead > before+7300 {
+		t.Errorf("ExhaustedUntil should be ~2h from now (%d), got %d", before+7200, dead)
+	}
+}
+
+func TestMaybeRefresh_StaleAndFresh(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("HERD_CREDITS_AUTO_REFRESH", "1")
+	t.Setenv("HERD_CREDITS_NO_REFRESH", "")
+	t.Setenv("HERD_CREDITS_REFRESH_TTL", "60")
+	t.Setenv("HERD_CLAUDE_ACCOUNTS_DIR", dir)
+	os.WriteFile(filepath.Join(dir, "active.email"), []byte("test@example.com\n"), 0644)
+
+	mockScript := filepath.Join(dir, "ccusage")
+	blocksJSON := `{"blocks":[{"isActive":true,"totalTokens":1000000,"projection":{"remainingMinutes":120}}]}`
+	dailyJSON := `{"totals":{"totalTokens":50000000}}`
+	os.WriteFile(mockScript, []byte(fmt.Sprintf(`#!/bin/sh
+if echo "$*" | grep -q "blocks"; then
+  echo '%s'
+else
+  echo '%s'
+fi`, blocksJSON, dailyJSON)), 0755)
+
+	origBase := CcUsageBase
+	defer func() { CcUsageBase = origBase }()
+	CcUsageBase = func() (string, error) { return mockScript, nil }
+
+	// fresh record (Updated = now) -> no refresh
+	l, _ := OpenLedger(filepath.Join(dir, "ledger.json"))
+	l.data["claude"] = Record{UsedPct: 42, Note: "manual", Updated: NowEpoch()}
+	r := MaybeRefresh(l)
+	if r != nil {
+		t.Errorf("fresh record must not trigger refresh, got: %+v", r)
+	}
+	rec, _ := l.Surface("claude")
+	if rec.UsedPct != 42 {
+		t.Errorf("fresh record must remain untouched, got %d%%", rec.UsedPct)
+	}
+
+	// stale record (Updated = 1h ago) -> refresh fires
+	l2, _ := OpenLedger(filepath.Join(dir, "ledger2.json"))
+	l2.data["claude"] = Record{UsedPct: 42, Note: "manual", Updated: NowEpoch() - 3600}
+	r2 := MaybeRefresh(l2)
+	if r2 == nil {
+		t.Fatal("stale record must trigger refresh")
+	}
+	rec2, _ := l2.Surface("claude")
+	if rec2.UsedPct != 50 {
+		t.Errorf("stale record should refresh to 50%%, got %d%%", rec2.UsedPct)
+	}
+}
+
 func TestRefresh_MalformedJSONLeavesManualSnapshot(t *testing.T) {
 	dir := t.TempDir()
-	os.Setenv("HERD_CREDITS_NO_REFRESH", "")
-	defer os.Unsetenv("HERD_CREDITS_NO_REFRESH")
-
-	origAccountsDir := os.Getenv("HERD_CLAUDE_ACCOUNTS_DIR")
-	os.Setenv("HERD_CLAUDE_ACCOUNTS_DIR", dir)
-	defer func() { os.Setenv("HERD_CLAUDE_ACCOUNTS_DIR", origAccountsDir) }()
+	t.Setenv("HERD_CREDITS_NO_REFRESH", "")
+	t.Setenv("HERD_CLAUDE_ACCOUNTS_DIR", dir)
 	os.WriteFile(filepath.Join(dir, "active.email"), []byte("test@example.com\n"), 0644)
 
 	mockScript := filepath.Join(dir, "ccusage")
@@ -808,5 +1003,112 @@ func TestEnvInt(t *testing.T) {
 	got = envInt("TEST_ENV_INT", 10)
 	if got != 10 {
 		t.Errorf("expected fallback 10 for negative, got %d", got)
+	}
+}
+
+func TestLedgerCommands_Pace_FloorTruncation(t *testing.T) {
+	// (33,0) pool: avg 16.5 -> floor 16 (not round 17)
+	l, _ := OpenLedger(filepath.Join(t.TempDir(), "ledger.json"))
+	l.data["claude"] = Record{
+		Accounts: []AccountRow{
+			{Email: "a@x", UsedPct: 33, BurnOrder: 1},
+			{Email: "b@y", UsedPct: 0, BurnOrder: 2},
+		},
+		WindowDays: intPtr(7),
+		DaysLeft:   intPtr(6),
+	}
+	lc := NewLedgerCommands(l)
+	out := lc.Pace("claude")
+	if !strings.Contains(out, "effective 16%") {
+		t.Errorf("expected floor(16.5)=16, got: %s", out)
+	}
+}
+
+func TestLedgerCommands_Pace_BoundaryClassifiesOnpace(t *testing.T) {
+	// (100,19) pool: avg 59.5 -> floor 59 -> at floor 60, 59 < 60 -> onpace/concurrency 2
+	// (round(59.5)=60 would be overpace/concurrency 1)
+	l, _ := OpenLedger(filepath.Join(t.TempDir(), "ledger.json"))
+	l.data["claude"] = Record{
+		Accounts: []AccountRow{
+			{Email: "a@x", UsedPct: 100, BurnOrder: 1},
+			{Email: "b@y", UsedPct: 19, BurnOrder: 2},
+		},
+		WindowDays: intPtr(7),
+		DaysLeft:   intPtr(4), // elapsed ~43% > 59% used
+	}
+	lc := NewLedgerCommands(l)
+	out := lc.Pace("claude")
+	if !strings.Contains(out, "effective 59%") {
+		t.Errorf("expected floor(59.5)=59, got: %s", out)
+	}
+	if !strings.Contains(out, "onpace") || !strings.Contains(out, "concurrency 2") {
+		t.Errorf("59%% at floor 60 must classify onpace/concurrency 2, got: %s", out)
+	}
+}
+
+func TestOpenLedger_RejectsZeroByte(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ledger.json")
+	os.WriteFile(path, []byte(""), 0644)
+	_, err := OpenLedger(path)
+	if err == nil {
+		t.Fatal("zero-byte ledger must be rejected")
+	}
+	if !strings.Contains(err.Error(), "empty") {
+		t.Errorf("expected empty-file error, got: %v", err)
+	}
+}
+
+func TestOpenLedger_RejectsNull(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ledger.json")
+	os.WriteFile(path, []byte("null"), 0644)
+	_, err := OpenLedger(path)
+	if err == nil {
+		t.Fatal("JSON null ledger must be rejected")
+	}
+	if !strings.Contains(err.Error(), "null") {
+		t.Errorf("expected null error, got: %v", err)
+	}
+}
+
+func TestClaudeActiveEmail_EnvOverride(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("HERD_CLAUDE_ACCOUNTS_DIR", dir)
+	os.WriteFile(filepath.Join(dir, "active.email"), []byte("override@example.com\n"), 0644)
+
+	email := ClaudeActiveEmail("")
+	if email != "override@example.com" {
+		t.Errorf("expected HERD_CLAUDE_ACCOUNTS_DIR sidecar, got %q", email)
+	}
+}
+
+func TestClaudeActiveEmail_ExplicitDirWins(t *testing.T) {
+	envDir := t.TempDir()
+	t.Setenv("HERD_CLAUDE_ACCOUNTS_DIR", envDir)
+	os.WriteFile(filepath.Join(envDir, "active.email"), []byte("env@example.com\n"), 0644)
+
+	explicitDir := t.TempDir()
+	os.WriteFile(filepath.Join(explicitDir, "active.email"), []byte("explicit@example.com\n"), 0644)
+
+	email := ClaudeActiveEmail(explicitDir)
+	if email != "explicit@example.com" {
+		t.Errorf("explicit accountsDir must win over env, got %q", email)
+	}
+}
+
+func TestClaudeEmailToAccount_Lowercase(t *testing.T) {
+	tests := []struct {
+		in   string
+		want string
+	}{
+		{"Blindside328@gmail.com", "blindside328"},
+		{"NICK.KAMPE@yugalabs.io", "yuga"},
+		{"SomeUser@example.com", "someuser"},
+		{"NoAtSign", "noatsign"},
+	}
+	for _, tt := range tests {
+		got := ClaudeEmailToAccount(tt.in)
+		if got != tt.want {
+			t.Errorf("ClaudeEmailToAccount(%q) = %q, want %q", tt.in, got, tt.want)
+		}
 	}
 }
