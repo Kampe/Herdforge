@@ -1,7 +1,6 @@
 package credits
 
 import (
-	"bytes"
 	"encoding/json"
 	"fmt"
 	"math"
@@ -30,8 +29,30 @@ func NowEpoch() int64 {
 	return time.Now().Unix()
 }
 
+func envInt(key string, fallback int) int {
+	if v := os.Getenv(key); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+	return fallback
+}
+
 var CcUsageBase = func() (string, error) {
-	return "ccusage", nil
+	if _, err := exec.LookPath("ccusage"); err == nil {
+		return "ccusage", nil
+	}
+	if _, err := exec.LookPath("npx"); err == nil {
+		return "npx", nil
+	}
+	return "", fmt.Errorf("credits: neither ccusage nor npx found on PATH")
+}
+
+func ccUsageArgs(base string, args []string) []string {
+	if base == "npx" {
+		return append([]string{"--yes", "ccusage@latest"}, args...)
+	}
+	return args
 }
 
 func CcUsageBlocks(surface string, timeoutSec int) string {
@@ -52,15 +73,20 @@ func WeekAgoYYYMMDD() string {
 	return time.Now().AddDate(0, 0, -7).Format("20060102")
 }
 
+var execCommand = func(name string, args ...string) *exec.Cmd {
+	return exec.Command(name, args...)
+}
+
 func execCcUsage(args []string, timeoutSec int) string {
 	base, err := CcUsageBase()
 	if err != nil {
 		return ""
 	}
-	cmdLine := strings.Join(append([]string{base}, args...), " ")
-	cmd := exec.Command("sh", "-c", cmdLine)
 
-	var outBuf bytes.Buffer
+	fullArgs := ccUsageArgs(base, args)
+	cmd := execCommand(base, fullArgs...)
+
+	var outBuf strings.Builder
 	cmd.Stdout = &outBuf
 	cmd.Stderr = nil
 
@@ -68,17 +94,19 @@ func execCcUsage(args []string, timeoutSec int) string {
 		return ""
 	}
 
-	done := make(chan error, 1)
-	go func() {
-		done <- cmd.Wait()
-	}()
-
 	if timeoutSec <= 0 {
 		timeoutSec = DefaultCcUsageTimeout
 	}
+
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+
 	select {
 	case <-time.After(time.Duration(timeoutSec) * time.Second):
-		cmd.Process.Kill()
+		if cmd.Process != nil {
+			cmd.Process.Kill()
+		}
+		<-done
 		return ""
 	case err := <-done:
 		if err != nil {
@@ -91,44 +119,69 @@ func execCcUsage(args []string, timeoutSec int) string {
 
 type TokenParser func(jsonStr, jqExpr string) int
 
+var jqCommand = func(jqExpr string, stdin string) ([]byte, error) {
+	cmd := exec.Command("jq", jqExpr)
+	cmd.Stdin = strings.NewReader(stdin)
+	return cmd.Output()
+}
+
+func parseJSONOrFail(jsonStr string, v interface{}) bool {
+	if jsonStr == "" {
+		return false
+	}
+	return json.Unmarshal([]byte(jsonStr), v) == nil
+}
+
 var ParseTokensFromJSON TokenParser = func(jsonStr, jqExpr string) int {
 	if jsonStr == "" {
 		return 0
 	}
-	cmd := exec.Command("jq", jqExpr)
-	cmd.Stdin = strings.NewReader(jsonStr)
-	out, err := cmd.Output()
+	out, err := jqCommand(jqExpr, jsonStr)
 	if err != nil {
 		return 0
 	}
-	v, err := strconv.Atoi(strings.TrimSpace(string(out)))
-	if err != nil {
+	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+	sum := 0
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" || line == "null" {
+			continue
+		}
+		v, err := strconv.Atoi(line)
+		if err != nil {
+			continue
+		}
+		if v > 0 {
+			sum += v
+		}
+	}
+	if sum < 0 {
 		return 0
 	}
-	if v < 0 {
-		return 0
-	}
-	return v
+	return sum
 }
 
 var ParseRemainingMinutes func(jsonStr string) int = func(jsonStr string) int {
 	if jsonStr == "" {
 		return 0
 	}
-	cmd := exec.Command("jq", ".blocks[] | select(.isActive == true) | .remainingMinutes // 0")
-	cmd.Stdin = strings.NewReader(jsonStr)
-	out, err := cmd.Output()
-	if err != nil {
+	var doc struct {
+		Blocks []struct {
+			IsActive   bool `json:"isActive"`
+			Projection struct {
+				RemainingMinutes int `json:"remainingMinutes"`
+			} `json:"projection"`
+		} `json:"blocks"`
+	}
+	if !parseJSONOrFail(jsonStr, &doc) {
 		return 0
 	}
-	v, err := strconv.Atoi(strings.TrimSpace(string(out)))
-	if err != nil {
-		return 0
+	for _, b := range doc.Blocks {
+		if b.IsActive && b.Projection.RemainingMinutes > 0 {
+			return b.Projection.RemainingMinutes
+		}
 	}
-	if v < 0 {
-		return 0
-	}
-	return v
+	return 0
 }
 
 func Refresh(ledger *Ledger, surface string, budget5h, budgetWeekly, ttl int, emails []string) *RefreshResult {
@@ -143,6 +196,14 @@ func Refresh(ledger *Ledger, surface string, budget5h, budgetWeekly, ttl int, em
 		return &RefreshResult{Output: "herd-credits: refresh skipped (HERD_CREDITS_NO_REFRESH=1)"}
 	}
 
+	timeoutSec := envInt("HERD_CCUSAGE_TIMEOUT", DefaultCcUsageTimeout)
+	if budget5h <= 0 {
+		budget5h = envInt("HERD_CLAUDE_MAX_5H_TOKEN_BUDGET", DefaultMax5hTokenBudget)
+	}
+	if budgetWeekly <= 0 {
+		budgetWeekly = envInt("HERD_CLAUDE_MAX_WEEKLY_TOKEN_BUDGET", DefaultMaxWeeklyTokenBudget)
+	}
+
 	activeEmail := ClaudeActiveEmail("")
 	if activeEmail == "" {
 		activeEmail = ClaudeActiveExpanded()
@@ -151,27 +212,52 @@ func Refresh(ledger *Ledger, surface string, budget5h, budgetWeekly, ttl int, em
 		return &RefreshResult{Output: "herd-credits: refresh skipped (no active claude account known)"}
 	}
 
-	blocksJSON := CcUsageBlocks(surface, DefaultCcUsageTimeout)
-	dailyJSON := CcUsageDaily(surface, WeekAgoYYYMMDD(), DefaultCcUsageTimeout)
+	blocksJSON := CcUsageBlocks(surface, timeoutSec)
+	dailyJSON := CcUsageDaily(surface, WeekAgoYYYMMDD(), timeoutSec)
 
 	if blocksJSON == "" && dailyJSON == "" {
 		return &RefreshResult{Output: "herd-credits: ccusage unavailable, using manual snapshot"}
 	}
 
-	tok5h := ParseTokensFromJSON(blocksJSON, ".blocks[]? | select(.isActive == true) | (.totalTokens // 0)")
-	if tok5h < 0 {
-		tok5h = 0
+	blocksOK := blocksJSON != ""
+	var blocksDoc struct {
+		Blocks []struct {
+			IsActive    bool `json:"isActive"`
+			TotalTokens int  `json:"totalTokens"`
+		} `json:"blocks"`
 	}
-	tokWeek := ParseTokensFromJSON(dailyJSON, ".totals.totalTokens // 0")
-	if tokWeek < 0 {
-		tokWeek = 0
+	if blocksOK {
+		if !parseJSONOrFail(blocksJSON, &blocksDoc) {
+			return &RefreshResult{Output: "herd-credits: ccusage returned malformed blocks JSON, manual snapshot unchanged"}
+		}
 	}
 
-	if budget5h <= 0 {
-		budget5h = DefaultMax5hTokenBudget
+	dailyOK := dailyJSON != ""
+	var dailyDoc struct {
+		Totals struct {
+			TotalTokens int `json:"totalTokens"`
+		} `json:"totals"`
 	}
-	if budgetWeekly <= 0 {
-		budgetWeekly = DefaultMaxWeeklyTokenBudget
+	if dailyOK {
+		if !parseJSONOrFail(dailyJSON, &dailyDoc) {
+			return &RefreshResult{Output: "herd-credits: ccusage returned malformed daily JSON, manual snapshot unchanged"}
+		}
+	}
+
+	tok5h := 0
+	if blocksOK {
+		for _, b := range blocksDoc.Blocks {
+			if b.IsActive && b.TotalTokens > 0 {
+				tok5h += b.TotalTokens
+			}
+		}
+	}
+	tokWeek := 0
+	if dailyOK {
+		tokWeek = dailyDoc.Totals.TotalTokens
+		if tokWeek < 0 {
+			tokWeek = 0
+		}
 	}
 
 	pct5h := tok5h * 100 / budget5h
@@ -278,13 +364,17 @@ func MaybeRefresh(ledger *Ledger) *RefreshResult {
 		return nil
 	}
 
+	ttl := envInt("HERD_CREDITS_REFRESH_TTL", DefaultRefreshTTL)
+	budget5h := envInt("HERD_CLAUDE_MAX_5H_TOKEN_BUDGET", DefaultMax5hTokenBudget)
+	budgetWeekly := envInt("HERD_CLAUDE_MAX_WEEKLY_TOKEN_BUDGET", DefaultMaxWeeklyTokenBudget)
+
 	rec, err := ledger.Surface("claude")
 	if err != nil {
-		return Refresh(ledger, "claude", DefaultMax5hTokenBudget, DefaultMaxWeeklyTokenBudget, DefaultRefreshTTL, nil)
+		return Refresh(ledger, "claude", budget5h, budgetWeekly, ttl, nil)
 	}
 	age := NowEpoch() - rec.Updated
-	if age >= int64(DefaultRefreshTTL) {
-		return Refresh(ledger, "claude", DefaultMax5hTokenBudget, DefaultMaxWeeklyTokenBudget, DefaultRefreshTTL, nil)
+	if age >= int64(ttl) {
+		return Refresh(ledger, "claude", budget5h, budgetWeekly, ttl, nil)
 	}
 	return nil
 }
@@ -471,7 +561,7 @@ func (lc *LedgerCommands) Pace(surface string) string {
 	paused := false
 	if rec.Note != "" {
 		noteL := strings.ToLower(rec.Note)
-		if strings.Contains(noteL, "paused") || strings.Contains(noteL, "do not dispatch") {
+		if strings.Contains(noteL, "paused") || strings.Contains(noteL, "do not dispatch") || strings.Contains(noteL, "do-not-dispatch") {
 			paused = true
 		}
 	}
@@ -503,8 +593,17 @@ func (lc *LedgerCommands) Pace(surface string) string {
 	}
 
 	classifyUsed := trueUsed
-	if nAcct > 0 && trueUsed >= 95 {
-		classifyUsed = 94
+	if nAcct > 0 {
+		allExhausted := true
+		for _, a := range rec.Accounts {
+			if a.UsedPct < 95 {
+				allExhausted = false
+				break
+			}
+		}
+		if !allExhausted && trueUsed >= 95 {
+			classifyUsed = 94
+		}
 	}
 
 	cls := PaceClassOf(classifyUsed, elapsed, floorPct)
@@ -522,20 +621,37 @@ func (lc *LedgerCommands) Pace(surface string) string {
 			out += fmt.Sprintf("\n  burn#%d %s used=%d%%%s", a.BurnOrder, a.Email, a.UsedPct, until)
 		}
 
-		var primary, reserve AccountRow
+		// primary = account with minimum burn order
+		var primary AccountRow
 		for _, a := range rec.Accounts {
-			if a.BurnOrder == 1 || (a.BurnOrder == 0 && primary.Email == "") {
+			if primary.Email == "" {
+				primary = a
+				continue
+			}
+			boA := a.BurnOrder
+			if boA == 0 {
+				boA = 99
+			}
+			boP := primary.BurnOrder
+			if boP == 0 {
+				boP = 99
+			}
+			if boA < boP {
 				primary = a
 			}
 		}
+
+		// reserve = first account with headroom (used < 95), not the primary
+		var reserve AccountRow
 		for _, a := range rec.Accounts {
-			if a.Email != primary.Email && reserve.Email == "" {
+			if a.Email != primary.Email && a.UsedPct < 95 {
 				reserve = a
+				break
 			}
 		}
 
 		primaryExhausted := primary.UsedPct >= 95 || primary.ExhaustedUntil > NowEpoch()
-		primaryPaused := strings.Contains(strings.ToLower(primary.Note), "paused") || strings.Contains(strings.ToLower(primary.Note), "do not dispatch")
+		primaryPaused := strings.Contains(strings.ToLower(primary.Note), "paused") || strings.Contains(strings.ToLower(primary.Note), "do not dispatch") || strings.Contains(strings.ToLower(primary.Note), "do-not-dispatch")
 
 		if primaryPaused {
 			out += fmt.Sprintf("\n  PAUSED: primary burn#%d %s is paused (note: %s)", primary.BurnOrder, primary.Email, primary.Note)
@@ -604,18 +720,33 @@ func normalizeProviderKey(surface string) string {
 	}
 }
 
-type QuotaPool struct {
-	Key       string `json:"key"`
-	Used      *int   `json:"used"`
-	Remaining *int   `json:"remaining"`
-	ResetsIn  *int   `json:"resetsIn"`
-	Class     string `json:"class"`
-	Stale     bool   `json:"stale"`
-	Reason    string `json:"reason"`
+type QuotaPoolEntry struct {
+	Used      interface{} `json:"used"`
+	Remaining interface{} `json:"remaining"`
+	ResetsIn  interface{} `json:"resetsIn"`
+	Class     string      `json:"class"`
+	Stale     bool        `json:"stale"`
+	Reason    string      `json:"reason"`
 }
 
-type QuotaJSON struct {
-	Pools []QuotaPool `json:"pools"`
+type QuotaProvider map[string]QuotaPoolEntry
+
+type QuotaJSON map[string]QuotaProvider
+
+func parseQuotaInt(v interface{}) (int, bool) {
+	switch val := v.(type) {
+	case float64:
+		return int(val), true
+	case string:
+		if f, err := strconv.ParseFloat(val, 64); err == nil {
+			return int(f), true
+		}
+		return 0, false
+	case int:
+		return val, true
+	default:
+		return 0, false
+	}
 }
 
 var quotaBinPath = func() string {
@@ -630,7 +761,6 @@ func (lc *LedgerCommands) Advise() string {
 
 	var out strings.Builder
 
-	// execute live quota bin
 	liveProviders := map[string]bool{}
 	liveOK := false
 
@@ -638,28 +768,41 @@ func (lc *LedgerCommands) Advise() string {
 	cmd := exec.Command(qBin, "--json")
 	if liveOut, err := cmd.Output(); err == nil {
 		var qj QuotaJSON
-		if jsonErr := json.Unmarshal(liveOut, &qj); jsonErr == nil && qj.Pools != nil {
+		if jsonErr := json.Unmarshal(liveOut, &qj); jsonErr == nil && qj != nil {
 			liveOK = true
-			for _, p := range qj.Pools {
-				if p.Key == "all" || p.Used == nil || p.Stale {
-					continue
-				}
-				if p.Reason != "ok" && p.Reason != "exhausted" {
-					continue
-				}
-				provider := normalizeProviderKey(p.Key)
-				liveProviders[provider] = true
+			out.WriteString("live OpenUsage quota (authoritative for routing):\n")
 
-				rem := 0
-				if p.Remaining != nil {
-					rem = *p.Remaining
+			providers := make([]string, 0, len(qj))
+			for prov := range qj {
+				providers = append(providers, prov)
+			}
+			sort.Strings(providers)
+
+			for _, prov := range providers {
+				pools := qj[prov]
+				poolKeys := make([]string, 0, len(pools))
+				for pk := range pools {
+					poolKeys = append(poolKeys, pk)
 				}
-				resets := 0
-				if p.ResetsIn != nil {
-					resets = *p.ResetsIn
+				sort.Strings(poolKeys)
+
+				for _, poolKey := range poolKeys {
+					p := pools[poolKey]
+					if poolKey == "all" || p.Used == nil || p.Stale {
+						continue
+					}
+					if p.Reason != "ok" && p.Reason != "exhausted" {
+						continue
+					}
+					normProvider := normalizeProviderKey(poolKey)
+					liveProviders[normProvider] = true
+
+					used, _ := parseQuotaInt(p.Used)
+					rem, _ := parseQuotaInt(p.Remaining)
+					resets, _ := parseQuotaInt(p.ResetsIn)
+					out.WriteString(fmt.Sprintf("%s/%s: %d%% used, %d remaining, %s class, resets in %d\n",
+						prov, poolKey, used, rem, p.Class, resets))
 				}
-				out.WriteString(fmt.Sprintf("%s: %d%% used, %d remaining, %s class, resets in %d\n",
-					p.Key, *p.Used, rem, p.Class, resets))
 			}
 		}
 	}
