@@ -690,8 +690,15 @@ func TestRunMutationCheck_TimeoutRestoresCandidate(t *testing.T) {
 	if result.Outcome != OutcomeBLOCKED || result.Killed || !result.Restored {
 		t.Fatalf("timeout must block and restore: %+v", result)
 	}
-	if time.Since(started) > time.Second {
-		t.Fatal("bounded mutation timeout exceeded one second")
+	// Bound the mutant Execute phase (Timeout + WaitDelay), not wall-clock of
+	// git baseline setup under -race×count scheduler noise. One-second bound
+	// matches the original contract applied to the timed mutation, not setup.
+	if result.Mutant.Duration > time.Second {
+		t.Fatalf("bounded mutation timeout exceeded one second: mutant_duration=%v wall=%v", result.Mutant.Duration, time.Since(started))
+	}
+	// Hang detector: full path including baseline must not stick on sleep-3.
+	if time.Since(started) > 10*time.Second {
+		t.Fatalf("RunMutationCheck hung: wall=%v (mutant_duration=%v)", time.Since(started), result.Mutant.Duration)
 	}
 	assertFile(t, filepath.Join(dir, "candidate.txt"), "original\n")
 	assertClean(t, dir)

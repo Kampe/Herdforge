@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -201,9 +202,10 @@ func (v *Verifier) execute(ctx context.Context, dir string, policy EnvironmentPo
 	// keeps the mutation transaction's restoration defer reachable.
 	cmd.WaitDelay = 100 * time.Millisecond
 
-	// Single buffer for stdout+stderr so OutputDigest matches CombinedOutput
-	// interleaving for any command that writes both streams.
-	var combined bytes.Buffer
+	// concurrentCombinedWriter serializes Writes from the stdout and stderr
+	// pipe-copy goroutines. A bare bytes.Buffer races under -race when both
+	// streams are attached (same shape as exec.CombinedOutput, but locked).
+	var combined concurrentCombinedWriter
 	cmd.Stdout = &combined
 	cmd.Stderr = &combined
 	if err := cmd.Start(); err != nil {
@@ -220,7 +222,7 @@ func (v *Verifier) execute(ctx context.Context, dir string, policy EnvironmentPo
 		}, nil
 	}
 	waitErr := cmd.Wait()
-	output := combined.Bytes()
+	output := combined.bytes()
 	err := waitErr
 	result := &Result{
 		Passed:       err == nil,
@@ -238,6 +240,29 @@ func (v *Verifier) execute(ctx context.Context, dir string, policy EnvironmentPo
 		result.Output = boundedOutput([]byte(fmt.Sprintf("verification failed: %v\noutput:\n%s", err, string(output))))
 	}
 	return result, nil
+}
+
+// concurrentCombinedWriter is an io.Writer used for both cmd.Stdout and
+// cmd.Stderr. exec starts one copy goroutine per pipe; without the mutex,
+// -race reports concurrent writes into bytes.Buffer.
+type concurrentCombinedWriter struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (w *concurrentCombinedWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.b.Write(p)
+}
+
+func (w *concurrentCombinedWriter) bytes() []byte {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	// Copy so callers can retain the slice after the next Write.
+	out := make([]byte, w.b.Len())
+	copy(out, w.b.Bytes())
+	return out
 }
 
 // VerifyCandidate runs the configured argv only when dir is a clean checkout

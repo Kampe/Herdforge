@@ -12,19 +12,19 @@ import (
 	"time"
 )
 
-// TestLateWriterIntoGitRequiresExplicitReap proves the ownership defect class:
-// an unreaped process-group writer remains live (and may recreate files under
-// .git) until processGroupKiller runs. RemoveAll is attempted while unreaped
-// only to exercise the concurrent-writer path; the hard assertions are live
-// before reap and gone after reap — never a soft t.Log when reproduction is
-// weak.
+// TestLateWriterIntoGitRequiresExplicitReap reproduces the pre-fix TempDir
+// cleanup class: an unreaped process-group writer either causes RemoveAll to
+// fail (directory not empty) or recreates residue under .git after RemoveAll
+// returns. Ignoring RemoveAll's result is not evidence — one of those two
+// premises must hold, then explicit reap makes cleanup succeed.
 func TestLateWriterIntoGitRequiresExplicitReap(t *testing.T) {
 	root, err := os.MkdirTemp("", "verifier-late-writer-*")
 	if err != nil {
 		t.Fatal(err)
 	}
 	gitDir := filepath.Join(root, ".git")
-	if err := os.MkdirAll(filepath.Join(gitDir, "objects"), 0o755); err != nil {
+	objects := filepath.Join(gitDir, "objects")
+	if err := os.MkdirAll(objects, 0o755); err != nil {
 		t.Fatal(err)
 	}
 
@@ -43,12 +43,26 @@ func TestLateWriterIntoGitRequiresExplicitReap(t *testing.T) {
 		t.Fatalf("unreaped writer must be live after creating residue: %v", err)
 	}
 
-	// Concurrent RemoveAll while unreaped — may fail with directory-not-empty.
-	_ = os.RemoveAll(root)
-
-	// Ownership defect: without explicit reap the group is still live.
+	// Pre-fix class: RemoveAll while the group still writes into .git.
+	removeErr := os.RemoveAll(root)
+	reproduced := removeErr != nil
+	if !reproduced {
+		// RemoveAll "won" the walk — the absolute-path writer must recreate
+		// residue (the other half of the TempDir cleanup race).
+		if err := waitForLateObject(gitDir, pgid); err != nil {
+			reapProcessGroup(pgid)
+			_ = cmd.Wait()
+			t.Fatalf("pre-fix late-writer class not reproduced: RemoveAll err=%v and no recreated residue: %v", removeErr, err)
+		}
+		reproduced = true
+	}
+	if !reproduced {
+		reapProcessGroup(pgid)
+		_ = cmd.Wait()
+		t.Fatal("pre-fix late-writer class not reproduced")
+	}
 	if err := syscall.Kill(pgid, 0); err != nil {
-		t.Fatalf("unreaped writer must survive RemoveAll until explicit reap: %v", err)
+		t.Fatalf("unreaped writer must remain live until explicit reap: %v", err)
 	}
 
 	reapProcessGroup(pgid)
@@ -58,6 +72,12 @@ func TestLateWriterIntoGitRequiresExplicitReap(t *testing.T) {
 	}
 	if err := os.RemoveAll(root); err != nil {
 		t.Fatalf("after explicit reap, RemoveAll must succeed: %v", err)
+	}
+	// No recreation after reap: tree must stay gone.
+	if _, err := os.Stat(objects); err == nil {
+		t.Fatal("after reap, unreaped writer residue must not reappear under .git/objects")
+	} else if !os.IsNotExist(err) {
+		t.Fatalf("stat after reap: %v", err)
 	}
 }
 
