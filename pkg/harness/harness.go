@@ -1,9 +1,16 @@
 package harness
 
 import (
+	"context"
+	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
+	"net/url"
 	"os/exec"
+	"sort"
 	"strings"
+	"time"
 
 	"github.com/Kampe/Herdforge/pkg/agentpolicy"
 	"github.com/Kampe/Herdforge/pkg/toolpolicy"
@@ -28,6 +35,7 @@ type HarnessConfig struct {
 	PromptFlag     string
 	NonInteractive bool
 	Supported      bool
+	Hooks          []Hook
 }
 
 // PolicyInvocation is the launch handoff boundary. It compiles policy data
@@ -71,6 +79,151 @@ func (h *HarnessConfig) BuildPolicyInvocation(prompt string, policy agentpolicy.
 		argv = composed
 	}
 	return PolicyInvocation{Argv: argv, PolicyDigest: policy.PolicyDigest, ParentSession: policy.HerdrSession}, nil
+}
+
+// HookRequirement controls whether a hook is part of the launch safety
+// boundary or only provides optional telemetry.
+type HookRequirement string
+
+const (
+	HookRequired HookRequirement = "required"
+	HookOptional HookRequirement = "optional"
+)
+
+type Hook struct {
+	Name        string
+	URL         string
+	Requirement HookRequirement
+	Timeout     time.Duration
+}
+
+type HookStatus string
+
+const (
+	HookHealthy     HookStatus = "healthy"
+	HookUnavailable HookStatus = "unavailable"
+	HookTimeout     HookStatus = "timeout"
+	HookMalformed   HookStatus = "malformed"
+)
+
+type HookResult struct {
+	Hook   Hook
+	Status HookStatus
+	Reason string
+}
+
+type HookReport struct {
+	Results         []HookResult
+	RequiredHealthy bool
+	DegradedWarning string
+}
+
+type HookIdentity struct {
+	Provider string
+	Model    string
+	Effort   string
+}
+
+const (
+	defaultHookTimeout = 2 * time.Second
+	maxHealthBody      = 4096
+)
+
+// CheckHooks probes hooks in stable order. A hook is healthy only when its
+// URL is valid and it returns a bounded JSON health response with status
+// "ok" or "healthy". Required failures make RequiredHealthy false; optional
+// failures are represented by one deduplicated warning on the report.
+func CheckHooks(ctx context.Context, hooks []Hook, identity HookIdentity, client *http.Client) HookReport {
+	ordered := append([]Hook(nil), hooks...)
+	sort.SliceStable(ordered, func(i, j int) bool {
+		if ordered[i].Name != ordered[j].Name {
+			return ordered[i].Name < ordered[j].Name
+		}
+		return ordered[i].URL < ordered[j].URL
+	})
+	if client == nil {
+		client = http.DefaultClient
+	}
+	report := HookReport{RequiredHealthy: true}
+	degraded := make([]string, 0)
+	for _, hook := range ordered {
+		result := checkHook(ctx, hook, identity, client)
+		report.Results = append(report.Results, result)
+		if result.Status != HookHealthy {
+			if hook.Requirement == HookRequired {
+				report.RequiredHealthy = false
+			} else if hook.Requirement == HookOptional {
+				degraded = append(degraded, hook.Name+"="+string(result.Status))
+			} else {
+				report.RequiredHealthy = false
+			}
+		}
+	}
+	if len(degraded) > 0 {
+		report.DegradedWarning = "optional harness hooks degraded: " + strings.Join(degraded, ",")
+	}
+	return report
+}
+
+func checkHook(parent context.Context, hook Hook, identity HookIdentity, client *http.Client) HookResult {
+	result := HookResult{Hook: hook}
+	if strings.TrimSpace(hook.Name) == "" || (hook.Requirement != HookRequired && hook.Requirement != HookOptional) {
+		result.Status, result.Reason = HookMalformed, "name and required/optional classification are required"
+		return result
+	}
+	u, err := url.Parse(strings.TrimSpace(hook.URL))
+	if err != nil || u.Scheme == "" || u.Host == "" || u.User != nil || (u.Scheme != "http" && u.Scheme != "https") {
+		result.Status, result.Reason = HookMalformed, "hook URL must be an http(s) URL with a host"
+		return result
+	}
+	timeout := hook.Timeout
+	if timeout <= 0 {
+		timeout = defaultHookTimeout
+	}
+	ctx, cancel := context.WithTimeout(parent, timeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		result.Status, result.Reason = HookMalformed, err.Error()
+		return result
+	}
+	// These headers are informational only; launch validation remains the
+	// authority and never substitutes a hook-provided identity.
+	req.Header.Set("X-Herd-Provider", identity.Provider)
+	req.Header.Set("X-Herd-Model", identity.Model)
+	req.Header.Set("X-Herd-Effort", identity.Effort)
+	resp, err := client.Do(req)
+	if err != nil {
+		if ctx.Err() != nil {
+			result.Status = HookTimeout
+			result.Reason = ctx.Err().Error()
+		} else {
+			result.Status = HookUnavailable
+			result.Reason = err.Error()
+		}
+		return result
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxHealthBody+1))
+	if err != nil || len(body) > maxHealthBody || resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		result.Status = HookUnavailable
+		if err != nil {
+			result.Reason = err.Error()
+		} else {
+			result.Reason = fmt.Sprintf("health response status %d or body too large", resp.StatusCode)
+		}
+		return result
+	}
+	var health struct {
+		Status string `json:"status"`
+	}
+	if err := json.Unmarshal(body, &health); err != nil || (health.Status != "ok" && health.Status != "healthy") {
+		result.Status = HookMalformed
+		result.Reason = "health response must be JSON with status ok or healthy"
+		return result
+	}
+	result.Status = HookHealthy
+	return result
 }
 
 // GetHarnessConfig maps harness identifiers to CLI invocation conventions

@@ -5,6 +5,8 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -12,6 +14,7 @@ import (
 	"time"
 
 	"github.com/Kampe/Herdforge/pkg/agentpolicy"
+	"github.com/Kampe/Herdforge/pkg/harness"
 	"github.com/Kampe/Herdforge/pkg/router"
 )
 
@@ -376,5 +379,97 @@ func TestRoutedWorkerArgvCarriesNestedAgentDenial(t *testing.T) {
 	req := good(t)
 	if err := agentpolicy.RequireNestedDeny(req.Decision.Provider, req.Decision.Argv); err != nil {
 		t.Fatalf("routed worker argv not fleet-safe: %v\nargv=%v", err, req.Decision.Argv)
+	}
+}
+
+func TestValidateRequiredHookFailureHasNoLaunchAcceptance(t *testing.T) {
+	called := false
+	req := good(t)
+	req.Hooks = []harness.Hook{{Name: "policy", URL: "http://127.0.0.1:1", Requirement: harness.HookRequired}}
+	req.HookWarning = func(string) { called = true }
+	sink := &MemorySink{}
+	if err := Validate(req, sink); err == nil {
+		t.Fatal("required hook failure must reject launch")
+	}
+	if called {
+		t.Fatal("required hook failure must not emit optional degradation warning")
+	}
+	if len(sink.Receipts) != 1 || sink.Receipts[0].Accepted {
+		t.Fatalf("required hook rejection receipt = %+v", sink.Receipts)
+	}
+}
+
+func TestLaunchBoundaryRequiredHookRejectionHasZeroSideEffects(t *testing.T) {
+	req := good(t)
+	req.Hooks = []harness.Hook{{Name: "required-policy", URL: "http://127.0.0.1:1", Requirement: harness.HookRequired}}
+	sink := &MemorySink{}
+	called := make([]string, 0, 4)
+	effects := LaunchEffects{
+		Tab:     func() error { called = append(called, "tab"); return nil },
+		Process: func() error { called = append(called, "process"); return nil },
+		Prompt:  func() error { called = append(called, "prompt"); return nil },
+		Board:   func() error { called = append(called, "board"); return nil },
+	}
+	if err := Launch(req, sink, effects); err == nil {
+		t.Fatal("required hook rejection must fail the production launch boundary")
+	}
+	if len(sink.Receipts) != 0 {
+		t.Fatalf("required hook rejection wrote receipts: %+v", sink.Receipts)
+	}
+	if len(called) != 0 {
+		t.Fatalf("required hook rejection reached side effects: %v", called)
+	}
+}
+
+func TestValidateOptionalHookWarningIsDeduplicatedAndIdentityPreserved(t *testing.T) {
+	var headers http.Header
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		headers = r.Header.Clone()
+		_, _ = w.Write([]byte(`{"status":"ok"}`))
+	}))
+	defer server.Close()
+	req := good(t)
+	req.Hooks = []harness.Hook{
+		{Name: "z-telemetry", URL: "http://127.0.0.1:1", Requirement: harness.HookOptional},
+		{Name: "healthy", URL: server.URL, Requirement: harness.HookOptional},
+	}
+	warnings := make([]string, 0)
+	req.HookWarning = func(warning string) { warnings = append(warnings, warning) }
+	if err := Validate(req, &MemorySink{}); err != nil {
+		t.Fatal(err)
+	}
+	if len(warnings) != 1 || warnings[0] != "optional harness hooks degraded: z-telemetry=unavailable" {
+		t.Fatalf("warnings = %v", warnings)
+	}
+	if headers.Get("X-Herd-Provider") != req.Decision.Provider || headers.Get("X-Herd-Model") != req.Decision.Model || headers.Get("X-Herd-Effort") != req.Decision.Effort {
+		t.Fatalf("routed identity changed at hook boundary: %v", headers)
+	}
+}
+
+func TestHasStartedRevalidatesHooks(t *testing.T) {
+	t.Setenv("HERD_LAUNCH_RECEIPTS", t.TempDir()+"/receipts.jsonl")
+	req := good(t)
+	req.TaskRef, req.Name, req.PaneID, req.LeaseGeneration, req.SessionGeneration = "FAC-177", "worker", "pane-1", 7, 1
+	if err := (&JSONLSink{Path: os.Getenv("HERD_LAUNCH_RECEIPTS")}).Write(Receipt{
+		TaskRef: req.TaskRef, Name: req.Name, PaneID: req.PaneID, LeaseGeneration: req.LeaseGeneration, SessionGeneration: req.SessionGeneration,
+		Role: WorkerRole, TaskShape: Implementation, Provider: req.Decision.Provider, Model: req.Decision.Model,
+		Effort: req.Decision.Effort, DecisionDigest: DecisionDigest(req.Decision), Argv: req.Decision.Argv, Accepted: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	req.Hooks = []harness.Hook{{Name: "required-policy", URL: "http://127.0.0.1:1", Requirement: harness.HookRequired}}
+	ok, err := HasStarted(req)
+	if err == nil || ok {
+		t.Fatalf("HasStarted must revalidate hooks: ok=%v err=%v", ok, err)
+	}
+}
+
+func TestRequiredHookPreflightMutantWouldFail(t *testing.T) {
+	// Mutation guard: if PreflightHooks stopped rejecting required failures,
+	// Launch would reach side effects and this test would fail closed.
+	req := good(t)
+	req.Hooks = []harness.Hook{{Name: "gate", URL: "http://127.0.0.1:1", Requirement: harness.HookRequired}}
+	if _, err := PreflightHooks(req); err == nil {
+		t.Fatal("required hook preflight must fail closed")
 	}
 }

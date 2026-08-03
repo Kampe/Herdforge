@@ -3,10 +3,12 @@
 package launch
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -14,6 +16,7 @@ import (
 	"time"
 
 	"github.com/Kampe/Herdforge/pkg/agentpolicy"
+	"github.com/Kampe/Herdforge/pkg/harness"
 	"github.com/Kampe/Herdforge/pkg/router"
 	"github.com/Kampe/Herdforge/pkg/toolpolicy"
 )
@@ -60,6 +63,48 @@ type Request struct {
 	// lease generation. Nested-agent argv denials are always required for
 	// codex/claude regardless of whether a binding is present.
 	FleetBinding agentpolicy.LaunchBinding
+	Hooks        []harness.Hook
+	HookClient   *http.Client
+	HookWarning  func(string)
+}
+
+// LaunchEffects are the write-capable operations that must remain behind the
+// hook and routing preflight boundary. The callbacks are deliberately injected
+// so the boundary can be proven without tabs, processes, prompts, or boards.
+type LaunchEffects struct {
+	Tab     func() error
+	Process func() error
+	Prompt  func() error
+	Board   func() error
+}
+
+// Launch validates the complete launch contract before invoking any
+// write-capable collaborator. Required hook health is checked first, so a
+// rejected launch cannot even emit a validation receipt or reach a side effect.
+func Launch(req Request, sink Sink, effects LaunchEffects) error {
+	if _, err := PreflightHooks(req); err != nil {
+		return err
+	}
+	if err := Validate(req, sink); err != nil {
+		return err
+	}
+	for _, effect := range []struct {
+		name string
+		fn   func() error
+	}{
+		{name: "tab", fn: effects.Tab},
+		{name: "process", fn: effects.Process},
+		{name: "prompt", fn: effects.Prompt},
+		{name: "board", fn: effects.Board},
+	} {
+		if effect.fn == nil {
+			continue
+		}
+		if err := effect.fn(); err != nil {
+			return fmt.Errorf("launch %s side effect: %w", effect.name, err)
+		}
+	}
+	return nil
 }
 
 // Receipt is durable evidence for one launch attempt. Validation does not
@@ -271,7 +316,13 @@ func HasStarted(req Request) (bool, error) {
 	if req.SessionGeneration <= 0 {
 		return false, nil
 	}
-	return matched && !invalidated, nil
+	if !matched || invalidated {
+		return false, nil
+	}
+	if _, err := PreflightHooks(req); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func equalStrings(a, b []string) bool {
@@ -310,6 +361,9 @@ func Validate(req Request, sink Sink) error {
 	}
 	if normalized(req.Decision.Harness) != normalized(wantHarness) || !equalStrings(req.Decision.HarnessArgv, wantHarnessArgv) {
 		return reject(req, sink, "launch harness does not match routed provider/model/effort/session")
+	}
+	if _, err := PreflightHooks(req); err != nil {
+		return reject(req, sink, err.Error())
 	}
 	role, shape, provider, model, effort = normalized(role), normalized(shape), normalized(provider), normalized(model), normalized(effort)
 	validShape := map[string]bool{"coordinator": true, "architecture": true, "implementation": true, "research": true, "bounded": true, "advisory": true, "qa-light": true, "qa": true, "adversarial": true}
@@ -447,6 +501,34 @@ func argvCarriesModel(argv []string) bool {
 		}
 	}
 	return false
+}
+
+// PreflightHooks checks the configured hook boundary without creating tabs,
+// processes, prompts, board records, or worktrees. It is also used by resume
+// recovery so a previously healthy session cannot bypass current hook health.
+func PreflightHooks(req Request) (harness.HookReport, error) {
+	if len(req.Hooks) == 0 {
+		return harness.HookReport{RequiredHealthy: true}, nil
+	}
+	identity := harness.HookIdentity{Provider: req.Decision.Provider, Model: req.Decision.Model, Effort: req.Decision.Effort}
+	report := harness.CheckHooks(context.Background(), req.Hooks, identity, req.HookClient)
+	if report.DegradedWarning != "" && req.HookWarning != nil {
+		req.HookWarning(report.DegradedWarning)
+	}
+	if !report.RequiredHealthy {
+		return report, fmt.Errorf("required harness hook preflight failed: %s", failedRequiredHooks(report))
+	}
+	return report, nil
+}
+
+func failedRequiredHooks(report harness.HookReport) string {
+	failed := make([]string, 0)
+	for _, result := range report.Results {
+		if result.Hook.Requirement == harness.HookRequired && result.Status != harness.HookHealthy {
+			failed = append(failed, result.Hook.Name+"="+string(result.Status))
+		}
+	}
+	return strings.Join(failed, ",")
 }
 
 func argvCarriesEffort(provider string, argv []string, effort string) bool {
