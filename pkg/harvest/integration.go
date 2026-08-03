@@ -4,12 +4,14 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/Kampe/Herdforge/pkg/lock"
+	"github.com/Kampe/Herdforge/pkg/preflight"
 	"github.com/Kampe/Herdforge/pkg/reviewledger"
 	hsync "github.com/Kampe/Herdforge/pkg/sync"
 )
@@ -198,6 +200,13 @@ func NewIntegration(h *Harvester, v Verifier, d Dispatcher, l *reviewledger.Ledg
 
 // Run executes the full harvest → review-gate → merge-gate → post-merge → cleanup flow.
 func (in *Integration) Run(ctx context.Context) (*IntegrationResult, error) {
+	// Fail closed on critical disk pressure before the integration pipeline
+	// touches anything — review-gate worktree ops, cherry-picks onto the
+	// shared checkout, cleanup (FAC-153). Refusal never reclaims space.
+	if err := preflight.CheckDiskPressure("integration", in.RepoRoot, os.TempDir()); err != nil {
+		return nil, err
+	}
+
 	res := &IntegrationResult{}
 
 	// Phase 1: Harvest
