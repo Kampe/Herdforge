@@ -293,3 +293,24 @@ func TestResolveKaneoProjectID_FromEnv(t *testing.T) {
 		t.Logf("got project id: %s", projID)
 	}
 }
+
+func TestKaneoLabel_DualShape(t *testing.T) {
+	// CLI form: labels as strings
+	var cli kaneoTaskDTO
+	if err := DecodeJSONBytes(200, []byte(`{"id":"1","ref":"FAC-1","title":"t","status":"to-do","priority":"low","projectId":"p","labels":["forge-smith","urgent"]}`), &cli); err != nil {
+		t.Fatalf("cli labels: %v", err)
+	}
+	task := dtoToTask(cli)
+	if len(task.Labels) != 2 || task.Labels[0] != "forge-smith" {
+		t.Fatalf("cli labels=%v", task.Labels)
+	}
+	// API form: labels as objects
+	var api kaneoTaskDTO
+	if err := DecodeJSONBytes(200, []byte(`{"id":"1","ref":"FAC-1","title":"t","status":"to-do","priority":"low","projectId":"p","labels":[{"name":"forge-smith"}]}`), &api); err != nil {
+		t.Fatalf("api labels: %v", err)
+	}
+	task2 := dtoToTask(api)
+	if len(task2.Labels) != 1 || task2.Labels[0] != "forge-smith" {
+		t.Fatalf("api labels=%v", task2.Labels)
+	}
+}
