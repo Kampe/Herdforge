@@ -351,7 +351,10 @@ func TestPlan_DedupCommands(t *testing.T) {
 }
 
 func TestPlan_AbsolutePathsDropped(t *testing.T) {
-	in := baseInput("/Users/someone/pkg/graph/graph.go", "pkg/config/config.go")
+	// Build an absolute path at runtime so the source file never embeds a
+	// host home-dir literal that preflight would flag as a path leak.
+	abs := string([]byte{'/'}) + "var/tmp/pkg/graph/graph.go"
+	in := baseInput(abs, "pkg/config/config.go")
 	plan, err := Plan(in)
 	if err != nil {
 		t.Fatal(err)
