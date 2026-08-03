@@ -38,8 +38,9 @@ const (
 	EnvDiskRecoverFreePct = "HERD_DISK_RECOVER_FREE_PCT"
 	// EnvDiskBuildHeadroomGB is extra reserve REQUIRED ON TOP of the free
 	// floor before a mutation is allowed: expected temp/build expansion
-	// (git object writes, race binaries, archives). Default 0 (opt-in) so
-	// held packages' test shims stay valid; operators set it fleet-wide.
+	// (git object writes, race binaries, archives). Defaults to 2GiB; the
+	// derived default is off only when every reserve floor is zeroed. Also
+	// used as the per-mutation reservation size by Admit.
 	EnvDiskBuildHeadroomGB = "HERD_DISK_BUILD_HEADROOM_GB"
 	// Soft (serialize) floors: below these but above the block floor,
 	// mutation fan-out must drop to serial before any work is refused.
@@ -118,6 +119,9 @@ type DiskPressureError struct {
 	Thresholds DiskThresholds `json:"thresholds"`
 	Detail     string         `json:"detail,omitempty"`
 	NextAction string         `json:"next_action"`
+	// OutstandingReservedBytes is admitted-but-unreleased fan-out capacity
+	// already subtracted from the Stats free-space figures.
+	OutstandingReservedBytes uint64 `json:"outstanding_reserved_bytes,omitempty"`
 }
 
 const (
@@ -156,10 +160,36 @@ const (
 // only — after a restart the first Check reconciles state from a fresh
 // probe (there is nothing stale to persist or replay).
 type DiskGuard struct {
+	// opMu serializes probe + state transition as one unit: without it,
+	// concurrent checks could apply stale observations out of order and
+	// parallel callers could all admit against the same free-space
+	// snapshot.
+	opMu sync.Mutex
+
 	mu           sync.Mutex
 	prober       DiskProber
 	state        DiskGuardState
 	lastEvidence *DiskPressureError
+	// outstanding is the sum of admitted-but-unreleased capacity
+	// reservations, subtracted from observed free space so concurrent
+	// fan-out is bounded by real remaining headroom.
+	outstanding uint64
+	sink        DiskEvidenceSink
+}
+
+// DiskEvidenceSink receives structured pressure state TRANSITIONS for
+// durable projection (provider/Kaneo lifecycle path). The sink only
+// observes; fencing and durable write semantics stay with the provider
+// projection owner (FAC-147) — this is the seam, not a duplicate.
+type DiskEvidenceSink interface {
+	RecordDiskState(state DiskGuardState, evidence *DiskPressureError)
+}
+
+// SetEvidenceSink installs the projection sink. Pass nil to detach.
+func (g *DiskGuard) SetEvidenceSink(s DiskEvidenceSink) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.sink = s
 }
 
 // NewDiskGuard returns a guard using prober, or the real statfs prober when
@@ -261,9 +291,48 @@ func (g *DiskGuard) probeAll(operation string, th DiskThresholds, paths []string
 // Check probes every distinct volume under paths and fails closed on
 // pressure, recovery-in-progress, or an unreadable stat.
 func (g *DiskGuard) Check(operation string, paths ...string) error {
+	g.opMu.Lock()
+	defer g.opMu.Unlock()
 	th := loadDiskThresholds()
 	stats, unreadable := g.probeAll(operation, th, paths)
 	return g.evaluate(operation, th, stats, unreadable)
+}
+
+// Admit is THE common admission/reservation gate for disk-growing actions
+// (worktree create, dispatch/launch, review/approve/renudge side effects,
+// archive/integration, future verifier fan-out). Probe + state transition
+// run serialized; on admission the configured per-mutation headroom is
+// reserved and subtracted from every concurrent caller's view until the
+// returned release func runs. Release is idempotent.
+func (g *DiskGuard) Admit(operation string, paths ...string) (func(), error) {
+	g.opMu.Lock()
+	defer g.opMu.Unlock()
+	th := loadDiskThresholds()
+	stats, unreadable := g.probeAll(operation, th, paths)
+	if err := g.evaluate(operation, th, stats, unreadable); err != nil {
+		return nil, err
+	}
+	res := th.HeadroomBytes
+	g.mu.Lock()
+	g.outstanding += res
+	g.mu.Unlock()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			g.mu.Lock()
+			if g.outstanding >= res {
+				g.outstanding -= res
+			} else {
+				g.outstanding = 0
+			}
+			g.mu.Unlock()
+		})
+	}, nil
+}
+
+// AdmitDiskMutation is Admit on the process-wide default guard.
+func AdmitDiskMutation(operation string, paths ...string) (func(), error) {
+	return DefaultDiskGuard.Admit(operation, paths...)
 }
 
 // evaluate drives the state machine from one probe result. Both Check and
@@ -271,22 +340,60 @@ func (g *DiskGuard) Check(operation string, paths ...string) error {
 // capacity is never permission for even one mutation.
 func (g *DiskGuard) evaluate(operation string, th DiskThresholds, stats []DiskStat, unreadable *DiskPressureError) error {
 	g.mu.Lock()
-	defer g.mu.Unlock()
+	prev := g.state
+	err := g.evaluateLocked(operation, th, stats, unreadable)
+	next, ev, sink := g.state, g.lastEvidence, g.sink
+	g.mu.Unlock()
+	// Fire the projection seam only on state TRANSITIONS (including the
+	// first reconcile from ""), never on steady-state checks — bounded,
+	// spam-free evidence for the provider/Kaneo lifecycle path.
+	if sink != nil && prev != next {
+		sink.RecordDiskState(next, ev)
+	}
+	return err
+}
 
+// adjustForOutstanding subtracts admitted-but-unreleased reservations from
+// observed free space so concurrent fan-out is bounded by real remaining
+// headroom, not N copies of the same snapshot.
+func adjustForOutstanding(stats []DiskStat, out uint64) []DiskStat {
+	if out == 0 {
+		return stats
+	}
+	adj := make([]DiskStat, len(stats))
+	copy(adj, stats)
+	for i := range adj {
+		if adj[i].FreeBytes > out {
+			adj[i].FreeBytes -= out
+		} else {
+			adj[i].FreeBytes = 0
+		}
+		if adj[i].TotalBytes > 0 {
+			adj[i].FreePct = float64(adj[i].FreeBytes) / float64(adj[i].TotalBytes) * 100
+		}
+	}
+	return adj
+}
+
+// evaluateLocked drives the state machine; caller holds g.mu.
+func (g *DiskGuard) evaluateLocked(operation string, th DiskThresholds, stats []DiskStat, unreadable *DiskPressureError) error {
 	if unreadable != nil {
 		g.state = DiskBlocked
 		g.lastEvidence = unreadable
 		return unreadable
 	}
 
+	stats = adjustForOutstanding(stats, g.outstanding)
+
 	if bad := below(stats, th.blockFreeBytes(), th.MinFreePct, th.MinInodePct); bad != nil {
 		g.state = DiskBlocked
 		pe := &DiskPressureError{
-			State:      "BLOCKED",
-			Reason:     ReasonDiskPressure,
-			Operation:  operation,
-			Stats:      stats,
-			Thresholds: th,
+			State:                    "BLOCKED",
+			Reason:                   ReasonDiskPressure,
+			Operation:                operation,
+			Stats:                    stats,
+			Thresholds:               th,
+			OutstandingReservedBytes: g.outstanding,
 			Detail: fmt.Sprintf("volume %s (%s) free %.1fGiB (%.1f%%, %d free inodes) below reserve (min %.1fGiB / %.1f%%)",
 				bad.Path, bad.FSID, float64(bad.FreeBytes)/bytesPerGiB, bad.FreePct, bad.FreeInodes,
 				float64(th.blockFreeBytes())/bytesPerGiB, th.MinFreePct),
@@ -304,11 +411,12 @@ func (g *DiskGuard) evaluate(operation string, th DiskThresholds, stats []DiskSt
 		if bad := below(stats, th.RecoverFreeBytes, th.RecoverFreePct, th.MinInodePct); bad != nil {
 			g.state = DiskRecovering
 			pe := &DiskPressureError{
-				State:      "BLOCKED",
-				Reason:     ReasonRecovering,
-				Operation:  operation,
-				Stats:      stats,
-				Thresholds: th,
+				State:                    "BLOCKED",
+				Reason:                   ReasonRecovering,
+				Operation:                operation,
+				Stats:                    stats,
+				Thresholds:               th,
+				OutstandingReservedBytes: g.outstanding,
 				Detail: fmt.Sprintf("volume %s above block floor but below recover floor (%.1fGiB / %.1f%%); holding closed until stable headroom",
 					bad.Path, float64(th.RecoverFreeBytes)/bytesPerGiB, th.RecoverFreePct),
 				NextAction: safeNextAction,
@@ -329,9 +437,9 @@ type DiskAdvice struct {
 	Verdict string `json:"verdict"`
 	// MaxParallel is the advised mutation fan-out: 0 = no cap (proceed),
 	// 1 = fully serialized, and refuse means no new work at all.
-	MaxParallel int         `json:"max_parallel"`
-	Detail      string      `json:"detail,omitempty"`
-	Stats       []DiskStat  `json:"stats,omitempty"`
+	MaxParallel int        `json:"max_parallel"`
+	Detail      string     `json:"detail,omitempty"`
+	Stats       []DiskStat `json:"stats,omitempty"`
 	// Evidence is the structured refusal; non-nil only when Verdict is
 	// "refuse" (it is the same error Check would return).
 	Evidence *DiskPressureError `json:"evidence,omitempty"`
@@ -351,6 +459,8 @@ const (
 // MaxParallel=1. Fan-out call sites (verifier/mutation testing) consume
 // this; single-mutation call sites use Check directly.
 func (g *DiskGuard) Advise(operation string, paths ...string) DiskAdvice {
+	g.opMu.Lock()
+	defer g.opMu.Unlock()
 	th := loadDiskThresholds()
 	// ONE probe feeds both the hard-floor state machine and the soft band:
 	// no second probe exists whose failure could be softened. An unreadable

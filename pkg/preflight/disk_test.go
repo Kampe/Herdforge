@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"math"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 )
 
@@ -419,5 +421,130 @@ func TestDiskGuardNonFiniteThresholdsFailClosed(t *testing.T) {
 				t.Fatalf("non-finite pct floor leaked: %+v", pe.Thresholds)
 			}
 		})
+	}
+}
+
+func TestDiskGuardAdmitReservationsBoundConcurrentFanOut(t *testing.T) {
+	// 20GiB free above a 10GiB floor with a 4GiB per-mutation reservation:
+	// only 2 concurrent admissions fit ((20-10-4)/4 + 1); the rest refuse
+	// against reservation-adjusted free space, not N stale snapshots.
+	t.Setenv(EnvDiskMinFreeGB, "10")
+	t.Setenv(EnvDiskMinFreePct, "0")
+	t.Setenv(EnvDiskMinInodePct, "0")
+	t.Setenv(EnvDiskBuildHeadroomGB, "4")
+	t.Setenv(EnvDiskRecoverFreeGB, "0.001") // effectively no hysteresis band
+
+	st := healthyStat("/repo", "a")
+	st.FreeBytes = 20 << 30
+	g := NewDiskGuard(fakeProber(map[string]DiskStat{"/repo": st}, nil))
+
+	var admitted int32
+	var releases []func()
+	var relMu sync.Mutex
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if rel, err := g.Admit("worktree_create", "/repo"); err == nil {
+				atomic.AddInt32(&admitted, 1)
+				relMu.Lock()
+				releases = append(releases, rel)
+				relMu.Unlock()
+			}
+		}()
+	}
+	wg.Wait()
+	// Floor 10+4=14; admissions subtract 4GiB each: #1 sees 20 (ok, out=4),
+	// #2 sees 16 (ok, out=8), #3 sees 12 < 14 (refused).
+	if admitted != 2 {
+		t.Fatalf("admitted %d, want exactly 2 bounded by reservations", admitted)
+	}
+	if pe := g.LastEvidence(); pe == nil || pe.OutstandingReservedBytes != 8<<30 {
+		t.Fatalf("refusal evidence missing outstanding reservations: %+v", pe)
+	}
+
+	// Release restores capacity: idempotent, and a new admission fits.
+	for _, rel := range releases {
+		rel()
+		rel() // double-release must not underflow accounting
+	}
+	if rel, err := g.Admit("worktree_create", "/repo"); err != nil {
+		t.Fatalf("admission after release refused: %v", err)
+	} else {
+		rel()
+	}
+}
+
+func TestDiskGuardProbeAndTransitionSerialized(t *testing.T) {
+	// The prober itself asserts mutual exclusion: any overlap between
+	// probe+transition sections is a serialization failure.
+	var inFlight int32
+	g := NewDiskGuard(func(path string) (DiskStat, error) {
+		if atomic.AddInt32(&inFlight, 1) != 1 {
+			t.Error("concurrent probe+transition detected")
+		}
+		defer atomic.AddInt32(&inFlight, -1)
+		return healthyStat(path, "a"), nil
+	})
+	var wg sync.WaitGroup
+	for i := 0; i < 16; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_ = g.Check("dispatch", "/repo")
+			_ = g.Advise("dispatch", "/repo")
+			if rel, err := g.Admit("dispatch", "/repo"); err == nil {
+				rel()
+			}
+		}()
+	}
+	wg.Wait()
+}
+
+type recordingSink struct {
+	mu     sync.Mutex
+	states []DiskGuardState
+	evs    []*DiskPressureError
+}
+
+func (r *recordingSink) RecordDiskState(s DiskGuardState, ev *DiskPressureError) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.states = append(r.states, s)
+	r.evs = append(r.evs, ev)
+}
+
+func TestDiskGuardEvidenceSinkTransitionsOnly(t *testing.T) {
+	current := incidentStat("/repo", "a")
+	g := NewDiskGuard(func(string) (DiskStat, error) { return current, nil })
+	sink := &recordingSink{}
+	g.SetEvidenceSink(sink)
+
+	_ = g.Check("dispatch", "/repo") // "" -> blocked
+	_ = g.Check("dispatch", "/repo") // blocked -> blocked: NO event
+	t.Setenv(EnvDiskMinFreePct, "0")
+	current.FreeBytes = 18 << 30 // blocked -> recovering
+	_ = g.Check("dispatch", "/repo")
+	_ = g.Check("dispatch", "/repo") // recovering steady: NO event
+	current.FreeBytes = 30 << 30
+	current.FreePct = 3.2 // recovering -> ok
+	_ = g.Check("dispatch", "/repo")
+
+	sink.mu.Lock()
+	defer sink.mu.Unlock()
+	want := []DiskGuardState{DiskBlocked, DiskRecovering, DiskOK}
+	if len(sink.states) != 3 || sink.states[0] != want[0] || sink.states[1] != want[1] || sink.states[2] != want[2] {
+		t.Fatalf("transitions = %v, want %v", sink.states, want)
+	}
+	// BLOCKED and recovering carry structured evidence; ok clears it.
+	if sink.evs[0] == nil || sink.evs[0].Reason != ReasonDiskPressure {
+		t.Fatalf("blocked evidence: %+v", sink.evs[0])
+	}
+	if sink.evs[1] == nil || sink.evs[1].Reason != ReasonRecovering {
+		t.Fatalf("recovering evidence: %+v", sink.evs[1])
+	}
+	if sink.evs[2] != nil {
+		t.Fatalf("ok must carry nil evidence, got %+v", sink.evs[2])
 	}
 }
