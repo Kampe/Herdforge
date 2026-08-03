@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"errors"
 	"strings"
 	"testing"
 
@@ -55,5 +56,31 @@ func TestStrictArgumentsReturnUsageExit(t *testing.T) {
 	}
 	if code := run([]string{"claude"}, &out, &errOut, inventoryDiscovery(nil, "")); code != 2 {
 		t.Fatalf("positional argument exit=%d", code)
+	}
+}
+
+func TestInventoryRejectsUnknownBlankAndNonAuthoritativeDiscovery(t *testing.T) {
+	cases := []struct {
+		name   string
+		args   []string
+		result harness.HookDiscoveryResult
+		err    error
+	}{
+		{name: "unknown-provider", args: []string{"--provider", "unknown"}},
+		{name: "blank-provider", args: []string{"--provider", "  "}},
+		{name: "not-discovered", result: harness.HookDiscoveryResult{State: harness.DiscoveryNotDiscovered}},
+		{name: "failed-state", result: harness.HookDiscoveryResult{State: harness.DiscoveryFailed}},
+		{name: "hooks-empty", result: harness.HookDiscoveryResult{State: harness.DiscoveryHooks}},
+		{name: "no-hooks-with-handler", result: harness.HookDiscoveryResult{State: harness.DiscoveryNoHooks, Hooks: []harness.Hook{{Name: "claude:pre-tool:" + strings.Repeat("a", 64)}}}},
+		{name: "discovery-error", err: errors.New("discovery failed")},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var out, errOut bytes.Buffer
+			d := harness.HookDiscoveryFunc(func(string) (harness.HookDiscoveryResult, error) { return tc.result, tc.err })
+			if code := run(tc.args, &out, &errOut, d); code != 1 || out.Len() != 0 {
+				t.Fatalf("code=%d stdout=%q stderr=%q", code, out.String(), errOut.String())
+			}
+		})
 	}
 }
