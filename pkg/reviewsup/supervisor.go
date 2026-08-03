@@ -124,6 +124,11 @@ func lookupFamily(model string) ModelFamily {
 }
 
 func CrossFamilyOK(authorFamily, reviewFamily ModelFamily) bool {
+	// Fail closed: an unrecognized model family can never satisfy the
+	// cross-family requirement for R1-R3.
+	if authorFamily == FamilyOther || reviewFamily == FamilyOther {
+		return false
+	}
 	return authorFamily != reviewFamily
 }
 
@@ -433,7 +438,11 @@ func (sv *ReviewSupervisor) SubmitVerdict(v ReviewVerdict) (newState CandidateSt
 		return "", fmt.Errorf("reviewsup: verdict reviewer %q does not match assigned reviewer %q", v.Reviewer, cand.Reviewer)
 	}
 
-	reviewFamily := lookupFamily(cand.ReviewModel())
+	// Use the family recorded at LaunchReview time (derived from the actual
+	// review model), never re-derive from the reviewer's label — a reviewer
+	// name is an arbitrary string and can accidentally collide with a family
+	// keyword, letting a same-family review masquerade as cross-family.
+	reviewFamily := ModelFamily(cand.ReviewFamily)
 	authorFamily := lookupFamily(cand.AuthorModel)
 	needsCross := RequireCrossFamily(cand.Tier)
 	if needsCross && !CrossFamilyOK(authorFamily, reviewFamily) {
@@ -810,6 +819,3 @@ func (sv *ReviewSupervisor) Candidate(sha string) *Candidate {
 	return &cp
 }
 
-func (c *Candidate) ReviewModel() string {
-	return c.Reviewer
-}
