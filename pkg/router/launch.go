@@ -26,10 +26,10 @@ const (
 type CapabilityTier string
 
 const (
-	CapFlash     CapabilityTier = "flash"
-	CapStandard  CapabilityTier = "standard"
-	CapFrontier  CapabilityTier = "frontier"
-	CapUnknown   CapabilityTier = "unknown"
+	CapFlash    CapabilityTier = "flash"
+	CapStandard CapabilityTier = "standard"
+	CapFrontier CapabilityTier = "frontier"
+	CapUnknown  CapabilityTier = "unknown"
 )
 
 // LaunchRequest is the input to SurfaceRouter.Decide. All policy fields that
@@ -78,22 +78,22 @@ type LaunchRequest struct {
 // reviewer launch. FAC-139 consumes this at every launch boundary; no field
 // may be left to harness defaults.
 type LaunchDecision struct {
-	Provider         string         `json:"provider"`
-	Model            string         `json:"model,omitempty"`
-	Effort           string         `json:"effort"`
-	Pool             string         `json:"quota_pool"`
-	Role             Role           `json:"role"`
-	Risk             classify.Tier  `json:"risk,omitempty"`
-	Family           string         `json:"family"`
-	CapabilityTier   CapabilityTier `json:"capability_tier"`
-	ProbeKey         string         `json:"probe_key,omitempty"`
-	ProbeRequired    bool           `json:"probe_required"`
-	Rationale        string         `json:"rationale"`
-	Availability     string         `json:"availability,omitempty"`
-	QuotaPressure    int            `json:"quota_pressure"`
-	Score            int            `json:"score"`
-	LazerLastResort  bool           `json:"lazer_last_resort"`
-	Argv             []string       `json:"argv,omitempty"`
+	Provider        string         `json:"provider"`
+	Model           string         `json:"model,omitempty"`
+	Effort          string         `json:"effort"`
+	Pool            string         `json:"quota_pool"`
+	Role            Role           `json:"role"`
+	Risk            classify.Tier  `json:"risk,omitempty"`
+	Family          string         `json:"family"`
+	CapabilityTier  CapabilityTier `json:"capability_tier"`
+	ProbeKey        string         `json:"probe_key,omitempty"`
+	ProbeRequired   bool           `json:"probe_required"`
+	Rationale       string         `json:"rationale"`
+	Availability    string         `json:"availability,omitempty"`
+	QuotaPressure   int            `json:"quota_pressure"`
+	Score           int            `json:"score"`
+	LazerLastResort bool           `json:"lazer_last_resort"`
+	Argv            []string       `json:"argv,omitempty"`
 }
 
 // ProbeKey returns the stable probe identity for a provider/model tuple.

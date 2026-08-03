@@ -220,13 +220,13 @@ func TestDecideFlashAuthorFrontierHighRejected(t *testing.T) {
 	// and a flash author — must fail closed when no coherent alternative exists.
 	r := testRouter(nil, "claude")
 	_, err := r.Decide(LaunchRequest{
-		Role:             RoleReviewer,
-		Shape:            "qa",
-		Risk:             classify.TierR3,
-		FinalPass:        true, // effort high
-		AuthorFamily:     "deepseek",
-		AuthorModel:      "opencode/deepseek-v4-flash",
-		AuthorCapability: CapFlash,
+		Role:              RoleReviewer,
+		Shape:             "qa",
+		Risk:              classify.TierR3,
+		FinalPass:         true, // effort high
+		AuthorFamily:      "deepseek",
+		AuthorModel:       "opencode/deepseek-v4-flash",
+		AuthorCapability:  CapFlash,
 		RequestedProvider: "claude",
 	})
 	if err == nil {
@@ -319,6 +319,60 @@ func TestPickWeeklyCapSkip(t *testing.T) {
 	}
 	if route.Provider == "claude" {
 		t.Fatal("Pick must also skip weekly-capped surfaces")
+	}
+}
+
+// Sole weekly-capped candidate is the mutation-critical case for the hard skip:
+// effectivePressure alone would still select that provider (pressure=200, only
+// pick). weeklyAtOrOverCap continue is what empties the candidate set and fails
+// closed. Removing the hard skip makes these tests fail.
+func TestDecideWeeklyCapSoleCandidateFailsClosed(t *testing.T) {
+	clearRouteEnv(t)
+	computed := map[string]usage.BurnState{
+		"claude": {
+			Available:     true,
+			Pressure:      1,
+			Window:        "weekly",
+			WindowSeconds: usage.WindowWeekly,
+			Used:          99,
+			Class:         usage.BurnExhausted,
+		},
+	}
+	r := testRouter(computed, "claude")
+	_, err := r.Decide(LaunchRequest{
+		Role:              RoleWorker,
+		Shape:             "implementation",
+		Risk:              classify.TierR1,
+		RequestedProvider: "claude",
+	})
+	if err == nil {
+		t.Fatal("sole weekly-capped candidate must fail closed in Decide (hard skip load-bearing; pressure bump alone would still pick it)")
+	}
+	if !strings.Contains(err.Error(), "no healthy") {
+		t.Fatalf("want no-healthy-candidate error, got: %v", err)
+	}
+}
+
+func TestPickWeeklyCapSoleCandidateFailsClosed(t *testing.T) {
+	clearRouteEnv(t)
+	computed := map[string]usage.BurnState{
+		"claude": {
+			Available:     true,
+			Pressure:      1,
+			Window:        "weekly",
+			WindowSeconds: usage.WindowWeekly,
+			Used:          99,
+			Class:         usage.BurnExhausted,
+		},
+	}
+	// Only claude CLI present and requested: no alternative to absorb pressure ranking.
+	r := testRouter(computed, "claude")
+	_, err := r.Pick("implementation", "claude", "")
+	if err == nil {
+		t.Fatal("sole weekly-capped candidate must fail closed in Pick (hard skip load-bearing; pressure bump alone would still pick it)")
+	}
+	if !strings.Contains(err.Error(), "no healthy") {
+		t.Fatalf("want no-healthy-provider error, got: %v", err)
 	}
 }
 
@@ -431,8 +485,10 @@ func TestDecideStrictQuotaMissingFailsClosed(t *testing.T) {
 	}
 }
 
-// Mutation-style negative: if weekly cap check were removed, weekly-capped
-// claude would win on preference. Assert the skip is load-bearing.
+// Two-candidate weekly-cap preference check. Note: effectivePressure=200 on a
+// capped surface already steers ranking away from claude when grok is healthy,
+// so this alone does NOT mutation-prove the hard skip — see
+// TestDecideWeeklyCapSoleCandidateFailsClosed / TestPickWeeklyCapSoleCandidateFailsClosed.
 func TestDecideWeeklyCapIsLoadBearing(t *testing.T) {
 	clearRouteEnv(t)
 	computed := map[string]usage.BurnState{
