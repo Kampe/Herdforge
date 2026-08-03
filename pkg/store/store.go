@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"time"
@@ -48,6 +49,7 @@ type BlockedRecord struct {
 	GraphRevision    string    `json:"graph_revision,omitempty"`
 	ProviderRevision string    `json:"provider_revision,omitempty"`
 	RecordedAt       time.Time `json:"recorded_at"`
+	RecencySeq       int64     `json:"recency_seq"`
 }
 
 // BlockedSelection is an attention item produced by dependency selection.
@@ -73,6 +75,7 @@ func New(path string) (*Store, error) {
 	}
 	s := &Store{db: db}
 	if err := s.migrate(); err != nil {
+		_ = db.Close()
 		return nil, err
 	}
 	return s, nil
@@ -83,6 +86,23 @@ func (s *Store) Close() error {
 }
 
 func (s *Store) migrate() error {
+	conn, err := s.db.Conn(context.Background())
+	if err != nil {
+		return fmt.Errorf("migration connection: %w", err)
+	}
+	defer conn.Close()
+	if err := configureSQLiteConnection(conn); err != nil {
+		return err
+	}
+	if _, err := conn.ExecContext(context.Background(), `BEGIN IMMEDIATE`); err != nil {
+		return fmt.Errorf("begin migration transaction: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_, _ = conn.ExecContext(context.Background(), `ROLLBACK`)
+		}
+	}()
 	migrations := []string{
 		`CREATE TABLE IF NOT EXISTS pulse_history (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -118,17 +138,23 @@ func (s *Store) migrate() error {
 			reason TEXT NOT NULL,
 			graph_revision TEXT NOT NULL DEFAULT '',
 			provider_revision TEXT NOT NULL DEFAULT '',
-			recorded_at DATETIME DEFAULT CURRENT_TIMESTAMP
+			recorded_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+			recency_seq INTEGER NOT NULL DEFAULT 0
 		)`,
 		`CREATE UNIQUE INDEX IF NOT EXISTS blocked_selection_identity ON blocked_selection_history
 			(ref, task_id, entrypoint, code, graph_revision, provider_revision)`,
+		`CREATE TABLE IF NOT EXISTS blocked_selection_sequence (
+			id INTEGER PRIMARY KEY CHECK (id = 1),
+			value INTEGER NOT NULL
+		)`,
+		`INSERT OR IGNORE INTO blocked_selection_sequence (id, value) VALUES (1, 0)`,
 	}
 	for _, m := range migrations {
-		if _, err := s.db.Exec(m); err != nil {
+		if _, err := conn.ExecContext(context.Background(), m); err != nil {
 			return fmt.Errorf("migrate: %w", err)
 		}
 	}
-	rows, err := s.db.Query(`PRAGMA table_info(blocked_selection_history)`)
+	rows, err := conn.QueryContext(context.Background(), `PRAGMA table_info(blocked_selection_history)`)
 	if err != nil {
 		return fmt.Errorf("inspect blocked selection schema: %w", err)
 	}
@@ -150,9 +176,31 @@ func (s *Store) migrate() error {
 		return fmt.Errorf("close blocked selection schema: %w", err)
 	}
 	if !hasRecency {
-		if _, err := s.db.Exec(`ALTER TABLE blocked_selection_history ADD COLUMN recency_seq INTEGER NOT NULL DEFAULT 0`); err != nil {
+		if _, err := conn.ExecContext(context.Background(), `ALTER TABLE blocked_selection_history ADD COLUMN recency_seq INTEGER NOT NULL DEFAULT 0`); err != nil {
 			return fmt.Errorf("add blocked selection recency: %w", err)
 		}
+	}
+	if _, err := conn.ExecContext(context.Background(), `CREATE UNIQUE INDEX IF NOT EXISTS blocked_selection_identity ON blocked_selection_history
+		(ref, task_id, entrypoint, code, graph_revision, provider_revision)`); err != nil {
+		return fmt.Errorf("create blocked selection identity index: %w", err)
+	}
+	if _, err := conn.ExecContext(context.Background(), `UPDATE blocked_selection_sequence
+		SET value = MAX(value, COALESCE((SELECT MAX(recency_seq) FROM blocked_selection_history), 0))
+		WHERE id = 1`); err != nil {
+		return fmt.Errorf("bootstrap blocked selection recency: %w", err)
+	}
+	if _, err := conn.ExecContext(context.Background(), `COMMIT`); err != nil {
+		return fmt.Errorf("commit migration transaction: %w", err)
+	}
+	committed = true
+	return nil
+}
+
+const sqliteBusyTimeout = 5000
+
+func configureSQLiteConnection(conn *sql.Conn) error {
+	if _, err := conn.ExecContext(context.Background(), fmt.Sprintf(`PRAGMA busy_timeout = %d`, sqliteBusyTimeout)); err != nil {
+		return fmt.Errorf("configure sqlite busy timeout: %w", err)
 	}
 	return nil
 }
@@ -177,17 +225,32 @@ func (s *Store) RecordBlockedSelections(items []BlockedSelection) ([]BlockedReco
 	if len(items) == 0 {
 		return nil, nil
 	}
-	tx, err := s.db.Begin()
+	conn, err := s.db.Conn(context.Background())
 	if err != nil {
+		return nil, fmt.Errorf("blocked selection connection: %w", err)
+	}
+	defer conn.Close()
+	if err := configureSQLiteConnection(conn); err != nil {
+		return nil, err
+	}
+	if _, err := conn.ExecContext(context.Background(), `BEGIN IMMEDIATE`); err != nil {
 		return nil, fmt.Errorf("begin blocked selection transaction: %w", err)
 	}
-	defer tx.Rollback()
+	committed := false
+	defer func() {
+		if !committed {
+			_, _ = conn.ExecContext(context.Background(), `ROLLBACK`)
+		}
+	}()
 	for _, item := range items {
-		var recencySeq int64
-		if err := tx.QueryRow(`SELECT COALESCE(MAX(recency_seq), 0) + 1 FROM blocked_selection_history`).Scan(&recencySeq); err != nil {
+		if _, err := conn.ExecContext(context.Background(), `UPDATE blocked_selection_sequence SET value = value + 1 WHERE id = 1`); err != nil {
 			return nil, fmt.Errorf("allocate blocked selection recency: %w", err)
 		}
-		_, err := tx.Exec(`INSERT INTO blocked_selection_history
+		var recencySeq int64
+		if err := conn.QueryRowContext(context.Background(), `SELECT value FROM blocked_selection_sequence WHERE id = 1`).Scan(&recencySeq); err != nil {
+			return nil, fmt.Errorf("read blocked selection recency: %w", err)
+		}
+		_, err := conn.ExecContext(context.Background(), `INSERT INTO blocked_selection_history
 			(ref, task_id, entrypoint, code, reason, graph_revision, provider_revision, recency_seq)
 			VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 			ON CONFLICT(ref, task_id, entrypoint, code, graph_revision, provider_revision)
@@ -198,19 +261,20 @@ func (s *Store) RecordBlockedSelections(items []BlockedSelection) ([]BlockedReco
 			return nil, fmt.Errorf("record blocked selection: %w", err)
 		}
 	}
-	if err := tx.Commit(); err != nil {
+	if _, err := conn.ExecContext(context.Background(), `COMMIT`); err != nil {
 		return nil, fmt.Errorf("commit blocked selection transaction: %w", err)
 	}
+	committed = true
 
 	records := make([]BlockedRecord, 0, len(items))
 	for _, item := range items {
 		var record BlockedRecord
-		err := s.db.QueryRow(`SELECT id, ref, task_id, entrypoint, code, reason,
-			graph_revision, provider_revision, recorded_at
+		err := conn.QueryRowContext(context.Background(), `SELECT id, ref, task_id, entrypoint, code, reason,
+			graph_revision, provider_revision, recorded_at, recency_seq
 			FROM blocked_selection_history WHERE ref=? AND task_id=? AND entrypoint=? AND code=? AND graph_revision=? AND provider_revision=?`,
 			item.Ref, item.TaskID, item.Entrypoint, item.Code, item.GraphRevision, item.ProviderRevision).
 			Scan(&record.ID, &record.Ref, &record.TaskID, &record.Entrypoint, &record.Code,
-				&record.Reason, &record.GraphRevision, &record.ProviderRevision, &record.RecordedAt)
+				&record.Reason, &record.GraphRevision, &record.ProviderRevision, &record.RecordedAt, &record.RecencySeq)
 		if err != nil {
 			return nil, fmt.Errorf("read persisted blocked selection: %w", err)
 		}
@@ -222,7 +286,7 @@ func (s *Store) RecordBlockedSelections(items []BlockedSelection) ([]BlockedReco
 // BlockedSelectionHistory returns durable dependency holds newest first.
 func (s *Store) BlockedSelectionHistory(limit int) ([]BlockedRecord, error) {
 	rows, err := s.db.Query(`SELECT id, ref, task_id, entrypoint, code, reason,
-		graph_revision, provider_revision, recorded_at FROM blocked_selection_history
+		graph_revision, provider_revision, recorded_at, recency_seq FROM blocked_selection_history
 		ORDER BY recency_seq DESC, id DESC LIMIT ?`, limit)
 	if err != nil {
 		return nil, err
@@ -232,7 +296,7 @@ func (s *Store) BlockedSelectionHistory(limit int) ([]BlockedRecord, error) {
 	for rows.Next() {
 		var r BlockedRecord
 		if err := rows.Scan(&r.ID, &r.Ref, &r.TaskID, &r.Entrypoint, &r.Code,
-			&r.Reason, &r.GraphRevision, &r.ProviderRevision, &r.RecordedAt); err != nil {
+			&r.Reason, &r.GraphRevision, &r.ProviderRevision, &r.RecordedAt, &r.RecencySeq); err != nil {
 			return nil, err
 		}
 		records = append(records, r)
