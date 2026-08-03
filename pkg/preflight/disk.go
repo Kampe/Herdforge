@@ -85,8 +85,22 @@ type DiskThresholds struct {
 	HeadroomBytes uint64 `json:"headroom_bytes,omitempty"`
 }
 
+// maxDiskFloorBytes saturates threshold conversion (2^62) so absurd or
+// hostile env values cannot overflow uint64 arithmetic and silently
+// produce a tiny floor — an overflow must fail closed, not open.
+const maxDiskFloorBytes = uint64(1) << 62
+
+// gbToBytes converts with saturation at maxDiskFloorBytes.
+func gbToBytes(gb float64) uint64 {
+	b := gb * bytesPerGiB
+	if b >= float64(maxDiskFloorBytes) {
+		return maxDiskFloorBytes
+	}
+	return uint64(b)
+}
+
 // blockFreeBytes is the effective byte floor: reserve plus required
-// temp/build headroom.
+// temp/build headroom. Both terms are ≤ 2^62 so the sum cannot wrap.
 func (t DiskThresholds) blockFreeBytes() uint64 {
 	return t.MinFreeBytes + t.HeadroomBytes
 }
@@ -402,14 +416,14 @@ func loadDiskThresholds() DiskThresholds {
 	}
 	headGB := envFloat(EnvDiskBuildHeadroomGB, defHead)
 	th := DiskThresholds{
-		MinFreeBytes: uint64(minGB * bytesPerGiB),
+		MinFreeBytes: gbToBytes(minGB),
 		MinFreePct:   minPct,
 		MinInodePct:  minInode,
 		// Recover floor defaults scale from the EFFECTIVE block floor
 		// (reserve + headroom) so hysteresis still clears above headroom.
-		RecoverFreeBytes: uint64(envFloat(EnvDiskRecoverFreeGB, (minGB+headGB)*recoverFactor) * bytesPerGiB),
+		RecoverFreeBytes: gbToBytes(envFloat(EnvDiskRecoverFreeGB, (minGB+headGB)*recoverFactor)),
 		RecoverFreePct:   envFloat(EnvDiskRecoverFreePct, minPct*recoverFactor),
-		HeadroomBytes:    uint64(headGB * bytesPerGiB),
+		HeadroomBytes:    gbToBytes(headGB),
 	}
 	return th
 }

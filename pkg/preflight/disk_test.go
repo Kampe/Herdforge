@@ -380,3 +380,19 @@ func TestDiskGuardDefaultHeadroomActive(t *testing.T) {
 	g2 := NewDiskGuard(fakeProber(map[string]DiskStat{"/repo": st}, nil))
 	asPressureErr(t, g2.Check("worktree_create", "/repo"))
 }
+
+func TestDiskGuardAbsurdFloorSaturatesFailClosed(t *testing.T) {
+	// A 1 ZiB floor (used by wiring tests) exceeds uint64 byte range.
+	// Conversion must saturate — an overflow that wraps to a tiny floor
+	// would fail OPEN. Refusal must be plain disk_pressure, not a
+	// wrap-corrupted recovering verdict.
+	t.Setenv(EnvDiskMinFreeGB, "1099511627776")
+	g := NewDiskGuard(fakeProber(map[string]DiskStat{"/repo": healthyStat("/repo", "a")}, nil))
+	pe := asPressureErr(t, g.Check("dispatch", "/repo"))
+	if pe.Reason != ReasonDiskPressure {
+		t.Fatalf("reason = %q, want %q", pe.Reason, ReasonDiskPressure)
+	}
+	if pe.Thresholds.MinFreeBytes != maxDiskFloorBytes {
+		t.Fatalf("floor not saturated: %d", pe.Thresholds.MinFreeBytes)
+	}
+}
