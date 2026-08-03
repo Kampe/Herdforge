@@ -502,6 +502,13 @@ func runStatus() {
 		cfg.Project.Name, cfg.TaskProvider.Type, len(cfg.Lanes))
 }
 
+
+// loadTaskProvider activates the configured board provider with FAC-150
+// deadlines via provider.NewFromHerdConfig. Non-Kaneo types error (FAC-155).
+func loadTaskProvider(cfg *config.Config) (provider.TaskProvider, error) {
+	return provider.NewFromHerdConfig(cfg)
+}
+
 func runPulse() {
 	pulseFlags := flag.NewFlagSet("pulse", flag.ExitOnError)
 	role := pulseFlags.String("role", "worker", "Target role to run pulse sweep for")
@@ -514,14 +521,10 @@ func runPulse() {
 		os.Exit(1)
 	}
 
-	var tp provider.TaskProvider
-	switch cfg.TaskProvider.Type {
-	case "kaneo":
-		tp = provider.NewKaneoProvider(cfg.TaskProvider.APIURL, cfg.TaskProvider.ProjectID, cfg.TaskProvider.UseCLI)
-	case "github":
-		tp = provider.NewGitHubProvider(os.Getenv("GITHUB_TOKEN"), "owner", "repo")
-	default:
-		tp = provider.NewMemoryProvider()
+	tp, tpErr := loadTaskProvider(cfg)
+	if tpErr != nil {
+		fmt.Fprintf(os.Stderr, "task provider: %v\n", tpErr)
+		os.Exit(1)
 	}
 
 	mr := router.NewModelRouter([]*router.ModelCandidate{
@@ -857,12 +860,11 @@ func runDaemon() {
 		default:
 		}
 
-		var tp provider.TaskProvider
-		switch cfg.TaskProvider.Type {
-		case "kaneo":
-			tp = provider.NewKaneoProvider(cfg.TaskProvider.APIURL, cfg.TaskProvider.ProjectID, cfg.TaskProvider.UseCLI)
-		default:
-			tp = provider.NewMemoryProvider()
+		tp, tpErr := loadTaskProvider(cfg)
+		if tpErr != nil {
+			fmt.Fprintf(os.Stderr, "daemon: task provider: %v\n", tpErr)
+			time.Sleep(pulseInterval)
+			continue
 		}
 
 		mr := router.NewModelRouter([]*router.ModelCandidate{
@@ -1084,12 +1086,10 @@ func runReview() {
 		os.Exit(1)
 	}
 
-	var tp provider.TaskProvider
-	switch cfg.TaskProvider.Type {
-	case "kaneo":
-		tp = provider.NewKaneoProvider(cfg.TaskProvider.APIURL, cfg.TaskProvider.ProjectID, cfg.TaskProvider.UseCLI)
-	default:
-		tp = provider.NewMemoryProvider()
+	tp, tpErr := loadTaskProvider(cfg)
+	if tpErr != nil {
+		fmt.Fprintf(os.Stderr, "task provider: %v\n", tpErr)
+		os.Exit(1)
 	}
 
 	ctx := context.Background()
@@ -1234,12 +1234,10 @@ func runApprove() {
 		os.Exit(1)
 	}
 
-	var tp provider.TaskProvider
-	switch cfg.TaskProvider.Type {
-	case "kaneo":
-		tp = provider.NewKaneoProvider(cfg.TaskProvider.APIURL, cfg.TaskProvider.ProjectID, cfg.TaskProvider.UseCLI)
-	default:
-		tp = provider.NewMemoryProvider()
+	tp, tpErr := loadTaskProvider(cfg)
+	if tpErr != nil {
+		fmt.Fprintf(os.Stderr, "task provider: %v\n", tpErr)
+		os.Exit(1)
 	}
 
 	ctx := context.Background()
@@ -1335,12 +1333,10 @@ func runBoardDone() {
 		os.Exit(1)
 	}
 
-	var tp provider.TaskProvider
-	switch cfg.TaskProvider.Type {
-	case "kaneo":
-		tp = provider.NewKaneoProvider(cfg.TaskProvider.APIURL, cfg.TaskProvider.ProjectID, cfg.TaskProvider.UseCLI)
-	default:
-		tp = provider.NewMemoryProvider()
+	tp, tpErr := loadTaskProvider(cfg)
+	if tpErr != nil {
+		fmt.Fprintf(os.Stderr, "task provider: %v\n", tpErr)
+		os.Exit(1)
 	}
 
 	res, err := hsync.BoardDone(context.Background(), tp, ".", cfg.TaskProvider.ProjectID, ref, *evidence, *force)
@@ -1412,12 +1408,10 @@ func runBoardSync() {
 		os.Exit(1)
 	}
 
-	var tp provider.TaskProvider
-	switch cfg.TaskProvider.Type {
-	case "kaneo":
-		tp = provider.NewKaneoProvider(cfg.TaskProvider.APIURL, cfg.TaskProvider.ProjectID, cfg.TaskProvider.UseCLI)
-	default:
-		tp = provider.NewMemoryProvider()
+	tp, tpErr := loadTaskProvider(cfg)
+	if tpErr != nil {
+		fmt.Fprintf(os.Stderr, "task provider: %v\n", tpErr)
+		os.Exit(1)
 	}
 
 	syncer := hsync.NewBoardSyncer(tp)
@@ -1707,16 +1701,18 @@ func runNext() {
 		os.Exit(1)
 	}
 
-	var tp provider.TaskProvider
-	switch cfg.TaskProvider.Type {
-	case "kaneo":
-		tp = provider.NewKaneoProvider(cfg.TaskProvider.APIURL, cfg.TaskProvider.ProjectID, cfg.TaskProvider.UseCLI)
-	default:
-		tp = provider.NewMemoryProvider()
+	tp, tpErr := loadTaskProvider(cfg)
+	if tpErr != nil {
+		fmt.Fprintf(os.Stderr, "task provider: %v\n", tpErr)
+		os.Exit(1)
 	}
 
 	picker := next.NewNextPicker(cfg, tp)
-	actions := picker.EvalAll(context.Background())
+	actions, evalErr := picker.EvalAll(context.Background())
+	if evalErr != nil {
+		fmt.Fprintf(os.Stderr, "next eval failed: %v\n", evalErr)
+		os.Exit(1)
+	}
 
 	if len(actions) == 0 {
 		fmt.Println("No action required.")
@@ -1752,12 +1748,10 @@ func runDispatch() {
 		os.Exit(1)
 	}
 
-	var tp provider.TaskProvider
-	switch cfg.TaskProvider.Type {
-	case "kaneo":
-		tp = provider.NewKaneoProvider(cfg.TaskProvider.APIURL, cfg.TaskProvider.ProjectID, cfg.TaskProvider.UseCLI)
-	default:
-		tp = provider.NewMemoryProvider()
+	tp, tpErr := loadTaskProvider(cfg)
+	if tpErr != nil {
+		fmt.Fprintf(os.Stderr, "task provider: %v\n", tpErr)
+		os.Exit(1)
 	}
 
 	wm := resolveCanonicalWorktreeManager()
@@ -2249,12 +2243,10 @@ func runForge() {
 		os.Exit(1)
 	}
 
-	var tp provider.TaskProvider
-	switch cfg.TaskProvider.Type {
-	case "kaneo":
-		tp = provider.NewKaneoProvider(cfg.TaskProvider.APIURL, cfg.TaskProvider.ProjectID, cfg.TaskProvider.UseCLI)
-	default:
-		tp = provider.NewMemoryProvider()
+	tp, tpErr := loadTaskProvider(cfg)
+	if tpErr != nil {
+		fmt.Fprintf(os.Stderr, "task provider: %v\n", tpErr)
+		os.Exit(1)
 	}
 
 	mr := router.NewModelRouter([]*router.ModelCandidate{
@@ -3233,12 +3225,10 @@ func runForgeLoop() {
 		fmt.Fprintf(os.Stderr, "forge --loop: %v\n", err)
 		os.Exit(1)
 	}
-	var tp provider.TaskProvider
-	switch cfg.TaskProvider.Type {
-	case "kaneo":
-		tp = provider.NewKaneoProvider(cfg.TaskProvider.APIURL, cfg.TaskProvider.ProjectID, cfg.TaskProvider.UseCLI)
-	default:
-		tp = provider.NewMemoryProvider()
+	tp, tpErr := loadTaskProvider(cfg)
+	if tpErr != nil {
+		fmt.Fprintf(os.Stderr, "task provider: %v\n", tpErr)
+		os.Exit(1)
 	}
 	eng := daemon.NewEngine(cfg, tp, nil, nil, resolveCanonicalWorktreeManager(), nil)
 	driver := &cliForgeDriver{cfg: cfg, maxLanes: *maxLanes}

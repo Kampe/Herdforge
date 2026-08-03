@@ -98,7 +98,7 @@ func BoardDone(ctx context.Context, tp provider.TaskProvider, repoDir, projectID
 
 	tasks, err := tp.ListTasks(ctx, projectID, "")
 	if err != nil {
-		return nil, fmt.Errorf("list tasks: %w", err)
+		return nil, boardCallErr("list tasks", err)
 	}
 	var task *provider.Task
 	for _, t := range tasks {
@@ -112,20 +112,38 @@ func BoardDone(ctx context.Context, tp provider.TaskProvider, repoDir, projectID
 	}
 
 	if err := tp.UpdateStatus(ctx, task.ID, "done"); err != nil {
-		return nil, fmt.Errorf("status write for %s: %w", ref, err)
+		return nil, boardCallErr(fmt.Sprintf("status write for %s", ref), err)
 	}
 
 	back, err := tp.GetTask(ctx, task.ID)
 	if err != nil {
-		return nil, fmt.Errorf("read-back for %s failed after status write: %w", ref, err)
+		return nil, boardCallErr(fmt.Sprintf("read-back for %s after status write", ref), err)
 	}
 	if back.Status != "done" {
 		return nil, fmt.Errorf("write reported success but %s reads back as %q", ref, back.Status)
 	}
 
 	res := &DoneResult{Ref: ref, TaskID: task.ID, Proof: proof, Forced: force && !strings.Contains(proof, "origin/main")}
-	if err := tp.AddComment(ctx, task.ID, "board-done: "+proof); err == nil {
+	// Comment is best-effort only when the call is non-timeout; timeout/ambiguous
+	// must not look like success with CommentPosted (FAC-150).
+	if err := tp.AddComment(ctx, task.ID, "board-done: "+proof); err != nil {
+		if provider.IsTimeout(err) || provider.IsAmbiguous(err) {
+			return nil, boardCallErr("board-done comment", err)
+		}
+		// Non-timeout comment failure: status is done; leave CommentPosted false.
+	} else {
 		res.CommentPosted = true
 	}
 	return res, nil
+}
+
+// boardCallErr projects provider timeout/ambiguous as BLOCKED(provider_timeout).
+func boardCallErr(op string, err error) error {
+	if err == nil {
+		return nil
+	}
+	if provider.IsTimeout(err) || provider.IsAmbiguous(err) || provider.ClassifyOpError(err) == provider.OpTimeout || provider.ClassifyOpError(err) == provider.OpAmbiguous {
+		return fmt.Errorf("%s: BLOCKED(provider_timeout): %w", op, err)
+	}
+	return fmt.Errorf("%s: %w", op, err)
 }
