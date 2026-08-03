@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -86,6 +87,7 @@ type fakeHerdr struct {
 	closedTabs  []string
 	closeErr    error // TabClose failure — must not be silently discarded
 	startCalls  int
+	startReq    launch.Request
 	deliverText string
 	model       string
 }
@@ -122,10 +124,11 @@ func (f *fakeHerdr) TabCreateForTask(workspaceID, label, cwd string, _ bool) (*h
 		Pane: herdr.PaneInfo{ID: pane, TabID: id},
 	}, nil
 }
-func (f *fakeHerdr) AgentStart(_ launch.Request, name, kind, paneID string) error {
+func (f *fakeHerdr) AgentStart(req launch.Request, name, kind, paneID string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.startCalls++
+	f.startReq = req
 	_ = name
 	_ = kind
 	_ = paneID
@@ -340,6 +343,10 @@ func TestDispatch_Launch_SetsCwdAndProvesPrompt(t *testing.T) {
 	}
 	if res.TabID != "tab-9" {
 		t.Fatalf("TabID = %q", res.TabID)
+	}
+	wantArgv := []string{"codex", "--model", launch.WorkerModel, "-c", "model_reasoning_effort=medium", "-a", "never"}
+	if fh.startReq.Decision == nil || !reflect.DeepEqual(fh.startReq.Decision.Argv, wantArgv) || fh.startReq.Decision.Provider != launch.WorkerProvider {
+		t.Fatalf("dispatch launch decision = %+v, want provider/argv %s", fh.startReq.Decision, wantArgv)
 	}
 	if res.Receipt == nil || !res.Receipt.Consumed || !res.Receipt.Verified {
 		t.Fatalf("receipt: %+v", res.Receipt)
