@@ -76,13 +76,13 @@ func TestPinnedProbeMustMatchExactRequestedModel(t *testing.T) {
 	}
 	for name, bad := range cases {
 		t.Run(name, func(t *testing.T) {
-			if _, err := NewRouter(nil, nil).Decide(bad); !errors.Is(err, ErrWorkerPolicy) {
+			if _, err := testRouter(nil, "codex").Decide(bad); !errors.Is(err, ErrWorkerPolicy) {
 				t.Fatalf("forbidden worker route error = %v", err)
 			}
 		})
 	}
 	good := LaunchRequest{Role: RoleWorker, Shape: "implementation", RequestedProvider: "codex", RequestedModel: "gpt-5.6-luna", RequestedEffort: "medium", ProbeResults: map[string]bool{ProbeKey("codex", "gpt-5.6-luna"): true}}
-	if _, err := NewRouter(nil, nil).Decide(good); err != nil {
+	if _, err := testRouter(nil, "codex").Decide(good); err != nil {
 		t.Fatalf("approved Luna route rejected: %v", err)
 	}
 }
@@ -91,19 +91,19 @@ func TestWorkerPolicyRequiresExplicitMediumEffort(t *testing.T) {
 	base := LaunchRequest{Role: RoleWorker, Shape: "implementation", RequestedProvider: "codex", RequestedModel: "gpt-5.6-luna"}
 	for name, effort := range map[string]string{"missing": "", "wrong": "high"} {
 		base.RequestedEffort = effort
-		if _, err := NewRouter(nil, nil).Decide(base); !errors.Is(err, ErrWorkerPolicy) {
+		if _, err := testRouter(nil, "codex").Decide(base); !errors.Is(err, ErrWorkerPolicy) {
 			t.Fatalf("%s effort error = %v", name, err)
 		}
 	}
 	base.RequestedEffort = "medium"
 	base.ProbeResults = map[string]bool{ProbeKey("codex", "gpt-5.6-luna"): true}
-	if _, err := NewRouter(nil, nil).Decide(base); err != nil {
+	if _, err := testRouter(nil, "codex").Decide(base); err != nil {
 		t.Fatalf("explicit medium rejected: %v", err)
 	}
 }
 
 func TestUnknownRoleRejectedBeforeSignedDecision(t *testing.T) {
-	if _, err := NewRouter(nil, nil).Decide(LaunchRequest{Role: Role("not-configured"), Shape: "implementation"}); !errors.Is(err, ErrRolePolicy) {
+	if _, err := testRouter(nil, "codex").Decide(LaunchRequest{Role: Role("not-configured"), Shape: "implementation"}); !errors.Is(err, ErrRolePolicy) {
 		t.Fatalf("unknown role error = %v", err)
 	}
 }
@@ -606,7 +606,7 @@ func TestLaunchDecisionFieldsComplete(t *testing.T) {
 
 func TestVerifyDecisionRequiresRouterIssuanceAndExactContext(t *testing.T) {
 	clearRouteEnv(t)
-	d, err := NewRouter(nil, nil).Decide(LaunchRequest{
+	d, err := testRouter(nil, "codex").Decide(LaunchRequest{
 		Role: RoleWorker, Shape: "implementation", RequestedProvider: "codex",
 		RequestedModel: "gpt-5.6-luna", RequestedEffort: "medium", TaskRef: "FAC-A",
 		Scope:        ScopeLane,
@@ -646,7 +646,7 @@ func TestVerifyDecisionRejectsPublicCanonicalForgery(t *testing.T) {
 
 func TestTaskDecisionCannotBeIssuedWithoutPositiveLease(t *testing.T) {
 	clearRouteEnv(t)
-	_, err := NewRouter(nil, nil).Decide(LaunchRequest{
+	_, err := testRouter(nil, "codex").Decide(LaunchRequest{
 		Role: RoleWorker, Shape: "implementation", RequestedProvider: "codex",
 		RequestedModel: "gpt-5.6-luna", RequestedEffort: "medium", TaskRef: "FAC-175",
 		Scope: ScopeTask, LeaseGeneration: 0,
@@ -659,7 +659,7 @@ func TestTaskDecisionCannotBeIssuedWithoutPositiveLease(t *testing.T) {
 
 func TestDecisionProofBindsExplicitScope(t *testing.T) {
 	clearRouteEnv(t)
-	d, err := NewRouter(nil, nil).Decide(LaunchRequest{
+	d, err := testRouter(nil, "codex").Decide(LaunchRequest{
 		Role: RoleWorker, Shape: "implementation", RequestedProvider: "codex",
 		RequestedModel: "gpt-5.6-luna", RequestedEffort: "medium",
 		ProbeResults: map[string]bool{ProbeKey("codex", "gpt-5.6-luna"): true},

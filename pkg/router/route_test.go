@@ -33,6 +33,23 @@ func testRouter(computed map[string]usage.BurnState, clis ...string) *SurfaceRou
 	return r
 }
 
+func TestTestRouterAvailabilityFixtureIsHermetic(t *testing.T) {
+	clearRouteEnv(t)
+	t.Setenv("PATH", "/dev/null")
+	r := testRouter(nil, "codex")
+	d, err := r.Decide(LaunchRequest{
+		Role: RoleWorker, Shape: "implementation", RequestedProvider: "codex",
+		RequestedModel: "gpt-5.6-luna", RequestedEffort: "medium",
+		ProbeResults: map[string]bool{ProbeKey("codex", "gpt-5.6-luna"): true},
+	})
+	if err != nil {
+		t.Fatalf("deterministic Codex fixture must issue Luna decision with empty PATH: %v", err)
+	}
+	if d.Provider != "codex" || d.Model != "gpt-5.6-luna" {
+		t.Fatalf("fixture selected %s/%s, want codex/gpt-5.6-luna", d.Provider, d.Model)
+	}
+}
+
 // The verbatim tables from bin/herd-route. If one of these fails, the port
 // has drifted from the shell contract.
 func TestModelForTable(t *testing.T) {
