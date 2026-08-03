@@ -243,6 +243,17 @@ func (d *Dispatcher) Dispatch(ctx context.Context, opts DispatchOptions) (*Dispa
 		return nil, err
 	}
 
+	// Fail closed on critical disk pressure before ANY fleet mutation —
+	// board claim, worktree creation, tab launch (FAC-153). The guard only
+	// refuses new work; it never reclaims space.
+	diskPaths := []string{os.TempDir()}
+	if d.Worktree != nil {
+		diskPaths = append(diskPaths, d.Worktree.RepoRoot())
+	}
+	if err := preflight.CheckDiskPressure("dispatch", diskPaths...); err != nil {
+		return nil, err
+	}
+
 	// 1. Fetch ticket from Kaneo (bounded context + health observe, FAC-150)
 	tasks, err := d.listTasksBound(ctx, d.Config.TaskProvider.ProjectID, "")
 	if err != nil {
