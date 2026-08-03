@@ -41,6 +41,36 @@ func TestStatusSchemaPreservesLivenessReadinessAndUnknownPressure(t *testing.T) 
 	}
 }
 
+func TestStatusSchemaReportsHealthyOnlyWithAuthoritativeSignals(t *testing.T) {
+	now := time.Date(2026, 8, 3, 12, 0, 0, 0, time.UTC)
+	exp := metrics.NewMetricsExporterWithPersistence(nil, func() time.Time { return now })
+	deps := []metrics.DependencyHealth{
+		{Name: "event", Critical: true, State: metrics.DependencyHealthy},
+		{Name: "git", Critical: true, State: metrics.DependencyHealthy},
+		{Name: "herdr", Critical: true, State: metrics.DependencyHealthy},
+		{Name: "provider", Critical: true, State: metrics.DependencyHealthy},
+	}
+	if err := exp.SetHealthAt(deps, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := exp.SetQueuePressureAt(metrics.QueuePressure{Depth: 1, Capacity: 2, Known: true}, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := exp.SetSignals(metrics.FleetSignals{LastReconciliation: now, ObservedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	srv := NewControlServerWithMetrics("127.0.0.1:0", exp, func() time.Time { return now })
+	w := httptest.NewRecorder()
+	srv.handleStatus(w, httptest.NewRequest("GET", "/v1/status", nil))
+	var got ServerStatusResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != "healthy" || !got.Health.Readiness || got.Signals.ObservedAt.IsZero() {
+		t.Fatalf("authoritative state was not reported healthy: %+v", got)
+	}
+}
+
 func TestControlServer_StartAndEndpoints(t *testing.T) {
 	srv := NewControlServer("127.0.0.1:18899")
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -71,5 +101,9 @@ func TestControlServer_StartAndEndpoints(t *testing.T) {
 	openAPIResp, err := http.Get("http://127.0.0.1:18899/openapi.json")
 	if err != nil || openAPIResp.StatusCode != http.StatusOK {
 		t.Fatalf("expected 200 OK from /openapi.json, got code %d", openAPIResp.StatusCode)
+	}
+	metricsResp, err := http.Get("http://127.0.0.1:18899/metrics")
+	if err != nil || metricsResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 OK from /metrics, got code %d (err: %v)", metricsResp.StatusCode, err)
 	}
 }
