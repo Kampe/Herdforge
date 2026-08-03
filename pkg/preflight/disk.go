@@ -49,6 +49,11 @@ const (
 	defaultDiskMinFreeGB   = 15.0
 	defaultDiskMinFreePct  = 2.0
 	defaultDiskMinInodePct = 1.0
+	// Conservative default temp/build expansion (git object writes, race
+	// binaries, archives) required on top of the reserve. Overridable via
+	// HERD_DISK_BUILD_HEADROOM_GB; auto-disabled only when every reserve
+	// floor is explicitly zeroed (guard wholly disabled, e.g. test shims).
+	defaultDiskBuildHeadroomGB = 2.0
 	// Hysteresis: once blocked, recover only after a fresh probe shows
 	// headroom above recoverFactor x the block threshold.
 	recoverFactor = 1.25
@@ -388,11 +393,18 @@ func below(stats []DiskStat, minFreeBytes uint64, minFreePct, minInodePct float6
 func loadDiskThresholds() DiskThresholds {
 	minGB := envFloat(EnvDiskMinFreeGB, defaultDiskMinFreeGB)
 	minPct := envFloat(EnvDiskMinFreePct, defaultDiskMinFreePct)
-	headGB := envFloat(EnvDiskBuildHeadroomGB, 0)
+	minInode := envFloat(EnvDiskMinInodePct, defaultDiskMinInodePct)
+	defHead := defaultDiskBuildHeadroomGB
+	if minGB == 0 && minPct == 0 && minInode == 0 {
+		// Guard explicitly disabled on every axis: the derived headroom
+		// default is off too. An explicit headroom env is always honored.
+		defHead = 0
+	}
+	headGB := envFloat(EnvDiskBuildHeadroomGB, defHead)
 	th := DiskThresholds{
 		MinFreeBytes: uint64(minGB * bytesPerGiB),
 		MinFreePct:   minPct,
-		MinInodePct:  envFloat(EnvDiskMinInodePct, defaultDiskMinInodePct),
+		MinInodePct:  minInode,
 		// Recover floor defaults scale from the EFFECTIVE block floor
 		// (reserve + headroom) so hysteresis still clears above headroom.
 		RecoverFreeBytes: uint64(envFloat(EnvDiskRecoverFreeGB, (minGB+headGB)*recoverFactor) * bytesPerGiB),

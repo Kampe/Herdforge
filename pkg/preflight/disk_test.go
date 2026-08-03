@@ -127,13 +127,14 @@ func TestDiskGuardInodeExhaustionFailsClosed(t *testing.T) {
 }
 
 func TestDiskGuardHysteresisRecovery(t *testing.T) {
-	// Defaults: block below 15GiB, recover above 15*1.25 = 18.75GiB.
+	// Defaults: block below 15GiB reserve + 2GiB headroom = 17GiB,
+	// recover above (15+2)*1.25 = 21.25GiB.
 	current := incidentStat("/repo", "a") // 13GiB → block
 	g := NewDiskGuard(func(string) (DiskStat, error) { return current, nil })
 	asPressureErr(t, g.Check("dispatch", "/repo"))
 
 	// Above block floor but below recover floor: still refused (recovering).
-	current.FreeBytes = 16 << 30
+	current.FreeBytes = 18 << 30
 	current.FreePct = 1.7
 	t.Setenv(EnvDiskMinFreePct, "0") // isolate the bytes axis
 	pe := asPressureErr(t, g.Check("dispatch", "/repo"))
@@ -204,9 +205,10 @@ func TestDiskGuardStateProjection(t *testing.T) {
 		t.Fatalf("evidence not exposed: %+v", g.LastEvidence())
 	}
 
-	// Hysteresis window → recovering label, still refusing.
+	// Hysteresis window → recovering label, still refusing (block floor is
+	// 17GiB with default headroom; recover floor 21.25GiB).
 	t.Setenv(EnvDiskMinFreePct, "0")
-	current.FreeBytes = 16 << 30
+	current.FreeBytes = 18 << 30
 	if err := g.Check("dispatch", "/repo"); err == nil {
 		t.Fatal("recovering window must still refuse")
 	}
@@ -245,7 +247,7 @@ func TestDiskGuardRestartReconciliation(t *testing.T) {
 	}
 
 	st := healthyStat("/repo", "a")
-	st.FreeBytes = 16 << 30 // above block floor (15GiB), below recover floor (18.75GiB)
+	st.FreeBytes = 18 << 30 // above block floor (17GiB incl. headroom), below recover floor (21.25GiB)
 	st.FreePct = 50
 	fresh := NewDiskGuard(fakeProber(map[string]DiskStat{"/repo": st}, nil))
 	err := fresh.Check("dispatch", "/repo")
@@ -269,16 +271,18 @@ func TestDiskGuardRestartReconciliation(t *testing.T) {
 }
 
 func TestDiskGuardBuildHeadroomIncludedInDecision(t *testing.T) {
-	// 13GiB free clears a 10GiB reserve alone, but not 10GiB + 8GiB
+	// 16GiB free clears a 10GiB reserve + 2GiB default headroom (and the
+	// 15GiB fresh-process recover floor), but not 10GiB + 8GiB explicit
 	// required temp/build headroom.
 	t.Setenv(EnvDiskMinFreeGB, "10")
 	t.Setenv(EnvDiskMinFreePct, "0")
-	st := incidentStat("/repo", "a") // 13GiB free
-	st.FreePct = 50                  // isolate the bytes axis
+	st := incidentStat("/repo", "a")
+	st.FreeBytes = 16 << 30
+	st.FreePct = 50 // isolate the bytes axis
 
 	g := NewDiskGuard(fakeProber(map[string]DiskStat{"/repo": st}, nil))
 	if err := g.Check("dispatch", "/repo"); err != nil {
-		t.Fatalf("without headroom 13GiB > 10GiB must pass: %v", err)
+		t.Fatalf("16GiB > 10+2GiB effective floor must pass: %v", err)
 	}
 
 	t.Setenv(EnvDiskBuildHeadroomGB, "8")
@@ -305,9 +309,10 @@ func TestDiskGuardAdviseGraduatedShedding(t *testing.T) {
 		t.Fatalf("proceed expected: %+v", adv)
 	}
 
-	// Soft band: 20GiB is above the 15GiB block floor but below the 30GiB
-	// default soft floor — serialize before refusing any work.
-	st.FreeBytes = 20 << 30
+	// Soft band: 25GiB is above the 21.25GiB recover floor (block floor is
+	// 17GiB with default headroom) but below the 34GiB default soft floor —
+	// serialize before refusing any work.
+	st.FreeBytes = 25 << 30
 	g2 := NewDiskGuard(fakeProber(map[string]DiskStat{"/repo": st}, nil))
 	adv = g2.Advise("verifier_fanout", "/repo")
 	if adv.Verdict != AdviceSerialize || adv.MaxParallel != 1 {
@@ -328,10 +333,10 @@ func TestDiskGuardAdviseGraduatedShedding(t *testing.T) {
 		t.Fatal("refuse must drive the same state machine as Check")
 	}
 
-	// Soft floor is configurable: shrink it below 20GiB and the same
+	// Soft floor is configurable: shrink it below 25GiB and the same
 	// volume proceeds at full parallelism.
-	t.Setenv(EnvDiskSerializeFreeGB, "16")
-	st.FreeBytes = 20 << 30
+	t.Setenv(EnvDiskSerializeFreeGB, "22")
+	st.FreeBytes = 25 << 30
 	g4 := NewDiskGuard(fakeProber(map[string]DiskStat{"/repo": st}, nil))
 	if adv = g4.Advise("verifier_fanout", "/repo"); adv.Verdict != AdviceProceed {
 		t.Fatalf("configured soft floor ignored: %+v", adv)
@@ -353,4 +358,25 @@ func TestDiskGuardAdviseUnreadableRefuses(t *testing.T) {
 	if !g.Blocked() || g.Status() != "BLOCKED(disk_stat_unreadable)" {
 		t.Fatalf("guard not blocked after unreadable Advise: %s", g.Status())
 	}
+}
+
+func TestDiskGuardDefaultHeadroomActive(t *testing.T) {
+	// No env at all: the 2GiB build headroom is on by default, so 16GiB
+	// free fails the 15+2GiB effective floor. The gate is not inert
+	// without operator setup.
+	st := healthyStat("/repo", "a")
+	st.FreeBytes = 16 << 30
+	g := NewDiskGuard(fakeProber(map[string]DiskStat{"/repo": st}, nil))
+	pe := asPressureErr(t, g.Check("worktree_create", "/repo"))
+	if pe.Thresholds.HeadroomBytes != 2<<30 {
+		t.Fatalf("default headroom missing from evidence: %+v", pe.Thresholds)
+	}
+
+	// Explicit headroom is honored even with the reserve floors zeroed.
+	t.Setenv(EnvDiskMinFreeGB, "0")
+	t.Setenv(EnvDiskMinFreePct, "0")
+	t.Setenv(EnvDiskMinInodePct, "0")
+	t.Setenv(EnvDiskBuildHeadroomGB, "20")
+	g2 := NewDiskGuard(fakeProber(map[string]DiskStat{"/repo": st}, nil))
+	asPressureErr(t, g2.Check("worktree_create", "/repo"))
 }
