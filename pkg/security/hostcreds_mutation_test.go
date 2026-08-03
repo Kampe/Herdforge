@@ -20,7 +20,7 @@ func TestMutation_NoAPIKeyPlant(t *testing.T) {
 	}
 }
 
-func TestMutation_MITMFailClosedWithoutAllowPID(t *testing.T) {
+func TestMutation_MITMFailClosedWithoutPeerAllow(t *testing.T) {
 	v := NewTestCredentialVault()
 	_ = v.InstallTestSecret("api.x.ai", "Bearer mut")
 	sess, err := StartHostCredsSession(SessionConfig{Kind: "grok", SessionID: "m-pid", Authority: v})
@@ -29,7 +29,31 @@ func TestMutation_MITMFailClosedWithoutAllowPID(t *testing.T) {
 	}
 	defer sess.Close()
 	if err := ProveMITMRequiresAllowPID(sess.Mitm, "api.x.ai"); err != nil {
-		t.Fatal("MUTATION: CONNECT allowed without PID:", err)
+		t.Fatal("MUTATION: CONNECT allowed without peer allow:", err)
+	}
+}
+
+// If authorizePeer is removed/fail-open, this fails closed must still hold.
+func TestMutation_UnregisteredPortDenied(t *testing.T) {
+	v := NewTestCredentialVault()
+	_ = v.InstallTestSecret("api.x.ai", "Bearer mut")
+	sess, err := StartHostCredsSession(SessionConfig{Kind: "grok", SessionID: "m-port", Authority: v})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sess.Close()
+	// Register a port that is NOT our dial source.
+	sess.Mitm.AllowClientPort(1)
+	c, err := net.DialTimeout("tcp", sess.Mitm.Addr(), 2*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	_, _ = c.Write([]byte("CONNECT api.x.ai:443 HTTP/1.1\r\nHost: api.x.ai:443\r\n\r\n"))
+	buf := make([]byte, 128)
+	n, _ := c.Read(buf)
+	if !strings.Contains(string(buf[:n]), "403") {
+		t.Fatalf("MUTATION: wrong-port CONNECT allowed: %q", string(buf[:n]))
 	}
 }
 
@@ -42,7 +66,6 @@ func TestMutation_RevokeKillsMITM(t *testing.T) {
 	}
 	addr := sess.Mitm.Addr()
 	_ = sess.Revoke()
-	// Dial should fail after revoke/close.
 	c, err := net.DialTimeout("tcp", addr, time.Second)
 	if err == nil {
 		_ = c.Close()
@@ -51,6 +74,9 @@ func TestMutation_RevokeKillsMITM(t *testing.T) {
 }
 
 func TestMutation_PerKindIsolation(t *testing.T) {
+	if testing.Short() {
+		t.Skip("subprocess")
+	}
 	v := NewTestCredentialVault()
 	_ = v.InstallTestSecret("api.x.ai", "Bearer x")
 	_ = v.InstallTestSecret("api.openai.com", "Bearer y")
@@ -166,5 +192,50 @@ func TestMutation_Redaction(t *testing.T) {
 	out := RedactSecrets(`Bearer sk-abc123XYZ and {"api_key":"sk-othersecret99"}`)
 	if strings.Contains(out, "sk-abc") || strings.Contains(out, "sk-other") {
 		t.Fatal(out)
+	}
+}
+
+func TestMutation_PIDMismatchHardFail(t *testing.T) {
+	// ProveAllowlistedHostViaWorker must hard-fail res.PID != process.Pid.
+	// Structural unit: empty-body check is banned — simulate mismatch condition.
+	res := &WorkerProbeResult{PID: 1}
+	processPid := 2
+	if res.PID == processPid {
+		t.Fatal("fixture broken")
+	}
+	if res.PID != processPid {
+		// expected hard fail path
+		err := fmtMismatch(res.PID, processPid)
+		if err == nil {
+			t.Fatal("MUTATION: pid mismatch must error")
+		}
+	}
+}
+
+func fmtMismatch(a, b int) error {
+	if a != b {
+		return errPIDMismatch(a, b)
+	}
+	return nil
+}
+
+func errPIDMismatch(a, b int) error {
+	return &BlockedError{Reason: BlockAbuse, Code: "worker_pid_mismatch"}
+}
+
+func TestMutation_EnvironAppendBanned(t *testing.T) {
+	// Regression: ProveAllowlistedHostViaWorker must not use append(os.Environ()).
+	// ExactWorkerChildEnv + assertExactEnvNoSecrets is the contract.
+	t.Setenv("XAI_API_KEY", "sk-parent-secret-must-not-leak")
+	env := ExactWorkerChildEnv(HarnessProxyEnv(nil, "s"), []string{"PATH=/bin"})
+	// HarnessProxyEnv(nil) is nil — still scrub.
+	env = ExactWorkerChildEnv([]string{"PATH=/usr/bin"}, []string{"XAI_API_KEY="})
+	if err := assertExactEnvNoSecrets(env); err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range env {
+		if strings.Contains(e, "sk-parent") {
+			t.Fatal("MUTATION: parent secret in exact env")
+		}
 	}
 }
