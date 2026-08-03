@@ -1,11 +1,111 @@
 package outbox
 
 import (
+	"database/sql"
 	"errors"
 	"path/filepath"
 	"testing"
 	"time"
 )
+
+func TestLegacyClaimCannotStealLiveOwnedClaim(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "outbox.db")
+	a, err := NewStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := NewStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	defer b.Close()
+	it, err := a.Enqueue(Item{IdempotencyKey: "legacy-live", TaskRef: "FAC-182", Kind: "control", Payload: "x"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.ClaimOwned(it.ID, "owner-a", time.Minute, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.Claim(it.ID); !errors.Is(err, ErrNotClaimable) {
+		t.Fatalf("legacy Claim stole live owned row: %v", err)
+	}
+}
+
+func TestOwnedClaimOnlyTakesOverAtExpiry(t *testing.T) {
+	s := tempStore(t)
+	it, err := s.Enqueue(Item{IdempotencyKey: "expiry", TaskRef: "FAC-182", Kind: "control", Payload: "x"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now().UTC().Truncate(time.Microsecond)
+	if _, err := s.ClaimOwned(it.ID, "owner-a", time.Minute, start); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.ClaimOwned(it.ID, "owner-b", time.Minute, start.Add(time.Minute-time.Nanosecond)); !errors.Is(err, ErrNotClaimable) {
+		t.Fatalf("claim before expiry succeeded: %v", err)
+	}
+	claimed, err := s.ClaimOwned(it.ID, "owner-b", time.Minute, start.Add(time.Minute))
+	if err != nil {
+		t.Fatalf("claim at expiry: %v", err)
+	}
+	if claimed.Owner != "owner-b" {
+		t.Fatalf("owner = %q", claimed.Owner)
+	}
+}
+
+func TestOldSchemaRowsScanAndBecomeRecoverable(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "old.db")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = db.Exec(`CREATE TABLE outbox_items (id INTEGER PRIMARY KEY AUTOINCREMENT, idempotency_key TEXT UNIQUE, task_ref TEXT, kind TEXT, payload TEXT, status TEXT, attempts INTEGER, last_error TEXT, next_attempt_at DATETIME, created_at DATETIME, updated_at DATETIME)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = db.Exec(`INSERT INTO outbox_items (idempotency_key,task_ref,kind,payload,status,attempts,created_at,updated_at) VALUES ('old','FAC-182','control','x','in_flight',2,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, err := NewStoreWithDB(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	it, err := s.Get(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if it == nil || it.Owner != "legacy-unowned" || it.ClaimedAt == nil {
+		t.Fatalf("legacy row not observable/recoverable: %#v", it)
+	}
+}
+
+func TestClaimAndFailurePreserveAttemptContract(t *testing.T) {
+	s := tempStore(t)
+	it, err := s.Enqueue(Item{IdempotencyKey: "attempts", TaskRef: "FAC-182", Kind: "control", Payload: "x"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := s.Claim(it.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claimed.Attempts != 0 {
+		t.Fatalf("Claim changed attempts: %d", claimed.Attempts)
+	}
+	if err := s.MarkFailed(it.ID, "boom", 3); err != nil {
+		t.Fatal(err)
+	}
+	failed, err := s.Get(it.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if failed.Attempts != 1 {
+		t.Fatalf("MarkFailed attempts = %d, want 1", failed.Attempts)
+	}
+}
 
 func tempStore(t *testing.T) *Store {
 	t.Helper()

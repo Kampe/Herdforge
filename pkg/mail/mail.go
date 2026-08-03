@@ -114,6 +114,24 @@ func (m *Mailbox) SendMessageContext(ctx context.Context, sender, recipient, sub
 	return env, nil
 }
 
+// AppendEnvelopeContext appends an envelope whose identity was assigned by a
+// durable protocol above the mailbox.  Unlike SendMessageContext this does
+// not mint a new ID; retries therefore remain idempotent across restarts.
+// The envelope is still assigned a mailbox sequence and is fsync'd before
+// this method returns.
+func (m *Mailbox) AppendEnvelopeContext(ctx context.Context, env *Envelope) error {
+	if env == nil || env.ID == "" {
+		return fmt.Errorf("append envelope: stable id is required")
+	}
+	if env.Recipient == "" || env.Sender == "" {
+		return fmt.Errorf("append envelope: sender and recipient are required")
+	}
+	if env.Timestamp.IsZero() {
+		env.Timestamp = time.Now().UTC()
+	}
+	return m.appendEnvelopeContext(ctx, env)
+}
+
 func newEnvelope(sender, recipient, subject, body string) *Envelope {
 	return &Envelope{
 		ID:        newID(),
@@ -145,6 +163,9 @@ func (m *Mailbox) appendEnvelopeContext(ctx context.Context, env *Envelope) erro
 
 	m.ensureSeenLoadedLocked()
 	if m.alreadySeenLocked(env.ID) {
+		if err := m.loadEnvelopeIdentityLocked(env); err != nil {
+			return err
+		}
 		// Idempotent: prior durable append (or same-id retry after a
 		// post-append dequeue/cleanup failure) must not re-append.
 		return nil
@@ -158,10 +179,13 @@ func (m *Mailbox) appendEnvelopeContext(ctx context.Context, env *Envelope) erro
 		// Re-check under the lock: a concurrent writer may have appended
 		// the same id between the outer alreadySeen and flock grant.
 		if m.alreadySeenLocked(env.ID) {
-			return nil
+			return m.loadEnvelopeIdentityLocked(env)
 		}
 		if m.fileHasID(env.ID) {
 			m.markSeenLocked(env.ID)
+			if err := m.loadEnvelopeIdentityLocked(env); err != nil {
+				return err
+			}
 			return nil
 		}
 		seq, err := m.nextSequenceLocked()
@@ -188,6 +212,24 @@ func (m *Mailbox) appendEnvelopeContext(ctx context.Context, env *Envelope) erro
 		return err
 	}
 	return nil
+}
+
+func (m *Mailbox) loadEnvelopeIdentityLocked(env *Envelope) error {
+	data, err := os.ReadFile(m.MailFile)
+	if err != nil {
+		return err
+	}
+	for _, line := range splitLines(string(data)) {
+		var existing Envelope
+		if json.Unmarshal([]byte(line), &existing) == nil && existing.ID == env.ID {
+			if existing.Sender != env.Sender || existing.Recipient != env.Recipient || existing.Subject != env.Subject || existing.Body != env.Body {
+				return fmt.Errorf("mailbox: envelope ID %q reused with different content", env.ID)
+			}
+			env.Sequence, env.Timestamp = existing.Sequence, existing.Timestamp
+			return nil
+		}
+	}
+	return fmt.Errorf("mailbox: envelope ID %q was seen but is not readable", env.ID)
 }
 
 // ensureSeenLoadedLocked seeds the in-memory dedup set from the mailbox
@@ -721,6 +763,43 @@ func (b *MessageBroker) SendMessageContext(ctx context.Context, sender, recipien
 		b.reportErr(fmt.Errorf("outbox cleanup failed for %s: %w", env.ID, err))
 	}
 	return env, nil
+}
+
+// SendEnvelopeContext delivers a caller-identified envelope.  It mirrors
+// SendMessageContext's outbox-before-mailbox-before-publish ordering while
+// preserving the caller's stable ID for protocol-level deduplication.
+func (b *MessageBroker) SendEnvelopeContext(ctx context.Context, env *Envelope) error {
+	if env == nil || env.ID == "" {
+		return fmt.Errorf("send envelope: stable id is required")
+	}
+	if env.Sender == "" || env.Recipient == "" {
+		return fmt.Errorf("send envelope: sender and recipient are required")
+	}
+	if env.Timestamp.IsZero() {
+		env.Timestamp = time.Now().UTC()
+	}
+	if ctx == nil {
+		ctx = b.ctx
+	}
+	if b.redis == nil {
+		return b.mb.appendEnvelopeContext(ctx, env)
+	}
+	channel := b.channelPrefix + "." + env.Recipient
+	if err := b.addOutboxEntryContext(ctx, env, channel); err != nil {
+		return fmt.Errorf("failed to durably record outbox entry for %s: %w", env.ID, err)
+	}
+	if err := b.mb.appendEnvelopeContext(ctx, env); err != nil {
+		b.reportErr(fmt.Errorf("local mailbox append failed for %s (outbox retains it): %w", env.ID, err))
+		return err
+	}
+	if err := b.publishOne(env, channel); err != nil {
+		b.reportErr(err)
+		return err
+	}
+	if err := b.removeOutboxEntryContext(ctx, env.ID); err != nil {
+		b.reportErr(fmt.Errorf("outbox cleanup failed for %s: %w", env.ID, err))
+	}
+	return nil
 }
 
 func (b *MessageBroker) publishOne(env *Envelope, channel string) error {
