@@ -548,6 +548,7 @@ func runPulse() {
 	}
 	var pulseLane *config.LaneDef
 	var pulseDecision *router.LaunchDecision
+	var pulseLeaseGeneration int64
 	var tp provider.TaskProvider
 	var tpErr error
 	if *spawn {
@@ -597,17 +598,27 @@ func runPulse() {
 		fmt.Println("Pulse sweep complete: No pending tasks available.")
 		return
 	}
+	claimedRef, claimedGeneration := eng.LastClaimIdentity()
+	if claimedRef != task.Ref || claimedGeneration == 0 {
+		fmt.Fprintf(os.Stderr, "pulse launch identity unavailable for %s\n", task.Ref)
+		os.Exit(1)
+	}
+	pulseLeaseGeneration = claimedGeneration
 
 	fmt.Printf("Pulse sweep claimed task [%s]: %s\n", task.Ref, task.Title)
 
 	if *spawn {
 		lane := pulseLane
-		decision := pulseDecision
+		decision, err := rebindDecisionForTask(pulseDecision, task.Ref, pulseLeaseGeneration)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "pulse launch decision rejected after claim: %v\n", err)
+			os.Exit(1)
+		}
 
 		standingName := fmt.Sprintf("forge-%s", lane.Name)
 		targetLabel := standingName
 
-		tabLabel, err := herdr.ResolveAgentTabWithDecision(standingName, launch.Request{Decision: decision, TaskRef: task.Ref}, 0)
+		tabLabel, err := herdr.ResolveAgentTabWithDecision(standingName, taskLaunchRequest(decision, task.Ref))
 		if err != nil {
 			if !errors.Is(err, herdr.ErrAgentNotFound) {
 				fmt.Fprintf(os.Stderr, "standing agent %s blocked: %v\n", standingName, err)
@@ -620,7 +631,7 @@ func runPulse() {
 				fmt.Fprintf(os.Stderr, "failed to create herdr tab: %v\n", err)
 				os.Exit(1)
 			}
-			if err := herdr.AgentStartWithDecision(tabLabel, decision.Provider, tab.Pane.ID, launch.Request{Decision: decision, TaskRef: task.Ref}); err != nil {
+			if err := herdr.AgentStartWithDecision(tabLabel, decision.Provider, tab.Pane.ID, taskLaunchRequest(decision, task.Ref)); err != nil {
 				fmt.Fprintf(os.Stderr, "failed to start agent: %v\n", err)
 				os.Exit(1)
 			}
@@ -1246,7 +1257,7 @@ func runReview() {
 		standingName := fmt.Sprintf("forge-%s", lane.Name)
 		targetLabel := standingName
 
-		tabLabel, err := herdr.ResolveAgentTabWithDecision(standingName, launch.Request{Decision: decision, TaskRef: task.Ref}, 0)
+		tabLabel, err := herdr.ResolveAgentTabWithDecision(standingName, taskLaunchRequest(decision, task.Ref))
 		if err != nil {
 			if !errors.Is(err, herdr.ErrAgentNotFound) {
 				fmt.Fprintf(os.Stderr, "standing reviewer %s blocked: %v\n", standingName, err)
@@ -1258,7 +1269,7 @@ func runReview() {
 				fmt.Fprintf(os.Stderr, "failed to create herdr tab: %v\n", tabErr)
 				os.Exit(1)
 			}
-			if err := herdr.AgentStartWithDecision(tabLabel, decision.Provider, tab.Pane.ID, launch.Request{Decision: decision, TaskRef: task.Ref}); err != nil {
+			if err := herdr.AgentStartWithDecision(tabLabel, decision.Provider, tab.Pane.ID, taskLaunchRequest(decision, task.Ref)); err != nil {
 				fmt.Fprintf(os.Stderr, "failed to start agent: %v\n", err)
 				os.Exit(1)
 			}
@@ -2381,6 +2392,7 @@ func runForgeE() error {
 	fmt.Println("=== Forge: Pulse ===")
 	var forgeLane *config.LaneDef
 	var forgeDecision *router.LaunchDecision
+	var forgeLeaseGeneration int64
 	var task *provider.Task
 	if !herdr.IsAvailable() {
 		return errors.New("herdr CLI not found — refusing launch-required forge claim")
@@ -2397,8 +2409,15 @@ func runForgeE() error {
 	if err != nil {
 		return fmt.Errorf("launch route rejected before forge claim: %w", err)
 	}
-	if err := validateDecisionBeforeSideEffect(forgeDecision, "forge"); err != nil {
+	if err := validateDecisionBeforeSideEffect(forgeDecision, forgeLane.Name); err != nil {
 		return fmt.Errorf("launch decision rejected before forge claim: %w", err)
+	}
+	claimedRef, claimedGeneration := eng.LastClaimIdentity()
+	if task != nil {
+		if claimedRef != task.Ref || claimedGeneration == 0 {
+			return fmt.Errorf("forge launch identity unavailable for %s", task.Ref)
+		}
+		forgeLeaseGeneration = claimedGeneration
 	}
 
 	if err != nil {
@@ -2415,9 +2434,12 @@ func runForgeE() error {
 		if herdr.IsAvailable() {
 			lane := forgeLane
 			if lane != nil {
-				decision := forgeDecision
+				decision, bindErr := rebindDecisionForTask(forgeDecision, task.Ref, forgeLeaseGeneration)
+				if bindErr != nil {
+					return fmt.Errorf("forge launch decision rejected after claim: %w", bindErr)
+				}
 				standingName := fmt.Sprintf("forge-%s", lane.Name)
-				tabLabel, resolveErr := herdr.ResolveAgentTabWithDecision(standingName, launch.Request{Decision: decision, TaskRef: task.Ref}, 0)
+				tabLabel, resolveErr := herdr.ResolveAgentTabWithDecision(standingName, taskLaunchRequest(decision, task.Ref))
 				if resolveErr != nil {
 					if !errors.Is(resolveErr, herdr.ErrAgentNotFound) {
 						return fmt.Errorf("standing forge agent %s blocked: %w", standingName, resolveErr)
@@ -2425,7 +2447,7 @@ func runForgeE() error {
 					tabLabel = fmt.Sprintf("forge-%s-%s", lane.Name, task.Ref)
 					tab, tabErr := herdr.Tab(herdr.ResolveWorkspace("."), tabLabel, true)
 					if tabErr == nil {
-						if err := herdr.AgentStartWithDecision(tabLabel, decision.Provider, tab.Pane.ID, launch.Request{Decision: decision, TaskRef: task.Ref}); err != nil {
+						if err := herdr.AgentStartWithDecision(tabLabel, decision.Provider, tab.Pane.ID, taskLaunchRequest(decision, task.Ref)); err != nil {
 							return fmt.Errorf("launch failed: %w", err)
 						}
 					} else {
@@ -2530,7 +2552,11 @@ func laneLaunchDecision(ctx context.Context, lane *config.LaneDef, task *provide
 		return nil, fmt.Errorf("lane %q has no authoritative task_shape", lane.Name)
 	}
 	provider := lane.Provider
-	request := router.LaunchRequest{Role: role, Shape: shape, RequestedProvider: provider, RequestedModel: lane.Model, RequestedEffort: lane.Effort, Risk: classify.TierR1}
+	contextRef := lane.Name
+	if task != nil {
+		contextRef = task.Ref
+	}
+	request := router.LaunchRequest{Role: role, Shape: shape, RequestedProvider: provider, RequestedModel: lane.Model, RequestedEffort: lane.Effort, TaskRef: contextRef, Risk: classify.TierR1}
 	if role == router.RoleReviewer || role == router.RoleAssayer {
 		if task == nil {
 			return nil, fmt.Errorf("review launch requires candidate provenance")
@@ -2562,7 +2588,7 @@ func laneLaunchDecision(ctx context.Context, lane *config.LaneDef, task *provide
 	if decision.Provider != lane.Provider || decision.Model != lane.Model || decision.Effort != lane.Effort || decision.Shape != lane.TaskShape {
 		return nil, fmt.Errorf("lane %q routed decision drift: configured %s/%s/%s/%s, got %s/%s/%s/%s", lane.Name, lane.Provider, lane.Model, lane.Effort, lane.TaskShape, decision.Provider, decision.Model, decision.Effort, decision.Shape)
 	}
-	if err := validateDecisionBeforeSideEffect(decision, lane.Name); err != nil {
+	if err := validateDecisionBeforeSideEffect(decision, contextRef); err != nil {
 		return nil, err
 	}
 	return decision, nil
@@ -2594,7 +2620,25 @@ func validateDecisionBeforeSideEffect(decision *router.LaunchDecision, taskRef s
 	if decision == nil {
 		return fmt.Errorf("missing routed launch decision")
 	}
-	return launch.Validate(launch.Request{Decision: decision, TaskRef: taskRef}, nil)
+	return launch.Validate(launch.Request{Decision: decision, TaskRef: taskRef, LeaseGeneration: decision.LeaseGeneration}, nil)
+}
+
+func rebindDecisionForTask(decision *router.LaunchDecision, taskRef string, leaseGeneration int64) (*router.LaunchDecision, error) {
+	bound, err := router.RebindDecision(decision, taskRef, leaseGeneration)
+	if err != nil {
+		return nil, err
+	}
+	if err := validateDecisionBeforeSideEffect(bound, taskRef); err != nil {
+		return nil, err
+	}
+	return bound, nil
+}
+
+func taskLaunchRequest(decision *router.LaunchDecision, taskRef string) launch.Request {
+	if decision == nil {
+		return launch.Request{TaskRef: taskRef}
+	}
+	return launch.Request{Decision: decision, TaskRef: taskRef, LeaseGeneration: decision.LeaseGeneration}
 }
 
 // launchAdmission is the compiled pre-side-effect gate shared by launch-capable

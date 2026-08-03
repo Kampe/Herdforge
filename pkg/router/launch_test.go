@@ -603,3 +603,39 @@ func TestLaunchDecisionFieldsComplete(t *testing.T) {
 		t.Fatalf("risk not plumbed: %s", d.Risk)
 	}
 }
+
+func TestVerifyDecisionRequiresRouterIssuanceAndExactContext(t *testing.T) {
+	clearRouteEnv(t)
+	d, err := NewRouter(nil, nil).Decide(LaunchRequest{
+		Role: RoleWorker, Shape: "implementation", RequestedProvider: "codex",
+		RequestedModel: "gpt-5.6-luna", RequestedEffort: "medium", TaskRef: "FAC-A",
+		ProbeResults: map[string]bool{ProbeKey("codex", "gpt-5.6-luna"): true},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := VerifyDecision(d, "FAC-B", 0); err == nil {
+		t.Fatal("decision issued for FAC-A must fail closed for FAC-B")
+	}
+	if err := VerifyDecision(d, "FAC-A", 0); err != nil {
+		t.Fatalf("router-issued decision should verify for exact context: %v", err)
+	}
+	bound, err := RebindDecision(d, "FAC-B", 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := VerifyDecision(bound, "FAC-B", 7); err != nil {
+		t.Fatalf("rebound decision should verify: %v", err)
+	}
+	if err := VerifyDecision(bound, "FAC-A", 0); err == nil {
+		t.Fatal("rebound decision must not replay against original task")
+	}
+}
+
+func TestVerifyDecisionRejectsPublicCanonicalForgery(t *testing.T) {
+	forged := &LaunchDecision{Role: RoleWorker, Shape: "implementation", Provider: "codex", Model: "gpt-5.6-luna", Effort: "medium", Argv: ArgvFor("codex", "gpt-5.6-luna", "medium")}
+	forged.Proof = decisionProof(*forged)
+	if err := VerifyDecision(forged, "", 0); err == nil {
+		t.Fatal("recomputed public canonical proof must not establish router issuance")
+	}
+}

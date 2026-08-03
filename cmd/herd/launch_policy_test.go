@@ -39,7 +39,7 @@ func (r *fakeLaunchLifecycle) Run(decision *router.LaunchDecision, effect func(*
 func TestLaunchAdmissionRejectsBeforeCompiledLifecycleSeams(t *testing.T) {
 	cfg := &config.Config{Lanes: []config.LaneDef{{Name: "mutant", Role: "worker", AgentKind: "codex", Provider: "codex", Model: "gpt-5.6-sol", Effort: "medium", TaskShape: "implementation"}}}
 	rec := &fakeLaunchLifecycle{}
-	valid, err := router.NewRouter(nil, nil).Decide(router.LaunchRequest{Role: router.RoleWorker, Shape: launch.Implementation, RequestedProvider: launch.WorkerProvider, RequestedModel: launch.WorkerModel, RequestedEffort: launch.WorkerEffort, ProbeResults: map[string]bool{router.ProbeKey(launch.WorkerProvider, launch.WorkerModel): true}})
+	valid, err := router.NewRouter(nil, nil).Decide(router.LaunchRequest{Role: router.RoleWorker, Shape: launch.Implementation, RequestedProvider: launch.WorkerProvider, RequestedModel: launch.WorkerModel, RequestedEffort: launch.WorkerEffort, TaskRef: "worker", ProbeResults: map[string]bool{router.ProbeKey(launch.WorkerProvider, launch.WorkerModel): true}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -60,7 +60,7 @@ func TestLaunchAdmissionRejectsBeforeCompiledLifecycleSeams(t *testing.T) {
 func TestLaunchAdmissionPassesExactDecisionToLifecycle(t *testing.T) {
 	lane := config.LaneDef{Name: "worker", Role: "worker", AgentKind: "codex", Provider: "codex", Model: "gpt-5.6-luna", Effort: "medium", TaskShape: "implementation"}
 	cfg := &config.Config{Lanes: []config.LaneDef{lane}}
-	valid, err := router.NewRouter(nil, nil).Decide(router.LaunchRequest{Role: router.RoleWorker, Shape: launch.Implementation, RequestedProvider: launch.WorkerProvider, RequestedModel: launch.WorkerModel, RequestedEffort: launch.WorkerEffort, ProbeResults: map[string]bool{router.ProbeKey(launch.WorkerProvider, launch.WorkerModel): true}})
+	valid, err := router.NewRouter(nil, nil).Decide(router.LaunchRequest{Role: router.RoleWorker, Shape: launch.Implementation, RequestedProvider: launch.WorkerProvider, RequestedModel: launch.WorkerModel, RequestedEffort: launch.WorkerEffort, TaskRef: "worker", ProbeResults: map[string]bool{router.ProbeKey(launch.WorkerProvider, launch.WorkerModel): true}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -73,6 +73,37 @@ func TestLaunchAdmissionPassesExactDecisionToLifecycle(t *testing.T) {
 	})
 	if err != nil || got != valid || rec.decision != valid {
 		t.Fatalf("decision identity was not preserved: got=%p err=%v recorded=%p", got, err, rec.decision)
+	}
+}
+
+func TestTaskLaunchRequestCarriesExactReboundGeneration(t *testing.T) {
+	d, err := router.NewRouter(nil, nil).Decide(router.LaunchRequest{
+		Role: router.RoleWorker, Shape: launch.Implementation,
+		RequestedProvider: launch.WorkerProvider, RequestedModel: launch.WorkerModel,
+		RequestedEffort: launch.WorkerEffort, TaskRef: "FAC-B", LeaseGeneration: 7,
+		ProbeResults: map[string]bool{router.ProbeKey(launch.WorkerProvider, launch.WorkerModel): true},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := taskLaunchRequest(d, "FAC-B")
+	if req.LeaseGeneration != 7 {
+		t.Fatalf("task request generation = %d, want 7", req.LeaseGeneration)
+	}
+	if err := launch.Validate(req, nil); err != nil {
+		t.Fatalf("exact task request must validate: %v", err)
+	}
+	for name, mutate := range map[string]func(*launch.Request){
+		"zero":     func(r *launch.Request) { r.LeaseGeneration = 0 },
+		"mismatch": func(r *launch.Request) { r.LeaseGeneration = 6 },
+	} {
+		t.Run(name, func(t *testing.T) {
+			bad := req
+			mutate(&bad)
+			if err := launch.Validate(bad, nil); err == nil {
+				t.Fatal("zero or mismatched generation must fail before lifecycle seams")
+			}
+		})
 	}
 }
 
