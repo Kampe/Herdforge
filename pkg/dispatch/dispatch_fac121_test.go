@@ -2,6 +2,7 @@ package dispatch
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"github.com/Kampe/Herdforge/pkg/config"
+	"github.com/Kampe/Herdforge/pkg/deps"
 	"github.com/Kampe/Herdforge/pkg/herdr"
 	"github.com/Kampe/Herdforge/pkg/provider"
 	"github.com/Kampe/Herdforge/pkg/worktree"
@@ -572,8 +574,15 @@ func TestDispatch_CompensateErrorPropagates(t *testing.T) {
 	if !strings.Contains(err.Error(), "lease fenced") {
 		t.Fatalf("compensate error must surface: %v", err)
 	}
+	if !strings.Contains(err.Error(), "Recovering") && !strings.Contains(err.Error(), "retained lease") {
+		t.Fatalf("compensate failure must retain lease (Recovering): %v", err)
+	}
 	if !strings.Contains(err.Error(), "prompt") && !strings.Contains(err.Error(), "consumption") {
 		t.Fatalf("primary error must surface: %v", err)
+	}
+	// Durable compensate failed → must not have recorded a successful compensate.
+	if len(comp.compsCopy()) != 0 {
+		t.Fatalf("failed compensate must not append success reason: %v", comp.compsCopy())
 	}
 }
 
@@ -691,11 +700,15 @@ func TestDispatch_AgentStart_TabCloseErrorNotSilent(t *testing.T) {
 	if !strings.Contains(err.Error(), "tab close") || !strings.Contains(err.Error(), "denied") {
 		t.Fatalf("TabClose error must propagate: %v", err)
 	}
+	// Exactly-one durable compensate (launch no longer double-fires shared lifecycle).
+	if n := len(comp.compsCopy()); n != 1 {
+		t.Fatalf("want exact-one compensate, got %d: %v", n, comp.compsCopy())
+	}
 	if !hasCompensateReason(comp.compsCopy(), "agent_start_failed") {
 		t.Fatalf("expected agent_start_failed: %v", comp.compsCopy())
 	}
-	if !hasCompensateReason(comp.compsCopy(), "agent_start_failed_orphan_tab_close_failed") {
-		t.Fatalf("expected orphan_tab_close_failed durable signal: %v", comp.compsCopy())
+	if hasCompensateReason(comp.compsCopy(), "agent_start_failed_orphan_tab_close_failed") {
+		t.Fatalf("must not double-compensate orphan close: %v", comp.compsCopy())
 	}
 	if len(fh.closedTabs) != 1 {
 		t.Fatalf("TabClose must still be attempted: %v", fh.closedTabs)
@@ -768,11 +781,14 @@ func TestDispatch_PromptFailure_TabCloseErrorNotSilent(t *testing.T) {
 	if !strings.Contains(err.Error(), "tab close") || !strings.Contains(err.Error(), "socket dead") {
 		t.Fatalf("TabClose error must propagate: %v", err)
 	}
+	if n := len(comp.compsCopy()); n != 1 {
+		t.Fatalf("want exact-one compensate, got %d: %v", n, comp.compsCopy())
+	}
 	if !hasCompensateReason(comp.compsCopy(), "prompt_delivery_failed") {
 		t.Fatalf("expected prompt_delivery_failed: %v", comp.compsCopy())
 	}
-	if !hasCompensateReason(comp.compsCopy(), "prompt_delivery_failed_orphan_tab_close_failed") {
-		t.Fatalf("expected orphan close durable signal: %v", comp.compsCopy())
+	if hasCompensateReason(comp.compsCopy(), "prompt_delivery_failed_orphan_tab_close_failed") {
+		t.Fatalf("must not double-compensate orphan close: %v", comp.compsCopy())
 	}
 	if res != nil && res.Launched {
 		t.Fatal("must not launch")
@@ -840,20 +856,19 @@ func TestDispatch_LaunchPath_RejectsSharedRoot(t *testing.T) {
 	if !strings.Contains(err.Error(), "shared-root") && !strings.Contains(err.Error(), "repository root") {
 		t.Fatalf("expected shared-root denial, got: %v", err)
 	}
+	// launch returns intent only — does not mutate shared lifecycle compensator.
+	var lf *launchFailure
+	if !errors.As(err, &lf) || lf.Reason != "shared_root_denied" {
+		t.Fatalf("want launchFailure reason shared_root_denied, got %T %v", err, err)
+	}
+	if len(comp.compsCopy()) != 0 {
+		t.Fatalf("launch must not compensate shared lifecycle: %v", comp.compsCopy())
+	}
 	if fh.tabCwd != "" || fh.startCalls != 0 {
 		t.Fatalf("must not start agent on shared root: cwd=%q starts=%d", fh.tabCwd, fh.startCalls)
 	}
 	if result.Launched {
 		t.Fatal("must not set Launched")
-	}
-	found := false
-	for _, c := range comp.compsCopy() {
-		if strings.Contains(c, "shared_root_denied") {
-			found = true
-		}
-	}
-	if !found {
-		t.Fatalf("expected shared_root_denied compensate: %v", comp.compsCopy())
 	}
 }
 
@@ -918,4 +933,154 @@ func revParse(t *testing.T, dir, rev string) string {
 		t.Fatalf("rev-parse %s: %v (%s)", rev, err, out)
 	}
 	return strings.TrimSpace(string(out))
+}
+
+// TestDispatch_LaunchFailures_ExactlyOneCompensation covers every launch
+// failure branch: launch returns intent only; Dispatch.failOwned runs durable
+// compensate exactly once while the generation lease is held.
+func TestDispatch_LaunchFailures_ExactlyOneCompensation(t *testing.T) {
+	cases := []struct {
+		name   string
+		ref    string
+		fh     *fakeHerdr
+		reason string
+	}{
+		{
+			name: "agent_start",
+			ref:  "FAC-EO-1",
+			fh: &fakeHerdr{
+				available: true, workspace: "w1", model: "m", tabID: "t1",
+				startErr: fmt.Errorf("pane busy"),
+			},
+			reason: "agent_start_failed",
+		},
+		{
+			name: "prompt_delivery",
+			ref:  "FAC-EO-2",
+			fh: &fakeHerdr{
+				available: true, workspace: "w1", model: "m", tabID: "t2",
+				deliverErr: fmt.Errorf("no consumption"),
+			},
+			reason: "prompt_delivery_failed",
+		},
+		{
+			name: "workspace_unknown",
+			ref:  "FAC-EO-3",
+			fh: &fakeHerdr{
+				available: true, model: "m",
+				wsErr: fmt.Errorf("workspace unknown"),
+			},
+			reason: "workspace_unknown",
+		},
+		{
+			name: "no_healthy_model",
+			ref:  "FAC-EO-4",
+			fh: &fakeHerdr{
+				available: true, workspace: "w1", model: "", // ResolveHealthyModel empty
+			},
+			reason: "no_healthy_model",
+		},
+		{
+			name: "prompt_sequence",
+			ref:  "FAC-EO-5",
+			fh: &fakeHerdr{
+				available: true, workspace: "w1", model: "m", tabID: "t5",
+				deliverRec: &herdr.PromptReceipt{
+					Target: "x", BaselineStatus: "working", FinalStatus: "working",
+					Consumed: true, Verified: true, SequenceToken: "working->working",
+				},
+			},
+			reason: "prompt_sequence_invalid",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, wm := initDispatchRepo(t)
+			tp := &statusTrackingProvider{
+				mockTaskProvider: mockTaskProvider{tasks: []*provider.Task{baseTask(tc.ref)}},
+			}
+			comp := &recordingCompensator{}
+			cfg := testCfg()
+			if tc.name == "no_healthy_model" {
+				for i := range cfg.Lanes {
+					cfg.Lanes[i].Model = ""
+					cfg.Lanes[i].FallbackModels = nil
+				}
+			}
+			d := NewDispatcher(cfg, tp, wm)
+			d.Herdr = tc.fh
+			d.Compensator = comp
+			res, err := d.Dispatch(context.Background(), DispatchOptions{TicketRef: tc.ref})
+			if err == nil {
+				t.Fatal("expected launch failure")
+			}
+			if res != nil {
+				t.Cleanup(func() { os.RemoveAll(res.Worktree) })
+			}
+			comps := comp.compsCopy()
+			if len(comps) != 1 {
+				t.Fatalf("want exact-one compensate, got %d: %v", len(comps), comps)
+			}
+			if !hasCompensateReason(comps, tc.reason) {
+				t.Fatalf("want reason %s, got %v", tc.reason, comps)
+			}
+			if res != nil && res.Launched {
+				t.Fatal("must not report Launched")
+			}
+		})
+	}
+}
+
+// TestDispatch_CompensateFailure_RetainsGenerationLease proves durable
+// compensate failure keeps the generation lease so B cannot acquire and get
+// stomped by a subsequent stale release.
+func TestDispatch_CompensateFailure_RetainsGenerationLease(t *testing.T) {
+	repo, wm := initDispatchRepo(t)
+	leasePath := filepath.Join(repo, ".herd", "launch-retain.db")
+	ownA, err := deps.OpenLeaseOwnership(leasePath, "herd", "memory", "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ownA.Close() })
+
+	tp := &statusTrackingProvider{
+		mockTaskProvider: mockTaskProvider{tasks: []*provider.Task{baseTask("FAC-RET")}},
+	}
+	fh := &fakeHerdr{
+		available:  true,
+		workspace:  "w1",
+		model:      "m",
+		tabID:      "tab-ret",
+		deliverErr: fmt.Errorf("no flip"),
+	}
+	comp := &recordingCompensator{compErr: fmt.Errorf("outbox down")}
+	d := NewDispatcher(testCfg(), tp, wm)
+	d.Herdr = fh
+	d.Compensator = comp
+	d.Ownership = ownA
+
+	res, err := d.Dispatch(context.Background(), DispatchOptions{TicketRef: "FAC-RET"})
+	if err == nil {
+		t.Fatal("expected failure")
+	}
+	if res != nil {
+		t.Cleanup(func() { os.RemoveAll(res.Worktree) })
+	}
+	if !strings.Contains(err.Error(), "Recovering") && !strings.Contains(err.Error(), "retained lease") {
+		t.Fatalf("want retain/Recovering signal: %v", err)
+	}
+
+	// B must not acquire while A retained the generation after failed durable compensate.
+	ownB, err := deps.OpenLeaseOwnership(leasePath, "herd", "memory", "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ownB.Close() })
+	_, berr := ownB.ClaimExclusive(context.Background(), "id", "FAC-RET", "launch", "rev-x", "", "")
+	if berr == nil {
+		t.Fatal("B must not acquire while A retained lease after compensate failure")
+	}
+	if !errors.Is(berr, deps.ErrAlreadyClaimed) && !strings.Contains(berr.Error(), "already") {
+		t.Fatalf("want already claimed, got %v", berr)
+	}
 }

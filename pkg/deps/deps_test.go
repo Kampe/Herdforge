@@ -139,7 +139,7 @@ func TestLeaseOwnership_TwoIndependentManagers_ExactlyOneWinner(t *testing.T) {
 	}
 }
 
-func TestLeaseOwnership_CompensateRefusesStaleGeneration(t *testing.T) {
+func TestLeaseOwnership_ReleaseRefusesStaleGeneration(t *testing.T) {
 	db := filepath.Join(t.TempDir(), "launch.db")
 	a, err := OpenLeaseOwnership(db, "herd", "memory", "p")
 	if err != nil {
@@ -157,7 +157,7 @@ func TestLeaseOwnership_CompensateRefusesStaleGeneration(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Release A, re-claim with B so generation advances.
-	if err := a.CompensateIfOwner(context.Background(), tokA, "done"); err != nil {
+	if err := a.ReleaseIfOwner(context.Background(), tokA, "done"); err != nil {
 		t.Fatal(err)
 	}
 	tokB, err := b.ClaimExclusive(context.Background(), "id1", "FAC-1", "launch", "rev1", "", "")
@@ -165,12 +165,82 @@ func TestLeaseOwnership_CompensateRefusesStaleGeneration(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Stale token A must not release B's lease.
-	if err := a.CompensateIfOwner(context.Background(), tokA, "stale"); !errors.Is(err, ErrNotOwner) {
+	if err := a.ReleaseIfOwner(context.Background(), tokA, "stale"); !errors.Is(err, ErrNotOwner) {
 		t.Fatalf("want ErrNotOwner for stale gen, got %v", err)
 	}
 	owns, err := b.StillOwns(context.Background(), tokB)
 	if err != nil || !owns {
 		t.Fatalf("B should still own: owns=%v err=%v", owns, err)
+	}
+}
+
+// TestLeaseOwnership_ReleaseBeforeAcquireInterleaving proves the BAD order
+// (release then B acquires) leaves A unable to release/stomp B — and the
+// CORRECT order keeps A owner through durable work until explicit release.
+func TestLeaseOwnership_ReleaseBeforeAcquireInterleaving(t *testing.T) {
+	db := filepath.Join(t.TempDir(), "launch.db")
+	a, err := OpenLeaseOwnership(db, "herd", "memory", "p")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	b, err := OpenLeaseOwnership(db, "herd", "memory", "p")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+
+	tokA, err := a.ClaimExclusive(context.Background(), "id1", "FAC-1", "launch", "rev1", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// --- BAD window simulation: release first (what failOwned used to do) ---
+	if err := a.ReleaseIfOwner(context.Background(), tokA, "early_release"); err != nil {
+		t.Fatal(err)
+	}
+	tokB, err := b.ClaimExclusive(context.Background(), "id1", "FAC-1", "launch", "rev1", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Stale A must not be able to drop B's generation.
+	if err := a.ReleaseIfOwner(context.Background(), tokA, "stale_after_B"); !errors.Is(err, ErrNotOwner) {
+		t.Fatalf("stale A release must be ErrNotOwner, got %v", err)
+	}
+	ownsB, err := b.StillOwns(context.Background(), tokB)
+	if err != nil || !ownsB {
+		t.Fatalf("B must still own after stale A: owns=%v err=%v", ownsB, err)
+	}
+	if err := b.ReleaseIfOwner(context.Background(), tokB, "cleanup"); err != nil {
+		t.Fatal(err)
+	}
+
+	// --- CORRECT order: hold through "durable", then release, then B acquires ---
+	tokA2, err := a.ClaimExclusive(context.Background(), "id1", "FAC-1", "launch", "rev2", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// While A still owns, B cannot acquire.
+	if _, err := b.ClaimExclusive(context.Background(), "id1", "FAC-1", "launch", "rev2", "", ""); !errors.Is(err, ErrAlreadyClaimed) {
+		t.Fatalf("B must conflict while A holds: %v", err)
+	}
+	owns, err := a.StillOwns(context.Background(), tokA2)
+	if err != nil || !owns {
+		t.Fatalf("A must own through durable window: owns=%v err=%v", owns, err)
+	}
+	// Durable compensate would run here (caller-owned); only then release.
+	if err := a.ReleaseIfOwner(context.Background(), tokA2, "after_durable"); err != nil {
+		t.Fatal(err)
+	}
+	tokB2, err := b.ClaimExclusive(context.Background(), "id1", "FAC-1", "launch", "rev2", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.ReleaseIfOwner(context.Background(), tokA2, "stale"); !errors.Is(err, ErrNotOwner) {
+		t.Fatalf("A after release must not touch B: %v", err)
+	}
+	if owns, _ := b.StillOwns(context.Background(), tokB2); !owns {
+		t.Fatal("B must own after correct-order handoff")
 	}
 }
 

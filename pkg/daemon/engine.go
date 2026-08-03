@@ -267,6 +267,8 @@ func (e *Engine) RunPulse(ctx context.Context, role string) (*provider.Task, err
 			return e.claimTaskBound(cctx, task.ID, role)
 		},
 		func(cctx context.Context, taskID deps.TaskID, reason string) error {
+			// Board reverse while still owner; release only after board OK.
+			// On board failure retain lease (Recovering) — never release-first.
 			owns, err := own.StillOwns(cctx, tok)
 			if err != nil {
 				return err
@@ -274,22 +276,24 @@ func (e *Engine) RunPulse(ctx context.Context, role string) (*provider.Task, err
 			if !owns {
 				return fmt.Errorf("%w: refuse board compensate (%s)", deps.ErrNotOwner, reason)
 			}
-			var boardErr error
 			if e.TaskProv != nil {
-				boardErr = e.TaskProv.UpdateStatus(cctx, string(taskID), provider.StatusToDo)
+				if boardErr := e.TaskProv.UpdateStatus(cctx, string(taskID), provider.StatusToDo); boardErr != nil {
+					return fmt.Errorf("board compensate retained lease (Recovering): %w", boardErr)
+				}
 			}
-			leaseErr := own.CompensateIfOwner(cctx, tok, reason)
-			if leaseErr != nil && errors.Is(leaseErr, deps.ErrNotOwner) {
-				leaseErr = nil
+			if rErr := own.ReleaseIfOwner(cctx, tok, reason); rErr != nil && !errors.Is(rErr, deps.ErrNotOwner) {
+				return rErr
 			}
-			return errors.Join(boardErr, leaseErr)
+			return nil
 		},
 	)
 	if gerr != nil {
-		// If FencedClaim failed before/without compensate (e.g. claimFn error),
-		// release lease only while we still own it.
-		if cErr := own.CompensateIfOwner(ctx, tok, "pulse_claim_failed"); cErr != nil && !errors.Is(cErr, deps.ErrNotOwner) {
-			gerr = errors.Join(gerr, cErr)
+		// Post-claim path already tried board+release via compensateFn.
+		// claimFn-only failures: release while still owner (no board flip yet).
+		if owns, _ := own.StillOwns(ctx, tok); owns {
+			if cErr := own.ReleaseIfOwner(ctx, tok, "pulse_claim_failed"); cErr != nil && !errors.Is(cErr, deps.ErrNotOwner) {
+				gerr = errors.Join(gerr, cErr)
+			}
 		}
 		return nil, fmt.Errorf("pulse claim blocked (dependency fence): %w", gerr)
 	}
