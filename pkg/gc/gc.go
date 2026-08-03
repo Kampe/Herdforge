@@ -62,3 +62,22 @@ func (g *GCManager) ScanOverlap(ctx context.Context, minTips int) (*OverlapRepor
 func (g *GCManager) PruneStaleWorktrees(ctx context.Context) (int, error) {
 	return g.WM.PruneMergedWorktrees(ctx, "main")
 }
+
+// PressureReclamationPlan compiles the exact safe-GC proof required before
+// ANY pressure-driven reclamation (FAC-153). It is strictly read-only
+// (dry-run, AutoReap=false — nothing is removed here): every eligible
+// target carries its content-merged classification, salvage ref, and
+// integration base, while dirty, unique-committed, unknown, protected, and
+// root worktrees appear only under Refused with the preservation reason.
+//
+// This is the sole sanctioned bridge from disk pressure to reclamation:
+// feed the Eligible paths as exact TargetPaths into the FAC-117 Reap
+// contract. Ad-hoc `git worktree remove --force` sweeps under pressure
+// (the 2026-08-03 incident: 35 forced removals with no per-target
+// dirty/unique check) are forbidden.
+func (g *GCManager) PressureReclamationPlan(ctx context.Context, defaultBranch string) (*worktree.ReapReport, error) {
+	if defaultBranch == "" {
+		defaultBranch = "main"
+	}
+	return g.WM.PlanReap(ctx, worktree.ReapPolicy{DefaultBranch: defaultBranch})
+}
