@@ -192,7 +192,8 @@ func TestSnapshotGraph_FenceReuse_NoSecondProjectFanout(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Post-selection check: still one project fan-out; +incident ListRelations only.
+	// Post-selection check: still one project fan-out; closure re-read only
+	// (launch + transitive prereqs — here FAC-n and FAC-1), not O(board).
 	relBefore := p.listRelCalls.Load()
 	_, err = RequireTaskLaunch(ctx, store, EntryDispatch, headRef, des, g1.GraphRevision)
 	if err != nil {
@@ -201,9 +202,13 @@ func TestSnapshotGraph_FenceReuse_NoSecondProjectFanout(t *testing.T) {
 	if p.bulkCalls.Load() != 1 {
 		t.Fatalf("post check must not re-run ListProjectRelations, got %d", p.bulkCalls.Load())
 	}
-	// AssertIncidentEdgesFresh → exactly one ListRelations on the target.
-	if p.listRelCalls.Load()-relBefore != 1 {
-		t.Fatalf("want 1 incident ListRelations on post check, got delta %d", p.listRelCalls.Load()-relBefore)
+	// Closure = {FAC-n, FAC-1} → 2 ListRelations (not 166).
+	delta := p.listRelCalls.Load() - relBefore
+	if delta < 1 || delta > 4 {
+		t.Fatalf("want small closure re-read (≈2), got delta %d", delta)
+	}
+	if delta >= int64(n/2) {
+		t.Fatalf("closure refresh must not re-read half the board, delta=%d n=%d", delta, n)
 	}
 }
 
@@ -225,7 +230,7 @@ func TestSnapshotGraph_CancelStopsBulkFanout(t *testing.T) {
 }
 
 // TestSnapshotGraph_IncidentTOCTOU_WithoutFullRefanout: mutating edges on the
-// launch target is caught by O(1) incident refresh without ListProjectRelations×2.
+// launch target is caught by closure refresh without ListProjectRelations×2.
 func TestSnapshotGraph_IncidentTOCTOU_WithoutFullRefanout(t *testing.T) {
 	p := newDelayedBoard(20, 0, 0, true)
 	store := NewProviderStore(p, "proj")
@@ -257,6 +262,87 @@ func TestSnapshotGraph_IncidentTOCTOU_WithoutFullRefanout(t *testing.T) {
 	if p.bulkCalls.Load() != bulkAfterPre {
 		t.Fatalf("post TOCTOU must not re-run project fan-out, bulk %d→%d", bulkAfterPre, p.bulkCalls.Load())
 	}
+}
+
+// TestPrerequisiteClosure_IndirectEdgeChange_CompensatesOnce: A→B→T chain;
+// after fence, mutate A→B (indirect prereq). Launch-task-only incident check
+// would miss this; closure refresh must TOCTOU and FencedClaim compensates
+// exactly once.
+func TestPrerequisiteClosure_IndirectEdgeChange_CompensatesOnce(t *testing.T) {
+	mp := provider.NewMemoryProvider()
+	// A (done) blocks B (done) blocks T (to-do).
+	for _, tk := range []*provider.Task{
+		{ID: "id-A", Ref: "FAC-A", Status: "done", ProjectID: "proj", Priority: provider.PriorityHigh,
+			Description: "```herd-deps-v1\n{\"version\":1,\"task_ref\":\"FAC-A\",\"task_id\":\"id-A\",\"edges\":[]}\n```\n"},
+		{ID: "id-B", Ref: "FAC-B", Status: "done", ProjectID: "proj", Priority: provider.PriorityHigh,
+			Description: "```herd-deps-v1\n{\"version\":1,\"task_ref\":\"FAC-B\",\"task_id\":\"id-B\",\"edges\":[]}\n```\n"},
+		{ID: "id-T", Ref: "FAC-T", Status: "to-do", ProjectID: "proj", Priority: provider.PriorityUrgent,
+			Description: "```herd-deps-v1\n{\"version\":1,\"task_ref\":\"FAC-T\",\"task_id\":\"id-T\",\"edges\":[{\"source_ref\":\"FAC-B\",\"target_ref\":\"FAC-T\",\"type\":\"blocks\"}]}\n```\n"},
+	} {
+		mp.AddTask(tk)
+	}
+	if _, err := mp.CreateRelation(context.Background(), "id-A", "id-B", provider.RelationBlocks); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mp.CreateRelation(context.Background(), "id-B", "id-T", provider.RelationBlocks); err != nil {
+		t.Fatal(err)
+	}
+
+	store := NewProviderStore(mp, "proj")
+	ctx, _ := WithSnapshotFence(context.Background())
+	des, err := ExtractProvenanceFromText(
+		"```herd-deps-v1\n{\"version\":1,\"task_ref\":\"FAC-T\",\"task_id\":\"id-T\",\"edges\":[{\"source_ref\":\"FAC-B\",\"target_ref\":\"FAC-T\",\"type\":\"blocks\"}]}\n```\n",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := des.BindAndValidate("FAC-T", "id-T"); err != nil {
+		t.Fatal(err)
+	}
+
+	pre, err := RequireTaskLaunch(ctx, store, EntryClaim, "FAC-T", des, "")
+	if err != nil {
+		t.Fatalf("pre-claim must pass: %v", err)
+	}
+
+	// Capture relation A→B for deletion (indirect edge).
+	snap, _ := store.SnapshotGraph(ctx)
+	var relAB string
+	for _, e := range snap.Edges {
+		if e.SourceID == "id-A" && e.TargetID == "id-B" {
+			relAB = e.RelationID
+			break
+		}
+	}
+	if relAB == "" {
+		t.Fatal("expected A→B edge in snapshot")
+	}
+
+	var comps int
+	_, err = FencedClaim(ctx, store, "FAC-T", "id-T", des, pre.GraphRevision,
+		func(context.Context) error {
+			// Concurrent mutation on indirect prerequisite edge during claim.
+			if err := mp.DeleteRelation(context.Background(), relAB, "id-A", "id-B"); err != nil {
+				return err
+			}
+			return nil
+		},
+		func(context.Context, TaskID, string) error {
+			comps++
+			return nil
+		},
+	)
+	if err == nil {
+		t.Fatal("expected post-claim TOCTOU after indirect prereq edge change")
+	}
+	if !errors.Is(err, ErrPostClaimDrift) {
+		t.Fatalf("want ErrPostClaimDrift, got %v", err)
+	}
+	if comps != 1 {
+		t.Fatalf("want exactly-one compensation, got %d", comps)
+	}
+	// Must not have re-run full project ListProjectRelations (Memory path: bulkCalls).
+	// ProviderStore uses Memory ListProjectRelations — fence still holds first snap.
 }
 
 // TestSnapshotGraph_NonBulkSequentialIsDetectablySlow is a mutation control:

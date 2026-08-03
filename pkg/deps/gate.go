@@ -114,8 +114,10 @@ func ValidateLaunch(
 	}
 
 	// Authoritative full project closure for cycle detection + revision.
-	// Fence reuses the first snapshot; post-side-effect checks do NOT re-fanout
-	// the whole board (AssertIncidentEdgesFresh is O(1) on the target).
+	// Cold SnapshotGraph is honest O(board) concurrent HTTP under list deadline
+	// (Kaneo exposes only per-task relation GETs). Fence reuses that snapshot;
+	// post-selection TOCTOU re-reads the prerequisite closure only (fixed-point
+	// expand), not unrelated board components.
 	snap, err := store.SnapshotGraph(ctx)
 	if err != nil {
 		return nil, &BlockedError{
@@ -130,10 +132,10 @@ func ValidateLaunch(
 		}
 	}
 
-	// Post-selection TOCTOU on the launch target: one ListRelations, not N.
+	// Post-selection TOCTOU: re-validate entire prerequisite closure under budget.
 	if selectionRevision != "" {
 		if ps, ok := store.(*ProviderStore); ok {
-			if ferr := ps.AssertIncidentEdgesFresh(ctx, taskRef, taskID, snap); ferr != nil {
+			if ferr := ps.AssertPrerequisiteClosureFresh(ctx, taskRef, taskID, snap); ferr != nil {
 				return nil, &BlockedError{
 					Ref: taskRef, Code: "toctou",
 					Reason: ferr.Error(),
