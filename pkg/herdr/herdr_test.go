@@ -121,6 +121,99 @@ func TestResumeUsesDurableClientIdentityNotHerdrMetadata(t *testing.T) {
 	}
 }
 
+func TestResumeRejectsStoredCoordinatorTierDecisionWithoutPrompt(t *testing.T) {
+	receiptPath := t.TempDir() + "/receipts.jsonl"
+	t.Setenv("HERD_LAUNCH_RECEIPTS", receiptPath)
+	d, err := router.NewRouter(nil, nil).Decide(router.LaunchRequest{Role: router.RoleWorker, Shape: launch.Implementation, RequestedProvider: launch.WorkerProvider, RequestedModel: launch.WorkerModel, RequestedEffort: launch.WorkerEffort, ProbeResults: map[string]bool{router.ProbeKey(launch.WorkerProvider, launch.WorkerModel): true}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	forbidden := &router.LaunchDecision{Role: router.RoleWorker, Shape: launch.Implementation, Provider: launch.WorkerProvider, Model: "gpt-5.6-sol", Effort: "ultra", Argv: []string{"codex", "--model", "gpt-5.6-sol", "-c", "model_reasoning_effort=ultra", "-a", "never"}}
+	historical := launch.Receipt{TaskRef: "FAC-175", Role: launch.WorkerRole, TaskShape: launch.Implementation, Provider: launch.WorkerProvider, Model: forbidden.Model, Effort: forbidden.Effort, DecisionDigest: launch.DecisionDigest(forbidden), Argv: forbidden.Argv, Accepted: true, Name: "stored-worker", PaneID: "pane-1", LeaseGeneration: 7}
+	if err := (&launch.JSONLSink{Path: receiptPath}).Write(historical); err != nil {
+		t.Fatal(err)
+	}
+	old := runHerdr
+	defer func() { runHerdr = old }()
+	var calls [][]string
+	runHerdr = func(args ...string) (string, error) {
+		calls = append(calls, append([]string(nil), args...))
+		return `{"result":{"agents":[{"name":"stored-worker","pane_id":"pane-1","tab_id":"tab-1"}]}}`, nil
+	}
+	_, err = ResolveAgentTabWithDecision("stored-worker", launch.Request{Decision: d, TaskRef: "FAC-175", Name: "stored-worker", PaneID: "pane-1", LeaseGeneration: 7}, 7)
+	if !errors.Is(err, ErrAgentIdentityMismatch) {
+		t.Fatalf("stored Sol/Ultra session must be blocked by durable identity mismatch, got %v", err)
+	}
+	if len(calls) != 1 || calls[0][0] != "agent" || calls[0][1] != "list" {
+		t.Fatalf("blocked resume must only inspect the live agent: %v", calls)
+	}
+}
+
+func TestResumePreservesMalformedCurrentDecisionError(t *testing.T) {
+	t.Setenv("HERD_LAUNCH_RECEIPTS", t.TempDir()+"/receipts.jsonl")
+	d, err := router.NewRouter(nil, nil).Decide(router.LaunchRequest{Role: router.RoleWorker, Shape: launch.Implementation, RequestedProvider: launch.WorkerProvider, RequestedModel: launch.WorkerModel, RequestedEffort: launch.WorkerEffort, ProbeResults: map[string]bool{router.ProbeKey(launch.WorkerProvider, launch.WorkerModel): true}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	d.Model = "gpt-5.6-sol"
+	old := runHerdr
+	defer func() { runHerdr = old }()
+	var calls int
+	runHerdr = func(args ...string) (string, error) {
+		calls++
+		return `{}`, nil
+	}
+	_, err = ResolveAgentTabWithDecision("stored-worker", launch.Request{Decision: d, TaskRef: "FAC-175", Name: "stored-worker", PaneID: "pane-1"}, 0)
+	if err == nil || errors.Is(err, ErrAgentIdentityMismatch) {
+		t.Fatalf("malformed current decision must preserve validation error: %v", err)
+	}
+	if calls != 0 {
+		t.Fatalf("malformed current decision must not inspect a live agent: %d calls", calls)
+	}
+}
+
+func TestResumeRejectsMissingAndStaleReceiptsWithoutProcessOrPrompt(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		populate func(string) error
+	}{
+		{name: "missing", populate: func(string) error { return nil }},
+		{name: "lease-mismatch", populate: func(path string) error {
+			d, err := router.NewRouter(nil, nil).Decide(router.LaunchRequest{Role: router.RoleWorker, Shape: launch.Implementation, RequestedProvider: launch.WorkerProvider, RequestedModel: launch.WorkerModel, RequestedEffort: launch.WorkerEffort, ProbeResults: map[string]bool{router.ProbeKey(launch.WorkerProvider, launch.WorkerModel): true}})
+			if err != nil {
+				return err
+			}
+			return (&launch.JSONLSink{Path: path}).Write(launch.Receipt{TaskRef: "FAC-175", Role: launch.WorkerRole, TaskShape: launch.Implementation, Provider: launch.WorkerProvider, Model: launch.WorkerModel, Effort: launch.WorkerEffort, DecisionDigest: launch.DecisionDigest(d), Argv: d.Argv, Accepted: true, Name: "stored-worker", PaneID: "pane-1", LeaseGeneration: 6})
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := t.TempDir() + "/receipts.jsonl"
+			t.Setenv("HERD_LAUNCH_RECEIPTS", path)
+			if err := tc.populate(path); err != nil {
+				t.Fatal(err)
+			}
+			d, err := router.NewRouter(nil, nil).Decide(router.LaunchRequest{Role: router.RoleWorker, Shape: launch.Implementation, RequestedProvider: launch.WorkerProvider, RequestedModel: launch.WorkerModel, RequestedEffort: launch.WorkerEffort, ProbeResults: map[string]bool{router.ProbeKey(launch.WorkerProvider, launch.WorkerModel): true}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			old := runHerdr
+			defer func() { runHerdr = old }()
+			var calls [][]string
+			runHerdr = func(args ...string) (string, error) {
+				calls = append(calls, append([]string(nil), args...))
+				return `{"result":{"agents":[{"name":"stored-worker","pane_id":"pane-1","tab_id":"tab-1"}]}}`, nil
+			}
+			_, err = ResolveAgentTabWithDecision("stored-worker", launch.Request{Decision: d, TaskRef: "FAC-175", Name: "stored-worker", PaneID: "pane-1", LeaseGeneration: 7}, 7)
+			if !errors.Is(err, ErrAgentIdentityMismatch) {
+				t.Fatalf("%s receipt must be blocked, got %v", tc.name, err)
+			}
+			if len(calls) != 1 || calls[0][0] != "agent" || calls[0][1] != "list" {
+				t.Fatalf("%s resume must not start or prompt: %v", tc.name, calls)
+			}
+		})
+	}
+}
+
 func TestReceiptFailureClosesAndVerifiesExactTab(t *testing.T) {
 	t.Setenv("HERD_LAUNCH_RECEIPTS", "/dev/null/launch-receipts.jsonl")
 	d, err := router.NewRouter(nil, nil).Decide(router.LaunchRequest{Role: router.RoleWorker, Shape: launch.Implementation, RequestedProvider: launch.WorkerProvider, RequestedModel: launch.WorkerModel, RequestedEffort: launch.WorkerEffort, ProbeResults: map[string]bool{router.ProbeKey(launch.WorkerProvider, launch.WorkerModel): true}})

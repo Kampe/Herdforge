@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"testing"
 
@@ -17,12 +18,13 @@ func TestWorkerConfigDriftRejectsBeforeLaunch(t *testing.T) {
 	}
 }
 
-type launchAdmissionRecorder struct{ providerList, claim, status, comment, worktree, tab, process, prompt int }
+type fakeLaunchLifecycle struct {
+	providerList, claim, status, comment, worktree, tab, process, prompt int
+	decision                                                             *router.LaunchDecision
+}
 
-func (r *launchAdmissionRecorder) all(decision *router.LaunchDecision) error {
-	if decision == nil {
-		return errors.New("missing decision")
-	}
+func (r *fakeLaunchLifecycle) Run(decision *router.LaunchDecision, effect func(*router.LaunchDecision) error) error {
+	r.decision = decision
 	r.providerList++
 	r.claim++
 	r.status++
@@ -31,25 +33,78 @@ func (r *launchAdmissionRecorder) all(decision *router.LaunchDecision) error {
 	r.tab++
 	r.process++
 	r.prompt++
-	return nil
+	return effect(decision)
 }
 
 func TestLaunchAdmissionRejectsBeforeCompiledLifecycleSeams(t *testing.T) {
 	cfg := &config.Config{Lanes: []config.LaneDef{{Name: "mutant", Role: "worker", AgentKind: "codex", Provider: "codex", Model: "gpt-5.6-sol", Effort: "medium", TaskShape: "implementation"}}}
-	rec := &launchAdmissionRecorder{}
+	rec := &fakeLaunchLifecycle{}
 	valid, err := router.NewRouter(nil, nil).Decide(router.LaunchRequest{Role: router.RoleWorker, Shape: launch.Implementation, RequestedProvider: launch.WorkerProvider, RequestedModel: launch.WorkerModel, RequestedEffort: launch.WorkerEffort, ProbeResults: map[string]bool{router.ProbeKey(launch.WorkerProvider, launch.WorkerModel): true}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	decision, err := launchAdmission(cfg, "worker", true, func(*config.LaneDef) (*router.LaunchDecision, error) { return valid, nil })
+	_, err = launchAdmissionWithLifecycle(rec, cfg, "worker", true, func(*config.LaneDef) (*router.LaunchDecision, error) { return valid, nil }, func(admitted *router.LaunchDecision) error {
+		if admitted != valid {
+			t.Fatalf("lifecycle received a different decision: got %p want %p", admitted, valid)
+		}
+		return nil
+	})
+	if *rec != (fakeLaunchLifecycle{}) {
+		t.Fatalf("rejected launch invoked lifecycle seams: counters/decision=%+v", rec)
+	}
 	if !errors.Is(err, ErrWorkerConfigPolicy) {
 		t.Fatalf("config must reject before lifecycle seams: %v", err)
 	}
-	if err == nil {
-		_ = rec.all(decision)
+}
+
+func TestLaunchAdmissionPassesExactDecisionToLifecycle(t *testing.T) {
+	lane := config.LaneDef{Name: "worker", Role: "worker", AgentKind: "codex", Provider: "codex", Model: "gpt-5.6-luna", Effort: "medium", TaskShape: "implementation"}
+	cfg := &config.Config{Lanes: []config.LaneDef{lane}}
+	valid, err := router.NewRouter(nil, nil).Decide(router.LaunchRequest{Role: router.RoleWorker, Shape: launch.Implementation, RequestedProvider: launch.WorkerProvider, RequestedModel: launch.WorkerModel, RequestedEffort: launch.WorkerEffort, ProbeResults: map[string]bool{router.ProbeKey(launch.WorkerProvider, launch.WorkerModel): true}})
+	if err != nil {
+		t.Fatal(err)
 	}
-	if *rec != (launchAdmissionRecorder{}) {
-		t.Fatalf("rejected launch invoked lifecycle seams: %+v", rec)
+	rec := &fakeLaunchLifecycle{}
+	got, err := launchAdmissionWithLifecycle(rec, cfg, lane.Role, true, func(*config.LaneDef) (*router.LaunchDecision, error) { return valid, nil }, func(admitted *router.LaunchDecision) error {
+		if admitted != valid || admitted.Proof != valid.Proof {
+			t.Fatalf("lifecycle did not receive exact admitted decision")
+		}
+		return nil
+	})
+	if err != nil || got != valid || rec.decision != valid {
+		t.Fatalf("decision identity was not preserved: got=%p err=%v recorded=%p", got, err, rec.decision)
+	}
+}
+
+func TestPrepareStandingWorktreePropagatesFailure(t *testing.T) {
+	lane := &config.LaneDef{Name: "standing", Worktree: "missing-standing-worktree"}
+	want := errors.New("worktree add failed")
+	err := prepareStandingWorktreeWith(lane, func(string, string) error { return want })
+	if !errors.Is(err, want) {
+		t.Fatalf("worktree failure must block lifecycle continuation: got %v", err)
+	}
+}
+
+func TestStandingEntryPointReturnsPolicyFailureBeforeHerdr(t *testing.T) {
+	cfg := &config.Config{Lanes: []config.LaneDef{{Name: "bad-standing", Role: "worker", Standing: true, AgentKind: "codex", Provider: "codex", Model: "gpt-5.6-sol", Effort: "medium", TaskShape: "implementation"}}}
+	err := runStandingConfig(cfg, true)
+	if !errors.Is(err, ErrWorkerConfigPolicy) {
+		t.Fatalf("standing entrypoint must return worker policy failure: %v", err)
+	}
+}
+
+func TestForgeEntryPointReturnsPolicyFailureBeforeClaim(t *testing.T) {
+	cfg := &config.Config{Lanes: []config.LaneDef{{Name: "bad-forge", Role: "worker", AgentKind: "codex", Provider: "codex", Model: "gpt-5.6-sol", Effort: "medium", TaskShape: "implementation"}}}
+	claimed := false
+	_, err := forgeLaunchAdmission(cfg, &cfg.Lanes[0], context.Background(), func(*router.LaunchDecision) error {
+		claimed = true
+		return nil
+	})
+	if claimed {
+		t.Fatal("forbidden forge route reached claim effect")
+	}
+	if !errors.Is(err, ErrWorkerConfigPolicy) {
+		t.Fatalf("forge entrypoint must return worker policy failure: %v", err)
 	}
 }
 

@@ -98,7 +98,7 @@
       "model_pin": "claude-opus-5",
       "effort_floor": "high",
       "cost_tier": "premium",
-      "reason": "board-ranking leverage and control-plane edits (scout-planner, herd-smith): operator 2026-07-21 pins these to native Claude on the otherwise mostly-idle Opus pool, with a high effort floor so a bounded shape does not undercut the judgment depth. The claude pin is dropped under HERD_NO_CLAUDE so a spent pool cannot strand the lane. cost_tier is an ENFORCED CEILING (CHA-894), not a description of the pick: a lane whose waterfall choice exceeds it is demoted to the best in-tier model for its provider, and where a model_pin or a model_floor_class forbids that, it escalates with an explicit cost_ceiling reason recorded in the resolved payload. Silent escalation is impossible."
+      "reason": "board-ranking leverage and control-plane edits are reserved for the configured scout-planner control lane. Worker and forge-smith implementation lanes are explicitly Codex gpt-5.6-luna at medium effort under FAC-175."
     },
     "fixture-critical": {
       "model_floor_class": "sonnet",
