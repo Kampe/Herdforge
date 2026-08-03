@@ -78,6 +78,26 @@ func TestProductionObserverUnavailableAuthorityBlocks(t *testing.T) {
 	}
 }
 
+func TestProductionObserverUnavailableAgentInventoryBlocksGlobally(t *testing.T) {
+	r := fixtureReader{
+		tabs:   present([]TabRecord{}),
+		agents: Authority[[]AgentEntry]{State: EvidenceUnknown, Detail: "agent inventory was not read"},
+	}
+	o := &ProductionReconciliationObserver{Workspace: "wF", Reader: r}
+	path := t.TempDir() + "/reconciliation.jsonl"
+	o.Record = (&JSONLRecorder{Path: path}).Record
+	if err := o.ObserveReconciliation(context.Background()); err == nil {
+		t.Fatal("unavailable agent inventory must block globally")
+	}
+	decisions := o.Decisions()
+	if len(decisions) != 1 || decisions[0].Class != TabBlocked || decisions[0].Evidence[0] != "BLOCKED: agents: agent inventory was not read" {
+		t.Fatalf("global blocked decision=%+v", decisions)
+	}
+	if data, err := os.ReadFile(path); err != nil || len(data) == 0 {
+		t.Fatalf("missing durable global blocked evidence: err=%v bytes=%d", err, len(data))
+	}
+}
+
 func TestProductionObserverDuplicateAgentAttachmentBlocks(t *testing.T) {
 	r := fixtureReader{
 		tabs:    present([]TabRecord{{TabID: "wF:t1", WorkspaceID: "wF"}}),

@@ -88,6 +88,9 @@ func (SocketAuthorityReader) Protection(context.Context, TabBinding) Authority[P
 func (o *ProductionReconciliationObserver) ObserveReconciliation(ctx context.Context) error {
 	recordBlocked := func(reason string) error {
 		d := TabDecision{TabID: "__reconciliation__", Class: TabBlocked, Evidence: []string{"BLOCKED: " + reason}}
+		if o != nil {
+			o.Last = ReconciliationResult{Decisions: []TabDecision{d}}
+		}
 		if o != nil && o.Record != nil {
 			if err := o.Record(ctx, []TabDecision{d}); err != nil {
 				return fmt.Errorf("reconciliation record: %w", err)
@@ -109,16 +112,17 @@ func (o *ProductionReconciliationObserver) ObserveReconciliation(ctx context.Con
 	if err != nil {
 		return recordBlocked("agents: " + err.Error())
 	}
+	if agents.State != EvidencePresent {
+		return recordBlocked("agents: " + agents.Detail)
+	}
 	byTab := map[string]AgentEntry{}
 	duplicateTabs := map[string]bool{}
-	if agents.State == EvidencePresent {
-		for _, agent := range agents.Value {
-			if agent.TabID != "" {
-				if _, exists := byTab[agent.TabID]; exists {
-					duplicateTabs[agent.TabID] = true
-				}
-				byTab[agent.TabID] = agent
+	for _, agent := range agents.Value {
+		if agent.TabID != "" {
+			if _, exists := byTab[agent.TabID]; exists {
+				duplicateTabs[agent.TabID] = true
 			}
+			byTab[agent.TabID] = agent
 		}
 	}
 	decisions := make([]TabDecision, 0)
@@ -135,10 +139,7 @@ func (o *ProductionReconciliationObserver) ObserveReconciliation(ctx context.Con
 		agent, found := byTab[tab.TabID]
 		ag := Authority[AgentTruth]{State: EvidenceAbsent}
 		if found {
-			ag = Authority[AgentTruth]{State: EvidencePresent, Value: AgentTruth{Present: true, Status: agent.Status, PaneID: agent.PaneID}}
-		}
-		if agents.State != EvidencePresent {
-			ag = Authority[AgentTruth]{State: agents.State, Detail: agents.Detail}
+			ag = Authority[AgentTruth]{State: EvidencePresent, Value: AgentTruth{Status: agent.Status, PaneID: agent.PaneID}}
 		}
 		taskRef := binding.TaskRef
 		a := AuthoritySnapshot{Agent: ag, Board: o.Reader.Board(ctx, taskRef), Lifecycle: o.Reader.Lifecycle(ctx, taskRef),
@@ -197,5 +198,5 @@ func (r *JSONLRecorder) Record(_ context.Context, decisions []TabDecision) error
 			return err
 		}
 	}
-	return nil
+	return f.Sync()
 }

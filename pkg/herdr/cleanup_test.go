@@ -75,6 +75,19 @@ func TestUnknownStatusAndRecoveryPreserve(t *testing.T) {
 	}
 }
 
+func TestPresentIdleOrUnknownAgentCannotBecomeSafeOrphan(t *testing.T) {
+	for _, status := range []string{"idle", "unknown", ""} {
+		t.Run(status, func(t *testing.T) {
+			o := boundFixture("to-do")
+			o.Authorities.Agent = present(AgentTruth{Status: status})
+			d := ReconcileTabs([]TabObservation{o})[0]
+			if d.Class != TabBlocked || d.CloseEligible {
+				t.Fatalf("present agent status %q was closable: %+v", status, d)
+			}
+		})
+	}
+}
+
 func TestWorktreeAndForegroundProcessUnknownsPreserve(t *testing.T) {
 	o := boundFixture("to-do")
 	o.Authorities.Worktree.Value.Known = false
@@ -85,6 +98,12 @@ func TestWorktreeAndForegroundProcessUnknownsPreserve(t *testing.T) {
 	o.Authorities.Process = present(ProcessTruth{Alive: true})
 	if d := ReconcileTabs([]TabObservation{o})[0]; d.Class != TabBlocked {
 		t.Fatalf("unowned process=%+v", d)
+	}
+	o = boundFixture("to-do")
+	o.Authorities.Agent = present(AgentTruth{Status: "working"})
+	o.Authorities.Process = present(ProcessTruth{Alive: true})
+	if d := ReconcileTabs([]TabObservation{o})[0]; d.Class != TabBlocked {
+		t.Fatalf("sessionless process=%+v", d)
 	}
 }
 
@@ -108,7 +127,7 @@ func TestDirtyUniqueReviewAndActiveSessionBlock(t *testing.T) {
 		{"unique", func(o *TabObservation) { o.Authorities.Worktree.Value.UniqueCommits = true }},
 		{"review", func(o *TabObservation) { o.Authorities.Review.Value.Pending = true }},
 		{"active", func(o *TabObservation) {
-			o.Authorities.Agent = Authority[AgentTruth]{State: EvidencePresent, Value: AgentTruth{Present: true, Status: "working", SessionID: "s1", SessionGeneration: "g1", PaneID: "wF:p1"}}
+			o.Authorities.Agent = Authority[AgentTruth]{State: EvidencePresent, Value: AgentTruth{Status: "working", SessionID: "s1", SessionGeneration: "g1", PaneID: "wF:p1"}}
 			o.Authorities.Process = Authority[ProcessTruth]{State: EvidencePresent, Value: ProcessTruth{Alive: true}}
 		}},
 	}
@@ -237,5 +256,12 @@ func TestTabCloseCASUsesMainFAC180Adapter(t *testing.T) {
 	var blocked *CloseUnavailableError
 	if !errors.As(err, &blocked) {
 		t.Fatalf("want typed unavailable error, got %T %v", err, err)
+	}
+}
+
+func TestFleetProjectionFailsClosedOnUnknown(t *testing.T) {
+	p := ProjectFleetStatus([]TabDecision{{Class: TabBlocked}}, 4)
+	if p.Unknown != 1 || p.Capacity != 0 {
+		t.Fatalf("unknown fleet was treated as available: %+v", p)
 	}
 }
