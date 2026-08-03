@@ -738,3 +738,159 @@ func TestClaimManager_CompleteProviderTransition_ReleaseBlockedDuringInFlightCAS
 		t.Fatalf("expected release to succeed once the lock clears, got %v", err)
 	}
 }
+
+// TestClaimManager_ExpireStale_BlockedDuringInFlightCAS reproduces the
+// follow-up race the review found: the provider-transition lock only
+// gated Release and Acquire's reclaim-eviction step, not the standalone
+// ExpireStale sweep -- so a lease genuinely past its TTL, but mid an
+// in-flight ProviderCAS call, could be expired by ExpireStale and then
+// reclaimed at a new generation by a concurrent Acquire while the old
+// CompleteProviderTransition was still running. The independent
+// deterministic probe: acquire the provider lock, advance time past TTL
+// while CAS is paused, invoke ExpireStale, claim the replacement
+// generation 2, then resume CAS -- outcome expired=1
+// replacement_generation=2 complete_err=<nil> provider_calls=1
+// mutated=true.
+//
+// completeProviderTransitionTestHook fires with the lock already held,
+// immediately before ProviderCAS -- exactly that window. This test
+// reproduces the probe's steps precisely: advances the fake clock past
+// TTL, calls ExpireStale (must transition nothing), then attempts a
+// reclaim via Claim with a different owner (must be rejected, not
+// silently handed generation 2). Only once the hook returns and
+// CompleteProviderTransition's deferred ReleaseProviderLock actually
+// runs does the lease become expirable/reclaimable again -- proving the
+// lock, not luck, is what kept it pinned during the call, and that this
+// is deliberate crash-recovery-bounded exclusion (see the staleness
+// assertion below), not a permanent hole.
+func TestClaimManager_ExpireStale_BlockedDuringInFlightCAS(t *testing.T) {
+	store := newTestStore(t)
+	outbox := newTestOutbox(t)
+	provider := newFakeProviderCAS()
+	provider.seed("FAC-45", "to-do", 1)
+	clk := newClock(time.Now())
+	mgr := NewClaimManager(store, WithProviderCAS(provider), WithDurableOutbox(outbox), WithClock(clk.now), WithTTL(time.Minute))
+	ctx := context.Background()
+	key := testKey("FAC-45")
+
+	lease, err := mgr.Claim(ctx, ClaimRequest{Key: key, OwnerID: "w1", Role: "herd-smith", TaskRole: "herd-smith"})
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	if _, err := mgr.BeginProviderTransition(ctx, key, "w1", lease.Generation, "provider_mutation"); err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+
+	var expired []*Lease
+	var expireErr error
+	var reclaimErr error
+	completeProviderTransitionTestHook = func() {
+		clk.advance(2 * time.Minute) // now well past the 1-minute TTL
+
+		expired, expireErr = mgr.ExpireStale(ctx)
+
+		_, reclaimErr = mgr.Claim(ctx, ClaimRequest{Key: key, OwnerID: "w2", Role: "herd-smith", TaskRole: "herd-smith"})
+	}
+	t.Cleanup(func() { completeProviderTransitionTestHook = nil })
+
+	rec, err := mgr.CompleteProviderTransition(ctx, key, "w1", lease.Generation, "FAC-45", "1", func(ctx context.Context) error {
+		provider.setStatus("FAC-45", "claimed")
+		return nil
+	})
+
+	if expireErr != nil {
+		t.Fatalf("expire stale (called from inside the hook): %v", expireErr)
+	}
+	if len(expired) != 0 {
+		t.Fatalf("expected ExpireStale to transition nothing while the provider lock is held, got %d: %+v", len(expired), expired)
+	}
+	var conflict *ClaimConflictError
+	if !errors.As(reclaimErr, &conflict) {
+		t.Fatalf("expected the reclaim attempt to be rejected with a ClaimConflictError while locked, got %v", reclaimErr)
+	}
+
+	if err != nil {
+		t.Fatalf("expected CompleteProviderTransition to succeed (it legitimately still owns generation %d throughout), got %v", lease.Generation, err)
+	}
+	if rec.Status != OutboxApplied {
+		t.Fatalf("expected applied, got %s", rec.Status)
+	}
+	if calls := provider.callCount(); calls != 1 {
+		t.Fatalf("expected exactly 1 correct ProviderCAS call, got %d", calls)
+	}
+	if status := provider.statusOf("FAC-45"); status != "claimed" {
+		t.Fatalf("expected the legitimate mutation to have applied, got %q", status)
+	}
+
+	// The original generation is still what's on record -- no reclaim
+	// snuck through while the lock was held. Checked directly against the
+	// store rather than via ClaimManager.ActiveClaims, since the clock
+	// has been advanced past TTL and ActiveClaims deliberately excludes
+	// unswept-but-expired leases regardless of the lock; status='active'
+	// here is exactly the fact this test cares about.
+	current, err := store.currentActive(ctx, key)
+	if err != nil {
+		t.Fatalf("current active: %v", err)
+	}
+	if current == nil || current.Generation != lease.Generation || current.OwnerID != "w1" {
+		t.Fatalf("expected the original generation %d still active on record, got %+v", lease.Generation, current)
+	}
+
+	// Now that the lock has cleared (CompleteProviderTransition returned),
+	// the genuinely-past-TTL lease is expirable and reclaimable again --
+	// this is bounded exclusion for the live call's duration, not a
+	// permanent block.
+	stillExpired, err := mgr.ExpireStale(ctx)
+	if err != nil {
+		t.Fatalf("expire stale after lock release: %v", err)
+	}
+	if len(stillExpired) != 1 || stillExpired[0].Generation != lease.Generation {
+		t.Fatalf("expected the lease to finally expire once the lock cleared, got %+v", stillExpired)
+	}
+}
+
+// TestSQLiteLeaseStore_ExpireStale_HonorsProviderLockStaleness proves the
+// review's explicit "do not reintroduce a five-minute live-call hole"
+// requirement is satisfied deliberately, not accidentally: a
+// provider-transition lock that has itself gone stale (its holder
+// crashed mid-call and never released it) must NOT block ExpireStale
+// forever -- it self-heals exactly like a stale capacity-release or
+// outbox claim does elsewhere in this package.
+func TestSQLiteLeaseStore_ExpireStale_HonorsProviderLockStaleness(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	key := testKey("FAC-46")
+	claimAt := time.Now()
+
+	lease, err := store.Acquire(ctx, key, "w1", "herd-smith", "/wt", claimAt, time.Minute)
+	if err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	// Simulate a settler that acquired the provider lock and then crashed
+	// mid-call, never releasing it.
+	if _, err := store.AcquireProviderLock(ctx, key, "w1", lease.Generation, "crashed-settler", time.Minute, claimAt); err != nil {
+		t.Fatalf("acquire provider lock: %v", err)
+	}
+
+	// Well past the lease's own TTL, but the crashed lock is still fresh
+	// (under providerLockStaleAfter): ExpireStale must NOT expire it.
+	tooSoon := claimAt.Add(2 * time.Minute)
+	notYetExpired, err := store.ExpireStale(ctx, tooSoon)
+	if err != nil {
+		t.Fatalf("expire stale (lock still fresh): %v", err)
+	}
+	if len(notYetExpired) != 0 {
+		t.Fatalf("expected the fresh (non-stale) crashed lock to still block expiry, got %+v", notYetExpired)
+	}
+
+	// Well past BOTH the TTL and providerLockStaleAfter: the crashed
+	// lock must now be treated as abandoned, and expiry proceeds.
+	longAfter := claimAt.Add(providerLockStaleAfter + time.Minute)
+	nowExpired, err := store.ExpireStale(ctx, longAfter)
+	if err != nil {
+		t.Fatalf("expire stale (lock stale): %v", err)
+	}
+	if len(nowExpired) != 1 || nowExpired[0].Generation != lease.Generation {
+		t.Fatalf("expected the lease to expire once the crashed lock itself went stale, got %+v", nowExpired)
+	}
+}
