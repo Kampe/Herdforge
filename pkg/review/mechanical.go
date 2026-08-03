@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"go/ast"
 	"go/parser"
+	"go/scanner"
 	"go/token"
 	"path"
 	"path/filepath"
@@ -249,6 +250,35 @@ func hasSmuggledProductionCodeAST(added []string) (smuggled, parsed bool) {
 	return false, true
 }
 
+// parenDelta returns the net change in parenthesis depth in s, counting
+// only real '(' / ')' tokens as go/scanner sees them — string, rune, and
+// comment content is opaque to it, so a ')' inside "safe = \")\"" or a //
+// comment can't be mistaken for a real one. The scanner tokenizes leniently
+// (no error handler), so unterminated fragments (a diff hunk cut mid-line)
+// don't panic; they just stop yielding tokens at EOF.
+func parenDelta(s string) int {
+	if strings.TrimSpace(s) == "" {
+		return 0
+	}
+	fset := token.NewFileSet()
+	file := fset.AddFile("", fset.Base(), len(s))
+	var sc scanner.Scanner
+	sc.Init(file, []byte(s), nil, 0)
+	delta := 0
+	for {
+		_, tok, _ := sc.Scan()
+		if tok == token.EOF {
+			return delta
+		}
+		switch tok {
+		case token.LPAREN:
+			delta++
+		case token.RPAREN:
+			delta--
+		}
+	}
+}
+
 // hasSmuggledProductionCodeHeuristic is the line-oriented fallback used
 // when added doesn't parse as a standalone Go file (the common case for a
 // partial diff hunk). It catches the same declaration forms on a
@@ -301,17 +331,13 @@ func hasSmuggledProductionCodeHeuristic(added []string) bool {
 		// are both handled the same way as a spread-out multi-line block.
 		// Parens inside the content (func signatures, call expressions)
 		// nest and unwind within the same scan, so they wash out net-zero.
+		// parenDelta only counts real '(' / ')' tokens — a ')' inside a
+		// string/rune literal or a comment can't masquerade as one and
+		// prematurely close the block, hiding whatever comes after it.
 		if strings.TrimSpace(content) != "" {
 			blockLines = append(blockLines, content)
 		}
-		for _, r := range content {
-			switch r {
-			case '(':
-				depth++
-			case ')':
-				depth--
-			}
-		}
+		depth += parenDelta(content)
 		if depth <= 0 {
 			depth = 0
 			if flushBlock() {

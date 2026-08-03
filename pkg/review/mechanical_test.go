@@ -159,6 +159,41 @@ func TestClassifyFile_IncompleteCompactGroupedVarSmuggledInTestPath(t *testing.T
 	}
 }
 
+func TestClassifyFile_GroupedVarStringParenCannotHideLaterSmuggling(t *testing.T) {
+	fc := FileChange{
+		Path: "pkg/review/sneaky_test.go",
+		Added: []string{
+			"var (",
+			`safe = ")"`,
+			"grantAdmin = func() {",
+		},
+	}
+	got := ClassifyFile(fc, DefaultMechanicalPolicy())
+	if got != CategoryAmbiguous {
+		t.Errorf("a ')' inside a string literal must not prematurely close the block and hide later smuggled code, got %s", got)
+	}
+}
+
+func TestParenDelta_IgnoresStringAndComment(t *testing.T) {
+	tests := []struct {
+		in   string
+		want int
+	}{
+		{`safe = ")"`, 0},
+		{"x() // trailing ) in a comment", 0},
+		{"grantAdmin = func() {", 0},
+		{"grantAdmin func() =", 0},
+		{"(", 1},
+		{")", -1},
+		{"", 0},
+	}
+	for _, tt := range tests {
+		if got := parenDelta(tt.in); got != tt.want {
+			t.Errorf("parenDelta(%q) = %d, want %d", tt.in, got, tt.want)
+		}
+	}
+}
+
 func TestClassifyFile_MethodDeclarationSmuggledInTestPath(t *testing.T) {
 	fc := FileChange{
 		Path:  "pkg/review/sneaky_test.go",
