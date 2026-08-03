@@ -29,6 +29,8 @@ func runHostCreds() {
 		os.Exit(runHostCredsLive(os.Args[3:]))
 	case "boundary":
 		os.Exit(runHostCredsBoundary(os.Args[3:]))
+	case "worker-probe":
+		os.Exit(runHostCredsWorkerProbe(os.Args[3:]))
 	case "-h", "--help", "help":
 		printHostCredsUsage()
 		os.Exit(0)
@@ -47,13 +49,36 @@ Usage:
   herd hostcreds session   --kind <grok|claude|codex>
   herd hostcreds selftest
   herd hostcreds boundary          # reports FAC-169 dependency status
-  herd hostcreds live --kind <grok|claude|codex> [--marker S]
+  herd hostcreds live --kind <grok|claude|codex>
+  herd hostcreds worker-probe --proxy URL --allow-host H --deny-host D --session S --nonce N --out FILE
 
-Production secrets: HERD_HOSTCREDS_HANDLES (keychain:|op:// only)
-OS isolation: FAC-169 (hard blocker) — FAC-170 does not reimplement it.
-Live admission waits for FAC-169 merge + RequireOSBoundary wiring.
+Production secrets: HERD_HOSTCREDS_HANDLES (or FAC-169 IPC after merge)
+OS isolation: FAC-169 (hard blocker). Live waits for FAC-169 + RequireOSBoundary.
 
 Exit: 0 ok, 1 fatal, 2 BLOCKED/usage. Never prints credential bytes. No OpenCode.`)
+}
+
+func runHostCredsWorkerProbe(args []string) int {
+	fs := flag.NewFlagSet("hostcreds worker-probe", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	proxy := fs.String("proxy", "", "HTTP proxy URL")
+	allow := fs.String("allow-host", "", "allowlisted host for CONNECT")
+	deny := fs.String("deny-host", "evil.example.invalid", "forbidden host")
+	session := fs.String("session", "", "session id")
+	nonce := fs.String("nonce", "", "capability nonce")
+	out := fs.String("out", "", "result JSON path")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if *proxy == "" || *allow == "" || *out == "" {
+		fmt.Fprintln(os.Stderr, "worker-probe: --proxy --allow-host --out required")
+		return 2
+	}
+	if err := security.RunWorkerProbeInProcess(*proxy, *allow, *deny, *session, *nonce, *out); err != nil {
+		fmt.Fprintln(os.Stderr, err.Error())
+		return 1
+	}
+	return 0
 }
 
 func runHostCredsBoundary(args []string) int {

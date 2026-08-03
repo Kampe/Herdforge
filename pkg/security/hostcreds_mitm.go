@@ -15,6 +15,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -508,21 +509,41 @@ func (c *mitmCA) leafFor(host string) (*tls.Certificate, error) {
 	return leaf, nil
 }
 
-// localPeerPID: TCP has no portable peer PID. Always 0 → authorizePeer fails closed
-// when allowlist is non-empty. Component tests register the test process and use
-// a test dialer hook that bypasses peer check only via AllowPID of current PID
-// combined with TestBypassPeerCheck — NOT used in production.
-//
-// Production must not set TestBypassPeerCheck.
-var TestBypassPeerCheck bool // tests only
+// localPeerPID is implemented in hostcreds_peer_*.go (production TCP port→PID).
 
-func localPeerPID(c net.Conn) int {
-	if TestBypassPeerCheck {
-		// Attribute to current process for unit tests of request path only.
-		return os.Getpid()
+// findHerdOrBuild returns a herd binary for worker-probe subprocesses.
+func findHerdOrBuild(tmpDir string) (string, error) {
+	if p, err := exec.LookPath("herd"); err == nil {
+		return p, nil
 	}
-	_ = c
-	return 0
+	// Build from module (tests run from package dir).
+	bin := filepath.Join(tmpDir, "herd-probe")
+	cmd := exec.Command("go", "build", "-o", bin, "github.com/Kampe/Herdforge/cmd/herd")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		// try relative from repo
+		cmd = exec.Command("go", "build", "-o", bin, "./cmd/herd")
+		cmd.Dir = findModuleRoot()
+		if out2, err2 := cmd.CombinedOutput(); err2 != nil {
+			return "", fmt.Errorf("build herd: %v %s / %v %s", err, out, err2, out2)
+		}
+	}
+	return bin, nil
+}
+
+func findModuleRoot() string {
+	wd, _ := os.Getwd()
+	dir := wd
+	for i := 0; i < 8; i++ {
+		if _, err := os.Stat(filepath.Join(dir, "go.mod")); err == nil {
+			return dir
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			break
+		}
+		dir = parent
+	}
+	return wd
 }
 
 func secureMkdirCA(dir string) error {
@@ -593,57 +614,76 @@ func HarnessProxyEnv(mitm *TLSMitmProxy, sessionID string) []string {
 	}
 }
 
-// ProveMITMExactHost: CONNECT to denied host must 403.
-// Requires AllowPID(current) + TestBypassPeerCheck for unit use.
+// ProveMITMExactHost: CONNECT to denied host must 403 from a real child PID
+// (production peer binding — no test bypass).
 func ProveMITMExactHost(mitm *TLSMitmProxy, deniedHost string) error {
 	if mitm == nil {
 		return fmt.Errorf("nil mitm")
 	}
-	prev := TestBypassPeerCheck
-	TestBypassPeerCheck = true
-	defer func() { TestBypassPeerCheck = prev }()
-	mitm.AllowPID(os.Getpid())
-
-	c, err := net.DialTimeout("tcp", mitm.Addr(), 2*time.Second)
-	if err != nil {
-		return err
-	}
-	defer c.Close()
-	_, _ = fmt.Fprintf(c, "CONNECT %s:443 HTTP/1.1\r\nHost: %s:443\r\n\r\n", deniedHost, deniedHost)
-	line, err := bufio.NewReader(c).ReadString('\n')
-	if err != nil {
-		return err
-	}
-	if !strings.Contains(line, "403") {
-		return fmt.Errorf("want 403 got %q", strings.TrimSpace(line))
-	}
-	return nil
+	// Child dials CONNECT; parent registers child PID.
+	return proveCONNECTFromChild(mitm, deniedHost, true)
 }
 
-// ProveMITMRequiresAllowPID: without AllowPID, CONNECT fail-closed.
+// ProveMITMRequiresAllowPID: without AllowPID, CONNECT fail-closed (child dial).
 func ProveMITMRequiresAllowPID(mitm *TLSMitmProxy, host string) error {
 	if mitm == nil {
 		return fmt.Errorf("nil")
 	}
-	prev := TestBypassPeerCheck
-	TestBypassPeerCheck = false
-	defer func() { TestBypassPeerCheck = prev }()
-	// Clear allowlist
 	mitm.mu.Lock()
 	mitm.allowed = map[int]bool{}
 	mitm.mu.Unlock()
-	c, err := net.DialTimeout("tcp", mitm.Addr(), 2*time.Second)
+	// Child CONNECT without AllowPID — must 403.
+	return proveCONNECTFromChild(mitm, host, false)
+}
+
+// proveCONNECTFromChild runs CONNECT in a subprocess so peer PID ≠ parent.
+// If registerChild, AllowPID is set after Start (race window minimized by small sleep).
+func proveCONNECTFromChild(mitm *TLSMitmProxy, host string, registerChild bool) error {
+	// Use shell one-liner via herd worker-probe deny-only path when available.
+	// Fallback: go helper process via /bin/sh + nc is flaky; use worker-probe binary.
+	dir, err := os.MkdirTemp("", "hc-conn-*")
 	if err != nil {
 		return err
 	}
-	defer c.Close()
-	_, _ = fmt.Fprintf(c, "CONNECT %s:443 HTTP/1.1\r\nHost: %s:443\r\n\r\n", host, host)
-	line, err := bufio.NewReader(c).ReadString('\n')
+	defer os.RemoveAll(dir)
+	outPath := filepath.Join(dir, "out.json")
+	exe, err := findHerdOrBuild(dir)
 	if err != nil {
 		return err
 	}
-	if !strings.Contains(line, "403") {
-		return fmt.Errorf("want 403 without allow pid, got %q", strings.TrimSpace(line))
+	cmd := exec.Command(exe, "hostcreds", "worker-probe",
+		"--proxy", mitm.ProxyURL(),
+		"--allow-host", "api.x.ai",
+		"--deny-host", host,
+		"--session", mitm.session,
+		"--nonce", "00",
+		"--out", outPath,
+	)
+	cmd.Env = append(os.Environ(), HarnessProxyEnv(mitm, mitm.session)...)
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+	if registerChild && cmd.Process != nil {
+		// Small delay so child exists; then allow. Child may retry? Probe is one-shot.
+		// Register immediately after Start.
+		mitm.AllowPID(cmd.Process.Pid)
+	}
+	_, err = WaitWorkerProbe(cmd, outPath, 12*time.Second)
+	if !registerChild {
+		// Expect deny CONNECT 403 for host (also used as deny-host).
+		raw, _ := os.ReadFile(outPath)
+		if !strings.Contains(string(raw), "403") {
+			return fmt.Errorf("want 403 without allow, got %s err=%v", raw, err)
+		}
+		return nil
+	}
+	// For denied host as deny-host, result.DenyCONNECT should be 403.
+	raw, rerr := os.ReadFile(outPath)
+	if rerr != nil {
+		return rerr
+	}
+	if !strings.Contains(string(raw), "403") {
+		return fmt.Errorf("want 403 for denied host, got %s", raw)
 	}
 	return nil
 }
