@@ -97,8 +97,12 @@ var generatedMarkerRe = regexp.MustCompile(`(?i)code generated.*do not edit`)
 // function, a method with a receiver, or a function-valued variable —
 // the ways Go allows code to run from package scope outside an existing
 // function body. Group 1 holds a func/method name; group 2 holds a
-// function-valued var name.
-var executableDeclRe = regexp.MustCompile(`^func\s+(?:\([^)]*\)\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*\(|^var\s+([A-Za-z_][A-Za-z0-9_]*)(?:\s+[A-Za-z_][A-Za-z0-9_.\[\]*]*)?\s*=\s*func\s*\(`)
+// function-valued var name. The var alternative's optional type segment is
+// `[^=]+?` (any type expression, not just a bare identifier) so an
+// explicitly-typed declaration like `var grantAdmin func() = func() {...}`
+// still matches — Go type syntax (func(), []T, map[K]V, generics) is too
+// varied to enumerate.
+var executableDeclRe = regexp.MustCompile(`^func\s+(?:\([^)]*\)\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*\(|^var\s+([A-Za-z_][A-Za-z0-9_]*)(?:\s+[^=]+?)?\s*=\s*func\s*\(`)
 
 // testFuncPrefixRe matches Go's recognized test-harness function prefixes.
 var testFuncPrefixRe = regexp.MustCompile(`^(Test|Benchmark|Example|Fuzz)`)
