@@ -2,6 +2,7 @@ package worktree
 
 import (
 	"context"
+	"encoding/hex"
 	"fmt"
 	"path/filepath"
 	"sort"
@@ -785,10 +786,11 @@ func (w *WorktreeManager) classifyOne(
 
 // SalvageRefFor returns the durable salvage ref for a branch name.
 func SalvageRefFor(branch string) string {
-	// Valid Git refnames are already portable path components. Preserve their
-	// exact spelling: lowercasing would alias herd/FAC-1 and herd/fac-1.
+	// Encode the original ref bytes, rather than preserving case in a ref path:
+	// macOS case-insensitive storage would still alias herd/FAC-1 and herd/fac-1.
+	// Full hex encoding is injective, portable, and avoids short-hash collisions.
 	b := strings.TrimPrefix(branch, "refs/heads/")
-	return SalvageRefPrefix + b
+	return SalvageRefPrefix + "v1/" + hex.EncodeToString([]byte(b))
 }
 
 func (w *WorktreeManager) resolveIntegrationBase(ctx context.Context, defaultBranch string) (string, error) {
