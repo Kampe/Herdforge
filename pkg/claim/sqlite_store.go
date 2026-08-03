@@ -213,11 +213,21 @@ var expireStaleTestHook func(candidate *Lease)
 // INSERTs itself, so exactly one succeeds regardless of how many
 // processes (real OS processes, not just goroutines) race this call.
 func (s *SQLiteLeaseStore) Acquire(ctx context.Context, key LeaseKey, ownerID, role, worktreePath string, now time.Time, ttl time.Duration) (*Lease, error) {
+	// Deliberately NOT a staleness carve-out on provider_lock_owner here
+	// (see ForceReleaseProviderLock's doc comment): whether it's safe to
+	// preempt a stale provider lock by time alone depends on whether a
+	// ProviderCAS/fencing scheme is even in play, which only
+	// ClaimManager knows. The store unconditionally refuses to evict a
+	// locked row; ClaimManager.Claim durably advances the provider fence
+	// (or, with no provider configured, force-clears the lock directly --
+	// safe, since there's nothing external to protect) BEFORE calling
+	// Acquire, so by the time this runs, a preemptable lock has already
+	// been cleared and this condition just sees provider_lock_owner = ''.
 	if _, err := execWithRetry(ctx, s.db, `UPDATE leases SET status = 'expired'
 		WHERE repo = ? AND provider = ? AND project = ? AND task_ref = ?
 		AND status = 'active' AND held = 0 AND expires_at <= ?
-		AND (provider_lock_owner = '' OR provider_lock_at <= ?)`,
-		key.Repo, key.Provider, key.Project, key.TaskRef, now, now.Add(-providerLockStaleAfter)); err != nil {
+		AND provider_lock_owner = ''`,
+		key.Repo, key.Provider, key.Project, key.TaskRef, now); err != nil {
 		return nil, fmt.Errorf("acquire: expire stale: %w", err)
 	}
 
@@ -309,11 +319,15 @@ func (s *SQLiteLeaseStore) renewFailureError(ctx context.Context, key LeaseKey, 
 // ClaimManager.settlePendingCapacity), not by this boolean, so a retry
 // after a capacity-coordinator failure still finds the row pending.
 func (s *SQLiteLeaseStore) Release(ctx context.Context, key LeaseKey, ownerID string, generation int64, now time.Time) (*Lease, bool, error) {
+	// See Acquire's comment: no staleness carve-out here either. Release
+	// is unconditionally blocked while ANY provider lock is held, live or
+	// stale; ClaimManager.Release durably preempts a stale one (fence
+	// advance, then ForceReleaseProviderLock) before calling this.
 	res, err := execWithRetry(ctx, s.db, `UPDATE leases SET status = 'released', released_at = ?
 		WHERE repo = ? AND provider = ? AND project = ? AND task_ref = ?
 		AND owner_id = ? AND generation = ? AND status = 'active'
-		AND (provider_lock_owner = '' OR provider_lock_at <= ?)`,
-		now, key.Repo, key.Provider, key.Project, key.TaskRef, ownerID, generation, now.Add(-providerLockStaleAfter))
+		AND provider_lock_owner = ''`,
+		now, key.Repo, key.Provider, key.Project, key.TaskRef, ownerID, generation)
 	if err != nil {
 		return nil, false, fmt.Errorf("release: %w", err)
 	}
@@ -391,6 +405,62 @@ func (s *SQLiteLeaseStore) ReleaseProviderLock(ctx context.Context, key LeaseKey
 	return nil
 }
 
+// PeekStaleProviderLock implements LeaseStore.
+func (s *SQLiteLeaseStore) PeekStaleProviderLock(ctx context.Context, key LeaseKey, now time.Time) (*Lease, error) {
+	staleBefore := now.Add(-providerLockStaleAfter)
+	row := s.db.QueryRowContext(ctx, `SELECT `+leaseColumns+` FROM leases
+		WHERE repo = ? AND provider = ? AND project = ? AND task_ref = ?
+		AND status = 'active' AND provider_lock_owner != '' AND provider_lock_at <= ?`,
+		key.Repo, key.Provider, key.Project, key.TaskRef, staleBefore)
+	l, err := scanLease(row)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	return l, err
+}
+
+// PeekAllStaleProviderLocks implements LeaseStore: the ExpireStale-scale
+// (all keys) counterpart to PeekStaleProviderLock, for
+// ClaimManager.ExpireStale's global sweep to durably preempt every
+// stale-locked lease before delegating to the store's own (now
+// lock-oblivious-to-staleness) ExpireStale.
+func (s *SQLiteLeaseStore) PeekAllStaleProviderLocks(ctx context.Context, now time.Time) ([]*Lease, error) {
+	staleBefore := now.Add(-providerLockStaleAfter)
+	rows, err := s.db.QueryContext(ctx, `SELECT `+leaseColumns+` FROM leases
+		WHERE status = 'active' AND provider_lock_owner != '' AND provider_lock_at <= ?
+		ORDER BY id ASC`, staleBefore)
+	if err != nil {
+		return nil, fmt.Errorf("peek all stale provider locks: %w", err)
+	}
+	defer rows.Close()
+
+	var leases []*Lease
+	for rows.Next() {
+		l, err := scanLease(rows)
+		if err != nil {
+			return nil, fmt.Errorf("peek all stale provider locks: scan: %w", err)
+		}
+		leases = append(leases, l)
+	}
+	return leases, rows.Err()
+}
+
+// ForceReleaseProviderLock implements LeaseStore: unlike
+// ReleaseProviderLock, this clears the lock unconditionally, without
+// requiring the caller to be the current lock owner. Reserved for
+// ClaimManager's orchestration layer, and only ever called immediately
+// after a durably-confirmed provider fence advance for the lease's next
+// generation -- never as a substitute for that confirmation.
+func (s *SQLiteLeaseStore) ForceReleaseProviderLock(ctx context.Context, key LeaseKey, generation int64) error {
+	_, err := execWithRetry(ctx, s.db, `UPDATE leases SET provider_lock_owner = '', provider_lock_at = NULL
+		WHERE repo = ? AND provider = ? AND project = ? AND task_ref = ? AND generation = ?`,
+		key.Repo, key.Provider, key.Project, key.TaskRef, generation)
+	if err != nil {
+		return fmt.Errorf("force release provider lock: %w", err)
+	}
+	return nil
+}
+
 func (s *SQLiteLeaseStore) byGeneration(ctx context.Context, key LeaseKey, ownerID string, generation int64) (*Lease, error) {
 	row := s.db.QueryRowContext(ctx, `SELECT `+leaseColumns+` FROM leases
 		WHERE repo = ? AND provider = ? AND project = ? AND task_ref = ? AND owner_id = ? AND generation = ?
@@ -456,11 +526,16 @@ func (s *SQLiteLeaseStore) Hold(ctx context.Context, key LeaseKey, ownerID strin
 // running, which is exactly as unsafe as Release racing it. A stale
 // (crashed settler) lock is not honored, so this self-heals the same
 // way Release/Acquire's reclaim path does.
+// ExpireStale never preempts a provider lock by time alone -- see
+// Acquire's comment. ClaimManager.ExpireStale durably preempts every
+// stale-locked lease (fence advance, then ForceReleaseProviderLock)
+// before calling this, so a row this method ever sees with
+// provider_lock_owner != ” is genuinely still protected and correctly
+// left alone.
 func (s *SQLiteLeaseStore) ExpireStale(ctx context.Context, now time.Time) ([]*Lease, error) {
-	staleBefore := now.Add(-providerLockStaleAfter)
 	rows, err := s.db.QueryContext(ctx, `SELECT `+leaseColumns+` FROM leases
 		WHERE status = 'active' AND held = 0 AND expires_at <= ?
-		AND (provider_lock_owner = '' OR provider_lock_at <= ?)`, now, staleBefore)
+		AND provider_lock_owner = ''`, now)
 	if err != nil {
 		return nil, fmt.Errorf("expire stale: candidates: %w", err)
 	}
@@ -485,7 +560,7 @@ func (s *SQLiteLeaseStore) ExpireStale(ctx context.Context, now time.Time) ([]*L
 		}
 		res, err := execWithRetry(ctx, s.db, `UPDATE leases SET status = 'expired'
 			WHERE id = ? AND status = 'active' AND held = 0 AND expires_at <= ?
-			AND (provider_lock_owner = '' OR provider_lock_at <= ?)`, l.ID, now, staleBefore)
+			AND provider_lock_owner = ''`, l.ID, now)
 		if err != nil {
 			return nil, fmt.Errorf("expire stale: transition %d: %w", l.ID, err)
 		}

@@ -186,6 +186,26 @@ func (m *ClaimManager) Claim(ctx context.Context, req ClaimRequest) (*Lease, err
 		return nil, ErrRoleMismatch
 	}
 
+	// If the current lease for this key is being kept alive only by a
+	// now-stale provider-transition lock (its holder looks crashed, but a
+	// call it made to the provider may still be in flight -- see
+	// AcquireProviderLock/ProviderCAS's doc comments), superseding it
+	// must not be allowed to proceed until the provider has durably been
+	// told about the new generation. A best-effort, error-swallowed
+	// AdvanceFence AFTER a local reclaim already happened is exactly the
+	// gap an independent review caught: local ownership moved to
+	// generation 2 while the provider never heard about it, so
+	// generation 1's eventually-resumed call still succeeded. Store-level
+	// Acquire/Release/ExpireStale no longer preempt a provider lock by
+	// time alone at all -- ONLY preemptStaleProviderLock (here) and
+	// preemptAllStaleProviderLocks (ExpireStale) may do it, and only
+	// after a durably-confirmed fence advance. Leases that were never
+	// provider-locked pay zero cost (PeekStaleProviderLock returns nil
+	// immediately) and reclaim exactly as before.
+	if err := m.preemptStaleProviderLock(ctx, req.Key); err != nil {
+		return nil, err
+	}
+
 	lease, err := m.store.Acquire(ctx, req.Key, req.OwnerID, req.Role, req.WorktreePath, m.now(), m.ttl)
 	if err != nil {
 		// Even a lost race can have flipped a stale row to Expired (see
@@ -195,21 +215,6 @@ func (m *ClaimManager) Claim(ctx context.Context, req ClaimRequest) (*Lease, err
 		// sweep.
 		_, _ = m.settlePendingCapacity(ctx, &req.Key)
 		return nil, err
-	}
-
-	// Reclaim (generation > 1): tell the provider about the new
-	// generation as early as possible, before anything else, so a
-	// superseded generation's ProviderCAS call -- however late it
-	// eventually arrives -- gets rejected by the provider's own fencing
-	// check rather than relying on a local lock's staleness timeout to
-	// prove the old call has stopped (it can't; see ProviderCAS's doc
-	// comment). Best-effort: a failure here does not block the claim
-	// (liveness), but does leave a narrow residual window where a stale
-	// call could still land if the new generation itself never calls
-	// CompleteProviderTransition (which would otherwise also advance the
-	// fence via its own fenceToken).
-	if m.provider != nil && lease.Generation > 1 {
-		_ = m.provider.AdvanceFence(ctx, req.Key.TaskRef, lease.Generation)
 	}
 
 	// Acquire durably evicts (Expires) any stale prior lease for this key
@@ -254,6 +259,15 @@ func (m *ClaimManager) Renew(ctx context.Context, key LeaseKey, ownerID string, 
 // SettlePendingCapacity) retries it instead of returning nil having
 // silently skipped it.
 func (m *ClaimManager) Release(ctx context.Context, key LeaseKey, ownerID string, generation int64) error {
+	// See Claim's matching comment: Release no longer preempts a stale
+	// provider lock by time alone at the store layer either, so a durable
+	// fence-advance is required first here too, or a genuinely-crashed
+	// owner's own Release call (or anyone else's, for that matter) could
+	// otherwise be the bypass route that skips fencing entirely.
+	if err := m.preemptStaleProviderLock(ctx, key); err != nil {
+		return err
+	}
+
 	_, _, err := m.store.Release(ctx, key, ownerID, generation, m.now())
 	if err != nil {
 		return err
@@ -274,13 +288,23 @@ func (m *ClaimManager) Hold(ctx context.Context, key LeaseKey, ownerID string, g
 	return m.store.Hold(ctx, key, ownerID, generation, held, m.now())
 }
 
-// ExpireStale sweeps expired leases and then settles all pending capacity
-// release across every key (not just the ones it just expired), so it
-// also self-heals any earlier Release/Claim call whose capacity
-// settlement failed and was left durably pending. Callers (e.g. a daemon
-// tick, or Reconcile) decide the schedule; ClaimManager does not run a
-// background loop itself.
+// ExpireStale first durably preempts every stale provider-locked lease
+// across every key (see preemptAllStaleProviderLocks -- same requirement
+// as Claim/Release: no lease with a provider lock is evicted by time
+// alone without a confirmed fence advance first), then sweeps expired
+// leases, then settles all pending capacity release across every key
+// (not just the ones it just expired), so it also self-heals any earlier
+// Release/Claim call whose capacity settlement failed and was left
+// durably pending. Callers (e.g. a daemon tick, or Reconcile) decide the
+// schedule; ClaimManager does not run a background loop itself.
+//
+// A preemption failure for one lease does not stop the sweep for
+// everything else: it's reported (via the returned error, never
+// swallowed) but that lease is simply left locked, to be retried on a
+// future call, exactly like Claim/Release leave it for their own retry.
 func (m *ClaimManager) ExpireStale(ctx context.Context) ([]*Lease, error) {
+	preemptErr := m.preemptAllStaleProviderLocks(ctx)
+
 	expired, err := m.store.ExpireStale(ctx, m.now())
 	if err != nil {
 		return nil, err
@@ -288,7 +312,74 @@ func (m *ClaimManager) ExpireStale(ctx context.Context) ([]*Lease, error) {
 	if _, settleErr := m.settlePendingCapacity(ctx, nil); settleErr != nil {
 		return expired, settleErr
 	}
+	if preemptErr != nil {
+		return expired, preemptErr
+	}
 	return expired, nil
+}
+
+// preemptStaleProviderLock durably advances the provider fence for key's
+// stale-provider-locked active lease (if any) and, only on success,
+// force-clears the lock so the lease becomes normally evictable/
+// releasable by the store's own (lock-oblivious-to-staleness)
+// Acquire/Release/ExpireStale. A no-op if there is no stale-locked lease
+// for key, or if no ProviderCAS is configured (nothing external to
+// protect, so a local lock's staleness alone is a sufficient and correct
+// signal -- this is the pre-FAC-120-review, pre-fencing behavior,
+// preserved exactly for callers who never touch the provider). A
+// fence-advance failure is returned -- never swallowed -- with the lock
+// left in place, so the caller (Claim, Release) refuses to proceed
+// rather than exposing new local state the provider was never told
+// about; a future call for the same key (the natural retry path) tries
+// again with the same durable idempotency key.
+func (m *ClaimManager) preemptStaleProviderLock(ctx context.Context, key LeaseKey) error {
+	if m.provider == nil {
+		return nil
+	}
+	stale, err := m.store.PeekStaleProviderLock(ctx, key, m.now())
+	if err != nil {
+		return fmt.Errorf("claim: check provider lock staleness: %w", err)
+	}
+	if stale == nil {
+		return nil
+	}
+	if err := m.durablyAdvanceFence(ctx, key.TaskRef, stale.Generation+1); err != nil {
+		return fmt.Errorf("claim: cannot safely preempt stale provider lock for %s: %w", key.TaskRef, err)
+	}
+	if err := m.store.ForceReleaseProviderLock(ctx, key, stale.Generation); err != nil {
+		return fmt.Errorf("claim: clear preempted provider lock for %s: %w", key.TaskRef, err)
+	}
+	return nil
+}
+
+// preemptAllStaleProviderLocks is preemptStaleProviderLock across every
+// key, for ExpireStale's global sweep. A fence-advance failure for one
+// lease does not stop the others; the first error encountered is
+// returned (never swallowed) after every eligible lease has been
+// attempted.
+func (m *ClaimManager) preemptAllStaleProviderLocks(ctx context.Context) error {
+	if m.provider == nil {
+		return nil
+	}
+	stales, err := m.store.PeekAllStaleProviderLocks(ctx, m.now())
+	if err != nil {
+		return fmt.Errorf("claim: list stale provider locks: %w", err)
+	}
+	var firstErr error
+	for _, l := range stales {
+		if err := m.durablyAdvanceFence(ctx, l.TaskRef, l.Generation+1); err != nil {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("claim: cannot safely preempt stale provider lock for %s: %w", l.TaskRef, err)
+			}
+			continue
+		}
+		if err := m.store.ForceReleaseProviderLock(ctx, l.LeaseKey, l.Generation); err != nil {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("claim: clear preempted provider lock for %s: %w", l.TaskRef, err)
+			}
+		}
+	}
+	return firstErr
 }
 
 // SettlePendingCapacity retries CapacityCoordinator.Release for every

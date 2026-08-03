@@ -28,6 +28,49 @@ var (
 // hold.
 var ErrLeaseNotCurrent = errors.New("claim: key/owner/generation is not the current active lease")
 
+// durablyAdvanceFence enqueues a durable record of the intent to advance
+// taskID's provider fence to fenceToken (idempotency key "fence:<taskID>:
+// g<fenceToken>"), then attempts it, and returns any failure -- never
+// swallowed -- so the caller (Claim, before allowing a reclaim to
+// supersede a stale provider-locked lease) can refuse to proceed rather
+// than expose new local ownership without the provider having been told.
+//
+// Unlike CompleteProviderTransition's provider_mutation intents, this
+// needs no exclusive claim/lock step: AdvanceFence has no side effect
+// beyond bumping a monotonic floor, so calling it concurrently or
+// redundantly from multiple settlers is safe by construction (the
+// highest value wins regardless of call order). The durable record exists
+// so a FAILED attempt is not lost: it stays Pending, and the next Claim
+// call for the same key (the natural retry path -- a daemon loop, an
+// operator retry, whatever keeps calling Claim for pending work) replays
+// the same idempotency key and tries again, until it succeeds. Once
+// Applied, replays short-circuit without calling the provider again.
+func (m *ClaimManager) durablyAdvanceFence(ctx context.Context, taskID string, fenceToken int64) error {
+	if m.outboxStore == nil {
+		// No durable outbox configured: nowhere to durably record the
+		// intent, but the failure is still surfaced to the caller, never
+		// swallowed -- degraded (no cross-process retry tracking), not
+		// silently unsafe.
+		return m.provider.AdvanceFence(ctx, taskID, fenceToken)
+	}
+
+	idempotencyKey := fmt.Sprintf("fence:%s:g%d", taskID, fenceToken)
+	rec, err := m.outboxStore.Enqueue(ctx, OutboxIntent{IdempotencyKey: idempotencyKey, Kind: "fence_advance"})
+	if err != nil {
+		return fmt.Errorf("claim: durably record fence advance intent: %w", err)
+	}
+	if rec.Status == OutboxApplied {
+		return nil // already durably advanced by a prior successful attempt.
+	}
+	if err := m.provider.AdvanceFence(ctx, taskID, fenceToken); err != nil {
+		return fmt.Errorf("claim: advance provider fence for %s to generation %d: %w", taskID, fenceToken, err)
+	}
+	if err := m.outboxStore.ForceMarkApplied(ctx, idempotencyKey, m.now()); err != nil {
+		return fmt.Errorf("claim: mark fence advance applied: %w", err)
+	}
+	return nil
+}
+
 // verifyCurrentLease fences a provider-transition attempt against live
 // lease state: only the exact current owner at the exact current
 // generation may enqueue or complete a provider mutation for key. Reads

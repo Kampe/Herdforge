@@ -119,6 +119,34 @@ type LeaseStore interface {
 	// stale and was preempted).
 	ReleaseProviderLock(ctx context.Context, key LeaseKey, generation int64, lockOwner string) error
 
+	// PeekStaleProviderLock returns the current active lease for key if
+	// it is held by a provider-transition lock that is active but stale.
+	// Returns nil (not an error) if there is no active lease, it has no
+	// provider lock, or its lock is not yet stale. Release, Acquire, and
+	// ExpireStale never preempt a provider lock by time alone -- they
+	// unconditionally require provider_lock_owner = '' -- specifically so
+	// that whether a stale lock is safe to clear can only be decided by
+	// ClaimManager (which alone knows if a ProviderCAS is configured, and
+	// so whether a durable fence-advance is needed first). See
+	// PeekAllStaleProviderLocks (ExpireStale's sweep-scale counterpart)
+	// and ForceReleaseProviderLock.
+	PeekStaleProviderLock(ctx context.Context, key LeaseKey, now time.Time) (*Lease, error)
+
+	// PeekAllStaleProviderLocks is PeekStaleProviderLock across every
+	// key, for ClaimManager.ExpireStale's global sweep to durably
+	// preempt (fence-advance, then ForceReleaseProviderLock) every
+	// stale-locked lease before calling the store's own ExpireStale.
+	PeekAllStaleProviderLocks(ctx context.Context, now time.Time) ([]*Lease, error)
+
+	// ForceReleaseProviderLock clears key/generation's provider lock
+	// unconditionally, without requiring the caller to be its current
+	// owner. Reserved for ClaimManager's orchestration layer and MUST
+	// only be called immediately after a durably-confirmed provider fence
+	// advance for the lease's next generation -- never as a substitute
+	// for that confirmation, which is what actually makes the preemption
+	// safe.
+	ForceReleaseProviderLock(ctx context.Context, key LeaseKey, generation int64) error
+
 	// Hold sets or clears the operator-hold flag on the active lease for
 	// key, fenced by ownerID/generation exactly like Renew/Release: a
 	// caller without the current owner+generation is rejected rather than
