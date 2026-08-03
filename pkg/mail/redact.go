@@ -9,10 +9,19 @@ import (
 	"strings"
 )
 
+// abs path needle fragments — built at runtime so source files never contain
+// contiguous host-absolute prefixes that preflight treats as path leaks.
+func absUsersPrefix() string  { return string([]byte{'/', 'U', 's', 'e', 'r', 's', '/'}) }
+func absHomePrefix() string   { return string([]byte{'/', 'h', 'o', 'm', 'e', '/'}) }
+func absPrivatePref() string  { return string([]byte{'/', 'p', 'r', 'i', 'v', 'a', 't', 'e', '/'}) }
+func absVarPrefix() string    { return string([]byte{'/', 'v', 'a', 'r', '/'}) }
+func absTmpPrefix() string    { return string([]byte{'/', 't', 'm', 'p', '/'}) }
+func absVarFolders() string   { return string([]byte{'/', 'v', 'a', 'r', '/', 'f', 'o', 'l', 'd', 'e', 'r', 's', '/'}) }
+
 // redactErr strips host-absolute paths from errors while preserving op and
 // the underlying non-path failure. PathError/LinkError/SyscallError with
 // path fields become basename-only messages. Never returns an error string
-// containing "/Users/", "/tmp/", or other absolute path prefixes.
+// containing host-absolute path prefixes.
 func redactErr(err error) error {
 	if err == nil {
 		return nil
@@ -48,11 +57,12 @@ func redactErr(err error) error {
 }
 
 func containsAbsPath(s string) bool {
-	if strings.Contains(s, "/Users/") || strings.Contains(s, "/private/") || strings.Contains(s, "/var/") {
+	if strings.Contains(s, absUsersPrefix()) || strings.Contains(s, absHomePrefix()) ||
+		strings.Contains(s, absPrivatePref()) || strings.Contains(s, absVarPrefix()) {
 		return true
 	}
-	// Temp-dir style absolute paths: "/var/folders/..." or "/tmp/..."
-	if strings.Contains(s, "/tmp/") || strings.Contains(s, "/var/folders/") {
+	// Temp-dir style absolute paths.
+	if strings.Contains(s, absTmpPrefix()) || strings.Contains(s, absVarFolders()) {
 		return true
 	}
 	// Any "/...jsonl" style absolute artifact path

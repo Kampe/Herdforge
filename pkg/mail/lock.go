@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -20,13 +21,17 @@ import (
 // Protocol:
 //  1. enqueueWaiter issues a monotonic ticket via an atomically replaced
 //     sequence file (writeFileAtomic) under a separate meta flock, then
-//     creates a token with O_EXCL bound to pid+start_ns(+boot).
+//     O_EXCL-creates the final token name bound to pid+start_ns(+boot).
+//     Staging debris left by crashed publishers is reaped under qmeta.
 //  2. waitForTurn blocks until this ticket is the minimum live ticket.
-//     Non-heads never flock the data lock (no barging). Mutation seam:
-//     skipWaitForTurn (tests only) disables this gate.
+//     Waiters themselves detect+reap a dead head (under qmeta) so progress
+//     does not require a new enqueue. Non-heads never flock the data lock.
+//     Mutation seam: skipWaitForTurn (tests only) disables this gate.
 //  3. Head acquires the data flock; only EWOULDBLOCK/EAGAIN are retried.
+//     Expired/cancelled contexts never enter the critical section, even
+//     when the lock is free (fail-closed deadline).
 //  4. On release: clear owner, unlock data, dequeue token (remove+dirsync);
-//     cleanup failures are joined with the critical-section result.
+//     unlock/close/dequeue failures are always joined (never discarded).
 //
 // Stuck detection is progress-based (stuckGrace). Context deadlines inherit.
 
@@ -149,6 +154,16 @@ func (m *Mailbox) withFileLockContext(ctx context.Context, fn func() error) erro
 	}
 
 	mailboxID := mailboxIdentity(m.MailFile)
+	lockPath := m.MailFile + ".lock"
+	start := hookNow()
+	bound, reason := m.lockWaitBound(ctx)
+
+	// Fail-closed before any queue mutation: an already-expired/cancelled
+	// context must never enqueue or enter the critical section, even when
+	// the data lock is completely free (uncontended).
+	if err := m.checkWaitLimits(ctx, start, start, bound, reason, lockPath, mailboxID, 0, 0); err != nil {
+		return redactErr(err)
+	}
 
 	// Fail-closed: enqueueWaiter errors never silently degrade to unordered
 	// data-flock-only. Corrupt counters, fsync/dirsync/token failures, and
@@ -164,15 +179,19 @@ func (m *Mailbox) withFileLockContext(ctx context.Context, fn func() error) erro
 		return redactErr(errors.Join(err, dequeueErr))
 	}
 
-	start := hookNow()
-	bound, reason := m.lockWaitBound(ctx)
 	if !skipWaitForTurn.Load() {
 		if err := m.waitForTurn(ctx, ticket, tokenPath, start, bound, reason, mailboxID); err != nil {
 			return finishQueue(err)
 		}
 	}
 
-	lockPath := m.MailFile + ".lock"
+	// Re-check deadline after becoming head: waitForTurn returns immediately
+	// when already head, so an expired ctx must still fail closed here before
+	// any uncontended flock + mutate.
+	if err := m.checkWaitLimits(ctx, start, hookNow(), bound, reason, lockPath, mailboxID, 1, 1); err != nil {
+		return finishQueue(err)
+	}
+
 	f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0644)
 	if err != nil {
 		return finishQueue(fmt.Errorf("failed to open mailbox lock for %s: %w", mailboxID, err))
@@ -187,17 +206,36 @@ func (m *Mailbox) withFileLockContext(ctx context.Context, fn func() error) erro
 			break
 		}
 		if !isLockBusy(err) {
-			_ = f.Close()
-			return finishQueue(fmt.Errorf("mailbox lock acquire failed for %s: %w", mailboxID, err))
+			closeErr := f.Close()
+			return finishQueue(errors.Join(
+				fmt.Errorf("mailbox lock acquire failed for %s: %w", mailboxID, err),
+				closeErr,
+			))
+		}
+		// Contended acquire: if HOL waiter looks dead, try non-blocking reap.
+		if m.headTokenDead() {
+			if rerr := m.reapDeadWaitersUnderMeta(); rerr != nil {
+				closeErr := f.Close()
+				return finishQueue(errors.Join(
+					fmt.Errorf("mailbox lock dead-head reap failed for %s: %w", mailboxID, rerr),
+					closeErr,
+				))
+			}
 		}
 		head, pos, depthNow, herr := m.queuePosition(ticket)
 		if herr != nil {
-			_ = f.Close()
-			return finishQueue(fmt.Errorf("mailbox lock queue inspect failed for %s: %w", mailboxID, herr))
+			closeErr := f.Close()
+			return finishQueue(errors.Join(
+				fmt.Errorf("mailbox lock queue inspect failed for %s: %w", mailboxID, herr),
+				closeErr,
+			))
 		}
 		if !skipWaitForTurn.Load() && !head {
-			_ = f.Close()
-			return finishQueue(m.newLockTimeout(lockPath, mailboxID, hookNow().Sub(start), bound, depthNow, pos, "lost_head_while_acquiring"))
+			closeErr := f.Close()
+			return finishQueue(errors.Join(
+				m.newLockTimeout(lockPath, mailboxID, hookNow().Sub(start), bound, depthNow, pos, "lost_head_while_acquiring"),
+				closeErr,
+			))
 		}
 		owner := readLockOwnerPID(lockPath)
 		if owner != lastOwner {
@@ -205,16 +243,27 @@ func (m *Mailbox) withFileLockContext(ctx context.Context, fn func() error) erro
 			lastProgress = hookNow()
 		}
 		if err := m.checkWaitLimits(ctx, start, lastProgress, bound, reason, lockPath, mailboxID, depthNow, pos); err != nil {
-			_ = f.Close()
-			return finishQueue(err)
+			closeErr := f.Close()
+			return finishQueue(errors.Join(err, closeErr))
 		}
 		hookSleep(lockPollInterval)
 	}
 
+	// Final deadline gate after exclusive flock, before any mutation.
+	if err := m.checkWaitLimits(ctx, start, hookNow(), bound, reason, lockPath, mailboxID, 1, 1); err != nil {
+		unlockErr := hookFlock(fd, syscall.LOCK_UN)
+		closeErr := f.Close()
+		return finishQueue(errors.Join(err, unlockErr, closeErr))
+	}
+
 	if werr := writeLockOwnerPID(f); werr != nil {
-		_ = hookFlock(fd, syscall.LOCK_UN)
-		_ = f.Close()
-		return finishQueue(fmt.Errorf("mailbox lock owner record failed for %s: %w", mailboxID, werr))
+		unlockErr := hookFlock(fd, syscall.LOCK_UN)
+		closeErr := f.Close()
+		return finishQueue(errors.Join(
+			fmt.Errorf("mailbox lock owner record failed for %s: %w", mailboxID, werr),
+			unlockErr,
+			closeErr,
+		))
 	}
 
 	fnErr := fn()
@@ -312,8 +361,8 @@ func (m *Mailbox) enqueueWaiter() (ticket int64, tokenPath string, depth int, er
 	metaClose := func() error { return meta.Close() }
 
 	if err := hookFlock(int(meta.Fd()), syscall.LOCK_EX); err != nil {
-		_ = metaClose()
-		return 0, "", 0, fmt.Errorf("qmeta flock: %w", err)
+		closeErr := metaClose()
+		return 0, "", 0, errors.Join(fmt.Errorf("qmeta flock: %w", err), closeErr)
 	}
 
 	// Reap only confidently-dead tokens under the meta lock.
@@ -339,45 +388,59 @@ func (m *Mailbox) enqueueWaiter() (ticket int64, tokenPath string, depth int, er
 		return 0, "", 0, errors.Join(err, uerr, cerr)
 	}
 
-	// Publish atomically: write+fsync a staging file, then rename to the
-	// final ticket name. Concurrent reapers/queuePosition never observe a
-	// partial JSON body under the final name.
+	// Publish with true O_EXCL on the final ticket name so exactly one
+	// publisher wins (Stat+Rename can clobber under a race; link/rename
+	// overwrite is not exclusive). Write fully-fsynced staging first so
+	// readers never observe a torn JSON body under the final name, then
+	// exclusive-create the final name via link (EEXIST = lost race).
 	name := fmt.Sprintf("%020d", ticket)
 	tokenPath = filepath.Join(qdir, name)
 	stagePath := tokenPath + ".staging"
-	_ = removeTokenFn(stagePath) // best-effort clear stale stage; ignore not-exist
+	// Under qmeta exclusive lock no concurrent publisher for this mailbox
+	// is in-flight; leftover staging is crashed debris — clear it.
+	if rmErr := removeTokenFn(stagePath); rmErr != nil && !os.IsNotExist(rmErr) {
+		uerr, cerr := metaUnlock(), metaClose()
+		return 0, "", 0, errors.Join(fmt.Errorf("token stage clear: %w", rmErr), uerr, cerr)
+	}
 	tf, err := os.OpenFile(stagePath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0644)
 	if err != nil {
 		uerr, cerr := metaUnlock(), metaClose()
 		return 0, "", 0, errors.Join(fmt.Errorf("token stage O_EXCL: %w", err), uerr, cerr)
 	}
 	if _, err := tf.Write(append(body, '\n')); err != nil {
-		_ = tf.Close()
-		_ = removeTokenFn(stagePath)
+		closeErr := tf.Close()
+		rmErr := removeTokenFn(stagePath)
 		uerr, cerr := metaUnlock(), metaClose()
-		return 0, "", 0, errors.Join(fmt.Errorf("token write: %w", err), uerr, cerr)
+		return 0, "", 0, errors.Join(fmt.Errorf("token write: %w", err), closeErr, rmErr, uerr, cerr)
 	}
 	if err := fileSyncFn(tf); err != nil {
-		_ = tf.Close()
-		_ = removeTokenFn(stagePath)
+		closeErr := tf.Close()
+		rmErr := removeTokenFn(stagePath)
 		uerr, cerr := metaUnlock(), metaClose()
-		return 0, "", 0, errors.Join(fmt.Errorf("token fsync: %w", err), uerr, cerr)
+		return 0, "", 0, errors.Join(fmt.Errorf("token fsync: %w", err), closeErr, rmErr, uerr, cerr)
 	}
 	if err := tf.Close(); err != nil {
-		_ = removeTokenFn(stagePath)
+		rmErr := removeTokenFn(stagePath)
 		uerr, cerr := metaUnlock(), metaClose()
-		return 0, "", 0, errors.Join(fmt.Errorf("token close: %w", err), uerr, cerr)
+		return 0, "", 0, errors.Join(fmt.Errorf("token close: %w", err), rmErr, uerr, cerr)
 	}
-	// Final name must not exist (O_EXCL equivalent via rename over missing target).
-	if _, statErr := os.Stat(tokenPath); statErr == nil {
-		_ = removeTokenFn(stagePath)
+	// O_EXCL of final name: link fails with EEXIST if another name already
+	// holds this ticket (never overwrite via rename).
+	if err := os.Link(stagePath, tokenPath); err != nil {
+		rmStage := removeTokenFn(stagePath)
 		uerr, cerr := metaUnlock(), metaClose()
-		return 0, "", 0, errors.Join(fmt.Errorf("token O_EXCL: destination exists"), uerr, cerr)
+		if os.IsExist(err) || errors.Is(err, syscall.EEXIST) {
+			return 0, "", 0, errors.Join(fmt.Errorf("token O_EXCL: destination exists"), rmStage, uerr, cerr)
+		}
+		return 0, "", 0, errors.Join(fmt.Errorf("token publish O_EXCL link: %w", err), rmStage, uerr, cerr)
 	}
-	if err := os.Rename(stagePath, tokenPath); err != nil {
-		_ = removeTokenFn(stagePath)
+	// Staging hard-link peer removed; final name alone remains.
+	if rmStage := removeTokenFn(stagePath); rmStage != nil && !os.IsNotExist(rmStage) {
+		// Final is published; try to roll it back so we don't leave a live
+		// head we failed to finish cleanly, and surface every error.
+		rmTok := removeTokenFn(tokenPath)
 		uerr, cerr := metaUnlock(), metaClose()
-		return 0, "", 0, errors.Join(fmt.Errorf("token publish rename: %w", err), uerr, cerr)
+		return 0, "", 0, errors.Join(fmt.Errorf("token stage unlink: %w", rmStage), rmTok, uerr, cerr)
 	}
 	if err := syncDirFn(tokenPath); err != nil {
 		// Published name exists; try to remove to avoid a stuck live head,
@@ -544,6 +607,10 @@ func (m *Mailbox) removeTokenDurable(path string) error {
 	return nil
 }
 
+// reapDeadWaiters reaps confidently-dead tokens and abandoned staging
+// debris. Caller MUST hold the qmeta exclusive flock so concurrent
+// publishers for this mailbox cannot be mid-staging (under qmeta, any
+// leftover *.staging is crashed debris and is safe to remove).
 func (m *Mailbox) reapDeadWaiters() error {
 	dir := m.waiterDir()
 	entries, err := os.ReadDir(dir)
@@ -560,10 +627,21 @@ func (m *Mailbox) reapDeadWaiters() error {
 		}
 		name := e.Name()
 		path := filepath.Join(dir, name)
-		// Staging files are never final tickets; clean only confidently-stale
-		// stages (not concurrent writers' in-flight stages). Leave *.staging
-		// alone — publisher owns them under qmeta.
+		// Staging debris: only reap when confidently abandoned by age.
+		// Never remove zero-age stages — a concurrent publisher (or a
+		// test calling reap without qmeta) may be mid-write. Publishers
+		// under qmeta clear their own stage path before O_EXCL create.
 		if strings.HasSuffix(name, ".staging") {
+			info, ierr := e.Info()
+			if ierr != nil {
+				continue
+			}
+			if hookNow().Sub(info.ModTime()) < stuckGrace {
+				continue // in-flight or fresh crash residue — leave it
+			}
+			if rerr := m.removeTokenDurable(path); rerr != nil && firstErr == nil {
+				firstErr = rerr
+			}
 			continue
 		}
 		if !isTicketTokenName(name) {
@@ -575,14 +653,13 @@ func (m *Mailbox) reapDeadWaiters() error {
 		}
 		data, rerr := os.ReadFile(path)
 		if rerr != nil {
-			// Unreadable (including concurrent partial if any slipped in):
-			// treat as ambiguous — never reap a potentially live waiter.
+			// Unreadable: treat as ambiguous — never reap a potentially live waiter.
 			continue
 		}
 		body, complete, perr := parseTokenBody(data)
 		if perr != nil || !complete {
-			// Incomplete/unreadable body: ambiguous (publish race or torn
-			// read). Never remove — stuckGrace bounds permanent stalls.
+			// Incomplete/unreadable body: ambiguous. Never remove —
+			// stuckGrace bounds permanent stalls.
 			continue
 		}
 		switch classifyToken(body, complete) {
@@ -597,15 +674,61 @@ func (m *Mailbox) reapDeadWaiters() error {
 	return firstErr
 }
 
+// reapDeadWaitersUnderMeta tries to acquire qmeta (non-blocking), reaps dead
+// tokens/staging, and releases. Used by waiters so a dead head can be
+// cleared without a new enqueue. If qmeta is busy (another waiter/enqueuer
+// holds it), returns nil — the next poll retries. Hard flock errors and
+// unlock/close failures are joined fail-closed.
+func (m *Mailbox) reapDeadWaitersUnderMeta() error {
+	meta, err := os.OpenFile(m.qmetaPath(), os.O_CREATE|os.O_RDWR, 0644)
+	if err != nil {
+		return fmt.Errorf("open qmeta for reap: %w", err)
+	}
+	if err := hookFlock(int(meta.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		closeErr := meta.Close()
+		if isLockBusy(err) {
+			// Another waiter or enqueuer owns qmeta; do not block the
+			// hot wait path behind 100× serial reaps.
+			return closeErr
+		}
+		return errors.Join(fmt.Errorf("qmeta flock for reap: %w", err), closeErr)
+	}
+	reapErr := m.reapDeadWaiters()
+	unlockErr := hookFlock(int(meta.Fd()), syscall.LOCK_UN)
+	closeErr := meta.Close()
+	return errors.Join(reapErr, unlockErr, closeErr)
+}
+
+// headTokenDead reports whether the current minimum live ticket token is
+// confidently dead. Lock-free observation only; never reaps.
+func (m *Mailbox) headTokenDead() bool {
+	min, err := m.minLiveTicket()
+	if err != nil || min <= 0 {
+		return false
+	}
+	path := filepath.Join(m.waiterDir(), fmt.Sprintf("%020d", min))
+	data, rerr := os.ReadFile(path)
+	if rerr != nil {
+		return false
+	}
+	body, complete, perr := parseTokenBody(data)
+	if perr != nil || !complete {
+		return false
+	}
+	return classifyToken(body, complete) == tokenDead
+}
+
 func (m *Mailbox) liveWaiterDepth() (int, error) {
-	// Reap only under qmeta (enqueue). Outside meta, counting must not reap
-	// — concurrent publishers may be staging tokens.
+	// Reap only under qmeta. Outside meta, counting must not reap —
+	// concurrent publishers may be staging tokens.
 	return m.countTicketTokens()
 }
 
 func (m *Mailbox) queuePosition(ticket int64) (head bool, position int, depth int, err error) {
 	// Do NOT reap here: enqueue holds qmeta for reaping; concurrent
 	// queuePosition from waitForTurn must only observe published tickets.
+	// Head-of-line is the minimum live ticket number (FIFO), never raw
+	// directory iteration order.
 	entries, err := os.ReadDir(m.waiterDir())
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -628,6 +751,7 @@ func (m *Mailbox) queuePosition(ticket int64) (head bool, position int, depth in
 	if depth == 0 {
 		return true, 1, 1, nil
 	}
+	sort.Slice(live, func(i, j int) bool { return live[i] < live[j] })
 	position = 0
 	for i, n := range live {
 		if n == ticket {
@@ -654,17 +778,34 @@ func (m *Mailbox) waitForTurn(ctx context.Context, ticket int64, tokenPath strin
 		if _, err := os.Stat(tokenPath); err != nil {
 			return m.newLockTimeout(lockPath, mailboxID, hookNow().Sub(start), bound, lastDepth, lastPos, "lost_token")
 		}
+
 		head, pos, depth, err := m.queuePosition(ticket)
 		if err != nil {
 			return fmt.Errorf("mailbox lock queue inspect failed for %s: %w", mailboxID, err)
 		}
 		if head {
+			// Head of line: still honor deadline before returning to mutate.
+			if err := m.checkWaitLimits(ctx, start, lastProgress, bound, reason, lockPath, mailboxID, depth, pos); err != nil {
+				return err
+			}
 			return nil
 		}
 		// queuePosition returns position=depth+1 when our ticket is absent.
 		if pos > depth {
 			return m.newLockTimeout(lockPath, mailboxID, hookNow().Sub(start), bound, depth, pos, "lost_token")
 		}
+
+		// Only when not head: if the HOL token looks dead, try a non-blocking
+		// qmeta reap so waiters clear a dead head without a new enqueue.
+		// Never thrash blocking qmeta on every poll under 100-writer load.
+		if m.headTokenDead() {
+			if rerr := m.reapDeadWaitersUnderMeta(); rerr != nil {
+				return fmt.Errorf("mailbox lock dead-head reap failed for %s: %w", mailboxID, rerr)
+			}
+			// Re-evaluate position immediately after a successful reap attempt.
+			continue
+		}
+
 		minTicket, _ := m.minLiveTicket()
 		// Progress: our position improves, head ticket advances, or depth drops.
 		if pos < lastPos || (minTicket > 0 && minTicket > lastMin) || depth < lastDepth {
@@ -774,12 +915,12 @@ func (m *Mailbox) writeLockDiag(lte *LockTimeoutError) error {
 			break
 		}
 		if !isLockBusy(err) {
-			_ = df.Close()
-			return redactErr(err)
+			closeErr := df.Close()
+			return redactErr(errors.Join(err, closeErr))
 		}
 		if hookNow().After(deadline) {
-			_ = df.Close()
-			return fmt.Errorf("diag lock busy")
+			closeErr := df.Close()
+			return errors.Join(fmt.Errorf("diag lock busy"), closeErr)
 		}
 		hookSleep(lockPollInterval)
 	}

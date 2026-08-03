@@ -95,9 +95,20 @@ func (m *Mailbox) SendMessage(sender, recipient, subject, body string) (*Envelop
 // SendMessageContext is SendMessage with caller-deadline propagation: when
 // ctx carries a deadline, lock acquisition fails closed at that deadline
 // (typed BLOCKED) instead of using the adaptive wall-clock policy.
+//
+// If the envelope was durably appended but a post-append unlock/dequeue
+// cleanup failed, the envelope is still returned with the cleanup error so
+// the caller retains the id (retry of the same id is idempotent).
 func (m *Mailbox) SendMessageContext(ctx context.Context, sender, recipient, subject, body string) (*Envelope, error) {
 	env := newEnvelope(sender, recipient, subject, body)
 	if err := m.appendEnvelopeContext(ctx, env); err != nil {
+		// Durable write may have completed before cleanup failed.
+		m.mu.Lock()
+		seen := m.alreadySeenLocked(env.ID)
+		m.mu.Unlock()
+		if seen || m.fileHasID(env.ID) {
+			return env, err
+		}
 		return nil, err
 	}
 	return env, nil
@@ -134,10 +145,25 @@ func (m *Mailbox) appendEnvelopeContext(ctx context.Context, env *Envelope) erro
 
 	m.ensureSeenLoadedLocked()
 	if m.alreadySeenLocked(env.ID) {
+		// Idempotent: prior durable append (or same-id retry after a
+		// post-append dequeue/cleanup failure) must not re-append.
 		return nil
 	}
 
+	// Append under the data flock; markSeen immediately after durable
+	// appendLine so a subsequent unlock/dequeue/dirsync failure cannot
+	// "lose" the envelope id and allow a retry to duplicate the line.
+	// Cleanup errors still surface fail-closed from withFileLockContext.
 	err := m.withFileLockContext(ctx, func() error {
+		// Re-check under the lock: a concurrent writer may have appended
+		// the same id between the outer alreadySeen and flock grant.
+		if m.alreadySeenLocked(env.ID) {
+			return nil
+		}
+		if m.fileHasID(env.ID) {
+			m.markSeenLocked(env.ID)
+			return nil
+		}
 		seq, err := m.nextSequenceLocked()
 		if err != nil {
 			return err
@@ -147,12 +173,20 @@ func (m *Mailbox) appendEnvelopeContext(ctx context.Context, env *Envelope) erro
 		if err != nil {
 			return fmt.Errorf("failed to marshal mail envelope: %w", err)
 		}
-		return appendLine(m.MailFile, data)
+		if err := appendLine(m.MailFile, data); err != nil {
+			return err
+		}
+		// Durable append succeeded: record id before unlock/dequeue so a
+		// cleanup failure cannot cause a lost-id → re-append duplicate.
+		m.markSeenLocked(env.ID)
+		return nil
 	})
 	if err != nil {
+		// Fail-closed on cleanup, but if the id is already durable/seen the
+		// caller must treat this as "written with cleanup error" — retry of
+		// the same env.ID is a no-op via alreadySeenLocked/fileHasID.
 		return err
 	}
-	m.markSeenLocked(env.ID)
 	return nil
 }
 
