@@ -279,3 +279,95 @@ func TestWriteMutation_PreservesAccountSourceRoundTrip(t *testing.T) {
 		t.Errorf("source field must survive re-encode, got: %s", string(raw))
 	}
 }
+
+func TestWriteMutation_PreservesEmptyAccountsArray(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "ledger.json")
+
+	// shell-shaped configured empty pool
+	os.WriteFile(p, []byte(`{"claude":{"used_pct":10,"accounts":[]}}`), 0644)
+
+	l, err := OpenLedger(p)
+	if err != nil {
+		t.Fatalf("OpenLedger: %v", err)
+	}
+
+	rec, _ := l.Surface("claude")
+	if rec.Accounts == nil {
+		t.Fatal("accounts:[] must decode as non-nil empty slice")
+	}
+	if len(rec.Accounts) != 0 {
+		t.Fatalf("expected 0 accounts, got %d", len(rec.Accounts))
+	}
+
+	// no-op mutation must preserve the explicit empty array
+	if err := l.WriteMutation(func(m *map[string]Record) {}); err != nil {
+		t.Fatalf("no-op WriteMutation: %v", err)
+	}
+
+	raw, _ := os.ReadFile(p)
+	if !strings.Contains(string(raw), `"accounts":[]`) && !strings.Contains(string(raw), `"accounts": []`) {
+		t.Errorf("empty accounts array must survive re-encode, got: %s", string(raw))
+	}
+
+	l2, err := OpenLedger(p)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	rec2, _ := l2.Surface("claude")
+	if rec2.Accounts == nil {
+		t.Error("after noop round-trip, Accounts must remain non-nil (not collapsed to scalar)")
+	}
+}
+
+func TestSet_PreservesEmptyAccountsArray(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "ledger.json")
+
+	os.WriteFile(p, []byte(`{"claude":{"used_pct":10,"window_days":7,"days_left":5,"accounts":[]}}`), 0644)
+
+	l, err := OpenLedger(p)
+	if err != nil {
+		t.Fatalf("OpenLedger: %v", err)
+	}
+	lc := NewLedgerCommands(l)
+
+	if _, err := lc.Set("claude", 42, 7, 5, false, "manual"); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+
+	l2, err := OpenLedger(p)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	rec, _ := l2.Surface("claude")
+	if rec.Accounts == nil {
+		t.Error("Set must preserve configured empty pool (accounts:[]), got nil after round-trip")
+	}
+	if len(rec.Accounts) != 0 {
+		t.Errorf("Set must not populate accounts, got %d", len(rec.Accounts))
+	}
+	if rec.UsedPct != 42 {
+		t.Errorf("Set must update used_pct, got %d", rec.UsedPct)
+	}
+}
+
+func TestScalarRecord_OmitsAccountsOnEncode(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "ledger.json")
+
+	os.WriteFile(p, []byte(`{"claude":{"used_pct":10}}`), 0644)
+
+	l, err := OpenLedger(p)
+	if err != nil {
+		t.Fatalf("OpenLedger: %v", err)
+	}
+	if err := l.WriteMutation(func(m *map[string]Record) {}); err != nil {
+		t.Fatalf("no-op WriteMutation: %v", err)
+	}
+
+	raw, _ := os.ReadFile(p)
+	if strings.Contains(string(raw), "accounts") {
+		t.Errorf("scalar record must not gain an accounts field, got: %s", string(raw))
+	}
+}
