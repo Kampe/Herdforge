@@ -460,16 +460,34 @@ func uniqueSortedStrings(in []string) []string {
 
 func normalizeRepoPath(p string) string {
 	p = strings.TrimSpace(p)
-	p = strings.ReplaceAll(p, "\\", "/")
-	p = filepath.ToSlash(p)
-	p = strings.TrimPrefix(p, "./")
-	// Reject absolute paths in plan inputs (repo-relative only).
-	if path.IsAbs(p) || strings.HasPrefix(p, "/") {
-		// Still normalize but strip leading slash for matching; absolute host
-		// paths are not accepted as-is — empty signals drop.
+	if p == "" {
 		return ""
 	}
-	return p
+	p = strings.ReplaceAll(p, "\\", "/")
+	p = filepath.ToSlash(p)
+	// Reject absolute paths (repo-relative only). Empty signals drop.
+	if path.IsAbs(p) || strings.HasPrefix(p, "/") {
+		return ""
+	}
+	// path.Clean resolves . and .. segments. After cleaning, any path that
+	// still starts with ".." has escaped the repo root and must be rejected
+	// (e.g. "../x", "foo/../../x"). Intra-repo rewrites like "a/../b" → "b"
+	// remain valid.
+	cleaned := path.Clean(p)
+	cleaned = strings.TrimPrefix(cleaned, "./")
+	if cleaned == "" || cleaned == "." {
+		return ""
+	}
+	if cleaned == ".." || strings.HasPrefix(cleaned, "../") {
+		return ""
+	}
+	// Defense in depth: never keep a residual ".." segment after Clean.
+	for _, seg := range strings.Split(cleaned, "/") {
+		if seg == ".." {
+			return ""
+		}
+	}
+	return cleaned
 }
 
 // packagesForPaths returns sorted unique owner package identifiers for paths.
