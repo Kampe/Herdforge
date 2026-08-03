@@ -62,10 +62,11 @@ type Request struct {
 	// When set, Validate and recovery re-proof require it to match the live
 	// lease generation. Nested-agent argv denials are always required for
 	// codex/claude regardless of whether a binding is present.
-	FleetBinding agentpolicy.LaunchBinding
-	Hooks        []harness.Hook
-	HookClient   *http.Client
-	HookWarning  func(string)
+	FleetBinding  agentpolicy.LaunchBinding
+	Hooks         []harness.Hook
+	HookClient    *http.Client
+	HookWarning   func(string)
+	HookDiscovery harness.HookDiscovery
 }
 
 // LaunchEffects are the write-capable operations that must remain behind the
@@ -80,11 +81,8 @@ type LaunchEffects struct {
 
 // Launch validates the complete launch contract before invoking any
 // write-capable collaborator. Required hook health is checked first, so a
-// rejected launch cannot even emit a validation receipt or reach a side effect.
+// rejected launch emits only its stable hook receipt and reaches no side effect.
 func Launch(req Request, sink Sink, effects LaunchEffects) error {
-	if _, err := PreflightHooks(req); err != nil {
-		return err
-	}
 	if err := Validate(req, sink); err != nil {
 		return err
 	}
@@ -140,11 +138,23 @@ type Receipt struct {
 	FleetAuthTag      string `json:"fleet_auth_tag,omitempty"`
 	FleetFamily       string `json:"fleet_parent_family,omitempty"`
 	FleetSurface      string `json:"fleet_allowed_surface,omitempty"`
+	// Hook preflight evidence (FAC-177).
+	Kind              string `json:"kind,omitempty"`
+	HookCode          string `json:"hook_code,omitempty"`
+	HookName          string `json:"hook_name,omitempty"`
+	EndpointClass     string `json:"endpoint_class,omitempty"`
+	RedactedAuthority string `json:"redacted_authority,omitempty"`
+	ReceiptKey        string `json:"receipt_key,omitempty"`
 }
 
 // Sink makes receipt durability injectable without making process tests touch
 // the host filesystem.
 type Sink interface{ Write(Receipt) error }
+
+type deduplicatingSink interface {
+	Sink
+	WriteOnce(Receipt) (bool, error)
+}
 
 type JSONLSink struct {
 	Path string
@@ -160,6 +170,10 @@ func (s *JSONLSink) Write(r Receipt) error {
 	if err := os.MkdirAll(filepath.Dir(s.Path), 0755); err != nil {
 		return fmt.Errorf("create launch receipt directory: %w", err)
 	}
+	return s.appendLocked(r)
+}
+
+func (s *JSONLSink) appendLocked(r Receipt) error {
 	f, err := os.OpenFile(s.Path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 	if err != nil {
 		return fmt.Errorf("open launch receipt: %w", err)
@@ -175,6 +189,39 @@ func (s *JSONLSink) Write(r Receipt) error {
 	return f.Sync()
 }
 
+func (s *JSONLSink) WriteOnce(r Receipt) (bool, error) {
+	if s == nil || strings.TrimSpace(s.Path) == "" {
+		return false, fmt.Errorf("launch receipt path is required")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if r.ReceiptKey != "" {
+		f, err := os.Open(s.Path)
+		if err == nil {
+			defer f.Close()
+			dec := json.NewDecoder(f)
+			for {
+				var existing Receipt
+				if err := dec.Decode(&existing); err != nil {
+					if err == io.EOF {
+						break
+					}
+					return false, fmt.Errorf("read launch receipts: %w", err)
+				}
+				if existing.ReceiptKey == r.ReceiptKey {
+					return false, nil
+				}
+			}
+		} else if !os.IsNotExist(err) {
+			return false, fmt.Errorf("open launch receipts: %w", err)
+		}
+	}
+	if err := os.MkdirAll(filepath.Dir(s.Path), 0755); err != nil {
+		return false, fmt.Errorf("create launch receipt directory: %w", err)
+	}
+	return true, s.appendLocked(r)
+}
+
 type MemorySink struct {
 	mu       sync.Mutex
 	Receipts []Receipt
@@ -185,6 +232,20 @@ func (s *MemorySink) Write(r Receipt) error {
 	defer s.mu.Unlock()
 	s.Receipts = append(s.Receipts, r)
 	return nil
+}
+
+func (s *MemorySink) WriteOnce(r Receipt) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if r.ReceiptKey != "" {
+		for _, existing := range s.Receipts {
+			if existing.ReceiptKey == r.ReceiptKey {
+				return false, nil
+			}
+		}
+	}
+	s.Receipts = append(s.Receipts, r)
+	return true, nil
 }
 
 func DefaultSink() Sink {
@@ -263,6 +324,19 @@ func RecordStarted(req Request, sink Sink) error {
 }
 
 func RecordRejected(req Request, sink Sink, reason string) error { return reject(req, sink, reason) }
+
+func writeOnce(sink Sink, receipt Receipt) (bool, error) {
+	if sink == nil {
+		sink = DefaultSink()
+	}
+	if dedupe, ok := sink.(deduplicatingSink); ok {
+		return dedupe.WriteOnce(receipt)
+	}
+	if err := sink.Write(receipt); err != nil {
+		return false, err
+	}
+	return true, nil
+}
 
 // HasStarted proves a resumable identity from the client-owned lifecycle
 // store; Herdr's agent list does not carry routing metadata.
@@ -362,8 +436,8 @@ func Validate(req Request, sink Sink) error {
 	if normalized(req.Decision.Harness) != normalized(wantHarness) || !equalStrings(req.Decision.HarnessArgv, wantHarnessArgv) {
 		return reject(req, sink, "launch harness does not match routed provider/model/effort/session")
 	}
-	if _, err := PreflightHooks(req); err != nil {
-		return reject(req, sink, err.Error())
+	if _, err := preflightHooks(req, sink); err != nil {
+		return err
 	}
 	role, shape, provider, model, effort = normalized(role), normalized(shape), normalized(provider), normalized(model), normalized(effort)
 	validShape := map[string]bool{"coordinator": true, "architecture": true, "implementation": true, "research": true, "bounded": true, "advisory": true, "qa-light": true, "qa": true, "adversarial": true}
@@ -507,28 +581,93 @@ func argvCarriesModel(argv []string) bool {
 // processes, prompts, board records, or worktrees. It is also used by resume
 // recovery so a previously healthy session cannot bypass current hook health.
 func PreflightHooks(req Request) (harness.HookReport, error) {
-	if len(req.Hooks) == 0 {
-		return harness.HookReport{RequiredHealthy: true}, nil
+	return preflightHooks(req, nil)
+}
+
+func preflightHooks(req Request, sink Sink) (harness.HookReport, error) {
+	report := harness.HookReport{RequiredHealthy: true}
+	if req.Decision == nil || strings.TrimSpace(req.Decision.Provider) == "" || strings.TrimSpace(req.Decision.Model) == "" || strings.TrimSpace(req.Decision.Effort) == "" {
+		return report, fmt.Errorf("launch hook preflight failed: %s", harness.HookCodeMalformed)
 	}
+	discovery := req.HookDiscovery
+	if discovery == nil {
+		discovery = harness.FileDiscovery{}
+	}
+	result, err := discovery.Discover(req.Decision.Provider)
+	if err != nil || result.State == harness.DiscoveryFailed {
+		return report, recordHookFailure(req, sink, harness.HookCodeDiscoveryFailed, "", harness.EndpointInvalid, "")
+	}
+	if result.State == harness.DiscoveryNotDiscovered {
+		return report, recordHookFailure(req, sink, harness.HookCodeDiscoveryMissing, "", harness.EndpointInvalid, "")
+	}
+	if result.State != harness.DiscoveryNoHooks && result.State != harness.DiscoveryHooks {
+		return report, recordHookFailure(req, sink, harness.HookCodeDiscoveryFailed, "", harness.EndpointInvalid, "")
+	}
+	if result.State == harness.DiscoveryNoHooks && len(result.Hooks) != 0 {
+		return report, recordHookFailure(req, sink, harness.HookCodeMalformed, "", harness.EndpointInvalid, "")
+	}
+	if result.State == harness.DiscoveryHooks && len(result.Hooks) == 0 {
+		return report, recordHookFailure(req, sink, harness.HookCodeDiscoveryFailed, "", harness.EndpointInvalid, "")
+	}
+	req.Hooks = result.Hooks
 	identity := harness.HookIdentity{Provider: req.Decision.Provider, Model: req.Decision.Model, Effort: req.Decision.Effort}
-	report := harness.CheckHooks(context.Background(), req.Hooks, identity, req.HookClient)
-	if report.DegradedWarning != "" && req.HookWarning != nil {
-		req.HookWarning(report.DegradedWarning)
+	report = harness.CheckHooksWithOptions(context.Background(), result.Hooks, identity, req.HookClient, harness.HookCheckOptions{ApprovedAuthorities: result.ApprovedAuthorities})
+	if report.DegradedWarning != "" {
+		written, err := recordHookDegraded(req, sink, report)
+		if err != nil {
+			return report, err
+		}
+		if written && req.HookWarning != nil {
+			req.HookWarning(report.DegradedWarning)
+		}
 	}
 	if !report.RequiredHealthy {
-		return report, fmt.Errorf("required harness hook preflight failed: %s", failedRequiredHooks(report))
+		return report, recordFirstHookFailure(req, sink, report)
 	}
 	return report, nil
 }
 
-func failedRequiredHooks(report harness.HookReport) string {
-	failed := make([]string, 0)
+func recordFirstHookFailure(req Request, sink Sink, report harness.HookReport) error {
 	for _, result := range report.Results {
 		if result.Hook.Requirement == harness.HookRequired && result.Status != harness.HookHealthy {
-			failed = append(failed, result.Hook.Name+"="+string(result.Status))
+			return recordHookFailure(req, sink, result.Code, result.Hook.Name, result.EndpointClass, result.RedactedAuthority)
 		}
 	}
-	return strings.Join(failed, ",")
+	return fmt.Errorf("launch hook preflight failed: %s", harness.HookCodeMalformed)
+}
+
+func hookReceiptKey(req Request, code harness.HookCode, name string) string {
+	return fmt.Sprintf("hook|%s|%s|%s|%d|%s|%s", req.TaskRef, req.Name, req.PaneID, req.LeaseGeneration, DecisionDigest(req.Decision), string(code)+"|"+name)
+}
+
+func recordHookFailure(req Request, sink Sink, code harness.HookCode, name string, endpoint harness.EndpointClass, authority string) error {
+	receipt := Receipt{CreatedAt: time.Now().UTC(), Kind: "launch_rejected", TaskRef: req.TaskRef, Name: req.Name, PaneID: req.PaneID, LeaseGeneration: req.LeaseGeneration, HookCode: string(code), HookName: name, EndpointClass: string(endpoint), RedactedAuthority: authority, ReceiptKey: hookReceiptKey(req, code, name)}
+	if _, err := writeOnce(sink, receipt); err != nil {
+		return fmt.Errorf("launch hook preflight failed: %s", code)
+	}
+	return fmt.Errorf("launch hook preflight failed: %s", code)
+}
+
+func recordHookDegraded(req Request, sink Sink, report harness.HookReport) (bool, error) {
+	names := make([]string, 0)
+	authorities := make([]string, 0)
+	classes := make([]string, 0)
+	for _, result := range report.Results {
+		if result.Hook.Requirement == harness.HookOptional && result.Status != harness.HookHealthy {
+			names = append(names, result.Hook.Name)
+			authorities = append(authorities, result.RedactedAuthority)
+			classes = append(classes, string(result.EndpointClass))
+		}
+	}
+	if len(names) == 0 {
+		return false, nil
+	}
+	receipt := Receipt{CreatedAt: time.Now().UTC(), Kind: "hook_degraded", TaskRef: req.TaskRef, Name: req.Name, PaneID: req.PaneID, LeaseGeneration: req.LeaseGeneration, HookCode: string(harness.HookCodeDegraded), HookName: strings.Join(names, ","), EndpointClass: strings.Join(classes, ","), RedactedAuthority: strings.Join(authorities, ","), ReceiptKey: hookReceiptKey(req, harness.HookCodeDegraded, strings.Join(names, ","))}
+	written, err := writeOnce(sink, receipt)
+	if err != nil {
+		return false, fmt.Errorf("launch hook preflight failed: %s", harness.HookCodeDegraded)
+	}
+	return written, nil
 }
 
 func argvCarriesEffort(provider string, argv []string, effort string) bool {

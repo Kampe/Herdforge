@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -123,5 +124,75 @@ func TestCheckHooksOptionalFailuresEmitOneWarning(t *testing.T) {
 	want := "optional harness hooks degraded: a-optional=malformed,b-optional=unavailable"
 	if report.DegradedWarning != want {
 		t.Fatalf("warning = %q, want %q", report.DegradedWarning, want)
+	}
+}
+
+func TestCheckHooksRejectsAuthorityAndRedirectEscapes(t *testing.T) {
+	redirect := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Location", "http://example.com/secret")
+		w.WriteHeader(http.StatusFound)
+	}))
+	defer redirect.Close()
+	cases := []struct {
+		name string
+		hook Hook
+		code HookCode
+	}{
+		{name: "query", hook: Hook{Name: "query", URL: redirect.URL + "?token=secret", Requirement: HookRequired}, code: HookCodeMalformed},
+		{name: "userinfo", hook: Hook{Name: "userinfo", URL: "http://user:secret@127.0.0.1:1", Requirement: HookRequired}, code: HookCodeMalformed},
+		{name: "non-local", hook: Hook{Name: "non-local", URL: "http://example.com/health", Requirement: HookRequired}, code: HookCodeAuthority},
+		{name: "redirect-ssrf", hook: Hook{Name: "redirect", URL: redirect.URL, Requirement: HookRequired}, code: HookCodeRedirect},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			report := CheckHooks(context.Background(), []Hook{tc.hook}, HookIdentity{}, redirect.Client())
+			if len(report.Results) != 1 || report.Results[0].Code != tc.code {
+				t.Fatalf("result = %+v, want code %s", report.Results, tc.code)
+			}
+			if report.Results[0].RedactedAuthority == "" || strings.Contains(report.Results[0].RedactedAuthority, "secret") {
+				t.Fatalf("authority was not safely redacted: %q", report.Results[0].RedactedAuthority)
+			}
+		})
+	}
+}
+
+func TestCheckHooksRejectsOversizedTimeoutAndDuplicateIdentity(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"status":"ok"}`))
+	}))
+	defer server.Close()
+	report := CheckHooks(context.Background(), []Hook{
+		{Name: "same", URL: server.URL, Requirement: HookRequired},
+		{Name: "same", URL: server.URL, Requirement: HookRequired},
+		{Name: "too-long", URL: server.URL, Requirement: HookRequired, Timeout: 3 * time.Second},
+	}, HookIdentity{}, server.Client())
+	if len(report.Results) != 3 || report.Results[1].Code != HookCodeDuplicate || report.Results[2].Code != HookCodeTimeoutLimit {
+		t.Fatalf("bounded policy report = %+v", report.Results)
+	}
+}
+
+func TestFileDiscoveryStatesAreDistinct(t *testing.T) {
+	path := t.TempDir() + "/hooks.json"
+	discovery := FileDiscovery{Path: path}
+	if _, err := discovery.Discover("codex"); err == nil {
+		t.Fatal("missing discovery file must fail closed")
+	}
+	if err := os.WriteFile(path, []byte(`{"providers":{"codex":{"hooks":[]}}}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	result, err := discovery.Discover("codex")
+	if err != nil || result.State != DiscoveryNoHooks {
+		t.Fatalf("explicit no-hooks state = %+v, err=%v", result, err)
+	}
+	result, err = discovery.Discover("claude")
+	if err != nil || result.State != DiscoveryNotDiscovered {
+		t.Fatalf("missing provider state = %+v, err=%v", result, err)
+	}
+	if err := os.WriteFile(path, []byte("not-json"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	result, err = discovery.Discover("codex")
+	if err == nil || result.State != DiscoveryFailed {
+		t.Fatalf("malformed discovery state = %+v, err=%v", result, err)
 	}
 }

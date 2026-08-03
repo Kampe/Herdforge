@@ -3,10 +3,12 @@ package harness
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"os/exec"
 	"sort"
 	"strings"
@@ -97,6 +99,99 @@ type Hook struct {
 	Timeout     time.Duration
 }
 
+func (h *Hook) UnmarshalJSON(data []byte) error {
+	var raw struct {
+		Name        string          `json:"name"`
+		URL         string          `json:"url"`
+		Requirement HookRequirement `json:"requirement"`
+		Timeout     json.RawMessage `json:"timeout"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	h.Name, h.URL, h.Requirement = raw.Name, raw.URL, raw.Requirement
+	if len(raw.Timeout) == 0 || string(raw.Timeout) == "null" {
+		return nil
+	}
+	var duration string
+	if json.Unmarshal(raw.Timeout, &duration) == nil {
+		parsed, err := time.ParseDuration(duration)
+		if err != nil {
+			return err
+		}
+		h.Timeout = parsed
+		return nil
+	}
+	return json.Unmarshal(raw.Timeout, &h.Timeout)
+}
+
+type DiscoveryState string
+
+const (
+	DiscoveryNotDiscovered DiscoveryState = "not-discovered"
+	DiscoveryNoHooks       DiscoveryState = "discovered-no-hooks"
+	DiscoveryHooks         DiscoveryState = "discovered-hooks"
+	DiscoveryFailed        DiscoveryState = "discovery-failed"
+)
+
+type HookDiscoveryResult struct {
+	State               DiscoveryState
+	Hooks               []Hook
+	ApprovedAuthorities []string
+}
+
+type HookDiscovery interface {
+	Discover(provider string) (HookDiscoveryResult, error)
+}
+
+type HookDiscoveryFunc func(provider string) (HookDiscoveryResult, error)
+
+func (f HookDiscoveryFunc) Discover(provider string) (HookDiscoveryResult, error) {
+	return f(provider)
+}
+
+func NoHooksDiscovery() HookDiscovery {
+	return HookDiscoveryFunc(func(string) (HookDiscoveryResult, error) {
+		return HookDiscoveryResult{State: DiscoveryNoHooks}, nil
+	})
+}
+
+type FileDiscovery struct {
+	Path string
+}
+
+func (d FileDiscovery) Discover(provider string) (HookDiscoveryResult, error) {
+	path := strings.TrimSpace(d.Path)
+	if path == "" {
+		path = strings.TrimSpace(os.Getenv("HERD_HARNESS_HOOKS_FILE"))
+	}
+	if path == "" {
+		path = ".herd/harness-hooks.json"
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return HookDiscoveryResult{State: DiscoveryFailed}, fmt.Errorf("hook discovery failed")
+	}
+	var config struct {
+		Providers map[string]struct {
+			Hooks               []Hook   `json:"hooks"`
+			ApprovedAuthorities []string `json:"approved_local_authorities"`
+		} `json:"providers"`
+	}
+	if err := json.Unmarshal(b, &config); err != nil {
+		return HookDiscoveryResult{State: DiscoveryFailed}, fmt.Errorf("hook discovery failed")
+	}
+	entry, ok := config.Providers[strings.ToLower(strings.TrimSpace(provider))]
+	if !ok {
+		return HookDiscoveryResult{State: DiscoveryNotDiscovered}, nil
+	}
+	state := DiscoveryHooks
+	if len(entry.Hooks) == 0 {
+		state = DiscoveryNoHooks
+	}
+	return HookDiscoveryResult{State: state, Hooks: entry.Hooks, ApprovedAuthorities: entry.ApprovedAuthorities}, nil
+}
+
 type HookStatus string
 
 const (
@@ -107,9 +202,11 @@ const (
 )
 
 type HookResult struct {
-	Hook   Hook
-	Status HookStatus
-	Reason string
+	Hook              Hook
+	Status            HookStatus
+	Code              HookCode
+	EndpointClass     EndpointClass
+	RedactedAuthority string
 }
 
 type HookReport struct {
@@ -124,16 +221,53 @@ type HookIdentity struct {
 	Effort   string
 }
 
+type HookCode string
+
+const (
+	HookCodeHealthy            HookCode = "hook.healthy"
+	HookCodeUnavailable        HookCode = "hook.unavailable"
+	HookCodeTimeout            HookCode = "hook.timeout"
+	HookCodeMalformed          HookCode = "hook.malformed"
+	HookCodeHTTPError          HookCode = "hook.http_error"
+	HookCodeAuthority          HookCode = "hook.authority_rejected"
+	HookCodeRedirect           HookCode = "hook.redirect_rejected"
+	HookCodeDuplicate          HookCode = "hook.duplicate_identity"
+	HookCodeUnknownRequirement HookCode = "hook.unknown_requirement"
+	HookCodeTimeoutLimit       HookCode = "hook.timeout_limit"
+	HookCodeDiscoveryFailed    HookCode = "hook.discovery_failed"
+	HookCodeDiscoveryMissing   HookCode = "hook.discovery_missing"
+	HookCodeDegraded           HookCode = "hook.degraded"
+)
+
+type EndpointClass string
+
+const (
+	EndpointLoopback      EndpointClass = "loopback"
+	EndpointApprovedLocal EndpointClass = "approved-local"
+	EndpointInvalid       EndpointClass = "invalid"
+)
+
 const (
 	defaultHookTimeout = 2 * time.Second
+	maxHookTimeout     = 2 * time.Second
+	maxHookBudget      = 5 * time.Second
 	maxHealthBody      = 4096
 )
+
+type HookCheckOptions struct {
+	ApprovedAuthorities []string
+	TotalTimeout        time.Duration
+}
 
 // CheckHooks probes hooks in stable order. A hook is healthy only when its
 // URL is valid and it returns a bounded JSON health response with status
 // "ok" or "healthy". Required failures make RequiredHealthy false; optional
 // failures are represented by one deduplicated warning on the report.
 func CheckHooks(ctx context.Context, hooks []Hook, identity HookIdentity, client *http.Client) HookReport {
+	return CheckHooksWithOptions(ctx, hooks, identity, client, HookCheckOptions{})
+}
+
+func CheckHooksWithOptions(parent context.Context, hooks []Hook, identity HookIdentity, client *http.Client, options HookCheckOptions) HookReport {
 	ordered := append([]Hook(nil), hooks...)
 	sort.SliceStable(ordered, func(i, j int) bool {
 		if ordered[i].Name != ordered[j].Name {
@@ -144,10 +278,17 @@ func CheckHooks(ctx context.Context, hooks []Hook, identity HookIdentity, client
 	if client == nil {
 		client = http.DefaultClient
 	}
+	budget := options.TotalTimeout
+	if budget <= 0 || budget > maxHookBudget {
+		budget = maxHookBudget
+	}
+	ctx, cancel := context.WithTimeout(parent, budget)
+	defer cancel()
 	report := HookReport{RequiredHealthy: true}
 	degraded := make([]string, 0)
+	seen := make(map[string]struct{}, len(ordered))
 	for _, hook := range ordered {
-		result := checkHook(ctx, hook, identity, client)
+		result := checkHook(ctx, hook, identity, client, options.ApprovedAuthorities, seen)
 		report.Results = append(report.Results, result)
 		if result.Status != HookHealthy {
 			if hook.Requirement == HookRequired {
@@ -165,26 +306,50 @@ func CheckHooks(ctx context.Context, hooks []Hook, identity HookIdentity, client
 	return report
 }
 
-func checkHook(parent context.Context, hook Hook, identity HookIdentity, client *http.Client) HookResult {
+func checkHook(parent context.Context, hook Hook, identity HookIdentity, client *http.Client, approved []string, seen map[string]struct{}) HookResult {
 	result := HookResult{Hook: hook}
-	if strings.TrimSpace(hook.Name) == "" || (hook.Requirement != HookRequired && hook.Requirement != HookOptional) {
-		result.Status, result.Reason = HookMalformed, "name and required/optional classification are required"
+	result.Code = HookCodeMalformed
+	result.EndpointClass = EndpointInvalid
+	if strings.TrimSpace(hook.Name) == "" {
+		result.Status = HookMalformed
 		return result
 	}
+	if hook.Requirement != HookRequired && hook.Requirement != HookOptional {
+		result.Status, result.Code = HookMalformed, HookCodeUnknownRequirement
+		return result
+	}
+	identityKey := strings.ToLower(strings.TrimSpace(hook.Name))
+	if _, ok := seen[identityKey]; ok {
+		result.Status, result.Code = HookMalformed, HookCodeDuplicate
+		return result
+	}
+	seen[identityKey] = struct{}{}
 	u, err := url.Parse(strings.TrimSpace(hook.URL))
-	if err != nil || u.Scheme == "" || u.Host == "" || u.User != nil || (u.Scheme != "http" && u.Scheme != "https") {
-		result.Status, result.Reason = HookMalformed, "hook URL must be an http(s) URL with a host"
+	if err == nil && u != nil {
+		result.RedactedAuthority = u.Host
+	}
+	if err != nil || u.Scheme == "" || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" || (u.Scheme != "http" && u.Scheme != "https") {
+		result.Status = HookMalformed
+		return result
+	}
+	result.EndpointClass = endpointClass(u, approved)
+	if result.EndpointClass == EndpointInvalid {
+		result.Status, result.Code = HookMalformed, HookCodeAuthority
 		return result
 	}
 	timeout := hook.Timeout
 	if timeout <= 0 {
 		timeout = defaultHookTimeout
 	}
+	if timeout > maxHookTimeout {
+		result.Status, result.Code = HookMalformed, HookCodeTimeoutLimit
+		return result
+	}
 	ctx, cancel := context.WithTimeout(parent, timeout)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
 	if err != nil {
-		result.Status, result.Reason = HookMalformed, err.Error()
+		result.Status = HookMalformed
 		return result
 	}
 	// These headers are informational only; launch validation remains the
@@ -192,38 +357,55 @@ func checkHook(parent context.Context, hook Hook, identity HookIdentity, client 
 	req.Header.Set("X-Herd-Provider", identity.Provider)
 	req.Header.Set("X-Herd-Model", identity.Model)
 	req.Header.Set("X-Herd-Effort", identity.Effort)
-	resp, err := client.Do(req)
+	probeClient := *client
+	probeClient.CheckRedirect = func(next *http.Request, via []*http.Request) error {
+		if next.URL.User != nil || next.URL.RawQuery != "" || next.URL.Fragment != "" || endpointClass(next.URL, approved) == EndpointInvalid {
+			return errRedirectRejected
+		}
+		return http.ErrUseLastResponse
+	}
+	resp, err := probeClient.Do(req)
 	if err != nil {
 		if ctx.Err() != nil {
-			result.Status = HookTimeout
-			result.Reason = ctx.Err().Error()
+			result.Status, result.Code = HookTimeout, HookCodeTimeout
+		} else if errors.Is(err, errRedirectRejected) {
+			result.Status, result.Code = HookMalformed, HookCodeRedirect
 		} else {
-			result.Status = HookUnavailable
-			result.Reason = err.Error()
+			result.Status, result.Code = HookUnavailable, HookCodeUnavailable
 		}
 		return result
 	}
 	defer resp.Body.Close()
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxHealthBody+1))
 	if err != nil || len(body) > maxHealthBody || resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
-		result.Status = HookUnavailable
-		if err != nil {
-			result.Reason = err.Error()
-		} else {
-			result.Reason = fmt.Sprintf("health response status %d or body too large", resp.StatusCode)
-		}
+		result.Status, result.Code = HookUnavailable, HookCodeHTTPError
 		return result
 	}
 	var health struct {
 		Status string `json:"status"`
 	}
 	if err := json.Unmarshal(body, &health); err != nil || (health.Status != "ok" && health.Status != "healthy") {
-		result.Status = HookMalformed
-		result.Reason = "health response must be JSON with status ok or healthy"
+		result.Status, result.Code = HookMalformed, HookCodeMalformed
 		return result
 	}
-	result.Status = HookHealthy
+	result.Status, result.Code = HookHealthy, HookCodeHealthy
 	return result
+}
+
+var errRedirectRejected = errors.New("hook redirect rejected")
+
+func endpointClass(u *url.URL, approved []string) EndpointClass {
+	host := strings.ToLower(strings.TrimSpace(u.Hostname()))
+	if host == "127.0.0.1" || host == "::1" || host == "localhost" {
+		return EndpointLoopback
+	}
+	authority := strings.ToLower(strings.TrimSpace(u.Host))
+	for _, candidate := range approved {
+		if authority == strings.ToLower(strings.TrimSpace(candidate)) {
+			return EndpointApprovedLocal
+		}
+	}
+	return EndpointInvalid
 }
 
 // GetHarnessConfig maps harness identifiers to CLI invocation conventions
