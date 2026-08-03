@@ -21,6 +21,7 @@ import (
 	"github.com/Kampe/Herdforge/pkg/attention"
 	"github.com/Kampe/Herdforge/pkg/classify"
 	"github.com/Kampe/Herdforge/pkg/config"
+	"github.com/Kampe/Herdforge/pkg/control"
 	"github.com/Kampe/Herdforge/pkg/daemon"
 	"github.com/Kampe/Herdforge/pkg/dispatch"
 	"github.com/Kampe/Herdforge/pkg/harvest"
@@ -29,7 +30,9 @@ import (
 	"github.com/Kampe/Herdforge/pkg/launch"
 	"github.com/Kampe/Herdforge/pkg/lifecycle"
 	"github.com/Kampe/Herdforge/pkg/lost"
+	"github.com/Kampe/Herdforge/pkg/mail"
 	"github.com/Kampe/Herdforge/pkg/next"
+	"github.com/Kampe/Herdforge/pkg/outbox"
 	"github.com/Kampe/Herdforge/pkg/overlap"
 	"github.com/Kampe/Herdforge/pkg/preflight"
 	"github.com/Kampe/Herdforge/pkg/process"
@@ -1854,7 +1857,13 @@ func runDispatch() {
 	}
 
 	wm := resolveCanonicalWorktreeManager()
-	d := dispatch.NewDispatcher(cfg, tp, wm)
+	d := dispatch.NewProductionDispatcher(cfg, tp, wm)
+	closeControl, err := configureProductionControl(d, ".")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "control store init failed: %v\n", err)
+		os.Exit(1)
+	}
+	defer closeControl()
 	var decision *router.LaunchDecision
 	var dispatchResult *dispatch.DispatchResult
 	if !*noLaunch {
@@ -1898,6 +1907,22 @@ func runDispatch() {
 	} else {
 		fmt.Printf("  Agent    : Not launched (use --no-launch or see TASK-PACKET.md)\n")
 	}
+}
+
+func configureProductionControl(d *dispatch.Dispatcher, root string) (func() error, error) {
+	controlStore, err := outbox.NewStore(filepath.Join(root, ".herd", "control-orders.db"))
+	if err != nil {
+		return nil, err
+	}
+	controlMailbox := mail.NewMailbox(filepath.Join(root, ".herd", "control-mail.jsonl"))
+	d.ControlFactory = func(_ context.Context, identity control.LaneIdentity, lane string) (*control.CoordinatorOrders, error) {
+		owner, err := control.NewOwnerToken()
+		if err != nil {
+			return nil, err
+		}
+		return &control.CoordinatorOrders{Identity: identity, Delivery: &control.Delivery{Outbox: controlStore, Sender: controlMailbox, Waker: control.HerdrWaker{Target: "forge-" + lane}, Authority: control.ScopedAuthority{Identity: identity}, Evidence: control.MailboxEvidenceReader{Mailbox: controlMailbox}, Owner: owner}}, nil
+	}
+	return controlStore.Close, nil
 }
 
 func runHarvest() {

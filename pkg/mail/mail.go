@@ -132,6 +132,12 @@ func (m *Mailbox) AppendEnvelopeContext(ctx context.Context, env *Envelope) erro
 	return m.appendEnvelopeContext(ctx, env)
 }
 
+// SendEnvelopeContext makes a file mailbox satisfy the same durable sender
+// contract as MessageBroker; both paths preserve the caller's stable ID.
+func (m *Mailbox) SendEnvelopeContext(ctx context.Context, env *Envelope) error {
+	return m.AppendEnvelopeContext(ctx, env)
+}
+
 func newEnvelope(sender, recipient, subject, body string) *Envelope {
 	return &Envelope{
 		ID:        newID(),
