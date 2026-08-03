@@ -512,31 +512,47 @@ func validSHA(sha string) bool {
 }
 
 func currentSHA(dir string) (string, error) {
-	out, err := runGit(dir, "rev-parse", "--verify", "HEAD^{commit}")
+	actual, _, err := candidateState(dir)
+	return actual, err
+}
+
+func candidateState(dir string) (string, []string, error) {
+	// Porcelain v2's branch header and entries provide the exact HEAD plus
+	// tracked/untracked state in one hermetic Git process. This gate runs both
+	// before and after verification, so avoiding a separate rev-parse halves
+	// deterministic admission subprocess overhead without caching mutable state.
+	out, err := runGit(dir, "status", "--porcelain=v2", "--branch", "--untracked-files=all")
 	if err != nil {
-		return "", fmt.Errorf("read candidate SHA: %w", err)
+		return "", nil, fmt.Errorf("read candidate status: %w", err)
 	}
-	sha := strings.TrimSpace(string(out))
-	if !validSHA(sha) {
-		return "", fmt.Errorf("git returned non-exact candidate SHA %q", sha)
+	var actual string
+	var dirty []string
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		switch {
+		case strings.HasPrefix(line, "# branch.oid "):
+			actual = strings.TrimSpace(strings.TrimPrefix(line, "# branch.oid "))
+		case line == "", strings.HasPrefix(line, "# "):
+			// Other branch headers are metadata, not worktree changes.
+		default:
+			dirty = append(dirty, line)
+		}
 	}
-	return sha, nil
+	if !validSHA(actual) {
+		return "", nil, fmt.Errorf("git returned non-exact candidate SHA %q", actual)
+	}
+	return actual, dirty, nil
 }
 
 func requireCleanCandidate(dir, expectedSHA string) error {
-	actual, err := currentSHA(dir)
+	actual, dirty, err := candidateState(dir)
 	if err != nil {
 		return err
 	}
 	if actual != expectedSHA {
 		return fmt.Errorf("candidate SHA %s does not match expected %s", actual, expectedSHA)
 	}
-	out, err := runGit(dir, "status", "--porcelain", "--untracked-files=all")
-	if err != nil {
-		return fmt.Errorf("read candidate status: %w", err)
-	}
-	if strings.TrimSpace(string(out)) != "" {
-		return fmt.Errorf("candidate worktree is dirty: %s", strings.TrimSpace(string(out)))
+	if len(dirty) > 0 {
+		return fmt.Errorf("candidate worktree is dirty: %s", strings.Join(dirty, "\n"))
 	}
 	return nil
 }
@@ -823,17 +839,15 @@ func (v *Verifier) RunMutationCheckForCandidate(ctx context.Context, dir string,
 		CandidateSHA: req.CandidateSHA,
 		Outcome:      OutcomeBLOCKED,
 	}
-	if err := requireCleanCandidate(dir, req.CandidateSHA); err != nil {
-		result.Output = err.Error()
-		result.Baseline = *blockedReceipt(baseReq, v.argv(), 0, nil, err)
-		return result, nil
-	}
 	if ctx.Err() != nil {
 		result.Output = ctx.Err().Error()
 		result.Baseline = *blockedReceipt(baseReq, v.argv(), 0, nil, ctx.Err())
 		return result, nil
 	}
 
+	// VerifyCandidate performs the exact-SHA and clean-worktree gate before it
+	// starts the baseline command. Repeating that same Git status immediately
+	// beforehand adds a subprocess but no additional observation point.
 	baseline, err := v.VerifyCandidate(ctx, dir, baseReq)
 	if err != nil {
 		// Cancellation during baseline must not escape as a bare error — the

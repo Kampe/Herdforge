@@ -1,6 +1,7 @@
 package verifier
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -94,18 +95,7 @@ func TestVerifyCandidateReceiptBindsExactSHAAndDigest(t *testing.T) {
 }
 
 func TestReceiptDigestCoversEveryReceiptField(t *testing.T) {
-	dir, candidate := verificationRepo(t)
-	receipt, err := NewVerifierArgs([]string{"./check.sh"}).VerifyCandidate(context.Background(), dir, VerificationRequest{
-		TaskRef:           "FAC-122",
-		LeaseGeneration:   "lease-7",
-		CandidateSHA:      candidate,
-		BaseSHA:           candidate,
-		EnvironmentPolicy: EnvironmentPolicyInherited,
-		Artifacts:         []string{"candidate.txt"},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	receipt := fixturePassingReceipt(strings.Repeat("f", 40))
 
 	tests := []struct {
 		name   string
@@ -127,7 +117,7 @@ func TestReceiptDigestCoversEveryReceiptField(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			tampered := *receipt
+			tampered := receipt
 			tampered.Command = append([]string(nil), receipt.Command...)
 			tampered.Artifacts = append([]string(nil), receipt.Artifacts...)
 			tt.mutate(&tampered)
@@ -300,14 +290,15 @@ func TestExecuteBoundsRetainedOutput(t *testing.T) {
 }
 
 func TestReceiptUsesFullOutputDigestWithBoundedRetention(t *testing.T) {
-	dir := t.TempDir()
-	script := filepath.Join(dir, "emit-output")
-	writeExecutable(t, script, "#!/bin/sh\nhead -c 2000000 /dev/zero\n")
-	v := NewVerifierArgs([]string{"./emit-output"})
-	result, err := v.Execute(context.Background(), dir)
-	if err != nil {
-		t.Fatal(err)
+	fullOutput := bytes.Repeat([]byte{'x'}, 2_000_000)
+	result := &Result{
+		Passed:       true,
+		Outcome:      OutcomePASS,
+		Output:       boundedOutput(fullOutput),
+		OutputDigest: digestBytes(fullOutput),
+		ExitCode:     0,
 	}
+	v := NewVerifierArgs([]string{"./emit-output"})
 	receipt := makeReceipt(VerificationRequest{
 		CandidateSHA:      strings.Repeat("a", 40),
 		EnvironmentPolicy: EnvironmentPolicyInherited,
@@ -332,15 +323,11 @@ func TestMutationPathGuardsRejectEscapesAndMetadataWithoutOutsideWrites(t *testi
 	if err := os.Symlink(outsideFile, trackedLink); err != nil {
 		t.Fatal(err)
 	}
-	git(t, dir, "add", "tracked-link")
-	git(t, dir, "commit", "-q", "-m", "add tracked link")
 
 	gitParentLink := filepath.Join(dir, "git-parent")
 	if err := os.Symlink(".git", gitParentLink); err != nil {
 		t.Fatal(err)
 	}
-	git(t, dir, "add", "git-parent")
-	git(t, dir, "commit", "-q", "-m", "add git metadata alias")
 	outsideParent := t.TempDir()
 	outsideVictim := filepath.Join(outsideParent, "victim.txt")
 	writeFile(t, outsideVictim, "outside-parent\n")
@@ -348,8 +335,8 @@ func TestMutationPathGuardsRejectEscapesAndMetadataWithoutOutsideWrites(t *testi
 	if err := os.Symlink(outsideParent, outsideParentLink); err != nil {
 		t.Fatal(err)
 	}
-	git(t, dir, "add", "outside-parent")
-	git(t, dir, "commit", "-q", "-m", "add outside parent alias")
+	git(t, dir, "add", "tracked-link", "git-parent", "outside-parent")
+	git(t, dir, "commit", "-q", "-m", "add mutation guard links")
 	candidate := gitOutput(t, dir, "rev-parse", "HEAD")
 
 	tests := []struct {
@@ -1626,49 +1613,17 @@ func TestRunMutationCheck_RestoredCandidateFailureIsBlocked(t *testing.T) {
 }
 
 func verificationRepo(t *testing.T) (string, string) {
-	dir := t.TempDir()
-	git(t, dir, "init", "-q", "-b", "main")
-	git(t, dir, "config", "user.email", "test@example.invalid")
-	git(t, dir, "config", "user.name", "verifier-test")
-	git(t, dir, "config", "commit.gpgsign", "false")
-	writeFile(t, filepath.Join(dir, "candidate.txt"), "original\n")
-	writeExecutable(t, filepath.Join(dir, "check.sh"), "#!/bin/sh\n[ \"$(cat candidate.txt)\" = \"original\" ]\n")
-	writeExecutable(t, filepath.Join(dir, "always-fail.sh"), "#!/bin/sh\nexit 7\n")
-	writeExecutable(t, filepath.Join(dir, "env-check.sh"), "#!/bin/sh\n[ -z \"${VERIFIER_AMBIENT_SECRET:-}\" ]\n")
-	writeExecutable(t, filepath.Join(dir, "dirty-check.sh"), "#!/bin/sh\ntouch post-run-dirty.txt\n")
-	git(t, dir, "add", ".")
-	git(t, dir, "commit", "-q", "-m", "candidate")
-	return dir, gitOutput(t, dir, "rev-parse", "HEAD")
+	return copyCachedRepo(t, "verification", buildVerificationFixture)
 }
 
 func restorationFailureRepo(t *testing.T) (string, string, string) {
-	dir := t.TempDir()
-	git(t, dir, "init", "-q", "-b", "main")
-	git(t, dir, "config", "user.email", "test@example.invalid")
-	git(t, dir, "config", "user.name", "verifier-test")
-	git(t, dir, "config", "commit.gpgsign", "false")
-	writeFile(t, filepath.Join(dir, "candidate.txt"), "original\n")
-	writeExecutable(t, filepath.Join(dir, "check.sh"), "#!/bin/sh\ncount=$(cat \"$1\" 2>/dev/null || echo 0)\ncount=$((count + 1))\nprintf '%s\\n' \"$count\" > \"$1\"\nif [ \"$(cat candidate.txt)\" = \"mutant\" ]; then exit 1; fi\n[ \"$count\" -lt 3 ]\n")
-	git(t, dir, "add", ".")
-	git(t, dir, "commit", "-q", "-m", "candidate")
-	return dir, gitOutput(t, dir, "rev-parse", "HEAD"), filepath.Join(t.TempDir(), "invocations")
+	dir, candidate := copyCachedRepo(t, "restoration-failure", buildRestorationFailureFixture)
+	return dir, candidate, filepath.Join(t.TempDir(), "invocations")
 }
 
 func mutationRepo(t *testing.T, waits bool) (string, string) {
-	dir := t.TempDir()
-	git(t, dir, "init", "-q", "-b", "main")
-	git(t, dir, "config", "user.email", "test@example.invalid")
-	git(t, dir, "config", "user.name", "verifier-test")
-	git(t, dir, "config", "commit.gpgsign", "false")
-	writeFile(t, filepath.Join(dir, "candidate.txt"), "original\n")
-	sleep := ""
-	if waits {
-		sleep = "\nif [ \"$(cat candidate.txt)\" = \"mutant\" ]; then sleep 3; fi\n"
-	}
-	writeExecutable(t, filepath.Join(dir, "check.sh"), "#!/bin/sh\n"+sleep+"[ \"$(cat candidate.txt)\" != \"mutant\" ]\n")
-	git(t, dir, "add", ".")
-	git(t, dir, "commit", "-q", "-m", "candidate")
-	return dir, gitOutput(t, dir, "rev-parse", "HEAD")
+	key := fmt.Sprintf("mutation-waits-%t", waits)
+	return copyCachedRepo(t, key, buildMutationFixture(waits))
 }
 
 func writeExecutable(t *testing.T, path, contents string) {

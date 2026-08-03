@@ -6,36 +6,12 @@ import (
 	"testing"
 )
 
-func vgit(t *testing.T, dir string, args ...string) {
-	t.Helper()
-	if _, err := runGit(dir, args...); err != nil {
-		t.Fatalf("git %v: %v", args, err)
-	}
-}
-
 // completionRepo builds a repo with origin/main plus a worktree branch whose
 // commits are controllable per test.
 func completionRepo(t *testing.T, subjects ...string) string {
-	dir := t.TempDir()
-	vgit(t, dir, "init", "-q", "-b", "main")
-	vgit(t, dir, "config", "user.email", "t@h.local")
-	vgit(t, dir, "config", "user.name", "t")
-	vgit(t, dir, "config", "commit.gpgsign", "false")
-	vgit(t, dir, "commit", "--allow-empty", "-q", "-m", "base")
-	vgit(t, dir, "update-ref", "refs/remotes/origin/main", mustHead(t, dir))
-	for _, s := range subjects {
-		vgit(t, dir, "commit", "--allow-empty", "-q", "-m", s)
-	}
+	key := "completion\x00" + strings.Join(subjects, "\x00")
+	dir, _ := copyCachedRepo(t, key, buildCompletionFixture(subjects))
 	return dir
-}
-
-func mustHead(t *testing.T, dir string) string {
-	t.Helper()
-	out, err := runGit(dir, "rev-parse", "HEAD")
-	if err != nil {
-		t.Fatal(err)
-	}
-	return strings.TrimSpace(string(out))
 }
 
 func TestCheckCompletion_RealWorkPasses(t *testing.T) {

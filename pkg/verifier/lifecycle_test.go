@@ -624,15 +624,11 @@ func runMutationPathGuardMatrix(t *testing.T) {
 	if err := os.Symlink(outsideFile, trackedLink); err != nil {
 		t.Fatal(err)
 	}
-	git(t, dir, "add", "tracked-link")
-	git(t, dir, "commit", "-q", "-m", "add tracked link")
 
 	gitParentLink := filepath.Join(dir, "git-parent")
 	if err := os.Symlink(".git", gitParentLink); err != nil {
 		t.Fatal(err)
 	}
-	git(t, dir, "add", "git-parent")
-	git(t, dir, "commit", "-q", "-m", "add git metadata alias")
 	outsideParent := t.TempDir()
 	outsideVictim := filepath.Join(outsideParent, "victim.txt")
 	writeFile(t, outsideVictim, "outside-parent\n")
@@ -640,8 +636,8 @@ func runMutationPathGuardMatrix(t *testing.T) {
 	if err := os.Symlink(outsideParent, outsideParentLink); err != nil {
 		t.Fatal(err)
 	}
-	git(t, dir, "add", "outside-parent")
-	git(t, dir, "commit", "-q", "-m", "add outside parent alias")
+	git(t, dir, "add", "tracked-link", "git-parent", "outside-parent")
+	git(t, dir, "commit", "-q", "-m", "add mutation guard links")
 	candidate := gitOutput(t, dir, "rev-parse", "HEAD")
 
 	cases := []struct {

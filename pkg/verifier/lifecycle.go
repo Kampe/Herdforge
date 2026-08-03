@@ -342,10 +342,9 @@ func (o *ownedSubprocess) RunProtocol() (userExitHint int, err error) {
 		userExitHint = ec
 	}
 
-	// Residual drain WHILE supervisor (leader) is still live.
-	if serr := o.sample(); serr != nil {
-		return userExitHint, fmt.Errorf("ownership sample at done: %w", serr)
-	}
+	// Residual drain WHILE supervisor (leader) is still live. The production
+	// drain begins with the authoritative done-phase sample; sampling here as
+	// well only enumerates the same process table twice back-to-back.
 	if derr := residualDrainFn(o); derr != nil {
 		return userExitHint, derr
 	}
@@ -439,26 +438,17 @@ func (o *ownedSubprocess) drainResidualsWhileLeaderLive() error {
 	if err := o.killTracked(false); err != nil {
 		return fmt.Errorf("drain residuals kill tracked: %w", err)
 	}
-	// Identity-kill remaining live members of the original pgid while leader
-	// live — never kill the supervisor itself.
-	if err := killProcessGroupMembersExcept(pgid, o.leader); err != nil {
-		return fmt.Errorf("drain residuals group members: %w", err)
-	}
 	// Fail-closed: original pgid must have no live non-leader members before
-	// we release the supervisor (same-group residual writers).
+	// we release the supervisor (same-group residual writers). The waiter
+	// identity-kills members from a fresh snapshot whenever it finds any, so a
+	// separate unconditional enumeration immediately beforehand is redundant.
 	if err := waitProcessGroupEmptyExcept(pgid, o.leader, processGroupGoneBound); err != nil {
 		return fmt.Errorf("drain residuals group empty: %w", err)
 	}
-	// One more causal sample+kill pass for late forks still in the owned tree.
-	if err := o.sample(); err != nil {
-		return fmt.Errorf("drain residuals re-sample: %w", err)
-	}
-	if err := o.killTracked(false); err != nil {
-		return fmt.Errorf("drain residuals re-kill: %w", err)
-	}
 	// Marker lineage residual: processes that still hold the inherited
-	// ownership marker FD. Authority is the marker, not path/start-time.
-	// Loop until no live marked holders remain (or bound) — fail closed.
+	// ownership marker FD. Authority is the marker, not path/start-time. Once
+	// the lock is acquirable, no future process can inherit the now-unheld
+	// marker, so another broad causal sample adds no completion evidence.
 	if err := o.adoptAndKillMarkedResiduals(); err != nil {
 		return err
 	}
