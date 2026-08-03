@@ -10,7 +10,10 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/Kampe/Herdforge/pkg/provider"
 )
@@ -31,20 +34,20 @@ const (
 
 // Result is the provider-neutral eligibility evaluation for one task.
 type Result struct {
-	Ref                  string            `json:"ref"`
-	Title                string            `json:"title"`
-	State                State             `json:"state"`
-	Priority             provider.Priority `json:"priority"`
-	Status               string            `json:"status"` // normalized
-	Role                 string            `json:"role,omitempty"`
-	RiskHint             string            `json:"risk_hint,omitempty"`
-	Reasons              []string          `json:"reasons,omitempty"` // exact missing field/authority
-	BlockedBy            []string          `json:"blocked_by,omitempty"`
-	DuplicateOf          []string          `json:"duplicate_of,omitempty"`
-	IntegratedEvidence   string            `json:"integrated_evidence,omitempty"`
-	AcceptancePresent    bool              `json:"acceptance_present"`
-	HasRoleLabel         bool              `json:"has_role_label"`
-	OperatorPrioritySet  bool              `json:"operator_priority_set"`
+	Ref                 string            `json:"ref"`
+	Title               string            `json:"title"`
+	State               State             `json:"state"`
+	Priority            provider.Priority `json:"priority"`
+	Status              string            `json:"status"` // normalized
+	Role                string            `json:"role,omitempty"`
+	RiskHint            string            `json:"risk_hint,omitempty"`
+	Reasons             []string          `json:"reasons,omitempty"` // exact missing field/authority
+	BlockedBy           []string          `json:"blocked_by,omitempty"`
+	DuplicateOf         []string          `json:"duplicate_of,omitempty"`
+	IntegratedEvidence  string            `json:"integrated_evidence,omitempty"`
+	AcceptancePresent   bool              `json:"acceptance_present"`
+	HasRoleLabel        bool              `json:"has_role_label"`
+	OperatorPrioritySet bool              `json:"operator_priority_set"`
 }
 
 // Facts carries external evidence the provider Task surface does not yet expose
@@ -65,6 +68,11 @@ type Facts struct {
 	RoleMap map[string]string
 	// RiskHints maps ref → risk tier (R0–R3). Labels/description may also supply risk.
 	RiskHints map[string]string
+	// RequireRiskHint opts into treating a missing risk hint as NEEDS_GROOMING.
+	// Default false: FAC-123 acceptance does not mandate risk on every card.
+	// TARGET-WORKFLOW "risk hint" discipline must be enabled by the operator
+	// explicitly — never silently.
+	RequireRiskHint bool
 }
 
 // Report partitions a board snapshot into eligibility buckets.
@@ -171,6 +179,8 @@ func ResolveRole(task *provider.Task, roleMap map[string]string) (role string, o
 }
 
 // ResolveRisk returns a risk hint from Facts, labels (risk:R2 / R2), or description.
+// Description scanning is Unicode-safe: key search and token extraction use the
+// same lowercased view so non-ASCII case folding cannot misalign byte indices.
 func ResolveRisk(task *provider.Task, hints map[string]string) string {
 	if task == nil {
 		return ""
@@ -184,25 +194,60 @@ func ResolveRisk(task *provider.Task, hints map[string]string) string {
 		l := strings.TrimSpace(label)
 		lower := strings.ToLower(l)
 		if strings.HasPrefix(lower, "risk:") {
-			return strings.TrimSpace(l[len("risk:"):])
+			// Slice the lowercased view (ASCII key); token is case-folded risk tier.
+			return strings.TrimSpace(lower[len("risk:"):])
 		}
 		switch lower {
 		case "r0", "r1", "r2", "r3":
 			return strings.ToUpper(lower)
 		}
 	}
-	lower := strings.ToLower(task.Description)
+	return riskFromDescription(task.Description)
+}
+
+// riskFromDescription finds "risk:", "risk tier:", or "risk hint:" using a
+// lowercased copy for both search and extraction so byte offsets stay aligned
+// under Unicode case folding (e.g. İ → i̇).
+func riskFromDescription(description string) string {
+	if description == "" {
+		return ""
+	}
+	lower := strings.ToLower(description)
 	for _, key := range []string{"risk:", "risk tier:", "risk hint:"} {
-		if i := strings.Index(lower, key); i >= 0 {
-			rest := strings.TrimSpace(task.Description[i+len(key):])
-			// first token
-			fields := strings.Fields(rest)
-			if len(fields) > 0 {
-				return strings.Trim(fields[0], ".,;")
-			}
+		i := strings.Index(lower, key)
+		if i < 0 {
+			continue
+		}
+		rest := strings.TrimSpace(lower[i+len(key):])
+		token := firstRiskToken(rest)
+		if token != "" {
+			return token
 		}
 	}
 	return ""
+}
+
+// firstRiskToken returns the first whitespace-delimited risk token, uppercased
+// when it looks like Rn, otherwise trimmed as-is (still from the lower view).
+func firstRiskToken(s string) string {
+	s = strings.TrimLeftFunc(s, unicode.IsSpace)
+	if s == "" {
+		return ""
+	}
+	end := 0
+	for end < len(s) {
+		r, size := utf8.DecodeRuneInString(s[end:])
+		if unicode.IsSpace(r) || strings.ContainsRune(".,;)]}", r) {
+			break
+		}
+		end += size
+	}
+	tok := s[:end]
+	switch tok {
+	case "r0", "r1", "r2", "r3":
+		return strings.ToUpper(tok)
+	}
+	return tok
 }
 
 // rolesMatch reports whether claimRole may claim a card with requiredRole.
@@ -311,8 +356,10 @@ func EvaluateTask(task *provider.Task, facts Facts, claimRole string) Result {
 	if !res.OperatorPrioritySet {
 		grooming = append(grooming, "priority: operator priority required")
 	}
-	if strings.TrimSpace(res.RiskHint) == "" {
-		grooming = append(grooming, "risk: risk hint required (label risk:R*, description, or facts.RiskHints)")
+	// Risk is optional unless the operator explicitly opts in (RequireRiskHint).
+	// FAC-123 acceptance lists acceptance/role/deps/duplicates/integrated — not risk.
+	if facts.RequireRiskHint && strings.TrimSpace(res.RiskHint) == "" {
+		grooming = append(grooming, "risk: risk hint required by operator policy (label risk:R*, description, or facts.RiskHints)")
 	}
 	if res.Status == "unknown" || strings.HasPrefix(res.Status, "unknown:") {
 		grooming = append(grooming, "status: unknown or unnormalized provider status ("+task.Status+")")
@@ -396,12 +443,62 @@ func SelectEligible(ctx context.Context, tp provider.TaskProvider, projectID str
 }
 
 // SortByClaimOrder sorts by priority DESC then numeric ticket ref ASC.
+// Ref ordering is local (compareRefs): handles PREFIX-N (FAC-9) and GitHub #N
+// without relying on provider.CompareRefs, which only parses hyphenated refs
+// (FAC-124 owns adapter-side normalization).
 func SortByClaimOrder(rows []Result) {
 	sort.SliceStable(rows, func(i, j int) bool {
 		pi, pj := priorityRank[rows[i].Priority], priorityRank[rows[j].Priority]
 		if pi != pj {
 			return pi > pj
 		}
-		return provider.CompareRefs(rows[i].Ref, rows[j].Ref) < 0
+		return compareRefs(rows[i].Ref, rows[j].Ref) < 0
 	})
+}
+
+// compareRefs orders ticket refs with numeric awareness for:
+//   - PREFIX-N forms (FAC-9 < FAC-10 < FAC-100)
+//   - GitHub #N forms (#9 < #10 < #100)
+//
+// Same numeric ticket with different shapes falls back to lexical compare.
+// Non-conforming refs are ordered lexically. Kept inside pkg/eligibility so
+// FAC-124 can later centralize adapter ref normalization without this package
+// editing pkg/provider.
+func compareRefs(a, b string) int {
+	an, aok := ticketNumber(a)
+	bn, bok := ticketNumber(b)
+	if aok && bok {
+		switch {
+		case an < bn:
+			return -1
+		case an > bn:
+			return 1
+		}
+		// Equal ticket numbers: stable lexical on full ref (FAC-9 vs #9).
+	}
+	return strings.Compare(a, b)
+}
+
+// ticketNumber extracts the integer ticket id from PREFIX-N or #N refs.
+func ticketNumber(ref string) (int, bool) {
+	ref = strings.TrimSpace(ref)
+	if ref == "" {
+		return 0, false
+	}
+	if strings.HasPrefix(ref, "#") {
+		n, err := strconv.Atoi(ref[1:])
+		if err != nil {
+			return 0, false
+		}
+		return n, true
+	}
+	i := strings.LastIndex(ref, "-")
+	if i <= 0 || i == len(ref)-1 {
+		return 0, false
+	}
+	n, err := strconv.Atoi(ref[i+1:])
+	if err != nil {
+		return 0, false
+	}
+	return n, true
 }
