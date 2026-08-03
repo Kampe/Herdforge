@@ -90,6 +90,10 @@ type ClaimManager struct {
 	// is honored before another settler may reclaim it, i.e. how long a
 	// crashed settler's in-flight release can block recovery.
 	capacityClaimTimeout time.Duration
+	// providerLockTimeout bounds how long CompleteProviderTransition's
+	// AcquireProviderLock is honored before a different settler may
+	// preempt it (crash recovery for a provider call that never returned).
+	providerLockTimeout time.Duration
 }
 
 // Option configures a ClaimManager.
@@ -126,12 +130,22 @@ func WithCapacityClaimTimeout(d time.Duration) Option {
 	return func(m *ClaimManager) { m.capacityClaimTimeout = d }
 }
 
+// WithProviderLockTimeout overrides how long CompleteProviderTransition's
+// provider-transition lock is honored before a different settler may
+// preempt it (crash recovery bound for a provider call that never
+// returned). Default 5m, matching providerLockStaleAfter (the fixed
+// window Release/Acquire's reclaim path use to honor -- or stop honoring
+// -- someone else's lock).
+func WithProviderLockTimeout(d time.Duration) Option {
+	return func(m *ClaimManager) { m.providerLockTimeout = d }
+}
+
 // NewClaimManager builds a ClaimManager over store. store's lifetime is
 // owned by the caller (Close it when the manager is no longer needed).
 func NewClaimManager(store LeaseStore, opts ...Option) *ClaimManager {
 	m := &ClaimManager{
 		store: store, capacity: noopCapacity{}, outbox: noopOutbox{}, now: time.Now, ttl: 10 * time.Minute,
-		capacityClaimTimeout: 5 * time.Minute,
+		capacityClaimTimeout: 5 * time.Minute, providerLockTimeout: 5 * time.Minute,
 	}
 	m.settlerID = fmt.Sprintf("pid%d-%p-%d", os.Getpid(), m, time.Now().UnixNano())
 	for _, opt := range opts {

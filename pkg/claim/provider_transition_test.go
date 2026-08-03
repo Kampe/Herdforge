@@ -649,3 +649,92 @@ func TestClaimManager_ProviderTransition_RejectsNoLease(t *testing.T) {
 
 	assertProviderTransitionFenced(t, mgr, outbox, provider, key, "w1", 1, "FAC-43")
 }
+
+// TestClaimManager_CompleteProviderTransition_ReleaseBlockedDuringInFlightCAS
+// reproduces the exact race the review's probe exploited and proves the
+// mutual-exclusion fix closes it. The probe: gate the SECOND read-only
+// check, release the exact owner/generation, then resume -- outcome
+// complete_err=<nil> provider_calls=1 mutated=true. Two reads can never
+// close that window, because the second read observing "still current"
+// and the ProviderCAS call actually running are not the same instant;
+// anything can happen between them. There is no way to make an
+// independent external call (ProviderCAS) atomic with a local read, so
+// the fix instead makes the two operations that must not interleave --
+// Release/reclaim and an in-flight provider mutation -- mutually
+// exclusive via a real lock: AcquireProviderLock verifies AND locks the
+// lease in one atomic store statement, held for the duration of the
+// ProviderCAS call.
+//
+// completeProviderTransitionTestHook fires with that lock already held,
+// immediately before ProviderCAS. This test uses it to attempt a REAL
+// Release for the exact owner/generation CompleteProviderTransition is
+// mid-flight for -- reproducing the review's "release after the final
+// check, before the provider call" scenario precisely. Under the fix,
+// that Release must fail (the lock blocks it, returning
+// ErrProviderTransitionInProgress) rather than silently succeeding, and
+// CompleteProviderTransition -- which legitimately still owns the lease
+// throughout, because the interleaved release never actually took
+// effect -- completes normally with exactly one correct (non-stale)
+// ProviderCAS call. Zero release/reclaim-and-provider-call interleaving
+// is possible; there is no outcome where the provider is mutated on
+// behalf of a lease that is not, at that exact instant, still current.
+func TestClaimManager_CompleteProviderTransition_ReleaseBlockedDuringInFlightCAS(t *testing.T) {
+	store := newTestStore(t)
+	outbox := newTestOutbox(t)
+	provider := newFakeProviderCAS()
+	provider.seed("FAC-44", "to-do", 1)
+	mgr := NewClaimManager(store, WithProviderCAS(provider), WithDurableOutbox(outbox))
+	ctx := context.Background()
+	key := testKey("FAC-44")
+
+	lease, err := mgr.Claim(ctx, ClaimRequest{Key: key, OwnerID: "w1", Role: "herd-smith", TaskRole: "herd-smith"})
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	if _, err := mgr.BeginProviderTransition(ctx, key, "w1", lease.Generation, "provider_mutation"); err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+
+	var releaseErr error
+	completeProviderTransitionTestHook = func() {
+		releaseErr = mgr.Release(ctx, key, "w1", lease.Generation)
+	}
+	t.Cleanup(func() { completeProviderTransitionTestHook = nil })
+
+	rec, err := mgr.CompleteProviderTransition(ctx, key, "w1", lease.Generation, "FAC-44", "1", func(ctx context.Context) error {
+		provider.setStatus("FAC-44", "claimed")
+		return nil
+	})
+
+	if !errors.Is(releaseErr, ErrProviderTransitionInProgress) {
+		t.Fatalf("expected the interleaved Release to be blocked by the in-flight lock with ErrProviderTransitionInProgress, got %v", releaseErr)
+	}
+	if err != nil {
+		t.Fatalf("expected CompleteProviderTransition to succeed (it legitimately still owns the lease throughout), got %v", err)
+	}
+	if rec.Status != OutboxApplied {
+		t.Fatalf("expected applied, got %s", rec.Status)
+	}
+	if calls := provider.callCount(); calls != 1 {
+		t.Fatalf("expected exactly 1 correct ProviderCAS call, got %d", calls)
+	}
+	if status := provider.statusOf("FAC-44"); status != "claimed" {
+		t.Fatalf("expected the legitimate mutation to have applied, got %q", status)
+	}
+
+	// The interleaved release never actually took effect: the lease is
+	// still active, same generation, once the lock is released.
+	claims, err := mgr.ActiveClaims(ctx)
+	if err != nil {
+		t.Fatalf("active claims: %v", err)
+	}
+	if len(claims) != 1 || claims[0].Generation != lease.Generation || claims[0].OwnerID != "w1" {
+		t.Fatalf("expected the original lease still active and untouched, got %+v", claims)
+	}
+
+	// Now that the lock is released (CompleteProviderTransition returned),
+	// the owner can release normally.
+	if err := mgr.Release(ctx, key, "w1", lease.Generation); err != nil {
+		t.Fatalf("expected release to succeed once the lock clears, got %v", err)
+	}
+}

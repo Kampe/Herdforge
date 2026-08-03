@@ -111,7 +111,9 @@ func (s *SQLiteLeaseStore) migrate() error {
 			capacity_released_at DATETIME,
 			capacity_release_state TEXT NOT NULL DEFAULT 'pending',
 			capacity_release_owner TEXT NOT NULL DEFAULT '',
-			capacity_release_claimed_at DATETIME
+			capacity_release_claimed_at DATETIME,
+			provider_lock_owner TEXT NOT NULL DEFAULT '',
+			provider_lock_at DATETIME
 		)`,
 		`CREATE UNIQUE INDEX IF NOT EXISTS idx_leases_active_key
 			ON leases(repo, provider, project, task_ref)
@@ -183,6 +185,18 @@ func isUniqueViolation(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "UNIQUE constraint")
 }
 
+// providerLockStaleAfter bounds how long Release and Acquire's reclaim
+// path honor a provider-transition lock (see AcquireProviderLock) before
+// treating it as abandoned (its holder crashed) and proceeding anyway.
+// Not configurable via the LeaseStore interface -- Release/Acquire's
+// signatures are unchanged and heavily depended on elsewhere -- but kept
+// generous enough that a normal (fast) provider call never trips it, and
+// short enough that a crash doesn't block a lease indefinitely.
+// ClaimManager's own WithProviderLockTimeout (which controls how long
+// AcquireProviderLock itself honors a *different* stale lock before
+// preempting it) defaults to the same value for consistency.
+const providerLockStaleAfter = 5 * time.Minute
+
 // expireStaleTestHook, when non-nil, runs once per candidate row right
 // before ExpireStale's per-row UPDATE, letting a test deterministically
 // land a concurrent Hold/Renew inside the SELECT-to-UPDATE window instead
@@ -201,8 +215,9 @@ var expireStaleTestHook func(candidate *Lease)
 func (s *SQLiteLeaseStore) Acquire(ctx context.Context, key LeaseKey, ownerID, role, worktreePath string, now time.Time, ttl time.Duration) (*Lease, error) {
 	if _, err := execWithRetry(ctx, s.db, `UPDATE leases SET status = 'expired'
 		WHERE repo = ? AND provider = ? AND project = ? AND task_ref = ?
-		AND status = 'active' AND held = 0 AND expires_at <= ?`,
-		key.Repo, key.Provider, key.Project, key.TaskRef, now); err != nil {
+		AND status = 'active' AND held = 0 AND expires_at <= ?
+		AND (provider_lock_owner = '' OR provider_lock_at <= ?)`,
+		key.Repo, key.Provider, key.Project, key.TaskRef, now, now.Add(-providerLockStaleAfter)); err != nil {
 		return nil, fmt.Errorf("acquire: expire stale: %w", err)
 	}
 
@@ -228,7 +243,11 @@ func (s *SQLiteLeaseStore) Acquire(ctx context.Context, key LeaseKey, ownerID, r
 				// re-reading; the winner has since released. Caller retries.
 				return nil, fmt.Errorf("acquire: %w: transient contention, retry", ErrAlreadyClaimed)
 			}
-			return nil, &ClaimConflictError{Key: key, Lease: existing, Reason: "active and unexpired"}
+			reason := "active and unexpired"
+			if existing.Expired(now) {
+				reason = "expired but blocked by an in-progress provider transition"
+			}
+			return nil, &ClaimConflictError{Key: key, Lease: existing, Reason: reason}
 		}
 		return nil, fmt.Errorf("acquire: insert: %w", err)
 	}
@@ -292,8 +311,9 @@ func (s *SQLiteLeaseStore) renewFailureError(ctx context.Context, key LeaseKey, 
 func (s *SQLiteLeaseStore) Release(ctx context.Context, key LeaseKey, ownerID string, generation int64, now time.Time) (*Lease, bool, error) {
 	res, err := execWithRetry(ctx, s.db, `UPDATE leases SET status = 'released', released_at = ?
 		WHERE repo = ? AND provider = ? AND project = ? AND task_ref = ?
-		AND owner_id = ? AND generation = ? AND status = 'active'`,
-		now, key.Repo, key.Provider, key.Project, key.TaskRef, ownerID, generation)
+		AND owner_id = ? AND generation = ? AND status = 'active'
+		AND (provider_lock_owner = '' OR provider_lock_at <= ?)`,
+		now, key.Repo, key.Provider, key.Project, key.TaskRef, ownerID, generation, now.Add(-providerLockStaleAfter))
 	if err != nil {
 		return nil, false, fmt.Errorf("release: %w", err)
 	}
@@ -303,7 +323,9 @@ func (s *SQLiteLeaseStore) Release(ctx context.Context, key LeaseKey, ownerID st
 	}
 
 	// Nothing flipped: figure out whether this is an idempotent replay of
-	// an already-released call, or a stale/unknown generation.
+	// an already-released call, a stale/unknown generation, or blocked by
+	// a live provider-transition lock (everything else in the WHERE
+	// clause matched, so if the row is still active, the lock is why).
 	existing, err := s.byGeneration(ctx, key, ownerID, generation)
 	if err != nil {
 		return nil, false, fmt.Errorf("release: lookup: %w", err)
@@ -311,10 +333,62 @@ func (s *SQLiteLeaseStore) Release(ctx context.Context, key LeaseKey, ownerID st
 	if existing != nil && existing.Status == StatusReleased {
 		return existing, false, nil
 	}
+	if existing != nil && existing.Status == StatusActive {
+		return nil, false, fmt.Errorf("%w: %s generation %d", ErrProviderTransitionInProgress, key.TaskRef, generation)
+	}
 	if existing != nil {
 		return nil, false, fmt.Errorf("release: %w: generation %d is %s, not active", ErrStaleGeneration, generation, existing.Status)
 	}
 	return nil, false, s.fencingError(ctx, key, ownerID, generation)
+}
+
+// AcquireProviderLock implements LeaseStore. The UPDATE...RETURNING
+// statement combines the fencing check (owner_id/generation/status match)
+// and the lock acquisition into one atomic operation, so there is no
+// window between "verify current" and "lock it" for a concurrent
+// Release/reclaim to land in -- unlike a plain read-only check followed
+// by a separate write.
+func (s *SQLiteLeaseStore) AcquireProviderLock(ctx context.Context, key LeaseKey, ownerID string, generation int64, lockOwner string, staleAfter time.Duration, now time.Time) (*Lease, error) {
+	staleBefore := now.Add(-staleAfter)
+	rows, err := queryWithRetry(ctx, s.db, `UPDATE leases SET provider_lock_owner = ?, provider_lock_at = ?
+		WHERE repo = ? AND provider = ? AND project = ? AND task_ref = ?
+		AND owner_id = ? AND generation = ? AND status = 'active'
+		AND (provider_lock_owner = '' OR provider_lock_owner = ? OR provider_lock_at < ?)
+		RETURNING `+leaseColumns,
+		lockOwner, now, key.Repo, key.Provider, key.Project, key.TaskRef, ownerID, generation, lockOwner, staleBefore)
+	if err != nil {
+		return nil, fmt.Errorf("acquire provider lock: %w", err)
+	}
+	defer rows.Close()
+	if rows.Next() {
+		return scanLease(rows)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	// Nothing matched: distinguish "still current but locked by a live,
+	// different transition" from "genuinely not the current lease
+	// anymore" (the race this whole mechanism exists to close).
+	current, cerr := s.byGeneration(ctx, key, ownerID, generation)
+	if cerr != nil {
+		return nil, fmt.Errorf("acquire provider lock: lookup: %w", cerr)
+	}
+	if current != nil && current.Status == StatusActive {
+		return nil, fmt.Errorf("%w: %s generation %d", ErrProviderTransitionInProgress, key.TaskRef, generation)
+	}
+	return nil, s.fencingError(ctx, key, ownerID, generation)
+}
+
+// ReleaseProviderLock implements LeaseStore.
+func (s *SQLiteLeaseStore) ReleaseProviderLock(ctx context.Context, key LeaseKey, generation int64, lockOwner string) error {
+	_, err := execWithRetry(ctx, s.db, `UPDATE leases SET provider_lock_owner = '', provider_lock_at = NULL
+		WHERE repo = ? AND provider = ? AND project = ? AND task_ref = ? AND generation = ? AND provider_lock_owner = ?`,
+		key.Repo, key.Provider, key.Project, key.TaskRef, generation, lockOwner)
+	if err != nil {
+		return fmt.Errorf("release provider lock: %w", err)
+	}
+	return nil
 }
 
 func (s *SQLiteLeaseStore) byGeneration(ctx context.Context, key LeaseKey, ownerID string, generation int64) (*Lease, error) {
