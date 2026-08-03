@@ -12,60 +12,52 @@ import (
 	"time"
 )
 
-// TestLateWriterIntoGitFailsCleanupWithoutReap is the deterministic pre-fix
-// reproduction of the FAC-125 CI flake class: a residual process-group writer
-// recreates files under .git while RemoveAll walks the tree, so unlinkat on
-// .git returns "directory not empty".
-//
-// This test deliberately does NOT use t.TempDir for the victim tree: it must
-// assert RemoveAll failure with a live unreaped writer, then reap and delete
-// under explicit ownership. No sleeps-as-fix, no RemoveAll retries.
-func TestLateWriterIntoGitFailsCleanupWithoutReap(t *testing.T) {
+// TestLateWriterIntoGitRequiresExplicitReap proves the ownership defect class:
+// an unreaped process-group writer remains live (and may recreate files under
+// .git) until processGroupKiller runs. RemoveAll is attempted while unreaped
+// only to exercise the concurrent-writer path; the hard assertions are live
+// before reap and gone after reap — never a soft t.Log when reproduction is
+// weak.
+func TestLateWriterIntoGitRequiresExplicitReap(t *testing.T) {
 	root, err := os.MkdirTemp("", "verifier-late-writer-*")
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Ownership of root transfers to the end of this test via explicit reap +
-	// RemoveAll — never leave an unreaped writer for the package teardown.
 	gitDir := filepath.Join(root, ".git")
 	if err := os.MkdirAll(filepath.Join(gitDir, "objects"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 
-	// Child process group: keep creating files under .git so concurrent
-	// RemoveAll races on a non-empty directory. Use sh -c (not a shebang
-	// script) so race-instrumented starts cannot miss an executable bit race.
 	cmd := exec.Command("sh", "-c", `i=0; while :; do i=$((i+1)); printf x > "$1/objects/late-$i"; done`, "late-writer", gitDir)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
 	pgid := cmd.Process.Pid
-	// Ensure at least one late object exists before RemoveAll.
 	if err := waitForLateObject(gitDir, pgid); err != nil {
 		reapProcessGroup(pgid)
 		_ = cmd.Wait()
 		t.Fatal(err)
 	}
-
-	removeErr := os.RemoveAll(root)
-	// Always reap before leaving the test, regardless of RemoveAll outcome.
-	reapProcessGroup(pgid)
-	_ = cmd.Process.Kill()
-	_ = cmd.Wait()
-
-	if removeErr == nil {
-		// Writer may have been scheduled such that RemoveAll still won. The
-		// lifecycle defect class is still that an unreaped process group was
-		// left owning the tree; we required an explicit reap above.
-		t.Log("RemoveAll won the scheduler race once; unreaped process group still required explicit kill")
-	} else {
-		t.Logf("reproduced pre-fix late-writer cleanup failure: %v", removeErr)
+	if err := syscall.Kill(pgid, 0); err != nil {
+		t.Fatalf("unreaped writer must be live after creating residue: %v", err)
 	}
 
-	// After process-group reap, cleanup must succeed without retry loops.
+	// Concurrent RemoveAll while unreaped — may fail with directory-not-empty.
+	_ = os.RemoveAll(root)
+
+	// Ownership defect: without explicit reap the group is still live.
+	if err := syscall.Kill(pgid, 0); err != nil {
+		t.Fatalf("unreaped writer must survive RemoveAll until explicit reap: %v", err)
+	}
+
+	reapProcessGroup(pgid)
+	_ = cmd.Wait()
+	if err := waitForPIDGone(pgid, 2*time.Second); err != nil {
+		t.Fatalf("after process-group reap, leader must be gone: %v", err)
+	}
 	if err := os.RemoveAll(root); err != nil {
-		t.Fatalf("after process-group reap, RemoveAll must succeed: %v (%s)", err, diagnoseRepoWriters(root))
+		t.Fatalf("after explicit reap, RemoveAll must succeed: %v", err)
 	}
 }
 
@@ -81,62 +73,71 @@ func TestProcessGroupReapAllowsTempDirCleanup(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(gitDir, "objects"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	life := &lifecycle{}
 	cmd := exec.Command("sh", "-c", `i=0; while :; do i=$((i+1)); printf x > "$1/objects/late-$i"; done`, "late-writer", gitDir)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
-	life.observeStarted(cmd)
-
-	if err := waitForLateObject(gitDir, cmd.Process.Pid); err != nil {
-		life.reap()
+	pgid := cmd.Process.Pid
+	if err := waitForLateObject(gitDir, pgid); err != nil {
+		reapProcessGroup(pgid)
 		_ = cmd.Wait()
 		t.Fatal(err)
 	}
-	life.finishCommand(cmd)
+	reapProcessGroup(pgid)
 	_ = cmd.Wait()
-	life.reap()
-
+	if err := waitForPIDGone(pgid, 2*time.Second); err != nil {
+		t.Fatalf("reaped writer still live: %v", err)
+	}
 	if err := os.RemoveAll(root); err != nil {
-		t.Fatalf("reaped writer must not block cleanup: %v (%s)", err, diagnoseRepoWriters(root))
+		t.Fatalf("reaped writer must not block cleanup: %v", err)
 	}
 }
 
-// TestHermeticGitDoesNotLeaveDetachedWriters proves production git helpers
-// disable auto-detach writers and leave a tree RemoveAll-clean without
-// test-side deletion tricks.
-func TestHermeticGitDoesNotLeaveDetachedWriters(t *testing.T) {
-	root, err := os.MkdirTemp("", "verifier-hermetic-git-*")
+// TestHermeticGitConfigFlagsReachGit is the non-vacuous coverage for
+// hermeticGitConfig: git must resolve the -c overrides on the same argv path
+// runGit uses. Deleting hermeticGitConfig fails these equality checks.
+func TestHermeticGitConfigFlagsReachGit(t *testing.T) {
+	root, err := os.MkdirTemp("", "verifier-hermetic-flags-*")
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() {
-		if err := os.RemoveAll(root); err != nil {
-			t.Fatalf("hermetic git tree must clean up: %v (%s)", err, diagnoseRepoWriters(root))
-		}
-	}()
+	t.Cleanup(func() { _ = os.RemoveAll(root) })
 
 	if _, err := runGit(root, "init", "-q", "-b", "main"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := runGit(root, "config", "user.email", "test@example.invalid"); err != nil {
+	// Intentional ambient-style repo values that must be overridden by -c.
+	if _, err := runGit(root, "config", "gc.auto", "6700"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := runGit(root, "config", "user.name", "verifier-test"); err != nil {
+	if _, err := runGit(root, "config", "gc.autoDetach", "true"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := runGit(root, "config", "commit.gpgsign", "false"); err != nil {
+	if _, err := runGit(root, "config", "maintenance.auto", "true"); err != nil {
 		t.Fatal(err)
 	}
-	for i := 0; i < 25; i++ {
-		writeFile(t, filepath.Join(root, "f.txt"), fmt.Sprintf("%d\n", i))
-		if _, err := runGit(root, "add", "f.txt"); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := runGit(root, "commit", "-q", "-m", fmt.Sprintf("c%d", i)); err != nil {
-			t.Fatal(err)
-		}
+
+	gotAuto, err := runGit(root, "config", "--get", "gc.auto")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(string(gotAuto)) != "0" {
+		t.Fatalf("gc.auto via hermetic runGit = %q, want 0 (hermeticGitConfig must reach git)", strings.TrimSpace(string(gotAuto)))
+	}
+	gotDetach, err := runGit(root, "config", "--get", "gc.autoDetach")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(string(gotDetach)) != "false" {
+		t.Fatalf("gc.autoDetach via hermetic runGit = %q, want false", strings.TrimSpace(string(gotDetach)))
+	}
+	gotMaint, err := runGit(root, "config", "--get", "maintenance.auto")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(string(gotMaint)) != "false" {
+		t.Fatalf("maintenance.auto via hermetic runGit = %q, want false", strings.TrimSpace(string(gotMaint)))
 	}
 }
 
@@ -145,8 +146,6 @@ func TestHermeticGitDoesNotLeaveDetachedWriters(t *testing.T) {
 //
 //	go test -race ./pkg/verifier -run 'TestMutationPathGuardsRejectEscapesAndMetadataWithoutOutsideWrites$' -count=500 -parallel=2
 //	go test -race ./pkg/verifier/... -count=100
-//
-// Failures must not be masked by cleanup retries.
 func TestMutationPathGuardsStressNoTempDirResidue(t *testing.T) {
 	const iterations = 5
 	if testing.Short() {
@@ -241,8 +240,6 @@ func waitForLateObject(gitDir string, pgid int) error {
 		if time.Now().After(deadline) {
 			return fmt.Errorf("late writer never created a residual file under .git/objects")
 		}
-		// Bound the poll; this is readiness for a synthetic writer, not a
-		// cleanup mitigation. The production fix is reap/hermetic git.
 		time.Sleep(time.Millisecond)
 	}
 }

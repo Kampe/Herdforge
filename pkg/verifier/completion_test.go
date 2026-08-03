@@ -17,7 +17,6 @@ func vgit(t *testing.T, dir string, args ...string) {
 // commits are controllable per test.
 func completionRepo(t *testing.T, subjects ...string) string {
 	dir := t.TempDir()
-	registerTempDirLifecycleBarrier(t, dir)
 	vgit(t, dir, "init", "-q", "-b", "main")
 	vgit(t, dir, "config", "user.email", "t@h.local")
 	vgit(t, dir, "config", "user.name", "t")

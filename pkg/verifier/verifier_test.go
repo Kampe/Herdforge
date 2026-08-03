@@ -321,7 +321,6 @@ func TestReceiptUsesFullOutputDigestWithBoundedRetention(t *testing.T) {
 
 func TestMutationPathGuardsRejectEscapesAndMetadataWithoutOutsideWrites(t *testing.T) {
 	dir, _ := verificationRepo(t)
-	registerTempDirLifecycleBarrier(t, dir)
 	outsideDir := t.TempDir()
 	outsideFile := filepath.Join(outsideDir, "outside.txt")
 	writeFile(t, outsideFile, "outside\n")
@@ -602,17 +601,9 @@ func TestExecuteCancellationRequiresProcessGroupReap(t *testing.T) {
 	_ = syscall.Kill(pid, syscall.SIGKILL)
 }
 
-// TestExecuteCancellationReadyBarrierSelectorRuns proves the primary
-// ready-barrier test name is selected by the FAC-151 stress -run filter.
+// TestExecuteCancellationReadyBarrierSelectorRuns proves waitForChildReadyPID
+// fails closed when the ready signal never appears (non-vacuous helper gate).
 func TestExecuteCancellationReadyBarrierSelectorRuns(t *testing.T) {
-	// Non-vacuous: this test fails if renamed away from the stress selector
-	// contract used in acceptance gates.
-	const required = "TestExecuteCancellationKillsProcessGroup"
-	if !strings.Contains(required, "ExecuteCancellation") || !strings.Contains(required, "ProcessGroup") {
-		t.Fatal("selector contract string malformed")
-	}
-	// Touch the helper so a broken waitForChildReadyPID fails compilation of
-	// this package's ownership path, not only the primary test.
 	missing := filepath.Join(t.TempDir(), "never-ready.pid")
 	if _, err := waitForChildReadyPID(missing, time.Millisecond); err == nil {
 		t.Fatal("waitForChildReadyPID must fail when the ready signal never appears")
@@ -699,10 +690,8 @@ func TestRunMutationCheck_TimeoutRestoresCandidate(t *testing.T) {
 	if result.Outcome != OutcomeBLOCKED || result.Killed || !result.Restored {
 		t.Fatalf("timeout must block and restore: %+v", result)
 	}
-	// Bound is generous under -race × high -count (scheduler noise), but still
-	// far below the mutant's sleep-3 path, so a hung Wait cannot pass.
-	if time.Since(started) > 5*time.Second {
-		t.Fatal("bounded mutation timeout exceeded five seconds")
+	if time.Since(started) > time.Second {
+		t.Fatal("bounded mutation timeout exceeded one second")
 	}
 	assertFile(t, filepath.Join(dir, "candidate.txt"), "original\n")
 	assertClean(t, dir)
@@ -711,18 +700,17 @@ func TestRunMutationCheck_TimeoutRestoresCandidate(t *testing.T) {
 func TestRunMutationCheck_CancellationRestoresCandidate(t *testing.T) {
 	dir, candidate := mutationRepo(t, true)
 	ctx, cancel := context.WithCancel(context.Background())
-	// Cancel only after the mutant phase has started: baseline must PASS first
-	// under -race load where git+execute can approach a 1s wall clock.
+	// Cancel after mutant bytes are on disk so Restored evidence is real.
+	// Ready-on-mutant is the cancel trigger (not a 3s Timeout inflation).
 	go func() {
 		deadline := time.Now().Add(10 * time.Second)
 		for time.Now().Before(deadline) {
-			// Mutant rewrite flips candidate.txt; cancel once it is no longer original.
 			data, err := os.ReadFile(filepath.Join(dir, "candidate.txt"))
 			if err == nil && string(data) == "mutant\n" {
 				cancel()
 				return
 			}
-			time.Sleep(5 * time.Millisecond)
+			time.Sleep(time.Millisecond)
 		}
 		cancel()
 	}()
@@ -732,7 +720,7 @@ func TestRunMutationCheck_CancellationRestoresCandidate(t *testing.T) {
 		TargetFile:        "candidate.txt",
 		OriginalCode:      "original\n",
 		MutantCode:        "mutant\n",
-		Timeout:           3 * time.Second,
+		Timeout:           2 * time.Second,
 	})
 	if err != nil {
 		t.Fatalf("cancellation should return a BLOCKED result: %v", err)
@@ -766,7 +754,6 @@ func TestRunMutationCheck_RestoredCandidateFailureIsBlocked(t *testing.T) {
 
 func verificationRepo(t *testing.T) (string, string) {
 	dir := t.TempDir()
-	registerTempDirLifecycleBarrier(t, dir)
 	git(t, dir, "init", "-q", "-b", "main")
 	git(t, dir, "config", "user.email", "test@example.invalid")
 	git(t, dir, "config", "user.name", "verifier-test")
@@ -796,7 +783,6 @@ func restorationFailureRepo(t *testing.T) (string, string, string) {
 
 func mutationRepo(t *testing.T, waits bool) (string, string) {
 	dir := t.TempDir()
-	registerTempDirLifecycleBarrier(t, dir)
 	git(t, dir, "init", "-q", "-b", "main")
 	git(t, dir, "config", "user.email", "test@example.invalid")
 	git(t, dir, "config", "user.name", "verifier-test")
@@ -864,17 +850,4 @@ func gitOutput(t *testing.T, dir string, args ...string) string {
 	return strings.TrimSpace(string(output))
 }
 
-// registerTempDirLifecycleBarrier runs before testing's TempDir RemoveAll.
-// Production helpers already reap per-command process groups; this barrier
-// surfaces relative residual diagnostics if a writer still left residue —
-// never host absolute paths.
-func registerTempDirLifecycleBarrier(t *testing.T, dir string) {
-	t.Helper()
-	t.Cleanup(func() {
-		if _, err := os.Stat(filepath.Join(dir, ".git")); err == nil {
-			// Touch diagnostics so a future failure has a relative name list
-			// available in logs without embedding host paths in assertions.
-			_ = diagnoseRepoWriters(dir)
-		}
-	})
-}
+

@@ -186,6 +186,7 @@ func (v *Verifier) execute(ctx context.Context, dir string, policy EnvironmentPo
 	// Cancel reaps the whole process group while the leader is still live.
 	// Group-wide kill is required: leader-only kill leaves shell grandchildren
 	// running (see TestExecuteCancellationRequiresProcessGroupReap).
+	// No post-Wait kill: that re-introduces PID-reuse hazard; Cancel is enough.
 	cmd.Cancel = func() error {
 		if cmd.Process == nil {
 			return nil
@@ -200,23 +201,26 @@ func (v *Verifier) execute(ctx context.Context, dir string, policy EnvironmentPo
 	// keeps the mutation transaction's restoration defer reachable.
 	cmd.WaitDelay = 100 * time.Millisecond
 
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
+	// Single buffer for stdout+stderr so OutputDigest matches CombinedOutput
+	// interleaving for any command that writes both streams.
+	var combined bytes.Buffer
+	cmd.Stdout = &combined
+	cmd.Stderr = &combined
 	if err := cmd.Start(); err != nil {
-		return nil, err
+		// Cancellation (and other Start failures) must surface as BLOCKED
+		// Result, not a bare error — RunMutationCheckForCandidate relies on
+		// (result, nil) so the restore defer still records Restored evidence.
+		output := []byte(err.Error())
+		return &Result{
+			Outcome:      OutcomeBLOCKED,
+			Output:       boundedOutput(output),
+			OutputDigest: digestBytes(output),
+			ExitCode:     -1,
+			Duration:     time.Since(started),
+		}, nil
 	}
-	// Capture the session process-group id at start (Setpgid ⇒ pgid == pid).
-	// Used for residual group reap after Wait when ctx cancelled — kill(-pgid)
-	// targets remaining group members, not a reused leader PID identity.
-	pgid := cmd.Process.Pid
 	waitErr := cmd.Wait()
-	if ctx.Err() != nil {
-		// Explicit reap completion: residual group members may outlive Wait
-		// even after Cancel. Re-signal the captured process group.
-		reapProcessGroup(pgid)
-	}
-	output := append(stdout.Bytes(), stderr.Bytes()...)
+	output := combined.Bytes()
 	err := waitErr
 	result := &Result{
 		Passed:       err == nil,
