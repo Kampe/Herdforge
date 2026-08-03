@@ -59,6 +59,8 @@ type Row struct {
 	Capacity     int    `json:"capacity,omitempty"`
 	Attempts     int    `json:"attempts,omitempty"`
 	IngestedAt   string `json:"ingested_at,omitempty"`
+	LeaseID      string `json:"lease_id,omitempty"`
+	Generation   int64  `json:"generation,omitempty"`
 }
 
 type CandidateState string
@@ -90,6 +92,7 @@ type Candidate struct {
 	UpdatedAt     time.Time
 	LeaseID       string
 	LeaseExpiry   time.Time
+	Generation    int64
 }
 
 type ModelFamily string
@@ -161,10 +164,11 @@ func DefaultConfig(ledgerDir string) Config {
 type ReviewSupervisor struct {
 	mu sync.RWMutex
 
-	cfg    Config
-	cands  map[string]*Candidate
-	shaIdx map[string]string
-	evrows []Row
+	cfg      Config
+	cands    map[string]*Candidate
+	shaIdx   map[string]string
+	leaseGen map[string]int64
+	evrows   []Row
 
 	pendingCount int
 }
@@ -174,9 +178,10 @@ func New(cfg Config) *ReviewSupervisor {
 	os.MkdirAll(dir, 0755)
 
 	sv := &ReviewSupervisor{
-		cfg:    cfg,
-		cands:  make(map[string]*Candidate),
-		shaIdx: make(map[string]string),
+		cfg:      cfg,
+		cands:    make(map[string]*Candidate),
+		shaIdx:   make(map[string]string),
+		leaseGen: make(map[string]int64),
 	}
 	return sv
 }
@@ -251,12 +256,15 @@ func readRows(path string) ([]Row, error) {
 }
 
 type CompletionCallback struct {
-	SHA         string
-	Branch      string
-	PatchID     string
-	AuthorModel string
-	Tier        RiskTier
-	Files       []string
+	SHA           string
+	Branch        string
+	PatchID       string
+	AuthorModel   string
+	Tier          RiskTier
+	Files         []string
+	LeaseID       string
+	Generation    int64
+	DirtyWorktree bool
 }
 
 func (sv *ReviewSupervisor) Ingest(cb CompletionCallback) (accepted bool, staleSHA string, err error) {
@@ -267,13 +275,33 @@ func (sv *ReviewSupervisor) Ingest(cb CompletionCallback) (accepted bool, staleS
 		return false, "", fmt.Errorf("reviewsup: empty SHA in completion callback")
 	}
 
+	// Dirty-worktree evidence can never be reviewed: the recorded SHA does
+	// not describe the actual tree state. Fail closed.
+	if cb.DirtyWorktree {
+		return false, "", fmt.Errorf("reviewsup: completion callback for %s rejected: dirty worktree", cb.SHA)
+	}
+
 	if _, ok := sv.cands[cb.SHA]; ok {
 		return false, "", nil
+	}
+
+	// Lease-generation verification: a callback carrying a lease must present
+	// a strictly newer generation than any previously accepted callback for
+	// that lease. Generation 0 means "unspecified" and skips ordering checks.
+	if cb.LeaseID != "" && cb.Generation > 0 {
+		if last, ok := sv.leaseGen[cb.LeaseID]; ok && cb.Generation <= last {
+			return false, "", fmt.Errorf("reviewsup: stale lease generation for %s (lease=%s gen=%d last=%d)", cb.SHA, cb.LeaseID, cb.Generation, last)
+		}
 	}
 
 	if cb.PatchID != "" {
 		if prevSHA, ok := sv.shaIdx[cb.PatchID]; ok {
 			if prevCand, ok := sv.cands[prevSHA]; ok {
+				// Exact stale-SHA validation: when both commits carry
+				// generation info, a superseding commit must be newer.
+				if cb.Generation > 0 && prevCand.Generation > 0 && cb.Generation <= prevCand.Generation {
+					return false, "", fmt.Errorf("reviewsup: stale SHA %s for patch %s (gen %d <= %d)", cb.SHA, cb.PatchID, cb.Generation, prevCand.Generation)
+				}
 				pState := prevCand.State
 				pWasPending := (pState == StatePending || pState == StateReviewing || pState == StatePass)
 				prevCand.State = StateEvicted
@@ -309,6 +337,8 @@ func (sv *ReviewSupervisor) Ingest(cb CompletionCallback) (accepted bool, staleS
 		State:        StatePending,
 		IngestedAt:   sv.now(),
 		UpdatedAt:    sv.now(),
+		LeaseID:      cb.LeaseID,
+		Generation:   cb.Generation,
 	}
 
 	if err := sv.appendRow(&Row{
@@ -320,6 +350,8 @@ func (sv *ReviewSupervisor) Ingest(cb CompletionCallback) (accepted bool, staleS
 		AuthorFamily: cand.AuthorFamily,
 		Tier:         string(cb.Tier),
 		IngestedAt:   sv.nowISO(),
+		LeaseID:      cb.LeaseID,
+		Generation:   cb.Generation,
 	}); err != nil {
 		return false, "", fmt.Errorf("reviewsup: append completion row: %w", err)
 	}
@@ -327,6 +359,9 @@ func (sv *ReviewSupervisor) Ingest(cb CompletionCallback) (accepted bool, staleS
 	sv.cands[cb.SHA] = cand
 	if cb.PatchID != "" {
 		sv.shaIdx[cb.PatchID] = cb.SHA
+	}
+	if cb.LeaseID != "" && cb.Generation > 0 {
+		sv.leaseGen[cb.LeaseID] = cb.Generation
 	}
 	sv.pendingCount++
 
@@ -669,6 +704,7 @@ func (sv *ReviewSupervisor) Reconstruct() (int, error) {
 
 	sv.cands = make(map[string]*Candidate)
 	sv.shaIdx = make(map[string]string)
+	sv.leaseGen = make(map[string]int64)
 	sv.pendingCount = 0
 	sv.evrows = nil
 
@@ -697,10 +733,17 @@ func (sv *ReviewSupervisor) Reconstruct() (int, error) {
 				State:        StatePending,
 				IngestedAt:   ingestedAt,
 				UpdatedAt:    sv.cfg.Now(),
+				LeaseID:      r.LeaseID,
+				Generation:   r.Generation,
 			}
 			sv.cands[r.SHA] = cand
 			if r.PatchID != "" {
 				sv.shaIdx[r.PatchID] = r.SHA
+			}
+			if r.LeaseID != "" && r.Generation > 0 {
+				if cur, ok := sv.leaseGen[r.LeaseID]; !ok || r.Generation > cur {
+					sv.leaseGen[r.LeaseID] = r.Generation
+				}
 			}
 			sv.pendingCount++
 
