@@ -52,6 +52,13 @@ func (s *MemorySecretStore) Set(host, authorization string) error {
 	if host == "" || authorization == "" {
 		return fmt.Errorf("host and authorization required")
 	}
+	// Dummy CLI sentinels must never become accepted upstream credentials.
+	if IsDummyCredential(authorization) {
+		return &BlockedError{
+			Reason: BlockDummyUpstream,
+			Detail: "cannot store dummy sentinel as HostCreds",
+		}
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.creds == nil {
@@ -144,12 +151,20 @@ func CoordinatorHostCredsFromEnv() map[string]string {
 }
 
 // LoadEnvIntoStore copies coordinator env HostCreds into store (host names only exposed via Hosts()).
+// Dummy CLI sentinels are skipped (never become upstream credentials).
 func LoadEnvIntoStore(store SecretStore) error {
 	if store == nil {
 		return fmt.Errorf("nil store")
 	}
 	for h, a := range CoordinatorHostCredsFromEnv() {
+		if IsDummyCredential(a) {
+			continue
+		}
 		if err := store.Set(h, a); err != nil {
+			// Skip dummy rejections; surface other errors.
+			if be, ok := err.(*BlockedError); ok && be.Reason == BlockDummyUpstream {
+				continue
+			}
 			return err
 		}
 	}
