@@ -98,10 +98,24 @@ func TestQueuePressureErrorCannotBecomeFreeCapacity(t *testing.T) {
 	if stored.Known || stored.Error == "" {
 		t.Fatalf("failed update must not replace unknown safe state: %+v", stored)
 	}
-	for _, invalid := range []QueuePressure{{Depth: -1, Capacity: 1, Known: true}, {Depth: 1, Capacity: -1, Known: true}, {Depth: 0, Capacity: 1, Known: false}, {Depth: 1, Capacity: 1, Known: false, Error: "probe failed"}} {
+	for _, invalid := range []QueuePressure{{Depth: -1, Capacity: 1, Known: true}, {Depth: 1, Capacity: -1, Known: true}, {Depth: 2, Capacity: 1, Known: true}, {Depth: 0, Capacity: 1, Known: false}, {Depth: 1, Capacity: 1, Known: false, Error: "probe failed"}} {
 		if err := invalid.Validate(); err == nil {
 			t.Fatalf("invalid queue observation accepted: %+v", invalid)
 		}
+	}
+}
+
+func TestDeadProviderCannotContradictHealthyProviderObservation(t *testing.T) {
+	now := time.Date(2026, 8, 3, 12, 0, 0, 0, time.UTC)
+	exp := NewMetricsExporterWithPersistence(nil, func() time.Time { return now })
+	if err := exp.SetHealthAt(completeDependencies(), now); err != nil {
+		t.Fatal(err)
+	}
+	if err := exp.SetSignals(FleetSignals{DeadProvider: true, LastReconciliation: now, ObservedAt: now}); err == nil {
+		t.Fatal("dead provider must not coexist with a healthy provider observation")
+	}
+	if got := exp.Signals(); got != (FleetSignals{}) {
+		t.Fatalf("contradictory signal was not rejected fail-closed: %+v", got)
 	}
 }
 
