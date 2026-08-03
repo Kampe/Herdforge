@@ -1,15 +1,19 @@
 package review
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/Kampe/Herdforge/pkg/harvest"
 	"github.com/Kampe/Herdforge/pkg/provider"
@@ -68,6 +72,7 @@ type DrainReport struct {
 	Shas                                                                                                                                                        DrainShas      `json:"-"`
 	Pins                                                                                                                                                        []PinFreshness `json:"-"`
 	BoardGit                                                                                                                                                    []BoardGitRow  `json:"-"`
+	Errors                                                                                                                                                      []string       `json:"-"`
 }
 
 type BoardGitRow struct {
@@ -76,20 +81,20 @@ type BoardGitRow struct {
 }
 
 func (s LedgerSnapshot) Pending() []LedgerRow {
-	records, verdicts := map[string]LedgerRow{}, map[string]LedgerRow{}
-	for _, row := range s.Rows {
+	recordIndex, verdictIndex := map[string]int{}, map[string]int{}
+	for i, row := range s.Rows {
 		key := row.SHA + "\x00" + row.Reviewer
 		if row.Event == string(EventRecord) {
-			records[key] = row
+			recordIndex[key] = i
 		}
 		if row.Event == string(EventVerdict) {
-			verdicts[key] = row
+			verdictIndex[key] = i
 		}
 	}
 	out := make([]LedgerRow, 0)
-	for key, row := range records {
-		if verdict, ok := verdicts[key]; !ok || verdict.Timestamp < row.Timestamp {
-			out = append(out, row)
+	for key, index := range recordIndex {
+		if verdict, ok := verdictIndex[key]; !ok || verdict < index {
+			out = append(out, s.Rows[index])
 		}
 	}
 	sort.SliceStable(out, func(i, j int) bool { return out[i].Timestamp < out[j].Timestamp })
@@ -188,8 +193,18 @@ func (d *Drain) Scan(ctx context.Context, unmerged []harvest.UnmergedWork) (*Dra
 		}
 	}
 	r := &DrainReport{Pending: len(pending), HarvestQueue: len(queued), Cap: d.Cap, StaleBehindMax: d.StaleBehind, KaneoOK: false, KaneoInReview: -1, Shas: DrainShas{}, WindDown: d.WindDown || envWindDown()}
-	r.ParkBranches = parkBranchCount(ctx, d.RepoRoot)
-	r.LedgerPass = len(pass)
+	var parkErr error
+	r.ParkBranches, r.ParkCHAWithDups, parkErr = parkStats(ctx, d.RepoRoot)
+	if parkErr != nil {
+		r.Errors = append(r.Errors, parkErr.Error())
+	}
+	for _, row := range snap.Rows {
+		if row.Event == string(EventVerdict) && row.Verdict == string(VerdictPASS) {
+			r.LedgerPass++
+		}
+	}
+	r.Skips7d = recentCount(filepath.Join(d.StateDir, "review-gate-skips.log"), time.Now().Add(-7*24*time.Hour))
+	r.Rejected = rejectedCount(d.ArtifactDir)
 	for sha := range pass {
 		r.Shas.ReviewPass = append(r.Shas.ReviewPass, sha)
 	}
@@ -212,8 +227,8 @@ func (d *Drain) Scan(ctx context.Context, unmerged []harvest.UnmergedWork) (*Dra
 			continue
 		}
 		if _, ok := pass[sha]; ok {
+			r.Shas.Harvestable = append(r.Shas.Harvestable, sha)
 			if pin.Conflict == ConflictClean && pin.Behind >= 0 && pin.Behind <= d.StaleBehind {
-				r.Shas.Harvestable = append(r.Shas.Harvestable, sha)
 				r.Shas.HarvestReady = append(r.Shas.HarvestReady, sha)
 			} else {
 				r.Shas.RebaseNeeded = append(r.Shas.RebaseNeeded, sha)
@@ -244,6 +259,7 @@ func (d *Drain) Scan(ctx context.Context, unmerged []harvest.UnmergedWork) (*Dra
 		if project == "" {
 			r.KaneoError = "project context unavailable"
 		} else if tasks, e := d.Provider.ListTasks(ctx, project, "in-review"); e != nil {
+			r.KaneoProject = project
 			r.KaneoError = e.Error()
 		} else {
 			r.KaneoOK = true
@@ -270,19 +286,27 @@ func boardGitRow(ctx context.Context, repo, ref, title string) BoardGitRow {
 	if len(row.Title) > 50 {
 		row.Title = row.Title[:50]
 	}
-	if out, err := gitOut(ctx, repo, "log", "origin/main", "--format=%H", "--grep", ref); err == nil && strings.TrimSpace(out) != "" {
-		row.Main = true
+	if out, err := gitOut(ctx, repo, "log", "origin/main", "--format=%s"); err == nil {
+		pattern := regexp.MustCompile(`(?i)(^|[^a-z0-9])` + regexp.QuoteMeta(ref) + `([^a-z0-9]|$)`)
+		for _, subject := range strings.Split(out, "\n") {
+			if pattern.MatchString(subject) {
+				row.Main = true
+				break
+			}
+		}
 	}
 	if out, err := gitOut(ctx, repo, "for-each-ref", "--format=%(refname:short)", "refs/heads", "refs/remotes"); err == nil {
 		for _, branch := range strings.Split(out, "\n") {
 			low := strings.ToLower(branch)
 			needle := strings.ToLower(strings.ReplaceAll(ref, "-", "/"))
-			if strings.Contains(low, strings.ToLower(ref)) || strings.Contains(low, needle) {
-				row.Tip = strings.TrimSpace(branch)
-				break
-			}
-			if strings.Contains(low, "park") && (strings.Contains(low, strings.ToLower(ref))) {
+			matches := strings.Contains(low, strings.ToLower(ref)) || strings.Contains(low, needle)
+			if strings.Contains(low, "park") && matches {
 				row.Park = true
+			}
+			if matches && row.Tip == "" {
+				if sha, e := gitOut(ctx, repo, "rev-parse", "--short=12", strings.TrimSpace(branch)); e == nil {
+					row.Tip = strings.TrimSpace(sha)
+				}
 			}
 		}
 	}
@@ -290,7 +314,11 @@ func boardGitRow(ctx context.Context, repo, ref, title string) BoardGitRow {
 }
 
 func (d *Drain) freshness(ctx context.Context, sha, branch, worktree string) PinFreshness {
-	p := PinFreshness{SHA: sha, Branch: branch, WorktreePath: worktree, Conflict: ConflictUnknown, Behind: -1, Note: "conflict=unknown"}
+	lane := strings.TrimSpace(branch)
+	if lane == "" {
+		lane = filepath.Base(strings.TrimRight(worktree, string(filepath.Separator)))
+	}
+	p := PinFreshness{SHA: sha, Lane: lane, Branch: branch, WorktreePath: worktree, Conflict: ConflictUnknown, Behind: -1, Note: "conflict=unknown"}
 	if ctx.Err() != nil {
 		return p
 	}
@@ -346,19 +374,66 @@ func envWindDown() bool {
 	return v == "1" || v == "true" || v == "yes" || v == "on"
 }
 
-func parkBranchCount(ctx context.Context, repo string) int {
-	out, err := gitOut(ctx, repo, "for-each-ref", "--format=%(refname:short)", "refs/heads", "refs/remotes")
+func parkStats(ctx context.Context, repo string) (int, int, error) {
+	out, err := gitOut(ctx, repo, "for-each-ref", "--format=%(refname:short)", "refs/heads")
 	if err != nil {
-		return 0
+		return 0, 0, fmt.Errorf("park branch probe: %w", err)
 	}
 	count := 0
+	seen := map[string]int{}
 	for _, raw := range strings.Split(out, "\n") {
 		name := strings.ToLower(strings.TrimSpace(raw))
 		if strings.Contains(name, "/park/") || strings.HasPrefix(name, "park/") || strings.HasPrefix(name, "parked/") || strings.Contains(name, "/parked/") {
 			count++
+			parts := strings.FieldsFunc(name, func(r rune) bool { return r == '/' })
+			if len(parts) > 1 {
+				key := parts[len(parts)-1]
+				seen[key]++
+			}
 		}
 	}
-	return count
+	dups := 0
+	for _, n := range seen {
+		if n > 1 {
+			dups += n - 1
+		}
+	}
+	return count, dups, nil
+}
+
+func recentCount(path string, since time.Time) int {
+	f, err := os.Open(path)
+	if err != nil {
+		return 0
+	}
+	defer f.Close()
+	n := 0
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if len(line) >= 10 {
+			if t, e := time.Parse("2006-01-02", line[:10]); e == nil && !t.Before(since.Truncate(24*time.Hour)) {
+				n++
+			}
+		}
+	}
+	return n
+}
+func rejectedCount(dir string) int {
+	if dir == "" {
+		return 0
+	}
+	entries, err := os.ReadDir(filepath.Join(dir, "rejected"))
+	if err != nil {
+		return 0
+	}
+	n := 0
+	for _, e := range entries {
+		if !e.IsDir() && strings.HasSuffix(e.Name(), ".md") {
+			n++
+		}
+	}
+	return n
 }
 
 // ResolveKaneoProject follows the explicit operator context order used by
