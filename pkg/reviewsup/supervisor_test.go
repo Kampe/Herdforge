@@ -959,12 +959,30 @@ func TestReadRowsMalformed(t *testing.T) {
 	p := filepath.Join(dir, "bad.jsonl")
 	os.WriteFile(p, []byte("{badjson}\n{\"event\":\"completion\",\"sha\":\"abc\"}\n"), 0644)
 
-	rows, err := readRows(p)
-	if err != nil {
-		t.Fatalf("readRows: %v", err)
+	// Fail closed: a corrupted evidence file must surface as a hard error,
+	// never silently drop replayable events.
+	_, err := readRows(p)
+	if err == nil {
+		t.Fatal("expected error for malformed JSON row")
 	}
-	if len(rows) != 1 {
-		t.Errorf("expected 1 valid row, got %d", len(rows))
+}
+
+func TestReconstructFailsOnCorruptQueue_RepairProbe(t *testing.T) {
+	dir := t.TempDir()
+	cfg := DefaultConfig(dir)
+	cfg.Now = fixedNow
+	sv := New(cfg)
+
+	if _, _, err := sv.Ingest(CompletionCallback{SHA: "aaa111", AuthorModel: "claude", Tier: TierR1}); err != nil {
+		t.Fatalf("Ingest: %v", err)
+	}
+	if err := os.WriteFile(cfg.QueuePath, []byte("{not json}\n"), 0644); err != nil {
+		t.Fatalf("write corrupt queue: %v", err)
+	}
+
+	sv2 := New(cfg)
+	if _, err := sv2.Reconstruct(); err == nil {
+		t.Fatal("expected Reconstruct to fail closed on an unreadable evidence queue")
 	}
 }
 
