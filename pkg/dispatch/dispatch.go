@@ -371,6 +371,16 @@ func (d *Dispatcher) Dispatch(ctx context.Context, opts DispatchOptions) (*Dispa
 		}
 		return primary
 	}
+	if !opts.NoLaunch {
+		bound, berr := router.RebindDecision(opts.Decision, task.Ref, tok.Generation)
+		if berr != nil {
+			return nil, failOwned("launch_policy_rejected", berr)
+		}
+		opts.Decision = bound
+		if _, berr = validateWorkerLaunchRequest(opts); berr != nil {
+			return nil, failOwned("launch_policy_rejected", berr)
+		}
+	}
 
 	// 3. Create worktree from immutable origin/<defaultBranch> (FAC-121).
 	if d.Worktree == nil {
@@ -685,13 +695,17 @@ func workerRequest(opts DispatchOptions, taskRef string) (launch.Request, error)
 	}
 	d := opts.Decision
 	if d.Provider == "" || d.Model == "" || d.Effort == "" || d.Role == "" || d.Shape == "" || len(d.Argv) == 0 {
-		return launch.Request{Decision: d, TaskRef: taskRef}, fmt.Errorf("compiled LaunchDecision fields are required; defaults are forbidden")
+		return launch.Request{Decision: d, TaskRef: taskRef, LeaseGeneration: d.LeaseGeneration}, fmt.Errorf("compiled LaunchDecision fields are required; defaults are forbidden")
 	}
-	return launch.Request{Decision: d, TaskRef: taskRef}, nil
+	return launch.Request{Decision: d, TaskRef: taskRef, LeaseGeneration: d.LeaseGeneration}, nil
 }
 
 func validateWorkerLaunchRequest(opts DispatchOptions) (launch.Request, error) {
-	req, err := workerRequest(opts, opts.TicketRef)
+	contextRef := ""
+	if opts.Decision != nil {
+		contextRef = opts.Decision.TaskRef
+	}
+	req, err := workerRequest(opts, contextRef)
 	if err != nil {
 		return req, launch.Validate(req, nil)
 	}

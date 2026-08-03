@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"sync"
 
 	"github.com/Kampe/Herdforge/pkg/config"
 	"github.com/Kampe/Herdforge/pkg/deps"
@@ -30,7 +31,22 @@ type Engine struct {
 	Ownership deps.OwnershipClaimer
 
 	// health projects BLOCKED(provider_timeout)/recovering for the control plane.
-	health providerHealth
+	health              providerHealth
+	claimMu             sync.Mutex
+	lastClaimRef        string
+	lastClaimGeneration int64
+}
+
+// LastClaimIdentity returns the task and generation most recently fenced by
+// RunPulse. Launch callers use it to reissue a decision after the dependency
+// and ownership claim; a zero/mismatched identity is not launchable.
+func (e *Engine) LastClaimIdentity() (string, int64) {
+	if e == nil {
+		return "", 0
+	}
+	e.claimMu.Lock()
+	defer e.claimMu.Unlock()
+	return e.lastClaimRef, e.lastClaimGeneration
 }
 
 func NewEngine(cfg *config.Config, tp provider.TaskProvider, r *router.ModelRouter, s *store.Store, wm *worktree.WorktreeManager, v *verifier.Verifier) *Engine {
@@ -325,6 +341,9 @@ func (e *Engine) RunPulse(ctx context.Context, role string) (*provider.Task, err
 	if cerr != nil {
 		return nil, fmt.Errorf("pulse lease claim: %w", cerr)
 	}
+	e.claimMu.Lock()
+	e.lastClaimRef, e.lastClaimGeneration = task.Ref, tok.Generation
+	e.claimMu.Unlock()
 
 	// Fenced claim: pre/post graph check around board ClaimTask. Compensation is
 	// generation-fenced — board to-do only when we still hold owner+generation.

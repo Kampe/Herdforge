@@ -92,6 +92,21 @@ type fakeHerdr struct {
 	model       string
 }
 
+type fixedGenerationOwnership struct {
+	generation int64
+}
+
+func (o *fixedGenerationOwnership) ClaimExclusive(_ context.Context, taskID deps.TaskID, taskRef deps.Ref, role, graphRev, providerRev, _ string) (*deps.OwnershipToken, error) {
+	return &deps.OwnershipToken{TaskID: taskID, TaskRef: taskRef, OwnerID: "test-owner", Generation: o.generation, GraphRev: graphRev, ProviderRev: providerRev, Role: role}, nil
+}
+func (o *fixedGenerationOwnership) StillOwns(context.Context, *deps.OwnershipToken) (bool, error) {
+	return true, nil
+}
+func (o *fixedGenerationOwnership) ReleaseIfOwner(context.Context, *deps.OwnershipToken, string) error {
+	return nil
+}
+func (o *fixedGenerationOwnership) Close() error { return nil }
+
 func (f *fakeHerdr) Available() bool { return f.available }
 func (f *fakeHerdr) RequireWorkspace(string) (string, error) {
 	if f.wsErr != nil {
@@ -324,6 +339,7 @@ func TestDispatch_Launch_SetsCwdAndProvesPrompt(t *testing.T) {
 	d := NewDispatcher(testCfg(), tp, wm)
 	d.Herdr = fh
 	d.Compensator = comp
+	d.Ownership = &fixedGenerationOwnership{generation: 7}
 
 	// Production path: always proves consumption (no SkipPromptVerify).
 	res, err := d.Dispatch(context.Background(), validLaunchOptions("FAC-9"))
@@ -334,6 +350,9 @@ func TestDispatch_Launch_SetsCwdAndProvesPrompt(t *testing.T) {
 
 	if !res.Launched {
 		t.Fatal("expected Launched")
+	}
+	if fh.startReq.LeaseGeneration != 7 {
+		t.Fatalf("launch request generation = %d, want exact claimed generation 7", fh.startReq.LeaseGeneration)
 	}
 	if fh.tabCwd != res.Worktree {
 		t.Fatalf("herdr cwd = %q, want worktree %q", fh.tabCwd, res.Worktree)

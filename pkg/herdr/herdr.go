@@ -294,7 +294,7 @@ func ResolveAgentTab(name string) (string, error) {
 // ResolveAgentTabWithDecision is the standing/resume trust boundary. A newly
 // computed route never proves an existing process: herdr must report the same
 // durable role, task identity, lease, provider, model, effort, and shape.
-func ResolveAgentTabWithDecision(name string, req launch.Request, leaseGeneration int64) (string, error) {
+func ResolveAgentTabWithDecision(name string, req launch.Request) (string, error) {
 	if err := launch.Validate(req, nil); err != nil {
 		return "", err
 	}
@@ -309,7 +309,7 @@ func ResolveAgentTabWithDecision(name string, req launch.Request, leaseGeneratio
 		if a.Name != name {
 			continue
 		}
-		req.Name, req.PaneID, req.LeaseGeneration = name, a.PaneID, leaseGeneration
+		req.Name, req.PaneID = name, a.PaneID
 		ok, err := launch.HasStarted(req)
 		if err != nil {
 			return "", fmt.Errorf("resume lifecycle lookup: %w", err)

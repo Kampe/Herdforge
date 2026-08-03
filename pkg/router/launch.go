@@ -1,6 +1,7 @@
 package router
 
 import (
+	cryptorand "crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -115,6 +116,7 @@ type LaunchDecision struct {
 	TaskRef         string         `json:"task_ref,omitempty"`
 	LeaseGeneration int64          `json:"lease_generation,omitempty"`
 	Proof           string         `json:"proof"`
+	issuanceToken   [32]byte
 }
 
 const decisionProofDomain = "herdforge-fac-175-launch-decision-v1"
@@ -152,13 +154,42 @@ func VerifyDecision(d *LaunchDecision, taskRef string, leaseGeneration int64) er
 	if d == nil || d.Proof == "" {
 		return fmt.Errorf("missing router-issued launch proof")
 	}
-	if d.TaskRef != "" && (d.TaskRef != taskRef || d.LeaseGeneration != leaseGeneration) {
-		return fmt.Errorf("launch proof task/lease context mismatch")
+	if d.issuanceToken == ([32]byte{}) {
+		return fmt.Errorf("missing router issuance capability")
+	}
+	if d.TaskRef != "" || taskRef != "" {
+		if d.TaskRef == "" || taskRef == "" || d.TaskRef != taskRef || d.LeaseGeneration != leaseGeneration {
+			return fmt.Errorf("launch proof task/lease context mismatch")
+		}
 	}
 	if decisionProof(*d) != d.Proof {
 		return fmt.Errorf("launch decision proof mismatch")
 	}
 	return nil
+}
+
+// RebindDecision issues a fresh router capability after a caller learns the
+// concrete task and durable lease generation. The public proof remains an
+// integrity digest; the unexported issuance capability proves this decision
+// came through the router rather than being reconstructed from public fields.
+func RebindDecision(d *LaunchDecision, taskRef string, leaseGeneration int64) (*LaunchDecision, error) {
+	if d == nil {
+		return nil, fmt.Errorf("launch decision is required")
+	}
+	if err := VerifyDecision(d, d.TaskRef, d.LeaseGeneration); err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(taskRef) == "" {
+		return nil, fmt.Errorf("launch decision task context is required")
+	}
+	bound := *d
+	bound.TaskRef = taskRef
+	bound.LeaseGeneration = leaseGeneration
+	if _, err := cryptorand.Read(bound.issuanceToken[:]); err != nil {
+		return nil, fmt.Errorf("issue rebound launch capability: %w", err)
+	}
+	bound.Proof = decisionProof(bound)
+	return &bound, nil
 }
 
 // ProbeKey returns the stable probe identity for a provider/model tuple.
@@ -693,6 +724,9 @@ func (r *SurfaceRouter) Decide(req LaunchRequest) (*LaunchDecision, error) {
 		LazerLastResort: best.provider == "lazer",
 		Argv:            ArgvFor(best.provider, model, effort),
 		TaskRef:         req.TaskRef, LeaseGeneration: req.LeaseGeneration,
+	}
+	if _, err := cryptorand.Read(d.issuanceToken[:]); err != nil {
+		return nil, fmt.Errorf("issue launch capability: %w", err)
 	}
 	d.Proof = decisionProof(*d)
 	return d, nil
