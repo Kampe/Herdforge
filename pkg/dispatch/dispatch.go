@@ -358,13 +358,27 @@ func (d *Dispatcher) Dispatch(ctx context.Context, opts DispatchOptions) (*Dispa
 	if cerr != nil {
 		return nil, fmt.Errorf("dispatch lease claim: %w", cerr)
 	}
-	// Token-conditional lease release + durable compensator. Never release if
-	// owner+generation no longer match (another process owns the card).
+	// Exactly-one durable compensation WHILE owner+generation still held.
+	// Release only after durable compensate succeeds. On compensate failure
+	// retain the lease (Recovering) — never release-then-compensate (B can
+	// acquire and get stomped by stale A). Audit: h5d6pay5vamxvv277qtt5qmk.
 	failOwned := func(reason string, primary error) error {
-		if cErr := own.CompensateIfOwner(ctx, tok, reason); cErr != nil && !errors.Is(cErr, deps.ErrNotOwner) {
-			primary = errors.Join(primary, cErr)
+		owns, oerr := own.StillOwns(ctx, tok)
+		if oerr != nil {
+			return errors.Join(primary, oerr)
 		}
-		return d.failWithCompensate(ctx, task.Ref, reason, primary)
+		if !owns {
+			// Lost generation: refuse unfenced shared lifecycle compensate.
+			return fmt.Errorf("%w: refuse unfenced compensate (%s): %w", deps.ErrNotOwner, reason, primary)
+		}
+		if cErr := d.compensate(ctx, task.Ref, reason); cErr != nil {
+			// Retain lease — Recovering. Do not open an acquire window for B.
+			return errors.Join(primary, fmt.Errorf("durable compensate retained lease (Recovering): %w", cErr))
+		}
+		if rErr := own.ReleaseIfOwner(ctx, tok, reason); rErr != nil && !errors.Is(rErr, deps.ErrNotOwner) {
+			return errors.Join(primary, rErr)
+		}
+		return primary
 	}
 
 	// 3. Create worktree from immutable origin/<defaultBranch> (FAC-121).
@@ -474,15 +488,56 @@ func (d *Dispatcher) Dispatch(ctx context.Context, opts DispatchOptions) (*Dispa
 		return result, failOwned("post_dispatch_graph_drift", postErr)
 	}
 
-	// 9. Optionally launch agent with explicit cwd + proven prompt consumption
+	// 9. Optionally launch agent with explicit cwd + proven prompt consumption.
+	// launch performs local cleanup only; shared lifecycle compensate is exactly
+	// once via failOwned while the generation lease is still held.
 	h := d.launcher()
 	if !opts.NoLaunch && h.Available() {
 		if err := d.launch(ctx, opts, task, lane, wtInfo, branch, packet, result); err != nil {
-			return result, failOwned("agent_launch_failed", err)
+			reason := "agent_launch_failed"
+			var lf *launchFailure
+			if errors.As(err, &lf) && lf.Reason != "" {
+				reason = lf.Reason
+			}
+			return result, failOwned(reason, err)
 		}
 	}
 
+	// Success path: keep the generation lease for the live run (FAC-120/147).
+	// Release is on completion/recovery paths, not here.
 	return result, nil
+}
+
+// launchFailure is intent-only: launch never calls Compensator.Compensate.
+// Outer Dispatch.failOwned performs the single owner-fenced durable compensate.
+type launchFailure struct {
+	Reason string
+	Err    error
+}
+
+func (e *launchFailure) Error() string {
+	if e == nil || e.Err == nil {
+		return "launch failure"
+	}
+	return e.Err.Error()
+}
+func (e *launchFailure) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Err
+}
+
+// closeTabLocal is safely-scoped local cleanup only (no shared lifecycle
+// Compensator.Compensate). TabClose errors are joined into primary — never silent.
+func closeTabLocal(h HerdrLauncher, tabID, reason string, primary error) error {
+	if tabID == "" || h == nil {
+		return primary
+	}
+	if closeErr := h.TabClose(tabID); closeErr != nil {
+		return errors.Join(primary, fmt.Errorf("tab close %q during %s: %w", tabID, reason, closeErr))
+	}
+	return primary
 }
 
 func (d *Dispatcher) launch(
@@ -494,8 +549,10 @@ func (d *Dispatcher) launch(
 	branch, packet string,
 	result *DispatchResult,
 ) error {
+	// Launch does not own shared lifecycle compensation. requireCompensator is
+	// enforced by Dispatch before side effects; record() still needs the hook.
 	if err := d.requireCompensator(); err != nil {
-		return err
+		return &launchFailure{Reason: "compensator_missing", Err: err}
 	}
 
 	h := d.launcher()
@@ -506,7 +563,7 @@ func (d *Dispatcher) launch(
 
 	// Shared-root denial before any write-capable agent starts (production guard).
 	if err := worktree.RejectSharedRoot(d.Worktree.RepoRoot(), wtInfo.Path); err != nil {
-		return d.failWithCompensate(ctx, task.Ref, "shared_root_denied", err)
+		return &launchFailure{Reason: "shared_root_denied", Err: err}
 	}
 
 	model, trail := h.ResolveHealthyModel(ctx, lane.Model, lane.FallbackModels)
@@ -515,23 +572,29 @@ func (d *Dispatcher) launch(
 		for _, p := range trail {
 			fmt.Fprintf(&b, "\n  %s: %s", p.Model, p.Reason)
 		}
-		return d.failWithCompensate(ctx, task.Ref, "no_healthy_model",
-			fmt.Errorf("no healthy model for lane %q — every candidate is exhausted:%s", lane.Name, b.String()))
+		return &launchFailure{
+			Reason: "no_healthy_model",
+			Err:    fmt.Errorf("no healthy model for lane %q — every candidate is exhausted:%s", lane.Name, b.String()),
+		}
 	}
 	result.Model = model
 
 	// Explicit workspace — never hardcoded "wF".
 	ws, err := h.RequireWorkspace(d.Worktree.RepoRoot())
 	if err != nil {
-		return d.failWithCompensate(ctx, task.Ref, "workspace_unknown",
-			fmt.Errorf("worktree ready but herdr workspace unresolved: %w", err))
+		return &launchFailure{
+			Reason: "workspace_unknown",
+			Err:    fmt.Errorf("worktree ready but herdr workspace unresolved: %w", err),
+		}
 	}
 
 	// Tab with exact task worktree as process cwd.
 	tab, err := h.TabCreateForTask(ws, tabLabel, wtInfo.Path, true)
 	if err != nil {
-		return d.failWithCompensate(ctx, task.Ref, "tab_create_failed",
-			fmt.Errorf("worktree ready but failed to launch agent: %w", err))
+		return &launchFailure{
+			Reason: "tab_create_failed",
+			Err:    fmt.Errorf("worktree ready but failed to launch agent: %w", err),
+		}
 	}
 	result.TabID = tab.ID
 	result.AgentName = tabLabel
@@ -544,13 +607,19 @@ func (d *Dispatcher) launch(
 		PaneID:    tab.Pane.ID,
 		AgentName: tabLabel,
 	}); err != nil {
-		return d.rollbackTab(ctx, h, tab.ID, task.Ref, "record_tab_failed", err)
+		return &launchFailure{
+			Reason: "record_tab_failed",
+			Err:    closeTabLocal(h, tab.ID, "record_tab_failed", err),
+		}
 	}
 
 	if err := h.AgentStart(tabLabel, lane.AgentKind, tab.Pane.ID, herdr.LaneAgentArgs(model)...); err != nil {
-		// Close orphan tab then durable compensate — TabClose errors must not be silent.
-		return d.rollbackTab(ctx, h, tab.ID, task.Ref, "agent_start_failed",
-			fmt.Errorf("worktree ready but agent start failed: %w", err))
+		// Local orphan-tab cleanup only — outer failOwned owns durable compensate.
+		return &launchFailure{
+			Reason: "agent_start_failed",
+			Err: closeTabLocal(h, tab.ID, "agent_start_failed",
+				fmt.Errorf("worktree ready but agent start failed: %w", err)),
+		}
 	}
 	if err := d.record(ctx, StepRecord{
 		TicketRef: task.Ref,
@@ -561,7 +630,10 @@ func (d *Dispatcher) launch(
 		PaneID:    tab.Pane.ID,
 		AgentName: tabLabel,
 	}); err != nil {
-		return d.rollbackTab(ctx, h, tab.ID, task.Ref, "record_agent_start_failed", err)
+		return &launchFailure{
+			Reason: "record_agent_start_failed",
+			Err:    closeTabLocal(h, tab.ID, "record_agent_start_failed", err),
+		}
 	}
 
 	// Always prove consumption — no production SkipPromptVerify bypass.
@@ -576,16 +648,25 @@ func (d *Dispatcher) launch(
 	receipt, err := h.DeliverAndProve(tabLabel, packet, timeout)
 	result.Receipt = receipt
 	if err != nil {
-		return d.rollbackTab(ctx, h, tab.ID, task.Ref, "prompt_delivery_failed",
-			fmt.Errorf("worktree ready but prompt consumption not proven: %w", err))
+		return &launchFailure{
+			Reason: "prompt_delivery_failed",
+			Err: closeTabLocal(h, tab.ID, "prompt_delivery_failed",
+				fmt.Errorf("worktree ready but prompt consumption not proven: %w", err)),
+		}
 	}
 	if receipt == nil || !receipt.Consumed || !receipt.Verified {
-		return d.rollbackTab(ctx, h, tab.ID, task.Ref, "prompt_receipt_invalid",
-			fmt.Errorf("worktree ready but prompt receipt did not prove consumption"))
+		return &launchFailure{
+			Reason: "prompt_receipt_invalid",
+			Err: closeTabLocal(h, tab.ID, "prompt_receipt_invalid",
+				fmt.Errorf("worktree ready but prompt receipt did not prove consumption")),
+		}
 	}
 	if !herdr.ConsumptionProven(receipt.BaselineStatus, receipt.FinalStatus) {
-		return d.rollbackTab(ctx, h, tab.ID, task.Ref, "prompt_sequence_invalid",
-			fmt.Errorf("prompt receipt sequence %q is not a valid consumption proof", receipt.SequenceToken))
+		return &launchFailure{
+			Reason: "prompt_sequence_invalid",
+			Err: closeTabLocal(h, tab.ID, "prompt_sequence_invalid",
+				fmt.Errorf("prompt receipt sequence %q is not a valid consumption proof", receipt.SequenceToken)),
+		}
 	}
 
 	if err := d.record(ctx, StepRecord{
@@ -597,7 +678,10 @@ func (d *Dispatcher) launch(
 		AgentName: tabLabel,
 		Receipt:   receipt.SequenceToken,
 	}); err != nil {
-		return d.rollbackTab(ctx, h, tab.ID, task.Ref, "record_prompt_failed", err)
+		return &launchFailure{
+			Reason: "record_prompt_failed",
+			Err:    closeTabLocal(h, tab.ID, "record_prompt_failed", err),
+		}
 	}
 	result.Launched = true
 	return nil

@@ -37,13 +37,19 @@ type OwnershipToken struct {
 
 // OwnershipClaimer acquires a durable cross-process lease before side effects.
 // The production implementation wraps claim.ClaimManager + SQLiteLeaseStore.
+//
+// Failure order (hard invariant — FAC-159 audit h5d6pay5vamxvv277qtt5qmk):
+//  1. StillOwns (owner+generation)
+//  2. exactly-one durable lifecycle compensate (outbox) while still owned
+//  3. ReleaseIfOwner only after durable compensate succeeds/readbacks
+// On durable compensate failure: retain the lease (Recovering) — never release
+// then compensate (B can acquire and get stomped by stale A).
 type OwnershipClaimer interface {
 	ClaimExclusive(ctx context.Context, taskID TaskID, taskRef Ref, role, graphRev, providerRev, worktreeHint string) (*OwnershipToken, error)
 	StillOwns(ctx context.Context, tok *OwnershipToken) (bool, error)
-	// CompensateIfOwner releases the fenced lease only when owner+generation
-	// still match. Does not touch provider board status (callers may do that
-	// only after StillOwns succeeds).
-	CompensateIfOwner(ctx context.Context, tok *OwnershipToken, reason string) error
+	// ReleaseIfOwner drops the generation fence only when owner+generation still
+	// match. Call AFTER successful durable compensation — never before.
+	ReleaseIfOwner(ctx context.Context, tok *OwnershipToken, reason string) error
 	Close() error
 }
 
@@ -168,16 +174,19 @@ func (o *LeaseOwnership) StillOwns(ctx context.Context, tok *OwnershipToken) (bo
 	return false, nil
 }
 
-func (o *LeaseOwnership) CompensateIfOwner(ctx context.Context, tok *OwnershipToken, reason string) error {
+// ReleaseIfOwner releases the generation-fenced lease only while this token
+// still matches active owner+generation. Stale tokens (after B acquires) get
+// ErrNotOwner and must not mutate B's lifecycle.
+func (o *LeaseOwnership) ReleaseIfOwner(ctx context.Context, tok *OwnershipToken, reason string) error {
 	if o == nil || tok == nil {
-		return fmt.Errorf("deps: nil lease compensate")
+		return fmt.Errorf("deps: nil lease release")
 	}
 	owns, err := o.StillOwns(ctx, tok)
 	if err != nil {
 		return err
 	}
 	if !owns {
-		return fmt.Errorf("%w: refuse compensate (%s) for %s g%d", ErrNotOwner, reason, tok.TaskRef, tok.Generation)
+		return fmt.Errorf("%w: refuse release (%s) for %s g%d", ErrNotOwner, reason, tok.TaskRef, tok.Generation)
 	}
 	if err := o.CM.Release(ctx, tok.Key, tok.OwnerID, tok.Generation); err != nil {
 		if errors.Is(err, claim.ErrStaleGeneration) || errors.Is(err, claim.ErrNotFound) {
@@ -186,6 +195,13 @@ func (o *LeaseOwnership) CompensateIfOwner(ctx context.Context, tok *OwnershipTo
 		return fmt.Errorf("deps: lease release: %w", err)
 	}
 	return nil
+}
+
+// CompensateIfOwner is a deprecated name for ReleaseIfOwner kept as a thin
+// wrapper for in-flight callers. Prefer ReleaseIfOwner — "compensate" is the
+// durable outbox step, not the lease drop.
+func (o *LeaseOwnership) CompensateIfOwner(ctx context.Context, tok *OwnershipToken, reason string) error {
+	return o.ReleaseIfOwner(ctx, tok, reason)
 }
 
 func (o *LeaseOwnership) Close() error {

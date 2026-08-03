@@ -54,8 +54,11 @@ func TestProductionLaunchWiring_GateBeforeSideEffects(t *testing.T) {
 	if !strings.Contains(runPulse, "FencedClaim") || !strings.Contains(runPulse, "claimTaskBound") {
 		t.Fatal("RunPulse must use FencedClaim wrapping claimTaskBound")
 	}
-	if !strings.Contains(runPulse, "ClaimExclusive") || !strings.Contains(runPulse, "CompensateIfOwner") {
-		t.Fatal("RunPulse must acquire durable claim lease (ClaimExclusive) and generation-fenced CompensateIfOwner")
+	if !strings.Contains(runPulse, "ClaimExclusive") || !strings.Contains(runPulse, "ReleaseIfOwner") {
+		t.Fatal("RunPulse must acquire durable claim lease (ClaimExclusive) and generation-fenced ReleaseIfOwner")
+	}
+	if !strings.Contains(runPulse, "StillOwns") {
+		t.Fatal("RunPulse must check StillOwns before board compensate/release")
 	}
 	if !strings.Contains(dispatchFn, "OpenLeaseOwnership") && !strings.Contains(dispatchFn, "ownershipClaimer") {
 		t.Fatal("Dispatch must use ownershipClaimer / OpenLeaseOwnership (not process-local map)")
