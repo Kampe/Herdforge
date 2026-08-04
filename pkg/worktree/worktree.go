@@ -2,11 +2,14 @@ package worktree
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+
+	"github.com/Kampe/Herdforge/pkg/resources"
 )
 
 // execCommandContext is a variable so tests can mock; defaults to exec.CommandContext
@@ -21,6 +24,10 @@ const AnchorRefPrefix = "refs/herd/anchors/"
 type WorktreeManager struct {
 	RepoRoot    string
 	WorktreeDir string
+	// DiskAdmission is checked before every creation mutation. It is an
+	// explicit seam so tests can prove rejected paths invoke no git or FS
+	// mutation callbacks.
+	DiskAdmission resources.DiskAdmission
 	// RemoveWorktreeFunc is an optional mutation seam for hermetic callers.
 	// Production managers leave it nil and use Git; tests can fail closed
 	// before any filesystem mutation is attempted.
@@ -31,17 +38,60 @@ type WorktreeManager struct {
 }
 
 func NewWorktreeManager(repoRoot string) *WorktreeManager {
-	return &WorktreeManager{
+	w := &WorktreeManager{
 		RepoRoot:    repoRoot,
 		WorktreeDir: filepath.Join(repoRoot, ".herd", "worktrees"),
 	}
+	w.configureDefaultDiskAdmission()
+	return w
 }
 
 func NewWorktreePool(repoRoot string, worktreeDir string) *WorktreeManager {
-	return &WorktreeManager{
+	w := &WorktreeManager{
 		RepoRoot:    repoRoot,
 		WorktreeDir: worktreeDir,
 	}
+	w.configureDefaultDiskAdmission()
+	return w
+}
+
+func (w *WorktreeManager) configureDefaultDiskAdmission() {
+	w.DiskAdmission = resources.NewCapacityGate(resources.OSBackend{}, resources.DefaultDiskPolicy())
+}
+
+func (w *WorktreeManager) admitDisk(operation string) error {
+	if w == nil {
+		return fmt.Errorf("disk capacity gate unavailable for %s", operation)
+	}
+	// Preserve compatibility for literal managers used by older callers while
+	// still giving every production mutation the same process-local authority.
+	if w.DiskAdmission == nil {
+		w.configureDefaultDiskAdmission()
+	}
+	repo, err := resources.ResolveExistingPath(w.RepoRoot)
+	if err != nil {
+		return fmt.Errorf("disk capacity gate: resolve repository volume: %w", err)
+	}
+	pool, err := resources.ResolveExistingPath(w.WorktreeDir)
+	if err != nil {
+		return fmt.Errorf("disk capacity gate: resolve worktree volume: %w", err)
+	}
+	tmp, err := resources.ResolveExistingPath(os.TempDir())
+	if err != nil {
+		return fmt.Errorf("disk capacity gate: resolve temporary volume: %w", err)
+	}
+	decision := w.DiskAdmission.Admit(resources.DiskRequest{
+		Operation:       operation,
+		Path:            repo,
+		TempPath:        tmp,
+		AdditionalPaths: []string{pool},
+		Scope:           resources.CapacityScopeForPaths(repo, pool, tmp),
+	})
+	if decision.Allowed {
+		return nil
+	}
+	evidence, _ := json.Marshal(decision.Evidence)
+	return fmt.Errorf("disk capacity gate blocked: state=%s evidence=%s", decision.State, evidence)
 }
 
 // WorktreeInfo describes a task worktree after creation or reattach.
@@ -57,6 +107,9 @@ type WorktreeInfo struct {
 }
 
 func (w *WorktreeManager) CreateWorktree(ctx context.Context, branch string, targetDir string) error {
+	if err := w.admitDisk("worktree_create"); err != nil {
+		return err
+	}
 	cmd := execCommandContext(ctx, "git", "worktree", "add", "-b", branch, targetDir, "HEAD")
 	cmd.Dir = w.RepoRoot
 	if output, err := cmd.CombinedOutput(); err != nil {
@@ -259,6 +312,9 @@ func (w *WorktreeManager) CreateTaskWorktree(ctx context.Context, taskRef string
 func (w *WorktreeManager) CreateTaskWorktreeFrom(ctx context.Context, taskRef, defaultBranch string) (*WorktreeInfo, error) {
 	if strings.TrimSpace(taskRef) == "" {
 		return nil, fmt.Errorf("task ref is required")
+	}
+	if err := w.admitDisk("worktree_create"); err != nil {
+		return nil, err
 	}
 	branch := TaskBranch(taskRef)
 	targetPath := filepath.Join(w.WorktreeDir, strings.ToLower(taskRef))
