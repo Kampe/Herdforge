@@ -327,121 +327,157 @@ func TestDispatch_PackageCwdNotPolluted(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Ambient git root (may be the shared Herdforge worktree when tests run in-package).
-	ambientRoot := findGitRoot(t, pkgDir)
-	before := snapshotAmbientGit(t, ambientRoot, pkgDir)
+	tmpRepo, wm := initDispatchRepo(t)
+	otherPath := filepath.Join(tmpRepo, "unrelated")
+	runDispatchGit(t, tmpRepo, "worktree", "add", "-b", "unrelated", otherPath, "main")
+	before, err := wm.ListWorktrees(context.Background())
+	if err != nil {
+		t.Fatalf("list fixture worktrees before dispatch: %v", err)
+	}
 
-	tp := &mockTaskProvider{
-		tasks: []*provider.Task{
-			{ID: "1", Ref: "FAC-1", Title: "First task", Status: "to-do", Priority: "high", Description: emptyDepsFence("FAC-1", "1")},
-		},
+	advanceStart := make(chan struct{})
+	advanceDone := make(chan error, 1)
+	go func() {
+		<-advanceStart
+		if err := os.WriteFile(filepath.Join(otherPath, "unrelated.txt"), []byte("advanced\n"), 0644); err != nil {
+			advanceDone <- err
+			return
+		}
+		_, err := runDispatchGitOutput(otherPath, "add", "unrelated.txt")
+		if err == nil {
+			_, err = runDispatchGitOutput(otherPath, "commit", "-m", "fixture: advance unrelated worktree")
+		}
+		advanceDone <- err
+	}()
+
+	service := &synchronizedDispatchWorktree{
+		manager: wm,
+		start:   advanceStart,
+		done:    advanceDone,
 	}
-	cfg := &config.Config{
-		Project:      config.ProjectConfig{Name: "t", DefaultBranch: "main"},
-		TaskProvider: config.TaskProvider{Type: "memory", ProjectID: "test"},
-		Lanes: []config.LaneDef{
-			{Name: "worker", Role: "worker", Model: "m", AgentKind: "opencode", Prompt: ".herd/prompts/worker.md"},
-		},
-		Verification: config.Verification{TestCommand: "go test ./...", PreflightCommand: "go build ./..."},
-	}
-	mw := &mockWorktree{err: fmt.Errorf("mock isolation: no ambient git")}
 	d := withTestLease(t, &Dispatcher{
-		Config: cfg, TaskProvider: tp, Worktree: mw,
+		Config: testCfg(),
+		TaskProvider: &mockTaskProvider{tasks: []*provider.Task{
+			{ID: "1", Ref: "FAC-1", Title: "Task FAC-1", Status: "to-do", Description: emptyDepsFence("FAC-1", "1")},
+		}},
+		Worktree:    service,
 		Compensator: &recordingCompensator{},
 		Herdr:       &fakeHerdr{available: false},
 	})
-	_, _ = d.Dispatch(context.Background(), DispatchOptions{TicketRef: "FAC-1", NoLaunch: true})
-
-	// Also exercise temp-repo path used by integration tests (must not leak to ambient).
-	tmpRepo, wm := initDispatchRepo(t)
-	d2 := NewDispatcher(cfg, tp, wm)
-	d2.Compensator = &recordingCompensator{}
-	d2.Herdr = &fakeHerdr{available: false}
-	res, err := d2.Dispatch(context.Background(), DispatchOptions{TicketRef: "FAC-1", NoLaunch: true})
+	res, err := d.Dispatch(context.Background(), DispatchOptions{TicketRef: "FAC-1", NoLaunch: true})
 	if err != nil {
 		t.Fatalf("temp-repo dispatch: %v", err)
 	}
-	// Temp worktree must live under the temp repo, never under package cwd.
-	if !strings.HasPrefix(res.Worktree, tmpRepo) {
-		t.Fatalf("worktree %q not under temp repo %q", res.Worktree, tmpRepo)
+	if service.advanceErr != nil {
+		t.Fatalf("advance unrelated fixture worktree: %v", service.advanceErr)
 	}
-	if strings.Contains(res.Worktree, filepath.Join("pkg", "dispatch")) {
-		t.Fatalf("worktree leaked into package tree: %s", res.Worktree)
+	if !strings.HasPrefix(res.Worktree, tmpRepo+string(filepath.Separator)) ||
+		strings.Contains(res.Worktree, filepath.Join("pkg", "dispatch")) {
+		t.Fatalf("worktree escaped isolated fixture repo: %s", res.Worktree)
 	}
-	t.Cleanup(func() {
-		_ = exec.Command("git", "-C", tmpRepo, "worktree", "remove", "--force", res.Worktree).Run()
-		os.RemoveAll(res.Worktree)
-	})
-
-	after := snapshotAmbientGit(t, ambientRoot, pkgDir)
-	if after.worktreeList != before.worktreeList {
-		t.Fatalf("ambient git worktree list changed:\n before:\n%s\n after:\n%s", before.worktreeList, after.worktreeList)
+	after, err := wm.ListWorktrees(context.Background())
+	if err != nil {
+		t.Fatalf("list fixture worktrees after dispatch: %v", err)
 	}
-	if after.branchFac1 != before.branchFac1 || after.anchorFac1 != before.anchorFac1 {
-		t.Fatalf("ambient herd/fac-1 branch/anchor changed (before branch=%v anchor=%v after branch=%v anchor=%v)",
-			before.branchFac1, before.anchorFac1, after.branchFac1, after.anchorFac1)
+	beforeOther := worktreeByPath(before, otherPath)
+	if beforeOther == nil {
+		t.Fatalf("unrelated fixture worktree identity missing before dispatch: %s", otherPath)
 	}
-	if after.pkgHerdExists != before.pkgHerdExists {
-		t.Fatalf("package .herd pollution changed: before=%v after=%v path=%s",
-			before.pkgHerdExists, after.pkgHerdExists, filepath.Join(pkgDir, ".herd"))
+	if got := worktreeByPath(after, res.Worktree); got == nil || got.Branch != worktree.TaskBranch("FAC-1") {
+		t.Fatalf("dispatch target identity missing or wrong: %+v", got)
 	}
-	if after.dirty != before.dirty {
-		t.Fatalf("ambient working tree dirtied by dispatch tests:\n before=%q\n after=%q", before.dirty, after.dirty)
-	}
-}
-
-type ambientSnap struct {
-	worktreeList  string
-	branchFac1    bool
-	anchorFac1    bool
-	pkgHerdExists bool
-	dirty         string
-}
-
-func snapshotAmbientGit(t *testing.T, ambientRoot, pkgDir string) ambientSnap {
-	t.Helper()
-	s := ambientSnap{}
-	if ambientRoot != "" {
-		s.worktreeList = gitOutAmbient(ambientRoot, "worktree", "list", "--porcelain")
-		s.branchFac1 = gitOutAmbient(ambientRoot, "show-ref", "--verify", "--quiet", "refs/heads/herd/fac-1") == "ok"
-		s.anchorFac1 = gitOutAmbient(ambientRoot, "show-ref", "--verify", "--quiet", "refs/herd/anchors/fac-1") == "ok"
-		s.dirty = gitOutAmbient(ambientRoot, "status", "--porcelain")
+	if got := worktreeByPath(after, otherPath); got == nil || got.Commit == beforeOther.Commit {
+		t.Fatalf("unrelated fixture worktree did not advance: before=%+v after=%+v", beforeOther, got)
 	}
 	if _, err := os.Stat(filepath.Join(pkgDir, ".herd")); err == nil {
-		s.pkgHerdExists = true
+		t.Fatalf("dispatch polluted package cwd: %s", filepath.Join(pkgDir, ".herd"))
 	}
-	// Also flag the historical pollution path specifically.
-	if _, err := os.Stat(filepath.Join(pkgDir, ".herd", "worktrees", "fac-1")); err == nil {
-		s.pkgHerdExists = true
+	if err := wm.RemoveWorktree(context.Background(), res.Worktree); err != nil {
+		t.Fatalf("remove attributable dispatch worktree: %v", err)
 	}
-	return s
+	if leaked := worktreeByPath(mustListDispatchWorktrees(t, wm), res.Worktree); leaked != nil {
+		t.Fatalf("attributable dispatch worktree leaked: %+v", leaked)
+	}
 }
 
-func findGitRoot(t *testing.T, start string) string {
-	t.Helper()
-	c := exec.Command("git", "rev-parse", "--show-toplevel")
-	c.Dir = start
-	out, err := c.CombinedOutput()
+type synchronizedDispatchWorktree struct {
+	manager    *worktree.WorktreeManager
+	start      chan struct{}
+	done       chan error
+	advanceErr error
+}
+
+func (s *synchronizedDispatchWorktree) CreateTaskWorktreeFrom(ctx context.Context, ref, branch string) (*worktree.WorktreeInfo, error) {
+	close(s.start)
+	info, err := s.manager.CreateTaskWorktreeFrom(ctx, ref, branch)
+	s.advanceErr = <-s.done
+	if s.advanceErr != nil && err == nil {
+		err = s.advanceErr
+	}
+	return info, err
+}
+
+func (s *synchronizedDispatchWorktree) RepoRoot() string { return s.manager.RepoRoot }
+
+func worktreeByPath(worktrees []*worktree.WorktreeInfo, path string) *worktree.WorktreeInfo {
+	for _, wt := range worktrees {
+		if wt.Path == path || sameDispatchFixturePath(wt.Path, path) {
+			return wt
+		}
+	}
+	return nil
+}
+
+func sameDispatchFixturePath(left, right string) bool {
+	leftInfo, err := os.Stat(left)
 	if err != nil {
-		return ""
+		return false
 	}
-	return strings.TrimSpace(string(out))
+	rightInfo, err := os.Stat(right)
+	if err != nil {
+		return false
+	}
+	return os.SameFile(leftInfo, rightInfo)
 }
 
-// gitOutAmbient runs git in ambientRoot. For --quiet verify, returns "ok" on success.
-func gitOutAmbient(dir string, args ...string) string {
+func mustListDispatchWorktrees(t *testing.T, wm *worktree.WorktreeManager) []*worktree.WorktreeInfo {
+	t.Helper()
+	worktrees, err := wm.ListWorktrees(context.Background())
+	if err != nil {
+		t.Fatalf("list fixture worktrees: %v", err)
+	}
+	return worktrees
+}
+
+func runDispatchGit(t *testing.T, dir string, args ...string) {
+	t.Helper()
+	if _, err := runDispatchGitOutput(dir, args...); err != nil {
+		t.Fatalf("git %v: %v", args, err)
+	}
+}
+
+func runDispatchGitOutput(dir string, args ...string) (string, error) {
 	c := exec.Command("git", args...)
 	c.Dir = dir
-	c.Env = append(os.Environ(), "GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_SYSTEM=/dev/null")
+	c.Env = append(os.Environ(),
+		"GIT_CONFIG_NOSYSTEM=1",
+		"GIT_CONFIG_GLOBAL=/dev/null",
+		"GIT_CONFIG_SYSTEM=/dev/null",
+		"GIT_CONFIG_COUNT=4",
+		"GIT_CONFIG_KEY_0=commit.gpgsign",
+		"GIT_CONFIG_VALUE_0=false",
+		"GIT_CONFIG_KEY_1=tag.gpgSign",
+		"GIT_CONFIG_VALUE_1=false",
+		"GIT_CONFIG_KEY_2=merge.verifySignatures",
+		"GIT_CONFIG_VALUE_2=false",
+		"GIT_CONFIG_KEY_3=core.hooksPath",
+		"GIT_CONFIG_VALUE_3=.dispatch-disabled-hooks",
+		"GIT_EDITOR=true",
+		"GIT_SEQUENCE_EDITOR=true",
+		"GIT_TERMINAL_PROMPT=0",
+		"GIT_ASKPASS=/usr/bin/false",
+		"SSH_ASKPASS=/usr/bin/false",
+	)
 	out, err := c.CombinedOutput()
-	if len(args) >= 1 && args[0] == "show-ref" {
-		if err == nil {
-			return "ok"
-		}
-		return ""
-	}
-	if err != nil {
-		return strings.TrimSpace(string(out))
-	}
-	return strings.TrimSpace(string(out))
+	return strings.TrimSpace(string(out)), err
 }
