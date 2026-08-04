@@ -119,13 +119,17 @@ func New(ctx context.Context, repoRoot, worktreePath string, opts Options) (*Wor
 	if err != nil {
 		return nil, err
 	}
+	// Match the binding script's order: refresh the target's remote-tracking
+	// ref before dirty/cherry planning. Fetch is deliberately best-effort;
+	// strict local cherry evidence below still governs when it is unavailable.
+	_ = gitRun(ctx, canonicalWorktree, "fetch", "origin", "main")
 	if dirty, err := dirtyFiles(ctx, canonicalWorktree); err != nil {
 		return nil, fmt.Errorf("herd-reset-safe: cannot inspect uncommitted changes: %w", err)
 	} else if len(dirty) > 0 {
 		return nil, fmt.Errorf("herd-reset-safe: %s has uncommitted changes, refusing:\n  %s\nherd-reset-safe: commit or stash first, then re-run", worktreePath, strings.Join(dirty, "\n  "))
 	}
 
-	u, err := harvest.NewHarvester(canonicalRoot).UnmergedForStrict(ctx, canonicalWorktree)
+	u, err := harvest.NewHarvester(canonicalRoot).UnmergedForStrictLocal(ctx, canonicalWorktree)
 	if err != nil {
 		return nil, fmt.Errorf("herd-reset-safe: cannot verify unmerged work: %w", err)
 	}
@@ -165,9 +169,9 @@ func (p *WorktreePlan) Run(ctx context.Context) (*WorktreePlan, error) {
 		return nil, err
 	}
 	if len(a.unique) == 0 {
-		fmt.Fprintf(p.opts.stdout(), "herd-reset-safe: %s (%s) has no unmerged work, safe to reset\n", a.worktree, a.branch)
+		fmt.Fprintf(p.opts.stdout(), "herd-reset-safe: %s (%s) has no unmerged work, safe to reset\n", p.Worktree, a.branch)
 	} else {
-		fmt.Fprintf(p.opts.stdout(), "herd-reset-safe: %s has %d unmerged commit(s), preserving to %s before reset:\n", a.worktree, len(a.unique), a.preserveBranch)
+		fmt.Fprintf(p.opts.stdout(), "herd-reset-safe: %s has %d unmerged commit(s), preserving to %s before reset:\n", p.Worktree, len(a.unique), a.preserveBranch)
 		for _, sha := range a.unique {
 			fmt.Fprintf(p.opts.stdout(), "  %s\n", sha)
 		}
@@ -175,7 +179,7 @@ func (p *WorktreePlan) Run(ctx context.Context) (*WorktreePlan, error) {
 			return nil, fmt.Errorf("herd-reset-safe: could not stage %s: %w", a.preserveBranch, err)
 		}
 		if err := gitRunFn(ctx, a.worktree, "push", "origin", a.preserveBranch); err != nil {
-			fmt.Fprintf(p.opts.stderr(), "herd-reset-safe: WARN could not push %s — it still exists locally at %s as a branch ref; do not delete this worktree until it's recovered\n", a.preserveBranch, a.worktree)
+			fmt.Fprintf(p.opts.stderr(), "herd-reset-safe: WARN could not push %s — it still exists locally at %s as a branch ref; do not delete this worktree until it's recovered\n", a.preserveBranch, p.Worktree)
 		} else {
 			p.Pushed = true
 			fmt.Fprintf(p.opts.stdout(), "herd-reset-safe: pushed %s. Recover with: git cherry-pick <sha>  OR  git merge %s\n", a.preserveBranch, a.preserveBranch)
@@ -198,7 +202,7 @@ func (p *WorktreePlan) Run(ctx context.Context) (*WorktreePlan, error) {
 		return nil, fmt.Errorf("herd-reset-safe: reset completed but could not read HEAD: %w", err)
 	}
 	p.ResetSHA = strings.TrimSpace(resetSHA)
-	fmt.Fprintf(p.opts.stdout(), "herd-reset-safe: %s reset to origin/main (%s)\n", a.worktree, p.ResetSHA)
+	fmt.Fprintf(p.opts.stdout(), "herd-reset-safe: %s reset to origin/main (%s)\n", p.Worktree, p.ResetSHA)
 	return p, nil
 }
 
