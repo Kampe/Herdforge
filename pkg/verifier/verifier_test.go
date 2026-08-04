@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -809,7 +810,13 @@ fi
 exit 0
 `
 
-func waitForPIDToken(path string, bound time.Duration) (procToken, error) {
+type pidTokenObservation struct {
+	path string
+	tok  procToken
+	err  error
+}
+
+func observePIDToken(ctx context.Context, path string, bound time.Duration) (procToken, error) {
 	deadline := time.Now().Add(bound)
 	for {
 		data, err := os.ReadFile(path)
@@ -824,7 +831,11 @@ func waitForPIDToken(path string, bound time.Duration) (procToken, error) {
 		if time.Now().After(deadline) {
 			return procToken{}, fmt.Errorf("diagnostic ready bound exceeded waiting for %s", filepath.Base(path))
 		}
-		time.Sleep(time.Millisecond)
+		select {
+		case <-ctx.Done():
+			return procToken{}, ctx.Err()
+		case <-time.After(10 * time.Millisecond):
+		}
 	}
 }
 
@@ -849,36 +860,6 @@ func reapExactTokens(t *testing.T, tokens ...procToken) {
 			t.Errorf("cleanup wait exact pid %d gone: %v", tok.pid, err)
 		}
 	}
-}
-
-// reapPIDFilesByIdentity is the immediate-launch cleanup fallback. It reads
-// only fixture-owned PID files, binds each currently present PID to its start
-// token, and then signals that exact incarnation. Missing files are expected
-// when launch failed before a writer published readiness.
-func reapPIDFilesByIdentity(t *testing.T, pidFiles ...string) {
-	t.Helper()
-	tokens := make([]procToken, 0, len(pidFiles))
-	for _, pidFile := range pidFiles {
-		data, err := os.ReadFile(pidFile)
-		if err != nil {
-			if os.IsNotExist(err) {
-				continue
-			}
-			t.Errorf("cleanup read pid file %s: %v", filepath.Base(pidFile), err)
-			continue
-		}
-		pid, convErr := strconv.Atoi(strings.TrimSpace(string(data)))
-		if convErr != nil || pid <= 1 {
-			t.Errorf("cleanup invalid pid file %s: %q", filepath.Base(pidFile), data)
-			continue
-		}
-		tok, tokenErr := tokenOf(pid)
-		if tokenErr != nil {
-			continue
-		}
-		tokens = append(tokens, tok)
-	}
-	reapExactTokens(t, tokens...)
 }
 
 func assertWriterGone(t *testing.T, pidFile string) {
@@ -1443,6 +1424,23 @@ func TestExecuteDetachedSessionAndBackgroundWriters(t *testing.T) {
 	done := make(chan executeOutcome, 1)
 	finished := make(chan struct{})
 	ctx, cancel := context.WithCancel(context.Background())
+	observerCtx, cancelObservers := context.WithCancel(context.Background())
+	observations := make(chan pidTokenObservation, 2)
+	observerDone := make(chan struct{}, 2)
+	var observedMu sync.Mutex
+	var observedTokens []procToken
+	observe := func(path string) {
+		go func() {
+			defer func() { observerDone <- struct{}{} }()
+			tok, err := observePIDToken(observerCtx, path, 5*time.Second)
+			if err == nil {
+				observedMu.Lock()
+				observedTokens = append(observedTokens, tok)
+				observedMu.Unlock()
+			}
+			observations <- pidTokenObservation{path: path, tok: tok, err: err}
+		}()
+	}
 	go func() {
 		defer close(finished)
 		result, err := NewVerifierArgs([]string{
@@ -1450,28 +1448,49 @@ func TestExecuteDetachedSessionAndBackgroundWriters(t *testing.T) {
 		}).Execute(ctx, dir)
 		done <- executeOutcome{result: result, err: err}
 	}()
+	// Observers start before any readiness wait and capture the first valid
+	// PID/start-token publication. Cleanup is registered immediately after all
+	// three goroutines launch, before any diagnostic failure can occur.
+	observe(sessionPidFile)
+	observe(groupPidFile)
 	// Register before any readiness wait. Cleanup order is explicit: cancel
-	// Execute, join its goroutine within a bound, then identity-bind/reap any
-	// fixture PID files that appeared before TempDir cleanup.
+	// Execute and observers, join all three within a bound, then recheck and
+	// reap only the stored start-token identities before TempDir cleanup.
 	t.Cleanup(func() {
 		cancel()
+		cancelObservers()
 		select {
 		case <-finished:
 		case <-time.After(3 * time.Second):
 			t.Errorf("cleanup: Execute did not stop after cancellation")
 		}
-		reapPIDFilesByIdentity(t, sessionPidFile, groupPidFile)
+		for range 2 {
+			select {
+			case <-observerDone:
+			case <-time.After(3 * time.Second):
+				t.Errorf("cleanup: PID observer did not stop after cancellation")
+			}
+		}
+		observedMu.Lock()
+		tokens := append([]procToken(nil), observedTokens...)
+		observedMu.Unlock()
+		reapExactTokens(t, tokens...)
 	})
 	if _, err := waitForChildReadyPID(startedFile, 5*time.Second); err != nil {
 		t.Fatal(err)
 	}
-	sessionToken, err := waitForPIDToken(sessionPidFile, 5*time.Second)
-	if err != nil {
-		t.Fatal(err)
+	observed := make(map[string]procToken, 2)
+	for range 2 {
+		observation := <-observations
+		if observation.err != nil {
+			t.Fatal(observation.err)
+		}
+		observed[observation.path] = observation.tok
 	}
-	groupToken, err := waitForPIDToken(groupPidFile, 5*time.Second)
-	if err != nil {
-		t.Fatal(err)
+	sessionToken, sessionOK := observed[sessionPidFile]
+	groupToken, groupOK := observed[groupPidFile]
+	if !sessionOK || !groupOK {
+		t.Fatalf("observer did not capture both fixture identities: %+v", observed)
 	}
 	if sessionToken.equal(groupToken) {
 		t.Fatalf("writer inventory aliases one identity: session=%+v group=%+v", sessionToken, groupToken)
