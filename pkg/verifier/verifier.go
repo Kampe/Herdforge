@@ -14,6 +14,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/Kampe/Herdforge/pkg/resources"
 )
 
 type Language string
@@ -120,6 +122,13 @@ type Verifier struct {
 	Argv       []string
 	commandErr error
 	Timeout    time.Duration
+	// DiskAdmission is checked before mutation/test fan-out. It is injectable
+	// so rejected paths can prove zero process and filesystem callbacks.
+	DiskAdmission resources.DiskAdmission
+}
+
+func defaultDiskAdmission() resources.DiskAdmission {
+	return resources.NewCapacityGate(resources.OSBackend{}, resources.DefaultDiskPolicy())
 }
 
 // NewVerifier preserves the existing config-string entry point, but parses a
@@ -128,7 +137,7 @@ type Verifier struct {
 // command substitution can occur.
 func NewVerifier(command string) *Verifier {
 	argv, err := parseArgv(command)
-	return &Verifier{Argv: argv, commandErr: err}
+	return &Verifier{Argv: argv, commandErr: err, DiskAdmission: defaultDiskAdmission()}
 }
 
 // NewVerifierArgs is the preferred constructor. The caller supplies the exact
@@ -140,7 +149,7 @@ func NewVerifierArgs(argv []string) *Verifier {
 	if len(copyArgv) == 0 || strings.TrimSpace(copyArgv[0]) == "" {
 		err = errors.New("verification command is empty")
 	}
-	return &Verifier{Argv: copyArgv, commandErr: err}
+	return &Verifier{Argv: copyArgv, commandErr: err, DiskAdmission: defaultDiskAdmission()}
 }
 
 func (v *Verifier) Execute(ctx context.Context, dir string) (*Result, error) {
@@ -618,12 +627,41 @@ type MutationRequest struct {
 	Timeout           time.Duration
 }
 
+func (v *Verifier) admitMutationDisk(dir string) error {
+	if v == nil || v.DiskAdmission == nil {
+		return errors.New("disk capacity gate unavailable for mutation")
+	}
+	candidate, err := resources.ResolveExistingPath(dir)
+	if err != nil {
+		return fmt.Errorf("disk capacity gate: resolve candidate volume: %w", err)
+	}
+	tmp, err := resources.ResolveExistingPath(os.TempDir())
+	if err != nil {
+		return fmt.Errorf("disk capacity gate: resolve temporary volume: %w", err)
+	}
+	scope := resources.CapacityScopeForPaths(candidate, tmp)
+	decision := v.DiskAdmission.Admit(resources.DiskRequest{
+		Operation: "verifier_mutation",
+		Path:      candidate,
+		TempPath:  tmp,
+		Scope:     scope,
+	})
+	if decision.Allowed {
+		return nil
+	}
+	evidence, _ := json.Marshal(decision.Evidence)
+	return fmt.Errorf("disk capacity gate blocked: state=%s evidence=%s", decision.State, evidence)
+}
+
 // RunMutationCheck is the compatibility entry point for callers that already
 // have a target and replacement. It resolves the exact current candidate SHA
 // and delegates to RunMutationCheckForCandidate.
 func (v *Verifier) RunMutationCheck(ctx context.Context, dir string, targetFile string, originalCode string, mutantCode string) (*MutationResult, error) {
 	if v == nil {
 		return nil, errors.New("nil verifier")
+	}
+	if err := v.admitMutationDisk(dir); err != nil {
+		return nil, err
 	}
 	sha, err := currentSHA(dir)
 	if err != nil {
@@ -649,6 +687,12 @@ func (v *Verifier) RunMutationCheckForCandidate(ctx context.Context, dir string,
 	}
 	if ctx == nil {
 		ctx = context.Background()
+	}
+	// This is the first operation after argument/context validation: no git
+	// read, target write, temp worktree, process start, or fan-out may precede
+	// the disk decision.
+	if err := v.admitMutationDisk(dir); err != nil {
+		return nil, err
 	}
 	if err := validateRequest(VerificationRequest{
 		CandidateSHA:      req.CandidateSHA,

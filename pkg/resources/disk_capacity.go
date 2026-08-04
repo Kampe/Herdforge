@@ -5,8 +5,12 @@ import (
 	"encoding/hex"
 	"fmt"
 	"math"
+	"os"
+	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
+	"sync"
 )
 
 // Capacity is a read-only filesystem capacity observation.
@@ -32,10 +36,56 @@ type DiskPolicy struct {
 	RecoveryPercent               float64
 }
 
+// DefaultDiskPolicy is intentionally conservative for disk-growing fleet
+// operations. Callers may supply a policy explicitly for hermetic tests or
+// deployment-specific capacity reservations.
+func DefaultDiskPolicy() DiskPolicy {
+	return DiskPolicy{
+		ReserveBytes:    15 * (1 << 30),
+		ReservePercent:  2,
+		ReserveInodes:   1,
+		RecoveryBytes:   19 * (1 << 30),
+		RecoveryPercent: 2.5,
+		RecoveryInodes:  1,
+	}
+}
+
+// ResolveExistingPath resolves a path for a read-only volume probe without
+// creating the destination. This is required for a first worktree creation,
+// where the pool directory does not exist yet.
+func ResolveExistingPath(path string) (string, error) {
+	if strings.TrimSpace(path) == "" {
+		return "", fmt.Errorf("probe path is empty")
+	}
+	p, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	for {
+		if _, err := os.Stat(p); err == nil {
+			resolved, err := filepath.EvalSymlinks(p)
+			if err != nil {
+				return "", err
+			}
+			return filepath.Clean(resolved), nil
+		} else if !os.IsNotExist(err) {
+			return "", err
+		}
+		next := filepath.Dir(p)
+		if next == p {
+			return "", fmt.Errorf("no existing ancestor for probe path")
+		}
+		p = next
+	}
+}
+
 type DiskRequest struct {
 	Operation, Path, TempPath     string
 	RequiredBytes, RequiredInodes uint64
 	PreviouslyBlocked             bool
+	AdditionalPaths               []string
+	// Scope is an opaque, stable canonical volume-set identity.
+	Scope string
 }
 
 type DiskState string
@@ -74,12 +124,75 @@ type DiskEvidence struct {
 	TempFreeBytes    uint64  `json:"temp_free_bytes,omitempty"`
 	TempFreePercent  float64 `json:"temp_free_percent,omitempty"`
 	TempFreeInodes   uint64  `json:"temp_free_inodes,omitempty"`
+	ScopeID          string  `json:"scope_id,omitempty"`
 }
 
 type DiskDecision struct {
 	State    DiskState    `json:"state"`
 	Allowed  bool         `json:"allowed"`
 	Evidence DiskEvidence `json:"evidence"`
+}
+
+// DiskAdmission is the read-only, fail-closed boundary used by mutation
+// owners. Implementations must not create, remove, or otherwise alter paths.
+type DiskAdmission interface {
+	Admit(DiskRequest) DiskDecision
+}
+
+type DiskAdmissionFunc func(DiskRequest) DiskDecision
+
+func (f DiskAdmissionFunc) Admit(request DiskRequest) DiskDecision { return f(request) }
+
+// CapacityGate adds hysteresis to the pure evaluator while keeping probing
+// and policy explicit. The mutex makes one gate safe for concurrent callers.
+type CapacityGate struct {
+	Backend StatFSBackend
+	Policy  DiskPolicy
+
+	mu      sync.Mutex
+	blocked map[string]bool
+}
+
+func NewCapacityGate(backend StatFSBackend, policy DiskPolicy) *CapacityGate {
+	return &CapacityGate{Backend: backend, Policy: policy, blocked: make(map[string]bool)}
+}
+
+func (g *CapacityGate) Admit(request DiskRequest) DiskDecision {
+	if g == nil {
+		return EvaluateDiskCapacity(nil, request, DiskPolicy{})
+	}
+	scope := request.Scope
+	if scope == "" {
+		scope = CapacityScopeForPaths(append([]string{request.Path, request.TempPath}, request.AdditionalPaths...)...)
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.blocked == nil {
+		g.blocked = make(map[string]bool)
+	}
+	request.PreviouslyBlocked = g.blocked[scope]
+	request.Scope = scope
+	decision := EvaluateDiskCapacity(g.Backend, request, g.Policy)
+	if decision.Allowed {
+		delete(g.blocked, scope)
+	} else {
+		g.blocked[scope] = true
+	}
+	return decision
+}
+
+// CapacityScopeForPaths returns a stable opaque identity for a canonical set
+// of capacity inputs. It intentionally never returns or logs the paths.
+func CapacityScopeForPaths(paths ...string) string {
+	values := make([]string, 0, len(paths))
+	for _, path := range paths {
+		if strings.TrimSpace(path) != "" {
+			values = append(values, filepath.Clean(path))
+		}
+	}
+	sort.Strings(values)
+	h := sha256.Sum256([]byte(strings.Join(values, "\x00")))
+	return "scope:" + hex.EncodeToString(h[:8])
 }
 
 var diskOperationPattern = regexp.MustCompile(`^[a-zA-Z][a-zA-Z0-9_.-]{0,31}$`)
@@ -89,6 +202,9 @@ var diskOperationPattern = regexp.MustCompile(`^[a-zA-Z][a-zA-Z0-9_.-]{0,31}$`)
 func EvaluateDiskCapacity(backend StatFSBackend, request DiskRequest, policy DiskPolicy) DiskDecision {
 	t := policy.thresholds(request.PreviouslyBlocked)
 	e := DiskEvidence{Kind: "disk_pressure", Operation: boundedDiskOperation(request.Operation), ReserveBytes: t.bytes, ReservePercent: t.percent, ReserveInodes: t.inodes, RequiredBytes: request.RequiredBytes}
+	if request.Scope != "" {
+		e.ScopeID = request.Scope
+	}
 	if err := validDiskPolicy(policy); err != nil {
 		return diskBlocked(e, DiskReasonInvalidPolicy)
 	}
@@ -101,6 +217,9 @@ func EvaluateDiskCapacity(backend StatFSBackend, request DiskRequest, policy Dis
 	}
 	if err := validCapacity(root); err != nil {
 		return diskBlocked(e, DiskReasonInvalid)
+	}
+	if strings.TrimSpace(root.FilesystemID) == "" {
+		return diskBlocked(e, DiskReasonUnavailable)
 	}
 	e.FilesystemID = safeDiskIdentity(root.FilesystemID)
 	e.FreeBytes, e.FreePercent, e.FreeInodes = capacityMetrics(root)
@@ -122,9 +241,27 @@ func EvaluateDiskCapacity(backend StatFSBackend, request DiskRequest, policy Dis
 		if err := validCapacity(tmp); err != nil {
 			return diskBlocked(e, DiskReasonInvalid)
 		}
+		if strings.TrimSpace(tmp.FilesystemID) == "" {
+			return diskBlocked(e, DiskReasonUnavailable)
+		}
 		e.TempFilesystemID = safeDiskIdentity(tmp.FilesystemID)
 		e.TempFreeBytes, e.TempFreePercent, e.TempFreeInodes = capacityMetrics(tmp)
 		if !capacityMeets(tmp, request.RequiredBytes, request.RequiredInodes, t) {
+			return diskBlocked(e, DiskReasonTempVolumeDivergence)
+		}
+	}
+	for _, path := range request.AdditionalPaths {
+		if path == "" || path == request.Path || path == request.TempPath {
+			continue
+		}
+		additional, err := backend.StatFS(path)
+		if err != nil {
+			return diskBlocked(e, DiskReasonUnavailable)
+		}
+		if err := validCapacity(additional); err != nil || strings.TrimSpace(additional.FilesystemID) == "" {
+			return diskBlocked(e, DiskReasonInvalid)
+		}
+		if !capacityMeets(additional, request.RequiredBytes, request.RequiredInodes, t) {
 			return diskBlocked(e, DiskReasonTempVolumeDivergence)
 		}
 	}
