@@ -123,6 +123,8 @@ func TestExecuteHoldCommandRejectsInvalidTargetBeforeAuthorityOpen(t *testing.T)
 		}},
 		{name: "missing task", edit: func(req *holdCommandRequest) { req.Task = "" }},
 		{name: "missing owner", edit: func(req *holdCommandRequest) { req.Owner = "" }},
+		{name: "padded task owner", edit: func(req *holdCommandRequest) { req.Owner = " worker" }},
+		{name: "padded lane owner", edit: func(req *holdCommandRequest) { req.Scope = "lane"; req.Task = ""; req.Owner = "worker " }},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -198,6 +200,27 @@ func TestExecuteHoldCommandSuccessClosesOnceAndFlushesOneReceipt(t *testing.T) {
 		default:
 			t.Fatalf("unexpected %s receipt type %T", action, encoded[0])
 		}
+	}
+}
+
+func TestExecuteHoldCommandLaneScopeDefaultsOwnerToConfiguredRole(t *testing.T) {
+	boundary := &adapterBoundary{hasCurrent: false}
+	opens := 0
+	encoded := []any{}
+	flushes := 0
+	req := adapterRequest("on")
+	req.Scope = "lane"
+	req.Task = ""
+	req.Owner = ""
+	if err := executeHoldCommand(context.Background(), req, adapterDeps(boundary, "", &opens, &encoded, &flushes)); err != nil {
+		t.Fatal(err)
+	}
+	if opens != 1 || boundary.closeCalls != 1 || boundary.holdCalls != 1 || len(encoded) != 1 || flushes != 1 {
+		t.Fatalf("lane success counts: opens=%d closes=%d holds=%d receipts=%d flushes=%d", opens, boundary.closeCalls, boundary.holdCalls, len(encoded), flushes)
+	}
+	receipt, ok := encoded[0].(lifecycle.HoldRecord)
+	if !ok || receipt.Repository != "github.com/example/repo" || receipt.Owner != "worker" || receipt.Lane != "smith" || receipt.Task != "" || receipt.Scope != "lane" || receipt.Generation != 1 || !receipt.Held {
+		t.Fatalf("lane receipt did not contain configured owner/lane identity: %#v", encoded[0])
 	}
 }
 

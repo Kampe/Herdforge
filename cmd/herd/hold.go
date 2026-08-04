@@ -149,8 +149,11 @@ func executeHoldCommand(ctx context.Context, req holdCommandRequest, deps holdCo
 	if deps.Now == nil {
 		deps.Now = time.Now
 	}
-	if strings.TrimSpace(req.Owner) == "" || req.Owner != strings.TrimSpace(req.Owner) {
-		return errors.New("hold owner is required and must be canonical")
+	if req.Owner != strings.TrimSpace(req.Owner) {
+		return errors.New("hold owner must be canonical")
+	}
+	if req.Scope == "task" && strings.TrimSpace(req.Owner) == "" {
+		return errors.New("task hold owner is required")
 	}
 
 	authenticated, err := deps.AuthenticateRepository()
