@@ -90,6 +90,9 @@ func main() {
 	case "pulse":
 		runPulse()
 
+	case "wind-down":
+		runWindDown()
+
 	case "standing":
 		if err := runStandingE(); err != nil {
 			fmt.Fprintf(os.Stderr, "standing failed: %v\n", err)
@@ -224,6 +227,7 @@ func printUsage() {
 	fmt.Println("  selftest   Run core orchestration behavior self-test suite")
 	fmt.Println("  status     Display current orchestration engine status")
 	fmt.Println("  pulse      Claim a task from Kaneo and optionally spawn an agent")
+	fmt.Println("  wind-down  Control durable fleet launch posture: on, off, or status")
 	fmt.Println("  review     Claim in-progress tasks for reviewer and advance to review status")
 	fmt.Println("  approve    Move in-review cards to done, gated on merge evidence")
 	fmt.Println("  board-done Move one card to done ONLY with proof its work is on origin/main")
@@ -580,6 +584,10 @@ func runPulse() {
 	role := pulseFlags.String("role", "worker", "Target role to run pulse sweep for")
 	spawn := pulseFlags.Bool("spawn", false, "Spawn an agent in herdr to work the claimed task")
 	pulseFlags.Parse(os.Args[2:])
+	if err := requireFleetAdmission(context.Background()); err != nil {
+		fmt.Fprintf(os.Stderr, "pulse: %v\n", err)
+		os.Exit(1)
+	}
 
 	cfg, err := config.LoadConfig(".herd/herd.yaml")
 	if err != nil {
@@ -930,6 +938,10 @@ func orEmpty(s string) string {
 }
 
 func runDaemon() {
+	if err := requireFleetAdmission(context.Background()); err != nil {
+		fmt.Fprintf(os.Stderr, "daemon: %v\n", err)
+		os.Exit(1)
+	}
 	daemonFlags := flag.NewFlagSet("daemon", flag.ExitOnError)
 	role := daemonFlags.String("role", "worker", "Target role for pulse sweeps")
 	interval := daemonFlags.Int("interval", 60, "Pulse interval in seconds")
@@ -994,6 +1006,9 @@ func runDaemon() {
 }
 
 func runStandingE() error {
+	if err := requireFleetAdmission(context.Background()); err != nil {
+		return err
+	}
 	cfg, err := config.LoadConfig(".herd/herd.yaml")
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
@@ -1083,6 +1098,10 @@ func runUp() {
 		os.Exit(1)
 	}
 	laneName := os.Args[2]
+	if err := requireFleetAdmission(context.Background()); err != nil {
+		fmt.Fprintf(os.Stderr, "up: %v\n", err)
+		os.Exit(1)
+	}
 
 	cfg, err := config.LoadConfig(".herd/herd.yaml")
 	if err != nil {
@@ -1161,6 +1180,12 @@ func runActivate() {
 		fmt.Println("activate selftest: PASS")
 		return
 	}
+	if !*noFleet {
+		if err := requireFleetAdmission(context.Background()); err != nil {
+			fmt.Fprintf(os.Stderr, "activate: %v\n", err)
+			os.Exit(1)
+		}
+	}
 
 	var buildServices []string
 	if *build != "" {
@@ -1234,6 +1259,12 @@ func runReview() {
 	spawn := reviewFlags.Bool("spawn", false, "Spawn reviewer agent in herdr")
 	reviewFlags.Parse(os.Args[2:])
 	refArg := reviewFlags.Arg(0)
+	if *spawn {
+		if err := requireFleetAdmission(context.Background()); err != nil {
+			fmt.Fprintf(os.Stderr, "review: %v\n", err)
+			os.Exit(1)
+		}
+	}
 
 	cfg, err := config.LoadConfig(".herd/herd.yaml")
 	if err != nil {
@@ -2461,6 +2492,9 @@ func runUnmerged() {
 }
 
 func runForgeE() error {
+	if err := requireFleetAdmission(context.Background()); err != nil {
+		return err
+	}
 	// FAC-128: `herd forge --loop` runs the autonomous orchestration loop.
 	for _, a := range os.Args[2:] {
 		if a == "--loop" {
@@ -2794,6 +2828,9 @@ type launchLifecycle interface {
 type liveLaunchLifecycle struct{}
 
 func (liveLaunchLifecycle) Run(decision *router.LaunchDecision, effect func(*router.LaunchDecision) error) error {
+	if err := requireFleetAdmission(context.Background()); err != nil {
+		return err
+	}
 	return effect(decision)
 }
 
@@ -2846,6 +2883,10 @@ func runKick() {
 		}
 		fmt.Println("kick selftest PASSED — all standing lane messages valid")
 		return
+	}
+	if err := requireFleetAdmission(context.Background()); err != nil {
+		fmt.Fprintf(os.Stderr, "herd-kick: %v\n", err)
+		os.Exit(1)
 	}
 
 	args := kickFlags.Args()
@@ -3606,6 +3647,10 @@ func runShoot() {
 		fmt.Fprintln(os.Stderr, "usage: herd shoot <pane|name> <refocus message>")
 		os.Exit(2)
 	}
+	if err := requireFleetAdmission(context.Background()); err != nil {
+		fmt.Fprintf(os.Stderr, "herd shoot: %v\n", err)
+		os.Exit(1)
+	}
 	if !herdr.IsAvailable() {
 		fmt.Fprintln(os.Stderr, "herd shoot: herdr CLI not found")
 		os.Exit(1)
@@ -3702,6 +3747,9 @@ func (d *cliForgeDriver) Approve(ctx context.Context, t *provider.Task) error {
 }
 
 func (d *cliForgeDriver) Renudge(ctx context.Context, t *provider.Task) error {
+	if err := requireFleetAdmission(ctx); err != nil {
+		return err
+	}
 	agent := "task-" + strings.ToLower(t.Ref)
 	msg := "RE-NUDGE " + t.Ref + ": you reported done but herd verify FAILED (missing commits, build, or tests). " +
 		"Finish it: implement, `go build ./... && go test ./...` green, `herd verify` PASS, then commit. Do not stop until committed."
@@ -3718,6 +3766,10 @@ func runForgeLoop() {
 	ticks := fs.Int("ticks", 0, "stop after N ticks (0 = run until drained)")
 	stopEmpty := fs.Bool("stop-empty", true, "stop when the board is clear and no lane is busy")
 	fs.Parse(os.Args[2:])
+	if err := requireFleetAdmission(context.Background()); err != nil {
+		fmt.Fprintf(os.Stderr, "forge --loop: %v\n", err)
+		os.Exit(1)
+	}
 
 	cfg, err := config.LoadConfig(".herd/herd.yaml")
 	if err != nil {
