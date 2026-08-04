@@ -111,9 +111,26 @@ func PrepareToolChildLifecycle(tabID, paneID string, req launch.Request, name st
 	if concrete, ok := lc.(*toolchild.Lifecycle); ok {
 		concrete.SetContext(toolchild.Identity{TabID: tabID, PaneID: paneID, Name: name, SessionGeneration: req.SessionGeneration, LaunchID: launch.DecisionDigest(req.Decision), Repository: req.Repository, Lane: req.Lane, Role: string(req.Decision.Role), TaskRef: req.TaskRef, Provider: req.Decision.Provider, ArgvDigest: launch.DecisionDigest(req.Decision), Argv: append([]string(nil), req.Decision.Argv...)})
 		if err := concrete.Provision(); err != nil {
+			// Provisioning has not published a valid lifecycle receipt. Close and
+			// verify only the exact prepared tab, then release the process-local
+			// reservation; never manufacture a tombstone for absent authority.
+			if cleanupErr := cleanupUnpublishedReservation(tabID, paneID); cleanupErr != nil {
+				return errors.Join(err, cleanupErr)
+			}
 			return err
 		}
 	}
+	return nil
+}
+
+func cleanupUnpublishedReservation(tabID, paneID string) error {
+	if err := tabCloseRaw(tabID); err != nil {
+		return fmt.Errorf("unpublished reservation tab close: %w", err)
+	}
+	if err := verifyHerdrTerminal(tabID, paneID); err != nil {
+		return fmt.Errorf("unpublished reservation terminal readback: %w", err)
+	}
+	dropToolChild(tabID, paneID)
 	return nil
 }
 
@@ -601,16 +618,17 @@ func AgentStartWithDecision(name, kind, paneID string, req launch.Request) error
 	if req.SessionGeneration <= 0 {
 		return fmt.Errorf("durable Herdr session generation is unavailable")
 	}
+	if lc == nil {
+		return fmt.Errorf("prepared tool-child lifecycle is required before process start")
+	}
 	if err := agentStartProcess(name, kind, paneID, req.Decision.Argv[1:]...); err != nil {
-		if lc != nil {
-			if rollbackErr := rollbackToolChild(tabForPane(paneID), paneID, lc, "failed-launch"); rollbackErr != nil {
-				return errors.Join(err, rollbackErr)
-			}
+		if rollbackErr := rollbackToolChild(tabForPane(paneID), paneID, lc, "failed-launch"); rollbackErr != nil {
+			return errors.Join(err, rollbackErr)
 		}
 		_ = launch.RecordRejected(req, nil, err.Error())
 		return err
 	}
-	if lc != nil {
+	{
 		if err := bindToolChildLifecycle(paneID, name, req); err != nil {
 			if rollbackErr := rollbackToolChild(tabForPane(paneID), paneID, lc, "failed-bind"); rollbackErr != nil {
 				return errors.Join(err, rollbackErr)
@@ -647,51 +665,43 @@ func compensateStartedProcess(name string) error {
 }
 
 func compensateStartedProcessExact(name, paneID string) error {
+	if strings.TrimSpace(name) == "" && strings.TrimSpace(paneID) == "" {
+		return fmt.Errorf("exact compensation identity is required")
+	}
 	agents, err := AgentList()
 	if err != nil {
 		return err
 	}
+	matches := make([]AgentEntry, 0, 1)
 	for _, a := range agents {
 		if (name != "" && a.Name != name) || (paneID != "" && a.PaneID != paneID) {
 			continue
 		}
-		if a.TabID == "" {
-			return fmt.Errorf("cannot compensate launch %q: missing tab id", name)
-		}
-		if err := tabCloseRaw(a.TabID); err != nil {
-			return err
-		}
-		remaining, err := AgentList()
-		if err != nil {
-			return fmt.Errorf("verify compensated launch %q: %w", name, err)
-		}
-		for _, live := range remaining {
-			if (name != "" && live.Name == name) || (paneID != "" && live.PaneID == paneID) {
-				return fmt.Errorf("compensated launch %q remains present", name)
-			}
-		}
-		return nil
+		matches = append(matches, a)
 	}
-	if paneID != "" {
-		tabID := tabForPane(paneID)
-		if tabID == "" {
-			return fmt.Errorf("cannot compensate pane %q: %w", paneID, ErrAgentNotFound)
-		}
-		if err := tabCloseRaw(tabID); err != nil {
-			return err
-		}
-		remaining, err := AgentList()
-		if err != nil {
-			return err
-		}
-		for _, a := range remaining {
-			if a.PaneID == paneID {
-				return fmt.Errorf("pane %s remains live after compensation", paneID)
-			}
-		}
-		return nil
+	if len(matches) == 0 {
+		return fmt.Errorf("cannot compensate launch %q: %w", name, ErrAgentNotFound)
 	}
-	return fmt.Errorf("cannot compensate launch %q: %w", name, ErrAgentNotFound)
+	if len(matches) != 1 {
+		return fmt.Errorf("cannot compensate launch %q: identity is ambiguous (%d matches)", name, len(matches))
+	}
+	target := matches[0]
+	if target.TabID == "" || target.PaneID == "" || target.Name == "" {
+		return fmt.Errorf("cannot compensate launch %q: exact tab/name/pane identity is incomplete", name)
+	}
+	if err := tabCloseRaw(target.TabID); err != nil {
+		return err
+	}
+	remaining, err := AgentList()
+	if err != nil {
+		return fmt.Errorf("verify compensated launch %q: %w", name, err)
+	}
+	for _, live := range remaining {
+		if live.Name == target.Name && live.PaneID == target.PaneID && live.TabID == target.TabID {
+			return fmt.Errorf("compensated launch %q remains present", name)
+		}
+	}
+	return nil
 }
 
 func tabCloseRaw(tabID string) error {

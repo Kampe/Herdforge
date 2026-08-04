@@ -114,6 +114,47 @@ func TestSessionReservationSurvivesRestartLoad(t *testing.T) {
 	}
 }
 
+func TestCorruptLedgerQuarantinePreservesHistoryAndBlocksReservation(t *testing.T) {
+	t.Setenv("HERD_TOOLCHILD_RECEIPT_ROOT", t.TempDir())
+	if generation, err := NextSessionGeneration("repo-quarantine"); err != nil || generation != 1 {
+		t.Fatalf("initial reservation=%d err=%v", generation, err)
+	}
+	path, err := StableReceiptPath("repo-quarantine")
+	if err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(`{"action":"session-reservation"}`); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NextSessionGeneration("repo-quarantine"); err == nil {
+		t.Fatal("corrupt ledger reservation was accepted")
+	}
+	if _, err := os.Stat(path + ".quarantine"); err != nil {
+		t.Fatalf("corrupt evidence was not quarantined: %v", err)
+	}
+	if _, err := NextSessionGeneration("repo-quarantine"); err == nil {
+		t.Fatal("later reservation bypassed corrupt ledger")
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(before) != string(after) {
+		t.Fatal("corrupt ledger history was overwritten")
+	}
+}
+
 func TestLifecycleReadersRejectUnframedFinalRecord(t *testing.T) {
 	path := t.TempDir() + "/receipts.jsonl"
 	ow := owner()
@@ -127,6 +168,43 @@ func TestLifecycleReadersRejectUnframedFinalRecord(t *testing.T) {
 	}
 	if _, err := LoadLifecycle(path, "tab", &FakeTree{}, &JSONLSink{Path: path}); err == nil {
 		t.Fatal("complete but unframed final record became cleanup authority")
+	}
+}
+
+func TestVerifyTerminalRejectsBlankFrame(t *testing.T) {
+	path := t.TempDir() + "/receipts.jsonl"
+	sink := &JSONLSink{Path: path}
+	ow := owner()
+	ow.Repository, ow.TabID, ow.PaneID, ow.SessionID, ow.TaskRef, ow.Lane = "repo", "tab", "pane", "session", "task", "lane"
+	if err := sink.Write(Receipt{Action: "owner", Identity: ow}); err != nil {
+		t.Fatal(err)
+	}
+	if err := sink.Write(Receipt{Action: "tombstone", Identity: ow}); err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString("\n"); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := NewLifecycle(ow, &FakeTree{}, sink).VerifyTerminal(); err == nil {
+		t.Fatal("blank receipt frame became terminal proof")
+	}
+}
+
+func TestFakeTreeReapRevalidatesStartTokenAtActionBoundary(t *testing.T) {
+	expected := child(20)
+	tree := &FakeTree{Nodes: map[int]Node{20: {Identity: Identity{PID: 20, StartToken: "reused"}}}}
+	if err := tree.Reap(expected); err == nil {
+		t.Fatal("PID reuse crossed identity-bearing reap boundary")
+	}
+	if len(tree.Reaped) != 0 {
+		t.Fatal("rejected reap mutated fake tree")
 	}
 }
 
@@ -160,7 +238,10 @@ func TestRecoveryRescansOwnerAndResumesPendingIntentPhase(t *testing.T) {
 	// so idempotent teardown completes the recorded intent.
 	path2 := t.TempDir() + "/receipts.jsonl"
 	sink2 := &JSONLSink{Path: path2}
-	for _, r := range []Receipt{{Action: "owner", Identity: ow}, {Action: "inventory", Identity: childID}, {Action: "reap-intent", Identity: childID}} {
+	childTwo := child(21)
+	childTwo.Repository, childTwo.TabID, childTwo.PaneID, childTwo.SessionID, childTwo.TaskRef, childTwo.Lane = "repo", "tab", "pane", "session", "task", "lane"
+	childTwo.OwnerPID, childTwo.OwnerStartToken = ow.PID, ow.StartToken
+	for _, r := range []Receipt{{Action: "owner", Identity: ow}, {Action: "inventory", Identity: childID}, {Action: "inventory", Identity: childTwo}, {Action: "reap-intent", Identity: childID}} {
 		if err := sink2.Write(r); err != nil {
 			t.Fatal(err)
 		}
@@ -219,11 +300,11 @@ func (f *failingTree) Descendants(int) ([]Node, error) {
 	return f.FakeTree.Descendants(10)
 }
 func (f *failingTree) Lookup(pid int) (Node, bool, error) { return f.FakeTree.Lookup(pid) }
-func (f *failingTree) Reap(pid int) error {
+func (f *failingTree) Reap(expected Identity) error {
 	if f.reapErr != nil {
 		return f.reapErr
 	}
-	return f.FakeTree.Reap(pid)
+	return f.FakeTree.Reap(expected)
 }
 
 func owner() Identity {

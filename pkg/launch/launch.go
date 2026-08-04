@@ -156,7 +156,7 @@ func reject(req Request, sink Sink, reason string) error {
 	}
 	err := fmt.Errorf("launch rejected: %s", reason)
 	role, shape, provider, model, effort, digest, argv := fields(req)
-	if werr := sink.Write(Receipt{CreatedAt: time.Now().UTC(), TaskRef: req.TaskRef, Role: role, TaskShape: shape, Provider: provider, Model: model, Effort: effort, DecisionDigest: digest, Argv: argv, Reason: reason}); werr != nil {
+	if werr := sink.Write(Receipt{CreatedAt: time.Now().UTC(), TaskRef: req.TaskRef, Role: role, TaskShape: shape, Provider: provider, Model: model, Effort: effort, DecisionDigest: digest, Argv: argv, Reason: reason, Name: req.Name, PaneID: req.PaneID, LeaseGeneration: req.LeaseGeneration, SessionGeneration: req.SessionGeneration}); werr != nil {
 		return fmt.Errorf("%w; failed to write failed-launch receipt: %v", err, werr)
 	}
 	return err
@@ -204,7 +204,7 @@ func HasStarted(req Request) (bool, error) {
 			}
 			return false, err
 		}
-		if r.TaskRef != req.TaskRef || r.Name != req.Name || r.PaneID != req.PaneID || r.LeaseGeneration != req.LeaseGeneration {
+		if r.TaskRef != req.TaskRef || r.Name != req.Name || r.PaneID != req.PaneID || r.LeaseGeneration != req.LeaseGeneration || r.SessionGeneration != req.SessionGeneration {
 			continue
 		}
 		// Every record for this session generation participates in the decision:
@@ -221,6 +221,9 @@ func HasStarted(req Request) (bool, error) {
 			continue
 		}
 		matched = true
+	}
+	if req.SessionGeneration <= 0 {
+		return false, nil
 	}
 	return matched && !invalidated, nil
 }

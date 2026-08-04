@@ -169,6 +169,40 @@ func TestHasStartedRejectsConflictingAcceptedAndRevokedRecords(t *testing.T) {
 	}
 }
 
+func TestHasStartedFencesSessionAndMatchingRejectedIdentity(t *testing.T) {
+	t.Setenv("HERD_LAUNCH_RECEIPTS", t.TempDir()+"/receipts.jsonl")
+	req := good(t)
+	req.TaskRef, req.Name, req.PaneID, req.LeaseGeneration, req.SessionGeneration = "FAC-188", "worker", "pane-1", 7, 42
+	sink := &JSONLSink{Path: os.Getenv("HERD_LAUNCH_RECEIPTS")}
+	if err := RecordStarted(req, sink); err != nil {
+		t.Fatal(err)
+	}
+	other := req
+	other.SessionGeneration = 41
+	started, err := HasStarted(other)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if started {
+		t.Fatal("different session generation authorized resume")
+	}
+	_ = RecordRejected(req, sink, "failed-bind")
+	started, err = HasStarted(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if started {
+		t.Fatal("matching rejected identity remained resumable")
+	}
+	data, err := os.ReadFile(os.Getenv("HERD_LAUNCH_RECEIPTS"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), `"name":"worker"`) || !strings.Contains(string(data), `"pane_id":"pane-1"`) || !strings.Contains(string(data), `"session_generation":42`) {
+		t.Fatalf("rejected receipt lost exact identity: %s", data)
+	}
+}
+
 func TestHasStartedRejectsMalformedReceiptData(t *testing.T) {
 	path := t.TempDir() + "/receipts.jsonl"
 	t.Setenv("HERD_LAUNCH_RECEIPTS", path)
