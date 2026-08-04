@@ -39,15 +39,15 @@ func (b *adapterBoundary) Check(_ context.Context, _ lifecycle.HoldIdentity, gen
 	b.lastGeneration = generation
 	return lifecycle.HoldDecision{Generation: generation, Reason: "maintenance", Code: "operator_hold"}, b.checkErr
 }
-func (b *adapterBoundary) Hold(_ context.Context, _ lifecycle.HoldIdentity, _ string, _ string, _ string, generation int64, _ *time.Time) (lifecycle.HoldRecord, error) {
+func (b *adapterBoundary) Hold(_ context.Context, identity lifecycle.HoldIdentity, actor, reason, code string, generation int64, expires *time.Time) (lifecycle.HoldRecord, error) {
 	b.holdCalls++
 	b.lastGeneration = generation
-	return lifecycle.HoldRecord{Generation: generation}, b.holdErr
+	return lifecycle.HoldRecord{HoldIdentity: identity, Actor: actor, Reason: reason, Code: code, Generation: generation, ExpiresAt: expires, Held: true}, b.holdErr
 }
-func (b *adapterBoundary) Release(_ context.Context, _ lifecycle.HoldIdentity, _ string, _ string, _ string, generation int64) (lifecycle.HoldRecord, error) {
+func (b *adapterBoundary) Release(_ context.Context, identity lifecycle.HoldIdentity, actor, reason, code string, generation int64) (lifecycle.HoldRecord, error) {
 	b.releaseCalls++
 	b.lastGeneration = generation
-	return lifecycle.HoldRecord{Generation: generation}, b.releaseErr
+	return lifecycle.HoldRecord{HoldIdentity: identity, Actor: actor, Reason: reason, Code: code, Generation: generation, Held: false}, b.releaseErr
 }
 
 func adapterConfig() *config.Config {
@@ -108,6 +108,40 @@ func TestExecuteHoldCommandRejectsForeignAndPaddedRepositoryBeforeOpen(t *testin
 	}
 }
 
+func TestExecuteHoldCommandRejectsInvalidTargetBeforeAuthorityOpen(t *testing.T) {
+	cases := []struct {
+		name string
+		edit func(*holdCommandRequest)
+	}{
+		{name: "invalid scope", edit: func(req *holdCommandRequest) { req.Scope = "bogus" }},
+		{name: "unknown lane", edit: func(req *holdCommandRequest) { req.LaneValue = "unknown"; req.ExplicitLane = true }},
+		{name: "unknown role", edit: func(req *holdCommandRequest) {
+			req.LaneValue = "unknown"
+			req.Scope = "lane"
+			req.Task = ""
+			req.ExplicitLane = false
+		}},
+		{name: "missing task", edit: func(req *holdCommandRequest) { req.Task = "" }},
+		{name: "missing owner", edit: func(req *holdCommandRequest) { req.Owner = "" }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			boundary := &adapterBoundary{}
+			opens := 0
+			encoded := []any{}
+			flushes := 0
+			req := adapterRequest("on")
+			tc.edit(&req)
+			if err := executeHoldCommand(context.Background(), req, adapterDeps(boundary, "", &opens, &encoded, &flushes)); err == nil {
+				t.Fatal("invalid target unexpectedly succeeded")
+			}
+			if opens != 0 || boundary.currentErr != nil || boundary.holdCalls != 0 || boundary.releaseCalls != 0 || len(encoded) != 0 || flushes != 0 {
+				t.Fatalf("invalid target crossed effect boundary: opens=%d holds=%d releases=%d encoded=%d flushes=%d", opens, boundary.holdCalls, boundary.releaseCalls, len(encoded), flushes)
+			}
+		})
+	}
+}
+
 func TestExecuteHoldCommandRepositoryFailurePreventsOpen(t *testing.T) {
 	repositoryErr := errors.New("repository identity unavailable")
 	boundary := &adapterBoundary{}
@@ -148,6 +182,22 @@ func TestExecuteHoldCommandSuccessClosesOnceAndFlushesOneReceipt(t *testing.T) {
 		if action == "on" && boundary.holdCalls != 1 || action == "off" && boundary.releaseCalls != 1 || action == "status" && boundary.checkCalls != 1 {
 			t.Fatalf("action %s authority call counts: checks=%d holds=%d releases=%d", action, boundary.checkCalls, boundary.holdCalls, boundary.releaseCalls)
 		}
+		switch receipt := encoded[0].(type) {
+		case map[string]any:
+			if action != "status" || receipt["repository"] != "github.com/example/repo" || receipt["owner"] != "worker" || receipt["lane"] != "smith" || receipt["task"] != "FAC-203" || receipt["generation"] != int64(1) || receipt["held"] != false || receipt["reason"] != "maintenance" || receipt["code"] != "operator_hold" {
+				t.Fatalf("incomplete status receipt=%#v", receipt)
+			}
+		case lifecycle.HoldRecord:
+			wantCode, wantHeld := "operator_release", false
+			if action == "on" {
+				wantCode, wantHeld = "operator_hold", true
+			}
+			if receipt.Repository != "github.com/example/repo" || receipt.Owner != "worker" || receipt.Lane != "smith" || receipt.Task != "FAC-203" || receipt.Scope != "task" || receipt.Generation != 1 || receipt.Actor != "tester" || receipt.Reason != "maintenance" || receipt.Code != wantCode || receipt.Held != wantHeld {
+				t.Fatalf("incomplete %s receipt=%+v", action, receipt)
+			}
+		default:
+			t.Fatalf("unexpected %s receipt type %T", action, encoded[0])
+		}
 	}
 }
 
@@ -181,32 +231,6 @@ func TestExecuteHoldCommandPropagatesOutputFlushAndCloseErrors(t *testing.T) {
 	if !errors.Is(err, primaryErr) || !errors.Is(err, closeErr) || flushes != 0 {
 		t.Fatalf("primary/close errors were not joined: %v flushes=%d", err, flushes)
 	}
-}
-
-type countingHoldBoundary struct {
-	generationReads int
-	holds           int
-	releases        int
-}
-
-func (b *countingHoldBoundary) Close() error { return nil }
-func (b *countingHoldBoundary) CurrentGeneration(context.Context, lifecycle.HoldIdentity) (int64, error) {
-	b.generationReads++
-	return 1, nil
-}
-func (b *countingHoldBoundary) HasCurrent(context.Context, lifecycle.HoldIdentity) (bool, error) {
-	return false, nil
-}
-func (b *countingHoldBoundary) Check(context.Context, lifecycle.HoldIdentity, int64) (lifecycle.HoldDecision, error) {
-	return lifecycle.HoldDecision{}, nil
-}
-func (b *countingHoldBoundary) Hold(context.Context, lifecycle.HoldIdentity, string, string, string, int64, *time.Time) (lifecycle.HoldRecord, error) {
-	b.holds++
-	return lifecycle.HoldRecord{}, nil
-}
-func (b *countingHoldBoundary) Release(context.Context, lifecycle.HoldIdentity, string, string, string, int64) (lifecycle.HoldRecord, error) {
-	b.releases++
-	return lifecycle.HoldRecord{}, nil
 }
 
 func TestParseHoldExpirySupportsAbsoluteAndBoundedDuration(t *testing.T) {
@@ -267,41 +291,5 @@ func TestNewLifecycleEngineFromConfigPreservesRosterAndStanding(t *testing.T) {
 	scout, err := eng.StandingRoster.ResolveRole("forge-smith")
 	if err != nil || scout.Name != "scout" || !scout.Standing {
 		t.Fatalf("standing scout roster entry=%+v err=%v", scout, err)
-	}
-}
-
-func TestComposeHoldIdentityRejectsUnknownBeforeAuthorityComposition(t *testing.T) {
-	cfg := &config.Config{Lanes: []config.LaneDef{{Name: "smith", Role: "worker"}}}
-	for _, tc := range []struct {
-		name       string
-		lane, task string
-		scope      string
-		explicit   bool
-		owner      string
-	}{
-		{name: "unknown lane", lane: "unknown", task: "FAC-69", scope: "task", explicit: true, owner: "worker"},
-		{name: "unknown role", lane: "unknown", scope: "lane"},
-		{name: "missing lane", task: "FAC-69", scope: "task", explicit: true, owner: "worker"},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			boundary := &countingHoldBoundary{}
-			opens := 0
-			_, got, err := prepareHoldCommand(cfg, tc.lane, tc.task, tc.scope, tc.explicit, tc.owner, "repo", func() (holdAuthorityBoundary, error) {
-				opens++
-				return boundary, nil
-			})
-			if err == nil || got != nil || opens != 0 || boundary.generationReads != 0 || boundary.holds != 0 || boundary.releases != 0 {
-				t.Fatalf("invalid target crossed effect boundary: err=%v got=%v opens=%d reads=%d holds=%d releases=%d", err, got, opens, boundary.generationReads, boundary.holds, boundary.releases)
-			}
-		})
-	}
-	boundary := &countingHoldBoundary{}
-	opens := 0
-	identity, got, err := prepareHoldCommand(cfg, "smith", "FAC-69", "task", true, "worker", "repo", func() (holdAuthorityBoundary, error) {
-		opens++
-		return boundary, nil
-	})
-	if err != nil || got != boundary || opens != 1 || identity.Lane != "smith" || identity.Owner != "worker" {
-		t.Fatalf("valid target did not reach opener exactly once: identity=%+v got=%v opens=%d err=%v", identity, got, opens, err)
 	}
 }
