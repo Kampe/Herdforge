@@ -1,0 +1,139 @@
+package resources
+
+import (
+	"errors"
+	"math"
+	"testing"
+)
+
+type diskFake struct {
+	values map[string]Capacity
+	err    error
+	calls  []string
+}
+
+func (f *diskFake) StatFS(path string) (Capacity, error) {
+	f.calls = append(f.calls, path)
+	if f.err != nil {
+		return Capacity{}, f.err
+	}
+	return f.values[path], nil
+}
+func diskHealthy(id string) Capacity {
+	return Capacity{FilesystemID: id, TotalBytes: 1000, FreeBytes: 500, TotalInodes: 100, FreeInodes: 80}
+}
+func diskPolicy() DiskPolicy {
+	return DiskPolicy{ReserveBytes: 100, ReservePercent: 20, ReserveInodes: 10}
+}
+
+func TestEvaluateDiskCapacityThresholdsAndInodes(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		c      Capacity
+		r      DiskRequest
+		state  DiskState
+		reason string
+	}{
+		{"bytes", Capacity{FilesystemID: "fs", TotalBytes: 1000, FreeBytes: 150, TotalInodes: 100, FreeInodes: 80}, DiskRequest{Path: ".", RequiredBytes: 100}, DiskBlocked, DiskReasonBelowThreshold},
+		{"percent", Capacity{FilesystemID: "fs", TotalBytes: 1000, FreeBytes: 150, TotalInodes: 100, FreeInodes: 80}, DiskRequest{Path: "."}, DiskBlocked, DiskReasonBelowThreshold},
+		{"inodes", Capacity{FilesystemID: "fs", TotalBytes: 1000, FreeBytes: 500, TotalInodes: 100, FreeInodes: 9}, DiskRequest{Path: "."}, DiskBlocked, DiskReasonInodeExhaustion},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := EvaluateDiskCapacity(&diskFake{values: map[string]Capacity{".": tc.c}}, tc.r, diskPolicy())
+			if got.State != tc.state || got.Evidence.Reason != tc.reason {
+				t.Fatalf("got %+v", got)
+			}
+		})
+	}
+}
+
+func TestEvaluateDiskCapacityHysteresisRecoveryAndTempVolume(t *testing.T) {
+	p := diskPolicy()
+	p.RecoveryBytes, p.RecoveryPercent, p.RecoveryInodes = 600, 60, 60
+	f := &diskFake{values: map[string]Capacity{"repo": diskHealthy("repo"), "tmp": {FilesystemID: "tmp", TotalBytes: 1000, FreeBytes: 150, TotalInodes: 100, FreeInodes: 80}}}
+	got := EvaluateDiskCapacity(f, DiskRequest{Path: "repo", TempPath: "tmp", PreviouslyBlocked: true}, p)
+	if got.State != DiskBlocked || got.Evidence.Reason != DiskReasonHysteresis {
+		t.Fatalf("hysteresis got %+v", got)
+	}
+	f.values["repo"] = Capacity{FilesystemID: "repo", TotalBytes: 1000, FreeBytes: 700, TotalInodes: 100, FreeInodes: 80}
+	got = EvaluateDiskCapacity(f, DiskRequest{Path: "repo", TempPath: "tmp"}, p)
+	if got.State != DiskBlocked || got.Evidence.Reason != DiskReasonTempVolumeDivergence {
+		t.Fatalf("temp divergence got %+v", got)
+	}
+	f.values["tmp"] = Capacity{FilesystemID: "tmp", TotalBytes: 1000, FreeBytes: 700, TotalInodes: 100, FreeInodes: 80}
+	got = EvaluateDiskCapacity(f, DiskRequest{Path: "repo", TempPath: "tmp"}, p)
+	if !got.Allowed || got.State != DiskReady {
+		t.Fatalf("recovery got %+v", got)
+	}
+}
+
+func TestEvaluateDiskCapacityFailsClosedAndEvidenceBounded(t *testing.T) {
+	for name, b := range map[string]StatFSBackend{"nil": nil, "error": &diskFake{err: errors.New("probe")}, "invalid": &diskFake{values: map[string]Capacity{".": {TotalBytes: 0, TotalInodes: 1, FreeInodes: 1}}}} {
+		t.Run(name, func(t *testing.T) {
+			got := EvaluateDiskCapacity(b, DiskRequest{Path: ".", Operation: "bad op secret/volume"}, diskPolicy())
+			if got.Allowed || got.State != DiskBlocked {
+				t.Fatalf("not fail closed: %+v", got)
+			}
+			want := DiskReasonUnavailable
+			if name == "invalid" {
+				want = DiskReasonInvalid
+			}
+			if got.Evidence.Reason != want {
+				t.Fatalf("reason = %q, want %q", got.Evidence.Reason, want)
+			}
+		})
+	}
+	f := &diskFake{values: map[string]Capacity{".": diskHealthy("secret/volume")}}
+	got := EvaluateDiskCapacity(f, DiskRequest{Path: ".", Operation: "bad op secret/volume"}, diskPolicy())
+	if got.Evidence.FilesystemID != "opaque:f82a67b36a2b" || got.Evidence.Operation != "unknown" || len(got.Evidence.Operation) > 32 {
+		t.Fatalf("unsafe evidence: %+v", got.Evidence)
+	}
+}
+
+func TestEvaluateDiskCapacityDenialProbesRootOnly(t *testing.T) {
+	f := &diskFake{values: map[string]Capacity{"repo": {FilesystemID: "repo", TotalBytes: 1000, FreeBytes: 1, TotalInodes: 100, FreeInodes: 80}, "tmp": diskHealthy("tmp")}}
+	got := EvaluateDiskCapacity(f, DiskRequest{Path: "repo", TempPath: "tmp", Operation: "build"}, diskPolicy())
+	if got.Allowed || got.Evidence.Reason != DiskReasonBelowThreshold {
+		t.Fatalf("decision = %+v", got)
+	}
+	if len(f.calls) != 1 || f.calls[0] != "repo" {
+		t.Fatalf("probes = %v, want root only", f.calls)
+	}
+	if got.Evidence.Operation != "build" {
+		t.Fatalf("operation evidence = %q", got.Evidence.Operation)
+	}
+	if got := EvaluateDiskCapacity(&diskFake{err: errors.New("probe")}, DiskRequest{Path: "repo", TempPath: "tmp", Operation: "build"}, diskPolicy()); got.Evidence.Reason != DiskReasonUnavailable {
+		t.Fatalf("probe error = %+v", got)
+	}
+}
+
+func TestStatfsConversionRejectsOverflow(t *testing.T) {
+	for name, tc := range map[string][7]uint64{
+		"zero block size": {1, 1, 0, 1, 1, 1, 1},
+		"total overflow":  {1, 1, 2, math.MaxUint64, 1, 1, 1},
+		"free overflow":   {1, 1, 2, 1, math.MaxUint64, 1, 1},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := capacityFromStatfs("fs", "1", tc[3], tc[4], tc[2], tc[5], tc[6]); err == nil {
+				t.Fatal("expected conversion failure")
+			}
+		})
+	}
+	left, err := capacityFromStatfs("a", "1", 2, 1, 4, 10, 5)
+	right, err2 := capacityFromStatfs("b", "1", 2, 1, 4, 10, 5)
+	typeVariant, err3 := capacityFromStatfs("a", "2", 2, 1, 4, 10, 5)
+	if err != nil || err2 != nil || err3 != nil || left.TotalBytes != 8 || left.FreeBytes != 4 || left.FilesystemID == right.FilesystemID || left.FilesystemID == typeVariant.FilesystemID {
+		t.Fatalf("conversion = %+v/%+v, errors %v/%v", left, right, err, err2)
+	}
+}
+
+func TestEvaluateDiskCapacityRejectsInvalidPolicy(t *testing.T) {
+	for _, value := range []float64{math.NaN(), math.Inf(1), -1, 101} {
+		p := diskPolicy()
+		p.ReservePercent = value
+		got := EvaluateDiskCapacity(&diskFake{values: map[string]Capacity{".": diskHealthy("fs")}}, DiskRequest{Path: "."}, p)
+		if got.Allowed || got.Evidence.Reason != DiskReasonInvalidPolicy {
+			t.Fatalf("policy %v = %+v", value, got)
+		}
+	}
+}
