@@ -3,7 +3,9 @@ package dispatch
 import (
 	"context"
 	"errors"
+	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -13,6 +15,18 @@ import (
 	"github.com/Kampe/Herdforge/pkg/scopefence"
 	"github.com/Kampe/Herdforge/pkg/worktree"
 )
+
+type testScopeAuthorityVerifier struct{}
+
+func (testScopeAuthorityVerifier) VerifyGraph(context.Context, scopefence.AuthorityReceipt, scopefence.Graph) error {
+	return nil
+}
+func (testScopeAuthorityVerifier) VerifyScope(context.Context, scopefence.AuthorityReceipt, scopefence.Scope) error {
+	return nil
+}
+func (testScopeAuthorityVerifier) VerifyRelease(context.Context, scopefence.ReleaseRequest) error {
+	return nil
+}
 
 func scopeDispatchConfig() *config.Config {
 	return &config.Config{TaskProvider: config.TaskProvider{ProjectID: "test"}, Lanes: []config.LaneDef{{Name: "worker"}}}
@@ -66,6 +80,42 @@ func TestProductionDispatcherNilScopeFenceFailsClosedBeforeProvider(t *testing.T
 	}
 }
 
+func TestProductionConstructorDoesNotSourceAuthorityFromRepoEnvOrDatabase(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("HERD_SCOPEFENCE_KEY", "must-not-be-read")
+	d := NewProductionDispatcher(scopeDispatchConfig(), &mockTaskProvider{}, worktree.NewWorktreeManager(root))
+	if d.ScopeFence != nil || d.scopeFenceErr == nil || !strings.Contains(d.scopeFenceErr.Error(), "protected coordinator/root verifier") {
+		t.Fatalf("production constructor installed an unprotected authority: fence=%T err=%v", d.ScopeFence, d.scopeFenceErr)
+	}
+	if _, err := os.Stat(filepath.Join(root, ".herd", "scopefence.db")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("production constructor sourced or created local authority database: err=%v", err)
+	}
+	if _, ok := reflect.TypeOf(*d).FieldByName("SigningKey"); ok {
+		t.Fatal("dispatcher exposes signing key material")
+	}
+	if _, ok := reflect.TypeOf(DispatchOptions{}).FieldByName("SigningKey"); ok {
+		t.Fatal("worker packet exposes signing key material")
+	}
+}
+
+type trackingCloser struct {
+	calls int
+	err   error
+}
+
+func (c *trackingCloser) Close() error { c.calls++; return c.err }
+
+func TestDispatcherClosePropagatesOwnedFenceCloseOnce(t *testing.T) {
+	closer := &trackingCloser{err: errors.New("close failed")}
+	d := &Dispatcher{scopeCloser: closer}
+	if err := d.Close(); !errors.Is(err, closer.err) {
+		t.Fatalf("close error not propagated: %v", err)
+	}
+	if err := d.Close(); !errors.Is(err, closer.err) || closer.calls != 1 {
+		t.Fatalf("close was not exactly once: calls=%d err=%v", closer.calls, err)
+	}
+}
+
 func TestDurableScopeAdmissionTwoOverlappingDispatchesOneWinner(t *testing.T) {
 	store, err := scopefence.NewSQLiteStore(filepath.Join(t.TempDir(), "scopefence.db"))
 	if err != nil {
@@ -82,7 +132,11 @@ func TestDurableScopeAdmissionTwoOverlappingDispatchesOneWinner(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	admission := durableScopeAdmission{fence: scopefence.ResolvingFence{Fence: scopefence.Fence{Store: store, Graph: scopefence.NewSQLiteGraphAuthority(store, "repo", graph.Revision, graph.Files)}, Authority: scopefence.NewSQLiteScopeAuthority(store)}}
+	graphAuthority := scopefence.NewSQLiteGraphAuthority(store, "repo", graph.Revision, graph.Files)
+	graphAuthority.Verifier = testScopeAuthorityVerifier{}
+	scopeAuthority := scopefence.NewSQLiteScopeAuthority(store)
+	scopeAuthority.Verifier = testScopeAuthorityVerifier{}
+	admission := durableScopeAdmission{fence: scopefence.ResolvingFence{Fence: scopefence.Fence{Store: store, Graph: graphAuthority}, Authority: scopeAuthority}}
 	results := make(chan scopefence.Decision, 2)
 	var wg sync.WaitGroup
 	for _, task := range []string{"FAC-216", "FAC-217"} {
