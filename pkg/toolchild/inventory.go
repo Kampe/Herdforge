@@ -109,7 +109,7 @@ type Receipt struct {
 
 type Tree interface {
 	Lookup(pid int) (Node, bool, error)
-	Reap(pid int) error
+	Reap(expected Identity) error
 }
 
 // DescendantTree is implemented by production and fake trees that can
@@ -125,12 +125,13 @@ type FakeTree struct {
 }
 
 func (f *FakeTree) Lookup(pid int) (Node, bool, error) { n, ok := f.Nodes[pid]; return n, ok, nil }
-func (f *FakeTree) Reap(pid int) error {
-	if _, ok := f.Nodes[pid]; !ok {
+func (f *FakeTree) Reap(expected Identity) error {
+	n, ok := f.Nodes[expected.PID]
+	if !ok || n.Identity.StartToken != expected.StartToken {
 		return errors.New("fake child missing")
 	}
-	delete(f.Nodes, pid)
-	f.Reaped = append(f.Reaped, pid)
+	delete(f.Nodes, expected.PID)
+	f.Reaped = append(f.Reaped, expected.PID)
 	return nil
 }
 func (f *FakeTree) Descendants(pid int) ([]Node, error) {
@@ -275,7 +276,7 @@ func Teardown(tree Tree, i *Inventory, pid int) (Receipt, error) {
 		r.Reason = err.Error()
 		return r, err
 	}
-	if err := tree.Reap(pid); err != nil {
+	if err := tree.Reap(*expected); err != nil {
 		r.Reason = err.Error()
 		return r, fmt.Errorf("reap owned child: %w", err)
 	}
@@ -352,15 +353,15 @@ func NextSessionGeneration(repository string) (result int64, err error) {
 	}
 	if readErr == nil {
 		if len(b) == 0 || b[len(b)-1] != '\n' {
-			return 0, fmt.Errorf("corrupt lifecycle receipt: incomplete final frame")
+			return 0, corruptReceipt(path, fmt.Errorf("corrupt lifecycle receipt: incomplete final frame"))
 		}
 		for _, line := range strings.Split(strings.TrimSuffix(string(b), "\n"), "\n") {
 			if strings.TrimSpace(line) == "" {
-				return 0, fmt.Errorf("corrupt lifecycle receipt")
+				return 0, corruptReceipt(path, fmt.Errorf("corrupt lifecycle receipt"))
 			}
 			var r Receipt
 			if err := json.Unmarshal([]byte(line), &r); err != nil {
-				return 0, err
+				return 0, corruptReceipt(path, err)
 			}
 			if r.Identity.SessionGeneration > result {
 				result = r.Identity.SessionGeneration
@@ -405,10 +406,40 @@ func NextSessionGeneration(repository string) (result int64, err error) {
 }
 
 func quarantineReceipt(path string) error {
-	if _, err := os.Stat(path); err != nil {
+	b, err := os.ReadFile(path)
+	if err != nil {
 		return err
 	}
-	return os.Rename(path, path+".quarantine")
+	for n := 0; n < 1000; n++ {
+		suffix := ".quarantine"
+		if n > 0 {
+			suffix += fmt.Sprintf(".%d", n)
+		}
+		f, createErr := os.OpenFile(path+suffix, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+		if createErr != nil {
+			if os.IsExist(createErr) {
+				continue
+			}
+			return createErr
+		}
+		writeN, writeErr := f.Write(b)
+		syncErr := f.Sync()
+		closeErr := f.Close()
+		if writeErr != nil || writeN != len(b) {
+			if writeErr == nil {
+				writeErr = io.ErrShortWrite
+			}
+		}
+		return errors.Join(writeErr, syncErr, closeErr)
+	}
+	return fmt.Errorf("unable to allocate non-overwriting receipt quarantine")
+}
+
+func corruptReceipt(path string, cause error) error {
+	if err := quarantineReceipt(path); err != nil {
+		return errors.Join(cause, fmt.Errorf("receipt evidence quarantine failed: %w", err))
+	}
+	return fmt.Errorf("%w; receipt evidence quarantined", cause)
 }
 
 func lockReceipt(path string) (*os.File, error) {
@@ -553,7 +584,7 @@ func (l *Lifecycle) VerifyTerminal() (err error) {
 	terminal := false
 	children := map[string]bool{}
 	intents := map[string]bool{}
-	for _, line := range strings.Split(strings.TrimSpace(string(b)), "\n") {
+	for _, line := range strings.Split(strings.TrimSuffix(string(b), "\n"), "\n") {
 		if strings.TrimSpace(line) == "" {
 			return fmt.Errorf("corrupt lifecycle receipt: blank or truncated record")
 		}
@@ -824,15 +855,6 @@ func (l *Lifecycle) Reconcile(event string) error {
 		return ErrUnsafeTeardown
 	}
 	children := append([]Identity(nil), l.Inventory.Children...)
-	if l.RecoveredPhase >= 3 && len(l.PendingIntents) > 0 {
-		pending := children[:0]
-		for _, child := range children {
-			if l.PendingIntents[childGenerationKey(child)] {
-				pending = append(pending, child)
-			}
-		}
-		children = pending
-	}
 	for _, child := range children {
 		key := childGenerationKey(child)
 		if !l.PendingIntents[key] {
@@ -907,16 +929,23 @@ func (s SystemTree) Descendants(pid int) ([]Node, error) {
 	}
 	return nodes, nil
 }
-func (SystemTree) Reap(pid int) error {
-	if pid <= 0 {
+func (SystemTree) Reap(expected Identity) error {
+	if expected.PID <= 0 || expected.StartToken == "" {
 		return ErrUnsafeTeardown
 	}
-	if err := syscall.Kill(pid, syscall.SIGTERM); err != nil {
+	current, ok, err := (SystemTree{}).Lookup(expected.PID)
+	if err != nil || !ok || current.Identity.StartToken != expected.StartToken {
+		if err != nil {
+			return err
+		}
+		return ErrUnsafeTeardown
+	}
+	if err := syscall.Kill(expected.PID, syscall.SIGTERM); err != nil {
 		return err
 	}
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
-		_, ok, err := (SystemTree{}).Lookup(pid)
+		_, ok, err := (SystemTree{}).Lookup(expected.PID)
 		if err != nil {
 			return err
 		}

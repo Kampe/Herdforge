@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -185,12 +184,11 @@ func TestAgentStartBoundaryRejectsRawAndRequiresDecision(t *testing.T) {
 		t.Fatal(err)
 	}
 	req := launch.Request{Decision: d, TaskRef: "FAC-188", Repository: "repo", Lane: "worker", SessionGeneration: 1, Scope: router.ScopeTask, LeaseGeneration: d.LeaseGeneration}
-	if err := AgentStartWithDecision("worker", "codex", "pane", req); err != nil {
-		t.Fatal(err)
+	if err := AgentStartWithDecision("worker", "codex", "pane", req); err == nil {
+		t.Fatal("direct worker start without a prepared lifecycle must fail closed")
 	}
-	want := []string{"agent", "start", "worker", "--kind", "codex", "--pane", "pane", "--", "--model", launch.WorkerModel, "-c", "model_reasoning_effort=medium", "-a", "never", "-c", "mcp_servers.code-review-graph.enabled=false"}
-	if !reflect.DeepEqual(calls, [][]string{want}) {
-		t.Fatalf("argv calls = %v, want %v", calls, [][]string{want})
+	if len(calls) != 0 {
+		t.Fatalf("unprepared start reached process API: %v", calls)
 	}
 }
 
@@ -292,6 +290,75 @@ type rollbackLifecycle struct {
 	bound                                            bool
 	events                                           *[]string
 	beginErr, reconcileErr, invalidateErr, verifyErr error
+}
+
+type failingProvisionSink struct{}
+
+func (failingProvisionSink) Write(toolchild.Receipt) error {
+	return errors.New("injected provisional sink failure")
+}
+
+func TestProvisioningFailureClosesExactTabWithoutPublishingReservation(t *testing.T) {
+	oldRun := runHerdr
+	defer func() { runHerdr = oldRun }()
+	oldFactory := newToolChildLifecycle
+	defer func() { newToolChildLifecycle = oldFactory }()
+	closed := false
+	runHerdr = func(args ...string) (string, error) {
+		if len(args) == 3 && args[0] == "tab" && args[1] == "close" {
+			closed = true
+			return `{}`, nil
+		}
+		if len(args) == 2 && args[0] == "tab" && args[1] == "list" {
+			return `{"result":{"tabs":[]}}`, nil
+		}
+		if len(args) == 2 && args[0] == "agent" && args[1] == "list" {
+			return `{"result":{"agents":[]}}`, nil
+		}
+		if len(args) == 4 && args[0] == "pane" {
+			return `{"error":{"code":"pane_not_found"}}`, errors.New("exit status 1")
+		}
+		return `{}`, nil
+	}
+	newToolChildLifecycle = func(req launch.Request, _ string, _ string) (ToolChildLifecycle, error) {
+		return toolchild.NewLifecycle(toolchild.Identity{}, toolchild.SystemTree{}, failingProvisionSink{}), nil
+	}
+	d, err := testLaunchRouter(t).Decide(router.LaunchRequest{Role: router.RoleWorker, Shape: launch.Implementation, RequestedProvider: launch.WorkerProvider, RequestedModel: launch.WorkerModel, RequestedEffort: launch.WorkerEffort, TaskRef: "FAC-188", LeaseGeneration: 7, Scope: router.ScopeTask, ProbeResults: map[string]bool{router.ProbeKey(launch.WorkerProvider, launch.WorkerModel): true}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := launch.Request{Decision: d, TaskRef: "FAC-188", Repository: "repo", Lane: "worker", SessionGeneration: 42, LeaseGeneration: 7, Scope: router.ScopeTask}
+	if err := StartPreparedAgent("tab-provision-fail", "worker", "codex", "pane-provision-fail", req); err == nil {
+		t.Fatal("provisioning failure was accepted")
+	}
+	if !closed {
+		t.Fatal("exact prepared tab was not closed")
+	}
+	if lifecycleForTab("tab-provision-fail") != nil || lifecycleForPane("pane-provision-fail") != nil {
+		t.Fatal("failed provisioning leaked map reservation")
+	}
+}
+
+func TestNameOnlyCompensationRejectsAmbiguousAgents(t *testing.T) {
+	old := runHerdr
+	defer func() { runHerdr = old }()
+	closeCalls := 0
+	runHerdr = func(args ...string) (string, error) {
+		if len(args) == 2 && args[0] == "agent" && args[1] == "list" {
+			return `{"result":{"agents":[{"name":"worker","pane_id":"p1","tab_id":"t1"},{"name":"worker","pane_id":"p2","tab_id":"t2"}]}}`, nil
+		}
+		if len(args) == 3 && args[0] == "tab" && args[1] == "close" {
+			closeCalls++
+			return `{}`, nil
+		}
+		return `{}`, nil
+	}
+	if err := compensateStartedProcess("worker"); err == nil {
+		t.Fatal("ambiguous name-only compensation was accepted")
+	}
+	if closeCalls != 0 {
+		t.Fatal("ambiguous compensation closed a tab")
+	}
 }
 
 func (l *rollbackLifecycle) Bind(toolchild.Identity) error { l.bound = true; return nil }
@@ -519,12 +586,11 @@ func TestAgentStartRequiresExactClaimGenerationBeforeProcess(t *testing.T) {
 			}
 		})
 	}
-	before := len(calls)
-	if err := AgentStartWithDecision("worker", launch.WorkerProvider, "pane", launch.Request{Decision: d, TaskRef: "FAC-178", Repository: "repo", Lane: "worker", SessionGeneration: 42, LeaseGeneration: 7, Scope: router.ScopeTask}); err != nil {
-		t.Fatalf("exact generation must reach injected process seam: %v", err)
+	if err := AgentStartWithDecision("worker", launch.WorkerProvider, "pane", launch.Request{Decision: d, TaskRef: "FAC-178", Repository: "repo", Lane: "worker", SessionGeneration: 42, LeaseGeneration: 7, Scope: router.ScopeTask}); err == nil {
+		t.Fatal("exact generation without prepared lifecycle must still fail closed")
 	}
-	if len(calls) != before+1 {
-		t.Fatalf("exact generation did not reach process seam: %v", calls)
+	if len(calls) != 0 {
+		t.Fatalf("unprepared exact-generation start reached process seam: %v", calls)
 	}
 }
 
@@ -739,10 +805,10 @@ func TestReceiptFailureClosesAndVerifiesExactTab(t *testing.T) {
 		}
 		return "{}", nil
 	}
-	if err := AgentStartWithDecision("worker", "codex", "pane", launch.Request{Decision: d, TaskRef: "FAC-188", Repository: "repo", Lane: "worker", SessionGeneration: 42, LeaseGeneration: 7, Scope: router.ScopeTask}); err == nil || !strings.Contains(err.Error(), "process stopped") {
-		t.Fatalf("receipt failure must be hard and compensated: %v", err)
+	if err := AgentStartWithDecision("worker", "codex", "pane", launch.Request{Decision: d, TaskRef: "FAC-188", Repository: "repo", Lane: "worker", SessionGeneration: 42, LeaseGeneration: 7, Scope: router.ScopeTask}); err == nil || !strings.Contains(err.Error(), "prepared tool-child lifecycle") {
+		t.Fatalf("unprepared receipt boundary must fail before process API: %v", err)
 	}
-	if len(calls) < 4 || !reflect.DeepEqual(calls[2], []string{"tab", "close", "tab"}) {
-		t.Fatalf("cleanup calls = %v", calls)
+	if len(calls) != 0 {
+		t.Fatalf("unprepared receipt path reached process API: %v", calls)
 	}
 }
