@@ -175,13 +175,23 @@
       "additionalProperties": false,
       "required": ["ref", "provider", "scopes", "expiresAt"],
       "properties": {
-        "ref": { "$ref": "#/$defs/identifier" },
+        "ref": {
+          "allOf": [
+            { "$ref": "#/$defs/identifier" },
+            { "pattern": "^(?!.*[mM][aA][sS][tT][eE][rR])(?![sS][kK]-)(?![gG][hH][pP]_)(?![gG][iI][tT][hH][uU][bB]_[pP][aA][tT]_)(?![xX][oO][xX][bB]-).+$" }
+          ]
+        },
         "provider": { "$ref": "#/$defs/identifier" },
         "scopes": {
           "type": "array",
           "minItems": 1,
           "uniqueItems": true,
-          "items": { "$ref": "#/$defs/identifier" }
+          "items": {
+            "allOf": [
+              { "$ref": "#/$defs/identifier" },
+              { "pattern": "^(?!.*[mM][aA][sS][tT][eE][rR]).+$" }
+            ]
+          }
         },
         "expiresAt": { "type": "string", "format": "date-time" }
       }

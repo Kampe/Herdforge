@@ -73,8 +73,8 @@ func validateContext(v *validator, ctx ValidationContext) {
 	if !validStringSet(ctx.AllowedCommandProfiles, validIdentifier) {
 		v.add(ViolationContext, "context.allowedCommandProfiles", "command profile allowlist must be non-empty, unique, and named")
 	}
-	if !validStringSet(ctx.AllowedCredentialRefs, validIdentifier) {
-		v.add(ViolationContext, "context.allowedCredentialRefs", "credential reference allowlist must be non-empty, unique, and named")
+	if !validStringSet(ctx.AllowedCredentialRefs, validCredentialReference) {
+		v.add(ViolationContext, "context.allowedCredentialRefs", "credential reference allowlist must be non-empty, unique, opaque, and non-master")
 	}
 	if !validStringSet(ctx.AllowedProviders, validIdentifier) {
 		v.add(ViolationContext, "context.allowedProviders", "provider allowlist must be non-empty, unique, and named")
@@ -86,8 +86,8 @@ func validateContext(v *validator, ctx ValidationContext) {
 	if ctx.Now.IsZero() || c.MaxScopeTTLSeconds <= 0 || c.MaxCredentialTTLSeconds <= 0 || c.MaxDeadlineSeconds <= 0 || c.MaxTurns <= 0 || c.MaxTokens <= 0 || c.MaxStallTimeoutSeconds <= 0 || c.MaxLoopWindow <= 0 || c.MaxLoopRepeatThreshold <= 0 || c.MaxLoopRepeatThreshold > c.MaxLoopWindow || c.MaxPaidUSD <= 0 || c.MaxPaidUSD > HardMaxPaidUSD || c.MaxEvidenceBytes <= 0 || !safeRelativePath(c.EvidencePrefix) {
 		v.add(ViolationContext, "context.policyCeiling", "policy ceiling is incomplete, unsafe, or exceeds a hard limit")
 	}
-	if !validGitActionSet(c.AllowedGitActions) || !validStringSet(c.AllowedCredentialScopes, validIdentifier) || !validEvidenceKindSet(c.AllowedEvidenceKinds) {
-		v.add(ViolationContext, "context.policyCeiling.allowlists", "policy allowlists must be non-empty, unique, and recognized")
+	if !validGitActionSet(c.AllowedGitActions) || !validStringSet(c.AllowedCredentialScopes, validCredentialScope) || !validEvidenceKindSet(c.AllowedEvidenceKinds) {
+		v.add(ViolationContext, "context.policyCeiling.allowlists", "policy allowlists must be non-empty, unique, recognized, and non-master")
 	}
 	if !validOptionalHostSet(c.AllowedNetworkHosts) {
 		v.add(ViolationContext, "context.policyCeiling.allowedNetworkHosts", "network host allowlist contains an unsafe host")
@@ -263,8 +263,8 @@ func validateCredentials(v *validator, credentials []CredentialGrant, runtimePro
 	seenRefs := map[string]struct{}{}
 	for i, credential := range credentials {
 		prefix := fmt.Sprintf("spec.credentials[%d]", i)
-		if !validIdentifier(credential.Ref) || !contains(refs, credential.Ref) {
-			v.add(ViolationCredentialScope, prefix+".ref", "credential must be an allowed opaque reference, never raw or master material")
+		if !validCredentialReference(credential.Ref) || !contains(refs, credential.Ref) {
+			v.add(ViolationCredentialScope, prefix+".ref", "credential must be an allowed opaque reference, never raw, wildcard, or master material")
 		}
 		if !validIdentifier(credential.Provider) || !contains(providers, credential.Provider) || credential.Provider != runtimeProvider {
 			v.add(ViolationCredentialScope, prefix+".provider", "credential provider must be allowed and exactly match the runtime provider")
@@ -278,8 +278,8 @@ func validateCredentials(v *validator, credentials []CredentialGrant, runtimePro
 		}
 		seenScopes := map[string]struct{}{}
 		for j, grant := range credential.Scopes {
-			if !validIdentifier(grant) || !contains(scopes, grant) || grant == "*" || strings.Contains(strings.ToLower(grant), "master") {
-				v.add(ViolationCredentialScope, fmt.Sprintf("%s.scopes[%d]", prefix, j), "credential scope is unknown or over-broad")
+			if !validCredentialScope(grant) || !contains(scopes, grant) {
+				v.add(ViolationCredentialScope, fmt.Sprintf("%s.scopes[%d]", prefix, j), "credential scope is unknown, wildcard, or over-broad")
 			}
 			if _, exists := seenScopes[grant]; exists {
 				v.add(ViolationCredentialScope, fmt.Sprintf("%s.scopes[%d]", prefix, j), "duplicate credential scope")
@@ -370,6 +370,19 @@ func validateGrants(v *validator, grants InlineGrantPolicy) {
 
 func validIdentifier(value string) bool {
 	return len(value) <= maxIdentifierLength && identifierPattern.MatchString(value) && strings.TrimSpace(value) == value
+}
+
+func validCredentialReference(value string) bool {
+	return validIdentifier(value) && !unsafeCredentialValue(value)
+}
+
+func validCredentialScope(value string) bool {
+	return validIdentifier(value) && !unsafeCredentialValue(value)
+}
+
+func unsafeCredentialValue(value string) bool {
+	lower := strings.ToLower(value)
+	return strings.Contains(value, "*") || strings.Contains(lower, "master") || strings.HasPrefix(lower, "sk-") || strings.HasPrefix(lower, "ghp_") || strings.HasPrefix(lower, "github_pat_") || strings.HasPrefix(lower, "xoxb-")
 }
 
 func safeRepositoryRoot(value string) bool {

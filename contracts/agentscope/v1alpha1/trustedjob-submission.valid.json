@@ -1,0 +1,121 @@
+{
+  "apiVersion": "herdforge.dev/v1alpha1",
+  "kind": "TrustedJobSubmission",
+  "correlation": {
+    "runId": "run-SPE-566-1",
+    "phaseId": "phase-SPE-566-implement",
+    "task": "SPE-566",
+    "scopeId": "scope-SPE-566",
+    "candidateSha": "3333333333333333333333333333333333333333",
+    "callbackSequence": 7
+  },
+  "job": {
+    "runId": "run-SPE-566-1",
+    "phaseId": "phase-SPE-566-implement",
+    "scopeId": "scope-SPE-566",
+    "candidateSha": "3333333333333333333333333333333333333333"
+  },
+  "workspace": {
+    "repository": "github.com/Kampe/Herdforge",
+    "worktree": "worktree-SPE-566",
+    "path": ".worktrees/SPE-566-agentscope-contract",
+    "repositoryRoot": ".",
+    "baseSha": "1111111111111111111111111111111111111111",
+    "headSha": "2222222222222222222222222222222222222222"
+  },
+  "repository": {
+    "identity": "github.com/Kampe/Herdforge",
+    "baseSha": "1111111111111111111111111111111111111111",
+    "headSha": "2222222222222222222222222222222222222222"
+  },
+  "trustedConfig": {
+    "repository": "github.com/Kampe/Herdforge",
+    "commitSha": "5555555555555555555555555555555555555555",
+    "path": ".herd/config/SPE-558.yaml",
+    "contentDigest": "sha256:6666666666666666666666666666666666666666666666666666666666666666"
+  },
+  "scope": {
+    "apiVersion": "herdforge.dev/v1alpha1",
+    "kind": "AgentScope",
+    "metadata": {
+      "id": "scope-SPE-566",
+      "runId": "run-SPE-566-1",
+      "phaseId": "phase-SPE-566-implement",
+      "task": "SPE-566",
+      "issuedAt": "2026-08-03T12:00:00Z",
+      "expiresAt": "2026-08-03T13:00:00Z"
+    },
+    "spec": {
+      "subject": {
+        "agentId": "pi-worker-1",
+        "sessionId": "session-SPE-566-1",
+        "lane": "foundation"
+      },
+      "repository": {
+        "identity": "github.com/Kampe/Herdforge",
+        "baseSha": "1111111111111111111111111111111111111111",
+        "headSha": "2222222222222222222222222222222222222222"
+      },
+      "worktree": {
+        "identity": "worktree-SPE-566",
+        "path": ".worktrees/SPE-566-agentscope-contract",
+        "repositoryRoot": ".",
+        "mutable": true,
+        "shared": false
+      },
+      "paths": {
+        "readable": ["contracts/agentscope/v1alpha1", "go.mod", "pkg/agentscope"],
+        "writable": ["contracts/agentscope/v1alpha1", "pkg/agentscope"]
+      },
+      "commandProfiles": ["git-commit", "go-test"],
+      "network": {
+        "mode": "allowlist",
+        "allowedHosts": ["api.openai.com"]
+      },
+      "git": {
+        "actions": ["status", "diff", "add", "commit", "push", "create_pr"]
+      },
+      "credentials": [{
+        "ref": "pi-openai-SPE-566",
+        "provider": "openai",
+        "scopes": ["inference"],
+        "expiresAt": "2026-08-03T12:45:00Z"
+      }],
+      "runtime": {
+        "provider": "openai",
+        "model": "gpt-5.6-luna",
+        "deadlineSeconds": 1800,
+        "maxTurns": 24,
+        "maxTokens": 120000,
+        "stallTimeoutSeconds": 180,
+        "loopWindow": 12,
+        "loopRepeatThreshold": 3,
+        "maxPaidUsd": 8
+      },
+      "evidence": {
+        "kinds": ["test", "lint", "diff", "receipt"],
+        "prefix": ".herd/evidence/SPE-566",
+        "maxBytes": 1048576
+      },
+      "grants": {
+        "kubernetes": false,
+        "unrestrictedShell": false,
+        "extensions": []
+      }
+    }
+  },
+  "scopeDigest": "sha256:4ede6bb11f103f38c8565c487d136b7b240e82bd1484f8e5f0efda6f246f758f",
+  "provider": "openai",
+  "model": "gpt-5.6-luna",
+  "virtualCredentials": [{
+    "ref": "pi-openai-SPE-566",
+    "scopes": ["inference"]
+  }],
+  "callbackDestination": "herdforge-coordinator",
+  "evidence": {
+    "kinds": ["test", "lint", "diff", "receipt"],
+    "prefix": ".herd/evidence/SPE-566",
+    "maxBytes": 1048576
+  },
+  "idempotencyKey": "idem-SPE-558-1"
+}
