@@ -3,19 +3,19 @@ package lost
 import (
 	"context"
 	"os"
-	"os/exec"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/Kampe/Herdforge/internal/testgit"
 )
 
 var commitSeq int64
 
 func run(t *testing.T, dir string, args ...string) string {
 	t.Helper()
-	cmd := exec.Command("git", args...)
-	cmd.Dir = dir
+	cmd := testgit.Command(dir, args...)
 	// Unique timestamps per commit: two --allow-empty commits with the same
 	// subject, parent, and second-resolution time produce the IDENTICAL sha
 	// (no content to differ), silently collapsing test branches together.

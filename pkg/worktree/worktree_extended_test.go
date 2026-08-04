@@ -4,9 +4,12 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/Kampe/Herdforge/internal/testgit"
 )
 
 func TestNewWorktreeManager(t *testing.T) {
@@ -145,8 +148,13 @@ func setupOriginMain(t *testing.T, tmpDir string) {
 }
 
 func runCmd(dir, name string, args ...string) error {
-	c := execCommandContext(context.Background(), name, args...)
-	c.Dir = dir
+	var c *exec.Cmd
+	if name == "git" {
+		c = testgit.Command(dir, args...)
+	} else {
+		c = execCommandContext(context.Background(), name, args...)
+		c.Dir = dir
+	}
 	out, err := c.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("%v: %s", err, strings.TrimSpace(string(out)))

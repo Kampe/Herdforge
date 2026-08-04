@@ -4,31 +4,19 @@ import (
 	"context"
 	"encoding/json"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/Kampe/Herdforge/internal/testgit"
 )
 
 // gitTestArgs prefixes every fixture git invocation with a hermetic author
 // and GPG-off flags so tests never depend on global git identity (CI runners
 // have none). Same pattern as gitIn / gitInHarvest in sibling test files.
-func gitTestArgs(args ...string) []string {
-	base := []string{
-		"-c", "commit.gpgSign=false",
-		"-c", "gpg.x509.program=false",
-		"-c", "gpg.format=openpgp",
-		"-c", "tag.gpgSign=false",
-		"-c", "user.email=test@herdforge.local",
-		"-c", "user.name=Test Runner",
-	}
-	return append(base, args...)
-}
-
 func gitInTest(t *testing.T, dir string, args ...string) {
 	t.Helper()
-	cmd := exec.Command("git", gitTestArgs(args...)...)
-	cmd.Dir = dir
+	cmd := testgit.Command(dir, args...)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("git %v: %v\n%s", args, err, out)
 	}

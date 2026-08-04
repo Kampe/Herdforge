@@ -9,13 +9,13 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/Kampe/Herdforge/internal/testgit"
 )
 
 func git(t *testing.T, dir string, args ...string) string {
 	t.Helper()
-	base := []string{"-c", "user.email=test@herdforge.local", "-c", "user.name=Test Runner", "-c", "commit.gpgSign=false"}
-	cmd := exec.Command("git", append(base, args...)...)
-	cmd.Dir = dir
+	cmd := testgit.Command(dir, args...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("git %v: %v\n%s", args, err, out)

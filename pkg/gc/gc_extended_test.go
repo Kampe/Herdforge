@@ -3,10 +3,10 @@ package gc
 import (
 	"context"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"testing"
 
+	"github.com/Kampe/Herdforge/internal/testgit"
 	"github.com/Kampe/Herdforge/pkg/worktree"
 )
 
@@ -43,17 +43,14 @@ func initGitRepo(t *testing.T, dir string) {
 		{"config", "user.email", "test@test.com"},
 		{"config", "user.name", "Test"},
 	} {
-		cmd := exec.Command("git", args...)
-		cmd.Dir = dir
+		cmd := testgit.Command(dir, args...)
 		if out, err := cmd.CombinedOutput(); err != nil {
 			t.Fatalf("git %v: %v, %s", args, err, out)
 		}
 	}
 	os.WriteFile(filepath.Join(dir, "README.md"), []byte("# test"), 0644)
-	cmd := exec.Command("git", "add", "README.md")
-	cmd.Dir = dir
+	cmd := testgit.Command(dir, "add", "README.md")
 	cmd.Run()
-	cmd = exec.Command("git", "commit", "-m", "initial")
-	cmd.Dir = dir
+	cmd = testgit.Command(dir, "commit", "-m", "initial")
 	cmd.Run()
 }

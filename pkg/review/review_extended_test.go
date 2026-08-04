@@ -3,8 +3,9 @@ package review
 import (
 	"context"
 	"os"
-	"os/exec"
 	"testing"
+
+	"github.com/Kampe/Herdforge/internal/testgit"
 )
 
 func TestClassifyRiskTier_AllTiers(t *testing.T) {
@@ -74,8 +75,7 @@ func patchIDFixture(t *testing.T) string {
 		{"config", "user.name", "t"},
 		{"config", "commit.gpgsign", "false"},
 	} {
-		c := exec.Command("git", args...)
-		c.Dir = dir
+		c := testgit.Command(dir, args...)
 		if out, err := c.CombinedOutput(); err != nil {
 			t.Fatalf("git %v: %v\n%s", args, err, out)
 		}
@@ -87,8 +87,7 @@ func patchIDFixture(t *testing.T) string {
 		{"add", "f.txt"},
 		{"commit", "-q", "-m", "feat: real diff"},
 	} {
-		c := exec.Command("git", args...)
-		c.Dir = dir
+		c := testgit.Command(dir, args...)
 		if out, err := c.CombinedOutput(); err != nil {
 			t.Fatalf("git %v: %v\n%s", args, err, out)
 		}
@@ -119,8 +118,7 @@ func TestComputePatchID_NoOutput(t *testing.T) {
 	// A commit with no diff (empty commit, like a merge) must fail closed,
 	// never return an empty id that a caller could mistake for a match.
 	dir := patchIDFixture(t)
-	c := exec.Command("git", "commit", "--allow-empty", "-q", "-m", "empty: no diff")
-	c.Dir = dir
+	c := testgit.Command(dir, "commit", "--allow-empty", "-q", "-m", "empty: no diff")
 	if out, err := c.CombinedOutput(); err != nil {
 		t.Fatalf("git commit: %v\n%s", err, out)
 	}
