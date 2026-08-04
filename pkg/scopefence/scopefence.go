@@ -18,6 +18,18 @@ var (
 	ErrCASLost = errors.New("scopefence: compare-and-swap lost")
 )
 
+const (
+	ReasonMissingScope        = "missing_scope"
+	ReasonAmbiguousIdentity   = "ambiguous_identity"
+	ReasonInvalidGeneration   = "invalid_generation"
+	ReasonGraphInvalid        = "graph_invalid"
+	ReasonOwnershipUnreadable = "ownership_unreadable"
+	ReasonScopeOverlap        = "scope_overlap"
+	ReasonIdentityConflict    = "identity_conflict"
+	ReasonCASContention       = "cas_contention"
+	ReasonContextCanceled     = "context_canceled"
+)
+
 type State string
 
 const (
@@ -45,9 +57,11 @@ type Identity struct {
 
 type Ownership struct {
 	Identity
-	Generation int64 `json:"generation"`
-	Scope      Scope `json:"scope"`
-	State      State `json:"state"`
+	Generation    int64  `json:"generation"`
+	Scope         Scope  `json:"scope"`
+	State         State  `json:"state"`
+	GraphRevision string `json:"graph_revision"`
+	GraphFiles    int    `json:"graph_files"`
 }
 
 type Graph struct {
@@ -63,16 +77,24 @@ type AcquireRequest struct {
 	Ownership
 	Graph                 Graph
 	ExpectedGraphRevision string
+	ExpectedGraphFiles    int
 }
 
 type Evidence struct {
-	Task       string   `json:"task"`
-	Branch     string   `json:"branch"`
-	Generation int64    `json:"generation"`
-	Packages   []string `json:"packages,omitempty"`
-	Files      []string `json:"files,omitempty"`
-	Symbols    []string `json:"symbols,omitempty"`
-	Reason     string   `json:"reason"`
+	Repository         string   `json:"repository"`
+	Task               string   `json:"task"`
+	Branch             string   `json:"branch"`
+	Generation         int64    `json:"generation"`
+	ConflictRepository string   `json:"conflict_repository,omitempty"`
+	ConflictTask       string   `json:"conflict_task,omitempty"`
+	ConflictBranch     string   `json:"conflict_branch,omitempty"`
+	ConflictGeneration int64    `json:"conflict_generation,omitempty"`
+	Packages           []string `json:"packages,omitempty"`
+	Files              []string `json:"files,omitempty"`
+	Symbols            []string `json:"symbols,omitempty"`
+	GraphRevision      string   `json:"graph_revision"`
+	GraphFiles         int      `json:"graph_files"`
+	Reason             string   `json:"reason"`
 }
 
 type Decision struct {
@@ -133,6 +155,40 @@ func (s Scope) validate() error {
 	return nil
 }
 
+func canonicalScope(s Scope) (Scope, error) {
+	clean := func(values []string, symbols bool) ([]string, error) {
+		seen := make(map[string]bool, len(values))
+		out := make([]string, 0, len(values))
+		for _, value := range values {
+			value = strings.ReplaceAll(value, "\\", "/")
+			if symbols {
+				if i := strings.Index(value, "::"); i > 0 {
+					value = path.Clean(value[:i]) + "::" + value[i+2:]
+				}
+			} else {
+				value = path.Clean(value)
+			}
+			if !seen[value] {
+				seen[value] = true
+				out = append(out, value)
+			}
+		}
+		sort.Strings(out)
+		return out, nil
+	}
+	var err error
+	if s.Packages, err = clean(s.Packages, false); err != nil {
+		return Scope{}, err
+	}
+	if s.Files, err = clean(s.Files, false); err != nil {
+		return Scope{}, err
+	}
+	if s.Symbols, err = clean(s.Symbols, true); err != nil {
+		return Scope{}, err
+	}
+	return s, s.validate()
+}
+
 func (i Identity) validate() error {
 	if !tokenPattern.MatchString(i.Repository) || !tokenPattern.MatchString(i.Branch) || !tokenPattern.MatchString(i.Task) {
 		return errors.New("ambiguous identity")
@@ -140,8 +196,8 @@ func (i Identity) validate() error {
 	return nil
 }
 
-func (g Graph) validate(expected string) error {
-	if !g.Complete || g.Revision == "" || (expected != "" && g.Revision != expected) || g.Nodes <= 0 || g.Edges <= 0 || g.Files <= 0 || g.Flows <= 0 || g.Edges < g.Nodes {
+func (g Graph) validate(expected string, expectedFiles int) error {
+	if !g.Complete || expected == "" || expectedFiles <= 0 || g.Revision == "" || g.Revision != expected || g.Files != expectedFiles || g.Nodes <= 0 || g.Edges <= 0 || g.Files <= 0 || g.Flows <= 0 || g.Edges < g.Nodes {
 		return errors.New("incomplete or implausible graph")
 	}
 	return nil
@@ -154,25 +210,50 @@ func (o Ownership) validate() error {
 	if o.Generation <= 0 {
 		return errors.New("invalid generation")
 	}
-	return o.Scope.validate()
+	if _, err := canonicalScope(o.Scope); err != nil {
+		return err
+	}
+	if o.GraphRevision == "" || o.GraphFiles <= 0 {
+		return errors.New("unbound graph")
+	}
+	return nil
 }
 
 func overlap(a, b Scope) (Evidence, bool) {
-	intersect := func(x, y []string) []string {
-		m := map[string]bool{}
-		for _, v := range x {
-			m[v] = true
-		}
-		var z []string
-		for _, v := range y {
-			if m[v] {
-				z = append(z, v)
+	contains := func(container, item string) bool { return container == item || strings.HasPrefix(item, container+"/") }
+	pairs := func(x, y []string, relation func(string, string) bool) []string {
+		var out []string
+		for _, left := range x {
+			for _, right := range y {
+				if relation(left, right) {
+					out = append(out, left+"<->"+right)
+				}
 			}
 		}
-		sort.Strings(z)
-		return z
+		sort.Strings(out)
+		return out
 	}
-	e := Evidence{Packages: intersect(a.Packages, b.Packages), Files: intersect(a.Files, b.Files), Symbols: intersect(a.Symbols, b.Symbols)}
+	unique := func(in []string) []string {
+		seen := map[string]bool{}
+		out := make([]string, 0, len(in))
+		for _, value := range in {
+			if !seen[value] {
+				seen[value] = true
+				out = append(out, value)
+			}
+		}
+		return out
+	}
+	packagePairs := unique(pairs(a.Packages, b.Packages, func(x, y string) bool { return contains(x, y) || contains(y, x) }))
+	filePairs := pairs(a.Files, b.Files, func(x, y string) bool { return contains(x, y) || contains(y, x) })
+	filePairs = append(filePairs, pairs(a.Packages, b.Files, contains)...)
+	filePairs = append(filePairs, pairs(b.Packages, a.Files, func(x, y string) bool { return contains(x, y) })...)
+	filePairs = unique(filePairs)
+	symbolPairs := pairs(a.Symbols, b.Files, func(x, y string) bool { return strings.HasPrefix(x, y+"::") })
+	symbolPairs = append(symbolPairs, pairs(b.Symbols, a.Files, func(x, y string) bool { return strings.HasPrefix(x, y+"::") })...)
+	symbolPairs = append(symbolPairs, pairs(a.Packages, b.Symbols, func(x, y string) bool { return strings.HasPrefix(y, x+"/") })...)
+	symbolPairs = unique(append(symbolPairs, pairs(b.Packages, a.Symbols, func(x, y string) bool { return strings.HasPrefix(y, x+"/") })...))
+	e := Evidence{Packages: packagePairs, Files: filePairs, Symbols: symbolPairs}
 	return e, len(e.Packages)+len(e.Files)+len(e.Symbols) > 0
 }
 
@@ -183,54 +264,104 @@ func bounded(in []string) []string {
 	return in
 }
 
+func scopesEqual(a, b Scope) bool {
+	return strings.Join(a.Packages, "\x00") == strings.Join(b.Packages, "\x00") && strings.Join(a.Files, "\x00") == strings.Join(b.Files, "\x00") && strings.Join(a.Symbols, "\x00") == strings.Join(b.Symbols, "\x00")
+}
+
+func cloneScope(s Scope) Scope {
+	return Scope{Packages: append([]string(nil), s.Packages...), Files: append([]string(nil), s.Files...), Symbols: append([]string(nil), s.Symbols...)}
+}
+
+func cloneOwnership(o Ownership) Ownership { o.Scope = cloneScope(o.Scope); return o }
+func cloneOwnerships(in []Ownership) []Ownership {
+	out := make([]Ownership, len(in))
+	for i, o := range in {
+		out[i] = cloneOwnership(o)
+	}
+	return out
+}
+
 func (f Fence) Acquire(ctx context.Context, req AcquireRequest) (Decision, error) {
 	if f.Store == nil {
 		return Decision{}, errors.New("nil store")
 	}
-	if err := req.Ownership.validate(); err != nil {
-		return Decision{Evidence: Evidence{Task: req.Task, Branch: req.Branch, Generation: req.Generation, Reason: err.Error()}}, nil
+	canonical, err := canonicalScope(req.Scope)
+	if err != nil {
+		return Decision{Evidence: Evidence{Repository: req.Repository, Task: req.Task, Branch: req.Branch, Generation: req.Generation, Reason: ReasonMissingScope}}, nil
 	}
-	if err := req.Graph.validate(req.ExpectedGraphRevision); err != nil {
-		return Decision{Evidence: Evidence{Task: req.Task, Branch: req.Branch, Generation: req.Generation, Reason: err.Error()}}, nil
+	req.Scope = canonical
+	if err := req.Identity.validate(); err != nil {
+		return Decision{Evidence: Evidence{Repository: req.Repository, Task: req.Task, Branch: req.Branch, Generation: req.Generation, Reason: ReasonAmbiguousIdentity}}, nil
 	}
+	if req.Generation <= 0 {
+		return Decision{Evidence: Evidence{Repository: req.Repository, Task: req.Task, Branch: req.Branch, Generation: req.Generation, Reason: ReasonInvalidGeneration}}, nil
+	}
+	if err := req.Graph.validate(req.ExpectedGraphRevision, req.ExpectedGraphFiles); err != nil {
+		return Decision{Evidence: Evidence{Repository: req.Repository, Task: req.Task, Branch: req.Branch, Generation: req.Generation, GraphRevision: req.Graph.Revision, GraphFiles: req.Graph.Files, Reason: ReasonGraphInvalid}}, nil
+	}
+	req.GraphRevision, req.GraphFiles = req.Graph.Revision, req.Graph.Files
+	baseEvidence := Evidence{Repository: req.Repository, Task: req.Task, Branch: req.Branch, Generation: req.Generation, GraphRevision: req.Graph.Revision, GraphFiles: req.Graph.Files}
 	for attempts := 0; attempts < 4; attempts++ {
+		if err := ctx.Err(); err != nil {
+			baseEvidence.Reason = ReasonContextCanceled
+			return Decision{Evidence: baseEvidence}, err
+		}
 		s, err := f.Store.Read(ctx)
 		if err != nil {
 			return Decision{}, err
 		}
 		for _, owner := range s.Owners {
-			if owner.Identity == req.Identity {
-				continue
-			}
 			if err := owner.validate(); err != nil {
-				return Decision{Evidence: Evidence{Task: req.Task, Branch: req.Branch, Generation: req.Generation, Reason: "unreadable active ownership"}}, nil
+				baseEvidence.Reason = ReasonOwnershipUnreadable
+				return Decision{Evidence: baseEvidence}, nil
+			}
+			ownerScope, _ := canonicalScope(owner.Scope)
+			owner.Scope = ownerScope
+			if owner.Identity == req.Identity {
+				if owner.Generation == req.Generation && owner.GraphRevision == req.GraphRevision && owner.GraphFiles == req.GraphFiles && scopesEqual(owner.Scope, req.Scope) {
+					copy := cloneOwnership(owner)
+					return Decision{Granted: true, Lease: &copy, Evidence: baseEvidence}, nil
+				}
+				baseEvidence.Reason = ReasonIdentityConflict
+				baseEvidence.ConflictRepository, baseEvidence.ConflictTask, baseEvidence.ConflictBranch, baseEvidence.ConflictGeneration = owner.Repository, owner.Task, owner.Branch, owner.Generation
+				return Decision{Evidence: baseEvidence}, nil
 			}
 			e, hit := overlap(req.Scope, owner.Scope)
 			if hit {
-				e.Task, e.Branch, e.Generation, e.Reason = req.Task, req.Branch, req.Generation, "scope overlap"
+				e.Repository, e.Task, e.Branch, e.Generation = req.Repository, req.Task, req.Branch, req.Generation
+				e.ConflictRepository, e.ConflictTask, e.ConflictBranch, e.ConflictGeneration = owner.Repository, owner.Task, owner.Branch, owner.Generation
+				e.GraphRevision, e.GraphFiles, e.Reason = req.Graph.Revision, req.Graph.Files, ReasonScopeOverlap
 				e.Packages, e.Files, e.Symbols = bounded(e.Packages), bounded(e.Files), bounded(e.Symbols)
 				return Decision{Evidence: e}, nil
 			}
 		}
-		next := append(append([]Ownership(nil), s.Owners...), req.Ownership)
+		if err := ctx.Err(); err != nil {
+			baseEvidence.Reason = ReasonContextCanceled
+			return Decision{Evidence: baseEvidence}, err
+		}
+		next := append(cloneOwnerships(s.Owners), req.Ownership)
 		won, err := f.Store.CompareAndSwap(ctx, s.Revision, next)
 		if err != nil {
 			return Decision{}, err
 		}
 		if won {
-			return Decision{Granted: true, Lease: &req.Ownership, Evidence: Evidence{Task: req.Task, Branch: req.Branch, Generation: req.Generation, Reason: "acquired"}}, nil
+			lease := cloneOwnership(req.Ownership)
+			return Decision{Granted: true, Lease: &lease, Evidence: baseEvidence}, nil
 		}
 	}
-	return Decision{Evidence: Evidence{Task: req.Task, Branch: req.Branch, Generation: req.Generation, Reason: "cas contention"}}, nil
+	baseEvidence.Reason = ReasonCASContention
+	return Decision{Evidence: baseEvidence}, nil
 }
 
 func (f Fence) Release(ctx context.Context, req ReleaseRequest) error {
 	if f.Store == nil || f.Verify == nil {
 		return ErrBlocked
 	}
-	if err := req.Ownership.validate(); err != nil {
+	canonical, err := canonicalScope(req.Scope)
+	if err != nil || req.Generation <= 0 || !tokenPattern.MatchString(req.Repository) || !tokenPattern.MatchString(req.Branch) || !tokenPattern.MatchString(req.Task) {
 		return ErrBlocked
 	}
+	req.Scope = canonical
 	if req.Authority != RootAdmittedMerge && req.Authority != FencedAbandonment && req.Authority != CompensatedNoCandidate {
 		return ErrBlocked
 	}
@@ -238,13 +369,18 @@ func (f Fence) Release(ctx context.Context, req ReleaseRequest) error {
 		return ErrBlocked
 	}
 	for attempts := 0; attempts < 4; attempts++ {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		s, err := f.Store.Read(ctx)
 		if err != nil {
 			return err
 		}
 		found := -1
 		for i, owner := range s.Owners {
-			if owner.Identity == req.Identity && owner.Generation == req.Generation {
+			ownerScope, _ := canonicalScope(owner.Scope)
+			owner.Scope = ownerScope
+			if owner.Identity == req.Identity && owner.Generation == req.Generation && owner.GraphRevision == req.GraphRevision && owner.GraphFiles == req.GraphFiles && scopesEqual(owner.Scope, req.Scope) {
 				found = i
 				break
 			}
@@ -252,8 +388,11 @@ func (f Fence) Release(ctx context.Context, req ReleaseRequest) error {
 		if found < 0 {
 			return ErrBlocked
 		}
-		next := append([]Ownership(nil), s.Owners[:found]...)
-		next = append(next, s.Owners[found+1:]...)
+		next := cloneOwnerships(s.Owners[:found])
+		next = append(next, cloneOwnerships(s.Owners[found+1:])...)
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		won, err := f.Store.CompareAndSwap(ctx, s.Revision, next)
 		if err != nil {
 			return err
@@ -298,12 +437,12 @@ type MemoryStore struct {
 }
 
 func NewMemoryStore(owners ...Ownership) *MemoryStore {
-	return &MemoryStore{revision: 1, owners: append([]Ownership(nil), owners...)}
+	return &MemoryStore{revision: 1, owners: cloneOwnerships(owners)}
 }
 func (m *MemoryStore) Read(context.Context) (Snapshot, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return Snapshot{Revision: fmt.Sprint(m.revision), Owners: append([]Ownership(nil), m.owners...)}, nil
+	return Snapshot{Revision: fmt.Sprint(m.revision), Owners: cloneOwnerships(m.owners)}, nil
 }
 func (m *MemoryStore) CompareAndSwap(_ context.Context, rev string, next []Ownership) (bool, error) {
 	m.mu.Lock()
@@ -311,7 +450,7 @@ func (m *MemoryStore) CompareAndSwap(_ context.Context, rev string, next []Owner
 	if rev != fmt.Sprint(m.revision) {
 		return false, nil
 	}
-	m.owners = append([]Ownership(nil), next...)
+	m.owners = cloneOwnerships(next)
 	m.revision++
 	return true, nil
 }
