@@ -262,7 +262,7 @@ func printUsage() {
 	fmt.Println("  --version       Show herd version")
 }
 
-const resetSafeUsage = "Usage: herd reset-safe <worktree-path>"
+const resetSafeUsage = "usage: herd reset-safe <worktree-path>"
 
 // runResetSafe composes the reviewed package operation into the public CLI.
 // The command intentionally accepts one positional target only: repo root is
