@@ -2823,7 +2823,14 @@ func launchAdmission(cfg *config.Config, role string, herdrAvailable bool, route
 	if err != nil {
 		return nil, err
 	}
-	if err := validateDecisionBeforeSideEffect(decision, lane.Name); err != nil {
+	validationContext := ""
+	switch decision.Scope {
+	case router.ScopeCandidate, router.ScopeTask:
+		validationContext = decision.TaskRef
+	case router.ScopeLane:
+		validationContext = lane.Name
+	}
+	if err := validateDecisionBeforeSideEffect(decision, validationContext); err != nil {
 		return nil, err
 	}
 	return decision, nil
