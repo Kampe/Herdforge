@@ -198,7 +198,18 @@ type AtomicLeaseStore interface {
 type RecoveryStore interface {
 	SnapshotExpiredLeases(context.Context, time.Time) ([]*Lease, error)
 	ExpireLeaseCAS(context.Context, int64, int64, time.Time) (*Lease, bool, error)
-	ForceReleaseProviderLockCAS(context.Context, int64, int64) error
+	ObserveStaleProviderLock(context.Context, LeaseKey, time.Time) (*ProviderLockObservation, error)
+	ClaimProviderLockCAS(context.Context, ProviderLockObservation) (bool, error)
+	FinalizeProviderLockCAS(context.Context, ProviderLockObservation) (bool, error)
+}
+
+type ProviderLockObservation struct {
+	LeaseID       int64
+	Generation    int64
+	Owner         string
+	LockedAt      time.Time
+	ObservedAt    time.Time
+	RecoveryOwner string
 }
 
 // ClaimConflictError reports why an Acquire lost the race, with enough

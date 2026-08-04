@@ -461,16 +461,27 @@ func (m *ClaimManager) ExpireStale(ctx context.Context) ([]*Lease, error) {
 		identities := validated[i]
 		transition := func() error {
 			if m.provider != nil {
-				stale, staleErr := m.store.PeekStaleProviderLock(ctx, candidate.LeaseKey, snapshotNow)
+				stale, staleErr := recovery.ObserveStaleProviderLock(ctx, candidate.LeaseKey, snapshotNow)
 				if staleErr != nil {
 					return staleErr
 				}
 				if stale != nil {
+					claimed, err := recovery.ClaimProviderLockCAS(ctx, *stale)
+					if err != nil {
+						return err
+					}
+					if !claimed {
+						return nil
+					}
 					if err := m.durablyAdvanceFence(ctx, candidate.TaskRef, candidate.Generation+1); err != nil {
 						return err
 					}
-					if err := recovery.ForceReleaseProviderLockCAS(ctx, candidate.ID, candidate.Generation); err != nil {
+					finalized, err := recovery.FinalizeProviderLockCAS(ctx, *stale)
+					if err != nil {
 						return err
+					}
+					if !finalized {
+						return nil
 					}
 				}
 			}

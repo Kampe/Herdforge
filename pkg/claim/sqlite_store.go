@@ -616,16 +616,40 @@ func (s *SQLiteLeaseStore) ExpireLeaseCAS(ctx context.Context, id, generation in
 	return l, true, nil
 }
 
-func (s *SQLiteLeaseStore) ForceReleaseProviderLockCAS(ctx context.Context, id, generation int64) error {
-	res, err := execWithRetry(ctx, s.db, `UPDATE leases SET provider_lock_owner='', provider_lock_at=NULL WHERE id=? AND generation=? AND status='active'`, id, generation)
+func (s *SQLiteLeaseStore) ObserveStaleProviderLock(ctx context.Context, key LeaseKey, now time.Time) (*ProviderLockObservation, error) {
+	var o ProviderLockObservation
+	if err := s.db.QueryRowContext(ctx, `SELECT id,generation,provider_lock_owner,provider_lock_at FROM leases WHERE repo=? AND provider=? AND project=? AND task_ref=? AND status='active' AND provider_lock_owner<>'' AND provider_lock_at IS NOT NULL AND provider_lock_at < ?`, key.Repo, key.Provider, key.Project, key.TaskRef, now.Add(-5*time.Minute)).Scan(&o.LeaseID, &o.Generation, &o.Owner, &o.LockedAt); err == sql.ErrNoRows {
+		return nil, nil
+	} else if err != nil {
+		return nil, err
+	}
+	o.ObservedAt = now
+	o.RecoveryOwner = fmt.Sprintf("fac69-recovery-%d-%d", o.LeaseID, o.Generation)
+	return &o, nil
+}
+
+func (s *SQLiteLeaseStore) ClaimProviderLockCAS(ctx context.Context, o ProviderLockObservation) (bool, error) {
+	res, err := execWithRetry(ctx, s.db, `UPDATE leases SET provider_lock_owner=? WHERE id=? AND generation=? AND status='active' AND provider_lock_owner=? AND provider_lock_at=? AND provider_lock_at < ?`, o.RecoveryOwner, o.LeaseID, o.Generation, o.Owner, o.LockedAt, o.ObservedAt.Add(-5*time.Minute))
 	if err != nil {
-		return err
+		return false, err
 	}
 	n, err := res.RowsAffected()
-	if err != nil || n != 1 {
-		return fmt.Errorf("provider lock CAS affected %d rows", n)
+	if err != nil {
+		return false, err
 	}
-	return nil
+	return n == 1, nil
+}
+
+func (s *SQLiteLeaseStore) FinalizeProviderLockCAS(ctx context.Context, o ProviderLockObservation) (bool, error) {
+	res, err := execWithRetry(ctx, s.db, `UPDATE leases SET provider_lock_owner='', provider_lock_at=NULL WHERE id=? AND generation=? AND status='active' AND provider_lock_owner=?`, o.LeaseID, o.Generation, o.RecoveryOwner)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return n == 1, nil
 }
 
 // ExpireStale transitions active-but-expired, unheld leases to Expired one
