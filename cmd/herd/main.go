@@ -974,35 +974,51 @@ func runDaemon() {
 		default:
 		}
 
-		tp, tpErr := loadTaskProvider(cfg)
-		if tpErr != nil {
-			fmt.Fprintf(os.Stderr, "daemon: task provider: %v\n", tpErr)
-			time.Sleep(pulseInterval)
-			continue
-		}
-
-		mr := router.NewModelRouter([]*router.ModelCandidate{
-			{Name: "opencode", Type: router.ProviderOllama, Model: "deepseek-v4-flash"},
-		}).WithUsageFunc(func(ctx context.Context, name string) float64 {
-			snap, err := usage.FetchSnapshot()
-			if err != nil {
-				return 0
+		cycleErr := runDaemonCycle(ctx, requireFleetAdmission, func(ctx context.Context) error {
+			tp, tpErr := loadTaskProvider(cfg)
+			if tpErr != nil {
+				return fmt.Errorf("task provider: %w", tpErr)
 			}
-			return snap.Utilization(name)
-		})
-		wm := resolveCanonicalWorktreeManager()
-		v := verifier.NewVerifier(cfg.Verification.TestCommand)
-		eng := daemon.NewEngine(cfg, tp, mr, st, wm, v)
 
-		task, err := eng.RunPulse(ctx, *role)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "daemon: pulse failed: %v\n", err)
-		} else if task != nil {
-			fmt.Printf("[%s] Claimed: %s — %s\n", time.Now().Format(time.RFC3339), task.Ref, task.Title)
+			mr := router.NewModelRouter([]*router.ModelCandidate{
+				{Name: "opencode", Type: router.ProviderOllama, Model: "deepseek-v4-flash"},
+			}).WithUsageFunc(func(ctx context.Context, name string) float64 {
+				snap, err := usage.FetchSnapshot()
+				if err != nil {
+					return 0
+				}
+				return snap.Utilization(name)
+			})
+			wm := resolveCanonicalWorktreeManager()
+			v := verifier.NewVerifier(cfg.Verification.TestCommand)
+			eng := daemon.NewEngine(cfg, tp, mr, st, wm, v)
+
+			task, err := eng.RunPulse(ctx, *role)
+			if err != nil {
+				return fmt.Errorf("pulse: %w", err)
+			}
+			if task != nil {
+				fmt.Printf("[%s] Claimed: %s — %s\n", time.Now().Format(time.RFC3339), task.Ref, task.Title)
+			}
+			return nil
+		})
+		if cycleErr != nil {
+			fmt.Fprintf(os.Stderr, "daemon: %v\n", cycleErr)
 		}
 
 		time.Sleep(pulseInterval)
 	}
+}
+
+// runDaemonCycle is the production per-cycle admission seam. The cycle
+// callback includes provider construction and RunPulse, so a posture
+// transition observed here reaches no provider, claim, worktree, tab, or
+// process effect.
+func runDaemonCycle(ctx context.Context, admit func(context.Context) error, cycle func(context.Context) error) error {
+	if err := admit(ctx); err != nil {
+		return fmt.Errorf("cycle admission: %w", err)
+	}
+	return cycle(ctx)
 }
 
 func runStandingE() error {
@@ -1180,12 +1196,12 @@ func runActivate() {
 		fmt.Println("activate selftest: PASS")
 		return
 	}
-	if !*noFleet {
-		if err := requireFleetAdmission(context.Background()); err != nil {
-			fmt.Fprintf(os.Stderr, "activate: %v\n", err)
-			os.Exit(1)
-		}
+	resolvedNoFleet, err := resolveActivateNoFleet(*noFleet, os.Getenv("HERD_WIND_DOWN"), requireFleetAdmission)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "activate: %v\n", err)
+		os.Exit(1)
 	}
+	*noFleet = resolvedNoFleet
 
 	var buildServices []string
 	if *build != "" {
@@ -1195,11 +1211,6 @@ func runActivate() {
 				buildServices = append(buildServices, s)
 			}
 		}
-	}
-
-	// HERD_WIND_DOWN=1 sets --no-fleet (wind-down resurrection guard).
-	if os.Getenv("HERD_WIND_DOWN") == "1" {
-		*noFleet = true
 	}
 
 	opts := activate.Options{
@@ -1231,6 +1242,17 @@ func runActivate() {
 	} else if res.FleetKicked {
 		fmt.Println("herd-activate: kicked standing fleet (post-activation)")
 	}
+}
+
+func resolveActivateNoFleet(flagValue bool, windDownEnv string, admit func(context.Context) error) (bool, error) {
+	noFleet := flagValue || windDownEnv == "1"
+	if noFleet {
+		return true, nil
+	}
+	if err := admit(context.Background()); err != nil {
+		return false, err
+	}
+	return false, nil
 }
 
 func overallOr(res *activate.Result, fallback string) string {
