@@ -272,6 +272,13 @@ func TestResetSafeCompiledFetchesFreshOriginMainBeforePlanning(t *testing.T) {
 	oldOrigin := resetSafeRevision(t, f.worktree, "origin/main")
 	updater := filepath.Join(t.TempDir(), "updater")
 	runGitT(t, filepath.Dir(updater), "clone", "-q", f.remote, updater)
+	runGitT(t, updater, "checkout", "-q", "main")
+	if got := strings.TrimSpace(runGitT(t, updater, "symbolic-ref", "--short", "HEAD")); got != "main" {
+		t.Fatalf("updater HEAD branch = %q, want main", got)
+	}
+	if got, want := resetSafeRevision(t, updater, "HEAD"), resetSafeRevision(t, updater, "refs/heads/main"); got != want {
+		t.Fatalf("updater HEAD = %s, want refs/heads/main %s", got, want)
+	}
 	runGitT(t, updater, "config", "user.email", "reset-safe-updater@test.invalid")
 	runGitT(t, updater, "config", "user.name", "Reset Safe Updater")
 	if err := os.WriteFile(filepath.Join(updater, "remote.txt"), []byte("new remote main\n"), 0o644); err != nil {
@@ -280,6 +287,9 @@ func TestResetSafeCompiledFetchesFreshOriginMainBeforePlanning(t *testing.T) {
 	runGitT(t, updater, "add", "remote.txt")
 	runGitT(t, updater, "commit", "-q", "-m", "advance remote main")
 	newOrigin := strings.TrimSpace(runGitT(t, updater, "rev-parse", "HEAD"))
+	if newOrigin == oldOrigin {
+		t.Fatalf("fixture did not advance updater main: still at %s", newOrigin)
+	}
 	runGitT(t, updater, "push", "-q", "origin", "main")
 	if got := resetSafeRevision(t, f.worktree, "origin/main"); got != oldOrigin {
 		t.Fatalf("fixture origin/main was not stale before command: %s", got)
