@@ -37,6 +37,7 @@ import (
 	"github.com/Kampe/Herdforge/pkg/preflight"
 	"github.com/Kampe/Herdforge/pkg/process"
 	"github.com/Kampe/Herdforge/pkg/provider"
+	"github.com/Kampe/Herdforge/pkg/resetsafe"
 	"github.com/Kampe/Herdforge/pkg/resolve"
 	"github.com/Kampe/Herdforge/pkg/resources"
 	"github.com/Kampe/Herdforge/pkg/review"
@@ -203,6 +204,9 @@ func main() {
 	case "lock":
 		runLock()
 
+	case "reset-safe":
+		runResetSafe()
+
 	default:
 		fmt.Fprintf(os.Stderr, "unknown subcommand '%s'\nRun 'herd --help' for usage.\n", command)
 		os.Exit(1)
@@ -254,7 +258,35 @@ func printUsage() {
 	fmt.Println("  lifecycle       Observe and act on fleet state via lifecycle engine")
 	fmt.Println("  resources       Snapshot system-resource headroom (free-mem, swap, gate verdict)")
 	fmt.Println("  lock           Advisory shared-checkout lock: with, acquire, release, status")
+	fmt.Println("  reset-safe     Reset a feature worktree after preserving unique commits")
 	fmt.Println("  --version       Show herd version")
+}
+
+const resetSafeUsage = "Usage: herd reset-safe <worktree-path>"
+
+// runResetSafe composes the reviewed package operation into the public CLI.
+// The command intentionally accepts one positional target only: repo root is
+// the current checkout, and all mutation/safety policy stays in resetsafe.
+func runResetSafe() {
+	args := os.Args[2:]
+	if len(args) == 1 && (args[0] == "-h" || args[0] == "--help") {
+		fmt.Println(resetSafeUsage)
+		return
+	}
+	if len(args) != 1 {
+		fmt.Fprintln(os.Stderr, resetSafeUsage)
+		os.Exit(2)
+	}
+
+	plan, err := resetsafe.New(context.Background(), ".", args[0], resetsafe.Options{})
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	if _, err := plan.Run(context.Background()); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
 }
 
 func runInit() {
