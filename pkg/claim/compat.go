@@ -2,8 +2,6 @@ package claim
 
 import (
 	"context"
-	"errors"
-	"fmt"
 	"time"
 
 	"github.com/Kampe/Herdforge/pkg/provider"
@@ -51,18 +49,7 @@ func NewInMemoryClaimManager(opts ...Option) *ClaimManager {
 //
 // Deprecated: migrate to Claim(ctx, ClaimRequest{...}) with a real Role.
 func (m *ClaimManager) ClaimTask(ctx context.Context, _ provider.TaskProvider, taskRef, workerID, worktreePath string) (*ClaimRecord, error) {
-	lease, err := m.Claim(ctx, ClaimRequest{
-		Key: legacyKey(taskRef), OwnerID: workerID, Role: legacyRole, TaskRole: legacyRole, WorktreePath: worktreePath,
-	})
-	if err != nil {
-		var conflict *ClaimConflictError
-		if errors.As(err, &conflict) {
-			return nil, fmt.Errorf("task %s already claimed by worker %s at %s",
-				taskRef, conflict.Lease.OwnerID, conflict.Lease.ClaimedAt.Format(time.RFC3339))
-		}
-		return nil, err
-	}
-	return &ClaimRecord{TaskRef: taskRef, WorkerID: workerID, ClaimedAt: lease.ClaimedAt, WorktreePath: worktreePath}, nil
+	return nil, ErrLegacyClaimDisabled
 }
 
 // ReleaseClaim preserves the pre-FAC-120 ClaimManager.ReleaseClaim
@@ -73,18 +60,8 @@ func (m *ClaimManager) ClaimTask(ctx context.Context, _ provider.TaskProvider, t
 //
 // Deprecated: migrate to Release(ctx, key, ownerID, generation) error.
 func (m *ClaimManager) ReleaseClaim(taskRef string) {
-	ctx := context.Background()
-	claims, err := m.ActiveClaims(ctx)
-	if err != nil {
-		return
-	}
-	key := legacyKey(taskRef)
-	for _, l := range claims {
-		if l.LeaseKey == key {
-			_ = m.Release(ctx, key, l.OwnerID, l.Generation)
-			return
-		}
-	}
+	// The legacy signature has no canonical repository/owner/lane identity;
+	// it is intentionally report-only and cannot release a lease.
 }
 
 // IsClaimedLegacy preserves the pre-FAC-120 boolean IsClaimed(taskRef)

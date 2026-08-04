@@ -2,6 +2,7 @@ package claim
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"testing"
 )
@@ -34,17 +35,17 @@ func TestClaimManager_ClaimTask_ConcurrentClaims(t *testing.T) {
 
 	wg.Wait()
 
-	if successCount != 1 {
-		t.Errorf("expected exactly 1 successful claim out of 10 concurrent requests, got %d", successCount)
+	if successCount != 0 {
+		t.Errorf("disabled ClaimTask must acquire nothing, got %d successes", successCount)
 	}
 
-	if !cm.IsClaimedLegacy("FAC-15") {
-		t.Errorf("expected task FAC-15 to be claimed")
+	if cm.IsClaimedLegacy("FAC-15") {
+		t.Errorf("disabled ClaimTask must not create a claim")
 	}
 
 	cm.ReleaseClaim("FAC-15")
 	if cm.IsClaimedLegacy("FAC-15") {
-		t.Errorf("expected task FAC-15 claim to be released")
+		t.Errorf("disabled ClaimTask must remain unclaimed")
 	}
 }
 
@@ -52,21 +53,17 @@ func TestClaimManager_ClaimTask_ReturnsRecordAndRejectsSecondClaim(t *testing.T)
 	cm := NewInMemoryClaimManager()
 	ctx := context.Background()
 
-	rec, err := cm.ClaimTask(ctx, nil, "FAC-16", "worker-a", "/tmp/wt-a")
-	if err != nil {
-		t.Fatalf("first ClaimTask: %v", err)
-	}
-	if rec.TaskRef != "FAC-16" || rec.WorkerID != "worker-a" || rec.WorktreePath != "/tmp/wt-a" {
-		t.Fatalf("unexpected ClaimRecord: %+v", rec)
+	if _, err := cm.ClaimTask(ctx, nil, "FAC-16", "worker-a", "/tmp/wt-a"); !errors.Is(err, ErrLegacyClaimDisabled) {
+		t.Fatalf("expected ClaimTask migration refusal, got %v", err)
 	}
 
-	if _, err := cm.ClaimTask(ctx, nil, "FAC-16", "worker-b", "/tmp/wt-b"); err == nil {
-		t.Fatal("expected a second ClaimTask for the same taskRef to fail")
+	if cm.IsClaimedLegacy("FAC-16") {
+		t.Fatal("disabled ClaimTask must not acquire a lease")
 	}
 
 	cm.ReleaseClaim("FAC-16")
-	if _, err := cm.ClaimTask(ctx, nil, "FAC-16", "worker-b", "/tmp/wt-b"); err != nil {
-		t.Fatalf("expected ClaimTask to succeed again after ReleaseClaim, got %v", err)
+	if _, err := cm.ClaimTask(ctx, nil, "FAC-16", "worker-b", "/tmp/wt-b"); !errors.Is(err, ErrLegacyClaimDisabled) {
+		t.Fatalf("expected repeated ClaimTask migration refusal, got %v", err)
 	}
 }
 
@@ -85,7 +82,7 @@ func TestClaimManager_ReleaseClaim_NoopWhenNotClaimed(t *testing.T) {
 // guarantee is process-local only, matching the pre-FAC-120 ClaimManager
 // it replaces; SQLiteLeaseStore is what adds cross-process safety.
 func TestInMemoryLeaseStore_ConcurrentAcquire_ExactlyOneWinnerInProcess(t *testing.T) {
-	mgr := NewClaimManager(NewInMemoryLeaseStore())
+	mgr := NewClaimManager(NewInMemoryLeaseStore(), WithHoldReader(newTestHoldAuthority(t)))
 	ctx := context.Background()
 	key := testKey("FAC-17")
 
@@ -96,7 +93,7 @@ func TestInMemoryLeaseStore_ConcurrentAcquire_ExactlyOneWinnerInProcess(t *testi
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			_, err := mgr.Claim(ctx, ClaimRequest{Key: key, OwnerID: string(rune('A' + i)), Role: "herd-smith", TaskRole: "herd-smith"})
+			_, err := mgr.Claim(ctx, testClaimRequest(key, string(rune('A'+i)), "herd-smith"))
 			if err == nil {
 				mu.Lock()
 				successCount++

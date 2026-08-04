@@ -6,8 +6,11 @@ import (
 	"fmt"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/Kampe/Herdforge/pkg/lifecycle"
 )
 
 // fakeProviderTask models one task's revision/status/highest-accepted
@@ -158,16 +161,49 @@ func newTestOutbox(t *testing.T) *SQLiteOutbox {
 	return o
 }
 
+type countingDurableOutbox struct {
+	*SQLiteOutbox
+	claimCalls atomic.Int32
+}
+
+func (o *countingDurableOutbox) Claim(ctx context.Context, key, owner string, staleAfter time.Duration, now time.Time) (*OutboxRecord, error) {
+	o.claimCalls.Add(1)
+	return o.SQLiteOutbox.Claim(ctx, key, owner, staleAfter, now)
+}
+
+func TestCompleteProviderTransitionRejectsInvalidSettlerAndTimeoutBeforeOutbox(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		settler string
+		timeout time.Duration
+	}{
+		{name: "invalid settler", settler: " ", timeout: time.Minute},
+		{name: "zero timeout", settler: "settler", timeout: 0},
+		{name: "negative timeout", settler: "settler", timeout: -time.Second},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			outbox := &countingDurableOutbox{SQLiteOutbox: newTestOutbox(t)}
+			mgr := NewClaimManager(newTestStore(t), WithProviderCAS(newFakeProviderCAS()), WithDurableOutbox(outbox), WithSettlerID(tc.settler), WithCapacityClaimTimeout(tc.timeout), WithHoldReader(newTestHoldAuthority(t)))
+			if _, err := mgr.CompleteProviderTransition(context.Background(), testKey("FAC-invalid-transition"), "owner", 1, "FAC-invalid-transition", "1", func(context.Context) error { return nil }); err == nil {
+				t.Fatal("invalid transition configuration unexpectedly succeeded")
+			}
+			if calls := outbox.claimCalls.Load(); calls != 0 {
+				t.Fatalf("invalid transition configuration reached outbox: %d calls", calls)
+			}
+		})
+	}
+}
+
 func TestClaimManager_ProviderTransition_HappyPath(t *testing.T) {
 	store := newTestStore(t)
 	outbox := newTestOutbox(t)
 	provider := newFakeProviderCAS()
 	provider.seed("FAC-30", "to-do", 1)
-	mgr := NewClaimManager(store, WithProviderCAS(provider), WithDurableOutbox(outbox))
+	mgr := NewClaimManager(store, WithProviderCAS(provider), WithDurableOutbox(outbox), WithHoldReader(newTestHoldAuthority(t)))
 	ctx := context.Background()
 	key := testKey("FAC-30")
 
-	lease, err := mgr.Claim(ctx, ClaimRequest{Key: key, OwnerID: "w1", Role: "herd-smith", TaskRole: "herd-smith"})
+	lease, err := mgr.Claim(ctx, ClaimRequest{Key: key, OwnerID: "w1", Role: "herd-smith", TaskRole: "herd-smith", HoldIdentities: []lifecycle.HoldIdentity{{Repository: key.Repo, Owner: "worker", Lane: "smith", Scope: "lane"}, {Repository: key.Repo, Owner: "worker", Lane: "smith", Task: key.TaskRef, Scope: "task"}}})
 	if err != nil {
 		t.Fatalf("claim: %v", err)
 	}
@@ -219,11 +255,11 @@ func TestClaimManager_ProviderTransition_StaleRevision_LeaseUntouched(t *testing
 	outbox := newTestOutbox(t)
 	provider := newFakeProviderCAS()
 	provider.seed("FAC-31", "to-do", 5) // current revision is 5
-	mgr := NewClaimManager(store, WithProviderCAS(provider), WithDurableOutbox(outbox))
+	mgr := NewClaimManager(store, WithProviderCAS(provider), WithDurableOutbox(outbox), WithHoldReader(newTestHoldAuthority(t)))
 	ctx := context.Background()
 	key := testKey("FAC-31")
 
-	lease, err := mgr.Claim(ctx, ClaimRequest{Key: key, OwnerID: "w1", Role: "herd-smith", TaskRole: "herd-smith"})
+	lease, err := mgr.Claim(ctx, ClaimRequest{Key: key, OwnerID: "w1", Role: "herd-smith", TaskRole: "herd-smith", HoldIdentities: []lifecycle.HoldIdentity{{Repository: key.Repo, Owner: "worker", Lane: "smith", Scope: "lane"}, {Repository: key.Repo, Owner: "worker", Lane: "smith", Task: key.TaskRef, Scope: "task"}}})
 	if err != nil {
 		t.Fatalf("claim: %v", err)
 	}
@@ -289,11 +325,11 @@ func TestClaimManager_ProviderSuccessLocalFailure_ReconciliationClosesWithoutRep
 	outbox := newTestOutbox(t)
 	provider := newFakeProviderCAS()
 	provider.seed("FAC-32", "to-do", 1)
-	mgr := NewClaimManager(store, WithProviderCAS(provider), WithDurableOutbox(outbox), WithSettlerID("crashed"))
+	mgr := NewClaimManager(store, WithProviderCAS(provider), WithDurableOutbox(outbox), WithSettlerID("crashed"), WithHoldReader(newTestHoldAuthority(t)))
 	ctx := context.Background()
 	key := testKey("FAC-32")
 
-	lease, err := mgr.Claim(ctx, ClaimRequest{Key: key, OwnerID: "w1", Role: "herd-smith", TaskRole: "herd-smith"})
+	lease, err := mgr.Claim(ctx, testClaimRequest(key, "w1", "herd-smith"))
 	if err != nil {
 		t.Fatalf("claim: %v", err)
 	}
@@ -368,11 +404,11 @@ func TestClaimManager_LocalSuccessProviderFailure_RetrySucceedsNoDoubleClaim(t *
 	outbox := newTestOutbox(t)
 	provider := newFakeProviderCAS()
 	provider.seed("FAC-33", "to-do", 1)
-	mgr := NewClaimManager(store, WithProviderCAS(provider), WithDurableOutbox(outbox))
+	mgr := NewClaimManager(store, WithProviderCAS(provider), WithDurableOutbox(outbox), WithHoldReader(newTestHoldAuthority(t)))
 	ctx := context.Background()
 	key := testKey("FAC-33")
 
-	lease, err := mgr.Claim(ctx, ClaimRequest{Key: key, OwnerID: "w1", Role: "herd-smith", TaskRole: "herd-smith"})
+	lease, err := mgr.Claim(ctx, testClaimRequest(key, "w1", "herd-smith"))
 	if err != nil {
 		t.Fatalf("claim: %v", err)
 	}
@@ -515,12 +551,13 @@ func TestClaimManager_ConcurrentProviderTransition_OnlyOneCASCall(t *testing.T) 
 
 	provider := newFakeProviderCAS()
 	provider.seed("FAC-34", "to-do", 1)
-	mgrA := NewClaimManager(storeA, WithProviderCAS(provider), WithDurableOutbox(outboxA), WithSettlerID("mgrA"))
-	mgrB := NewClaimManager(storeB, WithProviderCAS(provider), WithDurableOutbox(outboxB), WithSettlerID("mgrB"))
+	authority := newTestHoldAuthority(t)
+	mgrA := NewClaimManager(storeA, WithProviderCAS(provider), WithDurableOutbox(outboxA), WithSettlerID("mgrA"), WithHoldReader(authority))
+	mgrB := NewClaimManager(storeB, WithProviderCAS(provider), WithDurableOutbox(outboxB), WithSettlerID("mgrB"), WithHoldReader(authority))
 	ctx := context.Background()
 	key := testKey("FAC-34")
 
-	lease, err := mgrA.Claim(ctx, ClaimRequest{Key: key, OwnerID: "w1", Role: "herd-smith", TaskRole: "herd-smith"})
+	lease, err := mgrA.Claim(ctx, testClaimRequest(key, "w1", "herd-smith"))
 	if err != nil {
 		t.Fatalf("claim: %v", err)
 	}
@@ -605,11 +642,11 @@ func TestClaimManager_ProviderTransition_RejectsReleasedGeneration(t *testing.T)
 	outbox := newTestOutbox(t)
 	provider := newFakeProviderCAS()
 	provider.seed("FAC-40", "to-do", 1)
-	mgr := NewClaimManager(store, WithProviderCAS(provider), WithDurableOutbox(outbox))
+	mgr := NewClaimManager(store, WithProviderCAS(provider), WithDurableOutbox(outbox), WithHoldReader(newTestHoldAuthority(t)))
 	ctx := context.Background()
 	key := testKey("FAC-40")
 
-	lease, err := mgr.Claim(ctx, ClaimRequest{Key: key, OwnerID: "w1", Role: "herd-smith", TaskRole: "herd-smith"})
+	lease, err := mgr.Claim(ctx, testClaimRequest(key, "w1", "herd-smith"))
 	if err != nil {
 		t.Fatalf("claim: %v", err)
 	}
@@ -631,16 +668,16 @@ func TestClaimManager_ProviderTransition_RejectsPriorGenerationAfterReclaim(t *t
 	provider := newFakeProviderCAS()
 	provider.seed("FAC-41", "to-do", 1)
 	clk := newClock(time.Now())
-	mgr := NewClaimManager(store, WithProviderCAS(provider), WithDurableOutbox(outbox), WithClock(clk.now), WithTTL(time.Minute))
+	mgr := NewClaimManager(store, WithProviderCAS(provider), WithDurableOutbox(outbox), WithHoldReader(newTestHoldAuthority(t)), WithClock(clk.now), WithTTL(time.Minute))
 	ctx := context.Background()
 	key := testKey("FAC-41")
 
-	lease, err := mgr.Claim(ctx, ClaimRequest{Key: key, OwnerID: "w1", Role: "herd-smith", TaskRole: "herd-smith"})
+	lease, err := mgr.Claim(ctx, testClaimRequest(key, "w1", "herd-smith"))
 	if err != nil {
 		t.Fatalf("claim: %v", err)
 	}
 	clk.advance(2 * time.Minute) // past TTL, nobody has swept it yet
-	next, err := mgr.Claim(ctx, ClaimRequest{Key: key, OwnerID: "w2", Role: "herd-smith", TaskRole: "herd-smith"})
+	next, err := mgr.Claim(ctx, testClaimRequest(key, "w2", "herd-smith"))
 	if err != nil {
 		t.Fatalf("reclaim: %v", err)
 	}
@@ -658,11 +695,11 @@ func TestClaimManager_ProviderTransition_RejectsWrongOwner(t *testing.T) {
 	outbox := newTestOutbox(t)
 	provider := newFakeProviderCAS()
 	provider.seed("FAC-42", "to-do", 1)
-	mgr := NewClaimManager(store, WithProviderCAS(provider), WithDurableOutbox(outbox))
+	mgr := NewClaimManager(store, WithProviderCAS(provider), WithDurableOutbox(outbox), WithHoldReader(newTestHoldAuthority(t)))
 	ctx := context.Background()
 	key := testKey("FAC-42")
 
-	lease, err := mgr.Claim(ctx, ClaimRequest{Key: key, OwnerID: "w1", Role: "herd-smith", TaskRole: "herd-smith"})
+	lease, err := mgr.Claim(ctx, testClaimRequest(key, "w1", "herd-smith"))
 	if err != nil {
 		t.Fatalf("claim: %v", err)
 	}
@@ -687,7 +724,7 @@ func TestClaimManager_ProviderTransition_RejectsNoLease(t *testing.T) {
 	outbox := newTestOutbox(t)
 	provider := newFakeProviderCAS()
 	provider.seed("FAC-43", "to-do", 1)
-	mgr := NewClaimManager(store, WithProviderCAS(provider), WithDurableOutbox(outbox))
+	mgr := NewClaimManager(store, WithProviderCAS(provider), WithDurableOutbox(outbox), WithHoldReader(newTestHoldAuthority(t)))
 	key := testKey("FAC-43")
 
 	assertProviderTransitionFenced(t, mgr, outbox, provider, key, "w1", 1, "FAC-43")
@@ -726,11 +763,11 @@ func TestClaimManager_CompleteProviderTransition_ReleaseBlockedDuringInFlightCAS
 	outbox := newTestOutbox(t)
 	provider := newFakeProviderCAS()
 	provider.seed("FAC-44", "to-do", 1)
-	mgr := NewClaimManager(store, WithProviderCAS(provider), WithDurableOutbox(outbox))
+	mgr := NewClaimManager(store, WithProviderCAS(provider), WithDurableOutbox(outbox), WithHoldReader(newTestHoldAuthority(t)))
 	ctx := context.Background()
 	key := testKey("FAC-44")
 
-	lease, err := mgr.Claim(ctx, ClaimRequest{Key: key, OwnerID: "w1", Role: "herd-smith", TaskRole: "herd-smith"})
+	lease, err := mgr.Claim(ctx, testClaimRequest(key, "w1", "herd-smith"))
 	if err != nil {
 		t.Fatalf("claim: %v", err)
 	}
@@ -812,11 +849,11 @@ func TestClaimManager_ExpireStale_BlockedDuringInFlightCAS(t *testing.T) {
 	provider := newFakeProviderCAS()
 	provider.seed("FAC-45", "to-do", 1)
 	clk := newClock(time.Now())
-	mgr := NewClaimManager(store, WithProviderCAS(provider), WithDurableOutbox(outbox), WithClock(clk.now), WithTTL(time.Minute))
+	mgr := NewClaimManager(store, WithProviderCAS(provider), WithDurableOutbox(outbox), WithHoldReader(newTestHoldAuthority(t)), WithClock(clk.now), WithTTL(time.Minute))
 	ctx := context.Background()
 	key := testKey("FAC-45")
 
-	lease, err := mgr.Claim(ctx, ClaimRequest{Key: key, OwnerID: "w1", Role: "herd-smith", TaskRole: "herd-smith"})
+	lease, err := mgr.Claim(ctx, ClaimRequest{Key: key, OwnerID: "w1", Role: "herd-smith", TaskRole: "herd-smith", HoldIdentities: []lifecycle.HoldIdentity{{Repository: key.Repo, Owner: "worker", Lane: "smith", Scope: "lane"}, {Repository: key.Repo, Owner: "worker", Lane: "smith", Task: key.TaskRef, Scope: "task"}}})
 	if err != nil {
 		t.Fatalf("claim: %v", err)
 	}
@@ -832,7 +869,7 @@ func TestClaimManager_ExpireStale_BlockedDuringInFlightCAS(t *testing.T) {
 
 		expired, expireErr = mgr.ExpireStale(ctx)
 
-		_, reclaimErr = mgr.Claim(ctx, ClaimRequest{Key: key, OwnerID: "w2", Role: "herd-smith", TaskRole: "herd-smith"})
+		_, reclaimErr = mgr.Claim(ctx, ClaimRequest{Key: key, OwnerID: "w2", Role: "herd-smith", TaskRole: "herd-smith", HoldIdentities: []lifecycle.HoldIdentity{{Repository: key.Repo, Owner: "worker", Lane: "smith", Scope: "lane"}, {Repository: key.Repo, Owner: "worker", Lane: "smith", Task: key.TaskRef, Scope: "task"}}})
 	}
 	t.Cleanup(func() { completeProviderTransitionTestHook = nil })
 
@@ -908,7 +945,7 @@ func TestSQLiteLeaseStore_StoreLayer_NeverPreemptsProviderLockByTimeAlone(t *tes
 	key := testKey("FAC-46")
 	claimAt := time.Now()
 
-	lease, err := store.Acquire(ctx, key, "w1", "herd-smith", "/wt", claimAt, time.Minute)
+	lease, err := store.AcquireWithIdentity(ctx, key, "w1", "herd-smith", "/wt", key.Repo, "worker", "smith", claimAt, time.Minute)
 	if err != nil {
 		t.Fatalf("acquire: %v", err)
 	}
@@ -917,34 +954,20 @@ func TestSQLiteLeaseStore_StoreLayer_NeverPreemptsProviderLockByTimeAlone(t *tes
 	}
 
 	// Arbitrarily far past both the TTL and providerLockStaleAfter: the
-	// store must still refuse to touch it -- no matter how much time
-	// passes, ExpireStale/Acquire never unilaterally decide a stale lock
-	// is safe to clear.
+	// store must still refuse to mutate it. Lifecycle recovery owns the
+	// only valid claim/fence/finalize path.
 	farFuture := claimAt.Add(24 * time.Hour)
 
-	notExpired, err := store.ExpireStale(ctx, farFuture)
-	if err != nil {
-		t.Fatalf("expire stale: %v", err)
-	}
-	if len(notExpired) != 0 {
-		t.Fatalf("expected the store to never preempt a provider lock by time alone, got %+v", notExpired)
+	if _, err := store.ExpireStale(ctx, farFuture); err == nil {
+		t.Fatal("expected raw store expiry to be disabled")
 	}
 
 	if _, err := store.Acquire(ctx, key, "w2", "herd-smith", "/wt", farFuture, time.Minute); err == nil {
 		t.Fatal("expected a reclaim attempt to still be blocked by the provider lock no matter how much time passed")
 	}
 
-	// Only ForceReleaseProviderLock (reserved for ClaimManager's
-	// orchestration, after a confirmed fence advance) can clear it.
-	if err := store.ForceReleaseProviderLock(ctx, key, lease.Generation); err != nil {
-		t.Fatalf("force release provider lock: %v", err)
-	}
-	nowExpired, err := store.ExpireStale(ctx, farFuture)
-	if err != nil {
-		t.Fatalf("expire stale after force release: %v", err)
-	}
-	if len(nowExpired) != 1 || nowExpired[0].Generation != lease.Generation {
-		t.Fatalf("expected the lease to expire once the lock was explicitly cleared, got %+v", nowExpired)
+	if err := store.ForceReleaseProviderLock(ctx, key, lease.Generation); err == nil {
+		t.Fatal("expected raw provider-lock force release to be disabled")
 	}
 }
 
@@ -965,7 +988,7 @@ func TestClaimManager_ExpireStale_RequiresFenceAdvanceBeforePreemptingStaleLock(
 	key := testKey("FAC-46")
 	claimAt := time.Now()
 
-	lease, err := store.Acquire(ctx, key, "w1", "herd-smith", "/wt", claimAt, time.Minute)
+	lease, err := store.AcquireWithIdentity(ctx, key, "w1", "herd-smith", "/wt", key.Repo, "worker", "smith", claimAt, time.Minute)
 	if err != nil {
 		t.Fatalf("acquire: %v", err)
 	}
@@ -975,19 +998,22 @@ func TestClaimManager_ExpireStale_RequiresFenceAdvanceBeforePreemptingStaleLock(
 
 	farFuture := claimAt.Add(24 * time.Hour)
 	unblockedNow := func() time.Time { return farFuture }
-	mgr := NewClaimManager(store, WithProviderCAS(failing), WithDurableOutbox(outbox), WithClock(unblockedNow))
+	mgr := NewClaimManager(store, WithProviderCAS(failing), WithDurableOutbox(outbox), WithHoldReader(newTestHoldAuthority(t)), WithClock(unblockedNow))
 
 	// First sweep: AdvanceFence fails (provider "unreachable"). The lock
 	// must be left in place -- not cleared, not the lease expired.
 	if _, err := mgr.ExpireStale(ctx); err == nil {
 		t.Fatal("expected ExpireStale to surface the fence-advance failure, not swallow it")
 	}
-	stillLocked, err := store.PeekStaleProviderLock(ctx, key, farFuture)
+	stillLocked, err := store.ObserveStaleProviderLock(ctx, key, farFuture)
 	if err != nil {
 		t.Fatalf("peek stale provider lock: %v", err)
 	}
-	if stillLocked == nil {
-		t.Fatal("expected the lock to remain in place after a failed fence-advance attempt")
+	if stillLocked == nil || !stillLocked.Recovery || stillLocked.LeaseID != lease.ID || stillLocked.Generation != lease.Generation || stillLocked.RecoveryOwner != recoveryOwnerFor(lease.ID, lease.Generation) {
+		t.Fatalf("expected exact durable recovery claim after failed fence advance, got %+v", stillLocked)
+	}
+	if _, changed, err := store.ExpireLeaseCAS(ctx, lease.ID, lease.Generation, farFuture); err != nil || changed {
+		t.Fatalf("recovery claim must block expiry before fence advancement: changed=%v err=%v", changed, err)
 	}
 
 	// Recovery: the provider becomes reachable again. A later sweep
@@ -1054,11 +1080,11 @@ func TestClaimManager_ProviderFencing_RejectsStaleCASAfterSixMinutePause(t *test
 	provider := newFakeProviderCAS()
 	provider.seed("FAC-47", "to-do", 1)
 	clk := newClock(time.Now())
-	mgr := NewClaimManager(store, WithProviderCAS(provider), WithDurableOutbox(outbox), WithClock(clk.now), WithTTL(time.Minute))
+	mgr := NewClaimManager(store, WithProviderCAS(provider), WithDurableOutbox(outbox), WithHoldReader(newTestHoldAuthority(t)), WithClock(clk.now), WithTTL(time.Minute))
 	ctx := context.Background()
 	key := testKey("FAC-47")
 
-	lease, err := mgr.Claim(ctx, ClaimRequest{Key: key, OwnerID: "w1", Role: "herd-smith", TaskRole: "herd-smith"})
+	lease, err := mgr.Claim(ctx, ClaimRequest{Key: key, OwnerID: "w1", Role: "herd-smith", TaskRole: "herd-smith", HoldIdentities: []lifecycle.HoldIdentity{{Repository: key.Repo, Owner: "worker", Lane: "smith", Scope: "lane"}, {Repository: key.Repo, Owner: "worker", Lane: "smith", Task: key.TaskRef, Scope: "task"}}})
 	if err != nil {
 		t.Fatalf("claim: %v", err)
 	}
@@ -1068,14 +1094,14 @@ func TestClaimManager_ProviderFencing_RejectsStaleCASAfterSixMinutePause(t *test
 	}
 
 	claimAt := clk.now()
-	claimedOutbox, err := outbox.Claim(ctx, rec.IdempotencyKey, "paused-settler", mgr.providerLockTimeout, claimAt)
+	claimedOutbox, err := outbox.Claim(ctx, rec.IdempotencyKey, "paused-settler", providerLockStaleAfter, claimAt)
 	if err != nil {
 		t.Fatalf("manual outbox claim: %v", err)
 	}
 	if claimedOutbox == nil {
 		t.Fatal("expected the manual outbox claim to succeed")
 	}
-	if _, err := store.AcquireProviderLock(ctx, key, "w1", lease.Generation, "paused-settler", mgr.providerLockTimeout, claimAt); err != nil {
+	if _, err := store.AcquireProviderLock(ctx, key, "w1", lease.Generation, "paused-settler", providerLockStaleAfter, claimAt); err != nil {
 		t.Fatalf("acquire provider lock: %v", err)
 	}
 	// The provider-transition lock is now held, exactly as if
@@ -1085,7 +1111,6 @@ func TestClaimManager_ProviderFencing_RejectsStaleCASAfterSixMinutePause(t *test
 	// Six minutes pass: past both the 1-minute TTL and the 5-minute
 	// provider-lock staleness window.
 	clk.advance(providerLockStaleAfter + time.Minute)
-
 	expired, err := mgr.ExpireStale(ctx)
 	if err != nil {
 		t.Fatalf("expire stale: %v", err)
@@ -1094,7 +1119,7 @@ func TestClaimManager_ProviderFencing_RejectsStaleCASAfterSixMinutePause(t *test
 		t.Fatalf("expected the lease to expire once the lock itself went stale (liveness preserved), got %+v", expired)
 	}
 
-	replacement, err := mgr.Claim(ctx, ClaimRequest{Key: key, OwnerID: "w2", Role: "herd-smith", TaskRole: "herd-smith"})
+	replacement, err := mgr.Claim(ctx, ClaimRequest{Key: key, OwnerID: "w2", Role: "herd-smith", TaskRole: "herd-smith", HoldIdentities: []lifecycle.HoldIdentity{{Repository: key.Repo, Owner: "worker", Lane: "smith", Scope: "lane"}, {Repository: key.Repo, Owner: "worker", Lane: "smith", Task: key.TaskRef, Scope: "task"}}})
 	if err != nil {
 		t.Fatalf("reclaim: %v", err)
 	}
@@ -1142,11 +1167,11 @@ func TestClaimManager_Claim_RejectsReclaimWhenFenceAdvanceFails_ThenRecoversSafe
 	provider.seed("FAC-48", "to-do", 1)
 	failing := &advanceFenceFailer{provider: provider, failNext: true}
 	clk := newClock(time.Now())
-	mgr := NewClaimManager(store, WithProviderCAS(failing), WithDurableOutbox(outbox), WithClock(clk.now), WithTTL(time.Minute))
+	mgr := NewClaimManager(store, WithProviderCAS(failing), WithDurableOutbox(outbox), WithHoldReader(newTestHoldAuthority(t)), WithClock(clk.now), WithTTL(time.Minute))
 	ctx := context.Background()
 	key := testKey("FAC-48")
 
-	lease, err := mgr.Claim(ctx, ClaimRequest{Key: key, OwnerID: "w1", Role: "herd-smith", TaskRole: "herd-smith"})
+	lease, err := mgr.Claim(ctx, testClaimRequest(key, "w1", "herd-smith"))
 	if err != nil {
 		t.Fatalf("claim: %v", err)
 	}
@@ -1159,10 +1184,10 @@ func TestClaimManager_Claim_RejectsReclaimWhenFenceAdvanceFails_ThenRecoversSafe
 	// provider: manually claim the outbox record and the provider lock,
 	// exactly as CompleteProviderTransition would have at that point.
 	pauseAt := clk.now()
-	if _, err := outbox.Claim(ctx, rec.IdempotencyKey, "paused-settler", mgr.providerLockTimeout, pauseAt); err != nil {
+	if _, err := outbox.Claim(ctx, rec.IdempotencyKey, "paused-settler", providerLockStaleAfter, pauseAt); err != nil {
 		t.Fatalf("manual outbox claim: %v", err)
 	}
-	if _, err := store.AcquireProviderLock(ctx, key, "w1", lease.Generation, "paused-settler", mgr.providerLockTimeout, pauseAt); err != nil {
+	if _, err := store.AcquireProviderLock(ctx, key, "w1", lease.Generation, "paused-settler", providerLockStaleAfter, pauseAt); err != nil {
 		t.Fatalf("acquire provider lock: %v", err)
 	}
 
@@ -1171,7 +1196,7 @@ func TestClaimManager_Claim_RejectsReclaimWhenFenceAdvanceFails_ThenRecoversSafe
 
 	// Attempt to reclaim while the provider is "unavailable" for fence
 	// advancement. This MUST fail -- no local generation 2, no exposure.
-	if _, err := mgr.Claim(ctx, ClaimRequest{Key: key, OwnerID: "w2", Role: "herd-smith", TaskRole: "herd-smith"}); err == nil {
+	if _, err := mgr.Claim(ctx, testClaimRequest(key, "w2", "herd-smith")); err == nil {
 		t.Fatal("expected Claim to fail when the provider fence advance fails, not silently reclaim")
 	}
 
@@ -1202,7 +1227,7 @@ func TestClaimManager_Claim_RejectsReclaimWhenFenceAdvanceFails_ThenRecoversSafe
 	// Recovery: the provider becomes reachable again. A retried Claim now
 	// succeeds, safely, via the same durable fence-advance record.
 	failing.failNext = false
-	replacement, err := mgr.Claim(ctx, ClaimRequest{Key: key, OwnerID: "w2", Role: "herd-smith", TaskRole: "herd-smith"})
+	replacement, err := mgr.Claim(ctx, testClaimRequest(key, "w2", "herd-smith"))
 	if err != nil {
 		t.Fatalf("reclaim after recovery: %v", err)
 	}

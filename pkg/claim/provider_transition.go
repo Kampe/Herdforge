@@ -187,6 +187,12 @@ func (m *ClaimManager) BeginProviderTransition(ctx context.Context, key LeaseKey
 // calls; a lock-acquisition failure also marks the outbox record Failed
 // so it does not sit claimed and orphaned.
 func (m *ClaimManager) CompleteProviderTransition(ctx context.Context, key LeaseKey, ownerID string, generation int64, taskID string, expectedRevision ProviderRevision, mutate func(ctx context.Context) error) (*OutboxRecord, error) {
+	if err := validateAttributableID(m.settlerID, "settler identity"); err != nil {
+		return nil, err
+	}
+	if err := validatePositiveDuration(m.capacityClaimTimeout, "capacity claim timeout"); err != nil {
+		return nil, err
+	}
 	if m.provider == nil {
 		return nil, ErrProviderNotConfigured
 	}
@@ -208,7 +214,7 @@ func (m *ClaimManager) CompleteProviderTransition(ctx context.Context, key Lease
 		return m.outboxStore.Get(ctx, idempotencyKey)
 	}
 
-	if _, err := m.store.AcquireProviderLock(ctx, key, ownerID, generation, m.settlerID, m.providerLockTimeout, m.now()); err != nil {
+	if _, err := m.store.AcquireProviderLock(ctx, key, ownerID, generation, m.settlerID, providerLockStaleAfter, m.now()); err != nil {
 		_ = m.outboxStore.MarkFailed(ctx, idempotencyKey, m.settlerID, err.Error(), m.now())
 		return nil, fmt.Errorf("%w: %w", ErrLeaseNotCurrent, err)
 	}

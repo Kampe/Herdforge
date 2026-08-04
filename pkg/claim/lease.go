@@ -48,7 +48,8 @@ type Lease struct {
 	// ExpireStale, or SettlePendingCapacity) must attempt it again rather
 	// than treating the lease's own status transition as proof capacity
 	// was returned.
-	CapacityReleasedAt *time.Time
+	CapacityReleasedAt   *time.Time
+	CapacityReleaseState string
 }
 
 // Age reports how long the lease has been held as of now.

@@ -5,6 +5,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/Kampe/Herdforge/pkg/lifecycle"
 )
 
 // recordingOutbox captures every OutboxIntent Record was called with, so
@@ -41,11 +43,11 @@ func (o *recordingOutbox) kinds() []string {
 func TestClaimManager_OutboxRecorder_WiredOnClaimAndRelease(t *testing.T) {
 	store := newTestStore(t)
 	outbox := newRecordingOutbox()
-	mgr := NewClaimManager(store, WithOutboxRecorder(outbox))
+	mgr := NewClaimManager(store, WithOutboxRecorder(outbox), WithHoldReader(newTestHoldAuthority(t)))
 	ctx := context.Background()
 	key := testKey("FAC-14")
 
-	lease, err := mgr.Claim(ctx, ClaimRequest{Key: key, OwnerID: "w1", Role: "herd-smith", TaskRole: "herd-smith"})
+	lease, err := mgr.Claim(ctx, testClaimRequest(key, "w1", "herd-smith"))
 	if err != nil {
 		t.Fatalf("claim: %v", err)
 	}
@@ -65,11 +67,11 @@ func TestClaimManager_OutboxRecorder_WiredOnClaimAndRelease(t *testing.T) {
 func TestClaimManager_SatisfiesReconciler(t *testing.T) {
 	store := newTestStore(t)
 	clk := newClock(time.Now())
-	mgr := NewClaimManager(store, WithClock(clk.now), WithTTL(0))
+	mgr := NewClaimManager(store, WithHoldReader(newTestHoldAuthority(t)), WithClock(clk.now), WithTTL(0))
 	ctx := context.Background()
 	key := testKey("FAC-15")
 
-	if _, err := mgr.Claim(ctx, ClaimRequest{Key: key, OwnerID: "w1", Role: "herd-smith", TaskRole: "herd-smith"}); err != nil {
+	if _, err := mgr.Claim(ctx, ClaimRequest{Key: key, OwnerID: "w1", Role: "herd-smith", TaskRole: "herd-smith", HoldIdentities: []lifecycle.HoldIdentity{{Repository: key.Repo, Owner: "worker", Lane: "smith", Scope: "lane"}, {Repository: key.Repo, Owner: "worker", Lane: "smith", Task: key.TaskRef, Scope: "task"}}}); err != nil {
 		t.Fatalf("claim: %v", err)
 	}
 	clk.advance(time.Nanosecond)

@@ -59,7 +59,7 @@ var ErrRoleMismatch = errors.New("claim: worker role does not match task role")
 // idempotencyKey is stable per (lease ID, generation, intent) — see
 // capacityKey — and is the same on every retry of the same logical
 // operation, including a retry after a crash. pkg/claim's own delivery
-// protocol (LeaseStore.ClaimCapacityRelease/AckCapacityRelease/
+// protocol (LeaseStore.ClaimCapacityReleaseExact/AckCapacityRelease/
 // FailCapacityRelease) already guarantees at most one live settler is
 // ever calling Release for a given lease at a time — concurrent
 // double-delivery is a store-level CAS claim, not something
@@ -114,19 +114,15 @@ type ClaimManager struct {
 	ttl         time.Duration
 
 	// settlerID identifies this ClaimManager instance as a capacity-
-	// release settler for LeaseStore.ClaimCapacityRelease's claim
+	// release settler for LeaseStore.ClaimCapacityReleaseExact's claim
 	// protocol. Unique per instance by default (see NewClaimManager);
 	// override with WithSettlerID for deterministic test identities.
 	settlerID string
-	// capacityClaimTimeout bounds how long a ClaimCapacityRelease claim
+	// capacityClaimTimeout bounds how long a ClaimCapacityReleaseExact claim
 	// is honored before another settler may reclaim it, i.e. how long a
 	// crashed settler's in-flight release can block recovery.
 	capacityClaimTimeout time.Duration
-	// providerLockTimeout bounds how long CompleteProviderTransition's
-	// AcquireProviderLock is honored before a different settler may
-	// preempt it (crash recovery for a provider call that never returned).
-	providerLockTimeout time.Duration
-	holdReader          lifecycle.HoldReader
+	holdReader           lifecycle.HoldReader
 }
 
 // Option configures a ClaimManager.
@@ -154,23 +150,15 @@ func WithOutboxRecorder(o OutboxRecorder) Option {
 // ClaimManager uses to claim capacity-release work. Tests that want two
 // distinct, deterministic settlers (e.g. simulating two processes) should
 // set this explicitly; production callers normally don't need to.
+// Empty or whitespace-padded identities are rejected before any settlement
+// or provider-transition side effect.
 func WithSettlerID(id string) Option { return func(m *ClaimManager) { m.settlerID = id } }
 
 // WithCapacityClaimTimeout overrides how long a capacity-release claim is
 // honored before another settler may reclaim it (crash recovery bound).
-// Default 5m.
+// Default 5m. Non-positive values are rejected before any claim mutation.
 func WithCapacityClaimTimeout(d time.Duration) Option {
 	return func(m *ClaimManager) { m.capacityClaimTimeout = d }
-}
-
-// WithProviderLockTimeout overrides how long CompleteProviderTransition's
-// provider-transition lock is honored before a different settler may
-// preempt it (crash recovery bound for a provider call that never
-// returned). Default 5m, matching providerLockStaleAfter (the fixed
-// window Release/Acquire's reclaim path use to honor -- or stop honoring
-// -- someone else's lock).
-func WithProviderLockTimeout(d time.Duration) Option {
-	return func(m *ClaimManager) { m.providerLockTimeout = d }
 }
 
 // WithHoldReader injects the canonical durable hold authority.
@@ -181,7 +169,7 @@ func WithHoldReader(r lifecycle.HoldReader) Option { return func(m *ClaimManager
 func NewClaimManager(store LeaseStore, opts ...Option) *ClaimManager {
 	m := &ClaimManager{
 		store: store, capacity: noopCapacity{}, outbox: noopOutbox{}, now: time.Now, ttl: 10 * time.Minute,
-		capacityClaimTimeout: 5 * time.Minute, providerLockTimeout: 5 * time.Minute,
+		capacityClaimTimeout: 5 * time.Minute,
 	}
 	m.settlerID = fmt.Sprintf("pid%d-%p-%d", os.Getpid(), m, time.Now().UnixNano())
 	for _, opt := range opts {
@@ -240,17 +228,11 @@ func exactClaimComposite(req ClaimRequest) ([]lifecycle.HoldIdentity, error) {
 // an unlabeled task (TaskRole == "") is never eligible, and a mismatched
 // role is rejected even if some lease is otherwise free.
 //
-// If Acquire silently evicted a stale, expired lease to grant this claim,
-// that evicted lease's capacity token becomes durably pending the instant
-// Acquire's UPDATE flips it to Expired (see LeaseStore's doc comment) —
-// Claim settles any capacity pending for this key before reserving new
-// capacity, so an old, dead owner's token is durably released before (or,
-// if settlement itself fails, at least queued durably ahead of) the new
-// reservation, instead of the new claim silently reserving on top of an
-// unreturned token. Settlement failure does not block the new claim
-// (liveness: a stuck coordinator must not prevent reclaiming stale work
-// forever) — the pending row remains durable and retryable via
-// SettlePendingCapacity/ExpireStale/a future Release call.
+// If Acquire silently evicted a stale, expired incumbent, Claim settles its
+// capacity before reserving new capacity. If incumbent settlement fails, the
+// replacement is atomically aborted as never-reserved and the new claim is
+// blocked; only the incumbent remains durable and retryable via
+// SettlePendingCapacity or a future Release call.
 func (m *ClaimManager) Claim(ctx context.Context, req ClaimRequest) (*Lease, error) {
 	if req.TaskRole == "" {
 		return nil, ErrUnlabeledTask
@@ -258,106 +240,113 @@ func (m *ClaimManager) Claim(ctx context.Context, req ClaimRequest) (*Lease, err
 	if req.Role == "" || req.Role != req.TaskRole {
 		return nil, ErrRoleMismatch
 	}
-	if m.holdReader != nil {
-		identities, err := exactClaimComposite(req)
+	if m.holdReader == nil {
+		return nil, fmt.Errorf("claim: lifecycle hold authority is required")
+	}
+	identities, err := exactClaimComposite(req)
+	if err != nil {
+		return nil, err
+	}
+	fencer, ok := m.holdReader.(interface {
+		WithUnheldTransition(context.Context, []lifecycle.HoldIdentity, func() error) error
+	})
+	if !ok {
+		return nil, fmt.Errorf("claim: lifecycle transition fencer is required")
+	}
+	snap, ok := m.store.(LeaseSnapshotStore)
+	if !ok {
+		return nil, fmt.Errorf("claim: historical lease snapshot store is required")
+	}
+	incumbent, err := snap.CurrentLease(ctx, req.Key)
+	if err != nil {
+		return nil, err
+	}
+	if incumbent != nil {
+		oldIDs, err := recoveryHoldIdentities(incumbent)
 		if err != nil {
 			return nil, err
 		}
-		for _, identity := range identities {
-			if !identityValid(identity) {
-				return nil, fmt.Errorf("claim: ambiguous canonical hold identity")
-			}
-			source, ok := m.holdReader.(interface {
-				CurrentGeneration(context.Context, lifecycle.HoldIdentity) (int64, error)
-			})
-			if !ok {
-				return nil, fmt.Errorf("claim: hold generation source is required")
-			}
-			generation, err := source.CurrentGeneration(ctx, identity)
-			if err != nil || generation <= 0 {
-				if err != nil {
-					return nil, fmt.Errorf("claim: hold generation: %w", err)
-				}
-				return nil, fmt.Errorf("claim: invalid hold generation %d", generation)
-			}
-			decision, err := m.holdReader.Check(ctx, identity, generation)
-			if err != nil {
-				return nil, fmt.Errorf("claim: hold authority: %w", err)
-			}
-			if decision.Held {
-				return nil, fmt.Errorf("claim: held identity denied: %s (%s)", decision.Reason, decision.Code)
-			}
-		}
+		identities = append(identities, oldIDs...)
 	}
-
-	// If the current lease for this key is being kept alive only by a
-	// now-stale provider-transition lock (its holder looks crashed, but a
-	// call it made to the provider may still be in flight -- see
-	// AcquireProviderLock/ProviderCAS's doc comments), superseding it
-	// must not be allowed to proceed until the provider has durably been
-	// told about the new generation. A best-effort, error-swallowed
-	// AdvanceFence AFTER a local reclaim already happened is exactly the
-	// gap an independent review caught: local ownership moved to
-	// generation 2 while the provider never heard about it, so
-	// generation 1's eventually-resumed call still succeeded. Store-level
-	// Acquire/Release/ExpireStale no longer preempt a provider lock by
-	// time alone at all -- ONLY preemptStaleProviderLock (here) and
-	// preemptAllStaleProviderLocks (ExpireStale) may do it, and only
-	// after a durably-confirmed fence advance. Leases that were never
-	// provider-locked pay zero cost (PeekStaleProviderLock returns nil
-	// immediately) and reclaim exactly as before.
-	if err := m.preemptStaleProviderLock(ctx, req.Key); err != nil {
-		return nil, err
-	}
-
+	identities = uniqueHoldIdentities(identities)
 	var lease *Lease
-	var err error
-	if m.holdReader != nil {
-		identities, compositeErr := exactClaimComposite(req)
-		if compositeErr != nil {
-			return nil, compositeErr
+	err = fencer.WithUnheldTransition(ctx, identities, func() error {
+		current, err := snap.CurrentLease(ctx, req.Key)
+		if err != nil {
+			return err
 		}
-		identity := identities[0]
+		if incumbent == nil && current != nil {
+			return fmt.Errorf("%w: incumbent appeared after snapshot", ErrAlreadyClaimed)
+		}
+		if incumbent != nil && (current == nil || !sameLeaseImmutable(current, incumbent) || current.Status != incumbent.Status) {
+			return fmt.Errorf("%w: incumbent changed after snapshot", ErrStaleGeneration)
+		}
+		if err := m.recoverStaleProviderLock(ctx, req.Key); err != nil {
+			return err
+		}
 		atomicStore, ok := m.store.(AtomicLeaseStore)
 		if !ok {
-			return nil, fmt.Errorf("claim: lease store cannot atomically persist canonical hold identity")
+			return fmt.Errorf("claim: lease store cannot atomically persist canonical hold identity")
 		}
-		lease, err = atomicStore.AcquireWithIdentity(ctx, req.Key, req.OwnerID, req.Role, req.WorktreePath, identity.Repository, identity.Owner, identity.Lane, m.now(), m.ttl)
-	} else {
-		lease, err = m.store.Acquire(ctx, req.Key, req.OwnerID, req.Role, req.WorktreePath, m.now(), m.ttl)
-	}
-	if err != nil {
-		// Even a lost race can have flipped a stale row to Expired (see
-		// LeaseStore.Acquire) before ultimately losing the insert to a
-		// concurrent winner; settle it regardless of our own outcome so
-		// that eviction's capacity token doesn't wait for someone else's
-		// sweep.
-		_, _ = m.settlePendingCapacity(ctx, &req.Key)
-		return nil, err
-	}
-	// Acquire durably evicts (Expires) any stale prior lease for this key
-	// as part of winning the claim, which is exactly what makes that
-	// lease's row claimable via ClaimCapacityRelease. Settle it now,
-	// before reserving the new token, so the old owner's capacity is
-	// released before (or, if settlement itself fails, at minimum durably
-	// queued ahead of) the new reservation instead of the new claim
-	// silently stacking on top of an unreturned token. Errors are
-	// intentionally not fatal to the new claim; the pending row stays
-	// durable and retryable regardless (see settlePendingCapacity).
-	_, _ = m.settlePendingCapacity(ctx, &req.Key)
-
-	if err := m.capacity.Reserve(ctx, req.Role, capacityKey("reserve", lease)); err != nil {
-		// Compensate: don't strand a durable lease with no capacity behind it.
-		_, _, _ = m.store.Release(ctx, req.Key, req.OwnerID, lease.Generation, m.now())
-		_, _ = m.settlePendingCapacity(ctx, &req.Key)
-		return nil, fmt.Errorf("claim: reserve capacity for role %s: %w", req.Role, err)
-	}
-
-	_ = m.outbox.Record(ctx, OutboxIntent{
-		IdempotencyKey: fmt.Sprintf("claim:%s/%s/%s/%s:g%d", req.Key.Repo, req.Key.Provider, req.Key.Project, req.Key.TaskRef, lease.Generation),
-		Kind:           "lease_claimed",
+		if _, ok := m.store.(UnreservedAbortStore); !ok {
+			return fmt.Errorf("claim: lease store cannot atomically abort an unreserved replacement")
+		}
+		lease, err = atomicStore.AcquireWithIdentity(ctx, req.Key, req.OwnerID, req.Role, req.WorktreePath, identities[0].Repository, identities[0].Owner, identities[0].Lane, m.now(), m.ttl)
+		if err != nil {
+			return err
+		}
+		if incumbent != nil && incumbent.ID != lease.ID {
+			if _, err := m.settleCapacityExact(ctx, incumbent); err != nil {
+				// AcquireWithIdentity has already committed the replacement. Do
+				// not strand that active lease without a reservation or claim
+				// intent when delivery of the incumbent's release fails.
+				abort, ok := m.store.(UnreservedAbortStore)
+				if !ok {
+					return errors.Join(err, fmt.Errorf("claim: exact unreserved abort store is required"))
+				}
+				aborted, changed, abortErr := abort.AbortUnreservedLease(ctx, lease, m.now())
+				if abortErr == nil && (!changed || aborted == nil || !sameLeaseImmutable(aborted, lease) || aborted.Status != StatusReleased || aborted.CapacityReleaseState != "cancelled" || aborted.ReleasedAt == nil || aborted.CapacityReleasedAt != nil) {
+					abortErr = fmt.Errorf("%w: invalid atomic abort receipt", ErrCapacityReleaseStale)
+				}
+				return errors.Join(err, abortErr)
+			}
+		}
+		if err := m.capacity.Reserve(ctx, req.Role, capacityKey("reserve", lease)); err != nil {
+			_, _, releaseErr := m.store.Release(ctx, req.Key, req.OwnerID, lease.Generation, m.now())
+			// Reserve errors are ambiguous: an external coordinator may have
+			// applied the reservation before returning the error. Keep the
+			// released row pending so the stable compensating Release is
+			// delivered and retried idempotently.
+			return errors.Join(err, releaseErr)
+		}
+		if err := m.outbox.Record(ctx, OutboxIntent{IdempotencyKey: fmt.Sprintf("claim:%s/%s/%s/%s:g%d", req.Key.Repo, req.Key.Provider, req.Key.Project, req.Key.TaskRef, lease.Generation), Kind: "lease_claimed"}); err != nil {
+			_, _, releaseErr := m.store.Release(ctx, req.Key, req.OwnerID, lease.Generation, m.now())
+			_, settleErr := m.settleCapacityExact(ctx, lease)
+			return errors.Join(err, releaseErr, settleErr)
+		}
+		return nil
 	})
+	if err != nil {
+		return nil, fmt.Errorf("claim: %w", err)
+	}
 	return lease, nil
+}
+
+func uniqueHoldIdentities(ids []lifecycle.HoldIdentity) []lifecycle.HoldIdentity {
+	out := make([]lifecycle.HoldIdentity, 0, len(ids))
+	for _, id := range ids {
+		seen := false
+		for _, prior := range out {
+			if prior == id {
+				seen = true
+				break
+			}
+		}
+		if !seen {
+			out = append(out, id)
+		}
+	}
+	return out
 }
 
 func identityValid(identity lifecycle.HoldIdentity) bool {
@@ -383,29 +372,66 @@ func (m *ClaimManager) Renew(ctx context.Context, key LeaseKey, ownerID string, 
 // flipped the row" scheme, this always attempts settlement for the key
 // after the store transition — including on a redundant/idempotent
 // replay call — so a capacity-coordinator failure on a prior Release
-// leaves the token durably pending and this call (or ExpireStale, or
+// leaves the token durably pending and this call (or recovery, or
 // SettlePendingCapacity) retries it instead of returning nil having
 // silently skipped it.
 func (m *ClaimManager) Release(ctx context.Context, key LeaseKey, ownerID string, generation int64) error {
-	// See Claim's matching comment: Release no longer preempts a stale
-	// provider lock by time alone at the store layer either, so a durable
-	// fence-advance is required first here too, or a genuinely-crashed
-	// owner's own Release call (or anyone else's, for that matter) could
-	// otherwise be the bypass route that skips fencing entirely.
-	if err := m.preemptStaleProviderLock(ctx, key); err != nil {
-		return err
+	if m.holdReader == nil {
+		return fmt.Errorf("claim: lifecycle hold authority is required")
 	}
-
-	_, _, err := m.store.Release(ctx, key, ownerID, generation, m.now())
+	fencer, ok := m.holdReader.(interface {
+		WithUnheldTransition(context.Context, []lifecycle.HoldIdentity, func() error) error
+	})
+	if !ok {
+		return fmt.Errorf("claim: lifecycle transition fencer is required")
+	}
+	snap, ok := m.store.(LeaseSnapshotStore)
+	if !ok {
+		return fmt.Errorf("claim: historical lease snapshot store is required")
+	}
+	incumbent, err := snap.LeaseByGeneration(ctx, key, ownerID, generation)
 	if err != nil {
 		return err
 	}
-	_, err = m.settlePendingCapacity(ctx, &key)
-	_ = m.outbox.Record(ctx, OutboxIntent{
-		IdempotencyKey: fmt.Sprintf("release:%s/%s/%s/%s:g%d", key.Repo, key.Provider, key.Project, key.TaskRef, generation),
-		Kind:           "lease_released",
+	if incumbent == nil {
+		return fmt.Errorf("%w: release target is not current", ErrStaleGeneration)
+	}
+	if incumbent.Status != StatusActive && incumbent.Status != StatusReleased {
+		return fmt.Errorf("%w: release target is %s", ErrStaleGeneration, incumbent.Status)
+	}
+	ids, err := recoveryHoldIdentities(incumbent)
+	if err != nil {
+		return err
+	}
+	return fencer.WithUnheldTransition(ctx, ids, func() error {
+		current, err := snap.LeaseByGeneration(ctx, key, ownerID, generation)
+		if err != nil || current == nil {
+			if err == nil {
+				err = fmt.Errorf("%w: release row disappeared", ErrStaleGeneration)
+			}
+			return err
+		}
+		if !sameLeaseImmutable(current, incumbent) {
+			return fmt.Errorf("claim: release identity changed inside fence")
+		}
+		if err := m.recoverStaleProviderLock(ctx, key); err != nil {
+			return err
+		}
+		if current.Status == StatusActive {
+			if _, _, err := m.store.Release(ctx, key, ownerID, generation, m.now()); err != nil {
+				return err
+			}
+		}
+		if current.CapacityReleasedAt == nil {
+			if _, err := m.settleCapacityExact(ctx, current); err != nil {
+				return err
+			}
+		}
+		if err := m.outbox.Record(ctx, OutboxIntent{IdempotencyKey: fmt.Sprintf("release:%s/%s/%s/%s:g%d", key.Repo, key.Provider, key.Project, key.TaskRef, generation), Kind: "lease_released"}); err != nil {
+			return err
+		}
+		return nil
 	})
-	return err
 }
 
 // Hold sets or clears operator hold on the active lease for key, fenced
@@ -413,23 +439,13 @@ func (m *ClaimManager) Release(ctx context.Context, key LeaseKey, ownerID string
 // wrong-owner caller is rejected rather than able to hold/unhold a lease
 // it does not currently own.
 func (m *ClaimManager) Hold(ctx context.Context, key LeaseKey, ownerID string, generation int64, held bool) (*Lease, error) {
-	return m.store.Hold(ctx, key, ownerID, generation, held, m.now())
+	return nil, ErrLegacyLeaseHoldDisabled
 }
 
-// ExpireStale first durably preempts every stale provider-locked lease
-// across every key (see preemptAllStaleProviderLocks -- same requirement
-// as Claim/Release: no lease with a provider lock is evicted by time
-// alone without a confirmed fence advance first), then sweeps expired
-// leases, then settles all pending capacity release across every key
-// (not just the ones it just expired), so it also self-heals any earlier
-// Release/Claim call whose capacity settlement failed and was left
-// durably pending. Callers (e.g. a daemon tick, or Reconcile) decide the
-// schedule; ClaimManager does not run a background loop itself.
-//
-// A preemption failure for one lease does not stop the sweep for
-// everything else: it's reported (via the returned error, never
-// swallowed) but that lease is simply left locked, to be retried on a
-// future call, exactly like Claim/Release leave it for their own retry.
+// ExpireStale snapshots and fences each expired candidate independently.
+// Provider recovery, lease CAS, and exact capacity settlement all occur
+// inside that candidate's authority transition. A failure is reported while
+// unrelated candidates continue.
 func (m *ClaimManager) ExpireStale(ctx context.Context) ([]*Lease, error) {
 	if m.holdReader == nil {
 		return nil, fmt.Errorf("claim: lifecycle hold authority is required for recovery")
@@ -457,6 +473,7 @@ func (m *ClaimManager) ExpireStale(ctx context.Context) ([]*Lease, error) {
 		}
 	}
 	var expired []*Lease
+	var sweepErr error
 	for i, candidate := range candidates {
 		identities := validated[i]
 		transition := func() error {
@@ -466,22 +483,19 @@ func (m *ClaimManager) ExpireStale(ctx context.Context) ([]*Lease, error) {
 					return staleErr
 				}
 				if stale != nil {
-					claimed, err := recovery.ClaimProviderLockCAS(ctx, *stale)
+					claimed, err := claimRecoveryObservation(ctx, recovery, candidate.LeaseKey, *stale, snapshotNow)
 					if err != nil {
 						return err
-					}
-					if !claimed {
-						return nil
 					}
 					if err := m.durablyAdvanceFence(ctx, candidate.TaskRef, candidate.Generation+1); err != nil {
 						return err
 					}
-					finalized, err := recovery.FinalizeProviderLockCAS(ctx, *stale)
+					finalized, err := recovery.FinalizeProviderLockCAS(ctx, *claimed)
 					if err != nil {
 						return err
 					}
 					if !finalized {
-						return nil
+						return fmt.Errorf("%w: provider recovery finalize lost", ErrProviderLockStale)
 					}
 				}
 			}
@@ -491,6 +505,9 @@ func (m *ClaimManager) ExpireStale(ctx context.Context) ([]*Lease, error) {
 			}
 			if changed {
 				expired = append(expired, lease)
+				if _, err := m.settleCapacityExact(ctx, lease); err != nil {
+					return err
+				}
 			}
 			return nil
 		}
@@ -498,10 +515,91 @@ func (m *ClaimManager) ExpireStale(ctx context.Context) ([]*Lease, error) {
 			if errors.Is(err, lifecycle.ErrHoldDenied) {
 				continue
 			}
-			return nil, err
+			sweepErr = errors.Join(sweepErr, err)
+			continue
 		}
 	}
-	return expired, nil
+	return expired, sweepErr
+}
+
+type capacitySettlementOutcome uint8
+
+const (
+	capacitySettlementAlreadySettled capacitySettlementOutcome = iota
+	capacitySettlementNewlySettled
+)
+
+// settleCapacityExact performs one exact, idempotent capacity settlement.
+// The outcome distinguishes a durable Ack performed by this call from a
+// replay that observed an already-acked historical row. Callers that report
+// newly completed work must use the former only.
+func (m *ClaimManager) settleCapacityExact(ctx context.Context, lease *Lease) (capacitySettlementOutcome, error) {
+	if err := validateAttributableID(m.settlerID, "settler identity"); err != nil {
+		return capacitySettlementAlreadySettled, err
+	}
+	if err := validatePositiveDuration(m.capacityClaimTimeout, "capacity claim timeout"); err != nil {
+		return capacitySettlementAlreadySettled, err
+	}
+	if lease == nil {
+		return capacitySettlementAlreadySettled, fmt.Errorf("%w: nil lease", ErrCapacityReleaseStale)
+	}
+	if lease.CapacityReleasedAt != nil {
+		return capacitySettlementAlreadySettled, nil
+	}
+	if lease.CapacityReleaseState == "cancelled" {
+		return capacitySettlementAlreadySettled, nil
+	}
+	store, ok := m.store.(ExactCapacityReleaseStore)
+	if !ok {
+		return capacitySettlementAlreadySettled, fmt.Errorf("claim: exact capacity release store is required")
+	}
+	claimed, changed, err := store.ClaimCapacityReleaseExact(ctx, lease.ID, lease.Generation, m.settlerID, m.capacityClaimTimeout, m.now())
+	if err != nil {
+		return capacitySettlementAlreadySettled, err
+	}
+	if !changed {
+		if claimed != nil && claimed.CapacityReleaseState == "cancelled" {
+			return capacitySettlementAlreadySettled, nil
+		}
+		if snap, ok := m.store.(LeaseSnapshotStore); ok {
+			current, readErr := snap.LeaseByGeneration(ctx, lease.LeaseKey, lease.OwnerID, lease.Generation)
+			if readErr == nil && current != nil && current.CapacityReleasedAt != nil && current.ID == lease.ID {
+				return capacitySettlementAlreadySettled, nil
+			}
+		}
+		return capacitySettlementAlreadySettled, fmt.Errorf("%w: lease %d generation %d", ErrCapacityReleaseStale, lease.ID, lease.Generation)
+	}
+	if claimed == nil || !sameLeaseImmutable(claimed, lease) || (claimed.Status != StatusReleased && claimed.Status != StatusExpired) {
+		return capacitySettlementAlreadySettled, fmt.Errorf("%w: claimed capacity row identity mismatch", ErrCapacityReleaseStale)
+	}
+	if err := m.capacity.Release(ctx, claimed.Role, capacityKey("release", claimed)); err != nil {
+		if failErr := m.store.FailCapacityRelease(ctx, claimed.ID, m.settlerID); failErr != nil {
+			return capacitySettlementAlreadySettled, errors.Join(err, failErr)
+		}
+		return capacitySettlementAlreadySettled, err
+	}
+	if err := m.store.AckCapacityRelease(ctx, claimed.ID, m.settlerID, m.now()); err != nil {
+		return capacitySettlementAlreadySettled, err
+	}
+	return capacitySettlementNewlySettled, nil
+}
+
+func validateAttributableID(value, label string) error {
+	if value == "" || strings.TrimSpace(value) != value {
+		return fmt.Errorf("claim: %s must be nonempty and canonical", label)
+	}
+	return nil
+}
+
+func validatePositiveDuration(value time.Duration, label string) error {
+	if value <= 0 {
+		return fmt.Errorf("claim: %s must be positive", label)
+	}
+	return nil
+}
+
+func sameLeaseImmutable(a, b *Lease) bool {
+	return a != nil && b != nil && a.ID == b.ID && a.LeaseKey == b.LeaseKey && a.OwnerID == b.OwnerID && a.Role == b.Role && a.HoldRepository == b.HoldRepository && a.HoldOwner == b.HoldOwner && a.HoldLane == b.HoldLane && a.WorktreePath == b.WorktreePath && a.Generation == b.Generation && a.ClaimedAt.Equal(b.ClaimedAt)
 }
 
 func recoveryHoldIdentities(lease *Lease) ([]lifecycle.HoldIdentity, error) {
@@ -517,90 +615,57 @@ func recoveryHoldIdentities(lease *Lease) ([]lifecycle.HoldIdentity, error) {
 	}, nil
 }
 
-func (m *ClaimManager) expireStaleUnlocked(ctx context.Context) ([]*Lease, error) {
-	preemptErr := m.preemptAllStaleProviderLocks(ctx)
-
-	expired, err := m.store.ExpireStale(ctx, m.now())
-	if err != nil {
-		return nil, err
-	}
-	if _, settleErr := m.settlePendingCapacity(ctx, nil); settleErr != nil {
-		return expired, settleErr
-	}
-	if preemptErr != nil {
-		return expired, preemptErr
-	}
-	return expired, nil
-}
-
-// preemptStaleProviderLock durably advances the provider fence for key's
-// stale-provider-locked active lease (if any) and, only on success,
-// force-clears the lock so the lease becomes normally evictable/
-// releasable by the store's own (lock-oblivious-to-staleness)
-// Acquire/Release/ExpireStale. A no-op if there is no stale-locked lease
-// for key, or if no ProviderCAS is configured (nothing external to
-// protect, so a local lock's staleness alone is a sufficient and correct
-// signal -- this is the pre-FAC-120-review, pre-fencing behavior,
-// preserved exactly for callers who never touch the provider). A
-// fence-advance failure is returned -- never swallowed -- with the lock
-// left in place, so the caller (Claim, Release) refuses to proceed
-// rather than exposing new local state the provider was never told
-// about; a future call for the same key (the natural retry path) tries
-// again with the same durable idempotency key.
-func (m *ClaimManager) preemptStaleProviderLock(ctx context.Context, key LeaseKey) error {
+func (m *ClaimManager) recoverStaleProviderLock(ctx context.Context, key LeaseKey) error {
 	if m.provider == nil {
 		return nil
 	}
-	stale, err := m.store.PeekStaleProviderLock(ctx, key, m.now())
+	recovery, ok := m.store.(RecoveryStore)
+	if !ok {
+		return fmt.Errorf("claim: typed provider recovery store is required")
+	}
+	obs, err := recovery.ObserveStaleProviderLock(ctx, key, m.now())
+	if err != nil || obs == nil {
+		return err
+	}
+	claimed, err := claimRecoveryObservation(ctx, recovery, key, *obs, m.now())
 	if err != nil {
-		return fmt.Errorf("claim: check provider lock staleness: %w", err)
+		return err
 	}
-	if stale == nil {
-		return nil
+	if err := m.durablyAdvanceFence(ctx, key.TaskRef, claimed.Generation+1); err != nil {
+		return err
 	}
-	if err := m.durablyAdvanceFence(ctx, key.TaskRef, stale.Generation+1); err != nil {
-		return fmt.Errorf("claim: cannot safely preempt stale provider lock for %s: %w", key.TaskRef, err)
+	finalized, err := recovery.FinalizeProviderLockCAS(ctx, *claimed)
+	if err != nil {
+		return err
 	}
-	if err := m.store.ForceReleaseProviderLock(ctx, key, stale.Generation); err != nil {
-		return fmt.Errorf("claim: clear preempted provider lock for %s: %w", key.TaskRef, err)
+	if !finalized {
+		return fmt.Errorf("%w: provider recovery finalize lost", ErrProviderLockStale)
 	}
 	return nil
 }
 
-// preemptAllStaleProviderLocks is preemptStaleProviderLock across every
-// key, for ExpireStale's global sweep. A fence-advance failure for one
-// lease does not stop the others; the first error encountered is
-// returned (never swallowed) after every eligible lease has been
-// attempted.
-func (m *ClaimManager) preemptAllStaleProviderLocks(ctx context.Context) error {
-	if m.provider == nil {
-		return nil
-	}
-	stales, err := m.store.PeekAllStaleProviderLocks(ctx, m.now())
+func claimRecoveryObservation(ctx context.Context, recovery RecoveryStore, key LeaseKey, observed ProviderLockObservation, now time.Time) (*ProviderLockObservation, error) {
+	claimed, err := recovery.ClaimProviderLockCAS(ctx, observed)
 	if err != nil {
-		return fmt.Errorf("claim: list stale provider locks: %w", err)
+		return nil, err
 	}
-	var firstErr error
-	for _, l := range stales {
-		if err := m.durablyAdvanceFence(ctx, l.TaskRef, l.Generation+1); err != nil {
-			if firstErr == nil {
-				firstErr = fmt.Errorf("claim: cannot safely preempt stale provider lock for %s: %w", l.TaskRef, err)
-			}
-			continue
-		}
-		if err := m.store.ForceReleaseProviderLock(ctx, l.LeaseKey, l.Generation); err != nil {
-			if firstErr == nil {
-				firstErr = fmt.Errorf("claim: clear preempted provider lock for %s: %w", l.TaskRef, err)
-			}
-		}
+	current, readErr := recovery.ObserveStaleProviderLock(ctx, key, now)
+	if readErr != nil {
+		return nil, readErr
 	}
-	return firstErr
+	if current == nil || current.LeaseID != observed.LeaseID || current.Generation != observed.Generation || current.Owner != recoveryOwnerFor(observed.LeaseID, observed.Generation) || current.RecoveryOwner != recoveryOwnerFor(observed.LeaseID, observed.Generation) || current.LockedAt.IsZero() || (observed.Recovery && !current.LockedAt.Equal(observed.LockedAt)) {
+		if !claimed {
+			return nil, fmt.Errorf("%w: provider recovery claim lost", ErrProviderLockStale)
+		}
+		return nil, fmt.Errorf("%w: post-claim recovery observation missing or mismatched", ErrProviderLockStale)
+	}
+	return current, nil
 }
 
 // SettlePendingCapacity retries CapacityCoordinator.Release for every
 // lease across every key whose capacity token has not yet been durably
 // marked returned. Exposed standalone (in addition to being called by
-// Claim/Release/ExpireStale) so a Reconciler or operator tool can drain a
+// Claim/Release/recovery) so a Reconciler or operator tool can drain a
 // backlog left by a coordinator outage without waiting for lease
 // activity to trigger it.
 func (m *ClaimManager) SettlePendingCapacity(ctx context.Context) ([]*Lease, error) {
@@ -625,33 +690,61 @@ func (m *ClaimManager) SettlePendingCapacity(ctx context.Context) ([]*Lease, err
 // with the SAME idempotency key — an at-least-once redelivery a
 // conforming coordinator dedupes into an effectively-exactly-once effect.
 func (m *ClaimManager) settlePendingCapacity(ctx context.Context, key *LeaseKey) ([]*Lease, error) {
+	if err := validateAttributableID(m.settlerID, "settler identity"); err != nil {
+		return nil, err
+	}
+	if err := validatePositiveDuration(m.capacityClaimTimeout, "capacity claim timeout"); err != nil {
+		return nil, err
+	}
+	if m.holdReader == nil {
+		return nil, fmt.Errorf("claim: lifecycle hold authority is required for capacity settlement")
+	}
 	if m.holdReader != nil {
-		return nil, fmt.Errorf("claim: per-lease fenced capacity settlement is required")
-	}
-	claimed, err := m.store.ClaimCapacityRelease(ctx, m.settlerID, m.capacityClaimTimeout, m.now(), key)
-	if err != nil {
-		return nil, fmt.Errorf("claim: claim capacity release batch: %w", err)
-	}
-
-	var settled []*Lease
-	var firstErr error
-	for _, l := range claimed {
-		if err := m.capacity.Release(ctx, l.Role, capacityKey("release", l)); err != nil {
-			if firstErr == nil {
-				firstErr = fmt.Errorf("claim: release capacity for %s (lease %d, role %s): %w", l.TaskRef, l.ID, l.Role, err)
-			}
-			_ = m.store.FailCapacityRelease(ctx, l.ID, m.settlerID) // durable, retryable: back to pending now, not stranded until staleAfter.
-			continue
+		if key != nil {
+			return nil, fmt.Errorf("claim: keyed settlement must use the exact transition path")
 		}
-		if err := m.store.AckCapacityRelease(ctx, l.ID, m.settlerID, m.now()); err != nil {
-			if firstErr == nil {
-				firstErr = fmt.Errorf("claim: ack capacity release for lease %d: %w", l.ID, err)
-			}
-			continue
+		pending, ok := m.store.(PendingCapacityStore)
+		if !ok {
+			return nil, fmt.Errorf("claim: pending capacity store is required")
 		}
-		settled = append(settled, l)
+		fencer, ok := m.holdReader.(interface {
+			WithUnheldTransition(context.Context, []lifecycle.HoldIdentity, func() error) error
+		})
+		if !ok {
+			return nil, fmt.Errorf("claim: lifecycle transition fencer is required")
+		}
+		leases, err := pending.PendingCapacityReleases(ctx)
+		if err != nil {
+			return nil, err
+		}
+		var settled []*Lease
+		var firstErr error
+		for _, lease := range leases {
+			ids, err := recoveryHoldIdentities(lease)
+			if err != nil {
+				firstErr = errors.Join(firstErr, err)
+				continue
+			}
+			err = fencer.WithUnheldTransition(ctx, ids, func() error {
+				outcome, err := m.settleCapacityExact(ctx, lease)
+				if err != nil {
+					return err
+				}
+				if outcome == capacitySettlementNewlySettled {
+					settled = append(settled, lease)
+				}
+				return nil
+			})
+			if errors.Is(err, lifecycle.ErrHoldDenied) {
+				continue
+			}
+			if err != nil {
+				firstErr = errors.Join(firstErr, err)
+			}
+		}
+		return settled, firstErr
 	}
-	return settled, firstErr
+	return nil, fmt.Errorf("claim: exact fenced capacity settlement path unavailable")
 }
 
 // ActiveClaims returns only live leases.
