@@ -1,7 +1,6 @@
 package launch
 
 import (
-	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -114,18 +113,66 @@ func (s *FileStore) CompareAndSwap(expected uint64, next Snapshot) (bool, error)
 }
 
 func validateSnapshot(s Snapshot) error {
-	if len(s.Events) == 0 {
-		return nil
+	if s.Version != uint64(len(s.Events)) {
+		return errors.New("corrupt launch state: version/sequence mismatch")
 	}
-	var seq uint64
-	for _, e := range s.Events {
-		if e.Sequence != seq+1 || e.Kind == "" || e.Receipt.Generation <= 0 {
+	type state struct {
+		r    Receipt
+		kind string
+	}
+	states := map[string]state{}
+	max := map[string]int64{}
+	for i, e := range s.Events {
+		if e.Sequence != uint64(i+1) {
 			return errors.New("corrupt launch state: invalid event sequence")
 		}
-		seq = e.Sequence
-	}
-	if s.Version != seq {
-		return errors.New("corrupt launch state: version/sequence mismatch")
+		if e.Kind != "reserved" && e.Kind != "accepted" && e.Kind != "rejected" && e.Kind != "superseded" && e.Kind != "terminal" {
+			return errors.New("corrupt launch state: unknown transition")
+		}
+		r := e.Receipt
+		key := identityKey(r)
+		genKey := fmt.Sprintf("%s\x00%d", key, r.Generation)
+		if r.Generation <= 0 {
+			return errors.New("corrupt launch state: invalid binding")
+		}
+		if err := validateRejection(r); err != nil {
+			return errors.New("corrupt launch state: invalid binding")
+		}
+		st, exists := states[genKey]
+		switch e.Kind {
+		case "reserved":
+			if exists || r.Generation != max[key]+1 || r.ProcessIdentity != "" || r.StartToken != "" {
+				return errors.New("corrupt launch state: invalid reservation provenance")
+			}
+			states[genKey] = state{r: r, kind: e.Kind}
+			max[key] = r.Generation
+		case "accepted":
+			if !exists || st.kind != "reserved" || !sameBinding(st.r, r) || r.ProcessIdentity == "" || r.StartToken == "" {
+				return errors.New("corrupt launch state: invalid acceptance provenance")
+			}
+			states[genKey] = state{r: r, kind: e.Kind}
+		case "rejected":
+			if !exists || (st.kind != "reserved" && st.kind != "accepted") || !sameBinding(st.r, r) || st.kind == "accepted" && !sameReceipt(st.r, r) {
+				return errors.New("corrupt launch state: invalid rejection provenance")
+			}
+			states[genKey] = state{r: r, kind: e.Kind}
+		case "superseded", "terminal":
+			if !exists || (st.kind != "reserved" && st.kind != "accepted") || !sameBinding(st.r, r) {
+				return errors.New("corrupt launch state: invalid terminal provenance")
+			}
+			if e.Kind == "superseded" {
+				foundNewer := false
+				for k, newer := range states {
+					if strings.HasPrefix(k, key+"\x00") && newer.r.Generation > r.Generation && newer.kind == "accepted" {
+						foundNewer = true
+					}
+				}
+				if !foundNewer {
+					return errors.New("corrupt launch state: invalid supersession provenance")
+				}
+			}
+			states[genKey] = state{r: r, kind: e.Kind}
+		}
 	}
 	return nil
 }
@@ -146,6 +193,9 @@ func (a *Authority) mutate(fn func(Snapshot) (Snapshot, error)) error {
 	for attempt := 0; attempt < 32; attempt++ {
 		current, err := a.Store.Read()
 		if err != nil {
+			return err
+		}
+		if err := validateSnapshot(current); err != nil {
 			return err
 		}
 		next, err := fn(current)
@@ -175,14 +225,6 @@ func (a *Authority) appendEvent(kind string, r Receipt) error {
 	})
 }
 
-func randomToken() (string, error) {
-	var b [16]byte
-	if _, err := rand.Read(b[:]); err != nil {
-		return "", fmt.Errorf("generate launch start token: %w", err)
-	}
-	return fmt.Sprintf("%x", b[:]), nil
-}
-
 // Reserve allocates the next generation for the exact identity. Replaying an
 // already-reserved packet is idempotent; a different packet cannot reuse it.
 func (a *Authority) Reserve(req Request, packetDigest string) (Receipt, error) {
@@ -191,13 +233,8 @@ func (a *Authority) Reserve(req Request, packetDigest string) (Receipt, error) {
 	}
 	base := receiptFor(req, packetDigest)
 	base.Generation = 1
-	var err error
-	base.StartToken, err = randomToken()
-	if err != nil {
-		return Receipt{}, err
-	}
 	var result Receipt
-	err = a.mutate(func(s Snapshot) (Snapshot, error) {
+	err := a.mutate(func(s Snapshot) (Snapshot, error) {
 		key := identityKey(base)
 		var max int64
 		var latest Receipt
@@ -229,7 +266,7 @@ func (a *Authority) Reserve(req Request, packetDigest string) (Receipt, error) {
 
 // Accept records process identity only after the process API reports started.
 func (a *Authority) Accept(r Receipt) error {
-	if err := validateReceipt(r); err != nil {
+	if err := validateAccepted(r); err != nil {
 		return err
 	}
 	return a.mutate(func(s Snapshot) (Snapshot, error) {
@@ -262,9 +299,15 @@ func (a *Authority) Accept(r Receipt) error {
 			}
 		}
 		s.Events = append(s.Events, Event{Sequence: uint64(len(s.Events) + 1), Kind: "accepted", Receipt: cloneReceipt(r)})
+		older := map[int64]Event{}
 		for _, e := range s.Events[:len(s.Events)-1] {
-			if identityKey(e.Receipt) == identityKey(r) && e.Receipt.Generation < r.Generation && (e.Kind == "accepted" || e.Kind == "reserved") {
-				s.Events = append(s.Events, Event{Sequence: uint64(len(s.Events) + 1), Kind: "superseded", Receipt: e.Receipt})
+			if identityKey(e.Receipt) == identityKey(r) && e.Receipt.Generation < r.Generation {
+				older[e.Receipt.Generation] = e
+			}
+		}
+		for _, old := range older {
+			if old.Kind == "accepted" || old.Kind == "reserved" {
+				s.Events = append(s.Events, Event{Sequence: uint64(len(s.Events) + 1), Kind: "superseded", Receipt: old.Receipt})
 			}
 		}
 		return s, nil
@@ -272,7 +315,7 @@ func (a *Authority) Accept(r Receipt) error {
 }
 
 func (a *Authority) Reject(r Receipt, reason string) error {
-	if err := validateReceipt(r); err != nil {
+	if err := validateRejection(r); err != nil {
 		return err
 	}
 	if strings.TrimSpace(reason) == "" {
@@ -295,7 +338,11 @@ func (a *Authority) Reject(r Receipt, reason string) error {
 				return s, errors.New("launch generation is terminal")
 			}
 			if e.Kind == "reserved" || e.Kind == "accepted" {
-				if !sameBinding(e.Receipt, r) {
+				matches := sameBinding(e.Receipt, r)
+				if e.Kind == "accepted" {
+					matches = matches && sameReceipt(e.Receipt, r)
+				}
+				if !matches {
 					return s, errors.New("launch rejection binding mismatch")
 				}
 				found = true
@@ -311,11 +358,14 @@ func (a *Authority) Reject(r Receipt, reason string) error {
 
 // HasStarted accepts only the latest exact accepted nonterminal generation.
 func (a *Authority) HasStarted(req Request, packetDigest string) (bool, error) {
-	if err := validateBinding(req, packetDigest); err != nil {
+	if err := validateReadback(req, packetDigest); err != nil {
 		return false, nil
 	}
 	s, err := a.Store.Read()
 	if err != nil {
+		return false, err
+	}
+	if err := validateSnapshot(s); err != nil {
 		return false, err
 	}
 	key := identityKey(receiptFor(req, packetDigest))
@@ -350,17 +400,35 @@ func (a *Authority) HasStarted(req Request, packetDigest string) (bool, error) {
 
 func receiptFor(req Request, packetDigest string) Receipt {
 	role, shape, provider, model, effort, digest, argv := fields(req)
-	return Receipt{TaskRef: req.TaskRef, Repository: req.Repository, Lane: req.Lane, Role: role, TaskShape: shape, Provider: provider, Model: model, Effort: effort, DecisionDigest: digest, Argv: argv, Name: req.Name, TabID: req.TabID, PaneID: req.PaneID, HerdrSession: req.HerdrSession, CWD: req.CWD, ProcessIdentity: req.ProcessIdentity, PacketDigest: packetDigest, LeaseGeneration: req.LeaseGeneration, SessionGeneration: req.SessionGeneration}
+	return Receipt{TaskRef: req.TaskRef, Repository: req.Repository, Lane: req.Lane, Role: role, TaskShape: shape, Provider: provider, Model: model, Effort: effort, DecisionDigest: digest, Argv: argv, Name: req.Name, TabID: req.TabID, PaneID: req.PaneID, HerdrSession: req.HerdrSession, CWD: req.CWD, PacketDigest: packetDigest, LeaseGeneration: req.LeaseGeneration, SessionGeneration: req.SessionGeneration}
 }
 func validateBinding(r Request, packet string) error {
-	if r.Decision == nil || r.TaskRef == "" || r.Repository == "" || r.Lane == "" || r.Name == "" || r.TabID == "" || r.PaneID == "" || r.HerdrSession == "" || r.CWD == "" || r.ProcessIdentity == "" || strings.TrimSpace(packet) == "" {
+	if r.Decision == nil || r.TaskRef == "" || r.Repository == "" || r.Lane == "" || r.Name == "" || r.TabID == "" || r.PaneID == "" || r.HerdrSession == "" || r.CWD == "" || r.ProcessIdentity != "" || r.StartToken != "" || strings.TrimSpace(packet) == "" {
 		return errors.New("all launch binding fields are required")
 	}
 	return nil
 }
-func validateReceipt(r Receipt) error {
-	if r.Generation <= 0 || r.TaskRef == "" || r.Repository == "" || r.Lane == "" || r.TabID == "" || r.PaneID == "" || r.HerdrSession == "" || r.CWD == "" || r.ProcessIdentity == "" || r.StartToken == "" || r.PacketDigest == "" || len(r.Argv) == 0 {
+func validateReadback(r Request, packet string) error {
+	if err := validateBinding(Request{Decision: r.Decision, TaskRef: r.TaskRef, Repository: r.Repository, Lane: r.Lane, Name: r.Name, TabID: r.TabID, PaneID: r.PaneID, HerdrSession: r.HerdrSession, CWD: r.CWD}, packet); err != nil {
+		return err
+	}
+	if r.ProcessIdentity == "" || r.StartToken == "" {
+		return errors.New("readback requires accepted process identity and start token")
+	}
+	return nil
+}
+func validateRejection(r Receipt) error {
+	if r.Generation <= 0 || r.TaskRef == "" || r.Repository == "" || r.Lane == "" || r.TabID == "" || r.PaneID == "" || r.HerdrSession == "" || r.CWD == "" || r.PacketDigest == "" || len(r.Argv) == 0 {
 		return errors.New("incomplete launch receipt")
+	}
+	return nil
+}
+func validateAccepted(r Receipt) error {
+	if err := validateRejection(r); err != nil {
+		return err
+	}
+	if r.ProcessIdentity == "" || r.StartToken == "" {
+		return errors.New("accepted launch requires process identity and start token")
 	}
 	return nil
 }
@@ -371,11 +439,12 @@ func sameReceipt(a, b Receipt) bool {
 	return a.TaskRef == b.TaskRef && a.Repository == b.Repository && a.Lane == b.Lane && a.Role == b.Role && a.TaskShape == b.TaskShape && a.Provider == b.Provider && a.Model == b.Model && a.Effort == b.Effort && a.Generation == b.Generation && a.TabID == b.TabID && a.PaneID == b.PaneID && a.HerdrSession == b.HerdrSession && a.CWD == b.CWD && a.ProcessIdentity == b.ProcessIdentity && a.StartToken == b.StartToken && a.PacketDigest == b.PacketDigest && a.DecisionDigest == b.DecisionDigest && equalStrings(a.Argv, b.Argv)
 }
 func sameBinding(a, b Receipt) bool {
-	return a.TaskRef == b.TaskRef && a.Repository == b.Repository && a.Lane == b.Lane && a.Name == b.Name && a.Role == b.Role && a.TaskShape == b.TaskShape && a.Provider == b.Provider && a.Model == b.Model && a.Effort == b.Effort && a.TabID == b.TabID && a.PaneID == b.PaneID && a.HerdrSession == b.HerdrSession && a.CWD == b.CWD && a.ProcessIdentity == b.ProcessIdentity && a.LeaseGeneration == b.LeaseGeneration && a.SessionGeneration == b.SessionGeneration && a.PacketDigest == b.PacketDigest && a.DecisionDigest == b.DecisionDigest && equalStrings(a.Argv, b.Argv)
+	return a.TaskRef == b.TaskRef && a.Repository == b.Repository && a.Lane == b.Lane && a.Name == b.Name && a.Role == b.Role && a.TaskShape == b.TaskShape && a.Provider == b.Provider && a.Model == b.Model && a.Effort == b.Effort && a.TabID == b.TabID && a.PaneID == b.PaneID && a.HerdrSession == b.HerdrSession && a.CWD == b.CWD && a.LeaseGeneration == b.LeaseGeneration && a.SessionGeneration == b.SessionGeneration && a.PacketDigest == b.PacketDigest && a.DecisionDigest == b.DecisionDigest && equalStrings(a.Argv, b.Argv)
 }
 func sameRequest(r Receipt, q Request, packet string) bool {
 	x := receiptFor(q, packet)
 	x.Generation = r.Generation
-	x.StartToken = r.StartToken
+	x.StartToken = q.StartToken
+	x.ProcessIdentity = q.ProcessIdentity
 	return sameReceipt(r, x)
 }
