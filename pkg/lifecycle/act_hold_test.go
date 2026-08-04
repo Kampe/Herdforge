@@ -2,12 +2,14 @@ package lifecycle
 
 import (
 	"context"
+	"encoding/json"
 	"testing"
 )
 
 type actHoldReader struct {
 	identities []HoldIdentity
 	holdLane   bool
+	taskHeld   *bool
 }
 
 func (r *actHoldReader) CurrentGeneration(context.Context, HoldIdentity) (int64, error) {
@@ -19,7 +21,11 @@ func (r *actHoldReader) Check(_ context.Context, identity HoldIdentity, generati
 		return HoldDecision{}, ErrHoldAuthorityUnavailable
 	}
 	r.identities = append(r.identities, identity)
-	return HoldDecision{Held: identity.Scope == "lane" && r.holdLane || identity.Scope == "task", Reason: "maintenance", Code: "operator_hold"}, nil
+	taskHeld := true
+	if r.taskHeld != nil {
+		taskHeld = *r.taskHeld
+	}
+	return HoldDecision{Held: identity.Scope == "lane" && r.holdLane || identity.Scope == "task" && taskHeld, Reason: "maintenance", Code: "operator_hold"}, nil
 }
 
 func actHoldEngine(reader *actHoldReader) *Engine {
@@ -72,6 +78,68 @@ func TestActModeSettledKickUsesTypedLiveAgentRoleLaneBeforeCommand(t *testing.T)
 	}
 	if len(reader.identities) != 1 || reader.identities[0].Lane != "smith" || reader.identities[0].Owner != "worker" || reader.identities[0].Scope != "lane" {
 		t.Fatalf("settled kick used noncanonical identity: %+v", reader.identities)
+	}
+}
+
+func TestConfiguredLiveForgeSmithSettledKickUsesSmithWorkerHold(t *testing.T) {
+	taskHeld := false
+	reader := &actHoldReader{holdLane: false, taskHeld: &taskHeld}
+	registry, err := NewCanonicalLaneRegistry([]CanonicalLane{
+		{Name: "smith", Role: "worker"},
+		{Name: "scout", Role: "forge-smith"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	e := actHoldEngine(reader)
+	e.StandingRoster = &registry
+	e.HoldLiveAgentResolver = func(id string) (string, string, error) {
+		lane, err := registry.ResolveLiveAgentID(id)
+		if err != nil {
+			return "", "", err
+		}
+		return lane.Role, lane.Name, nil
+	}
+	agents := struct {
+		Result struct {
+			Agents []json.RawMessage `json:"agents"`
+		} `json:"result"`
+	}{}
+	agents.Result.Agents = []json.RawMessage{json.RawMessage(`{"name":"forge-smith","status":"idle","interactive":true}`)}
+	board := json.RawMessage(`{"tasks":[{"ref":"FAC-202","status":"to-do","labels":["worker"]}]}`)
+	s := e.computeSummary(agents, board, nil, nil)
+	if len(s.Settled) != 1 || s.Settled[0].Lane != "smith" || s.Settled[0].Role != "worker" {
+		t.Fatalf("live forge-smith was not resolved as smith/worker: %+v", s.Settled)
+	}
+	if s.Dispatchable != 1 {
+		t.Fatalf("expected dispatchable task before hold, summary=%+v", s)
+	}
+	reader.holdLane = true
+	taskHeld = true
+	if err := e.executeActMode(t.TempDir(), t.TempDir(), s, nil, nil, nil, nil); err == nil {
+		t.Fatal("held smith/worker live agent unexpectedly reached kick")
+	}
+	if len(reader.identities) == 0 || reader.identities[0].Owner != "worker" || reader.identities[0].Lane != "smith" {
+		t.Fatalf("settled kick did not check canonical smith/worker identity: %+v", reader.identities)
+	}
+}
+
+func TestUnknownLiveIdentityIsCriticalAndNotSettled(t *testing.T) {
+	registry, err := NewCanonicalLaneRegistry([]CanonicalLane{{Name: "smith", Role: "worker"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	e := &Engine{StandingRoster: &registry}
+	agents := struct {
+		Result struct {
+			Agents []json.RawMessage `json:"agents"`
+		} `json:"result"`
+	}{}
+	agents.Result.Agents = []json.RawMessage{json.RawMessage(`{"name":"legacy-worker","status":"idle"}`)}
+	s := e.computeSummary(agents, json.RawMessage(`{"tasks":[]}`), nil, nil)
+	e.computeRedCodes(s)
+	if len(s.Settled) != 0 || len(s.Critical) != 1 || s.Healthy {
+		t.Fatalf("unknown live identity was not fail-closed: %+v", s)
 	}
 }
 

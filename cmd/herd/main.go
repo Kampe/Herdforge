@@ -3161,6 +3161,8 @@ func runLifecycle() {
 		fmt.Fprintf(os.Stderr, "lifecycle lane registry: %v\n", registryErr)
 		os.Exit(1)
 	}
+	eng.StandingRoster = &roleRegistry
+	eng.Lanes = roleRegistry.LaneNames()
 	holdAuthority, holdErr := newProductionHoldAuthority()
 	if holdErr != nil {
 		fmt.Fprintf(os.Stderr, "lifecycle hold authority: %v\n", holdErr)
@@ -3208,6 +3210,9 @@ func runLifecycle() {
 			}
 			fmt.Printf("lifecycle act: %s — stale=%d in-progress=%d blocked=%d dispatchable=%d actions=%d\n",
 				healthy, len(summary.StaleCards), summary.InProgress, summary.Blocked, summary.Dispatchable, len(summary.Actions))
+			if !summary.Healthy {
+				os.Exit(7)
+			}
 		}
 		return
 	}
@@ -3226,6 +3231,9 @@ func runLifecycle() {
 			healthy, len(summary.StaleCards), summary.InProgress, summary.Blocked, summary.Dispatchable)
 		for _, sc := range summary.StaleCards {
 			fmt.Printf("  stale: %s owner=%s\n", sc.Ref, sc.Owner)
+		}
+		if !summary.Healthy {
+			os.Exit(7)
 		}
 	}
 }
