@@ -121,6 +121,12 @@ type Store interface {
 	CompareAndSwap(context.Context, string, []Ownership) (bool, error)
 }
 
+// AtomicReleaseStore removes an ownership and records its proof in one
+// durable transaction. Fence uses this stronger contract when available.
+type AtomicReleaseStore interface {
+	Release(context.Context, ReleaseRequest) error
+}
+
 // ReleaseProofStore durably records a successful fenced release. Implementations
 // must key the record by the exact ownership identity, generation, scope, and
 // graph binding so a stale release cannot overwrite a newer proof.
@@ -165,6 +171,12 @@ type TrustedGraph struct {
 // expected revision/file-count contract.
 type GraphAuthority interface {
 	Current(context.Context) (TrustedGraph, error)
+}
+
+// ScopeAuthority resolves task scope from a separately trusted, revision-bound
+// source. Acquire callers must not be treated as scope authority.
+type ScopeAuthority interface {
+	Resolve(context.Context, string, string, string) (Scope, error)
 }
 
 var tokenPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._/:-]{0,127}$`)
@@ -395,6 +407,9 @@ func (f Fence) Acquire(ctx context.Context, req AcquireRequest) (Decision, error
 	if err := graph.validate(trusted.ExpectedRevision, trusted.ExpectedFiles); err != nil {
 		return Decision{Evidence: Evidence{Repository: req.Repository, Task: req.Task, Branch: req.Branch, Generation: req.Generation, GraphRevision: graph.Revision, GraphFiles: graph.Files, Reason: ReasonGraphInvalid}}, nil
 	}
+	if req.ExpectedGraphRevision != "" && req.ExpectedGraphRevision != graph.Revision {
+		return Decision{Evidence: Evidence{Repository: req.Repository, Task: req.Task, Branch: req.Branch, Generation: req.Generation, GraphRevision: graph.Revision, GraphFiles: graph.Files, Reason: ReasonGraphInvalid}}, nil
+	}
 	req.GraphRevision, req.GraphFiles = graph.Revision, graph.Files
 	baseEvidence := Evidence{Repository: req.Repository, Task: req.Task, Branch: req.Branch, Generation: req.Generation, GraphRevision: graph.Revision, GraphFiles: graph.Files}
 	for attempts := 0; attempts < 4; attempts++ {
@@ -465,6 +480,9 @@ func (f Fence) Release(ctx context.Context, req ReleaseRequest) error {
 	}
 	if !f.Verify(ctx, req) {
 		return ErrBlocked
+	}
+	if atomicStore, ok := f.Store.(AtomicReleaseStore); ok {
+		return atomicStore.Release(ctx, req)
 	}
 	for attempts := 0; attempts < 4; attempts++ {
 		if err := ctx.Err(); err != nil {
