@@ -171,15 +171,30 @@ func TestTaskLaunchRequestCarriesExactReboundGeneration(t *testing.T) {
 	}
 }
 
-func TestStandingIdentityMismatchCreatesEphemeralTaskAgent(t *testing.T) {
-	if !shouldCreateEphemeralTaskAgent(herdr.ErrAgentIdentityMismatch) {
-		t.Fatal("standing identity mismatch must be treated as non-reusable")
+func TestEphemeralTaskAuthorizationAllowsOnlyNotFound(t *testing.T) {
+	if shouldCreateEphemeralTaskAgent(herdr.ErrAgentIdentityMismatch) {
+		t.Fatal("standing identity mismatch must fail closed")
 	}
 	if !shouldCreateEphemeralTaskAgent(herdr.ErrAgentNotFound) {
 		t.Fatal("missing standing agent must create ephemeral task agent")
 	}
 	if shouldCreateEphemeralTaskAgent(errors.New("herdr unavailable")) {
 		t.Fatal("unrelated standing failure must remain fail-closed")
+	}
+}
+
+func TestStandingIdentityMismatchCannotReachEphemeralSideEffects(t *testing.T) {
+	tabCreate, agentStart, prompt := 0, 0, 0
+	resolveErr := herdr.ErrAgentIdentityMismatch
+	if gateErr := authorizeEphemeralTaskAgent(resolveErr); gateErr == nil {
+		// This is the caller-level branch shared by pulse, review, and forge:
+		// all side effects are downstream of the authorization result.
+		tabCreate++
+		agentStart++
+		prompt++
+	}
+	if tabCreate != 0 || agentStart != 0 || prompt != 0 {
+		t.Fatalf("identity mismatch reached ephemeral side effects: tab=%d start=%d prompt=%d", tabCreate, agentStart, prompt)
 	}
 }
 

@@ -628,7 +628,7 @@ func runPulse() {
 
 		tabLabel, err := herdr.ResolveAgentTabWithDecision(standingName, taskLaunchRequest(decision, task.Ref, repository, lane.Name))
 		if err != nil {
-			if !shouldCreateEphemeralTaskAgent(err) {
+			if gateErr := authorizeEphemeralTaskAgent(err); gateErr != nil {
 				fmt.Fprintf(os.Stderr, "standing agent %s blocked: %v\n", standingName, err)
 				os.Exit(1)
 			}
@@ -1300,7 +1300,7 @@ func runReview() {
 
 		tabLabel, err := herdr.ResolveAgentTabWithDecision(standingName, taskLaunchRequest(decision, task.Ref, repositoryIdentityForLaunch(cfg), lane.Name))
 		if err != nil {
-			if !shouldCreateEphemeralTaskAgent(err) {
+			if gateErr := authorizeEphemeralTaskAgent(err); gateErr != nil {
 				fmt.Fprintf(os.Stderr, "standing reviewer %s blocked: %v\n", standingName, err)
 				os.Exit(1)
 			}
@@ -2517,7 +2517,7 @@ func runForgeE() error {
 				}
 				tabLabel, resolveErr := herdr.ResolveAgentTabWithDecision(standingName, taskLaunchRequest(decision, task.Ref, repositoryIdentityForLaunch(cfg), lane.Name))
 				if resolveErr != nil {
-					if !shouldCreateEphemeralTaskAgent(resolveErr) {
+					if gateErr := authorizeEphemeralTaskAgent(resolveErr); gateErr != nil {
 						return fmt.Errorf("standing forge agent %s blocked: %w", standingName, resolveErr)
 					}
 					tabLabel = fmt.Sprintf("forge-%s-%s", lane.Name, task.Ref)
@@ -2736,7 +2736,14 @@ func taskLaunchRequest(decision *router.LaunchDecision, taskRef, repository, lan
 }
 
 func shouldCreateEphemeralTaskAgent(err error) bool {
-	return errors.Is(err, herdr.ErrAgentNotFound) || errors.Is(err, herdr.ErrAgentIdentityMismatch)
+	return errors.Is(err, herdr.ErrAgentNotFound)
+}
+
+func authorizeEphemeralTaskAgent(err error) error {
+	if err == nil || shouldCreateEphemeralTaskAgent(err) {
+		return nil
+	}
+	return err
 }
 
 // launchAdmission is the compiled pre-side-effect gate shared by launch-capable
