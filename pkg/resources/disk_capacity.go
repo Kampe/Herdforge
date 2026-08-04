@@ -94,14 +94,17 @@ const (
 )
 
 const (
-	DiskReasonNone                 = "none"
-	DiskReasonBelowThreshold       = "below_threshold"
-	DiskReasonHysteresis           = "hysteresis"
-	DiskReasonInodeExhaustion      = "inode_exhaustion"
-	DiskReasonTempVolumeDivergence = "temp_volume_divergence"
-	DiskReasonUnavailable          = "unavailable"
-	DiskReasonInvalid              = "invalid"
-	DiskReasonInvalidPolicy        = "invalid_policy"
+	DiskReasonNone                  = "none"
+	DiskReasonBelowThreshold        = "below_threshold"
+	DiskReasonHysteresis            = "hysteresis"
+	DiskReasonInodeExhaustion       = "inode_exhaustion"
+	DiskReasonTempVolumeDivergence  = "temp_volume_divergence"
+	DiskReasonUnavailable           = "unavailable"
+	DiskReasonInvalid               = "invalid"
+	DiskReasonInvalidPolicy         = "invalid_policy"
+	DiskReasonAdditionalUnavailable = "additional_volume_unavailable"
+	DiskReasonAdditionalInvalid     = "additional_volume_invalid"
+	DiskReasonAdditionalBelow       = "additional_volume_below_threshold"
 )
 
 // DiskEvidence is bounded and safe to serialize or log. Paths are never
@@ -119,14 +122,15 @@ type DiskEvidence struct {
 	ReserveBytes       uint64  `json:"reserve_bytes"`
 	ReservePercent     float64 `json:"reserve_percent"`
 	ReserveInodes      uint64  `json:"reserve_inodes"`
-	TempFreeBytes      uint64  `json:"temp_free_bytes,omitempty"`
-	TempFreePercent    float64 `json:"temp_free_percent,omitempty"`
-	TempFreeInodes     uint64  `json:"temp_free_inodes,omitempty"`
+	RequiredInodes     uint64  `json:"required_inodes"`
+	TempFreeBytes      uint64  `json:"temp_free_bytes"`
+	TempFreePercent    float64 `json:"temp_free_percent"`
+	TempFreeInodes     uint64  `json:"temp_free_inodes"`
 	ScopeID            string  `json:"scope_id,omitempty"`
 	FailedFilesystemID string  `json:"failed_filesystem_id,omitempty"`
-	FailedFreeBytes    uint64  `json:"failed_free_bytes,omitempty"`
-	FailedFreePercent  float64 `json:"failed_free_percent,omitempty"`
-	FailedFreeInodes   uint64  `json:"failed_free_inodes,omitempty"`
+	FailedFreeBytes    uint64  `json:"failed_free_bytes"`
+	FailedFreePercent  float64 `json:"failed_free_percent"`
+	FailedFreeInodes   uint64  `json:"failed_free_inodes"`
 }
 
 type DiskDecision struct {
@@ -202,7 +206,7 @@ var diskOperationPattern = regexp.MustCompile(`^[a-zA-Z][a-zA-Z0-9_.-]{0,31}$`)
 // performs no claim, worktree, process, archive, delete, or cleanup action.
 func EvaluateDiskCapacity(backend StatFSBackend, request DiskRequest, policy DiskPolicy) DiskDecision {
 	t := policy.thresholds(request.PreviouslyBlocked)
-	e := DiskEvidence{Kind: "disk_pressure", Operation: boundedDiskOperation(request.Operation), ReserveBytes: t.bytes, ReservePercent: t.percent, ReserveInodes: t.inodes, RequiredBytes: request.RequiredBytes}
+	e := DiskEvidence{Kind: "disk_pressure", Operation: boundedDiskOperation(request.Operation), ReserveBytes: t.bytes, ReservePercent: t.percent, ReserveInodes: t.inodes, RequiredBytes: request.RequiredBytes, RequiredInodes: request.RequiredInodes}
 	if err := validDiskPolicy(policy); err != nil {
 		return diskBlocked(e, DiskReasonInvalidPolicy)
 	}
@@ -254,23 +258,23 @@ func EvaluateDiskCapacity(backend StatFSBackend, request DiskRequest, policy Dis
 		}
 		additional, err := backend.StatFS(path)
 		if err != nil {
-			e.Reason = "additional_volume_unavailable"
+			e.Reason = DiskReasonAdditionalUnavailable
 			return DiskDecision{State: DiskBlocked, Evidence: e}
 		}
 		if strings.TrimSpace(additional.FilesystemID) != "" {
 			e.FailedFilesystemID = safeDiskIdentity(additional.FilesystemID)
 		}
 		if validCapacity(additional) != nil {
-			e.Reason = "additional_volume_invalid"
+			e.Reason = DiskReasonAdditionalInvalid
 			return DiskDecision{State: DiskBlocked, Evidence: e}
 		}
 		e.FailedFreeBytes, e.FailedFreePercent, e.FailedFreeInodes = capacityMetrics(additional)
 		if strings.TrimSpace(additional.FilesystemID) == "" {
-			e.Reason = "additional_volume_unavailable"
+			e.Reason = DiskReasonAdditionalUnavailable
 			return DiskDecision{State: DiskBlocked, Evidence: e}
 		}
 		if !capacityMeets(additional, request.RequiredBytes, request.RequiredInodes, t) {
-			e.Reason = "additional_volume_below_threshold"
+			e.Reason = DiskReasonAdditionalBelow
 			return DiskDecision{State: DiskBlocked, Evidence: e}
 		}
 	}

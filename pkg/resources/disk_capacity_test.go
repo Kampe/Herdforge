@@ -1,6 +1,7 @@
 package resources
 
 import (
+	"encoding/json"
 	"errors"
 	"math"
 	"strings"
@@ -112,7 +113,7 @@ func TestEvaluateDiskCapacityAdditionalFailureCarriesExactOpaqueEvidence(t *test
 	additional := Capacity{FilesystemID: "target/secret", TotalBytes: 1000, FreeBytes: 50, TotalInodes: 100, FreeInodes: 7}
 	f := &diskFake{values: map[string]Capacity{"repo": diskHealthy("repo"), "target": additional}}
 	got := EvaluateDiskCapacity(f, DiskRequest{Path: "repo", AdditionalPaths: []string{"target"}, Operation: "worktree_create"}, diskPolicy())
-	if got.Allowed || got.Evidence.Reason != "additional_volume_below_threshold" {
+	if got.Allowed || got.Evidence.Reason != DiskReasonAdditionalBelow {
 		t.Fatalf("decision = %+v", got)
 	}
 	if got.Evidence.FilesystemID != "repo" || got.Evidence.FailedFilesystemID != safeDiskIdentity("target/secret") {
@@ -120,6 +121,68 @@ func TestEvaluateDiskCapacityAdditionalFailureCarriesExactOpaqueEvidence(t *test
 	}
 	if got.Evidence.FailedFreeBytes != 50 || got.Evidence.FailedFreePercent != 5 || got.Evidence.FailedFreeInodes != 7 {
 		t.Fatalf("failed volume metrics = %+v", got.Evidence)
+	}
+}
+
+func TestAdditionalVolumeReasonCodesAreStable(t *testing.T) {
+	root := diskHealthy("repo")
+	for _, tc := range []struct {
+		name   string
+		path   string
+		want   string
+		result Capacity
+		err    error
+	}{
+		{name: "unavailable", path: "missing", want: DiskReasonAdditionalUnavailable, err: errors.New("probe")},
+		{name: "invalid", path: "invalid", want: DiskReasonAdditionalInvalid, result: Capacity{FilesystemID: "invalid", TotalBytes: 0, TotalInodes: 100}},
+		{name: "below", path: "low", want: DiskReasonAdditionalBelow, result: Capacity{FilesystemID: "low", TotalBytes: 1000, FreeBytes: 0, TotalInodes: 100, FreeInodes: 0}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			backend := StatFSFunc(func(path string) (Capacity, error) {
+				if path == "repo" {
+					return root, nil
+				}
+				return tc.result, tc.err
+			})
+			got := EvaluateDiskCapacity(backend, DiskRequest{Path: "repo", AdditionalPaths: []string{tc.path}}, diskPolicy())
+			if got.Evidence.Reason != tc.want {
+				t.Fatalf("reason = %q, want %q", got.Evidence.Reason, tc.want)
+			}
+		})
+	}
+}
+
+func TestAdditionalVolumeEvidenceJSONPreservesZeroObservations(t *testing.T) {
+	backend := &diskFake{values: map[string]Capacity{
+		"repo":   diskHealthy("repo"),
+		"target": {FilesystemID: "target/secret", TotalBytes: 1000, FreeBytes: 0, TotalInodes: 100, FreeInodes: 0},
+	}}
+	request := DiskRequest{Path: "repo", AdditionalPaths: []string{"target"}, RequiredBytes: 7, RequiredInodes: 3, Operation: "worktree_create"}
+	policy := diskPolicy()
+	got := EvaluateDiskCapacity(backend, request, policy)
+	if got.Allowed || got.Evidence.Reason != DiskReasonAdditionalBelow {
+		t.Fatalf("decision = %+v", got)
+	}
+	data, err := json.Marshal(got.Evidence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded := string(data)
+	if strings.Contains(encoded, "target/secret") || strings.Contains(encoded, "target") {
+		t.Fatalf("evidence leaked a path: %s", encoded)
+	}
+	var decoded DiskEvidence
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if decoded.FailedFilesystemID != safeDiskIdentity("target/secret") || decoded.Reason != DiskReasonAdditionalBelow {
+		t.Fatalf("decoded identity/reason = %+v", decoded)
+	}
+	if decoded.RequiredBytes != 7 || decoded.RequiredInodes != 3 || decoded.ReserveBytes != policy.ReserveBytes || decoded.ReserveInodes != policy.ReserveInodes {
+		t.Fatalf("decoded requirements/thresholds = %+v", decoded)
+	}
+	if decoded.FailedFreeBytes != 0 || decoded.FailedFreePercent != 0 || decoded.FailedFreeInodes != 0 {
+		t.Fatalf("zero observations were not preserved: %+v JSON=%s", decoded, encoded)
 	}
 }
 
