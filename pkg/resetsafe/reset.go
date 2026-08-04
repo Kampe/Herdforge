@@ -181,10 +181,13 @@ func (p *WorktreePlan) Run(ctx context.Context) (*WorktreePlan, error) {
 			fmt.Fprintf(p.opts.stdout(), "herd-reset-safe: pushed %s. Recover with: git cherry-pick <sha>  OR  git merge %s\n", a.preserveBranch, a.preserveBranch)
 		}
 	}
+	if err := revalidate(ctx, a); err != nil {
+		return nil, err
+	}
 	if err := gitRunFn(ctx, a.worktree, "reset", "--hard", "origin/main"); err != nil {
 		return nil, fmt.Errorf("herd-reset-safe: reset failed: %w", err)
 	}
-	resetSHA, err := gitOutput(ctx, p.Worktree, "rev-parse", "--short", "HEAD")
+	resetSHA, err := gitOutput(ctx, a.worktree, "rev-parse", "--short", "HEAD")
 	if err != nil {
 		return nil, fmt.Errorf("herd-reset-safe: reset completed but could not read HEAD: %w", err)
 	}
