@@ -74,7 +74,7 @@ func execWithRetry(ctx context.Context, db *sql.DB, query string, args ...any) (
 
 // queryWithRetry is execWithRetry's counterpart for statements that
 // return rows (in particular UPDATE...RETURNING, used by
-// ClaimCapacityRelease so the atomic claim and reading back exactly what
+// ClaimCapacityReleaseExact so the atomic claim and reading back exactly what
 // was claimed happen in one statement instead of a claim-then-SELECT
 // pair that would reopen a race window).
 func queryWithRetry(ctx context.Context, db *sql.DB, query string, args ...any) (*sql.Rows, error) {
@@ -116,7 +116,8 @@ func (s *SQLiteLeaseStore) migrate() error {
 			capacity_release_owner TEXT NOT NULL DEFAULT '',
 			capacity_release_claimed_at DATETIME,
 			provider_lock_owner TEXT NOT NULL DEFAULT '',
-			provider_lock_at DATETIME
+			provider_lock_at DATETIME,
+			provider_lock_kind TEXT NOT NULL DEFAULT ''
 		)`,
 		`CREATE UNIQUE INDEX IF NOT EXISTS idx_leases_active_key
 			ON leases(repo, provider, project, task_ref)
@@ -135,7 +136,84 @@ func (s *SQLiteLeaseStore) migrate() error {
 	if err := ensureHoldIdentityColumns(s.db); err != nil {
 		return fmt.Errorf("validate hold identity schema: %w", err)
 	}
+	if err := ensureProviderLockKind(s.db); err != nil {
+		return err
+	}
 	return nil
+}
+
+func ensureProviderLockKind(db *sql.DB) error {
+	rows, err := db.Query(`PRAGMA table_info(leases)`)
+	if err != nil {
+		return err
+	}
+	found := false
+	var foundType string
+	var foundNotNull int
+	var foundDefault sql.NullString
+	for rows.Next() {
+		var cid, nn, pk int
+		var name, typ string
+		var def sql.NullString
+		if err := rows.Scan(&cid, &name, &typ, &nn, &def, &pk); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		if name == "provider_lock_kind" {
+			found, foundType, foundNotNull, foundDefault = true, typ, nn, def
+		}
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if !found {
+		if _, err = db.Exec(`ALTER TABLE leases ADD COLUMN provider_lock_kind TEXT NOT NULL DEFAULT ''`); err != nil {
+			return fmt.Errorf("add provider_lock_kind: %w", err)
+		}
+		return ensureProviderLockKind(db)
+	}
+	if !strings.EqualFold(strings.TrimSpace(foundType), "TEXT") || foundNotNull != 1 || !foundDefault.Valid || strings.Trim(strings.TrimSpace(foundDefault.String), "'\"") != "" {
+		return fmt.Errorf("incompatible provider_lock_kind schema")
+	}
+	var bad string
+	if err := db.QueryRow(`SELECT provider_lock_kind FROM leases WHERE provider_lock_kind IS NULL OR provider_lock_kind NOT IN ('','recovery') LIMIT 1`).Scan(&bad); err != nil && err != sql.ErrNoRows {
+		return err
+	} else if err == nil {
+		return fmt.Errorf("unknown provider lock state %q", bad)
+	}
+	return nil
+}
+
+func validateProviderLockRows(ctx context.Context, db *sql.DB) error {
+	rows, err := db.QueryContext(ctx, `SELECT id,generation,provider_lock_kind,provider_lock_owner,provider_lock_at FROM leases`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id, generation int64
+		var kind, owner string
+		var at sql.NullTime
+		if err := rows.Scan(&id, &generation, &kind, &owner, &at); err != nil {
+			return err
+		}
+		switch kind {
+		case providerLockKindOrdinary:
+			if isReservedRecoveryOwner(owner) || (owner == "") != (!at.Valid) {
+				return fmt.Errorf("incoherent ordinary provider lock row")
+			}
+		case providerLockKindRecovery:
+			if !isRecoveryOwnerFor(owner, id, generation) || !at.Valid {
+				return fmt.Errorf("incoherent recovery provider lock row")
+			}
+		default:
+			return fmt.Errorf("unknown provider lock state %q", kind)
+		}
+	}
+	return rows.Err()
 }
 
 func ensureHoldIdentityColumns(db *sql.DB) error {
@@ -196,20 +274,22 @@ func leaseIdentityColumns(db *sql.DB) (map[string]leaseIdentityColumn, error) {
 }
 
 const leaseColumns = `id, repo, provider, project, task_ref, owner_id, role, hold_repository, hold_owner, hold_lane, worktree_path,
-	generation, status, held, claimed_at, renewed_at, expires_at, released_at, capacity_released_at`
+	generation, status, held, claimed_at, renewed_at, expires_at, released_at, capacity_released_at, capacity_release_state`
 
 func scanLease(row interface{ Scan(...any) error }) (*Lease, error) {
 	l := &Lease{}
 	var status string
 	var held int
 	var releasedAt, capacityReleasedAt sql.NullTime
+	var capacityReleaseState string
 	err := row.Scan(&l.ID, &l.Repo, &l.Provider, &l.Project, &l.TaskRef, &l.OwnerID, &l.Role, &l.HoldRepository, &l.HoldOwner, &l.HoldLane,
 		&l.WorktreePath, &l.Generation, &status, &held, &l.ClaimedAt, &l.RenewedAt, &l.ExpiresAt,
-		&releasedAt, &capacityReleasedAt)
+		&releasedAt, &capacityReleasedAt, &capacityReleaseState)
 	if err != nil {
 		return nil, err
 	}
 	l.Status = LeaseStatus(status)
+	l.CapacityReleaseState = capacityReleaseState
 	l.Held = held != 0
 	if releasedAt.Valid {
 		t := releasedAt.Time
@@ -248,27 +328,21 @@ func isUniqueViolation(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "UNIQUE constraint")
 }
 
-// providerLockStaleAfter bounds how long Release and Acquire's reclaim
-// path honor a provider-transition lock (see AcquireProviderLock) before
-// treating it as abandoned (its holder crashed) and proceeding anyway.
-// Not configurable via the LeaseStore interface -- Release/Acquire's
-// signatures are unchanged and heavily depended on elsewhere -- but kept
-// generous enough that a normal (fast) provider call never trips it, and
-// short enough that a crash doesn't block a lease indefinitely.
-// ClaimManager's own WithProviderLockTimeout (which controls how long
-// AcquireProviderLock itself honors a *different* stale lock before
-// preempting it) defaults to the same value for consistency.
+// providerLockStaleAfter is the fixed lifecycle-recovery observation
+// threshold. Ordinary Acquire and Release never preempt a provider lock
+// by time, and the compatibility staleAfter argument is not a safety
+// setting.
 const providerLockStaleAfter = 5 * time.Minute
 
 // expireStaleTestHook, when non-nil, runs once per candidate row right
-// before ExpireStale's per-row UPDATE, letting a test deterministically
+// before recovery's per-row CAS, letting a test deterministically
 // land a concurrent Hold/Renew inside the SELECT-to-UPDATE window instead
 // of relying on goroutine timing. Always nil outside tests.
 var expireStaleTestHook func(candidate *Lease)
 
 // Acquire implements LeaseStore. It first expires any stale active row for
 // key (a no-op if the row is still live) — which is also what makes that
-// row's capacity token show up as claimable via ClaimCapacityRelease,
+// row's capacity token show up as claimable via ClaimCapacityReleaseExact,
 // since it now has status Expired and a still-nil CapacityReleasedAt —
 // then attempts to insert a new active row. The partial unique index on
 // (repo,provider,project,task_ref) WHERE status='active' is the only
@@ -285,19 +359,13 @@ func (s *SQLiteLeaseStore) AcquireWithIdentity(ctx context.Context, key LeaseKey
 
 func (s *SQLiteLeaseStore) acquire(ctx context.Context, key LeaseKey, ownerID, role, worktreePath, holdRepository, holdOwner, holdLane string, now time.Time, ttl time.Duration) (*Lease, error) {
 	// Deliberately NOT a staleness carve-out on provider_lock_owner here
-	// (see ForceReleaseProviderLock's doc comment): whether it's safe to
-	// preempt a stale provider lock by time alone depends on whether a
-	// ProviderCAS/fencing scheme is even in play, which only
-	// ClaimManager knows. The store unconditionally refuses to evict a
-	// locked row; ClaimManager.Claim durably advances the provider fence
-	// (or, with no provider configured, force-clears the lock directly --
-	// safe, since there's nothing external to protect) BEFORE calling
-	// Acquire, so by the time this runs, a preemptable lock has already
-	// been cleared and this condition just sees provider_lock_owner = ''.
+	// The store unconditionally refuses to evict a locked row. Lifecycle
+	// recovery must durably claim and fence stale locks before Acquire runs,
+	// so this path only sees an empty provider-lock state.
 	if _, err := execWithRetry(ctx, s.db, `UPDATE leases SET status = 'expired'
 		WHERE repo = ? AND provider = ? AND project = ? AND task_ref = ?
 		AND status = 'active' AND held = 0 AND expires_at <= ?
-		AND provider_lock_owner = ''`,
+		AND provider_lock_owner = '' AND provider_lock_kind = ''`,
 		key.Repo, key.Provider, key.Project, key.TaskRef, now); err != nil {
 		return nil, fmt.Errorf("acquire: expire stale: %w", err)
 	}
@@ -308,11 +376,13 @@ func (s *SQLiteLeaseStore) acquire(ctx context.Context, key LeaseKey, ownerID, r
 	}
 	gen++
 
-	claimedAt, expiresAt := now, now.Add(ttl)
+	claimedAt := normalizeProviderLockTime(now)
+	expiresAt := now.Add(ttl)
+	claimedAtText := providerLockTimeText(claimedAt)
 	res, err := execWithRetry(ctx, s.db, `INSERT INTO leases
 		(repo, provider, project, task_ref, owner_id, role, hold_repository, hold_owner, hold_lane, worktree_path, generation, status, held, claimed_at, renewed_at, expires_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', 0, ?, ?, ?)`,
-		key.Repo, key.Provider, key.Project, key.TaskRef, ownerID, role, holdRepository, holdOwner, holdLane, worktreePath, gen, claimedAt, claimedAt, expiresAt)
+		key.Repo, key.Provider, key.Project, key.TaskRef, ownerID, role, holdRepository, holdOwner, holdLane, worktreePath, gen, claimedAtText, claimedAtText, expiresAt)
 	if err != nil {
 		if isUniqueViolation(err) {
 			existing, lookupErr := s.currentActive(ctx, key)
@@ -385,15 +455,14 @@ func (s *SQLiteLeaseStore) renewFailureError(ctx context.Context, key LeaseKey, 
 
 // Release implements LeaseStore. transitioned=true only for the call that
 // actually flips the row from active to released; capacity settlement is
-// driven separately by the ClaimCapacityRelease/AckCapacityRelease
+// driven separately by the ClaimCapacityReleaseExact/AckCapacityRelease
 // claim/ack protocol (see
 // ClaimManager.settlePendingCapacity), not by this boolean, so a retry
 // after a capacity-coordinator failure still finds the row pending.
 func (s *SQLiteLeaseStore) Release(ctx context.Context, key LeaseKey, ownerID string, generation int64, now time.Time) (*Lease, bool, error) {
-	// See Acquire's comment: no staleness carve-out here either. Release
-	// is unconditionally blocked while ANY provider lock is held, live or
-	// stale; ClaimManager.Release durably preempts a stale one (fence
-	// advance, then ForceReleaseProviderLock) before calling this.
+	// Release is blocked while ANY provider lock is held, live or stale;
+	// ClaimManager.Release durably recovers a stale one (claim, fence
+	// advance, then exact finalize) before calling this.
 	res, err := execWithRetry(ctx, s.db, `UPDATE leases SET status = 'released', released_at = ?
 		WHERE repo = ? AND provider = ? AND project = ? AND task_ref = ?
 		AND owner_id = ? AND generation = ? AND status = 'active'
@@ -434,13 +503,22 @@ func (s *SQLiteLeaseStore) Release(ctx context.Context, key LeaseKey, ownerID st
 // Release/reclaim to land in -- unlike a plain read-only check followed
 // by a separate write.
 func (s *SQLiteLeaseStore) AcquireProviderLock(ctx context.Context, key LeaseKey, ownerID string, generation int64, lockOwner string, staleAfter time.Duration, now time.Time) (*Lease, error) {
-	staleBefore := now.Add(-staleAfter)
-	rows, err := queryWithRetry(ctx, s.db, `UPDATE leases SET provider_lock_owner = ?, provider_lock_at = ?
+	now = normalizeProviderLockTime(now)
+	if err := validateAttributableID(lockOwner, "provider lock owner"); err != nil {
+		return nil, err
+	}
+	if isReservedRecoveryOwner(lockOwner) {
+		return nil, fmt.Errorf("reserved recovery lock owner")
+	}
+	if err := validateProviderLockRows(ctx, s.db); err != nil {
+		return nil, err
+	}
+	rows, err := queryWithRetry(ctx, s.db, `UPDATE leases SET provider_lock_owner = ?, provider_lock_at = ?, provider_lock_kind = ''
 		WHERE repo = ? AND provider = ? AND project = ? AND task_ref = ?
 		AND owner_id = ? AND generation = ? AND status = 'active'
-		AND (provider_lock_owner = '' OR provider_lock_owner = ? OR provider_lock_at < ?)
+		AND provider_lock_kind = '' AND provider_lock_owner = ''
 		RETURNING `+leaseColumns,
-		lockOwner, now, key.Repo, key.Provider, key.Project, key.TaskRef, ownerID, generation, lockOwner, staleBefore)
+		lockOwner, providerLockTimeText(now), key.Repo, key.Provider, key.Project, key.TaskRef, ownerID, generation)
 	if err != nil {
 		return nil, fmt.Errorf("acquire provider lock: %w", err)
 	}
@@ -467,21 +545,32 @@ func (s *SQLiteLeaseStore) AcquireProviderLock(ctx context.Context, key LeaseKey
 
 // ReleaseProviderLock implements LeaseStore.
 func (s *SQLiteLeaseStore) ReleaseProviderLock(ctx context.Context, key LeaseKey, generation int64, lockOwner string) error {
-	_, err := execWithRetry(ctx, s.db, `UPDATE leases SET provider_lock_owner = '', provider_lock_at = NULL
-		WHERE repo = ? AND provider = ? AND project = ? AND task_ref = ? AND generation = ? AND provider_lock_owner = ?`,
+	if err := validateProviderLockRows(ctx, s.db); err != nil {
+		return err
+	}
+	res, err := execWithRetry(ctx, s.db, `UPDATE leases SET provider_lock_owner = '', provider_lock_at = NULL
+		WHERE repo = ? AND provider = ? AND project = ? AND task_ref = ? AND generation = ? AND provider_lock_kind = '' AND provider_lock_owner = ?`,
 		key.Repo, key.Provider, key.Project, key.TaskRef, generation, lockOwner)
 	if err != nil {
 		return fmt.Errorf("release provider lock: %w", err)
+	}
+	if n, e := res.RowsAffected(); e != nil {
+		return e
+	} else if n != 1 {
+		return fmt.Errorf("%w: release blocked or stale", ErrProviderLockStale)
 	}
 	return nil
 }
 
 // PeekStaleProviderLock implements LeaseStore.
 func (s *SQLiteLeaseStore) PeekStaleProviderLock(ctx context.Context, key LeaseKey, now time.Time) (*Lease, error) {
+	if err := validateProviderLockRows(ctx, s.db); err != nil {
+		return nil, err
+	}
 	staleBefore := now.Add(-providerLockStaleAfter)
 	row := s.db.QueryRowContext(ctx, `SELECT `+leaseColumns+` FROM leases
 		WHERE repo = ? AND provider = ? AND project = ? AND task_ref = ?
-		AND status = 'active' AND provider_lock_owner != '' AND provider_lock_at <= ?`,
+		AND status = 'active' AND provider_lock_kind = '' AND provider_lock_owner != '' AND provider_lock_at <= ?`,
 		key.Repo, key.Provider, key.Project, key.TaskRef, staleBefore)
 	l, err := scanLease(row)
 	if err == sql.ErrNoRows {
@@ -490,15 +579,15 @@ func (s *SQLiteLeaseStore) PeekStaleProviderLock(ctx context.Context, key LeaseK
 	return l, err
 }
 
-// PeekAllStaleProviderLocks implements LeaseStore: the ExpireStale-scale
-// (all keys) counterpart to PeekStaleProviderLock, for
-// ClaimManager.ExpireStale's global sweep to durably preempt every
-// stale-locked lease before delegating to the store's own (now
-// lock-oblivious-to-staleness) ExpireStale.
+// PeekAllStaleProviderLocks is the all-keys read counterpart used by
+// ClaimManager's per-lease recovery sweep.
 func (s *SQLiteLeaseStore) PeekAllStaleProviderLocks(ctx context.Context, now time.Time) ([]*Lease, error) {
+	if err := validateProviderLockRows(ctx, s.db); err != nil {
+		return nil, err
+	}
 	staleBefore := now.Add(-providerLockStaleAfter)
 	rows, err := s.db.QueryContext(ctx, `SELECT `+leaseColumns+` FROM leases
-		WHERE status = 'active' AND provider_lock_owner != '' AND provider_lock_at <= ?
+		WHERE status = 'active' AND provider_lock_kind = '' AND provider_lock_owner != '' AND provider_lock_at <= ?
 		ORDER BY id ASC`, staleBefore)
 	if err != nil {
 		return nil, fmt.Errorf("peek all stale provider locks: %w", err)
@@ -516,20 +605,9 @@ func (s *SQLiteLeaseStore) PeekAllStaleProviderLocks(ctx context.Context, now ti
 	return leases, rows.Err()
 }
 
-// ForceReleaseProviderLock implements LeaseStore: unlike
-// ReleaseProviderLock, this clears the lock unconditionally, without
-// requiring the caller to be the current lock owner. Reserved for
-// ClaimManager's orchestration layer, and only ever called immediately
-// after a durably-confirmed provider fence advance for the lease's next
-// generation -- never as a substitute for that confirmation.
-func (s *SQLiteLeaseStore) ForceReleaseProviderLock(ctx context.Context, key LeaseKey, generation int64) error {
-	_, err := execWithRetry(ctx, s.db, `UPDATE leases SET provider_lock_owner = '', provider_lock_at = NULL
-		WHERE repo = ? AND provider = ? AND project = ? AND task_ref = ? AND generation = ?`,
-		key.Repo, key.Provider, key.Project, key.TaskRef, generation)
-	if err != nil {
-		return fmt.Errorf("force release provider lock: %w", err)
-	}
-	return nil
+// ForceReleaseProviderLock is retained only as a typed refusal for legacy callers.
+func (s *SQLiteLeaseStore) ForceReleaseProviderLock(_ context.Context, _ LeaseKey, _ int64) error {
+	return fmt.Errorf("claim: unfenced provider-lock force release is disabled; use lifecycle recovery")
 }
 
 func (s *SQLiteLeaseStore) byGeneration(ctx context.Context, key LeaseKey, ownerID string, generation int64) (*Lease, error) {
@@ -542,6 +620,19 @@ func (s *SQLiteLeaseStore) byGeneration(ctx context.Context, key LeaseKey, owner
 		return nil, nil
 	}
 	return l, err
+}
+
+func (s *SQLiteLeaseStore) CurrentLease(ctx context.Context, key LeaseKey) (*Lease, error) {
+	row := s.db.QueryRowContext(ctx, `SELECT `+leaseColumns+` FROM leases WHERE repo=? AND provider=? AND project=? AND task_ref=? ORDER BY id DESC LIMIT 1`, key.Repo, key.Provider, key.Project, key.TaskRef)
+	l, err := scanLease(row)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	return l, err
+}
+
+func (s *SQLiteLeaseStore) LeaseByGeneration(ctx context.Context, key LeaseKey, ownerID string, generation int64) (*Lease, error) {
+	return s.byGeneration(ctx, key, ownerID, generation)
 }
 
 // fencingError distinguishes "a newer generation now owns this key"
@@ -562,21 +653,7 @@ func (s *SQLiteLeaseStore) fencingError(ctx context.Context, key LeaseKey, owner
 // stale generation (or no lease at all) is rejected rather than being
 // able to hold/unhold a lease it does not currently own.
 func (s *SQLiteLeaseStore) Hold(ctx context.Context, key LeaseKey, ownerID string, generation int64, held bool, now time.Time) (*Lease, error) {
-	h := 0
-	if held {
-		h = 1
-	}
-	res, err := execWithRetry(ctx, s.db, `UPDATE leases SET held = ?, renewed_at = ?
-		WHERE repo = ? AND provider = ? AND project = ? AND task_ref = ?
-		AND owner_id = ? AND generation = ? AND status = 'active'`,
-		h, now, key.Repo, key.Provider, key.Project, key.TaskRef, ownerID, generation)
-	if err != nil {
-		return nil, fmt.Errorf("hold: %w", err)
-	}
-	if n, _ := res.RowsAffected(); n != 1 {
-		return nil, s.fencingError(ctx, key, ownerID, generation)
-	}
-	return s.currentActive(ctx, key)
+	return nil, ErrLegacyLeaseHoldDisabled
 }
 
 func (s *SQLiteLeaseStore) SnapshotExpiredLeases(ctx context.Context, now time.Time) ([]*Lease, error) {
@@ -597,7 +674,10 @@ func (s *SQLiteLeaseStore) SnapshotExpiredLeases(ctx context.Context, now time.T
 }
 
 func (s *SQLiteLeaseStore) ExpireLeaseCAS(ctx context.Context, id, generation int64, now time.Time) (*Lease, bool, error) {
-	res, err := execWithRetry(ctx, s.db, `UPDATE leases SET status='expired', released_at=? WHERE id=? AND generation=? AND status='active' AND held=0 AND expires_at <= ? AND provider_lock_owner=''`, now, id, generation, now)
+	if err := validateProviderLockRows(ctx, s.db); err != nil {
+		return nil, false, err
+	}
+	res, err := execWithRetry(ctx, s.db, `UPDATE leases SET status='expired', released_at=? WHERE id=? AND generation=? AND status='active' AND held=0 AND expires_at <= ? AND provider_lock_kind='' AND provider_lock_owner=''`, now, id, generation, now)
 	if err != nil {
 		return nil, false, fmt.Errorf("expire lease %d: %w", id, err)
 	}
@@ -617,19 +697,62 @@ func (s *SQLiteLeaseStore) ExpireLeaseCAS(ctx context.Context, id, generation in
 }
 
 func (s *SQLiteLeaseStore) ObserveStaleProviderLock(ctx context.Context, key LeaseKey, now time.Time) (*ProviderLockObservation, error) {
+	if err := validateProviderLockRows(ctx, s.db); err != nil {
+		return nil, err
+	}
 	var o ProviderLockObservation
-	if err := s.db.QueryRowContext(ctx, `SELECT id,generation,provider_lock_owner,provider_lock_at FROM leases WHERE repo=? AND provider=? AND project=? AND task_ref=? AND status='active' AND provider_lock_owner<>'' AND provider_lock_at IS NOT NULL AND provider_lock_at < ?`, key.Repo, key.Provider, key.Project, key.TaskRef, now.Add(-5*time.Minute)).Scan(&o.LeaseID, &o.Generation, &o.Owner, &o.LockedAt); err == sql.ErrNoRows {
+	var kind string
+	if err := s.db.QueryRowContext(ctx, `SELECT id,generation,provider_lock_owner,provider_lock_at,provider_lock_kind FROM leases WHERE repo=? AND provider=? AND project=? AND task_ref=? AND status='active' AND ((provider_lock_kind='' AND provider_lock_owner<>'') OR provider_lock_kind='recovery')`, key.Repo, key.Provider, key.Project, key.TaskRef).Scan(&o.LeaseID, &o.Generation, &o.Owner, &o.LockedAt, &kind); err == sql.ErrNoRows {
 		return nil, nil
 	} else if err != nil {
 		return nil, err
 	}
 	o.ObservedAt = now
-	o.RecoveryOwner = fmt.Sprintf("fac69-recovery-%d-%d", o.LeaseID, o.Generation)
+	if kind == providerLockKindOrdinary && !o.LockedAt.Before(now.Add(-5*time.Minute)) {
+		return nil, nil
+	}
+	o.RecoveryOwner = recoveryOwnerFor(o.LeaseID, o.Generation)
+	if kind == providerLockKindRecovery {
+		o.Recovery = true
+		if !isRecoveryOwnerFor(o.Owner, o.LeaseID, o.Generation) {
+			return nil, fmt.Errorf("incoherent recovery provider lock owner")
+		}
+		o.RecoveryOwner = o.Owner
+	}
 	return &o, nil
 }
 
 func (s *SQLiteLeaseStore) ClaimProviderLockCAS(ctx context.Context, o ProviderLockObservation) (bool, error) {
-	res, err := execWithRetry(ctx, s.db, `UPDATE leases SET provider_lock_owner=? WHERE id=? AND generation=? AND status='active' AND provider_lock_owner=? AND provider_lock_at=? AND provider_lock_at < ?`, o.RecoveryOwner, o.LeaseID, o.Generation, o.Owner, o.LockedAt, o.ObservedAt.Add(-5*time.Minute))
+	o.LockedAt = normalizeProviderLockTime(o.LockedAt)
+	o.ObservedAt = normalizeProviderLockTime(o.ObservedAt)
+	if err := validateProviderLockRows(ctx, s.db); err != nil {
+		return false, err
+	}
+	if !isRecoveryOwnerFor(o.RecoveryOwner, o.LeaseID, o.Generation) {
+		return false, fmt.Errorf("invalid recovery provider lock owner")
+	}
+	var query string
+	var args []any
+	if o.Recovery {
+		if o.Owner != o.RecoveryOwner || !isRecoveryOwnerFor(o.Owner, o.LeaseID, o.Generation) {
+			return false, fmt.Errorf("invalid recovery provider lock identity")
+		}
+		var actual time.Time
+		err := s.db.QueryRowContext(ctx, `SELECT provider_lock_at FROM leases WHERE id=? AND generation=? AND status='active' AND provider_lock_kind='recovery' AND provider_lock_owner=?`, o.LeaseID, o.Generation, o.RecoveryOwner).Scan(&actual)
+		if err != nil || !actual.Equal(o.LockedAt) {
+			return false, err
+		}
+		return true, nil
+	} else {
+		var actual time.Time
+		err := s.db.QueryRowContext(ctx, `SELECT provider_lock_at FROM leases WHERE id=? AND generation=? AND status='active' AND provider_lock_kind='' AND provider_lock_owner=? AND provider_lock_at=?`, o.LeaseID, o.Generation, o.Owner, providerLockTimeText(o.LockedAt)).Scan(&actual)
+		if err != nil || !actual.Before(o.ObservedAt.Add(-5*time.Minute)) {
+			return false, err
+		}
+		query = `UPDATE leases SET provider_lock_owner=?, provider_lock_at=?, provider_lock_kind='recovery' WHERE id=? AND generation=? AND status='active' AND provider_lock_kind='' AND provider_lock_owner=? AND provider_lock_at=? AND julianday(provider_lock_at) < julianday(?)`
+		args = []any{o.RecoveryOwner, providerLockTimeText(o.ObservedAt), o.LeaseID, o.Generation, o.Owner, providerLockTimeText(o.LockedAt), providerLockTimeText(o.ObservedAt.Add(-5 * time.Minute))}
+	}
+	res, err := execWithRetry(ctx, s.db, query, args...)
 	if err != nil {
 		return false, err
 	}
@@ -641,7 +764,14 @@ func (s *SQLiteLeaseStore) ClaimProviderLockCAS(ctx context.Context, o ProviderL
 }
 
 func (s *SQLiteLeaseStore) FinalizeProviderLockCAS(ctx context.Context, o ProviderLockObservation) (bool, error) {
-	res, err := execWithRetry(ctx, s.db, `UPDATE leases SET provider_lock_owner='', provider_lock_at=NULL WHERE id=? AND generation=? AND status='active' AND provider_lock_owner=?`, o.LeaseID, o.Generation, o.RecoveryOwner)
+	o.LockedAt = normalizeProviderLockTime(o.LockedAt)
+	if err := validateProviderLockRows(ctx, s.db); err != nil {
+		return false, err
+	}
+	if !isRecoveryOwnerFor(o.RecoveryOwner, o.LeaseID, o.Generation) {
+		return false, fmt.Errorf("invalid recovery provider lock owner")
+	}
+	res, err := execWithRetry(ctx, s.db, `UPDATE leases SET provider_lock_owner='', provider_lock_at=NULL, provider_lock_kind='' WHERE id=? AND generation=? AND status='active' AND provider_lock_kind='recovery' AND provider_lock_owner=? AND provider_lock_at=?`, o.LeaseID, o.Generation, o.RecoveryOwner, providerLockTimeText(o.LockedAt))
 	if err != nil {
 		return false, err
 	}
@@ -652,68 +782,10 @@ func (s *SQLiteLeaseStore) FinalizeProviderLockCAS(ctx context.Context, o Provid
 	return n == 1, nil
 }
 
-// ExpireStale transitions active-but-expired, unheld leases to Expired one
-// row at a time. The per-row UPDATE re-checks held/expiry in its own
-// predicate (not just relying on the earlier candidate SELECT), so a
-// Renew or Hold that lands between candidate selection and the row
-// transition wins the race: the UPDATE simply matches zero rows for that
-// id instead of expiring a lease that was, in the same instant, renewed
-// or held. Guarded by `WHERE status = 'active'` too, so a lease already
-// flipped by a concurrent ExpireStale (in this or another process) is
-// skipped rather than double-counted. Also respects an active,
-// non-stale provider-transition lock (see AcquireProviderLock) exactly
-// like Release and Acquire's reclaim path do: a lease genuinely past its
-// TTL but mid an in-flight ProviderCAS call must not be expired (and
-// thus become reclaimable at a new generation) out from under that call
-// -- expiring a locked lease would let a concurrent Acquire hand the key
-// to a new owner while the old CompleteProviderTransition is still
-// running, which is exactly as unsafe as Release racing it. A stale
-// (crashed settler) lock is not honored, so this self-heals the same
-// way Release/Acquire's reclaim path does.
-// ExpireStale never preempts a provider lock by time alone -- see
-// Acquire's comment. ClaimManager.ExpireStale durably preempts every
-// stale-locked lease (fence advance, then ForceReleaseProviderLock)
-// before calling this, so a row this method ever sees with
-// provider_lock_owner != ” is genuinely still protected and correctly
-// left alone.
-func (s *SQLiteLeaseStore) ExpireStale(ctx context.Context, now time.Time) ([]*Lease, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT `+leaseColumns+` FROM leases
-		WHERE status = 'active' AND held = 0 AND expires_at <= ?
-		AND provider_lock_owner = ''`, now)
-	if err != nil {
-		return nil, fmt.Errorf("expire stale: candidates: %w", err)
-	}
-	var candidates []*Lease
-	for rows.Next() {
-		l, err := scanLease(rows)
-		if err != nil {
-			rows.Close()
-			return nil, fmt.Errorf("expire stale: scan: %w", err)
-		}
-		candidates = append(candidates, l)
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-
-	var transitioned []*Lease
-	for _, l := range candidates {
-		if expireStaleTestHook != nil {
-			expireStaleTestHook(l)
-		}
-		res, err := execWithRetry(ctx, s.db, `UPDATE leases SET status = 'expired'
-			WHERE id = ? AND status = 'active' AND held = 0 AND expires_at <= ?
-			AND provider_lock_owner = ''`, l.ID, now)
-		if err != nil {
-			return nil, fmt.Errorf("expire stale: transition %d: %w", l.ID, err)
-		}
-		if n, _ := res.RowsAffected(); n == 1 {
-			l.Status = StatusExpired
-			transitioned = append(transitioned, l)
-		}
-	}
-	return transitioned, nil
+// ExpireStale is retained only as a typed refusal for legacy callers;
+// lifecycle recovery uses ExpireLeaseCAS.
+func (s *SQLiteLeaseStore) ExpireStale(_ context.Context, _ time.Time) ([]*Lease, error) {
+	return nil, fmt.Errorf("claim: unfenced store expiry is disabled; use lifecycle recovery")
 }
 
 func (s *SQLiteLeaseStore) ActiveClaims(ctx context.Context, now time.Time) ([]*Lease, error) {
@@ -736,44 +808,65 @@ func (s *SQLiteLeaseStore) ActiveClaims(ctx context.Context, now time.Time) ([]*
 	return leases, rows.Err()
 }
 
-// ClaimCapacityRelease implements LeaseStore. The UPDATE...RETURNING
-// statement is both the atomic claim and the read of exactly what got
-// claimed in one operation: SQLite executes a write statement (including
-// one that returns rows) as a single atomic unit under its single-writer
-// lock, so no other connection's write can interleave between rows of
-// this statement or between "claim" and "read back". That is the mutual
-// exclusion primitive that fixes concurrent double-delivery: two
-// settlers racing this call can never both see the same lease in their
-// claimed batch, because only one of their UPDATEs can be the one that
-// actually flips a given row's owner (the WHERE clause only matches rows
-// still pending, or in_progress with a stale claimed_at).
+// ClaimCapacityRelease is a hard-disabled compatibility symbol. Production
+// settlement must use ClaimCapacityReleaseExact inside the lifecycle fence.
 func (s *SQLiteLeaseStore) ClaimCapacityRelease(ctx context.Context, settlerID string, staleAfter time.Duration, now time.Time, key *LeaseKey) ([]*Lease, error) {
-	staleBefore := now.Add(-staleAfter)
-	query := `UPDATE leases SET capacity_release_state = 'in_progress', capacity_release_owner = ?, capacity_release_claimed_at = ?
-		WHERE status IN ('released', 'expired') AND capacity_released_at IS NULL
-		AND (capacity_release_state = 'pending' OR (capacity_release_state = 'in_progress' AND capacity_release_claimed_at < ?))`
-	args := []any{settlerID, now, staleBefore}
-	if key != nil {
-		query += ` AND repo = ? AND provider = ? AND project = ? AND task_ref = ?`
-		args = append(args, key.Repo, key.Provider, key.Project, key.TaskRef)
-	}
-	query += ` RETURNING ` + leaseColumns
+	return nil, fmt.Errorf("claim: raw batch capacity mutation is disabled; use fenced exact settlement")
+}
 
-	rows, err := queryWithRetry(ctx, s.db, query, args...)
+func (s *SQLiteLeaseStore) ClaimCapacityReleaseExact(ctx context.Context, leaseID, generation int64, settlerID string, staleAfter time.Duration, now time.Time) (*Lease, bool, error) {
+	if err := validateAttributableID(settlerID, "settler identity"); err != nil {
+		return nil, false, err
+	}
+	if err := validatePositiveDuration(staleAfter, "capacity claim timeout"); err != nil {
+		return nil, false, err
+	}
+	rows, err := queryWithRetry(ctx, s.db, `UPDATE leases SET capacity_release_state='in_progress', capacity_release_owner=?, capacity_release_claimed_at=? WHERE id=? AND generation=? AND status IN ('released','expired') AND capacity_released_at IS NULL AND (capacity_release_state='pending' OR (capacity_release_state='in_progress' AND capacity_release_claimed_at < ?)) RETURNING `+leaseColumns, settlerID, now, leaseID, generation, now.Add(-staleAfter))
 	if err != nil {
-		return nil, fmt.Errorf("claim capacity release: %w", err)
+		return nil, false, err
 	}
 	defer rows.Close()
+	if !rows.Next() {
+		return nil, false, rows.Err()
+	}
+	l, err := scanLease(rows)
+	return l, err == nil, err
+}
 
-	var claimed []*Lease
+func (s *SQLiteLeaseStore) PendingCapacityReleases(ctx context.Context) ([]*Lease, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT `+leaseColumns+` FROM leases WHERE status IN ('released','expired') AND capacity_released_at IS NULL AND capacity_release_state IN ('pending','in_progress') ORDER BY id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*Lease
 	for rows.Next() {
 		l, err := scanLease(rows)
 		if err != nil {
-			return nil, fmt.Errorf("claim capacity release: scan: %w", err)
+			return nil, err
 		}
-		claimed = append(claimed, l)
+		out = append(out, l)
 	}
-	return claimed, rows.Err()
+	return out, rows.Err()
+}
+
+// AbortUnreservedLease atomically marks a replacement's never-reserved
+// capacity token cancelled and releases the replacement row.
+func (s *SQLiteLeaseStore) AbortUnreservedLease(ctx context.Context, lease *Lease, now time.Time) (*Lease, bool, error) {
+	if lease == nil {
+		return nil, false, fmt.Errorf("%w: abort unreserved nil lease", ErrCapacityReleaseStale)
+	}
+	res, err := execWithRetry(ctx, s.db, `UPDATE leases SET status='released', released_at=?, capacity_release_state='cancelled', capacity_release_owner='', capacity_release_claimed_at=NULL WHERE id=? AND repo=? AND provider=? AND project=? AND task_ref=? AND generation=? AND owner_id=? AND role=? AND hold_repository=? AND hold_owner=? AND hold_lane=? AND worktree_path=? AND claimed_at=? AND status='active' AND capacity_released_at IS NULL AND capacity_release_state='pending' AND provider_lock_kind='' AND provider_lock_owner=''`, now, lease.ID, lease.Repo, lease.Provider, lease.Project, lease.TaskRef, lease.Generation, lease.OwnerID, lease.Role, lease.HoldRepository, lease.HoldOwner, lease.HoldLane, lease.WorktreePath, providerLockTimeText(lease.ClaimedAt))
+	if err != nil {
+		return nil, false, fmt.Errorf("abort unreserved lease: %w", err)
+	}
+	if n, err := res.RowsAffected(); err != nil {
+		return nil, false, err
+	} else if n != 1 {
+		return nil, false, fmt.Errorf("%w: abort unreserved identity mismatch", ErrCapacityReleaseStale)
+	}
+	row, err := s.byGeneration(ctx, lease.LeaseKey, lease.OwnerID, lease.Generation)
+	return row, true, err
 }
 
 // AckCapacityRelease implements LeaseStore. Guarded on
@@ -782,11 +875,19 @@ func (s *SQLiteLeaseStore) ClaimCapacityRelease(ctx context.Context, settlerID s
 // different settler is a silent no-op rather than clobbering that
 // settler's in-flight claim.
 func (s *SQLiteLeaseStore) AckCapacityRelease(ctx context.Context, leaseID int64, settlerID string, now time.Time) error {
-	_, err := execWithRetry(ctx, s.db, `UPDATE leases SET capacity_release_state = 'done', capacity_released_at = ?
+	if err := validateAttributableID(settlerID, "settler identity"); err != nil {
+		return err
+	}
+	res, err := execWithRetry(ctx, s.db, `UPDATE leases SET capacity_release_state = 'done', capacity_released_at = ?
 		WHERE id = ? AND capacity_release_owner = ? AND capacity_release_state = 'in_progress'`,
 		now, leaseID, settlerID)
 	if err != nil {
 		return fmt.Errorf("ack capacity release: %w", err)
+	}
+	if n, err := res.RowsAffected(); err != nil {
+		return err
+	} else if n != 1 {
+		return fmt.Errorf("%w: ack", ErrCapacityReleaseStale)
 	}
 	return nil
 }
@@ -794,11 +895,19 @@ func (s *SQLiteLeaseStore) AckCapacityRelease(ctx context.Context, leaseID int64
 // FailCapacityRelease implements LeaseStore, guarded the same way as
 // AckCapacityRelease.
 func (s *SQLiteLeaseStore) FailCapacityRelease(ctx context.Context, leaseID int64, settlerID string) error {
-	_, err := execWithRetry(ctx, s.db, `UPDATE leases SET capacity_release_state = 'pending', capacity_release_owner = '', capacity_release_claimed_at = NULL
+	if err := validateAttributableID(settlerID, "settler identity"); err != nil {
+		return err
+	}
+	res, err := execWithRetry(ctx, s.db, `UPDATE leases SET capacity_release_state = 'pending', capacity_release_owner = '', capacity_release_claimed_at = NULL
 		WHERE id = ? AND capacity_release_owner = ? AND capacity_release_state = 'in_progress'`,
 		leaseID, settlerID)
 	if err != nil {
 		return fmt.Errorf("fail capacity release: %w", err)
+	}
+	if n, err := res.RowsAffected(); err != nil {
+		return err
+	} else if n != 1 {
+		return fmt.Errorf("%w: fail", ErrCapacityReleaseStale)
 	}
 	return nil
 }

@@ -17,6 +17,17 @@ func testKey(taskRef string) LeaseKey {
 	return LeaseKey{Repo: "Herdforge", Provider: "kaneo", Project: "FAC", TaskRef: taskRef}
 }
 
+func testHoldIdentities(key LeaseKey) []lifecycle.HoldIdentity {
+	return []lifecycle.HoldIdentity{
+		{Repository: key.Repo, Owner: "worker", Lane: "smith", Scope: "lane"},
+		{Repository: key.Repo, Owner: "worker", Lane: "smith", Task: key.TaskRef, Scope: "task"},
+	}
+}
+
+func testClaimRequest(key LeaseKey, owner, role string) ClaimRequest {
+	return ClaimRequest{Key: key, OwnerID: owner, Role: role, TaskRole: role, HoldIdentities: testHoldIdentities(key)}
+}
+
 func newTestStore(t *testing.T) *SQLiteLeaseStore {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "leases.db")
@@ -28,6 +39,27 @@ func newTestStore(t *testing.T) *SQLiteLeaseStore {
 	return store
 }
 
+func newTestHoldAuthority(t *testing.T) *lifecycle.HoldAuthority {
+	t.Helper()
+	now := time.Date(2026, 8, 4, 12, 0, 0, 0, time.UTC)
+	a, err := lifecycle.NewHoldAuthorityWithClock(filepath.Join(t.TempDir(), "lifecycle.db"), func() time.Time { return now })
+	if err != nil {
+		t.Fatalf("open hold authority: %v", err)
+	}
+	t.Cleanup(func() { _ = a.Close() })
+	return a
+}
+
+// lyingAbortStore performs the underlying atomic abort but discards its
+// receipt. Claim must reject this malformed store response rather than
+// treating the replacement as safely compensated.
+type lyingAbortStore struct{ *SQLiteLeaseStore }
+
+func (s *lyingAbortStore) AbortUnreservedLease(ctx context.Context, lease *Lease, now time.Time) (*Lease, bool, error) {
+	_, _, err := s.SQLiteLeaseStore.AbortUnreservedLease(ctx, lease, now)
+	return nil, false, err
+}
+
 type heldClaimAuthority struct{}
 
 func (heldClaimAuthority) CurrentGeneration(context.Context, lifecycle.HoldIdentity) (int64, error) {
@@ -36,6 +68,9 @@ func (heldClaimAuthority) CurrentGeneration(context.Context, lifecycle.HoldIdent
 
 func (heldClaimAuthority) Check(context.Context, lifecycle.HoldIdentity, int64) (lifecycle.HoldDecision, error) {
 	return lifecycle.HoldDecision{Held: true, Generation: 1, Reason: "maintenance", Code: "operator_hold"}, nil
+}
+func (heldClaimAuthority) WithUnheldTransition(context.Context, []lifecycle.HoldIdentity, func() error) error {
+	return lifecycle.ErrHoldDenied
 }
 
 type recordingClaimAuthority struct{ got lifecycle.HoldIdentity }
@@ -47,6 +82,21 @@ func (*recordingClaimAuthority) CurrentGeneration(context.Context, lifecycle.Hol
 func (a *recordingClaimAuthority) Check(_ context.Context, id lifecycle.HoldIdentity, _ int64) (lifecycle.HoldDecision, error) {
 	a.got = id
 	return lifecycle.HoldDecision{}, nil
+}
+func (a *recordingClaimAuthority) WithUnheldTransition(_ context.Context, ids []lifecycle.HoldIdentity, action func() error) error {
+	if len(ids) == 0 {
+		return errors.New("missing hold identity")
+	}
+	for _, id := range ids {
+		if id.Task != "" {
+			a.got = id
+			break
+		}
+	}
+	if a.got == (lifecycle.HoldIdentity{}) {
+		a.got = ids[0]
+	}
+	return action()
 }
 
 func TestClaimUsesCanonicalTargetBeforeRandomLeaseOwner(t *testing.T) {
@@ -133,7 +183,7 @@ func (c *countingCapacity) counts(role string) (reserved, released int) {
 
 func TestClaimManager_ConcurrentClaims_ExactlyOneWinner(t *testing.T) {
 	store := newTestStore(t)
-	mgr := NewClaimManager(store)
+	mgr := NewClaimManager(store, WithHoldReader(newTestHoldAuthority(t)))
 	ctx := context.Background()
 	key := testKey("FAC-15")
 
@@ -143,10 +193,9 @@ func TestClaimManager_ConcurrentClaims_ExactlyOneWinner(t *testing.T) {
 		wg.Add(1)
 		go func(workerID int) {
 			defer wg.Done()
-			_, err := mgr.Claim(ctx, ClaimRequest{
-				Key: key, OwnerID: fmt.Sprintf("worker-%d", workerID),
-				Role: "herd-smith", TaskRole: "herd-smith", WorktreePath: "/wt",
-			})
+			req := testClaimRequest(key, fmt.Sprintf("worker-%d", workerID), "herd-smith")
+			req.WorktreePath = "/wt"
+			_, err := mgr.Claim(ctx, req)
 			if err == nil {
 				atomic.AddInt64(&successCount, 1)
 			}
@@ -224,7 +273,7 @@ func TestSQLiteLeaseStore_CrossProcess_ExactlyOneWinner(t *testing.T) {
 
 func TestClaimManager_RoleEnforcement(t *testing.T) {
 	store := newTestStore(t)
-	mgr := NewClaimManager(store)
+	mgr := NewClaimManager(store, WithHoldReader(newTestHoldAuthority(t)))
 	ctx := context.Background()
 
 	_, err := mgr.Claim(ctx, ClaimRequest{Key: testKey("FAC-1"), OwnerID: "w1", Role: "herd-smith", TaskRole: ""})
@@ -237,7 +286,7 @@ func TestClaimManager_RoleEnforcement(t *testing.T) {
 		t.Fatalf("expected ErrRoleMismatch, got %v", err)
 	}
 
-	lease, err := mgr.Claim(ctx, ClaimRequest{Key: testKey("FAC-1"), OwnerID: "w1", Role: "herd-smith", TaskRole: "herd-smith"})
+	lease, err := mgr.Claim(ctx, testClaimRequest(testKey("FAC-1"), "w1", "herd-smith"))
 	if err != nil {
 		t.Fatalf("expected exact role match to succeed: %v", err)
 	}
@@ -249,11 +298,11 @@ func TestClaimManager_RoleEnforcement(t *testing.T) {
 func TestClaimManager_RenewAndFencing(t *testing.T) {
 	store := newTestStore(t)
 	clk := newClock(time.Now())
-	mgr := NewClaimManager(store, WithClock(clk.now), WithTTL(time.Minute))
+	mgr := NewClaimManager(store, WithHoldReader(newTestHoldAuthority(t)), WithClock(clk.now), WithTTL(time.Minute))
 	ctx := context.Background()
 	key := testKey("FAC-2")
 
-	lease, err := mgr.Claim(ctx, ClaimRequest{Key: key, OwnerID: "w1", Role: "herd-smith", TaskRole: "herd-smith"})
+	lease, err := mgr.Claim(ctx, testClaimRequest(key, "w1", "herd-smith"))
 	if err != nil {
 		t.Fatalf("claim: %v", err)
 	}
@@ -274,7 +323,7 @@ func TestClaimManager_RenewAndFencing(t *testing.T) {
 
 	// Let the lease expire, someone else reclaims it (new generation)...
 	clk.advance(2 * time.Minute)
-	next, err := mgr.Claim(ctx, ClaimRequest{Key: key, OwnerID: "w2", Role: "herd-smith", TaskRole: "herd-smith"})
+	next, err := mgr.Claim(ctx, testClaimRequest(key, "w2", "herd-smith"))
 	if err != nil {
 		t.Fatalf("reclaim after expiry: %v", err)
 	}
@@ -294,11 +343,11 @@ func TestClaimManager_RenewAndFencing(t *testing.T) {
 func TestClaimManager_IdempotentRelease_CapacityExactlyOnce(t *testing.T) {
 	store := newTestStore(t)
 	cap := newCountingCapacity()
-	mgr := NewClaimManager(store, WithCapacityCoordinator(cap))
+	mgr := NewClaimManager(store, WithCapacityCoordinator(cap), WithHoldReader(newTestHoldAuthority(t)))
 	ctx := context.Background()
 	key := testKey("FAC-3")
 
-	lease, err := mgr.Claim(ctx, ClaimRequest{Key: key, OwnerID: "w1", Role: "herd-smith", TaskRole: "herd-smith"})
+	lease, err := mgr.Claim(ctx, testClaimRequest(key, "w1", "herd-smith"))
 	if err != nil {
 		t.Fatalf("claim: %v", err)
 	}
@@ -333,11 +382,11 @@ func TestClaimManager_CapacityReserveFailure_CompensatesLease(t *testing.T) {
 	store := newTestStore(t)
 	cap := newCountingCapacity()
 	cap.failNext = true
-	mgr := NewClaimManager(store, WithCapacityCoordinator(cap))
+	mgr := NewClaimManager(store, WithCapacityCoordinator(cap), WithHoldReader(newTestHoldAuthority(t)))
 	ctx := context.Background()
 	key := testKey("FAC-4")
 
-	_, err := mgr.Claim(ctx, ClaimRequest{Key: key, OwnerID: "w1", Role: "herd-smith", TaskRole: "herd-smith"})
+	_, err := mgr.Claim(ctx, testClaimRequest(key, "w1", "herd-smith"))
 	if err == nil {
 		t.Fatal("expected claim to fail when capacity reservation fails")
 	}
@@ -350,9 +399,81 @@ func TestClaimManager_CapacityReserveFailure_CompensatesLease(t *testing.T) {
 		t.Fatal("expected the durable lease to be released after capacity reservation failed")
 	}
 
-	// A second worker (fresh capacity call, no failure injected) can now claim.
-	if _, err := mgr.Claim(ctx, ClaimRequest{Key: key, OwnerID: "w2", Role: "herd-smith", TaskRole: "herd-smith"}); err != nil {
-		t.Fatalf("expected key free for a new claim after compensation, got %v", err)
+	settled, err := mgr.SettlePendingCapacity(ctx)
+	if err != nil {
+		t.Fatalf("drain after failed reserve: %v", err)
+	}
+	_, releases := cap.counts("herd-smith")
+	if len(settled) != 1 || releases != 1 {
+		t.Fatalf("ambiguous reserve error did not preserve compensating release: settled=%d", len(settled))
+	}
+	if _, err := mgr.Claim(ctx, testClaimRequest(key, "w2", "herd-smith")); err != nil {
+		t.Fatalf("expected key reusable after compensating release, got %v", err)
+	}
+}
+
+func TestClaimManager_IncumbentSettlementFailureCompensatesReplacementWithoutFalseRelease(t *testing.T) {
+	store := newTestStore(t)
+	cap := &failNTimesCapacity{failsLeft: 1}
+	clk := newClock(time.Date(2026, 8, 4, 12, 0, 0, 0, time.UTC))
+	mgr := NewClaimManager(store, WithHoldReader(newTestHoldAuthority(t)), WithClock(clk.now), WithTTL(time.Minute), WithCapacityCoordinator(cap))
+	ctx := context.Background()
+	key := testKey("FAC-4B")
+	old, err := mgr.Claim(ctx, testClaimRequest(key, "old", "herd-smith"))
+	if err != nil {
+		t.Fatalf("old claim: %v", err)
+	}
+	clk.advance(2 * time.Minute)
+	if _, err := mgr.Claim(ctx, testClaimRequest(key, "new", "herd-smith")); err == nil {
+		t.Fatal("expected reclaim to surface incumbent capacity failure")
+	}
+	if claimed, err := mgr.IsClaimed(ctx, key); err != nil || claimed {
+		t.Fatalf("replacement lease leaked after incumbent failure: claimed=%v err=%v", claimed, err)
+	}
+	settled, err := mgr.SettlePendingCapacity(ctx)
+	if err != nil {
+		t.Fatalf("retry incumbent settlement: %v", err)
+	}
+	if len(settled) != 1 || cap.releasedCount() != 1 {
+		t.Fatalf("expected only the genuinely reserved incumbent release, settled=%d releases=%d old=%d", len(settled), cap.releasedCount(), old.ID)
+	}
+	if again, err := mgr.SettlePendingCapacity(ctx); err != nil || len(again) != 0 {
+		t.Fatalf("settlement replay was not idempotent: leases=%d err=%v", len(again), err)
+	}
+}
+
+func TestClaimManager_AbortReceiptFailureBlocksClaimWithoutReplacementRelease(t *testing.T) {
+	base := time.Date(2026, 8, 4, 12, 0, 0, 0, time.UTC)
+	baseStore := newTestStore(t)
+	store := &lyingAbortStore{SQLiteLeaseStore: baseStore}
+	cap := &failNTimesCapacity{failsLeft: 1}
+	clk := newClock(base)
+	mgr := NewClaimManager(store, WithHoldReader(newTestHoldAuthority(t)), WithClock(clk.now), WithTTL(time.Minute), WithCapacityCoordinator(cap))
+	ctx := context.Background()
+	key := testKey("FAC-abort-receipt")
+	incumbent, err := mgr.Claim(ctx, testClaimRequest(key, "old", "herd-smith"))
+	if err != nil {
+		t.Fatalf("incumbent claim: %v", err)
+	}
+	clk.advance(2 * time.Minute)
+	if _, err := mgr.Claim(ctx, testClaimRequest(key, "new", "herd-smith")); err == nil {
+		t.Fatal("malformed abort receipt unexpectedly admitted replacement")
+	} else if !errors.Is(err, ErrCapacityReleaseStale) {
+		t.Fatalf("malformed abort receipt lost typed abort failure: %v", err)
+	}
+	current, err := store.CurrentLease(ctx, key)
+	if err != nil || current == nil || current.Status == StatusActive {
+		t.Fatalf("replacement remained active after malformed abort receipt: current=%+v err=%v", current, err)
+	}
+	if claimed, err := mgr.IsClaimed(ctx, key); err != nil || claimed {
+		t.Fatalf("replacement remained claimable after malformed abort receipt: claimed=%v err=%v", claimed, err)
+	}
+	if got := cap.releasedCount(); got != 0 {
+		t.Fatalf("never-reserved replacement emitted external release: %d", got)
+	}
+	settled, err := mgr.SettlePendingCapacity(ctx)
+	if err != nil || len(settled) != 1 || settled[0].ID != incumbent.ID || cap.releasedCount() != 1 {
+		t.Fatalf("only incumbent should remain retryable: settled=%+v releases=%d err=%v", settled, cap.releasedCount(), err)
 	}
 }
 
@@ -360,16 +481,16 @@ func TestClaimManager_ExpiryAndActiveClaims(t *testing.T) {
 	store := newTestStore(t)
 	clk := newClock(time.Now())
 	cap := newCountingCapacity()
-	mgr := NewClaimManager(store, WithClock(clk.now), WithTTL(time.Minute), WithCapacityCoordinator(cap))
+	mgr := NewClaimManager(store, WithHoldReader(newTestHoldAuthority(t)), WithClock(clk.now), WithTTL(time.Minute), WithCapacityCoordinator(cap))
 	ctx := context.Background()
 
 	live := testKey("FAC-5")
 	stale := testKey("FAC-6")
 
-	if _, err := mgr.Claim(ctx, ClaimRequest{Key: live, OwnerID: "w1", Role: "herd-smith", TaskRole: "herd-smith"}); err != nil {
+	if _, err := mgr.Claim(ctx, ClaimRequest{Key: live, OwnerID: "w1", Role: "herd-smith", TaskRole: "herd-smith", HoldIdentities: []lifecycle.HoldIdentity{{Repository: live.Repo, Owner: "worker", Lane: "smith", Scope: "lane"}, {Repository: live.Repo, Owner: "worker", Lane: "smith", Task: live.TaskRef, Scope: "task"}}}); err != nil {
 		t.Fatalf("claim live: %v", err)
 	}
-	if _, err := mgr.Claim(ctx, ClaimRequest{Key: stale, OwnerID: "w2", Role: "herd-smith", TaskRole: "herd-smith"}); err != nil {
+	if _, err := mgr.Claim(ctx, ClaimRequest{Key: stale, OwnerID: "w2", Role: "herd-smith", TaskRole: "herd-smith", HoldIdentities: []lifecycle.HoldIdentity{{Repository: stale.Repo, Owner: "worker", Lane: "smith", Scope: "lane"}, {Repository: stale.Repo, Owner: "worker", Lane: "smith", Task: stale.TaskRef, Scope: "task"}}}); err != nil {
 		t.Fatalf("claim stale: %v", err)
 	}
 
@@ -407,39 +528,34 @@ func TestClaimManager_ExpiryAndActiveClaims(t *testing.T) {
 	}
 
 	// The key is free again after expiry.
-	if _, err := mgr.Claim(ctx, ClaimRequest{Key: live, OwnerID: "w3", Role: "herd-smith", TaskRole: "herd-smith"}); err != nil {
+	if _, err := mgr.Claim(ctx, ClaimRequest{Key: live, OwnerID: "w3", Role: "herd-smith", TaskRole: "herd-smith", HoldIdentities: []lifecycle.HoldIdentity{{Repository: live.Repo, Owner: "worker", Lane: "smith", Scope: "lane"}, {Repository: live.Repo, Owner: "worker", Lane: "smith", Task: live.TaskRef, Scope: "task"}}}); err != nil {
 		t.Fatalf("expected expired key reclaimable, got %v", err)
 	}
 }
 
 func TestClaimManager_OperatorHold_PreventsExpiry(t *testing.T) {
 	store := newTestStore(t)
-	clk := newClock(time.Now())
-	mgr := NewClaimManager(store, WithClock(clk.now), WithTTL(time.Minute))
+	clk := newClock(time.Date(2026, 8, 4, 12, 0, 0, 0, time.UTC))
+	authority := newTestHoldAuthority(t)
+	mgr := NewClaimManager(store, WithHoldReader(authority), WithClock(clk.now), WithTTL(time.Minute))
 	ctx := context.Background()
 	key := testKey("FAC-7")
+	ids := testHoldIdentities(key)
 
-	lease, err := mgr.Claim(ctx, ClaimRequest{Key: key, OwnerID: "w1", Role: "herd-smith", TaskRole: "herd-smith"})
+	lease, err := mgr.Claim(ctx, ClaimRequest{Key: key, OwnerID: "w1", Role: "herd-smith", TaskRole: "herd-smith", HoldIdentities: []lifecycle.HoldIdentity{{Repository: key.Repo, Owner: "worker", Lane: "smith", Scope: "lane"}, {Repository: key.Repo, Owner: "worker", Lane: "smith", Task: key.TaskRef, Scope: "task"}}})
 	if err != nil {
 		t.Fatalf("claim: %v", err)
 	}
-	if _, err := mgr.Hold(ctx, key, "w1", lease.Generation, true); err != nil {
-		t.Fatalf("hold: %v", err)
+	for _, id := range ids {
+		if _, err := authority.Hold(ctx, id, "operator", "maintenance", "operator_hold", 1, nil); err != nil {
+			t.Fatalf("lifecycle hold: %v", err)
+		}
+	}
+	if _, err := mgr.Hold(ctx, key, "w1", lease.Generation, true); !errors.Is(err, ErrLegacyLeaseHoldDisabled) {
+		t.Fatalf("legacy lease hold must be disabled, got %v", err)
 	}
 
 	clk.advance(10 * time.Minute) // well past TTL
-
-	claimed, err := mgr.IsClaimed(ctx, key)
-	if err != nil {
-		t.Fatalf("IsClaimed: %v", err)
-	}
-	if !claimed {
-		t.Fatal("expected held lease to survive past TTL")
-	}
-	active, err := mgr.ActiveClaims(ctx)
-	if err != nil || len(active) != 1 || !active[0].Held {
-		t.Fatalf("held lease must remain occupied capacity: active=%+v err=%v", active, err)
-	}
 
 	expired, err := mgr.ExpireStale(ctx)
 	if err != nil {
@@ -450,12 +566,14 @@ func TestClaimManager_OperatorHold_PreventsExpiry(t *testing.T) {
 	}
 
 	// A competing claim must still be rejected while held.
-	if _, err := mgr.Claim(ctx, ClaimRequest{Key: key, OwnerID: "w2", Role: "herd-smith", TaskRole: "herd-smith"}); err == nil {
+	if _, err := mgr.Claim(ctx, testClaimRequest(key, "w2", "herd-smith")); err == nil {
 		t.Fatal("expected held lease to block a competing claim")
 	}
 
-	if _, err := mgr.Hold(ctx, key, "w1", lease.Generation, false); err != nil {
-		t.Fatalf("unhold: %v", err)
+	for _, id := range ids {
+		if _, err := authority.Release(ctx, id, "operator", "maintenance complete", "operator_release", 1); err != nil {
+			t.Fatalf("lifecycle release: %v", err)
+		}
 	}
 	expired, err = mgr.ExpireStale(ctx)
 	if err != nil {
@@ -466,55 +584,35 @@ func TestClaimManager_OperatorHold_PreventsExpiry(t *testing.T) {
 	}
 }
 
-func TestClaimManager_Hold_RequiresCurrentOwnerAndGeneration(t *testing.T) {
+func TestClaimManager_LegacyHoldAPIIsDisabledWithoutChangingLease(t *testing.T) {
 	store := newTestStore(t)
 	clk := newClock(time.Now())
-	mgr := NewClaimManager(store, WithClock(clk.now), WithTTL(time.Minute))
+	mgr := NewClaimManager(store, WithHoldReader(newTestHoldAuthority(t)), WithClock(clk.now), WithTTL(time.Minute))
 	ctx := context.Background()
 	key := testKey("FAC-9")
 
-	lease, err := mgr.Claim(ctx, ClaimRequest{Key: key, OwnerID: "w1", Role: "herd-smith", TaskRole: "herd-smith"})
+	lease, err := mgr.Claim(ctx, testClaimRequest(key, "w1", "herd-smith"))
 	if err != nil {
 		t.Fatalf("claim: %v", err)
 	}
-
-	if _, err := mgr.Hold(ctx, key, "someone-else", lease.Generation, true); !errors.Is(err, ErrStaleGeneration) && !errors.Is(err, ErrNotFound) {
-		t.Fatalf("expected wrong-owner Hold to be rejected, got %v", err)
+	if _, err := mgr.Hold(ctx, key, "w1", lease.Generation, true); !errors.Is(err, ErrLegacyLeaseHoldDisabled) {
+		t.Fatalf("expected legacy Hold API to be disabled, got %v", err)
 	}
-	if _, err := mgr.Hold(ctx, key, "w1", lease.Generation+1, true); !errors.Is(err, ErrStaleGeneration) && !errors.Is(err, ErrNotFound) {
-		t.Fatalf("expected wrong-generation Hold to be rejected, got %v", err)
-	}
-	if _, err := mgr.Hold(ctx, key, "w1", lease.Generation, true); err != nil {
-		t.Fatalf("expected correct owner+generation Hold to succeed, got %v", err)
-	}
-
-	// Let it expire and get reclaimed by someone else (new generation);
-	// the original owner's now-stale generation must not be able to hold
-	// or unhold the new claimant's lease.
-	if _, err := mgr.Hold(ctx, key, "w1", lease.Generation, false); err != nil {
-		t.Fatalf("unhold before reclaim: %v", err)
-	}
-	clk.advance(2 * time.Minute)
-	next, err := mgr.Claim(ctx, ClaimRequest{Key: key, OwnerID: "w2", Role: "herd-smith", TaskRole: "herd-smith"})
-	if err != nil {
-		t.Fatalf("reclaim: %v", err)
-	}
-	if _, err := mgr.Hold(ctx, key, "w1", lease.Generation, true); !errors.Is(err, ErrStaleGeneration) {
-		t.Fatalf("expected stale-generation Hold to be rejected after reclaim, got %v", err)
-	}
-	if _, err := mgr.Hold(ctx, key, "w2", next.Generation, true); err != nil {
-		t.Fatalf("expected new owner's Hold to succeed, got %v", err)
+	row, err := store.LeaseByGeneration(ctx, key, "w1", lease.Generation)
+	if err != nil || row == nil || row.Status != StatusActive || row.Held {
+		t.Fatalf("legacy Hold changed lease state: row=%+v err=%v", row, err)
 	}
 }
 
 func TestClaimManager_Renew_RejectsExpiredLease(t *testing.T) {
 	store := newTestStore(t)
 	clk := newClock(time.Now())
-	mgr := NewClaimManager(store, WithClock(clk.now), WithTTL(time.Minute))
+	authority := newTestHoldAuthority(t)
+	mgr := NewClaimManager(store, WithHoldReader(authority), WithClock(clk.now), WithTTL(time.Minute))
 	ctx := context.Background()
 	key := testKey("FAC-10")
 
-	lease, err := mgr.Claim(ctx, ClaimRequest{Key: key, OwnerID: "w1", Role: "herd-smith", TaskRole: "herd-smith"})
+	lease, err := mgr.Claim(ctx, testClaimRequest(key, "w1", "herd-smith"))
 	if err != nil {
 		t.Fatalf("claim: %v", err)
 	}
@@ -527,12 +625,8 @@ func TestClaimManager_Renew_RejectsExpiredLease(t *testing.T) {
 		t.Fatalf("expected ErrLeaseExpired for an unswept but past-TTL lease, got %v", err)
 	}
 
-	// A held lease never counts as expired, even well past its TTL.
-	if _, err := mgr.Hold(ctx, key, "w1", lease.Generation, true); err != nil {
-		t.Fatalf("hold: %v", err)
-	}
-	if _, err := mgr.Renew(ctx, key, "w1", lease.Generation); err != nil {
-		t.Fatalf("expected held lease to still be renewable, got %v", err)
+	if _, err := mgr.Hold(ctx, key, "w1", lease.Generation, true); !errors.Is(err, ErrLegacyLeaseHoldDisabled) {
+		t.Fatalf("expected legacy Hold API to remain disabled, got %v", err)
 	}
 }
 
@@ -545,11 +639,11 @@ func TestClaimManager_ReclaimReleasesOldCapacityBeforeReservingNew(t *testing.T)
 	store := newTestStore(t)
 	clk := newClock(time.Now())
 	capCoord := newCountingCapacity()
-	mgr := NewClaimManager(store, WithClock(clk.now), WithTTL(time.Minute), WithCapacityCoordinator(capCoord))
+	mgr := NewClaimManager(store, WithHoldReader(newTestHoldAuthority(t)), WithClock(clk.now), WithTTL(time.Minute), WithCapacityCoordinator(capCoord))
 	ctx := context.Background()
 	key := testKey("FAC-11")
 
-	if _, err := mgr.Claim(ctx, ClaimRequest{Key: key, OwnerID: "w1", Role: "herd-smith", TaskRole: "herd-smith"}); err != nil {
+	if _, err := mgr.Claim(ctx, testClaimRequest(key, "w1", "herd-smith")); err != nil {
 		t.Fatalf("first claim: %v", err)
 	}
 	if r, rel := capCoord.counts("herd-smith"); r != 1 || rel != 0 {
@@ -558,7 +652,7 @@ func TestClaimManager_ReclaimReleasesOldCapacityBeforeReservingNew(t *testing.T)
 
 	clk.advance(2 * time.Minute) // first lease's TTL passes, nobody has swept it
 
-	if _, err := mgr.Claim(ctx, ClaimRequest{Key: key, OwnerID: "w2", Role: "herd-smith", TaskRole: "herd-smith"}); err != nil {
+	if _, err := mgr.Claim(ctx, testClaimRequest(key, "w2", "herd-smith")); err != nil {
 		t.Fatalf("reclaim: %v", err)
 	}
 	// The reclaim must have durably released w1's token (not just
@@ -611,11 +705,11 @@ func (c *failNTimesCapacity) releasedCount() int {
 func TestClaimManager_CapacityReleaseFailure_DurablyPendingAndRetryable(t *testing.T) {
 	store := newTestStore(t)
 	failing := &failNTimesCapacity{failsLeft: 2}
-	mgr := NewClaimManager(store, WithCapacityCoordinator(failing))
+	mgr := NewClaimManager(store, WithCapacityCoordinator(failing), WithHoldReader(newTestHoldAuthority(t)))
 	ctx := context.Background()
 	key := testKey("FAC-12")
 
-	lease, err := mgr.Claim(ctx, ClaimRequest{Key: key, OwnerID: "w1", Role: "herd-smith", TaskRole: "herd-smith"})
+	lease, err := mgr.Claim(ctx, testClaimRequest(key, "w1", "herd-smith"))
 	if err != nil {
 		t.Fatalf("claim: %v", err)
 	}
@@ -664,7 +758,7 @@ func TestClaimManager_CapacityReleaseFailure_DurablyPendingAndRetryable(t *testi
 // transition time, not just at the earlier candidate SELECT, so an
 // operator Hold landing in that window wins the race instead of being
 // silently overridden.
-func TestSQLiteLeaseStore_ExpireStale_RechecksHeldAtTransitionTime(t *testing.T) {
+func TestSQLiteLeaseStore_LegacyHoldAPIIsDisabled(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
 	key := testKey("FAC-13")
@@ -674,33 +768,11 @@ func TestSQLiteLeaseStore_ExpireStale_RechecksHeldAtTransitionTime(t *testing.T)
 	if err != nil {
 		t.Fatalf("acquire: %v", err)
 	}
-
-	sweepAt := claimAt.Add(2 * time.Minute) // past TTL, a real ExpireStale candidate
-
-	var holdErr error
-	expireStaleTestHook = func(candidate *Lease) {
-		// Simulate an operator Hold landing exactly between ExpireStale's
-		// candidate SELECT and its per-row UPDATE.
-		_, holdErr = store.Hold(ctx, key, "w1", lease.Generation, true, sweepAt)
+	if _, err := store.Hold(ctx, key, "w1", lease.Generation, true, claimAt); !errors.Is(err, ErrLegacyLeaseHoldDisabled) {
+		t.Fatalf("raw lease Hold must be disabled, got %v", err)
 	}
-	t.Cleanup(func() { expireStaleTestHook = nil })
-
-	transitioned, err := store.ExpireStale(ctx, sweepAt)
-	if err != nil {
-		t.Fatalf("expire stale: %v", err)
-	}
-	if holdErr != nil {
-		t.Fatalf("interleaved hold: %v", holdErr)
-	}
-	if len(transitioned) != 0 {
-		t.Fatalf("expected the interleaved Hold to win the race and prevent expiry, got %d transitioned", len(transitioned))
-	}
-
-	active, err := store.currentActive(ctx, key)
-	if err != nil {
-		t.Fatalf("current active: %v", err)
-	}
-	if active == nil || active.Generation != lease.Generation || !active.Held {
-		t.Fatalf("expected the held lease to still be active and held, got %+v", active)
+	row, err := store.currentActive(ctx, key)
+	if err != nil || row == nil || row.Status != StatusActive || row.Held {
+		t.Fatalf("legacy Hold changed store row: row=%+v err=%v", row, err)
 	}
 }

@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
+	"strings"
 	"time"
 )
 
@@ -27,24 +29,70 @@ var (
 	// mutation. Distinct from ErrStaleGeneration/ErrAlreadyClaimed, which
 	// mean the lease has actually moved on.
 	ErrProviderTransitionInProgress = errors.New("claim: provider transition in progress for this lease")
+	ErrProviderLockStale            = errors.New("claim: provider lock missing or stale")
+	ErrCapacityReleaseStale         = errors.New("claim: capacity release claim missing or stale")
+	ErrLegacyLeaseHoldDisabled      = errors.New("claim: legacy lease-held authority is disabled; use lifecycle hold authority")
+	ErrLegacyClaimDisabled          = errors.New("claim: legacy ClaimTask is disabled; use exact canonical ClaimRequest")
 )
+
+const (
+	providerLockKindOrdinary = ""
+	providerLockKindRecovery = "recovery"
+)
+
+func recoveryOwnerFor(leaseID, generation int64) string {
+	return fmt.Sprintf("herd-provider-recovery:%d:%d", leaseID, generation)
+}
+
+func parseRecoveryOwner(owner string) (leaseID, generation int64, reserved bool, err error) {
+	const prefix = "herd-provider-recovery:"
+	if !strings.HasPrefix(owner, prefix) {
+		return 0, 0, false, nil
+	}
+	parts := strings.Split(strings.TrimPrefix(owner, prefix), ":")
+	if len(parts) != 2 {
+		return 0, 0, true, fmt.Errorf("malformed reserved recovery owner")
+	}
+	leaseID, idErr := strconv.ParseInt(parts[0], 10, 64)
+	generation, genErr := strconv.ParseInt(parts[1], 10, 64)
+	if idErr != nil || genErr != nil || leaseID <= 0 || generation <= 0 {
+		return 0, 0, true, fmt.Errorf("malformed reserved recovery owner")
+	}
+	return leaseID, generation, true, nil
+}
+
+func isReservedRecoveryOwner(owner string) bool {
+	_, _, reserved, _ := parseRecoveryOwner(owner)
+	return reserved
+}
+
+func isRecoveryOwnerFor(owner string, leaseID, generation int64) bool {
+	id, gen, reserved, err := parseRecoveryOwner(owner)
+	return reserved && err == nil && id == leaseID && gen == generation
+}
+
+func normalizeProviderLockTime(t time.Time) time.Time { return t.UTC().Truncate(time.Microsecond) }
+func providerLockTimeText(t time.Time) string {
+	return normalizeProviderLockTime(t).Format(time.RFC3339Nano)
+}
 
 // LeaseStore is the narrow durable-persistence port ClaimManager depends
 // on. All methods must be safe to call from multiple OS processes against
 // the same backing store concurrently; exactly one caller may win a
 // contended Acquire.
 //
-// Capacity accounting is NOT tied to a single Release/ExpireStale call
+// Capacity accounting is NOT tied to a single Release/recovery call
 // returning "this is the one true transition" boolean: a lease entering
 // Released or Expired only records that its lease lifecycle ended.
 // Whether its capacity token has been durably given back is tracked
-// separately as a small claim/ack protocol (ClaimCapacityRelease /
-// AckCapacityRelease / FailCapacityRelease) so that:
+// separately as a small exact-ID claim/ack protocol
+// (ClaimCapacityReleaseExact / AckCapacityRelease / FailCapacityRelease)
+// so that:
 //
 //   - Two settlers (two processes, two goroutines, whatever) can never
 //     both be attempting the external CapacityCoordinator.Release call for
-//     the same lease at the same time -- ClaimCapacityRelease's atomic
-//     claim is the mutual-exclusion boundary, not a Go-level mutex or an
+//     the same lease at the same time -- the exact-ID atomic claim is the
+//     mutual-exclusion boundary, not a Go-level mutex or an
 //     assumption that the coordinator itself dedupes concurrent calls.
 //   - A crash between the external call succeeding and the local Ack
 //     leaves the claim stale (its claimed_at ages past staleAfter) rather
@@ -83,7 +131,7 @@ type LeaseStore interface {
 	// Renew extends an active lease's expiry, fenced by generation. A
 	// generation that no longer matches the active lease returns
 	// ErrStaleGeneration; a matching generation whose TTL has already
-	// passed (but which no other Acquire/ExpireStale has evicted yet)
+	// passed (but which no other Acquire/recovery transition has evicted yet)
 	// returns ErrLeaseExpired rather than silently extending it; a lease
 	// gone entirely returns ErrNotFound.
 	Renew(ctx context.Context, key LeaseKey, ownerID string, generation int64, now time.Time, ttl time.Duration) (*Lease, error)
@@ -108,84 +156,37 @@ type LeaseStore interface {
 	// errors (via the same fencing/not-found errors Release/Renew/Hold
 	// use) if the lease has moved on, or with
 	// ErrProviderTransitionInProgress if it's still current but another
-	// live (non-stale) lock already holds it. A stale lock (older than
-	// staleAfter, e.g. its holder crashed) is preempted rather than
-	// blocking forever.
+	// lock already holds it. This method never preempts a lock by time;
+	// staleAfter is retained only for compatibility. Lifecycle recovery
+	// alone observes its fixed threshold, claims a typed recovery record,
+	// advances the provider fence, and finalizes it.
 	AcquireProviderLock(ctx context.Context, key LeaseKey, ownerID string, generation int64, lockOwner string, staleAfter time.Duration, now time.Time) (*Lease, error)
 
-	// ReleaseProviderLock clears lockOwner's provider-transition lock,
-	// allowing Release/reclaim to proceed again. Idempotent: a no-op if
-	// lockOwner does not currently hold the lock (e.g. it already went
-	// stale and was preempted).
+	// ReleaseProviderLock clears exactly lockOwner's ordinary provider
+	// transition lock. A mismatched or absent owner is an error; it is not
+	// an idempotent no-op and it never clears recovery state.
 	ReleaseProviderLock(ctx context.Context, key LeaseKey, generation int64, lockOwner string) error
 
-	// PeekStaleProviderLock returns the current active lease for key if
-	// it is held by a provider-transition lock that is active but stale.
-	// Returns nil (not an error) if there is no active lease, it has no
-	// provider lock, or its lock is not yet stale. Release, Acquire, and
-	// ExpireStale never preempt a provider lock by time alone -- they
-	// unconditionally require provider_lock_owner = '' -- specifically so
-	// that whether a stale lock is safe to clear can only be decided by
-	// ClaimManager (which alone knows if a ProviderCAS is configured, and
-	// so whether a durable fence-advance is needed first). See
-	// PeekAllStaleProviderLocks (ExpireStale's sweep-scale counterpart)
-	// and ForceReleaseProviderLock.
+	// PeekStaleProviderLock returns an immutable observation for lifecycle
+	// recovery. It never mutates a provider lock.
 	PeekStaleProviderLock(ctx context.Context, key LeaseKey, now time.Time) (*Lease, error)
 
-	// PeekAllStaleProviderLocks is PeekStaleProviderLock across every
-	// key, for ClaimManager.ExpireStale's global sweep to durably
-	// preempt (fence-advance, then ForceReleaseProviderLock) every
-	// stale-locked lease before calling the store's own ExpireStale.
+	// PeekAllStaleProviderLocks is the read-only sweep counterpart used to
+	// discover candidates for lifecycle recovery.
 	PeekAllStaleProviderLocks(ctx context.Context, now time.Time) ([]*Lease, error)
-
-	// ForceReleaseProviderLock clears key/generation's provider lock
-	// unconditionally, without requiring the caller to be its current
-	// owner. Reserved for ClaimManager's orchestration layer and MUST
-	// only be called immediately after a durably-confirmed provider fence
-	// advance for the lease's next generation -- never as a substitute
-	// for that confirmation, which is what actually makes the preemption
-	// safe.
-	ForceReleaseProviderLock(ctx context.Context, key LeaseKey, generation int64) error
-
-	// Hold sets or clears the operator-hold flag on the active lease for
-	// key, fenced by ownerID/generation exactly like Renew/Release: a
-	// caller without the current owner+generation is rejected rather than
-	// being able to hold/unhold a lease it does not own.
-	Hold(ctx context.Context, key LeaseKey, ownerID string, generation int64, held bool, now time.Time) (*Lease, error)
-
-	// ExpireStale transitions active-but-expired (and not held) leases to
-	// Expired and returns exactly the ones this call transitioned. The
-	// held/expiry check must be re-evaluated at the moment of the actual
-	// row transition (not just an earlier candidate SELECT), so a Renew
-	// or Hold that lands between candidate selection and transition wins
-	// the race instead of being silently overridden.
-	ExpireStale(ctx context.Context, now time.Time) ([]*Lease, error)
 
 	// ActiveClaims returns only live (Active, unexpired) leases.
 	ActiveClaims(ctx context.Context, now time.Time) ([]*Lease, error)
 
-	// ClaimCapacityRelease atomically claims a batch of leases whose
-	// capacity token still needs releasing -- either never attempted
-	// (pending) or a prior attempt looks crashed (its claim's
-	// claimed_at is older than staleAfter) -- for settlerID. If key is
-	// non-nil, only that key's leases are eligible; nil claims across
-	// every key. Implementations must make this a single atomic
-	// operation (e.g. one UPDATE...RETURNING under the store's
-	// single-writer lock) so that under concurrent callers, each
-	// eligible lease is claimed by at most one of them.
-	ClaimCapacityRelease(ctx context.Context, settlerID string, staleAfter time.Duration, now time.Time, key *LeaseKey) ([]*Lease, error)
-
 	// AckCapacityRelease durably marks leaseID's capacity token
-	// returned, completing settlerID's claim. A no-op (not an error) if
-	// settlerID no longer holds the claim -- e.g. it went stale and a
-	// different settler reclaimed leaseID in the meantime, in which case
-	// that settler is responsible for acking it now.
+	// returned, completing settlerID's claim. A foreign, stale, or zero-row
+	// ack is an error and preserves the durable evidence.
 	AckCapacityRelease(ctx context.Context, leaseID int64, settlerID string, now time.Time) error
 
 	// FailCapacityRelease releases settlerID's claim on leaseID
 	// immediately back to pending (instead of waiting out staleAfter),
 	// for a synchronous, non-crash failure the settler itself observed.
-	// A no-op if settlerID no longer holds the claim.
+	// A foreign or stale claim is an error.
 	FailCapacityRelease(ctx context.Context, leaseID int64, settlerID string) error
 
 	Close() error
@@ -203,6 +204,26 @@ type RecoveryStore interface {
 	FinalizeProviderLockCAS(context.Context, ProviderLockObservation) (bool, error)
 }
 
+type ExactCapacityReleaseStore interface {
+	ClaimCapacityReleaseExact(context.Context, int64, int64, string, time.Duration, time.Time) (*Lease, bool, error)
+}
+
+type UnreservedAbortStore interface {
+	AbortUnreservedLease(context.Context, *Lease, time.Time) (*Lease, bool, error)
+}
+
+type PendingCapacityStore interface {
+	PendingCapacityReleases(context.Context) ([]*Lease, error)
+}
+
+// LeaseSnapshotStore reads the durable historical row without applying
+// active/unexpired filtering. Mutating callers use it before entering the
+// authority fence and re-read/CAS inside that fence.
+type LeaseSnapshotStore interface {
+	CurrentLease(context.Context, LeaseKey) (*Lease, error)
+	LeaseByGeneration(context.Context, LeaseKey, string, int64) (*Lease, error)
+}
+
 type ProviderLockObservation struct {
 	LeaseID       int64
 	Generation    int64
@@ -210,6 +231,7 @@ type ProviderLockObservation struct {
 	LockedAt      time.Time
 	ObservedAt    time.Time
 	RecoveryOwner string
+	Recovery      bool
 }
 
 // ClaimConflictError reports why an Acquire lost the race, with enough
