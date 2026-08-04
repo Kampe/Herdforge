@@ -2,6 +2,7 @@ package kick
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"sort"
@@ -265,6 +266,7 @@ func TestRun_DryRun(t *testing.T) {
 		HoldReader:   allowAllHolds{}, Identity: testIdentity,
 		ActiveTasks: testActiveTasks,
 		Generation:  testGeneration,
+		FetchAgents: emptyAgentList,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -293,14 +295,22 @@ func (heldHolds) Check(context.Context, lifecycle.HoldIdentity, int64) (lifecycl
 }
 
 func TestRun_HeldAuthorityStopsBeforeAgentRead(t *testing.T) {
+	agentListCalls := 0
 	result, err := Run(Options{
-		Names: []string{"forge-held"}, Quiet: true, RaiseMissing: true,
+		Names: []string{"forge-held", "forge-also-held"}, Quiet: true, RaiseMissing: true,
 		HoldReader: heldHolds{}, Identity: testIdentity,
 		ActiveTasks: testActiveTasks,
 		Generation:  testGeneration,
+		FetchAgents: func() ([]AgentEntry, error) {
+			agentListCalls++
+			return nil, nil
+		},
 	})
-	if err != nil || result == nil || result.Skipped != 1 || !strings.Contains(result.Entries[0].Reason, "held") {
+	if err != nil || result == nil || result.Skipped != 2 || len(result.Entries) != 2 || !strings.Contains(result.Entries[0].Reason, "held") || !strings.Contains(result.Entries[1].Reason, "held") {
 		t.Fatalf("held kick result=%v err=%v", result, err)
+	}
+	if agentListCalls != 0 {
+		t.Fatalf("held targets must be skipped before agent-list lookup: calls=%d", agentListCalls)
 	}
 }
 
@@ -314,9 +324,28 @@ func (selectiveHolds) Check(_ context.Context, id lifecycle.HoldIdentity, _ int6
 }
 
 func TestRun_HeldLaneDoesNotFreezeUnheldLane(t *testing.T) {
-	result, err := Run(Options{Names: []string{"forge-held", "forge-free"}, DryRun: true, Quiet: true, RaiseMissing: false, HoldReader: selectiveHolds{}, Identity: testIdentity, ActiveTasks: testActiveTasks, Generation: testGeneration})
+	result, err := Run(Options{Names: []string{"forge-held", "forge-free"}, DryRun: true, Quiet: true, RaiseMissing: false, HoldReader: selectiveHolds{}, Identity: testIdentity, ActiveTasks: testActiveTasks, Generation: testGeneration, FetchAgents: emptyAgentList})
 	if err != nil || result == nil || result.Skipped != 1 || result.Kicked != 1 {
 		t.Fatalf("selective kick result=%+v err=%v", result, err)
+	}
+}
+
+func TestRunUsesInjectedAgentList(t *testing.T) {
+	wantErr := errors.New("deterministic agent-list failure")
+	_, err := Run(Options{
+		Names:        []string{"forge-injected"},
+		Quiet:        true,
+		RaiseMissing: false,
+		HoldReader:   allowAllHolds{},
+		Identity:     testIdentity,
+		ActiveTasks:  testActiveTasks,
+		Generation:   testGeneration,
+		FetchAgents: func() ([]AgentEntry, error) {
+			return nil, wantErr
+		},
+	})
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("Run error=%v, want injected agent-list error", err)
 	}
 }
 
@@ -346,7 +375,7 @@ func TestRunUsesGenerationForExactLaneAndTaskIdentity(t *testing.T) {
 		return lifecycle.HoldIdentity{Repository: "repo", Owner: "role", Lane: "lane", Scope: "lane"}, nil
 	}, ActiveTasks: func(context.Context, string) ([]lifecycle.HoldIdentity, error) {
 		return []lifecycle.HoldIdentity{{Repository: "repo", Owner: "role", Lane: "lane", Task: "FAC-4", Scope: "task"}}, nil
-	}, Generation: genFn})
+	}, Generation: genFn, FetchAgents: emptyAgentList})
 	if runErr != nil || len(r.got) != 2 || r.got[0].gen != 1 || r.got[1].gen != 4 {
 		t.Fatalf("err=%v checks=%+v", runErr, r.got)
 	}
@@ -365,6 +394,7 @@ func TestRun_ForceOverridesStatus(t *testing.T) {
 		HoldReader:   allowAllHolds{}, Identity: testIdentity,
 		ActiveTasks: testActiveTasks,
 		Generation:  testGeneration,
+		FetchAgents: emptyAgentList,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -387,6 +417,7 @@ func TestRun_EmptyQuiet(t *testing.T) {
 		HoldReader:   allowAllHolds{}, Identity: testIdentity,
 		ActiveTasks: testActiveTasks,
 		Generation:  testGeneration,
+		FetchAgents: emptyAgentList,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -442,3 +473,5 @@ func testActiveTasks(_ context.Context, lane string) ([]lifecycle.HoldIdentity, 
 }
 
 func testGeneration(context.Context, lifecycle.HoldIdentity) (int64, error) { return 1, nil }
+
+func emptyAgentList() ([]AgentEntry, error) { return nil, nil }
