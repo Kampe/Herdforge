@@ -33,7 +33,7 @@ func TestClaudePolicyInvocationUsesDisallowedTools(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []string{"claude", "--disallowed-tools", "Agent", "Task", "-p", "prompt"}
+	want := []string{"claude", "--mcp-config", "{}", "--strict-mcp-config", "--disable-slash-commands", "--disallowed-tools", "Agent", "Task", "-p", "prompt"}
 	if !reflect.DeepEqual(got.Argv, want) {
 		t.Fatalf("argv = %v, want %v", got.Argv, want)
 	}

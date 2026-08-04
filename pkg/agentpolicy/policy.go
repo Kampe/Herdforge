@@ -42,6 +42,14 @@ const (
 	OperationHerdrDispatch Operation = "herdr-dispatch"
 )
 
+const (
+	SurfaceShell         = "shell"
+	SurfaceHerdrDispatch = "herd dispatch"
+	SurfaceHerdrSend     = "herd send"
+	SurfaceHerdrReview   = "herd review"
+	SurfaceNestedAgent   = "nested agent"
+)
+
 type Contract struct {
 	Repository            string `json:"repository"`
 	Task                  string `json:"task"`
@@ -61,13 +69,14 @@ var (
 	ErrInvalidContract = errors.New("agentpolicy: invalid or unauthenticated contract")
 	ErrDenied          = errors.New("agentpolicy: nested agent denied")
 	ErrEvidence        = errors.New("agentpolicy: invalid denial evidence")
+	ErrInvalidAttempt  = errors.New("agentpolicy: invalid attempted operation")
 )
 
 func NewContract(repository, task, lane, role string, generation int64, session, tab, pane, family, surface string, key []byte) (Contract, error) {
 	if len(key) == 0 {
 		return Contract{}, errors.New("metadata key must be nonempty")
 	}
-	c := Contract{Repository: normalize(repository), Task: normalize(task), Lane: normalize(lane), Role: normalize(role), LeaseGeneration: generation, HerdrSession: normalize(session), HerdrTab: normalize(tab), HerdrPane: normalize(pane), ParentExecutionFamily: normalize(family), AllowedHerdrSurface: normalize(surface)}
+	c := Contract{Repository: normalizeRepository(repository), Task: normalizeOpaque(task), Lane: normalizeOpaque(lane), Role: normalizeEnum(role), LeaseGeneration: generation, HerdrSession: normalizeOpaque(session), HerdrTab: normalizeOpaque(tab), HerdrPane: normalizeOpaque(pane), ParentExecutionFamily: normalizeEnum(family), AllowedHerdrSurface: normalizeEnum(surface)}
 	if err := c.validFields(false); err != nil {
 		return Contract{}, err
 	}
@@ -98,13 +107,21 @@ func (c Contract) validFields(authenticated bool) error {
 	if c.LeaseGeneration < 1 {
 		return errors.New("lease generation must be positive")
 	}
+	if !validHerdrSurface(c.AllowedHerdrSurface) {
+		return errors.New("allowed Herdr surface is not a supported explicit surface")
+	}
 	if authenticated && (len(c.AuthTag) == 0 || len(c.PolicyDigest) == 0) {
 		return errors.New("policy authentication is required")
 	}
 	return nil
 }
 
-func normalize(value string) string { return strings.ToLower(strings.TrimSpace(value)) }
+func normalizeOpaque(value string) string     { return strings.TrimSpace(value) }
+func normalizeEnum(value string) string       { return strings.ToLower(strings.TrimSpace(value)) }
+func normalizeRepository(value string) string { return normalizeEnum(value) }
+func validHerdrSurface(value string) bool {
+	return value == SurfaceHerdrDispatch || value == SurfaceHerdrSend || value == SurfaceHerdrReview
+}
 
 func (c Contract) digest() string {
 	b, _ := json.Marshal(struct {
@@ -133,10 +150,16 @@ func (c Contract) Decide(key []byte, attempt Attempt) error {
 	if err := c.Verify(key); err != nil {
 		return err
 	}
-	if normalize(attempt.Repository) != c.Repository || normalize(attempt.Surface) != c.AllowedHerdrSurface || normalize(attempt.Family) != c.ParentExecutionFamily {
+	if err := validateAttempt(attempt); err != nil {
+		return err
+	}
+	if normalizeRepository(attempt.Repository) != c.Repository || normalizeEnum(attempt.Family) != c.ParentExecutionFamily {
 		return ErrDenied
 	}
-	if attempt.Operation == OperationShell || attempt.Operation == OperationHerdrDispatch {
+	if attempt.Operation == OperationShell && normalizeEnum(attempt.Surface) == SurfaceShell {
+		return nil
+	}
+	if attempt.Operation == OperationHerdrDispatch && normalizeEnum(attempt.Surface) == c.AllowedHerdrSurface {
 		return nil
 	}
 	if attempt.Operation == OperationNestedAgent {
@@ -145,57 +168,131 @@ func (c Contract) Decide(key []byte, attempt Attempt) error {
 	return ErrDenied
 }
 
+func validateAttempt(a Attempt) error {
+	if normalizeRepository(a.Repository) == "" || normalizeEnum(a.Surface) == "" || normalizeEnum(a.Family) == "" {
+		return invalidAttempt()
+	}
+	switch a.Operation {
+	case OperationShell:
+		if normalizeEnum(a.Surface) != SurfaceShell || a.Child != "" {
+			return invalidAttempt()
+		}
+	case OperationHerdrDispatch:
+		if !validHerdrSurface(normalizeEnum(a.Surface)) || a.Child != "" {
+			return invalidAttempt()
+		}
+	case OperationNestedAgent:
+		if normalizeEnum(a.Surface) != SurfaceNestedAgent || !validChild(a.Child) {
+			return invalidAttempt()
+		}
+	default:
+		return invalidAttempt()
+	}
+	return nil
+}
+
+func invalidAttempt() error { return fmt.Errorf("%w: %w", ErrInvalidAttempt, ErrDenied) }
+
+func validChild(child ChildKind) bool {
+	switch child {
+	case ChildClaudeAgent, ChildClaudeTask, ChildCodexSubagent, ChildCodexCollaboration, ChildRecovery, ChildReviewer, ChildVerifier, ChildWorker, ChildCoordinator, ChildExternalRepository:
+		return true
+	default:
+		return false
+	}
+}
+
 type DenialEvidence struct {
-	Repository       string    `json:"repository"`
-	Task             string    `json:"task"`
-	Lane             string    `json:"lane"`
-	Role             string    `json:"role"`
-	HerdrSession     string    `json:"herdr_session"`
-	HerdrTab         string    `json:"herdr_tab"`
-	HerdrPane        string    `json:"herdr_pane"`
-	LeaseGeneration  int64     `json:"lease_generation"`
-	Sequence         int64     `json:"sequence"`
-	Child            ChildKind `json:"child"`
-	Reason           string    `json:"reason,omitempty"`
-	ContractDigest   string    `json:"policy_digest"`
-	Operation        Operation `json:"operation"`
-	AttemptedRepo    string    `json:"attempted_repository"`
-	AttemptedSurface string    `json:"attempted_surface"`
-	AttemptedFamily  string    `json:"attempted_family"`
+	Repository            string    `json:"repository"`
+	Task                  string    `json:"task"`
+	Lane                  string    `json:"lane"`
+	Role                  string    `json:"role"`
+	HerdrSession          string    `json:"herdr_session"`
+	HerdrTab              string    `json:"herdr_tab"`
+	HerdrPane             string    `json:"herdr_pane"`
+	LeaseGeneration       int64     `json:"lease_generation"`
+	Sequence              int64     `json:"sequence"`
+	Child                 ChildKind `json:"child"`
+	Reason                string    `json:"reason,omitempty"`
+	ContractDigest        string    `json:"policy_digest"`
+	Operation             Operation `json:"operation"`
+	AttemptedRepo         string    `json:"attempted_repository"`
+	AttemptedSurface      string    `json:"attempted_surface"`
+	AttemptedFamily       string    `json:"attempted_family"`
+	ContractAuthTag       string    `json:"contract_auth_tag"`
+	ParentExecutionFamily string    `json:"parent_execution_family"`
+	AllowedHerdrSurface   string    `json:"allowed_herdr_surface"`
+	Outcome               string    `json:"outcome"`
+	RecordMAC             string    `json:"record_mac"`
 }
 
 type EvidenceStore struct {
-	mu   sync.Mutex
-	file *os.File
-	next int64
+	mu     sync.Mutex
+	file   *os.File
+	next   int64
+	key    []byte
+	closed bool
 }
 
-func NewEvidenceStore(path string) (*EvidenceStore, error) {
+func NewEvidenceStore(path string, key []byte) (*EvidenceStore, error) {
+	if len(key) == 0 {
+		return nil, errors.New("metadata key must be nonempty")
+	}
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_RDWR, 0600)
 	if err != nil {
 		return nil, err
 	}
-	s := &EvidenceStore{file: f}
-	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
-		f.Close()
-		return nil, err
+	s := &EvidenceStore{file: f, key: append([]byte(nil), key...)}
+	if err := evidenceLock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+		return nil, errors.Join(err, f.Close())
 	}
 	if err := s.readbackLocked(); err != nil {
-		syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
-		f.Close()
-		return nil, err
+		unlockErr := evidenceUnlock(int(f.Fd()), syscall.LOCK_UN)
+		closeErr := f.Close()
+		return nil, errors.Join(err, unlockErr, closeErr)
 	}
-	syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+	if err := evidenceUnlock(int(f.Fd()), syscall.LOCK_UN); err != nil {
+		closeErr := f.Close()
+		return nil, errors.Join(err, closeErr)
+	}
 	return s, nil
 }
-func (s *EvidenceStore) Close() error { return s.file.Close() }
-func (s *EvidenceStore) Append(c Contract, key []byte, attempt Attempt, reason error) (DenialEvidence, error) {
+func (s *EvidenceStore) Close() error {
+	if s == nil || s.file == nil {
+		return nil
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if err := syscall.Flock(int(s.file.Fd()), syscall.LOCK_EX); err != nil {
+	if s.closed {
+		return nil
+	}
+	err := s.file.Close()
+	if err == nil {
+		s.closed = true
+	}
+	return err
+}
+func (s *EvidenceStore) Append(c Contract, key []byte, attempt Attempt, reason error) (e DenialEvidence, err error) {
+	if s == nil || s.file == nil {
+		return DenialEvidence{}, ErrEvidence
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return DenialEvidence{}, ErrEvidence
+	}
+	if len(key) == 0 || !hmac.Equal(s.key, key) {
+		return DenialEvidence{}, ErrInvalidContract
+	}
+	if err := evidenceLock(int(s.file.Fd()), syscall.LOCK_EX); err != nil {
 		return DenialEvidence{}, err
 	}
-	defer syscall.Flock(int(s.file.Fd()), syscall.LOCK_UN)
+	defer func() {
+		unlockErr := evidenceUnlock(int(s.file.Fd()), syscall.LOCK_UN)
+		if unlockErr != nil {
+			err = errors.Join(err, unlockErr)
+		}
+	}()
 	if err := s.readbackLocked(); err != nil {
 		return DenialEvidence{}, err
 	}
@@ -203,27 +300,48 @@ func (s *EvidenceStore) Append(c Contract, key []byte, attempt Attempt, reason e
 		return DenialEvidence{}, err
 	}
 	decision := c.Decide(key, attempt)
+	if errors.Is(decision, ErrInvalidAttempt) {
+		return DenialEvidence{}, decision
+	}
 	if !errors.Is(decision, ErrDenied) || !errors.Is(reason, ErrDenied) {
 		return DenialEvidence{}, ErrEvidence
 	}
 	s.next++
-	e := DenialEvidence{Repository: c.Repository, Task: c.Task, Lane: c.Lane, Role: c.Role, HerdrSession: c.HerdrSession, HerdrTab: c.HerdrTab, HerdrPane: c.HerdrPane, LeaseGeneration: c.LeaseGeneration, Sequence: s.next, Child: attempt.Child, Reason: decision.Error(), ContractDigest: c.PolicyDigest, Operation: attempt.Operation, AttemptedRepo: normalize(attempt.Repository), AttemptedSurface: normalize(attempt.Surface), AttemptedFamily: normalize(attempt.Family)}
+	e = DenialEvidence{Repository: c.Repository, Task: c.Task, Lane: c.Lane, Role: c.Role, HerdrSession: c.HerdrSession, HerdrTab: c.HerdrTab, HerdrPane: c.HerdrPane, LeaseGeneration: c.LeaseGeneration, Sequence: s.next, Child: attempt.Child, Reason: decision.Error(), ContractDigest: c.PolicyDigest, Operation: attempt.Operation, AttemptedRepo: normalizeRepository(attempt.Repository), AttemptedSurface: normalizeEnum(attempt.Surface), AttemptedFamily: normalizeEnum(attempt.Family), ContractAuthTag: c.AuthTag, Outcome: "denied", ParentExecutionFamily: c.ParentExecutionFamily, AllowedHerdrSurface: c.AllowedHerdrSurface}
+	e.RecordMAC = recordMAC(e, key)
 	b, err := json.Marshal(e)
 	if err != nil {
 		return DenialEvidence{}, err
 	}
 	b = append(b, '\n')
-	if _, err = s.file.Write(b); err != nil {
+	appendOffset, err := s.file.Seek(0, io.SeekEnd)
+	if err != nil {
 		s.next--
 		return DenialEvidence{}, err
 	}
-	if err = s.file.Sync(); err != nil {
-		return DenialEvidence{}, err
+	if n, writeErr := evidenceWrite(s.file, b); writeErr != nil || n != len(b) {
+		s.next--
+		rollbackErr := rollbackAppend(s.file, appendOffset)
+		if writeErr != nil {
+			return DenialEvidence{}, errors.Join(writeErr, rollbackErr)
+		}
+		return DenialEvidence{}, errors.Join(io.ErrShortWrite, rollbackErr)
+	}
+	if err = evidenceSync(s.file); err != nil {
+		return DenialEvidence{}, s.quarantine(err)
 	}
 	if err = s.readbackLocked(); err != nil {
-		return DenialEvidence{}, err
+		return DenialEvidence{}, s.quarantine(err)
 	}
 	return e, nil
+}
+
+func (s *EvidenceStore) quarantine(err error) error {
+	s.closed = true
+	if s.file == nil {
+		return err
+	}
+	return errors.Join(err, s.file.Close())
 }
 func (s *EvidenceStore) readbackLocked() error {
 	if _, err := s.file.Seek(0, io.SeekStart); err != nil {
@@ -237,7 +355,18 @@ func (s *EvidenceStore) readbackLocked() error {
 		if errors.Is(err, io.EOF) {
 			break
 		}
-		if err != nil || e.Sequence != last.Sequence+1 || e.Sequence < 1 || e.Repository == "" || e.Task == "" || e.HerdrSession == "" || e.ContractDigest == "" || e.Child == "" || e.Operation == "" || e.AttemptedRepo == "" || e.AttemptedSurface == "" || e.AttemptedFamily == "" {
+		if err != nil || e.Sequence != last.Sequence+1 || e.Sequence < 1 || e.Repository == "" || e.Task == "" || e.Lane == "" || e.Role == "" || e.HerdrSession == "" || e.HerdrTab == "" || e.HerdrPane == "" || e.ContractDigest == "" || e.ContractAuthTag == "" || e.ParentExecutionFamily == "" || e.AllowedHerdrSurface == "" || e.Outcome != "denied" || e.RecordMAC == "" || e.Operation == "" || e.AttemptedRepo == "" || e.AttemptedSurface == "" || e.AttemptedFamily == "" || !hmac.Equal([]byte(e.RecordMAC), []byte(recordMAC(e, s.key))) {
+			return ErrEvidence
+		}
+		contract := Contract{Repository: e.Repository, Task: e.Task, Lane: e.Lane, Role: e.Role, LeaseGeneration: e.LeaseGeneration, HerdrSession: e.HerdrSession, HerdrTab: e.HerdrTab, HerdrPane: e.HerdrPane, ParentExecutionFamily: e.ParentExecutionFamily, AllowedHerdrSurface: e.AllowedHerdrSurface, PolicyDigest: e.ContractDigest, AuthTag: e.ContractAuthTag}
+		if err := contract.Verify(s.key); err != nil {
+			return ErrEvidence
+		}
+		decision := contract.Decide(s.key, Attempt{Operation: e.Operation, Child: e.Child, Repository: e.AttemptedRepo, Surface: e.AttemptedSurface, Family: e.AttemptedFamily})
+		if errors.Is(decision, ErrInvalidAttempt) || !errors.Is(decision, ErrDenied) {
+			return ErrEvidence
+		}
+		if err := validateAttempt(Attempt{Operation: e.Operation, Child: e.Child, Repository: e.AttemptedRepo, Surface: e.AttemptedSurface, Family: e.AttemptedFamily}); err != nil {
 			return ErrEvidence
 		}
 		last = e
@@ -245,4 +374,36 @@ func (s *EvidenceStore) readbackLocked() error {
 	s.next = last.Sequence
 	_, err := s.file.Seek(0, io.SeekEnd)
 	return err
+}
+
+var evidenceWrite = func(f *os.File, b []byte) (int, error) { return f.Write(b) }
+
+var evidenceSync = func(f *os.File) error { return f.Sync() }
+
+var evidenceLock = func(fd int, how int) error { return syscall.Flock(fd, how) }
+
+var evidenceUnlock = func(fd int, how int) error { return syscall.Flock(fd, how) }
+
+func rollbackAppend(f *os.File, offset int64) error {
+	if err := f.Truncate(offset); err != nil {
+		return err
+	}
+	if _, err := f.Seek(0, io.SeekEnd); err != nil {
+		return err
+	}
+	return f.Sync()
+}
+
+func authenticateDigest(digest string, key []byte) string {
+	mac := hmac.New(sha256.New, key)
+	_, _ = mac.Write([]byte(digest))
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
+func recordMAC(e DenialEvidence, key []byte) string {
+	e.RecordMAC = ""
+	b, _ := json.Marshal(e)
+	mac := hmac.New(sha256.New, key)
+	_, _ = mac.Write(b)
+	return hex.EncodeToString(mac.Sum(nil))
 }
