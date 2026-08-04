@@ -6,6 +6,7 @@
 package agentpolicy
 
 import (
+	"bytes"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
@@ -13,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -116,9 +118,28 @@ func (c Contract) validFields(authenticated bool) error {
 	return nil
 }
 
-func normalizeOpaque(value string) string     { return strings.TrimSpace(value) }
-func normalizeEnum(value string) string       { return strings.ToLower(strings.TrimSpace(value)) }
-func normalizeRepository(value string) string { return normalizeEnum(value) }
+func normalizeOpaque(value string) string { return strings.TrimSpace(value) }
+func normalizeEnum(value string) string   { return strings.ToLower(strings.TrimSpace(value)) }
+
+// normalizeRepository canonicalizes only the authoritative host component.
+// Repository path components and local paths remain case-sensitive.
+func normalizeRepository(value string) string {
+	s := strings.TrimSpace(value)
+	if strings.Contains(s, "://") {
+		if u, err := url.Parse(s); err == nil && u.Host != "" {
+			u.Scheme, u.Host = strings.ToLower(u.Scheme), strings.ToLower(u.Host)
+			return u.String()
+		}
+	}
+	if slash := strings.IndexByte(s, '/'); slash > 0 {
+		host := strings.ToLower(s[:slash])
+		switch host {
+		case "github.com", "gitlab.com", "bitbucket.org":
+			return host + s[slash:]
+		}
+	}
+	return s
+}
 func validHerdrSurface(value string) bool {
 	return value == SurfaceHerdrDispatch || value == SurfaceHerdrSend || value == SurfaceHerdrReview
 }
@@ -321,7 +342,14 @@ func (s *EvidenceStore) Append(c Contract, key []byte, attempt Attempt, reason e
 	}
 	if n, writeErr := evidenceWrite(s.file, b); writeErr != nil || n != len(b) {
 		s.next--
-		rollbackErr := rollbackAppend(s.file, appendOffset)
+		rollbackErr := evidenceRollback(s.file, appendOffset)
+		if rollbackErr != nil {
+			primary := io.ErrShortWrite
+			if writeErr != nil {
+				primary = writeErr
+			}
+			return DenialEvidence{}, s.quarantine(errors.Join(primary, rollbackErr))
+		}
 		if writeErr != nil {
 			return DenialEvidence{}, errors.Join(writeErr, rollbackErr)
 		}
@@ -347,14 +375,28 @@ func (s *EvidenceStore) readbackLocked() error {
 	if _, err := s.file.Seek(0, io.SeekStart); err != nil {
 		return err
 	}
-	dec := json.NewDecoder(s.file)
+	data, err := io.ReadAll(s.file)
+	if err != nil {
+		return err
+	}
+	if len(data) == 0 {
+		s.next = 0
+		_, err := s.file.Seek(0, io.SeekEnd)
+		return err
+	}
+	// JSONL commit framing is the trailing newline. A complete JSON object
+	// without it is an uncertain crash tail, never a committed record.
+	if data[len(data)-1] != '\n' {
+		return ErrEvidence
+	}
+	lines := bytes.Split(data[:len(data)-1], []byte{'\n'})
 	var last DenialEvidence
-	for {
-		var e DenialEvidence
-		err := dec.Decode(&e)
-		if errors.Is(err, io.EOF) {
-			break
+	for _, line := range lines {
+		if len(line) == 0 {
+			return ErrEvidence
 		}
+		var e DenialEvidence
+		err := json.Unmarshal(line, &e)
 		if err != nil || e.Sequence != last.Sequence+1 || e.Sequence < 1 || e.Repository == "" || e.Task == "" || e.Lane == "" || e.Role == "" || e.HerdrSession == "" || e.HerdrTab == "" || e.HerdrPane == "" || e.ContractDigest == "" || e.ContractAuthTag == "" || e.ParentExecutionFamily == "" || e.AllowedHerdrSurface == "" || e.Outcome != "denied" || e.RecordMAC == "" || e.Operation == "" || e.AttemptedRepo == "" || e.AttemptedSurface == "" || e.AttemptedFamily == "" || !hmac.Equal([]byte(e.RecordMAC), []byte(recordMAC(e, s.key))) {
 			return ErrEvidence
 		}
@@ -372,7 +414,7 @@ func (s *EvidenceStore) readbackLocked() error {
 		last = e
 	}
 	s.next = last.Sequence
-	_, err := s.file.Seek(0, io.SeekEnd)
+	_, err = s.file.Seek(0, io.SeekEnd)
 	return err
 }
 
@@ -383,6 +425,7 @@ var evidenceSync = func(f *os.File) error { return f.Sync() }
 var evidenceLock = func(fd int, how int) error { return syscall.Flock(fd, how) }
 
 var evidenceUnlock = func(fd int, how int) error { return syscall.Flock(fd, how) }
+var evidenceRollback = rollbackAppend
 
 func rollbackAppend(f *os.File, offset int64) error {
 	if err := f.Truncate(offset); err != nil {

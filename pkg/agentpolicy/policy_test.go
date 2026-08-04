@@ -29,7 +29,7 @@ func attempt(op Operation, child ChildKind) Attempt {
 	if op == OperationHerdrDispatch {
 		surface = SurfaceHerdrDispatch
 	}
-	return Attempt{Operation: op, Child: child, Repository: "github.com/kampe/herdforge", Surface: surface, Family: "codex"}
+	return Attempt{Operation: op, Child: child, Repository: "github.com/Kampe/Herdforge", Surface: surface, Family: "codex"}
 }
 
 func TestContractBindsAndAuthenticatesAllFields(t *testing.T) {
@@ -55,6 +55,35 @@ func TestOpaqueHerdrIDsRemainCaseSensitive(t *testing.T) {
 	}
 	if a.PolicyDigest == b.PolicyDigest || a.AuthTag == b.AuthTag {
 		t.Fatal("case-distinct Herdr identities must not collide")
+	}
+}
+
+func TestRepositoryCanonicalizationPreservesCaseSensitivePaths(t *testing.T) {
+	key := []byte("fixture-key")
+	hostCase, err := NewContract("GitHub.com/Kampe/Herdforge", "task", "lane", "role", 1, "session", "tab", "pane", "codex", SurfaceHerdrDispatch, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hostPathCase, err := NewContract("github.com/kampe/Herdforge", "task", "lane", "role", 1, "session", "tab", "pane", "codex", SurfaceHerdrDispatch, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hostCase.Repository != "github.com/Kampe/Herdforge" {
+		t.Fatalf("host canonicalization changed path: %q", hostCase.Repository)
+	}
+	if hostCase.PolicyDigest == hostPathCase.PolicyDigest {
+		t.Fatal("Git-host path case must remain identity-bearing")
+	}
+	localUpper, err := NewContract("/Volumes/Forge/CaseRepo", "task", "lane", "role", 1, "session", "tab", "pane", "codex", SurfaceHerdrDispatch, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	localLower, err := NewContract("/volumes/forge/caserepo", "task", "lane", "role", 1, "session", "tab", "pane", "codex", SurfaceHerdrDispatch, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if localUpper.PolicyDigest == localLower.PolicyDigest {
+		t.Fatal("local path case must remain identity-bearing")
 	}
 }
 
@@ -232,6 +261,15 @@ func TestEvidenceRecordMACRejectsTamperingAndPartialTail(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if err := os.WriteFile(path, b[:len(b)-1], 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewEvidenceStore(path, key); !errors.Is(err, ErrEvidence) {
+		t.Fatal("complete JSON without trailing newline must fail closed")
+	}
+	if err := os.WriteFile(path, b, 0600); err != nil {
+		t.Fatal(err)
+	}
 	var allowed DenialEvidence
 	if err := json.Unmarshal(b, &allowed); err != nil {
 		t.Fatal(err)
@@ -329,4 +367,23 @@ func TestEvidenceShortWriteFailsClosed(t *testing.T) {
 		}
 		_ = reopened.Close()
 	}
+}
+
+func TestRollbackFailureQuarantinesStore(t *testing.T) {
+	c, key := testContract(t)
+	s, err := NewEvidenceStore(filepath.Join(t.TempDir(), "denials.jsonl"), key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldWrite, oldRollback := evidenceWrite, evidenceRollback
+	evidenceWrite = func(_ *os.File, b []byte) (int, error) { return len(b) - 1, nil }
+	evidenceRollback = func(*os.File, int64) error { return errors.New("rollback fixture") }
+	if _, err := s.Append(c, key, attempt(OperationNestedAgent, ChildClaudeAgent), ErrDenied); err == nil || !strings.Contains(err.Error(), "rollback fixture") {
+		t.Fatalf("rollback failure not surfaced: %v", err)
+	}
+	evidenceWrite, evidenceRollback = oldWrite, oldRollback
+	if _, err := s.Append(c, key, attempt(OperationNestedAgent, ChildRecovery), ErrDenied); !errors.Is(err, ErrEvidence) {
+		t.Fatalf("rollback uncertainty must quarantine store: %v", err)
+	}
+	_ = s.Close()
 }
