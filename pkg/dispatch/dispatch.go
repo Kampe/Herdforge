@@ -25,8 +25,10 @@ import (
 // AuthenticatedRepositoryIdentity is the sole production repository binding
 // used by launch/lifecycle authority. The config project name is display-only.
 func AuthenticatedRepositoryIdentity(root string) (string, error) {
-	return toolchild.RepositoryIdentity(root)
+	return authenticatedRepositoryIdentity(root)
 }
+
+var authenticatedRepositoryIdentity = toolchild.RepositoryIdentity
 
 func (d *Dispatcher) repositoryIdentity() (string, error) {
 	root := "."
@@ -35,6 +37,9 @@ func (d *Dispatcher) repositoryIdentity() (string, error) {
 	}
 	id, err := AuthenticatedRepositoryIdentity(root)
 	if err == nil {
+		if strings.TrimSpace(id) == "" {
+			return "", fmt.Errorf("authenticated repository identity is empty")
+		}
 		return id, nil
 	}
 	if d.Production {
@@ -255,11 +260,13 @@ func (d *Dispatcher) ownershipClaimer() (deps.OwnershipClaimer, error) {
 	if root == "" {
 		root = "."
 	}
-	repo := ""
+	repo, err := d.repositoryIdentity()
+	if err != nil {
+		return nil, fmt.Errorf("dispatch: repository identity: %w", err)
+	}
 	providerType := "memory"
 	project := ""
 	if d.Config != nil {
-		repo, _ = d.repositoryIdentity()
 		providerType = d.Config.TaskProvider.Type
 		project = d.Config.TaskProvider.ProjectID
 	}
@@ -742,10 +749,7 @@ func (d *Dispatcher) launch(
 		timeout = 60 * time.Second
 	}
 
-	repository := ""
-	if d.Config != nil {
-		repository, _ = d.repositoryIdentity()
-	}
+	repository := request.Repository
 	identity := control.LaneIdentity{Repository: repository, TaskRef: task.Ref, Lane: lane.Name, LeaseGeneration: result.LeaseGeneration, CandidateSHA: wtInfo.BaseSHA}
 	if identity.Repository == "" || identity.CandidateSHA == "" {
 		identity.Repository = repository

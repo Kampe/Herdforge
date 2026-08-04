@@ -122,6 +122,7 @@ type StaleCard struct {
 	Ref   string `json:"ref"`
 	Owner string `json:"owner"`
 	Lane  string `json:"lane"`
+	Role  string `json:"role"`
 }
 
 type HoldTarget struct {
@@ -180,7 +181,11 @@ type Engine struct {
 	// HoldLaneResolver maps a configured role label to its canonical lane.
 	// Production composition must provide it when HoldReader is configured.
 	HoldLaneResolver func(role string) (string, error)
-	HoldRoles        []string
+	// HoldLiveAgentResolver maps a typed live standing ID to its configured
+	// role and canonical lane. It prevents live IDs from being interpreted as
+	// roles or lanes by act-mode side effects.
+	HoldLiveAgentResolver func(string) (string, string, error)
+	HoldRoles             []string
 
 	// Test seams.
 	TestClaimAttempts          int
@@ -1209,7 +1214,15 @@ func (e *Engine) computeSummary(agentsWrapper struct {
 			if c.Blocked {
 				s.Blocked++
 				s.BlockedRefs = append(s.BlockedRefs, c.Ref)
-				s.BlockedTargets = append(s.BlockedTargets, HoldTarget{Repository: repoRoot(), Owner: c.Role, Lane: c.Role, Task: c.Ref, Scope: "task"})
+				canonicalLane := c.Lane
+				if e.HoldLaneResolver != nil && c.Role != "" {
+					if resolved, err := e.HoldLaneResolver(c.Role); err == nil {
+						canonicalLane = resolved
+					} else {
+						canonicalLane = ""
+					}
+				}
+				s.BlockedTargets = append(s.BlockedTargets, HoldTarget{Repository: repoRoot(), Owner: c.Role, Lane: canonicalLane, Task: c.Ref, Scope: "task"})
 			} else {
 				if e.holdBlocks(context.Background(), c.Role, c.Role, c.Ref) {
 					s.OccupiedRefs = append(s.OccupiedRefs, c.Ref)
@@ -1222,7 +1235,7 @@ func (e *Engine) computeSummary(agentsWrapper struct {
 			s.InProgress++
 			if c.Owner == "" || !liveOwner(c.Owner) {
 				s.StaleInProgress++
-				s.StaleCards = append(s.StaleCards, StaleCard{Ref: c.Ref, Owner: c.Lane, Lane: c.Lane})
+				s.StaleCards = append(s.StaleCards, StaleCard{Ref: c.Ref, Owner: c.Role, Lane: c.Lane, Role: c.Role})
 				s.Unutilized = append(s.Unutilized, c.Ref)
 			} else {
 				s.Utilized = append(s.Utilized, c.Ref)
@@ -1309,8 +1322,15 @@ func (e *Engine) executeActMode(stateRoot, leaseRoot string, s *Summary, agentsJ
 	if s.StaleInProgress > 0 {
 		reclaimHook := e.ReclaimHook
 		for _, sc := range s.StaleCards {
-			if err := e.checkHold(sc.Ref, sc.Lane, sc.Owner); err != nil {
+			if strings.TrimSpace(sc.Role) == "" {
+				return fmt.Errorf("lifecycle: stale card %s has no configured role", sc.Ref)
+			}
+			held, err := e.targetHeld(context.Background(), sc.Role, sc.Ref)
+			if err != nil {
 				return err
+			}
+			if held {
+				continue
 			}
 			if reclaimHook != "" {
 				cmd := exec.Command(reclaimHook,
@@ -1349,9 +1369,19 @@ func (e *Engine) executeActMode(stateRoot, leaseRoot string, s *Summary, agentsJ
 	if s.Todo > 0 && s.Dispatchable == 0 && s.Blocked == s.Todo {
 		blocked := make([]string, 0, len(s.BlockedTargets))
 		for _, target := range s.BlockedTargets {
-			held, err := e.targetHeld(context.Background(), target.Lane, target.Task)
+			if strings.TrimSpace(target.Owner) == "" || strings.TrimSpace(target.Lane) == "" || strings.TrimSpace(target.Task) == "" {
+				return fmt.Errorf("lifecycle: blocked target has incomplete canonical role/lane/task identity: %+v", target)
+			}
+			lane, err := e.resolveRoleLane(target.Owner)
+			if err != nil || lane != target.Lane {
+				if err == nil {
+					err = fmt.Errorf("resolved lane %q does not match target lane %q", lane, target.Lane)
+				}
+				return fmt.Errorf("lifecycle: blocked target identity: %w", err)
+			}
+			held, err := e.targetHeld(context.Background(), target.Owner, target.Task)
 			if err != nil {
-				held = true
+				return err
 			}
 			if !held {
 				blocked = append(blocked, target.Task)
@@ -1422,7 +1452,24 @@ func (e *Engine) executeActMode(stateRoot, leaseRoot string, s *Summary, agentsJ
 	// 3. Kick settled lanes with dispatchable queue.
 	if s.Dispatchable > 0 && len(s.Settled) > 0 {
 		for _, settled := range s.Settled {
-			if err := e.checkLaneHold(settled.Name, settled.Name); err != nil {
+			if e.HoldReader != nil && e.HoldLaneResolver == nil {
+				return fmt.Errorf("lifecycle: canonical lane resolver is required")
+			}
+			role, lane := settled.Name, settled.Name
+			if e.HoldReader != nil {
+				if e.HoldLiveAgentResolver == nil {
+					return fmt.Errorf("lifecycle: live-agent canonical resolver is required")
+				}
+				var err error
+				role, lane, err = e.HoldLiveAgentResolver(settled.Name)
+				if err != nil || strings.TrimSpace(role) == "" || strings.TrimSpace(lane) == "" {
+					if err == nil {
+						err = fmt.Errorf("unknown configured live agent %q", settled.Name)
+					}
+					return fmt.Errorf("lifecycle: settled lane %s: %w", settled.Name, err)
+				}
+			}
+			if err := e.checkLaneHold(lane, role); err != nil {
 				return err
 			}
 			cmd := exec.Command(e.kickBin(), "--no-raise", "--quiet", "--reason", "lifecycle: dispatchable queue", settled.Name)
@@ -1709,6 +1756,20 @@ func (e *Engine) targetHeld(ctx context.Context, role, task string) (bool, error
 		}
 	}
 	return false, nil
+}
+
+func (e *Engine) resolveRoleLane(role string) (string, error) {
+	if e.HoldLaneResolver == nil {
+		return "", fmt.Errorf("lifecycle: canonical lane resolver is required")
+	}
+	lane, err := e.HoldLaneResolver(role)
+	if err != nil {
+		return "", err
+	}
+	if strings.TrimSpace(lane) == "" {
+		return "", fmt.Errorf("unknown configured role %q", role)
+	}
+	return lane, nil
 }
 
 func (e *Engine) authoritativeReadback(action, refOrRefs, replacementRef, lane, owner string) ([]byte, error) {

@@ -215,10 +215,12 @@ func (m *ClaimManager) CompleteProviderTransition(ctx context.Context, key Lease
 	}
 
 	if _, err := m.store.AcquireProviderLock(ctx, key, ownerID, generation, m.settlerID, providerLockStaleAfter, m.now()); err != nil {
-		_ = m.outboxStore.MarkFailed(ctx, idempotencyKey, m.settlerID, err.Error(), m.now())
-		return nil, fmt.Errorf("%w: %w", ErrLeaseNotCurrent, err)
+		markErr := m.outboxStore.MarkFailed(ctx, idempotencyKey, m.settlerID, err.Error(), m.now())
+		return nil, errors.Join(fmt.Errorf("%w: %w", ErrLeaseNotCurrent, err), markErr)
 	}
-	defer func() { _ = m.store.ReleaseProviderLock(ctx, key, generation, m.settlerID) }()
+	release := func(rec *OutboxRecord, primary error) (*OutboxRecord, error) {
+		return rec, errors.Join(primary, m.store.ReleaseProviderLock(ctx, key, generation, m.settlerID))
+	}
 
 	if completeProviderTransitionTestHook != nil {
 		// Fires with the lock already held, immediately before the
@@ -230,13 +232,16 @@ func (m *ClaimManager) CompleteProviderTransition(ctx context.Context, key Lease
 	}
 
 	if _, casErr := m.provider.CompareAndSwap(ctx, taskID, expectedRevision, generation, mutate); casErr != nil {
-		_ = m.outboxStore.MarkFailed(ctx, idempotencyKey, m.settlerID, casErr.Error(), m.now())
-		return m.outboxStore.Get(ctx, idempotencyKey)
+		markErr := m.outboxStore.MarkFailed(ctx, idempotencyKey, m.settlerID, casErr.Error(), m.now())
+		rec, getErr := m.outboxStore.Get(ctx, idempotencyKey)
+		return release(rec, errors.Join(casErr, markErr, getErr))
 	}
 	if err := m.outboxStore.MarkApplied(ctx, idempotencyKey, m.settlerID, m.now()); err != nil {
-		return nil, fmt.Errorf("claim: mark provider transition applied: %w", err)
+		rec, getErr := m.outboxStore.Get(ctx, idempotencyKey)
+		return release(rec, errors.Join(fmt.Errorf("claim: mark provider transition applied: %w", err), getErr))
 	}
-	return m.outboxStore.Get(ctx, idempotencyKey)
+	rec, getErr := m.outboxStore.Get(ctx, idempotencyKey)
+	return release(rec, getErr)
 }
 
 // completeProviderTransitionTestHook, when non-nil, runs once per

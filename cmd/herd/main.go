@@ -3180,6 +3180,13 @@ func runLifecycle() {
 		}
 		return lane.Name, nil
 	}
+	eng.HoldLiveAgentResolver = func(agent string) (string, string, error) {
+		lane, err := roleRegistry.ResolveLiveAgentID(agent)
+		if err != nil {
+			return "", "", err
+		}
+		return lane.Role, lane.Name, nil
+	}
 	eng.HoldIdentity = func(task, lane, owner string) lifecycle.HoldIdentity {
 		scope := "task"
 		if task == "" {

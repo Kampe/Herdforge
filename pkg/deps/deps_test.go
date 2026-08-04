@@ -155,6 +155,44 @@ func configureTestLaneResolver(o *LeaseOwnership) {
 	}
 }
 
+func TestClaimExclusiveRandomFailureFailsBeforeLeaseMutation(t *testing.T) {
+	ownership, err := OpenLeaseOwnership(filepath.Join(t.TempDir(), "launch.db"), "repo", "memory", "p")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ownership.Close()
+	configureTestLaneResolver(ownership)
+
+	randomErr := errors.New("random source unavailable")
+	previous := ownerRandomRead
+	ownerRandomRead = func([]byte) (int, error) { return 0, randomErr }
+	defer func() { ownerRandomRead = previous }()
+
+	if _, err := ownership.ClaimExclusive(context.Background(), "id", "FAC-RAND", "worker", "rev", "", ""); !errors.Is(err, randomErr) {
+		t.Fatalf("random failure was not attributable: %v", err)
+	}
+	current, err := ownership.Store.(claim.LeaseSnapshotStore).CurrentLease(context.Background(), ownership.key("FAC-RAND"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current != nil {
+		t.Fatalf("random failure created a lease: %+v", current)
+	}
+}
+
+func TestLeaseOwnershipCloseJoinsHoldAndStoreErrors(t *testing.T) {
+	holdErr := errors.New("hold close failed")
+	storeErr := errors.New("store close failed")
+	ownership := &LeaseOwnership{
+		holdClose:  func() error { return holdErr },
+		storeClose: func() error { return storeErr },
+	}
+	err := ownership.Close()
+	if !errors.Is(err, holdErr) || !errors.Is(err, storeErr) {
+		t.Fatalf("close lost one or both errors: %v", err)
+	}
+}
+
 func TestClaimExclusiveMissingLaneResolverFailsBeforeLeaseMutation(t *testing.T) {
 	ownership, err := OpenLeaseOwnership(filepath.Join(t.TempDir(), "launch.db"), "herd", "memory", "p")
 	if err != nil {
