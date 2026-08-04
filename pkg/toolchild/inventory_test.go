@@ -383,6 +383,7 @@ func TestRecoveryRescansOwnerAndResumesPendingIntentPhase(t *testing.T) {
 		t.Fatal(err)
 	}
 	ownerRecords := 0
+	teardownRecords := 0
 	for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
 		var receipt Receipt
 		if err := json.Unmarshal([]byte(line), &receipt); err != nil {
@@ -391,10 +392,12 @@ func TestRecoveryRescansOwnerAndResumesPendingIntentPhase(t *testing.T) {
 		if receipt.Action == "owner" {
 			ownerRecords++
 		}
+		if receipt.Action == "teardown" { teardownRecords++ }
 	}
 	if ownerRecords != 1 {
 		t.Fatalf("phase-3 recovery restarted Begin: owner records=%d", ownerRecords)
 	}
+	if teardownRecords != 2 { t.Fatalf("phase-3 recovery left known children pending: teardown records=%d", teardownRecords) }
 }
 
 type failingTree struct {
