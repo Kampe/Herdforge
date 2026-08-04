@@ -3,6 +3,7 @@ package resources
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"math"
 	"os"
@@ -195,6 +196,88 @@ type DiskAdmissionFunc func(DiskRequest) DiskDecision
 
 func (f DiskAdmissionFunc) Admit(request DiskRequest) DiskDecision { return f(request) }
 
+// DiskAdmissionPlan is the complete set of capacity scopes for one
+// concurrent mutation batch. Requests are sorted by opaque filesystem ID so
+// admission order is deterministic and every scope is admitted exactly once.
+type DiskAdmissionPlan struct {
+	Requests []DiskRequest
+	Scopes   []string
+}
+
+// DiskPlanProvider lets an admission authority resolve canonical volume
+// identities and aggregate a complete batch before any callback is launched.
+type DiskPlanProvider interface {
+	PlanDiskAdmission([]DiskRequest) (DiskAdmissionPlan, error)
+}
+
+// BatchDiskAdmission admits an already-authoritative plan. Implementations
+// must not probe or mutate between scopes and must return the first denial.
+type BatchDiskAdmission interface {
+	AdmitDiskPlan(DiskAdmissionPlan) error
+}
+
+// DiskAdmissionError retains the bounded, path-free evidence produced by a
+// denied scope. Callers must propagate this error rather than reconstructing
+// a lossy reason string.
+type DiskAdmissionError struct {
+	Scope    string
+	Decision DiskDecision
+}
+
+func (e *DiskAdmissionError) Error() string {
+	evidence := marshalDiskEvidence(e.Decision.Evidence)
+	return fmt.Sprintf("disk capacity gate blocked scope %s: state=%s evidence=%s", e.Scope, e.Decision.State, evidence)
+}
+
+func marshalDiskEvidence(evidence DiskEvidence) []byte {
+	clean := func(value float64) float64 {
+		if math.IsNaN(value) || math.IsInf(value, 0) {
+			return 0
+		}
+		return value
+	}
+	evidence.FreePercent = clean(evidence.FreePercent)
+	evidence.ReservePercent = clean(evidence.ReservePercent)
+	if evidence.TempFreePercent != nil {
+		value := clean(*evidence.TempFreePercent)
+		evidence.TempFreePercent = &value
+	}
+	if evidence.FailedFreePercent != nil {
+		value := clean(*evidence.FailedFreePercent)
+		evidence.FailedFreePercent = &value
+	}
+	data, err := json.Marshal(evidence)
+	if err != nil {
+		return []byte(`{"kind":"disk_pressure","reason":"invalid","next_action":"retry_capacity_probe"}`)
+	}
+	return data
+}
+
+// AdmitDiskPlan admits every planned scope once and stops at the first
+// denial; no mutation callback is reachable until this returns nil.
+func AdmitDiskPlan(admission DiskAdmission, plan DiskAdmissionPlan) error {
+	if admission == nil {
+		return fmt.Errorf("disk capacity gate unavailable")
+	}
+	if len(plan.Requests) == 0 || len(plan.Requests) != len(plan.Scopes) {
+		return fmt.Errorf("disk capacity gate: incomplete admission plan")
+	}
+	seen := make(map[string]struct{}, len(plan.Scopes))
+	for _, scope := range plan.Scopes {
+		if scope == "" {
+			return fmt.Errorf("disk capacity gate: incomplete admission plan")
+		}
+		if _, ok := seen[scope]; ok {
+			return fmt.Errorf("disk capacity gate: duplicate admission scope %s", scope)
+		}
+		seen[scope] = struct{}{}
+	}
+	if batch, ok := admission.(BatchDiskAdmission); ok {
+		return batch.AdmitDiskPlan(plan)
+	}
+	return fmt.Errorf("disk capacity gate: batch admission unavailable")
+}
+
 // CapacityGate adds hysteresis to the pure evaluator while keeping probing
 // and policy explicit. The mutex makes one gate safe for concurrent callers.
 type CapacityGate struct {
@@ -230,6 +313,139 @@ func (g *CapacityGate) Admit(request DiskRequest) DiskDecision {
 		g.blocked[scope] = true
 	}
 	return decision
+}
+
+// PlanDiskAdmission resolves every path once, groups requirements by the
+// canonical filesystem identity reported by the read-only backend, and
+// aggregates bytes/inodes with overflow checks. Each volume receives the
+// total headroom for all operations that can grow it.
+func (g *CapacityGate) PlanDiskAdmission(requests []DiskRequest) (DiskAdmissionPlan, error) {
+	if g == nil || g.Backend == nil {
+		return DiskAdmissionPlan{}, fmt.Errorf("disk capacity gate unavailable")
+	}
+	totals := make(map[string]DiskRequirement)
+	paths := make(map[string]string)
+	for _, request := range requests {
+		if request.RequiredBytes == 0 || request.RequiredInodes == 0 {
+			return DiskAdmissionPlan{}, &DiskAdmissionError{Scope: "plan", Decision: diskBlocked(DiskEvidence{Operation: "harvest_batch", RequiredBytes: request.RequiredBytes, RequiredInodes: request.RequiredInodes}, DiskReasonInvalid)}
+		}
+		seen := make(map[string]struct{})
+		seenVolumes := make(map[string]struct{})
+		for _, path := range append([]string{request.Path, request.TempPath}, request.AdditionalPaths...) {
+			if strings.TrimSpace(path) == "" {
+				continue
+			}
+			canonical, err := ResolveExistingPath(path)
+			if err != nil {
+				return DiskAdmissionPlan{}, &DiskAdmissionError{Scope: "plan", Decision: diskBlocked(DiskEvidence{Operation: "harvest_batch", RequiredBytes: request.RequiredBytes, RequiredInodes: request.RequiredInodes}, DiskReasonUnavailable)}
+			}
+			if _, ok := seen[canonical]; ok {
+				continue
+			}
+			seen[canonical] = struct{}{}
+			capacity, err := g.Backend.StatFS(canonical)
+			if err != nil {
+				return DiskAdmissionPlan{}, &DiskAdmissionError{Scope: "plan", Decision: diskBlocked(DiskEvidence{Operation: "harvest_batch", RequiredBytes: request.RequiredBytes, RequiredInodes: request.RequiredInodes}, DiskReasonUnavailable)}
+			}
+			if err := validCapacity(capacity); err != nil || strings.TrimSpace(capacity.FilesystemID) == "" {
+				return DiskAdmissionPlan{}, &DiskAdmissionError{Scope: "plan", Decision: diskBlocked(DiskEvidence{Operation: "harvest_batch", RequiredBytes: request.RequiredBytes, RequiredInodes: request.RequiredInodes}, DiskReasonInvalid)}
+			}
+			id := safeDiskIdentity(capacity.FilesystemID)
+			if _, ok := seenVolumes[id]; ok {
+				continue
+			}
+			seenVolumes[id] = struct{}{}
+			current := totals[id]
+			combined, err := AggregateDiskRequirement(current, DiskRequirement{Bytes: request.RequiredBytes, Inodes: request.RequiredInodes})
+			if err != nil {
+				return DiskAdmissionPlan{}, &DiskAdmissionError{Scope: id, Decision: diskBlocked(DiskEvidence{Operation: "harvest_batch", FilesystemID: id, RequiredBytes: request.RequiredBytes, RequiredInodes: request.RequiredInodes}, DiskReasonInvalid)}
+			}
+			totals[id] = combined
+			paths[id] = canonical
+		}
+	}
+	ids := make([]string, 0, len(totals))
+	for id := range totals {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	plan := DiskAdmissionPlan{Requests: make([]DiskRequest, 0, len(ids)), Scopes: ids}
+	for _, id := range ids {
+		plan.Requests = append(plan.Requests, DiskRequest{Operation: "harvest_batch", Path: paths[id], RequiredBytes: totals[id].Bytes, RequiredInodes: totals[id].Inodes})
+	}
+	if len(plan.Requests) == 0 {
+		return DiskAdmissionPlan{}, &DiskAdmissionError{Scope: "plan", Decision: diskBlocked(DiskEvidence{Operation: "harvest_batch"}, DiskReasonInvalid)}
+	}
+	return plan, nil
+}
+
+// AdmitDiskPlan preserves hysteresis by canonical filesystem identity rather
+// than by whichever path happened to represent that volume in the batch.
+func (g *CapacityGate) AdmitDiskPlan(plan DiskAdmissionPlan) error {
+	if g == nil {
+		return fmt.Errorf("disk capacity gate unavailable")
+	}
+	if len(plan.Requests) != len(plan.Scopes) || len(plan.Requests) == 0 {
+		return fmt.Errorf("disk capacity gate: incomplete admission plan")
+	}
+	seen := make(map[string]struct{}, len(plan.Scopes))
+	for _, scope := range plan.Scopes {
+		if scope == "" {
+			return fmt.Errorf("disk capacity gate: incomplete admission plan")
+		}
+		if _, ok := seen[scope]; ok {
+			return fmt.Errorf("disk capacity gate: duplicate admission scope %s", scope)
+		}
+		seen[scope] = struct{}{}
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	decisions := make([]DiskDecision, len(plan.Requests))
+	failed := -1
+	for i, request := range plan.Requests {
+		request.PreviouslyBlocked = g.blocked[plan.Scopes[i]]
+		decisions[i] = EvaluateDiskCapacity(g.Backend, request, g.Policy)
+		if !decisions[i].Allowed {
+			if failed < 0 {
+				failed = i
+			}
+		}
+	}
+	if len(decisions) != len(plan.Requests) || len(decisions) != len(plan.Scopes) {
+		return &DiskAdmissionError{Scope: "plan", Decision: diskBlocked(DiskEvidence{Operation: "harvest_batch"}, DiskReasonInvalid)}
+	}
+	for i, decision := range decisions {
+		freshID := strings.TrimSpace(decision.Evidence.FilesystemID)
+		if !validFilesystemIdentity(freshID) || safeDiskIdentity(freshID) != plan.Scopes[i] {
+			return &DiskAdmissionError{Scope: plan.Scopes[i], Decision: DiskDecision{
+				State: DiskBlocked,
+				Evidence: DiskEvidence{
+					Kind: "disk_pressure", Reason: DiskReasonInvalid,
+					FilesystemID: safeDiskIdentity(freshID), ScopeID: plan.Scopes[i],
+					NextAction: DiskActionRetryProbe,
+				},
+			}}
+		}
+		decisions[i].Evidence.ScopeID = plan.Scopes[i]
+	}
+	if g.blocked == nil {
+		g.blocked = make(map[string]bool)
+	}
+	for i := range decisions {
+		if decisions[i].Allowed {
+			delete(g.blocked, plan.Scopes[i])
+		} else {
+			g.blocked[plan.Scopes[i]] = true
+		}
+	}
+	if failed >= 0 {
+		return &DiskAdmissionError{Scope: plan.Scopes[failed], Decision: decisions[failed]}
+	}
+	return nil
+}
+
+func validFilesystemIdentity(identity string) bool {
+	return strings.TrimSpace(identity) != "" && safeDiskIdentity(identity) != "unknown"
 }
 
 // CapacityScopeForPaths returns a stable opaque identity for a canonical set
