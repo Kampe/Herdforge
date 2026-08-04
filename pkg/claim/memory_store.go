@@ -156,15 +156,41 @@ func (s *InMemoryLeaseStore) ExpireLeaseCAS(_ context.Context, id, generation in
 	return cloneLease(l), true, nil
 }
 
-func (s *InMemoryLeaseStore) ForceReleaseProviderLockCAS(_ context.Context, id, generation int64) error {
+func (s *InMemoryLeaseStore) ObserveStaleProviderLock(_ context.Context, key LeaseKey, now time.Time) (*ProviderLockObservation, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	l := s.rows[id]
-	if l == nil || l.Generation != generation || l.Status != StatusActive {
-		return fmt.Errorf("provider lock CAS lease mismatch")
+	l := s.activeLocked(key)
+	if l == nil {
+		return nil, nil
 	}
-	delete(s.provLock, id)
-	return nil
+	p := s.provLock[l.ID]
+	if p == nil || !p.lockedAt.Before(now.Add(-5*time.Minute)) {
+		return nil, nil
+	}
+	return &ProviderLockObservation{LeaseID: l.ID, Generation: l.Generation, Owner: p.owner, LockedAt: p.lockedAt, ObservedAt: now, RecoveryOwner: fmt.Sprintf("fac69-recovery-%d-%d", l.ID, l.Generation)}, nil
+}
+
+func (s *InMemoryLeaseStore) ClaimProviderLockCAS(_ context.Context, o ProviderLockObservation) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	l := s.rows[o.LeaseID]
+	p := s.provLock[o.LeaseID]
+	if l == nil || p == nil || l.Generation != o.Generation || l.Status != StatusActive || p.owner != o.Owner || !p.lockedAt.Equal(o.LockedAt) || !p.lockedAt.Before(o.ObservedAt.Add(-5*time.Minute)) {
+		return false, nil
+	}
+	p.owner = o.RecoveryOwner
+	return true, nil
+}
+
+func (s *InMemoryLeaseStore) FinalizeProviderLockCAS(_ context.Context, o ProviderLockObservation) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	p := s.provLock[o.LeaseID]
+	if p == nil || p.owner != o.RecoveryOwner {
+		return false, nil
+	}
+	delete(s.provLock, o.LeaseID)
+	return true, nil
 }
 
 func (s *InMemoryLeaseStore) acquire(_ context.Context, key LeaseKey, ownerID, role, worktreePath, holdRepository, holdOwner, holdLane string, now time.Time, ttl time.Duration) (*Lease, error) {
