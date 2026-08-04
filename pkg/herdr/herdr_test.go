@@ -784,6 +784,133 @@ func TestResumeRejectsMissingAndStaleReceiptsWithoutProcessOrPrompt(t *testing.T
 	}
 }
 
+func standingResumeFixture(t *testing.T, durable bool) (launch.Request, *toolchild.Lifecycle, AgentEntry, string) {
+	t.Helper()
+	t.Setenv("HERD_LAUNCH_RECEIPTS", t.TempDir()+"/launch.jsonl")
+	d, err := testLaunchRouter(t).Decide(router.LaunchRequest{
+		Role: router.RoleWorker, Shape: launch.Implementation, TaskRef: "FAC-188",
+		LeaseGeneration: 7, RequestedProvider: launch.WorkerProvider,
+		RequestedModel: launch.WorkerModel, RequestedEffort: launch.WorkerEffort,
+		Scope:        router.ScopeTask,
+		ProbeResults: map[string]bool{router.ProbeKey(launch.WorkerProvider, launch.WorkerModel): true},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := launch.Request{Decision: d, TaskRef: "FAC-188", Name: "forge-worker", PaneID: "pane-standing", LeaseGeneration: 7, Scope: router.ScopeTask, Repository: "repo-standing", Lane: "worker"}
+	digest := launch.DecisionDigest(d)
+	owner := toolchild.Identity{PID: 900, StartToken: "owner-start", SessionGeneration: 42, LaunchID: digest, Repository: req.Repository, Role: string(d.Role), Lane: req.Lane, SessionID: "herdr-session", PaneID: req.PaneID, TabID: "tab-standing", Provider: d.Provider, ArgvDigest: digest, Argv: append([]string(nil), d.Argv...), TaskRef: req.TaskRef, Name: req.Name}
+	lc := toolchild.NewLifecycle(owner, &toolchild.FakeTree{}, &toolchild.MemorySink{})
+	path := t.TempDir() + "/toolchild.jsonl"
+	if durable {
+		sink := &toolchild.JSONLSink{Path: path}
+		if err := sink.Write(toolchild.Receipt{Action: "owner", Identity: owner, Reason: "exact launch owner bound"}); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv("HERD_TOOLCHILD_RECEIPTS", path)
+	} else {
+		toolChildMu.Lock()
+		toolChildByTab[owner.TabID] = lc
+		toolChildByPane[owner.PaneID] = lc
+		toolChildMu.Unlock()
+		t.Cleanup(func() { dropToolChild(owner.TabID, owner.PaneID) })
+	}
+	started := req
+	started.SessionGeneration = owner.SessionGeneration
+	if err := launch.RecordStarted(started, nil); err != nil {
+		t.Fatal(err)
+	}
+	agent := AgentEntry{Name: owner.Name, Kind: owner.Provider, Status: "working", PaneID: owner.PaneID, TabID: owner.TabID}
+	agent.Session.Value = owner.SessionID
+	req.SessionGeneration = 0
+	return req, lc, agent, path
+}
+
+func TestStandingResumeRecoversGenerationFromTaskLaunchRequestShape(t *testing.T) {
+	req, lc, agent, _ := standingResumeFixture(t, false)
+	oldRun := runHerdr
+	defer func() { runHerdr = oldRun }()
+	var calls [][]string
+	runHerdr = func(args ...string) (string, error) {
+		calls = append(calls, append([]string(nil), args...))
+		if len(args) == 2 && args[0] == "agent" && args[1] == "list" {
+			b, _ := json.Marshal(struct {
+				Result struct {
+					Agents []AgentEntry `json:"agents"`
+				} `json:"result"`
+			}{Result: struct {
+				Agents []AgentEntry `json:"agents"`
+			}{Agents: []AgentEntry{agent}}})
+			return string(b), nil
+		}
+		return "", fmt.Errorf("unexpected process or tab side effect: %v", args)
+	}
+	if _, err := ResolveAgentTabWithDecision(agent.Name, req); err != nil {
+		t.Fatal(err)
+	}
+	if lc.Inventory.Owner.SessionGeneration != 42 || len(calls) != 1 {
+		t.Fatalf("standing lane was not reused exactly: generation=%d calls=%v", lc.Inventory.Owner.SessionGeneration, calls)
+	}
+}
+
+func TestStandingResumeRecoversGenerationAfterCoordinatorRestart(t *testing.T) {
+	req, _, agent, path := standingResumeFixture(t, true)
+	oldRun := runHerdr
+	defer func() { runHerdr = oldRun }()
+	toolChildMu.Lock()
+	toolChildByTab = map[string]ToolChildLifecycle{}
+	toolChildByPane = map[string]ToolChildLifecycle{}
+	toolChildMu.Unlock()
+	runHerdr = func(args ...string) (string, error) {
+		if len(args) == 2 && args[0] == "agent" && args[1] == "list" {
+			return fmt.Sprintf(`{"result":{"agents":[{"name":%q,"agent":%q,"agent_status":"working","pane_id":%q,"tab_id":%q,"agent_session":{"value":%q}}]}}`, agent.Name, agent.Kind, agent.PaneID, agent.TabID, agent.Session.Value), nil
+		}
+		return "", fmt.Errorf("unexpected process or tab side effect: %v", args)
+	}
+	if _, err := ResolveAgentTabWithDecision(agent.Name, req); err != nil {
+		t.Fatalf("restart recovery from %s failed: %v", path, err)
+	}
+	if lifecycleForTab(agent.TabID) == nil {
+		t.Fatal("restart recovery did not retain exact lifecycle authority")
+	}
+}
+
+func TestStandingResumeRejectsLifecycleTupleMismatches(t *testing.T) {
+	cases := []struct {
+		name   string
+		mutate func(*toolchild.Identity, *AgentEntry, *launch.Request)
+	}{
+		{name: "repository", mutate: func(o *toolchild.Identity, _ *AgentEntry, _ *launch.Request) { o.Repository = "other" }},
+		{name: "task", mutate: func(o *toolchild.Identity, _ *AgentEntry, _ *launch.Request) { o.TaskRef = "FAC-other" }},
+		{name: "lane", mutate: func(o *toolchild.Identity, _ *AgentEntry, _ *launch.Request) { o.Lane = "other" }},
+		{name: "provider", mutate: func(o *toolchild.Identity, _ *AgentEntry, _ *launch.Request) { o.Provider = "other" }},
+		{name: "digest", mutate: func(o *toolchild.Identity, _ *AgentEntry, _ *launch.Request) { o.LaunchID = "other" }},
+		{name: "argv", mutate: func(o *toolchild.Identity, _ *AgentEntry, _ *launch.Request) { o.Argv = []string{"codex", "mutated"} }},
+		{name: "session", mutate: func(_ *toolchild.Identity, a *AgentEntry, _ *launch.Request) { a.Session.Value = "other" }},
+		{name: "pane", mutate: func(o *toolchild.Identity, a *AgentEntry, _ *launch.Request) { o.PaneID, a.PaneID = "other", "other" }},
+		{name: "generation", mutate: func(o *toolchild.Identity, _ *AgentEntry, r *launch.Request) {
+			r.SessionGeneration = o.SessionGeneration + 1
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req, lc, agent, _ := standingResumeFixture(t, false)
+			tc.mutate(&lc.Inventory.Owner, &agent, &req)
+			oldRun := runHerdr
+			defer func() { runHerdr = oldRun }()
+			runHerdr = func(args ...string) (string, error) {
+				if len(args) == 2 && args[0] == "agent" && args[1] == "list" {
+					return fmt.Sprintf(`{"result":{"agents":[{"name":%q,"agent":%q,"agent_status":"working","pane_id":%q,"tab_id":%q,"agent_session":{"value":%q}}]}}`, agent.Name, agent.Kind, agent.PaneID, agent.TabID, agent.Session.Value), nil
+				}
+				return "", fmt.Errorf("unexpected side effect: %v", args)
+			}
+			if _, err := ResolveAgentTabWithDecision(agent.Name, req); !errors.Is(err, ErrAgentIdentityMismatch) {
+				t.Fatalf("mismatch %s was not fail-closed: %v", tc.name, err)
+			}
+		})
+	}
+}
+
 func TestReceiptFailureClosesAndVerifiesExactTab(t *testing.T) {
 	t.Setenv("HERD_LAUNCH_RECEIPTS", "/dev/null/launch-receipts.jsonl")
 	d, err := testLaunchRouter(t).Decide(router.LaunchRequest{Role: router.RoleWorker, Shape: launch.Implementation, RequestedProvider: launch.WorkerProvider, RequestedModel: launch.WorkerModel, RequestedEffort: launch.WorkerEffort, TaskRef: "FAC-188", LeaseGeneration: 7, Scope: router.ScopeTask, ProbeResults: map[string]bool{router.ProbeKey(launch.WorkerProvider, launch.WorkerModel): true}})
