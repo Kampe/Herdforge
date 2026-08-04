@@ -53,7 +53,22 @@ func (h *HarnessConfig) BuildPolicyInvocation(prompt string, policy agentpolicy.
 		argv = []string{h.BinaryName, "--mcp-config", "{}", "--strict-mcp-config", "--disable-slash-commands", "--disallowed-tools", "Agent", "Task", "-p", prompt}
 	}
 	if h.Type == HarnessCodex {
-		argv = append([]string{h.BinaryName, "--disable", "multi_agent", "--disable", "multi_agent_v2"}, prompt)
+		promptIndex := -1
+		for index := 1; index < len(argv); index++ {
+			if argv[index] == prompt {
+				promptIndex = index
+				break
+			}
+		}
+		if promptIndex < 0 {
+			return PolicyInvocation{}, fmt.Errorf("harness %q compiled invocation lost prompt", h.Type)
+		}
+		composed := append([]string(nil), argv[:1]...)
+		composed = append(composed, "--disable", "multi_agent", "--disable", "multi_agent_v2")
+		composed = append(composed, argv[1:promptIndex]...)
+		composed = append(composed, argv[promptIndex+1:]...)
+		composed = append(composed, prompt)
+		argv = composed
 	}
 	return PolicyInvocation{Argv: argv, PolicyDigest: policy.PolicyDigest, ParentSession: policy.HerdrSession}, nil
 }
