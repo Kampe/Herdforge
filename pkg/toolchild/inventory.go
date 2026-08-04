@@ -315,6 +315,68 @@ type JSONLSink struct {
 	mu   sync.Mutex
 }
 
+var (
+	receiptIOMu     sync.RWMutex
+	receiptWrite    = func(f *os.File, b []byte) (int, error) { return f.Write(b) }
+	receiptSync     = func(f *os.File) error { return f.Sync() }
+	directorySyncMu sync.RWMutex
+	directorySyncFn = syncDirectory
+)
+
+func setReceiptIOForTest(write func(*os.File, []byte) (int, error), syncFn func(*os.File) error) func() {
+	receiptIOMu.Lock()
+	defer receiptIOMu.Unlock()
+	oldWrite, oldSync := receiptWrite, receiptSync
+	if write == nil {
+		receiptWrite = func(f *os.File, b []byte) (int, error) { return f.Write(b) }
+	} else {
+		receiptWrite = write
+	}
+	if syncFn == nil {
+		receiptSync = func(f *os.File) error { return f.Sync() }
+	} else {
+		receiptSync = syncFn
+	}
+	return func() { receiptIOMu.Lock(); receiptWrite, receiptSync = oldWrite, oldSync; receiptIOMu.Unlock() }
+}
+
+func writeReceiptFile(f *os.File, b []byte) (int, error) {
+	receiptIOMu.RLock()
+	defer receiptIOMu.RUnlock()
+	return receiptWrite(f, b)
+}
+func syncReceiptFile(f *os.File) error {
+	receiptIOMu.RLock()
+	defer receiptIOMu.RUnlock()
+	return receiptSync(f)
+}
+
+func syncDirectory(path string) error {
+	dir, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	return errors.Join(dir.Sync(), dir.Close())
+}
+
+func syncDirectoryPath(path string) error {
+	directorySyncMu.RLock()
+	defer directorySyncMu.RUnlock()
+	return directorySyncFn(filepathDir(path))
+}
+
+func setDirectorySyncForTest(fn func(string) error) func() {
+	directorySyncMu.Lock()
+	old := directorySyncFn
+	if fn == nil {
+		directorySyncFn = syncDirectory
+	} else {
+		directorySyncFn = fn
+	}
+	directorySyncMu.Unlock()
+	return func() { directorySyncMu.Lock(); directorySyncFn = old; directorySyncMu.Unlock() }
+}
+
 func StableReceiptPath(repository string) (string, error) {
 	repository = strings.TrimSpace(repository)
 	if repository == "" {
@@ -347,28 +409,21 @@ func NextSessionGeneration(repository string) (result int64, err error) {
 		return 0, err
 	}
 	defer func() { err = errors.Join(err, releaseReceiptLock(lock)) }()
-	b, readErr := os.ReadFile(path)
-	if readErr != nil && !os.IsNotExist(readErr) {
-		return 0, readErr
+	maximum, historyErr := readReceiptGenerationHistory(path, repository)
+	if historyErr != nil {
+		return 0, corruptReceipt(path, historyErr)
 	}
-	if readErr == nil {
-		if len(b) == 0 || b[len(b)-1] != '\n' {
-			return 0, corruptReceipt(path, fmt.Errorf("corrupt lifecycle receipt: incomplete final frame"))
-		}
-		for _, line := range strings.Split(strings.TrimSuffix(string(b), "\n"), "\n") {
-			if strings.TrimSpace(line) == "" {
-				return 0, corruptReceipt(path, fmt.Errorf("corrupt lifecycle receipt"))
-			}
-			var r Receipt
-			if err := json.Unmarshal([]byte(line), &r); err != nil {
-				return 0, corruptReceipt(path, err)
-			}
-			if r.Identity.SessionGeneration > result {
-				result = r.Identity.SessionGeneration
-			}
-		}
+	highWater, err := readGenerationHighWater(path, repository)
+	if err != nil {
+		return 0, err
 	}
-	result++
+	if maximum > highWater {
+		highWater = maximum
+	}
+	result = highWater + 1
+	if err := writeGenerationHighWater(path, repository, result); err != nil {
+		return 0, err
+	}
 	reservation, err := json.Marshal(Receipt{Action: "session-reservation", Identity: Identity{Repository: repository, SessionGeneration: result}})
 	if err != nil {
 		return 0, err
@@ -378,18 +433,22 @@ func NextSessionGeneration(repository string) (result int64, err error) {
 		return 0, err
 	}
 	frame := append(reservation, '\n')
-	if n, writeErr := f.Write(frame); writeErr != nil || n != len(frame) {
+	if n, writeErr := writeReceiptFile(f, frame); writeErr != nil || n != len(frame) {
 		closeErr := f.Close()
 		if writeErr == nil {
 			writeErr = io.ErrShortWrite
 		}
 		return 0, errors.Join(writeErr, closeErr, quarantineReceipt(path))
 	}
-	if err := f.Sync(); err != nil {
-		return 0, errors.Join(err, f.Close())
+	if err := syncReceiptFile(f); err != nil {
+		closeErr := f.Close()
+		return 0, errors.Join(err, closeErr, quarantineReceipt(path))
 	}
 	if err := f.Close(); err != nil {
 		return 0, err
+	}
+	if err := syncDirectoryPath(path); err != nil {
+		return 0, fmt.Errorf("reservation directory durability: %w", err)
 	}
 	// Read back while holding the same lock. Returning a generation without
 	// this proof would let a concurrent coordinator use an uncommitted value.
@@ -403,6 +462,110 @@ func NextSessionGeneration(repository string) (result int64, err error) {
 		return 0, fmt.Errorf("session reservation readback mismatch")
 	}
 	return result, nil
+}
+
+func readReceiptGenerationHistory(path, repository string) (int64, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0, nil
+		}
+		return 0, err
+	}
+	if len(b) == 0 || b[len(b)-1] != '\n' {
+		return 0, fmt.Errorf("corrupt lifecycle receipt: incomplete final frame")
+	}
+	var maximum int64
+	for _, line := range strings.Split(strings.TrimSuffix(string(b), "\n"), "\n") {
+		if strings.TrimSpace(line) == "" {
+			return 0, fmt.Errorf("corrupt lifecycle receipt")
+		}
+		var r Receipt
+		if err := json.Unmarshal([]byte(line), &r); err != nil {
+			return 0, err
+		}
+		if r.Identity.Repository != "" && r.Identity.Repository != repository {
+			return 0, fmt.Errorf("receipt repository identity mismatch")
+		}
+		if r.Identity.SessionGeneration > maximum {
+			maximum = r.Identity.SessionGeneration
+		}
+	}
+	return maximum, nil
+}
+
+type generationHighWater struct {
+	Repository string `json:"repository"`
+	Generation int64  `json:"generation"`
+}
+
+func generationHighWaterPath(receiptPath string) string { return receiptPath + ".generation" }
+
+func readGenerationHighWater(receiptPath, repository string) (int64, error) {
+	b, err := os.ReadFile(generationHighWaterPath(receiptPath))
+	if os.IsNotExist(err) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	if len(b) == 0 || b[len(b)-1] != '\n' {
+		return 0, fmt.Errorf("corrupt generation high-water record")
+	}
+	var record generationHighWater
+	if err := json.Unmarshal([]byte(strings.TrimSuffix(string(b), "\n")), &record); err != nil {
+		return 0, err
+	}
+	if record.Repository != repository || record.Generation <= 0 {
+		return 0, fmt.Errorf("generation high-water identity mismatch")
+	}
+	return record.Generation, nil
+}
+
+func writeGenerationHighWater(receiptPath, repository string, generation int64) error {
+	b, err := json.Marshal(generationHighWater{Repository: repository, Generation: generation})
+	if err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(filepathDir(receiptPath), ".generation-*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath)
+	if err := tmp.Chmod(0600); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	frame := append(b, '\n')
+	if n, err := tmp.Write(frame); err != nil || n != len(frame) {
+		if err == nil {
+			err = io.ErrShortWrite
+		}
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpPath, generationHighWaterPath(receiptPath)); err != nil {
+		return err
+	}
+	if err := syncDirectoryPath(receiptPath); err != nil {
+		return fmt.Errorf("generation high-water directory durability: %w", err)
+	}
+	readback, err := readGenerationHighWater(receiptPath, repository)
+	if err != nil {
+		return err
+	}
+	if readback != generation {
+		return fmt.Errorf("generation high-water readback mismatch")
+	}
+	return nil
 }
 
 func quarantineReceipt(path string) error {
@@ -430,7 +593,8 @@ func quarantineReceipt(path string) error {
 				writeErr = io.ErrShortWrite
 			}
 		}
-		return errors.Join(writeErr, syncErr, closeErr)
+		directoryErr := syncDirectoryPath(path)
+		return errors.Join(writeErr, syncErr, closeErr, directoryErr)
 	}
 	return fmt.Errorf("unable to allocate non-overwriting receipt quarantine")
 }
@@ -478,18 +642,28 @@ func (s *JSONLSink) Write(r Receipt) (err error) {
 	if err != nil {
 		return fmt.Errorf("open tool-child receipt: %w", err)
 	}
-	defer func() { err = errors.Join(err, f.Close()) }()
 	b, err := json.Marshal(r)
 	if err != nil {
+		_ = f.Close()
 		return fmt.Errorf("marshal tool-child receipt: %w", err)
 	}
 	line := append(b, '\n')
-	if n, err := f.Write(line); err != nil {
-		return fmt.Errorf("write tool-child receipt: %w", err)
-	} else if n != len(line) {
-		return errors.Join(io.ErrShortWrite, quarantineReceipt(s.Path))
+	n, writeErr := writeReceiptFile(f, line)
+	if writeErr != nil || n != len(line) {
+		closeErr := f.Close()
+		if writeErr == nil {
+			writeErr = io.ErrShortWrite
+		}
+		return errors.Join(fmt.Errorf("write tool-child receipt: %w", writeErr), closeErr, quarantineReceipt(s.Path))
 	}
-	return f.Sync()
+	if syncErr := syncReceiptFile(f); syncErr != nil {
+		closeErr := f.Close()
+		return errors.Join(fmt.Errorf("sync tool-child receipt: %w", syncErr), closeErr, quarantineReceipt(s.Path))
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	return syncDirectoryPath(s.Path)
 }
 
 // filepathDir is kept local so the package has one narrow filesystem seam.

@@ -155,6 +155,128 @@ func TestCorruptLedgerQuarantinePreservesHistoryAndBlocksReservation(t *testing.
 	}
 }
 
+func TestReceiptWriteAndSyncFaultsQuarantinePartialEvidence(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		write func(*os.File, []byte) (int, error)
+		sync  func(*os.File) error
+	}{
+		{name: "partial-with-error", write: func(f *os.File, b []byte) (int, error) {
+			n, _ := f.Write(b[:len(b)-1])
+			return n, errors.New("injected partial write")
+		}, sync: func(*os.File) error { return nil }},
+		{name: "fsync-error", write: nil, sync: func(*os.File) error { return errors.New("injected durability failure") }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := t.TempDir() + "/receipts.jsonl"
+			restore := setReceiptIOForTest(tc.write, tc.sync)
+			defer restore()
+			if err := (&JSONLSink{Path: path}).Write(Receipt{Action: "owner", Identity: owner()}); err == nil {
+				t.Fatal("fault was accepted")
+			}
+			if _, err := os.Stat(path + ".quarantine"); err != nil {
+				t.Fatalf("fault evidence was not quarantined: %v", err)
+			}
+		})
+	}
+}
+
+func TestReservationUsesValidQuarantineHistoryAfterOriginalRecovery(t *testing.T) {
+	t.Setenv("HERD_TOOLCHILD_RECEIPT_ROOT", t.TempDir())
+	if generation, err := NextSessionGeneration("repo-recovered"); err != nil || generation != 1 {
+		t.Fatalf("initial generation=%d err=%v", generation, err)
+	}
+	path, err := StableReceiptPath("repo-recovered")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := quarantineReceipt(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	next, err := NextSessionGeneration("repo-recovered")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if next != 2 {
+		t.Fatalf("recovered generation=%d want 2", next)
+	}
+}
+
+func TestPartialReservationAfterGenerationNRecoversAboveHighWater(t *testing.T) {
+	t.Setenv("HERD_TOOLCHILD_RECEIPT_ROOT", t.TempDir())
+	if generation, err := NextSessionGeneration("repo-partial-recovery"); err != nil || generation != 1 {
+		t.Fatalf("initial generation=%d err=%v", generation, err)
+	}
+	path, err := StableReceiptPath("repo-partial-recovery")
+	if err != nil {
+		t.Fatal(err)
+	}
+	restore := setReceiptIOForTest(func(f *os.File, b []byte) (int, error) {
+		n, _ := f.Write(b[:len(b)-1])
+		return n, errors.New("injected reservation partial")
+	}, nil)
+	_, reservationErr := NextSessionGeneration("repo-partial-recovery")
+	restore()
+	if reservationErr == nil {
+		t.Fatal("partial reservation was accepted")
+	}
+	if _, err := os.Stat(path + ".quarantine"); err != nil {
+		t.Fatalf("partial reservation evidence missing: %v", err)
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	} // explicit authenticated repair step
+	next, err := NextSessionGeneration("repo-partial-recovery")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if next <= 1 {
+		t.Fatalf("recovered reservation reused generation: %d", next)
+	}
+	if _, err := os.Stat(path + ".quarantine"); err != nil {
+		t.Fatalf("corrupt evidence was lost: %v", err)
+	}
+}
+
+func TestDirectoryDurabilityFailureBlocksBeforeReservationReturn(t *testing.T) {
+	t.Setenv("HERD_TOOLCHILD_RECEIPT_ROOT", t.TempDir())
+	path, err := StableReceiptPath("repo-dir-failure")
+	if err != nil {
+		t.Fatal(err)
+	}
+	restore := setDirectorySyncForTest(func(string) error { return errors.New("injected directory fsync failure") })
+	if _, err := NextSessionGeneration("repo-dir-failure"); err == nil {
+		t.Fatal("generation returned without directory durability")
+	}
+	if _, statErr := os.Stat(path); !os.IsNotExist(statErr) {
+		t.Fatalf("reservation was appended before high-water directory durability: %v", statErr)
+	}
+	restore()
+	next, err := NextSessionGeneration("repo-dir-failure")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if next <= 1 {
+		t.Fatalf("directory failure permitted generation reuse: %d", next)
+	}
+}
+
+func TestReceiptDirectoryDurabilityFailureIsObservable(t *testing.T) {
+	path := t.TempDir() + "/receipts.jsonl"
+	restore := setDirectorySyncForTest(func(string) error { return errors.New("injected receipt directory fsync failure") })
+	err := (&JSONLSink{Path: path}).Write(Receipt{Action: "owner", Identity: owner()})
+	restore()
+	if err == nil {
+		t.Fatal("receipt write returned before directory durability")
+	}
+	if _, statErr := os.Stat(path); statErr != nil {
+		t.Fatalf("receipt bytes were not retained: %v", statErr)
+	}
+}
+
 func TestLifecycleReadersRejectUnframedFinalRecord(t *testing.T) {
 	path := t.TempDir() + "/receipts.jsonl"
 	ow := owner()
