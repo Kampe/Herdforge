@@ -2,6 +2,7 @@ package scopefence
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"testing"
 )
@@ -11,6 +12,18 @@ type countingStore struct {
 	cas   int
 }
 
+type testGraphAuthority struct{ graph Graph }
+
+type missingExpectationAuthority struct{}
+
+func (missingExpectationAuthority) Current(context.Context) (TrustedGraph, error) {
+	return TrustedGraph{Snapshot: Graph{Revision: "g1", Nodes: 10, Edges: 20, Files: 2, Flows: 1, Complete: true}}, nil
+}
+
+func (a testGraphAuthority) Current(context.Context) (TrustedGraph, error) {
+	return TrustedGraph{Snapshot: a.graph, ExpectedRevision: a.graph.Revision, ExpectedFiles: a.graph.Files}, nil
+}
+
 func (s *countingStore) Read(ctx context.Context) (Snapshot, error) { return s.inner.Read(ctx) }
 func (s *countingStore) CompareAndSwap(ctx context.Context, rev string, next []Ownership) (bool, error) {
 	s.cas++
@@ -18,13 +31,16 @@ func (s *countingStore) CompareAndSwap(ctx context.Context, rev string, next []O
 }
 
 func scope(pkg, file, symbol string) Scope {
+	if symbol != "" && !strings.Contains(symbol, "::") && file != "" {
+		symbol = file + "::" + symbol
+	}
 	return Scope{Packages: []string{pkg}, Files: []string{file}, Symbols: []string{symbol}}
 }
 func req(task, branch string, gen int64, s Scope) AcquireRequest {
 	return AcquireRequest{Ownership: Ownership{Identity: Identity{Repository: "repo", Branch: branch, Task: task}, Generation: gen, Scope: s, State: Active, GraphRevision: "g1", GraphFiles: 2}, Graph: Graph{Revision: "g1", Nodes: 10, Edges: 20, Files: 2, Flows: 1, Complete: true}, ExpectedGraphRevision: "g1", ExpectedGraphFiles: 2}
 }
 func fence(store Store) Fence {
-	return Fence{Store: store, Verify: func(context.Context, ReleaseRequest) bool { return true }}
+	return Fence{Store: store, Verify: func(context.Context, ReleaseRequest) bool { return true }, Graph: testGraphAuthority{graph: Graph{Revision: "g1", Nodes: 10, Edges: 20, Files: 2, Flows: 1, Complete: true}}}
 }
 
 func TestAcquireBlocksCleanUnadmittedAndNamesOverlap(t *testing.T) {
@@ -66,14 +82,34 @@ func TestContainmentAndCanonicalDeclarationOverlap(t *testing.T) {
 	}
 }
 
+func TestSymbolOnlyOverlapPolicy(t *testing.T) {
+	owner := req("FAC-185", "symbol-owner", 1, Scope{Symbols: []string{"pkg/a/file.go::Run"}}).Ownership
+	for _, candidate := range []Scope{{Symbols: []string{"pkg/a/file.go::Run"}}, {Symbols: []string{"pkg/a/file.go::Other"}}} {
+		d, _ := fence(NewMemoryStore(owner)).Acquire(context.Background(), req("FAC-186", "symbol-candidate", 1, candidate))
+		if d.Granted || d.Evidence.Reason != ReasonScopeOverlap {
+			t.Fatalf("symbol-only policy missed %+v: %+v", candidate, d)
+		}
+	}
+}
+
+func TestRawScopeValidationRejectsAliasesAndMalformedDeclarations(t *testing.T) {
+	driveLike := "C:" + string([]byte{92}) + "repo" + string([]byte{92}) + "file.go"
+	for _, s := range []Scope{{Files: []string{"pkg/a/../b.go"}}, {Files: []string{driveLike}}, {Files: []string{"pkg/a\x00.go"}}, {Symbols: []string{"pkg/a/file.go:::Run"}}} {
+		d, _ := fence(NewMemoryStore()).Acquire(context.Background(), req("FAC-187", "unsafe", 1, s))
+		if d.Granted || d.Evidence.Reason != ReasonInvalidScope {
+			t.Fatalf("unsafe raw scope accepted: %+v => %+v", s, d)
+		}
+	}
+}
+
 func TestExactIdentityIsIdempotentButChangedFenceBlocks(t *testing.T) {
 	base := req("FAC-1", "same", 4, scope("pkg/a", "pkg/a.go", "pkg/a.go::Run")).Ownership
 	store := &countingStore{inner: NewMemoryStore(base)}
-	d, err := (Fence{Store: store}).Acquire(context.Background(), req("FAC-1", "same", 4, scope("pkg/a", "pkg/a.go", "pkg/a.go::Run")))
+	d, err := fence(store).Acquire(context.Background(), req("FAC-1", "same", 4, scope("pkg/a", "pkg/a.go", "pkg/a.go::Run")))
 	if err != nil || !d.Granted || store.cas != 0 {
 		t.Fatalf("idempotent acquire used CAS: %+v cas=%d", d, store.cas)
 	}
-	d, _ = (Fence{Store: store}).Acquire(context.Background(), req("FAC-1", "same", 5, scope("pkg/a", "pkg/a.go", "pkg/a.go::Run")))
+	d, _ = fence(store).Acquire(context.Background(), req("FAC-1", "same", 5, scope("pkg/a", "pkg/a.go", "pkg/a.go::Run")))
 	if d.Granted || d.Evidence.Reason != ReasonIdentityConflict {
 		t.Fatalf("changed generation was accepted: %+v", d)
 	}
@@ -81,8 +117,9 @@ func TestExactIdentityIsIdempotentButChangedFenceBlocks(t *testing.T) {
 
 func TestConflictEvidenceContainsBothOwnersAndGraphBinding(t *testing.T) {
 	owner := req("FAC-2", "other", 8, scope("pkg/a", "pkg/a.go", "pkg/a.go::Run")).Ownership
+	owner.GraphRevision, owner.GraphFiles = "owner-graph", 7
 	d, _ := fence(NewMemoryStore(owner)).Acquire(context.Background(), req("FAC-1", "candidate", 3, scope("pkg/a", "pkg/a.go", "pkg/a.go::Run")))
-	if d.Granted || d.Evidence.Task != "FAC-1" || d.Evidence.ConflictTask != "FAC-2" || d.Evidence.ConflictBranch != "other" || d.Evidence.ConflictGeneration != 8 || d.Evidence.GraphRevision != "g1" || d.Evidence.GraphFiles != 2 || d.Evidence.ConflictRepository != "repo" {
+	if d.Granted || d.Evidence.Task != "FAC-1" || d.Evidence.ConflictTask != "FAC-2" || d.Evidence.ConflictBranch != "other" || d.Evidence.ConflictGeneration != 8 || d.Evidence.GraphRevision != "g1" || d.Evidence.GraphFiles != 2 || d.Evidence.ConflictGraphRevision != "owner-graph" || d.Evidence.ConflictGraphFiles != 7 || d.Evidence.ConflictRepository != "repo" {
 		t.Fatalf("incomplete evidence: %+v", d.Evidence)
 	}
 }
@@ -90,9 +127,16 @@ func TestConflictEvidenceContainsBothOwnersAndGraphBinding(t *testing.T) {
 func TestGraphExpectationsAndDeepCopy(t *testing.T) {
 	r := req("FAC-1", "one", 1, scope("pkg/a", "pkg/a.go", "pkg/a.go::Run"))
 	r.ExpectedGraphRevision = "g2"
+	r.Graph.Revision, r.Graph.Files, r.Graph.Complete = "forged", 999, false
 	d, _ := fence(NewMemoryStore()).Acquire(context.Background(), r)
+	if !d.Granted || d.Evidence.GraphRevision != "g1" || d.Evidence.GraphFiles != 2 {
+		t.Fatalf("request graph was trusted over authority: %+v", d)
+	}
+	badGraphFence := fence(NewMemoryStore())
+	badGraphFence.Graph = testGraphAuthority{graph: Graph{Revision: "bad", Nodes: 1, Edges: 1, Files: 1, Flows: 0, Complete: false}}
+	d, _ = badGraphFence.Acquire(context.Background(), req("FAC-2", "two", 1, scope("pkg/b", "pkg/b.go", "B")))
 	if d.Granted || d.Evidence.Reason != ReasonGraphInvalid {
-		t.Fatalf("stale graph accepted: %+v", d)
+		t.Fatalf("invalid trusted graph accepted: %+v", d)
 	}
 	input := req("FAC-1", "one", 1, scope("pkg/a", "pkg/a.go", "pkg/a.go::Run")).Ownership
 	store := NewMemoryStore(input)
@@ -105,6 +149,19 @@ func TestGraphExpectationsAndDeepCopy(t *testing.T) {
 	}
 }
 
+func TestGraphAuthorityIsMandatory(t *testing.T) {
+	d, _ := (Fence{Store: NewMemoryStore()}).Acquire(context.Background(), req("FAC-188", "no-graph", 1, scope("pkg/a", "pkg/a.go", "Run")))
+	if d.Granted || d.Evidence.Reason != ReasonGraphUntrusted {
+		t.Fatalf("self-attested graph was allowed: %+v", d)
+	}
+	f := fence(NewMemoryStore())
+	f.Graph = missingExpectationAuthority{}
+	d, _ = f.Acquire(context.Background(), req("FAC-189", "missing-expectation", 1, scope("pkg/a", "pkg/a.go", "Run")))
+	if d.Granted || d.Evidence.Reason != ReasonGraphInvalid {
+		t.Fatalf("missing trusted expectations were allowed: %+v", d)
+	}
+}
+
 func TestDisjointAndGraphValidation(t *testing.T) {
 	d, _ := fence(NewMemoryStore()).Acquire(context.Background(), req("FAC-183", "one", 1, scope("pkg/a", "pkg/a.go", "A")))
 	if !d.Granted {
@@ -112,7 +169,9 @@ func TestDisjointAndGraphValidation(t *testing.T) {
 	}
 	r := req("FAC-184", "two", 1, scope("pkg/b", "pkg/b.go", "B"))
 	r.Graph.Complete = false
-	d, _ = fence(NewMemoryStore()).Acquire(context.Background(), r)
+	badGraphFence := fence(NewMemoryStore())
+	badGraphFence.Graph = testGraphAuthority{graph: r.Graph}
+	d, _ = badGraphFence.Acquire(context.Background(), r)
 	if d.Granted || d.Evidence.Reason == "" {
 		t.Fatal("incomplete graph must block")
 	}
@@ -123,7 +182,9 @@ func TestDisjointAndGraphValidation(t *testing.T) {
 	}
 	r = req("FAC-186", "four", 1, scope("pkg/c", "pkg/c.go", "C"))
 	r.Graph.Flows = 0
-	d, _ = fence(NewMemoryStore()).Acquire(context.Background(), r)
+	badGraphFence = fence(NewMemoryStore())
+	badGraphFence.Graph = testGraphAuthority{graph: r.Graph}
+	d, _ = badGraphFence.Acquire(context.Background(), r)
 	if d.Granted || d.Evidence.Reason == "" {
 		t.Fatal("zero-flow graph must be blocked")
 	}
@@ -201,7 +262,7 @@ func TestCanceledAcquireNeverCallsCAS(t *testing.T) {
 	store := &countingStore{inner: NewMemoryStore()}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	d, err := (Fence{Store: store}).Acquire(ctx, req("FAC-1", "one", 1, scope("pkg/a", "pkg/a.go", "pkg/a.go::Run")))
+	d, err := fence(store).Acquire(ctx, req("FAC-1", "one", 1, scope("pkg/a", "pkg/a.go", "pkg/a.go::Run")))
 	if err == nil || d.Evidence.Reason != ReasonContextCanceled || store.cas != 0 {
 		t.Fatalf("canceled acquire crossed CAS: %+v err=%v cas=%d", d, err, store.cas)
 	}

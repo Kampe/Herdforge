@@ -28,6 +28,8 @@ const (
 	ReasonIdentityConflict    = "identity_conflict"
 	ReasonCASContention       = "cas_contention"
 	ReasonContextCanceled     = "context_canceled"
+	ReasonInvalidScope        = "invalid_scope"
+	ReasonGraphUntrusted      = "graph_untrusted"
 )
 
 type State string
@@ -81,20 +83,22 @@ type AcquireRequest struct {
 }
 
 type Evidence struct {
-	Repository         string   `json:"repository"`
-	Task               string   `json:"task"`
-	Branch             string   `json:"branch"`
-	Generation         int64    `json:"generation"`
-	ConflictRepository string   `json:"conflict_repository,omitempty"`
-	ConflictTask       string   `json:"conflict_task,omitempty"`
-	ConflictBranch     string   `json:"conflict_branch,omitempty"`
-	ConflictGeneration int64    `json:"conflict_generation,omitempty"`
-	Packages           []string `json:"packages,omitempty"`
-	Files              []string `json:"files,omitempty"`
-	Symbols            []string `json:"symbols,omitempty"`
-	GraphRevision      string   `json:"graph_revision"`
-	GraphFiles         int      `json:"graph_files"`
-	Reason             string   `json:"reason"`
+	Repository            string   `json:"repository"`
+	Task                  string   `json:"task"`
+	Branch                string   `json:"branch"`
+	Generation            int64    `json:"generation"`
+	ConflictRepository    string   `json:"conflict_repository,omitempty"`
+	ConflictTask          string   `json:"conflict_task,omitempty"`
+	ConflictBranch        string   `json:"conflict_branch,omitempty"`
+	ConflictGeneration    int64    `json:"conflict_generation,omitempty"`
+	ConflictGraphRevision string   `json:"conflict_graph_revision,omitempty"`
+	ConflictGraphFiles    int      `json:"conflict_graph_files,omitempty"`
+	Packages              []string `json:"packages,omitempty"`
+	Files                 []string `json:"files,omitempty"`
+	Symbols               []string `json:"symbols,omitempty"`
+	GraphRevision         string   `json:"graph_revision"`
+	GraphFiles            int      `json:"graph_files"`
+	Reason                string   `json:"reason"`
 }
 
 type Decision struct {
@@ -137,6 +141,22 @@ type ProofVerifier func(context.Context, ReleaseRequest) bool
 type Fence struct {
 	Store  Store
 	Verify ProofVerifier
+	Graph  GraphAuthority
+}
+
+// TrustedGraph carries observed graph data and expectations from the
+// separately wired authority. The request's graph fields are never sufficient
+// to authorize an acquire.
+type TrustedGraph struct {
+	Snapshot         Graph
+	ExpectedRevision string
+	ExpectedFiles    int
+}
+
+// GraphAuthority is a separately wired source of trusted graph truth and its
+// expected revision/file-count contract.
+type GraphAuthority interface {
+	Current(context.Context) (TrustedGraph, error)
 }
 
 var tokenPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._/:-]{0,127}$`)
@@ -147,7 +167,7 @@ func (s Scope) validate() error {
 	}
 	for _, group := range [][]string{s.Packages, s.Files, s.Symbols} {
 		for _, value := range group {
-			if value == "" || strings.HasPrefix(value, "/") || path.IsAbs(value) || path.Clean(value) != value || strings.Contains(value, "..") || !tokenPattern.MatchString(value) {
+			if !rawScopeValueValid(value) {
 				return fmt.Errorf("invalid scope value")
 			}
 		}
@@ -155,11 +175,39 @@ func (s Scope) validate() error {
 	return nil
 }
 
+func rawScopeValueValid(value string) bool {
+	if value == "" || strings.HasPrefix(value, "/") || path.IsAbs(value) || strings.Contains(value, "\\") || strings.ContainsRune(value, '\x00') || strings.HasPrefix(value, "~") || (len(value) >= 2 && value[1] == ':' && ((value[0] >= 'A' && value[0] <= 'Z') || (value[0] >= 'a' && value[0] <= 'z'))) || !tokenPattern.MatchString(value) {
+		return false
+	}
+	for _, part := range strings.Split(value, "/") {
+		if part == ".." {
+			return false
+		}
+		for _, r := range part {
+			if r < 0x20 || r == 0x7f {
+				return false
+			}
+		}
+	}
+	return true
+}
+
 func canonicalScope(s Scope) (Scope, error) {
 	clean := func(values []string, symbols bool) ([]string, error) {
 		seen := make(map[string]bool, len(values))
 		out := make([]string, 0, len(values))
 		for _, value := range values {
+			if !rawScopeValueValid(value) {
+				return nil, errors.New("invalid scope value")
+			}
+			if symbols {
+				parts := strings.Split(value, "::")
+				if len(parts) != 2 || parts[0] == "" || parts[1] == "" || strings.Contains(parts[1], ":") {
+					return nil, errors.New("invalid symbol declaration")
+				}
+			} else if strings.Contains(value, "::") {
+				return nil, errors.New("invalid declaration")
+			}
 			value = strings.ReplaceAll(value, "\\", "/")
 			if symbols {
 				if i := strings.Index(value, "::"); i > 0 {
@@ -253,6 +301,13 @@ func overlap(a, b Scope) (Evidence, bool) {
 	symbolPairs = append(symbolPairs, pairs(b.Symbols, a.Files, func(x, y string) bool { return strings.HasPrefix(x, y+"::") })...)
 	symbolPairs = append(symbolPairs, pairs(a.Packages, b.Symbols, func(x, y string) bool { return strings.HasPrefix(y, x+"/") })...)
 	symbolPairs = unique(append(symbolPairs, pairs(b.Packages, a.Symbols, func(x, y string) bool { return strings.HasPrefix(y, x+"/") })...))
+	symbolFile := func(value string) string {
+		if i := strings.Index(value, "::"); i > 0 {
+			return value[:i]
+		}
+		return ""
+	}
+	symbolPairs = unique(append(symbolPairs, pairs(a.Symbols, b.Symbols, func(x, y string) bool { return x == y || (symbolFile(x) != "" && symbolFile(x) == symbolFile(y)) })...))
 	e := Evidence{Packages: packagePairs, Files: filePairs, Symbols: symbolPairs}
 	return e, len(e.Packages)+len(e.Files)+len(e.Symbols) > 0
 }
@@ -287,7 +342,11 @@ func (f Fence) Acquire(ctx context.Context, req AcquireRequest) (Decision, error
 	}
 	canonical, err := canonicalScope(req.Scope)
 	if err != nil {
-		return Decision{Evidence: Evidence{Repository: req.Repository, Task: req.Task, Branch: req.Branch, Generation: req.Generation, Reason: ReasonMissingScope}}, nil
+		reason := ReasonInvalidScope
+		if len(req.Scope.Packages)+len(req.Scope.Files)+len(req.Scope.Symbols) == 0 {
+			reason = ReasonMissingScope
+		}
+		return Decision{Evidence: Evidence{Repository: req.Repository, Task: req.Task, Branch: req.Branch, Generation: req.Generation, Reason: reason}}, nil
 	}
 	req.Scope = canonical
 	if err := req.Identity.validate(); err != nil {
@@ -296,11 +355,19 @@ func (f Fence) Acquire(ctx context.Context, req AcquireRequest) (Decision, error
 	if req.Generation <= 0 {
 		return Decision{Evidence: Evidence{Repository: req.Repository, Task: req.Task, Branch: req.Branch, Generation: req.Generation, Reason: ReasonInvalidGeneration}}, nil
 	}
-	if err := req.Graph.validate(req.ExpectedGraphRevision, req.ExpectedGraphFiles); err != nil {
-		return Decision{Evidence: Evidence{Repository: req.Repository, Task: req.Task, Branch: req.Branch, Generation: req.Generation, GraphRevision: req.Graph.Revision, GraphFiles: req.Graph.Files, Reason: ReasonGraphInvalid}}, nil
+	if f.Graph == nil {
+		return Decision{Evidence: Evidence{Repository: req.Repository, Task: req.Task, Branch: req.Branch, Generation: req.Generation, Reason: ReasonGraphUntrusted}}, nil
 	}
-	req.GraphRevision, req.GraphFiles = req.Graph.Revision, req.Graph.Files
-	baseEvidence := Evidence{Repository: req.Repository, Task: req.Task, Branch: req.Branch, Generation: req.Generation, GraphRevision: req.Graph.Revision, GraphFiles: req.Graph.Files}
+	trusted, err := f.Graph.Current(ctx)
+	if err != nil {
+		return Decision{}, err
+	}
+	graph := trusted.Snapshot
+	if err := graph.validate(trusted.ExpectedRevision, trusted.ExpectedFiles); err != nil {
+		return Decision{Evidence: Evidence{Repository: req.Repository, Task: req.Task, Branch: req.Branch, Generation: req.Generation, GraphRevision: graph.Revision, GraphFiles: graph.Files, Reason: ReasonGraphInvalid}}, nil
+	}
+	req.GraphRevision, req.GraphFiles = graph.Revision, graph.Files
+	baseEvidence := Evidence{Repository: req.Repository, Task: req.Task, Branch: req.Branch, Generation: req.Generation, GraphRevision: graph.Revision, GraphFiles: graph.Files}
 	for attempts := 0; attempts < 4; attempts++ {
 		if err := ctx.Err(); err != nil {
 			baseEvidence.Reason = ReasonContextCanceled
@@ -324,13 +391,15 @@ func (f Fence) Acquire(ctx context.Context, req AcquireRequest) (Decision, error
 				}
 				baseEvidence.Reason = ReasonIdentityConflict
 				baseEvidence.ConflictRepository, baseEvidence.ConflictTask, baseEvidence.ConflictBranch, baseEvidence.ConflictGeneration = owner.Repository, owner.Task, owner.Branch, owner.Generation
+				baseEvidence.ConflictGraphRevision, baseEvidence.ConflictGraphFiles = owner.GraphRevision, owner.GraphFiles
 				return Decision{Evidence: baseEvidence}, nil
 			}
 			e, hit := overlap(req.Scope, owner.Scope)
 			if hit {
 				e.Repository, e.Task, e.Branch, e.Generation = req.Repository, req.Task, req.Branch, req.Generation
 				e.ConflictRepository, e.ConflictTask, e.ConflictBranch, e.ConflictGeneration = owner.Repository, owner.Task, owner.Branch, owner.Generation
-				e.GraphRevision, e.GraphFiles, e.Reason = req.Graph.Revision, req.Graph.Files, ReasonScopeOverlap
+				e.ConflictGraphRevision, e.ConflictGraphFiles = owner.GraphRevision, owner.GraphFiles
+				e.GraphRevision, e.GraphFiles, e.Reason = graph.Revision, graph.Files, ReasonScopeOverlap
 				e.Packages, e.Files, e.Symbols = bounded(e.Packages), bounded(e.Files), bounded(e.Symbols)
 				return Decision{Evidence: e}, nil
 			}
