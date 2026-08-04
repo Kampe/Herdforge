@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/Kampe/Herdforge/pkg/router"
+	"github.com/Kampe/Herdforge/pkg/toolpolicy"
 )
 
 const (
@@ -262,7 +263,7 @@ func Validate(req Request, sink Sink) error {
 	}
 	want := clone(argv)
 	if worker {
-		want = []string{"codex", "--model", WorkerModel, "-c", "model_reasoning_effort=medium", "-a", "never"}
+		want = []string{"codex", "--model", WorkerModel, "-c", "model_reasoning_effort=medium", "-a", "never", "-c", "mcp_servers.code-review-graph.enabled=false"}
 	}
 	if !worker && (len(want) < 2 || want[0] == "" || want[1] != "--model" || !argvCarriesEffort(provider, want, effort)) {
 		return reject(req, sink, "non-worker launch argv must explicitly carry --model and effort")
@@ -273,6 +274,11 @@ func Validate(req Request, sink Sink) error {
 	for i := range want {
 		if argv[i] != want[i] {
 			return reject(req, sink, fmt.Sprintf("argv[%d]=%q does not match routed launch decision", i, argv[i]))
+		}
+	}
+	if provider == WorkerProvider {
+		if _, cfg, err := toolpolicy.Require(toolpolicy.Role(role), provider, argv); err != nil || !cfg.Valid() {
+			return reject(req, sink, "codex launch lacks explicit CRG MCP isolation")
 		}
 	}
 	modelIndex := -1

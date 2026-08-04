@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/Kampe/Herdforge/pkg/agentpolicy"
+	"github.com/Kampe/Herdforge/pkg/toolpolicy"
 )
 
 type HarnessType string
@@ -81,16 +82,31 @@ func GetHarnessConfig(harness string) *HarnessConfig {
 
 // BuildInvocation constructs the exact CLI command array to spawn a subagent in the target harness
 func (h *HarnessConfig) BuildInvocation(prompt string) []string {
-	if h.Type == HarnessCodex {
-		return []string{h.BinaryName, prompt}
+	args, err := h.BuildInvocationE(prompt)
+	if err != nil {
+		return nil // callers cannot accidentally launch an uncompiled surface
 	}
+	return args
+}
+
+// BuildInvocationE is the fail-closed invocation compiler.
+func (h *HarnessConfig) BuildInvocationE(prompt string) ([]string, error) {
 	args := []string{h.BinaryName}
-	if h.PromptFlag != "" {
+	if h.Type == HarnessCodex {
+		// Preserve the current-main Codex positional prompt contract while
+		// compiling the explicit tool-server boundary for child launches.
+		args = append(args, prompt)
+	} else if h.PromptFlag != "" {
 		args = append(args, h.PromptFlag, prompt)
 	} else {
 		args = append(args, prompt)
 	}
-	return args
+	if h.Type == HarnessCodex {
+		// A Codex child must not inherit the operator's CRG MCP. The CRG CLI
+		// remains available as a normal executable.
+		return toolpolicy.CompileCodexArgs(args)
+	}
+	return args, nil
 }
 
 // LookPath checks if the harness binary is installed and executable in PATH

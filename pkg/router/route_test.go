@@ -388,7 +388,7 @@ func TestArgvContracts(t *testing.T) {
 		{"claude", "claude-sonnet-5", "high",
 			[]string{"claude", "--model", "claude-sonnet-5", "--effort", "high"}},
 		{"codex", "gpt-5.6-luna", "xhigh",
-			[]string{"codex", "--model", "gpt-5.6-luna", "-c", "model_reasoning_effort=high", "-a", "never"}},
+			[]string{"codex", "--model", "gpt-5.6-luna", "-c", "model_reasoning_effort=high", "-a", "never", "-c", "mcp_servers.code-review-graph.enabled=false"}},
 		{"grok", "grok-4.5", "max",
 			[]string{"grok", "--model", "grok-4.5", "--reasoning-effort", "high", "--always-approve"}},
 		{"kimi", "", "high", []string{"kimi", "--auto"}},
