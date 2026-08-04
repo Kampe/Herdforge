@@ -12,13 +12,15 @@
 package kick
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"sort"
 	"strings"
+
+	"github.com/Kampe/Herdforge/pkg/lifecycle"
 )
 
 // The canonical standing fleet roster is derived at runtime by StandingIDs()
@@ -32,13 +34,13 @@ const LiveStatuses = "working|idle|starting|done|blocked"
 
 // AgentEntry represents a single agent from herdr agent list.
 type AgentEntry struct {
-	Name       string `json:"name,omitempty"`
-	Label      string `json:"label,omitempty"`
-	Status     string `json:"agent_status,omitempty"`
-	PaneID     string `json:"pane_id,omitempty"`
-	TabID      string `json:"tab_id,omitempty"`
-	Workspace  string `json:"workspace_id,omitempty"`
-	Interactive *bool `json:"interactive,omitempty"`
+	Name        string `json:"name,omitempty"`
+	Label       string `json:"label,omitempty"`
+	Status      string `json:"agent_status,omitempty"`
+	PaneID      string `json:"pane_id,omitempty"`
+	TabID       string `json:"tab_id,omitempty"`
+	Workspace   string `json:"workspace_id,omitempty"`
+	Interactive *bool  `json:"interactive,omitempty"`
 }
 
 // AgentListResult wraps the herdr agent list response.
@@ -62,6 +64,13 @@ type Options struct {
 	Reason string
 	// RaiseMissing calls herd-standing for missing agents (default true).
 	RaiseMissing bool
+	// HoldReader is the shared durable hold authority. Production callers must
+	// inject it; nil is rejected by Run before any fleet side effect.
+	HoldReader lifecycle.HoldReader
+	// Identity resolves a complete authority identity for each lane.
+	Identity    func(string) lifecycle.HoldIdentity
+	Generation  func(context.Context, lifecycle.HoldIdentity) (int64, error)
+	ActiveTasks lifecycle.ActiveTaskResolver
 }
 
 // Result holds counts for one kick run.
@@ -158,34 +167,6 @@ func LookupAgent(agents []AgentEntry, name string) (status, paneID string, found
 	return "", "", false
 }
 
-// LaneHeld checks whether a lane has a hold file in the hold directory.
-// Returns the hold reason string and whether the lane is held.
-func LaneHeld(lane string) (string, bool) {
-	holdDir := os.Getenv("HERD_HOLD_DIR")
-	if holdDir == "" {
-		// Default hold dir.
-		stateHome := os.Getenv("XDG_STATE_HOME")
-		if stateHome == "" {
-			home, err := os.UserHomeDir()
-			if err != nil {
-				return "", false
-			}
-			stateHome = filepath.Join(home, ".local", "state")
-		}
-		holdDir = filepath.Join(stateHome, "chainseer", "herd", "hold")
-	}
-	path := filepath.Join(holdDir, lane)
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return "", false
-	}
-	reason := strings.TrimSpace(string(data))
-	if reason == "" {
-		reason = "held by coordinator (no reason recorded)"
-	}
-	return reason, true
-}
-
 // ProviderDeathCheck runs herd-process --check-provider-death for a lane.
 // Returns true if the provider died mid-run (should not re-engage).
 func ProviderDeathCheck(lane string) bool {
@@ -214,6 +195,12 @@ func Selftest() error {
 
 // Run executes a kick operation.
 func Run(opts Options) (*Result, error) {
+	if opts.HoldReader == nil {
+		return nil, fmt.Errorf("kick: hold authority is required")
+	}
+	if opts.Identity == nil {
+		return nil, fmt.Errorf("kick: complete hold identity resolver is required")
+	}
 	// Determine target names.
 	names := opts.Names
 	if len(names) == 0 {
@@ -225,8 +212,18 @@ func Run(opts Options) (*Result, error) {
 		sort.Strings(names)
 	}
 
+	// Consult the shared authority for every target before raising or nudging.
+	held := make(map[string]string)
+	for _, id := range names {
+		laneID := opts.Identity(id)
+		gen := opts.Generation
+		if err := lifecycle.CheckLaneAndTaskHold(context.Background(), opts.HoldReader, opts.ActiveTasks, laneID.Repository, laneID.Owner, laneID.Lane, gen); err != nil {
+			held[id] = err.Error()
+		}
+	}
+
 	// Raise missing standing agents when kicking the full default set.
-	if opts.RaiseMissing && len(names) >= len(StandingIDs()) {
+	if opts.RaiseMissing && len(names) >= len(StandingIDs()) && len(held) == 0 {
 		HerdStanding("--all")
 	}
 
@@ -239,20 +236,14 @@ func Run(opts Options) (*Result, error) {
 	result := &Result{}
 
 	for _, id := range names {
-		// Check hold first.
-		if reason, held := LaneHeld(id); held {
+		if reason, skip := held[id]; skip {
 			if !opts.Quiet {
-				fmt.Printf("herd-kick: skip %s (HELD: %s) -- release with herd hold off %s\n", id, reason, id)
+				fmt.Printf("herd-kick: skip %s (%s)\n", id, reason)
 			}
 			result.Skipped++
-			result.Entries = append(result.Entries, EntryResult{
-				Name:   id,
-				Result: "skipped",
-				Reason: fmt.Sprintf("HELD: %s", reason),
-			})
+			result.Entries = append(result.Entries, EntryResult{Name: id, Result: "skipped", Reason: reason})
 			continue
 		}
-
 		st, paneID, found := LookupAgent(agents, id)
 		if !found || paneID == "" {
 			if !opts.Quiet {

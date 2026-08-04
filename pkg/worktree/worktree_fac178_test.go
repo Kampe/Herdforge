@@ -506,5 +506,6 @@ func fac178Policy(t *testing.T, wm *WorktreeManager, target string) ReapPolicy {
 			BoardEvidence:  board, LeaseGeneration: generation, PolicyDigest: digest, Actor: actor,
 		},
 		ActionPolicy: "remove",
+		HoldReader:   unheldHoldReader{}, IdentityFor: reapHoldIdentity,
 	}
 }

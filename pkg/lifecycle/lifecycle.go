@@ -7,6 +7,7 @@
 package lifecycle
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/json"
 	"fmt"
@@ -97,7 +98,9 @@ type Summary struct {
 	Todo           int               `json:"todo"`
 	Blocked        int               `json:"blocked"`
 	BlockedRefs    []string          `json:"blocked_refs"`
+	BlockedTargets []HoldTarget      `json:"blocked_targets,omitempty"`
 	Dispatchable   int               `json:"dispatchable"`
+	OccupiedRefs   []string          `json:"occupied_refs,omitempty"`
 	InProgress     int               `json:"in_progress"`
 	StaleInProgress int              `json:"stale_in_progress"`
 	StaleCards     []StaleCard       `json:"stale_cards"`
@@ -118,6 +121,15 @@ type Summary struct {
 type StaleCard struct {
 	Ref   string `json:"ref"`
 	Owner string `json:"owner"`
+	Lane  string `json:"lane"`
+}
+
+type HoldTarget struct {
+	Repository string `json:"repository"`
+	Owner      string `json:"owner"`
+	Lane       string `json:"lane"`
+	Task       string `json:"task"`
+	Scope      string `json:"scope"`
 }
 
 // ActionLogEntry records one act-mode action.
@@ -163,6 +175,9 @@ type Engine struct {
 	ReviewHook  string // executable for review handoff
 	NextHook    string // executable for next-task handoff
 	ReadbackHook string // executable for authoritative readback
+	HoldReader HoldReader
+	HoldIdentity func(task, lane, owner string) HoldIdentity
+	HoldRoles []string
 
 	// Test seams.
 	TestClaimAttempts       int
@@ -1057,6 +1072,8 @@ func (e *Engine) computeSummary(agentsWrapper struct {
 		Status      string
 		Labels      []string
 		Owner       string
+		Lane        string
+		Role        string
 		Blocked     bool
 		UpdatedAt   string
 		CreatedAt   string
@@ -1130,11 +1147,13 @@ func (e *Engine) computeSummary(agentsWrapper struct {
 			}
 		}
 
-		normalized = append(normalized, cardNorm{
+			normalized = append(normalized, cardNorm{
 			Ref:        ref,
 			Status:     st,
 			Labels:     labels,
 			Owner:      owner,
+			Lane:       strings.TrimSpace(c.Lane),
+			Role:       recognizedRole(labels, e.HoldRoles),
 			Blocked:    blocked,
 			UpdatedAt:  c.UpdatedAt,
 			CreatedAt:  c.CreatedAt,
@@ -1187,15 +1206,20 @@ func (e *Engine) computeSummary(agentsWrapper struct {
 			if c.Blocked {
 				s.Blocked++
 				s.BlockedRefs = append(s.BlockedRefs, c.Ref)
+				s.BlockedTargets = append(s.BlockedTargets, HoldTarget{Repository: repoRoot(), Owner: c.Role, Lane: c.Role, Task: c.Ref, Scope: "task"})
 			} else {
-				s.Dispatchable++
+				if e.holdBlocks(context.Background(), c.Role, c.Role, c.Ref) {
+					s.OccupiedRefs = append(s.OccupiedRefs, c.Ref)
+				} else {
+					s.Dispatchable++
+				}
 			}
 		}
 		if isInProgress(c.Status) {
 			s.InProgress++
 			if c.Owner == "" || !liveOwner(c.Owner) {
 				s.StaleInProgress++
-				s.StaleCards = append(s.StaleCards, StaleCard{Ref: c.Ref, Owner: c.Owner})
+				s.StaleCards = append(s.StaleCards, StaleCard{Ref: c.Ref, Owner: c.Lane, Lane: c.Lane})
 				s.Unutilized = append(s.Unutilized, c.Ref)
 			} else {
 				s.Utilized = append(s.Utilized, c.Ref)
@@ -1218,6 +1242,21 @@ func (e *Engine) computeSummary(agentsWrapper struct {
 	}
 
 	return s
+}
+
+func recognizedRole(labels, configured []string) string {
+	roles := make(map[string]bool, len(configured))
+	for _, role := range configured { roles[strings.ToLower(strings.TrimSpace(role))] = true }
+	var role string
+	count := 0
+	for _, label := range labels {
+		if !roles[label] { continue }
+		count++
+		if role != "" && role != label { return "" }
+		role = label
+	}
+	if count != 1 { return "" }
+	return role
 }
 
 func (e *Engine) parseCards(boardJSON json.RawMessage) []boardCard {
@@ -1259,6 +1298,7 @@ func (e *Engine) executeActMode(stateRoot, leaseRoot string, s *Summary, agentsJ
 	if s.StaleInProgress > 0 {
 		reclaimHook := e.ReclaimHook
 		for _, sc := range s.StaleCards {
+			if err := e.checkHold(sc.Ref, sc.Lane, sc.Owner); err != nil { return err }
 			if reclaimHook != "" {
 				cmd := exec.Command(reclaimHook,
 					"--ref", sc.Ref,
@@ -1294,10 +1334,18 @@ func (e *Engine) executeActMode(stateRoot, leaseRoot string, s *Summary, agentsJ
 
 	// 2. Routing repair for blocked-only queue.
 	if s.Todo > 0 && s.Dispatchable == 0 && s.Blocked == s.Todo {
+		blocked := make([]string, 0, len(s.BlockedTargets))
+		for _, target := range s.BlockedTargets {
+			held, err := e.targetHeld(context.Background(), target.Lane, target.Task)
+			if err != nil { held = true }
+			if !held { blocked = append(blocked, target.Task) }
+		}
+		if e.HoldReader == nil { blocked = append(blocked, s.BlockedRefs...) }
+		if e.HoldReader != nil && len(blocked) == 0 { return nil }
 		if e.RoutingHook == "" {
 			return fmt.Errorf("blocked-only queue requires routing hook")
 		}
-		blockedRefs := strings.Join(s.BlockedRefs, ",")
+		blockedRefs := strings.Join(blocked, ",")
 		cmd := exec.Command(e.RoutingHook,
 			"--refs", blockedRefs,
 			"--reason", "blocked-only queue",
@@ -1353,6 +1401,7 @@ func (e *Engine) executeActMode(stateRoot, leaseRoot string, s *Summary, agentsJ
 	// 3. Kick settled lanes with dispatchable queue.
 	if s.Dispatchable > 0 && len(s.Settled) > 0 {
 		for _, settled := range s.Settled {
+			if err := e.checkLaneHold(settled.Name, settled.Name); err != nil { return err }
 			cmd := exec.Command(e.kickBin(), "--no-raise", "--quiet", "--reason", "lifecycle: dispatchable queue", settled.Name)
 			if out, err := cmd.CombinedOutput(); err != nil {
 				return fmt.Errorf("kick failed for %s: %w\n%s", settled.Name, err, string(out))
@@ -1540,6 +1589,60 @@ func (e *Engine) executeActMode(stateRoot, leaseRoot string, s *Summary, agentsJ
 	}
 
 	return nil
+}
+
+func (e *Engine) checkHold(task, lane, owner string) error {
+	return e.checkHoldIdentity(HoldIdentity{Repository: repoRoot(), Owner: owner, Lane: lane, Task: task, Scope: "task"})
+}
+
+func (e *Engine) checkLaneHold(lane, owner string) error {
+	return e.checkHoldIdentity(HoldIdentity{Repository: repoRoot(), Owner: owner, Lane: lane, Scope: "lane"})
+}
+
+func (e *Engine) checkHoldIdentity(identity HoldIdentity) error {
+	if e.HoldReader == nil { return nil }
+	if e.HoldIdentity != nil { identity = e.HoldIdentity(identity.Task, identity.Lane, identity.Owner) }
+	held, err := e.isHeld(identity)
+	if err != nil { return err }
+	if held { return fmt.Errorf("lifecycle: held identity denied") }
+	return nil
+}
+
+func (e *Engine) isHeld(identity HoldIdentity) (bool, error) {
+	if e.HoldReader == nil { return false, nil }
+	if !identity.valid() { return false, fmt.Errorf("lifecycle: hold authority denied ambiguous exact identity") }
+	generation := int64(1)
+	if source, ok := e.HoldReader.(interface{ CurrentGeneration(context.Context, HoldIdentity) (int64, error) }); ok {
+		var err error
+		generation, err = source.CurrentGeneration(context.Background(), identity)
+		if err != nil { return false, err }
+	}
+	decision, err := e.HoldReader.Check(context.Background(), identity, generation)
+	if err != nil { return false, fmt.Errorf("lifecycle: hold authority: %w", err) }
+	return decision.Held, nil
+}
+
+func (e *Engine) holdBlocks(ctx context.Context, lane, owner, task string) bool {
+	if e.HoldReader == nil { return false }
+	held, err := e.targetHeld(ctx, lane, task)
+	return err != nil || held
+}
+
+func (e *Engine) targetHeld(ctx context.Context, role, task string) (bool, error) {
+	if strings.TrimSpace(role) == "" || strings.TrimSpace(task) == "" { return true, nil }
+	identities := []HoldIdentity{
+		{Repository: repoRoot(), Owner: role, Lane: role, Scope: "lane"},
+		{Repository: repoRoot(), Owner: role, Lane: role, Task: task, Scope: "task"},
+	}
+	if e.HoldIdentity != nil {
+		identities = []HoldIdentity{e.HoldIdentity("", role, role), e.HoldIdentity(task, role, role)}
+	}
+	for _, identity := range identities {
+		held, err := e.isHeld(identity)
+		if err != nil { return true, err }
+		if held { return true, nil }
+	}
+	return false, nil
 }
 
 func (e *Engine) authoritativeReadback(action, refOrRefs, replacementRef, lane, owner string) ([]byte, error) {

@@ -93,6 +93,9 @@ func main() {
 	case "wind-down":
 		runWindDown()
 
+	case "hold":
+		runHold()
+
 	case "standing":
 		if err := runStandingE(); err != nil {
 			fmt.Fprintf(os.Stderr, "standing failed: %v\n", err)
@@ -228,6 +231,7 @@ func printUsage() {
 	fmt.Println("  status     Display current orchestration engine status")
 	fmt.Println("  pulse      Claim a task from Kaneo and optionally spawn an agent")
 	fmt.Println("  wind-down  Control durable fleet launch posture: on, off, or status")
+	fmt.Println("  hold       Control durable generation-fenced lane/task hold: on, off, or status")
 	fmt.Println("  review     Claim in-progress tasks for reviewer and advance to review status")
 	fmt.Println("  approve    Move in-review cards to done, gated on merge evidence")
 	fmt.Println("  board-done Move one card to done ONLY with proof its work is on origin/main")
@@ -1973,6 +1977,16 @@ func runDispatch() {
 		fmt.Fprintf(os.Stderr, "failed to load config: %v\n", err)
 		os.Exit(1)
 	}
+	registry, err := canonicalLaneRegistry(cfg)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "lane identity: %v\n", err)
+		os.Exit(1)
+	}
+	canonicalLane, err := registry.Resolve(*laneName)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "lane identity: %v\n", err)
+		os.Exit(1)
+	}
 
 	tp, tpErr := loadTaskProvider(cfg)
 	if tpErr != nil {
@@ -1990,6 +2004,37 @@ func runDispatch() {
 	defer closeControl()
 	var decision *router.LaunchDecision
 	var dispatchResult *dispatch.DispatchResult
+	holdAuthority, holdErr := newProductionHoldAuthority()
+	if holdErr != nil {
+		fmt.Fprintf(os.Stderr, "hold authority: %v\n", holdErr)
+		os.Exit(1)
+	}
+	defer holdAuthority.Close()
+	repositoryIdentity, identityErr := holdRepository()
+	if identityErr != nil {
+		fmt.Fprintf(os.Stderr, "hold identity: %v\n", identityErr)
+		os.Exit(1)
+	}
+	admitDispatch := func() error {
+		for _, identity := range []lifecycle.HoldIdentity{{Repository: repositoryIdentity, Owner: canonicalLane.Role, Lane: canonicalLane.Name, Scope: "lane"}, {Repository: repositoryIdentity, Owner: canonicalLane.Role, Lane: canonicalLane.Name, Task: ticketRef, Scope: "task"}} {
+			generation, err := holdAuthority.CurrentGeneration(context.Background(), identity)
+			if err != nil {
+				return err
+			}
+			decision, err := holdAuthority.Check(context.Background(), identity, generation)
+			if err != nil {
+				return err
+			}
+			if decision.Held {
+				return fmt.Errorf("held: %s (%s)", decision.Reason, decision.Code)
+			}
+		}
+		return nil
+	}
+	if err := admitDispatch(); err != nil {
+		fmt.Fprintf(os.Stderr, "dispatch hold admission rejected: %v\n", err)
+		os.Exit(1)
+	}
 	if !*noLaunch {
 		lane := findLaneByName(cfg, *laneName)
 		if lane == nil {
@@ -1997,6 +2042,9 @@ func runDispatch() {
 			os.Exit(1)
 		}
 		decision, err = launchAdmissionWithLifecycle(liveLaunchLifecycle{}, cfg, lane.Role, true, routedLaneDecision(context.Background(), nil), func(admitted *router.LaunchDecision) error {
+			if err := admitDispatch(); err != nil {
+				return err
+			}
 			var dispatchErr error
 			dispatchResult, dispatchErr = d.Dispatch(context.Background(), dispatch.DispatchOptions{TicketRef: ticketRef, NoLaunch: *noLaunch, LaneName: *laneName, Decision: admitted})
 			return dispatchErr
@@ -2010,11 +2058,14 @@ func runDispatch() {
 			os.Exit(1)
 		}
 	}
-
 	fmt.Printf("Dispatching %s to lane '%s'...\n", ticketRef, *laneName)
 
 	result := dispatchResult
 	if *noLaunch {
+		if err := admitDispatch(); err != nil {
+			fmt.Fprintf(os.Stderr, "dispatch hold admission rejected: %v\n", err)
+			os.Exit(1)
+		}
 		result, err = d.Dispatch(context.Background(), dispatch.DispatchOptions{TicketRef: ticketRef, NoLaunch: true, LaneName: *laneName, Decision: decision})
 	}
 	if err != nil {
@@ -2912,6 +2963,22 @@ func runKick() {
 	}
 
 	args := kickFlags.Args()
+	authority, err := newProductionHoldAuthority()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "herd-kick: hold authority: %v\n", err)
+		os.Exit(1)
+	}
+	defer authority.Close()
+	repository, err := holdRepository()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "herd-kick: hold identity: %v\n", err)
+		os.Exit(1)
+	}
+	activeResolver, err := loadProductionActiveTaskResolver(context.Background())
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "herd-kick: active task authority: %v\n", err)
+		os.Exit(1)
+	}
 
 	result, err := kick.Run(kick.Options{
 		Names:        args,
@@ -2920,6 +2987,12 @@ func runKick() {
 		Quiet:        *quiet,
 		Reason:       *reason,
 		RaiseMissing: !*noRaise,
+		HoldReader:   authority,
+		Identity:     func(id string) lifecycle.HoldIdentity { return holdIdentity(id, id, repository) },
+		Generation: func(ctx context.Context, identity lifecycle.HoldIdentity) (int64, error) {
+			return authority.CurrentGeneration(ctx, identity)
+		},
+		ActiveTasks: activeResolver,
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "herd-kick: error — %v\n", err)
@@ -2950,7 +3023,23 @@ func runAttention() {
 		return
 	}
 
-	result, err := attention.Run()
+	attentionAuthority, err := newProductionHoldAuthority()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "herd-attention: %v\n", err)
+		os.Exit(1)
+	}
+	defer attentionAuthority.Close()
+	attentionRepository, err := holdRepository()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "herd-attention: %v\n", err)
+		os.Exit(1)
+	}
+	activeResolver, err := loadProductionActiveTaskResolver(context.Background())
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "herd-attention: active task authority: %v\n", err)
+		os.Exit(1)
+	}
+	result, err := attention.RunWithHoldReaderAndTasks(attentionAuthority, attentionRepository, activeResolver)
 	if err != nil {
 		// Fail-closed: herdr unavailable or agent list parse error is a hard
 		// error, not a silent "fleet healthy".
@@ -3005,6 +3094,35 @@ func runLifecycle() {
 	}
 
 	eng := &lifecycle.Engine{}
+	roleConfig, roleErr := config.LoadConfig(".herd/herd.yaml")
+	if roleErr != nil {
+		fmt.Fprintf(os.Stderr, "lifecycle role config: %v\n", roleErr)
+		os.Exit(1)
+	}
+	for _, lane := range roleConfig.Lanes {
+		if strings.TrimSpace(lane.Role) != "" {
+			eng.HoldRoles = append(eng.HoldRoles, strings.TrimSpace(lane.Role))
+		}
+	}
+	holdAuthority, holdErr := newProductionHoldAuthority()
+	if holdErr != nil {
+		fmt.Fprintf(os.Stderr, "lifecycle hold authority: %v\n", holdErr)
+		os.Exit(1)
+	}
+	defer holdAuthority.Close()
+	repository, repoErr := holdRepository()
+	if repoErr != nil {
+		fmt.Fprintf(os.Stderr, "lifecycle hold identity: %v\n", repoErr)
+		os.Exit(1)
+	}
+	eng.HoldReader = holdAuthority
+	eng.HoldIdentity = func(task, lane, owner string) lifecycle.HoldIdentity {
+		scope := "task"
+		if task == "" {
+			scope = "lane"
+		}
+		return lifecycle.HoldIdentity{Repository: repository, Owner: owner, Lane: lane, Task: task, Scope: scope}
+	}
 
 	if *actMode {
 		summary, err := eng.Act()

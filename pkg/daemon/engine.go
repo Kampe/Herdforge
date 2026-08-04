@@ -11,6 +11,7 @@ import (
 	"github.com/Kampe/Herdforge/pkg/config"
 	"github.com/Kampe/Herdforge/pkg/control"
 	"github.com/Kampe/Herdforge/pkg/deps"
+	"github.com/Kampe/Herdforge/pkg/dispatch"
 	"github.com/Kampe/Herdforge/pkg/provider"
 	"github.com/Kampe/Herdforge/pkg/router"
 	"github.com/Kampe/Herdforge/pkg/store"
@@ -298,12 +299,12 @@ func (e *Engine) ownershipClaimer() (deps.OwnershipClaimer, error) {
 		root = e.Worktree.RepoRoot
 	}
 	repo := "herd"
+	if canonical, err := dispatch.AuthenticatedRepositoryIdentity(root); err == nil && canonical != "" {
+		repo = canonical
+	}
 	providerType := "memory"
 	project := ""
 	if e.Config != nil {
-		if e.Config.Project.Name != "" {
-			repo = e.Config.Project.Name
-		}
 		if e.Config.TaskProvider.Type != "" {
 			providerType = e.Config.TaskProvider.Type
 		}

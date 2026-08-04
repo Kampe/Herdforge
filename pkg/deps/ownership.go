@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/Kampe/Herdforge/pkg/claim"
+	"github.com/Kampe/Herdforge/pkg/lifecycle"
 )
 
 // ErrNotOwner means compensation was refused — this owner+generation no longer
@@ -42,6 +43,7 @@ type OwnershipToken struct {
 //  1. StillOwns (owner+generation)
 //  2. exactly-one durable lifecycle compensate (outbox) while still owned
 //  3. ReleaseIfOwner only after durable compensate succeeds/readbacks
+//
 // On durable compensate failure: retain the lease (Recovering) — never release
 // then compensate (B can acquire and get stomped by stale A).
 type OwnershipClaimer interface {
@@ -78,13 +80,30 @@ func OpenLeaseOwnership(dbPath, repo, provider, project string) (*LeaseOwnership
 	if err != nil {
 		return nil, fmt.Errorf("deps: open launch lease store: %w", err)
 	}
+	holdDB, canonicalErr := lifecycle.CanonicalStatePathForLaunchDB(dbPath)
+	if canonicalErr != nil {
+		if filepath.Base(filepath.Dir(dbPath)) == ".herd" {
+			_ = store.Close()
+			return nil, fmt.Errorf("deps: canonical hold path: %w", canonicalErr)
+		}
+		holdDB = lifecycle.CanonicalStatePath(filepath.Dir(filepath.Dir(dbPath)))
+	}
+	if err := os.MkdirAll(filepath.Dir(holdDB), 0o755); err != nil {
+		_ = store.Close()
+		return nil, fmt.Errorf("deps: create canonical hold directory: %w", err)
+	}
+	holds, err := lifecycle.NewHoldAuthority(holdDB)
+	if err != nil {
+		_ = store.Close()
+		return nil, fmt.Errorf("deps: open canonical hold authority: %w", err)
+	}
 	return &LeaseOwnership{
-		CM:       claim.NewClaimManager(store),
+		CM:       claim.NewClaimManager(store, claim.WithHoldReader(holds)),
 		Store:    store,
 		Repo:     repo,
 		Provider: provider,
 		Project:  project,
-		closeDB:  store.Close,
+		closeDB:  func() error { _ = holds.Close(); return store.Close() },
 	}, nil
 }
 
@@ -132,11 +151,13 @@ func (o *LeaseOwnership) ClaimExclusive(ctx context.Context, taskID TaskID, task
 	ownerID := newOwnerID(role)
 	key := o.key(taskRef)
 	lease, err := o.CM.Claim(ctx, claim.ClaimRequest{
-		Key:          key,
-		OwnerID:      ownerID,
-		Role:         role,
-		TaskRole:     role,
-		WorktreePath: worktreeHint,
+		Key:            key,
+		OwnerID:        ownerID,
+		Role:           role,
+		TaskRole:       role,
+		WorktreePath:   worktreeHint,
+		HoldIdentity:   lifecycle.HoldIdentity{Repository: o.Repo, Owner: role, Lane: role, Task: string(taskRef), Scope: "task"},
+		HoldIdentities: []lifecycle.HoldIdentity{{Repository: o.Repo, Owner: role, Lane: role, Scope: "lane"}, {Repository: o.Repo, Owner: role, Lane: role, Task: string(taskRef), Scope: "task"}},
 	})
 	if err != nil {
 		var conflict *claim.ClaimConflictError
