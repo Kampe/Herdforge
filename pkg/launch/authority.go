@@ -35,9 +35,21 @@ type Store interface {
 
 // FileStore is a production-shaped durable store. The lock is separate from
 // the state file so replacement can use rename without exposing partial JSON.
-type FileStore struct{ Path string }
+type FileStore struct {
+	Path    string
+	DirSync func(string) error
+}
 
 func NewFileStore(path string) *FileStore { return &FileStore{Path: path} }
+
+func syncLaunchDir(path string) error {
+	d, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	return d.Sync()
+}
 
 func (s *FileStore) Read() (Snapshot, error) {
 	if s == nil || strings.TrimSpace(s.Path) == "" {
@@ -108,6 +120,13 @@ func (s *FileStore) CompareAndSwap(expected uint64, next Snapshot) (bool, error)
 	}
 	if err := os.Rename(tmpName, s.Path); err != nil {
 		return false, fmt.Errorf("commit launch state: %w", err)
+	}
+	syncDir := s.DirSync
+	if syncDir == nil {
+		syncDir = syncLaunchDir
+	}
+	if err := syncDir(filepath.Dir(s.Path)); err != nil {
+		return false, fmt.Errorf("sync launch state directory: %w", err)
 	}
 	return true, nil
 }
@@ -409,7 +428,7 @@ func validateBinding(r Request, packet string) error {
 	return nil
 }
 func validateReadback(r Request, packet string) error {
-	if err := validateBinding(Request{Decision: r.Decision, TaskRef: r.TaskRef, Repository: r.Repository, Lane: r.Lane, Name: r.Name, TabID: r.TabID, PaneID: r.PaneID, HerdrSession: r.HerdrSession, CWD: r.CWD}, packet); err != nil {
+	if err := validateBinding(Request{Decision: r.Decision, TaskRef: r.TaskRef, Repository: r.Repository, Lane: r.Lane, Name: r.Name, TabID: r.TabID, PaneID: r.PaneID, HerdrSession: r.HerdrSession, CWD: r.CWD, LeaseGeneration: r.LeaseGeneration, SessionGeneration: r.SessionGeneration}, packet); err != nil {
 		return err
 	}
 	if r.ProcessIdentity == "" || r.StartToken == "" {
@@ -436,7 +455,7 @@ func identityKey(r Receipt) string {
 	return strings.Join([]string{r.TaskRef, r.Repository, r.Lane}, "\x00")
 }
 func sameReceipt(a, b Receipt) bool {
-	return a.TaskRef == b.TaskRef && a.Repository == b.Repository && a.Lane == b.Lane && a.Role == b.Role && a.TaskShape == b.TaskShape && a.Provider == b.Provider && a.Model == b.Model && a.Effort == b.Effort && a.Generation == b.Generation && a.TabID == b.TabID && a.PaneID == b.PaneID && a.HerdrSession == b.HerdrSession && a.CWD == b.CWD && a.ProcessIdentity == b.ProcessIdentity && a.StartToken == b.StartToken && a.PacketDigest == b.PacketDigest && a.DecisionDigest == b.DecisionDigest && equalStrings(a.Argv, b.Argv)
+	return a.TaskRef == b.TaskRef && a.Repository == b.Repository && a.Lane == b.Lane && a.Name == b.Name && a.Role == b.Role && a.TaskShape == b.TaskShape && a.Provider == b.Provider && a.Model == b.Model && a.Effort == b.Effort && a.Generation == b.Generation && a.LeaseGeneration == b.LeaseGeneration && a.SessionGeneration == b.SessionGeneration && a.TabID == b.TabID && a.PaneID == b.PaneID && a.HerdrSession == b.HerdrSession && a.CWD == b.CWD && a.ProcessIdentity == b.ProcessIdentity && a.StartToken == b.StartToken && a.PacketDigest == b.PacketDigest && a.DecisionDigest == b.DecisionDigest && equalStrings(a.Argv, b.Argv)
 }
 func sameBinding(a, b Receipt) bool {
 	return a.TaskRef == b.TaskRef && a.Repository == b.Repository && a.Lane == b.Lane && a.Name == b.Name && a.Role == b.Role && a.TaskShape == b.TaskShape && a.Provider == b.Provider && a.Model == b.Model && a.Effort == b.Effort && a.TabID == b.TabID && a.PaneID == b.PaneID && a.HerdrSession == b.HerdrSession && a.CWD == b.CWD && a.LeaseGeneration == b.LeaseGeneration && a.SessionGeneration == b.SessionGeneration && a.PacketDigest == b.PacketDigest && a.DecisionDigest == b.DecisionDigest && equalStrings(a.Argv, b.Argv)
