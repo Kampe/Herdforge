@@ -5,6 +5,7 @@ import (
 	"errors"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/Kampe/Herdforge/pkg/config"
@@ -62,5 +63,48 @@ func TestProductionDispatcherNilScopeFenceFailsClosedBeforeProvider(t *testing.T
 	d := &Dispatcher{Production: true, Config: scopeDispatchConfig(), Compensator: &recordingCompensator{}, TaskProvider: &mockTaskProvider{}, Worktree: &mockWorktree{err: errors.New("must not create")}}
 	if _, err := d.Dispatch(context.Background(), DispatchOptions{TicketRef: "FAC-215", NoLaunch: true}); err == nil || !strings.Contains(err.Error(), "scope fence is required") {
 		t.Fatal("production dispatcher bypassed nil scope fence")
+	}
+}
+
+func TestDurableScopeAdmissionTwoOverlappingDispatchesOneWinner(t *testing.T) {
+	store, err := scopefence.NewSQLiteStore(filepath.Join(t.TempDir(), "scopefence.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	graph := scopefence.Graph{Revision: "graph-dispatch", Nodes: 10, Edges: 20, Files: 2, Flows: 1, Complete: true}
+	if err := store.PutGraphSnapshot(context.Background(), "repo", graph); err != nil {
+		t.Fatal(err)
+	}
+	shared := scopefence.Scope{Packages: []string{"pkg/overlap"}}
+	for _, task := range []string{"FAC-216", "FAC-217"} {
+		if err := store.PutScopeDeclaration(context.Background(), "repo", task, graph.Revision, shared); err != nil {
+			t.Fatal(err)
+		}
+	}
+	admission := durableScopeAdmission{fence: scopefence.ResolvingFence{Fence: scopefence.Fence{Store: store, Graph: scopefence.NewSQLiteGraphAuthority(store, "repo", graph.Revision, graph.Files)}, Authority: scopefence.NewSQLiteScopeAuthority(store)}}
+	results := make(chan scopefence.Decision, 2)
+	var wg sync.WaitGroup
+	for _, task := range []string{"FAC-216", "FAC-217"} {
+		wg.Add(1)
+		go func(task string) {
+			defer wg.Done()
+			decision, err := admission.Acquire(context.Background(), scopefence.AcquireRequest{Ownership: scopefence.Ownership{Identity: scopefence.Identity{Repository: "repo", Branch: worktree.TaskBranch(task), Task: task}, Generation: 1, State: scopefence.Active}, ExpectedGraphRevision: graph.Revision})
+			if err != nil {
+				t.Errorf("admission %s: %v", task, err)
+			}
+			results <- decision
+		}(task)
+	}
+	wg.Wait()
+	close(results)
+	wins := 0
+	for decision := range results {
+		if decision.Granted {
+			wins++
+		}
+	}
+	if wins != 1 {
+		t.Fatalf("overlapping durable dispatch admissions won=%d, want exactly one", wins)
 	}
 }
