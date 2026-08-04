@@ -72,6 +72,9 @@ type Options struct {
 	Identity    func(string) (lifecycle.HoldIdentity, error)
 	Generation  func(context.Context, lifecycle.HoldIdentity) (int64, error)
 	ActiveTasks lifecycle.ActiveTaskResolver
+	// FetchAgents lists live agents. When nil, Run uses the production herdr
+	// lookup; tests and embedders can inject a deterministic source.
+	FetchAgents func() ([]AgentEntry, error)
 }
 
 // Result holds counts for one kick run.
@@ -240,9 +243,28 @@ func Run(opts Options) (*Result, error) {
 			return nil, fmt.Errorf("kick: raise standing: %w", err)
 		}
 	}
+	if len(held) == len(names) {
+		result := &Result{}
+		for _, id := range names {
+			reason := held[id]
+			if !opts.Quiet {
+				fmt.Printf("herd-kick: skip %s (%s)\n", id, reason)
+			}
+			result.Skipped++
+			result.Entries = append(result.Entries, EntryResult{Name: id, Result: "skipped", Reason: reason})
+		}
+		if !opts.Quiet {
+			fmt.Printf("herd-kick: done kicked=%d skipped=%d failed=%d\n", result.Kicked, result.Skipped, result.Failed)
+		}
+		return result, nil
+	}
 
 	// Fetch agent list once (was 2N herdr calls in the zsh script).
-	agents, err := FetchAgentList()
+	fetchAgents := opts.FetchAgents
+	if fetchAgents == nil {
+		fetchAgents = FetchAgentList
+	}
+	agents, err := fetchAgents()
 	if err != nil {
 		return nil, fmt.Errorf("kick: fetch agents: %w", err)
 	}
@@ -270,7 +292,7 @@ func Run(opts Options) (*Result, error) {
 					continue
 				}
 				// Re-fetch just for this lane.
-				agents2, err2 := FetchAgentList()
+				agents2, err2 := fetchAgents()
 				if err2 != nil {
 					result.Failed++
 					result.Entries = append(result.Entries, EntryResult{Name: id, Result: "failed", Reason: "refetch failed: " + err2.Error()})
