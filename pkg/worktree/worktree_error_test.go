@@ -137,28 +137,49 @@ func TestCreateTaskWorktree_Error_NonRepo(t *testing.T) {
 	}
 }
 
-func TestCreateTaskWorktree_Error_MkdirAllFailure(t *testing.T) {
-	// Create a file where WorktreeDir should be, so MkdirAll fails.
+func TestCreateTaskWorktree_Error_DiskCapacityTargetNotDirectory(t *testing.T) {
 	tmpDir := t.TempDir()
 	wm := NewWorktreeManager(tmpDir)
-	// .herd directory exists as a file, so MkdirAll(".herd/worktrees", ...) fails
 	herdDir := filepath.Join(tmpDir, ".herd")
 	if err := os.MkdirAll(herdDir, 0755); err != nil {
 		t.Fatalf("mkdir .herd: %v", err)
 	}
-	// Replace the worktrees dir with a file
 	if err := os.WriteFile(wm.WorktreeDir, []byte("not a dir"), 0644); err != nil {
 		t.Fatalf("write file for worktreeDir: %v", err)
 	}
-	// init repo so git command would succeed (but mkdir fails first)
+	// Initialize the repository before taking the post-admission mutation baseline.
 	initRepo(t, tmpDir)
+
+	gitCalls := 0
+	oldExec := execCommandContext
+	defer func() { execCommandContext = oldExec }()
+	execCommandContext = func(ctx context.Context, name string, args ...string) *exec.Cmd {
+		gitCalls++
+		return exec.CommandContext(ctx, "false")
+	}
 
 	_, err := wm.CreateTaskWorktree(context.Background(), "TASK-1")
 	if err == nil {
-		t.Fatal("expected error when worktree dir is a file")
+		t.Fatal("expected disk capacity denial when worktree dir is a file")
 	}
-	if !strings.Contains(err.Error(), "failed to create worktree root directory") {
-		t.Errorf("unexpected error message: %v", err)
+	errText := err.Error()
+	if !strings.Contains(errText, "disk capacity gate: resolve target volume") ||
+		!strings.Contains(errText, "not a directory") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if gitCalls != 0 {
+		t.Fatalf("git callback count = %d, want zero after admission denial", gitCalls)
+	}
+	if info, statErr := os.Stat(wm.WorktreeDir); statErr != nil || info.IsDir() {
+		t.Fatalf("worktree root fixture changed after admission denial: info=%v err=%v", info, statErr)
+	}
+	if _, statErr := os.Stat(filepath.Join(wm.WorktreeDir, "task-1")); statErr == nil {
+		t.Fatal("task worktree path was mutated after admission denial")
+	}
+	anchorCheck := exec.Command("git", "show-ref", "--verify", "--quiet", AnchorRefFor("TASK-1"))
+	anchorCheck.Dir = tmpDir
+	if anchorCheck.Run() == nil {
+		t.Fatal("durable anchor was created after admission denial")
 	}
 }
 
