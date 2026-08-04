@@ -423,12 +423,8 @@ func TestRunExactCleanOutput(t *testing.T) {
 	if _, err := plan.Run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	canonicalWT, err := filepath.EvalSymlinks(wt)
-	if err != nil {
-		t.Fatal(err)
-	}
-	want := "herd-reset-safe: " + canonicalWT + " (feature/cha-77) has no unmerged work, safe to reset\n" +
-		"herd-reset-safe: " + canonicalWT + " reset to origin/main (" + plan.ResetSHA + ")\n"
+	want := "herd-reset-safe: " + wt + " (feature/cha-77) has no unmerged work, safe to reset\n" +
+		"herd-reset-safe: " + wt + " reset to origin/main (" + plan.ResetSHA + ")\n"
 	if out.String() != want || errOut.String() != "" {
 		t.Fatalf("output mismatch:\nwant %q\nstdout %q\nstderr %q", want, out.String(), errOut.String())
 	}
