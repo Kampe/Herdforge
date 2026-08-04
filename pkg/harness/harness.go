@@ -49,7 +49,7 @@ func (h *HarnessConfig) BuildPolicyInvocation(prompt string, policy agentpolicy.
 	}
 	argv := h.BuildInvocation(prompt)
 	if h.Type == HarnessClaude {
-		argv = append([]string{h.BinaryName, "--disallowed-tools", "Agent", "Task", "-p"}, prompt)
+		argv = []string{h.BinaryName, "--mcp-config", "{}", "--strict-mcp-config", "--disable-slash-commands", "--disallowed-tools", "Agent", "Task", "-p", prompt}
 	}
 	if h.Type == HarnessCodex {
 		argv = append([]string{h.BinaryName, "--disable", "multi_agent", "--disable", "multi_agent_v2"}, prompt)
@@ -81,11 +81,8 @@ func GetHarnessConfig(harness string) *HarnessConfig {
 
 // BuildInvocation constructs the exact CLI command array to spawn a subagent in the target harness
 func (h *HarnessConfig) BuildInvocation(prompt string) []string {
-	if !h.Supported {
-		return nil
-	}
 	if h.Type == HarnessCodex {
-		return []string{h.BinaryName, "--disable", "multi_agent", "--disable", "multi_agent_v2", prompt}
+		return []string{h.BinaryName, prompt}
 	}
 	args := []string{h.BinaryName}
 	if h.PromptFlag != "" {
