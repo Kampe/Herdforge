@@ -460,6 +460,20 @@ func (m *ClaimManager) ExpireStale(ctx context.Context) ([]*Lease, error) {
 	for i, candidate := range candidates {
 		identities := validated[i]
 		transition := func() error {
+			if m.provider != nil {
+				stale, staleErr := m.store.PeekStaleProviderLock(ctx, candidate.LeaseKey, snapshotNow)
+				if staleErr != nil {
+					return staleErr
+				}
+				if stale != nil {
+					if err := m.durablyAdvanceFence(ctx, candidate.TaskRef, candidate.Generation+1); err != nil {
+						return err
+					}
+					if err := recovery.ForceReleaseProviderLockCAS(ctx, candidate.ID, candidate.Generation); err != nil {
+						return err
+					}
+				}
+			}
 			lease, changed, casErr := recovery.ExpireLeaseCAS(ctx, candidate.ID, candidate.Generation, snapshotNow)
 			if casErr != nil {
 				return casErr

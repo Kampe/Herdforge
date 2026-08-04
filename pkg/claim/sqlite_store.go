@@ -616,6 +616,18 @@ func (s *SQLiteLeaseStore) ExpireLeaseCAS(ctx context.Context, id, generation in
 	return l, true, nil
 }
 
+func (s *SQLiteLeaseStore) ForceReleaseProviderLockCAS(ctx context.Context, id, generation int64) error {
+	res, err := execWithRetry(ctx, s.db, `UPDATE leases SET provider_lock_owner='', provider_lock_at=NULL WHERE id=? AND generation=? AND status='active'`, id, generation)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil || n != 1 {
+		return fmt.Errorf("provider lock CAS affected %d rows", n)
+	}
+	return nil
+}
+
 // ExpireStale transitions active-but-expired, unheld leases to Expired one
 // row at a time. The per-row UPDATE re-checks held/expiry in its own
 // predicate (not just relying on the earlier candidate SELECT), so a

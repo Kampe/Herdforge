@@ -198,6 +198,7 @@ type AtomicLeaseStore interface {
 type RecoveryStore interface {
 	SnapshotExpiredLeases(context.Context, time.Time) ([]*Lease, error)
 	ExpireLeaseCAS(context.Context, int64, int64, time.Time) (*Lease, bool, error)
+	ForceReleaseProviderLockCAS(context.Context, int64, int64) error
 }
 
 // ClaimConflictError reports why an Acquire lost the race, with enough
