@@ -35,9 +35,14 @@ func TestDiskAdmissionFixtureHasNoMutationCallbacks(t *testing.T) {
 }
 
 // Later single-fault guard identities:
-//   FAC153-M1 remove Harvester.admitDisk before fetch or goroutine fan-out.
-//   FAC153-M2 remove Integration.admitMergeDisk before prepareMain.
-//   FAC153-M3 zero worktree_create headroom.
-//   FAC153-M4 replace canonical ResolveExistingPath identities with caller labels.
-//   FAC153-M5 allow invalid policy/probe/pressure decisions to continue.
-//   FAC153-M6 collapse CapacityGate scopes across volumes.
+// Independent RED mutants:
+//   FAC153-M1 re-add per-goroutine admission in checkUnmergedMode.
+//   FAC153-M2 aggregate only the first worktree instead of the complete batch.
+//   FAC153-M3 bypass uint64 overflow in batch aggregation.
+//   FAC153-M4 move fetch before h.admitHarvestBatch.
+//   FAC153-M5 swallow harvest denial/probe/policy failure into HarvestResult.Errors.
+//   FAC153-M6 let Integration.Run continue after Harvester.Harvest returns an error.
+//   FAC153-M7 replace canonical volume identities with caller path labels.
+//   FAC153-M8 collapse CapacityGate hysteresis scopes across volumes.
+//   FAC153-M9 remove direct admission from UnmergedFor/UnmergedForStrict.
+//   FAC153-M10 map batch tokens by original instead of canonical worktree path.

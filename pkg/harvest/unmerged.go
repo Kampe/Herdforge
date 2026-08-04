@@ -18,14 +18,14 @@ import "context"
 // (nil, nil); transient fetch failure ignored; git cherry failure → (nil,
 // nil) matching the zsh `|| true`; no unique commits → (nil, nil).
 func (h *Harvester) UnmergedFor(ctx context.Context, worktreePath string) (*UnmergedWork, error) {
-	return h.checkUnmergedMode(ctx, worktreePath, false, true)
+	return h.checkUnmergedMode(ctx, worktreePath, false, directFetch, nil)
 }
 
 // UnmergedForStrict is the fail-closed variant for destructive callers. It
 // uses the same git cherry implementation as UnmergedFor, but reports fetch
 // or cherry failures instead of treating them as no unique work.
 func (h *Harvester) UnmergedForStrict(ctx context.Context, worktreePath string) (*UnmergedWork, error) {
-	return h.checkUnmergedMode(ctx, worktreePath, true, true)
+	return h.checkUnmergedMode(ctx, worktreePath, true, directFetch, nil)
 }
 
 // UnmergedForStrictLocal performs strict cherry validation against the
@@ -34,5 +34,5 @@ func (h *Harvester) UnmergedForStrict(ctx context.Context, worktreePath string) 
 // not erase usable local evidence while malformed or incomplete cherry
 // evidence still fails closed.
 func (h *Harvester) UnmergedForStrictLocal(ctx context.Context, worktreePath string) (*UnmergedWork, error) {
-	return h.checkUnmergedMode(ctx, worktreePath, true, false)
+	return h.checkUnmergedMode(ctx, worktreePath, true, noFetch, nil)
 }

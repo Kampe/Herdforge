@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"errors"
 	"math"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -12,6 +14,19 @@ type diskFake struct {
 	values map[string]Capacity
 	err    error
 	calls  []string
+}
+
+type changingFilesystemBackend struct {
+	calls int
+}
+
+func (b *changingFilesystemBackend) StatFS(string) (Capacity, error) {
+	b.calls++
+	id := "planned-volume"
+	if b.calls > 1 {
+		id = "fresh-volume"
+	}
+	return Capacity{FilesystemID: id, TotalBytes: 1 << 40, FreeBytes: 1 << 40, TotalInodes: 1 << 30, FreeInodes: 1 << 30}, nil
 }
 
 func (f *diskFake) StatFS(path string) (Capacity, error) {
@@ -27,6 +42,148 @@ func diskHealthy(id string) Capacity {
 func diskPolicy() DiskPolicy {
 	return DiskPolicy{ReserveBytes: 100, ReservePercent: 20, ReserveInodes: 10}
 }
+
+func TestCapacityGatePlanAggregatesCompleteBatchByVolume(t *testing.T) {
+	root := t.TempDir()
+	repo := filepath.Join(root, "repo")
+	tmp := filepath.Join(root, "tmp")
+	worktreeA := filepath.Join(root, "worktree-a")
+	worktreeB := filepath.Join(root, "worktree-b")
+	for _, path := range []string{repo, tmp, worktreeA, worktreeB} {
+		if err := os.MkdirAll(path, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	canonicalTmp, err := ResolveExistingPath(tmp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	backend := StatFSFunc(func(path string) (Capacity, error) {
+		id := "repo-volume"
+		if path == canonicalTmp {
+			id = "temp-volume"
+		}
+		return Capacity{FilesystemID: id, TotalBytes: 1 << 40, FreeBytes: 1 << 40, TotalInodes: 1 << 30, FreeInodes: 1 << 30}, nil
+	})
+	gate := NewCapacityGate(backend, diskPolicy())
+	plan, err := gate.PlanDiskAdmission([]DiskRequest{
+		{Path: repo, TempPath: tmp, AdditionalPaths: []string{worktreeA}, RequiredBytes: 10, RequiredInodes: 2},
+		{Path: repo, TempPath: tmp, AdditionalPaths: []string{worktreeB}, RequiredBytes: 20, RequiredInodes: 3},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.Requests) != 2 || len(plan.Scopes) != 2 {
+		t.Fatalf("plan = %+v, want two volume scopes", plan)
+	}
+	if plan.Requests[0].RequiredBytes != 30 || plan.Requests[0].RequiredInodes != 5 || plan.Requests[1].RequiredBytes != 30 || plan.Requests[1].RequiredInodes != 5 {
+		t.Fatalf("plan did not aggregate complete batch: %+v", plan)
+	}
+	if plan.Scopes[0] >= plan.Scopes[1] {
+		t.Fatalf("scopes not deterministic: %v", plan.Scopes)
+	}
+}
+
+func TestAdmitDiskPlanRejectsIncompleteBatchBeforeAnyAdmission(t *testing.T) {
+	admissions := 0
+	admission := DiskAdmissionFunc(func(DiskRequest) DiskDecision {
+		admissions++
+		return DiskDecision{Allowed: true, State: DiskReady}
+	})
+	for _, plan := range []DiskAdmissionPlan{
+		{Requests: []DiskRequest{{Path: "repo"}}, Scopes: nil},
+		{Requests: []DiskRequest{{Path: "repo"}, {Path: "tmp"}}, Scopes: []string{"scope:repo"}},
+		{Requests: []DiskRequest{{Path: "repo"}, {Path: "tmp"}}, Scopes: []string{"scope:repo", "scope:repo"}},
+	} {
+		if err := AdmitDiskPlan(admission, plan); err == nil {
+			t.Fatalf("expected incomplete/duplicate plan denial: %+v", plan)
+		}
+	}
+	if admissions != 0 {
+		t.Fatalf("admission callbacks = %d, want zero", admissions)
+	}
+}
+
+func TestAdmitDiskPlanRequiresBatchAuthority(t *testing.T) {
+	admission := DiskAdmissionFunc(func(DiskRequest) DiskDecision {
+		return DiskDecision{Allowed: true, State: DiskReady}
+	})
+	plan := DiskAdmissionPlan{
+		Requests: []DiskRequest{{Path: "repo", RequiredBytes: 1, RequiredInodes: 1}},
+		Scopes:   []string{"scope:repo"},
+	}
+	if err := AdmitDiskPlan(admission, plan); err == nil || !strings.Contains(err.Error(), "batch admission unavailable") {
+		t.Fatalf("sequential fallback was not rejected: %v", err)
+	}
+}
+
+func TestCapacityGatePlanProbeAndPolicyFailuresPrecedeAdmissionCallbacks(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "repo")
+	if err := os.MkdirAll(path, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for name, gate := range map[string]*CapacityGate{
+		"probe": NewCapacityGate(StatFSFunc(func(string) (Capacity, error) { return Capacity{}, errors.New("probe") }), diskPolicy()),
+		"invalid policy": NewCapacityGate(StatFSFunc(func(string) (Capacity, error) {
+			return diskHealthy("volume"), nil
+		}), DiskPolicy{ReservePercent: math.NaN()}),
+	} {
+		t.Run(name, func(t *testing.T) {
+			plan, err := gate.PlanDiskAdmission([]DiskRequest{{Path: path, RequiredBytes: 1, RequiredInodes: 1}})
+			if name == "probe" {
+				if err == nil {
+					t.Fatal("expected probe failure")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := gate.AdmitDiskPlan(plan); err == nil {
+				t.Fatal("expected invalid policy denial")
+			}
+		})
+	}
+}
+
+func TestCapacityGatePlanRejectsOverflowBeforeAdmission(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "repo")
+	if err := os.MkdirAll(path, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	gate := NewCapacityGate(StatFSFunc(func(string) (Capacity, error) {
+		return Capacity{FilesystemID: "volume", TotalBytes: 1 << 40, FreeBytes: 1 << 40, TotalInodes: 1 << 30, FreeInodes: 1 << 30}, nil
+	}), diskPolicy())
+	_, err := gate.PlanDiskAdmission([]DiskRequest{
+		{Path: path, RequiredBytes: math.MaxUint64, RequiredInodes: 1},
+		{Path: path, RequiredBytes: 1, RequiredInodes: 1},
+	})
+	if err == nil {
+		t.Fatal("expected overflow denial")
+	}
+}
+
+func TestCapacityGateAdmitPlanRejectsFreshFilesystemIdentityDriftAtomically(t *testing.T) {
+	root := t.TempDir()
+	backend := &changingFilesystemBackend{}
+	gate := NewCapacityGate(backend, DiskPolicy{ReserveBytes: 1, ReserveInodes: 1})
+	plan, err := gate.PlanDiskAdmission([]DiskRequest{{Path: root, RequiredBytes: 1, RequiredInodes: 1}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := gate.AdmitDiskPlan(plan); err == nil {
+		t.Fatal("expected fresh filesystem identity drift denial")
+	}
+	if len(gate.blocked) != 0 {
+		t.Fatalf("blocked scopes mutated after identity drift: %v", gate.blocked)
+	}
+}
+
+// FAC153-M17 is load-bearing: removing the fresh-to-planned identity check
+// must make the changingFilesystemBackend fixture RED and must not create a
+// blocked-map entry before the mismatch is reported.
 
 func TestEvaluateDiskCapacityThresholdsAndInodes(t *testing.T) {
 	for _, tc := range []struct {
