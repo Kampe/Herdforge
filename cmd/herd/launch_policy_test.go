@@ -90,6 +90,66 @@ func TestLaunchAdmissionPassesExactDecisionToLifecycle(t *testing.T) {
 	}
 }
 
+func TestLaunchAdmissionValidatesDecisionContextByScope(t *testing.T) {
+	lane := config.LaneDef{Name: "reviewer", Role: "reviewer", AgentKind: "codex", Provider: "codex", Model: "gpt-5.6-luna", Effort: "medium", TaskShape: "qa"}
+	cfg := &config.Config{Lanes: []config.LaneDef{lane}}
+	newDecision := func(t *testing.T, taskRef string) *router.LaunchDecision {
+		t.Helper()
+		decision, err := testLaunchRouter(t).Decide(router.LaunchRequest{
+			Role: router.RoleAssayer, Shape: "qa", RequestedProvider: "codex", RequestedModel: "gpt-5.6-luna", RequestedEffort: "medium",
+			AuthorFamily: "deepseek", AuthorModel: "deepseek-v4-pro", CandidateSHA: "sha-fac-153", TaskRef: taskRef, Scope: router.ScopeCandidate,
+			ProbeResults: map[string]bool{router.ProbeKey("codex", "gpt-5.6-luna"): true},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return decision
+	}
+
+	t.Run("candidate context reaches effect once", func(t *testing.T) {
+		decision := newDecision(t, "FAC-153")
+		effects := 0
+		_, err := launchAdmissionWithLifecycle(&fakeLaunchLifecycle{}, cfg, lane.Role, true, func(*config.LaneDef) (*router.LaunchDecision, error) { return decision, nil }, func(*router.LaunchDecision) error {
+			effects++
+			return nil
+		})
+		if err != nil || effects != 1 {
+			t.Fatalf("candidate launch effect count = %d, err = %v; want 1, nil", effects, err)
+		}
+	})
+
+	t.Run("mismatched candidate context is rejected before effect", func(t *testing.T) {
+		decision := newDecision(t, "FAC-153")
+		decision.TaskRef = "FAC-154"
+		effects := 0
+		_, err := launchAdmissionWithLifecycle(&fakeLaunchLifecycle{}, cfg, lane.Role, true, func(*config.LaneDef) (*router.LaunchDecision, error) { return decision, nil }, func(*router.LaunchDecision) error {
+			effects++
+			return nil
+		})
+		if err == nil || effects != 0 {
+			t.Fatalf("mismatched candidate launch effect count = %d, err = %v; want 0 and an error", effects, err)
+		}
+	})
+
+	t.Run("lane context remains lane name", func(t *testing.T) {
+		decision, err := testLaunchRouter(t).Decide(router.LaunchRequest{
+			Role: router.RoleReviewer, Shape: "qa", RequestedProvider: "codex", RequestedModel: "gpt-5.6-luna", RequestedEffort: "medium", TaskRef: lane.Name, Scope: router.ScopeLane,
+			AuthorFamily: "deepseek", AuthorModel: "deepseek-v4-pro", CandidateSHA: "sha-fac-153", ProbeResults: map[string]bool{router.ProbeKey("codex", "gpt-5.6-luna"): true},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		effects := 0
+		_, err = launchAdmissionWithLifecycle(&fakeLaunchLifecycle{}, cfg, lane.Role, true, func(*config.LaneDef) (*router.LaunchDecision, error) { return decision, nil }, func(*router.LaunchDecision) error {
+			effects++
+			return nil
+		})
+		if err != nil || effects != 1 {
+			t.Fatalf("lane launch effect count = %d, err = %v; want 1, nil", effects, err)
+		}
+	})
+}
+
 func TestWorkerFinalTupleRejectsSparkFallbackBeforeAnySideEffect(t *testing.T) {
 	roles := []string{launch.WorkerRole, launch.ForgeSmithRole, launch.RecoveryRole}
 	for _, role := range roles {
