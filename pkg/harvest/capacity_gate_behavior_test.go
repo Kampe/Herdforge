@@ -406,7 +406,12 @@ func TestCanonicalSymlinkMappingCannotTriggerSecondAdmission(t *testing.T) {
 	if err := os.Symlink(realWorktree, alias); err != nil {
 		t.Fatal(err)
 	}
-	commands := &capacityBehaviorCommands{root: root, wts: []string{alias}, order: &capacityBehaviorTimeline{}}
+	commands := &capacityBehaviorCommands{
+		root:          root,
+		wts:           []string{alias},
+		order:         &capacityBehaviorTimeline{},
+		branchOutputs: []string{"main", "feature"},
+	}
 	admission := &capacityBehaviorAdmission{order: commands.order}
 	h := NewHarvester(root)
 	h.DiskAdmission = admission
@@ -416,8 +421,8 @@ func TestCanonicalSymlinkMappingCannotTriggerSecondAdmission(t *testing.T) {
 	if _, err := h.Harvest(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if admission.batchPlans != 1 || commands.count("fetch") != 1 {
-		t.Fatalf("canonical alias caused partial/second path: admissions=%d commands=%v", admission.batchPlans, commands.calls)
+	if admission.plans != 1 || admission.batchPlans != 1 || commands.count("fetch") != 1 {
+		t.Fatalf("canonical alias caused partial/second path: plans=%d batch admissions=%d fetches=%d commands=%v", admission.plans, admission.batchPlans, commands.count("fetch"), commands.calls)
 	}
 }
 
