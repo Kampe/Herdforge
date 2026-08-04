@@ -760,9 +760,11 @@ exit 0
 
 // productionDetachedSessionScript: same-group background + real setsid residual
 // that retains FD5 marker lineage and chdirs away with an open descendant FD.
+// Each writer has a bounded first generation, then remains alive briefly so
+// Execute must reap it rather than passing after natural writer exit.
 // $1=sessionPid $2=writetarget $3=groupPid
 const productionDetachedSessionScript = `
-sh -c 'printf "%s\n" "$$" > "$1"; while true; do printf g >> "$2"; done' grpwriter "$3" "$2" </dev/null >/dev/null 2>&1 &
+sh -c 'printf "%s\n" "$$" > "$1"; for i in $(seq 1 4096); do printf g >> "$2"; done; sleep 30' grpwriter "$3" "$2" </dev/null >/dev/null 2>&1 &
 python3 -c '
 import os, sys
 path, target = sys.argv[1], sys.argv[2]
@@ -776,14 +778,62 @@ out = open(target, "a", encoding="utf-8")
 os.chdir("/")
 with open(path, "w", encoding="utf-8") as f:
     f.write("%d\n" % os.getpid())
-while True:
+for _ in range(4096):
     out.write("w")
     out.flush()
+import time
+time.sleep(30)
 ' "$1" "$2" </dev/null >/dev/null 2>&1
 while [ ! -s "$3" ]; do :; done
 while [ ! -s "$1" ]; do :; done
+if [ "$#" -ge 5 ]; then
+  printf "%s\n" "$$" > "$4" || exit 1
+  while [ ! -e "$5" ]; do :; done
+fi
 exit 0
 `
+
+func waitForPIDToken(path string, bound time.Duration) (procToken, error) {
+	deadline := time.Now().Add(bound)
+	for {
+		data, err := os.ReadFile(path)
+		if err == nil {
+			pid, convErr := strconv.Atoi(strings.TrimSpace(string(data)))
+			if convErr == nil && pid > 1 {
+				if tok, tokenErr := tokenOf(pid); tokenErr == nil && tok.isLiveTarget() {
+					return tok, nil
+				}
+			}
+		}
+		if time.Now().After(deadline) {
+			return procToken{}, fmt.Errorf("diagnostic ready bound exceeded waiting for %s", filepath.Base(path))
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func reapExactTokens(t *testing.T, tokens ...procToken) {
+	t.Helper()
+	for _, tok := range tokens {
+		if !tok.valid() {
+			continue
+		}
+		h, err := openHandle(tok)
+		if err != nil {
+			if tok.stillSame() {
+				t.Errorf("cleanup open exact pid %d: %v", tok.pid, err)
+			}
+			continue
+		}
+		if _, err := h.kill(); err != nil {
+			t.Errorf("cleanup kill exact pid %d: %v", tok.pid, err)
+		}
+		h.close()
+		if err := waitTokenGone(tok, 2*time.Second); err != nil {
+			t.Errorf("cleanup wait exact pid %d gone: %v", tok.pid, err)
+		}
+	}
+}
 
 func assertWriterGone(t *testing.T, pidFile string) {
 	t.Helper()
@@ -1329,7 +1379,6 @@ func TestExecuteDetachedOnlyMutationRemovingMarkerDrainLeavesWriter(t *testing.T
 // TestExecuteDetachedSessionAndBackgroundWriters covers real setsid + same-group
 // residual; production must BLOCKED and both writers gone via owned tree close.
 func TestExecuteDetachedSessionAndBackgroundWriters(t *testing.T) {
-	parallelVerifierStress(t)
 	if _, err := exec.LookPath("python3"); err != nil {
 		t.Skip("python3 required for setsid residual writer fixture")
 	}
@@ -1337,19 +1386,65 @@ func TestExecuteDetachedSessionAndBackgroundWriters(t *testing.T) {
 	sessionPidFile := filepath.Join(dir, "session.pid")
 	groupPidFile := filepath.Join(dir, "group.pid")
 	writeTarget := filepath.Join(dir, "residue.log")
+	startedFile := filepath.Join(dir, "writers-started")
+	releaseFile := filepath.Join(dir, "release-writers")
 	writeExecutable(t, filepath.Join(dir, "leave-detached"), "#!/bin/sh\n"+productionDetachedSessionScript)
 
-	result, err := NewVerifierArgs([]string{
-		"./leave-detached", sessionPidFile, writeTarget, groupPidFile,
-	}).Execute(context.Background(), dir)
+	type executeOutcome struct {
+		result *Result
+		err    error
+	}
+	done := make(chan executeOutcome, 1)
+	go func() {
+		result, err := NewVerifierArgs([]string{
+			"./leave-detached", sessionPidFile, writeTarget, groupPidFile, startedFile, releaseFile,
+		}).Execute(context.Background(), dir)
+		done <- executeOutcome{result: result, err: err}
+	}()
+	if _, err := waitForChildReadyPID(startedFile, 5*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	sessionToken, err := waitForPIDToken(sessionPidFile, 5*time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { reapExactTokens(t, sessionToken) })
+	groupToken, err := waitForPIDToken(groupPidFile, 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { reapExactTokens(t, groupToken) })
+	if sessionToken.equal(groupToken) {
+		t.Fatalf("writer inventory aliases one identity: session=%+v group=%+v", sessionToken, groupToken)
+	}
+	t.Logf("writer inventory: session pid=%d start=%d/%d; group pid=%d start=%d/%d",
+		sessionToken.pid, sessionToken.startSec, sessionToken.startUsec,
+		groupToken.pid, groupToken.startSec, groupToken.startUsec)
+	if err := os.WriteFile(releaseFile, []byte("release\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var outcome executeOutcome
+	select {
+	case outcome = <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("bounded detached-session proof exceeded diagnostic bound")
+	}
+	if outcome.err != nil {
+		t.Fatal(outcome.err)
+	}
+	result := outcome.result
 	if result.Outcome != OutcomeBLOCKED {
 		t.Fatalf("detached+background leave-writer must BLOCKED, got %+v", result)
 	}
 	assertWriterGone(t, groupPidFile)
 	assertWriterGone(t, sessionPidFile)
+	residue, err := os.ReadFile(writeTarget)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(residue) == 0 || len(residue) > 8192 {
+		t.Fatalf("bounded residue must be non-empty and <=8192 bytes, got %d", len(residue))
+	}
 }
 
 // TestProcTokenIdentityBoundRefusesStalePID proves kill is refused when a PID
