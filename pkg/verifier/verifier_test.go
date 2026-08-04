@@ -861,7 +861,7 @@ func reapExactTokens(t *testing.T, tokens ...procToken) {
 	}
 }
 
-func assertWriterGone(t *testing.T, pidFile string) {
+func assertWriterGone(t *testing.T, pidFile string, diagnostics ...string) {
 	t.Helper()
 	data, err := os.ReadFile(pidFile)
 	if err != nil {
@@ -872,6 +872,9 @@ func assertWriterGone(t *testing.T, pidFile string) {
 		t.Fatalf("bad writer pid %q", data)
 	}
 	if err := waitForPIDGone(pid, 2*time.Second); err != nil {
+		if len(diagnostics) > 0 {
+			t.Fatalf("production left writer pid %d live: %v; result output: %s", pid, err, diagnostics[0])
+		}
 		t.Fatalf("production left writer pid %d live: %v", pid, err)
 	}
 }
@@ -1545,7 +1548,7 @@ func TestExecuteDetachedSessionAndBackgroundWriters(t *testing.T) {
 		t.Fatalf("detached+background leave-writer must BLOCKED, got %+v", result)
 	}
 	assertWriterGone(t, groupPidFile)
-	assertWriterGone(t, sessionPidFile)
+	assertWriterGone(t, sessionPidFile, result.Output)
 	residue, err := os.ReadFile(writeTarget)
 	if err != nil {
 		t.Fatal(err)

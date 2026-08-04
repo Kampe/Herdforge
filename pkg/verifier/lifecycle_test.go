@@ -394,6 +394,131 @@ func TestProcessGroupReapAllowsTempDirCleanup(t *testing.T) {
 	f.root = ""
 }
 
+func TestMarkedResidualsReapExactHolderAfterTransientAndTerminalScans(t *testing.T) {
+	leader := procToken{pid: 4241, startSec: 11, startUsec: 1}
+	holder := procToken{pid: 4242, startSec: 22, startUsec: 2}
+	self := procToken{pid: os.Getpid(), startSec: 33, startUsec: 3}
+	tests := []struct {
+		name  string
+		scans []struct {
+			tokens []procToken
+			err    error
+		}
+		wantReapCalls int
+	}{
+		{
+			name: "transient empty then deadline",
+			scans: []struct {
+				tokens []procToken
+				err    error
+			}{
+				{},
+				{tokens: []procToken{holder}},
+				{err: errors.New("marker scan deadline")},
+			},
+			wantReapCalls: 3,
+		},
+		{
+			name: "permission after holder",
+			scans: []struct {
+				tokens []procToken
+				err    error
+			}{
+				{tokens: []procToken{holder}},
+				{err: fmt.Errorf("wrapped permission: %w", syscall.EPERM)},
+			},
+			wantReapCalls: 2,
+		},
+		{
+			name: "deadline after holder",
+			scans: []struct {
+				tokens []procToken
+				err    error
+			}{
+				{tokens: []procToken{holder}},
+				{err: context.DeadlineExceeded},
+			},
+			wantReapCalls: 2,
+		},
+		{
+			name: "exact exclusion",
+			scans: []struct {
+				tokens []procToken
+				err    error
+			}{
+				{tokens: []procToken{leader, self, holder}},
+				{err: errors.New("final marker scan error")},
+			},
+			wantReapCalls: 2,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			previousDrain := markerLineageDrainedFn
+			previousScan := markerLineageScanFn
+			previousNote := markerTokenNoteFn
+			previousLive := markerTokenLiveFn
+			previousLeaderLive := markerLeaderLiveFn
+			previousReap := markerResidualReapFn
+			previousExclude := residualExcludePIDsFn
+			t.Cleanup(func() {
+				markerLineageDrainedFn = previousDrain
+				markerLineageScanFn = previousScan
+				markerTokenNoteFn = previousNote
+				markerTokenLiveFn = previousLive
+				markerLeaderLiveFn = previousLeaderLive
+				markerResidualReapFn = previousReap
+				residualExcludePIDsFn = previousExclude
+			})
+
+			owned := &ownedSubprocess{
+				leader:     leader.pid,
+				markerPath: "fixture-marker",
+				handles:    map[int]ownedHandle{leader.pid: {tok: leader}},
+			}
+			markerLineageDrainedFn = func(string) (bool, error) { return false, nil }
+			residualExcludePIDsFn = func() map[int]struct{} {
+				return map[int]struct{}{self.pid: {}}
+			}
+			markerTokenLiveFn = func(procToken) bool { return true }
+			markerLeaderLiveFn = func(ownedHandle) bool { return true }
+			noted := make([]procToken, 0)
+			markerTokenNoteFn = func(_ *ownedSubprocess, tok procToken) error {
+				noted = append(noted, tok)
+				return nil
+			}
+			reaped := make([][]procToken, 0)
+			markerResidualReapFn = func(_ *ownedSubprocess) error {
+				snapshot := append([]procToken(nil), noted...)
+				reaped = append(reaped, snapshot)
+				return nil
+			}
+			scanIndex := 0
+			markerLineageScanFn = func(string, time.Time) ([]procToken, error) {
+				if scanIndex >= len(tt.scans) {
+					return nil, errors.New("unexpected extra marker scan")
+				}
+				scan := tt.scans[scanIndex]
+				scanIndex++
+				return scan.tokens, scan.err
+			}
+
+			if err := owned.adoptAndKillMarkedResiduals(); err == nil {
+				t.Fatal("terminal marker scan error must remain BLOCKED")
+			}
+			if len(reaped) != tt.wantReapCalls {
+				t.Fatalf("reap calls=%d, want %d; snapshots=%+v", len(reaped), tt.wantReapCalls, reaped)
+			}
+			if len(reaped[len(reaped)-1]) != 1 || !reaped[len(reaped)-1][0].equal(holder) {
+				t.Fatalf("final reap=%+v, want exact holder %+v", reaped[len(reaped)-1], holder)
+			}
+			if len(noted) != 1 || !noted[0].equal(holder) {
+				t.Fatalf("noted tokens=%+v, want only exact holder %+v", noted, holder)
+			}
+		})
+	}
+}
+
 // grandchildGroupScript: leader backgrounds a real nested sh (not a shell
 // function — $$ in functions is the parent shell on bash/zsh) that writes its
 // own pid then parks. Production ReapOwnedCmd must kill leader + grandchild.

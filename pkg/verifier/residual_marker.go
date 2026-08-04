@@ -13,6 +13,13 @@ import (
 // lock probe below.
 var markerLineageDrainedFn = markerLineageDrained
 
+// markerLineageScanFn and markerTokenNoteFn are narrow seams for proving
+// marker-holder retry and exact-token ownership without live writer fixtures.
+var markerLineageScanFn = processesHoldingMarkerUntil
+var markerTokenNoteFn = (*ownedSubprocess).noteCausal
+var markerTokenLiveFn = procToken.isLiveTarget
+var markerLeaderLiveFn = func(h ownedHandle) bool { return h.tok.stillSame() }
+
 // createOwnershipMarker creates a private, mode-0600 file used as an inherited
 // locked lineage marker. The open file is passed to the ownership wrapper as
 // ExtraFiles FD5; descendants that retain the FD are causally owned. The path

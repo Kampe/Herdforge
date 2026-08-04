@@ -12,6 +12,8 @@ import (
 // the current verifier process and every ancestor up the PPID chain (control
 // plane / daemon / test runner). Path residual ownership is for escaped
 // candidate writers, not self or the orchestration plane.
+var residualExcludePIDsFn = residualExcludePIDs
+
 func residualExcludePIDs() map[int]struct{} {
 	excl := make(map[int]struct{}, 8)
 	for _, start := range []int{os.Getpid(), os.Getppid()} {
@@ -54,7 +56,7 @@ func processParentPID(pid int) (int, error) {
 // filterResidualTokens drops control-plane and invalid PIDs from a path
 // residual scan. leader, when > 1, is also excluded (ownership supervisor).
 func filterResidualTokens(toks []procToken, leader int) []procToken {
-	excl := residualExcludePIDs()
+	excl := residualExcludePIDsFn()
 	if leader > 1 {
 		excl[leader] = struct{}{}
 	}

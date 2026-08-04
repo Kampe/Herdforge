@@ -33,6 +33,10 @@ var finalizeOwnedTree = (*ownedSubprocess).Close
 // leaves residual writers alive (PASS-with-writer regression).
 var residualDrainFn = (*ownedSubprocess).drainResidualsWhileLeaderLive
 
+// markerResidualReapFn is the exact-token final reap seam. Production uses
+// owned handles; hermetic tests replace it with an identity recorder.
+var markerResidualReapFn = (*ownedSubprocess).reapMarkerResiduals
+
 const (
 	processGroupGoneBound = 500 * time.Millisecond
 	trackSampleInterval   = 5 * time.Millisecond
@@ -472,23 +476,24 @@ func (o *ownedSubprocess) adoptAndKillMarkedResiduals() error {
 		o.mu.Lock()
 		leaderH, ok := o.handles[o.leader]
 		o.mu.Unlock()
-		if !ok || !leaderH.tok.stillSame() {
+		if !ok || !markerLeaderLiveFn(leaderH) {
 			return fmt.Errorf("drain residuals marker lineage: supervisor leader not live")
 		}
 		drained, err := markerLineageDrainedFn(o.markerPath)
 		if err != nil {
-			return fmt.Errorf("drain residuals marker fixed point: %w", err)
+			return o.finishMarkerResidualError(fmt.Errorf("drain residuals marker fixed point: %w", err))
 		}
 		if drained {
 			return nil
 		}
 		if !time.Now().Before(deadline) {
-			return fmt.Errorf("%w: marked residual lock held after %s (last discovered=%d)",
-				ErrResidualOwnedTree, processGroupGoneBound, lastLive)
+			return o.finishMarkerResidualError(fmt.Errorf(
+				"%w: marked residual lock held after %s (last discovered=%d)",
+				ErrResidualOwnedTree, processGroupGoneBound, lastLive))
 		}
-		toks, err := processesHoldingMarkerUntil(o.markerPath, deadline)
+		toks, err := markerLineageScanFn(o.markerPath, deadline)
 		if err != nil {
-			return fmt.Errorf("drain residuals marker lineage: %w", err)
+			return o.finishMarkerResidualError(fmt.Errorf("drain residuals marker lineage: %w", err))
 		}
 		toks = filterResidualTokens(toks, o.leader)
 		live := make([]procToken, 0, len(toks))
@@ -496,26 +501,38 @@ func (o *ownedSubprocess) adoptAndKillMarkedResiduals() error {
 			if tok.pid <= 1 || tok.pid == o.leader || tok.pid == os.Getpid() {
 				continue
 			}
-			if !tok.isLiveTarget() {
+			if !markerTokenLiveFn(tok) {
 				continue
 			}
 			live = append(live, tok)
 		}
 		lastLive = len(live)
 		for _, tok := range live {
-			if err := o.noteCausal(tok); err != nil {
+			if err := markerTokenNoteFn(o, tok); err != nil {
 				if !tok.stillSame() {
 					continue
 				}
-				return fmt.Errorf("drain residuals note marker lineage pid %d: %w", tok.pid, err)
+				return o.finishMarkerResidualError(fmt.Errorf(
+					"drain residuals note marker lineage pid %d: %w", tok.pid, err))
 			}
 		}
-		if err := o.killTracked(false); err != nil {
+		if err := markerResidualReapFn(o); err != nil {
 			return fmt.Errorf("drain residuals kill marker lineage: %w", err)
 		}
 		// No sleep/stability window: immediately repeat discovery until the
 		// kernel lock proves the last inherited FD is gone or the bound expires.
 	}
+}
+
+func (o *ownedSubprocess) reapMarkerResiduals() error {
+	return o.killTracked(false)
+}
+
+func (o *ownedSubprocess) finishMarkerResidualError(cause error) error {
+	if reapErr := markerResidualReapFn(o); reapErr != nil {
+		return errors.Join(cause, fmt.Errorf("final marker residual reap: %w", reapErr))
+	}
+	return cause
 }
 
 // waitProcessGroupEmptyExcept repeatedly membership-kills and probes until
