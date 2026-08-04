@@ -369,6 +369,7 @@ static int marker_holders(const char *path, int64_t budget_ns,
 import "C"
 
 import (
+	"errors"
 	"fmt"
 	"syscall"
 	"time"
@@ -514,6 +515,13 @@ func processesHoldingMarkerUntil(markerPath string, deadline time.Time) ([]procT
 	}
 	native, err := markerHoldersFn(markerPath, remaining)
 	if err != nil {
+		// Some macOS configurations deny libproc FD enumeration to the test
+		// process. Fall back to the path-targeted lsof scanner, which retains
+		// the same marker-path and PID/start-token authority. Other native
+		// inspection errors remain fail-closed.
+		if errors.Is(err, syscall.EPERM) || errors.Is(err, syscall.EACCES) {
+			return processesHoldingMarkerViaLsof(markerPath, deadline)
+		}
 		return nil, fmt.Errorf("processesHoldingMarker libproc: %w", err)
 	}
 	if len(native) == 0 {
