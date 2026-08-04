@@ -96,6 +96,138 @@ type holdAuthorityBoundary interface {
 	Release(context.Context, lifecycle.HoldIdentity, string, string, string, int64) (lifecycle.HoldRecord, error)
 }
 
+type holdCommandRequest struct {
+	Config       *config.Config
+	LaneValue    string
+	Task         string
+	Scope        string
+	ExplicitLane bool
+	Owner        string
+	Action       string
+	Actor        string
+	Reason       string
+	Code         string
+	Repository   string
+	Generation   int64
+	Until        string
+}
+
+type holdCommandDependencies struct {
+	AuthenticateRepository func() (string, error)
+	OpenAuthority          func() (holdAuthorityBoundary, error)
+	Encode                 func(any) error
+	Flush                  func() error
+	Now                    func() time.Time
+}
+
+func closeHoldAuthority(primary error, authority holdAuthorityBoundary) error {
+	if authority == nil {
+		return primary
+	}
+	return errors.Join(primary, authority.Close())
+}
+
+// executeHoldCommand is the non-exiting hold command adapter. All target and
+// repository validation completes before OpenAuthority, and every authority,
+// output, flush, and close error remains observable to the caller.
+func executeHoldCommand(ctx context.Context, req holdCommandRequest, deps holdCommandDependencies) (err error) {
+	if req.Action != "on" && req.Action != "off" && req.Action != "status" {
+		return fmt.Errorf("unknown hold action %q", req.Action)
+	}
+	if deps.AuthenticateRepository == nil {
+		return errors.New("authenticated repository resolver is required")
+	}
+	if deps.OpenAuthority == nil {
+		return errors.New("hold authority opener is required")
+	}
+	if deps.Encode == nil {
+		return errors.New("hold output encoder is required")
+	}
+	if deps.Flush == nil {
+		return errors.New("hold output flush is required")
+	}
+	if deps.Now == nil {
+		deps.Now = time.Now
+	}
+
+	authenticated, err := deps.AuthenticateRepository()
+	if err != nil {
+		return fmt.Errorf("resolve repository identity: %w", err)
+	}
+	if strings.TrimSpace(authenticated) == "" || authenticated != strings.TrimSpace(authenticated) {
+		return errors.New("authenticated repository identity is empty or noncanonical")
+	}
+	if req.Repository != "" && (req.Repository != authenticated || req.Repository != strings.TrimSpace(req.Repository)) {
+		return fmt.Errorf("repository override %q does not match authenticated repository", req.Repository)
+	}
+
+	identity, err := composeHoldIdentity(req.Config, req.LaneValue, req.Task, req.Scope, req.ExplicitLane, req.Owner, authenticated)
+	if err != nil {
+		return err
+	}
+	authority, err := deps.OpenAuthority()
+	if err != nil {
+		return err
+	}
+	defer func() { err = closeHoldAuthority(err, authority) }()
+
+	current, err := authority.CurrentGeneration(ctx, identity)
+	if err != nil {
+		return err
+	}
+	gen := req.Generation
+	if gen == 0 {
+		gen = current
+		if req.Action == "on" {
+			exists, existsErr := authority.HasCurrent(ctx, identity)
+			if existsErr != nil {
+				return existsErr
+			}
+			if !exists {
+				gen = 1
+			} else {
+				decision, checkErr := authority.Check(ctx, identity, current)
+				if checkErr != nil {
+					return checkErr
+				}
+				if !decision.Held {
+					gen = current + 1
+				}
+			}
+		}
+	}
+
+	var receipt any
+	switch req.Action {
+	case "status":
+		decision, checkErr := authority.Check(ctx, identity, gen)
+		if checkErr != nil {
+			return checkErr
+		}
+		receipt = map[string]any{"repository": identity.Repository, "owner": identity.Owner, "lane": identity.Lane, "task": identity.Task, "generation": decision.Generation, "held": decision.Held, "reason": decision.Reason, "code": decision.Code}
+	case "on":
+		expires, parseErr := parseHoldExpiry(req.Until, deps.Now)
+		if parseErr != nil {
+			return parseErr
+		}
+		record, holdErr := authority.Hold(ctx, identity, req.Actor, req.Reason, req.Code, gen, expires)
+		if holdErr != nil {
+			return holdErr
+		}
+		receipt = record
+	case "off":
+		record, releaseErr := authority.Release(ctx, identity, req.Actor, req.Reason, "operator_release", gen)
+		if releaseErr != nil {
+			return releaseErr
+		}
+		receipt = record
+	}
+	if err := deps.Encode(receipt); err != nil {
+		return err
+	}
+	return deps.Flush()
+}
+
 func prepareHoldCommand(cfg *config.Config, laneValue, task, scope string, explicitLane bool, owner, repository string, open func() (holdAuthorityBoundary, error)) (lifecycle.HoldIdentity, holdAuthorityBoundary, error) {
 	identity, err := composeHoldIdentity(cfg, laneValue, task, scope, explicitLane, owner, repository)
 	if err != nil {
@@ -233,14 +365,6 @@ func runHold() {
 		fmt.Fprintf(os.Stderr, "hold: unknown action %q\n", action)
 		os.Exit(2)
 	}
-	repository, err := holdRepository()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "hold: %v\n", err)
-		os.Exit(1)
-	}
-	if strings.TrimSpace(*repositoryFlag) != "" {
-		repository = strings.TrimSpace(*repositoryFlag)
-	}
 	if *scope != "task" && *scope != "lane" {
 		fmt.Fprintf(os.Stderr, "hold: invalid --scope %q\n", *scope)
 		os.Exit(2)
@@ -266,68 +390,20 @@ func runHold() {
 		fmt.Fprintf(os.Stderr, "hold: %v\n", cfgErr)
 		os.Exit(1)
 	}
-	identity, a, err := prepareHoldCommand(cfg, *lane, *task, *scope, laneSet || *scope == "task", *owner, repository, func() (holdAuthorityBoundary, error) {
-		root, err := worktree.ResolveCanonicalRoot(ctx, ".", firstEnv("HERD_ROOT", "HERD_REPO_ROOT", ""))
-		if err != nil {
-			return nil, err
-		}
-		return lifecycle.NewHoldAuthority(lifecycle.CanonicalStatePath(root))
+	err := executeHoldCommand(ctx, holdCommandRequest{Config: cfg, LaneValue: *lane, Task: *task, Scope: *scope, ExplicitLane: laneSet || *scope == "task", Owner: *owner, Action: action, Actor: *actor, Reason: *reason, Code: *code, Repository: *repositoryFlag, Generation: *generation, Until: *until}, holdCommandDependencies{
+		AuthenticateRepository: holdRepository,
+		OpenAuthority: func() (holdAuthorityBoundary, error) {
+			root, err := worktree.ResolveCanonicalRoot(ctx, ".", firstEnv("HERD_ROOT", "HERD_REPO_ROOT", ""))
+			if err != nil {
+				return nil, err
+			}
+			return lifecycle.NewHoldAuthority(lifecycle.CanonicalStatePath(root))
+		},
+		Encode: json.NewEncoder(os.Stdout).Encode,
+		Flush:  func() error { return nil },
+		Now:    time.Now,
 	})
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "hold: %v\n", err)
-		os.Exit(2)
-	}
-	defer a.Close()
-	current, err := a.CurrentGeneration(ctx, identity)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "hold: %v\n", err)
-		os.Exit(1)
-	}
-	gen := *generation
-	if gen == 0 {
-		gen = current
-		if action == "on" {
-			exists, existsErr := a.HasCurrent(ctx, identity)
-			if existsErr != nil {
-				fmt.Fprintf(os.Stderr, "hold: %v\n", existsErr)
-				os.Exit(1)
-			}
-			if !exists {
-				gen = 1
-			} else if decision, checkErr := a.Check(ctx, identity, current); checkErr == nil && !decision.Held {
-				gen = current + 1
-			}
-		}
-	}
-	if action == "status" {
-		decision, checkErr := a.Check(ctx, identity, gen)
-		if checkErr != nil {
-			if errors.Is(checkErr, lifecycle.ErrHoldMissing) {
-				fmt.Fprintf(os.Stderr, "hold: %v\n", checkErr)
-			} else {
-				fmt.Fprintf(os.Stderr, "hold status: %v\n", checkErr)
-			}
-			os.Exit(1)
-		}
-		_ = json.NewEncoder(os.Stdout).Encode(map[string]any{"repository": identity.Repository, "owner": identity.Owner, "lane": identity.Lane, "task": identity.Task, "generation": decision.Generation, "held": decision.Held, "reason": decision.Reason, "code": decision.Code})
-		return
-	}
-	var record lifecycle.HoldRecord
-	if action == "on" {
-		expires, parseErr := parseHoldExpiry(*until, time.Now)
-		if parseErr != nil {
-			fmt.Fprintf(os.Stderr, "hold: %v\n", parseErr)
-			os.Exit(1)
-		}
-		record, err = a.Hold(ctx, identity, *actor, *reason, *code, gen, expires)
-	} else {
-		record, err = a.Release(ctx, identity, *actor, *reason, "operator_release", gen)
-	}
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "hold %s: %v\n", action, err)
-		os.Exit(1)
-	}
-	if err := json.NewEncoder(os.Stdout).Encode(record); err != nil {
 		fmt.Fprintf(os.Stderr, "hold: %v\n", err)
 		os.Exit(1)
 	}
