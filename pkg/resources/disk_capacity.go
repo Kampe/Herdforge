@@ -110,27 +110,27 @@ const (
 // DiskEvidence is bounded and safe to serialize or log. Paths are never
 // included; identities containing path-like data are reduced to an opaque ID.
 type DiskEvidence struct {
-	Kind               string  `json:"kind"`
-	Reason             string  `json:"reason"`
-	Operation          string  `json:"operation"`
-	FilesystemID       string  `json:"filesystem_id,omitempty"`
-	TempFilesystemID   string  `json:"temp_filesystem_id,omitempty"`
-	FreeBytes          uint64  `json:"free_bytes"`
-	FreePercent        float64 `json:"free_percent"`
-	FreeInodes         uint64  `json:"free_inodes"`
-	RequiredBytes      uint64  `json:"required_bytes"`
-	ReserveBytes       uint64  `json:"reserve_bytes"`
-	ReservePercent     float64 `json:"reserve_percent"`
-	ReserveInodes      uint64  `json:"reserve_inodes"`
-	RequiredInodes     uint64  `json:"required_inodes"`
-	TempFreeBytes      uint64  `json:"temp_free_bytes"`
-	TempFreePercent    float64 `json:"temp_free_percent"`
-	TempFreeInodes     uint64  `json:"temp_free_inodes"`
-	ScopeID            string  `json:"scope_id,omitempty"`
-	FailedFilesystemID string  `json:"failed_filesystem_id,omitempty"`
-	FailedFreeBytes    uint64  `json:"failed_free_bytes"`
-	FailedFreePercent  float64 `json:"failed_free_percent"`
-	FailedFreeInodes   uint64  `json:"failed_free_inodes"`
+	Kind               string   `json:"kind"`
+	Reason             string   `json:"reason"`
+	Operation          string   `json:"operation"`
+	FilesystemID       string   `json:"filesystem_id,omitempty"`
+	TempFilesystemID   string   `json:"temp_filesystem_id,omitempty"`
+	FreeBytes          uint64   `json:"free_bytes"`
+	FreePercent        float64  `json:"free_percent"`
+	FreeInodes         uint64   `json:"free_inodes"`
+	RequiredBytes      uint64   `json:"required_bytes"`
+	ReserveBytes       uint64   `json:"reserve_bytes"`
+	ReservePercent     float64  `json:"reserve_percent"`
+	ReserveInodes      uint64   `json:"reserve_inodes"`
+	RequiredInodes     uint64   `json:"required_inodes"`
+	TempFreeBytes      *uint64  `json:"temp_free_bytes,omitempty"`
+	TempFreePercent    *float64 `json:"temp_free_percent,omitempty"`
+	TempFreeInodes     *uint64  `json:"temp_free_inodes,omitempty"`
+	ScopeID            string   `json:"scope_id,omitempty"`
+	FailedFilesystemID string   `json:"failed_filesystem_id,omitempty"`
+	FailedFreeBytes    *uint64  `json:"failed_free_bytes,omitempty"`
+	FailedFreePercent  *float64 `json:"failed_free_percent,omitempty"`
+	FailedFreeInodes   *uint64  `json:"failed_free_inodes,omitempty"`
 }
 
 type DiskDecision struct {
@@ -247,7 +247,8 @@ func EvaluateDiskCapacity(backend StatFSBackend, request DiskRequest, policy Dis
 			return diskBlocked(e, DiskReasonUnavailable)
 		}
 		e.TempFilesystemID = safeDiskIdentity(tmp.FilesystemID)
-		e.TempFreeBytes, e.TempFreePercent, e.TempFreeInodes = capacityMetrics(tmp)
+		freeBytes, freePercent, freeInodes := capacityMetrics(tmp)
+		e.TempFreeBytes, e.TempFreePercent, e.TempFreeInodes = &freeBytes, &freePercent, &freeInodes
 		if !capacityMeets(tmp, request.RequiredBytes, request.RequiredInodes, t) {
 			return diskBlocked(e, DiskReasonTempVolumeDivergence)
 		}
@@ -268,7 +269,8 @@ func EvaluateDiskCapacity(backend StatFSBackend, request DiskRequest, policy Dis
 			e.Reason = DiskReasonAdditionalInvalid
 			return DiskDecision{State: DiskBlocked, Evidence: e}
 		}
-		e.FailedFreeBytes, e.FailedFreePercent, e.FailedFreeInodes = capacityMetrics(additional)
+		freeBytes, freePercent, freeInodes := capacityMetrics(additional)
+		e.FailedFreeBytes, e.FailedFreePercent, e.FailedFreeInodes = &freeBytes, &freePercent, &freeInodes
 		if strings.TrimSpace(additional.FilesystemID) == "" {
 			e.Reason = DiskReasonAdditionalUnavailable
 			return DiskDecision{State: DiskBlocked, Evidence: e}
