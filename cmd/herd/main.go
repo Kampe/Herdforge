@@ -3121,6 +3121,24 @@ func runAttention() {
 	}
 }
 
+// newLifecycleEngineFromConfig is the production roster-construction seam.
+// It preserves every configured lane for typed role/live-ID resolution while
+// carrying the declarative Standing bit used by lifecycle classification.
+func newLifecycleEngineFromConfig(roleConfig *config.Config) (*lifecycle.Engine, error) {
+	if roleConfig == nil {
+		return nil, fmt.Errorf("lifecycle: config is required")
+	}
+	lanes := make([]lifecycle.CanonicalLane, 0, len(roleConfig.Lanes))
+	for _, lane := range roleConfig.Lanes {
+		lanes = append(lanes, lifecycle.CanonicalLane{Name: lane.Name, Role: lane.Role, Standing: lane.Standing})
+	}
+	registry, err := lifecycle.NewCanonicalLaneRegistry(lanes)
+	if err != nil {
+		return nil, fmt.Errorf("lifecycle lane registry: %w", err)
+	}
+	return &lifecycle.Engine{StandingRoster: &registry, Lanes: registry.LaneNames()}, nil
+}
+
 func runLifecycle() {
 	lifecycleFlags := flag.NewFlagSet("lifecycle", flag.ExitOnError)
 	actMode := lifecycleFlags.Bool("act", false, "Execute act mode")
@@ -3139,10 +3157,14 @@ func runLifecycle() {
 		return
 	}
 
-	eng := &lifecycle.Engine{}
 	roleConfig, roleErr := config.LoadConfig(".herd/herd.yaml")
 	if roleErr != nil {
 		fmt.Fprintf(os.Stderr, "lifecycle role config: %v\n", roleErr)
+		os.Exit(1)
+	}
+	eng, registryErr := newLifecycleEngineFromConfig(roleConfig)
+	if registryErr != nil {
+		fmt.Fprintf(os.Stderr, "%v\n", registryErr)
 		os.Exit(1)
 	}
 	for _, lane := range roleConfig.Lanes {
@@ -3150,19 +3172,7 @@ func runLifecycle() {
 			eng.HoldRoles = append(eng.HoldRoles, strings.TrimSpace(lane.Role))
 		}
 	}
-	roleRegistry, registryErr := lifecycle.NewCanonicalLaneRegistry(func() []lifecycle.CanonicalLane {
-		lanes := make([]lifecycle.CanonicalLane, 0, len(roleConfig.Lanes))
-		for _, lane := range roleConfig.Lanes {
-			lanes = append(lanes, lifecycle.CanonicalLane{Name: lane.Name, Role: lane.Role})
-		}
-		return lanes
-	}())
-	if registryErr != nil {
-		fmt.Fprintf(os.Stderr, "lifecycle lane registry: %v\n", registryErr)
-		os.Exit(1)
-	}
-	eng.StandingRoster = &roleRegistry
-	eng.Lanes = roleRegistry.LaneNames()
+	roleRegistry := *eng.StandingRoster
 	holdAuthority, holdErr := newProductionHoldAuthority()
 	if holdErr != nil {
 		fmt.Fprintf(os.Stderr, "lifecycle hold authority: %v\n", holdErr)

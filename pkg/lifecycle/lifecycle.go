@@ -173,8 +173,8 @@ type Engine struct {
 
 	Lanes []string // explicit lane snapshot to observe; production injects it from herd.yaml
 	// StandingRoster is the validated immutable config snapshot used to
-	// classify live standing IDs. Lifecycle never falls back to a hard-coded
-	// legacy roster.
+	// classify configured live IDs and their Standing bit. Lifecycle never
+	// falls back to a hard-coded legacy roster.
 	StandingRoster *CanonicalLaneRegistry
 
 	// Hooks for act mode.
@@ -1004,6 +1004,32 @@ func (e *Engine) computeSummary(agentsWrapper struct {
 	} `json:"result"`
 }, boardJSON json.RawMessage, stateEntries []LaneStateSnapshot, eventJSON json.RawMessage) *Summary {
 	s := &Summary{}
+	liveCounts := make(map[string]int)
+	for _, raw := range agentsWrapper.Result.Agents {
+		var ag struct {
+			Name      string `json:"name"`
+			Label     string `json:"label"`
+			AgentName string `json:"agent_name"`
+			Agent     string `json:"agent"`
+		}
+		if err := json.Unmarshal(raw, &ag); err != nil {
+			continue
+		}
+		name := ag.Name
+		if name == "" {
+			name = ag.Label
+		}
+		if name == "" {
+			name = ag.AgentName
+		}
+		if name == "" {
+			name = ag.Agent
+		}
+		if name != "" {
+			liveCounts[strings.ToLower(strings.TrimSpace(name))]++
+		}
+	}
+	reportedDuplicates := make(map[string]bool)
 
 	// Parse agents.
 	for _, raw := range agentsWrapper.Result.Agents {
@@ -1043,13 +1069,23 @@ func (e *Engine) computeSummary(agentsWrapper struct {
 
 		var canonical CanonicalLane
 		var resolveErr error
-		isStanding := false
+		configured := false
 		if e.StandingRoster == nil {
 			resolveErr = fmt.Errorf("configured standing roster is unavailable")
 		} else {
 			canonical, resolveErr = e.StandingRoster.ResolveLiveAgentID(name)
-			isStanding = resolveErr == nil
+			configured = resolveErr == nil
 		}
+		duplicateKey := strings.ToLower(strings.TrimSpace(name))
+		if liveCounts[duplicateKey] > 1 {
+			configured = false
+			resolveErr = fmt.Errorf("duplicate live agent ID %q", name)
+			if !reportedDuplicates[duplicateKey] {
+				s.Critical = append(s.Critical, fmt.Sprintf("duplicate_live_agent:%s", name))
+				reportedDuplicates[duplicateKey] = true
+			}
+		}
+		isStanding := configured && canonical.Standing
 
 		interactive := false
 		if ag.Interactive != nil {
@@ -1069,11 +1105,11 @@ func (e *Engine) computeSummary(agentsWrapper struct {
 			Standing:    isStanding,
 		}
 		s.Standing = append(s.Standing, as)
-		if resolveErr != nil {
+		if resolveErr != nil && liveCounts[duplicateKey] <= 1 {
 			s.Critical = append(s.Critical, fmt.Sprintf("unknown_live_agent:%s:%v", name, resolveErr))
 		}
 
-		if (st == "idle" || st == "done" || st == "blocked" || st == "unknown") && isStanding {
+		if (st == "idle" || st == "done" || st == "blocked" || st == "unknown") && configured {
 			s.Settled = append(s.Settled, as)
 		}
 	}

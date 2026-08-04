@@ -74,6 +74,28 @@ func TestCanonicalHoldIdentityUsesConfiguredLaneAndFailsUnknownRole(t *testing.T
 	}
 }
 
+func TestNewLifecycleEngineFromConfigPreservesRosterAndStanding(t *testing.T) {
+	cfg := &config.Config{Lanes: []config.LaneDef{
+		{Name: "smith", Role: "worker", Standing: false},
+		{Name: "scout", Role: "forge-smith", Standing: true},
+	}}
+	eng, err := newLifecycleEngineFromConfig(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if eng.StandingRoster == nil || len(eng.Lanes) != 2 {
+		t.Fatalf("production roster wiring lost configured lanes: %+v", eng)
+	}
+	smith, err := eng.StandingRoster.ResolveLiveAgentID("forge-smith")
+	if err != nil || smith.Name != "smith" || smith.Role != "worker" || smith.Standing {
+		t.Fatalf("non-standing smith roster entry=%+v err=%v", smith, err)
+	}
+	scout, err := eng.StandingRoster.ResolveRole("forge-smith")
+	if err != nil || scout.Name != "scout" || !scout.Standing {
+		t.Fatalf("standing scout roster entry=%+v err=%v", scout, err)
+	}
+}
+
 func TestComposeHoldIdentityRejectsUnknownBeforeAuthorityComposition(t *testing.T) {
 	cfg := &config.Config{Lanes: []config.LaneDef{{Name: "smith", Role: "worker"}}}
 	for _, tc := range []struct {
