@@ -63,12 +63,30 @@ func Require(role Role, provider string, argv []string) ([]string, EffectiveConf
 		if err != nil {
 			return nil, EffectiveConfig{}, err
 		}
+		// Worker compilers may add the explicit inherited-MCP override. Every
+		// control/resume role must instead present the already-compiled argv;
+		// silently correcting it here would let callers discard the authority.
+		if role != RoleWorker && role != RoleForgeSmith && role != RoleRecovery && !sameArgs(compiled, argv) {
+			return nil, EffectiveConfig{}, fmt.Errorf("control-role codex argv is not compiled")
+		}
 		return compiled, CodexConfig(), nil
 	}
 	if strings.TrimSpace(string(role)) == "" || len(argv) == 0 {
 		return nil, EffectiveConfig{}, ErrMissingPolicy
 	}
 	return append([]string(nil), argv...), EffectiveConfig{MCPServers: map[string]bool{}, CLI: map[string]bool{}}, nil
+}
+
+func sameArgs(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // Authorization binds an exceptional stateful server to every identity that

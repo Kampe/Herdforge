@@ -644,6 +644,9 @@ func (d *Dispatcher) launch(
 	}
 	result.TabID = tab.ID
 	result.AgentName = tabLabel
+	if err := herdr.PrepareToolChildLifecycle(tab.ID, tab.Pane.ID, request, tabLabel); err != nil {
+		return &launchFailure{Reason: "tool_child_lifecycle_failed", Err: closeTabLocal(h, tab.ID, "tool_child_lifecycle_failed", err)}
+	}
 	if err := d.record(ctx, StepRecord{
 		TicketRef: task.Ref,
 		Step:      StepTab,

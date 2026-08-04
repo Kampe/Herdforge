@@ -5,11 +5,16 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
+	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Kampe/Herdforge/pkg/launch"
+	"github.com/Kampe/Herdforge/pkg/toolchild"
 )
 
 const (
@@ -19,6 +24,150 @@ const (
 
 // runHerdr is overridable for crash-point / unit tests (FAC-121).
 var runHerdr = runHerdrReal
+
+// ToolChildLifecycle is the narrow process-tree seam used by every real
+// launch. Tests install a FakeTree-backed implementation; production uses the
+// exact-PID SystemTree and durable JSONL sink.
+type ToolChildLifecycle interface {
+	Bind(owner toolchild.Identity) error
+	Begin() error
+	Reconcile(event string) error
+}
+
+var (
+	toolChildMu           sync.Mutex
+	toolChildByPane       = map[string]ToolChildLifecycle{}
+	toolChildByTab        = map[string]ToolChildLifecycle{}
+	newToolChildLifecycle = defaultToolChildLifecycle
+)
+
+func defaultToolChildLifecycle(req launch.Request, name, paneID string) (ToolChildLifecycle, error) {
+	p := os.Getenv("HERD_TOOLCHILD_RECEIPTS")
+	if p == "" {
+		p = ".herd/toolchild-receipts.jsonl"
+	}
+	role := ""
+	if req.Decision != nil {
+		role = string(req.Decision.Role)
+	}
+	owner := toolchild.Identity{SessionGeneration: req.LeaseGeneration, LaunchID: launch.DecisionDigest(req.Decision), Repository: "herdforge", Role: role, Lane: name}
+	return toolchild.NewLifecycle(owner, toolchild.SystemTree{}, &toolchild.JSONLSink{Path: p}), nil
+}
+
+// SetToolChildLifecycleFactory is intentionally test-facing injection. A nil
+// factory restores the production adapter.
+func SetToolChildLifecycleFactory(f func(launch.Request, string, string) (ToolChildLifecycle, error)) func() {
+	toolChildMu.Lock()
+	old := newToolChildLifecycle
+	if f == nil {
+		newToolChildLifecycle = defaultToolChildLifecycle
+	} else {
+		newToolChildLifecycle = f
+	}
+	toolChildMu.Unlock()
+	return func() { toolChildMu.Lock(); newToolChildLifecycle = old; toolChildMu.Unlock() }
+}
+
+func PrepareToolChildLifecycle(tabID, paneID string, req launch.Request, name string) error {
+	if tabID == "" || paneID == "" {
+		return fmt.Errorf("tool-child lifecycle requires tab and pane")
+	}
+	toolChildMu.Lock()
+	f := newToolChildLifecycle
+	toolChildMu.Unlock()
+	lc, err := f(req, name, paneID)
+	if err != nil {
+		return err
+	}
+	if lc == nil {
+		return fmt.Errorf("tool-child lifecycle factory returned nil")
+	}
+	toolChildMu.Lock()
+	toolChildByPane[paneID] = lc
+	toolChildByTab[tabID] = lc
+	toolChildMu.Unlock()
+	return nil
+}
+
+// StartPreparedAgent is the required direct-entrypoint adapter. It closes
+// the gap between tab creation and exact Herdr-reported owner binding.
+func StartPreparedAgent(tabID, name, kind, paneID string, req launch.Request) error {
+	if err := PrepareToolChildLifecycle(tabID, paneID, req, name); err != nil {
+		return err
+	}
+	return AgentStartWithDecision(name, kind, paneID, req)
+}
+
+func lifecycleForPane(paneID string) ToolChildLifecycle {
+	toolChildMu.Lock()
+	defer toolChildMu.Unlock()
+	return toolChildByPane[paneID]
+}
+
+func bindToolChildLifecycle(paneID, name string, req launch.Request) error {
+	lc := lifecycleForPane(paneID)
+	if lc == nil {
+		return nil
+	}
+	agents, err := AgentList()
+	if err != nil {
+		return fmt.Errorf("tool-child owner lookup: %w", err)
+	}
+	for _, a := range agents {
+		if a.Name != name || a.PaneID != paneID || a.Session.Value == "" || a.Kind != req.Decision.Provider {
+			continue
+		}
+		processes, err := paneProcesses(paneID)
+		if err != nil {
+			return err
+		}
+		var matches, wrappers []PaneProcess
+		for _, p := range processes {
+			if nativeCandidate(req.Decision.Provider, req.Decision.Argv, p) {
+				matches = append(matches, p)
+			}
+			if wrapperCandidate(p) {
+				wrappers = append(wrappers, p)
+			}
+		}
+		if len(matches) != 1 {
+			return fmt.Errorf("pane %s has %d exact routed agent processes", paneID, len(matches))
+		}
+		p := matches[0]
+		if p.PID <= 0 || len(p.Argv) == 0 {
+			return fmt.Errorf("pane process identity is incomplete")
+		}
+		token, err := readPIDStartToken(p.PID)
+		if err != nil {
+			return err
+		}
+		parent, err := readPIDParent(p.PID)
+		if err != nil {
+			return err
+		}
+		if len(wrappers) > 0 {
+			if len(wrappers) != 1 || parent != wrappers[0].PID {
+				return fmt.Errorf("native process parent does not prove the unique node wrapper")
+			}
+		}
+		role := ""
+		if req.Decision != nil {
+			role = string(req.Decision.Role)
+		}
+		return lc.Bind(toolchild.Identity{PID: p.PID, ParentPID: parent, StartToken: token, SessionGeneration: req.LeaseGeneration, LaunchID: launch.DecisionDigest(req.Decision), Repository: "herdforge", Role: role, Lane: name, SessionID: a.Session.Value, PaneID: paneID, Provider: req.Decision.Provider, ArgvDigest: launch.DecisionDigest(req.Decision)})
+	}
+	return fmt.Errorf("tool-child owner identity unavailable for %s/%s", name, paneID)
+}
+
+func ReconcileToolChild(tabID, event string) error {
+	toolChildMu.Lock()
+	lc := toolChildByTab[tabID]
+	toolChildMu.Unlock()
+	if lc == nil {
+		return nil
+	}
+	return lc.Reconcile(event)
+}
 
 type TabInfo struct {
 	ID    string
@@ -147,11 +296,30 @@ func AgentStartWithDecision(name, kind, paneID string, req launch.Request) error
 	if req.Decision == nil || len(req.Decision.Argv) == 0 {
 		return fmt.Errorf("launch decision argv is empty")
 	}
+	lc := lifecycleForPane(paneID)
 	if err := agentStartProcess(name, kind, paneID, req.Decision.Argv[1:]...); err != nil {
+		if lc != nil {
+			_ = lc.Reconcile("failed-launch")
+		}
 		_ = launch.RecordRejected(req, nil, err.Error())
 		return err
 	}
+	if lc != nil {
+		if err := bindToolChildLifecycle(paneID, name, req); err != nil {
+			_ = lc.Reconcile("failed-launch")
+			_ = launch.RecordRejected(req, nil, err.Error())
+			return err
+		}
+		if err := lc.Begin(); err != nil {
+			_ = lc.Reconcile("failed-launch")
+			_ = launch.RecordRejected(req, nil, err.Error())
+			return fmt.Errorf("tool-child inventory failed: %w", err)
+		}
+	}
 	if err := launch.RecordStarted(req, nil); err != nil {
+		if lc != nil {
+			_ = lc.Reconcile("failed-launch")
+		}
 		cleanupErr := compensateStartedProcess(name)
 		if cleanupErr != nil {
 			return fmt.Errorf("launch receipt failed: %w; compensating unaccounted process failed: %v", err, cleanupErr)
@@ -274,6 +442,121 @@ type AgentEntry struct {
 	} `json:"agent_session,omitempty"`
 }
 
+type PaneProcess struct {
+	PID  int      `json:"pid"`
+	Name string   `json:"name"`
+	Cwd  string   `json:"cwd"`
+	Argv []string `json:"argv"`
+}
+
+var readPIDStartToken = func(pid int) (string, error) {
+	out, err := exec.Command("ps", "-p", strconv.Itoa(pid), "-o", "lstart=").Output()
+	if err != nil {
+		return "", err
+	}
+	token := strings.TrimSpace(string(out))
+	if token == "" {
+		return "", fmt.Errorf("empty start token for pid %d", pid)
+	}
+	return token, nil
+}
+
+func SetPIDStartTokenReader(f func(int) (string, error)) func() {
+	old := readPIDStartToken
+	if f == nil {
+		readPIDStartToken = func(pid int) (string, error) {
+			out, err := exec.Command("ps", "-p", strconv.Itoa(pid), "-o", "lstart=").Output()
+			if err != nil {
+				return "", err
+			}
+			return strings.TrimSpace(string(out)), nil
+		}
+	} else {
+		readPIDStartToken = f
+	}
+	return func() { readPIDStartToken = old }
+}
+
+var readPIDParent = func(pid int) (int, error) {
+	out, err := exec.Command("ps", "-p", strconv.Itoa(pid), "-o", "ppid=").Output()
+	if err != nil {
+		return 0, err
+	}
+	parent, err := strconv.Atoi(strings.TrimSpace(string(out)))
+	if err != nil || parent <= 0 {
+		return 0, fmt.Errorf("invalid parent pid for %d", pid)
+	}
+	return parent, nil
+}
+
+func SetPIDParentReader(f func(int) (int, error)) func() {
+	old := readPIDParent
+	if f == nil {
+		readPIDParent = func(pid int) (int, error) {
+			out, err := exec.Command("ps", "-p", strconv.Itoa(pid), "-o", "ppid=").Output()
+			if err != nil {
+				return 0, err
+			}
+			parent, err := strconv.Atoi(strings.TrimSpace(string(out)))
+			if err != nil || parent <= 0 {
+				return 0, fmt.Errorf("invalid parent pid for %d", pid)
+			}
+			return parent, nil
+		}
+	} else {
+		readPIDParent = f
+	}
+	return func() { readPIDParent = old }
+}
+
+func paneProcesses(paneID string) ([]PaneProcess, error) {
+	output, err := runHerdr("pane", "process-info", "--pane", paneID)
+	if err != nil {
+		return nil, fmt.Errorf("herdr pane process-info: %w", err)
+	}
+	var envelope struct {
+		Result struct {
+			ProcessInfo struct {
+				ForegroundProcesses []PaneProcess `json:"foreground_processes"`
+			} `json:"process_info"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal([]byte(output), &envelope); err != nil {
+		return nil, err
+	}
+	if envelope.Result.ProcessInfo.ForegroundProcesses == nil {
+		return nil, fmt.Errorf("pane process-info returned no process inventory")
+	}
+	return envelope.Result.ProcessInfo.ForegroundProcesses, nil
+}
+
+func exactArgv(want, got []string) bool {
+	if len(want) != len(got) {
+		return false
+	}
+	for i := range want {
+		if want[i] != got[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func nativeCandidate(provider string, routed []string, p PaneProcess) bool {
+	if len(routed) < 1 || len(p.Argv) < 1 {
+		return false
+	}
+	provider = strings.ToLower(strings.TrimSpace(provider))
+	if filepath.Base(strings.ToLower(p.Argv[0])) != provider && filepath.Base(strings.ToLower(p.Name)) != provider {
+		return false
+	}
+	return exactArgv(routed[1:], p.Argv[1:])
+}
+
+func wrapperCandidate(p PaneProcess) bool {
+	return len(p.Argv) > 0 && filepath.Base(strings.ToLower(p.Argv[0])) == "node"
+}
+
 var (
 	ErrAgentNotFound         = errors.New("herdr agent not found")
 	ErrAgentIdentityMismatch = errors.New("herdr agent identity mismatch")
@@ -319,6 +602,9 @@ func ResolveAgentTabWithDecision(name string, req launch.Request) (string, error
 		}
 		if !ok {
 			return "", fmt.Errorf("standing agent %q has no matching durable launch identity: %w", name, ErrAgentIdentityMismatch)
+		}
+		if err := ReconcileToolChild(a.TabID, "recovery"); err != nil {
+			return "", fmt.Errorf("resume tool-child recovery: %w", err)
 		}
 		return name, nil
 	}

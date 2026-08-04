@@ -53,10 +53,16 @@ func SelectCleanupCandidates(agents []AgentEntry, standing map[string]bool) []Cl
 
 // TabClose closes a tab over the herdr socket API.
 func TabClose(tabID string) error {
+	if err := ReconcileToolChild(tabID, "tab-close"); err != nil {
+		return fmt.Errorf("tool-child teardown before tab close %s: %w", tabID, err)
+	}
 	out, err := runHerdr("tab", "close", tabID)
 	if err != nil {
 		return fmt.Errorf("herdr tab close %s: %s: %w", tabID, out, err)
 	}
+	toolChildMu.Lock()
+	delete(toolChildByTab, tabID)
+	toolChildMu.Unlock()
 	return nil
 }
 
