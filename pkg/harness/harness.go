@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"os/exec"
 	"strings"
+
+	"github.com/Kampe/Herdforge/pkg/agentpolicy"
 )
 
 type HarnessType string
@@ -24,15 +26,44 @@ type HarnessConfig struct {
 	BinaryName     string
 	PromptFlag     string
 	NonInteractive bool
+	Supported      bool
+}
+
+// PolicyInvocation is the launch handoff boundary. It compiles policy data
+// for a future launcher; it never creates a child process or mutates a task.
+type PolicyInvocation struct {
+	Argv          []string
+	PolicyDigest  string
+	ParentSession string
+}
+
+func (h *HarnessConfig) BuildPolicyInvocation(prompt string, policy agentpolicy.Contract, key []byte) (PolicyInvocation, error) {
+	if err := policy.Verify(key); err != nil {
+		return PolicyInvocation{}, err
+	}
+	if !h.Supported {
+		return PolicyInvocation{}, fmt.Errorf("harness %q has no fleet-only controls", h.Type)
+	}
+	if policy.ParentExecutionFamily != string(h.Type) {
+		return PolicyInvocation{}, fmt.Errorf("policy family %q does not match harness %q", policy.ParentExecutionFamily, h.Type)
+	}
+	argv := h.BuildInvocation(prompt)
+	if h.Type == HarnessClaude {
+		argv = append([]string{h.BinaryName, "--disallowed-tools", "Agent", "Task", "-p"}, prompt)
+	}
+	if h.Type == HarnessCodex {
+		argv = append([]string{h.BinaryName, "--disable", "multi_agent", "--disable", "multi_agent_v2"}, prompt)
+	}
+	return PolicyInvocation{Argv: argv, PolicyDigest: policy.PolicyDigest, ParentSession: policy.HerdrSession}, nil
 }
 
 // GetHarnessConfig maps harness identifiers to CLI invocation conventions
 func GetHarnessConfig(harness string) *HarnessConfig {
 	switch strings.ToLower(harness) {
 	case "claude":
-		return &HarnessConfig{Type: HarnessClaude, BinaryName: "claude", PromptFlag: "-p", NonInteractive: true}
+		return &HarnessConfig{Type: HarnessClaude, BinaryName: "claude", PromptFlag: "-p", NonInteractive: true, Supported: true}
 	case "codex":
-		return &HarnessConfig{Type: HarnessCodex, BinaryName: "codex", PromptFlag: "--prompt", NonInteractive: true}
+		return &HarnessConfig{Type: HarnessCodex, BinaryName: "codex", NonInteractive: true, Supported: true}
 	case "opencode":
 		return &HarnessConfig{Type: HarnessOpenCode, BinaryName: "opencode", PromptFlag: "-p", NonInteractive: true}
 	case "grok":
@@ -50,6 +81,12 @@ func GetHarnessConfig(harness string) *HarnessConfig {
 
 // BuildInvocation constructs the exact CLI command array to spawn a subagent in the target harness
 func (h *HarnessConfig) BuildInvocation(prompt string) []string {
+	if !h.Supported {
+		return nil
+	}
+	if h.Type == HarnessCodex {
+		return []string{h.BinaryName, "--disable", "multi_agent", "--disable", "multi_agent_v2", prompt}
+	}
 	args := []string{h.BinaryName}
 	if h.PromptFlag != "" {
 		args = append(args, h.PromptFlag, prompt)
