@@ -6,6 +6,8 @@ import (
 	"testing"
 )
 
+const wantResetSafeUsage = "Usage: herd reset-safe <worktree-path>"
+
 func TestResetSafeHelpByteContract(t *testing.T) {
 	binary := buildHerd(t)
 	cmd := exec.Command(binary, "reset-safe", "--help")
@@ -13,7 +15,7 @@ func TestResetSafeHelpByteContract(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reset-safe help failed: %v\n%s", err, out)
 	}
-	if got, want := string(out), resetSafeUsage+"\n"; got != want {
+	if got, want := string(out), wantResetSafeUsage+"\n"; got != want {
 		t.Fatalf("help bytes = %q, want %q", got, want)
 	}
 }
@@ -29,7 +31,7 @@ func TestResetSafeUsageExitAndByteContract(t *testing.T) {
 		if exitErr, ok := err.(*exec.ExitError); !ok || exitErr.ExitCode() != 2 {
 			t.Fatalf("%v exit = %v, want 2", args, err)
 		}
-		if got, want := string(out), resetSafeUsage+"\n"; got != want {
+		if got, want := string(out), wantResetSafeUsage+"\n"; got != want {
 			t.Fatalf("%v bytes = %q, want %q", args, got, want)
 		}
 	}
