@@ -209,16 +209,14 @@ func (b boundary) AuthorizeCommand(cap Capability, command Command) error {
 }
 
 func (b boundary) authorizeCommand(cap Capability, command Command, depth int, nodes *int, root bool) error {
-	if command.Name == "" || command.ProcessIdentity == "" || command.ArgvIdentity == "" || len(command.Paths)+len(command.Children) == 0 || len(command.Paths) > maxCommandNodes || depth >= maxCommandDepth || *nodes >= maxCommandNodes {
+	if command.Name == "" || command.ProcessIdentity == "" || command.ArgvIdentity == "" || len(command.Paths)+len(command.Children) == 0 || depth >= maxCommandDepth || *nodes >= maxCommandNodes || *nodes+1+len(command.Paths) > maxCommandNodes {
 		return ErrInvalidCommand
 	}
 	if root && (command.ProcessIdentity != cap.tuple.ProcessIdentity || command.ArgvIdentity != cap.tuple.ArgvIdentity) {
 		return ErrInvalidCommand
 	}
 	*nodes = *nodes + 1
-	if *nodes+len(command.Paths)+len(command.Children) > maxCommandNodes {
-		return ErrInvalidCommand
-	}
+	*nodes += len(command.Paths)
 	for _, path := range command.Paths {
 		if err := b.AuthorizeWrite(cap, path); err != nil {
 			return fmt.Errorf("command %q: %w", command.Name, err)

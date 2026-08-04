@@ -2,6 +2,7 @@ package confinement
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -193,6 +194,20 @@ func TestCommandShapeBounded(t *testing.T) {
 	}
 	if err := b.AuthorizeCommand(cap, deep); !errors.Is(err, ErrInvalidCommand) {
 		t.Fatalf("over-depth command error = %v", err)
+	}
+}
+
+func TestCommandGlobalBudgetDeniesWideNestedShape(t *testing.T) {
+	b, cap, _, _ := fixture(t)
+	wide := Command{Name: "wide-root", ProcessIdentity: cap.tuple.ProcessIdentity, ArgvIdentity: cap.tuple.ArgvIdentity, Children: make([]Command, 31)}
+	for childIndex := range wide.Children {
+		wide.Children[childIndex] = Command{Name: "child", ProcessIdentity: "child-process", ArgvIdentity: "child-argv", Paths: make([]string, 31)}
+		for pathIndex := range wide.Children[childIndex].Paths {
+			wide.Children[childIndex].Paths[pathIndex] = filepath.Join("wide", fmt.Sprintf("child-%d-path-%d", childIndex, pathIndex))
+		}
+	}
+	if err := b.AuthorizeCommand(cap, wide); !errors.Is(err, ErrInvalidCommand) {
+		t.Fatalf("global command/path budget error = %v", err)
 	}
 }
 
