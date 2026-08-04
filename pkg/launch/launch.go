@@ -45,6 +45,7 @@ type Request struct {
 	HerdrSession    string
 	CWD             string
 	ProcessIdentity string
+	StartToken      string
 	LeaseGeneration int64
 	// SessionGeneration fences the Herdr session independently of task lease
 	// generations; lane launches intentionally have LeaseGeneration == 0.
