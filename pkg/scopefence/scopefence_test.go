@@ -2,6 +2,7 @@ package scopefence
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"sync"
 	"testing"
@@ -9,6 +10,7 @@ import (
 
 type countingStore struct {
 	inner Store
+	reads int
 	cas   int
 }
 
@@ -24,7 +26,10 @@ func (a testGraphAuthority) Current(context.Context) (TrustedGraph, error) {
 	return TrustedGraph{Snapshot: a.graph, ExpectedRevision: a.graph.Revision, ExpectedFiles: a.graph.Files}, nil
 }
 
-func (s *countingStore) Read(ctx context.Context) (Snapshot, error) { return s.inner.Read(ctx) }
+func (s *countingStore) Read(ctx context.Context) (Snapshot, error) {
+	s.reads++
+	return s.inner.Read(ctx)
+}
 func (s *countingStore) CompareAndSwap(ctx context.Context, rev string, next []Ownership) (bool, error) {
 	s.cas++
 	return s.inner.CompareAndSwap(ctx, rev, next)
@@ -94,11 +99,41 @@ func TestSymbolOnlyOverlapPolicy(t *testing.T) {
 
 func TestRawScopeValidationRejectsAliasesAndMalformedDeclarations(t *testing.T) {
 	driveLike := "C:" + string([]byte{92}) + "repo" + string([]byte{92}) + "file.go"
-	for _, s := range []Scope{{Files: []string{"pkg/a/../b.go"}}, {Files: []string{driveLike}}, {Files: []string{"pkg/a\x00.go"}}, {Symbols: []string{"pkg/a/file.go:::Run"}}} {
+	for _, s := range []Scope{{Files: []string{"pkg/a/../b.go"}}, {Files: []string{"pkg//a"}}, {Files: []string{"pkg/./a"}}, {Files: []string{"pkg/a/"}}, {Files: []string{driveLike}}, {Files: []string{"pkg/a\x00.go"}}, {Symbols: []string{"pkg/a/file.go:::Run"}}} {
 		d, _ := fence(NewMemoryStore()).Acquire(context.Background(), req("FAC-187", "unsafe", 1, s))
 		if d.Granted || d.Evidence.Reason != ReasonInvalidScope {
 			t.Fatalf("unsafe raw scope accepted: %+v => %+v", s, d)
 		}
+	}
+}
+
+func TestInvalidOwnershipStateBlocksBeforeStoreRead(t *testing.T) {
+	store := &countingStore{inner: NewMemoryStore()}
+	r := req("FAC-190", "bad-state", 1, scope("pkg/state", "pkg/state.go", "Run"))
+	r.State = State("")
+	d, err := fence(store).Acquire(context.Background(), r)
+	if err != nil || d.Granted || d.Evidence.Reason != ReasonInvalidState || store.reads != 0 || store.cas != 0 {
+		t.Fatalf("invalid state crossed store boundary: %+v err=%v reads=%d cas=%d", d, err, store.reads, store.cas)
+	}
+	r.State = State("unknown")
+	d, err = fence(store).Acquire(context.Background(), r)
+	if err != nil || d.Evidence.Reason != ReasonInvalidState || store.reads != 0 || store.cas != 0 {
+		t.Fatalf("unknown state was not rejected stably: %+v err=%v reads=%d cas=%d", d, err, store.reads, store.cas)
+	}
+}
+
+func TestIdempotentAcquireAndReleaseRequireExactState(t *testing.T) {
+	owner := req("FAC-191", "stateful", 1, scope("pkg/state", "pkg/state.go", "Run")).Ownership
+	owner.State = Clean
+	store := &countingStore{inner: NewMemoryStore(owner)}
+	r := req("FAC-191", "stateful", 1, scope("pkg/state", "pkg/state.go", "Run"))
+	r.State = Active
+	d, err := fence(store).Acquire(context.Background(), r)
+	if err != nil || d.Granted || d.Evidence.Reason != ReasonIdentityConflict || store.cas != 0 {
+		t.Fatalf("state-changing idempotence was accepted: %+v err=%v cas=%d", d, err, store.cas)
+	}
+	if err := fence(store).Release(context.Background(), ReleaseRequest{Ownership: r.Ownership, Authority: RootAdmittedMerge, Proof: "ok"}); err == nil {
+		t.Fatal("release ignored the ownership state")
 	}
 }
 
@@ -263,8 +298,63 @@ func TestCanceledAcquireNeverCallsCAS(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	d, err := fence(store).Acquire(ctx, req("FAC-1", "one", 1, scope("pkg/a", "pkg/a.go", "pkg/a.go::Run")))
-	if err == nil || d.Evidence.Reason != ReasonContextCanceled || store.cas != 0 {
-		t.Fatalf("canceled acquire crossed CAS: %+v err=%v cas=%d", d, err, store.cas)
+	if err == nil || d.Evidence.Reason != ReasonContextCanceled || store.reads != 0 || store.cas != 0 {
+		t.Fatalf("canceled acquire crossed store boundary: %+v err=%v reads=%d cas=%d", d, err, store.reads, store.cas)
+	}
+}
+
+type errorGraphAuthority struct{ err error }
+
+func (a errorGraphAuthority) Current(context.Context) (TrustedGraph, error) {
+	return TrustedGraph{}, a.err
+}
+
+type observingGraphAuthority struct {
+	called *bool
+	graph  Graph
+}
+
+type mismatchedExpectationAuthority struct{}
+
+func (mismatchedExpectationAuthority) Current(context.Context) (TrustedGraph, error) {
+	return TrustedGraph{Snapshot: Graph{Revision: "g1", Nodes: 10, Edges: 20, Files: 2, Flows: 1, Complete: true}, ExpectedRevision: "g2", ExpectedFiles: 2}, nil
+}
+
+func (a observingGraphAuthority) Current(context.Context) (TrustedGraph, error) {
+	*a.called = true
+	return TrustedGraph{Snapshot: a.graph, ExpectedRevision: a.graph.Revision, ExpectedFiles: a.graph.Files}, nil
+}
+
+func TestGraphAuthorityErrorDoesNotReadOrCAS(t *testing.T) {
+	store := &countingStore{inner: NewMemoryStore()}
+	f := fence(store)
+	f.Graph = errorGraphAuthority{err: errors.New("graph unavailable")}
+	_, err := f.Acquire(context.Background(), req("FAC-192", "graph-error", 1, scope("pkg/graph", "pkg/graph.go", "Run")))
+	if err == nil || store.reads != 0 || store.cas != 0 {
+		t.Fatalf("graph error crossed store boundary: err=%v reads=%d cas=%d", err, store.reads, store.cas)
+	}
+}
+
+func TestExpectedGraphRevisionMismatchDoesNotReadOrCAS(t *testing.T) {
+	store := &countingStore{inner: NewMemoryStore()}
+	f := fence(store)
+	f.Graph = mismatchedExpectationAuthority{}
+	d, err := f.Acquire(context.Background(), req("FAC-193", "graph-mismatch", 1, scope("pkg/graph", "pkg/graph.go", "Run")))
+	if err != nil || d.Granted || d.Evidence.Reason != ReasonGraphInvalid || store.reads != 0 || store.cas != 0 {
+		t.Fatalf("graph expectation mismatch crossed store boundary: %+v err=%v reads=%d cas=%d", d, err, store.reads, store.cas)
+	}
+}
+
+func TestPreCanceledAcquireSkipsGraphAuthorityAndStore(t *testing.T) {
+	called := false
+	store := &countingStore{inner: NewMemoryStore()}
+	f := fence(store)
+	f.Graph = observingGraphAuthority{called: &called, graph: Graph{Revision: "g1", Nodes: 10, Edges: 20, Files: 2, Flows: 1, Complete: true}}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	d, err := f.Acquire(ctx, req("FAC-194", "pre-canceled", 1, scope("pkg/context", "pkg/context.go", "Run")))
+	if err == nil || d.Evidence.Reason != ReasonContextCanceled || called || store.reads != 0 || store.cas != 0 {
+		t.Fatalf("pre-canceled acquire crossed authority/store boundary: %+v err=%v graph_called=%v reads=%d cas=%d", d, err, called, store.reads, store.cas)
 	}
 }
 

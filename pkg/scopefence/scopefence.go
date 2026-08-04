@@ -30,6 +30,7 @@ const (
 	ReasonContextCanceled     = "context_canceled"
 	ReasonInvalidScope        = "invalid_scope"
 	ReasonGraphUntrusted      = "graph_untrusted"
+	ReasonInvalidState        = "invalid_state"
 )
 
 type State string
@@ -179,8 +180,11 @@ func rawScopeValueValid(value string) bool {
 	if value == "" || strings.HasPrefix(value, "/") || path.IsAbs(value) || strings.Contains(value, "\\") || strings.ContainsRune(value, '\x00') || strings.HasPrefix(value, "~") || (len(value) >= 2 && value[1] == ':' && ((value[0] >= 'A' && value[0] <= 'Z') || (value[0] >= 'a' && value[0] <= 'z'))) || !tokenPattern.MatchString(value) {
 		return false
 	}
+	if strings.HasSuffix(value, "/") || strings.Contains(value, "//") {
+		return false
+	}
 	for _, part := range strings.Split(value, "/") {
-		if part == ".." {
+		if part == "" || part == "." || part == ".." {
 			return false
 		}
 		for _, r := range part {
@@ -258,6 +262,9 @@ func (o Ownership) validate() error {
 	if o.Generation <= 0 {
 		return errors.New("invalid generation")
 	}
+	if !validState(o.State) {
+		return errors.New("invalid state")
+	}
 	if _, err := canonicalScope(o.Scope); err != nil {
 		return err
 	}
@@ -265,6 +272,15 @@ func (o Ownership) validate() error {
 		return errors.New("unbound graph")
 	}
 	return nil
+}
+
+func validState(state State) bool {
+	switch state {
+	case Active, Clean, Done, Idle, Audit, Review:
+		return true
+	default:
+		return false
+	}
 }
 
 func overlap(a, b Scope) (Evidence, bool) {
@@ -355,6 +371,12 @@ func (f Fence) Acquire(ctx context.Context, req AcquireRequest) (Decision, error
 	if req.Generation <= 0 {
 		return Decision{Evidence: Evidence{Repository: req.Repository, Task: req.Task, Branch: req.Branch, Generation: req.Generation, Reason: ReasonInvalidGeneration}}, nil
 	}
+	if !validState(req.State) {
+		return Decision{Evidence: Evidence{Repository: req.Repository, Task: req.Task, Branch: req.Branch, Generation: req.Generation, Reason: ReasonInvalidState}}, nil
+	}
+	if err := ctx.Err(); err != nil {
+		return Decision{Evidence: Evidence{Repository: req.Repository, Task: req.Task, Branch: req.Branch, Generation: req.Generation, Reason: ReasonContextCanceled}}, err
+	}
 	if f.Graph == nil {
 		return Decision{Evidence: Evidence{Repository: req.Repository, Task: req.Task, Branch: req.Branch, Generation: req.Generation, Reason: ReasonGraphUntrusted}}, nil
 	}
@@ -385,7 +407,7 @@ func (f Fence) Acquire(ctx context.Context, req AcquireRequest) (Decision, error
 			ownerScope, _ := canonicalScope(owner.Scope)
 			owner.Scope = ownerScope
 			if owner.Identity == req.Identity {
-				if owner.Generation == req.Generation && owner.GraphRevision == req.GraphRevision && owner.GraphFiles == req.GraphFiles && scopesEqual(owner.Scope, req.Scope) {
+				if owner.Generation == req.Generation && owner.State == req.State && owner.GraphRevision == req.GraphRevision && owner.GraphFiles == req.GraphFiles && scopesEqual(owner.Scope, req.Scope) {
 					copy := cloneOwnership(owner)
 					return Decision{Granted: true, Lease: &copy, Evidence: baseEvidence}, nil
 				}
@@ -427,7 +449,7 @@ func (f Fence) Release(ctx context.Context, req ReleaseRequest) error {
 		return ErrBlocked
 	}
 	canonical, err := canonicalScope(req.Scope)
-	if err != nil || req.Generation <= 0 || !tokenPattern.MatchString(req.Repository) || !tokenPattern.MatchString(req.Branch) || !tokenPattern.MatchString(req.Task) {
+	if err != nil || req.Generation <= 0 || !validState(req.State) || !tokenPattern.MatchString(req.Repository) || !tokenPattern.MatchString(req.Branch) || !tokenPattern.MatchString(req.Task) {
 		return ErrBlocked
 	}
 	req.Scope = canonical
@@ -449,7 +471,7 @@ func (f Fence) Release(ctx context.Context, req ReleaseRequest) error {
 		for i, owner := range s.Owners {
 			ownerScope, _ := canonicalScope(owner.Scope)
 			owner.Scope = ownerScope
-			if owner.Identity == req.Identity && owner.Generation == req.Generation && owner.GraphRevision == req.GraphRevision && owner.GraphFiles == req.GraphFiles && scopesEqual(owner.Scope, req.Scope) {
+			if owner.Identity == req.Identity && owner.Generation == req.Generation && owner.State == req.State && owner.GraphRevision == req.GraphRevision && owner.GraphFiles == req.GraphFiles && scopesEqual(owner.Scope, req.Scope) {
 				found = i
 				break
 			}
