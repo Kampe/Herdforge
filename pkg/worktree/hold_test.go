@@ -2,6 +2,7 @@ package worktree
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/Kampe/Herdforge/pkg/lifecycle"
@@ -25,15 +26,19 @@ func (heldHoldReader) CurrentGeneration(context.Context, lifecycle.HoldIdentity)
 	return 1, nil
 }
 
-func reapHoldIdentity(w *WorktreeInfo) lifecycle.HoldIdentity {
-	return lifecycle.HoldIdentity{Repository: "repo", Owner: "owner", Lane: w.Branch, Scope: "lane"}
+func reapHoldIdentities(w *WorktreeInfo) []lifecycle.HoldIdentity {
+	task := strings.TrimPrefix(w.Branch, "herd/")
+	return []lifecycle.HoldIdentity{
+		{Repository: "repo", Owner: "owner", Lane: w.Branch, Scope: "lane"},
+		{Repository: "repo", Owner: "owner", Lane: w.Branch, Task: task, Scope: "task"},
+	}
 }
 
 func TestClassifyHeldIdentityRefusesBeforeGitEvidence(t *testing.T) {
 	wm := NewWorktreeManager(t.TempDir())
 	wt := &WorktreeInfo{Path: t.TempDir(), Branch: "herd/held", Commit: "head"}
 	candidate := wm.classifyOne(context.Background(), wt, ReapPolicy{AutoReap: true, HoldReader: heldHoldReader{}, IdentitySetFor: func(w *WorktreeInfo) []lifecycle.HoldIdentity {
-		return []lifecycle.HoldIdentity{reapHoldIdentity(w), {Repository: "repo", Owner: "owner", Lane: w.Branch, Task: "FAC-HELD", Scope: "task"}}
+		return append(reapHoldIdentities(w)[:1], lifecycle.HoldIdentity{Repository: "repo", Owner: "owner", Lane: w.Branch, Task: "FAC-HELD", Scope: "task"})
 	}}, "", nil)
 	if candidate.Class != ReapClassUnknown || candidate.Eligible || candidate.PreserveAction == "" {
 		t.Fatalf("held candidate=%+v", candidate)

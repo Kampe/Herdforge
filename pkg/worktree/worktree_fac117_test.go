@@ -3,7 +3,6 @@ package worktree
 import (
 	"context"
 	"errors"
-	"github.com/Kampe/Herdforge/pkg/lifecycle"
 	"os"
 	"path/filepath"
 	"strings"
@@ -343,7 +342,7 @@ func admissibleReapPolicy(t *testing.T, wm *WorktreeManager, target string, acti
 		},
 		ReceiptSink:  func(ReapReceipt) error { return nil },
 		ActionPolicy: "remove",
-		HoldReader:   unheldHoldReader{}, IdentitySetFor: func(w *WorktreeInfo) []lifecycle.HoldIdentity { return []lifecycle.HoldIdentity{reapHoldIdentity(w)} },
+		HoldReader:   unheldHoldReader{}, IdentitySetFor: reapHoldIdentities,
 	}
 }
 

@@ -254,17 +254,19 @@ func (o *LeaseOwnership) Close() error {
 
 // TwoIndependentManagersClaim races two ClaimManagers on the same SQLite
 // path (two *sql.DB, like two OS processes). Exactly one ClaimExclusive wins.
-func TwoIndependentManagersClaim(ctx context.Context, dbPath, repo, provider, project string, taskRef Ref, graphRev string) (wins, conflicts int, err error) {
+func TwoIndependentManagersClaim(ctx context.Context, dbPath, repo, provider, project string, taskRef Ref, graphRev string, laneResolver func(string) (string, error)) (wins, conflicts int, err error) {
 	a, err := OpenLeaseOwnership(dbPath, repo, provider, project)
 	if err != nil {
 		return 0, 0, err
 	}
 	defer a.Close()
+	a.LaneResolver = laneResolver
 	b, err := OpenLeaseOwnership(dbPath, repo, provider, project)
 	if err != nil {
 		return 0, 0, err
 	}
 	defer b.Close()
+	b.LaneResolver = laneResolver
 
 	type res struct {
 		err error

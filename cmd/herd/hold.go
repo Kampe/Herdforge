@@ -46,6 +46,71 @@ func canonicalLaneRegistry(cfg *config.Config) (lifecycle.CanonicalLaneRegistry,
 	return lifecycle.NewCanonicalLaneRegistry(lanes)
 }
 
+func resolveHoldLane(registry lifecycle.CanonicalLaneRegistry, value string, explicitLane bool) (lifecycle.CanonicalLane, error) {
+	if explicitLane {
+		return registry.ResolveLaneName(value)
+	}
+	return registry.ResolveRole(value)
+}
+
+// composeHoldIdentity validates the complete hold target before opening the
+// durable authority or reading its generation. It is intentionally pure so
+// invalid lane/role composition cannot cause store or authority effects.
+func composeHoldIdentity(cfg *config.Config, laneValue, task, scope string, explicitLane bool, owner, repository string) (lifecycle.HoldIdentity, error) {
+	if cfg == nil {
+		return lifecycle.HoldIdentity{}, errors.New("hold configuration is required")
+	}
+	if scope != "lane" && scope != "task" {
+		return lifecycle.HoldIdentity{}, fmt.Errorf("invalid hold scope %q", scope)
+	}
+	registry, err := canonicalLaneRegistry(cfg)
+	if err != nil {
+		return lifecycle.HoldIdentity{}, err
+	}
+	lane, err := resolveHoldLane(registry, laneValue, explicitLane)
+	if err != nil {
+		return lifecycle.HoldIdentity{}, err
+	}
+	owner = strings.TrimSpace(owner)
+	if owner == "" {
+		owner = lane.Role
+	}
+	if !strings.EqualFold(owner, lane.Role) {
+		return lifecycle.HoldIdentity{}, fmt.Errorf("owner %q does not match configured lane role %q", owner, lane.Role)
+	}
+	if strings.TrimSpace(repository) == "" || (scope == "task" && strings.TrimSpace(task) == "") {
+		return lifecycle.HoldIdentity{}, errors.New("complete repository and task identity are required")
+	}
+	if scope == "lane" {
+		task = ""
+	}
+	return lifecycle.HoldIdentity{Repository: strings.TrimSpace(repository), Owner: lane.Role, Lane: lane.Name, Task: strings.TrimSpace(task), Scope: scope}, nil
+}
+
+type holdAuthorityBoundary interface {
+	Close() error
+	CurrentGeneration(context.Context, lifecycle.HoldIdentity) (int64, error)
+	HasCurrent(context.Context, lifecycle.HoldIdentity) (bool, error)
+	Check(context.Context, lifecycle.HoldIdentity, int64) (lifecycle.HoldDecision, error)
+	Hold(context.Context, lifecycle.HoldIdentity, string, string, string, int64, *time.Time) (lifecycle.HoldRecord, error)
+	Release(context.Context, lifecycle.HoldIdentity, string, string, string, int64) (lifecycle.HoldRecord, error)
+}
+
+func prepareHoldCommand(cfg *config.Config, laneValue, task, scope string, explicitLane bool, owner, repository string, open func() (holdAuthorityBoundary, error)) (lifecycle.HoldIdentity, holdAuthorityBoundary, error) {
+	identity, err := composeHoldIdentity(cfg, laneValue, task, scope, explicitLane, owner, repository)
+	if err != nil {
+		return lifecycle.HoldIdentity{}, nil, err
+	}
+	if open == nil {
+		return lifecycle.HoldIdentity{}, nil, errors.New("hold authority opener is required")
+	}
+	authority, err := open()
+	if err != nil {
+		return lifecycle.HoldIdentity{}, nil, err
+	}
+	return identity, authority, nil
+}
+
 func holdOwner() string {
 	if v := strings.TrimSpace(os.Getenv("HERD_OWNER")); v != "" {
 		return v
@@ -176,17 +241,6 @@ func runHold() {
 	if strings.TrimSpace(*repositoryFlag) != "" {
 		repository = strings.TrimSpace(*repositoryFlag)
 	}
-	root, err := worktree.ResolveCanonicalRoot(ctx, ".", firstEnv("HERD_ROOT", "HERD_REPO_ROOT", ""))
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "hold: %v\n", err)
-		os.Exit(1)
-	}
-	a, err := lifecycle.NewHoldAuthority(lifecycle.CanonicalStatePath(root))
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "hold: %v\n", err)
-		os.Exit(1)
-	}
-	defer a.Close()
 	if *scope != "task" && *scope != "lane" {
 		fmt.Fprintf(os.Stderr, "hold: invalid --scope %q\n", *scope)
 		os.Exit(2)
@@ -212,31 +266,18 @@ func runHold() {
 		fmt.Fprintf(os.Stderr, "hold: %v\n", cfgErr)
 		os.Exit(1)
 	}
-	registry, regErr := canonicalLaneRegistry(cfg)
-	if regErr != nil {
-		fmt.Fprintf(os.Stderr, "hold: %v\n", regErr)
-		os.Exit(1)
-	}
-	var laneDef lifecycle.CanonicalLane
-	var laneErr error
-	if !laneSet && *scope == "lane" {
-		laneDef, laneErr = registry.ResolveRole(*lane)
-	} else {
-		laneDef, laneErr = registry.ResolveLaneName(*lane)
-	}
-	if laneErr != nil {
-		fmt.Fprintf(os.Stderr, "hold: %v\n", laneErr)
+	identity, a, err := prepareHoldCommand(cfg, *lane, *task, *scope, laneSet || *scope == "task", *owner, repository, func() (holdAuthorityBoundary, error) {
+		root, err := worktree.ResolveCanonicalRoot(ctx, ".", firstEnv("HERD_ROOT", "HERD_REPO_ROOT", ""))
+		if err != nil {
+			return nil, err
+		}
+		return lifecycle.NewHoldAuthority(lifecycle.CanonicalStatePath(root))
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "hold: %v\n", err)
 		os.Exit(2)
 	}
-	ownerValue := strings.TrimSpace(*owner)
-	if ownerValue == "" {
-		ownerValue = laneDef.Role
-	}
-	if !strings.EqualFold(ownerValue, laneDef.Role) {
-		fmt.Fprintf(os.Stderr, "hold: owner %q does not match configured lane role %q\n", ownerValue, laneDef.Role)
-		os.Exit(2)
-	}
-	identity := lifecycle.HoldIdentity{Repository: repository, Owner: laneDef.Role, Lane: laneDef.Name, Task: *task, Scope: *scope}
+	defer a.Close()
 	current, err := a.CurrentGeneration(ctx, identity)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "hold: %v\n", err)

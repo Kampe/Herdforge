@@ -3150,6 +3150,17 @@ func runLifecycle() {
 			eng.HoldRoles = append(eng.HoldRoles, strings.TrimSpace(lane.Role))
 		}
 	}
+	roleRegistry, registryErr := lifecycle.NewCanonicalLaneRegistry(func() []lifecycle.CanonicalLane {
+		lanes := make([]lifecycle.CanonicalLane, 0, len(roleConfig.Lanes))
+		for _, lane := range roleConfig.Lanes {
+			lanes = append(lanes, lifecycle.CanonicalLane{Name: lane.Name, Role: lane.Role})
+		}
+		return lanes
+	}())
+	if registryErr != nil {
+		fmt.Fprintf(os.Stderr, "lifecycle lane registry: %v\n", registryErr)
+		os.Exit(1)
+	}
 	holdAuthority, holdErr := newProductionHoldAuthority()
 	if holdErr != nil {
 		fmt.Fprintf(os.Stderr, "lifecycle hold authority: %v\n", holdErr)
@@ -3162,6 +3173,13 @@ func runLifecycle() {
 		os.Exit(1)
 	}
 	eng.HoldReader = holdAuthority
+	eng.HoldLaneResolver = func(role string) (string, error) {
+		lane, err := roleRegistry.ResolveRole(role)
+		if err != nil {
+			return "", err
+		}
+		return lane.Name, nil
+	}
 	eng.HoldIdentity = func(task, lane, owner string) lifecycle.HoldIdentity {
 		scope := "task"
 		if task == "" {

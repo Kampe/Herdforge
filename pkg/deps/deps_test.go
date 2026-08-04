@@ -4,10 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/Kampe/Herdforge/pkg/claim"
 	"github.com/Kampe/Herdforge/pkg/provider"
 )
 
@@ -129,13 +131,41 @@ func TestEdgeMultisetEqual_CountsDuplicates(t *testing.T) {
 func TestLeaseOwnership_TwoIndependentManagers_ExactlyOneWinner(t *testing.T) {
 	db := filepath.Join(t.TempDir(), "launch.db")
 	wins, conflicts, err := TwoIndependentManagersClaim(
-		context.Background(), db, "herd", "memory", "p", "FAC-1", "rev-abc",
+		context.Background(), db, "herd", "memory", "p", "FAC-1", "rev-abc", func(role string) (string, error) {
+			if role == "launch" {
+				return "smith", nil
+			}
+			return "", fmt.Errorf("unknown configured role %q", role)
+		},
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if wins != 1 || conflicts != 1 {
 		t.Fatalf("want 1 win + 1 conflict, got wins=%d conflicts=%d", wins, conflicts)
+	}
+}
+
+func configureTestLaneResolver(o *LeaseOwnership) {
+	o.LaneResolver = func(role string) (string, error) {
+		if role == "launch" || role == "worker" {
+			return "smith", nil
+		}
+		return "", fmt.Errorf("unknown configured test role %q", role)
+	}
+}
+
+func TestClaimExclusiveMissingLaneResolverFailsBeforeLeaseMutation(t *testing.T) {
+	ownership, err := OpenLeaseOwnership(filepath.Join(t.TempDir(), "launch.db"), "herd", "memory", "p")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ownership.Close()
+	if _, err := ownership.ClaimExclusive(context.Background(), "id", "FAC-unknown", "worker", "rev", "", ""); err == nil {
+		t.Fatal("missing canonical lane resolver unexpectedly admitted claim")
+	}
+	if current, err := ownership.Store.(claim.LeaseSnapshotStore).CurrentLease(context.Background(), ownership.key("FAC-unknown")); err != nil || current != nil {
+		t.Fatalf("missing resolver mutated lease state: current=%+v err=%v", current, err)
 	}
 }
 
@@ -146,11 +176,13 @@ func TestLeaseOwnership_ReleaseRefusesStaleGeneration(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer a.Close()
+	configureTestLaneResolver(a)
 	b, err := OpenLeaseOwnership(db, "herd", "memory", "p")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer b.Close()
+	configureTestLaneResolver(b)
 
 	tokA, err := a.ClaimExclusive(context.Background(), "id1", "FAC-1", "launch", "rev1", "", "")
 	if err != nil {
@@ -184,11 +216,13 @@ func TestLeaseOwnership_ReleaseBeforeAcquireInterleaving(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer a.Close()
+	configureTestLaneResolver(a)
 	b, err := OpenLeaseOwnership(db, "herd", "memory", "p")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer b.Close()
+	configureTestLaneResolver(b)
 
 	tokA, err := a.ClaimExclusive(context.Background(), "id1", "FAC-1", "launch", "rev1", "", "")
 	if err != nil {
