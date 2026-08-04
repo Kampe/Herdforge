@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -148,14 +149,8 @@ func TestLibprocInspectionSeamBlocksUnexpectedErrorsByStage(t *testing.T) {
 		stage string
 		errno syscall.Errno
 	}{
-		{name: "identity EPERM", stage: "identity", errno: syscall.EPERM},
-		{name: "identity EACCES", stage: "identity", errno: syscall.EACCES},
 		{name: "identity unexpected", stage: "identity", errno: syscall.EIO},
-		{name: "fd list EPERM", stage: "fd list", errno: syscall.EPERM},
-		{name: "fd list EACCES", stage: "fd list", errno: syscall.EACCES},
 		{name: "fd list unexpected", stage: "fd list", errno: syscall.ENOSPC},
-		{name: "vnode EPERM", stage: "vnode", errno: syscall.EPERM},
-		{name: "vnode EACCES", stage: "vnode", errno: syscall.EACCES},
 		{name: "vnode unexpected", stage: "vnode", errno: syscall.EBADF},
 		{name: "truncated PID inventory", stage: "pid inventory", errno: syscall.EOVERFLOW},
 	}
@@ -190,7 +185,7 @@ func TestLibprocInspectionFailureMakesVerifierBlocked(t *testing.T) {
 	})
 	markerLineageDrainedFn = func(string) (bool, error) { return false, nil }
 	markerHoldersFn = func(string, time.Duration) ([]markerHolder, error) {
-		return nil, &libprocInspectionError{stage: "identity", errno: syscall.EPERM}
+		return nil, &libprocInspectionError{stage: "identity", errno: syscall.EIO}
 	}
 
 	dir := t.TempDir()
@@ -204,5 +199,71 @@ func TestLibprocInspectionFailureMakesVerifierBlocked(t *testing.T) {
 	}
 	if receipt == nil || receipt.Outcome != OutcomeBLOCKED {
 		t.Fatalf("uninspectable marker holder must BLOCKED: %+v", receipt)
+	}
+}
+
+func TestDarwinPermissionFallbackParsesSpacedMarkerAndBindsToken(t *testing.T) {
+	previousHolders := markerHoldersFn
+	previousLsof := markerLsofOutputFn
+	previousToken := markerTokenOfFn
+	t.Cleanup(func() {
+		markerHoldersFn = previousHolders
+		markerLsofOutputFn = previousLsof
+		markerTokenOfFn = previousToken
+	})
+	markerPath := filepath.Join(t.TempDir(), "repo with spaces", "marker file")
+	want := procToken{pid: 4242, startSec: 77, startUsec: 88}
+	markerHoldersFn = func(string, time.Duration) ([]markerHolder, error) {
+		return nil, fmt.Errorf("wrapped permission failure: %w", syscall.EPERM)
+	}
+	markerTokenOfFn = func(pid int) (procToken, error) {
+		if pid != want.pid {
+			return procToken{}, fmt.Errorf("unexpected token lookup pid %d", pid)
+		}
+		return want, nil
+	}
+	abs, err := filepath.Abs(markerPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	markerLsofOutputFn = func(string, time.Time) ([]byte, error) {
+		return []byte(fmt.Sprintf("p%d\nn%s\npnot-a-pid\nn%s\np%d\nn%s\n",
+			os.Getpid(), abs, abs, want.pid, abs)), nil
+	}
+	got, err := processesHoldingMarkerUntil(markerPath, time.Now().Add(time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || !got[0].equal(want) {
+		t.Fatalf("permission fallback tokens = %+v, want exact %+v", got, want)
+	}
+}
+
+func TestDarwinPermissionFallbackRejectsNonPermissionAndDeadline(t *testing.T) {
+	previousHolders := markerHoldersFn
+	previousLsof := markerLsofOutputFn
+	t.Cleanup(func() {
+		markerHoldersFn = previousHolders
+		markerLsofOutputFn = previousLsof
+	})
+	lsofCalls := 0
+	markerLsofOutputFn = func(string, time.Time) ([]byte, error) {
+		lsofCalls++
+		return nil, errors.New("lsof seam must not run")
+	}
+	markerHoldersFn = func(string, time.Duration) ([]markerHolder, error) {
+		return nil, fmt.Errorf("wrapped inspection failure: %w", syscall.EIO)
+	}
+	if _, err := processesHoldingMarkerUntil("marker", time.Now().Add(time.Second)); err == nil {
+		t.Fatal("non-permission native failure must remain fail-closed")
+	}
+	if lsofCalls != 0 {
+		t.Fatalf("non-permission native failure invoked lsof fallback %d time(s)", lsofCalls)
+	}
+	if _, err := processesHoldingMarkerViaLsof("marker", time.Now().Add(-time.Millisecond)); err == nil {
+		t.Fatal("expired lsof deadline must fail before runner invocation")
+	}
+	if lsofCalls != 0 {
+		t.Fatalf("expired lsof deadline invoked runner %d time(s)", lsofCalls)
 	}
 }

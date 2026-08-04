@@ -1,4 +1,4 @@
-//go:build darwin && cgo
+//go:build darwin
 
 package verifier
 
@@ -14,10 +14,15 @@ import (
 	"time"
 )
 
-// processesHoldingMarkerViaLsof is the Darwin-cgo permission fallback for
-// marker lineage. It inspects only the private marker path and binds every
-// returned PID to its current kernel start token before adoption.
-func processesHoldingMarkerViaLsof(markerPath string, deadline time.Time) ([]procToken, error) {
+type markerLsofOutput func(string, time.Time) ([]byte, error)
+
+var markerLsofOutputFn markerLsofOutput = runMarkerLsof
+var markerTokenOfFn = tokenOf
+
+func runMarkerLsof(markerPath string, deadline time.Time) ([]byte, error) {
+	if time.Until(deadline) <= 0 {
+		return nil, fmt.Errorf("processesHoldingMarker lsof deadline exceeded")
+	}
 	abs, err := filepath.Abs(markerPath)
 	if err != nil {
 		return nil, fmt.Errorf("processesHoldingMarker abs: %w", err)
@@ -30,15 +35,13 @@ func processesHoldingMarkerViaLsof(markerPath string, deadline time.Time) ([]pro
 	if strings.HasPrefix(abs, "/var/") {
 		privateAbs = "/private" + abs
 	}
-
 	args := []string{"-n", "-F", "pn", "--", abs}
 	if privateAbs != abs {
 		args = append(args, privateAbs)
 	}
 	ctx, cancel := context.WithDeadline(context.Background(), deadline)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "lsof", args...)
-	out, err := cmd.Output()
+	out, err := exec.CommandContext(ctx, "lsof", args...).Output()
 	if ctx.Err() != nil {
 		return nil, fmt.Errorf("processesHoldingMarker lsof deadline: %w", ctx.Err())
 	}
@@ -50,10 +53,36 @@ func processesHoldingMarkerViaLsof(markerPath string, deadline time.Time) ([]pro
 			return nil, fmt.Errorf("processesHoldingMarker lsof: %w", err)
 		}
 	}
+	return out, nil
+}
+
+func processesHoldingMarkerViaLsof(markerPath string, deadline time.Time) ([]procToken, error) {
+	if markerPath == "" {
+		return nil, nil
+	}
+	if time.Until(deadline) <= 0 {
+		return nil, fmt.Errorf("processesHoldingMarker lsof deadline exceeded")
+	}
+	abs, err := filepath.Abs(markerPath)
+	if err != nil {
+		return nil, fmt.Errorf("processesHoldingMarker abs: %w", err)
+	}
+	if resolved, rerr := filepath.EvalSymlinks(abs); rerr == nil {
+		abs = resolved
+	}
+	abs = filepath.Clean(abs)
+	privateAbs := abs
+	if strings.HasPrefix(abs, "/var/") {
+		privateAbs = "/private" + abs
+	}
+	out, err := markerLsofOutputFn(markerPath, deadline)
+	if err != nil {
+		return nil, err
+	}
 
 	excl := residualExcludePIDs()
-	var currentPID int
 	seen := make(map[int]struct{})
+	var currentPID int
 	result := make([]procToken, 0)
 	for _, line := range strings.Split(string(out), "\n") {
 		if line == "" {
@@ -74,18 +103,14 @@ func processesHoldingMarkerViaLsof(markerPath string, deadline time.Time) ([]pro
 			if _, skip := excl[currentPID]; skip {
 				continue
 			}
-			name := line[1:]
-			if i := strings.IndexByte(name, ' '); i >= 0 {
-				name = name[:i]
-			}
-			name = filepath.Clean(name)
+			name := filepath.Clean(line[1:])
 			if name != abs && name != privateAbs {
 				continue
 			}
 			if _, ok := seen[currentPID]; ok {
 				continue
 			}
-			tok, terr := tokenOf(currentPID)
+			tok, terr := markerTokenOfFn(currentPID)
 			if terr != nil {
 				if isESRCH(terr) || errors.Is(terr, syscall.EIO) {
 					continue
