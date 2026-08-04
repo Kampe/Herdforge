@@ -197,12 +197,20 @@ func TestRunPushFailureStillResetsAndLeavesLocalBranch(t *testing.T) {
 	ctx := context.Background()
 	root, wt, _ := fixture(t)
 	git(t, wt, "commit", "--allow-empty", "-q", "-m", "unique")
-	git(t, root, "remote", "set-url", "origin", filepath.Join(t.TempDir(), "missing.git"))
 	var out, errOut bytes.Buffer
 	plan, err := New(ctx, root, wt, Options{Stdout: &out, Stderr: &errOut})
 	if err != nil {
 		t.Fatal(err)
 	}
+	oldRun := gitRunFn
+	gitRunFn = func(ctx context.Context, dir string, args ...string) error {
+		err := oldRun(ctx, dir, args...)
+		if err == nil && len(args) >= 2 && args[0] == "push" {
+			return errors.New("injected push failure")
+		}
+		return err
+	}
+	t.Cleanup(func() { gitRunFn = oldRun })
 	got, err := plan.Run(ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -215,6 +223,75 @@ func TestRunPushFailureStillResetsAndLeavesLocalBranch(t *testing.T) {
 	}
 	if git(t, wt, "rev-parse", "HEAD") != git(t, root, "rev-parse", "origin/main") {
 		t.Fatal("reset did not execute after push failure")
+	}
+}
+
+func TestRunRefMutationAfterPushBlocksReset(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		retarget  bool
+		pushError bool
+	}{
+		{name: "delete after push succeeds"},
+		{name: "retarget after push succeeds", retarget: true},
+		{name: "delete after push fails", pushError: true},
+		{name: "retarget after push fails", retarget: true, pushError: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			root, wt, _ := fixture(t)
+			git(t, wt, "commit", "--allow-empty", "-q", "-m", "unique")
+			plan, err := New(ctx, root, wt, Options{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			oldRun := gitRunFn
+			gitRunFn = func(ctx context.Context, dir string, args ...string) error {
+				err := oldRun(ctx, dir, args...)
+				if err == nil && len(args) >= 2 && args[0] == "push" {
+					ref := "refs/heads/" + plan.authority.preserveBranch
+					if tc.retarget {
+						git(t, dir, "update-ref", ref, "origin/main")
+					} else {
+						git(t, dir, "update-ref", "-d", ref)
+					}
+					if tc.pushError {
+						return errors.New("injected push failure")
+					}
+				}
+				return err
+			}
+			t.Cleanup(func() { gitRunFn = oldRun })
+			if _, err := plan.Run(ctx); err == nil || !strings.Contains(err.Error(), "preserve ref changed") {
+				t.Fatalf("preserve ref mutation must block reset, got %v", err)
+			}
+			if got := git(t, wt, "rev-parse", "HEAD"); got != plan.authority.head {
+				t.Fatalf("reset ran after preserve ref mutation: got %s want %s", got, plan.authority.head)
+			}
+		})
+	}
+}
+
+func TestNewStrictCherryFailureFailsClosed(t *testing.T) {
+	ctx := context.Background()
+	root, wt, _ := fixture(t)
+	if err := osWrite(filepath.Join(wt, "unique.txt"), "unique\n"); err != nil {
+		t.Fatal(err)
+	}
+	git(t, wt, "add", "unique.txt")
+	git(t, wt, "commit", "-q", "-m", "unique")
+	missingAncestor := git(t, wt, "rev-parse", "HEAD")
+	git(t, wt, "commit", "--allow-empty", "-q", "-m", "tip")
+	objects := git(t, wt, "rev-parse", "--git-path", "objects")
+	if !filepath.IsAbs(objects) {
+		objects = filepath.Join(wt, objects)
+	}
+	objectPath := filepath.Join(objects, missingAncestor[:2], missingAncestor[2:])
+	if err := os.Remove(objectPath); err != nil {
+		t.Fatalf("remove fixture object: %v", err)
+	}
+	if _, err := New(ctx, root, wt, Options{}); err == nil || !strings.Contains(err.Error(), "cannot verify unmerged work") || !strings.Contains(err.Error(), "git cherry") {
+		t.Fatalf("strict cherry failure must propagate, got %v", err)
 	}
 }
 
