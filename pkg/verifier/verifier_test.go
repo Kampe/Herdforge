@@ -764,7 +764,23 @@ exit 0
 // Execute must reap it rather than passing after natural writer exit.
 // $1=sessionPid $2=writetarget $3=groupPid
 const productionDetachedSessionScript = `
-sh -c 'printf "%s\n" "$$" > "$1"; for i in $(seq 1 4096); do printf g >> "$2"; done; sleep 30' grpwriter "$3" "$2" </dev/null >/dev/null 2>&1 &
+wait_for_nonempty() {
+  i=0
+  while [ ! -s "$1" ]; do
+    if [ "$i" -ge 500 ]; then return 124; fi
+    i=$((i + 1))
+    sleep 0.01
+  done
+}
+wait_for_exists() {
+  i=0
+  while [ ! -e "$1" ]; do
+    if [ "$i" -ge 500 ]; then return 124; fi
+    i=$((i + 1))
+    sleep 0.01
+  done
+}
+sh -c 'printf "%s\n" "$$" > "$1"; for i in $(seq 1 4096); do printf g >> "$2"; done; sleep 5' grpwriter "$3" "$2" </dev/null >/dev/null 2>&1 &
 python3 -c '
 import os, sys
 path, target = sys.argv[1], sys.argv[2]
@@ -782,13 +798,13 @@ for _ in range(4096):
     out.write("w")
     out.flush()
 import time
-time.sleep(30)
+time.sleep(5)
 ' "$1" "$2" </dev/null >/dev/null 2>&1
-while [ ! -s "$3" ]; do :; done
-while [ ! -s "$1" ]; do :; done
+wait_for_nonempty "$3" || exit $?
+wait_for_nonempty "$1" || exit $?
 if [ "$#" -ge 5 ]; then
   printf "%s\n" "$$" > "$4" || exit 1
-  while [ ! -e "$5" ]; do :; done
+  wait_for_exists "$5" || exit $?
 fi
 exit 0
 `
@@ -833,6 +849,36 @@ func reapExactTokens(t *testing.T, tokens ...procToken) {
 			t.Errorf("cleanup wait exact pid %d gone: %v", tok.pid, err)
 		}
 	}
+}
+
+// reapPIDFilesByIdentity is the immediate-launch cleanup fallback. It reads
+// only fixture-owned PID files, binds each currently present PID to its start
+// token, and then signals that exact incarnation. Missing files are expected
+// when launch failed before a writer published readiness.
+func reapPIDFilesByIdentity(t *testing.T, pidFiles ...string) {
+	t.Helper()
+	tokens := make([]procToken, 0, len(pidFiles))
+	for _, pidFile := range pidFiles {
+		data, err := os.ReadFile(pidFile)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			t.Errorf("cleanup read pid file %s: %v", filepath.Base(pidFile), err)
+			continue
+		}
+		pid, convErr := strconv.Atoi(strings.TrimSpace(string(data)))
+		if convErr != nil || pid <= 1 {
+			t.Errorf("cleanup invalid pid file %s: %q", filepath.Base(pidFile), data)
+			continue
+		}
+		tok, tokenErr := tokenOf(pid)
+		if tokenErr != nil {
+			continue
+		}
+		tokens = append(tokens, tok)
+	}
+	reapExactTokens(t, tokens...)
 }
 
 func assertWriterGone(t *testing.T, pidFile string) {
@@ -1395,12 +1441,27 @@ func TestExecuteDetachedSessionAndBackgroundWriters(t *testing.T) {
 		err    error
 	}
 	done := make(chan executeOutcome, 1)
+	finished := make(chan struct{})
+	ctx, cancel := context.WithCancel(context.Background())
 	go func() {
+		defer close(finished)
 		result, err := NewVerifierArgs([]string{
 			"./leave-detached", sessionPidFile, writeTarget, groupPidFile, startedFile, releaseFile,
-		}).Execute(context.Background(), dir)
+		}).Execute(ctx, dir)
 		done <- executeOutcome{result: result, err: err}
 	}()
+	// Register before any readiness wait. Cleanup order is explicit: cancel
+	// Execute, join its goroutine within a bound, then identity-bind/reap any
+	// fixture PID files that appeared before TempDir cleanup.
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case <-finished:
+		case <-time.After(3 * time.Second):
+			t.Errorf("cleanup: Execute did not stop after cancellation")
+		}
+		reapPIDFilesByIdentity(t, sessionPidFile, groupPidFile)
+	})
 	if _, err := waitForChildReadyPID(startedFile, 5*time.Second); err != nil {
 		t.Fatal(err)
 	}
@@ -1408,12 +1469,10 @@ func TestExecuteDetachedSessionAndBackgroundWriters(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { reapExactTokens(t, sessionToken) })
 	groupToken, err := waitForPIDToken(groupPidFile, 5*time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { reapExactTokens(t, groupToken) })
 	if sessionToken.equal(groupToken) {
 		t.Fatalf("writer inventory aliases one identity: session=%+v group=%+v", sessionToken, groupToken)
 	}
