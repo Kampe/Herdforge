@@ -38,7 +38,9 @@ func CodexConfig() EffectiveConfig {
 }
 
 func (c EffectiveConfig) Valid() bool {
-	return c.MCPServers != nil && c.MCPServers[CodeReviewGraph] == false && c.CLI != nil && c.CLI[CodeReviewGraph]
+	mcpEnabled, mcpPresent := c.MCPServers[CodeReviewGraph]
+	cliEnabled, cliPresent := c.CLI[CodeReviewGraph]
+	return c.MCPServers != nil && mcpPresent && !mcpEnabled && c.CLI != nil && cliPresent && cliEnabled
 }
 
 // CompileCodexArgs adds an explicit override, never relying on inherited

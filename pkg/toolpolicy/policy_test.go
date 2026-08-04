@@ -22,6 +22,16 @@ func TestCodexPolicyDisablesInheritedMCPKeepsCLI(t *testing.T) {
 	}
 }
 
+func TestEffectiveConfigRejectsMissingCRGMapKey(t *testing.T) {
+	cfg := toolpolicy.EffectiveConfig{
+		MCPServers: map[string]bool{},
+		CLI:        map[string]bool{toolpolicy.CodeReviewGraph: true},
+	}
+	if cfg.Valid() {
+		t.Fatal("missing CRG MCP key must not default to disabled")
+	}
+}
+
 func fakeInheritedCRGChildren(argv []string) int {
 	for i := range argv {
 		if i+1 < len(argv) && argv[i] == "-c" && argv[i+1] == "mcp_servers.code-review-graph.enabled=false" {
