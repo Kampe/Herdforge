@@ -121,6 +121,13 @@ type Store interface {
 	CompareAndSwap(context.Context, string, []Ownership) (bool, error)
 }
 
+// ReleaseProofStore durably records a successful fenced release. Implementations
+// must key the record by the exact ownership identity, generation, scope, and
+// graph binding so a stale release cannot overwrite a newer proof.
+type ReleaseProofStore interface {
+	RecordReleaseProof(context.Context, ReleaseRequest) error
+}
+
 type Authority int
 
 const (
@@ -489,6 +496,11 @@ func (f Fence) Release(ctx context.Context, req ReleaseRequest) error {
 			return err
 		}
 		if won {
+			if proofs, ok := f.Store.(ReleaseProofStore); ok {
+				if err := proofs.RecordReleaseProof(ctx, req); err != nil {
+					return err
+				}
+			}
 			return nil
 		}
 	}
