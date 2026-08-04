@@ -37,7 +37,7 @@ type Store interface {
 // the state file so replacement can use rename without exposing partial JSON.
 type FileStore struct {
 	Path    string
-	DirSync func(string) error
+	dirSync func(string) error
 }
 
 func NewFileStore(path string) *FileStore { return &FileStore{Path: path} }
@@ -121,7 +121,7 @@ func (s *FileStore) CompareAndSwap(expected uint64, next Snapshot) (bool, error)
 	if err := os.Rename(tmpName, s.Path); err != nil {
 		return false, fmt.Errorf("commit launch state: %w", err)
 	}
-	syncDir := s.DirSync
+	syncDir := s.dirSync
 	if syncDir == nil {
 		syncDir = syncLaunchDir
 	}

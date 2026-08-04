@@ -348,7 +348,7 @@ func TestAuthorityHasStartedRejectsEveryExactBindingMismatch(t *testing.T) {
 
 func TestFileStoreDirectorySyncFailureIsNotCASSuccess(t *testing.T) {
 	s := NewFileStore(t.TempDir() + "/state.json")
-	s.DirSync = func(string) error { return fmt.Errorf("directory sync failed") }
+	s.dirSync = func(string) error { return fmt.Errorf("directory sync failed") }
 	ok, err := s.CompareAndSwap(0, Snapshot{})
 	if err == nil || ok {
 		t.Fatalf("directory durability failure reported success: ok=%v err=%v", ok, err)
@@ -380,6 +380,27 @@ func TestAuthorityRejectsSemanticCorruptionBeforeResume(t *testing.T) {
 				t.Fatal("semantic corruption authorized resume")
 			}
 		})
+	}
+}
+
+func TestAuthorityRejectsStoredArgvTamperWithPreservedDecisionDigest(t *testing.T) {
+	seed := authorityRequest(t)
+	store := &sharedStore{}
+	a, _ := NewAuthority(store)
+	reserved := mustReserve(t, a, seed, "packet")
+	acceptedReceipt := accepted(t, a, reserved)
+	proof := seed
+	proof.ProcessIdentity, proof.StartToken = acceptedReceipt.ProcessIdentity, acceptedReceipt.StartToken
+	snap, _ := store.Read()
+	for i := range snap.Events {
+		if snap.Events[i].Kind == "reserved" || snap.Events[i].Kind == "accepted" {
+			snap.Events[i].Receipt.Argv[0] = "tampered"
+		}
+	}
+	tampered := &sharedStore{snap: snap}
+	reader, _ := NewAuthority(tampered)
+	if ok, err := reader.HasStarted(proof, "packet"); err == nil && ok {
+		t.Fatal("stored argv tamper authorized resume")
 	}
 }
 
