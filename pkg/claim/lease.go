@@ -27,16 +27,19 @@ const (
 type Lease struct {
 	ID int64
 	LeaseKey
-	OwnerID      string
-	Role         string
-	WorktreePath string
-	Generation   int64
-	Status       LeaseStatus
-	Held         bool
-	ClaimedAt    time.Time
-	RenewedAt    time.Time
-	ExpiresAt    time.Time
-	ReleasedAt   *time.Time
+	OwnerID        string
+	Role           string
+	HoldRepository string
+	HoldOwner      string
+	HoldLane       string
+	WorktreePath   string
+	Generation     int64
+	Status         LeaseStatus
+	Held           bool
+	ClaimedAt      time.Time
+	RenewedAt      time.Time
+	ExpiresAt      time.Time
+	ReleasedAt     *time.Time
 
 	// CapacityReleasedAt is set once the CapacityCoordinator.Release call
 	// for this lease's Reserve has durably completed. A Released/Expired

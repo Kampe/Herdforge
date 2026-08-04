@@ -100,6 +100,9 @@ func (s *SQLiteLeaseStore) migrate() error {
 			task_ref TEXT NOT NULL,
 			owner_id TEXT NOT NULL,
 			role TEXT NOT NULL,
+			hold_repository TEXT NOT NULL DEFAULT '',
+			hold_owner TEXT NOT NULL DEFAULT '',
+			hold_lane TEXT NOT NULL DEFAULT '',
 			worktree_path TEXT NOT NULL DEFAULT '',
 			generation INTEGER NOT NULL,
 			status TEXT NOT NULL DEFAULT 'active',
@@ -129,10 +132,70 @@ func (s *SQLiteLeaseStore) migrate() error {
 			return fmt.Errorf("migrate leases: %w", err)
 		}
 	}
+	if err := ensureHoldIdentityColumns(s.db); err != nil {
+		return fmt.Errorf("validate hold identity schema: %w", err)
+	}
 	return nil
 }
 
-const leaseColumns = `id, repo, provider, project, task_ref, owner_id, role, worktree_path,
+func ensureHoldIdentityColumns(db *sql.DB) error {
+	for pass := 0; pass < 2; pass++ {
+		columns, err := leaseIdentityColumns(db)
+		if err != nil {
+			return err
+		}
+		missing := false
+		for _, name := range []string{"hold_repository", "hold_owner", "hold_lane"} {
+			if _, ok := columns[name]; !ok {
+				missing = true
+				if _, err := execWithRetry(context.Background(), db, `ALTER TABLE leases ADD COLUMN `+name+` TEXT NOT NULL DEFAULT ''`); err != nil {
+					return fmt.Errorf("add %s: %w", name, err)
+				}
+			}
+		}
+		if !missing {
+			break
+		}
+	}
+	columns, err := leaseIdentityColumns(db)
+	if err != nil {
+		return err
+	}
+	for _, name := range []string{"hold_repository", "hold_owner", "hold_lane"} {
+		c, ok := columns[name]
+		if !ok || !strings.EqualFold(strings.TrimSpace(c.typ), "TEXT") || c.notNull != 1 || !c.def.Valid || strings.Trim(strings.TrimSpace(c.def.String), "'\"") != "" {
+			return fmt.Errorf("incompatible %s column", name)
+		}
+	}
+	return nil
+}
+
+type leaseIdentityColumn struct {
+	typ     string
+	notNull int
+	def     sql.NullString
+}
+
+func leaseIdentityColumns(db *sql.DB) (map[string]leaseIdentityColumn, error) {
+	rows, err := db.Query(`PRAGMA table_info(leases)`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	columns := map[string]leaseIdentityColumn{}
+	for rows.Next() {
+		var cid, notNull, pk int
+		var name, typ string
+		var def sql.NullString
+		if err := rows.Scan(&cid, &name, &typ, &notNull, &def, &pk); err != nil {
+			return nil, err
+		}
+		columns[name] = leaseIdentityColumn{typ: typ, notNull: notNull, def: def}
+	}
+	return columns, rows.Err()
+}
+
+const leaseColumns = `id, repo, provider, project, task_ref, owner_id, role, hold_repository, hold_owner, hold_lane, worktree_path,
 	generation, status, held, claimed_at, renewed_at, expires_at, released_at, capacity_released_at`
 
 func scanLease(row interface{ Scan(...any) error }) (*Lease, error) {
@@ -140,7 +203,7 @@ func scanLease(row interface{ Scan(...any) error }) (*Lease, error) {
 	var status string
 	var held int
 	var releasedAt, capacityReleasedAt sql.NullTime
-	err := row.Scan(&l.ID, &l.Repo, &l.Provider, &l.Project, &l.TaskRef, &l.OwnerID, &l.Role,
+	err := row.Scan(&l.ID, &l.Repo, &l.Provider, &l.Project, &l.TaskRef, &l.OwnerID, &l.Role, &l.HoldRepository, &l.HoldOwner, &l.HoldLane,
 		&l.WorktreePath, &l.Generation, &status, &held, &l.ClaimedAt, &l.RenewedAt, &l.ExpiresAt,
 		&releasedAt, &capacityReleasedAt)
 	if err != nil {
@@ -213,6 +276,14 @@ var expireStaleTestHook func(candidate *Lease)
 // INSERTs itself, so exactly one succeeds regardless of how many
 // processes (real OS processes, not just goroutines) race this call.
 func (s *SQLiteLeaseStore) Acquire(ctx context.Context, key LeaseKey, ownerID, role, worktreePath string, now time.Time, ttl time.Duration) (*Lease, error) {
+	return s.acquire(ctx, key, ownerID, role, worktreePath, "", "", "", now, ttl)
+}
+
+func (s *SQLiteLeaseStore) AcquireWithIdentity(ctx context.Context, key LeaseKey, ownerID, role, worktreePath, holdRepository, holdOwner, holdLane string, now time.Time, ttl time.Duration) (*Lease, error) {
+	return s.acquire(ctx, key, ownerID, role, worktreePath, holdRepository, holdOwner, holdLane, now, ttl)
+}
+
+func (s *SQLiteLeaseStore) acquire(ctx context.Context, key LeaseKey, ownerID, role, worktreePath, holdRepository, holdOwner, holdLane string, now time.Time, ttl time.Duration) (*Lease, error) {
 	// Deliberately NOT a staleness carve-out on provider_lock_owner here
 	// (see ForceReleaseProviderLock's doc comment): whether it's safe to
 	// preempt a stale provider lock by time alone depends on whether a
@@ -239,9 +310,9 @@ func (s *SQLiteLeaseStore) Acquire(ctx context.Context, key LeaseKey, ownerID, r
 
 	claimedAt, expiresAt := now, now.Add(ttl)
 	res, err := execWithRetry(ctx, s.db, `INSERT INTO leases
-		(repo, provider, project, task_ref, owner_id, role, worktree_path, generation, status, held, claimed_at, renewed_at, expires_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', 0, ?, ?, ?)`,
-		key.Repo, key.Provider, key.Project, key.TaskRef, ownerID, role, worktreePath, gen, claimedAt, claimedAt, expiresAt)
+		(repo, provider, project, task_ref, owner_id, role, hold_repository, hold_owner, hold_lane, worktree_path, generation, status, held, claimed_at, renewed_at, expires_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', 0, ?, ?, ?)`,
+		key.Repo, key.Provider, key.Project, key.TaskRef, ownerID, role, holdRepository, holdOwner, holdLane, worktreePath, gen, claimedAt, claimedAt, expiresAt)
 	if err != nil {
 		if isUniqueViolation(err) {
 			existing, lookupErr := s.currentActive(ctx, key)
@@ -267,7 +338,7 @@ func (s *SQLiteLeaseStore) Acquire(ctx context.Context, key LeaseKey, ownerID, r
 	}
 
 	return &Lease{
-		ID: id, LeaseKey: key, OwnerID: ownerID, Role: role, WorktreePath: worktreePath,
+		ID: id, LeaseKey: key, OwnerID: ownerID, Role: role, HoldRepository: holdRepository, HoldOwner: holdOwner, HoldLane: holdLane, WorktreePath: worktreePath,
 		Generation: gen, Status: StatusActive, ClaimedAt: claimedAt, RenewedAt: claimedAt, ExpiresAt: expiresAt,
 	}, nil
 }

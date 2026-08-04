@@ -67,10 +67,36 @@ func TestHoldAuthorityAbsentIsExplicitlyUnheldAtPositiveGeneration(t *testing.T)
 	if decision.Held || decision.Generation != 1 || decision.Code != "unheld" {
 		t.Fatalf("absent decision=%+v", decision)
 	}
-	if _, err := a.Check(context.Background(), id, 0); !errors.Is(err, ErrHoldStale) {
+	if _, err := a.Check(context.Background(), id, 0); !errors.Is(err, ErrHoldAuthorityUnavailable) || errors.Is(err, ErrHoldDenied) {
 		t.Fatalf("zero generation error=%v", err)
 	}
 }
+
+func TestWithUnheldTransitionReleasedExpiredRowDoesNotRewriteHistory(t *testing.T) {
+	a, id, now := holdFixture(t)
+	if _, err := a.Hold(context.Background(), id, "actor", "maintenance", "operator_hold", 1, ptrTime(now.Add(-time.Second))); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.Release(context.Background(), id, "actor", "explicit", "operator_release", 1); err != nil {
+		t.Fatal(err)
+	}
+	called := 0
+	if err := a.WithUnheldTransition(context.Background(), []HoldIdentity{id}, func() error { called++; return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if called != 1 {
+		t.Fatalf("callback count=%d, want 1", called)
+	}
+	var releases int
+	if err := a.db.QueryRow(`SELECT COUNT(*) FROM lifecycle_hold_events WHERE repository=? AND owner=? AND lane=? AND task=? AND generation=? AND intent='release'`, id.Repository, id.Owner, id.Lane, id.Task, 1).Scan(&releases); err != nil {
+		t.Fatal(err)
+	}
+	if releases != 1 {
+		t.Fatalf("release event count=%d, want 1", releases)
+	}
+}
+
+func ptrTime(t time.Time) *time.Time { return &t }
 
 func TestHoldAuthorityFirstGenerationIsExactlyOne(t *testing.T) {
 	a, id, _ := holdFixture(t)
@@ -280,20 +306,39 @@ func TestCanonicalLaunchDBPathFailsClosedOutsideGit(t *testing.T) {
 func TestCheckLaneAndTaskHoldZeroOneAndAmbiguous(t *testing.T) {
 	reader := holdDecisionReader{}
 	zero := func(context.Context, string) ([]HoldIdentity, error) { return nil, nil }
-	if err := CheckLaneAndTaskHold(context.Background(), reader, zero, "repo", "worker", "worker", nil); err != nil {
+	generation := func(context.Context, HoldIdentity) (int64, error) { return 1, nil }
+	if err := CheckLaneAndTaskHold(context.Background(), reader, zero, "repo", "worker", "worker", generation); err != nil {
 		t.Fatalf("zero active tasks blocked lane: %v", err)
 	}
 	one := func(context.Context, string) ([]HoldIdentity, error) {
 		return []HoldIdentity{{Repository: "repo", Owner: "worker", Lane: "worker", Task: "FAC-1", Scope: "task"}}, nil
 	}
-	if err := CheckLaneAndTaskHold(context.Background(), heldTaskReader{}, one, "repo", "worker", "worker", nil); err == nil {
+	if err := CheckLaneAndTaskHold(context.Background(), heldTaskReader{}, one, "repo", "worker", "worker", generation); err == nil {
 		t.Fatal("task-held lane was admitted")
 	}
 	many := func(context.Context, string) ([]HoldIdentity, error) {
 		return []HoldIdentity{{Repository: "repo", Owner: "worker", Lane: "worker", Task: "FAC-1", Scope: "task"}, {Repository: "repo", Owner: "worker", Lane: "worker", Task: "FAC-2", Scope: "task"}}, nil
 	}
-	if err := CheckLaneAndTaskHold(context.Background(), reader, many, "repo", "worker", "worker", nil); err == nil {
+	if err := CheckLaneAndTaskHold(context.Background(), reader, many, "repo", "worker", "worker", generation); err == nil {
 		t.Fatal("ambiguous active tasks were admitted")
+	}
+}
+
+func TestTypedCanonicalNamespacesKeepScoutRoleAndSmithLiveIDDistinct(t *testing.T) {
+	r, err := NewCanonicalLaneRegistry([]CanonicalLane{{Name: "smith", Role: "worker"}, {Name: "scout", Role: "forge-smith"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	role, err := r.ResolveRole("forge-smith")
+	if err != nil || role.Name != "scout" {
+		t.Fatalf("role=%+v err=%v", role, err)
+	}
+	live, err := r.ResolveLiveAgentID("forge-smith")
+	if err != nil || live.Name != "smith" || live.Role != "worker" {
+		t.Fatalf("live=%+v err=%v", live, err)
+	}
+	if _, err := r.ResolveLaneName("forge-smith"); err == nil {
+		t.Fatal("live ID accepted as lane name")
 	}
 }
 

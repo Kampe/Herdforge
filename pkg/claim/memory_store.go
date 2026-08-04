@@ -109,7 +109,15 @@ func (s *InMemoryLeaseStore) fencingErrorLocked(key LeaseKey, ownerID string, ge
 	return fmt.Errorf("%w: no lease for %s owned by %s at generation %d", ErrNotFound, key.TaskRef, ownerID, generation)
 }
 
-func (s *InMemoryLeaseStore) Acquire(_ context.Context, key LeaseKey, ownerID, role, worktreePath string, now time.Time, ttl time.Duration) (*Lease, error) {
+func (s *InMemoryLeaseStore) Acquire(ctx context.Context, key LeaseKey, ownerID, role, worktreePath string, now time.Time, ttl time.Duration) (*Lease, error) {
+	return s.acquire(ctx, key, ownerID, role, worktreePath, "", "", "", now, ttl)
+}
+
+func (s *InMemoryLeaseStore) AcquireWithIdentity(ctx context.Context, key LeaseKey, ownerID, role, worktreePath, holdRepository, holdOwner, holdLane string, now time.Time, ttl time.Duration) (*Lease, error) {
+	return s.acquire(ctx, key, ownerID, role, worktreePath, holdRepository, holdOwner, holdLane, now, ttl)
+}
+
+func (s *InMemoryLeaseStore) acquire(_ context.Context, key LeaseKey, ownerID, role, worktreePath, holdRepository, holdOwner, holdLane string, now time.Time, ttl time.Duration) (*Lease, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -128,7 +136,7 @@ func (s *InMemoryLeaseStore) Acquire(_ context.Context, key LeaseKey, ownerID, r
 	gen := s.latestGenerationLocked(key) + 1
 	s.nextID++
 	l := &Lease{
-		ID: s.nextID, LeaseKey: key, OwnerID: ownerID, Role: role, WorktreePath: worktreePath,
+		ID: s.nextID, LeaseKey: key, OwnerID: ownerID, Role: role, HoldRepository: holdRepository, HoldOwner: holdOwner, HoldLane: holdLane, WorktreePath: worktreePath,
 		Generation: gen, Status: StatusActive, ClaimedAt: now, RenewedAt: now, ExpiresAt: now.Add(ttl),
 	}
 	s.rows[l.ID] = l

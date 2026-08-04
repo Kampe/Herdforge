@@ -310,7 +310,21 @@ func (e *Engine) ownershipClaimer() (deps.OwnershipClaimer, error) {
 		}
 		project = e.Config.TaskProvider.ProjectID
 	}
-	return deps.OpenLeaseOwnership(deps.ResolveLaunchLeasePath(root), repo, providerType, project)
+	ownership, err := deps.OpenLeaseOwnership(deps.ResolveLaunchLeasePath(root), repo, providerType, project)
+	if err != nil {
+		return nil, err
+	}
+	if e.Config != nil {
+		ownership.LaneResolver = func(role string) (string, error) {
+			for _, lane := range e.Config.Lanes {
+				if lane.Role == role {
+					return lane.Name, nil
+				}
+			}
+			return "", fmt.Errorf("unknown configured role %q", role)
+		}
+	}
+	return ownership, nil
 }
 
 // RunPulse executes one orchestration sweep pass, recording to the SQLite store.

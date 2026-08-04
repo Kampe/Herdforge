@@ -48,9 +48,9 @@ type EventRecord struct {
 
 // EventLease stores the lease state for an event.
 type EventLease struct {
-	Event     json.RawMessage `json:"event"`
-	OwnerPID  int             `json:"owner_pid"`
-	OwnerToken string         `json:"owner_token"`
+	Event      json.RawMessage `json:"event"`
+	OwnerPID   int             `json:"owner_pid"`
+	OwnerToken string          `json:"owner_token"`
 }
 
 // HookMarker is the state payload for a hook marker file.
@@ -69,17 +69,17 @@ type HookState struct {
 
 // ReclaimGate is the gate file for a reclaim operation.
 type ReclaimGate struct {
-	Claim     json.RawMessage `json:"claim"`
-	OwnerPID  int             `json:"owner_pid"`
-	OwnerToken string         `json:"owner_token"`
+	Claim      json.RawMessage `json:"claim"`
+	OwnerPID   int             `json:"owner_pid"`
+	OwnerToken string          `json:"owner_token"`
 }
 
 // AgentSnapshot describes one herdr agent's state.
 type AgentSnapshot struct {
-	Name      string `json:"name"`
-	Status    string `json:"status"`
-	Standing  bool   `json:"standing"`
-	Interactive bool `json:"interactive"`
+	Name        string `json:"name"`
+	Status      string `json:"status"`
+	Standing    bool   `json:"standing"`
+	Interactive bool   `json:"interactive"`
 }
 
 // LaneStateSnapshot describes one lane's state summary.
@@ -94,27 +94,27 @@ type LaneStateSnapshot struct {
 
 // Summary is the JSON structure returned by the lifecycle observation.
 type Summary struct {
-	Standing       []AgentSnapshot   `json:"standing"`
-	Todo           int               `json:"todo"`
-	Blocked        int               `json:"blocked"`
-	BlockedRefs    []string          `json:"blocked_refs"`
-	BlockedTargets []HoldTarget      `json:"blocked_targets,omitempty"`
-	Dispatchable   int               `json:"dispatchable"`
-	OccupiedRefs   []string          `json:"occupied_refs,omitempty"`
-	InProgress     int               `json:"in_progress"`
-	StaleInProgress int              `json:"stale_in_progress"`
-	StaleCards     []StaleCard       `json:"stale_cards"`
-	Settled        []AgentSnapshot   `json:"settled"`
-	Utilized       []string          `json:"utilized"`
-	Unutilized     []string          `json:"unutilized"`
-	Goaled         []string          `json:"goaled"`
-	GoalViolations []string          `json:"goal_violations"`
-	Red            []string          `json:"red"`
-	Actions        []ActionLogEntry  `json:"actions"`
-	Healthy        bool              `json:"healthy"`
-	StaleActionsExecuted int         `json:"stale_actions_executed"`
-	RoutingActionExecuted  bool      `json:"routing_action_executed"`
-	EventCompleted bool             `json:"event_completed"`
+	Standing              []AgentSnapshot  `json:"standing"`
+	Todo                  int              `json:"todo"`
+	Blocked               int              `json:"blocked"`
+	BlockedRefs           []string         `json:"blocked_refs"`
+	BlockedTargets        []HoldTarget     `json:"blocked_targets,omitempty"`
+	Dispatchable          int              `json:"dispatchable"`
+	OccupiedRefs          []string         `json:"occupied_refs,omitempty"`
+	InProgress            int              `json:"in_progress"`
+	StaleInProgress       int              `json:"stale_in_progress"`
+	StaleCards            []StaleCard      `json:"stale_cards"`
+	Settled               []AgentSnapshot  `json:"settled"`
+	Utilized              []string         `json:"utilized"`
+	Unutilized            []string         `json:"unutilized"`
+	Goaled                []string         `json:"goaled"`
+	GoalViolations        []string         `json:"goal_violations"`
+	Red                   []string         `json:"red"`
+	Actions               []ActionLogEntry `json:"actions"`
+	Healthy               bool             `json:"healthy"`
+	StaleActionsExecuted  int              `json:"stale_actions_executed"`
+	RoutingActionExecuted bool             `json:"routing_action_executed"`
+	EventCompleted        bool             `json:"event_completed"`
 }
 
 // StaleCard identifies a stale in-progress card.
@@ -134,17 +134,17 @@ type HoldTarget struct {
 
 // ActionLogEntry records one act-mode action.
 type ActionLogEntry struct {
-	Action      string `json:"action"`
-	Ref         string `json:"ref,omitempty"`
-	Owner       string `json:"owner,omitempty"`
-	Lane        string `json:"lane,omitempty"`
-	EventID     string `json:"event_id,omitempty"`
-	Producer    string `json:"producer,omitempty"`
-	Reviewer    string `json:"reviewer,omitempty"`
-	Task        string `json:"task,omitempty"`
-	Verified    bool   `json:"verified"`
-	Idempotent  bool   `json:"idempotent,omitempty"`
-	Observed    string `json:"observed,omitempty"`
+	Action     string `json:"action"`
+	Ref        string `json:"ref,omitempty"`
+	Owner      string `json:"owner,omitempty"`
+	Lane       string `json:"lane,omitempty"`
+	EventID    string `json:"event_id,omitempty"`
+	Producer   string `json:"producer,omitempty"`
+	Reviewer   string `json:"reviewer,omitempty"`
+	Task       string `json:"task,omitempty"`
+	Verified   bool   `json:"verified"`
+	Idempotent bool   `json:"idempotent,omitempty"`
+	Observed   string `json:"observed,omitempty"`
 }
 
 // ============================================================================
@@ -156,11 +156,11 @@ type ActionLogEntry struct {
 type Engine struct {
 	mu sync.Mutex
 
-	StateRoot  string
-	KickBin    string
-	HerdrBin   string
-	KaneoBin   string
-	SendBin    string
+	StateRoot   string
+	KickBin     string
+	HerdrBin    string
+	KaneoBin    string
+	SendBin     string
 	StandingBin string
 
 	AgentsFile string // if set, read agents from file instead of herdr
@@ -170,19 +170,19 @@ type Engine struct {
 	Lanes []string // lane IDs to observe; defaults to standing IDs
 
 	// Hooks for act mode.
-	ReclaimHook string // executable for reclaim actions
-	RoutingHook string // executable for routing repair
-	ReviewHook  string // executable for review handoff
-	NextHook    string // executable for next-task handoff
+	ReclaimHook  string // executable for reclaim actions
+	RoutingHook  string // executable for routing repair
+	ReviewHook   string // executable for review handoff
+	NextHook     string // executable for next-task handoff
 	ReadbackHook string // executable for authoritative readback
-	HoldReader HoldReader
+	HoldReader   HoldReader
 	HoldIdentity func(task, lane, owner string) HoldIdentity
-	HoldRoles []string
+	HoldRoles    []string
 
 	// Test seams.
-	TestClaimAttempts       int
-	TestCrashAfterClaim     bool
-	TestCrashAfterHookAck   string
+	TestClaimAttempts          int
+	TestCrashAfterClaim        bool
+	TestCrashAfterHookAck      string
 	TestReleaseValidateBarrier string
 	TestReclaimValidateBarrier string
 }
@@ -638,8 +638,8 @@ func (e *Engine) reclaimEventClaim(root, eventID string, expectedJSON []byte) er
 	// Publish reclaim gate.
 	token := randomToken()
 	gate := ReclaimGate{
-		Claim:     json.RawMessage(expectedJSON),
-		OwnerPID:  os.Getpid(),
+		Claim:      json.RawMessage(expectedJSON),
+		OwnerPID:   os.Getpid(),
 		OwnerToken: token,
 	}
 	gatePayload, err := json.Marshal(gate)
@@ -926,9 +926,9 @@ func (e *Engine) observeLaneState(lane string) LaneStateSnapshot {
 		}
 		var state struct {
 			Features []struct {
-				State    string         `json:"state"`
-				Behavior string         `json:"behavior"`
-				ID       string         `json:"id"`
+				State    string `json:"state"`
+				Behavior string `json:"behavior"`
+				ID       string `json:"id"`
 			} `json:"features"`
 		}
 		if err := json.Unmarshal(data, &state); err != nil {
@@ -969,25 +969,25 @@ func (e *Engine) observeLaneState(lane string) LaneStateSnapshot {
 }
 
 type boardCard struct {
-	Ref        string   `json:"ref,omitempty"`
-	ID         string   `json:"id,omitempty"`
-	Key        string   `json:"key,omitempty"`
-	Title      string   `json:"title,omitempty"`
-	Status     string   `json:"status,omitempty"`
-	Column     string   `json:"column,omitempty"`
-	State      string   `json:"state,omitempty"`
-	Owner      string   `json:"owner,omitempty"`
-	Assignee   string   `json:"assignee,omitempty"`
-	AssignedTo string   `json:"assigned_to,omitempty"`
-	AssignedAgent string `json:"assignedAgent,omitempty"`
-	Lane       string   `json:"lane,omitempty"`
-	Labels     []any    `json:"labels,omitempty"`
-	Blocked    *bool    `json:"blocked,omitempty"`
-	BlockedBy  []string `json:"blocked_by,omitempty"`
-	UpdatedAt  string   `json:"updated_at,omitempty"`
-	CreatedAt  string   `json:"created_at,omitempty"`
-	ReviewedAt string   `json:"reviewed_at,omitempty"`
-	MergedAt   string   `json:"merged_at,omitempty"`
+	Ref           string   `json:"ref,omitempty"`
+	ID            string   `json:"id,omitempty"`
+	Key           string   `json:"key,omitempty"`
+	Title         string   `json:"title,omitempty"`
+	Status        string   `json:"status,omitempty"`
+	Column        string   `json:"column,omitempty"`
+	State         string   `json:"state,omitempty"`
+	Owner         string   `json:"owner,omitempty"`
+	Assignee      string   `json:"assignee,omitempty"`
+	AssignedTo    string   `json:"assigned_to,omitempty"`
+	AssignedAgent string   `json:"assignedAgent,omitempty"`
+	Lane          string   `json:"lane,omitempty"`
+	Labels        []any    `json:"labels,omitempty"`
+	Blocked       *bool    `json:"blocked,omitempty"`
+	BlockedBy     []string `json:"blocked_by,omitempty"`
+	UpdatedAt     string   `json:"updated_at,omitempty"`
+	CreatedAt     string   `json:"created_at,omitempty"`
+	ReviewedAt    string   `json:"reviewed_at,omitempty"`
+	MergedAt      string   `json:"merged_at,omitempty"`
 }
 
 func (e *Engine) computeSummary(agentsWrapper struct {
@@ -1000,15 +1000,15 @@ func (e *Engine) computeSummary(agentsWrapper struct {
 	// Parse agents.
 	for _, raw := range agentsWrapper.Result.Agents {
 		var ag struct {
-			Name      string `json:"name"`
-			Label     string `json:"label"`
-			AgentName string `json:"agent_name"`
-			Agent     string `json:"agent"`
-			Status    string `json:"status"`
-			AgentStatus string `json:"agent_status"`
-			Interactive    *bool `json:"interactive"`
-			InteractiveReady *bool `json:"interactive_ready"`
-			InteractiveReady2 *bool `json:"interactiveReady"`
+			Name              string `json:"name"`
+			Label             string `json:"label"`
+			AgentName         string `json:"agent_name"`
+			Agent             string `json:"agent"`
+			Status            string `json:"status"`
+			AgentStatus       string `json:"agent_status"`
+			Interactive       *bool  `json:"interactive"`
+			InteractiveReady  *bool  `json:"interactive_ready"`
+			InteractiveReady2 *bool  `json:"interactiveReady"`
 		}
 		if err := json.Unmarshal(raw, &ag); err != nil {
 			continue
@@ -1068,18 +1068,18 @@ func (e *Engine) computeSummary(agentsWrapper struct {
 
 	// Normalize labels and status.
 	type cardNorm struct {
-		Ref         string
-		Status      string
-		Labels      []string
-		Owner       string
-		Lane        string
-		Role        string
-		Blocked     bool
-		UpdatedAt   string
-		CreatedAt   string
-		ReviewedAt  string
-		MergedAt    string
-		LedgerAt    string
+		Ref        string
+		Status     string
+		Labels     []string
+		Owner      string
+		Lane       string
+		Role       string
+		Blocked    bool
+		UpdatedAt  string
+		CreatedAt  string
+		ReviewedAt string
+		MergedAt   string
+		LedgerAt   string
 	}
 	normalized := make([]cardNorm, 0, len(cards))
 	for _, c := range cards {
@@ -1147,7 +1147,7 @@ func (e *Engine) computeSummary(agentsWrapper struct {
 			}
 		}
 
-			normalized = append(normalized, cardNorm{
+		normalized = append(normalized, cardNorm{
 			Ref:        ref,
 			Status:     st,
 			Labels:     labels,
@@ -1246,16 +1246,24 @@ func (e *Engine) computeSummary(agentsWrapper struct {
 
 func recognizedRole(labels, configured []string) string {
 	roles := make(map[string]bool, len(configured))
-	for _, role := range configured { roles[strings.ToLower(strings.TrimSpace(role))] = true }
+	for _, role := range configured {
+		roles[strings.ToLower(strings.TrimSpace(role))] = true
+	}
 	var role string
 	count := 0
 	for _, label := range labels {
-		if !roles[label] { continue }
+		if !roles[label] {
+			continue
+		}
 		count++
-		if role != "" && role != label { return "" }
+		if role != "" && role != label {
+			return ""
+		}
 		role = label
 	}
-	if count != 1 { return "" }
+	if count != 1 {
+		return ""
+	}
 	return role
 }
 
@@ -1298,7 +1306,9 @@ func (e *Engine) executeActMode(stateRoot, leaseRoot string, s *Summary, agentsJ
 	if s.StaleInProgress > 0 {
 		reclaimHook := e.ReclaimHook
 		for _, sc := range s.StaleCards {
-			if err := e.checkHold(sc.Ref, sc.Lane, sc.Owner); err != nil { return err }
+			if err := e.checkHold(sc.Ref, sc.Lane, sc.Owner); err != nil {
+				return err
+			}
 			if reclaimHook != "" {
 				cmd := exec.Command(reclaimHook,
 					"--ref", sc.Ref,
@@ -1337,11 +1347,19 @@ func (e *Engine) executeActMode(stateRoot, leaseRoot string, s *Summary, agentsJ
 		blocked := make([]string, 0, len(s.BlockedTargets))
 		for _, target := range s.BlockedTargets {
 			held, err := e.targetHeld(context.Background(), target.Lane, target.Task)
-			if err != nil { held = true }
-			if !held { blocked = append(blocked, target.Task) }
+			if err != nil {
+				held = true
+			}
+			if !held {
+				blocked = append(blocked, target.Task)
+			}
 		}
-		if e.HoldReader == nil { blocked = append(blocked, s.BlockedRefs...) }
-		if e.HoldReader != nil && len(blocked) == 0 { return nil }
+		if e.HoldReader == nil {
+			blocked = append(blocked, s.BlockedRefs...)
+		}
+		if e.HoldReader != nil && len(blocked) == 0 {
+			return nil
+		}
 		if e.RoutingHook == "" {
 			return fmt.Errorf("blocked-only queue requires routing hook")
 		}
@@ -1357,12 +1375,12 @@ func (e *Engine) executeActMode(stateRoot, leaseRoot string, s *Summary, agentsJ
 		}
 
 		var routingResult struct {
-			ReplacementRef string `json:"replacement_ref"`
+			ReplacementRef  string `json:"replacement_ref"`
 			ReplacementRef2 string `json:"replacementRef"`
-			Lane           string `json:"lane"`
-			AssignedLane   string `json:"assigned_lane"`
-			Owner          string `json:"owner"`
-			Assignee       string `json:"assignee"`
+			Lane            string `json:"lane"`
+			AssignedLane    string `json:"assigned_lane"`
+			Owner           string `json:"owner"`
+			Assignee        string `json:"assignee"`
 		}
 		json.Unmarshal(out, &routingResult)
 
@@ -1401,7 +1419,9 @@ func (e *Engine) executeActMode(stateRoot, leaseRoot string, s *Summary, agentsJ
 	// 3. Kick settled lanes with dispatchable queue.
 	if s.Dispatchable > 0 && len(s.Settled) > 0 {
 		for _, settled := range s.Settled {
-			if err := e.checkLaneHold(settled.Name, settled.Name); err != nil { return err }
+			if err := e.checkLaneHold(settled.Name, settled.Name); err != nil {
+				return err
+			}
 			cmd := exec.Command(e.kickBin(), "--no-raise", "--quiet", "--reason", "lifecycle: dispatchable queue", settled.Name)
 			if out, err := cmd.CombinedOutput(); err != nil {
 				return fmt.Errorf("kick failed for %s: %w\n%s", settled.Name, err, string(out))
@@ -1572,12 +1592,12 @@ func (e *Engine) executeActMode(stateRoot, leaseRoot string, s *Summary, agentsJ
 			releaseEventFile(leaseRoot, eventID+".pending.json", claimJSON)
 			s.EventCompleted = true
 			s.Actions = append(s.Actions, ActionLogEntry{
-				Action:     "review-dispatch",
-				EventID:    eventID,
-				Producer:   producer,
-				Reviewer:   event.Reviewer,
-				Task:       task,
-				Observed:   "interactive-working",
+				Action:   "review-dispatch",
+				EventID:  eventID,
+				Producer: producer,
+				Reviewer: event.Reviewer,
+				Task:     task,
+				Observed: "interactive-working",
 			}, ActionLogEntry{
 				Action:   "next-owned-task",
 				EventID:  eventID,
@@ -1600,36 +1620,61 @@ func (e *Engine) checkLaneHold(lane, owner string) error {
 }
 
 func (e *Engine) checkHoldIdentity(identity HoldIdentity) error {
-	if e.HoldReader == nil { return nil }
-	if e.HoldIdentity != nil { identity = e.HoldIdentity(identity.Task, identity.Lane, identity.Owner) }
+	if e.HoldReader == nil {
+		return nil
+	}
+	if e.HoldIdentity != nil {
+		identity = e.HoldIdentity(identity.Task, identity.Lane, identity.Owner)
+	}
 	held, err := e.isHeld(identity)
-	if err != nil { return err }
-	if held { return fmt.Errorf("lifecycle: held identity denied") }
+	if err != nil {
+		return err
+	}
+	if held {
+		return fmt.Errorf("lifecycle: held identity denied")
+	}
 	return nil
 }
 
 func (e *Engine) isHeld(identity HoldIdentity) (bool, error) {
-	if e.HoldReader == nil { return false, nil }
-	if !identity.valid() { return false, fmt.Errorf("lifecycle: hold authority denied ambiguous exact identity") }
-	generation := int64(1)
-	if source, ok := e.HoldReader.(interface{ CurrentGeneration(context.Context, HoldIdentity) (int64, error) }); ok {
-		var err error
-		generation, err = source.CurrentGeneration(context.Background(), identity)
-		if err != nil { return false, err }
+	if e.HoldReader == nil {
+		return false, nil
+	}
+	if !identity.valid() {
+		return false, fmt.Errorf("lifecycle: hold authority denied ambiguous exact identity")
+	}
+	source, ok := e.HoldReader.(interface {
+		CurrentGeneration(context.Context, HoldIdentity) (int64, error)
+	})
+	if !ok {
+		return false, fmt.Errorf("lifecycle: hold generation source is required")
+	}
+	generation, err := source.CurrentGeneration(context.Background(), identity)
+	if err != nil || generation <= 0 {
+		if err != nil {
+			return false, err
+		}
+		return false, fmt.Errorf("lifecycle: invalid hold generation %d", generation)
 	}
 	decision, err := e.HoldReader.Check(context.Background(), identity, generation)
-	if err != nil { return false, fmt.Errorf("lifecycle: hold authority: %w", err) }
+	if err != nil {
+		return false, fmt.Errorf("lifecycle: hold authority: %w", err)
+	}
 	return decision.Held, nil
 }
 
 func (e *Engine) holdBlocks(ctx context.Context, lane, owner, task string) bool {
-	if e.HoldReader == nil { return false }
+	if e.HoldReader == nil {
+		return false
+	}
 	held, err := e.targetHeld(ctx, lane, task)
 	return err != nil || held
 }
 
 func (e *Engine) targetHeld(ctx context.Context, role, task string) (bool, error) {
-	if strings.TrimSpace(role) == "" || strings.TrimSpace(task) == "" { return true, nil }
+	if strings.TrimSpace(role) == "" || strings.TrimSpace(task) == "" {
+		return true, nil
+	}
 	identities := []HoldIdentity{
 		{Repository: repoRoot(), Owner: role, Lane: role, Scope: "lane"},
 		{Repository: repoRoot(), Owner: role, Lane: role, Task: task, Scope: "task"},
@@ -1639,8 +1684,12 @@ func (e *Engine) targetHeld(ctx context.Context, role, task string) (bool, error
 	}
 	for _, identity := range identities {
 		held, err := e.isHeld(identity)
-		if err != nil { return true, err }
-		if held { return true, nil }
+		if err != nil {
+			return true, err
+		}
+		if held {
+			return true, nil
+		}
 	}
 	return false, nil
 }
@@ -1672,15 +1721,15 @@ func (e *Engine) authoritativeReadback(action, refOrRefs, replacementRef, lane, 
 
 func (e *Engine) verifyReclaimReadback(ref string, payload []byte) bool {
 	var card struct {
-		Ref          string `json:"ref"`
-		ID           string `json:"id"`
-		Key          string `json:"key"`
-		Status       string `json:"status"`
-		Column       string `json:"column"`
-		State        string `json:"state"`
-		Owner        string `json:"owner"`
-		Assignee     string `json:"assignee"`
-		AssignedTo   string `json:"assigned_to"`
+		Ref           string `json:"ref"`
+		ID            string `json:"id"`
+		Key           string `json:"key"`
+		Status        string `json:"status"`
+		Column        string `json:"column"`
+		State         string `json:"state"`
+		Owner         string `json:"owner"`
+		Assignee      string `json:"assignee"`
+		AssignedTo    string `json:"assigned_to"`
 		AssignedAgent string `json:"assignedAgent"`
 	}
 	if err := json.Unmarshal(payload, &card); err != nil {
@@ -1722,20 +1771,20 @@ func (e *Engine) verifyReclaimReadback(ref string, payload []byte) bool {
 func (e *Engine) verifyRoutingReadback(payload []byte, replacementRef, lane, owner string) bool {
 	// Try direct card first.
 	var card struct {
-		Ref          string   `json:"ref"`
-		ID           string   `json:"id"`
-		Key          string   `json:"key"`
-		Status       string   `json:"status"`
-		Column       string   `json:"column"`
-		State        string   `json:"state"`
-		Owner        string   `json:"owner"`
-		Assignee     string   `json:"assignee"`
-		AssignedTo   string   `json:"assigned_to"`
-		AssignedAgent string  `json:"assignedAgent"`
-		Lane         string   `json:"lane"`
-		AssignedLane string   `json:"assigned_lane"`
-		Labels       []any    `json:"labels"`
-		Blocked      *bool    `json:"blocked"`
+		Ref           string `json:"ref"`
+		ID            string `json:"id"`
+		Key           string `json:"key"`
+		Status        string `json:"status"`
+		Column        string `json:"column"`
+		State         string `json:"state"`
+		Owner         string `json:"owner"`
+		Assignee      string `json:"assignee"`
+		AssignedTo    string `json:"assigned_to"`
+		AssignedAgent string `json:"assignedAgent"`
+		Lane          string `json:"lane"`
+		AssignedLane  string `json:"assigned_lane"`
+		Labels        []any  `json:"labels"`
+		Blocked       *bool  `json:"blocked"`
 	}
 	if err := json.Unmarshal(payload, &card); err == nil {
 		return e.checkRoutingCard(card, replacementRef, lane, owner)
@@ -1743,37 +1792,37 @@ func (e *Engine) verifyRoutingReadback(payload []byte, replacementRef, lane, own
 
 	// Try array or wrapper.
 	var wrapper struct {
-		Tasks  []struct {
-			Ref          string   `json:"ref"`
-			ID           string   `json:"id"`
-			Key          string   `json:"key"`
-			Status       string   `json:"status"`
-			Column       string   `json:"column"`
-			State        string   `json:"state"`
-			Owner        string   `json:"owner"`
-			Assignee     string   `json:"assignee"`
-			AssignedTo   string   `json:"assigned_to"`
-			AssignedAgent string  `json:"assignedAgent"`
-			Lane         string   `json:"lane"`
-			AssignedLane string   `json:"assigned_lane"`
-			Labels       []any    `json:"labels"`
-			Blocked      *bool    `json:"blocked"`
+		Tasks []struct {
+			Ref           string `json:"ref"`
+			ID            string `json:"id"`
+			Key           string `json:"key"`
+			Status        string `json:"status"`
+			Column        string `json:"column"`
+			State         string `json:"state"`
+			Owner         string `json:"owner"`
+			Assignee      string `json:"assignee"`
+			AssignedTo    string `json:"assigned_to"`
+			AssignedAgent string `json:"assignedAgent"`
+			Lane          string `json:"lane"`
+			AssignedLane  string `json:"assigned_lane"`
+			Labels        []any  `json:"labels"`
+			Blocked       *bool  `json:"blocked"`
 		} `json:"tasks"`
 		Items []struct {
-			Ref          string   `json:"ref"`
-			ID           string   `json:"id"`
-			Key          string   `json:"key"`
-			Status       string   `json:"status"`
-			Column       string   `json:"column"`
-			State        string   `json:"state"`
-			Owner        string   `json:"owner"`
-			Assignee     string   `json:"assignee"`
-			AssignedTo   string   `json:"assigned_to"`
-			AssignedAgent string  `json:"assignedAgent"`
-			Lane         string   `json:"lane"`
-			AssignedLane string   `json:"assigned_lane"`
-			Labels       []any    `json:"labels"`
-			Blocked      *bool    `json:"blocked"`
+			Ref           string `json:"ref"`
+			ID            string `json:"id"`
+			Key           string `json:"key"`
+			Status        string `json:"status"`
+			Column        string `json:"column"`
+			State         string `json:"state"`
+			Owner         string `json:"owner"`
+			Assignee      string `json:"assignee"`
+			AssignedTo    string `json:"assigned_to"`
+			AssignedAgent string `json:"assignedAgent"`
+			Lane          string `json:"lane"`
+			AssignedLane  string `json:"assigned_lane"`
+			Labels        []any  `json:"labels"`
+			Blocked       *bool  `json:"blocked"`
 		} `json:"items"`
 	}
 	if err := json.Unmarshal(payload, &wrapper); err != nil {
@@ -1785,20 +1834,20 @@ func (e *Engine) verifyRoutingReadback(payload []byte, replacementRef, lane, own
 	}
 	for _, item := range items {
 		if e.checkRoutingCard(struct {
-			Ref          string  `json:"ref"`
-			ID           string  `json:"id"`
-			Key          string  `json:"key"`
-			Status       string  `json:"status"`
-			Column       string  `json:"column"`
-			State        string  `json:"state"`
-			Owner        string  `json:"owner"`
-			Assignee     string  `json:"assignee"`
-			AssignedTo   string  `json:"assigned_to"`
+			Ref           string `json:"ref"`
+			ID            string `json:"id"`
+			Key           string `json:"key"`
+			Status        string `json:"status"`
+			Column        string `json:"column"`
+			State         string `json:"state"`
+			Owner         string `json:"owner"`
+			Assignee      string `json:"assignee"`
+			AssignedTo    string `json:"assigned_to"`
 			AssignedAgent string `json:"assignedAgent"`
-			Lane         string  `json:"lane"`
-			AssignedLane string  `json:"assigned_lane"`
-			Labels       []any   `json:"labels"`
-			Blocked      *bool   `json:"blocked"`
+			Lane          string `json:"lane"`
+			AssignedLane  string `json:"assigned_lane"`
+			Labels        []any  `json:"labels"`
+			Blocked       *bool  `json:"blocked"`
 		}(item), replacementRef, lane, owner) {
 			return true
 		}
@@ -1807,20 +1856,20 @@ func (e *Engine) verifyRoutingReadback(payload []byte, replacementRef, lane, own
 }
 
 func (e *Engine) checkRoutingCard(card struct {
-	Ref          string  `json:"ref"`
-	ID           string  `json:"id"`
-	Key          string  `json:"key"`
-	Status       string  `json:"status"`
-	Column       string  `json:"column"`
-	State        string  `json:"state"`
-	Owner        string  `json:"owner"`
-	Assignee     string  `json:"assignee"`
-	AssignedTo   string  `json:"assigned_to"`
+	Ref           string `json:"ref"`
+	ID            string `json:"id"`
+	Key           string `json:"key"`
+	Status        string `json:"status"`
+	Column        string `json:"column"`
+	State         string `json:"state"`
+	Owner         string `json:"owner"`
+	Assignee      string `json:"assignee"`
+	AssignedTo    string `json:"assigned_to"`
 	AssignedAgent string `json:"assignedAgent"`
-	Lane         string  `json:"lane"`
-	AssignedLane string  `json:"assigned_lane"`
-	Labels       []any   `json:"labels"`
-	Blocked      *bool   `json:"blocked"`
+	Lane          string `json:"lane"`
+	AssignedLane  string `json:"assigned_lane"`
+	Labels        []any  `json:"labels"`
+	Blocked       *bool  `json:"blocked"`
 }, replacementRef, lane, owner string) bool {
 	ref := card.Ref
 	if ref == "" {
@@ -1899,13 +1948,13 @@ func (e *Engine) verifyAgentWorking(agentList []byte, name string) bool {
 	var wrapper struct {
 		Result struct {
 			Agents []struct {
-				Name      string `json:"name"`
-				Label     string `json:"label"`
-				Status    string `json:"status"`
-				AgentStatus string `json:"agent_status"`
-				Interactive    *bool `json:"interactive"`
-				InteractiveReady *bool `json:"interactive_ready"`
-				InteractiveReady2 *bool `json:"interactiveReady"`
+				Name              string `json:"name"`
+				Label             string `json:"label"`
+				Status            string `json:"status"`
+				AgentStatus       string `json:"agent_status"`
+				Interactive       *bool  `json:"interactive"`
+				InteractiveReady  *bool  `json:"interactive_ready"`
+				InteractiveReady2 *bool  `json:"interactiveReady"`
 			} `json:"agents"`
 		} `json:"result"`
 	}

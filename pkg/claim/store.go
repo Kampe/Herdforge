@@ -191,6 +191,10 @@ type LeaseStore interface {
 	Close() error
 }
 
+type AtomicLeaseStore interface {
+	AcquireWithIdentity(context.Context, LeaseKey, string, string, string, string, string, string, time.Time, time.Duration) (*Lease, error)
+}
+
 // ClaimConflictError reports why an Acquire lost the race, with enough
 // detail for callers/dashboards to explain the block: current owner,
 // generation, and expiry.

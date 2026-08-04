@@ -263,7 +263,21 @@ func (d *Dispatcher) ownershipClaimer() (deps.OwnershipClaimer, error) {
 		providerType = d.Config.TaskProvider.Type
 		project = d.Config.TaskProvider.ProjectID
 	}
-	return deps.OpenLeaseOwnership(deps.ResolveLaunchLeasePath(root), repo, providerType, project)
+	ownership, err := deps.OpenLeaseOwnership(deps.ResolveLaunchLeasePath(root), repo, providerType, project)
+	if err != nil {
+		return nil, err
+	}
+	if d.Config != nil {
+		ownership.LaneResolver = func(role string) (string, error) {
+			for _, lane := range d.Config.Lanes {
+				if lane.Role == role {
+					return lane.Name, nil
+				}
+			}
+			return "", fmt.Errorf("unknown configured role %q", role)
+		}
+	}
+	return ownership, nil
 }
 
 func (d *Dispatcher) launcher() HerdrLauncher {

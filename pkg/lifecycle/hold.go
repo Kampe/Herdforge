@@ -12,14 +12,20 @@ import (
 )
 
 var (
-	ErrHoldMissing       = errors.New("hold authority state is missing")
-	ErrHoldCorrupt       = errors.New("hold authority state is corrupt")
-	ErrHoldDenied        = errors.New("hold authority denied action")
-	ErrHoldStale         = errors.New("hold authority generation is stale")
-	ErrHoldConflict      = errors.New("hold authority generation conflicts")
-	ErrHoldReleaseFailed = errors.New("hold authority expiry release failed")
-	ErrActiveTaskUnknown = errors.New("active task binding is unknown or ambiguous")
+	ErrHoldMissing              = errors.New("hold authority state is missing")
+	ErrHoldCorrupt              = errors.New("hold authority state is corrupt")
+	ErrHoldDenied               = errors.New("hold authority denied action")
+	ErrHoldStale                = errors.New("hold authority generation is stale")
+	ErrHoldConflict             = errors.New("hold authority generation conflicts")
+	ErrHoldReleaseFailed        = errors.New("hold authority expiry release failed")
+	ErrHoldAuthorityUnavailable = errors.New("hold authority unavailable")
+	ErrActiveTaskUnknown        = errors.New("active task binding is unknown or ambiguous")
 )
+
+type HoldBlockedError struct{ Reason string }
+
+func (e *HoldBlockedError) Error() string { return "held target: " + e.Reason }
+func (e *HoldBlockedError) Unwrap() error { return ErrHoldDenied }
 
 // HoldIdentity is the complete identity fence used by every side-effecting
 // caller. Empty fields are never wildcard matches.
@@ -68,20 +74,22 @@ func CheckLaneAndTaskHold(ctx context.Context, reader HoldReader, resolver Activ
 		return fmt.Errorf("%w: authority and resolver are required", ErrActiveTaskUnknown)
 	}
 	check := func(identity HoldIdentity) error {
-		gen := int64(1)
-		if generation != nil {
-			var err error
-			gen, err = generation(ctx, identity)
-			if err != nil {
-				return err
-			}
+		if generation == nil {
+			return fmt.Errorf("%w: current generation source is required", ErrHoldAuthorityUnavailable)
+		}
+		gen, err := generation(ctx, identity)
+		if err != nil {
+			return fmt.Errorf("%w: generation read: %v", ErrHoldAuthorityUnavailable, err)
+		}
+		if gen <= 0 {
+			return fmt.Errorf("%w: invalid current generation %d", ErrHoldAuthorityUnavailable, gen)
 		}
 		decision, err := reader.Check(ctx, identity, gen)
 		if err != nil {
-			return err
+			return fmt.Errorf("%w: read: %v", ErrHoldAuthorityUnavailable, err)
 		}
 		if decision.Held {
-			return fmt.Errorf("held target: %s (%s)", decision.Reason, decision.Code)
+			return &HoldBlockedError{Reason: fmt.Sprintf("%s (%s)", decision.Reason, decision.Code)}
 		}
 		return nil
 	}
@@ -109,6 +117,8 @@ type HoldAuthority struct {
 	db  *sql.DB
 	now func() time.Time
 }
+
+type authorityTxKey struct{}
 
 // CanonicalStatePath is the one runtime state location shared by CLI,
 // dispatch, daemon, lifecycle, kick, claim, and reap. The caller supplies
@@ -172,6 +182,61 @@ func newHoldAuthority(path string, now func() time.Time) (*HoldAuthority, error)
 	return a, nil
 }
 
+type holdSQL interface {
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}
+
+func (a *HoldAuthority) withImmediate(ctx context.Context, reason string, action func(context.Context, holdSQL) error) error {
+	conn, err := a.db.Conn(ctx)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	if _, err := conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
+		return fmt.Errorf("begin immediate %s: %w", reason, err)
+	}
+	if err := action(ctx, conn); err != nil {
+		_, _ = conn.ExecContext(ctx, "ROLLBACK")
+		return err
+	}
+	if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
+		_, _ = conn.ExecContext(ctx, "ROLLBACK")
+		return err
+	}
+	return nil
+}
+
+func (a *HoldAuthority) WithUnheldTransition(ctx context.Context, identities []HoldIdentity, action func() error) error {
+	if action == nil || len(identities) == 0 {
+		return fmt.Errorf("hold transition requires exact identities and callback")
+	}
+	return a.withImmediate(ctx, "unheld transition", func(ctx context.Context, q holdSQL) error {
+		for _, identity := range identities {
+			if !identity.valid() {
+				return fmt.Errorf("%w: ambiguous transition identity", ErrActiveTaskUnknown)
+			}
+			row, exists, err := readHoldTx(ctx, q, identity)
+			if err != nil {
+				return err
+			}
+			if !exists {
+				continue
+			}
+			if row.Held && row.ExpiresAt != nil && !a.now().UTC().Before(*row.ExpiresAt) {
+				if _, err := a.releaseIn(ctx, q, identity, "hold-expiry", "hold expired", "expired", row.Generation); err != nil {
+					return fmt.Errorf("%w: %v", ErrHoldReleaseFailed, err)
+				}
+				continue
+			}
+			if row.Held {
+				return &HoldBlockedError{Reason: row.Reason + " (" + row.Code + ")"}
+			}
+		}
+		return action()
+	})
+}
+
 func (a *HoldAuthority) Close() error { return a.db.Close() }
 
 func (a *HoldAuthority) migrate() error {
@@ -218,6 +283,9 @@ func ensureHoldColumn(db *sql.DB, table, column string) error {
 			return fmt.Errorf("inspect %s schema row: %w", table, err)
 		}
 		if name == column {
+			if !strings.EqualFold(strings.TrimSpace(typ), "TEXT") || notnull != 1 || !dflt.Valid || strings.Trim(strings.TrimSpace(dflt.String), "'\"") != "task" {
+				return fmt.Errorf("incompatible %s.%s schema", table, column)
+			}
 			found = true
 		}
 	}
@@ -247,15 +315,20 @@ func validateHold(identity HoldIdentity, actor, reason, code string, generation 
 }
 
 func (a *HoldAuthority) Hold(ctx context.Context, identity HoldIdentity, actor, reason, code string, generation int64, expires *time.Time) (HoldRecord, error) {
+	var record HoldRecord
+	err := a.withImmediate(ctx, "hold", func(ctx context.Context, q holdSQL) error {
+		var err error
+		record, err = a.holdIn(ctx, q, identity, actor, reason, code, generation, expires)
+		return err
+	})
+	return record, err
+}
+
+func (a *HoldAuthority) holdIn(ctx context.Context, q holdSQL, identity HoldIdentity, actor, reason, code string, generation int64, expires *time.Time) (HoldRecord, error) {
 	if err := validateHold(identity, actor, reason, code, generation); err != nil {
 		return HoldRecord{}, err
 	}
-	tx, err := a.db.BeginTx(ctx, nil)
-	if err != nil {
-		return HoldRecord{}, fmt.Errorf("hold begin: %w", err)
-	}
-	defer tx.Rollback()
-	current, exists, err := readHoldTx(ctx, tx, identity)
+	current, exists, err := readHoldTx(ctx, q, identity)
 	if err != nil {
 		return HoldRecord{}, err
 	}
@@ -280,9 +353,10 @@ func (a *HoldAuthority) Hold(ctx context.Context, identity HoldIdentity, actor, 
 	}
 	now := a.now().UTC()
 	if !exists {
-		_, err = tx.ExecContext(ctx, `INSERT INTO lifecycle_hold_state(repository,owner,lane,task,scope,actor,reason,code,generation,created_at,expires_at,held,released_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,1,NULL)`, identity.Repository, identity.Owner, identity.Lane, identity.Task, identity.Scope, actor, reason, code, generation, now, expires)
+		result, insertErr := q.ExecContext(ctx, `INSERT INTO lifecycle_hold_state(repository,owner,lane,task,scope,actor,reason,code,generation,created_at,expires_at,held,released_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,1,NULL)`, identity.Repository, identity.Owner, identity.Lane, identity.Task, identity.Scope, actor, reason, code, generation, now, expires)
+		err = exactOne(result, insertErr)
 	} else {
-		result, updateErr := tx.ExecContext(ctx, `UPDATE lifecycle_hold_state SET actor=?,reason=?,code=?,generation=?,created_at=?,expires_at=?,held=1,released_at=NULL WHERE repository=? AND owner=? AND lane=? AND task=? AND scope=? AND generation=?`, actor, reason, code, generation, now, expires, identity.Repository, identity.Owner, identity.Lane, identity.Task, identity.Scope, current.Generation)
+		result, updateErr := q.ExecContext(ctx, `UPDATE lifecycle_hold_state SET actor=?,reason=?,code=?,generation=?,created_at=?,expires_at=?,held=1,released_at=NULL WHERE repository=? AND owner=? AND lane=? AND task=? AND scope=? AND generation=?`, actor, reason, code, generation, now, expires, identity.Repository, identity.Owner, identity.Lane, identity.Task, identity.Scope, current.Generation)
 		if updateErr == nil {
 			var n int64
 			n, updateErr = result.RowsAffected()
@@ -295,25 +369,28 @@ func (a *HoldAuthority) Hold(ctx context.Context, identity HoldIdentity, actor, 
 	if err != nil {
 		return HoldRecord{}, fmt.Errorf("write hold state: %w", err)
 	}
-	if _, err = tx.ExecContext(ctx, `INSERT INTO lifecycle_hold_events(repository,owner,lane,task,scope,generation,intent,actor,reason,code,created_at,expires_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`, identity.Repository, identity.Owner, identity.Lane, identity.Task, identity.Scope, generation, "hold", actor, reason, code, now, expires); err != nil {
+	result, insertErr := q.ExecContext(ctx, `INSERT INTO lifecycle_hold_events(repository,owner,lane,task,scope,generation,intent,actor,reason,code,created_at,expires_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`, identity.Repository, identity.Owner, identity.Lane, identity.Task, identity.Scope, generation, "hold", actor, reason, code, now, expires)
+	if err = exactOne(result, insertErr); err != nil {
 		return HoldRecord{}, fmt.Errorf("record hold event: %w", err)
-	}
-	if err = tx.Commit(); err != nil {
-		return HoldRecord{}, fmt.Errorf("commit hold: %w", err)
 	}
 	return HoldRecord{HoldIdentity: identity, Actor: actor, Reason: reason, Code: code, Generation: generation, CreatedAt: now, ExpiresAt: cloneTime(expires), Held: true}, nil
 }
 
 func (a *HoldAuthority) Release(ctx context.Context, identity HoldIdentity, actor, reason, code string, generation int64) (HoldRecord, error) {
+	var record HoldRecord
+	err := a.withImmediate(ctx, "release", func(ctx context.Context, q holdSQL) error {
+		var err error
+		record, err = a.releaseIn(ctx, q, identity, actor, reason, code, generation)
+		return err
+	})
+	return record, err
+}
+
+func (a *HoldAuthority) releaseIn(ctx context.Context, q holdSQL, identity HoldIdentity, actor, reason, code string, generation int64) (HoldRecord, error) {
 	if err := validateHold(identity, actor, reason, code, generation); err != nil {
 		return HoldRecord{}, err
 	}
-	tx, err := a.db.BeginTx(ctx, nil)
-	if err != nil {
-		return HoldRecord{}, fmt.Errorf("release begin: %w", err)
-	}
-	defer tx.Rollback()
-	current, exists, err := readHoldTx(ctx, tx, identity)
+	current, exists, err := readHoldTx(ctx, q, identity)
 	if err != nil {
 		return HoldRecord{}, err
 	}
@@ -333,7 +410,7 @@ func (a *HoldAuthority) Release(ctx context.Context, identity HoldIdentity, acto
 		return HoldRecord{}, fmt.Errorf("%w: release payload differs", ErrHoldConflict)
 	}
 	now := a.now().UTC()
-	result, updateErr := tx.ExecContext(ctx, `UPDATE lifecycle_hold_state SET held=0,released_at=?,actor=?,reason=?,code=? WHERE repository=? AND owner=? AND lane=? AND task=? AND scope=? AND generation=? AND held=1`, now, actor, reason, code, identity.Repository, identity.Owner, identity.Lane, identity.Task, identity.Scope, generation)
+	result, updateErr := q.ExecContext(ctx, `UPDATE lifecycle_hold_state SET held=0,released_at=?,actor=?,reason=?,code=? WHERE repository=? AND owner=? AND lane=? AND task=? AND scope=? AND generation=? AND held=1`, now, actor, reason, code, identity.Repository, identity.Owner, identity.Lane, identity.Task, identity.Scope, generation)
 	if updateErr == nil {
 		var n int64
 		n, updateErr = result.RowsAffected()
@@ -344,16 +421,28 @@ func (a *HoldAuthority) Release(ctx context.Context, identity HoldIdentity, acto
 	if updateErr != nil {
 		return HoldRecord{}, fmt.Errorf("release state: %w", updateErr)
 	}
-	if _, err = tx.ExecContext(ctx, `INSERT INTO lifecycle_hold_events(repository,owner,lane,task,scope,generation,intent,actor,reason,code,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)`, identity.Repository, identity.Owner, identity.Lane, identity.Task, identity.Scope, generation, "release", actor, reason, code, now); err != nil {
+	result, insertErr := q.ExecContext(ctx, `INSERT INTO lifecycle_hold_events(repository,owner,lane,task,scope,generation,intent,actor,reason,code,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)`, identity.Repository, identity.Owner, identity.Lane, identity.Task, identity.Scope, generation, "release", actor, reason, code, now)
+	if err = exactOne(result, insertErr); err != nil {
 		return HoldRecord{}, fmt.Errorf("record release event: %w", err)
-	}
-	if err = tx.Commit(); err != nil {
-		return HoldRecord{}, fmt.Errorf("commit release: %w", err)
 	}
 	return HoldRecord{HoldIdentity: identity, Actor: actor, Reason: reason, Code: code, Generation: generation, CreatedAt: current.CreatedAt, ExpiresAt: current.ExpiresAt, Held: false, ReleasedAt: &now}, nil
 }
 
-func readHoldTx(ctx context.Context, tx *sql.Tx, identity HoldIdentity) (HoldRecord, bool, error) {
+func exactOne(result sql.Result, err error) error {
+	if err != nil {
+		return err
+	}
+	n, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n != 1 {
+		return fmt.Errorf("expected one affected row, got %d", n)
+	}
+	return nil
+}
+
+func readHoldTx(ctx context.Context, tx holdSQL, identity HoldIdentity) (HoldRecord, bool, error) {
 	var r HoldRecord
 	var exp, rel sql.NullTime
 	err := tx.QueryRowContext(ctx, `SELECT repository,owner,lane,task,scope,actor,reason,code,generation,created_at,expires_at,held,released_at FROM lifecycle_hold_state WHERE repository=? AND owner=? AND lane=? AND task=? AND scope=?`, identity.Repository, identity.Owner, identity.Lane, identity.Task, identity.Scope).Scan(&r.Repository, &r.Owner, &r.Lane, &r.Task, &r.Scope, &r.Actor, &r.Reason, &r.Code, &r.Generation, &r.CreatedAt, &exp, &r.Held, &rel)
@@ -392,10 +481,10 @@ func cloneTime(t *time.Time) *time.Time {
 // valid identity with no active row is explicitly unheld.
 func (a *HoldAuthority) Check(ctx context.Context, identity HoldIdentity, generation int64) (HoldDecision, error) {
 	if !identity.valid() {
-		return HoldDecision{}, fmt.Errorf("%w: ambiguous identity", ErrHoldDenied)
+		return HoldDecision{}, fmt.Errorf("%w: ambiguous identity", ErrActiveTaskUnknown)
 	}
 	if generation <= 0 {
-		return HoldDecision{}, fmt.Errorf("%w: positive generation is required", ErrHoldStale)
+		return HoldDecision{}, fmt.Errorf("%w: positive generation is required", ErrHoldAuthorityUnavailable)
 	}
 	var actor, reason, code string
 	var currentGen int64
@@ -406,7 +495,7 @@ func (a *HoldAuthority) Check(ctx context.Context, identity HoldIdentity, genera
 		return HoldDecision{Held: false, Generation: generation, Reason: "no active hold", Code: "unheld"}, nil
 	}
 	if err != nil {
-		return HoldDecision{}, fmt.Errorf("%w: read: %v", ErrHoldDenied, err)
+		return HoldDecision{}, fmt.Errorf("%w: read: %v", ErrHoldAuthorityUnavailable, err)
 	}
 	if actor == "" || reason == "" || code == "" || currentGen <= 0 {
 		return HoldDecision{}, fmt.Errorf("%w: invalid row", ErrHoldCorrupt)
@@ -415,7 +504,12 @@ func (a *HoldAuthority) Check(ctx context.Context, identity HoldIdentity, genera
 		return HoldDecision{}, fmt.Errorf("%w: current=%d got=%d", ErrHoldStale, currentGen, generation)
 	}
 	if held && expires.Valid && !a.now().UTC().Before(expires.Time) {
-		if _, err := a.Release(ctx, identity, "hold-expiry", "hold expired", "expired", currentGen); err != nil {
+		var expiryErr error
+		err := a.withImmediate(ctx, "hold-expiry", func(ctx context.Context, q holdSQL) error {
+			_, expiryErr = a.releaseIn(ctx, q, identity, "hold-expiry", "hold expired", "expired", currentGen)
+			return expiryErr
+		})
+		if err != nil {
 			return HoldDecision{}, fmt.Errorf("%w: %v", ErrHoldReleaseFailed, err)
 		}
 		return HoldDecision{Held: false, Generation: currentGen, Reason: "expired", Code: "expired"}, nil
@@ -427,7 +521,7 @@ func (a *HoldAuthority) Check(ctx context.Context, identity HoldIdentity, genera
 // starts at generation one; callers still pass that positive value to Check.
 func (a *HoldAuthority) CurrentGeneration(ctx context.Context, identity HoldIdentity) (int64, error) {
 	if !identity.valid() {
-		return 0, fmt.Errorf("%w: ambiguous identity", ErrHoldDenied)
+		return 0, fmt.Errorf("%w: ambiguous identity", ErrActiveTaskUnknown)
 	}
 	var generation int64
 	err := a.db.QueryRowContext(ctx, `SELECT generation FROM lifecycle_hold_state WHERE repository=? AND owner=? AND lane=? AND task=? AND scope=?`, identity.Repository, identity.Owner, identity.Lane, identity.Task, identity.Scope).Scan(&generation)
@@ -435,7 +529,7 @@ func (a *HoldAuthority) CurrentGeneration(ctx context.Context, identity HoldIden
 		return 1, nil
 	}
 	if err != nil {
-		return 0, fmt.Errorf("%w: generation read: %v", ErrHoldDenied, err)
+		return 0, fmt.Errorf("%w: generation read: %v", ErrHoldAuthorityUnavailable, err)
 	}
 	if generation <= 0 {
 		return 0, ErrHoldCorrupt

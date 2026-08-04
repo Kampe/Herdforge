@@ -30,11 +30,19 @@ func newTestStore(t *testing.T) *SQLiteLeaseStore {
 
 type heldClaimAuthority struct{}
 
+func (heldClaimAuthority) CurrentGeneration(context.Context, lifecycle.HoldIdentity) (int64, error) {
+	return 1, nil
+}
+
 func (heldClaimAuthority) Check(context.Context, lifecycle.HoldIdentity, int64) (lifecycle.HoldDecision, error) {
 	return lifecycle.HoldDecision{Held: true, Generation: 1, Reason: "maintenance", Code: "operator_hold"}, nil
 }
 
 type recordingClaimAuthority struct{ got lifecycle.HoldIdentity }
+
+func (*recordingClaimAuthority) CurrentGeneration(context.Context, lifecycle.HoldIdentity) (int64, error) {
+	return 1, nil
+}
 
 func (a *recordingClaimAuthority) Check(_ context.Context, id lifecycle.HoldIdentity, _ int64) (lifecycle.HoldDecision, error) {
 	a.got = id
@@ -46,16 +54,20 @@ func TestClaimUsesCanonicalTargetBeforeRandomLeaseOwner(t *testing.T) {
 	mgr := NewClaimManager(newTestStore(t), WithHoldReader(a))
 	_, err := mgr.Claim(context.Background(), ClaimRequest{
 		Key: testKey("FAC-TARGET"), OwnerID: "random-lease-owner", Role: "herd-smith", TaskRole: "herd-smith",
-		HoldIdentity: lifecycle.HoldIdentity{Repository: "Herdforge", Owner: "herd-smith", Lane: "herd-smith", Task: "FAC-TARGET", Scope: "task"},
+		HoldIdentities: []lifecycle.HoldIdentity{{Repository: "Herdforge", Owner: "herd-smith", Lane: "herd-smith", Scope: "lane"}, {Repository: "Herdforge", Owner: "herd-smith", Lane: "herd-smith", Task: "FAC-TARGET", Scope: "task"}},
 	})
-	if err != nil { t.Fatal(err) }
-	if a.got.Owner == "random-lease-owner" || a.got.Task != "FAC-TARGET" { t.Fatalf("authority saw lease owner or wrong target: %+v", a.got) }
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.got.Owner == "random-lease-owner" || a.got.Task != "FAC-TARGET" {
+		t.Fatalf("authority saw lease owner or wrong target: %+v", a.got)
+	}
 }
 
 func TestClaimHeldAuthorityDeniesBeforeReserve(t *testing.T) {
 	cap := newCountingCapacity()
 	mgr := NewClaimManager(newTestStore(t), WithCapacityCoordinator(cap), WithHoldReader(heldClaimAuthority{}))
-	_, err := mgr.Claim(context.Background(), ClaimRequest{Key: testKey("FAC-HOLD"), OwnerID: "w1", Role: "herd-smith", TaskRole: "herd-smith", HoldIdentity: lifecycle.HoldIdentity{Repository: "Herdforge", Owner: "herd-smith", Lane: "herd-smith", Task: "FAC-HOLD", Scope: "task"}})
+	_, err := mgr.Claim(context.Background(), ClaimRequest{Key: testKey("FAC-HOLD"), OwnerID: "w1", Role: "herd-smith", TaskRole: "herd-smith", HoldIdentities: []lifecycle.HoldIdentity{{Repository: "Herdforge", Owner: "herd-smith", Lane: "herd-smith", Scope: "lane"}, {Repository: "Herdforge", Owner: "herd-smith", Lane: "herd-smith", Task: "FAC-HOLD", Scope: "task"}}})
 	if err == nil {
 		t.Fatal("held claim must be denied")
 	}
