@@ -5,6 +5,8 @@ import (
 	"os"
 	"sync"
 	"testing"
+
+	"github.com/Kampe/Herdforge/pkg/router"
 )
 
 type sharedStore struct {
@@ -185,6 +187,10 @@ func TestAuthoritySamePacketActiveBindingMismatchRefused(t *testing.T) {
 		t.Fatal(err)
 	}
 	fields := []func(*Request){func(x *Request) { x.Name = "other" }, func(x *Request) { x.TabID = "other" }, func(x *Request) { x.PaneID = "other" }, func(x *Request) { x.HerdrSession = "other" }, func(x *Request) { x.CWD = "./other" }, func(x *Request) { x.ProcessIdentity = "pid=other" }}
+	fields = append(fields, func(x *Request) { x.Decision.Role = router.RoleForgeSmith }, func(x *Request) { x.Decision.Shape = "research" }, func(x *Request) { x.Decision.Provider = "other" }, func(x *Request) { x.Decision.Model = "other" }, func(x *Request) { x.Decision.Effort = "high" }, func(x *Request) {
+		x.Decision.Argv = append([]string(nil), x.Decision.Argv...)
+		x.Decision.Argv[0] = "other"
+	})
 	for i, mutate := range fields {
 		x := r
 		mutate(&x)
