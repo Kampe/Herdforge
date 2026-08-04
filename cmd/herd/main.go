@@ -634,7 +634,7 @@ func runPulse() {
 				fmt.Fprintf(os.Stderr, "failed to create herdr tab: %v\n", err)
 				os.Exit(1)
 			}
-			if err := herdr.AgentStartWithDecision(tabLabel, decision.Provider, tab.Pane.ID, taskLaunchRequest(decision, task.Ref)); err != nil {
+			if err := herdr.StartPreparedAgent(tab.ID, tabLabel, decision.Provider, tab.Pane.ID, taskLaunchRequest(decision, task.Ref)); err != nil {
 				fmt.Fprintf(os.Stderr, "failed to start agent: %v\n", err)
 				os.Exit(1)
 			}
@@ -986,7 +986,7 @@ func runStandingConfig(cfg *config.Config, herdrAvailable bool) error {
 			continue
 		}
 
-		if err := herdr.AgentStartWithDecision(tabLabel, decision.Provider, tab.Pane.ID, launch.Request{Decision: decision, TaskRef: lane.Name, Scope: router.ScopeLane}); err != nil {
+		if err := herdr.StartPreparedAgent(tab.ID, tabLabel, decision.Provider, tab.Pane.ID, launch.Request{Decision: decision, TaskRef: lane.Name, Scope: router.ScopeLane}); err != nil {
 			fmt.Fprintf(os.Stderr, "  failed to start agent for lane %s: %v\n", lane.Name, err)
 			failures = append(failures, fmt.Errorf("lane %s start agent: %w", lane.Name, err))
 			continue
@@ -1064,7 +1064,7 @@ func runUp() {
 
 	tabLabel := fmt.Sprintf("forge-%s", lane.Name)
 
-	if err := herdr.AgentStartWithDecision(tabLabel, decision.Provider, tab.Pane.ID, launch.Request{Decision: decision, TaskRef: lane.Name, Scope: router.ScopeLane}); err != nil {
+	if err := herdr.StartPreparedAgent(tab.ID, tabLabel, decision.Provider, tab.Pane.ID, launch.Request{Decision: decision, TaskRef: lane.Name, Scope: router.ScopeLane}); err != nil {
 		fmt.Fprintf(os.Stderr, "failed to start agent: %v\n", err)
 		os.Exit(1)
 	}
@@ -1272,7 +1272,7 @@ func runReview() {
 				fmt.Fprintf(os.Stderr, "failed to create herdr tab: %v\n", tabErr)
 				os.Exit(1)
 			}
-			if err := herdr.AgentStartWithDecision(tabLabel, decision.Provider, tab.Pane.ID, taskLaunchRequest(decision, task.Ref)); err != nil {
+			if err := herdr.StartPreparedAgent(tab.ID, tabLabel, decision.Provider, tab.Pane.ID, taskLaunchRequest(decision, task.Ref)); err != nil {
 				fmt.Fprintf(os.Stderr, "failed to start agent: %v\n", err)
 				os.Exit(1)
 			}
@@ -2486,7 +2486,7 @@ func runForgeE() error {
 					tabLabel = fmt.Sprintf("forge-%s-%s", lane.Name, task.Ref)
 					tab, tabErr := herdr.Tab(herdr.ResolveWorkspace("."), tabLabel, true)
 					if tabErr == nil {
-						if err := herdr.AgentStartWithDecision(tabLabel, decision.Provider, tab.Pane.ID, taskLaunchRequest(decision, task.Ref)); err != nil {
+						if err := herdr.StartPreparedAgent(tab.ID, tabLabel, decision.Provider, tab.Pane.ID, taskLaunchRequest(decision, task.Ref)); err != nil {
 							return fmt.Errorf("launch failed: %w", err)
 						}
 					} else {

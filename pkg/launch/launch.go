@@ -277,7 +277,8 @@ func Validate(req Request, sink Sink) error {
 		}
 	}
 	if provider == WorkerProvider {
-		if _, cfg, err := toolpolicy.Require(toolpolicy.Role(role), provider, argv); err != nil || !cfg.Valid() {
+		compiled, cfg, err := toolpolicy.Require(toolpolicy.Role(role), provider, argv)
+		if err != nil || !cfg.Valid() || !equalStrings(compiled, argv) {
 			return reject(req, sink, "codex launch lacks explicit CRG MCP isolation")
 		}
 	}

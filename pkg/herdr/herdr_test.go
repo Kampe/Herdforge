@@ -1,7 +1,9 @@
 package herdr
 
 import (
+	"encoding/json"
 	"errors"
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
@@ -9,6 +11,7 @@ import (
 
 	"github.com/Kampe/Herdforge/pkg/launch"
 	"github.com/Kampe/Herdforge/pkg/router"
+	"github.com/Kampe/Herdforge/pkg/toolchild"
 )
 
 func testLaunchRouter(t *testing.T) *router.SurfaceRouter {
@@ -121,6 +124,53 @@ func TestAgentStartBoundaryRejectsRawAndRequiresDecision(t *testing.T) {
 		t.Fatalf("argv calls = %v, want %v", calls, [][]string{want})
 	}
 }
+
+func TestPreparedStartUsesPaneProcessInfoAndExactRoutedOwner(t *testing.T) {
+	t.Setenv("HERD_LAUNCH_RECEIPTS", t.TempDir()+"/launch.jsonl")
+	oldRun := runHerdr
+	defer func() { runHerdr = oldRun }()
+	defer SetPIDParentReader(func(int) (int, error) { return 500, nil })()
+	defer SetPIDStartTokenReader(func(int) (string, error) { return "agent-start", nil })()
+	d, err := testLaunchRouter(t).Decide(router.LaunchRequest{Role: router.RoleWorker, Shape: launch.Implementation, RequestedProvider: launch.WorkerProvider, RequestedModel: launch.WorkerModel, RequestedEffort: launch.WorkerEffort, TaskRef: "FAC-188", LeaseGeneration: 7, Scope: router.ScopeTask, ProbeResults: map[string]bool{router.ProbeKey(launch.WorkerProvider, launch.WorkerModel): true}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := launch.Request{Decision: d, TaskRef: d.TaskRef, LeaseGeneration: d.LeaseGeneration, Scope: d.Scope}
+	owner := toolchild.Identity{PID: 501, StartToken: "agent-start", SessionGeneration: req.LeaseGeneration, LaunchID: launch.DecisionDigest(d), Repository: "herdforge", Role: launch.WorkerRole, Lane: "worker", SessionID: "session-1", PaneID: "pane-1", Provider: launch.WorkerProvider, ArgvDigest: launch.DecisionDigest(d)}
+	tree := &toolchild.FakeTree{Nodes: map[int]toolchild.Node{501: {Identity: owner}, 601: {Identity: toolchild.Identity{PID: 601, ParentPID: 501, StartToken: "child-start"}, ParentPID: 501}}}
+	lc := toolchild.NewLifecycle(toolchild.Identity{}, tree, &toolchild.MemorySink{})
+	restoreFactory := SetToolChildLifecycleFactory(func(launch.Request, string, string) (ToolChildLifecycle, error) { return lc, nil })
+	defer restoreFactory()
+	calledInfo := false
+	runHerdr = func(args ...string) (string, error) {
+		if len(args) >= 2 && args[0] == "agent" && args[1] == "start" {
+			return `{}`, nil
+		}
+		if len(args) == 2 && args[0] == "agent" && args[1] == "list" {
+			return `{"result":{"agents":[{"name":"worker","agent":"codex","agent_status":"working","pane_id":"pane-1","tab_id":"tab-1","agent_session":{"value":"session-1"}}]}}`, nil
+		}
+		if len(args) == 4 && args[0] == "pane" && args[1] == "process-info" {
+			calledInfo = true
+			native := append([]string{"/opt/homebrew/bin/codex"}, d.Argv[1:]...)
+			return fmt.Sprintf(`{"result":{"process_info":{"foreground_processes":[{"pid":500,"name":"node","cwd":"/repo","argv":["node","/opt/homebrew/bin/codex"]},{"pid":501,"name":"codex","cwd":"/repo","argv":%s}]}}}`, mustJSON(native)), nil
+		}
+		return `{}`, nil
+	}
+	if err := StartPreparedAgent("tab-1", "worker", "codex", "pane-1", req); err != nil {
+		t.Fatal(err)
+	}
+	if !calledInfo {
+		t.Fatal("agent-list-only path did not query exact pane process-info")
+	}
+	if err := ReconcileToolChild("tab-1", "done"); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if len(tree.Reaped) != 1 || tree.Reaped[0] != 601 {
+		t.Fatalf("reaped=%v", tree.Reaped)
+	}
+}
+
+func mustJSON(v any) string { b, _ := json.Marshal(v); return string(b) }
 
 func TestAgentStartRequiresExactClaimGenerationBeforeProcess(t *testing.T) {
 	t.Setenv("HERD_LAUNCH_RECEIPTS", t.TempDir()+"/receipts.jsonl")
