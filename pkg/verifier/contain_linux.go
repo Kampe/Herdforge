@@ -13,8 +13,9 @@ import (
 // namespace when the kernel allows it. The supervisor becomes PID 1 inside the
 // namespace; when it exits, the kernel kills every remaining process in that
 // namespace — including setsid/double-fork descendants that left the original
-// process group. Failures to enable namespaces are non-fatal: path residual
-// ownership still applies.
+// process group. Namespace setup is required containment; exec.Start fails
+// closed if the kernel refuses it, and path residual ownership is not a
+// substitute for a missing namespace boundary.
 func applyOwnershipContainment(attr *syscall.SysProcAttr) {
 	if attr == nil {
 		return

@@ -48,6 +48,16 @@ type procToken struct {
 	startUsec int64
 }
 
+// Production uses the platform implementations. Tests replace these seams
+// to prove identity and signal decisions without touching host processes.
+var (
+	tokenOfFn         = tokenOf
+	processIsZombieFn = processIsZombie
+	pidfdOpenFn       = pidfdOpen
+	pidfdSendSignalFn = pidfdSendSignal
+	processSnapshotFn = snapshotProcesses
+)
+
 func (t procToken) valid() bool { return t.pid > 1 }
 
 func (t procToken) equal(o procToken) bool {
@@ -59,7 +69,7 @@ func (t procToken) stillSame() bool {
 	if !t.valid() {
 		return false
 	}
-	cur, err := tokenOf(t.pid)
+	cur, err := tokenOfFn(t.pid)
 	if err != nil {
 		return false
 	}
@@ -68,7 +78,7 @@ func (t procToken) stillSame() bool {
 
 // isLiveTarget is a running (non-zombie) process matching this incarnation.
 func (t procToken) isLiveTarget() bool {
-	return t.stillSame() && !processIsZombie(t.pid)
+	return t.stillSame() && !processIsZombieFn(t.pid)
 }
 
 // ownedHandle is a causally discovered process we may signal.
@@ -92,7 +102,7 @@ func openHandle(tok procToken) (ownedHandle, error) {
 	if !tok.valid() {
 		return ownedHandle{}, fmt.Errorf("openHandle: invalid token")
 	}
-	fd, err := pidfdOpen(tok.pid)
+	fd, err := pidfdOpenFn(tok.pid)
 	if err != nil {
 		// Fall back to token-only if pidfd unavailable (old kernel); still
 		// better than bare kill, and Darwin always takes this path.
@@ -120,7 +130,12 @@ func (h ownedHandle) kill() (signaled bool, err error) {
 		return false, nil
 	}
 	if h.fd >= 0 {
-		if err := pidfdSendSignal(h.fd, syscallSIGKILL()); err != nil {
+		// A pidfd prevents PID reuse, but dead/zombie handles are not valid
+		// signal targets. Match the token-only live/non-zombie gate first.
+		if !h.tok.isLiveTarget() {
+			return false, nil
+		}
+		if err := pidfdSendSignalFn(h.fd, syscallSIGKILL()); err != nil {
 			if isESRCH(err) || isNotExistPidfd(err) {
 				return false, nil
 			}

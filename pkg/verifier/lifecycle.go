@@ -105,7 +105,7 @@ func killProcessGroupIfLive(pgid int) error {
 // ownedSubprocess is causal process-tree ownership for one verification run.
 //
 // Protocol (two-phase handshake with the ownership wrapper):
-//  1. Wrapper starts user command, writes "start <pid>" on FD3, waits for user.
+//  1. Wrapper starts user command, writes "start" on FD3, waits for user.
 //  2. On user exit, wrapper writes "done <ec>" on FD3 and BLOCKS reading FD4.
 //  3. Parent, while wrapper is still alive (process group still owned), samples
 //     the causal tree + live original pgid members, kills residuals that still
@@ -165,7 +165,9 @@ child=$!
 # The background child inherited the locked FD5. Drop the supervisor's copy so
 # lock release later means the user tree has no marked holder left.
 exec 5>&- || exit 1
-printf 'start %s\n' "$child" >&3
+# The child PID is namespace-local when CLONE_NEWPID is enabled. It must not
+# cross the namespace boundary as a parent-namespace signal identity.
+printf 'start\n' >&3
 wait "$child"
 ec=$?
 printf 'done %s\n' "$ec" >&3
@@ -175,8 +177,8 @@ exit "$ec"
 `
 
 // prepareOwnedCommand builds a Setpgid supervisor with status+ack pipes and an
-// inherited ownership marker FD. On Linux, also applies PID/user namespace
-// containment when the kernel allows it.
+// inherited ownership marker FD. On Linux, also applies required PID/user
+// namespace containment; cmd.Start fails closed if the kernel refuses it.
 func prepareOwnedCommand(ctx context.Context, path string, args []string, dir string, env []string) (cmd *exec.Cmd, statusR, statusW, ackR, ackW, marker *os.File, markerPath string, err error) {
 	statusR, statusW, err = os.Pipe()
 	if err != nil {
@@ -284,7 +286,9 @@ func (o *ownedSubprocess) RunProtocol() (userExitHint int, err error) {
 		}
 	}()
 
-	// Phase 1: start <pid> — child is blocked on FD4 before user exec.
+	// Phase 1: start — the child is blocked on FD4 before user exec. The
+	// handshake intentionally carries no PID because namespace-local PIDs are
+	// not parent-namespace signal identities.
 	if err := o.statusR.SetReadDeadline(time.Now().Add(handshakeReadBound)); err != nil {
 		return -1, fmt.Errorf("ownership start deadline: %w", err)
 	}
@@ -294,21 +298,8 @@ func (o *ownedSubprocess) RunProtocol() (userExitHint int, err error) {
 		return -1, fmt.Errorf("ownership start handshake: %w", err)
 	}
 	fields := strings.Fields(line)
-	if len(fields) != 2 || fields[0] != "start" {
+	if len(fields) != 1 || fields[0] != "start" {
 		return -1, fmt.Errorf("ownership start handshake bad line %q", strings.TrimSpace(line))
-	}
-	childPid, err := strconv.Atoi(fields[1])
-	if err != nil || childPid <= 1 {
-		return -1, fmt.Errorf("ownership start handshake bad pid %q", fields[1])
-	}
-	tok, err := tokenOf(childPid)
-	if err != nil {
-		_ = killProcessGroupIfLive(o.leader)
-		return -1, fmt.Errorf("ownership start handshake token: %w", err)
-	}
-	if err := o.noteCausal(tok); err != nil {
-		_ = killProcessGroupIfLive(o.leader)
-		return -1, fmt.Errorf("ownership start handshake note: %w", err)
 	}
 	// Sample while child is still blocked pre-exec so discovery cannot race fork.
 	if serr := o.sample(); serr != nil {
@@ -544,7 +535,7 @@ func waitProcessGroupEmptyExcept(pgid, exceptPID int, bound time.Duration) error
 	}
 	deadline := time.Now().Add(bound)
 	for {
-		snap, err := snapshotProcesses()
+		snap, err := processSnapshotFn()
 		if err != nil {
 			return fmt.Errorf("wait process group empty: snapshot: %w", err)
 		}
@@ -626,7 +617,7 @@ func (o *ownedSubprocess) sample() error {
 		o.mu.Unlock()
 		return nil
 	}
-	snap, err := snapshotProcesses()
+	snap, err := processSnapshotFn()
 	if err != nil {
 		return err
 	}
@@ -962,7 +953,7 @@ func waitPIDGone(pid int, bound time.Duration) error {
 // processGroupLive reports whether pgid still has members. Snapshot failure
 // is treated as still-live (fail closed) so callers do not claim empty on error.
 func processGroupLive(pgid int) bool {
-	snap, err := snapshotProcesses()
+	snap, err := processSnapshotFn()
 	if err != nil {
 		return true
 	}
@@ -986,7 +977,7 @@ func waitProcessGroupEmpty(pgid int) error {
 }
 
 func listChildPids(ppid int) ([]int, error) {
-	snap, err := snapshotProcesses()
+	snap, err := processSnapshotFn()
 	if err != nil {
 		return nil, err
 	}
@@ -994,7 +985,7 @@ func listChildPids(ppid int) ([]int, error) {
 }
 
 func listPidsInGroup(pgid int) ([]int, error) {
-	snap, err := snapshotProcesses()
+	snap, err := processSnapshotFn()
 	if err != nil {
 		return nil, err
 	}
