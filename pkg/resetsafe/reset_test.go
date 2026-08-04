@@ -364,7 +364,9 @@ func TestRunPreservesBeforeResetAndLeavesSiblingUntouched(t *testing.T) {
 	git(t, root, "worktree", "add", "-q", "-b", "sibling", sibling)
 	git(t, wt, "commit", "--allow-empty", "-q", "-m", "unique")
 	uniqueSHA := git(t, wt, "rev-parse", "HEAD")
-	siblingSHA := git(t, sibling, "rev-parse", "HEAD")
+	siblingHeadBefore := git(t, sibling, "rev-parse", "HEAD")
+	siblingRefBefore := git(t, root, "rev-parse", "refs/heads/sibling")
+	siblingStatusBefore := git(t, sibling, "status", "--porcelain")
 	rootSHA := git(t, root, "rev-parse", "HEAD")
 	refsBefore := git(t, root, "for-each-ref", "--format=%(refname)=%(objectname)", "refs/heads/")
 	plan, err := New(ctx, root, wt, Options{})
@@ -380,8 +382,14 @@ func TestRunPreservesBeforeResetAndLeavesSiblingUntouched(t *testing.T) {
 	if got := git(t, wt, "rev-parse", "HEAD"); got != git(t, root, "rev-parse", "origin/main") {
 		t.Fatalf("target HEAD was not reset: %s", got)
 	}
-	if got := git(t, sibling, "rev-parse", "HEAD"); got != siblingSHA {
-		t.Fatalf("sibling HEAD changed: got %s want %s", got, siblingSHA)
+	if got := git(t, sibling, "rev-parse", "HEAD"); got != siblingHeadBefore {
+		t.Fatalf("sibling HEAD changed: got %s want %s", got, siblingHeadBefore)
+	}
+	if got := git(t, root, "rev-parse", "refs/heads/sibling"); got != siblingRefBefore {
+		t.Fatalf("sibling ref changed: got %s want %s", got, siblingRefBefore)
+	}
+	if got := git(t, sibling, "status", "--porcelain"); got != siblingStatusBefore {
+		t.Fatalf("sibling status changed: got %q want %q", got, siblingStatusBefore)
 	}
 	if got := git(t, root, "rev-parse", "refs/heads/main"); got != rootSHA {
 		t.Fatalf("main ref changed: got %s want %s", got, rootSHA)
@@ -409,6 +417,36 @@ func conservedRefs(before, after, preserve, target string) bool {
 		}
 	}
 	return now[preserve] != ""
+}
+
+func TestRunSkipsResetWhenPushIntroducesPreResetDrift(t *testing.T) {
+	ctx := context.Background()
+	root, wt, _ := fixture(t)
+	git(t, wt, "commit", "--allow-empty", "-q", "-m", "unique")
+	plan, err := New(ctx, root, wt, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldRun := gitRunFn
+	var driftSHA string
+	gitRunFn = func(ctx context.Context, dir string, args ...string) error {
+		err := oldRun(ctx, dir, args...)
+		if err == nil && len(args) >= 2 && args[0] == "push" {
+			git(t, dir, "commit", "--allow-empty", "-q", "-m", "injected pre-reset drift")
+			driftSHA = git(t, dir, "rev-parse", "HEAD")
+		}
+		return err
+	}
+	t.Cleanup(func() { gitRunFn = oldRun })
+	if _, err := plan.Run(ctx); err == nil || !strings.Contains(err.Error(), "planned HEAD changed") {
+		t.Fatalf("post-push drift must fail closed, got %v", err)
+	}
+	if driftSHA == "" {
+		t.Fatal("injected drift did not execute")
+	}
+	if got := git(t, wt, "rev-parse", "HEAD"); got != driftSHA {
+		t.Fatalf("reset ran after post-push drift: got %s want %s", got, driftSHA)
+	}
 }
 
 func refMap(text string) map[string]string {
