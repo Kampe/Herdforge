@@ -156,7 +156,9 @@ func TestAuthorityReplacementSupersedesStaleAcceptedEvidence(t *testing.T) {
 func TestAuthorityIncidentReplacementUsesStableFamilyKey(t *testing.T) {
 	a, _ := NewAuthority(&sharedStore{})
 	oldReq := authorityRequest(t)
+	oldReq.LeaseGeneration, oldReq.SessionGeneration = 7, 41
 	old := accepted(t, a, mustReserve(t, a, oldReq, "same-packet"))
+	oldReq.LeaseGeneration, oldReq.SessionGeneration = 8, 42
 	oldReq.Name, oldReq.TabID, oldReq.PaneID, oldReq.HerdrSession, oldReq.ProcessIdentity = "forge-worker-restarted", "tab-new", "pane-new", "session-new", "pid=43"
 	if err := a.Reject(old, "failed generation"); err != nil {
 		t.Fatal(err)

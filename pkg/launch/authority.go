@@ -365,7 +365,7 @@ func validateReceipt(r Receipt) error {
 	return nil
 }
 func identityKey(r Receipt) string {
-	return strings.Join([]string{r.TaskRef, r.Repository, r.Lane, fmt.Sprintf("%d", r.LeaseGeneration), fmt.Sprintf("%d", r.SessionGeneration)}, "\x00")
+	return strings.Join([]string{r.TaskRef, r.Repository, r.Lane}, "\x00")
 }
 func sameReceipt(a, b Receipt) bool {
 	return a.TaskRef == b.TaskRef && a.Repository == b.Repository && a.Lane == b.Lane && a.Role == b.Role && a.TaskShape == b.TaskShape && a.Provider == b.Provider && a.Model == b.Model && a.Effort == b.Effort && a.Generation == b.Generation && a.TabID == b.TabID && a.PaneID == b.PaneID && a.HerdrSession == b.HerdrSession && a.CWD == b.CWD && a.ProcessIdentity == b.ProcessIdentity && a.StartToken == b.StartToken && a.PacketDigest == b.PacketDigest && a.DecisionDigest == b.DecisionDigest && equalStrings(a.Argv, b.Argv)
