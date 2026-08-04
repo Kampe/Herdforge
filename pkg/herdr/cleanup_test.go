@@ -36,3 +36,30 @@ func TestCloseTabForRef_NoMatchIsNil(t *testing.T) {
 		t.Skip("herdr present — no-match returned nil as designed")
 	}
 }
+
+func TestTabCloseFailsClosedWithoutExactPaneAuthority(t *testing.T) {
+	events := []string{}
+	lc := &rollbackLifecycle{bound: true, events: &events}
+	toolChildMu.Lock()
+	toolChildByTab["tab-no-pane"] = lc
+	toolChildMu.Unlock()
+	defer dropToolChild("tab-no-pane", "")
+	oldRun := runHerdr
+	defer func() { runHerdr = oldRun }()
+	closeCalled := false
+	runHerdr = func(args ...string) (string, error) {
+		if len(args) == 3 && args[0] == "tab" && args[1] == "close" {
+			closeCalled = true
+		}
+		return `{}`, nil
+	}
+	if err := TabClose("tab-no-pane"); err == nil {
+		t.Fatal("empty pane authority must fail closed")
+	}
+	if closeCalled {
+		t.Fatal("empty pane authority reached tab close")
+	}
+	if len(events) != 1 || events[0] != "reconcile" {
+		t.Fatalf("cleanup skipped or performed terminal lifecycle steps: %v", events)
+	}
+}

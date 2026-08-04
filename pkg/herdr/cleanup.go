@@ -62,22 +62,23 @@ func TabClose(tabID string) error {
 	if concrete, ok := lc.(*toolchild.Lifecycle); ok {
 		paneID = concrete.Inventory.Owner.PaneID
 	}
+	if paneID == "" {
+		return fmt.Errorf("tab close %s requires exact lifecycle pane authority", tabID)
+	}
 	out, err := runHerdr("tab", "close", tabID)
 	if err != nil {
 		return fmt.Errorf("herdr tab close %s: %s: %w", tabID, out, err)
 	}
-	if paneID != "" {
-		if err := verifyHerdrTerminal(tabID, paneID); err != nil {
-			return fmt.Errorf("tab close terminal readback %s: %w", tabID, err)
-		}
-		if err := lc.Invalidate("tab-close"); err != nil {
-			return err
-		}
-		if err := lc.VerifyTerminal(); err != nil {
-			return err
-		}
-		dropToolChild(tabID, paneID)
+	if err := verifyHerdrTerminal(tabID, paneID); err != nil {
+		return fmt.Errorf("tab close terminal readback %s: %w", tabID, err)
 	}
+	if err := lc.Invalidate("tab-close"); err != nil {
+		return err
+	}
+	if err := lc.VerifyTerminal(); err != nil {
+		return err
+	}
+	dropToolChild(tabID, paneID)
 	return nil
 }
 
