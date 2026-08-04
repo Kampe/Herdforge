@@ -202,6 +202,39 @@ type ClaimRequest struct {
 	HoldIdentities []lifecycle.HoldIdentity
 }
 
+func exactClaimComposite(req ClaimRequest) ([]lifecycle.HoldIdentity, error) {
+	ids := req.HoldIdentities
+	if len(ids) != 2 {
+		return nil, fmt.Errorf("claim: exact lane/task hold identity composite is required")
+	}
+	var lane, task *lifecycle.HoldIdentity
+	for i := range ids {
+		id := ids[i]
+		if !identityValid(id) {
+			return nil, fmt.Errorf("claim: invalid hold identity composite")
+		}
+		if id.Scope == "lane" && id.Task == "" {
+			if lane != nil {
+				return nil, fmt.Errorf("claim: duplicate lane hold identity")
+			}
+			copy := id
+			lane = &copy
+		} else if id.Scope == "task" && id.Task != "" {
+			if task != nil {
+				return nil, fmt.Errorf("claim: duplicate task hold identity")
+			}
+			copy := id
+			task = &copy
+		} else {
+			return nil, fmt.Errorf("claim: hold identity has invalid scope")
+		}
+	}
+	if lane == nil || task == nil || lane.Repository != task.Repository || lane.Owner != task.Owner || lane.Lane != task.Lane || task.Task != req.Key.TaskRef {
+		return nil, fmt.Errorf("claim: lane/task hold identities do not form the exact task composite")
+	}
+	return []lifecycle.HoldIdentity{*lane, *task}, nil
+}
+
 // Claim attempts to atomically acquire a lease. Role enforcement is exact:
 // an unlabeled task (TaskRole == "") is never eligible, and a mismatched
 // role is rejected even if some lease is otherwise free.
@@ -225,26 +258,26 @@ func (m *ClaimManager) Claim(ctx context.Context, req ClaimRequest) (*Lease, err
 		return nil, ErrRoleMismatch
 	}
 	if m.holdReader != nil {
-		identities := req.HoldIdentities
-		if len(identities) == 0 && identityValid(req.HoldIdentity) {
-			identities = []lifecycle.HoldIdentity{req.HoldIdentity}
-		}
-		if len(identities) == 0 {
-			return nil, fmt.Errorf("claim: canonical hold identity is required before lease owner allocation")
+		identities, err := exactClaimComposite(req)
+		if err != nil {
+			return nil, err
 		}
 		for _, identity := range identities {
 			if !identityValid(identity) {
 				return nil, fmt.Errorf("claim: ambiguous canonical hold identity")
 			}
-			generation := int64(1)
-			if source, ok := m.holdReader.(interface {
+			source, ok := m.holdReader.(interface {
 				CurrentGeneration(context.Context, lifecycle.HoldIdentity) (int64, error)
-			}); ok {
-				var err error
-				generation, err = source.CurrentGeneration(ctx, identity)
+			})
+			if !ok {
+				return nil, fmt.Errorf("claim: hold generation source is required")
+			}
+			generation, err := source.CurrentGeneration(ctx, identity)
+			if err != nil || generation <= 0 {
 				if err != nil {
 					return nil, fmt.Errorf("claim: hold generation: %w", err)
 				}
+				return nil, fmt.Errorf("claim: invalid hold generation %d", generation)
 			}
 			decision, err := m.holdReader.Check(ctx, identity, generation)
 			if err != nil {
@@ -276,7 +309,22 @@ func (m *ClaimManager) Claim(ctx context.Context, req ClaimRequest) (*Lease, err
 		return nil, err
 	}
 
-	lease, err := m.store.Acquire(ctx, req.Key, req.OwnerID, req.Role, req.WorktreePath, m.now(), m.ttl)
+	var lease *Lease
+	var err error
+	if m.holdReader != nil {
+		identities, compositeErr := exactClaimComposite(req)
+		if compositeErr != nil {
+			return nil, compositeErr
+		}
+		identity := identities[0]
+		atomicStore, ok := m.store.(AtomicLeaseStore)
+		if !ok {
+			return nil, fmt.Errorf("claim: lease store cannot atomically persist canonical hold identity")
+		}
+		lease, err = atomicStore.AcquireWithIdentity(ctx, req.Key, req.OwnerID, req.Role, req.WorktreePath, identity.Repository, identity.Owner, identity.Lane, m.now(), m.ttl)
+	} else {
+		lease, err = m.store.Acquire(ctx, req.Key, req.OwnerID, req.Role, req.WorktreePath, m.now(), m.ttl)
+	}
 	if err != nil {
 		// Even a lost race can have flipped a stale row to Expired (see
 		// LeaseStore.Acquire) before ultimately losing the insert to a
@@ -286,7 +334,6 @@ func (m *ClaimManager) Claim(ctx context.Context, req ClaimRequest) (*Lease, err
 		_, _ = m.settlePendingCapacity(ctx, &req.Key)
 		return nil, err
 	}
-
 	// Acquire durably evicts (Expires) any stale prior lease for this key
 	// as part of winning the claim, which is exactly what makes that
 	// lease's row claimable via ClaimCapacityRelease. Settle it now,
@@ -383,6 +430,13 @@ func (m *ClaimManager) Hold(ctx context.Context, key LeaseKey, ownerID string, g
 // swallowed) but that lease is simply left locked, to be retried on a
 // future call, exactly like Claim/Release leave it for their own retry.
 func (m *ClaimManager) ExpireStale(ctx context.Context) ([]*Lease, error) {
+	if m.holdReader != nil {
+		return nil, fmt.Errorf("claim: exact per-lease WithUnheldTransition fence is required for recovery")
+	}
+	return m.expireStaleUnlocked(ctx)
+}
+
+func (m *ClaimManager) expireStaleUnlocked(ctx context.Context) ([]*Lease, error) {
 	preemptErr := m.preemptAllStaleProviderLocks(ctx)
 
 	expired, err := m.store.ExpireStale(ctx, m.now())

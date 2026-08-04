@@ -264,6 +264,7 @@ func TestRun_DryRun(t *testing.T) {
 		RaiseMissing: false,
 		HoldReader:   allowAllHolds{}, Identity: testIdentity,
 		ActiveTasks: testActiveTasks,
+		Generation:  testGeneration,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -296,6 +297,7 @@ func TestRun_HeldAuthorityStopsBeforeAgentRead(t *testing.T) {
 		Names: []string{"forge-held"}, Quiet: true, RaiseMissing: true,
 		HoldReader: heldHolds{}, Identity: testIdentity,
 		ActiveTasks: testActiveTasks,
+		Generation:  testGeneration,
 	})
 	if err != nil || result == nil || result.Skipped != 1 || !strings.Contains(result.Entries[0].Reason, "held") {
 		t.Fatalf("held kick result=%v err=%v", result, err)
@@ -312,7 +314,7 @@ func (selectiveHolds) Check(_ context.Context, id lifecycle.HoldIdentity, _ int6
 }
 
 func TestRun_HeldLaneDoesNotFreezeUnheldLane(t *testing.T) {
-	result, err := Run(Options{Names: []string{"forge-held", "forge-free"}, DryRun: true, Quiet: true, RaiseMissing: false, HoldReader: selectiveHolds{}, Identity: testIdentity, ActiveTasks: testActiveTasks})
+	result, err := Run(Options{Names: []string{"forge-held", "forge-free"}, DryRun: true, Quiet: true, RaiseMissing: false, HoldReader: selectiveHolds{}, Identity: testIdentity, ActiveTasks: testActiveTasks, Generation: testGeneration})
 	if err != nil || result == nil || result.Skipped != 1 || result.Kicked != 1 {
 		t.Fatalf("selective kick result=%+v err=%v", result, err)
 	}
@@ -340,8 +342,8 @@ func TestRunUsesGenerationForExactLaneAndTaskIdentity(t *testing.T) {
 		}
 		return 4, nil
 	}
-	_, runErr := Run(Options{Names: []string{"forge-fenced"}, DryRun: true, Quiet: true, HoldReader: r, Identity: func(string) lifecycle.HoldIdentity {
-		return lifecycle.HoldIdentity{Repository: "repo", Owner: "role", Lane: "lane", Scope: "lane"}
+	_, runErr := Run(Options{Names: []string{"forge-fenced"}, DryRun: true, Quiet: true, HoldReader: r, Identity: func(string) (lifecycle.HoldIdentity, error) {
+		return lifecycle.HoldIdentity{Repository: "repo", Owner: "role", Lane: "lane", Scope: "lane"}, nil
 	}, ActiveTasks: func(context.Context, string) ([]lifecycle.HoldIdentity, error) {
 		return []lifecycle.HoldIdentity{{Repository: "repo", Owner: "role", Lane: "lane", Task: "FAC-4", Scope: "task"}}, nil
 	}, Generation: genFn})
@@ -362,6 +364,7 @@ func TestRun_ForceOverridesStatus(t *testing.T) {
 		RaiseMissing: false,
 		HoldReader:   allowAllHolds{}, Identity: testIdentity,
 		ActiveTasks: testActiveTasks,
+		Generation:  testGeneration,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -383,6 +386,7 @@ func TestRun_EmptyQuiet(t *testing.T) {
 		RaiseMissing: false,
 		HoldReader:   allowAllHolds{}, Identity: testIdentity,
 		ActiveTasks: testActiveTasks,
+		Generation:  testGeneration,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -429,10 +433,12 @@ func (allowAllHolds) Check(context.Context, lifecycle.HoldIdentity, int64) (life
 	return lifecycle.HoldDecision{Generation: 1}, nil
 }
 
-func testIdentity(name string) lifecycle.HoldIdentity {
-	return lifecycle.HoldIdentity{Repository: "repo", Owner: name, Lane: name, Scope: "lane"}
+func testIdentity(name string) (lifecycle.HoldIdentity, error) {
+	return lifecycle.HoldIdentity{Repository: "repo", Owner: name, Lane: name, Scope: "lane"}, nil
 }
 
 func testActiveTasks(_ context.Context, lane string) ([]lifecycle.HoldIdentity, error) {
 	return []lifecycle.HoldIdentity{{Repository: "repo", Owner: lane, Lane: lane, Task: lane + "-task", Scope: "task"}}, nil
 }
+
+func testGeneration(context.Context, lifecycle.HoldIdentity) (int64, error) { return 1, nil }

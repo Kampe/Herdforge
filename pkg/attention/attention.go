@@ -24,6 +24,7 @@ package attention
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -135,6 +136,9 @@ func ClassifyAgent(a kick.AgentEntry, held bool, heldReason string, providerDeat
 	}
 
 	switch {
+	case strings.HasPrefix(heldReason, "authority-error:"):
+		item.Level = LevelCritical
+		item.Reason = strings.TrimSpace(strings.TrimPrefix(heldReason, "authority-error:"))
 	case held:
 		item.Level = LevelLow
 		item.Held = true
@@ -329,10 +333,10 @@ func Run() (*Result, error) {
 }
 
 func RunWithHoldReader(reader lifecycle.HoldReader, repository string) (*Result, error) {
-	return RunWithHoldReaderAndTasks(reader, repository, nil)
+	return nil, fmt.Errorf("herd-attention: canonical lane registry and active-task resolver are required")
 }
 
-func RunWithHoldReaderAndTasks(reader lifecycle.HoldReader, repository string, resolver lifecycle.ActiveTaskResolver) (*Result, error) {
+func RunWithHoldReaderAndTasks(reader lifecycle.HoldReader, repository string, resolver lifecycle.ActiveTaskResolver, registry lifecycle.CanonicalLaneRegistry) (*Result, error) {
 	if reader == nil || strings.TrimSpace(repository) == "" {
 		return nil, fmt.Errorf("herd-attention: durable hold authority and repository identity are required")
 	}
@@ -340,19 +344,54 @@ func RunWithHoldReaderAndTasks(reader lifecycle.HoldReader, repository string, r
 	if err != nil {
 		return nil, fmt.Errorf("herd-attention: %w", err)
 	}
-	check := func(name string) (string, bool) {
-		if resolver == nil {
-			return "active task binding unknown", true
+	heldFacts := map[string]string{}
+	for _, name := range kick.StandingIDs() {
+		if _, live := findAttentionAgent(agents, name); !live {
+			continue
 		}
-		identity := lifecycle.HoldIdentity{Repository: repository, Owner: name, Lane: name, Scope: "lane"}
-		_ = identity
-		if err := lifecycle.CheckLaneAndTaskHold(context.Background(), reader, resolver, repository, name, name, nil); err != nil {
-			return err.Error(), true
+		lane, resolveErr := registry.ResolveLiveAgentID(name)
+		if resolveErr != nil {
+			return authorityFailure(name, resolveErr)
 		}
-		return "", false
+		generation := func(ctx context.Context, identity lifecycle.HoldIdentity) (int64, error) {
+			if source, ok := reader.(interface {
+				CurrentGeneration(context.Context, lifecycle.HoldIdentity) (int64, error)
+			}); ok {
+				return source.CurrentGeneration(ctx, identity)
+			}
+			return 0, fmt.Errorf("herd-attention: current generation source is required")
+		}
+		err := lifecycle.CheckLaneAndTaskHold(context.Background(), reader, resolver, repository, lane.Role, lane.Name, generation)
+		if err != nil {
+			if errors.Is(err, lifecycle.ErrHoldDenied) {
+				heldFacts[name] = err.Error()
+				continue
+			}
+			return authorityFailure(name, err)
+		}
 	}
+	check := func(name string) (string, bool) { reason, held := heldFacts[name]; return reason, held }
 	r := Triage(agents, kick.StandingIDs(), check, kick.ProviderDeathCheck)
 	return &r, nil
+}
+
+func authorityFailure(name string, err error) (*Result, error) {
+	item := Item{Name: name, Status: "unknown", Level: LevelCritical, Reason: "hold authority unavailable: " + err.Error()}
+	return &Result{
+		Items:   []Item{item},
+		Counts:  map[AttentionLevel]int{LevelCritical: 1},
+		Total:   1,
+		Needing: 1,
+	}, err
+}
+
+func findAttentionAgent(agents []kick.AgentEntry, name string) (kick.AgentEntry, bool) {
+	for _, agent := range agents {
+		if agent.Name == name || agent.Label == name {
+			return agent, true
+		}
+	}
+	return kick.AgentEntry{}, false
 }
 
 // MarshalJSON ensures Result (with its map) serializes cleanly.

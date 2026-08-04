@@ -14,6 +14,7 @@ package kick
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -68,7 +69,7 @@ type Options struct {
 	// inject it; nil is rejected by Run before any fleet side effect.
 	HoldReader lifecycle.HoldReader
 	// Identity resolves a complete authority identity for each lane.
-	Identity    func(string) lifecycle.HoldIdentity
+	Identity    func(string) (lifecycle.HoldIdentity, error)
 	Generation  func(context.Context, lifecycle.HoldIdentity) (int64, error)
 	ActiveTasks lifecycle.ActiveTaskResolver
 }
@@ -215,22 +216,35 @@ func Run(opts Options) (*Result, error) {
 	// Consult the shared authority for every target before raising or nudging.
 	held := make(map[string]string)
 	for _, id := range names {
-		laneID := opts.Identity(id)
+		laneID, identityErr := opts.Identity(id)
+		if identityErr != nil {
+			if errors.Is(identityErr, lifecycle.ErrHoldDenied) {
+				held[id] = identityErr.Error()
+				continue
+			}
+			return nil, fmt.Errorf("kick: lane %s identity: %w", id, identityErr)
+		}
 		gen := opts.Generation
 		if err := lifecycle.CheckLaneAndTaskHold(context.Background(), opts.HoldReader, opts.ActiveTasks, laneID.Repository, laneID.Owner, laneID.Lane, gen); err != nil {
-			held[id] = err.Error()
+			if errors.Is(err, lifecycle.ErrHoldDenied) {
+				held[id] = err.Error()
+				continue
+			}
+			return nil, fmt.Errorf("kick: lane %s authority: %w", id, err)
 		}
 	}
 
 	// Raise missing standing agents when kicking the full default set.
 	if opts.RaiseMissing && len(names) >= len(StandingIDs()) && len(held) == 0 {
-		HerdStanding("--all")
+		if _, err := HerdStanding("--all"); err != nil {
+			return nil, fmt.Errorf("kick: raise standing: %w", err)
+		}
 	}
 
 	// Fetch agent list once (was 2N herdr calls in the zsh script).
 	agents, err := FetchAgentList()
 	if err != nil {
-		agents = nil // proceed with empty list
+		return nil, fmt.Errorf("kick: fetch agents: %w", err)
 	}
 
 	result := &Result{}
@@ -250,14 +264,21 @@ func Run(opts Options) (*Result, error) {
 				fmt.Printf("herd-kick: %s missing (not live)\n", id)
 			}
 			if opts.RaiseMissing {
-				HerdStanding("--only", id)
+				if _, raiseErr := HerdStanding("--only", id); raiseErr != nil {
+					result.Failed++
+					result.Entries = append(result.Entries, EntryResult{Name: id, Result: "failed", Reason: "raise failed: " + raiseErr.Error()})
+					continue
+				}
 				// Re-fetch just for this lane.
 				agents2, err2 := FetchAgentList()
-				if err2 == nil {
-					st2, paneID2, found2 := LookupAgent(agents2, id)
-					if found2 {
-						st, paneID, found = st2, paneID2, found2
-					}
+				if err2 != nil {
+					result.Failed++
+					result.Entries = append(result.Entries, EntryResult{Name: id, Result: "failed", Reason: "refetch failed: " + err2.Error()})
+					continue
+				}
+				st2, paneID2, found2 := LookupAgent(agents2, id)
+				if found2 {
+					st, paneID, found = st2, paneID2, found2
 				}
 			}
 			if !found || paneID == "" {

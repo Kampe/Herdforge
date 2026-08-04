@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -282,6 +283,12 @@ func TestRunPulse_SelectsAndClaimsTask(t *testing.T) {
 		t.Fatal(oerr)
 	}
 	defer own.Close()
+	own.LaneResolver = func(role string) (string, error) {
+		if role == "herd-smith" {
+			return "herd-smith", nil
+		}
+		return "", fmt.Errorf("unknown role %q", role)
+	}
 	engine.Ownership = own
 
 	task, err := engine.RunPulse(context.Background(), "herd-smith")

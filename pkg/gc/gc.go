@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 
 	"github.com/Kampe/Herdforge/pkg/lifecycle"
@@ -18,9 +20,29 @@ type OverlapReport struct {
 }
 
 type GCManager struct {
-	RepoRoot   string
-	WM         *worktree.WorktreeManager
-	HoldReader lifecycle.HoldReader
+	RepoRoot      string
+	WM            *worktree.WorktreeManager
+	HoldReader    lifecycle.HoldReader
+	HoldAuthority *lifecycle.HoldAuthority
+}
+
+func NewCanonicalGCManager(repoRoot string, wm *worktree.WorktreeManager) (*GCManager, error) {
+	path := lifecycle.CanonicalStatePath(repoRoot)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return nil, err
+	}
+	authority, err := lifecycle.NewHoldAuthority(path)
+	if err != nil {
+		return nil, err
+	}
+	return &GCManager{RepoRoot: repoRoot, WM: wm, HoldReader: authority, HoldAuthority: authority}, nil
+}
+
+func (g *GCManager) Close() error {
+	if g.HoldAuthority != nil {
+		return g.HoldAuthority.Close()
+	}
+	return nil
 }
 
 func NewGCManager(repoRoot string, wm *worktree.WorktreeManager) *GCManager {

@@ -87,10 +87,17 @@ func loadProductionActiveTaskResolver(ctx context.Context) (lifecycle.ActiveTask
 	}
 	accepted := map[string]bool{"todo": true, "to-do": true, "backlog": true, "planned": true, "in-progress": true, "in_progress": true, "working": true, "started": true, "done": true, "complete": true, "closed": true, "blocked": true, "review": true, "in-review": true}
 	configured := map[string]bool{}
+	roleLanes := map[string]lifecycle.CanonicalLane{}
 	for _, lane := range cfg.Lanes {
 		if strings.TrimSpace(lane.Role) != "" {
-			configured[strings.ToLower(strings.TrimSpace(lane.Role))] = true
+			role := strings.ToLower(strings.TrimSpace(lane.Role))
+			configured[role] = true
+			roleLanes[role] = lifecycle.CanonicalLane{Name: strings.TrimSpace(lane.Name), Role: strings.TrimSpace(lane.Role)}
 		}
+	}
+	registry, err := canonicalLaneRegistry(cfg)
+	if err != nil {
+		return nil, err
 	}
 	active := map[string][]lifecycle.HoldIdentity{}
 	for _, task := range tasks {
@@ -112,7 +119,8 @@ func loadProductionActiveTaskResolver(ctx context.Context) (lifecycle.ActiveTask
 		for _, label := range task.Labels {
 			role := strings.ToLower(strings.TrimSpace(label))
 			if configured[role] {
-				active[role] = append(active[role], lifecycle.HoldIdentity{Repository: repository, Owner: role, Lane: role, Task: ref, Scope: "task"})
+				lane := roleLanes[role]
+				active[lane.Name] = append(active[lane.Name], lifecycle.HoldIdentity{Repository: repository, Owner: lane.Role, Lane: lane.Name, Task: ref, Scope: "task"})
 			}
 		}
 	}
@@ -120,7 +128,11 @@ func loadProductionActiveTaskResolver(ctx context.Context) (lifecycle.ActiveTask
 		sort.Slice(active[role], func(i, j int) bool { return active[role][i].Task < active[role][j].Task })
 	}
 	return func(_ context.Context, lane string) ([]lifecycle.HoldIdentity, error) {
-		return append([]lifecycle.HoldIdentity(nil), active[lane]...), nil
+		canonical, err := registry.ResolveLaneName(lane)
+		if err != nil {
+			return nil, err
+		}
+		return append([]lifecycle.HoldIdentity(nil), active[canonical.Name]...), nil
 	}, nil
 }
 
@@ -131,7 +143,7 @@ func runHold() {
 		os.Exit(2)
 	}
 	if os.Args[2] == "--help" || os.Args[2] == "-h" {
-		fmt.Println("usage: herd hold <task> on|off|status --lane ROLE --owner ROLE [--until RFC3339|duration]")
+		fmt.Println("usage: herd hold <task> on|off|status --lane <configured-lane-name> --owner <configured-role> [--until RFC3339|duration]")
 		return
 	}
 	value := os.Args[2]
@@ -144,10 +156,10 @@ func runHold() {
 	actor := fs.String("actor", holdOwner(), "stable actor identifier")
 	reason := fs.String("reason", "operator hold", "stable reason")
 	code := fs.String("code", "operator_hold", "stable reason code")
-	lane := fs.String("lane", value, "exact lane identity (default: positional value)")
+	lane := fs.String("lane", value, "configured lane name; required for task scope")
 	task := fs.String("task", value, "exact task identity (default: positional value)")
 	scope := fs.String("scope", "task", "target scope: task or lane")
-	owner := fs.String("owner", "", "exact owner identity (default: lane)")
+	owner := fs.String("owner", "", "configured role; required for task scope")
 	repositoryFlag := fs.String("repository", "", "exact repository identity (default: current repository)")
 	generation := fs.Int64("generation", 0, "exact generation (default: next for hold, current for release/status)")
 	until := fs.String("until", "", "absolute RFC3339 time or bounded duration from now")
@@ -195,11 +207,36 @@ func runHold() {
 		fmt.Fprintln(os.Stderr, "hold: task scope requires explicit --lane and --owner")
 		os.Exit(2)
 	}
+	cfg, cfgErr := config.LoadConfig(".herd/herd.yaml")
+	if cfgErr != nil {
+		fmt.Fprintf(os.Stderr, "hold: %v\n", cfgErr)
+		os.Exit(1)
+	}
+	registry, regErr := canonicalLaneRegistry(cfg)
+	if regErr != nil {
+		fmt.Fprintf(os.Stderr, "hold: %v\n", regErr)
+		os.Exit(1)
+	}
+	var laneDef lifecycle.CanonicalLane
+	var laneErr error
+	if !laneSet && *scope == "lane" {
+		laneDef, laneErr = registry.ResolveRole(*lane)
+	} else {
+		laneDef, laneErr = registry.ResolveLaneName(*lane)
+	}
+	if laneErr != nil {
+		fmt.Fprintf(os.Stderr, "hold: %v\n", laneErr)
+		os.Exit(2)
+	}
 	ownerValue := strings.TrimSpace(*owner)
 	if ownerValue == "" {
-		ownerValue = strings.TrimSpace(*lane)
+		ownerValue = laneDef.Role
 	}
-	identity := lifecycle.HoldIdentity{Repository: repository, Owner: ownerValue, Lane: *lane, Task: *task, Scope: *scope}
+	if !strings.EqualFold(ownerValue, laneDef.Role) {
+		fmt.Fprintf(os.Stderr, "hold: owner %q does not match configured lane role %q\n", ownerValue, laneDef.Role)
+		os.Exit(2)
+	}
+	identity := lifecycle.HoldIdentity{Repository: repository, Owner: laneDef.Role, Lane: laneDef.Name, Task: *task, Scope: *scope}
 	current, err := a.CurrentGeneration(ctx, identity)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "hold: %v\n", err)

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/Kampe/Herdforge/pkg/claim"
@@ -60,12 +61,13 @@ type OwnershipClaimer interface {
 // processes) race to exactly one winner — proven by claim package tests and
 // deps.TestLeaseOwnership_TwoIndependentManagers_ExactlyOneWinner.
 type LeaseOwnership struct {
-	CM       *claim.ClaimManager
-	Store    claim.LeaseStore // for Close when we own it
-	Repo     string
-	Provider string
-	Project  string
-	closeDB  func() error
+	CM           *claim.ClaimManager
+	Store        claim.LeaseStore // for Close when we own it
+	Repo         string
+	Provider     string
+	Project      string
+	LaneResolver func(string) (string, error)
+	closeDB      func() error
 }
 
 // OpenLeaseOwnership opens (or creates) a SQLite lease DB at path and returns
@@ -122,6 +124,20 @@ func (o *LeaseOwnership) key(taskRef Ref) claim.LeaseKey {
 	}
 }
 
+func (o *LeaseOwnership) canonicalLane(role string) (string, error) {
+	if o.LaneResolver == nil {
+		return "", fmt.Errorf("canonical lane resolver is required")
+	}
+	lane, err := o.LaneResolver(role)
+	if err != nil {
+		return "", err
+	}
+	if strings.TrimSpace(lane) == "" {
+		return "", fmt.Errorf("unknown configured role %q", role)
+	}
+	return strings.TrimSpace(lane), nil
+}
+
 func newOwnerID(role string) string {
 	var b [8]byte
 	_, _ = rand.Read(b[:])
@@ -150,14 +166,18 @@ func (o *LeaseOwnership) ClaimExclusive(ctx context.Context, taskID TaskID, task
 	// claim.Claim requires Role == TaskRole and non-empty TaskRole.
 	ownerID := newOwnerID(role)
 	key := o.key(taskRef)
+	laneName, err := o.canonicalLane(role)
+	if err != nil {
+		return nil, err
+	}
 	lease, err := o.CM.Claim(ctx, claim.ClaimRequest{
 		Key:            key,
 		OwnerID:        ownerID,
 		Role:           role,
 		TaskRole:       role,
 		WorktreePath:   worktreeHint,
-		HoldIdentity:   lifecycle.HoldIdentity{Repository: o.Repo, Owner: role, Lane: role, Task: string(taskRef), Scope: "task"},
-		HoldIdentities: []lifecycle.HoldIdentity{{Repository: o.Repo, Owner: role, Lane: role, Scope: "lane"}, {Repository: o.Repo, Owner: role, Lane: role, Task: string(taskRef), Scope: "task"}},
+		HoldIdentity:   lifecycle.HoldIdentity{Repository: o.Repo, Owner: role, Lane: laneName, Task: string(taskRef), Scope: "task"},
+		HoldIdentities: []lifecycle.HoldIdentity{{Repository: o.Repo, Owner: role, Lane: laneName, Scope: "lane"}, {Repository: o.Repo, Owner: role, Lane: laneName, Task: string(taskRef), Scope: "task"}},
 	})
 	if err != nil {
 		var conflict *claim.ClaimConflictError

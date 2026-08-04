@@ -90,8 +90,9 @@ type ReapPolicy struct {
 	ActionPolicy string
 	// HoldReader and IdentityFor are required for destructive action. The
 	// identity is bound per candidate, never reduced to a lane boolean.
-	HoldReader  lifecycle.HoldReader
-	IdentityFor func(*WorktreeInfo) lifecycle.HoldIdentity
+	HoldReader     lifecycle.HoldReader
+	IdentityFor    func(*WorktreeInfo) lifecycle.HoldIdentity
+	IdentitySetFor func(*WorktreeInfo) []lifecycle.HoldIdentity
 }
 
 // ReapCandidate is one classified worktree with evidence and preservation guidance.
@@ -558,8 +559,31 @@ func validateDestructivePolicy(policy ReapPolicy) error {
 			return err
 		}
 	}
-	if policy.HoldReader == nil || policy.IdentityFor == nil {
+	if policy.HoldReader == nil || policy.IdentitySetFor == nil {
 		return fmt.Errorf("reap action refused: durable hold authority and exact identity resolver are required")
+	}
+	return nil
+}
+
+func validateCompositeHoldIdentities(ids []lifecycle.HoldIdentity) error {
+	if len(ids) != 2 {
+		return fmt.Errorf("reap action refused: exactly lane and task hold identities are required")
+	}
+	var lane, task *lifecycle.HoldIdentity
+	for i := range ids {
+		id := ids[i]
+		if id.Scope == "lane" && id.Task == "" {
+			lane = &id
+		}
+		if id.Scope == "task" && id.Task != "" {
+			task = &id
+		}
+	}
+	if lane == nil || task == nil || lane.Repository != task.Repository || lane.Owner != task.Owner || lane.Lane != task.Lane {
+		return fmt.Errorf("reap action refused: lane/task identities must share repository, owner, and lane")
+	}
+	if ids[0] == ids[1] {
+		return fmt.Errorf("reap action refused: duplicate hold identities")
 	}
 	return nil
 }
@@ -610,37 +634,62 @@ func (w *WorktreeManager) classifyOne(
 		Actor:        policy.Evidence.Actor,
 	}
 	if policy.AutoReap {
-		if policy.HoldReader == nil || policy.IdentityFor == nil {
+		if policy.HoldReader == nil || policy.IdentitySetFor == nil {
 			c.Class = ReapClassUnknown
 			c.Reason = "durable hold authority or exact identity unavailable"
 			c.PreserveAction = "keep worktree until hold identity is readable"
 			return c
 		}
-		generation := int64(1)
-		identity := policy.IdentityFor(wt)
-		if source, ok := policy.HoldReader.(interface {
-			CurrentGeneration(context.Context, lifecycle.HoldIdentity) (int64, error)
-		}); ok {
-			var genErr error
-			generation, genErr = source.CurrentGeneration(ctx, identity)
-			if genErr != nil {
-				err := genErr
+		var identities []lifecycle.HoldIdentity
+		if policy.IdentitySetFor != nil {
+			identities = policy.IdentitySetFor(wt)
+		}
+		if identities == nil && policy.IdentityFor != nil {
+			identities = []lifecycle.HoldIdentity{policy.IdentityFor(wt)}
+		}
+		if len(identities) == 0 {
+			c.Class = ReapClassUnknown
+			c.Reason = "exact lane/task hold identities unavailable"
+			c.PreserveAction = "preserve worktree until identities are readable"
+			return c
+		}
+		if err := validateCompositeHoldIdentities(identities); err != nil {
+			c.Class = ReapClassUnknown
+			c.Reason = err.Error()
+			c.PreserveAction = "preserve worktree until exact composite identities are available"
+			return c
+		}
+		for _, identity := range identities {
+			source, ok := policy.HoldReader.(interface {
+				CurrentGeneration(context.Context, lifecycle.HoldIdentity) (int64, error)
+			})
+			if !ok {
 				c.Class = ReapClassUnknown
-				c.Reason = "hold generation unavailable: " + err.Error()
+				c.Reason = "hold generation source unavailable"
 				c.PreserveAction = "keep worktree until the hold fence is readable"
 				return c
 			}
-		}
-		decision, err := policy.HoldReader.Check(ctx, identity, generation)
-		if err != nil || decision.Held {
-			c.Class = ReapClassUnknown
-			if err != nil {
-				c.Reason = "hold authority denied reap: " + err.Error()
-			} else {
-				c.Reason = "worktree identity is held"
+			generation, genErr := source.CurrentGeneration(ctx, identity)
+			if genErr != nil || generation <= 0 {
+				c.Class = ReapClassUnknown
+				c.Reason = "hold generation unavailable"
+				if genErr != nil {
+					c.Reason += ": " + genErr.Error()
+				}
+				c.PreserveAction = "keep worktree until the hold fence is readable"
+				return c
 			}
-			c.PreserveAction = "preserve worktree until the exact hold is released"
-			return c
+			decision, err := policy.HoldReader.Check(ctx, identity, generation)
+			if err != nil || decision.Held {
+				c.Class = ReapClassUnknown
+				if err != nil {
+					c.Reason = "hold authority denied reap: " + err.Error()
+				} else {
+					c.Reason = "worktree identity is held"
+				}
+				c.PreserveAction = "preserve worktree until the exact hold is released"
+				return c
+			}
 		}
 	}
 

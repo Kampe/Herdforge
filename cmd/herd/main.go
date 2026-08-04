@@ -1971,6 +1971,12 @@ func runDispatch() {
 	noLaunch := dispatchFlags.Bool("no-launch", false, "Skip agent launch")
 	laneName := dispatchFlags.String("lane", "worker", "Lane name from config")
 	dispatchFlags.Parse(os.Args[3:])
+	laneExplicit := false
+	dispatchFlags.Visit(func(f *flag.Flag) {
+		if f.Name == "lane" {
+			laneExplicit = true
+		}
+	})
 
 	cfg, err := config.LoadConfig(".herd/herd.yaml")
 	if err != nil {
@@ -1982,7 +1988,12 @@ func runDispatch() {
 		fmt.Fprintf(os.Stderr, "lane identity: %v\n", err)
 		os.Exit(1)
 	}
-	canonicalLane, err := registry.Resolve(*laneName)
+	var canonicalLane lifecycle.CanonicalLane
+	if laneExplicit {
+		canonicalLane, err = registry.ResolveLaneName(*laneName)
+	} else {
+		canonicalLane, err = registry.ResolveRole(*laneName)
+	}
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "lane identity: %v\n", err)
 		os.Exit(1)
@@ -2974,6 +2985,16 @@ func runKick() {
 		fmt.Fprintf(os.Stderr, "herd-kick: hold identity: %v\n", err)
 		os.Exit(1)
 	}
+	kickConfig, err := config.LoadConfig(".herd/herd.yaml")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "herd-kick: %v\n", err)
+		os.Exit(1)
+	}
+	kickRegistry, err := canonicalLaneRegistry(kickConfig)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "herd-kick: %v\n", err)
+		os.Exit(1)
+	}
 	activeResolver, err := loadProductionActiveTaskResolver(context.Background())
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "herd-kick: active task authority: %v\n", err)
@@ -2988,7 +3009,13 @@ func runKick() {
 		Reason:       *reason,
 		RaiseMissing: !*noRaise,
 		HoldReader:   authority,
-		Identity:     func(id string) lifecycle.HoldIdentity { return holdIdentity(id, id, repository) },
+		Identity: func(id string) (lifecycle.HoldIdentity, error) {
+			lane, resolveErr := kickRegistry.ResolveLiveAgentID(id)
+			if resolveErr != nil {
+				return lifecycle.HoldIdentity{}, resolveErr
+			}
+			return lifecycle.HoldIdentity{Repository: repository, Owner: lane.Role, Lane: lane.Name, Scope: "lane"}, nil
+		},
 		Generation: func(ctx context.Context, identity lifecycle.HoldIdentity) (int64, error) {
 			return authority.CurrentGeneration(ctx, identity)
 		},
@@ -3039,10 +3066,29 @@ func runAttention() {
 		fmt.Fprintf(os.Stderr, "herd-attention: active task authority: %v\n", err)
 		os.Exit(1)
 	}
-	result, err := attention.RunWithHoldReaderAndTasks(attentionAuthority, attentionRepository, activeResolver)
+	attentionConfig, err := config.LoadConfig(".herd/herd.yaml")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "herd-attention: %v\n", err)
+		os.Exit(1)
+	}
+	attentionRegistry, err := canonicalLaneRegistry(attentionConfig)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "herd-attention: %v\n", err)
+		os.Exit(1)
+	}
+	result, err := attention.RunWithHoldReaderAndTasks(attentionAuthority, attentionRepository, activeResolver, attentionRegistry)
 	if err != nil {
 		// Fail-closed: herdr unavailable or agent list parse error is a hard
 		// error, not a silent "fleet healthy".
+		if result != nil {
+			if *asJSON {
+				if out, marshalErr := json.MarshalIndent(result, "", "  "); marshalErr == nil {
+					fmt.Println(string(out))
+				}
+			} else {
+				fmt.Println(attention.Summary(*result))
+			}
+		}
 		fmt.Fprintf(os.Stderr, "herd-attention: %v\n", err)
 		os.Exit(1)
 	}
