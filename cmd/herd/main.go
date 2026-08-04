@@ -278,7 +278,12 @@ func runResetSafe() {
 		os.Exit(2)
 	}
 
-	plan, err := resetsafe.New(context.Background(), ".", args[0], resetsafe.Options{})
+	repoRoot, err := os.Getwd()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "herd-reset-safe: cannot resolve repo root: %v\n", err)
+		os.Exit(1)
+	}
+	plan, err := resetsafe.New(context.Background(), repoRoot, args[0], resetsafe.Options{})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
