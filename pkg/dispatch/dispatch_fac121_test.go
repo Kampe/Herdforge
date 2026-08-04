@@ -10,6 +10,7 @@ import (
 	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -92,6 +93,8 @@ type fakeHerdr struct {
 	model       string
 }
 
+var fakePaneSeq uint64
+
 type fixedGenerationOwnership struct {
 	generation int64
 }
@@ -132,7 +135,10 @@ func (f *fakeHerdr) TabCreateForTask(workspaceID, label, cwd string, _ bool) (*h
 	}
 	pane := f.paneID
 	if pane == "" {
-		pane = "pane-1"
+		// Keep fake tab reservations isolated. Production deliberately retains
+		// an identity after failed compensation, so reusing one pane across
+		// independent tests would exercise the collision guard, not dispatch.
+		pane = fmt.Sprintf("pane-test-%d", atomic.AddUint64(&fakePaneSeq, 1))
 	}
 	return &herdr.TabInfo{
 		ID: id, Label: label, Cwd: cwd,
@@ -698,7 +704,7 @@ func TestDispatch_CrashPoint_AgentStartClosesOrphanTab(t *testing.T) {
 		available: true,
 		workspace: "w1",
 		model:     "m",
-		tabID:     "orphan-tab",
+		tabID:     "orphan-tab-start",
 		startErr:  fmt.Errorf("agent_pane_busy forever"),
 	}
 	comp := &recordingCompensator{}
@@ -713,7 +719,7 @@ func TestDispatch_CrashPoint_AgentStartClosesOrphanTab(t *testing.T) {
 	if res != nil {
 		t.Cleanup(func() { os.RemoveAll(res.Worktree) })
 	}
-	if len(fh.closedTabs) != 1 || fh.closedTabs[0] != "orphan-tab" {
+	if len(fh.closedTabs) != 1 || fh.closedTabs[0] != "orphan-tab-start" {
 		t.Fatalf("expected orphan tab closed, got %v", fh.closedTabs)
 	}
 	if !hasCompensateReason(comp.compsCopy(), "agent_start_failed") {
@@ -733,7 +739,7 @@ func TestDispatch_AgentStart_TabCloseErrorNotSilent(t *testing.T) {
 		available: true,
 		workspace: "w1",
 		model:     "m",
-		tabID:     "orphan-tab",
+		tabID:     "orphan-tab-close",
 		startErr:  fmt.Errorf("agent start failed"),
 		closeErr:  fmt.Errorf("herdr tab close denied"),
 	}
@@ -784,7 +790,7 @@ func TestDispatch_CrashPoint_PromptFailureClosesTab(t *testing.T) {
 		available:  true,
 		workspace:  "w1",
 		model:      "m",
-		tabID:      "tab-prompt",
+		tabID:      "tab-prompt-delivery",
 		deliverErr: fmt.Errorf("never confirmed consumption"),
 	}
 	comp := &recordingCompensator{}
@@ -799,7 +805,7 @@ func TestDispatch_CrashPoint_PromptFailureClosesTab(t *testing.T) {
 	if res != nil {
 		t.Cleanup(func() { os.RemoveAll(res.Worktree) })
 	}
-	if len(fh.closedTabs) != 1 || fh.closedTabs[0] != "tab-prompt" {
+	if len(fh.closedTabs) != 1 || fh.closedTabs[0] != "tab-prompt-delivery" {
 		t.Fatalf("expected tab closed after prompt fail: %v", fh.closedTabs)
 	}
 	if !hasCompensateReason(comp.compsCopy(), "prompt_delivery_failed") {
@@ -816,7 +822,7 @@ func TestDispatch_PromptFailure_TabCloseErrorNotSilent(t *testing.T) {
 		available:  true,
 		workspace:  "w1",
 		model:      "m",
-		tabID:      "tab-prompt",
+		tabID:      "tab-prompt-close",
 		deliverErr: fmt.Errorf("never confirmed consumption"),
 		closeErr:   fmt.Errorf("socket dead on close"),
 	}

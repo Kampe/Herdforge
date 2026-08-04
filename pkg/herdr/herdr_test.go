@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"reflect"
 	"strings"
 	"testing"
@@ -48,6 +49,71 @@ func TestAgentListDecodesExactSessionValue(t *testing.T) {
 	}
 	if agents[0].Session.Value != "session-actual" {
 		t.Fatalf("session=%q", agents[0].Session.Value)
+	}
+}
+
+func TestProductionRecoveryRebindsDurableProvisionalByExactPaneProcess(t *testing.T) {
+	owner := toolchild.Identity{TabID: "tab-recover", PaneID: "pane-recover", Name: "worker", Provider: "codex", Repository: "repo-recover", TaskRef: "FAC-188", Role: "worker", Lane: "lane", SessionGeneration: 9, LaunchID: "launch", ArgvDigest: "digest", Argv: []string{"codex", "--model", "gpt-5.6-luna", "-c", "model_reasoning_effort=medium"}}
+	lc := toolchild.NewLifecycle(owner, &toolchild.FakeTree{}, &toolchild.MemorySink{})
+	oldRun := runHerdr
+	defer func() { runHerdr = oldRun }()
+	runHerdr = func(args ...string) (string, error) {
+		if len(args) == 2 && args[0] == "agent" && args[1] == "list" {
+			return `{"result":{"agents":[{"name":"worker","agent":"codex","pane_id":"pane-recover","tab_id":"tab-recover","agent_session":{"value":"session-recover"}}]}}`, nil
+		}
+		return `{"result":{"process_info":{"foreground_processes":[{"pid":501,"name":"codex","cwd":"/repo","argv":["codex","--model","gpt-5.6-luna","-c","model_reasoning_effort=medium"]},{"pid":500,"name":"node","cwd":"/repo","argv":["node","/opt/codex"]}]}}}`, nil
+	}
+	oldToken, oldParent := readPIDStartToken, readPIDParent
+	defer func() { readPIDStartToken, readPIDParent = oldToken, oldParent }()
+	readPIDStartToken = func(pid int) (string, error) { return fmt.Sprintf("start-%d", pid), nil }
+	readPIDParent = func(pid int) (int, error) {
+		if pid == 501 {
+			return 500, nil
+		}
+		return 1, nil
+	}
+	if err := bindRecoveredToolChildLifecycle(lc); err != nil {
+		t.Fatal(err)
+	}
+	if !lc.Bound() || lc.Inventory.Owner.PID != 501 || lc.Inventory.Owner.StartToken != "start-501" || lc.Inventory.Owner.SessionID != "session-recover" {
+		t.Fatalf("recovered owner was not exact: %+v", lc.Inventory.Owner)
+	}
+}
+
+func TestPaneProcessInfoAcceptsOnlyTypedPaneNotFound(t *testing.T) {
+	old := runHerdr
+	defer func() { runHerdr = old }()
+	runHerdr = func(args ...string) (string, error) {
+		if len(args) == 4 {
+			return `{"error":{"code":"pane_not_found","message":"pane no longer exists"}}`, errors.New("exit status 1")
+		}
+		return `{"result":{"process_info":{"foreground_processes":[]}}}`, nil
+	}
+	if _, err := paneProcesses("old-pane"); !errors.Is(err, ErrPaneNotFound) {
+		t.Fatalf("typed absence = %v", err)
+	}
+	runHerdr = func(args ...string) (string, error) {
+		return `{"error":{"code":"transport_failed"}}`, errors.New("exit status 1")
+	}
+	if _, err := paneProcesses("old-pane"); errors.Is(err, ErrPaneNotFound) || err == nil {
+		t.Fatalf("arbitrary failure accepted: %v", err)
+	}
+}
+
+func TestVerifyHerdrTerminalRequiresExactTabAndAgentAbsence(t *testing.T) {
+	old := runHerdr
+	defer func() { runHerdr = old }()
+	runHerdr = func(args ...string) (string, error) {
+		if len(args) == 2 && args[0] == "tab" {
+			return `{"result":{"tabs":[]}}`, nil
+		}
+		if len(args) == 2 && args[0] == "agent" {
+			return `{"result":{"agents":[]}}`, nil
+		}
+		return `{"error":{"code":"pane_not_found"}}`, errors.New("exit status 1")
+	}
+	if err := verifyHerdrTerminal("tab-old", "pane-old"); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -103,6 +169,9 @@ func TestAgentStartBoundaryRejectsRawAndRequiresDecision(t *testing.T) {
 	var calls [][]string
 	runHerdr = func(args ...string) (string, error) {
 		calls = append(calls, append([]string(nil), args...))
+		if len(args) == 2 && args[0] == "tab" && args[1] == "list" {
+			return `{"result":{"tabs":[]}}`, nil
+		}
 		return "{}", nil
 	}
 	if err := AgentStart("raw", "codex", "pane", "--model", launch.WorkerModel); err == nil {
@@ -111,11 +180,11 @@ func TestAgentStartBoundaryRejectsRawAndRequiresDecision(t *testing.T) {
 	if len(calls) != 0 {
 		t.Fatalf("raw rejection invoked process API: %v", calls)
 	}
-	d, err := testLaunchRouter(t).Decide(router.LaunchRequest{Role: router.RoleWorker, Shape: launch.Implementation, RequestedProvider: launch.WorkerProvider, RequestedModel: launch.WorkerModel, RequestedEffort: launch.WorkerEffort, ProbeResults: map[string]bool{router.ProbeKey(launch.WorkerProvider, launch.WorkerModel): true}})
+	d, err := testLaunchRouter(t).Decide(router.LaunchRequest{Role: router.RoleWorker, Shape: launch.Implementation, RequestedProvider: launch.WorkerProvider, RequestedModel: launch.WorkerModel, RequestedEffort: launch.WorkerEffort, TaskRef: "FAC-188", LeaseGeneration: 7, Scope: router.ScopeTask, ProbeResults: map[string]bool{router.ProbeKey(launch.WorkerProvider, launch.WorkerModel): true}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	req := launch.Request{Decision: d}
+	req := launch.Request{Decision: d, TaskRef: "FAC-188", Repository: "repo", Lane: "worker", SessionGeneration: 1, Scope: router.ScopeTask, LeaseGeneration: d.LeaseGeneration}
 	if err := AgentStartWithDecision("worker", "codex", "pane", req); err != nil {
 		t.Fatal(err)
 	}
@@ -135,14 +204,17 @@ func TestPreparedStartUsesPaneProcessInfoAndExactRoutedOwner(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	req := launch.Request{Decision: d, TaskRef: d.TaskRef, LeaseGeneration: d.LeaseGeneration, Scope: d.Scope}
-	owner := toolchild.Identity{PID: 501, StartToken: "agent-start", SessionGeneration: req.LeaseGeneration, LaunchID: launch.DecisionDigest(d), Repository: "herdforge", Role: launch.WorkerRole, Lane: "worker", SessionID: "session-1", PaneID: "pane-1", Provider: launch.WorkerProvider, ArgvDigest: launch.DecisionDigest(d)}
+	req := launch.Request{Decision: d, TaskRef: d.TaskRef, LeaseGeneration: d.LeaseGeneration, Scope: d.Scope, Repository: "herdforge-test", Lane: "worker"}
+	owner := toolchild.Identity{PID: 501, StartToken: "agent-start", SessionGeneration: req.LeaseGeneration, LaunchID: launch.DecisionDigest(d), Repository: "herdforge-test", Role: launch.WorkerRole, Lane: "worker", SessionID: "session-1", PaneID: "pane-1", TabID: "tab-1", Provider: launch.WorkerProvider, ArgvDigest: launch.DecisionDigest(d)}
 	tree := &toolchild.FakeTree{Nodes: map[int]toolchild.Node{501: {Identity: owner}, 601: {Identity: toolchild.Identity{PID: 601, ParentPID: 501, StartToken: "child-start"}, ParentPID: 501}}}
 	lc := toolchild.NewLifecycle(toolchild.Identity{}, tree, &toolchild.MemorySink{})
 	restoreFactory := SetToolChildLifecycleFactory(func(launch.Request, string, string) (ToolChildLifecycle, error) { return lc, nil })
 	defer restoreFactory()
 	calledInfo := false
 	runHerdr = func(args ...string) (string, error) {
+		if len(args) == 2 && args[0] == "tab" && args[1] == "list" {
+			return `{"result":{"tabs":[]}}`, nil
+		}
 		if len(args) >= 2 && args[0] == "agent" && args[1] == "start" {
 			return `{}`, nil
 		}
@@ -159,6 +231,7 @@ func TestPreparedStartUsesPaneProcessInfoAndExactRoutedOwner(t *testing.T) {
 	if err := StartPreparedAgent("tab-1", "worker", "codex", "pane-1", req); err != nil {
 		t.Fatal(err)
 	}
+	defer dropToolChild("tab-1", "pane-1")
 	if !calledInfo {
 		t.Fatal("agent-list-only path did not query exact pane process-info")
 	}
@@ -170,7 +243,250 @@ func TestPreparedStartUsesPaneProcessInfoAndExactRoutedOwner(t *testing.T) {
 	}
 }
 
+func TestStartPreparedValidationFailureCompensatesProvisionedAuthority(t *testing.T) {
+	d, err := testLaunchRouter(t).Decide(router.LaunchRequest{Role: router.RoleWorker, Shape: launch.Implementation, RequestedProvider: launch.WorkerProvider, RequestedModel: launch.WorkerModel, RequestedEffort: launch.WorkerEffort, TaskRef: "FAC-188", LeaseGeneration: 7, Scope: router.ScopeTask, ProbeResults: map[string]bool{router.ProbeKey(launch.WorkerProvider, launch.WorkerModel): true}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := t.TempDir() + "/receipts.jsonl"
+	lc := toolchild.NewLifecycle(toolchild.Identity{}, &toolchild.FakeTree{}, &toolchild.JSONLSink{Path: path})
+	restore := SetToolChildLifecycleFactory(func(launch.Request, string, string) (ToolChildLifecycle, error) { return lc, nil })
+	defer restore()
+	old := runHerdr
+	defer func() { runHerdr = old }()
+	list := 0
+	runHerdr = func(args ...string) (string, error) {
+		if len(args) == 2 && args[0] == "agent" && args[1] == "list" {
+			list++
+			if list == 1 {
+				return `{"result":{"agents":[{"name":"worker","agent":"codex","pane_id":"pane","tab_id":"tab","agent_session":{"value":"session"}}]}}`, nil
+			}
+			return `{"result":{"agents":[]}}`, nil
+		}
+		if len(args) == 2 && args[0] == "tab" && args[1] == "list" {
+			return `{"result":{"tabs":[]}}`, nil
+		}
+		if len(args) == 3 && args[0] == "tab" && args[1] == "close" {
+			return `{}`, nil
+		}
+		if len(args) == 4 && args[0] == "pane" {
+			return `{"result":{"process_info":{"foreground_processes":[]}}}`, nil
+		}
+		return `{}`, nil
+	}
+	req := launch.Request{Decision: d, TaskRef: d.TaskRef, LeaseGeneration: d.LeaseGeneration, Scope: d.Scope, Repository: "repo", Lane: "worker"}
+	if err := StartPreparedAgent("tab", "worker", "wrong-provider", "pane", req); err == nil {
+		t.Fatal("provider validation unexpectedly passed")
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatal(err)
+	}
+	if lc.Bound() {
+		t.Fatal("failed pre-bind compensation retained a bound owner")
+	}
+}
+
 func mustJSON(v any) string { b, _ := json.Marshal(v); return string(b) }
+
+type rollbackLifecycle struct {
+	bound                                            bool
+	events                                           *[]string
+	beginErr, reconcileErr, invalidateErr, verifyErr error
+}
+
+func (l *rollbackLifecycle) Bind(toolchild.Identity) error { l.bound = true; return nil }
+func (l *rollbackLifecycle) Bound() bool                   { return l.bound }
+func (l *rollbackLifecycle) Begin() error                  { return l.beginErr }
+func (l *rollbackLifecycle) Reconcile(string) error {
+	*l.events = append(*l.events, "reconcile")
+	return l.reconcileErr
+}
+func (l *rollbackLifecycle) Invalidate(string) error {
+	*l.events = append(*l.events, "tombstone")
+	return l.invalidateErr
+}
+func (l *rollbackLifecycle) VerifyTerminal() error {
+	*l.events = append(*l.events, "terminal-readback")
+	return l.verifyErr
+}
+
+func TestRollbackCrashMatrixRetainsAuthorityUntilTerminalTombstone(t *testing.T) {
+	cases := []struct {
+		name                                             string
+		bound                                            bool
+		reconcileErr, closeErr, invalidateErr, verifyErr error
+		keepLive                                         bool
+		wantErr, wantRetained                            bool
+	}{
+		{name: "after-herdr-start"},
+		{name: "after-bind-failure"},
+		{name: "after-begin-failure", bound: true, reconcileErr: errors.New("begin failure"), wantErr: true, wantRetained: true},
+		{name: "after-launch-receipt-failure", bound: true},
+		{name: "after-child-reconcile", bound: true, reconcileErr: errors.New("child reconcile crash"), wantErr: true, wantRetained: true},
+		{name: "before-tab-close", closeErr: errors.New("close crash"), wantErr: true, wantRetained: true},
+		{name: "after-close-before-readback", keepLive: true, wantErr: true, wantRetained: true},
+		{name: "after-terminal-readback-before-tombstone", invalidateErr: errors.New("tombstone crash"), wantErr: true, wantRetained: true},
+		{name: "after-tombstone", verifyErr: errors.New("terminal readback crash"), wantErr: true, wantRetained: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			old := runHerdr
+			defer func() { runHerdr = old }()
+			var events []string
+			lc := &rollbackLifecycle{bound: tc.bound, events: &events, reconcileErr: tc.reconcileErr, invalidateErr: tc.invalidateErr, verifyErr: tc.verifyErr}
+			toolChildMu.Lock()
+			toolChildByPane["pane-crash"] = lc
+			toolChildByTab["tab-crash"] = lc
+			toolChildMu.Unlock()
+			defer dropToolChild("tab-crash", "pane-crash")
+			listCalls := 0
+			runHerdr = func(args ...string) (string, error) {
+				if len(args) == 2 && args[0] == "tab" && args[1] == "list" {
+					return `{"result":{"tabs":[]}}`, nil
+				}
+				if len(args) == 4 && args[0] == "pane" && args[1] == "process-info" {
+					return `{"result":{"process_info":{"foreground_processes":[]}}}`, nil
+				}
+				if len(args) == 2 && args[0] == "agent" && args[1] == "list" {
+					listCalls++
+					if tc.keepLive || listCalls == 1 {
+						return `{"result":{"agents":[{"name":"worker","pane_id":"pane-crash","tab_id":"tab-crash"}]}}`, nil
+					}
+					return `{"result":{"agents":[]}}`, nil
+				}
+				if len(args) == 3 && args[0] == "tab" && args[1] == "close" {
+					if tc.closeErr != nil {
+						return "", tc.closeErr
+					}
+					return `{}`, nil
+				}
+				return `{}`, nil
+			}
+			err := rollbackToolChild("tab-crash", "pane-crash", lc, tc.name)
+			if tc.wantErr != (err != nil) {
+				t.Fatalf("error=%v wantErr=%v events=%v", err, tc.wantErr, events)
+			}
+			toolChildMu.Lock()
+			_, retained := toolChildByTab["tab-crash"]
+			toolChildMu.Unlock()
+			if tc.wantRetained != retained {
+				t.Fatalf("retained=%v want=%v events=%v", retained, tc.wantRetained, events)
+			}
+			if !tc.wantErr && (len(events) == 0 || events[len(events)-1] != "terminal-readback") {
+				t.Fatalf("terminal evidence missing: %v", events)
+			}
+		})
+	}
+}
+
+// This table enters the real StartPreparedAgent -> AgentStartWithDecision ->
+// bind/Begin/receipt/rollback path. Herdr, process identity and lifecycle are
+// all fake adapters; no host process or signal is involved.
+func TestProductionStartCrashMatrixRetainsAuthorityUntilReadback(t *testing.T) {
+	cases := []struct {
+		name                                                                          string
+		startErr, bindErr, beginErr, reconcileErr, closeErr, invalidateErr, verifyErr bool
+		keepLive                                                                      bool
+	}{
+		{name: "after-preparation-before-start", startErr: true},
+		{name: "after-herdr-start-before-bind", bindErr: true},
+		{name: "bind-failure", bindErr: true},
+		{name: "begin-inventory-failure", beginErr: true},
+		{name: "launch-receipt-failure"},
+		{name: "child-reap-intent-result-failure", reconcileErr: true},
+		{name: "before-raw-tab-close", closeErr: true},
+		{name: "after-raw-tab-close-before-readback", keepLive: true},
+		{name: "after-terminal-readback-before-tombstone", invalidateErr: true},
+		{name: "after-tombstone-readback", verifyErr: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			d, err := testLaunchRouter(t).Decide(router.LaunchRequest{Role: router.RoleWorker, Shape: launch.Implementation, RequestedProvider: launch.WorkerProvider, RequestedModel: launch.WorkerModel, RequestedEffort: launch.WorkerEffort, TaskRef: "FAC-188", LeaseGeneration: 7, Scope: router.ScopeTask, ProbeResults: map[string]bool{router.ProbeKey(launch.WorkerProvider, launch.WorkerModel): true}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var events []string
+			lc := &rollbackLifecycle{events: &events}
+			if tc.beginErr {
+				lc.beginErr = errors.New("injected Begin failure")
+			}
+			if tc.reconcileErr {
+				lc.reconcileErr = errors.New("injected reap intent/result failure")
+			}
+			if tc.invalidateErr {
+				lc.invalidateErr = errors.New("injected tombstone boundary failure")
+			}
+			if tc.verifyErr {
+				lc.verifyErr = errors.New("injected terminal readback failure")
+			}
+			restoreFactory := SetToolChildLifecycleFactory(func(launch.Request, string, string) (ToolChildLifecycle, error) { return lc, nil })
+			defer restoreFactory()
+			if !tc.startErr {
+				t.Setenv("HERD_LAUNCH_RECEIPTS", t.TempDir()+"/receipts.jsonl")
+			} else {
+				t.Setenv("HERD_LAUNCH_RECEIPTS", t.TempDir()+"/receipts.jsonl")
+			}
+			oldRun := runHerdr
+			defer func() { runHerdr = oldRun }()
+			defer dropToolChild("tab-crash-prod", "pane-crash-prod")
+			defer SetPIDParentReader(func(int) (int, error) { return 500, nil })()
+			defer SetPIDStartTokenReader(func(int) (string, error) { return "start-agent", nil })()
+			listCalls := 0
+			closeDone := false
+			runHerdr = func(args ...string) (string, error) {
+				if len(args) >= 2 && args[0] == "agent" && args[1] == "start" && tc.startErr {
+					return "", errors.New("injected Herdr start failure")
+				}
+				if len(args) == 2 && args[0] == "agent" && args[1] == "list" {
+					listCalls++
+					if tc.keepLive || listCalls == 1 {
+						return `{"result":{"agents":[{"name":"worker","agent":"codex","pane_id":"pane-crash-prod","tab_id":"tab-crash-prod","agent_session":{"value":"session"}}]}}`, nil
+					}
+					return `{"result":{"agents":[]}}`, nil
+				}
+				if len(args) == 2 && args[0] == "tab" && args[1] == "list" {
+					return `{"result":{"tabs":[]}}`, nil
+				}
+				if len(args) == 3 && args[0] == "tab" && args[1] == "close" {
+					if tc.closeErr {
+						return "", errors.New("injected tab close failure")
+					}
+					closeDone = true
+					return `{}`, nil
+				}
+				if len(args) == 4 && args[0] == "pane" && args[1] == "process-info" {
+					if closeDone && !tc.keepLive {
+						return `{"result":{"process_info":{"foreground_processes":[]}}}`, nil
+					}
+					if tc.bindErr {
+						return `{"result":{"process_info":{"foreground_processes":[]}}}`, nil
+					}
+					native := append([]string{"/opt/homebrew/bin/codex"}, d.Argv[1:]...)
+					return fmt.Sprintf(`{"result":{"process_info":{"foreground_processes":[{"pid":500,"name":"node","argv":["node","/opt/homebrew/bin/codex"],"cwd":"/repo"},{"pid":501,"name":"codex","argv":%s,"cwd":"/repo"}]}}}`, mustJSON(native)), nil
+				}
+				return `{}`, nil
+			}
+			req := launch.Request{Decision: d, TaskRef: d.TaskRef, LeaseGeneration: d.LeaseGeneration, SessionGeneration: 42, Scope: d.Scope, Repository: "repo", Lane: "worker"}
+			if tc.name == "launch-receipt-failure" || tc.reconcileErr || tc.closeErr || tc.keepLive || tc.invalidateErr || tc.verifyErr {
+				t.Setenv("HERD_LAUNCH_RECEIPTS", "/dev/null/receipts.jsonl")
+			}
+			err = StartPreparedAgent("tab-crash-prod", "worker", "codex", "pane-crash-prod", req)
+			if err == nil {
+				t.Fatal("crash boundary unexpectedly succeeded")
+			}
+			if tc.reconcileErr || tc.closeErr || tc.keepLive || tc.invalidateErr || tc.verifyErr {
+				if lifecycleForTab("tab-crash-prod") == nil {
+					t.Fatalf("authority dropped before verified terminal state: %v", events)
+				}
+			}
+			if tc.invalidateErr || tc.verifyErr || tc.keepLive || tc.closeErr || tc.reconcileErr {
+				if len(events) == 0 {
+					t.Fatalf("authority events missing: %v", events)
+				}
+			}
+		})
+	}
+}
 
 func TestAgentStartRequiresExactClaimGenerationBeforeProcess(t *testing.T) {
 	t.Setenv("HERD_LAUNCH_RECEIPTS", t.TempDir()+"/receipts.jsonl")
@@ -194,7 +510,7 @@ func TestAgentStartRequiresExactClaimGenerationBeforeProcess(t *testing.T) {
 	for name, generation := range map[string]int64{"zero": 0, "mismatch": 6} {
 		t.Run(name, func(t *testing.T) {
 			before := len(calls)
-			err := AgentStartWithDecision("worker", launch.WorkerProvider, "pane", launch.Request{Decision: d, TaskRef: "FAC-178", LeaseGeneration: generation, Scope: router.ScopeTask})
+			err := AgentStartWithDecision("worker", launch.WorkerProvider, "pane", launch.Request{Decision: d, TaskRef: "FAC-178", Repository: "repo", Lane: "worker", SessionGeneration: 42, LeaseGeneration: generation, Scope: router.ScopeTask})
 			if err == nil {
 				t.Fatal("zero or mismatched generation must fail before process seam")
 			}
@@ -204,7 +520,7 @@ func TestAgentStartRequiresExactClaimGenerationBeforeProcess(t *testing.T) {
 		})
 	}
 	before := len(calls)
-	if err := AgentStartWithDecision("worker", launch.WorkerProvider, "pane", launch.Request{Decision: d, TaskRef: "FAC-178", LeaseGeneration: 7, Scope: router.ScopeTask}); err != nil {
+	if err := AgentStartWithDecision("worker", launch.WorkerProvider, "pane", launch.Request{Decision: d, TaskRef: "FAC-178", Repository: "repo", Lane: "worker", SessionGeneration: 42, LeaseGeneration: 7, Scope: router.ScopeTask}); err != nil {
 		t.Fatalf("exact generation must reach injected process seam: %v", err)
 	}
 	if len(calls) != before+1 {
@@ -234,8 +550,8 @@ func TestResumeUsesDurableClientIdentityNotHerdrMetadata(t *testing.T) {
 		}
 		return "{}", nil
 	}
-	if got, err := ResolveAgentTabWithDecision("standing-worker", launch.Request{Decision: d, TaskRef: "FAC-175", LeaseGeneration: d.LeaseGeneration, Scope: router.ScopeTask}); err != nil || got != "standing-worker" {
-		t.Fatalf("durable resume failed: %q %v", got, err)
+	if got, err := ResolveAgentTabWithDecision("standing-worker", launch.Request{Decision: d, TaskRef: "FAC-175", LeaseGeneration: d.LeaseGeneration, Scope: router.ScopeTask}); err == nil || got != "" {
+		t.Fatalf("unbound provisional resume must fail closed: %q %v", got, err)
 	}
 	if _, err := ResolveAgentTabWithDecision("standing-worker", launch.Request{Decision: d, TaskRef: "other", LeaseGeneration: d.LeaseGeneration, Scope: router.ScopeTask}); err == nil {
 		t.Fatal("different task identity must fail closed before resume")
@@ -404,7 +720,7 @@ func TestResumeRejectsMissingAndStaleReceiptsWithoutProcessOrPrompt(t *testing.T
 
 func TestReceiptFailureClosesAndVerifiesExactTab(t *testing.T) {
 	t.Setenv("HERD_LAUNCH_RECEIPTS", "/dev/null/launch-receipts.jsonl")
-	d, err := testLaunchRouter(t).Decide(router.LaunchRequest{Role: router.RoleWorker, Shape: launch.Implementation, RequestedProvider: launch.WorkerProvider, RequestedModel: launch.WorkerModel, RequestedEffort: launch.WorkerEffort, ProbeResults: map[string]bool{router.ProbeKey(launch.WorkerProvider, launch.WorkerModel): true}})
+	d, err := testLaunchRouter(t).Decide(router.LaunchRequest{Role: router.RoleWorker, Shape: launch.Implementation, RequestedProvider: launch.WorkerProvider, RequestedModel: launch.WorkerModel, RequestedEffort: launch.WorkerEffort, TaskRef: "FAC-188", LeaseGeneration: 7, Scope: router.ScopeTask, ProbeResults: map[string]bool{router.ProbeKey(launch.WorkerProvider, launch.WorkerModel): true}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -423,7 +739,7 @@ func TestReceiptFailureClosesAndVerifiesExactTab(t *testing.T) {
 		}
 		return "{}", nil
 	}
-	if err := AgentStartWithDecision("worker", "codex", "pane", launch.Request{Decision: d}); err == nil || !strings.Contains(err.Error(), "process stopped") {
+	if err := AgentStartWithDecision("worker", "codex", "pane", launch.Request{Decision: d, TaskRef: "FAC-188", Repository: "repo", Lane: "worker", SessionGeneration: 42, LeaseGeneration: 7, Scope: router.ScopeTask}); err == nil || !strings.Contains(err.Error(), "process stopped") {
 		t.Fatalf("receipt failure must be hard and compensated: %v", err)
 	}
 	if len(calls) < 4 || !reflect.DeepEqual(calls[2], []string{"tab", "close", "tab"}) {

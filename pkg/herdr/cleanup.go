@@ -2,6 +2,7 @@ package herdr
 
 import (
 	"fmt"
+	"github.com/Kampe/Herdforge/pkg/toolchild"
 	"strings"
 )
 
@@ -56,13 +57,27 @@ func TabClose(tabID string) error {
 	if err := ReconcileToolChild(tabID, "tab-close"); err != nil {
 		return fmt.Errorf("tool-child teardown before tab close %s: %w", tabID, err)
 	}
+	lc := lifecycleForTab(tabID)
+	paneID := ""
+	if concrete, ok := lc.(*toolchild.Lifecycle); ok {
+		paneID = concrete.Inventory.Owner.PaneID
+	}
 	out, err := runHerdr("tab", "close", tabID)
 	if err != nil {
 		return fmt.Errorf("herdr tab close %s: %s: %w", tabID, out, err)
 	}
-	toolChildMu.Lock()
-	delete(toolChildByTab, tabID)
-	toolChildMu.Unlock()
+	if paneID != "" {
+		if err := verifyHerdrTerminal(tabID, paneID); err != nil {
+			return fmt.Errorf("tab close terminal readback %s: %w", tabID, err)
+		}
+		if err := lc.Invalidate("tab-close"); err != nil {
+			return err
+		}
+		if err := lc.VerifyTerminal(); err != nil {
+			return err
+		}
+		dropToolChild(tabID, paneID)
+	}
 	return nil
 }
 

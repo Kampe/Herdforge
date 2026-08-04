@@ -18,8 +18,30 @@ import (
 	"github.com/Kampe/Herdforge/pkg/preflight"
 	"github.com/Kampe/Herdforge/pkg/provider"
 	"github.com/Kampe/Herdforge/pkg/router"
+	"github.com/Kampe/Herdforge/pkg/toolchild"
 	"github.com/Kampe/Herdforge/pkg/worktree"
 )
+
+// AuthenticatedRepositoryIdentity is the sole production repository binding
+// used by launch/lifecycle authority. The config project name is display-only.
+func AuthenticatedRepositoryIdentity(root string) (string, error) {
+	return toolchild.RepositoryIdentity(root)
+}
+
+func (d *Dispatcher) repositoryIdentity() (string, error) {
+	root := "."
+	if d.Worktree != nil && d.Worktree.RepoRoot() != "" {
+		root = d.Worktree.RepoRoot()
+	}
+	id, err := AuthenticatedRepositoryIdentity(root)
+	if err == nil {
+		return id, nil
+	}
+	if d.Production {
+		return "", err
+	}
+	return "test-repository:" + filepath.Clean(root), nil
+}
 
 // LaunchStep names a partial side-effect during dispatch (FAC-121).
 // FAC-119's transactional outbox must persist these for crash recovery.
@@ -237,10 +259,7 @@ func (d *Dispatcher) ownershipClaimer() (deps.OwnershipClaimer, error) {
 	providerType := "memory"
 	project := ""
 	if d.Config != nil {
-		repo = d.Config.Project.Name
-		if repo == "" {
-			repo = "herd"
-		}
+		repo, _ = d.repositoryIdentity()
 		providerType = d.Config.TaskProvider.Type
 		project = d.Config.TaskProvider.ProjectID
 	}
@@ -622,6 +641,21 @@ func (d *Dispatcher) launch(
 	if err := launch.Validate(request, nil); err != nil {
 		return &launchFailure{Reason: "launch_policy_rejected", Err: err}
 	}
+	if d.Production {
+		request.Repository, err = AuthenticatedRepositoryIdentity(d.Worktree.RepoRoot())
+		if err != nil {
+			return &launchFailure{Reason: "repository_identity_missing", Err: err}
+		}
+	} else {
+		request.Repository, err = d.repositoryIdentity()
+		if err != nil {
+			return &launchFailure{Reason: "repository_identity_missing", Err: err}
+		}
+	}
+	request.Lane = lane.Name
+	if request.Repository == "" || request.Lane == "" {
+		return &launchFailure{Reason: "launch_identity_missing", Err: fmt.Errorf("repository and lane identity are required")}
+	}
 	model := request.Decision.Model
 	result.Model = model
 
@@ -696,7 +730,7 @@ func (d *Dispatcher) launch(
 
 	repository := ""
 	if d.Config != nil {
-		repository = d.Config.Project.Name
+		repository, _ = d.repositoryIdentity()
 	}
 	identity := control.LaneIdentity{Repository: repository, TaskRef: task.Ref, Lane: lane.Name, LeaseGeneration: result.LeaseGeneration, CandidateSHA: wtInfo.BaseSHA}
 	if identity.Repository == "" || identity.CandidateSHA == "" {
