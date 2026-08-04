@@ -816,8 +816,7 @@ type pidTokenObservation struct {
 	err  error
 }
 
-func observePIDToken(ctx context.Context, path string, bound time.Duration) (procToken, error) {
-	deadline := time.Now().Add(bound)
+func observePIDToken(ctx context.Context, path string, deadline time.Time) (procToken, error) {
 	for {
 		data, err := os.ReadFile(path)
 		if err == nil {
@@ -1427,12 +1426,13 @@ func TestExecuteDetachedSessionAndBackgroundWriters(t *testing.T) {
 	observerCtx, cancelObservers := context.WithCancel(context.Background())
 	observations := make(chan pidTokenObservation, 2)
 	observerDone := make(chan struct{}, 2)
+	observerDeadline := time.Now().Add(5 * time.Second)
 	var observedMu sync.Mutex
 	var observedTokens []procToken
 	observe := func(path string) {
 		go func() {
 			defer func() { observerDone <- struct{}{} }()
-			tok, err := observePIDToken(observerCtx, path, 5*time.Second)
+			tok, err := observePIDToken(observerCtx, path, observerDeadline)
 			if err == nil {
 				observedMu.Lock()
 				observedTokens = append(observedTokens, tok)
@@ -1454,26 +1454,56 @@ func TestExecuteDetachedSessionAndBackgroundWriters(t *testing.T) {
 	observe(sessionPidFile)
 	observe(groupPidFile)
 	// Register before any readiness wait. Cleanup order is explicit: cancel
-	// Execute and observers, join all three within a bound, then recheck and
-	// reap only the stored start-token identities before TempDir cleanup.
+	// Execute first; give both observers one shared capture deadline, then
+	// cancel unfinished observers, join all three, and reap only stored tokens.
 	t.Cleanup(func() {
 		cancel()
-		cancelObservers()
 		select {
 		case <-finished:
 		case <-time.After(3 * time.Second):
 			t.Errorf("cleanup: Execute did not stop after cancellation")
 		}
-		for range 2 {
+		observersJoined := 0
+		captureWindow := time.Until(observerDeadline)
+		if captureWindow < 0 {
+			captureWindow = 0
+		}
+		captureTimer := time.NewTimer(captureWindow)
+		captureExpired := false
+		for observersJoined < 2 && !captureExpired {
 			select {
 			case <-observerDone:
-			case <-time.After(3 * time.Second):
-				t.Errorf("cleanup: PID observer did not stop after cancellation")
+				observersJoined++
+			case <-captureTimer.C:
+				captureExpired = true
 			}
 		}
+		if !captureExpired && !captureTimer.Stop() {
+			select {
+			case <-captureTimer.C:
+			default:
+			}
+		}
+		cancelObservers()
+		for observersJoined < 2 {
+			<-observerDone
+			observersJoined++
+		}
+		for {
+			select {
+			case <-observations:
+			default:
+				goto observationsDrained
+			}
+		}
+	observationsDrained:
 		observedMu.Lock()
 		tokens := append([]procToken(nil), observedTokens...)
 		observedMu.Unlock()
+		if len(tokens) == 0 {
+			t.Errorf("cleanup: no fixture PID/start-token identity was captured")
+			return
+		}
 		reapExactTokens(t, tokens...)
 	})
 	if _, err := waitForChildReadyPID(startedFile, 5*time.Second); err != nil {
