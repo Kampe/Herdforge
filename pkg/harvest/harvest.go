@@ -90,6 +90,10 @@ func (h *Harvester) listWorktrees(ctx context.Context) ([]string, error) {
 }
 
 func (h *Harvester) checkUnmerged(ctx context.Context, worktreePath string) (*UnmergedWork, error) {
+	return h.checkUnmergedMode(ctx, worktreePath, false)
+}
+
+func (h *Harvester) checkUnmergedMode(ctx context.Context, worktreePath string, strict bool) (*UnmergedWork, error) {
 	branchCmd := exec.CommandContext(ctx, "git", "rev-parse", "--abbrev-ref", "HEAD")
 	branchCmd.Dir = worktreePath
 	branchOut, err := branchCmd.Output()
@@ -104,12 +108,17 @@ func (h *Harvester) checkUnmerged(ctx context.Context, worktreePath string) (*Un
 
 	fetchCmd := exec.CommandContext(ctx, "git", "fetch", "origin", "main")
 	fetchCmd.Dir = worktreePath
-	_ = fetchCmd.Run()
+	if err := fetchCmd.Run(); err != nil && strict {
+		return nil, fmt.Errorf("git fetch origin main: %w", err)
+	}
 
 	cherryCmd := exec.CommandContext(ctx, "git", "cherry", "origin/main", branch)
 	cherryCmd.Dir = worktreePath
 	cherryOut, err := cherryCmd.Output()
 	if err != nil {
+		if strict {
+			return nil, fmt.Errorf("git cherry origin/main %s: %w", branch, err)
+		}
 		return nil, nil
 	}
 

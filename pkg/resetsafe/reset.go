@@ -125,7 +125,7 @@ func New(ctx context.Context, repoRoot, worktreePath string, opts Options) (*Wor
 		return nil, fmt.Errorf("herd-reset-safe: %s has uncommitted changes, refusing:\n  %s\nherd-reset-safe: commit or stash first, then re-run", worktreePath, strings.Join(dirty, "\n  "))
 	}
 
-	u, err := harvest.NewHarvester(canonicalRoot).UnmergedFor(ctx, canonicalWorktree)
+	u, err := harvest.NewHarvester(canonicalRoot).UnmergedForStrict(ctx, canonicalWorktree)
 	if err != nil {
 		return nil, fmt.Errorf("herd-reset-safe: cannot verify unmerged work: %w", err)
 	}
@@ -183,6 +183,12 @@ func (p *WorktreePlan) Run(ctx context.Context) (*WorktreePlan, error) {
 	}
 	if err := revalidate(ctx, a); err != nil {
 		return nil, err
+	}
+	if len(a.unique) > 0 {
+		preserveSHA, err := gitOutput(ctx, a.worktree, "show-ref", "--hash", "--verify", "refs/heads/"+a.preserveBranch)
+		if err != nil || strings.TrimSpace(preserveSHA) != a.head {
+			return nil, fmt.Errorf("herd-reset-safe: preserve ref changed")
+		}
 	}
 	if err := gitRunFn(ctx, a.worktree, "reset", "--hard", "origin/main"); err != nil {
 		return nil, fmt.Errorf("herd-reset-safe: reset failed: %w", err)
