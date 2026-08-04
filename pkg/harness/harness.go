@@ -50,7 +50,7 @@ func (h *HarnessConfig) BuildPolicyInvocation(prompt string, policy agentpolicy.
 	}
 	argv := h.BuildInvocation(prompt)
 	if h.Type == HarnessClaude {
-		argv = []string{h.BinaryName, "--mcp-config", "{}", "--strict-mcp-config", "--disable-slash-commands", "--disallowed-tools", "Agent", "Task", "-p", prompt}
+		argv = []string{h.BinaryName, "--mcp-config", "{}", "--strict-mcp-config", "--disable-slash-commands", "--disallowed-tools", "Agent", "Task", "ToolSearch", "-p", prompt}
 	}
 	if h.Type == HarnessCodex {
 		promptIndex := -1
