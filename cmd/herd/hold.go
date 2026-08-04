@@ -149,6 +149,9 @@ func executeHoldCommand(ctx context.Context, req holdCommandRequest, deps holdCo
 	if deps.Now == nil {
 		deps.Now = time.Now
 	}
+	if strings.TrimSpace(req.Owner) == "" || req.Owner != strings.TrimSpace(req.Owner) {
+		return errors.New("hold owner is required and must be canonical")
+	}
 
 	authenticated, err := deps.AuthenticateRepository()
 	if err != nil {
@@ -226,21 +229,6 @@ func executeHoldCommand(ctx context.Context, req holdCommandRequest, deps holdCo
 		return err
 	}
 	return deps.Flush()
-}
-
-func prepareHoldCommand(cfg *config.Config, laneValue, task, scope string, explicitLane bool, owner, repository string, open func() (holdAuthorityBoundary, error)) (lifecycle.HoldIdentity, holdAuthorityBoundary, error) {
-	identity, err := composeHoldIdentity(cfg, laneValue, task, scope, explicitLane, owner, repository)
-	if err != nil {
-		return lifecycle.HoldIdentity{}, nil, err
-	}
-	if open == nil {
-		return lifecycle.HoldIdentity{}, nil, errors.New("hold authority opener is required")
-	}
-	authority, err := open()
-	if err != nil {
-		return lifecycle.HoldIdentity{}, nil, err
-	}
-	return identity, authority, nil
 }
 
 func holdOwner() string {
