@@ -14,8 +14,8 @@ func (testIssuer) Issue(string, string, AuthTuple) (IssuerProof, error) {
 	return IssuerProof{MAC: []byte("test-issuer-mac"), Nonce: "test-issuer-nonce"}, nil
 }
 
-func fixtureTuple() AuthTuple {
-	return AuthTuple{Repository: "fixture-repo", Task: "FAC-190", LeaseID: "lease-1", Lane: "foundation", Session: "test-session", SessionGeneration: "generation-1", HerdrTab: "tab-1", HerdrPane: "pane-1", ProcessIdentity: "process-1", ArgvIdentity: "argv-1", PolicyDigest: "policy-v1", AllowedRoots: []string{"fixture-root"}}
+func fixtureTuple(root string) AuthTuple {
+	return AuthTuple{Repository: "fixture-repo", Task: "FAC-190", LeaseID: "lease-1", Lane: "foundation", Session: "test-session", SessionGeneration: "generation-1", HerdrTab: "tab-1", HerdrPane: "pane-1", ProcessIdentity: "process-1", ArgvIdentity: "argv-1", PolicyDigest: "policy-v1", AllowedRoots: []string{root}}
 }
 
 func fixture(t *testing.T) (Boundary, Capability, string, string) {
@@ -29,7 +29,7 @@ func fixture(t *testing.T) (Boundary, Capability, string, string) {
 	if err := os.WriteFile(sentinel, []byte(sentinelContents), 0600); err != nil {
 		t.Fatal(err)
 	}
-	b, cap, err := New(root, sentinel, fixtureTuple(), testIssuer{})
+	b, cap, err := New(root, sentinel, fixtureTuple(root), testIssuer{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -91,7 +91,7 @@ func TestNestedRelativeWriteSucceeds(t *testing.T) {
 
 func TestChildAndGrandchildAttemptsDenied(t *testing.T) {
 	b, cap, shared, _ := fixture(t)
-	cmd := Command{Name: "worker", ProcessIdentity: "worker-process", ArgvIdentity: "worker-argv", Children: []Command{{Name: "child", ProcessIdentity: "child-process", ArgvIdentity: "child-argv", Children: []Command{{Name: "grandchild", ProcessIdentity: "grandchild-process", ArgvIdentity: "grandchild-argv", Paths: []string{filepath.Join(shared, "grandchild.out")}}}}}}
+	cmd := Command{Name: "worker", ProcessIdentity: cap.tuple.ProcessIdentity, ArgvIdentity: cap.tuple.ArgvIdentity, Children: []Command{{Name: "child", ProcessIdentity: "child-process", ArgvIdentity: "child-argv", Children: []Command{{Name: "grandchild", ProcessIdentity: "grandchild-process", ArgvIdentity: "grandchild-argv", Paths: []string{filepath.Join(shared, "grandchild.out")}}}}}}
 	if err := b.AuthorizeCommand(cap, cmd); err == nil {
 		t.Fatal("grandchild outside-root write was authorized")
 	}
@@ -154,6 +154,13 @@ func TestSentinelReplacementDenied(t *testing.T) {
 	}
 }
 
+func TestSentinelMutationDenied(t *testing.T) {
+	b, cap, _, _ := fixture(t)
+	if err := b.AuthorizeWrite(cap, cap.sentinel); !errors.Is(err, ErrSentinelMutation) {
+		t.Fatalf("sentinel write error = %v", err)
+	}
+}
+
 func TestCommandShapeBounded(t *testing.T) {
 	b, cap, shared, _ := fixture(t)
 	invalid := []Command{
@@ -164,6 +171,21 @@ func TestCommandShapeBounded(t *testing.T) {
 		if err := b.AuthorizeCommand(cap, command); !errors.Is(err, ErrInvalidCommand) {
 			t.Fatalf("invalid command error = %v", err)
 		}
+	}
+	wrongIdentity := Command{Name: "worker", ProcessIdentity: "wrong-process", ArgvIdentity: cap.tuple.ArgvIdentity, Paths: []string{"ok"}}
+	if err := b.AuthorizeCommand(cap, wrongIdentity); !errors.Is(err, ErrInvalidCommand) {
+		t.Fatalf("wrong root identity error = %v", err)
+	}
+	widePaths := Command{Name: "wide-paths", ProcessIdentity: cap.tuple.ProcessIdentity, ArgvIdentity: cap.tuple.ArgvIdentity, Paths: make([]string, maxCommandNodes+1)}
+	if err := b.AuthorizeCommand(cap, widePaths); !errors.Is(err, ErrInvalidCommand) {
+		t.Fatalf("wide path command error = %v", err)
+	}
+	wideChildren := Command{Name: "wide-children", ProcessIdentity: cap.tuple.ProcessIdentity, ArgvIdentity: cap.tuple.ArgvIdentity, Children: make([]Command, maxCommandNodes)}
+	for i := range wideChildren.Children {
+		wideChildren.Children[i] = Command{Name: "child", ProcessIdentity: "p", ArgvIdentity: "a", Paths: []string{"ok"}}
+	}
+	if err := b.AuthorizeCommand(cap, wideChildren); !errors.Is(err, ErrInvalidCommand) {
+		t.Fatalf("wide child command error = %v", err)
 	}
 	deep := Command{Name: "0", ProcessIdentity: "p", ArgvIdentity: "a", Paths: []string{"ok"}}
 	for i := 1; i < maxCommandDepth+1; i++ {
@@ -217,6 +239,11 @@ func TestRootSentinelAndCapabilityAreSeparate(t *testing.T) {
 	if _, _, err := New(root, siblingSentinel, cap.tuple, testIssuer{}); !errors.Is(err, ErrInvalidSentinel) {
 		t.Fatalf("sibling sentinel error = %v", err)
 	}
+	wrongRootTuple := cap.tuple
+	wrongRootTuple.AllowedRoots = []string{shared}
+	if _, _, err := New(root, filepath.Join(root, ".worktree-sentinel"), wrongRootTuple, testIssuer{}); !errors.Is(err, ErrUnauthenticated) {
+		t.Fatalf("unallowed root error = %v", err)
+	}
 	if err := b.AuthorizeWrite(Capability{root: cap.root, sentinel: cap.sentinel, tuple: cap.tuple}, filepath.Join(root, "ok")); !errors.Is(err, ErrUnauthenticated) {
 		t.Fatalf("uncredentialed capability error = %v", err)
 	}
@@ -235,7 +262,7 @@ func TestSymlinkedRootRejected(t *testing.T) {
 	if err := os.Symlink(root, alias); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := New(alias, filepath.Join(alias, "sentinel"), fixtureTuple(), testIssuer{}); !errors.Is(err, ErrSymlink) {
+	if _, _, err := New(alias, filepath.Join(alias, "sentinel"), fixtureTuple(alias), testIssuer{}); !errors.Is(err, ErrSymlink) {
 		t.Fatalf("symlinked root error = %v", err)
 	}
 }

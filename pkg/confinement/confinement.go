@@ -21,6 +21,7 @@ var (
 	ErrDifferentDevice     = errors.New("confinement: path is on a different device")
 	ErrUnsupportedIdentity = errors.New("confinement: unsupported filesystem identity")
 	ErrInvalidCommand      = errors.New("confinement: invalid or unbounded command")
+	ErrSentinelMutation    = errors.New("confinement: sentinel mutation is not allowed")
 )
 
 const sentinelContents = "herdforge-worktree-sentinel\n"
@@ -94,6 +95,20 @@ func New(root, sentinel string, tuple AuthTuple, issuer Issuer) (Boundary, Capab
 	if err != nil {
 		return nil, Capability{}, err
 	}
+	canonicalRoots := make([]string, 0, len(tuple.AllowedRoots))
+	rootAllowed := false
+	for _, allowedRoot := range tuple.AllowedRoots {
+		canonicalAllowed, err := canonicalRoot(allowedRoot)
+		if err != nil {
+			return nil, Capability{}, ErrUnauthenticated
+		}
+		canonicalRoots = append(canonicalRoots, canonicalAllowed)
+		rootAllowed = rootAllowed || canonicalAllowed == rootCanonical
+	}
+	if !rootAllowed {
+		return nil, Capability{}, ErrUnauthenticated
+	}
+	tuple.AllowedRoots = canonicalRoots
 	sentinelAbs, err := filepath.Abs(filepath.Clean(sentinel))
 	if err != nil {
 		return nil, Capability{}, fmt.Errorf("authenticate sentinel: %w", ErrInvalidSentinel)
@@ -176,6 +191,9 @@ func (boundary) AuthorizeWrite(cap Capability, path string) error {
 	if !isDescendant(canonical, cap.root) {
 		return ErrOutsideRoot
 	}
+	if canonical == cap.sentinel {
+		return ErrSentinelMutation
+	}
 	if err := sameDevice(canonical, cap.rootID); err != nil {
 		return err
 	}
@@ -186,21 +204,28 @@ func (b boundary) AuthorizeCommand(cap Capability, command Command) error {
 	if err := validateCapability(cap); err != nil {
 		return err
 	}
-	return b.authorizeCommand(cap, command, 0, 0)
+	nodes := 0
+	return b.authorizeCommand(cap, command, 0, &nodes, true)
 }
 
-func (b boundary) authorizeCommand(cap Capability, command Command, depth, nodes int) error {
-	if command.Name == "" || command.ProcessIdentity == "" || command.ArgvIdentity == "" || len(command.Paths)+len(command.Children) == 0 || depth >= maxCommandDepth || nodes >= maxCommandNodes {
+func (b boundary) authorizeCommand(cap Capability, command Command, depth int, nodes *int, root bool) error {
+	if command.Name == "" || command.ProcessIdentity == "" || command.ArgvIdentity == "" || len(command.Paths)+len(command.Children) == 0 || len(command.Paths) > maxCommandNodes || depth >= maxCommandDepth || *nodes >= maxCommandNodes {
 		return ErrInvalidCommand
 	}
-	nodes++
+	if root && (command.ProcessIdentity != cap.tuple.ProcessIdentity || command.ArgvIdentity != cap.tuple.ArgvIdentity) {
+		return ErrInvalidCommand
+	}
+	*nodes = *nodes + 1
+	if *nodes+len(command.Paths)+len(command.Children) > maxCommandNodes {
+		return ErrInvalidCommand
+	}
 	for _, path := range command.Paths {
 		if err := b.AuthorizeWrite(cap, path); err != nil {
 			return fmt.Errorf("command %q: %w", command.Name, err)
 		}
 	}
 	for _, child := range command.Children {
-		if err := b.authorizeCommand(cap, child, depth+1, nodes); err != nil {
+		if err := b.authorizeCommand(cap, child, depth+1, nodes, false); err != nil {
 			return fmt.Errorf("child of %q: %w", command.Name, err)
 		}
 	}
