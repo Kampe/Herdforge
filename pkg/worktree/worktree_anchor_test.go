@@ -3,15 +3,15 @@ package worktree
 import (
 	"context"
 	"os"
-	"os/exec"
 	"strings"
 	"testing"
+
+	"github.com/Kampe/Herdforge/internal/testgit"
 )
 
 func gitOut(t *testing.T, dir string, args ...string) string {
 	t.Helper()
-	c := exec.Command("git", args...)
-	c.Dir = dir
+	c := testgit.Command(dir, args...)
 	out, err := c.CombinedOutput()
 	if err != nil {
 		return ""

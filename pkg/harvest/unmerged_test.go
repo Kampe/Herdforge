@@ -2,17 +2,15 @@ package harvest
 
 import (
 	"context"
-	"os/exec"
 	"strings"
 	"testing"
+
+	"github.com/Kampe/Herdforge/internal/testgit"
 )
 
 func gitIn(t *testing.T, dir string, args ...string) string {
 	t.Helper()
-	base := []string{"-c", "commit.gpgSign=false", "-c", "gpg.x509.program=false", "-c", "gpg.format=openpgp", "-c", "tag.gpgSign=false", "-c", "user.email=test@herdforge.local", "-c", "user.name=Test Runner"}
-	gitArgs := append(base, args...)
-	cmd := exec.Command("git", gitArgs...)
-	cmd.Dir = dir
+	cmd := testgit.Command(dir, args...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("git %v: %v\n%s", args, err, out)

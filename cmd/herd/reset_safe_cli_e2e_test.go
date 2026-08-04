@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/Kampe/Herdforge/internal/testgit"
 )
 
 type resetSafeRepo struct {
@@ -13,6 +15,16 @@ type resetSafeRepo struct {
 	worktree string
 	sibling  string
 	remote   string
+}
+
+func runResetSafeGit(t *testing.T, dir string, args ...string) string {
+	t.Helper()
+	cmd := testgit.Command(dir, args...)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %v failed: %v\n%s", args, err, out)
+	}
+	return string(out)
 }
 
 func newResetSafeRepo(t *testing.T) resetSafeRepo {
@@ -29,7 +41,7 @@ func newResetSafeRepo(t *testing.T) resetSafeRepo {
 	runGitT(t, f.root, "config", "user.email", "reset-safe@test.invalid")
 	runGitT(t, f.root, "config", "user.name", "Reset Safe Test")
 	runGitT(t, f.root, "config", "commit.gpgSign", "false")
-	runGitT(t, f.root, "commit", "--allow-empty", "-q", "-m", "base")
+	runResetSafeGit(t, f.root, "commit", "--allow-empty", "-q", "-m", "base")
 	runGitT(t, f.root, "remote", "add", "origin", f.remote)
 	runGitT(t, f.root, "push", "-q", "-u", "origin", "main")
 	f.worktree = filepath.Join(t.TempDir(), "feature-wt")
@@ -172,7 +184,7 @@ func TestResetSafeCompiledPacketOnlySuccessIsDisposable(t *testing.T) {
 func TestResetSafeCompiledPushFailurePreservesLocalRefAndSibling(t *testing.T) {
 	binary := buildHerd(t)
 	f := newResetSafeRepo(t)
-	runGitT(t, f.worktree, "commit", "--allow-empty", "-q", "-m", "unique")
+	runResetSafeGit(t, f.worktree, "commit", "--allow-empty", "-q", "-m", "unique")
 	uniqueSHA := strings.TrimSpace(runGitT(t, f.worktree, "rev-parse", "HEAD"))
 	shortSHA := strings.TrimSpace(runGitT(t, f.worktree, "rev-parse", "--short", "HEAD"))
 	preserve := "harvest/feature-cli-" + shortSHA
@@ -202,7 +214,7 @@ func TestResetSafeCompiledPushFailurePreservesLocalRefAndSibling(t *testing.T) {
 func TestResetSafeCompiledSuccessPushesAndDoesNotAddWorktrees(t *testing.T) {
 	binary := buildHerd(t)
 	f := newResetSafeRepo(t)
-	runGitT(t, f.worktree, "commit", "--allow-empty", "-q", "-m", "unique")
+	runResetSafeGit(t, f.worktree, "commit", "--allow-empty", "-q", "-m", "unique")
 	uniqueSHA := strings.TrimSpace(runGitT(t, f.worktree, "rev-parse", "HEAD"))
 	shortSHA := strings.TrimSpace(runGitT(t, f.worktree, "rev-parse", "--short", "HEAD"))
 	preserve := "harvest/feature-cli-" + shortSHA
@@ -285,7 +297,7 @@ func TestResetSafeCompiledFetchesFreshOriginMainBeforePlanning(t *testing.T) {
 		t.Fatal(err)
 	}
 	runGitT(t, updater, "add", "remote.txt")
-	runGitT(t, updater, "commit", "-q", "-m", "advance remote main")
+	runResetSafeGit(t, updater, "commit", "-q", "-m", "advance remote main")
 	newOrigin := strings.TrimSpace(runGitT(t, updater, "rev-parse", "HEAD"))
 	if newOrigin == oldOrigin {
 		t.Fatalf("fixture did not advance updater main: still at %s", newOrigin)

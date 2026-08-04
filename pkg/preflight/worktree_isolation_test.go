@@ -4,6 +4,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/Kampe/Herdforge/internal/testgit"
 )
 
 func TestCheckAgentStayedInWorktree(t *testing.T) {
@@ -106,17 +108,23 @@ func initMinimalRepo(t *testing.T, dir string) {
 	mustRun(t, dir, "git", "config", "user.name", "Test")
 	writeFile(t, filepath.Join(dir, ".gitkeep"), "")
 	mustRun(t, dir, "git", "add", ".")
-	mustRun(t, dir, "git", "-c", "commit.gpgSign=false", "commit", "-m", "initial")
+	mustRun(t, dir, "git", "commit", "-m", "initial")
 }
 
 func addAndCommit(t *testing.T, dir, msg string) {
 	t.Helper()
 	mustRun(t, dir, "git", "add", ".")
-	mustRun(t, dir, "git", "-c", "commit.gpgSign=false", "commit", "-m", msg)
+	mustRun(t, dir, "git", "commit", "-m", msg)
 }
 
 func mustRun(t *testing.T, dir, name string, args ...string) {
 	t.Helper()
+	if name == "git" {
+		if out, err := testgit.Command(dir, args...).CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+		return
+	}
 	_, err := runCmd(dir, name, args...)
 	if err != nil {
 		t.Fatalf("%s %v: %v", name, args, err)
