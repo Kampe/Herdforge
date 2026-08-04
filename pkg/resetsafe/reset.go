@@ -75,6 +75,9 @@ func NewWorktree(ctx context.Context, worktree string) (string, string, error) {
 	if branch == "main" || branch == "master" {
 		return "", "", fmt.Errorf("herd-reset-safe: refusing on '%s' — this is for feature-branch worktrees, never the shared main checkout", branch)
 	}
+	if branch == "HEAD" {
+		return "", "", fmt.Errorf("herd-reset-safe: refusing on detached HEAD — a feature branch is required for preservation")
+	}
 	short, err := gitOutput(ctx, worktree, "rev-parse", "--short", "HEAD")
 	if err != nil {
 		return "", "", fmt.Errorf("herd-reset-safe: %s has no readable HEAD: %w", worktree, err)
@@ -90,6 +93,9 @@ func New(ctx context.Context, repoRoot, worktreePath string, opts Options) (*Wor
 	}
 	branch, short, err := NewWorktree(ctx, worktreePath)
 	if err != nil {
+		return nil, err
+	}
+	if err := sameRepository(ctx, repoRoot, worktreePath); err != nil {
 		return nil, err
 	}
 	if dirty, err := dirtyFiles(ctx, worktreePath); err != nil {
@@ -175,5 +181,24 @@ func gitOutput(ctx context.Context, dir string, args ...string) (string, error) 
 
 func gitRun(ctx context.Context, dir string, args ...string) error {
 	cmd := exec.CommandContext(ctx, "git", append([]string{"-C", filepath.Clean(dir)}, args...)...)
+	cmd.Stdout = io.Discard
+	cmd.Stderr = io.Discard
 	return cmd.Run()
+}
+
+func sameRepository(ctx context.Context, repoRoot, worktreePath string) error {
+	rootCommon, err := gitOutput(ctx, repoRoot, "rev-parse", "--path-format=absolute", "--git-common-dir")
+	if err != nil {
+		return fmt.Errorf("herd-reset-safe: repo root is not a git repository")
+	}
+	worktreeCommon, err := gitOutput(ctx, worktreePath, "rev-parse", "--path-format=absolute", "--git-common-dir")
+	if err != nil {
+		return fmt.Errorf("herd-reset-safe: %s is not owned by repo root", worktreePath)
+	}
+	rootCommon, _ = filepath.EvalSymlinks(strings.TrimSpace(rootCommon))
+	worktreeCommon, _ = filepath.EvalSymlinks(strings.TrimSpace(worktreeCommon))
+	if filepath.Clean(rootCommon) != filepath.Clean(worktreeCommon) {
+		return fmt.Errorf("herd-reset-safe: %s is not owned by repo root", worktreePath)
+	}
+	return nil
 }
