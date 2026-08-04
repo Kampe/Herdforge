@@ -80,10 +80,16 @@ func (w *WorktreeManager) admitDisk(operation, targetPath string) error {
 	if err != nil {
 		return fmt.Errorf("disk capacity gate: resolve temporary volume: %w", err)
 	}
+	requirement, err := resources.AggregateDiskRequirement(resources.DefaultWorktreeCreateRequirement())
+	if err != nil {
+		return fmt.Errorf("disk capacity gate: invalid worktree requirement")
+	}
 	decision := w.DiskAdmission.Admit(resources.DiskRequest{
 		Operation:       operation,
 		Path:            repo,
 		TempPath:        tmp,
+		RequiredBytes:   requirement.Bytes,
+		RequiredInodes:  requirement.Inodes,
 		AdditionalPaths: []string{target},
 	})
 	if decision.Allowed {

@@ -3,13 +3,18 @@ package harvest
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
+
+	"github.com/Kampe/Herdforge/pkg/resources"
 )
+
+var execCommandContext = exec.CommandContext
 
 type UnmergedWork struct {
 	WorktreePath string   `json:"worktree_path"`
@@ -23,14 +28,25 @@ type HarvestResult struct {
 }
 
 type Harvester struct {
-	repoRoot string
+	repoRoot      string
+	DiskAdmission resources.DiskAdmission
 }
 
 func NewHarvester(repoRoot string) *Harvester {
-	return &Harvester{repoRoot: repoRoot}
+	return &Harvester{repoRoot: repoRoot, DiskAdmission: resources.NewCapacityGate(resources.OSBackend{}, resources.DefaultDiskPolicy())}
 }
 
 func (h *Harvester) Harvest(ctx context.Context) (*HarvestResult, error) {
+	return h.harvest(ctx, true)
+}
+
+// HarvestReadOnly inventories existing refs without fetching or otherwise
+// fabricating a mutation. Dry-run integration uses this path.
+func (h *Harvester) HarvestReadOnly(ctx context.Context) (*HarvestResult, error) {
+	return h.harvest(ctx, false)
+}
+
+func (h *Harvester) harvest(ctx context.Context, fetch bool) (*HarvestResult, error) {
 	result := &HarvestResult{}
 	var mu sync.Mutex
 	var wg sync.WaitGroup
@@ -40,17 +56,35 @@ func (h *Harvester) Harvest(ctx context.Context) (*HarvestResult, error) {
 		return nil, fmt.Errorf("list worktrees: %w", err)
 	}
 
+	eligible := make([]string, 0, len(worktrees))
 	for _, wt := range worktrees {
 		canonical, _ := filepath.EvalSymlinks(h.repoRoot)
 		wtCanonical, _ := filepath.EvalSymlinks(wt)
 		if canonical != "" && wtCanonical != "" && canonical == wtCanonical {
 			continue
 		}
+		eligible = append(eligible, wt)
+	}
+	// Capacity is checked before goroutine fan-out so a failed probe cannot
+	// start concurrent fetches or leave a partially-mutating harvest.
+	if fetch {
+		requirement, err := resources.AggregateDiskRequirement(resources.DefaultMergeRequirement(), resources.DefaultWorktreeCreateRequirement())
+		if err != nil {
+			return nil, fmt.Errorf("disk capacity gate: invalid harvest requirement")
+		}
+		for _, wt := range eligible {
+			if err := h.admitDisk("harvest_fetch", wt, requirement); err != nil {
+				return nil, err
+			}
+		}
+	}
+
+	for _, wt := range eligible {
 
 		wg.Add(1)
 		go func(path string) {
 			defer wg.Done()
-			u, err := h.checkUnmerged(ctx, path)
+			u, err := h.checkUnmergedMode(ctx, path, false, fetch)
 			if err != nil {
 				mu.Lock()
 				result.Errors = append(result.Errors, fmt.Sprintf("%s: %v", path, err))
@@ -69,8 +103,36 @@ func (h *Harvester) Harvest(ctx context.Context) (*HarvestResult, error) {
 	return result, nil
 }
 
+func (h *Harvester) admitDisk(operation, worktreePath string, requirement resources.DiskRequirement) error {
+	if h == nil || h.DiskAdmission == nil {
+		return fmt.Errorf("disk capacity gate unavailable for %s", operation)
+	}
+	repo, err := resources.ResolveExistingPath(h.repoRoot)
+	if err != nil {
+		return fmt.Errorf("disk capacity gate: resolve repository volume: %w", err)
+	}
+	worktree, err := resources.ResolveExistingPath(worktreePath)
+	if err != nil {
+		return fmt.Errorf("disk capacity gate: resolve worktree volume: %w", err)
+	}
+	tmp, err := resources.ResolveExistingPath(os.TempDir())
+	if err != nil {
+		return fmt.Errorf("disk capacity gate: resolve temporary volume: %w", err)
+	}
+	decision := h.DiskAdmission.Admit(resources.DiskRequest{
+		Operation: operation, Path: repo, TempPath: tmp,
+		RequiredBytes: requirement.Bytes, RequiredInodes: requirement.Inodes,
+		AdditionalPaths: []string{worktree},
+	})
+	if decision.Allowed {
+		return nil
+	}
+	evidence, _ := json.Marshal(decision.Evidence)
+	return fmt.Errorf("disk capacity gate blocked: state=%s evidence=%s", decision.State, evidence)
+}
+
 func (h *Harvester) listWorktrees(ctx context.Context) ([]string, error) {
-	cmd := exec.CommandContext(ctx, "git", "worktree", "list", "--porcelain")
+	cmd := execCommandContext(ctx, "git", "worktree", "list", "--porcelain")
 	cmd.Dir = h.repoRoot
 	out, err := cmd.Output()
 	if err != nil {
@@ -94,7 +156,7 @@ func (h *Harvester) checkUnmerged(ctx context.Context, worktreePath string) (*Un
 }
 
 func (h *Harvester) checkUnmergedMode(ctx context.Context, worktreePath string, strict, fetch bool) (*UnmergedWork, error) {
-	branchCmd := exec.CommandContext(ctx, "git", "rev-parse", "--abbrev-ref", "HEAD")
+	branchCmd := execCommandContext(ctx, "git", "rev-parse", "--abbrev-ref", "HEAD")
 	branchCmd.Dir = worktreePath
 	branchOut, err := branchCmd.Output()
 	if err != nil {
@@ -107,14 +169,21 @@ func (h *Harvester) checkUnmergedMode(ctx context.Context, worktreePath string, 
 	}
 
 	if fetch {
-		fetchCmd := exec.CommandContext(ctx, "git", "fetch", "origin", "main")
+		requirement, err := resources.AggregateDiskRequirement(resources.DefaultMergeRequirement(), resources.DefaultWorktreeCreateRequirement())
+		if err != nil {
+			return nil, fmt.Errorf("disk capacity gate: invalid harvest requirement")
+		}
+		if err := h.admitDisk("harvest_fetch", worktreePath, requirement); err != nil {
+			return nil, err
+		}
+		fetchCmd := execCommandContext(ctx, "git", "fetch", "origin", "main")
 		fetchCmd.Dir = worktreePath
 		if err := fetchCmd.Run(); err != nil && strict {
 			return nil, fmt.Errorf("git fetch origin main: %w", err)
 		}
 	}
 
-	cherryCmd := exec.CommandContext(ctx, "git", "cherry", "origin/main", branch)
+	cherryCmd := execCommandContext(ctx, "git", "cherry", "origin/main", branch)
 	cherryCmd.Dir = worktreePath
 	cherryOut, err := cherryCmd.Output()
 	if err != nil {
@@ -169,7 +238,7 @@ func PaneAttentionFromHerdr(ctx context.Context, workspace string) ([]PaneAttent
 	if workspace != "" {
 		args = append(args, "--workspace", workspace)
 	}
-	cmd := exec.CommandContext(ctx, "herdr", args...)
+	cmd := execCommandContext(ctx, "herdr", args...)
 	out, err := cmd.Output()
 	if err != nil {
 		return nil, fmt.Errorf("herdr agent list: %w", err)
