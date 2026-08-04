@@ -195,6 +195,11 @@ type AtomicLeaseStore interface {
 	AcquireWithIdentity(context.Context, LeaseKey, string, string, string, string, string, string, time.Time, time.Duration) (*Lease, error)
 }
 
+type RecoveryStore interface {
+	SnapshotExpiredLeases(context.Context, time.Time) ([]*Lease, error)
+	ExpireLeaseCAS(context.Context, int64, int64, time.Time) (*Lease, bool, error)
+}
+
 // ClaimConflictError reports why an Acquire lost the race, with enough
 // detail for callers/dashboards to explain the block: current owner,
 // generation, and expiry.

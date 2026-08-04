@@ -117,6 +117,45 @@ func (s *InMemoryLeaseStore) AcquireWithIdentity(ctx context.Context, key LeaseK
 	return s.acquire(ctx, key, ownerID, role, worktreePath, holdRepository, holdOwner, holdLane, now, ttl)
 }
 
+func (s *InMemoryLeaseStore) SnapshotExpiredLeases(_ context.Context, now time.Time) ([]*Lease, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []*Lease
+	for _, l := range s.rows {
+		if l.Status == StatusActive && !l.Held && !now.Before(l.ExpiresAt) {
+			out = append(out, cloneLease(l))
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		a, b := out[i], out[j]
+		if a.Repo != b.Repo {
+			return a.Repo < b.Repo
+		}
+		if a.Provider != b.Provider {
+			return a.Provider < b.Provider
+		}
+		if a.Project != b.Project {
+			return a.Project < b.Project
+		}
+		if a.TaskRef != b.TaskRef {
+			return a.TaskRef < b.TaskRef
+		}
+		return a.ID < b.ID
+	})
+	return out, nil
+}
+
+func (s *InMemoryLeaseStore) ExpireLeaseCAS(_ context.Context, id, generation int64, now time.Time) (*Lease, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	l := s.rows[id]
+	if l == nil || l.ID != id || l.Generation != generation || l.Status != StatusActive || l.Held || s.providerLockHeldAtAllLocked(l.ID) || now.Before(l.ExpiresAt) {
+		return nil, false, nil
+	}
+	l.Status = StatusExpired
+	return cloneLease(l), true, nil
+}
+
 func (s *InMemoryLeaseStore) acquire(_ context.Context, key LeaseKey, ownerID, role, worktreePath, holdRepository, holdOwner, holdLane string, now time.Time, ttl time.Duration) (*Lease, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

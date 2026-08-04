@@ -579,6 +579,43 @@ func (s *SQLiteLeaseStore) Hold(ctx context.Context, key LeaseKey, ownerID strin
 	return s.currentActive(ctx, key)
 }
 
+func (s *SQLiteLeaseStore) SnapshotExpiredLeases(ctx context.Context, now time.Time) ([]*Lease, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT `+leaseColumns+` FROM leases WHERE status='active' AND held=0 AND expires_at <= ? ORDER BY repo, provider, project, task_ref, id`, now)
+	if err != nil {
+		return nil, fmt.Errorf("snapshot expired leases: %w", err)
+	}
+	defer rows.Close()
+	var out []*Lease
+	for rows.Next() {
+		l, scanErr := scanLease(rows)
+		if scanErr != nil {
+			return nil, fmt.Errorf("snapshot expired lease: %w", scanErr)
+		}
+		out = append(out, l)
+	}
+	return out, rows.Err()
+}
+
+func (s *SQLiteLeaseStore) ExpireLeaseCAS(ctx context.Context, id, generation int64, now time.Time) (*Lease, bool, error) {
+	res, err := execWithRetry(ctx, s.db, `UPDATE leases SET status='expired', released_at=? WHERE id=? AND generation=? AND status='active' AND held=0 AND expires_at <= ? AND provider_lock_owner=''`, now, id, generation, now)
+	if err != nil {
+		return nil, false, fmt.Errorf("expire lease %d: %w", id, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return nil, false, err
+	}
+	if n != 1 {
+		return nil, false, nil
+	}
+	row := s.db.QueryRowContext(ctx, `SELECT `+leaseColumns+` FROM leases WHERE id=?`, id)
+	l, err := scanLease(row)
+	if err != nil {
+		return nil, false, err
+	}
+	return l, true, nil
+}
+
 // ExpireStale transitions active-but-expired, unheld leases to Expired one
 // row at a time. The per-row UPDATE re-checks held/expiry in its own
 // predicate (not just relying on the earlier candidate SELECT), so a

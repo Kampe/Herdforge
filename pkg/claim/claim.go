@@ -38,6 +38,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/Kampe/Herdforge/pkg/lifecycle"
@@ -430,10 +431,65 @@ func (m *ClaimManager) Hold(ctx context.Context, key LeaseKey, ownerID string, g
 // swallowed) but that lease is simply left locked, to be retried on a
 // future call, exactly like Claim/Release leave it for their own retry.
 func (m *ClaimManager) ExpireStale(ctx context.Context) ([]*Lease, error) {
-	if m.holdReader != nil {
-		return nil, fmt.Errorf("claim: exact per-lease WithUnheldTransition fence is required for recovery")
+	if m.holdReader == nil {
+		return nil, fmt.Errorf("claim: lifecycle hold authority is required for recovery")
 	}
-	return m.expireStaleUnlocked(ctx)
+	fencer, fenced := m.holdReader.(interface {
+		WithUnheldTransition(context.Context, []lifecycle.HoldIdentity, func() error) error
+	})
+	if !fenced {
+		return nil, fmt.Errorf("claim: hold authority transition fencer is required")
+	}
+	snapshotNow := m.now()
+	recovery, ok := m.store.(RecoveryStore)
+	if !ok {
+		return nil, fmt.Errorf("claim: per-lease recovery store is required")
+	}
+	candidates, err := recovery.SnapshotExpiredLeases(ctx, snapshotNow)
+	if err != nil {
+		return nil, err
+	}
+	validated := make([][]lifecycle.HoldIdentity, len(candidates))
+	for i, candidate := range candidates {
+		validated[i], err = recoveryHoldIdentities(candidate)
+		if err != nil {
+			return nil, err
+		}
+	}
+	var expired []*Lease
+	for i, candidate := range candidates {
+		identities := validated[i]
+		transition := func() error {
+			lease, changed, casErr := recovery.ExpireLeaseCAS(ctx, candidate.ID, candidate.Generation, snapshotNow)
+			if casErr != nil {
+				return casErr
+			}
+			if changed {
+				expired = append(expired, lease)
+			}
+			return nil
+		}
+		if err := fencer.WithUnheldTransition(ctx, identities, transition); err != nil {
+			if errors.Is(err, lifecycle.ErrHoldDenied) {
+				continue
+			}
+			return nil, err
+		}
+	}
+	return expired, nil
+}
+
+func recoveryHoldIdentities(lease *Lease) ([]lifecycle.HoldIdentity, error) {
+	if lease == nil || strings.TrimSpace(lease.Repo) != lease.Repo || strings.TrimSpace(lease.Provider) != lease.Provider || strings.TrimSpace(lease.Project) != lease.Project || strings.TrimSpace(lease.TaskRef) != lease.TaskRef || strings.TrimSpace(lease.HoldRepository) != lease.HoldRepository || strings.TrimSpace(lease.HoldOwner) != lease.HoldOwner || strings.TrimSpace(lease.HoldLane) != lease.HoldLane || strings.TrimSpace(lease.Repo) == "" || strings.TrimSpace(lease.Provider) == "" || strings.TrimSpace(lease.Project) == "" || strings.TrimSpace(lease.TaskRef) == "" || strings.TrimSpace(lease.HoldRepository) == "" || strings.TrimSpace(lease.HoldOwner) == "" || strings.TrimSpace(lease.HoldLane) == "" {
+		return nil, fmt.Errorf("claim: expired lease has missing or malformed canonical hold identity")
+	}
+	if lease.HoldRepository != lease.Repo {
+		return nil, fmt.Errorf("claim: hold repository does not match lease repository")
+	}
+	return []lifecycle.HoldIdentity{
+		{Repository: lease.HoldRepository, Owner: lease.HoldOwner, Lane: lease.HoldLane, Scope: "lane"},
+		{Repository: lease.HoldRepository, Owner: lease.HoldOwner, Lane: lease.HoldLane, Task: lease.TaskRef, Scope: "task"},
+	}, nil
 }
 
 func (m *ClaimManager) expireStaleUnlocked(ctx context.Context) ([]*Lease, error) {
@@ -544,6 +600,9 @@ func (m *ClaimManager) SettlePendingCapacity(ctx context.Context) ([]*Lease, err
 // with the SAME idempotency key — an at-least-once redelivery a
 // conforming coordinator dedupes into an effectively-exactly-once effect.
 func (m *ClaimManager) settlePendingCapacity(ctx context.Context, key *LeaseKey) ([]*Lease, error) {
+	if m.holdReader != nil {
+		return nil, fmt.Errorf("claim: per-lease fenced capacity settlement is required")
+	}
 	claimed, err := m.store.ClaimCapacityRelease(ctx, m.settlerID, m.capacityClaimTimeout, m.now(), key)
 	if err != nil {
 		return nil, fmt.Errorf("claim: claim capacity release batch: %w", err)
