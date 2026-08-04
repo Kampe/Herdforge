@@ -164,8 +164,8 @@ func TestGraphExpectationsAndDeepCopy(t *testing.T) {
 	r.ExpectedGraphRevision = "g2"
 	r.Graph.Revision, r.Graph.Files, r.Graph.Complete = "forged", 999, false
 	d, _ := fence(NewMemoryStore()).Acquire(context.Background(), r)
-	if !d.Granted || d.Evidence.GraphRevision != "g1" || d.Evidence.GraphFiles != 2 {
-		t.Fatalf("request graph was trusted over authority: %+v", d)
+	if d.Granted || d.Evidence.Reason != ReasonGraphInvalid || d.Evidence.GraphRevision != "g1" || d.Evidence.GraphFiles != 2 {
+		t.Fatalf("stale expected graph revision was trusted: %+v", d)
 	}
 	badGraphFence := fence(NewMemoryStore())
 	badGraphFence.Graph = testGraphAuthority{graph: Graph{Revision: "bad", Nodes: 1, Edges: 1, Files: 1, Flows: 0, Complete: false}}

@@ -93,16 +93,29 @@ type mockWorktree struct {
 }
 
 type recordingScopeAdmission struct {
-	called   bool
-	request  scopefence.AcquireRequest
-	decision scopefence.Decision
-	err      error
+	called     bool
+	request    scopefence.AcquireRequest
+	decision   scopefence.Decision
+	err        error
+	releases   int
+	releaseReq scopefence.ReleaseRequest
 }
 
 func (f *recordingScopeAdmission) Acquire(_ context.Context, request scopefence.AcquireRequest) (scopefence.Decision, error) {
 	f.called = true
 	f.request = request
+	if f.decision.Granted && f.decision.Lease == nil {
+		lease := request.Ownership
+		lease.GraphRevision, lease.GraphFiles = "g1", 2
+		f.decision.Lease = &lease
+	}
 	return f.decision, f.err
+}
+
+func (f *recordingScopeAdmission) Release(_ context.Context, request scopefence.ReleaseRequest) error {
+	f.releases++
+	f.releaseReq = request
+	return nil
 }
 
 func (m *mockWorktree) CreateTaskWorktreeFrom(_ context.Context, taskRef, _ string) (*worktree.WorktreeInfo, error) {
@@ -200,11 +213,11 @@ func TestDispatchScopeFenceRejectsBeforeWorktreeOrLaunchSideEffects(t *testing.T
 		Herdr:        &fakeHerdr{available: false},
 		ScopeFence:   fence,
 	})
-	_, err := d.Dispatch(context.Background(), DispatchOptions{TicketRef: "FAC-205", NoLaunch: true, Scope: scopefence.Scope{Packages: []string{"pkg/dispatch"}}})
+	_, err := d.Dispatch(context.Background(), DispatchOptions{TicketRef: "FAC-205", NoLaunch: true})
 	if err == nil || !fence.called || mw.calls != 0 {
 		t.Fatalf("scope rejection crossed worktree boundary: err=%v fence_called=%v worktree_calls=%d", err, fence.called, mw.calls)
 	}
-	if fence.request.Generation <= 0 || fence.request.Identity.Branch != worktree.TaskBranch("FAC-205") || len(fence.request.Scope.Packages) != 1 {
+	if fence.request.Generation <= 0 || fence.request.Identity.Branch != worktree.TaskBranch("FAC-205") || len(fence.request.Scope.Packages) != 0 {
 		t.Fatalf("scope admission was not bound to exact pre-side-effect identity: %+v", fence.request)
 	}
 }

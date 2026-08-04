@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"path/filepath"
 	"reflect"
 	"sync"
@@ -166,5 +167,132 @@ func TestSQLiteStoreRejectsInvalidCASOwnerWithoutChangingRevision(t *testing.T) 
 	snapshot, err := store.Read(context.Background())
 	if err != nil || snapshot.Revision != "1" || len(snapshot.Owners) != 0 {
 		t.Fatalf("invalid CAS changed durable state: %+v err=%v", snapshot, err)
+	}
+}
+
+func TestSQLiteStoreRejectsNoncanonicalRevisionBeforeSQLiteCoercion(t *testing.T) {
+	store, err := NewSQLiteStore(filepath.Join(t.TempDir(), "scopefence.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	owner := req("FAC-208", "strict", 1, scope("pkg/strict", "pkg/strict.go", "Run")).Ownership
+	for _, revision := range []string{"", "01", "1.0", "+1", " 1"} {
+		if won, err := store.CompareAndSwap(context.Background(), revision, []Ownership{owner}); err == nil || won {
+			t.Fatalf("revision %q was accepted: won=%v err=%v", revision, won, err)
+		}
+	}
+}
+
+func TestSQLiteStoreAtomicReleaseRollsBackWhenProofWriteFails(t *testing.T) {
+	store, err := NewSQLiteStore(filepath.Join(t.TempDir(), "scopefence.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	owner := req("FAC-209", "atomic", 1, scope("pkg/atomic", "pkg/atomic.go", "Run")).Ownership
+	if won, err := store.CompareAndSwap(context.Background(), "1", []Ownership{owner}); err != nil || !won {
+		t.Fatalf("seed: %v", err)
+	}
+	store.proofWriteHook = func() error { return errors.New("forced proof write failure") }
+	f := Fence{Store: store, Verify: func(_ context.Context, r ReleaseRequest) bool { return r.Proof == ReleaseProof(r) }}
+	release := ReleaseRequest{Ownership: owner, Authority: CompensatedNoCandidate}
+	release.Proof = ReleaseProof(release)
+	if err := f.Release(context.Background(), release); err == nil {
+		t.Fatal("forced proof failure was swallowed")
+	}
+	snapshot, err := store.Read(context.Background())
+	if err != nil || len(snapshot.Owners) != 1 || snapshot.Owners[0].Generation != owner.Generation {
+		t.Fatalf("atomic release removed owner before proof: %+v err=%v", snapshot, err)
+	}
+}
+
+func TestSQLiteStoreConflictingProofReplayFailsClosed(t *testing.T) {
+	store, err := NewSQLiteStore(filepath.Join(t.TempDir(), "scopefence.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	owner := req("FAC-210", "proof", 1, scope("pkg/proof", "pkg/proof.go", "Run")).Ownership
+	r := ReleaseRequest{Ownership: owner, Authority: RootAdmittedMerge, Proof: "first"}
+	if err := store.RecordReleaseProof(context.Background(), r); err != nil {
+		t.Fatal(err)
+	}
+	conflict := r
+	conflict.Proof = "second"
+	if err := store.RecordReleaseProof(context.Background(), conflict); err == nil {
+		t.Fatal("conflicting proof replay was accepted")
+	}
+	record, err := store.ReadReleaseProof(context.Background(), r)
+	if err != nil || record.ProofDigest == "" {
+		t.Fatalf("first proof was not preserved: %+v err=%v", record, err)
+	}
+}
+
+func TestSQLiteStoreReadRejectsEvidenceBindingCorruption(t *testing.T) {
+	store, err := NewSQLiteStore(filepath.Join(t.TempDir(), "scopefence.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	owner := req("FAC-211", "evidence", 1, scope("pkg/evidence", "pkg/evidence.go", "Run")).Ownership
+	if won, err := store.CompareAndSwap(context.Background(), "1", []Ownership{owner}); err != nil || !won {
+		t.Fatalf("seed: %v", err)
+	}
+	if _, err := store.db.Exec(`UPDATE scopefence_owners SET evidence_json = '{"reason":"tampered"}'`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Read(context.Background()); err == nil {
+		t.Fatal("corrupt evidence was returned as trusted")
+	}
+}
+
+func TestSQLiteScopeAuthorityRequiresExactGraphRevisionAndCanonicalScope(t *testing.T) {
+	store, err := NewSQLiteStore(filepath.Join(t.TempDir(), "scopefence.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	declared := Scope{Packages: []string{"pkg/authority"}}
+	if err := store.PutScopeDeclaration(context.Background(), "repo", "FAC-212", "graph-1", declared); err != nil {
+		t.Fatal(err)
+	}
+	authority := NewSQLiteScopeAuthority(store)
+	resolved, err := authority.Resolve(context.Background(), "repo", "FAC-212", "graph-1")
+	if err != nil || !scopesEqual(resolved, declared) {
+		t.Fatalf("scope resolution failed: %+v err=%v", resolved, err)
+	}
+	if _, err := authority.Resolve(context.Background(), "repo", "FAC-212", "stale"); err == nil {
+		t.Fatal("stale scope declaration was trusted")
+	}
+	if err := store.PutScopeDeclaration(context.Background(), "repo", "FAC-213", "graph-1", Scope{Packages: []string{"pkg//raw"}}); err == nil {
+		t.Fatal("noncanonical scope declaration was persisted")
+	}
+}
+
+func TestResolvingFenceIgnoresCallerScopeAndUsesRevisionBoundAuthority(t *testing.T) {
+	store, err := NewSQLiteStore(filepath.Join(t.TempDir(), "scopefence.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	graph := Graph{Revision: "graph-2", Nodes: 10, Edges: 20, Files: 2, Flows: 1, Complete: true}
+	if err := store.PutGraphSnapshot(context.Background(), "repo", graph); err != nil {
+		t.Fatal(err)
+	}
+	trusted := Scope{Packages: []string{"pkg/trusted"}}
+	if err := store.PutScopeDeclaration(context.Background(), "repo", "FAC-214", graph.Revision, trusted); err != nil {
+		t.Fatal(err)
+	}
+	resolving := ResolvingFence{
+		Fence:     Fence{Store: store, Graph: NewSQLiteGraphAuthority(store, "repo", graph.Revision, graph.Files)},
+		Authority: NewSQLiteScopeAuthority(store),
+	}
+	request := req("FAC-214", "branch", 1, Scope{Packages: []string{"pkg/underdeclared"}})
+	request.Repository, request.Task = "repo", "FAC-214"
+	request.ExpectedGraphRevision = graph.Revision
+	decision, err := resolving.Acquire(context.Background(), request)
+	if err != nil || !decision.Granted || decision.Lease == nil || !scopesEqual(decision.Lease.Scope, trusted) {
+		t.Fatalf("caller scope bypassed authority: decision=%+v err=%v", decision, err)
 	}
 }
