@@ -3,6 +3,7 @@ package resources
 import (
 	"errors"
 	"math"
+	"strings"
 	"testing"
 )
 
@@ -107,6 +108,21 @@ func TestEvaluateDiskCapacityDenialProbesRootOnly(t *testing.T) {
 	}
 }
 
+func TestEvaluateDiskCapacityAdditionalFailureCarriesExactOpaqueEvidence(t *testing.T) {
+	additional := Capacity{FilesystemID: "target/secret", TotalBytes: 1000, FreeBytes: 50, TotalInodes: 100, FreeInodes: 7}
+	f := &diskFake{values: map[string]Capacity{"repo": diskHealthy("repo"), "target": additional}}
+	got := EvaluateDiskCapacity(f, DiskRequest{Path: "repo", AdditionalPaths: []string{"target"}, Operation: "worktree_create"}, diskPolicy())
+	if got.Allowed || got.Evidence.Reason != "additional_volume_below_threshold" {
+		t.Fatalf("decision = %+v", got)
+	}
+	if got.Evidence.FilesystemID != "repo" || got.Evidence.FailedFilesystemID != safeDiskIdentity("target/secret") {
+		t.Fatalf("filesystem evidence = %+v", got.Evidence)
+	}
+	if got.Evidence.FailedFreeBytes != 50 || got.Evidence.FailedFreePercent != 5 || got.Evidence.FailedFreeInodes != 7 {
+		t.Fatalf("failed volume metrics = %+v", got.Evidence)
+	}
+}
+
 func TestStatfsConversionRejectsOverflow(t *testing.T) {
 	for name, tc := range map[string][7]uint64{
 		"zero block size": {1, 1, 0, 1, 1, 1, 1},
@@ -142,40 +158,58 @@ func TestCapacityGateHysteresisIsBoundToScope(t *testing.T) {
 	p := DiskPolicy{ReserveBytes: 600, ReservePercent: 1, RecoveryBytes: 800, RecoveryPercent: 1, ReserveInodes: 1, RecoveryInodes: 1}
 	f := &diskFake{values: map[string]Capacity{
 		"same":  {FilesystemID: "same", TotalBytes: 1000, FreeBytes: 500, TotalInodes: 100, FreeInodes: 90},
-		"other": {FilesystemID: "other", TotalBytes: 1000, FreeBytes: 900, TotalInodes: 100, FreeInodes: 90},
+		"other": {FilesystemID: "other", TotalBytes: 1000, FreeBytes: 700, TotalInodes: 100, FreeInodes: 90},
 	}}
 	g := NewCapacityGate(f, p)
-	first := g.Admit(DiskRequest{Path: "same", Scope: "scope:same"})
+	first := g.Admit(DiskRequest{Path: "same"})
 	if first.Allowed || first.Evidence.Reason != DiskReasonBelowThreshold {
 		t.Fatalf("first denial = %+v", first)
 	}
-	second := g.Admit(DiskRequest{Path: "same", Scope: "scope:same"})
+	second := g.Admit(DiskRequest{Path: "same"})
 	if second.Allowed || second.Evidence.Reason != DiskReasonHysteresis {
 		t.Fatalf("same-scope recovery denial = %+v", second)
 	}
-	other := g.Admit(DiskRequest{Path: "other", Scope: "scope:other"})
+	other := g.Admit(DiskRequest{Path: "other"})
 	if !other.Allowed {
 		t.Fatalf("different healthy scope inherited hysteresis: %+v", other)
 	}
-	if other.Evidence.ScopeID != "scope:other" {
-		t.Fatalf("scope evidence = %q", other.Evidence.ScopeID)
+	if first.Evidence.ScopeID == other.Evidence.ScopeID {
+		t.Fatalf("derived scope identities aliased: %q", first.Evidence.ScopeID)
+	}
+	if strings.Contains(other.Evidence.ScopeID, "/") || len(other.Evidence.ScopeID) > 32 {
+		t.Fatalf("unsafe scope evidence = %q", other.Evidence.ScopeID)
 	}
 }
 
 func TestCapacityGateConcurrentScopesDoNotBleed(t *testing.T) {
-	p := DiskPolicy{ReserveBytes: 400, ReservePercent: 1, ReserveInodes: 1}
+	p := DiskPolicy{ReserveBytes: 400, ReservePercent: 1, RecoveryBytes: 800, RecoveryPercent: 1, ReserveInodes: 1, RecoveryInodes: 1}
 	f := &diskFake{values: map[string]Capacity{
 		"a": {FilesystemID: "a", TotalBytes: 1000, FreeBytes: 100, TotalInodes: 100, FreeInodes: 90},
-		"b": {FilesystemID: "b", TotalBytes: 1000, FreeBytes: 900, TotalInodes: 100, FreeInodes: 90},
+		"b": {FilesystemID: "b", TotalBytes: 1000, FreeBytes: 500, TotalInodes: 100, FreeInodes: 90},
 	}}
 	g := NewCapacityGate(f, p)
-	results := make(chan DiskDecision, 2)
-	go func() { results <- g.Admit(DiskRequest{Path: "a", Scope: "scope:a"}) }()
-	go func() { results <- g.Admit(DiskRequest{Path: "b", Scope: "scope:b"}) }()
+	first := g.Admit(DiskRequest{Path: "a"})
+	if first.Allowed {
+		t.Fatal("volume A must establish blocked state")
+	}
+	type result struct {
+		path string
+		got  DiskDecision
+	}
+	results := make(chan result, 2)
+	go func() { results <- result{"a", g.Admit(DiskRequest{Path: "a"})} }()
+	go func() { results <- result{"b", g.Admit(DiskRequest{Path: "b"})} }()
+	var b DiskDecision
 	for i := 0; i < 2; i++ {
 		got := <-results
-		if got.Evidence.ScopeID == "scope:b" && !got.Allowed {
-			t.Fatalf("healthy concurrent scope was blocked: %+v", got)
+		if got.path == "b" {
+			b = got.got
 		}
+	}
+	if !b.Allowed {
+		t.Fatalf("boundary-valued healthy scope inherited recovery hysteresis: %+v", b)
+	}
+	if first.Evidence.ScopeID == b.Evidence.ScopeID {
+		t.Fatalf("concurrent derived scope identities aliased: %q", b.Evidence.ScopeID)
 	}
 }

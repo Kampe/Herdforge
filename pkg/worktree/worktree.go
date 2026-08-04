@@ -59,7 +59,7 @@ func (w *WorktreeManager) configureDefaultDiskAdmission() {
 	w.DiskAdmission = resources.NewCapacityGate(resources.OSBackend{}, resources.DefaultDiskPolicy())
 }
 
-func (w *WorktreeManager) admitDisk(operation string) error {
+func (w *WorktreeManager) admitDisk(operation, targetPath string) error {
 	if w == nil {
 		return fmt.Errorf("disk capacity gate unavailable for %s", operation)
 	}
@@ -72,9 +72,9 @@ func (w *WorktreeManager) admitDisk(operation string) error {
 	if err != nil {
 		return fmt.Errorf("disk capacity gate: resolve repository volume: %w", err)
 	}
-	pool, err := resources.ResolveExistingPath(w.WorktreeDir)
+	target, err := resources.ResolveExistingPath(targetPath)
 	if err != nil {
-		return fmt.Errorf("disk capacity gate: resolve worktree volume: %w", err)
+		return fmt.Errorf("disk capacity gate: resolve target volume: %w", err)
 	}
 	tmp, err := resources.ResolveExistingPath(os.TempDir())
 	if err != nil {
@@ -84,8 +84,7 @@ func (w *WorktreeManager) admitDisk(operation string) error {
 		Operation:       operation,
 		Path:            repo,
 		TempPath:        tmp,
-		AdditionalPaths: []string{pool},
-		Scope:           resources.CapacityScopeForPaths(repo, pool, tmp),
+		AdditionalPaths: []string{target},
 	})
 	if decision.Allowed {
 		return nil
@@ -107,7 +106,7 @@ type WorktreeInfo struct {
 }
 
 func (w *WorktreeManager) CreateWorktree(ctx context.Context, branch string, targetDir string) error {
-	if err := w.admitDisk("worktree_create"); err != nil {
+	if err := w.admitDisk("worktree_create", targetDir); err != nil {
 		return err
 	}
 	cmd := execCommandContext(ctx, "git", "worktree", "add", "-b", branch, targetDir, "HEAD")
@@ -313,12 +312,12 @@ func (w *WorktreeManager) CreateTaskWorktreeFrom(ctx context.Context, taskRef, d
 	if strings.TrimSpace(taskRef) == "" {
 		return nil, fmt.Errorf("task ref is required")
 	}
-	if err := w.admitDisk("worktree_create"); err != nil {
-		return nil, err
-	}
 	branch := TaskBranch(taskRef)
 	targetPath := filepath.Join(w.WorktreeDir, strings.ToLower(taskRef))
 	anchorRef := AnchorRefFor(taskRef)
+	if err := w.admitDisk("worktree_create", targetPath); err != nil {
+		return nil, err
+	}
 
 	if err := RejectSharedRoot(w.RepoRoot, targetPath); err != nil {
 		return nil, err
