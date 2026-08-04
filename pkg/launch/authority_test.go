@@ -53,12 +53,16 @@ func authorityRequest(t *testing.T) Request {
 	r.PaneID = "pane-3"
 	r.HerdrSession = "session-9"
 	r.CWD = "./.herd/worktrees/fac-191"
-	r.ProcessIdentity = "pid=42"
 	return r
 }
 func accepted(t *testing.T, a *Authority, r Receipt) Receipt {
 	r.Accepted = true
-	r.StartToken = "start-42"
+	if r.ProcessIdentity == "" {
+		r.ProcessIdentity = "pid=42"
+	}
+	if r.StartToken == "" {
+		r.StartToken = "start-42"
+	}
 	if err := a.Accept(r); err != nil {
 		t.Fatal(err)
 	}
@@ -116,6 +120,7 @@ func TestAuthorityCrashRestartAndExactReplay(t *testing.T) {
 		t.Fatal("exact reservation replay was not idempotent")
 	}
 	first = accepted(t, a, first)
+	r.ProcessIdentity, r.StartToken = "pid=42", "start-42"
 	restarted, _ := NewAuthority(NewFileStore(p))
 	ok, err := restarted.HasStarted(r, "packet-1")
 	if err != nil || !ok {
@@ -136,6 +141,7 @@ func TestAuthorityReplacementSupersedesStaleAcceptedEvidence(t *testing.T) {
 	r := authorityRequest(t)
 	old := accepted(t, a, mustReserve(t, a, r, "packet-old"))
 	newer := accepted(t, a, mustReserve(t, a, r, "packet-new"))
+	r.ProcessIdentity, r.StartToken = "pid=42", "start-42"
 	if ok, err := a.HasStarted(r, "packet-old"); err != nil || ok {
 		t.Fatalf("stale accepted evidence remained resumable: %v %v", ok, err)
 	}
@@ -159,7 +165,7 @@ func TestAuthorityIncidentReplacementUsesStableFamilyKey(t *testing.T) {
 	oldReq.LeaseGeneration, oldReq.SessionGeneration = 7, 41
 	old := accepted(t, a, mustReserve(t, a, oldReq, "same-packet"))
 	oldReq.LeaseGeneration, oldReq.SessionGeneration = 8, 42
-	oldReq.Name, oldReq.TabID, oldReq.PaneID, oldReq.HerdrSession, oldReq.ProcessIdentity = "forge-worker-restarted", "tab-new", "pane-new", "session-new", "pid=43"
+	oldReq.Name, oldReq.TabID, oldReq.PaneID, oldReq.HerdrSession = "forge-worker-restarted", "tab-new", "pane-new", "session-new"
 	if err := a.Reject(old, "failed generation"); err != nil {
 		t.Fatal(err)
 	}
@@ -167,6 +173,9 @@ func TestAuthorityIncidentReplacementUsesStableFamilyKey(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	newer.ProcessIdentity = "pid=43"
+	newer.StartToken = "start-43"
+	oldReq.ProcessIdentity, oldReq.StartToken = "pid=43", "start-43"
 	if newer.Generation != 2 {
 		t.Fatalf("replacement did not advance family generation: %d", newer.Generation)
 	}
@@ -177,6 +186,13 @@ func TestAuthorityIncidentReplacementUsesStableFamilyKey(t *testing.T) {
 		t.Fatal("unaccepted replacement became resumable")
 	}
 	accepted(t, a, newer)
+	snap, _ := a.Store.Read()
+	if err := validateSnapshot(snap); err != nil {
+		t.Fatal(err)
+	}
+	if len(snap.Events) != 5 || snap.Events[2].Kind != "rejected" || snap.Events[4].Kind != "accepted" {
+		t.Fatalf("unexpected replacement transition sequence: %+v", snap.Events)
+	}
 	if ok, _ := a.HasStarted(oldReq, "same-packet"); !ok {
 		t.Fatal("accepted replacement was not resumable")
 	}
@@ -210,6 +226,7 @@ func TestAuthorityConcurrentConflictingAcceptsHaveOneWinner(t *testing.T) {
 	one, two := r, r
 	one.Accepted, two.Accepted = true, true
 	one.StartToken, two.StartToken = "start-one", "start-two"
+	one.ProcessIdentity, two.ProcessIdentity = "pid-one", "pid-two"
 	var wg sync.WaitGroup
 	errs := make(chan error, 2)
 	for i, x := range []*Authority{a, b} {
@@ -243,6 +260,83 @@ func TestAuthorityConcurrentConflictingAcceptsHaveOneWinner(t *testing.T) {
 	}
 	if accepted != 1 {
 		t.Fatalf("conflicting acceptance appended %d authorities", accepted)
+	}
+}
+
+func TestAuthoritySeparatesPrestartReservationFromExactResumeProof(t *testing.T) {
+	a, _ := NewAuthority(&sharedStore{})
+	req := authorityRequest(t)
+	reserved := mustReserve(t, a, req, "packet")
+	if reserved.ProcessIdentity != "" || reserved.StartToken != "" {
+		t.Fatal("reservation fabricated post-start identity")
+	}
+	prestarted := req
+	prestarted.ProcessIdentity = "pid-forged"
+	if _, err := a.Reserve(prestarted, "other-packet"); err == nil {
+		t.Fatal("reservation accepted fabricated process identity")
+	}
+	prestarted = req
+	prestarted.StartToken = "token-forged"
+	if _, err := a.Reserve(prestarted, "other-packet"); err == nil {
+		t.Fatal("reservation accepted fabricated start token")
+	}
+	b, _ := NewAuthority(&sharedStore{})
+	failed := mustReserve(t, b, req, "replacement-packet")
+	if err := b.Reject(failed, "agent failed before start"); err != nil {
+		t.Fatal(err)
+	}
+	replacement := mustReserve(t, b, req, "replacement-packet")
+	if replacement.Generation != 2 {
+		t.Fatalf("pre-start rejection did not advance generation: %d", replacement.Generation)
+	}
+	if err := a.Accept(reserved); err == nil {
+		t.Fatal("acceptance without actual process proof succeeded")
+	}
+	if ok, _ := a.HasStarted(req, "packet"); ok {
+		t.Fatal("pre-start request became resumable")
+	}
+	acceptedReceipt := reserved
+	acceptedReceipt.ProcessIdentity, acceptedReceipt.StartToken = "pid=actual", "token-actual"
+	if err := a.Accept(acceptedReceipt); err != nil {
+		t.Fatal(err)
+	}
+	proof := req
+	proof.ProcessIdentity, proof.StartToken = "pid=actual", "token-actual"
+	if ok, _ := a.HasStarted(proof, "packet"); !ok {
+		t.Fatal("exact accepted process proof was not resumable")
+	}
+	wrong := proof
+	wrong.ProcessIdentity, wrong.StartToken = "pid-other", "token-other"
+	if ok, _ := a.HasStarted(wrong, "packet"); ok {
+		t.Fatal("mismatched process proof authorized resume")
+	}
+}
+
+func TestAuthorityRejectsSemanticCorruptionBeforeResume(t *testing.T) {
+	seed := authorityRequest(t)
+	reserved := mustReserve(t, func() *Authority { a, _ := NewAuthority(&sharedStore{}); return a }(), seed, "packet")
+	acceptedReceipt := reserved
+	acceptedReceipt.ProcessIdentity, acceptedReceipt.StartToken = "pid=actual", "token-actual"
+	cases := []struct {
+		name   string
+		events []Event
+	}{
+		{"unknown-kind", []Event{{Sequence: 1, Kind: "nonsense", Receipt: reserved}}},
+		{"accepted-without-reservation", []Event{{Sequence: 1, Kind: "accepted", Receipt: acceptedReceipt}}},
+		{"generation-gap", []Event{{Sequence: 1, Kind: "reserved", Receipt: Receipt{TaskRef: reserved.TaskRef, Repository: reserved.Repository, Lane: reserved.Lane, Role: reserved.Role, TaskShape: reserved.TaskShape, Provider: reserved.Provider, Model: reserved.Model, Effort: reserved.Effort, DecisionDigest: reserved.DecisionDigest, Argv: reserved.Argv, Name: reserved.Name, TabID: reserved.TabID, PaneID: reserved.PaneID, HerdrSession: reserved.HerdrSession, CWD: reserved.CWD, PacketDigest: reserved.PacketDigest, Generation: 2}}}},
+		{"terminal-then-accepted", []Event{{Sequence: 1, Kind: "reserved", Receipt: reserved}, {Sequence: 2, Kind: "terminal", Receipt: reserved}, {Sequence: 3, Kind: "accepted", Receipt: acceptedReceipt}}},
+		{"double-acceptance", []Event{{Sequence: 1, Kind: "reserved", Receipt: reserved}, {Sequence: 2, Kind: "accepted", Receipt: acceptedReceipt}, {Sequence: 3, Kind: "accepted", Receipt: acceptedReceipt}}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := &sharedStore{snap: Snapshot{Version: uint64(len(tc.events)), Events: tc.events}}
+			a, _ := NewAuthority(s)
+			proof := seed
+			proof.ProcessIdentity, proof.StartToken = "pid=actual", "token-actual"
+			if ok, err := a.HasStarted(proof, "packet"); err == nil && ok {
+				t.Fatal("semantic corruption authorized resume")
+			}
+		})
 	}
 }
 
@@ -282,7 +376,7 @@ func TestAuthorityRequiresEveryBindingField(t *testing.T) {
 		name   string
 		mutate func(*Request)
 	}{
-		{"task", func(r *Request) { r.TaskRef = "" }}, {"repository", func(r *Request) { r.Repository = "" }}, {"lane", func(r *Request) { r.Lane = "" }}, {"tab", func(r *Request) { r.TabID = "" }}, {"pane", func(r *Request) { r.PaneID = "" }}, {"session", func(r *Request) { r.HerdrSession = "" }}, {"cwd", func(r *Request) { r.CWD = "" }}, {"process", func(r *Request) { r.ProcessIdentity = "" }}, {"decision", func(r *Request) { r.Decision = nil }}, {"packet", func(r *Request) {}}}
+		{"task", func(r *Request) { r.TaskRef = "" }}, {"repository", func(r *Request) { r.Repository = "" }}, {"lane", func(r *Request) { r.Lane = "" }}, {"tab", func(r *Request) { r.TabID = "" }}, {"pane", func(r *Request) { r.PaneID = "" }}, {"session", func(r *Request) { r.HerdrSession = "" }}, {"cwd", func(r *Request) { r.CWD = "" }}, {"decision", func(r *Request) { r.Decision = nil }}, {"packet", func(r *Request) {}}}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			r := base
