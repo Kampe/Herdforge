@@ -143,6 +143,28 @@ func TestUnknownLiveIdentityIsCriticalAndNotSettled(t *testing.T) {
 	}
 }
 
+func TestDuplicateLiveIdentityIsCriticalAndNotSettled(t *testing.T) {
+	registry, err := NewCanonicalLaneRegistry([]CanonicalLane{{Name: "smith", Role: "worker", Standing: true}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	e := &Engine{StandingRoster: &registry}
+	agents := struct {
+		Result struct {
+			Agents []json.RawMessage `json:"agents"`
+		} `json:"result"`
+	}{}
+	agents.Result.Agents = []json.RawMessage{
+		json.RawMessage(`{"name":"forge-smith","status":"idle"}`),
+		json.RawMessage(`{"name":"Forge-Smith","status":"idle"}`),
+	}
+	s := e.computeSummary(agents, json.RawMessage(`{"tasks":[]}`), nil, nil)
+	e.computeRedCodes(s)
+	if len(s.Settled) != 0 || len(s.Critical) != 1 || s.Healthy {
+		t.Fatalf("duplicate live identity was admitted: %+v", s)
+	}
+}
+
 func TestActModeBlockedRoutingUsesCanonicalRoleLaneBeforeCommand(t *testing.T) {
 	reader := &actHoldReader{holdLane: false}
 	e := actHoldEngine(reader)

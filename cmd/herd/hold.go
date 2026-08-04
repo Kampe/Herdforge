@@ -41,7 +41,7 @@ func holdRepository() (string, error) {
 func canonicalLaneRegistry(cfg *config.Config) (lifecycle.CanonicalLaneRegistry, error) {
 	lanes := make([]lifecycle.CanonicalLane, 0, len(cfg.Lanes))
 	for _, lane := range cfg.Lanes {
-		lanes = append(lanes, lifecycle.CanonicalLane{Name: lane.Name, Role: lane.Role})
+		lanes = append(lanes, lifecycle.CanonicalLane{Name: lane.Name, Role: lane.Role, Standing: lane.Standing})
 	}
 	return lifecycle.NewCanonicalLaneRegistry(lanes)
 }
@@ -157,7 +157,7 @@ func loadProductionActiveTaskResolver(ctx context.Context) (lifecycle.ActiveTask
 		if strings.TrimSpace(lane.Role) != "" {
 			role := strings.ToLower(strings.TrimSpace(lane.Role))
 			configured[role] = true
-			roleLanes[role] = lifecycle.CanonicalLane{Name: strings.TrimSpace(lane.Name), Role: strings.TrimSpace(lane.Role)}
+			roleLanes[role] = lifecycle.CanonicalLane{Name: strings.TrimSpace(lane.Name), Role: strings.TrimSpace(lane.Role), Standing: lane.Standing}
 		}
 	}
 	registry, err := canonicalLaneRegistry(cfg)

@@ -6,8 +6,9 @@ import (
 )
 
 type CanonicalLane struct {
-	Name string
-	Role string
+	Name     string
+	Role     string
+	Standing bool
 }
 type CanonicalLaneRegistry struct{ lanes []CanonicalLane }
 
@@ -21,7 +22,7 @@ func NewCanonicalLaneRegistry(lanes []CanonicalLane) (CanonicalLaneRegistry, err
 		}
 		seenName[strings.ToLower(name)] = true
 		seenRole[strings.ToLower(role)] = true
-		copyLanes = append(copyLanes, CanonicalLane{Name: name, Role: role})
+		copyLanes = append(copyLanes, CanonicalLane{Name: name, Role: role, Standing: lane.Standing})
 	}
 	return CanonicalLaneRegistry{lanes: copyLanes}, nil
 }
