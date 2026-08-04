@@ -116,7 +116,7 @@ func TestAgentStartBoundaryRejectsRawAndRequiresDecision(t *testing.T) {
 	if err := AgentStartWithDecision("worker", "codex", "pane", req); err != nil {
 		t.Fatal(err)
 	}
-	want := []string{"agent", "start", "worker", "--kind", "codex", "--pane", "pane", "--", "--model", launch.WorkerModel, "-c", "model_reasoning_effort=medium", "-a", "never"}
+	want := []string{"agent", "start", "worker", "--kind", "codex", "--pane", "pane", "--", "--model", launch.WorkerModel, "-c", "model_reasoning_effort=medium", "-a", "never", "-c", "mcp_servers.code-review-graph.enabled=false"}
 	if !reflect.DeepEqual(calls, [][]string{want}) {
 		t.Fatalf("argv calls = %v, want %v", calls, [][]string{want})
 	}

@@ -375,7 +375,7 @@ func TestDispatch_Launch_SetsCwdAndProvesPrompt(t *testing.T) {
 	if res.TabID != "tab-9" {
 		t.Fatalf("TabID = %q", res.TabID)
 	}
-	wantArgv := []string{"codex", "--model", launch.WorkerModel, "-c", "model_reasoning_effort=medium", "-a", "never"}
+	wantArgv := []string{"codex", "--model", launch.WorkerModel, "-c", "model_reasoning_effort=medium", "-a", "never", "-c", "mcp_servers.code-review-graph.enabled=false"}
 	if fh.startReq.Decision == nil || !reflect.DeepEqual(fh.startReq.Decision.Argv, wantArgv) || fh.startReq.Decision.Provider != launch.WorkerProvider {
 		t.Fatalf("dispatch launch decision = %+v, want provider/argv %s", fh.startReq.Decision, wantArgv)
 	}
