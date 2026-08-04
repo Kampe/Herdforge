@@ -30,6 +30,8 @@ var runHerdr = runHerdrReal
 // exact-PID SystemTree and durable JSONL sink.
 type ToolChildLifecycle interface {
 	Bind(owner toolchild.Identity) error
+	Invalidate(reason string) error
+	VerifyTerminal() error
 	Begin() error
 	Reconcile(event string) error
 }
@@ -44,13 +46,17 @@ var (
 func defaultToolChildLifecycle(req launch.Request, name, paneID string) (ToolChildLifecycle, error) {
 	p := os.Getenv("HERD_TOOLCHILD_RECEIPTS")
 	if p == "" {
-		p = ".herd/toolchild-receipts.jsonl"
+		var err error
+		p, err = toolchild.StableReceiptPath(req.Repository)
+		if err != nil {
+			return nil, err
+		}
 	}
 	role := ""
 	if req.Decision != nil {
 		role = string(req.Decision.Role)
 	}
-	owner := toolchild.Identity{SessionGeneration: req.LeaseGeneration, LaunchID: launch.DecisionDigest(req.Decision), Repository: "herdforge", Role: role, Lane: name}
+	owner := toolchild.Identity{SessionGeneration: req.SessionGeneration, LaunchID: launch.DecisionDigest(req.Decision), Role: role, Lane: name}
 	return toolchild.NewLifecycle(owner, toolchild.SystemTree{}, &toolchild.JSONLSink{Path: p}), nil
 }
 
@@ -72,36 +78,201 @@ func PrepareToolChildLifecycle(tabID, paneID string, req launch.Request, name st
 	if tabID == "" || paneID == "" {
 		return fmt.Errorf("tool-child lifecycle requires tab and pane")
 	}
+	if req.Decision == nil || req.TaskRef == "" || req.Repository == "" || req.Lane == "" || (req.Scope != "lane" && req.LeaseGeneration <= 0) {
+		return fmt.Errorf("complete launch identity is required before lifecycle preparation")
+	}
+	if req.SessionGeneration <= 0 {
+		var err error
+		req.SessionGeneration, err = toolchild.NextSessionGeneration(req.Repository)
+		if err != nil {
+			return fmt.Errorf("durable Herdr session generation: %w", err)
+		}
+	}
 	toolChildMu.Lock()
+	// A reserved identity is occupied even while provisional or test-injected;
+	// replacing it would orphan durable authority and race a concurrent launch.
+	if toolChildByTab[tabID] != nil || toolChildByPane[paneID] != nil {
+		toolChildMu.Unlock()
+		return fmt.Errorf("%w: tab %s/pane %s", toolchild.ErrLifecycleCollision, tabID, paneID)
+	}
 	f := newToolChildLifecycle
-	toolChildMu.Unlock()
 	lc, err := f(req, name, paneID)
 	if err != nil {
+		toolChildMu.Unlock()
 		return err
 	}
 	if lc == nil {
+		toolChildMu.Unlock()
 		return fmt.Errorf("tool-child lifecycle factory returned nil")
 	}
-	toolChildMu.Lock()
 	toolChildByPane[paneID] = lc
 	toolChildByTab[tabID] = lc
 	toolChildMu.Unlock()
+	if concrete, ok := lc.(*toolchild.Lifecycle); ok {
+		concrete.SetContext(toolchild.Identity{TabID: tabID, PaneID: paneID, Name: name, SessionGeneration: req.SessionGeneration, LaunchID: launch.DecisionDigest(req.Decision), Repository: req.Repository, Lane: req.Lane, Role: string(req.Decision.Role), TaskRef: req.TaskRef, Provider: req.Decision.Provider, ArgvDigest: launch.DecisionDigest(req.Decision), Argv: append([]string(nil), req.Decision.Argv...)})
+		if err := concrete.Provision(); err != nil {
+			return err
+		}
+	}
 	return nil
+}
+
+func isBoundConcreteLifecycle(lc ToolChildLifecycle) bool {
+	concrete, ok := lc.(*toolchild.Lifecycle)
+	return ok && concrete.Bound()
 }
 
 // StartPreparedAgent is the required direct-entrypoint adapter. It closes
 // the gap between tab creation and exact Herdr-reported owner binding.
 func StartPreparedAgent(tabID, name, kind, paneID string, req launch.Request) error {
 	if err := PrepareToolChildLifecycle(tabID, paneID, req, name); err != nil {
+		if errors.Is(err, toolchild.ErrLifecycleCollision) {
+			return err
+		}
+		if lc := lifecycleForTab(tabID); lc != nil {
+			if rollbackErr := rollbackToolChild(tabID, paneID, lc, "prepare-failed"); rollbackErr != nil {
+				return errors.Join(err, rollbackErr)
+			}
+			return err
+		}
+		if closeErr := tabCloseRaw(tabID); closeErr != nil {
+			return errors.Join(err, closeErr)
+		}
+		if readbackErr := verifyHerdrTerminal(tabID, paneID); readbackErr != nil {
+			return errors.Join(err, readbackErr)
+		}
 		return err
 	}
-	return AgentStartWithDecision(name, kind, paneID, req)
+	err := AgentStartWithDecision(name, kind, paneID, req)
+	if err == nil {
+		return nil
+	}
+	if lc := lifecycleForTab(tabID); lc != nil {
+		if rollbackErr := rollbackToolChild(tabID, paneID, lc, "prepared-start-failed"); rollbackErr != nil {
+			return errors.Join(err, rollbackErr)
+		}
+	}
+	return err
 }
 
 func lifecycleForPane(paneID string) ToolChildLifecycle {
 	toolChildMu.Lock()
 	defer toolChildMu.Unlock()
 	return toolChildByPane[paneID]
+}
+func lifecycleForTab(tabID string) ToolChildLifecycle {
+	toolChildMu.Lock()
+	defer toolChildMu.Unlock()
+	return toolChildByTab[tabID]
+}
+
+func dropToolChild(tabID, paneID string) {
+	toolChildMu.Lock()
+	delete(toolChildByTab, tabID)
+	delete(toolChildByPane, paneID)
+	toolChildMu.Unlock()
+}
+func tabForPane(paneID string) string {
+	toolChildMu.Lock()
+	defer toolChildMu.Unlock()
+	for tab, lc := range toolChildByTab {
+		if toolChildByPane[paneID] == lc {
+			return tab
+		}
+	}
+	return ""
+}
+func rollbackToolChild(tabID, paneID string, lc ToolChildLifecycle, reason string) error {
+	bound := false
+	if concrete, ok := lc.(*toolchild.Lifecycle); ok {
+		bound = concrete.Bound()
+	}
+	if probe, ok := lc.(interface{ Bound() bool }); ok {
+		bound = probe.Bound()
+	}
+	if bound {
+		if err := lc.Reconcile("failed-launch"); err != nil {
+			return fmt.Errorf("child reconciliation failed; authority retained: %w", err)
+		}
+	}
+	if err := compensateStartedProcessExact("", paneID); err != nil {
+		return err
+	}
+	if err := verifyHerdrTerminal(tabID, paneID); err != nil {
+		return fmt.Errorf("terminal Herdr readback failed; authority retained: %w", err)
+	}
+	if err := lc.Invalidate(reason); err != nil {
+		return fmt.Errorf("tombstone failed; authority retained: %w", err)
+	}
+	if err := lc.VerifyTerminal(); err != nil {
+		return fmt.Errorf("tombstone readback failed; authority retained: %w", err)
+	}
+	dropToolChild(tabID, paneID)
+	return nil
+}
+
+func verifyHerdrTerminal(tabID, paneID string) error {
+	tabs, err := tabList()
+	if err != nil {
+		return err
+	}
+	for _, id := range tabs {
+		if id == tabID {
+			return fmt.Errorf("tab %s remains live", tabID)
+		}
+	}
+	agents, err := AgentList()
+	if err != nil {
+		return err
+	}
+	for _, a := range agents {
+		if a.TabID == tabID || a.PaneID == paneID {
+			return fmt.Errorf("agent/tab/pane remains live")
+		}
+	}
+	processes, err := paneProcesses(paneID)
+	if err != nil {
+		if errors.Is(err, ErrPaneNotFound) {
+			return nil
+		}
+		return err
+	}
+	if len(processes) != 0 {
+		return fmt.Errorf("foreground process remains live")
+	}
+	return nil
+}
+
+func tabList() ([]string, error) {
+	output, err := runHerdr("tab", "list")
+	if err != nil {
+		return nil, fmt.Errorf("herdr tab list: %s: %w", output, err)
+	}
+	var envelope struct {
+		Result struct {
+			Tabs []struct {
+				ID    string `json:"id"`
+				TabID string `json:"tab_id"`
+			} `json:"tabs"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal([]byte(output), &envelope); err != nil {
+		return nil, err
+	}
+	if envelope.Result.Tabs == nil {
+		return nil, fmt.Errorf("herdr tab list returned no tabs inventory")
+	}
+	ids := make([]string, 0, len(envelope.Result.Tabs))
+	for _, t := range envelope.Result.Tabs {
+		id := t.TabID
+		if id == "" {
+			id = t.ID
+		}
+		if id != "" {
+			ids = append(ids, id)
+		}
+	}
+	return ids, nil
 }
 
 func bindToolChildLifecycle(paneID, name string, req launch.Request) error {
@@ -112,6 +283,15 @@ func bindToolChildLifecycle(paneID, name string, req launch.Request) error {
 	agents, err := AgentList()
 	if err != nil {
 		return fmt.Errorf("tool-child owner lookup: %w", err)
+	}
+	sessionGeneration := req.SessionGeneration
+	if sessionGeneration <= 0 {
+		if concrete, ok := lc.(*toolchild.Lifecycle); ok {
+			sessionGeneration = concrete.Inventory.Owner.SessionGeneration
+		}
+	}
+	if sessionGeneration <= 0 {
+		return fmt.Errorf("Herdr session generation is unavailable")
 	}
 	for _, a := range agents {
 		if a.Name != name || a.PaneID != paneID || a.Session.Value == "" || a.Kind != req.Decision.Provider {
@@ -145,18 +325,105 @@ func bindToolChildLifecycle(paneID, name string, req launch.Request) error {
 		if err != nil {
 			return err
 		}
-		if len(wrappers) > 0 {
+		if strings.EqualFold(req.Decision.Provider, "codex") {
 			if len(wrappers) != 1 || parent != wrappers[0].PID {
-				return fmt.Errorf("native process parent does not prove the unique node wrapper")
+				return fmt.Errorf("codex native process requires exactly one node wrapper parent")
 			}
+		} else if len(wrappers) > 1 {
+			return fmt.Errorf("provider process has ambiguous node wrappers")
 		}
 		role := ""
 		if req.Decision != nil {
 			role = string(req.Decision.Role)
 		}
-		return lc.Bind(toolchild.Identity{PID: p.PID, ParentPID: parent, StartToken: token, SessionGeneration: req.LeaseGeneration, LaunchID: launch.DecisionDigest(req.Decision), Repository: "herdforge", Role: role, Lane: name, SessionID: a.Session.Value, PaneID: paneID, Provider: req.Decision.Provider, ArgvDigest: launch.DecisionDigest(req.Decision)})
+		if req.Repository == "" || req.Lane == "" {
+			return fmt.Errorf("repository and lane binding are required")
+		}
+		if a.TabID != "" && a.TabID != tabForPane(paneID) {
+			return fmt.Errorf("prepared tab identity drift: got %s", a.TabID)
+		}
+		if a.TabID == "" {
+			return fmt.Errorf("agent list returned missing tab identity")
+		}
+		return lc.Bind(toolchild.Identity{PID: p.PID, ParentPID: parent, StartToken: token, SessionGeneration: sessionGeneration, LaunchID: launch.DecisionDigest(req.Decision), Repository: req.Repository, Role: role, Lane: req.Lane, TaskRef: req.TaskRef, Name: name, SessionID: a.Session.Value, PaneID: paneID, TabID: a.TabID, Provider: req.Decision.Provider, ArgvDigest: launch.DecisionDigest(req.Decision), Argv: append([]string(nil), req.Decision.Argv...)})
 	}
 	return fmt.Errorf("tool-child owner identity unavailable for %s/%s", name, paneID)
+}
+
+// bindRecoveredToolChildLifecycle reconstructs the exact owner after a
+// coordinator restart. The provisional receipt is the only source of launch
+// intent; live Herdr inventory supplies the tab/session and pane process-info
+// supplies the candidate PID. No process-local map or broad process match is
+// used.
+func bindRecoveredToolChildLifecycle(lc *toolchild.Lifecycle) error {
+	if lc == nil || lc.Bound() {
+		return nil
+	}
+	owner := lc.Inventory.Owner
+	if owner.TabID == "" || owner.PaneID == "" || owner.Provider == "" || len(owner.Argv) == 0 || owner.ArgvDigest == "" || owner.Repository == "" {
+		return fmt.Errorf("recovery provisional identity is incomplete")
+	}
+	agents, err := AgentList()
+	if err != nil {
+		return fmt.Errorf("recovery agent inventory: %w", err)
+	}
+	var match *AgentEntry
+	for i := range agents {
+		a := &agents[i]
+		if a.TabID != owner.TabID || a.PaneID != owner.PaneID || a.Kind != owner.Provider || a.Name != owner.Name || a.Session.Value == "" {
+			continue
+		}
+		if owner.SessionID != "" && a.Session.Value != owner.SessionID {
+			continue
+		}
+		if match != nil {
+			return fmt.Errorf("recovery agent identity is ambiguous")
+		}
+		match = a
+	}
+	if match == nil {
+		return fmt.Errorf("recovery agent identity unavailable")
+	}
+	processes, err := paneProcesses(owner.PaneID)
+	if err != nil {
+		return err
+	}
+	var native []PaneProcess
+	var wrappers []PaneProcess
+	for _, p := range processes {
+		if nativeCandidate(owner.Provider, owner.Argv, p) {
+			native = append(native, p)
+		}
+		if wrapperCandidate(p) {
+			wrappers = append(wrappers, p)
+		}
+	}
+	if len(native) != 1 {
+		return fmt.Errorf("recovery routed owner candidates=%d", len(native))
+	}
+	p := native[0]
+	if strings.EqualFold(owner.Provider, "codex") {
+		parent, err := readPIDParent(p.PID)
+		if err != nil || len(wrappers) != 1 || parent != wrappers[0].PID {
+			return fmt.Errorf("recovery codex wrapper ancestry is not exact")
+		}
+	} else if len(wrappers) > 1 {
+		return fmt.Errorf("recovery provider wrapper ancestry is ambiguous")
+	}
+	token, err := readPIDStartToken(p.PID)
+	if err != nil {
+		return err
+	}
+	parent, err := readPIDParent(p.PID)
+	if err != nil {
+		return err
+	}
+	if owner.SessionID != "" && owner.SessionID != match.Session.Value {
+		return fmt.Errorf("recovery session drift")
+	}
+	owner.PID, owner.ParentPID, owner.StartToken = p.PID, parent, token
+	owner.SessionID = match.Session.Value
+	return lc.Bind(owner)
 }
 
 func ReconcileToolChild(tabID, event string) error {
@@ -164,7 +431,27 @@ func ReconcileToolChild(tabID, event string) error {
 	lc := toolChildByTab[tabID]
 	toolChildMu.Unlock()
 	if lc == nil {
-		return nil
+		path := os.Getenv("HERD_TOOLCHILD_RECEIPTS")
+		var err error
+		if path != "" {
+			lc, err = toolchild.LoadLifecycle(path, tabID, toolchild.SystemTree{}, &toolchild.JSONLSink{Path: path})
+		} else {
+			lc, err = toolchild.DiscoverLifecycle(tabID, toolchild.SystemTree{}, &toolchild.JSONLSink{})
+		}
+		if err != nil {
+			return fmt.Errorf("tool-child cleanup blocked: %w", err)
+		}
+		toolChildMu.Lock()
+		toolChildByTab[tabID] = lc
+		if concrete, ok := lc.(*toolchild.Lifecycle); ok {
+			toolChildByPane[concrete.Inventory.Owner.PaneID] = lc
+		}
+		toolChildMu.Unlock()
+	}
+	if concrete, ok := lc.(*toolchild.Lifecycle); ok && !concrete.Bound() {
+		if err := bindRecoveredToolChildLifecycle(concrete); err != nil {
+			return fmt.Errorf("tool-child pre-bind recovery blocked: %w", err)
+		}
 	}
 	return lc.Reconcile(event)
 }
@@ -287,38 +574,64 @@ func AgentStart(name, kind string, paneID string, agentArgs ...string) error {
 // before the process API is invoked, including for recovery/rescue callers.
 func AgentStartWithDecision(name, kind, paneID string, req launch.Request) error {
 	req.Name, req.PaneID = name, paneID
+	lc := lifecycleForPane(paneID)
+	compensateValidation := func(primary error) error {
+		if lc == nil {
+			return primary
+		}
+		if rollbackErr := rollbackToolChild(tabForPane(paneID), paneID, lc, "pre-start-validation-failed"); rollbackErr != nil {
+			return errors.Join(primary, rollbackErr)
+		}
+		return primary
+	}
 	if err := launch.Validate(req, nil); err != nil {
-		return err
+		return compensateValidation(err)
 	}
 	if req.Decision == nil || strings.TrimSpace(kind) != strings.TrimSpace(req.Decision.Provider) {
-		return launch.RecordRejected(req, nil, fmt.Sprintf("herdr kind %q does not match decision provider", kind))
+		return compensateValidation(launch.RecordRejected(req, nil, fmt.Sprintf("herdr kind %q does not match decision provider", kind)))
 	}
 	if req.Decision == nil || len(req.Decision.Argv) == 0 {
-		return fmt.Errorf("launch decision argv is empty")
+		return compensateValidation(fmt.Errorf("launch decision argv is empty"))
 	}
-	lc := lifecycleForPane(paneID)
+	if req.SessionGeneration <= 0 {
+		if concrete, ok := lc.(*toolchild.Lifecycle); ok {
+			req.SessionGeneration = concrete.Inventory.Owner.SessionGeneration
+		}
+	}
+	if req.SessionGeneration <= 0 {
+		return fmt.Errorf("durable Herdr session generation is unavailable")
+	}
 	if err := agentStartProcess(name, kind, paneID, req.Decision.Argv[1:]...); err != nil {
 		if lc != nil {
-			_ = lc.Reconcile("failed-launch")
+			if rollbackErr := rollbackToolChild(tabForPane(paneID), paneID, lc, "failed-launch"); rollbackErr != nil {
+				return errors.Join(err, rollbackErr)
+			}
 		}
 		_ = launch.RecordRejected(req, nil, err.Error())
 		return err
 	}
 	if lc != nil {
 		if err := bindToolChildLifecycle(paneID, name, req); err != nil {
-			_ = lc.Reconcile("failed-launch")
+			if rollbackErr := rollbackToolChild(tabForPane(paneID), paneID, lc, "failed-bind"); rollbackErr != nil {
+				return errors.Join(err, rollbackErr)
+			}
 			_ = launch.RecordRejected(req, nil, err.Error())
 			return err
 		}
 		if err := lc.Begin(); err != nil {
-			_ = lc.Reconcile("failed-launch")
+			if rollbackErr := rollbackToolChild(tabForPane(paneID), paneID, lc, "failed-inventory"); rollbackErr != nil {
+				return errors.Join(err, rollbackErr)
+			}
 			_ = launch.RecordRejected(req, nil, err.Error())
 			return fmt.Errorf("tool-child inventory failed: %w", err)
 		}
 	}
 	if err := launch.RecordStarted(req, nil); err != nil {
 		if lc != nil {
-			_ = lc.Reconcile("failed-launch")
+			if rollbackErr := rollbackToolChild(tabForPane(paneID), paneID, lc, "launch-receipt-failed"); rollbackErr != nil {
+				return errors.Join(err, rollbackErr)
+			}
+			return fmt.Errorf("launch receipt failed: %w; compensated exact launch", err)
 		}
 		cleanupErr := compensateStartedProcess(name)
 		if cleanupErr != nil {
@@ -330,18 +643,22 @@ func AgentStartWithDecision(name, kind, paneID string, req launch.Request) error
 }
 
 func compensateStartedProcess(name string) error {
+	return compensateStartedProcessExact(name, "")
+}
+
+func compensateStartedProcessExact(name, paneID string) error {
 	agents, err := AgentList()
 	if err != nil {
 		return err
 	}
 	for _, a := range agents {
-		if a.Name != name {
+		if (name != "" && a.Name != name) || (paneID != "" && a.PaneID != paneID) {
 			continue
 		}
 		if a.TabID == "" {
 			return fmt.Errorf("cannot compensate launch %q: missing tab id", name)
 		}
-		if err := TabClose(a.TabID); err != nil {
+		if err := tabCloseRaw(a.TabID); err != nil {
 			return err
 		}
 		remaining, err := AgentList()
@@ -349,13 +666,40 @@ func compensateStartedProcess(name string) error {
 			return fmt.Errorf("verify compensated launch %q: %w", name, err)
 		}
 		for _, live := range remaining {
-			if live.Name == name {
+			if (name != "" && live.Name == name) || (paneID != "" && live.PaneID == paneID) {
 				return fmt.Errorf("compensated launch %q remains present", name)
 			}
 		}
 		return nil
 	}
+	if paneID != "" {
+		tabID := tabForPane(paneID)
+		if tabID == "" {
+			return fmt.Errorf("cannot compensate pane %q: %w", paneID, ErrAgentNotFound)
+		}
+		if err := tabCloseRaw(tabID); err != nil {
+			return err
+		}
+		remaining, err := AgentList()
+		if err != nil {
+			return err
+		}
+		for _, a := range remaining {
+			if a.PaneID == paneID {
+				return fmt.Errorf("pane %s remains live after compensation", paneID)
+			}
+		}
+		return nil
+	}
 	return fmt.Errorf("cannot compensate launch %q: %w", name, ErrAgentNotFound)
+}
+
+func tabCloseRaw(tabID string) error {
+	out, err := runHerdr("tab", "close", tabID)
+	if err != nil {
+		return fmt.Errorf("herdr tab close %s: %s: %w", tabID, out, err)
+	}
+	return nil
 }
 
 func agentStartProcess(name, kind, paneID string, agentArgs ...string) error {
@@ -425,6 +769,9 @@ func AgentList() ([]AgentEntry, error) {
 	}
 	if err := json.Unmarshal([]byte(output), &resp); err != nil {
 		return nil, fmt.Errorf("parsing agent list: %s: %w", output, err)
+	}
+	if resp.Result.Agents == nil {
+		return nil, fmt.Errorf("herdr agent list returned no agents inventory")
 	}
 	return resp.Result.Agents, nil
 }
@@ -512,6 +859,19 @@ func SetPIDParentReader(f func(int) (int, error)) func() {
 func paneProcesses(paneID string) ([]PaneProcess, error) {
 	output, err := runHerdr("pane", "process-info", "--pane", paneID)
 	if err != nil {
+		var envelope struct {
+			Error struct {
+				Code string `json:"code"`
+			} `json:"error"`
+			Result struct {
+				Error struct {
+					Code string `json:"code"`
+				} `json:"error"`
+			} `json:"result"`
+		}
+		if json.Unmarshal([]byte(output), &envelope) == nil && (envelope.Error.Code == "pane_not_found" || envelope.Result.Error.Code == "pane_not_found") {
+			return nil, ErrPaneNotFound
+		}
 		return nil, fmt.Errorf("herdr pane process-info: %w", err)
 	}
 	var envelope struct {
@@ -560,6 +920,7 @@ func wrapperCandidate(p PaneProcess) bool {
 var (
 	ErrAgentNotFound         = errors.New("herdr agent not found")
 	ErrAgentIdentityMismatch = errors.New("herdr agent identity mismatch")
+	ErrPaneNotFound          = errors.New("herdr pane not found")
 )
 
 // ResolveAgentTab finds a standing agent by name and returns its tab label.

@@ -620,8 +620,13 @@ func runPulse() {
 
 		standingName := fmt.Sprintf("forge-%s", lane.Name)
 		targetLabel := standingName
+		repository := repositoryIdentityForLaunch(cfg)
+		if repository == "" || lane.Worktree == "" {
+			fmt.Fprintf(os.Stderr, "pulse launch rejected: repository and isolated worktree identity required\n")
+			os.Exit(1)
+		}
 
-		tabLabel, err := herdr.ResolveAgentTabWithDecision(standingName, taskLaunchRequest(decision, task.Ref))
+		tabLabel, err := herdr.ResolveAgentTabWithDecision(standingName, taskLaunchRequest(decision, task.Ref, repository, lane.Name))
 		if err != nil {
 			if !shouldCreateEphemeralTaskAgent(err) {
 				fmt.Fprintf(os.Stderr, "standing agent %s blocked: %v\n", standingName, err)
@@ -629,12 +634,16 @@ func runPulse() {
 			}
 			// no standing agent — create a fresh one
 			tabLabel = fmt.Sprintf("pulse-%s-%s", lane.Name, task.Ref)
-			tab, err := herdr.Tab(herdr.ResolveWorkspace("."), tabLabel, true)
+			cwd := "."
+			if lane.Worktree != "" {
+				cwd = filepath.Join(".", lane.Worktree)
+			}
+			tab, err := herdr.TabCreateForTask(herdr.ResolveWorkspace("."), tabLabel, cwd, true)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "failed to create herdr tab: %v\n", err)
 				os.Exit(1)
 			}
-			if err := herdr.StartPreparedAgent(tab.ID, tabLabel, decision.Provider, tab.Pane.ID, taskLaunchRequest(decision, task.Ref)); err != nil {
+			if err := herdr.StartPreparedAgent(tab.ID, tabLabel, decision.Provider, tab.Pane.ID, taskLaunchRequest(decision, task.Ref, repository, lane.Name)); err != nil {
 				fmt.Fprintf(os.Stderr, "failed to start agent: %v\n", err)
 				os.Exit(1)
 			}
@@ -978,15 +987,28 @@ func runStandingConfig(cfg *config.Config, herdrAvailable bool) error {
 		}
 		tabLabel := fmt.Sprintf("forge-%s", lane.Name)
 		fmt.Printf("Launching lane '%s' as agent '%s' (kind=%s)...\n", lane.Name, tabLabel, lane.AgentKind)
+		repository := repositoryIdentityForLaunch(cfg)
+		if repository == "" {
+			failures = append(failures, fmt.Errorf("lane %s repository identity unavailable", lane.Name))
+			continue
+		}
+		if lane.Worktree == "" {
+			failures = append(failures, fmt.Errorf("lane %s requires an isolated worktree", lane.Name))
+			continue
+		}
 
-		tab, err := herdr.Tab(herdr.ResolveWorkspace("."), tabLabel, true)
+		cwd := "."
+		if lane.Worktree != "" {
+			cwd = filepath.Join(".", lane.Worktree)
+		}
+		tab, err := herdr.TabCreateForTask(herdr.ResolveWorkspace("."), tabLabel, cwd, true)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "  failed to create tab for lane %s: %v\n", lane.Name, err)
 			failures = append(failures, fmt.Errorf("lane %s create tab: %w", lane.Name, err))
 			continue
 		}
 
-		if err := herdr.StartPreparedAgent(tab.ID, tabLabel, decision.Provider, tab.Pane.ID, launch.Request{Decision: decision, TaskRef: lane.Name, Scope: router.ScopeLane}); err != nil {
+		if err := herdr.StartPreparedAgent(tab.ID, tabLabel, decision.Provider, tab.Pane.ID, launch.Request{Decision: decision, TaskRef: lane.Name, Scope: router.ScopeLane, Repository: repository, Lane: lane.Name}); err != nil {
 			fmt.Fprintf(os.Stderr, "  failed to start agent for lane %s: %v\n", lane.Name, err)
 			failures = append(failures, fmt.Errorf("lane %s start agent: %w", lane.Name, err))
 			continue
@@ -1047,10 +1069,23 @@ func runUp() {
 		fmt.Fprintf(os.Stderr, "herdr CLI not found\n")
 		os.Exit(1)
 	}
+	repository := repositoryIdentityForLaunch(cfg)
+	if repository == "" {
+		fmt.Fprintf(os.Stderr, "launch rejected before tab creation: repository identity unavailable\n")
+		os.Exit(1)
+	}
+	if lane.Worktree == "" {
+		fmt.Fprintf(os.Stderr, "launch rejected before tab creation: isolated worktree required\n")
+		os.Exit(1)
+	}
 	var tab *herdr.TabInfo
 	decision, err := launchAdmissionWithLifecycle(liveLaunchLifecycle{}, cfg, lane.Role, true, routedLaneDecision(context.Background(), nil), func(_ *router.LaunchDecision) error {
 		var tabErr error
-		tab, tabErr = herdr.Tab(herdr.ResolveWorkspace("."), fmt.Sprintf("forge-%s", lane.Name), true)
+		cwd := "."
+		if lane.Worktree != "" {
+			cwd = filepath.Join(".", lane.Worktree)
+		}
+		tab, tabErr = herdr.TabCreateForTask(herdr.ResolveWorkspace("."), fmt.Sprintf("forge-%s", lane.Name), cwd, true)
 		return tabErr
 	})
 	if err != nil {
@@ -1061,10 +1096,8 @@ func runUp() {
 		fmt.Fprintf(os.Stderr, "launch decision rejected before tab creation: %v\n", err)
 		os.Exit(1)
 	}
-
 	tabLabel := fmt.Sprintf("forge-%s", lane.Name)
-
-	if err := herdr.StartPreparedAgent(tab.ID, tabLabel, decision.Provider, tab.Pane.ID, launch.Request{Decision: decision, TaskRef: lane.Name, Scope: router.ScopeLane}); err != nil {
+	if err := herdr.StartPreparedAgent(tab.ID, tabLabel, decision.Provider, tab.Pane.ID, launch.Request{Decision: decision, TaskRef: lane.Name, Scope: router.ScopeLane, Repository: repository, Lane: lane.Name}); err != nil {
 		fmt.Fprintf(os.Stderr, "failed to start agent: %v\n", err)
 		os.Exit(1)
 	}
@@ -1259,20 +1292,26 @@ func runReview() {
 
 		standingName := fmt.Sprintf("forge-%s", lane.Name)
 		targetLabel := standingName
+		worktreeDir := lane.Worktree
+		if worktreeDir == "" {
+			fmt.Fprintf(os.Stderr, "review launch rejected: isolated task worktree required\n")
+			os.Exit(1)
+		}
 
-		tabLabel, err := herdr.ResolveAgentTabWithDecision(standingName, taskLaunchRequest(decision, task.Ref))
+		tabLabel, err := herdr.ResolveAgentTabWithDecision(standingName, taskLaunchRequest(decision, task.Ref, repositoryIdentityForLaunch(cfg), lane.Name))
 		if err != nil {
 			if !shouldCreateEphemeralTaskAgent(err) {
 				fmt.Fprintf(os.Stderr, "standing reviewer %s blocked: %v\n", standingName, err)
 				os.Exit(1)
 			}
 			tabLabel = fmt.Sprintf("review-%s-%s", lane.Name, task.Ref)
-			tab, tabErr := herdr.Tab(herdr.ResolveWorkspace("."), tabLabel, true)
+			cwd := filepath.Join(".", worktreeDir)
+			tab, tabErr := herdr.TabCreateForTask(herdr.ResolveWorkspace("."), tabLabel, cwd, true)
 			if tabErr != nil {
 				fmt.Fprintf(os.Stderr, "failed to create herdr tab: %v\n", tabErr)
 				os.Exit(1)
 			}
-			if err := herdr.StartPreparedAgent(tab.ID, tabLabel, decision.Provider, tab.Pane.ID, taskLaunchRequest(decision, task.Ref)); err != nil {
+			if err := herdr.StartPreparedAgent(tab.ID, tabLabel, decision.Provider, tab.Pane.ID, taskLaunchRequest(decision, task.Ref, repositoryIdentityForLaunch(cfg), lane.Name)); err != nil {
 				fmt.Fprintf(os.Stderr, "failed to start agent: %v\n", err)
 				os.Exit(1)
 			}
@@ -1280,11 +1319,6 @@ func runReview() {
 		} else {
 			targetLabel = standingName
 			fmt.Printf("Using standing reviewer '%s' (tab %s)\n", standingName, tabLabel)
-		}
-
-		worktreeDir := lane.Worktree
-		if worktreeDir == "" {
-			worktreeDir = ".worktrees/reviewer"
 		}
 
 		// FAC-131: a TIGHT, SCOPED review packet — no spec dump, only the
@@ -2478,15 +2512,22 @@ func runForgeE() error {
 					return fmt.Errorf("forge launch decision rejected after claim: %w", bindErr)
 				}
 				standingName := fmt.Sprintf("forge-%s", lane.Name)
-				tabLabel, resolveErr := herdr.ResolveAgentTabWithDecision(standingName, taskLaunchRequest(decision, task.Ref))
+				if lane.Worktree == "" {
+					return fmt.Errorf("forge launch requires an isolated worktree")
+				}
+				tabLabel, resolveErr := herdr.ResolveAgentTabWithDecision(standingName, taskLaunchRequest(decision, task.Ref, repositoryIdentityForLaunch(cfg), lane.Name))
 				if resolveErr != nil {
 					if !shouldCreateEphemeralTaskAgent(resolveErr) {
 						return fmt.Errorf("standing forge agent %s blocked: %w", standingName, resolveErr)
 					}
 					tabLabel = fmt.Sprintf("forge-%s-%s", lane.Name, task.Ref)
-					tab, tabErr := herdr.Tab(herdr.ResolveWorkspace("."), tabLabel, true)
+					cwd := "."
+					if lane.Worktree != "" {
+						cwd = filepath.Join(".", lane.Worktree)
+					}
+					tab, tabErr := herdr.TabCreateForTask(herdr.ResolveWorkspace("."), tabLabel, cwd, true)
 					if tabErr == nil {
-						if err := herdr.StartPreparedAgent(tab.ID, tabLabel, decision.Provider, tab.Pane.ID, taskLaunchRequest(decision, task.Ref)); err != nil {
+						if err := herdr.StartPreparedAgent(tab.ID, tabLabel, decision.Provider, tab.Pane.ID, taskLaunchRequest(decision, task.Ref, repositoryIdentityForLaunch(cfg), lane.Name)); err != nil {
 							return fmt.Errorf("launch failed: %w", err)
 						}
 					} else {
@@ -2680,11 +2721,18 @@ func rebindDecisionForTask(decision *router.LaunchDecision, taskRef string, leas
 	return bound, nil
 }
 
-func taskLaunchRequest(decision *router.LaunchDecision, taskRef string) launch.Request {
-	if decision == nil {
-		return launch.Request{TaskRef: taskRef}
+func repositoryIdentityForLaunch(cfg *config.Config) string {
+	if id, err := dispatch.AuthenticatedRepositoryIdentity("."); err == nil {
+		return id
 	}
-	return launch.Request{Decision: decision, TaskRef: taskRef, LeaseGeneration: decision.LeaseGeneration, Scope: decision.Scope}
+	return ""
+}
+
+func taskLaunchRequest(decision *router.LaunchDecision, taskRef, repository, lane string) launch.Request {
+	if decision == nil {
+		return launch.Request{TaskRef: taskRef, Repository: repository, Lane: lane}
+	}
+	return launch.Request{Decision: decision, TaskRef: taskRef, LeaseGeneration: decision.LeaseGeneration, Scope: decision.Scope, Repository: repository, Lane: lane}
 }
 
 func shouldCreateEphemeralTaskAgent(err error) bool {

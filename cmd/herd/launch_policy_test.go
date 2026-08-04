@@ -147,7 +147,7 @@ func TestTaskLaunchRequestCarriesExactReboundGeneration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	req := taskLaunchRequest(d, "FAC-B")
+	req := taskLaunchRequest(d, "FAC-B", "test-repository", "worker")
 	if req.LeaseGeneration != 7 {
 		t.Fatalf("task request generation = %d, want 7", req.LeaseGeneration)
 	}

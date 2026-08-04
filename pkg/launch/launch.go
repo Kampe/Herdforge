@@ -42,26 +42,32 @@ type Request struct {
 	Name            string
 	PaneID          string
 	LeaseGeneration int64
-	Scope           string
+	// SessionGeneration fences the Herdr session independently of task lease
+	// generations; lane launches intentionally have LeaseGeneration == 0.
+	SessionGeneration int64
+	Scope             string
+	Repository        string
+	Lane              string
 }
 
 // Receipt is durable evidence for one launch attempt. Validation does not
 // write acceptance: acceptance is recorded only after the process API starts.
 type Receipt struct {
-	CreatedAt       time.Time `json:"created_at"`
-	TaskRef         string    `json:"task_ref,omitempty"`
-	Role            string    `json:"role"`
-	TaskShape       string    `json:"task_shape"`
-	Provider        string    `json:"provider"`
-	Model           string    `json:"model"`
-	Effort          string    `json:"effort"`
-	DecisionDigest  string    `json:"decision_digest"`
-	Argv            []string  `json:"argv,omitempty"`
-	Accepted        bool      `json:"accepted"`
-	Reason          string    `json:"reason,omitempty"`
-	Name            string    `json:"name,omitempty"`
-	PaneID          string    `json:"pane_id,omitempty"`
-	LeaseGeneration int64     `json:"lease_generation,omitempty"`
+	CreatedAt         time.Time `json:"created_at"`
+	TaskRef           string    `json:"task_ref,omitempty"`
+	Role              string    `json:"role"`
+	TaskShape         string    `json:"task_shape"`
+	Provider          string    `json:"provider"`
+	Model             string    `json:"model"`
+	Effort            string    `json:"effort"`
+	DecisionDigest    string    `json:"decision_digest"`
+	Argv              []string  `json:"argv,omitempty"`
+	Accepted          bool      `json:"accepted"`
+	Reason            string    `json:"reason,omitempty"`
+	Name              string    `json:"name,omitempty"`
+	PaneID            string    `json:"pane_id,omitempty"`
+	LeaseGeneration   int64     `json:"lease_generation,omitempty"`
+	SessionGeneration int64     `json:"session_generation,omitempty"`
 }
 
 // Sink makes receipt durability injectable without making process tests touch
@@ -162,7 +168,7 @@ func RecordStarted(req Request, sink Sink) error {
 		sink = DefaultSink()
 	}
 	role, shape, provider, model, effort, digest, argv := fields(req)
-	return sink.Write(Receipt{CreatedAt: time.Now().UTC(), TaskRef: req.TaskRef, Role: role, TaskShape: shape, Provider: provider, Model: model, Effort: effort, DecisionDigest: digest, Argv: argv, Accepted: true, Reason: "process started", Name: req.Name, PaneID: req.PaneID, LeaseGeneration: req.LeaseGeneration})
+	return sink.Write(Receipt{CreatedAt: time.Now().UTC(), TaskRef: req.TaskRef, Role: role, TaskShape: shape, Provider: provider, Model: model, Effort: effort, DecisionDigest: digest, Argv: argv, Accepted: true, Reason: "process started", Name: req.Name, PaneID: req.PaneID, LeaseGeneration: req.LeaseGeneration, SessionGeneration: req.SessionGeneration})
 }
 
 func RecordRejected(req Request, sink Sink, reason string) error { return reject(req, sink, reason) }
