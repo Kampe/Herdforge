@@ -244,7 +244,7 @@ func (in *Integration) Run(ctx context.Context) (*IntegrationResult, error) {
 		if len(group) == 0 || !allEligible(group) || in.DryRun {
 			continue
 		}
-		mos, err := in.runMergeBatch(ctx, group)
+		mos, err := in.runMergeGate(ctx, group)
 		if err != nil {
 			res.Errors = append(res.Errors, fmt.Sprintf("merge batch %s: %v", group[0].Task, err))
 			continue
@@ -385,17 +385,6 @@ func ensureCandidateOnBranch(ctx context.Context, worktreePath, sha string) erro
 	return nil
 }
 
-func (in *Integration) runMergeGate(ctx context.Context, rg ReviewGateOutcome) (*MergeOutcome, error) {
-	mos, err := in.runMergeBatch(ctx, []ReviewGateOutcome{rg})
-	if err != nil {
-		return nil, err
-	}
-	if len(mos) != 1 {
-		return nil, fmt.Errorf("singleton merge gate received batch cardinality %d", len(mos))
-	}
-	return &mos[0], nil
-}
-
 func allEligible(group []ReviewGateOutcome) bool {
 	for _, rg := range group {
 		if !rg.Eligible || rg.Task == "" {
@@ -412,7 +401,7 @@ func (in *Integration) mergeReadback(ctx context.Context, ref, sha string) (stri
 	return hsync.MergeEvidence(in.RepoRoot, ref, sha)
 }
 
-func (in *Integration) runMergeBatch(ctx context.Context, group []ReviewGateOutcome) ([]MergeOutcome, error) {
+func (in *Integration) runMergeGate(ctx context.Context, group []ReviewGateOutcome) ([]MergeOutcome, error) {
 	if len(group) == 0 || in.DryRun {
 		return nil, nil
 	}

@@ -51,7 +51,12 @@ func addAndCommitHarvest(t *testing.T, dir, msg string, files ...string) string 
 	t.Helper()
 	args := append([]string{"add"}, files...)
 	gitInHarvest(t, dir, args...)
-	gitInHarvest(t, dir, "commit", "-q", "-m", msg)
+	commitArgs := []string{"commit", "-q"}
+	if len(files) == 0 {
+		commitArgs = append(commitArgs, "--allow-empty")
+	}
+	commitArgs = append(commitArgs, "-m", msg)
+	gitInHarvest(t, dir, commitArgs...)
 	return gitInHarvest(t, dir, "rev-parse", "HEAD")
 }
 
