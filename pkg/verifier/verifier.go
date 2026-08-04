@@ -639,12 +639,10 @@ func (v *Verifier) admitMutationDisk(dir string) error {
 	if err != nil {
 		return fmt.Errorf("disk capacity gate: resolve temporary volume: %w", err)
 	}
-	scope := resources.CapacityScopeForPaths(candidate, tmp)
 	decision := v.DiskAdmission.Admit(resources.DiskRequest{
 		Operation: "verifier_mutation",
 		Path:      candidate,
 		TempPath:  tmp,
-		Scope:     scope,
 	})
 	if decision.Allowed {
 		return nil

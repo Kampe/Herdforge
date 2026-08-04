@@ -84,8 +84,6 @@ type DiskRequest struct {
 	RequiredBytes, RequiredInodes uint64
 	PreviouslyBlocked             bool
 	AdditionalPaths               []string
-	// Scope is an opaque, stable canonical volume-set identity.
-	Scope string
 }
 
 type DiskState string
@@ -109,22 +107,26 @@ const (
 // DiskEvidence is bounded and safe to serialize or log. Paths are never
 // included; identities containing path-like data are reduced to an opaque ID.
 type DiskEvidence struct {
-	Kind             string  `json:"kind"`
-	Reason           string  `json:"reason"`
-	Operation        string  `json:"operation"`
-	FilesystemID     string  `json:"filesystem_id,omitempty"`
-	TempFilesystemID string  `json:"temp_filesystem_id,omitempty"`
-	FreeBytes        uint64  `json:"free_bytes"`
-	FreePercent      float64 `json:"free_percent"`
-	FreeInodes       uint64  `json:"free_inodes"`
-	RequiredBytes    uint64  `json:"required_bytes"`
-	ReserveBytes     uint64  `json:"reserve_bytes"`
-	ReservePercent   float64 `json:"reserve_percent"`
-	ReserveInodes    uint64  `json:"reserve_inodes"`
-	TempFreeBytes    uint64  `json:"temp_free_bytes,omitempty"`
-	TempFreePercent  float64 `json:"temp_free_percent,omitempty"`
-	TempFreeInodes   uint64  `json:"temp_free_inodes,omitempty"`
-	ScopeID          string  `json:"scope_id,omitempty"`
+	Kind               string  `json:"kind"`
+	Reason             string  `json:"reason"`
+	Operation          string  `json:"operation"`
+	FilesystemID       string  `json:"filesystem_id,omitempty"`
+	TempFilesystemID   string  `json:"temp_filesystem_id,omitempty"`
+	FreeBytes          uint64  `json:"free_bytes"`
+	FreePercent        float64 `json:"free_percent"`
+	FreeInodes         uint64  `json:"free_inodes"`
+	RequiredBytes      uint64  `json:"required_bytes"`
+	ReserveBytes       uint64  `json:"reserve_bytes"`
+	ReservePercent     float64 `json:"reserve_percent"`
+	ReserveInodes      uint64  `json:"reserve_inodes"`
+	TempFreeBytes      uint64  `json:"temp_free_bytes,omitempty"`
+	TempFreePercent    float64 `json:"temp_free_percent,omitempty"`
+	TempFreeInodes     uint64  `json:"temp_free_inodes,omitempty"`
+	ScopeID            string  `json:"scope_id,omitempty"`
+	FailedFilesystemID string  `json:"failed_filesystem_id,omitempty"`
+	FailedFreeBytes    uint64  `json:"failed_free_bytes,omitempty"`
+	FailedFreePercent  float64 `json:"failed_free_percent,omitempty"`
+	FailedFreeInodes   uint64  `json:"failed_free_inodes,omitempty"`
 }
 
 type DiskDecision struct {
@@ -161,18 +163,17 @@ func (g *CapacityGate) Admit(request DiskRequest) DiskDecision {
 	if g == nil {
 		return EvaluateDiskCapacity(nil, request, DiskPolicy{})
 	}
-	scope := request.Scope
-	if scope == "" {
-		scope = CapacityScopeForPaths(append([]string{request.Path, request.TempPath}, request.AdditionalPaths...)...)
-	}
+	// Scope is derived here, never accepted from a caller or persisted input.
+	// The inputs are the canonical paths actually sent to the probe backend.
+	scope := CapacityScopeForPaths(append([]string{request.Path, request.TempPath}, request.AdditionalPaths...)...)
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	if g.blocked == nil {
 		g.blocked = make(map[string]bool)
 	}
 	request.PreviouslyBlocked = g.blocked[scope]
-	request.Scope = scope
 	decision := EvaluateDiskCapacity(g.Backend, request, g.Policy)
+	decision.Evidence.ScopeID = scope
 	if decision.Allowed {
 		delete(g.blocked, scope)
 	} else {
@@ -202,9 +203,6 @@ var diskOperationPattern = regexp.MustCompile(`^[a-zA-Z][a-zA-Z0-9_.-]{0,31}$`)
 func EvaluateDiskCapacity(backend StatFSBackend, request DiskRequest, policy DiskPolicy) DiskDecision {
 	t := policy.thresholds(request.PreviouslyBlocked)
 	e := DiskEvidence{Kind: "disk_pressure", Operation: boundedDiskOperation(request.Operation), ReserveBytes: t.bytes, ReservePercent: t.percent, ReserveInodes: t.inodes, RequiredBytes: request.RequiredBytes}
-	if request.Scope != "" {
-		e.ScopeID = request.Scope
-	}
 	if err := validDiskPolicy(policy); err != nil {
 		return diskBlocked(e, DiskReasonInvalidPolicy)
 	}
@@ -256,13 +254,24 @@ func EvaluateDiskCapacity(backend StatFSBackend, request DiskRequest, policy Dis
 		}
 		additional, err := backend.StatFS(path)
 		if err != nil {
-			return diskBlocked(e, DiskReasonUnavailable)
+			e.Reason = "additional_volume_unavailable"
+			return DiskDecision{State: DiskBlocked, Evidence: e}
 		}
-		if err := validCapacity(additional); err != nil || strings.TrimSpace(additional.FilesystemID) == "" {
-			return diskBlocked(e, DiskReasonInvalid)
+		if strings.TrimSpace(additional.FilesystemID) != "" {
+			e.FailedFilesystemID = safeDiskIdentity(additional.FilesystemID)
+		}
+		if validCapacity(additional) != nil {
+			e.Reason = "additional_volume_invalid"
+			return DiskDecision{State: DiskBlocked, Evidence: e}
+		}
+		e.FailedFreeBytes, e.FailedFreePercent, e.FailedFreeInodes = capacityMetrics(additional)
+		if strings.TrimSpace(additional.FilesystemID) == "" {
+			e.Reason = "additional_volume_unavailable"
+			return DiskDecision{State: DiskBlocked, Evidence: e}
 		}
 		if !capacityMeets(additional, request.RequiredBytes, request.RequiredInodes, t) {
-			return diskBlocked(e, DiskReasonTempVolumeDivergence)
+			e.Reason = "additional_volume_below_threshold"
+			return DiskDecision{State: DiskBlocked, Evidence: e}
 		}
 	}
 	e.Reason = DiskReasonNone
