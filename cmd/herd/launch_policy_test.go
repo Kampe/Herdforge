@@ -151,6 +151,9 @@ func TestTaskLaunchRequestCarriesExactReboundGeneration(t *testing.T) {
 	if req.LeaseGeneration != 7 {
 		t.Fatalf("task request generation = %d, want 7", req.LeaseGeneration)
 	}
+	if req.SessionGeneration != 0 {
+		t.Fatalf("task request must defer standing session recovery, got generation %d", req.SessionGeneration)
+	}
 	if err := launch.Validate(req, nil); err != nil {
 		t.Fatalf("exact task request must validate: %v", err)
 	}

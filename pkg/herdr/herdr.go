@@ -444,6 +444,19 @@ func bindRecoveredToolChildLifecycle(lc *toolchild.Lifecycle) error {
 }
 
 func ReconcileToolChild(tabID, event string) error {
+	lc, err := loadToolChildLifecycle(tabID)
+	if err != nil {
+		return fmt.Errorf("tool-child cleanup blocked: %w", err)
+	}
+	if concrete, ok := lc.(*toolchild.Lifecycle); ok && !concrete.Bound() {
+		if err := bindRecoveredToolChildLifecycle(concrete); err != nil {
+			return fmt.Errorf("tool-child pre-bind recovery blocked: %w", err)
+		}
+	}
+	return lc.Reconcile(event)
+}
+
+func loadToolChildLifecycle(tabID string) (ToolChildLifecycle, error) {
 	toolChildMu.Lock()
 	lc := toolChildByTab[tabID]
 	toolChildMu.Unlock()
@@ -456,7 +469,7 @@ func ReconcileToolChild(tabID, event string) error {
 			lc, err = toolchild.DiscoverLifecycle(tabID, toolchild.SystemTree{}, &toolchild.JSONLSink{})
 		}
 		if err != nil {
-			return fmt.Errorf("tool-child cleanup blocked: %w", err)
+			return nil, err
 		}
 		toolChildMu.Lock()
 		toolChildByTab[tabID] = lc
@@ -465,12 +478,51 @@ func ReconcileToolChild(tabID, event string) error {
 		}
 		toolChildMu.Unlock()
 	}
-	if concrete, ok := lc.(*toolchild.Lifecycle); ok && !concrete.Bound() {
-		if err := bindRecoveredToolChildLifecycle(concrete); err != nil {
-			return fmt.Errorf("tool-child pre-bind recovery blocked: %w", err)
+	return lc, nil
+}
+
+func recoverStandingLifecycle(agent AgentEntry, req launch.Request) (int64, error) {
+	if req.Decision == nil || agent.TabID == "" || agent.PaneID == "" || agent.Session.Value == "" {
+		return 0, fmt.Errorf("standing lifecycle authority is incomplete: %w", ErrAgentIdentityMismatch)
+	}
+	lc, err := loadToolChildLifecycle(agent.TabID)
+	if err != nil {
+		return 0, fmt.Errorf("standing lifecycle recovery: %w", err)
+	}
+	concrete, ok := lc.(*toolchild.Lifecycle)
+	if !ok || !concrete.Bound() {
+		return 0, fmt.Errorf("standing lifecycle is not bound: %w", ErrAgentIdentityMismatch)
+	}
+	owner := concrete.Inventory.Owner
+	expectedDigest := launch.DecisionDigest(req.Decision)
+	if owner.TabID != agent.TabID || owner.PaneID != agent.PaneID || agent.Kind != req.Decision.Provider || owner.Repository != req.Repository || owner.TaskRef != req.TaskRef || owner.Lane != req.Lane || owner.Provider != req.Decision.Provider || owner.Role != string(req.Decision.Role) || owner.LaunchID != expectedDigest || owner.ArgvDigest != expectedDigest || !equalArgs(owner.Argv, req.Decision.Argv) || owner.SessionID != agent.Session.Value || owner.SessionGeneration <= 0 || concrete.RecoveredPhase >= 4 {
+		return 0, fmt.Errorf("standing lifecycle identity mismatch or terminal authority: %w", ErrAgentIdentityMismatch)
+	}
+	if req.SessionGeneration != 0 && req.SessionGeneration != owner.SessionGeneration {
+		return 0, fmt.Errorf("standing lifecycle generation mismatch: %w", ErrAgentIdentityMismatch)
+	}
+	return owner.SessionGeneration, nil
+}
+
+func equalArgs(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
 		}
 	}
-	return lc.Reconcile(event)
+	return true
+}
+
+func reconcileRecoveredToolChild(tabID, event string, generation int64) error {
+	lc := lifecycleForTab(tabID)
+	concrete, ok := lc.(*toolchild.Lifecycle)
+	if !ok || concrete.Inventory.Owner.SessionGeneration != generation {
+		return fmt.Errorf("standing lifecycle generation changed before reconciliation: %w", ErrAgentIdentityMismatch)
+	}
+	return ReconcileToolChild(tabID, event)
 }
 
 type TabInfo struct {
@@ -967,6 +1019,11 @@ func ResolveAgentTabWithDecision(name string, req launch.Request) (string, error
 			continue
 		}
 		req.Name, req.PaneID = name, a.PaneID
+		generation, err := recoverStandingLifecycle(a, req)
+		if err != nil {
+			return "", err
+		}
+		req.SessionGeneration = generation
 		ok, err := launch.HasStarted(req)
 		if err != nil {
 			return "", fmt.Errorf("resume lifecycle lookup: %w", err)
@@ -974,7 +1031,7 @@ func ResolveAgentTabWithDecision(name string, req launch.Request) (string, error
 		if !ok {
 			return "", fmt.Errorf("standing agent %q has no matching durable launch identity: %w", name, ErrAgentIdentityMismatch)
 		}
-		if err := ReconcileToolChild(a.TabID, "recovery"); err != nil {
+		if err := reconcileRecoveredToolChild(a.TabID, "recovery", generation); err != nil {
 			return "", fmt.Errorf("resume tool-child recovery: %w", err)
 		}
 		return name, nil
