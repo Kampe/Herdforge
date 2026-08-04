@@ -11,6 +11,39 @@ import (
 	"testing"
 )
 
+type testAuthorityVerifier struct{}
+
+func (testAuthorityVerifier) VerifyGraph(context.Context, AuthorityReceipt, Graph) error { return nil }
+func (testAuthorityVerifier) VerifyScope(context.Context, AuthorityReceipt, Scope) error { return nil }
+func (testAuthorityVerifier) VerifyRelease(context.Context, ReleaseRequest) error        { return nil }
+
+type rejectingReleaseAuthority struct{}
+
+func (rejectingReleaseAuthority) VerifyRelease(context.Context, ReleaseRequest) error {
+	return errors.New("root authority absent")
+}
+
+func TestFenceDoesNotTreatDeterministicProofAsRootReleaseAuthority(t *testing.T) {
+	store, err := NewSQLiteStore(filepath.Join(t.TempDir(), "scopefence.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	owner := req("FAC-213", "release-authority", 1, scope("pkg/release-authority", "pkg/release-authority.go", "Run")).Ownership
+	if won, err := store.CompareAndSwap(context.Background(), "1", []Ownership{owner}); err != nil || !won {
+		t.Fatalf("seed: won=%v err=%v", won, err)
+	}
+	release := ReleaseRequest{Ownership: owner, Authority: RootAdmittedMerge, Proof: ReleaseProof(ReleaseRequest{Ownership: owner, Authority: RootAdmittedMerge})}
+	f := Fence{Store: store, Verify: func(context.Context, ReleaseRequest) bool { return true }, ReleaseAuthority: rejectingReleaseAuthority{}}
+	if err := f.Release(context.Background(), release); err == nil {
+		t.Fatal("deterministic proof bypassed protected root release authority")
+	}
+	snapshot, err := store.Read(context.Background())
+	if err != nil || len(snapshot.Owners) != 1 {
+		t.Fatalf("rejected release changed ownership: owners=%+v err=%v", snapshot.Owners, err)
+	}
+}
+
 func TestSQLiteStorePersistsExactOwnershipAndEvidenceAcrossRestart(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "scopefence.db")
 	owner := req("FAC-200", "durable", 4, scope("pkg/durable", "pkg/durable.go", "Run")).Ownership
@@ -95,6 +128,7 @@ func TestSQLiteGraphAuthorityBindsRepositoryRevisionAndCompleteness(t *testing.T
 		t.Fatal(err)
 	}
 	authority := NewSQLiteGraphAuthority(store, "repo", graph.Revision, graph.Files)
+	authority.Verifier = testAuthorityVerifier{}
 	trusted, err := authority.Current(context.Background())
 	if err != nil || trusted.Snapshot != graph || trusted.ExpectedRevision != graph.Revision || trusted.ExpectedFiles != graph.Files {
 		t.Fatalf("unexpected trusted graph: %+v err=%v", trusted, err)
@@ -258,6 +292,7 @@ func TestSQLiteScopeAuthorityRequiresExactGraphRevisionAndCanonicalScope(t *test
 		t.Fatal(err)
 	}
 	authority := NewSQLiteScopeAuthority(store)
+	authority.Verifier = testAuthorityVerifier{}
 	resolved, err := authority.Resolve(context.Background(), "repo", "FAC-212", "graph-1")
 	if err != nil || !scopesEqual(resolved, declared) {
 		t.Fatalf("scope resolution failed: %+v err=%v", resolved, err)
@@ -285,9 +320,14 @@ func TestResolvingFenceIgnoresCallerScopeAndUsesRevisionBoundAuthority(t *testin
 		t.Fatal(err)
 	}
 	resolving := ResolvingFence{
-		Fence:     Fence{Store: store, Graph: NewSQLiteGraphAuthority(store, "repo", graph.Revision, graph.Files)},
+		Fence: Fence{Store: store, Graph: func() *SQLiteGraphAuthority {
+			a := NewSQLiteGraphAuthority(store, "repo", graph.Revision, graph.Files)
+			a.Verifier = testAuthorityVerifier{}
+			return a
+		}()},
 		Authority: NewSQLiteScopeAuthority(store),
 	}
+	resolving.Authority.(*SQLiteScopeAuthority).Verifier = testAuthorityVerifier{}
 	request := req("FAC-214", "branch", 1, Scope{Packages: []string{"pkg/underdeclared"}})
 	request.Repository, request.Task = "repo", "FAC-214"
 	request.ExpectedGraphRevision = graph.Revision

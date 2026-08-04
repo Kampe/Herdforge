@@ -4,10 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Kampe/Herdforge/pkg/config"
@@ -211,6 +213,9 @@ type Dispatcher struct {
 	// supplies a durable scopefence.Fence; nil preserves packet-only callers.
 	ScopeFence    ScopeAdmission
 	scopeFenceErr error
+	scopeCloser   io.Closer
+	closeOnce     sync.Once
+	closeErr      error
 
 	// health projects BLOCKED(provider_timeout) for board calls (FAC-150).
 	health dispatchHealth
@@ -262,6 +267,22 @@ func NewDispatcher(cfg *config.Config, tp provider.TaskProvider, wm *worktree.Wo
 func NewProductionDispatcher(cfg *config.Config, tp provider.TaskProvider, wm *worktree.WorktreeManager) *Dispatcher {
 	d := NewDispatcher(cfg, tp, wm)
 	d.Production = true
+	d.scopeFenceErr = errors.New("dispatch scope authority requires separately protected coordinator/root verifier (FAC-169 authority surface is not present)")
+	return d
+}
+
+// NewProductionDispatcherWithAuthorities is the only production constructor
+// that can install scope admission. Both verify-only authorities are injected
+// by protected coordinator surfaces: graph/scope publication cannot authorize
+// RootAdmittedMerge or FencedAbandonment. No key, signer, environment value,
+// or database row is accepted as authority.
+func NewProductionDispatcherWithAuthorities(cfg *config.Config, tp provider.TaskProvider, wm *worktree.WorktreeManager, graphVerifier scopefence.GraphScopeVerifier, releaseAuthority scopefence.ReleaseAuthority, expectedRevision string, expectedFiles int) *Dispatcher {
+	d := NewDispatcher(cfg, tp, wm)
+	d.Production = true
+	if graphVerifier == nil || releaseAuthority == nil {
+		d.scopeFenceErr = errors.New("dispatch scope authority requires separately protected coordinator/root verifier")
+		return d
+	}
 	root := "."
 	if wm != nil && wm.RepoRoot != "" {
 		root = wm.RepoRoot
@@ -276,15 +297,28 @@ func NewProductionDispatcher(cfg *config.Config, tp provider.TaskProvider, wm *w
 		d.scopeFenceErr = err
 		return d
 	}
-	graph := scopefence.NewSQLiteGraphAuthority(store, repository, "", 0)
+	graph := scopefence.NewSQLiteGraphAuthority(store, repository, expectedRevision, expectedFiles)
+	graph.Verifier = graphVerifier
 	resolver := scopefence.NewSQLiteScopeAuthority(store)
-	verify := func(_ context.Context, req scopefence.ReleaseRequest) bool {
-		return req.Proof == scopefence.ReleaseProof(req)
-	}
+	resolver.Verifier = graphVerifier
 	d.ScopeFence = durableScopeAdmission{fence: scopefence.ResolvingFence{
-		Fence: scopefence.Fence{Store: store, Verify: verify, Graph: graph}, Authority: resolver,
+		Fence: scopefence.Fence{Store: store, ReleaseAuthority: releaseAuthority, Graph: graph}, Authority: resolver,
 	}}
+	d.scopeCloser = store
 	return d
+}
+
+// Close propagates the owned durable fence resource exactly once.
+func (d *Dispatcher) Close() error {
+	if d == nil {
+		return nil
+	}
+	d.closeOnce.Do(func() {
+		if d.scopeCloser != nil {
+			d.closeErr = d.scopeCloser.Close()
+		}
+	})
+	return d.closeErr
 }
 
 func (d *Dispatcher) ownershipClaimer() (deps.OwnershipClaimer, error) {
@@ -491,7 +525,9 @@ func (d *Dispatcher) Dispatch(ctx context.Context, opts DispatchOptions) (*Dispa
 		}
 		if scopeOwned && !worktreeCreated {
 			scopeRelease.Authority = scopefence.CompensatedNoCandidate
-			scopeRelease.Proof = scopefence.ReleaseProof(scopeRelease)
+			// Production release authentication is performed by the injected
+			// protected authority; no worker-mintable hash is a credential.
+			scopeRelease.Proof = ""
 			if sErr := d.ScopeFence.Release(ctx, scopeRelease); sErr != nil {
 				return errors.Join(primary, fmt.Errorf("scopefence compensation retained ownership: %w", sErr))
 			}

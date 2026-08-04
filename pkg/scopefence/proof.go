@@ -6,7 +6,8 @@ import (
 	"encoding/json"
 )
 
-// ReleaseProof is deterministic for the exact ownership fence and authority.
+// ReleaseProof is a deterministic test/deduplication identifier only. It is
+// never a production release credential; production uses ReleaseAuthority.
 // It carries no secret and is intended for a separately authenticated
 // verifier to compare byte-for-byte.
 func ReleaseProof(req ReleaseRequest) string {

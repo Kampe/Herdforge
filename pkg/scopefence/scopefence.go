@@ -153,9 +153,10 @@ type ReleaseRequest struct {
 type ProofVerifier func(context.Context, ReleaseRequest) bool
 
 type Fence struct {
-	Store  Store
-	Verify ProofVerifier
-	Graph  GraphAuthority
+	Store            Store
+	Verify           ProofVerifier
+	ReleaseAuthority ReleaseAuthority
+	Graph            GraphAuthority
 }
 
 // TrustedGraph carries observed graph data and expectations from the
@@ -467,7 +468,7 @@ func (f Fence) Acquire(ctx context.Context, req AcquireRequest) (Decision, error
 }
 
 func (f Fence) Release(ctx context.Context, req ReleaseRequest) error {
-	if f.Store == nil || f.Verify == nil {
+	if f.Store == nil || (f.Verify == nil && f.ReleaseAuthority == nil) {
 		return ErrBlocked
 	}
 	canonical, err := canonicalScope(req.Scope)
@@ -478,7 +479,11 @@ func (f Fence) Release(ctx context.Context, req ReleaseRequest) error {
 	if req.Authority != RootAdmittedMerge && req.Authority != FencedAbandonment && req.Authority != CompensatedNoCandidate {
 		return ErrBlocked
 	}
-	if !f.Verify(ctx, req) {
+	if f.ReleaseAuthority != nil {
+		if err := f.ReleaseAuthority.VerifyRelease(ctx, req); err != nil {
+			return ErrBlocked
+		}
+	} else if !f.Verify(ctx, req) {
 		return ErrBlocked
 	}
 	if atomicStore, ok := f.Store.(AtomicReleaseStore); ok {
