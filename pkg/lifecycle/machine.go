@@ -138,14 +138,8 @@ func (m *Machine) Close() error {
 // re-read current state and retry with a fresh request rather than
 // resuming this one.
 func (m *Machine) Transition(req TransitionRequest) (TransitionResult, error) {
-	if req.TaskRef == "" {
-		return TransitionResult{}, fmt.Errorf("transition: task_ref is required")
-	}
-	if req.IdempotencyKey == "" {
-		return TransitionResult{}, fmt.Errorf("transition: idempotency_key is required (fail-closed)")
-	}
-	if req.Actor == "" {
-		return TransitionResult{}, fmt.Errorf("transition: actor is required")
+	if err := validateTransitionRequest(req); err != nil {
+		return TransitionResult{}, err
 	}
 
 	m.mu.Lock()
@@ -157,6 +151,24 @@ func (m *Machine) Transition(req TransitionRequest) (TransitionResult, error) {
 	}
 	defer tx.Rollback()
 
+	result, err := m.transitionTx(tx, req)
+	if err != nil {
+		return TransitionResult{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return TransitionResult{}, fmt.Errorf("transition: commit: %w", err)
+	}
+	return result, nil
+}
+
+// transitionTx is the canonical transaction-scoped transition primitive used
+// by Machine and by the higher-level lifecycle Service. The caller must hold
+// m.mu and own tx. Keeping validation, event append, and outbox enrollment here
+// prevents service commands from growing a parallel state engine.
+func (m *Machine) transitionTx(tx *sql.Tx, req TransitionRequest) (TransitionResult, error) {
+	if err := validateTransitionRequest(req); err != nil {
+		return TransitionResult{}, err
+	}
 	appended, err := m.events.AppendTx(tx, AppendIntent{
 		TaskRef:          req.TaskRef,
 		Repo:             req.Repo,
@@ -174,10 +186,6 @@ func (m *Machine) Transition(req TransitionRequest) (TransitionResult, error) {
 		return TransitionResult{}, fmt.Errorf("transition: append event: %w", err)
 	}
 
-	// Enqueue outbox side effects on BOTH a fresh append and a replay —
-	// one code path, so a retried caller's items are filled in exactly
-	// like the first attempt's. outbox.Store's own idempotency dedup
-	// makes the replay a no-op instead of a duplicate side effect.
 	for _, item := range req.OutboxItems {
 		if item.TaskRef == "" {
 			item.TaskRef = req.TaskRef
@@ -186,10 +194,18 @@ func (m *Machine) Transition(req TransitionRequest) (TransitionResult, error) {
 			return TransitionResult{}, fmt.Errorf("transition: enqueue outbox item: %w", err)
 		}
 	}
-
-	if err := tx.Commit(); err != nil {
-		return TransitionResult{}, fmt.Errorf("transition: commit: %w", err)
-	}
-
 	return TransitionResult{Event: appended.Event, Replayed: appended.Replayed}, nil
+}
+
+func validateTransitionRequest(req TransitionRequest) error {
+	if req.TaskRef == "" {
+		return fmt.Errorf("transition: task_ref is required")
+	}
+	if req.IdempotencyKey == "" {
+		return fmt.Errorf("transition: idempotency_key is required (fail-closed)")
+	}
+	if req.Actor == "" {
+		return fmt.Errorf("transition: actor is required")
+	}
+	return nil
 }

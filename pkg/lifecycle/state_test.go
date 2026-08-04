@@ -68,7 +68,8 @@ func TestValidTransition_ReviewingCanReturnToBuildingOnChangesRequested(t *testi
 func TestValidTransition_RecoveringResumesIntoOwnedStates(t *testing.T) {
 	resumable := []State{
 		StateEligible, StateClaimed, StateDispatched, StateBuilding,
-		StateVerifying, StateReviewing, StateIntegrationQueued, StateBlocked,
+		StateVerifying, StateReviewing, StateIntegrationQueued, StateIntegrated,
+		StateReconciled, StateBlocked,
 	}
 	for _, to := range resumable {
 		if !ValidTransition(StateRecovering, to) {
