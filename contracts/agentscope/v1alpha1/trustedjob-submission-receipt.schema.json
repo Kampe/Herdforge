@@ -1,0 +1,104 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "contracts/agentscope/v1alpha1/trustedjob-submission-receipt.schema.json",
+  "title": "Herdforge Trusted Job Submission Receipt v1alpha1",
+  "description": "Contract-only outbound admission receipt. Admitted does not attest job execution.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["apiVersion", "kind", "correlation", "job", "workspace", "submissionDigest", "scopeDigest", "provider", "model", "callbackDestination", "idempotencyKey", "status", "admitted", "blocking", "violations"],
+  "properties": {
+    "apiVersion": { "const": "herdforge.dev/v1alpha1" },
+    "kind": { "const": "TrustedJobSubmissionReceipt" },
+    "correlation": { "$ref": "#/$defs/correlation" },
+    "job": { "$ref": "#/$defs/job" },
+    "workspace": { "$ref": "#/$defs/workspace" },
+    "submissionDigest": { "$ref": "#/$defs/digest" },
+    "scopeDigest": { "$ref": "#/$defs/digest" },
+    "provider": { "$ref": "#/$defs/identifier" },
+    "model": { "$ref": "#/$defs/identifier" },
+    "callbackDestination": { "$ref": "#/$defs/identifier" },
+    "idempotencyKey": { "$ref": "#/$defs/identifier" },
+    "status": { "enum": ["admitted", "rejected"] },
+    "admitted": { "type": "boolean" },
+    "blocking": { "type": "boolean" },
+    "violations": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/violation" }
+    }
+  },
+  "$defs": {
+    "identifier": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$"
+    },
+    "sha": {
+      "type": "string",
+      "pattern": "^([0-9a-f]{40}|[0-9a-f]{64})$"
+    },
+    "digest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "relativePath": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^(?!/)(?!\\.\\.?$)(?!.*(?:^|/)\\.\\.?(?:/|$))(?!.*//)(?!.*\\\\)(?!.*\\s).+$"
+    },
+    "correlation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["runId", "phaseId", "task", "scopeId", "candidateSha", "callbackSequence"],
+      "properties": {
+        "runId": { "$ref": "#/$defs/identifier" },
+        "phaseId": { "$ref": "#/$defs/identifier" },
+        "task": { "$ref": "#/$defs/identifier" },
+        "scopeId": { "$ref": "#/$defs/identifier" },
+        "candidateSha": { "$ref": "#/$defs/sha" },
+        "callbackSequence": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "job": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["runId", "phaseId", "scopeId", "candidateSha"],
+      "properties": {
+        "runId": { "$ref": "#/$defs/identifier" },
+        "phaseId": { "$ref": "#/$defs/identifier" },
+        "scopeId": { "$ref": "#/$defs/identifier" },
+        "candidateSha": { "$ref": "#/$defs/sha" }
+      }
+    },
+    "workspace": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repository", "worktree", "path", "repositoryRoot", "baseSha", "headSha"],
+      "properties": {
+        "repository": { "$ref": "#/$defs/identifier" },
+        "worktree": { "$ref": "#/$defs/identifier" },
+        "path": { "$ref": "#/$defs/relativePath" },
+        "repositoryRoot": {
+          "anyOf": [
+            { "const": "." },
+            { "$ref": "#/$defs/relativePath" }
+          ]
+        },
+        "baseSha": { "$ref": "#/$defs/sha" },
+        "headSha": { "$ref": "#/$defs/sha" }
+      }
+    },
+    "violation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "field", "message"],
+      "properties": {
+        "code": {
+          "enum": ["trusted_job_context", "trusted_job_schema", "trusted_job_scope", "trusted_job_path", "trusted_job_credential", "trusted_job_provider_model", "trusted_job_identity", "trusted_job_digest", "trusted_job_candidate", "trusted_job_evidence", "trusted_job_sequence", "trusted_job_submission", "trusted_job_replay", "trusted_job_config", "trusted_job_virtual_credential", "trusted_job_callback_destination", "trusted_job_idempotency", "trusted_job_workspace", "trusted_job_status"]
+        },
+        "field": { "type": "string", "minLength": 1 },
+        "message": { "type": "string", "minLength": 1 }
+      }
+    }
+  }
+}

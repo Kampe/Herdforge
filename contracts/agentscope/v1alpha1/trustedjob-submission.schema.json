@@ -1,0 +1,160 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "trustedjob-submission.schema.json",
+  "title": "Herdforge Trusted Job Submission v1alpha1",
+  "description": "Contract-only outbound trusted-job admission. Admission does not assert or trigger execution.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["apiVersion", "kind", "correlation", "job", "workspace", "repository", "trustedConfig", "scope", "scopeDigest", "provider", "model", "virtualCredentials", "callbackDestination", "evidence", "idempotencyKey"],
+  "properties": {
+    "apiVersion": { "const": "herdforge.dev/v1alpha1" },
+    "kind": { "const": "TrustedJobSubmission" },
+    "correlation": { "$ref": "#/$defs/correlation" },
+    "job": { "$ref": "#/$defs/job" },
+    "workspace": { "$ref": "#/$defs/workspace" },
+    "repository": { "$ref": "#/$defs/repository" },
+    "trustedConfig": { "$ref": "#/$defs/trustedConfig" },
+    "scope": { "$ref": "agentscope.schema.json" },
+    "scopeDigest": { "$ref": "#/$defs/digest" },
+    "provider": { "$ref": "#/$defs/identifier" },
+    "model": { "$ref": "#/$defs/identifier" },
+    "virtualCredentials": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/virtualCredential" }
+    },
+    "callbackDestination": { "$ref": "#/$defs/identifier" },
+    "evidence": { "$ref": "#/$defs/evidencePolicy" },
+    "idempotencyKey": { "$ref": "#/$defs/identifier" }
+  },
+  "$defs": {
+    "identifier": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$"
+    },
+    "sha": {
+      "type": "string",
+      "pattern": "^([0-9a-f]{40}|[0-9a-f]{64})$"
+    },
+    "digest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "relativePath": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^(?!/)(?!\\.\\.?$)(?!.*(?:^|/)\\.\\.?(?:/|$))(?!.*//)(?!.*\\\\)(?!.*\\s).+$"
+    },
+    "scopedPath": {
+      "allOf": [
+        { "$ref": "#/$defs/relativePath" },
+        { "pattern": "^(?!\\.git(?:/|$)).+$" }
+      ]
+    },
+    "correlation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["runId", "phaseId", "task", "scopeId", "candidateSha", "callbackSequence"],
+      "properties": {
+        "runId": { "$ref": "#/$defs/identifier" },
+        "phaseId": { "$ref": "#/$defs/identifier" },
+        "task": { "$ref": "#/$defs/identifier" },
+        "scopeId": { "$ref": "#/$defs/identifier" },
+        "candidateSha": { "$ref": "#/$defs/sha" },
+        "callbackSequence": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "job": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["runId", "phaseId", "scopeId", "candidateSha"],
+      "properties": {
+        "runId": { "$ref": "#/$defs/identifier" },
+        "phaseId": { "$ref": "#/$defs/identifier" },
+        "scopeId": { "$ref": "#/$defs/identifier" },
+        "candidateSha": { "$ref": "#/$defs/sha" }
+      }
+    },
+    "workspace": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repository", "worktree", "path", "repositoryRoot", "baseSha", "headSha"],
+      "properties": {
+        "repository": { "$ref": "#/$defs/identifier" },
+        "worktree": { "$ref": "#/$defs/identifier" },
+        "path": { "$ref": "#/$defs/relativePath" },
+        "repositoryRoot": {
+          "anyOf": [
+            { "const": "." },
+            { "$ref": "#/$defs/relativePath" }
+          ]
+        },
+        "baseSha": { "$ref": "#/$defs/sha" },
+        "headSha": { "$ref": "#/$defs/sha" }
+      }
+    },
+    "repository": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["identity", "baseSha", "headSha"],
+      "properties": {
+        "identity": { "$ref": "#/$defs/identifier" },
+        "baseSha": { "$ref": "#/$defs/sha" },
+        "headSha": { "$ref": "#/$defs/sha" }
+      }
+    },
+    "trustedConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repository", "commitSha", "path", "contentDigest"],
+      "properties": {
+        "repository": { "$ref": "#/$defs/identifier" },
+        "commitSha": { "$ref": "#/$defs/sha" },
+        "path": { "$ref": "#/$defs/scopedPath" },
+        "contentDigest": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "virtualCredential": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["ref", "scopes"],
+      "properties": {
+        "ref": {
+          "allOf": [
+            { "$ref": "#/$defs/identifier" },
+            { "pattern": "^(?!.*[mM][aA][sS][tT][eE][rR])(?![sS][kK]-)(?![gG][hH][pP]_)(?![gG][iI][tT][hH][uU][bB]_[pP][aA][tT]_)(?![xX][oO][xX][bB]-).+$" }
+          ]
+        },
+        "scopes": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "allOf": [
+              { "$ref": "#/$defs/identifier" },
+              { "pattern": "^(?!.*[mM][aA][sS][tT][eE][rR]).+$" }
+            ]
+          }
+        }
+      }
+    },
+    "evidencePolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kinds", "prefix", "maxBytes"],
+      "properties": {
+        "kinds": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "enum": ["test", "lint", "diff", "log", "receipt"] }
+        },
+        "prefix": { "$ref": "#/$defs/relativePath" },
+        "maxBytes": { "type": "integer", "minimum": 1 }
+      }
+    }
+  }
+}

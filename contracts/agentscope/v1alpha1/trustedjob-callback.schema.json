@@ -1,0 +1,74 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "trustedjob-callback.schema.json",
+  "title": "Herdforge Trusted Job Callback v1alpha1",
+  "description": "Contract-only trusted-job callback. Admission does not assert or trigger execution.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["apiVersion", "kind", "correlation", "scope", "scopeDigest", "submissionDigest", "callbackDestination", "idempotencyKey", "job", "evidence"],
+  "properties": {
+    "apiVersion": { "const": "herdforge.dev/v1alpha1" },
+    "kind": { "const": "TrustedJobCallback" },
+    "correlation": { "$ref": "#/$defs/correlation" },
+    "scope": { "$ref": "agentscope.schema.json" },
+    "scopeDigest": { "$ref": "#/$defs/digest" },
+    "submissionDigest": { "$ref": "#/$defs/digest" },
+    "callbackDestination": { "$ref": "#/$defs/identifier" },
+    "idempotencyKey": { "$ref": "#/$defs/identifier" },
+    "job": { "$ref": "#/$defs/job" },
+    "evidence": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/evidence" }
+    }
+  },
+  "$defs": {
+    "identifier": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$"
+    },
+    "sha": {
+      "type": "string",
+      "pattern": "^([0-9a-f]{40}|[0-9a-f]{64})$"
+    },
+    "digest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "correlation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["runId", "phaseId", "task", "scopeId", "candidateSha", "callbackSequence"],
+      "properties": {
+        "runId": { "$ref": "#/$defs/identifier" },
+        "phaseId": { "$ref": "#/$defs/identifier" },
+        "task": { "$ref": "#/$defs/identifier" },
+        "scopeId": { "$ref": "#/$defs/identifier" },
+        "candidateSha": { "$ref": "#/$defs/sha" },
+        "callbackSequence": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "job": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["candidateSha", "provider", "effectiveModel"],
+      "properties": {
+        "candidateSha": { "$ref": "#/$defs/sha" },
+        "provider": { "$ref": "#/$defs/identifier" },
+        "effectiveModel": { "$ref": "#/$defs/identifier" }
+      }
+    },
+    "evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "digest"],
+      "properties": {
+        "kind": { "enum": ["test", "lint", "diff", "log", "receipt"] },
+        "digest": { "$ref": "#/$defs/digest" }
+      }
+    }
+  }
+}

@@ -1,0 +1,80 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "contracts/agentscope/v1alpha1/trustedjob-callback-receipt.schema.json",
+  "title": "Herdforge Trusted Job Callback Receipt v1alpha1",
+  "description": "Contract-only callback admission receipt. Accepted does not attest job execution.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["apiVersion", "kind", "correlation", "scopeDigest", "submissionDigest", "callbackDestination", "idempotencyKey", "provider", "effectiveModel", "evidence", "accepted", "blocking", "violations"],
+  "properties": {
+    "apiVersion": { "const": "herdforge.dev/v1alpha1" },
+    "kind": { "const": "TrustedJobCallbackReceipt" },
+    "correlation": { "$ref": "#/$defs/correlation" },
+    "scopeDigest": { "$ref": "#/$defs/digest" },
+    "submissionDigest": { "$ref": "#/$defs/digest" },
+    "callbackDestination": { "$ref": "#/$defs/identifier" },
+    "idempotencyKey": { "$ref": "#/$defs/identifier" },
+    "provider": { "$ref": "#/$defs/identifier" },
+    "effectiveModel": { "$ref": "#/$defs/identifier" },
+    "evidence": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/evidence" }
+    },
+    "accepted": { "type": "boolean" },
+    "blocking": { "type": "boolean" },
+    "violations": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/violation" }
+    }
+  },
+  "$defs": {
+    "identifier": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$"
+    },
+    "sha": {
+      "type": "string",
+      "pattern": "^([0-9a-f]{40}|[0-9a-f]{64})$"
+    },
+    "digest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "correlation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["runId", "phaseId", "task", "scopeId", "candidateSha", "callbackSequence"],
+      "properties": {
+        "runId": { "$ref": "#/$defs/identifier" },
+        "phaseId": { "$ref": "#/$defs/identifier" },
+        "task": { "$ref": "#/$defs/identifier" },
+        "scopeId": { "$ref": "#/$defs/identifier" },
+        "candidateSha": { "$ref": "#/$defs/sha" },
+        "callbackSequence": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "digest"],
+      "properties": {
+        "kind": { "enum": ["test", "lint", "diff", "log", "receipt"] },
+        "digest": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "violation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "field", "message"],
+      "properties": {
+        "code": {
+          "enum": ["trusted_job_context", "trusted_job_schema", "trusted_job_scope", "trusted_job_path", "trusted_job_credential", "trusted_job_provider_model", "trusted_job_identity", "trusted_job_digest", "trusted_job_candidate", "trusted_job_evidence", "trusted_job_sequence", "trusted_job_submission", "trusted_job_replay"]
+        },
+        "field": { "type": "string", "minLength": 1 },
+        "message": { "type": "string", "minLength": 1 }
+      }
+    }
+  }
+}
