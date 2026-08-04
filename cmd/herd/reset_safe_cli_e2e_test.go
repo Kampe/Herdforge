@@ -76,6 +76,11 @@ func resetSafeRef(t *testing.T, dir, branch string) string {
 	return strings.TrimSpace(runGitT(t, dir, "rev-parse", "refs/heads/"+branch))
 }
 
+func resetSafeRevision(t *testing.T, dir, ref string) string {
+	t.Helper()
+	return strings.TrimSpace(runGitT(t, dir, "rev-parse", ref))
+}
+
 func resetSafeCanonical(t *testing.T, path string) string {
 	t.Helper()
 	canonical, err := filepath.EvalSymlinks(path)
@@ -147,10 +152,9 @@ func TestResetSafeCompiledPacketOnlySuccessIsDisposable(t *testing.T) {
 		t.Fatal(err)
 	}
 	beforeShape := resetSafeShape(t, f.root)
-	canonicalWorktree := resetSafeCanonical(t, f.worktree)
 	output, exit := resetSafeCommand(t, binary, f.root, "reset-safe", f.worktree)
-	want := "herd-reset-safe: " + canonicalWorktree + " (feature/cli) has no unmerged work, safe to reset\n" +
-		"herd-reset-safe: " + canonicalWorktree + " reset to origin/main (" + strings.TrimSpace(runGitT(t, f.root, "rev-parse", "--short", "origin/main")) + ")\n"
+	want := "herd-reset-safe: " + f.worktree + " (feature/cli) has no unmerged work, safe to reset\n" +
+		"herd-reset-safe: " + f.worktree + " reset to origin/main (" + strings.TrimSpace(runGitT(t, f.root, "rev-parse", "--short", "origin/main")) + ")\n"
 	if exit != 0 || output != want {
 		t.Fatalf("packet-only result = exit %d, bytes %q, want %q", exit, output, want)
 	}
@@ -175,13 +179,12 @@ func TestResetSafeCompiledPushFailurePreservesLocalRefAndSibling(t *testing.T) {
 	siblingHead := resetSafeRef(t, f.sibling, "sibling")
 	badRemote := filepath.Join(t.TempDir(), "missing-origin.git")
 	runGitT(t, f.root, "config", "remote.origin.pushurl", badRemote)
-	canonicalWorktree := resetSafeCanonical(t, f.worktree)
 
 	output, exit := resetSafeCommand(t, binary, f.root, "reset-safe", f.worktree)
-	want := "herd-reset-safe: " + canonicalWorktree + " has 1 unmerged commit(s), preserving to " + preserve + " before reset:\n" +
+	want := "herd-reset-safe: " + f.worktree + " has 1 unmerged commit(s), preserving to " + preserve + " before reset:\n" +
 		"  " + uniqueSHA + "\n" +
-		"herd-reset-safe: WARN could not push " + preserve + " — it still exists locally at " + canonicalWorktree + " as a branch ref; do not delete this worktree until it's recovered\n" +
-		"herd-reset-safe: " + canonicalWorktree + " reset to origin/main (" + strings.TrimSpace(runGitT(t, f.root, "rev-parse", "--short", "origin/main")) + ")\n"
+		"herd-reset-safe: WARN could not push " + preserve + " — it still exists locally at " + f.worktree + " as a branch ref; do not delete this worktree until it's recovered\n" +
+		"herd-reset-safe: " + f.worktree + " reset to origin/main (" + strings.TrimSpace(runGitT(t, f.root, "rev-parse", "--short", "origin/main")) + ")\n"
 	if exit != 0 || output != want {
 		t.Fatalf("push-failure result = exit %d, bytes %q, want %q", exit, output, want)
 	}
@@ -205,13 +208,12 @@ func TestResetSafeCompiledSuccessPushesAndDoesNotAddWorktrees(t *testing.T) {
 	preserve := "harvest/feature-cli-" + shortSHA
 	siblingHead := resetSafeRef(t, f.sibling, "sibling")
 	beforeShape := resetSafeShape(t, f.root)
-	canonicalWorktree := resetSafeCanonical(t, f.worktree)
 
 	output, exit := resetSafeCommand(t, binary, f.root, "reset-safe", f.worktree)
-	want := "herd-reset-safe: " + canonicalWorktree + " has 1 unmerged commit(s), preserving to " + preserve + " before reset:\n" +
+	want := "herd-reset-safe: " + f.worktree + " has 1 unmerged commit(s), preserving to " + preserve + " before reset:\n" +
 		"  " + uniqueSHA + "\n" +
 		"herd-reset-safe: pushed " + preserve + ". Recover with: git cherry-pick <sha>  OR  git merge " + preserve + "\n" +
-		"herd-reset-safe: " + canonicalWorktree + " reset to origin/main (" + strings.TrimSpace(runGitT(t, f.root, "rev-parse", "--short", "origin/main")) + ")\n"
+		"herd-reset-safe: " + f.worktree + " reset to origin/main (" + strings.TrimSpace(runGitT(t, f.root, "rev-parse", "--short", "origin/main")) + ")\n"
 	if exit != 0 || output != want {
 		t.Fatalf("success result = exit %d, bytes %q, want %q", exit, output, want)
 	}
@@ -232,5 +234,91 @@ func TestResetSafeCompiledSuccessPushesAndDoesNotAddWorktrees(t *testing.T) {
 	}
 	if got := strings.TrimSpace(runGitT(t, f.sibling, "status", "--porcelain")); got != "" {
 		t.Fatalf("successful command dirtied sibling: %q", got)
+	}
+}
+
+func TestResetSafeCompiledSymlinkInputUsesCanonicalAuthorityButExactOutput(t *testing.T) {
+	binary := buildHerd(t)
+	f := newResetSafeRepo(t)
+	link := filepath.Join(t.TempDir(), "worktree-link")
+	if err := os.Symlink(f.worktree, link); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(f.worktree, "TASK-PACKET.md"), []byte("packet\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if resetSafeCanonical(t, link) == link {
+		t.Fatal("fixture did not create a distinct canonical path")
+	}
+	beforeShape := resetSafeShape(t, f.root)
+	newShort := strings.TrimSpace(runGitT(t, f.root, "rev-parse", "--short", "origin/main"))
+	output, exit := resetSafeCommand(t, binary, f.root, "reset-safe", link)
+	want := "herd-reset-safe: " + link + " (feature/cli) has no unmerged work, safe to reset\n" +
+		"herd-reset-safe: " + link + " reset to origin/main (" + newShort + ")\n"
+	if exit != 0 || output != want {
+		t.Fatalf("symlink result = exit %d, bytes %q, want %q", exit, output, want)
+	}
+	if got := resetSafeShape(t, f.root); got != beforeShape {
+		t.Fatalf("symlink command changed worktree shape: before %q after %q", beforeShape, got)
+	}
+	if got := resetSafeRef(t, f.worktree, "feature/cli"); got != resetSafeRef(t, f.root, "main") {
+		t.Fatalf("symlink target did not reset through canonical worktree: %s", got)
+	}
+}
+
+func TestResetSafeCompiledFetchesFreshOriginMainBeforePlanning(t *testing.T) {
+	binary := buildHerd(t)
+	f := newResetSafeRepo(t)
+	oldOrigin := resetSafeRevision(t, f.worktree, "origin/main")
+	updater := filepath.Join(t.TempDir(), "updater")
+	runGitT(t, filepath.Dir(updater), "clone", "-q", f.remote, updater)
+	runGitT(t, updater, "config", "user.email", "reset-safe-updater@test.invalid")
+	runGitT(t, updater, "config", "user.name", "Reset Safe Updater")
+	if err := os.WriteFile(filepath.Join(updater, "remote.txt"), []byte("new remote main\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGitT(t, updater, "add", "remote.txt")
+	runGitT(t, updater, "commit", "-q", "-m", "advance remote main")
+	newOrigin := strings.TrimSpace(runGitT(t, updater, "rev-parse", "HEAD"))
+	runGitT(t, updater, "push", "-q", "origin", "main")
+	if got := resetSafeRevision(t, f.worktree, "origin/main"); got != oldOrigin {
+		t.Fatalf("fixture origin/main was not stale before command: %s", got)
+	}
+	if err := os.WriteFile(filepath.Join(f.worktree, "TASK-PACKET.md"), []byte("packet\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	newShort := strings.TrimSpace(runGitT(t, updater, "rev-parse", "--short", "HEAD"))
+	output, exit := resetSafeCommand(t, binary, f.root, "reset-safe", f.worktree)
+	want := "herd-reset-safe: " + f.worktree + " (feature/cli) has no unmerged work, safe to reset\n" +
+		"herd-reset-safe: " + f.worktree + " reset to origin/main (" + newShort + ")\n"
+	if exit != 0 || output != want {
+		t.Fatalf("fresh-origin result = exit %d, bytes %q, want %q", exit, output, want)
+	}
+	if got := resetSafeRevision(t, f.worktree, "origin/main"); got != newOrigin {
+		t.Fatalf("target origin/main was not refreshed: %s, want %s", got, newOrigin)
+	}
+	if got := resetSafeRef(t, f.worktree, "feature/cli"); got != newOrigin {
+		t.Fatalf("target did not reset to freshly fetched origin/main: %s", got)
+	}
+}
+
+func TestResetSafeCompiledFetchFailureUsesExistingLocalOriginMain(t *testing.T) {
+	binary := buildHerd(t)
+	f := newResetSafeRepo(t)
+	localOrigin := resetSafeRevision(t, f.worktree, "origin/main")
+	badRemote := filepath.Join(t.TempDir(), "no-network-origin")
+	runGitT(t, f.root, "remote", "set-url", "origin", badRemote)
+	if err := os.WriteFile(filepath.Join(f.worktree, "TASK-PACKET.md"), []byte("packet\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	localShort := strings.TrimSpace(runGitT(t, f.worktree, "rev-parse", "--short", "origin/main"))
+	output, exit := resetSafeCommand(t, binary, f.root, "reset-safe", f.worktree)
+	want := "herd-reset-safe: " + f.worktree + " (feature/cli) has no unmerged work, safe to reset\n" +
+		"herd-reset-safe: " + f.worktree + " reset to origin/main (" + localShort + ")\n"
+	if exit != 0 || output != want {
+		t.Fatalf("fetch-failure result = exit %d, bytes %q, want %q", exit, output, want)
+	}
+	if got := resetSafeRevision(t, f.worktree, "origin/main"); got != localOrigin {
+		t.Fatalf("fetch failure changed local origin/main: %s", got)
 	}
 }
