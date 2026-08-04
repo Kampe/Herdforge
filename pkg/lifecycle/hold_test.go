@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -235,24 +236,88 @@ func TestLifecycleRejectsInvalidActionTupleBeforeAuthorityOrSideEffect(t *testin
 	}
 }
 
+func TestLifecycleMissingOrUnknownLaneResolverFailsBeforeAuthority(t *testing.T) {
+	for _, resolver := range []func(string) (string, error){nil, func(string) (string, error) {
+		return "", fmt.Errorf("unknown configured role")
+	}} {
+		r := &countingHoldReader{}
+		e := &Engine{HoldReader: r, HoldLaneResolver: resolver}
+		if !e.holdBlocks(context.Background(), "worker", "worker", "FAC-69") {
+			t.Fatal("unresolved lane was not occupied fail-closed")
+		}
+		if r.calls != 0 {
+			t.Fatalf("unresolved lane reached authority %d times", r.calls)
+		}
+	}
+}
+
 func TestLifecycleHeldCandidateIsOccupiedBeforeDispatchable(t *testing.T) {
-	e := &Engine{HoldReader: heldSummaryReader{}}
+	calls := 0
+	identities := []HoldIdentity{}
+	e := &Engine{HoldReader: countingHeldSummaryReader{calls: &calls, identities: &identities}, HoldLaneResolver: func(role string) (string, error) {
+		if role == "owner" {
+			return "lane", nil
+		}
+		return "", fmt.Errorf("unknown role")
+	}}
 	if !e.holdBlocks(context.Background(), "lane", "owner", "FAC-69") {
 		t.Fatal("held candidate was not occupied before selection")
+	}
+	if calls == 0 {
+		t.Fatal("held candidate did not consult authority")
+	}
+	if len(identities) != 2 {
+		t.Fatalf("authority identities=%+v, want lane then task", identities)
+	}
+	laneIdentity, taskIdentity := identities[0], identities[1]
+	if laneIdentity.Repository == "" || laneIdentity.Owner != "owner" || laneIdentity.Lane != "lane" || laneIdentity.Task != "" || laneIdentity.Scope != "lane" {
+		t.Fatalf("malformed lane authority identity=%+v", laneIdentity)
+	}
+	if taskIdentity.Repository == "" || taskIdentity.Owner != "owner" || taskIdentity.Lane != "lane" || taskIdentity.Task != "FAC-69" || taskIdentity.Scope != "task" {
+		t.Fatalf("malformed task authority identity=%+v", taskIdentity)
 	}
 }
 
 type heldSummaryReader struct{}
 
+type countingHeldSummaryReader struct {
+	calls      *int
+	identities *[]HoldIdentity
+}
+
+func (r countingHeldSummaryReader) Check(_ context.Context, identity HoldIdentity, _ int64) (HoldDecision, error) {
+	(*r.calls)++
+	*r.identities = append(*r.identities, identity)
+	if identity.Scope == "task" {
+		return HoldDecision{Held: true, Reason: "maintenance", Code: "operator_hold"}, nil
+	}
+	if identity.Scope == "lane" {
+		return HoldDecision{Held: false}, nil
+	}
+	return HoldDecision{}, nil
+}
+
+func (r countingHeldSummaryReader) CurrentGeneration(context.Context, HoldIdentity) (int64, error) {
+	return 1, nil
+}
+
 func (heldSummaryReader) Check(context.Context, HoldIdentity, int64) (HoldDecision, error) {
 	return HoldDecision{Held: true, Reason: "maintenance", Code: "operator_hold"}, nil
 }
 
-type kaneoShapeReader struct{ identities []HoldIdentity }
+type kaneoShapeReader struct {
+	identities  []HoldIdentity
+	generations []int64
+}
 
-func (r *kaneoShapeReader) Check(_ context.Context, id HoldIdentity, _ int64) (HoldDecision, error) {
+func (r *kaneoShapeReader) CurrentGeneration(context.Context, HoldIdentity) (int64, error) {
+	return 1, nil
+}
+
+func (r *kaneoShapeReader) Check(_ context.Context, id HoldIdentity, generation int64) (HoldDecision, error) {
 	r.identities = append(r.identities, id)
-	if id.Lane == "forge-smith" {
+	r.generations = append(r.generations, generation)
+	if id.Owner == "forge-smith" {
 		return HoldDecision{Held: true}, nil
 	}
 	return HoldDecision{}, nil
@@ -260,7 +325,23 @@ func (r *kaneoShapeReader) Check(_ context.Context, id HoldIdentity, _ int64) (H
 
 func TestKaneoShapeRolesFenceOnlyMatchingLaneAndTask(t *testing.T) {
 	r := &kaneoShapeReader{}
-	e := &Engine{HoldReader: r, HoldRoles: []string{"forge-smith", "worker"}}
+	registry, err := NewCanonicalLaneRegistry([]CanonicalLane{{Name: "smith", Role: "worker"}, {Name: "scout", Role: "forge-smith"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	e := &Engine{HoldReader: r, HoldRoles: []string{"forge-smith", "worker"}, HoldLaneResolver: func(role string) (string, error) {
+		lane, resolveErr := registry.ResolveRole(role)
+		if resolveErr != nil {
+			return "", resolveErr
+		}
+		return lane.Name, nil
+	}, HoldIdentity: func(task, _, owner string) HoldIdentity {
+		lane, resolveErr := registry.ResolveRole(owner)
+		if resolveErr != nil {
+			return HoldIdentity{}
+		}
+		return HoldIdentity{Repository: "repo", Owner: lane.Role, Lane: lane.Name, Task: task, Scope: map[bool]string{true: "task", false: "lane"}[task != ""]}
+	}}
 	agents := struct {
 		Result struct {
 			Agents []json.RawMessage `json:"agents"`
@@ -274,6 +355,14 @@ func TestKaneoShapeRolesFenceOnlyMatchingLaneAndTask(t *testing.T) {
 	for _, id := range r.identities {
 		if id.Owner == "" || id.Lane == "" || (id.Scope == "task" && id.Task == "") {
 			t.Fatalf("malformed authority target=%+v", id)
+		}
+	}
+	if len(r.generations) == 0 {
+		t.Fatal("authority Check was never called")
+	}
+	for _, generation := range r.generations {
+		if generation != 1 {
+			t.Fatalf("authority received generation %d, want 1", generation)
 		}
 	}
 }

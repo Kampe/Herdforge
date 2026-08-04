@@ -24,6 +24,12 @@ func withTestLease(t *testing.T, d *Dispatcher) *Dispatcher {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = own.Close() })
+	own.LaneResolver = func(role string) (string, error) {
+		if role == "launch" || role == "worker" {
+			return "smith", nil
+		}
+		return "", fmt.Errorf("unknown configured test role %q", role)
+	}
 	d.Ownership = own
 	return d
 }

@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/Kampe/Herdforge/pkg/lifecycle"
 	"os"
 	"path/filepath"
 	"strings"
@@ -507,6 +506,6 @@ func fac178Policy(t *testing.T, wm *WorktreeManager, target string) ReapPolicy {
 			BoardEvidence:  board, LeaseGeneration: generation, PolicyDigest: digest, Actor: actor,
 		},
 		ActionPolicy: "remove",
-		HoldReader:   unheldHoldReader{}, IdentitySetFor: func(w *WorktreeInfo) []lifecycle.HoldIdentity { return []lifecycle.HoldIdentity{reapHoldIdentity(w)} },
+		HoldReader:   unheldHoldReader{}, IdentitySetFor: reapHoldIdentities,
 	}
 }

@@ -1091,6 +1091,12 @@ func TestDispatch_CompensateFailure_RetainsGenerationLease(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = ownA.Close() })
+	ownA.LaneResolver = func(role string) (string, error) {
+		if role == "launch" || role == "worker" {
+			return "smith", nil
+		}
+		return "", fmt.Errorf("unknown configured test role %q", role)
+	}
 
 	tp := &statusTrackingProvider{
 		mockTaskProvider: mockTaskProvider{tasks: []*provider.Task{baseTask("FAC-RET")}},
@@ -1125,6 +1131,7 @@ func TestDispatch_CompensateFailure_RetainsGenerationLease(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = ownB.Close() })
+	ownB.LaneResolver = ownA.LaneResolver
 	_, berr := ownB.ClaimExclusive(context.Background(), "id", "FAC-RET", "launch", "rev-x", "", "")
 	if berr == nil {
 		t.Fatal("B must not acquire while A retained lease after compensate failure")

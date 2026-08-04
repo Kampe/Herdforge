@@ -177,7 +177,10 @@ type Engine struct {
 	ReadbackHook string // executable for authoritative readback
 	HoldReader   HoldReader
 	HoldIdentity func(task, lane, owner string) HoldIdentity
-	HoldRoles    []string
+	// HoldLaneResolver maps a configured role label to its canonical lane.
+	// Production composition must provide it when HoldReader is configured.
+	HoldLaneResolver func(role string) (string, error)
+	HoldRoles        []string
 
 	// Test seams.
 	TestClaimAttempts          int
@@ -1667,7 +1670,7 @@ func (e *Engine) holdBlocks(ctx context.Context, lane, owner, task string) bool 
 	if e.HoldReader == nil {
 		return false
 	}
-	held, err := e.targetHeld(ctx, lane, task)
+	held, err := e.targetHeld(ctx, owner, task)
 	return err != nil || held
 }
 
@@ -1675,12 +1678,26 @@ func (e *Engine) targetHeld(ctx context.Context, role, task string) (bool, error
 	if strings.TrimSpace(role) == "" || strings.TrimSpace(task) == "" {
 		return true, nil
 	}
+	if e.HoldReader != nil && e.HoldLaneResolver == nil {
+		return true, fmt.Errorf("lifecycle: canonical lane resolver is required")
+	}
+	lane := role
+	if e.HoldLaneResolver != nil {
+		var err error
+		lane, err = e.HoldLaneResolver(role)
+		if err != nil || strings.TrimSpace(lane) == "" {
+			if err == nil {
+				err = fmt.Errorf("unknown configured role %q", role)
+			}
+			return true, err
+		}
+	}
 	identities := []HoldIdentity{
-		{Repository: repoRoot(), Owner: role, Lane: role, Scope: "lane"},
-		{Repository: repoRoot(), Owner: role, Lane: role, Task: task, Scope: "task"},
+		{Repository: repoRoot(), Owner: role, Lane: lane, Scope: "lane"},
+		{Repository: repoRoot(), Owner: role, Lane: lane, Task: task, Scope: "task"},
 	}
 	if e.HoldIdentity != nil {
-		identities = []HoldIdentity{e.HoldIdentity("", role, role), e.HoldIdentity(task, role, role)}
+		identities = []HoldIdentity{e.HoldIdentity("", lane, role), e.HoldIdentity(task, lane, role)}
 	}
 	for _, identity := range identities {
 		held, err := e.isHeld(identity)
