@@ -519,6 +519,73 @@ func TestMarkedResidualsReapExactHolderAfterTransientAndTerminalScans(t *testing
 	}
 }
 
+func TestMarkedResidualsRetriesTransientExactReapFailure(t *testing.T) {
+	leader := procToken{pid: 4241, startSec: 11, startUsec: 1}
+	holder := procToken{pid: 4242, startSec: 22, startUsec: 2}
+	self := os.Getpid()
+	transient := errors.New("transient exact reap failure")
+	previousDrain := markerLineageDrainedFn
+	previousScan := markerLineageScanFn
+	previousNote := markerTokenNoteFn
+	previousLive := markerTokenLiveFn
+	previousLeaderLive := markerLeaderLiveFn
+	previousReap := markerResidualReapFn
+	previousExclude := residualExcludePIDsFn
+	t.Cleanup(func() {
+		markerLineageDrainedFn = previousDrain
+		markerLineageScanFn = previousScan
+		markerTokenNoteFn = previousNote
+		markerTokenLiveFn = previousLive
+		markerLeaderLiveFn = previousLeaderLive
+		markerResidualReapFn = previousReap
+		residualExcludePIDsFn = previousExclude
+	})
+
+	owned := &ownedSubprocess{
+		leader:     leader.pid,
+		markerPath: "fixture-marker",
+		handles:    map[int]ownedHandle{leader.pid: {tok: leader}},
+	}
+	markerLineageDrainedFn = func(string) (bool, error) { return false, nil }
+	scanCalls := 0
+	markerLineageScanFn = func(string, time.Time) ([]procToken, error) {
+		if scanCalls == 0 {
+			scanCalls++
+			return []procToken{leader, {pid: self, startSec: 33, startUsec: 3}, holder}, nil
+		}
+		return nil, errors.New("unexpected extra marker scan")
+	}
+	residualExcludePIDsFn = func() map[int]struct{} { return map[int]struct{}{self: {}} }
+	markerTokenLiveFn = func(procToken) bool { return true }
+	markerLeaderLiveFn = func(ownedHandle) bool { return true }
+	noted := make([]procToken, 0)
+	markerTokenNoteFn = func(_ *ownedSubprocess, tok procToken) error {
+		noted = append(noted, tok)
+		return nil
+	}
+	var attempts [][]procToken
+	markerResidualReapFn = func(_ *ownedSubprocess) error {
+		attempts = append(attempts, append([]procToken(nil), noted...))
+		if len(attempts) == 1 {
+			return transient
+		}
+		return nil
+	}
+
+	err := owned.adoptAndKillMarkedResiduals()
+	if err == nil || !errors.Is(err, transient) {
+		t.Fatalf("retry failure must preserve transient cause: %v", err)
+	}
+	if len(attempts) != 2 {
+		t.Fatalf("exact reap attempts=%d, want 2: %+v", len(attempts), attempts)
+	}
+	for i, attempt := range attempts {
+		if len(attempt) != 1 || !attempt[0].equal(holder) {
+			t.Fatalf("attempt %d authority=%+v, want only holder %+v", i+1, attempt, holder)
+		}
+	}
+}
+
 // grandchildGroupScript: leader backgrounds a real nested sh (not a shell
 // function — $$ in functions is the parent shell on bash/zsh) that writes its
 // own pid then parks. Production ReapOwnedCmd must kill leader + grandchild.

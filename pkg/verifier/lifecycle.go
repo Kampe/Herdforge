@@ -517,7 +517,8 @@ func (o *ownedSubprocess) adoptAndKillMarkedResiduals() error {
 			}
 		}
 		if err := markerResidualReapFn(o); err != nil {
-			return fmt.Errorf("drain residuals kill marker lineage: %w", err)
+			return o.finishMarkerResidualError(fmt.Errorf(
+				"drain residuals kill marker lineage: %w", err))
 		}
 		// No sleep/stability window: immediately repeat discovery until the
 		// kernel lock proves the last inherited FD is gone or the bound expires.
