@@ -77,6 +77,8 @@ type ReclaimGate struct {
 // AgentSnapshot describes one herdr agent's state.
 type AgentSnapshot struct {
 	Name        string `json:"name"`
+	Lane        string `json:"lane,omitempty"`
+	Role        string `json:"role,omitempty"`
 	Status      string `json:"status"`
 	Standing    bool   `json:"standing"`
 	Interactive bool   `json:"interactive"`
@@ -110,6 +112,7 @@ type Summary struct {
 	Goaled                []string         `json:"goaled"`
 	GoalViolations        []string         `json:"goal_violations"`
 	Red                   []string         `json:"red"`
+	Critical              []string         `json:"critical,omitempty"`
 	Actions               []ActionLogEntry `json:"actions"`
 	Healthy               bool             `json:"healthy"`
 	StaleActionsExecuted  int              `json:"stale_actions_executed"`
@@ -168,7 +171,11 @@ type Engine struct {
 	BoardFile  string // if set, read board from file instead of kaneo
 	EventFile  string // if set, read event payload from file
 
-	Lanes []string // lane IDs to observe; defaults to standing IDs
+	Lanes []string // explicit lane snapshot to observe; production injects it from herd.yaml
+	// StandingRoster is the validated immutable config snapshot used to
+	// classify live standing IDs. Lifecycle never falls back to a hard-coded
+	// legacy roster.
+	StandingRoster *CanonicalLaneRegistry
 
 	// Hooks for act mode.
 	ReclaimHook  string // executable for reclaim actions
@@ -193,16 +200,6 @@ type Engine struct {
 	TestCrashAfterHookAck      string
 	TestReleaseValidateBarrier string
 	TestReclaimValidateBarrier string
-}
-
-// defaultLanes returns the default standing agent IDs.
-func defaultLanes() []string {
-	return []string{
-		"scout-planner", "ux-comber", "docs-custodian", "platform-ops",
-		"security-sentinel", "defi-crusader", "herd-smith", "coverage-integrity",
-		"api-crusader", "chain-indexer", "nft-data-engineer", "qa-sentinel",
-		"perf-cost-guard", "review-harvest-supervisor",
-	}
 }
 
 func (e *Engine) stateRoot() string {
@@ -260,11 +257,14 @@ func (e *Engine) lanes() []string {
 	if len(e.Lanes) > 0 {
 		return e.Lanes
 	}
+	if e.StandingRoster != nil {
+		return e.StandingRoster.LaneNames()
+	}
 	env := os.Getenv("HERD_LIFECYCLE_LANES")
 	if env != "" {
 		return strings.Split(env, ",")
 	}
-	return defaultLanes()
+	return nil
 }
 
 func (e *Engine) claimAttempts() int {
@@ -1041,12 +1041,14 @@ func (e *Engine) computeSummary(agentsWrapper struct {
 		}
 		st = strings.ToLower(st)
 
+		var canonical CanonicalLane
+		var resolveErr error
 		isStanding := false
-		for _, lane := range defaultLanes() {
-			if name == lane {
-				isStanding = true
-				break
-			}
+		if e.StandingRoster == nil {
+			resolveErr = fmt.Errorf("configured standing roster is unavailable")
+		} else {
+			canonical, resolveErr = e.StandingRoster.ResolveLiveAgentID(name)
+			isStanding = resolveErr == nil
 		}
 
 		interactive := false
@@ -1060,11 +1062,16 @@ func (e *Engine) computeSummary(agentsWrapper struct {
 
 		as := AgentSnapshot{
 			Name:        name,
+			Lane:        canonical.Name,
+			Role:        canonical.Role,
 			Status:      st,
 			Interactive: interactive,
 			Standing:    isStanding,
 		}
 		s.Standing = append(s.Standing, as)
+		if resolveErr != nil {
+			s.Critical = append(s.Critical, fmt.Sprintf("unknown_live_agent:%s:%v", name, resolveErr))
+		}
 
 		if (st == "idle" || st == "done" || st == "blocked" || st == "unknown") && isStanding {
 			s.Settled = append(s.Settled, as)
@@ -1455,19 +1462,20 @@ func (e *Engine) executeActMode(stateRoot, leaseRoot string, s *Summary, agentsJ
 			if e.HoldReader != nil && e.HoldLaneResolver == nil {
 				return fmt.Errorf("lifecycle: canonical lane resolver is required")
 			}
-			role, lane := settled.Name, settled.Name
-			if e.HoldReader != nil {
-				if e.HoldLiveAgentResolver == nil {
-					return fmt.Errorf("lifecycle: live-agent canonical resolver is required")
-				}
-				var err error
-				role, lane, err = e.HoldLiveAgentResolver(settled.Name)
-				if err != nil || strings.TrimSpace(role) == "" || strings.TrimSpace(lane) == "" {
-					if err == nil {
-						err = fmt.Errorf("unknown configured live agent %q", settled.Name)
+			role, lane := settled.Role, settled.Lane
+			if role == "" || lane == "" {
+				if e.HoldReader == nil {
+					role, lane = settled.Name, settled.Name
+				} else if e.HoldLiveAgentResolver != nil {
+					var err error
+					role, lane, err = e.HoldLiveAgentResolver(settled.Name)
+					if err != nil {
+						return fmt.Errorf("lifecycle: settled lane %s: %w", settled.Name, err)
 					}
-					return fmt.Errorf("lifecycle: settled lane %s: %w", settled.Name, err)
 				}
+			}
+			if e.HoldReader != nil && (strings.TrimSpace(role) == "" || strings.TrimSpace(lane) == "") {
+				return fmt.Errorf("lifecycle: settled lane %s has no canonical identity", settled.Name)
 			}
 			if err := e.checkLaneHold(lane, role); err != nil {
 				return err
@@ -2095,6 +2103,9 @@ func (e *Engine) computeRedCodes(s *Summary) *Summary {
 		}
 	}
 
+	if len(s.Critical) > 0 {
+		red = append(red, "unknown_or_unconfigured_live_identity")
+	}
 	s.Red = red
 	s.Healthy = len(red) == 0
 	return s

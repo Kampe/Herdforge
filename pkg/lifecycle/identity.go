@@ -66,6 +66,16 @@ func (r CanonicalLaneRegistry) Resolve(value string) (CanonicalLane, error) {
 	}
 	return CanonicalLane{}, fmt.Errorf("unknown lane/role %q", value)
 }
+
+// LaneNames returns the validated configured lane-name snapshot in config
+// order. Live IDs remain a distinct namespace and use ResolveLiveAgentID.
+func (r CanonicalLaneRegistry) LaneNames() []string {
+	names := make([]string, 0, len(r.lanes))
+	for _, lane := range r.lanes {
+		names = append(names, lane.Name)
+	}
+	return names
+}
 func (r CanonicalLaneRegistry) Identity(repository, value, task, scope string) (HoldIdentity, error) {
 	lane, err := r.ResolveLaneName(value)
 	if err != nil {
