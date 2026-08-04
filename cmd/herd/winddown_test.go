@@ -13,7 +13,7 @@ import (
 )
 
 type namedLaunchEffects struct {
-	provider, claim, worktree, tab, process, prompt int
+	provider, claim, worktree, tab, process, prompt, fleet int
 }
 
 func (e *namedLaunchEffects) run(_ *router.LaunchDecision) error {
@@ -23,6 +23,14 @@ func (e *namedLaunchEffects) run(_ *router.LaunchDecision) error {
 	e.tab++
 	e.process++
 	e.prompt++
+	e.fleet++
+	return nil
+}
+
+func (e *namedLaunchEffects) runCycle(context.Context) error {
+	e.provider++
+	e.claim++
+	e.fleet++
 	return nil
 }
 
@@ -101,6 +109,66 @@ func TestLiveLaunchLifecycleHonorsDeadline(t *testing.T) {
 	}
 	if *effects != (namedLaunchEffects{}) {
 		t.Fatalf("expired posture reached downstream effects: %+v", effects)
+	}
+}
+
+func TestDaemonCycleRevalidatesMutablePostureBeforeEffects(t *testing.T) {
+	postureEnabled := false
+	mutableAdmission := func(context.Context) error {
+		if postureEnabled {
+			return winddown.ErrWinddownActive
+		}
+		return nil
+	}
+	if err := mutableAdmission(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	// The daemon has started, then the durable posture transitions before the
+	// next provider/claim cycle.
+	postureEnabled = true
+	effects := &namedLaunchEffects{}
+	err := runDaemonCycle(context.Background(), mutableAdmission, effects.runCycle)
+	if !errors.Is(err, winddown.ErrWinddownActive) {
+		t.Fatalf("cycle error = %v, want %v", err, winddown.ErrWinddownActive)
+	}
+	if *effects != (namedLaunchEffects{}) {
+		t.Fatalf("posture transition reached provider/claim/fleet effects: %+v", effects)
+	}
+}
+
+func TestActivateNoFleetResolvesFlagAndEnvironmentBeforeAdmission(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		flagValue bool
+		windDown  string
+	}{
+		{name: "flag", flagValue: true},
+		{name: "environment", windDown: "1"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			admissionCalls := 0
+			serviceEffects, fleetEffects := 0, 0
+			resolved, err := resolveActivateNoFleet(tc.flagValue, tc.windDown, func(context.Context) error {
+				admissionCalls++
+				return winddown.ErrWinddownActive
+			})
+			if err != nil {
+				t.Fatalf("resolved activation rejected: %v", err)
+			}
+			if !resolved {
+				t.Fatal("resolved activation must permit active-service activation")
+			}
+			serviceEffects++
+			if admissionCalls != 0 {
+				t.Fatalf("fleet admission called for no-fleet activation: %d", admissionCalls)
+			}
+			if fleetEffects != 0 {
+				t.Fatalf("no-fleet activation reached fleet effects: %d", fleetEffects)
+			}
+			if serviceEffects != 1 {
+				t.Fatalf("active-service effect count = %d, want 1", serviceEffects)
+			}
+		})
 	}
 }
 
