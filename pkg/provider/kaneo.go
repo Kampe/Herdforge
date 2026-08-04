@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -35,6 +36,8 @@ type KaneoProvider struct {
 	// BulkConcurrency bounds concurrent relation fetches in ListProjectRelations.
 	// Zero => DefaultBulkRelationConcurrency.
 	BulkConcurrency int
+	proofMu         sync.Mutex
+	pendingCreates  map[string]map[string]TaskLabel
 }
 
 type KaneoLinkConfig struct {
@@ -77,6 +80,7 @@ func NewKaneoProvider(apiURL string, projectID string, useCLI bool) *KaneoProvid
 		Client:           kaneoHTTPClient(),
 		Deadlines:        DefaultDeadlines(),
 		Retry:            DefaultReadRetry(),
+		pendingCreates:   make(map[string]map[string]TaskLabel),
 	}
 }
 
