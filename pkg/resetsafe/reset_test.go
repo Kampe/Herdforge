@@ -3,6 +3,7 @@ package resetsafe
 import (
 	"bytes"
 	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -68,7 +69,7 @@ func TestOpenAndNewRejectInvalidTargets(t *testing.T) {
 		t.Fatalf("non-directory error = %v", err)
 	}
 	nonrepo := t.TempDir()
-	if _, err := New(ctx, nonrepo, nonrepo, Options{}); err == nil || !strings.Contains(err.Error(), "not a git worktree") {
+	if _, err := New(ctx, nonrepo, nonrepo, Options{}); err == nil || !strings.Contains(err.Error(), "not a git repository") {
 		t.Fatalf("non-repository must fail closed, got %v", err)
 	}
 }
@@ -89,6 +90,35 @@ func TestNewRejectsMasterDetachedAndMismatchedRepositories(t *testing.T) {
 	git(t, wt, "checkout", "--detach", "-q")
 	if _, err := New(ctx, root, wt, Options{}); err == nil || !strings.Contains(err.Error(), "refusing on detached HEAD") {
 		t.Fatalf("detached HEAD must be refused, got %v", err)
+	}
+}
+
+func TestCanonicalCommonDirFailsClosedAndResolvesSymlink(t *testing.T) {
+	if _, err := canonicalCommonDir("", "fixture"); err == nil || !strings.Contains(err.Error(), "common dir is empty") {
+		t.Fatalf("empty common dir must fail closed, got %v", err)
+	}
+	missing := filepath.Join(t.TempDir(), "missing-common-dir")
+	if _, err := canonicalCommonDir(missing, "fixture"); err == nil || !strings.Contains(err.Error(), "cannot resolve fixture git common dir") {
+		t.Fatalf("unresolvable common dir must fail closed, got %v", err)
+	}
+	realDir := filepath.Join(t.TempDir(), "real-common-dir")
+	if err := os.MkdirAll(realDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(t.TempDir(), "common-dir-link")
+	if err := os.Symlink(realDir, link); err != nil {
+		t.Fatal(err)
+	}
+	canonical, err := canonicalCommonDir(link, "fixture")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, err := filepath.EvalSymlinks(realDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if canonical != want {
+		t.Fatalf("symlink common dir = %q, want %q", canonical, want)
 	}
 }
 
@@ -196,13 +226,113 @@ func TestRunPropagatesResetFailure(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	git(t, root, "update-ref", "-d", "refs/remotes/origin/main")
+	oldRun := gitRunFn
+	gitRunFn = func(ctx context.Context, dir string, args ...string) error {
+		if len(args) >= 2 && args[0] == "reset" && args[1] == "--hard" {
+			return errors.New("injected reset failure")
+		}
+		return oldRun(ctx, dir, args...)
+	}
+	t.Cleanup(func() { gitRunFn = oldRun })
 	if _, err := plan.Run(ctx); err == nil || !strings.Contains(err.Error(), "reset failed") {
 		t.Fatalf("reset failure must propagate, got %v", err)
 	}
 	if !strings.Contains(out.String(), "safe to reset") || errOut.String() != "" {
 		t.Fatalf("unexpected failure output: stdout=%q stderr=%q", out.String(), errOut.String())
 	}
+}
+
+func TestRunIgnoresExportedAuthorityTamperingAndSiblingRetarget(t *testing.T) {
+	ctx := context.Background()
+	root, wt, _ := fixture(t)
+	sibling := filepath.Join(t.TempDir(), "sibling-wt")
+	git(t, root, "worktree", "add", "-q", "-b", "sibling", sibling)
+	git(t, wt, "commit", "--allow-empty", "-q", "-m", "unique")
+	plan, err := New(ctx, root, wt, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	originalPreserve := plan.authority.preserveBranch
+	plan.Worktree = sibling
+	plan.Branch = "main"
+	plan.ShortSHA = "tampered"
+	plan.Unique = nil
+	plan.PreserveBranch = "harvest/evil"
+	if _, err := plan.Run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := git(t, wt, "rev-parse", "HEAD"); got != git(t, root, "rev-parse", "origin/main") {
+		t.Fatalf("bound target was not reset: %s", got)
+	}
+	if got := git(t, sibling, "rev-parse", "HEAD"); got != git(t, root, "rev-parse", "origin/main") {
+		t.Fatalf("sibling was retargeted or changed: %s", got)
+	}
+	if git(t, wt, "show-ref", "--verify", "refs/heads/"+originalPreserve) == "" {
+		t.Fatal("bound preserve branch was not used")
+	}
+	if hasRef(wt, "refs/heads/harvest/evil") {
+		t.Fatal("tampered preserve branch was used")
+	}
+}
+
+func TestRunRejectsPostPlanDirtyChange(t *testing.T) {
+	ctx := context.Background()
+	root, wt, _ := fixture(t)
+	plan, err := New(ctx, root, wt, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := osWrite(filepath.Join(wt, "late.txt"), "late\n"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := plan.Run(ctx); err == nil || !strings.Contains(err.Error(), "planned worktree has uncommitted changes") {
+		t.Fatalf("post-plan dirty state must fail closed, got %v", err)
+	}
+	if git(t, wt, "rev-parse", "HEAD") != git(t, root, "rev-parse", "origin/main") {
+		t.Fatal("post-plan dirty rejection must not reset")
+	}
+}
+
+func TestRunRejectsPostPlanHeadBranchAndOriginDrift(t *testing.T) {
+	ctx := context.Background()
+	t.Run("head drift", func(t *testing.T) {
+		root, wt, _ := fixture(t)
+		plan, err := New(ctx, root, wt, Options{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		git(t, wt, "commit", "--allow-empty", "-q", "-m", "late commit")
+		if _, err := plan.Run(ctx); err == nil || !strings.Contains(err.Error(), "planned HEAD changed") {
+			t.Fatalf("HEAD drift must fail closed, got %v", err)
+		}
+	})
+	t.Run("branch drift", func(t *testing.T) {
+		root, wt, _ := fixture(t)
+		plan, err := New(ctx, root, wt, Options{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		git(t, wt, "checkout", "-q", "-b", "late-branch")
+		if _, err := plan.Run(ctx); err == nil || !strings.Contains(err.Error(), "planned branch changed") {
+			t.Fatalf("branch drift must fail closed, got %v", err)
+		}
+	})
+	t.Run("origin main drift", func(t *testing.T) {
+		root, wt, _ := fixture(t)
+		plan, err := New(ctx, root, wt, Options{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := osWrite(filepath.Join(root, "base-change.txt"), "changed\n"); err != nil {
+			t.Fatal(err)
+		}
+		git(t, root, "add", "base-change.txt")
+		git(t, root, "commit", "-q", "-m", "base changed")
+		git(t, root, "push", "-q", "origin", "main")
+		if _, err := plan.Run(ctx); err == nil || !strings.Contains(err.Error(), "planned origin/main changed") {
+			t.Fatalf("origin/main drift must fail closed, got %v", err)
+		}
+	})
 }
 
 func TestRunExactCleanOutput(t *testing.T) {
@@ -216,8 +346,12 @@ func TestRunExactCleanOutput(t *testing.T) {
 	if _, err := plan.Run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	want := "herd-reset-safe: " + wt + " (feature/cha-77) has no unmerged work, safe to reset\n" +
-		"herd-reset-safe: " + wt + " reset to origin/main (" + plan.ResetSHA + ")\n"
+	canonicalWT, err := filepath.EvalSymlinks(wt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "herd-reset-safe: " + canonicalWT + " (feature/cha-77) has no unmerged work, safe to reset\n" +
+		"herd-reset-safe: " + canonicalWT + " reset to origin/main (" + plan.ResetSHA + ")\n"
 	if out.String() != want || errOut.String() != "" {
 		t.Fatalf("output mismatch:\nwant %q\nstdout %q\nstderr %q", want, out.String(), errOut.String())
 	}
@@ -286,6 +420,12 @@ func refMap(text string) map[string]string {
 		}
 	}
 	return refs
+}
+
+func hasRef(dir, ref string) bool {
+	cmd := exec.Command("git", "show-ref", "--verify", ref)
+	cmd.Dir = dir
+	return cmd.Run() == nil
 }
 
 func TestNewReportsPatchEquivalentCommitAsClean(t *testing.T) {

@@ -45,9 +45,22 @@ type WorktreePlan struct {
 	Pushed         bool
 	ResetSHA       string
 
-	repoRoot string
-	opts     Options
+	repoRoot  string
+	opts      Options
+	authority planAuthority
 }
+
+type planAuthority struct {
+	repoRoot       string
+	worktree       string
+	branch         string
+	head           string
+	unique         []string
+	preserveBranch string
+	originMain     string
+}
+
+var gitRunFn = gitRun
 
 // Open verifies that worktree names an existing directory.
 func Open(worktree string) error {
@@ -91,27 +104,52 @@ func New(ctx context.Context, repoRoot, worktreePath string, opts Options) (*Wor
 	if err := Open(worktreePath); err != nil {
 		return nil, err
 	}
-	branch, short, err := NewWorktree(ctx, worktreePath)
+	canonicalRoot, err := canonicalExistingPath(repoRoot, "repo root")
 	if err != nil {
 		return nil, err
 	}
-	if err := sameRepository(ctx, repoRoot, worktreePath); err != nil {
+	canonicalWorktree, err := canonicalExistingPath(worktreePath, "worktree")
+	if err != nil {
 		return nil, err
 	}
-	if dirty, err := dirtyFiles(ctx, worktreePath); err != nil {
+	if err := sameRepository(ctx, canonicalRoot, canonicalWorktree); err != nil {
+		return nil, err
+	}
+	branch, short, err := NewWorktree(ctx, canonicalWorktree)
+	if err != nil {
+		return nil, err
+	}
+	if dirty, err := dirtyFiles(ctx, canonicalWorktree); err != nil {
 		return nil, fmt.Errorf("herd-reset-safe: cannot inspect uncommitted changes: %w", err)
 	} else if len(dirty) > 0 {
 		return nil, fmt.Errorf("herd-reset-safe: %s has uncommitted changes, refusing:\n  %s\nherd-reset-safe: commit or stash first, then re-run", worktreePath, strings.Join(dirty, "\n  "))
 	}
 
-	u, err := harvest.NewHarvester(repoRoot).UnmergedFor(ctx, worktreePath)
+	u, err := harvest.NewHarvester(canonicalRoot).UnmergedFor(ctx, canonicalWorktree)
 	if err != nil {
 		return nil, fmt.Errorf("herd-reset-safe: cannot verify unmerged work: %w", err)
 	}
+	head, err := gitOutput(ctx, canonicalWorktree, "rev-parse", "HEAD")
+	if err != nil {
+		return nil, fmt.Errorf("herd-reset-safe: cannot bind HEAD: %w", err)
+	}
+	originMain, err := gitOutput(ctx, canonicalWorktree, "rev-parse", "origin/main")
+	if err != nil {
+		return nil, fmt.Errorf("herd-reset-safe: cannot bind origin/main: %w", err)
+	}
 	plan := &WorktreePlan{Worktree: worktreePath, Branch: branch, ShortSHA: short, repoRoot: repoRoot, opts: opts}
+	plan.authority = planAuthority{
+		repoRoot:   canonicalRoot,
+		worktree:   canonicalWorktree,
+		branch:     branch,
+		head:       strings.TrimSpace(head),
+		originMain: strings.TrimSpace(originMain),
+	}
 	if u != nil && len(u.Unmerged) > 0 {
 		plan.Unique = append([]string(nil), u.Unmerged...)
 		plan.PreserveBranch = "harvest/" + strings.ReplaceAll(branch, "/", "-") + "-" + short
+		plan.authority.unique = append([]string(nil), u.Unmerged...)
+		plan.authority.preserveBranch = plan.PreserveBranch
 	}
 	return plan, nil
 }
@@ -122,24 +160,28 @@ func (p *WorktreePlan) Run(ctx context.Context) (*WorktreePlan, error) {
 	if p == nil {
 		return nil, fmt.Errorf("herd-reset-safe: nil worktree plan")
 	}
-	if len(p.Unique) == 0 {
-		fmt.Fprintf(p.opts.stdout(), "herd-reset-safe: %s (%s) has no unmerged work, safe to reset\n", p.Worktree, p.Branch)
+	a := p.authority
+	if err := revalidate(ctx, a); err != nil {
+		return nil, err
+	}
+	if len(a.unique) == 0 {
+		fmt.Fprintf(p.opts.stdout(), "herd-reset-safe: %s (%s) has no unmerged work, safe to reset\n", a.worktree, a.branch)
 	} else {
-		fmt.Fprintf(p.opts.stdout(), "herd-reset-safe: %s has %d unmerged commit(s), preserving to %s before reset:\n", p.Worktree, len(p.Unique), p.PreserveBranch)
-		for _, sha := range p.Unique {
+		fmt.Fprintf(p.opts.stdout(), "herd-reset-safe: %s has %d unmerged commit(s), preserving to %s before reset:\n", a.worktree, len(a.unique), a.preserveBranch)
+		for _, sha := range a.unique {
 			fmt.Fprintf(p.opts.stdout(), "  %s\n", sha)
 		}
-		if err := gitRun(ctx, p.Worktree, "branch", p.PreserveBranch, "HEAD"); err != nil {
-			return nil, fmt.Errorf("herd-reset-safe: could not stage %s: %w", p.PreserveBranch, err)
+		if err := gitRunFn(ctx, a.worktree, "branch", a.preserveBranch, "HEAD"); err != nil {
+			return nil, fmt.Errorf("herd-reset-safe: could not stage %s: %w", a.preserveBranch, err)
 		}
-		if err := gitRun(ctx, p.Worktree, "push", "origin", p.PreserveBranch); err != nil {
-			fmt.Fprintf(p.opts.stderr(), "herd-reset-safe: WARN could not push %s — it still exists locally at %s as a branch ref; do not delete this worktree until it's recovered\n", p.PreserveBranch, p.Worktree)
+		if err := gitRunFn(ctx, a.worktree, "push", "origin", a.preserveBranch); err != nil {
+			fmt.Fprintf(p.opts.stderr(), "herd-reset-safe: WARN could not push %s — it still exists locally at %s as a branch ref; do not delete this worktree until it's recovered\n", a.preserveBranch, a.worktree)
 		} else {
 			p.Pushed = true
-			fmt.Fprintf(p.opts.stdout(), "herd-reset-safe: pushed %s. Recover with: git cherry-pick <sha>  OR  git merge %s\n", p.PreserveBranch, p.PreserveBranch)
+			fmt.Fprintf(p.opts.stdout(), "herd-reset-safe: pushed %s. Recover with: git cherry-pick <sha>  OR  git merge %s\n", a.preserveBranch, a.preserveBranch)
 		}
 	}
-	if err := gitRun(ctx, p.Worktree, "reset", "--hard", "origin/main"); err != nil {
+	if err := gitRunFn(ctx, a.worktree, "reset", "--hard", "origin/main"); err != nil {
 		return nil, fmt.Errorf("herd-reset-safe: reset failed: %w", err)
 	}
 	resetSHA, err := gitOutput(ctx, p.Worktree, "rev-parse", "--short", "HEAD")
@@ -147,7 +189,7 @@ func (p *WorktreePlan) Run(ctx context.Context) (*WorktreePlan, error) {
 		return nil, fmt.Errorf("herd-reset-safe: reset completed but could not read HEAD: %w", err)
 	}
 	p.ResetSHA = strings.TrimSpace(resetSHA)
-	fmt.Fprintf(p.opts.stdout(), "herd-reset-safe: %s reset to origin/main (%s)\n", p.Worktree, p.ResetSHA)
+	fmt.Fprintf(p.opts.stdout(), "herd-reset-safe: %s reset to origin/main (%s)\n", a.worktree, p.ResetSHA)
 	return p, nil
 }
 
@@ -195,10 +237,75 @@ func sameRepository(ctx context.Context, repoRoot, worktreePath string) error {
 	if err != nil {
 		return fmt.Errorf("herd-reset-safe: %s is not owned by repo root", worktreePath)
 	}
-	rootCommon, _ = filepath.EvalSymlinks(strings.TrimSpace(rootCommon))
-	worktreeCommon, _ = filepath.EvalSymlinks(strings.TrimSpace(worktreeCommon))
+	rootCommon, err = canonicalCommonDir(rootCommon, "repo root")
+	if err != nil {
+		return err
+	}
+	worktreeCommon, err = canonicalCommonDir(worktreeCommon, "worktree")
+	if err != nil {
+		return err
+	}
 	if filepath.Clean(rootCommon) != filepath.Clean(worktreeCommon) {
 		return fmt.Errorf("herd-reset-safe: %s is not owned by repo root", worktreePath)
 	}
 	return nil
+}
+
+func canonicalExistingPath(path, owner string) (string, error) {
+	canonical, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return "", fmt.Errorf("herd-reset-safe: cannot resolve %s path %q: %w", owner, path, err)
+	}
+	canonical = filepath.Clean(canonical)
+	if canonical == "" || canonical == "." {
+		return "", fmt.Errorf("herd-reset-safe: %s path is empty after canonicalization", owner)
+	}
+	return canonical, nil
+}
+
+func revalidate(ctx context.Context, a planAuthority) error {
+	if err := Open(a.worktree); err != nil {
+		return err
+	}
+	canonicalWorktree, err := canonicalExistingPath(a.worktree, "worktree")
+	if err != nil || canonicalWorktree != a.worktree {
+		return fmt.Errorf("herd-reset-safe: planned worktree changed")
+	}
+	if err := sameRepository(ctx, a.repoRoot, a.worktree); err != nil {
+		return err
+	}
+	branch, _, err := NewWorktree(ctx, a.worktree)
+	if err != nil || branch != a.branch {
+		return fmt.Errorf("herd-reset-safe: planned branch changed")
+	}
+	head, err := gitOutput(ctx, a.worktree, "rev-parse", "HEAD")
+	if err != nil || strings.TrimSpace(head) != a.head {
+		return fmt.Errorf("herd-reset-safe: planned HEAD changed")
+	}
+	if dirty, err := dirtyFiles(ctx, a.worktree); err != nil {
+		return fmt.Errorf("herd-reset-safe: cannot revalidate uncommitted changes: %w", err)
+	} else if len(dirty) > 0 {
+		return fmt.Errorf("herd-reset-safe: planned worktree has uncommitted changes, refusing")
+	}
+	originMain, err := gitOutput(ctx, a.worktree, "rev-parse", "origin/main")
+	if err != nil || strings.TrimSpace(originMain) != a.originMain {
+		return fmt.Errorf("herd-reset-safe: planned origin/main changed")
+	}
+	return nil
+}
+
+func canonicalCommonDir(raw, owner string) (string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", fmt.Errorf("herd-reset-safe: %s git common dir is empty", owner)
+	}
+	canonical, err := filepath.EvalSymlinks(raw)
+	if err != nil {
+		return "", fmt.Errorf("herd-reset-safe: cannot resolve %s git common dir %q: %w", owner, raw, err)
+	}
+	canonical = filepath.Clean(canonical)
+	if canonical == "." || canonical == "" {
+		return "", fmt.Errorf("herd-reset-safe: %s git common dir is empty after canonicalization", owner)
+	}
+	return canonical, nil
 }
