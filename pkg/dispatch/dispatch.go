@@ -18,6 +18,7 @@ import (
 	"github.com/Kampe/Herdforge/pkg/preflight"
 	"github.com/Kampe/Herdforge/pkg/provider"
 	"github.com/Kampe/Herdforge/pkg/router"
+	"github.com/Kampe/Herdforge/pkg/scopefence"
 	"github.com/Kampe/Herdforge/pkg/toolchild"
 	"github.com/Kampe/Herdforge/pkg/worktree"
 )
@@ -138,6 +139,9 @@ type DispatchOptions struct {
 	Decision  *router.LaunchDecision
 	NoLaunch  bool
 	LaneName  string
+	// Scope is required when ScopeFence is injected. It is acquired before
+	// worktree, board, tab, or prompt side effects.
+	Scope scopefence.Scope
 	// PromptVerifyTimeout bounds DeliverAndProve polling (default 60s).
 	// Production launches always require consumption proof — there is no
 	// SkipPromptVerify bypass (FAC-121 R3 repair).
@@ -206,9 +210,16 @@ type Dispatcher struct {
 	// Ownership is a durable cross-process lease claimer (claim.ClaimManager +
 	// SQLite). When nil, opened at .herd/launch-claims.db under RepoRoot.
 	Ownership deps.OwnershipClaimer
+	// ScopeFence is an optional injected admission boundary. Production wiring
+	// supplies a durable scopefence.Fence; nil preserves packet-only callers.
+	ScopeFence ScopeAdmission
 
 	// health projects BLOCKED(provider_timeout) for board calls (FAC-150).
 	health dispatchHealth
+}
+
+type ScopeAdmission interface {
+	Acquire(context.Context, scopefence.AcquireRequest) (scopefence.Decision, error)
 }
 
 // ControlScope is constructed after AgentStart, so each order is bound to the
@@ -431,6 +442,25 @@ func (d *Dispatcher) Dispatch(ctx context.Context, opts DispatchOptions) (*Dispa
 			return errors.Join(primary, rErr)
 		}
 		return primary
+	}
+	if d.ScopeFence != nil {
+		repository, ierr := d.repositoryIdentity()
+		if ierr != nil {
+			return nil, failOwned("scopefence_identity_failed", ierr)
+		}
+		admission, aerr := d.ScopeFence.Acquire(ctx, scopefence.AcquireRequest{Ownership: scopefence.Ownership{
+			Identity:      scopefence.Identity{Repository: repository, Branch: worktree.TaskBranch(task.Ref), Task: task.Ref},
+			Generation:    tok.Generation,
+			Scope:         opts.Scope,
+			State:         scopefence.Active,
+			GraphRevision: pre.GraphRevision,
+		}})
+		if aerr != nil {
+			return nil, failOwned("scopefence_error", aerr)
+		}
+		if !admission.Granted {
+			return nil, failOwned("scopefence_rejected", fmt.Errorf("dispatch scope fence rejected: %s", admission.Evidence.Reason))
+		}
 	}
 	if !opts.NoLaunch {
 		bound, berr := router.RebindDecision(opts.Decision, task.Ref, tok.Generation)
