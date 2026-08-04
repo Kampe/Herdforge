@@ -73,6 +73,22 @@ func TestHoldAuthorityAbsentIsExplicitlyUnheldAtPositiveGeneration(t *testing.T)
 	}
 }
 
+func TestHoldAuthorityRejectsPaddedIdentityBeforeWrite(t *testing.T) {
+	a, id, _ := holdFixture(t)
+	padded := id
+	padded.Owner = " owner"
+	if _, err := a.Hold(context.Background(), padded, "actor", "maintenance", "operator_hold", 1, nil); !errors.Is(err, ErrHoldCorrupt) {
+		t.Fatalf("padded identity was not rejected: %v", err)
+	}
+	var count int
+	if err := a.db.QueryRow(`SELECT COUNT(*) FROM lifecycle_hold_state`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("padded identity wrote hold state: %d rows", count)
+	}
+}
+
 func TestWithUnheldTransitionReleasedExpiredRowDoesNotRewriteHistory(t *testing.T) {
 	a, id, now := holdFixture(t)
 	if _, err := a.Hold(context.Background(), id, "actor", "maintenance", "operator_hold", 1, ptrTime(now.Add(-time.Second))); err != nil {

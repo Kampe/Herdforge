@@ -67,8 +67,11 @@ type LeaseOwnership struct {
 	Provider     string
 	Project      string
 	LaneResolver func(string) (string, error)
-	closeDB      func() error
+	holdClose    func() error
+	storeClose   func() error
 }
+
+var ownerRandomRead = rand.Read
 
 // OpenLeaseOwnership opens (or creates) a SQLite lease DB at path and returns
 // a ClaimManager-backed OwnershipClaimer. path should be repo-relative under
@@ -85,27 +88,25 @@ func OpenLeaseOwnership(dbPath, repo, provider, project string) (*LeaseOwnership
 	holdDB, canonicalErr := lifecycle.CanonicalStatePathForLaunchDB(dbPath)
 	if canonicalErr != nil {
 		if filepath.Base(filepath.Dir(dbPath)) == ".herd" {
-			_ = store.Close()
-			return nil, fmt.Errorf("deps: canonical hold path: %w", canonicalErr)
+			return nil, fmt.Errorf("deps: canonical hold path: %w", errors.Join(canonicalErr, store.Close()))
 		}
 		holdDB = lifecycle.CanonicalStatePath(filepath.Dir(filepath.Dir(dbPath)))
 	}
 	if err := os.MkdirAll(filepath.Dir(holdDB), 0o755); err != nil {
-		_ = store.Close()
-		return nil, fmt.Errorf("deps: create canonical hold directory: %w", err)
+		return nil, fmt.Errorf("deps: create canonical hold directory: %w", errors.Join(err, store.Close()))
 	}
 	holds, err := lifecycle.NewHoldAuthority(holdDB)
 	if err != nil {
-		_ = store.Close()
-		return nil, fmt.Errorf("deps: open canonical hold authority: %w", err)
+		return nil, fmt.Errorf("deps: open canonical hold authority: %w", errors.Join(err, store.Close()))
 	}
 	return &LeaseOwnership{
-		CM:       claim.NewClaimManager(store, claim.WithHoldReader(holds)),
-		Store:    store,
-		Repo:     repo,
-		Provider: provider,
-		Project:  project,
-		closeDB:  func() error { _ = holds.Close(); return store.Close() },
+		CM:         claim.NewClaimManager(store, claim.WithHoldReader(holds)),
+		Store:      store,
+		Repo:       repo,
+		Provider:   provider,
+		Project:    project,
+		holdClose:  holds.Close,
+		storeClose: store.Close,
 	}, nil
 }
 
@@ -138,13 +139,15 @@ func (o *LeaseOwnership) canonicalLane(role string) (string, error) {
 	return strings.TrimSpace(lane), nil
 }
 
-func newOwnerID(role string) string {
+func newOwnerID(role string) (string, error) {
 	var b [8]byte
-	_, _ = rand.Read(b[:])
+	if _, err := ownerRandomRead(b[:]); err != nil {
+		return "", fmt.Errorf("deps: generate lease owner identity: %w", err)
+	}
 	if role == "" {
 		role = "launch"
 	}
-	return fmt.Sprintf("%s-pid%d-%s", role, os.Getpid(), hex.EncodeToString(b[:]))
+	return fmt.Sprintf("%s-pid%d-%s", role, os.Getpid(), hex.EncodeToString(b[:])), nil
 }
 
 // ClaimExclusive acquires a durable generation-fenced lease. graphRev must be
@@ -164,9 +167,12 @@ func (o *LeaseOwnership) ClaimExclusive(ctx context.Context, taskID TaskID, task
 		role = "launch"
 	}
 	// claim.Claim requires Role == TaskRole and non-empty TaskRole.
-	ownerID := newOwnerID(role)
 	key := o.key(taskRef)
 	laneName, err := o.canonicalLane(role)
+	if err != nil {
+		return nil, err
+	}
+	ownerID, err := newOwnerID(role)
 	if err != nil {
 		return nil, err
 	}
@@ -246,10 +252,17 @@ func (o *LeaseOwnership) CompensateIfOwner(ctx context.Context, tok *OwnershipTo
 }
 
 func (o *LeaseOwnership) Close() error {
-	if o != nil && o.closeDB != nil {
-		return o.closeDB()
+	if o == nil {
+		return nil
 	}
-	return nil
+	var holdErr, storeErr error
+	if o.holdClose != nil {
+		holdErr = o.holdClose()
+	}
+	if o.storeClose != nil {
+		storeErr = o.storeClose()
+	}
+	return errors.Join(holdErr, storeErr)
 }
 
 // TwoIndependentManagersClaim races two ClaimManagers on the same SQLite

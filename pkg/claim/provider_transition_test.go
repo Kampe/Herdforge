@@ -166,6 +166,55 @@ type countingDurableOutbox struct {
 	claimCalls atomic.Int32
 }
 
+type releaseErrorLeaseStore struct {
+	*SQLiteLeaseStore
+	err error
+}
+
+func (s *releaseErrorLeaseStore) ReleaseProviderLock(context.Context, LeaseKey, int64, string) error {
+	return s.err
+}
+
+type markFailedErrorOutbox struct {
+	*SQLiteOutbox
+	err error
+}
+
+func (o *markFailedErrorOutbox) MarkFailed(context.Context, string, string, string, time.Time) error {
+	return o.err
+}
+
+func TestCompleteProviderTransitionSurfacesMarkFailedAndReleaseErrors(t *testing.T) {
+	markErr := errors.New("mark failed unavailable")
+	releaseErr := errors.New("provider lock release unavailable")
+	baseStore := newTestStore(t)
+	store := &releaseErrorLeaseStore{SQLiteLeaseStore: baseStore, err: releaseErr}
+	baseOutbox := newTestOutbox(t)
+	outbox := &markFailedErrorOutbox{SQLiteOutbox: baseOutbox, err: markErr}
+	provider := newFakeProviderCAS()
+	provider.seed("FAC-errors", "to-do", 5)
+	mgr := NewClaimManager(store, WithProviderCAS(provider), WithDurableOutbox(outbox), WithHoldReader(newTestHoldAuthority(t)))
+	ctx := context.Background()
+	key := testKey("FAC-errors")
+	lease, err := mgr.Claim(ctx, testClaimRequest(key, "w1", "herd-smith"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mgr.BeginProviderTransition(ctx, key, "w1", lease.Generation, "provider_mutation"); err != nil {
+		t.Fatal(err)
+	}
+	rec, err := mgr.CompleteProviderTransition(ctx, key, "w1", lease.Generation, "FAC-errors", "1", func(context.Context) error {
+		t.Fatal("stale provider revision must not mutate")
+		return nil
+	})
+	if rec == nil || rec.Status != OutboxInProgress {
+		t.Fatalf("expected preserved in-progress outbox evidence after MarkFailed failure, got %+v", rec)
+	}
+	if !errors.Is(err, ErrProviderRevisionStale) || !errors.Is(err, markErr) || !errors.Is(err, releaseErr) {
+		t.Fatalf("transition lost provider/MarkFailed/release evidence: %v", err)
+	}
+}
+
 func (o *countingDurableOutbox) Claim(ctx context.Context, key, owner string, staleAfter time.Duration, now time.Time) (*OutboxRecord, error) {
 	o.claimCalls.Add(1)
 	return o.SQLiteOutbox.Claim(ctx, key, owner, staleAfter, now)
@@ -273,8 +322,8 @@ func TestClaimManager_ProviderTransition_StaleRevision_LeaseUntouched(t *testing
 		t.Fatal("mutate must not run on a revision mismatch")
 		return nil
 	})
-	if err != nil {
-		t.Fatalf("complete (stale revision should not error the call itself): %v", err)
+	if err == nil || !errors.Is(err, ErrProviderRevisionStale) {
+		t.Fatalf("complete must surface stale provider evidence: %v", err)
 	}
 	if rec.Status != OutboxFailed {
 		t.Fatalf("expected failed status after stale revision, got %s", rec.Status)
@@ -421,8 +470,8 @@ func TestClaimManager_LocalSuccessProviderFailure_RetrySucceedsNoDoubleClaim(t *
 	rec, err = mgr.CompleteProviderTransition(ctx, key, "w1", lease.Generation, "FAC-33", "1", func(ctx context.Context) error {
 		return transientErr
 	})
-	if err != nil {
-		t.Fatalf("complete (transient failure should not error the call itself): %v", err)
+	if err == nil || !errors.Is(err, transientErr) {
+		t.Fatalf("complete must surface provider failure evidence: %v", err)
 	}
 	if rec.Status != OutboxFailed {
 		t.Fatalf("expected failed, got %s", rec.Status)

@@ -45,6 +45,8 @@ type Engine struct {
 	lastClaimGeneration int64
 }
 
+var daemonAuthenticatedRepositoryIdentity = dispatch.AuthenticatedRepositoryIdentity
+
 // LastClaimIdentity returns the task and generation most recently fenced by
 // RunPulse. Launch callers use it to reissue a decision after the dependency
 // and ownership claim; a zero/mismatched identity is not launchable.
@@ -298,9 +300,12 @@ func (e *Engine) ownershipClaimer() (deps.OwnershipClaimer, error) {
 	if e.Worktree != nil && e.Worktree.RepoRoot != "" {
 		root = e.Worktree.RepoRoot
 	}
-	repo := "herd"
-	if canonical, err := dispatch.AuthenticatedRepositoryIdentity(root); err == nil && canonical != "" {
-		repo = canonical
+	repo, err := daemonAuthenticatedRepositoryIdentity(root)
+	if err != nil {
+		return nil, fmt.Errorf("daemon: authenticated repository identity: %w", err)
+	}
+	if strings.TrimSpace(repo) == "" {
+		return nil, fmt.Errorf("daemon: authenticated repository identity is empty")
 	}
 	providerType := "memory"
 	project := ""

@@ -40,13 +40,17 @@ type HoldIdentity struct {
 }
 
 func (i HoldIdentity) valid() bool {
-	if strings.TrimSpace(i.Repository) == "" || strings.TrimSpace(i.Owner) == "" || strings.TrimSpace(i.Lane) == "" {
+	if !canonicalIdentityField(i.Repository) || !canonicalIdentityField(i.Owner) || !canonicalIdentityField(i.Lane) {
 		return false
 	}
 	if i.Scope == "lane" {
-		return strings.TrimSpace(i.Task) == ""
+		return i.Task == ""
 	}
-	return i.Scope == "task" && strings.TrimSpace(i.Task) != ""
+	return i.Scope == "task" && canonicalIdentityField(i.Task)
+}
+
+func canonicalIdentityField(value string) bool {
+	return value != "" && value == strings.TrimSpace(value)
 }
 
 // HoldDecision is the single read decision shared by all action callers.
@@ -451,6 +455,9 @@ func readHoldTx(ctx context.Context, tx holdSQL, identity HoldIdentity) (HoldRec
 	}
 	if err != nil {
 		return HoldRecord{}, false, fmt.Errorf("%w: read row: %v", ErrHoldCorrupt, err)
+	}
+	if !(HoldIdentity{Repository: r.Repository, Owner: r.Owner, Lane: r.Lane, Task: r.Task, Scope: r.Scope}).valid() {
+		return HoldRecord{}, false, ErrHoldCorrupt
 	}
 	if r.Generation <= 0 || r.Actor == "" || r.Reason == "" || r.Code == "" {
 		return HoldRecord{}, false, ErrHoldCorrupt
