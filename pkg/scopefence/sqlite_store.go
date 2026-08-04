@@ -76,11 +76,16 @@ func (s *SQLiteStore) Read(ctx context.Context) (Snapshot, error) {
 	if err := ctx.Err(); err != nil {
 		return Snapshot{}, err
 	}
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return Snapshot{}, fmt.Errorf("scopefence: begin read: %w", err)
+	}
+	defer tx.Rollback()
 	var revision int64
-	if err := s.db.QueryRowContext(ctx, `SELECT revision FROM scopefence_meta WHERE id = 1`).Scan(&revision); err != nil {
+	if err := tx.QueryRowContext(ctx, `SELECT revision FROM scopefence_meta WHERE id = 1`).Scan(&revision); err != nil {
 		return Snapshot{}, fmt.Errorf("scopefence: read revision: %w", err)
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT ownership_json FROM scopefence_owners ORDER BY ordinal`)
+	rows, err := tx.QueryContext(ctx, `SELECT ownership_json FROM scopefence_owners ORDER BY ordinal`)
 	if err != nil {
 		return Snapshot{}, fmt.Errorf("scopefence: read owners: %w", err)
 	}
@@ -99,6 +104,9 @@ func (s *SQLiteStore) Read(ctx context.Context) (Snapshot, error) {
 	}
 	if err := rows.Err(); err != nil {
 		return Snapshot{}, fmt.Errorf("scopefence: read owners: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return Snapshot{}, fmt.Errorf("scopefence: commit read: %w", err)
 	}
 	return Snapshot{Revision: fmt.Sprint(revision), Owners: owners}, nil
 }
