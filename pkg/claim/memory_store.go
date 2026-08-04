@@ -156,6 +156,17 @@ func (s *InMemoryLeaseStore) ExpireLeaseCAS(_ context.Context, id, generation in
 	return cloneLease(l), true, nil
 }
 
+func (s *InMemoryLeaseStore) ForceReleaseProviderLockCAS(_ context.Context, id, generation int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	l := s.rows[id]
+	if l == nil || l.Generation != generation || l.Status != StatusActive {
+		return fmt.Errorf("provider lock CAS lease mismatch")
+	}
+	delete(s.provLock, id)
+	return nil
+}
+
 func (s *InMemoryLeaseStore) acquire(_ context.Context, key LeaseKey, ownerID, role, worktreePath, holdRepository, holdOwner, holdLane string, now time.Time, ttl time.Duration) (*Lease, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
