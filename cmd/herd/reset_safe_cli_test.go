@@ -6,7 +6,7 @@ import (
 	"testing"
 )
 
-const wantResetSafeUsage = "Usage: herd reset-safe <worktree-path>"
+const wantResetSafeUsage = "usage: herd reset-safe <worktree-path>"
 
 func TestResetSafeHelpByteContract(t *testing.T) {
 	binary := buildHerd(t)
