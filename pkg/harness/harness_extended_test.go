@@ -20,6 +20,7 @@ func TestBuildInvocation_NoPromptFlag(t *testing.T) {
 		Type:       HarnessGeneric,
 		BinaryName: "my-tool",
 		PromptFlag: "",
+		Supported:  true,
 	}
 	inv := cfg.BuildInvocation("do it")
 	expected := []string{"my-tool", "do it"}

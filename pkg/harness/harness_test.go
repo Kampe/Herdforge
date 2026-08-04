@@ -34,8 +34,7 @@ func TestBuildInvocation(t *testing.T) {
 	cfg := GetHarnessConfig("pi")
 	inv := cfg.BuildInvocation("do work")
 
-	expected := []string{"pi", "-p", "do work"}
-	if !reflect.DeepEqual(inv, expected) {
-		t.Errorf("BuildInvocation() = %v, expected %v", inv, expected)
+	if !reflect.DeepEqual(inv, []string(nil)) {
+		t.Errorf("unsupported harness must compile no argv, got %v", inv)
 	}
 }
