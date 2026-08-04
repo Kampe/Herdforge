@@ -1,0 +1,231 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "contracts/agentscope/v1alpha1/agentscope.schema.json",
+  "title": "Herdforge AgentScope v1alpha1",
+  "description": "Contract-only bounded agent runtime scope. Runtime enforcement is outside this schema.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["apiVersion", "kind", "metadata", "spec"],
+  "properties": {
+    "apiVersion": { "const": "herdforge.dev/v1alpha1" },
+    "kind": { "const": "AgentScope" },
+    "metadata": { "$ref": "#/$defs/metadata" },
+    "spec": { "$ref": "#/$defs/spec" }
+  },
+  "$defs": {
+    "identifier": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$"
+    },
+    "sha": {
+      "type": "string",
+      "pattern": "^([0-9a-f]{40}|[0-9a-f]{64})$"
+    },
+    "relativePath": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^(?!/)(?!\\.\\.?$)(?!.*(?:^|/)\\.\\.?(?:/|$))(?!.*//)(?!.*\\\\)(?!.*\\s).+$"
+    },
+    "scopedPath": {
+      "allOf": [
+        { "$ref": "#/$defs/relativePath" },
+        { "pattern": "^(?!\\.git(?:/|$)).+$" }
+      ]
+    },
+    "metadata": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "runId", "phaseId", "task", "issuedAt", "expiresAt"],
+      "properties": {
+        "id": { "$ref": "#/$defs/identifier" },
+        "runId": { "$ref": "#/$defs/identifier" },
+        "phaseId": { "$ref": "#/$defs/identifier" },
+        "task": { "$ref": "#/$defs/identifier" },
+        "issuedAt": { "type": "string", "format": "date-time" },
+        "expiresAt": { "type": "string", "format": "date-time" }
+      }
+    },
+    "spec": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["subject", "repository", "worktree", "paths", "commandProfiles", "network", "git", "credentials", "runtime", "evidence", "grants"],
+      "properties": {
+        "subject": { "$ref": "#/$defs/subject" },
+        "repository": { "$ref": "#/$defs/repository" },
+        "worktree": { "$ref": "#/$defs/worktree" },
+        "paths": { "$ref": "#/$defs/paths" },
+        "commandProfiles": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/identifier" }
+        },
+        "network": { "$ref": "#/$defs/network" },
+        "git": { "$ref": "#/$defs/git" },
+        "credentials": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/credential" }
+        },
+        "runtime": { "$ref": "#/$defs/runtime" },
+        "evidence": { "$ref": "#/$defs/evidence" },
+        "grants": { "$ref": "#/$defs/grants" }
+      }
+    },
+    "subject": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["agentId", "sessionId", "lane"],
+      "properties": {
+        "agentId": { "$ref": "#/$defs/identifier" },
+        "sessionId": { "$ref": "#/$defs/identifier" },
+        "lane": { "$ref": "#/$defs/identifier" }
+      }
+    },
+    "repository": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["identity", "baseSha", "headSha"],
+      "properties": {
+        "identity": { "$ref": "#/$defs/identifier" },
+        "baseSha": { "$ref": "#/$defs/sha" },
+        "headSha": { "$ref": "#/$defs/sha" }
+      }
+    },
+    "worktree": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["identity", "path", "repositoryRoot", "mutable", "shared"],
+      "properties": {
+        "identity": { "$ref": "#/$defs/identifier" },
+        "path": { "$ref": "#/$defs/relativePath" },
+        "repositoryRoot": {
+          "anyOf": [
+            { "const": "." },
+            { "$ref": "#/$defs/relativePath" }
+          ]
+        },
+        "mutable": { "const": true },
+        "shared": { "const": false }
+      }
+    },
+    "paths": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["readable", "writable"],
+      "properties": {
+        "readable": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/scopedPath" }
+        },
+        "writable": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/scopedPath" }
+        }
+      }
+    },
+    "network": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode", "allowedHosts"],
+      "properties": {
+        "mode": { "enum": ["deny", "allowlist"] },
+        "allowedHosts": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "^[a-z0-9.:[\\]-]+$"
+          }
+        }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "mode": { "const": "deny" } } },
+          "then": { "properties": { "allowedHosts": { "maxItems": 0 } } }
+        },
+        {
+          "if": { "properties": { "mode": { "const": "allowlist" } } },
+          "then": { "properties": { "allowedHosts": { "minItems": 1 } } }
+        }
+      ]
+    },
+    "git": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["actions"],
+      "properties": {
+        "actions": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "enum": ["status", "diff", "add", "commit", "fetch", "push", "create_pr"] }
+        }
+      }
+    },
+    "credential": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["ref", "provider", "scopes", "expiresAt"],
+      "properties": {
+        "ref": { "$ref": "#/$defs/identifier" },
+        "provider": { "$ref": "#/$defs/identifier" },
+        "scopes": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/identifier" }
+        },
+        "expiresAt": { "type": "string", "format": "date-time" }
+      }
+    },
+    "runtime": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["provider", "model", "deadlineSeconds", "maxTurns", "maxTokens", "stallTimeoutSeconds", "loopWindow", "loopRepeatThreshold", "maxPaidUsd"],
+      "properties": {
+        "provider": { "$ref": "#/$defs/identifier" },
+        "model": { "$ref": "#/$defs/identifier" },
+        "deadlineSeconds": { "type": "integer", "minimum": 1 },
+        "maxTurns": { "type": "integer", "minimum": 1 },
+        "maxTokens": { "type": "integer", "minimum": 1 },
+        "stallTimeoutSeconds": { "type": "integer", "minimum": 1 },
+        "loopWindow": { "type": "integer", "minimum": 1 },
+        "loopRepeatThreshold": { "type": "integer", "minimum": 1 },
+        "maxPaidUsd": { "type": "number", "exclusiveMinimum": 0, "maximum": 10 }
+      }
+    },
+    "evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kinds", "prefix", "maxBytes"],
+      "properties": {
+        "kinds": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "enum": ["test", "lint", "diff", "log", "receipt"] }
+        },
+        "prefix": { "$ref": "#/$defs/relativePath" },
+        "maxBytes": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "grants": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kubernetes", "unrestrictedShell", "extensions"],
+      "properties": {
+        "kubernetes": { "const": false },
+        "unrestrictedShell": { "const": false },
+        "extensions": { "type": "array", "maxItems": 0 }
+      }
+    }
+  }
+}
