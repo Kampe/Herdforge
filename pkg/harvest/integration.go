@@ -3,13 +3,15 @@ package harvest
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
-	"os/exec"
+	"os"
 	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/Kampe/Herdforge/pkg/lock"
+	"github.com/Kampe/Herdforge/pkg/resources"
 	"github.com/Kampe/Herdforge/pkg/reviewledger"
 	hsync "github.com/Kampe/Herdforge/pkg/sync"
 )
@@ -44,6 +46,7 @@ type Integration struct {
 	LockDir         string
 	MaxMergeAge     time.Duration
 	DryRun          bool
+	DiskAdmission   resources.DiskAdmission
 }
 
 // AdmissionContext is the caller-asserted merge context bound into
@@ -144,6 +147,11 @@ func WithSessionManager(sm SessionManager) IntegrationOption {
 	return func(i *Integration) { i.SessionManager = sm }
 }
 
+// WithDiskAdmission replaces the default read-only capacity authority.
+func WithDiskAdmission(admission resources.DiskAdmission) IntegrationOption {
+	return func(i *Integration) { i.DiskAdmission = admission }
+}
+
 // IntegrationResult carries the outcome of the full pipeline for one harvest.
 type IntegrationResult struct {
 	HarvestResult      *HarvestResult      `json:"harvest_result"`
@@ -182,13 +190,14 @@ type MergeOutcome struct {
 // l must be a reviewledger.Ledger; merge admission always goes through Admit.
 func NewIntegration(h *Harvester, v Verifier, d Dispatcher, l *reviewledger.Ledger, repoRoot string, opts ...IntegrationOption) *Integration {
 	i := &Integration{
-		Harvester:   h,
-		Verifier:    v,
-		Dispatcher:  d,
-		Ledger:      l,
-		RepoRoot:    repoRoot,
-		LockDir:     filepath.Join(repoRoot, ".git", "herd-shared-checkout.lock.d"),
-		MaxMergeAge: 5 * time.Minute,
+		Harvester:     h,
+		Verifier:      v,
+		Dispatcher:    d,
+		Ledger:        l,
+		RepoRoot:      repoRoot,
+		LockDir:       filepath.Join(repoRoot, ".git", "herd-shared-checkout.lock.d"),
+		MaxMergeAge:   5 * time.Minute,
+		DiskAdmission: resources.NewCapacityGate(resources.OSBackend{}, resources.DefaultDiskPolicy()),
 	}
 	for _, o := range opts {
 		o(i)
@@ -201,7 +210,13 @@ func (in *Integration) Run(ctx context.Context) (*IntegrationResult, error) {
 	res := &IntegrationResult{}
 
 	// Phase 1: Harvest
-	hr, err := in.Harvester.Harvest(ctx)
+	var hr *HarvestResult
+	var err error
+	if in.DryRun {
+		hr, err = in.Harvester.HarvestReadOnly(ctx)
+	} else {
+		hr, err = in.Harvester.Harvest(ctx)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("harvest: %w", err)
 	}
@@ -385,6 +400,9 @@ func (in *Integration) runMergeGate(ctx context.Context, rg ReviewGateOutcome) (
 		mo.CherryPicked = true
 		return mo, nil
 	}
+	if err := in.admitMergeDisk(rg.Worktree); err != nil {
+		return nil, err
+	}
 
 	dl := lock.NewDirLock(in.LockDir)
 	if err := dl.Acquire(ctx, in.MaxMergeAge, fmt.Sprintf("merge %s/%s", rg.Branch, rg.SHA)); err != nil {
@@ -455,6 +473,43 @@ func (in *Integration) runMergeGate(ctx context.Context, rg ReviewGateOutcome) (
 	return nil, fmt.Errorf("push failed after %d attempts for %s", maxAttempts, rg.SHA)
 }
 
+func (in *Integration) admitMergeDisk(worktreePath string) error {
+	if in == nil || in.DiskAdmission == nil {
+		return fmt.Errorf("disk capacity gate unavailable for merge")
+	}
+	parts := []resources.DiskRequirement{resources.DefaultMergeRequirement()}
+	if in.Verifier != nil {
+		// Build/test artifacts need independent headroom from the merge itself.
+		parts = append(parts, resources.DefaultWorktreeCreateRequirement())
+	}
+	requirement, err := resources.AggregateDiskRequirement(parts...)
+	if err != nil {
+		return fmt.Errorf("disk capacity gate: invalid merge requirement")
+	}
+	repo, err := resources.ResolveExistingPath(in.RepoRoot)
+	if err != nil {
+		return fmt.Errorf("disk capacity gate: resolve repository volume")
+	}
+	worktree, err := resources.ResolveExistingPath(worktreePath)
+	if err != nil {
+		return fmt.Errorf("disk capacity gate: resolve worktree volume")
+	}
+	tmp, err := resources.ResolveExistingPath(os.TempDir())
+	if err != nil {
+		return fmt.Errorf("disk capacity gate: resolve temporary volume")
+	}
+	decision := in.DiskAdmission.Admit(resources.DiskRequest{
+		Operation: "merge_gate", Path: repo, TempPath: tmp,
+		RequiredBytes: requirement.Bytes, RequiredInodes: requirement.Inodes,
+		AdditionalPaths: []string{worktree},
+	})
+	if decision.Allowed {
+		return nil
+	}
+	evidence, _ := json.Marshal(decision.Evidence)
+	return fmt.Errorf("disk capacity gate blocked: state=%s evidence=%s", decision.State, evidence)
+}
+
 func (in *Integration) prepareMain(ctx context.Context) error {
 	current, err := gitOutput(ctx, in.RepoRoot, "rev-parse", "--abbrev-ref", "HEAD")
 	if err != nil {
@@ -476,7 +531,7 @@ func (in *Integration) prepareMain(ctx context.Context) error {
 
 func (in *Integration) cherryPick(ctx context.Context, sha string) (mergeSHA string, conflict bool, err error) {
 	var stderr bytes.Buffer
-	cmd := exec.CommandContext(ctx, "git", "cherry-pick", sha)
+	cmd := execCommandContext(ctx, "git", "cherry-pick", sha)
 	cmd.Dir = in.RepoRoot
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
@@ -546,7 +601,7 @@ func (in *Integration) runCleanup(ctx context.Context, uw UnmergedWork) (bool, e
 // -- helpers --
 
 func runGit(ctx context.Context, dir string, args ...string) error {
-	cmd := exec.CommandContext(ctx, "git", args...)
+	cmd := execCommandContext(ctx, "git", args...)
 	cmd.Dir = dir
 	out, err := cmd.CombinedOutput()
 	if err != nil {
@@ -556,7 +611,7 @@ func runGit(ctx context.Context, dir string, args ...string) error {
 }
 
 func gitOutput(ctx context.Context, dir string, args ...string) (string, error) {
-	cmd := exec.CommandContext(ctx, "git", args...)
+	cmd := execCommandContext(ctx, "git", args...)
 	cmd.Dir = dir
 	out, err := cmd.Output()
 	if err != nil {
@@ -570,7 +625,7 @@ func gitOutput(ctx context.Context, dir string, args ...string) (string, error) 
 // unmerged paths only — NOT git diff --check (which catches whitespace
 // errors, not conflict markers).
 func hasUnmergedPaths(ctx context.Context, dir string) bool {
-	cmd := exec.CommandContext(ctx, "git", "diff", "--name-only", "--diff-filter=U")
+	cmd := execCommandContext(ctx, "git", "diff", "--name-only", "--diff-filter=U")
 	cmd.Dir = dir
 	out, _ := cmd.Output()
 	return strings.TrimSpace(string(out)) != ""

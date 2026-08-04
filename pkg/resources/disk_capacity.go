@@ -36,6 +36,44 @@ type DiskPolicy struct {
 	RecoveryPercent               float64
 }
 
+// DiskRequirement describes bounded headroom for one disk-growing operation.
+type DiskRequirement struct {
+	Bytes  uint64
+	Inodes uint64
+}
+
+const (
+	worktreeCreateBytes  = 64 * (1 << 20)
+	worktreeCreateInodes = 128
+	mergeBytes           = 128 * (1 << 20)
+	mergeInodes          = 256
+)
+
+func DefaultWorktreeCreateRequirement() DiskRequirement {
+	return DiskRequirement{Bytes: worktreeCreateBytes, Inodes: worktreeCreateInodes}
+}
+
+func DefaultMergeRequirement() DiskRequirement {
+	return DiskRequirement{Bytes: mergeBytes, Inodes: mergeInodes}
+}
+
+// AggregateDiskRequirement adds independent artifact/build headroom without
+// wrapping. Overflow is a policy/configuration error and must fail closed.
+func AggregateDiskRequirement(parts ...DiskRequirement) (DiskRequirement, error) {
+	var total DiskRequirement
+	for _, part := range parts {
+		if part.Bytes > math.MaxUint64-total.Bytes || part.Inodes > math.MaxUint64-total.Inodes {
+			return DiskRequirement{}, fmt.Errorf("disk requirement overflow")
+		}
+		total.Bytes += part.Bytes
+		total.Inodes += part.Inodes
+	}
+	if total.Bytes == 0 || total.Inodes == 0 {
+		return DiskRequirement{}, fmt.Errorf("disk requirement must be nonzero")
+	}
+	return total, nil
+}
+
 // DefaultDiskPolicy is intentionally conservative for disk-growing fleet
 // operations. Callers may supply a policy explicitly for hermetic tests or
 // deployment-specific capacity reservations.
@@ -107,6 +145,13 @@ const (
 	DiskReasonAdditionalBelow       = "additional_volume_below_threshold"
 )
 
+const (
+	DiskActionProceed      = "proceed"
+	DiskActionRetryProbe   = "retry_capacity_probe"
+	DiskActionFixPolicy    = "fix_disk_policy"
+	DiskActionRecoverSpace = "recover_capacity_without_cleanup"
+)
+
 // DiskEvidence is bounded and safe to serialize or log. Paths are never
 // included; identities containing path-like data are reduced to an opaque ID.
 type DiskEvidence struct {
@@ -131,6 +176,7 @@ type DiskEvidence struct {
 	FailedFreeBytes    *uint64  `json:"failed_free_bytes,omitempty"`
 	FailedFreePercent  *float64 `json:"failed_free_percent,omitempty"`
 	FailedFreeInodes   *uint64  `json:"failed_free_inodes,omitempty"`
+	NextAction         string   `json:"next_action"`
 }
 
 type DiskDecision struct {
@@ -260,27 +306,28 @@ func EvaluateDiskCapacity(backend StatFSBackend, request DiskRequest, policy Dis
 		additional, err := backend.StatFS(path)
 		if err != nil {
 			e.Reason = DiskReasonAdditionalUnavailable
-			return DiskDecision{State: DiskBlocked, Evidence: e}
+			return diskBlocked(e, DiskReasonAdditionalUnavailable)
 		}
 		if strings.TrimSpace(additional.FilesystemID) != "" {
 			e.FailedFilesystemID = safeDiskIdentity(additional.FilesystemID)
 		}
 		if validCapacity(additional) != nil {
 			e.Reason = DiskReasonAdditionalInvalid
-			return DiskDecision{State: DiskBlocked, Evidence: e}
+			return diskBlocked(e, DiskReasonAdditionalInvalid)
 		}
 		freeBytes, freePercent, freeInodes := capacityMetrics(additional)
 		e.FailedFreeBytes, e.FailedFreePercent, e.FailedFreeInodes = &freeBytes, &freePercent, &freeInodes
 		if strings.TrimSpace(additional.FilesystemID) == "" {
 			e.Reason = DiskReasonAdditionalUnavailable
-			return DiskDecision{State: DiskBlocked, Evidence: e}
+			return diskBlocked(e, DiskReasonAdditionalUnavailable)
 		}
 		if !capacityMeets(additional, request.RequiredBytes, request.RequiredInodes, t) {
 			e.Reason = DiskReasonAdditionalBelow
-			return DiskDecision{State: DiskBlocked, Evidence: e}
+			return diskBlocked(e, DiskReasonAdditionalBelow)
 		}
 	}
 	e.Reason = DiskReasonNone
+	e.NextAction = DiskActionProceed
 	return DiskDecision{State: DiskReady, Allowed: true, Evidence: e}
 }
 
@@ -346,6 +393,14 @@ func capacityShortOnInodes(free, required, reserve uint64) bool {
 }
 func diskBlocked(e DiskEvidence, reason string) DiskDecision {
 	e.Reason = reason
+	switch reason {
+	case DiskReasonInvalidPolicy:
+		e.NextAction = DiskActionFixPolicy
+	case DiskReasonUnavailable, DiskReasonInvalid, DiskReasonAdditionalUnavailable, DiskReasonAdditionalInvalid:
+		e.NextAction = DiskActionRetryProbe
+	default:
+		e.NextAction = DiskActionRecoverSpace
+	}
 	return DiskDecision{State: DiskBlocked, Evidence: e}
 }
 func boundedDiskOperation(s string) string {

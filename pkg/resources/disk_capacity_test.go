@@ -343,3 +343,27 @@ func TestCapacityGateConcurrentScopesDoNotBleed(t *testing.T) {
 		t.Fatalf("concurrent derived scope identities aliased: %q", b.Evidence.ScopeID)
 	}
 }
+
+func TestAggregateDiskRequirementIsNonzeroAndOverflowSafe(t *testing.T) {
+	got, err := AggregateDiskRequirement(DefaultMergeRequirement(), DefaultWorktreeCreateRequirement())
+	if err != nil || got.Bytes == 0 || got.Inodes == 0 {
+		t.Fatalf("aggregate = %+v, err=%v", got, err)
+	}
+	if _, err := AggregateDiskRequirement(DiskRequirement{Bytes: math.MaxUint64}, DiskRequirement{Bytes: 1, Inodes: 1}); err == nil {
+		t.Fatal("expected byte requirement overflow")
+	}
+	if _, err := AggregateDiskRequirement(DiskRequirement{Inodes: math.MaxUint64}, DiskRequirement{Bytes: 1, Inodes: 1}); err == nil {
+		t.Fatal("expected inode requirement overflow")
+	}
+}
+
+func TestDiskEvidenceNextActionIsStableAndPathFree(t *testing.T) {
+	blocked := EvaluateDiskCapacity(&diskFake{values: map[string]Capacity{".": diskHealthy("fs")}}, DiskRequest{Operation: "merge_gate", Path: ".", RequiredBytes: 600}, diskPolicy())
+	if blocked.Allowed || blocked.Evidence.NextAction != DiskActionRecoverSpace {
+		t.Fatalf("pressure action = %+v", blocked)
+	}
+	invalid := EvaluateDiskCapacity(nil, DiskRequest{Operation: "merge_gate", Path: "/secret/path"}, DiskPolicy{ReservePercent: 101})
+	if invalid.Allowed || invalid.Evidence.NextAction != DiskActionFixPolicy || strings.Contains(invalid.Evidence.NextAction, "/") {
+		t.Fatalf("invalid-policy action = %+v", invalid)
+	}
+}
