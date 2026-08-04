@@ -119,7 +119,7 @@ func TestEvaluateDiskCapacityAdditionalFailureCarriesExactOpaqueEvidence(t *test
 	if got.Evidence.FilesystemID != "repo" || got.Evidence.FailedFilesystemID != safeDiskIdentity("target/secret") {
 		t.Fatalf("filesystem evidence = %+v", got.Evidence)
 	}
-	if got.Evidence.FailedFreeBytes != 50 || got.Evidence.FailedFreePercent != 5 || got.Evidence.FailedFreeInodes != 7 {
+	if got.Evidence.FailedFreeBytes == nil || *got.Evidence.FailedFreeBytes != 50 || got.Evidence.FailedFreePercent == nil || *got.Evidence.FailedFreePercent != 5 || got.Evidence.FailedFreeInodes == nil || *got.Evidence.FailedFreeInodes != 7 {
 		t.Fatalf("failed volume metrics = %+v", got.Evidence)
 	}
 }
@@ -181,8 +181,75 @@ func TestAdditionalVolumeEvidenceJSONPreservesZeroObservations(t *testing.T) {
 	if decoded.RequiredBytes != 7 || decoded.RequiredInodes != 3 || decoded.ReserveBytes != policy.ReserveBytes || decoded.ReserveInodes != policy.ReserveInodes {
 		t.Fatalf("decoded requirements/thresholds = %+v", decoded)
 	}
-	if decoded.FailedFreeBytes != 0 || decoded.FailedFreePercent != 0 || decoded.FailedFreeInodes != 0 {
+	if decoded.FailedFreeBytes == nil || *decoded.FailedFreeBytes != 0 || decoded.FailedFreePercent == nil || *decoded.FailedFreePercent != 0 || decoded.FailedFreeInodes == nil || *decoded.FailedFreeInodes != 0 {
 		t.Fatalf("zero observations were not preserved: %+v JSON=%s", decoded, encoded)
+	}
+}
+
+func TestDiskEvidenceJSONOmitsUnobservedVolumeMetrics(t *testing.T) {
+	backend := &diskFake{values: map[string]Capacity{"repo": diskHealthy("repo")}}
+	evidence := EvaluateDiskCapacity(backend, DiskRequest{Path: "repo"}, diskPolicy()).Evidence
+	data, err := json.Marshal(evidence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded := string(data)
+	for _, field := range []string{"temp_free_bytes", "temp_free_percent", "temp_free_inodes", "failed_free_bytes", "failed_free_percent", "failed_free_inodes"} {
+		if strings.Contains(encoded, field) {
+			t.Fatalf("unobserved field %q serialized: %s", field, encoded)
+		}
+	}
+	var decoded DiskEvidence
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if decoded.TempFreeBytes != nil || decoded.TempFreePercent != nil || decoded.TempFreeInodes != nil || decoded.FailedFreeBytes != nil || decoded.FailedFreePercent != nil || decoded.FailedFreeInodes != nil {
+		t.Fatalf("unobserved metrics became present after unmarshal: %+v", decoded)
+	}
+}
+
+func TestDiskEvidenceJSONOmitsAdditionalErrorMetrics(t *testing.T) {
+	backend := StatFSFunc(func(path string) (Capacity, error) {
+		if path == "repo" {
+			return diskHealthy("repo"), nil
+		}
+		return Capacity{}, errors.New("additional probe failed")
+	})
+	evidence := EvaluateDiskCapacity(backend, DiskRequest{Path: "repo", AdditionalPaths: []string{"target"}}, diskPolicy()).Evidence
+	if evidence.Reason != DiskReasonAdditionalUnavailable {
+		t.Fatalf("reason = %q", evidence.Reason)
+	}
+	data, err := json.Marshal(evidence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), "failed_free_") {
+		t.Fatalf("probe-error metrics serialized without observation: %s", data)
+	}
+}
+
+func TestDiskEvidenceJSONPreservesObservedTempZeros(t *testing.T) {
+	backend := &diskFake{values: map[string]Capacity{
+		"repo": diskHealthy("repo"),
+		"tmp":  {FilesystemID: "tmp/secret", TotalBytes: 1000, FreeBytes: 0, TotalInodes: 100, FreeInodes: 0},
+	}}
+	evidence := EvaluateDiskCapacity(backend, DiskRequest{Path: "repo", TempPath: "tmp"}, diskPolicy()).Evidence
+	if evidence.Reason != DiskReasonTempVolumeDivergence || evidence.TempFreeBytes == nil || evidence.TempFreePercent == nil || evidence.TempFreeInodes == nil {
+		t.Fatalf("observed temp zeros missing: %+v", evidence)
+	}
+	data, err := json.Marshal(evidence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded DiskEvidence
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if decoded.TempFreeBytes == nil || *decoded.TempFreeBytes != 0 || decoded.TempFreePercent == nil || *decoded.TempFreePercent != 0 || decoded.TempFreeInodes == nil || *decoded.TempFreeInodes != 0 {
+		t.Fatalf("observed temp zeros lost after unmarshal: %+v JSON=%s", decoded, data)
+	}
+	if decoded.FailedFreeBytes != nil || decoded.FailedFreePercent != nil || decoded.FailedFreeInodes != nil {
+		t.Fatalf("unobserved additional metrics became present: %+v", decoded)
 	}
 }
 
