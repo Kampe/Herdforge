@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+
+	"github.com/Kampe/Herdforge/pkg/lifecycle"
 )
 
 // ReapClass is the fail-closed classification of a worktree before any
@@ -86,6 +88,10 @@ type ReapPolicy struct {
 	// ActionPolicy is the one explicit policy decision. The zero value is
 	// report-only; destructive action requires exactly "remove".
 	ActionPolicy string
+	// HoldReader and IdentityFor are required for destructive action. The
+	// identity is bound per candidate, never reduced to a lane boolean.
+	HoldReader  lifecycle.HoldReader
+	IdentityFor func(*WorktreeInfo) lifecycle.HoldIdentity
 }
 
 // ReapCandidate is one classified worktree with evidence and preservation guidance.
@@ -552,6 +558,9 @@ func validateDestructivePolicy(policy ReapPolicy) error {
 			return err
 		}
 	}
+	if policy.HoldReader == nil || policy.IdentityFor == nil {
+		return fmt.Errorf("reap action refused: durable hold authority and exact identity resolver are required")
+	}
 	return nil
 }
 
@@ -599,6 +608,40 @@ func (w *WorktreeManager) classifyOne(
 		PolicyDigest: policy.Evidence.PolicyDigest,
 		ActionPolicy: policy.ActionPolicy,
 		Actor:        policy.Evidence.Actor,
+	}
+	if policy.AutoReap {
+		if policy.HoldReader == nil || policy.IdentityFor == nil {
+			c.Class = ReapClassUnknown
+			c.Reason = "durable hold authority or exact identity unavailable"
+			c.PreserveAction = "keep worktree until hold identity is readable"
+			return c
+		}
+		generation := int64(1)
+		identity := policy.IdentityFor(wt)
+		if source, ok := policy.HoldReader.(interface {
+			CurrentGeneration(context.Context, lifecycle.HoldIdentity) (int64, error)
+		}); ok {
+			var genErr error
+			generation, genErr = source.CurrentGeneration(ctx, identity)
+			if genErr != nil {
+				err := genErr
+				c.Class = ReapClassUnknown
+				c.Reason = "hold generation unavailable: " + err.Error()
+				c.PreserveAction = "keep worktree until the hold fence is readable"
+				return c
+			}
+		}
+		decision, err := policy.HoldReader.Check(ctx, identity, generation)
+		if err != nil || decision.Held {
+			c.Class = ReapClassUnknown
+			if err != nil {
+				c.Reason = "hold authority denied reap: " + err.Error()
+			} else {
+				c.Reason = "worktree identity is held"
+			}
+			c.PreserveAction = "preserve worktree until the exact hold is released"
+			return c
+		}
 	}
 
 	// Resolve HEAD if list porcelain omitted it.

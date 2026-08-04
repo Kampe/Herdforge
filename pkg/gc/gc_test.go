@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/Kampe/Herdforge/pkg/worktree"
+	"github.com/Kampe/Herdforge/pkg/lifecycle"
 )
 
 // FAC-178: this test must remain disposable. It intentionally proves that the
@@ -25,6 +26,7 @@ func TestGCManager_GlobalAutoReapIsContained(t *testing.T) {
 	fixtureWorktrees(t, tmpDir)
 	wm := worktree.NewWorktreeManager(tmpDir)
 	gcm := NewGCManager(tmpDir, wm)
+	gcm.HoldReader = gcAllowHolds{}
 
 	report, err := gcm.ScanOverlap(context.Background(), 2)
 	if err != nil || report == nil {
@@ -80,6 +82,12 @@ func TestGCManager_GlobalAutoReapIsContained(t *testing.T) {
 	if err == nil || removals != 0 {
 		t.Fatalf("ambient-dot guard failed: err=%v removal calls=%d", err, removals)
 	}
+}
+
+type gcAllowHolds struct{}
+
+func (gcAllowHolds) Check(context.Context, lifecycle.HoldIdentity, int64) (lifecycle.HoldDecision, error) {
+	return lifecycle.HoldDecision{Generation: 1}, nil
 }
 
 func fixtureWorktrees(t *testing.T, root string) {

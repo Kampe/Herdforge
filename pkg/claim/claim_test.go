@@ -9,6 +9,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/Kampe/Herdforge/pkg/lifecycle"
 )
 
 func testKey(taskRef string) LeaseKey {
@@ -24,6 +26,42 @@ func newTestStore(t *testing.T) *SQLiteLeaseStore {
 	}
 	t.Cleanup(func() { store.Close() })
 	return store
+}
+
+type heldClaimAuthority struct{}
+
+func (heldClaimAuthority) Check(context.Context, lifecycle.HoldIdentity, int64) (lifecycle.HoldDecision, error) {
+	return lifecycle.HoldDecision{Held: true, Generation: 1, Reason: "maintenance", Code: "operator_hold"}, nil
+}
+
+type recordingClaimAuthority struct{ got lifecycle.HoldIdentity }
+
+func (a *recordingClaimAuthority) Check(_ context.Context, id lifecycle.HoldIdentity, _ int64) (lifecycle.HoldDecision, error) {
+	a.got = id
+	return lifecycle.HoldDecision{}, nil
+}
+
+func TestClaimUsesCanonicalTargetBeforeRandomLeaseOwner(t *testing.T) {
+	a := &recordingClaimAuthority{}
+	mgr := NewClaimManager(newTestStore(t), WithHoldReader(a))
+	_, err := mgr.Claim(context.Background(), ClaimRequest{
+		Key: testKey("FAC-TARGET"), OwnerID: "random-lease-owner", Role: "herd-smith", TaskRole: "herd-smith",
+		HoldIdentity: lifecycle.HoldIdentity{Repository: "Herdforge", Owner: "herd-smith", Lane: "herd-smith", Task: "FAC-TARGET", Scope: "task"},
+	})
+	if err != nil { t.Fatal(err) }
+	if a.got.Owner == "random-lease-owner" || a.got.Task != "FAC-TARGET" { t.Fatalf("authority saw lease owner or wrong target: %+v", a.got) }
+}
+
+func TestClaimHeldAuthorityDeniesBeforeReserve(t *testing.T) {
+	cap := newCountingCapacity()
+	mgr := NewClaimManager(newTestStore(t), WithCapacityCoordinator(cap), WithHoldReader(heldClaimAuthority{}))
+	_, err := mgr.Claim(context.Background(), ClaimRequest{Key: testKey("FAC-HOLD"), OwnerID: "w1", Role: "herd-smith", TaskRole: "herd-smith", HoldIdentity: lifecycle.HoldIdentity{Repository: "Herdforge", Owner: "herd-smith", Lane: "herd-smith", Task: "FAC-HOLD", Scope: "task"}})
+	if err == nil {
+		t.Fatal("held claim must be denied")
+	}
+	if reserves, _ := cap.counts("herd-smith"); reserves != 0 {
+		t.Fatalf("held claim reached capacity reserve: %d", reserves)
+	}
 }
 
 // clock is a mutex-guarded fake clock so tests can move time forward
@@ -385,6 +423,10 @@ func TestClaimManager_OperatorHold_PreventsExpiry(t *testing.T) {
 	}
 	if !claimed {
 		t.Fatal("expected held lease to survive past TTL")
+	}
+	active, err := mgr.ActiveClaims(ctx)
+	if err != nil || len(active) != 1 || !active[0].Held {
+		t.Fatalf("held lease must remain occupied capacity: active=%+v err=%v", active, err)
 	}
 
 	expired, err := mgr.ExpireStale(ctx)

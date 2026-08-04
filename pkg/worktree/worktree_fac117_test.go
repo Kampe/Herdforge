@@ -342,6 +342,7 @@ func admissibleReapPolicy(t *testing.T, wm *WorktreeManager, target string, acti
 		},
 		ReceiptSink:  func(ReapReceipt) error { return nil },
 		ActionPolicy: "remove",
+		HoldReader:   unheldHoldReader{}, IdentityFor: reapHoldIdentity,
 	}
 }
 

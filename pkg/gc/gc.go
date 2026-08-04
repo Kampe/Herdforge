@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"strings"
 
+	"github.com/Kampe/Herdforge/pkg/lifecycle"
 	"github.com/Kampe/Herdforge/pkg/worktree"
 )
 
@@ -17,8 +18,9 @@ type OverlapReport struct {
 }
 
 type GCManager struct {
-	RepoRoot string
-	WM       *worktree.WorktreeManager
+	RepoRoot   string
+	WM         *worktree.WorktreeManager
+	HoldReader lifecycle.HoldReader
 }
 
 func NewGCManager(repoRoot string, wm *worktree.WorktreeManager) *GCManager {
@@ -69,6 +71,9 @@ func (g *GCManager) PruneStaleWorktrees(ctx context.Context) (int, error) {
 	// worktree from the caller's repository.
 	if g == nil || g.WM == nil {
 		return 0, fmt.Errorf("gc: worktree manager is required")
+	}
+	if g.HoldReader == nil {
+		return 0, fmt.Errorf("gc: durable hold authority is required")
 	}
 	return 0, fmt.Errorf("gc: %w; exact targets and action evidence are required", errGlobalAutoReapDisabled)
 }

@@ -1,11 +1,14 @@
 package kick
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 	"testing"
+
+	"github.com/Kampe/Herdforge/pkg/lifecycle"
 )
 
 // overrideRoster pins the roster for a test, restoring derivation on cleanup.
@@ -250,63 +253,17 @@ func TestLookupAgent_LabelFallback(t *testing.T) {
 	}
 }
 
-func TestLaneHeld_NotHeld(t *testing.T) {
-	// Use a temp dir that definitely has no hold file.
-	dir := t.TempDir()
-	t.Setenv("HERD_HOLD_DIR", dir)
-
-	reason, held := LaneHeld("forge-worker")
-	if held {
-		t.Fatalf("lane should not be held, got reason: %s", reason)
-	}
-}
-
-func TestLaneHeld_Held(t *testing.T) {
-	dir := t.TempDir()
-	t.Setenv("HERD_HOLD_DIR", dir)
-
-	holdPath := filepath.Join(dir, "forge-worker")
-	if err := os.WriteFile(holdPath, []byte("test hold reason\n"), 0644); err != nil {
-		t.Fatal(err)
-	}
-
-	reason, held := LaneHeld("forge-worker")
-	if !held {
-		t.Fatal("lane should be held")
-	}
-	if reason != "test hold reason" {
-		t.Fatalf("expected 'test hold reason', got %q", reason)
-	}
-}
-
-func TestLaneHeld_EmptyReason(t *testing.T) {
-	dir := t.TempDir()
-	t.Setenv("HERD_HOLD_DIR", dir)
-
-	holdPath := filepath.Join(dir, "forge-worker")
-	if err := os.WriteFile(holdPath, []byte(""), 0644); err != nil {
-		t.Fatal(err)
-	}
-
-	reason, held := LaneHeld("forge-worker")
-	if !held {
-		t.Fatal("lane should be held")
-	}
-	if !strings.Contains(reason, "held by coordinator") {
-		t.Fatalf("expected default reason, got %q", reason)
-	}
-}
-
 func TestRun_DryRun(t *testing.T) {
 	// Use a guaranteed-absent agent name so the dry-run path is exercised
 	// deterministically regardless of the live herdr fleet.
-	t.Setenv("HERD_HOLD_DIR", t.TempDir())
 	newRepoFixture(t, testRegistry, "")
 	result, err := Run(Options{
 		Names:        []string{"forge-no-such-lane"},
 		DryRun:       true,
 		Quiet:        true,
 		RaiseMissing: false,
+		HoldReader:   allowAllHolds{}, Identity: testIdentity,
+		ActiveTasks: testActiveTasks,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -328,17 +285,83 @@ func TestRun_DryRun(t *testing.T) {
 	}
 }
 
+type heldHolds struct{}
+
+func (heldHolds) Check(context.Context, lifecycle.HoldIdentity, int64) (lifecycle.HoldDecision, error) {
+	return lifecycle.HoldDecision{Held: true, Generation: 1, Reason: "maintenance", Code: "operator_hold"}, nil
+}
+
+func TestRun_HeldAuthorityStopsBeforeAgentRead(t *testing.T) {
+	result, err := Run(Options{
+		Names: []string{"forge-held"}, Quiet: true, RaiseMissing: true,
+		HoldReader: heldHolds{}, Identity: testIdentity,
+		ActiveTasks: testActiveTasks,
+	})
+	if err != nil || result == nil || result.Skipped != 1 || !strings.Contains(result.Entries[0].Reason, "held") {
+		t.Fatalf("held kick result=%v err=%v", result, err)
+	}
+}
+
+type selectiveHolds struct{}
+
+func (selectiveHolds) Check(_ context.Context, id lifecycle.HoldIdentity, _ int64) (lifecycle.HoldDecision, error) {
+	if id.Lane == "forge-held" {
+		return lifecycle.HoldDecision{Held: true, Reason: "maintenance", Code: "operator_hold"}, nil
+	}
+	return lifecycle.HoldDecision{}, nil
+}
+
+func TestRun_HeldLaneDoesNotFreezeUnheldLane(t *testing.T) {
+	result, err := Run(Options{Names: []string{"forge-held", "forge-free"}, DryRun: true, Quiet: true, RaiseMissing: false, HoldReader: selectiveHolds{}, Identity: testIdentity, ActiveTasks: testActiveTasks})
+	if err != nil || result == nil || result.Skipped != 1 || result.Kicked != 1 {
+		t.Fatalf("selective kick result=%+v err=%v", result, err)
+	}
+}
+
+type generationFenceReader struct {
+	got []struct {
+		id  lifecycle.HoldIdentity
+		gen int64
+	}
+}
+
+func (r *generationFenceReader) Check(_ context.Context, id lifecycle.HoldIdentity, gen int64) (lifecycle.HoldDecision, error) {
+	r.got = append(r.got, struct {
+		id  lifecycle.HoldIdentity
+		gen int64
+	}{id, gen})
+	return lifecycle.HoldDecision{}, nil
+}
+func TestRunUsesGenerationForExactLaneAndTaskIdentity(t *testing.T) {
+	r := &generationFenceReader{}
+	genFn := func(_ context.Context, id lifecycle.HoldIdentity) (int64, error) {
+		if id.Scope == "lane" {
+			return 1, nil
+		}
+		return 4, nil
+	}
+	_, runErr := Run(Options{Names: []string{"forge-fenced"}, DryRun: true, Quiet: true, HoldReader: r, Identity: func(string) lifecycle.HoldIdentity {
+		return lifecycle.HoldIdentity{Repository: "repo", Owner: "role", Lane: "lane", Scope: "lane"}
+	}, ActiveTasks: func(context.Context, string) ([]lifecycle.HoldIdentity, error) {
+		return []lifecycle.HoldIdentity{{Repository: "repo", Owner: "role", Lane: "lane", Task: "FAC-4", Scope: "task"}}, nil
+	}, Generation: genFn})
+	if runErr != nil || len(r.got) != 2 || r.got[0].gen != 1 || r.got[1].gen != 4 {
+		t.Fatalf("err=%v checks=%+v", runErr, r.got)
+	}
+}
+
 func TestRun_ForceOverridesStatus(t *testing.T) {
 	// The target is guaranteed absent, so the missing-agent path runs. With
 	// Force=true the agent would be kicked regardless of status; assert the
 	// dry-run still reports a kick and never panics.
-	t.Setenv("HERD_HOLD_DIR", t.TempDir())
 	result, err := Run(Options{
 		Names:        []string{"forge-no-such-lane"},
 		Force:        true,
 		DryRun:       true,
 		Quiet:        true,
 		RaiseMissing: false,
+		HoldReader:   allowAllHolds{}, Identity: testIdentity,
+		ActiveTasks: testActiveTasks,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -352,13 +375,14 @@ func TestRun_ForceOverridesStatus(t *testing.T) {
 
 func TestRun_EmptyQuiet(t *testing.T) {
 	newRepoFixture(t, testRegistry, "")
-	t.Setenv("HERD_HOLD_DIR", t.TempDir())
 	// With Quiet=false and DryRun=true, we should see output but no error.
 	result, err := Run(Options{
 		Names:        []string{"forge-no-such-lane"},
 		DryRun:       true,
 		Quiet:        false,
 		RaiseMissing: false,
+		HoldReader:   allowAllHolds{}, Identity: testIdentity,
+		ActiveTasks: testActiveTasks,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -397,4 +421,18 @@ func equalStrings(a, b []string) bool {
 		}
 	}
 	return true
+}
+
+type allowAllHolds struct{}
+
+func (allowAllHolds) Check(context.Context, lifecycle.HoldIdentity, int64) (lifecycle.HoldDecision, error) {
+	return lifecycle.HoldDecision{Generation: 1}, nil
+}
+
+func testIdentity(name string) lifecycle.HoldIdentity {
+	return lifecycle.HoldIdentity{Repository: "repo", Owner: name, Lane: name, Scope: "lane"}
+}
+
+func testActiveTasks(_ context.Context, lane string) ([]lifecycle.HoldIdentity, error) {
+	return []lifecycle.HoldIdentity{{Repository: "repo", Owner: lane, Lane: lane, Task: lane + "-task", Scope: "task"}}, nil
 }

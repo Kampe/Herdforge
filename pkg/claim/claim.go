@@ -39,6 +39,8 @@ import (
 	"fmt"
 	"os"
 	"time"
+
+	"github.com/Kampe/Herdforge/pkg/lifecycle"
 )
 
 // ErrUnlabeledTask is returned when a task carries no matching role label;
@@ -123,6 +125,7 @@ type ClaimManager struct {
 	// AcquireProviderLock is honored before a different settler may
 	// preempt it (crash recovery for a provider call that never returned).
 	providerLockTimeout time.Duration
+	holdReader          lifecycle.HoldReader
 }
 
 // Option configures a ClaimManager.
@@ -169,6 +172,9 @@ func WithProviderLockTimeout(d time.Duration) Option {
 	return func(m *ClaimManager) { m.providerLockTimeout = d }
 }
 
+// WithHoldReader injects the canonical durable hold authority.
+func WithHoldReader(r lifecycle.HoldReader) Option { return func(m *ClaimManager) { m.holdReader = r } }
+
 // NewClaimManager builds a ClaimManager over store. store's lifetime is
 // owned by the caller (Close it when the manager is no longer needed).
 func NewClaimManager(store LeaseStore, opts ...Option) *ClaimManager {
@@ -190,6 +196,10 @@ type ClaimRequest struct {
 	Role         string // the claiming worker's role
 	TaskRole     string // the role label read off the task by the caller; "" means unlabeled
 	WorktreePath string
+	// HoldIdentity is resolved before OwnerID is generated. OwnerID is a
+	// lease provenance token and must never be used as hold authority identity.
+	HoldIdentity   lifecycle.HoldIdentity
+	HoldIdentities []lifecycle.HoldIdentity
 }
 
 // Claim attempts to atomically acquire a lease. Role enforcement is exact:
@@ -213,6 +223,37 @@ func (m *ClaimManager) Claim(ctx context.Context, req ClaimRequest) (*Lease, err
 	}
 	if req.Role == "" || req.Role != req.TaskRole {
 		return nil, ErrRoleMismatch
+	}
+	if m.holdReader != nil {
+		identities := req.HoldIdentities
+		if len(identities) == 0 && identityValid(req.HoldIdentity) {
+			identities = []lifecycle.HoldIdentity{req.HoldIdentity}
+		}
+		if len(identities) == 0 {
+			return nil, fmt.Errorf("claim: canonical hold identity is required before lease owner allocation")
+		}
+		for _, identity := range identities {
+			if !identityValid(identity) {
+				return nil, fmt.Errorf("claim: ambiguous canonical hold identity")
+			}
+			generation := int64(1)
+			if source, ok := m.holdReader.(interface {
+				CurrentGeneration(context.Context, lifecycle.HoldIdentity) (int64, error)
+			}); ok {
+				var err error
+				generation, err = source.CurrentGeneration(ctx, identity)
+				if err != nil {
+					return nil, fmt.Errorf("claim: hold generation: %w", err)
+				}
+			}
+			decision, err := m.holdReader.Check(ctx, identity, generation)
+			if err != nil {
+				return nil, fmt.Errorf("claim: hold authority: %w", err)
+			}
+			if decision.Held {
+				return nil, fmt.Errorf("claim: held identity denied: %s (%s)", decision.Reason, decision.Code)
+			}
+		}
 	}
 
 	// If the current lease for this key is being kept alive only by a
@@ -269,6 +310,16 @@ func (m *ClaimManager) Claim(ctx context.Context, req ClaimRequest) (*Lease, err
 		Kind:           "lease_claimed",
 	})
 	return lease, nil
+}
+
+func identityValid(identity lifecycle.HoldIdentity) bool {
+	if identity.Repository == "" || identity.Owner == "" || identity.Lane == "" {
+		return false
+	}
+	if identity.Scope == "lane" {
+		return identity.Task == ""
+	}
+	return identity.Scope == "task" && identity.Task != ""
 }
 
 // Renew extends an active lease's expiry, fenced by generation. Renewing

@@ -22,12 +22,14 @@
 package attention
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"sort"
 	"strings"
 
 	"github.com/Kampe/Herdforge/pkg/kick"
+	"github.com/Kampe/Herdforge/pkg/lifecycle"
 )
 
 // AttentionLevel ranks how urgently a lane needs coordinator eyes.
@@ -62,10 +64,10 @@ type Item struct {
 
 // Result is the full attention triage.
 type Result struct {
-	Items   []Item               `json:"items"`
+	Items   []Item                 `json:"items"`
 	Counts  map[AttentionLevel]int `json:"counts"`
-	Total   int                  `json:"total"`
-	Needing int                  `json:"needing"`
+	Total   int                    `json:"total"`
+	Needing int                    `json:"needing"`
 }
 
 // urgencyRank maps a level to a numeric urgency (higher = more urgent).
@@ -323,11 +325,33 @@ func Selftest() error {
 // failure it returns an error (fail-closed); the caller decides whether to
 // proceed with an empty agent list.
 func Run() (*Result, error) {
+	return nil, fmt.Errorf("herd-attention: durable hold authority is required")
+}
+
+func RunWithHoldReader(reader lifecycle.HoldReader, repository string) (*Result, error) {
+	return RunWithHoldReaderAndTasks(reader, repository, nil)
+}
+
+func RunWithHoldReaderAndTasks(reader lifecycle.HoldReader, repository string, resolver lifecycle.ActiveTaskResolver) (*Result, error) {
+	if reader == nil || strings.TrimSpace(repository) == "" {
+		return nil, fmt.Errorf("herd-attention: durable hold authority and repository identity are required")
+	}
 	agents, err := kick.FetchAgentList()
 	if err != nil {
 		return nil, fmt.Errorf("herd-attention: %w", err)
 	}
-	r := Triage(agents, kick.StandingIDs(), kick.LaneHeld, kick.ProviderDeathCheck)
+	check := func(name string) (string, bool) {
+		if resolver == nil {
+			return "active task binding unknown", true
+		}
+		identity := lifecycle.HoldIdentity{Repository: repository, Owner: name, Lane: name, Scope: "lane"}
+		_ = identity
+		if err := lifecycle.CheckLaneAndTaskHold(context.Background(), reader, resolver, repository, name, name, nil); err != nil {
+			return err.Error(), true
+		}
+		return "", false
+	}
+	r := Triage(agents, kick.StandingIDs(), check, kick.ProviderDeathCheck)
 	return &r, nil
 }
 
