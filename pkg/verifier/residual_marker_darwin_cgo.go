@@ -59,6 +59,13 @@ static int marker_vanished(int result, int saved_errno) {
 	return result <= 0 && (saved_errno == ESRCH || saved_errno == EIO);
 }
 
+// marker_stage_vanished is deliberately narrower than marker_vanished:
+// proc_pidfdinfo may report EBADF when an FD from a prior inventory closes,
+// but EBADF at any other inspection stage remains a hard failure.
+static int marker_stage_vanished(int stage, int result, int saved_errno) {
+	return stage == MARKER_STAGE_VNODE && result <= 0 && saved_errno == EBADF;
+}
+
 static int marker_clock_failure_for_test(int saved_errno) {
 	return marker_errno_or_eio(saved_errno);
 }
@@ -313,7 +320,9 @@ static int marker_holders(const char *path, int64_t budget_ns,
 			int vnode_bytes = proc_pidfdinfo(pid, fds[j].proc_fd,
 				PROC_PIDFDVNODEPATHINFO, &vnode, (int)sizeof(vnode));
 			int vnode_errno = errno;
-			if (vnode_bytes != (int)sizeof(vnode) && marker_vanished(vnode_bytes, vnode_errno)) {
+			if (vnode_bytes != (int)sizeof(vnode) &&
+				(marker_vanished(vnode_bytes, vnode_errno) ||
+				 marker_stage_vanished(MARKER_STAGE_VNODE, vnode_bytes, vnode_errno))) {
 				continue;
 			}
 			if (vnode_bytes != (int)sizeof(vnode)) {
@@ -428,6 +437,10 @@ func libprocStage(stage C.int) string {
 // tests without touching host process state.
 func libprocVanishedForTest(result int, errno syscall.Errno) bool {
 	return C.marker_vanished(C.int(result), C.int(errno)) != 0
+}
+
+func libprocStageVanishedForTest(stage, result int, errno syscall.Errno) bool {
+	return C.marker_stage_vanished(C.int(stage), C.int(result), C.int(errno)) != 0
 }
 
 func libprocErrnoOrEIOForTest(errno syscall.Errno) syscall.Errno {

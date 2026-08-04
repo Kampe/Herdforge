@@ -63,6 +63,37 @@ func TestCompiledLibprocVanishedClassificationIsFailClosed(t *testing.T) {
 	}
 }
 
+func TestCompiledLibprocVnodeEBADFOnlySkipsIndividualClosedFD(t *testing.T) {
+	if libprocVanishedForTest(-1, syscall.EBADF) {
+		t.Fatal("generic libproc vanished classification must remain fail-closed for EBADF")
+	}
+
+	tests := []struct {
+		name   string
+		stage  int
+		result int
+		errno  syscall.Errno
+		want   bool
+	}{
+		{name: "vnode negative EBADF", stage: 6, result: -1, errno: syscall.EBADF, want: true},
+		{name: "vnode zero EBADF", stage: 6, result: 0, errno: syscall.EBADF, want: true},
+		{name: "vnode malformed positive EBADF", stage: 6, result: 1, errno: syscall.EBADF},
+		{name: "vnode negative EPERM", stage: 6, result: -1, errno: syscall.EPERM},
+		{name: "vnode negative EACCES", stage: 6, result: -1, errno: syscall.EACCES},
+		{name: "identity negative EBADF", stage: 4, result: -1, errno: syscall.EBADF},
+		{name: "fd list negative EBADF", stage: 5, result: -1, errno: syscall.EBADF},
+		{name: "stat negative EBADF", stage: 1, result: -1, errno: syscall.EBADF},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := libprocStageVanishedForTest(tc.stage, tc.result, tc.errno); got != tc.want {
+				t.Fatalf("stage vanished=%v, want %v (stage=%d result=%d errno=%v)",
+					got, tc.want, tc.stage, tc.result, tc.errno)
+			}
+		})
+	}
+}
+
 func TestCompiledLibprocCapacityAndIdentityDecisions(t *testing.T) {
 	if got := libprocErrnoOrEIOForTest(0); got != syscall.EIO {
 		t.Fatalf("errno-zero native failure must become EIO: %v", got)
