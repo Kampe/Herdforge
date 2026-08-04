@@ -42,7 +42,8 @@ var transitions = map[State][]State{
 	// durable evidence supports.
 	StateRecovering: {
 		StateEligible, StateClaimed, StateDispatched, StateBuilding,
-		StateVerifying, StateReviewing, StateIntegrationQueued, StateBlocked,
+		StateVerifying, StateReviewing, StateIntegrationQueued, StateIntegrated,
+		StateReconciled, StateBlocked,
 	},
 	// Blocked can be lifted back to Recovering (retry), reset to Eligible
 	// (operator override), or abandoned via Cleaned.
