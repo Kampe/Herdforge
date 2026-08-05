@@ -15,7 +15,7 @@ import (
 	"github.com/santhosh-tekuri/jsonschema/v6"
 )
 
-const fixtureRoot = "../../contracts/agentscope/v1alpha1"
+const fixtureRoot = "v1alpha1"
 
 func goldenScope(t *testing.T, name string) AgentScope {
 	t.Helper()
