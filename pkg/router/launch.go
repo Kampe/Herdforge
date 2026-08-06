@@ -133,6 +133,19 @@ type LaunchDecision struct {
 
 const decisionProofDomain = "herdforge-fac-175-launch-decision-v1"
 
+// The single approved worker/forge-smith/recovery launch tuple. This was
+// previously spelled as codex/gpt-5.6-luna/medium literals in three places
+// (two here, one in cmd/herd), which pinned the whole builder fleet to one
+// vendor and made every other routed pick fail as drift. Keep it equal to
+// what the live router picks for WorkerShape.
+// ponytail: still a compile-time pin — derive from fleet config/router.
+const (
+	WorkerProvider = "grok"
+	WorkerModel    = "grok-4.5"
+	WorkerEffort   = "high"
+	WorkerShape    = "implementation"
+)
+
 var ErrWorkerPolicy = errors.New("launch.policy.worker_tuple_mismatch")
 var ErrRolePolicy = errors.New("launch.policy.unknown_role")
 
@@ -347,8 +360,8 @@ func EffortForRequest(req LaunchRequest) string {
 	case RoleReviewer, RoleAssayer:
 		return reviewerEffort(req)
 	case RoleWorker, RoleForgeSmith, RoleRecovery:
-		if req.Shape == "" || req.Shape == "implementation" {
-			return "medium"
+		if req.Shape == "" || req.Shape == WorkerShape {
+			return WorkerEffort
 		}
 		return EffortFor(req.Shape)
 	default:
@@ -503,8 +516,8 @@ func (r *SurfaceRouter) Decide(req LaunchRequest) (*LaunchDecision, error) {
 		return nil, fmt.Errorf("%w: %s", ErrRolePolicy, req.Role)
 	}
 	if req.Role == RoleWorker || req.Role == RoleForgeSmith || req.Role == RoleRecovery {
-		if req.Shape != "implementation" || req.RequestedProvider != "codex" || req.RequestedModel != "gpt-5.6-luna" || req.RequestedEffort != "medium" {
-			return nil, fmt.Errorf("%w: worker/forge-smith/recovery requires codex/gpt-5.6-luna/medium implementation", ErrWorkerPolicy)
+		if req.Shape != WorkerShape || req.RequestedProvider != WorkerProvider || req.RequestedModel != WorkerModel || req.RequestedEffort != WorkerEffort {
+			return nil, fmt.Errorf("%w: worker/forge-smith/recovery requires %s/%s/%s %s", ErrWorkerPolicy, WorkerProvider, WorkerModel, WorkerEffort, WorkerShape)
 		}
 	}
 
@@ -732,8 +745,8 @@ func (r *SurfaceRouter) Decide(req LaunchRequest) (*LaunchDecision, error) {
 		}
 	}
 	if req.Role == RoleWorker || req.Role == RoleForgeSmith || req.Role == RoleRecovery {
-		if best.provider != "codex" || model != "gpt-5.6-luna" || effort != "medium" || shape != "implementation" {
-			return nil, fmt.Errorf("%w: worker/forge-smith/recovery final tuple must remain codex/gpt-5.6-luna/medium implementation", ErrWorkerPolicy)
+		if best.provider != WorkerProvider || model != WorkerModel || effort != WorkerEffort || shape != WorkerShape {
+			return nil, fmt.Errorf("%w: worker/forge-smith/recovery final tuple must remain %s/%s/%s %s", ErrWorkerPolicy, WorkerProvider, WorkerModel, WorkerEffort, WorkerShape)
 		}
 	}
 	// Final coherence re-check (mutation-safe).

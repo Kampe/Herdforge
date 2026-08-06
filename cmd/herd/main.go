@@ -2128,7 +2128,18 @@ func configureProductionControl(d *dispatch.Dispatcher, root string) (func() err
 		orders := &control.CoordinatorOrders{Identity: scope.Identity, Delivery: &control.Delivery{Outbox: controlStore, Sender: controlMailbox, Waker: control.HerdrWaker{Target: scope.Wake, Validate: validate}, Authority: control.FencedAuthority{Identity: scope.Identity, Check: scope.Check}, Evidence: control.MailboxEvidenceReader{Mailbox: controlMailbox}, Owner: owner}}
 		return orders, nil
 	}
-	return controlStore.Close, nil
+	// Production dispatch fails closed without a Compensator (FAC-121). Only
+	// test doubles implemented it, so every real dispatch was rejected; wire
+	// the durable FAC-119 outbox here.
+	compensator, err := dispatch.NewOutboxCompensator(filepath.Join(root, ".herd", "dispatch-outbox.db"))
+	if err != nil {
+		controlStore.Close()
+		return nil, err
+	}
+	d.Compensator = compensator
+	return func() error {
+		return errors.Join(compensator.Close(), controlStore.Close())
+	}, nil
 }
 
 func runHarvest() {
