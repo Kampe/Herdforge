@@ -171,10 +171,27 @@ func runHarvestMerge() {
 			return fmt.Errorf("worktree add: %v: %s", addErr, out)
 		}
 		for _, c := range commits {
-			if out, pickErr := exec.Command("git", "-C", dir, "cherry-pick", c).CombinedOutput(); pickErr != nil {
-				exec.Command("git", "-C", dir, "cherry-pick", "--abort").Run()
-				return fmt.Errorf("cherry-pick %s conflicted, aborting before any PR:\n%s", c[:min(9, len(c))], out)
+			out, pickErr := exec.Command("git", "-C", dir, "cherry-pick", c).CombinedOutput()
+			if pickErr == nil {
+				continue
 			}
+			// A commit whose content is already upstream applies to nothing and
+			// cherry-pick stops with "nothing to commit". That is NOT a
+			// conflict — the fleet opens every worktree with a reap-safe anchor
+			// commit (FAC-106) that is frequently redundant, so aborting here
+			// made every fleet branch unharvestable. Distinguish by asking git
+			// whether the tree is actually clean rather than by matching text.
+			status, _ := exec.Command("git", "-C", dir, "status", "--porcelain").Output()
+			if len(strings.TrimSpace(string(status))) == 0 {
+				if skipOut, skipErr := exec.Command("git", "-C", dir, "cherry-pick", "--skip").CombinedOutput(); skipErr != nil {
+					exec.Command("git", "-C", dir, "cherry-pick", "--abort").Run()
+					return fmt.Errorf("redundant commit %s could not be skipped:\n%s", c[:min(9, len(c))], skipOut)
+				}
+				fmt.Fprintf(os.Stderr, "herd harvest-merge: skipped %s (already upstream, no content to apply)\n", c[:min(9, len(c))])
+				continue
+			}
+			exec.Command("git", "-C", dir, "cherry-pick", "--abort").Run()
+			return fmt.Errorf("cherry-pick %s conflicted, aborting before any PR:\n%s", c[:min(9, len(c))], out)
 		}
 		// Hard stage gate: a marker in the harvested ADDED lines means the pick
 		// produced a structurally broken diff, and once it is in a PR body
