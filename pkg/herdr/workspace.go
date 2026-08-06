@@ -85,9 +85,8 @@ func ResolveWorkspaceWithConfig(repoRoot string, cfg *config.Config) string {
 // Config fleet.herdr_workspace is intentionally not consulted here: fail-closed
 // dispatch must not silently adopt a soft config override without env/list proof.
 func RequireWorkspace(repoRoot string) (string, error) {
-	if ws := strings.TrimSpace(os.Getenv("HERD_WORKSPACE")); ws != "" {
-		return ws, nil
-	}
+	envWS := strings.TrimSpace(os.Getenv("HERD_WORKSPACE"))
+
 	abs, err := filepath.Abs(repoRoot)
 	if err != nil {
 		abs = repoRoot
@@ -96,7 +95,32 @@ func RequireWorkspace(repoRoot string) (string, error) {
 
 	entries, err := WorkspaceList()
 	if err != nil {
+		// No live list to check against: an explicit env value is all we have.
+		if envWS != "" {
+			return envWS, nil
+		}
 		return "", fmt.Errorf("herdr workspace resolution failed: %w", err)
+	}
+
+	// An explicit HERD_WORKSPACE wins unconditionally — chainseer
+	// herd_resolve_workspace returns it without checking, and that escape hatch
+	// has to keep working (a workspace can legitimately be named before it
+	// exists). But a STALE export is silent poison: a long-lived shell profile
+	// outliving the workspace it names routes the whole fleet at a dead ID,
+	// every agent list comes back empty, and the fleet reads as idle when it is
+	// really being addressed into the void. Honour it, but say so loudly.
+	if envWS != "" {
+		for _, e := range entries {
+			if e.WorkspaceID == envWS {
+				return envWS, nil
+			}
+		}
+		hint := ""
+		if id, ok := PickWorkspaceStrict(entries, repoName); ok {
+			hint = fmt.Sprintf("; this repo labels to %s", id)
+		}
+		fmt.Fprintf(os.Stderr, "herdr: WARN HERD_WORKSPACE=%s is not in the live workspace list%s — the fleet will look empty (unset the stale export or correct it)\n", envWS, hint)
+		return envWS, nil
 	}
 	id, ok := PickWorkspaceStrict(entries, repoName)
 	if !ok {
