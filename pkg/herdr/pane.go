@@ -32,6 +32,45 @@ func PaneList() ([]PaneEntry, error) {
 	return resp.Result.Panes, nil
 }
 
+// PaneProcessInfo exposes the pane's foreground processes to callers outside
+// this package (stall detection needs the agent's real cwd).
+func PaneProcessInfo(paneID string) ([]PaneProcess, error) { return paneProcesses(paneID) }
+
+// PaneRead returns recent unwrapped pane output. Unwrapped matters for stall
+// detection: reflowed text changes with terminal width, which would make a
+// frozen pane fingerprint differently after a resize.
+func PaneRead(paneID string, lines int) (string, error) {
+	if strings.TrimSpace(paneID) == "" {
+		return "", fmt.Errorf("herdr pane read: pane id is required")
+	}
+	if lines <= 0 {
+		lines = 80
+	}
+	out, err := runHerdr("pane", "read", paneID,
+		"--source", "recent-unwrapped", "--lines", fmt.Sprint(lines))
+	if err != nil {
+		return "", fmt.Errorf("herdr pane read %s: %w", paneID, err)
+	}
+	// The payload may be a JSON envelope or raw text depending on herdr
+	// version; treat an unparseable body as raw rather than failing, since a
+	// missing tail only degrades detection instead of breaking it.
+	var resp struct {
+		Result struct {
+			Text  string   `json:"text"`
+			Lines []string `json:"lines"`
+		} `json:"result"`
+	}
+	if json.Unmarshal([]byte(out), &resp) == nil {
+		if resp.Result.Text != "" {
+			return resp.Result.Text, nil
+		}
+		if len(resp.Result.Lines) > 0 {
+			return strings.Join(resp.Result.Lines, "\n"), nil
+		}
+	}
+	return out, nil
+}
+
 // PaneClose closes one pane. Callers must have already established that the
 // pane holds no agent: this does not re-check.
 func PaneClose(paneID string) error {
