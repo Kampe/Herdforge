@@ -24,7 +24,7 @@ var shaRe = regexp.MustCompile(`^[0-9a-f]{40}$`)
 // unrecognised key is surfaced rather than ignored: a misspelled
 // `reviewed-head` silently disables the wandering-reviewer gate, which is
 // exactly how that gate came to be dead code in the first place.
-var unknownHeaderRe = regexp.MustCompile(`^[a-z][a-z0-9-]*$`)
+var unknownHeaderRe = regexp.MustCompile(`^[a-z][a-z0-9._-]*$`)
 
 // Artifact is a parsed reviewer verdict.
 type Artifact struct {
@@ -40,9 +40,16 @@ type Artifact struct {
 	// state a mismatch or lie outright.
 	ReadHead string
 	Body     string
-	// UnknownHeaders are front-matter keys we did not recognise. Surfaced so a
-	// misspelled gate key cannot silently disable the gate.
+	// UnknownHeaders are front-matter keys we did not recognise. Validate
+	// REFUSES on these — a write-only field would surface nothing, which is how
+	// a misspelled gate key stayed silent in the first place.
 	UnknownHeaders []string
+	// MalformedHeaderRegion records that a non-header line appeared before the
+	// `---` separator.
+	MalformedHeaderRegion bool
+	// ConflictingHeaders are keys that appeared more than once with DIFFERENT
+	// values. Ambiguous provenance is refused, never resolved by position.
+	ConflictingHeaders []string
 }
 
 // Parse reads a front-matter artifact: `key: value` lines, then `---`, then a
@@ -52,7 +59,7 @@ func Parse(text string) Artifact {
 	sc := bufio.NewScanner(strings.NewReader(text))
 	sc.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
 	inBody := false
-	seen := map[string]bool{}
+	seen := map[string]string{}
 	var body strings.Builder
 
 	for sc.Scan() {
@@ -62,19 +69,40 @@ func Parse(text string) Artifact {
 				inBody = true
 				continue
 			}
+			if strings.TrimSpace(line) == "" {
+				continue
+			}
 			key, value, ok := strings.Cut(line, ":")
-			if !ok {
+			// The header region is the LEADING block only. Any prose line
+			// before the real headers used to claim a slot permanently under
+			// first-wins, letting an attacker shadow `reviewer`,
+			// `reviewer-family` or `reviewed-head` with a sentence and have
+			// the honest header below it discarded. A non-header line ends the
+			// region; everything after it is body.
+			if !ok || !unknownHeaderRe.MatchString(strings.ToLower(strings.TrimSpace(key))) {
+				a.MalformedHeaderRegion = true
+				inBody = true
+				body.WriteString(line)
+				body.WriteString("\n")
 				continue
 			}
 			value = strings.TrimSpace(value)
 			name := strings.ToLower(strings.TrimSpace(key))
-			// FIRST wins, matching the reference's `hdr() | head -1`. Last-wins
-			// is the unsafe direction: an artifact with `verdict: FAIL` followed
-			// by `verdict: PASS` would be admitted as PASS.
-			if seen[name] {
+			// Neither first-wins nor last-wins is safe. Last-wins admits
+			// `verdict: FAIL` followed by `verdict: PASS`. First-wins is worse:
+			// a prose line like "Reviewer: see the lane assignment below"
+			// lowercases to a REAL key and permanently shadows the honest
+			// `reviewer:` beneath it, defeating the coordinator, reviewed-head
+			// and family gates at once. A key that appears twice with different
+			// values is ambiguous, and an ambiguous correctness gate must
+			// refuse rather than pick.
+			if prior, dup := seen[name]; dup {
+				if prior != value {
+					a.ConflictingHeaders = append(a.ConflictingHeaders, name)
+				}
 				continue
 			}
-			seen[name] = true
+			seen[name] = value
 			switch name {
 			case "sha":
 				a.SHA = value
@@ -154,6 +182,24 @@ func (a Artifact) Validate(coordinators map[string]struct{}, commitExists func(s
 		return fmt.Errorf("reviewer states it read %s but the verdict claims to be about %s; "+
 			"a verdict from a different tree is not a verdict about this commit",
 			shortSHA(a.ReadHead), shortSHA(a.SHA))
+	}
+
+	// An unrecognised header is refused, not logged. A misspelled `reviewed-head`
+	// silently disables the wandering-reviewer gate, and a field nothing reads
+	// surfaces nothing at all.
+	if len(a.UnknownHeaders) > 0 {
+		return fmt.Errorf("unrecognised front-matter key(s): %s; "+
+			"a misspelled gate key silently disables its gate, so this is refused rather than ignored",
+			strings.Join(a.UnknownHeaders, ", "))
+	}
+	if len(a.ConflictingHeaders) > 0 {
+		return fmt.Errorf("front-matter key(s) %s appear more than once with different values; "+
+			"ambiguous provenance is refused rather than resolved by position",
+			strings.Join(a.ConflictingHeaders, ", "))
+	}
+	if a.MalformedHeaderRegion {
+		return fmt.Errorf("front matter must be the leading block ending in ---; " +
+			"a prose line before the headers can shadow a real one")
 	}
 
 	// A PASS with no evidence is the failure mode this whole gate exists for.

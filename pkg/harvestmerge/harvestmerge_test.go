@@ -53,13 +53,20 @@ func TestUnrelatedMarkersInContextDoNotBlock(t *testing.T) {
 // and a half-resolved conflict where the head/tail markers were stripped but
 // the separator survived is a real and common shape.
 func TestBareSeparatorIsAConflictMarker(t *testing.T) {
-	if found := ConflictMarkers("+Heading\n+=======\n"); len(found) != 1 {
+	if found := ConflictMarkers("+ours\n+=======\n"); len(found) != 1 {
 		t.Fatalf("a bare ======= separator must be caught, got %v", found)
 	}
-	// A markdown setext underline is sized to its heading, so a longer run is
-	// documentation rather than a separator.
-	if found := ConflictMarkers("+Heading\n+===========\n"); len(found) != 0 {
-		t.Fatalf("a longer underline is documentation, got %v", found)
+	// conflict-marker-size=8 emits an 8-char separator; exact-7 missed it.
+	if found := ConflictMarkers("+ours\n+========\n"); len(found) != 1 {
+		t.Fatalf("an 8-char separator must be caught, got %v", found)
+	}
+}
+
+// CRLF must not defeat the separator: "=======\r" does not match an unanchored
+// `$`, so line endings alone used to slip a half-resolved conflict through.
+func TestCRLFDoesNotDefeatTheSeparator(t *testing.T) {
+	if found := ConflictMarkers("+ours\r\n+=======\r\n"); len(found) != 1 {
+		t.Fatalf("a CRLF separator must be caught, got %v", found)
 	}
 }
 

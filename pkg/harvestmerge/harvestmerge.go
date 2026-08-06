@@ -33,18 +33,22 @@ func MergeAllowed(v Verdict) bool { return v == PASS }
 
 // conflictMarkerRe matches git conflict markers at line start.
 //
-// Mirrors the reference `^\+(<{7}|>{7}|={7}$)`. Two earlier mistakes are fixed
-// here: `={7}$` was dropped on the theory that flagging it would catch markdown
-// underlines — but the reference already solved that by anchoring the separator
-// to end-of-line, so a `=======` heading rule with trailing content is fine
-// while a bare separator is caught. And the old exact-7 quantifier missed
-// longer markers, which git emits under `.gitattributes conflict-marker-size=8`.
-// Asymmetric on purpose: <<< >>> ||| never occur in prose so they match 7-or-
-// more (covering conflict-marker-size=8), while the separator is EXACTLY seven
-// '=' anchored to end-of-line, matching the reference. A markdown setext
-// underline is sized to its heading and is rarely exactly seven, so this
-// catches the real separator without flagging documentation.
-var conflictMarkerRe = regexp.MustCompile(`^(<{7,}|>{7,}|\|{7,})( |$)|^={7}$`)
+// All four markers accept 7-or-more so `.gitattributes conflict-marker-size=8`
+// is covered. The earlier exact-7 separator missed `========` — the very
+// configuration the angle markers had just been widened for — so the
+// half-resolved shape it was restored to catch was still getting through.
+//
+// DECIDED TRADE-OFF: `={7,}$` also matches a markdown setext underline, so a
+// heading of seven-or-more characters in an added doc line will abort the
+// harvest. That is accepted deliberately. This is a merge gate: a false
+// positive is recoverable in seconds and names the offending line, while a
+// false negative puts a structurally broken diff into a PR body that nobody
+// re-reads. Prefer the recoverable failure. Use an ATX `#` heading or a `---`
+// underline in docs if you hit it.
+//
+// (?m) is set so the pattern stays correct if a future caller passes a
+// multi-line string; today ConflictMarkers feeds it one line at a time.
+var conflictMarkerRe = regexp.MustCompile(`(?m)^(<{7,}|>{7,}|\|{7,})( |$)|^={7,}$`)
 
 // ConflictMarkers returns the conflict markers found in staged ADDED lines.
 //
@@ -58,9 +62,13 @@ func ConflictMarkers(stagedDiff string) []string {
 		if !strings.HasPrefix(line, "+") || strings.HasPrefix(line, "+++") {
 			continue
 		}
-		body := strings.TrimPrefix(line, "+")
+		// Match the TRIMMED body: with CRLF the added line is "=======\r" and
+		// `$` does not match before the \r, so the separator check was
+		// defeated by line endings alone. Reporting already trimmed, so
+		// matching on the same value keeps the two consistent.
+		body := strings.TrimSpace(strings.TrimPrefix(line, "+"))
 		if conflictMarkerRe.MatchString(body) {
-			found = append(found, strings.TrimSpace(body))
+			found = append(found, body)
 		}
 	}
 	return found
