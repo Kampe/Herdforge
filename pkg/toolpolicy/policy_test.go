@@ -1,6 +1,8 @@
 package toolpolicy_test
 
 import (
+	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -25,7 +27,7 @@ func TestCodexPolicyDisablesInheritedMCPKeepsCLI(t *testing.T) {
 	if !cfg.Valid() || cfg.MCPServers[toolpolicy.CodeReviewGraph] || !cfg.CLI[toolpolicy.CodeReviewGraph] {
 		t.Fatalf("bad effective config: %+v", cfg)
 	}
-	if len(argv) != 5 || argv[3] != "-c" || argv[4] != "mcp_servers.code-review-graph.enabled=false" {
+	if len(argv) != 5 || argv[3] != "-c" || argv[4] != "mcp_servers.code-review-graph={command=\"false\",enabled=false}" {
 		t.Fatalf("missing compiled override: %v", argv)
 	}
 }
@@ -42,7 +44,7 @@ func TestEffectiveConfigRejectsMissingCRGMapKey(t *testing.T) {
 
 func fakeInheritedCRGChildren(argv []string) int {
 	for i := range argv {
-		if i+1 < len(argv) && argv[i] == "-c" && argv[i+1] == "mcp_servers.code-review-graph.enabled=false" {
+		if i+1 < len(argv) && argv[i] == "-c" && argv[i+1] == "mcp_servers.code-review-graph={command=\"false\",enabled=false}" {
 			return 0
 		}
 	}
@@ -81,6 +83,75 @@ func TestExceptionalAuthorizationBindsAllIdentity(t *testing.T) {
 			mutate(&b)
 			if a.Matches(b, time.Now().UTC()) {
 				t.Fatal("identity mutation accepted")
+			}
+		})
+	}
+}
+
+func TestCompileCodexArgsUpgradesUnsafePartialOverride(t *testing.T) {
+	argv, err := toolpolicy.CompileCodexArgs([]string{"codex", "--model", "gpt-5.6-luna", "-c", "mcp_servers.code-review-graph.enabled=false"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if argv[4] != toolpolicy.CodexDisableCodeReviewGraph {
+		t.Fatalf("unsafe partial override not upgraded: %v", argv)
+	}
+}
+
+func TestCompileCodexArgsCanonicalizesConflictingOverrides(t *testing.T) {
+	unsafe := "mcp_servers.code-review-graph.enabled=false"
+	for _, tc := range []struct {
+		name string
+		argv []string
+	}{
+		{name: "safe then unsafe", argv: []string{"codex", "-c", toolpolicy.CodexDisableCodeReviewGraph, "-c", unsafe}},
+		{name: "unsafe then safe", argv: []string{"codex", "--config", unsafe, "-c", toolpolicy.CodexDisableCodeReviewGraph}},
+		{name: "duplicate unsafe", argv: []string{"codex", "-c", unsafe, "-c", unsafe}},
+		{name: "reenable", argv: []string{"codex", "-c", "mcp_servers.code-review-graph.enabled=true"}},
+		{name: "quoted reenable", argv: []string{"codex", "-c", `mcp_servers."code-review-graph".enabled=true`}},
+		{name: "inline long reenable", argv: []string{"codex", "--config=mcp_servers.code-review-graph.enabled=true"}},
+		{name: "inline short unsafe", argv: []string{"codex", "-c=mcp_servers.code-review-graph.enabled=false"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := toolpolicy.CompileCodexArgs(tc.argv)
+			if err != nil {
+				t.Fatal(err)
+			}
+			count := 0
+			for _, arg := range got {
+				if strings.Contains(strings.ToLower(arg), "code-review-graph") {
+					count++
+					if arg != toolpolicy.CodexDisableCodeReviewGraph {
+						t.Fatalf("noncanonical CRG override: %v", got)
+					}
+				}
+			}
+			if count != 1 {
+				t.Fatalf("CRG override count=%d argv=%v", count, got)
+			}
+		})
+	}
+}
+
+func TestCompileCodexArgsSentinelHandling(t *testing.T) {
+	t.Run("disable is inserted before sentinel", func(t *testing.T) {
+		got, err := toolpolicy.CompileCodexArgs([]string{"codex", "--", "prompt"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := []string{"codex", "-c", toolpolicy.CodexDisableCodeReviewGraph, "--", "prompt"}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("argv=%v want=%v", got, want)
+		}
+	})
+	for _, trailing := range []string{
+		"--config=mcp_servers.code-review-graph.enabled=true",
+		"mcp_servers.code-review-graph.enabled=false",
+	} {
+		t.Run(trailing, func(t *testing.T) {
+			_, err := toolpolicy.CompileCodexArgs([]string{"codex", "-c", toolpolicy.CodexDisableCodeReviewGraph, "--", trailing})
+			if err == nil {
+				t.Fatal("post-sentinel CRG policy was accepted")
 			}
 		})
 	}
