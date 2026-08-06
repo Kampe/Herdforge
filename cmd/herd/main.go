@@ -111,6 +111,9 @@ func main() {
 	case "feedback":
 		runFeedback()
 
+	case "stop":
+		runStop()
+
 	case "hold":
 		runHold()
 
@@ -255,6 +258,9 @@ func printUsage() {
 	fmt.Println("  claude-only  Route the whole fleet to native Claude: on, off, or status")
 	fmt.Println("  no-claude    Hold native Claude out of the fleet: on, off, or status")
 	fmt.Println("  board-frozen Exit 0 with the freeze trigger when board mutation is frozen")
+	fmt.Println("  role-inject  SessionStart hook: bind a lane to its worker contract")
+	fmt.Println("  feedback     Fleet-wide control-plane feedback census")
+	fmt.Println("  stop         Stop the herd without deleting worktrees (dry-run default)")
 	fmt.Println("  hold       Control durable generation-fenced lane/task hold: on, off, or status")
 	fmt.Println("  review     Claim in-progress tasks for reviewer and advance to review status")
 	fmt.Println("  approve    Move in-review cards to done, gated on merge evidence")
