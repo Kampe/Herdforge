@@ -90,7 +90,7 @@ func TestProductionConstructorDoesNotSourceAuthorityFromRepoEnvOrDatabase(t *tes
 	if _, err := os.Stat(filepath.Join(root, ".herd", "scopefence.db")); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("production constructor sourced or created local authority database: err=%v", err)
 	}
-	if _, ok := reflect.TypeOf(*d).FieldByName("SigningKey"); ok {
+	if _, ok := reflect.TypeOf(d).Elem().FieldByName("SigningKey"); ok {
 		t.Fatal("dispatcher exposes signing key material")
 	}
 	if _, ok := reflect.TypeOf(DispatchOptions{}).FieldByName("SigningKey"); ok {

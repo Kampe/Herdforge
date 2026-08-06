@@ -19,6 +19,16 @@ func freezeTime() time.Time {
 	return time.Date(2026, 8, 2, 12, 0, 0, 0, time.UTC)
 }
 
+// newTestEngine pins the engine clock to freezeTime so pace classification is
+// reproducible. Without it these tests silently rot: the fixture's resetsAt
+// timestamps recede into the past, elapsed% climbs, and pace collapses from
+// overpace to onpace some days after the fixture was authored.
+func newTestEngine() *QuotaEngine {
+	e := NewQuotaEngine()
+	e.Now = freezeTime
+	return e
+}
+
 func TestComputeBinding_Claude(t *testing.T) {
 	snap := parseFixture(t)
 	prov := snap.Providers["claude"]
@@ -188,7 +198,7 @@ func TestPoolResources(t *testing.T) {
 
 func TestComputeAll(t *testing.T) {
 	snap := parseFixture(t)
-	e := NewQuotaEngine()
+	e := newTestEngine()
 	computed := e.ComputeAll(snap)
 
 	claude, ok := computed["claude"]
@@ -219,7 +229,7 @@ func TestComputeAll(t *testing.T) {
 
 func TestPickProvider_SelectsClaude(t *testing.T) {
 	snap := parseFixture(t)
-	e := NewQuotaEngine()
+	e := newTestEngine()
 	computed := e.ComputeAll(snap)
 
 	pick, state, err := e.PickProvider(computed, []string{"claude", "codex"})
@@ -236,7 +246,7 @@ func TestPickProvider_SelectsClaude(t *testing.T) {
 }
 
 func TestPickProvider_AllExhausted(t *testing.T) {
-	e := NewQuotaEngine()
+	e := newTestEngine()
 	exhausted := map[string]BurnState{
 		"codex":  {Available: false, Reason: "exhausted", Used: 100},
 		"claude": {Available: false, Reason: "exhausted", Used: 100},
@@ -249,7 +259,7 @@ func TestPickProvider_AllExhausted(t *testing.T) {
 
 func TestPickProvider_NoAmong(t *testing.T) {
 	snap := parseFixture(t)
-	e := NewQuotaEngine()
+	e := newTestEngine()
 	computed := e.ComputeAll(snap)
 
 	pick, _, err := e.PickProvider(computed, nil)
@@ -263,7 +273,7 @@ func TestPickProvider_NoAmong(t *testing.T) {
 
 func TestProviderOK(t *testing.T) {
 	snap := parseFixture(t)
-	e := NewQuotaEngine()
+	e := newTestEngine()
 	computed := e.ComputeAll(snap)
 
 	_, ok := e.ProviderOK(computed, "claude")
@@ -281,7 +291,7 @@ func TestProviderOK(t *testing.T) {
 }
 
 func TestAliasProvider(t *testing.T) {
-	e := NewQuotaEngine()
+	e := newTestEngine()
 	if e.AliasProvider("agy") != "antigravity" {
 		t.Errorf("agy -> antigravity failed")
 	}
@@ -306,7 +316,7 @@ func TestHumanDuration(t *testing.T) {
 }
 
 func TestComputeAll_NilSnapshot(t *testing.T) {
-	e := NewQuotaEngine()
+	e := newTestEngine()
 	computed := e.ComputeAll(nil)
 	if computed != nil {
 		t.Error("nil snapshot should return nil")

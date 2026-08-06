@@ -52,6 +52,18 @@ type BurnState struct {
 type QuotaEngine struct {
 	ExhaustedPct  float64
 	AliasProvider func(string) string
+	// Now supplies the engine's clock. Tests freeze it so pace
+	// classification is deterministic instead of rotting as the
+	// fixture's reset timestamps recede into the past.
+	Now func() time.Time
+}
+
+// now resolves the engine clock, defaulting to wall time.
+func (e *QuotaEngine) now() time.Time {
+	if e.Now != nil {
+		return e.Now()
+	}
+	return time.Now()
 }
 
 func NewQuotaEngine() *QuotaEngine {
@@ -128,7 +140,7 @@ func classPace(used float64, windowSeconds int, resetsAt string, exhaustedPct fl
 }
 
 func (e *QuotaEngine) ClassPace(used float64, windowSeconds int, resetsAt string) (BurnClass, int, float64) {
-	return classPace(used, windowSeconds, resetsAt, e.ExhaustedPct, time.Now())
+	return classPace(used, windowSeconds, resetsAt, e.ExhaustedPct, e.now())
 }
 
 func computeBinding(prov ProviderUsage, resourceNames map[string]bool, exhaustedPct float64, now time.Time) *BurnState {
@@ -345,7 +357,7 @@ func (e *QuotaEngine) ComputeAll(snap *UsageSnapshot) map[string]BurnState {
 	if snap == nil {
 		return nil
 	}
-	now := time.Now()
+	now := e.now()
 	computed := make(map[string]BurnState)
 	for name, prov := range snap.Providers {
 		stale := prov.Stale
@@ -388,7 +400,7 @@ func (e *QuotaEngine) PickProvider(computed map[string]BurnState, among []string
 		state     BurnState
 	}
 
-	now := time.Now()
+	now := e.now()
 	var candidates []ranked
 	for _, name := range resolved {
 		p, ok := computed[name]
