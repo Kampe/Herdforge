@@ -126,6 +126,12 @@ func main() {
 	case "quota-supervisor":
 		runQuotaSupervisor()
 
+	case "rescue":
+		runRescue()
+
+	case "seed-lane-state":
+		runSeedLaneState()
+
 	case "hold":
 		runHold()
 
@@ -277,6 +283,8 @@ func printUsage() {
 	fmt.Println("  park         Make parked work durable (annotated pushed tag) + audit exposure")
 	fmt.Println("  wave         Pre-wave checklist; --standing also raises the standing fleet")
 	fmt.Println("  quota-supervisor  Map live agents to their real pools and report capacity transitions")
+	fmt.Println("  rescue       Move a cramped pane to its own tab; --empty-siblings closes blank shells")
+	fmt.Println("  seed-lane-state   Restore or seed a lane's state artifacts (never overwrites)")
 	fmt.Println("  hold       Control durable generation-fenced lane/task hold: on, off, or status")
 	fmt.Println("  review     Claim in-progress tasks for reviewer and advance to review status")
 	fmt.Println("  approve    Move in-review cards to done, gated on merge evidence")
