@@ -151,7 +151,15 @@ type Service struct {
 	machine   *Machine
 	inspector WorktreeInspector
 	now       func() time.Time
+	scopeGate ScopeGate
 }
+
+// ScopeGate verifies that a candidate's admission scope (pkg/scope:
+// merge-base..candidate, not just the direct-parent diff — see FAC-201/
+// FAC-69) is still current before an irreversible publication step: PR
+// promotion or integration begin. Nil disables the check, so existing
+// callers are unaffected unless they opt in via WithScopeGate.
+type ScopeGate func(ctx context.Context, candidateID, candidateSHA string) error
 
 type ServiceOption func(*Service)
 
@@ -161,6 +169,10 @@ func WithWorktreeInspector(i WorktreeInspector) ServiceOption {
 
 func WithServiceClock(now func() time.Time) ServiceOption {
 	return func(s *Service) { s.now = now }
+}
+
+func WithScopeGate(gate ScopeGate) ServiceOption {
+	return func(s *Service) { s.scopeGate = gate }
 }
 
 func NewService(machine *Machine, opts ...ServiceOption) (*Service, error) {
@@ -463,6 +475,11 @@ func (s *Service) PromotePullRequest(ctx context.Context, req PromotePRRequest) 
 		if err := requirePassingEvidenceTx(tx, req.CandidateID, req.CandidateSHA); err != nil {
 			return CommandResult{}, err
 		}
+		if s.scopeGate != nil {
+			if err := s.scopeGate(ctx, req.CandidateID, req.CandidateSHA); err != nil {
+				return CommandResult{}, fmt.Errorf("promote pull request: admission scope check failed: %w", err)
+			}
+		}
 		payload, _ := json.Marshal(map[string]string{"candidate_id": req.CandidateID, "candidate_sha": req.CandidateSHA, "pull_request": req.PullRequest})
 		items := []outbox.Item{{IdempotencyKey: req.Command.IdempotencyKey + ":pr", Kind: "git.pr.promote", Payload: string(payload)}}
 		res, err := s.transition(tx, req.Command, f, StateIntegrationQueued, evidenceDigest(payload), req.CandidateSHA, items, "pr-promoted")
@@ -533,6 +550,11 @@ func (s *Service) BeginIntegration(ctx context.Context, req BeginIntegrationRequ
 		}
 		if err := s.admitMergeTx(tx, req); err != nil {
 			return CommandResult{}, err
+		}
+		if s.scopeGate != nil {
+			if err := s.scopeGate(ctx, req.CandidateID, req.CandidateSHA); err != nil {
+				return CommandResult{}, fmt.Errorf("begin integration: admission scope check failed: %w", err)
+			}
 		}
 		now := s.now().UTC()
 		if _, err := tx.Exec(`INSERT INTO lifecycle_service_integration_locks
