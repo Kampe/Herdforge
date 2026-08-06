@@ -123,6 +123,9 @@ func main() {
 	case "wave":
 		runWave()
 
+	case "quota-supervisor":
+		runQuotaSupervisor()
+
 	case "hold":
 		runHold()
 
@@ -273,6 +276,7 @@ func printUsage() {
 	fmt.Println("  stash        Worktree-scoped stash that cannot collide across lanes")
 	fmt.Println("  park         Make parked work durable (annotated pushed tag) + audit exposure")
 	fmt.Println("  wave         Pre-wave checklist; --standing also raises the standing fleet")
+	fmt.Println("  quota-supervisor  Map live agents to their real pools and report capacity transitions")
 	fmt.Println("  hold       Control durable generation-fenced lane/task hold: on, off, or status")
 	fmt.Println("  review     Claim in-progress tasks for reviewer and advance to review status")
 	fmt.Println("  approve    Move in-review cards to done, gated on merge evidence")
