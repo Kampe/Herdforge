@@ -99,6 +99,92 @@ func (b *BoundClient) AddComment(ctx context.Context, taskID, body string) error
 	return b.wrap("AddComment", OpComment, b.Inner.AddComment(opCtx, taskID, body))
 }
 
+// Label operations are delegated only when the underlying adapter explicitly
+// implements the label contract. This keeps old providers fail-closed while
+// allowing the production daemon to reach Kaneo through BoundClient.
+func (b *BoundClient) labelProvider() (TaskLabelProvider, error) {
+	if b == nil || b.Inner == nil {
+		return nil, fmt.Errorf("label provider: nil")
+	}
+	p, ok := b.Inner.(TaskLabelProvider)
+	if !ok {
+		return nil, fmt.Errorf("label provider unsupported")
+	}
+	return p, nil
+}
+
+func (b *BoundClient) ListTaskLabels(ctx context.Context, taskID string) ([]TaskLabel, error) {
+	p, err := b.labelProvider()
+	if err != nil {
+		return nil, err
+	}
+	opCtx, cancel := BoundOp(ctx, b.deadlines(), OpList)
+	defer cancel()
+	rows, e := p.ListTaskLabels(opCtx, taskID)
+	return rows, b.wrap("ListTaskLabels", OpList, e)
+}
+func (b *BoundClient) CreateTaskLabel(ctx context.Context, taskID, name string) (TaskLabel, error) {
+	p, err := b.labelProvider()
+	if err != nil {
+		return TaskLabel{}, err
+	}
+	opCtx, cancel := BoundOp(ctx, b.deadlines(), OpMutate)
+	defer cancel()
+	row, e := p.CreateTaskLabel(opCtx, taskID, name)
+	return row, b.wrap("CreateTaskLabel", OpMutate, e)
+}
+func (b *BoundClient) AttachTaskLabel(ctx context.Context, taskID, labelID string) error {
+	p, err := b.labelProvider()
+	if err != nil {
+		return err
+	}
+	opCtx, cancel := BoundOp(ctx, b.deadlines(), OpMutate)
+	defer cancel()
+	return b.wrap("AttachTaskLabel", OpMutate, p.AttachTaskLabel(opCtx, taskID, labelID))
+}
+func (b *BoundClient) DetachTaskLabel(ctx context.Context, labelID string) error {
+	p, err := b.labelProvider()
+	if err != nil {
+		return err
+	}
+	opCtx, cancel := BoundOp(ctx, b.deadlines(), OpMutate)
+	defer cancel()
+	return b.wrap("DetachTaskLabel", OpMutate, p.DetachTaskLabel(opCtx, labelID))
+}
+func (b *BoundClient) DeleteTaskLabel(ctx context.Context, labelID string) error {
+	p, err := b.labelProvider()
+	if err != nil {
+		return err
+	}
+	opCtx, cancel := BoundOp(ctx, b.deadlines(), OpMutate)
+	defer cancel()
+	return b.wrap("DeleteTaskLabel", OpMutate, p.DeleteTaskLabel(opCtx, labelID))
+}
+func (b *BoundClient) ProveLabelCreation(ctx context.Context, created TaskLabel, targetID, name string, opts LabelRepairOptions) error {
+	p, err := b.labelProvider()
+	if err != nil {
+		return err
+	}
+	proof, ok := p.(LabelCreationProof)
+	if !ok {
+		return fmt.Errorf("label creation proof unsupported")
+	}
+	opCtx, cancel := BoundOp(ctx, b.deadlines(), OpReadback)
+	defer cancel()
+	return b.wrap("ProveLabelCreation", OpReadback, proof.ProveLabelCreation(opCtx, created, targetID, name, opts))
+}
+func (b *BoundClient) LabelMutationAuthority() (string, error) {
+	p, err := b.labelProvider()
+	if err != nil {
+		return "", err
+	}
+	a, ok := p.(labelAuthority)
+	if !ok {
+		return "", fmt.Errorf("label authority unsupported")
+	}
+	return a.LabelMutationAuthority()
+}
+
 // ConfigDeadlineSource is the subset of config needed without importing
 // pkg/config (avoids cycles). cmd and packages pass Resolved() parts.
 type ConfigDeadlineSource interface {

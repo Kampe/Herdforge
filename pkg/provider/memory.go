@@ -11,15 +11,130 @@ import (
 type MemoryProvider struct {
 	mu        sync.Mutex
 	tasks     map[string]*Task
+	labels    map[string]TaskLabel
+	nextLabel int
+	attachIDs []string
+	proofed   map[string]bool
 	relations map[string]Relation // id → relation
 	nextRel   int
+}
+
+func (m *MemoryProvider) LabelMutationAuthority() (string, error) {
+	return "memory-provider/project", nil
 }
 
 func NewMemoryProvider() *MemoryProvider {
 	return &MemoryProvider{
 		tasks:     make(map[string]*Task),
+		labels:    make(map[string]TaskLabel),
 		relations: make(map[string]Relation),
+		proofed:   make(map[string]bool),
 	}
+}
+
+func (m *MemoryProvider) ListTaskLabels(_ context.Context, taskID string) ([]TaskLabel, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []TaskLabel
+	for _, l := range m.labels {
+		if l.TaskID == taskID {
+			out = append(out, l)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out, nil
+}
+
+func (m *MemoryProvider) CreateTaskLabel(_ context.Context, taskID, name string) (TaskLabel, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.tasks[taskID]; !ok {
+		return TaskLabel{}, fmt.Errorf("task not found: %s", taskID)
+	}
+	m.nextLabel++
+	// Kaneo creates an unattached row. Ownership is established only by attach.
+	l := TaskLabel{ID: fmt.Sprintf("label-%d", m.nextLabel), Name: name}
+	m.labels[l.ID] = l
+	return l, nil
+}
+
+func (m *MemoryProvider) ProveLabelCreation(_ context.Context, created TaskLabel, targetID, name string, opts LabelRepairOptions) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	l, ok := m.labels[created.ID]
+	if !ok || m.proofed[created.ID] || l.ID != created.ID || l.Name != name || l.TaskID != "" || created.TaskID != "" {
+		return fmt.Errorf("label creation proof failed: foreign or attached identity")
+	}
+	if targetID == "" || (opts.Evidence != nil && (opts.TransactionID == "" || opts.Generation == "")) {
+		return fmt.Errorf("label creation proof missing target or generation")
+	}
+	m.proofed[created.ID] = true
+	return nil
+}
+
+func (m *MemoryProvider) AttachTaskLabel(_ context.Context, taskID, labelID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	l, ok := m.labels[labelID]
+	if !ok {
+		return fmt.Errorf("label not found: %s", labelID)
+	}
+	// Kaneo's observed destructive semantics: attaching an already-owned row
+	// moves it. Repair must prevent this call for source-owned IDs.
+	oldTask := l.TaskID
+	l.TaskID = taskID
+	m.labels[labelID] = l
+	m.attachIDs = append(m.attachIDs, labelID)
+	if oldTask != "" {
+		m.syncTaskLabelsLocked(oldTask)
+	}
+	m.syncTaskLabelsLocked(taskID)
+	return nil
+}
+
+func (m *MemoryProvider) DetachTaskLabel(_ context.Context, labelID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	l, ok := m.labels[labelID]
+	if !ok {
+		return nil
+	}
+	oldTask := l.TaskID
+	l.TaskID = ""
+	m.labels[labelID] = l
+	if oldTask != "" {
+		m.syncTaskLabelsLocked(oldTask)
+	}
+	return nil
+}
+
+func (m *MemoryProvider) DeleteTaskLabel(_ context.Context, labelID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	oldTask := ""
+	if l, ok := m.labels[labelID]; ok {
+		oldTask = l.TaskID
+	}
+	delete(m.labels, labelID)
+	if oldTask != "" {
+		m.syncTaskLabelsLocked(oldTask)
+	}
+	return nil
+}
+
+func (m *MemoryProvider) syncTaskLabelsLocked(taskID string) {
+	t := m.tasks[taskID]
+	if t == nil {
+		return
+	}
+	labels := make([]string, 0)
+	for _, l := range m.labels {
+		if l.TaskID == taskID {
+			labels = append(labels, l.Name)
+		}
+	}
+	sort.Strings(labels)
+	t.Labels = labels
 }
 
 func (m *MemoryProvider) AddTask(t *Task) {
