@@ -75,6 +75,192 @@ type LedgerRow struct {
 	Status         string `json:"status,omitempty"`
 }
 
+// VerdictRecord is the small, stable view consumed by the drain coordinator.
+// At is the parsed event time; Index is retained as the deterministic tie
+// breaker for ledgers whose producers use the same timestamp.
+type VerdictRecord struct {
+	SHA           string
+	Verdict       string
+	Branch        string
+	Tier          string
+	BuilderFamily string
+	At            int64 // Unix nanoseconds; zero means an omitted timestamp.
+	Index         int
+}
+
+// OpenLedger opens an existing ledger without creating or mutating state.
+// Drain uses this constructor so a missing ledger is an empty, readable
+// review pile while an unreadable ledger remains a hard error.
+func OpenLedger(path string) *Ledger {
+	return &Ledger{Path: path, QueuePath: filepath.Join(filepath.Dir(path), "harvest-queue.jsonl")}
+}
+
+// LedgerSnapshot is the one-beat read of the two append-only streams.
+type LedgerSnapshot struct {
+	Rows  []LedgerRow
+	Queue []LedgerRow
+}
+
+func (l *Ledger) Snapshot() (LedgerSnapshot, error) {
+	rows, err := readDrainRows(context.Background(), l.Path)
+	if err != nil {
+		return LedgerSnapshot{}, err
+	}
+	queue, err := readDrainRows(context.Background(), l.QueuePath)
+	if err != nil {
+		return LedgerSnapshot{}, err
+	}
+	return LedgerSnapshot{Rows: rows, Queue: queue}, nil
+}
+
+// Verdicts returns verdict events in file order. Last verdict wins is applied
+// by PASSes and Vetoed, never by map iteration order.
+func (l *Ledger) Verdicts(ctx context.Context) ([]VerdictRecord, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	events, err := readDrainEvents(ctx, l.Path)
+	if err != nil {
+		return nil, err
+	}
+	result := make([]VerdictRecord, 0)
+	for _, event := range events {
+		row := event.row
+		if row.Event != string(EventVerdict) {
+			continue
+		}
+		at := int64(0)
+		if ts, e := parseRowTime(row.Timestamp); e == nil {
+			at = ts.UnixNano()
+		}
+		result = append(result, VerdictRecord{SHA: row.SHA, Verdict: row.Verdict, Branch: row.Branch, Tier: row.Tier, BuilderFamily: row.BuilderFamily, At: at, Index: event.index})
+	}
+	return result, nil
+}
+
+// PASSes returns PASS SHA -> recorded tier. A tier is taken from the verdict
+// only when present, otherwise from the latest record for that SHA.
+func (l *Ledger) PASSes(ctx context.Context) (map[string]string, error) {
+	rows, err := readDrainRows(ctx, l.Path)
+	if err != nil {
+		return nil, err
+	}
+	return l.passMap(rows), nil
+}
+
+// Vetoed returns SHAs whose latest verdict for any reviewer is FAIL/BLOCKED.
+func (l *Ledger) Vetoed(ctx context.Context) (map[string]bool, error) {
+	rows, err := readDrainRows(ctx, l.Path)
+	if err != nil {
+		return nil, err
+	}
+	latest := make(map[string]LedgerRow)
+	for _, row := range rows {
+		if row.Event == string(EventVerdict) {
+			latest[row.SHA+"\x00"+row.Reviewer] = row
+		}
+	}
+	result := make(map[string]bool)
+	for _, row := range latest {
+		if row.Verdict == string(VerdictFAIL) || row.Verdict == string(VerdictBLOCKED) {
+			result[row.SHA] = true
+		}
+	}
+	return result, nil
+}
+
+// TierProp resolves the latest recorded tier for a SHA, or empty when the
+// ledger has no recorded tier. It deliberately does not infer a tier.
+func (l *Ledger) TierProp(ctx context.Context, sha string) string {
+	tier, _ := l.TierPropErr(ctx, sha)
+	return tier
+}
+
+// TierPropErr is the fail-closed drain-facing tier lookup. Callers that make
+// an automation decision must retain the error instead of treating empty as a
+// recorded tier.
+func (l *Ledger) TierPropErr(ctx context.Context, sha string) (string, error) {
+	rows, err := readDrainRows(ctx, l.Path)
+	if err != nil {
+		return "", err
+	}
+	var tier string
+	for _, row := range rows {
+		if row.Event == string(EventRecord) && row.SHA == sha {
+			tier = row.Tier
+		}
+	}
+	return tier, nil
+}
+
+func (l *Ledger) passMap(rows []LedgerRow) map[string]string {
+	ordered, err := orderedRows(rows)
+	if err != nil {
+		return map[string]string{}
+	}
+	rows = ordered
+	recordTier := make(map[string]string)
+	latest := make(map[string]LedgerRow)
+	for _, row := range rows {
+		switch row.Event {
+		case string(EventRecord):
+			recordTier[row.SHA] = row.Tier
+		case string(EventVerdict):
+			latest[row.SHA+"\x00"+row.Reviewer] = row
+		}
+	}
+	result := make(map[string]string)
+	for _, row := range latest {
+		if row.Verdict == string(VerdictPASS) {
+			result[row.SHA] = recordTier[row.SHA]
+		}
+	}
+	return result
+}
+
+func parseRowTime(raw string) (time.Time, error) {
+	if strings.TrimSpace(raw) == "" {
+		return time.Time{}, nil
+	}
+	return time.Parse(time.RFC3339Nano, raw)
+}
+
+func orderedRows(rows []LedgerRow) ([]LedgerRow, error) {
+	items, err := orderedEvents(rows)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]LedgerRow, len(items))
+	for i, item := range items {
+		out[i] = item.row
+	}
+	return out, nil
+}
+
+type orderedLedgerRow struct {
+	row   LedgerRow
+	index int
+	at    time.Time
+}
+
+func orderedEvents(rows []LedgerRow) ([]orderedLedgerRow, error) {
+	items := make([]orderedLedgerRow, 0, len(rows))
+	for i, row := range rows {
+		at, err := parseRowTime(row.Timestamp)
+		if err != nil {
+			return nil, fmt.Errorf("invalid event timestamp at JSONL index %d: %w", i, err)
+		}
+		items = append(items, orderedLedgerRow{row: row, index: i, at: at})
+	}
+	sort.SliceStable(items, func(i, j int) bool {
+		if items[i].at.Equal(items[j].at) {
+			return items[i].index < items[j].index
+		}
+		return items[i].at.Before(items[j].at)
+	})
+	return items, nil
+}
+
 // familyResolve carries the 3-state resolution so null!=empty maps to a bit.
 type familyResolve int
 
@@ -180,6 +366,76 @@ func readRows(path string) ([]LedgerRow, error) {
 		rows = append(rows, row)
 	}
 	return rows, sc.Err()
+}
+
+func readRowsStrict(path string) ([]LedgerRow, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("read ledger %s: %w", path, err)
+	}
+	defer f.Close()
+	var rows []LedgerRow
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if line == "" {
+			continue
+		}
+		var row LedgerRow
+		if err := json.Unmarshal([]byte(line), &row); err != nil {
+			return nil, fmt.Errorf("read ledger %s: invalid JSONL: %w", path, err)
+		}
+		rows = append(rows, row)
+	}
+	if err := sc.Err(); err != nil {
+		return nil, fmt.Errorf("read ledger %s: %w", path, err)
+	}
+	return rows, nil
+}
+
+func validateLedgerRows(path string, rows []LedgerRow) error {
+	for i, row := range rows {
+		switch row.Event {
+		case string(EventRecord), string(EventVerdict), string(EventEnqueue), string(EventRevoked), string(EventConsumed), string(EventRepair):
+			if strings.TrimSpace(row.SHA) == "" {
+				return fmt.Errorf("read ledger %s: JSONL index %d event %q is missing sha", path, i, row.Event)
+			}
+		}
+	}
+	return nil
+}
+
+func readDrainEvents(ctx context.Context, path string) ([]orderedLedgerRow, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	rows, err := readRowsStrict(path)
+	if err != nil {
+		return nil, err
+	}
+	if err := validateLedgerRows(path, rows); err != nil {
+		return nil, err
+	}
+	events, err := orderedEvents(rows)
+	if err != nil {
+		return nil, err
+	}
+	return events, nil
+}
+
+func readDrainRows(ctx context.Context, path string) ([]LedgerRow, error) {
+	events, err := readDrainEvents(ctx, path)
+	if err != nil {
+		return nil, err
+	}
+	rows := make([]LedgerRow, len(events))
+	for i, event := range events {
+		rows[i] = event.row
+	}
+	return rows, nil
 }
 
 // newestBy groups rows by key and keeps the last (newest) per key.

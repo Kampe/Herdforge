@@ -1,6 +1,26 @@
 package harvest
 
-import "context"
+import (
+	"context"
+	"os/exec"
+	"strings"
+)
+
+// ContentMerged reports whether a commit's patch is already represented by
+// the integration ref. It is intentionally based on git's cherry-equivalence
+// logic, not reachability, because rebase merges create new object IDs.
+func ContentMerged(ctx context.Context, repoRoot, mainRef, sha string) (bool, error) {
+	if mainRef == "" {
+		mainRef = "origin/main"
+	}
+	cmd := exec.CommandContext(ctx, "git", "log", "--cherry-pick", "--right-only", "--no-merges", mainRef+"..."+sha, "--oneline")
+	cmd.Dir = repoRoot
+	out, err := cmd.Output()
+	if err != nil {
+		return false, err
+	}
+	return strings.TrimSpace(string(out)) == "", nil
+}
 
 // UnmergedFor is the ONE authoritative single-target "does this worktree
 // have genuinely unmerged work" check (port of bin/herd-unmerged). Uses
