@@ -117,6 +117,12 @@ func main() {
 	case "stash":
 		runStash()
 
+	case "park":
+		runPark()
+
+	case "wave":
+		runWave()
+
 	case "hold":
 		runHold()
 
@@ -265,6 +271,8 @@ func printUsage() {
 	fmt.Println("  feedback     Fleet-wide control-plane feedback census")
 	fmt.Println("  stop         Stop the herd without deleting worktrees (dry-run default)")
 	fmt.Println("  stash        Worktree-scoped stash that cannot collide across lanes")
+	fmt.Println("  park         Make parked work durable (annotated pushed tag) + audit exposure")
+	fmt.Println("  wave         Pre-wave checklist; --standing also raises the standing fleet")
 	fmt.Println("  hold       Control durable generation-fenced lane/task hold: on, off, or status")
 	fmt.Println("  review     Claim in-progress tasks for reviewer and advance to review status")
 	fmt.Println("  approve    Move in-review cards to done, gated on merge evidence")
