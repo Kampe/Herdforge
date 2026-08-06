@@ -30,11 +30,6 @@ const (
 	HarvestRole          = "harvest"
 	RecoverySentinelRole = "recovery-sentinel"
 	Implementation       = "implementation"
-	// Re-exported from pkg/router so the approved worker tuple has exactly one
-	// definition. Previously duplicated as codex/gpt-5.6-luna/medium literals.
-	WorkerModel          = router.WorkerModel
-	WorkerProvider       = router.WorkerProvider
-	WorkerEffort         = router.WorkerEffort
 )
 
 // Request is the complete, durable identity of one process launch.
@@ -281,8 +276,11 @@ func Validate(req Request, sink Sink) error {
 		if shape != Implementation {
 			return reject(req, sink, "worker task shape must be implementation")
 		}
-		if provider != WorkerProvider || model != WorkerModel || effort != WorkerEffort {
-			return reject(req, sink, fmt.Sprintf("worker launch requires %s/%s/%s", WorkerProvider, WorkerModel, WorkerEffort))
+		// No vendor tuple: the routed decision already came from the live
+		// quota-ranked implementation waterfall. Validate that it is coherent,
+		// not that it names one preordained provider.
+		if strings.TrimSpace(provider) == "" || strings.TrimSpace(model) == "" || strings.TrimSpace(effort) == "" {
+			return reject(req, sink, "worker launch decision is missing provider, model, or effort")
 		}
 	} else if !controlRole(role) {
 		return reject(req, sink, "unknown launch role")

@@ -133,18 +133,14 @@ type LaunchDecision struct {
 
 const decisionProofDomain = "herdforge-fac-175-launch-decision-v1"
 
-// The single approved worker/forge-smith/recovery launch tuple. This was
-// previously spelled as codex/gpt-5.6-luna/medium literals in three places
-// (two here, one in cmd/herd), which pinned the whole builder fleet to one
-// vendor and made every other routed pick fail as drift. Keep it equal to
-// what the live router picks for WorkerShape.
-// ponytail: still a compile-time pin — derive from fleet config/router.
-const (
-	WorkerProvider = "grok"
-	WorkerModel    = "grok-4.5"
-	WorkerEffort   = "high"
-	WorkerShape    = "implementation"
-)
+// WorkerShape is the only thing fixed about a builder launch: builders do
+// implementation work. Provider/model/effort come from the live quota-ranked
+// waterfall, never a compile-time vendor tuple.
+//
+// This replaced codex/gpt-5.6-luna/medium literals that had been spelled out
+// in three places (two here, one in cmd/herd). The pin defeated the router it
+// sat on top of: chainseer's bin/herd-route has no worker tuple gate at all.
+const WorkerShape = "implementation"
 
 var ErrWorkerPolicy = errors.New("launch.policy.worker_tuple_mismatch")
 var ErrRolePolicy = errors.New("launch.policy.unknown_role")
@@ -360,8 +356,10 @@ func EffortForRequest(req LaunchRequest) string {
 	case RoleReviewer, RoleAssayer:
 		return reviewerEffort(req)
 	case RoleWorker, RoleForgeSmith, RoleRecovery:
-		if req.Shape == "" || req.Shape == WorkerShape {
-			return WorkerEffort
+		// Shape ladder, same as chainseer effort_for. This used to hard-return
+		// "medium" for implementation, which no routed effort could satisfy.
+		if req.Shape == "" {
+			return EffortFor(WorkerShape)
 		}
 		return EffortFor(req.Shape)
 	default:
@@ -515,9 +513,15 @@ func (r *SurfaceRouter) Decide(req LaunchRequest) (*LaunchDecision, error) {
 	if !knownRole(req.Role) {
 		return nil, fmt.Errorf("%w: %s", ErrRolePolicy, req.Role)
 	}
+	// Worker/forge-smith/recovery are NOT pinned to a vendor tuple. They route
+	// like every other role: the shape's Waterfall re-ranked by live quota
+	// pressure. The previous codex/gpt-5.6-luna/medium pin defeated the router
+	// it sat on top of and stranded the fleet whenever that one pool was spent.
+	// Requested provider/model/effort from lane config are SOFT hints, exactly
+	// as .herd/herd.yaml documents them.
 	if req.Role == RoleWorker || req.Role == RoleForgeSmith || req.Role == RoleRecovery {
-		if req.Shape != WorkerShape || req.RequestedProvider != WorkerProvider || req.RequestedModel != WorkerModel || req.RequestedEffort != WorkerEffort {
-			return nil, fmt.Errorf("%w: worker/forge-smith/recovery requires %s/%s/%s %s", ErrWorkerPolicy, WorkerProvider, WorkerModel, WorkerEffort, WorkerShape)
+		if req.Shape != "" && req.Shape != WorkerShape {
+			return nil, fmt.Errorf("%w: worker/forge-smith/recovery task shape must be %s, got %q", ErrWorkerPolicy, WorkerShape, req.Shape)
 		}
 	}
 
@@ -744,9 +748,12 @@ func (r *SurfaceRouter) Decide(req LaunchRequest) (*LaunchDecision, error) {
 			best.probeKey = ProbeKey(best.provider, model)
 		}
 	}
+	// No final vendor tuple for builders — herd-route (chainseer bin/herd-route)
+	// has no such gate. The shape is still bound; the surface is whatever the
+	// live quota ranking selected from the implementation waterfall.
 	if req.Role == RoleWorker || req.Role == RoleForgeSmith || req.Role == RoleRecovery {
-		if best.provider != WorkerProvider || model != WorkerModel || effort != WorkerEffort || shape != WorkerShape {
-			return nil, fmt.Errorf("%w: worker/forge-smith/recovery final tuple must remain %s/%s/%s %s", ErrWorkerPolicy, WorkerProvider, WorkerModel, WorkerEffort, WorkerShape)
+		if shape != WorkerShape {
+			return nil, fmt.Errorf("%w: worker/forge-smith/recovery task shape must be %s, got %q", ErrWorkerPolicy, WorkerShape, shape)
 		}
 	}
 	// Final coherence re-check (mutation-safe).

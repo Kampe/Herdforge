@@ -14,12 +14,20 @@ import (
 	"github.com/Kampe/Herdforge/pkg/toolchild"
 )
 
+// Fixture tuple: production no longer pins a vendor for builder roles, so
+// these tests carry their own concrete provider instead of importing one.
+const (
+	testWorkerProvider = "codex"
+	testWorkerModel    = "gpt-5.6-luna"
+	testWorkerEffort   = "high"
+)
+
 func testLaunchRouter(t *testing.T) *router.SurfaceRouter {
 	t.Helper()
 	t.Setenv("HERDR_ROUTE_STATE_DIR", t.TempDir())
 	r := router.NewRouter(nil, nil)
 	r.Probes = &router.Probes{
-		CLIPresent: func(cli string) bool { return cli == launch.WorkerProvider },
+		CLIPresent: func(cli string) bool { return cli == testWorkerProvider },
 		Now:        func() time.Time { return time.Unix(1_800_000_000, 0) },
 	}
 	return r
@@ -173,13 +181,13 @@ func TestAgentStartBoundaryRejectsRawAndRequiresDecision(t *testing.T) {
 		}
 		return "{}", nil
 	}
-	if err := AgentStart("raw", "codex", "pane", "--model", launch.WorkerModel); err == nil {
+	if err := AgentStart("raw", "codex", "pane", "--model", testWorkerModel); err == nil {
 		t.Fatal("raw/bare AgentStart must fail closed")
 	}
 	if len(calls) != 0 {
 		t.Fatalf("raw rejection invoked process API: %v", calls)
 	}
-	d, err := testLaunchRouter(t).Decide(router.LaunchRequest{Role: router.RoleWorker, Shape: launch.Implementation, RequestedProvider: launch.WorkerProvider, RequestedModel: launch.WorkerModel, RequestedEffort: launch.WorkerEffort, TaskRef: "FAC-188", LeaseGeneration: 7, Scope: router.ScopeTask, ProbeResults: map[string]bool{router.ProbeKey(launch.WorkerProvider, launch.WorkerModel): true}})
+	d, err := testLaunchRouter(t).Decide(router.LaunchRequest{Role: router.RoleWorker, Shape: launch.Implementation, RequestedProvider: testWorkerProvider, RequestedModel: testWorkerModel, RequestedEffort: testWorkerEffort, TaskRef: "FAC-188", LeaseGeneration: 7, Scope: router.ScopeTask, ProbeResults: map[string]bool{router.ProbeKey(testWorkerProvider, testWorkerModel): true}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -198,12 +206,12 @@ func TestPreparedStartUsesPaneProcessInfoAndExactRoutedOwner(t *testing.T) {
 	defer func() { runHerdr = oldRun }()
 	defer SetPIDParentReader(func(int) (int, error) { return 500, nil })()
 	defer SetPIDStartTokenReader(func(int) (string, error) { return "agent-start", nil })()
-	d, err := testLaunchRouter(t).Decide(router.LaunchRequest{Role: router.RoleWorker, Shape: launch.Implementation, RequestedProvider: launch.WorkerProvider, RequestedModel: launch.WorkerModel, RequestedEffort: launch.WorkerEffort, TaskRef: "FAC-188", LeaseGeneration: 7, Scope: router.ScopeTask, ProbeResults: map[string]bool{router.ProbeKey(launch.WorkerProvider, launch.WorkerModel): true}})
+	d, err := testLaunchRouter(t).Decide(router.LaunchRequest{Role: router.RoleWorker, Shape: launch.Implementation, RequestedProvider: testWorkerProvider, RequestedModel: testWorkerModel, RequestedEffort: testWorkerEffort, TaskRef: "FAC-188", LeaseGeneration: 7, Scope: router.ScopeTask, ProbeResults: map[string]bool{router.ProbeKey(testWorkerProvider, testWorkerModel): true}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	req := launch.Request{Decision: d, TaskRef: d.TaskRef, LeaseGeneration: d.LeaseGeneration, Scope: d.Scope, Repository: "herdforge-test", Lane: "worker"}
-	owner := toolchild.Identity{PID: 501, StartToken: "agent-start", SessionGeneration: req.LeaseGeneration, LaunchID: launch.DecisionDigest(d), Repository: "herdforge-test", Role: launch.WorkerRole, Lane: "worker", SessionID: "session-1", PaneID: "pane-1", TabID: "tab-1", Provider: launch.WorkerProvider, ArgvDigest: launch.DecisionDigest(d)}
+	owner := toolchild.Identity{PID: 501, StartToken: "agent-start", SessionGeneration: req.LeaseGeneration, LaunchID: launch.DecisionDigest(d), Repository: "herdforge-test", Role: launch.WorkerRole, Lane: "worker", SessionID: "session-1", PaneID: "pane-1", TabID: "tab-1", Provider: testWorkerProvider, ArgvDigest: launch.DecisionDigest(d)}
 	tree := &toolchild.FakeTree{Nodes: map[int]toolchild.Node{501: {Identity: owner}, 601: {Identity: toolchild.Identity{PID: 601, ParentPID: 501, StartToken: "child-start"}, ParentPID: 501}}}
 	lc := toolchild.NewLifecycle(toolchild.Identity{}, tree, &toolchild.MemorySink{})
 	restoreFactory := SetToolChildLifecycleFactory(func(launch.Request, string, string) (ToolChildLifecycle, error) { return lc, nil })
@@ -242,7 +250,7 @@ func TestPreparedStartUsesPaneProcessInfoAndExactRoutedOwner(t *testing.T) {
 }
 
 func TestStartPreparedValidationFailureCompensatesProvisionedAuthority(t *testing.T) {
-	d, err := testLaunchRouter(t).Decide(router.LaunchRequest{Role: router.RoleWorker, Shape: launch.Implementation, RequestedProvider: launch.WorkerProvider, RequestedModel: launch.WorkerModel, RequestedEffort: launch.WorkerEffort, TaskRef: "FAC-188", LeaseGeneration: 7, Scope: router.ScopeTask, ProbeResults: map[string]bool{router.ProbeKey(launch.WorkerProvider, launch.WorkerModel): true}})
+	d, err := testLaunchRouter(t).Decide(router.LaunchRequest{Role: router.RoleWorker, Shape: launch.Implementation, RequestedProvider: testWorkerProvider, RequestedModel: testWorkerModel, RequestedEffort: testWorkerEffort, TaskRef: "FAC-188", LeaseGeneration: 7, Scope: router.ScopeTask, ProbeResults: map[string]bool{router.ProbeKey(testWorkerProvider, testWorkerModel): true}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -323,7 +331,7 @@ func TestProvisioningFailureClosesExactTabWithoutPublishingReservation(t *testin
 	newToolChildLifecycle = func(req launch.Request, _ string, _ string) (ToolChildLifecycle, error) {
 		return toolchild.NewLifecycle(toolchild.Identity{}, toolchild.SystemTree{}, failingProvisionSink{}), nil
 	}
-	d, err := testLaunchRouter(t).Decide(router.LaunchRequest{Role: router.RoleWorker, Shape: launch.Implementation, RequestedProvider: launch.WorkerProvider, RequestedModel: launch.WorkerModel, RequestedEffort: launch.WorkerEffort, TaskRef: "FAC-188", LeaseGeneration: 7, Scope: router.ScopeTask, ProbeResults: map[string]bool{router.ProbeKey(launch.WorkerProvider, launch.WorkerModel): true}})
+	d, err := testLaunchRouter(t).Decide(router.LaunchRequest{Role: router.RoleWorker, Shape: launch.Implementation, RequestedProvider: testWorkerProvider, RequestedModel: testWorkerModel, RequestedEffort: testWorkerEffort, TaskRef: "FAC-188", LeaseGeneration: 7, Scope: router.ScopeTask, ProbeResults: map[string]bool{router.ProbeKey(testWorkerProvider, testWorkerModel): true}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -468,7 +476,7 @@ func TestProductionStartCrashMatrixRetainsAuthorityUntilReadback(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			d, err := testLaunchRouter(t).Decide(router.LaunchRequest{Role: router.RoleWorker, Shape: launch.Implementation, RequestedProvider: launch.WorkerProvider, RequestedModel: launch.WorkerModel, RequestedEffort: launch.WorkerEffort, TaskRef: "FAC-188", LeaseGeneration: 7, Scope: router.ScopeTask, ProbeResults: map[string]bool{router.ProbeKey(launch.WorkerProvider, launch.WorkerModel): true}})
+			d, err := testLaunchRouter(t).Decide(router.LaunchRequest{Role: router.RoleWorker, Shape: launch.Implementation, RequestedProvider: testWorkerProvider, RequestedModel: testWorkerModel, RequestedEffort: testWorkerEffort, TaskRef: "FAC-188", LeaseGeneration: 7, Scope: router.ScopeTask, ProbeResults: map[string]bool{router.ProbeKey(testWorkerProvider, testWorkerModel): true}})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -566,10 +574,10 @@ func TestAgentStartRequiresExactClaimGenerationBeforeProcess(t *testing.T) {
 	}
 	d, err := testLaunchRouter(t).Decide(router.LaunchRequest{
 		Role: router.RoleWorker, Shape: launch.Implementation,
-		RequestedProvider: launch.WorkerProvider, RequestedModel: launch.WorkerModel,
-		RequestedEffort: launch.WorkerEffort, TaskRef: "FAC-178", LeaseGeneration: 7,
+		RequestedProvider: testWorkerProvider, RequestedModel: testWorkerModel,
+		RequestedEffort: testWorkerEffort, TaskRef: "FAC-178", LeaseGeneration: 7,
 		Scope:        router.ScopeTask,
-		ProbeResults: map[string]bool{router.ProbeKey(launch.WorkerProvider, launch.WorkerModel): true},
+		ProbeResults: map[string]bool{router.ProbeKey(testWorkerProvider, testWorkerModel): true},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -577,7 +585,7 @@ func TestAgentStartRequiresExactClaimGenerationBeforeProcess(t *testing.T) {
 	for name, generation := range map[string]int64{"zero": 0, "mismatch": 6} {
 		t.Run(name, func(t *testing.T) {
 			before := len(calls)
-			err := AgentStartWithDecision("worker", launch.WorkerProvider, "pane", launch.Request{Decision: d, TaskRef: "FAC-178", Repository: "repo", Lane: "worker", SessionGeneration: 42, LeaseGeneration: generation, Scope: router.ScopeTask})
+			err := AgentStartWithDecision("worker", testWorkerProvider, "pane", launch.Request{Decision: d, TaskRef: "FAC-178", Repository: "repo", Lane: "worker", SessionGeneration: 42, LeaseGeneration: generation, Scope: router.ScopeTask})
 			if err == nil {
 				t.Fatal("zero or mismatched generation must fail before process seam")
 			}
@@ -586,7 +594,7 @@ func TestAgentStartRequiresExactClaimGenerationBeforeProcess(t *testing.T) {
 			}
 		})
 	}
-	if err := AgentStartWithDecision("worker", launch.WorkerProvider, "pane", launch.Request{Decision: d, TaskRef: "FAC-178", Repository: "repo", Lane: "worker", SessionGeneration: 42, LeaseGeneration: 7, Scope: router.ScopeTask}); err == nil {
+	if err := AgentStartWithDecision("worker", testWorkerProvider, "pane", launch.Request{Decision: d, TaskRef: "FAC-178", Repository: "repo", Lane: "worker", SessionGeneration: 42, LeaseGeneration: 7, Scope: router.ScopeTask}); err == nil {
 		t.Fatal("exact generation without prepared lifecycle must still fail closed")
 	}
 	if len(calls) != 0 {
@@ -596,7 +604,7 @@ func TestAgentStartRequiresExactClaimGenerationBeforeProcess(t *testing.T) {
 
 func TestResumeUsesDurableClientIdentityNotHerdrMetadata(t *testing.T) {
 	t.Setenv("HERD_LAUNCH_RECEIPTS", t.TempDir()+"/receipts.jsonl")
-	d, err := testLaunchRouter(t).Decide(router.LaunchRequest{Role: router.RoleWorker, Shape: launch.Implementation, RequestedProvider: launch.WorkerProvider, RequestedModel: launch.WorkerModel, RequestedEffort: launch.WorkerEffort, ProbeResults: map[string]bool{router.ProbeKey(launch.WorkerProvider, launch.WorkerModel): true}})
+	d, err := testLaunchRouter(t).Decide(router.LaunchRequest{Role: router.RoleWorker, Shape: launch.Implementation, RequestedProvider: testWorkerProvider, RequestedModel: testWorkerModel, RequestedEffort: testWorkerEffort, ProbeResults: map[string]bool{router.ProbeKey(testWorkerProvider, testWorkerModel): true}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -632,10 +640,10 @@ func TestStandingReceiptCannotAuthorizeClaimedTaskAssignment(t *testing.T) {
 	t.Setenv("HERD_LAUNCH_RECEIPTS", receiptPath)
 	standing, err := testLaunchRouter(t).Decide(router.LaunchRequest{
 		Role: router.RoleWorker, Shape: launch.Implementation,
-		RequestedProvider: launch.WorkerProvider, RequestedModel: launch.WorkerModel,
-		RequestedEffort: launch.WorkerEffort, TaskRef: "worker",
+		RequestedProvider: testWorkerProvider, RequestedModel: testWorkerModel,
+		RequestedEffort: testWorkerEffort, TaskRef: "worker",
 		Scope:        router.ScopeLane,
-		ProbeResults: map[string]bool{router.ProbeKey(launch.WorkerProvider, launch.WorkerModel): true},
+		ProbeResults: map[string]bool{router.ProbeKey(testWorkerProvider, testWorkerModel): true},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -678,7 +686,7 @@ func TestStandingReceiptCannotAuthorizeClaimedTaskAssignment(t *testing.T) {
 func TestResumeRejectsStoredCoordinatorTierDecisionWithoutPrompt(t *testing.T) {
 	receiptPath := t.TempDir() + "/receipts.jsonl"
 	t.Setenv("HERD_LAUNCH_RECEIPTS", receiptPath)
-	d, err := testLaunchRouter(t).Decide(router.LaunchRequest{Role: router.RoleWorker, Shape: launch.Implementation, RequestedProvider: launch.WorkerProvider, RequestedModel: launch.WorkerModel, RequestedEffort: launch.WorkerEffort, ProbeResults: map[string]bool{router.ProbeKey(launch.WorkerProvider, launch.WorkerModel): true}})
+	d, err := testLaunchRouter(t).Decide(router.LaunchRequest{Role: router.RoleWorker, Shape: launch.Implementation, RequestedProvider: testWorkerProvider, RequestedModel: testWorkerModel, RequestedEffort: testWorkerEffort, ProbeResults: map[string]bool{router.ProbeKey(testWorkerProvider, testWorkerModel): true}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -686,8 +694,8 @@ func TestResumeRejectsStoredCoordinatorTierDecisionWithoutPrompt(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	forbidden := &router.LaunchDecision{Role: router.RoleWorker, Shape: launch.Implementation, Provider: launch.WorkerProvider, Model: "gpt-5.6-sol", Effort: "ultra", Argv: []string{"codex", "--model", "gpt-5.6-sol", "-c", "model_reasoning_effort=ultra", "-a", "never"}}
-	historical := launch.Receipt{TaskRef: "FAC-175", Role: launch.WorkerRole, TaskShape: launch.Implementation, Provider: launch.WorkerProvider, Model: forbidden.Model, Effort: forbidden.Effort, DecisionDigest: launch.DecisionDigest(forbidden), Argv: forbidden.Argv, Accepted: true, Name: "stored-worker", PaneID: "pane-1", LeaseGeneration: 7}
+	forbidden := &router.LaunchDecision{Role: router.RoleWorker, Shape: launch.Implementation, Provider: testWorkerProvider, Model: "gpt-5.6-sol", Effort: "ultra", Argv: []string{"codex", "--model", "gpt-5.6-sol", "-c", "model_reasoning_effort=ultra", "-a", "never"}}
+	historical := launch.Receipt{TaskRef: "FAC-175", Role: launch.WorkerRole, TaskShape: launch.Implementation, Provider: testWorkerProvider, Model: forbidden.Model, Effort: forbidden.Effort, DecisionDigest: launch.DecisionDigest(forbidden), Argv: forbidden.Argv, Accepted: true, Name: "stored-worker", PaneID: "pane-1", LeaseGeneration: 7}
 	if err := (&launch.JSONLSink{Path: receiptPath}).Write(historical); err != nil {
 		t.Fatal(err)
 	}
@@ -709,7 +717,7 @@ func TestResumeRejectsStoredCoordinatorTierDecisionWithoutPrompt(t *testing.T) {
 
 func TestResumePreservesMalformedCurrentDecisionError(t *testing.T) {
 	t.Setenv("HERD_LAUNCH_RECEIPTS", t.TempDir()+"/receipts.jsonl")
-	d, err := testLaunchRouter(t).Decide(router.LaunchRequest{Role: router.RoleWorker, Shape: launch.Implementation, RequestedProvider: launch.WorkerProvider, RequestedModel: launch.WorkerModel, RequestedEffort: launch.WorkerEffort, ProbeResults: map[string]bool{router.ProbeKey(launch.WorkerProvider, launch.WorkerModel): true}})
+	d, err := testLaunchRouter(t).Decide(router.LaunchRequest{Role: router.RoleWorker, Shape: launch.Implementation, RequestedProvider: testWorkerProvider, RequestedModel: testWorkerModel, RequestedEffort: testWorkerEffort, ProbeResults: map[string]bool{router.ProbeKey(testWorkerProvider, testWorkerModel): true}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -741,7 +749,7 @@ func TestResumeRejectsMissingAndStaleReceiptsWithoutProcessOrPrompt(t *testing.T
 	}{
 		{name: "missing", populate: func(string) error { return nil }},
 		{name: "lease-mismatch", populate: func(path string) error {
-			d, err := testLaunchRouter(t).Decide(router.LaunchRequest{Role: router.RoleWorker, Shape: launch.Implementation, RequestedProvider: launch.WorkerProvider, RequestedModel: launch.WorkerModel, RequestedEffort: launch.WorkerEffort, ProbeResults: map[string]bool{router.ProbeKey(launch.WorkerProvider, launch.WorkerModel): true}})
+			d, err := testLaunchRouter(t).Decide(router.LaunchRequest{Role: router.RoleWorker, Shape: launch.Implementation, RequestedProvider: testWorkerProvider, RequestedModel: testWorkerModel, RequestedEffort: testWorkerEffort, ProbeResults: map[string]bool{router.ProbeKey(testWorkerProvider, testWorkerModel): true}})
 			if err != nil {
 				return err
 			}
@@ -749,7 +757,7 @@ func TestResumeRejectsMissingAndStaleReceiptsWithoutProcessOrPrompt(t *testing.T
 			if err != nil {
 				return err
 			}
-			return (&launch.JSONLSink{Path: path}).Write(launch.Receipt{TaskRef: "FAC-175", Role: launch.WorkerRole, TaskShape: launch.Implementation, Provider: launch.WorkerProvider, Model: launch.WorkerModel, Effort: launch.WorkerEffort, DecisionDigest: launch.DecisionDigest(d), Argv: d.Argv, Accepted: true, Name: "stored-worker", PaneID: "pane-1", LeaseGeneration: 6})
+			return (&launch.JSONLSink{Path: path}).Write(launch.Receipt{TaskRef: "FAC-175", Role: launch.WorkerRole, TaskShape: launch.Implementation, Provider: testWorkerProvider, Model: testWorkerModel, Effort: testWorkerEffort, DecisionDigest: launch.DecisionDigest(d), Argv: d.Argv, Accepted: true, Name: "stored-worker", PaneID: "pane-1", LeaseGeneration: 6})
 		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -758,7 +766,7 @@ func TestResumeRejectsMissingAndStaleReceiptsWithoutProcessOrPrompt(t *testing.T
 			if err := tc.populate(path); err != nil {
 				t.Fatal(err)
 			}
-			d, err := testLaunchRouter(t).Decide(router.LaunchRequest{Role: router.RoleWorker, Shape: launch.Implementation, RequestedProvider: launch.WorkerProvider, RequestedModel: launch.WorkerModel, RequestedEffort: launch.WorkerEffort, ProbeResults: map[string]bool{router.ProbeKey(launch.WorkerProvider, launch.WorkerModel): true}})
+			d, err := testLaunchRouter(t).Decide(router.LaunchRequest{Role: router.RoleWorker, Shape: launch.Implementation, RequestedProvider: testWorkerProvider, RequestedModel: testWorkerModel, RequestedEffort: testWorkerEffort, ProbeResults: map[string]bool{router.ProbeKey(testWorkerProvider, testWorkerModel): true}})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -789,10 +797,10 @@ func standingResumeFixture(t *testing.T, durable bool) (launch.Request, *toolchi
 	t.Setenv("HERD_LAUNCH_RECEIPTS", t.TempDir()+"/launch.jsonl")
 	d, err := testLaunchRouter(t).Decide(router.LaunchRequest{
 		Role: router.RoleWorker, Shape: launch.Implementation, TaskRef: "FAC-188",
-		LeaseGeneration: 7, RequestedProvider: launch.WorkerProvider,
-		RequestedModel: launch.WorkerModel, RequestedEffort: launch.WorkerEffort,
+		LeaseGeneration: 7, RequestedProvider: testWorkerProvider,
+		RequestedModel: testWorkerModel, RequestedEffort: testWorkerEffort,
 		Scope:        router.ScopeTask,
-		ProbeResults: map[string]bool{router.ProbeKey(launch.WorkerProvider, launch.WorkerModel): true},
+		ProbeResults: map[string]bool{router.ProbeKey(testWorkerProvider, testWorkerModel): true},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -913,7 +921,7 @@ func TestStandingResumeRejectsLifecycleTupleMismatches(t *testing.T) {
 
 func TestReceiptFailureClosesAndVerifiesExactTab(t *testing.T) {
 	t.Setenv("HERD_LAUNCH_RECEIPTS", "/dev/null/launch-receipts.jsonl")
-	d, err := testLaunchRouter(t).Decide(router.LaunchRequest{Role: router.RoleWorker, Shape: launch.Implementation, RequestedProvider: launch.WorkerProvider, RequestedModel: launch.WorkerModel, RequestedEffort: launch.WorkerEffort, TaskRef: "FAC-188", LeaseGeneration: 7, Scope: router.ScopeTask, ProbeResults: map[string]bool{router.ProbeKey(launch.WorkerProvider, launch.WorkerModel): true}})
+	d, err := testLaunchRouter(t).Decide(router.LaunchRequest{Role: router.RoleWorker, Shape: launch.Implementation, RequestedProvider: testWorkerProvider, RequestedModel: testWorkerModel, RequestedEffort: testWorkerEffort, TaskRef: "FAC-188", LeaseGeneration: 7, Scope: router.ScopeTask, ProbeResults: map[string]bool{router.ProbeKey(testWorkerProvider, testWorkerModel): true}})
 	if err != nil {
 		t.Fatal(err)
 	}

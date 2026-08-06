@@ -23,6 +23,15 @@ import (
 	"github.com/Kampe/Herdforge/pkg/worktree"
 )
 
+// Fixture tuple for launch-policy tests. Deliberately a concrete provider so
+// the hermetic router picks deterministically; production no longer pins any
+// vendor for builder roles, so these must NOT come from pkg/launch.
+const (
+	testWorkerProvider = "codex"
+	testWorkerModel    = "gpt-5.6-luna"
+	testWorkerEffort   = "high"
+)
+
 // --- fakes -----------------------------------------------------------------
 
 type recordingCompensator struct {
@@ -161,7 +170,7 @@ func testRouter(t *testing.T) *router.SurfaceRouter {
 	t.Setenv("HERDR_ROUTE_STATE_DIR", t.TempDir())
 	r := router.NewRouter(nil, nil)
 	r.Probes = &router.Probes{
-		CLIPresent: func(cli string) bool { return cli == launch.WorkerProvider },
+		CLIPresent: func(cli string) bool { return cli == testWorkerProvider },
 		Now:        func() time.Time { return time.Unix(1_800_000_000, 0) },
 	}
 	return r
@@ -169,7 +178,7 @@ func testRouter(t *testing.T) *router.SurfaceRouter {
 
 func validLaunchOptions(t *testing.T, ref string) DispatchOptions {
 	t.Helper()
-	d, err := testRouter(t).Decide(router.LaunchRequest{Role: router.RoleWorker, Shape: launch.Implementation, RequestedProvider: launch.WorkerProvider, RequestedModel: launch.WorkerModel, RequestedEffort: launch.WorkerEffort, ProbeResults: map[string]bool{router.ProbeKey(launch.WorkerProvider, launch.WorkerModel): true}})
+	d, err := testRouter(t).Decide(router.LaunchRequest{Role: router.RoleWorker, Shape: launch.Implementation, RequestedProvider: testWorkerProvider, RequestedModel: testWorkerModel, RequestedEffort: testWorkerEffort, ProbeResults: map[string]bool{router.ProbeKey(testWorkerProvider, testWorkerModel): true}})
 	if err != nil {
 		t.Fatalf("build launch fixture: %v", err)
 	}
@@ -381,8 +390,8 @@ func TestDispatch_Launch_SetsCwdAndProvesPrompt(t *testing.T) {
 	if res.TabID != "tab-9" {
 		t.Fatalf("TabID = %q", res.TabID)
 	}
-	wantArgv := []string{"codex", "--model", launch.WorkerModel, "-c", "model_reasoning_effort=medium", "-a", "never", "-c", "mcp_servers.code-review-graph.enabled=false"}
-	if fh.startReq.Decision == nil || !reflect.DeepEqual(fh.startReq.Decision.Argv, wantArgv) || fh.startReq.Decision.Provider != launch.WorkerProvider {
+	wantArgv := []string{"codex", "--model", testWorkerModel, "-c", "model_reasoning_effort=" + testWorkerEffort, "-a", "never", "-c", "mcp_servers.code-review-graph.enabled=false"}
+	if fh.startReq.Decision == nil || !reflect.DeepEqual(fh.startReq.Decision.Argv, wantArgv) || fh.startReq.Decision.Provider != testWorkerProvider {
 		t.Fatalf("dispatch launch decision = %+v, want provider/argv %s", fh.startReq.Decision, wantArgv)
 	}
 	if res.Receipt == nil || !res.Receipt.Consumed || !res.Receipt.Verified {

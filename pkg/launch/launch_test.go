@@ -12,12 +12,21 @@ import (
 	"github.com/Kampe/Herdforge/pkg/router"
 )
 
+// Fixture tuple for launch-policy tests. Deliberately a concrete provider so
+// the hermetic router picks deterministically; production no longer pins any
+// vendor for builder roles, so these must NOT come from pkg/launch.
+const (
+	testWorkerProvider = "codex"
+	testWorkerModel    = "gpt-5.6-luna"
+	testWorkerEffort   = "high"
+)
+
 func testRouter(t *testing.T) *router.SurfaceRouter {
 	t.Helper()
 	t.Setenv("HERDR_ROUTE_STATE_DIR", t.TempDir())
 	r := router.NewRouter(nil, nil)
 	r.Probes = &router.Probes{
-		CLIPresent: func(cli string) bool { return cli == WorkerProvider },
+		CLIPresent: func(cli string) bool { return cli == testWorkerProvider },
 		Now:        func() time.Time { return time.Unix(1_800_000_000, 0) },
 	}
 	return r
@@ -25,7 +34,7 @@ func testRouter(t *testing.T) *router.SurfaceRouter {
 
 func good(t *testing.T) Request {
 	t.Helper()
-	d, err := testRouter(t).Decide(router.LaunchRequest{Role: router.RoleWorker, Shape: Implementation, RequestedProvider: WorkerProvider, RequestedModel: WorkerModel, RequestedEffort: WorkerEffort, ProbeResults: map[string]bool{router.ProbeKey(WorkerProvider, WorkerModel): true}})
+	d, err := testRouter(t).Decide(router.LaunchRequest{Role: router.RoleWorker, Shape: Implementation, RequestedProvider: testWorkerProvider, RequestedModel: testWorkerModel, RequestedEffort: testWorkerEffort, ProbeResults: map[string]bool{router.ProbeKey(testWorkerProvider, testWorkerModel): true}})
 	if err != nil {
 		t.Fatalf("build worker fixture: %v", err)
 	}
@@ -88,7 +97,7 @@ func TestValidateNormalizesAllowedAliases(t *testing.T) {
 }
 
 func TestRecoveryDecisionUsesSameWorkerBoundary(t *testing.T) {
-	d, err := testRouter(t).Decide(router.LaunchRequest{Role: router.RoleRecovery, Shape: Implementation, RequestedProvider: WorkerProvider, RequestedModel: WorkerModel, RequestedEffort: WorkerEffort, ProbeResults: map[string]bool{router.ProbeKey(WorkerProvider, WorkerModel): true}})
+	d, err := testRouter(t).Decide(router.LaunchRequest{Role: router.RoleRecovery, Shape: Implementation, RequestedProvider: testWorkerProvider, RequestedModel: testWorkerModel, RequestedEffort: testWorkerEffort, ProbeResults: map[string]bool{router.ProbeKey(testWorkerProvider, testWorkerModel): true}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -112,10 +121,10 @@ func TestDecisionDigestBindsReceiptToDecision(t *testing.T) {
 }
 
 func TestHandBuiltApprovedTupleFailsClosed(t *testing.T) {
-	d := &router.LaunchDecision{Role: router.RoleWorker, Shape: Implementation, Provider: WorkerProvider, Model: WorkerModel, Effort: WorkerEffort, Argv: []string{"codex", "--model", WorkerModel, "-c", "model_reasoning_effort=medium", "-a", "never"}}
+	d := &router.LaunchDecision{Role: router.RoleWorker, Shape: Implementation, Provider: testWorkerProvider, Model: testWorkerModel, Effort: testWorkerEffort, Argv: []string{"codex", "--model", testWorkerModel, "-c", "model_reasoning_effort=" + testWorkerEffort, "-a", "never"}}
 	// This is an exact public-field forgery: recompute the production
 	// canonical digest byte-for-byte instead of merely omitting Proof.
-	canonical := fmt.Sprintf("%s|%s|%s|%s|%s|%s|%s|%d|%s|%s|%s|%s|%s", "herdforge-fac-175-launch-decision-v1", "worker", Implementation, WorkerProvider, WorkerModel, WorkerEffort, d.CandidateSHA, d.LeaseGeneration, d.TaskRef, d.Scope, d.ProbeKey, d.Rationale, strings.Join(d.Argv, "\x00"))
+	canonical := fmt.Sprintf("%s|%s|%s|%s|%s|%s|%s|%d|%s|%s|%s|%s|%s", "herdforge-fac-175-launch-decision-v1", "worker", Implementation, testWorkerProvider, testWorkerModel, testWorkerEffort, d.CandidateSHA, d.LeaseGeneration, d.TaskRef, d.Scope, d.ProbeKey, d.Rationale, strings.Join(d.Argv, "\x00"))
 	sum := sha256.Sum256([]byte(canonical))
 	d.Proof = "sha256:" + hex.EncodeToString(sum[:])
 	r := Request{Decision: d}
@@ -130,10 +139,10 @@ func TestHasStartedRejectsConflictingPersistedTupleDespiteMatchingDigest(t *test
 	req.TaskRef, req.Name, req.PaneID, req.LeaseGeneration = "FAC-175", "worker", "pane-1", 7
 	if err := (&JSONLSink{Path: os.Getenv("HERD_LAUNCH_RECEIPTS")}).Write(Receipt{
 		TaskRef: req.TaskRef, Name: req.Name, PaneID: req.PaneID, LeaseGeneration: req.LeaseGeneration,
-		Role: WorkerRole, TaskShape: Implementation, Provider: WorkerProvider,
+		Role: WorkerRole, TaskShape: Implementation, Provider: testWorkerProvider,
 		// The digest claims the current Luna decision, while persisted identity
 		// fields and argv claim the forbidden coordinator-tier session.
-		Model: WorkerModel, Effort: "ultra", DecisionDigest: DecisionDigest(req.Decision),
+		Model: testWorkerModel, Effort: "ultra", DecisionDigest: DecisionDigest(req.Decision),
 		Argv: []string{"codex", "--model", "gpt-5.6-sol", "-c", "model_reasoning_effort=ultra", "-a", "never"}, Accepted: true,
 	}); err != nil {
 		t.Fatal(err)
@@ -219,8 +228,15 @@ func TestHasStartedRejectsMalformedReceiptData(t *testing.T) {
 
 func TestEditedRouterDecisionFailsProof(t *testing.T) {
 	r := good(t)
-	r.Decision.Effort = "high"
+	// Tamper with a value that is definitely NOT what the router issued. This
+	// previously wrote "high", which silently became a no-op once the worker
+	// effort ladder started producing "high" — the test passed by accident.
+	if r.Decision.Effort == "low" {
+		r.Decision.Effort = "high"
+	} else {
+		r.Decision.Effort = "low"
+	}
 	if err := Validate(r, &MemorySink{}); err == nil {
-		t.Fatal("edited routed decision must fail proof verification")
+		t.Fatalf("edited routed decision must fail proof verification (effort now %q)", r.Decision.Effort)
 	}
 }
