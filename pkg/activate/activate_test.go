@@ -3,10 +3,11 @@ package activate
 import (
 	"errors"
 	"os"
-	"os/exec"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/Kampe/Herdforge/internal/testgit"
 )
 
 // --- Pure predicate fixtures (mirror bin/herd-activate --selftest) ---
@@ -502,9 +503,7 @@ func TestCanonicalCheckout_WorktreeRefused(t *testing.T) {
 
 	runGit := func(dir string, args ...string) {
 		t.Helper()
-		cmd := exec.Command("git", args...)
-		cmd.Dir = dir
-		cmd.Env = append(os.Environ(), "GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_SYSTEM=/dev/null")
+		cmd := testgit.Command(dir, args...)
 		if out, err := cmd.CombinedOutput(); err != nil {
 			t.Fatalf("git %v in %s failed: %v\n%s", args, dir, err, out)
 		}

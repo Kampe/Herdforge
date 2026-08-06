@@ -5,13 +5,13 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/Kampe/Herdforge/internal/testgit"
 	"github.com/Kampe/Herdforge/pkg/ledger"
 )
 
@@ -370,7 +370,7 @@ func TestServiceRejectsSharedRootAndUnownedWorktree(t *testing.T) {
 			t.Fatal(err)
 		}
 		runGit := func(args ...string) string {
-			cmd := exec.Command("git", append([]string{"-C", repo}, args...)...)
+			cmd := testgit.Command(repo, args...)
 			out, err := cmd.CombinedOutput()
 			if err != nil {
 				t.Fatalf("git %v: %v\n%s", args, err, out)

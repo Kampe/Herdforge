@@ -3,33 +3,33 @@ package release
 import (
 	"context"
 	"os"
-	"os/exec"
 	"strings"
 	"testing"
+
+	"github.com/Kampe/Herdforge/internal/testgit"
 )
 
 func TestGenerateChangelog_WithFromTag(t *testing.T) {
- tmpDir := t.TempDir()
- initGitRepo(t, tmpDir)
+	tmpDir := t.TempDir()
+	initGitRepo(t, tmpDir)
 
- // Create a tag so git log v0.0.1..HEAD works
- cmd := exec.Command("git", "tag", "v0.0.1", "-m", "tag v0.0.1")
- cmd.Dir = tmpDir
- if out, err := cmd.CombinedOutput(); err != nil {
-  t.Fatalf("git tag: %v, %s", err, out)
- }
+	// Create a tag so git log v0.0.1..HEAD works
+	cmd := testgit.Command(tmpDir, "tag", "v0.0.1", "-m", "tag v0.0.1")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git tag: %v, %s", err, out)
+	}
 
- r := NewReleaseEngine(tmpDir)
- notes, md, err := r.GenerateChangelog(context.Background(), "v0.0.1", "v0.2.0")
- if err != nil {
-  t.Fatalf("expected clean changelog, got err: %v", err)
- }
- if notes.Version != "v0.2.0" {
-  t.Errorf("expected version v0.2.0, got %s", notes.Version)
- }
- if !strings.Contains(md, "v0.2.0") {
-  t.Errorf("expected markdown to contain version")
- }
+	r := NewReleaseEngine(tmpDir)
+	notes, md, err := r.GenerateChangelog(context.Background(), "v0.0.1", "v0.2.0")
+	if err != nil {
+		t.Fatalf("expected clean changelog, got err: %v", err)
+	}
+	if notes.Version != "v0.2.0" {
+		t.Errorf("expected version v0.2.0, got %s", notes.Version)
+	}
+	if !strings.Contains(md, "v0.2.0") {
+		t.Errorf("expected markdown to contain version")
+	}
 }
 
 func TestGenerateChangelog_SortsByTypes(t *testing.T) {
@@ -67,8 +67,7 @@ func initGitRepo(t *testing.T, dir string) {
 		{"config", "user.email", "test@test.com"},
 		{"config", "user.name", "Test"},
 	} {
-		cmd := exec.Command("git", args...)
-		cmd.Dir = dir
+		cmd := testgit.Command(dir, args...)
 		if out, err := cmd.CombinedOutput(); err != nil {
 			t.Fatalf("git %v: %v, %s", args, err, out)
 		}
@@ -83,13 +82,11 @@ func makeCommit(t *testing.T, dir, msg string) {
 		t.Fatalf("create temp: %v", err)
 	}
 	f.Close()
-	cmd := exec.Command("git", "add", ".")
-	cmd.Dir = dir
+	cmd := testgit.Command(dir, "add", ".")
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("git add: %v, %s", err, out)
 	}
-	cmd = exec.Command("git", "commit", "-m", msg, "--allow-empty")
-	cmd.Dir = dir
+	cmd = testgit.Command(dir, "commit", "-m", msg, "--allow-empty")
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("git commit: %v, %s", err, out)
 	}
