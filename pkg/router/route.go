@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/Kampe/Herdforge/pkg/posture"
+	"github.com/Kampe/Herdforge/pkg/toolpolicy"
 	"github.com/Kampe/Herdforge/pkg/usage"
 )
 
@@ -308,7 +309,7 @@ func ArgvFor(provider, model, effort string) []string {
 	case "agy":
 		return []string{"agy", "--model", model, "--prompt-interactive"}
 	case "codex":
-		return []string{"codex", "--model", model, "-c", "model_reasoning_effort=" + pe, "-a", "never", "-c", "mcp_servers.code-review-graph.enabled=false"}
+		return []string{"codex", "--model", model, "-c", "model_reasoning_effort=" + pe, "-a", "never", "-c", toolpolicy.CodexDisableCodeReviewGraph}
 	case "grok":
 		return []string{"grok", "--model", model, "--reasoning-effort", pe, "--always-approve"}
 	case "kimi":

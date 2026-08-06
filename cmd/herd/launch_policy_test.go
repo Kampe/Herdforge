@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -329,5 +331,37 @@ func TestConfiguredRolePoliciesAreComplete(t *testing.T) {
 		if err := validateLaneLaunchConfig(&lane); err != nil {
 			t.Errorf("%s: %v", lane.Role, err)
 		}
+	}
+}
+
+func TestLaneLaunchDecisionProbesExactCodexProvider(t *testing.T) {
+	dir := t.TempDir()
+	opencodeMarker := filepath.Join(dir, "opencode.called")
+	codex := "#!/bin/sh\nout=\nprev=\nfor a in \"$@\"; do\n  if [ \"$prev\" = \"--output-last-message\" ]; then\n    out=$a\n  fi\n  prev=$a\ndone\nif [ -n \"$out\" ]; then\n  printf '%s\\n' \"PROBE_OK\" > \"$out\"\nfi\necho '{\"type\":\"turn.completed\"}'\n"
+	opencode := "#!/bin/sh\necho called > \"" + opencodeMarker + "\"\necho quota exceeded\nexit 91\n"
+	if err := os.WriteFile(filepath.Join(dir, "codex"), []byte(codex), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "opencode"), []byte(opencode), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir)
+	t.Setenv("HERD_AVAILABLE_PROVIDERS", "codex")
+	t.Setenv("HERDR_ROUTE_STATE_DIR", t.TempDir())
+	lane := &config.LaneDef{
+		Name: "smith", Role: launch.WorkerRole, AgentKind: launch.WorkerProvider,
+		Provider: launch.WorkerProvider, Model: launch.WorkerModel,
+		Effort: launch.WorkerEffort, TaskShape: launch.Implementation,
+	}
+
+	decision, err := laneLaunchDecision(context.Background(), lane, nil)
+	if err != nil {
+		t.Fatalf("configured Codex route rejected: %v", err)
+	}
+	if decision.Provider != launch.WorkerProvider || decision.Model != launch.WorkerModel || decision.Effort != launch.WorkerEffort {
+		t.Fatalf("routed tuple drifted: %+v", decision)
+	}
+	if _, err := os.Stat(opencodeMarker); !os.IsNotExist(err) {
+		t.Fatalf("lane Codex route invoked OpenCode: %v", err)
 	}
 }

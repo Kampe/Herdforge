@@ -3099,10 +3099,10 @@ func laneLaunchDecision(ctx context.Context, lane *config.LaneDef, task *provide
 		if _, done := probes[key]; done {
 			continue
 		}
-		probes[key] = herdr.ProbeModel(ctx, cm).Available
+		probes[key] = herdr.ProbeProviderModel(ctx, cp, cm, lane.Effort).Available
 	}
 	if router.ModelRequiresProbe(model) {
-		probes[router.ProbeKey(provider, model)] = herdr.ProbeModel(ctx, model).Available
+		probes[router.ProbeKey(provider, model)] = herdr.ProbeProviderModel(ctx, provider, model, lane.Effort).Available
 	}
 	if len(probes) > 0 {
 		request.ProbeResults = probes

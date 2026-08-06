@@ -17,7 +17,7 @@ func TestBuildPolicyInvocationCompilesBoundHandoff(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []string{"codex", "--disable", "multi_agent", "--disable", "multi_agent_v2", "-c", "mcp_servers.code-review-graph.enabled=false", "prompt"}
+	want := []string{"codex", "--disable", "multi_agent", "--disable", "multi_agent_v2", "-c", "mcp_servers.code-review-graph={command=\"false\",enabled=false}", "prompt"}
 	if !reflect.DeepEqual(got.Argv, want) {
 		t.Fatalf("argv = %v, want %v", got.Argv, want)
 	}

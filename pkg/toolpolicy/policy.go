@@ -10,7 +10,13 @@ import (
 	"time"
 )
 
-const CodeReviewGraph = "code-review-graph"
+const (
+	CodeReviewGraph = "code-review-graph"
+	// CodexDisableCodeReviewGraph is a complete disabled stdio server value.
+	// A partial `.enabled=false` value is rejected by Codex when the inherited
+	// config has no server definition ("invalid transport").
+	CodexDisableCodeReviewGraph = `mcp_servers.code-review-graph={command="false",enabled=false}`
+)
 
 var ErrMissingPolicy = errors.New("tool policy is missing compiled effective configuration")
 
@@ -49,14 +55,71 @@ func CompileCodexArgs(argv []string) ([]string, error) {
 	if len(argv) == 0 || strings.TrimSpace(argv[0]) != "codex" {
 		return nil, fmt.Errorf("compile codex policy: codex executable is required")
 	}
-	for i := 0; i+1 < len(argv); i++ {
-		if argv[i] == "-c" && argv[i+1] == "mcp_servers.code-review-graph.enabled=false" {
-			return append([]string(nil), argv...), nil
+	out := make([]string, 0, len(argv))
+	insertAt := -1
+	for i := 0; i < len(argv); i++ {
+		arg := argv[i]
+		if arg == "--" {
+			for _, trailing := range argv[i+1:] {
+				if targetsCodeReviewGraph(trailing) {
+					return nil, fmt.Errorf("compile codex policy: code-review-graph policy appears after --")
+				}
+			}
+			if insertAt < 0 {
+				insertAt = len(out)
+			}
+			out = append(out, argv[i:]...)
+			break
+		}
+		if arg == "-c" || arg == "--config" {
+			if i+1 >= len(argv) {
+				return nil, fmt.Errorf("compile codex policy: %s requires a value", arg)
+			}
+			value := argv[i+1]
+			if targetsCodeReviewGraph(value) {
+				insertAt = len(out)
+				i++
+				continue
+			}
+			out = append(out, arg, value)
+			i++
+			continue
+		}
+		if value, ok := inlineConfigValue(arg); ok {
+			if value == "" {
+				return nil, fmt.Errorf("compile codex policy: inline config requires a value")
+			}
+			if targetsCodeReviewGraph(value) {
+				insertAt = len(out)
+				continue
+			}
+		}
+		out = append(out, arg)
+	}
+	if insertAt < 0 {
+		insertAt = len(out)
+	}
+	return insertCodexPolicy(out, insertAt), nil
+}
+
+func inlineConfigValue(arg string) (string, bool) {
+	for _, prefix := range []string{"--config=", "-c="} {
+		if strings.HasPrefix(arg, prefix) {
+			return strings.TrimPrefix(arg, prefix), true
 		}
 	}
-	out := append([]string(nil), argv...)
-	out = append(out, "-c", "mcp_servers.code-review-graph.enabled=false")
-	return out, nil
+	return "", false
+}
+
+func insertCodexPolicy(argv []string, at int) []string {
+	out := make([]string, 0, len(argv)+2)
+	out = append(out, argv[:at]...)
+	out = append(out, "-c", CodexDisableCodeReviewGraph)
+	return append(out, argv[at:]...)
+}
+
+func targetsCodeReviewGraph(value string) bool {
+	return strings.Contains(strings.ToLower(value), strings.ToLower(CodeReviewGraph))
 }
 
 func Require(role Role, provider string, argv []string) ([]string, EffectiveConfig, error) {
