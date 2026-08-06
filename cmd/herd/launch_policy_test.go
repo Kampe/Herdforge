@@ -199,7 +199,7 @@ func TestWorkerUnprobedFallbackRejectsBeforeAnySideEffect(t *testing.T) {
 					TaskRef:           lane.Name,
 					Scope:             router.ScopeLane,
 					// No passing probe for any reachable model: fail closed.
-					ProbeResults:      map[string]bool{router.ProbeKey(testWorkerProvider, "gpt-5.3-codex-spark"): false},
+					ProbeResults: map[string]bool{router.ProbeKey(testWorkerProvider, "gpt-5.3-codex-spark"): false},
 				})
 			}, func(*router.LaunchDecision) error {
 				t.Fatal("rejected launch reached lifecycle side effects")

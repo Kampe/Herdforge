@@ -324,7 +324,18 @@ func TestAuthorityHasStartedRejectsEveryExactBindingMismatch(t *testing.T) {
 		mutate func(*Request)
 		packet string
 	}{
-		{"task", func(r *Request) { r.TaskRef = "other" }, "packet"}, {"repository", func(r *Request) { r.Repository = "other" }, "packet"}, {"lane", func(r *Request) { r.Lane = "other" }, "packet"}, {"name", func(r *Request) { r.Name = "other" }, "packet"}, {"lease", func(r *Request) { r.LeaseGeneration++ }, "packet"}, {"session-generation", func(r *Request) { r.SessionGeneration++ }, "packet"}, {"role", func(r *Request) { r.Decision.Role = router.RoleForgeSmith }, "packet"}, {"shape", func(r *Request) { r.Decision.Shape = "research" }, "packet"}, {"provider", func(r *Request) { r.Decision.Provider = "other" }, "packet"}, {"model", func(r *Request) { r.Decision.Model = "other" }, "packet"}, {"effort", func(r *Request) { r.Decision.Effort = "high" }, "packet"}, {"decision-digest", func(r *Request) { r.Decision.Rationale = "other" }, "packet"}, {"argv", func(r *Request) {
+		{"task", func(r *Request) { r.TaskRef = "other" }, "packet"}, {"repository", func(r *Request) { r.Repository = "other" }, "packet"}, {"lane", func(r *Request) { r.Lane = "other" }, "packet"}, {"name", func(r *Request) { r.Name = "other" }, "packet"}, {"lease", func(r *Request) { r.LeaseGeneration++ }, "packet"}, {"session-generation", func(r *Request) { r.SessionGeneration++ }, "packet"}, {"role", func(r *Request) { r.Decision.Role = router.RoleForgeSmith }, "packet"}, {"shape", func(r *Request) { r.Decision.Shape = "research" }, "packet"}, {"provider", func(r *Request) { r.Decision.Provider = "other" }, "packet"}, {"model", func(r *Request) { r.Decision.Model = "other" }, "packet"}, {"effort", func(r *Request) {
+			// Mutate to a value guaranteed DIFFERENT from the fixture's. A
+			// literal "high" became a no-op once the worker effort ladder
+			// started producing "high", and a no-op mutation makes the
+			// authority correctly accept — so the case silently stopped
+			// testing anything. Same defect as TestEditedRouterDecisionFailsProof.
+			if r.Decision.Effort == "low" {
+				r.Decision.Effort = "high"
+			} else {
+				r.Decision.Effort = "low"
+			}
+		}, "packet"}, {"decision-digest", func(r *Request) { r.Decision.Rationale = "other" }, "packet"}, {"argv", func(r *Request) {
 			r.Decision.Argv = append([]string(nil), r.Decision.Argv...)
 			r.Decision.Argv[0] = "other"
 		}, "packet"}, {"tab", func(r *Request) { r.TabID = "other" }, "packet"}, {"pane", func(r *Request) { r.PaneID = "other" }, "packet"}, {"herdr-session", func(r *Request) { r.HerdrSession = "other" }, "packet"}, {"cwd", func(r *Request) { r.CWD = "./other" }, "packet"}, {"process", func(r *Request) { r.ProcessIdentity = "pid-other" }, "packet"}, {"start", func(r *Request) { r.StartToken = "token-other" }, "packet"}, {"packet", func(r *Request) {}, "other-packet"},
