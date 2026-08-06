@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"sync"
 )
 
 type LinearProvider struct {
@@ -17,6 +18,15 @@ type LinearProvider struct {
 	BaseURL   string
 	Deadlines Deadlines
 	Retry     RetryPolicy
+	// BulkConcurrency bounds concurrent relation fetches in ListProjectRelations.
+	// Zero => DefaultBulkRelationConcurrency. Honest O(board) fan-out — not O(1).
+	BulkConcurrency int
+
+	// relationMu serializes CreateRelation/DeleteRelation on this instance so
+	// concurrent identical creates cannot both pass precheck and issue duplicate
+	// mutations. Process-local only; durable task lease remains the cross-process
+	// authority for multi-writer fleets.
+	relationMu sync.Mutex
 }
 
 func NewLinearProvider(apiKey string) *LinearProvider {
@@ -199,7 +209,9 @@ func (l *LinearProvider) ListTasks(ctx context.Context, projectID string, status
 
 func (l *LinearProvider) listTasksOnce(ctx context.Context, projectID string, status string) ([]*Task, error) {
 	const pageSize = 100
-	const query = `query ListIssues($projectID: String!, $after: String) {
+	// $projectID is ID! — ProjectFilter.id is IdComparator; IdComparator.eq is Scalars["ID"]
+	// (evidence: @linear/sdk@37.0.0 dist/_generated_documents.d.ts ProjectFilter/IdComparator).
+	const query = `query ListIssues($projectID: ID!, $after: String) {
 		issues(first: 100, after: $after, filter: { project: { id: { eq: $projectID } } }) {
 			nodes { id identifier title description priority state { name } project { id } labels { nodes { name } } }
 			pageInfo { hasNextPage endCursor }
