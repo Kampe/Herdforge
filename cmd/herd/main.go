@@ -105,6 +105,12 @@ func main() {
 	case "board-frozen":
 		runBoardFrozen()
 
+	case "role-inject":
+		runRoleInject()
+
+	case "feedback":
+		runFeedback()
+
 	case "hold":
 		runHold()
 
