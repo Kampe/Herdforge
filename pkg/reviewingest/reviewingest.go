@@ -56,6 +56,9 @@ type Artifact struct {
 // free-form body.
 func Parse(text string) Artifact {
 	var a Artifact
+	// A BOM makes the first key parse as "\ufeffsha", which ends the header
+	// region and reports a missing sha instead of the real cause.
+	text = strings.TrimPrefix(text, "\ufeff")
 	sc := bufio.NewScanner(strings.NewReader(text))
 	sc.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
 	inBody := false
@@ -145,6 +148,32 @@ func (a Artifact) BodyChars() int {
 // commitExists resolves a SHA against the repository; pass nil to skip that
 // check (fixtures).
 func (a Artifact) Validate(coordinators map[string]struct{}, commitExists func(string) bool) error {
+	// STRUCTURAL checks run FIRST so the error names the real defect. A markdown
+	// title above the front matter ends the header region, which meant the
+	// operator was told their sha was missing rather than that their title broke
+	// the artifact.
+	if a.MalformedHeaderRegion {
+		return fmt.Errorf("front matter must be the leading block ending in ---; " +
+			"a prose line before the headers can shadow a real one")
+	}
+	if len(a.ConflictingHeaders) > 0 {
+		return fmt.Errorf("front-matter key(s) %s appear more than once with different values; "+
+			"ambiguous provenance is refused rather than resolved by position",
+			strings.Join(a.ConflictingHeaders, ", "))
+	}
+	// An unrecognised header is refused, not logged. A misspelled reviewed-head
+	// silently disables the wandering-reviewer gate, and a field nothing reads
+	// surfaces nothing at all. The accepted key set is published in
+	// .herd/prompts/review-verdict.template.md — a blanket refusal against an
+	// unwritten contract would make every reviewer's first artifact a guess.
+	if len(a.UnknownHeaders) > 0 {
+		return fmt.Errorf("unrecognised front-matter key(s): %s; accepted keys are "+
+			"sha, branch, reviewer, reviewer-family, builder-family, verdict, reviewed-head "+
+			"(see .herd/prompts/review-verdict.template.md); a misspelled gate key silently "+
+			"disables its gate, so this is refused rather than ignored",
+			strings.Join(a.UnknownHeaders, ", "))
+	}
+
 	if !shaRe.MatchString(a.SHA) {
 		return fmt.Errorf("sha is not a 40-hex commit id: %q", orMissing(a.SHA))
 	}
@@ -182,24 +211,6 @@ func (a Artifact) Validate(coordinators map[string]struct{}, commitExists func(s
 		return fmt.Errorf("reviewer states it read %s but the verdict claims to be about %s; "+
 			"a verdict from a different tree is not a verdict about this commit",
 			shortSHA(a.ReadHead), shortSHA(a.SHA))
-	}
-
-	// An unrecognised header is refused, not logged. A misspelled `reviewed-head`
-	// silently disables the wandering-reviewer gate, and a field nothing reads
-	// surfaces nothing at all.
-	if len(a.UnknownHeaders) > 0 {
-		return fmt.Errorf("unrecognised front-matter key(s): %s; "+
-			"a misspelled gate key silently disables its gate, so this is refused rather than ignored",
-			strings.Join(a.UnknownHeaders, ", "))
-	}
-	if len(a.ConflictingHeaders) > 0 {
-		return fmt.Errorf("front-matter key(s) %s appear more than once with different values; "+
-			"ambiguous provenance is refused rather than resolved by position",
-			strings.Join(a.ConflictingHeaders, ", "))
-	}
-	if a.MalformedHeaderRegion {
-		return fmt.Errorf("front matter must be the leading block ending in ---; " +
-			"a prose line before the headers can shadow a real one")
 	}
 
 	// A PASS with no evidence is the failure mode this whole gate exists for.

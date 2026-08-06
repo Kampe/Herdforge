@@ -103,6 +103,9 @@ func runShot() {
 func routeShot(req shot.Request, tried map[string]bool) (*router.LaunchDecision, error) {
 	if req.Provider != "" && !tried[req.Provider] {
 		// An explicit pin is honoured once; it was already validated as capable.
+		if m := router.ModelFor(req.Provider, req.Shape); !router.AuthoringModelAllowed(m) {
+			return nil, fmt.Errorf("%s/%s is coordinator-only and may not be used for a shot", req.Provider, m)
+		}
 		return &router.LaunchDecision{
 			Provider: req.Provider,
 			Model:    "",
@@ -117,6 +120,12 @@ func routeShot(req shot.Request, tried map[string]bool) (*router.LaunchDecision,
 		}
 		route, err := r.Pick(req.Shape, p, "")
 		if err != nil {
+			continue
+		}
+		// routeShot uses Pick, not Decide, so the coordinator-only guard inside
+		// Decide never ran here. A coordinator- or architecture-shaped shot can
+		// resolve to a fable-flavoured model on claude or lazer.
+		if !router.AuthoringModelAllowed(route.Model) {
 			continue
 		}
 		return &router.LaunchDecision{

@@ -67,6 +67,11 @@ func TestRealRoster_AllPromptsRegisteredOrTemplated(t *testing.T) {
 	// Explicitly documented one-off templates — not standing role contracts.
 	templates := map[string]bool{
 		"critical-wave-coordinator.md": true,
+		// The artifact contract `herd review-ingest` enforces. Not a lane
+		// contract — it briefs reviewers on the seven accepted front-matter
+		// keys. The gate refuses any other key, so the accepted set must be
+		// published somewhere rather than living only in a Go switch.
+		"review-verdict.template.md": true,
 	}
 
 	entries, err := os.ReadDir(filepath.Join(root, ".herd", "prompts"))

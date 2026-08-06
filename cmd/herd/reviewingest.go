@@ -115,6 +115,8 @@ func runHarvestMerge() {
 	verdict := fs.String("verdict", "", "Review verdict: PASS merges, FAIL/BLOCKED refuse")
 	base := fs.String("base", "origin/main", "Base to harvest onto")
 	dryRun := fs.Bool("dry-run", false, "Plan and gate without creating the worktree")
+	allowMarkers := fs.Bool("allow-markers", false,
+		"Proceed despite conflict markers in the harvested diff (for files whose CONTENT is marker fixtures)")
 
 	// Pull the leading positional out BEFORE flag parsing: Go's flag package
 	// stops at the first non-flag argument, so `harvest-merge <lane> --branch x`
@@ -184,7 +186,16 @@ func runHarvestMerge() {
 			return fmt.Errorf("cannot read the harvested diff to gate it: %w", diffErr)
 		}
 		if markers := harvestmerge.ConflictMarkers(string(staged)); len(markers) > 0 {
-			return fmt.Errorf("REFUSED — %d conflict marker(s) in the harvested diff:\n  %s",
+			if !*allowMarkers {
+				return fmt.Errorf("REFUSED — %d conflict marker(s) in the harvested diff:\n  %s\n"+
+					"  If these are fixture CONTENT rather than a broken pick (e.g. a marker parser's\n"+
+					"  own test data), re-run with --allow-markers. There was previously no escape\n"+
+					"  hatch at all, which made pkg/conflict/conflict_test.go unharvestable by this tool.",
+					len(markers), strings.Join(markers, "\n  "))
+			}
+			// Loud and durable in the output: an override on a merge gate must
+			// never be quiet, and the operator must own it explicitly.
+			fmt.Fprintf(os.Stderr, "herd harvest-merge: WARNING --allow-markers OVERRIDE: proceeding despite %d conflict marker(s):\n  %s\n",
 				len(markers), strings.Join(markers, "\n  "))
 		}
 		return nil
