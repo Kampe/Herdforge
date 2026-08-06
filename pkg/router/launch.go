@@ -145,10 +145,9 @@ const decisionProofDomain = "herdforge-fac-175-launch-decision-v1"
 // Soft-preference weights. Large enough that a configured lane wins among
 // comparably healthy surfaces, small enough that real quota pressure or a
 // task-fit penalty still moves the launch elsewhere.
-const (
-	preferProviderBonus = 2500
-	preferModelBonus    = 1500
-)
+// A configured lane outranks candidates up to this many waterfall positions
+// ahead of it, on any shape. Beyond that, task fit legitimately wins.
+const preferProviderPositions = 3
 
 // WorkerShape is the only thing fixed about a builder launch: builders do
 // implementation work. Provider/model/effort come from the live quota-ranked
@@ -158,6 +157,43 @@ const (
 // in three places (two here, one in cmd/herd). The pin defeated the router it
 // sat on top of: chainseer's bin/herd-route has no worker tuple gate at all.
 const WorkerShape = "implementation"
+
+// KnownRoutableModel reports whether a model is one the router can actually
+// produce, i.e. it appears in the ModelFor catalog for some provider/shape.
+//
+// Expressible preferences made this necessary. Before, lane.Model only had to
+// MATCH what ModelFor produced, so a typo surfaced as loud drift and the launch
+// still used a real model. Now the preference BECOMES the launched model, and
+// CapabilityOf falls through to CapStandard for anything containing "claude",
+// "gpt" or "deepseek" — so "claude-sonet-5" passes every gate and gets launched.
+// Worse is a typo naming a different REAL model, which fails nowhere at all.
+func KnownRoutableModel(model string) bool {
+	m := strings.ToLower(strings.TrimSpace(model))
+	if m == "" {
+		return false
+	}
+	for _, shape := range AllShapes() {
+		providers, err := Waterfall(shape)
+		if err != nil {
+			continue
+		}
+		for _, p := range providers {
+			if strings.EqualFold(ModelFor(p, shape), m) {
+				return true
+			}
+		}
+	}
+	for _, fallback := range knownFallbackModels {
+		if strings.EqualFold(fallback, m) {
+			return true
+		}
+	}
+	return false
+}
+
+// knownFallbackModels are substitution targets that never appear as a primary
+// ModelFor result but are reachable through pool fallbacks.
+var knownFallbackModels = []string{"gpt-5.3-codex-spark", "claude-sonnet-5", "claude-haiku-4-5"}
 
 // coordinatorOnlyMarkers identify models reserved to the coordinator. Matched
 // by SUBSTRING, following the CapabilityOf convention: an exact-match map was
@@ -185,7 +221,8 @@ func BuilderModelAllowed(model string) bool { return AuthoringModelAllowed(model
 // run a coordinator-only model.
 func authoringRole(role Role) bool {
 	switch role {
-	case RoleWorker, RoleForgeSmith, RoleRecovery, RoleReviewer, RoleAssayer:
+	case RoleWorker, RoleForgeSmith, RoleRecovery, RoleReviewer, RoleAssayer,
+		RoleVerificationGate, RoleReviewSupervisor, RoleHarvest:
 		return true
 	}
 	return false
@@ -636,7 +673,8 @@ func (r *SurfaceRouter) Decide(req LaunchRequest) (*LaunchDecision, error) {
 		model := ModelFor(provider, shape)
 		if req.RequestedModel != "" {
 			model = req.RequestedModel
-		} else if req.PreferredModel != "" && strings.EqualFold(provider, req.PreferredProvider) {
+		} else if req.PreferredModel != "" && strings.EqualFold(provider, req.PreferredProvider) &&
+			KnownRoutableModel(req.PreferredModel) {
 			// A soft preference has to be EXPRESSIBLE, not merely rankable. A
 			// rank bonus alone gave a lane its configured model only when that
 			// model already was the waterfall head, so six of nine lanes still
@@ -752,11 +790,15 @@ func (r *SurfaceRouter) Decide(req LaunchRequest) (*LaunchDecision, error) {
 		// the lane could not launch at all; dropping it entirely meant every
 		// lane silently launched on the waterfall head instead (reviewer, harvest
 		// and orchestrator lanes all moved off their configured models).
+		// Proportional to fitWeight so the bonus means the same number of
+		// waterfall positions on every shape. An absolute value cleared two
+		// positions on implementation and none at all on qa (fitWeight 60),
+		// which made the assayer's preference undeclinable-by-config.
 		preferBonus := 0
 		if req.PreferredProvider != "" && strings.EqualFold(provider, req.PreferredProvider) {
-			preferBonus -= preferProviderBonus
+			preferBonus -= preferProviderPositions * fitWeight * 100
 			if req.PreferredModel != "" && strings.EqualFold(model, req.PreferredModel) {
-				preferBonus -= preferModelBonus
+				preferBonus -= fitWeight * 100
 			}
 		}
 		flashPenalty += preferBonus

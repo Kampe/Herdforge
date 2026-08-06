@@ -38,9 +38,9 @@ func MergeAllowed(v Verdict) bool { return v == PASS }
 // configuration the angle markers had just been widened for — so the
 // half-resolved shape it was restored to catch was still getting through.
 //
-// DECIDED TRADE-OFF: `={7,}$` also matches a markdown setext underline, so a
-// heading of seven-or-more characters in an added doc line will abort the
-// harvest. That is accepted deliberately. This is a merge gate: a false
+// DECIDED TRADE-OFF, stated at full cost: `={7,}$` matches essentially ANY
+// setext-underlined markdown heading, not an edge case — round two only caught
+// exactly-seven, this catches seven-or-more. That is accepted deliberately. This is a merge gate: a false
 // positive is recoverable in seconds and names the offending line, while a
 // false negative puts a structurally broken diff into a PR body that nobody
 // re-reads. Prefer the recoverable failure. Use an ATX `#` heading or a `---`
@@ -50,6 +50,11 @@ func MergeAllowed(v Verdict) bool { return v == PASS }
 // multi-line string; today ConflictMarkers feeds it one line at a time.
 var conflictMarkerRe = regexp.MustCompile(`(?m)^(<{7,}|>{7,}|\|{7,})( |$)|^={7,}$`)
 
+// NOTE: pkg/conflict has a SECOND, independent marker detector used by the
+// resolver (prefix-based, unanchored, no width rules). The two deliberately
+// disagree — this one gates a merge and errs toward refusing, that one parses a
+// conflict it already knows is present. Change one and check the other.
+//
 // ConflictMarkers returns the conflict markers found in staged ADDED lines.
 //
 // This is a HARD stage gate. A cherry-pick that leaves markers behind produces
@@ -62,11 +67,12 @@ func ConflictMarkers(stagedDiff string) []string {
 		if !strings.HasPrefix(line, "+") || strings.HasPrefix(line, "+++") {
 			continue
 		}
-		// Match the TRIMMED body: with CRLF the added line is "=======\r" and
-		// `$` does not match before the \r, so the separator check was
-		// defeated by line endings alone. Reporting already trimmed, so
-		// matching on the same value keeps the two consistent.
-		body := strings.TrimSpace(strings.TrimPrefix(line, "+"))
+		// TrimRIGHT only. CRLF is the actual problem — the added line is
+		// "=======\r" and `$` does not match before the \r — but TrimSpace also
+		// stripped LEADING whitespace, which the anchor was relying on. That
+		// widened the gate to indented markers, so a runbook showing an operator
+		// what a conflict looks like became unharvestable.
+		body := strings.TrimRight(strings.TrimPrefix(line, "+"), "\r\n \t")
 		if conflictMarkerRe.MatchString(body) {
 			found = append(found, body)
 		}

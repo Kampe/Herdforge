@@ -16,7 +16,10 @@ import (
 func TestEveryConfiguredLaneLaunchesOnItsConfiguredModel(t *testing.T) {
 	cfg, err := config.LoadConfig("../../.herd/herd.yaml")
 	if err != nil {
-		t.Skipf("real roster unavailable: %v", err)
+		// NOT Skipf. A self-disabling gate is the exact class of defect this
+		// suite exists to catch — a test that silently stops running when its
+		// input moves protects nothing.
+		t.Fatalf("real roster unavailable: %v", err)
 	}
 	if len(cfg.Lanes) == 0 {
 		t.Fatal("roster has no lanes")

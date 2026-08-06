@@ -32,6 +32,13 @@ var validShapes = map[string]bool{
 	"qa-light": true, "qa": true, "adversarial": true,
 }
 
+// AllShapes is every task shape Waterfall accepts. Kept next to Waterfall so
+// the two cannot drift.
+func AllShapes() []string {
+	return []string{"coordinator", "architecture", "implementation", "research",
+		"bounded", "advisory", "qa-light", "qa", "adversarial"}
+}
+
 // Waterfall returns the preference-ordered candidate providers for a shape.
 func Waterfall(shape string) ([]string, error) {
 	switch shape {
