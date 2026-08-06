@@ -514,6 +514,14 @@ func (d *Dispatcher) Dispatch(ctx context.Context, opts DispatchOptions) (*Dispa
 	if oerr != nil {
 		return nil, fmt.Errorf("dispatch lease store: %w", oerr)
 	}
+	// Memoize the live claimer. The control-order check later in this dispatch
+	// reads d.Ownership directly and fails closed on nil; without this the
+	// claimer exists only as a local here, so every production launch was
+	// rejected with "control: live ownership authority is required" even though
+	// a working authority had just been constructed.
+	if d.Ownership == nil {
+		d.Ownership = own
+	}
 	claimRole := "launch"
 	if lane.Role != "" {
 		claimRole = lane.Role

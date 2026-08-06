@@ -2143,7 +2143,13 @@ func runDispatch() {
 			fmt.Fprintf(os.Stderr, "launch route rejected before dispatch: %v\n", err)
 			os.Exit(1)
 		}
-		if err := validateDecisionBeforeSideEffect(decision, ticketRef); err != nil {
+		// Validate against the context the decision was MINTED with. This
+		// admission mints at lane scope (routedLaneDecision is given a nil
+		// task), so checking it against the ticket ref could never match and
+		// rejected every dispatch. Dispatch itself rebinds the decision to the
+		// task ref and lease generation once the lease is held, and revalidates
+		// there — that is where task-scope proof belongs.
+		if err := validateDecisionBeforeSideEffect(decision, lane.Name); err != nil {
 			fmt.Fprintf(os.Stderr, "launch decision rejected before dispatch: %v\n", err)
 			os.Exit(1)
 		}
