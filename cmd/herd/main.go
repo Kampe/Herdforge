@@ -135,6 +135,9 @@ func main() {
 	case "spin":
 		runSpin()
 
+	case "watch":
+		runWatch()
+
 	case "hold":
 		runHold()
 
@@ -289,6 +292,7 @@ func printUsage() {
 	fmt.Println("  rescue       Move a cramped pane to its own tab; --empty-siblings closes blank shells")
 	fmt.Println("  seed-lane-state   Restore or seed a lane's state artifacts (never overwrites)")
 	fmt.Println("  spin         Detect stalled (frozen output) and spinning (no git delta) panes")
+	fmt.Println("  watch        Fire the moment an agent settles; --stream feeds harvest triggers")
 	fmt.Println("  hold       Control durable generation-fenced lane/task hold: on, off, or status")
 	fmt.Println("  review     Claim in-progress tasks for reviewer and advance to review status")
 	fmt.Println("  approve    Move in-review cards to done, gated on merge evidence")
