@@ -20,6 +20,12 @@ const MinBodyChars = 200
 
 var shaRe = regexp.MustCompile(`^[0-9a-f]{40}$`)
 
+// unknownHeaderRe matches things that LOOK like front-matter keys. An
+// unrecognised key is surfaced rather than ignored: a misspelled
+// `reviewed-head` silently disables the wandering-reviewer gate, which is
+// exactly how that gate came to be dead code in the first place.
+var unknownHeaderRe = regexp.MustCompile(`^[a-z][a-z0-9-]*$`)
+
 // Artifact is a parsed reviewer verdict.
 type Artifact struct {
 	SHA            string
@@ -34,6 +40,9 @@ type Artifact struct {
 	// state a mismatch or lie outright.
 	ReadHead string
 	Body     string
+	// UnknownHeaders are front-matter keys we did not recognise. Surfaced so a
+	// misspelled gate key cannot silently disable the gate.
+	UnknownHeaders []string
 }
 
 // Parse reads a front-matter artifact: `key: value` lines, then `---`, then a
@@ -43,6 +52,7 @@ func Parse(text string) Artifact {
 	sc := bufio.NewScanner(strings.NewReader(text))
 	sc.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
 	inBody := false
+	seen := map[string]bool{}
 	var body strings.Builder
 
 	for sc.Scan() {
@@ -57,7 +67,15 @@ func Parse(text string) Artifact {
 				continue
 			}
 			value = strings.TrimSpace(value)
-			switch strings.ToLower(strings.TrimSpace(key)) {
+			name := strings.ToLower(strings.TrimSpace(key))
+			// FIRST wins, matching the reference's `hdr() | head -1`. Last-wins
+			// is the unsafe direction: an artifact with `verdict: FAIL` followed
+			// by `verdict: PASS` would be admitted as PASS.
+			if seen[name] {
+				continue
+			}
+			seen[name] = true
+			switch name {
 			case "sha":
 				a.SHA = value
 			case "branch":
@@ -70,8 +88,16 @@ func Parse(text string) Artifact {
 				a.BuilderFamily = value
 			case "verdict":
 				a.Verdict = strings.ToUpper(value)
-			case "read-head", "head-read", "read_head":
+			case "reviewed-head":
+				// The reference key, written by every reviewer via
+				// `reviewed-head: $(git rev-parse HEAD)`. Spelling this
+				// anything else makes the wandering-reviewer gate dead code
+				// that fails OPEN with no warning.
 				a.ReadHead = value
+			default:
+				if unknownHeaderRe.MatchString(name) {
+					a.UnknownHeaders = append(a.UnknownHeaders, name)
+				}
 			}
 			continue
 		}
@@ -107,14 +133,17 @@ func (a Artifact) Validate(coordinators map[string]struct{}, commitExists func(s
 	}
 
 	// The coordinator grading its own work is not review at any tier.
-	if coordinators != nil {
-		if _, isCoord := coordinators[a.Reviewer]; isCoord {
+	// Case-insensitive: "Herdforge-Orchestrator" is the same identity as
+	// "herdforge-orchestrator", and nothing downstream re-checks this.
+	for c := range coordinators {
+		if strings.EqualFold(strings.TrimSpace(a.Reviewer), strings.TrimSpace(c)) {
 			return fmt.Errorf("reviewer %q is a coordinator; self-verification never qualifies", a.Reviewer)
 		}
 	}
 
 	// Same family is not an independent read.
-	if a.ReviewerFamily != "" && a.BuilderFamily != "" && a.ReviewerFamily == a.BuilderFamily {
+	if a.ReviewerFamily != "" && a.BuilderFamily != "" &&
+		strings.EqualFold(strings.TrimSpace(a.ReviewerFamily), strings.TrimSpace(a.BuilderFamily)) {
 		return fmt.Errorf("reviewer-family %q equals builder-family; not an independent review", a.ReviewerFamily)
 	}
 

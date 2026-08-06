@@ -31,11 +31,20 @@ const (
 // an explicit PASS refuses: an unknown or absent verdict is not consent.
 func MergeAllowed(v Verdict) bool { return v == PASS }
 
-// conflictMarkerRe matches the three git conflict markers at line start.
-// `=======` alone is deliberately excluded: it appears legitimately in
-// markdown underlines and ASCII tables, and flagging it would make the gate
-// noisy enough to be disabled.
-var conflictMarkerRe = regexp.MustCompile(`(?m)^(<{7}|>{7})( |$)|^\|{7}( |$)`)
+// conflictMarkerRe matches git conflict markers at line start.
+//
+// Mirrors the reference `^\+(<{7}|>{7}|={7}$)`. Two earlier mistakes are fixed
+// here: `={7}$` was dropped on the theory that flagging it would catch markdown
+// underlines — but the reference already solved that by anchoring the separator
+// to end-of-line, so a `=======` heading rule with trailing content is fine
+// while a bare separator is caught. And the old exact-7 quantifier missed
+// longer markers, which git emits under `.gitattributes conflict-marker-size=8`.
+// Asymmetric on purpose: <<< >>> ||| never occur in prose so they match 7-or-
+// more (covering conflict-marker-size=8), while the separator is EXACTLY seven
+// '=' anchored to end-of-line, matching the reference. A markdown setext
+// underline is sized to its heading and is rarely exactly seven, so this
+// catches the real separator without flagging documentation.
+var conflictMarkerRe = regexp.MustCompile(`^(<{7,}|>{7,}|\|{7,})( |$)|^={7}$`)
 
 // ConflictMarkers returns the conflict markers found in staged ADDED lines.
 //
@@ -79,7 +88,13 @@ func (p Plan) Validate() error {
 	if strings.TrimSpace(p.Title) == "" {
 		return fmt.Errorf("harvest-merge: --title is required; an unlabelled PR is unreviewable")
 	}
-	if p.Verdict != "" && !MergeAllowed(p.Verdict) {
+	// Absent is not consent. The first version only rejected a NON-EMPTY
+	// non-PASS verdict, so omitting --verdict entirely sailed through the gate
+	// and a full harvest ran to "gates passed" with no review at all.
+	if !MergeAllowed(p.Verdict) {
+		if strings.TrimSpace(string(p.Verdict)) == "" {
+			return fmt.Errorf("harvest-merge: --verdict is required; an absent verdict is not consent to merge")
+		}
 		return fmt.Errorf("harvest-merge: verdict %s refuses the merge", p.Verdict)
 	}
 	if len(p.Commits) == 0 {

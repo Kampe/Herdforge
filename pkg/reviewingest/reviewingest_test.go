@@ -23,7 +23,7 @@ func artifact(reviewer, rfam, bfam, verdict, readHead, body string) string {
 	}
 	b.WriteString("verdict: " + verdict + "\n")
 	if readHead != "" {
-		b.WriteString("read-head: " + readHead + "\n")
+		b.WriteString("reviewed-head: " + readHead + "\n")
 	}
 	b.WriteString("---\n")
 	b.WriteString(body)

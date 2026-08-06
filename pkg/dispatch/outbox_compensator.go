@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/Kampe/Herdforge/pkg/outbox"
@@ -40,19 +41,44 @@ func (c *OutboxCompensator) Close() error {
 	return c.Store.Close()
 }
 
-// stepKey is the idempotency key for one (ticket, step) side-effect. Replaying
-// the same step must not enqueue a second durable item.
+// stepKey is the idempotency key for one (ticket, step) side-effect.
+//
+// It must cover EVERY field carried in the payload. The outbox rejects a reused
+// key whose payload differs, so any payload field left out of the key turns a
+// legitimate retry into ErrIdempotencyConflict — and because the key is
+// deterministic per ticket, that wedges the ticket permanently until someone
+// hand-edits the SQLite file. The first version keyed on only four fields while
+// marshalling the whole record, so a re-dispatch after main advanced (new
+// BaseSHA, same branch) was unrecoverable.
+//
+// Encoding is fixed-arity `field=value` with an escaped separator: positional
+// concatenation lost field identity, so {TabID:"x"} and {Branch:"x"} produced
+// the same key, and pane/tab ids legitimately contain ':'.
 func stepKey(rec StepRecord) string {
-	parts := []string{"dispatch", rec.TicketRef, string(rec.Step)}
-	// Steps that can legitimately recur within one dispatch are further
-	// qualified so a retry is idempotent but a genuinely new artifact is not
-	// silently collapsed into the previous one.
-	for _, q := range []string{rec.Branch, rec.TabID, rec.PaneID, rec.Receipt} {
-		if strings.TrimSpace(q) != "" {
-			parts = append(parts, q)
-		}
+	esc := func(v string) string {
+		v = strings.ReplaceAll(v, `\`, `\\`)
+		return strings.ReplaceAll(v, "|", `\|`)
 	}
-	return strings.Join(parts, ":")
+	fields := []struct{ name, value string }{
+		{"ticket", rec.TicketRef},
+		{"step", string(rec.Step)},
+		{"worktree", rec.Worktree},
+		{"branch", rec.Branch},
+		{"base", rec.BaseSHA},
+		{"anchor", rec.AnchorRef},
+		{"tab", rec.TabID},
+		{"pane", rec.PaneID},
+		{"agent", rec.AgentName},
+		{"receipt", rec.Receipt},
+		{"message", rec.MessageID},
+		{"seq", strconv.FormatInt(rec.Sequence, 10)},
+	}
+	parts := make([]string, 0, len(fields)+1)
+	parts = append(parts, "dispatch")
+	for _, f := range fields {
+		parts = append(parts, f.name+"="+esc(f.value))
+	}
+	return strings.Join(parts, "|")
 }
 
 // RecordStep durably persists one successful launch side-effect.

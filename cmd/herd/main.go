@@ -2894,13 +2894,16 @@ func laneLaunchDecision(ctx context.Context, lane *config.LaneDef, task *provide
 			scope = router.ScopeCandidate
 		}
 	}
-	// Lane provider/model/effort are SOFT pins. RequestedProvider is the hard
-	// --provider channel: it narrows the waterfall to exactly one surface, so
-	// feeding a lane's preference through it means an exhausted preferred pool
-	// leaves zero candidates and the lane cannot launch at all. Let the shape's
-	// quota-ranked waterfall choose; `provider` stays the documented default.
-	_ = provider
-	request := router.LaunchRequest{Role: role, Shape: shape, TaskRef: contextRef, Scope: scope, Risk: classify.TierR1}
+	// Lane provider/model/effort are SOFT pins, so they go through the
+	// Preferred* channel, not the hard Requested* one. Requested* narrows the
+	// waterfall to a single surface (an exhausted pool then yields zero
+	// candidates); dropping the lane values entirely was worse still — every
+	// lane silently launched on the waterfall head, moving the reviewer lane
+	// onto Opus and the harvest/verification lanes onto a flash model.
+	request := router.LaunchRequest{
+		Role: role, Shape: shape, TaskRef: contextRef, Scope: scope, Risk: classify.TierR1,
+		PreferredProvider: provider, PreferredModel: lane.Model,
+	}
 	if role == router.RoleReviewer || role == router.RoleAssayer {
 		if task == nil {
 			return nil, fmt.Errorf("review launch requires candidate provenance")
@@ -2921,9 +2924,33 @@ func laneLaunchDecision(ctx context.Context, lane *config.LaneDef, task *provide
 		}
 	}
 	model := lane.Model
+	// Probe every probe-gated model the router could actually pick for this
+	// shape, not just the lane's configured tuple. Keying the probe on the lane
+	// model meant a probe-gated candidate the router might choose had no result,
+	// and unknown-probe fails closed — so removing the codex pin accidentally
+	// made codex unreachable from every lane whose configured model was not
+	// itself the probe-gated one.
+	candidates, wfErr := router.Waterfall(shape)
+	if wfErr != nil {
+		return nil, wfErr
+	}
+	probes := map[string]bool{}
+	for _, cp := range candidates {
+		cm := router.ModelFor(cp, shape)
+		if cm == "" || !router.ModelRequiresProbe(cm) {
+			continue
+		}
+		key := router.ProbeKey(cp, cm)
+		if _, done := probes[key]; done {
+			continue
+		}
+		probes[key] = herdr.ProbeModel(ctx, cm).Available
+	}
 	if router.ModelRequiresProbe(model) {
-		probe := herdr.ProbeModel(ctx, model)
-		request.ProbeResults = map[string]bool{router.ProbeKey(provider, model): probe.Available}
+		probes[router.ProbeKey(provider, model)] = herdr.ProbeModel(ctx, model).Available
+	}
+	if len(probes) > 0 {
+		request.ProbeResults = probes
 	}
 	decision, err := router.NewRouter(nil, nil).Decide(request)
 	if err != nil {

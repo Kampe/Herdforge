@@ -28,9 +28,12 @@ func TestConflictMarkersInAddedLinesAbort(t *testing.T) {
 		"+	return \"implementation\"",
 		"+>>>>>>> theirs",
 	}, "\n")
+	// Three: the head marker, the bare separator, and the tail marker. The
+	// separator counts — an earlier version excluded it and let half-resolved
+	// conflicts through.
 	found := ConflictMarkers(diff)
-	if len(found) != 2 {
-		t.Fatalf("both <<<<<<< and >>>>>>> must be caught, got %v", found)
+	if len(found) != 3 {
+		t.Fatalf("head, separator and tail must all be caught, got %v", found)
 	}
 }
 
@@ -46,16 +49,25 @@ func TestUnrelatedMarkersInContextDoNotBlock(t *testing.T) {
 	}
 }
 
-// ======= alone appears in markdown underlines and ASCII tables; flagging it
-// would make the gate noisy enough that someone disables it.
-func TestMarkdownUnderlineIsNotAConflictMarker(t *testing.T) {
-	diff := strings.Join([]string{
-		"+Heading",
-		"+=======",
-		"+| col |",
-	}, "\n")
-	if found := ConflictMarkers(diff); len(found) != 0 {
-		t.Fatalf("a markdown underline must not read as a conflict, got %v", found)
+// A bare seven-'=' separator IS a conflict marker — the reference catches it,
+// and a half-resolved conflict where the head/tail markers were stripped but
+// the separator survived is a real and common shape.
+func TestBareSeparatorIsAConflictMarker(t *testing.T) {
+	if found := ConflictMarkers("+Heading\n+=======\n"); len(found) != 1 {
+		t.Fatalf("a bare ======= separator must be caught, got %v", found)
+	}
+	// A markdown setext underline is sized to its heading, so a longer run is
+	// documentation rather than a separator.
+	if found := ConflictMarkers("+Heading\n+===========\n"); len(found) != 0 {
+		t.Fatalf("a longer underline is documentation, got %v", found)
+	}
+}
+
+// git emits longer markers under .gitattributes conflict-marker-size=8.
+func TestLongerThanSevenMarkersAreCaught(t *testing.T) {
+	diff := "+<<<<<<<< HEAD\n+ours\n+>>>>>>>> theirs\n"
+	if found := ConflictMarkers(diff); len(found) != 2 {
+		t.Fatalf("8-char markers must be caught, got %v", found)
 	}
 }
 
@@ -75,7 +87,7 @@ func TestUniqueCommitsSkipsAlreadyUpstreamPatches(t *testing.T) {
 }
 
 func TestValidateRefusesUnmergeableHarvests(t *testing.T) {
-	base := Plan{Lane: "smith", Title: "feat: x", Commits: []string{"aaa"}}
+	base := Plan{Lane: "smith", Title: "feat: x", Commits: []string{"aaa"}, Verdict: PASS}
 	if err := base.Validate(); err != nil {
 		t.Fatalf("a well-formed plan must validate: %v", err)
 	}
@@ -88,6 +100,12 @@ func TestValidateRefusesUnmergeableHarvests(t *testing.T) {
 	noCommits.Commits = nil
 	if err := noCommits.Validate(); err == nil {
 		t.Fatal("nothing to harvest must be refused, not merged empty")
+	}
+	// Absent is not consent: omitting --verdict must refuse, not sail through.
+	noVerdict := base
+	noVerdict.Verdict = ""
+	if err := noVerdict.Validate(); err == nil {
+		t.Fatal("an absent verdict must refuse the merge")
 	}
 	failed := base
 	failed.Verdict = FAIL

@@ -84,7 +84,16 @@ type LaunchRequest struct {
 	// RiskChanged is true when classify evidence changed since the last review.
 	RiskChanged bool
 	// RequestedProvider pins a single provider (tests / operator override).
+	// HARD: it narrows the waterfall to exactly this surface, so an exhausted
+	// pool yields no candidates at all. Never feed lane config through it —
+	// use PreferredProvider.
 	RequestedProvider string
+	// PreferredProvider / PreferredModel are SOFT lane preferences. They bias
+	// ranking toward the configured surface without removing any candidate, so
+	// a healthy lane launches on what the operator configured and an exhausted
+	// one still reroutes instead of failing closed.
+	PreferredProvider string
+	PreferredModel    string
 	// RequestedModel pins the configured model when a lane policy requires it.
 	RequestedModel  string
 	RequestedEffort string
@@ -133,6 +142,14 @@ type LaunchDecision struct {
 
 const decisionProofDomain = "herdforge-fac-175-launch-decision-v1"
 
+// Soft-preference weights. Large enough that a configured lane wins among
+// comparably healthy surfaces, small enough that real quota pressure or a
+// task-fit penalty still moves the launch elsewhere.
+const (
+	preferProviderBonus = 2500
+	preferModelBonus    = 1500
+)
+
 // WorkerShape is the only thing fixed about a builder launch: builders do
 // implementation work. Provider/model/effort come from the live quota-ranked
 // waterfall, never a compile-time vendor tuple.
@@ -141,6 +158,17 @@ const decisionProofDomain = "herdforge-fac-175-launch-decision-v1"
 // in three places (two here, one in cmd/herd). The pin defeated the router it
 // sat on top of: chainseer's bin/herd-route has no worker tuple gate at all.
 const WorkerShape = "implementation"
+
+// BuilderReservedModels are models that must never author code, regardless of
+// how they were routed. Fable is the coordinator surface: dispatching it as a
+// builder or reviewer is a standing operator prohibition, and the old codex
+// vendor pin was accidentally enforcing it as a side effect.
+var BuilderReservedModels = map[string]bool{"claude-fable-5": true}
+
+// BuilderModelAllowed reports whether a model may author code.
+func BuilderModelAllowed(model string) bool {
+	return !BuilderReservedModels[strings.ToLower(strings.TrimSpace(model))]
+}
 
 var ErrWorkerPolicy = errors.New("launch.policy.worker_tuple_mismatch")
 var ErrRolePolicy = errors.New("launch.policy.unknown_role")
@@ -677,6 +705,22 @@ func (r *SurfaceRouter) Decide(req LaunchRequest) (*LaunchDecision, error) {
 		if !isReviewer && cap == CapFlash {
 			flashPenalty = 15 * fitWeight // soft demotion, not a hard ban
 		}
+		// A lane's configured provider/model is a SOFT preference: it wins ties
+		// and near-ties so a healthy lane launches on what the operator
+		// configured, but it never narrows the candidate set the way the hard
+		// RequestedProvider channel does. Feeding lane config through the hard
+		// channel meant an exhausted preferred pool left ZERO candidates and
+		// the lane could not launch at all; dropping it entirely meant every
+		// lane silently launched on the waterfall head instead (reviewer, harvest
+		// and orchestrator lanes all moved off their configured models).
+		preferBonus := 0
+		if req.PreferredProvider != "" && strings.EqualFold(provider, req.PreferredProvider) {
+			preferBonus -= preferProviderBonus
+			if req.PreferredModel != "" && strings.EqualFold(model, req.PreferredModel) {
+				preferBonus -= preferModelBonus
+			}
+		}
+		flashPenalty += preferBonus
 		var rank int
 		switch {
 		case shape == "coordinator" && haveQuota && st.ExhaustsBeforeReset != nil && *st.ExhaustsBeforeReset && st.RunwayMinutes != nil:
@@ -754,6 +798,13 @@ func (r *SurfaceRouter) Decide(req LaunchRequest) (*LaunchDecision, error) {
 	if req.Role == RoleWorker || req.Role == RoleForgeSmith || req.Role == RoleRecovery {
 		if shape != WorkerShape {
 			return nil, fmt.Errorf("%w: worker/forge-smith/recovery task shape must be %s, got %q", ErrWorkerPolicy, WorkerShape, shape)
+		}
+		// Capability guard, NOT a vendor pin. Removing the codex tuple left
+		// RequestedModel able to put any catalog model on a builder, including
+		// Fable — which is orchestrator-only and must never build or review.
+		// This is about what a model is FOR, so it survives any reroute.
+		if !BuilderModelAllowed(model) {
+			return nil, fmt.Errorf("%w: %s is not permitted for a builder launch (orchestrator-only)", ErrWorkerPolicy, model)
 		}
 	}
 	// Final coherence re-check (mutation-safe).
