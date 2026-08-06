@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Kampe/Herdforge/pkg/posture"
 	"github.com/Kampe/Herdforge/pkg/usage"
 )
 
@@ -514,6 +515,16 @@ func (r *SurfaceRouter) available(provider, model, pool string) (bool, string) {
 }
 
 func envSet(key string) bool {
+	// The two fleet postures are durable FILE sentinels with an env override,
+	// not env-only flags: an export dies with its shell and the coordinator
+	// drives the fleet through one-shot calls, so an env-only posture silently
+	// lapses between invocations. See pkg/posture.
+	switch key {
+	case "HERD_CLAUDE_ONLY":
+		return posture.Active(posture.ClaudeOnly)
+	case "HERD_NO_CLAUDE":
+		return posture.Active(posture.NoClaude)
+	}
 	v := os.Getenv(key)
 	return v != "" && v != "0"
 }

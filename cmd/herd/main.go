@@ -36,6 +36,7 @@ import (
 	"github.com/Kampe/Herdforge/pkg/next"
 	"github.com/Kampe/Herdforge/pkg/outbox"
 	"github.com/Kampe/Herdforge/pkg/overlap"
+	"github.com/Kampe/Herdforge/pkg/posture"
 	"github.com/Kampe/Herdforge/pkg/preflight"
 	"github.com/Kampe/Herdforge/pkg/process"
 	"github.com/Kampe/Herdforge/pkg/provider"
@@ -94,6 +95,15 @@ func main() {
 
 	case "wind-down":
 		runWindDown()
+
+	case "claude-only":
+		runPosture(posture.ClaudeOnly)
+
+	case "no-claude":
+		runPosture(posture.NoClaude)
+
+	case "board-frozen":
+		runBoardFrozen()
 
 	case "hold":
 		runHold()
@@ -236,6 +246,9 @@ func printUsage() {
 	fmt.Println("  status     Display current orchestration engine status")
 	fmt.Println("  pulse      Claim a task from Kaneo and optionally spawn an agent")
 	fmt.Println("  wind-down  Control durable fleet launch posture: on, off, or status")
+	fmt.Println("  claude-only  Route the whole fleet to native Claude: on, off, or status")
+	fmt.Println("  no-claude    Hold native Claude out of the fleet: on, off, or status")
+	fmt.Println("  board-frozen Exit 0 with the freeze trigger when board mutation is frozen")
 	fmt.Println("  hold       Control durable generation-fenced lane/task hold: on, off, or status")
 	fmt.Println("  review     Claim in-progress tasks for reviewer and advance to review status")
 	fmt.Println("  approve    Move in-review cards to done, gated on merge evidence")
