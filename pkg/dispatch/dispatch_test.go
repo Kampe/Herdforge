@@ -12,6 +12,7 @@ import (
 	"github.com/Kampe/Herdforge/pkg/config"
 	"github.com/Kampe/Herdforge/pkg/deps"
 	"github.com/Kampe/Herdforge/pkg/provider"
+	"github.com/Kampe/Herdforge/pkg/scopefence"
 	"github.com/Kampe/Herdforge/pkg/worktree"
 )
 
@@ -89,6 +90,32 @@ type mockWorktree struct {
 	err   error
 	calls int
 	refs  []string // task refs requested
+}
+
+type recordingScopeAdmission struct {
+	called     bool
+	request    scopefence.AcquireRequest
+	decision   scopefence.Decision
+	err        error
+	releases   int
+	releaseReq scopefence.ReleaseRequest
+}
+
+func (f *recordingScopeAdmission) Acquire(_ context.Context, request scopefence.AcquireRequest) (scopefence.Decision, error) {
+	f.called = true
+	f.request = request
+	if f.decision.Granted && f.decision.Lease == nil {
+		lease := request.Ownership
+		lease.GraphRevision, lease.GraphFiles = "g1", 2
+		f.decision.Lease = &lease
+	}
+	return f.decision, f.err
+}
+
+func (f *recordingScopeAdmission) Release(_ context.Context, request scopefence.ReleaseRequest) error {
+	f.releases++
+	f.releaseReq = request
+	return nil
 }
 
 func (m *mockWorktree) CreateTaskWorktreeFrom(_ context.Context, taskRef, _ string) (*worktree.WorktreeInfo, error) {
@@ -171,6 +198,27 @@ func TestDispatchRejectsMissingDecisionBeforeAnyProviderOrWorktreeMutation(t *te
 	}
 	if mw.calls != 0 {
 		t.Fatalf("rejected launch created worktree: %d", mw.calls)
+	}
+}
+
+func TestDispatchScopeFenceRejectsBeforeWorktreeOrLaunchSideEffects(t *testing.T) {
+	tp := &mockTaskProvider{tasks: []*provider.Task{{ID: "1", Ref: "FAC-205", Title: "scope fence test", Status: "to-do", Description: emptyDepsFence("FAC-205", "1")}}}
+	mw := &mockWorktree{err: fmt.Errorf("scope fence must reject first")}
+	fence := &recordingScopeAdmission{decision: scopefence.Decision{Evidence: scopefence.Evidence{Reason: scopefence.ReasonScopeOverlap}}}
+	d := withTestLease(t, &Dispatcher{
+		Config:       &config.Config{TaskProvider: config.TaskProvider{ProjectID: "test"}, Lanes: []config.LaneDef{{Name: "worker"}}},
+		TaskProvider: tp,
+		Worktree:     mw,
+		Compensator:  &recordingCompensator{},
+		Herdr:        &fakeHerdr{available: false},
+		ScopeFence:   fence,
+	})
+	_, err := d.Dispatch(context.Background(), DispatchOptions{TicketRef: "FAC-205", NoLaunch: true})
+	if err == nil || !fence.called || mw.calls != 0 {
+		t.Fatalf("scope rejection crossed worktree boundary: err=%v fence_called=%v worktree_calls=%d", err, fence.called, mw.calls)
+	}
+	if fence.request.Generation <= 0 || fence.request.Identity.Branch != worktree.TaskBranch("FAC-205") || len(fence.request.Scope.Packages) != 0 {
+		t.Fatalf("scope admission was not bound to exact pre-side-effect identity: %+v", fence.request)
 	}
 }
 

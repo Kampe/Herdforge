@@ -4,10 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Kampe/Herdforge/pkg/config"
@@ -18,6 +20,7 @@ import (
 	"github.com/Kampe/Herdforge/pkg/preflight"
 	"github.com/Kampe/Herdforge/pkg/provider"
 	"github.com/Kampe/Herdforge/pkg/router"
+	"github.com/Kampe/Herdforge/pkg/scopefence"
 	"github.com/Kampe/Herdforge/pkg/toolchild"
 	"github.com/Kampe/Herdforge/pkg/worktree"
 )
@@ -211,9 +214,32 @@ type Dispatcher struct {
 	// Ownership is a durable cross-process lease claimer (claim.ClaimManager +
 	// SQLite). When nil, opened at .herd/launch-claims.db under RepoRoot.
 	Ownership deps.OwnershipClaimer
+	// ScopeFence is an optional injected admission boundary. Production wiring
+	// supplies a durable scopefence.Fence; nil preserves packet-only callers.
+	ScopeFence    ScopeAdmission
+	scopeFenceErr error
+	scopeCloser   io.Closer
+	closeOnce     sync.Once
+	closeErr      error
 
 	// health projects BLOCKED(provider_timeout) for board calls (FAC-150).
 	health dispatchHealth
+}
+
+type ScopeAdmission interface {
+	Acquire(context.Context, scopefence.AcquireRequest) (scopefence.Decision, error)
+	Release(context.Context, scopefence.ReleaseRequest) error
+}
+
+type durableScopeAdmission struct{ fence scopefence.ResolvingFence }
+
+func (a durableScopeAdmission) Acquire(ctx context.Context, req scopefence.AcquireRequest) (scopefence.Decision, error) {
+	req.Scope = scopefence.Scope{}
+	return a.fence.Acquire(ctx, req)
+}
+
+func (a durableScopeAdmission) Release(ctx context.Context, req scopefence.ReleaseRequest) error {
+	return a.fence.Release(ctx, req)
 }
 
 // ControlScope is constructed after AgentStart, so each order is bound to the
@@ -246,7 +272,58 @@ func NewDispatcher(cfg *config.Config, tp provider.TaskProvider, wm *worktree.Wo
 func NewProductionDispatcher(cfg *config.Config, tp provider.TaskProvider, wm *worktree.WorktreeManager) *Dispatcher {
 	d := NewDispatcher(cfg, tp, wm)
 	d.Production = true
+	d.scopeFenceErr = errors.New("dispatch scope authority requires separately protected coordinator/root verifier (FAC-169 authority surface is not present)")
 	return d
+}
+
+// NewProductionDispatcherWithAuthorities is the only production constructor
+// that can install scope admission. Both verify-only authorities are injected
+// by protected coordinator surfaces: graph/scope publication cannot authorize
+// RootAdmittedMerge or FencedAbandonment. No key, signer, environment value,
+// or database row is accepted as authority.
+func NewProductionDispatcherWithAuthorities(cfg *config.Config, tp provider.TaskProvider, wm *worktree.WorktreeManager, graphVerifier scopefence.GraphScopeVerifier, releaseAuthority scopefence.ReleaseAuthority, expectedRevision string, expectedFiles int) *Dispatcher {
+	d := NewDispatcher(cfg, tp, wm)
+	d.Production = true
+	if graphVerifier == nil || releaseAuthority == nil {
+		d.scopeFenceErr = errors.New("dispatch scope authority requires separately protected coordinator/root verifier")
+		return d
+	}
+	root := "."
+	if wm != nil && wm.RepoRoot != "" {
+		root = wm.RepoRoot
+	}
+	repository, err := AuthenticatedRepositoryIdentity(root)
+	if err != nil {
+		d.scopeFenceErr = fmt.Errorf("dispatch scope authority identity: %w", err)
+		return d
+	}
+	store, err := scopefence.NewSQLiteStore(filepath.Join(root, ".herd", "scopefence.db"))
+	if err != nil {
+		d.scopeFenceErr = err
+		return d
+	}
+	graph := scopefence.NewSQLiteGraphAuthority(store, repository, expectedRevision, expectedFiles)
+	graph.Verifier = graphVerifier
+	resolver := scopefence.NewSQLiteScopeAuthority(store)
+	resolver.Verifier = graphVerifier
+	d.ScopeFence = durableScopeAdmission{fence: scopefence.ResolvingFence{
+		Fence: scopefence.Fence{Store: store, ReleaseAuthority: releaseAuthority, Graph: graph}, Authority: resolver,
+	}}
+	d.scopeCloser = store
+	return d
+}
+
+// Close propagates the owned durable fence resource exactly once.
+func (d *Dispatcher) Close() error {
+	if d == nil {
+		return nil
+	}
+	d.closeOnce.Do(func() {
+		if d.scopeCloser != nil {
+			d.closeErr = d.scopeCloser.Close()
+		}
+	})
+	return d.closeErr
 }
 
 func (d *Dispatcher) ownershipClaimer() (deps.OwnershipClaimer, error) {
@@ -302,6 +379,19 @@ func (d *Dispatcher) requireCompensator() error {
 	return nil
 }
 
+func (d *Dispatcher) requireScopeAdmission() error {
+	if !d.Production {
+		return nil
+	}
+	if d.scopeFenceErr != nil {
+		return d.scopeFenceErr
+	}
+	if d.ScopeFence == nil {
+		return errors.New("dispatch scope fence is required in production")
+	}
+	return nil
+}
+
 func (d *Dispatcher) record(ctx context.Context, rec StepRecord) error {
 	if err := d.requireCompensator(); err != nil {
 		return err
@@ -335,6 +425,9 @@ func (d *Dispatcher) Dispatch(ctx context.Context, opts DispatchOptions) (*Dispa
 	}
 	if d.Production && !opts.NoLaunch && d.ControlFactory == nil {
 		return nil, fmt.Errorf("dispatch: durable control factory is required for production launch")
+	}
+	if err := d.requireScopeAdmission(); err != nil {
+		return nil, err
 	}
 	// FAC-175: reject an under-specified worker launch before even reading or
 	// mutating provider/worktree state. --no-launch is the explicit packet-only
@@ -431,6 +524,9 @@ func (d *Dispatcher) Dispatch(ctx context.Context, opts DispatchOptions) (*Dispa
 	if cerr != nil {
 		return nil, fmt.Errorf("dispatch lease claim: %w", cerr)
 	}
+	var scopeOwned bool
+	var scopeRelease scopefence.ReleaseRequest
+	worktreeCreated := false
 	// Exactly-one durable compensation WHILE owner+generation still held.
 	// Release only after durable compensate succeeds. On compensate failure
 	// retain the lease (Recovering) — never release-then-compensate (B can
@@ -448,10 +544,44 @@ func (d *Dispatcher) Dispatch(ctx context.Context, opts DispatchOptions) (*Dispa
 			// Retain lease — Recovering. Do not open an acquire window for B.
 			return errors.Join(primary, fmt.Errorf("durable compensate retained lease (Recovering): %w", cErr))
 		}
+		if scopeOwned && !worktreeCreated {
+			scopeRelease.Authority = scopefence.CompensatedNoCandidate
+			// Production release authentication is performed by the injected
+			// protected authority; no worker-mintable hash is a credential.
+			scopeRelease.Proof = ""
+			if sErr := d.ScopeFence.Release(ctx, scopeRelease); sErr != nil {
+				return errors.Join(primary, fmt.Errorf("scopefence compensation retained ownership: %w", sErr))
+			}
+			scopeOwned = false
+		}
 		if rErr := own.ReleaseIfOwner(ctx, tok, reason); rErr != nil && !errors.Is(rErr, deps.ErrNotOwner) {
 			return errors.Join(primary, rErr)
 		}
 		return primary
+	}
+	if d.ScopeFence != nil {
+		repository, ierr := d.repositoryIdentity()
+		if ierr != nil {
+			return nil, failOwned("scopefence_identity_failed", ierr)
+		}
+		admissionReq := scopefence.AcquireRequest{Ownership: scopefence.Ownership{
+			Identity:      scopefence.Identity{Repository: repository, Branch: worktree.TaskBranch(task.Ref), Task: task.Ref},
+			Generation:    tok.Generation,
+			State:         scopefence.Active,
+			GraphRevision: pre.GraphRevision,
+		}, ExpectedGraphRevision: pre.GraphRevision}
+		admission, aerr := d.ScopeFence.Acquire(ctx, admissionReq)
+		if aerr != nil {
+			return nil, failOwned("scopefence_error", aerr)
+		}
+		if !admission.Granted {
+			return nil, failOwned("scopefence_rejected", fmt.Errorf("dispatch scope fence rejected: %s", admission.Evidence.Reason))
+		}
+		if admission.Lease == nil {
+			return nil, failOwned("scopefence_missing_lease", errors.New("scopefence granted without durable lease"))
+		}
+		scopeOwned = true
+		scopeRelease = scopefence.ReleaseRequest{Ownership: *admission.Lease}
 	}
 	if !opts.NoLaunch {
 		bound, berr := router.RebindDecision(opts.Decision, task.Ref, tok.Generation)
@@ -471,6 +601,10 @@ func (d *Dispatcher) Dispatch(ctx context.Context, opts DispatchOptions) (*Dispa
 	wtInfo, err := d.Worktree.CreateTaskWorktreeFrom(ctx, task.Ref, defaultBranch)
 	if err != nil {
 		return nil, failOwned("worktree_create_failed", fmt.Errorf("failed to create worktree: %w", err))
+	}
+	worktreeCreated = wtInfo != nil
+	if wtInfo == nil {
+		return nil, failOwned("worktree_create_failed", errors.New("worktree service returned nil info"))
 	}
 	if err := worktree.RejectSharedRoot(d.Worktree.RepoRoot(), wtInfo.Path); err != nil {
 		return nil, failOwned("shared_root_denied", err)
