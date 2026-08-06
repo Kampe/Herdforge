@@ -159,19 +159,47 @@ const (
 // sat on top of: chainseer's bin/herd-route has no worker tuple gate at all.
 const WorkerShape = "implementation"
 
-// BuilderReservedModels are models that must never author code, regardless of
-// how they were routed. Fable is the coordinator surface: dispatching it as a
-// builder or reviewer is a standing operator prohibition, and the old codex
-// vendor pin was accidentally enforcing it as a side effect.
-var BuilderReservedModels = map[string]bool{"claude-fable-5": true}
+// coordinatorOnlyMarkers identify models reserved to the coordinator. Matched
+// by SUBSTRING, following the CapabilityOf convention: an exact-match map was
+// bypassed outright by the proxied spelling `litellm/lazer/claude-fable-5`,
+// which is a real routable model.
+var coordinatorOnlyMarkers = []string{"fable"}
 
-// BuilderModelAllowed reports whether a model may author code.
-func BuilderModelAllowed(model string) bool {
-	return !BuilderReservedModels[strings.ToLower(strings.TrimSpace(model))]
+// AuthoringModelAllowed reports whether a model may author OR review code.
+// Fable is the coordinator surface and a standing operator prohibition covers
+// both roles; the old codex vendor pin had been enforcing it by accident.
+func AuthoringModelAllowed(model string) bool {
+	m := strings.ToLower(strings.TrimSpace(model))
+	for _, marker := range coordinatorOnlyMarkers {
+		if strings.Contains(m, marker) {
+			return false
+		}
+	}
+	return true
+}
+
+// BuilderModelAllowed is retained for callers that only mean the builder case.
+func BuilderModelAllowed(model string) bool { return AuthoringModelAllowed(model) }
+
+// authoringRole reports roles that produce or certify code, and so may never
+// run a coordinator-only model.
+func authoringRole(role Role) bool {
+	switch role {
+	case RoleWorker, RoleForgeSmith, RoleRecovery, RoleReviewer, RoleAssayer:
+		return true
+	}
+	return false
 }
 
 var ErrWorkerPolicy = errors.New("launch.policy.worker_tuple_mismatch")
 var ErrRolePolicy = errors.New("launch.policy.unknown_role")
+
+func authoringVerb(role Role) string {
+	if role == RoleReviewer || role == RoleAssayer {
+		return "review"
+	}
+	return "build"
+}
 
 func knownRole(role Role) bool {
 	switch role {
@@ -608,6 +636,17 @@ func (r *SurfaceRouter) Decide(req LaunchRequest) (*LaunchDecision, error) {
 		model := ModelFor(provider, shape)
 		if req.RequestedModel != "" {
 			model = req.RequestedModel
+		} else if req.PreferredModel != "" && strings.EqualFold(provider, req.PreferredProvider) {
+			// A soft preference has to be EXPRESSIBLE, not merely rankable. A
+			// rank bonus alone gave a lane its configured model only when that
+			// model already was the waterfall head, so six of nine lanes still
+			// launched on something the operator never chose — including the
+			// Sonnet->Opus reviewer escalation this was meant to fix. The
+			// preferred model is a candidate like any other from here: it still
+			// passes the availability, family, capability, probe and
+			// builder-reserved gates below, and a candidate that fails one is
+			// dropped exactly as ModelFor's would be.
+			model = req.PreferredModel
 		}
 		// Spark / AGY fallbacks reuse Pick's available() + overrides.
 		family := FamilyFor(provider, model)
@@ -803,9 +842,11 @@ func (r *SurfaceRouter) Decide(req LaunchRequest) (*LaunchDecision, error) {
 		// RequestedModel able to put any catalog model on a builder, including
 		// Fable — which is orchestrator-only and must never build or review.
 		// This is about what a model is FOR, so it survives any reroute.
-		if !BuilderModelAllowed(model) {
-			return nil, fmt.Errorf("%w: %s is not permitted for a builder launch (orchestrator-only)", ErrWorkerPolicy, model)
-		}
+	}
+	// Applies to reviewers too: the prohibition is on authoring or certifying
+	// code with the coordinator surface, not on the builder role specifically.
+	if authoringRole(req.Role) && !AuthoringModelAllowed(model) {
+		return nil, fmt.Errorf("%w: %s is coordinator-only and may not %s", ErrWorkerPolicy, model, authoringVerb(req.Role))
 	}
 	// Final coherence re-check (mutation-safe).
 	if isReviewer {

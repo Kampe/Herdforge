@@ -131,14 +131,18 @@ lanes:
   # verification-gate — deterministic verifier for one immutable candidate
   # SHA. Attests evidence; never repairs the candidate or issues a review
   # verdict (.herd/prompts/verification-gate.md).
+  # verification-gate previously named opencode, which is NOT in the `bounded`
+  # waterfall in either this port or chainseer's bin/herd-route — so its
+  # configured surface was unreachable and every launch silently landed
+  # elsewhere. claude/claude-haiku-4-5 is the real bounded claude model.
   - name: "verification-gate"
     role: "verification-gate"
-    agent_kind: "opencode"
-    harness: "opencode"
+    agent_kind: "claude"
+    harness: "claude"
     prompt: ".herd/prompts/verification-gate.md"
     worktree: ".worktrees/verification-gate"
-    provider: "opencode"
-    model: "opencode/kimi-k3"
+    provider: "claude"
+    model: "claude-haiku-4-5"
     effort: "medium"
     task_shape: "bounded"
     standing: false
