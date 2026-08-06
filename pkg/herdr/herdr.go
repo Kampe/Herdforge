@@ -1055,7 +1055,17 @@ func runHerdrReal(args ...string) (string, error) {
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
-		return strings.TrimSpace(stderr.String()), err
+		// Fold herdr's stderr into the error. Returning a bare
+		// *exec.ExitError leaves every caller reporting "exit status 1"
+		// with no cause, which makes a failed launch undiagnosable.
+		msg := strings.TrimSpace(stderr.String())
+		if msg == "" {
+			msg = strings.TrimSpace(stdout.String())
+		}
+		if msg == "" {
+			return "", err
+		}
+		return msg, fmt.Errorf("%w: %s", err, msg)
 	}
 	return stdout.String(), nil
 }

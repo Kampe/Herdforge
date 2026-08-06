@@ -30,9 +30,11 @@ const (
 	HarvestRole          = "harvest"
 	RecoverySentinelRole = "recovery-sentinel"
 	Implementation       = "implementation"
-	WorkerModel          = "gpt-5.6-luna"
-	WorkerProvider       = "codex"
-	WorkerEffort         = "medium"
+	// Re-exported from pkg/router so the approved worker tuple has exactly one
+	// definition. Previously duplicated as codex/gpt-5.6-luna/medium literals.
+	WorkerModel          = router.WorkerModel
+	WorkerProvider       = router.WorkerProvider
+	WorkerEffort         = router.WorkerEffort
 )
 
 // Request is the complete, durable identity of one process launch.
@@ -280,27 +282,38 @@ func Validate(req Request, sink Sink) error {
 			return reject(req, sink, "worker task shape must be implementation")
 		}
 		if provider != WorkerProvider || model != WorkerModel || effort != WorkerEffort {
-			return reject(req, sink, "worker launch requires codex/gpt-5.6-luna/medium")
+			return reject(req, sink, fmt.Sprintf("worker launch requires %s/%s/%s", WorkerProvider, WorkerModel, WorkerEffort))
 		}
 	} else if !controlRole(role) {
 		return reject(req, sink, "unknown launch role")
 	}
 	want := clone(argv)
 	if worker {
-		want = []string{"codex", "--model", WorkerModel, "-c", "model_reasoning_effort=medium", "-a", "never", "-c", "mcp_servers.code-review-graph.enabled=false"}
+		// Derive the expected argv from the provider contract rather than
+		// re-spelling one vendor's command line here; the literal silently
+		// pinned every worker launch to codex.
+		want = router.ArgvFor(provider, model, effort)
+		if len(want) == 0 {
+			return reject(req, sink, fmt.Sprintf("no launch argv contract for provider %q", provider))
+		}
 	}
 	if !worker && (len(want) < 2 || want[0] == "" || want[1] != "--model" || !argvCarriesEffort(provider, want, effort)) {
 		return reject(req, sink, "non-worker launch argv must explicitly carry --model and effort")
 	}
 	if len(argv) != len(want) {
-		return reject(req, sink, "argv must explicitly contain the routed model, medium reasoning effort, and approval policy")
+		return reject(req, sink, fmt.Sprintf("argv must match the routed launch contract: want %v, got %v", want, argv))
 	}
 	for i := range want {
 		if argv[i] != want[i] {
 			return reject(req, sink, fmt.Sprintf("argv[%d]=%q does not match routed launch decision", i, argv[i]))
 		}
 	}
-	if provider == WorkerProvider {
+	// CRG MCP isolation is a codex-argv concern (-c mcp_servers…=false). This
+	// read `provider == WorkerProvider`, which only meant "codex" while the
+	// worker tuple happened to be codex; once the worker moved to grok it
+	// demanded a codex-only guarantee from a provider that has no such flag.
+	// Non-codex providers were never covered by this check.
+	if strings.EqualFold(provider, "codex") {
 		compiled, cfg, err := toolpolicy.Require(toolpolicy.Role(role), provider, argv)
 		if err != nil || !cfg.Valid() || !equalStrings(compiled, argv) {
 			return reject(req, sink, "codex launch lacks explicit CRG MCP isolation")
