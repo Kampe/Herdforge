@@ -40,7 +40,12 @@ type Request struct {
 	Decision        *router.LaunchDecision
 	TaskRef         string
 	Name            string
+	TabID           string
 	PaneID          string
+	HerdrSession    string
+	CWD             string
+	ProcessIdentity string
+	StartToken      string
 	LeaseGeneration int64
 	// SessionGeneration fences the Herdr session independently of task lease
 	// generations; lane launches intentionally have LeaseGeneration == 0.
@@ -48,6 +53,7 @@ type Request struct {
 	Scope             string
 	Repository        string
 	Lane              string
+	PacketDigest      string
 }
 
 // Receipt is durable evidence for one launch attempt. Validation does not
@@ -68,6 +74,15 @@ type Receipt struct {
 	PaneID            string    `json:"pane_id,omitempty"`
 	LeaseGeneration   int64     `json:"lease_generation,omitempty"`
 	SessionGeneration int64     `json:"session_generation,omitempty"`
+	Repository        string    `json:"repository,omitempty"`
+	Lane              string    `json:"lane,omitempty"`
+	Generation        int64     `json:"generation,omitempty"`
+	TabID             string    `json:"tab_id,omitempty"`
+	HerdrSession      string    `json:"herdr_session,omitempty"`
+	CWD               string    `json:"cwd,omitempty"`
+	ProcessIdentity   string    `json:"process_identity,omitempty"`
+	StartToken        string    `json:"start_token,omitempty"`
+	PacketDigest      string    `json:"packet_digest,omitempty"`
 }
 
 // Sink makes receipt durability injectable without making process tests touch
