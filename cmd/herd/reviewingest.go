@@ -92,10 +92,11 @@ func runReviewIngest() {
 	}
 
 	fmt.Printf("herd review-ingest: admitted=%d refused=%d\n", admitted, refused)
-	// Refusals are the signal, not a crash — but a run that admitted nothing
-	// while refusing something exits non-zero so a caller cannot mistake it
-	// for a clean ingest.
-	if admitted == 0 && refused > 0 {
+	// ANY refusal is a non-zero exit. Exiting 0 on a partial batch let
+	// `herd review-ingest *.md && <next step>` proceed with silently rejected
+	// verdicts, which is precisely the fail-open this gate exists to prevent
+	// (CLAUDE.md invariant 2).
+	if refused > 0 {
 		os.Exit(1)
 	}
 }
@@ -157,40 +158,56 @@ func runHarvestMerge() {
 	}
 
 	dir := filepath.Join(".herd", "worktrees", "harvest-"+filepath.Base(plan.TempBranch))
-	// Always remove the merge worktree, on every exit path. A leaked worktree
-	// is what turned a failed harvest into a blocked retry in chainseer.
-	defer func() {
-		exec.Command("git", "worktree", "remove", "--force", dir).Run()
-		exec.Command("git", "branch", "-D", plan.TempBranch).Run()
+
+	// The harvest body is a closure returning an error rather than calling
+	// os.Exit inline. os.Exit does NOT run deferred functions, so a defer here
+	// plus os.Exit on the failure paths would skip cleanup on exactly the
+	// conflict and marker paths where a leaked worktree matters most — the very
+	// trap chainseer's EXIT trap exists to prevent, reintroduced.
+	err = func() error {
+		if out, addErr := exec.Command("git", "worktree", "add", "-B", plan.TempBranch, dir, *base).CombinedOutput(); addErr != nil {
+			return fmt.Errorf("worktree add: %v: %s", addErr, out)
+		}
+		for _, c := range commits {
+			if out, pickErr := exec.Command("git", "-C", dir, "cherry-pick", c).CombinedOutput(); pickErr != nil {
+				exec.Command("git", "-C", dir, "cherry-pick", "--abort").Run()
+				return fmt.Errorf("cherry-pick %s conflicted, aborting before any PR:\n%s", c[:min(9, len(c))], out)
+			}
+		}
+		// Hard stage gate: a marker in the harvested ADDED lines means the pick
+		// produced a structurally broken diff, and once it is in a PR body
+		// nobody re-reads it.
+		// A hard gate must never pass because its input failed to load: an
+		// empty diff from a failed git call would yield zero markers.
+		staged, diffErr := exec.Command("git", "-C", dir, "diff", *base+"...HEAD").Output()
+		if diffErr != nil {
+			return fmt.Errorf("cannot read the harvested diff to gate it: %w", diffErr)
+		}
+		if markers := harvestmerge.ConflictMarkers(string(staged)); len(markers) > 0 {
+			return fmt.Errorf("REFUSED — %d conflict marker(s) in the harvested diff:\n  %s",
+				len(markers), strings.Join(markers, "\n  "))
+		}
+		return nil
 	}()
 
-	if out, err := exec.Command("git", "worktree", "add", "-B", plan.TempBranch, dir, *base).CombinedOutput(); err != nil {
-		fmt.Fprintf(os.Stderr, "herd harvest-merge: worktree add: %v: %s\n", err, out)
-		os.Exit(1)
-	}
-	for _, c := range commits {
-		if out, err := exec.Command("git", "-C", dir, "cherry-pick", c).CombinedOutput(); err != nil {
-			fmt.Fprintf(os.Stderr, "herd harvest-merge: cherry-pick %s conflicted, aborting before any PR:\n%s\n", c[:min(9, len(c))], out)
-			exec.Command("git", "-C", dir, "cherry-pick", "--abort").Run()
-			os.Exit(1)
-		}
+	// Cleanup runs on the FAILURE path only — the worktree is deliberately kept
+	// on success so the coordinator can push from it.
+	cleanup := func() {
+		exec.Command("git", "worktree", "remove", "--force", dir).Run()
+		exec.Command("git", "branch", "-D", plan.TempBranch).Run()
 	}
 
-	// Hard stage gate: a marker in the harvested ADDED lines means the pick
-	// produced a structurally broken diff, and once it is in a PR body nobody
-	// re-reads it.
-	staged, _ := exec.Command("git", "-C", dir, "diff", *base+"...HEAD").Output()
-	if markers := harvestmerge.ConflictMarkers(string(staged)); len(markers) > 0 {
-		fmt.Fprintf(os.Stderr, "herd harvest-merge: REFUSED — %d conflict marker(s) in the harvested diff:\n", len(markers))
-		for _, m := range markers {
-			fmt.Fprintf(os.Stderr, "  %s\n", m)
-		}
+	if err != nil {
+		cleanup()
+		fmt.Fprintf(os.Stderr, "herd harvest-merge: %v\n", err)
 		os.Exit(1)
 	}
 
 	fmt.Printf("herd harvest-merge: harvested %d commit(s) clean onto %s at %s\n", len(commits), *base, dir)
 	fmt.Println("herd harvest-merge: gates passed. Publish and merge is the coordinator's explicit action:")
 	fmt.Printf("  git push -u origin %s && gh pr create --title %q\n", plan.TempBranch, *title)
+	// The worktree is intentionally KEPT on success: the coordinator pushes
+	// from it. Cleanup on success is the caller's, after publishing.
 }
 
 func min(a, b int) int {

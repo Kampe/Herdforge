@@ -27,7 +27,20 @@ func runReviewClassify() {
 	insertions := fs.Int("insertions", 0, "Fixture: inserted line count")
 	deletions := fs.Int("deletions", 0, "Fixture: deleted line count")
 	asJSON := fs.Bool("json", false, "Emit the verdict as JSON")
-	fs.Parse(os.Args[2:])
+
+	// Pull the leading positional out BEFORE parsing. Go's flag package stops
+	// at the first non-flag argument, so `review-classify <branch> --tier R3`
+	// silently discarded --tier (and --json, yielding prose to a machine
+	// consumer). This is the same defect that was fixed in harvest-merge.
+	rawArgs := os.Args[2:]
+	positional := ""
+	if len(rawArgs) > 0 && !strings.HasPrefix(rawArgs[0], "-") {
+		positional, rawArgs = rawArgs[0], rawArgs[1:]
+	}
+	fs.Parse(rawArgs)
+	if positional == "" {
+		positional = fs.Arg(0)
+	}
 
 	explicit := classify.Tier(strings.TrimSpace(*tier))
 	switch explicit {
@@ -51,7 +64,7 @@ func runReviewClassify() {
 			target = "(fixture)"
 		}
 	} else {
-		branch := fs.Arg(0)
+		branch := positional
 		if branch == "" && target == "" {
 			fmt.Fprintln(os.Stderr, "Usage: herd review-classify <branch> [--tier R0|R1|R2|R3] [--pin SHA] [--json]")
 			fmt.Fprintln(os.Stderr, "       herd review-classify --paths CSV --insertions N --deletions N [--tier ...] [--json]")
