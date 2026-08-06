@@ -50,7 +50,7 @@ type serviceFixture struct {
 	base     string
 }
 
-func newServiceFixture(t *testing.T) *serviceFixture {
+func newServiceFixture(t *testing.T, extraOpts ...ServiceOption) *serviceFixture {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "lifecycle.db")
 	m, err := NewMachine(path)
@@ -65,7 +65,8 @@ func newServiceFixture(t *testing.T) *serviceFixture {
 		}
 	}
 	git := &fakeWorktrees{facts: map[string]WorktreeFacts{}}
-	s, err := NewService(m, WithWorktreeInspector(git), WithServiceClock(func() time.Time { return fixed }))
+	opts := append([]ServiceOption{WithWorktreeInspector(git), WithServiceClock(func() time.Time { return fixed })}, extraOpts...)
+	s, err := NewService(m, opts...)
 	if err != nil {
 		m.Close()
 		t.Fatal(err)
@@ -131,7 +132,10 @@ type queuedCandidate struct {
 	id, sha, reviewReceiptID string
 }
 
-func (f *serviceFixture) submitThroughPromotion(task, suffix string) queuedCandidate {
+// prepareReviewed drives a task through submit/verify/review and stops short
+// of promotion, so callers can exercise the promotion boundary (e.g. a
+// FAC-201 scope gate) directly.
+func (f *serviceFixture) prepareReviewed(task, suffix string) queuedCandidate {
 	f.t.Helper()
 	sha := testSHA(suffix)
 	candidateID := task + "-candidate-" + suffix
@@ -169,15 +173,27 @@ func (f *serviceFixture) submitThroughPromotion(task, suffix string) queuedCandi
 	}); err != nil {
 		f.t.Fatalf("review %s: %v", task, err)
 	}
-	// Promotion is intentionally autonomous: a local service principal, not a
-	// human, can advance a fully verified/reviewed exact candidate.
+	return queuedCandidate{id: candidateID, sha: sha, reviewReceiptID: reviewReceipt.ID}
+}
+
+// promote advances an already-reviewed candidate to StateIntegrationQueued.
+// Promotion is intentionally autonomous: a local service principal, not a
+// human, can advance a fully verified/reviewed exact candidate.
+func (f *serviceFixture) promote(task, suffix string, c queuedCandidate) {
+	f.t.Helper()
 	if _, err := f.service.PromotePullRequest(context.Background(), PromotePRRequest{
-		Command: f.command(task, task+":promote:"+suffix, f.agent), CandidateID: candidateID,
-		CandidateSHA: sha, PullRequest: "pr://" + task + "/" + suffix,
+		Command: f.command(task, task+":promote:"+suffix, f.agent), CandidateID: c.id,
+		CandidateSHA: c.sha, PullRequest: "pr://" + task + "/" + suffix,
 	}); err != nil {
 		f.t.Fatalf("promote %s: %v", task, err)
 	}
-	return queuedCandidate{id: candidateID, sha: sha, reviewReceiptID: reviewReceipt.ID}
+}
+
+func (f *serviceFixture) submitThroughPromotion(task, suffix string) queuedCandidate {
+	f.t.Helper()
+	c := f.prepareReviewed(task, suffix)
+	f.promote(task, suffix, c)
+	return c
 }
 
 func (f *serviceFixture) prepareQueued(task, suffix string) queuedCandidate {
