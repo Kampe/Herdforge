@@ -108,9 +108,11 @@ func routeShot(req shot.Request, tried map[string]bool) (*router.LaunchDecision,
 		}
 		return &router.LaunchDecision{
 			Provider: req.Provider,
-			Model:    "",
-			Effort:   router.EffortFor(req.Shape),
-			Shape:    req.Shape,
+			// Was hardcoded "", which produced argv like `grok --model` with no
+			// value. Resolve the provider's real model for this shape.
+			Model:  router.ModelFor(req.Provider, req.Shape),
+			Effort: router.EffortFor(req.Shape),
+			Shape:  req.Shape,
 		}, nil
 	}
 	r := router.NewRouter(nil, nil)
@@ -139,20 +141,51 @@ func routeShot(req shot.Request, tried map[string]bool) (*router.LaunchDecision,
 
 // execShot runs the routed surface headlessly with a hard timeout.
 func execShot(d *router.LaunchDecision, prompt string, timeout time.Duration) (string, error) {
-	argv := router.ArgvFor(d.Provider, d.Model, d.Effort)
+	// A shot is headless. The interactive argv expects herdr to send text to a
+	// pane afterwards, so using it here just printed the CLI's help.
+	f, err := os.CreateTemp("", "herd-shot-*.md")
+	if err != nil {
+		return "", fmt.Errorf("stage shot prompt: %w", err)
+	}
+	defer os.Remove(f.Name())
+	if _, err := f.WriteString(prompt); err != nil {
+		f.Close()
+		return "", fmt.Errorf("write shot prompt: %w", err)
+	}
+	f.Close()
+
+	argv, delivery := router.HeadlessArgvFor(d.Provider, d.Model, d.Effort, f.Name())
 	if len(argv) == 0 {
-		return "", fmt.Errorf("no launch argv contract for provider %q", d.Provider)
+		return "", fmt.Errorf("no headless argv contract for provider %q", d.Provider)
+	}
+	if delivery == router.DeliverByArg {
+		if len(prompt) > router.MaxArgPromptBytes {
+			return "", fmt.Errorf("%s takes its prompt as an argument and this one is %d bytes (limit %d); "+
+				"use a file-delivering surface such as grok for a packet this large",
+				d.Provider, len(prompt), router.MaxArgPromptBytes)
+		}
+		argv = append(argv, prompt)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
-	cmd.Stdin = strings.NewReader(prompt)
+	if delivery == router.DeliverByStdin {
+		cmd.Stdin = strings.NewReader(prompt)
+	}
+	var stderr strings.Builder
+	cmd.Stderr = &stderr
 	out, err := cmd.Output()
 	if ctx.Err() == context.DeadlineExceeded {
 		return "", fmt.Errorf("timed out after %s", timeout)
 	}
 	if err != nil {
+		// Surface the surface's own diagnosis. A bare exit status makes a
+		// failed shot undiagnosable, which is what made the launch chain
+		// impossible to debug earlier.
+		if msg := strings.TrimSpace(stderr.String()); msg != "" {
+			return "", fmt.Errorf("%w: %s", err, msg)
+		}
 		return "", err
 	}
 	return string(out), nil

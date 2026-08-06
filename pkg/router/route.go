@@ -323,6 +323,56 @@ func ArgvFor(provider, model, effort string) []string {
 	return nil
 }
 
+// HeadlessArgvFor is the argv for a ONE-SHOT, non-interactive run.
+//
+// This is deliberately separate from ArgvFor. ArgvFor launches an interactive
+// pane that herdr later sends text to; reusing it headlessly just printed the
+// CLI's help, because none of these tools take a prompt on stdin in
+// interactive mode. promptPath is a file containing the prompt; the bool
+// reports whether the caller should ALSO pipe the prompt on stdin (surfaces
+// that read stdin rather than a file).
+func HeadlessArgvFor(provider, model, effort, promptPath string) (argv []string, delivery PromptDelivery) {
+	pe := PeerEffort(effort)
+	switch provider {
+	case "grok":
+		return []string{"grok", "--model", model, "--reasoning-effort", pe,
+			"--prompt-file", promptPath, "--output-format", "plain"}, DeliverByFile
+	case "agy":
+		// agy --print takes the prompt as a POSITIONAL argument; piping it on
+		// stdin is silently ignored and agy answers as if asked nothing.
+		// --print must be the LAST flag: a flag after it consumes the
+		// positional, which fails the same silent way. No permission flag —
+		// a shot is read-only and does not need one.
+		return []string{"agy", "--model", model, "--print"}, DeliverByArg
+	case "claude":
+		return []string{"claude", "--model", model, "--effort", effort, "-p"}, DeliverByStdin
+	case "codex":
+		return []string{"codex", "exec", "--model", model,
+			"-c", "model_reasoning_effort=" + pe, "-s", "read-only"}, DeliverByStdin
+	case "kimi":
+		return []string{"kimi", "--auto"}, DeliverByStdin
+	case "ollama", "opencode", "lazer":
+		return []string{"opencode", "run", "--model", model}, DeliverByStdin
+	}
+	return nil, DeliverByStdin
+}
+
+// PromptDelivery is how a headless surface accepts its prompt. Getting this
+// wrong is silent: agy ignores stdin entirely and answers as though it were
+// asked nothing at all, which reads as a model failure rather than a wiring bug.
+type PromptDelivery int
+
+const (
+	DeliverByStdin PromptDelivery = iota
+	DeliverByFile
+	DeliverByArg
+)
+
+// MaxArgPromptBytes bounds a prompt delivered as argv. Well under the ~1MB
+// macOS ARG_MAX so a large review packet fails with a clear message instead of
+// E2BIG or a truncated exec.
+const MaxArgPromptBytes = 200 * 1024
+
 // Route is the routing decision, mirroring herd-route's route_json payload.
 type Route struct {
 	Provider        string   `json:"provider"`
