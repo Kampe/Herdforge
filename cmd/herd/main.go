@@ -2815,7 +2815,13 @@ func laneLaunchDecision(ctx context.Context, lane *config.LaneDef, task *provide
 			scope = router.ScopeCandidate
 		}
 	}
-	request := router.LaunchRequest{Role: role, Shape: shape, RequestedProvider: provider, RequestedModel: lane.Model, RequestedEffort: lane.Effort, TaskRef: contextRef, Scope: scope, Risk: classify.TierR1}
+	// Lane provider/model/effort are SOFT pins. RequestedProvider is the hard
+	// --provider channel: it narrows the waterfall to exactly one surface, so
+	// feeding a lane's preference through it means an exhausted preferred pool
+	// leaves zero candidates and the lane cannot launch at all. Let the shape's
+	// quota-ranked waterfall choose; `provider` stays the documented default.
+	_ = provider
+	request := router.LaunchRequest{Role: role, Shape: shape, TaskRef: contextRef, Scope: scope, Risk: classify.TierR1}
 	if role == router.RoleReviewer || role == router.RoleAssayer {
 		if task == nil {
 			return nil, fmt.Errorf("review launch requires candidate provenance")
@@ -2844,8 +2850,18 @@ func laneLaunchDecision(ctx context.Context, lane *config.LaneDef, task *provide
 	if err != nil {
 		return nil, err
 	}
-	if decision.Provider != lane.Provider || decision.Model != lane.Model || decision.Effort != lane.Effort || decision.Shape != lane.TaskShape {
-		return nil, fmt.Errorf("lane %q routed decision drift: configured %s/%s/%s/%s, got %s/%s/%s/%s", lane.Name, lane.Provider, lane.Model, lane.Effort, lane.TaskShape, decision.Provider, decision.Model, decision.Effort, decision.Shape)
+	// Lane provider/model/effort are SOFT pins (see .herd/herd.yaml): they are
+	// the preference handed to the router, not a contract the live decision
+	// must reproduce. Requiring equality made every quota-driven reroute look
+	// like drift and stranded the lane the moment its preferred pool filled.
+	// The task SHAPE is the hard part of a lane's identity, so keep that bound.
+	if decision.Shape != lane.TaskShape {
+		return nil, fmt.Errorf("lane %q routed shape drift: configured %s, got %s", lane.Name, lane.TaskShape, decision.Shape)
+	}
+	if decision.Provider != lane.Provider || decision.Model != lane.Model || decision.Effort != lane.Effort {
+		fmt.Fprintf(os.Stderr, "herd: lane %q rerouted by quota: %s/%s/%s -> %s/%s/%s (%s)\n",
+			lane.Name, lane.Provider, lane.Model, lane.Effort,
+			decision.Provider, decision.Model, decision.Effort, decision.Availability)
 	}
 	if err := validateDecisionBeforeSideEffect(decision, contextRef); err != nil {
 		return nil, err
@@ -2860,16 +2876,14 @@ func validateLaneLaunchConfig(lane *config.LaneDef) error {
 	}
 	expectedShapes := map[string]string{launch.WorkerRole: "implementation", launch.ForgeSmithRole: "implementation", launch.RecoveryRole: "implementation", launch.ReviewerRole: "qa", launch.OrchestratorRole: "coordinator", launch.ScoutPlannerRole: "architecture", launch.VerificationGateRole: "bounded", launch.ReviewSupervisorRole: "coordinator", launch.HarvestRole: "bounded", launch.RecoverySentinelRole: "bounded"}
 	if expected, ok := expectedShapes[role]; !ok || lane.TaskShape != expected {
-		return fmt.Errorf("lane %q has invalid task_shape %q for role %q", lane.Name, lane.TaskShape, role)
+		return fmt.Errorf("%w: lane %q has invalid task_shape %q for role %q", ErrWorkerConfigPolicy, lane.Name, lane.TaskShape, role)
 	}
 	if strings.TrimSpace(lane.AgentKind) != strings.TrimSpace(lane.Provider) {
 		return fmt.Errorf("lane %q agent kind %q does not match provider %q", lane.Name, lane.AgentKind, lane.Provider)
 	}
-	if role == launch.WorkerRole || role == launch.ForgeSmithRole || role == launch.RecoveryRole {
-		if lane.AgentKind != launch.WorkerProvider || lane.Provider != launch.WorkerProvider || lane.Model != launch.WorkerModel || lane.Effort != launch.WorkerEffort {
-			return fmt.Errorf("%w: lane %q must explicitly be codex/gpt-5.6-luna/medium", ErrWorkerConfigPolicy, lane.Name)
-		}
-	}
+	// Builder lanes are not pinned to a vendor. Their provider/model/effort are
+	// soft preferences fed to the quota-ranked router; the shape check above is
+	// the real constraint.
 	return nil
 }
 

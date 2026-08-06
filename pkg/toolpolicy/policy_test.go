@@ -9,6 +9,14 @@ import (
 	"github.com/Kampe/Herdforge/pkg/toolpolicy"
 )
 
+// Fixture tuple: production no longer pins a vendor for builder roles, so
+// these tests carry their own concrete provider instead of importing one.
+const (
+	testWorkerProvider = "codex"
+	testWorkerModel    = "gpt-5.6-luna"
+	testWorkerEffort   = "high"
+)
+
 func TestCodexPolicyDisablesInheritedMCPKeepsCLI(t *testing.T) {
 	argv, cfg, err := toolpolicy.Require(toolpolicy.RoleWorker, "codex", []string{"codex", "--model", "gpt-5.6-luna"})
 	if err != nil {
@@ -44,8 +52,8 @@ func fakeInheritedCRGChildren(argv []string) int {
 func TestProductionLaunchRejectsInheritedCRGChild(t *testing.T) {
 	t.Setenv("HERDR_ROUTE_STATE_DIR", t.TempDir())
 	r := router.NewRouter(nil, nil)
-	r.Probes = &router.Probes{CLIPresent: func(cli string) bool { return cli == launch.WorkerProvider }, Now: func() time.Time { return time.Unix(1_800_000_000, 0) }}
-	d, err := r.Decide(router.LaunchRequest{Role: router.RoleWorker, Shape: launch.Implementation, RequestedProvider: launch.WorkerProvider, RequestedModel: launch.WorkerModel, RequestedEffort: launch.WorkerEffort, ProbeResults: map[string]bool{router.ProbeKey(launch.WorkerProvider, launch.WorkerModel): true}})
+	r.Probes = &router.Probes{CLIPresent: func(cli string) bool { return cli == testWorkerProvider }, Now: func() time.Time { return time.Unix(1_800_000_000, 0) }}
+	d, err := r.Decide(router.LaunchRequest{Role: router.RoleWorker, Shape: launch.Implementation, RequestedProvider: testWorkerProvider, RequestedModel: testWorkerModel, RequestedEffort: testWorkerEffort, ProbeResults: map[string]bool{router.ProbeKey(testWorkerProvider, testWorkerModel): true}})
 	if err != nil {
 		t.Fatal(err)
 	}

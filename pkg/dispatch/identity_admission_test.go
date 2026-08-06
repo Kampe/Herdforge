@@ -52,7 +52,7 @@ func TestLaunchRepositoryIdentityFailureHasZeroHerdrAndCompensatorEffects(t *tes
 	task := baseTask("FAC-3")
 	lane := &d.Config.Lanes[0]
 	result := &DispatchResult{}
-	decision, err := testRouter(t).Decide(router.LaunchRequest{Role: router.RoleWorker, Shape: launch.Implementation, RequestedProvider: launch.WorkerProvider, RequestedModel: launch.WorkerModel, RequestedEffort: launch.WorkerEffort, TaskRef: task.Ref, LeaseGeneration: 1, Scope: router.ScopeTask, ProbeResults: map[string]bool{router.ProbeKey(launch.WorkerProvider, launch.WorkerModel): true}})
+	decision, err := testRouter(t).Decide(router.LaunchRequest{Role: router.RoleWorker, Shape: launch.Implementation, RequestedProvider: testWorkerProvider, RequestedModel: testWorkerModel, RequestedEffort: testWorkerEffort, TaskRef: task.Ref, LeaseGeneration: 1, Scope: router.ScopeTask, ProbeResults: map[string]bool{router.ProbeKey(testWorkerProvider, testWorkerModel): true}})
 	if err != nil {
 		t.Fatal(err)
 	}

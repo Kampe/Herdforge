@@ -64,36 +64,69 @@ func TestModelRequiresProbeLunaAndDeepseek(t *testing.T) {
 	}
 }
 
-func TestPinnedProbeMustMatchExactRequestedModel(t *testing.T) {
+// The whole point of unpinning builders: when the preferred surface is out of
+// quota, a worker launch reroutes instead of failing. A vendor tuple gate made
+// this impossible and stranded the fleet whenever one pool filled.
+func TestWorkerDecideReroutesOnQuotaExhaustion(t *testing.T) {
 	clearRouteEnv(t)
-	cases := map[string]LaunchRequest{
-		"provider":       {Role: RoleWorker, Shape: "implementation", RequestedProvider: "lazer", RequestedModel: "gpt-5.6-luna", RequestedEffort: "medium", ProbeResults: map[string]bool{ProbeKey("lazer", "gpt-5.6-luna"): true}},
-		"deepseek-model": {Role: RoleForgeSmith, Shape: "implementation", RequestedProvider: "codex", RequestedModel: "opencode/deepseek-v4-flash", RequestedEffort: "medium", ProbeResults: map[string]bool{ProbeKey("codex", "opencode/deepseek-v4-flash"): true}},
-		"spark-model":    {Role: RoleRecovery, Shape: "implementation", RequestedProvider: "codex", RequestedModel: "gpt-5.3-codex-spark", RequestedEffort: "medium", ProbeResults: map[string]bool{ProbeKey("codex", "gpt-5.3-codex-spark"): true}},
-		"sol-model":      {Role: RoleRecovery, Shape: "implementation", RequestedProvider: "codex", RequestedModel: "gpt-5.6-sol", RequestedEffort: "medium"},
-		"fable-model":    {Role: RoleWorker, Shape: "implementation", RequestedProvider: "claude", RequestedModel: "claude-fable-5", RequestedEffort: "medium"},
-		"shape":          {Role: RoleWorker, Shape: "bounded", RequestedProvider: "codex", RequestedModel: "gpt-5.6-luna", RequestedEffort: "medium", ProbeResults: map[string]bool{ProbeKey("codex", "gpt-5.6-luna"): true}},
+	computed := map[string]usage.BurnState{
+		"claude": {Available: false, Reason: "exhausted", Pressure: 100},
+		"codex":  {Available: false, Reason: "exhausted", Pressure: 100},
+		"grok":   {Available: true, Pressure: 10},
 	}
-	for name, bad := range cases {
-		t.Run(name, func(t *testing.T) {
-			if _, err := testRouter(nil, "codex").Decide(bad); !errors.Is(err, ErrWorkerPolicy) {
-				t.Fatalf("forbidden worker route error = %v", err)
-			}
-		})
+	r := testRouter(computed, "claude", "codex", "grok")
+	// No RequestedProvider: a lane's configured provider is a soft preference,
+	// so the CLI must not pass it through the hard --provider channel (which
+	// narrows candidates to exactly one surface, chainseer herd-route parity).
+	d, err := r.Decide(LaunchRequest{Role: RoleWorker, Shape: "implementation"})
+	if err != nil {
+		t.Fatalf("worker must reroute when the preferred surface is exhausted: %v", err)
 	}
-	good := LaunchRequest{Role: RoleWorker, Shape: "implementation", RequestedProvider: "codex", RequestedModel: "gpt-5.6-luna", RequestedEffort: "medium", ProbeResults: map[string]bool{ProbeKey("codex", "gpt-5.6-luna"): true}}
-	if _, err := testRouter(nil, "codex").Decide(good); err != nil {
-		t.Fatalf("approved Luna route rejected: %v", err)
+	if d.Provider != "grok" {
+		t.Fatalf("worker routed to %s/%s, want the healthy grok surface", d.Provider, d.Model)
+	}
+	if d.Shape != "implementation" {
+		t.Fatalf("rerouted worker lost its shape: %s", d.Shape)
 	}
 }
 
-func TestWorkerPolicyRequiresExplicitMediumEffort(t *testing.T) {
+// Builder roles are bound to the implementation shape but NOT to a vendor.
+// Anything else is the quota-ranked waterfall's business.
+func TestWorkerRoleIsBoundToImplementationShapeOnly(t *testing.T) {
+	clearRouteEnv(t)
+	bad := LaunchRequest{Role: RoleWorker, Shape: "bounded", RequestedProvider: "codex", RequestedModel: "gpt-5.6-luna", RequestedEffort: "medium", ProbeResults: map[string]bool{ProbeKey("codex", "gpt-5.6-luna"): true}}
+	if _, err := testRouter(nil, "codex").Decide(bad); !errors.Is(err, ErrWorkerPolicy) {
+		t.Fatalf("worker on a non-implementation shape must be rejected, got %v", err)
+	}
+	good := LaunchRequest{Role: RoleWorker, Shape: "implementation", RequestedProvider: "codex", RequestedModel: "gpt-5.6-luna", RequestedEffort: "medium", ProbeResults: map[string]bool{ProbeKey("codex", "gpt-5.6-luna"): true}}
+	if _, err := testRouter(nil, "codex").Decide(good); err != nil {
+		t.Fatalf("implementation-shape worker rejected: %v", err)
+	}
+}
+
+// A probe-required model only routes when the probe for that EXACT
+// (provider, model) passed. A probe for a sibling model must not carry it.
+func TestProbeRequiredModelNeedsMatchingProbe(t *testing.T) {
+	clearRouteEnv(t)
+	if !ModelRequiresProbe("gpt-5.6-luna") {
+		t.Fatal("fixture assumes luna requires a probe")
+	}
+	mismatched := LaunchRequest{Role: RoleWorker, Shape: "implementation", RequestedProvider: "codex", RequestedModel: "gpt-5.6-luna", RequestedEffort: "medium",
+		ProbeResults: map[string]bool{ProbeKey("codex", "gpt-5.3-codex-spark"): true}}
+	if _, err := testRouter(nil, "codex").Decide(mismatched); err == nil {
+		t.Fatal("probe for a different model must not satisfy the gate")
+	}
+	failed := LaunchRequest{Role: RoleWorker, Shape: "implementation", RequestedProvider: "codex", RequestedModel: "gpt-5.6-luna", RequestedEffort: "medium",
+		ProbeResults: map[string]bool{ProbeKey("codex", "gpt-5.6-luna"): false}}
+	if _, err := testRouter(nil, "codex").Decide(failed); err == nil {
+		t.Fatal("failed probe must fail closed")
+	}
+}
+
+func TestWorkerEffortComesFromShapeLadder(t *testing.T) {
 	base := LaunchRequest{Role: RoleWorker, Shape: "implementation", RequestedProvider: "codex", RequestedModel: "gpt-5.6-luna"}
-	for name, effort := range map[string]string{"missing": "", "wrong": "high"} {
-		base.RequestedEffort = effort
-		if _, err := testRouter(nil, "codex").Decide(base); !errors.Is(err, ErrWorkerPolicy) {
-			t.Fatalf("%s effort error = %v", name, err)
-		}
+	if got := EffortForRequest(base); got != EffortFor("implementation") {
+		t.Fatalf("worker effort = %q, want shape ladder %q", got, EffortFor("implementation"))
 	}
 	base.RequestedEffort = "medium"
 	base.ProbeResults = map[string]bool{ProbeKey("codex", "gpt-5.6-luna"): true}
@@ -160,7 +193,7 @@ func TestEffortLadderReviewer(t *testing.T) {
 		{
 			name: "worker uses shape ladder",
 			req:  LaunchRequest{Role: RoleWorker, Shape: "implementation"},
-			want: "medium",
+			want: "high", // EffortFor("implementation"); was hard-coded "medium"
 		},
 		{
 			name: "worker bounded low",
@@ -220,9 +253,9 @@ func TestDecideWorkerPicksModelAndEffort(t *testing.T) {
 	if d.Role != RoleWorker {
 		t.Fatalf("role = %s", d.Role)
 	}
-	// Effort must come from router policy, not harness default empty.
-	if d.Effort != "medium" {
-		t.Fatalf("worker effort = %q, want medium", d.Effort)
+	// Effort must come from router policy (the shape ladder), not a harness default.
+	if d.Effort != EffortFor("implementation") {
+		t.Fatalf("worker effort = %q, want %q", d.Effort, EffortFor("implementation"))
 	}
 	if len(d.Argv) == 0 {
 		t.Fatal("argv must be populated from decision")

@@ -13,22 +13,37 @@ import (
 	"github.com/Kampe/Herdforge/pkg/usage"
 )
 
+// Fixture tuple for launch-policy tests. Deliberately a concrete provider so
+// the hermetic router picks deterministically; production no longer pins any
+// vendor for builder roles, so these must NOT come from pkg/launch.
+const (
+	testWorkerProvider = "codex"
+	testWorkerModel    = "gpt-5.6-luna"
+	testWorkerEffort   = "high"
+)
+
 func testLaunchRouter(t *testing.T) *router.SurfaceRouter {
 	t.Helper()
 	t.Setenv("HERDR_ROUTE_STATE_DIR", t.TempDir())
 	r := router.NewRouter(nil, nil)
 	r.Probes = &router.Probes{
-		CLIPresent: func(cli string) bool { return cli == launch.WorkerProvider },
+		CLIPresent: func(cli string) bool { return cli == testWorkerProvider },
 		Now:        func() time.Time { return time.Unix(1_800_000_000, 0) },
 	}
 	return r
 }
 
 func TestWorkerConfigDriftRejectsBeforeLaunch(t *testing.T) {
-	lane := &config.LaneDef{Name: "mutant", Role: "worker", AgentKind: "codex", Provider: "codex", Model: "gpt-5.6-sol", Effort: "medium", TaskShape: "implementation"}
-	err := validateLaneLaunchConfig(lane)
-	if !errors.Is(err, ErrWorkerConfigPolicy) {
-		t.Fatalf("drift must fail at worker policy boundary, got %v", err)
+	// A builder lane on the wrong task shape is still a policy failure. Its
+	// provider/model/effort are soft pins the quota router may override, so a
+	// different model is NOT drift any more.
+	bad := &config.LaneDef{Name: "mutant", Role: "worker", AgentKind: "codex", Provider: "codex", Model: "gpt-5.6-sol", Effort: "medium", TaskShape: "bounded"}
+	if err := validateLaneLaunchConfig(bad); !errors.Is(err, ErrWorkerConfigPolicy) {
+		t.Fatalf("shape drift must fail at worker policy boundary, got %v", err)
+	}
+	softPin := &config.LaneDef{Name: "soft", Role: "worker", AgentKind: "codex", Provider: "codex", Model: "gpt-5.6-sol", Effort: "medium", TaskShape: "implementation"}
+	if err := validateLaneLaunchConfig(softPin); err != nil {
+		t.Fatalf("a non-default builder model is a soft pin, not drift: %v", err)
 	}
 }
 
@@ -51,9 +66,9 @@ func (r *fakeLaunchLifecycle) Run(decision *router.LaunchDecision, effect func(*
 }
 
 func TestLaunchAdmissionRejectsBeforeCompiledLifecycleSeams(t *testing.T) {
-	cfg := &config.Config{Lanes: []config.LaneDef{{Name: "mutant", Role: "worker", AgentKind: "codex", Provider: "codex", Model: "gpt-5.6-sol", Effort: "medium", TaskShape: "implementation"}}}
+	cfg := &config.Config{Lanes: []config.LaneDef{{Name: "mutant", Role: "worker", AgentKind: "codex", Provider: "codex", Model: "gpt-5.6-sol", Effort: "medium", TaskShape: "bounded"}}}
 	rec := &fakeLaunchLifecycle{}
-	valid, err := testLaunchRouter(t).Decide(router.LaunchRequest{Role: router.RoleWorker, Shape: launch.Implementation, RequestedProvider: launch.WorkerProvider, RequestedModel: launch.WorkerModel, RequestedEffort: launch.WorkerEffort, TaskRef: "worker", Scope: router.ScopeLane, ProbeResults: map[string]bool{router.ProbeKey(launch.WorkerProvider, launch.WorkerModel): true}})
+	valid, err := testLaunchRouter(t).Decide(router.LaunchRequest{Role: router.RoleWorker, Shape: launch.Implementation, RequestedProvider: testWorkerProvider, RequestedModel: testWorkerModel, RequestedEffort: testWorkerEffort, TaskRef: "worker", Scope: router.ScopeLane, ProbeResults: map[string]bool{router.ProbeKey(testWorkerProvider, testWorkerModel): true}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -74,7 +89,7 @@ func TestLaunchAdmissionRejectsBeforeCompiledLifecycleSeams(t *testing.T) {
 func TestLaunchAdmissionPassesExactDecisionToLifecycle(t *testing.T) {
 	lane := config.LaneDef{Name: "worker", Role: "worker", AgentKind: "codex", Provider: "codex", Model: "gpt-5.6-luna", Effort: "medium", TaskShape: "implementation"}
 	cfg := &config.Config{Lanes: []config.LaneDef{lane}}
-	valid, err := testLaunchRouter(t).Decide(router.LaunchRequest{Role: router.RoleWorker, Shape: launch.Implementation, RequestedProvider: launch.WorkerProvider, RequestedModel: launch.WorkerModel, RequestedEffort: launch.WorkerEffort, TaskRef: "worker", Scope: router.ScopeLane, ProbeResults: map[string]bool{router.ProbeKey(launch.WorkerProvider, launch.WorkerModel): true}})
+	valid, err := testLaunchRouter(t).Decide(router.LaunchRequest{Role: router.RoleWorker, Shape: launch.Implementation, RequestedProvider: testWorkerProvider, RequestedModel: testWorkerModel, RequestedEffort: testWorkerEffort, TaskRef: "worker", Scope: router.ScopeLane, ProbeResults: map[string]bool{router.ProbeKey(testWorkerProvider, testWorkerModel): true}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -150,12 +165,16 @@ func TestLaunchAdmissionValidatesDecisionContextByScope(t *testing.T) {
 	})
 }
 
-func TestWorkerFinalTupleRejectsSparkFallbackBeforeAnySideEffect(t *testing.T) {
+// A builder whose only reachable model has no passing tool-probe must be
+// rejected before ANY lifecycle side effect. (Previously this asserted a
+// codex/luna vendor tuple; builders are no longer vendor-pinned, so the
+// surviving invariant is the probe gate plus side-effect ordering.)
+func TestWorkerUnprobedFallbackRejectsBeforeAnySideEffect(t *testing.T) {
 	roles := []string{launch.WorkerRole, launch.ForgeSmithRole, launch.RecoveryRole}
 	for _, role := range roles {
 		t.Run(role, func(t *testing.T) {
 			t.Setenv("HERDR_ROUTE_STATE_DIR", t.TempDir())
-			lane := config.LaneDef{Name: role, Role: role, AgentKind: launch.WorkerProvider, Provider: launch.WorkerProvider, Model: launch.WorkerModel, Effort: launch.WorkerEffort, TaskShape: launch.Implementation}
+			lane := config.LaneDef{Name: role, Role: role, AgentKind: testWorkerProvider, Provider: testWorkerProvider, Model: testWorkerModel, Effort: testWorkerEffort, TaskShape: launch.Implementation}
 			cfg := &config.Config{Lanes: []config.LaneDef{lane}}
 			r := router.NewRouter(usage.NewQuotaEngine(), map[string]usage.BurnState{
 				"codex": {
@@ -166,31 +185,34 @@ func TestWorkerFinalTupleRejectsSparkFallbackBeforeAnySideEffect(t *testing.T) {
 					},
 				},
 			})
-			r.Probes = &router.Probes{CLIPresent: func(cli string) bool { return cli == launch.WorkerProvider }, Now: func() time.Time { return time.Unix(1_800_000_000, 0) }}
+			// No builder CLI is installed, so the waterfall has no healthy
+			// surface at all and must reject before any lifecycle seam.
+			r.Probes = &router.Probes{CLIPresent: func(string) bool { return false }, Now: func() time.Time { return time.Unix(1_800_000_000, 0) }}
 			rec := &fakeLaunchLifecycle{}
 			decision, err := launchAdmissionWithLifecycle(rec, cfg, role, true, func(lane *config.LaneDef) (*router.LaunchDecision, error) {
 				return r.Decide(router.LaunchRequest{
 					Role:              router.Role(role),
 					Shape:             launch.Implementation,
-					RequestedProvider: launch.WorkerProvider,
-					RequestedModel:    launch.WorkerModel,
-					RequestedEffort:   launch.WorkerEffort,
+					RequestedProvider: testWorkerProvider,
+					RequestedModel:    testWorkerModel,
+					RequestedEffort:   testWorkerEffort,
 					TaskRef:           lane.Name,
 					Scope:             router.ScopeLane,
-					ProbeResults:      map[string]bool{router.ProbeKey(launch.WorkerProvider, "gpt-5.3-codex-spark"): true},
+					// No passing probe for any reachable model: fail closed.
+					ProbeResults:      map[string]bool{router.ProbeKey(testWorkerProvider, "gpt-5.3-codex-spark"): false},
 				})
 			}, func(*router.LaunchDecision) error {
-				t.Fatal("forbidden Spark fallback reached lifecycle side effects")
+				t.Fatal("rejected launch reached lifecycle side effects")
 				return nil
 			})
 			if decision != nil {
-				t.Fatalf("rejected final tuple must not produce a LaunchDecision: %+v", decision)
+				t.Fatalf("rejected launch must not produce a LaunchDecision: %+v", decision)
 			}
-			if !errors.Is(err, router.ErrWorkerPolicy) {
-				t.Fatalf("Spark fallback must fail with ErrWorkerPolicy: %v", err)
+			if err == nil {
+				t.Fatal("no healthy builder surface must fail closed")
 			}
 			if *rec != (fakeLaunchLifecycle{}) {
-				t.Fatalf("rejected final tuple caused side effects: %+v", rec)
+				t.Fatalf("rejected launch caused side effects: %+v", rec)
 			}
 		})
 	}
@@ -199,10 +221,10 @@ func TestWorkerFinalTupleRejectsSparkFallbackBeforeAnySideEffect(t *testing.T) {
 func TestTaskLaunchRequestCarriesExactReboundGeneration(t *testing.T) {
 	d, err := testLaunchRouter(t).Decide(router.LaunchRequest{
 		Role: router.RoleWorker, Shape: launch.Implementation,
-		RequestedProvider: launch.WorkerProvider, RequestedModel: launch.WorkerModel,
-		RequestedEffort: launch.WorkerEffort, TaskRef: "FAC-B", LeaseGeneration: 7,
+		RequestedProvider: testWorkerProvider, RequestedModel: testWorkerModel,
+		RequestedEffort: testWorkerEffort, TaskRef: "FAC-B", LeaseGeneration: 7,
 		Scope:        router.ScopeTask,
-		ProbeResults: map[string]bool{router.ProbeKey(launch.WorkerProvider, launch.WorkerModel): true},
+		ProbeResults: map[string]bool{router.ProbeKey(testWorkerProvider, testWorkerModel): true},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -268,7 +290,7 @@ func TestPrepareStandingWorktreePropagatesFailure(t *testing.T) {
 }
 
 func TestStandingEntryPointReturnsPolicyFailureBeforeHerdr(t *testing.T) {
-	cfg := &config.Config{Lanes: []config.LaneDef{{Name: "bad-standing", Role: "worker", Standing: true, AgentKind: "codex", Provider: "codex", Model: "gpt-5.6-sol", Effort: "medium", TaskShape: "implementation"}}}
+	cfg := &config.Config{Lanes: []config.LaneDef{{Name: "bad-standing", Role: "worker", Standing: true, AgentKind: "codex", Provider: "codex", Model: "gpt-5.6-sol", Effort: "medium", TaskShape: "bounded"}}}
 	err := runStandingConfig(cfg, true)
 	if !errors.Is(err, ErrWorkerConfigPolicy) {
 		t.Fatalf("standing entrypoint must return worker policy failure: %v", err)
@@ -276,7 +298,7 @@ func TestStandingEntryPointReturnsPolicyFailureBeforeHerdr(t *testing.T) {
 }
 
 func TestForgeEntryPointReturnsPolicyFailureBeforeClaim(t *testing.T) {
-	cfg := &config.Config{Lanes: []config.LaneDef{{Name: "bad-forge", Role: "worker", AgentKind: "codex", Provider: "codex", Model: "gpt-5.6-sol", Effort: "medium", TaskShape: "implementation"}}}
+	cfg := &config.Config{Lanes: []config.LaneDef{{Name: "bad-forge", Role: "worker", AgentKind: "codex", Provider: "codex", Model: "gpt-5.6-sol", Effort: "medium", TaskShape: "bounded"}}}
 	claimed := false
 	_, err := forgeLaunchAdmission(cfg, &cfg.Lanes[0], context.Background(), func(*router.LaunchDecision) error {
 		claimed = true
