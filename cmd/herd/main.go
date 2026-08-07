@@ -1691,6 +1691,11 @@ func runBoardDone() {
 		os.Exit(1)
 	}
 	fmt.Printf("herd board-done: %s proof: %s\n", res.Ref, res.Proof)
+	// A closed ticket must not keep holding scope. Its claim otherwise stays
+	// Active forever and blocks any later task that overlaps it — FAC-174 was
+	// merged and board-closed yet still held pkg/verifier, which rejected
+	// FAC-198 with scope_overlap and needed a manual release to clear.
+	releaseScopeClaimQuietly(res.Ref)
 	fmt.Printf("herd board-done: %s is done (verified by read-back)\n", res.Ref)
 }
 
@@ -4798,4 +4803,39 @@ func leadingPositionalArgs(args []string) []string {
 		return args
 	}
 	return append(append([]string{}, args[1:]...), args[0])
+}
+
+// releaseScopeClaimQuietly surrenders a completed ticket's scope claim through
+// the fence's own abandonment path. Best-effort by design: a ticket that is
+// provably merged must still close even if the fence is unavailable, so a
+// failure here warns rather than blocking the board write that already
+// succeeded.
+func releaseScopeClaimQuietly(ref string) {
+	store, err := scopefence.NewSQLiteStore(filepath.Join(".", ".herd", "scopefence.db"))
+	if err != nil {
+		return
+	}
+	repository, err := dispatch.AuthenticatedRepositoryIdentity(".")
+	if err != nil {
+		return
+	}
+	snap, err := store.Read(context.Background())
+	if err != nil {
+		return
+	}
+	for i := range snap.Owners {
+		if snap.Owners[i].Task != ref {
+			continue
+		}
+		fence := scopefence.Fence{Store: store, ReleaseAuthority: scopeauth.New()}
+		if err := fence.Release(context.Background(), scopefence.ReleaseRequest{
+			Ownership: snap.Owners[i],
+			Authority: scopefence.FencedAbandonment,
+		}); err != nil {
+			fmt.Fprintf(os.Stderr, "herd board-done: WARN %s closed but its scope claim could not be released: %v\n", ref, err)
+			return
+		}
+		fmt.Printf("herd board-done: released %s scope claim in %s\n", ref, repository)
+		return
+	}
 }
