@@ -126,6 +126,10 @@ func (g GoProfile) ArtifactNames() ArtifactSpec {
 	return ArtifactSpec{}
 }
 
+func (g GoProfile) ChainHeader(pkg string, n int) string {
+	return fmt.Sprintf("herd-fresh-build: chain for %s = %d package(s) (target only; Go profile does not walk dependencies):", pkg, n)
+}
+
 func (g GoProfile) DryRunClearLine() string {
 	return "herd-fresh-build: --dry-run, would clear nothing (Go profile has no stale-artifact clear step), then rebuild. Nothing changed."
 }
@@ -146,11 +150,7 @@ func (g GoProfile) Build(ctx context.Context, root, pkg string, log io.Writer) (
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	args := []string{"build", pkg}
-	if pkg == "" {
-		args = []string{"build", "./..."}
-	}
-	cmd := exec.CommandContext(ctx, g.bin(), args...)
+	cmd := exec.CommandContext(ctx, g.bin(), "build", pkg)
 	cmd.Dir = root
 	cmd.Stdout = log
 	cmd.Stderr = log

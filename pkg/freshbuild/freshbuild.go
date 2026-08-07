@@ -39,11 +39,16 @@ type Chain struct {
 }
 
 // Sections returns repo-root-relative paths for plan printing.
+// root is realpath'd so logical and physical roots strip the same prefix.
 func (c *Chain) Sections(root string) []string {
 	if c == nil {
 		return nil
 	}
-	root = filepath.Clean(root)
+	if canon, err := canonicalPath(root); err == nil {
+		root = canon
+	} else {
+		root = filepath.Clean(root)
+	}
 	out := make([]string, 0, len(c.Dirs))
 	for _, d := range c.Dirs {
 		rel := d
@@ -131,9 +136,9 @@ func FreshBuild(ctx context.Context, opts Options) (*Verdict, error) {
 		}
 		root = wd
 	}
-	root, err := filepath.Abs(root)
+	root, err := canonicalPath(root)
 	if err != nil {
-		return nil, fmt.Errorf("freshbuild: abs root: %w", err)
+		return nil, fmt.Errorf("freshbuild: canonicalize root: %w", err)
 	}
 
 	stdout := opts.Stdout
@@ -189,7 +194,7 @@ func FreshBuild(ctx context.Context, opts Options) (*Verdict, error) {
 	}
 	chain := &Chain{Target: pkg, Dirs: dirs}
 
-	fmt.Fprintf(stdout, "herd-fresh-build: chain for %s = %d package(s) (target + dependencies):\n", pkg, len(dirs))
+	fmt.Fprintln(stdout, prof.ChainHeader(pkg, len(dirs)))
 	for _, s := range chain.Sections(root) {
 		fmt.Fprintf(stdout, "  %s\n", s)
 	}

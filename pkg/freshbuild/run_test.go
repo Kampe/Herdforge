@@ -49,8 +49,8 @@ func TestFreshBuild_DryRunDeletesNothing_PnpmMessages(t *testing.T) {
 		t.Fatalf("dry-run must not delete dist: %v", err)
 	}
 	out := stdout.String()
-	if !strings.Contains(out, "chain for @scope/a = 1 package") {
-		t.Fatalf("plan missing:\n%s", out)
+	if !strings.Contains(out, "chain for @scope/a = 1 package(s) (target + dependencies)") {
+		t.Fatalf("pnpm plan header missing:\n%s", out)
 	}
 	if !strings.Contains(out, "would clear dist/") {
 		t.Fatalf("pnpm dry-run must mention dist clear:\n%s", out)
@@ -96,6 +96,12 @@ func TestFreshBuild_DryRun_GoDoesNotPromiseDistClear(t *testing.T) {
 	}
 	if !strings.Contains(out, "nothing") {
 		t.Fatalf("go dry-run must say clear nothing:\n%s", out)
+	}
+	if !strings.Contains(out, "target only") {
+		t.Fatalf("go chain header must not claim dependencies:\n%s", out)
+	}
+	if strings.Contains(out, "target + dependencies") {
+		t.Fatalf("go chain header must not claim dependencies:\n%s", out)
 	}
 }
 
@@ -236,6 +242,9 @@ func TestFreshBuild_NodeModulesVerdict(t *testing.T) {
 	if !strings.Contains(stderr.String(), "STALE/MISSING node_modules") {
 		t.Fatalf("stderr=%s", stderr.String())
 	}
+	if !strings.Contains(stderr.String(), "Run: pnpm install") {
+		t.Fatalf("node_modules verdict must print remediation line:\n%s", stderr.String())
+	}
 }
 
 func TestFreshBuild_RealErrorModuleNotInLock(t *testing.T) {
@@ -275,6 +284,9 @@ func TestFreshBuild_RealErrorModuleNotInLock(t *testing.T) {
 	}
 	if !strings.Contains(stderr.String(), "REAL build error") {
 		t.Fatalf("stderr=%s", stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "full log at") {
+		t.Fatalf("real error must print log path handoff:\n%s", stderr.String())
 	}
 	if v.LogPath == "" {
 		t.Fatal("real error must keep log path")

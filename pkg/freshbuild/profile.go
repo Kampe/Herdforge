@@ -45,6 +45,9 @@ type Profile interface {
 	CleanLine(n int) string
 	// RealErrorHeader is the stderr banner for a genuine rebuild failure.
 	RealErrorHeader() string
+	// ChainHeader describes the chain membership for plan printing.
+	// Must not claim "dependencies" unless the profile actually walks them.
+	ChainHeader(pkg string, n int) string
 }
 
 // ArtifactSpec describes what a profile may delete inside a chain directory.
@@ -88,8 +91,8 @@ func (s ArtifactSpec) PlanSummary() string {
 //  1. Explicit pnpm workspace markers (pnpm-lock.yaml / pnpm-workspace.yaml) → pnpm
 //  2. go.mod → go (checked before bare package.json so a Go repo that ships a
 //     docs-tooling package.json is not misrouted to pnpm)
-//  3. package.json only when packageManager declares pnpm (or no competing
-//     npm/yarn lock); package-lock.json / yarn.lock → refuse, never guess npm
+//  3. package.json only when packageManager declares pnpm; package-lock.json /
+//     yarn.lock or bare package.json without packageManager → refuse
 //  4. otherwise → nil
 func DetectProfile(root string) Profile {
 	root = filepath.Clean(root)
@@ -135,10 +138,56 @@ func fileExists(path string) bool {
 	return err == nil && !st.IsDir()
 }
 
-// normalizeChainDirs abs-normalizes, dedupes, sorts, and enforces the
-// destructive boundary: every dir must live under root.
+// canonicalPath returns the absolute, symlink-resolved form of path.
+// Matches zsh :A (realpath) so Getwd()-style logical roots compare equal to
+// pnpm `exec pwd` physical paths under /tmp→/private/tmp or a symlink checkout.
+//
+// When the leaf does not exist yet, existing parents are still realpath'd and
+// the missing suffix is re-joined — otherwise root (/private/var/...) and a
+// non-existent child under /var/... compare as an escape on macOS.
+func canonicalPath(path string) (string, error) {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return "", fmt.Errorf("freshbuild: empty path")
+	}
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	abs = filepath.Clean(abs)
+	if resolved, err := filepath.EvalSymlinks(abs); err == nil {
+		return filepath.Clean(resolved), nil
+	}
+	// Walk up until an existing prefix can be realpath'd.
+	cur := abs
+	var missing []string
+	for {
+		if _, err := os.Lstat(cur); err == nil {
+			base, err := filepath.EvalSymlinks(cur)
+			if err != nil {
+				return abs, nil
+			}
+			for i := len(missing) - 1; i >= 0; i-- {
+				base = filepath.Join(base, missing[i])
+			}
+			return filepath.Clean(base), nil
+		}
+		parent := filepath.Dir(cur)
+		if parent == cur {
+			return abs, nil
+		}
+		missing = append(missing, filepath.Base(cur))
+		cur = parent
+	}
+}
+
+// normalizeChainDirs realpath-normalizes, dedupes, sorts, and enforces the
+// destructive boundary: every dir must live under root (after EvalSymlinks).
 func normalizeChainDirs(root string, dirs []string) ([]string, error) {
-	root = filepath.Clean(root)
+	rootCanon, err := canonicalPath(root)
+	if err != nil {
+		return nil, fmt.Errorf("freshbuild: canonicalize root: %w", err)
+	}
 	seen := map[string]struct{}{}
 	var out []string
 	for _, d := range dirs {
@@ -146,14 +195,13 @@ func normalizeChainDirs(root string, dirs []string) ([]string, error) {
 		if d == "" {
 			continue
 		}
-		abs, err := filepath.Abs(d)
+		abs, err := canonicalPath(d)
 		if err != nil {
-			return nil, fmt.Errorf("freshbuild: abs chain dir %q: %w", d, err)
+			return nil, fmt.Errorf("freshbuild: canonicalize chain dir %q: %w", d, err)
 		}
-		abs = filepath.Clean(abs)
-		rel, err := filepath.Rel(root, abs)
+		rel, err := filepath.Rel(rootCanon, abs)
 		if err != nil || strings.HasPrefix(rel, "..") || rel == ".." {
-			return nil, fmt.Errorf("freshbuild: chain dir %q escapes repository root %q", abs, root)
+			return nil, fmt.Errorf("freshbuild: chain dir %q escapes repository root %q", abs, rootCanon)
 		}
 		if _, ok := seen[abs]; ok {
 			continue

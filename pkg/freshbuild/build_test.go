@@ -1,6 +1,9 @@
 package freshbuild
 
 import (
+	"bytes"
+	"context"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -145,7 +148,7 @@ func TestDetectProfile_OrderAndHonesty(t *testing.T) {
 }
 
 func TestGoResolveTarget_RootRelativeNotCwd(t *testing.T) {
-	t.Parallel()
+	// Not parallel: t.Chdir mutates process cwd for this test only.
 	root := t.TempDir()
 	// Create root/cmd and a cwd-local cmd that would confuse cwd-relative stat.
 	rootCmd := filepath.Join(root, "cmd")
@@ -156,15 +159,7 @@ func TestGoResolveTarget_RootRelativeNotCwd(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(cwd, "cmd"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	// Change into cwd so a naive os.Stat("cmd") would see the wrong dir.
-	old, err := os.Getwd()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Chdir(cwd); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.Chdir(old) })
+	t.Chdir(cwd)
 
 	g := GoProfile{}
 	pkg, isPath, err := g.ResolveTarget(root, "cmd")
@@ -180,6 +175,86 @@ func TestGoResolveTarget_RootRelativeNotCwd(t *testing.T) {
 	}
 	if len(dirs) != 1 || dirs[0] != rootCmd {
 		t.Fatalf("chain must be root/cmd, got %v (cwd cmd=%s)", dirs, filepath.Join(cwd, "cmd"))
+	}
+}
+
+func TestNormalizeChainDirs_SymlinkedRoot(t *testing.T) {
+	t.Parallel()
+	// Reproduce finding 1: logical root via symlink, physical chain dirs from
+	// "pnpm exec pwd". Without EvalSymlinks, filepath.Rel rejects the chain.
+	base := t.TempDir()
+	realWS := filepath.Join(base, "ws")
+	if err := os.MkdirAll(filepath.Join(realWS, "packages", "b"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	linkWS := filepath.Join(base, "link")
+	if err := os.Symlink(realWS, linkWS); err != nil {
+		t.Skipf("symlink not available: %v", err)
+	}
+	// Physical chain dir (what pnpm prints).
+	physB := filepath.Join(realWS, "packages", "b")
+	// Logical root (what Getwd returns under the symlink).
+	logicalRoot := linkWS
+
+	dirs, err := normalizeChainDirs(logicalRoot, []string{physB})
+	if err != nil {
+		t.Fatalf("symlinked root must accept physical chain dirs: %v", err)
+	}
+	if len(dirs) != 1 {
+		t.Fatalf("dirs=%v", dirs)
+	}
+	// Result is canonical (physical).
+	want, err := filepath.EvalSymlinks(physB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dirs[0] != want {
+		t.Fatalf("got %q want %q", dirs[0], want)
+	}
+}
+
+func TestFreshBuild_SymlinkedRootWithPhysicalChain(t *testing.T) {
+	t.Parallel()
+	base := t.TempDir()
+	realWS := filepath.Join(base, "ws")
+	pkgDir := filepath.Join(realWS, "packages", "a")
+	if err := os.MkdirAll(pkgDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(realWS, "pnpm-lock.yaml"), []byte("lockfileVersion: '9.0'\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	linkWS := filepath.Join(base, "link")
+	if err := os.Symlink(realWS, linkWS); err != nil {
+		t.Skipf("symlink not available: %v", err)
+	}
+	// Inject chain dirs as the physical path (pnpm-style).
+	physA, err := filepath.EvalSymlinks(pkgDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout bytes.Buffer
+	v, err := FreshBuild(context.Background(), Options{
+		Root:     linkWS, // logical/symlink root
+		Target:   "@s/a",
+		DryRun:   true,
+		Profile:  PnpmProfile{},
+		LookPath: func(string) (string, error) { return "/bin/pnpm", nil },
+		ChainFn: func(ctx context.Context, root, pkg string) ([]string, error) {
+			return []string{physA}, nil
+		},
+		Stdout: &stdout,
+		Stderr: io.Discard,
+	})
+	if err != nil {
+		t.Fatalf("symlinked root + physical chain must succeed: %v\n%s", err, stdout.String())
+	}
+	if v.Kind != VerdictDryRun {
+		t.Fatalf("verdict=%+v", v)
+	}
+	if !strings.Contains(stdout.String(), "chain for @s/a") {
+		t.Fatalf("plan missing:\n%s", stdout.String())
 	}
 }
 
