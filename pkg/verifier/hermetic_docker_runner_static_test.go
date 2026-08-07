@@ -400,13 +400,22 @@ func TestSourceManifestDigestFromFilesystemMembersSkipsDirectory(t *testing.T) {
 }
 
 func TestFAC151HermeticRuntimeArgvBindsCompileArtifactAndPolicy(t *testing.T) {
-	want := []string{hermeticRunPath + "/verifier.test", "-test.run", fixedFAC151Regex(), "-test.count=" + hermeticTestCount, "-test.timeout=" + hermeticTestTimeout}
+	want := []string{
+		"/usr/bin/env",
+		"TMPDIR=" + hermeticGoTmpDir,
+		"GOTMPDIR=" + hermeticGoTmpDir,
+		"HOME=" + hermeticGoTmpDir,
+		hermeticRunPath + "/verifier.test",
+		"-test.run", fixedFAC151Regex(),
+		"-test.count=" + hermeticTestCount,
+		"-test.timeout=" + hermeticTestTimeout,
+	}
 	got := fixedFAC151Argv()
 	if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
 		t.Fatalf("runtime argv = %#v, want %#v", got, want)
 	}
-	if got[0] != hermeticRunPath+"/verifier.test" {
-		t.Fatalf("runtime binary path = %q, want compile output path", got[0])
+	if !containsString(got, hermeticRunPath+"/verifier.test") {
+		t.Fatalf("runtime argv missing compile output path: %#v", got)
 	}
 }
 
@@ -559,7 +568,9 @@ func (f *fac198DockerFake) Exec(_ context.Context, _ string, argv []string, _ []
 	if len(argv) == 3 && argv[0] == "/bin/sh" {
 		return dockerResult{Output: []byte("101 202 65532 65532")}, nil
 	}
-	if len(argv) > 0 && argv[0] == hermeticRunPath+"/verifier.test" {
+	// Runtime invocation is env + binary + -test.*; compile is `go test -c -o …/verifier.test`
+	// and must not be treated as the verifier run (would short-circuit before the test binary).
+	if isHermeticVerifierInvocation(argv) {
 		f.verifierExecCalls++
 		if f.executionErr != nil {
 			return dockerResult{Output: []byte("stdout\nstderr"), ExitCode: 7}, f.executionErr
@@ -567,6 +578,23 @@ func (f *fac198DockerFake) Exec(_ context.Context, _ string, argv []string, _ []
 		return dockerResult{Output: []byte("stdout\nstderr"), ExitCode: 7}, errors.New("exit status 7")
 	}
 	return dockerResult{}, nil
+}
+
+func isHermeticVerifierInvocation(argv []string) bool {
+	for i, arg := range argv {
+		if arg == hermeticRunPath+"/verifier.test" {
+			// Binary as argv[0], or after env assignments before -test flags.
+			if i == 0 {
+				return true
+			}
+			for _, later := range argv[i+1:] {
+				if strings.HasPrefix(later, "-test.") {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }
 func (f *fac198DockerFake) Remove(_ context.Context, id string) error {
 	f.removeID = id
