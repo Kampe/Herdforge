@@ -12,6 +12,7 @@ import (
 
 	"github.com/Kampe/Herdforge/pkg/claim"
 	"github.com/Kampe/Herdforge/pkg/config"
+	"github.com/Kampe/Herdforge/pkg/deps"
 	"github.com/Kampe/Herdforge/pkg/herdr"
 	"github.com/Kampe/Herdforge/pkg/mail"
 	"github.com/Kampe/Herdforge/pkg/provider"
@@ -53,7 +54,15 @@ func runPulseCommand(args []string, out, errOut *os.File) int {
 		return 2
 	}
 
+	// FAC-93 / stop-cli AC: pulse is the canonical fleet-admission gate.
+	// Missing, corrupt, or active wind-down must fail closed before any beat
+	// work (observe or --act), matching every other claiming command.
 	ctx := context.Background()
+	if err := requireFleetAdmission(ctx); err != nil {
+		fmt.Fprintf(errOut, "pulse: %v\n", err)
+		return 1
+	}
+
 	obs, actor := gatherPulseObservation(ctx, opts.Act)
 	snap, err := pulse.Beat(ctx, obs, opts, actor)
 	if err != nil {
@@ -187,10 +196,13 @@ func readPulseHerdr() pulse.HerdrObservation {
 }
 
 func leaseDBPath() string {
+	// HERD_LEASE_DB is a test/override hook only. Production claims write
+	// deps.DefaultLaunchLeasePath() (.herd/launch-claims.db) via daemon/dispatch
+	// OpenLeaseOwnership — pulse must renew against that same store.
 	if p := strings.TrimSpace(os.Getenv("HERD_LEASE_DB")); p != "" {
 		return p
 	}
-	return filepath.Join(".herd", "leases.db")
+	return deps.DefaultLaunchLeasePath()
 }
 
 func readPulseLeases(ctx context.Context) ([]pulse.LeaseObservation, *claim.ClaimManager, error) {
