@@ -355,7 +355,7 @@ func printUsage() {
 	fmt.Println("  stop         Stop the herd without deleting worktrees (dry-run default)")
 	fmt.Println("  stash        Worktree-scoped stash that cannot collide across lanes")
 	fmt.Println("  park         Make parked work durable (annotated pushed tag) + audit exposure")
-	fmt.Println("  wave         Pre-wave checklist; --standing also raises the standing fleet")
+	fmt.Println("  wave         Pre-wave readiness report; --standing/--up raise after gates pass")
 	fmt.Println("  quota-supervisor  Convert live quota, cooldown and process evidence into per-surface concurrency caps")
 	fmt.Println("  rescue       Diagnose/repair cramped or split agent panes (dry-run default; --apply once)")
 	fmt.Println("  seed-lane-state   Restore or seed a lane's state artifacts (never overwrites)")

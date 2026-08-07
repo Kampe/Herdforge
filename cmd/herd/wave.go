@@ -1,84 +1,272 @@
 package main
 
 import (
+	"context"
+	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
-	"os/exec"
 	"strings"
+	"time"
+
+	"github.com/Kampe/Herdforge/pkg/boardfreeze"
+	"github.com/Kampe/Herdforge/pkg/config"
+	"github.com/Kampe/Herdforge/pkg/eligibility"
+	"github.com/Kampe/Herdforge/pkg/herdr"
+	"github.com/Kampe/Herdforge/pkg/lifecycle"
+	"github.com/Kampe/Herdforge/pkg/resources"
+	"github.com/Kampe/Herdforge/pkg/standing"
+	"github.com/Kampe/Herdforge/pkg/usage"
+	"github.com/Kampe/Herdforge/pkg/wave"
 )
 
-// runWave ports bin/herd-wave: the pre-wave checklist. It is deliberately a
-// composition of existing subcommands rather than new logic — the value is
-// running the whole checklist in one deterministic order so a wave never starts
-// on unexamined state, not in reimplementing what each command already does.
+// runWave is the FAC-105 operator entry point for a controlled work wave.
+// Default is a read-only pre-wave report. --standing / --up raise only
+// configured standing roles after every readiness gate passes. Wave never
+// claims board work; claimable refs are reported as next-action handoffs.
 //
-// Every step is advisory: a failing check prints and continues, because a
-// checklist that aborts halfway hides the rest of the picture. Only the
-// mutating steps (--standing) can fail the command.
+// Standing raise reuses pkg/standing via runStandingConfigMode (FAC-91) — it
+// does not reimplement tab create/start.
 func runWave() {
-	fs := flag.NewFlagSet("wave", flag.ExitOnError)
-	standing := fs.Bool("standing", false, "Also raise and kick every standing lane")
-	fs.Parse(os.Args[2:])
-
-	self, err := os.Executable()
-	if err != nil || strings.TrimSpace(self) == "" {
-		self = "./bin/herd"
-	}
-
-	type step struct {
-		title string
-		args  []string
-	}
-	for _, s := range []step{
-		{"route doctor", []string{"doctor-models"}},
-		{"quota", []string{"quota"}},
-		{"resources", []string{"resources"}},
-		{"attention", []string{"attention"}},
-		{"worktrees", []string{"worktrees"}},
-		{"parked-work exposure", []string{"park", "audit"}},
-		{"board drift", []string{"board-sync"}},
-		{"next action", []string{"next"}},
-	} {
-		fmt.Printf("=== herd wave: %s ===\n", s.title)
-		cmd := exec.Command(self, s.args...)
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
-		// Advisory: report the failure, keep going. An early abort would hide
-		// every remaining signal, which is the opposite of a pre-wave check.
-		if err := cmd.Run(); err != nil {
-			fmt.Printf("(herd %s reported a problem: %v)\n", strings.Join(s.args, " "), err)
+	fs := flag.NewFlagSet("wave", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	doStanding := fs.Bool("standing", false, "Raise configured standing roles after every readiness gate passes")
+	up := fs.Bool("up", false, "Alias of --standing: raise standing roles after gates pass")
+	asJSON := fs.Bool("json", false, "Emit the stable wave report as JSON")
+	if err := fs.Parse(os.Args[2:]); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			fmt.Println(usageFor("wave"))
+			os.Exit(0)
 		}
+		fmt.Fprintf(os.Stderr, "herd wave: %v\n", err)
+		os.Exit(2)
 	}
 
-	waveFailed := false
-	if *standing {
-		fmt.Println("=== herd wave: raising standing fleet ===")
-		cmd := exec.Command(self, "standing")
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
-		if err := cmd.Run(); err != nil {
-			fmt.Fprintf(os.Stderr, "herd wave: standing raise failed: %v\n", err)
-			waveFailed = true
+	opts := wave.Options{Standing: *doStanding, Up: *up}
+	ctx := context.Background()
+
+	cfg, cfgErr := config.LoadConfig(".herd/herd.yaml")
+	src, raiser := buildWaveRuntime(ctx, cfg, cfgErr)
+
+	rep, err := wave.Run(ctx, src, opts, raiser)
+	if *asJSON {
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		if encErr := enc.Encode(rep); encErr != nil {
+			fmt.Fprintf(os.Stderr, "herd wave: json encode: %v\n", encErr)
+			os.Exit(1)
 		}
+	} else if rep != nil {
+		fmt.Print(wave.FormatHuman(rep))
 	}
-
-	fmt.Println("=== herd wave: cheatsheet ===")
-	for _, line := range []string{
-		"herd next | herd attention | herd standing | herd up <lane>",
-		"herd dispatch <REF> --lane smith | herd review --spawn",
-		"herd harvest | herd unmerged --all | herd overlap",
-		"herd stash push|pop  # worktree-scoped, never the shared stack",
-		"herd park audit      # parked work one reset --hard from gone",
-		"herd stop            # rest the fleet without destroying work",
-		"herd claude-only|no-claude status  # durable routing posture",
-	} {
-		fmt.Printf("  %s\n", line)
-	}
-
-	if waveFailed {
-		fmt.Fprintln(os.Stderr, "herd wave: complete with failures")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "herd wave: %v\n", err)
 		os.Exit(1)
 	}
-	fmt.Println("herd wave: complete")
+	if rep != nil && !rep.Ready && opts.WantsRaise() {
+		os.Exit(1)
+	}
+}
+
+// buildWaveRuntime wires production read-only sources and an optional raiser.
+// cfg may be nil when load failed; standing_roster then fails closed.
+func buildWaveRuntime(ctx context.Context, cfg *config.Config, cfgErr error) (wave.Sources, wave.Raiser) {
+	src := wave.Sources{
+		ReviewCap: 3,
+		// Same production posture gate as herd standing / pulse (cmd requireFleetAdmission).
+		Winddown: requireFleetAdmission,
+		BoardFreeze: func() (bool, string, error) {
+			st, frozen, err := boardfreeze.Active(time.Now())
+			if err != nil {
+				return true, "", err
+			}
+			detail := fmt.Sprintf("on=%v generation=%d actor=%s", st.On, st.Generation, st.Actor)
+			return frozen, detail, nil
+		},
+		Resources: func() (string, string) {
+			s := resources.TakeSnapshot()
+			return s.Verdict, fmt.Sprintf("verdict=%s free_pct=%d swap_mb=%d", s.Verdict, s.FreePct, s.SwapMB)
+		},
+		Quota: func() (bool, string, error) {
+			snap, err := usage.FetchSnapshot()
+			if err != nil {
+				return false, "", fmt.Errorf("live quota unreadable: %w", err)
+			}
+			if snap == nil || len(snap.Providers) == 0 {
+				return true, "quota snapshot empty (no providers reported)", nil
+			}
+			return true, fmt.Sprintf("quota snapshot ok (%d provider(s))", len(snap.Providers)), nil
+		},
+		HerdrOK: func() (bool, string) {
+			if !herdr.IsAvailable() {
+				return false, "herdr CLI not found"
+			}
+			return true, "herdr available"
+		},
+	}
+
+	if cfgErr != nil || cfg == nil {
+		src.StandingLanes = func() []wave.Lane { return nil }
+	} else {
+		cfg := cfg
+		src.StandingLanes = func() []wave.Lane {
+			lanes := standing.StandingLanes(cfg)
+			out := make([]wave.Lane, 0, len(lanes))
+			for _, lane := range lanes {
+				out = append(out, wave.Lane{
+					Name:      lane.Name,
+					AgentName: standing.AgentName(lane.Name),
+				})
+			}
+			return out
+		}
+	}
+
+	src.LiveAgents = func() ([]wave.Agent, error) {
+		agents, err := herdr.AgentList()
+		if err != nil {
+			return nil, err
+		}
+		out := make([]wave.Agent, 0, len(agents))
+		for _, a := range agents {
+			if strings.TrimSpace(a.Name) == "" {
+				continue
+			}
+			out = append(out, wave.Agent{
+				Name:   a.Name,
+				Status: a.Status,
+				PaneID: a.PaneID,
+				TabID:  a.TabID,
+			})
+		}
+		return out, nil
+	}
+
+	// Held: durable hold authority. Any authority/registry failure fails closed
+	// by treating the lane as held so raise skips rather than launching into
+	// unknown hold state.
+	src.Held = buildWaveHeldChecker(ctx, cfg, cfgErr)
+
+	// Claimable + in-review: read-only provider list. Provider failure is a
+	// non-blocking unknown enrichment (raise is fleet posture, not claim).
+	if cfg != nil && cfgErr == nil {
+		cfg := cfg
+		src.Claimable = func(c context.Context) ([]wave.ClaimableRef, error) {
+			tp, err := loadTaskProvider(cfg)
+			if err != nil {
+				return nil, err
+			}
+			// Empty claimRole = hygiene scan (no role filter). Empty Facts =
+			// no external blocker/dupe evidence; dispatch still re-gates.
+			rep, err := eligibility.EvaluateBoard(c, tp, cfg.TaskProvider.ProjectID, "to-do", eligibility.Facts{}, "")
+			if err != nil {
+				return nil, err
+			}
+			out := make([]wave.ClaimableRef, 0, len(rep.Eligible))
+			for _, r := range rep.Eligible {
+				out = append(out, wave.ClaimableRef{
+					Ref:      r.Ref,
+					Title:    r.Title,
+					Priority: string(r.Priority),
+					Role:     r.Role,
+				})
+			}
+			return out, nil
+		}
+		src.InReview = func(c context.Context) (int, error) {
+			tp, err := loadTaskProvider(cfg)
+			if err != nil {
+				return 0, err
+			}
+			tasks, err := tp.ListTasks(c, cfg.TaskProvider.ProjectID, "in-review")
+			if err != nil {
+				return 0, err
+			}
+			return len(tasks), nil
+		}
+	}
+
+	var raiser wave.Raiser
+	if cfg != nil && cfgErr == nil {
+		raiser = &standingRaiser{cfg: cfg}
+	}
+	return src, raiser
+}
+
+func buildWaveHeldChecker(ctx context.Context, cfg *config.Config, cfgErr error) func(string) (bool, string) {
+	if cfgErr != nil || cfg == nil {
+		return func(string) (bool, string) {
+			return true, "hold check unavailable: config load failed"
+		}
+	}
+	holdAuth, holdErr := newProductionHoldAuthority()
+	if holdErr != nil {
+		return func(string) (bool, string) {
+			return true, "hold authority unavailable: " + holdErr.Error()
+		}
+	}
+	repoIdentity, repoErr := holdRepository()
+	if repoErr != nil {
+		_ = holdAuth.Close()
+		return func(string) (bool, string) {
+			return true, "repository identity unavailable: " + repoErr.Error()
+		}
+	}
+	registry, regErr := canonicalLaneRegistry(cfg)
+	if regErr != nil {
+		_ = holdAuth.Close()
+		return func(string) (bool, string) {
+			return true, "lane registry unavailable: " + regErr.Error()
+		}
+	}
+	activeResolver, resErr := loadProductionActiveTaskResolver(ctx)
+	if resErr != nil {
+		// Fail closed on resolver errors: cannot know task-scope holds.
+		_ = holdAuth.Close()
+		return func(string) (bool, string) {
+			return true, "active task resolver unavailable: " + resErr.Error()
+		}
+	}
+	// holdAuth intentionally kept open for the process lifetime of this CLI
+	// invocation (same pattern as herd attention).
+	return func(agentName string) (bool, string) {
+		lane, err := registry.ResolveLiveAgentID(agentName)
+		if err != nil {
+			return true, "resolve lane: " + err.Error()
+		}
+		generation := func(c context.Context, identity lifecycle.HoldIdentity) (int64, error) {
+			return holdAuth.CurrentGeneration(c, identity)
+		}
+		err = lifecycle.CheckLaneAndTaskHold(ctx, holdAuth, activeResolver, repoIdentity, lane.Role, lane.Name, generation)
+		if err == nil {
+			return false, ""
+		}
+		if errors.Is(err, lifecycle.ErrHoldDenied) {
+			return true, err.Error()
+		}
+		return true, "hold check failed: " + err.Error()
+	}
+}
+
+// standingRaiser raises one configured standing lane through the FAC-91
+// production standing path (runStandingConfigMode). Plan already skipped
+// live/held agents; standing.Run re-checks NameHeld before create so a
+// concurrent raise cannot duplicate a standing agent.
+type standingRaiser struct {
+	cfg *config.Config
+}
+
+func (r *standingRaiser) Raise(ctx context.Context, lane wave.Lane) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if r.cfg == nil {
+		return errors.New("wave raise: config required")
+	}
+	if !herdr.IsAvailable() {
+		return errors.New("herdr CLI not found — install herdr first")
+	}
+	// quiet=true: wave already prints its own raise_results JSON/human report.
+	return runStandingConfigMode(r.cfg, true, standing.ModeRaise, []string{lane.Name}, true, false)
 }
