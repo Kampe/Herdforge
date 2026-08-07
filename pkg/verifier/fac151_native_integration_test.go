@@ -1512,20 +1512,19 @@ func (f *lateWriterFixture) reapOwned() {
 	f.reaped = true
 }
 
-// waitForProcessGroupGone proves no member of the process group remains
-// (grandchildren included). Leader-only ESRCH is not sufficient.
+// waitForProcessGroupGone proves no running member of the process group remains
+// (grandchildren included). Leader-only ESRCH is not sufficient. Uses the same
+// live/non-zombie snapshot as production processGroupLive so unreaped zombies
+// left by a non-reaping container init (sleep) are not false positives.
 func waitForProcessGroupGone(pgid int, bound time.Duration) error {
 	deadline := time.Now().Add(bound)
 	for {
-		err := syscall.Kill(-pgid, 0)
-		if err != nil && isESRCH(err) {
+		if !processGroupLive(pgid) {
 			return nil
 		}
+		_ = processGroupKiller(pgid)
 		if time.Now().After(deadline) {
-			if err == nil {
-				return fmt.Errorf("process group %d still has live members after diagnostic bound", pgid)
-			}
-			return fmt.Errorf("process group %d probe after bound: %w", pgid, err)
+			return fmt.Errorf("process group %d still has live members after diagnostic bound", pgid)
 		}
 		time.Sleep(time.Millisecond)
 	}
