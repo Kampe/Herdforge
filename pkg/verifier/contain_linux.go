@@ -17,10 +17,15 @@ import (
 // closed if the kernel refuses it, and path residual ownership is not a
 // substitute for a missing namespace boundary.
 //
-// Nested userns requires the hermetic container's seccomp profile to allow
-// clone(NEWUSER|NEWPID). The Docker runner sets seccomp=unconfined for that.
+// Nested unprivileged userns is skipped when HERD_HERMETIC_CONTAINER=1: the
+// outer Docker profile is the isolation boundary, and nested clone(NEWUSER)
+// remains unreliable under cap-drop ALL even with seccomp=unconfined on some
+// engines. Residual marker lineage is the escaped-writer kill authority.
 func applyOwnershipContainment(attr *syscall.SysProcAttr) {
 	if attr == nil {
+		return
+	}
+	if os.Getenv(hermeticContainerEnv) == "1" {
 		return
 	}
 	uid := os.Getuid()
