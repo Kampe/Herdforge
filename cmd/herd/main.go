@@ -52,6 +52,7 @@ import (
 	"github.com/Kampe/Herdforge/pkg/router"
 	"github.com/Kampe/Herdforge/pkg/scopeauth"
 	"github.com/Kampe/Herdforge/pkg/scopefence"
+	"github.com/Kampe/Herdforge/pkg/security"
 	"github.com/Kampe/Herdforge/pkg/selftest"
 	"github.com/Kampe/Herdforge/pkg/standing"
 	"github.com/Kampe/Herdforge/pkg/store"
@@ -354,6 +355,12 @@ func main() {
 	case "tests-for":
 		runTestsFor()
 
+	case "control":
+		runControl()
+
+	case "netbroker-serve":
+		runNetbrokerServe()
+
 	default:
 		fmt.Fprintf(os.Stderr, "unknown subcommand '%s'\nRun 'herd --help' for usage.\n", command)
 		os.Exit(1)
@@ -443,6 +450,8 @@ func printUsage() {
 	fmt.Println("  signer-boundary  OS signing boundary: serve | establish | status | prove | sign (FAC-169)")
 	fmt.Println("  command         Run a root-authorized command under a durable attempt budget")
 	fmt.Println("  hostcreds       HostCreds oracle: diagnose|session|selftest (FAC-170; no OpenCode)")
+	fmt.Println("  control        Issue/drain authenticated control envelopes (FAC-133)")
+	fmt.Println("  netbroker-serve Durable network allowlist broker process (FAC-133)")
 	fmt.Println("  --version       Show herd version")
 }
 
@@ -734,6 +743,38 @@ func runPreflight() {
 		os.Exit(1)
 	}
 	fmt.Println("Preflight merge-policy check passed. Required CI and different-family review declared.")
+
+
+	// FAC-133 fleet readiness: optional live refresh, then consume attestation.
+	// HERD_LIVE_HARNESS_PROOF=1 or HERD_REFRESH_READINESS=1 triggers a single-flight
+	// live proof + durable signed attestation write. Without that, preflight only
+	// reports the current ConsumeFleetAttestation status (dispatch fails closed
+	// when HERD_CONTROL_SECRET is set and no valid attestation exists).
+	root := security.ResolveReadinessRoot()
+	if os.Getenv("HERD_LIVE_HARNESS_PROOF") == "1" || os.Getenv("HERD_REFRESH_READINESS") == "1" {
+		fr, err := security.RefreshFleetAttestationLive(root)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "FAC-133 fleet readiness refresh failed: %v\n", err)
+			if fr != nil {
+				fmt.Fprint(os.Stderr, security.FormatReadinessReport(fr))
+			}
+			os.Exit(1)
+		}
+		fmt.Print(security.FormatReadinessReport(fr))
+		fmt.Println("FAC-133 durable fleet attestation refreshed.")
+		return
+	}
+	if fr, err := security.EvaluateFleetReadiness(); err != nil {
+		fmt.Fprintf(os.Stderr, "%s\n", security.FormatReadinessReport(fr))
+		fmt.Fprintf(os.Stderr, "FAC-133 readiness: BLOCKED (refresh with HERD_LIVE_HARNESS_PROOF=1 herd preflight)\n")
+		// Fail closed when control plane is configured — same gate as dispatch.
+		if strings.TrimSpace(os.Getenv("HERD_CONTROL_SECRET")) != "" {
+			os.Exit(1)
+		}
+	} else {
+		fmt.Print(security.FormatReadinessReport(fr))
+		fmt.Println("FAC-133 readiness: OK (durable attestation)")
+	}
 }
 
 func runSelfTest() {
@@ -2774,6 +2815,30 @@ func configureProductionControl(d *dispatch.Dispatcher, root string) (func() err
 		return nil, err
 	}
 	d.Compensator = compensator
+	// FAC-133 MAC control plane (pkg/envelope) — distinct from coordinator orders above.
+	if secret := strings.TrimSpace(os.Getenv("HERD_CONTROL_SECRET")); secret != "" {
+		mailPath := strings.TrimSpace(os.Getenv("HERD_MAIL_FILE"))
+		if mailPath == "" {
+			mailPath = filepath.Join(root, ".herd", "mail.jsonl")
+		}
+		_ = os.MkdirAll(filepath.Dir(mailPath), 0o755)
+		issuer := strings.TrimSpace(os.Getenv("HERD_CONTROL_ISSUER"))
+		if issuer == "" {
+			issuer = "coordinator"
+		}
+		d.ControlSecret = secret
+		d.Control = &dispatch.ControlPlane{
+			Secret:        secret,
+			Mailbox:       mail.NewMailbox(mailPath),
+			IssuerRole:    "coordinator",
+			IssuerSession: issuer,
+			DurableRoot:   root,
+		}
+		if id, err := dispatch.AuthenticatedRepositoryIdentity(root); err == nil {
+			d.RepoIdentity = id
+			d.RepoAllowlist = []string{id}
+		}
+	}
 	return func() error {
 		return errors.Join(compensator.Close(), controlStore.Close())
 	}, nil

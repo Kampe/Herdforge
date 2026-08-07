@@ -89,6 +89,7 @@ type fakeHerdr struct {
 	tabCwd      string
 	tabWS       string
 	tabLabel    string
+	tabEnv      []string // FAC-133 scrubbed env from TabCreateWithEnv
 	tabErr      error
 	tabID       string
 	paneID      string
@@ -133,7 +134,21 @@ func (f *fakeHerdr) RequireWorkspace(string) (string, error) {
 	}
 	return f.workspace, nil
 }
-func (f *fakeHerdr) TabCreateForTask(workspaceID, label, cwd string, _ bool, _ ...string) (*herdr.TabInfo, error) {
+func (f *fakeHerdr) TabCreateWithEnv(workspaceID, label, cwd string, env []string, noFocus bool) (*herdr.TabInfo, error) {
+	if len(env) == 0 {
+		return nil, fmt.Errorf("sandboxed tab create: scrubbed env required")
+	}
+	f.mu.Lock()
+	f.tabEnv = append([]string(nil), env...)
+	f.mu.Unlock()
+	return f.TabCreateForTask(workspaceID, label, cwd, noFocus)
+}
+func (f *fakeHerdr) TabCreateForTask(workspaceID, label, cwd string, _ bool, env ...string) (*herdr.TabInfo, error) {
+	if len(env) > 0 {
+		f.mu.Lock()
+		f.tabEnv = append([]string(nil), env...)
+		f.mu.Unlock()
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.tabWS = workspaceID

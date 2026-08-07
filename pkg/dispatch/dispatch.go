@@ -23,6 +23,7 @@ import (
 	"github.com/Kampe/Herdforge/pkg/provider"
 	"github.com/Kampe/Herdforge/pkg/router"
 	"github.com/Kampe/Herdforge/pkg/scopefence"
+	"github.com/Kampe/Herdforge/pkg/security"
 	"github.com/Kampe/Herdforge/pkg/toolchild"
 	"github.com/Kampe/Herdforge/pkg/toolprobe"
 	"github.com/Kampe/Herdforge/pkg/worktree"
@@ -100,6 +101,10 @@ type StepRecord struct {
 type HerdrLauncher interface {
 	Available() bool
 	RequireWorkspace(repoRoot string) (string, error)
+	// TabCreateWithEnv creates a pane with explicit KEY=VALUE env (FAC-133 scrubbed env).
+	// Empty env must be rejected by sandboxed launch paths.
+	TabCreateWithEnv(workspaceID, label, cwd string, env []string, noFocus bool) (*herdr.TabInfo, error)
+	// TabCreateForTask creates a task tab; optional env is used by FAC-190 confinement PATH/ZDOTDIR.
 	TabCreateForTask(workspaceID, label, cwd string, noFocus bool, env ...string) (*herdr.TabInfo, error)
 	AgentStart(req launch.Request, name, kind, paneID string) error
 	DeliverAndProve(target, text string, timeout time.Duration) (*herdr.PromptReceipt, error)
@@ -113,6 +118,12 @@ type LiveHerdr struct{}
 func (LiveHerdr) Available() bool { return herdr.IsAvailable() }
 func (LiveHerdr) RequireWorkspace(repoRoot string) (string, error) {
 	return herdr.RequireWorkspace(repoRoot)
+}
+func (LiveHerdr) TabCreateWithEnv(workspaceID, label, cwd string, env []string, noFocus bool) (*herdr.TabInfo, error) {
+	if len(env) == 0 {
+		return nil, fmt.Errorf("sandboxed tab create: scrubbed env required (refuse ambient inheritance)")
+	}
+	return herdr.TabCreateForTaskEnv(workspaceID, label, cwd, env, noFocus)
 }
 func (LiveHerdr) TabCreateForTask(workspaceID, label, cwd string, noFocus bool, env ...string) (*herdr.TabInfo, error) {
 	return herdr.TabCreateForTask(workspaceID, label, cwd, noFocus, env...)
@@ -168,6 +179,15 @@ func (LiveHerdr) AgentStart(req launch.Request, name, kind, paneID string) error
 	return herdr.AgentStartWithDecision(name, kind, paneID, req)
 }
 func (LiveHerdr) DeliverAndProve(target, text string, timeout time.Duration) (*herdr.PromptReceipt, error) {
+	// Prefer session-exact delivery when live agent_session is known.
+	// Does not invent a prompt-delivery subcommand — uses AgentPromptExact.
+	if a, err := herdr.LookupAgent(target); err == nil && a != nil {
+		sid := strings.TrimSpace(a.Session.Value)
+		if sid != "" && herdr.RealModelSessionID(sid) {
+			b := herdr.BindingFromSpawn(a.Name, a.TabID, a.PaneID, sid, a.Kind)
+			return herdr.DeliverAndProveExact(b, text, timeout)
+		}
+	}
 	return herdr.DeliverAndProve(target, text, timeout)
 }
 func (LiveHerdr) TabClose(tabID string) error { return herdr.TabClose(tabID) }
@@ -210,6 +230,9 @@ type DispatchOptions struct {
 	// Production launches always require consumption proof — there is no
 	// SkipPromptVerify bypass (FAC-121 R3 repair).
 	PromptVerifyTimeout time.Duration
+	// LeaseGeneration binds trusted control envelopes for this launch (FAC-133).
+	// Must be >0 for sandboxed write-capable launch (fail-closed; no fabrications).
+	LeaseGeneration int64
 }
 
 type DispatchResult struct {
@@ -227,6 +250,12 @@ type DispatchResult struct {
 	TabID           string
 	AgentName       string
 	Receipt         *herdr.PromptReceipt
+	// ControlBound is true when a MAC-signed launch control envelope was posted (FAC-133).
+	ControlBound bool
+	// SandboxGranted is true when least-privilege LaunchPolicy authorized the agent.
+	SandboxGranted bool
+	// SecurityEvents is the count of injection/denial events recorded at launch.
+	SecurityEvents int
 }
 
 // WorktreeService is the isolation surface Dispatch uses (FAC-121).
@@ -289,6 +318,22 @@ type Dispatcher struct {
 	// When nil under Production, launch constructs ProductionEnforcer() and
 	// fails closed without a MAC issuer + OS write-denial proof.
 	Confinement *confinement.Enforcer
+	// FAC-133 trusted control plane (MAC envelopes) — distinct from Orders/ControlFactory.
+	// Required for write-capable launch when least-privilege sandbox is enforced.
+	Control *ControlPlane
+	// ControlSecret is the shared MAC secret (fail-closed when empty on sandboxed launch).
+	ControlSecret string
+	// RepoIdentity / RepoAllowlist gate which repository the agent may touch.
+	RepoIdentity  string
+	RepoAllowlist []string
+	// PackageAllowlist exclusive FS roots under the worktree (structured provenance).
+	PackageAllowlist []string
+	// SandboxEvents receives denial/injection security events (optional sink).
+	SandboxEvents security.EventSink
+	// SecurityEventLog is the durable JSONL path for security events.
+	SecurityEventLog string
+	// ClaimLookup proves LeaseGeneration against live FAC-147 claim records.
+	ClaimLookup security.LiveClaimLookup
 
 	// health projects BLOCKED(provider_timeout) for board calls (FAC-150).
 	health dispatchHealth
@@ -575,6 +620,14 @@ func (d *Dispatcher) Dispatch(ctx context.Context, opts DispatchOptions) (*Dispa
 	if task == nil {
 		return nil, fmt.Errorf("ticket %s not found", opts.TicketRef)
 	}
+
+	// FAC-133: provider title/description stay untrusted at the write-capable
+	// launch boundary — never elevate card text into control authority.
+	if err := RefuseProviderControlElevation(task); err != nil {
+		return nil, err
+	}
+	// Observable injection indicators only; never elevates authority.
+	_ = security.DetectProviderAuthorityClaims(security.ProviderTextBundle(task.Title, task.Description))
 
 	// 2. Determine lane (still no side effects).
 	laneName := opts.LaneName
@@ -1191,9 +1244,8 @@ func (d *Dispatcher) launch(
 		}
 	}
 
-	// FAC-190: prepare OS profile + agent PATH wrapper and prove denials
-	// before TabCreate so the pane inherits PATH with the wrapper first.
-	// Lease generation is required for the outside-worktree session directory.
+
+	// Normalize production lease/task identity for confinement + control.
 	if d.Production {
 		if request.LeaseGeneration <= 0 && result.LeaseGeneration > 0 {
 			request.LeaseGeneration = result.LeaseGeneration
@@ -1202,119 +1254,232 @@ func (d *Dispatcher) launch(
 			request.TaskRef = task.Ref
 		}
 	}
-	var (
-		confEnf  *confinement.Enforcer
-		confPrep *confinement.PreparedOS
-	)
-	if d.Production {
-		var perr error
-		confEnf, confPrep, perr = d.prepareConfinementOS(request, wtInfo)
-		if perr != nil {
-			return &launchFailure{Reason: "confinement_rejected", Err: perr}
-		}
-	}
 
-	// Tab with exact task worktree as process cwd (+ confinement PATH/ZDOTDIR).
-	var tabEnv []string
-	if confPrep != nil {
-		var eerr error
-		tabEnv, eerr = confPrep.TabEnv(wtInfo.Path, os.Getenv("PATH"))
-		if eerr != nil {
-			return &launchFailure{Reason: "confinement_rejected", Err: eerr}
+	// FAC-133 least-privilege path when Control plane is wired: authorize
+	// sandbox, LaunchAgent (scrubbed env + optional OS containment), then
+	// bind MAC control to live AgentSessionID. Without Control, retain main's
+	// FAC-190 confinement + TabCreate+AgentStart path.
+	var tabID, paneID string
+	var boundSession string
+	var spawner *launcherSpawner
+	if d.Control != nil {
+		grant, policy, aerr := d.authorizeAgentSandbox(lane, task, wtInfo.Path)
+		if aerr != nil {
+			return &launchFailure{Reason: "sandbox_denied", Err: aerr}
 		}
-		// Fail closed if wrappers would not resolve for argv0/provider names.
-		for _, n := range confPrep.Names {
-			if !confPrep.WrapperResolves(n) {
-				return &launchFailure{Reason: "confinement_rejected", Err: fmt.Errorf("confinement: wrapper %q not installed", n)}
-			}
-		}
-	}
-	// FAC-139: write-capable Tab creation goes only through the launch boundary
-	// (LaunchDecision + current artifact tool-probe PASS). Direct TabCreate is
-	// forbidden on this path.
-	probe, perr := d.resolveToolProbe(opts, request.Decision)
-	if perr != nil {
-		return &launchFailure{Reason: "tool_probe_rejected", Err: perr}
-	}
-	plan, tabID, paneID, err := launch.Open(dispatchTabOpener{h: h}, launch.BoundarySpec{
-		Decision:  request.Decision,
-		Request:   request,
-		Probe:     probe,
-		Lane:      lane,
-		Workspace: ws,
-		Label:     tabLabel,
-		Cwd:       wtInfo.Path,
-		Env:       tabEnv,
-		NoFocus:   true,
-	})
-	if err != nil {
-		return &launchFailure{
-			Reason: "tab_create_failed",
-			Err:    fmt.Errorf("worktree ready but launch boundary rejected tab: %w", err),
-		}
-	}
-	if plan != nil && plan.Model != "" {
-		result.Model = plan.Model
-	}
-	tab := &herdr.TabInfo{ID: tabID, Label: tabLabel, Cwd: wtInfo.Path, Pane: herdr.PaneInfo{ID: paneID, TabID: tabID}}
-	result.TabID = tab.ID
-	result.AgentName = tabLabel
-	// Pointer so SessionGeneration reserved here is visible to bindConfinement.
-	if err := herdr.PrepareToolChildLifecycle(tab.ID, tab.Pane.ID, &request, tabLabel); err != nil {
-		return &launchFailure{Reason: "tool_child_lifecycle_failed", Err: closeTabLocal(h, tab.ID, "tool_child_lifecycle_failed", err)}
-	}
-	if request.SessionGeneration <= 0 {
-		return &launchFailure{
-			Reason: "tool_child_lifecycle_failed",
-			Err:    closeTabLocal(h, tab.ID, "tool_child_lifecycle_failed", fmt.Errorf("tool-child lifecycle left session generation unset")),
-		}
-	}
-	if err := d.record(ctx, StepRecord{
-		TicketRef: task.Ref,
-		Step:      StepTab,
-		Worktree:  wtInfo.Path,
-		Branch:    branch,
-		TabID:     tab.ID,
-		PaneID:    tab.Pane.ID,
-		AgentName: tabLabel,
-	}); err != nil {
-		return &launchFailure{
-			Reason: "record_tab_failed",
-			Err:    closeTabLocal(h, tab.ID, "record_tab_failed", err),
-		}
-	}
-
-	// FAC-190: MAC-bind the launch identity to the prepared OS wrap after
-	// tab/pane identity is known; re-prove denials before AgentStart.
-	if d.Production {
-		if err := d.bindConfinement(confEnf, confPrep, request, task, lane, wtInfo, result, tab, tabLabel); err != nil {
+		result.SandboxGranted = true
+		if opts.LeaseGeneration <= 0 {
 			return &launchFailure{
-				Reason: "confinement_rejected",
-				Err:    closeTabLocal(h, tab.ID, "confinement_rejected", err),
+				Reason: "lease_missing",
+				Err:    fmt.Errorf("%w: DispatchOptions.LeaseGeneration must be >0 (live claim/control lease required)", security.ErrUnknownPolicy),
 			}
 		}
-	}
-
-	if err := h.AgentStart(request, tabLabel, request.Decision.Harness, tab.Pane.ID); err != nil {
-		// Local orphan-tab cleanup only — outer failOwned owns durable compensate.
-		return &launchFailure{
-			Reason: "agent_start_failed",
-			Err: closeTabLocal(h, tab.ID, "agent_start_failed",
-				fmt.Errorf("worktree ready but agent start failed: %w", err)),
+		leaseGen, lerr := security.LeaseFromOpts(opts.LeaseGeneration)
+		if lerr != nil {
+			return &launchFailure{Reason: "lease_invalid", Err: lerr}
 		}
-	}
-	if err := d.record(ctx, StepRecord{
-		TicketRef: task.Ref,
-		Step:      StepAgentStart,
-		Worktree:  wtInfo.Path,
-		Branch:    branch,
-		TabID:     tab.ID,
-		PaneID:    tab.Pane.ID,
-		AgentName: tabLabel,
-	}); err != nil {
-		return &launchFailure{
-			Reason: "record_agent_start_failed",
-			Err:    closeTabLocal(h, tab.ID, "record_agent_start_failed", err),
+		lookup := d.ClaimLookup
+		if lookup == nil {
+			lookup = security.ResolveClaimLookup()
+		}
+		if err := security.ValidateLiveTaskLease(ctx, lookup, task.Ref, leaseGen, false, "", ""); err != nil {
+			return &launchFailure{Reason: "lease_not_live", Err: err}
+		}
+		if err := security.RequireFleetReady(); err != nil {
+			return &launchFailure{Reason: "fleet_blocked", Err: err}
+		}
+		eventLog := d.SecurityEventLog
+		if eventLog == "" && d.Worktree != nil {
+			eventLog = filepath.Join(d.Worktree.RepoRoot(), ".herd", "security-events.jsonl")
+		}
+		scope, scErr := launchControlScope(policy, wtInfo.Path)
+		if scErr != nil {
+			return &launchFailure{Reason: "package_provenance_unknown", Err: scErr}
+		}
+		if err := security.ApplyControlScopeToPolicy(policy, grant, scope); err != nil {
+			return &launchFailure{Reason: "package_scope_apply_failed", Err: err}
+		}
+		spawner = newLauncherSpawner(h, request)
+		skipContain := !d.Production
+		spawn, serr := security.LaunchAgent(spawner, security.AgentSpawnRequest{
+			Policy:          policy,
+			Grant:           grant,
+			Name:            tabLabel,
+			Kind:            request.Decision.Harness,
+			Model:           model,
+			Workspace:       ws,
+			Label:           tabLabel,
+			NoFocus:         true,
+			EventLogPath:    eventLog,
+			TaskRef:         task.Ref,
+			LeaseGeneration: leaseGen,
+			ClaimLookup:     lookup,
+			SessionResolver: spawner,
+			SkipContainment: skipContain,
+			ControlSecret:   d.Control.Secret,
+			Ambient: map[string]string{
+				"HERD_EXPECTED_TASK":  task.Ref,
+				"HERD_EXPECTED_LEASE": leaseGen,
+			},
+		})
+		if serr != nil {
+			tid := ""
+			if spawn != nil {
+				tid = spawn.TabID
+			}
+			reason := "sandbox_spawn_failed"
+			if strings.Contains(serr.Error(), "agent start") {
+				reason = "agent_start_failed"
+			} else if strings.Contains(serr.Error(), "tab create") {
+				reason = "tab_create_failed"
+			}
+			if tid != "" {
+				return &launchFailure{Reason: reason, Err: closeTabLocal(h, tid, reason, serr)}
+			}
+			return &launchFailure{Reason: reason, Err: serr}
+		}
+		tabID, paneID = spawn.TabID, spawn.PaneID
+		result.TabID = tabID
+		result.AgentName = tabLabel
+		if sink := eventCount(policy); sink > 0 {
+			result.SecurityEvents = sink
+		}
+		if err := herdr.PrepareToolChildLifecycle(tabID, paneID, &request, tabLabel); err != nil {
+			return &launchFailure{Reason: "tool_child_lifecycle_failed", Err: closeTabLocal(h, tabID, "tool_child_lifecycle_failed", err)}
+		}
+		if request.SessionGeneration <= 0 {
+			return &launchFailure{
+				Reason: "tool_child_lifecycle_failed",
+				Err:    closeTabLocal(h, tabID, "tool_child_lifecycle_failed", fmt.Errorf("tool-child lifecycle left session generation unset")),
+			}
+		}
+		if err := d.record(ctx, StepRecord{
+			TicketRef: task.Ref, Step: StepTab, Worktree: wtInfo.Path, Branch: branch,
+			TabID: tabID, PaneID: paneID, AgentName: tabLabel,
+		}); err != nil {
+			return &launchFailure{Reason: "record_tab_failed", Err: closeTabLocal(h, tabID, "record_tab_failed", err)}
+		}
+		if err := d.record(ctx, StepRecord{
+			TicketRef: task.Ref, Step: StepAgentStart, Worktree: wtInfo.Path, Branch: branch,
+			TabID: tabID, PaneID: paneID, AgentName: tabLabel,
+		}); err != nil {
+			return &launchFailure{Reason: "record_agent_start_failed", Err: closeTabLocal(h, tabID, "record_agent_start_failed", err)}
+		}
+		// Bind control to live worker identity (session optional for grok).
+		wantSess := strings.TrimSpace(spawn.AgentSessionID)
+		if err := security.RefuseProvisionalWorkerSession(wantSess); err != nil {
+			wantSess = ""
+		}
+		agentSess := wantSess
+		if live, lerr := spawner.requireLiveIdentity(tabLabel, wantSess, tabID, paneID); lerr == nil && live != nil {
+			if bid, berr := bindingID(live); berr == nil {
+				agentSess = bid
+			}
+		} else if d.Production {
+			return &launchFailure{Reason: "session_drift", Err: closeTabLocal(h, tabID, "session_drift", lerr)}
+		}
+		if err := security.RefuseProvisionalWorkerSession(agentSess); err != nil {
+			return &launchFailure{Reason: "control_bind_failed", Err: closeTabLocal(h, tabID, "control_bind_failed", err)}
+		}
+		reinstallKind := ""
+		if d.Production {
+			reinstallKind = request.Decision.Harness
+		}
+		if err := d.bindLaunchControlKind(agentSess, task.Ref, opts.LeaseGeneration, wtInfo.Path, policy, grant, reinstallKind, ""); err != nil {
+			return &launchFailure{Reason: "control_bind_failed", Err: closeTabLocal(h, tabID, "control_bind_failed",
+				fmt.Errorf("control-plane launch binding failed: %w", err))}
+		}
+		result.ControlBound = true
+		boundSession = agentSess
+	} else {
+		// FAC-190 non-Control path: prepare OS profile + agent PATH wrapper.
+		var (
+			confEnf  *confinement.Enforcer
+			confPrep *confinement.PreparedOS
+		)
+		if d.Production {
+			var perr error
+			confEnf, confPrep, perr = d.prepareConfinementOS(request, wtInfo)
+			if perr != nil {
+				return &launchFailure{Reason: "confinement_rejected", Err: perr}
+			}
+		}
+		var tabEnv []string
+		if confPrep != nil {
+			var eerr error
+			tabEnv, eerr = confPrep.TabEnv(wtInfo.Path, os.Getenv("PATH"))
+			if eerr != nil {
+				return &launchFailure{Reason: "confinement_rejected", Err: eerr}
+			}
+			for _, n := range confPrep.Names {
+				if !confPrep.WrapperResolves(n) {
+					return &launchFailure{Reason: "confinement_rejected", Err: fmt.Errorf("confinement: wrapper %q not installed", n)}
+				}
+			}
+		}
+		// FAC-139: write-capable Tab creation goes only through the launch boundary
+		// (LaunchDecision + current artifact tool-probe PASS). Direct TabCreate is
+		// forbidden on this path.
+		probe, perr := d.resolveToolProbe(opts, request.Decision)
+		if perr != nil {
+			return &launchFailure{Reason: "tool_probe_rejected", Err: perr}
+		}
+		plan, tID, pID, lErr := launch.Open(dispatchTabOpener{h: h}, launch.BoundarySpec{
+			Decision:  request.Decision,
+			Request:   request,
+			Probe:     probe,
+			Lane:      lane,
+			Workspace: ws,
+			Label:     tabLabel,
+			Cwd:       wtInfo.Path,
+			Env:       tabEnv,
+			NoFocus:   true,
+		})
+		if lErr != nil {
+			return &launchFailure{
+				Reason: "tab_create_failed",
+				Err:    fmt.Errorf("worktree ready but launch boundary rejected tab: %w", lErr),
+			}
+		}
+		if plan != nil && plan.Model != "" {
+			result.Model = plan.Model
+		}
+		tab := &herdr.TabInfo{ID: tID, Label: tabLabel, Cwd: wtInfo.Path, Pane: herdr.PaneInfo{ID: pID, TabID: tID}}
+		tabID, paneID = tab.ID, tab.Pane.ID
+		result.TabID = tabID
+		result.AgentName = tabLabel
+		if err := herdr.PrepareToolChildLifecycle(tabID, paneID, &request, tabLabel); err != nil {
+			return &launchFailure{Reason: "tool_child_lifecycle_failed", Err: closeTabLocal(h, tabID, "tool_child_lifecycle_failed", err)}
+		}
+		if request.SessionGeneration <= 0 {
+			return &launchFailure{
+				Reason: "tool_child_lifecycle_failed",
+				Err:    closeTabLocal(h, tabID, "tool_child_lifecycle_failed", fmt.Errorf("tool-child lifecycle left session generation unset")),
+			}
+		}
+		if err := d.record(ctx, StepRecord{
+			TicketRef: task.Ref, Step: StepTab, Worktree: wtInfo.Path, Branch: branch,
+			TabID: tabID, PaneID: paneID, AgentName: tabLabel,
+		}); err != nil {
+			return &launchFailure{Reason: "record_tab_failed", Err: closeTabLocal(h, tabID, "record_tab_failed", err)}
+		}
+		if d.Production {
+			if err := d.bindConfinement(confEnf, confPrep, request, task, lane, wtInfo, result, tab, tabLabel); err != nil {
+				return &launchFailure{Reason: "confinement_rejected", Err: closeTabLocal(h, tabID, "confinement_rejected", err)}
+			}
+		}
+		if err := h.AgentStart(request, tabLabel, request.Decision.Harness, paneID); err != nil {
+			return &launchFailure{
+				Reason: "agent_start_failed",
+				Err: closeTabLocal(h, tabID, "agent_start_failed",
+					fmt.Errorf("worktree ready but agent start failed: %w", err)),
+			}
+		}
+		if err := d.record(ctx, StepRecord{
+			TicketRef: task.Ref, Step: StepAgentStart, Worktree: wtInfo.Path, Branch: branch,
+			TabID: tabID, PaneID: paneID, AgentName: tabLabel,
+		}); err != nil {
+			return &launchFailure{Reason: "record_agent_start_failed", Err: closeTabLocal(h, tabID, "record_agent_start_failed", err)}
 		}
 	}
 
@@ -1333,7 +1498,7 @@ func (d *Dispatcher) launch(
 		identity.Repository = repository
 		identity.CandidateSHA = opts.Decision.CandidateSHA
 	}
-	wakeTarget := control.WakeTarget{Target: tabLabel, Workspace: ws, TabID: tab.ID, PaneID: tab.Pane.ID, AgentName: tabLabel, Provider: request.Decision.Harness, LeaseGeneration: result.LeaseGeneration}
+	wakeTarget := control.WakeTarget{Target: tabLabel, Workspace: ws, TabID: tabID, PaneID: paneID, AgentName: tabLabel, Provider: request.Decision.Harness, LeaseGeneration: result.LeaseGeneration}
 	check := func(checkCtx context.Context, o control.Order) error {
 		if o.LaneIdentity != identity {
 			return control.ErrStaleIdentity
@@ -1355,44 +1520,51 @@ func (d *Dispatcher) launch(
 	}); ok {
 		actual, err := verifier.ReadControlTarget(wakeTarget)
 		if err != nil && d.Production {
-			return &launchFailure{Reason: "control_target_drift", Err: closeTabLocal(h, tab.ID, "control_target_drift", err)}
+			return &launchFailure{Reason: "control_target_drift", Err: closeTabLocal(h, tabID, "control_target_drift", err)}
 		}
 		if err == nil {
 			wakeTarget = actual
 		}
 	} else if d.Production {
-		return &launchFailure{Reason: "control_target_unverifiable", Err: closeTabLocal(h, tab.ID, "control_target_unverifiable", fmt.Errorf("Herdr launcher cannot verify exact target"))}
+		return &launchFailure{Reason: "control_target_unverifiable", Err: closeTabLocal(h, tabID, "control_target_unverifiable", fmt.Errorf("Herdr launcher cannot verify exact target"))}
 	}
 	var evidence control.Evidence
 	if d.Production {
 		orders, factoryErr := d.ControlFactory(ctx, ControlScope{Identity: identity, Wake: wakeTarget, Check: check})
 		if factoryErr != nil {
-			return &launchFailure{Reason: "control_factory_failed", Err: closeTabLocal(h, tab.ID, "control_factory_failed", factoryErr)}
+			return &launchFailure{Reason: "control_factory_failed", Err: closeTabLocal(h, tabID, "control_factory_failed", factoryErr)}
 		}
 		var orderGuardErr error
-		orders, orderGuardErr = requireControlOrdersOrClose(h, tab.ID, orders)
+		orders, orderGuardErr = requireControlOrdersOrClose(h, tabID, orders)
 		if orderGuardErr != nil {
 			return orderGuardErr
 		}
 		var orderErr error
 		evidence, orderErr = orders.Repair(ctx, packet)
 		if orderErr != nil {
-			return &launchFailure{Reason: "control_order_failed", Err: closeTabLocal(h, tab.ID, "control_order_failed", orderErr)}
+			return &launchFailure{Reason: "control_order_failed", Err: closeTabLocal(h, tabID, "control_order_failed", orderErr)}
 		}
 	} else if d.Orders != nil {
 		if e, orderErr := d.Orders.Repair(ctx, packet); orderErr != nil {
-			return &launchFailure{Reason: "control_order_failed", Err: closeTabLocal(h, tab.ID, "control_order_failed", orderErr)}
+			return &launchFailure{Reason: "control_order_failed", Err: closeTabLocal(h, tabID, "control_order_failed", orderErr)}
 		} else {
 			evidence = e
 		}
 	}
+	// Pre-delivery live identity ownership (liveLookup only; session optional).
+	if spawner != nil && boundSession != "" && d.Production {
+		if _, lerr := spawner.requireLiveIdentity(tabLabel, boundSession, tabID, paneID); lerr != nil {
+			return &launchFailure{Reason: "session_drift", Err: closeTabLocal(h, tabID, "session_drift", lerr)}
+		}
+	}
+
 	var receipt *herdr.PromptReceipt
 	var receiptErr error
 	if evidence.MessageID != "" {
 		// Delivery already performed the one Herdr wake and returned its actual
 		// receipt. Never nudge the same order again from this outer layer.
 		if !evidence.Wake.Consumed || !evidence.Wake.Verified {
-			return &launchFailure{Reason: "prompt_receipt_invalid", Err: closeTabLocal(h, tab.ID, "prompt_receipt_invalid", fmt.Errorf("durable control wake did not prove consumption"))}
+			return &launchFailure{Reason: "prompt_receipt_invalid", Err: closeTabLocal(h, tabID, "prompt_receipt_invalid", fmt.Errorf("durable control wake did not prove consumption"))}
 		}
 		receipt = &herdr.PromptReceipt{Target: evidence.Wake.Target, Consumed: evidence.Wake.Consumed, Verified: evidence.Wake.Verified, BaselineStatus: evidence.Wake.Baseline, FinalStatus: evidence.Wake.Final, SequenceToken: evidence.Wake.SequenceToken}
 	} else {
@@ -1401,27 +1573,34 @@ func (d *Dispatcher) launch(
 		// control.WakeTextForTask, not a hand-copied string: a second copy is a
 		// second place that can regress to a bare protocol directive with a green
 		// suite, and the two had already drifted apart in wording.
+		// LiveHerdr.DeliverAndProve uses AgentPromptExact when a live session exists.
 		receipt, receiptErr = h.DeliverAndProve(tabLabel, control.WakeTextForTask(task.Ref), timeout)
 	}
 	result.Receipt = receipt
 	if receiptErr != nil {
 		return &launchFailure{
 			Reason: "prompt_delivery_failed",
-			Err: closeTabLocal(h, tab.ID, "prompt_delivery_failed",
+			Err: closeTabLocal(h, tabID, "prompt_delivery_failed",
 				fmt.Errorf("worktree ready but prompt consumption not proven: %w", err)),
+		}
+	}
+	// Post-delivery live identity ownership — same liveLookup path.
+	if spawner != nil && boundSession != "" && d.Production {
+		if _, lerr := spawner.requireLiveIdentity(tabLabel, boundSession, tabID, paneID); lerr != nil {
+			return &launchFailure{Reason: "session_drift_post", Err: closeTabLocal(h, tabID, "session_drift_post", lerr)}
 		}
 	}
 	if receipt == nil || !receipt.Consumed || !receipt.Verified {
 		return &launchFailure{
 			Reason: "prompt_receipt_invalid",
-			Err: closeTabLocal(h, tab.ID, "prompt_receipt_invalid",
+			Err: closeTabLocal(h, tabID, "prompt_receipt_invalid",
 				fmt.Errorf("worktree ready but prompt receipt did not prove consumption")),
 		}
 	}
 	if !herdr.ConsumptionProven(receipt.BaselineStatus, receipt.FinalStatus) {
 		return &launchFailure{
 			Reason: "prompt_sequence_invalid",
-			Err: closeTabLocal(h, tab.ID, "prompt_sequence_invalid",
+			Err: closeTabLocal(h, tabID, "prompt_sequence_invalid",
 				fmt.Errorf("prompt receipt sequence %q is not a valid consumption proof", receipt.SequenceToken)),
 		}
 	}
@@ -1431,7 +1610,7 @@ func (d *Dispatcher) launch(
 		Step:      StepPrompt,
 		Worktree:  wtInfo.Path,
 		Branch:    branch,
-		TabID:     tab.ID,
+		TabID:     tabID,
 		AgentName: tabLabel,
 		Receipt:   receipt.SequenceToken,
 		MessageID: evidence.MessageID,
@@ -1439,7 +1618,7 @@ func (d *Dispatcher) launch(
 	}); err != nil {
 		return &launchFailure{
 			Reason: "record_prompt_failed",
-			Err:    closeTabLocal(h, tab.ID, "record_prompt_failed", err),
+			Err:    closeTabLocal(h, tabID, "record_prompt_failed", err),
 		}
 	}
 	result.Launched = true
