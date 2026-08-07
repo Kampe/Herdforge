@@ -1,7 +1,6 @@
 package verifier
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"maps"
@@ -308,15 +307,17 @@ func TestExecuteBoundsRetainedOutput(t *testing.T) {
 }
 
 func TestReceiptUsesFullOutputDigestWithBoundedRetention(t *testing.T) {
-	fullOutput := bytes.Repeat([]byte{'x'}, 2_000_000)
-	result := &Result{
-		Passed:       true,
-		Outcome:      OutcomePASS,
-		Output:       boundedOutput(fullOutput),
-		OutputDigest: digestBytes(fullOutput),
-		ExitCode:     0,
-	}
+	// Production path: Execute must digest the unbounded process output while
+	// only retaining a bounded payload. Hand-building a Result would miss an
+	// Execute regression that truncated before hashing.
+	dir := t.TempDir()
+	script := filepath.Join(dir, "emit-output")
+	writeExecutable(t, script, "#!/bin/sh\nhead -c 2000000 /dev/zero\n")
 	v := NewVerifierArgs([]string{"./emit-output"})
+	result, err := v.Execute(context.Background(), dir)
+	if err != nil {
+		t.Fatal(err)
+	}
 	receipt := makeReceipt(VerificationRequest{
 		CandidateSHA:      strings.Repeat("a", 40),
 		EnvironmentPolicy: EnvironmentPolicyInherited,
