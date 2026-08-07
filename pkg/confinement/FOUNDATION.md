@@ -13,16 +13,19 @@ write sandbox for linked git worktrees and real coding agents.
   denied; repo-relative writes under the bound worktree allowed.
 
 ### OS layer (Darwin `sandbox-exec`, first-match)
-Grants (agent-viable):
+Grants (agent-viable — verified with live `git hash-object -w`):
 - `file-write*` under the authenticated worktree
-- `file-write*` under **this worktree's absolute gitdir** (linked-worktree
-  metadata — required for `git commit`)
-- `file-write*` under `/tmp`, `/private/tmp`, and `/private/var/folders`
+- `file-write*` under this worktree's **gitdir** (`.git/worktrees/<name>`)
+- **Narrow common-dir grants only**: `objects/`, `refs/`, `logs/`, `info/`,
+  plus top-level `HEAD`/`packed-refs`/lock files (not the whole `.git` tree)
+- `file-write*` under `/tmp` and `/private/tmp` (agents also get
+  `TMPDIR=<worktree>/.herd/confine/tmp`)
 - `network*` for model API calls
-- process/read/sysctl/mach as required to exec
 
-Denies (by `(deny default)`):
-- Shared-root residual paths (e.g. FAC-188 incident file)
+Denies (deny-default + missing grants):
+- **`common-dir/hooks`** and **`common-dir/config`** (no blanket common-dir
+  allow — Darwin does not honor deny-before-allow for parent subpaths here)
+- Shared-root residual paths (FAC-188 incident shape)
 - Sibling worktrees and other paths outside the grants
 
 ### Shared root

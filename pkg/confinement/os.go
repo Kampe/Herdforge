@@ -94,6 +94,29 @@ func (f *FakeOS) ProveWriteDenials(worktree, sharedRoot, profilePath string) err
 	if strings.TrimSpace(worktree) == "" || strings.TrimSpace(profilePath) == "" {
 		return ErrOSProbeFailed
 	}
+	// Non-vacuous without sandbox-exec: profile must exist and look like a
+	// write-confine profile, and must not grant the entire shared root.
+	data, err := os.ReadFile(profilePath)
+	if err != nil || len(data) == 0 {
+		return fmt.Errorf("%w: empty or missing profile", ErrOSProbeFailed)
+	}
+	body := string(data)
+	if !strings.Contains(body, "file-write") || !strings.Contains(body, "deny default") {
+		return fmt.Errorf("%w: profile missing deny-default write policy", ErrOSProbeFailed)
+	}
+	if sharedRoot != "" {
+		// Match either raw or cleaned absolute forms of the shared root grant.
+		abs, _ := filepath.Abs(sharedRoot)
+		for _, root := range []string{sharedRoot, abs, filepath.Clean(sharedRoot)} {
+			if root == "" {
+				continue
+			}
+			grant := "(allow file-write* (subpath \"" + root + "\"))"
+			if strings.Contains(body, grant) {
+				return fmt.Errorf("%w: profile grants whole shared root", ErrOSProbeFailed)
+			}
+		}
+	}
 	f.Proved = true
 	return nil
 }
@@ -162,11 +185,15 @@ func (d DarwinSeatbelt) Prepare(worktree, sharedRoot string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("confinement: resolve worktree gitdir: %w", err)
 	}
-	// gitdir must not be the shared worktree root itself; linked metadata is OK.
-	if absShared != "" && gitDir == absShared {
-		return "", fmt.Errorf("confinement: refusing profile that would grant whole shared root as gitdir")
+	commonDir, err := absoluteGitCommonDir(absWT)
+	if err != nil {
+		return "", fmt.Errorf("confinement: resolve git common-dir: %w", err)
 	}
-	return writeSeatbeltProfile(absWT, gitDir)
+	// Never grant the entire shared checkout as a write root.
+	if absShared != "" && (gitDir == absShared || commonDir == absShared) {
+		return "", fmt.Errorf("confinement: refusing profile that would grant whole shared root")
+	}
+	return writeSeatbeltProfile(absWT, gitDir, commonDir)
 }
 
 func (d DarwinSeatbelt) ProveWriteDenials(worktree, sharedRoot, profilePath string) error {
@@ -257,8 +284,7 @@ func (d DarwinSeatbelt) ProveWriteDenials(worktree, sharedRoot, profilePath stri
 	}
 	_ = os.Remove(inside)
 
-	// Allowed: write under this worktree's absolute gitdir (linked worktree
-	// metadata — required for `git commit` and the agent contract).
+	// Allowed: linked gitdir metadata.
 	gitDir, err := absoluteGitDir(absWT)
 	if err != nil {
 		return fmt.Errorf("%w: gitdir: %v", ErrOSProbeFailed, err)
@@ -266,12 +292,76 @@ func (d DarwinSeatbelt) ProveWriteDenials(worktree, sharedRoot, profilePath stri
 	gitProbe := filepath.Join(gitDir, "fac190-confine-probe.lock")
 	_ = os.Remove(gitProbe)
 	if err := d.writeUnder(profilePath, absWT, gitProbe, "ok\n"); err != nil {
-		return fmt.Errorf("%w: linked gitdir write denied (agents cannot commit): %v", ErrOSProbeFailed, err)
-	}
-	if data, err := os.ReadFile(gitProbe); err != nil || !strings.Contains(string(data), "ok") {
-		return fmt.Errorf("%w: linked gitdir write missing", ErrOSProbeFailed)
+		return fmt.Errorf("%w: linked gitdir write denied: %v", ErrOSProbeFailed, err)
 	}
 	_ = os.Remove(gitProbe)
+
+	// Allowed: agent-shaped git object write into common-dir (no empty commit).
+	// This is the real "agents can land work" gate; tee into gitdir alone is
+	// insufficient (objects live under common .git/objects).
+	if err := d.proveGitObjectWrite(profilePath, absWT); err != nil {
+		return err
+	}
+
+	// Denied: git hooks under common-dir when common-dir is outside the
+	// worktree (linked worktree topology). If common-dir is nested inside the
+	// worktree (standalone git init fixture), hooks fall under the worktree
+	// grant — production Herdforge task worktrees are linked, not nested.
+	commonDir, err := absoluteGitCommonDir(absWT)
+	if err != nil {
+		return fmt.Errorf("%w: common-dir: %v", ErrOSProbeFailed, err)
+	}
+	if !isPathPrefix(commonDir, absWT) && filepath.Clean(commonDir) != absWT {
+		hook := filepath.Join(commonDir, "hooks", "fac190-deny-hook")
+		_ = os.Remove(hook)
+		if err := d.writeUnder(profilePath, absWT, hook, "evil\n"); err == nil {
+			if _, statErr := os.Stat(hook); statErr == nil {
+				_ = os.Remove(hook)
+				return fmt.Errorf("%w: git hook write under common-dir succeeded", ErrOSProbeFailed)
+			}
+		}
+		if _, err := os.Stat(hook); err == nil {
+			_ = os.Remove(hook)
+			return fmt.Errorf("%w: git hook inode created", ErrOSProbeFailed)
+		}
+	}
+	return nil
+}
+
+// proveGitObjectWrite runs `git hash-object -w` under the profile with TMPDIR
+// inside the worktree — proves common-dir object store writes without leaving
+// a branch commit.
+func (d DarwinSeatbelt) proveGitObjectWrite(profile, worktree string) error {
+	tmpDir := filepath.Join(worktree, ".herd", "confine", "tmp")
+	if err := os.MkdirAll(tmpDir, 0o755); err != nil {
+		return err
+	}
+	cmd := exec.Command("/usr/bin/sandbox-exec", "-f", profile, "git", "-C", worktree, "hash-object", "-w", "--stdin")
+	cmd.Dir = worktree
+	cmd.Env = []string{
+		"PATH=/usr/bin:/bin:/usr/local/bin",
+		"TMPDIR=" + tmpDir,
+		"TMP=" + tmpDir,
+		"TEMP=" + tmpDir,
+		"GIT_CONFIG_NOSYSTEM=1",
+		"HOME=" + tmpDir,
+	}
+	cmd.Stdin = strings.NewReader("fac190-confine-object-probe\n")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("%w: git hash-object -w denied (agents cannot store objects): %v (%s)",
+			ErrOSProbeFailed, err, strings.TrimSpace(string(out)))
+	}
+	oid := strings.TrimSpace(string(out))
+	if len(oid) < 40 {
+		return fmt.Errorf("%w: git hash-object produced no oid", ErrOSProbeFailed)
+	}
+	// Best-effort cleanup of the probe object (not required for proof validity).
+	obj := filepath.Join(worktree, ".git", "objects", oid[:2], oid[2:])
+	if common, err := absoluteGitCommonDir(worktree); err == nil {
+		obj = filepath.Join(common, "objects", oid[:2], oid[2:])
+	}
+	_ = os.Remove(obj)
 	return nil
 }
 
@@ -433,21 +523,16 @@ func (d DarwinSeatbelt) writeUnder(profile, worktree, target, content string) er
 	return nil
 }
 
-// writeSeatbeltProfile emits a first-match-safe, agent-viable profile.
+// writeSeatbeltProfile emits an agent-viable profile that can still land git
+// objects without opening shared-repo hook/config RCE.
 //
-// Design (round-3 CRITICAL #1): a worktree-only write grant bricks linked
-// git worktrees (metadata under <common>/.git/worktrees/<name>/) and agents
-// that need network/temp. Grants are therefore:
-//   - file-write under the authenticated worktree
-//   - file-write under this worktree's absolute gitdir only
-//   - file-write under /tmp and /private/tmp
-//   - network* for model API calls
-// Everything else (shared-root residual paths, sibling worktrees, $HOME
-// secrets paths not covered by temp) falls through to (deny default).
-// The shared checkout root itself is never granted as a write subpath.
-func writeSeatbeltProfile(worktree, gitDir string) (string, error) {
-	if worktree == "" || gitDir == "" {
-		return "", fmt.Errorf("confinement: worktree and gitdir required for profile")
+// Linked worktrees need worktree + gitdir + common objects/refs/logs (not the
+// whole common-dir: a blanket common-dir allow lets agents rewrite hooks even
+// when a prior deny line is present — observed on Darwin TrustedBSD).
+// Shared checkout root is never a write subpath grant.
+func writeSeatbeltProfile(worktree, gitDir, commonDir string) (string, error) {
+	if worktree == "" || gitDir == "" || commonDir == "" {
+		return "", fmt.Errorf("confinement: worktree, gitdir, and common-dir required for profile")
 	}
 	var b strings.Builder
 	b.WriteString("(version 1)\n")
@@ -460,12 +545,18 @@ func writeSeatbeltProfile(worktree, gitDir string) (string, error) {
 	b.WriteString("(allow file-read*)\n")
 	b.WriteString("(allow file-ioctl)\n")
 	b.WriteString("(allow file-write-data (literal \"/dev/null\"))\n")
-	// More-specific write grants first (TrustedBSD first-match).
 	fmt.Fprintf(&b, "(allow file-write* (subpath %q))\n", worktree)
 	fmt.Fprintf(&b, "(allow file-write* (subpath %q))\n", gitDir)
-	// Host temp dirs commonly used by CLIs. Do NOT grant /private/var/folders
-	// wholesale — that is where hermetic probes live and would vacate denials.
-	// Agents receive TMPDIR under the worktree via PreparedOS.TabEnv.
+	// Narrow common-dir grants — objects/refs/logs only (no hooks/, no config).
+	fmt.Fprintf(&b, "(allow file-write* (subpath %q))\n", filepath.Join(commonDir, "objects"))
+	fmt.Fprintf(&b, "(allow file-write* (subpath %q))\n", filepath.Join(commonDir, "refs"))
+	fmt.Fprintf(&b, "(allow file-write* (subpath %q))\n", filepath.Join(commonDir, "logs"))
+	fmt.Fprintf(&b, "(allow file-write* (subpath %q))\n", filepath.Join(commonDir, "info"))
+	// Top-level git lock/state files (not under hooks/).
+	for _, name := range []string{"packed-refs", "COMMIT_EDITMSG", "FETCH_HEAD", "ORIG_HEAD", "HEAD"} {
+		fmt.Fprintf(&b, "(allow file-write* (literal %q))\n", filepath.Join(commonDir, name))
+		fmt.Fprintf(&b, "(allow file-write* (literal %q))\n", filepath.Join(commonDir, name+".lock"))
+	}
 	b.WriteString("(allow file-write* (subpath \"/private/tmp\"))\n")
 	b.WriteString("(allow file-write* (subpath \"/tmp\"))\n")
 
@@ -488,6 +579,22 @@ func absoluteGitDir(worktree string) (string, error) {
 		return "", fmt.Errorf("git rev-parse --absolute-git-dir: %w", err)
 	}
 	return realPath(strings.TrimSpace(string(out)))
+}
+
+// absoluteGitCommonDir returns the absolute common git directory (object store).
+func absoluteGitCommonDir(worktree string) (string, error) {
+	out, err := exec.Command("git", "-C", worktree, "rev-parse", "--git-common-dir").Output()
+	if err != nil {
+		return "", fmt.Errorf("git rev-parse --git-common-dir: %w", err)
+	}
+	path := strings.TrimSpace(string(out))
+	if path == "" {
+		return "", fmt.Errorf("empty git-common-dir")
+	}
+	if !filepath.IsAbs(path) {
+		path = filepath.Join(worktree, path)
+	}
+	return realPath(path)
 }
 
 // ProfileDigest returns the SHA-256 of the profile file bytes.
