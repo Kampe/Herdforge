@@ -2,9 +2,33 @@ package provider
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
+
+	"github.com/Kampe/Herdforge/pkg/boardfreeze"
 )
+
+// ErrBoardFrozen is wrapped into every mutation BoundClient refuses while
+// the FAC-103 board-freeze gate is active. Callers use errors.Is against
+// this to distinguish a deliberate freeze refusal from a transport error.
+var ErrBoardFrozen = errors.New("provider: board is frozen")
+
+// freezeGate is consulted fresh (never cached) before every mutating call,
+// so a caller that retries after a refusal always sees the live
+// generation — a retry can never be judged against a freeze state that has
+// since been superseded. Reads bypass this entirely.
+func freezeGate(op string) error {
+	st, frozen, err := boardfreeze.Active(time.Now())
+	if err != nil {
+		return fmt.Errorf("%s: BLOCKED(board_freeze_unavailable): %w", op, err)
+	}
+	if !frozen {
+		return nil
+	}
+	_ = boardfreeze.RecordBlock() // best-effort accounting; refusal stands regardless
+	return fmt.Errorf("%s: %w (actor=%q reason=%q scope=%q generation=%d)", op, ErrBoardFrozen, st.Actor, st.Reason, st.Scope, st.Generation)
+}
 
 // BoundClient is the production TaskProvider wrapper: every external board
 // call gets a configured per-op deadline and timeout/ambiguous failures are
@@ -76,6 +100,9 @@ func (b *BoundClient) ClaimTask(ctx context.Context, taskID, role string) error 
 	if b == nil || b.Inner == nil {
 		return fmt.Errorf("ClaimTask: nil provider")
 	}
+	if err := freezeGate("ClaimTask"); err != nil {
+		return err
+	}
 	opCtx, cancel := BoundOp(ctx, b.deadlines(), OpMutate)
 	defer cancel()
 	return b.wrap("ClaimTask", OpMutate, b.Inner.ClaimTask(opCtx, taskID, role))
@@ -85,6 +112,9 @@ func (b *BoundClient) UpdateStatus(ctx context.Context, taskID, status string) e
 	if b == nil || b.Inner == nil {
 		return fmt.Errorf("UpdateStatus: nil provider")
 	}
+	if err := freezeGate("UpdateStatus"); err != nil {
+		return err
+	}
 	opCtx, cancel := BoundOp(ctx, b.deadlines(), OpMutate)
 	defer cancel()
 	return b.wrap("UpdateStatus", OpMutate, b.Inner.UpdateStatus(opCtx, taskID, status))
@@ -93,6 +123,9 @@ func (b *BoundClient) UpdateStatus(ctx context.Context, taskID, status string) e
 func (b *BoundClient) AddComment(ctx context.Context, taskID, body string) error {
 	if b == nil || b.Inner == nil {
 		return fmt.Errorf("AddComment: nil provider")
+	}
+	if err := freezeGate("AddComment"); err != nil {
+		return err
 	}
 	opCtx, cancel := BoundOp(ctx, b.deadlines(), OpComment)
 	defer cancel()
@@ -128,6 +161,9 @@ func (b *BoundClient) CreateTaskLabel(ctx context.Context, taskID, name string) 
 	if err != nil {
 		return TaskLabel{}, err
 	}
+	if err := freezeGate("CreateTaskLabel"); err != nil {
+		return TaskLabel{}, err
+	}
 	opCtx, cancel := BoundOp(ctx, b.deadlines(), OpMutate)
 	defer cancel()
 	row, e := p.CreateTaskLabel(opCtx, taskID, name)
@@ -136,6 +172,9 @@ func (b *BoundClient) CreateTaskLabel(ctx context.Context, taskID, name string) 
 func (b *BoundClient) AttachTaskLabel(ctx context.Context, taskID, labelID string) error {
 	p, err := b.labelProvider()
 	if err != nil {
+		return err
+	}
+	if err := freezeGate("AttachTaskLabel"); err != nil {
 		return err
 	}
 	opCtx, cancel := BoundOp(ctx, b.deadlines(), OpMutate)
@@ -147,6 +186,9 @@ func (b *BoundClient) DetachTaskLabel(ctx context.Context, labelID string) error
 	if err != nil {
 		return err
 	}
+	if err := freezeGate("DetachTaskLabel"); err != nil {
+		return err
+	}
 	opCtx, cancel := BoundOp(ctx, b.deadlines(), OpMutate)
 	defer cancel()
 	return b.wrap("DetachTaskLabel", OpMutate, p.DetachTaskLabel(opCtx, labelID))
@@ -154,6 +196,9 @@ func (b *BoundClient) DetachTaskLabel(ctx context.Context, labelID string) error
 func (b *BoundClient) DeleteTaskLabel(ctx context.Context, labelID string) error {
 	p, err := b.labelProvider()
 	if err != nil {
+		return err
+	}
+	if err := freezeGate("DeleteTaskLabel"); err != nil {
 		return err
 	}
 	opCtx, cancel := BoundOp(ctx, b.deadlines(), OpMutate)
@@ -218,6 +263,9 @@ func (b *BoundClient) CreateRelation(ctx context.Context, sourceID, targetID str
 	if err != nil {
 		return nil, err
 	}
+	if err := freezeGate("CreateRelation"); err != nil {
+		return nil, err
+	}
 	opCtx, cancel := BoundOp(ctx, b.deadlines(), OpMutate)
 	defer cancel()
 	rel, e := rp.CreateRelation(opCtx, sourceID, targetID, typ)
@@ -227,6 +275,9 @@ func (b *BoundClient) CreateRelation(ctx context.Context, sourceID, targetID str
 func (b *BoundClient) DeleteRelation(ctx context.Context, relationID, sourceID, targetID string) error {
 	rp, err := b.relationProvider()
 	if err != nil {
+		return err
+	}
+	if err := freezeGate("DeleteRelation"); err != nil {
 		return err
 	}
 	opCtx, cancel := BoundOp(ctx, b.deadlines(), OpMutate)
