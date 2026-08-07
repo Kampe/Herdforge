@@ -811,6 +811,9 @@ func (d *Dispatcher) confinementEnforcer(worktreePath string) (*confinement.Enfo
 		enf.ReceiptDir = filepath.Join(worktreePath, ".herd", "confinement")
 		return enf, nil
 	}
+	if enf.Issuer == nil || enf.OS == nil {
+		return nil, fmt.Errorf("confinement: injected Enforcer requires Issuer and OS backend")
+	}
 	if strings.TrimSpace(enf.ReceiptDir) == "" {
 		cloned := *enf
 		cloned.ReceiptDir = filepath.Join(worktreePath, ".herd", "confinement")
@@ -1003,11 +1006,19 @@ func (d *Dispatcher) launch(
 		}
 	}
 
-	// Tab with exact task worktree as process cwd (+ confinement PATH).
+	// Tab with exact task worktree as process cwd (+ confinement PATH/ZDOTDIR).
 	var tabEnv []string
 	if confPrep != nil {
-		if pe := confPrep.PathEnv(os.Getenv("PATH")); pe != "" {
-			tabEnv = append(tabEnv, pe)
+		var eerr error
+		tabEnv, eerr = confPrep.TabEnv(wtInfo.Path, os.Getenv("PATH"))
+		if eerr != nil {
+			return &launchFailure{Reason: "confinement_rejected", Err: eerr}
+		}
+		// Fail closed if wrappers would not resolve for argv0/provider names.
+		for _, n := range confPrep.Names {
+			if !confPrep.WrapperResolves(n) {
+				return &launchFailure{Reason: "confinement_rejected", Err: fmt.Errorf("confinement: wrapper %q not installed", n)}
+			}
 		}
 	}
 	tab, err := h.TabCreateForTask(ws, tabLabel, wtInfo.Path, true, tabEnv...)

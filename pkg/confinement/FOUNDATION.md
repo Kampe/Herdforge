@@ -1,46 +1,59 @@
 # Confinement foundation (FAC-190)
 
 This package is the production write-confinement surface for Herdforge task
-worktrees.
+worktrees. Round-3 redesign addresses the impossibility of a worktree-only
+write sandbox for linked git worktrees and real coding agents.
 
 ## What it enforces today
 
-- **Authenticated capability**: a capability binds canonical worktree + sentinel
-  device/inode identities, the full repository/task/lease/lane/session/Herdr/
-  process/argv/policy/allowed-roots tuple, and an HMAC-SHA256 issuer proof.
-- **Policy path checks**: absolute shared-root paths, `..` traversal, symlink and
-  case aliases, hardlinks, different devices, and sentinel mutation are denied;
-  repo-relative writes under the bound worktree are allowed.
-- **Worktree sentinel**: every created/reattached task worktree installs
-  `.herd/worktree-sentinel`. The shared checkout installs
-  `.herd/shared-root-sentinel` and revalidates it around launch.
-- **OS write-denial proof (Darwin)**: `sandbox-exec` hermetic probes must fail to
-  create the FAC-188 incident-shaped absolute shared-root file and sibling
-  writes, while an in-worktree write succeeds, before production dispatch starts
-  an agent.
-- **Durable receipts**: `BindAndProve` appends JSONL evidence under the worktree
-  when a receipt directory is configured.
+### Policy layer
+- Authenticated capability: worktree + sentinel device/inode identities, full
+  AuthTuple, HMAC-SHA256 issuer proof.
+- Absolute shared-root residual paths, traversal, symlink/case aliases, hardlinks
+  denied; repo-relative writes under the bound worktree allowed.
 
-## Production launch order (FAC-190)
+### OS layer (Darwin `sandbox-exec`, first-match)
+Grants (agent-viable):
+- `file-write*` under the authenticated worktree
+- `file-write*` under **this worktree's absolute gitdir** (linked-worktree
+  metadata — required for `git commit`)
+- `file-write*` under `/tmp`, `/private/tmp`, and `/private/var/folders`
+- `network*` for model API calls
+- process/read/sysctl/mach as required to exec
 
-1. `PrepareOS` — write first-match-safe profile (worktree write only), prove
-   hermetic denials with `/usr/bin/tee` under `sandbox-exec` (no shell, no
-   shared-root mutation), install PATH-first agent wrapper under
-   `.herd/confine/bin/<kind>`.
-2. `TabCreate` with `PATH=<wrapper-bin>:$PATH` so herdr kind resolution hits the
-   wrapper.
-3. `BindAndProve` — MAC-bind tab/pane/lease identity, re-prove with the same
-   profile, require `AgentWrapped && OSProved` before `AgentStart`.
+Denies (by `(deny default)`):
+- Shared-root residual paths (e.g. FAC-188 incident file)
+- Sibling worktrees and other paths outside the grants
+
+### Shared root
+- **Read-only observation** (`ObserveSharedRoot`) — never writes under the
+  shared checkout. Detects FAC-188 residual presence and `.herd` listing drift.
+- Worktree sentinel remains under the task worktree only.
+
+### Launch order
+1. `PrepareOS` — profile (with gitdir), prove denials **including linked gitdir
+   write + shared residual deny**, install wrappers for provider **and** argv0,
+   bind **profile content digest** into wrappers.
+2. `TabCreate` with `PATH`, `ZDOTDIR` (worktree-local rc re-exports wrapper
+   PATH first), and `HERD_CONFINEMENT_*` markers.
+3. `BindAndProve` — MAC identity, re-prove, re-hash profile, verify wrappers
+   still embed path+digest, **HMAC-sign receipt**.
+4. `AgentStart` — wrappers force `sandbox-exec -f <profile>` when PATH resolves
+   them.
+
+### Receipts
+- `ReceiptDigest` covers identity, OS fields, **profile digest**, wrapper names.
+- `ReceiptMACHex` is HMAC-SHA256 over the digest with the confinement issuer
+  secret (not forgeable from public fields alone).
 
 ## Residuals (honest)
 
-- Herdr must resolve the agent kind via PATH for the wrapper to exec. If a
-  future herdr release hardcodes absolute agent binaries, production will still
-  fail closed on missing wrap install but the live process may bypass the
-  wrapper — that is a Herdr contract change, not a silent policy skip.
-- Bind mounts that preserve device numbers, and making an already-authorized
-  write atomic, remain outside this package.
-- Coordinator root/Git plumbing is a separate authority and is never delegated
-  into a worker capability.
-- `sandbox-exec` is deprecated by Apple; when unavailable `RequireOS` fails
-  closed (no policy-only production admission).
+- If Herdr resolves agent kinds by absolute path (ignoring PATH), wrappers do
+  not intercept. Production still requires wrapper install + profile proof;
+  live binary resolution depends on Herdr using PATH for kind executables.
+- Login shells that ignore `ZDOTDIR` can still reorder PATH; wrappers that
+  *do* run always re-enter `sandbox-exec` with the proved profile path.
+- Profile file under the writable worktree can be rewritten after bind in a
+  race with a concurrent writer; re-prove/re-hash narrows but does not close
+  kernel-level races against a compromised worktree process.
+- Non-Darwin hosts fail closed (`ErrOSUnavailable`).
