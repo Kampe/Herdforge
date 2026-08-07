@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"strings"
 	"testing"
 	"time"
@@ -166,6 +167,480 @@ func TestEnsureHerdforgeLabel_MidStringStillPrefixed(t *testing.T) {
 	want := "Herdforge · review of Herdforge · thing"
 	if got != want {
 		t.Errorf("EnsureHerdforgeLabel(%q) = %q, want %q", in, got, want)
+	}
+}
+
+// FAC-199 round-2 finding 2: the fleet already carries live labels using the
+// older "Herdforge | " prefix (see the ticket's own regression evidence,
+// e.g. "Herdforge | FAC-183 | Worker Delivery R1"). Acceptance explicitly
+// allows either prefix; a pipe-form label must be recognized as already
+// canonical, never rewritten into the dot form.
+func TestEnsureHerdforgeLabel_PipeFormAlreadyPrefixed(t *testing.T) {
+	got := EnsureHerdforgeLabel("Herdforge | FAC-183 | Worker Delivery R1")
+	if got != "Herdforge | FAC-183 | Worker Delivery R1" {
+		t.Errorf("pipe-form label was rewritten: %q", got)
+	}
+}
+
+func TestEnsureHerdforgeLabel_MidStringPipeFormStillPrefixed(t *testing.T) {
+	in := "review of Herdforge | thing"
+	got := EnsureHerdforgeLabel(in)
+	want := "Herdforge · review of Herdforge | thing"
+	if got != want {
+		t.Errorf("EnsureHerdforgeLabel(%q) = %q, want %q", in, got, want)
+	}
+}
+
+func TestTabRename_IssuesExactArgv(t *testing.T) {
+	old := runHerdr
+	defer func() { runHerdr = old }()
+	var got []string
+	runHerdr = func(args ...string) (string, error) {
+		got = append([]string(nil), args...)
+		return `{}`, nil
+	}
+	if err := TabRename("tab-9", "Herdforge · worker"); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"tab", "rename", "tab-9", "Herdforge · worker"}
+	if len(got) != len(want) {
+		t.Fatalf("argv = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("argv = %v, want %v", got, want)
+		}
+	}
+}
+
+func TestTabRename_RequiresTabID(t *testing.T) {
+	if err := TabRename("", "label"); err == nil {
+		t.Fatal("empty tab id must fail closed")
+	}
+}
+
+// FAC-199 finding 4: TabRename is the only write path for labels; it must
+// enforce the Herdforge prefix itself so no caller can use it to put a raw
+// label back onto a live tab, independent of ReconcileHerdforgeLabel.
+func TestTabRename_PrefixesRawLabelAsDefenseInDepth(t *testing.T) {
+	old := runHerdr
+	defer func() { runHerdr = old }()
+	var got []string
+	runHerdr = func(args ...string) (string, error) {
+		got = append([]string(nil), args...)
+		return `{}`, nil
+	}
+	if err := TabRename("tab-9", "task-fac-9-raw"); err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 4 || got[3] != "Herdforge · task-fac-9-raw" {
+		t.Fatalf("TabRename did not enforce the Herdforge prefix: argv = %v", got)
+	}
+}
+
+// FAC-199: reconciliation must relabel a live tab in place — never close or
+// recreate it — across every raw-label shape the coordinator/worker/reviewer
+// fleet can produce, including the mid-string mutation-killer from
+// TestEnsureHerdforgeLabel_MidStringStillPrefixed. Every case also proves the
+// post-rename readback (finding 1): the stub's "tab list" always reflects
+// whatever the most recent "tab rename" actually wrote, so a reconciliation
+// that trusted only the rename's exit code (and skipped the readback) would
+// still pass here — the dedicated readback-mismatch test below is what kills
+// that mutation.
+func TestReconcileHerdforgeLabel_Table(t *testing.T) {
+	cases := []struct {
+		name    string
+		current string
+		want    string
+		renamed bool
+	}{
+		{name: "already_prefixed", current: "Herdforge · worker", want: "Herdforge · worker", renamed: false},
+		{name: "already_prefixed_pipe_form", current: "Herdforge | FAC-183 | Worker Delivery R1", want: "Herdforge | FAC-183 | Worker Delivery R1", renamed: false},
+		{name: "raw_task_label", current: "task-fac-183-production-delivery-r1", want: "Herdforge · task-fac-183-production-delivery-r1", renamed: true},
+		{name: "malicious_mid_string", current: "review of Herdforge · thing", want: "Herdforge · review of Herdforge · thing", renamed: true},
+		{name: "empty_label", current: "", want: "Herdforge · ", renamed: true},
+		{name: "recovery_name", current: "recovery-worker-r3", want: "Herdforge · recovery-worker-r3", renamed: true},
+		{name: "reviewer_name", current: "reviewer-1", want: "Herdforge · reviewer-1", renamed: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			old := runHerdr
+			defer func() { runHerdr = old }()
+			liveLabel := tc.current
+			var renameArgs []string
+			var listCalls int
+			runHerdr = func(args ...string) (string, error) {
+				if len(args) == 2 && args[0] == "tab" && args[1] == "list" {
+					listCalls++
+					return fmt.Sprintf(`{"result":{"tabs":[{"tab_id":"tab-x","label":%q,"workspace_id":"wK"}]}}`, liveLabel), nil
+				}
+				if len(args) == 4 && args[0] == "tab" && args[1] == "rename" {
+					renameArgs = append([]string(nil), args...)
+					liveLabel = args[3]
+					return `{}`, nil
+				}
+				t.Fatalf("unexpected herdr call: %v", args)
+				return "", nil
+			}
+			label, renamed, err := ReconcileHerdforgeLabel("tab-x", "wK")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if label != tc.want {
+				t.Fatalf("label = %q, want %q", label, tc.want)
+			}
+			if renamed != tc.renamed {
+				t.Fatalf("renamed = %v, want %v", renamed, tc.renamed)
+			}
+			switch {
+			case tc.renamed && (len(renameArgs) != 4 || renameArgs[2] != "tab-x" || renameArgs[3] != tc.want):
+				t.Fatalf("rename argv = %v", renameArgs)
+			case tc.renamed && listCalls != 2:
+				t.Fatalf("rename must be followed by a readback: tab list calls = %d", listCalls)
+			case !tc.renamed && renameArgs != nil:
+				t.Fatalf("unexpected rename call for already-prefixed label: %v", renameArgs)
+			}
+		})
+	}
+}
+
+func TestReconcileHerdforgeLabel_RequiresWorkspace(t *testing.T) {
+	if _, _, err := ReconcileHerdforgeLabel("tab-x", ""); err == nil {
+		t.Fatal("empty workspace must fail closed (no unscoped relabel)")
+	}
+}
+
+// FAC-199 finding 2: a tab id whose live workspace does not match the
+// caller's expected workspace must never be relabeled — this is the gate
+// that stops a stale/incorrect tab id, or a tab that belongs to some other
+// non-Herdforge workspace, from being silently rewritten.
+func TestReconcileHerdforgeLabel_RefusesCrossWorkspaceRename(t *testing.T) {
+	old := runHerdr
+	defer func() { runHerdr = old }()
+	var renamed bool
+	runHerdr = func(args ...string) (string, error) {
+		if len(args) == 2 && args[0] == "tab" && args[1] == "list" {
+			return `{"result":{"tabs":[{"tab_id":"tab-x","label":"task-fac-9","workspace_id":"w1"}]}}`, nil
+		}
+		if len(args) == 4 && args[0] == "tab" && args[1] == "rename" {
+			renamed = true
+			return `{}`, nil
+		}
+		t.Fatalf("unexpected herdr call: %v", args)
+		return "", nil
+	}
+	if _, _, err := ReconcileHerdforgeLabel("tab-x", "wK"); err == nil {
+		t.Fatal("tab in a different workspace must be refused, not relabeled")
+	}
+	if renamed {
+		t.Fatal("cross-workspace refusal must never issue a rename")
+	}
+}
+
+// FAC-199 finding 1: a `tab rename` that exits 0 but does not actually take
+// (herdr bug, truncation, race with another writer) must not be reported as
+// success — the post-rename readback is the proof, not the exit code.
+func TestReconcileHerdforgeLabel_FailsClosedWhenReadbackDisagreesWithRename(t *testing.T) {
+	old := runHerdr
+	defer func() { runHerdr = old }()
+	runHerdr = func(args ...string) (string, error) {
+		if len(args) == 2 && args[0] == "tab" && args[1] == "list" {
+			// Live label never actually changes, no matter what was renamed.
+			return `{"result":{"tabs":[{"tab_id":"tab-x","label":"task-fac-9","workspace_id":"wK"}]}}`, nil
+		}
+		if len(args) == 4 && args[0] == "tab" && args[1] == "rename" {
+			return `{}`, nil // exits clean, but the readback below proves it didn't take
+		}
+		t.Fatalf("unexpected herdr call: %v", args)
+		return "", nil
+	}
+	if _, renamed, err := ReconcileHerdforgeLabel("tab-x", "wK"); err == nil {
+		t.Fatalf("a rename that does not survive readback must be an error, got renamed=%v", renamed)
+	}
+}
+
+// FAC-199 finding 5: the bounded fleet sweep must repair every named,
+// in-workspace raw label, skip tabs already correct, skip unnamed/operator
+// tabs (empty label), and never cross a workspace boundary.
+// FAC-199 round-2 finding 1: ownership for the sweep must be determined by
+// AgentEntry.Name (same doctrine as SelectCleanupCandidates — an unnamed
+// pane is the operator's own terminal), never by "does the tab have a
+// non-empty label", since a raw operator terminal commonly has a non-empty
+// label too ("1", "2", "Terminal", ...). tab-1/tab-2 below model exactly
+// that: real tab-list rows with plain numeric/word labels and NO
+// corresponding agent entry. The sweep must never even look them up, let
+// alone rename them.
+func TestReconcileWorkspaceLabels_SweepsOnlyNamedAgentTabsInWorkspace(t *testing.T) {
+	old := runHerdr
+	defer func() { runHerdr = old }()
+	agents := []AgentEntry{
+		{Name: "forge-worker", TabID: "tab-raw", PaneID: "pane-raw", Workspace: "wK", Session: struct {
+			Value string `json:"value,omitempty"`
+		}{Value: "sess-raw"}},
+		{Name: "forge-reviewer", TabID: "tab-ok", PaneID: "pane-ok", Workspace: "wK", Session: struct {
+			Value string `json:"value,omitempty"`
+		}{Value: "sess-ok"}},
+		{Name: "forge-other", TabID: "tab-other-w", PaneID: "pane-other", Workspace: "w1", Session: struct {
+			Value string `json:"value,omitempty"`
+		}{Value: "sess-other"}},
+	}
+	labels := map[string]string{
+		"tab-raw":     "task-fac-183-production-delivery-r1",
+		"tab-ok":      "Herdforge · forge-reviewer",
+		"tab-other-w": "task-fac-9-other-workspace",
+		"tab-1":       "1",
+		"tab-2":       "Terminal",
+	}
+	workspaces := map[string]string{
+		"tab-raw": "wK", "tab-ok": "wK", "tab-other-w": "w1", "tab-1": "wK", "tab-2": "wK",
+	}
+	type row struct {
+		TabID     string `json:"tab_id"`
+		Label     string `json:"label"`
+		Workspace string `json:"workspace_id"`
+	}
+	var renames []string
+	runHerdr = func(args ...string) (string, error) {
+		if len(args) == 2 && args[0] == "agent" && args[1] == "list" {
+			b, err := json.Marshal(struct {
+				Result struct {
+					Agents []AgentEntry `json:"agents"`
+				} `json:"result"`
+			}{Result: struct {
+				Agents []AgentEntry `json:"agents"`
+			}{Agents: agents}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			return string(b), nil
+		}
+		if len(args) == 2 && args[0] == "tab" && args[1] == "list" {
+			var rows []row
+			for _, id := range []string{"tab-raw", "tab-ok", "tab-other-w", "tab-1", "tab-2"} {
+				rows = append(rows, row{TabID: id, Label: labels[id], Workspace: workspaces[id]})
+			}
+			b, err := json.Marshal(struct {
+				Result struct {
+					Tabs []row `json:"tabs"`
+				} `json:"result"`
+			}{Result: struct {
+				Tabs []row `json:"tabs"`
+			}{Tabs: rows}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			return string(b), nil
+		}
+		if len(args) == 4 && args[0] == "tab" && args[1] == "rename" {
+			renames = append(renames, args[2])
+			labels[args[2]] = args[3]
+			return `{}`, nil
+		}
+		t.Fatalf("unexpected herdr call: %v", args)
+		return "", nil
+	}
+	renamed, err := ReconcileWorkspaceLabels("wK")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(renamed) != 1 || renamed[0] != "tab-raw" {
+		t.Fatalf("sweep renamed = %v, want only tab-raw", renamed)
+	}
+	if len(renames) != 1 || renames[0] != "tab-raw" {
+		t.Fatalf("rename calls = %v, want exactly one for tab-raw", renames)
+	}
+	if labels["tab-1"] != "1" || labels["tab-2"] != "Terminal" {
+		t.Fatal("sweep must never touch a tab with no corresponding named agent, even with a non-empty label")
+	}
+	if labels["tab-other-w"] != "task-fac-9-other-workspace" {
+		t.Fatal("sweep must never cross the workspace boundary")
+	}
+}
+
+func TestReconcileWorkspaceLabels_RequiresWorkspace(t *testing.T) {
+	if _, err := ReconcileWorkspaceLabels(""); err == nil {
+		t.Fatal("empty workspace must fail closed")
+	}
+}
+
+// FAC-199 round-2 finding 3: ReconcileAgentLabel must fail closed when the
+// agent inventory disagrees with the identity snapshot the caller renamed
+// against — pane, session, cwd, or workspace changing between the rename
+// decision and the post-rename readback is exactly the race a "read-verify
+// before renaming already happened live" repair is supposed to catch.
+func TestReconcileAgentLabel_FailsClosedWhenIdentityDriftsDuringRename(t *testing.T) {
+	before := AgentEntry{Name: "forge-worker", TabID: "tab-x", PaneID: "pane-1", Workspace: "wK", Cwd: "/repo"}
+	before.Session.Value = "sess-1"
+
+	cases := []struct {
+		name  string
+		after AgentEntry
+	}{
+		{name: "pane_changed", after: func() AgentEntry { a := before; a.PaneID = "pane-2"; return a }()},
+		{name: "session_changed", after: func() AgentEntry { a := before; a.Session.Value = "sess-2"; return a }()},
+		{name: "cwd_changed", after: func() AgentEntry { a := before; a.Cwd = "/other"; return a }()},
+		{name: "workspace_changed", after: func() AgentEntry { a := before; a.Workspace = "w1"; return a }()},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			old := runHerdr
+			defer func() { runHerdr = old }()
+			liveLabel := "task-fac-9-raw"
+			runHerdr = func(args ...string) (string, error) {
+				if len(args) == 2 && args[0] == "agent" && args[1] == "list" {
+					// ReconcileAgentLabel takes "before" as the caller's already-current
+					// snapshot and only calls AgentList once, for the post-rename
+					// readback — so this stub always answers with the drifted state.
+					b, err := json.Marshal(struct {
+						Result struct {
+							Agents []AgentEntry `json:"agents"`
+						} `json:"result"`
+					}{Result: struct {
+						Agents []AgentEntry `json:"agents"`
+					}{Agents: []AgentEntry{tc.after}}})
+					if err != nil {
+						t.Fatal(err)
+					}
+					return string(b), nil
+				}
+				if len(args) == 2 && args[0] == "tab" && args[1] == "list" {
+					return fmt.Sprintf(`{"result":{"tabs":[{"tab_id":"tab-x","label":%q,"workspace_id":"wK"}]}}`, liveLabel), nil
+				}
+				if len(args) == 4 && args[0] == "tab" && args[1] == "rename" {
+					liveLabel = args[3]
+					return `{}`, nil
+				}
+				t.Fatalf("unexpected herdr call: %v", args)
+				return "", nil
+			}
+			if _, renamed, err := ReconcileAgentLabel(before); err == nil {
+				t.Fatalf("identity drift %s must fail closed, got renamed=%v", tc.name, renamed)
+			}
+		})
+	}
+}
+
+func TestReconcileAgentLabel_RequiresTabID(t *testing.T) {
+	if _, _, err := ReconcileAgentLabel(AgentEntry{Workspace: "wK"}); err == nil {
+		t.Fatal("empty tab id must fail closed")
+	}
+}
+
+// FAC-199: this is the mutation-killer for the resume/recovery call site —
+// if ReconcileHerdforgeLabel stops being called from ResolveAgentTabWithDecision,
+// renamedTo stays empty and the test fails. It also proves the repair is a
+// pure in-place rename against independently-measured identity, not values
+// the reconciliation code happens to already hold in memory:
+//   - pane/session/generation are re-read from the same in-memory fixture the
+//     production code reads from, and must be unchanged after the call;
+//   - readPIDStartToken/readPIDParent (the only process-identity seam this
+//     package has) must never be invoked — label repair never touches the
+//     process tree;
+//   - a real git repository's HEAD and working-tree dirty state are measured
+//     with actual `git` commands before and after — since pkg/herdr never
+//     shells out to git at all, this proves worktree state is physically
+//     untouched, not merely assumed so from reading the diff;
+//   - no "tab close" is ever issued.
+func TestResumeReconcilesRawLabelInPlaceWithoutTabClose(t *testing.T) {
+	// Hermetic git: ignore the developer/CI machine's global and system git
+	// config (commit signing backends in particular — e.g. a 1Password SSH
+	// signer with no agent socket available in a sandboxed test run) so this
+	// fixture never depends on ambient environment.
+	t.Setenv("GIT_CONFIG_GLOBAL", os.DevNull)
+	t.Setenv("GIT_CONFIG_SYSTEM", os.DevNull)
+	repo := t.TempDir()
+	git := func(args ...string) string {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = repo
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v: %s: %v", args, out, err)
+		}
+		return strings.TrimSpace(string(out))
+	}
+	git("init", "-q")
+	git("config", "user.email", "fac199@example.com")
+	git("config", "user.name", "fac199")
+	git("config", "commit.gpgsign", "false")
+	git("config", "tag.gpgsign", "false")
+	if err := os.WriteFile(repo+"/committed.txt", []byte("a"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	git("add", "committed.txt")
+	git("commit", "-q", "-m", "init")
+	if err := os.WriteFile(repo+"/dirty.txt", []byte("b"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	headBefore := git("rev-parse", "HEAD")
+	dirtyBefore := git("status", "--porcelain")
+
+	req, lc, agent, _ := standingResumeFixture(t, false)
+
+	oldToken, oldParent := readPIDStartToken, readPIDParent
+	defer func() { readPIDStartToken, readPIDParent = oldToken, oldParent }()
+	readPIDStartToken = func(int) (string, error) {
+		t.Fatal("label reconciliation must never touch process identity (readPIDStartToken)")
+		return "", nil
+	}
+	readPIDParent = func(int) (int, error) {
+		t.Fatal("label reconciliation must never touch process identity (readPIDParent)")
+		return 0, nil
+	}
+
+	oldRun := runHerdr
+	defer func() { runHerdr = oldRun }()
+	var calls [][]string
+	liveLabel := "task-fac-188-worker"
+	var renamedTo string
+	runHerdr = func(args ...string) (string, error) {
+		calls = append(calls, append([]string(nil), args...))
+		switch {
+		case len(args) == 2 && args[0] == "agent" && args[1] == "list":
+			b, _ := json.Marshal(struct {
+				Result struct {
+					Agents []AgentEntry `json:"agents"`
+				} `json:"result"`
+			}{Result: struct {
+				Agents []AgentEntry `json:"agents"`
+			}{Agents: []AgentEntry{agent}}})
+			return string(b), nil
+		case len(args) == 2 && args[0] == "tab" && args[1] == "list":
+			return fmt.Sprintf(`{"result":{"tabs":[{"tab_id":%q,"label":%q,"workspace_id":%q}]}}`, agent.TabID, liveLabel, agent.Workspace), nil
+		case len(args) == 4 && args[0] == "tab" && args[1] == "rename":
+			renamedTo = args[3]
+			liveLabel = args[3]
+			return `{}`, nil
+		default:
+			t.Fatalf("unexpected herdr call (must not close/restart the tab): %v", args)
+			return "", nil
+		}
+	}
+	beforeGen := lc.Inventory.Owner.SessionGeneration
+	beforePane := agent.PaneID
+	beforeSession := agent.Session.Value
+	if _, err := ResolveAgentTabWithDecision(agent.Name, req); err != nil {
+		t.Fatal(err)
+	}
+	if renamedTo != "Herdforge · task-fac-188-worker" {
+		t.Fatalf("raw label was not reconciled on resume: renamed to %q", renamedTo)
+	}
+	if lc.Inventory.Owner.SessionGeneration != beforeGen || agent.PaneID != beforePane || agent.Session.Value != beforeSession {
+		t.Fatal("label reconciliation must not mutate pane, session, or process identity")
+	}
+	for _, c := range calls {
+		if len(c) >= 2 && c[0] == "tab" && c[1] == "close" {
+			t.Fatal("label reconciliation must never close the tab")
+		}
+	}
+
+	headAfter := git("rev-parse", "HEAD")
+	dirtyAfter := git("status", "--porcelain")
+	if headAfter != headBefore {
+		t.Fatalf("worktree HEAD changed: before=%s after=%s", headBefore, headAfter)
+	}
+	if dirtyAfter != dirtyBefore {
+		t.Fatalf("worktree dirty state changed: before=%q after=%q", dirtyBefore, dirtyAfter)
 	}
 }
 
@@ -828,7 +1303,7 @@ func standingResumeFixture(t *testing.T, durable bool) (launch.Request, *toolchi
 	if err := launch.RecordStarted(started, nil); err != nil {
 		t.Fatal(err)
 	}
-	agent := AgentEntry{Name: owner.Name, Kind: owner.Provider, Status: "working", PaneID: owner.PaneID, TabID: owner.TabID}
+	agent := AgentEntry{Name: owner.Name, Kind: owner.Provider, Status: "working", PaneID: owner.PaneID, TabID: owner.TabID, Workspace: "wK"}
 	agent.Session.Value = owner.SessionID
 	req.SessionGeneration = 0
 	return req, lc, agent, path
@@ -851,12 +1326,15 @@ func TestStandingResumeRecoversGenerationFromTaskLaunchRequestShape(t *testing.T
 			}{Agents: []AgentEntry{agent}}})
 			return string(b), nil
 		}
+		if len(args) == 2 && args[0] == "tab" && args[1] == "list" {
+			return fmt.Sprintf(`{"result":{"tabs":[{"tab_id":%q,"label":"Herdforge · forge-worker","workspace_id":%q}]}}`, agent.TabID, agent.Workspace), nil
+		}
 		return "", fmt.Errorf("unexpected process or tab side effect: %v", args)
 	}
 	if _, err := ResolveAgentTabWithDecision(agent.Name, req); err != nil {
 		t.Fatal(err)
 	}
-	if lc.Inventory.Owner.SessionGeneration != 42 || len(calls) != 1 {
+	if lc.Inventory.Owner.SessionGeneration != 42 || len(calls) != 2 {
 		t.Fatalf("standing lane was not reused exactly: generation=%d calls=%v", lc.Inventory.Owner.SessionGeneration, calls)
 	}
 }
@@ -871,7 +1349,10 @@ func TestStandingResumeRecoversGenerationAfterCoordinatorRestart(t *testing.T) {
 	toolChildMu.Unlock()
 	runHerdr = func(args ...string) (string, error) {
 		if len(args) == 2 && args[0] == "agent" && args[1] == "list" {
-			return fmt.Sprintf(`{"result":{"agents":[{"name":%q,"agent":%q,"agent_status":"working","pane_id":%q,"tab_id":%q,"agent_session":{"value":%q}}]}}`, agent.Name, agent.Kind, agent.PaneID, agent.TabID, agent.Session.Value), nil
+			return fmt.Sprintf(`{"result":{"agents":[{"name":%q,"agent":%q,"agent_status":"working","pane_id":%q,"tab_id":%q,"workspace_id":%q,"agent_session":{"value":%q}}]}}`, agent.Name, agent.Kind, agent.PaneID, agent.TabID, agent.Workspace, agent.Session.Value), nil
+		}
+		if len(args) == 2 && args[0] == "tab" && args[1] == "list" {
+			return fmt.Sprintf(`{"result":{"tabs":[{"tab_id":%q,"label":"Herdforge · forge-worker","workspace_id":%q}]}}`, agent.TabID, agent.Workspace), nil
 		}
 		return "", fmt.Errorf("unexpected process or tab side effect: %v", args)
 	}
