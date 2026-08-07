@@ -845,13 +845,12 @@ func (b *FenceBroker) handleStatusMutate(w http.ResponseWriter, r *http.Request,
 			return err
 		}
 
-		// Upstream is stock Kaneo under the broker; force PUT schema path used by
-	// hermetic/sandbox boards (PATCH is not accepted by the AtomicFence test board).
-	prevAtomic := b.upstream.AtomicFenceServer
-	b.upstream.AtomicFenceServer = true
-	upErr := b.upstream.mutateStatus(context.WithoutCancel(ctx), boardTaskID, status)
-	b.upstream.AtomicFenceServer = prevAtomic
-	if err := upErr; err != nil {
+		// Upstream is stock Kaneo under the broker. Use the full-schema PUT
+		// path without toggling shared AtomicFenceServer (data race under
+		// concurrent multi-task mutates; also a correctness flip if another
+		// request restores prevAtomic mid-flight).
+		upErr := b.upstream.mutateStatusFullSchemaPUT(context.WithoutCancel(ctx), boardTaskID, status)
+		if err := upErr; err != nil {
 			// Do NOT reset pending: arbitrary provider errors are not pre-commit proof.
 			return fmt.Errorf("%w: after in_flight (no remutate): %v", errAmbiguousFailClosed, err)
 		}

@@ -298,53 +298,7 @@ func (k *KaneoProvider) mutateStatus(ctx context.Context, taskID, status string)
 
 	// AtomicFenceServer without FenceBroker: full-schema PUT (hermetic boards).
 	if k.AtomicFenceServer {
-		apiURL := strings.TrimSpace(k.APIURL)
-		if apiURL == "" {
-			return fmt.Errorf("kaneo: APIURL required for AtomicFenceServer mutate")
-		}
-		payload := map[string]any{"status": status}
-		if cur, err := k.GetTask(ctx, taskID); err == nil && cur != nil {
-			title := cur.Title
-			if title == "" {
-				title = taskID
-			}
-			priority := string(cur.Priority)
-			if priority == "" {
-				priority = "medium"
-			}
-			projectID := cur.ProjectID
-			if projectID == "" {
-				projectID = k.ProjectID
-			}
-			payload = map[string]any{
-				"title": title, "description": cur.Description, "status": status,
-				"priority": priority, "projectId": projectID, "position": cur.Position,
-			}
-		}
-		body, _ := json.Marshal(payload)
-		url := fmt.Sprintf("%s/api/task/%s", strings.TrimRight(apiURL, "/"), taskID)
-		req, err := http.NewRequestWithContext(ctx, http.MethodPut, url, bytes.NewBuffer(body))
-		if err != nil {
-			return err
-		}
-		req.Header.Set("Content-Type", "application/json")
-		k.authorizeKaneo(req)
-		AttachFenceHeaders(ctx, req.Header.Set)
-		resp, err := k.httpClient().Do(req)
-		if err != nil {
-			return err
-		}
-		if err := DecodeJSONResponse(resp, nil); err != nil {
-			if pe, ok := err.(*ProviderError); ok {
-				pe.Provider = "kaneo"
-				pe.Op = "UpdateStatus"
-				if pe.StatusCode == http.StatusConflict {
-					return fmt.Errorf("%w: %v", claim.ErrProviderFenceRejected, pe)
-				}
-			}
-			return err
-		}
-		return nil
+		return k.mutateStatusFullSchemaPUT(ctx, taskID, status)
 	}
 
 	// Unfenced path: stock Kaneo PATCH (main production shape).
@@ -373,6 +327,63 @@ func (k *KaneoProvider) mutateStatus(ctx context.Context, taskID, status string)
 		if pe, ok := err.(*ProviderError); ok {
 			pe.Provider = "kaneo"
 			pe.Op = "UpdateStatus"
+		}
+		return err
+	}
+	return nil
+}
+
+// mutateStatusFullSchemaPUT rebuilds a full task PUT body for hermetic /
+// broker-upstream boards that reject PATCH. Position is only included when
+// GetTask reported HasPosition — never clobber board rank with a zero default.
+// Safe for concurrent callers: does not toggle shared AtomicFenceServer.
+func (k *KaneoProvider) mutateStatusFullSchemaPUT(ctx context.Context, taskID, status string) error {
+	apiURL := strings.TrimSpace(k.APIURL)
+	if apiURL == "" {
+		return fmt.Errorf("kaneo: APIURL required for AtomicFenceServer mutate")
+	}
+	payload := map[string]any{"status": status}
+	if cur, err := k.GetTask(ctx, taskID); err == nil && cur != nil {
+		title := cur.Title
+		if title == "" {
+			title = taskID
+		}
+		priority := string(cur.Priority)
+		if priority == "" {
+			priority = "medium"
+		}
+		projectID := cur.ProjectID
+		if projectID == "" {
+			projectID = k.ProjectID
+		}
+		payload = map[string]any{
+			"title": title, "description": cur.Description, "status": status,
+			"priority": priority, "projectId": projectID,
+		}
+		if cur.HasPosition {
+			payload["position"] = cur.Position
+		}
+	}
+	body, _ := json.Marshal(payload)
+	url := fmt.Sprintf("%s/api/task/%s", strings.TrimRight(apiURL, "/"), taskID)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, url, bytes.NewBuffer(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	k.authorizeKaneo(req)
+	AttachFenceHeaders(ctx, req.Header.Set)
+	resp, err := k.httpClient().Do(req)
+	if err != nil {
+		return err
+	}
+	if err := DecodeJSONResponse(resp, nil); err != nil {
+		if pe, ok := err.(*ProviderError); ok {
+			pe.Provider = "kaneo"
+			pe.Op = "UpdateStatus"
+			if pe.StatusCode == http.StatusConflict {
+				return fmt.Errorf("%w: %v", claim.ErrProviderFenceRejected, pe)
+			}
 		}
 		return err
 	}

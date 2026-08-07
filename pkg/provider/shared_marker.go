@@ -277,6 +277,19 @@ func ValidateSharedMarker(dir string) error {
 	return nil
 }
 
+// ReadVolumeSeal returns the durable volume_seal from fences.db under claimDir.
+// Used by `herd fence-provision` to print the mint for fleet distribution.
+func ReadVolumeSeal(claimDir string) (string, error) {
+	if claimDir == "" {
+		return "", fmt.Errorf("provider: empty claim dir")
+	}
+	abs, err := filepath.Abs(claimDir)
+	if err != nil {
+		return "", err
+	}
+	return readDBVolumeSeal(filepath.Join(abs, fencesDBLeaf))
+}
+
 // ProvisionSharedFenceForTest provisions sealed fence store + env for tests.
 func ProvisionSharedFenceForTest(t interface {
 	Helper()

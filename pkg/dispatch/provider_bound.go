@@ -116,6 +116,11 @@ func (d *Dispatcher) listTasksBound(ctx context.Context, projectID, status strin
 }
 
 func (d *Dispatcher) updateStatusBound(ctx context.Context, taskID, status string) error {
+	// When a ClaimStack is wired (production FAC-147), fail closed unless
+	// the caller uses updateStatusFenced with a live lease generation.
+	if d != nil && d.Claims != nil {
+		return fmt.Errorf("dispatch: Claims is set; use updateStatusFenced with a live lease (FAC-147 fail-closed)")
+	}
 	d.ensureDeadlinesApplied()
 	opCtx, cancel := provider.BoundOp(ctx, d.deadlines(), provider.OpMutate)
 	defer cancel()
@@ -124,11 +129,71 @@ func (d *Dispatcher) updateStatusBound(ctx context.Context, taskID, status strin
 	return err
 }
 
+// updateStatusFenced applies board status under ClaimStack MutateStatusGuarded
+// (Begin/Complete + FencedCAS + AdvanceFence on the acquired generation).
+func (d *Dispatcher) updateStatusFenced(ctx context.Context, task *provider.Task, role, status string) error {
+	if d == nil || d.Claims == nil {
+		return fmt.Errorf("dispatch: updateStatusFenced requires Claims")
+	}
+	if task == nil {
+		return fmt.Errorf("dispatch: updateStatusFenced requires task")
+	}
+	if d.Config == nil {
+		return fmt.Errorf("dispatch: updateStatusFenced requires Config")
+	}
+	owner, err := provider.ProcessOwnerID()
+	if err != nil || owner == "" {
+		return fmt.Errorf("process owner identity: %w", err)
+	}
+	taskRole, err := provider.TaskOwnershipRole(task, role)
+	if err != nil {
+		return err
+	}
+	key := provider.LeaseKey(".", d.Config.TaskProvider.Type, d.Config.TaskProvider.ProjectID, task.Ref)
+	d.ensureDeadlinesApplied()
+	opCtx, cancel := provider.BoundOp(ctx, d.deadlines(), provider.OpMutate)
+	defer cancel()
+	_, err = d.Claims.MutateStatusGuarded(opCtx, key, owner, taskRole, taskRole, task.ID, status)
+	d.health.observe(err)
+	return err
+}
+
 func (d *Dispatcher) addCommentBound(ctx context.Context, taskID, body string) error {
+	if d != nil && d.Claims != nil {
+		return fmt.Errorf("dispatch: Claims is set; use addCommentFenced with a live lease (FAC-147 fail-closed)")
+	}
 	d.ensureDeadlinesApplied()
 	opCtx, cancel := provider.BoundOp(ctx, d.deadlines(), provider.OpComment)
 	defer cancel()
 	err := d.TaskProvider.AddComment(opCtx, taskID, body)
+	d.health.observe(err)
+	return err
+}
+
+// addCommentFenced posts a board comment under ClaimStack MutateCommentGuarded.
+func (d *Dispatcher) addCommentFenced(ctx context.Context, task *provider.Task, role, body string) error {
+	if d == nil || d.Claims == nil {
+		return fmt.Errorf("dispatch: addCommentFenced requires Claims")
+	}
+	if task == nil {
+		return fmt.Errorf("dispatch: addCommentFenced requires task")
+	}
+	if d.Config == nil {
+		return fmt.Errorf("dispatch: addCommentFenced requires Config")
+	}
+	owner, err := provider.ProcessOwnerID()
+	if err != nil || owner == "" {
+		return fmt.Errorf("process owner identity: %w", err)
+	}
+	taskRole, err := provider.TaskOwnershipRole(task, role)
+	if err != nil {
+		return err
+	}
+	key := provider.LeaseKey(".", d.Config.TaskProvider.Type, d.Config.TaskProvider.ProjectID, task.Ref)
+	d.ensureDeadlinesApplied()
+	opCtx, cancel := provider.BoundOp(ctx, d.deadlines(), provider.OpComment)
+	defer cancel()
+	_, err = d.Claims.MutateCommentGuarded(opCtx, key, owner, taskRole, taskRole, task.ID, body)
 	d.health.observe(err)
 	return err
 }

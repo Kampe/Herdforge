@@ -33,7 +33,10 @@ type Task struct {
 	// footer after an atomic status PUT (FAC-147). Not a native Kaneo field.
 	StatusReceipt string `json:"-"`
 	// Position is Kaneo's board rank; required for full-schema PUT rebuilds.
-	Position float64 `json:"-"`
+	// HasPosition is true only when the provider returned a position field —
+	// zero is a valid board rank and must not be confused with "unknown".
+	Position    float64 `json:"-"`
+	HasPosition bool    `json:"-"`
 }
 
 // TaskProvider defines the interface for task tracking backends (Kaneo, GitHub, Linear)

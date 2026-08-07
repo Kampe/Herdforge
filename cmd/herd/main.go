@@ -227,6 +227,12 @@ func main() {
 	case "approve":
 		runApprove()
 
+	case "fence-provision":
+		runFenceProvision()
+
+	case "fence-broker":
+		runFenceBroker()
+
 	case "board-done":
 		runBoardDone()
 
@@ -1815,6 +1821,13 @@ func runApprove() {
 		return provider.CompareRefs(tasks[i].Ref, tasks[j].Ref) < 0
 	})
 
+	stack, stackErr := loadClaimStack(tp)
+	if stackErr != nil {
+		fmt.Fprintf(os.Stderr, "claim stack: %v\n", stackErr)
+		os.Exit(1)
+	}
+	defer stack.Close()
+
 	approved, refused, failed := 0, 0, 0
 	for _, task := range tasks {
 		req, closeAuthority, buildErr := buildDoneRequest(".", cfg.TaskProvider.ProjectID, task.Ref, receiptPathArg, override)
@@ -1824,7 +1837,7 @@ func runApprove() {
 			failed++
 			continue
 		}
-		res, err := hsync.BoardDone(ctx, tp, req)
+		res, err := fencedBoardDone(ctx, cfg, tp, stack, task, req)
 		closeAuthority()
 		switch {
 		case err == nil:
@@ -1833,6 +1846,7 @@ func runApprove() {
 			} else {
 				fmt.Printf("APPROVED [%s]: %s\n  proof: %s\n", res.Ref, task.Title, res.Proof)
 			}
+			releaseScopeClaimQuietly(res.Ref)
 			approved++
 		case errors.Is(err, hsync.ErrNoEvidence):
 			fmt.Printf("REFUSED  [%s]: %s\n  %v\n", task.Ref, task.Title, err)
@@ -1901,13 +1915,26 @@ func runBoardDone() {
 		os.Exit(1)
 	}
 
+	ctx := context.Background()
+	task, err := resolveTaskByRef(ctx, tp, cfg.TaskProvider.ProjectID, ref)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "herd board-done: %v\n", err)
+		os.Exit(1)
+	}
+	stack, stackErr := loadClaimStack(tp)
+	if stackErr != nil {
+		fmt.Fprintf(os.Stderr, "herd board-done: claim stack: %v\n", stackErr)
+		os.Exit(1)
+	}
+	defer stack.Close()
+
 	req, closeAuthority, buildErr := buildDoneRequest(".", cfg.TaskProvider.ProjectID, ref, *receiptPath, override)
 	if buildErr != nil {
 		closeAuthority()
 		fmt.Fprintf(os.Stderr, "herd board-done: %v\n", buildErr)
 		os.Exit(1)
 	}
-	res, err := hsync.BoardDone(context.Background(), tp, req)
+	res, err := fencedBoardDone(ctx, cfg, tp, stack, task, req)
 	closeAuthority()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "herd board-done: %v\n", err)
@@ -2555,6 +2582,14 @@ func dispatchTicketDecision(ctx context.Context, req dispatchRequest, announce i
 	expectedRevision, expectedFiles := publishedGraphBinding(".")
 	d := dispatch.NewProductionDispatcherWithAuthorities(cfg, tp, wm,
 		scopeVerifier, scopeVerifier, expectedRevision, expectedFiles)
+	// FAC-147: production board mutations go through ClaimStack Begin/Complete.
+	stack, stackErr := loadClaimStack(tp)
+	if stackErr != nil {
+		fmt.Fprintf(os.Stderr, "claim stack: %v\n", stackErr)
+		os.Exit(1)
+	}
+	defer stack.Close()
+	d.Claims = stack
 	closeControl, err := configureProductionControl(d, ".")
 	if err != nil {
 		return nil, nil, fmt.Errorf("control store init failed: %w", err)
@@ -3244,12 +3279,20 @@ func runForgeE() error {
 	}
 
 	fmt.Println("\n=== Forge: Review ===")
+	stack, stackErr := loadClaimStack(tp)
+	if stackErr != nil {
+		fmt.Fprintf(os.Stderr, "claim stack: %v\n", stackErr)
+		os.Exit(1)
+	}
+	defer stack.Close()
 	tasks, err := tp.ListTasks(ctx, cfg.TaskProvider.ProjectID, "in-progress")
 	if err == nil && len(tasks) > 0 {
 		t := tasks[0]
 		fmt.Printf("Selected [%s]: %s for review\n", t.Ref, t.Title)
-		if err := tp.UpdateStatus(ctx, t.ID, "in-review"); err == nil {
-			fmt.Printf("  -> moved to 'in-review' status\n")
+		if err := fencedBoardStatus(ctx, cfg, stack, t, "reviewer", "in-review"); err != nil {
+			fmt.Printf("  -> fenced in-review failed: %v\n", err)
+		} else {
+			fmt.Printf("  -> moved to 'in-review' status (fenced)\n")
 		}
 	}
 
@@ -3263,13 +3306,14 @@ func runForgeE() error {
 				fmt.Printf("Not approved [%s]: %v\n", t.Ref, buildErr)
 				continue
 			}
-			res, err := hsync.BoardDone(ctx, tp, req)
+			res, err := fencedBoardDone(ctx, cfg, tp, stack, t, req)
 			closeAuthority()
 			if err != nil {
 				fmt.Printf("Not approved [%s]: %v\n", t.Ref, err)
 				continue
 			}
 			fmt.Printf("Approved [%s]: %s (proof: %s)\n", res.Ref, t.Title, res.Proof)
+			releaseScopeClaimQuietly(res.Ref)
 		}
 	}
 

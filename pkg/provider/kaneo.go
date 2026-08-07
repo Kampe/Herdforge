@@ -434,7 +434,11 @@ type kaneoTaskDTO struct {
 	Priority    string       `json:"priority"`
 	ProjectId   string       `json:"projectId"`
 	CreatedAt   string       `json:"createdAt"`
-	Labels      []kaneoLabel `json:"labels"`
+	UpdatedAt   string       `json:"updatedAt"`
+	// Position is a pointer so JSON null/absent is distinguishable from 0
+	// (board rank 0 is valid and must survive full-schema PUT rebuilds).
+	Position *float64     `json:"position"`
+	Labels   []kaneoLabel `json:"labels"`
 }
 
 func dtoToTask(dto kaneoTaskDTO) *Task {
@@ -443,7 +447,7 @@ func dtoToTask(dto kaneoTaskDTO) *Task {
 		labels = append(labels, l.Name)
 	}
 	createdAt, _ := time.Parse(time.RFC3339, dto.CreatedAt)
-	return &Task{
+	t := &Task{
 		ID:          dto.ID,
 		Ref:         dto.Ref,
 		Title:       dto.Title,
@@ -454,6 +458,16 @@ func dtoToTask(dto kaneoTaskDTO) *Task {
 		Labels:      labels,
 		CreatedAt:   createdAt,
 	}
+	if dto.UpdatedAt != "" {
+		if u, err := time.Parse(time.RFC3339, dto.UpdatedAt); err == nil {
+			t.UpdatedAt = u
+		}
+	}
+	if dto.Position != nil {
+		t.Position = *dto.Position
+		t.HasPosition = true
+	}
+	return t
 }
 
 // kaneoTaskMatches reports whether dto is exactly the requested task by id or ref.
