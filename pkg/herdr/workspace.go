@@ -82,6 +82,7 @@ func ResolveWorkspaceWithConfig(repoRoot string, cfg *config.Config) string {
 //  2. label match against repo directory name
 //  3. focused workspace from the live list
 //  4. error — unknown workspace is a hard failure
+//
 // Config fleet.herdr_workspace is intentionally not consulted here: fail-closed
 // dispatch must not silently adopt a soft config override without env/list proof.
 func RequireWorkspace(repoRoot string) (string, error) {

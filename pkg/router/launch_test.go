@@ -123,15 +123,22 @@ func TestProbeRequiredModelNeedsMatchingProbe(t *testing.T) {
 	}
 }
 
-func TestWorkerEffortComesFromShapeLadder(t *testing.T) {
+func TestWorkerEffortUsesShapeUnlessExplicitlyRequested(t *testing.T) {
 	base := LaunchRequest{Role: RoleWorker, Shape: "implementation", RequestedProvider: "codex", RequestedModel: "gpt-5.6-luna"}
 	if got := EffortForRequest(base); got != EffortFor("implementation") {
 		t.Fatalf("worker effort = %q, want shape ladder %q", got, EffortFor("implementation"))
 	}
 	base.RequestedEffort = "medium"
 	base.ProbeResults = map[string]bool{ProbeKey("codex", "gpt-5.6-luna"): true}
-	if _, err := testRouter(nil, "codex").Decide(base); err != nil {
+	if got := EffortForRequest(base); got != "medium" {
+		t.Fatalf("hard requested effort = %q, want medium", got)
+	}
+	d, err := testRouter(nil, "codex").Decide(base)
+	if err != nil {
 		t.Fatalf("explicit medium rejected: %v", err)
+	}
+	if d.Effort != "medium" {
+		t.Fatalf("decision effort = %q, want medium", d.Effort)
 	}
 }
 
@@ -253,9 +260,9 @@ func TestDecideWorkerPicksModelAndEffort(t *testing.T) {
 	if d.Role != RoleWorker {
 		t.Fatalf("role = %s", d.Role)
 	}
-	// Effort must come from router policy (the shape ladder), not a harness default.
-	if d.Effort != EffortFor("implementation") {
-		t.Fatalf("worker effort = %q, want %q", d.Effort, EffortFor("implementation"))
+	// An explicit hard effort request is authoritative.
+	if d.Effort != "medium" {
+		t.Fatalf("worker effort = %q, want medium", d.Effort)
 	}
 	if len(d.Argv) == 0 {
 		t.Fatal("argv must be populated from decision")

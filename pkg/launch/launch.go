@@ -30,6 +30,9 @@ const (
 	HarvestRole          = "harvest"
 	RecoverySentinelRole = "recovery-sentinel"
 	Implementation       = "implementation"
+	WorkerProvider       = "codex"
+	WorkerModel          = "gpt-5.6-luna"
+	WorkerEffort         = "medium"
 )
 
 // Request is the complete, durable identity of one process launch.
@@ -257,11 +260,25 @@ func equalStrings(a, b []string) bool {
 // narrow: coordinator-only models can never enter a worker boundary.
 func Validate(req Request, sink Sink) error {
 	role, shape, provider, model, effort, _, argv := fields(req)
-	if role == "" || shape == "" || provider == "" || model == "" || effort == "" || len(argv) == 0 {
+	if req.Decision == nil || role == "" || shape == "" || provider == "" || model == "" || effort == "" || len(argv) == 0 || strings.TrimSpace(req.Decision.Harness) == "" || len(req.Decision.HarnessArgv) == 0 {
 		return reject(req, sink, "an actual compiled LaunchDecision with role, task shape, provider, model, effort, and argv is required")
 	}
 	if err := router.VerifyDecisionForScope(req.Decision, req.TaskRef, req.LeaseGeneration, req.Scope); err != nil {
 		return reject(req, sink, err.Error())
+	}
+	wantHarness, wantHarnessArgv, err := router.HarnessArgvFor(provider, model, effort)
+	if err != nil {
+		return reject(req, sink, "launch harness does not match routed provider/model/effort")
+	}
+	if req.Decision.HarnessSession != "" {
+		sessionPath := filepath.Clean(strings.TrimSpace(req.Decision.HarnessSession))
+		if sessionPath == "." || !filepath.IsAbs(sessionPath) {
+			return reject(req, sink, "launch harness session path is not absolute")
+		}
+		wantHarnessArgv = append(wantHarnessArgv, "--session", sessionPath)
+	}
+	if normalized(req.Decision.Harness) != normalized(wantHarness) || !equalStrings(req.Decision.HarnessArgv, wantHarnessArgv) {
+		return reject(req, sink, "launch harness does not match routed provider/model/effort/session")
 	}
 	role, shape, provider, model, effort = normalized(role), normalized(shape), normalized(provider), normalized(model), normalized(effort)
 	validShape := map[string]bool{"coordinator": true, "architecture": true, "implementation": true, "research": true, "bounded": true, "advisory": true, "qa-light": true, "qa": true, "adversarial": true}

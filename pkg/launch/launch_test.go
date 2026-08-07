@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -26,7 +27,7 @@ func testRouter(t *testing.T) *router.SurfaceRouter {
 	t.Setenv("HERDR_ROUTE_STATE_DIR", t.TempDir())
 	r := router.NewRouter(nil, nil)
 	r.Probes = &router.Probes{
-		CLIPresent: func(cli string) bool { return cli == testWorkerProvider },
+		CLIPresent: func(cli string) bool { return cli == router.PiHarness },
 		Now:        func() time.Time { return time.Unix(1_800_000_000, 0) },
 	}
 	return r
@@ -238,5 +239,67 @@ func TestEditedRouterDecisionFailsProof(t *testing.T) {
 	}
 	if err := Validate(r, &MemorySink{}); err == nil {
 		t.Fatalf("edited routed decision must fail proof verification (effort now %q)", r.Decision.Effort)
+	}
+}
+
+func TestValidateRejectsHarnessMutation(t *testing.T) {
+	for name, mutate := range map[string]func(*router.LaunchDecision){
+		"harness": func(d *router.LaunchDecision) { d.Harness = "codex" },
+		"argv": func(d *router.LaunchDecision) {
+			d.HarnessArgv = append([]string(nil), d.HarnessArgv...)
+			d.HarnessArgv[2] = "openai-codex/gpt-5.6-sol"
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			req := good(t)
+			decision := *req.Decision
+			mutate(&decision)
+			req.Decision = &decision
+			if err := Validate(req, nil); err == nil {
+				t.Fatal("mutated harness accepted")
+			}
+		})
+	}
+}
+
+func TestDecisionDigestBindsHarnessArgv(t *testing.T) {
+	a, b := good(t), good(t)
+	b.Decision.HarnessArgv = append([]string(nil), b.Decision.HarnessArgv...)
+	b.Decision.HarnessArgv[2] = "openai-codex/gpt-5.6-sol"
+	if DecisionDigest(a.Decision) == DecisionDigest(b.Decision) {
+		t.Fatal("decision digest must change when signed harness argv changes")
+	}
+}
+
+func TestValidateAcceptsBoundPiSession(t *testing.T) {
+	req := good(t)
+	bound, err := router.BindHarnessSession(req.Decision, filepath.Join(t.TempDir(), "launch.jsonl"))
+	if err != nil {
+		t.Fatalf("bind harness session: %v", err)
+	}
+	req.Decision = bound
+	if err := Validate(req, nil); err != nil {
+		t.Fatalf("bound Pi session rejected: %v", err)
+	}
+
+	for name, mutate := range map[string]func(*router.LaunchDecision){
+		"session": func(d *router.LaunchDecision) {
+			d.HarnessSession = filepath.Join(t.TempDir(), "mutated.jsonl")
+		},
+		"argv-path": func(d *router.LaunchDecision) {
+			d.HarnessArgv = append([]string(nil), d.HarnessArgv...)
+			d.HarnessArgv[len(d.HarnessArgv)-1] = filepath.Join(t.TempDir(), "mutated.jsonl")
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			decision := *req.Decision
+			decision.HarnessArgv = append([]string(nil), req.Decision.HarnessArgv...)
+			mutate(&decision)
+			mutated := req
+			mutated.Decision = &decision
+			if err := Validate(mutated, nil); err == nil {
+				t.Fatal("mutated bound session accepted")
+			}
+		})
 	}
 }

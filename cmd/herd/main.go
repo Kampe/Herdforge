@@ -438,16 +438,21 @@ project:
   default_branch: "main"
 
 task_provider:
-  type: "kaneo"
-  project_id: "your-project-id"
-  api_url: "https://kanban-api.kampe.kluster"
+  type: "linear"
+  project_id: "your-linear-project-id"
+  api_key_env: "LINEAR_API_KEY"
 
 lanes:
   - name: "worker"
     role: "worker"
-    agent_kind: "opencode"
-    model: "opencode/deepseek-v4-flash"
+    agent_kind: "pi"
+    harness: "pi"
     prompt: ".herd/prompts/worker.md"
+    worktree: ".worktrees/worker"
+    provider: "codex"
+    model: "gpt-5.6-luna"
+    effort: "medium"
+    task_shape: "implementation"
 
 verification:
   test_command: "go test ./..."
@@ -484,41 +489,44 @@ project:
   repo_url: "https://github.com/user/my-herd-app.git"
 
 task_provider:
-  type: "kaneo"
-  workspace_id: "your-workspace-id"
-  project_id: "your-project-id"
-  api_url: "https://kanban-api.kampe.kluster"
-  use_cli: true
+  type: "linear"
+  project_id: "your-linear-project-id"
+  api_key_env: "LINEAR_API_KEY"
 
 # Agent lanes — each lane runs in a herdr workspace tab
-# All lanes default to deepseek-v4-flash via opencode for cheap self-forging
 lanes:
   - name: "forge-smith"
     role: "forge-smith"
-    agent_kind: "opencode"
-    harness: "opencode"
+    agent_kind: "pi"
+    harness: "pi"
     prompt: ".herd/prompts/smith.md"
     worktree: ".worktrees/smith"
-    provider: "deepseek"
-    model: "opencode/deepseek-v4-flash"
+    provider: "codex"
+    model: "gpt-5.6-luna"
+    effort: "medium"
+    task_shape: "implementation"
 
   - name: "worker"
     role: "worker"
-    agent_kind: "opencode"
-    harness: "opencode"
+    agent_kind: "pi"
+    harness: "pi"
     prompt: ".herd/prompts/worker.md"
     worktree: ".worktrees/worker"
-    provider: "deepseek"
-    model: "opencode/deepseek-v4-flash"
+    provider: "codex"
+    model: "gpt-5.6-luna"
+    effort: "medium"
+    task_shape: "implementation"
 
   - name: "reviewer"
     role: "reviewer"
-    agent_kind: "opencode"
-    harness: "opencode"
+    agent_kind: "pi"
+    harness: "pi"
     prompt: ".herd/prompts/reviewer.md"
     worktree: ".worktrees/reviewer"
-    provider: "deepseek"
-    model: "opencode/deepseek-v4-flash"
+    provider: "claude"
+    model: "claude-sonnet-5"
+    effort: "medium"
+    task_shape: "qa"
 
 verification:
   test_command: "go test ./..."
@@ -804,7 +812,7 @@ func runPulse() {
 				fmt.Fprintf(os.Stderr, "failed to create herdr tab: %v\n", err)
 				os.Exit(1)
 			}
-			if err := herdr.StartPreparedAgent(tab.ID, tabLabel, decision.Provider, tab.Pane.ID, taskLaunchRequest(decision, task.Ref, repository, lane.Name)); err != nil {
+			if err := herdr.StartPreparedAgent(tab.ID, tabLabel, decision.Harness, tab.Pane.ID, taskLaunchRequest(decision, task.Ref, repository, lane.Name)); err != nil {
 				fmt.Fprintf(os.Stderr, "failed to start agent: %v\n", err)
 				os.Exit(1)
 			}
@@ -1192,7 +1200,7 @@ func runStandingConfig(cfg *config.Config, herdrAvailable bool) error {
 			continue
 		}
 
-		if err := herdr.StartPreparedAgent(tab.ID, tabLabel, decision.Provider, tab.Pane.ID, launch.Request{Decision: decision, TaskRef: lane.Name, Scope: router.ScopeLane, Repository: repository, Lane: lane.Name}); err != nil {
+		if err := herdr.StartPreparedAgent(tab.ID, tabLabel, decision.Harness, tab.Pane.ID, launch.Request{Decision: decision, TaskRef: lane.Name, Scope: router.ScopeLane, Repository: repository, Lane: lane.Name}); err != nil {
 			fmt.Fprintf(os.Stderr, "  failed to start agent for lane %s: %v\n", lane.Name, err)
 			failures = append(failures, fmt.Errorf("lane %s start agent: %w", lane.Name, err))
 			continue
@@ -1285,7 +1293,7 @@ func runUp() {
 		os.Exit(1)
 	}
 	tabLabel := fmt.Sprintf("forge-%s", lane.Name)
-	if err := herdr.StartPreparedAgent(tab.ID, tabLabel, decision.Provider, tab.Pane.ID, launch.Request{Decision: decision, TaskRef: lane.Name, Scope: router.ScopeLane, Repository: repository, Lane: lane.Name}); err != nil {
+	if err := herdr.StartPreparedAgent(tab.ID, tabLabel, decision.Harness, tab.Pane.ID, launch.Request{Decision: decision, TaskRef: lane.Name, Scope: router.ScopeLane, Repository: repository, Lane: lane.Name}); err != nil {
 		fmt.Fprintf(os.Stderr, "failed to start agent: %v\n", err)
 		os.Exit(1)
 	}
@@ -1517,7 +1525,7 @@ func runReview() {
 				fmt.Fprintf(os.Stderr, "failed to create herdr tab: %v\n", tabErr)
 				os.Exit(1)
 			}
-			if err := herdr.StartPreparedAgent(tab.ID, tabLabel, decision.Provider, tab.Pane.ID, taskLaunchRequest(decision, task.Ref, repositoryIdentityForLaunch(cfg), lane.Name)); err != nil {
+			if err := herdr.StartPreparedAgent(tab.ID, tabLabel, decision.Harness, tab.Pane.ID, taskLaunchRequest(decision, task.Ref, repositoryIdentityForLaunch(cfg), lane.Name)); err != nil {
 				fmt.Fprintf(os.Stderr, "failed to start agent: %v\n", err)
 				os.Exit(1)
 			}
@@ -2217,6 +2225,7 @@ func runDispatch() {
 		fmt.Fprintf(os.Stderr, "lane identity: %v\n", err)
 		os.Exit(1)
 	}
+	laneName = canonicalLane.Name
 
 	tp, tpErr := loadTaskProvider(cfg)
 	if tpErr != nil {
@@ -2292,19 +2301,11 @@ func runDispatch() {
 			return dispatchErr
 		})
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "launch route rejected before dispatch: %v\n", err)
+			fmt.Fprintf(os.Stderr, "dispatch launch failed: %v\n", err)
 			os.Exit(1)
 		}
-		// Validate against the context the decision was MINTED with. This
-		// admission mints at lane scope (routedLaneDecision is given a nil
-		// task), so checking it against the ticket ref could never match and
-		// rejected every dispatch. Dispatch itself rebinds the decision to the
-		// task ref and lease generation once the lease is held, and revalidates
-		// there — that is where task-scope proof belongs.
-		if err := validateDecisionBeforeSideEffect(decision, lane.Name); err != nil {
-			fmt.Fprintf(os.Stderr, "launch decision rejected before dispatch: %v\n", err)
-			os.Exit(1)
-		}
+		// launchAdmission already validated lane capability before any side effect.
+		// Dispatch rebinds/validates the exact task+lease after claim; never post-validate a lane decision against a task ref.
 	}
 	fmt.Printf("Dispatching %s to lane '%s'...\n", ticketRef, laneName)
 
@@ -2933,7 +2934,7 @@ func runForgeE() error {
 					}
 					tab, tabErr := herdr.TabCreateForTask(herdr.ResolveWorkspace("."), tabLabel, cwd, true)
 					if tabErr == nil {
-						if err := herdr.StartPreparedAgent(tab.ID, tabLabel, decision.Provider, tab.Pane.ID, taskLaunchRequest(decision, task.Ref, repositoryIdentityForLaunch(cfg), lane.Name)); err != nil {
+						if err := herdr.StartPreparedAgent(tab.ID, tabLabel, decision.Harness, tab.Pane.ID, taskLaunchRequest(decision, task.Ref, repositoryIdentityForLaunch(cfg), lane.Name)); err != nil {
 							return fmt.Errorf("launch failed: %w", err)
 						}
 					} else {
@@ -3049,15 +3050,15 @@ func laneLaunchDecision(ctx context.Context, lane *config.LaneDef, task *provide
 			scope = router.ScopeCandidate
 		}
 	}
-	// Lane provider/model/effort are SOFT pins, so they go through the
-	// Preferred* channel, not the hard Requested* one. Requested* narrows the
-	// waterfall to a single surface (an exhausted pool then yields zero
-	// candidates); dropping the lane values entirely was worse still — every
-	// lane silently launched on the waterfall head, moving the reviewer lane
-	// onto Opus and the harvest/verification lanes onto a flash model.
-	request := router.LaunchRequest{
-		Role: role, Shape: shape, TaskRef: contextRef, Scope: scope, Risk: classify.TierR1,
-		PreferredProvider: provider, PreferredModel: lane.Model,
+	pinnedBuilder := role == router.RoleWorker || role == router.RoleForgeSmith || role == router.RoleRecovery
+	request := router.LaunchRequest{Role: role, Shape: shape, TaskRef: contextRef, Scope: scope, Risk: classify.TierR1}
+	if pinnedBuilder {
+		request.RequestedProvider = provider
+		request.RequestedModel = lane.Model
+		request.RequestedEffort = lane.Effort
+	} else {
+		request.PreferredProvider = provider
+		request.PreferredModel = lane.Model
 	}
 	if role == router.RoleReviewer || role == router.RoleAssayer {
 		if task == nil {
@@ -3102,7 +3103,15 @@ func laneLaunchDecision(ctx context.Context, lane *config.LaneDef, task *provide
 		probes[key] = herdr.ProbeProviderModel(ctx, cp, cm, lane.Effort).Available
 	}
 	if router.ModelRequiresProbe(model) {
-		probes[router.ProbeKey(provider, model)] = herdr.ProbeProviderModel(ctx, provider, model, lane.Effort).Available
+		probe := herdr.ProbeProviderModel(ctx, provider, model, lane.Effort)
+		probes[router.ProbeKey(provider, model)] = probe.Available
+		if pinnedBuilder && !probe.Available {
+			reason := strings.TrimSpace(probe.Reason)
+			if reason == "" {
+				reason = "unknown probe failure"
+			}
+			return nil, fmt.Errorf("lane %q configured probe %s/%s unavailable: %s", lane.Name, provider, model, reason)
+		}
 	}
 	if len(probes) > 0 {
 		request.ProbeResults = probes
@@ -3111,18 +3120,18 @@ func laneLaunchDecision(ctx context.Context, lane *config.LaneDef, task *provide
 	if err != nil {
 		return nil, err
 	}
-	// Lane provider/model/effort are SOFT pins (see .herd/herd.yaml): they are
-	// the preference handed to the router, not a contract the live decision
-	// must reproduce. Requiring equality made every quota-driven reroute look
-	// like drift and stranded the lane the moment its preferred pool filled.
-	// The task SHAPE is the hard part of a lane's identity, so keep that bound.
 	if decision.Shape != lane.TaskShape {
 		return nil, fmt.Errorf("lane %q routed shape drift: configured %s, got %s", lane.Name, lane.TaskShape, decision.Shape)
 	}
-	if decision.Provider != lane.Provider || decision.Model != lane.Model || decision.Effort != lane.Effort {
-		fmt.Fprintf(os.Stderr, "herd: lane %q rerouted by quota: %s/%s/%s -> %s/%s/%s (%s)\n",
-			lane.Name, lane.Provider, lane.Model, lane.Effort,
-			decision.Provider, decision.Model, decision.Effort, decision.Availability)
+	if decision.Harness != router.PiHarness {
+		return nil, fmt.Errorf("lane %q routed harness drift: got %s, want %s", lane.Name, decision.Harness, router.PiHarness)
+	}
+	if pinnedBuilder {
+		if decision.Provider != lane.Provider || decision.Model != lane.Model || decision.Effort != lane.Effort {
+			return nil, fmt.Errorf("lane %q fixed builder route drift: configured %s/%s/%s, got %s/%s/%s", lane.Name, lane.Provider, lane.Model, lane.Effort, decision.Provider, decision.Model, decision.Effort)
+		}
+	} else if decision.Provider != lane.Provider || decision.Model != lane.Model || decision.Effort != lane.Effort {
+		fmt.Fprintf(os.Stderr, "herd: lane %q rerouted by quota: %s/%s/%s -> %s/%s/%s (%s)\n", lane.Name, lane.Provider, lane.Model, lane.Effort, decision.Provider, decision.Model, decision.Effort, decision.Availability)
 	}
 	if err := validateDecisionBeforeSideEffect(decision, contextRef); err != nil {
 		return nil, err
@@ -3132,23 +3141,26 @@ func laneLaunchDecision(ctx context.Context, lane *config.LaneDef, task *provide
 
 func validateLaneLaunchConfig(lane *config.LaneDef) error {
 	role := strings.TrimSpace(lane.Role)
-	if role == "" || strings.TrimSpace(lane.AgentKind) == "" || strings.TrimSpace(lane.Provider) == "" || strings.TrimSpace(lane.Model) == "" || strings.TrimSpace(lane.Effort) == "" || strings.TrimSpace(lane.TaskShape) == "" {
+	if role == "" || strings.TrimSpace(lane.AgentKind) == "" || strings.TrimSpace(lane.Provider) == "" || strings.TrimSpace(lane.Model) == "" || strings.TrimSpace(lane.Harness) == "" || strings.TrimSpace(lane.Effort) == "" || strings.TrimSpace(lane.TaskShape) == "" {
 		return fmt.Errorf("lane %q has incomplete launch authority", lane.Name)
 	}
 	expectedShapes := map[string]string{launch.WorkerRole: "implementation", launch.ForgeSmithRole: "implementation", launch.RecoveryRole: "implementation", launch.ReviewerRole: "qa", launch.OrchestratorRole: "coordinator", launch.ScoutPlannerRole: "architecture", launch.VerificationGateRole: "bounded", launch.ReviewSupervisorRole: "coordinator", launch.HarvestRole: "bounded", launch.RecoverySentinelRole: "bounded"}
 	if expected, ok := expectedShapes[role]; !ok || lane.TaskShape != expected {
 		return fmt.Errorf("%w: lane %q has invalid task_shape %q for role %q", ErrWorkerConfigPolicy, lane.Name, lane.TaskShape, role)
 	}
-	if strings.TrimSpace(lane.AgentKind) != strings.TrimSpace(lane.Provider) {
-		return fmt.Errorf("lane %q agent kind %q does not match provider %q", lane.Name, lane.AgentKind, lane.Provider)
+	if strings.TrimSpace(lane.AgentKind) != router.PiHarness || strings.TrimSpace(lane.Harness) != router.PiHarness {
+		return fmt.Errorf("%w: lane %q agent kind %q harness %q must both be %q", ErrHarnessConfigPolicy, lane.Name, lane.AgentKind, lane.Harness, router.PiHarness)
 	}
-	// Builder lanes are not pinned to a vendor. Their provider/model/effort are
-	// soft preferences fed to the quota-ranked router; the shape check above is
-	// the real constraint.
+	if role == launch.WorkerRole || role == launch.ForgeSmithRole || role == launch.RecoveryRole {
+		if lane.Provider != launch.WorkerProvider || lane.Model != launch.WorkerModel || lane.Effort != launch.WorkerEffort {
+			return fmt.Errorf("%w: lane %q must explicitly be Pi harness with codex/gpt-5.6-luna/medium", ErrWorkerConfigPolicy, lane.Name)
+		}
+	}
 	return nil
 }
 
 var ErrWorkerConfigPolicy = errors.New("launch.policy.config_worker_tuple_mismatch")
+var ErrHarnessConfigPolicy = errors.New("launch.policy.config_harness_mismatch")
 
 func validateDecisionBeforeSideEffect(decision *router.LaunchDecision, taskRef string) error {
 	if decision == nil {

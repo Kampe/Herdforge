@@ -1,6 +1,7 @@
 package router
 
 import (
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -23,6 +24,9 @@ func clearRouteEnv(t *testing.T) {
 func testRouter(computed map[string]usage.BurnState, clis ...string) *SurfaceRouter {
 	present := map[string]bool{}
 	for _, c := range clis {
+		if c == "codex" {
+			c = PiHarness
+		}
 		present[c] = true
 	}
 	r := NewRouter(usage.NewQuotaEngine(), computed)
@@ -416,5 +420,163 @@ func writeCooldown(t *testing.T, dir, name, content string) {
 	t.Helper()
 	if err := writeFile(dir+"/"+name, content); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestPiModelForConfiguredFleet(t *testing.T) {
+	cases := []struct{ provider, model, want string }{
+		{"codex", "gpt-5.6-luna", "openai-codex/gpt-5.6-luna"},
+		{"claude", "claude-sonnet-5", "anthropic/claude-sonnet-5"},
+		{"agy", "gemini-3.1-pro-high", "google/gemini-3.1-pro-high"},
+		{"grok", "grok-4.5", "xai/grok-4.5"},
+		{"opencode", "opencode/kimi-k3", "opencode/kimi-k3"},
+		{"lazer", "litellm/lazer/gpt-5.6-sol", "litellm/lazer/gpt-5.6-sol"},
+		{"ollama", "litellm/ollama/glm-5.2:cloud", "litellm/ollama/glm-5.2:cloud"},
+	}
+	for _, tc := range cases {
+		got, err := PiModelFor(tc.provider, tc.model)
+		if err != nil || got != tc.want {
+			t.Fatalf("PiModelFor(%s,%s)=%q,%v want %q", tc.provider, tc.model, got, err, tc.want)
+		}
+	}
+	if _, err := PiModelFor("unknown", "model"); err == nil {
+		t.Fatal("unsupported provider accepted")
+	}
+	if _, err := PiModelFor("lazer", "unqualified"); err == nil {
+		t.Fatal("unqualified lazer model accepted")
+	}
+	rejects := []struct {
+		name     string
+		provider string
+		model    string
+	}{
+		{"codex empty openai-codex prefix", "codex", "openai-codex/"},
+		{"opencode empty opencode prefix", "opencode", "opencode/"},
+		{"lazer rejects openai-codex model", "lazer", "openai-codex/gpt-5.6-luna"},
+		{"ollama rejects litellm/lazer model", "ollama", "litellm/lazer/gpt-5.6-sol"},
+		{"lazer empty litellm/lazer prefix", "lazer", "litellm/lazer/"},
+	}
+	for _, tc := range rejects {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := PiModelFor(tc.provider, tc.model); err == nil {
+				t.Fatalf("PiModelFor(%s,%s) accepted, want error", tc.provider, tc.model)
+			}
+		})
+	}
+}
+
+func TestHarnessArgvForExactPi(t *testing.T) {
+	harness, argv, err := HarnessArgvFor("codex", "gpt-5.6-luna", "medium")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"pi", "--model", "openai-codex/gpt-5.6-luna", "--thinking", "medium"}
+	if harness != PiHarness || len(argv) != len(want) {
+		t.Fatalf("harness=%q argv=%v", harness, argv)
+	}
+	for i := range want {
+		if argv[i] != want[i] {
+			t.Fatalf("argv[%d]=%q want %q", i, argv[i], want[i])
+		}
+	}
+	if _, _, err := HarnessArgvFor("codex", "gpt-5.6-luna", "ultra"); err == nil {
+		t.Fatal("unsupported Pi thinking level accepted")
+	}
+}
+
+func TestLaunchDecisionProofBindsHarness(t *testing.T) {
+	clearRouteEnv(t)
+	d, err := testRouter(nil, "codex").Decide(LaunchRequest{
+		Role: RoleWorker, Shape: "implementation", RequestedProvider: "codex",
+		RequestedModel: "gpt-5.6-luna", RequestedEffort: "medium",
+		ProbeResults: map[string]bool{ProbeKey("codex", "gpt-5.6-luna"): true},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.Harness != "pi" || len(d.HarnessArgv) != 5 || d.HarnessArgv[2] != "openai-codex/gpt-5.6-luna" {
+		t.Fatalf("incomplete Pi harness: %+v", d)
+	}
+	badHarness := *d
+	badHarness.Harness = "codex"
+	if err := VerifyDecision(&badHarness, "", 0); err == nil {
+		t.Fatal("harness mutation preserved proof")
+	}
+	badArgv := *d
+	badArgv.HarnessArgv = append([]string(nil), d.HarnessArgv...)
+	badArgv.HarnessArgv[2] = "openai-codex/gpt-5.6-sol"
+	if err := VerifyDecision(&badArgv, "", 0); err == nil {
+		t.Fatal("harness argv mutation preserved proof")
+	}
+	badSession := *d
+	badSession.HarnessSession = "/tmp/mutated.jsonl"
+	if err := VerifyDecision(&badSession, "", 0); err == nil {
+		t.Fatal("harness session mutation preserved proof")
+	}
+}
+
+func TestBindHarnessSession(t *testing.T) {
+	clearRouteEnv(t)
+	d, err := testRouter(nil, "codex").Decide(LaunchRequest{Role: RoleWorker, Shape: "implementation", RequestedProvider: "codex", RequestedModel: "gpt-5.6-luna", RequestedEffort: "medium", ProbeResults: map[string]bool{ProbeKey("codex", "gpt-5.6-luna"): true}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "launch.jsonl")
+	bound, err := BindHarnessSession(d, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.HarnessSession != "" || len(d.HarnessArgv) != 5 {
+		t.Fatalf("original decision mutated: %+v", d)
+	}
+	if bound.HarnessSession != path || len(bound.HarnessArgv) != 7 || bound.HarnessArgv[5] != "--session" || bound.HarnessArgv[6] != path {
+		t.Fatalf("bound session incomplete: %+v", bound)
+	}
+	if bound.Proof == d.Proof {
+		t.Fatal("session binding did not reissue proof")
+	}
+	if err := VerifyDecision(bound, "", 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := BindHarnessSession(d, "relative.jsonl"); err == nil {
+		t.Fatal("relative session path accepted")
+	}
+	if _, err := BindHarnessSession(bound, path); err == nil {
+		t.Fatal("double session binding accepted")
+	}
+}
+
+func TestCodexAvailabilityRequiresPiHarnessCLI(t *testing.T) {
+	clearRouteEnv(t)
+	req := LaunchRequest{
+		Role: RoleWorker, Shape: "implementation", RequestedProvider: "codex",
+		RequestedModel: "gpt-5.6-luna", RequestedEffort: "medium",
+		ProbeResults: map[string]bool{ProbeKey("codex", "gpt-5.6-luna"): true},
+	}
+	fixedNow := func() time.Time { return time.Unix(1_800_000_000, 0) }
+
+	seen := map[string]bool{}
+	r := NewRouter(nil, nil)
+	r.Probes = &Probes{
+		CLIPresent: func(cli string) bool {
+			seen[cli] = true
+			return cli == PiHarness
+		},
+		Now: fixedNow,
+	}
+	if _, err := r.Decide(req); err != nil {
+		t.Fatalf("codex must pass when PiHarness CLI is present: %v", err)
+	}
+	if !seen[PiHarness] || seen["codex"] {
+		t.Fatalf("CLIPresent seen=%v want pi true/codex false", seen)
+	}
+
+	r2 := NewRouter(nil, nil)
+	r2.Probes = &Probes{
+		CLIPresent: func(cli string) bool { return cli == "codex" },
+		Now:        fixedNow,
+	}
+	if _, err := r2.Decide(req); err == nil {
+		t.Fatal("codex must error when only codex CLI is present")
 	}
 }

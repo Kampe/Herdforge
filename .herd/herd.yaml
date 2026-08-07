@@ -6,14 +6,11 @@ project:
   default_branch: "main"
   repo_url: "https://github.com/Kampe/Herdforge.git"
 
-# Kaneo Kanban Board (Kluster local deployment)
+# Linear Project (Herdforge)
 task_provider:
-  type: "kaneo"
-  workspace_id: "2FeaTZjdSJDSvUVWeiKH0uKNGBhwLEld"
-  project_id: "b939c5jzixruza3vvywrg1hs"
-  api_url: "https://kanban-api.kampe.kluster"
-  api_key_env: "KANEO_API_KEY"
-  use_cli: true
+  type: "linear"
+  project_id: "75548eb4-5382-444e-8dfd-6c6778f3b2d9"
+  api_key_env: "LINEAR_API_KEY"
 
 # The forge fleet — the complete role roster (FAC-127). Soft model pins below
 # are roster defaults only. FAC-142 SurfaceRouter.Decide owns the live
@@ -42,13 +39,13 @@ lanes:
   # into dispatch-ready specs, feeding the forge loop what to forge next.
   - name: "scout"
     role: "forge-smith"
-    agent_kind: "grok"
-    harness: "grok"
+    agent_kind: "pi"
+    harness: "pi"
     prompt: ".herd/prompts/smith.md"
     worktree: ".worktrees/scout"
-    provider: "grok"
-    model: "grok-4.5"
-    effort: "high"
+    provider: "codex"
+    model: "gpt-5.6-luna"
+    effort: "medium"
     task_shape: "implementation"
     standing: false
     authority: "write"
@@ -59,27 +56,27 @@ lanes:
   # per card (task-fac-<ref>) using router LaunchDecision, not harness defaults.
   - name: "smith"
     role: "worker"
-    agent_kind: "grok"
-    harness: "grok"
+    agent_kind: "pi"
+    harness: "pi"
     prompt: ".herd/prompts/worker.md"
     worktree: ".worktrees/smith"
-    provider: "grok"
-    model: "grok-4.5"
-    effort: "high"
+    provider: "codex"
+    model: "gpt-5.6-luna"
+    effort: "medium"
     task_shape: "implementation"
     standing: false
     authority: "write"
     capabilities: ["git-write", "fs-write", "shell-exec"]
     incompatible_with: ["reviewer"]
 
-  # assayer — independent review. Soft default is a DIFFERENT family from the
-  # Reviewer independence is enforced from candidate provenance. Worker and
-  # forge-smith lanes use the explicit Codex/Luna/medium policy above.
-  # by default; high only for final-pass/critical R2/R3 (FAC-142).
+  # assayer — independent review. Reviewer independence is enforced from
+  # candidate provenance. Worker/forge lanes use a Pi harness with the explicit
+  # Codex/Luna/medium route; review effort is medium by default and high only
+  # for final-pass/critical R2/R3 work (FAC-142).
   - name: "assayer"
     role: "reviewer"
-    agent_kind: "claude"
-    harness: "claude"
+    agent_kind: "pi"
+    harness: "pi"
     prompt: ".herd/prompts/reviewer.md"
     worktree: ".worktrees/assayer"
     provider: "claude"
@@ -97,8 +94,8 @@ lanes:
   # implements, reviews, or merges a candidate itself (.herd/prompts/orchestrator.md).
   - name: "orchestrator"
     role: "orchestrator"
-    agent_kind: "claude"
-    harness: "claude"
+    agent_kind: "pi"
+    harness: "pi"
     prompt: ".herd/prompts/orchestrator.md"
     worktree: ".worktrees/orchestrator"
     provider: "claude"
@@ -115,8 +112,8 @@ lanes:
   # (.herd/prompts/scout-planner.md).
   - name: "scout-planner"
     role: "scout-planner"
-    agent_kind: "claude"
-    harness: "claude"
+    agent_kind: "pi"
+    harness: "pi"
     prompt: ".herd/prompts/scout-planner.md"
     worktree: ".worktrees/scout-planner"
     provider: "claude"
@@ -137,8 +134,8 @@ lanes:
   # elsewhere. claude/claude-haiku-4-5 is the real bounded claude model.
   - name: "verification-gate"
     role: "verification-gate"
-    agent_kind: "claude"
-    harness: "claude"
+    agent_kind: "pi"
+    harness: "pi"
     prompt: ".herd/prompts/verification-gate.md"
     worktree: ".worktrees/verification-gate"
     provider: "claude"
@@ -155,8 +152,8 @@ lanes:
   # the single integration queue (.herd/prompts/review-supervisor.md).
   - name: "review-supervisor"
     role: "review-supervisor"
-    agent_kind: "claude"
-    harness: "claude"
+    agent_kind: "pi"
+    harness: "pi"
     prompt: ".herd/prompts/review-supervisor.md"
     worktree: ".worktrees/review-supervisor"
     provider: "claude"
@@ -174,8 +171,8 @@ lanes:
   # rejected).
   - name: "harvest"
     role: "harvest"
-    agent_kind: "claude"
-    harness: "claude"
+    agent_kind: "pi"
+    harness: "pi"
     prompt: ".herd/prompts/harvest.md"
     worktree: ".worktrees/harvest"
     provider: "claude"
@@ -192,8 +189,8 @@ lanes:
   # unique work (.herd/prompts/recovery-sentinel.md).
   - name: "recovery-sentinel"
     role: "recovery-sentinel"
-    agent_kind: "claude"
-    harness: "claude"
+    agent_kind: "pi"
+    harness: "pi"
     prompt: ".herd/prompts/recovery-sentinel.md"
     worktree: ".worktrees/recovery-sentinel"
     provider: "claude"

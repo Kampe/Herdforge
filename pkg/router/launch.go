@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 
@@ -117,6 +118,9 @@ type LaunchRequest struct {
 type LaunchDecision struct {
 	Provider        string         `json:"provider"`
 	Model           string         `json:"model,omitempty"`
+	Harness         string         `json:"harness"`
+	HarnessArgv     []string       `json:"harness_argv,omitempty"`
+	HarnessSession  string         `json:"harness_session,omitempty"`
 	Effort          string         `json:"effort"`
 	Pool            string         `json:"quota_pool"`
 	Role            Role           `json:"role"`
@@ -257,7 +261,7 @@ func decisionProof(d LaunchDecision) string {
 		}
 		return v
 	}
-	canonical := fmt.Sprintf("%s|%s|%s|%s|%s|%s|%s|%d|%s|%s|%s|%s|%s", decisionProofDomain, norm(string(d.Role)), norm(d.Shape), norm(d.Provider), norm(d.Model), norm(d.Effort), d.CandidateSHA, d.LeaseGeneration, d.TaskRef, norm(d.Scope), d.ProbeKey, d.Rationale, strings.Join(d.Argv, "\x00"))
+	canonical := fmt.Sprintf("%s|%s|%s|%s|%s|%s|%s|%s|%d|%s|%s|%s|%s|%s|%s|%s", decisionProofDomain, norm(string(d.Role)), norm(d.Shape), norm(d.Provider), norm(d.Model), norm(d.Harness), norm(d.Effort), d.CandidateSHA, d.LeaseGeneration, d.TaskRef, norm(d.Scope), d.ProbeKey, d.Rationale, d.HarnessSession, strings.Join(d.Argv, "\x00"), strings.Join(d.HarnessArgv, "\x00"))
 	sum := sha256.Sum256([]byte(canonical))
 	return "sha256:" + hex.EncodeToString(sum[:])
 }
@@ -338,6 +342,45 @@ func RebindDecision(d *LaunchDecision, taskRef string, leaseGeneration int64) (*
 	bound.Scope = ScopeTask
 	if _, err := cryptorand.Read(bound.issuanceToken[:]); err != nil {
 		return nil, fmt.Errorf("issue rebound launch capability: %w", err)
+	}
+	bound.Proof = decisionProof(bound)
+	return &bound, nil
+}
+
+func BindHarnessSession(d *LaunchDecision, sessionPath string) (*LaunchDecision, error) {
+	if d == nil {
+		return nil, fmt.Errorf("launch decision is required")
+	}
+	if err := VerifyDecision(d, d.TaskRef, d.LeaseGeneration); err != nil {
+		return nil, err
+	}
+	if d.Harness != PiHarness {
+		return nil, fmt.Errorf("only Pi harness decisions can bind a session")
+	}
+	if d.HarnessSession != "" {
+		return nil, fmt.Errorf("launch decision already has a harness session")
+	}
+	sessionPath = filepath.Clean(strings.TrimSpace(sessionPath))
+	if sessionPath == "." || !filepath.IsAbs(sessionPath) {
+		return nil, fmt.Errorf("Pi harness session path must be absolute")
+	}
+	_, baseArgv, err := HarnessArgvFor(d.Provider, d.Model, d.Effort)
+	if err != nil {
+		return nil, err
+	}
+	if len(d.HarnessArgv) != len(baseArgv) {
+		return nil, fmt.Errorf("launch decision does not contain base Pi harness argv")
+	}
+	for i := range baseArgv {
+		if d.HarnessArgv[i] != baseArgv[i] {
+			return nil, fmt.Errorf("launch decision does not contain base Pi harness argv")
+		}
+	}
+	bound := *d
+	bound.HarnessSession = sessionPath
+	bound.HarnessArgv = append(append([]string(nil), baseArgv...), "--session", sessionPath)
+	if _, err := cryptorand.Read(bound.issuanceToken[:]); err != nil {
+		return nil, fmt.Errorf("issue session-bound launch capability: %w", err)
 	}
 	bound.Proof = decisionProof(bound)
 	return &bound, nil
@@ -449,6 +492,9 @@ func EffortForRequest(req LaunchRequest) string {
 	case RoleReviewer, RoleAssayer:
 		return reviewerEffort(req)
 	case RoleWorker, RoleForgeSmith, RoleRecovery:
+		if requested := strings.ToLower(strings.TrimSpace(req.RequestedEffort)); requested != "" {
+			return requested
+		}
 		// Shape ladder, same as chainseer effort_for. This used to hard-return
 		// "medium" for implementation, which no routed effort could satisfy.
 		if req.Shape == "" {
@@ -691,7 +737,7 @@ func (r *SurfaceRouter) Decide(req LaunchRequest) (*LaunchDecision, error) {
 		pool := QuotaPoolFor(provider, model)
 		ok, detail := r.available(provider, model, pool)
 
-		if !ok && provider == "codex" && model != "gpt-5.3-codex-spark" &&
+		if !ok && req.RequestedModel == "" && provider == "codex" && model != "gpt-5.3-codex-spark" &&
 			strings.Contains(detail, "exhausted") {
 			if ok2, d2 := r.available("codex", "gpt-5.3-codex-spark", "spark"); ok2 {
 				model = "gpt-5.3-codex-spark"
@@ -701,7 +747,7 @@ func (r *SurfaceRouter) Decide(req LaunchRequest) (*LaunchDecision, error) {
 				ok, detail = true, d2
 			}
 		}
-		if !ok && provider == "agy" && !strings.HasPrefix(strings.ToLower(model), "gemini") &&
+		if !ok && req.RequestedModel == "" && provider == "agy" && !strings.HasPrefix(strings.ToLower(model), "gemini") &&
 			(strings.Contains(detail, "exhausted") || strings.Contains(strings.ToLower(detail), "quota")) {
 			if fb := AgyGeminiPoolFallback(shape); fb != "" {
 				if ok2, d2 := r.available("agy", fb, "gemini"); ok2 {
@@ -923,9 +969,15 @@ func (r *SurfaceRouter) Decide(req LaunchRequest) (*LaunchDecision, error) {
 		rationale = "no-claude; " + rationale
 	}
 
+	harness, harnessArgv, err := HarnessArgvFor(best.provider, model, effort)
+	if err != nil {
+		return nil, fmt.Errorf("herd-route: Pi harness: %w", err)
+	}
 	d := &LaunchDecision{
 		Provider:        best.provider,
 		Model:           model,
+		Harness:         harness,
+		HarnessArgv:     harnessArgv,
 		Effort:          effort,
 		Pool:            best.pool,
 		Role:            req.Role,

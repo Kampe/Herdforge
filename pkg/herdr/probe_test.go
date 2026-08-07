@@ -7,17 +7,16 @@ import (
 	"reflect"
 	"strings"
 	"testing"
-
-	"github.com/Kampe/Herdforge/pkg/toolpolicy"
 )
 
-// withStubOpencode puts a fake `opencode` on PATH whose behavior per model is
-// scripted, so ProbeModel/ResolveHealthyModel are hermetic.
-func withStubOpencode(t *testing.T, script string) {
+// withStubOpencode installs a fake `opencode` binary on PATH that runs the
+// given shell body. body is the shell script body (no shebang).
+func withStubOpencode(t *testing.T, body string) {
 	t.Helper()
 	dir := t.TempDir()
-	stub := "#!/bin/sh\n" + script + "\n"
-	if err := os.WriteFile(filepath.Join(dir, "opencode"), []byte(stub), 0o755); err != nil {
+	path := filepath.Join(dir, "opencode")
+	script := "#!/bin/sh\n" + body + "\n"
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
@@ -27,15 +26,18 @@ func TestProbeModel_Healthy(t *testing.T) {
 	withStubOpencode(t, `echo "PROBE_OK"`)
 	r := ProbeModel(context.Background(), "litellm/lazer/deepseek-v4-flash")
 	if !r.Available {
-		t.Fatalf("healthy model must probe available: %+v", r)
+		t.Fatalf("expected available, got %+v", r)
 	}
 }
 
 func TestProbeModel_Exhausted(t *testing.T) {
 	withStubOpencode(t, `echo "No payment method. Add one at ..."; exit 1`)
 	r := ProbeModel(context.Background(), "opencode/deepseek-v4-flash-free")
-	if r.Available || r.Reason != "no payment method" {
-		t.Fatalf("exhausted model must be caught: %+v", r)
+	if r.Available {
+		t.Fatal("exhausted surface marked available")
+	}
+	if r.Reason != "no payment method" {
+		t.Fatalf("reason = %q, want no payment method", r.Reason)
 	}
 }
 
@@ -43,7 +45,7 @@ func TestProbeModel_QuotaSignal(t *testing.T) {
 	withStubOpencode(t, `echo "error: quota exceeded for this key"; exit 1`)
 	r := ProbeModel(context.Background(), "m")
 	if r.Available || r.Reason != "quota" {
-		t.Fatalf("quota signal must be caught: %+v", r)
+		t.Fatalf("got %+v", r)
 	}
 }
 
@@ -87,74 +89,48 @@ func writeProbeCLI(t *testing.T, dir, name, script string) {
 	}
 }
 
-func TestProbeProviderModel_CodexUsesExactCodexCLI(t *testing.T) {
+func TestProbeProviderModel_CodexUsesExactPiCLI(t *testing.T) {
 	dir := t.TempDir()
-	argsPath := filepath.Join(dir, "codex.args")
+	argsPath := filepath.Join(dir, "pi.args")
+	codexMarker := filepath.Join(dir, "codex.called")
 	opencodeMarker := filepath.Join(dir, "opencode.called")
-	writeProbeCLI(t, dir, "codex", `printf '%s\n' "$@" > "`+argsPath+`"
-out=
-prev=
-for a in "$@"; do
-  if [ "$prev" = "--output-last-message" ]; then
-    out=$a
-  fi
-  prev=$a
-done
-if [ -n "$out" ]; then
-  printf '%s\n' "PROBE_OK" > "$out"
-fi
-echo '{"type":"turn.completed"}'`)
+	writeProbeCLI(t, dir, "pi", `printf '%s\n' "$@" > "`+argsPath+`"
+echo PROBE_OK`)
+	writeProbeCLI(t, dir, "codex", `echo called > "`+codexMarker+`"
+exit 91`)
 	writeProbeCLI(t, dir, "opencode", `echo called > "`+opencodeMarker+`"
-echo quota exceeded
 exit 91`)
 	t.Setenv("PATH", dir)
 
 	result := ProbeProviderModel(context.Background(), "codex", "gpt-5.6-luna", "medium")
 	if !result.Available {
-		t.Fatalf("exact Codex probe unavailable: %+v", result)
+		t.Fatalf("exact Pi probe unavailable: %+v", result)
 	}
-	got, err := os.ReadFile(argsPath)
+	if _, err := os.Stat(codexMarker); !os.IsNotExist(err) {
+		t.Fatal("native codex CLI was invoked")
+	}
+	if _, err := os.Stat(opencodeMarker); !os.IsNotExist(err) {
+		t.Fatal("opencode CLI was invoked")
+	}
+	raw, err := os.ReadFile(argsPath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	gotArgs := strings.Split(strings.TrimSuffix(string(got), "\n"), "\n")
-	outputPath := ""
-	for i, arg := range gotArgs {
-		if arg == "--output-last-message" {
-			if i+1 >= len(gotArgs) {
-				t.Fatalf("missing path after --output-last-message in %q", gotArgs)
-			}
-			outputPath = gotArgs[i+1]
-			if strings.TrimSpace(outputPath) == "" {
-				t.Fatalf("blank path after --output-last-message in %q", gotArgs)
-			}
-			gotArgs[i+1] = "<probe-output>"
-			break
-		}
-	}
-	if outputPath == "" {
-		t.Fatalf("Codex args missing --output-last-message: %q", gotArgs)
-	}
+	gotArgs := strings.Split(strings.TrimSpace(string(raw)), "\n")
 	wantArgs := []string{
-		"exec",
-		"--model", "gpt-5.6-luna",
-		"--sandbox", "read-only",
-		"--skip-git-repo-check",
-		"--json",
-		"--ephemeral",
-		"--output-last-message", "<probe-output>",
-		"--config", "model_reasoning_effort=medium",
-		"--config", toolpolicy.CodexDisableCodeReviewGraph,
-		probePrompt,
+		"--no-session",
+		"--no-approve",
+		"--no-context-files",
+		"--no-extensions",
+		"--no-skills",
+		"--no-prompt-templates",
+		"--no-tools",
+		"--model", "openai-codex/gpt-5.6-luna",
+		"--thinking", "medium",
+		"-p", probePrompt,
 	}
 	if !reflect.DeepEqual(gotArgs, wantArgs) {
-		t.Fatalf("Codex args = %q, want %q", gotArgs, wantArgs)
-	}
-	if _, err := os.Stat(outputPath); !os.IsNotExist(err) {
-		t.Fatalf("probe output path still exists after return: %v", err)
-	}
-	if _, err := os.Stat(opencodeMarker); !os.IsNotExist(err) {
-		t.Fatalf("Codex probe invoked OpenCode: %v", err)
+		t.Fatalf("argv mismatch\n got: %#v\nwant: %#v", gotArgs, wantArgs)
 	}
 }
 
@@ -164,19 +140,21 @@ func TestProbeProviderModel_OpenCodeBackedUsesOpenCode(t *testing.T) {
 	writeProbeCLI(t, dir, "opencode", `printf '%s\n' "$@" > "`+argsPath+`"
 echo PROBE_OK`)
 	writeProbeCLI(t, dir, "codex", `exit 91`)
+	writeProbeCLI(t, dir, "pi", `exit 91`)
 	t.Setenv("PATH", dir)
 
 	result := ProbeProviderModel(context.Background(), "lazer", "litellm/lazer/deepseek-v4-flash", "medium")
 	if !result.Available {
 		t.Fatalf("OpenCode-backed probe unavailable: %+v", result)
 	}
-	got, err := os.ReadFile(argsPath)
+	raw, err := os.ReadFile(argsPath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	args := string(got)
-	if !strings.Contains(args, "run\n--model\nlitellm/lazer/deepseek-v4-flash\n") {
-		t.Fatalf("unexpected OpenCode args: %q", args)
+	gotArgs := strings.Split(strings.TrimSpace(string(raw)), "\n")
+	wantArgs := []string{"run", "--model", "litellm/lazer/deepseek-v4-flash", probePrompt}
+	if !reflect.DeepEqual(gotArgs, wantArgs) {
+		t.Fatalf("argv mismatch\n got: %#v\nwant: %#v", gotArgs, wantArgs)
 	}
 }
 
@@ -191,43 +169,25 @@ func TestProbeProviderModel_FailsClosed(t *testing.T) {
 		t.Setenv("PATH", t.TempDir())
 		result := ProbeProviderModel(context.Background(), "codex", "gpt-5.6-luna", "medium")
 		if result.Available || !strings.HasPrefix(result.Reason, "probe failed:") {
-			t.Fatalf("missing Codex executable did not fail closed: %+v", result)
+			t.Fatalf("missing Pi executable did not fail closed: %+v", result)
 		}
 	})
-	for _, tc := range []struct {
-		name, script, reason string
+
+	cases := []struct {
+		name   string
+		script string
+		reason string
 	}{
 		{name: "nonzero", script: "echo command failed; exit 2", reason: "probe failed:"},
 		{name: "quota", script: "echo quota exceeded; exit 1", reason: "quota"},
-		{name: "missing token", script: `echo '{"type":"turn.completed"}'`, reason: "no exact probe output"},
-		{name: "non-exact token", script: `out=
-prev=
-for a in "$@"; do
-  if [ "$prev" = "--output-last-message" ]; then
-    out=$a
-  fi
-  prev=$a
-done
-if [ -n "$out" ]; then
-  printf '%s\n' "NOT_PROBE_OK" > "$out"
-fi
-echo '{"type":"turn.completed"}'`, reason: "no exact probe output"},
-		{name: "error after token", script: `out=
-prev=
-for a in "$@"; do
-  if [ "$prev" = "--output-last-message" ]; then
-    out=$a
-  fi
-  prev=$a
-done
-if [ -n "$out" ]; then
-  printf '%s\n' "PROBE_OK" > "$out"
-fi
-echo '{"type":"turn.failed"}'`, reason: "no exact probe output"},
-	} {
+		{name: "missing token", script: `exit 0`, reason: "no exact probe output"},
+		{name: "nonexact token", script: `echo NOT_PROBE_OK`, reason: "no exact probe output"},
+		{name: "extra token", script: `printf 'PROBE_OK\nextra\n'`, reason: "no exact probe output"},
+	}
+	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			dir := t.TempDir()
-			writeProbeCLI(t, dir, "codex", tc.script)
+			writeProbeCLI(t, dir, "pi", tc.script)
 			t.Setenv("PATH", dir)
 			result := ProbeProviderModel(context.Background(), "codex", "gpt-5.6-luna", "medium")
 			if result.Available || !strings.HasPrefix(result.Reason, tc.reason) {
