@@ -35,10 +35,10 @@ const (
 	hermeticRunPath               = "/tmp/run"
 	hermeticReplayPath            = "/tmp/replay"
 	hermeticReceiptPath           = "/tmp/replay/receipt.json"
-	// GOTMPDIR/TMPDIR must be on an exec-capable tmpfs: fixtures write and run
-	// shell scripts (fork/exec). /tmp/build is intentionally noexec for the
-	// source tree; /tmp/run is the exec scratch space.
-	hermeticGoTmpDir = hermeticRunPath + "/gotmp"
+	// Compiler scratch can live on noexec /tmp/build (object files only).
+	// Fixture TMPDIR must be exec-capable (/tmp/run) so shell scripts start.
+	hermeticGoCompileTmpDir = hermeticBuildPath + "/gotmp"
+	hermeticGoFixtureTmpDir = hermeticRunPath + "/gotmp"
 	hermeticTestCount             = "1"
 	hermeticTestTimeout           = "10m"
 	maxHermeticSourceArchiveBytes = 64 << 20
@@ -63,9 +63,9 @@ func hermeticGoEnv() []string {
 		"GOTOOLCHAIN=local",
 		"GOMODCACHE=" + hermeticGoModCache,
 		"GOCACHE=" + hermeticGoBuildCache,
-		"GOTMPDIR=" + hermeticGoTmpDir,
-		"TMPDIR=" + hermeticGoTmpDir,
-		"HOME=" + hermeticGoTmpDir,
+		"GOTMPDIR=" + hermeticGoCompileTmpDir,
+		"TMPDIR=" + hermeticGoCompileTmpDir,
+		"HOME=" + hermeticGoCompileTmpDir,
 		// Network is none; refuse module fetches so a missing cache is a hard
 		// error instead of a DNS hang under --network none.
 		"GOPROXY=off",
@@ -75,7 +75,8 @@ func hermeticGoEnv() []string {
 
 var hermeticDockerTmpfs = [...]string{
 	hermeticBuildPath + ":rw,noexec,nosuid,nodev,size=512m",
-	hermeticRunPath + ":rw,exec,nosuid,nodev,size=64m",
+	// exec scratch for the compiled test binary + fixture shell scripts
+	hermeticRunPath + ":rw,exec,nosuid,nodev,size=256m",
 	hermeticReplayPath + ":rw,noexec,nosuid,nodev,size=64m",
 }
 
@@ -355,10 +356,10 @@ func (r *hermeticDockerRunner) Run(ctx context.Context) (result FAC151DockerResu
 	// Cache/tmp dirs must be writable by the container user (65532). Create as
 	// root then chown so the go compiler can write under --read-only rootfs.
 	if ok {
-		if _, err := setup.execAsRoot(operationCtx, containerID, []string{"/bin/mkdir", "-p", hermeticGoModDownload, hermeticGoBuildCache, hermeticGoTmpDir}); err != nil {
+		if _, err := setup.execAsRoot(operationCtx, containerID, []string{"/bin/mkdir", "-p", hermeticGoModDownload, hermeticGoBuildCache, hermeticGoCompileTmpDir, hermeticGoFixtureTmpDir}); err != nil {
 			return result, fmt.Errorf("prepare fixed container paths: %w", err)
 		}
-	} else if _, err := r.docker.Exec(operationCtx, containerID, []string{"/bin/mkdir", "-p", hermeticGoModDownload, hermeticGoBuildCache, hermeticGoTmpDir}, nil); err != nil {
+	} else if _, err := r.docker.Exec(operationCtx, containerID, []string{"/bin/mkdir", "-p", hermeticGoModDownload, hermeticGoBuildCache, hermeticGoCompileTmpDir, hermeticGoFixtureTmpDir}, nil); err != nil {
 		return result, fmt.Errorf("prepare fixed container paths: %w", err)
 	}
 	if err := r.docker.Copy(operationCtx, containerID, hermeticGoModDownload, cacheTar); err != nil {
@@ -367,7 +368,7 @@ func (r *hermeticDockerRunner) Run(ctx context.Context) (result FAC151DockerResu
 	// cap-drop ALL + userns means root cannot always chown; open write access on
 	// the cache/tmp trees so the container user can compile without network.
 	if ok {
-		if _, err := setup.execAsRoot(operationCtx, containerID, []string{"/bin/chmod", "-R", "a+rwX", hermeticGoModCache, hermeticGoBuildCache, hermeticGoTmpDir}); err != nil {
+		if _, err := setup.execAsRoot(operationCtx, containerID, []string{"/bin/chmod", "-R", "a+rwX", hermeticGoModCache, hermeticGoBuildCache, hermeticGoCompileTmpDir, hermeticGoFixtureTmpDir}); err != nil {
 			return result, fmt.Errorf("open cache paths for container user: %w", err)
 		}
 	}
@@ -477,9 +478,12 @@ func validateRuntimeMountInfo(output []byte) error {
 			}
 			record.sizeBytes = sizeBytes
 			seen[destination] = true
-			expectedSize := int64(64 << 20)
+			expectedSize := int64(64 << 20) // replay default
 			if destination == hermeticBuildPath {
 				expectedSize = 512 << 20
+			}
+			if destination == hermeticRunPath {
+				expectedSize = 256 << 20
 			}
 			if record.root != "/" || record.fstype != "tmpfs" || record.sizeBytes != expectedSize || !record.mountOpts["rw"] || record.mountOpts["ro"] || record.superOpts["ro"] || !record.mountOpts["nosuid"] && !record.superOpts["nosuid"] || !record.mountOpts["nodev"] && !record.superOpts["nodev"] {
 				return fmt.Errorf("runtime_mountinfo_wrong:%s", destination)
@@ -966,7 +970,7 @@ func (i dockerInspection) validate(policy hermeticDockerPolicy, expectedContaine
 	if len(i.HostConfig.Tmpfs) != len(allowed) || (len(i.Mounts) != 0 && len(i.Mounts) != len(allowed)) {
 		return dockerMountShapeDiagnostic(i, stage, allowed)
 	}
-	for destination, options := range map[string]string{hermeticBuildPath: "rw,noexec,nosuid,nodev,size=512m", hermeticRunPath: "rw,exec,nosuid,nodev,size=64m", hermeticReplayPath: "rw,noexec,nosuid,nodev,size=64m"} {
+	for destination, options := range map[string]string{hermeticBuildPath: "rw,noexec,nosuid,nodev,size=512m", hermeticRunPath: "rw,exec,nosuid,nodev,size=256m", hermeticReplayPath: "rw,noexec,nosuid,nodev,size=64m"} {
 		if got, ok := i.HostConfig.Tmpfs[destination]; !ok || got != options {
 			return errors.New("Docker tmpfs map does not match fixed policy")
 		}
@@ -990,13 +994,13 @@ func (i dockerInspection) validate(policy hermeticDockerPolicy, expectedContaine
 type namespaceIdentity struct{ PID, User string }
 
 func fixedFAC151Argv() []string {
-	// Test fixtures call t.TempDir/os.MkdirTemp; without TMPDIR under tmpfs they
-	// try bare /tmp on the read-only rootfs and fail before any ownership proof.
+	// Fixtures call t.TempDir and execute shell scripts: TMPDIR must be on the
+	// exec-capable /tmp/run tmpfs, not the noexec /tmp/build tree.
 	return []string{
 		"/usr/bin/env",
-		"TMPDIR=" + hermeticGoTmpDir,
-		"GOTMPDIR=" + hermeticGoTmpDir,
-		"HOME=" + hermeticGoTmpDir,
+		"TMPDIR=" + hermeticGoFixtureTmpDir,
+		"GOTMPDIR=" + hermeticGoFixtureTmpDir,
+		"HOME=" + hermeticGoFixtureTmpDir,
 		hermeticRunPath + "/verifier.test",
 		"-test.run", fixedFAC151Regex(),
 		"-test.count=" + hermeticTestCount,
