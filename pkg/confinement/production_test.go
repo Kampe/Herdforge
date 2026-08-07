@@ -191,16 +191,40 @@ func TestDarwinSeatbeltProveWriteDenials(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Must not create .herd under shared as a proof side-effect.
+	// Prepare must not create shared/.herd (only EnsureSharedRootSentinel does).
 	if _, err := os.Stat(filepath.Join(shared, ".herd")); err == nil {
-		// Prepare may not create shared .herd; only EnsureSharedRootSentinel does.
+		t.Fatal("Prepare created .herd under shared root")
+	}
+	// Snapshot shared tree entries before prove — must be unchanged after.
+	before, err := os.ReadDir(shared)
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeNames := map[string]struct{}{}
+	for _, e := range before {
+		beforeNames[e.Name()] = struct{}{}
 	}
 	if err := osb.ProveWriteDenials(root, shared, profile); err != nil {
 		t.Fatal(err)
 	}
-	// After prove, shared root must not have residual probe inodes from proof.
+	after, err := os.ReadDir(shared)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range after {
+		if _, ok := beforeNames[e.Name()]; !ok {
+			t.Fatalf("ProveWriteDenials mutated shared root with new entry %q", e.Name())
+		}
+	}
 	if _, err := os.Stat(filepath.Join(shared, ".herd", "FAC-188-R2-RESIDUAL.md")); err == nil {
 		t.Fatal("proof left residual under shared root")
+	}
+	// No fac190-probe leftovers under shared (including worktrees parent).
+	entries, _ := os.ReadDir(shared)
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), "fac190-probe-") {
+			t.Fatalf("probe dir under shared: %s", e.Name())
+		}
 	}
 }
 
@@ -251,12 +275,76 @@ func TestDarwinFirstMatchProfileDeniesSharedParent(t *testing.T) {
 }
 
 func TestRealPathFailsClosedOnMissing(t *testing.T) {
-	if _, err := realPath(filepath.Join(t.TempDir(), "missing-leaf")); err == nil {
-		// EvalSymlinks on missing path fails — good.
+	// Missing path must error. A fail-open reimplementation (EvalSymlinks err →
+	// return abs, nil) would return nil err and must turn this test red.
+	missing := filepath.Join(t.TempDir(), "missing-leaf")
+	if _, err := realPath(missing); err == nil {
+		t.Fatal("realPath accepted missing path — fail-open regression")
 	}
 	// Control characters rejected.
 	if _, err := realPath("/tmp/foo\nbar"); err == nil {
 		t.Fatal("control char path accepted")
+	}
+}
+
+func TestWrapperNamesCoversProviderAndArgv0(t *testing.T) {
+	names := WrapperNames("ollama", "opencode")
+	if len(names) != 2 {
+		t.Fatalf("want provider+argv0, got %v", names)
+	}
+	seen := map[string]bool{}
+	for _, n := range names {
+		seen[n] = true
+	}
+	if !seen["ollama"] || !seen["opencode"] {
+		t.Fatalf("missing names: %v", names)
+	}
+	// Same name once.
+	if got := WrapperNames("codex", "codex"); len(got) != 1 || got[0] != "codex" {
+		t.Fatalf("dedupe: %v", got)
+	}
+}
+
+func TestVerifyAgentWrappersDetectsSwap(t *testing.T) {
+	issuer, err := NewHMACIssuer([]byte("secret"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := t.TempDir()
+	fake := &FakeOS{}
+	enf := &Enforcer{Issuer: issuer, OS: fake}
+	prep, err := enf.PrepareOS(root, "", "codex", "codex")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Swap wrapper contents after prepare.
+	wrapper := filepath.Join(prep.BinDir, "codex")
+	if err := os.WriteFile(wrapper, []byte("#!/bin/sh\n# swapped\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := VerifyAgentWrappers(prep.BinDir, prep.ProfilePath, prep.Names); err == nil {
+		t.Fatal("swapped wrapper accepted")
+	}
+	if _, err := enf.BindAndProve(productionIdentity(t, root, ""), prep); err == nil {
+		t.Fatal("BindAndProve accepted swapped wrapper")
+	}
+}
+
+func TestPrepareOSInstallsBothOllamaAndOpencode(t *testing.T) {
+	issuer, err := NewHMACIssuer([]byte("secret"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := t.TempDir()
+	enf := &Enforcer{Issuer: issuer, OS: &FakeOS{}}
+	prep, err := enf.PrepareOS(root, "", "ollama", "opencode")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"ollama", "opencode"} {
+		if _, err := os.Stat(filepath.Join(prep.BinDir, name)); err != nil {
+			t.Fatalf("wrapper %s: %v", name, err)
+		}
 	}
 }
 
