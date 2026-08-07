@@ -58,11 +58,17 @@ func TestConsumptionProven(t *testing.T) {
 		want               bool
 	}{
 		{"idle", "working", true},
-		{"idle", "done", true},
 		{"", "working", true},
-		{"", "done", true},
-		{"working", "done", true},
 		{"done", "working", true},
+		// A bare idle->done is NOT proof: a freshly launched agent renders its
+		// UI and can settle straight to done without processing the prompt.
+		// Observed twice on grok lanes (FAC-174, FAC-172) — delivery reported
+		// healthy while the pane sat at an empty prompt with only its dispatch
+		// anchor commit. done counts only via ConsumptionProvenSeen, once the
+		// agent has actually been seen working.
+		{"idle", "done", false},
+		{"", "done", false},
+		{"working", "done", true},
 		// R3: same-state sequences are not consumption proof
 		{"working", "working", false},
 		{"done", "done", false},
@@ -76,6 +82,18 @@ func TestConsumptionProven(t *testing.T) {
 		if got != c.want {
 			t.Errorf("ConsumptionProven(%q, %q) = %v, want %v", c.baseline, c.observed, got, c.want)
 		}
+	}
+
+	// done IS proof once the agent was actually seen working — the normal
+	// finish, and the repair case where a busy agent takes follow-up work.
+	if !ConsumptionProvenSeen("idle", "done", true) {
+		t.Error("idle->working->done must prove consumption")
+	}
+	if ConsumptionProvenSeen("idle", "done", false) {
+		t.Error("idle->done without ever working must NOT prove consumption")
+	}
+	if !ConsumptionProvenSeen("working", "done", false) {
+		t.Error("a prompt delivered to an already-working agent that finishes is proof")
 	}
 }
 
