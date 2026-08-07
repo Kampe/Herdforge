@@ -4,9 +4,10 @@
 // FAC-67 is profile-driven (FAC-94 seam). Pnpm is one adapter; Go is another.
 // The shared flow resolves a target, builds its dependency-plus-self chain,
 // optionally clears ONLY that chain's artifacts (never repo-wide), rebuilds
-// fresh, and emits a three-way verdict:
+// fresh, and emits a profile-honest verdict:
 //
-//   - clean rebuild  → prior error was STALE DIST (exit 0)
+//   - clean rebuild after a real clear → prior error was STALE DIST (pnpm)
+//   - clean rebuild with no clear step → rebuild succeeded (go; no stale-dist claim)
 //   - missing modules declared in the lockfile → STALE/MISSING install (rc)
 //   - any other failure → REAL build error (rc)
 package freshbuild
@@ -20,11 +21,11 @@ import (
 	"strings"
 )
 
-// VerdictKind is the three-way diagnosis.
+// VerdictKind is the diagnosis band.
 type VerdictKind string
 
 const (
-	VerdictClean       VerdictKind = "clean"        // stale dist, not real
+	VerdictClean       VerdictKind = "clean"        // rebuild succeeded
 	VerdictNodeModules VerdictKind = "node_modules" // stale/missing install
 	VerdictRealError   VerdictKind = "real_error"   // genuine code/build error
 	VerdictDryRun      VerdictKind = "dry_run"
@@ -102,6 +103,7 @@ type Verdict struct {
 	MissingModule  string
 	NodeModulesHit bool
 	Message        string
+	Profile        string
 }
 
 // UsageError is a fail-closed CLI/usage failure (exit 2).
@@ -153,7 +155,7 @@ func FreshBuild(ctx context.Context, opts Options) (*Verdict, error) {
 		prof = DetectProfile(root)
 	}
 	if prof == nil {
-		return nil, &UsageError{Msg: "freshbuild: no supported repository profile (need pnpm-lock.yaml or go.mod)"}
+		return nil, &UsageError{Msg: "freshbuild: no supported repository profile (need pnpm-lock.yaml / pnpm-workspace.yaml, go.mod, or package.json with packageManager=pnpm)"}
 	}
 
 	if opts.LookPath != nil {
@@ -193,14 +195,15 @@ func FreshBuild(ctx context.Context, opts Options) (*Verdict, error) {
 	}
 
 	if opts.DryRun {
-		fmt.Fprintln(stdout, "herd-fresh-build: --dry-run, would clear dist/ + *.tsbuildinfo in each above, then rebuild. Nothing changed.")
-		return &Verdict{Kind: VerdictDryRun, Rc: 0, Pkg: pkg, Chain: chain, Message: "dry-run"}, nil
+		fmt.Fprintln(stdout, prof.DryRunClearLine())
+		return &Verdict{Kind: VerdictDryRun, Rc: 0, Pkg: pkg, Chain: chain, Message: "dry-run", Profile: prof.Name()}, nil
 	}
 
-	if err := ClearChain(root, dirs, prof.ArtifactNames()); err != nil {
+	spec := prof.ArtifactNames()
+	if err := ClearChain(root, dirs, spec); err != nil {
 		return nil, fmt.Errorf("freshbuild: clear: %w", err)
 	}
-	fmt.Fprintf(stdout, "herd-fresh-build: cleared dist + .tsbuildinfo for %d chain package(s), rebuilding fresh...\n", len(dirs))
+	fmt.Fprintln(stdout, prof.ClearedLine(len(dirs)))
 
 	tmpDir := opts.TempDir
 	if tmpDir == "" {
@@ -225,9 +228,9 @@ func FreshBuild(ctx context.Context, opts Options) (*Verdict, error) {
 
 	if rc == 0 {
 		_ = os.Remove(logPath)
-		msg := fmt.Sprintf("herd-fresh-build: fresh chain clean (%d pkgs rebuilt) -- any prior cross-package error was STALE DIST, not real.", len(dirs))
+		msg := prof.CleanLine(len(dirs))
 		fmt.Fprintln(stdout, msg)
-		return &Verdict{Kind: VerdictClean, Rc: 0, Pkg: pkg, Chain: chain, Message: msg}, nil
+		return &Verdict{Kind: VerdictClean, Rc: 0, Pkg: pkg, Chain: chain, Message: msg, Profile: prof.Name()}, nil
 	}
 
 	logBytes, _ := os.ReadFile(logPath)
@@ -240,6 +243,7 @@ func FreshBuild(ctx context.Context, opts Options) (*Verdict, error) {
 		LogPath:        logPath,
 		MissingModule:  missing,
 		NodeModulesHit: kind == VerdictNodeModules,
+		Profile:        prof.Name(),
 	}
 
 	switch kind {
@@ -250,7 +254,7 @@ func FreshBuild(ctx context.Context, opts Options) (*Verdict, error) {
 		v.LogPath = ""
 		v.Message = "stale/missing node_modules"
 	default:
-		fmt.Fprintln(stderr, "herd-fresh-build: REAL build error in the freshly-built chain (NOT stale dist):")
+		fmt.Fprintln(stderr, prof.RealErrorHeader())
 		for _, line := range errorTail(logBytes, 20) {
 			fmt.Fprintf(stderr, "  %s\n", line)
 		}
@@ -260,5 +264,6 @@ func FreshBuild(ctx context.Context, opts Options) (*Verdict, error) {
 	return v, nil
 }
 
-// UsageLine is the exact no-target usage text (ported from bin/herd-fresh-build).
+// UsageLine is the herd CLI usage line (adapted from bin/herd-fresh-build's
+// `usage: bin/herd-fresh-build <pkg-or-path> [--dry-run]`).
 const UsageLine = "usage: herd fresh-build <pkg-or-path> [--dry-run]"

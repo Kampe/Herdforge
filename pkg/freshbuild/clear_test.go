@@ -3,6 +3,7 @@ package freshbuild
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -67,19 +68,48 @@ func TestClearChain_IdempotentMissing(t *testing.T) {
 	}
 }
 
-func TestClearChain_RejectsForbiddenAndEscape(t *testing.T) {
+func TestClearChain_RejectsForbiddenDirsFilesAndGlobs(t *testing.T) {
 	t.Parallel()
 	root := t.TempDir()
 	a := filepath.Join(root, "a")
 	if err := os.MkdirAll(a, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := ClearChain(root, []string{a}, ArtifactSpec{Dirs: []string{"node_modules"}}); err == nil {
-		t.Fatal("must refuse node_modules")
+	if err := os.WriteFile(filepath.Join(a, "go.mod"), []byte("module x\n"), 0o644); err != nil {
+		t.Fatal(err)
 	}
+	if err := os.WriteFile(filepath.Join(a, "package.json"), []byte(`{}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := ClearChain(root, []string{a}, ArtifactSpec{Dirs: []string{"node_modules"}}); err == nil {
+		t.Fatal("must refuse node_modules dir")
+	}
+	if err := ClearChain(root, []string{a}, ArtifactSpec{Files: []string{"go.mod"}}); err == nil {
+		t.Fatal("must refuse go.mod file")
+	}
+	if err := ClearChain(root, []string{a}, ArtifactSpec{Files: []string{"package.json"}}); err == nil {
+		t.Fatal("must refuse package.json file")
+	}
+	// Glob that would match go.mod
+	if err := ClearChain(root, []string{a}, ArtifactSpec{Globs: []string{"go.mod"}}); err == nil {
+		t.Fatal("must refuse go.mod via glob pattern")
+	}
+	if err := ClearChain(root, []string{a}, ArtifactSpec{Globs: []string{"*.mod"}}); err == nil {
+		t.Fatal("must refuse go.mod matched by *.mod")
+	}
+	// Survivors still present
+	if _, err := os.Stat(filepath.Join(a, "go.mod")); err != nil {
+		t.Fatalf("go.mod must survive: %v", err)
+	}
+
 	outside := filepath.Join(root, "..", "nope")
-	if err := ClearChain(root, []string{outside}, PnpmProfile{}.ArtifactNames()); err == nil {
+	escErr := ClearChain(root, []string{outside}, PnpmProfile{}.ArtifactNames())
+	if escErr == nil {
 		t.Fatal("must refuse path escape")
+	}
+	if !strings.Contains(escErr.Error(), "escapes") {
+		t.Fatalf("unexpected escape err: %v", escErr)
 	}
 }
 

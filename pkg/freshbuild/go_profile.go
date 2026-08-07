@@ -11,9 +11,8 @@ import (
 )
 
 // GoProfile is a non-pnpm adapter so fresh-build is not locked to Node.
-// Go has no stale-dist equivalent; the adapter rebuilds the target package
-// without clearing source trees. A clean rebuild → STALE DIST phrasing still
-// means "fresh compile succeeded"; failure is always REAL.
+// Go has no stale-dist equivalent: ArtifactNames is empty, no clear runs, and
+// success/failure messages never claim a STALE DIST diagnosis.
 type GoProfile struct {
 	GoBin string
 }
@@ -46,61 +45,101 @@ func (g GoProfile) ResolveTarget(root, target string) (string, bool, error) {
 	if target == "" {
 		return "", false, fmt.Errorf("herd-fresh-build: empty target")
 	}
-	// Directory path → treat as package path relative to root if possible.
-	cand := target
-	if !filepath.IsAbs(cand) {
-		if st, err := os.Stat(cand); err == nil && st.IsDir() {
-			if rel, rerr := filepath.Rel(root, cand); rerr == nil && !strings.HasPrefix(rel, "..") {
-				pkg := "./" + filepath.ToSlash(rel)
-				if rel == "." {
-					pkg = "."
-				}
-				return pkg, true, nil
+	root = filepath.Clean(root)
+
+	// Prefer root-relative resolution so CLI walk-up to repo root and package
+	// path stay consistent (never stat cwd-local path then build under root).
+	if filepath.IsAbs(target) {
+		if st, err := os.Stat(target); err == nil && st.IsDir() {
+			rel, rerr := filepath.Rel(root, target)
+			if rerr != nil || strings.HasPrefix(rel, "..") {
+				return "", true, fmt.Errorf("herd-fresh-build: path %q is outside repository root", target)
 			}
-			return cand, true, nil
+			return goPkgFromRel(rel), true, nil
 		}
-		joined := filepath.Join(root, cand)
-		if st, err := os.Stat(joined); err == nil && st.IsDir() {
-			pkg := "./" + filepath.ToSlash(filepath.Clean(cand))
-			return pkg, true, nil
-		}
-	} else if st, err := os.Stat(cand); err == nil && st.IsDir() {
-		if rel, rerr := filepath.Rel(root, cand); rerr == nil && !strings.HasPrefix(rel, "..") {
-			pkg := "./" + filepath.ToSlash(rel)
-			if rel == "." {
-				pkg = "."
-			}
-			return pkg, true, nil
-		}
+		return target, false, nil
 	}
-	// Bare import path or ./pkg/foo passes through.
+
+	// Relative: only accept as a path when it exists under root.
+	joined := filepath.Join(root, filepath.FromSlash(target))
+	if st, err := os.Stat(joined); err == nil && st.IsDir() {
+		rel, rerr := filepath.Rel(root, joined)
+		if rerr != nil || strings.HasPrefix(rel, "..") {
+			return "", true, fmt.Errorf("herd-fresh-build: path %q is outside repository root", target)
+		}
+		return goPkgFromRel(rel), true, nil
+	}
+
+	// Bare import path or ./pkg/foo that is not a directory under root passes through.
 	return target, false, nil
+}
+
+func goPkgFromRel(rel string) string {
+	rel = filepath.ToSlash(filepath.Clean(rel))
+	if rel == "." {
+		return "."
+	}
+	return "./" + rel
 }
 
 func (g GoProfile) ChainFor(ctx context.Context, root, pkg string) ([]string, error) {
 	_ = ctx
-	// Go packages do not have a pnpm-style dependency dist chain. The chain
-	// is the single target directory so clear stays a no-op and rebuild is
-	// scoped.
-	dir := pkg
-	if strings.HasPrefix(pkg, "./") || pkg == "." {
-		dir = filepath.Join(root, filepath.FromSlash(strings.TrimPrefix(pkg, "./")))
-	} else if !filepath.IsAbs(pkg) {
-		// Try as repo-relative path first.
-		try := filepath.Join(root, filepath.FromSlash(pkg))
-		if st, err := os.Stat(try); err == nil && st.IsDir() {
-			dir = try
-		} else {
-			// Non-dir import path: chain is the module root only.
-			dir = root
-		}
+	root = filepath.Clean(root)
+	// Single-directory chain for the resolved package path under root.
+	dir, err := goDirForPkg(root, pkg)
+	if err != nil {
+		return nil, err
 	}
 	return []string{dir}, nil
+}
+
+func goDirForPkg(root, pkg string) (string, error) {
+	pkg = strings.TrimSpace(pkg)
+	if pkg == "" || pkg == "." {
+		return root, nil
+	}
+	if strings.HasPrefix(pkg, "./") {
+		dir := filepath.Join(root, filepath.FromSlash(strings.TrimPrefix(pkg, "./")))
+		if st, err := os.Stat(dir); err != nil || !st.IsDir() {
+			return "", fmt.Errorf("herd-fresh-build: no packages matched '%s' (unknown name/path, or not a workspace package)", pkg)
+		}
+		return dir, nil
+	}
+	if filepath.IsAbs(pkg) {
+		rel, err := filepath.Rel(root, pkg)
+		if err != nil || strings.HasPrefix(rel, "..") {
+			return "", fmt.Errorf("herd-fresh-build: path %q is outside repository root", pkg)
+		}
+		return filepath.Clean(pkg), nil
+	}
+	// Try as repo-relative path.
+	try := filepath.Join(root, filepath.FromSlash(pkg))
+	if st, err := os.Stat(try); err == nil && st.IsDir() {
+		return try, nil
+	}
+	// Non-dir import path: chain is the module root (build still uses pkg).
+	return root, nil
 }
 
 func (g GoProfile) ArtifactNames() ArtifactSpec {
 	// No safe universal stale-artifact set for Go source packages.
 	return ArtifactSpec{}
+}
+
+func (g GoProfile) DryRunClearLine() string {
+	return "herd-fresh-build: --dry-run, would clear nothing (Go profile has no stale-artifact clear step), then rebuild. Nothing changed."
+}
+
+func (g GoProfile) ClearedLine(n int) string {
+	return fmt.Sprintf("herd-fresh-build: no artifact clear for %d package(s) (Go profile); rebuilding...", n)
+}
+
+func (g GoProfile) CleanLine(n int) string {
+	return fmt.Sprintf("herd-fresh-build: fresh package build clean (%d package(s)) -- rebuild succeeded; Go profile does not diagnose stale dist.", n)
+}
+
+func (g GoProfile) RealErrorHeader() string {
+	return "herd-fresh-build: REAL build error:"
 }
 
 func (g GoProfile) Build(ctx context.Context, root, pkg string, log io.Writer) (int, error) {

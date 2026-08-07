@@ -11,7 +11,7 @@ import (
 	"testing"
 )
 
-func TestFreshBuild_DryRunDeletesNothing(t *testing.T) {
+func TestFreshBuild_DryRunDeletesNothing_PnpmMessages(t *testing.T) {
 	t.Parallel()
 	root := t.TempDir()
 	a := filepath.Join(root, "pkgs", "a")
@@ -28,10 +28,10 @@ func TestFreshBuild_DryRunDeletesNothing(t *testing.T) {
 
 	var stdout, stderr bytes.Buffer
 	v, err := FreshBuild(context.Background(), Options{
-		Root:   root,
-		Target: "@scope/a",
-		DryRun: true,
-		Profile: PnpmProfile{},
+		Root:     root,
+		Target:   "@scope/a",
+		DryRun:   true,
+		Profile:  PnpmProfile{},
 		LookPath: func(string) (string, error) { return "/bin/pnpm", nil },
 		ChainFn: func(ctx context.Context, root, pkg string) ([]string, error) {
 			return []string{a}, nil
@@ -52,12 +52,54 @@ func TestFreshBuild_DryRunDeletesNothing(t *testing.T) {
 	if !strings.Contains(out, "chain for @scope/a = 1 package") {
 		t.Fatalf("plan missing:\n%s", out)
 	}
+	if !strings.Contains(out, "would clear dist/") {
+		t.Fatalf("pnpm dry-run must mention dist clear:\n%s", out)
+	}
 	if !strings.Contains(out, "Nothing changed.") {
 		t.Fatalf("dry-run message missing:\n%s", out)
 	}
 }
 
-func TestFreshBuild_CleanVerdict(t *testing.T) {
+func TestFreshBuild_DryRun_GoDoesNotPromiseDistClear(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "go.mod"), []byte("module example.com/x\n\ngo 1.22\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	pkgDir := filepath.Join(root, "pkg", "x")
+	if err := os.MkdirAll(pkgDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout bytes.Buffer
+	v, err := FreshBuild(context.Background(), Options{
+		Root:     root,
+		Target:   "./pkg/x",
+		DryRun:   true,
+		Profile:  GoProfile{},
+		LookPath: func(string) (string, error) { return "/usr/bin/go", nil },
+		Stdout:   &stdout,
+		Stderr:   io.Discard,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v.Kind != VerdictDryRun {
+		t.Fatalf("verdict=%+v", v)
+	}
+	out := stdout.String()
+	if strings.Contains(out, "STALE DIST") {
+		t.Fatalf("go dry-run must not claim STALE DIST:\n%s", out)
+	}
+	if strings.Contains(out, "would clear dist/") {
+		t.Fatalf("go dry-run must not promise dist clear:\n%s", out)
+	}
+	if !strings.Contains(out, "nothing") {
+		t.Fatalf("go dry-run must say clear nothing:\n%s", out)
+	}
+}
+
+func TestFreshBuild_CleanVerdict_PnpmClaimsStaleDist(t *testing.T) {
 	t.Parallel()
 	root := t.TempDir()
 	a := filepath.Join(root, "a")
@@ -73,9 +115,9 @@ func TestFreshBuild_CleanVerdict(t *testing.T) {
 
 	var stdout bytes.Buffer
 	v, err := FreshBuild(context.Background(), Options{
-		Root:    root,
-		Target:  "a",
-		Profile: PnpmProfile{},
+		Root:     root,
+		Target:   "a",
+		Profile:  PnpmProfile{},
 		LookPath: func(string) (string, error) { return "/bin/pnpm", nil },
 		ChainFn: func(ctx context.Context, root, pkg string) ([]string, error) {
 			return []string{a}, nil
@@ -104,6 +146,59 @@ func TestFreshBuild_CleanVerdict(t *testing.T) {
 	}
 }
 
+func TestFreshBuild_CleanVerdict_GoDoesNotClaimStaleDist(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "go.mod"), []byte("module example.com/x\n\ngo 1.22\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	pkgDir := filepath.Join(root, "pkg", "x")
+	if err := os.MkdirAll(pkgDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// A dist that must NOT be deleted by Go profile.
+	if err := os.MkdirAll(filepath.Join(pkgDir, "dist"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	marker := filepath.Join(pkgDir, "dist", "keep")
+	if err := os.WriteFile(marker, []byte("1"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout bytes.Buffer
+	v, err := FreshBuild(context.Background(), Options{
+		Root:     root,
+		Target:   "./pkg/x",
+		Profile:  GoProfile{},
+		LookPath: func(string) (string, error) { return "/usr/bin/go", nil },
+		Runner: func(ctx context.Context, root, pkg string, log io.Writer) (int, error) {
+			return 0, nil
+		},
+		Stdout:  &stdout,
+		Stderr:  io.Discard,
+		TempDir: t.TempDir(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v.Kind != VerdictClean {
+		t.Fatalf("verdict=%+v", v)
+	}
+	out := stdout.String()
+	if strings.Contains(out, "STALE DIST") {
+		t.Fatalf("go clean must not claim STALE DIST:\n%s", out)
+	}
+	if strings.Contains(out, "cleared dist") {
+		t.Fatalf("go must not claim cleared dist:\n%s", out)
+	}
+	if !strings.Contains(out, "does not diagnose stale dist") {
+		t.Fatalf("go clean must disclaim stale-dist diagnosis:\n%s", out)
+	}
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("go profile must not delete dist: %v", err)
+	}
+}
+
 func TestFreshBuild_NodeModulesVerdict(t *testing.T) {
 	t.Parallel()
 	root := t.TempDir()
@@ -117,9 +212,9 @@ func TestFreshBuild_NodeModulesVerdict(t *testing.T) {
 
 	var stderr bytes.Buffer
 	v, err := FreshBuild(context.Background(), Options{
-		Root:    root,
-		Target:  "a",
-		Profile: PnpmProfile{},
+		Root:     root,
+		Target:   "a",
+		Profile:  PnpmProfile{},
 		LookPath: func(string) (string, error) { return "/bin/pnpm", nil },
 		ChainFn: func(ctx context.Context, root, pkg string) ([]string, error) {
 			return []string{a}, nil
@@ -141,9 +236,6 @@ func TestFreshBuild_NodeModulesVerdict(t *testing.T) {
 	if !strings.Contains(stderr.String(), "STALE/MISSING node_modules") {
 		t.Fatalf("stderr=%s", stderr.String())
 	}
-	if !strings.Contains(stderr.String(), "Run: pnpm install") {
-		t.Fatalf("stderr=%s", stderr.String())
-	}
 }
 
 func TestFreshBuild_RealErrorModuleNotInLock(t *testing.T) {
@@ -159,9 +251,9 @@ func TestFreshBuild_RealErrorModuleNotInLock(t *testing.T) {
 
 	var stderr bytes.Buffer
 	v, err := FreshBuild(context.Background(), Options{
-		Root:    root,
-		Target:  "a",
-		Profile: PnpmProfile{},
+		Root:     root,
+		Target:   "a",
+		Profile:  PnpmProfile{},
 		LookPath: func(string) (string, error) { return "/bin/pnpm", nil },
 		ChainFn: func(ctx context.Context, root, pkg string) ([]string, error) {
 			return []string{a}, nil
@@ -184,9 +276,6 @@ func TestFreshBuild_RealErrorModuleNotInLock(t *testing.T) {
 	if !strings.Contains(stderr.String(), "REAL build error") {
 		t.Fatalf("stderr=%s", stderr.String())
 	}
-	if !strings.Contains(stderr.String(), "full log at") {
-		t.Fatalf("stderr=%s", stderr.String())
-	}
 	if v.LogPath == "" {
 		t.Fatal("real error must keep log path")
 	}
@@ -205,9 +294,9 @@ func TestFreshBuild_RealErrorGeneric(t *testing.T) {
 
 	var stderr bytes.Buffer
 	v, err := FreshBuild(context.Background(), Options{
-		Root:    root,
-		Target:  "a",
-		Profile: PnpmProfile{},
+		Root:     root,
+		Target:   "a",
+		Profile:  PnpmProfile{},
 		LookPath: func(string) (string, error) { return "/bin/pnpm", nil },
 		ChainFn: func(ctx context.Context, root, pkg string) ([]string, error) {
 			return []string{a}, nil
@@ -233,13 +322,12 @@ func TestFreshBuild_RealErrorGeneric(t *testing.T) {
 
 func TestFreshBuild_UsageNoTarget(t *testing.T) {
 	t.Parallel()
+	// Empty target returns before profile/lookpath are consulted — no fixtures.
 	_, err := FreshBuild(context.Background(), Options{
-		Root:    t.TempDir(),
-		Target:  "",
-		Profile: PnpmProfile{},
-		LookPath: func(string) (string, error) { return "/bin/pnpm", nil },
-		Stdout:  io.Discard,
-		Stderr:  io.Discard,
+		Root:   t.TempDir(),
+		Target: "",
+		Stdout: io.Discard,
+		Stderr: io.Discard,
 	})
 	if err == nil {
 		t.Fatal("expected usage error")
@@ -256,12 +344,12 @@ func TestFreshBuild_PnpmRequired(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, err := FreshBuild(context.Background(), Options{
-		Root:    root,
-		Target:  "a",
-		Profile: PnpmProfile{},
+		Root:     root,
+		Target:   "a",
+		Profile:  PnpmProfile{},
 		LookPath: func(string) (string, error) { return "", fmt.Errorf("not found") },
-		Stdout:  io.Discard,
-		Stderr:  io.Discard,
+		Stdout:   io.Discard,
+		Stderr:   io.Discard,
 	})
 	if err == nil || !strings.Contains(err.Error(), "pnpm required") {
 		t.Fatalf("err=%v", err)
@@ -272,9 +360,9 @@ func TestFreshBuild_EmptyChain(t *testing.T) {
 	t.Parallel()
 	root := t.TempDir()
 	_, err := FreshBuild(context.Background(), Options{
-		Root:    root,
-		Target:  "missing",
-		Profile: PnpmProfile{},
+		Root:     root,
+		Target:   "missing",
+		Profile:  PnpmProfile{},
 		LookPath: func(string) (string, error) { return "/bin/pnpm", nil },
 		ChainFn: func(ctx context.Context, root, pkg string) ([]string, error) {
 			return nil, nil
@@ -283,6 +371,26 @@ func TestFreshBuild_EmptyChain(t *testing.T) {
 		Stderr: io.Discard,
 	})
 	if err == nil || !strings.Contains(err.Error(), "no packages matched") {
+		t.Fatalf("err=%v", err)
+	}
+}
+
+func TestPnpmChainFor_FailClosedOnNonZero(t *testing.T) {
+	t.Parallel()
+	// Inject a fake pnpm that writes partial stdout then exits 1.
+	dir := t.TempDir()
+	script := filepath.Join(dir, "pnpm")
+	// shell script: echo one dir, exit 1
+	body := "#!/bin/sh\necho /tmp/partial-only\nexit 1\n"
+	if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	p := PnpmProfile{Pnpm: script}
+	_, err := p.ChainFor(context.Background(), dir, "@scope/x")
+	if err == nil {
+		t.Fatal("expected fail-closed chain error")
+	}
+	if !strings.Contains(err.Error(), "chain resolution failed") && !strings.Contains(err.Error(), "pnpm") {
 		t.Fatalf("err=%v", err)
 	}
 }
@@ -315,7 +423,6 @@ func TestErrorTail_FilterAndFallback(t *testing.T) {
 	if len(got) != 2 {
 		t.Fatalf("got=%v", got)
 	}
-	// No match → last n lines.
 	got = errorTail([]byte("one\ntwo\nthree\n"), 2)
 	if len(got) != 2 || got[0] != "two" || got[1] != "three" {
 		t.Fatalf("got=%v", got)

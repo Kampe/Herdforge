@@ -79,6 +79,8 @@ func TestFreshBuildCLI_DryRunBareIsUsage(t *testing.T) {
 	}
 }
 
+// TestFreshBuildCLI_DryRunOnGoModule pins the honest-Go-profile contract:
+// dry-run must not promise a dist/tsbuildinfo clear or claim STALE DIST.
 func TestFreshBuildCLI_DryRunOnGoModule(t *testing.T) {
 	binary := buildHerd(t)
 	root := t.TempDir()
@@ -98,8 +100,42 @@ func TestFreshBuildCLI_DryRunOnGoModule(t *testing.T) {
 	if !strings.Contains(body, "Nothing changed.") {
 		t.Fatalf("expected dry-run plan:\n%s", body)
 	}
-	// Dist must not appear/be required; ensure no panic path.
-	if strings.Contains(body, "REAL build error") {
-		t.Fatalf("dry-run must not rebuild:\n%s", body)
+	if strings.Contains(body, "STALE DIST") {
+		t.Fatalf("Go dry-run must not claim STALE DIST:\n%s", body)
+	}
+	if strings.Contains(body, "would clear dist/") {
+		t.Fatalf("Go dry-run must not promise dist clear:\n%s", body)
+	}
+	if !strings.Contains(body, "nothing") {
+		t.Fatalf("Go dry-run must state clear=nothing:\n%s", body)
+	}
+}
+
+// TestFreshBuildCLI_GoCleanDoesNotLieAboutStaleDist runs a real go build via
+// the CLI and asserts the success line never diagnoses STALE DIST.
+func TestFreshBuildCLI_GoCleanDoesNotLieAboutStaleDist(t *testing.T) {
+	binary := buildHerd(t)
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "go.mod"), []byte("module example.com/tmp\n\ngo 1.22\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "main.go"), []byte("package main\nfunc main() {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	c := exec.Command(binary, "fresh-build", ".")
+	c.Dir = root
+	out, err := c.CombinedOutput()
+	if err != nil {
+		t.Fatalf("fresh-build failed: %v\n%s", err, out)
+	}
+	body := string(out)
+	if strings.Contains(body, "STALE DIST") {
+		t.Fatalf("Go clean rebuild must not claim STALE DIST:\n%s", body)
+	}
+	if strings.Contains(body, "cleared dist") {
+		t.Fatalf("Go clean rebuild must not claim cleared dist:\n%s", body)
+	}
+	if !strings.Contains(body, "does not diagnose stale dist") {
+		t.Fatalf("expected honest Go clean message:\n%s", body)
 	}
 }
