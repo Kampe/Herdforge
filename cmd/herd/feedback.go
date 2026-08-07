@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -40,6 +41,12 @@ func runFeedback() {
 		MailDir:  *mailDir,
 	}
 	if err := feedback.Run(context.Background(), opts); err != nil {
+		// The workspace-unresolved path already printed its exact required
+		// refusal text inside Run; every other error still needs a message
+		// here or a failure exits silently with no diagnostic at all.
+		if !errors.Is(err, feedback.ErrWorkspaceUnresolved) {
+			fmt.Fprintf(os.Stderr, "herd-feedback: %v\n", err)
+		}
 		os.Exit(1)
 	}
 }

@@ -56,21 +56,20 @@ func ResolveWorkspace(root, label, override string, list func() ([]herdr.Workspa
 	return "", ErrWorkspaceUnknown
 }
 
-// CoordinatorTarget ports herd_coordinator_target: the first workspace agent
-// whose name matches coordinator|orchestrator (case-insensitive), identified
-// by name when set, else by pane id. Empty when no agent matches.
+// CoordinatorTarget ports herd_coordinator_target: the name of the first
+// workspace agent whose name matches coordinator|orchestrator
+// (case-insensitive). Empty when no agent matches. There is no pane-id
+// fallback: the match requires a non-empty name, so an agent could never
+// reach this point with one — the original jq `.name // .pane_id` is
+// unreachable for the same reason and is not ported.
 func CoordinatorTarget(agents []herdr.AgentEntry, workspace string) string {
 	for _, a := range agents {
 		if workspace != "" && a.Workspace != workspace {
 			continue
 		}
-		if !coordinatorPattern.MatchString(a.Name) {
-			continue
-		}
-		if a.Name != "" {
+		if coordinatorPattern.MatchString(a.Name) {
 			return a.Name
 		}
-		return a.PaneID
 	}
 	return ""
 }

@@ -3,6 +3,7 @@ package feedback
 import (
 	"bytes"
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	"github.com/Kampe/Herdforge/pkg/herdr"
+	"github.com/Kampe/Herdforge/pkg/winddown"
 )
 
 func TestMissingIsSetDifferenceAndDeterministic(t *testing.T) {
@@ -146,9 +148,10 @@ func TestRunOpensCensusWhenDue(t *testing.T) {
 				{Name: "other-workspace-lane", Workspace: "wOther", Status: "idle"},
 			}, nil
 		},
-		DurableMail: func(ctx context.Context, to, summary, body string) error { sent = append(sent, to); return nil },
-		Wake:        func(ctx context.Context, lane, nudge string) error { return nil },
-		Stdout:      &stdout,
+		DurableMail:   func(ctx context.Context, to, summary, body string) error { sent = append(sent, to); return nil },
+		Wake:          func(ctx context.Context, lane, nudge string) error { return nil },
+		AdmissionGate: func(ctx context.Context) error { return nil },
+		Stdout:        &stdout,
 	}
 	if err := Run(context.Background(), opts); err != nil {
 		t.Fatalf("Run() = %v, want nil", err)
@@ -260,6 +263,105 @@ func TestRunWorkspaceUnresolvedRefusesFalseEmptyCensus(t *testing.T) {
 	}
 }
 
+func TestRunAdmissionGateRejectionSkipsNewCensusWithoutError(t *testing.T) {
+	now := time.Unix(1_800_000_000, 0).UTC()
+	stateDir := t.TempDir()
+	var sent []string
+	var stdout bytes.Buffer
+	opts := Options{
+		Interval: 1800, Grace: 600, StateDir: stateDir, MailDir: t.TempDir(),
+		Workspace: "wF", Coordinator: "coordinator-1", Now: fixedNow(now),
+		AdmissionGate: func(ctx context.Context) error { return winddown.ErrWinddownActive },
+		DurableMail:   func(ctx context.Context, to, summary, body string) error { sent = append(sent, to); return nil },
+		Stdout:        &stdout,
+	}
+	if err := Run(context.Background(), opts); err != nil {
+		t.Fatalf("Run() = %v, want nil (admission rejection is not a command failure)", err)
+	}
+	if len(sent) != 0 {
+		t.Fatalf("admission rejection must not send any envelope, sent=%v", sent)
+	}
+	if !strings.Contains(stdout.String(), "herd-feedback: fleet admission rejected, not starting a new census") {
+		t.Fatalf("stdout missing admission-rejected line: %s", stdout.String())
+	}
+	if _, err := os.Stat(StatePath(stateDir)); !os.IsNotExist(err) {
+		t.Fatalf("admission rejection must not persist a new census, stat err=%v", err)
+	}
+}
+
+// The default AdmissionGate wires to the fleet's real posture authority
+// (pkg/winddown), not a permissive no-op: `herd winddown on` (or simply
+// never having run `herd winddown off`) must stop this census from waking
+// idle lanes, matching every other fleet-capacity-engaging command.
+func TestRunDefaultAdmissionGateHonorsRealWinddownState(t *testing.T) {
+	now := time.Unix(1_800_000_000, 0).UTC()
+	statePath := filepath.Join(t.TempDir(), "winddown.json")
+	t.Setenv("HERD_WINDDOWN_STATE", statePath)
+
+	stateDir := t.TempDir()
+	var sent []string
+	opts := Options{
+		Interval: 1800, Grace: 600, StateDir: stateDir, MailDir: t.TempDir(),
+		Workspace: "wF", Coordinator: "coordinator-1", Now: fixedNow(now),
+		ListAgents: func() ([]herdr.AgentEntry, error) {
+			return []herdr.AgentEntry{{Name: "smith", Workspace: "wF", Status: "idle"}}, nil
+		},
+		DurableMail: func(ctx context.Context, to, summary, body string) error { sent = append(sent, to); return nil },
+		// Kept hermetic: no real herdr wake call from a unit test.
+		Wake:   func(ctx context.Context, lane, nudge string) error { return nil },
+		Stdout: &bytes.Buffer{},
+	}
+	// No winddown state file exists yet: missing state is deliberately
+	// rejected, same as cmd/herd's requireFleetAdmission.
+	if err := Run(context.Background(), opts); err != nil {
+		t.Fatalf("Run() = %v, want nil", err)
+	}
+	if len(sent) != 0 {
+		t.Fatalf("missing winddown state must refuse a new census, sent=%v", sent)
+	}
+
+	a, err := winddown.New(statePath, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.Update(context.Background(), false, "test-actor", "test", 1, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := Run(context.Background(), opts); err != nil {
+		t.Fatalf("Run() = %v, want nil", err)
+	}
+	if !reflect.DeepEqual(sent, []string{"smith"}) {
+		t.Fatalf("sent = %v, want [smith] once winddown is explicitly disabled", sent)
+	}
+}
+
+// A failed enumeration must never be indistinguishable from a genuinely
+// empty fleet: persisting a zero-lane census here would report 0/0 "fully
+// replied" on every subsequent cycle, masking the outage instead of
+// surfacing it.
+func TestRunAgentListFailureSkipsCycleRatherThanOpeningFalseEmptyCensus(t *testing.T) {
+	now := time.Unix(1_800_000_000, 0).UTC()
+	stateDir := t.TempDir()
+	sentinel := errors.New("herdr unavailable")
+	var stderr bytes.Buffer
+	opts := Options{
+		Interval: 1800, Grace: 600, StateDir: stateDir, MailDir: t.TempDir(),
+		Workspace: "wF", Coordinator: "coordinator-1", Now: fixedNow(now),
+		AdmissionGate: func(ctx context.Context) error { return nil },
+		ListAgents:    func() ([]herdr.AgentEntry, error) { return nil, sentinel },
+		Stderr:        &stderr,
+	}
+	if err := Run(context.Background(), opts); err != nil {
+		t.Fatalf("Run() = %v, want nil (a failing herdr must not fail the command)", err)
+	}
+	if !strings.Contains(stderr.String(), "herd-feedback: WARN agent list unavailable") {
+		t.Fatalf("stderr missing the agent-list warning: %s", stderr.String())
+	}
+	if _, err := os.Stat(StatePath(stateDir)); !os.IsNotExist(err) {
+		t.Fatalf("a failed enumeration must not persist a false empty census, stat err=%v", err)
+	}
+}
+
 func TestRunDurableSendFailureIsFatal(t *testing.T) {
 	now := time.Unix(1_800_000_000, 0).UTC()
 	stateDir := t.TempDir()
@@ -269,8 +371,9 @@ func TestRunDurableSendFailureIsFatal(t *testing.T) {
 		ListAgents: func() ([]herdr.AgentEntry, error) {
 			return []herdr.AgentEntry{{Name: "smith", Workspace: "wF", Status: "idle"}}, nil
 		},
-		DurableMail: func(ctx context.Context, to, summary, body string) error { return os.ErrPermission },
-		Stderr:      &bytes.Buffer{},
+		DurableMail:   func(ctx context.Context, to, summary, body string) error { return os.ErrPermission },
+		AdmissionGate: func(ctx context.Context) error { return nil },
+		Stderr:        &bytes.Buffer{},
 	}
 	if err := Run(context.Background(), opts); err == nil {
 		t.Fatal("a failed durable send must fail the whole census, not silently drop the lane")
