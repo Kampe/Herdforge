@@ -161,13 +161,19 @@ type cooldownEntry struct {
 //
 // ttl is clamped to [MinActCooldown, MaxActCooldown]; a caller cannot widen
 // the blast radius of an automated block by passing a large value.
-func Act(dir string, now time.Time, ttl time.Duration, decisions []Decision) ([]string, error) {
+//
+// The directory is router.GlobalStateDir() and is deliberately NOT a
+// parameter. Act has to read the store (to see whose cool is already there)
+// as well as write it, and a caller that could point those at different
+// directories would get a supervisor that checks one store and stamps another.
+func Act(now time.Time, ttl time.Duration, decisions []Decision) ([]string, error) {
 	if ttl < MinActCooldown {
 		ttl = MinActCooldown
 	}
 	if ttl > MaxActCooldown {
 		ttl = MaxActCooldown
 	}
+	dir := router.GlobalStateDir()
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, fmt.Errorf("quota supervisor act: create routing state dir: %w", err)
 	}
@@ -177,6 +183,17 @@ func Act(dir string, now time.Time, ttl time.Duration, decisions []Decision) ([]
 		for _, rp := range RouteProviders(d.Surface.Provider) {
 			path := CooldownPath(dir, rp, d.Surface.Pool)
 			if d.Posture == PostureBlocked {
+				// Someone else's live hold already gates this surface. Do not
+				// restamp it as ours: that both shortens their deadline to our
+				// clamped ttl AND hands us the right to lift it on the next
+				// tick, so two ordinary ticks would silently destroy a manual
+				// hold. Their block and ours have the same effect, so there is
+				// nothing to gain by writing.
+				if reason, held := foreignGate(now, rp, d.Surface.Pool); held {
+					changes = append(changes, fmt.Sprintf("deferred %s/%s to an existing hold: %s",
+						rp, d.Surface.Pool, reason))
+					continue
+				}
 				body, err := json.Marshal(cooldownEntry{
 					Provider:  rp,
 					Pool:      d.Surface.Pool,
@@ -204,6 +221,22 @@ func Act(dir string, now time.Time, ttl time.Duration, decisions []Decision) ([]
 		}
 	}
 	return changes, nil
+}
+
+// foreignGate reports a live cool on this surface that the supervisor did not
+// write.
+//
+// It asks router.CooldownFor rather than reading the file, so "is this surface
+// already held" is answered by the same scoping and expiry rules the launch
+// gate applies. A file that sits at our path but does not actually gate this
+// surface — wrong provider, wrong pool, expired, unparseable — is not a hold,
+// and refusing to write over it would leave an exhausted surface ungated.
+func foreignGate(now time.Time, routeProvider, pool string) (string, bool) {
+	c := router.CooldownFor(now, routeProvider, "", pool)
+	if c == nil || c.Source == ActSource {
+		return "", false
+	}
+	return c.Reason, true
 }
 
 // clearOwnCooldown removes a cool only if this supervisor wrote it. An

@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Kampe/Herdforge/pkg/router"
 	"github.com/Kampe/Herdforge/pkg/usage"
 )
 
@@ -355,6 +356,7 @@ func TestPriorStateColdStartsBlocked(t *testing.T) {
 
 func TestActWritesPoolScopedCoolsAndNeverAProviderWideOne(t *testing.T) {
 	dir := t.TempDir()
+	t.Setenv("HERDR_ROUTE_STATE_DIR", dir)
 	blocked := Decision{
 		Surface: Surface{Provider: "antigravity", Pool: "gemini"},
 		Cap:     0, Posture: PostureBlocked, Reason: "exhausted (98% used, window 5h)",
@@ -363,7 +365,7 @@ func TestActWritesPoolScopedCoolsAndNeverAProviderWideOne(t *testing.T) {
 		Surface: Surface{Provider: "antigravity", Pool: "nonGemini"},
 		Cap:     3, Posture: PostureOpen, Reason: "healthy",
 	}
-	if _, err := Act(dir, fakeNow, MaxActCooldown, []Decision{blocked, open}); err != nil {
+	if _, err := Act(fakeNow, MaxActCooldown, []Decision{blocked, open}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -382,6 +384,7 @@ func TestActWritesPoolScopedCoolsAndNeverAProviderWideOne(t *testing.T) {
 
 func TestActClampsCooldownLifetime(t *testing.T) {
 	dir := t.TempDir()
+	t.Setenv("HERDR_ROUTE_STATE_DIR", dir)
 	d := Decision{Surface: Surface{Provider: "claude", Pool: "fable"}, Posture: PostureBlocked, Reason: "exhausted"}
 	for _, c := range []struct {
 		name string
@@ -393,7 +396,7 @@ func TestActClampsCooldownLifetime(t *testing.T) {
 		{"in range", 10 * time.Minute, 10 * time.Minute},
 	} {
 		t.Run(c.name, func(t *testing.T) {
-			if _, err := Act(dir, fakeNow, c.ttl, []Decision{d}); err != nil {
+			if _, err := Act(fakeNow, c.ttl, []Decision{d}); err != nil {
 				t.Fatal(err)
 			}
 			var e struct {
@@ -419,6 +422,7 @@ func TestActClampsCooldownLifetime(t *testing.T) {
 
 func TestActLiftsOnlyItsOwnCools(t *testing.T) {
 	dir := t.TempDir()
+	t.Setenv("HERDR_ROUTE_STATE_DIR", dir)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -436,7 +440,7 @@ func TestActLiftsOnlyItsOwnCools(t *testing.T) {
 	write(mine, ActSource)
 	write(theirs, "") // a human's manual hold
 
-	changes, err := Act(dir, fakeNow, MaxActCooldown, []Decision{
+	changes, err := Act(fakeNow, MaxActCooldown, []Decision{
 		{Surface: Surface{Provider: "claude", Pool: "default"}, Cap: 2, Posture: PostureOpen, Reason: "healthy"},
 		{Surface: Surface{Provider: "claude", Pool: "fable"}, Cap: 2, Posture: PostureOpen, Reason: "healthy"},
 	})
@@ -458,8 +462,9 @@ func TestActLiftsOnlyItsOwnCools(t *testing.T) {
 // of them or launches keep landing on the pool through an alias.
 func TestActCoolsEveryRouteProviderMeteredByTheLedger(t *testing.T) {
 	dir := t.TempDir()
+	t.Setenv("HERDR_ROUTE_STATE_DIR", dir)
 	d := Decision{Surface: Surface{Provider: "opencode", Pool: "default"}, Posture: PostureBlocked, Reason: "exhausted"}
-	if _, err := Act(dir, fakeNow, MaxActCooldown, []Decision{d}); err != nil {
+	if _, err := Act(fakeNow, MaxActCooldown, []Decision{d}); err != nil {
 		t.Fatal(err)
 	}
 	for _, rp := range []string{"opencode", "ollama", "lazer"} {
@@ -493,7 +498,7 @@ func TestSupervisorDoesNotReadBackItsOwnCoolAsEvidence(t *testing.T) {
 	s := Surface{Provider: "claude", Pool: "fable"}
 
 	blocked := Decision{Surface: s, Cap: 0, Posture: PostureBlocked, Reason: "exhausted (97% used)"}
-	if _, err := Act(dir, fakeNow, MaxActCooldown, []Decision{blocked}); err != nil {
+	if _, err := Act(fakeNow, MaxActCooldown, []Decision{blocked}); err != nil {
 		t.Fatal(err)
 	}
 	if got := SurfaceCooldown(fakeNow, s); got != "" {
@@ -529,7 +534,7 @@ func TestBlockedSurfaceRecoversThroughActAcrossRuns(t *testing.T) {
 			Cooldown: SurfaceCooldown(now, s),
 		}.Grade(now, DefaultWarnRunwayMinutes, 0)
 		next := &Snapshot{Decisions: []Decision{Decide(s, e, PriorState(prior, s))}}
-		if _, err := Act(dir, now, MaxActCooldown, next.Decisions); err != nil {
+		if _, err := Act(now, MaxActCooldown, next.Decisions); err != nil {
 			t.Fatal(err)
 		}
 		return next
@@ -558,5 +563,136 @@ func TestBlockedSurfaceRecoversThroughActAcrossRuns(t *testing.T) {
 	}
 	if _, err := os.Stat(CooldownPath(dir, "claude", "fable")); !os.IsNotExist(err) {
 		t.Fatal("a fully recovered surface is still cooled")
+	}
+}
+
+// A human hold sits on the SAME file the supervisor would write to block. Two
+// ordinary ticks must not be able to destroy it: tick one would restamp it as
+// ours (shortening a 6h hold to our clamped ttl), and tick two would lift it,
+// because the supervisor skips its own cools when grading.
+func TestActNeverRestampsOrLiftsALiveForeignHold(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("HERDR_ROUTE_STATE_DIR", dir)
+	s := Surface{Provider: "claude", Pool: "fable"}
+	path := CooldownPath(dir, "claude", "fable")
+
+	body, _ := json.Marshal(map[string]any{
+		"provider": "claude", "pool": "fable",
+		"expiresAt": fakeNow.Add(6 * time.Hour).Unix(),
+		"reason":    "manual hold: incident 4471",
+	})
+	if err := os.WriteFile(path, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Tick 1: the hold makes the surface blocked; Act enforces the block.
+	e1 := Observation{Surface: s, SourceAt: fakeNow, Cooldown: SurfaceCooldown(fakeNow, s)}.
+		Grade(fakeNow, DefaultWarnRunwayMinutes, 0)
+	d1 := Decide(s, e1, State{Cap: 2, Streak: 5})
+	if d1.Posture != PostureBlocked {
+		t.Fatalf("held surface posture = %s", d1.Posture)
+	}
+	if _, err := Act(fakeNow, MaxActCooldown, []Decision{d1}); err != nil {
+		t.Fatal(err)
+	}
+
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("hold file gone after tick 1: %v", err)
+	}
+	var got struct {
+		Reason    string `json:"reason"`
+		Source    string `json:"source"`
+		ExpiresAt int64  `json:"expiresAt"`
+	}
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Reason != "manual hold: incident 4471" || got.Source != "" {
+		t.Fatalf("tick 1 rewrote the human hold: %+v", got)
+	}
+
+	// Tick 2: if tick 1 had stamped it as ours, this lifts it entirely.
+	later := fakeNow.Add(time.Minute)
+	e2 := Observation{Surface: s, SourceAt: later, Cooldown: SurfaceCooldown(later, s)}.
+		Grade(later, DefaultWarnRunwayMinutes, 0)
+	if _, err := Act(later, MaxActCooldown, []Decision{Decide(s, e2, d1.State())}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("the supervisor destroyed a live human hold: %v", err)
+	}
+}
+
+// The block path must also refuse to overwrite a foreign hold, and must still
+// write when the file at that path is NOT actually gating the surface —
+// deferring to an inert file would leave an exhausted surface open.
+func TestActBlockPathDefersToLiveHoldsOnlyNotInertFiles(t *testing.T) {
+	blocked := Decision{
+		Surface: Surface{Provider: "claude", Pool: "fable"},
+		Posture: PostureBlocked, Reason: "exhausted",
+	}
+	cases := []struct {
+		name       string
+		entry      map[string]any
+		wantOurs   bool
+		wantChange string
+	}{
+		{
+			name: "live foreign hold is left alone",
+			entry: map[string]any{"provider": "claude", "pool": "fable",
+				"expiresAt": fakeNow.Add(time.Hour).Unix(), "reason": "manual hold"},
+			wantOurs: false, wantChange: "deferred",
+		},
+		{
+			// Expired: the router already ignores it, so it gates nothing.
+			name: "expired foreign entry is replaced",
+			entry: map[string]any{"provider": "claude", "pool": "fable",
+				"expiresAt": fakeNow.Add(-time.Hour).Unix(), "reason": "old hold"},
+			wantOurs: true, wantChange: "cooled",
+		},
+		{
+			// Scoped to another provider: never gated this surface.
+			name: "foreign entry for a different provider is replaced",
+			entry: map[string]any{"provider": "grok", "pool": "fable",
+				"expiresAt": fakeNow.Add(time.Hour).Unix(), "reason": "grok hold"},
+			wantOurs: true, wantChange: "cooled",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			dir := t.TempDir()
+			t.Setenv("HERDR_ROUTE_STATE_DIR", dir)
+			path := CooldownPath(dir, "claude", "fable")
+			body, _ := json.Marshal(c.entry)
+			if err := os.WriteFile(path, body, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			changes, err := Act(fakeNow, MaxActCooldown, []Decision{blocked})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(changes) != 1 || !strings.HasPrefix(changes[0], c.wantChange) {
+				t.Fatalf("changes = %v, want one %q line", changes, c.wantChange)
+			}
+			raw, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var got struct {
+				Source string `json:"source"`
+				Reason string `json:"reason"`
+			}
+			if err := json.Unmarshal(raw, &got); err != nil {
+				t.Fatal(err)
+			}
+			if ours := got.Source == ActSource; ours != c.wantOurs {
+				t.Fatalf("entry after Act = %+v; ours=%v want ours=%v", got, ours, c.wantOurs)
+			}
+			// Whatever happened, the surface must end up gated.
+			if router.CooldownFor(fakeNow, "claude", "", "fable") == nil {
+				t.Fatal("blocked surface left ungated")
+			}
+		})
 	}
 }
