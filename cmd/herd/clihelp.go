@@ -70,7 +70,9 @@ var subcommandUsage = map[string]string{
 	"review-ledger": "Usage: herd review-ledger [flags]\n  Append-only review ledger operations.",
 	"drain":         "Usage: herd drain [flags]\n  Drain control / review backlog.",
 	"approve":       "Usage: herd approve [flags]\n  Approve a reviewed candidate.",
-	"board-done":    "Usage: herd board-done <ref> [--evidence <sha>] [--force]\n  Mark board card done with evidence.",
+	"board-done": "Usage: herd board-done <ref> [--receipt <path>] [--override-policy <p> --override-actor <who> --override-reason <why> --override-evidence <what>]\n" +
+		"  Close a card from its task-bound completion receipt, or by an attributable manual override.",
+	"board-audit": "Usage: herd board-audit [--json]\n  Report Done cards no completion receipt closed. Read-only; never mutates the board.",
 	"board-sync":    "Usage: herd board-sync [flags]\n  Reconcile multi-board state.",
 	"sh":            "Usage: herd sh\n  Interactive REPL shell (alias: herd repl).",
 	"repl":          "Usage: herd repl\n  Interactive REPL shell (alias: herd sh).",
