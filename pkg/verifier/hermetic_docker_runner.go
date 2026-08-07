@@ -109,7 +109,11 @@ type dockerCommandError struct {
 }
 
 func (e *dockerCommandError) Error() string {
-	return fmt.Sprintf("docker %s failed with exit status %d: %s", e.Operation, e.ExitCode, e.Stderr)
+	msg := e.Stderr
+	if msg == "" {
+		msg = "(no stderr)"
+	}
+	return fmt.Sprintf("docker %s failed with exit status %d: %s", e.Operation, e.ExitCode, msg)
 }
 
 func (e *dockerCommandError) Unwrap() error { return e.Cause }
@@ -381,10 +385,20 @@ func (r *hermeticDockerRunner) Run(ctx context.Context) (result FAC151DockerResu
 	sum := sha256.Sum256(execution.Output)
 	result.OutputDigest = "sha256:" + hex.EncodeToString(sum[:])
 	if execErr != nil || execution.ExitCode != 0 {
-		if execErr != nil {
-			return result, fmt.Errorf("FAC-151 verifier exited: %w", execErr)
+		detail := strings.TrimSpace(string(execution.Output))
+		if len(detail) > 4096 {
+			detail = detail[len(detail)-4096:]
 		}
-		return result, fmt.Errorf("FAC-151 verifier exited with status %d", execution.ExitCode)
+		if execErr != nil {
+			if detail == "" {
+				return result, fmt.Errorf("FAC-151 verifier exited: %w", execErr)
+			}
+			return result, fmt.Errorf("FAC-151 verifier exited: %w\n%s", execErr, detail)
+		}
+		if detail == "" {
+			return result, fmt.Errorf("FAC-151 verifier exited with status %d", execution.ExitCode)
+		}
+		return result, fmt.Errorf("FAC-151 verifier exited with status %d\n%s", execution.ExitCode, detail)
 	}
 	return result, nil
 }
@@ -831,7 +845,11 @@ func runDocker(ctx context.Context, input []byte, args []string) (dockerResult, 
 func runDockerWithProcess(ctx context.Context, input []byte, args []string, process dockerCommandFunc) (dockerResult, error) {
 	result, err := process(ctx, input, args)
 	if err != nil {
-		return result, &dockerCommandError{Operation: dockerOperation(args), ExitCode: result.ExitCode, Stderr: string(result.Stderr), Cause: err}
+		msg := string(result.Stderr)
+	if strings.TrimSpace(msg) == "" {
+		msg = string(result.Stdout)
+	}
+	return result, &dockerCommandError{Operation: dockerOperation(args), ExitCode: result.ExitCode, Stderr: msg, Cause: err}
 	}
 	return result, nil
 }
