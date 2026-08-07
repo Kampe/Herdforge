@@ -339,7 +339,7 @@ func printUsage() {
 	fmt.Println("  stash        Worktree-scoped stash that cannot collide across lanes")
 	fmt.Println("  park         Make parked work durable (annotated pushed tag) + audit exposure")
 	fmt.Println("  wave         Pre-wave checklist; --standing also raises the standing fleet")
-	fmt.Println("  quota-supervisor  Map live agents to their real pools and report capacity transitions")
+	fmt.Println("  quota-supervisor  Convert live quota, cooldown and process evidence into per-surface concurrency caps")
 	fmt.Println("  rescue       Move a cramped pane to its own tab; --empty-siblings closes blank shells")
 	fmt.Println("  seed-lane-state   Restore or seed a lane's state artifacts (never overwrites)")
 	fmt.Println("  spin         Detect stalled (frozen output) and spinning (no git delta) panes")
