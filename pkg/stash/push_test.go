@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -234,7 +235,7 @@ func TestPushRevertFailureKeepsRef(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Inject a failing revert AFTER the ref has been stored. The entry must
-	// remain so the caller can recover with bin/herd-stash apply.
+	// remain so the caller can recover with herd stash apply.
 	revertHook = func(ctx context.Context, r Repo, scoped []string) error {
 		return errors.New("simulated revert failure")
 	}
@@ -245,8 +246,11 @@ func TestPushRevertFailureKeepsRef(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected revert failure")
 	}
-	if !strings.Contains(err.Error(), "recover with: bin/herd-stash apply") {
+	if !strings.Contains(err.Error(), "recover with: herd stash apply") {
 		t.Fatalf("error must name recover path, got %v", err)
+	}
+	if strings.Contains(err.Error(), "bin/herd-stash") {
+		t.Fatalf("must not name non-existent bin/herd-stash binary: %v", err)
 	}
 	if ref == "" {
 		t.Fatal("ref must be returned even on revert failure")
@@ -263,6 +267,46 @@ func TestPushRevertFailureKeepsRef(t *testing.T) {
 	body, _ := os.ReadFile(filepath.Join(dir, "f.txt"))
 	if string(body) != "dirty\n" {
 		t.Fatalf("worktree must still hold WIP after failed revert, got %q", body)
+	}
+}
+
+// TestPlainStashCreateFailsClosedOnGitError proves a non-zero `git stash create`
+// with empty output is a hard error — never remapped to ErrNoChanges / exit 0.
+// The previous swallow treated empty+err as "nothing to save" while the worktree
+// stayed dirty (fail-open against CLAUDE.md hard rule #2).
+func TestPlainStashCreateFailsClosedOnGitError(t *testing.T) {
+	r, dir := newRepo(t)
+	if err := os.WriteFile(filepath.Join(dir, "f.txt"), []byte("still-dirty\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	orig := execCommandContext
+	t.Cleanup(func() { execCommandContext = orig })
+	execCommandContext = func(ctx context.Context, name string, args ...string) *exec.Cmd {
+		// Simulate cancel/exec failure: non-zero exit, empty stdout/stderr.
+		return exec.CommandContext(ctx, "sh", "-c", "exit 1")
+	}
+
+	ref, err := r.PushOpts(context.Background(), PushOptions{Message: "must-fail"})
+	if err == nil {
+		t.Fatal("git stash create failure must not succeed")
+	}
+	if errors.Is(err, ErrNoChanges) {
+		t.Fatalf("must not remap git failure to ErrNoChanges (exit 0 path), got %v", err)
+	}
+	if !strings.Contains(err.Error(), "git stash create") {
+		t.Fatalf("error must name the failing step, got %v", err)
+	}
+	if ref != "" {
+		t.Fatalf("no ref on create failure, got %q", ref)
+	}
+	if refs, _ := r.Entries(); len(refs) != 0 {
+		t.Fatalf("must not write a ref after create failure, got %v", refs)
+	}
+	// Worktree still dirty — nothing was saved or reverted.
+	body, _ := os.ReadFile(filepath.Join(dir, "f.txt"))
+	if string(body) != "still-dirty\n" {
+		t.Fatalf("worktree must stay dirty after create failure, got %q", body)
 	}
 }
 

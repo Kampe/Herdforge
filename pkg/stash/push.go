@@ -75,7 +75,7 @@ func ParsePushArgs(args []string) (msg string, paths []string, err error) {
 //
 // Returns the full ref written. ErrNoChanges when there is nothing to save
 // (exit-0 at the CLI). On revert failure the ref is KEPT and the error names
-// the recover path (`herd stash apply` / `bin/herd-stash apply`).
+// the recover path (`herd stash apply`).
 func (r Repo) Push(msg string) (string, error) {
 	return r.PushOpts(context.Background(), PushOptions{Message: msg})
 }
@@ -126,13 +126,13 @@ func (r Repo) PushOpts(ctx context.Context, opts PushOptions) (string, error) {
 		inHead, _ := r.splitInHead(ctx, opts.ScopedPaths)
 		if err := r.revertWorktree(ctx, inHead); err != nil {
 			// Ref is KEPT — the only copy of the work lives there now.
-			return ref, fmt.Errorf("stored %s but could not revert %v; recover with: bin/herd-stash apply: %w", ref, inHead, err)
+			return ref, fmt.Errorf("stored %s but could not revert %v; recover with: herd stash apply: %w", ref, inHead, err)
 		}
 		fmt.Fprintf(stderr, "herd-stash: saved %s %q scoped to: %s; only those paths reverted to HEAD\n",
 			ref, msg, strings.Join(inHead, " "))
 	} else {
 		if err := r.revertWorktree(ctx, nil); err != nil {
-			return ref, fmt.Errorf("stored %s but could not revert; recover with: bin/herd-stash apply: %w", ref, err)
+			return ref, fmt.Errorf("stored %s but could not revert; recover with: herd stash apply: %w", ref, err)
 		}
 		fmt.Fprintf(stderr, "herd-stash: saved %s %q; worktree reverted to HEAD (untracked left in place)\n", ref, msg)
 	}
@@ -163,14 +163,15 @@ func (r Repo) revertWorktree(ctx context.Context, scopedPaths []string) error {
 // WITHOUT touching refs/stash — that is what makes this safe across lanes.
 func (r Repo) plainStashCreate(ctx context.Context, msg string) (string, error) {
 	// stash create prints nothing (and exits 0) when there are no changes.
+	// Fail closed on non-zero exit: empty output with err is a real failure
+	// (cancel, exec, signal), not "nothing to save".
 	cmd := execCommandContext(ctx, "git", "stash", "create", msg)
 	cmd.Dir = r.Dir
 	out, err := cmd.CombinedOutput()
 	text := strings.TrimSpace(string(out))
 	if err != nil {
-		// Treat empty output as "nothing to save" (matches zsh: || true).
 		if text == "" {
-			return "", nil
+			return "", fmt.Errorf("git stash create: %w", err)
 		}
 		return "", fmt.Errorf("git stash create: %w: %s", err, text)
 	}
