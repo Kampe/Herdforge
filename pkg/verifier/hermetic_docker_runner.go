@@ -1571,7 +1571,13 @@ func isDockerContainerAbsent(err error, id string) bool {
 		return false
 	}
 	stderr := strings.TrimSpace(commandErr.Stderr)
-	return stderr == "Error response from daemon: No such container: "+id || stderr == "Error: No such object: "+id
+	// Docker Engine serializations vary by version/context.
+	return stderr == "Error response from daemon: No such container: "+id ||
+		stderr == "Error: No such object: "+id ||
+		stderr == "error: no such object: "+id ||
+		strings.EqualFold(stderr, "Error: No such object: "+id) ||
+		strings.Contains(strings.ToLower(stderr), "no such object: "+strings.ToLower(id)) ||
+		strings.Contains(strings.ToLower(stderr), "no such container: "+strings.ToLower(id))
 }
 
 func isDockerImageAbsent(err error, reference string) bool {
