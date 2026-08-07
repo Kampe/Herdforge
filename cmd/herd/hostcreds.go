@@ -29,8 +29,6 @@ func runHostCreds() {
 		os.Exit(runHostCredsLive(os.Args[3:]))
 	case "boundary":
 		os.Exit(runHostCredsBoundary(os.Args[3:]))
-	case "worker-probe":
-		os.Exit(runHostCredsWorkerProbe(os.Args[3:]))
 	case "author-causal":
 		os.Exit(runHostCredsAuthorCausal(os.Args[3:]))
 	case "-h", "--help", "help":
@@ -52,7 +50,6 @@ Usage:
   herd hostcreds selftest
   herd hostcreds boundary          # reports FAC-169 dependency status
   herd hostcreds live --kind <grok|claude|codex>
-  herd hostcreds worker-probe  ... (deprecated helper; not live admission)
   herd hostcreds author-causal --proxy URL --allow-host H --deny-host D --session S --nonce N --out FILE
        # exact author child: inherited HERD_HOSTCREDS_CLAIM_FD=3 one-shot peer
 
@@ -81,39 +78,6 @@ func runHostCredsAuthorCausal(args []string) int {
 		fmt.Fprintln(os.Stderr, "author-causal: --proxy --allow-host --out required")
 		return 2
 	}
-	if err := security.RunAuthorCausalInProcess(security.AuthorCausalConfig{
-		ProxyURL: *proxy, AllowHost: *allow, DenyHost: *deny,
-		SessionID: *session, Nonce: *nonce, OutPath: *out,
-		ConnectOnly: *connectOnly, Method: *method, Path: *path,
-	}); err != nil {
-		fmt.Fprintln(os.Stderr, err.Error())
-		return 1
-	}
-	return 0
-}
-
-func runHostCredsWorkerProbe(args []string) int {
-	// Deprecated: helper split is not exact-session admission. Still available
-	// for low-level CONNECT checks via author-causal --connect-only preferred.
-	fs := flag.NewFlagSet("hostcreds worker-probe", flag.ContinueOnError)
-	fs.SetOutput(os.Stderr)
-	proxy := fs.String("proxy", "", "HTTP proxy URL")
-	allow := fs.String("allow-host", "", "allowlisted host for CONNECT")
-	deny := fs.String("deny-host", "evil.example.invalid", "forbidden host")
-	session := fs.String("session", "", "session id")
-	nonce := fs.String("nonce", "", "capability nonce")
-	out := fs.String("out", "", "result JSON path")
-	connectOnly := fs.Bool("connect-only", false, "CONNECT status only")
-	method := fs.String("method", "POST", "TLS HTTP method after CONNECT")
-	path := fs.String("path", "/v1/chat/completions", "TLS HTTP path after CONNECT")
-	if err := fs.Parse(args); err != nil {
-		return 2
-	}
-	if *proxy == "" || *allow == "" || *out == "" {
-		fmt.Fprintln(os.Stderr, "worker-probe: --proxy --allow-host --out required")
-		return 2
-	}
-	// Route to author-causal body (inherited FD) — claim-file path removed.
 	if err := security.RunAuthorCausalInProcess(security.AuthorCausalConfig{
 		ProxyURL: *proxy, AllowHost: *allow, DenyHost: *deny,
 		SessionID: *session, Nonce: *nonce, OutPath: *out,

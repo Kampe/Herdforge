@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/Kampe/Herdforge/pkg/security"
 )
 
 func TestHostCredsCLI_Selftest(t *testing.T) {
@@ -51,10 +53,15 @@ func TestHostCredsCLI_OpenCodeRejected(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected reject")
 	}
+	// diagnose --kind opencode reports BLOCKED via DiagnoseKindAuthReadiness
+	// (class config) or an explicit out-of-scope reject. This was a t.Logf, so
+	// the wording was unguarded and the branch could never fail the test.
 	if !strings.Contains(string(out), "out of scope") && !strings.Contains(string(out), "BLOCKED") {
-		// diagnose --kind opencode returns class config BLOCKED via DiagnoseKindAuthReadiness
-		// or explicit open code reject
-		t.Logf("out=%s", out)
+		t.Fatalf("opencode rejection must say BLOCKED or out of scope; got:\n%s", out)
+	}
+	// The rejection must not leak credential material.
+	if security.RedactSecrets(string(out)) != string(out) {
+		t.Fatalf("opencode rejection carries secret-shaped material:\n%s", out)
 	}
 }
 
