@@ -1,17 +1,17 @@
 ---
 name: herd
-description: Operate the Herdforge self-forging multi-agent software factory. Use for standing agents, pulse sweeps from Kaneo, task-packet delivery to agents, review pipeline, and worktree lane management.
+description: Operate the Herdforge self-forging multi-agent software factory. Use for standing agents, pulse sweeps from Linear, task-packet delivery to agents, review pipeline, and worktree lane management.
 ---
 
 # Herdforge Agent Skill Guide
 
-Herdforge is a **self-forging** orchestration daemon — it claims its own Kaneo board cards,
+Herdforge is a **self-forging** orchestration daemon — it claims its own Linear issues,
 spawns/uses standing agents in herdr, and moves work through review without human intervention.
 
 ## Prerequisites
 
 - **herdr** must be installed (`brew install herdr` or `npm install -g herdr`)
-- **kaneo** CLI must be configured (`~/.config/kaneo/config.json`) when `use_cli: true`
+- **LINEAR_API_KEY** must be set in the environment (keep it outside Git)
 - Workspace `wF` must exist in herdr for standing lanes
 
 ## Core Workflow
@@ -36,9 +36,9 @@ herd pulse --role reviewer --spawn
 ```
 
 What happens:
-1. Lists all `to-do` cards from Kaneo
+1. Lists eligible Linear issues for the role
 2. Sorts by priority DESC, ref ASC
-3. Claims the top card (moves to `in-progress` via `kaneo task status`)
+3. Claims the top issue (moves to in-progress)
 4. Resolves the standing agent by name (`forge-worker`, `forge-forge-smith`, etc.)
 5. Delivers a structured task packet via `herdr agent prompt`
 
@@ -57,7 +57,7 @@ herdr agent read forge-reviewer --source recent --lines 20
 | `herd preflight` | Check repo-relative path violations |
 | `herd status` | Show project, provider, lane config |
 | `herd standing` | Launch all lane agents in herdr tabs |
-| `herd pulse --role <r> --spawn` | Claim next Kaneo card, deliver task packet to standing agent |
+| `herd pulse --role <r> --spawn` | Claim next Linear issue, deliver task packet to standing agent |
 | `herd up <lane-name>` | Start a single lane agent |
 | `herd selftest` | Run self-test suite |
 
@@ -67,11 +67,11 @@ herdr agent read forge-reviewer --source recent --lines 20
 # 1. Launch lanes
 herd standing
 
-# 2. Run pulse — claims the next worker-eligible card
+# 2. Run pulse — claims the next worker-eligible issue
 herd pulse --role worker --spawn
 
 # Output:
-#   Pulse sweep claimed task [FAC-33]: Port herd-next to Go
+#   Pulse sweep claimed task [SPE-589]: Provider-aware route probe
 #   Using standing agent 'forge-worker' (tab wF:t7)
 #   -> delivered task packet to forge-worker
 
@@ -81,18 +81,23 @@ herdr agent read forge-worker --source recent --lines 30
 
 ## Config
 
-The `.herd/herd.yaml` defines lanes, provider, and Kaneo integration:
+The `.herd/herd.yaml` defines lanes, provider, and Linear integration:
 
 ```yaml
 task_provider:
-  type: "kaneo"
-  project_id: "b939c5jzixruza3vvywrg1hs"
-  use_cli: true
+  type: "linear"
+  project_id: "replace-with-linear-project-id"
+  api_key_env: "LINEAR_API_KEY"
 
 lanes:
   - name: "worker"
     role: "worker"
-    agent_kind: "opencode"
+    agent_kind: "pi"
+    harness: "pi"
+    provider: "codex"
+    model: "gpt-5.6-luna"
+    effort: "medium"
+    task_shape: "implementation"
     prompt: ".herd/prompts/worker.md"
     worktree: ".worktrees/worker"
 ```

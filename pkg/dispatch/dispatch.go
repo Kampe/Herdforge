@@ -786,6 +786,19 @@ func closeTabLocal(h HerdrLauncher, tabID, reason string, primary error) error {
 	return primary
 }
 
+// requireControlOrdersOrClose returns non-nil orders unchanged. A nil factory
+// result is a control_factory_failed intent with local tab cleanup only.
+func requireControlOrdersOrClose(h HerdrLauncher, tabID string, orders *control.CoordinatorOrders) (*control.CoordinatorOrders, error) {
+	if orders != nil {
+		return orders, nil
+	}
+	primary := fmt.Errorf("nil control orders")
+	return nil, &launchFailure{
+		Reason: "control_factory_failed",
+		Err:    closeTabLocal(h, tabID, "control_factory_failed", primary),
+	}
+}
+
 func (d *Dispatcher) launch(
 	ctx context.Context,
 	opts DispatchOptions,
@@ -878,7 +891,7 @@ func (d *Dispatcher) launch(
 		}
 	}
 
-	if err := h.AgentStart(request, tabLabel, request.Decision.Provider, tab.Pane.ID); err != nil {
+	if err := h.AgentStart(request, tabLabel, request.Decision.Harness, tab.Pane.ID); err != nil {
 		// Local orphan-tab cleanup only — outer failOwned owns durable compensate.
 		return &launchFailure{
 			Reason: "agent_start_failed",
@@ -916,7 +929,7 @@ func (d *Dispatcher) launch(
 		identity.Repository = repository
 		identity.CandidateSHA = opts.Decision.CandidateSHA
 	}
-	wakeTarget := control.WakeTarget{Target: tabLabel, Workspace: ws, TabID: tab.ID, PaneID: tab.Pane.ID, AgentName: tabLabel, Provider: request.Decision.Provider, LeaseGeneration: result.LeaseGeneration}
+	wakeTarget := control.WakeTarget{Target: tabLabel, Workspace: ws, TabID: tab.ID, PaneID: tab.Pane.ID, AgentName: tabLabel, Provider: request.Decision.Harness, LeaseGeneration: result.LeaseGeneration}
 	check := func(checkCtx context.Context, o control.Order) error {
 		if o.LaneIdentity != identity {
 			return control.ErrStaleIdentity
@@ -952,8 +965,10 @@ func (d *Dispatcher) launch(
 		if factoryErr != nil {
 			return &launchFailure{Reason: "control_factory_failed", Err: closeTabLocal(h, tab.ID, "control_factory_failed", factoryErr)}
 		}
-		if orders == nil {
-			return &launchFailure{Reason: "control_factory_failed", Err: fmt.Errorf("nil control orders")}
+		var orderGuardErr error
+		orders, orderGuardErr = requireControlOrdersOrClose(h, tab.ID, orders)
+		if orderGuardErr != nil {
+			return orderGuardErr
 		}
 		var orderErr error
 		evidence, orderErr = orders.Repair(ctx, packet)

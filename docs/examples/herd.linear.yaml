@@ -13,11 +13,14 @@ task_provider:
 lanes:
   - name: "worker"
     role: "worker"
-    agent_kind: "opencode"
-    harness: "opencode"
+    agent_kind: "pi"
+    harness: "pi"
+    provider: "codex"
+    model: "gpt-5.6-luna"
+    effort: "medium"
+    task_shape: "implementation"
     prompt: ".herd/prompts/worker.md"
     worktree: ".worktrees/worker"
-    model: "replace-with-approved-worker-model"
 
 verification:
   test_command: "make ci"

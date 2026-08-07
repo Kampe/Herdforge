@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/Kampe/Herdforge/pkg/launch"
+	"github.com/Kampe/Herdforge/pkg/router"
 	"github.com/Kampe/Herdforge/pkg/toolchild"
 )
 
@@ -29,6 +30,18 @@ const (
 
 // runHerdr is overridable for crash-point / unit tests (FAC-121).
 var runHerdr = runHerdrReal
+
+var (
+	ownerBindTimeout      = 20 * time.Second
+	ownerBindPollInterval = 100 * time.Millisecond
+)
+
+// SetOwnerBindTimingForTest overrides bounded owner readiness polling.
+func SetOwnerBindTimingForTest(timeout, poll time.Duration) func() {
+	oldTimeout, oldPoll := ownerBindTimeout, ownerBindPollInterval
+	ownerBindTimeout, ownerBindPollInterval = timeout, poll
+	return func() { ownerBindTimeout, ownerBindPollInterval = oldTimeout, oldPoll }
+}
 
 // ToolChildLifecycle is the narrow process-tree seam used by every real
 // launch. Tests install a FakeTree-backed implementation; production uses the
@@ -86,12 +99,35 @@ func PrepareToolChildLifecycle(tabID, paneID string, req launch.Request, name st
 	if req.Decision == nil || req.TaskRef == "" || req.Repository == "" || req.Lane == "" || (req.Scope != "lane" && req.LeaseGeneration <= 0) {
 		return fmt.Errorf("complete launch identity is required before lifecycle preparation")
 	}
+	if err := launch.Validate(req, nil); err != nil {
+		return err
+	}
 	if req.SessionGeneration <= 0 {
 		var err error
 		req.SessionGeneration, err = toolchild.NextSessionGeneration(req.Repository)
 		if err != nil {
 			return fmt.Errorf("durable Herdr session generation: %w", err)
 		}
+	}
+	if req.Decision.Harness != router.PiHarness {
+		return fmt.Errorf("tool-child lifecycle requires Pi harness")
+	}
+	if req.Decision.HarnessSession != "" {
+		return fmt.Errorf("tool-child lifecycle requires an unbound Pi session decision")
+	}
+	sessionPath, err := createPiLaunchSession(req)
+	if err != nil {
+		return err
+	}
+	bound, err := router.BindHarnessSession(req.Decision, sessionPath)
+	if err != nil {
+		_ = os.Remove(sessionPath)
+		return err
+	}
+	*req.Decision = *bound
+	if err := launch.Validate(req, nil); err != nil {
+		_ = os.Remove(sessionPath)
+		return err
 	}
 	toolChildMu.Lock()
 	// A reserved identity is occupied even while provisional or test-injected;
@@ -114,7 +150,7 @@ func PrepareToolChildLifecycle(tabID, paneID string, req launch.Request, name st
 	toolChildByTab[tabID] = lc
 	toolChildMu.Unlock()
 	if concrete, ok := lc.(*toolchild.Lifecycle); ok {
-		concrete.SetContext(toolchild.Identity{TabID: tabID, PaneID: paneID, Name: name, SessionGeneration: req.SessionGeneration, LaunchID: launch.DecisionDigest(req.Decision), Repository: req.Repository, Lane: req.Lane, Role: string(req.Decision.Role), TaskRef: req.TaskRef, Provider: req.Decision.Provider, ArgvDigest: launch.DecisionDigest(req.Decision), Argv: append([]string(nil), req.Decision.Argv...)})
+		concrete.SetContext(toolchild.Identity{TabID: tabID, PaneID: paneID, Name: name, SessionGeneration: req.SessionGeneration, LaunchID: launch.DecisionDigest(req.Decision), Repository: req.Repository, Lane: req.Lane, Role: string(req.Decision.Role), TaskRef: req.TaskRef, Provider: req.Decision.Harness, ArgvDigest: launch.DecisionDigest(req.Decision), Argv: append([]string(nil), req.Decision.HarnessArgv...)})
 		if err := concrete.Provision(); err != nil {
 			// Provisioning has not published a valid lifecycle receipt. Close and
 			// verify only the exact prepared tab, then release the process-local
@@ -480,39 +516,18 @@ func ReconcileWorkspaceLabels(workspace string) ([]string, error) {
 	return renamed, nil
 }
 
+func paneProcessInventorySummary(processes []PaneProcess) string {
+	parts := make([]string, 0, len(processes))
+	for _, p := range processes {
+		parts = append(parts, fmt.Sprintf("pid=%d name=%q argv=%q", p.PID, p.Name, p.Argv))
+	}
+	return "[" + strings.Join(parts, "; ") + "]"
+}
+
 func bindToolChildLifecycle(paneID, name string, req launch.Request) error {
 	lc := lifecycleForPane(paneID)
 	if lc == nil {
 		return nil
-	}
-	// Herdr populates an agent's session id asynchronously AFTER `agent start`
-	// returns, so an immediate lookup finds the agent with an empty session,
-	// the exact-match loop below skips it, and an otherwise healthy launch dies
-	// as "tool-child owner identity unavailable". Poll briefly for the exact
-	// agent to become fully described.
-	var agents []AgentEntry
-	var err error
-	for attempt := 0; attempt < 20; attempt++ {
-		agents, err = AgentList()
-		if err != nil {
-			return fmt.Errorf("tool-child owner lookup: %w", err)
-		}
-		ready := false
-		for _, a := range agents {
-			// Match on the identity herdr guarantees for EVERY kind. Waiting on
-			// a session id here pinned the fleet to claude: grok agents start
-			// healthy and interactive_ready but never report one, so the wait
-			// always timed out and the launch died as "tool-child owner
-			// identity unavailable".
-			if a.Name == name && a.PaneID == paneID && a.TabID != "" {
-				ready = true
-				break
-			}
-		}
-		if ready {
-			break
-		}
-		time.Sleep(500 * time.Millisecond)
 	}
 	sessionGeneration := req.SessionGeneration
 	if sessionGeneration <= 0 {
@@ -523,64 +538,98 @@ func bindToolChildLifecycle(paneID, name string, req launch.Request) error {
 	if sessionGeneration <= 0 {
 		return fmt.Errorf("Herdr session generation is unavailable")
 	}
-	for _, a := range agents {
-		// A session id is provenance, not identity: herdr reports one for
-		// claude and not for grok, so requiring it excluded every non-claude
-		// surface from ever binding an owner.
-		if a.Name != name || a.PaneID != paneID || a.Kind != req.Decision.Provider {
-			continue
-		}
-		processes, err := paneProcesses(paneID)
+
+	deadline := time.Now().Add(ownerBindTimeout)
+	sawAgent := false
+	lastWaitReason := "matching agent not listed"
+	for {
+		agents, err := AgentList()
 		if err != nil {
-			return err
+			return fmt.Errorf("tool-child owner lookup: %w", err)
 		}
-		var matches, wrappers []PaneProcess
-		for _, p := range processes {
-			if nativeCandidate(req.Decision.Provider, req.Decision.Argv, p) {
-				matches = append(matches, p)
-			}
-			if wrapperCandidate(p) {
-				wrappers = append(wrappers, p)
+		matchesAgent := make([]AgentEntry, 0, 1)
+		for _, a := range agents {
+			if a.Name == name && a.PaneID == paneID {
+				matchesAgent = append(matchesAgent, a)
 			}
 		}
-		if len(matches) != 1 {
-			return fmt.Errorf("pane %s has %d exact routed agent processes", paneID, len(matches))
+		if len(matchesAgent) > 1 {
+			return fmt.Errorf("tool-child owner agent identity is ambiguous for %s/%s", name, paneID)
 		}
-		p := matches[0]
-		if p.PID <= 0 || len(p.Argv) == 0 {
-			return fmt.Errorf("pane process identity is incomplete")
-		}
-		token, err := readPIDStartToken(p.PID)
-		if err != nil {
-			return err
-		}
-		parent, err := readPIDParent(p.PID)
-		if err != nil {
-			return err
-		}
-		if strings.EqualFold(req.Decision.Provider, "codex") {
-			if len(wrappers) != 1 || parent != wrappers[0].PID {
-				return fmt.Errorf("codex native process requires exactly one node wrapper parent")
+		if len(matchesAgent) == 1 {
+			a := matchesAgent[0]
+			sawAgent = true
+			if a.Kind != req.Decision.Harness {
+				return fmt.Errorf("tool-child owner harness mismatch: got %s want %s", a.Kind, req.Decision.Harness)
 			}
-		} else if len(wrappers) > 1 {
-			return fmt.Errorf("provider process has ambiguous node wrappers")
+			if a.Session.Value == "" || a.TabID == "" {
+				lastWaitReason = fmt.Sprintf("agent incomplete kind=%q status=%q session_present=%t tab_present=%t", a.Kind, a.Status, a.Session.Value != "", a.TabID != "")
+			} else {
+				if a.TabID != tabForPane(paneID) {
+					return fmt.Errorf("prepared tab identity drift: got %s", a.TabID)
+				}
+				processes, err := paneProcesses(paneID)
+				if err != nil {
+					if !errors.Is(err, ErrPaneNotFound) {
+						return err
+					}
+					lastWaitReason = "prepared pane process inventory is not yet available"
+				} else {
+					hydrated, argvErrors := hydratePaneProcesses(processes)
+					processes = hydrated
+					if len(argvErrors) > 0 {
+						lastWaitReason = fmt.Sprintf("process argv unavailable: session=%q %v; observed=%s", a.Session.Value, errors.Join(argvErrors...), paneProcessInventorySummary(processes))
+					} else {
+						processMatches, wrappers, routeWait, routeErr := routedProcessCandidates(req.Decision.Harness, req.Decision.HarnessArgv, a.Session.Value, processes)
+						if routeErr != nil {
+							return routeErr
+						}
+						if routeWait != "" {
+							lastWaitReason = fmt.Sprintf("%s; session=%q observed=%s", routeWait, a.Session.Value, paneProcessInventorySummary(processes))
+						} else if len(processMatches) == 0 || (strings.EqualFold(req.Decision.Harness, "codex") && len(wrappers) == 0) {
+							lastWaitReason = fmt.Sprintf("process candidates exact=%d wrappers=%d total=%d session=%q observed=%s", len(processMatches), len(wrappers), len(processes), a.Session.Value, paneProcessInventorySummary(processes))
+						} else {
+							if len(processMatches) != 1 {
+								return fmt.Errorf("pane %s has %d exact routed agent processes", paneID, len(processMatches))
+							}
+							p := processMatches[0]
+							if p.PID <= 0 || len(p.Argv) == 0 {
+								return fmt.Errorf("pane process identity is incomplete")
+							}
+							token, err := readPIDStartToken(p.PID)
+							if err != nil {
+								return err
+							}
+							parent, err := readPIDParent(p.PID)
+							if err != nil {
+								return err
+							}
+							if strings.EqualFold(req.Decision.Harness, "codex") {
+								if len(wrappers) != 1 || parent != wrappers[0].PID {
+									return fmt.Errorf("codex native process requires exactly one node wrapper parent")
+								}
+							} else if len(wrappers) > 1 {
+								return fmt.Errorf("harness process has ambiguous node wrappers")
+							}
+							if req.Repository == "" || req.Lane == "" {
+								return fmt.Errorf("repository and lane binding are required")
+							}
+							return lc.Bind(toolchild.Identity{PID: p.PID, ParentPID: parent, StartToken: token, SessionGeneration: sessionGeneration, LaunchID: launch.DecisionDigest(req.Decision), Repository: req.Repository, Role: string(req.Decision.Role), Lane: req.Lane, TaskRef: req.TaskRef, Name: name, SessionID: a.Session.Value, PaneID: paneID, TabID: a.TabID, Provider: req.Decision.Harness, ArgvDigest: launch.DecisionDigest(req.Decision), Argv: append([]string(nil), req.Decision.HarnessArgv...)})
+						}
+					}
+				}
+			}
+		} else {
+			lastWaitReason = "matching agent not listed"
 		}
-		role := ""
-		if req.Decision != nil {
-			role = string(req.Decision.Role)
+		if !time.Now().Before(deadline) {
+			if sawAgent {
+				return fmt.Errorf("tool-child owner identity did not become ready for %s/%s: %s", name, paneID, lastWaitReason)
+			}
+			return fmt.Errorf("tool-child owner identity unavailable for %s/%s: %s", name, paneID, lastWaitReason)
 		}
-		if req.Repository == "" || req.Lane == "" {
-			return fmt.Errorf("repository and lane binding are required")
-		}
-		if a.TabID != "" && a.TabID != tabForPane(paneID) {
-			return fmt.Errorf("prepared tab identity drift: got %s", a.TabID)
-		}
-		if a.TabID == "" {
-			return fmt.Errorf("agent list returned missing tab identity")
-		}
-		return lc.Bind(toolchild.Identity{PID: p.PID, ParentPID: parent, StartToken: token, SessionGeneration: sessionGeneration, LaunchID: launch.DecisionDigest(req.Decision), Repository: req.Repository, Role: role, Lane: req.Lane, TaskRef: req.TaskRef, Name: name, SessionID: a.Session.Value, PaneID: paneID, TabID: a.TabID, Provider: req.Decision.Provider, ArgvDigest: launch.DecisionDigest(req.Decision), Argv: append([]string(nil), req.Decision.Argv...)})
+		time.Sleep(ownerBindPollInterval)
 	}
-	return fmt.Errorf("tool-child owner identity unavailable for %s/%s", name, paneID)
 }
 
 // bindRecoveredToolChildLifecycle reconstructs the exact owner after a
@@ -621,15 +670,17 @@ func bindRecoveredToolChildLifecycle(lc *toolchild.Lifecycle) error {
 	if err != nil {
 		return err
 	}
-	var native []PaneProcess
-	var wrappers []PaneProcess
-	for _, p := range processes {
-		if nativeCandidate(owner.Provider, owner.Argv, p) {
-			native = append(native, p)
-		}
-		if wrapperCandidate(p) {
-			wrappers = append(wrappers, p)
-		}
+	hydrated, argvErrors := hydratePaneProcesses(processes)
+	if len(argvErrors) > 0 {
+		return fmt.Errorf("recovery pane process argv unavailable: %w", errors.Join(argvErrors...))
+	}
+	processes = hydrated
+	native, wrappers, routeWait, routeErr := routedProcessCandidates(owner.Provider, owner.Argv, match.Session.Value, processes)
+	if routeErr != nil {
+		return fmt.Errorf("recovery Pi session route attestation: %w", routeErr)
+	}
+	if routeWait != "" {
+		return fmt.Errorf("recovery Pi session route not ready: %s", routeWait)
 	}
 	if len(native) != 1 {
 		return fmt.Errorf("recovery routed owner candidates=%d", len(native))
@@ -641,7 +692,7 @@ func bindRecoveredToolChildLifecycle(lc *toolchild.Lifecycle) error {
 			return fmt.Errorf("recovery codex wrapper ancestry is not exact")
 		}
 	} else if len(wrappers) > 1 {
-		return fmt.Errorf("recovery provider wrapper ancestry is ambiguous")
+		return fmt.Errorf("recovery harness wrapper ancestry is ambiguous")
 	}
 	token, err := readPIDStartToken(p.PID)
 	if err != nil {
@@ -711,7 +762,7 @@ func recoverStandingLifecycle(agent AgentEntry, req launch.Request) (int64, erro
 	}
 	owner := concrete.Inventory.Owner
 	expectedDigest := launch.DecisionDigest(req.Decision)
-	if owner.TabID != agent.TabID || owner.PaneID != agent.PaneID || agent.Kind != req.Decision.Provider || owner.Repository != req.Repository || owner.TaskRef != req.TaskRef || owner.Lane != req.Lane || owner.Provider != req.Decision.Provider || owner.Role != string(req.Decision.Role) || owner.LaunchID != expectedDigest || owner.ArgvDigest != expectedDigest || !equalArgs(owner.Argv, req.Decision.Argv) || owner.SessionID != agent.Session.Value || owner.SessionGeneration <= 0 || concrete.RecoveredPhase >= 4 {
+	if owner.TabID != agent.TabID || owner.PaneID != agent.PaneID || agent.Kind != req.Decision.Harness || owner.Repository != req.Repository || owner.TaskRef != req.TaskRef || owner.Lane != req.Lane || owner.Provider != req.Decision.Harness || owner.Role != string(req.Decision.Role) || owner.LaunchID != expectedDigest || owner.ArgvDigest != expectedDigest || !equalArgs(owner.Argv, req.Decision.HarnessArgv) || owner.SessionID != agent.Session.Value || owner.SessionGeneration <= 0 || concrete.RecoveredPhase >= 4 {
 		return 0, fmt.Errorf("standing lifecycle identity mismatch or terminal authority: %w", ErrAgentIdentityMismatch)
 	}
 	if req.SessionGeneration != 0 && req.SessionGeneration != owner.SessionGeneration {
@@ -829,14 +880,29 @@ func TabCreate(opts TabCreateOptions) (*TabInfo, error) {
 
 // TabCreateForTask is the FAC-121 launch entry: requires workspace and cwd.
 // Rejects empty cwd so shared-root / unknown-directory starts cannot slip through.
+// Resolves cwd to an absolute path at the caller and requires it to be an existing
+// directory before contacting Herdr, so relative paths cannot be re-resolved from
+// the Herdr server process cwd.
 func TabCreateForTask(workspaceID, label, cwd string, noFocus bool) (*TabInfo, error) {
-	if strings.TrimSpace(cwd) == "" {
+	cwd = strings.TrimSpace(cwd)
+	if cwd == "" {
 		return nil, fmt.Errorf("herdr tab create: cwd is required for task agents")
+	}
+	abs, err := filepath.Abs(cwd)
+	if err != nil {
+		return nil, fmt.Errorf("herdr tab create: resolve cwd %q: %w", cwd, err)
+	}
+	info, err := os.Stat(abs)
+	if err != nil {
+		return nil, fmt.Errorf("herdr tab create: cwd %q: %w", abs, err)
+	}
+	if !info.IsDir() {
+		return nil, fmt.Errorf("herdr tab create: cwd %q is not a directory", abs)
 	}
 	return TabCreate(TabCreateOptions{
 		Workspace: workspaceID,
 		Label:     label,
-		Cwd:       cwd,
+		Cwd:       abs,
 		NoFocus:   noFocus,
 	})
 }
@@ -872,11 +938,11 @@ func AgentStartWithDecision(name, kind, paneID string, req launch.Request) error
 	if err := launch.Validate(req, nil); err != nil {
 		return compensateValidation(err)
 	}
-	if req.Decision == nil || strings.TrimSpace(kind) != strings.TrimSpace(req.Decision.Provider) {
-		return compensateValidation(launch.RecordRejected(req, nil, fmt.Sprintf("herdr kind %q does not match decision provider", kind)))
+	if req.Decision == nil || strings.TrimSpace(kind) != strings.TrimSpace(req.Decision.Harness) {
+		return compensateValidation(launch.RecordRejected(req, nil, fmt.Sprintf("herdr kind %q does not match decision harness", kind)))
 	}
-	if req.Decision == nil || len(req.Decision.Argv) == 0 {
-		return compensateValidation(fmt.Errorf("launch decision argv is empty"))
+	if req.Decision == nil || len(req.Decision.HarnessArgv) == 0 {
+		return compensateValidation(fmt.Errorf("launch decision harness argv is empty"))
 	}
 	if req.SessionGeneration <= 0 {
 		if concrete, ok := lc.(*toolchild.Lifecycle); ok {
@@ -889,7 +955,7 @@ func AgentStartWithDecision(name, kind, paneID string, req launch.Request) error
 	if lc == nil {
 		return fmt.Errorf("prepared tool-child lifecycle is required before process start")
 	}
-	if err := agentStartProcess(name, kind, paneID, req.Decision.Argv[1:]...); err != nil {
+	if err := agentStartProcess(name, kind, paneID, req.Decision.HarnessArgv[1:]...); err != nil {
 		if rollbackErr := rollbackToolChild(tabForPane(paneID), paneID, lc, "failed-launch"); rollbackErr != nil {
 			return errors.Join(err, rollbackErr)
 		}
@@ -1075,6 +1141,42 @@ type PaneProcess struct {
 	Argv []string `json:"argv"`
 }
 
+var readPIDArgv = systemPIDArgv
+
+func SetPIDArgvReader(f func(int) ([]string, error)) func() {
+	old := readPIDArgv
+	if f == nil {
+		readPIDArgv = systemPIDArgv
+	} else {
+		readPIDArgv = f
+	}
+	return func() { readPIDArgv = old }
+}
+
+func hydratePaneProcesses(processes []PaneProcess) ([]PaneProcess, []error) {
+	hydrated := make([]PaneProcess, 0, len(processes))
+	var readErrors []error
+	for _, process := range processes {
+		process.Argv = append([]string(nil), process.Argv...)
+		if len(process.Argv) == 0 {
+			if process.PID <= 0 {
+				readErrors = append(readErrors, fmt.Errorf("process argv requires positive pid, got %d", process.PID))
+			} else {
+				argv, err := readPIDArgv(process.PID)
+				if err != nil {
+					readErrors = append(readErrors, fmt.Errorf("pid %d argv: %w", process.PID, err))
+				} else if len(argv) == 0 {
+					readErrors = append(readErrors, fmt.Errorf("pid %d argv is empty", process.PID))
+				} else {
+					process.Argv = append([]string(nil), argv...)
+				}
+			}
+		}
+		hydrated = append(hydrated, process)
+	}
+	return hydrated, readErrors
+}
+
 var readPIDStartToken = func(pid int) (string, error) {
 	out, err := exec.Command("ps", "-p", strconv.Itoa(pid), "-o", "lstart=").Output()
 	if err != nil {
@@ -1181,12 +1283,65 @@ func exactArgv(want, got []string) bool {
 	return true
 }
 
+func piEntrypoint(value string) bool {
+	clean := filepath.ToSlash(strings.ToLower(filepath.Clean(value)))
+	base := filepath.Base(clean)
+	return base == "pi" || (base == "cli.js" && strings.Contains(clean, "/pi-coding-agent/"))
+}
+
+func piProcessTitleCandidate(p PaneProcess) bool {
+	if filepath.Base(strings.ToLower(p.Name)) != "node" || len(p.Argv) == 0 || filepath.Base(strings.ToLower(p.Argv[0])) != router.PiHarness {
+		return false
+	}
+	for _, arg := range p.Argv[1:] {
+		if arg != "" {
+			return false
+		}
+	}
+	return true
+}
+
+func routedProcessCandidates(provider string, routed []string, sessionPath string, processes []PaneProcess) ([]PaneProcess, []PaneProcess, string, error) {
+	var exact, titled, wrappers []PaneProcess
+	for _, p := range processes {
+		if nativeCandidate(provider, routed, p) {
+			exact = append(exact, p)
+		} else if strings.EqualFold(provider, router.PiHarness) && piProcessTitleCandidate(p) {
+			titled = append(titled, p)
+		}
+		if wrapperCandidate(p) {
+			wrappers = append(wrappers, p)
+		}
+	}
+	if len(titled) > 0 {
+		if err := verifyPiSessionRoute(sessionPath, routed); err != nil {
+			if errors.Is(err, ErrPiSessionNotReady) {
+				return nil, wrappers, err.Error(), nil
+			}
+			return nil, nil, "", err
+		}
+		exact = append(exact, titled...)
+	}
+	return exact, wrappers, "", nil
+}
+
 func nativeCandidate(provider string, routed []string, p PaneProcess) bool {
 	if len(routed) < 1 || len(p.Argv) < 1 {
 		return false
 	}
 	provider = strings.ToLower(strings.TrimSpace(provider))
-	if filepath.Base(strings.ToLower(p.Argv[0])) != provider && filepath.Base(strings.ToLower(p.Name)) != provider {
+	argv0 := filepath.Base(strings.ToLower(p.Argv[0]))
+	name := filepath.Base(strings.ToLower(p.Name))
+	if provider == router.PiHarness {
+		if argv0 == "node" {
+			return len(p.Argv) >= 2 && piEntrypoint(p.Argv[1]) && exactArgv(routed[1:], p.Argv[2:])
+		}
+		if argv0 != router.PiHarness {
+			return false
+		}
+		return exactArgv(routed[1:], p.Argv[1:])
+	}
+	if argv0 != provider && name != provider {
 		return false
 	}
 	return exactArgv(routed[1:], p.Argv[1:])

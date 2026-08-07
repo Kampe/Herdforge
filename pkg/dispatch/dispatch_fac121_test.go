@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/Kampe/Herdforge/pkg/config"
+	"github.com/Kampe/Herdforge/pkg/control"
 	"github.com/Kampe/Herdforge/pkg/deps"
 	"github.com/Kampe/Herdforge/pkg/herdr"
 	"github.com/Kampe/Herdforge/pkg/launch"
@@ -98,6 +99,9 @@ type fakeHerdr struct {
 	closeErr    error // TabClose failure — must not be silently discarded
 	startCalls  int
 	startReq    launch.Request
+	startName   string
+	startKind   string
+	startPane   string
 	deliverText string
 	model       string
 }
@@ -159,18 +163,30 @@ func (f *fakeHerdr) AgentStart(req launch.Request, name, kind, paneID string) er
 	defer f.mu.Unlock()
 	f.startCalls++
 	f.startReq = req
-	_ = name
-	_ = kind
-	_ = paneID
+	f.startName = name
+	f.startKind = kind
+	f.startPane = paneID
 	return f.startErr
+}
+
+type targetCapturingHerdr struct {
+	*fakeHerdr
+	target control.WakeTarget
+}
+
+func (f *targetCapturingHerdr) ReadControlTarget(target control.WakeTarget) (control.WakeTarget, error) {
+	f.target = target
+	target.SessionID = "pi-session"
+	return target, nil
 }
 
 func testRouter(t *testing.T) *router.SurfaceRouter {
 	t.Helper()
 	t.Setenv("HERDR_ROUTE_STATE_DIR", t.TempDir())
+	t.Setenv("PI_CODING_AGENT_SESSION_DIR", t.TempDir())
 	r := router.NewRouter(nil, nil)
 	r.Probes = &router.Probes{
-		CLIPresent: func(cli string) bool { return cli == testWorkerProvider },
+		CLIPresent: func(cli string) bool { return cli == router.PiHarness },
 		Now:        func() time.Time { return time.Unix(1_800_000_000, 0) },
 	}
 	return r
@@ -362,9 +378,10 @@ func TestDispatch_Launch_SetsCwdAndProvesPrompt(t *testing.T) {
 		model:     "deepseek-v4-flash",
 		tabID:     "tab-9",
 	}
+	targetReader := &targetCapturingHerdr{fakeHerdr: fh}
 	comp := &recordingCompensator{}
 	d := NewDispatcher(testCfg(), tp, wm)
-	d.Herdr = fh
+	d.Herdr = targetReader
 	d.Compensator = comp
 	d.Ownership = &fixedGenerationOwnership{generation: 7}
 
@@ -372,6 +389,12 @@ func TestDispatch_Launch_SetsCwdAndProvesPrompt(t *testing.T) {
 	res, err := d.Dispatch(context.Background(), validLaunchOptions(t, "FAC-9"))
 	if err != nil {
 		t.Fatalf("Dispatch: %v", err)
+	}
+	if targetReader.target.Provider != router.PiHarness {
+		t.Fatalf("control target provider = %q, want %q", targetReader.target.Provider, router.PiHarness)
+	}
+	if targetReader.target.Provider == testWorkerProvider {
+		t.Fatalf("control target provider = %q, want not worker provider %q", targetReader.target.Provider, testWorkerProvider)
 	}
 	t.Cleanup(func() { os.RemoveAll(res.Worktree) })
 
@@ -393,6 +416,35 @@ func TestDispatch_Launch_SetsCwdAndProvesPrompt(t *testing.T) {
 	wantArgv := router.ArgvFor(testWorkerProvider, testWorkerModel, testWorkerEffort)
 	if fh.startReq.Decision == nil || !reflect.DeepEqual(fh.startReq.Decision.Argv, wantArgv) || fh.startReq.Decision.Provider != testWorkerProvider {
 		t.Fatalf("dispatch launch decision = %+v, want provider/argv %s", fh.startReq.Decision, wantArgv)
+	}
+	wantHarnessArgv := []string{"pi", "--model", "openai-codex/gpt-5.6-luna", "--thinking", testWorkerEffort}
+	if fh.startKind != router.PiHarness {
+		t.Fatalf("AgentStart kind = %q, want %q", fh.startKind, router.PiHarness)
+	}
+	if fh.startReq.Decision.Harness != router.PiHarness {
+		t.Fatalf("decision harness = %q, want %q", fh.startReq.Decision.Harness, router.PiHarness)
+	}
+	hav := fh.startReq.Decision.HarnessArgv
+	if len(hav) != 7 {
+		t.Fatalf("decision harness argv len = %d, want 7: %#v", len(hav), hav)
+	}
+	if !reflect.DeepEqual(hav[:5], wantHarnessArgv) {
+		t.Fatalf("decision harness argv base = %#v, want %#v", hav[:5], wantHarnessArgv)
+	}
+	if hav[5] != "--session" {
+		t.Fatalf("decision harness argv[5] = %q, want --session", hav[5])
+	}
+	if hav[6] == "" || !filepath.IsAbs(hav[6]) {
+		t.Fatalf("decision harness argv[6] = %q, want nonempty absolute path", hav[6])
+	}
+	if fh.startReq.Decision.HarnessSession != hav[6] {
+		t.Fatalf("decision harness session = %q, want argv[6] %q", fh.startReq.Decision.HarnessSession, hav[6])
+	}
+	if fh.startName == "" {
+		t.Fatal("AgentStart name is blank")
+	}
+	if fh.startPane == "" {
+		t.Fatal("AgentStart pane is blank")
 	}
 	if res.Receipt == nil || !res.Receipt.Consumed || !res.Receipt.Verified {
 		t.Fatalf("receipt: %+v", res.Receipt)
@@ -1147,5 +1199,25 @@ func TestDispatch_CompensateFailure_RetainsGenerationLease(t *testing.T) {
 	}
 	if !errors.Is(berr, deps.ErrAlreadyClaimed) && !strings.Contains(berr.Error(), "already") {
 		t.Fatalf("want already claimed, got %v", berr)
+	}
+}
+
+func TestRequireControlOrdersOrClose(t *testing.T) {
+	fh := &fakeHerdr{}
+	want := &control.CoordinatorOrders{}
+	got, err := requireControlOrdersOrClose(fh, "tab-control", want)
+	if err != nil || got != want || len(fh.closedTabs) != 0 {
+		t.Fatalf("nonnull orders changed: got=%p err=%v closed=%v", got, err, fh.closedTabs)
+	}
+	got, err = requireControlOrdersOrClose(fh, "tab-control", nil)
+	if got != nil || err == nil || !strings.Contains(err.Error(), "nil control orders") {
+		t.Fatalf("nil orders result: got=%v err=%v", got, err)
+	}
+	var failure *launchFailure
+	if !errors.As(err, &failure) || failure.Reason != "control_factory_failed" {
+		t.Fatalf("failure=%#v err=%v", failure, err)
+	}
+	if !reflect.DeepEqual(fh.closedTabs, []string{"tab-control"}) {
+		t.Fatalf("closed tabs=%v", fh.closedTabs)
 	}
 }

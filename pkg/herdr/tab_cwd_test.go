@@ -2,13 +2,15 @@ package herdr
 
 import (
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 )
 
-func TestTabCreate_RequiresWorkspace(t *testing.T) {
-	_, err := TabCreate(TabCreateOptions{Label: "x", Cwd: "/tmp/wt"})
+func TestTabCreateRequiresWorkspace(t *testing.T) {
+	_, err := TabCreate(TabCreateOptions{Label: "x", Cwd: "/tmp"})
 	if err == nil || !strings.Contains(err.Error(), "workspace is required") {
 		t.Fatalf("expected workspace required error, got %v", err)
 	}
@@ -19,33 +21,40 @@ func TestTabCreateForTask_RequiresCwd(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "cwd is required") {
 		t.Fatalf("expected cwd required error, got %v", err)
 	}
+	_, err = TabCreateForTask("w1", "task-fac-1", "   ", true)
+	if err == nil || !strings.Contains(err.Error(), "cwd is required") {
+		t.Fatalf("expected trimmed blank cwd required error, got %v", err)
+	}
 }
 
-func TestTabCreate_PassesCwdAndWorkspace(t *testing.T) {
-	defer func(old func(args ...string) (string, error)) { runHerdr = old }(runHerdr)
-
-	var got []string
-	runHerdr = func(args ...string) (string, error) {
-		got = append([]string{}, args...)
-		return `{"result":{"tab":{"tab_id":"t1","label":"task-fac-1"},"root_pane":{"pane_id":"p1","tab_id":"t1"}}}`, nil
+func TestTabCreateForTask_PassesAbsoluteCwd(t *testing.T) {
+	tmp := t.TempDir()
+	absTmp, err := filepath.Abs(tmp)
+	if err != nil {
+		t.Fatalf("filepath.Abs temp: %v", err)
 	}
 
-	tab, err := TabCreateForTask("wABC", "task-fac-1", "/repo/.herd/worktrees/fac-1", true)
+	old := runHerdr
+	defer func() { runHerdr = old }()
+	var got []string
+	runHerdr = func(args ...string) (string, error) {
+		got = append([]string(nil), args...)
+		return `{"result":{"tab":{"tab_id":"t1","label":"task-fac-1","cwd":"` + absTmp + `"}}}`, nil
+	}
+
+	tab, err := TabCreateForTask("wABC", "task-fac-1", tmp, true)
 	if err != nil {
 		t.Fatalf("TabCreateForTask: %v", err)
 	}
-	if tab.Cwd != "/repo/.herd/worktrees/fac-1" {
-		t.Fatalf("tab.Cwd = %q", tab.Cwd)
-	}
-	if tab.ID != "t1" || tab.Pane.ID != "p1" {
-		t.Fatalf("unexpected tab: %+v", tab)
+	if tab.Cwd != absTmp {
+		t.Fatalf("tab.Cwd = %q, want exact abs %q", tab.Cwd, absTmp)
 	}
 	joined := strings.Join(got, " ")
 	if !strings.Contains(joined, "--workspace wABC") {
 		t.Fatalf("missing workspace in args: %v", got)
 	}
-	if !strings.Contains(joined, "--cwd /repo/.herd/worktrees/fac-1") {
-		t.Fatalf("missing cwd in args: %v", got)
+	if !strings.Contains(joined, "--cwd "+absTmp) {
+		t.Fatalf("missing absolute cwd in args: %v", got)
 	}
 	if !strings.Contains(joined, "--no-focus") {
 		t.Fatalf("missing no-focus in args: %v", got)
@@ -202,5 +211,85 @@ func TestDeliverAndProve_PromptFailure(t *testing.T) {
 	}
 	if rec == nil || rec.Consumed {
 		t.Fatalf("failed receipt must not claim consumed: %+v", rec)
+	}
+}
+
+func TestTabCreateForTask_RelativeDotResolvesToAbs(t *testing.T) {
+	wantAbs, err := filepath.Abs(".")
+	if err != nil {
+		t.Fatalf("filepath.Abs(.): %v", err)
+	}
+
+	old := runHerdr
+	defer func() { runHerdr = old }()
+	var got []string
+	calls := 0
+	runHerdr = func(args ...string) (string, error) {
+		calls++
+		got = append([]string(nil), args...)
+		return `{"result":{"tab":{"tab_id":"t-dot","label":"task-dot","cwd":"` + wantAbs + `"}}}`, nil
+	}
+
+	tab, err := TabCreateForTask("wDOT", "task-dot", ".", true)
+	if err != nil {
+		t.Fatalf("TabCreateForTask(.): %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("runHerdr calls = %d, want 1", calls)
+	}
+	if tab.Cwd != wantAbs {
+		t.Fatalf("tab.Cwd = %q, want %q", tab.Cwd, wantAbs)
+	}
+	// Non-vacuous: emitted --cwd must equal filepath.Abs("."), not the relative ".".
+	cwdFlag := ""
+	for i := 0; i < len(got)-1; i++ {
+		if got[i] == "--cwd" {
+			cwdFlag = got[i+1]
+			break
+		}
+	}
+	if cwdFlag == "" {
+		t.Fatalf("missing --cwd in args: %v", got)
+	}
+	if cwdFlag != wantAbs {
+		t.Fatalf("emitted --cwd = %q, want exact abs %q", cwdFlag, wantAbs)
+	}
+	if cwdFlag == "." {
+		t.Fatalf("emitted relative cwd %q; must resolve at caller", cwdFlag)
+	}
+}
+
+func TestTabCreateForTask_RejectsMissingAndNonDirectory(t *testing.T) {
+	old := runHerdr
+	defer func() { runHerdr = old }()
+	calls := 0
+	runHerdr = func(args ...string) (string, error) {
+		calls++
+		return `{"result":{"tab":{"tab_id":"should-not","label":"x"}}}`, nil
+	}
+
+	missing := filepath.Join(t.TempDir(), "no-such-dir")
+	_, err := TabCreateForTask("w1", "task-missing", missing, true)
+	if err == nil {
+		t.Fatal("expected missing cwd error")
+	}
+	if calls != 0 {
+		t.Fatalf("runHerdr called %d times on missing cwd; want 0", calls)
+	}
+
+	// Non-directory path (a regular file).
+	f, err := os.CreateTemp(t.TempDir(), "not-a-dir-*")
+	if err != nil {
+		t.Fatalf("CreateTemp: %v", err)
+	}
+	filePath := f.Name()
+	_ = f.Close()
+
+	_, err = TabCreateForTask("w1", "task-file", filePath, true)
+	if err == nil || !strings.Contains(err.Error(), "not a directory") {
+		t.Fatalf("expected not-a-directory error, got %v", err)
+	}
+	if calls != 0 {
+		t.Fatalf("runHerdr called %d times on non-dir cwd; want 0", calls)
 	}
 }

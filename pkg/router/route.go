@@ -295,6 +295,97 @@ func AgyGeminiPoolFallback(shape string) string {
 	return ""
 }
 
+const PiHarness = "pi"
+
+// PiModelFor maps a routed provider/model to Pi's exact provider-qualified model.
+func PiModelFor(provider, model string) (string, error) {
+	provider = strings.ToLower(strings.TrimSpace(provider))
+	model = strings.ToLower(strings.TrimSpace(model))
+	if provider == "" || model == "" {
+		return "", fmt.Errorf("Pi harness requires provider and model")
+	}
+	strip := func(value string, prefixes ...string) string {
+		for _, prefix := range prefixes {
+			if strings.HasPrefix(value, prefix) {
+				return value[len(prefix):]
+			}
+		}
+		return value
+	}
+	requireSuffix := func(suffix, kind string) (string, error) {
+		if strings.TrimSpace(suffix) == "" {
+			return "", fmt.Errorf("unsupported Pi %s model %q", kind, model)
+		}
+		return suffix, nil
+	}
+	switch provider {
+	case "codex":
+		suffix, err := requireSuffix(strip(model, "openai-codex/", "codex/", "openai/"), "codex")
+		if err != nil {
+			return "", err
+		}
+		return "openai-codex/" + suffix, nil
+	case "claude":
+		suffix, err := requireSuffix(strip(model, "anthropic/", "claude/"), "claude")
+		if err != nil {
+			return "", err
+		}
+		return "anthropic/" + suffix, nil
+	case "agy":
+		mapped := strip(model, "google/")
+		if mapped == "" || !strings.HasPrefix(mapped, "gemini-") {
+			return "", fmt.Errorf("unsupported Pi agy model %q", model)
+		}
+		return "google/" + mapped, nil
+	case "grok":
+		suffix, err := requireSuffix(strip(model, "xai/", "grok/"), "grok")
+		if err != nil {
+			return "", err
+		}
+		return "xai/" + suffix, nil
+	case "opencode":
+		suffix, err := requireSuffix(strip(model, "opencode/"), "opencode")
+		if err != nil {
+			return "", err
+		}
+		return "opencode/" + suffix, nil
+	case "lazer":
+		const prefix = "litellm/lazer/"
+		if !strings.HasPrefix(model, prefix) {
+			return "", fmt.Errorf("unsupported Pi lazer model %q", model)
+		}
+		if _, err := requireSuffix(model[len(prefix):], "lazer"); err != nil {
+			return "", err
+		}
+		return model, nil
+	case "ollama":
+		const prefix = "litellm/ollama/"
+		if !strings.HasPrefix(model, prefix) {
+			return "", fmt.Errorf("unsupported Pi ollama model %q", model)
+		}
+		if _, err := requireSuffix(model[len(prefix):], "ollama"); err != nil {
+			return "", err
+		}
+		return model, nil
+	default:
+		return "", fmt.Errorf("unsupported Pi provider %q", provider)
+	}
+}
+
+// HarnessArgvFor returns the signed Pi harness and exact interactive argv.
+func HarnessArgvFor(provider, model, effort string) (string, []string, error) {
+	piModel, err := PiModelFor(provider, model)
+	if err != nil {
+		return "", nil, err
+	}
+	effort = strings.ToLower(strings.TrimSpace(effort))
+	validEffort := map[string]bool{"off": true, "minimal": true, "low": true, "medium": true, "high": true, "xhigh": true, "max": true}
+	if !validEffort[effort] {
+		return "", nil, fmt.Errorf("unsupported Pi thinking level %q", effort)
+	}
+	return PiHarness, []string{PiHarness, "--model", piModel, "--thinking", effort}, nil
+}
+
 // ArgvFor mirrors argv_json: the exact launch argv per provider contract.
 // opencode-family argv is launcher-owned (herd_opencode_persistent_argv);
 // here we emit the canonical model invocation.
@@ -392,7 +483,7 @@ type Route struct {
 
 // Probes abstracts the live availability checks so tests are hermetic.
 type Probes struct {
-	// CLIPresent reports whether the provider's CLI binary exists.
+	// CLIPresent reports whether the required launch/probe surface CLI exists.
 	CLIPresent func(cli string) bool
 	// Now supplies the clock for cooldown expiry.
 	Now func() time.Time
@@ -422,6 +513,8 @@ func NewRouter(engine *usage.QuotaEngine, computed map[string]usage.BurnState) *
 
 func cliFor(provider string) string {
 	switch provider {
+	case "codex":
+		return PiHarness
 	case "ollama", "opencode", "lazer":
 		return "opencode"
 	}
