@@ -12,11 +12,13 @@
 package boardfreeze
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -50,7 +52,7 @@ func (s State) Active(now time.Time) bool {
 // ErrFrozen is wrapped into refusals so callers can errors.Is(err, ErrFrozen).
 var ErrFrozen = errors.New("board is frozen")
 
-const sqliteBusyTimeoutMillis = 5000
+const sqliteBusyTimeoutMillis = 10000
 
 // DefaultPath is the durable gate location, mirroring pkg/posture's
 // StateDir so a HERD_STATE_DIR override moves both together.
@@ -62,25 +64,25 @@ func DefaultPath() string { return filepath.Join(posture.StateDir(), "board-free
 // any in-process cache.
 type Store struct{ db *sql.DB }
 
-// Open opens (creating if needed) the gate database at path.
+// Open opens (creating if needed) the gate database at path. busy_timeout
+// is set via the connection DSN — not a separate PRAGMA exec — so it is
+// active before ANY statement runs, including the journal_mode=WAL
+// conversion of a brand-new file. Setting it as a follow-up Exec (as an
+// earlier version of this file did) leaves a window where two processes
+// racing to create the same fresh database both hit "database is locked"
+// immediately, because busy_timeout defaults to 0 until that Exec
+// completes. Mirrors pkg/claim/sqlite_store.go's NewSQLiteLeaseStore,
+// which hit and fixed the identical race.
 func Open(path string) (*Store, error) {
 	if dir := filepath.Dir(path); dir != "" && dir != "." {
 		if err := os.MkdirAll(dir, 0o700); err != nil {
 			return nil, fmt.Errorf("boardfreeze: create state dir: %w", err)
 		}
 	}
-	db, err := sql.Open("sqlite", path)
+	dsn := fmt.Sprintf("file:%s?_pragma=busy_timeout(%d)&_pragma=journal_mode(WAL)", path, sqliteBusyTimeoutMillis)
+	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("boardfreeze: open: %w", err)
-	}
-	db.SetMaxOpenConns(1)
-	if _, err := db.Exec("PRAGMA journal_mode=WAL"); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("boardfreeze: journal_mode: %w", err)
-	}
-	if _, err := db.Exec(fmt.Sprintf("PRAGMA busy_timeout=%d", sqliteBusyTimeoutMillis)); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("boardfreeze: busy_timeout: %w", err)
 	}
 	s := &Store{db: db}
 	if err := s.migrate(); err != nil {
@@ -95,8 +97,43 @@ func OpenDefault() (*Store, error) { return Open(DefaultPath()) }
 
 func (s *Store) Close() error { return s.db.Close() }
 
+// isBusyErr matches SQLite's lock-contention errors. busy_timeout already
+// makes SQLite itself block-and-retry internally for the configured
+// window; execWithRetry adds an application-level retry on top so a
+// fresh-file open/migrate race across several real OS processes (which can
+// briefly exceed even a generous busy_timeout while WAL mode is being
+// established) degrades to a short additional wait instead of a hard
+// error. Same rationale as pkg/claim/sqlite_store.go's isBusyErr.
+func isBusyErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "database is locked") ||
+		strings.Contains(msg, "SQLITE_BUSY") ||
+		strings.Contains(msg, "database table is locked")
+}
+
+func execWithRetry(db execer, query string, args ...any) (sql.Result, error) {
+	var res sql.Result
+	var err error
+	for attempt := 0; attempt < 8; attempt++ {
+		res, err = db.ExecContext(context.Background(), query, args...)
+		if err == nil || !isBusyErr(err) {
+			return res, err
+		}
+		time.Sleep(time.Duration(attempt+1) * 25 * time.Millisecond)
+	}
+	return res, err
+}
+
+// execer is satisfied by both *sql.DB and *sql.Tx.
+type execer interface {
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+}
+
 func (s *Store) migrate() error {
-	if _, err := s.db.Exec(`CREATE TABLE IF NOT EXISTS board_freeze (
+	if _, err := execWithRetry(s.db, `CREATE TABLE IF NOT EXISTS board_freeze (
 		id INTEGER PRIMARY KEY CHECK (id = 1),
 		is_on INTEGER NOT NULL DEFAULT 0,
 		generation INTEGER NOT NULL DEFAULT 0,
@@ -109,7 +146,7 @@ func (s *Store) migrate() error {
 	)`); err != nil {
 		return fmt.Errorf("boardfreeze: migrate: %w", err)
 	}
-	if _, err := s.db.Exec(`INSERT OR IGNORE INTO board_freeze (id, is_on, generation, changed_at) VALUES (1, 0, 0, CURRENT_TIMESTAMP)`); err != nil {
+	if _, err := execWithRetry(s.db, `INSERT OR IGNORE INTO board_freeze (id, is_on, generation, changed_at) VALUES (1, 0, 0, CURRENT_TIMESTAMP)`); err != nil {
 		return fmt.Errorf("boardfreeze: seed row: %w", err)
 	}
 	return nil
@@ -163,7 +200,7 @@ func (s *Store) Set(on bool, actor, reason, scope string, expiresAt *time.Time, 
 	if expiresAt != nil {
 		expiresArg = expiresAt.UTC()
 	}
-	if _, err := tx.Exec(`UPDATE board_freeze SET is_on = ?, generation = generation + 1, actor = ?, reason = ?, scope = ?, expires_at = ?, changed_at = ? WHERE id = 1`,
+	if _, err := execWithRetry(tx, `UPDATE board_freeze SET is_on = ?, generation = generation + 1, actor = ?, reason = ?, scope = ?, expires_at = ?, changed_at = ? WHERE id = 1`,
 		isOn, actor, reason, scope, expiresArg, now.UTC()); err != nil {
 		return State{}, fmt.Errorf("boardfreeze: set: %w", err)
 	}
@@ -182,7 +219,7 @@ func (s *Store) Set(on bool, actor, reason, scope string, expiresAt *time.Time, 
 // report pending blocked mutations even though nothing was queued for
 // retry.
 func (s *Store) RecordBlock() error {
-	if _, err := s.db.Exec(`UPDATE board_freeze SET blocked_mutations = blocked_mutations + 1 WHERE id = 1`); err != nil {
+	if _, err := execWithRetry(s.db, `UPDATE board_freeze SET blocked_mutations = blocked_mutations + 1 WHERE id = 1`); err != nil {
 		return fmt.Errorf("boardfreeze: record block: %w", err)
 	}
 	return nil
