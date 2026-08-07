@@ -48,7 +48,7 @@ var fac151NativeManifest = map[string]string{
 	"pkg/verifier/lifecycle_test.go::*lateWriterFixture.waitGenAdvance":                                     "976651cb39caef80273ec6fce99b2648992e342ab78a0253ee20ae1a1013e62b",
 	"pkg/verifier/lifecycle_test.go::*lateWriterFixture.shutdown":                                           "fb269fb7b6f855e5ef2f57e0e4e44d8775489e070ec5cbf11cc5dc9f556c7f92",
 	"pkg/verifier/lifecycle_test.go::*lateWriterFixture.reapOwned":                                          "4824563d5cfa85f61d50a3e8f09bacfcfe15841ec360d18f7c51624300b49389",
-	"pkg/verifier/lifecycle_test.go::waitForProcessGroupGone":                                               "83acaa9c6ac3b67a7f06dd0c146b5eb06d43e14ca9207236736891616ff84f45",
+	"pkg/verifier/lifecycle_test.go::waitForProcessGroupGone":                                               "365add40273d81e4e4983e469e1a48e08cbaedbdce0cf7d7040afb8e20656249",
 	"pkg/verifier/lifecycle_test.go::waitForWriterReady":                                                    "fdd144da5d39551b6abd0e8d84f44fdbfae04488ffc9512f53a447f0dacf8fc3",
 	"pkg/verifier/lifecycle_test.go::TestLateWriterIntoGitRequiresExplicitReap":                             "35fd6d6e586a47e3f2303c67aa28ae204a5ca7d66b9db05d056e779221d01c9f",
 	"pkg/verifier/lifecycle_test.go::TestLateWriterCleanupMutationOmittingReapStillFails":                   "6e1ae2a53774ecc2a1a5cd34f5326e4d3c802a2b88c071a6bb72d649b0057c79",

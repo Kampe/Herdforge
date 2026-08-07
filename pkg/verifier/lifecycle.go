@@ -979,14 +979,20 @@ func waitPIDGone(pid int, bound time.Duration) error {
 	return waitTokenGone(tok, bound)
 }
 
-// processGroupLive reports whether pgid still has members. Snapshot failure
-// is treated as still-live (fail closed) so callers do not claim empty on error.
+// processGroupLive reports whether pgid still has running (non-zombie) members.
+// Zombies that container init has not yet reaped are not "live" for ownership
+// residual purposes. Snapshot failure is treated as still-live (fail closed).
 func processGroupLive(pgid int) bool {
 	snap, err := processSnapshotFn()
 	if err != nil {
 		return true
 	}
-	return len(snap.membersOfGroup(pgid)) > 0
+	for _, tok := range snap.membersOfGroup(pgid) {
+		if tok.isLiveTarget() {
+			return true
+		}
+	}
+	return false
 }
 
 func waitProcessGroupEmpty(pgid int) error {
