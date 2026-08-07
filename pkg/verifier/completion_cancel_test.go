@@ -21,6 +21,9 @@ func TestRunShell_NilContextFailsClosed(t *testing.T) {
 // TestRunShellCancellationKillsProcessGroup proves FAC-192: completion-gate
 // cancel reaps the full Setpgid tree via procsignal, not leader-only kill.
 // Wait for a live background child, then cancel — same barrier as execute.
+//
+// Liveness probes use package killPID (not raw syscall.Kill) so ordinary-source
+// static recovery (FAC-198) still forbids unmediated host kill calls.
 func TestRunShellCancellationKillsProcessGroup(t *testing.T) {
 	dir := t.TempDir()
 	pidFile := filepath.Join(dir, "child.pid")
@@ -51,7 +54,7 @@ func TestRunShellCancellationKillsProcessGroup(t *testing.T) {
 		<-done
 		t.Fatal("background child pid file never written")
 	}
-	if err := syscall.Kill(pid, 0); err != nil {
+	if err := killPID(pid, 0); err != nil {
 		cancel()
 		<-done
 		t.Fatalf("child %d already dead before cancel: %v", pid, err)
@@ -63,11 +66,11 @@ func TestRunShellCancellationKillsProcessGroup(t *testing.T) {
 	}
 	goneDeadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(goneDeadline) {
-		if err := syscall.Kill(pid, 0); err != nil {
+		if err := killPID(pid, 0); err != nil {
 			return
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	_ = syscall.Kill(pid, syscall.SIGKILL)
+	_ = killPID(pid, syscall.SIGKILL)
 	t.Fatalf("canceled completion gate left process-group child %d alive", pid)
 }
