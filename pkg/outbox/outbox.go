@@ -8,10 +8,15 @@
 package outbox
 
 import (
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
+
+	"github.com/Kampe/Herdforge/pkg/textdelivery"
 )
 
 type Status string
@@ -43,8 +48,11 @@ var (
 	// ErrNotInFlight is returned by MarkSent/MarkFailed when the item
 	// wasn't in the in_flight state they expect — e.g. two Relays raced
 	// and the other one already resolved it.
-	ErrNotInFlight = errors.New("outbox: item is not in_flight")
-	ErrNotSent     = errors.New("outbox: item is not sent")
+	ErrNotInFlight       = errors.New("outbox: item is not in_flight")
+	ErrNotSent           = errors.New("outbox: item is not sent")
+	ErrDeliveryAmbiguous = errors.New("outbox: delivery was accepted but completion is unproven")
+	ErrDeliveryConflict  = errors.New("outbox: delivery intent conflicts with durable receipt")
+	ErrDeliveryCorrupt   = errors.New("outbox: durable delivery receipt is corrupt or missing")
 )
 
 // Item is one durable side-effect intent.
@@ -71,7 +79,8 @@ type Item struct {
 
 // Store is the SQLite-backed outbox persistence.
 type Store struct {
-	db *sql.DB
+	db                    *sql.DB
+	beforeCompleteCASHook func()
 }
 
 // NewStore opens (or creates) a SQLite database at path, applies the
@@ -127,6 +136,21 @@ func (s *Store) migrate() error {
 	if err != nil {
 		return fmt.Errorf("migrate outbox schema: %w", err)
 	}
+	if _, err := s.db.Exec(`CREATE TABLE IF NOT EXISTS text_delivery_receipts (
+		key TEXT PRIMARY KEY,
+		executable TEXT NOT NULL,
+		args_json TEXT NOT NULL,
+		payload_sha256 TEXT NOT NULL,
+		intent_sha256 TEXT NOT NULL,
+		generation INTEGER NOT NULL,
+		state TEXT NOT NULL,
+		readback BLOB,
+		readback_sha256 TEXT,
+		created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+	)`); err != nil {
+		return fmt.Errorf("migrate text delivery receipts: %w", err)
+	}
 	for _, column := range []struct{ name, ddl string }{
 		{"owner", `ALTER TABLE outbox_items ADD COLUMN owner TEXT`},
 		{"claimed_at", `ALTER TABLE outbox_items ADD COLUMN claimed_at DATETIME`},
@@ -151,6 +175,117 @@ func (s *Store) migrate() error {
 		return fmt.Errorf("migrate outbox schema: %w", err)
 	}
 	return nil
+}
+
+// ReserveDelivery durably accepts an exact delivery intent before transport
+// execution. A second process can replay a completed receipt, but an accepted
+// receipt without proof is deliberately ambiguous and can never be resent.
+func (s *Store) ReserveDelivery(intent textdelivery.DeliveryIntent) (textdelivery.DurableReceipt, error) {
+	if s == nil || s.db == nil || intent.Key == "" || intent.Executable == "" || intent.PayloadSHA256 == "" || intent.IntentSHA256 == "" || intent.Generation <= 0 {
+		return textdelivery.DurableReceipt{}, fmt.Errorf("%w: incomplete intent", ErrDeliveryCorrupt)
+	}
+	argsJSON, err := json.Marshal(intent.Args)
+	if err != nil {
+		return textdelivery.DurableReceipt{}, fmt.Errorf("encode delivery argv: %w", err)
+	}
+	_, err = s.db.Exec(`INSERT INTO text_delivery_receipts
+		(key, executable, args_json, payload_sha256, intent_sha256, generation, state)
+		VALUES (?, ?, ?, ?, ?, ?, 'accepted')`, intent.Key, intent.Executable, string(argsJSON), intent.PayloadSHA256, intent.IntentSHA256, intent.Generation)
+	if err == nil {
+		return textdelivery.DurableReceipt{Key: intent.Key, Executable: intent.Executable, Args: append([]string(nil), intent.Args...), PayloadSHA256: intent.PayloadSHA256, IntentSHA256: intent.IntentSHA256, Generation: intent.Generation}, nil
+	}
+	receipt, readErr := s.readDelivery(intent.Key)
+	if readErr != nil {
+		return textdelivery.DurableReceipt{}, fmt.Errorf("%w: reservation state unavailable for key=%s: %v", ErrDeliveryCorrupt, intent.Key, readErr)
+	}
+	if receipt.Executable != intent.Executable || !sameStrings(receipt.Args, intent.Args) || receipt.PayloadSHA256 != intent.PayloadSHA256 || receipt.IntentSHA256 != intent.IntentSHA256 || receipt.Generation != intent.Generation {
+		return textdelivery.DurableReceipt{}, fmt.Errorf("%w: key=%s", ErrDeliveryConflict, intent.Key)
+	}
+	if !receipt.Completed {
+		return textdelivery.DurableReceipt{}, fmt.Errorf("%w: key=%s", ErrDeliveryAmbiguous, intent.Key)
+	}
+	return receipt, nil
+}
+
+// CompleteDelivery publishes exact readback with a status-conditioned CAS.
+func (s *Store) CompleteDelivery(intent textdelivery.DeliveryIntent, readback []byte) (textdelivery.DurableReceipt, error) {
+	if readback == nil {
+		return textdelivery.DurableReceipt{}, fmt.Errorf("%w: empty readback", ErrDeliveryCorrupt)
+	}
+	receipt, err := s.readDelivery(intent.Key)
+	if err != nil {
+		return textdelivery.DurableReceipt{}, err
+	}
+	if receipt.Executable != intent.Executable || !sameStrings(receipt.Args, intent.Args) || receipt.PayloadSHA256 != intent.PayloadSHA256 || receipt.IntentSHA256 != intent.IntentSHA256 || receipt.Generation != intent.Generation {
+		return textdelivery.DurableReceipt{}, fmt.Errorf("%w: key=%s", ErrDeliveryConflict, intent.Key)
+	}
+	readbackDigest := sha256.Sum256(readback)
+	readbackSHA := hex.EncodeToString(readbackDigest[:])
+	if receipt.Completed {
+		if receipt.ReadbackSHA256 != readbackSHA || string(receipt.Readback) != string(readback) {
+			return textdelivery.DurableReceipt{}, fmt.Errorf("%w: completed readback differs", ErrDeliveryCorrupt)
+		}
+		return receipt, nil
+	}
+	if s.beforeCompleteCASHook != nil {
+		s.beforeCompleteCASHook()
+	}
+	res, err := s.db.Exec(`UPDATE text_delivery_receipts SET state='completed', readback=?, readback_sha256=?, updated_at=? WHERE key=? AND state='accepted'`, append([]byte(nil), readback...), readbackSHA, time.Now().UTC(), intent.Key)
+	if err != nil {
+		return textdelivery.DurableReceipt{}, fmt.Errorf("complete delivery: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n != 1 {
+		return textdelivery.DurableReceipt{}, fmt.Errorf("%w: completion CAS lost", ErrDeliveryCorrupt)
+	}
+	receipt.Readback = append([]byte(nil), readback...)
+	receipt.ReadbackSHA256 = readbackSHA
+	receipt.Completed = true
+	return receipt, nil
+}
+
+func (s *Store) readDelivery(key string) (textdelivery.DurableReceipt, error) {
+	var r textdelivery.DurableReceipt
+	var argsJSON, state string
+	var readback []byte
+	var readbackSHA sql.NullString
+	err := s.db.QueryRow(`SELECT executable, args_json, payload_sha256, intent_sha256, generation, state, readback, readback_sha256 FROM text_delivery_receipts WHERE key=?`, key).Scan(&r.Executable, &argsJSON, &r.PayloadSHA256, &r.IntentSHA256, &r.Generation, &state, &readback, &readbackSHA)
+	if err == sql.ErrNoRows {
+		return textdelivery.DurableReceipt{}, fmt.Errorf("%w: key=%s", ErrDeliveryCorrupt, key)
+	}
+	if err != nil {
+		return textdelivery.DurableReceipt{}, fmt.Errorf("read delivery receipt: %w", err)
+	}
+	if json.Unmarshal([]byte(argsJSON), &r.Args) != nil || r.Executable == "" || r.PayloadSHA256 == "" || r.IntentSHA256 == "" || r.Generation <= 0 || (state != "accepted" && state != "completed") {
+		return textdelivery.DurableReceipt{}, fmt.Errorf("%w: key=%s", ErrDeliveryCorrupt, key)
+	}
+	r.Key = key
+	r.Completed = state == "completed"
+	if r.Completed {
+		if readback == nil || !readbackSHA.Valid || readbackSHA.String == "" {
+			return textdelivery.DurableReceipt{}, fmt.Errorf("%w: completed receipt lacks readback", ErrDeliveryCorrupt)
+		}
+		r.Readback = append([]byte(nil), readback...)
+		r.ReadbackSHA256 = readbackSHA.String
+		sum := sha256.Sum256(r.Readback)
+		if hex.EncodeToString(sum[:]) != r.ReadbackSHA256 {
+			return textdelivery.DurableReceipt{}, fmt.Errorf("%w: readback digest mismatch", ErrDeliveryCorrupt)
+		}
+	} else if readback != nil || readbackSHA.Valid {
+		return textdelivery.DurableReceipt{}, fmt.Errorf("%w: accepted receipt contains completion fields", ErrDeliveryCorrupt)
+	}
+	return r, nil
+}
+
+func sameStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func hasColumn(db *sql.DB, table, wanted string) (bool, error) {

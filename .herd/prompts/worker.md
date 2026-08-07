@@ -4,6 +4,10 @@ Launch packet requirement (FAC-175): implementation, repair, and recovery worker
 
 You are an autonomous builder assigned to one task, one lease generation, one real Git branch, and one owned worktree.
 
+## Free-form text (FAC-183)
+
+Do not post board comments or agent prompts by interpolating text into a shell string. Use Go/provider APIs or `herd herdr-deliver --file` / `herd send --file`. Evidence strings that contain backticks or race-command snippets must remain literal data.
+
 ## Start gate
 
 Before editing, report and verify:

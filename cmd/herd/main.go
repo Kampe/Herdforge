@@ -50,6 +50,7 @@ import (
 	"github.com/Kampe/Herdforge/pkg/selftest"
 	"github.com/Kampe/Herdforge/pkg/store"
 	hsync "github.com/Kampe/Herdforge/pkg/sync"
+	"github.com/Kampe/Herdforge/pkg/textdelivery"
 	"github.com/Kampe/Herdforge/pkg/throughput"
 	"github.com/Kampe/Herdforge/pkg/usage"
 	"github.com/Kampe/Herdforge/pkg/verifier"
@@ -217,6 +218,9 @@ func main() {
 	case "send":
 		runSend()
 
+	case "herdr-deliver":
+		runHerdrDeliver()
+
 	case "cleanup":
 		runCleanup()
 
@@ -351,6 +355,7 @@ func printUsage() {
 	fmt.Println("  board-sync Reconcile board status against git reality (report only)")
 	fmt.Println("  sh         Interactive shell: run herd subcommands in a loop")
 	fmt.Println("  send       Submit text to a herdr agent pane and verify consumption")
+	fmt.Println("  herdr-deliver  Durably deliver stdin or --file bytes to one Herdr session (FAC-183)")
 	fmt.Println("  cleanup    Close finished one-off agent tabs (standing fleet exempt)")
 	fmt.Println("  labels     Reconcile drifted Herdforge tab labels in place (FAC-199)")
 	fmt.Println("  forge      Full cycle: pulse worker + review + approve")
@@ -1907,6 +1912,56 @@ func runSend() {
 		os.Exit(1)
 	}
 	fmt.Printf("herd send: %s -> %s\n", target, status)
+}
+
+// runHerdrDeliver is the durable operator boundary for free-form prompt bytes.
+// Text comes only from stdin or --file; positional free-form arguments are
+// rejected so shells cannot evaluate backticks or $(...) (FAC-183 / FAC-151).
+func runHerdrDeliver() {
+	fs := flag.NewFlagSet("herdr-deliver", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	key := fs.String("key", "", "stable operation key")
+	generation := fs.Int64("generation", 0, "positive operation generation")
+	target := fs.String("target", "", "exact Herdr target (name or pane)")
+	session := fs.String("session", "", "optional session provenance")
+	wait := fs.Bool("wait", false, "ask herdr to wait for a working state")
+	file := fs.String("file", "", "read exact prompt bytes from this file")
+	state := fs.String("state", ".herd/herdr-delivery.db", "shared SQLite receipt authority path")
+	deliveryTimeout := fs.Int("timeout", 30, "seconds to wait for consumption proof")
+	if err := fs.Parse(os.Args[2:]); err != nil {
+		os.Exit(2)
+	}
+	if len(fs.Args()) != 0 {
+		fmt.Fprintln(os.Stderr, "herd herdr-deliver: positional payloads are forbidden; use stdin or --file")
+		os.Exit(2)
+	}
+	if *file == "-" {
+		fmt.Fprintln(os.Stderr, "herd herdr-deliver: --file - is not a payload source; omit --file and use stdin")
+		os.Exit(2)
+	}
+	payload := textdelivery.Payload{File: *file}
+	if *file == "" {
+		body, err := io.ReadAll(os.Stdin)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "herd herdr-deliver: read stdin: %v\n", err)
+			os.Exit(1)
+		}
+		payload.Bytes = body
+	}
+	proof, err := herdr.DeliverOperator(context.Background(), herdr.OperatorDelivery{
+		Key: *key, Generation: *generation, Target: *target, Session: *session,
+		Wait: *wait, Payload: payload, StatePath: *state, Timeout: time.Duration(*deliveryTimeout) * time.Second,
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "herd herdr-deliver: %v\n", err)
+		os.Exit(1)
+	}
+	encoded, err := json.Marshal(proof)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "herd herdr-deliver: encode proof: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Println(string(encoded))
 }
 
 // runCleanup ports bin/herd-cleanup: one agent = one tab — close tabs of
