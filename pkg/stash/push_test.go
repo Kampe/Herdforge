@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -276,15 +277,16 @@ func TestCounterMonotonicPerWorktree(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if !strings.HasSuffix(ref, "/"+string(rune('0'+i))) {
-			// use numeric check
-			_, n, err := r.PeekNewest(context.Background())
-			if err != nil {
-				t.Fatal(err)
-			}
-			if n != i {
-				// After push, newest is i; but Peek after push of i should be i.
-			}
+		wantSuffix := fmt.Sprintf("/%d", i)
+		if !strings.HasSuffix(ref, wantSuffix) {
+			t.Fatalf("after push %d: ref %q must end with %s", i, ref, wantSuffix)
+		}
+		_, n, err := r.PeekNewest(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if n != i {
+			t.Fatalf("after push %d: PeekNewest n=%d want %d", i, n, i)
 		}
 	}
 	_, n, err := r.PeekNewest(context.Background())
