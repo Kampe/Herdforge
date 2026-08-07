@@ -127,6 +127,11 @@ Commands:
 	"lock":          "Usage: herd lock <acquire|release|status|with> [flags]\n  Shared-checkout dir lock.",
 	// Byte-stable contract with reset_safe_cli_test.go (exact single line).
 	"reset-safe": resetSafeUsage,
+	"fresh-build": "Usage: herd fresh-build <pkg-or-path> [--dry-run]\n" +
+		"  Prove whether a cross-package type/build error is REAL or just stale dist.\n" +
+		"  Resolves the dependency-plus-self chain, clears only that chain's build\n" +
+		"  artifacts, rebuilds fresh, and prints a one-line verdict (profile-driven;\n" +
+		"  pnpm is one adapter).",
 }
 
 // knownSubcommands is the deterministic set of routed herd subcommands.
