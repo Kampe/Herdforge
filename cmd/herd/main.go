@@ -121,6 +121,9 @@ func main() {
 	case "board-frozen":
 		runBoardFrozen()
 
+	case "board-freeze":
+		runBoardFreeze()
+
 	case "role-inject":
 		runRoleInject()
 
@@ -319,6 +322,7 @@ func printUsage() {
 	fmt.Println("  claude-only  Route the whole fleet to native Claude: on, off, or status")
 	fmt.Println("  no-claude    Hold native Claude out of the fleet: on, off, or status")
 	fmt.Println("  board-frozen Exit 0 with the freeze trigger when board mutation is frozen")
+	fmt.Println("  board-freeze Durable gate: on, off, or status; every provider mutation refuses while on")
 	fmt.Println("  role-inject  SessionStart hook: bind a lane to its worker contract")
 	fmt.Println("  feedback     Fleet-wide control-plane feedback census")
 	fmt.Println("  stop         Stop the herd without deleting worktrees (dry-run default)")
