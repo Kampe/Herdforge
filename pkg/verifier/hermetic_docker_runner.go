@@ -314,7 +314,18 @@ func (r *hermeticDockerRunner) Run(ctx context.Context) (result FAC151DockerResu
 	if err := validateRuntimeMountInfo(mountInfo.Output); err != nil {
 		return result, err
 	}
-	if _, err := r.docker.Exec(operationCtx, containerID, []string{"/bin/mkdir", "-p", hermeticSourcePath}, nil); err != nil {
+	setup, ok := r.docker.(interface {
+		execAsRoot(context.Context, string, []string) (dockerResult, error)
+	})
+	mkdirSource := func() error {
+		if ok {
+			_, err := setup.execAsRoot(operationCtx, containerID, []string{"/bin/mkdir", "-p", hermeticSourcePath})
+			return err
+		}
+		_, err := r.docker.Exec(operationCtx, containerID, []string{"/bin/mkdir", "-p", hermeticSourcePath}, nil)
+		return err
+	}
+	if err := mkdirSource(); err != nil {
 		return result, fmt.Errorf("prepare immutable source path: %w", err)
 	}
 	if _, err := r.docker.Exec(operationCtx, containerID, []string{"/bin/test", "-d", hermeticSourcePath}, nil); err != nil {
@@ -323,14 +334,33 @@ func (r *hermeticDockerRunner) Run(ctx context.Context) (result FAC151DockerResu
 	if err := r.docker.Copy(operationCtx, containerID, hermeticBuildPath, transportArchive); err != nil {
 		return result, fmt.Errorf("copy immutable source archive: %w", err)
 	}
-	if _, err := r.docker.Exec(operationCtx, containerID, []string{"/bin/chmod", "a-w", hermeticSourcePath}, nil); err != nil {
+	chmodSource := func() error {
+		if ok {
+			_, err := setup.execAsRoot(operationCtx, containerID, []string{"/bin/chmod", "a-w", hermeticSourcePath})
+			return err
+		}
+		_, err := r.docker.Exec(operationCtx, containerID, []string{"/bin/chmod", "a-w", hermeticSourcePath}, nil)
+		return err
+	}
+	if err := chmodSource(); err != nil {
 		return result, fmt.Errorf("seal immutable source snapshot: %w", err)
 	}
-	if _, err := r.docker.Exec(operationCtx, containerID, []string{"/bin/mkdir", "-p", hermeticGoModDownload, hermeticGoBuildCache, hermeticGoTmpDir}, nil); err != nil {
+	// Cache/tmp dirs must be writable by the container user (65532). Create as
+	// root then chown so the go compiler can write under --read-only rootfs.
+	if ok {
+		if _, err := setup.execAsRoot(operationCtx, containerID, []string{"/bin/mkdir", "-p", hermeticGoModDownload, hermeticGoBuildCache, hermeticGoTmpDir}); err != nil {
+			return result, fmt.Errorf("prepare fixed container paths: %w", err)
+		}
+	} else if _, err := r.docker.Exec(operationCtx, containerID, []string{"/bin/mkdir", "-p", hermeticGoModDownload, hermeticGoBuildCache, hermeticGoTmpDir}, nil); err != nil {
 		return result, fmt.Errorf("prepare fixed container paths: %w", err)
 	}
 	if err := r.docker.Copy(operationCtx, containerID, hermeticGoModDownload, cacheTar); err != nil {
 		return result, fmt.Errorf("copy verified Go cache closure: %w", err)
+	}
+	if ok {
+		if _, err := setup.execAsRoot(operationCtx, containerID, []string{"/bin/chown", "-R", hermeticContainerUser, hermeticGoModCache, hermeticGoBuildCache, hermeticGoTmpDir}); err != nil {
+			return result, fmt.Errorf("delegate cache ownership to container user: %w", err)
+		}
 	}
 	namespaces, uid, gid, err := r.namespaceIdentities(operationCtx, containerID)
 	if err != nil {
@@ -710,17 +740,25 @@ func (d fixedDockerCLI) Start(ctx context.Context, id string) error {
 func (d fixedDockerCLI) Copy(ctx context.Context, id, destination string, input []byte) error {
 	// docker cp rejects --read-only containers even when the destination is a
 	// writable tmpfs mount (Colima/Docker Engine). Extract the transport tar
-	// through docker exec into the already-proved directory instead.
+	// through docker exec as root into the already-proved directory instead so
+	// filesystem ownership matches the root-owned archive policy.
 	if destination == "" || !strings.HasPrefix(destination, "/") {
 		return errors.New("copy destination must be an absolute container path")
 	}
-	_, err := d.run(ctx, input, []string{"exec", "-i", id, "/bin/tar", "-x", "-C", destination, "-f", "-"})
+	_, err := d.run(ctx, input, []string{"exec", "-u", "0:0", "-i", id, "/bin/tar", "-x", "-C", destination, "-f", "-"})
 	return err
 }
 
 func (d fixedDockerCLI) Exec(ctx context.Context, id string, argv []string, input []byte) (dockerResult, error) {
 	args := append([]string{"exec", id}, argv...)
 	return d.run(ctx, input, args)
+}
+
+// execAsRoot runs a setup command as uid 0 inside the container (mkdir/chmod
+// of root-owned trees). Production test execution stays on the default user.
+func (d fixedDockerCLI) execAsRoot(ctx context.Context, id string, argv []string) (dockerResult, error) {
+	args := append([]string{"exec", "-u", "0:0", id}, argv...)
+	return d.run(ctx, nil, args)
 }
 
 func (d fixedDockerCLI) Remove(ctx context.Context, id string) error {
