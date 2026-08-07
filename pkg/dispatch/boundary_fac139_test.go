@@ -1,17 +1,13 @@
 package dispatch
 
 import (
-	"context"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/Kampe/Herdforge/pkg/config"
 	"github.com/Kampe/Herdforge/pkg/launch"
-	"github.com/Kampe/Herdforge/pkg/provider"
 	"github.com/Kampe/Herdforge/pkg/router"
 	"github.com/Kampe/Herdforge/pkg/toolprobe"
-	"github.com/Kampe/Herdforge/pkg/worktree"
 )
 
 // Production write-capable launch without a tool-probe PASS must fail before
@@ -154,17 +150,4 @@ type countingOpener struct {
 func (c countingOpener) OpenTab(workspace, label, cwd string, noFocus bool, env ...string) (string, string, error) {
 	*c.n++
 	return c.inner.OpenTab(workspace, label, cwd, noFocus, env...)
-}
-
-// Compile-time check: DispatchOptions carries Probe for the six launch paths.
-func TestDispatchOptionsCarriesProbeField(t *testing.T) {
-	var opts DispatchOptions
-	opts.Probe = &toolprobe.Receipt{Status: toolprobe.StatusPASS}
-	if opts.Probe == nil {
-		t.Fatal("Probe field missing")
-	}
-	_ = context.Background()
-	_ = provider.Task{}
-	_ = config.LaneDef{}
-	_ = worktree.WorktreeInfo{}
 }
