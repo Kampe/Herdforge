@@ -184,20 +184,7 @@ func StartAuthorLive(cfg LiveConfig) (*HostCredsSession, *exec.Cmd, *LiveProof, 
 		return nil, nil, nil, err
 	}
 
-	proof := &LiveProof{
-		SessionID:       sess.ID,
-		Kind:            kind,
-		Prompt:          prompt,
-		BoundaryDigest:  bound.ProbeDigest(),
-		AllowedMarker:   marker,
-		CapabilityNonce: cap.Nonce,
-		MitmTransport:   sess.Mitm != nil,
-		IsolatedHOME:    homeDir,
-		PeerPort:        port,
-		AuthorCausal:    cfg.CausalAuthorOnly,
-		// Self-test author ⇒ transport proof only, never model evidence.
-		ModelEvidence: !cfg.CausalAuthorOnly,
-	}
+	proof := newLiveProof(cfg, kind, prompt, marker, sess, cap, bound, homeDir, port)
 
 	timeout := cfg.Timeout
 	if timeout <= 0 {
@@ -388,6 +375,42 @@ func StartAuthorLive(cfg LiveConfig) (*HostCredsSession, *exec.Cmd, *LiveProof, 
 
 func scrubAndMergeEnv(parent, worker []string) []string {
 	return ExactWorkerChildEnv(parent, worker)
+}
+
+// newLiveProof builds the initial LiveProof for a run.
+//
+// Extracted so the ModelEvidence derivation is observable by a test. Asserting
+// it through StartAuthorLive is impossible: every authority a test can supply
+// is rejected by the fac169-ipc gate, which returns before this struct is ever
+// built, so a test driving StartAuthorLive cannot see the field at all.
+//
+// ModelEvidence is the inverse of CausalAuthorOnly. The causal path runs herd's
+// own `hostcreds author-causal`, which derives the capability marker with
+// in-process SHA-256 and prints it — ModelMarkerReached there is herd checking
+// its own hash, a transport proof, not proof a model ran.
+func newLiveProof(
+	cfg LiveConfig,
+	kind, prompt, marker string,
+	sess *HostCredsSession,
+	cap Capability,
+	bound OSBoundary,
+	homeDir string,
+	port int,
+) *LiveProof {
+	return &LiveProof{
+		SessionID:       sess.ID,
+		Kind:            kind,
+		Prompt:          prompt,
+		BoundaryDigest:  bound.ProbeDigest(),
+		AllowedMarker:   marker,
+		CapabilityNonce: cap.Nonce,
+		MitmTransport:   sess.Mitm != nil,
+		IsolatedHOME:    homeDir,
+		PeerPort:        port,
+		AuthorCausal:    cfg.CausalAuthorOnly,
+		// Self-test author ⇒ transport proof only, never model evidence.
+		ModelEvidence: !cfg.CausalAuthorOnly,
+	}
 }
 
 // liveChildEnv composes the exact environ handed to a live author child.
