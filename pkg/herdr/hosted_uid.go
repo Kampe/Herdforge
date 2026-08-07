@@ -100,21 +100,29 @@ type HostedProcessIdentity struct {
 	PID        int
 	StartToken string
 	UID        int
+	GID        int
 	ParentPID  int
 	Role       string // shell | foreground | pgid | descendant | agent
 }
 
+// EnvBuilderGID optionally pins the expected primary GID for hosted processes.
+// When unset, proof requires a homogeneous tree GID equal to the shell's GID
+// and distinct from the coordinator's primary GID (group-drop evidence).
+const EnvBuilderGID = "HERD_BUILDER_GID"
+
 // test seams — production defaults use real OS / procsignal.
 var (
-	processUIDOf       = processUIDOfReal
-	signalExact        = procsignal.SignalExactProcess
-	osGetuid           = os.Getuid
-	osGetpid           = os.Getpid
-	readStartTok       = func(pid int) (string, error) { return readPIDStartToken(pid) }
-	readParent         = func(pid int) (int, error) { return readPIDParent(pid) }
-	listPGIDMembers    = listProcessGroupMembersReal
-	listChildPIDs      = listDirectChildrenReal
-	sleepBrief         = func() { time.Sleep(50 * time.Millisecond) }
+	processUIDOf    = processUIDOfReal
+	processGIDOf    = processGIDOfReal
+	signalExact     = procsignal.SignalExactProcess
+	osGetuid        = os.Getuid
+	osGetgid        = os.Getgid
+	osGetpid        = os.Getpid
+	readStartTok    = func(pid int) (string, error) { return readPIDStartToken(pid) }
+	readParent      = func(pid int) (int, error) { return readPIDParent(pid) }
+	listPGIDMembers = listProcessGroupMembersReal
+	listChildPIDs   = listDirectChildrenReal
+	sleepBrief      = func() { time.Sleep(50 * time.Millisecond) }
 )
 
 // BuilderUID returns the configured HERD_BUILDER_UID or an error when unset/invalid.
@@ -305,8 +313,12 @@ func GetHostedPaneIdentity(paneID string) (*HostedPaneIdentity, error) {
 		if err != nil {
 			return fmt.Errorf("%w: uid pid %d role %s: %v", ErrHostedUIDProofFailed, pid, role, err)
 		}
+		gid, err := processGIDOf(pid)
+		if err != nil {
+			return fmt.Errorf("%w: gid pid %d role %s: %v", ErrHostedUIDProofFailed, pid, role, err)
+		}
 		ppid, _ := readParent(pid) // best-effort; zero is ok for shell
-		id := HostedProcessIdentity{PID: pid, StartToken: tok, UID: uid, ParentPID: ppid, Role: role}
+		id := HostedProcessIdentity{PID: pid, StartToken: tok, UID: uid, GID: gid, ParentPID: ppid, Role: role}
 		byPID[pid] = &id
 		return nil
 	}
@@ -325,17 +337,19 @@ func GetHostedPaneIdentity(paneID string) (*HostedPaneIdentity, error) {
 			info.Foreground = append(info.Foreground, *id)
 		}
 	}
-	// Process-group members (validated PGID only — never pgid <=1 / self).
+	// Process-group members: reported PGID > 1 must be usable. Silent skip
+	// when ValidatePGID fails would drop prior HIGH #3 coverage.
 	if info.ProcessGroupID > 1 {
-		if err := procsignal.ValidatePGID(info.ProcessGroupID); err == nil {
-			members, err := listPGIDMembers(info.ProcessGroupID)
-			if err != nil {
-				return nil, fmt.Errorf("%w: process-group members pgid %d: %v", ErrHostedUIDProofFailed, info.ProcessGroupID, err)
-			}
-			for _, pid := range members {
-				if err := add(pid, "pgid"); err != nil {
-					return nil, err
-				}
+		if err := procsignal.ValidatePGID(info.ProcessGroupID); err != nil {
+			return nil, fmt.Errorf("%w: hosted process group %d unusable: %v", ErrHostedUIDProofFailed, info.ProcessGroupID, err)
+		}
+		members, err := listPGIDMembers(info.ProcessGroupID)
+		if err != nil {
+			return nil, fmt.Errorf("%w: process-group members pgid %d: %v", ErrHostedUIDProofFailed, info.ProcessGroupID, err)
+		}
+		for _, pid := range members {
+			if err := add(pid, "pgid"); err != nil {
+				return nil, err
 			}
 		}
 	}
@@ -442,8 +456,44 @@ func processUIDOfReal(pid int) (int, error) {
 	return u, nil
 }
 
+func processGIDOfReal(pid int) (int, error) {
+	if pid <= 0 {
+		return 0, fmt.Errorf("invalid pid")
+	}
+	out, err := exec.Command("/bin/ps", "-o", "gid=", "-p", strconv.Itoa(pid)).Output()
+	if err != nil {
+		return 0, fmt.Errorf("ps gid for pid %d: %w", pid, err)
+	}
+	g, err := strconv.Atoi(strings.TrimSpace(string(out)))
+	if err != nil {
+		return 0, fmt.Errorf("parse gid for pid %d: %w", pid, err)
+	}
+	return g, nil
+}
+
+// expectedBuilderGID resolves the GID the isolation tree must share.
+// Explicit HERD_BUILDER_GID wins; otherwise shell GID is the anchor and must
+// differ from the coordinator primary GID (evidence of group drop).
+func expectedBuilderGID(shellGID int) (int, error) {
+	if raw := strings.TrimSpace(os.Getenv(EnvBuilderGID)); raw != "" {
+		g, err := strconv.Atoi(raw)
+		if err != nil || g < 0 {
+			return 0, fmt.Errorf("%w: %s=%q invalid", ErrHostedUIDConfig, EnvBuilderGID, raw)
+		}
+		return g, nil
+	}
+	if shellGID < 0 {
+		return 0, fmt.Errorf("%w: shell gid unreadable", ErrHostedUIDProofFailed)
+	}
+	if shellGID == osGetgid() {
+		return 0, fmt.Errorf("%w: shell gid %d equals coordinator gid — group drop not proven", ErrHostedUIDProofFailed, shellGID)
+	}
+	return shellGID, nil
+}
+
 // AssertHostedPaneUID proves shell, foreground inventory, process-group
-// members, and shell descendants all run as wantUID with non-empty start tokens.
+// members, and shell descendants all run as wantUID with non-empty start
+// tokens and a homogeneous primary GID (capability hosted_process_gid).
 func AssertHostedPaneUID(paneID string, wantUID int) error {
 	if wantUID <= 0 {
 		return fmt.Errorf("%w: invalid want uid", ErrHostedUIDConfig)
@@ -464,6 +514,17 @@ func AssertHostedPaneUID(paneID string, wantUID int) error {
 	if len(info.Tree) == 0 {
 		return fmt.Errorf("%w: pane %s has empty isolation tree", ErrHostedUIDProofFailed, paneID)
 	}
+	shell := HostedProcessIdentity{}
+	for _, p := range info.Tree {
+		if p.PID == info.ShellPID {
+			shell = p
+			break
+		}
+	}
+	wantGID, err := expectedBuilderGID(shell.GID)
+	if err != nil {
+		return err
+	}
 	for _, p := range info.Tree {
 		if strings.TrimSpace(p.StartToken) == "" {
 			return fmt.Errorf("%w: pid %d missing start token", ErrHostedUIDProofFailed, p.PID)
@@ -471,6 +532,10 @@ func AssertHostedPaneUID(paneID string, wantUID int) error {
 		if p.UID != wantUID {
 			return fmt.Errorf("%w: hosted process pid %d uid=%d want BuilderUID=%d role=%s (CLI setuid is not isolation)",
 				ErrHostedUIDProofFailed, p.PID, p.UID, wantUID, p.Role)
+		}
+		if p.GID != wantGID {
+			return fmt.Errorf("%w: hosted process pid %d gid=%d want BuilderGID=%d role=%s",
+				ErrHostedUIDProofFailed, p.PID, p.GID, wantGID, p.Role)
 		}
 	}
 	return nil
@@ -653,6 +718,10 @@ func FailHostedIsolationProof(paneID, tabID string, proofErr error) error {
 // FailHostedIsolationProofWithLifecycle signals bound PIDs first, then runs
 // lifecycle rollback (tombstone + drop) before any raw tab close, so
 // compensateStartedProcessExact can still see the agent and Invalidate runs.
+//
+// If rollback fails mid-cascade, this path still writes a durable tombstone
+// via Invalidate and drops process-local authority — never drop without a
+// tombstone attempt (sticky provisional residual of prior HIGH #2).
 func FailHostedIsolationProofWithLifecycle(paneID, tabID string, lc ToolChildLifecycle, proofErr error) error {
 	var parts []error
 	if err := SignalHostedPaneTree(paneID); err != nil {
@@ -661,14 +730,21 @@ func FailHostedIsolationProofWithLifecycle(paneID, tabID string, lc ToolChildLif
 	if lc != nil {
 		if err := rollbackToolChild(tabID, paneID, lc, "hosted-uid-proof-failed"); err != nil {
 			parts = append(parts, err)
-			// Rollback failed to close/tombstone — force raw close so the
-			// orphan tab does not remain live under a sticky lifecycle.
+			// Rollback returned before Invalidate/drop — force tombstone + close.
+			if invErr := lc.Invalidate("hosted-uid-proof-failed"); invErr != nil {
+				parts = append(parts, invErr)
+			} else if verErr := lc.VerifyTerminal(); verErr != nil {
+				// VerifyTerminal is strict for JSONL sinks; MemorySink fails it.
+				// Tombstone write already happened — retain verify failure only
+				// as secondary evidence, never skip Invalidate.
+				parts = append(parts, verErr)
+			}
 			if tabID != "" {
 				if cerr := tabCloseRaw(tabID); cerr != nil {
 					parts = append(parts, cerr)
 				}
-				dropToolChild(tabID, paneID)
 			}
+			dropToolChild(tabID, paneID)
 		}
 	} else if tabID != "" {
 		if err := tabCloseRaw(tabID); err != nil {
