@@ -26,9 +26,7 @@ type CompletionCheck struct {
 }
 
 func gitOut(dir string, args ...string) (string, error) {
-	cmd := exec.Command("git", args...)
-	cmd.Dir = dir
-	out, err := cmd.Output()
+	out, err := runGit(dir, args...)
 	return strings.TrimSpace(string(out)), err
 }
 
