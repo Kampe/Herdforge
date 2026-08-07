@@ -66,6 +66,27 @@ func TestDirLockAcquire(t *testing.T) {
 		}
 	})
 
+	// FAC-138: the marker names ONE lockdir. Treating any non-empty value as
+	// "held" granted every OTHER lock for free — so the forge coordinator
+	// fence, taken underneath `herd lock with`, was never actually held.
+	t.Run("marker for a different lockdir does not grant this lock", func(t *testing.T) {
+		dir := tempDir(t)
+		other := NewDirLock(filepath.Join(dir, "other.d"))
+		fence := NewDirLock(filepath.Join(dir, "fence.d"))
+		t.Setenv(EnvHeld, other.Dir())
+
+		if err := fence.Acquire(context.Background(), 0, "first"); err != nil {
+			t.Fatalf("first fence acquire: %v", err)
+		}
+		if _, err := os.Stat(fence.Dir()); err != nil {
+			t.Fatalf("fence did not take the filesystem lock: %v", err)
+		}
+		// A second live coordinator must be refused, marker or not.
+		if err := NewDirLock(fence.Dir()).Acquire(context.Background(), 0, "second"); err == nil {
+			t.Fatal("second holder acquired a fence already held by a live process")
+		}
+	})
+
 	t.Run("timeout on young live lock returns error with holder", func(t *testing.T) {
 		dir := tempDir(t)
 		lockDir := filepath.Join(dir, "held")

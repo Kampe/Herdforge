@@ -10,10 +10,12 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 	"unicode"
 
@@ -1474,12 +1476,20 @@ func notRunningOr(res *activate.Result, fallback string) string {
 	return res.NotRunning
 }
 
+// parseReviewArgs parses `herd review [<ref>] [--spawn]`. Go's flag package
+// stops at the first positional, so `review FAC-1 --spawn` used to parse
+// spawn=false and NO reviewer was ever spawned — the forge loop's review step
+// was a no-op for every caller that put the ref first (FAC-138).
+func parseReviewArgs(args []string) (ref string, spawn bool) {
+	fs := flag.NewFlagSet("review", flag.ExitOnError)
+	spawnFlag := fs.Bool("spawn", false, "Spawn reviewer agent in herdr")
+	fs.Parse(leadingPositionalArgs(args))
+	return fs.Arg(0), *spawnFlag
+}
+
 func runReview() {
-	reviewFlags := flag.NewFlagSet("review", flag.ExitOnError)
-	spawn := reviewFlags.Bool("spawn", false, "Spawn reviewer agent in herdr")
-	reviewFlags.Parse(os.Args[2:])
-	refArg := reviewFlags.Arg(0)
-	if *spawn {
+	refArg, spawn := parseReviewArgs(os.Args[2:])
+	if spawn {
 		if err := requireFleetAdmission(context.Background()); err != nil {
 			fmt.Fprintf(os.Stderr, "review: %v\n", err)
 			os.Exit(1)
@@ -1554,7 +1564,7 @@ func runReview() {
 	task := tasks[claimIdx]
 	fmt.Printf("\nSelected [%s] %s for review\n", task.Ref, task.Title)
 
-	if *spawn {
+	if spawn {
 		if !herdr.IsAvailable() {
 			fmt.Fprintf(os.Stderr, "herdr CLI not found\n")
 			os.Exit(1)
@@ -1642,15 +1652,22 @@ Do not read the whole codebase. Do not run the full suite. Change nothing.`,
 	}
 }
 
+// parseApproveArgs parses `herd approve [<ref>] [--force] [--evidence <sha>]`.
+// Same swallowed-flag defect as review (FAC-138): with the ref first, --force
+// and --evidence silently parsed as their zero values.
+func parseApproveArgs(args []string) (ref, evidence string, force bool) {
+	fs := flag.NewFlagSet("approve", flag.ExitOnError)
+	forceFlag := fs.Bool("force", false, "Approve without merge evidence (look at the diff first)")
+	evidenceFlag := fs.String("evidence", "", "Proof commit SHA (only with a single <ref> argument)")
+	fs.Parse(leadingPositionalArgs(args))
+	return fs.Arg(0), *evidenceFlag, *forceFlag
+}
+
 // runApprove sweeps in-review cards and moves each to done ONLY with merge
 // evidence on origin/main (via sync.BoardDone). Cards without proof are
 // refused and stay in-review — a done card is a claim about reality.
 func runApprove() {
-	approveFlags := flag.NewFlagSet("approve", flag.ExitOnError)
-	force := approveFlags.Bool("force", false, "Approve without merge evidence (look at the diff first)")
-	evidence := approveFlags.String("evidence", "", "Proof commit SHA (only with a single <ref> argument)")
-	approveFlags.Parse(os.Args[2:])
-	refArg := approveFlags.Arg(0)
+	refArg, evidenceArg, forceArg := parseApproveArgs(os.Args[2:])
 
 	cfg, err := config.LoadConfig(".herd/herd.yaml")
 	if err != nil {
@@ -1685,7 +1702,7 @@ func runApprove() {
 			fmt.Fprintf(os.Stderr, "no in-review card matches %s\n", want)
 			os.Exit(1)
 		}
-	} else if *evidence != "" {
+	} else if evidenceArg != "" {
 		fmt.Fprintf(os.Stderr, "--evidence needs a single <ref> argument\n")
 		os.Exit(1)
 	}
@@ -1701,7 +1718,7 @@ func runApprove() {
 
 	approved, refused, failed := 0, 0, 0
 	for _, task := range tasks {
-		res, err := hsync.BoardDone(ctx, tp, ".", cfg.TaskProvider.ProjectID, task.Ref, *evidence, *force)
+		res, err := hsync.BoardDone(ctx, tp, ".", cfg.TaskProvider.ProjectID, task.Ref, evidenceArg, forceArg)
 		switch {
 		case err == nil:
 			fmt.Printf("APPROVED [%s]: %s\n  proof: %s\n", res.Ref, task.Title, res.Proof)
@@ -4740,27 +4757,34 @@ type cliForgeDriver struct {
 
 func (d *cliForgeDriver) Log(msg string) { fmt.Println(msg) }
 
-// LaneState counts live task-fac-* builder agents that are working.
-func (d *cliForgeDriver) LaneState(ctx context.Context) daemon.LaneState {
+// LaneState counts live task-fac-* builder agents that are working. A herdr
+// read failure is UNKNOWN capacity, not free capacity (FAC-138) — reporting
+// zero busy lanes on a failed list backfilled every lane the coordinator had
+// just lost sight of.
+func (d *cliForgeDriver) LaneState(ctx context.Context) (daemon.LaneState, error) {
+	agents, err := herdr.AgentList()
+	if err != nil {
+		return daemon.LaneState{}, fmt.Errorf("herdr agent list: %w", err)
+	}
 	busy := 0
-	if agents, err := herdr.AgentList(); err == nil {
-		for _, a := range agents {
-			if strings.HasPrefix(a.Name, "task-fac-") && (a.Status == "working" || a.Status == "starting") {
-				busy++
-			}
+	for _, a := range agents {
+		if strings.HasPrefix(a.Name, "task-fac-") && (a.Status == "working" || a.Status == "starting") {
+			busy++
 		}
 	}
-	return daemon.LaneState{Busy: busy, Max: d.maxLanes}
+	return daemon.LaneState{Busy: busy, Max: d.maxLanes}, nil
 }
 
 // Signals: a card is completed when its builder agent exists and is no longer
-// working; it is verified when herd verify passes on its worktree.
-func (d *cliForgeDriver) Signals(ctx context.Context) (map[string]bool, map[string]bool) {
+// working; it is verified when herd verify passes on its worktree. An
+// unreadable fleet yields an error, never an empty (and so drained-looking)
+// signal set.
+func (d *cliForgeDriver) Signals(ctx context.Context) (map[string]bool, map[string]bool, error) {
 	completed := map[string]bool{}
 	verified := map[string]bool{}
 	agents, err := herdr.AgentList()
 	if err != nil {
-		return completed, verified
+		return nil, nil, fmt.Errorf("herdr agent list: %w", err)
 	}
 	v := verifier.NewVerifier("")
 	for _, a := range agents {
@@ -4780,7 +4804,7 @@ func (d *cliForgeDriver) Signals(ctx context.Context) (map[string]bool, map[stri
 			}
 		}
 	}
-	return completed, verified
+	return completed, verified, nil
 }
 
 func (d *cliForgeDriver) herd(args ...string) error {
@@ -4799,7 +4823,10 @@ func (d *cliForgeDriver) Dispatch(ctx context.Context, t *provider.Task) error {
 }
 
 func (d *cliForgeDriver) Review(ctx context.Context, t *provider.Task) error {
-	return d.herd("review", t.Ref, "--spawn")
+	// --spawn BEFORE the ref: flag.Parse stops at the first positional, so the
+	// old trailing form silently parsed spawn=false and no reviewer ever
+	// started. runReview now also normalizes the order (FAC-138).
+	return d.herd("review", "--spawn", t.Ref)
 }
 
 func (d *cliForgeDriver) Approve(ctx context.Context, t *provider.Task) error {
@@ -4823,34 +4850,66 @@ func (d *cliForgeDriver) Renudge(ctx context.Context, t *provider.Task) error {
 	return err
 }
 
+// forgeLoopFenceDir is the single-active-coordinator fence for `herd forge
+// --loop`. It is deliberately NOT the shared-checkout lock: the coordinator
+// holds this for its whole run, while harvest/merge still needs the checkout
+// lock underneath it.
+const forgeLoopFenceDir = ".herd/forge-loop.lock.d"
+
+// forgeLoopFenceMaxAge disables DirLock's age-based stale rule for the
+// coordinator. A standing loop legitimately outlives any timer; holder-PID
+// liveness is what releases an abandoned fence.
+const forgeLoopFenceMaxAge = 365 * 24 * time.Hour
+
 // runForgeLoop wires the real driver and runs the autonomous forge loop.
-func runForgeLoop() {
+func runForgeLoop() { os.Exit(forgeLoopMain()) }
+
+// forgeLoopMain returns the process exit code so every path releases the
+// coordinator fence — os.Exit skips deferred releases (FAC-138).
+func forgeLoopMain() int {
 	fs := flag.NewFlagSet("forge-loop", flag.ExitOnError)
 	_ = fs.Bool("loop", true, "run the autonomous loop")
 	maxLanes := fs.Int("max-lanes", 3, "max concurrent builder lanes")
 	interval := fs.Int("interval", 15, "seconds between ticks")
 	ticks := fs.Int("ticks", 0, "stop after N ticks (0 = run until drained)")
 	stopEmpty := fs.Bool("stop-empty", true, "stop when the board is clear and no lane is busy")
-	fs.Parse(os.Args[2:])
-	if err := requireFleetAdmission(context.Background()); err != nil {
+	fs.Parse(leadingPositionalArgs(os.Args[2:]))
+
+	// Signal-aware: SIGINT/SIGTERM cancels the loop's context so the current
+	// tick unwinds and the fence is released, instead of dying mid-transition.
+	ctx, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stopSignals()
+
+	if err := requireFleetAdmission(ctx); err != nil {
 		fmt.Fprintf(os.Stderr, "forge --loop: %v\n", err)
-		os.Exit(1)
+		return 1
 	}
+
+	// Single-active coordinator: two loops driving the same board race every
+	// claim, review and board write. Wait 0 — a second coordinator is an
+	// operator error to report, not a queue to join.
+	fence := lock.NewDirLock(forgeLoopFenceDir)
+	fence.SetMaxAge(forgeLoopFenceMaxAge)
+	if err := fence.Acquire(ctx, 0, "herd forge --loop"); err != nil {
+		fmt.Fprintf(os.Stderr, "forge --loop: another coordinator is active: %v\n", err)
+		return 1
+	}
+	defer fence.Release()
 
 	cfg, err := config.LoadConfig(".herd/herd.yaml")
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "forge --loop: %v\n", err)
-		os.Exit(1)
+		return 1
 	}
 	tp, tpErr := loadTaskProvider(cfg)
 	if tpErr != nil {
 		fmt.Fprintf(os.Stderr, "task provider: %v\n", tpErr)
-		os.Exit(1)
+		return 1
 	}
 	st, err := store.New(".herd/herdforge.db")
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "forge --loop: store init failed — durable dependency BLOCKED evidence is required: %v\n", err)
-		os.Exit(1)
+		return 1
 	}
 	defer st.Close()
 	// The forge loop is wake-capable: it must be composed with a durable
@@ -4861,14 +4920,21 @@ func runForgeLoop() {
 	driver := &cliForgeDriver{cfg: cfg, maxLanes: *maxLanes}
 
 	fmt.Printf("herd forge --loop: max-lanes=%d interval=%ds — driving the board autonomously\n", *maxLanes, *interval)
-	err = eng.ForgeLoop(context.Background(), driver, daemon.ForgeLoopOptions{
+	err = eng.ForgeLoop(ctx, driver, daemon.ForgeLoopOptions{
 		Interval:  time.Duration(*interval) * time.Second,
 		MaxTicks:  *ticks,
 		StopEmpty: *stopEmpty,
 	})
-	if err != nil {
+	switch {
+	case err == nil:
+		return 0
+	case errors.Is(err, context.Canceled):
+		// Operator signal, with no transition left failing: a clean stop.
+		fmt.Println("herd forge --loop: signalled — stopped between ticks")
+		return 0
+	default:
 		fmt.Fprintf(os.Stderr, "forge --loop: %v\n", err)
-		os.Exit(1)
+		return 1
 	}
 }
 

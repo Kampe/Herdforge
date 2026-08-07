@@ -64,11 +64,16 @@ func (l *DirLock) Dir() string { return l.dir }
 // SetMaxAge overrides the default stale-lock age bound.
 func (l *DirLock) SetMaxAge(age time.Duration) { l.maxAge = age }
 
-// Acquire takes the lock, breaking any stale lock first. A re-entrant call
-// (HERD_SHARED_LOCK_HELD set in the environment) returns immediately without
-// touching the filesystem. Returns an error after wait expires.
+// Acquire takes the lock, breaking any stale lock first. A re-entrant call —
+// HERD_SHARED_LOCK_HELD naming THIS lockdir, as `herd lock with` exports it —
+// returns immediately without touching the filesystem. Returns an error after
+// wait expires.
+//
+// The marker is compared against l.dir: any-value-means-held granted every
+// OTHER lock for free, so a distinct lock (the forge coordinator fence) taken
+// underneath `herd lock with` was never actually held.
 func (l *DirLock) Acquire(ctx context.Context, wait time.Duration, reason string) error {
-	if os.Getenv(EnvHeld) != "" {
+	if held := os.Getenv(EnvHeld); held != "" && held == l.dir {
 		return nil
 	}
 	waited := 0

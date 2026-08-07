@@ -12,12 +12,16 @@ import (
 // fakeDriver records the actions the loop drives and lets a test script the
 // board's lane state and completion signals per tick.
 type fakeDriver struct {
-	lanes     LaneState
-	completed map[string]bool
-	verified  map[string]bool
-	actions   []string
-	onApprove func(ref string)
-	onReview  func(ref string)
+	lanes      LaneState
+	laneErr    error
+	signalErr  error
+	completed  map[string]bool
+	verified   map[string]bool
+	actions    []string
+	logged     []string
+	onApprove  func(ref string)
+	onReview   func(ref string)
+	approveErr func(ref string) error
 }
 
 func TestForgeLoop_ReconciliationFailureStopsBeforeDriverActions(t *testing.T) {
@@ -44,9 +48,17 @@ func TestForgeLoop_MissingProductionCompositionFailsClosed(t *testing.T) {
 	}
 }
 
-func (f *fakeDriver) LaneState(context.Context) LaneState { return f.lanes }
-func (f *fakeDriver) Signals(context.Context) (map[string]bool, map[string]bool) {
-	return f.completed, f.verified
+func (f *fakeDriver) LaneState(context.Context) (LaneState, error) {
+	if f.laneErr != nil {
+		return LaneState{}, f.laneErr
+	}
+	return f.lanes, nil
+}
+func (f *fakeDriver) Signals(context.Context) (map[string]bool, map[string]bool, error) {
+	if f.signalErr != nil {
+		return nil, nil, f.signalErr
+	}
+	return f.completed, f.verified, nil
 }
 func (f *fakeDriver) Dispatch(_ context.Context, t *provider.Task) error {
 	f.actions = append(f.actions, "dispatch:"+t.Ref)
@@ -65,13 +77,16 @@ func (f *fakeDriver) Approve(_ context.Context, t *provider.Task) error {
 	if f.onApprove != nil {
 		f.onApprove(t.Ref)
 	}
+	if f.approveErr != nil {
+		return f.approveErr(t.Ref)
+	}
 	return nil
 }
 func (f *fakeDriver) Renudge(_ context.Context, t *provider.Task) error {
 	f.actions = append(f.actions, "renudge:"+t.Ref)
 	return nil
 }
-func (f *fakeDriver) Log(string) {}
+func (f *fakeDriver) Log(msg string) { f.logged = append(f.logged, msg) }
 
 func TestForgeLoop_DrivesActionsPerStep(t *testing.T) {
 	e := forgeEngine(t,
