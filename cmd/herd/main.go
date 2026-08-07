@@ -58,6 +58,7 @@ import (
 	hsync "github.com/Kampe/Herdforge/pkg/sync"
 	"github.com/Kampe/Herdforge/pkg/textdelivery"
 	"github.com/Kampe/Herdforge/pkg/throughput"
+	"github.com/Kampe/Herdforge/pkg/toolprobe"
 	"github.com/Kampe/Herdforge/pkg/usage"
 	"github.com/Kampe/Herdforge/pkg/verifier"
 	"github.com/Kampe/Herdforge/pkg/worktree"
@@ -1231,6 +1232,12 @@ func runStandingConfigMode(cfg *config.Config, herdrAvailable bool, mode standin
 		return errors.New("herdr CLI not found — install herdr first")
 	}
 
+	// lastAdmit carries the exact decision AdmitRoute just proved so CreateTab
+	// can open through the FAC-139 write-capable boundary (decision + tool-probe).
+	var lastAdmit struct {
+		lane     *config.LaneDef
+		decision *router.LaunchDecision
+	}
 	opts := standing.Options{
 		Mode:     mode,
 		Only:     only,
@@ -1280,6 +1287,8 @@ func runStandingConfigMode(cfg *config.Config, herdrAvailable bool, mode standin
 			if err := validateDecisionBeforeSideEffect(decision, lane.Name); err != nil {
 				return standing.Route{}, err
 			}
+			lastAdmit.lane = lane
+			lastAdmit.decision = decision
 			return standing.Route{
 				Provider: decision.Provider,
 				Model:    decision.Model,
@@ -1290,7 +1299,16 @@ func runStandingConfigMode(cfg *config.Config, herdrAvailable bool, mode standin
 		},
 		RepositoryIdentity: repositoryIdentityForLaunch,
 		CreateTab: func(workspace, label, cwd string) (standing.Tab, error) {
-			tab, err := herdr.TabCreateForTask(workspace, label, cwd, true)
+			if lastAdmit.decision == nil || lastAdmit.lane == nil {
+				return standing.Tab{}, errors.New("standing tab create requires prior AdmitRoute decision")
+			}
+			req := launch.Request{
+				Decision: lastAdmit.decision,
+				TaskRef:  lastAdmit.lane.Name,
+				Scope:    router.ScopeLane,
+				Lane:     lastAdmit.lane.Name,
+			}
+			_, tab, err := openWriteCapableTab(lastAdmit.decision, req, lastAdmit.lane, workspace, label, cwd)
 			if err != nil {
 				return standing.Tab{}, err
 			}
@@ -1318,7 +1336,6 @@ func runStandingConfigMode(cfg *config.Config, herdrAvailable bool, mode standin
 			return nil
 		},
 	}
-
 	if mode == standing.ModeShutdown && shutdownDry {
 		// Plan-only shutdown: do not close tabs.
 		opts.CloseTab = nil
@@ -1408,13 +1425,14 @@ func runUp() {
 		os.Exit(1)
 	}
 	var tab *herdr.TabInfo
-	decision, err := launchAdmissionWithLifecycle(liveLaunchLifecycle{}, cfg, lane.Role, true, routedLaneDecision(context.Background(), nil), func(_ *router.LaunchDecision) error {
+	decision, err := launchAdmissionWithLifecycle(liveLaunchLifecycle{}, cfg, lane.Role, true, routedLaneDecision(context.Background(), nil), func(admitted *router.LaunchDecision) error {
 		var tabErr error
 		cwd := "."
 		if lane.Worktree != "" {
 			cwd = filepath.Join(".", lane.Worktree)
 		}
-		tab, tabErr = herdr.TabCreateForTask(herdr.ResolveWorkspace("."), fmt.Sprintf("forge-%s", lane.Name), cwd, true)
+		req := launch.Request{Decision: admitted, TaskRef: lane.Name, Scope: router.ScopeLane, Repository: repository, Lane: lane.Name}
+		_, tab, tabErr = openWriteCapableTab(admitted, req, lane, herdr.ResolveWorkspace("."), fmt.Sprintf("forge-%s", lane.Name), cwd)
 		return tabErr
 	})
 	if err != nil {
@@ -3199,9 +3217,10 @@ func runForgeE() error {
 					if lane.Worktree != "" {
 						cwd = filepath.Join(".", lane.Worktree)
 					}
-					tab, tabErr := herdr.TabCreateForTask(herdr.ResolveWorkspace("."), tabLabel, cwd, true)
+					req := taskLaunchRequest(decision, task.Ref, repositoryIdentityForLaunch(cfg), lane.Name)
+					_, tab, tabErr := openWriteCapableTab(decision, req, lane, herdr.ResolveWorkspace("."), tabLabel, cwd)
 					if tabErr == nil {
-						if err := herdr.StartPreparedAgent(tab.ID, tabLabel, decision.Harness, tab.Pane.ID, taskLaunchRequest(decision, task.Ref, repositoryIdentityForLaunch(cfg), lane.Name)); err != nil {
+						if err := herdr.StartPreparedAgent(tab.ID, tabLabel, decision.Harness, tab.Pane.ID, req); err != nil {
 							return fmt.Errorf("launch failed: %w", err)
 						}
 					} else {
@@ -3572,6 +3591,51 @@ func validateDecisionBeforeSideEffect(decision *router.LaunchDecision, taskRef s
 		return fmt.Errorf("missing routed launch decision")
 	}
 	return launch.Validate(launch.Request{Decision: decision, TaskRef: taskRef, LeaseGeneration: decision.LeaseGeneration, Scope: decision.Scope}, nil)
+}
+
+// ensureArtifactToolProbe returns a current tool-probe PASS for decision's
+// surface, using the durable cache then a live artifact probe (FAC-139).
+func ensureArtifactToolProbe(ctx context.Context, decision *router.LaunchDecision) (*toolprobe.Receipt, error) {
+	if decision == nil {
+		return nil, fmt.Errorf("tool-probe requires LaunchDecision")
+	}
+	id, err := toolprobe.IdentityFromDecision(decision)
+	if err != nil {
+		return nil, err
+	}
+	cache := toolprobe.NewFileCache(toolprobe.DefaultCachePath)
+	r, err := toolprobe.Ensure(ctx, id, cache, &toolprobe.ExecRunner{}, time.Now().UTC())
+	if err != nil {
+		return nil, err
+	}
+	if !r.Passes(time.Now().UTC()) {
+		return &r, fmt.Errorf("tool-probe status %s blocks write-capable launch: %s", r.Status, r.Reason)
+	}
+	return &r, nil
+}
+
+// openWriteCapableTab is the single cmd/herd path to Herdr TabCreate for
+// write-capable worker/reviewer flows (FAC-139). It admits LaunchDecision +
+// artifact tool-probe PASS before any tab exists.
+func openWriteCapableTab(decision *router.LaunchDecision, req launch.Request, lane *config.LaneDef, workspace, label, cwd string, env ...string) (*launch.Plan, *herdr.TabInfo, error) {
+	probe, err := ensureArtifactToolProbe(context.Background(), decision)
+	if err != nil {
+		return nil, nil, err
+	}
+	if req.Decision == nil {
+		req.Decision = decision
+	}
+	return herdr.OpenWriteCapableTab(launch.BoundarySpec{
+		Decision:  decision,
+		Request:   req,
+		Probe:     probe,
+		Lane:      lane,
+		Workspace: workspace,
+		Label:     label,
+		Cwd:       cwd,
+		Env:       env,
+		NoFocus:   true,
+	})
 }
 
 func rebindDecisionForTask(decision *router.LaunchDecision, taskRef string, leaseGeneration int64) (*router.LaunchDecision, error) {
