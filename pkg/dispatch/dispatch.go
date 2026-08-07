@@ -24,6 +24,7 @@ import (
 	"github.com/Kampe/Herdforge/pkg/router"
 	"github.com/Kampe/Herdforge/pkg/scopefence"
 	"github.com/Kampe/Herdforge/pkg/toolchild"
+	"github.com/Kampe/Herdforge/pkg/toolprobe"
 	"github.com/Kampe/Herdforge/pkg/worktree"
 )
 
@@ -116,6 +117,53 @@ func (LiveHerdr) RequireWorkspace(repoRoot string) (string, error) {
 func (LiveHerdr) TabCreateForTask(workspaceID, label, cwd string, noFocus bool, env ...string) (*herdr.TabInfo, error) {
 	return herdr.TabCreateForTask(workspaceID, label, cwd, noFocus, env...)
 }
+
+// dispatchTabOpener routes boundary Open through the injectable HerdrLauncher
+// so crash-point tests still observe TabCreateForTask.
+type dispatchTabOpener struct{ h HerdrLauncher }
+
+func (o dispatchTabOpener) OpenTab(workspace, label, cwd string, noFocus bool, env ...string) (string, string, error) {
+	tab, err := o.h.TabCreateForTask(workspace, label, cwd, noFocus, env...)
+	if err != nil {
+		return "", "", err
+	}
+	if tab == nil {
+		return "", "", fmt.Errorf("herdr tab create returned nil")
+	}
+	return tab.ID, tab.Pane.ID, nil
+}
+
+// resolveToolProbe returns the artifact tool-probe receipt required by the
+// launch boundary. Production requires an explicit or live PASS; non-production
+// synthesizes a PASS bound to the decision so hermetic unit tests stay offline.
+func (d *Dispatcher) resolveToolProbe(opts DispatchOptions, decision *router.LaunchDecision) (*toolprobe.Receipt, error) {
+	if opts.Probe != nil {
+		return opts.Probe, nil
+	}
+	if decision == nil {
+		return nil, fmt.Errorf("tool-probe requires LaunchDecision")
+	}
+	id, err := toolprobe.IdentityFromDecision(decision)
+	if err != nil {
+		return nil, err
+	}
+	if d != nil && d.Production {
+		cache := toolprobe.NewFileCache(toolprobe.DefaultCachePath)
+		r, err := toolprobe.Ensure(context.Background(), id, cache, &toolprobe.ExecRunner{}, time.Now().UTC())
+		if err != nil {
+			return nil, err
+		}
+		if !r.Passes(time.Now().UTC()) {
+			return &r, fmt.Errorf("tool-probe status %s blocks launch: %s", r.Status, r.Reason)
+		}
+		return &r, nil
+	}
+	r, err := toolprobe.NewReceipt(id, toolprobe.StatusPASS, "test-synthetic", "sha256:test", time.Now().UTC(), toolprobe.DefaultTTL)
+	if err != nil {
+		return nil, err
+	}
+	return &r, nil
+}
 func (LiveHerdr) AgentStart(req launch.Request, name, kind, paneID string) error {
 	return herdr.AgentStartWithDecision(name, kind, paneID, req)
 }
@@ -151,8 +199,13 @@ func (LiveHerdr) ReadControlTarget(target control.WakeTarget) (control.WakeTarge
 type DispatchOptions struct {
 	TicketRef string
 	Decision  *router.LaunchDecision
-	NoLaunch  bool
-	LaneName  string
+	// Probe is a current artifact-backed tool-probe PASS for Decision's surface
+	// (FAC-139). Production write-capable launches fail closed when absent or
+	// stale. Non-production tests may omit it; launch synthesizes a PASS bound
+	// to Decision only in that mode.
+	Probe    *toolprobe.Receipt
+	NoLaunch bool
+	LaneName string
 	// PromptVerifyTimeout bounds DeliverAndProve polling (default 60s).
 	// Production launches always require consumption proof — there is no
 	// SkipPromptVerify bypass (FAC-121 R3 repair).
@@ -1161,13 +1214,34 @@ func (d *Dispatcher) launch(
 			}
 		}
 	}
-	tab, err := h.TabCreateForTask(ws, tabLabel, wtInfo.Path, true, tabEnv...)
+	// FAC-139: write-capable Tab creation goes only through the launch boundary
+	// (LaunchDecision + current artifact tool-probe PASS). Direct TabCreate is
+	// forbidden on this path.
+	probe, perr := d.resolveToolProbe(opts, request.Decision)
+	if perr != nil {
+		return &launchFailure{Reason: "tool_probe_rejected", Err: perr}
+	}
+	plan, tabID, paneID, err := launch.Open(dispatchTabOpener{h: h}, launch.BoundarySpec{
+		Decision:  request.Decision,
+		Request:   request,
+		Probe:     probe,
+		Lane:      lane,
+		Workspace: ws,
+		Label:     tabLabel,
+		Cwd:       wtInfo.Path,
+		Env:       tabEnv,
+		NoFocus:   true,
+	})
 	if err != nil {
 		return &launchFailure{
 			Reason: "tab_create_failed",
-			Err:    fmt.Errorf("worktree ready but failed to launch agent: %w", err),
+			Err:    fmt.Errorf("worktree ready but launch boundary rejected tab: %w", err),
 		}
 	}
+	if plan != nil && plan.Model != "" {
+		result.Model = plan.Model
+	}
+	tab := &herdr.TabInfo{ID: tabID, Label: tabLabel, Cwd: wtInfo.Path, Pane: herdr.PaneInfo{ID: paneID, TabID: tabID}}
 	result.TabID = tab.ID
 	result.AgentName = tabLabel
 	// Pointer so SessionGeneration reserved here is visible to bindConfinement.

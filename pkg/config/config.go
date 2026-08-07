@@ -190,29 +190,20 @@ type LaneDef struct {
 	Standing bool `yaml:"standing,omitempty"`
 	// Authority is this lane's repository write authority (read|write).
 	// Optional for backward compatibility; validated when present.
-	//
-	// DECLARATIVE ONLY (FAC-127): nothing in this repo yet reads Authority
-	// to gate a live launch. FAC-139 ("routed launch enforcement") owns the
-	// executable launch-boundary API that must consume it.
+	// Enforced at the FAC-139 launch boundary: authority=read cannot open a
+	// write-capable tab (launch.Admit / launch.Open).
 	Authority Authority `yaml:"authority,omitempty"`
 	// Capabilities are the tool/network requirements this lane's launch
 	// surface must satisfy (probe-gated); values must come from the known
-	// Capability vocabulary.
-	//
-	// DECLARATIVE ONLY (FAC-127): Validate() checks the vocabulary is known,
-	// but no launch path probes a surface against these values yet. FAC-139
-	// owns wiring this into the artifact-backed capability probe.
+	// Capability vocabulary. Write capabilities (git-write/fs-write/
+	// shell-exec) require a current artifact tool-probe PASS at the FAC-139
+	// boundary before Tab create.
 	Capabilities []Capability `yaml:"capabilities,omitempty"`
 	// IncompatibleWith lists role labels this lane's role must never be
 	// launched as/alongside for the same task (e.g. an author role listing
 	// the reviewer role). Each value must match a role declared by some
-	// lane in this same roster.
-	//
-	// DECLARATIVE ONLY (FAC-127): Validate() checks referential integrity
-	// against this roster (dead-role references are rejected, and standing
-	// roles get a single-owner check), but no launch path consults this
-	// field to block a live spawn. FAC-139 owns enforcing it at launch —
-	// author/reviewer family separation and single integration ownership.
+	// lane in this same roster. FAC-139 refuses a lane that lists its own
+	// role here; roster presence is checked when a role list is supplied.
 	IncompatibleWith []string `yaml:"incompatible_with,omitempty"`
 }
 
