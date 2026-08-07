@@ -45,6 +45,29 @@ func requireFleetAdmission(ctx context.Context) error {
 	return nil
 }
 
+// enterWinddown makes "no new work" durable, fencing the current generation.
+// It is idempotent by design: an already-enabled posture is a resume, not a
+// conflict, so a stop interrupted partway through restarts into the same
+// state machine instead of failing or regressing the fence. Corrupt or
+// unreadable state fails closed — the generation to fence is unknown.
+func enterWinddown(ctx context.Context, actor, reason string) (winddown.State, error) {
+	a, err := newWinddownAuthority()
+	if err != nil {
+		return winddown.State{}, err
+	}
+	current, readErr := a.Read(ctx)
+	switch {
+	case readErr == nil && current.Enabled:
+		return current, nil
+	case readErr == nil:
+		return a.Update(ctx, true, actor, reason, current.Generation+1, nil)
+	case errors.Is(readErr, winddown.ErrStateMissing):
+		return a.Update(ctx, true, actor, reason, 1, nil)
+	default:
+		return winddown.State{}, readErr
+	}
+}
+
 func winddownActor() string {
 	if actor := strings.TrimSpace(os.Getenv("HERD_ACTOR")); actor != "" {
 		return actor
