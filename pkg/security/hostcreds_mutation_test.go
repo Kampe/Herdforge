@@ -166,12 +166,40 @@ func TestMutation_LiveNeedsFAC169Boundary(t *testing.T) {
 	}
 }
 
+// The kind gate must be what rejects these, not the boundary gate below it.
+// Asserting only err != nil could not fail: RequireOSBoundary defaults to
+// fac169_required, so deleting both kind gates left this green. Pin the code,
+// and install a passing boundary so the kind gate is the only thing left to
+// reject — otherwise this silently reverts to testing the boundary again.
 func TestMutation_LiveNeedsRealKind(t *testing.T) {
+	restore := SetRequireOSBoundaryForTest(func() (OSBoundary, error) {
+		return fakeBoundary{}, nil
+	})
+	defer restore()
+
 	for _, k := range []string{"fake", "test", "opencode"} {
 		_, _, _, err := StartAuthorLive(LiveConfig{Kind: k, Prompt: "x"})
 		if err == nil {
-			t.Fatal("MUTATION: kind allowed", k)
+			t.Fatalf("MUTATION: kind %q allowed", k)
 		}
+		be, ok := err.(*BlockedError)
+		if !ok {
+			t.Fatalf("kind %q: want *BlockedError, got %T (%v)", k, err, err)
+		}
+		if be.Reason != BlockUnbrokerableKind {
+			t.Fatalf("kind %q: reason %q want %q — rejected by the wrong gate",
+				k, be.Reason, BlockUnbrokerableKind)
+		}
+		if be.Code != "live_kind" && be.Code != "unsupported_kind" {
+			t.Fatalf("kind %q: code %q — not the kind gate", k, be.Code)
+		}
+	}
+
+	// An unmapped kind must also die on the kind gate, not later.
+	_, _, _, err := StartAuthorLive(LiveConfig{Kind: "no-such-kind", Prompt: "x"})
+	be, ok := err.(*BlockedError)
+	if !ok || be.Code != "unsupported_kind" {
+		t.Fatalf("unmapped kind: want unsupported_kind, got %v", err)
 	}
 }
 
@@ -185,6 +213,18 @@ func TestMutation_InProcessAuthorityNotLive(t *testing.T) {
 	_, _, _, err := StartAuthorLive(LiveConfig{Kind: "grok", SessionID: "m-auth", Authority: v})
 	if err == nil {
 		t.Fatal("MUTATION: in-process test vault live-admitted")
+	}
+	// Pin which gate rejected. Bare err != nil also passed with both
+	// in-process-authority checks deleted, because the fac169-ipc class check
+	// below catches the test vault anyway — that made this test unable to
+	// detect the mutation it is named for.
+	be, ok := err.(*BlockedError)
+	if !ok {
+		t.Fatalf("want *BlockedError, got %T (%v)", err, err)
+	}
+	if be.Code != "test_vault_not_live" {
+		t.Fatalf("code=%q want test_vault_not_live — the in-process-authority "+
+			"check is not what rejected the test vault", be.Code)
 	}
 }
 

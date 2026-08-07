@@ -248,7 +248,20 @@ func StartAuthorLive(cfg LiveConfig) (*HostCredsSession, *exec.Cmd, *LiveProof, 
 			_ = sess.Close()
 			return nil, nil, nil, &BlockedError{Reason: BlockUnbrokerableKind, Code: "harness_binary_missing", Kind: kind}
 		}
-		inv := hcfg.BuildInvocation(prompt)
+		// BuildInvocationE, not BuildInvocation: the latter returns nil on a
+		// compile error by design ("callers cannot accidentally launch an
+		// uncompiled surface"), and inv[0] would turn that fail-closed nil into
+		// a panic instead of a typed BlockedError.
+		inv, ierr := hcfg.BuildInvocationE(prompt)
+		if ierr != nil || len(inv) == 0 {
+			cancel()
+			_ = claimFD.Close()
+			_ = os.RemoveAll(homeDir)
+			_ = sess.Close()
+			return nil, nil, nil, &BlockedError{
+				Reason: BlockUnbrokerableKind, Code: "harness_invocation_uncompilable", Kind: kind,
+			}
+		}
 		inv[0] = bin
 		cmd = exec.CommandContext(ctx, inv[0], inv[1:]...)
 		if cfg.WorkDir != "" {

@@ -204,8 +204,19 @@ func TestLive_RefusesWithoutFAC169(t *testing.T) {
 }
 
 func TestLive_RefusesFake(t *testing.T) {
+	// Boundary passes so the kind gate is the only thing that can reject;
+	// a bare err != nil check was satisfied by the fac169_required default.
+	restore := SetRequireOSBoundaryForTest(func() (OSBoundary, error) {
+		return fakeBoundary{}, nil
+	})
+	defer restore()
+
 	_, _, _, err := StartAuthorLive(LiveConfig{Kind: "fake", Prompt: "x"})
-	if err == nil {
-		t.Fatal()
+	be, ok := err.(*BlockedError)
+	if !ok {
+		t.Fatalf("want *BlockedError, got %T (%v)", err, err)
+	}
+	if be.Reason != BlockUnbrokerableKind || be.Code != "live_kind" {
+		t.Fatalf("reason=%q code=%q — fake must die on the kind gate", be.Reason, be.Code)
 	}
 }
