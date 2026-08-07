@@ -5,18 +5,46 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 )
 
+// The CLI tests exec the built binary ~70 times. Linking it once keeps the
+// package inside the suite's timeout; every caller only ever runs it, so a
+// shared artifact is equivalent to a per-test one.
+var (
+	herdBinaryOnce sync.Once
+	herdBinary     string
+	herdBinaryErr  error
+	herdBinaryOut  []byte
+)
+
+func TestMain(m *testing.M) {
+	code := m.Run()
+	if dir := filepath.Dir(herdBinary); herdBinary != "" {
+		_ = os.RemoveAll(dir)
+	}
+	os.Exit(code)
+}
+
 func buildHerd(t *testing.T) string {
 	t.Helper()
-	binary := filepath.Join(t.TempDir(), "herd")
-	cmd := exec.Command("go", "build", "-buildvcs=false", "-o", binary, ".")
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		t.Fatalf("build failed: %v, output: %s", err, out)
+	herdBinaryOnce.Do(func() {
+		dir, err := os.MkdirTemp("", "herd-cli-bin")
+		if err != nil {
+			herdBinaryErr = err
+			return
+		}
+		binary := filepath.Join(dir, "herd")
+		herdBinaryOut, herdBinaryErr = exec.Command("go", "build", "-buildvcs=false", "-o", binary, ".").CombinedOutput()
+		if herdBinaryErr == nil {
+			herdBinary = binary
+		}
+	})
+	if herdBinaryErr != nil {
+		t.Fatalf("build failed: %v, output: %s", herdBinaryErr, herdBinaryOut)
 	}
-	return binary
+	return herdBinary
 }
 
 func TestVersionFlag(t *testing.T) {
