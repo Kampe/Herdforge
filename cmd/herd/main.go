@@ -214,6 +214,9 @@ func main() {
 	case "cleanup":
 		runCleanup()
 
+	case "labels":
+		runLabels()
+
 	case "forge":
 		if err := runForgeE(); err != nil {
 			fmt.Fprintf(os.Stderr, "forge failed: %v\n", err)
@@ -341,6 +344,7 @@ func printUsage() {
 	fmt.Println("  sh         Interactive shell: run herd subcommands in a loop")
 	fmt.Println("  send       Submit text to a herdr agent pane and verify consumption")
 	fmt.Println("  cleanup    Close finished one-off agent tabs (standing fleet exempt)")
+	fmt.Println("  labels     Reconcile drifted Herdforge tab labels in place (FAC-199)")
 	fmt.Println("  forge      Full cycle: pulse worker + review + approve")
 	fmt.Println("  standing   Launch all configured agent lanes in herdr tabs")
 	fmt.Println("  daemon     Start the long-running orchestration daemon (infinite pulse loop)")
@@ -1921,6 +1925,50 @@ func runCleanup() {
 		}
 	}
 	if len(errs) > 0 {
+		os.Exit(1)
+	}
+}
+
+// runLabels ports the FAC-199 acceptance criterion "live readback shows no
+// raw task-fac-* label in workspace <ws>": a bounded, one-shot sweep that
+// repairs every drifted tab label in the resolved workspace in place. It
+// never closes a tab and never crosses a workspace boundary — see
+// herdr.ReconcileWorkspaceLabels.
+func runLabels() {
+	fs := flag.NewFlagSet("labels", flag.ExitOnError)
+	asJSON := fs.Bool("json", false, "Output JSON")
+	fs.Parse(os.Args[2:])
+
+	if !herdr.IsAvailable() {
+		fmt.Fprintf(os.Stderr, "herd labels: herdr CLI not found\n")
+		os.Exit(1)
+	}
+	workspace, err := herdr.RequireWorkspace(".")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "herd labels: %v\n", err)
+		os.Exit(1)
+	}
+	renamed, err := herdr.ReconcileWorkspaceLabels(workspace)
+	if *asJSON {
+		errMsg := ""
+		if err != nil {
+			errMsg = err.Error()
+		}
+		json.NewEncoder(os.Stdout).Encode(map[string]interface{}{
+			"workspace": workspace, "renamed": renamed, "error": errMsg,
+		})
+	} else {
+		if len(renamed) == 0 {
+			fmt.Printf("herd labels: no drifted labels in workspace %s\n", workspace)
+		}
+		for _, id := range renamed {
+			fmt.Printf("herd labels: reconciled tab %s\n", id)
+		}
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "herd labels: error — %v\n", err)
+		}
+	}
+	if err != nil {
 		os.Exit(1)
 	}
 }

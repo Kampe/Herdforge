@@ -20,6 +20,11 @@ import (
 const (
 	herdrCLI       = "herdr"
 	herdforgeLabel = "Herdforge · "
+	// herdforgeLabelPipe is a second canonical prefix already live on the
+	// fleet from an older labeling path (FAC-199 acceptance explicitly
+	// accepts either form). Recognized as already-correct; never written by
+	// this package — new/repaired labels always use herdforgeLabel.
+	herdforgeLabelPipe = "Herdforge | "
 )
 
 // runHerdr is overridable for crash-point / unit tests (FAC-121).
@@ -260,7 +265,16 @@ func verifyHerdrTerminal(tabID, paneID string) error {
 	return nil
 }
 
-func tabList() ([]string, error) {
+// tabListEntry is one row of `herdr tab list`, id/label plus the workspace
+// it actually lives in — required so label repair can refuse to cross a
+// workspace boundary (FAC-199).
+type tabListEntry struct {
+	ID        string
+	Label     string
+	Workspace string
+}
+
+func tabListDetailed() ([]tabListEntry, error) {
 	output, err := runHerdr("tab", "list")
 	if err != nil {
 		return nil, fmt.Errorf("herdr tab list: %s: %w", output, err)
@@ -268,8 +282,10 @@ func tabList() ([]string, error) {
 	var envelope struct {
 		Result struct {
 			Tabs []struct {
-				ID    string `json:"id"`
-				TabID string `json:"tab_id"`
+				ID        string `json:"id"`
+				TabID     string `json:"tab_id"`
+				Label     string `json:"label"`
+				Workspace string `json:"workspace_id"`
 			} `json:"tabs"`
 		} `json:"result"`
 	}
@@ -279,17 +295,189 @@ func tabList() ([]string, error) {
 	if envelope.Result.Tabs == nil {
 		return nil, fmt.Errorf("herdr tab list returned no tabs inventory")
 	}
-	ids := make([]string, 0, len(envelope.Result.Tabs))
+	entries := make([]tabListEntry, 0, len(envelope.Result.Tabs))
 	for _, t := range envelope.Result.Tabs {
 		id := t.TabID
 		if id == "" {
 			id = t.ID
 		}
 		if id != "" {
-			ids = append(ids, id)
+			entries = append(entries, tabListEntry{ID: id, Label: t.Label, Workspace: t.Workspace})
 		}
 	}
+	return entries, nil
+}
+
+func tabList() ([]string, error) {
+	entries, err := tabListDetailed()
+	if err != nil {
+		return nil, err
+	}
+	ids := make([]string, 0, len(entries))
+	for _, e := range entries {
+		ids = append(ids, e.ID)
+	}
 	return ids, nil
+}
+
+// tabLookup returns the live tab list row for tabID.
+func tabLookup(tabID string) (tabListEntry, error) {
+	entries, err := tabListDetailed()
+	if err != nil {
+		return tabListEntry{}, err
+	}
+	for _, e := range entries {
+		if e.ID == tabID {
+			return e, nil
+		}
+	}
+	return tabListEntry{}, fmt.Errorf("herdr tab list: tab %s not found", tabID)
+}
+
+// TabLabel returns the live label of tabID as reported by `herdr tab list`.
+func TabLabel(tabID string) (string, error) {
+	e, err := tabLookup(tabID)
+	if err != nil {
+		return "", err
+	}
+	return e.Label, nil
+}
+
+// TabRename renames tabID in place. Unlike TabClose+TabCreate, this touches
+// only the tab's label — pane, session, process, and worktree identity are
+// untouched, which is what live label reconciliation requires (FAC-199).
+// The Herdforge prefix is enforced here too (not just at TabCreate) so this
+// primitive can never be used to write a raw label back onto a live tab.
+func TabRename(tabID, label string) error {
+	if strings.TrimSpace(tabID) == "" {
+		return fmt.Errorf("herdr tab rename: tab id is required")
+	}
+	label = EnsureHerdforgeLabel(label)
+	out, err := runHerdr("tab", "rename", tabID, label)
+	if err != nil {
+		return fmt.Errorf("herdr tab rename %s: %s: %w", tabID, out, err)
+	}
+	return nil
+}
+
+// ReconcileHerdforgeLabel renames tabID in place when its live label does
+// not carry the Herdforge prefix, and leaves it untouched otherwise. It
+// never closes or restarts the tab (FAC-199: resumed/recovered tabs must be
+// relabeled without disturbing pane/session/process/worktree identity).
+//
+// wantWorkspace fails the repair closed when the tab's live workspace_id
+// does not match: label repair must never cross a workspace boundary, so a
+// stale/incorrect tab id (or a tab that lives in some other, non-Herdforge
+// workspace) is refused rather than silently relabeled.
+//
+// After issuing the rename, the label is read back from a fresh `tab list`
+// call and compared against what was requested — a zero exit status from
+// `herdr tab rename` is not accepted as proof by itself.
+//
+// This is the tab-only primitive. Callers that hold a live AgentEntry
+// (resume and the fleet sweep both do) should use ReconcileAgentLabel
+// instead, which additionally proves pane/session/cwd identity survived the
+// rename untouched.
+func ReconcileHerdforgeLabel(tabID, wantWorkspace string) (label string, renamed bool, err error) {
+	if strings.TrimSpace(wantWorkspace) == "" {
+		return "", false, fmt.Errorf("herdr label reconcile: workspace is required (refusing unscoped relabel)")
+	}
+	before, err := tabLookup(tabID)
+	if err != nil {
+		return "", false, err
+	}
+	if before.Workspace != wantWorkspace {
+		return "", false, fmt.Errorf("herdr label reconcile: tab %s is in workspace %q, not %q; refusing cross-workspace relabel", tabID, before.Workspace, wantWorkspace)
+	}
+	want := EnsureHerdforgeLabel(before.Label)
+	if want == before.Label {
+		return before.Label, false, nil
+	}
+	if err := TabRename(tabID, want); err != nil {
+		return "", false, err
+	}
+	after, err := tabLookup(tabID)
+	if err != nil {
+		return "", false, fmt.Errorf("herdr label reconcile: post-rename readback failed: %w", err)
+	}
+	if after.Label != want {
+		return "", false, fmt.Errorf("herdr label reconcile: rename reported success but live label is %q, want %q", after.Label, want)
+	}
+	if after.Workspace != wantWorkspace {
+		return "", false, fmt.Errorf("herdr label reconcile: tab %s workspace changed during rename (%q -> %q)", tabID, before.Workspace, after.Workspace)
+	}
+	return want, true, nil
+}
+
+// ReconcileAgentLabel is the identity-verified reconciliation entrypoint
+// (FAC-199): given a live AgentEntry snapshot (the caller's already-current
+// view from AgentList), it repairs the label in place via
+// ReconcileHerdforgeLabel and then — only when a rename actually happened —
+// re-reads AgentList and proves pane, session, workspace, and cwd are
+// exactly what they were before the rename. This is the full identity
+// surface herdr's live inventory actually exposes; task/lease/generation
+// identity is verified earlier by the launch-lifecycle checks that already
+// run before resume ever reaches this call (recoverStandingLifecycle,
+// launch.HasStarted) — herdr's own `agent list`/`tab list` carry no
+// task/generation fields to re-check here.
+func ReconcileAgentLabel(before AgentEntry) (label string, renamed bool, err error) {
+	if strings.TrimSpace(before.TabID) == "" {
+		return "", false, fmt.Errorf("herdr label reconcile: agent tab id is required")
+	}
+	label, renamed, err = ReconcileHerdforgeLabel(before.TabID, before.Workspace)
+	if err != nil || !renamed {
+		return label, renamed, err
+	}
+	agents, aerr := AgentList()
+	if aerr != nil {
+		return "", false, fmt.Errorf("herdr label reconcile: post-rename identity readback failed: %w", aerr)
+	}
+	for _, a := range agents {
+		if a.TabID != before.TabID {
+			continue
+		}
+		if a.PaneID != before.PaneID || a.Session.Value != before.Session.Value || a.Cwd != before.Cwd || a.Workspace != before.Workspace {
+			return "", false, fmt.Errorf("herdr label reconcile: tab %s identity drifted during rename (pane/session/cwd/workspace changed)", before.TabID)
+		}
+		return label, renamed, nil
+	}
+	return "", false, fmt.Errorf("herdr label reconcile: tab %s vanished from agent inventory during rename", before.TabID)
+}
+
+// ReconcileWorkspaceLabels sweeps every live, Herdforge-owned agent's tab in
+// workspace and repairs any drifted label in place (FAC-199's bounded
+// reconciliation path). Ownership is determined by AgentEntry.Name — same
+// doctrine as SelectCleanupCandidates ("unnamed panes are the operator's,
+// never ours"). A tab is only ever touched when it belongs to a *named*
+// live agent; a raw, non-empty tab label alone (an operator's numbered
+// terminal, "Terminal", etc.) is never sufficient, since those commonly
+// have non-empty labels too. Bounded: one pass over the live agent
+// inventory, no retries, no process/pane mutation. Returns the tab ids that
+// were actually renamed.
+func ReconcileWorkspaceLabels(workspace string) ([]string, error) {
+	if strings.TrimSpace(workspace) == "" {
+		return nil, fmt.Errorf("herdr label sweep: workspace is required")
+	}
+	agents, err := AgentList()
+	if err != nil {
+		return nil, err
+	}
+	var renamed []string
+	var errs []error
+	for _, a := range agents {
+		if a.Name == "" || a.Workspace != workspace || a.TabID == "" {
+			continue
+		}
+		if _, changed, err := ReconcileAgentLabel(a); err != nil {
+			errs = append(errs, fmt.Errorf("tab %s: %w", a.TabID, err))
+		} else if changed {
+			renamed = append(renamed, a.TabID)
+		}
+	}
+	if len(errs) > 0 {
+		return renamed, errors.Join(errs...)
+	}
+	return renamed, nil
 }
 
 func bindToolChildLifecycle(paneID, name string, req launch.Request) error {
@@ -874,6 +1062,7 @@ type AgentEntry struct {
 	PaneID    string `json:"pane_id,omitempty"`
 	TabID     string `json:"tab_id,omitempty"`
 	Workspace string `json:"workspace_id,omitempty"`
+	Cwd       string `json:"cwd,omitempty"`
 	Session   struct {
 		Value string `json:"value,omitempty"`
 	} `json:"agent_session,omitempty"`
@@ -1062,16 +1251,21 @@ func ResolveAgentTabWithDecision(name string, req launch.Request) (string, error
 		if err := reconcileRecoveredToolChild(a.TabID, "recovery", generation); err != nil {
 			return "", fmt.Errorf("resume tool-child recovery: %w", err)
 		}
+		if _, _, err := ReconcileAgentLabel(a); err != nil {
+			return "", fmt.Errorf("resume label reconciliation: %w", err)
+		}
 		return name, nil
 	}
 	return "", fmt.Errorf("no standing agent named '%s' found: %w", name, ErrAgentNotFound)
 }
 
 // EnsureHerdforgeLabel prefixes the label with "Herdforge · " if it does not
-// already start with that prefix. HasPrefix (not Contains) is required so a
-// mid-string match such as "review of Herdforge · thing" still gets prefixed.
+// already start with that prefix, or with the older "Herdforge | " prefix
+// (FAC-199 accepts either as already-canonical and never rewrites one form
+// to the other). HasPrefix (not Contains) is required so a mid-string match
+// such as "review of Herdforge · thing" still gets prefixed.
 func EnsureHerdforgeLabel(label string) string {
-	if strings.HasPrefix(label, herdforgeLabel) {
+	if strings.HasPrefix(label, herdforgeLabel) || strings.HasPrefix(label, herdforgeLabelPipe) {
 		return label
 	}
 	return herdforgeLabel + label
