@@ -214,7 +214,9 @@ func (d *Delivery) Deliver(ctx context.Context, o Order) (Evidence, error) {
 	} else if ok {
 		current, readErr := d.Waker.ReadTarget(ctx)
 		target := d.Waker.WakeTarget()
-		if readErr != nil || current != target || !wake.Consumed || !wake.Verified || wake.MessageID != item.MessageID || wake.SequenceToken == "" || wake.Target != current.Target || wake.Workspace != current.Workspace || wake.TabID != current.TabID || wake.PaneID != current.PaneID || wake.AgentName != current.AgentName || wake.Provider != current.Provider || wake.SessionID != current.SessionID || wake.LeaseGeneration != current.LeaseGeneration || wake.LeaseGeneration != o.LeaseGeneration {
+		// SessionCompatible: stored wake may have empty session while live has
+		// filled after boot; only a swap/disappearance of a bound session is drift.
+		if readErr != nil || !WakeTargetsCompatible(target, current) || !wake.Consumed || !wake.Verified || wake.MessageID != item.MessageID || wake.SequenceToken == "" || wake.Target != current.Target || wake.Workspace != current.Workspace || wake.TabID != current.TabID || wake.PaneID != current.PaneID || wake.AgentName != current.AgentName || wake.Provider != current.Provider || !SessionCompatible(wake.SessionID, current.SessionID) || wake.LeaseGeneration != current.LeaseGeneration || wake.LeaseGeneration != o.LeaseGeneration {
 			return e, ErrMissingReceipt
 		}
 		e.MessageID, e.Sequence, e.Wake, e.State = item.MessageID, item.Sequence, wake, outbox.StatusSent
@@ -274,7 +276,7 @@ func (d *Delivery) wake(ctx context.Context, o Order, e Evidence, _ string) (Evi
 	if err != nil {
 		return e, fmt.Errorf("control wake failed (order retained for retry): %w", err)
 	}
-	if r.MessageID != e.MessageID || !r.Consumed || !r.Verified || r.Target != target.Target || r.Workspace != target.Workspace || r.TabID != target.TabID || r.PaneID != target.PaneID || r.AgentName != target.AgentName || r.Provider != target.Provider || r.SessionID != target.SessionID || r.LeaseGeneration != target.LeaseGeneration || target.LeaseGeneration != o.LeaseGeneration {
+	if r.MessageID != e.MessageID || !r.Consumed || !r.Verified || r.Target != target.Target || r.Workspace != target.Workspace || r.TabID != target.TabID || r.PaneID != target.PaneID || r.AgentName != target.AgentName || r.Provider != target.Provider || !SessionCompatible(target.SessionID, r.SessionID) || r.LeaseGeneration != target.LeaseGeneration || target.LeaseGeneration != o.LeaseGeneration {
 		return e, ErrMissingReceipt
 	}
 	e.Wake = r

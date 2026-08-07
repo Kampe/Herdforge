@@ -410,15 +410,9 @@ func TestReconcileWorkspaceLabels_SweepsOnlyNamedAgentTabsInWorkspace(t *testing
 	old := runHerdr
 	defer func() { runHerdr = old }()
 	agents := []AgentEntry{
-		{Name: "forge-worker", TabID: "tab-raw", PaneID: "pane-raw", Workspace: "wK", Session: struct {
-			Value string `json:"value,omitempty"`
-		}{Value: "sess-raw"}},
-		{Name: "forge-reviewer", TabID: "tab-ok", PaneID: "pane-ok", Workspace: "wK", Session: struct {
-			Value string `json:"value,omitempty"`
-		}{Value: "sess-ok"}},
-		{Name: "forge-other", TabID: "tab-other-w", PaneID: "pane-other", Workspace: "w1", Session: struct {
-			Value string `json:"value,omitempty"`
-		}{Value: "sess-other"}},
+		{Name: "forge-worker", TabID: "tab-raw", PaneID: "pane-raw", Workspace: "wK", Session: AgentSession{Value: "sess-raw"}},
+		{Name: "forge-reviewer", TabID: "tab-ok", PaneID: "pane-ok", Workspace: "wK", Session: AgentSession{Value: "sess-ok"}},
+		{Name: "forge-other", TabID: "tab-other-w", PaneID: "pane-other", Workspace: "w1", Session: AgentSession{Value: "sess-other"}},
 	}
 	labels := map[string]string{
 		"tab-raw":     "task-fac-183-production-delivery-r1",

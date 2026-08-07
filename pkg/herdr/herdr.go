@@ -31,6 +31,17 @@ const (
 // runHerdr is overridable for crash-point / unit tests (FAC-121).
 var runHerdr = runHerdrReal
 
+// SetRunHerdrForTest replaces the CLI runner. Restore with the returned func.
+func SetRunHerdrForTest(f func(args ...string) (string, error)) func() {
+	old := runHerdr
+	if f == nil {
+		runHerdr = runHerdrReal
+	} else {
+		runHerdr = f
+	}
+	return func() { runHerdr = old }
+}
+
 var (
 	ownerBindTimeout      = 20 * time.Second
 	ownerBindPollInterval = 100 * time.Millisecond
@@ -1149,17 +1160,28 @@ func AgentList() ([]AgentEntry, error) {
 }
 
 // AgentEntry represents a single herdr-managed agent.
+// AgentSession is optional provenance. Grok never reports it; claude/opencode
+// fill it only after boot (after launch-time control bind).
+type AgentSession struct {
+	Source string `json:"source,omitempty"`
+	Agent  string `json:"agent,omitempty"`
+	Kind   string `json:"kind,omitempty"`
+	Value  string `json:"value,omitempty"`
+}
+
+// AgentEntry matches live herdr 0.7.x agent list rows. Real counters are
+// Revision and StateChangeSeq — there is no generation field.
 type AgentEntry struct {
-	Name      string `json:"name,omitempty"`
-	Kind      string `json:"agent,omitempty"`
-	Status    string `json:"agent_status,omitempty"`
-	PaneID    string `json:"pane_id,omitempty"`
-	TabID     string `json:"tab_id,omitempty"`
-	Workspace string `json:"workspace_id,omitempty"`
-	Cwd       string `json:"cwd,omitempty"`
-	Session   struct {
-		Value string `json:"value,omitempty"`
-	} `json:"agent_session,omitempty"`
+	Name           string       `json:"name,omitempty"`
+	Kind           string       `json:"agent,omitempty"`
+	Status         string       `json:"agent_status,omitempty"`
+	PaneID         string       `json:"pane_id,omitempty"`
+	TabID          string       `json:"tab_id,omitempty"`
+	Workspace      string       `json:"workspace_id,omitempty"`
+	Cwd            string       `json:"cwd,omitempty"`
+	Session        AgentSession `json:"agent_session,omitempty"`
+	Revision       uint64       `json:"revision,omitempty"`
+	StateChangeSeq uint64       `json:"state_change_seq,omitempty"`
 }
 
 type PaneProcess struct {
