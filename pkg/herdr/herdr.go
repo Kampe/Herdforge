@@ -823,6 +823,10 @@ type TabCreateOptions struct {
 	Cwd       string
 	NoFocus   bool
 	Env       []string // optional KEY=VALUE pairs
+	// HostedUID when >0 requests the herdr *daemon* host the tab shell as this
+	// kernel UID (FAC-172 BuilderUID). Requires structured capability negotiation.
+	// Running the herdr CLI under setuid is NOT used and is not isolation.
+	HostedUID int
 }
 
 // Tab creates a new tab in the specified workspace and returns the tab + root pane.
@@ -856,6 +860,18 @@ func TabCreate(opts TabCreateOptions) (*TabInfo, error) {
 		if e != "" {
 			args = append(args, "--env", e)
 		}
+	}
+	// FAC-172: request daemon-hosted uid only after structured capability
+	// negotiation. Never sudo the CLI; never scrape --help for flags.
+	if opts.HostedUID > 0 {
+		if err := RequireHerdrBuilderSpawnCapability(opts.HostedUID); err != nil {
+			return nil, err
+		}
+		fa, err := hostedUIDFlagArgs(opts.HostedUID)
+		if err != nil {
+			return nil, err
+		}
+		args = append(args, fa...)
 	}
 	output, err := runHerdr(args...)
 	if err != nil {
@@ -894,6 +910,11 @@ func TabCreate(opts TabCreateOptions) (*TabInfo, error) {
 // Resolves cwd to an absolute path at the caller and requires it to be an existing
 // directory before contacting Herdr, so relative paths cannot be re-resolved from
 // the Herdr server process cwd.
+//
+// FAC-172: when HERD_BUILDER_UID is configured, the herdr daemon must host the tab
+// shell as BuilderUID. Capability negotiation is structured only; post-create
+// process-info proves the shell tree. Proof failure terminates hosted PIDs
+// (procsignal) and closes the orphan tab.
 func TabCreateForTask(workspaceID, label, cwd string, noFocus bool) (*TabInfo, error) {
 	cwd = strings.TrimSpace(cwd)
 	if cwd == "" {
@@ -910,12 +931,33 @@ func TabCreateForTask(workspaceID, label, cwd string, noFocus bool) (*TabInfo, e
 	if !info.IsDir() {
 		return nil, fmt.Errorf("herdr tab create: cwd %q is not a directory", abs)
 	}
-	return TabCreate(TabCreateOptions{
+	opts := TabCreateOptions{
 		Workspace: workspaceID,
 		Label:     label,
 		Cwd:       abs,
 		NoFocus:   noFocus,
-	})
+	}
+	if HostedUIDIsolationRequired() {
+		bUID, err := BuilderUID()
+		if err != nil {
+			return nil, fmt.Errorf("herdr tab create: %w", err)
+		}
+		if err := RequireHerdrBuilderSpawnCapability(bUID); err != nil {
+			return nil, fmt.Errorf("herdr tab create: %w", err)
+		}
+		opts.HostedUID = bUID
+		opts.Env = append(opts.Env, hostedUIDLaunchEnv(bUID)...)
+		tab, err := TabCreate(opts)
+		if err != nil {
+			return nil, err
+		}
+		if err := AssertHostedPaneUID(tab.Pane.ID, bUID); err != nil {
+			return nil, FailHostedIsolationProof(tab.Pane.ID, tab.ID,
+				fmt.Errorf("herdr tab create: hosted uid proof failed: %w", err))
+		}
+		return tab, nil
+	}
+	return TabCreate(opts)
 }
 
 // AgentStart starts an agent in the specified pane. Extra agentArgs are
@@ -994,6 +1036,19 @@ func AgentStartWithDecision(name, kind, paneID string, req launch.Request) error
 	if err := validatePreparedPiStart(tabForPane(paneID), lc, name, paneID, req); err != nil {
 		return compensateValidation(err)
 	}
+	// FAC-172: when isolation is configured, negotiate capability and attach
+	// structured daemon uid flags before process start (never CLI setuid).
+	var builderUID int
+	if HostedUIDIsolationRequired() {
+		var err error
+		builderUID, err = BuilderUID()
+		if err != nil {
+			return compensateValidation(err)
+		}
+		if err := RequireHerdrBuilderSpawnCapability(builderUID); err != nil {
+			return compensateValidation(err)
+		}
+	}
 	if err := agentStartProcess(name, kind, paneID, req.Decision.HarnessArgv[1:]...); err != nil {
 		if rollbackErr := rollbackToolChild(tabForPane(paneID), paneID, lc, "failed-launch"); rollbackErr != nil {
 			return errors.Join(err, rollbackErr)
@@ -1015,6 +1070,29 @@ func AgentStartWithDecision(name, kind, paneID string, req launch.Request) error
 			}
 			_ = launch.RecordRejected(req, nil, err.Error())
 			return fmt.Errorf("tool-child inventory failed: %w", err)
+		}
+	}
+	// FAC-172 acceptance: prove shell/harness/descendants run as BuilderUID.
+	// Proof failure kills exact hosted PIDs (procsignal) and closes the tab.
+	if builderUID > 0 {
+		tabID := tabForPane(paneID)
+		if err := AssertHostedPaneUID(paneID, builderUID); err != nil {
+			proof := FailHostedIsolationProof(paneID, tabID,
+				fmt.Errorf("herdr agent start: hosted uid proof failed: %w", err))
+			if rollbackErr := rollbackToolChild(tabID, paneID, lc, "hosted-uid-proof-failed"); rollbackErr != nil {
+				return errors.Join(proof, rollbackErr)
+			}
+			_ = launch.RecordRejected(req, nil, proof.Error())
+			return proof
+		}
+		if err := AssertAgentHostedAsBuilder(name, builderUID); err != nil {
+			proof := FailHostedIsolationProof(paneID, tabID,
+				fmt.Errorf("herdr agent start: agent descendant uid proof failed: %w", err))
+			if rollbackErr := rollbackToolChild(tabID, paneID, lc, "hosted-uid-agent-proof-failed"); rollbackErr != nil {
+				return errors.Join(proof, rollbackErr)
+			}
+			_ = launch.RecordRejected(req, nil, proof.Error())
+			return proof
 		}
 	}
 	if err := launch.RecordStarted(req, nil); err != nil {
@@ -1090,6 +1168,18 @@ func agentStartProcess(name, kind, paneID string, agentArgs ...string) error {
 	time.Sleep(500 * time.Millisecond)
 
 	args := []string{"agent", "start", name, "--kind", kind, "--pane", paneID}
+	// FAC-172: daemon-hosted uid flags only from negotiated capability.
+	if HostedUIDIsolationRequired() {
+		bUID, err := BuilderUID()
+		if err != nil {
+			return fmt.Errorf("herdr agent start: %w", err)
+		}
+		fa, err := agentStartUIDFlagArgs(bUID)
+		if err != nil {
+			return fmt.Errorf("herdr agent start: %w", err)
+		}
+		args = append(args, fa...)
+	}
 	if len(agentArgs) > 0 {
 		args = append(args, "--")
 		args = append(args, agentArgs...)
