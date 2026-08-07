@@ -1587,7 +1587,7 @@ func TestLateWriterIntoGitRequiresExplicitReap(t *testing.T) {
 	if err := durableCleanupAfterReap(f.root, 100*time.Millisecond); err != nil {
 		t.Fatalf("post-fix: durable cleanup after production ReapOwnedCmd: %v", err)
 	}
-	if err := syscall.Kill(-f.pgid, 0); err == nil {
+	if processGroupLive(f.pgid) {
 		t.Fatalf("process group %d still live after production ReapOwnedCmd", f.pgid)
 	}
 	// Gen must not keep advancing after reap (writer dead).
@@ -1699,7 +1699,9 @@ func TestReapOwnedCmdKillsGrandchildren(t *testing.T) {
 	if err := waitForProcessGroupGone(pgid, 2*time.Second); err != nil {
 		t.Fatalf("after ReapOwnedCmd: %v", err)
 	}
-	if err := syscall.Kill(grandchild, 0); err == nil {
+	// kill(pid,0) is true for zombies; container init may be sleep and not reap.
+	// Production residual checks use live/non-zombie membership.
+	if tok, err := tokenOf(grandchild); err == nil && tok.isLiveTarget() {
 		t.Fatalf("grandchild %d still live after production ReapOwnedCmd", grandchild)
 	}
 	if cmd.ProcessState == nil {
@@ -1726,13 +1728,16 @@ func TestReapOwnedCmdTreeCloseKillsGrandchildrenDespiteLeaderOnlyGroupKill(t *te
 
 	if err := ReapOwnedCmd(cmd); err != nil {
 		// Residual tree error is acceptable if grandchild is still cleaned;
-		// hard-fail only when grandchild survives.
-		if kerr := syscall.Kill(grandchild, 0); kerr == nil {
+		// hard-fail only when grandchild survives as a running process.
+		if tok, terr := tokenOf(grandchild); terr == nil && tok.isLiveTarget() {
 			t.Fatalf("ReapOwnedCmd error %v and grandchild %d still live", err, grandchild)
 		}
 	}
 	if err := waitForPIDGone(grandchild, 2*time.Second); err != nil {
-		t.Fatalf("tree close must reap grandchild %d despite leader-only group killer: %v", grandchild, err)
+		// Zombie residual under non-reaping container init is acceptable if not live.
+		if tok, terr := tokenOf(grandchild); terr == nil && tok.isLiveTarget() {
+			t.Fatalf("tree close must reap grandchild %d despite leader-only group killer: %v", grandchild, err)
+		}
 	}
 	if err := waitForProcessGroupGone(pgid, 2*time.Second); err != nil {
 		// Group may already be empty; only fail if still live.
