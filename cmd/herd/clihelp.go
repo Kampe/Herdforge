@@ -120,7 +120,9 @@ Commands:
     herd worktrees            # human summary + collisions
     herd worktrees --json     # machine-readable array
     herd worktrees --files    # also list per-worktree touched files`,
-	"overlap":      "Usage: herd overlap [flags]\n  Overlap / collision analysis.",
+	"overlap": "Usage: herd overlap [flags]\n  Overlap / collision analysis.",
+	"rescue": "Usage: herd rescue [<pane-id>] [--empty-siblings] [--workspace ID] [--label NAME] [--apply] [--json]\n" +
+		"  Diagnose cramped/split agent panes. Dry-run by default; --apply repairs one proven target.",
 	"attention":    "Usage: herd attention [flags]\n  Coordinator-eyes triage for the standing fleet.",
 	"process":      "Usage: herd process [flags]\n  Process-engine inspection.",
 	"resolve-lane": "Usage: herd resolve-lane [flags]\n  Resolve canonical lane identity.",
