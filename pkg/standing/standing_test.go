@@ -272,6 +272,77 @@ func TestMissingRouteBlocksBeforeTab(t *testing.T) {
 	}
 }
 
+// TestRaisePolicyFailureNeverListsAgents is the non-vacuous regression for the
+// HIGH finding: a failing herdr agent list must not mask AdmitRoute policy
+// errors. Inventory is lazy and only loads after a lane is admitted.
+func TestRaisePolicyFailureNeverListsAgents(t *testing.T) {
+	repo, cfg := standingFixture(t)
+	t.Chdir(repo)
+	listed := 0
+	opts := baseOpts(t, repo)
+	opts.Mode = ModeRaise
+	opts.ListAgents = func() ([]Agent, error) {
+		listed++
+		return nil, errors.New("herdr agent list: exit status 1")
+	}
+	opts.AdmitRoute = func(*config.LaneDef) (Route, error) {
+		return Route{}, errors.New("launch.policy.config_worker_tuple_mismatch: lane \"bad\" must explicitly be Pi harness with codex/gpt-5.6-luna/medium")
+	}
+	opts.CreateTab = func(string, string, string) (Tab, error) {
+		t.Fatal("policy failure must not create tabs")
+		return Tab{}, nil
+	}
+	r, err := Run(cfg, opts)
+	if err == nil {
+		t.Fatal("policy failure must surface")
+	}
+	if listed != 0 {
+		t.Fatalf("ListAgents called %d times on pure policy failure; must be 0", listed)
+	}
+	if !strings.Contains(err.Error(), "launch.policy.config_worker_tuple_mismatch") {
+		t.Fatalf("policy error masked: %v", err)
+	}
+	if strings.Contains(err.Error(), "list agents") {
+		t.Fatalf("list-agents error must not appear: %v", err)
+	}
+	if r == nil || r.Failed == 0 {
+		t.Fatalf("expected failed roles, got %+v", r)
+	}
+}
+
+// TestRaiseListsAgentsOnlyAfterAdmit proves load order is admit → list, and
+// that a list failure after a successful admit is reported as list (not policy).
+func TestRaiseListsAgentsOnlyAfterAdmit(t *testing.T) {
+	repo, cfg := standingFixture(t)
+	t.Chdir(repo)
+	var order []string
+	opts := baseOpts(t, repo)
+	opts.Mode = ModeRaise
+	opts.Only = []string{"orch"}
+	opts.AdmitRoute = func(lane *config.LaneDef) (Route, error) {
+		order = append(order, "admit")
+		return Route{Provider: lane.Provider, Model: lane.Model, Effort: lane.Effort, Harness: lane.Harness}, nil
+	}
+	opts.ListAgents = func() ([]Agent, error) {
+		order = append(order, "list")
+		return nil, errors.New("herdr agent list: exit status 1")
+	}
+	opts.CreateTab = func(string, string, string) (Tab, error) {
+		t.Fatal("list failure must not create tabs")
+		return Tab{}, nil
+	}
+	_, err := Run(cfg, opts)
+	if err == nil {
+		t.Fatal("list failure must surface after admit")
+	}
+	if !strings.Contains(err.Error(), "list agents") {
+		t.Fatalf("expected list-agents error, got %v", err)
+	}
+	if len(order) < 2 || order[0] != "admit" || order[1] != "list" {
+		t.Fatalf("order = %v, want admit then list", order)
+	}
+}
+
 func TestMissingPromptBlocksBeforeTab(t *testing.T) {
 	repo, cfg := standingFixture(t)
 	t.Chdir(repo)
