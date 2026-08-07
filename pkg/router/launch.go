@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"github.com/Kampe/Herdforge/pkg/classify"
+	"github.com/Kampe/Herdforge/pkg/posture"
 	"github.com/Kampe/Herdforge/pkg/usage"
 )
 
@@ -691,8 +692,12 @@ func (r *SurfaceRouter) Decide(req LaunchRequest) (*LaunchDecision, error) {
 
 	authCap := authorCapability(req)
 
-	// Build candidate list (same waterfall / env postures as Pick).
-	candidates, err := r.candidateProviders(shape, req.RequestedProvider)
+	// Build candidate list (same waterfall / family posture as Pick).
+	mode, modeErr := familyPostureMode()
+	if modeErr != nil {
+		return nil, fmt.Errorf("herd-route: family posture: %w", modeErr)
+	}
+	candidates, err := r.candidateProviders(mode, shape, req.RequestedProvider)
 	if err != nil {
 		return nil, err
 	}
@@ -734,6 +739,9 @@ func (r *SurfaceRouter) Decide(req LaunchRequest) (*LaunchDecision, error) {
 		}
 		// Spark / AGY fallbacks reuse Pick's available() + overrides.
 		family := FamilyFor(provider, model)
+		if ok, _ := posture.Allow(mode, provider, model, family); !ok {
+			continue
+		}
 		pool := QuotaPoolFor(provider, model)
 		ok, detail := r.available(provider, model, pool)
 
@@ -874,18 +882,7 @@ func (r *SurfaceRouter) Decide(req LaunchRequest) (*LaunchDecision, error) {
 		})
 	}
 
-	// Claude-only / lazer precedence (same as Pick).
-	if envSet("HERD_CLAUDE_ONLY") {
-		var cl []scored
-		for _, s := range picks {
-			if s.provider == "claude" {
-				cl = append(cl, s)
-			}
-		}
-		if len(cl) > 0 {
-			picks = cl
-		}
-	}
+	// Lazer precedence (same as Pick). Claude-only already restricted the set.
 	var nonLazer []scored
 	for _, s := range picks {
 		if s.provider != "lazer" {
@@ -897,6 +894,12 @@ func (r *SurfaceRouter) Decide(req LaunchRequest) (*LaunchDecision, error) {
 	}
 
 	if len(picks) == 0 {
+		if mode == posture.ModeClaudeOnly {
+			return nil, fmt.Errorf("herd-route: claude-only posture has no healthy native Claude route for role=%s shape=%s", req.Role, shape)
+		}
+		if mode == posture.ModeNoClaude {
+			return nil, fmt.Errorf("herd-route: no-claude posture has no healthy non-Anthropic route for role=%s shape=%s", req.Role, shape)
+		}
 		return nil, fmt.Errorf("herd-route: no healthy launch candidate for role=%s shape=%s", req.Role, shape)
 	}
 
@@ -962,10 +965,10 @@ func (r *SurfaceRouter) Decide(req LaunchRequest) (*LaunchDecision, error) {
 	if best.probeReq {
 		rationale += " probe=required+pass"
 	}
-	if envSet("HERD_CLAUDE_ONLY") {
+	if mode == posture.ModeClaudeOnly {
 		rationale = "claude-only; " + rationale
 	}
-	if envSet("HERD_NO_CLAUDE") {
+	if mode == posture.ModeNoClaude {
 		rationale = "no-claude; " + rationale
 	}
 
@@ -1003,9 +1006,17 @@ func (r *SurfaceRouter) Decide(req LaunchRequest) (*LaunchDecision, error) {
 	return d, nil
 }
 
-// candidateProviders mirrors Pick's candidate construction.
-func (r *SurfaceRouter) candidateProviders(shape, requestedProvider string) ([]string, error) {
+// candidateProviders is the single candidate construction for both Pick and
+// Decide, including the shared family-posture filter so they cannot diverge
+// (FAC-102). An explicit requestedProvider the posture forbids is a hard error:
+// silently substituting native claude would record provider_pin=codex on a
+// route that actually ran claude.
+func (r *SurfaceRouter) candidateProviders(mode posture.Mode, shape, requestedProvider string) ([]string, error) {
 	if requestedProvider != "" {
+		if ok, reason := posture.Allow(mode, requestedProvider, "", ""); !ok {
+			return nil, fmt.Errorf("herd-route: %s posture forbids requested provider %q: %s",
+				posture.ModeLabel(mode), requestedProvider, reason)
+		}
 		return []string{requestedProvider}, nil
 	}
 	candidates, err := Waterfall(shape)
@@ -1027,31 +1038,12 @@ func (r *SurfaceRouter) candidateProviders(shape, requestedProvider string) ([]s
 			candidates = kept
 		}
 	}
-	if envSet("HERD_CLAUDE_ONLY") {
-		var cl, rest []string
-		for _, c := range candidates {
-			if c == "claude" {
-				cl = append(cl, c)
-			} else {
-				rest = append(rest, c)
-			}
-		}
-		if len(cl) == 0 {
-			cl = []string{"claude"}
-		}
-		candidates = append(cl, rest...)
+	candidates, _ = posture.FilterProviders(mode, candidates)
+	if mode == posture.ModeNoClaude && len(candidates) == 0 {
+		return nil, fmt.Errorf("herd-route: no-claude posture leaves NO candidate for shape %q", shape)
 	}
-	if envSet("HERD_NO_CLAUDE") {
-		var nc []string
-		for _, c := range candidates {
-			if c != "claude" {
-				nc = append(nc, c)
-			}
-		}
-		if len(nc) == 0 {
-			return nil, fmt.Errorf("herd-route: no-claude posture leaves NO candidate for shape %q", shape)
-		}
-		candidates = nc
+	if mode == posture.ModeClaudeOnly && len(candidates) == 0 {
+		return nil, fmt.Errorf("herd-route: claude-only posture leaves NO candidate for shape %q", shape)
 	}
 	return candidates, nil
 }
