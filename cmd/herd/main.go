@@ -3016,15 +3016,6 @@ func runForgeE() error {
 		return fmt.Errorf("task provider: %w", tpErr)
 	}
 
-	mr := router.NewModelRouter([]*router.ModelCandidate{
-		{Name: "opencode", Type: router.ProviderOllama, Model: "deepseek-v4-flash"},
-	}).WithUsageFunc(func(ctx context.Context, name string) float64 {
-		snap, err := usage.FetchSnapshot()
-		if err != nil {
-			return 0
-		}
-		return snap.Utilization(name)
-	})
 	wm := resolveCanonicalWorktreeManager()
 	v := verifier.NewVerifier(cfg.Verification.TestCommand)
 	st, err := store.New(".herd/herdforge.db")
@@ -3033,7 +3024,6 @@ func runForgeE() error {
 		os.Exit(1)
 	}
 	defer st.Close()
-	eng := daemon.NewEngine(cfg, tp, mr, st, wm, v)
 
 	ctx := context.Background()
 	fmt.Println("=== Forge: Pulse ===")
@@ -3041,6 +3031,7 @@ func runForgeE() error {
 	var forgeDecision *router.LaunchDecision
 	var forgeLeaseGeneration int64
 	var task *provider.Task
+	var eng *daemon.Engine
 	if !herdr.IsAvailable() {
 		return errors.New("herdr CLI not found — refusing launch-required forge claim")
 	}
@@ -3048,16 +3039,30 @@ func runForgeE() error {
 	if forgeLane == nil {
 		return errors.New("no worker lane configured; refusing forge claim")
 	}
-	forgeDecision, err = forgeLaunchAdmission(cfg, forgeLane, ctx, func(_ *router.LaunchDecision) error {
-		var claimErr error
-		task, claimErr = eng.RunPulse(ctx, "worker")
-		return claimErr
+	// FAC-194: after route admission, bind ModelRouter from the compiled
+	// LaunchDecision (forbidden-identity gate) before any claim. Never from
+	// an embedded OpenCode/DeepSeek fallback.
+	forgeDecision, err = forgeLaunchAdmission(cfg, forgeLane, ctx, func(d *router.LaunchDecision) error {
+		return applyWorkerModelRouterBeforeClaim(d, func(mr *router.ModelRouter) error {
+			eng = daemon.NewEngine(cfg, tp, attachWorkerUsage(mr), st, wm, v)
+			var claimErr error
+			task, claimErr = eng.RunPulse(ctx, "worker")
+			return claimErr
+		})
 	})
+	if err != nil && errors.Is(err, ErrWorkerModelPolicy) {
+		if recErr := recordWorkerModelPolicyBlocked(st, "forge", err.Error()); recErr != nil {
+			return fmt.Errorf("launch route rejected before forge claim: %w (%v)", err, recErr)
+		}
+	}
 	if err != nil {
 		return fmt.Errorf("launch route rejected before forge claim: %w", err)
 	}
 	if err := validateDecisionBeforeSideEffect(forgeDecision, forgeLane.Name); err != nil {
 		return fmt.Errorf("launch decision rejected before forge claim: %w", err)
+	}
+	if eng == nil {
+		return fmt.Errorf("forge engine was not composed after launch admission")
 	}
 	claimedRef, claimedGeneration := eng.LastClaimIdentity()
 	if task != nil {
@@ -3065,11 +3070,6 @@ func runForgeE() error {
 			return fmt.Errorf("forge launch identity unavailable for %s", task.Ref)
 		}
 		forgeLeaseGeneration = claimedGeneration
-	}
-
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "pulse failed: %v\n", err)
-		os.Exit(1)
 	}
 	if task == nil {
 		fmt.Println("No pending tasks. Checking for review items...")
@@ -3319,6 +3319,146 @@ func validateLaneLaunchConfig(lane *config.LaneDef) error {
 
 var ErrWorkerConfigPolicy = errors.New("launch.policy.config_worker_tuple_mismatch")
 var ErrHarnessConfigPolicy = errors.New("launch.policy.config_harness_mismatch")
+
+// ErrWorkerModelPolicy rejects forbidden model identity on production
+// pulse/forge paths that bind a ModelRouter from a LaunchDecision (FAC-194).
+// It does not re-pin workers to a vendor tuple; launch.Validate and the live
+// quota waterfall own coherent provider/model/effort selection.
+var ErrWorkerModelPolicy = errors.New("worker.model.policy")
+
+// applyWorkerModelRouterBeforeClaim is the production forge/spawn seam:
+// compile a ModelRouter from the admitted LaunchDecision, then run claim.
+// Forbidden OpenCode/Ollama/DeepSeek/coordinator identities fail before claim.
+func applyWorkerModelRouterBeforeClaim(d *router.LaunchDecision, claim func(*router.ModelRouter) error) error {
+	mr, err := modelRouterFromLaunchDecision(d)
+	if err != nil {
+		return err
+	}
+	if claim == nil {
+		return fmt.Errorf("%w: claim effect is required", ErrWorkerModelPolicy)
+	}
+	return claim(mr)
+}
+
+// modelRouterFromLaunchDecision derives a single-candidate ModelRouter from a
+// compiled LaunchDecision. Missing identity fails closed; OpenCode/DeepSeek/
+// Ollama/coordinator-tier surfaces are rejected. Any coherent implementation
+// waterfall pick (including non-codex providers and non-medium effort) is kept.
+func modelRouterFromLaunchDecision(d *router.LaunchDecision) (*router.ModelRouter, error) {
+	if d == nil {
+		return nil, fmt.Errorf("%w: missing LaunchDecision route evidence", ErrWorkerModelPolicy)
+	}
+	return modelRouterFromWorkerIdentity(d.Provider, d.Model, d.Effort)
+}
+
+func modelRouterFromWorkerIdentity(provider, model, effort string) (*router.ModelRouter, error) {
+	return modelRouterFromCandidates([]*router.ModelCandidate{{
+		Name:            provider,
+		Type:            workerProviderType(provider),
+		Model:           model,
+		ReasoningEffort: effort,
+	}})
+}
+
+// modelRouterFromCandidates is the production worker ModelRouter constructor.
+// A mutant restoring OpenCode/Ollama/DeepSeek candidates fails here before any
+// claim effect that applyWorkerModelRouterBeforeClaim wraps.
+func modelRouterFromCandidates(candidates []*router.ModelCandidate) (*router.ModelRouter, error) {
+	if len(candidates) == 0 {
+		return nil, fmt.Errorf("%w: missing model candidates", ErrWorkerModelPolicy)
+	}
+	if len(candidates) != 1 {
+		return nil, fmt.Errorf("%w: production worker path forbids multi-candidate fallback routers", ErrWorkerModelPolicy)
+	}
+	c := candidates[0]
+	if c == nil {
+		return nil, fmt.Errorf("%w: nil model candidate", ErrWorkerModelPolicy)
+	}
+	if c.Type == router.ProviderOllama {
+		return nil, fmt.Errorf("%w: Ollama provider type forbidden on worker path", ErrWorkerModelPolicy)
+	}
+	if err := rejectProductionWorkerModelIdentity(c.Name, c.Model, c.ReasoningEffort); err != nil {
+		return nil, err
+	}
+	return router.NewModelRouter([]*router.ModelCandidate{{
+		Name:            strings.TrimSpace(c.Name),
+		Type:            c.Type,
+		Model:           strings.TrimSpace(c.Model),
+		ReasoningEffort: strings.TrimSpace(c.ReasoningEffort),
+	}}), nil
+}
+
+func workerProviderType(provider string) router.ProviderType {
+	switch strings.ToLower(strings.TrimSpace(provider)) {
+	case "codex", "openai":
+		return router.ProviderOpenAI
+	case "claude", "anthropic":
+		return router.ProviderAnthropic
+	case "agy", "google":
+		return router.ProviderGoogle
+	case "grok", "xai":
+		return router.ProviderXAI
+	default:
+		return router.ProviderOpenAI
+	}
+}
+
+// rejectProductionWorkerModelIdentity refuses missing, OpenCode, Ollama,
+// DeepSeek, and coordinator-tier identities. It deliberately does NOT require
+// codex/gpt-5.6-luna/medium — that pin defeated live quota routing (9af6c78).
+func rejectProductionWorkerModelIdentity(provider, model, effort string) error {
+	p := strings.TrimSpace(provider)
+	m := strings.TrimSpace(model)
+	e := strings.ToLower(strings.TrimSpace(effort))
+	if p == "" || m == "" || e == "" {
+		return fmt.Errorf("%w: missing provider/model/effort evidence", ErrWorkerModelPolicy)
+	}
+	switch e {
+	case "low", "medium", "high", "xhigh", "max":
+	default:
+		return fmt.Errorf("%w: invalid effort %q", ErrWorkerModelPolicy, effort)
+	}
+	pl, ml := strings.ToLower(p), strings.ToLower(m)
+	if pl == "opencode" || pl == "ollama" || strings.Contains(pl, "deepseek") {
+		return fmt.Errorf("%w: provider %q forbidden on worker path", ErrWorkerModelPolicy, p)
+	}
+	if strings.Contains(ml, "deepseek") || strings.Contains(ml, "opencode") || strings.Contains(ml, "litellm/ollama") {
+		return fmt.Errorf("%w: model %q forbidden on worker path", ErrWorkerModelPolicy, m)
+	}
+	// Coordinator-only / non-authoring surfaces must not enter worker loops.
+	if !router.AuthoringModelAllowed(m) {
+		return fmt.Errorf("%w: coordinator-tier model %q forbidden on worker path", ErrWorkerModelPolicy, m)
+	}
+	for _, bad := range []string{"gpt-5.6-sol", "gpt-5.6-terra", "-sol", "claude-fable"} {
+		if strings.Contains(ml, bad) {
+			return fmt.Errorf("%w: coordinator-tier model %q forbidden on worker path", ErrWorkerModelPolicy, m)
+		}
+	}
+	return nil
+}
+
+func attachWorkerUsage(mr *router.ModelRouter) *router.ModelRouter {
+	if mr == nil {
+		return nil
+	}
+	return mr.WithUsageFunc(func(ctx context.Context, name string) float64 {
+		snap, err := usage.FetchSnapshot()
+		if err != nil {
+			return 0
+		}
+		return snap.Utilization(name)
+	})
+}
+
+// recordWorkerModelPolicyBlocked writes durable BLOCKED evidence when a
+// production worker path cannot establish a non-forbidden model identity.
+func recordWorkerModelPolicyBlocked(st *store.Store, entrypoint, reason string) error {
+	if st == nil {
+		return fmt.Errorf("durable BLOCKED evidence unavailable for worker model policy")
+	}
+	_, err := st.RecordBlockedSelection("WORKER-POLICY", "", entrypoint, "worker_model_policy", reason, "", "")
+	return err
+}
 
 func validateDecisionBeforeSideEffect(decision *router.LaunchDecision, taskRef string) error {
 	if decision == nil {
