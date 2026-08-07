@@ -527,9 +527,11 @@ func TestRun_BroadcastQuarantineMarkersNeverPrompt(t *testing.T) {
 	}
 }
 
-func TestCompileKickExclusions_AutoMarksReviewers(t *testing.T) {
+func TestCompileKickExclusions_EphemeralReviewTabsOnly(t *testing.T) {
+	// FAC-187: only ephemeral review-* tabs are auto-excluded. Standing
+	// forge-assayer must remain kickable (recovery path).
 	ex := compileKickExclusions(
-		[]string{"forge-worker", "review-assayer-fac-151", "forge-assayer"},
+		[]string{"forge-worker", "review-assayer-fac-151", "forge-assayer", "forge-reviewer"},
 		nil, nil,
 	)
 	if _, ok := ex["forge-worker"]; ok {
@@ -538,7 +540,49 @@ func TestCompileKickExclusions_AutoMarksReviewers(t *testing.T) {
 	if ex["review-assayer-fac-151"] != string(broadcast.ExcludeReviewer) {
 		t.Fatalf("review tab: %q", ex["review-assayer-fac-151"])
 	}
-	if ex["forge-assayer"] != string(broadcast.ExcludeReviewer) {
-		t.Fatalf("assayer: %q", ex["forge-assayer"])
+	if _, ok := ex["forge-assayer"]; ok {
+		t.Fatalf("standing forge-assayer must remain kickable, got %q", ex["forge-assayer"])
+	}
+	if _, ok := ex["forge-reviewer"]; ok {
+		t.Fatalf("standing forge-reviewer must remain kickable, got %q", ex["forge-reviewer"])
+	}
+}
+
+func TestRun_StandingAssayerIsKickable(t *testing.T) {
+	// Proved the regression: blanket "assayer" exclusion made
+	// herd kick forge-assayer (and --all) skip with broadcast:reviewer.
+	agents := []AgentEntry{
+		{Name: "forge-assayer", Status: "idle", PaneID: "p-assayer"},
+		{Name: "review-assayer-fac-x", Status: "idle", PaneID: "p-ephemeral"},
+	}
+	for _, force := range []bool{false, true} {
+		result, err := Run(Options{
+			Names:        []string{"forge-assayer", "review-assayer-fac-x"},
+			Force:        force,
+			DryRun:       true,
+			Quiet:        true,
+			RaiseMissing: false,
+			HoldReader:   allowAllHolds{},
+			Identity:     testIdentity,
+			ActiveTasks:  testActiveTasks,
+			Generation:   testGeneration,
+			FetchAgents:  func() ([]AgentEntry, error) { return agents, nil },
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		byName := map[string]EntryResult{}
+		for _, e := range result.Entries {
+			byName[e.Name] = e
+		}
+		if byName["forge-assayer"].Result != "dry-run" {
+			t.Fatalf("force=%v forge-assayer must be kicked, got %+v", force, byName["forge-assayer"])
+		}
+		if byName["review-assayer-fac-x"].Result != "skipped" {
+			t.Fatalf("force=%v ephemeral review tab must stay excluded, got %+v", force, byName["review-assayer-fac-x"])
+		}
+		if !strings.HasPrefix(byName["review-assayer-fac-x"].Reason, "broadcast:") {
+			t.Fatalf("force=%v reason = %q", force, byName["review-assayer-fac-x"].Reason)
+		}
 	}
 }

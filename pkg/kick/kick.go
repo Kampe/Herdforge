@@ -78,8 +78,9 @@ type Options struct {
 	FetchAgents func() ([]AgentEntry, error)
 	// Markers maps agent name → broadcast exclusion markers (FAC-187).
 	// Production runKick loads quarantine/protected sets here so a
-	// lifted-hold kick never prompts excluded lanes. Reviewer-like names
-	// are always auto-marked even when this map is empty.
+	// lifted-hold kick never prompts excluded task lanes. Ephemeral
+	// review-* tabs are auto-marked; standing forge-assayer / reviewer
+	// lanes are NOT — kick is their recovery path.
 	Markers map[string][]broadcast.ExclusionKind
 	// LiveIdentity, when set, re-reads identity immediately before every
 	// prompt; BoundIdentities supplies the bound side of the fence.
@@ -280,8 +281,8 @@ func Run(opts Options) (*Result, error) {
 	}
 
 	// FAC-187: compile the broadcast target set and subtract protected /
-	// quarantined / reviewer / historical lanes before any prompt. This is
-	// the live production seam for pkg/broadcast (herd kick).
+	// quarantined / ephemeral review-* task tabs before any prompt. Standing
+	// reviewer lanes stay eligible — kick is their recovery path.
 	excludedByBroadcast := compileKickExclusions(names, held, opts.Markers)
 
 	result := &Result{}
@@ -489,8 +490,9 @@ func sorted(slice, reference []string) bool {
 
 // compileKickExclusions builds the broadcast target set for a kick wave and
 // returns name → exclusion reason for every candidate that must not be
-// prompted. Always auto-marks reviewer-shaped agent names; held lanes and
-// explicit Markers are layered on top.
+// prompted. Auto-marks ephemeral review-* task tabs only; standing reviewer
+// lanes stay kickable so recovery works. Held lanes and explicit Markers
+// (quarantine/protected) are layered on top.
 func compileKickExclusions(names []string, held map[string]string, markers map[string][]broadcast.ExclusionKind) map[string]string {
 	candidates := make([]broadcast.Target, 0, len(names))
 	for _, id := range names {
@@ -500,7 +502,7 @@ func compileKickExclusions(names []string, held map[string]string, markers map[s
 			AllowedActions: []string{"kick", "prompt"},
 			Generation:     1, // standing kick has no lease generation fence
 		}
-		if isReviewerAgentName(id) {
+		if isEphemeralReviewTab(id) {
 			t.Markers = append(t.Markers, broadcast.ExcludeReviewer)
 		}
 		if _, ok := held[id]; ok {
@@ -519,17 +521,13 @@ func compileKickExclusions(names []string, held map[string]string, markers map[s
 	return out
 }
 
-// isReviewerAgentName matches ephemeral review-assayer-… tabs and standing
-// forge-reviewer / forge-assayer lanes so a fleet kick never prompts them.
-func isReviewerAgentName(id string) bool {
+// isEphemeralReviewTab matches task-bound review tabs created by
+// herd review --spawn (review-assayer-FAC-…), not standing forge-assayer /
+// forge-reviewer lanes. Standing reviewers must remain kickable: kick is
+// the recovery path for an idle/blocked lane (FAC-187).
+func isEphemeralReviewTab(id string) bool {
 	id = strings.ToLower(strings.TrimSpace(id))
-	if strings.HasPrefix(id, "review-") {
-		return true
-	}
-	if strings.Contains(id, "reviewer") || strings.Contains(id, "assayer") {
-		return true
-	}
-	return false
+	return strings.HasPrefix(id, "review-")
 }
 
 // LoadBroadcastMarkers reads an optional JSON object of agent-name →
