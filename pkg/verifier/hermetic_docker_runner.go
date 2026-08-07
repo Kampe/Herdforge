@@ -22,6 +22,11 @@ import (
 	"time"
 )
 
+// hermeticContainerEnv is set by the FAC-151 Docker runner so ownership
+// supervision skips nested unprivileged user/PID namespaces (the outer
+// container is the isolation boundary).
+const hermeticContainerEnv = "HERD_HERMETIC_CONTAINER"
+
 const (
 	hermeticContainerUser         = "65532:65532"
 	hermeticPIDLimit              = 64
@@ -66,6 +71,7 @@ func hermeticGoEnv() []string {
 		"GOTMPDIR=" + hermeticGoCompileTmpDir,
 		"TMPDIR=" + hermeticGoCompileTmpDir,
 		"HOME=" + hermeticGoCompileTmpDir,
+		hermeticContainerEnv + "=1",
 		// Network is none; refuse module fetches so a missing cache is a hard
 		// error instead of a DNS hang under --network none.
 		"GOPROXY=off",
@@ -1001,6 +1007,7 @@ func fixedFAC151Argv() []string {
 		"TMPDIR=" + hermeticGoFixtureTmpDir,
 		"GOTMPDIR=" + hermeticGoFixtureTmpDir,
 		"HOME=" + hermeticGoFixtureTmpDir,
+		hermeticContainerEnv + "=1",
 		hermeticRunPath + "/verifier.test",
 		"-test.run", fixedFAC151Regex(),
 		"-test.count=" + hermeticTestCount,
