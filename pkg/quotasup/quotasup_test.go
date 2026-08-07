@@ -167,3 +167,52 @@ func TestQuotaPoolAgreesWithTheRouterOnCanonicalModels(t *testing.T) {
 		t.Fatalf("ledger provider name = %q, want gemini", got)
 	}
 }
+
+// A lane launched through the Pi harness carries a vendor-qualified model.
+// Billed as-is it misses the pool rules entirely: "anthropic/claude-fable-5"
+// fails the exact-match fable rule and "google/gemini-3.1-pro-high" fails the
+// gemini prefix rule, so the supervisor caps a pool nobody is using while the
+// real one runs uncapped.
+func TestPiHarnessArgvBillsTheRoutedPool(t *testing.T) {
+	for _, c := range []struct{ provider, model, wantPool string }{
+		{"claude", "claude-fable-5", "fable"},
+		{"claude", "claude-sonnet-5", "default"},
+		{"agy", "gemini-3.1-pro-high", "gemini"},
+		{"codex", "gpt-5.3-codex-spark", "spark"},
+		{"codex", "gpt-5.6-luna", "default"},
+		{"grok", "grok-4.5", "default"},
+		// opencode and lazer models are their own routed names; Pi passes
+		// them through, so nothing may be stripped off them either.
+		{"opencode", "opencode/kimi-k3", "default"},
+		{"lazer", "litellm/lazer/grok-4.5", "default"},
+	} {
+		harness, argv, err := router.HarnessArgvFor(c.provider, c.model, "high")
+		if err != nil {
+			t.Fatalf("HarnessArgvFor(%s,%s): %v", c.provider, c.model, err)
+		}
+		if harness != router.PiHarness {
+			t.Fatalf("expected the pi harness, got %q", harness)
+		}
+		got := ModelFromArgv(argv)
+		if got != c.model {
+			t.Errorf("ModelFromArgv(%v) = %q, want the routed model %q", argv, got, c.model)
+		}
+		if pool := QuotaPool(c.provider, got); pool != c.wantPool {
+			t.Errorf("%s/%s launched via pi bills pool %q, want %q", c.provider, c.model, pool, c.wantPool)
+		}
+	}
+}
+
+// Only Pi argv is de-qualified. A provider CLI invoked directly reports its
+// own model verbatim, and a stray "anthropic/..." there is not ours to rewrite.
+func TestOnlyPiArgvIsDeQualified(t *testing.T) {
+	direct := []string{"claude", "--model", "anthropic/claude-fable-5"}
+	if got := ModelFromArgv(direct); got != "anthropic/claude-fable-5" {
+		t.Fatalf("non-pi argv = %q, want it verbatim", got)
+	}
+	// An absolute path to the harness still identifies it.
+	piPath := []string{"/opt/homebrew/bin/pi", "--model", "anthropic/claude-fable-5"}
+	if got := ModelFromArgv(piPath); got != "claude-fable-5" {
+		t.Fatalf("pi by absolute path = %q, want the routed model", got)
+	}
+}

@@ -83,12 +83,12 @@ func runQuotaSupervisor() {
 			continue
 		}
 		provider := a.Kind
-		model := laneModel(a.PaneID)
+		model, resolved := laneModel(a.PaneID)
 		qp := quotasup.QuotaProvider(provider)
 		pool := quotasup.QuotaPool(provider, model)
 		assignment := quotasup.Assignment{
 			Name: a.Name, PaneID: a.PaneID, TabID: a.TabID, AgentStatus: a.Status,
-			Provider: provider, QuotaProvider: qp, Model: model,
+			Provider: provider, QuotaProvider: qp, Model: model, ModelResolved: resolved,
 			Family: router.FamilyFor(strings.ToLower(provider), model), Pool: pool,
 			Capacity: quotasup.Classify(quotasup.BurnFor(computed, quotasup.Surface{Provider: qp, Pool: pool}), *warn),
 		}
@@ -177,6 +177,12 @@ func runQuotaSupervisor() {
 	c := current.Counts()
 	fmt.Printf("herd quota-supervisor: agents=%d exhausted=%d at_risk=%d unknown=%d\n",
 		c.Agents, c.Exhausted, c.AtRisk, c.Unknown)
+	// Naming the guesses beats a clean-looking total: these lanes are counted
+	// against their provider's default pool because their argv was unreadable.
+	if unresolved := current.UnresolvedModels(); len(unresolved) > 0 {
+		fmt.Printf("  WARN %d lane(s) billed to a default pool without argv evidence: %s\n",
+			len(unresolved), strings.Join(unresolved, " "))
+	}
 	for _, d := range current.Decisions {
 		fmt.Printf("  %-24s cap=%d/%d posture=%-7s active=%d  %s\n",
 			d.Surface, d.Cap, d.Target, d.Posture, d.Evidence.Active, d.Reason)
@@ -184,23 +190,29 @@ func runQuotaSupervisor() {
 }
 
 // laneModel recovers a running lane's model from its own process argv, the
-// only live source for it. Best effort by design: a pane that has already gone
-// away, or an agent launched on its surface default, yields "" and bills the
-// default pool rather than failing the whole sweep.
-func laneModel(paneID string) string {
+// only live source for it.
+//
+// PaneProcessArgv, not PaneProcessInfo: herdr does not always report argv, and
+// the OS read is what makes this evidence rather than a guess. Best effort by
+// design — a pane that has already gone away, or an agent launched on its
+// surface default, yields "" and bills the default pool rather than failing the
+// whole sweep. resolved reports whether argv was actually read, so the caller
+// can say which lanes are billed on evidence and which on a fallback.
+func laneModel(paneID string) (model string, resolved bool) {
 	if strings.TrimSpace(paneID) == "" {
-		return ""
+		return "", false
 	}
-	procs, err := herdr.PaneProcessInfo(paneID)
-	if err != nil {
-		return ""
-	}
+	procs, _ := herdr.PaneProcessArgv(paneID)
 	for _, p := range procs {
+		if len(p.Argv) == 0 {
+			continue
+		}
+		resolved = true
 		if m := quotasup.ModelFromArgv(p.Argv); m != "" {
-			return m
+			return m, true
 		}
 	}
-	return ""
+	return "", resolved
 }
 
 func sortedKeys(m map[string]bool) []string {
