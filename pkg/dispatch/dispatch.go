@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/Kampe/Herdforge/pkg/config"
+	"github.com/Kampe/Herdforge/pkg/confinement"
 	"github.com/Kampe/Herdforge/pkg/control"
 	"github.com/Kampe/Herdforge/pkg/deps"
 	"github.com/Kampe/Herdforge/pkg/herdr"
@@ -226,6 +227,11 @@ type Dispatcher struct {
 	scopeCloser   io.Closer
 	closeOnce     sync.Once
 	closeErr      error
+
+	// Confinement is the FAC-190 write-boundary gate for production launches.
+	// When nil under Production, launch constructs ProductionEnforcer() and
+	// fails closed without a MAC issuer + OS write-denial proof.
+	Confinement *confinement.Enforcer
 
 	// health projects BLOCKED(provider_timeout) for board calls (FAC-150).
 	health dispatchHealth
@@ -793,6 +799,96 @@ func requireControlOrdersOrClose(h HerdrLauncher, tabID string, orders *control.
 	}
 }
 
+// enforceConfinement is the FAC-190 production gate: MAC-authenticated worktree
+// binding plus OS write-denial proof for shared-root/sibling incident paths.
+func (d *Dispatcher) enforceConfinement(
+	request launch.Request,
+	task *provider.Task,
+	lane *config.LaneDef,
+	wtInfo *worktree.WorktreeInfo,
+	result *DispatchResult,
+	tab *herdr.TabInfo,
+	tabLabel string,
+) error {
+	if d == nil || task == nil || lane == nil || wtInfo == nil || result == nil || tab == nil {
+		return fmt.Errorf("confinement: incomplete launch context")
+	}
+	enf := d.Confinement
+	if enf == nil {
+		var err error
+		enf, err = confinement.ProductionEnforcer()
+		if err != nil {
+			return fmt.Errorf("confinement production enforcer: %w", err)
+		}
+		enf.ReceiptDir = filepath.Join(wtInfo.Path, ".herd", "confinement")
+	} else if strings.TrimSpace(enf.ReceiptDir) == "" {
+		// Copy so concurrent launches do not race a shared enforcer path.
+		cloned := *enf
+		cloned.ReceiptDir = filepath.Join(wtInfo.Path, ".herd", "confinement")
+		enf = &cloned
+	}
+	leaseGen := result.LeaseGeneration
+	if leaseGen <= 0 {
+		leaseGen = request.LeaseGeneration
+	}
+	if leaseGen <= 0 {
+		return fmt.Errorf("confinement: lease generation is required")
+	}
+	sessionGen := request.SessionGeneration
+	if sessionGen <= 0 {
+		// Align with tool-child preparation: mint a durable generation when
+		// the request has not yet been stamped (pre-agent-start).
+		var err error
+		sessionGen, err = toolchild.NextSessionGeneration(request.Repository)
+		if err != nil {
+			return fmt.Errorf("confinement session generation: %w", err)
+		}
+	}
+	processIdentity := strings.TrimSpace(request.ProcessIdentity)
+	if processIdentity == "" {
+		processIdentity = fmt.Sprintf("prestart:%s:%s:%s", tab.ID, tab.Pane.ID, launch.DecisionDigest(request.Decision))
+	}
+	session := strings.TrimSpace(request.HerdrSession)
+	if session == "" {
+		session = tabLabel
+	}
+	argv := []string{}
+	if request.Decision != nil {
+		argv = append(argv, request.Decision.Argv...)
+	}
+	id := confinement.LaunchIdentity{
+		Repository:        request.Repository,
+		Task:              task.Ref,
+		LeaseGeneration:   leaseGen,
+		Lane:              lane.Name,
+		Session:           session,
+		SessionGeneration: sessionGen,
+		HerdrTab:          tab.ID,
+		HerdrPane:         tab.Pane.ID,
+		ProcessIdentity:   processIdentity,
+		Argv:              argv,
+		WorktreeRoot:      wtInfo.Path,
+		SharedRoot:        d.Worktree.RepoRoot(),
+	}
+	binding, err := enf.BindAndProve(id)
+	if err != nil {
+		return err
+	}
+	// Surface the binding digest into the worktree for coordinator harvest.
+	receiptPath := filepath.Join(wtInfo.Path, ".herd", "confinement", "last-binding.json")
+	if err := os.MkdirAll(filepath.Dir(receiptPath), 0o755); err != nil {
+		return err
+	}
+	raw, err := binding.MarshalReceipt()
+	if err != nil {
+		return err
+	}
+	if err := os.WriteFile(receiptPath, raw, 0o600); err != nil {
+		return err
+	}
+	return nil
+}
+
 func (d *Dispatcher) launch(
 	ctx context.Context,
 	opts DispatchOptions,
@@ -882,6 +978,18 @@ func (d *Dispatcher) launch(
 		return &launchFailure{
 			Reason: "record_tab_failed",
 			Err:    closeTabLocal(h, tab.ID, "record_tab_failed", err),
+		}
+	}
+
+	// FAC-190: authenticate the worktree, MAC-bind the launch identity, and
+	// prove OS write denials for the shared-root incident path before any
+	// write-capable agent process is started.
+	if d.Production {
+		if err := d.enforceConfinement(request, task, lane, wtInfo, result, tab, tabLabel); err != nil {
+			return &launchFailure{
+				Reason: "confinement_rejected",
+				Err:    closeTabLocal(h, tab.ID, "confinement_rejected", err),
+			}
 		}
 	}
 

@@ -1,5 +1,7 @@
-// Package confinement defines the foundation boundary used by future worker
-// enforcement. It deliberately has no production call sites yet.
+// Package confinement defines the authenticated write boundary for worker and
+// reviewer launches (FAC-190). Policy Authorize* is fail-closed path planning;
+// production also requires a MAC issuer and an OS backend that proves shared-root
+// and sibling write denials before a write-capable agent is started.
 package confinement
 
 import (
