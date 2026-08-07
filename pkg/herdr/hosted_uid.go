@@ -105,24 +105,31 @@ type HostedPaneIdentity struct {
 }
 
 // HostedProcessIdentity is one process in the hosted pane tree.
+// RUID/EUID and RGID/EGID are all required: seteuid-only drops leave ruid as
+// coordinator and must not pass isolation proof (HIGH round-6).
 type HostedProcessIdentity struct {
 	PID        int
 	StartToken string
-	UID        int
-	GID        int
+	RUID       int // real uid
+	EUID       int // effective uid
+	RGID       int // real gid
+	EGID       int // effective gid
 	ParentPID  int
 	Role       string // shell | foreground | pgid | descendant | agent
 }
 
-// EnvBuilderGID pins the expected primary GID for hosted processes. Required
-// for group-drop evidence when isolation is on: must be positive and must not
-// equal the coordinator's primary GID.
+// EnvBuilderGID pins the expected primary GID for hosted processes when set.
+// When unset, shell EGID (≠ coordinator) anchors the homogeneous tree check.
 const EnvBuilderGID = "HERD_BUILDER_GID"
+
+// processCreds is one kernel credential snapshot from a single ps invocation.
+type processCreds struct {
+	RUID, EUID, RGID, EGID int
+}
 
 // test seams — production defaults use real OS / procsignal.
 var (
-	processUIDOf    = processUIDOfReal
-	processGIDOf    = processGIDOfReal
+	processCredsOf  = processCredsOfReal
 	processExists   = processExistsReal
 	signalExact     = procsignal.SignalExactProcess
 	osGetuid        = os.Getuid
@@ -134,6 +141,9 @@ var (
 	listChildPIDs   = listDirectChildrenReal
 	// sleepBrief is the TERM→KILL grace quantum (must run between the two signals).
 	sleepBrief = func() { time.Sleep(50 * time.Millisecond) }
+	// agentReadySleep is the poll interval matching bindToolChildLifecycle.
+	agentReadySleep = func() { time.Sleep(500 * time.Millisecond) }
+	agentReadyTries = 20
 )
 
 // Capability cache: one successful negotiation per process lifetime (or until
@@ -359,28 +369,22 @@ func GetHostedPaneIdentity(paneID string) (*HostedPaneIdentity, error) {
 			}
 			return fmt.Errorf("%w: start token pid %d role %s: %v", ErrHostedUIDObserve, pid, role, err)
 		}
-		uid, err := processUIDOf(pid)
+		creds, err := processCredsOf(pid)
 		if err != nil {
 			if !required && !processExists(pid) {
 				return nil
 			}
 			if !processExists(pid) {
-				return fmt.Errorf("%w: uid pid %d role %s: %v", ErrHostedUIDProcessGone, pid, role, err)
+				return fmt.Errorf("%w: creds pid %d role %s: %v", ErrHostedUIDProcessGone, pid, role, err)
 			}
-			return fmt.Errorf("%w: uid pid %d role %s: %v", ErrHostedUIDObserve, pid, role, err)
-		}
-		gid, err := processGIDOf(pid)
-		if err != nil {
-			if !required && !processExists(pid) {
-				return nil
-			}
-			if !processExists(pid) {
-				return fmt.Errorf("%w: gid pid %d role %s: %v", ErrHostedUIDProcessGone, pid, role, err)
-			}
-			return fmt.Errorf("%w: gid pid %d role %s: %v", ErrHostedUIDObserve, pid, role, err)
+			return fmt.Errorf("%w: creds pid %d role %s: %v", ErrHostedUIDObserve, pid, role, err)
 		}
 		ppid, _ := readParent(pid)
-		id := HostedProcessIdentity{PID: pid, StartToken: tok, UID: uid, GID: gid, ParentPID: ppid, Role: role}
+		id := HostedProcessIdentity{
+			PID: pid, StartToken: tok,
+			RUID: creds.RUID, EUID: creds.EUID, RGID: creds.RGID, EGID: creds.EGID,
+			ParentPID: ppid, Role: role,
+		}
 		byPID[pid] = &id
 		return nil
 	}
@@ -503,34 +507,30 @@ func parsePIDList(s string) []int {
 	return pids
 }
 
-func processUIDOfReal(pid int) (int, error) {
+// processCredsOfReal reads real+effective uid/gid in one ps invocation so a
+// seteuid-only drop cannot pass as isolation (ruid still coordinator).
+func processCredsOfReal(pid int) (processCreds, error) {
 	if pid <= 0 {
-		return 0, fmt.Errorf("invalid pid")
+		return processCreds{}, fmt.Errorf("invalid pid")
 	}
-	out, err := exec.Command("/bin/ps", "-o", "uid=", "-p", strconv.Itoa(pid)).Output()
+	// Single snapshot: ruid,uid,rgid,gid (real + effective on macOS/Linux ps).
+	out, err := exec.Command("/bin/ps", "-o", "ruid=,uid=,rgid=,gid=", "-p", strconv.Itoa(pid)).Output()
 	if err != nil {
-		return 0, fmt.Errorf("ps uid for pid %d: %w", pid, err)
+		return processCreds{}, fmt.Errorf("ps creds for pid %d: %w", pid, err)
 	}
-	u, err := strconv.Atoi(strings.TrimSpace(string(out)))
-	if err != nil {
-		return 0, fmt.Errorf("parse uid for pid %d: %w", pid, err)
+	fields := strings.Fields(string(out))
+	if len(fields) != 4 {
+		return processCreds{}, fmt.Errorf("ps creds for pid %d: want 4 fields got %v", pid, fields)
 	}
-	return u, nil
-}
-
-func processGIDOfReal(pid int) (int, error) {
-	if pid <= 0 {
-		return 0, fmt.Errorf("invalid pid")
+	var c processCreds
+	for i, dst := range []*int{&c.RUID, &c.EUID, &c.RGID, &c.EGID} {
+		n, err := strconv.Atoi(fields[i])
+		if err != nil {
+			return processCreds{}, fmt.Errorf("ps creds for pid %d field %d: %w", pid, i, err)
+		}
+		*dst = n
 	}
-	out, err := exec.Command("/bin/ps", "-o", "gid=", "-p", strconv.Itoa(pid)).Output()
-	if err != nil {
-		return 0, fmt.Errorf("ps gid for pid %d: %w", pid, err)
-	}
-	g, err := strconv.Atoi(strings.TrimSpace(string(out)))
-	if err != nil {
-		return 0, fmt.Errorf("parse gid for pid %d: %w", pid, err)
-	}
-	return g, nil
+	return c, nil
 }
 
 // processExistsReal probes liveness with kill(pid, 0). ESRCH → gone; any other
@@ -574,27 +574,29 @@ func expectedBuilderGID(shellGID int) (int, error) {
 }
 
 // AssertHostedPaneUID proves shell, foreground inventory, process-group
-// members, and shell descendants all run as wantUID with non-empty start
-// tokens and a homogeneous primary GID (capability hosted_process_gid).
-func AssertHostedPaneUID(paneID string, wantUID int) error {
+// members, and shell descendants all run as wantUID (real+effective) with
+// non-empty start tokens and homogeneous real+effective GID.
+// Returns wantGID for the agent-owner proof so GID checks are not re-derived
+// from the subject process (avoids tautology when HERD_BUILDER_GID is unset).
+func AssertHostedPaneUID(paneID string, wantUID int) (wantGID int, err error) {
 	if wantUID <= 0 {
-		return fmt.Errorf("%w: invalid want uid", ErrHostedUIDConfig)
+		return 0, fmt.Errorf("%w: invalid want uid", ErrHostedUIDConfig)
 	}
 	info, err := GetHostedPaneIdentity(paneID)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	if info.ShellPID <= 0 {
-		return fmt.Errorf("%w: pane %s has no shell_pid", ErrHostedUIDProofFailed, paneID)
+		return 0, fmt.Errorf("%w: pane %s has no shell_pid", ErrHostedUIDProofFailed, paneID)
 	}
 	if strings.TrimSpace(info.ShellStart) == "" {
-		return fmt.Errorf("%w: shell pid %d missing start token", ErrHostedUIDProofFailed, info.ShellPID)
+		return 0, fmt.Errorf("%w: shell pid %d missing start token", ErrHostedUIDProofFailed, info.ShellPID)
 	}
 	if len(info.Foreground) == 0 {
-		return fmt.Errorf("%w: pane %s has empty foreground inventory", ErrHostedUIDProofFailed, paneID)
+		return 0, fmt.Errorf("%w: pane %s has empty foreground inventory", ErrHostedUIDProofFailed, paneID)
 	}
 	if len(info.Tree) == 0 {
-		return fmt.Errorf("%w: pane %s has empty isolation tree", ErrHostedUIDProofFailed, paneID)
+		return 0, fmt.Errorf("%w: pane %s has empty isolation tree", ErrHostedUIDProofFailed, paneID)
 	}
 	shell := HostedProcessIdentity{}
 	for _, p := range info.Tree {
@@ -603,37 +605,70 @@ func AssertHostedPaneUID(paneID string, wantUID int) error {
 			break
 		}
 	}
-	wantGID, err := expectedBuilderGID(shell.GID)
+	wantGID, err = expectedBuilderGID(shell.EGID)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	for _, p := range info.Tree {
 		if strings.TrimSpace(p.StartToken) == "" {
-			return fmt.Errorf("%w: pid %d missing start token", ErrHostedUIDProofFailed, p.PID)
+			return 0, fmt.Errorf("%w: pid %d missing start token", ErrHostedUIDProofFailed, p.PID)
 		}
-		if p.UID != wantUID {
-			return fmt.Errorf("%w: hosted process pid %d uid=%d want BuilderUID=%d role=%s (CLI setuid is not isolation)",
-				ErrHostedUIDProofFailed, p.PID, p.UID, wantUID, p.Role)
+		// Real and effective must both match — seteuid-only is not isolation.
+		if p.RUID != wantUID || p.EUID != wantUID {
+			return 0, fmt.Errorf("%w: hosted process pid %d ruid=%d euid=%d want BuilderUID=%d role=%s (seteuid-only is not isolation)",
+				ErrHostedUIDProofFailed, p.PID, p.RUID, p.EUID, wantUID, p.Role)
 		}
-		if p.GID != wantGID {
-			return fmt.Errorf("%w: hosted process pid %d gid=%d want BuilderGID=%d role=%s",
-				ErrHostedUIDProofFailed, p.PID, p.GID, wantGID, p.Role)
+		if p.RGID != wantGID || p.EGID != wantGID {
+			return 0, fmt.Errorf("%w: hosted process pid %d rgid=%d egid=%d want BuilderGID=%d role=%s",
+				ErrHostedUIDProofFailed, p.PID, p.RGID, p.EGID, wantGID, p.Role)
 		}
 	}
-	return nil
+	return wantGID, nil
+}
+
+// isHostedUIDReadinessError is true when the agent/process inventory is not
+// yet populated after agent start (async herdr state) — safe to poll/retry.
+func isHostedUIDReadinessError(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	return strings.Contains(s, "not found") ||
+		strings.Contains(s, "has 0 exact routed") ||
+		strings.Contains(s, "exact routed agent processes")
 }
 
 // AssertAgentHostedAsBuilder proves the exact routed agent process (and its
-// wrapper parent when required) runs as BuilderUID. Callers that already ran
-// AssertHostedPaneUID do not re-walk the full isolation tree here — only the
-// routed owner match (provider/argv) and UID/start-token on that owner.
-func AssertAgentHostedAsBuilder(agentName string, builderUID int, provider string, argv []string) error {
+// wrapper parent when required) runs as BuilderUID with real+effective IDs.
+// wantGID must come from AssertHostedPaneUID (not re-derived from the agent).
+// Polls the same readiness window as bindToolChildLifecycle (async agent list).
+func AssertAgentHostedAsBuilder(agentName string, builderUID, wantGID int, provider string, argv []string) error {
 	if builderUID <= 0 {
 		return fmt.Errorf("%w: invalid builder uid", ErrHostedUIDConfig)
+	}
+	if wantGID <= 0 {
+		return fmt.Errorf("%w: invalid builder gid from pane proof", ErrHostedUIDConfig)
 	}
 	if strings.TrimSpace(agentName) == "" || strings.TrimSpace(provider) == "" || len(argv) == 0 {
 		return fmt.Errorf("%w: agent name, provider, and argv required for agent lineage proof", ErrHostedUIDProofFailed)
 	}
+	var last error
+	for attempt := 0; attempt < agentReadyTries; attempt++ {
+		last = assertAgentHostedAsBuilderOnce(agentName, builderUID, wantGID, provider, argv)
+		if last == nil {
+			return nil
+		}
+		if !isHostedUIDReadinessError(last) {
+			return last
+		}
+		if attempt+1 < agentReadyTries {
+			agentReadySleep()
+		}
+	}
+	return last
+}
+
+func assertAgentHostedAsBuilderOnce(agentName string, builderUID, wantGID int, provider string, argv []string) error {
 	agents, err := AgentList()
 	if err != nil {
 		return err
@@ -675,50 +710,45 @@ func AssertAgentHostedAsBuilder(agentName string, builderUID int, provider strin
 		}
 		return fmt.Errorf("%w: agent start token pid %d: %v", ErrHostedUIDObserve, p.PID, err)
 	}
-	uid, err := processUIDOf(p.PID)
+	creds, err := processCredsOf(p.PID)
 	if err != nil {
-		return fmt.Errorf("%w: agent uid pid %d: %v", ErrHostedUIDProofFailed, p.PID, err)
+		return fmt.Errorf("%w: agent creds pid %d: %v", ErrHostedUIDProofFailed, p.PID, err)
 	}
-	if uid != builderUID {
-		return fmt.Errorf("%w: agent pid %d uid=%d want BuilderUID=%d", ErrHostedUIDProofFailed, p.PID, uid, builderUID)
+	if creds.RUID != builderUID || creds.EUID != builderUID {
+		return fmt.Errorf("%w: agent pid %d ruid=%d euid=%d want BuilderUID=%d", ErrHostedUIDProofFailed, p.PID, creds.RUID, creds.EUID, builderUID)
 	}
-	gid, err := processGIDOf(p.PID)
-	if err != nil {
-		return fmt.Errorf("%w: agent gid pid %d: %v", ErrHostedUIDProofFailed, p.PID, err)
-	}
-	wantGID, err := expectedBuilderGID(gid)
-	if err != nil {
-		return err
-	}
-	if gid != wantGID {
-		return fmt.Errorf("%w: agent pid %d gid=%d want BuilderGID=%d", ErrHostedUIDProofFailed, p.PID, gid, wantGID)
+	if creds.RGID != wantGID || creds.EGID != wantGID {
+		return fmt.Errorf("%w: agent pid %d rgid=%d egid=%d want BuilderGID=%d", ErrHostedUIDProofFailed, p.PID, creds.RGID, creds.EGID, wantGID)
 	}
 	parent, err := readParent(p.PID)
 	if err != nil {
 		return fmt.Errorf("%w: agent parent pid %d: %v", ErrHostedUIDProofFailed, p.PID, err)
 	}
-	if strings.EqualFold(provider, "codex") {
-		if len(wrappers) != 1 || parent != wrappers[0].PID {
+	// Pi (and node-wrapped providers) require exact wrapper parent when present.
+	if strings.EqualFold(provider, "codex") || strings.EqualFold(provider, "pi") {
+		if len(wrappers) == 1 {
+			if parent != wrappers[0].PID {
+				return fmt.Errorf("%w: agent requires exact node wrapper parent", ErrHostedUIDProofFailed)
+			}
+			w := wrappers[0]
+			wTok, err := readStartTok(w.PID)
+			if err != nil || strings.TrimSpace(wTok) == "" {
+				return fmt.Errorf("%w: wrapper start token pid %d: %v", ErrHostedUIDProofFailed, w.PID, err)
+			}
+			wCreds, err := processCredsOf(w.PID)
+			if err != nil {
+				return fmt.Errorf("%w: wrapper creds pid %d: %v", ErrHostedUIDProofFailed, w.PID, err)
+			}
+			if wCreds.RUID != builderUID || wCreds.EUID != builderUID {
+				return fmt.Errorf("%w: wrapper pid %d ruid=%d euid=%d want BuilderUID=%d", ErrHostedUIDProofFailed, w.PID, wCreds.RUID, wCreds.EUID, builderUID)
+			}
+			if wCreds.RGID != wantGID || wCreds.EGID != wantGID {
+				return fmt.Errorf("%w: wrapper pid %d rgid=%d egid=%d want BuilderGID=%d", ErrHostedUIDProofFailed, w.PID, wCreds.RGID, wCreds.EGID, wantGID)
+			}
+		} else if strings.EqualFold(provider, "codex") && len(wrappers) != 1 {
 			return fmt.Errorf("%w: codex agent requires exact node wrapper parent", ErrHostedUIDProofFailed)
-		}
-		w := wrappers[0]
-		wTok, err := readStartTok(w.PID)
-		if err != nil || strings.TrimSpace(wTok) == "" {
-			return fmt.Errorf("%w: wrapper start token pid %d: %v", ErrHostedUIDProofFailed, w.PID, err)
-		}
-		wUID, err := processUIDOf(w.PID)
-		if err != nil {
-			return fmt.Errorf("%w: wrapper uid pid %d: %v", ErrHostedUIDProofFailed, w.PID, err)
-		}
-		if wUID != builderUID {
-			return fmt.Errorf("%w: wrapper pid %d uid=%d want BuilderUID=%d", ErrHostedUIDProofFailed, w.PID, wUID, builderUID)
-		}
-		wGID, err := processGIDOf(w.PID)
-		if err != nil {
-			return fmt.Errorf("%w: wrapper gid pid %d: %v", ErrHostedUIDProofFailed, w.PID, err)
-		}
-		if wGID != wantGID {
-			return fmt.Errorf("%w: wrapper pid %d gid=%d want BuilderGID=%d", ErrHostedUIDProofFailed, w.PID, wGID, wantGID)
+		} else if len(wrappers) > 1 {
+			return fmt.Errorf("%w: provider process has ambiguous node wrappers", ErrHostedUIDProofFailed)
 		}
 	} else if len(wrappers) > 1 {
 		return fmt.Errorf("%w: provider process has ambiguous node wrappers", ErrHostedUIDProofFailed)
