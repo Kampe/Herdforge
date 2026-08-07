@@ -1,199 +1,160 @@
-// Package park ports bin/herd-park: make parked work DURABLE, and audit
-// whether it already is.
-//
-// A lane parks unfinished work as a `wip(parked):` commit on its branch. That
-// commit's only ref is then refs/heads/<branch>. The next thing that happens to
-// a lane after a harvest is a `reset --hard` to origin/main — at that moment the
-// parked commit becomes reflog-only, and a `git gc` deletes it for good.
-//
-// chainseer observed this twice in one hour on 2026-07-25: one lane's parked
-// work survived only in the reflog, and three others sat in the same exposure
-// unnoticed, because a `wip(parked):` commit LOOKS preserved.
-//
-// Three properties make parked work durable, and a branch has none of them:
-//
-//  1. A TAG, not a branch — a rebase or reset moves a branch, never a tag.
-//  2. ANNOTATED, so resume context travels with the object instead of living in
-//     a chat message that scrolls away.
-//  3. PUSHED, so it survives local gc, worktree removal, and a fresh clone.
-//
-// Audit is the important verb: it answers "is anything parked reachable from
-// nothing but a branch", and it exits non-zero so a heartbeat can surface it
-// without a human remembering to look.
 package park
 
 import (
+	"context"
 	"fmt"
 	"os/exec"
+	"regexp"
 	"strings"
 )
 
-// Durability classifies one parked commit.
-type Durability string
-
-const (
-	// Durable: reachable from a tag that exists on the remote.
-	Durable Durability = "DURABLE"
-	// LocalTagOnly: tagged, but the tag was never pushed. Survives a reset,
-	// not a fresh clone or a lost checkout.
-	LocalTagOnly Durability = "LOCAL-TAG-ONLY"
-	// Exposed: reachable from a branch and nothing else. One reset --hard
-	// from gone.
-	Exposed Durability = "EXPOSED"
+var (
+	reNonAlphaNum = regexp.MustCompile(`[^a-zA-Z0-9]+`)
+	reMultiDash   = regexp.MustCompile(`-{2,}`)
 )
 
-// Finding is one parked commit and how exposed it is.
-type Finding struct {
-	SHA        string
-	Branch     string
-	Subject    string
-	Tags       []string
-	Durability Durability
+var execCommandContext = exec.CommandContext
+
+type ParkOptions struct {
+	RepoRoot  string
+	SignFirst bool
 }
 
-// TagPrefix is the namespace for durable park tags.
-const TagPrefix = "parked/"
+type ParkResult struct {
+	Tag      string `json:"tag"`
+	ShortSHA string `json:"short_sha"`
+	Signed   bool   `json:"signed"`
+	// SignWarning is set only when SignFirst attempted a signed tag, that
+	// attempt failed, and the unsigned fallback succeeded instead. It
+	// carries the signer's error plus the exact re-sign command; the
+	// caller (cmd/herd) owns printing it, not this package.
+	SignWarning string `json:"sign_warning,omitempty"`
+}
 
-// Repo runs git in one checkout.
-type Repo struct{ Dir string }
+var (
+	ErrNotCommit       = fmt.Errorf("is not a commit")
+	ErrPushFailed      = fmt.Errorf("push failed")
+	ErrMessageRequired = fmt.Errorf("message required")
+)
 
-func (r Repo) git(args ...string) (string, error) {
-	cmd := exec.Command("git", args...)
-	cmd.Dir = r.Dir
+func Slugify(s string) string {
+	return slug(s)
+}
+
+func slug(s string) string {
+	s = strings.TrimSpace(s)
+	s = strings.ToLower(s)
+	s = reNonAlphaNum.ReplaceAllString(s, "-")
+	s = reMultiDash.ReplaceAllString(s, "-")
+	s = strings.Trim(s, "-")
+	if len(s) > 40 {
+		s = s[:40]
+	}
+	return strings.Trim(s, "-")
+}
+
+func revParse(ctx context.Context, repoRoot, ref string) (string, error) {
+	cmd := execCommandContext(ctx, "git", "rev-parse", ref)
+	cmd.Dir = repoRoot
 	out, err := cmd.Output()
-	return strings.TrimSpace(string(out)), err
-}
-
-// IsParkedSubject matches the commit subjects that mark deliberately
-// unfinished work. Anything else on a branch is ordinary in-flight work and is
-// not park's business.
-func IsParkedSubject(subject string) bool {
-	s := strings.ToLower(strings.TrimSpace(subject))
-	return strings.HasPrefix(s, "wip(parked)") ||
-		strings.HasPrefix(s, "wip:") ||
-		strings.HasPrefix(s, "parked:")
-}
-
-// Classify decides how durable a parked commit is. Pure, so the policy is
-// testable without a repository.
-func Classify(tags []string, pushed bool) Durability {
-	switch {
-	case len(tags) == 0:
-		return Exposed
-	case !pushed:
-		return LocalTagOnly
-	default:
-		return Durable
-	}
-}
-
-// Audit reports every parked commit and its durability. Branches are scanned
-// against origin/main; a commit already on main is not parked work.
-func (r Repo) Audit() ([]Finding, error) {
-	branches, err := r.git("for-each-ref", "--format=%(refname:short)", "refs/heads/")
 	if err != nil {
-		return nil, fmt.Errorf("park: list branches: %w", err)
+		return "", err
 	}
-	seen := map[string]bool{}
-	var findings []Finding
-
-	for _, b := range strings.Split(branches, "\n") {
-		b = strings.TrimSpace(b)
-		if b == "" || b == "main" {
-			continue
-		}
-		log, err := r.git("log", "--format=%h%x09%s", "origin/main.."+b)
-		if err != nil || log == "" {
-			continue
-		}
-		for _, line := range strings.Split(log, "\n") {
-			sha, subject, ok := strings.Cut(line, "\t")
-			if !ok || sha == "" || !IsParkedSubject(subject) || seen[sha] {
-				continue
-			}
-			seen[sha] = true
-			tags := r.tagsContaining(sha)
-			findings = append(findings, Finding{
-				SHA: sha, Branch: b, Subject: subject, Tags: tags,
-				Durability: Classify(tags, r.anyTagPushed(tags)),
-			})
-		}
-	}
-	return findings, nil
+	return strings.TrimSpace(string(out)), nil
 }
 
-func (r Repo) tagsContaining(sha string) []string {
-	out, err := r.git("for-each-ref", "--contains", sha, "--format=%(refname:short)", "refs/tags/")
-	if err != nil || out == "" {
-		return nil
-	}
-	var tags []string
-	for _, t := range strings.Split(out, "\n") {
-		if t = strings.TrimSpace(t); t != "" {
-			tags = append(tags, t)
-		}
-	}
-	return tags
-}
-
-func (r Repo) anyTagPushed(tags []string) bool {
-	for _, t := range tags {
-		if _, err := r.git("ls-remote", "--exit-code", "--tags", "origin", t); err == nil {
-			return true
-		}
-	}
-	return false
-}
-
-// ExposedCount is how many findings are not durable. Callers exit non-zero on
-// a positive count so a heartbeat surfaces the exposure automatically.
-func ExposedCount(findings []Finding) int {
-	n := 0
-	for _, f := range findings {
-		if f.Durability != Durable {
-			n++
-		}
-	}
-	return n
-}
-
-// Park makes one commit durable: annotated tag, then push. The push is part of
-// the operation, not a follow-up — a local-only tag still dies with the
-// checkout, which is one of the three failure modes this exists to prevent.
-func (r Repo) Park(slug, sha, message string) (string, error) {
-	if strings.TrimSpace(slug) == "" || strings.TrimSpace(sha) == "" {
-		return "", fmt.Errorf("park: slug and sha are required")
-	}
-	if strings.TrimSpace(message) == "" {
-		return "", fmt.Errorf("park: -m <message> is required; the resume context must travel with the tag")
-	}
-	if _, err := r.git("rev-parse", "--verify", "--quiet", sha+"^{commit}"); err != nil {
-		return "", fmt.Errorf("park: %s is not a commit in this repository", sha)
-	}
-	tag := TagPrefix + slug
-	if _, err := r.git("rev-parse", "--verify", "--quiet", "refs/tags/"+tag); err == nil {
-		return "", fmt.Errorf("park: tag %s already exists; choose another slug rather than moving a durable tag", tag)
-	}
-	if _, err := r.git("tag", "-a", tag, sha, "-m", message); err != nil {
-		return "", fmt.Errorf("park: annotate %s: %w", tag, err)
-	}
-	if _, err := r.git("push", "origin", "refs/tags/"+tag); err != nil {
-		return tag, fmt.Errorf("park: tagged %s locally but PUSH FAILED — still exposed to local gc: %w", tag, err)
-	}
-	return tag, nil
-}
-
-// List returns every park tag with its subject.
-func (r Repo) List() ([]string, error) {
-	out, err := r.git("for-each-ref", "--format=%(refname:short)%09%(contents:subject)", "refs/tags/"+TagPrefix+"*")
+func verifyCommit(ctx context.Context, repoRoot, sha string) (string, error) {
+	full, err := revParse(ctx, repoRoot, sha+"^{commit}")
 	if err != nil {
-		return nil, err
+		return "", ErrNotCommit
 	}
-	var rows []string
-	for _, l := range strings.Split(out, "\n") {
-		if l = strings.TrimSpace(l); l != "" {
-			rows = append(rows, l)
+	return full, nil
+}
+
+// createTag runs `git tag -f -m <msg> <tag> <sha>`, optionally forcing
+// unsigned mode via `-c tag.gpgSign=false` ahead of it.
+func createTag(ctx context.Context, repoRoot string, unsigned bool, msg, tag, sha string) ([]byte, error) {
+	args := []string{"tag", "-f", "-m", msg, tag, sha}
+	if unsigned {
+		args = append([]string{"-c", "tag.gpgSign=false"}, args...)
+	}
+	cmd := execCommandContext(ctx, "git", args...)
+	cmd.Dir = repoRoot
+	return cmd.CombinedOutput()
+}
+
+func signWarningText(tag, sha, msg string, signerOut []byte) string {
+	allLines := strings.Split(strings.TrimSpace(string(signerOut)), "\n")
+	if len(allLines) > 2 {
+		allLines = allLines[:2]
+	}
+	warnLines := strings.Join(allLines, "\n")
+	return fmt.Sprintf(
+		"could not SIGN %s, created it UNSIGNED so the park is not lost.\n"+
+			"  signer said: %s\n"+
+			"  Re-sign once the agent is back: git tag -f -a -m '%s' %s %s && git push --force origin refs/tags/%s",
+		tag, warnLines, msg, tag, sha, tag)
+}
+
+func shortenSHA(sha string) string {
+	if len(sha) > 7 {
+		return sha[:7]
+	}
+	return sha
+}
+
+// Park makes committed-but-unfinished work durable: it creates an annotated
+// tag parked/<slug> at <sha> (falling back to unsigned when the signing
+// agent is dead so the park is never lost), verifies the tag artifact
+// actually points at <sha>, and force-pushes it to origin. Park never
+// writes to stdout/stderr itself — all user-facing output (WARN text,
+// success messages, JSON) is the caller's responsibility.
+func Park(ctx context.Context, opts ParkOptions, slug, sha, msg string) (*ParkResult, error) {
+	if strings.TrimSpace(msg) == "" {
+		return nil, fmt.Errorf("%w: -m <message> is required. Say what is DONE, what is NOT, and the exact next step; a resume note that lives only in chat is gone by the next session", ErrMessageRequired)
+	}
+
+	fullCommitSHA, err := verifyCommit(ctx, opts.RepoRoot, sha)
+	if err != nil {
+		return nil, fmt.Errorf("herd-park: '%s' %w", sha, err)
+	}
+
+	tag := fmt.Sprintf("parked/%s", strings.TrimPrefix(slug, "parked/"))
+
+	var signed bool
+	var signWarning string
+
+	if opts.SignFirst {
+		signOut, signErr := createTag(ctx, opts.RepoRoot, false, msg, tag, fullCommitSHA)
+		if signErr == nil {
+			signed = true
+		} else if unsignOut, unsignErr := createTag(ctx, opts.RepoRoot, true, msg, tag, fullCommitSHA); unsignErr != nil {
+			return nil, fmt.Errorf("herd-park: both signed and unsigned tag creation failed\nsigned error: %v\nsigned output: %s\nunsigned error: %v\nunsigned output: %s", signErr, string(signOut), unsignErr, string(unsignOut))
+		} else {
+			signWarning = signWarningText(tag, fullCommitSHA, msg, signOut)
 		}
+	} else if _, err := createTag(ctx, opts.RepoRoot, true, msg, tag, fullCommitSHA); err != nil {
+		return nil, fmt.Errorf("herd-park: tag creation failed: %w", err)
 	}
-	return rows, nil
+
+	// Verify the artifact, not the command: tag^{commit} must match the
+	// exact commit SHA requested, or refuse to claim the park.
+	tagCommit, err := revParse(ctx, opts.RepoRoot, "refs/tags/"+tag+"^{commit}")
+	if err != nil {
+		return nil, fmt.Errorf("herd-park: cannot verify tag target: %w", err)
+	}
+	if tagCommit != fullCommitSHA {
+		return nil, fmt.Errorf("herd-park: %s does not point at %s after creation; refusing to claim a park", tag, sha)
+	}
+
+	res := &ParkResult{Tag: tag, ShortSHA: shortenSHA(fullCommitSHA), Signed: signed, SignWarning: signWarning}
+
+	pushCmd := execCommandContext(ctx, "git", "push", "-q", "--force", "origin", "refs/tags/"+tag)
+	pushCmd.Dir = opts.RepoRoot
+	if pushOut, pushErr := pushCmd.CombinedOutput(); pushErr != nil {
+		return res, fmt.Errorf("%w: %s created locally but the PUSH FAILED; it is not durable yet. Retry: git push --force origin refs/tags/%s (push error: %v; output: %s)",
+			ErrPushFailed, tag, tag, pushErr, strings.TrimSpace(string(pushOut)))
+	}
+
+	return res, nil
 }
