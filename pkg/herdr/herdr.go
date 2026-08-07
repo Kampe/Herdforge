@@ -924,7 +924,11 @@ func TabCreate(opts TabCreateOptions) (*TabInfo, error) {
 // shell as BuilderUID. Capability negotiation is structured only; TabCreate
 // proves shell/process-group/descendant UIDs after create. Proof failure
 // terminates start-token-bound PIDs (procsignal) and closes the orphan tab.
-func TabCreateForTask(workspaceID, label, cwd string, noFocus bool) (*TabInfo, error) {
+//
+// Optional env entries are KEY=VALUE pairs passed to herdr tab create --env
+// (FAC-190: PATH must put the confinement agent wrapper first). HostedUID
+// launch env is appended after caller env when isolation is required.
+func TabCreateForTask(workspaceID, label, cwd string, noFocus bool, env ...string) (*TabInfo, error) {
 	cwd = strings.TrimSpace(cwd)
 	if cwd == "" {
 		return nil, fmt.Errorf("herdr tab create: cwd is required for task agents")
@@ -945,6 +949,7 @@ func TabCreateForTask(workspaceID, label, cwd string, noFocus bool) (*TabInfo, e
 		Label:     label,
 		Cwd:       abs,
 		NoFocus:   noFocus,
+		Env:       append([]string(nil), env...),
 	}
 	if HostedUIDIsolationRequired() {
 		bUID, err := BuilderUID()
