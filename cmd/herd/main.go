@@ -1635,6 +1635,21 @@ func runReview() {
 		os.Exit(1)
 	}
 
+	// FAC-144: RequireCurrentPassing before any reviewer tab is created.
+	// CheckCompletion is not sufficient authority for review spawn.
+	wt := worktreePathForRef(task.Ref)
+	if !worktreeExists(wt) {
+		// Fall back to configured reviewer lane worktree only for
+		// isolated standing reviewers — still require admission against
+		// the task worktree when present.
+		fmt.Fprintf(os.Stderr, "review: no task worktree at %s — cannot admit verification receipt\n", wt)
+		os.Exit(1)
+	}
+	if err := admitWorktreeForReview(ctx, cfg, task.Ref, wt, ""); err != nil {
+		fmt.Fprintf(os.Stderr, "review: receipt admission refused for %s: %v\n", task.Ref, err)
+		os.Exit(1)
+	}
+
 	lane := findLaneForRole(cfg, "reviewer")
 	if lane == nil {
 		fmt.Fprintf(os.Stderr, "no lane configured for role 'reviewer'\n")
@@ -5061,9 +5076,10 @@ func (d *cliForgeDriver) LaneState(ctx context.Context) (daemon.LaneState, error
 }
 
 // Signals: a card is completed when its builder agent exists and is no longer
-// working; it is verified when herd verify passes on its worktree. An
-// unreadable fleet yields an error, never an empty (and so drained-looking)
-// signal set.
+// working; it is verified only when FAC-144 completion admission produces a
+// current PASS receipt (VerifyAndPersist + lifecycle evidence). CheckCompletion
+// is never review authority. An unreadable fleet yields an error, never an
+// empty (and so drained-looking) signal set (FAC-138).
 func (d *cliForgeDriver) Signals(ctx context.Context) (map[string]bool, map[string]bool, error) {
 	completed := map[string]bool{}
 	verified := map[string]bool{}
@@ -5071,7 +5087,6 @@ func (d *cliForgeDriver) Signals(ctx context.Context) (map[string]bool, map[stri
 	if err != nil {
 		return nil, nil, fmt.Errorf("herdr agent list: %w", err)
 	}
-	v := verifier.NewVerifier("")
 	for _, a := range agents {
 		if !strings.HasPrefix(a.Name, "task-fac-") {
 			continue
@@ -5081,12 +5096,22 @@ func (d *cliForgeDriver) Signals(ctx context.Context) (map[string]bool, map[stri
 		}
 		ref := strings.ToUpper(strings.TrimPrefix(a.Name, "task-"))
 		completed[ref] = true
-		wt := filepath.Join(".herd", "worktrees", strings.ToLower(ref))
-		if fi, err := os.Stat(wt); err == nil && fi.IsDir() {
-			c := v.CheckCompletion(ctx, wt, "go build ./...", "go test ./...")
-			if c.Passed {
-				verified[ref] = true
+		wt := worktreePathForRef(ref)
+		if !worktreeExists(wt) {
+			continue
+		}
+		ready, digest, reason, verr := verifyWorktreeForReview(ctx, d.cfg, ref, wt)
+		if verr != nil {
+			d.Log(fmt.Sprintf("forge: verify %s hard-failed: %v", ref, verr))
+			continue
+		}
+		if ready {
+			verified[ref] = true
+			if digest != "" {
+				d.Log(fmt.Sprintf("forge: %s verification PASS digest=%s", ref, digest))
 			}
+		} else if reason != "" {
+			d.Log(fmt.Sprintf("forge: %s not review-ready: %s", ref, reason))
 		}
 	}
 	return completed, verified, nil
@@ -5138,6 +5163,15 @@ func (d *cliForgeDriver) Dispatch(ctx context.Context, t *provider.Task) error {
 }
 
 func (d *cliForgeDriver) Review(ctx context.Context, t *provider.Task) error {
+	// FAC-144: re-admit with RequireCurrentPassing before spawning review.
+	// A Signals-time PASS is not sufficient if the candidate moved.
+	wt := worktreePathForRef(t.Ref)
+	if !worktreeExists(wt) {
+		return fmt.Errorf("review %s: worktree missing", t.Ref)
+	}
+	if err := admitWorktreeForReview(ctx, d.cfg, t.Ref, wt, ""); err != nil {
+		return fmt.Errorf("review %s refused without current PASS receipt: %w", t.Ref, err)
+	}
 	// --spawn BEFORE the ref: flag.Parse stops at the first positional, so the
 	// old trailing form silently parsed spawn=false and no reviewer ever
 	// started. runReview now also normalizes the order (FAC-138).
