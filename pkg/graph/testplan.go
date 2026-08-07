@@ -124,6 +124,16 @@ type PlanInput struct {
 	ChangedSymbols []string            `json:"changed_symbols,omitempty"`
 	Graph          GraphEvidence       `json:"graph"`
 	Profile        VerificationProfile `json:"profile"`
+	// ForceEscalate, when non-empty, broadens the plan to the full profile
+	// regardless of the change set. Callers set it when graph integrity cannot
+	// be proven, so a rejected index yields broader verification rather than an
+	// empty targeted plan.
+	ForceEscalate string `json:"force_escalate,omitempty"`
+	// GraphAnchorSHA is the revision the index must be built at for its hits to
+	// count as fresh. Empty keeps the FAC-94 default of BaseSHA. herd tests-for
+	// sets it to CandidateSHA: an edge about a symbol introduced by the
+	// candidate can only exist in an index built on the candidate tree.
+	GraphAnchorSHA string `json:"graph_anchor_sha,omitempty"`
 }
 
 // TestPlan is the deterministic targeted verification plan.
@@ -191,13 +201,17 @@ func Plan(in PlanInput) (*TestPlan, error) {
 	symbols := uniqueSortedStrings(in.ChangedSymbols)
 	packages := packagesForPaths(paths, prof.Language)
 
-	graphState, graphBuilt := classifyGraph(in.Graph, base)
+	anchor := strings.TrimSpace(in.GraphAnchorSHA)
+	if anchor == "" {
+		anchor = base
+	}
+	graphState, graphBuilt := classifyGraph(in.Graph, anchor)
 	if prof.RequireFreshGraph {
 		switch graphState {
 		case GraphMissing:
 			return nil, errors.New("graph unavailable: require_fresh_graph is set")
 		case GraphStale:
-			return nil, fmt.Errorf("graph stale (built_at=%s base=%s): require_fresh_graph is set", graphBuilt, base)
+			return nil, fmt.Errorf("graph stale (built_at=%s anchor=%s): require_fresh_graph is set", graphBuilt, anchor)
 		case GraphUnsupported:
 			return nil, errors.New("graph unsupported_language: require_fresh_graph is set")
 		}
@@ -212,7 +226,7 @@ func Plan(in PlanInput) (*TestPlan, error) {
 	case GraphMissing:
 		caveats = append(caveats, "graph evidence unavailable; owner-package filters only; missing edges never prove coverage")
 	case GraphStale:
-		caveats = append(caveats, fmt.Sprintf("graph available but stale (built_at=%s, base=%s); refresh before trusting hits", graphBuilt, base))
+		caveats = append(caveats, fmt.Sprintf("graph available but stale (built_at=%s, anchor=%s); refresh before trusting hits", graphBuilt, anchor))
 	case GraphUnsupported:
 		caveats = append(caveats, "graph does not support this language; owner-package filters only")
 	default:
@@ -222,6 +236,9 @@ func Plan(in PlanInput) (*TestPlan, error) {
 	// Escalation: high-risk paths, public symbols, or uncertain impact.
 	if reasons := escalationFor(paths, symbols, graphState); len(reasons) > 0 {
 		escalateReasons = append(escalateReasons, reasons...)
+	}
+	if forced := strings.TrimSpace(in.ForceEscalate); forced != "" {
+		escalateReasons = append(escalateReasons, "forced escalation: "+forced)
 	}
 
 	// Build command list deterministically: stages in fixed order, packages
@@ -284,6 +301,14 @@ func Plan(in PlanInput) (*TestPlan, error) {
 	// Graph-derived tests only when graph is available and fresh.
 	if graphState == GraphAvailable {
 		testHits, consumerPkgs := partitionHits(in.Graph.Hits, packages, prof.Language)
+		// A complete, revision-bound index that still has no tests_for edge for
+		// a changed exported production symbol is uncovered surface, not proof
+		// of coverage: broaden to consumer/blackbox/full instead of shipping a
+		// targeted plan that exercises nothing.
+		if len(testHits) == 0 && looksExported(symbols) && hasProductionCode(paths) {
+			escalateReasons = append(escalateReasons,
+				"no graph tests_for edges for changed exported production symbols")
+		}
 		for _, hit := range testHits {
 			pkg := packageForPath(hit.FilePath, prof.Language)
 			if pkg == "" || len(prof.PackageTest) == 0 {
@@ -308,7 +333,9 @@ func Plan(in PlanInput) (*TestPlan, error) {
 		add(StageMutation, argv, "profile mutation", "profile")
 	}
 
-	// Escalation: full suite + blackbox when required.
+	// Escalation: full suite + blackbox when required. Re-normalize because
+	// the graph pass may append after escalationFor already sorted.
+	escalateReasons = uniqueSortedStrings(escalateReasons)
 	escalated := len(escalateReasons) > 0
 	if escalated {
 		for _, argv := range prof.Full {

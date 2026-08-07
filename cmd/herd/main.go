@@ -336,6 +336,9 @@ func main() {
 		// FAC-170 production caller (independent of FAC-133 WIP).
 		runHostCreds()
 
+	case "tests-for":
+		runTestsFor()
+
 	default:
 		fmt.Fprintf(os.Stderr, "unknown subcommand '%s'\nRun 'herd --help' for usage.\n", command)
 		os.Exit(1)
@@ -401,6 +404,7 @@ func printUsage() {
 	fmt.Println("  next            Show highest-priority next action")
 	fmt.Println("  dispatch        Dispatch a ticket to a worktree and launch agent")
 	fmt.Println("  deps            Packet↔board dependency-graph conformance (FAC-159)")
+	fmt.Println("  tests-for       Targeted verification plan for <base>..<candidate>, gated on graph completeness (FAC-160)")
 	fmt.Println("  harvest         Sweep all worktrees for unmerged commits")
 	fmt.Println("  unmerged        Authoritative cherry-based unmerged check (herd unmerged <path> | --all)")
 	fmt.Println("  lost            Find ownerless unmerged work on ANY branch (subject-based)")

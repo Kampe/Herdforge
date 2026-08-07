@@ -131,7 +131,7 @@ func TestKnownSubcommandsCoverRoutedCommands(t *testing.T) {
 		"harvest", "unmerged", "lost", "throughput", "worktrees", "overlap",
 		"attention", "process", "resolve-lane", "route", "kick", "lifecycle",
 		"resources", "lock", "reset-safe", "verify", "tool-probe", "shoot",
-		"review-ledger", "repl", "fresh-build",
+		"review-ledger", "repl", "fresh-build", "tests-for",
 	}
 	for _, name := range required {
 		if _, ok := subcommandUsage[name]; !ok {

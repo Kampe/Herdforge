@@ -10,9 +10,12 @@ import (
 // to decide freshness. Extra fields are ignored.
 type GraphStatusReport struct {
 	BuiltAtCommit string `json:"built_at_commit"`
-	Nodes         int    `json:"nodes"`
-	Edges         int    `json:"edges"`
-	Files         int    `json:"files"`
+	// CurrentSHA is the revision the working tree is on right now. It differs
+	// from BuiltAtCommit whenever the tree moved after the last index run.
+	CurrentSHA string `json:"current_sha"`
+	Nodes      int    `json:"nodes"`
+	Edges      int    `json:"edges"`
+	Files      int    `json:"files"`
 }
 
 // ParseGraphStatusJSON decodes a code-review-graph status --json body.
@@ -26,6 +29,7 @@ func ParseGraphStatusJSON(raw []byte) (GraphStatusReport, error) {
 		return r, fmt.Errorf("decode graph status: %w", err)
 	}
 	r.BuiltAtCommit = strings.TrimSpace(r.BuiltAtCommit)
+	r.CurrentSHA = strings.TrimSpace(r.CurrentSHA)
 	return r, nil
 }
 
