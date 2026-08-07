@@ -232,7 +232,7 @@ func (s *InMemoryLeaseStore) ObserveStaleProviderLock(_ context.Context, key Lea
 	if p.owner == "" || p.lockedAt.IsZero() {
 		return nil, fmt.Errorf("incoherent provider lock")
 	}
-	if p.kind == providerLockKindOrdinary && !p.lockedAt.Before(now.Add(-5*time.Minute)) {
+	if p.kind == providerLockKindOrdinary && !p.lockedAt.Before(now.Add(-effectiveProviderLockStaleAfter())) {
 		return nil, nil
 	}
 	recoveryOwner := recoveryOwnerFor(l.ID, l.Generation)
@@ -255,7 +255,7 @@ func (s *InMemoryLeaseStore) ClaimProviderLockCAS(_ context.Context, o ProviderL
 	if err := s.validateProviderLockLocked(o.LeaseID); err != nil {
 		return false, err
 	}
-	if l == nil || p == nil || l.Generation != o.Generation || l.Status != StatusActive || p.owner != o.Owner || !p.lockedAt.Equal(o.LockedAt) || (p.kind == providerLockKindOrdinary && !p.lockedAt.Before(o.ObservedAt.Add(-5*time.Minute))) || (p.kind != providerLockKindOrdinary && p.kind != providerLockKindRecovery) {
+	if l == nil || p == nil || l.Generation != o.Generation || l.Status != StatusActive || p.owner != o.Owner || !p.lockedAt.Equal(o.LockedAt) || (p.kind == providerLockKindOrdinary && !p.lockedAt.Before(o.ObservedAt.Add(-effectiveProviderLockStaleAfter()))) || (p.kind != providerLockKindOrdinary && p.kind != providerLockKindRecovery) {
 		return false, nil
 	}
 	if p.kind == providerLockKindRecovery && p.owner != o.RecoveryOwner {
@@ -427,7 +427,7 @@ func (s *InMemoryLeaseStore) PeekStaleProviderLock(_ context.Context, key LeaseK
 		}
 		return nil, nil
 	}
-	staleBefore := now.Add(-providerLockStaleAfter)
+	staleBefore := now.Add(-effectiveProviderLockStaleAfter())
 	if pl.lockedAt.Before(staleBefore) {
 		return cloneLease(l), nil
 	}
@@ -439,7 +439,7 @@ func (s *InMemoryLeaseStore) PeekAllStaleProviderLocks(_ context.Context, now ti
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	staleBefore := now.Add(-providerLockStaleAfter)
+	staleBefore := now.Add(-effectiveProviderLockStaleAfter())
 	var out []*Lease
 	for id, l := range s.rows {
 		if l.Status != StatusActive {
@@ -474,6 +474,29 @@ func (s *InMemoryLeaseStore) Hold(_ context.Context, key LeaseKey, ownerID strin
 // lifecycle recovery uses ExpireLeaseCAS.
 func (s *InMemoryLeaseStore) ExpireStale(_ context.Context, _ time.Time) ([]*Lease, error) {
 	return nil, fmt.Errorf("claim: unfenced store expiry is disabled; use lifecycle recovery")
+}
+
+func (s *InMemoryLeaseStore) HandoffOwner(_ context.Context, key LeaseKey, fromOwner, toOwner string, generation int64, now time.Time, ttl time.Duration) (*Lease, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if fromOwner == "" || toOwner == "" {
+		return nil, fmt.Errorf("handoff: fromOwner and toOwner required")
+	}
+	if ttl <= 0 {
+		return nil, fmt.Errorf("handoff: ttl must be positive")
+	}
+	l := s.activeLocked(key)
+	if l == nil || l.OwnerID != fromOwner || l.Generation != generation {
+		return nil, s.fencingErrorLocked(key, fromOwner, generation)
+	}
+	// Match Renew: refuse expired unheld leases (never revive past-TTL rows).
+	if !l.Held && !now.Before(l.ExpiresAt) {
+		return nil, fmt.Errorf("%w: lease expired at %s", ErrLeaseExpired, l.ExpiresAt.Format(time.RFC3339))
+	}
+	l.OwnerID = toOwner
+	l.RenewedAt = now
+	l.ExpiresAt = now.Add(ttl)
+	return cloneLease(l), nil
 }
 
 func (s *InMemoryLeaseStore) ActiveClaims(_ context.Context, now time.Time) ([]*Lease, error) {

@@ -134,6 +134,14 @@ func WithClock(now func() time.Time) Option { return func(m *ClaimManager) { m.n
 // WithTTL sets the lease duration granted by Claim/Renew. Default 10m.
 func WithTTL(ttl time.Duration) Option { return func(m *ClaimManager) { m.ttl = ttl } }
 
+// WithProviderLockTimeout is retained for FAC-147 ClaimStack seams. Main's
+// AcquireProviderLock uses the package providerLockStaleAfter constant for
+// ordinary locks; this option is currently a documented no-op so production
+// lock preemption remains lifecycle-recovery owned.
+func WithProviderLockTimeout(d time.Duration) Option {
+	return func(m *ClaimManager) { _ = d }
+}
+
 // WithCapacityCoordinator wires a role-capacity pool into claim/release.
 func WithCapacityCoordinator(c CapacityCoordinator) Option {
 	return func(m *ClaimManager) { m.capacity = c }
@@ -446,6 +454,28 @@ func (m *ClaimManager) Hold(ctx context.Context, key LeaseKey, ownerID string, g
 // Provider recovery, lease CAS, and exact capacity settlement all occur
 // inside that candidate's authority transition. A failure is reported while
 // unrelated candidates continue.
+// Handoff atomically transfers lease ownership to toOwner at the same
+// generation (coordinator → live Herdr worker session) and extends expiry
+// in one store transaction. Generation is preserved so fencing authority
+// is continuous; the coordinator must not Release after a successful
+// Handoff (it no longer owns the lease).
+func (m *ClaimManager) Handoff(ctx context.Context, key LeaseKey, fromOwner, toOwner string, generation int64) (*Lease, error) {
+	if fromOwner == "" || toOwner == "" {
+		return nil, fmt.Errorf("claim: handoff requires fromOwner and toOwner")
+	}
+	if generation <= 0 {
+		return nil, fmt.Errorf("claim: handoff requires positive generation")
+	}
+	lease, err := m.store.HandoffOwner(ctx, key, fromOwner, toOwner, generation, m.now(), m.ttl)
+	if err != nil {
+		return nil, err
+	}
+	if lease == nil || lease.OwnerID != toOwner || lease.Generation != generation {
+		return nil, fmt.Errorf("claim: handoff readback failed")
+	}
+	return lease, nil
+}
+
 func (m *ClaimManager) ExpireStale(ctx context.Context) ([]*Lease, error) {
 	if m.holdReader == nil {
 		return nil, fmt.Errorf("claim: lifecycle hold authority is required for recovery")

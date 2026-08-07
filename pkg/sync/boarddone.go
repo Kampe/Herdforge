@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"strings"
 
+	"github.com/Kampe/Herdforge/pkg/claim"
 	"github.com/Kampe/Herdforge/pkg/provider"
 )
 
@@ -278,4 +279,87 @@ func boardCallErr(op string, err error) error {
 		return fmt.Errorf("%s: BLOCKED(provider_timeout): %w", op, err)
 	}
 	return fmt.Errorf("%s: %w", op, err)
+}
+
+// BoardDoneFenced is the FAC-147 production approve path. Requires stack,
+// ownerID, and generation > 0 (live lease). Status mutation goes through
+// BeginProviderTransition/CompleteProviderTransition only — no raw
+// UpdateStatus and no generation minting on conflict.
+func BoardDoneFenced(
+	ctx context.Context,
+	tp provider.TaskProvider,
+	stack *provider.ClaimStack,
+	key claim.LeaseKey,
+	ownerID string,
+	generation int64,
+	repoDir, projectID, ref, evidenceSHA string,
+	force bool,
+) (*DoneResult, error) {
+	if stack == nil || stack.Board == nil || stack.Manager == nil {
+		return nil, fmt.Errorf("sync: BoardDoneFenced requires ClaimStack (FAC-147 fail-closed)")
+	}
+	if ownerID == "" || generation <= 0 {
+		return nil, fmt.Errorf("sync: BoardDoneFenced requires live lease owner+generation (FAC-147 fail-closed)")
+	}
+
+	ref = NormalizeRef(ref)
+
+	proof, err := MergeEvidence(repoDir, ref, evidenceSHA)
+	if err != nil {
+		return nil, err
+	}
+	if proof == "" {
+		if !force {
+			return nil, fmt.Errorf("%w for %s: no commit on origin/main names it and no evidence commit was given; "+
+				"if the work truly landed without naming the ref, prove it by content: herd board-done %s --evidence <sha>",
+				ErrNoEvidence, ref, ref)
+		}
+		proof = "operator --force, no automatic evidence found"
+	}
+
+	tasks, err := tp.ListTasks(ctx, projectID, "")
+	if err != nil {
+		return nil, boardCallErr("list tasks", err)
+	}
+	var task *provider.Task
+	for _, t := range tasks {
+		if strings.EqualFold(NormalizeRef(t.Ref), ref) {
+			task = t
+			break
+		}
+	}
+	if task == nil {
+		return nil, fmt.Errorf("no task with ref %s on the board", ref)
+	}
+
+	// Already done: idempotent success without a new fenced mutate (crash
+	// recovery / re-approve must not mint a second board effect).
+	if provider.NormalizeStatus(task.Status) == provider.StatusDone {
+		return &DoneResult{Ref: ref, TaskID: task.ID, Proof: proof, Forced: force && !strings.Contains(proof, "origin/main")}, nil
+	}
+
+	if err := stack.Board.MutateStatus(ctx, stack.Manager, key, ownerID, generation, task.ID, "done"); err != nil {
+		return nil, boardCallErr(fmt.Sprintf("fenced status write for %s", ref), err)
+	}
+
+	back, err := tp.GetTask(ctx, task.ID)
+	if err != nil {
+		return nil, boardCallErr(fmt.Sprintf("read-back for %s after status write", ref), err)
+	}
+	if back.Status != "done" {
+		return nil, fmt.Errorf("write reported success but %s reads back as %q", ref, back.Status)
+	}
+
+	res := &DoneResult{Ref: ref, TaskID: task.ID, Proof: proof, Forced: force && !strings.Contains(proof, "origin/main")}
+	// Comment via Begin/Complete with body-hash kind (FAC-147: not bare CAS).
+	commentBody := "board-done: " + proof
+	if commentErr := stack.Board.MutateComment(ctx, stack.Manager, key, ownerID, generation, task.ID, commentBody); commentErr != nil {
+		if provider.IsTimeout(commentErr) || provider.IsAmbiguous(commentErr) {
+			return nil, boardCallErr("board-done comment", commentErr)
+		}
+		// Non-timeout comment failure: status is done; leave CommentPosted false.
+	} else {
+		res.CommentPosted = true
+	}
+	return res, nil
 }

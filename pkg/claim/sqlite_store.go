@@ -567,7 +567,7 @@ func (s *SQLiteLeaseStore) PeekStaleProviderLock(ctx context.Context, key LeaseK
 	if err := validateProviderLockRows(ctx, s.db); err != nil {
 		return nil, err
 	}
-	staleBefore := now.Add(-providerLockStaleAfter)
+	staleBefore := now.Add(-effectiveProviderLockStaleAfter())
 	row := s.db.QueryRowContext(ctx, `SELECT `+leaseColumns+` FROM leases
 		WHERE repo = ? AND provider = ? AND project = ? AND task_ref = ?
 		AND status = 'active' AND provider_lock_kind = '' AND provider_lock_owner != '' AND provider_lock_at <= ?`,
@@ -585,7 +585,7 @@ func (s *SQLiteLeaseStore) PeekAllStaleProviderLocks(ctx context.Context, now ti
 	if err := validateProviderLockRows(ctx, s.db); err != nil {
 		return nil, err
 	}
-	staleBefore := now.Add(-providerLockStaleAfter)
+	staleBefore := now.Add(-effectiveProviderLockStaleAfter())
 	rows, err := s.db.QueryContext(ctx, `SELECT `+leaseColumns+` FROM leases
 		WHERE status = 'active' AND provider_lock_kind = '' AND provider_lock_owner != '' AND provider_lock_at <= ?
 		ORDER BY id ASC`, staleBefore)
@@ -708,7 +708,7 @@ func (s *SQLiteLeaseStore) ObserveStaleProviderLock(ctx context.Context, key Lea
 		return nil, err
 	}
 	o.ObservedAt = now
-	if kind == providerLockKindOrdinary && !o.LockedAt.Before(now.Add(-5*time.Minute)) {
+	if kind == providerLockKindOrdinary && !o.LockedAt.Before(now.Add(-effectiveProviderLockStaleAfter())) {
 		return nil, nil
 	}
 	o.RecoveryOwner = recoveryOwnerFor(o.LeaseID, o.Generation)
@@ -786,6 +786,59 @@ func (s *SQLiteLeaseStore) FinalizeProviderLockCAS(ctx context.Context, o Provid
 // lifecycle recovery uses ExpireLeaseCAS.
 func (s *SQLiteLeaseStore) ExpireStale(_ context.Context, _ time.Time) ([]*Lease, error) {
 	return nil, fmt.Errorf("claim: unfenced store expiry is disabled; use lifecycle recovery")
+}
+
+func (s *SQLiteLeaseStore) HandoffOwner(ctx context.Context, key LeaseKey, fromOwner, toOwner string, generation int64, now time.Time, ttl time.Duration) (*Lease, error) {
+	if fromOwner == "" || toOwner == "" {
+		return nil, fmt.Errorf("handoff: fromOwner and toOwner required")
+	}
+	if ttl <= 0 {
+		return nil, fmt.Errorf("handoff: ttl must be positive")
+	}
+	expiresAt := now.Add(ttl)
+	// Match Renew: refuse expired unheld leases (never revive past-TTL active rows).
+	livePred := `AND status = 'active' AND (held = 1 OR expires_at > ?)`
+	if fromOwner == toOwner {
+		// Same owner: renew only, still one statement.
+		res, err := execWithRetry(ctx, s.db, `UPDATE leases SET renewed_at = ?, expires_at = ?
+			WHERE repo = ? AND provider = ? AND project = ? AND task_ref = ?
+			AND owner_id = ? AND generation = ? `+livePred,
+			now, expiresAt, key.Repo, key.Provider, key.Project, key.TaskRef, fromOwner, generation, now)
+		if err != nil {
+			return nil, fmt.Errorf("handoff: %w", err)
+		}
+		if n, _ := res.RowsAffected(); n != 1 {
+			return nil, s.fencingError(ctx, key, fromOwner, generation)
+		}
+		return s.currentActive(ctx, key)
+	}
+	rows, err := queryWithRetry(ctx, s.db, `UPDATE leases SET owner_id = ?, renewed_at = ?, expires_at = ?
+		WHERE repo = ? AND provider = ? AND project = ? AND task_ref = ?
+		AND owner_id = ? AND generation = ? `+livePred+`
+		RETURNING `+leaseColumns,
+		toOwner, now, expiresAt, key.Repo, key.Provider, key.Project, key.TaskRef, fromOwner, generation, now)
+	if err != nil {
+		return nil, fmt.Errorf("handoff: %w", err)
+	}
+	defer rows.Close()
+	if !rows.Next() {
+		if err := rows.Err(); err != nil {
+			return nil, err
+		}
+		return nil, s.fencingError(ctx, key, fromOwner, generation)
+	}
+	lease, err := scanLease(rows)
+	if err != nil {
+		return nil, fmt.Errorf("handoff: scan: %w", err)
+	}
+	// Post-condition readback: owner and expiry must match the transfer.
+	if lease.OwnerID != toOwner || lease.Generation != generation {
+		return nil, fmt.Errorf("handoff: readback owner/gen mismatch got owner=%s gen=%d", lease.OwnerID, lease.Generation)
+	}
+	if lease.ExpiresAt.Before(now) || lease.ExpiresAt.Equal(now) {
+		return nil, fmt.Errorf("handoff: readback expiry not extended")
+	}
+	return lease, nil
 }
 
 func (s *SQLiteLeaseStore) ActiveClaims(ctx context.Context, now time.Time) ([]*Lease, error) {

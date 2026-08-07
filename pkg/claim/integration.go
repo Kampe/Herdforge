@@ -61,13 +61,12 @@ var ErrProviderFenceRejected = errors.New("claim: provider rejected a stale fenc
 type ProviderCAS interface {
 	// CompareAndSwap applies mutate only if BOTH the task's current
 	// revision equals expected AND fenceToken is not stale (see above).
-	// Returns the task's new revision on success. A revision mismatch
-	// should be distinguishable from a fencing rejection (e.g. via
-	// ErrProviderRevisionStale vs ErrProviderFenceRejected) so callers
-	// can tell "someone else changed the task" from "my lease is gone"
-	// apart, though pkg/claim currently treats any CompareAndSwap error
-	// the same way (mark the outbox intent Failed).
-	CompareAndSwap(ctx context.Context, taskID string, expected ProviderRevision, fenceToken int64, mutate func(ctx context.Context) error) (ProviderRevision, error)
+	// opID is a stable idempotency key for this logical mutation (must
+	// include generation and operation kind/payload identity). A prior
+	// successful apply of the same opID MUST return success without
+	// re-invoking mutate (crash-safe retry). Returns the task's new
+	// revision on success.
+	CompareAndSwap(ctx context.Context, taskID string, expected ProviderRevision, fenceToken int64, opID string, mutate func(ctx context.Context) error) (ProviderRevision, error)
 
 	// AdvanceFence durably records fenceToken as the new minimum accepted
 	// fence for taskID if fenceToken is greater than what's currently
@@ -80,6 +79,11 @@ type ProviderCAS interface {
 	// owner never engages the provider for.
 	AdvanceFence(ctx context.Context, taskID string, fenceToken int64) error
 }
+
+// ErrProviderAmbiguous means the provider mutation may have succeeded but
+// local confirmation (post-mutate revision read / applied mark) failed.
+// Callers must reconcile by opID / readback before retrying blindly.
+var ErrProviderAmbiguous = errors.New("claim: provider mutation outcome is ambiguous; reconcile before retry")
 
 // OutboxIntent is one durable, idempotent side effect a lease transition
 // wants applied to an external system (provider board update, git push,
