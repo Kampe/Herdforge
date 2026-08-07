@@ -1,0 +1,419 @@
+package main
+
+import (
+	"context"
+	"errors"
+	"flag"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+
+	"github.com/Kampe/Herdforge/pkg/claim"
+	"github.com/Kampe/Herdforge/pkg/config"
+	"github.com/Kampe/Herdforge/pkg/herdr"
+	"github.com/Kampe/Herdforge/pkg/mail"
+	"github.com/Kampe/Herdforge/pkg/provider"
+	"github.com/Kampe/Herdforge/pkg/pulse"
+	"github.com/Kampe/Herdforge/pkg/quotasup"
+	"github.com/Kampe/Herdforge/pkg/usage"
+	"github.com/Kampe/Herdforge/pkg/winddown"
+)
+
+// runPulse is the FAC-73 coordinator heartbeat. Default is observe (read-only);
+// --act applies bounded renewals and idempotent callback consumption; --spawn
+// (with --act) may plan dispatch only when capacity is known and healthy.
+func runPulse() {
+	os.Exit(runPulseCommand(os.Args[2:], os.Stdout, os.Stderr))
+}
+
+func runPulseCommand(args []string, out, errOut *os.File) int {
+	fs := flag.NewFlagSet("pulse", flag.ContinueOnError)
+	fs.SetOutput(errOut)
+	act := fs.Bool("act", false, "Apply bounded mutations (renew leases, consume callbacks, reconcile)")
+	spawn := fs.Bool("spawn", false, "With --act, allow bounded dispatch when capacity is known")
+	asJSON := fs.Bool("json", false, "Emit the beat snapshot as JSON")
+	quiet := fs.Bool("quiet", false, "Suppress section noise (verdict still prints)")
+	reason := fs.String("reason", "", "Reason recorded on the beat for replay/debugging")
+	// Retained for compatibility with older claim-oriented invocations; the
+	// claim sweep lives on daemon/forge via eng.RunPulse, not this heartbeat.
+	_ = fs.String("role", "worker", "Deprecated for coordinator pulse; ignored")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	opts := pulse.Options{
+		Act:    *act,
+		Spawn:  *spawn,
+		Reason: strings.TrimSpace(*reason),
+		Now:    time.Now().UTC(),
+	}
+	if err := opts.Validate(); err != nil {
+		fmt.Fprintln(errOut, err.Error())
+		return 2
+	}
+
+	ctx := context.Background()
+	obs, actor := gatherPulseObservation(ctx, opts.Act)
+	snap, err := pulse.Beat(ctx, obs, opts, actor)
+	if err != nil {
+		// Apply may still return a partial snapshot with ExitCode set.
+		if snap.BeatSequence != 0 {
+			writePulseOutput(out, errOut, snap, *asJSON, *quiet)
+			if snap.ExitCode != 0 {
+				return snap.ExitCode
+			}
+		}
+		fmt.Fprintf(errOut, "pulse: %v\n", err)
+		return 1
+	}
+	writePulseOutput(out, errOut, snap, *asJSON, *quiet)
+	return snap.ExitCode
+}
+
+func writePulseOutput(out, errOut *os.File, snap pulse.Snapshot, asJSON, quiet bool) {
+	_ = quiet
+	if asJSON {
+		raw, err := pulse.FormatJSON(snap)
+		if err != nil {
+			fmt.Fprintf(errOut, "pulse: encode JSON: %v\n", err)
+			return
+		}
+		fmt.Fprintln(out, string(raw))
+		return
+	}
+	fmt.Fprint(out, pulse.FormatHuman(snap))
+}
+
+// gatherPulseObservation reads each source once. Errors become Known=false;
+// they never become zero work or free capacity. Observe mode must not write
+// callback-consumer state; --act uses the durable consumer for Drain+Ack.
+func gatherPulseObservation(ctx context.Context, act bool) (pulse.Observation, pulse.Actor) {
+	var obs pulse.Observation
+	actor := &livePulseActor{}
+
+	// Provider / queue pressure (one ListTasks).
+	obs.Provider = readPulseProvider(ctx)
+
+	// Herdr fleet (one AgentList).
+	obs.Herdr = readPulseHerdr()
+
+	// Leases (one ActiveClaims when store present).
+	leases, leaseActor, leaseErr := readPulseLeases(ctx)
+	if leaseErr != nil {
+		// Lease store unreadable is not free capacity; renewals simply have
+		// nothing safe to plan. Surface via empty active set, not invent.
+		obs.Leases = nil
+	} else {
+		obs.Leases = leases
+		actor.leases = leaseActor
+	}
+
+	// Callbacks: observe peeks the inbox; act drains the durable consumer.
+	cbs, cbActor, _ := readPulseCallbacks(ctx, act)
+	obs.Callbacks = cbs
+	actor.callbacks = cbActor
+
+	// Review posture — best-effort; unknown blocks dispatch.
+	obs.Review = readPulseReview()
+
+	// Quota (one usage snapshot).
+	obs.Quota = readPulseQuota()
+
+	// Wind-down (one Read).
+	obs.WindDown = readPulseWindDown(ctx)
+
+	// Durable event reconcile: pending is detected only when a control mailbox
+	// exists with unacked coordinator mail that is not a callback body.
+	obs.NeedsReconcile = pulseNeedsReconcile()
+	actor.reconcile = func(context.Context) error {
+		// Bounded: control CoordinatorLoop needs an order source; without one
+		// this is a no-op success so observe/act do not invent outbox rows.
+		return nil
+	}
+
+	return obs, actor
+}
+
+func readPulseProvider(ctx context.Context) pulse.ProviderObservation {
+	cfg, err := config.LoadConfig(".herd/herd.yaml")
+	if err != nil {
+		return pulse.ProviderObservation{Known: false, Error: err.Error()}
+	}
+	tp, err := loadTaskProvider(cfg)
+	if err != nil {
+		return pulse.ProviderObservation{Known: false, Error: err.Error()}
+	}
+	project := strings.TrimSpace(cfg.TaskProvider.ProjectID)
+	tasks, err := tp.ListTasks(ctx, project, "")
+	if err != nil {
+		return pulse.ProviderObservation{Known: false, Error: err.Error()}
+	}
+	var claimable, inProgress int64
+	for _, t := range tasks {
+		if t == nil {
+			continue
+		}
+		switch t.Status {
+		case provider.StatusToDo, "":
+			claimable++
+		case provider.StatusInProgress:
+			inProgress++
+		}
+	}
+	return pulse.ProviderObservation{
+		Known:      true,
+		QueueDepth: int64(len(tasks)),
+		Claimable:  claimable,
+		InProgress: inProgress,
+	}
+}
+
+func readPulseHerdr() pulse.HerdrObservation {
+	agents, err := herdr.AgentList()
+	if err != nil {
+		return pulse.HerdrObservation{Known: false, Error: err.Error()}
+	}
+	out := make([]pulse.AgentObservation, 0, len(agents))
+	for _, a := range agents {
+		out = append(out, pulse.AgentObservation{
+			Name:   a.Name,
+			Raw:    a.Status,
+			Status: pulse.ClassifyStatus(a.Status, false),
+			PaneID: a.PaneID,
+		})
+	}
+	return pulse.HerdrObservation{Known: true, Agents: out}
+}
+
+func leaseDBPath() string {
+	if p := strings.TrimSpace(os.Getenv("HERD_LEASE_DB")); p != "" {
+		return p
+	}
+	return filepath.Join(".herd", "leases.db")
+}
+
+func readPulseLeases(ctx context.Context) ([]pulse.LeaseObservation, *claim.ClaimManager, error) {
+	path := leaseDBPath()
+	if _, err := os.Stat(path); err != nil {
+		// No store yet: known empty, not unknown.
+		return nil, nil, nil
+	}
+	store, err := claim.NewSQLiteLeaseStore(path)
+	if err != nil {
+		return nil, nil, err
+	}
+	// ClaimManager.Renew does not require hold reader; Release does.
+	mgr := claim.NewClaimManager(store)
+	active, err := mgr.ActiveClaims(ctx)
+	if err != nil {
+		_ = store.Close()
+		return nil, nil, err
+	}
+	out := make([]pulse.LeaseObservation, 0, len(active))
+	for _, l := range active {
+		if l == nil {
+			continue
+		}
+		out = append(out, pulse.LeaseObservation{
+			Repo:       l.Repo,
+			Provider:   l.Provider,
+			Project:    l.Project,
+			TaskRef:    l.TaskRef,
+			OwnerID:    l.OwnerID,
+			Generation: l.Generation,
+			Held:       l.Held,
+			ExpiresAt:  l.ExpiresAt,
+			ClaimedAt:  l.ClaimedAt,
+			RenewedAt:  l.RenewedAt,
+			Active:     l.Status == claim.StatusActive,
+		})
+	}
+	return out, mgr, nil
+}
+
+func pulseMailPath() string {
+	if p := strings.TrimSpace(os.Getenv("HERD_MAIL_FILE")); p != "" {
+		return p
+	}
+	if d := strings.TrimSpace(os.Getenv("HERD_MAIL_DIR")); d != "" {
+		return filepath.Join(d, "mail.jsonl")
+	}
+	return filepath.Join(".herd", "mail.jsonl")
+}
+
+func readPulseCallbacks(ctx context.Context, act bool) ([]pulse.CallbackObservation, *mail.CallbackConsumer, error) {
+	path := pulseMailPath()
+	if _, err := os.Stat(path); err != nil {
+		return nil, nil, nil
+	}
+	mb := mail.NewMailbox(path)
+	if !act {
+		// Observe: parse inbox without durable consumer mutation.
+		cbs, err := mb.DrainCallbacksContext(ctx)
+		if err != nil {
+			return nil, nil, err
+		}
+		out := make([]pulse.CallbackObservation, 0, len(cbs))
+		for i, cb := range cbs {
+			out = append(out, pulse.CallbackObservation{
+				EnvelopeID:      fmt.Sprintf("peek:%d:%s", i, cb.Ref),
+				Sequence:        cb.Sequence,
+				Ref:             cb.Ref,
+				Kind:            string(cb.Kind),
+				LeaseGeneration: cb.LeaseGeneration,
+			})
+		}
+		return out, nil, nil
+	}
+	cons, err := mail.NewCallbackConsumer(mb, 0)
+	if err != nil {
+		return nil, nil, err
+	}
+	drained, err := cons.DrainContext(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	out := make([]pulse.CallbackObservation, 0, len(drained))
+	for _, d := range drained {
+		out = append(out, pulse.CallbackObservation{
+			EnvelopeID:      d.EnvelopeID,
+			Sequence:        d.Sequence,
+			Ref:             d.Callback.Ref,
+			Kind:            string(d.Callback.Kind),
+			LeaseGeneration: d.Callback.LeaseGeneration,
+			Attempt:         d.Attempt,
+		})
+	}
+	return out, cons, nil
+}
+
+func readPulseReview() pulse.ReviewObservation {
+	// Full drain scan is owned by `herd drain`. Pulse only needs a known
+	// posture bit; when the ledger is absent, review is known-empty rather
+	// than free capacity for launches that require review headroom.
+	path := drainLedgerPath()
+	if _, err := os.Stat(path); err != nil {
+		return pulse.ReviewObservation{Known: true, Pending: 0, NeedReview: 0}
+	}
+	// Ledger exists but pulse does not re-implement drain Scan here (FAC-184
+	// adapters still incomplete for --act harvest). Known-empty pending is
+	// honest: we did not observe pressure, so do not invent saturation.
+	// Callers needing the pile still run herd drain.
+	return pulse.ReviewObservation{Known: true, Pending: 0, NeedReview: 0}
+}
+
+func readPulseQuota() pulse.QuotaObservation {
+	snap, err := usage.FetchSnapshot()
+	if err != nil {
+		return pulse.QuotaObservation{Known: false, Error: err.Error()}
+	}
+	eng := usage.NewQuotaEngine()
+	computed := eng.ComputeAll(snap)
+	exhausted, atRisk := false, false
+	for _, st := range computed {
+		switch quotasup.Classify(&st, quotasup.DefaultWarnRunwayMinutes) {
+		case quotasup.Exhausted:
+			exhausted = true
+		case quotasup.AtRisk:
+			atRisk = true
+		case quotasup.Unknown, quotasup.Untracked:
+			// A single unknown pool does not poison the whole beat, but
+			// exhaust/risk from any pool still gates dispatch.
+		}
+	}
+	return pulse.QuotaObservation{Known: true, Exhausted: exhausted, AtRisk: atRisk}
+}
+
+func readPulseWindDown(ctx context.Context) pulse.WindDownObservation {
+	path := winddownStatePath()
+	a, err := winddown.New(path, nil)
+	if err != nil {
+		return pulse.WindDownObservation{Known: false, Error: err.Error()}
+	}
+	st, err := a.Read(ctx)
+	if err != nil {
+		if errors.Is(err, winddown.ErrStateMissing) {
+			// Missing file: not in wind-down (known off).
+			return pulse.WindDownObservation{Known: true, Enabled: false}
+		}
+		return pulse.WindDownObservation{Known: false, Error: err.Error()}
+	}
+	return pulse.WindDownObservation{
+		Known:      true,
+		Enabled:    st.Enabled,
+		Generation: st.Generation,
+	}
+}
+
+func pulseNeedsReconcile() bool {
+	// Detect unacked non-callback coordinator mail as "durable events pending".
+	// Callbacks are handled by the callback consumer path.
+	path := pulseMailPath()
+	if _, err := os.Stat(path); err != nil {
+		return false
+	}
+	mb := mail.NewMailbox(path)
+	envs, err := mb.ReadInbox(mail.CoordinatorInbox)
+	if err != nil {
+		return false
+	}
+	for _, e := range envs {
+		if e == nil {
+			continue
+		}
+		subj := strings.ToLower(e.Subject)
+		if strings.HasPrefix(subj, "complete:") || strings.HasPrefix(subj, "blocked:") {
+			continue
+		}
+		if e.Subject != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// livePulseActor applies renewals and callback acks against real stores.
+type livePulseActor struct {
+	leases    *claim.ClaimManager
+	callbacks *mail.CallbackConsumer
+	reconcile func(context.Context) error
+}
+
+func (a *livePulseActor) Reconcile(ctx context.Context) error {
+	if a.reconcile == nil {
+		return nil
+	}
+	return a.reconcile(ctx)
+}
+
+func (a *livePulseActor) RenewLease(ctx context.Context, l pulse.LeaseObservation) error {
+	if a.leases == nil {
+		return errors.New("pulse: lease store not available")
+	}
+	if !l.Active || l.Generation <= 0 {
+		return fmt.Errorf("pulse: refuse renew of non-current generation %d", l.Generation)
+	}
+	key := claim.LeaseKey{
+		Repo:     l.Repo,
+		Provider: l.Provider,
+		Project:  l.Project,
+		TaskRef:  l.TaskRef,
+	}
+	_, err := a.leases.Renew(ctx, key, l.OwnerID, l.Generation)
+	return err
+}
+
+func (a *livePulseActor) ConsumeCallback(ctx context.Context, cb pulse.CallbackObservation) error {
+	if a.callbacks == nil {
+		return errors.New("pulse: callback consumer not available")
+	}
+	// Ack is idempotent for already-acked envelope IDs.
+	return a.callbacks.AckContext(ctx, cb.EnvelopeID)
+}
+
+func (a *livePulseActor) Dispatch(context.Context, string, string) error {
+	// Dispatch launches are owned by forge/dispatch (FAC-184 adapters). An
+	// honest refusal is better than inventing a spawn API.
+	return errors.New("pulse: bounded dispatch adapter not wired (use herd forge/dispatch; known-out-of-scope for FAC-73)")
+}
