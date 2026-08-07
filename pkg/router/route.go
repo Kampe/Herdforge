@@ -521,8 +521,11 @@ func cliFor(provider string) string {
 	return provider
 }
 
-// globalStateDir mirrors herdr_global_state_dir.
-func globalStateDir() string {
+// GlobalStateDir mirrors herdr_global_state_dir. Exported so writers of the
+// cooldown store (the quota supervisor's --act) land files in the exact
+// directory this package reads; a second path convention would write cools
+// nobody enforces.
+func GlobalStateDir() string {
 	if d := os.Getenv("HERDR_ROUTE_STATE_DIR"); d != "" {
 		return d
 	}
@@ -537,7 +540,38 @@ func globalStateDir() string {
 // globalCooldownReason mirrors global_cooldown_reason: the global store is a
 // peer authority (CHA-792); an unexpired scoped entry blocks the candidate.
 func (r *SurfaceRouter) globalCooldownReason(provider, model, pool string) string {
-	gdir := globalStateDir()
+	return CooldownReason(r.Probes.Now(), provider, model, pool)
+}
+
+// Cooldown is one unexpired entry from the routing cooldown store.
+//
+// Source is whatever wrote it ("" for hand-written holds). Readers that also
+// WRITE cools need it: a writer that treats its own entry as independent
+// evidence has built a latch it can never open.
+type Cooldown struct {
+	Reason    string
+	Source    string
+	ExpiresAt time.Time
+}
+
+// CooldownReason reports why an unexpired scoped cooldown blocks
+// (provider, model, pool), or "" when nothing does.
+func CooldownReason(at time.Time, provider, model, pool string) string {
+	if c := CooldownFor(at, provider, model, pool); c != nil {
+		return c.Reason
+	}
+	return ""
+}
+
+// CooldownFor returns the unexpired scoped cool blocking (provider, model,
+// pool), or nil.
+//
+// Exported so the quota supervisor grades a surface against the same store,
+// the same scoping rules, and the same expiry arithmetic that Pick enforces.
+// A supervisor with its own reader would eventually disagree with the gate it
+// exists to anticipate.
+func CooldownFor(at time.Time, provider, model, pool string) *Cooldown {
+	gdir := GlobalStateDir()
 	paths := []string{filepath.Join(gdir, provider+".cooldown.json")}
 	if pool != "" {
 		paths = append(paths, filepath.Join(gdir, provider+"--"+pool+".cooldown.json"))
@@ -545,7 +579,7 @@ func (r *SurfaceRouter) globalCooldownReason(provider, model, pool string) strin
 	if model != "" {
 		paths = append(paths, filepath.Join(gdir, provider+"--model--"+url.QueryEscape(model)+".cooldown.json"))
 	}
-	now := r.Probes.Now().Unix()
+	now := at.Unix()
 	for _, p := range paths {
 		data, err := os.ReadFile(p)
 		if err != nil {
@@ -559,6 +593,7 @@ func (r *SurfaceRouter) globalCooldownReason(provider, model, pool string) strin
 			Model      string `json:"model"`
 			Pool       string `json:"pool"`
 			Reason     string `json:"reason"`
+			Source     string `json:"source"`
 		}
 		if json.Unmarshal(data, &e) != nil {
 			continue // a half-parsed file must not read as a cool
@@ -583,12 +618,13 @@ func (r *SurfaceRouter) globalCooldownReason(provider, model, pool string) strin
 		if e.Pool != "" && e.Pool != pool {
 			continue
 		}
-		if e.Reason != "" {
-			return e.Reason
+		reason := e.Reason
+		if reason == "" {
+			reason = "global cooldown"
 		}
-		return "global cooldown"
+		return &Cooldown{Reason: reason, Source: e.Source, ExpiresAt: time.Unix(exp, 0).UTC()}
 	}
-	return ""
+	return nil
 }
 
 func csvHas(csv, item string) bool {

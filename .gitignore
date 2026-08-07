@@ -35,6 +35,7 @@ opencode.json
 .worktrees/
 .herd/worktrees/
 .herd/launch-receipts.jsonl
+.herd/quota-supervisor.json
 **/.herd/launch-receipts.jsonl
 .herd/confine-sessions/
 **/.herd/confine-sessions/

@@ -580,3 +580,41 @@ func TestCodexAvailabilityRequiresPiHarnessCLI(t *testing.T) {
 		t.Fatal("codex must error when only codex CLI is present")
 	}
 }
+
+// The quota supervisor both reads and writes this store. It needs to tell its
+// own entries apart from a human's hold, or --act builds a latch it can never
+// open: it blocks, reads the block it wrote back as independent evidence, and
+// blocks again however far quota has recovered.
+func TestCooldownForReportsSourceAndExpiry(t *testing.T) {
+	clearRouteEnv(t)
+	dir := t.TempDir()
+	t.Setenv("HERDR_ROUTE_STATE_DIR", dir)
+	at := time.Unix(1800000000, 0).UTC()
+
+	writeCooldown(t, dir, "claude--fable.cooldown.json",
+		`{"provider":"claude","pool":"fable","expiresAt":1800000600,"reason":"exhausted","source":"herd-quota-supervisor"}`)
+	c := CooldownFor(at, "claude", "", "fable")
+	if c == nil {
+		t.Fatal("unexpired pool-scoped cool was not reported")
+	}
+	if c.Source != "herd-quota-supervisor" || c.Reason != "exhausted" {
+		t.Fatalf("cool = %+v", c)
+	}
+	if !c.ExpiresAt.Equal(time.Unix(1800000600, 0).UTC()) {
+		t.Fatalf("expiry = %s", c.ExpiresAt)
+	}
+
+	// A pool-scoped cool must not leak onto a sibling pool.
+	if got := CooldownFor(at, "claude", "", "default"); got != nil {
+		t.Fatalf("fable's cool blocked claude/default: %+v", got)
+	}
+	// A hold with no source reports an empty one rather than being dropped.
+	writeCooldown(t, dir, "grok--default.cooldown.json",
+		`{"provider":"grok","pool":"default","expiresAt":1800000600,"reason":"manual hold"}`)
+	if got := CooldownFor(at, "grok", "", "default"); got == nil || got.Source != "" {
+		t.Fatalf("unsourced hold = %+v, want a cool with an empty source", got)
+	}
+	if got := CooldownFor(time.Unix(1800000601, 0).UTC(), "grok", "", "default"); got != nil {
+		t.Fatalf("expired cool still reported: %+v", got)
+	}
+}

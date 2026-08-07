@@ -10,6 +10,7 @@ package quotasup
 import (
 	"strings"
 
+	"github.com/Kampe/Herdforge/pkg/router"
 	"github.com/Kampe/Herdforge/pkg/usage"
 )
 
@@ -47,27 +48,41 @@ func QuotaProvider(provider string) string {
 // a lane on codex/spark charged against codex/default reads as exhausted while
 // its own pool is idle, and the supervisor reroutes work that never needed to
 // move.
+//
+// The table itself is router.QuotaPoolFor's, deliberately: if the supervisor
+// and the router disagreed about which pool a model bills, every cap the
+// supervisor set would apply to a surface the router never routes to. This
+// wrapper only normalises live, untrusted input — herdr reports the harness
+// kind and argv verbatim, in whatever case the operator typed — before handing
+// it to a table keyed on canonical lowercase names.
 func QuotaPool(provider, model string) string {
 	p := strings.ToLower(strings.TrimSpace(provider))
-	m := strings.ToLower(strings.TrimSpace(model))
-	switch p {
-	case "agy", "antigravity":
-		if strings.Contains(m, "gemini") {
-			return "gemini"
-		}
-		return "nonGemini"
-	case "codex":
-		if strings.Contains(m, "spark") {
-			return "spark"
-		}
-		return "default"
-	case "claude":
-		if strings.Contains(m, "fable") {
-			return "fable"
-		}
-		return "default"
+	if p == "antigravity" {
+		p = "agy" // the pool table is keyed by harness name, not ledger name
 	}
-	return "default"
+	return router.QuotaPoolFor(p, strings.ToLower(strings.TrimSpace(model)))
+}
+
+// ModelFromArgv recovers the model a running agent was actually launched with.
+//
+// `herdr agent list` reports no model (verified against the 0.7.5 API schema:
+// AgentInfo carries agent/display_agent, never a model), so the running
+// process's own argv is the only live evidence of which pool a lane bills.
+// Returns "" when the lane took its surface default, which is not an error:
+// QuotaPool maps an empty model to the surface's default pool.
+func ModelFromArgv(argv []string) string {
+	for i, a := range argv {
+		if a == "--model" || a == "-m" {
+			if i+1 < len(argv) {
+				return strings.TrimSpace(argv[i+1])
+			}
+			return ""
+		}
+		if v, ok := strings.CutPrefix(a, "--model="); ok {
+			return strings.TrimSpace(v)
+		}
+	}
+	return ""
 }
 
 // Classify grades one pool's capacity. A nil state is Untracked, and a stale
@@ -97,6 +112,11 @@ func Classify(st *usage.BurnState, warnRunwayMinutes int) Capacity {
 }
 
 // Assignment is one live agent bound to the pool it actually runs on.
+//
+// Provider is the harness kind herdr reports ("agy"); QuotaProvider is the
+// ledger that meters it ("antigravity"). They are kept apart because the
+// cooldown store and the router are keyed on the first while the quota map is
+// keyed on the second.
 type Assignment struct {
 	Name          string   `json:"name"`
 	PaneID        string   `json:"pane_id,omitempty"`
@@ -105,16 +125,38 @@ type Assignment struct {
 	Provider      string   `json:"provider"`
 	QuotaProvider string   `json:"quota_provider"`
 	Model         string   `json:"model,omitempty"`
+	Family        string   `json:"family,omitempty"`
 	Pool          string   `json:"pool"`
 	Capacity      Capacity `json:"capacity_state"`
 }
 
-// Snapshot is one observation of the fleet's capacity.
+// Surface is the metered surface this agent bills against.
+func (a Assignment) Surface() Surface {
+	return Surface{Provider: a.QuotaProvider, Pool: a.Pool}
+}
+
+// Snapshot is one observation of the fleet's capacity, and the whole of what
+// the supervisor carries across runs. Decisions is the durable part: it is
+// what makes the next run's caps continuous with this one's instead of
+// restarting the ratchet from cold every time the process bounces.
 type Snapshot struct {
 	ObservedAt        string       `json:"observed_at"`
+	SourceAt          string       `json:"source_at,omitempty"`
 	Workspace         string       `json:"workspace"`
 	WarnRunwayMinutes int          `json:"warn_runway_minutes"`
 	Agents            []Assignment `json:"agents"`
+	Decisions         []Decision   `json:"decisions,omitempty"`
+}
+
+// Blocked lists the surfaces admitting no new work, in decision order.
+func (s *Snapshot) Blocked() []Decision {
+	var out []Decision
+	for _, d := range s.Decisions {
+		if d.Cap == 0 {
+			out = append(out, d)
+		}
+	}
+	return out
 }
 
 // Counts summarises a snapshot.

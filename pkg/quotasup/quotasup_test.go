@@ -3,6 +3,7 @@ package quotasup
 import (
 	"testing"
 
+	"github.com/Kampe/Herdforge/pkg/router"
 	"github.com/Kampe/Herdforge/pkg/usage"
 )
 
@@ -116,5 +117,53 @@ func TestCountsGroupUnknownWithUntracked(t *testing.T) {
 	c := s.Counts()
 	if c.Agents != 5 || c.Exhausted != 1 || c.AtRisk != 1 || c.Unknown != 2 {
 		t.Fatalf("counts = %+v", c)
+	}
+}
+
+// `herdr agent list` reports no model, so a running lane's own argv is the
+// only live evidence of which pool it bills.
+func TestModelFromArgvRecoversTheLaunchedModel(t *testing.T) {
+	cases := []struct {
+		name string
+		argv []string
+		want string
+	}{
+		{"separate value", []string{"codex", "--model", "gpt-5.3-codex-spark", "--effort", "low"}, "gpt-5.3-codex-spark"},
+		{"equals form", []string{"claude", "--model=claude-fable-5"}, "claude-fable-5"},
+		{"short flag", []string{"agy", "-m", "gemini-3.1-pro-high"}, "gemini-3.1-pro-high"},
+		{"surface default", []string{"kimi", "--auto"}, ""},
+		{"no argv at all", nil, ""},
+		// A dangling flag must not read the next lane's argument or panic.
+		{"dangling flag", []string{"codex", "--model"}, ""},
+		// The first --model wins; a later mention is not the launch model.
+		{"first wins", []string{"codex", "--model", "gpt-5.6-luna", "--model", "other"}, "gpt-5.6-luna"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := ModelFromArgv(c.argv); got != c.want {
+				t.Fatalf("ModelFromArgv(%v) = %q, want %q", c.argv, got, c.want)
+			}
+		})
+	}
+}
+
+// The supervisor and the router must agree about which pool a model bills; if
+// they diverge, every cap the supervisor sets lands on a surface the router
+// never routes to.
+func TestQuotaPoolAgreesWithTheRouterOnCanonicalModels(t *testing.T) {
+	for _, c := range []struct{ provider, model string }{
+		{"claude", "claude-fable-5"}, {"claude", "claude-sonnet-5"},
+		{"agy", "gemini-3.1-pro-high"}, {"agy", "claude-opus-4-6-thinking"},
+		{"codex", "gpt-5.3-codex-spark"}, {"codex", "gpt-5.6-luna"},
+		{"grok", "grok-4.5"}, {"kimi", ""},
+	} {
+		if got, want := QuotaPool(c.provider, c.model), router.QuotaPoolFor(c.provider, c.model); got != want {
+			t.Errorf("QuotaPool(%s,%s) = %q but the router bills %q",
+				c.provider, c.model, got, want)
+		}
+	}
+	// The ledger's own name for AGY still resolves to AGY's pools.
+	if got := QuotaPool("antigravity", "gemini-3.1-pro-high"); got != "gemini" {
+		t.Fatalf("ledger provider name = %q, want gemini", got)
 	}
 }
