@@ -22,9 +22,25 @@ func TestApplyEmpty(t *testing.T) {
 	}
 }
 
+// TestApplyConflictKeepsEntry forces a real three-way conflict on apply and
+// asserts the entry is KEPT with the recover error text. Soft-success is a
+// hard failure of this test (not a skip): the named claim is conflict keep.
 func TestApplyConflictKeepsEntry(t *testing.T) {
 	r, dir := newRepo(t)
-	if err := os.WriteFile(filepath.Join(dir, "f.txt"), []byte("stashed\n"), 0o644); err != nil {
+
+	// Multi-line base so the stash patch and a diverging commit share context
+	// but disagree on the middle line — the classic 3-way conflict shape.
+	base := "alpha\nbase-line\ngamma\n"
+	stashed := "alpha\nstashed-line\ngamma\n"
+	diverged := "alpha\ndiverged-line\ngamma\n"
+
+	if err := os.WriteFile(filepath.Join(dir, "f.txt"), []byte(base), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run(t, dir, "add", "f.txt")
+	run(t, dir, "commit", "-q", "-m", "multiline-base")
+
+	if err := os.WriteFile(filepath.Join(dir, "f.txt"), []byte(stashed), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	var buf bytes.Buffer
@@ -32,37 +48,45 @@ func TestApplyConflictKeepsEntry(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Create a conflicting worktree state, then commit so apply has a base to hit.
-	if err := os.WriteFile(filepath.Join(dir, "f.txt"), []byte("conflicting-committed\n"), 0o644); err != nil {
+	// Worktree is clean at base again. Commit a diverging edit of the same line.
+	if err := os.WriteFile(filepath.Join(dir, "f.txt"), []byte(diverged), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	run(t, dir, "add", "f.txt")
 	run(t, dir, "commit", "-q", "-m", "diverge")
-	// Also dirty the same path so stash apply has a real conflict surface.
-	if err := os.WriteFile(filepath.Join(dir, "f.txt"), []byte("conflicting-dirty\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
 
 	_, err = r.ApplyKeep(context.Background())
 	if err == nil {
-		// git stash apply may still succeed if the patch applies cleanly on
-		// the dirty tree; force a harder conflict by using a three-way mess.
-		// Fall through only if apply failed; if it succeeded, still assert keep.
-		t.Log("apply succeeded without conflict on this git version; verifying keep path separately")
-	} else {
-		if !strings.Contains(err.Error(), "KEPT") {
-			t.Fatalf("conflict error must mention KEPT, got %v", err)
-		}
-		if !strings.Contains(err.Error(), ref) {
-			t.Fatalf("conflict error must name the entry, got %v", err)
-		}
+		t.Fatal("expected apply conflict: clean diverging commit must not apply stashed middle line cleanly")
 	}
-	refs, err := r.Entries()
-	if err != nil {
-		t.Fatal(err)
+	if !strings.Contains(err.Error(), "KEPT") {
+		t.Fatalf("conflict error must mention KEPT, got %v", err)
+	}
+	if !strings.Contains(err.Error(), ref) {
+		t.Fatalf("conflict error must name the entry, got %v", err)
+	}
+	// Conflict path must never drop the ref.
+	refs, listErr := r.Entries()
+	if listErr != nil {
+		t.Fatal(listErr)
 	}
 	if len(refs) != 1 || refs[0] != ref {
-		t.Fatalf("entry must remain after conflict/apply, got %v", refs)
+		t.Fatalf("entry must remain after conflict, got %v", refs)
+	}
+	// Pop after a failed apply must also keep the entry (same apply path).
+	_, popErr := r.Pop(context.Background())
+	if popErr == nil {
+		t.Fatal("pop over the same conflict must also fail")
+	}
+	if !strings.Contains(popErr.Error(), "KEPT") {
+		t.Fatalf("pop conflict error must mention KEPT, got %v", popErr)
+	}
+	refs, listErr = r.Entries()
+	if listErr != nil {
+		t.Fatal(listErr)
+	}
+	if len(refs) != 1 || refs[0] != ref {
+		t.Fatalf("entry must remain after failed pop, got %v", refs)
 	}
 }
 
