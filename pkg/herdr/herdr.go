@@ -894,7 +894,7 @@ func TabCreate(opts TabCreateOptions) (*TabInfo, error) {
 		return nil, fmt.Errorf("parsing tab create output: %s: %w", output, err)
 	}
 
-	return &TabInfo{
+	tab := &TabInfo{
 		ID:    resp.Result.Tab.TabID,
 		Label: resp.Result.Tab.Label,
 		Cwd:   opts.Cwd,
@@ -902,7 +902,16 @@ func TabCreate(opts TabCreateOptions) (*TabInfo, error) {
 			ID:    resp.Result.RootPane.PaneID,
 			TabID: resp.Result.RootPane.TabID,
 		},
-	}, nil
+	}
+	// FAC-172: every HostedUID path proves shell/tree UID after create — not
+	// flag-and-trust-daemon. Proof failure kills bound PIDs and closes the tab.
+	if opts.HostedUID > 0 {
+		if err := AssertHostedPaneUID(tab.Pane.ID, opts.HostedUID); err != nil {
+			return nil, FailHostedIsolationProof(tab.Pane.ID, tab.ID,
+				fmt.Errorf("herdr tab create: hosted uid proof failed: %w", err))
+		}
+	}
+	return tab, nil
 }
 
 // TabCreateForTask is the FAC-121 launch entry: requires workspace and cwd.
@@ -911,10 +920,10 @@ func TabCreate(opts TabCreateOptions) (*TabInfo, error) {
 // directory before contacting Herdr, so relative paths cannot be re-resolved from
 // the Herdr server process cwd.
 //
-// FAC-172: when HERD_BUILDER_UID is configured, the herdr daemon must host the tab
-// shell as BuilderUID. Capability negotiation is structured only; post-create
-// process-info proves the shell tree. Proof failure terminates hosted PIDs
-// (procsignal) and closes the orphan tab.
+// FAC-172: when isolation is required, the herdr daemon must host the tab
+// shell as BuilderUID. Capability negotiation is structured only; TabCreate
+// proves shell/process-group/descendant UIDs after create. Proof failure
+// terminates start-token-bound PIDs (procsignal) and closes the orphan tab.
 func TabCreateForTask(workspaceID, label, cwd string, noFocus bool) (*TabInfo, error) {
 	cwd = strings.TrimSpace(cwd)
 	if cwd == "" {
@@ -947,15 +956,6 @@ func TabCreateForTask(workspaceID, label, cwd string, noFocus bool) (*TabInfo, e
 		}
 		opts.HostedUID = bUID
 		opts.Env = append(opts.Env, hostedUIDLaunchEnv(bUID)...)
-		tab, err := TabCreate(opts)
-		if err != nil {
-			return nil, err
-		}
-		if err := AssertHostedPaneUID(tab.Pane.ID, bUID); err != nil {
-			return nil, FailHostedIsolationProof(tab.Pane.ID, tab.ID,
-				fmt.Errorf("herdr tab create: hosted uid proof failed: %w", err))
-		}
-		return tab, nil
 	}
 	return TabCreate(opts)
 }
@@ -1056,6 +1056,23 @@ func AgentStartWithDecision(name, kind, paneID string, req launch.Request) error
 		_ = launch.RecordRejected(req, nil, err.Error())
 		return err
 	}
+	// FAC-172: prove shell/tree and exact routed agent UID BEFORE binding
+	// tool-child inventory — a wrong-UID process must never become durable owner.
+	if builderUID > 0 {
+		tabID := tabForPane(paneID)
+		if err := AssertHostedPaneUID(paneID, builderUID); err != nil {
+			proof := FailHostedIsolationProofWithLifecycle(paneID, tabID, lc,
+				fmt.Errorf("herdr agent start: hosted uid proof failed: %w", err))
+			_ = launch.RecordRejected(req, nil, proof.Error())
+			return proof
+		}
+		if err := AssertAgentHostedAsBuilder(name, builderUID, kind, req.Decision.HarnessArgv); err != nil {
+			proof := FailHostedIsolationProofWithLifecycle(paneID, tabID, lc,
+				fmt.Errorf("herdr agent start: agent descendant uid proof failed: %w", err))
+			_ = launch.RecordRejected(req, nil, proof.Error())
+			return proof
+		}
+	}
 	{
 		if err := bindToolChildLifecycle(paneID, name, req); err != nil {
 			if rollbackErr := rollbackToolChild(tabForPane(paneID), paneID, lc, "failed-bind"); rollbackErr != nil {
@@ -1070,29 +1087,6 @@ func AgentStartWithDecision(name, kind, paneID string, req launch.Request) error
 			}
 			_ = launch.RecordRejected(req, nil, err.Error())
 			return fmt.Errorf("tool-child inventory failed: %w", err)
-		}
-	}
-	// FAC-172 acceptance: prove shell/harness/descendants run as BuilderUID.
-	// Proof failure kills exact hosted PIDs (procsignal) and closes the tab.
-	if builderUID > 0 {
-		tabID := tabForPane(paneID)
-		if err := AssertHostedPaneUID(paneID, builderUID); err != nil {
-			proof := FailHostedIsolationProof(paneID, tabID,
-				fmt.Errorf("herdr agent start: hosted uid proof failed: %w", err))
-			if rollbackErr := rollbackToolChild(tabID, paneID, lc, "hosted-uid-proof-failed"); rollbackErr != nil {
-				return errors.Join(proof, rollbackErr)
-			}
-			_ = launch.RecordRejected(req, nil, proof.Error())
-			return proof
-		}
-		if err := AssertAgentHostedAsBuilder(name, builderUID); err != nil {
-			proof := FailHostedIsolationProof(paneID, tabID,
-				fmt.Errorf("herdr agent start: agent descendant uid proof failed: %w", err))
-			if rollbackErr := rollbackToolChild(tabID, paneID, lc, "hosted-uid-agent-proof-failed"); rollbackErr != nil {
-				return errors.Join(proof, rollbackErr)
-			}
-			_ = launch.RecordRejected(req, nil, proof.Error())
-			return proof
 		}
 	}
 	if err := launch.RecordStarted(req, nil); err != nil {
