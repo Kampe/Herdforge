@@ -308,6 +308,9 @@ func main() {
 	case "reset-safe":
 		runResetSafe()
 
+	case "signer-boundary":
+		runSignerBoundary()
+
 	default:
 		fmt.Fprintf(os.Stderr, "unknown subcommand '%s'\nRun 'herd --help' for usage.\n", command)
 		os.Exit(1)
@@ -387,6 +390,7 @@ func printUsage() {
 	fmt.Println("  resources       Snapshot system-resource headroom (free-mem, swap, gate verdict)")
 	fmt.Println("  lock           Advisory shared-checkout lock: with, acquire, release, status")
 	fmt.Println("  reset-safe     Reset a feature worktree after preserving unique commits")
+	fmt.Println("  signer-boundary  OS signing boundary: serve | establish | status | prove | sign (FAC-169)")
 	fmt.Println("  --version       Show herd version")
 }
 
