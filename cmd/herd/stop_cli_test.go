@@ -136,12 +136,21 @@ func TestStopCLIMakesWinddownDurableAndDestroysNoWork(t *testing.T) {
 	}
 
 	// Force is the explicit kill: it still may not reach any work.
+	// FAC-180: unfenced TabClose fails closed, so execute exits non-zero with
+	// blocked_close>0 while still making wind-down durable. That honesty is
+	// the contract — never claim a clean close when the fence refuses.
 	out, err = run("stop", "--execute", "--force-working", "--wait", "0", "--workspace", "wT")
-	if err != nil {
-		t.Fatalf("stop --execute failed: %v\n%s", err, out)
+	if err == nil {
+		t.Fatalf("stop --execute must exit non-zero when FAC-180 blocks close:\n%s", out)
 	}
 	if !strings.Contains(out, "WINDDOWN generation=1") || !strings.Contains(out, "EXECUTED") {
 		t.Fatalf("stop did not report a durable posture: %s", out)
+	}
+	if !strings.Contains(out, "BLOCKED_CLOSE") || !strings.Contains(out, "blocked_close=") {
+		t.Fatalf("stop must report blocked close honestly: %s", out)
+	}
+	if !strings.Contains(out, "closed=0") {
+		t.Fatalf("blocked execute must not claim released capacity: %s", out)
 	}
 
 	var durable winddown.State

@@ -131,12 +131,22 @@ func runStop() {
 		Wait:         *wait,
 	}.Run(ctx, plan)
 
-	mode := "DRY_RUN"
+	// FAC-180: summarize performed outcomes. Unfenced TabClose fails closed;
+	// never claim a clean EXECUTED when closes were blocked.
 	if *execute {
-		mode = "EXECUTED"
+		fmt.Printf("herd stop: EXECUTED workspace=%s closed=%d blocked_close=%d preserved=%d protected=%d signaled=%d unproven=%d\n",
+			ws, res.Closed, res.BlockedClose, res.Preserved, res.Protected, res.Signaled, res.Unproven)
+		if runErr != nil {
+			fmt.Fprintf(os.Stderr, "herd stop: %v\n", runErr)
+			os.Exit(1)
+		}
+		if res.BlockedClose > 0 {
+			os.Exit(1)
+		}
+		return
 	}
-	fmt.Printf("herd stop: %s workspace=%s close=%d preserved=%d protected=%d signaled=%d unproven=%d\n",
-		mode, ws, res.Closed, res.Preserved, res.Protected, res.Signaled, res.Unproven)
+	fmt.Printf("herd stop: DRY_RUN workspace=%s would_close=%d preserved=%d protected=%d\n",
+		ws, res.Closed, res.Preserved, res.Protected)
 	if runErr != nil {
 		fmt.Fprintf(os.Stderr, "herd stop: %v\n", runErr)
 		os.Exit(1)
