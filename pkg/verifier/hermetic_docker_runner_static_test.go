@@ -405,6 +405,7 @@ func TestFAC151HermeticRuntimeArgvBindsCompileArtifactAndPolicy(t *testing.T) {
 		"TMPDIR=" + hermeticGoFixtureTmpDir,
 		"GOTMPDIR=" + hermeticGoFixtureTmpDir,
 		"HOME=" + hermeticGoFixtureTmpDir,
+		hermeticContainerEnv + "=1",
 		hermeticRunPath + "/verifier.test",
 		"-test.run", fixedFAC151Regex(),
 		"-test.count=" + hermeticTestCount,
