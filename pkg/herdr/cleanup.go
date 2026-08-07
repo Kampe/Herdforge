@@ -52,38 +52,25 @@ func SelectCleanupCandidates(agents []AgentEntry, standing map[string]bool) []Cl
 	return out
 }
 
-// TabClose closes a tab over the herdr socket API.
+// TabClose is the legacy unfenced close entrypoint. Autonomous Herdforge
+// callers (cleanup, forge auto-close, FAC-158 reconciliation) MUST NOT use
+// it: FAC-180 requires generation/session compare-and-close via TabCloseCAS
+// / CompareAndCloseTab. This function fails closed so a plain tab-id close
+// can never recycle-kill a tab that gained a new agent between readback and
+// mutation.
+//
+// Internal launch compensation still uses unexported tabCloseRaw after the
+// tool-child lifecycle has already proven the exact pane identity it owns.
 func TabClose(tabID string) error {
-	if err := ReconcileToolChild(tabID, "tab-close"); err != nil {
-		return fmt.Errorf("tool-child teardown before tab close %s: %w", tabID, err)
+	return &CloseUnavailableError{
+		TabID:  tabID,
+		Reason: "FAC-180 atomic generation/session compare-and-close is required; use TabCloseCAS",
 	}
-	lc := lifecycleForTab(tabID)
-	paneID := ""
-	if concrete, ok := lc.(*toolchild.Lifecycle); ok {
-		paneID = concrete.Inventory.Owner.PaneID
-	}
-	if paneID == "" {
-		return fmt.Errorf("tab close %s requires exact lifecycle pane authority", tabID)
-	}
-	out, err := runHerdr("tab", "close", tabID)
-	if err != nil {
-		return fmt.Errorf("herdr tab close %s: %s: %w", tabID, out, err)
-	}
-	if err := verifyHerdrTerminal(tabID, paneID); err != nil {
-		return fmt.Errorf("tab close terminal readback %s: %w", tabID, err)
-	}
-	if err := lc.Invalidate("tab-close"); err != nil {
-		return err
-	}
-	if err := lc.VerifyTerminal(); err != nil {
-		return err
-	}
-	dropToolChild(tabID, paneID)
-	return nil
 }
 
-// Cleanup sweeps the workspace: candidates from live agent list, closed
-// unless dryRun. Returns candidates and per-tab close errors.
+// Cleanup sweeps the workspace: candidates from live agent list. Dry-run
+// returns observe-only candidates; mutation mode is BLOCKED without a
+// FAC-180 fenced decision (TabCloseCAS). Never falls back to plain tab close.
 func Cleanup(standing map[string]bool, dryRun bool) ([]CleanupCandidate, []error) {
 	agents, err := AgentList()
 	if err != nil {
@@ -95,28 +82,44 @@ func Cleanup(standing map[string]bool, dryRun bool) ([]CleanupCandidate, []error
 	}
 	var errs []error
 	for _, c := range cands {
-		if err := TabClose(c.TabID); err != nil {
-			errs = append(errs, err)
-		}
+		errs = append(errs, &CloseUnavailableError{
+			TabID:  c.TabID,
+			Reason: "automatic close requires FAC-180 compare-and-close evidence via TabCloseCAS",
+		})
 	}
 	return cands, errs
 }
 
 // CloseTabForRef closes the herdr tab of the builder agent working a given
-// card ref (FAC-111). The forge calls this once a card reaches done, so the
-// workspace does not rot with finished one-off builders — "one agent = one
-// tab". The agent is named "task-<ref>" by the dispatcher. Returns nil when
-// no such tab exists (already closed / never launched).
+// card ref (FAC-111). Legacy name/ref lookup cannot establish the exact
+// durable generation/session binding FAC-180 requires, so this path fails
+// closed. Callers with a durable reconciliation decision must use TabCloseCAS.
 func CloseTabForRef(ref string) error {
-	agents, err := AgentList()
-	if err != nil {
-		return err
+	return &CloseUnavailableError{
+		TabID:  ref,
+		Reason: "legacy ref/name lookup cannot establish exact durable binding; FAC-180 compare-and-close required",
 	}
-	want := "task-" + strings.ToLower(ref)
-	for _, a := range agents {
-		if strings.EqualFold(a.Name, want) && a.TabID != "" {
-			return TabClose(a.TabID)
-		}
+}
+
+// LegacyTabCloseWithLifecycle is retained only for unit tests that pin the
+// pre-FAC-180 pane-authority gate. Production autonomous code must not call
+// it; it still refuses empty pane authority and never becomes the cleanup path.
+func LegacyTabCloseWithLifecycle(tabID string) error {
+	if err := ReconcileToolChild(tabID, "tab-close"); err != nil {
+		return fmt.Errorf("tool-child teardown before tab close %s: %w", tabID, err)
 	}
-	return nil
+	lc := lifecycleForTab(tabID)
+	paneID := ""
+	if concrete, ok := lc.(*toolchild.Lifecycle); ok {
+		paneID = concrete.Inventory.Owner.PaneID
+	}
+	if paneID == "" {
+		return fmt.Errorf("tab close %s requires exact lifecycle pane authority", tabID)
+	}
+	// Even the legacy lifecycle helper refuses plain close after FAC-180:
+	// pane authority alone is not a generation fence.
+	return &CloseUnavailableError{
+		TabID:  tabID,
+		Reason: "lifecycle pane authority is not a generation fence; FAC-180 compare-and-close required",
+	}
 }

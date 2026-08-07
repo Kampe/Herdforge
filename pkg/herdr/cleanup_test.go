@@ -26,18 +26,32 @@ func TestSelectCleanupCandidates(t *testing.T) {
 	}
 }
 
-func TestCloseTabForRef_NoMatchIsNil(t *testing.T) {
-	// With no live herdr, AgentList errors; the function must return that
-	// error, not panic — and a matching-name lookup is exercised in the
-	// pure candidate-selection path already tested above.
+func TestCloseTabForRef_FailsClosedWithoutFencedBinding(t *testing.T) {
+	// FAC-180: legacy ref lookup cannot establish generation/session fence.
 	if err := CloseTabForRef("FAC-999"); err == nil {
-		// In a real herdr session this would find nothing and return nil;
-		// hermetic CI has no herdr so an error (CLI missing) is expected.
-		t.Skip("herdr present — no-match returned nil as designed")
+		t.Fatal("CloseTabForRef must fail closed without FAC-180 compare-and-close")
 	}
 }
 
-func TestTabCloseFailsClosedWithoutExactPaneAuthority(t *testing.T) {
+func TestTabCloseFailsClosedWithoutCompareAndClose(t *testing.T) {
+	oldRun := runHerdr
+	defer func() { runHerdr = oldRun }()
+	closeCalled := false
+	runHerdr = func(args ...string) (string, error) {
+		if len(args) >= 2 && args[0] == "tab" && args[1] == "close" {
+			closeCalled = true
+		}
+		return `{}`, nil
+	}
+	if err := TabClose("tab-no-pane"); err == nil {
+		t.Fatal("unfenced TabClose must fail closed")
+	}
+	if closeCalled {
+		t.Fatal("unfenced TabClose reached plain herdr tab close")
+	}
+}
+
+func TestLegacyTabCloseWithLifecycleStillRequiresPaneAndFence(t *testing.T) {
 	events := []string{}
 	lc := &rollbackLifecycle{bound: true, events: &events}
 	toolChildMu.Lock()
@@ -53,7 +67,7 @@ func TestTabCloseFailsClosedWithoutExactPaneAuthority(t *testing.T) {
 		}
 		return `{}`, nil
 	}
-	if err := TabClose("tab-no-pane"); err == nil {
+	if err := LegacyTabCloseWithLifecycle("tab-no-pane"); err == nil {
 		t.Fatal("empty pane authority must fail closed")
 	}
 	if closeCalled {
