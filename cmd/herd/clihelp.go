@@ -57,7 +57,7 @@ var subcommandUsage = map[string]string{
 	"verify":        "Usage: herd verify [--build cmd] [--test cmd] [worktree]\n  Completion gate: real commits + build + tests.",
 	"selftest":      "Usage: herd selftest\n  Run self-test assertion suite against the active repository.",
 	"status":        "Usage: herd status\n  Show herd workspace / daemon status.",
-	"pulse":         "Usage: herd pulse [--role <role>]\n  Claim sweep for the given role.",
+	"pulse":         "Usage: herd pulse [--act [--spawn]] [--json] [--quiet] [--reason TEXT]\n  Coordinator heartbeat: observe by default; --act applies bounded renewals/callbacks.",
 	"wind-down":     "Usage: herd wind-down <on|off|status> [flags]\n  Control durable fleet launch posture.",
 	"hold":          "Usage: herd hold <task> on|off|status --lane <name> --owner <role> [flags]\n  Generation-fenced lane/task hold.",
 	"standing":      "Usage: herd standing\n  Standing-lane receive / reconcile loop.",
