@@ -596,7 +596,13 @@ func (d *Dispatcher) Dispatch(ctx context.Context, opts DispatchOptions) (*Dispa
 			return nil, failOwned("scopefence_error", aerr)
 		}
 		if !admission.Granted {
-			return nil, failOwned("scopefence_rejected", fmt.Errorf("dispatch scope fence rejected: %s", admission.Evidence.Reason))
+			// Always name the revision. A fence rejection is only actionable
+			// if you know which deps-graph revision to publish against, and
+			// that hash appears nowhere else in the output.
+			return nil, failOwned("scopefence_rejected", fmt.Errorf(
+				"dispatch scope fence rejected: %s (graph revision %s)\n"+
+					"  republish scope at this revision: herd scope publish %s --revision %s --packages <pkg>",
+				admission.Evidence.Reason, pre.GraphRevision, task.Ref, pre.GraphRevision))
 		}
 		if admission.Lease == nil {
 			return nil, failOwned("scopefence_missing_lease", errors.New("scopefence granted without durable lease"))
