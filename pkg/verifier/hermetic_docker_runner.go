@@ -682,7 +682,13 @@ func (d fixedDockerCLI) Start(ctx context.Context, id string) error {
 }
 
 func (d fixedDockerCLI) Copy(ctx context.Context, id, destination string, input []byte) error {
-	_, err := d.run(ctx, input, []string{"cp", "-", id + ":" + destination})
+	// docker cp rejects --read-only containers even when the destination is a
+	// writable tmpfs mount (Colima/Docker Engine). Extract the transport tar
+	// through docker exec into the already-proved directory instead.
+	if destination == "" || !strings.HasPrefix(destination, "/") {
+		return errors.New("copy destination must be an absolute container path")
+	}
+	_, err := d.run(ctx, input, []string{"exec", "-i", id, "/bin/tar", "-x", "-C", destination, "-f", "-"})
 	return err
 }
 
