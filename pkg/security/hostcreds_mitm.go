@@ -55,15 +55,18 @@ type BrokerReceipt struct {
 type TLSMitmProxy struct {
 	mu sync.Mutex
 
-	ln      net.Listener
-	addr    string
-	ca      *mitmCA
-	caPath  string
-	caDir   string // owned temp dir if we created it
-	auth    CredentialAuthority
-	rules   []RequestRule
-	hosts   map[string]bool
-	session string
+	ln     net.Listener
+	addr   string
+	ca     *mitmCA
+	caPath string
+	caDir  string // owned temp dir if we created it
+	auth   CredentialAuthority
+	rules  []RequestRule
+	hosts  map[string]bool
+	// allowLoopback is derived from hosts at construction (loopback IP literal
+	// present in the allowlist). Never widens the allowlist itself.
+	allowLoopback bool
+	session       string
 	// allowed PIDs (Linux secondary; single-use).
 	allowed map[int]bool
 	// oneShot: port → PeerGrant (consumed on first authorizePeer match).
@@ -138,23 +141,34 @@ func StartTLSMitmProxy(sessionID string, auth CredentialAuthority, rules []Reque
 		return nil, err
 	}
 	hosts := map[string]bool{}
+	// allowLoopback is derived from the allowlist, never passed in: it only lets
+	// a host that is ALREADY allowlisted normalize, so it cannot widen policy.
+	// Production kinds map to DNS provider hosts, so this stays false for them.
+	// Without it, handle() normalized with a hardcoded false and a loopback
+	// component session could never reach its own allowlisted host.
+	allowLoopback := false
 	for _, r := range rules {
-		hosts[strings.ToLower(r.Host)] = true
+		h := strings.ToLower(r.Host)
+		hosts[h] = true
+		if ip := net.ParseIP(h); ip != nil && ip.IsLoopback() {
+			allowLoopback = true
+		}
 	}
 	p := &TLSMitmProxy{
-		ln:      ln,
-		addr:    ln.Addr().String(),
-		ca:      ca,
-		caPath:  caPath,
-		caDir:   "",
-		auth:    auth,
-		rules:   append([]RequestRule(nil), rules...),
-		hosts:   hosts,
-		session: sessionID,
-		allowed: map[int]bool{},
-		oneShot: map[int]*PeerGrant{},
-		maxReqs: maxReqs,
-		conns:   map[net.Conn]struct{}{},
+		ln:            ln,
+		addr:          ln.Addr().String(),
+		ca:            ca,
+		caPath:        caPath,
+		caDir:         "",
+		auth:          auth,
+		rules:         append([]RequestRule(nil), rules...),
+		hosts:         hosts,
+		allowLoopback: allowLoopback,
+		session:       sessionID,
+		allowed:       map[int]bool{},
+		oneShot:       map[int]*PeerGrant{},
+		maxReqs:       maxReqs,
+		conns:         map[net.Conn]struct{}{},
 	}
 	if owned {
 		p.caDir = caDir
@@ -443,7 +457,7 @@ func (p *TLSMitmProxy) handle(c net.Conn) {
 		_, _ = io.WriteString(c, "HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n")
 		return
 	}
-	nh, nerr := NormalizeHost(host, false)
+	nh, nerr := NormalizeHost(host, p.allowLoopback)
 	if nerr != nil || !p.hosts[nh] {
 		p.mu.Lock()
 		p.DeniedConnects++
@@ -836,13 +850,138 @@ func HarnessProxyEnv(mitm *TLSMitmProxy, sessionID string) []string {
 	}
 }
 
-// ProveMITMExactHost: CONNECT to denied host must 403 from a real child with
-// inherited one-shot peer FD (no claim-file, no flaky lsof).
+// ProveMITMExactHost proves the CONNECT host allowlist itself.
+//
+// The peer MUST be attributed on both legs (fresh one-shot claim FD each time),
+// so the only variable is the host. An unattributed dial is denied by
+// authorizePeer before handle() ever reaches the host check, which is why the
+// earlier child-based prover could not observe host policy at all: its deny leg
+// was a bare dial and the 403 came from peer attribution.
+//
+// Two legs, because a 403-only assertion also passes on a wholly broken proxy:
+//
+//	negative — attributed CONNECT to deniedHost must 403 and must NOT count a connect
+//	positive — attributed CONNECT to an allowlisted host must pass the host gate
+//
+// ConnectCount is bumped immediately after the host check and before any
+// upstream dial, so it is the exact host-gate boundary and needs no network.
 func ProveMITMExactHost(mitm *TLSMitmProxy, deniedHost string) error {
 	if mitm == nil {
 		return fmt.Errorf("nil mitm")
 	}
-	return proveCONNECTFromChild(mitm, deniedHost, true)
+	allowHost := mitm.anAllowedHost()
+	if allowHost == "" {
+		return fmt.Errorf("proxy has no allowlisted host; nothing to contrast")
+	}
+	if nh, err := NormalizeHost(deniedHost, false); err == nil && nh == allowHost {
+		return fmt.Errorf("denied host %q is the allowlisted host; vacuous", deniedHost)
+	}
+
+	// Negative leg: attributed peer, non-allowlisted host.
+	beforeC, beforeD := mitm.counters()
+	status, err := attributedCONNECTStatus(mitm, deniedHost)
+	if err != nil {
+		return fmt.Errorf("denied-host leg: %w", err)
+	}
+	afterC, afterD := mitm.counters()
+	if !strings.Contains(status, "403") {
+		return fmt.Errorf("attributed CONNECT to non-allowlisted %q not denied: %q", deniedHost, status)
+	}
+	if afterD == beforeD {
+		return fmt.Errorf("denied-host leg did not register a denial (host gate not reached)")
+	}
+	if afterC != beforeC {
+		return fmt.Errorf("non-allowlisted %q passed the host gate (ConnectCount %d→%d)", deniedHost, beforeC, afterC)
+	}
+
+	// Positive control: identical attributed path, allowlisted host, must pass
+	// the host gate. Without this the negative leg proves nothing.
+	beforeC2, _ := mitm.counters()
+	if err := attributedCONNECTPassesHostGate(mitm, allowHost, beforeC2); err != nil {
+		return fmt.Errorf("allowlisted %q wrongly denied — denied-host leg is vacuous: %w", allowHost, err)
+	}
+	return nil
+}
+
+// counters reads the observability counters under the proxy lock.
+func (p *TLSMitmProxy) counters() (connects, deniedConnects int) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.ConnectCount, p.DeniedConnects
+}
+
+// anAllowedHost returns one allowlisted host (deterministic: lowest sorted).
+func (p *TLSMitmProxy) anAllowedHost() string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	best := ""
+	for h := range p.hosts {
+		if best == "" || h < best {
+			best = h
+		}
+	}
+	return best
+}
+
+// attributedCONNECTStatus issues one CONNECT from a freshly granted one-shot
+// peer and returns the proxy's status line. Peer attribution succeeds by
+// construction, so any 403 is host/port policy.
+func attributedCONNECTStatus(mitm *TLSMitmProxy, host string) (string, error) {
+	conn, err := dialAttributed(mitm)
+	if err != nil {
+		return "", err
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
+	if _, err := fmt.Fprintf(conn, "CONNECT %s:443 HTTP/1.1\r\nHost: %s:443\r\n\r\n", host, host); err != nil {
+		return "", err
+	}
+	buf := make([]byte, 128)
+	n, _ := conn.Read(buf)
+	return string(buf[:n]), nil
+}
+
+// attributedCONNECTPassesHostGate asserts an attributed CONNECT to host gets
+// past the allowlist. It waits on ConnectCount rather than the status line so
+// no upstream network is required (the counter bumps before any dial).
+func attributedCONNECTPassesHostGate(mitm *TLSMitmProxy, host string, before int) error {
+	conn, err := dialAttributed(mitm)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
+	if _, err := fmt.Fprintf(conn, "CONNECT %s:443 HTTP/1.1\r\nHost: %s:443\r\n\r\n", host, host); err != nil {
+		return err
+	}
+	if !waitUntil(5*time.Second, func() bool {
+		c, _ := mitm.counters()
+		return c > before
+	}) {
+		return fmt.Errorf("ConnectCount never advanced past %d", before)
+	}
+	return nil
+}
+
+// dialAttributed binds an exclusive source port, grants it one-shot, and dials
+// the proxy from it — the same kernel-owned attribution a real author child gets.
+func dialAttributed(mitm *TLSMitmProxy) (net.Conn, error) {
+	port, f, err := ClaimLocalPort()
+	if err != nil {
+		return nil, err
+	}
+	if err := mitm.AllowOneShotPeer(PeerGrant{
+		Port: port, SessionID: mitm.session, CapabilityNonce: "hostpolicy",
+	}); err != nil {
+		_ = f.Close()
+		return nil, err
+	}
+	conn, err := ConnectClaimed(f, mitm.Addr())
+	_ = f.Close()
+	if err != nil {
+		return nil, err
+	}
+	return conn, nil
 }
 
 // ProveMITMRequiresAllowPID: without peer registration, CONNECT fail-closed.
