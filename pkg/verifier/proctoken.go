@@ -1,8 +1,10 @@
 package verifier
 
 import (
+	"errors"
 	"fmt"
 	"os"
+	"syscall"
 )
 
 // processSnapshot is one native enumeration of the system process table.
@@ -112,6 +114,12 @@ func openHandle(tok procToken) (ownedHandle, error) {
 		// Process may have exited between discovery and open.
 		if !tok.stillSame() {
 			return ownedHandle{}, fmt.Errorf("openHandle: pid %d gone: %w", tok.pid, err)
+		}
+		// Some confined containers (cap-drop ALL) reject pidfd_open with EPERM
+		// even for same-uid processes. Fall back to token-only kill so
+		// identity-bound reaping still works without host-wide -pgid signals.
+		if errors.Is(err, syscall.EPERM) || errors.Is(err, os.ErrPermission) {
+			return ownedHandle{tok: tok, fd: -1}, nil
 		}
 		return ownedHandle{}, fmt.Errorf("openHandle pid %d: %w", tok.pid, err)
 	}
