@@ -17,12 +17,17 @@ import (
 // WHY (incident, 2026-07-28, chainseer): marking done is a claim about
 // reality, and nothing checked it. Cards were moved to done while the merge
 // had been REFUSED by a gate, because the board write was chained behind a
-// pipe whose tail exited 0. Proof is by CONTENT, not commit message alone:
-// tickets have shipped with zero commits naming them, so an explicit
-// --evidence ancestor commit is accepted as first-class proof.
+// pipe whose tail exited 0.
+//
+// The first fix proved by CONTENT rather than commit message alone, accepting
+// an explicit --evidence ancestor commit as first-class proof. FAC-132 removed
+// that too: an arbitrary ancestor says nothing about a specific task, and a
+// commit subject says nothing about what it contains. Closing authority now
+// lives entirely in CompletionReceipt (donereceipt.go).
 
-// ErrNoEvidence marks an honest refusal: no proof the work is on origin/main.
-var ErrNoEvidence = errors.New("no merge evidence found on origin/main")
+// ErrNoEvidence marks an honest refusal: nothing proves this task's accepted
+// candidate is on origin/main.
+var ErrNoEvidence = errors.New("no completion receipt proves this task landed")
 
 var zeroPadRef = regexp.MustCompile(`^([A-Za-z]+-)0+([0-9])`)
 
@@ -39,12 +44,19 @@ func git(repoDir string, args ...string) (string, error) {
 	return strings.TrimSpace(string(out)), err
 }
 
-// MergeEvidence returns a human-readable proof that ref's work is on
-// origin/main, or "" when no proof exists. Order of proof:
+// MergeEvidence returns a human-readable HINT that ref's work may be on
+// origin/main, or "" when nothing matches. Order:
 //  1. an explicit evidenceSHA that is an ancestor of origin/main (hard error
 //     if given but NOT an ancestor — a wrong claim must not fall through), or
 //  2. a commit on origin/main naming the ref, with an explicit non-digit
 //     boundary so FAC-18 does not match FAC-180 (git's POSIX ERE has no \b).
+//
+// FAC-132: this is a DISCOVERY HINT, not closing authority. Neither form
+// proves a specific task's accepted candidate landed — an empty commit whose
+// subject names the ticket satisfies (2), and any unrelated ancestor satisfies
+// (1). BoardDone no longer consults it; only CompletionReceipt closes a card.
+// It is still used for post-merge ancestry readback in the harvest pipeline
+// and to surface suspicious historical closures in AuditDone.
 func MergeEvidence(repoDir, ref, evidenceSHA string) (string, error) {
 	// Refresh origin/main; offline is fine, we check against the local ref.
 	_, _ = git(repoDir, "fetch", "-q", "origin", "main")
@@ -60,12 +72,19 @@ func MergeEvidence(repoDir, ref, evidenceSHA string) (string, error) {
 		return fmt.Sprintf("explicit evidence commit %s is an ancestor of origin/main", short), nil
 	}
 
+	return commitHint(repoDir, ref), nil
+}
+
+// commitHint is the commit-subject match on its own, WITHOUT the fetch, so a
+// caller sweeping many refs pays for one refresh instead of one per ref. The
+// non-digit boundary is explicit because git's POSIX ERE has no \b.
+func commitHint(repoDir, ref string) string {
 	hit, err := git(repoDir, "log", "origin/main", "--format=%h %s", "-E",
 		"--grep="+ref+`([^0-9]|$)`, "-1")
-	if err == nil && hit != "" {
-		return fmt.Sprintf("origin/main carries a commit naming %s: %s", ref, hit), nil
+	if err != nil || hit == "" {
+		return ""
 	}
-	return "", nil
+	return fmt.Sprintf("origin/main carries a commit naming %s: %s", ref, hit)
 }
 
 // DoneResult reports what BoardDone did and why it was allowed to.
@@ -73,30 +92,106 @@ type DoneResult struct {
 	Ref           string
 	TaskID        string
 	Proof         string
-	Forced        bool
+	Overridden    bool
 	CommentPosted bool
+	// Idempotent is true when this exact receipt had already been consumed
+	// and no provider mutation was attempted.
+	Idempotent    bool
+	ReceiptDigest string
 }
 
-// BoardDone moves the ticket with the given ref to done, gated on merge
-// evidence, and verifies the write by READ-BACK: board APIs are known to
-// report success on writes that did not persist.
-func BoardDone(ctx context.Context, tp provider.TaskProvider, repoDir, projectID, ref, evidenceSHA string, force bool) (*DoneResult, error) {
-	ref = NormalizeRef(ref)
+// DoneRequest is everything BoardDone needs to decide whether a card may
+// close. Exactly one of Receipt or Override supplies the authority; supplying
+// neither refuses, and supplying both refuses (an override is for the case
+// where there IS no receipt).
+type DoneRequest struct {
+	RepoDir   string
+	ProjectID string
+	Ref       string
+	// Receipt is the automatic authority: a sealed, task-bound completion
+	// receipt. Requires Lifecycle.
+	Receipt *CompletionReceipt
+	// Lifecycle is the durable state authority consulted for receipt-driven
+	// transitions. Nil refuses.
+	Lifecycle LifecycleAuthority
+	// Override is the manual authority: explicit, policy-limited,
+	// attributable, and appended to the append-only done log.
+	Override *OverrideRequest
+}
 
-	proof, err := MergeEvidence(repoDir, ref, evidenceSHA)
+// BoardDone moves the ticket with the given ref to done, gated on a task-bound
+// completion receipt (or an explicit policy-limited manual override), and
+// verifies the write by READ-BACK: board APIs are known to report success on
+// writes that did not persist.
+//
+// FAC-132: a commit subject naming the ticket, and an unrelated origin/main
+// ancestor, are both refused here. Neither is task evidence.
+func BoardDone(ctx context.Context, tp provider.TaskProvider, req DoneRequest) (*DoneResult, error) {
+	ref := NormalizeRef(req.Ref)
+	repoDir := req.RepoDir
+	if repoDir == "" {
+		repoDir = "."
+	}
+
+	var proof string
+	var override *OverrideRecord
+	switch {
+	case req.Receipt != nil && req.Override != nil:
+		return nil, fmt.Errorf("%w for %s: a manual override cannot accompany a receipt; "+
+			"drop one of them so the closing authority is unambiguous", ErrNoEvidence, ref)
+
+	case req.Receipt != nil:
+		if req.Lifecycle == nil {
+			return nil, fmt.Errorf("%w for %s: no lifecycle state authority configured; "+
+				"a receipt alone cannot prove the task is past integration", ErrNoEvidence, ref)
+		}
+		st, err := req.Lifecycle.CurrentState(ref)
+		if err != nil {
+			return nil, fmt.Errorf("lifecycle state for %s: %w", ref, err)
+		}
+		if err := req.Receipt.Validate(repoDir, ref, st); err != nil {
+			return nil, fmt.Errorf("%w for %s: %v", ErrNoEvidence, ref, err)
+		}
+		proof = fmt.Sprintf("completion receipt %s: candidate %s merged as %s, patch %s, verification %s, tier %s, %s reviewed by %s",
+			shortDigest(req.Receipt.Digest), shortSHA(req.Receipt.CandidateSHA), shortSHA(req.Receipt.MergeSHA),
+			shortDigest(req.Receipt.PatchID), shortDigest(req.Receipt.VerificationDigest),
+			req.Receipt.RiskTier, req.Receipt.AuthorFamily, req.Receipt.ReviewerFamily)
+
+	case req.Override != nil:
+		rec, err := authorizeOverride(*req.Override)
+		if err != nil {
+			return nil, fmt.Errorf("%w for %s: %v", ErrNoEvidence, ref, err)
+		}
+		override = rec
+		proof = fmt.Sprintf("manual override by %s under policy %s (%s): %s [evidence: %s]",
+			rec.Actor, rec.Policy, rec.Decision, rec.Reason, rec.Evidence)
+
+	default:
+		return nil, fmt.Errorf("%w for %s: no completion receipt at %s. A commit naming the ref is a "+
+			"discovery hint, not proof. Supply the receipt the integration produced, or close it manually with "+
+			"--override-policy/--override-actor/--override-reason/--override-evidence",
+			ErrNoEvidence, ref, ReceiptPath(repoDir, ref))
+	}
+
+	// Exactly-once: a receipt already recorded in the append-only done log
+	// never advances the card a second time. Read errors refuse rather than
+	// look like "not yet consumed".
+	log, err := ReadDoneLog(repoDir)
 	if err != nil {
 		return nil, err
 	}
-	if proof == "" {
-		if !force {
-			return nil, fmt.Errorf("%w for %s: no commit on origin/main names it and no evidence commit was given; "+
-				"if the work truly landed without naming the ref, prove it by content: herd board-done %s --evidence <sha>",
-				ErrNoEvidence, ref, ref)
+	if req.Receipt != nil {
+		for _, rec := range log {
+			if rec.ReceiptDigest != "" && rec.ReceiptDigest == req.Receipt.Digest {
+				return &DoneResult{
+					Ref: ref, TaskID: rec.TaskID, Proof: proof,
+					Idempotent: true, ReceiptDigest: req.Receipt.Digest,
+				}, nil
+			}
 		}
-		proof = "operator --force, no automatic evidence found"
 	}
 
-	tasks, err := tp.ListTasks(ctx, projectID, "")
+	tasks, err := tp.ListTasks(ctx, req.ProjectID, "")
 	if err != nil {
 		return nil, boardCallErr("list tasks", err)
 	}
@@ -109,6 +204,13 @@ func BoardDone(ctx context.Context, tp provider.TaskProvider, repoDir, projectID
 	}
 	if task == nil {
 		return nil, fmt.Errorf("no task with ref %s on the board", ref)
+	}
+	// Task binding: the receipt names the provider task it was minted for. A
+	// ref match alone is not enough — refs are re-minted across board
+	// rollbacks, and a re-minted card is a different task.
+	if req.Receipt != nil && req.Receipt.TaskID != task.ID {
+		return nil, fmt.Errorf("%w for %s: receipt is bound to task id %s but the board card is %s",
+			ErrNoEvidence, ref, req.Receipt.TaskID, task.ID)
 	}
 
 	if err := tp.UpdateStatus(ctx, task.ID, "done"); err != nil {
@@ -123,7 +225,23 @@ func BoardDone(ctx context.Context, tp provider.TaskProvider, repoDir, projectID
 		return nil, fmt.Errorf("write reported success but %s reads back as %q", ref, back.Status)
 	}
 
-	res := &DoneResult{Ref: ref, TaskID: task.ID, Proof: proof, Forced: force && !strings.Contains(proof, "origin/main")}
+	// The durable record is appended AFTER the readback, so a crash between
+	// the two leaves a done card with no record — which replays safely (the
+	// status write is idempotent) — rather than a record for a write that
+	// never landed.
+	rec := DoneRecord{
+		Timestamp: nowStamp(), Ref: ref, TaskID: task.ID,
+		ProviderReadback: back.Status, Override: override,
+	}
+	if req.Receipt != nil {
+		rec.ReceiptDigest = req.Receipt.Digest
+		rec.MergeSHA = req.Receipt.MergeSHA
+	}
+	if err := appendDoneRecord(repoDir, rec); err != nil {
+		return nil, fmt.Errorf("%s reads back as done but its closure could not be recorded (re-run to record): %w", ref, err)
+	}
+
+	res := &DoneResult{Ref: ref, TaskID: task.ID, Proof: proof, Overridden: override != nil, ReceiptDigest: rec.ReceiptDigest}
 	// Comment is best-effort only when the call is non-timeout; timeout/ambiguous
 	// must not look like success with CommentPosted (FAC-150).
 	if err := tp.AddComment(ctx, task.ID, "board-done: "+proof); err != nil {
@@ -135,6 +253,20 @@ func BoardDone(ctx context.Context, tp provider.TaskProvider, repoDir, projectID
 		res.CommentPosted = true
 	}
 	return res, nil
+}
+
+func shortSHA(s string) string {
+	if len(s) > 12 {
+		return s[:12]
+	}
+	return s
+}
+
+func shortDigest(s string) string {
+	if len(s) > 16 {
+		return s[:16]
+	}
+	return s
 }
 
 // boardCallErr projects provider timeout/ambiguous as BLOCKED(provider_timeout).

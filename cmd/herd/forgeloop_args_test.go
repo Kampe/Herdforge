@@ -24,19 +24,48 @@ func TestParseReviewArgs_SpawnAfterRef(t *testing.T) {
 	}
 }
 
-// Same swallowed-flag defect on the approve path the loop drives.
+// Same swallowed-flag defect on the approve path the loop drives. FAC-132
+// replaced --force/--evidence with --receipt and the --override-* quartet;
+// the property under test is unchanged — a flag placed AFTER the ref must
+// still reach the parser.
 func TestParseApproveArgs_FlagsAfterRef(t *testing.T) {
-	ref, evidence, force := parseApproveArgs([]string{"FAC-2", "--force", "--evidence", "deadbeef"})
+	ref, receipt, ov := parseApproveArgs([]string{
+		"FAC-2", "--receipt", "r.json",
+		"--override-policy", "duplicate-card", "--override-actor", "kampe",
+		"--override-reason", "dupe", "--override-evidence", "deadbeef",
+	})
 	if ref != "FAC-2" {
 		t.Fatalf("ref=%q want FAC-2", ref)
 	}
-	if !force {
-		t.Fatal("--force after the ref was swallowed")
+	if receipt != "r.json" {
+		t.Fatalf("--receipt after the ref was swallowed: %q", receipt)
 	}
-	if evidence != "deadbeef" {
-		t.Fatalf("--evidence after the ref was swallowed: %q", evidence)
+	req, err := ov.request()
+	if err != nil {
+		t.Fatalf("override request: %v", err)
 	}
-	if ref, evidence, force := parseApproveArgs([]string{"FAC-2"}); ref != "FAC-2" || evidence != "" || force {
-		t.Fatalf("bare ref must not force or carry evidence: %q %q %v", ref, evidence, force)
+	if req == nil {
+		t.Fatal("the --override-* quartet after the ref was swallowed entirely")
+	}
+	if req.Policy != "duplicate-card" || req.Actor != "kampe" || req.Reason != "dupe" || req.Evidence != "deadbeef" {
+		t.Fatalf("an --override-* flag after the ref was swallowed: %+v", req)
+	}
+
+	ref, receipt, ov = parseApproveArgs([]string{"FAC-2"})
+	req, err = ov.request()
+	if err != nil {
+		t.Fatalf("bare ref: %v", err)
+	}
+	if ref != "FAC-2" || receipt != "" || req != nil {
+		t.Fatalf("bare ref must carry no receipt and no override: %q %q %+v", ref, receipt, req)
+	}
+}
+
+// --force is refused even when it lands after the ref, so the old muscle
+// memory fails loudly instead of being parsed as a swallowed false.
+func TestParseApproveArgs_ForceAfterRefIsRefused(t *testing.T) {
+	_, _, ov := parseApproveArgs([]string{"FAC-2", "--force"})
+	if _, err := ov.request(); err == nil {
+		t.Fatal("--force after the ref must be refused, not silently ignored")
 	}
 }

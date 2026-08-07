@@ -221,6 +221,9 @@ func main() {
 	case "board-done":
 		runBoardDone()
 
+	case "board-audit":
+		runBoardAudit()
+
 	case "board-sync":
 		runBoardSync()
 
@@ -378,7 +381,8 @@ func printUsage() {
 	fmt.Println("  review     Claim in-progress tasks for reviewer and advance to review status")
 	fmt.Println("  approve    Move in-review cards to done, gated on merge evidence")
 	fmt.Println("  drain      Report coordinator review pile (optional bounded --act)")
-	fmt.Println("  board-done Move one card to done ONLY with proof its work is on origin/main")
+	fmt.Println("  board-done Move one card to done ONLY from a task-bound completion receipt")
+	fmt.Println("  board-audit Report Done cards that no completion receipt closed (read-only)")
 	fmt.Println("  board-sync Reconcile board status against git reality (report only)")
 	fmt.Println("  sh         Interactive shell: run herd subcommands in a loop")
 	fmt.Println("  send       Submit text to a herdr agent pane and verify consumption")
@@ -1660,22 +1664,29 @@ Do not read the whole codebase. Do not run the full suite. Change nothing.`,
 	}
 }
 
-// parseApproveArgs parses `herd approve [<ref>] [--force] [--evidence <sha>]`.
-// Same swallowed-flag defect as review (FAC-138): with the ref first, --force
-// and --evidence silently parsed as their zero values.
-func parseApproveArgs(args []string) (ref, evidence string, force bool) {
+// parseApproveArgs parses `herd approve [<ref>] [--receipt <path>] [--override-* ...]`.
+// Same swallowed-flag defect as review (FAC-138): with the ref first, the flags
+// silently parsed as their zero values, so the leading positional comes out
+// BEFORE parsing.
+func parseApproveArgs(args []string) (ref, receiptPath string, ov overrideFlags) {
 	fs := flag.NewFlagSet("approve", flag.ExitOnError)
-	forceFlag := fs.Bool("force", false, "Approve without merge evidence (look at the diff first)")
-	evidenceFlag := fs.String("evidence", "", "Proof commit SHA (only with a single <ref> argument)")
+	receiptFlag := fs.String("receipt", "", "Completion receipt path (only with a single <ref> argument)")
+	ovFlags := registerOverrideFlags(fs)
 	fs.Parse(leadingPositionalArgs(args))
-	return fs.Arg(0), *evidenceFlag, *forceFlag
+	return fs.Arg(0), *receiptFlag, ovFlags
 }
 
-// runApprove sweeps in-review cards and moves each to done ONLY with merge
-// evidence on origin/main (via sync.BoardDone). Cards without proof are
+// runApprove sweeps in-review cards and moves each to done ONLY from a
+// task-bound completion receipt (via sync.BoardDone). Cards without one are
 // refused and stay in-review — a done card is a claim about reality.
 func runApprove() {
-	refArg, evidenceArg, forceArg := parseApproveArgs(os.Args[2:])
+	refArg, receiptPathArg, ovFlags := parseApproveArgs(os.Args[2:])
+
+	override, ovErr := ovFlags.request()
+	if ovErr != nil {
+		fmt.Fprintf(os.Stderr, "herd approve: %v\n", ovErr)
+		os.Exit(1)
+	}
 
 	cfg, err := config.LoadConfig(".herd/herd.yaml")
 	if err != nil {
@@ -1710,8 +1721,8 @@ func runApprove() {
 			fmt.Fprintf(os.Stderr, "no in-review card matches %s\n", want)
 			os.Exit(1)
 		}
-	} else if evidenceArg != "" {
-		fmt.Fprintf(os.Stderr, "--evidence needs a single <ref> argument\n")
+	} else if receiptPathArg != "" || override != nil {
+		fmt.Fprintf(os.Stderr, "--receipt and --override-* need a single <ref> argument\n")
 		os.Exit(1)
 	}
 
@@ -1726,10 +1737,22 @@ func runApprove() {
 
 	approved, refused, failed := 0, 0, 0
 	for _, task := range tasks {
-		res, err := hsync.BoardDone(ctx, tp, ".", cfg.TaskProvider.ProjectID, task.Ref, evidenceArg, forceArg)
+		req, closeAuthority, buildErr := buildDoneRequest(".", cfg.TaskProvider.ProjectID, task.Ref, receiptPathArg, override)
+		if buildErr != nil {
+			closeAuthority()
+			fmt.Fprintf(os.Stderr, "ERROR    [%s]: %v\n", task.Ref, buildErr)
+			failed++
+			continue
+		}
+		res, err := hsync.BoardDone(ctx, tp, req)
+		closeAuthority()
 		switch {
 		case err == nil:
-			fmt.Printf("APPROVED [%s]: %s\n  proof: %s\n", res.Ref, task.Title, res.Proof)
+			if res.Idempotent {
+				fmt.Printf("ALREADY  [%s]: %s\n  receipt %s was already consumed\n", res.Ref, task.Title, res.ReceiptDigest)
+			} else {
+				fmt.Printf("APPROVED [%s]: %s\n  proof: %s\n", res.Ref, task.Title, res.Proof)
+			}
 			approved++
 		case errors.Is(err, hsync.ErrNoEvidence):
 			fmt.Printf("REFUSED  [%s]: %s\n  %v\n", task.Ref, task.Title, err)
@@ -1750,8 +1773,8 @@ func runApprove() {
 // provably moved to done. Port of bin/herd-board-done.
 func runBoardDone() {
 	fs := flag.NewFlagSet("board-done", flag.ExitOnError)
-	evidence := fs.String("evidence", "", "Explicit proof commit SHA (must be an ancestor of origin/main)")
-	force := fs.Bool("force", false, "Override missing evidence (look at the diff first)")
+	receiptPath := fs.String("receipt", "", "Completion receipt path (default .herd/receipts/<REF>.json)")
+	ovFlags := registerOverrideFlags(fs)
 	selftestFlag := fs.Bool("selftest", false, "Run normalization/repo assertions and exit")
 	// Pull the leading positional out BEFORE parsing. Go's flag package stops
 	// at the first non-flag argument, so `board-done FAC-136 --evidence <sha>`
@@ -1776,8 +1799,14 @@ func runBoardDone() {
 
 	ref := fs.Arg(0)
 	if ref == "" {
-		fmt.Fprintf(os.Stderr, "Usage: herd board-done <ref> [--evidence <sha>] [--force]\n")
+		fmt.Fprintf(os.Stderr, "Usage: herd board-done <ref> [--receipt <path>] "+
+			"[--override-policy <p> --override-actor <who> --override-reason <why> --override-evidence <what>]\n")
 		os.Exit(2)
+	}
+	override, ovErr := ovFlags.request()
+	if ovErr != nil {
+		fmt.Fprintf(os.Stderr, "herd board-done: %v\n", ovErr)
+		os.Exit(1)
 	}
 
 	cfg, err := config.LoadConfig(".herd/herd.yaml")
@@ -1792,18 +1821,19 @@ func runBoardDone() {
 		os.Exit(1)
 	}
 
-	res, err := hsync.BoardDone(context.Background(), tp, ".", cfg.TaskProvider.ProjectID, ref, *evidence, *force)
+	req, closeAuthority, buildErr := buildDoneRequest(".", cfg.TaskProvider.ProjectID, ref, *receiptPath, override)
+	if buildErr != nil {
+		closeAuthority()
+		fmt.Fprintf(os.Stderr, "herd board-done: %v\n", buildErr)
+		os.Exit(1)
+	}
+	res, err := hsync.BoardDone(context.Background(), tp, req)
+	closeAuthority()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "herd board-done: %v\n", err)
 		os.Exit(1)
 	}
-	fmt.Printf("herd board-done: %s proof: %s\n", res.Ref, res.Proof)
-	// A closed ticket must not keep holding scope. Its claim otherwise stays
-	// Active forever and blocks any later task that overlaps it — FAC-174 was
-	// merged and board-closed yet still held pkg/verifier, which rejected
-	// FAC-198 with scope_overlap and needed a manual release to clear.
-	releaseScopeClaimQuietly(res.Ref)
-	fmt.Printf("herd board-done: %s is done (verified by read-back)\n", res.Ref)
+	finishBoardDone(os.Stdout, res, releaseScopeClaimQuietly)
 }
 
 // runBoardSync reconciles the board against git reality and reports drift.
@@ -3144,7 +3174,14 @@ func runForgeE() error {
 	reviewTasks, err := tp.ListTasks(ctx, cfg.TaskProvider.ProjectID, "in-review")
 	if err == nil {
 		for _, t := range reviewTasks {
-			res, err := hsync.BoardDone(ctx, tp, ".", cfg.TaskProvider.ProjectID, t.Ref, "", false)
+			req, closeAuthority, buildErr := buildDoneRequest(".", cfg.TaskProvider.ProjectID, t.Ref, "", nil)
+			if buildErr != nil {
+				closeAuthority()
+				fmt.Printf("Not approved [%s]: %v\n", t.Ref, buildErr)
+				continue
+			}
+			res, err := hsync.BoardDone(ctx, tp, req)
+			closeAuthority()
 			if err != nil {
 				fmt.Printf("Not approved [%s]: %v\n", t.Ref, err)
 				continue

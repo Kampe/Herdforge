@@ -2,6 +2,7 @@ package sync
 
 import (
 	"context"
+	"errors"
 	"os/exec"
 	"strings"
 	"testing"
@@ -103,25 +104,25 @@ func TestBoardDone(t *testing.T) {
 		return mp
 	}
 
-	t.Run("moves to done with commit evidence and read-back", func(t *testing.T) {
+	// FAC-132: the commit-subject oracle is gone. This fixture's origin/main
+	// carries a commit naming FAC-18 — under the old contract that closed the
+	// card. It must now refuse.
+	t.Run("a commit naming the ref no longer closes it", func(t *testing.T) {
 		mp := newBoard("FAC-18")
-		res, err := BoardDone(ctx, mp, dir, "p1", "FAC-018", "", false)
-		if err != nil {
-			t.Fatalf("BoardDone: %v", err)
-		}
-		if res.Ref != "FAC-18" || !strings.Contains(res.Proof, "FAC-18") {
-			t.Fatalf("unexpected result %+v", res)
+		_, err := BoardDone(ctx, mp, DoneRequest{RepoDir: dir, ProjectID: "p1", Ref: "FAC-018"})
+		if !errors.Is(err, ErrNoEvidence) {
+			t.Fatalf("want ErrNoEvidence refusal, got %v", err)
 		}
 		got, _ := mp.GetTask(ctx, "id-FAC-18")
-		if got.Status != "done" {
-			t.Fatalf("status = %q, want done", got.Status)
+		if got.Status != "in-review" {
+			t.Fatalf("refused card must not move, status = %q", got.Status)
 		}
 	})
 
-	t.Run("refuses without evidence", func(t *testing.T) {
+	t.Run("refuses without any authority", func(t *testing.T) {
 		mp := newBoard("FAC-99")
-		_, err := BoardDone(ctx, mp, dir, "p1", "FAC-99", "", false)
-		if err == nil || !strings.Contains(err.Error(), "no merge evidence") {
+		_, err := BoardDone(ctx, mp, DoneRequest{RepoDir: dir, ProjectID: "p1", Ref: "FAC-99"})
+		if !errors.Is(err, ErrNoEvidence) || !strings.Contains(err.Error(), "no completion receipt") {
 			t.Fatalf("want ErrNoEvidence refusal, got %v", err)
 		}
 		got, _ := mp.GetTask(ctx, "id-FAC-99")
@@ -130,20 +131,13 @@ func TestBoardDone(t *testing.T) {
 		}
 	})
 
-	t.Run("force overrides with honest proof text", func(t *testing.T) {
-		mp := newBoard("FAC-99")
-		res, err := BoardDone(ctx, mp, dir, "p1", "FAC-99", "", true)
-		if err != nil {
-			t.Fatalf("BoardDone --force: %v", err)
-		}
-		if !strings.Contains(res.Proof, "--force") || !res.Forced {
-			t.Fatalf("forced result must say so: %+v", res)
-		}
-	})
-
-	t.Run("unknown ref errors", func(t *testing.T) {
+	t.Run("unknown ref errors even under a valid override", func(t *testing.T) {
 		mp := newBoard("FAC-18")
-		if _, err := BoardDone(ctx, mp, dir, "p1", "FAC-500", "", true); err == nil {
+		_, err := BoardDone(ctx, mp, DoneRequest{
+			RepoDir: dir, ProjectID: "p1", Ref: "FAC-500",
+			Override: &OverrideRequest{Actor: "kampe", Reason: "scope withdrawn", Evidence: "n/a", Policy: "abandoned-scope"},
+		})
+		if err == nil {
 			t.Fatal("unknown ref must error")
 		}
 	})
