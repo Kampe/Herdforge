@@ -54,8 +54,18 @@ type LiveTab struct {
 type CompareCloseOutcome string
 
 const (
-	OutcomeClosed            CompareCloseOutcome = "closed"
-	OutcomeReplayed          CompareCloseOutcome = "replayed"
+	// OutcomeIntent is a durable reservation written before mutate. It is NOT
+	// final: a nonce whose latest record is only intent must re-read live state
+	// and must never be replayed as a successful close.
+	OutcomeIntent CompareCloseOutcome = "intent"
+	// OutcomeClosed is final: mutate succeeded and resulting absence is claimed.
+	OutcomeClosed CompareCloseOutcome = "closed"
+	// OutcomeReplayed is reserved for wire compatibility; clients treat a
+	// final Closed receipt on nonce retry as success without re-mutating.
+	OutcomeReplayed CompareCloseOutcome = "replayed"
+	// OutcomeAlreadyClosed is returned when the tab is absent under the server
+	// lock. Callers must still prove absence via durable final receipt or a
+	// live re-read — see TabCloseCAS.
 	OutcomeAlreadyClosed     CompareCloseOutcome = "already_closed"
 	OutcomeStaleGeneration   CompareCloseOutcome = "stale_generation"
 	OutcomeAttachmentChanged CompareCloseOutcome = "attachment_changed"
@@ -65,8 +75,21 @@ const (
 	OutcomeError             CompareCloseOutcome = "error"
 )
 
+// isFinalOutcome reports whether a durable receipt may be replayed as the
+// definitive result for its nonce. Intent is never final.
+func isFinalOutcome(o CompareCloseOutcome) bool {
+	switch o {
+	case OutcomeIntent, "":
+		return false
+	default:
+		return true
+	}
+}
+
 // CloseReceipt binds request, pre-close identity, server generation, outcome,
-// timestamp, and resulting absence. Append-only; nonce duplicates replay.
+// timestamp, and resulting absence. Append-only. A close attempt writes an
+// intent record first, then a final outcome after mutate (or a final refusal
+// without mutate). Nonce replay returns only final outcomes.
 type CloseReceipt struct {
 	Request          CompareAndCloseRequest `json:"request"`
 	PreClose         LiveTab                `json:"pre_close"`
@@ -77,8 +100,11 @@ type CloseReceipt struct {
 }
 
 // ReceiptStore is the durable append-only close-receipt seam.
+// Read returns the latest record for nonce (intent or final).
+// ReadFinal returns the latest final outcome, or nil when only intent exists.
 type ReceiptStore interface {
 	Read(nonce string) (*CloseReceipt, error)
+	ReadFinal(nonce string) (*CloseReceipt, error)
 	Append(receipt *CloseReceipt) error
 	Readback(nonce string) (*CloseReceipt, error)
 }
@@ -101,27 +127,40 @@ func (SystemClock) NowMS() uint64 {
 }
 
 // MemoryReceiptStore is the hermetic receipt store used by unit tests and the
-// in-process fake server.
+// in-process fake server. Records are append-only per nonce (intent then outcome).
 type MemoryReceiptStore struct {
 	mu           sync.Mutex
-	receipts     map[string]CloseReceipt
+	receipts     map[string][]CloseReceipt
 	FailWrite    bool
 	FailReadback bool
 }
 
 func NewMemoryReceiptStore() *MemoryReceiptStore {
-	return &MemoryReceiptStore{receipts: map[string]CloseReceipt{}}
+	return &MemoryReceiptStore{receipts: map[string][]CloseReceipt{}}
 }
 
 func (s *MemoryReceiptStore) Read(nonce string) (*CloseReceipt, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	r, ok := s.receipts[nonce]
-	if !ok {
+	list := s.receipts[nonce]
+	if len(list) == 0 {
 		return nil, nil
 	}
-	cp := r
+	cp := list[len(list)-1]
 	return &cp, nil
+}
+
+func (s *MemoryReceiptStore) ReadFinal(nonce string) (*CloseReceipt, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	list := s.receipts[nonce]
+	for i := len(list) - 1; i >= 0; i-- {
+		if isFinalOutcome(list[i].Outcome) {
+			cp := list[i]
+			return &cp, nil
+		}
+	}
+	return nil, nil
 }
 
 func (s *MemoryReceiptStore) Append(receipt *CloseReceipt) error {
@@ -131,9 +170,9 @@ func (s *MemoryReceiptStore) Append(receipt *CloseReceipt) error {
 		return errors.New("receipt write failed")
 	}
 	if s.receipts == nil {
-		s.receipts = map[string]CloseReceipt{}
+		s.receipts = map[string][]CloseReceipt{}
 	}
-	s.receipts[receipt.Request.Nonce] = *receipt
+	s.receipts[receipt.Request.Nonce] = append(s.receipts[receipt.Request.Nonce], *receipt)
 	return nil
 }
 
@@ -182,8 +221,25 @@ func (s *JSONLReceiptStore) Read(nonce string) (*CloseReceipt, error) {
 	if err != nil {
 		return nil, err
 	}
+	var last *CloseReceipt
 	for i := range recs {
 		if recs[i].Request.Nonce == nonce {
+			cp := recs[i]
+			last = &cp
+		}
+	}
+	return last, nil
+}
+
+func (s *JSONLReceiptStore) ReadFinal(nonce string) (*CloseReceipt, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	recs, err := s.records()
+	if err != nil {
+		return nil, err
+	}
+	for i := len(recs) - 1; i >= 0; i-- {
+		if recs[i].Request.Nonce == nonce && isFinalOutcome(recs[i].Outcome) {
 			cp := recs[i]
 			return &cp, nil
 		}
@@ -240,9 +296,19 @@ func ValidateCompareAndCloseRequest(req CompareAndCloseRequest) error {
 	return nil
 }
 
-// CompareAndClose is the pure server authority. closeMutate runs only after a
-// durable Closed receipt is written and read back; receipt write/readback
-// failure blocks the mutation.
+// CompareAndClose is the pure server authority.
+//
+// Protocol (two durable records for a successful close):
+//  1. Replay only a *final* receipt for this nonce (never an intent).
+//  2. Re-evaluate the live fence under the caller's lifecycle lock.
+//  3. Terminal refusals (stale, attachment-changed, …) append one final record.
+//  4. A close path appends OutcomeIntent, readbacks it, then mutates, then
+//     appends a final OutcomeClosed or OutcomeError. A nonce with only intent
+//     forces a live re-read on the next call — it is never success.
+//
+// Appending Closed only after mutate would reopen the crash-after-close window;
+// appending Closed before mutate made failed mutates replay as success. Intent
+// then outcome closes both holes.
 func CompareAndClose(
 	req CompareAndCloseRequest,
 	live LiveTab,
@@ -252,11 +318,29 @@ func CompareAndClose(
 	closeMutate func() error,
 ) CloseReceipt {
 	if store != nil {
-		if prior, err := store.Read(req.Nonce); err == nil && prior != nil {
-			return *prior
+		if final, err := store.ReadFinal(req.Nonce); err == nil && final != nil {
+			return *final
 		}
 	}
 
+	var ts uint64
+	if clock != nil {
+		ts = clock.NowMS()
+	}
+	base := CloseReceipt{
+		Request:          req,
+		PreClose:         live,
+		ServerGeneration: serverGeneration,
+		TimestampMS:      ts,
+		ResultingAbsence: false,
+	}
+
+	if store == nil {
+		base.Outcome = OutcomeError
+		return base
+	}
+
+	// Fence evaluation against the live snapshot supplied under the server lock.
 	outcome := OutcomeClosed
 	if err := ValidateCompareAndCloseRequest(req); err != nil {
 		outcome = OutcomeError
@@ -271,52 +355,66 @@ func CompareAndClose(
 		outcome = OutcomeProtected
 	}
 
-	var ts uint64
-	if clock != nil {
-		ts = clock.NowMS()
-	}
-	receipt := CloseReceipt{
-		Request:          req,
-		PreClose:         live,
-		ServerGeneration: serverGeneration,
-		Outcome:          outcome,
-		TimestampMS:      ts,
-		ResultingAbsence: outcome == OutcomeClosed,
+	// Terminal refusal: one final record, no mutation.
+	if outcome != OutcomeClosed {
+		base.Outcome = outcome
+		if err := store.Append(&base); err != nil {
+			base.Outcome = OutcomeError
+			return base
+		}
+		return base
 	}
 
-	if store == nil {
-		receipt.Outcome = OutcomeError
-		receipt.ResultingAbsence = false
-		return receipt
+	// Resume path: a prior attempt may have written intent only (crash or
+	// mutate failure without a final outcome). Do not re-append intent.
+	hasIntent := false
+	if latest, err := store.Read(req.Nonce); err == nil && latest != nil && latest.Outcome == OutcomeIntent {
+		hasIntent = true
 	}
-	if err := store.Append(&receipt); err != nil {
-		receipt.Outcome = OutcomeError
-		receipt.ResultingAbsence = false
-		return receipt
-	}
-	readback, err := store.Readback(req.Nonce)
-	if err != nil || readback == nil || !receiptEqual(readback, &receipt) {
-		return CloseReceipt{
-			Request:          req,
-			PreClose:         live,
-			ServerGeneration: serverGeneration,
-			Outcome:          OutcomeError,
-			TimestampMS:      ts,
-			ResultingAbsence: false,
+	if !hasIntent {
+		intent := base
+		intent.Outcome = OutcomeIntent
+		intent.ResultingAbsence = false
+		if err := store.Append(&intent); err != nil {
+			base.Outcome = OutcomeError
+			return base
+		}
+		readback, err := store.Readback(req.Nonce)
+		if err != nil || readback == nil || readback.Outcome != OutcomeIntent {
+			base.Outcome = OutcomeError
+			return base
 		}
 	}
-	if receipt.Outcome == OutcomeClosed {
-		if closeMutate == nil {
-			receipt.Outcome = OutcomeError
-			receipt.ResultingAbsence = false
-			return receipt
-		}
-		if err := closeMutate(); err != nil {
-			receipt.Outcome = OutcomeError
-			receipt.ResultingAbsence = false
-		}
+
+	if closeMutate == nil {
+		fail := base
+		fail.Outcome = OutcomeError
+		_ = store.Append(&fail)
+		return fail
 	}
-	return receipt
+	if err := closeMutate(); err != nil {
+		fail := base
+		fail.Outcome = OutcomeError
+		fail.ResultingAbsence = false
+		// Durable final error so a retry does not invent Closed from a stale promise.
+		if appendErr := store.Append(&fail); appendErr != nil {
+			// Still return error to the caller; durable may only show intent.
+			// Next call with unresolved intent re-reads live (must not report closed).
+			return fail
+		}
+		return fail
+	}
+
+	closed := base
+	closed.Outcome = OutcomeClosed
+	closed.ResultingAbsence = true
+	if err := store.Append(&closed); err != nil {
+		// Mutate already happened. Return closed to this caller; durable may
+		// only show intent. A later call re-reads live (tab absent) rather than
+		// replaying a false Closed from a pre-mutate promise.
+		return closed
+	}
+	return closed
 }
 
 func equalStringSlice(a, b []string) bool {
@@ -482,12 +580,15 @@ func (s *FakeCompareCloseServer) CompareAndClose(req CompareAndCloseRequest) Clo
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// Already closed with matching prior receipt: nonce replay path.
-	if prior, err := s.store.Read(req.Nonce); err == nil && prior != nil {
-		return *prior
+	// Replay only final durable outcomes. Unresolved intent falls through to a
+	// live re-read so a failed mutate cannot be retried as success.
+	if final, err := s.store.ReadFinal(req.Nonce); err == nil && final != nil {
+		return *final
 	}
 	if s.closed[req.TabID] {
-		// Absent tab without a matching nonce receipt — not a free pass.
+		// Tab already removed under this server. Without a final Closed receipt
+		// for this nonce, still report already_closed from live absence after
+		// re-read — the pure path cannot invent Closed from intent alone.
 		return CloseReceipt{
 			Request:          req,
 			Outcome:          OutcomeAlreadyClosed,
@@ -684,9 +785,11 @@ func CompareAndCloseTab(req CompareAndCloseRequest) (CloseReceipt, error) {
 }
 
 // TabCloseCAS is the FAC-158 adapter: expand the durable decision, call the
-// fenced operation, and treat only Closed (or matching already-closed replay)
-// as success. Every other typed outcome is a hard error so reconciliation
-// never confuses "refused" with "gone".
+// fenced operation, and treat only final Closed (with resulting absence) as
+// success. Intent is never success. AlreadyClosed is accepted only when the
+// server reported resulting absence after a live re-read (idempotent retry
+// after a prior successful close). Every other typed outcome is a hard error
+// so reconciliation never confuses "refused" with "gone".
 func TabCloseCAS(req CloseRequest) error {
 	wire, err := ExpandCloseRequest(req)
 	if err != nil {
@@ -702,9 +805,18 @@ func TabCloseCAS(req CloseRequest) error {
 			return &CloseUnavailableError{TabID: req.TabID, Reason: "closed outcome without resulting absence"}
 		}
 		return nil
-	case OutcomeReplayed, OutcomeAlreadyClosed:
-		// Matching receipt / durable absence — idempotent success.
+	case OutcomeReplayed:
+		if !receipt.ResultingAbsence {
+			return &CloseUnavailableError{TabID: req.TabID, Reason: "replayed outcome without resulting absence"}
+		}
 		return nil
+	case OutcomeAlreadyClosed:
+		if !receipt.ResultingAbsence {
+			return &CloseUnavailableError{TabID: req.TabID, Reason: "already_closed without resulting absence"}
+		}
+		return nil
+	case OutcomeIntent:
+		return &CloseUnavailableError{TabID: req.TabID, Reason: "unresolved intent is not a close"}
 	case OutcomeStaleGeneration:
 		return &CloseUnavailableError{TabID: req.TabID, Reason: "stale-generation"}
 	case OutcomeAttachmentChanged:

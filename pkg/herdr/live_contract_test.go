@@ -2,6 +2,7 @@ package herdr
 
 import (
 	"encoding/json"
+	"errors"
 	"os/exec"
 	"strings"
 	"testing"
@@ -35,9 +36,11 @@ func TestLiveHerdrAgentHelp_HasPromptNotPromptDelivery(t *testing.T) {
 	}
 }
 
-// TestLiveHerdrTabHelp_CompareCloseCapability pins the FAC-180 CLI surface.
-// Installed binaries that predate the herdr compare-close merge simply log
-// the gap; production never falls back to plain `tab close`.
+// TestLiveHerdrTabHelp_CompareCloseCapability pins the FAC-180 CLI contract:
+// production calls `herdr tab compare-close`. When the installed binary lacks
+// that subcommand, live transport must fail closed and must not fall back to
+// plain `tab close`. When the subcommand is listed, help must show it as a
+// command row (first field), not merely prose.
 func TestLiveHerdrTabHelp_CompareCloseCapability(t *testing.T) {
 	if _, err := exec.LookPath("herdr"); err != nil {
 		t.Skip("herdr not installed")
@@ -55,13 +58,45 @@ func TestLiveHerdrTabHelp_CompareCloseCapability(t *testing.T) {
 			break
 		}
 	}
+
+	// Always pin the transport argv shape via a hermetic runner: production
+	// path is tab compare-close, never tab close as fallback.
+	old := runHerdr
+	defer func() { runHerdr = old }()
+	var calls [][]string
 	if !hasCompareClose {
-		// Capability not on the installed binary yet — live transport fails
-		// closed (see TestLiveTransport_NeverFallsBackToPlainTabClose).
-		t.Log("live herdr tab help has no compare-close; autonomous close stays blocked until the herdr FAC-180 binary is installed")
+		runHerdr = func(args ...string) (string, error) {
+			calls = append(calls, append([]string(nil), args...))
+			return "unknown command", errors.New("exit status 2")
+		}
+		_, trErr := liveCompareCloseTransport(fixtureRequest())
+		if trErr == nil {
+			t.Fatal("live transport must fail when compare-close is unavailable")
+		}
+		for _, c := range calls {
+			if len(c) >= 2 && c[0] == "tab" && c[1] == "close" {
+				t.Fatalf("fell back to plain tab close: %v", calls)
+			}
+			if len(c) < 2 || c[0] != "tab" || c[1] != "compare-close" {
+				t.Fatalf("expected tab compare-close transport call, got %v", c)
+			}
+		}
+		if len(calls) == 0 {
+			t.Fatal("expected at least one compare-close transport attempt")
+		}
 		return
 	}
-	t.Log("live herdr exposes compare-close; wire client is CompareAndCloseTab / TabCloseCAS")
+
+	// Binary claims the subcommand: help pin must not be prose-only, and a
+	// malformed request must still go to compare-close (not tab close).
+	runHerdr = func(args ...string) (string, error) {
+		calls = append(calls, append([]string(nil), args...))
+		return "", errors.New("forced")
+	}
+	_, _ = liveCompareCloseTransport(fixtureRequest())
+	if len(calls) != 1 || len(calls[0]) < 2 || calls[0][0] != "tab" || calls[0][1] != "compare-close" {
+		t.Fatalf("with compare-close present, transport must call tab compare-close: %v", calls)
+	}
 }
 
 func TestLiveHerdrAgentList_NoGenerationFieldRequired(t *testing.T) {
