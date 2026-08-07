@@ -85,7 +85,10 @@ func operatorReadbackPolicy(key, target, session string) textdelivery.ReadbackPo
 		if proof.Key != key || proof.Target != target || proof.Session != session {
 			return false
 		}
-		if proof.BaselineStatus == "" || !proof.Submitted || !proof.Consumed || !proof.Verified {
+		// Baseline may be empty: a freshly launched agent is often not yet in
+		// inventory (same as DeliverAndProve). Empty is a valid pre-submit
+		// baseline; ConsumptionProvenSeen decides whether the transition is proof.
+		if !proof.Submitted || !proof.Consumed || !proof.Verified {
 			return false
 		}
 		if !ConsumptionProvenSeen(proof.BaselineStatus, proof.FinalStatus, proof.SawWorking) {

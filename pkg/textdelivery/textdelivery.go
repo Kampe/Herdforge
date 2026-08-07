@@ -35,13 +35,18 @@ type Payload struct {
 }
 
 func (p Payload) read() ([]byte, error) {
+	// Exactly one source: non-nil Bytes XOR non-empty File.
+	// Bytes may be a zero-length non-nil slice (empty stdin); that is a valid
+	// empty payload and must not round-trip to nil (append(nil) would).
 	if (p.Bytes == nil) == (p.File == "") {
 		return nil, ErrInvalidPayload
 	}
 	if p.File != "" {
 		return os.ReadFile(p.File)
 	}
-	return append([]byte(nil), p.Bytes...), nil
+	out := make([]byte, len(p.Bytes))
+	copy(out, p.Bytes)
+	return out, nil
 }
 
 // Read returns an immutable copy of the selected payload source.

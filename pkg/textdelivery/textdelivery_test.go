@@ -535,3 +535,25 @@ func TestDirectExecutorRejectsShellExecutable(t *testing.T) {
 		}
 	}
 }
+
+func TestEmptyBytesPayloadIsValidSource(t *testing.T) {
+	// io.ReadAll(empty stdin) yields a non-nil zero-length slice.
+	empty := make([]byte, 0)
+	got, err := (Payload{Bytes: empty}).Read()
+	if err != nil {
+		t.Fatalf("Read empty bytes: %v", err)
+	}
+	if got == nil {
+		t.Fatal("empty payload Read must not return nil (would re-fail as invalid source)")
+	}
+	if len(got) != 0 {
+		t.Fatalf("len=%d", len(got))
+	}
+	receipt, err := NewLedger().Deliver(context.Background(), "empty-body", "transport", nil, Payload{Bytes: empty}, &echoExecutor{})
+	if err != nil {
+		t.Fatalf("Deliver empty payload: %v", err)
+	}
+	if receipt.SHA256 != Digest(empty) {
+		t.Fatalf("digest mismatch")
+	}
+}

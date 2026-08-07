@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"path/filepath"
 	"reflect"
@@ -203,22 +204,87 @@ func TestDeliverOperatorIdleToDoneWithoutWorkingIsNotProof(t *testing.T) {
 	}
 	starter := &captureStarter{}
 	state := filepath.Join(t.TempDir(), "idle-done.db")
-	_, err := DeliverOperatorWithExecutor(context.Background(), OperatorDelivery{
+	d := OperatorDelivery{
 		Key: "idle-done-183", Generation: 3, Target: "worker",
 		Payload: textdelivery.Payload{Bytes: []byte("x")}, StatePath: state, Timeout: 300 * time.Millisecond,
-	}, textdelivery.NewDirectExecutor(starter.Start))
+	}
+	_, err := DeliverOperatorWithExecutor(context.Background(), d, textdelivery.NewDirectExecutor(starter.Start))
 	if err == nil {
 		t.Fatal("bare idle→done must not complete as consumed")
 	}
 	if !errors.Is(err, textdelivery.ErrDurableAmbiguous) && !strings.Contains(err.Error(), "no prompt-correlated") {
 		t.Fatalf("want consumption ambiguity, got %v", err)
 	}
-	// Reservation left accepted (ambiguous) — restart must not re-send as success without proof.
-	store, err := outbox.NewStore(state)
-	if err != nil {
-		t.Fatal(err)
+	firstCalls := atomic.LoadInt32(&starter.calls)
+	if firstCalls < 1 {
+		t.Fatal("first attempt must have transported once before failing proof")
 	}
-	defer store.Close()
+	// Reservation is accepted without completion: restart must refuse with
+	// durable ambiguity and must not re-invoke transport.
+	starter2 := &captureStarter{}
+	_, err = DeliverOperatorWithExecutor(context.Background(), d, textdelivery.NewDirectExecutor(starter2.Start))
+	if err == nil {
+		t.Fatal("restart after unproven accept must not succeed")
+	}
+	if !errors.Is(err, outbox.ErrDeliveryAmbiguous) && !errors.Is(err, textdelivery.ErrDurableAmbiguous) &&
+		!strings.Contains(err.Error(), "unproven") && !strings.Contains(err.Error(), "ambiguous") {
+		t.Fatalf("want durable ambiguity on restart, got %v", err)
+	}
+	if atomic.LoadInt32(&starter2.calls) != 0 {
+		t.Fatalf("restart must not re-send after accepted-unproven reservation; calls=%d", starter2.calls)
+	}
+}
+
+func TestDeliverOperatorEmptyBaselineThenWorkingSucceeds(t *testing.T) {
+	// Fresh launch: agent not yet listed (statusProbe error → baseline ""), then working.
+	prev := statusProbe
+	t.Cleanup(func() { statusProbe = prev })
+	var n int32
+	statusProbe = func(string) (string, error) {
+		if atomic.AddInt32(&n, 1) == 1 {
+			return "", fmt.Errorf("no agent found")
+		}
+		return "working", nil
+	}
+	state := filepath.Join(t.TempDir(), "empty-base.db")
+	proof, err := DeliverOperatorWithExecutor(context.Background(), OperatorDelivery{
+		Key: "empty-base-183", Generation: 5, Target: "worker",
+		Payload: textdelivery.Payload{Bytes: []byte("fresh launch")}, StatePath: state, Timeout: time.Second,
+	}, textdelivery.NewDirectExecutor((&captureStarter{}).Start))
+	if err != nil {
+		t.Fatalf("empty baseline → working must complete: %v", err)
+	}
+	if proof.BaselineStatus != "" || proof.FinalStatus != "working" || !proof.Consumed || !proof.SawWorking {
+		t.Fatalf("unexpected proof: %+v", proof)
+	}
+}
+
+func TestDeliverOperatorEmptyPayloadSucceeds(t *testing.T) {
+	prev := statusProbe
+	t.Cleanup(func() { statusProbe = prev })
+	var n int32
+	statusProbe = func(string) (string, error) {
+		if atomic.AddInt32(&n, 1) == 1 {
+			return "idle", nil
+		}
+		return "working", nil
+	}
+	state := filepath.Join(t.TempDir(), "empty-payload.db")
+	// Non-nil zero-length slice is what io.ReadAll returns for empty stdin.
+	empty := make([]byte, 0)
+	proof, err := DeliverOperatorWithExecutor(context.Background(), OperatorDelivery{
+		Key: "empty-payload-183", Generation: 6, Target: "worker",
+		Payload: textdelivery.Payload{Bytes: empty}, StatePath: state, Timeout: time.Second,
+	}, textdelivery.NewDirectExecutor((&captureStarter{}).Start))
+	if err != nil {
+		t.Fatalf("empty payload must not be rejected as invalid source: %v", err)
+	}
+	if proof.PayloadSHA256 != textdelivery.Digest(empty) {
+		t.Fatalf("empty payload digest mismatch")
+	}
+	if len(proof.Argv) < 4 || proof.Argv[3] != "" {
+		t.Fatalf("empty TEXT argv element missing: %#v", proof.Argv)
+	}
 }
 
 func TestDeliverOperatorWorkingStatusIsProof(t *testing.T) {
