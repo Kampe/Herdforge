@@ -1129,30 +1129,78 @@ func runDaemon() {
 		}
 
 		cycleErr := runDaemonCycle(ctx, requireFleetAdmission, func(ctx context.Context) error {
-			tp, tpErr := loadTaskProvider(cfg)
-			if tpErr != nil {
-				return fmt.Errorf("task provider: %w", tpErr)
+			// FAC-196: claim-to-dispatch is one transaction. Non-compensable
+			// prep (lane, routed decision, Herdr) happens before RunPulse.
+			// FAC-194 still owns removing any residual OpenCode ModelRouter
+			// constructions on other entrypoints; this path uses the
+			// authoritative launchAdmission + SurfaceRouter waterfall only.
+			lane := findLaneForRole(cfg, *role)
+			if lane == nil {
+				return fmt.Errorf("no lane configured for role %q", *role)
+			}
+			var tp provider.TaskProvider
+			decision, admitErr := launchAdmissionWithLifecycle(liveLaunchLifecycle{}, cfg, *role, herdr.IsAvailable(), routedLaneDecision(ctx, nil), func(_ *router.LaunchDecision) error {
+				var tpErr error
+				tp, tpErr = loadTaskProvider(cfg)
+				return tpErr
+			})
+			if admitErr != nil {
+				return fmt.Errorf("launch route rejected before claim: %w", admitErr)
+			}
+			if tp == nil {
+				return fmt.Errorf("task provider: not constructed after launch admission")
+			}
+			repository := repositoryIdentityForLaunch(cfg)
+			if repository == "" {
+				return fmt.Errorf("authenticated repository identity is required")
 			}
 
-			mr := router.NewModelRouter([]*router.ModelCandidate{
-				{Name: "opencode", Type: router.ProviderOllama, Model: "deepseek-v4-flash"},
-			}).WithUsageFunc(func(ctx context.Context, name string) float64 {
-				snap, err := usage.FetchSnapshot()
-				if err != nil {
-					return 0
-				}
-				return snap.Utilization(name)
-			})
 			wm := resolveCanonicalWorktreeManager()
 			v := verifier.NewVerifier(cfg.Verification.TestCommand)
-			eng := daemon.NewEngine(cfg, tp, mr, st, wm, v)
+			eng := daemon.NewEngine(cfg, tp, nil, st, wm, v)
 
-			task, err := eng.RunPulse(ctx, *role)
+			standing := fmt.Sprintf("forge-%s", lane.Name)
+			rec, err := eng.RunDaemonTick(ctx, *role, daemon.TickOptions{
+				Decision:     decision,
+				Lane:         lane,
+				Repository:   repository,
+				Herdr:        dispatch.LiveHerdr{},
+				StandingName: standing,
+				ResolveStanding: func(_ context.Context, name string, req launch.Request) (*daemon.StandingAgent, error) {
+					tabLabel, rerr := herdr.ResolveAgentTabWithDecision(name, req)
+					if rerr != nil {
+						if authorizeEphemeralTaskAgent(rerr) != nil {
+							return nil, rerr
+						}
+						return nil, nil
+					}
+					// Readback exact agent identity for reuse gate.
+					agents, lerr := herdr.AgentList()
+					if lerr != nil {
+						return nil, lerr
+					}
+					for _, a := range agents {
+						if a.Name == name || a.Name == tabLabel {
+							return &daemon.StandingAgent{
+								Name:    a.Name,
+								TabID:   a.TabID,
+								PaneID:  a.PaneID,
+								Session: a.Session.Value,
+								CWD:     a.Cwd,
+								Model:   req.Decision.Model,
+								Harness: a.Kind,
+							}, nil
+						}
+					}
+					return nil, nil
+				},
+			})
 			if err != nil {
-				return fmt.Errorf("pulse: %w", err)
+				return fmt.Errorf("daemon tick: %w", err)
 			}
-			if task != nil {
-				fmt.Printf("[%s] Claimed: %s — %s\n", time.Now().Format(time.RFC3339), task.Ref, task.Title)
+			if rec != nil && rec.Launched {
+				fmt.Printf("[%s] Dispatched: %s — agent=%s tab=%s model=%s/%s lease=g%d\n",
+					time.Now().Format(time.RFC3339), rec.TaskRef, rec.AgentName, rec.TabID, rec.Model, rec.Effort, rec.LeaseGeneration)
 			}
 			return nil
 		})

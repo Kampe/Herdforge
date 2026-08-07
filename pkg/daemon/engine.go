@@ -43,6 +43,10 @@ type Engine struct {
 	claimMu             sync.Mutex
 	lastClaimRef        string
 	lastClaimGeneration int64
+	// lastClaimToken is the generation-fenced ownership identity most recently
+	// acquired by RunPulse. FAC-196 post-claim launch compensation requires
+	// the full token (owner+generation), not just the generation number.
+	lastClaimToken *deps.OwnershipToken
 }
 
 var daemonAuthenticatedRepositoryIdentity = dispatch.AuthenticatedRepositoryIdentity
@@ -57,6 +61,45 @@ func (e *Engine) LastClaimIdentity() (string, int64) {
 	e.claimMu.Lock()
 	defer e.claimMu.Unlock()
 	return e.lastClaimRef, e.lastClaimGeneration
+}
+
+// LastClaimToken returns a copy of the ownership token most recently acquired
+// by RunPulse. Callers use it for generation-fenced post-claim compensation.
+// A nil return means no live claim is held by this engine instance.
+func (e *Engine) LastClaimToken() *deps.OwnershipToken {
+	if e == nil {
+		return nil
+	}
+	e.claimMu.Lock()
+	defer e.claimMu.Unlock()
+	if e.lastClaimToken == nil {
+		return nil
+	}
+	cp := *e.lastClaimToken
+	return &cp
+}
+
+func (e *Engine) recordClaimToken(tok *deps.OwnershipToken) {
+	if e == nil || tok == nil {
+		return
+	}
+	e.claimMu.Lock()
+	defer e.claimMu.Unlock()
+	e.lastClaimRef = string(tok.TaskRef)
+	e.lastClaimGeneration = tok.Generation
+	cp := *tok
+	e.lastClaimToken = &cp
+}
+
+func (e *Engine) clearClaimToken() {
+	if e == nil {
+		return
+	}
+	e.claimMu.Lock()
+	defer e.claimMu.Unlock()
+	e.lastClaimRef = ""
+	e.lastClaimGeneration = 0
+	e.lastClaimToken = nil
 }
 
 func NewEngine(cfg *config.Config, tp provider.TaskProvider, r *router.ModelRouter, s *store.Store, wm *worktree.WorktreeManager, v *verifier.Verifier) *Engine {
@@ -384,9 +427,7 @@ func (e *Engine) RunPulse(ctx context.Context, role string) (*provider.Task, err
 	if cerr != nil {
 		return nil, fmt.Errorf("pulse lease claim: %w", cerr)
 	}
-	e.claimMu.Lock()
-	e.lastClaimRef, e.lastClaimGeneration = task.Ref, tok.Generation
-	e.claimMu.Unlock()
+	e.recordClaimToken(tok)
 
 	// Fenced claim: pre/post graph check around board ClaimTask. Compensation is
 	// generation-fenced — board to-do only when we still hold owner+generation.
