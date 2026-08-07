@@ -1,6 +1,7 @@
 package herdr
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -27,33 +28,57 @@ func pinBuilderGID(t *testing.T, gid int) {
 func stubHostedTreeSeams(t *testing.T, uid, gid int) {
 	t.Helper()
 	pinBuilderGID(t, gid)
+	ResetHostedUIDCapabilityCache()
+	t.Cleanup(ResetHostedUIDCapabilityCache)
 	oldUID, oldGID := processUIDOf, processGIDOf
 	oldTok, oldPG, oldKids := readStartTok, listPGIDMembers, listChildPIDs
+	oldExists := processExists
 	t.Cleanup(func() {
 		processUIDOf, processGIDOf = oldUID, oldGID
 		readStartTok, listPGIDMembers, listChildPIDs = oldTok, oldPG, oldKids
+		processExists = oldExists
 	})
 	processUIDOf = func(int) (int, error) { return uid, nil }
 	processGIDOf = func(int) (int, error) { return gid, nil }
 	readStartTok = func(pid int) (string, error) { return fmt.Sprintf("tok-%d", pid), nil }
 	listPGIDMembers = func(int) ([]int, error) { return nil, nil }
 	listChildPIDs = func(int) ([]int, error) { return nil, nil }
+	processExists = func(int) bool { return true }
 }
 
 func TestNegotiateHostedUID_CurrentFleetBlocked(t *testing.T) {
+	// Stub only — never depend on a live herdr binary or ambient daemon.
+	ResetHostedUIDCapabilityCache()
+	t.Cleanup(ResetHostedUIDCapabilityCache)
+	defer func(old func(args ...string) (string, error)) { runHerdr = old }(runHerdr)
+	runHerdr = func(args ...string) (string, error) {
+		// Real fleet today: exit 0 with usage text (not JSON).
+		return "herdr api commands:\n  herdr api snapshot\n  herdr api schema\n", nil
+	}
 	_, err := NegotiateHostedUIDCapability()
 	if err == nil {
-		t.Fatal("current fleet must not report hosted-uid capability without FAC-172 API")
+		t.Fatal("usage-text capabilities output must not unlock isolation")
 	}
 	if !errorsIsHostedBlocked(err) {
 		t.Fatalf("want FAC-172/BLOCKED, got: %v", err)
 	}
-	if HerdrSupportsHostedUID() {
-		t.Fatal("HerdrSupportsHostedUID must be false on current fleet")
+	if !strings.Contains(err.Error(), "unreadable") && !strings.Contains(err.Error(), "JSON") {
+		t.Fatalf("want JSON-unreadable cause in error, got: %v", err)
+	}
+	// Command-failure path preserves underlying cause.
+	ResetHostedUIDCapabilityCache()
+	runHerdr = func(args ...string) (string, error) {
+		return "", fmt.Errorf("exit 1: unknown command")
+	}
+	_, err = NegotiateHostedUIDCapability()
+	if err == nil || !strings.Contains(err.Error(), "unknown command") {
+		t.Fatalf("want underlying cause preserved, got %v", err)
 	}
 }
 
 func TestNegotiateHostedUID_NoHelpTextSpoof(t *testing.T) {
+	ResetHostedUIDCapabilityCache()
+	t.Cleanup(ResetHostedUIDCapabilityCache)
 	defer func(old func(args ...string) (string, error)) { runHerdr = old }(runHerdr)
 	runHerdr = func(args ...string) (string, error) {
 		joined := strings.Join(args, " ")
@@ -74,9 +99,13 @@ func TestNegotiateHostedUID_NoHelpTextSpoof(t *testing.T) {
 }
 
 func TestNegotiateHostedUID_StructuredJSONUnlocks(t *testing.T) {
+	ResetHostedUIDCapabilityCache()
+	t.Cleanup(ResetHostedUIDCapabilityCache)
 	defer func(old func(args ...string) (string, error)) { runHerdr = old }(runHerdr)
+	calls := 0
 	runHerdr = func(args ...string) (string, error) {
 		if strings.Contains(strings.Join(args, " "), "capabilities") {
+			calls++
 			return goodCapJSON(), nil
 		}
 		return "", fmt.Errorf("unexpected %v", args)
@@ -87,6 +116,13 @@ func TestNegotiateHostedUID_StructuredJSONUnlocks(t *testing.T) {
 	}
 	if !cap.HostedProcessUID || !cap.HostedProcessGID || cap.TabCreateUIDFlag != "--uid" {
 		t.Fatalf("bad cap: %+v", cap)
+	}
+	// Cache: second negotiate must not re-shell.
+	if _, err := NegotiateHostedUIDCapability(); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 1 {
+		t.Fatalf("capability negotiation not cached: calls=%d", calls)
 	}
 	if err := RequireHerdrBuilderSpawnCapability(os.Getuid() + 1); err != nil {
 		t.Fatal(err)
@@ -119,6 +155,8 @@ func TestValidateHostedUIDCapability_Table(t *testing.T) {
 }
 
 func TestRequireCapability_RejectsCoordinatorUID(t *testing.T) {
+	ResetHostedUIDCapabilityCache()
+	t.Cleanup(ResetHostedUIDCapabilityCache)
 	defer func(old func(args ...string) (string, error)) { runHerdr = old }(runHerdr)
 	runHerdr = func(args ...string) (string, error) { return goodCapJSON(), nil }
 	if err := RequireHerdrBuilderSpawnCapability(os.Getuid()); err == nil {
@@ -130,6 +168,8 @@ func TestRequireCapability_RejectsCoordinatorUID(t *testing.T) {
 }
 
 func TestTabCreateForTask_BlocksWithoutHostedUIDCapability(t *testing.T) {
+	ResetHostedUIDCapabilityCache()
+	t.Cleanup(ResetHostedUIDCapabilityCache)
 	me := os.Getuid()
 	t.Setenv(EnvBuilderUID, fmt.Sprintf("%d", me+1))
 	t.Setenv(EnvRequireHostedUID, "")
@@ -695,35 +735,191 @@ func TestHostedUIDIsolationRequired_ForceAndEnv(t *testing.T) {
 	t.Setenv(EnvBuilderUID, "")
 	t.Setenv(EnvRequireHostedUID, "")
 	if HostedUIDIsolationRequired() {
-		t.Fatal("empty env must not require isolation")
+		t.Fatal("absent builder env must not require isolation")
+	}
+	// Present-but-invalid must fail closed (require path), not silently off.
+	for _, bad := range []string{"5O1", "501 ", "-1", "0", "abc"} {
+		t.Setenv(EnvBuilderUID, bad)
+		if !HostedUIDIsolationRequired() {
+			t.Fatalf("present-but-invalid %q must require isolation (fail closed)", bad)
+		}
+		if _, err := BuilderUID(); err == nil {
+			t.Fatalf("BuilderUID must reject %q", bad)
+		}
 	}
 	t.Setenv(EnvBuilderUID, fmt.Sprintf("%d", me))
+	if !HostedUIDIsolationRequired() {
+		t.Fatal("present builder env requires isolation even when equal coordinator")
+	}
+	t.Setenv(EnvBuilderUID, "")
 	t.Setenv(EnvRequireHostedUID, "1")
 	if !HostedUIDIsolationRequired() {
 		t.Fatal("HERD_REQUIRE_HOSTED_UID=1 must force isolation path")
 	}
 	t.Setenv(EnvRequireHostedUID, "")
-	if HostedUIDIsolationRequired() {
-		t.Fatal("builder == self without force is not isolation")
-	}
 	t.Setenv(EnvBuilderUID, fmt.Sprintf("%d", me+1))
 	if !HostedUIDIsolationRequired() {
 		t.Fatal("distinct builder uid must require isolation")
 	}
 }
 
+func TestExpectedBuilderGID_RejectsCoordinatorAndZero(t *testing.T) {
+	// Unset branch: shell GID == coordinator fails.
+	t.Setenv(EnvBuilderGID, "")
+	if _, err := expectedBuilderGID(os.Getgid()); err == nil {
+		t.Fatal("shell gid == coordinator must fail group-drop proof")
+	}
+	// Distinct shell GID succeeds when env unset.
+	want := os.Getgid() + 7
+	if want == 0 {
+		want = 42
+	}
+	g, err := expectedBuilderGID(want)
+	if err != nil || g != want {
+		t.Fatalf("got %d %v want %d", g, err, want)
+	}
+	// Set branch: reject coordinator GID and non-positive.
+	t.Setenv(EnvBuilderGID, fmt.Sprintf("%d", os.Getgid()))
+	if _, err := expectedBuilderGID(999); err == nil {
+		t.Fatal("HERD_BUILDER_GID == coordinator must fail")
+	}
+	t.Setenv(EnvBuilderGID, "0")
+	if _, err := expectedBuilderGID(999); err == nil {
+		t.Fatal("HERD_BUILDER_GID=0 must fail")
+	}
+	t.Setenv(EnvBuilderGID, "42")
+	if os.Getgid() == 42 {
+		t.Setenv(EnvBuilderGID, "43")
+	}
+	if g, err := expectedBuilderGID(1); err != nil || g <= 0 {
+		t.Fatalf("valid builder gid: %d %v", g, err)
+	}
+}
+
+func TestSignalBoundIdentity_ObserveFailureFailsClosed(t *testing.T) {
+	// HIGH: read error while process still exists must not skip the kill.
+	defer func(old func(int) (string, error)) { readStartTok = old }(readStartTok)
+	defer func(old func(int) bool) { processExists = old }(processExists)
+	defer func(old func(int, syscall.Signal) error) { signalExact = old }(signalExact)
+	defer func(old func() int) { osGetpid = old }(osGetpid)
+	osGetpid = func() int { return 1 }
+	processExists = func(int) bool { return true } // still alive
+	readStartTok = func(int) (string, error) { return "", fmt.Errorf("ps: fork failed") }
+	var signals int
+	signalExact = func(pid int, sig syscall.Signal) error {
+		signals++
+		return nil
+	}
+	err := signalBoundIdentity(HostedProcessIdentity{PID: 900001, StartToken: "tok"}, syscall.SIGTERM)
+	if err == nil || !errors.Is(err, ErrHostedUIDObserve) && !strings.Contains(err.Error(), "observation") {
+		t.Fatalf("want observation failure, got %v", err)
+	}
+	if signals != 0 {
+		t.Fatal("must not signal when observation failed")
+	}
+	// Gone process: idempotent success, no signal needed.
+	processExists = func(int) bool { return false }
+	if err := signalBoundIdentity(HostedProcessIdentity{PID: 900001, StartToken: "tok"}, syscall.SIGTERM); err != nil {
+		t.Fatalf("gone process must be idempotent success: %v", err)
+	}
+}
+
+func TestGetHostedPaneIdentity_SkipsGoneOptionalDescendants(t *testing.T) {
+	defer func(old func(args ...string) (string, error)) { runHerdr = old }(runHerdr)
+	stubHostedTreeSeams(t, 501, 42)
+	listChildPIDs = func(pid int) ([]int, error) {
+		if pid == 900001 {
+			return []int{900099}, nil // transient child
+		}
+		return nil, nil
+	}
+	processExists = func(pid int) bool { return pid != 900099 }
+	readStartTok = func(pid int) (string, error) {
+		if pid == 900099 {
+			return "", fmt.Errorf("no such process")
+		}
+		return fmt.Sprintf("tok-%d", pid), nil
+	}
+	runHerdr = func(args ...string) (string, error) {
+		return `{"result":{"process_info":{"pane_id":"p1","shell_pid":900001,"foreground_processes":[{"pid":900001}]}}}`, nil
+	}
+	info, err := GetHostedPaneIdentity("p1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range info.Tree {
+		if p.PID == 900099 {
+			t.Fatal("gone optional descendant must be skipped, not included")
+		}
+	}
+	// Required foreground gone → fail closed.
+	processExists = func(int) bool { return false }
+	readStartTok = func(int) (string, error) { return "", fmt.Errorf("no such process") }
+	if _, err := GetHostedPaneIdentity("p1"); err == nil {
+		t.Fatal("required shell/fg observation failure must fail closed")
+	}
+}
+
+func TestSignalHostedPaneTree_GraceBetweenTermAndKill(t *testing.T) {
+	defer func(old func(args ...string) (string, error)) { runHerdr = old }(runHerdr)
+	defer func(old func(int, syscall.Signal) error) { signalExact = old }(signalExact)
+	defer func(old func()) { sleepBrief = old }(sleepBrief)
+	defer func(old func() int) { osGetpid = old }(osGetpid)
+	stubHostedTreeSeams(t, 501, 42)
+	fakePID := 1<<30 - 9
+	osGetpid = func() int { return 1 }
+	readStartTok = func(pid int) (string, error) { return "tok", nil }
+	var order []string
+	sleepBrief = func() { order = append(order, "sleep") }
+	signalExact = func(pid int, sig syscall.Signal) error {
+		order = append(order, fmt.Sprintf("%d", sig))
+		return nil
+	}
+	runHerdr = func(args ...string) (string, error) {
+		return fmt.Sprintf(`{"result":{"process_info":{"pane_id":"p1","shell_pid":%d,"foreground_processes":[{"pid":%d}]}}}`, fakePID, fakePID), nil
+	}
+	if err := SignalHostedPaneTree("p1"); err != nil {
+		t.Fatal(err)
+	}
+	// Expect TERM, grace, KILL — not TERM/KILL adjacent without sleep.
+	want := []string{
+		fmt.Sprintf("%d", syscall.SIGTERM),
+		"sleep",
+		fmt.Sprintf("%d", syscall.SIGKILL),
+	}
+	if len(order) != 3 || order[0] != want[0] || order[1] != want[1] || order[2] != want[2] {
+		t.Fatalf("signal order %v want %v", order, want)
+	}
+}
+
 func TestNoCLISetuidEnforcementInSource(t *testing.T) {
-	for _, name := range []string{"herdr.go", "hosted_uid.go"} {
-		data, err := os.ReadFile(name)
+	// Scan every package source file for CLI setuid / host-wide kill / sudo escapes.
+	ents, err := os.ReadDir(".")
+	if err != nil {
+		t.Fatal(err)
+	}
+	forbidden := []string{
+		"runHerdrAsUID", "syscall.Setuid", "syscall.Kill(-1", "Kill(-1,",
+		"\"sudo\"", "'sudo'", " doas ", "\"doas\"", "\"su\"", "launchctl asuser",
+		"/usr/bin/sudo", "Credential{Uid",
+	}
+	for _, e := range ents {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".go") {
+			continue
+		}
+		data, err := os.ReadFile(e.Name())
 		if err != nil {
 			t.Fatal(err)
 		}
 		src := string(data)
-		if strings.Contains(src, "runHerdrAsUID") || strings.Contains(src, "syscall.Setuid") {
-			t.Fatalf("%s must not setuid the herdr CLI", name)
+		// Allow mentions in this test file's forbidden list itself.
+		if e.Name() == "hosted_uid_test.go" {
+			continue
 		}
-		if strings.Contains(src, "syscall.Kill(-1") || strings.Contains(src, "Kill(-1,") {
-			t.Fatalf("%s must not issue kill(-1)", name)
+		for _, bad := range forbidden {
+			if strings.Contains(src, bad) {
+				t.Fatalf("%s must not contain %q", e.Name(), bad)
+			}
 		}
 	}
 }

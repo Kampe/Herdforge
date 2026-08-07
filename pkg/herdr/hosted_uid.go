@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -66,6 +67,14 @@ var (
 	// ErrHostedUIDPIDReuse is returned when a PID's start token changed between
 	// observation and action (kill refused — would hit a recycled identity).
 	ErrHostedUIDPIDReuse = errors.New("herdr: hosted UID pid start-token reuse")
+
+	// ErrHostedUIDProcessGone means the PID no longer exists (ESRCH) — kill is
+	// idempotent success. Distinct from observation failure.
+	ErrHostedUIDProcessGone = errors.New("herdr: hosted process already gone")
+
+	// ErrHostedUIDObserve means start-token/UID/GID observation failed for a
+	// process that still exists — fail closed, do not pretend cleanup succeeded.
+	ErrHostedUIDObserve = errors.New("herdr: hosted process observation failed")
 )
 
 // HostedUIDCapability is the FAC-172 structured capability document.
@@ -105,15 +114,16 @@ type HostedProcessIdentity struct {
 	Role       string // shell | foreground | pgid | descendant | agent
 }
 
-// EnvBuilderGID optionally pins the expected primary GID for hosted processes.
-// When unset, proof requires a homogeneous tree GID equal to the shell's GID
-// and distinct from the coordinator's primary GID (group-drop evidence).
+// EnvBuilderGID pins the expected primary GID for hosted processes. Required
+// for group-drop evidence when isolation is on: must be positive and must not
+// equal the coordinator's primary GID.
 const EnvBuilderGID = "HERD_BUILDER_GID"
 
 // test seams — production defaults use real OS / procsignal.
 var (
 	processUIDOf    = processUIDOfReal
 	processGIDOf    = processGIDOfReal
+	processExists   = processExistsReal
 	signalExact     = procsignal.SignalExactProcess
 	osGetuid        = os.Getuid
 	osGetgid        = os.Getgid
@@ -122,14 +132,34 @@ var (
 	readParent      = func(pid int) (int, error) { return readPIDParent(pid) }
 	listPGIDMembers = listProcessGroupMembersReal
 	listChildPIDs   = listDirectChildrenReal
-	sleepBrief      = func() { time.Sleep(50 * time.Millisecond) }
+	// sleepBrief is the TERM→KILL grace quantum (must run between the two signals).
+	sleepBrief = func() { time.Sleep(50 * time.Millisecond) }
 )
 
+// Capability cache: one successful negotiation per process lifetime (or until
+// ResetHostedUIDCapabilityCache). Avoids 4+ herdr subprocesses per launch.
+var (
+	capMu     sync.Mutex
+	capCached *HostedUIDCapability
+)
+
+// ResetHostedUIDCapabilityCache clears the negotiation cache (tests / after
+// daemon upgrade probes).
+func ResetHostedUIDCapabilityCache() {
+	capMu.Lock()
+	capCached = nil
+	capMu.Unlock()
+}
+
 // BuilderUID returns the configured HERD_BUILDER_UID or an error when unset/invalid.
+// Leading/trailing whitespace is rejected (present-but-malformed fail-closed).
 func BuilderUID() (int, error) {
-	raw := strings.TrimSpace(os.Getenv(EnvBuilderUID))
+	raw := os.Getenv(EnvBuilderUID)
 	if raw == "" {
 		return 0, fmt.Errorf("%w: %s is required", ErrHostedUIDConfig, EnvBuilderUID)
+	}
+	if raw != strings.TrimSpace(raw) || strings.TrimSpace(raw) == "" {
+		return 0, fmt.Errorf("%w: %s=%q must be a bare positive kernel uid (no whitespace)", ErrHostedUIDConfig, EnvBuilderUID, raw)
 	}
 	uid, err := strconv.Atoi(raw)
 	if err != nil || uid <= 0 {
@@ -138,27 +168,29 @@ func BuilderUID() (int, error) {
 	return uid, nil
 }
 
-// HostedUIDIsolationRequired is true when the fleet has configured a builder
-// identity that must be daemon-hosted, or when HERD_REQUIRE_HOSTED_UID=1 forces
-// the path. Force-on never silently fail-opens for builder==coordinator: the
-// subsequent BuilderUID/capability gates reject that misconfiguration.
+// HostedUIDIsolationRequired is true when isolation is forced, or when
+// HERD_BUILDER_UID is *present* (even if malformed). Only a truly absent
+// builder env means isolation is off. Present-but-invalid fails closed at
+// BuilderUID/capability gates — never silently launches as coordinator.
 func HostedUIDIsolationRequired() bool {
 	if os.Getenv(EnvRequireHostedUID) == "1" {
 		return true
 	}
-	uid, err := BuilderUID()
-	if err != nil {
-		return false
-	}
-	return uid != osGetuid()
+	return strings.TrimSpace(os.Getenv(EnvBuilderUID)) != ""
 }
 
 // NegotiateHostedUIDCapability performs structured capability negotiation.
-// It does NOT scrape --help text.
+// It does NOT scrape --help text. Successful results are cached; errors are
+// never cached so a recovering daemon can be retried.
 func NegotiateHostedUIDCapability() (HostedUIDCapability, error) {
+	capMu.Lock()
+	defer capMu.Unlock()
+	if capCached != nil {
+		return *capCached, nil
+	}
 	out, err := runHerdr("api", "capabilities", "--json")
 	if err != nil {
-		return HostedUIDCapability{}, fmt.Errorf("%w", ErrHostedUIDUnsupported)
+		return HostedUIDCapability{}, fmt.Errorf("%w: herdr api capabilities failed: %v (output=%q)", ErrHostedUIDUnsupported, err, truncateForErr(out, 200))
 	}
 	var cap HostedUIDCapability
 	if err := json.Unmarshal([]byte(out), &cap); err != nil {
@@ -166,14 +198,24 @@ func NegotiateHostedUIDCapability() (HostedUIDCapability, error) {
 			Result HostedUIDCapability `json:"result"`
 		}
 		if err2 := json.Unmarshal([]byte(out), &env); err2 != nil {
-			return HostedUIDCapability{}, fmt.Errorf("%w: capabilities JSON unreadable: %v", ErrHostedUIDUnsupported, err)
+			return HostedUIDCapability{}, fmt.Errorf("%w: capabilities JSON unreadable: %v (output=%q)", ErrHostedUIDUnsupported, err, truncateForErr(out, 200))
 		}
 		cap = env.Result
 	}
 	if err := validateHostedUIDCapability(cap); err != nil {
 		return HostedUIDCapability{}, err
 	}
+	cp := cap
+	capCached = &cp
 	return cap, nil
+}
+
+func truncateForErr(s string, n int) string {
+	s = strings.TrimSpace(s)
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "…"
 }
 
 func validateHostedUIDCapability(c HostedUIDCapability) error {
@@ -291,7 +333,10 @@ func GetHostedPaneIdentity(paneID string) (*HostedPaneIdentity, error) {
 		ProcessGroupID: resp.Result.ProcessInfo.ForegroundProcessGroupID,
 	}
 	byPID := map[int]*HostedProcessIdentity{}
-	add := func(pid int, role string) error {
+	// required=true: shell/foreground must be observable. required=false: pgid/
+	// descendant PIDs from pgrep may exit between enumeration and observation —
+	// skip only when the process is confirmed gone, never on observation failure.
+	add := func(pid int, role string, required bool) error {
 		if pid <= 0 {
 			return nil
 		}
@@ -299,7 +344,6 @@ func GetHostedPaneIdentity(paneID string) (*HostedPaneIdentity, error) {
 			if existing.Role == "shell" || role == existing.Role {
 				return nil
 			}
-			// Keep the more specific role tag when re-seen.
 			if role == "agent" {
 				existing.Role = role
 			}
@@ -307,30 +351,48 @@ func GetHostedPaneIdentity(paneID string) (*HostedPaneIdentity, error) {
 		}
 		tok, err := readStartTok(pid)
 		if err != nil || strings.TrimSpace(tok) == "" {
-			return fmt.Errorf("%w: start token pid %d role %s: %v", ErrHostedUIDProofFailed, pid, role, err)
+			if !required && !processExists(pid) {
+				return nil
+			}
+			if !processExists(pid) {
+				return fmt.Errorf("%w: start token pid %d role %s: %v", ErrHostedUIDProcessGone, pid, role, err)
+			}
+			return fmt.Errorf("%w: start token pid %d role %s: %v", ErrHostedUIDObserve, pid, role, err)
 		}
 		uid, err := processUIDOf(pid)
 		if err != nil {
-			return fmt.Errorf("%w: uid pid %d role %s: %v", ErrHostedUIDProofFailed, pid, role, err)
+			if !required && !processExists(pid) {
+				return nil
+			}
+			if !processExists(pid) {
+				return fmt.Errorf("%w: uid pid %d role %s: %v", ErrHostedUIDProcessGone, pid, role, err)
+			}
+			return fmt.Errorf("%w: uid pid %d role %s: %v", ErrHostedUIDObserve, pid, role, err)
 		}
 		gid, err := processGIDOf(pid)
 		if err != nil {
-			return fmt.Errorf("%w: gid pid %d role %s: %v", ErrHostedUIDProofFailed, pid, role, err)
+			if !required && !processExists(pid) {
+				return nil
+			}
+			if !processExists(pid) {
+				return fmt.Errorf("%w: gid pid %d role %s: %v", ErrHostedUIDProcessGone, pid, role, err)
+			}
+			return fmt.Errorf("%w: gid pid %d role %s: %v", ErrHostedUIDObserve, pid, role, err)
 		}
-		ppid, _ := readParent(pid) // best-effort; zero is ok for shell
+		ppid, _ := readParent(pid)
 		id := HostedProcessIdentity{PID: pid, StartToken: tok, UID: uid, GID: gid, ParentPID: ppid, Role: role}
 		byPID[pid] = &id
 		return nil
 	}
 
 	if info.ShellPID > 0 {
-		if err := add(info.ShellPID, "shell"); err != nil {
+		if err := add(info.ShellPID, "shell", true); err != nil {
 			return nil, err
 		}
 		info.ShellStart = byPID[info.ShellPID].StartToken
 	}
 	for _, p := range *fgRaw {
-		if err := add(p.PID, "foreground"); err != nil {
+		if err := add(p.PID, "foreground", true); err != nil {
 			return nil, err
 		}
 		if id := byPID[p.PID]; id != nil {
@@ -348,7 +410,7 @@ func GetHostedPaneIdentity(paneID string) (*HostedPaneIdentity, error) {
 			return nil, fmt.Errorf("%w: process-group members pgid %d: %v", ErrHostedUIDProofFailed, info.ProcessGroupID, err)
 		}
 		for _, pid := range members {
-			if err := add(pid, "pgid"); err != nil {
+			if err := add(pid, "pgid", false); err != nil {
 				return nil, err
 			}
 		}
@@ -360,7 +422,7 @@ func GetHostedPaneIdentity(paneID string) (*HostedPaneIdentity, error) {
 			return nil, fmt.Errorf("%w: shell descendants: %v", ErrHostedUIDProofFailed, err)
 		}
 		for _, pid := range desc {
-			if err := add(pid, "descendant"); err != nil {
+			if err := add(pid, "descendant", false); err != nil {
 				return nil, err
 			}
 		}
@@ -471,22 +533,42 @@ func processGIDOfReal(pid int) (int, error) {
 	return g, nil
 }
 
+// processExistsReal probes liveness with kill(pid, 0). ESRCH → gone; any other
+// result (including EPERM) means the process still exists.
+func processExistsReal(pid int) bool {
+	if pid <= 0 {
+		return false
+	}
+	err := syscall.Kill(pid, 0)
+	if err == nil {
+		return true
+	}
+	if errors.Is(err, syscall.ESRCH) {
+		return false
+	}
+	return true
+}
+
 // expectedBuilderGID resolves the GID the isolation tree must share.
-// Explicit HERD_BUILDER_GID wins; otherwise shell GID is the anchor and must
-// differ from the coordinator primary GID (evidence of group drop).
+// HERD_BUILDER_GID is required for group-drop evidence: positive and not the
+// coordinator primary GID. The unset branch still requires shell GID ≠
+// coordinator GID (homogeneous tree under a dropped group).
 func expectedBuilderGID(shellGID int) (int, error) {
 	if raw := strings.TrimSpace(os.Getenv(EnvBuilderGID)); raw != "" {
 		g, err := strconv.Atoi(raw)
-		if err != nil || g < 0 {
-			return 0, fmt.Errorf("%w: %s=%q invalid", ErrHostedUIDConfig, EnvBuilderGID, raw)
+		if err != nil || g <= 0 {
+			return 0, fmt.Errorf("%w: %s=%q must be a positive gid", ErrHostedUIDConfig, EnvBuilderGID, raw)
+		}
+		if g == osGetgid() {
+			return 0, fmt.Errorf("%w: %s=%d equals coordinator gid — group drop not proven", ErrHostedUIDConfig, EnvBuilderGID, g)
 		}
 		return g, nil
 	}
-	if shellGID < 0 {
-		return 0, fmt.Errorf("%w: shell gid unreadable", ErrHostedUIDProofFailed)
+	if shellGID <= 0 {
+		return 0, fmt.Errorf("%w: shell gid unreadable or zero", ErrHostedUIDProofFailed)
 	}
 	if shellGID == osGetgid() {
-		return 0, fmt.Errorf("%w: shell gid %d equals coordinator gid — group drop not proven", ErrHostedUIDProofFailed, shellGID)
+		return 0, fmt.Errorf("%w: shell gid %d equals coordinator gid — group drop not proven (set %s)", ErrHostedUIDProofFailed, shellGID, EnvBuilderGID)
 	}
 	return shellGID, nil
 }
@@ -542,8 +624,9 @@ func AssertHostedPaneUID(paneID string, wantUID int) error {
 }
 
 // AssertAgentHostedAsBuilder proves the exact routed agent process (and its
-// wrapper parent when required) runs as BuilderUID on the agent's pane.
-// It is not a second full-pane walk: it matches provider/argv like bindToolChildLifecycle.
+// wrapper parent when required) runs as BuilderUID. Callers that already ran
+// AssertHostedPaneUID do not re-walk the full isolation tree here — only the
+// routed owner match (provider/argv) and UID/start-token on that owner.
 func AssertAgentHostedAsBuilder(agentName string, builderUID int, provider string, argv []string) error {
 	if builderUID <= 0 {
 		return fmt.Errorf("%w: invalid builder uid", ErrHostedUIDConfig)
@@ -587,7 +670,10 @@ func AssertAgentHostedAsBuilder(agentName string, builderUID int, provider strin
 	}
 	tok, err := readStartTok(p.PID)
 	if err != nil || strings.TrimSpace(tok) == "" {
-		return fmt.Errorf("%w: agent start token pid %d: %v", ErrHostedUIDProofFailed, p.PID, err)
+		if !processExists(p.PID) {
+			return fmt.Errorf("%w: agent start token pid %d: %v", ErrHostedUIDProcessGone, p.PID, err)
+		}
+		return fmt.Errorf("%w: agent start token pid %d: %v", ErrHostedUIDObserve, p.PID, err)
 	}
 	uid, err := processUIDOf(p.PID)
 	if err != nil {
@@ -595,6 +681,17 @@ func AssertAgentHostedAsBuilder(agentName string, builderUID int, provider strin
 	}
 	if uid != builderUID {
 		return fmt.Errorf("%w: agent pid %d uid=%d want BuilderUID=%d", ErrHostedUIDProofFailed, p.PID, uid, builderUID)
+	}
+	gid, err := processGIDOf(p.PID)
+	if err != nil {
+		return fmt.Errorf("%w: agent gid pid %d: %v", ErrHostedUIDProofFailed, p.PID, err)
+	}
+	wantGID, err := expectedBuilderGID(gid)
+	if err != nil {
+		return err
+	}
+	if gid != wantGID {
+		return fmt.Errorf("%w: agent pid %d gid=%d want BuilderGID=%d", ErrHostedUIDProofFailed, p.PID, gid, wantGID)
 	}
 	parent, err := readParent(p.PID)
 	if err != nil {
@@ -616,26 +713,38 @@ func AssertAgentHostedAsBuilder(agentName string, builderUID int, provider strin
 		if wUID != builderUID {
 			return fmt.Errorf("%w: wrapper pid %d uid=%d want BuilderUID=%d", ErrHostedUIDProofFailed, w.PID, wUID, builderUID)
 		}
+		wGID, err := processGIDOf(w.PID)
+		if err != nil {
+			return fmt.Errorf("%w: wrapper gid pid %d: %v", ErrHostedUIDProofFailed, w.PID, err)
+		}
+		if wGID != wantGID {
+			return fmt.Errorf("%w: wrapper pid %d gid=%d want BuilderGID=%d", ErrHostedUIDProofFailed, w.PID, wGID, wantGID)
+		}
 	} else if len(wrappers) > 1 {
 		return fmt.Errorf("%w: provider process has ambiguous node wrappers", ErrHostedUIDProofFailed)
-	}
-	// Ensure the agent PID is also inside the pane isolation tree as BuilderUID.
-	if err := AssertHostedPaneUID(pane, builderUID); err != nil {
-		return err
 	}
 	return nil
 }
 
 // revalidateStartToken re-reads the PID's start identity and refuses when it
-// no longer matches the bound token (PID reuse window).
+// no longer matches the bound token (PID reuse window). Distinguishes process
+// gone (ESRCH) from observation failure (ps/fork errors while process lives).
 func revalidateStartToken(pid int, bound string) error {
 	if pid <= 0 || strings.TrimSpace(bound) == "" {
 		return fmt.Errorf("%w: incomplete identity", ErrHostedUIDPIDReuse)
 	}
 	cur, err := readStartTok(pid)
 	if err != nil {
-		// Process gone — not reuse; treat as already reaped.
-		return err
+		if !processExists(pid) {
+			return fmt.Errorf("%w: pid %d", ErrHostedUIDProcessGone, pid)
+		}
+		return fmt.Errorf("%w: pid %d: %v", ErrHostedUIDObserve, pid, err)
+	}
+	if strings.TrimSpace(cur) == "" {
+		if !processExists(pid) {
+			return fmt.Errorf("%w: pid %d empty token", ErrHostedUIDProcessGone, pid)
+		}
+		return fmt.Errorf("%w: pid %d empty start token", ErrHostedUIDObserve, pid)
 	}
 	if cur != bound {
 		return fmt.Errorf("%w: pid %d start token changed (was %q now %q)", ErrHostedUIDPIDReuse, pid, bound, cur)
@@ -645,23 +754,24 @@ func revalidateStartToken(pid int, bound string) error {
 
 // signalBoundIdentity delivers sig only after start-token revalidation.
 // Callers must have proven ownership of the identity (procsignal contract).
+// Process-gone is idempotent success; observation failure and PID reuse fail closed.
 func signalBoundIdentity(id HostedProcessIdentity, sig syscall.Signal) error {
 	if id.PID == osGetpid() {
 		return fmt.Errorf("%w: refusing to signal self", procsignal.ErrUnsafeTarget)
 	}
 	if err := revalidateStartToken(id.PID, id.StartToken); err != nil {
-		// Gone: idempotent success for kill. Reuse: hard refuse.
-		if errors.Is(err, ErrHostedUIDPIDReuse) {
-			return err
+		if errors.Is(err, ErrHostedUIDProcessGone) {
+			return nil
 		}
-		return nil
+		return err
 	}
 	return signalExact(id.PID, sig)
 }
 
 // SignalHostedPaneTree terminates shell/foreground/pgid/descendant PIDs with
-// start-token revalidation. Does not close the tab (so lifecycle rollback can
-// still observe the agent and write tombstones).
+// start-token revalidation. SIGTERM is delivered to the whole tree, then a
+// grace quantum, then SIGKILL — never TERM+KILL in the same iteration.
+// Does not close the tab (lifecycle rollback must still observe the agent).
 func SignalHostedPaneTree(paneID string) error {
 	info, err := GetHostedPaneIdentity(paneID)
 	if err != nil {
@@ -670,19 +780,29 @@ func SignalHostedPaneTree(paneID string) error {
 	var first error
 	self := osGetpid()
 	seen := map[int]bool{self: true}
+	var targets []HostedProcessIdentity
 	for _, p := range info.Tree {
 		if p.PID <= 0 || seen[p.PID] {
 			continue
 		}
 		seen[p.PID] = true
+		targets = append(targets, p)
+	}
+	for _, p := range targets {
 		if err := signalBoundIdentity(p, syscall.SIGTERM); err != nil && first == nil {
 			if !errors.Is(err, procsignal.ErrUnsafeTarget) {
 				first = err
 			}
 		}
-		_ = signalBoundIdentity(p, syscall.SIGKILL)
 	}
-	sleepBrief()
+	sleepBrief() // grace quantum — bound children may handle TERM
+	for _, p := range targets {
+		if err := signalBoundIdentity(p, syscall.SIGKILL); err != nil && first == nil {
+			if !errors.Is(err, procsignal.ErrUnsafeTarget) && !errors.Is(err, ErrHostedUIDProcessGone) {
+				first = err
+			}
+		}
+	}
 	return first
 }
 
