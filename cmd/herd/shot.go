@@ -14,9 +14,21 @@ import (
 	"github.com/Kampe/Herdforge/pkg/shot"
 )
 
-// runShot ports bin/herd-shot: one bounded task, headless, through the quota
-// router. No tab, no pane, no session bootstrap.
+// runShot has two lanes, told apart by the first argument.
+//
+//	herd shot FAC-89 [--lane ...] — the FAC-89 bounded ONE-TASK lane: a board
+//	  task driven through eligibility, atomic claim, isolated dispatch,
+//	  completion callback, exact-SHA verification, and handoff to review.
+//	herd shot <prompt words>      — ports bin/herd-shot: one bounded prompt,
+//	  headless, through the quota router. No tab, no pane, no session bootstrap.
+//
+// The task lane requires the ref FIRST, so a prompt can never be mistaken for
+// a card by a flag value that happens to look like one.
 func runShot() {
+	if len(os.Args) > 2 && shot.IsTaskRef(os.Args[2]) {
+		runShotTask(os.Args[2], os.Args[3:])
+		return
+	}
 	fs := flag.NewFlagSet("shot", flag.ExitOnError)
 	shape := fs.String("task", shot.DefaultShape, "Task shape (bounded, research, qa, ...)")
 	provider := fs.String("provider", "", "Pin a surface (must be able to do the job)")

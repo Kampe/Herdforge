@@ -366,7 +366,8 @@ func printUsage() {
 	fmt.Println("  spin         Detect stalled (frozen output) and spinning (no git delta) panes")
 	fmt.Println("  watch        Fire the moment an agent settles; --stream feeds harvest triggers")
 	fmt.Println("  fresh-build  Prove cross-package build errors are real (not stale dist)")
-	fmt.Println("  shot         Run one bounded task headless through the quota router")
+	fmt.Println("  shot         <task-ref>: one bounded task from eligibility to review handoff;")
+	fmt.Println("               <prompt>: one headless prompt through the quota router")
 	fmt.Println("  scope        Publish the trusted task scope the dispatch fence resolves against")
 	fmt.Println("  review-classify   Deterministic R0-R3 risk floor for review dispatch")
 	fmt.Println("  review-ingest     Validate reviewer verdicts and admit them to the ledger")
@@ -2364,6 +2365,33 @@ func runDispatch() {
 		}
 		os.Exit(1)
 	}
+	result, _, err := dispatchTicketDecision(context.Background(), req, os.Stdout)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Printf("  Ticket : %s — %s\n", result.TicketRef, result.TicketTitle)
+	fmt.Printf("  Worktree : %s\n", result.Worktree)
+	fmt.Printf("  Branch   : %s\n", result.Branch)
+	fmt.Printf("  Packet   : %s\n", result.TaskPacket)
+	if result.Launched {
+		fmt.Printf("  Agent    : Launched in herdr tab\n")
+	} else {
+		fmt.Printf("  Agent    : Not launched (use --no-launch or see TASK-PACKET.md)\n")
+	}
+}
+
+// dispatchTicketDecision is the production claim + isolated dispatch for ONE
+// ticket: lane identity, hold admission, scope-fenced dispatcher, launch
+// admission. `herd dispatch` and the FAC-89 bounded `herd shot <task-ref>` lane
+// share it so neither can drift into a weaker admission path than the other.
+//
+// It also returns the admitted LaunchDecision, because the surface that
+// actually launched is what makes the builder family provable at review
+// handoff. The decision is nil on the --no-launch path (nothing launched).
+// Progress goes to announce; every failure is returned, never exited on.
+func dispatchTicketDecision(ctx context.Context, req dispatchRequest, announce io.Writer) (*dispatch.DispatchResult, *router.LaunchDecision, error) {
 	ticketRef := req.TicketRef
 	noLaunch := req.NoLaunch
 	laneName := req.LaneName
@@ -2371,13 +2399,11 @@ func runDispatch() {
 
 	cfg, err := config.LoadConfig(".herd/herd.yaml")
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "failed to load config: %v\n", err)
-		os.Exit(1)
+		return nil, nil, fmt.Errorf("failed to load config: %w", err)
 	}
 	registry, err := canonicalLaneRegistry(cfg)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "lane identity: %v\n", err)
-		os.Exit(1)
+		return nil, nil, fmt.Errorf("lane identity: %w", err)
 	}
 	var canonicalLane lifecycle.CanonicalLane
 	if laneExplicit {
@@ -2386,8 +2412,7 @@ func runDispatch() {
 		canonicalLane, err = registry.ResolveRole(laneName)
 	}
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "lane identity: %v\n", err)
-		os.Exit(1)
+		return nil, nil, fmt.Errorf("lane identity: %w", err)
 	}
 	// Collapse to the resolved lane NAME right here. Everything downstream --
 	// the hold gate, the launch admission, both Dispatch calls, the log line --
@@ -2399,8 +2424,7 @@ func runDispatch() {
 
 	tp, tpErr := loadTaskProvider(cfg)
 	if tpErr != nil {
-		fmt.Fprintf(os.Stderr, "task provider: %v\n", tpErr)
-		os.Exit(1)
+		return nil, nil, fmt.Errorf("task provider: %w", tpErr)
 	}
 
 	wm := resolveCanonicalWorktreeManager()
@@ -2419,30 +2443,27 @@ func runDispatch() {
 		scopeVerifier, scopeVerifier, expectedRevision, expectedFiles)
 	closeControl, err := configureProductionControl(d, ".")
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "control store init failed: %v\n", err)
-		os.Exit(1)
+		return nil, nil, fmt.Errorf("control store init failed: %w", err)
 	}
 	defer closeControl()
 	var decision *router.LaunchDecision
 	var dispatchResult *dispatch.DispatchResult
 	holdAuthority, holdErr := newProductionHoldAuthority()
 	if holdErr != nil {
-		fmt.Fprintf(os.Stderr, "hold authority: %v\n", holdErr)
-		os.Exit(1)
+		return nil, nil, fmt.Errorf("hold authority: %w", holdErr)
 	}
 	defer holdAuthority.Close()
 	repositoryIdentity, identityErr := holdRepository()
 	if identityErr != nil {
-		fmt.Fprintf(os.Stderr, "hold identity: %v\n", identityErr)
-		os.Exit(1)
+		return nil, nil, fmt.Errorf("hold identity: %w", identityErr)
 	}
 	admitDispatch := func() error {
 		for _, identity := range []lifecycle.HoldIdentity{{Repository: repositoryIdentity, Owner: canonicalLane.Role, Lane: canonicalLane.Name, Scope: "lane"}, {Repository: repositoryIdentity, Owner: canonicalLane.Role, Lane: canonicalLane.Name, Task: ticketRef, Scope: "task"}} {
-			generation, err := holdAuthority.CurrentGeneration(context.Background(), identity)
+			generation, err := holdAuthority.CurrentGeneration(ctx, identity)
 			if err != nil {
 				return err
 			}
-			decision, err := holdAuthority.Check(context.Background(), identity, generation)
+			decision, err := holdAuthority.Check(ctx, identity, generation)
 			if err != nil {
 				return err
 			}
@@ -2453,51 +2474,41 @@ func runDispatch() {
 		return nil
 	}
 	if err := admitDispatch(); err != nil {
-		fmt.Fprintf(os.Stderr, "dispatch hold admission rejected: %v\n", err)
-		os.Exit(1)
+		return nil, nil, fmt.Errorf("dispatch hold admission rejected: %w", err)
 	}
 	if !noLaunch {
 		// canonicalLane.Role, not a second lookup: this is the same lane the hold
 		// gate above already admitted.
-		decision, err = launchAdmissionWithLifecycle(liveLaunchLifecycle{}, cfg, canonicalLane.Role, true, routedLaneDecision(context.Background(), nil), func(admitted *router.LaunchDecision) error {
+		decision, err = launchAdmissionWithLifecycle(liveLaunchLifecycle{}, cfg, canonicalLane.Role, true, routedLaneDecision(ctx, nil), func(admitted *router.LaunchDecision) error {
 			if err := admitDispatch(); err != nil {
 				return err
 			}
 			var dispatchErr error
-			dispatchResult, dispatchErr = d.Dispatch(context.Background(), dispatch.DispatchOptions{TicketRef: ticketRef, NoLaunch: noLaunch, LaneName: laneName, Decision: admitted})
+			dispatchResult, dispatchErr = d.Dispatch(ctx, dispatch.DispatchOptions{TicketRef: ticketRef, NoLaunch: noLaunch, LaneName: laneName, Decision: admitted})
 			return dispatchErr
 		})
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "dispatch launch failed: %v\n", err)
-			os.Exit(1)
+			return nil, nil, fmt.Errorf("dispatch launch failed: %w", err)
 		}
 		// launchAdmission already validated lane capability before any side effect.
 		// Dispatch rebinds/validates the exact task+lease after claim; never post-validate a lane decision against a task ref.
 	}
-	fmt.Printf("Dispatching %s to lane '%s'...\n", ticketRef, laneName)
+	fmt.Fprintf(announce, "Dispatching %s to lane '%s'...\n", ticketRef, laneName)
 
 	result := dispatchResult
 	if noLaunch {
 		if err := admitDispatch(); err != nil {
-			fmt.Fprintf(os.Stderr, "dispatch hold admission rejected: %v\n", err)
-			os.Exit(1)
+			return nil, nil, fmt.Errorf("dispatch hold admission rejected: %w", err)
 		}
-		result, err = d.Dispatch(context.Background(), dispatch.DispatchOptions{TicketRef: ticketRef, NoLaunch: true, LaneName: laneName, Decision: decision})
+		result, err = d.Dispatch(ctx, dispatch.DispatchOptions{TicketRef: ticketRef, NoLaunch: true, LaneName: laneName, Decision: decision})
 	}
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "dispatch failed: %v\n", err)
-		os.Exit(1)
+		return nil, nil, fmt.Errorf("dispatch failed: %w", err)
 	}
-
-	fmt.Printf("  Ticket : %s — %s\n", result.TicketRef, result.TicketTitle)
-	fmt.Printf("  Worktree : %s\n", result.Worktree)
-	fmt.Printf("  Branch   : %s\n", result.Branch)
-	fmt.Printf("  Packet   : %s\n", result.TaskPacket)
-	if result.Launched {
-		fmt.Printf("  Agent    : Launched in herdr tab\n")
-	} else {
-		fmt.Printf("  Agent    : Not launched (use --no-launch or see TASK-PACKET.md)\n")
+	if result == nil {
+		return nil, nil, fmt.Errorf("dispatch returned no result for %s", ticketRef)
 	}
+	return result, decision, nil
 }
 
 func configureProductionControl(d *dispatch.Dispatcher, root string) (func() error, error) {

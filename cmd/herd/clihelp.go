@@ -86,7 +86,26 @@ var subcommandUsage = map[string]string{
 	"doctor-models":   "Usage: herd doctor-models [flags]\n  Probe lane models for quota / availability.",
 	"tool-probe":      "Usage: herd tool-probe <model>\n  Exit 0 only if the model executes a tool.",
 	"shoot":           "Usage: herd shoot <pane|name> <refocus message>\n  Interrupt a stalled agent and refocus it.",
-	"next":            "Usage: herd next [flags]\n  Deterministic next-task selection.",
+	"shot": `Usage: herd shot <task-ref> [flags]        (bounded ONE-TASK lane, FAC-89)
+       herd shot <prompt words>            (headless prompt through the quota router)
+
+Task lane — eligibility, atomic claim, isolated dispatch, completion callback,
+exact-SHA verification, handoff to review. It never merges and never marks a
+card Done. The ref must come FIRST.
+
+Flags:
+  --lane <name>     Lane name or role to dispatch into (default: worker)
+  --timeout <s>     Seconds to wait for the completion callback (default: 900)
+  --risk <R0-R3>    Risk tier when the board carries no risk label
+  --json            Emit the evidence packet as JSON on stdout
+
+Builder half of the loop (run from the task worktree):
+  herd shot <task-ref> --report complete --sha <40-hex> --lease <n>
+  herd shot <task-ref> --report blocked --detail "<why>" --lease <n>
+
+Prompt lane flags: --task <shape> --provider <name> --schema <file>
+                   --timeout <s> --dry-run`,
+	"next": "Usage: herd next [flags]\n  Deterministic next-task selection.",
 	"dispatch": `Usage: herd dispatch <ticket-ref> [flags]
   Dispatch a ticket to a worktree and launch an agent.
 
