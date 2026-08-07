@@ -1,6 +1,7 @@
 package posture
 
 import (
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
@@ -11,13 +12,13 @@ func isolate(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()
 	t.Setenv("HERD_STATE_DIR", dir)
+	t.Setenv("HERD_FAMILY_POSTURE", "")
 	t.Setenv("HERD_CLAUDE_ONLY", "")
 	t.Setenv("HERD_NO_CLAUDE", "")
 	return dir
 }
 
-// The whole reason these are files: the posture must outlive the shell that
-// set it, because the coordinator drives the fleet through one-shot calls.
+// Durable JSON (and mirrored sentinels) must outlive the shell that set them.
 func TestSentinelSurvivesWithoutAnyEnvVar(t *testing.T) {
 	isolate(t)
 	if Active(ClaudeOnly) {
@@ -28,13 +29,13 @@ func TestSentinelSurvivesWithoutAnyEnvVar(t *testing.T) {
 	}
 	os.Unsetenv("HERD_CLAUDE_ONLY") // a new shell inherits nothing
 	if !Active(ClaudeOnly) {
-		t.Fatal("sentinel must carry the posture with no env var set")
+		t.Fatal("durable state must carry the posture with no env var set")
 	}
 	if err := Set(ClaudeOnly, false); err != nil {
 		t.Fatal(err)
 	}
 	if Active(ClaudeOnly) {
-		t.Fatal("off must clear the sentinel")
+		t.Fatal("off must clear the posture")
 	}
 }
 
@@ -47,10 +48,19 @@ func TestEnvOverridesSentinelBothWays(t *testing.T) {
 	}
 	t.Setenv("HERD_NO_CLAUDE", "0")
 	if Active(NoClaude) {
-		t.Fatal("explicit 0 must override an on sentinel for this invocation")
+		t.Fatal("explicit 0 must override an on durable posture for this invocation")
 	}
-	if !SentinelPresent(NoClaude) {
-		t.Fatal("an env override must not mutate the persisted posture")
+	// Durable JSON still records no-claude; env only changes effective mode.
+	a, err := OpenDefault()
+	if err != nil {
+		t.Fatal(err)
+	}
+	st, err := a.Read(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Mode != ModeNoClaude {
+		t.Fatalf("env override must not mutate durable mode, got %s", st.Mode)
 	}
 	t.Setenv("HERD_NO_CLAUDE", "1")
 	if !Active(NoClaude) {
@@ -58,17 +68,59 @@ func TestEnvOverridesSentinelBothWays(t *testing.T) {
 	}
 }
 
-// Contradictory postures must fail loudly instead of silently picking one.
+// `off` must clear DURABLE state even while a single-invocation env override
+// shadows the effective mode — otherwise the CLI reports OFF while the fleet
+// stays pinned.
+func TestSetOffClearsDurableStateUnderEnvOverride(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		posture Name
+		env     string
+		value   string
+	}{
+		{"claude-only forced off for this invocation", ClaudeOnly, "HERD_CLAUDE_ONLY", "0"},
+		{"claude-only shadowed by no-claude", ClaudeOnly, "HERD_NO_CLAUDE", "1"},
+		{"no-claude forced off for this invocation", NoClaude, "HERD_NO_CLAUDE", "0"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			isolate(t)
+			if err := Set(tc.posture, true); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv(tc.env, tc.value)
+			if err := Set(tc.posture, false); err != nil {
+				t.Fatal(err)
+			}
+			a, err := OpenDefault()
+			if err != nil {
+				t.Fatal(err)
+			}
+			st, err := a.Read(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if st.Mode != ModeClear {
+				t.Fatalf("durable mode after off = %s, want %s", st.Mode, ModeClear)
+			}
+			if SentinelPresent(tc.posture) {
+				t.Fatal("legacy sentinel must be removed by off")
+			}
+		})
+	}
+}
+
+// Contradictory legacy sentinels (no JSON) must fail loudly.
 func TestContradictoryPosturesFailClosed(t *testing.T) {
-	isolate(t)
+	dir := isolate(t)
 	if err := Resolve(); err != nil {
 		t.Fatalf("clean state must resolve: %v", err)
 	}
-	if err := Set(ClaudeOnly, true); err != nil {
-		t.Fatal(err)
-	}
-	if err := Set(NoClaude, true); err != nil {
-		t.Fatal(err)
+	// Write both legacy sentinels without JSON authority.
+	for _, n := range []Name{ClaudeOnly, NoClaude} {
+		path := filepath.Join(dir, string(n))
+		if err := os.WriteFile(path, []byte("on\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
 	}
 	var contradiction *ErrContradictory
 	if err := Resolve(); !errors.As(err, &contradiction) {

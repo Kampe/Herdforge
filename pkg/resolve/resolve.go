@@ -15,10 +15,12 @@
 package resolve
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
-	"os"
 	"strings"
+
+	"github.com/Kampe/Herdforge/pkg/posture"
 )
 
 // DefaultAdapter wraps an external scoring function as a RouteScorer.
@@ -202,8 +204,16 @@ func (r *LaneResolver) Resolve(laneID string, dropPrefer bool) *ResolvedLane {
 		byteOffClaude = *rc.ByteReplayReviewOffClaude
 	}
 
+	// Family posture (shared with router Pick/Decide — FAC-102).
+	effMode, _, modeErr := posture.Effective(context.Background())
+	if modeErr != nil {
+		result.Resolvable = false
+		result.Reason = fmt.Sprintf("family posture: %v", modeErr)
+		return result
+	}
+
 	// Posture interplay
-	if providerPin == "claude" && isEnvSet("HERD_NO_CLAUDE") {
+	if providerPin == "claude" && effMode == posture.ModeNoClaude {
 		providerPin = ""
 		result.Constraints = append(result.Constraints, "provider_pin=claude(dropped:no-claude)")
 	}
@@ -211,7 +221,7 @@ func (r *LaneResolver) Resolve(laneID string, dropPrefer bool) *ResolvedLane {
 	prefer := lane.Prefer
 	preferModel := lane.PreferModel
 
-	if prefer != "" && isEnvSet("HERD_CLAUDE_ONLY") {
+	if prefer != "" && effMode == posture.ModeClaudeOnly {
 		result.Constraints = append(result.Constraints, fmt.Sprintf("prefer=%s(dropped:claude-only)", prefer))
 		prefer = ""
 	}
@@ -243,6 +253,11 @@ func (r *LaneResolver) Resolve(laneID string, dropPrefer bool) *ResolvedLane {
 		if providerPin != "" {
 			score = r.scorer.Score(lane.RouteShape, providerPin)
 			result.Constraints = append(result.Constraints, fmt.Sprintf("provider_pin=%s", providerPin))
+		} else if effMode == posture.ModeClaudeOnly {
+			// Claude-only: score the only allowed surface; never fall through
+			// to a proxy or non-Anthropic provider.
+			score = r.scorer.Score(lane.RouteShape, "claude")
+			result.Constraints = append(result.Constraints, "provider_pin=claude(claude-only)")
 		} else {
 			score = r.scorer.Score(lane.RouteShape, "")
 		}
@@ -254,6 +269,20 @@ func (r *LaneResolver) Resolve(laneID string, dropPrefer bool) *ResolvedLane {
 		if providerPin != "" {
 			result.Reason += fmt.Sprintf(" (pinned %s)", providerPin)
 		}
+		if effMode == posture.ModeClaudeOnly {
+			result.Reason = "claude-only posture has no healthy native Claude route"
+		}
+		return result
+	}
+
+	// Family-level gate (same Allow() as router) so resolve cannot admit an
+	// Anthropic-family proxy under no-claude or a non-native surface under
+	// claude-only.
+	family := familyHint(score.Provider, score.Model)
+	if ok, why := posture.Allow(effMode, score.Provider, score.Model, family); !ok {
+		result.Resolvable = false
+		result.Reason = why
+		result.Constraints = append(result.Constraints, why)
 		return result
 	}
 
@@ -408,8 +437,20 @@ func (r *LaneResolver) findLane(id string) *LaneDef {
 	return nil
 }
 
-func isEnvSet(key string) bool {
-	return os.Getenv(key) != "" && os.Getenv(key) != "0"
+// familyHint is the minimal family label resolve needs for posture.Allow.
+// It intentionally mirrors router.FamilyFor for Anthropic/proxy only — the
+// only families the execution policy currently gates — without importing
+// pkg/router (which would create a cycle via resolve adapters).
+func familyHint(provider, model string) string {
+	p := strings.ToLower(strings.TrimSpace(provider))
+	m := strings.ToLower(model)
+	if p == "claude" || strings.Contains(m, "claude") {
+		return "anthropic"
+	}
+	if p == "lazer" {
+		return "proxy"
+	}
+	return ""
 }
 
 // effortRank maps effort labels to numeric ranks (low=1 .. max=5).

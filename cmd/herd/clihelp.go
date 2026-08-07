@@ -59,6 +59,7 @@ var subcommandUsage = map[string]string{
 	"status":        "Usage: herd status\n  Show herd workspace / daemon status.",
 	"pulse":         "Usage: herd pulse [--act [--spawn]] [--json] [--quiet] [--reason TEXT]\n  Coordinator heartbeat: observe by default; --act applies bounded renewals/callbacks.",
 	"wind-down":     "Usage: herd wind-down <on|off|status> [flags]\n  Control durable fleet launch posture.",
+	"posture":       "Usage: herd posture <claude-only|no-claude|clear|status> [flags]\n  Durable provider-family execution policy.",
 	"hold":          "Usage: herd hold <task> on|off|status --lane <name> --owner <role> [flags]\n  Generation-fenced lane/task hold.",
 	"standing": "Usage: herd standing [--dry-run|--status|--shutdown] [--only id,...] [id ...]\n  Raise, report, or shut down declarative standing control roles (not ephemeral workers).",
 	"daemon":        "Usage: herd daemon [flags]\n  Run the orchestration daemon.",

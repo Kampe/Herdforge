@@ -2,6 +2,7 @@ package router
 
 import (
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -15,9 +16,12 @@ func clearRouteEnv(t *testing.T) {
 		"HERD_CLAUDE_ONLY", "HERD_NO_CLAUDE", "HERD_NO_GEMINI",
 		"HERD_ERA_PROVIDERS", "HERD_AVAILABLE_PROVIDERS", "HERD_UNAVAILABLE_PROVIDERS",
 		"HERD_ROUTE_FIT_WEIGHT", "HERD_ROUTE_PRESSURE_FLOOR", "HERD_OLLAMA_USE_KIMI",
+		"HERD_FAMILY_POSTURE",
 	} {
 		t.Setenv(k, "")
 	}
+	// Hermetic durable posture so operator state under ~/.local cannot leak.
+	t.Setenv("HERD_STATE_DIR", t.TempDir())
 	t.Setenv("HERDR_ROUTE_STATE_DIR", t.TempDir()) // empty: no global cooldowns
 }
 
@@ -216,7 +220,7 @@ func TestPickNoClaudeFilters(t *testing.T) {
 func TestPickClaudeOnlyHoists(t *testing.T) {
 	clearRouteEnv(t)
 	t.Setenv("HERD_CLAUDE_ONLY", "1")
-	// bounded lists codex first; claude-only must hoist claude to win
+	// bounded lists codex first; claude-only must pick native claude only
 	r := testRouter(nil, "claude", "codex", "opencode", "grok")
 	route, err := r.Pick("bounded", "", "")
 	if err != nil {
@@ -224,6 +228,88 @@ func TestPickClaudeOnlyHoists(t *testing.T) {
 	}
 	if route.Provider != "claude" {
 		t.Fatalf("claude-only must pick claude, got %s", route.Provider)
+	}
+}
+
+func TestPickClaudeOnlyFailsClosedWithoutNativeClaude(t *testing.T) {
+	clearRouteEnv(t)
+	t.Setenv("HERD_CLAUDE_ONLY", "1")
+	// Only non-Claude CLIs present: must not fall through to proxy/codex.
+	r := testRouter(nil, "codex", "opencode", "grok")
+	_, err := r.Pick("implementation", "", "")
+	if err == nil {
+		t.Fatal("claude-only must fail closed when native Claude is unavailable")
+	}
+	if !strings.Contains(err.Error(), "claude-only") {
+		t.Fatalf("want claude-only failure, got %v", err)
+	}
+}
+
+func TestPickNoClaudeExcludesAnthropicFamilyProxy(t *testing.T) {
+	clearRouteEnv(t)
+	t.Setenv("HERD_NO_CLAUDE", "1")
+	// agy default for implementation is claude-opus (anthropic family).
+	// With only agy present, no-claude must fail rather than route Anthropic
+	// through a proxy harness.
+	r := testRouter(nil, "agy")
+	_, err := r.Pick("implementation", "", "")
+	if err == nil {
+		t.Fatal("no-claude must not route Anthropic family via agy")
+	}
+}
+
+// A pinned provider the posture forbids must be a hard error on both entry
+// points. Substituting native claude silently would stamp provider_pin=codex
+// onto a resolved lane that actually ran claude.
+func TestPinnedProviderForbiddenByPostureFailsClosed(t *testing.T) {
+	for _, tc := range []struct {
+		name, env, pin string
+	}{
+		{"claude-only rejects a codex pin", "HERD_CLAUDE_ONLY", "codex"},
+		{"no-claude rejects a claude pin", "HERD_NO_CLAUDE", "claude"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			clearRouteEnv(t)
+			t.Setenv(tc.env, "1")
+			r := testRouter(nil, "claude", "codex", "grok")
+			route, err := r.Pick("implementation", tc.pin, "")
+			if err == nil {
+				t.Fatalf("Pick must reject pin %q, got %s/%s", tc.pin, route.Provider, route.Model)
+			}
+			if !strings.Contains(err.Error(), tc.pin) {
+				t.Fatalf("error must name the rejected pin, got %v", err)
+			}
+			d, err := r.Decide(LaunchRequest{Role: RoleWorker, Shape: "implementation", RequestedProvider: tc.pin})
+			if err == nil {
+				t.Fatalf("Decide must reject pin %q, got %s/%s", tc.pin, d.Provider, d.Model)
+			}
+		})
+	}
+}
+
+// Pick and Decide must share the same allowed provider set under family posture.
+func TestPickDecideSharePostureCandidateSet(t *testing.T) {
+	clearRouteEnv(t)
+	t.Setenv("HERD_NO_CLAUDE", "1")
+	r := testRouter(nil, "claude", "grok", "codex", "agy")
+	route, err := r.Pick("implementation", "", "")
+	if err != nil {
+		t.Fatalf("Pick: %v", err)
+	}
+	d, err := r.Decide(LaunchRequest{Role: RoleWorker, Shape: "implementation"})
+	if err != nil {
+		t.Fatalf("Decide: %v", err)
+	}
+	if route.Provider == "claude" || d.Provider == "claude" {
+		t.Fatalf("no-claude must exclude native claude from both entry points: pick=%s decide=%s", route.Provider, d.Provider)
+	}
+	if route.Family == "anthropic" || d.Family == "anthropic" {
+		t.Fatalf("no-claude must exclude anthropic family: pick=%s/%s decide=%s/%s",
+			route.Provider, route.Family, d.Provider, d.Family)
+	}
+	// Both entry points must land on the same first healthy non-Anthropic surface.
+	if route.Provider != d.Provider {
+		t.Fatalf("Pick/Decide diverged under no-claude: pick=%s decide=%s", route.Provider, d.Provider)
 	}
 }
 

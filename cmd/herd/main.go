@@ -117,7 +117,11 @@ func main() {
 	case "wind-down":
 		runWindDown()
 
+	case "posture":
+		runFamilyPosture()
+
 	case "claude-only":
+		// Legacy alias: prefer `herd posture claude-only|no-claude|clear|status`.
 		runPosture(posture.ClaudeOnly)
 
 	case "no-claude":
@@ -336,8 +340,9 @@ func printUsage() {
 	fmt.Println("  status     Display current orchestration engine status")
 	fmt.Println("  pulse      Coordinator heartbeat (observe default; --act mutates bounded steps)")
 	fmt.Println("  wind-down  Control durable fleet launch posture: on, off, or status")
-	fmt.Println("  claude-only  Route the whole fleet to native Claude: on, off, or status")
-	fmt.Println("  no-claude    Hold native Claude out of the fleet: on, off, or status")
+	fmt.Println("  posture      Family policy: claude-only | no-claude | clear | status")
+	fmt.Println("  claude-only  Legacy alias for posture claude-only on/off/status")
+	fmt.Println("  no-claude    Legacy alias for posture no-claude on/off/status")
 	fmt.Println("  board-frozen Exit 0 with the freeze trigger when board mutation is frozen")
 	fmt.Println("  board-freeze Durable gate: on, off, or status; every provider mutation refuses while on")
 	fmt.Println("  role-inject  SessionStart hook: bind a lane to its worker contract")

@@ -1,6 +1,7 @@
 package router
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/url"
@@ -719,18 +720,26 @@ func (r *SurfaceRouter) available(provider, model, pool string) (bool, string) {
 }
 
 func envSet(key string) bool {
-	// The two fleet postures are durable FILE sentinels with an env override,
-	// not env-only flags: an export dies with its shell and the coordinator
-	// drives the fleet through one-shot calls, so an env-only posture silently
-	// lapses between invocations. See pkg/posture.
+	// Family posture is generation-fenced JSON (with env override). Prefer
+	// familyPostureMode() at route entry points — this helper remains for
+	// non-posture keys and for callers that only need a bool.
 	switch key {
 	case "HERD_CLAUDE_ONLY":
-		return posture.Active(posture.ClaudeOnly)
+		mode, err := familyPostureMode()
+		return err == nil && mode == posture.ModeClaudeOnly
 	case "HERD_NO_CLAUDE":
-		return posture.Active(posture.NoClaude)
+		mode, err := familyPostureMode()
+		return err == nil && mode == posture.ModeNoClaude
 	}
 	v := os.Getenv(key)
 	return v != "" && v != "0"
+}
+
+// familyPostureMode is the single resolve path for claude-only / no-claude.
+// Corrupt or contradictory posture fails closed (non-nil error).
+func familyPostureMode() (posture.Mode, error) {
+	mode, _, err := posture.Effective(context.Background())
+	return mode, err
 }
 
 func fitWeightFor(shape string) int {
@@ -766,59 +775,16 @@ func (r *SurfaceRouter) Pick(shape, requestedProvider, excludedFamily string) (*
 		return nil, fmt.Errorf("herd-route: unknown task shape: %s", shape)
 	}
 
-	var candidates []string
-	if requestedProvider != "" {
-		candidates = []string{requestedProvider}
-	} else {
-		var err error
-		candidates, err = Waterfall(shape)
-		if err != nil {
-			return nil, err
-		}
-		// Era intersection preserves preference order; empty keeps full list.
-		if era := strings.TrimSpace(os.Getenv("HERD_ERA_PROVIDERS")); era != "" {
-			eraSet := map[string]bool{}
-			for _, p := range strings.Fields(era) {
-				eraSet[p] = true
-			}
-			var kept []string
-			for _, c := range candidates {
-				if eraSet[c] {
-					kept = append(kept, c)
-				}
-			}
-			if len(kept) > 0 {
-				candidates = kept
-			}
-		}
-		// Claude-only hoists native claude, keeping the rest as fallback ladder.
-		if envSet("HERD_CLAUDE_ONLY") {
-			var cl, rest []string
-			for _, c := range candidates {
-				if c == "claude" {
-					cl = append(cl, c)
-				} else {
-					rest = append(rest, c)
-				}
-			}
-			if len(cl) == 0 {
-				cl = []string{"claude"}
-			}
-			candidates = append(cl, rest...)
-		}
-		// No-claude DROPS native claude entirely (a filter, not a demotion).
-		if envSet("HERD_NO_CLAUDE") {
-			var nc []string
-			for _, c := range candidates {
-				if c != "claude" {
-					nc = append(nc, c)
-				}
-			}
-			if len(nc) == 0 {
-				return nil, fmt.Errorf("herd-route: no-claude posture leaves NO candidate for shape %q (it lists claude only)", shape)
-			}
-			candidates = nc
-		}
+	mode, err := familyPostureMode()
+	if err != nil {
+		return nil, fmt.Errorf("herd-route: family posture: %w", err)
+	}
+
+	// Shared with Decide so the allowed provider set (waterfall, era
+	// intersection, family posture) cannot diverge between them (FAC-102).
+	candidates, err := r.candidateProviders(mode, shape, requestedProvider)
+	if err != nil {
+		return nil, err
 	}
 
 	fitWeight := fitWeightFor(shape)
@@ -838,6 +804,12 @@ func (r *SurfaceRouter) Pick(shape, requestedProvider, excludedFamily string) (*
 		model := ModelFor(provider, shape)
 		family := FamilyFor(provider, model)
 		if excludedFamily != "" && family == excludedFamily {
+			continue
+		}
+		// Family posture (provider+model+family) — applied before scoring so
+		// proxy Anthropic and agy claude-* cannot sneak past a provider-only
+		// filter under no-claude, and claude-only never scores a proxy surface.
+		if ok, _ := posture.Allow(mode, provider, model, family); !ok {
 			continue
 		}
 		pool := QuotaPoolFor(provider, model)
@@ -911,19 +883,9 @@ func (r *SurfaceRouter) Pick(shape, requestedProvider, excludedFamily string) (*
 		picks = append(picks, scored{rank, provider, model, pressure, detail})
 	}
 
-	// Claude-only: if native claude scored at all, it is the ONLY candidate.
-	if envSet("HERD_CLAUDE_ONLY") {
-		var cl []scored
-		for _, s := range picks {
-			if s.provider == "claude" {
-				cl = append(cl, s)
-			}
-		}
-		if len(cl) > 0 {
-			picks = cl
-		}
-	}
 	// Lazer precedence: any available non-lazer wins; lazer only when alone.
+	// Claude-only already restricted candidates to native claude, so lazer
+	// cannot be selected under that mode (proxy family is also forbidden).
 	var nonLazer []scored
 	for _, s := range picks {
 		if s.provider != "lazer" {
@@ -935,6 +897,12 @@ func (r *SurfaceRouter) Pick(shape, requestedProvider, excludedFamily string) (*
 	}
 
 	if len(picks) == 0 {
+		if mode == posture.ModeClaudeOnly {
+			return nil, fmt.Errorf("herd-route: claude-only posture has no healthy native Claude route for task=%s", shape)
+		}
+		if mode == posture.ModeNoClaude {
+			return nil, fmt.Errorf("herd-route: no-claude posture has no healthy non-Anthropic route for task=%s", shape)
+		}
 		return nil, fmt.Errorf("herd-route: no healthy provider for task=%s", shape)
 	}
 
@@ -950,11 +918,11 @@ func (r *SurfaceRouter) Pick(shape, requestedProvider, excludedFamily string) (*
 	if shape == "coordinator" {
 		reason = "projected exhaustion runway; safe pools compare headroom"
 	}
-	if envSet("HERD_CLAUDE_ONLY") {
+	if mode == posture.ModeClaudeOnly {
 		reason = "claude-only posture; " + reason
 	}
-	if envSet("HERD_NO_CLAUDE") {
-		reason = "no-claude posture (native claude held out); " + reason
+	if mode == posture.ModeNoClaude {
+		reason = "no-claude posture (anthropic family held out); " + reason
 	}
 
 	return &Route{

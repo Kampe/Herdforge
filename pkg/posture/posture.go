@@ -1,20 +1,20 @@
-// Package posture ports the chainseer fleet-wide routing postures
-// (bin/herd-claude-only, bin/herd-no-claude) and the board mutation freeze
-// (bin/herd-board-frozen).
+// Package posture owns the durable provider-family execution policy
+// (`herd posture claude-only|no-claude|clear|status`) and the board mutation
+// freeze probe used by board-mutating tools.
 //
-// These are FILE sentinels, not environment variables, and that is the whole
-// point. The posture started as HERD_CLAUDE_ONLY=1, but an env export dies with
-// its shell and a coordinator drives the fleet through one-shot Bash calls. One
-// forgotten prefix leaked a lane onto a pool the operator had ordered held
-// (chainseer, 2026-07-23). A sentinel survives shells, so a bare launch carries
-// the posture with no prefix at all. Turning a posture off is then a deliberate,
-// visible act rather than something that reverts when a shell exits.
+// Family posture is a generation-fenced JSON authority (actor, reason, scope,
+// optional expiry). Route, resolve, and dispatch all call Effective + Allow so
+// the allowed candidate set cannot diverge across entry points. Env overrides
+// (HERD_CLAUDE_ONLY / HERD_NO_CLAUDE) still win for a single invocation so a
+// one-off never has to mutate shared state.
 //
-// An explicit environment variable still wins for a single invocation, so a
-// one-off override in either direction never has to mutate shared state.
+// This is an execution policy only — it does not rewrite historical agent
+// metadata or ledger rows.
 package posture
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -22,8 +22,8 @@ import (
 	"time"
 )
 
-// State is the durable posture directory. Mirrors chainseer's
-// ${HERD_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/<repo>/herd}.
+// StateDir is the durable posture directory. Mirrors chainseer's
+// ${HERD_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/herdforge/herd}.
 func StateDir() string {
 	if d := strings.TrimSpace(os.Getenv("HERD_STATE_DIR")); d != "" {
 		return d
@@ -40,7 +40,7 @@ func StateDir() string {
 	return filepath.Join(base, "herdforge", "herd")
 }
 
-// Name identifies one posture sentinel.
+// Name identifies one legacy posture sentinel (still mirrored for status UX).
 type Name string
 
 const (
@@ -59,13 +59,12 @@ func (n Name) EnvVar() string {
 	return ""
 }
 
-// SentinelPath is the durable file backing a posture.
+// SentinelPath is the legacy durable file mirrored from the JSON authority.
 func (n Name) SentinelPath() string { return filepath.Join(StateDir(), string(n)) }
 
 // envTruthy reports the explicit env value and whether it was set at all.
-// Chainseer treats any non-empty HERD_CLAUDE_ONLY as authoritative, so "0"
-// explicitly turns the posture OFF for that invocation even when the sentinel
-// exists. Preserve that: it is how a one-off override works in both directions.
+// Any non-empty HERD_CLAUDE_ONLY is authoritative, so "0" explicitly turns the
+// posture OFF for that invocation even when durable state is on.
 func envTruthy(key string) (value, set bool) {
 	raw, ok := os.LookupEnv(key)
 	if !ok || strings.TrimSpace(raw) == "" {
@@ -78,43 +77,84 @@ func envTruthy(key string) (value, set bool) {
 	return true, true
 }
 
-// Active reports the EFFECTIVE posture the launchers will see.
+// Active reports whether the named legacy switch is effectively on. Prefer
+// Effective for new code: it fails closed on corrupt state and returns Mode.
 func Active(n Name) bool {
-	if v, set := envTruthy(n.EnvVar()); set {
-		return v
+	mode, _, err := Effective(context.Background())
+	if err != nil {
+		// Fail closed for consumers that only check the bool: a corrupt
+		// contradictory posture must not look "off" for either switch.
+		return false
 	}
-	_, err := os.Stat(n.SentinelPath())
-	return err == nil
+	switch n {
+	case ClaudeOnly:
+		return mode == ModeClaudeOnly
+	case NoClaude:
+		return mode == ModeNoClaude
+	}
+	return false
 }
 
-// SentinelPresent reports only the persisted file, ignoring any env override.
-// `status` needs both so an env override can never be mistaken for the
-// persisted posture — exactly the case where the file would otherwise mislead.
+// SentinelPresent reports only the legacy file, ignoring env and JSON.
 func SentinelPresent(n Name) bool {
 	_, err := os.Stat(n.SentinelPath())
 	return err == nil
 }
 
-// EnvOverride reports whether an explicit env var is overriding the sentinel.
+// EnvOverride reports whether an explicit env var is overriding durable state.
 func EnvOverride(n Name) (value, set bool) { return envTruthy(n.EnvVar()) }
 
-// Set turns a posture on or off durably.
+// Set turns a legacy named posture on or off by writing generation-fenced JSON.
+// Prefer Authority.Update from the CLI so actor/reason/generation are explicit.
+// This convenience path uses actor "legacy-set" and bumps generation.
 func Set(n Name, on bool) error {
-	path := n.SentinelPath()
-	if !on {
-		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
-			return fmt.Errorf("posture %s off: %w", n, err)
+	ctx := context.Background()
+	a, err := OpenDefault()
+	if err != nil {
+		return err
+	}
+	current, err := a.Read(ctx)
+	gen := uint64(1)
+	if err == nil {
+		gen = current.Generation + 1
+	} else if !errors.Is(err, ErrStateMissing) {
+		return err
+	}
+	var mode Mode
+	var reason string
+	if on {
+		switch n {
+		case ClaudeOnly:
+			mode = ModeClaudeOnly
+			reason = "legacy-set-claude-only"
+		case NoClaude:
+			mode = ModeNoClaude
+			reason = "legacy-set-no-claude"
+		default:
+			return fmt.Errorf("posture: unknown name %q", n)
 		}
-		return nil
+	} else {
+		// Turning one switch off clears DURABLE state. Effective() would be
+		// shadowed by a single-invocation env override, which made `off` a
+		// silent no-op that left the fleet pinned (the operator is told OFF).
+		durable, _, durErr := effectiveDurable(ctx)
+		if durErr != nil {
+			return durErr
+		}
+		switch {
+		case n == ClaudeOnly && durable == ModeClaudeOnly:
+			mode = ModeClear
+			reason = "legacy-set-claude-only-off"
+		case n == NoClaude && durable == ModeNoClaude:
+			mode = ModeClear
+			reason = "legacy-set-no-claude-off"
+		default:
+			// Already off durably: nothing to clear.
+			return nil
+		}
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return fmt.Errorf("posture %s on: create state dir: %w", n, err)
-	}
-	body := fmt.Sprintf("%s enabled %s\n", n, time.Now().UTC().Format(time.RFC3339))
-	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
-		return fmt.Errorf("posture %s on: %w", n, err)
-	}
-	return nil
+	_, err = a.Update(ctx, mode, "legacy-set", reason, defaultScope, gen, nil)
+	return err
 }
 
 // ErrContradictory is returned when both routing postures are active.
@@ -123,27 +163,19 @@ type ErrContradictory struct{ ClaudeOnlyPath, NoClaudePath string }
 func (e *ErrContradictory) Error() string {
 	return fmt.Sprintf("herd: CONTRADICTORY POSTURES, claude-only and no-claude are both active\n"+
 		"  claude-only: %s\n  no-claude:   %s\n"+
-		"  clear one: herd claude-only off   OR   herd no-claude off",
+		"  clear: herd posture clear --reason 'resolve contradiction'",
 		e.ClaudeOnlyPath, e.NoClaudePath)
 }
 
 // Resolve fails closed when the two routing postures contradict each other.
-// One says route everything to Claude, the other says Claude is out; whichever
-// won, the operator did not ask for it. Fail loudly at the only place that can
-// see both, rather than silently picking.
 func Resolve() error {
-	if Active(ClaudeOnly) && Active(NoClaude) {
-		return &ErrContradictory{
-			ClaudeOnlyPath: ClaudeOnly.SentinelPath(),
-			NoClaudePath:   NoClaude.SentinelPath(),
-		}
-	}
-	return nil
+	_, _, err := Effective(context.Background())
+	return err
 }
 
 // BoardFrozen ports herd_board_frozen: reports the active freeze trigger and
-// whether the board is frozen. Every board-mutating tool consults this instead
-// of reimplementing the check.
+// whether the board is frozen. Prefer pkg/boardfreeze for the generation-fenced
+// gate; this remains the env/file probe board-mutating shell tools call.
 func BoardFrozen(repoRoot string) (trigger string, frozen bool) {
 	if strings.TrimSpace(os.Getenv("HERD_BOARD_FREEZE")) == "1" {
 		return "env:HERD_BOARD_FREEZE=1", true
@@ -156,3 +188,6 @@ func BoardFrozen(repoRoot string) (trigger string, frozen bool) {
 	}
 	return "", false
 }
+
+// Now is exposed for tests that need the same clock notion as Effective expiry.
+func Now() time.Time { return time.Now().UTC() }
