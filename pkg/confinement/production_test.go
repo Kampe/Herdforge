@@ -33,17 +33,36 @@ func productionIdentity(t *testing.T, worktree, shared string) LaunchIdentity {
 
 func gitInit(t *testing.T, dir string) {
 	t.Helper()
-	run := func(args ...string) {
+	run := func(dir string, args ...string) {
 		cmd := exec.Command(args[0], args[1:]...)
 		cmd.Dir = dir
 		if out, err := cmd.CombinedOutput(); err != nil {
 			t.Fatalf("%v: %s (%v)", args, out, err)
 		}
 	}
-	run("git", "init")
-	run("git", "config", "user.email", "fac190@test.local")
-	run("git", "config", "user.name", "fac190")
-	run("git", "commit", "--allow-empty", "-m", "init")
+	run(dir, "git", "init")
+	run(dir, "git", "config", "user.email", "fac190@test.local")
+	run(dir, "git", "config", "user.name", "fac190")
+	run(dir, "git", "commit", "--allow-empty", "-m", "init")
+}
+
+// linkedWorktreeFixture mirrors production: shared repo root + task worktree
+// under a sibling path so common-dir is outside the worktree.
+func linkedWorktreeFixture(t *testing.T) (shared, worktree string) {
+	t.Helper()
+	shared = t.TempDir()
+	repo := filepath.Join(shared, "repo")
+	if err := os.MkdirAll(repo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	gitInit(t, repo)
+	worktree = filepath.Join(shared, "task-wt")
+	cmd := exec.Command("git", "worktree", "add", worktree, "-b", "task/fac-190-test", "HEAD")
+	cmd.Dir = repo
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("worktree add: %s (%v)", out, err)
+	}
+	return shared, worktree
 }
 
 func TestHMACIssuerSignsAndRejectsForgery(t *testing.T) {
@@ -180,15 +199,7 @@ func TestDarwinSeatbeltProveWriteDenials(t *testing.T) {
 	if _, err := RequireOS(); err != nil {
 		t.Skip(err.Error())
 	}
-	shared := t.TempDir()
-	root := filepath.Join(shared, "wt")
-	if err := os.MkdirAll(root, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	gitInit(t, root)
-	if err := os.MkdirAll(filepath.Join(root, ".herd"), 0o755); err != nil {
-		t.Fatal(err)
-	}
+	shared, root := linkedWorktreeFixture(t)
 	osb := DarwinSeatbelt{}
 	before, err := os.ReadDir(shared)
 	if err != nil {
@@ -229,12 +240,7 @@ func TestDarwinFirstMatchProfileDeniesSharedParent(t *testing.T) {
 	if _, err := RequireOS(); err != nil {
 		t.Skip(err.Error())
 	}
-	shared := t.TempDir()
-	root := filepath.Join(shared, "task-wt")
-	if err := os.MkdirAll(root, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	gitInit(t, root)
+	shared, root := linkedWorktreeFixture(t)
 	osb := DarwinSeatbelt{}
 	profile, err := osb.Prepare(root, shared)
 	if err != nil {
@@ -256,7 +262,10 @@ func TestDarwinFirstMatchProfileDeniesSharedParent(t *testing.T) {
 	if !strings.Contains(body, "(allow network*)") {
 		t.Fatal("profile missing network grant required for agents")
 	}
-	// Live denial of shared residual + live allow of gitdir (real evaluation).
+	if !strings.Contains(body, filepath.Join("objects")) {
+		t.Fatal("profile missing common objects grant")
+	}
+	// Live denial of shared residual.
 	outside := filepath.Join(shared, "outside-shared.txt")
 	if err := osb.writeUnder(profile, root, outside, "nope\n"); err == nil {
 		if _, statErr := os.Stat(outside); statErr == nil {
@@ -265,6 +274,10 @@ func TestDarwinFirstMatchProfileDeniesSharedParent(t *testing.T) {
 	}
 	if _, err := os.Stat(outside); err == nil {
 		t.Fatal("outside inode under shared parent")
+	}
+	// Live allow: object store write (agent-shaped) + gitdir lock.
+	if err := osb.proveGitObjectWrite(profile, root); err != nil {
+		t.Fatalf("git object write: %v", err)
 	}
 	gitDir, err := absoluteGitDir(root)
 	if err != nil {
@@ -275,6 +288,23 @@ func TestDarwinFirstMatchProfileDeniesSharedParent(t *testing.T) {
 		t.Fatalf("gitdir write denied: %v", err)
 	}
 	_ = os.Remove(lock)
+	// Live deny: hooks under common-dir (outside worktree).
+	common, err := absoluteGitCommonDir(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if isPathPrefix(common, root) {
+		t.Fatal("fixture is not linked topology")
+	}
+	hook := filepath.Join(common, "hooks", "fac190-test-hook")
+	if err := osb.writeUnder(profile, root, hook, "evil\n"); err == nil {
+		if _, e := os.Stat(hook); e == nil {
+			t.Fatal("hook write under common-dir succeeded")
+		}
+	}
+	if _, err := os.Stat(hook); err == nil {
+		t.Fatal("hook inode created")
+	}
 }
 
 func TestRealPathFailsClosedOnMissing(t *testing.T) {
