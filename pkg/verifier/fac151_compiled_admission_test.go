@@ -13,7 +13,6 @@ import (
 	"io"
 	"os"
 	"strconv"
-	"syscall"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -104,7 +103,7 @@ func fac151TestMainAdmission() error { return compiledFAC151Admission() }
 type fac151RuntimeNamespaces struct{ PID, User string }
 
 func runtimeFAC151Namespaces() (fac151RuntimeNamespaces, error) {
-	var pid, user syscall.Stat_t
+	var pid, user unix.Stat_t
 	if err := unix.Stat("/proc/1/ns/pid", &pid); err != nil {
 		return fac151RuntimeNamespaces{}, err
 	}
