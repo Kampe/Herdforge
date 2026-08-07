@@ -262,6 +262,9 @@ func main() {
 	case "worktrees":
 		runWorktrees()
 
+	case "containers":
+		runContainers()
+
 	case "overlap":
 		runOverlap()
 
@@ -355,6 +358,7 @@ func printUsage() {
 	fmt.Println("  lost            Find ownerless unmerged work on ANY branch (subject-based)")
 	fmt.Println("  throughput      Read-only fleet throughput KPIs from local evidence")
 	fmt.Println("  worktrees       Snapshot all worktree state + collision check")
+	fmt.Println("  containers      Durable container lifecycle status + unowned audit (FAC-200)")
 	fmt.Println("  overlap         Detect files/symbols edited together by 2+ unmerged branches")
 	fmt.Println("  attention       List agents needing coordinator eyes")
 	fmt.Println("  process         Classify harvest targets (herd-process digest)")
