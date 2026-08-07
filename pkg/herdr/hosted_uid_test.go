@@ -712,7 +712,7 @@ func TestAgentStartWithDecision_HostedUIDProofFailsBeforeBind(t *testing.T) {
 		return `{}`, nil
 	}
 
-	if err := PrepareToolChildLifecycle("t1", "p1", req, "worker"); err != nil {
+	if err := PrepareToolChildLifecycle("t1", "p1", &req, "worker"); err != nil {
 		t.Fatal(err)
 	}
 	// Kind must match decision harness (pi on current fleet).
