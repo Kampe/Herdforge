@@ -835,11 +835,24 @@ func (d *Dispatcher) prepareConfinementOS(
 	if err != nil {
 		return nil, nil, err
 	}
+	leaseGen := request.LeaseGeneration
+	if leaseGen <= 0 {
+		// Caller may only know lease after ownership; require positive for session dir.
+		return nil, nil, fmt.Errorf("confinement: positive lease generation required for session dir")
+	}
+	taskRef := request.TaskRef
+	if taskRef == "" {
+		taskRef = "unknown-task"
+	}
+	branch := wtInfo.Branch
 	// Pass provider + argv[0] so wrappers cover both herdr kind names and the
 	// shell executable (e.g. provider=ollama/lazer → argv0=opencode).
 	prep, err := enf.PrepareOS(
 		wtInfo.Path,
 		d.Worktree.RepoRoot(),
+		taskRef,
+		leaseGen,
+		branch,
 		request.Decision.Provider,
 		request.Decision.Argv[0],
 	)
@@ -914,17 +927,28 @@ func (d *Dispatcher) bindConfinement(
 	if !binding.AgentWrapped || !binding.OSProved {
 		return fmt.Errorf("confinement: binding missing agent wrap or OS proof")
 	}
-	receiptPath := filepath.Join(wtInfo.Path, ".herd", "confinement", "last-binding.json")
+	// Persist receipt under the session dir (outside worktree) when available;
+	// fall back to worktree only for diagnostics (HMAC still authenticates).
+	receiptDir := ""
+	if prep != nil && prep.Session.Root != "" {
+		receiptDir = prep.Session.Root
+	} else {
+		receiptDir = filepath.Join(wtInfo.Path, ".herd", "confinement")
+	}
+	receiptPath := filepath.Join(receiptDir, "last-binding.json")
 	if err := os.MkdirAll(filepath.Dir(receiptPath), 0o755); err != nil {
 		return err
 	}
+	// Session dir may be frozen 0555; temporarily allow write for the receipt.
+	_ = os.Chmod(filepath.Dir(receiptPath), 0o755)
 	raw, err := binding.MarshalReceipt()
 	if err != nil {
 		return err
 	}
-	if err := os.WriteFile(receiptPath, raw, 0o600); err != nil {
+	if err := os.WriteFile(receiptPath, raw, 0o644); err != nil {
 		return err
 	}
+	_ = os.Chmod(receiptPath, 0o444)
 	return nil
 }
 
@@ -994,6 +1018,15 @@ func (d *Dispatcher) launch(
 
 	// FAC-190: prepare OS profile + agent PATH wrapper and prove denials
 	// before TabCreate so the pane inherits PATH with the wrapper first.
+	// Lease generation is required for the outside-worktree session directory.
+	if d.Production {
+		if request.LeaseGeneration <= 0 && result.LeaseGeneration > 0 {
+			request.LeaseGeneration = result.LeaseGeneration
+		}
+		if request.TaskRef == "" {
+			request.TaskRef = task.Ref
+		}
+	}
 	var (
 		confEnf  *confinement.Enforcer
 		confPrep *confinement.PreparedOS

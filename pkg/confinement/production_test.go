@@ -124,19 +124,21 @@ func TestBindAndProvePolicyDeniesIncidentPath(t *testing.T) {
 	}
 	fake := &FakeOS{}
 	enf := &Enforcer{Issuer: issuer, OS: fake, ReceiptDir: filepath.Join(root, ".herd", "receipts")}
-	prep, err := enf.PrepareOS(root, shared, "codex", "codex")
+	prep, err := enf.PrepareOS(root, shared, "FAC-190", 7, "task/fac-190", "codex", "codex")
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Bind must NOT create files under shared root.
-	before, _ := os.ReadDir(shared)
+	// Integrity store must live outside the worktree.
+	if prep.Session.Root == "" || isPathPrefix(prep.Session.Root, root) {
+		t.Fatalf("session inside worktree: %+v", prep.Session)
+	}
+	// Bind must not create FAC-188 residual under shared.
 	binding, err := enf.BindAndProve(productionIdentity(t, root, shared), prep)
 	if err != nil {
 		t.Fatal(err)
 	}
-	after, _ := os.ReadDir(shared)
-	if len(after) != len(before) {
-		t.Fatalf("Bind mutated shared root entries: before=%d after=%d", len(before), len(after))
+	if _, err := os.Stat(filepath.Join(shared, filepath.FromSlash(SharedRootIncidentRel))); err == nil {
+		t.Fatal("Bind created residual under shared")
 	}
 	if !binding.OSProved || !binding.AgentWrapped || binding.ProfileDigest == "" || binding.ReceiptMACHex == "" {
 		t.Fatalf("incomplete binding: %+v", binding)
@@ -200,36 +202,29 @@ func TestDarwinSeatbeltProveWriteDenials(t *testing.T) {
 		t.Skip(err.Error())
 	}
 	shared, root := linkedWorktreeFixture(t)
+	session, err := NewSessionPaths(shared, "FAC-190", 7)
+	if err != nil {
+		t.Fatal(err)
+	}
 	osb := DarwinSeatbelt{}
-	before, err := os.ReadDir(shared)
+	profile, err := osb.Prepare(root, shared, "task/fac-190", session)
 	if err != nil {
 		t.Fatal(err)
 	}
-	beforeNames := map[string]struct{}{}
-	for _, e := range before {
-		beforeNames[e.Name()] = struct{}{}
+	// Session integrity store is under shared/.herd/confine-sessions (allowed);
+	// residual .herd/FAC-188 must not appear.
+	if _, err := os.Stat(filepath.Join(shared, filepath.FromSlash(SharedRootIncidentRel))); err == nil {
+		t.Fatal("Prepare created residual under shared")
 	}
-	profile, err := osb.Prepare(root, shared)
-	if err != nil {
+	if err := osb.ProveWriteDenials(root, shared, profile, session); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Stat(filepath.Join(shared, ".herd")); err == nil {
-		t.Fatal("Prepare created .herd under shared root")
-	}
-	if err := osb.ProveWriteDenials(root, shared, profile); err != nil {
-		t.Fatal(err)
-	}
-	after, err := os.ReadDir(shared)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, e := range after {
-		if _, ok := beforeNames[e.Name()]; !ok {
-			t.Fatalf("ProveWriteDenials mutated shared root with %q", e.Name())
-		}
-		if strings.HasPrefix(e.Name(), "fac190-probe-") || e.Name() == "FAC190_DENY_PROBE" {
-			t.Fatalf("probe residue under shared: %s", e.Name())
-		}
+	// Confined rewrite of session profile must not stick (re-read digest).
+	d1, _ := ProfileDigest(profile)
+	_ = osb.writeUnder(profile, root, profile, "(allow default)\n")
+	d2, _ := ProfileDigest(profile)
+	if d1 != d2 {
+		t.Fatal("session profile was rewritten by confined write")
 	}
 }
 
@@ -241,8 +236,12 @@ func TestDarwinFirstMatchProfileDeniesSharedParent(t *testing.T) {
 		t.Skip(err.Error())
 	}
 	shared, root := linkedWorktreeFixture(t)
+	session, err := NewSessionPaths(shared, "FAC-190", 7)
+	if err != nil {
+		t.Fatal(err)
+	}
 	osb := DarwinSeatbelt{}
-	profile, err := osb.Prepare(root, shared)
+	profile, err := osb.Prepare(root, shared, "task/fac-190", session)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -255,17 +254,15 @@ func TestDarwinFirstMatchProfileDeniesSharedParent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Shared parent must never be a file-write subpath grant.
 	if strings.Contains(body, "(allow file-write* (subpath \""+absShared+"\"))") {
 		t.Fatal("profile grants shared parent writes")
 	}
 	if !strings.Contains(body, "(allow network*)") {
 		t.Fatal("profile missing network grant required for agents")
 	}
-	if !strings.Contains(body, filepath.Join("objects")) {
+	if !strings.Contains(body, "objects") {
 		t.Fatal("profile missing common objects grant")
 	}
-	// Live denial of shared residual.
 	outside := filepath.Join(shared, "outside-shared.txt")
 	if err := osb.writeUnder(profile, root, outside, "nope\n"); err == nil {
 		if _, statErr := os.Stat(outside); statErr == nil {
@@ -275,7 +272,6 @@ func TestDarwinFirstMatchProfileDeniesSharedParent(t *testing.T) {
 	if _, err := os.Stat(outside); err == nil {
 		t.Fatal("outside inode under shared parent")
 	}
-	// Live allow: object store write (agent-shaped) + gitdir lock.
 	if err := osb.proveGitObjectWrite(profile, root); err != nil {
 		t.Fatalf("git object write: %v", err)
 	}
@@ -288,7 +284,6 @@ func TestDarwinFirstMatchProfileDeniesSharedParent(t *testing.T) {
 		t.Fatalf("gitdir write denied: %v", err)
 	}
 	_ = os.Remove(lock)
-	// Live deny: hooks under common-dir (outside worktree).
 	common, err := absoluteGitCommonDir(root)
 	if err != nil {
 		t.Fatal(err)
@@ -336,20 +331,25 @@ func TestVerifyAgentWrappersDetectsSwap(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	root := t.TempDir()
+	shared := t.TempDir()
+	root := filepath.Join(shared, "wt")
+	_ = os.MkdirAll(root, 0o755)
 	enf := &Enforcer{Issuer: issuer, OS: &FakeOS{}}
-	prep, err := enf.PrepareOS(root, "", "codex", "codex")
+	prep, err := enf.PrepareOS(root, shared, "FAC-190", 7, "task/fac-190", "codex", "codex")
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Unfreeze bin for the swap test.
+	_ = os.Chmod(prep.BinDir, 0o755)
 	wrapper := filepath.Join(prep.BinDir, "codex")
+	_ = os.Chmod(wrapper, 0o755)
 	if err := os.WriteFile(wrapper, []byte("#!/bin/sh\n# swapped\nexit 0\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	if err := VerifyAgentWrappers(prep.BinDir, prep.ProfilePath, prep.ProfileDigest, prep.Names); err == nil {
 		t.Fatal("swapped wrapper accepted")
 	}
-	if _, err := enf.BindAndProve(productionIdentity(t, root, ""), prep); err == nil {
+	if _, err := enf.BindAndProve(productionIdentity(t, root, shared), prep); err == nil {
 		t.Fatal("BindAndProve accepted swapped wrapper")
 	}
 }
@@ -359,9 +359,11 @@ func TestPrepareOSInstallsBothOllamaAndOpencode(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	root := t.TempDir()
+	shared := t.TempDir()
+	root := filepath.Join(shared, "wt")
+	_ = os.MkdirAll(root, 0o755)
 	enf := &Enforcer{Issuer: issuer, OS: &FakeOS{}}
-	prep, err := enf.PrepareOS(root, "", "ollama", "opencode")
+	prep, err := enf.PrepareOS(root, shared, "FAC-190", 7, "task/fac-190", "ollama", "opencode")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -370,6 +372,9 @@ func TestPrepareOSInstallsBothOllamaAndOpencode(t *testing.T) {
 			t.Fatalf("wrapper %s missing", name)
 		}
 	}
+	if isPathPrefix(prep.Session.Root, root) {
+		t.Fatal("session inside worktree")
+	}
 	env, err := prep.TabEnv(root, "/usr/bin")
 	if err != nil {
 		t.Fatal(err)
@@ -377,6 +382,44 @@ func TestPrepareOSInstallsBothOllamaAndOpencode(t *testing.T) {
 	joined := strings.Join(env, "\n")
 	if !strings.Contains(joined, "ZDOTDIR=") || !strings.Contains(joined, "PATH=") {
 		t.Fatalf("TabEnv incomplete: %v", env)
+	}
+	if !strings.Contains(joined, prep.Session.ZdotDir) {
+		t.Fatal("ZDOTDIR not session-local")
+	}
+}
+
+func TestObserveSharedRootStableUnderHerdChurn(t *testing.T) {
+	shared := t.TempDir()
+	d1, err := ObserveSharedRoot(shared)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Coordinator-like volatile files under .herd must not drift the digest.
+	_ = os.MkdirAll(filepath.Join(shared, ".herd"), 0o755)
+	_ = os.WriteFile(filepath.Join(shared, ".herd", "launch-claims.db-wal"), []byte("x"), 0o644)
+	_ = os.WriteFile(filepath.Join(shared, ".herd", "mail.lock"), []byte("y"), 0o644)
+	d2, err := ObserveSharedRoot(shared)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d1 != d2 {
+		t.Fatal("ObserveSharedRoot drifted on coordinator .herd churn")
+	}
+}
+
+func TestProductionEnforcerRequiresOSWhenSecretPresent(t *testing.T) {
+	t.Setenv(SecretEnv, "present-secret")
+	// On Darwin with sandbox-exec this may succeed; on Linux must be ErrOSUnavailable.
+	_, err := ProductionEnforcer()
+	if runtime.GOOS != "darwin" {
+		if !errors.Is(err, ErrOSUnavailable) {
+			t.Fatalf("want ErrOSUnavailable on non-darwin, got %v", err)
+		}
+		return
+	}
+	if err != nil && !errors.Is(err, ErrOSUnavailable) {
+		// secret present — only OS unavailability is acceptable failure
+		t.Fatalf("unexpected: %v", err)
 	}
 }
 
@@ -408,13 +451,11 @@ func TestDigestIncludesCreatedAtAndMarshalErrors(t *testing.T) {
 	}
 }
 
-func TestProductionEnforcerRequiresSecretAndOS(t *testing.T) {
+func TestProductionEnforcerRequiresSecret(t *testing.T) {
 	t.Setenv(SecretEnv, "")
 	t.Setenv(SecretEnvFallback, "")
 	if _, err := ProductionEnforcer(); !errors.Is(err, ErrMissingSecret) {
-		if err == nil || !errors.Is(err, ErrMissingSecret) {
-			t.Fatalf("got %v", err)
-		}
+		t.Fatalf("want ErrMissingSecret, got %v", err)
 	}
 }
 

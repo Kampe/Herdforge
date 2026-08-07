@@ -43,10 +43,10 @@ func InstallSentinel(worktreeRoot string) (string, error) {
 	return path, nil
 }
 
-// ObserveSharedRoot is a read-only snapshot of shared-root safety. It never
-// creates files or directories under sharedRoot (FAC-190 round-3 finding #3).
-// Digest covers: absolute path, whether .herd exists, and incident-path absence.
-// Presence of the FAC-188 residual path fails closed.
+// ObserveSharedRoot is a read-only check that the FAC-188 residual path is
+// absent. It deliberately does NOT digest the shared `.herd` listing — that
+// directory holds launch-claims WAL/SHM and mail locks and changes under
+// concurrent coordinator activity (round-5 HIGH finding #2).
 func ObserveSharedRoot(sharedRoot string) (digest string, err error) {
 	if strings.TrimSpace(sharedRoot) == "" {
 		return "", nil
@@ -65,29 +65,13 @@ func ObserveSharedRoot(sharedRoot string) (digest string, err error) {
 	} else if !os.IsNotExist(err) {
 		return "", err
 	}
-	herdDir := filepath.Join(root, ".herd")
-	herdState := "absent"
-	if st, err := os.Stat(herdDir); err == nil && st.IsDir() {
-		herdState = "present"
-		// List names only — no writes. Detect new top-level .herd children later.
-		entries, err := os.ReadDir(herdDir)
-		if err != nil {
-			return "", err
-		}
-		names := make([]string, 0, len(entries))
-		for _, e := range entries {
-			names = append(names, e.Name())
-		}
-		herdState = "present:" + strings.Join(names, ",")
-	} else if err != nil && !os.IsNotExist(err) {
-		return "", err
-	}
-	sum := sha256.Sum256([]byte(root + "\x00" + herdState + "\x00incident-absent"))
+	// Stable digest: only the absolute root identity + residual-absent fact.
+	sum := sha256.Sum256([]byte(root + "\x00incident-absent"))
 	return hex.EncodeToString(sum[:]), nil
 }
 
 // CheckSharedRootObservation re-runs ObserveSharedRoot and requires the same
-// digest. Any shared-root .herd mutation or incident file creation fails closed.
+// digest. Creating the residual path fails closed; coordinator WAL churn does not.
 func CheckSharedRootObservation(sharedRoot, wantDigest string) error {
 	if strings.TrimSpace(sharedRoot) == "" {
 		return nil
