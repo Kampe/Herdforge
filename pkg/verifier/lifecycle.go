@@ -918,6 +918,19 @@ func ReapOwnedCmd(cmd *exec.Cmd) error {
 	if err != nil {
 		return err
 	}
+	// Fixture path has no tracker loop: sample repeatedly so late grandchildren
+	// (background jobs that start after Start returns) are adopted before freeze.
+	sampleDeadline := time.Now().Add(50 * time.Millisecond)
+	for {
+		if serr := owned.sample(); serr != nil {
+			// Still proceed to kill/Wait so the supervisor cannot hang.
+			break
+		}
+		if time.Now().After(sampleDeadline) {
+			break
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
 	return owned.Reap()
 }
 
