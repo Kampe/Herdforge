@@ -97,30 +97,59 @@ func TestMutation_PerKindIsolation(t *testing.T) {
 // herd verifying its own hash. Defaulting CausalAuthorOnly to true would make
 // `herd hostcreds live` print PASS for that.
 func TestMutation_CausalAuthorIsNotModelEvidence(t *testing.T) {
+	v := NewTestCredentialVault()
+	_ = v.InstallTestSecret("api.x.ai", "Bearer x")
+	sess, err := StartHostCredsSession(SessionConfig{Kind: "grok", SessionID: "m-evidence", Authority: v})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sess.Close()
+	cap, err := NewCapability(sess.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Assert the PRODUCTION construction, not a hand-built literal. An earlier
+	// version of this test asserted &LiveProof{ModelEvidence: false} directly,
+	// which could not fail: the fac169-ipc gate returns before StartAuthorLive
+	// ever builds the struct, so no test observed the real assignment and
+	// inverting it left the whole suite green.
+	for _, tc := range []struct {
+		causal            bool
+		wantModelEvidence bool
+	}{
+		{causal: true, wantModelEvidence: false}, // herd's own author-causal self-test
+		{causal: false, wantModelEvidence: true}, // a real hosted harness
+	} {
+		p := newLiveProof(
+			LiveConfig{Kind: "grok", CausalAuthorOnly: tc.causal},
+			"grok", "prompt", cap.Expected, sess, cap, fakeBoundary{}, t.TempDir(), 1234,
+		)
+		if p.ModelEvidence != tc.wantModelEvidence {
+			t.Fatalf("CausalAuthorOnly=%v: ModelEvidence=%v want %v",
+				tc.causal, p.ModelEvidence, tc.wantModelEvidence)
+		}
+		if p.AuthorCausal != tc.causal {
+			t.Fatalf("CausalAuthorOnly=%v: AuthorCausal=%v", tc.causal, p.AuthorCausal)
+		}
+		// The self-test path must still be admissible as a transport proof.
+		if tc.causal && !p.AuthorCausal {
+			t.Fatal("self-test author must remain author-causal")
+		}
+	}
+
+	// The gate that made the field unobservable is itself still closed.
 	restore := SetRequireOSBoundaryForTest(func() (OSBoundary, error) {
 		return fakeBoundary{}, nil
 	})
 	defer restore()
-
-	// Reaching the authority gate is enough: proof carries ModelEvidence before
-	// any launch, and the live path is FAC-169-gated beyond this point.
 	for _, causal := range []bool{true, false} {
-		_, _, _, err := StartAuthorLive(LiveConfig{
-			Kind: "grok", SessionID: "m-evidence", Prompt: "x",
-			Authority: NewTestCredentialVault(), CausalAuthorOnly: causal,
-		})
-		if err == nil {
+		if _, _, _, err := StartAuthorLive(LiveConfig{
+			Kind: "grok", SessionID: "m-evidence-gate", Prompt: "x",
+			Authority: v, CausalAuthorOnly: causal,
+		}); err == nil {
 			t.Fatal("test vault must not live-admit regardless of causal flag")
 		}
-	}
-
-	// The invariant itself, asserted directly on the struct the CLI reads.
-	selfTest := &LiveProof{AuthorCausal: true, ModelEvidence: false}
-	if selfTest.ModelEvidence {
-		t.Fatal("self-test author must not report model evidence")
-	}
-	if !selfTest.AuthorCausal {
-		t.Fatal("self-test author is still author-causal (transport proof)")
 	}
 }
 
