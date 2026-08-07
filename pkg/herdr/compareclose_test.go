@@ -200,19 +200,25 @@ func TestCompareAndClose_AutonomousPathsCannotUseLegacyPlainClose(t *testing.T) 
 		t.Fatal("legacy plain close reached herdr transport")
 	}
 
-	// Cleanup mutation mode also refuses unfenced close.
+	// Cleanup mutation mode also refuses unfenced close and must not issue tab close.
+	plainClose := false
+	nonListCalls := 0
 	runHerdr = func(args ...string) (string, error) {
 		if len(args) >= 2 && args[0] == "agent" && args[1] == "list" {
 			return `{"result":{"agents":[{"name":"task-fac-1","agent_status":"done","tab_id":"t1","pane_id":"p1"}]}}`, nil
 		}
-		called = true
+		nonListCalls++
+		if len(args) >= 2 && args[0] == "tab" && args[1] == "close" {
+			plainClose = true
+		}
 		return `{}`, nil
 	}
-	// SelectCleanupCandidates still returns candidates from agent list on main.
 	cands, errs := Cleanup(nil, false)
 	if len(cands) == 0 {
-		// Policy may still select; either way mutation errs must not call tab close.
-		_ = cands
+		t.Fatal("fixture agent list must yield at least one cleanup candidate")
+	}
+	if len(errs) == 0 {
+		t.Fatal("Cleanup mutation mode must return BLOCKED errors for each candidate")
 	}
 	for _, e := range errs {
 		if e == nil {
@@ -222,9 +228,95 @@ func TestCompareAndClose_AutonomousPathsCannotUseLegacyPlainClose(t *testing.T) 
 			t.Fatalf("cleanup err=%v", e)
 		}
 	}
-	// tab close must not have been issued
-	if called {
-		// called is set only for non-list; list doesn't set it. Good.
+	if plainClose {
+		t.Fatal("Cleanup must not issue plain herdr tab close")
+	}
+	if nonListCalls != 0 {
+		t.Fatalf("Cleanup mutation must not reach non-list herdr transport, calls=%d", nonListCalls)
+	}
+}
+
+func TestCompareAndClose_FailedMutateDoesNotReplayAsClosed(t *testing.T) {
+	// Reviewer finding 1: durable must not record Closed before mutate succeeds.
+	store := NewMemoryReceiptStore()
+	req := fixtureRequest()
+	live := fixtureLive()
+	var mutates int
+	failMutate := true
+	first := CompareAndClose(req, live, 1, store, &FixedClock{MS: 1}, func() error {
+		mutates++
+		if failMutate {
+			return errors.New("mutate failed")
+		}
+		return nil
+	})
+	if first.Outcome != OutcomeError || first.ResultingAbsence {
+		t.Fatalf("first attempt after mutate failure: %+v", first)
+	}
+	final, err := store.ReadFinal(req.Nonce)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if final == nil {
+		t.Fatal("mutate failure must append a final Error outcome")
+	}
+	if final.Outcome == OutcomeClosed || final.ResultingAbsence {
+		t.Fatalf("durable final must not claim closed after failed mutate: %+v", final)
+	}
+	// Retry with same nonce: replay final Error — never Closed, no second mutate.
+	second := CompareAndClose(req, live, 2, store, &FixedClock{MS: 2}, func() error {
+		mutates++
+		return nil
+	})
+	if second.Outcome != OutcomeError {
+		t.Fatalf("retry must replay final error, got %+v", second)
+	}
+	if mutates != 1 {
+		t.Fatalf("mutate called %d times; want 1 (retry must not re-mutate after final error)", mutates)
+	}
+	// TabCloseCAS must not treat that as success.
+	restore := SetCompareCloseTransportForTest(func(r CompareAndCloseRequest) (CloseReceipt, error) {
+		return second, nil
+	})
+	defer restore()
+	if err := TabCloseCAS(CloseRequest{
+		WorkspaceID: "w", TabID: "t", Generation: "7", TabRevision: 3,
+		PaneIDs: []string{"p"}, SessionID: "s1", SessionGeneration: "2", Nonce: req.Nonce,
+	}); err == nil {
+		t.Fatal("TabCloseCAS must not succeed on error receipt")
+	}
+}
+
+func TestCompareAndClose_UnresolvedIntentForcesLiveRereadNotClosedReplay(t *testing.T) {
+	// Intent written, outcome append never happens (simulate crash after intent
+	// before mutate by using FailWrite after intent is in store).
+	store := NewMemoryReceiptStore()
+	req := fixtureRequest()
+	live := fixtureLive()
+	// Manually plant intent-only durable state.
+	intent := CloseReceipt{
+		Request: req, PreClose: live, ServerGeneration: 1,
+		Outcome: OutcomeIntent, TimestampMS: 1, ResultingAbsence: false,
+	}
+	if err := store.Append(&intent); err != nil {
+		t.Fatal(err)
+	}
+	// Live attachment changed after intent — must not close.
+	live.Attachments[0].Session = StringPtr("s-hijacked")
+	var mutates int
+	got := CompareAndClose(req, live, 2, store, &FixedClock{MS: 2}, func() error {
+		mutates++
+		return nil
+	})
+	if got.Outcome != OutcomeAttachmentChanged {
+		t.Fatalf("unresolved intent must re-evaluate live, got %+v", got)
+	}
+	if mutates != 0 {
+		t.Fatal("must not mutate when live fence fails after intent")
+	}
+	final, _ := store.ReadFinal(req.Nonce)
+	if final == nil || final.Outcome != OutcomeAttachmentChanged {
+		t.Fatalf("final refusal after intent re-read: %+v", final)
 	}
 }
 
@@ -301,23 +393,28 @@ func TestJSONLReceiptStore_AppendReadIdempotent(t *testing.T) {
 	if r2.Outcome != r1.Outcome || r2.ServerGeneration != r1.ServerGeneration {
 		t.Fatalf("jsonl replay diverged: %+v vs %+v", r1, r2)
 	}
-	// File is append-only JSONL.
+	// File is append-only JSONL: intent + final closed (two lines).
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	lines := 0
+	var outcomes []CompareCloseOutcome
 	for _, line := range strings.Split(string(raw), "\n") {
-		if strings.TrimSpace(line) != "" {
-			lines++
-			var rec CloseReceipt
-			if err := json.Unmarshal([]byte(line), &rec); err != nil {
-				t.Fatal(err)
-			}
+		if strings.TrimSpace(line) == "" {
+			continue
 		}
+		var rec CloseReceipt
+		if err := json.Unmarshal([]byte(line), &rec); err != nil {
+			t.Fatal(err)
+		}
+		outcomes = append(outcomes, rec.Outcome)
 	}
-	if lines != 1 {
-		t.Fatalf("want 1 receipt line, got %d", lines)
+	if len(outcomes) != 2 || outcomes[0] != OutcomeIntent || outcomes[1] != OutcomeClosed {
+		t.Fatalf("want intent then closed, got %v", outcomes)
+	}
+	final, err := store.ReadFinal(req.Nonce)
+	if err != nil || final == nil || final.Outcome != OutcomeClosed {
+		t.Fatalf("ReadFinal: %+v err=%v", final, err)
 	}
 }
 
