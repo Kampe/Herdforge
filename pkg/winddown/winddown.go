@@ -208,6 +208,34 @@ func (a *Authority) Gate(ctx context.Context) error {
 	return ErrWinddownActive
 }
 
+// DefaultStatePath is the durable wind-down state file every production
+// caller in this repo uses unless HERD_WINDDOWN_STATE overrides it
+// (mirrors cmd/herd's own winddownStatePath).
+func DefaultStatePath() string {
+	if path := strings.TrimSpace(os.Getenv("HERD_WINDDOWN_STATE")); path != "" {
+		return path
+	}
+	return ".herd/winddown.json"
+}
+
+// RequireAdmission is the one production posture gate for work that can
+// claim or re-engage fleet capacity: missing, corrupt, or unreadable state
+// is deliberately rejected, same as cmd/herd's requireFleetAdmission. An
+// empty path resolves via DefaultStatePath.
+func RequireAdmission(ctx context.Context, path string) error {
+	if strings.TrimSpace(path) == "" {
+		path = DefaultStatePath()
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return fmt.Errorf("create wind-down state directory: %w", err)
+	}
+	a, err := New(path, nil)
+	if err != nil {
+		return err
+	}
+	return a.Gate(ctx)
+}
+
 func (a *Authority) read() (State, error) {
 	f, err := os.Open(a.path)
 	if err != nil {

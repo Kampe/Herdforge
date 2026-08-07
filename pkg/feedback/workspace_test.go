@@ -89,7 +89,7 @@ func TestResolveWorkspaceListErrorPropagates(t *testing.T) {
 	}
 }
 
-func TestCoordinatorTargetPrefersNameOverPaneID(t *testing.T) {
+func TestCoordinatorTargetMatchesFirstQualifyingAgent(t *testing.T) {
 	agents := []herdr.AgentEntry{
 		{Name: "worker-1", Workspace: "wF"},
 		{Name: "chainseer-orchestrator", Workspace: "wF", PaneID: "pane-9"},
@@ -99,13 +99,17 @@ func TestCoordinatorTargetPrefersNameOverPaneID(t *testing.T) {
 	}
 }
 
-func TestCoordinatorTargetFallsBackToPaneID(t *testing.T) {
-	agents := []herdr.AgentEntry{{Name: "", Workspace: "wF", PaneID: "pane-9"}}
-	// An unnamed agent never matches the name pattern; this only exercises
-	// the pane-id fallback branch directly.
-	agents[0].Name = "Coordinator"
+func TestCoordinatorTargetCaseInsensitive(t *testing.T) {
+	agents := []herdr.AgentEntry{{Name: "Coordinator", Workspace: "wF", PaneID: "pane-9"}}
 	if got := CoordinatorTarget(agents, "wF"); got != "Coordinator" {
 		t.Fatalf("got %q, want Coordinator (case-insensitive match)", got)
+	}
+}
+
+func TestCoordinatorTargetUnnamedAgentNeverMatches(t *testing.T) {
+	agents := []herdr.AgentEntry{{Name: "", Workspace: "wF", PaneID: "pane-9"}}
+	if got := CoordinatorTarget(agents, "wF"); got != "" {
+		t.Fatalf("got %q, want empty: an unnamed agent can never match coordinator|orchestrator", got)
 	}
 }
 

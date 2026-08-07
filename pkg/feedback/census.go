@@ -27,6 +27,7 @@ import (
 
 	"github.com/Kampe/Herdforge/pkg/herdr"
 	"github.com/Kampe/Herdforge/pkg/posture"
+	"github.com/Kampe/Herdforge/pkg/winddown"
 )
 
 const (
@@ -196,6 +197,13 @@ type Options struct {
 	DurableMail    func(ctx context.Context, to, summary, body string) error
 	Wake           func(ctx context.Context, lane, nudge string) error
 
+	// AdmissionGate governs whether a NEW census may open (the report of an
+	// outstanding census is never gated — only sending fresh requests is).
+	// Defaults to the fleet's one production posture gate (pkg/winddown,
+	// ".herd/winddown.json" or HERD_WINDDOWN_STATE) so `herd winddown on`
+	// also stops this census from waking idle lanes.
+	AdmissionGate func(ctx context.Context) error
+
 	Stdout, Stderr io.Writer
 }
 
@@ -251,6 +259,9 @@ func (o *Options) setDefaults() {
 	if o.ListAgents == nil {
 		o.ListAgents = herdr.AgentList
 	}
+	if o.AdmissionGate == nil {
+		o.AdmissionGate = func(ctx context.Context) error { return winddown.RequireAdmission(ctx, "") }
+	}
 	if o.Stdout == nil {
 		o.Stdout = os.Stdout
 	}
@@ -260,18 +271,29 @@ func (o *Options) setDefaults() {
 }
 
 // Selftest verifies the load-bearing commitments this port must preserve:
-// the census subject prefix, the interval env var name, and that the
-// outbound request still names herd-mail as the durable reply channel.
+// the outbound request still carries the FLEET_FEEDBACK subject and names
+// herd-mail as the durable reply channel, and HERD_FEEDBACK_INTERVAL is
+// actually read by the interval resolver — a behavioral check, not a
+// literal-vs-literal comparison that can only fail by editing both sides.
 // It is the in-process equivalent of bin/herd-feedback's own `grep` selftest.
 func Selftest() error {
-	if SubjectPrefix != "FLEET_FEEDBACK" {
-		return fmt.Errorf("subject prefix drifted from FLEET_FEEDBACK")
+	body := RequestBody("E1", "coordinator")
+	if !strings.Contains(body, SubjectPrefix) {
+		return fmt.Errorf("request body lost the %s subject", SubjectPrefix)
 	}
-	if EnvInterval != "HERD_FEEDBACK_INTERVAL" {
-		return fmt.Errorf("interval env var drifted from HERD_FEEDBACK_INTERVAL")
-	}
-	if !strings.Contains(RequestBody("E1", "coordinator"), "herd-mail") {
+	if !strings.Contains(body, "herd-mail") {
 		return fmt.Errorf("request body lost the herd-mail reply command")
+	}
+	old, had := os.LookupEnv(EnvInterval)
+	os.Setenv(EnvInterval, "4242")
+	got := envInt(EnvInterval, 1800)
+	if had {
+		os.Setenv(EnvInterval, old)
+	} else {
+		os.Unsetenv(EnvInterval)
+	}
+	if got != 4242 {
+		return fmt.Errorf("%s is not honored by the interval resolver", EnvInterval)
 	}
 	return nil
 }
@@ -346,11 +368,22 @@ func Run(ctx context.Context, opts Options) error {
 		}
 	}
 
-	// Best-effort enumeration: a missing/failing herdr never fails the
-	// census, it just opens one requesting zero lanes.
+	if opts.AdmissionGate != nil {
+		if aerr := opts.AdmissionGate(ctx); aerr != nil {
+			fmt.Fprintf(opts.Stdout, "herd-feedback: fleet admission rejected, not starting a new census: %v\n", aerr)
+			return nil
+		}
+	}
+
+	// A failed enumeration is NOT the same as a genuinely empty fleet: opening
+	// and persisting a zero-lane census here would report 0/0 "fully replied"
+	// forever afterward, silently masking the outage instead of surfacing it.
+	// Skip this cycle (Run still returns nil — a missing/failing herdr must
+	// never fail the whole command) and retry the request on the next tick.
 	agents, err := opts.ListAgents()
 	if err != nil {
-		agents = nil
+		fmt.Fprintf(opts.Stderr, "herd-feedback: WARN agent list unavailable, not opening a new census this cycle: %v\n", err)
+		return nil
 	}
 
 	durableMail := opts.DurableMail
