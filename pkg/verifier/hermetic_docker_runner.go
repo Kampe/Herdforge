@@ -35,7 +35,10 @@ const (
 	hermeticRunPath               = "/tmp/run"
 	hermeticReplayPath            = "/tmp/replay"
 	hermeticReceiptPath           = "/tmp/replay/receipt.json"
-	hermeticGoTmpDir              = "/tmp/build/gotmp" // GOTMPDIR/TMPDIR under tmpfs (rootfs /tmp is RO)
+	// GOTMPDIR/TMPDIR must be on an exec-capable tmpfs: fixtures write and run
+	// shell scripts (fork/exec). /tmp/build is intentionally noexec for the
+	// source tree; /tmp/run is the exec scratch space.
+	hermeticGoTmpDir = hermeticRunPath + "/gotmp"
 	hermeticTestCount             = "1"
 	hermeticTestTimeout           = "10m"
 	maxHermeticSourceArchiveBytes = 64 << 20
