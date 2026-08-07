@@ -27,13 +27,31 @@ type PromptReceipt struct {
 //   - observed must differ from baseline (sequence change)
 //   - working→working and done→done are explicitly rejected
 func ConsumptionProven(baseline, observed string) bool {
-	if observed != "working" && observed != "done" {
-		return false
-	}
+	return ConsumptionProvenSeen(baseline, observed, false)
+}
+
+// ConsumptionProvenSeen is ConsumptionProven with the extra evidence of
+// whether the agent was ever observed WORKING during this delivery.
+//
+// A bare idle->done transition is NOT proof. A freshly launched agent renders
+// its UI and can settle straight to done without ever processing the prompt —
+// observed twice on grok lanes (FAC-174, FAC-172), each time reporting a
+// healthy delivery while the pane sat at an empty prompt with only its
+// dispatch anchor commit. A lane that looks busy while idle is worse than one
+// that fails loudly, so done only counts when the agent actually passed
+// through working, or was already working when the prompt arrived (the repair
+// case, where a busy agent takes follow-up work).
+func ConsumptionProvenSeen(baseline, observed string, sawWorking bool) bool {
 	if observed == baseline {
 		return false
 	}
-	return true
+	switch observed {
+	case "working":
+		return true
+	case "done":
+		return sawWorking || baseline == "working"
+	}
+	return false
 }
 
 // DeliverAndProve submits text and polls until the agent confirms consumption
@@ -62,11 +80,15 @@ func DeliverAndProve(target, text string, timeout time.Duration) (*PromptReceipt
 	deadline := time.Now().Add(timeout)
 	nudged := false
 	last := baseline
+	sawWorking := baseline == "working"
 	for time.Now().Before(deadline) {
 		st, err := liveStatus(target)
 		if err == nil {
 			last = st
-			if ConsumptionProven(baseline, st) {
+			if st == "working" {
+				sawWorking = true
+			}
+			if ConsumptionProvenSeen(baseline, st, sawWorking) {
 				return &PromptReceipt{
 					Target:         target,
 					BaselineStatus: baseline,
@@ -92,7 +114,7 @@ func DeliverAndProve(target, text string, timeout time.Duration) (*PromptReceipt
 		Verified:       true,
 		Duration:       time.Since(start),
 		SequenceToken:  sequenceToken(baseline, last),
-	}, fmt.Errorf("agent %q never confirmed prompt-correlated consumption (baseline %q last %q; working→working/done→done is not proof)", target, baseline, last)
+	}, fmt.Errorf("agent %q never confirmed prompt-correlated consumption (baseline %q last %q; working→working/done→done and a bare idle→done are not proof)", target, baseline, last)
 }
 
 func sequenceToken(baseline, final string) string {
