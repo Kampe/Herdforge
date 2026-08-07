@@ -969,7 +969,18 @@ func (i dockerInspection) validate(policy hermeticDockerPolicy, expectedContaine
 type namespaceIdentity struct{ PID, User string }
 
 func fixedFAC151Argv() []string {
-	return []string{hermeticRunPath + "/verifier.test", "-test.run", fixedFAC151Regex(), "-test.count=" + hermeticTestCount, "-test.timeout=" + hermeticTestTimeout}
+	// Test fixtures call t.TempDir/os.MkdirTemp; without TMPDIR under tmpfs they
+	// try bare /tmp on the read-only rootfs and fail before any ownership proof.
+	return []string{
+		"/usr/bin/env",
+		"TMPDIR=" + hermeticGoTmpDir,
+		"GOTMPDIR=" + hermeticGoTmpDir,
+		"HOME=" + hermeticGoTmpDir,
+		hermeticRunPath + "/verifier.test",
+		"-test.run", fixedFAC151Regex(),
+		"-test.count=" + hermeticTestCount,
+		"-test.timeout=" + hermeticTestTimeout,
+	}
 }
 
 func fixedFAC151Regex() string { return "^(?:" + strings.Join(hermeticFAC151Allowlist[:], "|") + ")$" }
