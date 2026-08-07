@@ -293,6 +293,8 @@ func TestResetSafeCompiledFetchesFreshOriginMainBeforePlanning(t *testing.T) {
 	}
 	runGitT(t, updater, "config", "user.email", "reset-safe-updater@test.invalid")
 	runGitT(t, updater, "config", "user.name", "Reset Safe Updater")
+	runGitT(t, updater, "config", "commit.gpgSign", "false")
+	runGitT(t, updater, "config", "tag.gpgSign", "false")
 	if err := os.WriteFile(filepath.Join(updater, "remote.txt"), []byte("new remote main\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
