@@ -159,8 +159,8 @@ func TestDeliverAndProve_WorkingToWorkingRejected(t *testing.T) {
 	if err == nil {
 		t.Fatal("working→working must not prove consumption")
 	}
-	if rec == nil || rec.Consumed {
-		t.Fatalf("must not claim consumed: %+v", rec)
+	if rec == nil || rec.Consumed || rec.Verified {
+		t.Fatalf("must not claim consumed/verified: %+v", rec)
 	}
 	if rec.BaselineStatus != "working" || rec.FinalStatus != "working" {
 		t.Fatalf("expected working→working receipt, got %+v", rec)

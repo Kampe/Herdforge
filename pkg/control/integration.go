@@ -86,6 +86,11 @@ func (r MailboxEvidenceReader) ReadEvidence(ctx context.Context, key string, sup
 // HerdrWaker is the only Herdr integration used by the durable adapter. Its
 // receipt proves prompt consumption only; it never acknowledges or finalizes
 // the durable order.
+//
+// FAC-185 residual (live herdr 0.7.5): there is no server-side compare-and-
+// prompt. Wakes use `herdr agent prompt` against the pane id when known, and
+// treat session id as late-bound provenance (empty at AgentStart is normal
+// for claude/opencode; grok never reports one).
 type WakeTarget struct {
 	Target          string
 	Workspace       string
@@ -94,7 +99,42 @@ type WakeTarget struct {
 	AgentName       string
 	Provider        string
 	LeaseGeneration int64
-	SessionID       string
+	SessionID       string // optional / late-bound; empty is not a distinct agent
+}
+
+// PromptTarget is the herdr CLI address for agent prompt. Prefer pane id —
+// it is unique across workspaces; tab labels can collide.
+func (t WakeTarget) PromptTarget() string {
+	if t.PaneID != "" {
+		return t.PaneID
+	}
+	return t.Target
+}
+
+// CoreIdentityEqual compares the fields herdr guarantees for every agent kind.
+// Session is intentionally excluded (see SessionCompatible).
+func CoreIdentityEqual(a, b WakeTarget) bool {
+	return a.Target == b.Target && a.Workspace == b.Workspace && a.TabID == b.TabID &&
+		a.PaneID == b.PaneID && a.AgentName == b.AgentName && a.Provider == b.Provider &&
+		a.LeaseGeneration == b.LeaseGeneration
+}
+
+// SessionCompatible reports whether a bound session and a live session refer
+// to the same agent. Empty bound means "not observed yet" (session UUIDs only
+// appear after claude/opencode boot; bind runs immediately after AgentStart).
+// A previously bound non-empty session must still match; disappearance or
+// swap is drift.
+func SessionCompatible(bound, live string) bool {
+	if bound == "" {
+		return true
+	}
+	return bound == live
+}
+
+// WakeTargetsCompatible is CoreIdentityEqual plus directional session check
+// (bound a → live b).
+func WakeTargetsCompatible(bound, live WakeTarget) bool {
+	return CoreIdentityEqual(bound, live) && SessionCompatible(bound.SessionID, live.SessionID)
 }
 
 type HerdrWaker struct {
@@ -113,7 +153,7 @@ func (w HerdrWaker) ReadTarget(ctx context.Context) (WakeTarget, error) {
 	if err != nil {
 		return WakeTarget{}, err
 	}
-	if actual != w.Target {
+	if !WakeTargetsCompatible(w.Target, actual) {
 		return WakeTarget{}, ErrStaleIdentity
 	}
 	return actual, nil
@@ -152,15 +192,15 @@ func wakeTextWithReference(reference string) string {
 }
 
 func (w HerdrWaker) Wake(ctx context.Context, req WakeRequest) (WakeReceipt, error) {
-	if req.Target != w.Target {
+	// Request must carry the same core identity the waker was bound with.
+	// Session may differ only in the empty→filled direction (checked live below).
+	if !CoreIdentityEqual(req.Target, w.Target) {
 		return WakeReceipt{}, ErrStaleIdentity
 	}
 	// Target/workspace/tab/pane/agent/provider plus a positive lease generation
 	// IS the exact addressable identity — herdr resolves a pane from those
-	// alone. SessionID is provenance only some kinds report: grok starts
-	// healthy and interactive_ready without one, so requiring it here rejected
-	// every non-claude wake and was the third place this same false assumption
-	// ("every agent kind has a session id") was encoded.
+	// alone. SessionID is provenance only some kinds report: grok never does;
+	// claude/opencode fill it only after boot (after the launch-time bind).
 	if w.Target.Target == "" || w.Target.Workspace == "" || w.Target.TabID == "" || w.Target.PaneID == "" || w.Target.AgentName == "" || w.Target.Provider == "" || w.Target.LeaseGeneration <= 0 {
 		return WakeReceipt{}, fmt.Errorf("control: exact Herdr target is required")
 	}
@@ -171,17 +211,39 @@ func (w HerdrWaker) Wake(ctx context.Context, req WakeRequest) (WakeReceipt, err
 	if err != nil {
 		return WakeReceipt{}, fmt.Errorf("control: Herdr target drift: %w", err)
 	}
-	if actual != w.Target {
+	if !WakeTargetsCompatible(w.Target, actual) {
 		return WakeReceipt{}, ErrStaleIdentity
 	}
-	receipt, err := herdr.DeliverAndProve(w.Target.Target, wakeText(req.MessageID, req.Sequence), w.Timeout)
+	// Prefer pane id: unique, and what herdr's compare paths actually key on.
+	promptAddr := w.Target.PromptTarget()
+	receipt, err := herdr.DeliverAndProve(promptAddr, wakeText(req.MessageID, req.Sequence), w.Timeout)
 	if err != nil {
 		return WakeReceipt{}, err
 	}
-	if receipt == nil || !receipt.Consumed || !receipt.Verified || receipt.Target != w.Target.Target {
+	// Receipt.Target is the CLI address we prompted (pane or label), not
+	// necessarily the human tab label stored on WakeTarget.Target.
+	if receipt == nil || !receipt.Consumed || !receipt.Verified {
 		return WakeReceipt{}, ErrMissingReceipt
 	}
-	return WakeReceipt{MessageID: req.MessageID, Consumed: receipt.Consumed, Verified: receipt.Verified, SequenceToken: receipt.SequenceToken, Baseline: receipt.BaselineStatus, Final: receipt.FinalStatus, Target: receipt.Target, Workspace: actual.Workspace, TabID: actual.TabID, PaneID: actual.PaneID, AgentName: actual.AgentName, Provider: actual.Provider, SessionID: actual.SessionID, LeaseGeneration: actual.LeaseGeneration}, nil
+	if receipt.Target != promptAddr {
+		return WakeReceipt{}, ErrMissingReceipt
+	}
+	return WakeReceipt{
+		MessageID:       req.MessageID,
+		Consumed:        receipt.Consumed,
+		Verified:        receipt.Verified,
+		SequenceToken:   receipt.SequenceToken,
+		Baseline:        receipt.BaselineStatus,
+		Final:           receipt.FinalStatus,
+		Target:          w.Target.Target,
+		Workspace:       actual.Workspace,
+		TabID:           actual.TabID,
+		PaneID:          actual.PaneID,
+		AgentName:       actual.AgentName,
+		Provider:        actual.Provider,
+		SessionID:       actual.SessionID,
+		LeaseGeneration: actual.LeaseGeneration,
+	}, nil
 }
 
 // CoordinatorOrders is the production-facing order port used by dispatch,

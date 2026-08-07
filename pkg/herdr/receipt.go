@@ -67,7 +67,7 @@ func DeliverAndProve(target, text string, timeout time.Duration) (*PromptReceipt
 			Target:         target,
 			BaselineStatus: baseline,
 			Consumed:       false,
-			Verified:       true,
+			Verified:       false, // never "verified" when the prompt never reached a pane
 			Duration:       time.Since(start),
 			SequenceToken:  sequenceToken(baseline, ""),
 		}, err
@@ -111,7 +111,7 @@ func DeliverAndProve(target, text string, timeout time.Duration) (*PromptReceipt
 		BaselineStatus: baseline,
 		FinalStatus:    last,
 		Consumed:       false,
-		Verified:       true,
+		Verified:       false,
 		Duration:       time.Since(start),
 		SequenceToken:  sequenceToken(baseline, last),
 	}, fmt.Errorf("agent %q never confirmed prompt-correlated consumption (baseline %q last %q; working→working/done→done and a bare idle→done are not proof)", target, baseline, last)
