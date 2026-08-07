@@ -34,7 +34,27 @@ func PaneList() ([]PaneEntry, error) {
 
 // PaneProcessInfo exposes the pane's foreground processes to callers outside
 // this package (stall detection needs the agent's real cwd).
+//
+// Argv is whatever herdr reported and may be empty. Callers that need argv
+// should use PaneProcessArgv rather than paying for the OS read here: stall
+// detection reads Cwd on a hot path and has no use for it.
 func PaneProcessInfo(paneID string) ([]PaneProcess, error) { return paneProcesses(paneID) }
+
+// PaneProcessArgv is PaneProcessInfo with argv filled in from the OS for any
+// process herdr reported without one.
+//
+// The second return is the per-PID read failures, not a fatal error: a process
+// that exited between the inventory and the read is ordinary, and the
+// surviving entries are still good. Callers that treat argv as evidence must
+// decide for themselves what a gap means — silently returning argv-less
+// processes is what makes a reader believe it saw everything.
+func PaneProcessArgv(paneID string) ([]PaneProcess, []error) {
+	processes, err := paneProcesses(paneID)
+	if err != nil {
+		return nil, []error{err}
+	}
+	return hydratePaneProcesses(processes)
+}
 
 // PaneRead returns recent unwrapped pane output. Unwrapped matters for stall
 // detection: reflowed text changes with terminal width, which would make a

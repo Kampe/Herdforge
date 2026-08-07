@@ -8,6 +8,7 @@
 package quotasup
 
 import (
+	"path/filepath"
 	"strings"
 
 	"github.com/Kampe/Herdforge/pkg/router"
@@ -63,26 +64,43 @@ func QuotaPool(provider, model string) string {
 	return router.QuotaPoolFor(p, strings.ToLower(strings.TrimSpace(model)))
 }
 
-// ModelFromArgv recovers the model a running agent was actually launched with.
+// ModelFromArgv recovers the ROUTED model a running agent was launched with.
 //
 // `herdr agent list` reports no model (verified against the 0.7.5 API schema:
 // AgentInfo carries agent/display_agent, never a model), so the running
 // process's own argv is the only live evidence of which pool a lane bills.
 // Returns "" when the lane took its surface default, which is not an error:
 // QuotaPool maps an empty model to the surface's default pool.
+//
+// A lane launched through the Pi harness carries a vendor-qualified model
+// ("anthropic/claude-fable-5"), because that is what Pi's --model wants — the
+// harness is not the provider. The pool table is keyed on routed model names,
+// so the qualification is undone here. Left in place it silently mis-bills:
+// "anthropic/claude-fable-5" misses the exact-match fable rule and
+// "google/gemini-3.1-pro-high" misses the gemini prefix rule, so a Fable lane
+// bills claude/default and a Gemini lane bills agy/nonGemini — each capping a
+// pool that was never touched while the real one runs uncapped.
 func ModelFromArgv(argv []string) string {
+	model := ""
 	for i, a := range argv {
 		if a == "--model" || a == "-m" {
 			if i+1 < len(argv) {
-				return strings.TrimSpace(argv[i+1])
+				model = strings.TrimSpace(argv[i+1])
 			}
-			return ""
+			break
 		}
 		if v, ok := strings.CutPrefix(a, "--model="); ok {
-			return strings.TrimSpace(v)
+			model = strings.TrimSpace(v)
+			break
 		}
 	}
-	return ""
+	if model == "" {
+		return ""
+	}
+	if len(argv) > 0 && filepath.Base(argv[0]) == router.PiHarness {
+		return router.PiBareModel(model)
+	}
+	return model
 }
 
 // Classify grades one pool's capacity. A nil state is Untracked, and a stale
@@ -128,6 +146,11 @@ type Assignment struct {
 	Family        string   `json:"family,omitempty"`
 	Pool          string   `json:"pool"`
 	Capacity      Capacity `json:"capacity_state"`
+	// ModelResolved records whether the lane's argv was actually read. False
+	// means Pool is the provider's default by fallback, not by evidence —
+	// this lane's contribution to a pool's active count is a guess, and the
+	// snapshot says so rather than letting it read as an observation.
+	ModelResolved bool `json:"model_resolved"`
 }
 
 // Surface is the metered surface this agent bills against.
@@ -146,6 +169,19 @@ type Snapshot struct {
 	WarnRunwayMinutes int          `json:"warn_runway_minutes"`
 	Agents            []Assignment `json:"agents"`
 	Decisions         []Decision   `json:"decisions,omitempty"`
+}
+
+// UnresolvedModels names the lanes whose pool is a fallback rather than an
+// observation, so a caller can report the gap instead of publishing a count
+// that reads as fully evidenced.
+func (s *Snapshot) UnresolvedModels() []string {
+	var out []string
+	for _, a := range s.Agents {
+		if !a.ModelResolved {
+			out = append(out, a.Name)
+		}
+	}
+	return out
 }
 
 // Blocked lists the surfaces admitting no new work, in decision order.

@@ -372,6 +372,23 @@ func PiModelFor(provider, model string) (string, error) {
 	}
 }
 
+// PiBareModel undoes PiModelFor's vendor qualification, recovering the routed
+// model from a Pi harness argv.
+//
+// Only the prefixes PiModelFor ADDS are stripped. opencode/ and litellm/… are
+// the routed model's own name, which PiModelFor passes through untouched, so
+// stripping them would invent a model the router never issued. Kept beside
+// PiModelFor so the two lists cannot drift apart.
+func PiBareModel(model string) string {
+	m := strings.ToLower(strings.TrimSpace(model))
+	for _, prefix := range []string{"openai-codex/", "anthropic/", "google/", "xai/"} {
+		if bare, ok := strings.CutPrefix(m, prefix); ok {
+			return bare
+		}
+	}
+	return m
+}
+
 // HarnessArgvFor returns the signed Pi harness and exact interactive argv.
 func HarnessArgvFor(provider, model, effort string) (string, []string, error) {
 	piModel, err := PiModelFor(provider, model)
