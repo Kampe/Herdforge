@@ -402,9 +402,9 @@ func TestSourceManifestDigestFromFilesystemMembersSkipsDirectory(t *testing.T) {
 func TestFAC151HermeticRuntimeArgvBindsCompileArtifactAndPolicy(t *testing.T) {
 	want := []string{
 		"/usr/bin/env",
-		"TMPDIR=" + hermeticGoTmpDir,
-		"GOTMPDIR=" + hermeticGoTmpDir,
-		"HOME=" + hermeticGoTmpDir,
+		"TMPDIR=" + hermeticGoFixtureTmpDir,
+		"GOTMPDIR=" + hermeticGoFixtureTmpDir,
+		"HOME=" + hermeticGoFixtureTmpDir,
 		hermeticRunPath + "/verifier.test",
 		"-test.run", fixedFAC151Regex(),
 		"-test.count=" + hermeticTestCount,
@@ -634,7 +634,7 @@ func newFAC198FakeRunner(t *testing.T, fake *fac198DockerFake) *hermeticDockerRu
 	fake.inspection.HostConfig.CapDrop = []string{"ALL"}
 	fake.inspection.HostConfig.SecurityOpt = []string{"no-new-privileges:true"}
 	fake.inspection.HostConfig.Tmpfs = map[string]string{
-		hermeticBuildPath: "rw,noexec,nosuid,nodev,size=512m", hermeticRunPath: "rw,exec,nosuid,nodev,size=64m", hermeticReplayPath: "rw,noexec,nosuid,nodev,size=64m",
+		hermeticBuildPath: "rw,noexec,nosuid,nodev,size=512m", hermeticRunPath: "rw,exec,nosuid,nodev,size=256m", hermeticReplayPath: "rw,noexec,nosuid,nodev,size=64m",
 	}
 	for _, destination := range []string{hermeticBuildPath, hermeticRunPath, hermeticReplayPath} {
 		fake.inspection.Mounts = append(fake.inspection.Mounts, struct {
@@ -660,7 +660,7 @@ func newFAC198FakeRunner(t *testing.T, fake *fac198DockerFake) *hermeticDockerRu
 }
 
 func fac198ValidMountInfo() []byte {
-	return []byte("36 25 0:29 / /tmp/build rw,relatime - tmpfs tmpfs rw,nosuid,nodev,noexec,size=524288k\n37 25 0:30 / /tmp/replay rw,relatime - tmpfs tmpfs rw,nosuid,nodev,noexec,size=65536k\n38 25 0:31 / /tmp/run rw,relatime - tmpfs tmpfs rw,nosuid,nodev,size=65536k\n")
+	return []byte("36 25 0:29 / /tmp/build rw,relatime - tmpfs tmpfs rw,nosuid,nodev,noexec,size=524288k\n37 25 0:30 / /tmp/replay rw,relatime - tmpfs tmpfs rw,nosuid,nodev,noexec,size=65536k\n38 25 0:31 / /tmp/run rw,relatime - tmpfs tmpfs rw,nosuid,nodev,size=262144k\n")
 }
 
 func fac198ValidInspection(t *testing.T) dockerInspection {
@@ -834,7 +834,7 @@ func TestFAC198DockerMountShapeDiagnostic(t *testing.T) {
 		for _, entry := range []string{
 			hermeticBuildPath + "=rw,noexec,nosuid,nodev,size=512m",
 			hermeticReplayPath + "=rw,noexec,nosuid,nodev,size=64m",
-			hermeticRunPath + "=rw,exec,nosuid,nodev,size=64m",
+			hermeticRunPath + "=rw,exec,nosuid,nodev,size=256m",
 			"(tmpfs," + hermeticBuildPath + ",true)",
 			"(tmpfs," + hermeticReplayPath + ",true)",
 			"(tmpfs," + hermeticRunPath + ",true)",
@@ -931,7 +931,7 @@ func TestFAC198RunnerRequiresRuntimeMountProofBeforeAuthorityUse(t *testing.T) {
 			return bytes.Replace(info, []byte("/tmp/run"), []byte("/tmp/foreign"), 1)
 		}},
 		{name: "duplicate", mutate: func(info []byte) []byte {
-			return append(append([]byte(nil), info...), []byte("39 25 0:32 / /tmp/run rw,relatime - tmpfs tmpfs rw,nosuid,nodev,size=65536k\n")...)
+			return append(append([]byte(nil), info...), []byte("39 25 0:32 / /tmp/run rw,relatime - tmpfs tmpfs rw,nosuid,nodev,size=262144k\n")...)
 		}},
 		{name: "wrong flags", mutate: func(info []byte) []byte {
 			return bytes.Replace(info, []byte("rw,nosuid,nodev,noexec"), []byte("ro,nosuid,nodev,noexec"), 1)
