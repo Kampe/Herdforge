@@ -167,6 +167,27 @@ func OpenClaimStack(dir string, tp TaskProvider) (*ClaimStack, error) {
 	// unfenced mutates (FAC-147). No-op for MemoryProvider test stacks
 	// that are not Kaneo.
 	AttachAuthoritativeReceiver(tp, fences)
+	// Worker attach: when HERD_FENCE_BROKER_URL is set, wire the live broker
+	// client so fenced status/comment writes reach the sidecar. Without this
+	// production callers fail closed at mutate time with no remedy.
+	if isRealKaneoProvider(tp) {
+		if url := strings.TrimSpace(os.Getenv(envFenceBrokerURL)); url != "" {
+			client, cerr := NewFenceBrokerClientFromEnv()
+			if cerr != nil {
+				_ = fences.Close()
+				_ = outbox.Close()
+				_ = leases.Close()
+				return nil, fmt.Errorf("provider: fence broker client: %w", cerr)
+			}
+			k, _ := UnwrapTaskProvider(tp).(*KaneoProvider)
+			if err := ConfigureKaneoFenceBroker(k, client); err != nil {
+				_ = fences.Close()
+				_ = outbox.Close()
+				_ = leases.Close()
+				return nil, fmt.Errorf("provider: attach fence broker: %w", err)
+			}
+		}
+	}
 	cas, err := NewFencedCAS(fences, tp)
 	if err != nil {
 		_ = fences.Close()
@@ -497,6 +518,54 @@ func (s *ClaimStack) MutateClaimGuarded(
 		return lease, err
 	}
 	return lease, nil
+}
+
+// MutateCommentGuarded posts a board comment under a live lease generation
+// via Begin/Complete. Fail-closed on claim conflict.
+func (s *ClaimStack) MutateCommentGuarded(
+	ctx context.Context,
+	key claim.LeaseKey,
+	ownerID, role, taskRole, taskID, body string,
+) (generation int64, err error) {
+	if s == nil || s.Board == nil || s.Manager == nil || s.CAS == nil {
+		return 0, fmt.Errorf("provider: incomplete ClaimStack")
+	}
+	lease, err := s.AcquireLease(ctx, key, ownerID, role, taskRole)
+	if err != nil {
+		return 0, fmt.Errorf("provider: refuse comment mutation without live lease: %w", err)
+	}
+	var mutErr error
+	defer func() {
+		if mutErr != nil {
+			err = mutErr
+			return
+		}
+		if rerr := s.Manager.Release(ctx, key, ownerID, lease.Generation); rerr != nil {
+			err = fmt.Errorf("provider: release lease after comment mutation: %w", rerr)
+			return
+		}
+		err = nil
+	}()
+	if err := s.CAS.AdvanceFence(ctx, taskID, lease.Generation); err != nil {
+		mutErr = err
+		return lease.Generation, mutErr
+	}
+	if k, ok := UnwrapTaskProvider(s.TP).(*KaneoProvider); ok && k != nil {
+		if s.Minter != nil && k.minter == nil {
+			_ = AttachCoordinatorMinter(k, s.Minter)
+		}
+		if k.minter != nil {
+			ctx = WithMintIdentity(ctx, MintIdentity{
+				Repo: lease.Repo, Provider: lease.Provider, Project: lease.Project,
+				TaskRef: lease.TaskRef, OwnerID: lease.OwnerID,
+			})
+		}
+	}
+	if err := s.Board.MutateComment(ctx, s.Manager, key, ownerID, lease.Generation, taskID, body); err != nil {
+		mutErr = err
+		return lease.Generation, mutErr
+	}
+	return lease.Generation, mutErr
 }
 
 // IsClaimConflict reports whether err is an active-lease conflict.

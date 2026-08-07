@@ -46,6 +46,15 @@ func initGitMain(t *testing.T, dir string) {
 	run("branch", "-u", "origin/main", "main")
 }
 
+func testOverride() *OverrideRequest {
+	return &OverrideRequest{
+		Policy:   "abandoned-scope",
+		Actor:    "test-operator",
+		Reason:   "fence test close without receipt",
+		Evidence: "unit-test",
+	}
+}
+
 // TestBoardDoneFenced_StaleGenerationRejected proves approve path fencing:
 // BoardDoneFenced with a stale generation does not mark done.
 func TestBoardDoneFenced_StaleGenerationRejected(t *testing.T) {
@@ -87,8 +96,10 @@ func TestBoardDoneFenced_StaleGenerationRejected(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	req := DoneRequest{RepoDir: repo, ProjectID: "p1", Ref: "FAC-147f", Override: testOverride()}
+
 	// Stale owner+generation must not mark done.
-	_, err = BoardDoneFenced(ctx, mp, stack, key, "owner-1", lease.Generation, repo, "p1", "FAC-147f", "", true)
+	_, err = BoardDoneFenced(ctx, mp, stack, key, "owner-1", lease.Generation, req)
 	if err == nil {
 		t.Fatal("expected stale generation rejection")
 	}
@@ -102,8 +113,8 @@ func TestBoardDoneFenced_StaleGenerationRejected(t *testing.T) {
 		t.Logf("rejection err: %v", err)
 	}
 
-	// Current generation succeeds with --force.
-	res, err := BoardDoneFenced(ctx, mp, stack, key, "owner-2", lease2.Generation, repo, "p1", "FAC-147f", "", true)
+	// Current generation succeeds with attributable override.
+	res, err := BoardDoneFenced(ctx, mp, stack, key, "owner-2", lease2.Generation, req)
 	if err != nil {
 		t.Fatalf("current gen BoardDoneFenced: %v", err)
 	}
@@ -132,10 +143,11 @@ func TestBoardDoneFenced_RequiresLiveLease(t *testing.T) {
 	}
 	defer stack.Close()
 	key := provider.LeaseKey(".", "kaneo", "p1", "FAC-147g")
-	if _, err := BoardDoneFenced(ctx, mp, stack, key, "", 0, repo, "p1", "FAC-147g", "", true); err == nil {
+	req := DoneRequest{RepoDir: repo, ProjectID: "p1", Ref: "FAC-147g", Override: testOverride()}
+	if _, err := BoardDoneFenced(ctx, mp, stack, key, "", 0, req); err == nil {
 		t.Fatal("expected fail-closed without live lease")
 	}
-	if _, err := BoardDoneFenced(ctx, mp, nil, key, "o", 1, repo, "p1", "FAC-147g", "", true); err == nil {
+	if _, err := BoardDoneFenced(ctx, mp, nil, key, "o", 1, req); err == nil {
 		t.Fatal("expected fail-closed without stack")
 	}
 }

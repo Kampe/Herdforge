@@ -245,6 +245,18 @@ func (b *authoritativeBoard) serve() *httptest.Server {
 				if prio := asString("priority"); prio != "" {
 					t.Priority = Priority(prio)
 				}
+				// Position: apply only when the PUT body carries the field.
+				// Missing key must not clobber board rank (FAC-147 review #3).
+				if raw, ok := body["position"]; ok {
+					switch v := raw.(type) {
+					case float64:
+						t.Position = v
+						t.HasPosition = true
+					case int:
+						t.Position = float64(v)
+						t.HasPosition = true
+					}
+				}
 				if !unfencedOK {
 					b.applied[opID] = appliedOp{TaskID: id, Fence: fence, Kind: "status", Body: st}
 				}

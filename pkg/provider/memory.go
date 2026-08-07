@@ -199,9 +199,21 @@ func (m *MemoryProvider) UpdateStatus(ctx context.Context, taskID string, status
 
 // UpdateStatusAtomic applies status and optional signed receipt in one step
 // (hermetic board model of Kaneo single-PATCH atomicity).
+// Resolves taskID by Ref when the map lookup misses (FAC-159 ref-keyed callers).
 func (m *MemoryProvider) UpdateStatusAtomic(ctx context.Context, taskID, status, receiptJSON string) error {
 	m.mu.Lock()
 	t, ok := m.tasks[taskID]
+	if !ok {
+		// FAC-159: resolve by Ref when the map lookup misses.
+		for id, cand := range m.tasks {
+			if cand.Ref == taskID {
+				t = cand
+				taskID = id
+				ok = true
+				break
+			}
+		}
+	}
 	if !ok {
 		m.mu.Unlock()
 		return fmt.Errorf("task not found: %s", taskID)

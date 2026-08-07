@@ -274,6 +274,9 @@ type Dispatcher struct {
 	// Ownership is a durable cross-process lease claimer (claim.ClaimManager +
 	// SQLite). When nil, opened at .herd/launch-claims.db under RepoRoot.
 	Ownership deps.OwnershipClaimer
+	// Claims, when set, routes board status/comment writes through FAC-147
+	// Begin/Complete + FencedCAS instead of bare TaskProvider.
+	Claims *provider.ClaimStack
 	// ScopeFence is an optional injected admission boundary. Production wiring
 	// supplies a durable scopefence.Fence; nil preserves packet-only callers.
 	ScopeFence    ScopeAdmission
@@ -790,7 +793,13 @@ func (d *Dispatcher) Dispatch(ctx context.Context, opts DispatchOptions) (*Dispa
 	if owns, _ := own.StillOwns(ctx, tok); !owns {
 		return nil, failOwned("lease_lost_before_status", fmt.Errorf("lease owner+generation lost before board status"))
 	}
-	if err := d.updateStatusBound(ctx, task.ID, "in-progress"); err != nil {
+	// FAC-147: when Claims is wired, board writes use Begin/Complete + fence.
+	// Tests without Claims keep the unfenced bound path.
+	if d.Claims != nil {
+		if err := d.updateStatusFenced(ctx, task, laneName, "in-progress"); err != nil {
+			return nil, failOwned("board_status_failed", formatBoardErr("failed to update ticket status", err))
+		}
+	} else if err := d.updateStatusBound(ctx, task.ID, "in-progress"); err != nil {
 		return nil, failOwned("board_status_failed", formatBoardErr("failed to update ticket status", err))
 	}
 	if err := d.record(ctx, StepRecord{
@@ -807,7 +816,11 @@ func (d *Dispatcher) Dispatch(ctx context.Context, opts DispatchOptions) (*Dispa
 	// 5. Comment with actual Git branch + base (not a fictional name)
 	comment := fmt.Sprintf("Dispatched to worktree %s on branch %s (base %s anchor %s lease g%d owner %s)",
 		wtInfo.Path, branch, wtInfo.BaseSHA, wtInfo.AnchorRef, tok.Generation, tok.OwnerID)
-	if err := d.addCommentBound(ctx, task.ID, comment); err != nil {
+	if d.Claims != nil {
+		if err := d.addCommentFenced(ctx, task, laneName, comment); err != nil {
+			return nil, failOwned("board_comment_failed", formatBoardErr("failed to add comment", err))
+		}
+	} else if err := d.addCommentBound(ctx, task.ID, comment); err != nil {
 		return nil, failOwned("board_comment_failed", formatBoardErr("failed to add comment", err))
 	}
 	if err := d.record(ctx, StepRecord{

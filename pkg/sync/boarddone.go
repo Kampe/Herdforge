@@ -281,10 +281,37 @@ func boardCallErr(op string, err error) error {
 	return fmt.Errorf("%s: %w", op, err)
 }
 
+// requireLiveLease rejects BoardDoneFenced when ownerID+generation is not the
+// current active claim for key (FAC-147: live lease is mandatory even for the
+// already-done idempotent short-circuit).
+func requireLiveLease(ctx context.Context, mgr *claim.ClaimManager, key claim.LeaseKey, ownerID string, generation int64) error {
+	if mgr == nil {
+		return fmt.Errorf("%w: nil ClaimManager", claim.ErrLeaseNotCurrent)
+	}
+	claims, err := mgr.ActiveClaims(ctx)
+	if err != nil {
+		return fmt.Errorf("verify live lease: %w", err)
+	}
+	for _, l := range claims {
+		if l == nil || l.LeaseKey != key {
+			continue
+		}
+		if l.OwnerID != ownerID {
+			return fmt.Errorf("%w: %s is held by %s, not %s", claim.ErrLeaseNotCurrent, key.TaskRef, l.OwnerID, ownerID)
+		}
+		if l.Generation != generation {
+			return fmt.Errorf("%w: %s active generation is %d, caller had %d", claim.ErrLeaseNotCurrent, key.TaskRef, l.Generation, generation)
+		}
+		return nil
+	}
+	return fmt.Errorf("%w: no active lease for %s", claim.ErrLeaseNotCurrent, key.TaskRef)
+}
+
 // BoardDoneFenced is the FAC-147 production approve path. Requires stack,
-// ownerID, and generation > 0 (live lease). Status mutation goes through
-// BeginProviderTransition/CompleteProviderTransition only — no raw
-// UpdateStatus and no generation minting on conflict.
+// ownerID, and generation > 0 (live lease). Closing authority is FAC-132
+// DoneRequest (completion receipt or attributable override). Status mutation
+// goes through BeginProviderTransition/CompleteProviderTransition only — no
+// raw UpdateStatus and no generation minting on conflict.
 func BoardDoneFenced(
 	ctx context.Context,
 	tp provider.TaskProvider,
@@ -292,8 +319,7 @@ func BoardDoneFenced(
 	key claim.LeaseKey,
 	ownerID string,
 	generation int64,
-	repoDir, projectID, ref, evidenceSHA string,
-	force bool,
+	req DoneRequest,
 ) (*DoneResult, error) {
 	if stack == nil || stack.Board == nil || stack.Manager == nil {
 		return nil, fmt.Errorf("sync: BoardDoneFenced requires ClaimStack (FAC-147 fail-closed)")
@@ -302,22 +328,72 @@ func BoardDoneFenced(
 		return nil, fmt.Errorf("sync: BoardDoneFenced requires live lease owner+generation (FAC-147 fail-closed)")
 	}
 
-	ref = NormalizeRef(ref)
+	ref := NormalizeRef(req.Ref)
+	repoDir := req.RepoDir
+	if repoDir == "" {
+		repoDir = "."
+	}
 
-	proof, err := MergeEvidence(repoDir, ref, evidenceSHA)
+	var proof string
+	var override *OverrideRecord
+	switch {
+	case req.Receipt != nil && req.Override != nil:
+		return nil, fmt.Errorf("%w for %s: a manual override cannot accompany a receipt; "+
+			"drop one of them so the closing authority is unambiguous", ErrNoEvidence, ref)
+
+	case req.Receipt != nil:
+		if req.Lifecycle == nil {
+			return nil, fmt.Errorf("%w for %s: no lifecycle state authority configured; "+
+				"a receipt alone cannot prove the task is past integration", ErrNoEvidence, ref)
+		}
+		st, err := req.Lifecycle.CurrentState(ref)
+		if err != nil {
+			return nil, fmt.Errorf("lifecycle state for %s: %w", ref, err)
+		}
+		if err := req.Receipt.Validate(repoDir, ref, st); err != nil {
+			return nil, fmt.Errorf("%w for %s: %v", ErrNoEvidence, ref, err)
+		}
+		proof = fmt.Sprintf("completion receipt %s: candidate %s merged as %s, patch %s, verification %s, tier %s, %s reviewed by %s",
+			shortDigest(req.Receipt.Digest), shortSHA(req.Receipt.CandidateSHA), shortSHA(req.Receipt.MergeSHA),
+			shortDigest(req.Receipt.PatchID), shortDigest(req.Receipt.VerificationDigest),
+			req.Receipt.RiskTier, req.Receipt.AuthorFamily, req.Receipt.ReviewerFamily)
+
+	case req.Override != nil:
+		rec, err := authorizeOverride(*req.Override)
+		if err != nil {
+			return nil, fmt.Errorf("%w for %s: %v", ErrNoEvidence, ref, err)
+		}
+		override = rec
+		proof = fmt.Sprintf("manual override by %s under policy %s (%s): %s [evidence: %s]",
+			rec.Actor, rec.Policy, rec.Decision, rec.Reason, rec.Evidence)
+
+	default:
+		return nil, fmt.Errorf("%w for %s: no completion receipt at %s. A commit naming the ref is a "+
+			"discovery hint, not proof. Supply the receipt the integration produced, or close it manually with "+
+			"--override-policy/--override-actor/--override-reason/--override-evidence",
+			ErrNoEvidence, ref, ReceiptPath(repoDir, ref))
+	}
+
+	// Exactly-once: a receipt already recorded never advances the card again.
+	log, err := ReadDoneLog(repoDir)
 	if err != nil {
 		return nil, err
 	}
-	if proof == "" {
-		if !force {
-			return nil, fmt.Errorf("%w for %s: no commit on origin/main names it and no evidence commit was given; "+
-				"if the work truly landed without naming the ref, prove it by content: herd board-done %s --evidence <sha>",
-				ErrNoEvidence, ref, ref)
+	if req.Receipt != nil {
+		for _, rec := range log {
+			if rec.ReceiptDigest != "" && rec.ReceiptDigest == req.Receipt.Digest {
+				if err := requireLiveLease(ctx, stack.Manager, key, ownerID, generation); err != nil {
+					return nil, boardCallErr(fmt.Sprintf("fenced done short-circuit for %s", ref), err)
+				}
+				return &DoneResult{
+					Ref: ref, TaskID: rec.TaskID, Proof: proof,
+					Idempotent: true, ReceiptDigest: req.Receipt.Digest,
+				}, nil
+			}
 		}
-		proof = "operator --force, no automatic evidence found"
 	}
 
-	tasks, err := tp.ListTasks(ctx, projectID, "")
+	tasks, err := tp.ListTasks(ctx, req.ProjectID, "")
 	if err != nil {
 		return nil, boardCallErr("list tasks", err)
 	}
@@ -331,11 +407,17 @@ func BoardDoneFenced(
 	if task == nil {
 		return nil, fmt.Errorf("no task with ref %s on the board", ref)
 	}
+	if req.Receipt != nil && req.Receipt.TaskID != task.ID {
+		return nil, fmt.Errorf("%w for %s: receipt is bound to task id %s but the board card is %s",
+			ErrNoEvidence, ref, req.Receipt.TaskID, task.ID)
+	}
 
-	// Already done: idempotent success without a new fenced mutate (crash
-	// recovery / re-approve must not mint a second board effect).
+	// Already done: idempotent success only for the live lease holder.
 	if provider.NormalizeStatus(task.Status) == provider.StatusDone {
-		return &DoneResult{Ref: ref, TaskID: task.ID, Proof: proof, Forced: force && !strings.Contains(proof, "origin/main")}, nil
+		if err := requireLiveLease(ctx, stack.Manager, key, ownerID, generation); err != nil {
+			return nil, boardCallErr(fmt.Sprintf("fenced done short-circuit for %s", ref), err)
+		}
+		return &DoneResult{Ref: ref, TaskID: task.ID, Proof: proof, Overridden: override != nil}, nil
 	}
 
 	if err := stack.Board.MutateStatus(ctx, stack.Manager, key, ownerID, generation, task.ID, "done"); err != nil {
@@ -350,14 +432,24 @@ func BoardDoneFenced(
 		return nil, fmt.Errorf("write reported success but %s reads back as %q", ref, back.Status)
 	}
 
-	res := &DoneResult{Ref: ref, TaskID: task.ID, Proof: proof, Forced: force && !strings.Contains(proof, "origin/main")}
-	// Comment via Begin/Complete with body-hash kind (FAC-147: not bare CAS).
+	rec := DoneRecord{
+		Timestamp: nowStamp(), Ref: ref, TaskID: task.ID,
+		ProviderReadback: back.Status, Override: override,
+	}
+	if req.Receipt != nil {
+		rec.ReceiptDigest = req.Receipt.Digest
+		rec.MergeSHA = req.Receipt.MergeSHA
+	}
+	if err := appendDoneRecord(repoDir, rec); err != nil {
+		return nil, fmt.Errorf("%s reads back as done but its closure could not be recorded (re-run to record): %w", ref, err)
+	}
+
+	res := &DoneResult{Ref: ref, TaskID: task.ID, Proof: proof, Overridden: override != nil, ReceiptDigest: rec.ReceiptDigest}
 	commentBody := "board-done: " + proof
 	if commentErr := stack.Board.MutateComment(ctx, stack.Manager, key, ownerID, generation, task.ID, commentBody); commentErr != nil {
 		if provider.IsTimeout(commentErr) || provider.IsAmbiguous(commentErr) {
 			return nil, boardCallErr("board-done comment", commentErr)
 		}
-		// Non-timeout comment failure: status is done; leave CommentPosted false.
 	} else {
 		res.CommentPosted = true
 	}
