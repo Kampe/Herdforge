@@ -37,6 +37,15 @@ type LiveProof struct {
 	ChildEnvProof      []string
 	HarnessWaitOK      bool // cmd.Wait succeeded or typed causal exit
 	AuthorCausal       bool // proof from author process, not helper
+	// ModelEvidence is true ONLY when the author was a real hosted harness.
+	//
+	// The CausalAuthorOnly path runs herd's own `hostcreds author-causal`
+	// binary, which derives the capability marker with in-process SHA-256 and
+	// prints it — so ModelMarkerReached there is herd verifying its own hash
+	// against its own expectation. That is a transport proof (peer attribution
+	// + host policy + broker inject + bound receipt), NOT proof a model ran.
+	// Callers must not treat the two as interchangeable.
+	ModelEvidence bool
 }
 
 // LiveConfig configures production live author launch.
@@ -62,6 +71,22 @@ type LiveConfig struct {
 // a substitute. Peer authority is one-shot inherited claim FD.
 //
 // FAC-169: OS boundary + non-test authority (no in-process HandleAuthority/Test vault).
+//
+// REACHABILITY (review finding 7 — stated, not worked around): there is
+// currently NO configuration that both passes and constitutes model evidence.
+//
+//   - CausalAuthorOnly=false (the real-harness path the CLI uses): stock Grok/
+//     Claude/Codex CLIs do not dial the one-shot inherited claim FD, so they
+//     produce no bound receipt and the run ends in author_not_causal. Peer
+//     attribution for a stock CLI needs FAC-169's attributable channel.
+//   - CausalAuthorOnly=true: the "author" is herd's own `hostcreds
+//     author-causal`, which derives the capability marker by in-process
+//     SHA-256. It proves transport end to end but no model ran, so
+//     ModelEvidence is false and the CLI refuses to print PASS.
+//
+// Packet AC 1 and AC 6 are therefore BLOCKED on FAC-169, not satisfied here.
+// Do not "fix" this by defaulting CausalAuthorOnly to true — that would make
+// the CLI print PASS for herd verifying its own hash.
 func StartAuthorLive(cfg LiveConfig) (*HostCredsSession, *exec.Cmd, *LiveProof, error) {
 	kind := strings.ToLower(strings.TrimSpace(cfg.Kind))
 	if kind == "opencode" || kind == "fake" || kind == "test" {
@@ -170,6 +195,8 @@ func StartAuthorLive(cfg LiveConfig) (*HostCredsSession, *exec.Cmd, *LiveProof, 
 		IsolatedHOME:    homeDir,
 		PeerPort:        port,
 		AuthorCausal:    cfg.CausalAuthorOnly,
+		// Self-test author ⇒ transport proof only, never model evidence.
+		ModelEvidence: !cfg.CausalAuthorOnly,
 	}
 
 	timeout := cfg.Timeout

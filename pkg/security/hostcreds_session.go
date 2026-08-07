@@ -28,12 +28,12 @@ type HostCredsSession struct {
 	ownCADir  string
 	ownSock   bool
 
-	mu             sync.Mutex
-	closed         bool
-	prompt         string
-	promptInArgv   bool // set true only when harness process started with prompt
-	authorPID      int
-	actionsUsed    int
+	mu           sync.Mutex
+	closed       bool
+	prompt       string
+	promptInArgv bool // set true only when harness process started with prompt
+	authorPID    int
+	actionsUsed  int
 }
 
 // HostCredsProxyOracle is a thin alias documentation type for the capability oracle.
@@ -46,7 +46,7 @@ type SessionConfig struct {
 	SessionID     string // required non-empty for production
 	Authority     CredentialAuthority
 	TTL           time.Duration
-	MaxActions    int  // default 16
+	MaxActions    int // default 16
 	Interactive   bool
 	AllowLoopback bool // component tests only
 	// CADir for public MITM CA PEM (worker-readable public cert only).
