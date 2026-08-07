@@ -355,7 +355,7 @@ func printUsage() {
 	fmt.Println("  park         Make parked work durable (annotated pushed tag) + audit exposure")
 	fmt.Println("  wave         Pre-wave checklist; --standing also raises the standing fleet")
 	fmt.Println("  quota-supervisor  Convert live quota, cooldown and process evidence into per-surface concurrency caps")
-	fmt.Println("  rescue       Move a cramped pane to its own tab; --empty-siblings closes blank shells")
+	fmt.Println("  rescue       Diagnose/repair cramped or split agent panes (dry-run default; --apply once)")
 	fmt.Println("  seed-lane-state   Restore or seed a lane's state artifacts (never overwrites)")
 	fmt.Println("  spin         Detect stalled (frozen output) and spinning (no git delta) panes")
 	fmt.Println("  watch        Fire the moment an agent settles; --stream feeds harvest triggers")

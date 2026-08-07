@@ -7,12 +7,48 @@ import (
 )
 
 // PaneEntry is one pane from `herdr pane list`.
+// Fields beyond the original identity set match live herdr 0.7.x rows used
+// by rescue diagnosis (focus, cwd, geometry scroll hints).
 type PaneEntry struct {
-	PaneID      string `json:"pane_id,omitempty"`
-	TabID       string `json:"tab_id,omitempty"`
-	Workspace   string `json:"workspace_id,omitempty"`
-	Name        string `json:"name,omitempty"`
-	AgentStatus string `json:"agent_status,omitempty"`
+	PaneID        string `json:"pane_id,omitempty"`
+	TabID         string `json:"tab_id,omitempty"`
+	Workspace     string `json:"workspace_id,omitempty"`
+	Name          string `json:"name,omitempty"`
+	Agent         string `json:"agent,omitempty"`
+	AgentStatus   string `json:"agent_status,omitempty"`
+	Focused       bool   `json:"focused"`
+	Cwd           string `json:"cwd,omitempty"`
+	ForegroundCwd string `json:"foreground_cwd,omitempty"`
+	TerminalID    string `json:"terminal_id,omitempty"`
+	TerminalTitle string `json:"terminal_title,omitempty"`
+}
+
+// PaneRect is a layout rectangle from `herdr pane layout`.
+type PaneRect struct {
+	X      int `json:"x"`
+	Y      int `json:"y"`
+	Width  int `json:"width"`
+	Height int `json:"height"`
+}
+
+// LayoutPane is one pane inside a PaneLayout.
+type LayoutPane struct {
+	PaneID  string   `json:"pane_id,omitempty"`
+	Focused bool     `json:"focused"`
+	Rect    PaneRect `json:"rect"`
+}
+
+// PaneLayout is the structured geometry for one tab from `herdr pane layout`.
+type PaneLayout struct {
+	TabID         string       `json:"tab_id,omitempty"`
+	Workspace     string       `json:"workspace_id,omitempty"`
+	FocusedPaneID string       `json:"focused_pane_id,omitempty"`
+	Zoomed        bool         `json:"zoomed"`
+	Area          PaneRect     `json:"area"`
+	Panes         []LayoutPane `json:"panes"`
+	// SplitCount is the number of split nodes herdr reports. Non-zero means
+	// the tab is not a single full-pane agent surface.
+	SplitCount int `json:"-"`
 }
 
 // PaneList returns every pane herdr knows about.
@@ -29,7 +65,45 @@ func PaneList() ([]PaneEntry, error) {
 	if err := json.Unmarshal([]byte(output), &resp); err != nil {
 		return nil, fmt.Errorf("parsing pane list output: %s: %w", output, err)
 	}
+	if resp.Result.Panes == nil {
+		return nil, fmt.Errorf("herdr pane list returned no panes inventory")
+	}
 	return resp.Result.Panes, nil
+}
+
+// GetPaneLayout returns geometry for the tab containing paneID.
+func GetPaneLayout(paneID string) (PaneLayout, error) {
+	if strings.TrimSpace(paneID) == "" {
+		return PaneLayout{}, fmt.Errorf("herdr pane layout: pane id is required")
+	}
+	output, err := runHerdr("pane", "layout", "--pane", paneID)
+	if err != nil {
+		return PaneLayout{}, fmt.Errorf("herdr pane layout %s: %w", paneID, err)
+	}
+	var resp struct {
+		Result struct {
+			Layout struct {
+				PaneLayout
+				Splits []json.RawMessage `json:"splits"`
+			} `json:"layout"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal([]byte(output), &resp); err != nil {
+		return PaneLayout{}, fmt.Errorf("parsing pane layout: %s: %w", output, err)
+	}
+	layout := resp.Result.Layout.PaneLayout
+	layout.SplitCount = len(resp.Result.Layout.Splits)
+	return layout, nil
+}
+
+// RectFor returns the layout rect for paneID inside this layout, if present.
+func (l PaneLayout) RectFor(paneID string) (PaneRect, bool) {
+	for _, p := range l.Panes {
+		if p.PaneID == paneID {
+			return p.Rect, true
+		}
+	}
+	return PaneRect{}, false
 }
 
 // PaneProcessInfo exposes the pane's foreground processes to callers outside
