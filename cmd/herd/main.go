@@ -1633,7 +1633,11 @@ func runBoardDone() {
 	evidence := fs.String("evidence", "", "Explicit proof commit SHA (must be an ancestor of origin/main)")
 	force := fs.Bool("force", false, "Override missing evidence (look at the diff first)")
 	selftestFlag := fs.Bool("selftest", false, "Run normalization/repo assertions and exit")
-	fs.Parse(os.Args[2:])
+	// Pull the leading positional out BEFORE parsing. Go's flag package stops
+	// at the first non-flag argument, so `board-done FAC-136 --evidence <sha>`
+	// silently discarded --evidence and the command then refused with
+	// "no merge evidence found" no matter what proof you supplied.
+	fs.Parse(leadingPositionalArgs(os.Args[2:]))
 
 	if *selftestFlag {
 		for in, want := range map[string]string{"FAC-018": "FAC-18", "FAC-648": "FAC-648", "FAC-0648": "FAC-648"} {
@@ -4727,4 +4731,14 @@ func publishedGraphBinding(root string) (string, int) {
 		return "", 0
 	}
 	return graph.Revision, graph.Files
+}
+
+// leadingPositionalArgs moves a leading positional to the END so flag.Parse
+// sees the flags. Go's flag package stops at the first non-flag argument,
+// which has silently swallowed flags in several subcommands.
+func leadingPositionalArgs(args []string) []string {
+	if len(args) == 0 || strings.HasPrefix(args[0], "-") {
+		return args
+	}
+	return append(append([]string{}, args[1:]...), args[0])
 }
