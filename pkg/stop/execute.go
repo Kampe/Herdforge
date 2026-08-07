@@ -39,11 +39,12 @@ type Exec struct {
 
 // Result counts one execution.
 type Result struct {
-	Closed    int // tabs closed; capacity released
-	Preserved int // left open and recoverable
-	Protected int // coordinator skipped
-	Signaled  int // stop requests proven delivered
-	Unproven  int // stop requests that failed; never closed without force
+	Closed       int // tabs closed; capacity released
+	Preserved    int // left open and recoverable (active / unproven / cancelled wait)
+	BlockedClose int // close attempted but refused (fence, transport, empty tab id)
+	Protected    int // coordinator skipped
+	Signaled     int // stop requests proven delivered
+	Unproven     int // stop requests that failed; never closed without force
 }
 
 const defaultPoll = 2 * time.Second
@@ -128,17 +129,24 @@ func (e Exec) Run(ctx context.Context, plan []Decision) (Result, error) {
 			fmt.Fprintf(out, "PRESERVE name=%s status=%s pane=%s (stop request unproven; ownership not checkpointed)\n", d.Agent.Name, status, d.Agent.PaneID)
 			continue
 		}
-		if d.Agent.TabID == "" || closed[d.Agent.TabID] {
+		if d.Agent.TabID != "" && closed[d.Agent.TabID] {
+			continue
+		}
+		// FAC-180: report the performed close outcome. A failed or unfenced
+		// close is BLOCKED_CLOSE — never PRESERVE-as-success and never CLOSED.
+		if d.Agent.TabID == "" {
+			res.BlockedClose++
+			fmt.Fprintf(out, "BLOCKED_CLOSE name=%s status=%s tab= (empty tab id)\n", d.Agent.Name, status)
 			continue
 		}
 		closed[d.Agent.TabID] = true
 		if err := e.Fleet.CloseTab(d.Agent.TabID); err != nil {
-			res.Preserved++
-			fmt.Fprintf(out, "PRESERVE name=%s tab=%s (close failed: %v)\n", d.Agent.Name, d.Agent.TabID, err)
+			res.BlockedClose++
+			fmt.Fprintf(out, "BLOCKED_CLOSE name=%s status=%s tab=%s (%v)\n", d.Agent.Name, status, d.Agent.TabID, err)
 			continue
 		}
 		res.Closed++
-		fmt.Fprintf(out, "CLOSE name=%s status=%s tab=%s\n", d.Agent.Name, status, d.Agent.TabID)
+		fmt.Fprintf(out, "CLOSED name=%s status=%s tab=%s\n", d.Agent.Name, status, d.Agent.TabID)
 	}
 	return res, nil
 }

@@ -255,16 +255,53 @@ func TestForceClosesUnsettledButOnlyEverClosesTabs(t *testing.T) {
 	}
 }
 
-// A close that fails leaves the agent counted as preserved, never as released.
-func TestFailedCloseIsNotCountedAsReleasedCapacity(t *testing.T) {
+// A close that fails is BLOCKED_CLOSE — never released capacity, never
+// mislabeled PRESERVE/CLOSED. FAC-180 honesty: unfenced/failed mutate must
+// surface as blocked, not as a successful stop outcome.
+func TestFailedCloseIsBlockedNotReleased(t *testing.T) {
 	agents := []Agent{{Name: "smith", Status: "idle", PaneID: "p1", TabID: "t1"}}
-	f := &fakeFleet{reads: [][]Agent{agents}, closeErr: map[string]error{"t1": errors.New("tab gone")}}
-	res, err := testExec(f, okPosture(f), io.Discard).Run(context.Background(), Plan(agents, Options{}))
+	f := &fakeFleet{reads: [][]Agent{agents}, closeErr: map[string]error{"t1": errors.New("FAC-180 compare-and-close required")}}
+	var out strings.Builder
+	res, err := testExec(f, okPosture(f), &out).Run(context.Background(), Plan(agents, Options{}))
 	if err != nil {
 		t.Fatalf("run: %v", err)
 	}
-	if res.Closed != 0 || res.Preserved != 1 {
-		t.Fatalf("failed close counted as released: %+v", res)
+	if res.Closed != 0 || res.BlockedClose != 1 || res.Preserved != 0 {
+		t.Fatalf("failed close must be blocked_close only: %+v", res)
+	}
+	got := out.String()
+	if !strings.Contains(got, "BLOCKED_CLOSE name=smith") {
+		t.Fatalf("missing BLOCKED_CLOSE line:\n%s", got)
+	}
+	if strings.Contains(got, "CLOSED name=smith") || strings.Contains(got, "PRESERVE name=smith") {
+		t.Fatalf("blocked close must not print CLOSED/PRESERVE:\n%s", got)
+	}
+	// Non-vacuity: a successful close still prints CLOSED and increments Closed.
+	ok := &fakeFleet{reads: [][]Agent{agents}}
+	var okOut strings.Builder
+	okRes, err := testExec(ok, okPosture(ok), &okOut).Run(context.Background(), Plan(agents, Options{}))
+	if err != nil {
+		t.Fatalf("ok run: %v", err)
+	}
+	if okRes.Closed != 1 || okRes.BlockedClose != 0 || !strings.Contains(okOut.String(), "CLOSED name=smith") {
+		t.Fatalf("control close must succeed so the blocked path is distinguishable: %+v\n%s", okRes, okOut.String())
+	}
+}
+
+// Empty tab id cannot release capacity; report BLOCKED_CLOSE rather than silent skip.
+func TestEmptyTabIDIsBlockedClose(t *testing.T) {
+	agents := []Agent{{Name: "smith", Status: "idle", PaneID: "p1", TabID: ""}}
+	f := &fakeFleet{reads: [][]Agent{agents}}
+	var out strings.Builder
+	res, err := testExec(f, okPosture(f), &out).Run(context.Background(), Plan(agents, Options{}))
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if res.Closed != 0 || res.BlockedClose != 1 || f.count("close:") != 0 {
+		t.Fatalf("empty tab id must block without calling CloseTab: %+v calls=%v", res, f.calls)
+	}
+	if !strings.Contains(out.String(), "BLOCKED_CLOSE name=smith") {
+		t.Fatalf("missing BLOCKED_CLOSE:\n%s", out.String())
 	}
 }
 
