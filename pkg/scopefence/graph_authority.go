@@ -42,6 +42,27 @@ func (s *SQLiteStore) PutGraphSnapshot(ctx context.Context, repository string, g
 	return err
 }
 
+// ReadGraphSnapshot returns the published snapshot WITHOUT verifying it. It
+// exists so a caller can bind its expected revision/file-count to exactly what
+// was published; verification still happens in Current.
+func (s *SQLiteStore) ReadGraphSnapshot(ctx context.Context, repository string) (Graph, error) {
+	if s == nil || s.db == nil || repository == "" {
+		return Graph{}, errors.New("scopefence: graph snapshot store is not configured")
+	}
+	var encoded []byte
+	if err := s.db.QueryRowContext(ctx, `SELECT graph_json FROM scopefence_graph WHERE repository = ?`, repository).Scan(&encoded); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return Graph{}, errors.New("scopefence: no published graph snapshot")
+		}
+		return Graph{}, err
+	}
+	var graph Graph
+	if err := json.Unmarshal(encoded, &graph); err != nil {
+		return Graph{}, err
+	}
+	return graph, nil
+}
+
 func (a *SQLiteGraphAuthority) Current(ctx context.Context) (TrustedGraph, error) {
 	if a == nil || a.store == nil || a.store.db == nil || a.repository == "" {
 		return TrustedGraph{}, errors.New("scopefence: graph authority is not configured")

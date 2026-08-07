@@ -580,6 +580,14 @@ func (d *Dispatcher) Dispatch(ctx context.Context, opts DispatchOptions) (*Dispa
 		}, ExpectedGraphRevision: pre.GraphRevision}
 		admission, aerr := d.ScopeFence.Acquire(ctx, admissionReq)
 		if aerr != nil {
+			// Name the exact revision to publish at. This error used to say only
+			// "trusted task scope unavailable", and the revision is a deps-graph
+			// hash that appears nowhere else, so there was no way to act on it.
+			if strings.Contains(aerr.Error(), "trusted task scope unavailable") ||
+				strings.Contains(aerr.Error(), "trusted graph snapshot unavailable") {
+				aerr = fmt.Errorf("%w\n  publish it first: herd scope publish %s --revision %s --packages <pkg>",
+					aerr, task.Ref, pre.GraphRevision)
+			}
 			return nil, failOwned("scopefence_error", aerr)
 		}
 		if !admission.Granted {
