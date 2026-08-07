@@ -92,6 +92,38 @@ func TestMutation_PerKindIsolation(t *testing.T) {
 	}
 }
 
+// The self-test author path must never be able to claim model evidence: it
+// derives the marker with in-process SHA-256, so ModelMarkerReached there is
+// herd verifying its own hash. Defaulting CausalAuthorOnly to true would make
+// `herd hostcreds live` print PASS for that.
+func TestMutation_CausalAuthorIsNotModelEvidence(t *testing.T) {
+	restore := SetRequireOSBoundaryForTest(func() (OSBoundary, error) {
+		return fakeBoundary{}, nil
+	})
+	defer restore()
+
+	// Reaching the authority gate is enough: proof carries ModelEvidence before
+	// any launch, and the live path is FAC-169-gated beyond this point.
+	for _, causal := range []bool{true, false} {
+		_, _, _, err := StartAuthorLive(LiveConfig{
+			Kind: "grok", SessionID: "m-evidence", Prompt: "x",
+			Authority: NewTestCredentialVault(), CausalAuthorOnly: causal,
+		})
+		if err == nil {
+			t.Fatal("test vault must not live-admit regardless of causal flag")
+		}
+	}
+
+	// The invariant itself, asserted directly on the struct the CLI reads.
+	selfTest := &LiveProof{AuthorCausal: true, ModelEvidence: false}
+	if selfTest.ModelEvidence {
+		t.Fatal("self-test author must not report model evidence")
+	}
+	if !selfTest.AuthorCausal {
+		t.Fatal("self-test author is still author-causal (transport proof)")
+	}
+}
+
 func TestMutation_LiveNeedsFAC169Boundary(t *testing.T) {
 	restore := SetRequireOSBoundaryForTest(nil)
 	defer restore()

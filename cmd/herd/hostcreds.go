@@ -130,8 +130,9 @@ func runHostCredsLive(args []string) int {
 		defer sess.Close()
 	}
 	if proof != nil {
-		fmt.Printf("HOSTCREDS_LIVE session_id=%s kind=%s author_pid=%d prompt_in_argv=%v marker_reached=%v forbidden_denied=%v no_api_keys=%v boundary=%s\n",
-			proof.SessionID, proof.Kind, proof.AuthorPID, proof.PromptInArgv, proof.ModelMarkerReached, proof.ForbiddenDenied, proof.NoAPIKeysInEnv, proof.BoundaryDigest)
+		fmt.Printf("HOSTCREDS_LIVE session_id=%s kind=%s author_pid=%d prompt_in_argv=%v marker_reached=%v forbidden_denied=%v no_api_keys=%v model_evidence=%v boundary=%s\n",
+			proof.SessionID, proof.Kind, proof.AuthorPID, proof.PromptInArgv, proof.ModelMarkerReached,
+			proof.ForbiddenDenied, proof.NoAPIKeysInEnv, proof.ModelEvidence, proof.BoundaryDigest)
 		if proof.OutputSnippet != "" {
 			fmt.Printf("output_snippet=%s\n", proof.OutputSnippet)
 		}
@@ -142,6 +143,14 @@ func runHostCredsLive(args []string) int {
 	}
 	if proof == nil || !proof.PromptInArgv || !proof.ForbiddenDenied || !proof.NoAPIKeysInEnv || !proof.ModelMarkerReached || !proof.BrokerReached {
 		fmt.Fprintln(os.Stderr, "hostcreds live: incomplete exact-session proof")
+		return 2
+	}
+	// A self-test author (herd's own author-causal) proves transport, not that a
+	// model ran: it derives the marker with in-process SHA-256 and verifies herd's
+	// own hash against herd's own expectation. Never print PASS for that.
+	if !proof.ModelEvidence {
+		fmt.Fprintln(os.Stderr, "hostcreds live: transport proof only — the author was herd's own "+
+			"author-causal self-test, so marker_reached is self-verification, not model evidence")
 		return 2
 	}
 	fmt.Println("hostcreds live: PASS (exact-session process proof)")

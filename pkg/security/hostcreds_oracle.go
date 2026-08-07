@@ -69,7 +69,7 @@ type HostCredsOracle struct {
 	resolveHook     func(host string) (net.IP, error)
 	// tlsConfig for upstream client (tests inject RootCAs for loopback TLS).
 	// Production leaves nil (system roots). Credentialed path NEVER uses plaintext HTTP.
-	upstreamTLS *tls.Config
+	upstreamTLS   *tls.Config
 	allowLoopback bool
 }
 
