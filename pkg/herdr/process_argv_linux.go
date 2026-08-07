@@ -3,7 +3,6 @@
 package herdr
 
 import (
-	"bytes"
 	"fmt"
 	"os"
 )
@@ -20,16 +19,5 @@ func systemPIDArgv(pid int) ([]string, error) {
 	if len(data) == 0 {
 		return nil, fmt.Errorf("empty process cmdline for pid %d", pid)
 	}
-	parts := bytes.Split(data, []byte{0})
-	argv := make([]string, 0, len(parts))
-	for _, p := range parts {
-		if len(p) == 0 {
-			continue
-		}
-		argv = append(argv, string(p))
-	}
-	if len(argv) == 0 {
-		return nil, fmt.Errorf("empty process argv for pid %d", pid)
-	}
-	return argv, nil
+	return parseProcCmdline(data)
 }
