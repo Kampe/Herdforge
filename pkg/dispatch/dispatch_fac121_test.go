@@ -133,7 +133,7 @@ func (f *fakeHerdr) RequireWorkspace(string) (string, error) {
 	}
 	return f.workspace, nil
 }
-func (f *fakeHerdr) TabCreateForTask(workspaceID, label, cwd string, _ bool) (*herdr.TabInfo, error) {
+func (f *fakeHerdr) TabCreateForTask(workspaceID, label, cwd string, _ bool, _ ...string) (*herdr.TabInfo, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.tabWS = workspaceID

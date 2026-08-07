@@ -21,14 +21,26 @@ worktrees.
 - **Durable receipts**: `BindAndProve` appends JSONL evidence under the worktree
   when a receipt directory is configured.
 
+## Production launch order (FAC-190)
+
+1. `PrepareOS` — write first-match-safe profile (worktree write only), prove
+   hermetic denials with `/usr/bin/tee` under `sandbox-exec` (no shell, no
+   shared-root mutation), install PATH-first agent wrapper under
+   `.herd/confine/bin/<kind>`.
+2. `TabCreate` with `PATH=<wrapper-bin>:$PATH` so herdr kind resolution hits the
+   wrapper.
+3. `BindAndProve` — MAC-bind tab/pane/lease identity, re-prove with the same
+   profile, require `AgentWrapped && OSProved` before `AgentStart`.
+
 ## Residuals (honest)
 
-- Wrapping the interactive Herdr agent argv itself (PATH seatbelt wrappers for
-  every descendant of a live pane) still depends on Herdr process composition
-  (FAC-172-class hosted isolation). Until that routes through `OSBackend.Wrap`,
-  production **fails closed** without a successful pre-start OS proof rather than
-  claiming ambient agent containment it cannot demonstrate.
+- Herdr must resolve the agent kind via PATH for the wrapper to exec. If a
+  future herdr release hardcodes absolute agent binaries, production will still
+  fail closed on missing wrap install but the live process may bypass the
+  wrapper — that is a Herdr contract change, not a silent policy skip.
 - Bind mounts that preserve device numbers, and making an already-authorized
   write atomic, remain outside this package.
 - Coordinator root/Git plumbing is a separate authority and is never delegated
   into a worker capability.
+- `sandbox-exec` is deprecated by Apple; when unavailable `RequireOS` fails
+  closed (no policy-only production admission).

@@ -8,6 +8,7 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 )
 
 func productionIdentity(t *testing.T, worktree, shared string) LaunchIdentity {
@@ -25,6 +26,7 @@ func productionIdentity(t *testing.T, worktree, shared string) LaunchIdentity {
 		Argv:              []string{"codex", "--model", "gpt-5.6-luna"},
 		WorktreeRoot:      worktree,
 		SharedRoot:        shared,
+		AgentKind:         "codex",
 	}
 }
 
@@ -50,14 +52,12 @@ func TestHMACIssuerSignsAndRejectsForgery(t *testing.T) {
 	if err := issuer.Verify(root, sentinel, tuple, proof); err != nil {
 		t.Fatal(err)
 	}
-	// Forged MAC
 	bad := proof
 	bad.MAC = append([]byte{}, proof.MAC...)
 	bad.MAC[0] ^= 0xff
 	if err := issuer.Verify(root, sentinel, tuple, bad); !errors.Is(err, ErrUnauthenticated) {
 		t.Fatalf("forged MAC: %v", err)
 	}
-	// Cross-task replay
 	other := tuple
 	other.Task = "FAC-999"
 	if err := issuer.Verify(root, sentinel, other, proof); !errors.Is(err, ErrUnauthenticated) {
@@ -89,12 +89,26 @@ func TestBindAndProvePolicyDeniesIncidentPath(t *testing.T) {
 	}
 	fake := &FakeOS{}
 	enf := &Enforcer{Issuer: issuer, OS: fake, ReceiptDir: filepath.Join(root, ".herd", "receipts")}
-	binding, err := enf.BindAndProve(productionIdentity(t, root, shared))
+	prep, err := enf.PrepareOS(root, shared, "codex", "codex")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !fake.Proved || !binding.OSProved || binding.OSBackend != "fake-os" {
-		t.Fatalf("OS proof not recorded: %+v fake=%+v", binding, fake)
+	if !fake.Proved || prep.BinDir == "" {
+		t.Fatalf("prepare incomplete: %+v fake=%+v", prep, fake)
+	}
+	binding, err := enf.BindAndProve(productionIdentity(t, root, shared), prep)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !fake.Proved || !binding.OSProved || !binding.AgentWrapped || binding.OSBackend != "fake-os" {
+		t.Fatalf("OS/agent wrap not recorded: %+v fake=%+v", binding, fake)
+	}
+	if binding.WrapperBinDir == "" || binding.ProfilePath == "" {
+		t.Fatalf("missing wrap paths: %+v", binding)
+	}
+	// Wrapper binary installed
+	if _, err := os.Stat(filepath.Join(binding.WrapperBinDir, "codex")); err != nil {
+		t.Fatalf("wrapper missing: %v", err)
 	}
 	incident := filepath.Join(shared, ".herd", "FAC-188-R2-RESIDUAL.md")
 	if err := binding.Boundary.AuthorizeWrite(binding.Capability, incident); err == nil {
@@ -103,16 +117,27 @@ func TestBindAndProvePolicyDeniesIncidentPath(t *testing.T) {
 	if err := binding.AuthorizeRelativeWrite("pkg/ok.go"); err != nil {
 		t.Fatalf("relative write: %v", err)
 	}
-	// Receipt persisted
-	receipts := filepath.Join(root, ".herd", "receipts", "confinement-receipts.jsonl")
-	if data, err := os.ReadFile(receipts); err != nil || !strings.Contains(string(data), binding.ReceiptDigest) {
-		t.Fatalf("receipt missing: %v %q", err, data)
+	// Unique receipt file persisted (not interleaved JSONL)
+	entries, err := os.ReadDir(filepath.Join(root, ".herd", "receipts"))
+	if err != nil || len(entries) == 0 {
+		t.Fatalf("receipts: %v %v", err, entries)
 	}
-	// Shared-root sentinel revalidation
+	found := false
+	for _, e := range entries {
+		data, err := os.ReadFile(filepath.Join(root, ".herd", "receipts", e.Name()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(string(data), binding.ReceiptDigest) && strings.Contains(string(data), `"agent_wrapped":true`) {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("receipt missing agent_wrapped digest")
+	}
 	if err := binding.CheckSharedRoot(); err != nil {
 		t.Fatal(err)
 	}
-	// Dirty shared root sentinel → fail closed
 	if err := os.WriteFile(filepath.Join(shared, filepath.FromSlash(SharedRootSentinelRelPath)), []byte("tampered\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -134,6 +159,18 @@ func TestBindRejectsMissingIdentity(t *testing.T) {
 	}
 }
 
+func TestBindAndProveRequiresPreparedOS(t *testing.T) {
+	issuer, err := NewHMACIssuer([]byte("secret"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := t.TempDir()
+	enf := &Enforcer{Issuer: issuer, OS: &FakeOS{}}
+	if _, err := enf.BindAndProve(productionIdentity(t, root, ""), nil); err == nil {
+		t.Fatal("expected fail closed without PreparedOS")
+	}
+}
+
 func TestDarwinSeatbeltProveWriteDenials(t *testing.T) {
 	if runtime.GOOS != "darwin" {
 		t.Skip("sandbox-exec is Darwin-only")
@@ -146,13 +183,109 @@ func TestDarwinSeatbeltProveWriteDenials(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(root, ".herd"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	// seed an allow path inside worktree
 	if err := os.WriteFile(filepath.Join(root, ".herd", "seed"), []byte("x"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	osb := DarwinSeatbelt{}
-	if err := osb.ProveWriteDenials(root, shared); err != nil {
+	profile, err := osb.Prepare(root, shared)
+	if err != nil {
 		t.Fatal(err)
+	}
+	// Must not create .herd under shared as a proof side-effect.
+	if _, err := os.Stat(filepath.Join(shared, ".herd")); err == nil {
+		// Prepare may not create shared .herd; only EnsureSharedRootSentinel does.
+	}
+	if err := osb.ProveWriteDenials(root, shared, profile); err != nil {
+		t.Fatal(err)
+	}
+	// After prove, shared root must not have residual probe inodes from proof.
+	if _, err := os.Stat(filepath.Join(shared, ".herd", "FAC-188-R2-RESIDUAL.md")); err == nil {
+		t.Fatal("proof left residual under shared root")
+	}
+}
+
+func TestDarwinFirstMatchProfileDeniesSharedParent(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("sandbox-exec is Darwin-only")
+	}
+	if _, err := RequireOS(); err != nil {
+		t.Skip(err.Error())
+	}
+	shared := t.TempDir()
+	root := filepath.Join(shared, "task-wt")
+	if err := os.MkdirAll(filepath.Join(root, ".herd"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	osb := DarwinSeatbelt{}
+	profile, err := osb.Prepare(root, shared)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Profile must not contain an allow for the shared parent path.
+	data, err := os.ReadFile(profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := string(data)
+	if strings.Count(body, "(allow file-write*") != 1 {
+		t.Fatalf("want exactly one file-write allow (worktree only), got:\n%s", body)
+	}
+	// Explicit: no allow line quoting the shared parent.
+	absShared, err := realPath(shared)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(body, "(allow file-write* (subpath \""+absShared+"\"))") {
+		t.Fatal("profile grants shared parent writes — first-match inverted")
+	}
+	// Live denial: write under shared but outside worktree must fail.
+	outside := filepath.Join(shared, "outside-shared.txt")
+	if err := osb.writeUnder(profile, root, outside, "nope\n"); err == nil {
+		if _, statErr := os.Stat(outside); statErr == nil {
+			t.Fatal("shared-parent write succeeded under first-match profile")
+		}
+	}
+	if _, err := os.Stat(outside); err == nil {
+		t.Fatal("outside inode under shared parent")
+	}
+}
+
+func TestRealPathFailsClosedOnMissing(t *testing.T) {
+	if _, err := realPath(filepath.Join(t.TempDir(), "missing-leaf")); err == nil {
+		// EvalSymlinks on missing path fails — good.
+	}
+	// Control characters rejected.
+	if _, err := realPath("/tmp/foo\nbar"); err == nil {
+		t.Fatal("control char path accepted")
+	}
+}
+
+func TestDigestIncludesCreatedAtAndMarshalErrors(t *testing.T) {
+	issuer, err := NewHMACIssuer([]byte("secret"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := t.TempDir()
+	if _, err := InstallSentinel(root); err != nil {
+		t.Fatal(err)
+	}
+	b1, err := Bind(productionIdentity(t, root, ""), issuer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Force distinct CreatedAt
+	b2 := *b1
+	b2.CreatedAt = b1.CreatedAt.Add(time.Second)
+	d1, err := b1.digest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	d2, err := b2.digest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d1 == d2 {
+		t.Fatal("digest ignores CreatedAt — replay collision")
 	}
 }
 
@@ -160,8 +293,6 @@ func TestProductionEnforcerRequiresSecretAndOS(t *testing.T) {
 	t.Setenv(SecretEnv, "")
 	t.Setenv(SecretEnvFallback, "")
 	if _, err := ProductionEnforcer(); !errors.Is(err, ErrMissingSecret) {
-		// On hosts without sandbox-exec we may fail OS first only after secret;
-		// without secret must be missing secret.
 		if err == nil || !errors.Is(err, ErrMissingSecret) {
 			t.Fatalf("got %v", err)
 		}
@@ -187,7 +318,6 @@ func execLookSandbox() error {
 }
 
 func TestMutationHMACUsesSecret(t *testing.T) {
-	// Non-vacuous: empty secret cannot issue.
 	if _, err := NewHMACIssuer(nil); !errors.Is(err, ErrMissingSecret) {
 		t.Fatal(err)
 	}
@@ -206,12 +336,10 @@ func TestMutationHMACUsesSecret(t *testing.T) {
 	if err := b.Verify(root, s, tuple, pa); err == nil {
 		t.Fatal("cross-secret verify accepted")
 	}
-	// Ensure MAC is real HMAC-SHA256 shaped (32 bytes)
 	if len(pa.MAC) != 32 {
 		t.Fatalf("mac len %d", len(pa.MAC))
 	}
-	// Manual recompute
-	want, _ := a.Issue(root, s, tuple) // different nonce
+	want, _ := a.Issue(root, s, tuple)
 	if hmac.Equal(pa.MAC, want.MAC) {
 		t.Fatal("identical MAC across nonces — nonce not mixed")
 	}

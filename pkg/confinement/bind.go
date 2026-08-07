@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -28,23 +29,30 @@ type LaunchIdentity struct {
 	Argv              []string
 	WorktreeRoot      string
 	SharedRoot        string
+	// AgentKind is the herdr kind (codex/grok/…) used to install the PATH wrapper.
+	AgentKind string
 }
 
 // Binding is the durable pre-launch confinement proof.
 type Binding struct {
-	Boundary           Boundary    `json:"-"`
-	Capability         Capability  `json:"-"`
-	WorktreeRoot       string      `json:"worktree_root"`
-	Sentinel           string      `json:"sentinel"`
-	SharedRoot         string      `json:"shared_root"`
-	SharedRootDigest   string      `json:"shared_root_digest"`
-	PolicyDigest       string      `json:"policy_digest"`
-	Tuple              AuthTuple   `json:"tuple"`
-	ProofNonce         string      `json:"proof_nonce"`
-	OSBackend          string      `json:"os_backend"`
-	OSProved           bool        `json:"os_proved"`
-	ReceiptDigest      string      `json:"receipt_digest"`
-	CreatedAt          time.Time   `json:"created_at"`
+	Boundary         Boundary   `json:"-"`
+	Capability       Capability `json:"-"`
+	WorktreeRoot     string     `json:"worktree_root"`
+	Sentinel         string     `json:"sentinel"`
+	SharedRoot       string     `json:"shared_root"`
+	SharedRootDigest string     `json:"shared_root_digest"`
+	PolicyDigest     string     `json:"policy_digest"`
+	Tuple            AuthTuple  `json:"tuple"`
+	ProofNonce       string     `json:"proof_nonce"`
+	OSBackend        string     `json:"os_backend"`
+	OSProved         bool       `json:"os_proved"`
+	// AgentWrapped is true only when a PATH-first sandbox wrapper matching the
+	// proved profile was installed for the agent kind.
+	AgentWrapped  bool      `json:"agent_wrapped"`
+	ProfilePath   string    `json:"profile_path,omitempty"`
+	WrapperBinDir string    `json:"wrapper_bin_dir,omitempty"`
+	ReceiptDigest string    `json:"receipt_digest"`
+	CreatedAt     time.Time `json:"created_at"`
 }
 
 // Bind authenticates a worktree, issues a production MAC, and returns a
@@ -99,7 +107,11 @@ func Bind(id LaunchIdentity, issuer Issuer) (*Binding, error) {
 		ProofNonce:       cap.proof.Nonce,
 		CreatedAt:        time.Now().UTC(),
 	}
-	b.ReceiptDigest = b.digest()
+	digest, err := b.digest()
+	if err != nil {
+		return nil, err
+	}
+	b.ReceiptDigest = digest
 	return b, nil
 }
 
@@ -125,9 +137,9 @@ func argvDigest(argv []string) string {
 	return hex.EncodeToString(sum[:])
 }
 
-func (b *Binding) digest() string {
+func (b *Binding) digest() (string, error) {
 	if b == nil {
-		return ""
+		return "", fmt.Errorf("confinement: nil binding")
 	}
 	payload := struct {
 		WorktreeRoot     string    `json:"worktree_root"`
@@ -139,6 +151,10 @@ func (b *Binding) digest() string {
 		ProofNonce       string    `json:"proof_nonce"`
 		OSBackend        string    `json:"os_backend"`
 		OSProved         bool      `json:"os_proved"`
+		AgentWrapped     bool      `json:"agent_wrapped"`
+		ProfilePath      string    `json:"profile_path"`
+		WrapperBinDir    string    `json:"wrapper_bin_dir"`
+		CreatedAt        time.Time `json:"created_at"`
 	}{
 		WorktreeRoot:     b.WorktreeRoot,
 		Sentinel:         b.Sentinel,
@@ -149,10 +165,17 @@ func (b *Binding) digest() string {
 		ProofNonce:       b.ProofNonce,
 		OSBackend:        b.OSBackend,
 		OSProved:         b.OSProved,
+		AgentWrapped:     b.AgentWrapped,
+		ProfilePath:      b.ProfilePath,
+		WrapperBinDir:    b.WrapperBinDir,
+		CreatedAt:        b.CreatedAt.UTC(),
 	}
-	encoded, _ := json.Marshal(payload)
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return "", fmt.Errorf("confinement: digest marshal: %w", err)
+	}
 	sum := sha256.Sum256(encoded)
-	return hex.EncodeToString(sum[:])
+	return hex.EncodeToString(sum[:]), nil
 }
 
 // AuthorizeRelativeWrite is a convenience for production callers that want a
@@ -175,11 +198,27 @@ func (b *Binding) CheckSharedRoot() error {
 	return CheckSharedRootSentinel(b.SharedRoot, b.SharedRootDigest)
 }
 
+// PathEnv returns the PATH assignment that must be first for the agent pane so
+// herdr kind resolution hits the sandbox wrapper.
+func (b *Binding) PathEnv(existingPATH string) string {
+	if b == nil || b.WrapperBinDir == "" {
+		return existingPATH
+	}
+	if existingPATH == "" {
+		return b.WrapperBinDir
+	}
+	return b.WrapperBinDir + string(os.PathListSeparator) + existingPATH
+}
+
 // MarshalReceipt returns durable JSON for launch/control evidence.
 func (b *Binding) MarshalReceipt() ([]byte, error) {
 	if b == nil {
 		return nil, fmt.Errorf("confinement: nil binding")
 	}
-	b.ReceiptDigest = b.digest()
+	digest, err := b.digest()
+	if err != nil {
+		return nil, err
+	}
+	b.ReceiptDigest = digest
 	return json.Marshal(b)
 }
