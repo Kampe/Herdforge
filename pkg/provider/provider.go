@@ -24,6 +24,16 @@ type Task struct {
 	ProjectID   string    `json:"project_id"`
 	Labels      []string  `json:"labels"`
 	CreatedAt   time.Time `json:"created_at"`
+	// UpdatedAt is the provider's last-mutation timestamp when available
+	// (Kaneo updatedAt, GitHub updated_at). Used as part of the opaque
+	// ProviderCAS revision token (FAC-147). Zero means the provider did
+	// not supply one; revision encoding falls back to status+id+createdAt.
+	UpdatedAt time.Time `json:"updated_at,omitempty"`
+	// StatusReceipt is the signed receipt extracted from the task description
+	// footer after an atomic status PUT (FAC-147). Not a native Kaneo field.
+	StatusReceipt string `json:"-"`
+	// Position is Kaneo's board rank; required for full-schema PUT rebuilds.
+	Position float64 `json:"-"`
 }
 
 // TaskProvider defines the interface for task tracking backends (Kaneo, GitHub, Linear)

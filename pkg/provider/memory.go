@@ -17,6 +17,7 @@ type MemoryProvider struct {
 	proofed   map[string]bool
 	relations map[string]Relation // id → relation
 	nextRel   int
+	comments  map[string][]string
 }
 
 func (m *MemoryProvider) LabelMutationAuthority() (string, error) {
@@ -25,6 +26,7 @@ func (m *MemoryProvider) LabelMutationAuthority() (string, error) {
 
 func NewMemoryProvider() *MemoryProvider {
 	return &MemoryProvider{
+		comments:  make(map[string][]string),
 		tasks:     make(map[string]*Task),
 		labels:    make(map[string]TaskLabel),
 		relations: make(map[string]Relation),
@@ -143,6 +145,13 @@ func (m *MemoryProvider) AddTask(t *Task) {
 	m.tasks[t.ID] = t
 }
 
+// Comments returns recorded comments for tests (FAC-147 fence coverage).
+func (m *MemoryProvider) Comments(taskID string) []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]string(nil), m.comments[taskID]...)
+}
+
 func (m *MemoryProvider) GetTask(ctx context.Context, id string) (*Task, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -185,27 +194,26 @@ func (m *MemoryProvider) ClaimTask(ctx context.Context, taskID string, role stri
 }
 
 func (m *MemoryProvider) UpdateStatus(ctx context.Context, taskID string, status string) error {
+	return m.UpdateStatusAtomic(ctx, taskID, status, "")
+}
+
+// UpdateStatusAtomic applies status and optional signed receipt in one step
+// (hermetic board model of Kaneo single-PATCH atomicity).
+func (m *MemoryProvider) UpdateStatusAtomic(ctx context.Context, taskID, status, receiptJSON string) error {
 	m.mu.Lock()
 	t, ok := m.tasks[taskID]
-	if !ok {
-		// Resolve by ref.
-		for id, cand := range m.tasks {
-			if cand.Ref == taskID {
-				t = cand
-				taskID = id
-				ok = true
-				break
-			}
-		}
-	}
 	if !ok {
 		m.mu.Unlock()
 		return fmt.Errorf("task not found: %s", taskID)
 	}
 	canonical := NormalizeStatus(status)
 	t.Status = canonical
+	t.UpdatedAt = time.Now().UTC()
+	if receiptJSON != "" {
+		t.StatusReceipt = receiptJSON
+		t.Description = EmbedStatusReceiptInDescription(t.Description, receiptJSON)
+	}
 	m.mu.Unlock()
-	// In-memory readback: re-load and verify (fail if map drift / missing).
 	got, err := m.GetTask(ctx, taskID)
 	if err != nil {
 		return fmt.Errorf("memory status readback after write: %w", err)
@@ -216,14 +224,21 @@ func (m *MemoryProvider) UpdateStatus(ctx context.Context, taskID string, status
 func (m *MemoryProvider) AddComment(ctx context.Context, taskID string, body string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if _, ok := m.tasks[taskID]; !ok {
-		for _, cand := range m.tasks {
+	id := taskID
+	if _, ok := m.tasks[id]; !ok {
+		found := false
+		for tid, cand := range m.tasks {
 			if cand.Ref == taskID {
-				return nil
+				id = tid
+				found = true
+				break
 			}
 		}
-		return fmt.Errorf("task not found: %s", taskID)
+		if !found {
+			return fmt.Errorf("task not found: %s", taskID)
+		}
 	}
+	m.comments[id] = append(m.comments[id], body)
 	return nil
 }
 

@@ -2,9 +2,22 @@ package claim
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"strings"
 )
+
+// mintOpUUID returns a 128-bit hex id persisted on the outbox intent so
+// the CAS opID is an immutable operation sequence, not a status/body hash.
+func mintOpUUID() string {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return fmt.Sprintf("fallback-%d", len(b))
+	}
+	return hex.EncodeToString(b[:])
+}
 
 // ErrProviderRevisionStale means ProviderCAS.CompareAndSwap observed a
 // current revision different from what the caller expected -- something
@@ -119,8 +132,11 @@ func WithProviderCAS(p ProviderCAS) Option { return func(m *ClaimManager) { m.pr
 // ReconcileProviderTransitions return ErrOutboxNotConfigured.
 func WithDurableOutbox(o DurableOutbox) Option { return func(m *ClaimManager) { m.outboxStore = o } }
 
-func providerIntentKey(key LeaseKey, generation int64) string {
-	return fmt.Sprintf("provider:%s/%s/%s/%s:g%d", key.Repo, key.Provider, key.Project, key.TaskRef, generation)
+func providerIntentKey(key LeaseKey, generation int64, kind string) string {
+	if kind == "" {
+		kind = "provider_mutation"
+	}
+	return fmt.Sprintf("provider:%s/%s/%s/%s:g%d:%s", key.Repo, key.Provider, key.Project, key.TaskRef, generation, kind)
 }
 
 // BeginProviderTransition durably records the intent to mutate the
@@ -142,7 +158,14 @@ func (m *ClaimManager) BeginProviderTransition(ctx context.Context, key LeaseKey
 	if err := m.verifyCurrentLease(ctx, key, ownerID, generation); err != nil {
 		return nil, err
 	}
-	return m.outboxStore.Enqueue(ctx, OutboxIntent{IdempotencyKey: providerIntentKey(key, generation), Kind: kind})
+	// Payload carries the immutable operation UUID. Enqueue is insert-or-
+	// ignore: a crash retry of the same intent reuses the first UUID so
+	// the authoritative broker sees one logical operation, not two.
+	return m.outboxStore.Enqueue(ctx, OutboxIntent{
+		IdempotencyKey: providerIntentKey(key, generation, kind),
+		Kind:           kind,
+		Payload:        []byte(mintOpUUID()),
+	})
 }
 
 // CompleteProviderTransition attempts the provider mutation for an
@@ -186,7 +209,10 @@ func (m *ClaimManager) BeginProviderTransition(ctx context.Context, key LeaseKey
 // this point returns ErrLeaseNotCurrent and guarantees zero ProviderCAS
 // calls; a lock-acquisition failure also marks the outbox record Failed
 // so it does not sit claimed and orphaned.
-func (m *ClaimManager) CompleteProviderTransition(ctx context.Context, key LeaseKey, ownerID string, generation int64, taskID string, expectedRevision ProviderRevision, mutate func(ctx context.Context) error) (*OutboxRecord, error) {
+// CompleteProviderTransition attempts the provider mutation for an
+// already-begun intent. kind MUST match BeginProviderTransition's kind
+// so the idempotency key is identical (FAC-147 multi-op-per-generation).
+func (m *ClaimManager) CompleteProviderTransition(ctx context.Context, key LeaseKey, ownerID string, generation int64, taskID, kind string, expectedRevision ProviderRevision, mutate func(ctx context.Context) error) (*OutboxRecord, error) {
 	if err := validateAttributableID(m.settlerID, "settler identity"); err != nil {
 		return nil, err
 	}
@@ -202,8 +228,11 @@ func (m *ClaimManager) CompleteProviderTransition(ctx context.Context, key Lease
 	if err := m.verifyCurrentLease(ctx, key, ownerID, generation); err != nil {
 		return nil, err
 	}
+	if kind == "" {
+		kind = "provider_mutation"
+	}
 
-	idempotencyKey := providerIntentKey(key, generation)
+	idempotencyKey := providerIntentKey(key, generation, kind)
 	rec, err := m.outboxStore.Claim(ctx, idempotencyKey, m.settlerID, m.capacityClaimTimeout, m.now())
 	if err != nil {
 		return nil, fmt.Errorf("claim: claim provider transition: %w", err)
@@ -231,7 +260,13 @@ func (m *ClaimManager) CompleteProviderTransition(ctx context.Context, key Lease
 		completeProviderTransitionTestHook()
 	}
 
-	if _, casErr := m.provider.CompareAndSwap(ctx, taskID, expectedRevision, generation, mutate); casErr != nil {
+	// Prefer the immutable op UUID from Begin payload; fall back to the
+	// stable intent key for records written before UUID payload existed.
+	opID := strings.TrimSpace(string(rec.Payload))
+	if opID == "" {
+		opID = idempotencyKey
+	}
+	if _, casErr := m.provider.CompareAndSwap(ctx, taskID, expectedRevision, generation, opID, mutate); casErr != nil {
 		markErr := m.outboxStore.MarkFailed(ctx, idempotencyKey, m.settlerID, casErr.Error(), m.now())
 		rec, getErr := m.outboxStore.Get(ctx, idempotencyKey)
 		return release(rec, errors.Join(casErr, markErr, getErr))
@@ -281,7 +316,9 @@ func (m *ClaimManager) ReconcileProviderTransitions(ctx context.Context, verify 
 
 	var firstErr error
 	for _, rec := range pending {
-		if rec.Kind != "provider_mutation" {
+		// Begin/Complete records kinds like status:done, claim, comment:…
+		// (legacy tests used the literal "provider_mutation").
+		if !isProviderTransitionKind(rec.Kind) {
 			continue
 		}
 		applied, verr := verify(ctx, rec)
@@ -306,4 +343,14 @@ func (m *ClaimManager) ReconcileProviderTransitions(ctx context.Context, verify 
 		closed++
 	}
 	return closed, stillPending, firstErr
+}
+
+func isProviderTransitionKind(kind string) bool {
+	if kind == "" {
+		return false
+	}
+	if kind == "provider_mutation" || kind == "claim" {
+		return true
+	}
+	return strings.HasPrefix(kind, "status:") || strings.HasPrefix(kind, "comment:")
 }

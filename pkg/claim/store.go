@@ -175,6 +175,14 @@ type LeaseStore interface {
 	// discover candidates for lifecycle recovery.
 	PeekAllStaleProviderLocks(ctx context.Context, now time.Time) ([]*Lease, error)
 
+	// HandoffOwner atomically rebinds owner_id AND extends expiry of the
+	// active lease from fromOwner to toOwner at the same generation in a
+	// single fenced UPDATE (owner transfer + renew + readback). Generation
+	// is preserved so the worker inherits fencing authority without a
+	// reclaim race. Fails if fromOwner+generation is not the current
+	// active lease. ttl is the new remaining lease duration from now.
+	HandoffOwner(ctx context.Context, key LeaseKey, fromOwner, toOwner string, generation int64, now time.Time, ttl time.Duration) (*Lease, error)
+
 	// ActiveClaims returns only live (Active, unexpired) leases.
 	ActiveClaims(ctx context.Context, now time.Time) ([]*Lease, error)
 

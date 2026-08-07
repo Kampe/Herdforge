@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
 	"strings"
 	"syscall"
@@ -86,6 +87,57 @@ func RunCLI(ctx context.Context, name string, args ...string) (*CLIResult, error
 }
 
 // RunCLIOutput is a convenience wrapper returning stdout only.
+
+// RunCLIEnv is RunCLI with optional extra environment entries (KEY=value).
+// Used to transport HERD_FENCE / HERD_OP into production Kaneo CLI mutates
+// so fence meta is not dropped when use_cli: true (FAC-147).
+func RunCLIEnv(ctx context.Context, extraEnv []string, name string, args ...string) (*CLIResult, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	cmd := exec.CommandContext(ctx, name, args...)
+	if len(extraEnv) > 0 {
+		cmd.Env = append(os.Environ(), extraEnv...)
+	}
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error {
+		if cmd.Process == nil {
+			return nil
+		}
+		return procsignal.CancelSpawnedProcess(cmd.Process)
+	}
+	cmd.WaitDelay = 100 * time.Millisecond
+
+	err := cmd.Run()
+	res := &CLIResult{
+		Stdout: stdout.Bytes(),
+		Stderr: truncateBytes(stderr.Bytes(), MaxCLIStderrBytes),
+	}
+	if err == nil {
+		return res, nil
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return res, &TimeoutError{Cause: ctxErr}
+	}
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		return res, &TimeoutError{Cause: err}
+	}
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
+		msg := strings.TrimSpace(string(res.Stderr))
+		if msg == "" {
+			msg = err.Error()
+		}
+		return res, fmt.Errorf("%s: %s", name, msg)
+	}
+	return res, err
+}
+
+var kaneoRunCLIEnv = RunCLIEnv
+
 func RunCLIOutput(ctx context.Context, name string, args ...string) ([]byte, error) {
 	res, err := RunCLI(ctx, name, args...)
 	if res == nil {

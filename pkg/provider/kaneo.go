@@ -2,6 +2,7 @@ package provider
 
 import (
 	"bytes"
+
 	"context"
 	"encoding/json"
 	"fmt"
@@ -38,6 +39,25 @@ type KaneoProvider struct {
 	BulkConcurrency int
 	proofMu         sync.Mutex
 	pendingCreates  map[string]map[string]TaskLabel
+
+	// Receiver is the local AuthBroker over fences.db (in_progress / applied).
+	// It is NOT a substitute for server-side fence+op enforcement.
+	Receiver AuthoritativeReceiver
+	// RequireCASMeta refuses UpdateStatus/AddComment/ClaimTask without
+	// CAS meta (fence+op). Set true when attached to a ClaimStack so
+	// unfenced bypass cannot skip the receiver.
+	RequireCASMeta bool
+	// AtomicFenceServer is true when a live FenceBroker (or hermetic enforcing
+	// board under test) enforces fence+op+op-dedupe with status. Production
+	// sets this only via ConfigureKaneoFenceBroker after health check — not a
+	// bare env toggle. Stock Kaneo alone is never sufficient.
+	AtomicFenceServer bool
+	// FenceBroker is the worker-facing sidecar client (mutate + op readback).
+	// Never holds mint credentials.
+	FenceBroker *FenceBrokerClient
+	// minter is coordinator-only (unexported). Workers never set this.
+	// Per-call lease identity comes from WithMintIdentity(ctx), not mutable fields.
+	minter *FenceBrokerMinter
 }
 
 type KaneoLinkConfig struct {
@@ -656,125 +676,6 @@ func filterTasks(dtos []kaneoTaskDTO, status string) []*Task {
 		tasks = append(tasks, t)
 	}
 	return tasks
-}
-
-func (k *KaneoProvider) ClaimTask(ctx context.Context, taskID string, role string) error {
-	return k.UpdateStatus(ctx, taskID, StatusInProgress)
-}
-
-func (k *KaneoProvider) UpdateStatus(ctx context.Context, taskID string, status string) error {
-	// Write the canonical lifecycle status so readback compares like-for-like
-	// against dtoToTask/NormalizeStatus (production Kaneo CLI + HTTP).
-	canonical := NormalizeStatus(status)
-	dls := k.deadlines()
-	writeCtx, cancel := WithOpDeadline(ctx, dls, OpMutate)
-	writeErr := k.updateStatusOnce(writeCtx, taskID, canonical)
-	cancel()
-	if writeErr != nil {
-		writeErr = AsTimeout("kaneo", "UpdateStatus", OpMutate, dls.For(OpMutate), writeErr)
-	}
-	// Parent ctx (not the expired write child) for readback / reconcile.
-	return AfterMutation(ctx, k, dls, "kaneo", "UpdateStatus", taskID, canonical, writeErr)
-}
-
-func (k *KaneoProvider) updateStatusOnce(ctx context.Context, taskID, status string) error {
-	if k.UseCLI {
-		res, err := kaneoRunCLI(ctx, "kaneo", "task", "status", taskID, status, "--project", k.ProjectID)
-		if err != nil {
-			msg := cliErrMsg(res)
-			if msg != "" {
-				return fmt.Errorf("kaneo task status: %s: %w", msg, err)
-			}
-			return fmt.Errorf("kaneo task status: %w", err)
-		}
-		return nil
-	}
-
-	url := fmt.Sprintf("%s/api/task/%s", k.APIURL, taskID)
-	payload := map[string]string{"status": status}
-	body, _ := json.Marshal(payload)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPatch, url, bytes.NewBuffer(body))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	k.authorizeKaneo(req)
-	resp, err := k.httpClient().Do(req)
-	if err != nil {
-		return err
-	}
-	if err := DecodeJSONResponse(resp, nil); err != nil {
-		if pe, ok := err.(*ProviderError); ok {
-			pe.Provider = "kaneo"
-			pe.Op = "UpdateStatus"
-		}
-		return err
-	}
-	return nil
-}
-
-func (k *KaneoProvider) AddComment(ctx context.Context, taskID string, body string) error {
-	dls := k.deadlines()
-	ctx, cancel := WithOpDeadline(ctx, dls, OpComment)
-	defer cancel()
-
-	err := k.addCommentOnce(ctx, taskID, body)
-	if err == nil {
-		return nil
-	}
-	err = AsTimeout("kaneo", "AddComment", OpComment, dls.For(OpComment), err)
-	if IsTimeout(err) {
-		// Comments are not status-reconcilable; never blind-retry.
-		return &AmbiguousMutationError{
-			Provider: "kaneo",
-			Op:       "AddComment",
-			TaskID:   taskID,
-			WriteErr: err,
-		}
-	}
-	return err
-}
-
-func (k *KaneoProvider) addCommentOnce(ctx context.Context, taskID, body string) error {
-	if k.UseCLI {
-		// Production Kaneo is multi-project; pin --project when configured
-		// (matches status/list CLI paths).
-		args := []string{"task", "comment", "add", taskID, body}
-		if k.ProjectID != "" {
-			args = append(args, "--project", k.ProjectID)
-		}
-		res, err := kaneoRunCLI(ctx, "kaneo", args...)
-		if err != nil {
-			msg := cliErrMsg(res)
-			if msg != "" {
-				return fmt.Errorf("kaneo task comment: %s: %w", msg, err)
-			}
-			return fmt.Errorf("kaneo task comment: %w", err)
-		}
-		return nil
-	}
-
-	url := fmt.Sprintf("%s/api/task/%s/comment", k.APIURL, taskID)
-	payload := map[string]string{"body": body}
-	buf, _ := json.Marshal(payload)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewBuffer(buf))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	k.authorizeKaneo(req)
-	resp, err := k.httpClient().Do(req)
-	if err != nil {
-		return err
-	}
-	if err := DecodeJSONResponse(resp, nil); err != nil {
-		if pe, ok := err.(*ProviderError); ok {
-			pe.Provider = "kaneo"
-			pe.Op = "AddComment"
-		}
-		return err
-	}
-	return nil
 }
 
 func cliErrMsg(res *CLIResult) string {

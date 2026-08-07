@@ -3,8 +3,6 @@ package claim
 import (
 	"context"
 	"time"
-
-	"github.com/Kampe/Herdforge/pkg/provider"
 )
 
 // legacyRole is the fixed pseudo-role the ClaimTask compatibility path
@@ -44,11 +42,16 @@ func NewInMemoryClaimManager(opts ...Option) *ClaimManager {
 
 // ClaimTask preserves the pre-FAC-120 ClaimManager.ClaimTask signature and
 // first-come-first-served-by-taskRef behavior on top of the new durable,
-// role-aware Claim. p is accepted for source compatibility and unused,
-// exactly as it was before FAC-120.
+// role-aware Claim. The second argument is accepted for source
+// compatibility and unused, exactly as it was before FAC-120 (callers
+// historically passed a TaskProvider). Typed as any so pkg/claim does not
+// import pkg/provider — FAC-147's production ProviderCAS lives in
+// pkg/provider and must import claim without a cycle.
+//
+// Always returns ErrLegacyClaimDisabled; use exact canonical ClaimRequest.
 //
 // Deprecated: migrate to Claim(ctx, ClaimRequest{...}) with a real Role.
-func (m *ClaimManager) ClaimTask(ctx context.Context, _ provider.TaskProvider, taskRef, workerID, worktreePath string) (*ClaimRecord, error) {
+func (m *ClaimManager) ClaimTask(ctx context.Context, _ any, taskRef, workerID, worktreePath string) (*ClaimRecord, error) {
 	return nil, ErrLegacyClaimDisabled
 }
 
