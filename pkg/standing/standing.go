@@ -1,0 +1,752 @@
+// Package standing raises and reports declaratively configured standing
+// control roles (FAC-91).
+//
+// herd standing loads standing lanes from configuration in roster order,
+// validates prompt path, authority, role label, capabilities, and isolated
+// worktree cwd, resolves workspace from live evidence (no hardcoded ID),
+// and raises each role at most once while the agent name is held.
+//
+// Modes: raise (default), dry-run, status, shutdown. Ephemeral task workers
+// are never selected or closed by this package.
+package standing
+
+import (
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+
+	"github.com/Kampe/Herdforge/pkg/config"
+	"github.com/Kampe/Herdforge/pkg/kick"
+	"github.com/Kampe/Herdforge/pkg/worktree"
+)
+
+// ForgePrefix is the live herdr agent name prefix shared with pkg/kick.
+const ForgePrefix = kick.ForgePrefix
+
+// Mode selects the standing operation.
+type Mode int
+
+const (
+	// ModeRaise creates missing standing owners (default).
+	ModeRaise Mode = iota
+	// ModeDryRun plans raise without herdr side effects.
+	ModeDryRun
+	// ModeStatus reports live vs missing standing owners.
+	ModeStatus
+	// ModeShutdown closes only configured standing owners (not ephemeral workers).
+	ModeShutdown
+)
+
+// Outcome is what happened to one standing role.
+type Outcome string
+
+const (
+	OutcomeRaised      Outcome = "raised"
+	OutcomeSkippedLive Outcome = "skipped_live"
+	OutcomePreview     Outcome = "preview"
+	OutcomeFailed      Outcome = "failed"
+	OutcomeLive        Outcome = "live"
+	OutcomeMissing     Outcome = "missing"
+	OutcomeWouldClose  Outcome = "would_close"
+	OutcomeClosed      Outcome = "closed"
+	OutcomePreserved   Outcome = "preserved"
+)
+
+// Agent is the fleet subset standing needs from herdr agent list.
+type Agent struct {
+	Name      string
+	Status    string
+	PaneID    string
+	TabID     string
+	Workspace string
+	Cwd       string
+}
+
+// Tab is a created herdr tab.
+type Tab struct {
+	ID     string
+	Label  string
+	PaneID string
+	Cwd    string
+}
+
+// Route is the admitted launch surface for one standing role.
+// Decision is opaque so callers can pass *router.LaunchDecision without
+// this package importing the router graph for pure validation tests.
+type Route struct {
+	Provider string
+	Model    string
+	Effort   string
+	Harness  string
+	Decision any
+}
+
+// Options controls one standing run. Production callers fill injectables
+// with live herdr/config seams; tests inject fakes.
+type Options struct {
+	Mode     Mode
+	Only     []string // lane names or forge-<lane>; empty = all standing
+	Quiet    bool
+	RepoRoot string
+
+	ListAgents         func() ([]Agent, error)
+	ResolveWorkspace   func(repoRoot string, cfg *config.Config) (string, error)
+	PrepareWorktree    func(lane *config.LaneDef) error
+	AdmitRoute         func(lane *config.LaneDef) (Route, error)
+	CreateTab          func(workspace, label, cwd string) (Tab, error)
+	StartAgent         func(tab Tab, agentName string, route Route, lane *config.LaneDef, repository string) error
+	PromptAgent        func(agentName, promptText string) error
+	CloseTab           func(tabID string) error
+	RepositoryIdentity func(cfg *config.Config) string
+	PromptReadable     func(path string) error
+	AbsPath            func(path string) (string, error)
+}
+
+// RoleResult records one standing role's outcome.
+type RoleResult struct {
+	LaneName  string  `json:"lane"`
+	AgentName string  `json:"agent"`
+	Role      string  `json:"role"`
+	CWD       string  `json:"cwd,omitempty"`
+	Outcome   Outcome `json:"outcome"`
+	Reason    string  `json:"reason,omitempty"`
+	TabID     string  `json:"tab_id,omitempty"`
+	PaneID    string  `json:"pane_id,omitempty"`
+	Provider  string  `json:"provider,omitempty"`
+	Model     string  `json:"model,omitempty"`
+}
+
+// Result is the full standing run report.
+type Result struct {
+	Workspace string       `json:"workspace"`
+	Mode      string       `json:"mode"`
+	Roles     []RoleResult `json:"roles"`
+	Raised    int          `json:"raised"`
+	Skipped   int          `json:"skipped"`
+	Failed    int          `json:"failed"`
+	Previewed int          `json:"previewed"`
+	Closed    int          `json:"closed"`
+	Missing   int          `json:"missing"`
+	Live      int          `json:"live"`
+}
+
+// NameHeld reports whether an agent_status means the live name is held and
+// a second raise must skip (shell parity: working|idle|starting|done|blocked).
+func NameHeld(status string) bool {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "working", "idle", "starting", "done", "blocked":
+		return true
+	default:
+		return false
+	}
+}
+
+// AgentName returns the live herdr name for a configured lane.
+func AgentName(laneName string) string {
+	return ForgePrefix + strings.TrimSpace(laneName)
+}
+
+// StandingLanes returns standing control roles in config declaration order.
+// Order is deterministic: the roster array order from herd.yaml, never sorted
+// by name (kick.StandingIDs sorts agent ids for kick; raise follows config).
+func StandingLanes(cfg *config.Config) []config.LaneDef {
+	if cfg == nil {
+		return nil
+	}
+	out := make([]config.LaneDef, 0, len(cfg.Lanes))
+	for _, lane := range cfg.Lanes {
+		if lane.Standing {
+			out = append(out, lane)
+		}
+	}
+	return out
+}
+
+// Select returns standing lanes filtered by Only. Empty Only means all.
+// Each Only entry may be a lane name ("harvest") or live agent name
+// ("forge-harvest"). Unknown selections fail closed. Result order follows
+// the input lanes slice (config declaration order).
+func Select(lanes []config.LaneDef, only []string) ([]config.LaneDef, error) {
+	if len(only) == 0 {
+		return append([]config.LaneDef(nil), lanes...), nil
+	}
+	wantLanes := map[string]struct{}{}
+	for _, raw := range only {
+		s := strings.TrimSpace(raw)
+		if s == "" {
+			continue
+		}
+		if strings.HasPrefix(s, ForgePrefix) {
+			wantLanes[strings.TrimPrefix(s, ForgePrefix)] = struct{}{}
+		} else {
+			wantLanes[s] = struct{}{}
+		}
+	}
+	if len(wantLanes) == 0 {
+		return nil, errors.New("standing selection is empty")
+	}
+	byName := make(map[string]config.LaneDef, len(lanes))
+	for _, lane := range lanes {
+		byName[lane.Name] = lane
+	}
+	for name := range wantLanes {
+		if _, ok := byName[name]; !ok {
+			return nil, fmt.Errorf("unknown standing selection %q (not a configured standing lane)", name)
+		}
+	}
+	out := make([]config.LaneDef, 0, len(wantLanes))
+	for _, lane := range lanes {
+		if _, ok := wantLanes[lane.Name]; ok {
+			out = append(out, lane)
+		}
+	}
+	return out, nil
+}
+
+// ValidateLane checks standing launch preconditions without side effects.
+// Missing prompt, worktree, authority, capabilities, role, or a shared-root
+// cwd blocks launch. Capability *probe* enforcement remains FAC-139; this
+// gate requires the declarative fields FAC-127 registered on the lane.
+func ValidateLane(lane config.LaneDef, repoRoot string, promptReadable func(string) error, absPath func(string) (string, error)) (cwd string, err error) {
+	name := strings.TrimSpace(lane.Name)
+	if name == "" {
+		return "", errors.New("standing lane missing name")
+	}
+	if strings.TrimSpace(lane.Role) == "" {
+		return "", fmt.Errorf("standing lane %q missing role label", name)
+	}
+	if strings.TrimSpace(lane.Prompt) == "" {
+		return "", fmt.Errorf("standing lane %q missing prompt path", name)
+	}
+	if promptReadable == nil {
+		promptReadable = defaultPromptReadable
+	}
+	if err := promptReadable(lane.Prompt); err != nil {
+		return "", fmt.Errorf("standing lane %q prompt %q: %w", name, lane.Prompt, err)
+	}
+	if strings.TrimSpace(lane.Worktree) == "" {
+		return "", fmt.Errorf("standing lane %q requires an isolated worktree", name)
+	}
+	if lane.Authority == "" {
+		return "", fmt.Errorf("standing lane %q missing authority", name)
+	}
+	switch lane.Authority {
+	case config.AuthorityRead, config.AuthorityWrite:
+	default:
+		return "", fmt.Errorf("standing lane %q invalid authority %q", name, lane.Authority)
+	}
+	if len(lane.Capabilities) == 0 {
+		return "", fmt.Errorf("standing lane %q missing capabilities (declarative route tools)", name)
+	}
+	for _, cap := range lane.Capabilities {
+		if !validCapability(cap) {
+			return "", fmt.Errorf("standing lane %q unknown capability %q", name, cap)
+		}
+	}
+	for _, inc := range lane.IncompatibleWith {
+		if strings.EqualFold(strings.TrimSpace(inc), strings.TrimSpace(lane.Role)) {
+			return "", fmt.Errorf("standing lane %q incompatible_with includes its own role %q", name, lane.Role)
+		}
+	}
+	if lane.Risk != nil {
+		switch *lane.Risk {
+		case config.RiskR0Mechanical, config.RiskR1Standard, config.RiskR2High, config.RiskR3Critical:
+		default:
+			return "", fmt.Errorf("standing lane %q invalid risk ceiling %q", name, *lane.Risk)
+		}
+	}
+
+	if absPath == nil {
+		absPath = filepath.Abs
+	}
+	if strings.TrimSpace(repoRoot) == "" {
+		repoRoot = "."
+	}
+	absRoot, err := absPath(repoRoot)
+	if err != nil {
+		return "", fmt.Errorf("standing lane %q resolve repo root: %w", name, err)
+	}
+	// Worktree paths in herd.yaml are repo-relative (e.g. .worktrees/harvest).
+	wt := lane.Worktree
+	if !filepath.IsAbs(wt) {
+		wt = filepath.Join(absRoot, wt)
+	}
+	absCwd, err := absPath(wt)
+	if err != nil {
+		return "", fmt.Errorf("standing lane %q resolve worktree: %w", name, err)
+	}
+	if err := worktree.RejectSharedRoot(absRoot, absCwd); err != nil {
+		return "", fmt.Errorf("standing lane %q refuses shared-root session: %w", name, err)
+	}
+	// Write-capable standing owners get the same shared-root refusal with an
+	// explicit authority mention for operators reading the failure.
+	if lane.Authority == config.AuthorityWrite {
+		if err := worktree.RejectSharedRoot(absRoot, absCwd); err != nil {
+			return "", fmt.Errorf("standing lane %q write authority cannot share repository root: %w", name, err)
+		}
+	}
+	return absCwd, nil
+}
+
+func validCapability(c config.Capability) bool {
+	switch c {
+	case config.CapabilityNetwork, config.CapabilityGitWrite, config.CapabilityFSWrite, config.CapabilityBoardWrite, config.CapabilityShellExec:
+		return true
+	default:
+		return false
+	}
+}
+
+func defaultPromptReadable(path string) error {
+	st, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+	if st.IsDir() {
+		return errors.New("path is a directory")
+	}
+	return nil
+}
+
+// indexAgents maps name -> Agent for O(1) live lookups.
+func indexAgents(agents []Agent) map[string]Agent {
+	idx := make(map[string]Agent, len(agents))
+	for _, a := range agents {
+		if a.Name != "" {
+			idx[a.Name] = a
+		}
+	}
+	return idx
+}
+
+// Run executes standing raise/status/shutdown/dry-run against cfg.
+func Run(cfg *config.Config, opts Options) (*Result, error) {
+	if cfg == nil {
+		return nil, errors.New("standing: config is required")
+	}
+	repoRoot := opts.RepoRoot
+	if repoRoot == "" {
+		repoRoot = "."
+	}
+	lanes, err := Select(StandingLanes(cfg), opts.Only)
+	if err != nil {
+		return nil, err
+	}
+	if len(lanes) == 0 {
+		return nil, errors.New("standing: no standing control roles configured")
+	}
+
+	modeName := modeString(opts.Mode)
+	result := &Result{Mode: modeName, Roles: make([]RoleResult, 0, len(lanes))}
+
+	if opts.ListAgents == nil {
+		return nil, errors.New("standing: agent list is required")
+	}
+	agents, err := opts.ListAgents()
+	if err != nil {
+		return nil, fmt.Errorf("standing: list agents: %w", err)
+	}
+	live := indexAgents(agents)
+
+	// Workspace is resolved from live evidence when reporting or creating
+	// tabs. Policy-only failures (AdmitRoute) must not require it, so unit
+	// tests can prove launch policy without a live herdr socket.
+	if opts.ResolveWorkspace != nil {
+		if ws, wsErr := opts.ResolveWorkspace(repoRoot, cfg); wsErr == nil {
+			result.Workspace = ws
+		} else if opts.Mode == ModeStatus || opts.Mode == ModeShutdown {
+			return nil, fmt.Errorf("standing: workspace: %w", wsErr)
+		} else {
+			// raise/dry-run: keep empty; resolve again before CreateTab.
+			result.Workspace = ""
+			opts = withDeferredWorkspace(opts, repoRoot, cfg, wsErr)
+		}
+	}
+
+	switch opts.Mode {
+	case ModeStatus:
+		return runStatus(result, lanes, live, repoRoot, opts)
+	case ModeShutdown:
+		return runShutdown(result, lanes, live, opts)
+	case ModeDryRun, ModeRaise:
+		return runRaise(result, cfg, lanes, live, repoRoot, opts)
+	default:
+		return nil, fmt.Errorf("standing: unknown mode %d", opts.Mode)
+	}
+}
+
+// withDeferredWorkspace stashes a prior resolution error so CreateTab still
+// fails closed when every policy check passed but workspace is unknown.
+func withDeferredWorkspace(opts Options, repoRoot string, cfg *config.Config, prior error) Options {
+	orig := opts.ResolveWorkspace
+	opts.ResolveWorkspace = func(rr string, c *config.Config) (string, error) {
+		if orig != nil {
+			if ws, err := orig(rr, c); err == nil && strings.TrimSpace(ws) != "" {
+				return ws, nil
+			}
+		}
+		if prior != nil {
+			return "", prior
+		}
+		return "", errors.New("standing: workspace unresolved")
+	}
+	return opts
+}
+
+func modeString(m Mode) string {
+	switch m {
+	case ModeDryRun:
+		return "dry-run"
+	case ModeStatus:
+		return "status"
+	case ModeShutdown:
+		return "shutdown"
+	default:
+		return "raise"
+	}
+}
+
+func runStatus(result *Result, lanes []config.LaneDef, live map[string]Agent, repoRoot string, opts Options) (*Result, error) {
+	var failures []error
+	for i := range lanes {
+		lane := lanes[i]
+		agentName := AgentName(lane.Name)
+		cwd, verr := ValidateLane(lane, repoRoot, opts.PromptReadable, opts.AbsPath)
+		rr := RoleResult{LaneName: lane.Name, AgentName: agentName, Role: lane.Role, CWD: cwd}
+		if verr != nil {
+			rr.Outcome = OutcomeFailed
+			rr.Reason = verr.Error()
+			result.Failed++
+			failures = append(failures, fmt.Errorf("%s: %w", lane.Name, verr))
+			result.Roles = append(result.Roles, rr)
+			continue
+		}
+		if a, ok := live[agentName]; ok && NameHeld(a.Status) {
+			rr.Outcome = OutcomeLive
+			rr.Reason = "status=" + a.Status
+			rr.TabID = a.TabID
+			rr.PaneID = a.PaneID
+			if a.Cwd != "" {
+				rr.CWD = a.Cwd
+			}
+			result.Live++
+		} else {
+			rr.Outcome = OutcomeMissing
+			rr.Reason = "not live — needs raising"
+			result.Missing++
+		}
+		result.Roles = append(result.Roles, rr)
+	}
+	return result, errors.Join(failures...)
+}
+
+func runShutdown(result *Result, lanes []config.LaneDef, live map[string]Agent, opts Options) (*Result, error) {
+	// Exact shutdown: only configured standing agent names. Ephemeral task
+	// workers (task-*, non-standing forge-*) are never selected.
+	standingNames := map[string]struct{}{}
+	for _, lane := range lanes {
+		standingNames[AgentName(lane.Name)] = struct{}{}
+	}
+	var failures []error
+	for _, lane := range lanes {
+		agentName := AgentName(lane.Name)
+		rr := RoleResult{LaneName: lane.Name, AgentName: agentName, Role: lane.Role}
+		a, ok := live[agentName]
+		if !ok || a.TabID == "" {
+			rr.Outcome = OutcomeMissing
+			rr.Reason = "not live"
+			result.Missing++
+			result.Roles = append(result.Roles, rr)
+			continue
+		}
+		rr.TabID = a.TabID
+		rr.PaneID = a.PaneID
+		// Active standing agents are preserved (same safety as herd stop)
+		// unless this is a pure close of settled sessions.
+		if isActive(a.Status) {
+			rr.Outcome = OutcomePreserved
+			rr.Reason = "active standing owner preserved; not destroyed"
+			result.Skipped++
+			result.Roles = append(result.Roles, rr)
+			continue
+		}
+		if opts.Mode == ModeShutdown && opts.CloseTab == nil {
+			// Should not happen for execute path; treat as would-close plan.
+			rr.Outcome = OutcomeWouldClose
+			rr.Reason = "settled standing owner"
+			result.Closed++
+			result.Roles = append(result.Roles, rr)
+			continue
+		}
+		// Dry-run of shutdown is expressed as ModeDryRun with a separate flag
+		// in the CLI; when CloseTab is nil we only plan.
+		if opts.CloseTab == nil {
+			rr.Outcome = OutcomeWouldClose
+			rr.Reason = "settled standing owner"
+			result.Closed++
+			result.Roles = append(result.Roles, rr)
+			continue
+		}
+		if err := opts.CloseTab(a.TabID); err != nil {
+			rr.Outcome = OutcomeFailed
+			rr.Reason = err.Error()
+			result.Failed++
+			failures = append(failures, fmt.Errorf("%s close: %w", agentName, err))
+			result.Roles = append(result.Roles, rr)
+			continue
+		}
+		rr.Outcome = OutcomeClosed
+		rr.Reason = "standing owner closed"
+		result.Closed++
+		result.Roles = append(result.Roles, rr)
+	}
+	_ = standingNames
+	return result, errors.Join(failures...)
+}
+
+func isActive(status string) bool {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "working", "starting":
+		return true
+	default:
+		return false
+	}
+}
+
+func runRaise(result *Result, cfg *config.Config, lanes []config.LaneDef, live map[string]Agent, repoRoot string, opts Options) (*Result, error) {
+	dry := opts.Mode == ModeDryRun
+	var failures []error
+
+	repository := ""
+	if opts.RepositoryIdentity != nil {
+		repository = opts.RepositoryIdentity(cfg)
+	}
+
+	for i := range lanes {
+		lane := &lanes[i]
+		agentName := AgentName(lane.Name)
+		rr := RoleResult{LaneName: lane.Name, AgentName: agentName, Role: lane.Role}
+
+		if a, ok := live[agentName]; ok && NameHeld(a.Status) {
+			rr.Outcome = OutcomeSkippedLive
+			rr.Reason = "already live status=" + a.Status
+			rr.TabID = a.TabID
+			rr.PaneID = a.PaneID
+			if a.Cwd != "" {
+				rr.CWD = a.Cwd
+			}
+			result.Skipped++
+			result.Roles = append(result.Roles, rr)
+			continue
+		}
+
+		// Route admission (role/shape/provider policy + live route) runs
+		// before local path validation so policy failures surface with
+		// their canonical errors and never touch herdr.
+		if opts.AdmitRoute == nil {
+			rr.Outcome = OutcomeFailed
+			rr.Reason = "route admitter is required"
+			result.Failed++
+			failures = append(failures, fmt.Errorf("%s: route admitter is required", lane.Name))
+			result.Roles = append(result.Roles, rr)
+			continue
+		}
+		route, routeErr := opts.AdmitRoute(lane)
+		if routeErr != nil {
+			rr.Outcome = OutcomeFailed
+			rr.Reason = "route blocked: " + routeErr.Error()
+			result.Failed++
+			failures = append(failures, fmt.Errorf("%s: %w", lane.Name, routeErr))
+			result.Roles = append(result.Roles, rr)
+			continue
+		}
+		if strings.TrimSpace(route.Provider) == "" || strings.TrimSpace(route.Model) == "" {
+			rr.Outcome = OutcomeFailed
+			rr.Reason = "route missing provider/model"
+			result.Failed++
+			failures = append(failures, fmt.Errorf("%s: route missing provider/model", lane.Name))
+			result.Roles = append(result.Roles, rr)
+			continue
+		}
+		rr.Provider = route.Provider
+		rr.Model = route.Model
+
+		cwd, verr := ValidateLane(*lane, repoRoot, opts.PromptReadable, opts.AbsPath)
+		if verr != nil {
+			rr.Outcome = OutcomeFailed
+			rr.Reason = verr.Error()
+			result.Failed++
+			failures = append(failures, fmt.Errorf("%s: %w", lane.Name, verr))
+			result.Roles = append(result.Roles, rr)
+			continue
+		}
+		rr.CWD = cwd
+
+		if dry {
+			rr.Outcome = OutcomePreview
+			rr.Reason = fmt.Sprintf("would start %s/%s cwd=%s", route.Provider, route.Model, cwd)
+			result.Previewed++
+			result.Roles = append(result.Roles, rr)
+			continue
+		}
+
+		if repository == "" {
+			rr.Outcome = OutcomeFailed
+			rr.Reason = "repository identity unavailable"
+			result.Failed++
+			failures = append(failures, fmt.Errorf("%s: repository identity unavailable", lane.Name))
+			result.Roles = append(result.Roles, rr)
+			continue
+		}
+
+		if opts.PrepareWorktree != nil {
+			if err := opts.PrepareWorktree(lane); err != nil {
+				rr.Outcome = OutcomeFailed
+				rr.Reason = "worktree: " + err.Error()
+				result.Failed++
+				failures = append(failures, fmt.Errorf("%s: %w", lane.Name, err))
+				result.Roles = append(result.Roles, rr)
+				continue
+			}
+		}
+
+		// Re-validate cwd after prepare: still not shared root, still isolated.
+		if _, err := ValidateLane(*lane, repoRoot, opts.PromptReadable, opts.AbsPath); err != nil {
+			rr.Outcome = OutcomeFailed
+			rr.Reason = err.Error()
+			result.Failed++
+			failures = append(failures, fmt.Errorf("%s: %w", lane.Name, err))
+			result.Roles = append(result.Roles, rr)
+			continue
+		}
+
+		if opts.CreateTab == nil || opts.StartAgent == nil {
+			rr.Outcome = OutcomeFailed
+			rr.Reason = "herdr raise seams are required"
+			result.Failed++
+			failures = append(failures, fmt.Errorf("%s: herdr raise seams are required", lane.Name))
+			result.Roles = append(result.Roles, rr)
+			continue
+		}
+
+		ws := result.Workspace
+		if strings.TrimSpace(ws) == "" {
+			if opts.ResolveWorkspace == nil {
+				rr.Outcome = OutcomeFailed
+				rr.Reason = "workspace resolver is required"
+				result.Failed++
+				failures = append(failures, fmt.Errorf("%s: workspace resolver is required", lane.Name))
+				result.Roles = append(result.Roles, rr)
+				continue
+			}
+			resolved, wsErr := opts.ResolveWorkspace(repoRoot, cfg)
+			if wsErr != nil || strings.TrimSpace(resolved) == "" {
+				reason := "workspace unresolved"
+				if wsErr != nil {
+					reason = wsErr.Error()
+				}
+				rr.Outcome = OutcomeFailed
+				rr.Reason = reason
+				result.Failed++
+				failures = append(failures, fmt.Errorf("%s: %s", lane.Name, reason))
+				result.Roles = append(result.Roles, rr)
+				continue
+			}
+			ws = resolved
+			result.Workspace = ws
+		}
+
+		tab, tabErr := opts.CreateTab(ws, agentName, cwd)
+		if tabErr != nil {
+			rr.Outcome = OutcomeFailed
+			rr.Reason = "create tab: " + tabErr.Error()
+			result.Failed++
+			failures = append(failures, fmt.Errorf("%s: %w", lane.Name, tabErr))
+			result.Roles = append(result.Roles, rr)
+			continue
+		}
+		rr.TabID = tab.ID
+		rr.PaneID = tab.PaneID
+
+		if err := opts.StartAgent(tab, agentName, route, lane, repository); err != nil {
+			// Partial launch: tab without a running agent must not orphan.
+			if opts.CloseTab != nil && tab.ID != "" {
+				if closeErr := opts.CloseTab(tab.ID); closeErr != nil {
+					err = errors.Join(err, fmt.Errorf("reconcile orphan tab %s: %w", tab.ID, closeErr))
+				}
+			}
+			rr.Outcome = OutcomeFailed
+			rr.Reason = "start agent: " + err.Error()
+			rr.TabID = ""
+			rr.PaneID = ""
+			result.Failed++
+			failures = append(failures, fmt.Errorf("%s: %w", lane.Name, err))
+			result.Roles = append(result.Roles, rr)
+			continue
+		}
+
+		promptBytes, readErr := os.ReadFile(lane.Prompt)
+		if readErr != nil {
+			// Agent is live with a held name; closing would destroy a raised
+			// owner. Report failure; status will show live for re-prompt.
+			rr.Outcome = OutcomeFailed
+			rr.Reason = "read prompt after start: " + readErr.Error()
+			result.Failed++
+			failures = append(failures, fmt.Errorf("%s: %w", lane.Name, readErr))
+			result.Roles = append(result.Roles, rr)
+			continue
+		}
+		promptText := strings.TrimSpace(string(promptBytes))
+		if promptText == "" {
+			rr.Outcome = OutcomeFailed
+			rr.Reason = "prompt file is empty"
+			result.Failed++
+			failures = append(failures, fmt.Errorf("%s: prompt file is empty", lane.Name))
+			result.Roles = append(result.Roles, rr)
+			continue
+		}
+		if opts.PromptAgent != nil {
+			if err := opts.PromptAgent(agentName, promptText); err != nil {
+				rr.Outcome = OutcomeFailed
+				rr.Reason = "prompt: " + err.Error()
+				result.Failed++
+				failures = append(failures, fmt.Errorf("%s: %w", lane.Name, err))
+				result.Roles = append(result.Roles, rr)
+				continue
+			}
+		}
+
+		rr.Outcome = OutcomeRaised
+		rr.Reason = fmt.Sprintf("%s/%s running", route.Provider, route.Model)
+		result.Raised++
+		// Reflect into live index so a second selection in the same run
+		// cannot double-raise the same name (repeated raise safety).
+		live[agentName] = Agent{Name: agentName, Status: "starting", TabID: tab.ID, PaneID: tab.PaneID, Cwd: cwd, Workspace: result.Workspace}
+		result.Roles = append(result.Roles, rr)
+	}
+
+	return result, errors.Join(failures...)
+}
+
+// Summary returns a one-line human report.
+func Summary(r *Result) string {
+	if r == nil {
+		return "herd-standing: empty result"
+	}
+	switch r.Mode {
+	case "status":
+		return fmt.Sprintf("herd-standing: status workspace=%s live=%d missing=%d failed=%d",
+			r.Workspace, r.Live, r.Missing, r.Failed)
+	case "shutdown":
+		return fmt.Sprintf("herd-standing: shutdown workspace=%s closed=%d preserved=%d missing=%d failed=%d",
+			r.Workspace, r.Closed, r.Skipped, r.Missing, r.Failed)
+	case "dry-run":
+		return fmt.Sprintf("herd-standing: DRY done workspace=%s previewed=%d skipped=%d failed=%d (nothing raised)",
+			r.Workspace, r.Previewed, r.Skipped, r.Failed)
+	default:
+		return fmt.Sprintf("herd-standing: done workspace=%s started=%d skipped=%d failed=%d",
+			r.Workspace, r.Raised, r.Skipped, r.Failed)
+	}
+}
