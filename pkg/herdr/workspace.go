@@ -15,6 +15,11 @@ type WorkspaceEntry struct {
 	WorkspaceID string `json:"workspace_id"`
 	Label       string `json:"label"`
 	Focused     bool   `json:"focused"`
+	// Cwd is the workspace's working directory, when herdr reports one.
+	// Absent from every fixture seen so far in this repo; consumers that
+	// match on it (e.g. pkg/feedback's workspace cascade) must treat an
+	// empty value as "no cwd match available", never as a match.
+	Cwd string `json:"cwd,omitempty"`
 }
 
 // WorkspaceList returns all herdr workspaces.
