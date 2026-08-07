@@ -167,15 +167,88 @@ func TestMutation_Redaction(t *testing.T) {
 
 func TestMutation_EnvironAppendBanned(t *testing.T) {
 	t.Setenv("XAI_API_KEY", "sk-parent-secret-must-not-leak")
-	env := ExactWorkerChildEnv([]string{"PATH=/usr/bin"}, []string{"XAI_API_KEY="})
+
+	// The caller supplies LIVE key material. Passing "XAI_API_KEY=" instead
+	// would be neutralised by last-key-wins before the scrub ever ran, which
+	// is why this test previously could not fail: deleting the force-empty
+	// loop in ExactWorkerChildEnv left the whole suite green.
+	env := ExactWorkerChildEnv(
+		[]string{"PATH=/usr/bin"},
+		[]string{
+			"XAI_API_KEY=sk-caller-supplied-must-be-scrubbed",
+			"OPENAI_API_KEY=sk-proj-also-scrubbed",
+			"ANTHROPIC_API_KEY=sk-ant-also-scrubbed",
+			"HERD_HOST_CREDS=Bearer smuggled-through-override",
+			"HERD_HOSTCREDS_HANDLES=op://vault/item/field",
+		},
+	)
 	if err := assertExactEnvNoSecrets(env); err != nil {
 		t.Fatal(err)
 	}
-	for _, e := range env {
-		if strings.Contains(e, "sk-parent") {
-			t.Fatal("MUTATION: parent secret in exact env")
+	for _, k := range []string{
+		"XAI_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY",
+		"HERD_HOST_CREDS", "HERD_HOSTCREDS_HANDLES",
+	} {
+		if got := envValue(env, k); got != "" {
+			t.Fatalf("MUTATION: %s not scrubbed, got %q", k, got)
 		}
 	}
+	for _, e := range env {
+		if strings.Contains(e, "sk-parent") || strings.Contains(e, "scrubbed") ||
+			strings.Contains(e, "smuggled") || strings.Contains(e, "op://") {
+			t.Fatalf("MUTATION: secret material survived in exact env: %q", e)
+		}
+	}
+}
+
+// The isolated HOME reported on LiveProof must be the HOME the child actually
+// receives. HarnessProxyEnv carries a blanket "HOME=" to hide host auth files,
+// so an isolated HOME supplied before it is silently zeroed by last-key-wins.
+func TestMutation_IsolatedHOMEActuallyApplied(t *testing.T) {
+	v := NewTestCredentialVault()
+	_ = v.InstallTestSecret("api.x.ai", "Bearer x")
+	sess, err := StartHostCredsSession(SessionConfig{Kind: "grok", SessionID: "m-home", Authority: v})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sess.Close()
+
+	homeDir := t.TempDir()
+
+	// Precondition: WorkerEnv really does carry a blanket HOME= that would win
+	// if the isolated HOME were supplied before it. If this stops holding, the
+	// ordering this test guards no longer exists and the test must be revisited.
+	bad := ExactWorkerChildEnv([]string{"HOME=" + homeDir}, sess.WorkerEnv())
+	if envValue(bad, "HOME") == homeDir {
+		t.Fatal("precondition gone: WorkerEnv no longer overrides HOME; " +
+			"this test no longer guards the ordering it was written for")
+	}
+
+	// The real live composition must apply the isolated HOME.
+	cap, err := NewCapability(sess.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	env := liveChildEnv(sess, cap, homeDir)
+	if got := envValue(env, "HOME"); got != homeDir {
+		t.Fatalf("liveChildEnv did not apply isolated HOME: got %q want %q", got, homeDir)
+	}
+	if n := countEnvKey(env, "HOME"); n != 1 {
+		t.Fatalf("HOME appears %d times; child env must have no duplicate keys", n)
+	}
+	if err := assertExactEnvNoSecrets(env); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func countEnvKey(env []string, key string) int {
+	n := 0
+	for _, e := range env {
+		if i := strings.IndexByte(e, '='); i > 0 && e[:i] == key {
+			n++
+		}
+	}
+	return n
 }
 
 func TestMutation_HelperProbeNotAdmission(t *testing.T) {

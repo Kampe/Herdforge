@@ -178,15 +178,15 @@ func StartAuthorLive(cfg LiveConfig) (*HostCredsSession, *exec.Cmd, *LiveProof, 
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 
-	childEnv := ExactWorkerChildEnv(
-		[]string{"PATH=" + os.Getenv("PATH"), "LANG=C", "HOME=" + homeDir},
-		sess.WorkerEnv(),
-		CapabilityEnv(cap),
-		[]string{
-			"CODEX_HOME=" + filepath.Join(homeDir, "codex-empty"),
-			"HERD_HOSTCREDS_CLAIM_FD=3",
-		},
-	)
+	childEnv := liveChildEnv(sess, cap, homeDir)
+	// The reported isolation must be the applied isolation.
+	if envValue(childEnv, "HOME") != homeDir {
+		cancel()
+		_ = claimFD.Close()
+		_ = os.RemoveAll(homeDir)
+		_ = sess.Close()
+		return nil, nil, proof, &BlockedError{Reason: BlockSecretExposure, Code: "home_isolation_not_applied"}
+	}
 	if err := assertExactEnvNoSecrets(childEnv); err != nil {
 		cancel()
 		_ = claimFD.Close()
@@ -361,6 +361,42 @@ func StartAuthorLive(cfg LiveConfig) (*HostCredsSession, *exec.Cmd, *LiveProof, 
 
 func scrubAndMergeEnv(parent, worker []string) []string {
 	return ExactWorkerChildEnv(parent, worker)
+}
+
+// liveChildEnv composes the exact environ handed to a live author child.
+//
+// Extracted so the ordering is testable: StartAuthorLive itself is unreachable
+// until FAC-169 lands, so a bug in this composition could not otherwise be
+// caught by any test.
+//
+// HOME must be in the LAST group. ExactWorkerChildEnv is last-key-wins and
+// sess.WorkerEnv() (HarnessProxyEnv) carries a blanket "HOME=" to hide host
+// auth files. Supplying the isolated HOME in the first group left the child
+// with an empty HOME while LiveProof.IsolatedHOME advertised the temp dir —
+// evidence for an isolation that was never applied.
+func liveChildEnv(sess *HostCredsSession, cap Capability, homeDir string) []string {
+	return ExactWorkerChildEnv(
+		[]string{"PATH=" + os.Getenv("PATH"), "LANG=C"},
+		sess.WorkerEnv(),
+		CapabilityEnv(cap),
+		[]string{
+			"HOME=" + homeDir,
+			"CODEX_HOME=" + filepath.Join(homeDir, "codex-empty"),
+			"HERD_HOSTCREDS_CLAIM_FD=3",
+		},
+	)
+}
+
+// envValue returns the effective value of key in an environ slice, honouring
+// last-key-wins (the same rule ExactWorkerChildEnv applies).
+func envValue(env []string, key string) string {
+	out := ""
+	for _, e := range env {
+		if i := strings.IndexByte(e, '='); i > 0 && e[:i] == key {
+			out = e[i+1:]
+		}
+	}
+	return out
 }
 
 func truncateLive(s string, n int) string {
