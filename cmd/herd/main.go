@@ -157,6 +157,9 @@ func main() {
 	case "watch":
 		runWatch()
 
+	case "fresh-build":
+		runFreshBuild()
+
 	case "shot":
 		runShot()
 
@@ -334,6 +337,7 @@ func printUsage() {
 	fmt.Println("  seed-lane-state   Restore or seed a lane's state artifacts (never overwrites)")
 	fmt.Println("  spin         Detect stalled (frozen output) and spinning (no git delta) panes")
 	fmt.Println("  watch        Fire the moment an agent settles; --stream feeds harvest triggers")
+	fmt.Println("  fresh-build  Prove cross-package build errors are real (not stale dist)")
 	fmt.Println("  shot         Run one bounded task headless through the quota router")
 	fmt.Println("  scope        Publish the trusted task scope the dispatch fence resolves against")
 	fmt.Println("  review-classify   Deterministic R0-R3 risk floor for review dispatch")
