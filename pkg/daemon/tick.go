@@ -33,10 +33,12 @@ var ErrDaemonPrep = errors.New("daemon: launch preparation refused before claim"
 
 // WorkerLauncher is the Herdr surface the daemon tick uses after a fenced claim.
 // Production wires dispatch.LiveHerdr (or an adapter that embeds it). Tests inject fakes.
+// TabCreateForTask matches dispatch.HerdrLauncher / LiveHerdr: optional env is
+// the confinement/seatbelt seat (FAC-190); callers may pass zero env vars.
 type WorkerLauncher interface {
 	Available() bool
 	RequireWorkspace(repoRoot string) (string, error)
-	TabCreateForTask(workspaceID, label, cwd string, noFocus bool) (*herdr.TabInfo, error)
+	TabCreateForTask(workspaceID, label, cwd string, noFocus bool, env ...string) (*herdr.TabInfo, error)
 	AgentStart(req launch.Request, name, kind, paneID string) error
 	DeliverAndProve(target, text string, timeout time.Duration) (*herdr.PromptReceipt, error)
 	TabClose(tabID string) error
