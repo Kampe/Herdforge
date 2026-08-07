@@ -1119,8 +1119,15 @@ func LaneAgentArgs(model string) []string {
 	return []string{"--model", model}
 }
 
-// AgentPrompt sends a prompt to a running agent. If wait is true, blocks for response.
+// AgentPrompt sends a prompt to a running agent via direct process argv.
+// The free-form text is always one argv element — never shell-concatenated
+// (FAC-183). If wait is true, herdr blocks until a settled state is observed.
+// Prefer DeliverOperator (or herd herdr-deliver --file) when a durable
+// content digest / readback receipt is required.
 func AgentPrompt(target, text string, wait bool) (string, error) {
+	if strings.IndexByte(text, 0) >= 0 {
+		return "", fmt.Errorf("herdr agent prompt: payload contains NUL")
+	}
 	args := []string{"agent", "prompt", target, text}
 	if wait {
 		args = append(args, "--wait")

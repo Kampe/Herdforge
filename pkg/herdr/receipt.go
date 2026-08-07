@@ -17,6 +17,9 @@ type PromptReceipt struct {
 	Verified       bool          `json:"verified"`
 	Duration       time.Duration `json:"duration"`
 	SequenceToken  string        `json:"sequence_token"` // baseline->final for outbox correlation
+	// SawWorking is true when working was observed during this delivery, or
+	// baseline was already working. Required for done to count as proof.
+	SawWorking bool `json:"saw_working,omitempty"`
 }
 
 // ConsumptionProven reports whether observed status proves the prompt was
@@ -97,6 +100,7 @@ func DeliverAndProve(target, text string, timeout time.Duration) (*PromptReceipt
 					Verified:       true,
 					Duration:       time.Since(start),
 					SequenceToken:  sequenceToken(baseline, st),
+					SawWorking:     sawWorking,
 				}, nil
 			}
 		}
@@ -114,6 +118,7 @@ func DeliverAndProve(target, text string, timeout time.Duration) (*PromptReceipt
 		Verified:       false,
 		Duration:       time.Since(start),
 		SequenceToken:  sequenceToken(baseline, last),
+		SawWorking:     sawWorking,
 	}, fmt.Errorf("agent %q never confirmed prompt-correlated consumption (baseline %q last %q; working→working/done→done and a bare idle→done are not proof)", target, baseline, last)
 }
 
