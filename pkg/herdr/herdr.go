@@ -297,9 +297,29 @@ func bindToolChildLifecycle(paneID, name string, req launch.Request) error {
 	if lc == nil {
 		return nil
 	}
-	agents, err := AgentList()
-	if err != nil {
-		return fmt.Errorf("tool-child owner lookup: %w", err)
+	// Herdr populates an agent's session id asynchronously AFTER `agent start`
+	// returns, so an immediate lookup finds the agent with an empty session,
+	// the exact-match loop below skips it, and an otherwise healthy launch dies
+	// as "tool-child owner identity unavailable". Poll briefly for the exact
+	// agent to become fully described.
+	var agents []AgentEntry
+	var err error
+	for attempt := 0; attempt < 20; attempt++ {
+		agents, err = AgentList()
+		if err != nil {
+			return fmt.Errorf("tool-child owner lookup: %w", err)
+		}
+		ready := false
+		for _, a := range agents {
+			if a.Name == name && a.PaneID == paneID && a.Session.Value != "" {
+				ready = true
+				break
+			}
+		}
+		if ready {
+			break
+		}
+		time.Sleep(500 * time.Millisecond)
 	}
 	sessionGeneration := req.SessionGeneration
 	if sessionGeneration <= 0 {

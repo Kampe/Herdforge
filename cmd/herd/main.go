@@ -45,6 +45,8 @@ import (
 	"github.com/Kampe/Herdforge/pkg/resources"
 	"github.com/Kampe/Herdforge/pkg/review"
 	"github.com/Kampe/Herdforge/pkg/router"
+	"github.com/Kampe/Herdforge/pkg/scopeauth"
+	"github.com/Kampe/Herdforge/pkg/scopefence"
 	"github.com/Kampe/Herdforge/pkg/selftest"
 	"github.com/Kampe/Herdforge/pkg/store"
 	hsync "github.com/Kampe/Herdforge/pkg/sync"
@@ -140,6 +142,9 @@ func main() {
 
 	case "shot":
 		runShot()
+
+	case "scope":
+		runScope()
 
 	case "review-classify":
 		runReviewClassify()
@@ -306,6 +311,7 @@ func printUsage() {
 	fmt.Println("  spin         Detect stalled (frozen output) and spinning (no git delta) panes")
 	fmt.Println("  watch        Fire the moment an agent settles; --stream feeds harvest triggers")
 	fmt.Println("  shot         Run one bounded task headless through the quota router")
+	fmt.Println("  scope        Publish the trusted task scope the dispatch fence resolves against")
 	fmt.Println("  review-classify   Deterministic R0-R3 risk floor for review dispatch")
 	fmt.Println("  review-ingest     Validate reviewer verdicts and admit them to the ledger")
 	fmt.Println("  harvest-merge     Cherry-pick a lane's reviewed commits onto a fresh base")
@@ -2085,7 +2091,19 @@ func runDispatch() {
 	}
 
 	wm := resolveCanonicalWorktreeManager()
-	d := dispatch.NewProductionDispatcher(cfg, tp, wm)
+	// NewProductionDispatcher alone leaves the scope fence unauthorised, which
+	// rejected EVERY production dispatch with "FAC-169 authority surface is not
+	// present". pkg/scopeauth verifies receipt/payload consistency so the fence
+	// can be constructed. Read its package doc: it does NOT authenticate the
+	// issuer, so FAC-169 remains open.
+	//
+	// expectedRevision is the DEPS graph revision (a hash of board edges and
+	// prerequisite statuses), not a git commit, and it must equal the revision
+	// the published graph snapshot carries. herd scope publish prints it.
+	scopeVerifier := scopeauth.New()
+	expectedRevision, expectedFiles := publishedGraphBinding(".")
+	d := dispatch.NewProductionDispatcherWithAuthorities(cfg, tp, wm,
+		scopeVerifier, scopeVerifier, expectedRevision, expectedFiles)
 	closeControl, err := configureProductionControl(d, ".")
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "control store init failed: %v\n", err)
@@ -4618,4 +4636,24 @@ func runDrainSelftest() int {
 		return 1
 	}
 	return 0
+}
+
+// publishedGraphBinding reads the graph snapshot the coordinator published so
+// the dispatcher binds to exactly what scopefence will resolve against. A
+// mismatch here is rejected as "trusted graph snapshot rejected", so deriving
+// both sides from the same stored row is the only way they cannot disagree.
+func publishedGraphBinding(root string) (string, int) {
+	store, err := scopefence.NewSQLiteStore(filepath.Join(root, ".herd", "scopefence.db"))
+	if err != nil {
+		return "", 0
+	}
+	repository, err := dispatch.AuthenticatedRepositoryIdentity(root)
+	if err != nil {
+		return "", 0
+	}
+	graph, err := store.ReadGraphSnapshot(context.Background(), repository)
+	if err != nil {
+		return "", 0
+	}
+	return graph.Revision, graph.Files
 }
