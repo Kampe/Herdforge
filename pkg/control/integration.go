@@ -123,7 +123,13 @@ func (w HerdrWaker) Wake(ctx context.Context, req WakeRequest) (WakeReceipt, err
 	if req.Target != w.Target {
 		return WakeReceipt{}, ErrStaleIdentity
 	}
-	if w.Target.Target == "" || w.Target.Workspace == "" || w.Target.TabID == "" || w.Target.PaneID == "" || w.Target.AgentName == "" || w.Target.Provider == "" || w.Target.SessionID == "" || w.Target.LeaseGeneration <= 0 {
+	// Target/workspace/tab/pane/agent/provider plus a positive lease generation
+	// IS the exact addressable identity — herdr resolves a pane from those
+	// alone. SessionID is provenance only some kinds report: grok starts
+	// healthy and interactive_ready without one, so requiring it here rejected
+	// every non-claude wake and was the third place this same false assumption
+	// ("every agent kind has a session id") was encoded.
+	if w.Target.Target == "" || w.Target.Workspace == "" || w.Target.TabID == "" || w.Target.PaneID == "" || w.Target.AgentName == "" || w.Target.Provider == "" || w.Target.LeaseGeneration <= 0 {
 		return WakeReceipt{}, fmt.Errorf("control: exact Herdr target is required")
 	}
 	if w.Validate == nil {

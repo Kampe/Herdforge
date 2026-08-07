@@ -2215,7 +2215,10 @@ func configureProductionControl(d *dispatch.Dispatcher, root string) (func() err
 				return control.WakeTarget{}, err
 			}
 			for _, a := range agents {
-				if a.TabID == target.TabID && a.PaneID == target.PaneID && a.Name == target.AgentName && a.Workspace == target.Workspace && a.Kind == target.Provider && a.Session.Value != "" {
+				// Fourth and last copy of "every agent kind reports a session
+				// id", which is false: grok never does. Tab/pane/name/
+				// workspace/kind is the exact identity herdr guarantees.
+				if a.TabID == target.TabID && a.PaneID == target.PaneID && a.Name == target.AgentName && a.Workspace == target.Workspace && a.Kind == target.Provider {
 					target.SessionID = a.Session.Value
 					return target, nil
 				}

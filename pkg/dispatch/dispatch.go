@@ -133,7 +133,12 @@ func (LiveHerdr) ReadControlTarget(target control.WakeTarget) (control.WakeTarge
 		return control.WakeTarget{}, err
 	}
 	for _, a := range agents {
-		if a.TabID == target.TabID && a.PaneID == target.PaneID && a.Name == target.AgentName && a.Workspace == target.Workspace && a.Kind == target.Provider && a.Session.Value != "" {
+		// Tab, pane, name, workspace and kind are the exact identity herdr
+		// guarantees for every agent kind. A session id is provenance that
+		// only some surfaces report — grok never does — so requiring it here
+		// rejected every non-claude launch as "no longer current" moments
+		// after it started healthy.
+		if a.TabID == target.TabID && a.PaneID == target.PaneID && a.Name == target.AgentName && a.Workspace == target.Workspace && a.Kind == target.Provider {
 			target.SessionID = a.Session.Value
 			return target, nil
 		}
