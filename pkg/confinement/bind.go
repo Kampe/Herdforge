@@ -47,15 +47,15 @@ type Binding struct {
 	ProofNonce       string     `json:"proof_nonce"`
 	// ProofMACHex is the issuer MAC over the AuthTuple (hex), so receipts are
 	// not forgeable from public fields alone.
-	ProofMACHex   string    `json:"proof_mac"`
-	OSBackend     string    `json:"os_backend"`
-	OSProved      bool      `json:"os_proved"`
-	AgentWrapped  bool      `json:"agent_wrapped"`
-	ProfilePath   string    `json:"profile_path,omitempty"`
-	ProfileDigest string    `json:"profile_digest,omitempty"`
-	WrapperBinDir string    `json:"wrapper_bin_dir,omitempty"`
-	WrapperNames  []string  `json:"wrapper_names,omitempty"`
-	ReceiptDigest string    `json:"receipt_digest"`
+	ProofMACHex   string   `json:"proof_mac"`
+	OSBackend     string   `json:"os_backend"`
+	OSProved      bool     `json:"os_proved"`
+	AgentWrapped  bool     `json:"agent_wrapped"`
+	ProfilePath   string   `json:"profile_path,omitempty"`
+	ProfileDigest string   `json:"profile_digest,omitempty"`
+	WrapperBinDir string   `json:"wrapper_bin_dir,omitempty"`
+	WrapperNames  []string `json:"wrapper_names,omitempty"`
+	ReceiptDigest string   `json:"receipt_digest"`
 	// ReceiptMACHex authenticates the receipt with the same HMAC issuer.
 	ReceiptMACHex string    `json:"receipt_mac"`
 	CreatedAt     time.Time `json:"created_at"`

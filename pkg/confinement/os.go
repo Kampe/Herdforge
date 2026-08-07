@@ -22,23 +22,21 @@ var ErrOSProbeFailed = errors.New("confinement: OS write confinement probe faile
 
 // OSBackend isolates helper children that exercise write paths and installs
 // the durable agent wrapper that production launches must place first on PATH.
+//
+// Session material (profile + wrappers) MUST be installed outside the worktree
+// write grant — see SessionPaths / NewSessionPaths.
 type OSBackend interface {
 	Name() string
 	Available() bool
-	// Prepare writes the durable seatbelt profile under the worktree and
-	// returns its absolute path. First-match safe: worktree + this worktree's
-	// gitdir + temp + network are granted; shared-root residual paths are not.
-	Prepare(worktree, sharedRoot string) (profilePath string, err error)
-	// ProveWriteDenials runs children under profilePath: denies shared-root
-	// residual writes, allows in-worktree and linked-gitdir writes. Never
-	// creates directories under sharedRoot.
-	ProveWriteDenials(worktree, sharedRoot, profilePath string) error
+	// Prepare writes the seatbelt profile to session.Profile (outside worktree).
+	Prepare(worktree, sharedRoot, branch string, session SessionPaths) (profilePath string, err error)
+	// ProveWriteDenials runs children under profilePath. Also proves the
+	// confined process cannot rewrite session.Profile (integrity store).
+	ProveWriteDenials(worktree, sharedRoot, profilePath string, session SessionPaths) error
 	// Wrap rewrites cmd to run under sandbox-exec with the prepared profile.
 	Wrap(cmd *exec.Cmd, profilePath string) error
-	// InstallAgentWrappers installs PATH-first wrappers for every name in
-	// `names` (provider and/or argv[0] basenames) that re-exec the real agent
-	// under the same profile used by ProveWriteDenials.
-	InstallAgentWrappers(worktree, profilePath string, names []string, realAgentPath string) (binDir string, err error)
+	// InstallAgentWrappers installs PATH-first wrappers into session.BinDir.
+	InstallAgentWrappers(session SessionPaths, profilePath string, names []string, realAgentPath string) (binDir string, err error)
 }
 
 // ActiveOS returns a live backend or nil when none is usable.
@@ -70,32 +68,30 @@ type FakeOS struct {
 func (f *FakeOS) Name() string    { return "fake-os" }
 func (f *FakeOS) Available() bool { return true }
 
-func (f *FakeOS) Prepare(worktree, sharedRoot string) (string, error) {
-	if strings.TrimSpace(worktree) == "" {
+func (f *FakeOS) Prepare(worktree, sharedRoot, branch string, session SessionPaths) (string, error) {
+	if strings.TrimSpace(worktree) == "" || session.Profile == "" {
 		return "", ErrOSProbeFailed
 	}
-	// Fake profile still encodes grants so digest/bind tests have real content.
 	body := "(version 1)\n(deny default)\n(allow file-write* (subpath \"" + worktree + "\"))\n"
 	if sharedRoot != "" {
 		body += "; shared=" + sharedRoot + "\n"
 	}
-	dir := filepath.Join(worktree, ".herd", "confine")
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if branch != "" {
+		body += "; branch=" + branch + "\n"
+	}
+	if err := os.MkdirAll(filepath.Dir(session.Profile), 0o755); err != nil {
 		return "", err
 	}
-	path := filepath.Join(dir, "profile.sb")
-	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+	if err := os.WriteFile(session.Profile, []byte(body), 0o644); err != nil {
 		return "", err
 	}
-	return path, nil
+	return session.Profile, nil
 }
 
-func (f *FakeOS) ProveWriteDenials(worktree, sharedRoot, profilePath string) error {
+func (f *FakeOS) ProveWriteDenials(worktree, sharedRoot, profilePath string, session SessionPaths) error {
 	if strings.TrimSpace(worktree) == "" || strings.TrimSpace(profilePath) == "" {
 		return ErrOSProbeFailed
 	}
-	// Non-vacuous without sandbox-exec: profile must exist and look like a
-	// write-confine profile, and must not grant the entire shared root.
 	data, err := os.ReadFile(profilePath)
 	if err != nil || len(data) == 0 {
 		return fmt.Errorf("%w: empty or missing profile", ErrOSProbeFailed)
@@ -105,7 +101,6 @@ func (f *FakeOS) ProveWriteDenials(worktree, sharedRoot, profilePath string) err
 		return fmt.Errorf("%w: profile missing deny-default write policy", ErrOSProbeFailed)
 	}
 	if sharedRoot != "" {
-		// Match either raw or cleaned absolute forms of the shared root grant.
 		abs, _ := filepath.Abs(sharedRoot)
 		for _, root := range []string{sharedRoot, abs, filepath.Clean(sharedRoot)} {
 			if root == "" {
@@ -115,6 +110,12 @@ func (f *FakeOS) ProveWriteDenials(worktree, sharedRoot, profilePath string) err
 			if strings.Contains(body, grant) {
 				return fmt.Errorf("%w: profile grants whole shared root", ErrOSProbeFailed)
 			}
+		}
+	}
+	// Integrity store must be outside worktree.
+	if session.Root != "" {
+		if isPathPrefix(session.Root, worktree) || session.Root == worktree {
+			return fmt.Errorf("%w: session dir is inside worktree", ErrOSProbeFailed)
 		}
 	}
 	f.Proved = true
@@ -129,31 +130,26 @@ func (f *FakeOS) Wrap(cmd *exec.Cmd, profilePath string) error {
 	return nil
 }
 
-func (f *FakeOS) InstallAgentWrappers(worktree, profilePath string, names []string, realAgentPath string) (string, error) {
-	if len(names) == 0 || profilePath == "" {
-		return "", fmt.Errorf("confinement: wrapper names and profile required")
+func (f *FakeOS) InstallAgentWrappers(session SessionPaths, profilePath string, names []string, realAgentPath string) (string, error) {
+	if len(names) == 0 || profilePath == "" || session.BinDir == "" {
+		return "", fmt.Errorf("confinement: wrapper names, profile, and session bin required")
 	}
-	binDir := filepath.Join(worktree, ".herd", "confine", "bin")
-	if err := os.MkdirAll(binDir, 0o755); err != nil {
+	if err := os.MkdirAll(session.BinDir, 0o755); err != nil {
 		return "", err
 	}
 	digest, _ := ProfileDigest(profilePath)
-	// Embed path + content digest so VerifyAgentWrappers binds install to prove.
-	body := "#!/bin/sh\n# profile=" + profilePath + "\n# profile_digest=" + digest + "\nexec " + shellSingleArg(realAgentPath) + " \"$@\"\n"
-	if realAgentPath == "" {
-		body = "#!/bin/sh\n# profile=" + profilePath + "\n# profile_digest=" + digest + "\nexit 0\n"
-	}
+	body := wrapperScript(profilePath, digest, realAgentPath, true)
 	for _, name := range names {
 		name = strings.TrimSpace(name)
 		if name == "" || strings.Contains(name, string(filepath.Separator)) {
 			return "", fmt.Errorf("confinement: invalid wrapper name %q", name)
 		}
-		if err := os.WriteFile(filepath.Join(binDir, name), []byte(body), 0o755); err != nil {
+		if err := os.WriteFile(filepath.Join(session.BinDir, name), []byte(body), 0o755); err != nil {
 			return "", err
 		}
 	}
-	f.BinDir = binDir
-	return binDir, nil
+	f.BinDir = session.BinDir
+	return session.BinDir, nil
 }
 
 // DarwinSeatbelt uses macOS sandbox-exec with a deny-default file-write profile
@@ -166,9 +162,12 @@ func (DarwinSeatbelt) Available() bool {
 	return err == nil
 }
 
-func (d DarwinSeatbelt) Prepare(worktree, sharedRoot string) (string, error) {
+func (d DarwinSeatbelt) Prepare(worktree, sharedRoot, branch string, session SessionPaths) (string, error) {
 	if !d.Available() {
 		return "", ErrOSUnavailable
+	}
+	if session.Profile == "" || session.Root == "" {
+		return "", fmt.Errorf("confinement: session paths required")
 	}
 	absWT, err := realPath(worktree)
 	if err != nil {
@@ -181,6 +180,17 @@ func (d DarwinSeatbelt) Prepare(worktree, sharedRoot string) (string, error) {
 			return "", err
 		}
 	}
+	absSession, err := realPath(session.Root)
+	if err != nil {
+		// Session root may be newly created; resolve parent and join base.
+		absSession, err = filepath.Abs(session.Root)
+		if err != nil {
+			return "", err
+		}
+	}
+	if isPathPrefix(absSession, absWT) || absSession == absWT {
+		return "", fmt.Errorf("confinement: session root must be outside worktree")
+	}
 	gitDir, err := absoluteGitDir(absWT)
 	if err != nil {
 		return "", fmt.Errorf("confinement: resolve worktree gitdir: %w", err)
@@ -189,14 +199,13 @@ func (d DarwinSeatbelt) Prepare(worktree, sharedRoot string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("confinement: resolve git common-dir: %w", err)
 	}
-	// Never grant the entire shared checkout as a write root.
 	if absShared != "" && (gitDir == absShared || commonDir == absShared) {
 		return "", fmt.Errorf("confinement: refusing profile that would grant whole shared root")
 	}
-	return writeSeatbeltProfile(absWT, gitDir, commonDir)
+	return writeSeatbeltProfile(absWT, gitDir, commonDir, branch, session.Profile)
 }
 
-func (d DarwinSeatbelt) ProveWriteDenials(worktree, sharedRoot, profilePath string) error {
+func (d DarwinSeatbelt) ProveWriteDenials(worktree, sharedRoot, profilePath string, session SessionPaths) error {
 	if !d.Available() {
 		return ErrOSUnavailable
 	}
@@ -246,6 +255,11 @@ func (d DarwinSeatbelt) ProveWriteDenials(worktree, sharedRoot, profilePath stri
 			return fmt.Errorf("%w: sibling write succeeded", ErrOSProbeFailed)
 		}
 	}
+	// Unconditional re-stat (same shape as outside/incident probes).
+	if _, err := os.Stat(sibling); err == nil {
+		_ = os.Remove(sibling)
+		return fmt.Errorf("%w: sibling inode created", ErrOSProbeFailed)
+	}
 
 	// Denied: FAC-188 incident path under the real shared root (no MkdirAll).
 	// Parent shared root already exists; tee cannot create intermediate dirs.
@@ -273,6 +287,9 @@ func (d DarwinSeatbelt) ProveWriteDenials(worktree, sharedRoot, profilePath stri
 	}
 
 	// Allowed: write inside the authenticated worktree.
+	if err := os.MkdirAll(filepath.Join(absWT, ".herd"), 0o755); err != nil {
+		return err
+	}
 	inside := filepath.Join(absWT, ".herd", "confine-probe-ok")
 	_ = os.Remove(inside)
 	if err := d.writeUnder(profilePath, absWT, inside, "ok\n"); err != nil {
@@ -323,6 +340,28 @@ func (d DarwinSeatbelt) ProveWriteDenials(worktree, sharedRoot, profilePath stri
 		if _, err := os.Stat(hook); err == nil {
 			_ = os.Remove(hook)
 			return fmt.Errorf("%w: git hook inode created", ErrOSProbeFailed)
+		}
+	}
+
+	// CRITICAL: confined process must not rewrite the integrity store.
+	if session.Profile != "" {
+		poison := filepath.Join(filepath.Dir(session.Profile), "poison-probe.sb")
+		_ = os.Remove(poison)
+		if err := d.writeUnder(profilePath, absWT, session.Profile, "(allow default)\n"); err == nil {
+			// If write "succeeded", check whether profile bytes actually changed.
+			if data, rerr := os.ReadFile(session.Profile); rerr == nil && strings.Contains(string(data), "allow default") && !strings.Contains(string(data), "deny default") {
+				return fmt.Errorf("%w: confined process rewrote session profile", ErrOSProbeFailed)
+			}
+		}
+		if err := d.writeUnder(profilePath, absWT, poison, "x\n"); err == nil {
+			if _, statErr := os.Stat(poison); statErr == nil {
+				_ = os.Remove(poison)
+				return fmt.Errorf("%w: confined process wrote into session dir", ErrOSProbeFailed)
+			}
+		}
+		if _, err := os.Stat(poison); err == nil {
+			_ = os.Remove(poison)
+			return fmt.Errorf("%w: session-dir inode created", ErrOSProbeFailed)
 		}
 	}
 	return nil
@@ -388,16 +427,12 @@ func (d DarwinSeatbelt) Wrap(cmd *exec.Cmd, profilePath string) error {
 	return nil
 }
 
-func (d DarwinSeatbelt) InstallAgentWrappers(worktree, profilePath string, names []string, realAgentPath string) (string, error) {
+func (d DarwinSeatbelt) InstallAgentWrappers(session SessionPaths, profilePath string, names []string, realAgentPath string) (string, error) {
 	if !d.Available() {
 		return "", ErrOSUnavailable
 	}
-	if len(names) == 0 || strings.TrimSpace(profilePath) == "" {
-		return "", fmt.Errorf("confinement: wrapper names and profile required")
-	}
-	absWT, err := realPath(worktree)
-	if err != nil {
-		return "", err
+	if len(names) == 0 || strings.TrimSpace(profilePath) == "" || session.BinDir == "" {
+		return "", fmt.Errorf("confinement: wrapper names, profile, and session bin required")
 	}
 	absProfile, err := realPath(profilePath)
 	if err != nil {
@@ -420,27 +455,48 @@ func (d DarwinSeatbelt) InstallAgentWrappers(worktree, profilePath string, names
 		return "", err
 	}
 	real = resolved
-	binDir := filepath.Join(absWT, ".herd", "confine", "bin")
-	if err := os.MkdirAll(binDir, 0o755); err != nil {
+	if err := os.MkdirAll(session.BinDir, 0o755); err != nil {
 		return "", err
 	}
 	digest, err := ProfileDigest(absProfile)
 	if err != nil {
 		return "", err
 	}
-	// Pure argv re-exec. Path + content digest bind wrapper to proved profile.
-	script := fmt.Sprintf("#!/bin/sh\n# FAC-190 agent wrap\n# profile=%s\n# profile_digest=%s\nexec /usr/bin/sandbox-exec -f %s %s \"$@\"\n",
-		absProfile, digest, shellSingleArg(absProfile), shellSingleArg(real))
+	script := wrapperScript(absProfile, digest, real, false)
 	for _, name := range names {
 		name = strings.TrimSpace(name)
 		if name == "" || strings.Contains(name, string(filepath.Separator)) {
 			return "", fmt.Errorf("confinement: invalid wrapper name %q", name)
 		}
-		if err := os.WriteFile(filepath.Join(binDir, name), []byte(script), 0o755); err != nil {
+		if err := os.WriteFile(filepath.Join(session.BinDir, name), []byte(script), 0o755); err != nil {
 			return "", err
 		}
 	}
-	return binDir, nil
+	return session.BinDir, nil
+}
+
+// wrapperScript emits a shell wrapper that re-checks profile digest at exec
+// time (not merely comments) before sandbox-exec.
+func wrapperScript(profilePath, digest, realAgent string, fake bool) string {
+	if fake {
+		if realAgent == "" {
+			return "#!/bin/sh\n# profile=" + profilePath + "\n# profile_digest=" + digest + "\nexit 0\n"
+		}
+		return "#!/bin/sh\n# profile=" + profilePath + "\n# profile_digest=" + digest + "\n" +
+			"EXPECT=" + shellSingleArg(digest) + "\n" +
+			"ACTUAL=$(/usr/bin/shasum -a 256 " + shellSingleArg(profilePath) + " 2>/dev/null | /usr/bin/awk '{print $1}')\n" +
+			"[ \"$ACTUAL\" = \"$EXPECT\" ] || exit 78\n" +
+			"exec " + shellSingleArg(realAgent) + " \"$@\"\n"
+	}
+	return "#!/bin/sh\n# FAC-190 agent wrap — integrity check at every exec\n" +
+		"# profile=" + profilePath + "\n" +
+		"# profile_digest=" + digest + "\n" +
+		"PROFILE=" + shellSingleArg(profilePath) + "\n" +
+		"EXPECT=" + shellSingleArg(digest) + "\n" +
+		"REAL=" + shellSingleArg(realAgent) + "\n" +
+		"ACTUAL=$(/usr/bin/shasum -a 256 \"$PROFILE\" 2>/dev/null | /usr/bin/awk '{print $1}')\n" +
+		"[ -n \"$ACTUAL\" ] && [ \"$ACTUAL\" = \"$EXPECT\" ] || exit 78\n" +
+		"exec /usr/bin/sandbox-exec -f \"$PROFILE\" \"$REAL\" \"$@\"\n"
 }
 
 // VerifyAgentWrappers fails closed when any expected wrapper is missing, not
@@ -523,20 +579,22 @@ func (d DarwinSeatbelt) writeUnder(profile, worktree, target, content string) er
 	return nil
 }
 
-// writeSeatbeltProfile emits an agent-viable profile that can still land git
-// objects without opening shared-repo hook/config RCE.
+// writeSeatbeltProfile emits an agent-viable profile. profilePath is the
+// absolute path of the profile file itself (outside the worktree).
 //
-// Linked worktrees need worktree + gitdir + common objects/refs/logs (not the
-// whole common-dir: a blanket common-dir allow lets agents rewrite hooks even
-// when a prior deny line is present — observed on Darwin TrustedBSD).
-// Shared checkout root is never a write subpath grant.
-func writeSeatbeltProfile(worktree, gitDir, commonDir string) (string, error) {
-	if worktree == "" || gitDir == "" || commonDir == "" {
-		return "", fmt.Errorf("confinement: worktree, gitdir, and common-dir required for profile")
+// Linked worktrees need worktree + gitdir + narrow common objects/refs/logs.
+// Branch-scoped refs only (not all of refs/heads/*) when branch is known.
+// Shared checkout root and the session integrity directory are never granted.
+func writeSeatbeltProfile(worktree, gitDir, commonDir, branch, profilePath string) (string, error) {
+	if worktree == "" || gitDir == "" || commonDir == "" || profilePath == "" {
+		return "", fmt.Errorf("confinement: worktree, gitdir, common-dir, and profile path required")
 	}
 	var b strings.Builder
 	b.WriteString("(version 1)\n")
 	b.WriteString("(deny default)\n")
+	// process* / network* / file-read* are required for coding agents (shell,
+	// model APIs, toolchains). Documented residual: not a least-privilege
+	// confidential-computing sandbox; write isolation is the FAC-190 surface.
 	b.WriteString("(allow process*)\n")
 	b.WriteString("(allow sysctl-read)\n")
 	b.WriteString("(allow mach*)\n")
@@ -547,12 +605,24 @@ func writeSeatbeltProfile(worktree, gitDir, commonDir string) (string, error) {
 	b.WriteString("(allow file-write-data (literal \"/dev/null\"))\n")
 	fmt.Fprintf(&b, "(allow file-write* (subpath %q))\n", worktree)
 	fmt.Fprintf(&b, "(allow file-write* (subpath %q))\n", gitDir)
-	// Narrow common-dir grants — objects/refs/logs only (no hooks/, no config).
 	fmt.Fprintf(&b, "(allow file-write* (subpath %q))\n", filepath.Join(commonDir, "objects"))
-	fmt.Fprintf(&b, "(allow file-write* (subpath %q))\n", filepath.Join(commonDir, "refs"))
-	fmt.Fprintf(&b, "(allow file-write* (subpath %q))\n", filepath.Join(commonDir, "logs"))
+	// Branch-scoped ref updates only — not every lane's refs/heads/*.
+	branch = strings.TrimPrefix(strings.TrimSpace(branch), "refs/heads/")
+	if branch != "" {
+		refPath := filepath.Join(commonDir, "refs", "heads", filepath.FromSlash(branch))
+		fmt.Fprintf(&b, "(allow file-write* (subpath %q))\n", filepath.Dir(refPath))
+		fmt.Fprintf(&b, "(allow file-write* (literal %q))\n", refPath)
+		fmt.Fprintf(&b, "(allow file-write* (literal %q))\n", refPath+".lock")
+		logPath := filepath.Join(commonDir, "logs", "refs", "heads", filepath.FromSlash(branch))
+		fmt.Fprintf(&b, "(allow file-write* (subpath %q))\n", filepath.Dir(logPath))
+	} else {
+		// Fail closed on missing branch: grant no heads/* (agents cannot push
+		// branch tips — better than cross-lane ref rewrite).
+		fmt.Fprintf(&b, "(allow file-write* (subpath %q))\n", filepath.Join(commonDir, "refs", "herd"))
+	}
+	fmt.Fprintf(&b, "(allow file-write* (subpath %q))\n", filepath.Join(commonDir, "refs", "herd"))
+	fmt.Fprintf(&b, "(allow file-write* (subpath %q))\n", filepath.Join(commonDir, "logs", "refs", "herd"))
 	fmt.Fprintf(&b, "(allow file-write* (subpath %q))\n", filepath.Join(commonDir, "info"))
-	// Top-level git lock/state files (not under hooks/).
 	for _, name := range []string{"packed-refs", "COMMIT_EDITMSG", "FETCH_HEAD", "ORIG_HEAD", "HEAD"} {
 		fmt.Fprintf(&b, "(allow file-write* (literal %q))\n", filepath.Join(commonDir, name))
 		fmt.Fprintf(&b, "(allow file-write* (literal %q))\n", filepath.Join(commonDir, name+".lock"))
@@ -560,15 +630,13 @@ func writeSeatbeltProfile(worktree, gitDir, commonDir string) (string, error) {
 	b.WriteString("(allow file-write* (subpath \"/private/tmp\"))\n")
 	b.WriteString("(allow file-write* (subpath \"/tmp\"))\n")
 
-	dir := filepath.Join(worktree, ".herd", "confine")
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(profilePath), 0o755); err != nil {
 		return "", err
 	}
-	path := filepath.Join(dir, "profile.sb")
-	if err := os.WriteFile(path, []byte(b.String()), 0o644); err != nil {
+	if err := os.WriteFile(profilePath, []byte(b.String()), 0o644); err != nil {
 		return "", err
 	}
-	return path, nil
+	return profilePath, nil
 }
 
 // absoluteGitDir returns the absolute git directory for a worktree (the

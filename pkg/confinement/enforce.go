@@ -12,21 +12,24 @@ import (
 
 // Enforcer is the production gate used by dispatch before a write-capable
 // agent process starts. Tests inject FakeOS; production uses RequireOS.
-// There is no SkipOS fail-open switch.
 type Enforcer struct {
 	Issuer *HMACIssuer
 	OS     OSBackend
 	// ReceiptDir, when set, persists binding receipts as JSON files.
+	// Prefer a path outside the agent write domain when possible; worktree
+	// receipts remain HMAC-authenticated even if agent-writable.
 	ReceiptDir string
 }
 
 // PreparedOS is the durable OS material installed before TabCreate.
+// Profile and wrappers live in Session (outside the worktree write grant).
 type PreparedOS struct {
 	Backend       string
 	ProfilePath   string
 	ProfileDigest string
 	BinDir        string
 	Names         []string
+	Session       SessionPaths
 }
 
 // ProductionEnforcer builds the fail-closed production enforcer from env.
@@ -42,9 +45,10 @@ func ProductionEnforcer() (*Enforcer, error) {
 	return &Enforcer{Issuer: issuer, OS: osb}, nil
 }
 
-// PrepareOS installs profile, proves denials (including linked gitdir write),
-// installs PATH wrappers for provider+argv0, and records the profile digest.
-func (e *Enforcer) PrepareOS(worktree, sharedRoot, provider, realAgent string) (*PreparedOS, error) {
+// PrepareOS installs profile+wrappers into a coordinator-owned session
+// directory outside the worktree, proves denials (including rewrite of the
+// session profile), and freezes session modes.
+func (e *Enforcer) PrepareOS(worktree, sharedRoot, taskRef string, leaseGeneration int64, branch, provider, realAgent string) (*PreparedOS, error) {
 	if e == nil || e.Issuer == nil {
 		return nil, ErrUnauthenticated
 	}
@@ -60,7 +64,11 @@ func (e *Enforcer) PrepareOS(worktree, sharedRoot, provider, realAgent string) (
 	if len(names) == 0 {
 		return nil, fmt.Errorf("confinement: agent wrapper names required (provider and/or argv0)")
 	}
-	profile, err := osb.Prepare(worktree, sharedRoot)
+	session, err := NewSessionPaths(sharedRoot, taskRef, leaseGeneration)
+	if err != nil {
+		return nil, err
+	}
+	profile, err := osb.Prepare(worktree, sharedRoot, branch, session)
 	if err != nil {
 		return nil, err
 	}
@@ -68,15 +76,14 @@ func (e *Enforcer) PrepareOS(worktree, sharedRoot, provider, realAgent string) (
 	if err != nil {
 		return nil, err
 	}
-	if err := osb.ProveWriteDenials(worktree, sharedRoot, profile); err != nil {
+	if err := osb.ProveWriteDenials(worktree, sharedRoot, profile, session); err != nil {
 		return nil, err
 	}
-	// Profile bytes must be stable across prove (no TOCTOU rewrite mid-prove).
 	digest2, err := ProfileDigest(profile)
 	if err != nil || digest2 != digest {
 		return nil, fmt.Errorf("confinement: profile mutated during prove")
 	}
-	binDir, err := osb.InstallAgentWrappers(worktree, profile, names, realAgent)
+	binDir, err := osb.InstallAgentWrappers(session, profile, names, realAgent)
 	if err != nil {
 		return nil, fmt.Errorf("confinement: agent wrapper: %w", err)
 	}
@@ -87,12 +94,16 @@ func (e *Enforcer) PrepareOS(worktree, sharedRoot, provider, realAgent string) (
 	if err := osb.Wrap(probe, profile); err != nil {
 		return nil, fmt.Errorf("confinement: wrap self-check: %w", err)
 	}
+	// Freeze after install so even a coordinator-side bug cannot leave
+	// world-writable integrity material.
+	_ = FreezeSession(SessionPaths{Root: session.Root, Profile: profile, BinDir: binDir, ZdotDir: session.ZdotDir})
 	return &PreparedOS{
 		Backend:       osb.Name(),
 		ProfilePath:   profile,
 		ProfileDigest: digest,
 		BinDir:        binDir,
 		Names:         append([]string(nil), names...),
+		Session:       session,
 	}, nil
 }
 
@@ -108,40 +119,41 @@ func (p *PreparedOS) PathEnv(existing string) string {
 	return "PATH=" + path
 }
 
-// TabEnv returns environment pairs for Herdr tab create so PATH prefers the
-// confinement wrappers and interactive zsh rc cannot silently drop them:
-// ZDOTDIR points at a worktree-local dir whose .zshrc re-exports PATH with
-// the wrapper bin first.
+// TabEnv returns environment pairs for Herdr tab create.
+// ZDOTDIR lives in the session directory (outside worktree), not under the
+// agent write grant.
 func (p *PreparedOS) TabEnv(worktree, existingPATH string) ([]string, error) {
-	if p == nil || p.BinDir == "" {
+	if p == nil || p.BinDir == "" || p.Session.ZdotDir == "" {
 		return nil, fmt.Errorf("confinement: empty PreparedOS for TabEnv")
 	}
 	pathVal := p.BinDir
 	if existingPATH != "" {
 		pathVal = p.BinDir + string(os.PathListSeparator) + existingPATH
 	}
-	zdot := filepath.Join(worktree, ".herd", "confine", "zdot")
+	// TMPDIR remains under the worktree (agent must write temp files).
 	tmpDir := filepath.Join(worktree, ".herd", "confine", "tmp")
-	if err := os.MkdirAll(zdot, 0o755); err != nil {
-		return nil, err
-	}
 	if err := os.MkdirAll(tmpDir, 0o755); err != nil {
 		return nil, err
 	}
-	// Force PATH even if user zshrc would have re-prepended brew.
+	// Session zdot may have been chmod'd 0555; reopen write briefly for rc install.
+	_ = os.Chmod(p.Session.ZdotDir, 0o755)
 	rc := "# FAC-190 confinement zdot — keep wrapper first on PATH\n" +
 		"export PATH=" + shellSingleArg(p.BinDir) + ":\"$PATH\"\n" +
 		"export TMPDIR=" + shellSingleArg(tmpDir) + "\n" +
 		"export TMP=" + shellSingleArg(tmpDir) + "\n" +
 		"export TEMP=" + shellSingleArg(tmpDir) + "\n"
 	for _, name := range []string{".zshrc", ".zprofile", ".zshenv"} {
-		if err := os.WriteFile(filepath.Join(zdot, name), []byte(rc), 0o644); err != nil {
+		path := filepath.Join(p.Session.ZdotDir, name)
+		if err := os.WriteFile(path, []byte(rc), 0o644); err != nil {
 			return nil, err
 		}
+		// File non-writable; directory stays 0755 so coordinator cleanup works.
+		// Agent still cannot write here — session dir is outside worktree grant.
+		_ = os.Chmod(path, 0o444)
 	}
 	return []string{
 		"PATH=" + pathVal,
-		"ZDOTDIR=" + zdot,
+		"ZDOTDIR=" + p.Session.ZdotDir,
 		"TMPDIR=" + tmpDir,
 		"TMP=" + tmpDir,
 		"TEMP=" + tmpDir,
@@ -151,8 +163,7 @@ func (p *PreparedOS) TabEnv(worktree, existingPATH string) ([]string, error) {
 	}, nil
 }
 
-// WrapperResolves reports whether name would resolve to a file under BinDir
-// when BinDir is first on PATH (unit-testable without herdr).
+// WrapperResolves reports whether name would resolve under BinDir.
 func (p *PreparedOS) WrapperResolves(name string) bool {
 	if p == nil || p.BinDir == "" || name == "" {
 		return false
@@ -161,8 +172,7 @@ func (p *PreparedOS) WrapperResolves(name string) bool {
 	return err == nil
 }
 
-// BindAndProve authenticates the worktree and attaches PreparedOS proof with
-// profile-content digest and HMAC-authenticated receipt.
+// BindAndProve authenticates the worktree and attaches PreparedOS proof.
 func (e *Enforcer) BindAndProve(id LaunchIdentity, prep *PreparedOS) (*Binding, error) {
 	if e == nil || e.Issuer == nil {
 		return nil, ErrUnauthenticated
@@ -172,6 +182,12 @@ func (e *Enforcer) BindAndProve(id LaunchIdentity, prep *PreparedOS) (*Binding, 
 	}
 	if prep == nil || prep.ProfilePath == "" || prep.ProfileDigest == "" || prep.BinDir == "" || prep.Backend == "" || len(prep.Names) == 0 {
 		return nil, fmt.Errorf("confinement: PreparedOS required before bind (call PrepareOS before TabCreate)")
+	}
+	// Session integrity store must remain outside the worktree.
+	if prep.Session.Root != "" {
+		if isPathPrefix(prep.Session.Root, id.WorktreeRoot) || prep.Session.Root == id.WorktreeRoot {
+			return nil, fmt.Errorf("confinement: session root inside worktree")
+		}
 	}
 	binding, err := Bind(id, e.Issuer)
 	if err != nil {
@@ -194,7 +210,6 @@ func (e *Enforcer) BindAndProve(id LaunchIdentity, prep *PreparedOS) (*Binding, 
 			return nil, err
 		}
 	}
-	// Re-prove + re-hash profile so a rewritten profile.sb cannot be used.
 	gotDigest, err := ProfileDigest(prep.ProfilePath)
 	if err != nil {
 		return nil, err
@@ -202,7 +217,7 @@ func (e *Enforcer) BindAndProve(id LaunchIdentity, prep *PreparedOS) (*Binding, 
 	if gotDigest != prep.ProfileDigest {
 		return nil, fmt.Errorf("confinement: profile digest drift before re-prove")
 	}
-	if err := osb.ProveWriteDenials(binding.WorktreeRoot, binding.SharedRoot, prep.ProfilePath); err != nil {
+	if err := osb.ProveWriteDenials(binding.WorktreeRoot, binding.SharedRoot, prep.ProfilePath, prep.Session); err != nil {
 		return nil, fmt.Errorf("confinement: re-prove after tab: %w", err)
 	}
 	gotDigest, err = ProfileDigest(prep.ProfilePath)
@@ -243,22 +258,22 @@ func (e *Enforcer) persist(b *Binding) error {
 	}
 	path := filepath.Join(e.ReceiptDir, fmt.Sprintf("receipt-%s-%d.json", b.ProofNonce, b.CreatedAt.UnixNano()))
 	type line struct {
-		CreatedAt      time.Time `json:"created_at"`
-		Task           string    `json:"task"`
-		Worktree       string    `json:"worktree"`
-		SharedRoot     string    `json:"shared_root,omitempty"`
-		ReceiptDigest  string    `json:"receipt_digest"`
-		ReceiptMAC     string    `json:"receipt_mac"`
-		OSBackend      string    `json:"os_backend,omitempty"`
-		OSProved       bool      `json:"os_proved"`
-		AgentWrapped   bool      `json:"agent_wrapped"`
-		ProfilePath    string    `json:"profile_path,omitempty"`
-		ProfileDigest  string    `json:"profile_digest,omitempty"`
-		WrapperBinDir  string    `json:"wrapper_bin_dir,omitempty"`
-		WrapperNames   []string  `json:"wrapper_names,omitempty"`
-		PolicyDigest   string    `json:"policy_digest"`
-		ProofNonce     string    `json:"proof_nonce"`
-		ProofMAC       string    `json:"proof_mac"`
+		CreatedAt     time.Time `json:"created_at"`
+		Task          string    `json:"task"`
+		Worktree      string    `json:"worktree"`
+		SharedRoot    string    `json:"shared_root,omitempty"`
+		ReceiptDigest string    `json:"receipt_digest"`
+		ReceiptMAC    string    `json:"receipt_mac"`
+		OSBackend     string    `json:"os_backend,omitempty"`
+		OSProved      bool      `json:"os_proved"`
+		AgentWrapped  bool      `json:"agent_wrapped"`
+		ProfilePath   string    `json:"profile_path,omitempty"`
+		ProfileDigest string    `json:"profile_digest,omitempty"`
+		WrapperBinDir string    `json:"wrapper_bin_dir,omitempty"`
+		WrapperNames  []string  `json:"wrapper_names,omitempty"`
+		PolicyDigest  string    `json:"policy_digest"`
+		ProofNonce    string    `json:"proof_nonce"`
+		ProofMAC      string    `json:"proof_mac"`
 	}
 	payload, err := json.Marshal(line{
 		CreatedAt:     b.CreatedAt,
