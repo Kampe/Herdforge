@@ -357,9 +357,11 @@ func (r *hermeticDockerRunner) Run(ctx context.Context) (result FAC151DockerResu
 	if err := r.docker.Copy(operationCtx, containerID, hermeticGoModDownload, cacheTar); err != nil {
 		return result, fmt.Errorf("copy verified Go cache closure: %w", err)
 	}
+	// cap-drop ALL + userns means root cannot always chown; open write access on
+	// the cache/tmp trees so the container user can compile without network.
 	if ok {
-		if _, err := setup.execAsRoot(operationCtx, containerID, []string{"/bin/chown", "-R", hermeticContainerUser, hermeticGoModCache, hermeticGoBuildCache, hermeticGoTmpDir}); err != nil {
-			return result, fmt.Errorf("delegate cache ownership to container user: %w", err)
+		if _, err := setup.execAsRoot(operationCtx, containerID, []string{"/bin/chmod", "-R", "a+rwX", hermeticGoModCache, hermeticGoBuildCache, hermeticGoTmpDir}); err != nil {
+			return result, fmt.Errorf("open cache paths for container user: %w", err)
 		}
 	}
 	namespaces, uid, gid, err := r.namespaceIdentities(operationCtx, containerID)
