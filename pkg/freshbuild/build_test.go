@@ -3,6 +3,7 @@ package freshbuild
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -16,7 +17,7 @@ func TestResolveTarget_PathToName(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(pkgDir, "package.json"), []byte(`{"name":"@scope/a"}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	pkg, isPath, err := ResolveTarget(root, pkgDir)
+	pkg, isPath, err := ResolveTarget(root, filepath.Join("packages", "a"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -35,12 +36,12 @@ func TestResolveTarget_PathNoName(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(pkgDir, "package.json"), []byte(`{"scripts":{}}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	_, _, err := ResolveTarget(root, pkgDir)
+	_, _, err := ResolveTarget(root, filepath.Join("packages", "b"))
 	if err == nil {
 		t.Fatal("expected error for missing name")
 	}
-	if want := "package.json has no name"; !contains(err.Error(), want) {
-		t.Fatalf("err=%v want substring %q", err, want)
+	if !strings.Contains(err.Error(), "package.json has no name") {
+		t.Fatalf("err=%v", err)
 	}
 }
 
@@ -60,7 +61,6 @@ func TestChainSections_RelativeAndSorted(t *testing.T) {
 	root := t.TempDir()
 	a := filepath.Join(root, "pkgs", "a")
 	b := filepath.Join(root, "pkgs", "b")
-	// Intentionally reverse input order; normalize sorts.
 	dirs, err := normalizeChainDirs(root, []string{b, a, a, b})
 	if err != nil {
 		t.Fatal(err)
@@ -85,8 +85,9 @@ func TestNormalizeChainDirs_RejectsEscape(t *testing.T) {
 	}
 }
 
-func TestDetectProfile_PnpmAndGo(t *testing.T) {
+func TestDetectProfile_OrderAndHonesty(t *testing.T) {
 	t.Parallel()
+
 	pnpmRoot := t.TempDir()
 	if err := os.WriteFile(filepath.Join(pnpmRoot, "pnpm-lock.yaml"), []byte("lockfileVersion: '9.0'\n"), 0o644); err != nil {
 		t.Fatal(err)
@@ -95,12 +96,46 @@ func TestDetectProfile_PnpmAndGo(t *testing.T) {
 		t.Fatalf("pnpm profile: %+v", p)
 	}
 
-	goRoot := t.TempDir()
-	if err := os.WriteFile(filepath.Join(goRoot, "go.mod"), []byte("module example.com/x\n\ngo 1.22\n"), 0o644); err != nil {
+	// Go wins over incidental package.json (docs tooling).
+	goWithPkg := t.TempDir()
+	if err := os.WriteFile(filepath.Join(goWithPkg, "go.mod"), []byte("module example.com/x\n\ngo 1.22\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if p := DetectProfile(goRoot); p == nil || p.Name() != "go" {
-		t.Fatalf("go profile: %+v", p)
+	if err := os.WriteFile(filepath.Join(goWithPkg, "package.json"), []byte(`{"name":"docs"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if p := DetectProfile(goWithPkg); p == nil || p.Name() != "go" {
+		t.Fatalf("go+package.json must select go, got %+v", p)
+	}
+
+	// package.json alone without packageManager → refuse.
+	bare := t.TempDir()
+	if err := os.WriteFile(filepath.Join(bare, "package.json"), []byte(`{"name":"x"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if p := DetectProfile(bare); p != nil {
+		t.Fatalf("ambiguous package.json must refuse, got %s", p.Name())
+	}
+
+	// packageManager=pnpm → pnpm.
+	pm := t.TempDir()
+	if err := os.WriteFile(filepath.Join(pm, "package.json"), []byte(`{"name":"x","packageManager":"pnpm@9.0.0"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if p := DetectProfile(pm); p == nil || p.Name() != "pnpm" {
+		t.Fatalf("packageManager pnpm: %+v", p)
+	}
+
+	// npm lock → refuse.
+	npm := t.TempDir()
+	if err := os.WriteFile(filepath.Join(npm, "package.json"), []byte(`{"name":"x"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(npm, "package-lock.json"), []byte(`{}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if p := DetectProfile(npm); p != nil {
+		t.Fatalf("npm lock must refuse, got %s", p.Name())
 	}
 
 	empty := t.TempDir()
@@ -109,14 +144,65 @@ func TestDetectProfile_PnpmAndGo(t *testing.T) {
 	}
 }
 
-func contains(s, sub string) bool {
-	return len(s) >= len(sub) && (s == sub || len(sub) == 0 ||
-		(len(s) > 0 && (func() bool {
-			for i := 0; i+len(sub) <= len(s); i++ {
-				if s[i:i+len(sub)] == sub {
-					return true
-				}
-			}
-			return false
-		})()))
+func TestGoResolveTarget_RootRelativeNotCwd(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	// Create root/cmd and a cwd-local cmd that would confuse cwd-relative stat.
+	rootCmd := filepath.Join(root, "cmd")
+	if err := os.MkdirAll(rootCmd, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cwd := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(cwd, "cmd"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Change into cwd so a naive os.Stat("cmd") would see the wrong dir.
+	old, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(cwd); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(old) })
+
+	g := GoProfile{}
+	pkg, isPath, err := g.ResolveTarget(root, "cmd")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !isPath || pkg != "./cmd" {
+		t.Fatalf("pkg=%q isPath=%v", pkg, isPath)
+	}
+	dirs, err := g.ChainFor(nil, root, pkg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(dirs) != 1 || dirs[0] != rootCmd {
+		t.Fatalf("chain must be root/cmd, got %v (cwd cmd=%s)", dirs, filepath.Join(cwd, "cmd"))
+	}
+}
+
+func TestPnpmMessagesClaimStaleDist_GoMessagesDoNot(t *testing.T) {
+	t.Parallel()
+	p := PnpmProfile{}
+	if !strings.Contains(p.CleanLine(2), "STALE DIST") {
+		t.Fatalf("pnpm clean must claim STALE DIST: %s", p.CleanLine(2))
+	}
+	if !strings.Contains(p.DryRunClearLine(), "dist/") {
+		t.Fatalf("pnpm dry-run must mention dist: %s", p.DryRunClearLine())
+	}
+	g := GoProfile{}
+	if strings.Contains(g.CleanLine(1), "STALE DIST") {
+		t.Fatalf("go clean must not claim STALE DIST: %s", g.CleanLine(1))
+	}
+	if strings.Contains(g.DryRunClearLine(), "dist/") && !strings.Contains(g.DryRunClearLine(), "nothing") {
+		t.Fatalf("go dry-run must not promise dist clear: %s", g.DryRunClearLine())
+	}
+	if !strings.Contains(g.DryRunClearLine(), "nothing") {
+		t.Fatalf("go dry-run must say nothing cleared: %s", g.DryRunClearLine())
+	}
+	if strings.Contains(g.ClearedLine(1), "cleared dist") {
+		t.Fatalf("go cleared line must not claim dist clear: %s", g.ClearedLine(1))
+	}
 }

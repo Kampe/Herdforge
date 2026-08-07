@@ -51,26 +51,13 @@ func (p PnpmProfile) ResolveTarget(root, target string) (string, bool, error) {
 }
 
 // ResolveTarget maps a path argument to its package.json name; a bare name
-// passes through. Matches bin/herd-fresh-build lines 31-35.
+// passes through. Paths are preferred under root when root is set.
 func ResolveTarget(root, target string) (pkg string, isPath bool, err error) {
 	target = strings.TrimSpace(target)
 	if target == "" {
 		return "", false, fmt.Errorf("herd-fresh-build: empty target")
 	}
-	// Absolute or relative path that contains package.json → use .name.
-	cand := target
-	if !filepath.IsAbs(cand) {
-		// Prefer target as given relative to cwd semantics: if root is set and
-		// target looks like a path under the repo, join; else try as-is.
-		if st, e := os.Stat(cand); e == nil && st.IsDir() {
-			// ok, use cand
-		} else if root != "" {
-			joined := filepath.Join(root, cand)
-			if st, e := os.Stat(joined); e == nil && st.IsDir() {
-				cand = joined
-			}
-		}
-	}
+	cand := resolvePathUnderRoot(root, target)
 	pkgJSON := filepath.Join(cand, "package.json")
 	if st, e := os.Stat(pkgJSON); e == nil && !st.IsDir() {
 		raw, rerr := os.ReadFile(pkgJSON)
@@ -92,6 +79,25 @@ func ResolveTarget(root, target string) (pkg string, isPath bool, err error) {
 	return target, false, nil
 }
 
+// resolvePathUnderRoot prefers root-joined relative targets so CLI root walk-up
+// and path resolution agree. Absolute paths and bare non-dir names are unchanged.
+func resolvePathUnderRoot(root, target string) string {
+	if filepath.IsAbs(target) {
+		return target
+	}
+	if root != "" {
+		joined := filepath.Join(root, target)
+		if st, err := os.Stat(joined); err == nil && st.IsDir() {
+			return joined
+		}
+	}
+	// Fall back to as-given (cwd-relative) only when root join is not a dir.
+	if st, err := os.Stat(target); err == nil && st.IsDir() {
+		return target
+	}
+	return target
+}
+
 func (p PnpmProfile) ChainFor(ctx context.Context, root, pkg string) ([]string, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -104,11 +110,12 @@ func (p PnpmProfile) ChainFor(ctx context.Context, root, pkg string) ([]string, 
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
-		// Empty / no match → usage-style error (exit 2 at CLI).
+		// Fail-closed: partial stdout on non-zero exit is not a trusted chain.
+		// Upstream zsh runs under set -euo pipefail and aborts on any failure.
 		if stdout.Len() == 0 {
 			return nil, fmt.Errorf("herd-fresh-build: no packages matched '%s' (unknown name/path, or not a workspace package)", pkg)
 		}
-		// Non-zero with some output still attempt parse.
+		return nil, fmt.Errorf("herd-fresh-build: pnpm chain resolution failed for %q: %w", pkg, err)
 	}
 	var dirs []string
 	for _, line := range strings.Split(stdout.String(), "\n") {
@@ -130,6 +137,22 @@ func (p PnpmProfile) ArtifactNames() ArtifactSpec {
 		Files: []string{"tsconfig.tsbuildinfo"},
 		Globs: []string{"*.tsbuildinfo"},
 	}
+}
+
+func (p PnpmProfile) DryRunClearLine() string {
+	return "herd-fresh-build: --dry-run, would clear " + p.ArtifactNames().PlanSummary() + " in each above, then rebuild. Nothing changed."
+}
+
+func (p PnpmProfile) ClearedLine(n int) string {
+	return fmt.Sprintf("herd-fresh-build: cleared %s for %d chain package(s), rebuilding fresh...", p.ArtifactNames().PlanSummary(), n)
+}
+
+func (p PnpmProfile) CleanLine(n int) string {
+	return fmt.Sprintf("herd-fresh-build: fresh chain clean (%d pkgs rebuilt) -- any prior cross-package error was STALE DIST, not real.", n)
+}
+
+func (p PnpmProfile) RealErrorHeader() string {
+	return "herd-fresh-build: REAL build error in the freshly-built chain (NOT stale dist):"
 }
 
 func (p PnpmProfile) Build(ctx context.Context, root, pkg string, log io.Writer) (int, error) {

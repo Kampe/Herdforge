@@ -11,12 +11,15 @@ import (
 // Fail-closed: any deletion error is returned (a partial clear that then
 // reports CLEAN would misdiagnose a real error as stale dist). Paths outside
 // root are rejected. Missing artifacts are not errors (idempotent clear).
+//
+// Destructive boundary: every Dirs/Files/Globs basename is checked against
+// forbiddenArtifact before any unlink.
 func ClearChain(root string, dirs []string, spec ArtifactSpec) error {
 	root = filepath.Clean(root)
 	if root == "" {
 		return fmt.Errorf("freshbuild: clear requires repository root")
 	}
-	if len(spec.Dirs) == 0 && len(spec.Files) == 0 && len(spec.Globs) == 0 {
+	if spec.Empty() {
 		// Profiles that declare no artifacts (e.g. pure Go source builds)
 		// perform no destructive work.
 		return nil
@@ -31,7 +34,6 @@ func ClearChain(root string, dirs []string, spec ArtifactSpec) error {
 			if name == "" || strings.Contains(name, string(os.PathSeparator)) || name == ".." || name == "." {
 				return fmt.Errorf("freshbuild: refuse unsafe artifact dir name %q", name)
 			}
-			// Destructive boundary: never wipe node_modules, .git, src, etc.
 			if forbiddenArtifact(name) {
 				return fmt.Errorf("freshbuild: refuse destructive artifact %q", name)
 			}
@@ -47,6 +49,9 @@ func ClearChain(root string, dirs []string, spec ArtifactSpec) error {
 			name = strings.TrimSpace(name)
 			if name == "" || strings.Contains(name, string(os.PathSeparator)) || name == ".." {
 				return fmt.Errorf("freshbuild: refuse unsafe artifact file name %q", name)
+			}
+			if forbiddenArtifact(name) {
+				return fmt.Errorf("freshbuild: refuse destructive artifact %q", name)
 			}
 			target := filepath.Join(d, name)
 			if err := assertUnderRoot(root, target); err != nil {
@@ -68,6 +73,10 @@ func ClearChain(root string, dirs []string, spec ArtifactSpec) error {
 			for _, m := range matches {
 				if err := assertUnderRoot(root, m); err != nil {
 					return err
+				}
+				base := filepath.Base(m)
+				if forbiddenArtifact(base) {
+					return fmt.Errorf("freshbuild: refuse destructive artifact %q (matched by glob %q)", base, pattern)
 				}
 				// Only remove files matching the glob; never follow into dirs
 				// unless the basename is an explicit Dir entry.
@@ -100,11 +109,14 @@ func assertUnderRoot(root, path string) error {
 	return nil
 }
 
+// forbiddenArtifact blocks wipe of source trees, VCS, lockfiles, and package
+// manifests — consulted for Dirs, Files, and every Glob match basename.
 func forbiddenArtifact(name string) bool {
-	switch strings.ToLower(name) {
+	switch strings.ToLower(strings.TrimSpace(name)) {
 	case "node_modules", ".git", "src", "lib", "vendor", "pkg", "cmd",
 		"internal", "testdata", ".herd", "go.mod", "go.sum", "package.json",
-		"pnpm-lock.yaml", "pnpm-workspace.yaml":
+		"pnpm-lock.yaml", "pnpm-workspace.yaml", "package-lock.json", "yarn.lock",
+		"cargo.toml", "cargo.lock", "pyproject.toml", "requirements.txt":
 		return true
 	default:
 		return false
