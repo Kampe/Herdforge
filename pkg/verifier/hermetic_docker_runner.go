@@ -48,15 +48,25 @@ const (
 // hermeticGoEnv is the fixed env prefix for every go/tool invocation inside the
 // hermetic container. Paths are under /tmp/build tmpfs so a read-only rootfs
 // cannot trap Go's default /tmp workdir.
+// hermeticGoModCache is GOMODCACHE inside the container. Module download
+// artifacts live under $GOMODCACHE/cache/download/... (not $GOMODCACHE/download).
+const hermeticGoModCache = "/tmp/build/gomodcache"
+const hermeticGoModDownload = hermeticGoModCache + "/cache/download/golang.org/x/sys/@v"
+const hermeticGoBuildCache = "/tmp/build/gocache"
+
 func hermeticGoEnv() []string {
 	return []string{
 		"/usr/bin/env",
 		"GOTOOLCHAIN=local",
-		"GOMODCACHE=/tmp/build/gomodcache",
-		"GOCACHE=/tmp/build/gocache",
+		"GOMODCACHE=" + hermeticGoModCache,
+		"GOCACHE=" + hermeticGoBuildCache,
 		"GOTMPDIR=" + hermeticGoTmpDir,
 		"TMPDIR=" + hermeticGoTmpDir,
 		"HOME=" + hermeticGoTmpDir,
+		// Network is none; refuse module fetches so a missing cache is a hard
+		// error instead of a DNS hang under --network none.
+		"GOPROXY=off",
+		"GOSUMDB=off",
 	}
 }
 
@@ -316,10 +326,10 @@ func (r *hermeticDockerRunner) Run(ctx context.Context) (result FAC151DockerResu
 	if _, err := r.docker.Exec(operationCtx, containerID, []string{"/bin/chmod", "a-w", hermeticSourcePath}, nil); err != nil {
 		return result, fmt.Errorf("seal immutable source snapshot: %w", err)
 	}
-	if _, err := r.docker.Exec(operationCtx, containerID, []string{"/bin/mkdir", "-p", "/tmp/build/gomodcache/download/golang.org/x/sys/@v", "/tmp/build/gocache", hermeticGoTmpDir}, nil); err != nil {
+	if _, err := r.docker.Exec(operationCtx, containerID, []string{"/bin/mkdir", "-p", hermeticGoModDownload, hermeticGoBuildCache, hermeticGoTmpDir}, nil); err != nil {
 		return result, fmt.Errorf("prepare fixed container paths: %w", err)
 	}
-	if err := r.docker.Copy(operationCtx, containerID, "/tmp/build/gomodcache/download/golang.org/x/sys/@v", cacheTar); err != nil {
+	if err := r.docker.Copy(operationCtx, containerID, hermeticGoModDownload, cacheTar); err != nil {
 		return result, fmt.Errorf("copy verified Go cache closure: %w", err)
 	}
 	namespaces, uid, gid, err := r.namespaceIdentities(operationCtx, containerID)
