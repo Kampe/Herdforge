@@ -48,6 +48,7 @@ import (
 	"github.com/Kampe/Herdforge/pkg/resources"
 	"github.com/Kampe/Herdforge/pkg/review"
 	"github.com/Kampe/Herdforge/pkg/reviewingest"
+	"github.com/Kampe/Herdforge/pkg/reviewlaunch"
 	"github.com/Kampe/Herdforge/pkg/reviewledger"
 	"github.com/Kampe/Herdforge/pkg/router"
 	"github.com/Kampe/Herdforge/pkg/scopeauth"
@@ -1613,68 +1614,49 @@ func runReview() {
 	task := tasks[claimIdx]
 	fmt.Printf("\nSelected [%s] %s for review\n", task.Ref, task.Title)
 
-	if spawn {
-		if !herdr.IsAvailable() {
-			fmt.Fprintf(os.Stderr, "herdr CLI not found\n")
-			os.Exit(1)
-		}
+	if !spawn {
+		// FAC-187: board status must not move to in-review until a reviewer
+		// exists, has the exact task worktree, and has consumed its packet.
+		// Without --spawn this command only selects; it does not claim the
+		// review column. (spawn is a bool from parseReviewArgs — FAC-138.)
+		fmt.Println("review: selected only (pass --spawn for transactional reviewer launch + board transition)")
+		return
+	}
 
-		lane := findLaneForRole(cfg, "reviewer")
-		if lane == nil {
-			fmt.Fprintf(os.Stderr, "no lane configured for role 'reviewer'\n")
-			os.Exit(1)
-		}
-		decision, err := launchAdmissionWithLifecycle(liveLaunchLifecycle{}, cfg, lane.Role, true, routedLaneDecision(context.Background(), task), func(_ *router.LaunchDecision) error {
-			_, listErr := herdr.AgentList()
-			return listErr
-		})
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "review launch route rejected before tab creation: %v\n", err)
-			os.Exit(1)
-		}
-		if err := validateDecisionBeforeSideEffect(decision, task.Ref); err != nil {
-			fmt.Fprintf(os.Stderr, "review launch decision rejected before tab creation: %v\n", err)
-			os.Exit(1)
-		}
+	if !herdr.IsAvailable() {
+		fmt.Fprintf(os.Stderr, "herdr CLI not found\n")
+		os.Exit(1)
+	}
 
-		standingName := fmt.Sprintf("forge-%s", lane.Name)
-		targetLabel := standingName
-		worktreeDir := lane.Worktree
-		if worktreeDir == "" {
-			fmt.Fprintf(os.Stderr, "review launch rejected: isolated task worktree required\n")
-			os.Exit(1)
-		}
+	lane := findLaneForRole(cfg, "reviewer")
+	if lane == nil {
+		fmt.Fprintf(os.Stderr, "no lane configured for role 'reviewer'\n")
+		os.Exit(1)
+	}
+	decision, err := launchAdmissionWithLifecycle(liveLaunchLifecycle{}, cfg, lane.Role, true, routedLaneDecision(context.Background(), task), func(_ *router.LaunchDecision) error {
+		_, listErr := herdr.AgentList()
+		return listErr
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "review launch route rejected before tab creation: %v\n", err)
+		os.Exit(1)
+	}
+	if err := validateDecisionBeforeSideEffect(decision, task.Ref); err != nil {
+		fmt.Fprintf(os.Stderr, "review launch decision rejected before tab creation: %v\n", err)
+		os.Exit(1)
+	}
 
-		tabLabel, err := herdr.ResolveAgentTabWithDecision(standingName, taskLaunchRequest(decision, task.Ref, repositoryIdentityForLaunch(cfg), lane.Name))
-		if err != nil {
-			if gateErr := authorizeEphemeralTaskAgent(err); gateErr != nil {
-				fmt.Fprintf(os.Stderr, "standing reviewer %s blocked: %v\n", standingName, err)
-				os.Exit(1)
-			}
-			tabLabel = fmt.Sprintf("review-%s-%s", lane.Name, task.Ref)
-			cwd := filepath.Join(".", worktreeDir)
-			tab, tabErr := herdr.TabCreateForTask(herdr.ResolveWorkspace("."), tabLabel, cwd, true)
-			if tabErr != nil {
-				fmt.Fprintf(os.Stderr, "failed to create herdr tab: %v\n", tabErr)
-				os.Exit(1)
-			}
-			if err := herdr.StartPreparedAgent(tab.ID, tabLabel, decision.Harness, tab.Pane.ID, taskLaunchRequest(decision, task.Ref, repositoryIdentityForLaunch(cfg), lane.Name)); err != nil {
-				fmt.Fprintf(os.Stderr, "failed to start agent: %v\n", err)
-				os.Exit(1)
-			}
-			fmt.Printf("Spawned reviewer '%s' in tab %s (pane %s)\n", tabLabel, tab.ID, tab.Pane.ID)
-		} else {
-			targetLabel = standingName
-			fmt.Printf("Using standing reviewer '%s' (tab %s)\n", standingName, tabLabel)
-		}
+	// Exact task worktree — never the shared reviewer lane tree (incident:
+	// review-assayer-FAC-151 opened inside the FAC-172 worktree).
+	taskWT := filepath.Join(".herd", "worktrees", strings.ToLower(task.Ref))
+	if fi, statErr := os.Stat(taskWT); statErr != nil || !fi.IsDir() {
+		fmt.Fprintf(os.Stderr, "review launch rejected: exact task worktree %s is required\n", taskWT)
+		os.Exit(1)
+	}
 
-		// FAC-131: a TIGHT, SCOPED review packet — no spec dump, only the
-		// changed packages' targeted tests. Deepseek and most fleet models
-		// have a small context window and overflow when handed the full spec
-		// plus a whole-repo `go test ./...`. Scope keeps the review inside the
-		// window: review only the diff, test only what changed.
-		testCmd := scopedTestCommand(worktreeDir)
-		reviewPacket := fmt.Sprintf(`REVIEW %s — verdict ONLY, edit nothing. End with the verdict line.
+	// FAC-131: tight scoped review packet.
+	testCmd := scopedTestCommand(taskWT)
+	reviewPacket := fmt.Sprintf(`REVIEW %s — verdict ONLY, edit nothing. End with the verdict line.
 cd %s
 1. git diff origin/main..HEAD --stat  (see ONLY the changed files — review just these)
 2. %s   (targeted tests for the changed packages, not the whole repo)
@@ -1683,22 +1665,36 @@ Your FINAL line MUST be exactly one of:
 REVIEW VERDICT %s: APPROVED
 REVIEW VERDICT %s: REJECTED - <numbered fixes>
 Do not read the whole codebase. Do not run the full suite. Change nothing.`,
-			task.Ref, worktreeDir, testCmd, task.Ref, task.Ref)
+		task.Ref, taskWT, testCmd, task.Ref, task.Ref)
 
-		if _, err := herdr.AgentPrompt(targetLabel, reviewPacket, false); err != nil {
-			fmt.Fprintf(os.Stderr, "failed to deliver review packet: %v\n", err)
-			os.Exit(1)
-		} else {
-			fmt.Printf("  -> delivered review packet to %s\n", targetLabel)
-		}
+	repoRoot, rootErr := worktree.ResolveCanonicalRoot(ctx, ".", firstEnv("HERD_ROOT", "HERD_REPO_ROOT", ""))
+	if rootErr != nil {
+		repoRoot = "."
 	}
-
-	// Move card to "in-review" status after dispatching
-	if err := tp.UpdateStatus(ctx, task.ID, "in-review"); err != nil {
-		fmt.Fprintf(os.Stderr, "  warning: failed to move card to in-review status: %v\n", err)
-	} else {
-		fmt.Printf("  -> moved card [%s] to 'in-review' status\n", task.Ref)
+	lr := taskLaunchRequest(decision, task.Ref, repositoryIdentityForLaunch(cfg), lane.Name)
+	receiptPath := filepath.Join(".herd", "state", "reviewlaunch-receipts.jsonl")
+	launcher := &reviewlaunch.Launcher{
+		Herdr:       reviewlaunch.LiveHerdr{},
+		Board:       tp,
+		ReceiptPath: receiptPath,
 	}
+	res, launchErr := launcher.Launch(ctx, reviewlaunch.Request{
+		TaskRef:       task.Ref,
+		TaskID:        task.ID,
+		Role:          lane.Role,
+		Lane:          lane.Name,
+		Repository:    lr.Repository,
+		RepoRoot:      repoRoot,
+		WorktreePath:  taskWT,
+		Packet:        reviewPacket,
+		LaunchRequest: &lr,
+	})
+	if launchErr != nil {
+		fmt.Fprintf(os.Stderr, "review launch failed (board unchanged): %v\n", launchErr)
+		os.Exit(1)
+	}
+	fmt.Printf("Spawned reviewer '%s' in tab %s (pane %s) cwd=%s\n", res.AgentName, res.TabID, res.PaneID, res.Cwd)
+	fmt.Printf("  -> packet consumed (%s); moved card [%s] to %q\n", res.Receipt.SequenceToken, task.Ref, res.BoardTo)
 }
 
 // parseApproveArgs parses `herd approve [<ref>] [--receipt <path>] [--override-* ...]`.
