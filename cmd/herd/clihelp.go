@@ -136,6 +136,16 @@ Commands:
 		"  Resolves the dependency-plus-self chain, clears only that chain's build\n" +
 		"  artifacts, rebuilds fresh, and prints a one-line verdict (profile-driven;\n" +
 		"  pnpm is one adapter).",
+	"command": "Usage: herd command <authorize|run|receipts> [flags] -- <argv>\n" +
+		"  Root/coordinator command authorization boundary (FAC-195).\n" +
+		"  A guarded command runs ONLY through `herd command run`, which durably\n" +
+		"  consumes one attempt before creating any process and refuses (exit 77)\n" +
+		"  once the budget is spent or a stop-on-first-failure command has failed.\n" +
+		"\n" +
+		"    herd command authorize --id C1 --lane worker-a --session S --authority root \\\n" +
+		"        --max-attempts 1 --disposition stop-on-first-failure -- go test ./pkg/x\n" +
+		"    herd command run --id C1 --lane worker-a --session S -- go test ./pkg/x\n" +
+		"    herd command receipts --id C1 [--json]",
 }
 
 // knownSubcommands is the deterministic set of routed herd subcommands.
