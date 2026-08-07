@@ -5,20 +5,21 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/Kampe/Herdforge/internal/testgit"
 	"github.com/Kampe/Herdforge/pkg/harvest"
 	"github.com/Kampe/Herdforge/pkg/provider"
 )
 
 func gitDrain(t *testing.T, dir string, args ...string) string {
 	t.Helper()
-	cmd := exec.Command("git", args...)
-	cmd.Dir = dir
+	// Hermetic git: never consult host signing/1Password (ambient agent
+	// sockets turn fixture commits into host-process coupling).
+	cmd := testgit.Command(dir, args...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("git %v: %v\n%s", args, err, out)
@@ -84,8 +85,7 @@ func TestPipelineContract_ContentMergedIsExcluded(t *testing.T) {
 	if tip == mainTip {
 		t.Fatal("lane and main tips must have distinct SHAs")
 	}
-	ancestor := exec.Command("git", "merge-base", "--is-ancestor", tip, "origin/main")
-	ancestor.Dir = d
+	ancestor := testgit.Command(d, "merge-base", "--is-ancestor", tip, "origin/main")
 	if err := ancestor.Run(); err == nil {
 		t.Fatal("lane tip unexpectedly reached origin/main; zombie test is vacuous")
 	}

@@ -15,6 +15,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/Kampe/Herdforge/pkg/procsignal"
 	"github.com/Kampe/Herdforge/pkg/resources"
 )
 
@@ -195,7 +196,8 @@ func (v *Verifier) execute(ctx context.Context, dir string, policy EnvironmentPo
 		if cmd.Process == nil {
 			return nil
 		}
-		return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		// FAC-174: opaque owned-group cancel from the live *os.Process only.
+		return procsignal.CancelSpawnedProcess(cmd.Process)
 	}
 	if policy == EnvironmentPolicyHermetic {
 		cmd.Env = commandEnv

@@ -20,6 +20,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/Kampe/Herdforge/pkg/procsignal"
 )
 
 // RepositoryIdentity derives a non-secret canonical origin binding from git's
@@ -1114,7 +1116,12 @@ func (SystemTree) Reap(expected Identity) error {
 		}
 		return ErrUnsafeTeardown
 	}
-	if err := syscall.Kill(expected.PID, syscall.SIGTERM); err != nil {
+	// FAC-174: identity was proven above; SignalExactProcess still validates
+	// PID and routes through the unexported host backend (no raw SyscallBackend).
+	if err := procsignal.SignalExactProcess(expected.PID, syscall.SIGTERM); err != nil {
+		if errors.Is(err, procsignal.ErrUnsafeTarget) {
+			return ErrUnsafeTeardown
+		}
 		return err
 	}
 	deadline := time.Now().Add(2 * time.Second)

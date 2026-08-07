@@ -643,6 +643,11 @@ func runPreflight() {
 		os.Exit(1)
 	}
 	fmt.Println("Preflight boundary check passed. Zero absolute path leaks detected.")
+	if err := preflight.CheckDangerousSignalLiterals("."); err != nil {
+		fmt.Fprintf(os.Stderr, "Preflight failed: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Println("Preflight signal-literal check passed. No host-wide kill literals in production sources.")
 }
 
 func runSelfTest() {

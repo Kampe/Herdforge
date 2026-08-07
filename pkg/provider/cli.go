@@ -9,6 +9,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/Kampe/Herdforge/pkg/procsignal"
 )
 
 // MaxCLIStderrBytes caps captured CLI stderr so credential-bearing or
@@ -44,8 +46,9 @@ func RunCLI(ctx context.Context, name string, args ...string) (*CLIResult, error
 		if cmd.Process == nil {
 			return nil
 		}
-		// Negative pid = process group.
-		return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		// FAC-174: claim the live *os.Process as an owned group leader, then
+		// cancel through the opaque handle (raw int cancel is not exported).
+		return procsignal.CancelSpawnedProcess(cmd.Process)
 	}
 	// Bound pipe drain after kill so CombinedOutput-style waits cannot stall
 	// on a grandchild holding stdout open.
