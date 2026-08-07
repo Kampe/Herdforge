@@ -17,6 +17,7 @@ import (
 	"os/user"
 	"path"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -25,9 +26,6 @@ import (
 )
 
 const (
-	hermeticDockerPlatform      = "linux/arm64"
-	hermeticDockerImage         = "golang@sha256:10e3849906212f513e105ab93ade96acd02dc30172adaf346c72ff82b003944b"
-	hermeticDockerConfigDigest  = "sha256:0d8d3155f6d8ef0ddc858877343d69c3683ac0807e218a7b28bb24e31ae9973d"
 	hermeticGoVersion           = "1.25.0"
 	hermeticGoToolchain         = "local"
 	hermeticXSysVersion         = "v0.46.0"
@@ -35,6 +33,67 @@ const (
 	hermeticXSysModHash         = "h1:4GL1E5IUh+htKOUEOaiffhrAeqysfVGipDYzABqnCmw="
 	hermeticNativeSourceRelPath = "pkg/verifier/fac151_native_integration_test.go"
 )
+
+// hermeticImagePin is the fixed golang image for one linux architecture.
+// Production resolves the host GOARCH so CI (amd64) and local Colima (arm64)
+// both have a reachable hermetic executor.
+type hermeticImagePin struct {
+	Platform     string // docker --platform value, e.g. linux/arm64
+	Architecture string // docker inspect Architecture, e.g. arm64
+	Image        string // golang@sha256:...
+	ConfigDigest string // image config/id digest accepted by InspectImage
+}
+
+// Pinned official library/golang:1.25.0 images (GOTOOLCHAIN=local). Digests
+// were recorded from docker image inspect --platform linux/<arch>.
+var hermeticImagePins = map[string]hermeticImagePin{
+	"arm64": {
+		Platform:     "linux/arm64",
+		Architecture: "arm64",
+		Image:        "golang@sha256:10e3849906212f513e105ab93ade96acd02dc30172adaf346c72ff82b003944b",
+		// Accept either the single-platform content digest (same as Image) or
+		// the historical config digest used by the original pin/tests.
+		ConfigDigest: "sha256:0d8d3155f6d8ef0ddc858877343d69c3683ac0807e218a7b28bb24e31ae9973d",
+	},
+	"amd64": {
+		Platform:     "linux/amd64",
+		Architecture: "amd64",
+		Image:        "golang@sha256:5502b0e56fca23feba76dbc5387ba59c593c02ccc2f0f7355871ea9a0852cebe",
+		ConfigDigest: "sha256:f7414a0dc5a64713686cbc9f1e8a7379b66af63ef9ad15760b43db40e0b15d9c",
+	},
+}
+
+// Package-level aliases resolve from the host architecture so existing tests
+// that reference hermeticDockerImage/Platform track the local pin. Production
+// code paths use hermeticDockerPolicy.pin explicitly.
+var (
+	hermeticDockerPlatform     string
+	hermeticDockerImage        string
+	hermeticDockerConfigDigest string
+)
+
+func init() {
+	pin, err := hermeticImagePinFor(runtime.GOARCH)
+	if err != nil {
+		return
+	}
+	hermeticDockerPlatform = pin.Platform
+	hermeticDockerImage = pin.Image
+	hermeticDockerConfigDigest = pin.ConfigDigest
+}
+
+func hermeticImagePinFor(arch string) (hermeticImagePin, error) {
+	switch arch {
+	case "arm64", "amd64":
+		pin, ok := hermeticImagePins[arch]
+		if !ok || pin.Image == "" || pin.Platform == "" || pin.Architecture == "" || pin.ConfigDigest == "" {
+			return hermeticImagePin{}, fmt.Errorf("FAC-151 hermetic image pin for %s is incomplete", arch)
+		}
+		return pin, nil
+	default:
+		return hermeticImagePin{}, fmt.Errorf("FAC-151 hermetic profile has no image pin for GOARCH=%s (supported: arm64, amd64)", arch)
+	}
+}
 
 var hermeticFAC151Allowlist = [...]string{
 	"TestExecuteCancellationKillsProcessGroup",
@@ -64,13 +123,35 @@ var hermeticFAC151Allowlist = [...]string{
 	"TestFinalizeOwnedTreeMutationLeavesGrandchildAlive",
 }
 
-type hermeticDockerPolicy struct{}
+type hermeticDockerPolicy struct {
+	pin hermeticImagePin
+}
 
-func fixedHermeticDockerPolicy() hermeticDockerPolicy { return hermeticDockerPolicy{} }
+// fixedHermeticDockerPolicy resolves the pin for the host GOARCH. Callers on
+// unsupported architectures fail closed when the pin is empty.
+func fixedHermeticDockerPolicy() hermeticDockerPolicy {
+	pin, err := hermeticImagePinFor(runtime.GOARCH)
+	if err != nil {
+		return hermeticDockerPolicy{}
+	}
+	return hermeticDockerPolicy{pin: pin}
+}
 
-func (hermeticDockerPolicy) image() string        { return hermeticDockerImage }
-func (hermeticDockerPolicy) platform() string     { return hermeticDockerPlatform }
-func (hermeticDockerPolicy) configDigest() string { return hermeticDockerConfigDigest }
+func hermeticDockerPolicyForArch(arch string) (hermeticDockerPolicy, error) {
+	pin, err := hermeticImagePinFor(arch)
+	if err != nil {
+		return hermeticDockerPolicy{}, err
+	}
+	return hermeticDockerPolicy{pin: pin}, nil
+}
+
+func (p hermeticDockerPolicy) image() string        { return p.pin.Image }
+func (p hermeticDockerPolicy) platform() string     { return p.pin.Platform }
+func (p hermeticDockerPolicy) configDigest() string { return p.pin.ConfigDigest }
+func (p hermeticDockerPolicy) architecture() string { return p.pin.Architecture }
+func (p hermeticDockerPolicy) valid() bool {
+	return p.pin.Image != "" && p.pin.Platform != "" && p.pin.Architecture != "" && p.pin.ConfigDigest != ""
+}
 
 func verifyFAC151Allowlist(sourceRoot string) error {
 	path := filepath.Join(sourceRoot, hermeticNativeSourceRelPath)

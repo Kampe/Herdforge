@@ -493,7 +493,7 @@ func (f *fac198DockerFake) InspectImage(context.Context) error {
 }
 func (f *fac198DockerFake) Pull(context.Context) error {
 	f.pullCalls++
-	f.callOrder = append(f.callOrder, "pull --platform linux/arm64 "+hermeticDockerImage)
+	f.callOrder = append(f.callOrder, "pull --platform "+hermeticDockerPlatform+" "+hermeticDockerImage)
 	return f.pullErr
 }
 func (f *fac198DockerFake) Inspect(_ context.Context, id string) (dockerInspection, error) {
@@ -1034,7 +1034,7 @@ func TestFAC198PinnedImageProvisioningCallOrder(t *testing.T) {
 	fake := &fac198DockerFake{imageInspectErr: []error{fac198ImageAbsentError(), nil}}
 	runner := newFAC198FakeRunner(t, fake)
 	_, _ = runner.Run(context.Background())
-	want := []string{"image inspect", "pull --platform linux/arm64 " + hermeticDockerImage, "image inspect", "create"}
+	want := []string{"image inspect", "pull --platform " + hermeticDockerPlatform + " " + hermeticDockerImage, "image inspect", "create"}
 	if len(fake.callOrder) < len(want) || !reflect.DeepEqual(fake.callOrder[:len(want)], want) {
 		t.Fatalf("call order = %#v, want prefix %#v", fake.callOrder, want)
 	}
@@ -1082,7 +1082,7 @@ func TestFAC198PinnedImageProvisioningFailuresBlockCreate(t *testing.T) {
 }
 
 func TestFAC198PinnedImageCLIArgumentsAndIdentity(t *testing.T) {
-	valid := dockerImageInspection{ID: hermeticDockerConfigDigest, Architecture: "arm64", OS: "linux"}
+	valid := dockerImageInspection{ID: hermeticDockerConfigDigest, Architecture: fixedHermeticDockerPolicy().architecture(), OS: "linux"}
 	valid.Config.Env = []string{"GOLANG_VERSION=" + hermeticGoVersion, "GOTOOLCHAIN=" + hermeticGoToolchain}
 	validOutput, err := json.Marshal([]dockerImageInspection{valid})
 	if err != nil {
@@ -1125,12 +1125,12 @@ func TestFAC198PinnedImageIDRepresentations(t *testing.T) {
 		want bool
 	}{
 		{name: "config digest", id: hermeticDockerConfigDigest, want: true},
-		{name: "reference digest", id: pinnedDockerReferenceDigest(), want: true},
+		{name: "reference digest", id: pinnedDockerReferenceDigest(hermeticDockerImage), want: true},
 		{name: "foreign ID", id: "sha256:" + strings.Repeat("f", 64), want: false},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			image := dockerImageInspection{ID: test.id, Architecture: "arm64", OS: "linux"}
+			image := dockerImageInspection{ID: test.id, Architecture: fixedHermeticDockerPolicy().architecture(), OS: "linux"}
 			image.Config.Env = []string{"GOLANG_VERSION=" + hermeticGoVersion, "GOTOOLCHAIN=" + hermeticGoToolchain}
 			output, err := json.Marshal([]dockerImageInspection{image})
 			if err != nil {
@@ -1156,22 +1156,27 @@ func TestFAC198PinnedImagePostPullMetadataBlocksProvisioning(t *testing.T) {
 		make func() dockerImageInspection
 	}{
 		{name: "config digest", make: func() dockerImageInspection {
-			image := dockerImageInspection{ID: "sha256:" + strings.Repeat("0", 64), Architecture: "arm64", OS: "linux"}
+			image := dockerImageInspection{ID: "sha256:" + strings.Repeat("0", 64), Architecture: fixedHermeticDockerPolicy().architecture(), OS: "linux"}
 			image.Config.Env = []string{"GOLANG_VERSION=" + hermeticGoVersion, "GOTOOLCHAIN=" + hermeticGoToolchain}
 			return image
 		}},
 		{name: "platform", make: func() dockerImageInspection {
-			image := dockerImageInspection{ID: hermeticDockerConfigDigest, Architecture: "amd64", OS: "linux"}
+			// Wrong architecture relative to the host pin must reject.
+			wrong := "amd64"
+			if fixedHermeticDockerPolicy().architecture() == "amd64" {
+				wrong = "arm64"
+			}
+			image := dockerImageInspection{ID: hermeticDockerConfigDigest, Architecture: wrong, OS: "linux"}
 			image.Config.Env = []string{"GOLANG_VERSION=" + hermeticGoVersion, "GOTOOLCHAIN=" + hermeticGoToolchain}
 			return image
 		}},
 		{name: "Go version", make: func() dockerImageInspection {
-			image := dockerImageInspection{ID: hermeticDockerConfigDigest, Architecture: "arm64", OS: "linux"}
+			image := dockerImageInspection{ID: hermeticDockerConfigDigest, Architecture: fixedHermeticDockerPolicy().architecture(), OS: "linux"}
 			image.Config.Env = []string{"GOLANG_VERSION=1.24.0", "GOTOOLCHAIN=" + hermeticGoToolchain}
 			return image
 		}},
 		{name: "Go toolchain", make: func() dockerImageInspection {
-			image := dockerImageInspection{ID: hermeticDockerConfigDigest, Architecture: "arm64", OS: "linux"}
+			image := dockerImageInspection{ID: hermeticDockerConfigDigest, Architecture: fixedHermeticDockerPolicy().architecture(), OS: "linux"}
 			image.Config.Env = []string{"GOLANG_VERSION=" + hermeticGoVersion, "GOTOOLCHAIN=auto"}
 			return image
 		}},

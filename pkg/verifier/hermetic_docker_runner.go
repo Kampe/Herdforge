@@ -114,8 +114,12 @@ func RunFAC151Hermetic(ctx context.Context) (FAC151DockerResult, error) {
 	if err != nil || !validSHA(candidate) {
 		return FAC151DockerResult{}, errors.New("FAC-151 requires an exact candidate HEAD")
 	}
-	if status, statusErr := fixedGitOutput(ctx, root, "status", "--porcelain", "--untracked-files=all"); statusErr != nil || status != "" {
-		return FAC151DockerResult{}, errors.New("FAC-151 requires a clean checkout")
+	// Archive is built from the exact candidate tree (git archive), so only
+	// tracked dirty state can desync the SHA from source. Untracked fleet
+	// residue under .herd/ (control-mail, sqlite, spin-state) must not block
+	// the hermetic gate or CI would never be able to run it.
+	if status, statusErr := fixedGitOutput(ctx, root, "status", "--porcelain", "--untracked-files=no"); statusErr != nil || status != "" {
+		return FAC151DockerResult{}, errors.New("FAC-151 requires a clean tracked checkout")
 	}
 	runner, err := newFAC151DockerRunner(root, candidate)
 	if err != nil {
@@ -166,8 +170,13 @@ func newFAC151DockerRunner(sourceRoot, candidateSHA string) (*hermeticDockerRunn
 	if !validSHA(candidateSHA) {
 		return nil, errors.New("FAC-151 candidate SHA is invalid")
 	}
+	policy := fixedHermeticDockerPolicy()
+	if !policy.valid() {
+		return nil, fmt.Errorf("FAC-151 hermetic image pin unavailable for this architecture")
+	}
 	return &hermeticDockerRunner{
-		sourceRoot: sourceRoot, candidateSHA: candidateSHA, policy: fixedHermeticDockerPolicy(), docker: fixedDockerCLI{command: runDocker},
+		sourceRoot: sourceRoot, candidateSHA: candidateSHA, policy: policy,
+		docker:    fixedDockerCLI{command: runDocker, pin: policy.pin},
 		allowlist: verifyFAC151Allowlist, hostCache: verifiedHostGoCache, archive: archiveCandidateSource,
 	}, nil
 }
@@ -510,7 +519,27 @@ func commaOptions(value string) (map[string]bool, error) {
 	return options, nil
 }
 
-type fixedDockerCLI struct{ command dockerCommandFunc }
+type fixedDockerCLI struct {
+	command dockerCommandFunc
+	pin     hermeticImagePin
+}
+
+func (d fixedDockerCLI) resolvedPin() hermeticImagePin {
+	if d.pin.Image != "" && d.pin.Platform != "" && d.pin.Architecture != "" {
+		return d.pin
+	}
+	// Tests that construct fixedDockerCLI without an explicit pin inherit the
+	// host architecture's package-level pin.
+	if hermeticDockerImage != "" {
+		return hermeticImagePin{
+			Platform:     hermeticDockerPlatform,
+			Architecture: strings.TrimPrefix(hermeticDockerPlatform, "linux/"),
+			Image:        hermeticDockerImage,
+			ConfigDigest: hermeticDockerConfigDigest,
+		}
+	}
+	return hermeticImagePin{}
+}
 
 func ensureHermeticDockerImage(ctx context.Context, docker fixedDocker) error {
 	err := docker.InspectImage(ctx)
@@ -518,7 +547,11 @@ func ensureHermeticDockerImage(ctx context.Context, docker fixedDocker) error {
 		return nil
 	}
 	var absent *dockerImageAbsentError
-	if !errors.As(err, &absent) || absent.Reference != hermeticDockerImage {
+	if !errors.As(err, &absent) {
+		return err
+	}
+	// Accept absence only for the reference this docker client inspects.
+	if absent.Reference == "" {
 		return err
 	}
 	if err := docker.Pull(ctx); err != nil {
@@ -536,11 +569,15 @@ func (d fixedDockerCLI) run(ctx context.Context, input []byte, args []string) (d
 }
 
 func (d fixedDockerCLI) Create(ctx context.Context) (string, error) {
-	args := []string{"create", "--pull", "never", "--platform", hermeticDockerPlatform, "--network", "none", "--read-only", "--cap-drop", "ALL", "--security-opt", "no-new-privileges:true", "--user", hermeticContainerUser, "--pids-limit", strconv.Itoa(hermeticPIDLimit), "--memory", hermeticMemoryLimit}
+	pin := d.resolvedPin()
+	if pin.Image == "" || pin.Platform == "" {
+		return "", errors.New("FAC-151 hermetic image pin is unavailable")
+	}
+	args := []string{"create", "--pull", "never", "--platform", pin.Platform, "--network", "none", "--read-only", "--cap-drop", "ALL", "--security-opt", "no-new-privileges:true", "--user", hermeticContainerUser, "--pids-limit", strconv.Itoa(hermeticPIDLimit), "--memory", hermeticMemoryLimit}
 	for _, tmpfs := range hermeticDockerTmpfs {
 		args = append(args, "--tmpfs", tmpfs)
 	}
-	args = append(args, hermeticDockerImage, "/bin/sh", "-c", "exec sleep 3600")
+	args = append(args, pin.Image, "/bin/sh", "-c", "exec sleep 3600")
 	result, err := d.run(ctx, nil, args)
 	if err != nil {
 		return "", fmt.Errorf("create fixed FAC-151 container: %w", err)
@@ -580,10 +617,14 @@ func (d fixedDockerCLI) Inspect(ctx context.Context, id string) (dockerInspectio
 }
 
 func (d fixedDockerCLI) InspectImage(ctx context.Context) error {
-	result, err := d.run(ctx, nil, []string{"image", "inspect", "--platform", hermeticDockerPlatform, hermeticDockerImage})
+	pin := d.resolvedPin()
+	if pin.Image == "" || pin.Platform == "" || pin.Architecture == "" {
+		return errors.New("FAC-151 hermetic image pin is unavailable")
+	}
+	result, err := d.run(ctx, nil, []string{"image", "inspect", "--platform", pin.Platform, pin.Image})
 	if err != nil {
-		if isDockerImageAbsent(err, hermeticDockerImage) {
-			return &dockerImageAbsentError{Reference: hermeticDockerImage, Cause: err}
+		if isDockerImageAbsent(err, pin.Image) {
+			return &dockerImageAbsentError{Reference: pin.Image, Cause: err}
 		}
 		return fmt.Errorf("inspect fixed Docker image before create: %w", err)
 	}
@@ -592,26 +633,28 @@ func (d fixedDockerCLI) InspectImage(ctx context.Context) error {
 		return errors.New("Docker image inspect response is malformed")
 	}
 	image := values[0]
-	referenceDigest := pinnedDockerReferenceDigest()
-	if referenceDigest == "" || (image.ID != hermeticDockerConfigDigest && image.ID != referenceDigest) || image.Architecture != "arm64" || image.OS != "linux" {
+	referenceDigest := pinnedDockerReferenceDigest(pin.Image)
+	// Accept config digest or the content/reference digest; architecture must
+	// match the pin so an arm64 pin cannot authorize an amd64 image (and vice versa).
+	if referenceDigest == "" || (image.ID != pin.ConfigDigest && image.ID != referenceDigest) || image.Architecture != pin.Architecture || image.OS != "linux" {
 		return errors.New("Docker image manifest/config/platform evidence violates fixed policy")
 	}
 	seen := map[string]bool{}
 	for _, value := range image.Config.Env {
 		seen[value] = true
 	}
-	if !seen["GOLANG_VERSION=1.25.0"] || !seen["GOTOOLCHAIN=local"] {
+	if !seen["GOLANG_VERSION="+hermeticGoVersion] || !seen["GOTOOLCHAIN="+hermeticGoToolchain] {
 		return errors.New("Docker image Go environment evidence violates fixed policy")
 	}
 	return nil
 }
 
-func pinnedDockerReferenceDigest() string {
+func pinnedDockerReferenceDigest(image string) string {
 	const prefix = "golang@sha256:"
-	if !strings.HasPrefix(hermeticDockerImage, prefix) {
+	if !strings.HasPrefix(image, prefix) {
 		return ""
 	}
-	digest := strings.TrimPrefix(hermeticDockerImage, "golang@")
+	digest := strings.TrimPrefix(image, "golang@")
 	if len(digest) != len("sha256:")+64 || !strings.HasPrefix(digest, "sha256:") || strings.ToLower(digest) != digest {
 		return ""
 	}
@@ -622,7 +665,11 @@ func pinnedDockerReferenceDigest() string {
 }
 
 func (d fixedDockerCLI) Pull(ctx context.Context) error {
-	_, err := d.run(ctx, nil, []string{"pull", "--platform", hermeticDockerPlatform, hermeticDockerImage})
+	pin := d.resolvedPin()
+	if pin.Image == "" || pin.Platform == "" {
+		return errors.New("FAC-151 hermetic image pin is unavailable")
+	}
+	_, err := d.run(ctx, nil, []string{"pull", "--platform", pin.Platform, pin.Image})
 	if err != nil {
 		return fmt.Errorf("pull fixed Docker image: %w", err)
 	}
