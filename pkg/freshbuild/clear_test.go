@@ -113,6 +113,30 @@ func TestClearChain_RejectsForbiddenDirsFilesAndGlobs(t *testing.T) {
 	}
 }
 
+// A multi-entry spec with a later forbidden name must refuse WITHOUT partial wipe.
+func TestClearChain_NoPartialWipeOnLaterForbidden(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	a := filepath.Join(root, "a")
+	if err := os.MkdirAll(filepath.Join(a, "dist"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	marker := filepath.Join(a, "dist", "keep.js")
+	if err := os.WriteFile(marker, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	err := ClearChain(root, []string{a}, ArtifactSpec{Dirs: []string{"dist", "node_modules"}})
+	if err == nil {
+		t.Fatal("must refuse multi-entry spec with forbidden name")
+	}
+	if !strings.Contains(err.Error(), "node_modules") {
+		t.Fatalf("err=%v", err)
+	}
+	if _, statErr := os.Stat(marker); statErr != nil {
+		t.Fatalf("dist must survive when a later entry is forbidden: %v", statErr)
+	}
+}
+
 func TestClearChain_EmptySpecNoop(t *testing.T) {
 	t.Parallel()
 	root := t.TempDir()

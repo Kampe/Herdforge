@@ -139,6 +139,10 @@ func (p PnpmProfile) ArtifactNames() ArtifactSpec {
 	}
 }
 
+func (p PnpmProfile) ChainHeader(pkg string, n int) string {
+	return fmt.Sprintf("herd-fresh-build: chain for %s = %d package(s) (target + dependencies):", pkg, n)
+}
+
 func (p PnpmProfile) DryRunClearLine() string {
 	return "herd-fresh-build: --dry-run, would clear " + p.ArtifactNames().PlanSummary() + " in each above, then rebuild. Nothing changed."
 }

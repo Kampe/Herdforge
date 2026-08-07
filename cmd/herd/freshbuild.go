@@ -36,6 +36,12 @@ func runFreshBuild() {
 	if r := findRepoRoot(root); r != "" {
 		root = r
 	}
+	// Realpath the root (zsh :A). Getwd keeps logical $PWD; pnpm `exec pwd`
+	// returns the physical path — without EvalSymlinks, normalizeChainDirs
+	// rejects every chain dir under a symlink checkout or /tmp→/private/tmp.
+	if resolved, rerr := filepath.EvalSymlinks(root); rerr == nil && resolved != "" {
+		root = resolved
+	}
 
 	v, err := freshbuild.FreshBuild(context.Background(), freshbuild.Options{
 		Root:   root,
@@ -75,9 +81,6 @@ func parseFreshBuildArgs(args []string) (target string, dry bool, err error) {
 		switch a {
 		case "--dry-run":
 			dry = true
-		case "-h", "--help":
-			// Help is handled by the global gate; keep defensive.
-			return "", false, nil
 		default:
 			if strings.HasPrefix(a, "-") {
 				return "", false, fmt.Errorf("herd-fresh-build: unknown flag %s", a)

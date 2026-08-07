@@ -12,11 +12,15 @@ import (
 // reports CLEAN would misdiagnose a real error as stale dist). Paths outside
 // root are rejected. Missing artifacts are not errors (idempotent clear).
 //
-// Destructive boundary: every Dirs/Files/Globs basename is checked against
-// forbiddenArtifact before any unlink.
+// Destructive boundary: every Dirs/Files/Globs entry is validated against
+// forbiddenArtifact (and path containment) in a dry pass before any unlink,
+// so a later forbidden entry cannot leave a partial wipe behind.
 func ClearChain(root string, dirs []string, spec ArtifactSpec) error {
-	root = filepath.Clean(root)
-	if root == "" {
+	rootCanon, err := canonicalPath(root)
+	if err != nil {
+		return fmt.Errorf("freshbuild: clear requires repository root: %w", err)
+	}
+	if rootCanon == "" {
 		return fmt.Errorf("freshbuild: clear requires repository root")
 	}
 	if spec.Empty() {
@@ -24,9 +28,19 @@ func ClearChain(root string, dirs []string, spec ArtifactSpec) error {
 		// perform no destructive work.
 		return nil
 	}
+
+	type job struct {
+		path  string
+		isDir bool // RemoveAll vs Remove
+	}
+	var jobs []job
+
 	for _, d := range dirs {
-		d = filepath.Clean(d)
-		if err := assertUnderRoot(root, d); err != nil {
+		dCanon, err := canonicalPath(d)
+		if err != nil {
+			return fmt.Errorf("freshbuild: canonicalize chain dir: %w", err)
+		}
+		if err := assertUnderRoot(rootCanon, dCanon); err != nil {
 			return err
 		}
 		for _, name := range spec.Dirs {
@@ -37,13 +51,11 @@ func ClearChain(root string, dirs []string, spec ArtifactSpec) error {
 			if forbiddenArtifact(name) {
 				return fmt.Errorf("freshbuild: refuse destructive artifact %q", name)
 			}
-			target := filepath.Join(d, name)
-			if err := assertUnderRoot(root, target); err != nil {
+			target := filepath.Join(dCanon, name)
+			if err := assertUnderRoot(rootCanon, target); err != nil {
 				return err
 			}
-			if err := os.RemoveAll(target); err != nil {
-				return fmt.Errorf("freshbuild: remove %s: %w", target, err)
-			}
+			jobs = append(jobs, job{path: target, isDir: true})
 		}
 		for _, name := range spec.Files {
 			name = strings.TrimSpace(name)
@@ -53,33 +65,34 @@ func ClearChain(root string, dirs []string, spec ArtifactSpec) error {
 			if forbiddenArtifact(name) {
 				return fmt.Errorf("freshbuild: refuse destructive artifact %q", name)
 			}
-			target := filepath.Join(d, name)
-			if err := assertUnderRoot(root, target); err != nil {
+			target := filepath.Join(dCanon, name)
+			if err := assertUnderRoot(rootCanon, target); err != nil {
 				return err
 			}
-			if err := os.Remove(target); err != nil && !os.IsNotExist(err) {
-				return fmt.Errorf("freshbuild: remove %s: %w", target, err)
-			}
+			jobs = append(jobs, job{path: target, isDir: false})
 		}
 		for _, pattern := range spec.Globs {
 			pattern = strings.TrimSpace(pattern)
 			if pattern == "" || strings.Contains(pattern, string(os.PathSeparator)) {
 				return fmt.Errorf("freshbuild: refuse unsafe artifact glob %q", pattern)
 			}
-			matches, err := filepath.Glob(filepath.Join(d, pattern))
+			matches, err := filepath.Glob(filepath.Join(dCanon, pattern))
 			if err != nil {
 				return fmt.Errorf("freshbuild: glob %s: %w", pattern, err)
 			}
 			for _, m := range matches {
-				if err := assertUnderRoot(root, m); err != nil {
+				// Glob match may itself be a symlink; canonicalize for containment.
+				mCanon, err := canonicalPath(m)
+				if err != nil {
+					return err
+				}
+				if err := assertUnderRoot(rootCanon, mCanon); err != nil {
 					return err
 				}
 				base := filepath.Base(m)
 				if forbiddenArtifact(base) {
 					return fmt.Errorf("freshbuild: refuse destructive artifact %q (matched by glob %q)", base, pattern)
 				}
-				// Only remove files matching the glob; never follow into dirs
-				// unless the basename is an explicit Dir entry.
 				st, err := os.Lstat(m)
 				if err != nil {
 					if os.IsNotExist(err) {
@@ -88,12 +101,25 @@ func ClearChain(root string, dirs []string, spec ArtifactSpec) error {
 					return err
 				}
 				if st.IsDir() {
+					// Only remove files matching the glob; never follow into dirs
+					// unless the basename is an explicit Dir entry.
 					continue
 				}
-				if err := os.Remove(m); err != nil && !os.IsNotExist(err) {
-					return fmt.Errorf("freshbuild: remove %s: %w", m, err)
-				}
+				jobs = append(jobs, job{path: m, isDir: false})
 			}
+		}
+	}
+
+	// All names validated — now unlink.
+	for _, j := range jobs {
+		if j.isDir {
+			if err := os.RemoveAll(j.path); err != nil {
+				return fmt.Errorf("freshbuild: remove %s: %w", j.path, err)
+			}
+			continue
+		}
+		if err := os.Remove(j.path); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("freshbuild: remove %s: %w", j.path, err)
 		}
 	}
 	return nil
