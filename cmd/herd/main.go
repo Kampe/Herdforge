@@ -38,6 +38,7 @@ import (
 	"github.com/Kampe/Herdforge/pkg/overlap"
 	"github.com/Kampe/Herdforge/pkg/posture"
 	"github.com/Kampe/Herdforge/pkg/preflight"
+	"github.com/Kampe/Herdforge/pkg/standing"
 	"github.com/Kampe/Herdforge/pkg/process"
 	"github.com/Kampe/Herdforge/pkg/provider"
 	"github.com/Kampe/Herdforge/pkg/resetsafe"
@@ -368,7 +369,7 @@ func printUsage() {
 	fmt.Println("  cleanup    Close finished one-off agent tabs (standing fleet exempt)")
 	fmt.Println("  labels     Reconcile drifted Herdforge tab labels in place (FAC-199)")
 	fmt.Println("  forge      Full cycle: pulse worker + review + approve")
-	fmt.Println("  standing   Launch all configured agent lanes in herdr tabs")
+	fmt.Println("  standing   Raise/status/shutdown declarative standing control roles")
 	fmt.Println("  daemon     Start the long-running orchestration daemon (infinite pulse loop)")
 	fmt.Println("  usage      Show harness quota usage from OpenUsage CLI")
 	fmt.Println("  quota      Show binding headroom, pace/pressure, pool breakdown")
@@ -1082,6 +1083,43 @@ func runDaemonCycle(ctx context.Context, admit func(context.Context) error, cycl
 }
 
 func runStandingE() error {
+	fs := flag.NewFlagSet("standing", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	dryRun := fs.Bool("dry-run", false, "Plan raise without creating tabs or starting agents")
+	status := fs.Bool("status", false, "Report live vs missing standing owners")
+	shutdown := fs.Bool("shutdown", false, "Close settled standing owners only (never ephemeral task workers)")
+	only := fs.String("only", "", "Comma-separated lane or forge-<lane> names to operate on")
+	quiet := fs.Bool("quiet", false, "Suppress non-error progress lines")
+	if err := fs.Parse(os.Args[2:]); err != nil {
+		return err
+	}
+
+	mode := standing.ModeRaise
+	switch {
+	case *status && *shutdown:
+		return errors.New("standing: --status and --shutdown are mutually exclusive")
+	case *status && *dryRun:
+		return errors.New("standing: --status and --dry-run are mutually exclusive")
+	case *shutdown && *dryRun:
+		// Dry-run shutdown: plan closes without executing.
+		mode = standing.ModeShutdown
+	case *status:
+		mode = standing.ModeStatus
+	case *shutdown:
+		mode = standing.ModeShutdown
+	case *dryRun:
+		mode = standing.ModeDryRun
+	}
+
+	// Positional bare ids are shorthand for --only (shell parity).
+	onlyList := splitCSV(*only)
+	for _, arg := range fs.Args() {
+		if strings.HasPrefix(arg, "-") {
+			return fmt.Errorf("standing: unknown flag %q", arg)
+		}
+		onlyList = append(onlyList, arg)
+	}
+
 	if err := requireFleetAdmission(context.Background()); err != nil {
 		return err
 	}
@@ -1089,76 +1127,167 @@ func runStandingE() error {
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
 	}
-	return runStandingConfig(cfg, herdr.IsAvailable())
+	return runStandingConfigMode(cfg, herdr.IsAvailable(), mode, onlyList, *quiet, *dryRun && *shutdown)
 }
 
+func splitCSV(s string) []string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return nil
+	}
+	parts := strings.Split(s, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// runStandingConfig is the testable raise entry used by launch-policy tests.
+// It raises every standing lane with live herdr seams when herdrAvailable.
 func runStandingConfig(cfg *config.Config, herdrAvailable bool) error {
-	if !herdrAvailable {
+	return runStandingConfigMode(cfg, herdrAvailable, standing.ModeRaise, nil, false, false)
+}
+
+func runStandingConfigMode(cfg *config.Config, herdrAvailable bool, mode standing.Mode, only []string, quiet bool, shutdownDry bool) error {
+	if !herdrAvailable && mode != standing.ModeDryRun && mode != standing.ModeStatus {
+		// Status may still want a workspace; raise/shutdown need herdr.
+		if mode == standing.ModeRaise || mode == standing.ModeShutdown {
+			return errors.New("herdr CLI not found — install herdr first")
+		}
+	}
+	if !herdrAvailable && mode == standing.ModeRaise {
 		return errors.New("herdr CLI not found — install herdr first")
 	}
 
-	var failures []error
-	for _, lane := range cfg.Lanes {
-		if !lane.Standing {
-			continue
-		}
-		decision, routeErr := launchAdmissionWithLifecycle(liveLaunchLifecycle{}, cfg, lane.Role, true, routedLaneDecision(context.Background(), nil), func(_ *router.LaunchDecision) error { return prepareStandingWorktree(&lane) })
-		if routeErr != nil {
-			fmt.Fprintf(os.Stderr, "  launch route rejected for lane %s: %v\n", lane.Name, routeErr)
-			failures = append(failures, fmt.Errorf("lane %s: %w", lane.Name, routeErr))
-			continue
-		}
-		if err := validateDecisionBeforeSideEffect(decision, lane.Name); err != nil {
-			fmt.Fprintf(os.Stderr, "  launch decision rejected for lane %s: %v\n", lane.Name, err)
-			failures = append(failures, fmt.Errorf("lane %s: %w", lane.Name, err))
-			continue
-		}
-		tabLabel := fmt.Sprintf("forge-%s", lane.Name)
-		fmt.Printf("Launching lane '%s' as agent '%s' (kind=%s)...\n", lane.Name, tabLabel, lane.AgentKind)
-		repository := repositoryIdentityForLaunch(cfg)
-		if repository == "" {
-			failures = append(failures, fmt.Errorf("lane %s repository identity unavailable", lane.Name))
-			continue
-		}
-		if lane.Worktree == "" {
-			failures = append(failures, fmt.Errorf("lane %s requires an isolated worktree", lane.Name))
-			continue
-		}
-
-		cwd := "."
-		if lane.Worktree != "" {
-			cwd = filepath.Join(".", lane.Worktree)
-		}
-		tab, err := herdr.TabCreateForTask(herdr.ResolveWorkspace("."), tabLabel, cwd, true)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "  failed to create tab for lane %s: %v\n", lane.Name, err)
-			failures = append(failures, fmt.Errorf("lane %s create tab: %w", lane.Name, err))
-			continue
-		}
-
-		if err := herdr.StartPreparedAgent(tab.ID, tabLabel, decision.Harness, tab.Pane.ID, launch.Request{Decision: decision, TaskRef: lane.Name, Scope: router.ScopeLane, Repository: repository, Lane: lane.Name}); err != nil {
-			fmt.Fprintf(os.Stderr, "  failed to start agent for lane %s: %v\n", lane.Name, err)
-			failures = append(failures, fmt.Errorf("lane %s start agent: %w", lane.Name, err))
-			continue
-		}
-
-		if lane.Prompt != "" {
-			promptData, readErr := os.ReadFile(lane.Prompt)
-			if readErr != nil {
-				failures = append(failures, fmt.Errorf("lane %s read prompt: %w", lane.Name, readErr))
-				continue
+	opts := standing.Options{
+		Mode:     mode,
+		Only:     only,
+		Quiet:    quiet,
+		RepoRoot: ".",
+		ListAgents: func() ([]standing.Agent, error) {
+			// Policy unit tests pass herdrAvailable=true without a live
+			// herdr binary; an empty inventory is correct until a real
+			// raise needs idempotency against live names.
+			if !herdrAvailable || !herdr.IsAvailable() {
+				return nil, nil
 			}
-			promptText := strings.TrimSpace(string(promptData))
-			if _, promptErr := herdr.AgentPrompt(tabLabel, promptText, false); promptErr != nil {
-				fmt.Fprintf(os.Stderr, "  prompt failed for lane %s: %v\n", lane.Name, promptErr)
-				failures = append(failures, fmt.Errorf("lane %s prompt: %w", lane.Name, promptErr))
-				continue
+			raw, err := herdr.AgentList()
+			if err != nil {
+				if mode == standing.ModeDryRun {
+					return nil, nil
+				}
+				return nil, err
 			}
-		}
-
-		fmt.Printf("  -> tab=%s pane=%s agent=%s running\n", tab.ID, tab.Pane.ID, tabLabel)
+			out := make([]standing.Agent, 0, len(raw))
+			for _, a := range raw {
+				out = append(out, standing.Agent{
+					Name: a.Name, Status: a.Status, PaneID: a.PaneID,
+					TabID: a.TabID, Workspace: a.Workspace, Cwd: a.Cwd,
+				})
+			}
+			return out, nil
+		},
+		ResolveWorkspace: func(repoRoot string, c *config.Config) (string, error) {
+			// Fail-closed: never invent a hardcoded workspace ID (FAC-121).
+			if !herdrAvailable || !herdr.IsAvailable() {
+				return "", errors.New("herdr unavailable for workspace resolution")
+			}
+			return herdr.RequireWorkspace(repoRoot)
+		},
+		PrepareWorktree: func(lane *config.LaneDef) error {
+			return prepareStandingWorktree(lane)
+		},
+		AdmitRoute: func(lane *config.LaneDef) (standing.Route, error) {
+			// Policy + route only — worktree prepare is a post-admission
+			// side effect owned by PrepareWorktree so dry-run/status never
+			// mutate the tree.
+			decision, err := launchAdmission(cfg, lane.Role, true, routedLaneDecision(context.Background(), nil))
+			if err != nil {
+				return standing.Route{}, err
+			}
+			if err := validateDecisionBeforeSideEffect(decision, lane.Name); err != nil {
+				return standing.Route{}, err
+			}
+			return standing.Route{
+				Provider: decision.Provider,
+				Model:    decision.Model,
+				Effort:   decision.Effort,
+				Harness:  decision.Harness,
+				Decision: decision,
+			}, nil
+		},
+		RepositoryIdentity: repositoryIdentityForLaunch,
+		CreateTab: func(workspace, label, cwd string) (standing.Tab, error) {
+			tab, err := herdr.TabCreateForTask(workspace, label, cwd, true)
+			if err != nil {
+				return standing.Tab{}, err
+			}
+			return standing.Tab{ID: tab.ID, Label: tab.Label, PaneID: tab.Pane.ID, Cwd: tab.Cwd}, nil
+		},
+		StartAgent: func(tab standing.Tab, agentName string, route standing.Route, lane *config.LaneDef, repository string) error {
+			decision, ok := route.Decision.(*router.LaunchDecision)
+			if !ok || decision == nil {
+				return errors.New("standing start requires a routed LaunchDecision")
+			}
+			return herdr.StartPreparedAgent(tab.ID, agentName, decision.Harness, tab.PaneID, launch.Request{
+				Decision: decision, TaskRef: lane.Name, Scope: router.ScopeLane,
+				Repository: repository, Lane: lane.Name, Name: agentName, TabID: tab.ID, PaneID: tab.PaneID,
+			})
+		},
+		PromptAgent: func(agentName, promptText string) error {
+			_, err := herdr.AgentPrompt(agentName, promptText, false)
+			return err
+		},
+		CloseTab: func(tabID string) error {
+			// Best-effort: StartPreparedAgent already reconciles most start
+			// failures. A second close of a gone tab must not mask the
+			// original start error.
+			_ = herdr.TabClose(tabID)
+			return nil
+		},
 	}
-	return errors.Join(failures...)
+
+	if mode == standing.ModeShutdown && shutdownDry {
+		// Plan-only shutdown: do not close tabs.
+		opts.CloseTab = nil
+	}
+	if mode == standing.ModeDryRun {
+		opts.CreateTab = nil
+		opts.StartAgent = nil
+		opts.PromptAgent = nil
+		opts.CloseTab = nil
+	}
+
+	result, err := standing.Run(cfg, opts)
+	if result != nil && !quiet {
+		for _, rr := range result.Roles {
+			switch rr.Outcome {
+			case standing.OutcomeRaised:
+				fmt.Printf("herd-standing: started %s (%s/%s) tab=%s pane=%s cwd=%s\n",
+					rr.AgentName, rr.Provider, rr.Model, rr.TabID, rr.PaneID, rr.CWD)
+			case standing.OutcomeSkippedLive:
+				fmt.Printf("herd-standing: skip %s (already live)\n", rr.AgentName)
+			case standing.OutcomePreview:
+				fmt.Printf("herd-standing: DRY %s %s\n", rr.AgentName, rr.Reason)
+			case standing.OutcomeLive:
+				fmt.Printf("herd-standing: live %s %s cwd=%s\n", rr.AgentName, rr.Reason, rr.CWD)
+			case standing.OutcomeMissing:
+				fmt.Printf("herd-standing: missing %s\n", rr.AgentName)
+			case standing.OutcomeClosed, standing.OutcomeWouldClose:
+				fmt.Printf("herd-standing: %s %s (%s)\n", rr.Outcome, rr.AgentName, rr.Reason)
+			case standing.OutcomePreserved:
+				fmt.Printf("herd-standing: preserve %s (%s)\n", rr.AgentName, rr.Reason)
+			case standing.OutcomeFailed:
+				fmt.Fprintf(os.Stderr, "herd-standing: FAIL %s: %s\n", rr.AgentName, rr.Reason)
+			}
+		}
+		fmt.Println(standing.Summary(result))
+	}
+	return err
 }
 
 func runStanding() {
