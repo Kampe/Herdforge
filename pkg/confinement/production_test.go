@@ -124,9 +124,12 @@ func TestBindAndProvePolicyDeniesIncidentPath(t *testing.T) {
 	}
 	fake := &FakeOS{}
 	enf := &Enforcer{Issuer: issuer, OS: fake, ReceiptDir: filepath.Join(root, ".herd", "receipts")}
-	prep, err := enf.PrepareOS(root, shared, "FAC-190", 7, "task/fac-190", "codex", "codex")
+	prep, err := enf.PrepareOS(root, shared, "FAC-190", 7, "task/fac-190", "pi", "pi")
 	if err != nil {
 		t.Fatal(err)
+	}
+	if !prep.WrapperResolves("pi") {
+		t.Fatal("pi harness wrapper not installed")
 	}
 	// Integrity store must live outside the worktree.
 	if prep.Session.Root == "" || isPathPrefix(prep.Session.Root, root) {
@@ -363,6 +366,36 @@ func TestDarwinFirstMatchProfileDeniesSharedParent(t *testing.T) {
 			t.Fatalf("%s: mutated under confinement", name)
 		}
 	}
+
+	// Live object-store unlink denial (test-only fixture — not on the launch
+	// hot path). Seed outside the sandbox, then try confined rm.
+	oidOut, err := exec.Command("git", "-C", root, "hash-object", "-w", "--stdin").CombinedOutput()
+	if err == nil {
+		oid := strings.TrimSpace(string(oidOut))
+		if len(oid) >= 40 {
+			obj := filepath.Join(common, "objects", oid[:2], oid[2:])
+			if _, err := os.Stat(obj); err == nil {
+				rm := exec.Command("/usr/bin/sandbox-exec", "-f", profile, "/bin/rm", "-f", obj)
+				rm.Dir = root
+				_ = rm.Run()
+				if _, err := os.Stat(obj); err != nil {
+					t.Fatal("confined rm deleted shared object in fixture")
+				}
+				// Do not rm -rf the whole store even in tests against a disposable
+				// fixture under t.TempDir — keep the probe single-object only.
+			}
+		}
+	}
+
+	// Agent home grants must be present once the pi wrapper applies the profile.
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		if !strings.Contains(body, filepath.Join(home, ".claude")) {
+			t.Fatal("profile missing agent home .claude write grant")
+		}
+		if !strings.Contains(body, filepath.Join(home, ".codex")) {
+			t.Fatal("profile missing agent home .codex write grant")
+		}
+	}
 }
 
 func TestRealPathFailsClosedOnMissing(t *testing.T) {
@@ -375,17 +408,24 @@ func TestRealPathFailsClosedOnMissing(t *testing.T) {
 	}
 }
 
-func TestWrapperNamesCoversProviderAndArgv0(t *testing.T) {
-	names := WrapperNames("ollama", "opencode")
-	if len(names) != 2 {
-		t.Fatalf("want provider+argv0, got %v", names)
+func TestWrapperNamesIncludesHarnessFirst(t *testing.T) {
+	names := WrapperNames("pi", "ollama", "opencode")
+	if len(names) != 3 {
+		t.Fatalf("want harness+extras, got %v", names)
+	}
+	if names[0] != "pi" {
+		t.Fatalf("harness must be first for herdr kind intercept, got %v", names)
 	}
 	seen := map[string]bool{}
 	for _, n := range names {
 		seen[n] = true
 	}
-	if !seen["ollama"] || !seen["opencode"] {
+	if !seen["pi"] || !seen["ollama"] || !seen["opencode"] {
 		t.Fatalf("missing names: %v", names)
+	}
+	// Dedup
+	if got := WrapperNames("pi", "pi", "pi"); len(got) != 1 || got[0] != "pi" {
+		t.Fatalf("dedup: %v", got)
 	}
 }
 
@@ -398,13 +438,13 @@ func TestVerifyAgentWrappersDetectsSwap(t *testing.T) {
 	root := filepath.Join(shared, "wt")
 	_ = os.MkdirAll(root, 0o755)
 	enf := &Enforcer{Issuer: issuer, OS: &FakeOS{}}
-	prep, err := enf.PrepareOS(root, shared, "FAC-190", 7, "task/fac-190", "codex", "codex")
+	prep, err := enf.PrepareOS(root, shared, "FAC-190", 7, "task/fac-190", "pi", "pi")
 	if err != nil {
 		t.Fatal(err)
 	}
 	// Unfreeze bin for the swap test.
 	_ = os.Chmod(prep.BinDir, 0o755)
-	wrapper := filepath.Join(prep.BinDir, "codex")
+	wrapper := filepath.Join(prep.BinDir, "pi")
 	_ = os.Chmod(wrapper, 0o755)
 	if err := os.WriteFile(wrapper, []byte("#!/bin/sh\n# swapped\nexit 0\n"), 0o755); err != nil {
 		t.Fatal(err)
@@ -417,7 +457,7 @@ func TestVerifyAgentWrappersDetectsSwap(t *testing.T) {
 	}
 }
 
-func TestPrepareOSInstallsBothOllamaAndOpencode(t *testing.T) {
+func TestPrepareOSInstallsPiHarnessWrapper(t *testing.T) {
 	issuer, err := NewHMACIssuer([]byte("secret"))
 	if err != nil {
 		t.Fatal(err)
@@ -426,11 +466,11 @@ func TestPrepareOSInstallsBothOllamaAndOpencode(t *testing.T) {
 	root := filepath.Join(shared, "wt")
 	_ = os.MkdirAll(root, 0o755)
 	enf := &Enforcer{Issuer: issuer, OS: &FakeOS{}}
-	prep, err := enf.PrepareOS(root, shared, "FAC-190", 7, "task/fac-190", "ollama", "opencode")
+	prep, err := enf.PrepareOS(root, shared, "FAC-190", 7, "task/fac-190", "pi", "pi", "ollama", "opencode")
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, name := range []string{"ollama", "opencode"} {
+	for _, name := range []string{"pi", "ollama", "opencode"} {
 		if !prep.WrapperResolves(name) {
 			t.Fatalf("wrapper %s missing", name)
 		}
@@ -523,7 +563,7 @@ func TestPrepareOSSameLeaseRelaunch(t *testing.T) {
 		t.Fatal(err)
 	}
 	enf := &Enforcer{Issuer: issuer, OS: &FakeOS{}}
-	prep1, err := enf.PrepareOS(root, shared, "FAC-190", 7, "task/fac-190", "codex", "codex")
+	prep1, err := enf.PrepareOS(root, shared, "FAC-190", 7, "task/fac-190", "pi", "pi")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -531,14 +571,14 @@ func TestPrepareOSSameLeaseRelaunch(t *testing.T) {
 		t.Fatalf("first TabEnv: %v", err)
 	}
 	// Second PrepareOS + TabEnv on the same generation must succeed (thaw).
-	prep2, err := enf.PrepareOS(root, shared, "FAC-190", 7, "task/fac-190", "codex", "codex")
+	prep2, err := enf.PrepareOS(root, shared, "FAC-190", 7, "task/fac-190", "pi", "pi")
 	if err != nil {
 		t.Fatalf("same-lease PrepareOS relaunch: %v", err)
 	}
 	if _, err := prep2.TabEnv(root, "/usr/bin"); err != nil {
 		t.Fatalf("same-lease TabEnv relaunch: %v", err)
 	}
-	if !prep2.WrapperResolves("codex") {
+	if !prep2.WrapperResolves("pi") {
 		t.Fatal("wrapper missing after relaunch")
 	}
 }

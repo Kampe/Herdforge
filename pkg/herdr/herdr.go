@@ -103,14 +103,21 @@ func SetToolChildLifecycleFactory(f func(launch.Request, string, string) (ToolCh
 	return func() { toolChildMu.Lock(); newToolChildLifecycle = old; toolChildMu.Unlock() }
 }
 
-func PrepareToolChildLifecycle(tabID, paneID string, req launch.Request, name string) error {
+// PrepareToolChildLifecycle reserves a durable session generation and publishes
+// the provisional tool-child lifecycle. req must be non-nil; SessionGeneration
+// is written back so callers (dispatch bindConfinement) MAC-bind the same
+// generation the agent actually runs under.
+func PrepareToolChildLifecycle(tabID, paneID string, req *launch.Request, name string) error {
+	if req == nil {
+		return fmt.Errorf("tool-child lifecycle requires launch request")
+	}
 	if tabID == "" || paneID == "" {
 		return fmt.Errorf("tool-child lifecycle requires tab and pane")
 	}
 	if req.Decision == nil || req.TaskRef == "" || req.Repository == "" || req.Lane == "" || (req.Scope != "lane" && req.LeaseGeneration <= 0) {
 		return fmt.Errorf("complete launch identity is required before lifecycle preparation")
 	}
-	if err := launch.Validate(req, nil); err != nil {
+	if err := launch.Validate(*req, nil); err != nil {
 		return err
 	}
 	if req.SessionGeneration <= 0 {
@@ -126,7 +133,7 @@ func PrepareToolChildLifecycle(tabID, paneID string, req launch.Request, name st
 	if req.Decision.HarnessSession != "" {
 		return fmt.Errorf("tool-child lifecycle requires an unbound Pi session decision")
 	}
-	sessionPath, err := createPiLaunchSession(req)
+	sessionPath, err := createPiLaunchSession(*req)
 	if err != nil {
 		return err
 	}
@@ -136,7 +143,7 @@ func PrepareToolChildLifecycle(tabID, paneID string, req launch.Request, name st
 		return err
 	}
 	*req.Decision = *bound
-	if err := launch.Validate(req, nil); err != nil {
+	if err := launch.Validate(*req, nil); err != nil {
 		_ = os.Remove(sessionPath)
 		return err
 	}
@@ -148,7 +155,7 @@ func PrepareToolChildLifecycle(tabID, paneID string, req launch.Request, name st
 		return fmt.Errorf("%w: tab %s/pane %s", toolchild.ErrLifecycleCollision, tabID, paneID)
 	}
 	f := newToolChildLifecycle
-	lc, err := f(req, name, paneID)
+	lc, err := f(*req, name, paneID)
 	if err != nil {
 		toolChildMu.Unlock()
 		return err
@@ -194,7 +201,7 @@ func isBoundConcreteLifecycle(lc ToolChildLifecycle) bool {
 // StartPreparedAgent is the required direct-entrypoint adapter. It closes
 // the gap between tab creation and exact Herdr-reported owner binding.
 func StartPreparedAgent(tabID, name, kind, paneID string, req launch.Request) error {
-	if err := PrepareToolChildLifecycle(tabID, paneID, req, name); err != nil {
+	if err := PrepareToolChildLifecycle(tabID, paneID, &req, name); err != nil {
 		if errors.Is(err, toolchild.ErrLifecycleCollision) {
 			return err
 		}

@@ -49,18 +49,21 @@ func TestProductionConfinementPrepareAndBind(t *testing.T) {
 		TaskRef:         "FAC-190",
 		LeaseGeneration: 7,
 		Decision: &router.LaunchDecision{
-			Provider: "codex",
-			Model:    "m",
-			Effort:   "medium",
-			Argv:     []string{"codex", "--model", "m"},
+			Provider:    "codex",
+			Harness:     router.PiHarness,
+			Model:       "m",
+			Effort:      "medium",
+			Argv:        []string{"codex", "--model", "m"},
+			HarnessArgv: []string{"pi", "--model", "m", "--thinking", "medium"},
 		},
 	}
 	_, prep, err := d.prepareConfinementOS(req, &worktree.WorktreeInfo{Path: wt, Branch: "task/fac-190"})
 	if err != nil {
 		t.Fatalf("prepare: %v", err)
 	}
-	if prep == nil || !prep.WrapperResolves("codex") || prep.ProfileDigest == "" {
-		t.Fatalf("prep incomplete: %+v", prep)
+	// Production herdr kind is pi — that wrapper is the only intercept that matters.
+	if prep == nil || !prep.WrapperResolves(router.PiHarness) || prep.ProfileDigest == "" {
+		t.Fatalf("prep incomplete (need pi wrapper): %+v", prep)
 	}
 	// Session integrity store must sit under shared, never nested in the worktree
 	// write grant (round-5 CRITICAL). Empty body / substring-only checks are not enough:
@@ -105,18 +108,24 @@ func TestProductionConfinementPrepareAndBind(t *testing.T) {
 		TaskRef:         "FAC-190",
 		LeaseGeneration: 8,
 		Decision: &router.LaunchDecision{
-			Provider: "ollama",
-			Model:    "m",
-			Effort:   "medium",
-			Argv:     []string{"opencode", "--model", "m"},
+			Provider:    "ollama",
+			Harness:     router.PiHarness,
+			Model:       "m",
+			Effort:      "medium",
+			Argv:        []string{"opencode", "--model", "m"},
+			HarnessArgv: []string{"pi", "--model", "m", "--thinking", "medium"},
 		},
 	}
 	_, prep2, err := d.prepareConfinementOS(req2, &worktree.WorktreeInfo{Path: wt, Branch: "task/fac-190"})
 	if err != nil {
 		t.Fatal(err)
 	}
+	if !prep2.WrapperResolves(router.PiHarness) {
+		t.Fatalf("pi wrapper missing: %+v", prep2.Names)
+	}
+	// Extras may also be installed; harness is the hard requirement.
 	if !prep2.WrapperResolves("ollama") || !prep2.WrapperResolves("opencode") {
-		t.Fatalf("multi-name wrap: %+v", prep2.Names)
+		t.Fatalf("optional multi-name wrap: %+v", prep2.Names)
 	}
 
 	d.Confinement = &confinement.Enforcer{Issuer: issuer, OS: nil}
@@ -125,11 +134,66 @@ func TestProductionConfinementPrepareAndBind(t *testing.T) {
 	}
 }
 
-func TestProductionConfinementRequiresArgv(t *testing.T) {
+func TestProductionConfinementRequiresHarness(t *testing.T) {
 	d := &Dispatcher{Production: true, Worktree: staticRoot{root: t.TempDir()}}
 	req := launch.Request{TaskRef: "FAC-190", LeaseGeneration: 1, Decision: &router.LaunchDecision{Provider: "codex"}}
 	if _, _, err := d.prepareConfinementOS(req, &worktree.WorktreeInfo{Path: t.TempDir()}); err == nil {
-		t.Fatal("empty argv accepted")
+		t.Fatal("missing harness accepted")
+	}
+}
+
+func TestProductionConfinementRejectsNonPiHarness(t *testing.T) {
+	shared := t.TempDir()
+	issuer, _ := confinement.NewHMACIssuer([]byte("s"))
+	d := &Dispatcher{
+		Production:  true,
+		Confinement: &confinement.Enforcer{Issuer: issuer, OS: &confinement.FakeOS{}},
+		Worktree:    staticRoot{root: shared},
+	}
+	req := launch.Request{
+		TaskRef: "FAC-190", LeaseGeneration: 1,
+		Decision: &router.LaunchDecision{
+			Provider: "codex", Harness: "codex", Model: "m", Effort: "medium",
+			Argv: []string{"codex"},
+		},
+	}
+	if _, _, err := d.prepareConfinementOS(req, &worktree.WorktreeInfo{Path: filepath.Join(shared, "wt")}); err == nil {
+		t.Fatal("non-pi harness accepted")
+	}
+}
+
+func TestBindConfinementRequiresSessionGeneration(t *testing.T) {
+	shared := t.TempDir()
+	wt := filepath.Join(shared, "wt")
+	_ = os.MkdirAll(wt, 0o755)
+	issuer, _ := confinement.NewHMACIssuer([]byte("s"))
+	enf := &confinement.Enforcer{Issuer: issuer, OS: &confinement.FakeOS{}}
+	d := &Dispatcher{Production: true, Confinement: enf, Worktree: staticRoot{root: shared}}
+	req := launch.Request{
+		TaskRef: "FAC-190", LeaseGeneration: 7, Repository: "repo",
+		// SessionGeneration deliberately 0 — must fail closed (no second mint).
+		Decision: &router.LaunchDecision{
+			Provider: "codex", Harness: router.PiHarness, Model: "m", Effort: "medium",
+			Argv: []string{"codex"}, HarnessArgv: []string{"pi", "--model", "m"},
+		},
+	}
+	_, prep, err := d.prepareConfinementOS(req, &worktree.WorktreeInfo{Path: wt, Branch: "task/fac-190"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = d.bindConfinement(enf, prep, req,
+		&provider.Task{Ref: "FAC-190"},
+		&config.LaneDef{Name: "smith"},
+		&worktree.WorktreeInfo{Path: wt, Branch: "task/fac-190"},
+		&DispatchResult{LeaseGeneration: 7},
+		&herdr.TabInfo{ID: "t", Pane: herdr.PaneInfo{ID: "p"}},
+		"task-fac-190",
+	)
+	if err == nil {
+		t.Fatal("bindConfinement minted a session generation instead of requiring the lifecycle one")
+	}
+	if !strings.Contains(err.Error(), "session generation") {
+		t.Fatalf("want session generation error, got %v", err)
 	}
 }
 
@@ -144,8 +208,8 @@ func TestProductionConfinementRequiresLease(t *testing.T) {
 	req := launch.Request{
 		TaskRef: "FAC-190",
 		Decision: &router.LaunchDecision{
-			Provider: "codex", Model: "m", Effort: "medium",
-			Argv: []string{"codex", "--model", "m"},
+			Provider: "codex", Harness: router.PiHarness, Model: "m", Effort: "medium",
+			Argv: []string{"codex", "--model", "m"}, HarnessArgv: []string{"pi"},
 		},
 	}
 	if _, _, err := d.prepareConfinementOS(req, &worktree.WorktreeInfo{Path: filepath.Join(shared, "wt")}); err == nil {
