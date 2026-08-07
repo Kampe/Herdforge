@@ -832,11 +832,14 @@ func (d *Dispatcher) prepareConfinementOS(
 	if err != nil {
 		return nil, nil, err
 	}
-	kind := strings.TrimSpace(request.Decision.Provider)
-	if kind == "" {
-		kind = filepath.Base(request.Decision.Argv[0])
-	}
-	prep, err := enf.PrepareOS(wtInfo.Path, d.Worktree.RepoRoot(), kind, request.Decision.Argv[0])
+	// Pass provider + argv[0] so wrappers cover both herdr kind names and the
+	// shell executable (e.g. provider=ollama/lazer → argv0=opencode).
+	prep, err := enf.PrepareOS(
+		wtInfo.Path,
+		d.Worktree.RepoRoot(),
+		request.Decision.Provider,
+		request.Decision.Argv[0],
+	)
 	if err != nil {
 		return nil, nil, err
 	}

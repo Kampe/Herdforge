@@ -32,7 +32,8 @@ type PreparedOS struct {
 	Backend     string
 	ProfilePath string
 	BinDir      string
-	Kind        string
+	// Names are PATH entry basenames installed under BinDir (provider + argv0).
+	Names []string
 }
 
 // ProductionEnforcer builds the fail-closed production enforcer from env.
@@ -49,9 +50,10 @@ func ProductionEnforcer() (*Enforcer, error) {
 }
 
 // PrepareOS installs the seatbelt profile, proves write denials under that
-// exact profile, and installs the PATH-first agent wrapper. Call this before
-// TabCreate so the pane inherits PATH with the wrapper first.
-func (e *Enforcer) PrepareOS(worktree, sharedRoot, kind, realAgent string) (*PreparedOS, error) {
+// exact profile, and installs PATH-first agent wrappers for every name that
+// the live shell or herdr kind may resolve (argv[0] basename and provider).
+// Call this before TabCreate so the pane inherits PATH with the wrappers first.
+func (e *Enforcer) PrepareOS(worktree, sharedRoot, provider, realAgent string) (*PreparedOS, error) {
 	if e == nil {
 		return nil, ErrUnauthenticated
 	}
@@ -66,9 +68,9 @@ func (e *Enforcer) PrepareOS(worktree, sharedRoot, kind, realAgent string) (*Pre
 			return nil, err
 		}
 	}
-	kind = strings.TrimSpace(kind)
-	if kind == "" {
-		return nil, fmt.Errorf("confinement: agent kind required")
+	names := WrapperNames(provider, realAgent)
+	if len(names) == 0 {
+		return nil, fmt.Errorf("confinement: agent wrapper names required (provider and/or argv0)")
 	}
 	profile, err := osb.Prepare(worktree, sharedRoot)
 	if err != nil {
@@ -77,9 +79,12 @@ func (e *Enforcer) PrepareOS(worktree, sharedRoot, kind, realAgent string) (*Pre
 	if err := osb.ProveWriteDenials(worktree, sharedRoot, profile); err != nil {
 		return nil, err
 	}
-	binDir, err := osb.InstallAgentWrapper(worktree, profile, kind, realAgent)
+	binDir, err := osb.InstallAgentWrappers(worktree, profile, names, realAgent)
 	if err != nil {
 		return nil, fmt.Errorf("confinement: agent wrapper: %w", err)
+	}
+	if err := VerifyAgentWrappers(binDir, profile, names); err != nil {
+		return nil, err
 	}
 	probe := exec.Command("/usr/bin/true")
 	if err := osb.Wrap(probe, profile); err != nil {
@@ -89,7 +94,7 @@ func (e *Enforcer) PrepareOS(worktree, sharedRoot, kind, realAgent string) (*Pre
 		Backend:     osb.Name(),
 		ProfilePath: profile,
 		BinDir:      binDir,
-		Kind:        kind,
+		Names:       append([]string(nil), names...),
 	}, nil
 }
 
@@ -130,7 +135,7 @@ func (e *Enforcer) BindAndProve(id LaunchIdentity, prep *PreparedOS) (*Binding, 
 		}
 	}
 	if !e.SkipOS {
-		if prep == nil || prep.ProfilePath == "" || prep.BinDir == "" || prep.Backend == "" {
+		if prep == nil || prep.ProfilePath == "" || prep.BinDir == "" || prep.Backend == "" || len(prep.Names) == 0 {
 			return nil, fmt.Errorf("confinement: PreparedOS required before bind (call PrepareOS before TabCreate)")
 		}
 		// Re-prove with the exact installed profile so a swapped profile cannot
@@ -145,6 +150,10 @@ func (e *Enforcer) BindAndProve(id LaunchIdentity, prep *PreparedOS) (*Binding, 
 		}
 		if err := osb.ProveWriteDenials(binding.WorktreeRoot, binding.SharedRoot, prep.ProfilePath); err != nil {
 			return nil, fmt.Errorf("confinement: re-prove after tab: %w", err)
+		}
+		// Bind wrap claim to on-disk wrapper contents, not just a prior PrepareOS.
+		if err := VerifyAgentWrappers(prep.BinDir, prep.ProfilePath, prep.Names); err != nil {
+			return nil, fmt.Errorf("confinement: wrapper integrity after tab: %w", err)
 		}
 		binding.OSBackend = prep.Backend
 		binding.OSProved = true

@@ -28,14 +28,15 @@ type OSBackend interface {
 	// worktree is granted file-write; shared-root parents are never allowed.
 	Prepare(worktree, sharedRoot string) (profilePath string, err error)
 	// ProveWriteDenials runs hermetic children under profilePath. It never
-	// creates directories under sharedRoot; outside targets live in a disposable
-	// probe tree that is removed after the proof.
+	// creates directories under sharedRoot; outside targets live only in a
+	// system-temp disposable tree that is removed after the proof.
 	ProveWriteDenials(worktree, sharedRoot, profilePath string) error
 	// Wrap rewrites cmd to run under sandbox-exec with the prepared profile.
 	Wrap(cmd *exec.Cmd, profilePath string) error
-	// InstallAgentWrapper installs a PATH-first wrapper named `kind` that
-	// re-execs the real agent under the same profile used by ProveWriteDenials.
-	InstallAgentWrapper(worktree, profilePath, kind, realAgentPath string) (binDir string, err error)
+	// InstallAgentWrappers installs PATH-first wrappers for every name in
+	// `names` (provider and/or argv[0] basenames) that re-exec the real agent
+	// under the same profile used by ProveWriteDenials.
+	InstallAgentWrappers(worktree, profilePath string, names []string, realAgentPath string) (binDir string, err error)
 }
 
 // ActiveOS returns a live backend or nil when none is usable.
@@ -98,22 +99,27 @@ func (f *FakeOS) Wrap(cmd *exec.Cmd, profilePath string) error {
 	return nil
 }
 
-func (f *FakeOS) InstallAgentWrapper(worktree, profilePath, kind, realAgentPath string) (string, error) {
-	if kind == "" || profilePath == "" {
-		return "", fmt.Errorf("confinement: kind and profile required for agent wrapper")
+func (f *FakeOS) InstallAgentWrappers(worktree, profilePath string, names []string, realAgentPath string) (string, error) {
+	if len(names) == 0 || profilePath == "" {
+		return "", fmt.Errorf("confinement: wrapper names and profile required")
 	}
 	binDir := filepath.Join(worktree, ".herd", "confine", "bin")
 	if err := os.MkdirAll(binDir, 0o755); err != nil {
 		return "", err
 	}
-	wrapper := filepath.Join(binDir, kind)
-	// Test wrapper records invocations; does not need sandbox-exec.
-	body := "#!/bin/sh\nexec " + shellSingleArg(realAgentPath) + " \"$@\"\n"
+	// Embed profile path so VerifyAgentWrappers can bind install to prove.
+	body := "#!/bin/sh\n# profile=" + profilePath + "\nexec " + shellSingleArg(realAgentPath) + " \"$@\"\n"
 	if realAgentPath == "" {
-		body = "#!/bin/sh\nexit 0\n"
+		body = "#!/bin/sh\n# profile=" + profilePath + "\nexit 0\n"
 	}
-	if err := os.WriteFile(wrapper, []byte(body), 0o755); err != nil {
-		return "", err
+	for _, name := range names {
+		name = strings.TrimSpace(name)
+		if name == "" || strings.Contains(name, string(filepath.Separator)) {
+			return "", fmt.Errorf("confinement: invalid wrapper name %q", name)
+		}
+		if err := os.WriteFile(filepath.Join(binDir, name), []byte(body), 0o755); err != nil {
+			return "", err
+		}
 	}
 	f.BinDir = binDir
 	return binDir, nil
@@ -157,49 +163,33 @@ func (d DarwinSeatbelt) ProveWriteDenials(worktree, sharedRoot, profilePath stri
 	if strings.TrimSpace(profilePath) == "" {
 		return fmt.Errorf("%w: empty profile", ErrOSProbeFailed)
 	}
-	// Hermetic outside targets: disposable tree OUTSIDE the worktree and NOT
-	// under the live shared root. Creating dirs under sharedRoot is forbidden
-	// for a proof function (FAC-190 review finding #2).
-	probeRoot, err := os.MkdirTemp(filepath.Dir(absWT), "fac190-probe-*")
+	// Hermetic outside targets: ALWAYS system temp. Never MkdirTemp under
+	// filepath.Dir(worktree) — for production task worktrees that parent is
+	// under the shared checkout, and creating then deleting still mutates
+	// the shared tree (round-2 finding #2).
+	probeRoot, err := os.MkdirTemp("", "fac190-probe-*")
 	if err != nil {
-		// Fall back to system temp when parent of worktree is not writable
-		// (should not happen for task worktrees under .herd/worktrees).
-		probeRoot, err = os.MkdirTemp("", "fac190-probe-*")
-		if err != nil {
-			return err
-		}
+		return err
 	}
 	probeRoot, err = realPath(probeRoot)
 	if err != nil {
 		_ = os.RemoveAll(probeRoot)
 		return err
 	}
-	// Refuse to place probes under the shared root or worktree.
+	defer os.RemoveAll(probeRoot)
 	if sharedRoot != "" {
 		absShared, err := realPath(sharedRoot)
 		if err != nil {
-			_ = os.RemoveAll(probeRoot)
 			return err
 		}
+		// Fail closed if system temp somehow nests under shared (misconfigured TMPDIR).
 		if probeRoot == absShared || isPathPrefix(probeRoot, absShared) || isPathPrefix(absShared, probeRoot) {
-			// Recreate on system temp if we accidentally nested under shared.
-			_ = os.RemoveAll(probeRoot)
-			probeRoot, err = os.MkdirTemp("", "fac190-probe-*")
-			if err != nil {
-				return err
-			}
-			probeRoot, err = realPath(probeRoot)
-			if err != nil {
-				_ = os.RemoveAll(probeRoot)
-				return err
-			}
+			return fmt.Errorf("%w: probe root collides with shared root (check TMPDIR)", ErrOSProbeFailed)
 		}
 	}
 	if isPathPrefix(probeRoot, absWT) || isPathPrefix(absWT, probeRoot) {
-		_ = os.RemoveAll(probeRoot)
 		return fmt.Errorf("%w: probe root collides with worktree", ErrOSProbeFailed)
 	}
-	defer os.RemoveAll(probeRoot)
 
 	outside := filepath.Join(probeRoot, "shared-root", ".herd", "FAC-188-R2-RESIDUAL.md")
 	if err := os.MkdirAll(filepath.Dir(outside), 0o755); err != nil {
@@ -269,12 +259,12 @@ func (d DarwinSeatbelt) Wrap(cmd *exec.Cmd, profilePath string) error {
 	return nil
 }
 
-func (d DarwinSeatbelt) InstallAgentWrapper(worktree, profilePath, kind, realAgentPath string) (string, error) {
+func (d DarwinSeatbelt) InstallAgentWrappers(worktree, profilePath string, names []string, realAgentPath string) (string, error) {
 	if !d.Available() {
 		return "", ErrOSUnavailable
 	}
-	if strings.TrimSpace(kind) == "" || strings.TrimSpace(profilePath) == "" {
-		return "", fmt.Errorf("confinement: kind and profile required")
+	if len(names) == 0 || strings.TrimSpace(profilePath) == "" {
+		return "", fmt.Errorf("confinement: wrapper names and profile required")
 	}
 	absWT, err := realPath(worktree)
 	if err != nil {
@@ -286,10 +276,9 @@ func (d DarwinSeatbelt) InstallAgentWrapper(worktree, profilePath, kind, realAge
 	}
 	real := strings.TrimSpace(realAgentPath)
 	if real == "" || !filepath.IsAbs(real) {
-		// Resolve bare kind/argv[0] names through PATH before realPath.
 		lookup := real
 		if lookup == "" {
-			lookup = kind
+			lookup = names[0]
 		}
 		found, lerr := exec.LookPath(lookup)
 		if lerr != nil {
@@ -307,14 +296,76 @@ func (d DarwinSeatbelt) InstallAgentWrapper(worktree, profilePath, kind, realAge
 		return "", err
 	}
 	// Pure argv re-exec: no shell interpolation of paths.
-	// sandbox-exec -f profile real-agent "$@"
-	script := fmt.Sprintf("#!/bin/sh\n# FAC-190 agent wrap — same profile as ProveWriteDenials.\nexec /usr/bin/sandbox-exec -f %s %s \"$@\"\n",
-		shellSingleArg(absProfile), shellSingleArg(real))
-	wrapper := filepath.Join(binDir, kind)
-	if err := os.WriteFile(wrapper, []byte(script), 0o755); err != nil {
-		return "", err
+	// Profile path appears literally so VerifyAgentWrappers can bind install.
+	script := fmt.Sprintf("#!/bin/sh\n# FAC-190 agent wrap — same profile as ProveWriteDenials.\n# profile=%s\nexec /usr/bin/sandbox-exec -f %s %s \"$@\"\n",
+		absProfile, shellSingleArg(absProfile), shellSingleArg(real))
+	for _, name := range names {
+		name = strings.TrimSpace(name)
+		if name == "" || strings.Contains(name, string(filepath.Separator)) {
+			return "", fmt.Errorf("confinement: invalid wrapper name %q", name)
+		}
+		if err := os.WriteFile(filepath.Join(binDir, name), []byte(script), 0o755); err != nil {
+			return "", err
+		}
 	}
 	return binDir, nil
+}
+
+// VerifyAgentWrappers fails closed when any expected wrapper is missing or no
+// longer embeds the proved profile path (swap between PrepareOS and bind).
+func VerifyAgentWrappers(binDir, profilePath string, names []string) error {
+	if strings.TrimSpace(binDir) == "" || strings.TrimSpace(profilePath) == "" || len(names) == 0 {
+		return fmt.Errorf("confinement: wrapper verification inputs incomplete")
+	}
+	for _, name := range names {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			return fmt.Errorf("confinement: empty wrapper name")
+		}
+		path := filepath.Join(binDir, name)
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return fmt.Errorf("confinement: wrapper %q missing: %w", name, err)
+		}
+		body := string(data)
+		if !strings.Contains(body, profilePath) {
+			return fmt.Errorf("confinement: wrapper %q does not embed profile %q", name, profilePath)
+		}
+		info, err := os.Stat(path)
+		if err != nil {
+			return err
+		}
+		if info.Mode()&0o111 == 0 {
+			return fmt.Errorf("confinement: wrapper %q is not executable", name)
+		}
+	}
+	return nil
+}
+
+// WrapperNames returns the distinct PATH entry names that must intercept the
+// live agent: argv[0] basename (shell executable) and provider (herdr kind),
+// when they differ (e.g. provider=ollama/lazer → argv0=opencode).
+func WrapperNames(provider, argv0 string) []string {
+	seen := map[string]struct{}{}
+	var out []string
+	add := func(s string) {
+		s = strings.TrimSpace(s)
+		if s == "" {
+			return
+		}
+		base := filepath.Base(s)
+		if base == "" || base == "." || base == string(filepath.Separator) {
+			return
+		}
+		if _, ok := seen[base]; ok {
+			return
+		}
+		seen[base] = struct{}{}
+		out = append(out, base)
+	}
+	add(argv0)
+	add(provider)
+	return out
 }
 
 // writeUnder runs /usr/bin/tee under sandbox-exec (no shell, path is argv).
