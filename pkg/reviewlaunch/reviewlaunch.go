@@ -253,6 +253,14 @@ func (l *Launcher) Launch(ctx context.Context, req Request) (Result, error) {
 	if strings.TrimSpace(req.WorktreePath) == "" {
 		return Result{}, ErrWorktreeRequired
 	}
+	// Production herdr returns absolute TabInfo.Cwd; callers often pass a
+	// repo-relative path (e.g. .herd/worktrees/fac-151). Normalize once so
+	// every identity gate compares apples to apples.
+	absWT, absErr := filepath.Abs(req.WorktreePath)
+	if absErr != nil {
+		return Result{}, fmt.Errorf("reviewlaunch: resolve worktree path: %w", absErr)
+	}
+	req.WorktreePath = absWT
 	if req.RepoRoot != "" {
 		if err := worktree.RejectSharedRoot(req.RepoRoot, req.WorktreePath); err != nil {
 			return Result{}, fmt.Errorf("%w: %v", ErrSharedRoot, err)
@@ -291,7 +299,9 @@ func (l *Launcher) Launch(ctx context.Context, req Request) (Result, error) {
 	paneID := tab.Pane.ID
 
 	// Cwd must be the exact task worktree, not a sibling (FAC-172 vs FAC-151).
-	if tab.Cwd != "" && filepath.Clean(tab.Cwd) != filepath.Clean(req.WorktreePath) {
+	// Compare Abs-normalized paths: herdr always reports absolute cwd while
+	// operators may have handed a relative path before normalization above.
+	if tab.Cwd != "" && !sameWorktreePath(tab.Cwd, req.WorktreePath) {
 		return Result{}, l.fail(req, tabID, "cwd_drift", fmt.Errorf("%w: tab cwd %q != task worktree %q", ErrIdentityDrift, tab.Cwd, req.WorktreePath), true)
 	}
 
@@ -333,7 +343,7 @@ func (l *Launcher) Launch(ctx context.Context, req Request) (Result, error) {
 	if snap.Workspace != "" && snap.Workspace != ws {
 		return Result{}, l.fail(req, tabID, "workspace_drift", fmt.Errorf("%w: workspace %q != %q", ErrIdentityDrift, snap.Workspace, ws), true)
 	}
-	if snap.Cwd != "" && filepath.Clean(snap.Cwd) != filepath.Clean(req.WorktreePath) {
+	if snap.Cwd != "" && !sameWorktreePath(snap.Cwd, req.WorktreePath) {
 		return Result{}, l.fail(req, tabID, "cwd_drift", fmt.Errorf("%w: agent cwd %q != %q", ErrIdentityDrift, snap.Cwd, req.WorktreePath), true)
 	}
 
@@ -403,6 +413,31 @@ func (l *Launcher) now() time.Time {
 		return l.Now()
 	}
 	return time.Now()
+}
+
+// sameWorktreePath reports whether a and b name the same directory after
+// absolute resolution and optional symlink evaluation. filepath.Clean alone
+// is not enough: production herdr returns absolute TabInfo.Cwd while callers
+// often pass a repo-relative worktree path.
+func sameWorktreePath(a, b string) bool {
+	if strings.TrimSpace(a) == "" || strings.TrimSpace(b) == "" {
+		return false
+	}
+	absA, err := filepath.Abs(a)
+	if err != nil {
+		return false
+	}
+	absB, err := filepath.Abs(b)
+	if err != nil {
+		return false
+	}
+	if resolved, err := filepath.EvalSymlinks(absA); err == nil {
+		absA = resolved
+	}
+	if resolved, err := filepath.EvalSymlinks(absB); err == nil {
+		absB = resolved
+	}
+	return filepath.Clean(absA) == filepath.Clean(absB)
 }
 
 var failureMu sync.Mutex

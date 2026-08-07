@@ -21,6 +21,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/Kampe/Herdforge/pkg/broadcast"
 	"github.com/Kampe/Herdforge/pkg/lifecycle"
 )
 
@@ -75,6 +76,15 @@ type Options struct {
 	// FetchAgents lists live agents. When nil, Run uses the production herdr
 	// lookup; tests and embedders can inject a deterministic source.
 	FetchAgents func() ([]AgentEntry, error)
+	// Markers maps agent name → broadcast exclusion markers (FAC-187).
+	// Production runKick loads quarantine/protected sets here so a
+	// lifted-hold kick never prompts excluded lanes. Reviewer-like names
+	// are always auto-marked even when this map is empty.
+	Markers map[string][]broadcast.ExclusionKind
+	// LiveIdentity, when set, re-reads identity immediately before every
+	// prompt; BoundIdentities supplies the bound side of the fence.
+	LiveIdentity    func(context.Context, broadcast.Target) (broadcast.PromptIdentity, error)
+	BoundIdentities map[string]broadcast.PromptIdentity
 }
 
 // Result holds counts for one kick run.
@@ -269,6 +279,11 @@ func Run(opts Options) (*Result, error) {
 		return nil, fmt.Errorf("kick: fetch agents: %w", err)
 	}
 
+	// FAC-187: compile the broadcast target set and subtract protected /
+	// quarantined / reviewer / historical lanes before any prompt. This is
+	// the live production seam for pkg/broadcast (herd kick).
+	excludedByBroadcast := compileKickExclusions(names, held, opts.Markers)
+
 	result := &Result{}
 
 	for _, id := range names {
@@ -278,6 +293,14 @@ func Run(opts Options) (*Result, error) {
 			}
 			result.Skipped++
 			result.Entries = append(result.Entries, EntryResult{Name: id, Result: "skipped", Reason: reason})
+			continue
+		}
+		if reason, skip := excludedByBroadcast[id]; skip {
+			if !opts.Quiet {
+				fmt.Printf("herd-kick: skip %s (broadcast exclusion: %s)\n", id, reason)
+			}
+			result.Skipped++
+			result.Entries = append(result.Entries, EntryResult{Name: id, Result: "skipped", Reason: "broadcast:" + reason})
 			continue
 		}
 		st, paneID, found := LookupAgent(agents, id)
@@ -368,6 +391,35 @@ func Run(opts Options) (*Result, error) {
 
 		msg := KickMessage(id, opts.Reason)
 
+		// FAC-187: exact identity fence immediately before every prompt when
+		// the caller supplies bound + live identity.
+		if opts.LiveIdentity != nil {
+			bound, ok := opts.BoundIdentities[id]
+			if !ok {
+				bound = broadcast.PromptIdentity{Action: "kick"}
+			}
+			if bound.Action == "" {
+				bound.Action = "kick"
+			}
+			live, liveErr := opts.LiveIdentity(context.Background(), broadcast.Target{Name: id, PaneID: paneID})
+			if liveErr != nil {
+				if !opts.Quiet {
+					fmt.Printf("herd-kick: skip %s (identity: %v)\n", id, liveErr)
+				}
+				result.Skipped++
+				result.Entries = append(result.Entries, EntryResult{Name: id, Status: st, PaneID: paneID, Result: "skipped", Reason: "identity: " + liveErr.Error()})
+				continue
+			}
+			if err := broadcast.CheckIdentity(bound, live); err != nil {
+				if !opts.Quiet {
+					fmt.Printf("herd-kick: skip %s (identity: %v)\n", id, err)
+				}
+				result.Skipped++
+				result.Entries = append(result.Entries, EntryResult{Name: id, Status: st, PaneID: paneID, Result: "skipped", Reason: "identity: " + err.Error()})
+				continue
+			}
+		}
+
 		if opts.DryRun {
 			if !opts.Quiet {
 				fmt.Printf("herd-kick: DRY %s pane=%s status=%s\n", id, paneID, st)
@@ -433,4 +485,76 @@ func sorted(slice, reference []string) bool {
 		}
 	}
 	return true
+}
+
+// compileKickExclusions builds the broadcast target set for a kick wave and
+// returns name → exclusion reason for every candidate that must not be
+// prompted. Always auto-marks reviewer-shaped agent names; held lanes and
+// explicit Markers are layered on top.
+func compileKickExclusions(names []string, held map[string]string, markers map[string][]broadcast.ExclusionKind) map[string]string {
+	candidates := make([]broadcast.Target, 0, len(names))
+	for _, id := range names {
+		t := broadcast.Target{
+			Name:           id,
+			Role:           "standing",
+			AllowedActions: []string{"kick", "prompt"},
+			Generation:     1, // standing kick has no lease generation fence
+		}
+		if isReviewerAgentName(id) {
+			t.Markers = append(t.Markers, broadcast.ExcludeReviewer)
+		}
+		if _, ok := held[id]; ok {
+			t.Markers = append(t.Markers, broadcast.ExcludeProtected)
+		}
+		if markers != nil {
+			t.Markers = append(t.Markers, markers[id]...)
+		}
+		candidates = append(candidates, t)
+	}
+	sel := broadcast.Select(candidates)
+	out := make(map[string]string, len(sel.Excluded))
+	for _, e := range sel.Excluded {
+		out[e.Target.Name] = string(e.Reason)
+	}
+	return out
+}
+
+// isReviewerAgentName matches ephemeral review-assayer-… tabs and standing
+// forge-reviewer / forge-assayer lanes so a fleet kick never prompts them.
+func isReviewerAgentName(id string) bool {
+	id = strings.ToLower(strings.TrimSpace(id))
+	if strings.HasPrefix(id, "review-") {
+		return true
+	}
+	if strings.Contains(id, "reviewer") || strings.Contains(id, "assayer") {
+		return true
+	}
+	return false
+}
+
+// LoadBroadcastMarkers reads an optional JSON object of agent-name →
+// exclusion-kind arrays from path. Missing file returns nil, nil so production
+// kick can call it unconditionally.
+func LoadBroadcastMarkers(path string) (map[string][]broadcast.ExclusionKind, error) {
+	if strings.TrimSpace(path) == "" {
+		return nil, nil
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	var raw map[string][]string
+	if err := json.Unmarshal(b, &raw); err != nil {
+		return nil, fmt.Errorf("kick: parse broadcast markers: %w", err)
+	}
+	out := make(map[string][]broadcast.ExclusionKind, len(raw))
+	for name, kinds := range raw {
+		for _, k := range kinds {
+			out[name] = append(out[name], broadcast.ExclusionKind(k))
+		}
+	}
+	return out, nil
 }

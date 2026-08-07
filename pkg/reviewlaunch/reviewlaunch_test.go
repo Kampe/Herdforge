@@ -22,11 +22,17 @@ type fakeBoard struct {
 	calls    []string
 	status   map[string]string
 	updateEr error
+	// timeline is a shared stage log with herdr fakes so tests can assert
+	// board-vs-deliver order in one sequence (FAC-187 review finding).
+	timeline *[]string
 }
 
 func (b *fakeBoard) UpdateStatus(_ context.Context, taskID, status string) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	if b.timeline != nil {
+		*b.timeline = append(*b.timeline, "board")
+	}
 	if b.updateEr != nil {
 		return b.updateEr
 	}
@@ -74,7 +80,15 @@ type fakeHerdr struct {
 	startCalls   int
 	deliverCalls int
 	// Order probe: append stage names as side effects run.
-	stages []string
+	stages   []string
+	timeline *[]string // shared with fakeBoard for cross-surface order
+}
+
+func (f *fakeHerdr) note(stage string) {
+	f.stages = append(f.stages, stage)
+	if f.timeline != nil {
+		*f.timeline = append(*f.timeline, stage)
+	}
 }
 
 func (f *fakeHerdr) RequireWorkspace(string) (string, error) {
@@ -90,7 +104,7 @@ func (f *fakeHerdr) RequireWorkspace(string) (string, error) {
 func (f *fakeHerdr) TabCreateForTask(ws, label, cwd string, _ bool) (*herdr.TabInfo, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.stages = append(f.stages, "tab_create")
+	f.note("tab_create")
 	if f.tabErr != nil {
 		return nil, f.tabErr
 	}
@@ -104,7 +118,13 @@ func (f *fakeHerdr) TabCreateForTask(ws, label, cwd string, _ bool) (*herdr.TabI
 	}
 	tabCwd := f.tabCwd
 	if tabCwd == "" {
-		tabCwd = cwd
+		// Mirror production herdr: TabInfo.Cwd is always absolute.
+		abs, err := filepath.Abs(cwd)
+		if err != nil {
+			tabCwd = cwd
+		} else {
+			tabCwd = abs
+		}
 	}
 	// Capture created label for identity.
 	f.readSnap = AgentSnapshot{
@@ -116,7 +136,7 @@ func (f *fakeHerdr) TabCreateForTask(ws, label, cwd string, _ bool) (*herdr.TabI
 func (f *fakeHerdr) AgentStart(_ launch.Request, name, kind, paneID string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.stages = append(f.stages, "agent_start")
+	f.note("agent_start")
 	f.startCalls++
 	if f.startErr != nil {
 		return f.startErr
@@ -134,7 +154,7 @@ func (f *fakeHerdr) AgentStart(_ launch.Request, name, kind, paneID string) erro
 func (f *fakeHerdr) DeliverAndProve(target, text string, _ time.Duration) (*herdr.PromptReceipt, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.stages = append(f.stages, "deliver")
+	f.note("deliver")
 	f.deliverCalls++
 	if f.deliverErr != nil {
 		return nil, f.deliverErr
@@ -153,7 +173,7 @@ func (f *fakeHerdr) DeliverAndProve(target, text string, _ time.Duration) (*herd
 func (f *fakeHerdr) TabClose(tabID string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.stages = append(f.stages, "tab_close")
+	f.note("tab_close")
 	f.closed = append(f.closed, tabID)
 	return f.closeErr
 }
@@ -161,7 +181,7 @@ func (f *fakeHerdr) TabClose(tabID string) error {
 func (f *fakeHerdr) ReadAgent(name string) (AgentSnapshot, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.stages = append(f.stages, "read_agent")
+	f.note("read_agent")
 	if f.readErr != nil {
 		return AgentSnapshot{}, f.readErr
 	}
@@ -173,6 +193,40 @@ func (f *fakeHerdr) ReadAgent(name string) (AgentSnapshot, error) {
 		s.Name = name
 	}
 	return s, nil
+}
+
+// boardBeforeDeliver reports whether "board" appears before "deliver" in tl.
+// Used as the non-vacuous mutation probe for transition-order tests.
+func boardBeforeDeliver(tl []string) bool {
+	di, bi := -1, -1
+	for i, s := range tl {
+		if s == "deliver" && di < 0 {
+			di = i
+		}
+		if s == "board" && bi < 0 {
+			bi = i
+		}
+	}
+	return bi >= 0 && di >= 0 && bi < di
+}
+
+func assertDeliverBeforeBoard(t *testing.T, tl []string) {
+	t.Helper()
+	if boardBeforeDeliver(tl) {
+		t.Fatalf("board ran before deliver: %v", tl)
+	}
+	di, bi := -1, -1
+	for i, s := range tl {
+		if s == "deliver" && di < 0 {
+			di = i
+		}
+		if s == "board" && bi < 0 {
+			bi = i
+		}
+	}
+	if di < 0 || bi < 0 {
+		t.Fatalf("timeline missing deliver or board: %v", tl)
+	}
 }
 
 func baseReq(t *testing.T) Request {
@@ -220,10 +274,20 @@ func TestAgentName_FitsWithin32(t *testing.T) {
 // --- happy path + transition order -----------------------------------------
 
 func TestLaunch_BoardTransitionOnlyAfterVerifiedConsumption(t *testing.T) {
-	h := &fakeHerdr{workspace: "wF"}
-	b := &fakeBoard{}
+	var tl []string
+	h := &fakeHerdr{workspace: "wF", timeline: &tl}
+	b := &fakeBoard{timeline: &tl}
 	l := &Launcher{Herdr: h, Board: b, ReceiptPath: filepath.Join(t.TempDir(), "r.jsonl")}
+	// Relative worktree path — production runReview passes this shape; herdr
+	// returns absolute TabInfo.Cwd. Happy path must still complete.
 	req := baseReq(t)
+	rel := filepath.Join(".", "relative-wt-"+filepath.Base(req.WorktreePath))
+	// Use the already-created temp dir as relative by chdiring into its parent.
+	parent := filepath.Dir(req.WorktreePath)
+	base := filepath.Base(req.WorktreePath)
+	t.Chdir(parent)
+	req.WorktreePath = base
+	_ = rel
 
 	res, err := l.Launch(context.Background(), req)
 	if err != nil {
@@ -235,19 +299,22 @@ func TestLaunch_BoardTransitionOnlyAfterVerifiedConsumption(t *testing.T) {
 	if res.AgentName != "review-assayer-fac-151" {
 		t.Fatalf("agent name = %q", res.AgentName)
 	}
-	// Order: tab → start → read → deliver → board (board is last, not in stages).
-	wantPrefix := []string{"tab_create", "agent_start", "read_agent", "deliver"}
-	if len(h.stages) < len(wantPrefix) {
-		t.Fatalf("stages = %v", h.stages)
-	}
-	for i, s := range wantPrefix {
-		if h.stages[i] != s {
-			t.Fatalf("stage[%d]=%s want %s full=%v", i, h.stages[i], s, h.stages)
-		}
-	}
-	// Board must not have been touched before deliver completed.
+	assertDeliverBeforeBoard(t, tl)
 	if b.callCount() != 1 {
 		t.Fatalf("board calls = %d", b.callCount())
+	}
+}
+
+func TestSameWorktreePath_AbsRelativeMatch(t *testing.T) {
+	dir := t.TempDir()
+	parent := filepath.Dir(dir)
+	base := filepath.Base(dir)
+	t.Chdir(parent)
+	if !sameWorktreePath(base, dir) {
+		t.Fatalf("relative %q must equal abs %q", base, dir)
+	}
+	if sameWorktreePath(base, filepath.Join(parent, "other")) {
+		t.Fatal("distinct paths must not match")
 	}
 }
 
@@ -407,42 +474,29 @@ func TestLaunch_UnverifiedReceiptRejected(t *testing.T) {
 // --- mutation probes -------------------------------------------------------
 
 func TestMutation_RemovingTransitionOrderWouldBoardBeforeDeliver(t *testing.T) {
-	// Unsafe baseline: board update before deliver (the pre-FAC-187 bug).
-	var order []string
-	unsafeBoardThenDeliver := func() {
-		order = append(order, "board")
-		order = append(order, "deliver")
-	}
-	unsafeBoardThenDeliver()
-	if order[0] != "board" {
-		t.Fatal("unsafe baseline broken")
+	// Unsafe baseline: a timeline with board before deliver MUST trip the
+	// assertion (reviewer proved the prior guard could not fail under that
+	// regression). boardBeforeDeliver is the named property under test.
+	unsafe := []string{"tab_create", "agent_start", "read_agent", "board", "deliver"}
+	if !boardBeforeDeliver(unsafe) {
+		t.Fatal("unsafe baseline broken: board-before-deliver not detected")
 	}
 
-	// Safe path: deliver is always observed before the single board call.
-	h := &fakeHerdr{}
-	b := &fakeBoard{}
-	// Interleave observation via stages + board call count after Launch.
+	// Production path: shared timeline must place deliver before board.
+	var tl []string
+	h := &fakeHerdr{timeline: &tl}
+	b := &fakeBoard{timeline: &tl}
 	l := &Launcher{Herdr: h, Board: b}
 	if _, err := l.Launch(context.Background(), baseReq(t)); err != nil {
 		t.Fatal(err)
 	}
-	deliverIdx := -1
-	for i, s := range h.stages {
-		if s == "deliver" {
-			deliverIdx = i
-			break
-		}
-	}
-	if deliverIdx < 0 {
-		t.Fatal("deliver never ran")
-	}
-	// Board call happens only after Launch returns success, and deliver is
-	// the last herdr stage before that.
-	if h.stages[len(h.stages)-1] != "deliver" {
-		t.Fatalf("last herdr stage before board must be deliver: %v", h.stages)
-	}
+	assertDeliverBeforeBoard(t, tl)
 	if b.callCount() != 1 {
 		t.Fatal("board must run exactly once after deliver")
+	}
+	// Non-vacuity of the helper against the live timeline.
+	if boardBeforeDeliver(tl) {
+		t.Fatalf("production timeline inverted: %v", tl)
 	}
 }
 
