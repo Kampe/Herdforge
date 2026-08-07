@@ -73,7 +73,21 @@ func main() {
 	case "--help", "-h":
 		printUsage()
 		os.Exit(0)
+	}
 
+	// FAC-189: every subcommand recognizes -h/--help before positional
+	// payloads or any provider/Herdr/git/outbox/claim/worktree side effect.
+	// Literal payloads equal to --help require `--` or an explicit flag
+	// (see parseTicketRef / dispatch --ticket=).
+	if _, known := subcommandUsage[command]; known {
+		if exitIfHelp(command, os.Args[2:]) {
+			return
+		}
+		// Probe after the help gate so help tests observe zero entries.
+		markOperational(command)
+	}
+
+	switch command {
 	case "init":
 		runInit()
 
@@ -2041,27 +2055,81 @@ func runNext() {
 	fmt.Println()
 }
 
-func runDispatch() {
-	if len(os.Args) < 3 {
-		fmt.Fprintf(os.Stderr, "Usage: herd dispatch <ticket-ref> [flags]\n")
-		fmt.Fprintf(os.Stderr, "Flags:\n")
-		fmt.Fprintf(os.Stderr, "  --no-launch    Create worktree and packet only, no agent\n")
-		fmt.Fprintf(os.Stderr, "  --lane <name>  Lane name from config (default: worker)\n")
-		os.Exit(1)
+// dispatchRequest is the parsed, side-effect-free CLI contract for dispatch.
+// Parsing never loads config, claims work, or opens durable stores.
+type dispatchRequest struct {
+	TicketRef    string
+	NoLaunch     bool
+	LaneName     string
+	LaneExplicit bool
+}
+
+// parseDispatchArgs routes flags through a real FlagSet before any operational
+// code. Flags may appear before or after the ticket (Go's flag package stops at
+// the first positional; we re-parse the tail like runSend). Help is handled by
+// the global gate; this parser still refuses bare reserved help tokens as
+// positionals (defense in depth).
+func parseDispatchArgs(args []string) (dispatchRequest, error) {
+	fs := flag.NewFlagSet("dispatch", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	noLaunch := fs.Bool("no-launch", false, "Skip agent launch")
+	laneName := fs.String("lane", "worker", "Lane name from config")
+	ticketFlag := fs.String("ticket", "", "Ticket ref (required when the value begins with '-')")
+
+	parse := func(in []string) error {
+		if err := fs.Parse(in); err != nil {
+			if err == flag.ErrHelp {
+				return fmt.Errorf("help requested")
+			}
+			return err
+		}
+		return nil
+	}
+	if err := parse(args); err != nil {
+		return dispatchRequest{}, err
+	}
+	// Collect positionals with flags interleaved anywhere after the first one.
+	var pos []string
+	rest := fs.Args()
+	for len(rest) > 0 {
+		pos = append(pos, rest[0])
+		if err := parse(rest[1:]); err != nil {
+			return dispatchRequest{}, err
+		}
+		rest = fs.Args()
 	}
 
-	ticketRef := os.Args[2]
-
-	dispatchFlags := flag.NewFlagSet("dispatch", flag.ExitOnError)
-	noLaunch := dispatchFlags.Bool("no-launch", false, "Skip agent launch")
-	laneName := dispatchFlags.String("lane", "worker", "Lane name from config")
-	dispatchFlags.Parse(os.Args[3:])
 	laneExplicit := false
-	dispatchFlags.Visit(func(f *flag.Flag) {
+	fs.Visit(func(f *flag.Flag) {
 		if f.Name == "lane" {
 			laneExplicit = true
 		}
 	})
+	ref, err := parseTicketRef(*ticketFlag, pos)
+	if err != nil {
+		return dispatchRequest{}, err
+	}
+	return dispatchRequest{
+		TicketRef:    ref,
+		NoLaunch:     *noLaunch,
+		LaneName:     *laneName,
+		LaneExplicit: laneExplicit,
+	}, nil
+}
+
+func runDispatch() {
+	req, err := parseDispatchArgs(os.Args[2:])
+	if err != nil {
+		fmt.Fprintln(os.Stderr, usageFor("dispatch"))
+		if !strings.Contains(err.Error(), "missing ticket") && err.Error() != "help requested" {
+			fmt.Fprintf(os.Stderr, "dispatch: %v\n", err)
+		}
+		os.Exit(1)
+	}
+	ticketRef := req.TicketRef
+	noLaunch := req.NoLaunch
+	laneName := req.LaneName
+	laneExplicit := req.LaneExplicit
 
 	cfg, err := config.LoadConfig(".herd/herd.yaml")
 	if err != nil {
@@ -2075,9 +2143,9 @@ func runDispatch() {
 	}
 	var canonicalLane lifecycle.CanonicalLane
 	if laneExplicit {
-		canonicalLane, err = registry.ResolveLaneName(*laneName)
+		canonicalLane, err = registry.ResolveLaneName(laneName)
 	} else {
-		canonicalLane, err = registry.ResolveRole(*laneName)
+		canonicalLane, err = registry.ResolveRole(laneName)
 	}
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "lane identity: %v\n", err)
@@ -2143,10 +2211,10 @@ func runDispatch() {
 		fmt.Fprintf(os.Stderr, "dispatch hold admission rejected: %v\n", err)
 		os.Exit(1)
 	}
-	if !*noLaunch {
-		lane := findLaneByName(cfg, *laneName)
+	if !noLaunch {
+		lane := findLaneByName(cfg, laneName)
 		if lane == nil {
-			fmt.Fprintf(os.Stderr, "lane '%s' not found\n", *laneName)
+			fmt.Fprintf(os.Stderr, "lane '%s' not found\n", laneName)
 			os.Exit(1)
 		}
 		decision, err = launchAdmissionWithLifecycle(liveLaunchLifecycle{}, cfg, lane.Role, true, routedLaneDecision(context.Background(), nil), func(admitted *router.LaunchDecision) error {
@@ -2154,7 +2222,7 @@ func runDispatch() {
 				return err
 			}
 			var dispatchErr error
-			dispatchResult, dispatchErr = d.Dispatch(context.Background(), dispatch.DispatchOptions{TicketRef: ticketRef, NoLaunch: *noLaunch, LaneName: *laneName, Decision: admitted})
+			dispatchResult, dispatchErr = d.Dispatch(context.Background(), dispatch.DispatchOptions{TicketRef: ticketRef, NoLaunch: noLaunch, LaneName: laneName, Decision: admitted})
 			return dispatchErr
 		})
 		if err != nil {
@@ -2172,15 +2240,15 @@ func runDispatch() {
 			os.Exit(1)
 		}
 	}
-	fmt.Printf("Dispatching %s to lane '%s'...\n", ticketRef, *laneName)
+	fmt.Printf("Dispatching %s to lane '%s'...\n", ticketRef, laneName)
 
 	result := dispatchResult
-	if *noLaunch {
+	if noLaunch {
 		if err := admitDispatch(); err != nil {
 			fmt.Fprintf(os.Stderr, "dispatch hold admission rejected: %v\n", err)
 			os.Exit(1)
 		}
-		result, err = d.Dispatch(context.Background(), dispatch.DispatchOptions{TicketRef: ticketRef, NoLaunch: true, LaneName: *laneName, Decision: decision})
+		result, err = d.Dispatch(context.Background(), dispatch.DispatchOptions{TicketRef: ticketRef, NoLaunch: true, LaneName: laneName, Decision: decision})
 	}
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "dispatch failed: %v\n", err)
