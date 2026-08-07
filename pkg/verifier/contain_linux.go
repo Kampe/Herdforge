@@ -17,14 +17,10 @@ import (
 // closed if the kernel refuses it, and path residual ownership is not a
 // substitute for a missing namespace boundary.
 //
-// Inside the hermetic Docker profile the outer container already isolates the
-// run; nested unprivileged userns is skipped so fork/exec of the ownership
-// wrapper is not rejected with EPERM.
+// Nested userns requires the hermetic container's seccomp profile to allow
+// clone(NEWUSER|NEWPID). The Docker runner sets seccomp=unconfined for that.
 func applyOwnershipContainment(attr *syscall.SysProcAttr) {
 	if attr == nil {
-		return
-	}
-	if os.Getenv(hermeticContainerEnv) == "1" {
 		return
 	}
 	uid := os.Getuid()

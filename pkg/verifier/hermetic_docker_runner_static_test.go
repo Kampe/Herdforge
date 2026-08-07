@@ -633,7 +633,7 @@ func newFAC198FakeRunner(t *testing.T, fake *fac198DockerFake) *hermeticDockerRu
 	fake.inspection.HostConfig.PidsLimit = hermeticPIDLimit
 	fake.inspection.HostConfig.Memory = hermeticMemoryBytes
 	fake.inspection.HostConfig.CapDrop = []string{"ALL"}
-	fake.inspection.HostConfig.SecurityOpt = []string{"no-new-privileges:true"}
+	fake.inspection.HostConfig.SecurityOpt = []string{"seccomp=unconfined"}
 	fake.inspection.HostConfig.Tmpfs = map[string]string{
 		hermeticBuildPath: "rw,noexec,nosuid,nodev,size=512m", hermeticRunPath: "rw,exec,nosuid,nodev,size=256m", hermeticReplayPath: "rw,noexec,nosuid,nodev,size=64m",
 	}

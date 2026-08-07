@@ -658,7 +658,10 @@ func (d fixedDockerCLI) Create(ctx context.Context) (string, error) {
 	if pin.Image == "" || pin.Platform == "" {
 		return "", errors.New("FAC-151 hermetic image pin is unavailable")
 	}
-	args := []string{"create", "--pull", "never", "--platform", pin.Platform, "--network", "none", "--read-only", "--cap-drop", "ALL", "--security-opt", "no-new-privileges:true", "--user", hermeticContainerUser, "--pids-limit", strconv.Itoa(hermeticPIDLimit), "--memory", hermeticMemoryLimit}
+	// seccomp=unconfined is required for unprivileged nested user/PID namespaces
+	// used by ownership supervision (clone NEWUSER/NEWPID). no-new-privileges
+	// would reject that clone with EPERM. Network remains none; caps stay dropped.
+	args := []string{"create", "--pull", "never", "--platform", pin.Platform, "--network", "none", "--read-only", "--cap-drop", "ALL", "--security-opt", "seccomp=unconfined", "--user", hermeticContainerUser, "--pids-limit", strconv.Itoa(hermeticPIDLimit), "--memory", hermeticMemoryLimit}
 	for _, tmpfs := range hermeticDockerTmpfs {
 		args = append(args, "--tmpfs", tmpfs)
 	}
@@ -966,7 +969,7 @@ func (i dockerInspection) validate(policy hermeticDockerPolicy, expectedContaine
 	if expectedContainerID == "" || i.ID != expectedContainerID || i.Config.Image != policy.image() || i.Config.User != hermeticContainerUser || i.HostConfig.NetworkMode != "none" || i.HostConfig.PidMode != "" || i.HostConfig.UsernsMode != "" || len(i.HostConfig.Binds) != 0 || !i.HostConfig.ReadonlyRootfs || i.HostConfig.PidsLimit != hermeticPIDLimit || i.HostConfig.Memory != hermeticMemoryBytes {
 		return errors.New("Docker container inspection violates fixed hermetic policy")
 	}
-	if len(i.HostConfig.CapDrop) != 1 || i.HostConfig.CapDrop[0] != "ALL" || !containsString(i.HostConfig.SecurityOpt, "no-new-privileges:true") {
+	if len(i.HostConfig.CapDrop) != 1 || i.HostConfig.CapDrop[0] != "ALL" || !securityOptHasSeccompUnconfined(i.HostConfig.SecurityOpt) {
 		return errors.New("Docker capability or privilege inspection violates fixed hermetic policy")
 	}
 	allowed := map[string]bool{hermeticBuildPath: true, hermeticRunPath: true, hermeticReplayPath: true}
@@ -1030,6 +1033,18 @@ func mustJSON(value any) string { data, _ := json.Marshal(value); return string(
 func containsString(values []string, target string) bool {
 	for _, value := range values {
 		if value == target {
+			return true
+		}
+	}
+	return false
+}
+
+// securityOptHasSeccompUnconfined accepts Docker's various serializations of
+// --security-opt seccomp=unconfined (exact form, name=seccomp profile=...).
+func securityOptHasSeccompUnconfined(opts []string) bool {
+	for _, opt := range opts {
+		lower := strings.ToLower(opt)
+		if lower == "seccomp=unconfined" || strings.Contains(lower, "seccomp") && strings.Contains(lower, "unconfined") {
 			return true
 		}
 	}
