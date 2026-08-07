@@ -278,6 +278,9 @@ func main() {
 	case "containers":
 		runContainers()
 
+	case "commands":
+		runCommandSessions()
+
 	case "overlap":
 		runOverlap()
 
@@ -379,6 +382,7 @@ func printUsage() {
 	fmt.Println("  throughput      Read-only fleet throughput KPIs from local evidence")
 	fmt.Println("  worktrees       Snapshot all worktree state + collision check")
 	fmt.Println("  containers      Durable container lifecycle status + unowned audit (FAC-200)")
+	fmt.Println("  commands        Retained command session status + recovery sweep (FAC-193)")
 	fmt.Println("  overlap         Detect files/symbols edited together by 2+ unmerged branches")
 	fmt.Println("  attention       List agents needing coordinator eyes")
 	fmt.Println("  process         Classify harvest targets (herd-process digest)")
@@ -712,6 +716,15 @@ func runStatus() {
 	for _, record := range blocked {
 		fmt.Printf("  BLOCKED %s [%s] %s\n", record.Ref, record.Code, record.Reason)
 	}
+	// FAC-193: a completed tool call must not be able to hide a live
+	// background terminal behind an agent-level working state, so fleet
+	// status reports retained command sessions alongside lane evidence.
+	line, err := commandSessionStatusLine(commandSessionDBPath(""), time.Now)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Retained command sessions: UNREADABLE (%v)\n", err)
+		os.Exit(1)
+	}
+	fmt.Println(line)
 }
 
 // loadTaskProvider activates the configured board provider with FAC-150
