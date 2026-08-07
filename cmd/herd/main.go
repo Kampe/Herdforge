@@ -2225,6 +2225,12 @@ func runDispatch() {
 		fmt.Fprintf(os.Stderr, "lane identity: %v\n", err)
 		os.Exit(1)
 	}
+	// Collapse to the resolved lane NAME right here. Everything downstream --
+	// the hold gate, the launch admission, both Dispatch calls, the log line --
+	// then refers to the same lane by construction. Re-resolving the raw string
+	// later (the bare default is a ROLE, "worker") is what let the hold bind one
+	// lane while the launch bound another; agreement has to be structural, not
+	// two lookups that happen to use compatible rules.
 	laneName = canonicalLane.Name
 
 	tp, tpErr := loadTaskProvider(cfg)
@@ -2287,12 +2293,9 @@ func runDispatch() {
 		os.Exit(1)
 	}
 	if !noLaunch {
-		lane := findLaneByName(cfg, laneName)
-		if lane == nil {
-			fmt.Fprintf(os.Stderr, "lane '%s' not found\n", laneName)
-			os.Exit(1)
-		}
-		decision, err = launchAdmissionWithLifecycle(liveLaunchLifecycle{}, cfg, lane.Role, true, routedLaneDecision(context.Background(), nil), func(admitted *router.LaunchDecision) error {
+		// canonicalLane.Role, not a second lookup: this is the same lane the hold
+		// gate above already admitted.
+		decision, err = launchAdmissionWithLifecycle(liveLaunchLifecycle{}, cfg, canonicalLane.Role, true, routedLaneDecision(context.Background(), nil), func(admitted *router.LaunchDecision) error {
 			if err := admitDispatch(); err != nil {
 				return err
 			}
@@ -2984,15 +2987,6 @@ func forgeLaunchAdmission(cfg *config.Config, lane *config.LaneDef, ctx context.
 func findLaneForRole(cfg *config.Config, role string) *config.LaneDef {
 	for i := range cfg.Lanes {
 		if cfg.Lanes[i].Role == role {
-			return &cfg.Lanes[i]
-		}
-	}
-	return nil
-}
-
-func findLaneByName(cfg *config.Config, name string) *config.LaneDef {
-	for i := range cfg.Lanes {
-		if cfg.Lanes[i].Name == name {
 			return &cfg.Lanes[i]
 		}
 	}

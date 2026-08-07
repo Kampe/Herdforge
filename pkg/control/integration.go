@@ -119,6 +119,38 @@ func (w HerdrWaker) ReadTarget(ctx context.Context) (WakeTarget, error) {
 	return actual, nil
 }
 
+// wakeText is what the woken agent actually reads. The wake used to send the
+// bare protocol string "consume durable control envelope <id> seq <n>", which
+// is addressed to the control plane, not to a person — and the agent is a
+// person-shaped reader. Observed on the FAC-103 lane: Claude treated it as an
+// unexplained directive, refused to act on an envelope ID it could not resolve
+// to any CLI verb, and stopped on a clarifying question. The lane then sat
+// "blocked" at an empty prompt with its packet unread. That is the silent-stall
+// class this fleet kept hitting.
+//
+// The envelope id and sequence stay in the text as provenance — they are what
+// makes a delivery receipt auditable — but they are framed so the reader knows
+// the wake is a nudge and the packet is the work.
+func wakeText(messageID string, sequence int64) string {
+	return wakeTextWithReference(fmt.Sprintf("control envelope %s seq %d", messageID, sequence))
+}
+
+// WakeTextForTask is the same wake for the non-durable path in pkg/dispatch,
+// which has a task ref rather than an envelope. It is exported and shared
+// rather than hand-copied: a reviewer pointed out that a second copy of this
+// string is a second place that can regress to a bare protocol directive with
+// a green suite, and the wording had already drifted between the two.
+func WakeTextForTask(taskRef string) string {
+	return wakeTextWithReference(fmt.Sprintf("task %s", taskRef))
+}
+
+func wakeTextWithReference(reference string) string {
+	return fmt.Sprintf(
+		"Wake-up from the Herdforge coordinator (%s — provenance only, nothing for you to do with it). "+
+			"Read TASK-PACKET.md in your worktree root and continue that task.",
+		reference)
+}
+
 func (w HerdrWaker) Wake(ctx context.Context, req WakeRequest) (WakeReceipt, error) {
 	if req.Target != w.Target {
 		return WakeReceipt{}, ErrStaleIdentity
@@ -142,7 +174,7 @@ func (w HerdrWaker) Wake(ctx context.Context, req WakeRequest) (WakeReceipt, err
 	if actual != w.Target {
 		return WakeReceipt{}, ErrStaleIdentity
 	}
-	receipt, err := herdr.DeliverAndProve(w.Target.Target, fmt.Sprintf("consume durable control envelope %s seq %d", req.MessageID, req.Sequence), w.Timeout)
+	receipt, err := herdr.DeliverAndProve(w.Target.Target, wakeText(req.MessageID, req.Sequence), w.Timeout)
 	if err != nil {
 		return WakeReceipt{}, err
 	}

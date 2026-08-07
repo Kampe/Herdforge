@@ -466,15 +466,9 @@ func (d *Dispatcher) Dispatch(ctx context.Context, opts DispatchOptions) (*Dispa
 	if laneName == "" {
 		laneName = "worker"
 	}
-	var lane *config.LaneDef
-	for i := range d.Config.Lanes {
-		if d.Config.Lanes[i].Name == laneName {
-			lane = &d.Config.Lanes[i]
-			break
-		}
-	}
-	if lane == nil {
-		return nil, fmt.Errorf("lane '%s' not found in config", laneName)
+	lane, err := config.ResolveLane(d.Config, laneName)
+	if err != nil {
+		return nil, err
 	}
 
 	defaultBranch := d.Config.Project.DefaultBranch
@@ -994,7 +988,10 @@ func (d *Dispatcher) launch(
 	} else {
 		// Explicit non-production test mode has no durable control port; it still
 		// sends only a fixed wake reference, never the task packet.
-		receipt, receiptErr = h.DeliverAndProve(tabLabel, fmt.Sprintf("consume durable control envelope task %s", task.Ref), timeout)
+		// control.WakeTextForTask, not a hand-copied string: a second copy is a
+		// second place that can regress to a bare protocol directive with a green
+		// suite, and the two had already drifted apart in wording.
+		receipt, receiptErr = h.DeliverAndProve(tabLabel, control.WakeTextForTask(task.Ref), timeout)
 	}
 	result.Receipt = receipt
 	if receiptErr != nil {
