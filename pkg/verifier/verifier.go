@@ -775,12 +775,43 @@ type MutationRequest struct {
 	Timeout           time.Duration
 }
 
+// admitMutationDisk is the shared pre-mutation capacity gate. Both mutation
+// entry points call it before any git inspection, candidate open, or process
+// start. Path and TempPath are resolved to existing volumes so the capacity
+// gate can see both the candidate and temp filesystems.
+func (v *Verifier) admitMutationDisk(dir string) error {
+	if v == nil || v.DiskAdmission == nil {
+		return errors.New("disk capacity gate unavailable for mutation")
+	}
+	candidate, err := resources.ResolveExistingPath(dir)
+	if err != nil {
+		return fmt.Errorf("disk capacity gate: resolve candidate volume: %w", err)
+	}
+	tmp, err := resources.ResolveExistingPath(os.TempDir())
+	if err != nil {
+		return fmt.Errorf("disk capacity gate: resolve temporary volume: %w", err)
+	}
+	decision := v.DiskAdmission.Admit(resources.DiskRequest{
+		Operation: "verifier_mutation",
+		Path:      candidate,
+		TempPath:  tmp,
+	})
+	if decision.Allowed {
+		return nil
+	}
+	evidence, _ := json.Marshal(decision.Evidence)
+	return fmt.Errorf("disk capacity gate blocked: state=%s evidence=%s", decision.State, evidence)
+}
+
 // RunMutationCheck is the compatibility entry point for callers that already
-// have a target and replacement. It resolves the exact current candidate SHA
-// and delegates to RunMutationCheckForCandidate.
+// have a target and replacement. It admits disk capacity first (no git yet),
+// then resolves the exact current candidate SHA and delegates.
 func (v *Verifier) RunMutationCheck(ctx context.Context, dir string, targetFile string, originalCode string, mutantCode string) (*MutationResult, error) {
 	if v == nil {
 		return nil, errors.New("nil verifier")
+	}
+	if err := v.admitMutationDisk(dir); err != nil {
+		return nil, err
 	}
 	sha, err := currentSHA(dir)
 	if err != nil {
@@ -813,19 +844,8 @@ func (v *Verifier) RunMutationCheckForCandidate(ctx context.Context, dir string,
 	}
 	// Disk admission is first: a denied path must not inspect git state, open
 	// the candidate, or start any process (see disk_gate_test.go).
-	if v.DiskAdmission == nil {
-		return nil, errors.New("disk admission is required")
-	}
-	decision := v.DiskAdmission.Admit(resources.DiskRequest{
-		Operation: "mutation",
-		Path:      dir,
-	})
-	if !decision.Allowed {
-		reason := decision.Evidence.Reason
-		if reason == "" {
-			reason = string(decision.State)
-		}
-		return nil, fmt.Errorf("disk admission denied: %s", reason)
+	if err := v.admitMutationDisk(dir); err != nil {
+		return nil, err
 	}
 	// Each owned subprocess reaps its own process group after Wait. Path-guard
 	// failures never start Execute; successful mutations still return only

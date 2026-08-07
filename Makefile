@@ -1,6 +1,6 @@
 # Herdforge Makefile
 
-.PHONY: all build test test-unit test-contracts test-coverage test-mutation preflight lint self-test herd-up clean ci
+.PHONY: all build test test-unit test-contracts test-hermetic-compile test-coverage test-mutation preflight lint self-test herd-up clean ci
 
 all: preflight test build
 
@@ -20,7 +20,18 @@ build:
 
 test: test-unit
 
-test-unit: test-contracts
+# Compile (do not run) the FAC-151 hermetic integration profile. This is the
+# exact go-test -c step hermeticDockerRunner.compile uses inside the container.
+# Without it, ordinary `go test ./pkg/verifier` can stay green while the
+# quarantined ownership suite fails to build under the hermetic tag (FAC-198).
+test-hermetic-compile:
+	@echo "==> Compiling FAC-151 hermetic profile (tag fac151_hermetic_integration)..."
+	@tmpdir=$$(mktemp -d) && \
+		go test -c -tags fac151_hermetic_integration -o "$$tmpdir/verifier.test" ./pkg/verifier && \
+		rm -rf "$$tmpdir" && \
+		echo "==> Hermetic profile compiles"
+
+test-unit: test-contracts test-hermetic-compile
 	@echo "==> Running full unit test suite..."
 	go test -count=1 -timeout=180s ./...
 
