@@ -6,7 +6,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -36,26 +35,28 @@ type LaunchIdentity struct {
 
 // Binding is the durable pre-launch confinement proof.
 type Binding struct {
-	Boundary         Boundary   `json:"-"`
-	Capability       Capability `json:"-"`
-	WorktreeRoot     string     `json:"worktree_root"`
-	Sentinel         string     `json:"sentinel"`
-	SharedRoot       string     `json:"shared_root"`
-	SharedRootDigest string     `json:"shared_root_digest"`
-	PolicyDigest     string     `json:"policy_digest"`
-	Tuple            AuthTuple  `json:"tuple"`
-	ProofNonce       string     `json:"proof_nonce"`
+	Boundary     Boundary   `json:"-"`
+	Capability   Capability `json:"-"`
+	WorktreeRoot string     `json:"worktree_root"`
+	Sentinel     string     `json:"sentinel"`
+	SharedRoot   string     `json:"shared_root"`
+	PolicyDigest string     `json:"policy_digest"`
+	Tuple        AuthTuple  `json:"tuple"`
+	ProofNonce   string     `json:"proof_nonce"`
 	// ProofMACHex is the issuer MAC over the AuthTuple (hex), so receipts are
 	// not forgeable from public fields alone.
-	ProofMACHex   string   `json:"proof_mac"`
-	OSBackend     string   `json:"os_backend"`
-	OSProved      bool     `json:"os_proved"`
-	AgentWrapped  bool     `json:"agent_wrapped"`
-	ProfilePath   string   `json:"profile_path,omitempty"`
-	ProfileDigest string   `json:"profile_digest,omitempty"`
-	WrapperBinDir string   `json:"wrapper_bin_dir,omitempty"`
-	WrapperNames  []string `json:"wrapper_names,omitempty"`
-	ReceiptDigest string   `json:"receipt_digest"`
+	ProofMACHex string `json:"proof_mac"`
+	OSBackend   string `json:"os_backend"`
+	OSProved    bool   `json:"os_proved"`
+	// WrapperInstalled means session-dir wrappers exist and pass integrity
+	// checks. It does NOT claim herdr resolved the live agent through them
+	// (that requires PATH interception by the external herdr CLI).
+	WrapperInstalled bool     `json:"wrapper_installed"`
+	ProfilePath      string   `json:"profile_path,omitempty"`
+	ProfileDigest    string   `json:"profile_digest,omitempty"`
+	WrapperBinDir    string   `json:"wrapper_bin_dir,omitempty"`
+	WrapperNames     []string `json:"wrapper_names,omitempty"`
+	ReceiptDigest    string   `json:"receipt_digest"`
 	// ReceiptMACHex authenticates the receipt with the same HMAC issuer.
 	ReceiptMACHex string    `json:"receipt_mac"`
 	CreatedAt     time.Time `json:"created_at"`
@@ -75,13 +76,10 @@ func Bind(id LaunchIdentity, issuer Issuer) (*Binding, error) {
 	if err != nil {
 		return nil, err
 	}
-	sharedDigest := ""
 	if strings.TrimSpace(id.SharedRoot) != "" {
-		dig, err := ObserveSharedRoot(id.SharedRoot)
-		if err != nil {
+		if err := CheckSharedRootResidual(id.SharedRoot); err != nil {
 			return nil, err
 		}
-		sharedDigest = dig
 	}
 	argvIdentity := argvDigest(id.Argv)
 	tuple := AuthTuple{
@@ -103,17 +101,16 @@ func Bind(id LaunchIdentity, issuer Issuer) (*Binding, error) {
 		return nil, err
 	}
 	b := &Binding{
-		Boundary:         boundary,
-		Capability:       cap,
-		WorktreeRoot:     cap.root,
-		Sentinel:         cap.sentinel,
-		SharedRoot:       strings.TrimSpace(id.SharedRoot),
-		SharedRootDigest: sharedDigest,
-		PolicyDigest:     PolicyDigestV1,
-		Tuple:            tuple,
-		ProofNonce:       cap.proof.Nonce,
-		ProofMACHex:      hex.EncodeToString(cap.proof.MAC),
-		CreatedAt:        time.Now().UTC(),
+		Boundary:     boundary,
+		Capability:   cap,
+		WorktreeRoot: cap.root,
+		Sentinel:     cap.sentinel,
+		SharedRoot:   strings.TrimSpace(id.SharedRoot),
+		PolicyDigest: PolicyDigestV1,
+		Tuple:        tuple,
+		ProofNonce:   cap.proof.Nonce,
+		ProofMACHex:  hex.EncodeToString(cap.proof.MAC),
+		CreatedAt:    time.Now().UTC(),
 	}
 	digest, err := b.digest()
 	if err != nil {
@@ -153,14 +150,13 @@ func (b *Binding) digest() (string, error) {
 		WorktreeRoot     string    `json:"worktree_root"`
 		Sentinel         string    `json:"sentinel"`
 		SharedRoot       string    `json:"shared_root"`
-		SharedRootDigest string    `json:"shared_root_digest"`
 		PolicyDigest     string    `json:"policy_digest"`
 		Tuple            AuthTuple `json:"tuple"`
 		ProofNonce       string    `json:"proof_nonce"`
 		ProofMACHex      string    `json:"proof_mac"`
 		OSBackend        string    `json:"os_backend"`
 		OSProved         bool      `json:"os_proved"`
-		AgentWrapped     bool      `json:"agent_wrapped"`
+		WrapperInstalled bool      `json:"wrapper_installed"`
 		ProfilePath      string    `json:"profile_path"`
 		ProfileDigest    string    `json:"profile_digest"`
 		WrapperBinDir    string    `json:"wrapper_bin_dir"`
@@ -170,14 +166,13 @@ func (b *Binding) digest() (string, error) {
 		WorktreeRoot:     b.WorktreeRoot,
 		Sentinel:         b.Sentinel,
 		SharedRoot:       b.SharedRoot,
-		SharedRootDigest: b.SharedRootDigest,
 		PolicyDigest:     b.PolicyDigest,
 		Tuple:            b.Tuple,
 		ProofNonce:       b.ProofNonce,
 		ProofMACHex:      b.ProofMACHex,
 		OSBackend:        b.OSBackend,
 		OSProved:         b.OSProved,
-		AgentWrapped:     b.AgentWrapped,
+		WrapperInstalled: b.WrapperInstalled,
 		ProfilePath:      b.ProfilePath,
 		ProfileDigest:    b.ProfileDigest,
 		WrapperBinDir:    b.WrapperBinDir,
@@ -231,7 +226,7 @@ func (b *Binding) AuthorizeRelativeWrite(path string) error {
 	return b.Boundary.AuthorizeWrite(b.Capability, path)
 }
 
-// CheckSharedRoot revalidates the read-only shared-root observation.
+// CheckSharedRoot re-checks that the FAC-188 residual path is still absent.
 func (b *Binding) CheckSharedRoot() error {
 	if b == nil {
 		return ErrUnauthenticated
@@ -239,18 +234,7 @@ func (b *Binding) CheckSharedRoot() error {
 	if b.SharedRoot == "" {
 		return nil
 	}
-	return CheckSharedRootObservation(b.SharedRoot, b.SharedRootDigest)
-}
-
-// PathEnv returns PATH=wrapperBin:existing for Herdr tab --env.
-func (b *Binding) PathEnv(existingPATH string) string {
-	if b == nil || b.WrapperBinDir == "" {
-		return existingPATH
-	}
-	if existingPATH == "" {
-		return b.WrapperBinDir
-	}
-	return b.WrapperBinDir + string(os.PathListSeparator) + existingPATH
+	return CheckSharedRootResidual(b.SharedRoot)
 }
 
 // MarshalReceipt returns durable JSON for launch/control evidence.

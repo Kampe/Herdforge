@@ -140,7 +140,7 @@ func TestBindAndProvePolicyDeniesIncidentPath(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(shared, filepath.FromSlash(SharedRootIncidentRel))); err == nil {
 		t.Fatal("Bind created residual under shared")
 	}
-	if !binding.OSProved || !binding.AgentWrapped || binding.ProfileDigest == "" || binding.ReceiptMACHex == "" {
+	if !binding.OSProved || !binding.WrapperInstalled || binding.ProfileDigest == "" || binding.ReceiptMACHex == "" {
 		t.Fatalf("incomplete binding: %+v", binding)
 	}
 	if err := binding.VerifyReceiptMAC(issuer); err != nil {
@@ -148,7 +148,7 @@ func TestBindAndProvePolicyDeniesIncidentPath(t *testing.T) {
 	}
 	// Forged receipt fails MAC
 	forged := *binding
-	forged.AgentWrapped = false
+	forged.WrapperInstalled = false
 	forged.ReceiptDigest, _ = forged.digest()
 	if err := forged.VerifyReceiptMAC(issuer); err == nil {
 		t.Fatal("forged receipt MAC accepted")
@@ -300,6 +300,63 @@ func TestDarwinFirstMatchProfileDeniesSharedParent(t *testing.T) {
 	if _, err := os.Stat(hook); err == nil {
 		t.Fatal("hook inode created")
 	}
+
+	// Profile must grant ONLY literal branch ref paths — never parent Dir subpaths
+	// (refs/heads/task would allow every sibling task/* lane). Prepare used branch "task/fac-190".
+	branchLiteral := filepath.Join(common, "refs", "heads", "task", "fac-190")
+	if !strings.Contains(body, "(allow file-write* (literal \""+branchLiteral+"\"))") {
+		t.Fatalf("profile missing literal branch ref grant for %s\n--- profile ---\n%s", branchLiteral, body)
+	}
+	taskDirGrant := "(allow file-write* (subpath \"" + filepath.Join(common, "refs", "heads", "task") + "\"))"
+	if strings.Contains(body, taskDirGrant) {
+		t.Fatal("profile grants sibling task/* ref namespace via Dir subpath")
+	}
+	if strings.Contains(body, "(allow file-write* (subpath \""+filepath.Join(common, "refs", "heads")+"\"))") {
+		t.Fatal("profile grants entire refs/heads namespace")
+	}
+	// packed-refs / shared HEAD must not be write-granted.
+	if strings.Contains(body, filepath.Join(common, "packed-refs")) {
+		t.Fatal("profile mentions packed-refs write grant")
+	}
+	headLit := "(allow file-write* (literal \"" + filepath.Join(common, "HEAD") + "\"))"
+	if strings.Contains(body, headLit) {
+		t.Fatal("profile grants common HEAD write")
+	}
+
+	// Live deny: sibling branch ref.
+	siblingRef := filepath.Join(common, "refs", "heads", "task", "fac-188-sibling")
+	_ = os.MkdirAll(filepath.Dir(siblingRef), 0o755)
+	_ = os.Remove(siblingRef)
+	if err := osb.writeUnder(profile, root, siblingRef, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef\n"); err == nil {
+		if _, e := os.Stat(siblingRef); e == nil {
+			t.Fatal("SIBLING-REF: write succeeded on sibling lane branch")
+		}
+	}
+	if _, err := os.Stat(siblingRef); err == nil {
+		t.Fatal("SIBLING-REF: inode created")
+	}
+
+	// Live deny: packed-refs and shared HEAD mutation.
+	for _, name := range []string{"packed-refs", "HEAD"} {
+		target := filepath.Join(common, name)
+		before, _ := os.ReadFile(target)
+		marker := "fac190-review-deny\n"
+		if err := osb.writeUnder(profile, root, target, marker); err == nil {
+			after, _ := os.ReadFile(target)
+			if strings.Contains(string(after), marker) {
+				if before != nil {
+					_ = os.WriteFile(target, before, 0o644)
+				}
+				t.Fatalf("%s: write succeeded under confinement", name)
+			}
+		}
+		if after, err := os.ReadFile(target); err == nil && strings.Contains(string(after), marker) {
+			if before != nil {
+				_ = os.WriteFile(target, before, 0o644)
+			}
+			t.Fatalf("%s: mutated under confinement", name)
+		}
+	}
 }
 
 func TestRealPathFailsClosedOnMissing(t *testing.T) {
@@ -388,22 +445,78 @@ func TestPrepareOSInstallsBothOllamaAndOpencode(t *testing.T) {
 	}
 }
 
-func TestObserveSharedRootStableUnderHerdChurn(t *testing.T) {
-	shared := t.TempDir()
-	d1, err := ObserveSharedRoot(shared)
+func TestWriteSeatbeltProfileBranchLiteralOnly(t *testing.T) {
+	// Platform-independent: profile text must never grant Dir(ref) subpaths.
+	dir := t.TempDir()
+	profile := filepath.Join(dir, "profile.sb")
+	wt := filepath.Join(dir, "wt")
+	gitDir := filepath.Join(dir, "gitdir")
+	common := filepath.Join(dir, "common")
+	path, err := writeSeatbeltProfile(wt, gitDir, common, "task/fac-190", profile)
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Coordinator-like volatile files under .herd must not drift the digest.
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(body)
+	wantRef := filepath.Join(common, "refs", "heads", "task", "fac-190")
+	if !strings.Contains(s, "(allow file-write* (literal \""+wantRef+"\"))") {
+		t.Fatalf("missing literal ref grant for %s", wantRef)
+	}
+	if !strings.Contains(s, "(allow file-write* (literal \""+wantRef+".lock\"))") {
+		t.Fatal("missing literal ref.lock grant")
+	}
+	// The round-5 CRITICAL regression: Dir("refs/heads/task/fac-190") == "refs/heads/task".
+	bad := "(allow file-write* (subpath \"" + filepath.Join(common, "refs", "heads", "task") + "\"))"
+	if strings.Contains(s, bad) {
+		t.Fatal("Dir subpath grant would allow every sibling task/* branch")
+	}
+	if strings.Contains(s, filepath.Join(common, "packed-refs")) {
+		t.Fatal("packed-refs write grant present")
+	}
+	if strings.Contains(s, "(allow file-write* (literal \""+filepath.Join(common, "HEAD")+"\"))") {
+		t.Fatal("common HEAD write grant present")
+	}
+	// Bare branch without slash must not grant entire refs/heads.
+	path2 := filepath.Join(dir, "profile-main.sb")
+	if _, err := writeSeatbeltProfile(wt, gitDir, common, "main", path2); err != nil {
+		t.Fatal(err)
+	}
+	body2, _ := os.ReadFile(path2)
+	s2 := string(body2)
+	if strings.Contains(s2, "(allow file-write* (subpath \""+filepath.Join(common, "refs", "heads")+"\"))") {
+		t.Fatal("bare branch Dir grant covers entire refs/heads")
+	}
+	if !strings.Contains(s2, "(allow file-write* (literal \""+filepath.Join(common, "refs", "heads", "main")+"\"))") {
+		t.Fatal("missing literal main ref")
+	}
+}
+
+func TestCheckSharedRootResidualStableUnderHerdChurn(t *testing.T) {
+	shared := t.TempDir()
+	if err := CheckSharedRootResidual(shared); err != nil {
+		t.Fatal(err)
+	}
+	// Coordinator-like volatile files under .herd must not cause false rejection.
+	// Residual check only Lstats the FAC-188 incident path — not WAL/locks.
 	_ = os.MkdirAll(filepath.Join(shared, ".herd"), 0o755)
 	_ = os.WriteFile(filepath.Join(shared, ".herd", "launch-claims.db-wal"), []byte("x"), 0o644)
 	_ = os.WriteFile(filepath.Join(shared, ".herd", "mail.lock"), []byte("y"), 0o644)
-	d2, err := ObserveSharedRoot(shared)
-	if err != nil {
+	if err := CheckSharedRootResidual(shared); err != nil {
+		t.Fatalf("residual check failed on coordinator churn: %v", err)
+	}
+	// Live failure mode: incident path present must be rejected (non-tautological).
+	incident := filepath.Join(shared, filepath.FromSlash(SharedRootIncidentRel))
+	if err := os.MkdirAll(filepath.Dir(incident), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if d1 != d2 {
-		t.Fatal("ObserveSharedRoot drifted on coordinator .herd churn")
+	if err := os.WriteFile(incident, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := CheckSharedRootResidual(shared); err == nil {
+		t.Fatal("incident path under shared accepted")
 	}
 }
 
@@ -505,22 +618,20 @@ func TestInstallSentinelIdempotentAndRejectsTamper(t *testing.T) {
 	}
 }
 
-func TestObserveSharedRootReadOnly(t *testing.T) {
+func TestCheckSharedRootResidualReadOnly(t *testing.T) {
 	shared := t.TempDir()
 	before, _ := os.ReadDir(shared)
-	dig, err := ObserveSharedRoot(shared)
-	if err != nil || dig == "" {
-		t.Fatalf("observe: %v %q", err, dig)
+	if err := CheckSharedRootResidual(shared); err != nil {
+		t.Fatalf("residual: %v", err)
 	}
 	after, _ := os.ReadDir(shared)
 	if len(after) != len(before) {
-		t.Fatal("ObserveSharedRoot wrote under shared")
+		t.Fatal("CheckSharedRootResidual wrote under shared")
 	}
-	// Incident present fails.
 	p := filepath.Join(shared, filepath.FromSlash(SharedRootIncidentRel))
 	_ = os.MkdirAll(filepath.Dir(p), 0o755)
 	_ = os.WriteFile(p, []byte("x"), 0o600)
-	if _, err := ObserveSharedRoot(shared); err == nil {
+	if err := CheckSharedRootResidual(shared); err == nil {
 		t.Fatal("incident path not rejected")
 	}
 }
