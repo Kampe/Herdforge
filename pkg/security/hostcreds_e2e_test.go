@@ -284,6 +284,58 @@ func TestE2E_HelperCannotSatisfyBrokerReached(t *testing.T) {
 	}
 }
 
+// An upstream that REJECTS the injected credential must not be recorded as a
+// successful brokered call. TLSRequestOK was `resp.StatusCode > 0`, so 401/403/
+// 500 all set it, and it gates ExitOK, ProveAuthorCausalSession and
+// StartAuthorLive's proof check.
+func TestE2E_UpstreamRejectionIsNotProof(t *testing.T) {
+	if testing.Short() {
+		t.Skip("subprocess build")
+	}
+	v := NewTestCredentialVault()
+	_ = v.InstallTestSecret("api.x.ai", "Bearer stale-rotated-out")
+	sess, err := StartHostCredsSession(SessionConfig{Kind: "grok", SessionID: "e2e-401", Authority: v})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sess.Close()
+
+	// Origin behaves like a provider refusing a revoked key.
+	up := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, `{"error":"invalid api key"}`, http.StatusUnauthorized)
+	}))
+	defer up.Close()
+	_, port, _ := net.SplitHostPort(up.Listener.Addr().String())
+	sess.Mitm.SetResolveHook(func(h string) (net.IP, error) { return net.IPv4(1, 2, 3, 4), nil })
+	sess.Mitm.SetDialHook(func(h string, ip net.IP) (net.Conn, error) {
+		return net.DialTimeout("tcp", net.JoinHostPort("127.0.0.1", port), 3*time.Second)
+	})
+
+	cap, err := NewCapability(sess.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, _, err := sess.RunAuthorCausalProbe(cap.Nonce)
+	if err == nil {
+		t.Fatal("a 401 from upstream must not satisfy the author causal proof")
+	}
+	if res == nil {
+		t.Fatal("expected a result to inspect")
+	}
+	if res.TLSStatus != http.StatusUnauthorized {
+		t.Fatalf("status %d want 401", res.TLSStatus)
+	}
+	if !res.TLSResponseReceived {
+		t.Fatal("a response did parse; TLSResponseReceived should be true")
+	}
+	if res.TLSRequestOK {
+		t.Fatal("MUTATION: upstream 401 recorded as a successful brokered call")
+	}
+	if res.ExitOK {
+		t.Fatal("ExitOK must not survive an upstream rejection")
+	}
+}
+
 type fakeBoundary struct{}
 
 func (fakeBoundary) Mechanism() string       { return "test-fake" }

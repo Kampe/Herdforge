@@ -554,8 +554,11 @@ func (p *TLSMitmProxy) authorizeAndForwardRequest(host string, creq *http.Reques
 
 	p.mu.Lock()
 	if p.reqCount >= p.maxReqs {
-		p.mu.Unlock()
+		// Increment BEFORE unlocking: every other DeniedRequests++ is guarded,
+		// and this one raced. -race stayed clean only because no test drives
+		// reqCount past maxReqs.
 		p.DeniedRequests++
+		p.mu.Unlock()
 		return fmt.Errorf("budget exceeded")
 	}
 	p.reqCount++

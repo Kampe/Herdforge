@@ -32,10 +32,14 @@ type AuthorCausalResult struct {
 	TLSMethod        string `json:"tls_method"`
 	TLSPath          string `json:"tls_path"`
 	TLSStatus        int    `json:"tls_status"`
-	TLSRequestOK     bool   `json:"tls_request_ok"`
-	RequestDigest    string `json:"request_digest"`
-	ExitOK           bool   `json:"exit_ok"`
-	Error            string `json:"error,omitempty"`
+	// TLSResponseReceived means a response parsed at all — NOT that it succeeded.
+	TLSResponseReceived bool `json:"tls_response_received"`
+	// TLSRequestOK means upstream returned 2xx, i.e. accepted the injected
+	// credential. Do not widen this to "any status".
+	TLSRequestOK  bool   `json:"tls_request_ok"`
+	RequestDigest string `json:"request_digest"`
+	ExitOK        bool   `json:"exit_ok"`
+	Error         string `json:"error,omitempty"`
 }
 
 // AuthorCausalConfig configures the in-process author causal path.
@@ -159,7 +163,15 @@ func RunAuthorCausalInProcess(cfg AuthorCausalConfig) error {
 	rawBody, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
 	res.TLSStatus = resp.StatusCode
 	_ = RedactSecrets(string(rawBody))
-	res.TLSRequestOK = resp.StatusCode > 0
+	res.TLSResponseReceived = resp.StatusCode > 0
+	// A brokered call is OK only when upstream ACCEPTED the injected credential.
+	// The old `StatusCode > 0` was true for 401/403/404/500 alike, so an upstream
+	// rejection was recorded as a successful broker inject and propagated into
+	// ExitOK, ProveAuthorCausalSession, and StartAuthorLive's proof check.
+	res.TLSRequestOK = resp.StatusCode >= 200 && resp.StatusCode < 300
+	if res.TLSResponseReceived && !res.TLSRequestOK {
+		res.Error = strings.TrimSpace(res.Error + fmt.Sprintf(" upstream_status_%d", resp.StatusCode))
+	}
 	res.ExitOK = res.TLSRequestOK && strings.Contains(res.DenyCONNECT, "403") && res.CapabilityMarker != ""
 	// Print marker on stdout for ModelMarkerReached (non-echo protocol).
 	if res.CapabilityMarker != "" {
