@@ -13,9 +13,9 @@ import (
 
 // ReceiptStore is the compile-safe persistence seam for production callers.
 // VerifyAndPersist stores every terminal outcome; ReceiptAdmission accepts only
-// a current PASS whose digest and candidate SHA still validate. The existing
-// command/review wiring has not yet been connected to this seam and remains a
-// documented FAC-122 integration item.
+// a current PASS whose digest and candidate SHA still validate. FAC-144 wires
+// this through pkg/daemon.CompletionGate into forge Signals/Review and
+// reviewsup.LaunchReview — CheckCompletion is never review authority.
 type ReceiptStore interface {
 	Persist(context.Context, Receipt) error
 	Load(context.Context, string) (Receipt, error)

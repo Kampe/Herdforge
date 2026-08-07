@@ -1,7 +1,9 @@
 package reviewsup
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -13,6 +15,17 @@ func fixedNow() time.Time {
 	return time.Date(2025, 6, 1, 12, 0, 0, 0, time.UTC)
 }
 
+// testReceiptDigest is a syntactically valid FAC-122 digest used by unit
+// fixtures that are not exercising the verifier itself.
+const testReceiptDigest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+func testAdmitReceipt(_ context.Context, _, digest string) error {
+	if !strings.HasPrefix(digest, "sha256:") || len(digest) != len(testReceiptDigest) {
+		return errors.New("test admit: invalid digest")
+	}
+	return nil
+}
+
 func newTestSupervisor(t *testing.T) (*ReviewSupervisor, string) {
 	t.Helper()
 	dir := t.TempDir()
@@ -21,29 +34,37 @@ func newTestSupervisor(t *testing.T) (*ReviewSupervisor, string) {
 	cfg.MaxPendingReviews = 3
 	cfg.StaleDuration = 24 * time.Hour
 	cfg.RetryLimit = 3
+	cfg.AdmitReceipt = testAdmitReceipt
 	return New(cfg), dir
+}
+
+func withDigest(cb CompletionCallback) CompletionCallback {
+	if cb.ReceiptDigest == "" {
+		cb.ReceiptDigest = testReceiptDigest
+	}
+	return cb
 }
 
 func svc(t *testing.T) *ReviewSupervisor {
 	t.Helper()
 	sv, _ := newTestSupervisor(t)
-	_, _, err := sv.Ingest(CompletionCallback{
+	_, _, err := sv.Ingest(withDigest(CompletionCallback{
 		SHA:         "aaa111",
 		Branch:      "feat/foo",
 		PatchID:     "patch-1",
 		AuthorModel: "claude-3-7-sonnet",
 		Tier:        TierR1,
-	})
+	}))
 	if err != nil {
 		t.Fatalf("Ingest: %v", err)
 	}
-	_, _, err = sv.Ingest(CompletionCallback{
+	_, _, err = sv.Ingest(withDigest(CompletionCallback{
 		SHA:         "bbb222",
 		Branch:      "feat/bar",
 		PatchID:     "patch-2",
 		AuthorModel: "gemini-2.5-flash",
 		Tier:        TierR3,
-	})
+	}))
 	if err != nil {
 		t.Fatalf("Ingest: %v", err)
 	}
@@ -53,6 +74,7 @@ func svc(t *testing.T) *ReviewSupervisor {
 func TestNewDefaultConfig(t *testing.T) {
 	dir := t.TempDir()
 	cfg := DefaultConfig(dir)
+	cfg.AdmitReceipt = testAdmitReceipt
 	if cfg.MaxPendingReviews != 3 {
 		t.Errorf("MaxPendingReviews = %d, want 3", cfg.MaxPendingReviews)
 	}
@@ -97,12 +119,12 @@ func TestIngest(t *testing.T) {
 
 func TestIngestDuplicateSHA(t *testing.T) {
 	sv := svc(t)
-	accepted, stale, err := sv.Ingest(CompletionCallback{
+	accepted, stale, err := sv.Ingest(withDigest(CompletionCallback{
 		SHA:         "aaa111",
 		Branch:      "feat/foo",
 		AuthorModel: "claude-3-7-sonnet",
 		Tier:        TierR1,
-	})
+	}))
 	if err != nil {
 		t.Fatalf("Ingest: %v", err)
 	}
@@ -117,13 +139,13 @@ func TestIngestDuplicateSHA(t *testing.T) {
 func TestIngestSupersedesOld(t *testing.T) {
 	sv := svc(t)
 
-	accepted, stale, err := sv.Ingest(CompletionCallback{
+	accepted, stale, err := sv.Ingest(withDigest(CompletionCallback{
 		SHA:         "aaa222",
 		Branch:      "feat/foo",
 		PatchID:     "patch-1",
 		AuthorModel: "claude-3-7-sonnet",
 		Tier:        TierR1,
-	})
+	}))
 	if err != nil {
 		t.Fatalf("Ingest: %v", err)
 	}
@@ -153,11 +175,11 @@ func TestIngestSupersedesOld(t *testing.T) {
 
 func TestIngestEmptySHA(t *testing.T) {
 	sv := svc(t)
-	_, _, err := sv.Ingest(CompletionCallback{
+	_, _, err := sv.Ingest(withDigest(CompletionCallback{
 		SHA:         "",
 		AuthorModel: "claude-3-7-sonnet",
 		Tier:        TierR1,
-	})
+	}))
 	if err == nil {
 		t.Fatal("expected error for empty SHA")
 	}
@@ -195,11 +217,11 @@ func TestSelectReviewerSameFamilyR1Rejected(t *testing.T) {
 
 func TestSelectReviewerR0SameFamilyOK(t *testing.T) {
 	s, _ := newTestSupervisor(t)
-	_, _, err := s.Ingest(CompletionCallback{
+	_, _, err := s.Ingest(withDigest(CompletionCallback{
 		SHA:         "r0sha",
 		AuthorModel: "claude-3-7-sonnet",
 		Tier:        TierR0,
-	})
+	}))
 	if err != nil {
 		t.Fatalf("Ingest: %v", err)
 	}
@@ -311,11 +333,11 @@ func TestLaunchReviewUnknownFamilyRejected_RepairProbe(t *testing.T) {
 // (or worse, a same-family one could slip through under a misleading label).
 func TestSubmitVerdictUsesStoredReviewFamily_RepairProbe(t *testing.T) {
 	sv, _ := newTestSupervisor(t)
-	_, _, err := sv.Ingest(CompletionCallback{
+	_, _, err := sv.Ingest(withDigest(CompletionCallback{
 		SHA:         "sha1",
 		AuthorModel: "gpt-4", // openai family
 		Tier:        TierR1,
-	})
+	}))
 	if err != nil {
 		t.Fatalf("Ingest: %v", err)
 	}
@@ -404,14 +426,15 @@ func TestSubmitVerdictFAILReturnsToPending(t *testing.T) {
 
 func TestSubmitVerdictFAILExceedsRetryLimit(t *testing.T) {
 	cfg := DefaultConfig(t.TempDir())
+	cfg.AdmitReceipt = testAdmitReceipt
 	cfg.Now = fixedNow
 	cfg.RetryLimit = 1
 	sv2 := New(cfg)
-	sv2.Ingest(CompletionCallback{
+	sv2.Ingest(withDigest(CompletionCallback{
 		SHA:         "aaa111",
 		AuthorModel: "claude",
 		Tier:        TierR1,
-	})
+	}))
 	sv2.LaunchReview("aaa111", "gemini", "gemini-2.5-flash")
 	sv2.SubmitVerdict(ReviewVerdict{SHA: "aaa111", Reviewer: "gemini", Verdict: VerdictFAIL})
 
@@ -471,7 +494,7 @@ func TestCapacityTracking(t *testing.T) {
 		t.Errorf("AvailableCapacity = %d, want 1", sv.AvailableCapacity())
 	}
 
-	sv.Ingest(CompletionCallback{SHA: "ccc333", AuthorModel: "gpt-4", Tier: TierR2})
+	sv.Ingest(withDigest(CompletionCallback{SHA: "ccc333", AuthorModel: "gpt-4", Tier: TierR2}))
 	if !sv.AtCapacity() {
 		t.Error("expected at capacity with 3/3")
 	}
@@ -482,7 +505,7 @@ func TestCapacityTracking(t *testing.T) {
 
 func TestVerdictReleasesCapacity(t *testing.T) {
 	sv := svc(t)
-	sv.Ingest(CompletionCallback{SHA: "ccc333", AuthorModel: "gpt-4", Tier: TierR2})
+	sv.Ingest(withDigest(CompletionCallback{SHA: "ccc333", AuthorModel: "gpt-4", Tier: TierR2}))
 	if !sv.AtCapacity() {
 		t.Fatal("expected at capacity")
 	}
@@ -519,20 +542,23 @@ func TestMarkHarvested(t *testing.T) {
 func TestEvictStale(t *testing.T) {
 	dir := t.TempDir()
 	cfg := DefaultConfig(dir)
+	cfg.AdmitReceipt = testAdmitReceipt
 	cfg.Now = func() time.Time {
 		return time.Date(2025, 6, 3, 12, 0, 0, 0, time.UTC)
 	}
 	cfg.StaleDuration = 24 * time.Hour
 
 	cfg2 := DefaultConfig(dir)
+	cfg2.AdmitReceipt = testAdmitReceipt
 	cfg2.Now = func() time.Time {
 		return time.Date(2025, 6, 1, 0, 0, 0, 0, time.UTC)
 	}
 	cfg2.StaleDuration = 24 * time.Hour
 	sv2 := New(cfg2)
-	sv2.Ingest(CompletionCallback{SHA: "oldsha", AuthorModel: "claude", Tier: TierR1})
+	sv2.Ingest(withDigest(CompletionCallback{SHA: "oldsha", AuthorModel: "claude", Tier: TierR1}))
 
 	cfg3 := DefaultConfig(dir)
+	cfg3.AdmitReceipt = testAdmitReceipt
 	cfg3.Now = func() time.Time {
 		return time.Date(2025, 6, 3, 12, 0, 0, 0, time.UTC)
 	}
@@ -552,11 +578,12 @@ func TestEvictStale(t *testing.T) {
 func TestReconstructFromLedger(t *testing.T) {
 	dir := t.TempDir()
 	cfg := DefaultConfig(dir)
+	cfg.AdmitReceipt = testAdmitReceipt
 	cfg.Now = fixedNow
 	sv := New(cfg)
 
-	sv.Ingest(CompletionCallback{SHA: "aaa111", AuthorModel: "claude", Tier: TierR1, PatchID: "p1"})
-	sv.Ingest(CompletionCallback{SHA: "bbb222", AuthorModel: "gemini", Tier: TierR3, PatchID: "p2"})
+	sv.Ingest(withDigest(CompletionCallback{SHA: "aaa111", AuthorModel: "claude", Tier: TierR1, PatchID: "p1"}))
+	sv.Ingest(withDigest(CompletionCallback{SHA: "bbb222", AuthorModel: "gemini", Tier: TierR3, PatchID: "p2"}))
 	sv.LaunchReview("aaa111", "gemini", "gemini-2.5-flash")
 	sv.SubmitVerdict(ReviewVerdict{SHA: "aaa111", Reviewer: "gemini", Verdict: VerdictPASS})
 
@@ -592,11 +619,12 @@ func TestReconstructFromLedger(t *testing.T) {
 func TestReconstructSupersede(t *testing.T) {
 	dir := t.TempDir()
 	cfg := DefaultConfig(dir)
+	cfg.AdmitReceipt = testAdmitReceipt
 	cfg.Now = fixedNow
 	sv := New(cfg)
 
-	sv.Ingest(CompletionCallback{SHA: "old", PatchID: "p1", AuthorModel: "claude", Tier: TierR1})
-	sv.Ingest(CompletionCallback{SHA: "new", PatchID: "p1", AuthorModel: "claude", Tier: TierR1})
+	sv.Ingest(withDigest(CompletionCallback{SHA: "old", PatchID: "p1", AuthorModel: "claude", Tier: TierR1}))
+	sv.Ingest(withDigest(CompletionCallback{SHA: "new", PatchID: "p1", AuthorModel: "claude", Tier: TierR1}))
 
 	sv2 := New(cfg)
 	sv2.Reconstruct()
@@ -621,10 +649,11 @@ func TestReconstructSupersede(t *testing.T) {
 func TestReconstructWithQueueState(t *testing.T) {
 	dir := t.TempDir()
 	cfg := DefaultConfig(dir)
+	cfg.AdmitReceipt = testAdmitReceipt
 	cfg.Now = fixedNow
 	sv := New(cfg)
 
-	sv.Ingest(CompletionCallback{SHA: "aaa111", AuthorModel: "claude", Tier: TierR1})
+	sv.Ingest(withDigest(CompletionCallback{SHA: "aaa111", AuthorModel: "claude", Tier: TierR1}))
 	sv.LaunchReview("aaa111", "gemini", "gemini-2.5-flash")
 	sv.SubmitVerdict(ReviewVerdict{SHA: "aaa111", Reviewer: "gemini", Verdict: VerdictPASS})
 	sv.MarkHarvested("aaa111")
@@ -643,8 +672,8 @@ func TestReconstructWithQueueState(t *testing.T) {
 
 func TestReadyForHarvestReturnsSorted(t *testing.T) {
 	sv := svc(t)
-	sv.Ingest(CompletionCallback{SHA: "ccc333", AuthorModel: "gpt-4", Tier: TierR2})
-	sv.Ingest(CompletionCallback{SHA: "ddd444", AuthorModel: "codex", Tier: TierR1})
+	sv.Ingest(withDigest(CompletionCallback{SHA: "ccc333", AuthorModel: "gpt-4", Tier: TierR2}))
+	sv.Ingest(withDigest(CompletionCallback{SHA: "ddd444", AuthorModel: "codex", Tier: TierR1}))
 
 	for _, sha := range []string{"aaa111", "bbb222", "ccc333", "ddd444"} {
 		rev := "gemini"
@@ -825,12 +854,13 @@ func TestDuplicateVerdictNoDoubleHarvest(t *testing.T) {
 func TestLostCallbackRecoveryViaReconstruct(t *testing.T) {
 	dir := t.TempDir()
 	cfg := DefaultConfig(dir)
+	cfg.AdmitReceipt = testAdmitReceipt
 	cfg.Now = func() time.Time {
 		return time.Date(2025, 6, 1, 12, 0, 0, 0, time.UTC)
 	}
 	sv := New(cfg)
 
-	sv.Ingest(CompletionCallback{SHA: "aaa111", AuthorModel: "claude", Tier: TierR1, PatchID: "p1"})
+	sv.Ingest(withDigest(CompletionCallback{SHA: "aaa111", AuthorModel: "claude", Tier: TierR1, PatchID: "p1"}))
 	sv.LaunchReview("aaa111", "gemini", "gemini-2.5-flash")
 
 	sv2 := New(cfg)
@@ -860,7 +890,7 @@ func TestZeroValueSafety(t *testing.T) {
 		t.Error("expected error for empty verdict SHA")
 	}
 
-	_, _, err = sv.Ingest(CompletionCallback{SHA: "", AuthorModel: "claude", Tier: TierR1})
+	_, _, err = sv.Ingest(withDigest(CompletionCallback{SHA: "", AuthorModel: "claude", Tier: TierR1}))
 	if err == nil {
 		t.Error("expected error for empty ingest SHA")
 	}
@@ -868,16 +898,17 @@ func TestZeroValueSafety(t *testing.T) {
 
 func TestAvailableCapacityFloor(t *testing.T) {
 	cfg := DefaultConfig(t.TempDir())
+	cfg.AdmitReceipt = testAdmitReceipt
 	cfg.MaxPendingReviews = 1
 	sv := New(cfg)
 	if sv.AvailableCapacity() != 1 {
 		t.Errorf("expected 1, got %d", sv.AvailableCapacity())
 	}
-	sv.Ingest(CompletionCallback{SHA: "s1", AuthorModel: "claude", Tier: TierR1})
+	sv.Ingest(withDigest(CompletionCallback{SHA: "s1", AuthorModel: "claude", Tier: TierR1}))
 	if sv.AvailableCapacity() != 0 {
 		t.Errorf("expected 0, got %d", sv.AvailableCapacity())
 	}
-	sv.Ingest(CompletionCallback{SHA: "s2", AuthorModel: "gemini", Tier: TierR1})
+	sv.Ingest(withDigest(CompletionCallback{SHA: "s2", AuthorModel: "gemini", Tier: TierR1}))
 	if sv.AvailableCapacity() != 0 {
 		t.Errorf("expected 0 (clamped), got %d", sv.AvailableCapacity())
 	}
@@ -886,9 +917,10 @@ func TestAvailableCapacityFloor(t *testing.T) {
 func TestLedgerFileCreation(t *testing.T) {
 	dir := t.TempDir()
 	cfg := DefaultConfig(dir)
+	cfg.AdmitReceipt = testAdmitReceipt
 	sv := New(cfg)
 
-	sv.Ingest(CompletionCallback{SHA: "aaa111", AuthorModel: "claude", Tier: TierR1})
+	sv.Ingest(withDigest(CompletionCallback{SHA: "aaa111", AuthorModel: "claude", Tier: TierR1}))
 	sv.LaunchReview("aaa111", "gemini", "gemini-2.5-flash")
 	sv.SubmitVerdict(ReviewVerdict{SHA: "aaa111", Reviewer: "gemini", Verdict: VerdictPASS})
 
@@ -924,10 +956,11 @@ func TestMarkHarvestedUpdatesState(t *testing.T) {
 func TestSelectReviewerAfterRecovery(t *testing.T) {
 	dir := t.TempDir()
 	cfg := DefaultConfig(dir)
+	cfg.AdmitReceipt = testAdmitReceipt
 	cfg.Now = fixedNow
 	sv := New(cfg)
 
-	sv.Ingest(CompletionCallback{SHA: "aaa111", AuthorModel: "claude", Tier: TierR1})
+	sv.Ingest(withDigest(CompletionCallback{SHA: "aaa111", AuthorModel: "claude", Tier: TierR1}))
 
 	sv2 := New(cfg)
 	sv2.Reconstruct()
@@ -971,10 +1004,11 @@ func TestReadRowsMalformed(t *testing.T) {
 func TestReconstructFailsOnCorruptQueue_RepairProbe(t *testing.T) {
 	dir := t.TempDir()
 	cfg := DefaultConfig(dir)
+	cfg.AdmitReceipt = testAdmitReceipt
 	cfg.Now = fixedNow
 	sv := New(cfg)
 
-	if _, _, err := sv.Ingest(CompletionCallback{SHA: "aaa111", AuthorModel: "claude", Tier: TierR1}); err != nil {
+	if _, _, err := sv.Ingest(withDigest(CompletionCallback{SHA: "aaa111", AuthorModel: "claude", Tier: TierR1})); err != nil {
 		t.Fatalf("Ingest: %v", err)
 	}
 	if err := os.WriteFile(cfg.QueuePath, []byte("{not json}\n"), 0644); err != nil {
@@ -992,12 +1026,12 @@ func TestReconstructFailsOnCorruptQueue_RepairProbe(t *testing.T) {
 // and must never be accepted for review.
 func TestIngestDirtyWorktreeRejected_RepairProbe(t *testing.T) {
 	sv, _ := newTestSupervisor(t)
-	accepted, _, err := sv.Ingest(CompletionCallback{
+	accepted, _, err := sv.Ingest(withDigest(CompletionCallback{
 		SHA:           "dirty1",
 		AuthorModel:   "claude",
 		Tier:          TierR1,
 		DirtyWorktree: true,
-	})
+	}))
 	if err == nil {
 		t.Fatal("expected error for dirty-worktree completion callback")
 	}
@@ -1014,25 +1048,25 @@ func TestIngestDirtyWorktreeRejected_RepairProbe(t *testing.T) {
 // accepted callback for that lease, or it is a stale/replayed callback.
 func TestIngestStaleLeaseGenerationRejected_RepairProbe(t *testing.T) {
 	sv, _ := newTestSupervisor(t)
-	_, _, err := sv.Ingest(CompletionCallback{
+	_, _, err := sv.Ingest(withDigest(CompletionCallback{
 		SHA:         "sha-gen2",
 		AuthorModel: "claude",
 		Tier:        TierR1,
 		LeaseID:     "lease-1",
 		Generation:  2,
-	})
+	}))
 	if err != nil {
 		t.Fatalf("Ingest gen 2: %v", err)
 	}
 
 	// Same generation replayed for the same lease must be rejected.
-	accepted, _, err := sv.Ingest(CompletionCallback{
+	accepted, _, err := sv.Ingest(withDigest(CompletionCallback{
 		SHA:         "sha-gen2-replay",
 		AuthorModel: "claude",
 		Tier:        TierR1,
 		LeaseID:     "lease-1",
 		Generation:  2,
-	})
+	}))
 	if err == nil {
 		t.Fatal("expected error for stale (non-increasing) lease generation")
 	}
@@ -1041,25 +1075,25 @@ func TestIngestStaleLeaseGenerationRejected_RepairProbe(t *testing.T) {
 	}
 
 	// An older generation for the same lease must also be rejected.
-	_, _, err = sv.Ingest(CompletionCallback{
+	_, _, err = sv.Ingest(withDigest(CompletionCallback{
 		SHA:         "sha-gen1",
 		AuthorModel: "claude",
 		Tier:        TierR1,
 		LeaseID:     "lease-1",
 		Generation:  1,
-	})
+	}))
 	if err == nil {
 		t.Fatal("expected error for older lease generation")
 	}
 
 	// A strictly newer generation for the same lease must succeed.
-	_, _, err = sv.Ingest(CompletionCallback{
+	_, _, err = sv.Ingest(withDigest(CompletionCallback{
 		SHA:         "sha-gen3",
 		AuthorModel: "claude",
 		Tier:        TierR1,
 		LeaseID:     "lease-1",
 		Generation:  3,
-	})
+	}))
 	if err != nil {
 		t.Fatalf("expected newer lease generation to be accepted: %v", err)
 	}
@@ -1070,24 +1104,24 @@ func TestIngestStaleLeaseGenerationRejected_RepairProbe(t *testing.T) {
 // commit's generation must be newer than the one it replaces.
 func TestIngestStaleSHAGenerationRejected_RepairProbe(t *testing.T) {
 	sv, _ := newTestSupervisor(t)
-	_, _, err := sv.Ingest(CompletionCallback{
+	_, _, err := sv.Ingest(withDigest(CompletionCallback{
 		SHA:         "sha-a",
 		PatchID:     "patch-x",
 		AuthorModel: "claude",
 		Tier:        TierR1,
 		Generation:  5,
-	})
+	}))
 	if err != nil {
 		t.Fatalf("Ingest sha-a: %v", err)
 	}
 
-	accepted, _, err := sv.Ingest(CompletionCallback{
+	accepted, _, err := sv.Ingest(withDigest(CompletionCallback{
 		SHA:         "sha-b-stale",
 		PatchID:     "patch-x",
 		AuthorModel: "claude",
 		Tier:        TierR1,
 		Generation:  5,
-	})
+	}))
 	if err == nil {
 		t.Fatal("expected error: same-generation SHA for the same patch is stale")
 	}
@@ -1098,13 +1132,13 @@ func TestIngestStaleSHAGenerationRejected_RepairProbe(t *testing.T) {
 		t.Error("original candidate must remain pending after a rejected stale supersede")
 	}
 
-	_, _, err = sv.Ingest(CompletionCallback{
+	_, _, err = sv.Ingest(withDigest(CompletionCallback{
 		SHA:         "sha-c-fresh",
 		PatchID:     "patch-x",
 		AuthorModel: "claude",
 		Tier:        TierR1,
 		Generation:  6,
-	})
+	}))
 	if err != nil {
 		t.Fatalf("expected newer-generation supersede to succeed: %v", err)
 	}
@@ -1188,6 +1222,7 @@ func TestBuilderHandoffDurableOnDirectBlocked_RepairProbe(t *testing.T) {
 func TestReconstructBackfillsMissingBuilderCallback_RepairProbe(t *testing.T) {
 	dir := t.TempDir()
 	cfg := DefaultConfig(dir)
+	cfg.AdmitReceipt = testAdmitReceipt
 	cfg.Now = fixedNow
 	cfg.RetryLimit = 1 // FAIL on first attempt goes straight to BLOCKED
 
@@ -1222,5 +1257,70 @@ func TestReconstructBackfillsMissingBuilderCallback_RepairProbe(t *testing.T) {
 	}
 	if handoffs[0].Findings != "critical bug" {
 		t.Errorf("backfilled findings = %q, want %q", handoffs[0].Findings, "critical bug")
+	}
+}
+
+// FAC-144: CheckCompletion-only (no receipt digest) cannot enter review.
+func TestIngest_MissingReceiptDigest_Refused(t *testing.T) {
+	sv, _ := newTestSupervisor(t)
+	_, _, err := sv.Ingest(CompletionCallback{
+		SHA:         "aaa111",
+		AuthorModel: "claude",
+		Tier:        TierR1,
+		// deliberately empty ReceiptDigest
+	})
+	if err == nil {
+		t.Fatal("expected missing receipt digest to refuse ingest")
+	}
+	if !strings.Contains(err.Error(), "receipt digest") {
+		t.Fatalf("error = %v, want receipt digest mention", err)
+	}
+}
+
+func TestLaunchReview_UnconfiguredAdmit_Refused(t *testing.T) {
+	dir := t.TempDir()
+	cfg := DefaultConfig(dir)
+	cfg.Now = fixedNow
+	// AdmitReceipt deliberately nil — production miscomposition.
+	sv := New(cfg)
+	_, _, err := sv.Ingest(withDigest(CompletionCallback{
+		SHA: "aaa111", AuthorModel: "claude", Tier: TierR1,
+	}))
+	if err != nil {
+		t.Fatalf("Ingest: %v", err)
+	}
+	err = sv.LaunchReview("aaa111", "gemini", "gemini-2.5-flash")
+	if err == nil {
+		t.Fatal("LaunchReview without AdmitReceipt must refuse")
+	}
+	if !strings.Contains(err.Error(), "admission is not configured") {
+		t.Fatalf("error = %v, want unconfigured admission", err)
+	}
+}
+
+func TestLaunchReview_AdmitRefuses_BlocksSpawn(t *testing.T) {
+	dir := t.TempDir()
+	cfg := DefaultConfig(dir)
+	cfg.Now = fixedNow
+	cfg.AdmitReceipt = func(context.Context, string, string) error {
+		return errors.New("not PASS")
+	}
+	sv := New(cfg)
+	_, _, err := sv.Ingest(withDigest(CompletionCallback{
+		SHA: "aaa111", AuthorModel: "claude", Tier: TierR1,
+	}))
+	if err != nil {
+		t.Fatalf("Ingest: %v", err)
+	}
+	err = sv.LaunchReview("aaa111", "gemini", "gemini-2.5-flash")
+	if err == nil {
+		t.Fatal("LaunchReview must surface admission refusal")
+	}
+	if !strings.Contains(err.Error(), "receipt admission refused") {
+		t.Fatalf("error = %v, want admission refused", err)
+	}
+	c := sv.Candidate("aaa111")
+	if c == nil || c.State != StatePending {
+		t.Fatalf("candidate must remain pending after refused launch, got %+v", c)
 	}
 }

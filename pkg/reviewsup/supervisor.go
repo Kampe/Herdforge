@@ -47,25 +47,26 @@ const (
 )
 
 type Row struct {
-	Timestamp    string `json:"ts"`
-	Event        string `json:"event"`
-	SHA          string `json:"sha"`
-	Branch       string `json:"branch,omitempty"`
-	PatchID      string `json:"patch_id,omitempty"`
-	AuthorModel  string `json:"author_model,omitempty"`
-	AuthorFamily string `json:"author_family,omitempty"`
-	Reviewer     string `json:"reviewer,omitempty"`
-	ReviewFamily string `json:"review_family,omitempty"`
-	Tier         string `json:"tier,omitempty"`
-	Verdict      string `json:"verdict,omitempty"`
-	Reason       string `json:"reason,omitempty"`
-	PrevSHA      string `json:"prev_sha,omitempty"`
-	Harvested    bool   `json:"harvested,omitempty"`
-	Capacity     int    `json:"capacity,omitempty"`
-	Attempts     int    `json:"attempts,omitempty"`
-	IngestedAt   string `json:"ingested_at,omitempty"`
-	LeaseID      string `json:"lease_id,omitempty"`
-	Generation   int64  `json:"generation,omitempty"`
+	Timestamp     string `json:"ts"`
+	Event         string `json:"event"`
+	SHA           string `json:"sha"`
+	Branch        string `json:"branch,omitempty"`
+	PatchID       string `json:"patch_id,omitempty"`
+	AuthorModel   string `json:"author_model,omitempty"`
+	AuthorFamily  string `json:"author_family,omitempty"`
+	Reviewer      string `json:"reviewer,omitempty"`
+	ReviewFamily  string `json:"review_family,omitempty"`
+	Tier          string `json:"tier,omitempty"`
+	Verdict       string `json:"verdict,omitempty"`
+	Reason        string `json:"reason,omitempty"`
+	PrevSHA       string `json:"prev_sha,omitempty"`
+	Harvested     bool   `json:"harvested,omitempty"`
+	Capacity      int    `json:"capacity,omitempty"`
+	Attempts      int    `json:"attempts,omitempty"`
+	IngestedAt    string `json:"ingested_at,omitempty"`
+	LeaseID       string `json:"lease_id,omitempty"`
+	Generation    int64  `json:"generation,omitempty"`
+	ReceiptDigest string `json:"receipt_digest,omitempty"`
 }
 
 type CandidateState string
@@ -98,6 +99,10 @@ type Candidate struct {
 	LeaseID       string
 	LeaseExpiry   time.Time
 	Generation    int64
+	// ReceiptDigest is the FAC-122 verification receipt digest that
+	// admitted this candidate. LaunchReview re-checks it; empty digest
+	// never enters review.
+	ReceiptDigest string
 }
 
 type ModelFamily string
@@ -144,6 +149,11 @@ func RequireCrossFamily(tier RiskTier) bool {
 	return tier == TierR1 || tier == TierR2 || tier == TierR3
 }
 
+// ReceiptAdmit is the FAC-144 review-spawn gate. Production composes it to
+// ReceiptAdmission.RequireCurrentPassing (via daemon.CompletionGate). A nil
+// admit refuses LaunchReview fail-closed — CheckCompletion is never enough.
+type ReceiptAdmit func(ctx context.Context, worktreeDir, digest string) error
+
 type Config struct {
 	LedgerPath        string
 	QueuePath         string
@@ -153,6 +163,12 @@ type Config struct {
 	LeaseDuration     time.Duration
 	Now               func() time.Time
 	Orders            *control.CoordinatorOrders
+	// AdmitReceipt is required for LaunchReview. When nil, review spawn is
+	// refused so a miscomposed supervisor cannot bypass verification.
+	AdmitReceipt ReceiptAdmit
+	// WorktreeFor resolves the candidate worktree for AdmitReceipt. When
+	// nil, AdmitReceipt is called with dir "".
+	WorktreeFor func(candidateSHA string) (string, error)
 }
 
 func DefaultConfig(ledgerDir string) Config {
@@ -275,6 +291,10 @@ type CompletionCallback struct {
 	LeaseID       string
 	Generation    int64
 	DirtyWorktree bool
+	// ReceiptDigest is the FAC-122 VerifyAndPersist digest for this SHA.
+	// Ingest refuses an empty digest so CheckCompletion-only callbacks
+	// cannot enter the review queue (FAC-144).
+	ReceiptDigest string
 }
 
 func (sv *ReviewSupervisor) Ingest(cb CompletionCallback) (accepted bool, staleSHA string, err error) {
@@ -283,6 +303,12 @@ func (sv *ReviewSupervisor) Ingest(cb CompletionCallback) (accepted bool, staleS
 
 	if cb.SHA == "" {
 		return false, "", fmt.Errorf("reviewsup: empty SHA in completion callback")
+	}
+	if strings.TrimSpace(cb.ReceiptDigest) == "" {
+		return false, "", fmt.Errorf("reviewsup: completion callback for %s rejected: missing verification receipt digest", cb.SHA)
+	}
+	if !strings.HasPrefix(cb.ReceiptDigest, "sha256:") {
+		return false, "", fmt.Errorf("reviewsup: completion callback for %s rejected: receipt digest must be sha256:…", cb.SHA)
 	}
 
 	// Dirty-worktree evidence can never be reviewed: the recorded SHA does
@@ -338,30 +364,32 @@ func (sv *ReviewSupervisor) Ingest(cb CompletionCallback) (accepted bool, staleS
 	}
 
 	cand := &Candidate{
-		SHA:          cb.SHA,
-		Branch:       cb.Branch,
-		PatchID:      cb.PatchID,
-		AuthorModel:  cb.AuthorModel,
-		AuthorFamily: string(lookupFamily(cb.AuthorModel)),
-		Tier:         cb.Tier,
-		State:        StatePending,
-		IngestedAt:   sv.now(),
-		UpdatedAt:    sv.now(),
-		LeaseID:      cb.LeaseID,
-		Generation:   cb.Generation,
+		SHA:           cb.SHA,
+		Branch:        cb.Branch,
+		PatchID:       cb.PatchID,
+		AuthorModel:   cb.AuthorModel,
+		AuthorFamily:  string(lookupFamily(cb.AuthorModel)),
+		Tier:          cb.Tier,
+		State:         StatePending,
+		IngestedAt:    sv.now(),
+		UpdatedAt:     sv.now(),
+		LeaseID:       cb.LeaseID,
+		Generation:    cb.Generation,
+		ReceiptDigest: cb.ReceiptDigest,
 	}
 
 	if err := sv.appendRow(&Row{
-		Event:        string(EventCompletion),
-		SHA:          cb.SHA,
-		Branch:       cb.Branch,
-		PatchID:      cb.PatchID,
-		AuthorModel:  cb.AuthorModel,
-		AuthorFamily: cand.AuthorFamily,
-		Tier:         string(cb.Tier),
-		IngestedAt:   sv.nowISO(),
-		LeaseID:      cb.LeaseID,
-		Generation:   cb.Generation,
+		Event:         string(EventCompletion),
+		SHA:           cb.SHA,
+		Branch:        cb.Branch,
+		PatchID:       cb.PatchID,
+		AuthorModel:   cb.AuthorModel,
+		AuthorFamily:  cand.AuthorFamily,
+		Tier:          string(cb.Tier),
+		IngestedAt:    sv.nowISO(),
+		LeaseID:       cb.LeaseID,
+		Generation:    cb.Generation,
+		ReceiptDigest: cb.ReceiptDigest,
 	}); err != nil {
 		return false, "", fmt.Errorf("reviewsup: append completion row: %w", err)
 	}
@@ -421,6 +449,25 @@ func (sv *ReviewSupervisor) LaunchReview(candidateSHA, reviewer, reviewModel str
 	if cand.State != StatePending {
 		return fmt.Errorf("reviewsup: candidate %s is not pending (state=%s)", candidateSHA, cand.State)
 	}
+	if strings.TrimSpace(cand.ReceiptDigest) == "" {
+		return fmt.Errorf("reviewsup: candidate %s has no verification receipt digest", candidateSHA)
+	}
+	// FAC-144: RequireCurrentPassing (or equivalent) before review spawn.
+	// A nil admit is a miscomposition, not a free pass.
+	if sv.cfg.AdmitReceipt == nil {
+		return fmt.Errorf("reviewsup: receipt admission is not configured — refusing to spawn review for %s", candidateSHA)
+	}
+	dir := ""
+	if sv.cfg.WorktreeFor != nil {
+		var err error
+		dir, err = sv.cfg.WorktreeFor(candidateSHA)
+		if err != nil {
+			return fmt.Errorf("reviewsup: resolve worktree for %s: %w", candidateSHA, err)
+		}
+	}
+	if err := sv.cfg.AdmitReceipt(context.Background(), dir, cand.ReceiptDigest); err != nil {
+		return fmt.Errorf("reviewsup: receipt admission refused for %s: %w", candidateSHA, err)
+	}
 
 	reviewFamily := lookupFamily(reviewModel)
 	authorFamily := lookupFamily(cand.AuthorModel)
@@ -436,12 +483,13 @@ func (sv *ReviewSupervisor) LaunchReview(candidateSHA, reviewer, reviewModel str
 	cand.UpdatedAt = sv.now()
 	cand.Attempts++
 	if err := sv.appendRow(&Row{
-		Event:        string(EventReview),
-		SHA:          candidateSHA,
-		Reviewer:     reviewer,
-		ReviewFamily: string(reviewFamily),
-		Tier:         string(cand.Tier),
-		Attempts:     cand.Attempts,
+		Event:         string(EventReview),
+		SHA:           candidateSHA,
+		Reviewer:      reviewer,
+		ReviewFamily:  string(reviewFamily),
+		Tier:          string(cand.Tier),
+		Attempts:      cand.Attempts,
+		ReceiptDigest: cand.ReceiptDigest,
 	}); err != nil {
 		cand.State = StatePending
 		cand.Reviewer = ""
@@ -882,17 +930,18 @@ func (sv *ReviewSupervisor) Reconstruct() (int, error) {
 				}
 			}
 			cand := &Candidate{
-				SHA:          r.SHA,
-				Branch:       r.Branch,
-				PatchID:      r.PatchID,
-				AuthorModel:  r.AuthorModel,
-				AuthorFamily: r.AuthorFamily,
-				Tier:         tier,
-				State:        StatePending,
-				IngestedAt:   ingestedAt,
-				UpdatedAt:    sv.cfg.Now(),
-				LeaseID:      r.LeaseID,
-				Generation:   r.Generation,
+				SHA:           r.SHA,
+				Branch:        r.Branch,
+				PatchID:       r.PatchID,
+				AuthorModel:   r.AuthorModel,
+				AuthorFamily:  r.AuthorFamily,
+				Tier:          tier,
+				State:         StatePending,
+				IngestedAt:    ingestedAt,
+				UpdatedAt:     sv.cfg.Now(),
+				LeaseID:       r.LeaseID,
+				Generation:    r.Generation,
+				ReceiptDigest: r.ReceiptDigest,
 			}
 			sv.cands[r.SHA] = cand
 			if r.PatchID != "" {
