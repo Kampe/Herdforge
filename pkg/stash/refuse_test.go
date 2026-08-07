@@ -57,8 +57,11 @@ func TestRefuseSharedStackBranchMatch(t *testing.T) {
 	if !strings.Contains(msg, "migrate them off the shared stack") {
 		t.Fatalf("migrate hint missing: %s", msg)
 	}
-	if !strings.Contains(msg, "bin/herd-stash push -m migrated") {
+	if !strings.Contains(msg, "herd stash push -m migrated") {
 		t.Fatalf("exact migrate command missing: %s", msg)
+	}
+	if strings.Contains(msg, "bin/herd-stash") {
+		t.Fatalf("must not name non-existent bin/herd-stash binary: %s", msg)
 	}
 }
 

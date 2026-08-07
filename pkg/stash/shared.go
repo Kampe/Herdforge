@@ -71,6 +71,6 @@ func FormatSharedStackRefusal(branch string, hits []string) string {
 		fmt.Fprintf(&b, "  %s\n", h)
 	}
 	b.WriteString("herd-stash: migrate them off the shared stack first (they race across worktrees):\n")
-	b.WriteString("  git stash apply <id> && bin/herd-stash push -m migrated   # then: git stash drop <id>\n")
+	b.WriteString("  git stash apply <id> && herd stash push -m migrated   # then: git stash drop <id>\n")
 	return b.String()
 }
