@@ -128,6 +128,15 @@ Commands:
   check <ref>        Validate launch eligibility without side effects
   reconcile <ref>    Print stable JSON reconcile report
   migrate            Dry-run description fence; --apply is coordinator-only`,
+	"tests-for": `Usage: herd tests-for [--graph-tool path] [--no-rebuild] [--timeout d] <base>..<candidate>
+  Deterministic targeted verification plan for an exact revision pair (FAC-160).
+  Flags precede the range; pass -- before a ref that begins with '-'.
+
+  Graph-derived absence (not_found / zero callers / zero tests) is trusted only
+  when the local code-review-graph index is bound to the candidate commit AND
+  covers the tracked-source manifest. Incomplete parity triggers one bounded
+  full rebuild; if parity still fails the run exits non-zero (BLOCKED) and the
+  emitted plan broadens to the full profile instead of narrowing.`,
 	"harvest":    "Usage: herd harvest [--quiet] [--json]\n  Fleet-wide worktree harvest sweep.",
 	"unmerged":   "Usage: herd unmerged [--all|<worktree>]\n  List unmerged commits in worktrees.",
 	"lost":       "Usage: herd lost [flags]\n  Find lost / orphaned work.",
