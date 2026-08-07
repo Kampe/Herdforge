@@ -143,6 +143,21 @@ type Sample struct {
 	// FirstWorkingUnix is when this pane was first seen working; it resets
 	// whenever the pane leaves the working state.
 	FirstWorkingUnix int64 `json:"first_working_unix"`
+
+	// The fields below belong to the FAC-90 durable progress assessment (see
+	// progress.go). They live on Sample so one persisted file carries both
+	// the diagnostic counters above and the act budget below — the budget is
+	// only a rate limit if it survives a restart.
+	Progress         Progress `json:"progress"`
+	PID              int      `json:"pid,omitempty"`
+	NoProgressCycles int      `json:"no_progress_cycles"`
+	RestartCycles    int      `json:"restart_cycles"`
+	// ActsUnix are the times spin acted on this pane, newest last, trimmed
+	// to Policy.ActWindow.
+	ActsUnix []int64 `json:"acts_unix,omitempty"`
+	// LastActionTaken is the last act actually performed, so a second stall
+	// escalates from nudge to recovery instead of nudging forever.
+	LastActionTaken Action `json:"last_action_taken,omitempty"`
 }
 
 // Thresholds tune detection.
