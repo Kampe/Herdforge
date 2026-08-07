@@ -2,19 +2,20 @@
 //
 // Bare `git stash` keeps ONE shared stack (refs/stash) across every worktree of
 // a repository, so a `git stash pop` in one lane can grab another lane's entry.
-// chainseer hit this twice on 2026-07-24, silently swapping WIP between lanes.
-// Herdforge runs far more concurrent worktrees than chainseer, so the hazard is
-// strictly worse here.
+// That hit twice on 2026-07-24, silently swapping WIP between lanes. Herdforge
+// runs far more concurrent worktrees, so the hazard is strictly worse here.
 //
 // Each worktree's stashes are stored as commits under a per-lane ref namespace,
-// refs/herd-stash/<worktree>/<n>, never touching the shared stack. Two lanes
-// physically cannot collide because each writes only its own namespace.
+// refs/herd-stash/<worktree-basename>/<n>, never touching the shared stack.
+// Two lanes physically cannot collide because each writes only its own prefix.
 //
-// Mirrors `git stash` DEFAULT: tracked and staged changes only. Untracked files
-// are left in place, exactly like git's own behaviour without -u.
+// Mirrors `git stash` DEFAULT: tracked and staged changes only. Untracked
+// files are left in place. -u/--include-untracked is refused, never ignored.
 package stash
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"os/exec"
 	"path/filepath"
@@ -27,13 +28,25 @@ import (
 // NamespaceRoot is the ref prefix that keeps lanes apart.
 const NamespaceRoot = "refs/herd-stash"
 
+// Sentinel errors. CLI maps ErrNoChanges to exit 0 (nothing to save is fine).
+var (
+	ErrNoChanges = errors.New("no local (tracked) changes to save")
+	ErrNoEntries = errors.New("no herd-stash entries for worktree")
+)
+
 var unsafeRefChars = regexp.MustCompile(`[^A-Za-z0-9._-]`)
 
-// Repo runs git in one worktree.
+// sanitizeBase turns a worktree basename into a ref-name-safe id.
+// Everything outside [A-Za-z0-9._-] becomes '_'. Empty input stays empty.
+func sanitizeBase(raw string) string {
+	return unsafeRefChars.ReplaceAllString(raw, "_")
+}
+
+// Repo runs git in one worktree. Dir is the worktree path (git -C).
 type Repo struct{ Dir string }
 
-func (r Repo) git(args ...string) (string, error) {
-	cmd := exec.Command("git", args...)
+func (r Repo) git(ctx context.Context, args ...string) (string, error) {
+	cmd := exec.CommandContext(ctx, "git", args...)
 	cmd.Dir = r.Dir
 	out, err := cmd.CombinedOutput()
 	text := strings.TrimSpace(string(out))
@@ -43,18 +56,44 @@ func (r Repo) git(args ...string) (string, error) {
 	return text, nil
 }
 
+// gitEnv runs git with extra env vars (used for GIT_INDEX_FILE temp index).
+// env overlays os.Environ so GIT_INDEX_FILE wins over any inherited value.
+func (r Repo) gitEnv(ctx context.Context, env []string, args ...string) (string, error) {
+	cmd := exec.CommandContext(ctx, "git", args...)
+	cmd.Dir = r.Dir
+	cmd.Env = append(environ(), env...)
+	out, err := cmd.CombinedOutput()
+	text := strings.TrimSpace(string(out))
+	if err != nil {
+		return text, fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, text)
+	}
+	return text, nil
+}
+
 // WorktreeID is the ref-name-safe identity of this worktree.
+// Same basename → same namespace (parallel checkouts of identically-named
+// directories intentionally collide; distinct basenames get distinct prefixes).
 func (r Repo) WorktreeID() (string, error) {
-	top, err := r.git("rev-parse", "--show-toplevel")
+	return r.WorktreeIDContext(context.Background())
+}
+
+// WorktreeIDContext is the context-aware form of WorktreeID.
+func (r Repo) WorktreeIDContext(ctx context.Context) (string, error) {
+	top, err := r.git(ctx, "rev-parse", "--show-toplevel")
 	if err != nil {
 		return "", err
 	}
-	return unsafeRefChars.ReplaceAllString(filepath.Base(top), "_"), nil
+	return sanitizeBase(filepath.Base(top)), nil
 }
 
 // Namespace is this worktree's private ref namespace.
 func (r Repo) Namespace() (string, error) {
-	id, err := r.WorktreeID()
+	return r.NamespaceContext(context.Background())
+}
+
+// NamespaceContext is the context-aware form of Namespace.
+func (r Repo) NamespaceContext(ctx context.Context) (string, error) {
+	id, err := r.WorktreeIDContext(ctx)
 	if err != nil {
 		return "", err
 	}
@@ -63,7 +102,12 @@ func (r Repo) Namespace() (string, error) {
 
 // Branch reports the current branch, or "" when detached.
 func (r Repo) Branch() string {
-	b, err := r.git("rev-parse", "--abbrev-ref", "HEAD")
+	return r.BranchContext(context.Background())
+}
+
+// BranchContext is the context-aware form of Branch.
+func (r Repo) BranchContext(ctx context.Context) string {
+	b, err := r.git(ctx, "rev-parse", "--abbrev-ref", "HEAD")
 	if err != nil || b == "HEAD" {
 		return ""
 	}
@@ -72,18 +116,27 @@ func (r Repo) Branch() string {
 
 // entryNum extracts the trailing <n> of a namespaced ref.
 func entryNum(ref string) (int, bool) {
-	n, err := strconv.Atoi(ref[strings.LastIndex(ref, "/")+1:])
+	i := strings.LastIndex(ref, "/")
+	if i < 0 || i+1 >= len(ref) {
+		return 0, false
+	}
+	n, err := strconv.Atoi(ref[i+1:])
 	return n, err == nil
 }
 
 // Entries lists this worktree's stash refs, oldest first. Sorted NUMERICALLY:
 // lexical order would put /10 before /9 and pop the wrong entry.
 func (r Repo) Entries() ([]string, error) {
-	ns, err := r.Namespace()
+	return r.EntriesContext(context.Background())
+}
+
+// EntriesContext is the context-aware form of Entries.
+func (r Repo) EntriesContext(ctx context.Context) ([]string, error) {
+	ns, err := r.NamespaceContext(ctx)
 	if err != nil {
 		return nil, err
 	}
-	out, err := r.git("for-each-ref", "--format=%(refname)", ns)
+	out, err := r.git(ctx, "for-each-ref", "--format=%(refname)", ns)
 	if err != nil {
 		return nil, err
 	}
@@ -104,26 +157,44 @@ func (r Repo) Entries() ([]string, error) {
 	return refs, nil
 }
 
-// Newest returns the most recent entry.
+// Newest returns the most recent entry (highest <n>).
 func (r Repo) Newest() (string, error) {
-	refs, err := r.Entries()
+	return r.NewestContext(context.Background())
+}
+
+// NewestContext is the context-aware form of Newest.
+func (r Repo) NewestContext(ctx context.Context) (string, error) {
+	refs, err := r.EntriesContext(ctx)
 	if err != nil {
 		return "", err
 	}
 	if len(refs) == 0 {
-		id, _ := r.WorktreeID()
-		return "", fmt.Errorf("herd-stash: no entries for worktree %q", id)
+		id, _ := r.WorktreeIDContext(ctx)
+		return "", fmt.Errorf("%w %q", ErrNoEntries, id)
 	}
 	return refs[len(refs)-1], nil
 }
 
+// PeekNewest returns the newest ref and its numeric index.
+func (r Repo) PeekNewest(ctx context.Context) (ref string, n int, err error) {
+	ref, err = r.NewestContext(ctx)
+	if err != nil {
+		return "", 0, err
+	}
+	n, ok := entryNum(ref)
+	if !ok {
+		return ref, 0, fmt.Errorf("herd-stash: malformed ref %q", ref)
+	}
+	return ref, n, nil
+}
+
 // nextRef is the next free slot in this worktree's namespace.
-func (r Repo) nextRef() (string, error) {
-	ns, err := r.Namespace()
+func (r Repo) nextRef(ctx context.Context) (string, error) {
+	ns, err := r.NamespaceContext(ctx)
 	if err != nil {
 		return "", err
 	}
-	refs, err := r.Entries()
+	refs, err := r.EntriesContext(ctx)
 	if err != nil {
 		return "", err
 	}
@@ -138,85 +209,31 @@ func (r Repo) nextRef() (string, error) {
 	return fmt.Sprintf("%s/%d", ns, n), nil
 }
 
-// SharedStackConflict reports entries on the SHARED stack made on this branch.
-// Those are exactly the racy entries herd-stash replaces; ignoring them would
-// leave the cross-lane hazard in place, so callers refuse rather than proceed.
-func (r Repo) SharedStackConflict() []string {
-	branch := r.Branch()
-	if branch == "" {
-		return nil
-	}
-	out, err := r.git("stash", "list")
-	if err != nil {
-		return nil
-	}
-	var hits []string
-	// Case-insensitive: git writes "On <branch>:" for `stash push` and
-	// "WIP on <branch>:" for a bare `git stash`. chainseer used grep -iF.
-	needle := strings.ToLower("on " + branch + ":")
-	for _, line := range strings.Split(out, "\n") {
-		if strings.Contains(strings.ToLower(line), needle) {
-			hits = append(hits, strings.TrimSpace(line))
-		}
-	}
-	return hits
+// ListEntry is one row of `herd stash list` (newest first).
+type ListEntry struct {
+	Ref     string // full ref
+	Short   string // ref without NamespaceRoot/
+	Summary string // `git log -1 --format=%h %cr %s`
 }
 
-// Push saves this worktree's tracked changes and reverts to HEAD.
-// Returns the ref written, or "" when there was nothing to save.
-func (r Repo) Push(msg string) (string, error) {
-	if msg == "" {
-		branch := r.Branch()
-		if branch == "" {
-			branch = "detached"
+// List returns this worktree's entries newest-first with short summaries.
+func (r Repo) List(ctx context.Context) ([]ListEntry, error) {
+	refs, err := r.EntriesContext(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]ListEntry, 0, len(refs))
+	for i := len(refs) - 1; i >= 0; i-- {
+		ref := refs[i]
+		sum, err := r.git(ctx, "log", "-1", "--format=%h %cr %s", ref)
+		if err != nil {
+			sum = ""
 		}
-		msg = "WIP on " + branch
+		out = append(out, ListEntry{
+			Ref:     ref,
+			Short:   strings.TrimPrefix(ref, NamespaceRoot+"/"),
+			Summary: sum,
+		})
 	}
-	// `git stash create` builds a stash-shaped commit WITHOUT touching
-	// refs/stash — that is what makes this safe alongside other lanes.
-	sha, err := r.git("stash", "create", msg)
-	if err != nil {
-		return "", err
-	}
-	if sha == "" {
-		return "", nil
-	}
-	ref, err := r.nextRef()
-	if err != nil {
-		return "", err
-	}
-	if _, err := r.git("update-ref", ref, sha); err != nil {
-		return "", fmt.Errorf("could not write %s (WIP NOT reverted, still in worktree): %w", ref, err)
-	}
-	// Read the ref back BEFORE destroying the working tree. If the ref did not
-	// store, reverting would discard the only copy of the work.
-	if _, err := r.git("rev-parse", "--verify", "--quiet", ref); err != nil {
-		return "", fmt.Errorf("ref %s did not store; NOT reverting worktree", ref)
-	}
-	if _, err := r.git("reset", "--hard", "HEAD"); err != nil {
-		return ref, fmt.Errorf("stored %s but could not revert; recover with: herd stash apply: %w", ref, err)
-	}
-	return ref, nil
-}
-
-// Apply replays the newest entry. When drop is true the entry is removed
-// afterwards (pop). A conflicting apply always KEEPS the entry.
-func (r Repo) Apply(drop bool) (string, error) {
-	ref, err := r.Newest()
-	if err != nil {
-		return "", err
-	}
-	sha, err := r.git("rev-parse", ref)
-	if err != nil {
-		return "", err
-	}
-	if _, err := r.git("stash", "apply", sha); err != nil {
-		return ref, fmt.Errorf("apply of %s hit a conflict; entry KEPT. Resolve, then re-run pop (or git update-ref -d %s)", ref, ref)
-	}
-	if drop {
-		if _, err := r.git("update-ref", "-d", ref); err != nil {
-			return ref, fmt.Errorf("applied %s but could not drop it: %w", ref, err)
-		}
-	}
-	return ref, nil
+	return out, nil
 }
