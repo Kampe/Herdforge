@@ -311,7 +311,12 @@ func bindToolChildLifecycle(paneID, name string, req launch.Request) error {
 		}
 		ready := false
 		for _, a := range agents {
-			if a.Name == name && a.PaneID == paneID && a.Session.Value != "" {
+			// Match on the identity herdr guarantees for EVERY kind. Waiting on
+			// a session id here pinned the fleet to claude: grok agents start
+			// healthy and interactive_ready but never report one, so the wait
+			// always timed out and the launch died as "tool-child owner
+			// identity unavailable".
+			if a.Name == name && a.PaneID == paneID && a.TabID != "" {
 				ready = true
 				break
 			}
@@ -331,7 +336,10 @@ func bindToolChildLifecycle(paneID, name string, req launch.Request) error {
 		return fmt.Errorf("Herdr session generation is unavailable")
 	}
 	for _, a := range agents {
-		if a.Name != name || a.PaneID != paneID || a.Session.Value == "" || a.Kind != req.Decision.Provider {
+		// A session id is provenance, not identity: herdr reports one for
+		// claude and not for grok, so requiring it excluded every non-claude
+		// surface from ever binding an owner.
+		if a.Name != name || a.PaneID != paneID || a.Kind != req.Decision.Provider {
 			continue
 		}
 		processes, err := paneProcesses(paneID)
