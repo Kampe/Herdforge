@@ -322,6 +322,11 @@ func indexAgents(agents []Agent) map[string]Agent {
 }
 
 // Run executes standing raise/status/shutdown/dry-run against cfg.
+//
+// Raise and dry-run never query the live fleet inventory until a lane has
+// passed AdmitRoute (launch policy). That keeps policy failures free of
+// herdr agent-list dependency — a wedged/unhealthy herdr cannot mask
+// config_worker_tuple_mismatch (or any other AdmitRoute error).
 func Run(cfg *config.Config, opts Options) (*Result, error) {
 	if cfg == nil {
 		return nil, errors.New("standing: config is required")
@@ -341,58 +346,38 @@ func Run(cfg *config.Config, opts Options) (*Result, error) {
 	modeName := modeString(opts.Mode)
 	result := &Result{Mode: modeName, Roles: make([]RoleResult, 0, len(lanes))}
 
-	if opts.ListAgents == nil {
-		return nil, errors.New("standing: agent list is required")
-	}
-	agents, err := opts.ListAgents()
-	if err != nil {
-		return nil, fmt.Errorf("standing: list agents: %w", err)
-	}
-	live := indexAgents(agents)
-
-	// Workspace is resolved from live evidence when reporting or creating
-	// tabs. Policy-only failures (AdmitRoute) must not require it, so unit
-	// tests can prove launch policy without a live herdr socket.
-	if opts.ResolveWorkspace != nil {
-		if ws, wsErr := opts.ResolveWorkspace(repoRoot, cfg); wsErr == nil {
-			result.Workspace = ws
-		} else if opts.Mode == ModeStatus || opts.Mode == ModeShutdown {
-			return nil, fmt.Errorf("standing: workspace: %w", wsErr)
-		} else {
-			// raise/dry-run: keep empty; resolve again before CreateTab.
-			result.Workspace = ""
-			opts = withDeferredWorkspace(opts, repoRoot, cfg, wsErr)
-		}
-	}
-
 	switch opts.Mode {
-	case ModeStatus:
-		return runStatus(result, lanes, live, repoRoot, opts)
-	case ModeShutdown:
+	case ModeStatus, ModeShutdown:
+		// Status/shutdown are inventory operations: the fleet list is the
+		// subject of the command, so it is required up front.
+		if opts.ListAgents == nil {
+			return nil, errors.New("standing: agent list is required")
+		}
+		agents, err := opts.ListAgents()
+		if err != nil {
+			return nil, fmt.Errorf("standing: list agents: %w", err)
+		}
+		live := indexAgents(agents)
+		if opts.ResolveWorkspace != nil {
+			ws, wsErr := opts.ResolveWorkspace(repoRoot, cfg)
+			if wsErr != nil {
+				return nil, fmt.Errorf("standing: workspace: %w", wsErr)
+			}
+			if strings.TrimSpace(ws) == "" {
+				return nil, errors.New("standing: workspace resolution returned empty id")
+			}
+			result.Workspace = ws
+		}
+		if opts.Mode == ModeStatus {
+			return runStatus(result, lanes, live, repoRoot, opts)
+		}
 		return runShutdown(result, lanes, live, opts)
 	case ModeDryRun, ModeRaise:
-		return runRaise(result, cfg, lanes, live, repoRoot, opts)
+		// No herdr inventory or workspace resolution until policy admits.
+		return runRaise(result, cfg, lanes, repoRoot, opts)
 	default:
 		return nil, fmt.Errorf("standing: unknown mode %d", opts.Mode)
 	}
-}
-
-// withDeferredWorkspace stashes a prior resolution error so CreateTab still
-// fails closed when every policy check passed but workspace is unknown.
-func withDeferredWorkspace(opts Options, repoRoot string, cfg *config.Config, prior error) Options {
-	orig := opts.ResolveWorkspace
-	opts.ResolveWorkspace = func(rr string, c *config.Config) (string, error) {
-		if orig != nil {
-			if ws, err := orig(rr, c); err == nil && strings.TrimSpace(ws) != "" {
-				return ws, nil
-			}
-		}
-		if prior != nil {
-			return "", prior
-		}
-		return "", errors.New("standing: workspace unresolved")
-	}
-	return opts
 }
 
 func modeString(m Mode) string {
@@ -515,7 +500,7 @@ func isActive(status string) bool {
 	}
 }
 
-func runRaise(result *Result, cfg *config.Config, lanes []config.LaneDef, live map[string]Agent, repoRoot string, opts Options) (*Result, error) {
+func runRaise(result *Result, cfg *config.Config, lanes []config.LaneDef, repoRoot string, opts Options) (*Result, error) {
 	dry := opts.Mode == ModeDryRun
 	var failures []error
 
@@ -524,27 +509,34 @@ func runRaise(result *Result, cfg *config.Config, lanes []config.LaneDef, live m
 		repository = opts.RepositoryIdentity(cfg)
 	}
 
+	// Lazy fleet inventory: loaded only after the first successful AdmitRoute
+	// so a policy-only failure never pays for (or is masked by) herdr agent list.
+	var live map[string]Agent
+	liveLoaded := false
+	loadLive := func() error {
+		if liveLoaded {
+			return nil
+		}
+		if opts.ListAgents == nil {
+			return errors.New("standing: agent list is required")
+		}
+		agents, err := opts.ListAgents()
+		if err != nil {
+			return fmt.Errorf("standing: list agents: %w", err)
+		}
+		live = indexAgents(agents)
+		liveLoaded = true
+		return nil
+	}
+
 	for i := range lanes {
 		lane := &lanes[i]
 		agentName := AgentName(lane.Name)
 		rr := RoleResult{LaneName: lane.Name, AgentName: agentName, Role: lane.Role}
 
-		if a, ok := live[agentName]; ok && NameHeld(a.Status) {
-			rr.Outcome = OutcomeSkippedLive
-			rr.Reason = "already live status=" + a.Status
-			rr.TabID = a.TabID
-			rr.PaneID = a.PaneID
-			if a.Cwd != "" {
-				rr.CWD = a.Cwd
-			}
-			result.Skipped++
-			result.Roles = append(result.Roles, rr)
-			continue
-		}
-
 		// Route admission (role/shape/provider policy + live route) runs
-		// before local path validation so policy failures surface with
-		// their canonical errors and never touch herdr.
+		// before inventory, path validation, and every herdr side effect so
+		// policy failures surface with their canonical errors.
 		if opts.AdmitRoute == nil {
 			rr.Outcome = OutcomeFailed
 			rr.Reason = "route admitter is required"
@@ -572,6 +564,28 @@ func runRaise(result *Result, cfg *config.Config, lanes []config.LaneDef, live m
 		}
 		rr.Provider = route.Provider
 		rr.Model = route.Model
+
+		// Inventory is only needed after policy admits (idempotent skip-if-live).
+		if err := loadLive(); err != nil {
+			rr.Outcome = OutcomeFailed
+			rr.Reason = err.Error()
+			result.Failed++
+			failures = append(failures, fmt.Errorf("%s: %w", lane.Name, err))
+			result.Roles = append(result.Roles, rr)
+			continue
+		}
+		if a, ok := live[agentName]; ok && NameHeld(a.Status) {
+			rr.Outcome = OutcomeSkippedLive
+			rr.Reason = "already live status=" + a.Status
+			rr.TabID = a.TabID
+			rr.PaneID = a.PaneID
+			if a.Cwd != "" {
+				rr.CWD = a.Cwd
+			}
+			result.Skipped++
+			result.Roles = append(result.Roles, rr)
+			continue
+		}
 
 		cwd, verr := ValidateLane(*lane, repoRoot, opts.PromptReadable, opts.AbsPath)
 		if verr != nil {
