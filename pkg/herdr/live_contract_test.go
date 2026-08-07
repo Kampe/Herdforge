@@ -35,6 +35,35 @@ func TestLiveHerdrAgentHelp_HasPromptNotPromptDelivery(t *testing.T) {
 	}
 }
 
+// TestLiveHerdrTabHelp_CompareCloseCapability pins the FAC-180 CLI surface.
+// Installed binaries that predate the herdr compare-close merge simply log
+// the gap; production never falls back to plain `tab close`.
+func TestLiveHerdrTabHelp_CompareCloseCapability(t *testing.T) {
+	if _, err := exec.LookPath("herdr"); err != nil {
+		t.Skip("herdr not installed")
+	}
+	out, err := exec.Command("herdr", "tab", "--help").CombinedOutput()
+	text := string(out)
+	if err != nil && text == "" {
+		t.Fatalf("herdr tab --help: %v", err)
+	}
+	hasCompareClose := false
+	for _, line := range strings.Split(text, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) > 0 && (fields[0] == "compare-close" || fields[0] == "compare_and_close") {
+			hasCompareClose = true
+			break
+		}
+	}
+	if !hasCompareClose {
+		// Capability not on the installed binary yet — live transport fails
+		// closed (see TestLiveTransport_NeverFallsBackToPlainTabClose).
+		t.Log("live herdr tab help has no compare-close; autonomous close stays blocked until the herdr FAC-180 binary is installed")
+		return
+	}
+	t.Log("live herdr exposes compare-close; wire client is CompareAndCloseTab / TabCloseCAS")
+}
+
 func TestLiveHerdrAgentList_NoGenerationFieldRequired(t *testing.T) {
 	if _, err := exec.LookPath("herdr"); err != nil {
 		t.Skip("herdr not installed")
