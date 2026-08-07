@@ -252,8 +252,10 @@ func rollbackToolChild(tabID, paneID string, lc ToolChildLifecycle, reason strin
 		if err := lc.Reconcile("failed-launch"); err != nil {
 			return fmt.Errorf("child reconciliation failed; authority retained: %w", err)
 		}
-	}
-	if err := compensateStartedProcessExact("", paneID); err != nil {
+		if err := compensateStartedProcessExact("", paneID); err != nil {
+			return err
+		}
+	} else if err := tabCloseRaw(tabID); err != nil {
 		return err
 	}
 	if err := verifyHerdrTerminal(tabID, paneID); err != nil {
@@ -642,8 +644,8 @@ func bindRecoveredToolChildLifecycle(lc *toolchild.Lifecycle) error {
 		return nil
 	}
 	owner := lc.Inventory.Owner
-	if owner.TabID == "" || owner.PaneID == "" || owner.Provider == "" || len(owner.Argv) == 0 || owner.ArgvDigest == "" || owner.Repository == "" {
-		return fmt.Errorf("recovery provisional identity is incomplete")
+	if owner.TabID == "" || owner.PaneID == "" || owner.Provider != router.PiHarness || len(owner.Argv) != 7 || owner.ArgvDigest == "" || owner.Repository == "" {
+		return fmt.Errorf("recovery provisional Pi identity is incomplete")
 	}
 	agents, err := AgentList()
 	if err != nil {
@@ -686,12 +688,7 @@ func bindRecoveredToolChildLifecycle(lc *toolchild.Lifecycle) error {
 		return fmt.Errorf("recovery routed owner candidates=%d", len(native))
 	}
 	p := native[0]
-	if strings.EqualFold(owner.Provider, "codex") {
-		parent, err := readPIDParent(p.PID)
-		if err != nil || len(wrappers) != 1 || parent != wrappers[0].PID {
-			return fmt.Errorf("recovery codex wrapper ancestry is not exact")
-		}
-	} else if len(wrappers) > 1 {
+	if len(wrappers) > 1 {
 		return fmt.Errorf("recovery harness wrapper ancestry is ambiguous")
 	}
 	token, err := readPIDStartToken(p.PID)
@@ -749,8 +746,11 @@ func loadToolChildLifecycle(tabID string) (ToolChildLifecycle, error) {
 }
 
 func recoverStandingLifecycle(agent AgentEntry, req launch.Request) (int64, error) {
-	if req.Decision == nil || agent.TabID == "" || agent.PaneID == "" || agent.Session.Value == "" {
+	if req.Decision == nil || req.Decision.Harness != router.PiHarness || req.Decision.HarnessSession == "" || agent.TabID == "" || agent.PaneID == "" || agent.Session.Value == "" {
 		return 0, fmt.Errorf("standing lifecycle authority is incomplete: %w", ErrAgentIdentityMismatch)
+	}
+	if err := verifyPiSessionRoute(agent.Session.Value, req.Decision.HarnessArgv); err != nil {
+		return 0, fmt.Errorf("standing Pi session route mismatch: %w: %w", err, ErrAgentIdentityMismatch)
 	}
 	lc, err := loadToolChildLifecycle(agent.TabID)
 	if err != nil {
@@ -762,7 +762,7 @@ func recoverStandingLifecycle(agent AgentEntry, req launch.Request) (int64, erro
 	}
 	owner := concrete.Inventory.Owner
 	expectedDigest := launch.DecisionDigest(req.Decision)
-	if owner.TabID != agent.TabID || owner.PaneID != agent.PaneID || agent.Kind != req.Decision.Harness || owner.Repository != req.Repository || owner.TaskRef != req.TaskRef || owner.Lane != req.Lane || owner.Provider != req.Decision.Harness || owner.Role != string(req.Decision.Role) || owner.LaunchID != expectedDigest || owner.ArgvDigest != expectedDigest || !equalArgs(owner.Argv, req.Decision.HarnessArgv) || owner.SessionID != agent.Session.Value || owner.SessionGeneration <= 0 || concrete.RecoveredPhase >= 4 {
+	if owner.TabID != agent.TabID || owner.PaneID != agent.PaneID || agent.Kind != req.Decision.Harness || owner.Repository != req.Repository || owner.TaskRef != req.TaskRef || owner.Lane != req.Lane || owner.Provider != req.Decision.Harness || owner.Role != string(req.Decision.Role) || owner.LaunchID != expectedDigest || owner.ArgvDigest != expectedDigest || !equalArgs(owner.Argv, req.Decision.HarnessArgv) || owner.SessionID != agent.Session.Value || owner.SessionID != req.Decision.HarnessSession || agent.Session.Value != req.Decision.HarnessSession || owner.SessionGeneration <= 0 || concrete.RecoveredPhase >= 4 {
 		return 0, fmt.Errorf("standing lifecycle identity mismatch or terminal authority: %w", ErrAgentIdentityMismatch)
 	}
 	if req.SessionGeneration != 0 && req.SessionGeneration != owner.SessionGeneration {
@@ -921,6 +921,31 @@ func AgentStart(name, kind string, paneID string, agentArgs ...string) error {
 	return launch.Validate(launch.Request{}, nil)
 }
 
+func validatePreparedPiStart(tabID string, lc ToolChildLifecycle, name, paneID string, req launch.Request) error {
+	if lc == nil || req.Decision == nil {
+		return fmt.Errorf("prepared Pi lifecycle and decision are required")
+	}
+	d := req.Decision
+	sessionPath := filepath.Clean(strings.TrimSpace(d.HarnessSession))
+	if d.Harness != router.PiHarness || sessionPath == "." || !filepath.IsAbs(sessionPath) {
+		return fmt.Errorf("process start requires a bound Pi harness session")
+	}
+	if len(d.HarnessArgv) != 7 || d.HarnessArgv[5] != "--session" || filepath.Clean(d.HarnessArgv[6]) != sessionPath {
+		return fmt.Errorf("process start requires exact bound Pi harness argv")
+	}
+	concrete, ok := lc.(*toolchild.Lifecycle)
+	if !ok {
+		// Non-concrete lifecycles exist only behind the explicit test seam.
+		return nil
+	}
+	owner := concrete.Inventory.Owner
+	digest := launch.DecisionDigest(d)
+	if owner.TabID != tabID || owner.PaneID != paneID || owner.Name != name || owner.SessionGeneration != req.SessionGeneration || owner.LaunchID != digest || owner.Repository != req.Repository || owner.Role != string(d.Role) || owner.Lane != req.Lane || owner.TaskRef != req.TaskRef || owner.Provider != d.Harness || owner.ArgvDigest != digest || !equalArgs(owner.Argv, d.HarnessArgv) {
+		return fmt.Errorf("prepared Pi lifecycle authority does not match launch request")
+	}
+	return nil
+}
+
 // AgentStartWithDecision is the direct Herdr adapter. Validation happens
 // before the process API is invoked, including for recovery/rescue callers.
 func AgentStartWithDecision(name, kind, paneID string, req launch.Request) error {
@@ -954,6 +979,9 @@ func AgentStartWithDecision(name, kind, paneID string, req launch.Request) error
 	}
 	if lc == nil {
 		return fmt.Errorf("prepared tool-child lifecycle is required before process start")
+	}
+	if err := validatePreparedPiStart(tabForPane(paneID), lc, name, paneID, req); err != nil {
+		return compensateValidation(err)
 	}
 	if err := agentStartProcess(name, kind, paneID, req.Decision.HarnessArgv[1:]...); err != nil {
 		if rollbackErr := rollbackToolChild(tabForPane(paneID), paneID, lc, "failed-launch"); rollbackErr != nil {
@@ -1313,15 +1341,15 @@ func routedProcessCandidates(provider string, routed []string, sessionPath strin
 			wrappers = append(wrappers, p)
 		}
 	}
-	if len(titled) > 0 {
+	if strings.EqualFold(provider, router.PiHarness) && (len(exact) > 0 || len(titled) > 0) {
 		if err := verifyPiSessionRoute(sessionPath, routed); err != nil {
 			if errors.Is(err, ErrPiSessionNotReady) {
 				return nil, wrappers, err.Error(), nil
 			}
 			return nil, nil, "", err
 		}
-		exact = append(exact, titled...)
 	}
+	exact = append(exact, titled...)
 	return exact, wrappers, "", nil
 }
 

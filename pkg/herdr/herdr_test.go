@@ -63,7 +63,8 @@ func TestAgentListDecodesExactSessionValue(t *testing.T) {
 }
 
 func TestProductionRecoveryRebindsDurableProvisionalByExactPaneProcess(t *testing.T) {
-	owner := toolchild.Identity{TabID: "tab-recover", PaneID: "pane-recover", Name: "worker", Provider: "codex", Repository: "repo-recover", TaskRef: "FAC-188", Role: "worker", Lane: "lane", SessionGeneration: 9, LaunchID: "launch", ArgvDigest: "digest", Argv: []string{"codex", "--model", "gpt-5.6-luna", "-c", "model_reasoning_effort=medium"}}
+	sessionPath := "/sessions/recover.jsonl"
+	owner := toolchild.Identity{TabID: "tab-recover", PaneID: "pane-recover", Name: "worker", Provider: router.PiHarness, Repository: "repo-recover", TaskRef: "FAC-188", Role: "worker", Lane: "lane", SessionGeneration: 9, LaunchID: "launch", ArgvDigest: "digest", Argv: []string{"pi", "--model", "openai-codex/gpt-5.6-luna", "--thinking", "medium", "--session", sessionPath}}
 	lc := toolchild.NewLifecycle(owner, &toolchild.FakeTree{}, &toolchild.MemorySink{})
 	argvReads := 0
 	defer SetPIDArgvReader(func(pid int) ([]string, error) {
@@ -73,13 +74,19 @@ func TestProductionRecoveryRebindsDurableProvisionalByExactPaneProcess(t *testin
 		argvReads++
 		return append([]string(nil), owner.Argv...), nil
 	})()
+	defer SetPiSessionRouteAttesterForTest(func(path string, argv []string) error {
+		if path != sessionPath || !equalArgs(argv, owner.Argv) {
+			t.Fatalf("attester path=%q argv=%q", path, argv)
+		}
+		return nil
+	})()
 	oldRun := runHerdr
 	defer func() { runHerdr = oldRun }()
 	runHerdr = func(args ...string) (string, error) {
 		if len(args) == 2 && args[0] == "agent" && args[1] == "list" {
-			return `{"result":{"agents":[{"name":"worker","agent":"codex","pane_id":"pane-recover","tab_id":"tab-recover","agent_session":{"value":"session-recover"}}]}}`, nil
+			return fmt.Sprintf(`{"result":{"agents":[{"name":"worker","agent":"pi","pane_id":"pane-recover","tab_id":"tab-recover","agent_session":{"value":%q}}]}}`, sessionPath), nil
 		}
-		return `{"result":{"process_info":{"foreground_processes":[{"pid":501,"name":"codex","cwd":"/repo","argv":[]},{"pid":500,"name":"node","cwd":"/repo","argv":["node","/opt/codex"]}]}}}`, nil
+		return `{"result":{"process_info":{"foreground_processes":[{"pid":501,"name":"node","cwd":"/repo","argv":[]}]}}}`, nil
 	}
 	oldToken, oldParent := readPIDStartToken, readPIDParent
 	defer func() { readPIDStartToken, readPIDParent = oldToken, oldParent }()
@@ -93,11 +100,27 @@ func TestProductionRecoveryRebindsDurableProvisionalByExactPaneProcess(t *testin
 	if err := bindRecoveredToolChildLifecycle(lc); err != nil {
 		t.Fatal(err)
 	}
-	if !lc.Bound() || lc.Inventory.Owner.PID != 501 || lc.Inventory.Owner.StartToken != "start-501" || lc.Inventory.Owner.SessionID != "session-recover" {
+	if !lc.Bound() || lc.Inventory.Owner.PID != 501 || lc.Inventory.Owner.StartToken != "start-501" || lc.Inventory.Owner.SessionID != sessionPath {
 		t.Fatalf("recovered owner was not exact: %+v", lc.Inventory.Owner)
 	}
 	if argvReads == 0 {
 		t.Fatal("expected empty pane argv to hydrate via PID argv reader")
+	}
+}
+
+func TestRecoveryRejectsNonPiProvisionalBeforeInventory(t *testing.T) {
+	owner := toolchild.Identity{TabID: "tab-native", PaneID: "pane-native", Name: "worker", Provider: "codex", Repository: "repo", TaskRef: "FAC-NATIVE", Role: "worker", Lane: "worker", SessionGeneration: 1, LaunchID: "launch", ArgvDigest: "digest", Argv: []string{"codex", "--model", "gpt-5.6-luna"}}
+	lc := toolchild.NewLifecycle(owner, &toolchild.FakeTree{}, &toolchild.MemorySink{})
+	oldRun := runHerdr
+	defer func() { runHerdr = oldRun }()
+	inventoryCalls := 0
+	runHerdr = func(args ...string) (string, error) { inventoryCalls++; return `{}`, nil }
+	err := bindRecoveredToolChildLifecycle(lc)
+	if err == nil || !strings.Contains(err.Error(), "provisional Pi identity") {
+		t.Fatalf("native recovery error = %v", err)
+	}
+	if inventoryCalls != 0 {
+		t.Fatalf("native recovery reached Herdr inventory %d times", inventoryCalls)
 	}
 }
 
@@ -688,6 +711,81 @@ func TestAgentStartBoundaryRejectsRawAndRequiresDecision(t *testing.T) {
 	}
 }
 
+func TestAgentStartRejectsUnboundPiDecisionBeforeProcess(t *testing.T) {
+	defer SetOwnerBindTimingForTest(20*time.Millisecond, time.Millisecond)()
+	d, err := testLaunchRouter(t).Decide(router.LaunchRequest{Role: router.RoleWorker, Shape: launch.Implementation, RequestedProvider: testWorkerProvider, RequestedModel: testWorkerModel, RequestedEffort: testWorkerEffort, TaskRef: "FAC-UNBOUND", LeaseGeneration: 7, Scope: router.ScopeTask, ProbeResults: map[string]bool{router.ProbeKey(testWorkerProvider, testWorkerModel): true}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner := toolchild.Identity{TabID: "tab-unbound", PaneID: "pane-unbound", Name: "worker-unbound", SessionGeneration: 1, LaunchID: launch.DecisionDigest(d), Repository: "repo", Role: launch.WorkerRole, Lane: "worker", TaskRef: d.TaskRef, Provider: d.Harness, ArgvDigest: launch.DecisionDigest(d), Argv: append([]string(nil), d.HarnessArgv...)}
+	path := filepath.Join(t.TempDir(), "receipts.jsonl")
+	lc := toolchild.NewLifecycle(owner, &toolchild.FakeTree{}, &toolchild.JSONLSink{Path: path})
+	if err := lc.Provision(); err != nil {
+		t.Fatal(err)
+	}
+	toolChildMu.Lock()
+	toolChildByTab[owner.TabID] = lc
+	toolChildByPane[owner.PaneID] = lc
+	toolChildMu.Unlock()
+	defer dropToolChild(owner.TabID, owner.PaneID)
+	oldRun := runHerdr
+	defer func() { runHerdr = oldRun }()
+	startCalls := 0
+	runHerdr = func(args ...string) (string, error) {
+		if len(args) >= 2 && args[0] == "agent" && args[1] == "start" {
+			startCalls++
+			return `{}`, nil
+		}
+		if len(args) == 3 && args[0] == "tab" && args[1] == "close" {
+			return `{}`, nil
+		}
+		if len(args) == 2 && args[0] == "tab" && args[1] == "list" {
+			return `{"result":{"tabs":[]}}`, nil
+		}
+		if len(args) == 2 && args[0] == "agent" && args[1] == "list" {
+			return `{"result":{"agents":[]}}`, nil
+		}
+		if len(args) == 4 && args[0] == "pane" {
+			return `{"error":{"code":"pane_not_found"}}`, errors.New("exit status 1")
+		}
+		return `{}`, nil
+	}
+	req := launch.Request{Decision: d, TaskRef: d.TaskRef, Repository: owner.Repository, Lane: owner.Lane, SessionGeneration: 1, LeaseGeneration: d.LeaseGeneration, Scope: d.Scope}
+	err = AgentStartWithDecision(owner.Name, d.Harness, owner.PaneID, req)
+	if err == nil || !strings.Contains(err.Error(), "bound Pi harness session") {
+		t.Fatalf("unbound start error = %v", err)
+	}
+	if startCalls != 0 {
+		t.Fatalf("unbound decision reached process seam %d times", startCalls)
+	}
+}
+
+func TestValidatePreparedPiStartRejectsSwappedBoundDecision(t *testing.T) {
+	newDecision := func(ref string, generation int64, session string) *router.LaunchDecision {
+		d, err := testLaunchRouter(t).Decide(router.LaunchRequest{Role: router.RoleWorker, Shape: launch.Implementation, RequestedProvider: testWorkerProvider, RequestedModel: testWorkerModel, RequestedEffort: testWorkerEffort, TaskRef: ref, LeaseGeneration: generation, Scope: router.ScopeTask, ProbeResults: map[string]bool{router.ProbeKey(testWorkerProvider, testWorkerModel): true}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		bound, err := router.BindHarnessSession(d, session)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return bound
+	}
+	one := newDecision("FAC-ONE", 7, filepath.Join(t.TempDir(), "one.jsonl"))
+	owner := toolchild.Identity{TabID: "tab", PaneID: "pane", Name: "worker", SessionGeneration: 7, LaunchID: launch.DecisionDigest(one), Repository: "repo", Role: launch.WorkerRole, Lane: "worker", TaskRef: one.TaskRef, Provider: one.Harness, ArgvDigest: launch.DecisionDigest(one), Argv: append([]string(nil), one.HarnessArgv...)}
+	lc := toolchild.NewLifecycle(owner, &toolchild.FakeTree{}, &toolchild.MemorySink{})
+	exact := launch.Request{Decision: one, TaskRef: one.TaskRef, Repository: owner.Repository, Lane: owner.Lane, SessionGeneration: 7, LeaseGeneration: one.LeaseGeneration, Scope: one.Scope}
+	if err := validatePreparedPiStart(owner.TabID, lc, owner.Name, owner.PaneID, exact); err != nil {
+		t.Fatalf("exact prepared authority rejected: %v", err)
+	}
+	two := newDecision("FAC-TWO", 8, filepath.Join(t.TempDir(), "two.jsonl"))
+	swapped := launch.Request{Decision: two, TaskRef: two.TaskRef, Repository: owner.Repository, Lane: owner.Lane, SessionGeneration: 8, LeaseGeneration: two.LeaseGeneration, Scope: two.Scope}
+	if err := validatePreparedPiStart(owner.TabID, lc, owner.Name, owner.PaneID, swapped); err == nil || !strings.Contains(err.Error(), "does not match") {
+		t.Fatalf("swapped authority error = %v", err)
+	}
+}
+
 func TestPreparedStartUsesPaneProcessInfoAndExactRoutedOwner(t *testing.T) {
 	t.Setenv("HERD_LAUNCH_RECEIPTS", t.TempDir()+"/launch.jsonl")
 	oldRun := runHerdr
@@ -698,6 +796,14 @@ func TestPreparedStartUsesPaneProcessInfoAndExactRoutedOwner(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	attestCalls := 0
+	defer SetPiSessionRouteAttesterForTest(func(path string, argv []string) error {
+		attestCalls++
+		if path != d.HarnessSession || !equalArgs(argv, d.HarnessArgv) {
+			t.Fatalf("attester path=%q argv=%q", path, argv)
+		}
+		return nil
+	})()
 	argvReads := 0
 	defer SetPIDArgvReader(func(pid int) ([]string, error) {
 		if pid != 501 {
@@ -728,7 +834,7 @@ func TestPreparedStartUsesPaneProcessInfoAndExactRoutedOwner(t *testing.T) {
 			if listCalls < 3 {
 				return `{"result":{"agents":[]}}`, nil
 			}
-			return `{"result":{"agents":[{"name":"worker","agent":"pi","agent_status":"working","pane_id":"pane-1","tab_id":"tab-1","agent_session":{"value":"session-1"}}]}}`, nil
+			return fmt.Sprintf(`{"result":{"agents":[{"name":"worker","agent":"pi","agent_status":"working","pane_id":"pane-1","tab_id":"tab-1","agent_session":{"value":%q}}]}}`, d.HarnessSession), nil
 		}
 		if len(args) == 4 && args[0] == "pane" && args[1] == "process-info" {
 			calledInfo = true
@@ -761,6 +867,9 @@ func TestPreparedStartUsesPaneProcessInfoAndExactRoutedOwner(t *testing.T) {
 	}
 	if argvReads == 0 {
 		t.Fatal("expected empty pane argv to hydrate via PID argv reader")
+	}
+	if attestCalls == 0 {
+		t.Fatal("native Pi owner skipped session attestation")
 	}
 	if err := ReconcileToolChild("tab-1", "done"); err != nil {
 		t.Fatalf("reconcile: %v", err)
@@ -935,7 +1044,7 @@ func TestRollbackCrashMatrixRetainsAuthorityUntilTerminalTombstone(t *testing.T)
 			toolChildByTab["tab-crash"] = lc
 			toolChildMu.Unlock()
 			defer dropToolChild("tab-crash", "pane-crash")
-			listCalls := 0
+			closeDone := false
 			runHerdr = func(args ...string) (string, error) {
 				if len(args) == 2 && args[0] == "tab" && args[1] == "list" {
 					return `{"result":{"tabs":[]}}`, nil
@@ -944,8 +1053,7 @@ func TestRollbackCrashMatrixRetainsAuthorityUntilTerminalTombstone(t *testing.T)
 					return `{"result":{"process_info":{"foreground_processes":[]}}}`, nil
 				}
 				if len(args) == 2 && args[0] == "agent" && args[1] == "list" {
-					listCalls++
-					if tc.keepLive || listCalls == 1 {
+					if tc.keepLive || !closeDone {
 						return `{"result":{"agents":[{"name":"worker","pane_id":"pane-crash","tab_id":"tab-crash"}]}}`, nil
 					}
 					return `{"result":{"agents":[]}}`, nil
@@ -954,6 +1062,7 @@ func TestRollbackCrashMatrixRetainsAuthorityUntilTerminalTombstone(t *testing.T)
 					if tc.closeErr != nil {
 						return "", tc.closeErr
 					}
+					closeDone = true
 					return `{}`, nil
 				}
 				return `{}`, nil
@@ -1002,6 +1111,12 @@ func TestProductionStartCrashMatrixRetainsAuthorityUntilReadback(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			defer SetPiSessionRouteAttesterForTest(func(path string, argv []string) error {
+				if path != d.HarnessSession || !equalArgs(argv, d.HarnessArgv) {
+					return fmt.Errorf("%w: test route mismatch", ErrPiSessionRouteMismatch)
+				}
+				return nil
+			})()
 			var events []string
 			lc := &rollbackLifecycle{events: &events}
 			if tc.beginErr {
@@ -1037,7 +1152,7 @@ func TestProductionStartCrashMatrixRetainsAuthorityUntilReadback(t *testing.T) {
 				if len(args) == 2 && args[0] == "agent" && args[1] == "list" {
 					listCalls++
 					if tc.keepLive || listCalls == 1 {
-						return `{"result":{"agents":[{"name":"worker","agent":"pi","pane_id":"pane-crash-prod","tab_id":"tab-crash-prod","agent_session":{"value":"session"}}]}}`, nil
+						return fmt.Sprintf(`{"result":{"agents":[{"name":"worker","agent":"pi","pane_id":"pane-crash-prod","tab_id":"tab-crash-prod","agent_session":{"value":%q}}]}}`, d.HarnessSession), nil
 					}
 					return `{"result":{"agents":[]}}`, nil
 				}
@@ -1327,9 +1442,21 @@ func standingResumeFixture(t *testing.T, durable bool) (launch.Request, *toolchi
 	if err != nil {
 		t.Fatal(err)
 	}
+	bound, err := router.BindHarnessSession(d, filepath.Join(t.TempDir(), "standing.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	d = bound
+	restoreAttester := SetPiSessionRouteAttesterForTest(func(path string, argv []string) error {
+		if path != d.HarnessSession || !equalArgs(argv, d.HarnessArgv) {
+			return fmt.Errorf("%w: standing route mismatch", ErrPiSessionRouteMismatch)
+		}
+		return nil
+	})
+	t.Cleanup(restoreAttester)
 	req := launch.Request{Decision: d, TaskRef: "FAC-188", Name: "forge-worker", PaneID: "pane-standing", LeaseGeneration: 7, Scope: router.ScopeTask, Repository: "repo-standing", Lane: "worker"}
 	digest := launch.DecisionDigest(d)
-	owner := toolchild.Identity{PID: 900, StartToken: "owner-start", SessionGeneration: 42, LaunchID: digest, Repository: req.Repository, Role: string(d.Role), Lane: req.Lane, SessionID: "herdr-session", PaneID: req.PaneID, TabID: "tab-standing", Provider: d.Harness, ArgvDigest: digest, Argv: append([]string(nil), d.HarnessArgv...), TaskRef: req.TaskRef, Name: req.Name}
+	owner := toolchild.Identity{PID: 900, StartToken: "owner-start", SessionGeneration: 42, LaunchID: digest, Repository: req.Repository, Role: string(d.Role), Lane: req.Lane, SessionID: d.HarnessSession, PaneID: req.PaneID, TabID: "tab-standing", Provider: d.Harness, ArgvDigest: digest, Argv: append([]string(nil), d.HarnessArgv...), TaskRef: req.TaskRef, Name: req.Name}
 	lc := toolchild.NewLifecycle(owner, &toolchild.FakeTree{}, &toolchild.MemorySink{})
 	path := t.TempDir() + "/toolchild.jsonl"
 	if durable {
@@ -1354,6 +1481,15 @@ func standingResumeFixture(t *testing.T, durable bool) (launch.Request, *toolchi
 	agent.Session.Value = owner.SessionID
 	req.SessionGeneration = 0
 	return req, lc, agent, path
+}
+
+func TestStandingResumeRequiresExactSessionAttestation(t *testing.T) {
+	req, _, agent, _ := standingResumeFixture(t, false)
+	restore := SetPiSessionRouteAttesterForTest(func(string, []string) error { return fmt.Errorf("%w: injected mismatch", ErrPiSessionRouteMismatch) })
+	defer restore()
+	if _, err := recoverStandingLifecycle(agent, req); !errors.Is(err, ErrAgentIdentityMismatch) || !errors.Is(err, ErrPiSessionRouteMismatch) {
+		t.Fatalf("standing session mismatch error = %v", err)
+	}
 }
 
 func TestStandingResumeRecoversGenerationFromTaskLaunchRequestShape(t *testing.T) {
@@ -1606,6 +1742,37 @@ func TestBindToolChildLifecycleTimeoutReportsArgvReadError(t *testing.T) {
 			t.Fatalf("argv read timeout error %v missing %q", err, want)
 		}
 	}
+}
+
+func TestRoutedProcessCandidatesRequiresPiSessionAttestationForNativePi(t *testing.T) {
+	routed := []string{"pi", "--model", "openai-codex/gpt-5.6-luna", "--thinking", "medium", "--session", "/sessions/signed.jsonl"}
+	processes := []PaneProcess{{PID: 42, Name: "node", Argv: append([]string(nil), routed...)}}
+	t.Run("matching signed session", func(t *testing.T) {
+		called := 0
+		defer SetPiSessionRouteAttesterForTest(func(path string, argv []string) error {
+			called++
+			if path != routed[6] || !equalArgs(argv, routed) {
+				t.Fatalf("attester path=%q argv=%q", path, argv)
+			}
+			return nil
+		})()
+		matches, wrappers, wait, err := routedProcessCandidates(router.PiHarness, routed, routed[6], processes)
+		if err != nil || wait != "" || called != 1 || len(matches) != 1 || matches[0].PID != 42 || len(wrappers) != 0 {
+			t.Fatalf("matches=%v wrappers=%v wait=%q err=%v called=%d", matches, wrappers, wait, err, called)
+		}
+	})
+	t.Run("reported session differs from signed argv", func(t *testing.T) {
+		defer SetPiSessionRouteAttesterForTest(func(path string, argv []string) error {
+			if path != routed[6] {
+				return fmt.Errorf("%w: bound session path mismatch", ErrPiSessionRouteMismatch)
+			}
+			return nil
+		})()
+		matches, _, wait, err := routedProcessCandidates(router.PiHarness, routed, "/sessions/other.jsonl", processes)
+		if !errors.Is(err, ErrPiSessionRouteMismatch) || len(matches) != 0 || wait != "" {
+			t.Fatalf("matches=%v wait=%q err=%v", matches, wait, err)
+		}
+	})
 }
 
 func TestRoutedProcessCandidatesRequiresPiSessionAttestationForTitledNode(t *testing.T) {
