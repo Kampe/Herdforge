@@ -31,9 +31,18 @@ test-hermetic-compile:
 		rm -rf "$$tmpdir" && \
 		echo "==> Hermetic profile compiles"
 
+# Execute the quarantined FAC-151 ownership suite inside the pinned hermetic
+# Docker container (linux/$(GOARCH)). Requires Docker and a clean tracked tree.
+# Wired into CI as a separate job so the unit gate stays Docker-free.
+test-hermetic-fac151: build test-hermetic-compile
+	@echo "==> Running FAC-151 hermetic Docker profile (herd verify-fac151)..."
+	./bin/herd verify-fac151
+
 test-unit: test-contracts test-hermetic-compile
 	@echo "==> Running full unit test suite..."
-	go test -count=1 -timeout=180s ./...
+	# 300s: cmd/herd integration builds the binary multiple times; 180s is
+	# flaky/red on both main and this branch (pre-existing, not FAC-198).
+	go test -count=1 -timeout=300s ./...
 
 # contracts/agentscope is a nested, independently consumable Go module. The
 # root module's `go test ./...` skips nested modules, so this target makes the

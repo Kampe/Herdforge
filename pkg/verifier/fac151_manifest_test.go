@@ -42,7 +42,7 @@ var fac151NativeManifest = map[string]string{
 	"pkg/verifier/lifecycle_test.go::startLateWriterFixture":                                                "6f31a702019079dc941a93080daba0c2bdc566d82c02bdd8ea0779ce64d9e178",
 	"pkg/verifier/lifecycle_test.go::cleanupTempDir":                                                        "eba7587b441952f981bae605251010522a5e6cb27720b697c624bf3e1d5052ed",
 	"pkg/verifier/lifecycle_test.go::isLiveWriterRemoveAllError":                                            "8d25497cafeb1081d44fc48628ef55073ad1245375f5e02e625417770d0d638f",
-	"pkg/verifier/lifecycle_test.go::ownershipBlocksDurableCleanup":                                         "82475aabbfc08a7ee83381c21358d336179bc9988d5b839aadbea187501cc43c",
+	"pkg/verifier/lifecycle_test.go::ownershipBlocksDurableCleanup":                                         "b7e2a78a7477e6041a1ce4113581d677c94029697d9ecfb456a8c6c5116209af",
 	"pkg/verifier/lifecycle_test.go::durableCleanupAfterReap":                                               "07eac81d2ae74060da8341cdbc55dc7f5a3bf80371e98be910d9b1eced7b340e",
 	"pkg/verifier/lifecycle_test.go::*lateWriterFixture.readGen":                                            "5f094d6a675014f6a4eb75b8b62a5d85f3935aea1f72264974915aaff405005b",
 	"pkg/verifier/lifecycle_test.go::*lateWriterFixture.waitGenAdvance":                                     "976651cb39caef80273ec6fce99b2648992e342ab78a0253ee20ae1a1013e62b",

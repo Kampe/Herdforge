@@ -1367,7 +1367,13 @@ func ownershipBlocksDurableCleanup(root string, pgid int) error {
 	}
 	err := cleanupTempDir(root)
 	if err != nil {
-		return err
+		// Only the concurrent-writer unlinkat/not-empty class proves active
+		// ownership blocked RemoveAll. Any other error is not ownership proof
+		// (isLiveWriterRemoveAllError is the attribution helper).
+		if isLiveWriterRemoveAllError(err) {
+			return err
+		}
+		return nil
 	}
 	// RemoveAll returned nil — require non-durable recreation under live writer.
 	objects := filepath.Join(root, ".git", "objects")
