@@ -5,7 +5,6 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"strings"
 	"testing"
 	"time"
@@ -341,7 +340,3 @@ type fakeBoundary struct{}
 func (fakeBoundary) Mechanism() string       { return "test-fake" }
 func (fakeBoundary) ProbeDigest() string     { return "fake" }
 func (fakeBoundary) AdversarialProbe() error { return nil }
-
-func TestMain(m *testing.M) {
-	os.Exit(m.Run())
-}
