@@ -334,6 +334,39 @@ func (s *EventStore) AllTaskStates() ([]TaskState, error) {
 	return states, rows.Err()
 }
 
+// EventsSince returns up to limit events whose ID is greater than after,
+// oldest first. ID is a usable tail cursor: SQLite permits only ONE write
+// transaction at a time across every connection and process on this file
+// (see the concurrency contract in openSQLite), so an event that commits
+// later always carries a higher AUTOINCREMENT id than one that committed
+// before it. A reader can therefore resume from the last id it applied
+// without risking a row appearing "behind" its cursor.
+func (s *EventStore) EventsSince(after int64, limit int) ([]Event, error) {
+	if limit <= 0 {
+		return nil, fmt.Errorf("events since: positive limit is required")
+	}
+	rows, err := s.db.Query(
+		`SELECT id, task_ref, repo, seq, from_state, to_state, provider_revision,
+			lease_generation, branch, candidate_sha, actor, evidence_digest,
+			payload, idempotency_key, created_at
+		 FROM lifecycle_events WHERE id > ? ORDER BY id ASC LIMIT ?`, after, limit,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("events since: %w", err)
+	}
+	defer rows.Close()
+
+	var events []Event
+	for rows.Next() {
+		ev, err := scanEvent(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan event: %w", err)
+		}
+		events = append(events, *ev)
+	}
+	return events, rows.Err()
+}
+
 // EventByIdempotencyKey returns the event previously recorded under key,
 // or nil (with no error) if it has never been seen. Plain, non-tx read
 // for external inspection; AppendTx uses its own tx-scoped variant.
