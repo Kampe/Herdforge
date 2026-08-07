@@ -67,7 +67,7 @@ func (f *tickFakeHerdr) RequireWorkspace(string) (string, error) {
 	}
 	return f.workspace, nil
 }
-func (f *tickFakeHerdr) TabCreateForTask(workspaceID, label, cwd string, _ bool) (*herdr.TabInfo, error) {
+func (f *tickFakeHerdr) TabCreateForTask(workspaceID, label, cwd string, _ bool, _ ...string) (*herdr.TabInfo, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.tabLabel = label
@@ -231,8 +231,10 @@ func baseTickOpts(t *testing.T, h *tickFakeHerdr, wt *tickFakeWorktree) TickOpti
 
 // --- production-shaped fixture: claim-only is forbidden --------------------
 
-// TestDaemonTick_ClaimWithoutLaunchIsForbidden reproduces the pre-FAC-196
-// production shape (RunPulse then stop) and proves it cannot pass as a tick.
+// TestDaemonTick_ClaimWithoutLaunchIsForbidden proves RunDaemonTick rejects a
+// claim that cannot be followed by a verified worker launch, and leaves no
+// orphan In Progress card. A mutant that returns success after RunPulse alone
+// (the pre-FAC-196 daemon shape) turns this test red.
 func TestDaemonTick_ClaimWithoutLaunchIsForbidden(t *testing.T) {
 	mp := provider.NewMemoryProvider()
 	mp.AddTask(&provider.Task{
@@ -241,35 +243,38 @@ func TestDaemonTick_ClaimWithoutLaunchIsForbidden(t *testing.T) {
 		Description: fence("FAC-196", "t-1"),
 	})
 	eng, _ := tickEngine(t, mp, "p1")
+	root := t.TempDir()
+	// Herdr available for prep, but agent start fails after the fenced claim —
+	// the exact orphan shape: board would be In Progress with zero worker
+	// unless compensation runs.
+	h := &tickFakeHerdr{available: true, startErr: errors.New("agent start refused")}
+	wt := &tickFakeWorktree{root: root, path: filepath.Join(root, ".herd", "worktrees", "fac-196")}
+	opts := baseTickOpts(t, h, wt)
 
-	// Current broken shape: claim then print "Claimed" with zero launch.
-	task, err := eng.RunPulse(context.Background(), "worker")
-	if err != nil {
-		t.Fatalf("RunPulse: %v", err)
+	rec, err := eng.RunDaemonTick(context.Background(), "worker", opts)
+	if err == nil {
+		t.Fatal("RunDaemonTick must fail when launch cannot complete after claim")
 	}
-	if task == nil {
-		t.Fatal("expected claimed task")
+	if !errors.Is(err, ErrClaimWithoutLaunch) {
+		t.Fatalf("want ErrClaimWithoutLaunch, got %v", err)
 	}
-	got, _ := mp.GetTask(context.Background(), "t-1")
-	if got.Status != provider.StatusInProgress {
-		t.Fatalf("status=%s want in-progress (orphan setup)", got.Status)
+	if rec != nil && rec.Launched {
+		t.Fatalf("must not return a launched receipt on claim-without-launch: %+v", rec)
 	}
-	// A claim-only outcome must not be treated as a successful daemon tick.
-	if eng.LastClaimToken() == nil {
-		t.Fatal("expected retained ownership token after claim")
+	// Board must not remain In Progress with no worker.
+	got, gerr := mp.GetTask(context.Background(), "t-1")
+	if gerr != nil {
+		t.Fatalf("GetTask: %v", gerr)
 	}
-	// Explicit invariant: without launch proof, this is ErrClaimWithoutLaunch territory.
-	// RunDaemonTick refuses to return a successful receipt without launch — the
-	// production-shaped missing-Herdr path fails at prep before claim when
-	// correctly composed. A bare RunPulse success is not a TickReceipt.
-	var bare *TickReceipt
-	if bare != nil && bare.Launched {
-		t.Fatal("vacuous: bare claim must not imply Launched")
+	if got.Status != provider.StatusToDo {
+		t.Fatalf("orphan In Progress after failed launch: status=%s (compensation required)", got.Status)
 	}
-	if task != nil && bare == nil {
-		// Document the orphan: board In Progress, zero worker. The repair is RunDaemonTick.
-		t.Log("reproduced orphan: In Progress with no TickReceipt.Launched")
+	// Claim path was exercised (not a prep-only rejection before board claim).
+	if h.startCalls != 1 {
+		t.Fatalf("expected one AgentStart attempt after claim, got %d (prep-only failure would be 0)", h.startCalls)
 	}
+	// Mutation guard: a success path that only RunPulses would leave
+	// In Progress and return nil error — both are rejected above.
 }
 
 // --- success path ----------------------------------------------------------
