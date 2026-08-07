@@ -35,6 +35,7 @@ const (
 	hermeticRunPath               = "/tmp/run"
 	hermeticReplayPath            = "/tmp/replay"
 	hermeticReceiptPath           = "/tmp/replay/receipt.json"
+	hermeticGoTmpDir              = "/tmp/build/gotmp" // GOTMPDIR/TMPDIR under tmpfs (rootfs /tmp is RO)
 	hermeticTestCount             = "1"
 	hermeticTestTimeout           = "10m"
 	maxHermeticSourceArchiveBytes = 64 << 20
@@ -43,6 +44,21 @@ const (
 	maxHermeticMountInfoBytes     = 64 << 10
 	hermeticSourceTransportRoot   = "source"
 )
+
+// hermeticGoEnv is the fixed env prefix for every go/tool invocation inside the
+// hermetic container. Paths are under /tmp/build tmpfs so a read-only rootfs
+// cannot trap Go's default /tmp workdir.
+func hermeticGoEnv() []string {
+	return []string{
+		"/usr/bin/env",
+		"GOTOOLCHAIN=local",
+		"GOMODCACHE=/tmp/build/gomodcache",
+		"GOCACHE=/tmp/build/gocache",
+		"GOTMPDIR=" + hermeticGoTmpDir,
+		"TMPDIR=" + hermeticGoTmpDir,
+		"HOME=" + hermeticGoTmpDir,
+	}
+}
 
 var hermeticDockerTmpfs = [...]string{
 	hermeticBuildPath + ":rw,noexec,nosuid,nodev,size=512m",
@@ -300,7 +316,7 @@ func (r *hermeticDockerRunner) Run(ctx context.Context) (result FAC151DockerResu
 	if _, err := r.docker.Exec(operationCtx, containerID, []string{"/bin/chmod", "a-w", hermeticSourcePath}, nil); err != nil {
 		return result, fmt.Errorf("seal immutable source snapshot: %w", err)
 	}
-	if _, err := r.docker.Exec(operationCtx, containerID, []string{"/bin/mkdir", "-p", "/tmp/build/gomodcache/download/golang.org/x/sys/@v", "/tmp/build/gocache"}, nil); err != nil {
+	if _, err := r.docker.Exec(operationCtx, containerID, []string{"/bin/mkdir", "-p", "/tmp/build/gomodcache/download/golang.org/x/sys/@v", "/tmp/build/gocache", hermeticGoTmpDir}, nil); err != nil {
 		return result, fmt.Errorf("prepare fixed container paths: %w", err)
 	}
 	if err := r.docker.Copy(operationCtx, containerID, "/tmp/build/gomodcache/download/golang.org/x/sys/@v", cacheTar); err != nil {
@@ -732,7 +748,10 @@ func (r *hermeticDockerRunner) compile(ctx context.Context, id string, publicKey
 		"-X", "github.com/Kampe/Herdforge/pkg/verifier.compiledFAC151Repository=github.com/Kampe/Herdforge",
 		"-X", "github.com/Kampe/Herdforge/pkg/verifier.compiledFAC151Task=FAC-198/FAC-151",
 	}
-	args := []string{"/usr/bin/env", "GOTOOLCHAIN=local", "GOMODCACHE=/tmp/build/gomodcache", "GOCACHE=/tmp/build/gocache", "/usr/local/go/bin/go", "-C", hermeticSourcePath, "test", "-c", "-tags", "fac151_hermetic_integration", "-trimpath", "-count=" + hermeticTestCount, "-timeout", hermeticTestTimeout, "-ldflags", strings.Join(ldflags, " "), "-o", hermeticRunPath + "/verifier.test", "./pkg/verifier"}
+	// GOTMPDIR/TMPDIR must live under a writable tmpfs: the container rootfs
+	// (including bare /tmp) is read-only, and go test -c otherwise fails with
+	// "mkdir /tmp/go-build…: read-only file system".
+	args := append(hermeticGoEnv(), "/usr/local/go/bin/go", "-C", hermeticSourcePath, "test", "-c", "-tags", "fac151_hermetic_integration", "-trimpath", "-count="+hermeticTestCount, "-timeout", hermeticTestTimeout, "-ldflags", strings.Join(ldflags, " "), "-o", hermeticRunPath+"/verifier.test", "./pkg/verifier")
 	if _, err := r.docker.Exec(ctx, id, args, nil); err != nil {
 		return fmt.Errorf("compile fixed FAC-151 verifier test binary: %w", err)
 	}
