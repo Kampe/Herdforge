@@ -40,6 +40,12 @@ opencode.json
 **/.herd/launch-receipts.jsonl
 .herd/confine-sessions/
 **/.herd/confine-sessions/
+.herd/security-events.jsonl
+**/.herd/security-events.jsonl
+# FAC-133 runtime containment artifacts (OS seatbelt needs abs paths ephemerally)
+**/.herd/contain/
+.herd/sessions/
+**/.herd/sessions/
 
 # compiled binaries must not be tracked
 /herd

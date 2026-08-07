@@ -1,6 +1,7 @@
 package dispatch
 
 import (
+	"github.com/Kampe/Herdforge/pkg/security"
 	"context"
 	"sync"
 	"testing"
@@ -16,6 +17,7 @@ func TestDispatchHealth_Race(t *testing.T) {
 		Deadlines: config.OpDeadlines{List: "25ms"},
 	}}
 	d := NewDispatcher(cfg, board, nil)
+	d.ClaimLookup = security.AllowGen1Lookup{}
 	d.Compensator = noopComp{}
 	var wg sync.WaitGroup
 	for i := 0; i < 8; i++ {

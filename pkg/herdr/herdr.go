@@ -544,6 +544,14 @@ func paneProcessInventorySummary(processes []PaneProcess) string {
 	return "[" + strings.Join(parts, "; ") + "]"
 }
 
+// AgentReadyForToolChildBind is the b81bf2e inventory gate for owner bind.
+// Session is provenance only: grok starts healthy/interactive without
+// agent_session.value. Identity is name+pane (matched by the caller) plus a
+// non-empty TabID. Waiting on session here pins the fleet to claude.
+func AgentReadyForToolChildBind(a AgentEntry) bool {
+	return strings.TrimSpace(a.TabID) != ""
+}
+
 func bindToolChildLifecycle(paneID, name string, req launch.Request) error {
 	lc := lifecycleForPane(paneID)
 	if lc == nil {
@@ -582,8 +590,10 @@ func bindToolChildLifecycle(paneID, name string, req launch.Request) error {
 			if a.Kind != req.Decision.Harness {
 				return fmt.Errorf("tool-child owner harness mismatch: got %s want %s", a.Kind, req.Decision.Harness)
 			}
-			if a.Session.Value == "" || a.TabID == "" {
-				lastWaitReason = fmt.Sprintf("agent incomplete kind=%q status=%q session_present=%t tab_present=%t", a.Kind, a.Status, a.Session.Value != "", a.TabID != "")
+			// Session id is provenance, not identity (b81bf2e): grok starts
+			// healthy without agent_session.value. Require tab only.
+			if !AgentReadyForToolChildBind(a) {
+				lastWaitReason = fmt.Sprintf("agent incomplete kind=%q status=%q tab_present=%t session_present=%t", a.Kind, a.Status, a.TabID != "", a.Session.Value != "")
 			} else {
 				if a.TabID != tabForPane(paneID) {
 					return fmt.Errorf("prepared tab identity drift: got %s", a.TabID)
@@ -1320,6 +1330,7 @@ type AgentEntry struct {
 	TabID          string       `json:"tab_id,omitempty"`
 	Workspace      string       `json:"workspace_id,omitempty"`
 	Cwd            string       `json:"cwd,omitempty"`
+	TerminalTitle  string       `json:"terminal_title,omitempty"` // UI title (login/auth detection)
 	Session        AgentSession `json:"agent_session,omitempty"`
 	Revision       uint64       `json:"revision,omitempty"`
 	StateChangeSeq uint64       `json:"state_change_seq,omitempty"`
@@ -1636,4 +1647,73 @@ func runHerdrReal(args ...string) (string, error) {
 		return msg, fmt.Errorf("%w: %s", err, msg)
 	}
 	return stdout.String(), nil
+}
+
+// TabCreateForTaskEnv is the FAC-133 process-boundary tab create: requires
+// workspace + cwd and injects only the provided KEY=VALUE env pairs (never
+// the parent ambient environment).
+func TabCreateForTaskEnv(workspaceID, label, cwd string, env []string, noFocus bool) (*TabInfo, error) {
+	if strings.TrimSpace(cwd) == "" {
+		return nil, fmt.Errorf("herdr tab create: cwd is required for task agents")
+	}
+	return TabCreate(TabCreateOptions{
+		Workspace: workspaceID,
+		Label:     label,
+		Cwd:       cwd,
+		Env:       env,
+		NoFocus:   noFocus,
+	})
+}
+
+// LookupAgent returns the live Herdr agent entry for name.
+// Returns ErrAgentNotFound when absent (distinct from list/parse errors).
+func LookupAgent(name string) (*AgentEntry, error) {
+	agents, err := AgentList()
+	if err != nil {
+		return nil, err
+	}
+	for i := range agents {
+		if agents[i].Name == name {
+			return &agents[i], nil
+		}
+	}
+	return nil, fmt.Errorf("%w: %s", ErrAgentNotFound, name)
+}
+
+// LoginOrAuthScreen reports whether title/body indicates the harness is stuck
+// on browser login / device auth and is NOT a model/tool session.
+func LoginOrAuthScreen(title, body string) bool {
+	s := strings.ToLower(title + "\n" + body)
+	needles := []string{
+		"browser-login", "browser login", "log in", "sign in", "sign-in",
+		"login to continue", "authenticate", "authorization", "device code",
+		"visit https://", "open the following url", "auth0", "oauth",
+		"chatgpt.com", "platform.openai.com", "please log in", "login required",
+		"not logged in", "api key", "enter your api key", "press enter to open",
+	}
+	for _, n := range needles {
+		if strings.Contains(s, n) {
+			return true
+		}
+	}
+	return false
+}
+
+// RealModelSessionID is true only for a non-provisional, non-terminal-fallback
+// agent_session value emitted by herdr for a real model session.
+func RealModelSessionID(sid string) bool {
+	sid = strings.TrimSpace(sid)
+	if sid == "" {
+		return false
+	}
+	if strings.HasPrefix(sid, "pending-") ||
+		strings.HasPrefix(sid, "ses_probe_") ||
+		strings.HasPrefix(sid, "ses_real_") ||
+		strings.HasPrefix(sid, "ses_spawn_") ||
+		strings.HasPrefix(sid, "test-session-") ||
+		strings.HasPrefix(sid, "herdr-term:") ||
+		strings.HasPrefix(sid, "herdr-pane:") {
+		return false
+	}
+	return true
 }
