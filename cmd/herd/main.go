@@ -101,6 +101,9 @@ func main() {
 	case "verify":
 		runVerify()
 
+	case "verify-fac151":
+		runFAC151Hermetic()
+
 	case "selftest":
 		runSelfTest()
 
@@ -383,6 +386,8 @@ func printUsage() {
 	fmt.Println("  worktrees       Snapshot all worktree state + collision check")
 	fmt.Println("  containers      Durable container lifecycle status + unowned audit (FAC-200)")
 	fmt.Println("  commands        Retained command session status + recovery sweep (FAC-193)")
+	fmt.Println("  verify          Gate: real commits + build + tests (FAC-98/FAC-116)")
+	fmt.Println("  verify-fac151   Run only the fixed hermetic FAC-151 verifier profile")
 	fmt.Println("  overlap         Detect files/symbols edited together by 2+ unmerged branches")
 	fmt.Println("  attention       List agents needing coordinator eyes")
 	fmt.Println("  process         Classify harvest targets (herd-process digest)")

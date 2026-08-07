@@ -2,44 +2,16 @@ package verifier
 
 import (
 	"context"
-	"os/exec"
 	"strings"
 	"testing"
 )
 
-func vgit(t *testing.T, dir string, args ...string) {
-	t.Helper()
-	cmd := exec.Command("git", args...)
-	cmd.Dir = dir
-	if out, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("git %v: %v\n%s", args, err, out)
-	}
-}
-
 // completionRepo builds a repo with origin/main plus a worktree branch whose
 // commits are controllable per test.
 func completionRepo(t *testing.T, subjects ...string) string {
-	dir := t.TempDir()
-	vgit(t, dir, "init", "-q", "-b", "main")
-	vgit(t, dir, "config", "user.email", "t@h.local")
-	vgit(t, dir, "config", "user.name", "t")
-	vgit(t, dir, "config", "commit.gpgsign", "false")
-	vgit(t, dir, "commit", "--allow-empty", "-q", "-m", "base")
-	vgit(t, dir, "update-ref", "refs/remotes/origin/main", mustHead(t, dir))
-	for _, s := range subjects {
-		vgit(t, dir, "commit", "--allow-empty", "-q", "-m", s)
-	}
+	key := "completion\x00" + strings.Join(subjects, "\x00")
+	dir, _ := copyCachedRepo(t, key, buildCompletionFixture(subjects))
 	return dir
-}
-
-func mustHead(t *testing.T, dir string) string {
-	cmd := exec.Command("git", "rev-parse", "HEAD")
-	cmd.Dir = dir
-	out, err := cmd.Output()
-	if err != nil {
-		t.Fatal(err)
-	}
-	return strings.TrimSpace(string(out))
 }
 
 func TestCheckCompletion_RealWorkPasses(t *testing.T) {

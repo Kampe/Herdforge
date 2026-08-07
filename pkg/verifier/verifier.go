@@ -1,6 +1,7 @@
 package verifier
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -12,10 +13,10 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
-	"github.com/Kampe/Herdforge/pkg/procsignal"
 	"github.com/Kampe/Herdforge/pkg/resources"
 )
 
@@ -189,40 +190,167 @@ func (v *Verifier) execute(ctx context.Context, dir string, policy EnvironmentPo
 			}, nil
 		}
 	}
-	cmd := exec.CommandContext(ctx, commandPath, v.Argv[1:]...)
-	cmd.Dir = dir
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	var env []string
+	if policy == EnvironmentPolicyHermetic {
+		env = commandEnv
+	}
+	// Two-phase ownership supervisor: start/done handshake + residual drain
+	// while the supervisor still owns the process group, then ack to exit.
+	// Marker FD (ExtraFiles FD5) is the unforgeable lineage for escaped writers.
+	cmd, statusR, statusW, ackR, ackW, marker, markerPath, prepErr := prepareOwnedCommand(ctx, commandPath, v.Argv[1:], dir, env)
+	if prepErr != nil {
+		output := []byte(prepErr.Error())
+		return &Result{
+			Outcome:      OutcomeBLOCKED,
+			Output:       boundedOutput(output),
+			OutputDigest: digestBytes(output),
+			ExitCode:     -1,
+			Duration:     time.Since(started),
+		}, nil
+	}
 	cmd.Cancel = func() error {
 		if cmd.Process == nil {
 			return nil
 		}
-		// FAC-174: opaque owned-group cancel from the live *os.Process only.
-		return procsignal.CancelSpawnedProcess(cmd.Process)
+		return killProcessGroupIfLive(cmd.Process.Pid)
 	}
-	if policy == EnvironmentPolicyHermetic {
-		cmd.Env = commandEnv
-	}
-	// A canceled shell can leave grandchildren holding CombinedOutput's pipe
-	// open (for example, `sh -c 'sleep 3'`). WaitDelay bounds that wait and
-	// keeps the mutation transaction's restoration defer reachable.
 	cmd.WaitDelay = 100 * time.Millisecond
-	output, err := cmd.CombinedOutput()
+
+	var combined concurrentCombinedWriter
+	cmd.Stdout = &combined
+	cmd.Stderr = &combined
+	if err := cmd.Start(); err != nil {
+		_ = statusR.Close()
+		_ = statusW.Close()
+		_ = ackR.Close()
+		_ = ackW.Close()
+		if marker != nil {
+			_ = marker.Close()
+			_ = os.Remove(markerPath)
+		}
+		output := []byte(err.Error())
+		return &Result{
+			Outcome:      OutcomeBLOCKED,
+			Output:       boundedOutput(output),
+			OutputDigest: digestBytes(output),
+			ExitCode:     -1,
+			Duration:     time.Since(started),
+		}, nil
+	}
+	// Parent keeps statusR + ackW + marker; close child-only ends in parent.
+	_ = statusW.Close()
+	_ = ackR.Close()
+
+	owned, adoptErr := adoptOwnedCmd(cmd, statusR, ackW, dir, markerPath, marker)
+	if adoptErr != nil {
+		var parts []string
+		parts = append(parts, "adopt owned cmd: "+adoptErr.Error())
+		if kerr := killProcessGroupIfLive(cmd.Process.Pid); kerr != nil {
+			parts = append(parts, "kill group members: "+kerr.Error())
+		}
+		_, _ = io.WriteString(ackW, "go\n")
+		_ = ackW.Close()
+		if marker != nil {
+			_ = marker.Close()
+			_ = os.Remove(markerPath)
+		}
+		waitErr := cmd.Wait()
+		if waitErr != nil {
+			parts = append(parts, "wait: "+waitErr.Error())
+		}
+		output := []byte(strings.Join(parts, "\n"))
+		return &Result{
+			Outcome:      OutcomeBLOCKED,
+			Output:       boundedOutput(output),
+			OutputDigest: digestBytes(output),
+			ExitCode:     exitCode(cmd, waitErr),
+			Duration:     time.Since(started),
+		}, nil
+	}
+	if ctx.Err() != nil {
+		reapErr := owned.Reap()
+		msg := ctx.Err().Error()
+		if reapErr != nil {
+			msg += "\n" + reapErr.Error()
+		}
+		output := []byte(msg)
+		return &Result{
+			Outcome:      OutcomeBLOCKED,
+			Output:       boundedOutput(output),
+			OutputDigest: digestBytes(output),
+			ExitCode:     -1,
+			Duration:     time.Since(started),
+		}, nil
+	}
+
+	// Protocol: start → (sample while running) → done → drain while supervisor
+	// live → freeze → ack → Wait. Fail-closed on protocol/sample errors.
+	_, protoErr := owned.RunProtocol()
+	waitErr := cmd.Wait()
+	ownErr := owned.finalizeForExecution()
+	if protoErr != nil {
+		if ownErr != nil {
+			ownErr = fmt.Errorf("%v; protocol: %w", ownErr, protoErr)
+		} else {
+			ownErr = protoErr
+		}
+	}
+	output := combined.bytes()
+
+	if ownErr != nil {
+		msg := fmt.Sprintf("verification ownership close: %v\noutput:\n%s", ownErr, string(output))
+		if waitErr != nil {
+			msg = fmt.Sprintf("verification failed: %v\nownership: %v\noutput:\n%s", waitErr, ownErr, string(output))
+		}
+		out := []byte(msg)
+		return &Result{
+			Outcome:      OutcomeBLOCKED,
+			Output:       boundedOutput(out),
+			OutputDigest: digestBytes(out),
+			ExitCode:     exitCode(cmd, waitErr),
+			Duration:     time.Since(started),
+		}, nil
+	}
+
 	result := &Result{
-		Passed:       err == nil,
+		Passed:       waitErr == nil,
 		Outcome:      OutcomePASS,
 		Output:       boundedOutput(output),
 		OutputDigest: digestBytes(output),
-		ExitCode:     exitCode(cmd, err),
+		ExitCode:     exitCode(cmd, waitErr),
 		Duration:     time.Since(started),
 	}
-	if err != nil {
+	if waitErr != nil {
 		result.Outcome = OutcomeFAIL
 		if ctx.Err() != nil || cmd.ProcessState == nil {
 			result.Outcome = OutcomeBLOCKED
 		}
-		result.Output = boundedOutput([]byte(fmt.Sprintf("verification failed: %v\noutput:\n%s", err, string(output))))
+		result.Output = boundedOutput([]byte(fmt.Sprintf("verification failed: %v\noutput:\n%s", waitErr, string(output))))
 	}
 	return result, nil
+}
+
+// concurrentCombinedWriter is an io.Writer used for both cmd.Stdout and
+// cmd.Stderr. exec starts one copy goroutine per pipe; without the mutex,
+// -race reports concurrent writes into bytes.Buffer.
+type concurrentCombinedWriter struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (w *concurrentCombinedWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.b.Write(p)
+}
+
+func (w *concurrentCombinedWriter) bytes() []byte {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	// Copy so callers can retain the slice after the next Write.
+	out := make([]byte, w.b.Len())
+	copy(out, w.b.Bytes())
+	return out
 }
 
 // VerifyCandidate runs the configured argv only when dir is a clean checkout
@@ -241,6 +369,14 @@ func (v *Verifier) VerifyCandidate(ctx context.Context, dir string, req Verifica
 
 	result, err := v.execute(ctx, dir, req.EnvironmentPolicy)
 	if err != nil {
+		// Never surface cancellation as a bare VerifyCandidate error.
+		if isContextDone(err) || (ctx != nil && ctx.Err() != nil) {
+			cause := err
+			if ctx != nil && ctx.Err() != nil {
+				cause = ctx.Err()
+			}
+			return blockedReceipt(req, v.argv(), -1, nil, cause), nil
+		}
 		return nil, err
 	}
 	outcome := result.Outcome
@@ -385,35 +521,47 @@ func validSHA(sha string) bool {
 }
 
 func currentSHA(dir string) (string, error) {
-	cmd := exec.Command("git", "rev-parse", "--verify", "HEAD^{commit}")
-	cmd.Dir = dir
-	out, err := cmd.Output()
+	actual, _, err := candidateState(dir)
+	return actual, err
+}
+
+func candidateState(dir string) (string, []string, error) {
+	// Porcelain v2's branch header and entries provide the exact HEAD plus
+	// tracked/untracked state in one hermetic Git process. This gate runs both
+	// before and after verification, so avoiding a separate rev-parse halves
+	// deterministic admission subprocess overhead without caching mutable state.
+	out, err := runGit(dir, "status", "--porcelain=v2", "--branch", "--untracked-files=all")
 	if err != nil {
-		return "", fmt.Errorf("read candidate SHA: %w", err)
+		return "", nil, fmt.Errorf("read candidate status: %w", err)
 	}
-	sha := strings.TrimSpace(string(out))
-	if !validSHA(sha) {
-		return "", fmt.Errorf("git returned non-exact candidate SHA %q", sha)
+	var actual string
+	var dirty []string
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		switch {
+		case strings.HasPrefix(line, "# branch.oid "):
+			actual = strings.TrimSpace(strings.TrimPrefix(line, "# branch.oid "))
+		case line == "", strings.HasPrefix(line, "# "):
+			// Other branch headers are metadata, not worktree changes.
+		default:
+			dirty = append(dirty, line)
+		}
 	}
-	return sha, nil
+	if !validSHA(actual) {
+		return "", nil, fmt.Errorf("git returned non-exact candidate SHA %q", actual)
+	}
+	return actual, dirty, nil
 }
 
 func requireCleanCandidate(dir, expectedSHA string) error {
-	actual, err := currentSHA(dir)
+	actual, dirty, err := candidateState(dir)
 	if err != nil {
 		return err
 	}
 	if actual != expectedSHA {
 		return fmt.Errorf("candidate SHA %s does not match expected %s", actual, expectedSHA)
 	}
-	cmd := exec.Command("git", "status", "--porcelain", "--untracked-files=all")
-	cmd.Dir = dir
-	out, err := cmd.Output()
-	if err != nil {
-		return fmt.Errorf("read candidate status: %w", err)
-	}
-	if strings.TrimSpace(string(out)) != "" {
-		return fmt.Errorf("candidate worktree is dirty: %s", strings.TrimSpace(string(out)))
+	if len(dirty) > 0 {
+		return fmt.Errorf("candidate worktree is dirty: %s", strings.Join(dirty, "\n"))
 	}
 	return nil
 }
@@ -598,9 +746,7 @@ func pathWithin(root, target string) bool {
 }
 
 func resolvedGitDir(root string) (string, error) {
-	cmd := exec.Command("git", "rev-parse", "--git-dir")
-	cmd.Dir = root
-	out, err := cmd.Output()
+	out, err := runGit(root, "rev-parse", "--git-dir")
 	if err != nil {
 		return "", fmt.Errorf("resolve git directory: %w", err)
 	}
@@ -629,39 +775,12 @@ type MutationRequest struct {
 	Timeout           time.Duration
 }
 
-func (v *Verifier) admitMutationDisk(dir string) error {
-	if v == nil || v.DiskAdmission == nil {
-		return errors.New("disk capacity gate unavailable for mutation")
-	}
-	candidate, err := resources.ResolveExistingPath(dir)
-	if err != nil {
-		return fmt.Errorf("disk capacity gate: resolve candidate volume: %w", err)
-	}
-	tmp, err := resources.ResolveExistingPath(os.TempDir())
-	if err != nil {
-		return fmt.Errorf("disk capacity gate: resolve temporary volume: %w", err)
-	}
-	decision := v.DiskAdmission.Admit(resources.DiskRequest{
-		Operation: "verifier_mutation",
-		Path:      candidate,
-		TempPath:  tmp,
-	})
-	if decision.Allowed {
-		return nil
-	}
-	evidence, _ := json.Marshal(decision.Evidence)
-	return fmt.Errorf("disk capacity gate blocked: state=%s evidence=%s", decision.State, evidence)
-}
-
 // RunMutationCheck is the compatibility entry point for callers that already
 // have a target and replacement. It resolves the exact current candidate SHA
 // and delegates to RunMutationCheckForCandidate.
 func (v *Verifier) RunMutationCheck(ctx context.Context, dir string, targetFile string, originalCode string, mutantCode string) (*MutationResult, error) {
 	if v == nil {
 		return nil, errors.New("nil verifier")
-	}
-	if err := v.admitMutationDisk(dir); err != nil {
-		return nil, err
 	}
 	sha, err := currentSHA(dir)
 	if err != nil {
@@ -681,6 +800,10 @@ func (v *Verifier) RunMutationCheck(ctx context.Context, dir string, targetFile 
 // original bytes in a defer, and PASS again after restoration. Cancellation,
 // timeout, dirty state, stale SHA, tooling errors, and restoration failures
 // are BLOCKED. A mutant that passes is FAIL.
+//
+// On every return path the owned subprocess process-groups are reaped before
+// the function returns so callers (including tests using t.TempDir) never
+// race a late writer under dir/.git during cleanup.
 func (v *Verifier) RunMutationCheckForCandidate(ctx context.Context, dir string, req MutationRequest) (*MutationResult, error) {
 	if v == nil {
 		return nil, errors.New("nil verifier")
@@ -688,12 +811,25 @@ func (v *Verifier) RunMutationCheckForCandidate(ctx context.Context, dir string,
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	// This is the first operation after argument/context validation: no git
-	// read, target write, temp worktree, process start, or fan-out may precede
-	// the disk decision.
-	if err := v.admitMutationDisk(dir); err != nil {
-		return nil, err
+	// Disk admission is first: a denied path must not inspect git state, open
+	// the candidate, or start any process (see disk_gate_test.go).
+	if v.DiskAdmission == nil {
+		return nil, errors.New("disk admission is required")
 	}
+	decision := v.DiskAdmission.Admit(resources.DiskRequest{
+		Operation: "mutation",
+		Path:      dir,
+	})
+	if !decision.Allowed {
+		reason := decision.Evidence.Reason
+		if reason == "" {
+			reason = string(decision.State)
+		}
+		return nil, fmt.Errorf("disk admission denied: %s", reason)
+	}
+	// Each owned subprocess reaps its own process group after Wait. Path-guard
+	// failures never start Execute; successful mutations still return only
+	// after baseline/mutant/final commands and git inspections have reaped.
 	if err := validateRequest(VerificationRequest{
 		CandidateSHA:      req.CandidateSHA,
 		BaseSHA:           req.BaseSHA,
@@ -728,19 +864,29 @@ func (v *Verifier) RunMutationCheckForCandidate(ctx context.Context, dir string,
 		CandidateSHA: req.CandidateSHA,
 		Outcome:      OutcomeBLOCKED,
 	}
-	if err := requireCleanCandidate(dir, req.CandidateSHA); err != nil {
-		result.Output = err.Error()
-		result.Baseline = *blockedReceipt(baseReq, v.argv(), 0, nil, err)
-		return result, nil
-	}
 	if ctx.Err() != nil {
 		result.Output = ctx.Err().Error()
 		result.Baseline = *blockedReceipt(baseReq, v.argv(), 0, nil, ctx.Err())
 		return result, nil
 	}
 
+	// VerifyCandidate performs the exact-SHA and clean-worktree gate before it
+	// starts the baseline command. Repeating that same Git status immediately
+	// beforehand adds a subprocess but no additional observation point.
 	baseline, err := v.VerifyCandidate(ctx, dir, baseReq)
 	if err != nil {
+		// Cancellation during baseline must not escape as a bare error — the
+		// contract is BLOCKED with a result (no mutant applied yet).
+		if isContextDone(err) || ctx.Err() != nil {
+			cause := err
+			if ctx.Err() != nil {
+				cause = ctx.Err()
+			}
+			result.Output = cause.Error()
+			result.Baseline = *blockedReceipt(baseReq, v.argv(), -1, nil, cause)
+			result.Outcome = OutcomeBLOCKED
+			return result, nil
+		}
 		return nil, err
 	}
 	result.Baseline = *baseline
@@ -779,6 +925,20 @@ func (v *Verifier) RunMutationCheckForCandidate(ctx context.Context, dir string,
 	mutantContextErr := mutantCtx.Err()
 	cancel()
 	if execErr != nil {
+		// No race window: cancellation/timeout from Execute is always a
+		// BLOCKED MutationResult so the restore defer still records Restored.
+		if isContextDone(execErr) || mutantContextErr != nil || ctx.Err() != nil {
+			cause := execErr
+			if mutantContextErr != nil {
+				cause = mutantContextErr
+			} else if ctx.Err() != nil {
+				cause = ctx.Err()
+			}
+			result.Output = cause.Error()
+			result.Mutant = *blockedReceipt(baseReq, v.argv(), -1, nil, cause)
+			result.Outcome = OutcomeBLOCKED
+			return result, nil
+		}
 		return nil, execErr
 	}
 	mutantReq := baseReq
@@ -807,6 +967,15 @@ func (v *Verifier) RunMutationCheckForCandidate(ctx context.Context, dir string,
 	result.Restored = true
 	final, err := v.VerifyCandidate(ctx, dir, baseReq)
 	if err != nil {
+		if isContextDone(err) || ctx.Err() != nil {
+			cause := err
+			if ctx.Err() != nil {
+				cause = ctx.Err()
+			}
+			result.Output += "\n" + cause.Error()
+			result.Outcome = OutcomeBLOCKED
+			return result, nil
+		}
 		return nil, err
 	}
 	result.Final = *final
@@ -825,6 +994,12 @@ func (v *Verifier) mutationTimeout() time.Duration {
 		return v.Timeout
 	}
 	return 30 * time.Second
+}
+
+// isContextDone reports whether err is context cancellation or deadline.
+// Mutation cancel paths must map these to BLOCKED results, never bare errors.
+func isContextDone(err error) bool {
+	return err != nil && (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded))
 }
 
 func restoreFile(path string, contents []byte, mode os.FileMode) error {

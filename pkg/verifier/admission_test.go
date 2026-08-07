@@ -10,7 +10,7 @@ import (
 )
 
 func TestFileReceiptStorePersistRejectsTamperedDigestWithoutFile(t *testing.T) {
-	_, store, receipt := persistedReceiptFixture(t)
+	store, receipt := persistedReceiptFixture(t)
 	receipt.Digest = "sha256:" + strings.Repeat("e", 64)
 	if err := store.Persist(context.Background(), receipt); err == nil {
 		t.Fatal("tampered receipt digest must be rejected")
@@ -25,7 +25,7 @@ func TestFileReceiptStorePersistRejectsTamperedDigestWithoutFile(t *testing.T) {
 }
 
 func TestFileReceiptStorePersistUsesAtomicRenameAndCompleteFile(t *testing.T) {
-	_, store, receipt := persistedReceiptFixture(t)
+	store, receipt := persistedReceiptFixture(t)
 	renamed := false
 	store.rename = func(oldPath, newPath string) error {
 		renamed = true
@@ -51,7 +51,7 @@ func TestFileReceiptStorePersistUsesAtomicRenameAndCompleteFile(t *testing.T) {
 }
 
 func TestFileReceiptStorePersistUses0600(t *testing.T) {
-	_, store, receipt := persistedReceiptFixture(t)
+	store, receipt := persistedReceiptFixture(t)
 	if err := store.Persist(context.Background(), receipt); err != nil {
 		t.Fatal(err)
 	}
@@ -66,7 +66,7 @@ func TestFileReceiptStorePersistUses0600(t *testing.T) {
 }
 
 func TestFileReceiptStoreLoadRejectsWrongFilenameDigest(t *testing.T) {
-	_, store, receipt := persistedReceiptFixture(t)
+	store, receipt := persistedReceiptFixture(t)
 	data, err := json.Marshal(receipt)
 	if err != nil {
 		t.Fatal(err)
@@ -82,7 +82,7 @@ func TestFileReceiptStoreLoadRejectsWrongFilenameDigest(t *testing.T) {
 }
 
 func TestFileReceiptStoreLoadRejectsPayloadDigestMismatch(t *testing.T) {
-	_, store, receipt := persistedReceiptFixture(t)
+	store, receipt := persistedReceiptFixture(t)
 	tampered := receipt
 	tampered.Outcome = OutcomeFAIL
 	data, err := json.Marshal(tampered)
@@ -129,23 +129,15 @@ func TestReceiptAdmissionRejectsFailAndBlockedReceipts(t *testing.T) {
 	}
 }
 
-func persistedReceiptFixture(t *testing.T) (string, *FileReceiptStore, Receipt) {
+func persistedReceiptFixture(t *testing.T) (*FileReceiptStore, Receipt) {
 	t.Helper()
-	dir, candidate := verificationRepo(t)
 	store, err := NewFileReceiptStore(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
-	receipt, err := NewVerifierArgs([]string{"./check.sh"}).VerifyCandidate(context.Background(), dir, VerificationRequest{
-		TaskRef:           "FAC-122",
-		LeaseGeneration:   "lease-7",
-		CandidateSHA:      candidate,
-		BaseSHA:           candidate,
-		EnvironmentPolicy: EnvironmentPolicyInherited,
-		Artifacts:         []string{"candidate.txt"},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	return dir, store, *receipt
+	// Receipt-store tests exercise persistence and digest validation, not
+	// subprocess ownership. Build the same signed PASS payload directly; the
+	// end-to-end verification/receipt path has dedicated tests below.
+	receipt := fixturePassingReceipt(strings.Repeat("a", 40))
+	return store, receipt
 }

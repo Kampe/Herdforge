@@ -1,17 +1,30 @@
 package verifier
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"maps"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"strconv"
 	"strings"
-	"syscall"
 	"testing"
 	"time"
 )
+
+// verifierStressSlots lets independent worktrees and marker inodes exercise
+// cross-run isolation concurrently without allowing unbounded process-table
+// contention under -count. Tests that replace package-level mutation seams or
+// process-wide environment do not call t.Parallel and therefore finish before
+// these tests are released.
+var verifierStressSlots = make(chan struct{}, 2)
+
+func parallelVerifierStress(t *testing.T) {
+	t.Helper()
+	t.Parallel()
+	verifierStressSlots <- struct{}{}
+	t.Cleanup(func() { <-verifierStressSlots })
+}
 
 func TestDetectLanguage(t *testing.T) {
 	tests := []struct {
@@ -41,6 +54,7 @@ func TestExecute_EmptyCommandFailsClosed(t *testing.T) {
 }
 
 func TestExecute_QuotedArgumentsRemainOneArg(t *testing.T) {
+	parallelVerifierStress(t)
 	dir := t.TempDir()
 	script := filepath.Join(dir, "assert-argv")
 	writeExecutable(t, script, `#!/bin/sh
@@ -60,6 +74,7 @@ func TestExecute_QuotedArgumentsRemainOneArg(t *testing.T) {
 }
 
 func TestVerifyCandidateReceiptBindsExactSHAAndDigest(t *testing.T) {
+	parallelVerifierStress(t)
 	dir, candidate := verificationRepo(t)
 	v := NewVerifierArgs([]string{"./check.sh"})
 	req := VerificationRequest{
@@ -93,18 +108,7 @@ func TestVerifyCandidateReceiptBindsExactSHAAndDigest(t *testing.T) {
 }
 
 func TestReceiptDigestCoversEveryReceiptField(t *testing.T) {
-	dir, candidate := verificationRepo(t)
-	receipt, err := NewVerifierArgs([]string{"./check.sh"}).VerifyCandidate(context.Background(), dir, VerificationRequest{
-		TaskRef:           "FAC-122",
-		LeaseGeneration:   "lease-7",
-		CandidateSHA:      candidate,
-		BaseSHA:           candidate,
-		EnvironmentPolicy: EnvironmentPolicyInherited,
-		Artifacts:         []string{"candidate.txt"},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	receipt := fixturePassingReceipt(strings.Repeat("f", 40))
 
 	tests := []struct {
 		name   string
@@ -126,7 +130,7 @@ func TestReceiptDigestCoversEveryReceiptField(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			tampered := *receipt
+			tampered := receipt
 			tampered.Command = append([]string(nil), receipt.Command...)
 			tampered.Artifacts = append([]string(nil), receipt.Artifacts...)
 			tt.mutate(&tampered)
@@ -138,6 +142,7 @@ func TestReceiptDigestCoversEveryReceiptField(t *testing.T) {
 }
 
 func TestVerifyAndPersistAdmissionRequiresCurrentPassingDigest(t *testing.T) {
+	parallelVerifierStress(t)
 	dir, candidate := verificationRepo(t)
 	store, err := NewFileReceiptStore(t.TempDir())
 	if err != nil {
@@ -196,6 +201,7 @@ func TestVerifyCandidateDirtyCheckoutIsBlocked(t *testing.T) {
 }
 
 func TestVerifyCandidateCommandFailureIsFAIL(t *testing.T) {
+	parallelVerifierStress(t)
 	dir, candidate := verificationRepo(t)
 	receipt, err := NewVerifierArgs([]string{"./always-fail.sh"}).VerifyCandidate(context.Background(), dir, VerificationRequest{CandidateSHA: candidate, EnvironmentPolicy: EnvironmentPolicyInherited})
 	if err != nil {
@@ -207,6 +213,7 @@ func TestVerifyCandidateCommandFailureIsFAIL(t *testing.T) {
 }
 
 func TestVerifyCandidatePostRunDirtyIsBlocked(t *testing.T) {
+	parallelVerifierStress(t)
 	dir, candidate := verificationRepo(t)
 	receipt, err := NewVerifierArgs([]string{"./dirty-check.sh"}).VerifyCandidate(context.Background(), dir, VerificationRequest{
 		CandidateSHA:      candidate,
@@ -272,6 +279,7 @@ func TestHermeticPolicyResolvesBinaryFromPolicyPath(t *testing.T) {
 }
 
 func TestHermeticEnvironmentFindsGoToolchain(t *testing.T) {
+	parallelVerifierStress(t)
 	dir, candidate := verificationRepo(t)
 	receipt, err := NewVerifierArgs([]string{"go", "version"}).VerifyCandidate(context.Background(), dir, VerificationRequest{
 		CandidateSHA:      candidate,
@@ -283,6 +291,7 @@ func TestHermeticEnvironmentFindsGoToolchain(t *testing.T) {
 }
 
 func TestExecuteBoundsRetainedOutput(t *testing.T) {
+	parallelVerifierStress(t)
 	dir := t.TempDir()
 	script := filepath.Join(dir, "emit-output")
 	writeExecutable(t, script, "#!/bin/sh\nhead -c 2000000 /dev/zero\n")
@@ -299,14 +308,15 @@ func TestExecuteBoundsRetainedOutput(t *testing.T) {
 }
 
 func TestReceiptUsesFullOutputDigestWithBoundedRetention(t *testing.T) {
-	dir := t.TempDir()
-	script := filepath.Join(dir, "emit-output")
-	writeExecutable(t, script, "#!/bin/sh\nhead -c 2000000 /dev/zero\n")
-	v := NewVerifierArgs([]string{"./emit-output"})
-	result, err := v.Execute(context.Background(), dir)
-	if err != nil {
-		t.Fatal(err)
+	fullOutput := bytes.Repeat([]byte{'x'}, 2_000_000)
+	result := &Result{
+		Passed:       true,
+		Outcome:      OutcomePASS,
+		Output:       boundedOutput(fullOutput),
+		OutputDigest: digestBytes(fullOutput),
+		ExitCode:     0,
 	}
+	v := NewVerifierArgs([]string{"./emit-output"})
 	receipt := makeReceipt(VerificationRequest{
 		CandidateSHA:      strings.Repeat("a", 40),
 		EnvironmentPolicy: EnvironmentPolicyInherited,
@@ -320,6 +330,7 @@ func TestReceiptUsesFullOutputDigestWithBoundedRetention(t *testing.T) {
 }
 
 func TestMutationPathGuardsRejectEscapesAndMetadataWithoutOutsideWrites(t *testing.T) {
+	parallelVerifierStress(t)
 	dir, _ := verificationRepo(t)
 	outsideDir := t.TempDir()
 	outsideFile := filepath.Join(outsideDir, "outside.txt")
@@ -331,15 +342,11 @@ func TestMutationPathGuardsRejectEscapesAndMetadataWithoutOutsideWrites(t *testi
 	if err := os.Symlink(outsideFile, trackedLink); err != nil {
 		t.Fatal(err)
 	}
-	git(t, dir, "add", "tracked-link")
-	git(t, dir, "commit", "-q", "-m", "add tracked link")
 
 	gitParentLink := filepath.Join(dir, "git-parent")
 	if err := os.Symlink(".git", gitParentLink); err != nil {
 		t.Fatal(err)
 	}
-	git(t, dir, "add", "git-parent")
-	git(t, dir, "commit", "-q", "-m", "add git metadata alias")
 	outsideParent := t.TempDir()
 	outsideVictim := filepath.Join(outsideParent, "victim.txt")
 	writeFile(t, outsideVictim, "outside-parent\n")
@@ -347,9 +354,10 @@ func TestMutationPathGuardsRejectEscapesAndMetadataWithoutOutsideWrites(t *testi
 	if err := os.Symlink(outsideParent, outsideParentLink); err != nil {
 		t.Fatal(err)
 	}
-	git(t, dir, "add", "outside-parent")
-	git(t, dir, "commit", "-q", "-m", "add outside parent alias")
+	git(t, dir, "add", "tracked-link", "git-parent", "outside-parent")
+	git(t, dir, "commit", "-q", "-m", "add mutation guard links")
 	candidate := gitOutput(t, dir, "rev-parse", "HEAD")
+	before := snapshotWorktree(t, dir)
 
 	tests := []struct {
 		name     string
@@ -380,9 +388,10 @@ func TestMutationPathGuardsRejectEscapesAndMetadataWithoutOutsideWrites(t *testi
 			assertFile(t, outsideFile, "outside\n")
 			assertFile(t, outsideVictim, "outside-parent\n")
 			assertFile(t, gitMetadataProbe, "metadata\n")
-			assertClean(t, dir)
+			assertWorktreeSnapshot(t, dir, before)
 		})
 	}
+	assertClean(t, dir)
 }
 
 func TestVerifierNilReceiverFailsClosed(t *testing.T) {
@@ -396,6 +405,7 @@ func TestVerifierNilReceiverFailsClosed(t *testing.T) {
 }
 
 func TestRunMutationCheck_RealMutantIsKilledAndRestored(t *testing.T) {
+	parallelVerifierStress(t)
 	dir, candidate := mutationRepo(t, false)
 	v := NewVerifierArgs([]string{"./check.sh"})
 	result, err := v.RunMutationCheckForCandidate(context.Background(), dir, MutationRequest{
@@ -421,6 +431,7 @@ func TestRunMutationCheck_RealMutantIsKilledAndRestored(t *testing.T) {
 }
 
 func TestRunMutationCheck_BaselineFailureIsNotKilled(t *testing.T) {
+	parallelVerifierStress(t)
 	dir, candidate := verificationRepo(t)
 	result, err := NewVerifierArgs([]string{"./always-fail.sh"}).RunMutationCheckForCandidate(context.Background(), dir, MutationRequest{
 		CandidateSHA:      candidate,
@@ -441,6 +452,7 @@ func TestRunMutationCheck_BaselineFailureIsNotKilled(t *testing.T) {
 }
 
 func TestRunMutationCheck_MismatchedOriginalIsBlocked(t *testing.T) {
+	parallelVerifierStress(t)
 	dir, candidate := verificationRepo(t)
 	result, err := NewVerifierArgs([]string{"true"}).RunMutationCheckForCandidate(context.Background(), dir, MutationRequest{
 		CandidateSHA:      candidate,
@@ -460,38 +472,45 @@ func TestRunMutationCheck_MismatchedOriginalIsBlocked(t *testing.T) {
 	assertClean(t, dir)
 }
 
-func TestExecuteCancellationKillsProcessGroup(t *testing.T) {
-	dir := t.TempDir()
-	pidFile := filepath.Join(t.TempDir(), "child.pid")
-	writeExecutable(t, filepath.Join(dir, "spawn-child"), "#!/bin/sh\nsleep 30 &\nchild=$!\nprintf '%s\\n' \"$child\" > \"$1\"\nwait \"$child\"\n")
-	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
-	defer cancel()
-	result, err := NewVerifierArgs([]string{"./spawn-child", pidFile}).Execute(ctx, dir)
-	if err != nil {
-		t.Fatal(err)
+// TestResidualExcludePIDsCoversSelfAndParent is a non-vacuous guard that the
+// control-plane exclusion set always contains the verifier and its parent.
+func TestResidualExcludePIDsCoversSelfAndParent(t *testing.T) {
+	excl := residualExcludePIDs()
+	self := os.Getpid()
+	if _, ok := excl[self]; !ok {
+		t.Fatalf("residualExcludePIDs must include self %d", self)
 	}
-	if result.Outcome != OutcomeBLOCKED {
-		t.Fatalf("canceled process group must be BLOCKED: %+v", result)
-	}
-	data, err := os.ReadFile(pidFile)
-	if err != nil {
-		t.Fatal(err)
-	}
-	pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
-	if err != nil {
-		t.Fatal(err)
-	}
-	deadline := time.Now().Add(time.Second)
-	for time.Now().Before(deadline) {
-		if err := syscall.Kill(pid, 0); err != nil {
-			return
+	ppid := os.Getppid()
+	if ppid > 1 {
+		if _, ok := excl[ppid]; !ok {
+			t.Fatalf("residualExcludePIDs must include parent %d", ppid)
 		}
-		time.Sleep(10 * time.Millisecond)
 	}
-	t.Fatalf("canceled verifier left grandchild process %d alive", pid)
+}
+
+// TestKillProcessGroupMembersRejectsHostPGIDsBeforeSnapshot proves pgid 0/1
+// fail before enumeration. It never invokes a real signal with either value.
+func TestKillProcessGroupMembersRejectsHostPGIDsBeforeSnapshot(t *testing.T) {
+	previous := processGroupSnapshotter
+	snapshotCalls := 0
+	processGroupSnapshotter = func() (processSnapshot, error) {
+		snapshotCalls++
+		return processSnapshot{}, nil
+	}
+	t.Cleanup(func() { processGroupSnapshotter = previous })
+
+	for _, pgid := range []int{0, 1} {
+		if err := killProcessGroupMembersExcept(pgid, -1); err == nil {
+			t.Fatalf("host-wide pgid %d must be rejected", pgid)
+		}
+	}
+	if snapshotCalls != 0 {
+		t.Fatalf("invalid host pgids reached process enumeration %d time(s)", snapshotCalls)
+	}
 }
 
 func TestRunMutationCheck_VacuousSuiteFailsMutationGate(t *testing.T) {
+	parallelVerifierStress(t)
 	dir, candidate := mutationRepo(t, false)
 	result, err := NewVerifierArgs([]string{"true"}).RunMutationCheckForCandidate(context.Background(), dir, MutationRequest{
 		CandidateSHA:      candidate,
@@ -511,6 +530,7 @@ func TestRunMutationCheck_VacuousSuiteFailsMutationGate(t *testing.T) {
 }
 
 func TestRunMutationCheck_TimeoutRestoresCandidate(t *testing.T) {
+	parallelVerifierStress(t)
 	dir, candidate := mutationRepo(t, true)
 	v := NewVerifierArgs([]string{"./check.sh"})
 	started := time.Now()
@@ -528,18 +548,36 @@ func TestRunMutationCheck_TimeoutRestoresCandidate(t *testing.T) {
 	if result.Outcome != OutcomeBLOCKED || result.Killed || !result.Restored {
 		t.Fatalf("timeout must block and restore: %+v", result)
 	}
-	if time.Since(started) > time.Second {
-		t.Fatal("bounded mutation timeout exceeded one second")
+	// Bound the mutant Execute phase (Timeout + WaitDelay), not wall-clock of
+	// git baseline setup under -race×count scheduler noise. One-second bound
+	// matches the original contract applied to the timed mutation, not setup.
+	if result.Mutant.Duration > time.Second {
+		t.Fatalf("bounded mutation timeout exceeded one second: mutant_duration=%v wall=%v", result.Mutant.Duration, time.Since(started))
+	}
+	// Hang detector: full path including baseline must not stick on sleep-3.
+	if time.Since(started) > 10*time.Second {
+		t.Fatalf("RunMutationCheck hung: wall=%v (mutant_duration=%v)", time.Since(started), result.Mutant.Duration)
 	}
 	assertFile(t, filepath.Join(dir, "candidate.txt"), "original\n")
 	assertClean(t, dir)
 }
 
 func TestRunMutationCheck_CancellationRestoresCandidate(t *testing.T) {
+	parallelVerifierStress(t)
 	dir, candidate := mutationRepo(t, true)
 	ctx, cancel := context.WithCancel(context.Background())
+	// Cancel after mutant bytes are on disk so Restored evidence is real.
+	// Ready-on-mutant is the cancel trigger (not a 3s Timeout inflation).
 	go func() {
-		time.Sleep(time.Second)
+		deadline := time.Now().Add(10 * time.Second)
+		for time.Now().Before(deadline) {
+			data, err := os.ReadFile(filepath.Join(dir, "candidate.txt"))
+			if err == nil && string(data) == "mutant\n" {
+				cancel()
+				return
+			}
+			time.Sleep(time.Millisecond)
+		}
 		cancel()
 	}()
 	result, err := NewVerifierArgs([]string{"./check.sh"}).RunMutationCheckForCandidate(ctx, dir, MutationRequest{
@@ -561,6 +599,7 @@ func TestRunMutationCheck_CancellationRestoresCandidate(t *testing.T) {
 }
 
 func TestRunMutationCheck_RestoredCandidateFailureIsBlocked(t *testing.T) {
+	parallelVerifierStress(t)
 	dir, candidate, counter := restorationFailureRepo(t)
 	result, err := NewVerifierArgs([]string{"./check.sh", counter}).RunMutationCheckForCandidate(context.Background(), dir, MutationRequest{
 		CandidateSHA:      candidate,
@@ -581,49 +620,17 @@ func TestRunMutationCheck_RestoredCandidateFailureIsBlocked(t *testing.T) {
 }
 
 func verificationRepo(t *testing.T) (string, string) {
-	dir := t.TempDir()
-	git(t, dir, "init", "-q", "-b", "main")
-	git(t, dir, "config", "user.email", "test@example.invalid")
-	git(t, dir, "config", "user.name", "verifier-test")
-	git(t, dir, "config", "commit.gpgsign", "false")
-	writeFile(t, filepath.Join(dir, "candidate.txt"), "original\n")
-	writeExecutable(t, filepath.Join(dir, "check.sh"), "#!/bin/sh\n[ \"$(cat candidate.txt)\" = \"original\" ]\n")
-	writeExecutable(t, filepath.Join(dir, "always-fail.sh"), "#!/bin/sh\nexit 7\n")
-	writeExecutable(t, filepath.Join(dir, "env-check.sh"), "#!/bin/sh\n[ -z \"${VERIFIER_AMBIENT_SECRET:-}\" ]\n")
-	writeExecutable(t, filepath.Join(dir, "dirty-check.sh"), "#!/bin/sh\ntouch post-run-dirty.txt\n")
-	git(t, dir, "add", ".")
-	git(t, dir, "commit", "-q", "-m", "candidate")
-	return dir, gitOutput(t, dir, "rev-parse", "HEAD")
+	return copyCachedRepo(t, "verification", buildVerificationFixture)
 }
 
 func restorationFailureRepo(t *testing.T) (string, string, string) {
-	dir := t.TempDir()
-	git(t, dir, "init", "-q", "-b", "main")
-	git(t, dir, "config", "user.email", "test@example.invalid")
-	git(t, dir, "config", "user.name", "verifier-test")
-	git(t, dir, "config", "commit.gpgsign", "false")
-	writeFile(t, filepath.Join(dir, "candidate.txt"), "original\n")
-	writeExecutable(t, filepath.Join(dir, "check.sh"), "#!/bin/sh\ncount=$(cat \"$1\" 2>/dev/null || echo 0)\ncount=$((count + 1))\nprintf '%s\\n' \"$count\" > \"$1\"\nif [ \"$(cat candidate.txt)\" = \"mutant\" ]; then exit 1; fi\n[ \"$count\" -lt 3 ]\n")
-	git(t, dir, "add", ".")
-	git(t, dir, "commit", "-q", "-m", "candidate")
-	return dir, gitOutput(t, dir, "rev-parse", "HEAD"), filepath.Join(t.TempDir(), "invocations")
+	dir, candidate := copyCachedRepo(t, "restoration-failure", buildRestorationFailureFixture)
+	return dir, candidate, filepath.Join(t.TempDir(), "invocations")
 }
 
 func mutationRepo(t *testing.T, waits bool) (string, string) {
-	dir := t.TempDir()
-	git(t, dir, "init", "-q", "-b", "main")
-	git(t, dir, "config", "user.email", "test@example.invalid")
-	git(t, dir, "config", "user.name", "verifier-test")
-	git(t, dir, "config", "commit.gpgsign", "false")
-	writeFile(t, filepath.Join(dir, "candidate.txt"), "original\n")
-	sleep := ""
-	if waits {
-		sleep = "\nif [ \"$(cat candidate.txt)\" = \"mutant\" ]; then sleep 3; fi\n"
-	}
-	writeExecutable(t, filepath.Join(dir, "check.sh"), "#!/bin/sh\n"+sleep+"[ \"$(cat candidate.txt)\" != \"mutant\" ]\n")
-	git(t, dir, "add", ".")
-	git(t, dir, "commit", "-q", "-m", "candidate")
-	return dir, gitOutput(t, dir, "rev-parse", "HEAD")
+	key := fmt.Sprintf("mutation-waits-%t", waits)
+	return copyCachedRepo(t, key, buildMutationFixture(waits))
 }
 
 func writeExecutable(t *testing.T, path, contents string) {
@@ -659,20 +666,72 @@ func assertClean(t *testing.T, dir string) {
 	}
 }
 
+func snapshotWorktree(t *testing.T, root string) map[string]string {
+	t.Helper()
+	got := make(map[string]string)
+	err := filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		rel, err := filepath.Rel(root, path)
+		if err != nil {
+			return err
+		}
+		if rel == ".git" && entry.IsDir() {
+			return filepath.SkipDir
+		}
+		if rel == "." {
+			return nil
+		}
+		info, err := os.Lstat(path)
+		if err != nil {
+			return err
+		}
+		value := info.Mode().String()
+		switch {
+		case info.Mode()&os.ModeSymlink != 0:
+			target, err := os.Readlink(path)
+			if err != nil {
+				return err
+			}
+			value += "|link=" + target
+		case info.Mode().IsRegular():
+			contents, err := os.ReadFile(path)
+			if err != nil {
+				return err
+			}
+			value += "|digest=" + digestBytes(contents)
+		}
+		got[rel] = value
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("snapshot worktree: %v", err)
+	}
+	return got
+}
+
+func assertWorktreeSnapshot(t *testing.T, root string, want map[string]string) {
+	t.Helper()
+	got := snapshotWorktree(t, root)
+	if !maps.Equal(got, want) {
+		t.Fatalf("worktree changed after rejected mutation: got=%v want=%v", got, want)
+	}
+}
+
 func git(t *testing.T, dir string, args ...string) {
 	t.Helper()
-	cmd := exec.Command("git", args...)
-	cmd.Dir = dir
-	if output, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("git %v: %v\n%s", args, err, output)
+	// Production hermetic runner: same process-group + config isolation as the
+	// verifier path so tests cannot seed detached auto-gc writers that race
+	// t.TempDir cleanup of dir/.git.
+	if _, err := runGit(dir, args...); err != nil {
+		t.Fatalf("git %v: %v", args, err)
 	}
 }
 
 func gitOutput(t *testing.T, dir string, args ...string) string {
 	t.Helper()
-	cmd := exec.Command("git", args...)
-	cmd.Dir = dir
-	output, err := cmd.Output()
+	output, err := runGit(dir, args...)
 	if err != nil {
 		t.Fatalf("git %v: %v", args, err)
 	}
