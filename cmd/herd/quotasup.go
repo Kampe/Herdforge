@@ -146,7 +146,7 @@ func runQuotaSupervisor() {
 	}
 
 	if *act {
-		changes, err := quotasup.Act(router.GlobalStateDir(), now, *ttl, current.Decisions)
+		changes, err := quotasup.Act(now, *ttl, current.Decisions)
 		for _, c := range changes {
 			fmt.Println("ACT " + c)
 		}
