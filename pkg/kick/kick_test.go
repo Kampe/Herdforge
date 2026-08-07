@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/Kampe/Herdforge/pkg/broadcast"
 	"github.com/Kampe/Herdforge/pkg/lifecycle"
 )
 
@@ -475,3 +476,69 @@ func testActiveTasks(_ context.Context, lane string) ([]lifecycle.HoldIdentity, 
 func testGeneration(context.Context, lifecycle.HoldIdentity) (int64, error) { return 1, nil }
 
 func emptyAgentList() ([]AgentEntry, error) { return nil, nil }
+
+func TestRun_BroadcastQuarantineMarkersNeverPrompt(t *testing.T) {
+	// FAC-187: lifted-hold kick with FAC-151/FAC-172 quarantine markers must
+	// not prompt those lanes; eligible lanes still receive exactly one kick.
+	agents := []AgentEntry{
+		{Name: "forge-worker", Status: "idle", PaneID: "p-w"},
+		{Name: "task-fac-151", Status: "idle", PaneID: "p-151"},
+		{Name: "p57", Status: "idle", PaneID: "p-172"},
+		{Name: "review-assayer-fac-x", Status: "idle", PaneID: "p-r"},
+	}
+	result, err := Run(Options{
+		Names:        []string{"forge-worker", "task-fac-151", "p57", "review-assayer-fac-x"},
+		DryRun:       true,
+		Quiet:        true,
+		RaiseMissing: false,
+		HoldReader:   allowAllHolds{},
+		Identity:     testIdentity,
+		ActiveTasks:  testActiveTasks,
+		Generation:   testGeneration,
+		FetchAgents:  func() ([]AgentEntry, error) { return agents, nil },
+		Markers: map[string][]broadcast.ExclusionKind{
+			"task-fac-151": {broadcast.ExcludeQuarantined, broadcast.ExcludeProtected},
+			"p57":          {broadcast.ExcludeQuarantined},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	byName := map[string]EntryResult{}
+	for _, e := range result.Entries {
+		byName[e.Name] = e
+	}
+	if byName["forge-worker"].Result != "dry-run" {
+		t.Fatalf("eligible worker: %+v", byName["forge-worker"])
+	}
+	for _, name := range []string{"task-fac-151", "p57", "review-assayer-fac-x"} {
+		if byName[name].Result != "skipped" {
+			t.Fatalf("%s must be skipped, got %+v", name, byName[name])
+		}
+		if !strings.Contains(byName[name].Reason, "broadcast:") && name != "review-assayer-fac-x" {
+			// review-assayer is auto-excluded as reviewer
+		}
+		if !strings.HasPrefix(byName[name].Reason, "broadcast:") {
+			t.Fatalf("%s reason = %q want broadcast:…", name, byName[name].Reason)
+		}
+	}
+	if result.Kicked != 1 || result.Skipped != 3 {
+		t.Fatalf("kicked=%d skipped=%d want 1/3", result.Kicked, result.Skipped)
+	}
+}
+
+func TestCompileKickExclusions_AutoMarksReviewers(t *testing.T) {
+	ex := compileKickExclusions(
+		[]string{"forge-worker", "review-assayer-fac-151", "forge-assayer"},
+		nil, nil,
+	)
+	if _, ok := ex["forge-worker"]; ok {
+		t.Fatal("worker must not be auto-excluded")
+	}
+	if ex["review-assayer-fac-151"] != string(broadcast.ExcludeReviewer) {
+		t.Fatalf("review tab: %q", ex["review-assayer-fac-151"])
+	}
+	if ex["forge-assayer"] != string(broadcast.ExcludeReviewer) {
+		t.Fatalf("assayer: %q", ex["forge-assayer"])
+	}
+}

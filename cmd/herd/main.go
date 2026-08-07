@@ -3695,6 +3695,14 @@ func runKick() {
 		os.Exit(1)
 	}
 
+	// FAC-187: durable exclusion markers so a lifted-hold kick never prompts
+	// quarantined/protected task lanes. Missing file is fine (nil markers).
+	markers, markerErr := kick.LoadBroadcastMarkers(filepath.Join(".herd", "state", "broadcast-exclude.json"))
+	if markerErr != nil {
+		fmt.Fprintf(os.Stderr, "herd-kick: broadcast markers: %v\n", markerErr)
+		os.Exit(1)
+	}
+
 	result, err := kick.Run(kick.Options{
 		Names:        args,
 		Force:        *all,
@@ -3703,6 +3711,7 @@ func runKick() {
 		Reason:       *reason,
 		RaiseMissing: !*noRaise,
 		HoldReader:   authority,
+		Markers:      markers,
 		Identity: func(id string) (lifecycle.HoldIdentity, error) {
 			lane, resolveErr := kickRegistry.ResolveLiveAgentID(id)
 			if resolveErr != nil {
