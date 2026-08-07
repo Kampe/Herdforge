@@ -65,6 +65,10 @@ func NewSessionPaths(sharedRoot, taskRef string, leaseGeneration int64) (Session
 // replace material on the next lease and so test cleanup can unlink files.
 // The confined agent still cannot write these paths: they sit outside the
 // worktree write grant.
+//
+// Coordinator rewrite paths must thaw before WriteFile (see thawFile): profile
+// install, InstallAgentWrappers, TabEnv, and session receipts. Without thaw,
+// reusing a (task, lease-generation) pair fails closed forever.
 func FreezeSession(s SessionPaths) error {
 	if err := os.Chmod(s.Profile, 0o444); err != nil {
 		return err
@@ -84,6 +88,18 @@ func FreezeSession(s SessionPaths) error {
 	}
 	for _, e := range zentries {
 		_ = os.Chmod(filepath.Join(s.ZdotDir, e.Name()), 0o444)
+	}
+	return nil
+}
+
+// thawFile makes a previously frozen session file writable for coordinator
+// rewrite. Missing files are OK (first install).
+func thawFile(path string, mode os.FileMode) error {
+	if strings.TrimSpace(path) == "" {
+		return nil
+	}
+	if err := os.Chmod(path, mode); err != nil && !os.IsNotExist(err) {
+		return err
 	}
 	return nil
 }

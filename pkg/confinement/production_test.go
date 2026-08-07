@@ -263,6 +263,9 @@ func TestDarwinFirstMatchProfileDeniesSharedParent(t *testing.T) {
 	if !strings.Contains(body, "objects") {
 		t.Fatal("profile missing common objects grant")
 	}
+	if !strings.Contains(body, "file-write-create") || !strings.Contains(body, "file-write-data") {
+		t.Fatal("objects must use create+data grants")
+	}
 	outside := filepath.Join(shared, "outside-shared.txt")
 	if err := osb.writeUnder(profile, root, outside, "nope\n"); err == nil {
 		if _, statErr := os.Stat(outside); statErr == nil {
@@ -290,6 +293,9 @@ func TestDarwinFirstMatchProfileDeniesSharedParent(t *testing.T) {
 	}
 	if isPathPrefix(common, root) {
 		t.Fatal("fixture is not linked topology")
+	}
+	if strings.Contains(body, "(allow file-write* (subpath \""+filepath.Join(common, "objects")+"\"))") {
+		t.Fatal("objects file-write* would allow rm -rf of shared store")
 	}
 	hook := filepath.Join(common, "hooks", "fac190-test-hook")
 	if err := osb.writeUnder(profile, root, hook, "evil\n"); err == nil {
@@ -479,6 +485,17 @@ func TestWriteSeatbeltProfileBranchLiteralOnly(t *testing.T) {
 	if strings.Contains(s, "(allow file-write* (literal \""+filepath.Join(common, "HEAD")+"\"))") {
 		t.Fatal("common HEAD write grant present")
 	}
+	// Objects must not use file-write* (includes unlink → rm -rf objects).
+	objects := filepath.Join(common, "objects")
+	if strings.Contains(s, "(allow file-write* (subpath \""+objects+"\"))") {
+		t.Fatal("objects granted file-write* (unlink/destroy surface)")
+	}
+	if !strings.Contains(s, "(allow file-write-create (subpath \""+objects+"\"))") {
+		t.Fatal("objects missing file-write-create")
+	}
+	if !strings.Contains(s, "(allow file-write-data (subpath \""+objects+"\"))") {
+		t.Fatal("objects missing file-write-data")
+	}
 	// Bare branch without slash must not grant entire refs/heads.
 	path2 := filepath.Join(dir, "profile-main.sb")
 	if _, err := writeSeatbeltProfile(wt, gitDir, common, "main", path2); err != nil {
@@ -491,6 +508,38 @@ func TestWriteSeatbeltProfileBranchLiteralOnly(t *testing.T) {
 	}
 	if !strings.Contains(s2, "(allow file-write* (literal \""+filepath.Join(common, "refs", "heads", "main")+"\"))") {
 		t.Fatal("missing literal main ref")
+	}
+}
+
+func TestPrepareOSSameLeaseRelaunch(t *testing.T) {
+	// FreezeSession must not brick coordinator rewrite of the same (task, lease).
+	issuer, err := NewHMACIssuer([]byte("secret"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	shared := t.TempDir()
+	root := filepath.Join(shared, "wt")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	enf := &Enforcer{Issuer: issuer, OS: &FakeOS{}}
+	prep1, err := enf.PrepareOS(root, shared, "FAC-190", 7, "task/fac-190", "codex", "codex")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := prep1.TabEnv(root, "/usr/bin"); err != nil {
+		t.Fatalf("first TabEnv: %v", err)
+	}
+	// Second PrepareOS + TabEnv on the same generation must succeed (thaw).
+	prep2, err := enf.PrepareOS(root, shared, "FAC-190", 7, "task/fac-190", "codex", "codex")
+	if err != nil {
+		t.Fatalf("same-lease PrepareOS relaunch: %v", err)
+	}
+	if _, err := prep2.TabEnv(root, "/usr/bin"); err != nil {
+		t.Fatalf("same-lease TabEnv relaunch: %v", err)
+	}
+	if !prep2.WrapperResolves("codex") {
+		t.Fatal("wrapper missing after relaunch")
 	}
 }
 
