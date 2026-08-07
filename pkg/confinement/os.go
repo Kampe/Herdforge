@@ -341,6 +341,45 @@ func (d DarwinSeatbelt) ProveWriteDenials(worktree, sharedRoot, profilePath stri
 			_ = os.Remove(hook)
 			return fmt.Errorf("%w: git hook inode created", ErrOSProbeFailed)
 		}
+
+		// CRITICAL: sibling lane branch refs must be denied (literal grant only).
+		// Parent-dir subpath grants (refs/heads/task) would allow every task/* tip.
+		siblingRef := filepath.Join(commonDir, "refs", "heads", "task", "fac-190-sibling-deny")
+		_ = os.MkdirAll(filepath.Dir(siblingRef), 0o755)
+		_ = os.Remove(siblingRef)
+		if err := d.writeUnder(profilePath, absWT, siblingRef, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef\n"); err == nil {
+			if _, statErr := os.Stat(siblingRef); statErr == nil {
+				_ = os.Remove(siblingRef)
+				return fmt.Errorf("%w: sibling branch ref write succeeded", ErrOSProbeFailed)
+			}
+		}
+		if _, err := os.Stat(siblingRef); err == nil {
+			_ = os.Remove(siblingRef)
+			return fmt.Errorf("%w: sibling branch ref inode created", ErrOSProbeFailed)
+		}
+
+		// HIGH: packed-refs and shared HEAD are coordinator-only.
+		for _, name := range []string{"packed-refs", "HEAD"} {
+			target := filepath.Join(commonDir, name)
+			before, _ := os.ReadFile(target)
+			marker := "fac190-deny-packed-or-head\n"
+			if err := d.writeUnder(profilePath, absWT, target, marker); err == nil {
+				after, rerr := os.ReadFile(target)
+				if rerr == nil && strings.Contains(string(after), marker) {
+					// Best-effort restore so the fixture repo stays usable.
+					if before != nil {
+						_ = os.WriteFile(target, before, 0o644)
+					}
+					return fmt.Errorf("%w: common %s write succeeded", ErrOSProbeFailed, name)
+				}
+			}
+			if after, rerr := os.ReadFile(target); rerr == nil && strings.Contains(string(after), marker) {
+				if before != nil {
+					_ = os.WriteFile(target, before, 0o644)
+				}
+				return fmt.Errorf("%w: common %s mutated under confinement", ErrOSProbeFailed, name)
+			}
+		}
 	}
 
 	// CRITICAL: confined process must not rewrite the integrity store.
@@ -582,9 +621,10 @@ func (d DarwinSeatbelt) writeUnder(profile, worktree, target, content string) er
 // writeSeatbeltProfile emits an agent-viable profile. profilePath is the
 // absolute path of the profile file itself (outside the worktree).
 //
-// Linked worktrees need worktree + gitdir + narrow common objects/refs/logs.
-// Branch-scoped refs only (not all of refs/heads/*) when branch is known.
-// Shared checkout root and the session integrity directory are never granted.
+// Branch refs are granted ONLY as exact literal paths (ref + .lock). Never use
+// filepath.Dir as a subpath grant: for branch "task/fac-190", Dir is
+// refs/heads/task which would allow every sibling task/* lane branch.
+// Shared common HEAD and packed-refs are NOT granted (coordinator-only).
 func writeSeatbeltProfile(worktree, gitDir, commonDir, branch, profilePath string) (string, error) {
 	if worktree == "" || gitDir == "" || commonDir == "" || profilePath == "" {
 		return "", fmt.Errorf("confinement: worktree, gitdir, common-dir, and profile path required")
@@ -606,33 +646,29 @@ func writeSeatbeltProfile(worktree, gitDir, commonDir, branch, profilePath strin
 	fmt.Fprintf(&b, "(allow file-write* (subpath %q))\n", worktree)
 	fmt.Fprintf(&b, "(allow file-write* (subpath %q))\n", gitDir)
 	fmt.Fprintf(&b, "(allow file-write* (subpath %q))\n", filepath.Join(commonDir, "objects"))
-	// Branch-scoped ref updates only — not every lane's refs/heads/*.
+	fmt.Fprintf(&b, "(allow file-write* (subpath %q))\n", filepath.Join(commonDir, "info"))
+	// Exact branch ref only — no parent-directory subpath.
 	branch = strings.TrimPrefix(strings.TrimSpace(branch), "refs/heads/")
 	if branch != "" {
 		refPath := filepath.Join(commonDir, "refs", "heads", filepath.FromSlash(branch))
-		fmt.Fprintf(&b, "(allow file-write* (subpath %q))\n", filepath.Dir(refPath))
-		fmt.Fprintf(&b, "(allow file-write* (literal %q))\n", refPath)
-		fmt.Fprintf(&b, "(allow file-write* (literal %q))\n", refPath+".lock")
 		logPath := filepath.Join(commonDir, "logs", "refs", "heads", filepath.FromSlash(branch))
-		fmt.Fprintf(&b, "(allow file-write* (subpath %q))\n", filepath.Dir(logPath))
-	} else {
-		// Fail closed on missing branch: grant no heads/* (agents cannot push
-		// branch tips — better than cross-lane ref rewrite).
-		fmt.Fprintf(&b, "(allow file-write* (subpath %q))\n", filepath.Join(commonDir, "refs", "herd"))
+		for _, p := range []string{refPath, refPath + ".lock", logPath, logPath + ".lock"} {
+			fmt.Fprintf(&b, "(allow file-write* (literal %q))\n", p)
+		}
 	}
+	// herd anchor/salvage refs are namespaced and not cross-lane branch tips.
 	fmt.Fprintf(&b, "(allow file-write* (subpath %q))\n", filepath.Join(commonDir, "refs", "herd"))
 	fmt.Fprintf(&b, "(allow file-write* (subpath %q))\n", filepath.Join(commonDir, "logs", "refs", "herd"))
-	fmt.Fprintf(&b, "(allow file-write* (subpath %q))\n", filepath.Join(commonDir, "info"))
-	for _, name := range []string{"packed-refs", "COMMIT_EDITMSG", "FETCH_HEAD", "ORIG_HEAD", "HEAD"} {
-		fmt.Fprintf(&b, "(allow file-write* (literal %q))\n", filepath.Join(commonDir, name))
-		fmt.Fprintf(&b, "(allow file-write* (literal %q))\n", filepath.Join(commonDir, name+".lock"))
-	}
+	// Worktree-local git bookkeeping only (paths under gitDir already granted).
+	// Do NOT grant common packed-refs or common HEAD — those rewrite shared repo state.
 	b.WriteString("(allow file-write* (subpath \"/private/tmp\"))\n")
 	b.WriteString("(allow file-write* (subpath \"/tmp\"))\n")
 
 	if err := os.MkdirAll(filepath.Dir(profilePath), 0o755); err != nil {
 		return "", err
 	}
+	// Idempotent rewrite: session profile may be 0444 from a prior FreezeSession.
+	_ = os.Chmod(profilePath, 0o644)
 	if err := os.WriteFile(profilePath, []byte(b.String()), 0o644); err != nil {
 		return "", err
 	}

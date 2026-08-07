@@ -924,8 +924,8 @@ func (d *Dispatcher) bindConfinement(
 	if err != nil {
 		return err
 	}
-	if !binding.AgentWrapped || !binding.OSProved {
-		return fmt.Errorf("confinement: binding missing agent wrap or OS proof")
+	if !binding.WrapperInstalled || !binding.OSProved {
+		return fmt.Errorf("confinement: binding missing wrapper install or OS proof")
 	}
 	// Persist receipt under the session dir (outside worktree) when available;
 	// fall back to worktree only for diagnostics (HMAC still authenticates).

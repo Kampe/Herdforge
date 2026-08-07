@@ -95,8 +95,10 @@ func (e *Enforcer) PrepareOS(worktree, sharedRoot, taskRef string, leaseGenerati
 		return nil, fmt.Errorf("confinement: wrap self-check: %w", err)
 	}
 	// Freeze after install so even a coordinator-side bug cannot leave
-	// world-writable integrity material.
-	_ = FreezeSession(SessionPaths{Root: session.Root, Profile: profile, BinDir: binDir, ZdotDir: session.ZdotDir})
+	// world-writable integrity material. Fail closed if freeze cannot apply.
+	if err := FreezeSession(SessionPaths{Root: session.Root, Profile: profile, BinDir: binDir, ZdotDir: session.ZdotDir}); err != nil {
+		return nil, fmt.Errorf("confinement: freeze session: %w", err)
+	}
 	return &PreparedOS{
 		Backend:       osb.Name(),
 		ProfilePath:   profile,
@@ -105,18 +107,6 @@ func (e *Enforcer) PrepareOS(worktree, sharedRoot, taskRef string, leaseGenerati
 		Names:         append([]string(nil), names...),
 		Session:       session,
 	}, nil
-}
-
-// PathEnv returns KEY=VALUE for Herdr tab create --env.
-func (p *PreparedOS) PathEnv(existing string) string {
-	if p == nil || p.BinDir == "" {
-		return ""
-	}
-	path := p.BinDir
-	if existing != "" {
-		path = p.BinDir + string(os.PathListSeparator) + existing
-	}
-	return "PATH=" + path
 }
 
 // TabEnv returns environment pairs for Herdr tab create.
@@ -229,7 +219,9 @@ func (e *Enforcer) BindAndProve(id LaunchIdentity, prep *PreparedOS) (*Binding, 
 	}
 	binding.OSBackend = prep.Backend
 	binding.OSProved = true
-	binding.AgentWrapped = true
+	// WrapperInstalled: session wrappers exist and pass VerifyAgentWrappers.
+	// Does not claim herdr resolved the live agent through PATH (external CLI).
+	binding.WrapperInstalled = true
 	binding.ProfilePath = prep.ProfilePath
 	binding.ProfileDigest = prep.ProfileDigest
 	binding.WrapperBinDir = prep.BinDir
@@ -237,8 +229,8 @@ func (e *Enforcer) BindAndProve(id LaunchIdentity, prep *PreparedOS) (*Binding, 
 	if err := binding.CheckSharedRoot(); err != nil {
 		return nil, err
 	}
-	if !binding.OSProved || !binding.AgentWrapped || binding.WrapperBinDir == "" || binding.ProfileDigest == "" {
-		return nil, fmt.Errorf("confinement: agent wrap incomplete after OS proof")
+	if !binding.OSProved || !binding.WrapperInstalled || binding.WrapperBinDir == "" || binding.ProfileDigest == "" {
+		return nil, fmt.Errorf("confinement: wrapper install incomplete after OS proof")
 	}
 	if err := binding.SignReceipt(e.Issuer); err != nil {
 		return nil, err
@@ -258,40 +250,40 @@ func (e *Enforcer) persist(b *Binding) error {
 	}
 	path := filepath.Join(e.ReceiptDir, fmt.Sprintf("receipt-%s-%d.json", b.ProofNonce, b.CreatedAt.UnixNano()))
 	type line struct {
-		CreatedAt     time.Time `json:"created_at"`
-		Task          string    `json:"task"`
-		Worktree      string    `json:"worktree"`
-		SharedRoot    string    `json:"shared_root,omitempty"`
-		ReceiptDigest string    `json:"receipt_digest"`
-		ReceiptMAC    string    `json:"receipt_mac"`
-		OSBackend     string    `json:"os_backend,omitempty"`
-		OSProved      bool      `json:"os_proved"`
-		AgentWrapped  bool      `json:"agent_wrapped"`
-		ProfilePath   string    `json:"profile_path,omitempty"`
-		ProfileDigest string    `json:"profile_digest,omitempty"`
-		WrapperBinDir string    `json:"wrapper_bin_dir,omitempty"`
-		WrapperNames  []string  `json:"wrapper_names,omitempty"`
-		PolicyDigest  string    `json:"policy_digest"`
-		ProofNonce    string    `json:"proof_nonce"`
-		ProofMAC      string    `json:"proof_mac"`
+		CreatedAt        time.Time `json:"created_at"`
+		Task             string    `json:"task"`
+		Worktree         string    `json:"worktree"`
+		SharedRoot       string    `json:"shared_root,omitempty"`
+		ReceiptDigest    string    `json:"receipt_digest"`
+		ReceiptMAC       string    `json:"receipt_mac"`
+		OSBackend        string    `json:"os_backend,omitempty"`
+		OSProved         bool      `json:"os_proved"`
+		WrapperInstalled bool      `json:"wrapper_installed"`
+		ProfilePath      string    `json:"profile_path,omitempty"`
+		ProfileDigest    string    `json:"profile_digest,omitempty"`
+		WrapperBinDir    string    `json:"wrapper_bin_dir,omitempty"`
+		WrapperNames     []string  `json:"wrapper_names,omitempty"`
+		PolicyDigest     string    `json:"policy_digest"`
+		ProofNonce       string    `json:"proof_nonce"`
+		ProofMAC         string    `json:"proof_mac"`
 	}
 	payload, err := json.Marshal(line{
-		CreatedAt:     b.CreatedAt,
-		Task:          b.Tuple.Task,
-		Worktree:      b.WorktreeRoot,
-		SharedRoot:    b.SharedRoot,
-		ReceiptDigest: b.ReceiptDigest,
-		ReceiptMAC:    b.ReceiptMACHex,
-		OSBackend:     b.OSBackend,
-		OSProved:      b.OSProved,
-		AgentWrapped:  b.AgentWrapped,
-		ProfilePath:   b.ProfilePath,
-		ProfileDigest: b.ProfileDigest,
-		WrapperBinDir: b.WrapperBinDir,
-		WrapperNames:  b.WrapperNames,
-		PolicyDigest:  b.PolicyDigest,
-		ProofNonce:    b.ProofNonce,
-		ProofMAC:      b.ProofMACHex,
+		CreatedAt:        b.CreatedAt,
+		Task:             b.Tuple.Task,
+		Worktree:         b.WorktreeRoot,
+		SharedRoot:       b.SharedRoot,
+		ReceiptDigest:    b.ReceiptDigest,
+		ReceiptMAC:       b.ReceiptMACHex,
+		OSBackend:        b.OSBackend,
+		OSProved:         b.OSProved,
+		WrapperInstalled: b.WrapperInstalled,
+		ProfilePath:      b.ProfilePath,
+		ProfileDigest:    b.ProfileDigest,
+		WrapperBinDir:    b.WrapperBinDir,
+		WrapperNames:     b.WrapperNames,
+		PolicyDigest:     b.PolicyDigest,
+		ProofNonce:       b.ProofNonce,
+		ProofMAC:         b.ProofMACHex,
 	})
 	if err != nil {
 		return err

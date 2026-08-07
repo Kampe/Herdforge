@@ -62,11 +62,20 @@ func TestProductionConfinementPrepareAndBind(t *testing.T) {
 	if prep == nil || !prep.WrapperResolves("codex") || prep.ProfileDigest == "" {
 		t.Fatalf("prep incomplete: %+v", prep)
 	}
-	if prep.Session.Root == "" || strings.Contains(prep.Session.Root, wt) {
-		// session must be under shared, not nested in wt
+	// Session integrity store must sit under shared, never nested in the worktree
+	// write grant (round-5 CRITICAL). Empty body / substring-only checks are not enough:
+	// a path under wt still contains "confine-sessions" if created there.
+	if prep.Session.Root == "" {
+		t.Fatal("empty session root")
 	}
 	if !strings.Contains(prep.Session.Root, "confine-sessions") {
 		t.Fatalf("session not under confine-sessions: %s", prep.Session.Root)
+	}
+	if prep.Session.Root == wt || strings.HasPrefix(prep.Session.Root, wt+string(os.PathSeparator)) {
+		t.Fatalf("session nested inside worktree write grant: session=%s wt=%s", prep.Session.Root, wt)
+	}
+	if !strings.HasPrefix(prep.Session.Root, shared+string(os.PathSeparator)) && prep.Session.Root != shared {
+		t.Fatalf("session not under shared root: session=%s shared=%s", prep.Session.Root, shared)
 	}
 	env, err := prep.TabEnv(wt, "/usr/bin")
 	if err != nil {
