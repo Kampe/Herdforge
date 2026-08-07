@@ -36,6 +36,8 @@ opencode.json
 .herd/worktrees/
 .herd/launch-receipts.jsonl
 **/.herd/launch-receipts.jsonl
+.herd/confine-sessions/
+**/.herd/confine-sessions/
 
 # compiled binaries must not be tracked
 /herd

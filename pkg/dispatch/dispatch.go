@@ -939,8 +939,9 @@ func (d *Dispatcher) bindConfinement(
 	if err := os.MkdirAll(filepath.Dir(receiptPath), 0o755); err != nil {
 		return err
 	}
-	// Session dir may be frozen 0555; temporarily allow write for the receipt.
+	// Thaw prior freeze (dir 0755 + file 0444) so same-lease relaunch can rewrite.
 	_ = os.Chmod(filepath.Dir(receiptPath), 0o755)
+	_ = os.Chmod(receiptPath, 0o644)
 	raw, err := binding.MarshalReceipt()
 	if err != nil {
 		return err

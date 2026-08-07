@@ -125,7 +125,7 @@ func (p *PreparedOS) TabEnv(worktree, existingPATH string) ([]string, error) {
 	if err := os.MkdirAll(tmpDir, 0o755); err != nil {
 		return nil, err
 	}
-	// Session zdot may have been chmod'd 0555; reopen write briefly for rc install.
+	// Session zdot files may be 0444 from FreezeSession; thaw then rewrite.
 	_ = os.Chmod(p.Session.ZdotDir, 0o755)
 	rc := "# FAC-190 confinement zdot — keep wrapper first on PATH\n" +
 		"export PATH=" + shellSingleArg(p.BinDir) + ":\"$PATH\"\n" +
@@ -134,11 +134,13 @@ func (p *PreparedOS) TabEnv(worktree, existingPATH string) ([]string, error) {
 		"export TEMP=" + shellSingleArg(tmpDir) + "\n"
 	for _, name := range []string{".zshrc", ".zprofile", ".zshenv"} {
 		path := filepath.Join(p.Session.ZdotDir, name)
+		if err := thawFile(path, 0o644); err != nil {
+			return nil, err
+		}
 		if err := os.WriteFile(path, []byte(rc), 0o644); err != nil {
 			return nil, err
 		}
-		// File non-writable; directory stays 0755 so coordinator cleanup works.
-		// Agent still cannot write here — session dir is outside worktree grant.
+		// Re-freeze; agent still cannot write — session dir is outside worktree grant.
 		_ = os.Chmod(path, 0o444)
 	}
 	return []string{
