@@ -48,7 +48,12 @@ func ProductionEnforcer() (*Enforcer, error) {
 // PrepareOS installs profile+wrappers into a coordinator-owned session
 // directory outside the worktree, proves denials (including rewrite of the
 // session profile), and freezes session modes.
-func (e *Enforcer) PrepareOS(worktree, sharedRoot, taskRef string, leaseGeneration int64, branch, provider, realAgent string) (*PreparedOS, error) {
+//
+// harness is the herdr agent-start kind (production: "pi") — a PATH wrapper
+// with that name MUST be installed or sandbox-exec never wraps the agent.
+// realAgent is LookPath'd when not absolute; extraNames may add provider/argv0
+// aliases for non-production experiments.
+func (e *Enforcer) PrepareOS(worktree, sharedRoot, taskRef string, leaseGeneration int64, branch, harness, realAgent string, extraNames ...string) (*PreparedOS, error) {
 	if e == nil || e.Issuer == nil {
 		return nil, ErrUnauthenticated
 	}
@@ -60,9 +65,13 @@ func (e *Enforcer) PrepareOS(worktree, sharedRoot, taskRef string, leaseGenerati
 			return nil, err
 		}
 	}
-	names := WrapperNames(provider, realAgent)
+	parts := append([]string{harness, realAgent}, extraNames...)
+	names := WrapperNames(parts...)
 	if len(names) == 0 {
-		return nil, fmt.Errorf("confinement: agent wrapper names required (provider and/or argv0)")
+		return nil, fmt.Errorf("confinement: agent wrapper names required (harness and/or real agent)")
+	}
+	if strings.TrimSpace(harness) != "" && !containsString(names, filepath.Base(strings.TrimSpace(harness))) {
+		return nil, fmt.Errorf("confinement: harness wrapper %q missing from install set %v", harness, names)
 	}
 	session, err := NewSessionPaths(sharedRoot, taskRef, leaseGeneration)
 	if err != nil {
@@ -162,6 +171,16 @@ func (p *PreparedOS) WrapperResolves(name string) bool {
 	}
 	_, err := os.Stat(filepath.Join(p.BinDir, filepath.Base(name)))
 	return err == nil
+}
+
+func containsString(ss []string, want string) bool {
+	want = strings.TrimSpace(want)
+	for _, s := range ss {
+		if s == want {
+			return true
+		}
+	}
+	return false
 }
 
 // BindAndProve authenticates the worktree and attaches PreparedOS proof.

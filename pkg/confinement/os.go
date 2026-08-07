@@ -385,9 +385,10 @@ func (d DarwinSeatbelt) ProveWriteDenials(worktree, sharedRoot, profilePath stri
 			}
 		}
 
-		// HIGH: object store must not be unlinkable/destroyable. Grant is
-		// create+data only — file-write* would allow rm -rf objects.
-		if err := d.proveObjectStoreHardening(profilePath, absWT, commonDir); err != nil {
+		// Object store grant shape is checked from profile text only.
+		// Never run rm/rm -rf against the live shared objects/ in the hot
+		// path (ae70b18 quarantine policy). Live unlink probes live in tests.
+		if err := d.proveObjectStoreGrantShape(profilePath, commonDir); err != nil {
 			return err
 		}
 	}
@@ -416,68 +417,25 @@ func (d DarwinSeatbelt) ProveWriteDenials(worktree, sharedRoot, profilePath stri
 	return nil
 }
 
-// proveObjectStoreHardening proves that create+data grants do not allow
-// destroying or overwriting existing shared objects (cross-lane data loss).
-func (d DarwinSeatbelt) proveObjectStoreHardening(profile, worktree, commonDir string) error {
-	// Seed a real object outside the sandbox, then attempt confined destruction.
-	seed := []byte("fac190-object-store-hardening-seed\n")
-	cmd := exec.Command("git", "-C", worktree, "hash-object", "-w", "--stdin")
-	cmd.Stdin = strings.NewReader(string(seed))
-	out, err := cmd.CombinedOutput()
+// proveObjectStoreGrantShape is a non-destructive hot-path check: the profile
+// must grant objects as create+data only, never file-write* (which includes
+// unlink and would allow destroying the shared store). Live rm/rm -rf probes
+// are restricted to Darwin unit tests against disposable fixtures.
+func (d DarwinSeatbelt) proveObjectStoreGrantShape(profilePath, commonDir string) error {
+	body, err := os.ReadFile(profilePath)
 	if err != nil {
-		return fmt.Errorf("%w: seed object for hardening probe: %v (%s)", ErrOSProbeFailed, err, strings.TrimSpace(string(out)))
+		return fmt.Errorf("%w: read profile: %v", ErrOSProbeFailed, err)
 	}
-	oid := strings.TrimSpace(string(out))
-	if len(oid) < 40 {
-		return fmt.Errorf("%w: seed object oid missing", ErrOSProbeFailed)
+	s := string(body)
+	objects := filepath.Join(commonDir, "objects")
+	if strings.Contains(s, "(allow file-write* (subpath \""+objects+"\"))") {
+		return fmt.Errorf("%w: profile grants file-write* on objects (unlink/destroy surface)", ErrOSProbeFailed)
 	}
-	obj := filepath.Join(commonDir, "objects", oid[:2], oid[2:])
-	before, err := os.ReadFile(obj)
-	if err != nil {
-		return fmt.Errorf("%w: seed object unreadable: %v", ErrOSProbeFailed, err)
+	if !strings.Contains(s, "(allow file-write-create (subpath \""+objects+"\"))") {
+		return fmt.Errorf("%w: profile missing file-write-create on objects", ErrOSProbeFailed)
 	}
-
-	// Unlink of a single existing object must fail.
-	rm := exec.Command("/usr/bin/sandbox-exec", "-f", profile, "/bin/rm", "-f", obj)
-	rm.Dir = worktree
-	_ = rm.Run()
-	if _, err := os.Stat(obj); err != nil {
-		// Best-effort restore so other probes still have a usable store.
-		_ = os.MkdirAll(filepath.Dir(obj), 0o755)
-		_ = os.WriteFile(obj, before, 0o644)
-		return fmt.Errorf("%w: confined process deleted shared object", ErrOSProbeFailed)
-	}
-
-	// Tree wipe must fail.
-	objectsRoot := filepath.Join(commonDir, "objects")
-	rmrf := exec.Command("/usr/bin/sandbox-exec", "-f", profile, "/bin/rm", "-rf", objectsRoot)
-	rmrf.Dir = worktree
-	_ = rmrf.Run()
-	if st, err := os.Stat(objectsRoot); err != nil || !st.IsDir() {
-		return fmt.Errorf("%w: confined process destroyed object store", ErrOSProbeFailed)
-	}
-	if _, err := os.Stat(obj); err != nil {
-		_ = os.MkdirAll(filepath.Dir(obj), 0o755)
-		_ = os.WriteFile(obj, before, 0o644)
-		return fmt.Errorf("%w: confined process deleted objects under store", ErrOSProbeFailed)
-	}
-
-	// Overwrite of an existing object must fail (create+data, not file-write*).
-	marker := "fac190-corrupt-object\n"
-	if err := d.writeUnder(profile, worktree, obj, marker); err == nil {
-		after, rerr := os.ReadFile(obj)
-		if rerr == nil && strings.Contains(string(after), marker) {
-			_ = os.WriteFile(obj, before, 0o644)
-			return fmt.Errorf("%w: confined process overwrote shared object", ErrOSProbeFailed)
-		}
-	}
-	after, err := os.ReadFile(obj)
-	if err != nil {
-		return fmt.Errorf("%w: object missing after overwrite probe: %v", ErrOSProbeFailed, err)
-	}
-	if string(after) != string(before) {
-		_ = os.WriteFile(obj, before, 0o644)
-		return fmt.Errorf("%w: shared object content mutated under confinement", ErrOSProbeFailed)
+	if !strings.Contains(s, "(allow file-write-data (subpath \""+objects+"\"))") {
+		return fmt.Errorf("%w: profile missing file-write-data on objects", ErrOSProbeFailed)
 	}
 	return nil
 }
@@ -577,12 +535,24 @@ func (d DarwinSeatbelt) InstallAgentWrappers(session SessionPaths, profilePath s
 	if err != nil {
 		return "", err
 	}
-	script := wrapperScript(absProfile, digest, real, false)
 	for _, name := range names {
 		name = strings.TrimSpace(name)
 		if name == "" || strings.Contains(name, string(filepath.Separator)) {
 			return "", fmt.Errorf("confinement: invalid wrapper name %q", name)
 		}
+		// Resolve each wrapper name to its own real binary so a `pi` PATH
+		// intercept runs the real pi (not a provider-shaped argv0).
+		target := real
+		if filepath.Base(real) != name {
+			if found, lerr := exec.LookPath(name); lerr == nil {
+				if resolvedName, rerr := realPath(found); rerr == nil {
+					target = resolvedName
+				} else {
+					target = found
+				}
+			}
+		}
+		script := wrapperScript(absProfile, digest, target, false)
 		path := filepath.Join(session.BinDir, name)
 		// Thaw prior FreezeSession (0555) so same-lease relaunch can rewrite.
 		_ = os.Chmod(path, 0o755)
@@ -660,9 +630,10 @@ func VerifyAgentWrappers(binDir, profilePath, profileDigest string, names []stri
 }
 
 // WrapperNames returns the distinct PATH entry names that must intercept the
-// live agent: argv[0] basename (shell executable) and provider (herdr kind),
-// when they differ (e.g. provider=ollama/lazer → argv0=opencode).
-func WrapperNames(provider, argv0 string) []string {
+// live agent. Production launches use herdr kind = Decision.Harness ("pi");
+// that name MUST be present or sandbox-exec never wraps the process.
+// Extra names (provider, argv0) may also be installed for non-pi experiments.
+func WrapperNames(parts ...string) []string {
 	seen := map[string]struct{}{}
 	var out []string
 	add := func(s string) {
@@ -680,8 +651,9 @@ func WrapperNames(provider, argv0 string) []string {
 		seen[base] = struct{}{}
 		out = append(out, base)
 	}
-	add(argv0)
-	add(provider)
+	for _, p := range parts {
+		add(p)
+	}
 	return out
 }
 
@@ -727,8 +699,8 @@ func writeSeatbeltProfile(worktree, gitDir, commonDir, branch, profilePath strin
 	// Common object store: create + write-data only. file-write* includes
 	// file-write-unlink and would let a confined agent `rm -rf objects`
 	// (destroy every lane's unpushed work). Create/data still allows
-	// `git hash-object -w` while denying unlink and overwrite of existing
-	// objects (proved live in ProveWriteDenials).
+	// `git hash-object -w`. Unlink denial is proved in Darwin unit tests
+	// (not via rm against the live store on the launch hot path).
 	objects := filepath.Join(commonDir, "objects")
 	fmt.Fprintf(&b, "(allow file-write-create (subpath %q))\n", objects)
 	fmt.Fprintf(&b, "(allow file-write-data (subpath %q))\n", objects)
@@ -745,6 +717,24 @@ func writeSeatbeltProfile(worktree, gitDir, commonDir, branch, profilePath strin
 	// herd anchor/salvage refs are namespaced and not cross-lane branch tips.
 	fmt.Fprintf(&b, "(allow file-write* (subpath %q))\n", filepath.Join(commonDir, "refs", "herd"))
 	fmt.Fprintf(&b, "(allow file-write* (subpath %q))\n", filepath.Join(commonDir, "logs", "refs", "herd"))
+	// Agent home state — required once the pi wrapper actually applies the
+	// profile. Without these, coding agents cannot write ~/.claude, ~/.codex,
+	// shell snapshots, or opencode state (Operation not permitted).
+	if home, herr := os.UserHomeDir(); herr == nil && strings.TrimSpace(home) != "" {
+		home, _ = filepath.Abs(home)
+		for _, rel := range []string{
+			".claude",
+			".codex",
+			".local/share/opencode",
+			".local/share/pi",
+			".config",
+			".cache",
+		} {
+			fmt.Fprintf(&b, "(allow file-write* (subpath %q))\n", filepath.Join(home, filepath.FromSlash(rel)))
+		}
+		// Claude Code top-level config is a file, not under .claude/.
+		fmt.Fprintf(&b, "(allow file-write* (literal %q))\n", filepath.Join(home, ".claude.json"))
+	}
 	// Worktree-local git bookkeeping only (paths under gitDir already granted).
 	// Do NOT grant common packed-refs or common HEAD — those rewrite shared repo state.
 	// Do NOT grant file-write* on common objects (unlink/destroy surface).

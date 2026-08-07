@@ -828,8 +828,11 @@ func (d *Dispatcher) prepareConfinementOS(
 	request launch.Request,
 	wtInfo *worktree.WorktreeInfo,
 ) (*confinement.Enforcer, *confinement.PreparedOS, error) {
-	if request.Decision == nil || len(request.Decision.Argv) == 0 {
-		return nil, nil, fmt.Errorf("confinement: compiled launch argv is required")
+	if request.Decision == nil {
+		return nil, nil, fmt.Errorf("confinement: launch decision is required")
+	}
+	if strings.TrimSpace(request.Decision.Harness) == "" && len(request.Decision.Argv) == 0 {
+		return nil, nil, fmt.Errorf("confinement: decision harness or argv is required")
 	}
 	enf, err := d.confinementEnforcer(wtInfo.Path)
 	if err != nil {
@@ -845,19 +848,36 @@ func (d *Dispatcher) prepareConfinementOS(
 		taskRef = "unknown-task"
 	}
 	branch := wtInfo.Branch
-	// Pass provider + argv[0] so wrappers cover both herdr kind names and the
-	// shell executable (e.g. provider=ollama/lazer → argv0=opencode).
+	// Production starts herdr kind = Decision.Harness ("pi"). A PATH wrapper
+	// with that exact name is required or sandbox-exec never wraps the agent.
+	harness := strings.TrimSpace(request.Decision.Harness)
+	if harness == "" {
+		return nil, nil, fmt.Errorf("confinement: decision harness is required (production launches pi)")
+	}
+	if harness != router.PiHarness {
+		return nil, nil, fmt.Errorf("confinement: harness %q unsupported; production requires %q", harness, router.PiHarness)
+	}
+	realAgent := harness
+	if len(request.Decision.HarnessArgv) > 0 && strings.TrimSpace(request.Decision.HarnessArgv[0]) != "" {
+		realAgent = request.Decision.HarnessArgv[0]
+	}
+	// Optional extras (provider/argv0) for diagnostics only — harness is mandatory.
 	prep, err := enf.PrepareOS(
 		wtInfo.Path,
 		d.Worktree.RepoRoot(),
 		taskRef,
 		leaseGen,
 		branch,
+		harness,
+		realAgent,
 		request.Decision.Provider,
 		request.Decision.Argv[0],
 	)
 	if err != nil {
 		return nil, nil, err
+	}
+	if !prep.WrapperResolves(harness) {
+		return nil, nil, fmt.Errorf("confinement: harness wrapper %q not installed (agent would not be sandboxed)", harness)
 	}
 	return enf, prep, nil
 }
@@ -878,8 +898,8 @@ func (d *Dispatcher) bindConfinement(
 	if d == nil || enf == nil || task == nil || lane == nil || wtInfo == nil || result == nil || tab == nil {
 		return fmt.Errorf("confinement: incomplete launch context")
 	}
-	if request.Decision == nil || len(request.Decision.Argv) == 0 {
-		return fmt.Errorf("confinement: compiled launch argv is required")
+	if request.Decision == nil {
+		return fmt.Errorf("confinement: launch decision is required")
 	}
 	leaseGen := result.LeaseGeneration
 	if leaseGen <= 0 {
@@ -888,13 +908,12 @@ func (d *Dispatcher) bindConfinement(
 	if leaseGen <= 0 {
 		return fmt.Errorf("confinement: lease generation is required")
 	}
+	// Session generation MUST be the one PrepareToolChildLifecycle reserved for
+	// the live agent. Do not mint a second durable generation here — that
+	// burned N+1 into the AuthTuple while the agent ran under N.
 	sessionGen := request.SessionGeneration
 	if sessionGen <= 0 {
-		var err error
-		sessionGen, err = toolchild.NextSessionGeneration(request.Repository)
-		if err != nil {
-			return fmt.Errorf("confinement session generation: %w", err)
-		}
+		return fmt.Errorf("confinement: session generation required after tool-child lifecycle prep")
 	}
 	processIdentity := strings.TrimSpace(request.ProcessIdentity)
 	if processIdentity == "" {
@@ -904,7 +923,14 @@ func (d *Dispatcher) bindConfinement(
 	if session == "" {
 		session = tabLabel
 	}
-	argv := append([]string(nil), request.Decision.Argv...)
+	// Prefer harness argv (what AgentStart actually runs); fall back to Argv.
+	argv := append([]string(nil), request.Decision.HarnessArgv...)
+	if len(argv) == 0 {
+		argv = append(argv, request.Decision.Argv...)
+	}
+	if len(argv) == 0 {
+		return fmt.Errorf("confinement: compiled harness argv is required")
+	}
 	id := confinement.LaunchIdentity{
 		Repository:        request.Repository,
 		Task:              task.Ref,
@@ -918,7 +944,7 @@ func (d *Dispatcher) bindConfinement(
 		Argv:              argv,
 		WorktreeRoot:      wtInfo.Path,
 		SharedRoot:        d.Worktree.RepoRoot(),
-		AgentKind:         request.Decision.Provider,
+		AgentKind:         request.Decision.Harness,
 	}
 	binding, err := enf.BindAndProve(id, prep)
 	if err != nil {
@@ -1064,8 +1090,15 @@ func (d *Dispatcher) launch(
 	}
 	result.TabID = tab.ID
 	result.AgentName = tabLabel
-	if err := herdr.PrepareToolChildLifecycle(tab.ID, tab.Pane.ID, request, tabLabel); err != nil {
+	// Pointer so SessionGeneration reserved here is visible to bindConfinement.
+	if err := herdr.PrepareToolChildLifecycle(tab.ID, tab.Pane.ID, &request, tabLabel); err != nil {
 		return &launchFailure{Reason: "tool_child_lifecycle_failed", Err: closeTabLocal(h, tab.ID, "tool_child_lifecycle_failed", err)}
+	}
+	if request.SessionGeneration <= 0 {
+		return &launchFailure{
+			Reason: "tool_child_lifecycle_failed",
+			Err:    closeTabLocal(h, tab.ID, "tool_child_lifecycle_failed", fmt.Errorf("tool-child lifecycle left session generation unset")),
+		}
 	}
 	if err := d.record(ctx, StepRecord{
 		TicketRef: task.Ref,
