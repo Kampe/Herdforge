@@ -906,7 +906,7 @@ func TabCreate(opts TabCreateOptions) (*TabInfo, error) {
 	// FAC-172: every HostedUID path proves shell/tree UID after create — not
 	// flag-and-trust-daemon. Proof failure kills bound PIDs and closes the tab.
 	if opts.HostedUID > 0 {
-		if err := AssertHostedPaneUID(tab.Pane.ID, opts.HostedUID); err != nil {
+		if _, err := AssertHostedPaneUID(tab.Pane.ID, opts.HostedUID); err != nil {
 			return nil, FailHostedIsolationProof(tab.Pane.ID, tab.ID,
 				fmt.Errorf("herdr tab create: hosted uid proof failed: %w", err))
 		}
@@ -1056,17 +1056,19 @@ func AgentStartWithDecision(name, kind, paneID string, req launch.Request) error
 		_ = launch.RecordRejected(req, nil, err.Error())
 		return err
 	}
-	// FAC-172: prove shell/tree and exact routed agent UID BEFORE binding
-	// tool-child inventory — a wrong-UID process must never become durable owner.
+	// FAC-172: prove shell/tree and exact routed agent credentials BEFORE
+	// binding tool-child inventory — a wrong-UID process must never become
+	// durable owner. Agent proof polls readiness like bindToolChildLifecycle.
 	if builderUID > 0 {
 		tabID := tabForPane(paneID)
-		if err := AssertHostedPaneUID(paneID, builderUID); err != nil {
+		wantGID, err := AssertHostedPaneUID(paneID, builderUID)
+		if err != nil {
 			proof := FailHostedIsolationProofWithLifecycle(paneID, tabID, lc,
 				fmt.Errorf("herdr agent start: hosted uid proof failed: %w", err))
 			_ = launch.RecordRejected(req, nil, proof.Error())
 			return proof
 		}
-		if err := AssertAgentHostedAsBuilder(name, builderUID, kind, req.Decision.HarnessArgv); err != nil {
+		if err := AssertAgentHostedAsBuilder(name, builderUID, wantGID, kind, req.Decision.HarnessArgv); err != nil {
 			proof := FailHostedIsolationProofWithLifecycle(paneID, tabID, lc,
 				fmt.Errorf("herdr agent start: agent descendant uid proof failed: %w", err))
 			_ = launch.RecordRejected(req, nil, proof.Error())

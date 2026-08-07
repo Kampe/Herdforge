@@ -30,20 +30,26 @@ func stubHostedTreeSeams(t *testing.T, uid, gid int) {
 	pinBuilderGID(t, gid)
 	ResetHostedUIDCapabilityCache()
 	t.Cleanup(ResetHostedUIDCapabilityCache)
-	oldUID, oldGID := processUIDOf, processGIDOf
+	oldCreds := processCredsOf
 	oldTok, oldPG, oldKids := readStartTok, listPGIDMembers, listChildPIDs
 	oldExists := processExists
+	oldReadySleep, oldReadyTries := agentReadySleep, agentReadyTries
 	t.Cleanup(func() {
-		processUIDOf, processGIDOf = oldUID, oldGID
+		processCredsOf = oldCreds
 		readStartTok, listPGIDMembers, listChildPIDs = oldTok, oldPG, oldKids
 		processExists = oldExists
+		agentReadySleep, agentReadyTries = oldReadySleep, oldReadyTries
 	})
-	processUIDOf = func(int) (int, error) { return uid, nil }
-	processGIDOf = func(int) (int, error) { return gid, nil }
+	processCredsOf = func(int) (processCreds, error) {
+		return processCreds{RUID: uid, EUID: uid, RGID: gid, EGID: gid}, nil
+	}
 	readStartTok = func(pid int) (string, error) { return fmt.Sprintf("tok-%d", pid), nil }
 	listPGIDMembers = func(int) ([]int, error) { return nil, nil }
 	listChildPIDs = func(int) ([]int, error) { return nil, nil }
 	processExists = func(int) bool { return true }
+	// Unit tests do not wait on async agent inventory unless they opt in.
+	agentReadyTries = 1
+	agentReadySleep = func() {}
 }
 
 func TestNegotiateHostedUID_CurrentFleetBlocked(t *testing.T) {
@@ -173,6 +179,7 @@ func TestTabCreateForTask_BlocksWithoutHostedUIDCapability(t *testing.T) {
 	me := os.Getuid()
 	t.Setenv(EnvBuilderUID, fmt.Sprintf("%d", me+1))
 	t.Setenv(EnvRequireHostedUID, "")
+	wt := t.TempDir()
 	defer func(old func(args ...string) (string, error)) { runHerdr = old }(runHerdr)
 	runHerdr = func(args ...string) (string, error) {
 		if strings.Contains(strings.Join(args, " "), "capabilities") {
@@ -181,7 +188,7 @@ func TestTabCreateForTask_BlocksWithoutHostedUIDCapability(t *testing.T) {
 		t.Fatalf("must not create tab without capability; args=%v", args)
 		return "", nil
 	}
-	_, err := TabCreateForTask("w1", "task-fac-1", "/tmp/wt", true)
+	_, err := TabCreateForTask("w1", "task-fac-1", wt, true)
 	if err == nil || !errorsIsHostedBlocked(err) {
 		t.Fatalf("want FAC-172 BLOCKED, got %v", err)
 	}
@@ -190,13 +197,14 @@ func TestTabCreateForTask_BlocksWithoutHostedUIDCapability(t *testing.T) {
 func TestTabCreateForTask_WithoutIsolationEnvStillWorks(t *testing.T) {
 	t.Setenv(EnvBuilderUID, "")
 	t.Setenv(EnvRequireHostedUID, "")
+	wt := t.TempDir()
 	defer func(old func(args ...string) (string, error)) { runHerdr = old }(runHerdr)
 	var got []string
 	runHerdr = func(args ...string) (string, error) {
 		got = append([]string{}, args...)
 		return `{"result":{"tab":{"tab_id":"t1","label":"task-fac-1"},"root_pane":{"pane_id":"p1","tab_id":"t1"}}}`, nil
 	}
-	tab, err := TabCreateForTask("wABC", "task-fac-1", "/repo/.herd/worktrees/fac-1", true)
+	tab, err := TabCreateForTask("wABC", "task-fac-1", wt, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -310,20 +318,20 @@ func TestAssertHostedPaneUID_RejectsWrongShellUID(t *testing.T) {
 	runHerdr = func(args ...string) (string, error) {
 		return fmt.Sprintf(`{"result":{"process_info":{"pane_id":"p1","shell_pid":%d,"foreground_processes":[{"pid":%d}]}}}`, me, me), nil
 	}
-	err := AssertHostedPaneUID("p1", os.Getuid()+999)
-	if err == nil || !strings.Contains(err.Error(), "CLI setuid is not isolation") {
-		t.Fatalf("want negative-control wording, got: %v", err)
+	_, err := AssertHostedPaneUID("p1", os.Getuid()+999)
+	if err == nil || !strings.Contains(err.Error(), "BuilderUID") {
+		t.Fatalf("want BuilderUID mismatch, got: %v", err)
 	}
 }
 
 func TestAssertHostedPaneUID_RejectsWrongGID(t *testing.T) {
 	defer func(old func(args ...string) (string, error)) { runHerdr = old }(runHerdr)
 	stubHostedTreeSeams(t, 501, 42)
-	processGIDOf = func(pid int) (int, error) {
+	processCredsOf = func(pid int) (processCreds, error) {
 		if pid == 900002 {
-			return 99, nil // wrong gid on descendant
+			return processCreds{RUID: 501, EUID: 501, RGID: 99, EGID: 99}, nil
 		}
-		return 42, nil
+		return processCreds{RUID: 501, EUID: 501, RGID: 42, EGID: 42}, nil
 	}
 	listChildPIDs = func(pid int) ([]int, error) {
 		if pid == 900001 {
@@ -334,7 +342,7 @@ func TestAssertHostedPaneUID_RejectsWrongGID(t *testing.T) {
 	runHerdr = func(args ...string) (string, error) {
 		return `{"result":{"process_info":{"pane_id":"p1","shell_pid":900001,"foreground_processes":[{"pid":900001}]}}}`, nil
 	}
-	if err := AssertHostedPaneUID("p1", 501); err == nil || !strings.Contains(err.Error(), "gid=") {
+	if _, err := AssertHostedPaneUID("p1", 501); err == nil || !strings.Contains(err.Error(), "gid") {
 		t.Fatalf("want gid mismatch, got %v", err)
 	}
 }
@@ -359,16 +367,17 @@ func TestAssertHostedPaneUID_CoversDescendantsAndPGID(t *testing.T) {
 	runHerdr = func(args ...string) (string, error) {
 		return fmt.Sprintf(`{"result":{"process_info":{"pane_id":"p1","shell_pid":%d,"foreground_process_group_id":%d,"foreground_processes":[{"pid":%d},{"pid":%d}]}}}`, shell, shell, shell, child), nil
 	}
-	if err := AssertHostedPaneUID("p1", wantUID); err != nil {
+	if _, err := AssertHostedPaneUID("p1", wantUID); err != nil {
 		t.Fatal(err)
 	}
-	processUIDOf = func(pid int) (int, error) {
+	processCredsOf = func(pid int) (processCreds, error) {
+		u := wantUID
 		if pid == bg {
-			return wantUID + 1, nil
+			u = wantUID + 1
 		}
-		return wantUID, nil
+		return processCreds{RUID: u, EUID: u, RGID: wantGID, EGID: wantGID}, nil
 	}
-	if err := AssertHostedPaneUID("p1", wantUID); err == nil {
+	if _, err := AssertHostedPaneUID("p1", wantUID); err == nil {
 		t.Fatal("background descendant wrong uid must fail")
 	}
 }
@@ -380,7 +389,7 @@ func TestAssertHostedPaneUID_RejectsMissingStartToken(t *testing.T) {
 	runHerdr = func(args ...string) (string, error) {
 		return `{"result":{"process_info":{"pane_id":"p1","shell_pid":900001,"foreground_processes":[{"pid":900001}]}}}`, nil
 	}
-	if err := AssertHostedPaneUID("p1", 501); err == nil {
+	if _, err := AssertHostedPaneUID("p1", 501); err == nil {
 		t.Fatal("missing start token must fail lineage proof")
 	}
 }
@@ -620,26 +629,28 @@ func TestAgentStartWithDecision_HostedUIDProofFailsBeforeBind(t *testing.T) {
 	pinBuilderGID(t, 42)
 
 	defer func(old func(args ...string) (string, error)) { runHerdr = old }(runHerdr)
-	defer func(old func(int) (int, error)) { processUIDOf = old }(processUIDOf)
-	defer func(old func(int) (int, error)) { processGIDOf = old }(processGIDOf)
+	defer func(old func(int) (processCreds, error)) { processCredsOf = old }(processCredsOf)
 	defer func(old func(int) (string, error)) { readStartTok = old }(readStartTok)
 	defer func(old func(int) ([]int, error)) { listPGIDMembers = old }(listPGIDMembers)
 	defer func(old func(int) ([]int, error)) { listChildPIDs = old }(listChildPIDs)
 	defer func(old func(int, syscall.Signal) error) { signalExact = old }(signalExact)
 	defer func(old func()) { sleepBrief = old }(sleepBrief)
 	defer func(old func() int) { osGetpid = old }(osGetpid)
-	// Short-circuit the 500ms agentStartProcess sleep.
-	oldSleep := sleepBrief
-	_ = oldSleep
-	// agentStartProcess uses time.Sleep directly — accept ~500ms.
+	defer func(old int) { agentReadyTries = old }(agentReadyTries)
+	defer func(old func()) { agentReadySleep = old }(agentReadySleep)
 
 	osGetpid = func() int { return 1 }
 	sleepBrief = func() {}
+	agentReadyTries = 1
+	agentReadySleep = func() {}
 	listPGIDMembers = func(int) ([]int, error) { return nil, nil }
 	listChildPIDs = func(int) ([]int, error) { return nil, nil }
 	readStartTok = func(pid int) (string, error) { return "tok", nil }
-	processUIDOf = func(pid int) (int, error) { return os.Getuid(), nil } // wrong: coordinator
-	processGIDOf = func(pid int) (int, error) { return 42, nil }
+	// Wrong: coordinator real+effective — isolation proof must fail.
+	me := os.Getuid()
+	processCredsOf = func(pid int) (processCreds, error) {
+		return processCreds{RUID: me, EUID: me, RGID: 42, EGID: 42}, nil
+	}
 	signalExact = func(pid int, sig syscall.Signal) error { return nil }
 
 	d, err := testLaunchRouter(t).Decide(router.LaunchRequest{
@@ -704,11 +715,12 @@ func TestAgentStartWithDecision_HostedUIDProofFailsBeforeBind(t *testing.T) {
 	if err := PrepareToolChildLifecycle("t1", "p1", req, "worker"); err != nil {
 		t.Fatal(err)
 	}
-	err = AgentStartWithDecision("worker", testWorkerProvider, "p1", req)
+	// Kind must match decision harness (pi on current fleet).
+	err = AgentStartWithDecision("worker", req.Decision.Harness, "p1", req)
 	if err == nil {
 		t.Fatal("expected hosted-uid proof failure")
 	}
-	if !strings.Contains(err.Error(), "hosted uid") && !strings.Contains(err.Error(), "BuilderUID") && !strings.Contains(err.Error(), "proof") {
+	if !strings.Contains(err.Error(), "hosted uid") && !strings.Contains(err.Error(), "BuilderUID") && !strings.Contains(err.Error(), "proof") && !strings.Contains(err.Error(), "seteuid") {
 		t.Fatalf("want isolation proof failure, got %v", err)
 	}
 	if lc.Bound() {
@@ -971,19 +983,148 @@ func TestAssertAgentHostedAsBuilder_ExactRoutedOwner(t *testing.T) {
 		}
 		return "", fmt.Errorf("unexpected %v", args)
 	}
-	if err := AssertAgentHostedAsBuilder("worker", builder, "codex", argv); err != nil {
+	if err := AssertAgentHostedAsBuilder("worker", builder, gid, "codex", argv); err != nil {
 		t.Fatal(err)
 	}
-	processUIDOf = func(pid int) (int, error) {
+	processCredsOf = func(pid int) (processCreds, error) {
+		u := builder
 		if pid == 501 {
-			return builder + 1, nil
+			u = builder + 1
 		}
-		return builder, nil
+		return processCreds{RUID: u, EUID: u, RGID: gid, EGID: gid}, nil
 	}
-	if err := AssertAgentHostedAsBuilder("worker", builder, "codex", argv); err == nil {
+	if err := AssertAgentHostedAsBuilder("worker", builder, gid, "codex", argv); err == nil {
 		t.Fatal("wrong agent uid must fail")
 	}
 }
+
+
+func TestAssertHostedPaneUID_RejectsSeteuidOnly(t *testing.T) {
+	// HIGH: ruid remains coordinator while euid is builder — not isolation.
+	defer func(old func(args ...string) (string, error)) { runHerdr = old }(runHerdr)
+	coord := os.Getuid()
+	builderUID := coord + 17
+	if builderUID == coord {
+		t.Fatal("fixture builder uid must differ from coordinator")
+	}
+	pinBuilderGID(t, 42)
+	oldCreds, oldTok, oldPG, oldKids, oldExists := processCredsOf, readStartTok, listPGIDMembers, listChildPIDs, processExists
+	t.Cleanup(func() {
+		processCredsOf, readStartTok, listPGIDMembers, listChildPIDs, processExists = oldCreds, oldTok, oldPG, oldKids, oldExists
+	})
+	readStartTok = func(int) (string, error) { return "tok", nil }
+	listPGIDMembers = func(int) ([]int, error) { return nil, nil }
+	listChildPIDs = func(int) ([]int, error) { return nil, nil }
+	processExists = func(int) bool { return true }
+	processCredsOf = func(int) (processCreds, error) {
+		// seteuid(builder) without setuid: euid matches builder, ruid stays coordinator.
+		return processCreds{RUID: coord, EUID: builderUID, RGID: 42, EGID: 42}, nil
+	}
+	runHerdr = func(args ...string) (string, error) {
+		return `{"result":{"process_info":{"pane_id":"p1","shell_pid":900001,"foreground_processes":[{"pid":900001}]}}}`, nil
+	}
+	_, err := AssertHostedPaneUID("p1", builderUID)
+	if err == nil {
+		t.Fatal("want seteuid-only rejection")
+	}
+	if !strings.Contains(err.Error(), "seteuid") && !strings.Contains(err.Error(), "ruid=") {
+		t.Fatalf("want ruid/euid mismatch wording, got %v", err)
+	}
+}
+
+func TestAssertAgentHostedAsBuilder_PollsReadiness(t *testing.T) {
+	defer func(old func(args ...string) (string, error)) { runHerdr = old }(runHerdr)
+	defer func(old func(int) (int, error)) { readParent = old }(readParent)
+	builder, gid := 501, 42
+	stubHostedTreeSeams(t, builder, gid)
+	agentReadyTries = 3
+	calls := 0
+	agentReadySleep = func() { calls++ }
+	readParent = func(pid int) (int, error) {
+		if pid == 501 {
+			return 500, nil
+		}
+		return 1, nil
+	}
+	listCalls := 0
+	runHerdr = func(args ...string) (string, error) {
+		if len(args) >= 2 && args[0] == "agent" && args[1] == "list" {
+			listCalls++
+			if listCalls < 3 {
+				return `{"result":{"agents":[]}}`, nil
+			}
+			return `{"result":{"agents":[{"name":"worker","agent":"codex","pane_id":"p1","tab_id":"t1"}]}}`, nil
+		}
+		if len(args) >= 2 && args[0] == "pane" && args[1] == "process-info" {
+			return `{"result":{"process_info":{"pane_id":"p1","shell_pid":499,"foreground_processes":[
+				{"pid":500,"name":"node","argv":["node","/opt/homebrew/bin/codex"]},
+				{"pid":501,"name":"codex","argv":["codex","--model","x"]}
+			]}}}`, nil
+		}
+		return "", fmt.Errorf("unexpected %v", args)
+	}
+	if err := AssertAgentHostedAsBuilder("worker", builder, gid, "codex", []string{"codex", "--model", "x"}); err != nil {
+		t.Fatal(err)
+	}
+	if listCalls < 3 || calls < 2 {
+		t.Fatalf("expected readiness poll listCalls=%d sleepCalls=%d", listCalls, calls)
+	}
+}
+
+func TestValidateHostedUIDCapability_AgentStartFlagAllowlist(t *testing.T) {
+	// Restored coverage deleted in 7e156f9.
+	cases := []struct {
+		name string
+		cap  HostedUIDCapability
+		ok   bool
+	}{
+		{"uid", HostedUIDCapability{SchemaVersion: 1, HostedProcessUID: true, HostedProcessGID: true, ProcessLineageProof: true, TabCreateUIDFlag: "--uid", AgentStartUIDFlag: "--uid"}, true},
+		{"run-as-uid", HostedUIDCapability{SchemaVersion: 1, HostedProcessUID: true, HostedProcessGID: true, ProcessLineageProof: true, TabCreateUIDFlag: "--run-as-uid"}, true},
+		{"hosted-uid", HostedUIDCapability{SchemaVersion: 1, HostedProcessUID: true, HostedProcessGID: true, ProcessLineageProof: true, TabCreateUIDFlag: "--hosted-uid", AgentStartUIDFlag: "--hosted-uid"}, true},
+		{"bad-agent-flag", HostedUIDCapability{SchemaVersion: 1, HostedProcessUID: true, HostedProcessGID: true, ProcessLineageProof: true, TabCreateUIDFlag: "--uid", AgentStartUIDFlag: "--user"}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateHostedUIDCapability(tc.cap)
+			if tc.ok && err != nil {
+				t.Fatal(err)
+			}
+			if !tc.ok && err == nil {
+				t.Fatal("expected rejection")
+			}
+		})
+	}
+}
+
+func TestAgentStartProcess_AttachesNegotiatedUIDFlag(t *testing.T) {
+	// Wiring lock: agentStartUIDFlagArgs must reach agent start argv.
+	ResetHostedUIDCapabilityCache()
+	t.Cleanup(ResetHostedUIDCapabilityCache)
+	me := os.Getuid()
+	t.Setenv(EnvBuilderUID, fmt.Sprintf("%d", me+1))
+	defer func(old func(args ...string) (string, error)) { runHerdr = old }(runHerdr)
+	var startArgs []string
+	runHerdr = func(args ...string) (string, error) {
+		joined := strings.Join(args, " ")
+		if strings.Contains(joined, "capabilities") {
+			return goodCapJSON(), nil
+		}
+		if len(args) >= 2 && args[0] == "agent" && args[1] == "start" {
+			startArgs = append([]string{}, args...)
+			return `{}`, nil
+		}
+		return "", fmt.Errorf("unexpected %v", args)
+	}
+	// Bypass the 500ms sleep by calling with isolation on.
+	if err := agentStartProcess("worker", "pi", "p1", "--session", "/tmp/s"); err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(startArgs, " ")
+	if !strings.Contains(joined, "--uid") || !strings.Contains(joined, fmt.Sprintf("%d", me+1)) {
+		t.Fatalf("agent start missing negotiated uid flags: %v", startArgs)
+	}
+}
+
 
 func errorsIsHostedBlocked(err error) bool {
 	if err == nil {
