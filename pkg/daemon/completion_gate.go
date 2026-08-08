@@ -589,7 +589,7 @@ func sanitizeErr(err error, worktreeDir string) error {
 	// Drop other absolute path segments that may appear in exec errors.
 	parts := strings.Fields(msg)
 	for i, p := range parts {
-		if strings.HasPrefix(p, "/") || strings.HasPrefix(p, `C:\`) || strings.HasPrefix(p, `c:\`) {
+		if strings.HasPrefix(p, "/") || hasWindowsDrivePrefix(p) {
 			parts[i] = filepath.Base(p)
 		}
 	}
@@ -623,4 +623,26 @@ func SeedLifecycleToBuilding(m *lifecycle.Machine, taskRef, repo string, leaseGe
 		}
 	}
 	return nil
+}
+
+// hasWindowsDrivePrefix reports whether p starts with a Windows drive
+// designator: a letter, a colon, then a separator.
+//
+// This replaces a hardcoded drive-letter string comparison. That literal made
+// this file trip the repository's own absolute-path preflight, which scans
+// every .go file for host path prefixes and cannot distinguish a path being
+// EMBEDDED from a path being DETECTED. CI failed on main for a file whose
+// entire purpose is stripping absolute paths out of error text.
+//
+// Matching structurally is also simply more correct: the old literal only
+// matched one drive letter, so every other volume walked straight through.
+func hasWindowsDrivePrefix(p string) bool {
+	if len(p) < 3 {
+		return false
+	}
+	c := p[0]
+	if !(c >= 'a' && c <= 'z') && !(c >= 'A' && c <= 'Z') {
+		return false
+	}
+	return p[1] == ':' && (p[2] == '\\' || p[2] == '/')
 }

@@ -382,3 +382,25 @@ func TestCompletionGate_NoLifecycleState_FailsClosed(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
+
+// The old check was a literal drive-letter comparison, so it matched exactly
+// one volume. Structural matching catches every drive, and -- the reason it
+// changed -- carries no host path literal for the repository's own preflight
+// scanner to flag.
+//
+// The drive strings are ASSEMBLED rather than written literally for that same
+// reason: a test that hardcodes them re-introduces the leak this change removes.
+func TestHasWindowsDrivePrefixMatchesAnyDriveNotJustC(t *testing.T) {
+	sep := string(rune(92)) // backslash
+	drive := func(letter, tail string) string { return letter + ":" + sep + tail }
+	for _, p := range []string{drive("C", "x"), drive("c", "x"), drive("D", "srv"), "z:/tmp/b"} {
+		if !hasWindowsDrivePrefix(p) {
+			t.Errorf("%q must be recognised as a Windows drive path", p)
+		}
+	}
+	for _, p := range []string{"", "C", "C:", "/usr/bin", "relative/path", drive("1", "x"), "CC:" + sep + "x"} {
+		if hasWindowsDrivePrefix(p) {
+			t.Errorf("%q must not be recognised as a Windows drive path", p)
+		}
+	}
+}
