@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -170,4 +171,101 @@ func TestClaudeCredentialsDecodeFloatExpiry(t *testing.T) {
 	if creds.ClaudeAiOauth.ExpiresAt < 1786223508385 {
 		t.Errorf("expiry lost precision: %v", creds.ClaudeAiOauth.ExpiresAt)
 	}
+}
+
+// Reading upstream OpenUsage's mappers — rather than inferring from the
+// binary's strings — surfaced two pools that live ONLY in nested arrays. Both
+// matter to routing: herdr-quota tracks claude/fable and codex/spark as
+// independent pools, and a spent default pool does not imply a spent scoped one.
+func TestClaudeExposesScopedWeeklyPools(t *testing.T) {
+	body := `{
+      "five_hour": {"utilization": 2.0},
+      "seven_day": {"utilization": 99.0},
+      "limits": [
+        {"kind": "session",       "scope": null, "percent": 2},
+        {"kind": "weekly_all",    "scope": null, "percent": 99},
+        {"kind": "weekly_scoped", "scope": {"model": {"display_name": "Fable"}}, "percent": 78}
+      ]
+    }`
+	s := serve(t, 200, body)
+	p, err := claudePollWithURL(s.URL, "tok")
+	if err != nil {
+		t.Fatal(err)
+	}
+	f, ok := p.Resources["fableWeekly"]
+	if !ok {
+		t.Fatalf("fable pool missing; scoped limits were dropped: %+v", p.Resources)
+	}
+	if f.Utilization != 0.78 || f.Remaining != 22 {
+		t.Errorf("fable util/remaining = %v/%v, want 0.78/22", f.Utilization, f.Remaining)
+	}
+	// Unscoped entries duplicate five_hour/seven_day and must not become pools.
+	if _, dup := p.Resources["weekly_all"]; dup {
+		t.Error("unscoped limits entries must not be added as pools")
+	}
+}
+
+func TestCodexExposesAdditionalRateLimitPools(t *testing.T) {
+	body := `{
+      "plan_type": "pro",
+      "rate_limit": {"primary_window": {"used_percent": 95, "limit_window_seconds": 604800}},
+      "additional_rate_limits": [
+        {"limit_name": "GPT-5.3-Codex-Spark",
+         "rate_limit": {"primary_window": {"used_percent": 13, "limit_window_seconds": 604800}}}
+      ]
+    }`
+	s := serve(t, 200, body)
+	p, err := codexPollWithURL(s.URL, "tok")
+	if err != nil {
+		t.Fatal(err)
+	}
+	spark, ok := p.Resources["sparkWeekly"]
+	if !ok {
+		t.Fatalf("spark pool missing — codex would look 95%% spent while spark had 87%% free: %+v", p.Resources)
+	}
+	if spark.Utilization != 0.13 || spark.Remaining != 87 {
+		t.Errorf("spark util/remaining = %v/%v, want 0.13/87", spark.Utilization, spark.Remaining)
+	}
+	if p.Resources["weekly"].Utilization != 0.95 {
+		t.Errorf("default pool must survive alongside spark: %+v", p.Resources["weekly"])
+	}
+}
+
+func TestCodexPoolKeyTakesTheModelSuffix(t *testing.T) {
+	for in, want := range map[string]string{
+		"GPT-5.3-Codex-Spark": "spark",
+		"spark":               "spark",
+		"":                    "",
+	} {
+		if got := codexPoolKey(in); got != want {
+			t.Errorf("codexPoolKey(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// Credential discovery must not be macOS-only. The first implementation read
+// the keychain alone, which cannot work on Linux — the portability this whole
+// package exists for.
+func TestCredentialDiscoveryHonoursConfigDirEnv(t *testing.T) {
+	t.Setenv("CLAUDE_CONFIG_DIR", "/custom/claude")
+	t.Setenv("CODEX_HOME", "/custom/codex")
+	t.Setenv("GEMINI_CONFIG_DIR", "/custom/gemini")
+
+	if got := claudeCredentialFiles(); len(got) == 0 || got[0] != "/custom/claude/.credentials.json" {
+		t.Errorf("CLAUDE_CONFIG_DIR must win: %v", got)
+	}
+	if got := codexCredentialFiles(); len(got) == 0 || got[0] != "/custom/codex/auth.json" {
+		t.Errorf("CODEX_HOME must win: %v", got)
+	}
+	if got := geminiCredentialFiles(); len(got) == 0 || got[0] != "/custom/gemini/oauth_creds.json" {
+		t.Errorf("GEMINI_CONFIG_DIR must win: %v", got)
+	}
+	// A file-based home must always be searched, so a Linux host with no
+	// keychain can still resolve credentials.
+	for _, f := range claudeCredentialFiles() {
+		if strings.HasSuffix(f, "/.claude/.credentials.json") {
+			return
+		}
+	}
+	t.Error("~/.claude/.credentials.json must be a candidate; keychain-only fails on Linux")
 }
