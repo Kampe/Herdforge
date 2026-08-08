@@ -6,6 +6,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+
+	"github.com/Kampe/Herdforge/pkg/gitdir"
 )
 
 // CheckWorktreeBoundary verifies that no absolute paths leak into git tracking or config files
@@ -16,12 +18,16 @@ func CheckWorktreeBoundary(rootDir string) error {
 		if err != nil {
 			return err
 		}
-		if info.IsDir() && (info.Name() == ".git" || info.Name() == "node_modules" || info.Name() == "vendor" ||
-			info.Name() == ".gemini" || info.Name() == ".qoder" || info.Name() == ".vscode" ||
-			info.Name() == ".claude" || info.Name() == ".codebuddy" || info.Name() == ".kiro") {
-			return filepath.SkipDir
-		}
 		if info.IsDir() {
+			name := info.Name()
+			if name == ".git" || name == "node_modules" || name == "vendor" ||
+				name == ".gemini" || name == ".qoder" || name == ".vscode" ||
+				name == ".claude" || name == ".codebuddy" || name == ".kiro" {
+				return filepath.SkipDir
+			}
+			if gitdir.IsNestedGitDir(path, rootDir) {
+				return filepath.SkipDir
+			}
 			return nil
 		}
 

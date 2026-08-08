@@ -9,6 +9,8 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+
+	"github.com/Kampe/Herdforge/pkg/gitdir"
 )
 
 // FAC-156 acceptance: "All production coordinator/forge-loop/manual merge call
@@ -66,14 +68,24 @@ func productionGoFiles(t *testing.T) []goFile {
 	if err != nil {
 		t.Fatalf("resolve repo root: %v", err)
 	}
+	return productionGoFilesFromRoot(t, root, 100)
+}
+
+// productionGoFilesFromRoot walks root and returns parsed non-test Go files.
+// minFiles is the coverage floor; pass 0 to disable it for sub-repo tests.
+func productionGoFilesFromRoot(t *testing.T, root string, minFiles int) []goFile {
+	t.Helper()
 	var out []goFile
-	err = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
 		if d.IsDir() {
 			switch d.Name() {
 			case ".git", "node_modules", "vendor", "testdata", ".herd":
+				return fs.SkipDir
+			}
+			if gitdir.IsNestedGitDir(path, root) {
 				return fs.SkipDir
 			}
 			return nil
@@ -97,8 +109,7 @@ func productionGoFiles(t *testing.T) []goFile {
 	if err != nil {
 		t.Fatalf("walk repo: %v", err)
 	}
-	// A scan that found nothing would pass every rule below vacuously.
-	if len(out) < 100 {
+	if minFiles > 0 && len(out) < minFiles {
 		t.Fatalf("only %d production go files found under %s; the scan is not covering the repository", len(out), root)
 	}
 	return out

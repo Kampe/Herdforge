@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/Kampe/Herdforge/pkg/config"
+	"github.com/Kampe/Herdforge/pkg/gitdir"
 )
 
 // TestActivationPolicy_EnabledGate pins FAC-155's activation authority: a
@@ -157,6 +158,22 @@ func TestActivationPolicy_LiveRepoConfigActivatesExactlyOneAdapter(t *testing.T)
 // a command fails this test.
 func TestActivationPolicy_NoProductionConstructorBypassesFactory(t *testing.T) {
 	root := repoRoot(t)
+	offenders, scanned := scanForConstructorBypasses(t, root)
+	if scanned < 50 {
+		t.Fatalf("scanned only %d production files; the walk is not covering the repo", scanned)
+	}
+	if len(offenders) > 0 {
+		t.Fatalf("production code must construct providers via provider.NewProductionProvider / NewFromHerdConfig only:\n  %s",
+			strings.Join(offenders, "\n  "))
+	}
+}
+
+// scanForConstructorBypasses walks root and returns offending files (non-test
+// Go files outside pkg/provider containing a banned constructor call) and the
+// count of files scanned. It is extracted so the worktree-skip test can call
+// it with a temp dir.
+func scanForConstructorBypasses(t *testing.T, root string) (offenders []string, scanned int) {
+	t.Helper()
 	banned := []string{
 		"NewMemoryProvider(",
 		"NewKaneoProvider(",
@@ -167,14 +184,15 @@ func TestActivationPolicy_NoProductionConstructorBypassesFactory(t *testing.T) {
 	}
 	providerPkg := filepath.Join(root, "pkg", "provider")
 
-	var offenders []string
-	scanned := 0
 	err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}
 		if info.IsDir() {
 			if info.Name() == ".git" || strings.HasPrefix(info.Name(), ".herd") {
+				return filepath.SkipDir
+			}
+			if gitdir.IsNestedGitDir(path, root) {
 				return filepath.SkipDir
 			}
 			return nil
@@ -201,14 +219,7 @@ func TestActivationPolicy_NoProductionConstructorBypassesFactory(t *testing.T) {
 	if err != nil {
 		t.Fatalf("walk: %v", err)
 	}
-	// Guard against the scan silently covering nothing (a vacuous pass).
-	if scanned < 50 {
-		t.Fatalf("scanned only %d production files; the walk is not covering the repo", scanned)
-	}
-	if len(offenders) > 0 {
-		t.Fatalf("production code must construct providers via provider.NewProductionProvider / NewFromHerdConfig only:\n  %s",
-			strings.Join(offenders, "\n  "))
-	}
+	return offenders, scanned
 }
 
 func typeName(v any) string {
