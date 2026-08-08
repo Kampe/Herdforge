@@ -325,7 +325,7 @@ func TestTabCreateForTaskEnv_RequiresCwdAndAbsolute(t *testing.T) {
 	var got []string
 	runHerdr = func(args ...string) (string, error) {
 		got = append([]string(nil), args...)
-		return `{"result":{"tab":{"tab_id":"t1","label":"task-fac-133","cwd":"` + absTmp + `"}}}`, nil
+		return `{"result":{"tab":{"tab_id":"t1","label":"task-fac-133","cwd":"` + absTmp + `"},"root_pane":{"pane_id":"p1","tab_id":"t1","terminal_id":"term_fac133"}}}`, nil
 	}
 	tab, err := TabCreateForTaskEnv("wABC", "task-fac-133", tmp, []string{"A=B"}, true)
 	if err != nil {

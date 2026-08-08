@@ -237,6 +237,9 @@ func TestDispatch_LaunchInjectsScrubbedEnv(t *testing.T) {
 	enableFAC133Sandbox(t, d)
 
 	opts := validLaunchOptions(t, "FAC-ENV")
+	// FAC-145 fences dispatch on an ACQUIRED claim lease, so a generation alone
+	// is no longer sufficient — the lease id is the canonical fence source.
+	opts.LeaseID = "claim:1"
 	opts.LeaseGeneration = 1
 	res, err := d.Dispatch(context.Background(), opts)
 	if err != nil {

@@ -129,7 +129,6 @@ type TabDecision struct {
 	Evidence      []string `json:"evidence"`
 }
 
-
 func NormalizeTaskStatus(status string) string {
 	switch strings.ToLower(strings.TrimSpace(status)) {
 	case "to-do", "todo", "to do":
@@ -194,7 +193,6 @@ func ProjectFleetStatus(decisions []TabDecision, maxLanes int) FleetStatus {
 	}
 	return p
 }
-
 
 func authorityReady[T any](a Authority[T]) bool {
 	return a.State == EvidenceAbsent || a.State == EvidencePresent

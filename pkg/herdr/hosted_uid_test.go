@@ -15,7 +15,6 @@ import (
 	"github.com/Kampe/Herdforge/pkg/toolchild"
 )
 
-
 func goodCapJSON() string {
 	return `{"schema_version":1,"hosted_process_uid":true,"hosted_process_gid":true,"tab_create_uid_flag":"--uid","agent_start_uid_flag":"--uid","process_lineage_proof":true}`
 }
@@ -253,7 +252,7 @@ func TestTabCreateForTaskEnv_AttachesHostedUIDWhenIsolationRequired(t *testing.T
 		}
 		if len(args) >= 2 && args[0] == "tab" && args[1] == "create" {
 			createArgs = append([]string{}, args...)
-			return `{"result":{"tab":{"tab_id":"t-env","label":"task-fac-133"},"root_pane":{"pane_id":"p-env","tab_id":"t-env"}}}`, nil
+			return `{"result":{"tab":{"tab_id":"t-env","label":"task-fac-133"},"root_pane":{"pane_id":"p-env","tab_id":"t-env","terminal_id":"term_env"}}}`, nil
 		}
 		if len(args) >= 2 && args[0] == "pane" && args[1] == "process-info" {
 			return `{"result":{"process_info":{"pane_id":"p-env","shell_pid":900001,"foreground_processes":[{"pid":900001}]}}}`, nil
@@ -285,7 +284,7 @@ func TestTabCreateForTaskEnv_WithoutIsolationEnvStillWorks(t *testing.T) {
 	var got []string
 	runHerdr = func(args ...string) (string, error) {
 		got = append([]string{}, args...)
-		return `{"result":{"tab":{"tab_id":"t1","label":"task-fac-133"},"root_pane":{"pane_id":"p1","tab_id":"t1"}}}`, nil
+		return `{"result":{"tab":{"tab_id":"t1","label":"task-fac-133"},"root_pane":{"pane_id":"p1","tab_id":"t1","terminal_id":"term_fac133"}}}`, nil
 	}
 	tab, err := TabCreateForTaskEnv("wABC", "task-fac-133", wt, []string{"K=V"}, true)
 	if err != nil {
@@ -740,7 +739,7 @@ func TestAgentStartWithDecision_HostedUIDProofFailsBeforeBind(t *testing.T) {
 		Role: router.RoleWorker, Shape: launch.Implementation,
 		RequestedProvider: testWorkerProvider, RequestedModel: testWorkerModel,
 		RequestedEffort: testWorkerEffort, TaskRef: "FAC-172", LeaseGeneration: 3,
-		Scope: router.ScopeTask,
+		Scope:        router.ScopeTask,
 		ProbeResults: map[string]bool{router.ProbeKey(testWorkerProvider, testWorkerModel): true},
 	})
 	if err != nil {
@@ -1081,7 +1080,6 @@ func TestAssertAgentHostedAsBuilder_ExactRoutedOwner(t *testing.T) {
 	}
 }
 
-
 func TestAssertHostedPaneUID_RejectsSeteuidOnly(t *testing.T) {
 	// HIGH: ruid remains coordinator while euid is builder — not isolation.
 	defer func(old func(args ...string) (string, error)) { runHerdr = old }(runHerdr)
@@ -1208,7 +1206,6 @@ func TestAgentStartProcess_AttachesNegotiatedUIDFlag(t *testing.T) {
 	}
 }
 
-
 func errorsIsHostedBlocked(err error) bool {
 	if err == nil {
 		return false
@@ -1216,4 +1213,3 @@ func errorsIsHostedBlocked(err error) bool {
 	s := err.Error()
 	return strings.Contains(s, "FAC-172") || strings.Contains(s, "BLOCKED") || strings.Contains(s, "hosted process UID")
 }
-
