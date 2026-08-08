@@ -9,6 +9,13 @@ import (
 	"github.com/Kampe/Herdforge/pkg/toolchild"
 )
 
+// writeReceipt is the persistence seam. It exists so a test can simulate the
+// failure the read-back below is FOR — a write that reports success and does
+// not persist what it claimed. Without the seam that check has no way to fail
+// and is therefore not really tested. Same pattern as herdSubprocess in
+// cmd/herd and execCommandContext in pkg/harvest.
+var writeReceipt = hsync.WriteReceipt
+
 // Complete is the post-merge half of the authority. Admit decides whether the
 // merge may happen; Complete proves it DID happen, as the same content, and
 // mints the durable receipt that is the only thing pkg/sync.BoardDone accepts
@@ -100,7 +107,7 @@ func (g *Gate) Complete(d *Decision, req Request) (*hsync.CompletionReceipt, err
 		}
 	}
 
-	if err := hsync.WriteReceipt(g.RepoDir, receipt); err != nil {
+	if err := writeReceipt(g.RepoDir, receipt); err != nil {
 		return nil, fmt.Errorf("herd-merge-completion: persist receipt: %w", err)
 	}
 

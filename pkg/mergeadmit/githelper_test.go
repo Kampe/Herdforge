@@ -25,6 +25,11 @@ func gitRepo(t *testing.T) string {
 		{"commit.gpgsign", "false"},
 		{"tag.gpgsign", "false"},
 		{"gc.auto", "0"},
+		// toolchild.RepositoryIdentity reads remote.origin.url to bind a
+		// receipt to its repository. This is a git CONFIG read only — nothing
+		// in this package fetches, so the fixture stays offline and CI never
+		// touches the network.
+		{"remote.origin.url", "git@github.com:Kampe/Herdforge-fixture.git"},
 	} {
 		run(t, dir, "git", "config", kv[0], kv[1])
 	}
