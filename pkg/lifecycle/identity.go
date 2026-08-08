@@ -1,9 +1,14 @@
 package lifecycle
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 )
+
+// ErrAmbiguousRole is returned by ResolveRole (and propagated by Resolve) when
+// multiple lanes carry the same role. The caller must name a lane explicitly.
+var ErrAmbiguousRole = errors.New("ambiguous role")
 
 type CanonicalLane struct {
 	Name     string
@@ -12,16 +17,21 @@ type CanonicalLane struct {
 }
 type CanonicalLaneRegistry struct{ lanes []CanonicalLane }
 
+// NewCanonicalLaneRegistry builds the validated lane registry. Lane NAMES
+// must be unique (a duplicate name is a config error). A ROLE may be owned by
+// several lanes — standing improvement fleets run ci-warden and mender both
+// carrying, say, "assayer" — but ResolveRole then refuses to pick one
+// silently and names every candidate instead, exactly like
+// config.ResolveLane does at the library boundary.
 func NewCanonicalLaneRegistry(lanes []CanonicalLane) (CanonicalLaneRegistry, error) {
-	seenName, seenRole := map[string]bool{}, map[string]bool{}
+	seenName := map[string]bool{}
 	copyLanes := make([]CanonicalLane, 0, len(lanes))
 	for _, lane := range lanes {
 		name, role := strings.TrimSpace(lane.Name), strings.TrimSpace(lane.Role)
-		if name == "" || role == "" || seenName[strings.ToLower(name)] || seenRole[strings.ToLower(role)] {
+		if name == "" || role == "" || seenName[strings.ToLower(name)] {
 			return CanonicalLaneRegistry{}, fmt.Errorf("invalid or duplicate canonical lane %q", name)
 		}
 		seenName[strings.ToLower(name)] = true
-		seenRole[strings.ToLower(role)] = true
 		copyLanes = append(copyLanes, CanonicalLane{Name: name, Role: role, Standing: lane.Standing})
 	}
 	return CanonicalLaneRegistry{lanes: copyLanes}, nil
@@ -44,7 +54,25 @@ func (r CanonicalLaneRegistry) ResolveLaneName(name string) (CanonicalLane, erro
 	return r.resolve(name, "lane", func(l CanonicalLane) bool { return strings.EqualFold(l.Name, strings.TrimSpace(name)) })
 }
 func (r CanonicalLaneRegistry) ResolveRole(role string) (CanonicalLane, error) {
-	return r.resolve(role, "role", func(l CanonicalLane) bool { return strings.EqualFold(l.Role, strings.TrimSpace(role)) })
+	role = strings.TrimSpace(role)
+	var matches []CanonicalLane
+	for _, lane := range r.lanes {
+		if strings.EqualFold(lane.Role, role) {
+			matches = append(matches, lane)
+		}
+	}
+	switch len(matches) {
+	case 0:
+		return CanonicalLane{}, fmt.Errorf("unknown role %q", role)
+	case 1:
+		return matches[0], nil
+	default:
+		names := make([]string, 0, len(matches))
+		for _, m := range matches {
+			names = append(names, m.Name)
+		}
+		return CanonicalLane{}, fmt.Errorf("%w: role %q is held by %d lanes (%v) — name one of them explicitly", ErrAmbiguousRole, role, len(matches), names)
+	}
 }
 func (r CanonicalLaneRegistry) ResolveLiveAgentID(id string) (CanonicalLane, error) {
 	id = strings.TrimSpace(id)
@@ -55,15 +83,18 @@ func (r CanonicalLaneRegistry) ResolveLiveAgentID(id string) (CanonicalLane, err
 }
 func (r CanonicalLaneRegistry) Resolve(value string) (CanonicalLane, error) {
 	byName, nameErr := r.ResolveLaneName(value)
-	byRole, roleErr := r.ResolveRole(value)
-	if nameErr == nil && roleErr == nil && (byName.Name != byRole.Name || byName.Role != byRole.Role) {
-		return CanonicalLane{}, fmt.Errorf("ambiguous mixed lane/role namespace %q", value)
-	}
 	if nameErr == nil {
 		return byName, nil
 	}
+	byRole, roleErr := r.ResolveRole(value)
 	if roleErr == nil {
 		return byRole, nil
+	}
+	// nameErr != nil. If the role matched multiple lanes, propagate the
+	// ambiguity error — it names the candidates so the caller can
+	// disambiguate by naming a lane. Otherwise neither lookup matched.
+	if errors.Is(roleErr, ErrAmbiguousRole) {
+		return CanonicalLane{}, roleErr
 	}
 	return CanonicalLane{}, fmt.Errorf("unknown lane/role %q", value)
 }

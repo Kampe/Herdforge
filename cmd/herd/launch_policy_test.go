@@ -43,6 +43,22 @@ func TestWorkerConfigDriftRejectsBeforeLaunch(t *testing.T) {
 	}
 }
 
+// Assayer is a valid launch role (same task_shape as reviewer: "qa"). A lane
+// carrying it with the wrong task_shape must be rejected — this test would
+// have passed vacuously before assayer was added to the expectedShapes map,
+// because the role was simply absent and every shape was rejected. Now it
+// must fail on the shape mismatch, not on the role being unknown.
+func TestAssayerRoleRejectsWrongTaskShape(t *testing.T) {
+	lane := &config.LaneDef{Name: "ci-warden", Role: launch.AssayerRole, AgentKind: router.PiHarness, Harness: router.PiHarness, Provider: "claude", Model: "claude-sonnet-5", Effort: "medium", TaskShape: "implementation"}
+	err := validateLaneLaunchConfig(lane)
+	if !errors.Is(err, ErrWorkerConfigPolicy) {
+		t.Fatalf("assayer with wrong task_shape must fail at worker policy boundary, got %v", err)
+	}
+	if !strings.Contains(err.Error(), launch.AssayerRole) {
+		t.Fatalf("error must name the role %q: %v", launch.AssayerRole, err)
+	}
+}
+
 type fakeLaunchLifecycle struct {
 	providerList, claim, status, comment, worktree, tab, process, prompt int
 	decision                                                             *router.LaunchDecision
@@ -331,6 +347,7 @@ func TestConfiguredRolePoliciesAreComplete(t *testing.T) {
 		{Name: "forge", Role: "forge-smith", AgentKind: router.PiHarness, Harness: router.PiHarness, Provider: "codex", Model: "gpt-5.6-luna", Effort: "medium", TaskShape: "implementation"},
 		{Name: "recovery-worker", Role: "recovery", AgentKind: router.PiHarness, Harness: router.PiHarness, Provider: "codex", Model: "gpt-5.6-luna", Effort: "medium", TaskShape: "implementation"},
 		{Name: "reviewer", Role: "reviewer", AgentKind: router.PiHarness, Harness: router.PiHarness, Provider: "claude", Model: "claude-sonnet-5", Effort: "medium", TaskShape: "qa"},
+		{Name: "assayer", Role: "assayer", AgentKind: router.PiHarness, Harness: router.PiHarness, Provider: "claude", Model: "claude-sonnet-5", Effort: "medium", TaskShape: "qa"},
 		{Name: "orchestrator", Role: "orchestrator", AgentKind: router.PiHarness, Harness: router.PiHarness, Provider: "claude", Model: "claude-opus-5", Effort: "medium", TaskShape: "coordinator"},
 		{Name: "scout-planner", Role: "scout-planner", AgentKind: router.PiHarness, Harness: router.PiHarness, Provider: "claude", Model: "claude-opus-5", Effort: "medium", TaskShape: "architecture"},
 		{Name: "verification", Role: "verification-gate", AgentKind: router.PiHarness, Harness: router.PiHarness, Provider: "opencode", Model: "opencode/kimi-k3", Effort: "medium", TaskShape: "bounded"},

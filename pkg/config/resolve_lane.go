@@ -25,10 +25,11 @@ import "fmt"
 // the first in file order would silently bind a caller to a lane it did not ask
 // for. Ambiguity is an error naming both candidates, not a coin flip.
 //
-// The CLI additionally builds a CanonicalLaneRegistry, which rejects ANY
-// duplicate role, so no shipping CLI path can reach the ambiguous case today.
-// That makes this a library-boundary guard, not a live defence — kept because
-// dispatch.Dispatch is callable without that registry, and cheap to hold.
+// The CLI additionally builds a CanonicalLaneRegistry, which now allows
+// multiple lanes per role (ResolveRole refuses an ambiguous role by naming
+// the candidates), so a shipping CLI path can still reach this ambiguous
+// case when a role is shared. That makes this a live defence, not just a
+// library-boundary guard.
 func ResolveLane(cfg *Config, nameOrRole string) (*LaneDef, error) {
 	if cfg == nil {
 		return nil, fmt.Errorf("lane %q not resolvable: no config", nameOrRole)
