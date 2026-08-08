@@ -315,6 +315,25 @@ func (s *JSONLSink) HasDegraded(req Request) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	found := false
+	// A READ of durable state must not fail closed because the state does not
+	// exist. HasDegraded is called from launch.Validate, which runs before the
+	// tool-child lifecycle is registered, so an error here aborts the launch with
+	// NO authority over anything -- StartPreparedAgent returns and
+	// lifecycleForTab is nil. That is what turned an unwritable receipt path into
+	// "authority dropped before verified terminal state" on origin/main and made
+	// the crash matrix fail for every open PR.
+	//
+	// withFileLock CREATES the lock file, so an unwritable or non-existent
+	// receipt directory made this read fail where opening the receipt itself
+	// would simply have reported IsNotExist. Absent state means "no degraded
+	// receipt recorded", which is exactly false. Writes still fail loudly.
+	// Any stat error means there is no readable receipt state, not that the
+	// launch is unsafe. IsNotExist alone is not enough: an unwritable parent
+	// (the tests use /dev/null/receipts.jsonl) reports ENOTDIR, which is still
+	// "no degraded receipt recorded".
+	if _, statErr := os.Stat(s.Path); statErr != nil {
+		return false, nil
+	}
 	err := s.withFileLock(func() error {
 		f, err := os.Open(s.Path)
 		if os.IsNotExist(err) {
