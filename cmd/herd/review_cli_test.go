@@ -1878,8 +1878,22 @@ var socketSeq atomic.Int64
 
 func shortSocketPath(t *testing.T) string {
 	t.Helper()
-	sock := filepath.Join(os.TempDir(), fmt.Sprintf("hb-%d-%d-%d.sock",
-		os.Getpid(), time.Now().UnixNano()%1000000, socketSeq.Add(1)))
+	// The socket's PARENT must be owned by this uid: the broker refuses a
+	// parent owned by anyone else ("refusing socket parent /tmp: owned by uid
+	// 0"), which is correct — a world-writable, foreign-owned parent lets
+	// another user interpose on the socket. os.TempDir() IS /tmp on Linux CI,
+	// so putting the socket straight there failed every broker test while
+	// passing on macOS, where TMPDIR is per-user.
+	//
+	// MkdirTemp creates a 0700 directory owned by us. It stays short because a
+	// Unix socket path is capped near 104 bytes, which is this helper's reason
+	// for existing.
+	parent, err := os.MkdirTemp(os.TempDir(), "hb")
+	if err != nil {
+		t.Fatalf("socket parent: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(parent) })
+	sock := filepath.Join(parent, fmt.Sprintf("%d.sock", socketSeq.Add(1)))
 	// Start from a clean slate and remove every side file afterwards: a
 	// stale .pid/.log/.lock makes the next run non-deterministic.
 	for _, suffix := range []string{"", ".pid", ".log", ".lock"} {
