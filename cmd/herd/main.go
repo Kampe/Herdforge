@@ -5675,6 +5675,14 @@ func forgeLoopMain() int {
 	interval := fs.Int("interval", 15, "seconds between ticks")
 	ticks := fs.Int("ticks", 0, "stop after N ticks (0 = run until drained)")
 	stopEmpty := fs.Bool("stop-empty", true, "stop when the board is clear and no lane is busy")
+	// --coordinator-name is what makes ReplyTarget.Name real. A reviewer caught
+	// that Register was called with the constant, so Dispatcher.CoordinatorName,
+	// ReplyTarget.Name and the non-default branch of coordinatorName() worked in
+	// tests and could never be driven in production -- a field that looked
+	// configurable and was not. Two coordinators against one repo need distinct
+	// inboxes, so this has to be settable, not merely parameterised.
+	coordName := fs.String("coordinator-name", coordinator.CoordinatorName,
+		"durable coordinator identity agents report to (must match the mail inbox)")
 	fs.Parse(leadingPositionalArgs(os.Args[2:]))
 
 	// Signal-aware: SIGINT/SIGTERM cancels the loop's context so the current
@@ -5718,7 +5726,7 @@ func forgeLoopMain() int {
 	// FAC-222: register the coordinator as a named agent so dispatched packets
 	// carry a reply address and agents report completion/BLOCKED to it instead
 	// of relying on the coordinator to notice by polling.
-	coordReg, regErr := coordinator.Register(".", coordinator.CoordinatorName, cfg.Fleet.HerdrWorkspace)
+	coordReg, regErr := coordinator.Register(".", *coordName, cfg.Fleet.HerdrWorkspace)
 	if regErr != nil {
 		fmt.Fprintf(os.Stderr, "forge --loop: coordinator registration failed: %v\n", regErr)
 		return 1
@@ -5751,7 +5759,7 @@ func forgeLoopMain() int {
 	feedbackRunner := func(ctx context.Context) error {
 		return feedback.Run(ctx, feedback.Options{
 			Coordinator: coordReg.Name,
-			Workspace:    cfg.Fleet.HerdrWorkspace,
+			Workspace:   cfg.Fleet.HerdrWorkspace,
 		})
 	}
 
