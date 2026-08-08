@@ -253,7 +253,7 @@ func TestBuildTaskPacket(t *testing.T) {
 		Model: "deepseek-v4-flash", Prompt: ".herd/prompts/worker.md",
 	}
 	verification := config.Verification{TestCommand: "go test ./...", PreflightCommand: "go build ./..."}
-	packet := buildTaskPacket(task, "herd/fac-33", ".herd/prompts/worker.md", "kaneo", "fac-proj", lane, verification)
+	packet := buildTaskPacket(task, "herd/fac-33", ".herd/prompts/worker.md", "kaneo", "fac-proj", lane, verification, ReplyTarget{Name: "coordinator", LeaseGeneration: 1})
 	if !strings.Contains(packet, "FAC-33") {
 		t.Error("packet should contain ticket ref")
 	}
@@ -288,6 +288,53 @@ func TestBuildTaskPacket(t *testing.T) {
 	if lines := strings.Count(packet, "\n"); lines > 25 {
 		t.Errorf("packet must stay tight (<25 lines), got %d", lines)
 	}
+	// FAC-222: the packet must carry a reply target so agents report to the
+	// coordinator instead of relying on the coordinator to notice by polling.
+	if !strings.Contains(packet, "Report to the coordinator") {
+		t.Error("packet must include the reply target section")
+	}
+	if !strings.Contains(packet, "herd shot FAC-33 --report complete") {
+		t.Error("packet must tell agents to report completion via herd shot --report")
+	}
+	if !strings.Contains(packet, "herd shot FAC-33 --report blocked") {
+		t.Error("packet must tell agents to report BLOCKED via herd shot --report")
+	}
+	if !strings.Contains(packet, "--lease 1") {
+		t.Error("packet must carry the lease generation for callback binding")
+	}
+}
+
+// TestBuildTaskPacket_ReplyTargetIsNonVacuous is non-vacuous: it proves the
+// reply target name and lease generation are actually driven into the packet.
+// A regression that hardcodes "coordinator" and lease 0 (or omits the
+// reporting section entirely) breaks the named-coordinator case even though
+// the default case would still pass.
+func TestBuildTaskPacket_ReplyTargetIsNonVacuous(t *testing.T) {
+	task := &provider.Task{Ref: "FAC-222", Title: "Reply target test"}
+	lane := &config.LaneDef{Name: "worker", Prompt: ".herd/prompts/worker.md"}
+	verification := config.Verification{TestCommand: "go test ./..."}
+
+	t.Run("named coordinator and lease are embedded", func(t *testing.T) {
+		packet := buildTaskPacket(task, "herd/fac-222", ".herd/prompts/worker.md", "kaneo", "fac-proj", lane, verification,
+			ReplyTarget{Name: "forge-coordinator", LeaseGeneration: 42})
+		if !strings.Contains(packet, "forge-coordinator") {
+			t.Errorf("packet must carry the named coordinator:\n%s", packet)
+		}
+		if !strings.Contains(packet, "--lease 42") {
+			t.Errorf("packet must carry lease generation 42:\n%s", packet)
+		}
+	})
+
+	t.Run("empty name falls back to default", func(t *testing.T) {
+		packet := buildTaskPacket(task, "herd/fac-222", ".herd/prompts/worker.md", "kaneo", "fac-proj", lane, verification,
+			ReplyTarget{Name: "", LeaseGeneration: 7})
+		if !strings.Contains(packet, "coordinator") {
+			t.Errorf("packet must fall back to default coordinator name:\n%s", packet)
+		}
+		if !strings.Contains(packet, "--lease 7") {
+			t.Errorf("packet must carry lease generation 7:\n%s", packet)
+		}
+	})
 }
 
 // TestBuildTaskPacket_ProviderNeutralTaskReference is non-vacuous: it proves
@@ -301,7 +348,7 @@ func TestBuildTaskPacket_ProviderNeutralTaskReference(t *testing.T) {
 	verification := config.Verification{TestCommand: "go test ./..."}
 
 	t.Run("kaneo provider gets the kaneo CLI reference", func(t *testing.T) {
-		packet := buildTaskPacket(task, "herd/fac-2", ".herd/prompts/worker.md", "kaneo", "fac-proj", lane, verification)
+		packet := buildTaskPacket(task, "herd/fac-2", ".herd/prompts/worker.md", "kaneo", "fac-proj", lane, verification, ReplyTarget{Name: "coordinator", LeaseGeneration: 1})
 		if !strings.Contains(packet, "kaneo task get FAC-2 --full") {
 			t.Errorf("kaneo provider must reference the kaneo CLI:\n%s", packet)
 		}
@@ -309,7 +356,7 @@ func TestBuildTaskPacket_ProviderNeutralTaskReference(t *testing.T) {
 
 	for _, providerType := range []string{"github", "linear", "jira", "memory", ""} {
 		t.Run(providerType+" provider does not assume kaneo", func(t *testing.T) {
-			packet := buildTaskPacket(task, "herd/fac-2", ".herd/prompts/worker.md", providerType, "fac-proj", lane, verification)
+			packet := buildTaskPacket(task, "herd/fac-2", ".herd/prompts/worker.md", providerType, "fac-proj", lane, verification, ReplyTarget{Name: "coordinator", LeaseGeneration: 1})
 			if strings.Contains(packet, "kaneo task get") || strings.Contains(packet, "kaneo") {
 				t.Errorf("provider %q must not assume ambient kaneo credentials:\n%s", providerType, packet)
 			}
@@ -357,7 +404,7 @@ func TestBuildTaskPacket_RepositoryAgnosticVerification(t *testing.T) {
 
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			packet := buildTaskPacket(task, "herd/fac-1", ".herd/prompts/worker.md", "kaneo", "fac-proj", lane, c.verification)
+			packet := buildTaskPacket(task, "herd/fac-1", ".herd/prompts/worker.md", "kaneo", "fac-proj", lane, c.verification, ReplyTarget{Name: "coordinator", LeaseGeneration: 1})
 			for _, want := range c.wantContains {
 				if !strings.Contains(packet, want) {
 					t.Errorf("packet missing %q:\n%s", want, packet)

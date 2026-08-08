@@ -26,8 +26,10 @@ import (
 	"github.com/Kampe/Herdforge/pkg/classify"
 	"github.com/Kampe/Herdforge/pkg/config"
 	"github.com/Kampe/Herdforge/pkg/control"
+	"github.com/Kampe/Herdforge/pkg/coordinator"
 	"github.com/Kampe/Herdforge/pkg/daemon"
 	"github.com/Kampe/Herdforge/pkg/dispatch"
+	"github.com/Kampe/Herdforge/pkg/feedback"
 	"github.com/Kampe/Herdforge/pkg/harvest"
 	"github.com/Kampe/Herdforge/pkg/herdr"
 	"github.com/Kampe/Herdforge/pkg/kick"
@@ -2706,6 +2708,12 @@ func dispatchTicketDecision(ctx context.Context, req dispatchRequest, announce i
 	}
 	defer stack.Close()
 	d.Claims = stack
+	// FAC-222: embed the coordinator's reply target in every TASK-PACKET.md.
+	// Resolve from the durable registration; absence falls back to the
+	// well-known default name (dispatch.coordinatorName handles that).
+	if reg, rerr := coordinator.Resolve("."); rerr == nil {
+		d.CoordinatorName = reg.Name
+	}
 	closeControl, err := configureProductionControl(d, ".")
 	if err != nil {
 		return nil, nil, fmt.Errorf("control store init failed: %w", err)
@@ -5706,6 +5714,17 @@ func forgeLoopMain() int {
 		return 1
 	}
 	defer st.Close()
+
+	// FAC-222: register the coordinator as a named agent so dispatched packets
+	// carry a reply address and agents report completion/BLOCKED to it instead
+	// of relying on the coordinator to notice by polling.
+	coordReg, regErr := coordinator.Register(".", cfg.Fleet.HerdrWorkspace)
+	if regErr != nil {
+		fmt.Fprintf(os.Stderr, "forge --loop: coordinator registration failed: %v\n", regErr)
+		return 1
+	}
+	fmt.Printf("herd forge --loop: coordinator registered as %q (workspace=%s)\n", coordReg.Name, coordReg.Workspace)
+
 	// The forge loop is wake-capable: it must be composed with a durable
 	// coordinator reconciler. Until the authoritative task-scoped composition
 	// is available, NewEngineWithControl makes the command fail closed before
@@ -5725,11 +5744,27 @@ func forgeLoopMain() int {
 		},
 	}
 
+	// FAC-222: wire the feedback census into the loop so a lane that goes quiet
+	// is REPORTED rather than discovered by polling. The census runs every
+	// feedbackInterval ticks; a failure is logged, never fatal.
+	feedbackInterval := *interval * 60 / int(feedback.DefaultInterval.Seconds())
+	if feedbackInterval < 1 {
+		feedbackInterval = 1
+	}
+	feedbackRunner := func(ctx context.Context) error {
+		return feedback.Run(ctx, feedback.Options{
+			Coordinator: coordReg.Name,
+			Workspace:    cfg.Fleet.HerdrWorkspace,
+		})
+	}
+
 	fmt.Printf("herd forge --loop: max-lanes=%d interval=%ds — driving the board autonomously\n", *maxLanes, *interval)
 	err = eng.ForgeLoop(ctx, driver, daemon.ForgeLoopOptions{
-		Interval:  time.Duration(*interval) * time.Second,
-		MaxTicks:  *ticks,
-		StopEmpty: *stopEmpty,
+		Interval:         time.Duration(*interval) * time.Second,
+		MaxTicks:         *ticks,
+		StopEmpty:        *stopEmpty,
+		Feedback:         feedbackRunner,
+		FeedbackInterval: feedbackInterval,
 	})
 	switch {
 	case err == nil:

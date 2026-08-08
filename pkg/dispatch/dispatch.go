@@ -258,6 +258,15 @@ type DispatchResult struct {
 	SecurityEvents int
 }
 
+// ReplyTarget carries the coordinator identity a packet embeds so agents
+// know where to report completion and BLOCKED (FAC-222). Before this, no
+// packet carried a reply address — the coordinator discovered every finished
+// branch by polling git state, late and lossy.
+type ReplyTarget struct {
+	Name            string // the coordinator's stable name (never empty)
+	LeaseGeneration int64  // the lease generation the agent must cite in callbacks
+}
+
 // WorktreeService is the isolation surface Dispatch uses (FAC-121).
 // *worktree.WorktreeManager is adapted via NewDispatcher; tests must inject
 // a temp-repo manager or a mock — never a manager rooted at the package cwd
@@ -335,8 +344,25 @@ type Dispatcher struct {
 	// ClaimLookup proves LeaseGeneration against live FAC-147 claim records.
 	ClaimLookup security.LiveClaimLookup
 
+	// CoordinatorName is the reply target embedded in every TASK-PACKET.md
+	// (FAC-222). When empty, dispatch resolves it from the durable coordinator
+	// registration (.herd/coordinator.json) or falls back to the well-known
+	// name "coordinator" (matching mail.CoordinatorInbox).
+	CoordinatorName string
+
 	// health projects BLOCKED(provider_timeout) for board calls (FAC-150).
 	health dispatchHealth
+}
+
+// coordinatorName returns the reply target name for packets. An explicitly
+// set CoordinatorName wins; otherwise the well-known default is used. The
+// caller (cmd/herd) is expected to populate CoordinatorName from the durable
+// coordinator registration at wiring time.
+func (d *Dispatcher) coordinatorName() string {
+	if name := strings.TrimSpace(d.CoordinatorName); name != "" {
+		return name
+	}
+	return "coordinator"
 }
 
 type ScopeAdmission interface {
@@ -903,7 +929,10 @@ func (d *Dispatcher) Dispatch(ctx context.Context, opts DispatchOptions) (*Dispa
 		rolePath = ".herd/prompts/worker.md"
 	}
 
-	packet := buildTaskPacket(task, branch, rolePath, d.Config.TaskProvider.Type, d.Config.TaskProvider.ProjectID, lane, d.Config.Verification)
+	packet := buildTaskPacket(task, branch, rolePath, d.Config.TaskProvider.Type, d.Config.TaskProvider.ProjectID, lane, d.Config.Verification, ReplyTarget{
+		Name:            d.coordinatorName(),
+		LeaseGeneration: tok.Generation,
+	})
 	if depProv != nil {
 		packet = packet + "\n" + deps.PacketSection(depProv)
 	}
@@ -1734,7 +1763,10 @@ func extractIntentFromTitle(title string) string {
 // FAC-155: the packet names the configured provider AND its project binding,
 // and forbids every other board tool. A worker that reaches for a different
 // provider CLI is reaching for a board this repository never activated.
-func buildTaskPacket(task *provider.Task, branch, rolePath, taskProviderType, taskProviderProject string, lane *config.LaneDef, verification config.Verification) string {
+// FAC-222: the packet carries a ReplyTarget so agents report completion and
+// BLOCKED to the coordinator by name, instead of relying on the coordinator
+// to notice by polling. Polling stays as the backstop, not the primary signal.
+func buildTaskPacket(task *provider.Task, branch, rolePath, taskProviderType, taskProviderProject string, lane *config.LaneDef, verification config.Verification, reply ReplyTarget) string {
 	var b strings.Builder
 
 	verifySummary := verification.TestCommand
@@ -1769,6 +1801,19 @@ func buildTaskPacket(task *provider.Task, branch, rolePath, taskProviderType, ta
 	fmt.Fprintf(&b, "  4. Verify yourself: herd verify %s . (must PASS: real commits + build + tests).\n", verifyFlags)
 	fmt.Fprintf(&b, "  5. git add -A && git commit -m \"<msg containing %s>\" (no AI-attribution trailers).\n", task.Ref)
 	fmt.Fprintf(&b, "  6. Final message: `BUILD COMPLETE %s` + `git rev-parse HEAD`.\n\n", task.Ref)
+
+	// FAC-222: reply target. Agents report to the coordinator by name instead
+	// of relying on the coordinator to notice by polling. The lease generation
+	// binds the report to this dispatch so a stale or duplicate redelivery is
+	// distinguishable from real progress.
+	coordinatorName := reply.Name
+	if coordinatorName == "" {
+		coordinatorName = "coordinator"
+	}
+	fmt.Fprintf(&b, "Report to the coordinator (%s) — do not wait to be asked:\n", coordinatorName)
+	fmt.Fprintf(&b, "  READY-FOR-REVIEW: herd shot %s --report complete --sha <sha> --lease %d\n", task.Ref, reply.LeaseGeneration)
+	fmt.Fprintf(&b, "  BLOCKED: herd shot %s --report blocked --detail \"<why>\" --lease %d\n", task.Ref, reply.LeaseGeneration)
+	b.WriteString("Report as soon as the condition is true. Polling is the backstop, not the primary signal.\n\n")
 
 	b.WriteString("Do NOT push, PR, or merge — the coordinator harvests your branch. Do NOT touch the root checkout.\n")
 	if lane != nil && rolePath != "" {
