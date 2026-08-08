@@ -148,6 +148,12 @@ type AgentObservation struct {
 	// agent must act on (e.g. "changes requested"). This is the KEEP signal:
 	// the lane is idle but it has specific pending work only it can do.
 	AwaitingVerdict bool `json:"awaiting_verdict,omitempty"`
+	// TabGeneration is the herdr tab lifecycle generation at observation time.
+	// The reap close path requires this for FAC-180 compare-and-close fencing.
+	// Zero means unknown; ReapLane will fail closed rather than close unfenced.
+	TabGeneration uint64 `json:"tab_generation,omitempty"`
+	// TabRevision is the herdr tab revision counter at observation time.
+	TabRevision uint64 `json:"tab_revision,omitempty"`
 }
 
 // LeaseObservation is one durable claim lease row.
@@ -375,6 +381,8 @@ func Plan(obs Observation, opts Options) (Snapshot, error) {
 			TicketDone:      a.TicketDone,
 			SafeRef:         a.SafeRef,
 			AwaitingVerdict: a.AwaitingVerdict,
+			TabGeneration:   a.TabGeneration,
+			TabRevision:     a.TabRevision,
 		})
 	}
 	sort.Slice(agents, func(i, j int) bool {

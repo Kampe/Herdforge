@@ -2,10 +2,13 @@ package main
 
 import (
 	"context"
+	cryptorand "crypto/rand"
+	"encoding/hex"
 	"errors"
 	"flag"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -18,8 +21,10 @@ import (
 	"github.com/Kampe/Herdforge/pkg/provider"
 	"github.com/Kampe/Herdforge/pkg/pulse"
 	"github.com/Kampe/Herdforge/pkg/quotasup"
+	"github.com/Kampe/Herdforge/pkg/review"
 	"github.com/Kampe/Herdforge/pkg/usage"
 	"github.com/Kampe/Herdforge/pkg/winddown"
+	"github.com/Kampe/Herdforge/pkg/worktree"
 )
 
 // runPulse is the FAC-73 coordinator heartbeat. Default is observe (read-only);
@@ -101,11 +106,16 @@ func gatherPulseObservation(ctx context.Context, act bool) (pulse.Observation, p
 	var obs pulse.Observation
 	actor := &livePulseActor{}
 
-	// Provider / queue pressure (one ListTasks).
-	obs.Provider = readPulseProvider(ctx)
+	// Provider / queue pressure (one ListTasks). Also captures done task
+	// refs for reap evidence — a lane whose ticket is done is reap-eligible.
+	providerObs, doneRefs := readPulseProvider(ctx)
+	obs.Provider = providerObs
 
-	// Herdr fleet (one AgentList).
-	obs.Herdr = readPulseHerdr()
+	// Herdr fleet (one AgentList) + reap evidence enrichment (FAC-218).
+	// Evidence gathering fills CommittedWork, TicketDone, SafeRef,
+	// AwaitingVerdict, TabGeneration, and TabRevision so the FAC-221 reap
+	// planner fires on every idle-with-evidence state, not just ticket-done.
+	obs.Herdr = readPulseHerdr(ctx, doneRefs)
 
 	// Leases (one ActiveClaims when store present).
 	leases, leaseActor, leaseErr := readPulseLeases(ctx)
@@ -144,21 +154,22 @@ func gatherPulseObservation(ctx context.Context, act bool) (pulse.Observation, p
 	return obs, actor
 }
 
-func readPulseProvider(ctx context.Context) pulse.ProviderObservation {
+func readPulseProvider(ctx context.Context) (pulse.ProviderObservation, map[string]bool) {
 	cfg, err := config.LoadConfig(".herd/herd.yaml")
 	if err != nil {
-		return pulse.ProviderObservation{Known: false, Error: err.Error()}
+		return pulse.ProviderObservation{Known: false, Error: err.Error()}, nil
 	}
 	tp, err := loadTaskProvider(cfg)
 	if err != nil {
-		return pulse.ProviderObservation{Known: false, Error: err.Error()}
+		return pulse.ProviderObservation{Known: false, Error: err.Error()}, nil
 	}
 	project := strings.TrimSpace(cfg.TaskProvider.ProjectID)
 	tasks, err := tp.ListTasks(ctx, project, "")
 	if err != nil {
-		return pulse.ProviderObservation{Known: false, Error: err.Error()}
+		return pulse.ProviderObservation{Known: false, Error: err.Error()}, nil
 	}
 	var claimable, inProgress int64
+	doneRefs := make(map[string]bool)
 	for _, t := range tasks {
 		if t == nil {
 			continue
@@ -168,6 +179,11 @@ func readPulseProvider(ctx context.Context) pulse.ProviderObservation {
 			claimable++
 		case provider.StatusInProgress:
 			inProgress++
+		case provider.StatusDone:
+			ref := strings.ToUpper(strings.TrimSpace(t.Ref))
+			if ref != "" {
+				doneRefs[ref] = true
+			}
 		}
 	}
 	return pulse.ProviderObservation{
@@ -175,24 +191,36 @@ func readPulseProvider(ctx context.Context) pulse.ProviderObservation {
 		QueueDepth: int64(len(tasks)),
 		Claimable:  claimable,
 		InProgress: inProgress,
-	}
+	}, doneRefs
 }
 
-func readPulseHerdr() pulse.HerdrObservation {
+// readPulseHerdr reads the live fleet and enriches each agent with reap
+// evidence (FAC-218). The evidence fields — CommittedWork, TicketDone,
+// SafeRef, AwaitingVerdict, TabGeneration, TabRevision — drive the FAC-221
+// reap planner so it fires on every idle-with-evidence state, not just
+// ticket-done. Without enrichment the planner never sees exit evidence and
+// idle lanes sit resident indefinitely.
+func readPulseHerdr(ctx context.Context, doneRefs map[string]bool) pulse.HerdrObservation {
 	agents, err := herdr.AgentList()
 	if err != nil {
 		return pulse.HerdrObservation{Known: false, Error: err.Error()}
 	}
+	ev := loadReapEvidence(ctx, agents, doneRefs)
 	out := make([]pulse.AgentObservation, 0, len(agents))
 	for _, a := range agents {
-		out = append(out, pulse.AgentObservation{
-			Name:      a.Name,
-			Raw:       a.Status,
-			Status:    pulse.ClassifyStatus(a.Status, false),
-			PaneID:    a.PaneID,
-			TabID:     a.TabID,
-			Workspace: a.Workspace,
-		})
+		agent := pulse.AgentObservation{
+			Name:          a.Name,
+			Raw:           a.Status,
+			Status:        pulse.ClassifyStatus(a.Status, false),
+			PaneID:        a.PaneID,
+			TabID:         a.TabID,
+			Workspace:     a.Workspace,
+			TabGeneration: a.StateChangeSeq,
+			TabRevision:   a.Revision,
+		}
+		ref := taskRefFromAgentName(a.Name)
+		agent = applyReapEvidence(agent, ref, ev)
+		out = append(out, agent)
 	}
 	return pulse.HerdrObservation{Known: true, Agents: out}
 }
@@ -439,15 +467,164 @@ func (a *livePulseActor) ReapLane(ctx context.Context, lane pulse.AgentObservati
 	if strings.TrimSpace(lane.Workspace) == "" {
 		return fmt.Errorf("pulse: reap requires workspace; lane %q tab %s has none", lane.Name, lane.TabID)
 	}
-	// FAC-221: the close path requires tab generation evidence from the
-	// herdr server (LiveTab.Generation) and a durable nonce. The pulse
-	// observation does not yet carry the tab generation — wiring it
-	// requires a herdr tab-list or toolchild-lifecycle read per reap
-	// target. An honest refusal is better than an unfenced close that
-	// could recycle-kill a tab that gained a new agent between readback
-	// and mutation (FAC-180). The reap is still ENFORCED: every beat
-	// plans it, so the coordinator cannot forget it.
-	return errors.New("pulse: reap close adapter requires tab generation evidence (FAC-180 compare-and-close; not yet wired into pulse observation)")
+	if lane.TabGeneration == 0 {
+		return fmt.Errorf("pulse: reap requires tab generation evidence; lane %q tab %s has none (FAC-180 compare-and-close fence)", lane.Name, lane.TabID)
+	}
+	nonce, err := reapNonce(lane.TabID)
+	if err != nil {
+		return fmt.Errorf("pulse: reap nonce: %w", err)
+	}
+	var paneIDs []string
+	if strings.TrimSpace(lane.PaneID) != "" {
+		paneIDs = []string{lane.PaneID}
+	}
+	req := herdr.CompareAndCloseRequest{
+		WorkspaceID:   lane.Workspace,
+		TabID:         lane.TabID,
+		TabGeneration: lane.TabGeneration,
+		TabRevision:   lane.TabRevision,
+		PaneIDs:       paneIDs,
+		Nonce:         nonce,
+	}
+	receipt, err := herdr.CompareAndCloseTab(req)
+	if err != nil {
+		return fmt.Errorf("pulse: reap close %s: %w", lane.TabID, err)
+	}
+	switch receipt.Outcome {
+	case herdr.OutcomeClosed, herdr.OutcomeReplayed, herdr.OutcomeAlreadyClosed:
+		if !receipt.ResultingAbsence {
+			return fmt.Errorf("pulse: reap close %s: outcome %s without resulting absence", lane.TabID, receipt.Outcome)
+		}
+		return nil
+	default:
+		return fmt.Errorf("pulse: reap close %s: %s", lane.TabID, receipt.Outcome)
+	}
+}
+
+// reapNonce generates a durable idempotency nonce for a pulse reap close.
+func reapNonce(tabID string) (string, error) {
+	b := make([]byte, 8)
+	if _, err := cryptorand.Read(b); err != nil {
+		return "", err
+	}
+	return "pulse-reap-" + tabID + "-" + hex.EncodeToString(b), nil
+}
+
+// taskRefFromAgentName extracts the ticket ref from a task-lane agent name.
+// Task lanes are named "task-<lowercased-ref>" (e.g. "task-fac-218" ->
+// "FAC-218"). Returns "" for standing lanes that don't carry a task ref.
+func taskRefFromAgentName(name string) string {
+	name = strings.TrimSpace(name)
+	lower := strings.ToLower(name)
+	if !strings.HasPrefix(lower, "task-") {
+		return ""
+	}
+	return strings.ToUpper(strings.TrimPrefix(lower, "task-"))
+}
+
+// reapEvidence holds pre-loaded evidence for enriching pulse agent
+// observations. Each map is nil-safe: a nil map means "no evidence
+// available" and the corresponding field is left unset (fail closed —
+// the lane is not reaped without proof).
+type reapEvidence struct {
+	doneRefs   map[string]bool   // uppercased task refs with done status
+	safeRefs   map[string]string // uppercased task ref -> safe ref name
+	vetoedSHAs map[string]bool   // SHAs with FAIL/BLOCKED verdict
+	headSHAs   map[string]string // agent name -> HEAD SHA
+	committed  map[string]bool   // agent name -> has committed work
+}
+
+// applyReapEvidence fills in CommittedWork, TicketDone, SafeRef, and
+// AwaitingVerdict on one agent observation from pre-loaded evidence.
+// This is a pure function — no I/O — so it is directly unit-testable.
+func applyReapEvidence(agent pulse.AgentObservation, ref string, ev reapEvidence) pulse.AgentObservation {
+	if ref != "" {
+		if ev.doneRefs != nil && ev.doneRefs[ref] {
+			agent.TicketDone = true
+		}
+		if sr, ok := ev.safeRefs[ref]; ok && strings.TrimSpace(sr) != "" {
+			agent.SafeRef = sr
+		}
+	}
+	if ev.committed != nil && ev.committed[agent.Name] {
+		agent.CommittedWork = true
+	}
+	if ev.vetoedSHAs != nil && ev.headSHAs != nil {
+		if sha, ok := ev.headSHAs[agent.Name]; ok && sha != "" && ev.vetoedSHAs[sha] {
+			agent.AwaitingVerdict = true
+		}
+	}
+	return agent
+}
+
+// loadReapEvidence gathers evidence from worktree, board, and review sources.
+// It runs git in each agent's Cwd to check for committed work, safe refs, and
+// HEAD SHAs, and reads the review ledger for vetoed SHAs. Any source error
+// leaves the corresponding map nil (fail closed) rather than inventing
+// evidence.
+func loadReapEvidence(ctx context.Context, entries []herdr.AgentEntry, doneRefs map[string]bool) reapEvidence {
+	ev := reapEvidence{doneRefs: doneRefs}
+
+	ledgerPath := drainLedgerPath()
+	if _, err := os.Stat(ledgerPath); err == nil {
+		ledger := review.OpenLedger(ledgerPath)
+		if vetoed, err := ledger.Vetoed(ctx); err == nil {
+			ev.vetoedSHAs = vetoed
+		}
+	}
+
+	ev.safeRefs = make(map[string]string)
+	ev.headSHAs = make(map[string]string)
+	ev.committed = make(map[string]bool)
+
+	for _, a := range entries {
+		cwd := strings.TrimSpace(a.Cwd)
+		if cwd == "" {
+			continue
+		}
+		ref := taskRefFromAgentName(a.Name)
+		if ref != "" {
+			safeRefName := worktree.SafeRefFor(ref)
+			if sha, err := gitRevParse(cwd, safeRefName); err == nil && sha != "" {
+				ev.safeRefs[ref] = safeRefName
+			}
+		}
+		if sha, err := gitRevParse(cwd, "HEAD"); err == nil && sha != "" {
+			ev.headSHAs[a.Name] = sha
+		}
+		if hasCommittedWork(cwd) {
+			ev.committed[a.Name] = true
+		}
+	}
+	return ev
+}
+
+// gitRevParse runs `git rev-parse --verify --quiet <ref>` in cwd and returns
+// the trimmed SHA. An empty string with nil error means the ref does not exist.
+func gitRevParse(cwd, ref string) (string, error) {
+	out, err := exec.Command("git", "-C", cwd, "rev-parse", "--verify", "--quiet", ref).Output()
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+
+// hasCommittedWork reports whether the worktree at cwd has at least one
+// commit ahead of origin/main whose subject is not an anchor or wip marker.
+// Git errors return false (fail closed — no evidence of committed work).
+func hasCommittedWork(cwd string) bool {
+	out, err := exec.Command("git", "-C", cwd, "log", "--format=%s", "origin/main..HEAD").Output()
+	if err != nil {
+		return false
+	}
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		subj := strings.TrimSpace(line)
+		if subj == "" || strings.HasPrefix(subj, "chore: anchor") || strings.HasPrefix(subj, "wip:") {
+			continue
+		}
+		return true
+	}
+	return false
 }
 
 func (a *livePulseActor) OpenReview(ctx context.Context, lane pulse.AgentObservation) error {

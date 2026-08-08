@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -10,6 +11,8 @@ import (
 
 	"github.com/Kampe/Herdforge/pkg/claim"
 	"github.com/Kampe/Herdforge/pkg/deps"
+	"github.com/Kampe/Herdforge/pkg/herdr"
+	"github.com/Kampe/Herdforge/pkg/pulse"
 	"github.com/Kampe/Herdforge/pkg/winddown"
 )
 
@@ -151,5 +154,343 @@ func TestReadPulseLeasesSeesProductionLaunchClaimsDB(t *testing.T) {
 		Project: leases[0].Project, TaskRef: leases[0].TaskRef,
 	}, leases[0].OwnerID, leases[0].Generation-1); err == nil {
 		t.Fatal("stale generation renew must fail")
+	}
+}
+
+// --- FAC-218: fleet-level reap evidence and close path tests ---
+
+func TestTaskRefFromAgentName(t *testing.T) {
+	cases := []struct {
+		name string
+		want string
+	}{
+		{"task-fac-218", "FAC-218"},
+		{"task-fac-155", "FAC-155"},
+		{"Task-FAC-218", "FAC-218"},
+		{"task-abc-123", "ABC-123"},
+		{"recovery-sentinel", ""},
+		{"forge-smith", ""},
+		{"", ""},
+		{"task-", ""},
+	}
+	for _, tc := range cases {
+		if got := taskRefFromAgentName(tc.name); got != tc.want {
+			t.Fatalf("taskRefFromAgentName(%q)=%q want %q", tc.name, got, tc.want)
+		}
+	}
+}
+
+func TestApplyReapEvidenceSetsAllFields(t *testing.T) {
+	agent := pulse.AgentObservation{Name: "task-fac-218"}
+	ev := reapEvidence{
+		doneRefs:   map[string]bool{"FAC-218": true},
+		safeRefs:   map[string]string{"FAC-218": "refs/herd/safe/fac-218"},
+		committed:  map[string]bool{"task-fac-218": true},
+		vetoedSHAs: map[string]bool{"abc123": true},
+		headSHAs:   map[string]string{"task-fac-218": "abc123"},
+	}
+	out := applyReapEvidence(agent, "FAC-218", ev)
+	if !out.TicketDone {
+		t.Fatal("TicketDone must be set when ref is in doneRefs")
+	}
+	if out.SafeRef != "refs/herd/safe/fac-218" {
+		t.Fatalf("SafeRef=%q", out.SafeRef)
+	}
+	if !out.CommittedWork {
+		t.Fatal("CommittedWork must be set when agent is in committed map")
+	}
+	if !out.AwaitingVerdict {
+		t.Fatal("AwaitingVerdict must be set when HEAD SHA is vetoed")
+	}
+}
+
+func TestApplyReapEvidenceNilMapsFailClosed(t *testing.T) {
+	agent := pulse.AgentObservation{Name: "task-fac-218"}
+	ev := reapEvidence{} // all nil maps
+	out := applyReapEvidence(agent, "FAC-218", ev)
+	if out.TicketDone || out.CommittedWork || out.AwaitingVerdict || out.SafeRef != "" {
+		t.Fatalf("nil evidence maps must not set any evidence fields: %+v", out)
+	}
+}
+
+func TestApplyReapEvidenceEmptyRefSkipsTicketAndSafeRef(t *testing.T) {
+	agent := pulse.AgentObservation{Name: "recovery-sentinel"}
+	ev := reapEvidence{
+		doneRefs:  map[string]bool{"FAC-218": true},
+		safeRefs:  map[string]string{"FAC-218": "refs/herd/safe/fac-218"},
+		committed: map[string]bool{"recovery-sentinel": true},
+	}
+	out := applyReapEvidence(agent, "", ev)
+	if out.TicketDone || out.SafeRef != "" {
+		t.Fatalf("empty ref must not set TicketDone or SafeRef: %+v", out)
+	}
+	if !out.CommittedWork {
+		t.Fatal("CommittedWork is keyed by agent name, not ref — must still be set")
+	}
+}
+
+// TestApplyReapEvidenceAwaitingVerdictFlipIsNonVacuous proves the KEEP
+// distinction is real: clearing the vetoed SHA must produce AwaitingVerdict=false.
+func TestApplyReapEvidenceAwaitingVerdictFlipIsNonVacuous(t *testing.T) {
+	agent := pulse.AgentObservation{Name: "task-fac-218"}
+	ev := reapEvidence{
+		vetoedSHAs: map[string]bool{"abc123": true},
+		headSHAs:   map[string]string{"task-fac-218": "abc123"},
+	}
+	if out := applyReapEvidence(agent, "FAC-218", ev); !out.AwaitingVerdict {
+		t.Fatal("vetoed HEAD must set AwaitingVerdict")
+	}
+	ev.vetoedSHAs = map[string]bool{}
+	if out := applyReapEvidence(agent, "FAC-218", ev); out.AwaitingVerdict {
+		t.Fatal("non-vetoed HEAD must not set AwaitingVerdict")
+	}
+}
+
+func TestReapLaneClosesWithFencingEvidence(t *testing.T) {
+	var capturedReq herdr.CompareAndCloseRequest
+	restore := herdr.SetCompareCloseTransportForTest(func(req herdr.CompareAndCloseRequest) (herdr.CloseReceipt, error) {
+		capturedReq = req
+		return herdr.CloseReceipt{
+			Request:          req,
+			Outcome:          herdr.OutcomeClosed,
+			ResultingAbsence: true,
+		}, nil
+	})
+	defer restore()
+
+	actor := &livePulseActor{}
+	lane := pulse.AgentObservation{
+		Name:          "task-fac-218",
+		TabID:         "wK:t1",
+		Workspace:     "wK",
+		PaneID:        "p1",
+		TabGeneration: 7,
+		TabRevision:   3,
+	}
+	if err := actor.ReapLane(context.Background(), lane); err != nil {
+		t.Fatalf("ReapLane: %v", err)
+	}
+	if capturedReq.WorkspaceID != "wK" || capturedReq.TabID != "wK:t1" {
+		t.Fatalf("close request target mismatch: %+v", capturedReq)
+	}
+	if capturedReq.TabGeneration != 7 || capturedReq.TabRevision != 3 {
+		t.Fatalf("close request generation fence mismatch: gen=%d rev=%d", capturedReq.TabGeneration, capturedReq.TabRevision)
+	}
+	if capturedReq.Nonce == "" {
+		t.Fatal("close request must carry a nonce")
+	}
+	if len(capturedReq.PaneIDs) != 1 || capturedReq.PaneIDs[0] != "p1" {
+		t.Fatalf("close request paneIDs=%v want [p1]", capturedReq.PaneIDs)
+	}
+}
+
+func TestReapLaneFailsClosedOnMissingGeneration(t *testing.T) {
+	restore := herdr.SetCompareCloseTransportForTest(func(req herdr.CompareAndCloseRequest) (herdr.CloseReceipt, error) {
+		t.Fatal("transport must not be called when generation is missing")
+		return herdr.CloseReceipt{}, nil
+	})
+	defer restore()
+
+	actor := &livePulseActor{}
+	lane := pulse.AgentObservation{
+		Name:      "task-fac-218",
+		TabID:     "wK:t1",
+		Workspace: "wK",
+		// TabGeneration deliberately zero — no fencing evidence.
+	}
+	if err := actor.ReapLane(context.Background(), lane); err == nil {
+		t.Fatal("ReapLane must fail when TabGeneration is zero (no fencing evidence)")
+	}
+}
+
+func TestReapLaneFailsClosedOnMissingTabID(t *testing.T) {
+	actor := &livePulseActor{}
+	lane := pulse.AgentObservation{
+		Name:          "task-fac-218",
+		Workspace:     "wK",
+		TabGeneration: 7,
+	}
+	if err := actor.ReapLane(context.Background(), lane); err == nil {
+		t.Fatal("ReapLane must fail when TabID is empty")
+	}
+}
+
+func TestReapLaneAcceptsAlreadyClosed(t *testing.T) {
+	restore := herdr.SetCompareCloseTransportForTest(func(req herdr.CompareAndCloseRequest) (herdr.CloseReceipt, error) {
+		return herdr.CloseReceipt{
+			Request:          req,
+			Outcome:          herdr.OutcomeAlreadyClosed,
+			ResultingAbsence: true,
+		}, nil
+	})
+	defer restore()
+
+	actor := &livePulseActor{}
+	lane := pulse.AgentObservation{
+		Name:          "task-fac-218",
+		TabID:         "wK:t1",
+		Workspace:     "wK",
+		TabGeneration: 7,
+	}
+	if err := actor.ReapLane(context.Background(), lane); err != nil {
+		t.Fatalf("AlreadyClosed with resulting absence must succeed: %v", err)
+	}
+}
+
+func TestReapLaneRejectsStaleGeneration(t *testing.T) {
+	restore := herdr.SetCompareCloseTransportForTest(func(req herdr.CompareAndCloseRequest) (herdr.CloseReceipt, error) {
+		return herdr.CloseReceipt{
+			Request: req,
+			Outcome: herdr.OutcomeStaleGeneration,
+		}, nil
+	})
+	defer restore()
+
+	actor := &livePulseActor{}
+	lane := pulse.AgentObservation{
+		Name:          "task-fac-218",
+		TabID:         "wK:t1",
+		Workspace:     "wK",
+		TabGeneration: 7,
+	}
+	if err := actor.ReapLane(context.Background(), lane); err == nil {
+		t.Fatal("stale generation must be a hard error, not success")
+	}
+}
+
+func TestReapLaneRejectsAlreadyClosedWithoutAbsence(t *testing.T) {
+	restore := herdr.SetCompareCloseTransportForTest(func(req herdr.CompareAndCloseRequest) (herdr.CloseReceipt, error) {
+		return herdr.CloseReceipt{
+			Request:          req,
+			Outcome:          herdr.OutcomeAlreadyClosed,
+			ResultingAbsence: false,
+		}, nil
+	})
+	defer restore()
+
+	actor := &livePulseActor{}
+	lane := pulse.AgentObservation{
+		Name:          "task-fac-218",
+		TabID:         "wK:t1",
+		Workspace:     "wK",
+		TabGeneration: 7,
+	}
+	if err := actor.ReapLane(context.Background(), lane); err == nil {
+		t.Fatal("already_closed without resulting absence must fail")
+	}
+}
+
+// TestReapLaneTransportErrorIsHardError proves a transport failure (e.g.
+// herdr CLI not installed) propagates as an error, not a silent success.
+func TestReapLaneTransportErrorIsHardError(t *testing.T) {
+	restore := herdr.SetCompareCloseTransportForTest(func(req herdr.CompareAndCloseRequest) (herdr.CloseReceipt, error) {
+		return herdr.CloseReceipt{}, errors.New("herdr tab compare-close: command not found")
+	})
+	defer restore()
+
+	actor := &livePulseActor{}
+	lane := pulse.AgentObservation{
+		Name:          "task-fac-218",
+		TabID:         "wK:t1",
+		Workspace:     "wK",
+		TabGeneration: 7,
+	}
+	if err := actor.ReapLane(context.Background(), lane); err == nil {
+		t.Fatal("transport error must propagate as hard error")
+	}
+}
+
+// TestLoadReapEvidenceWithRealGitRepo proves evidence gathering works against
+// a real git worktree: committed work, safe refs, and HEAD SHA are detected.
+func TestLoadReapEvidenceWithRealGitRepo(t *testing.T) {
+	// Isolate the review ledger path so loadReapEvidence does not read a
+	// real ledger from the operator's state directory.
+	t.Setenv("HERD_REVIEW_LEDGER", filepath.Join(t.TempDir(), "no-ledger.jsonl"))
+
+	dir := t.TempDir()
+	runGitT(t, dir, "init", "-q", "-b", "main")
+	runGitT(t, dir, "config", "user.email", "reap@test")
+	runGitT(t, dir, "config", "user.name", "reap")
+	runGitT(t, dir, "config", "core.hooksPath", "/dev/null")
+	runGitT(t, dir, "config", "commit.gpgsign", "false")
+	writeRepoFile(t, dir, "base.txt", "base\n")
+	runGitT(t, dir, "branch", "-M", "main")
+	baseSHA := strings.TrimSpace(runGitT(t, dir, "rev-parse", "HEAD"))
+	runGitT(t, dir, "update-ref", "refs/remotes/origin/main", baseSHA)
+	writeRepoFile(t, dir, "work.txt", "work\n")
+	headSHA := strings.TrimSpace(runGitT(t, dir, "rev-parse", "HEAD"))
+
+	safeRef := "refs/herd/safe/fac-218"
+	runGitT(t, dir, "update-ref", safeRef, headSHA)
+
+	entries := []herdr.AgentEntry{
+		{Name: "task-fac-218", Cwd: dir},
+		{Name: "task-fac-999", Cwd: ""}, // empty Cwd — skipped
+	}
+	ev := loadReapEvidence(context.Background(), entries, map[string]bool{"FAC-218": true})
+
+	if !ev.committed["task-fac-218"] {
+		t.Fatal("expected committed work for task-fac-218")
+	}
+	if ev.safeRefs["FAC-218"] == "" {
+		t.Fatal("expected safe ref for FAC-218")
+	}
+	if ev.safeRefs["FAC-999"] != "" {
+		t.Fatal("FAC-999 should not have a safe ref")
+	}
+	if ev.headSHAs["task-fac-218"] != headSHA {
+		t.Fatalf("head SHA mismatch: got %q want %q", ev.headSHAs["task-fac-218"], headSHA)
+	}
+	if ev.headSHAs["task-fac-999"] != "" {
+		t.Fatal("empty Cwd agent should not have a head SHA")
+	}
+}
+
+// TestHasCommittedWorkExcludesAnchorAndWip proves that anchor and wip commits
+// do not count as committed work — only real feature commits do.
+func TestHasCommittedWorkExcludesAnchorAndWip(t *testing.T) {
+	dir := t.TempDir()
+	runGitT(t, dir, "init", "-q", "-b", "main")
+	runGitT(t, dir, "config", "user.email", "reap@test")
+	runGitT(t, dir, "config", "user.name", "reap")
+	runGitT(t, dir, "config", "core.hooksPath", "/dev/null")
+	runGitT(t, dir, "config", "commit.gpgsign", "false")
+	writeRepoFile(t, dir, "base.txt", "base\n")
+	baseSHA := strings.TrimSpace(runGitT(t, dir, "rev-parse", "HEAD"))
+	runGitT(t, dir, "update-ref", "refs/remotes/origin/main", baseSHA)
+
+	// Anchor commit only — should NOT count as committed work.
+	runGitT(t, dir, "commit", "--allow-empty", "-m", "chore: anchor FAC-218")
+	if hasCommittedWork(dir) {
+		t.Fatal("anchor-only commit must not count as committed work")
+	}
+
+	// Wip commit — should NOT count.
+	runGitT(t, dir, "commit", "--allow-empty", "-m", "wip: partial work")
+	if hasCommittedWork(dir) {
+		t.Fatal("wip commit must not count as committed work")
+	}
+
+	// Real commit — SHOULD count.
+	runGitT(t, dir, "commit", "--allow-empty", "-m", "feat: real work")
+	if !hasCommittedWork(dir) {
+		t.Fatal("real feature commit must count as committed work")
+	}
+}
+
+// TestHasCommittedWorkFailsClosedOnNoCommits proves that a worktree with no
+// commits ahead of origin/main does not show committed work.
+func TestHasCommittedWorkFailsClosedOnNoCommits(t *testing.T) {
+	dir := t.TempDir()
+	runGitT(t, dir, "init", "-q", "-b", "main")
+	runGitT(t, dir, "config", "user.email", "reap@test")
+	runGitT(t, dir, "config", "user.name", "reap")
+	runGitT(t, dir, "config", "core.hooksPath", "/dev/null")
+	runGitT(t, dir, "config", "commit.gpgsign", "false")
+	writeRepoFile(t, dir, "base.txt", "base\n")
+	baseSHA := strings.TrimSpace(runGitT(t, dir, "rev-parse", "HEAD"))
+	runGitT(t, dir, "update-ref", "refs/remotes/origin/main", baseSHA)
+	if hasCommittedWork(dir) {
+		t.Fatal("no commits ahead of origin/main must not show committed work")
 	}
 }
