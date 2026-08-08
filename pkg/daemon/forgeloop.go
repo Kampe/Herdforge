@@ -66,6 +66,15 @@ type ForgeLoopOptions struct {
 	Interval  time.Duration // pause between ticks (default 5s)
 	MaxTicks  int           // 0 = run until ctx cancelled or board drained
 	StopEmpty bool          // stop once the board is clear and no lane is busy
+
+	// Feedback is the periodic fleet-wide census runner (FAC-222). When set,
+	// the loop calls it every FeedbackInterval ticks so a lane that goes quiet
+	// is REPORTED rather than discovered by polling. A nil Feedback preserves
+	// the prior behavior (polling-only) — it is the backstop, not the primary
+	// signal. A Feedback error is logged, never fatal: a census failure must
+	// not stop the forge loop the way a transition failure does.
+	Feedback          func(ctx context.Context) error
+	FeedbackInterval  int // call Feedback every N ticks (default 0 = every tick when Feedback is set)
 }
 
 // ForgeLoop runs the async orchestration cycle: each tick it reads lane state
@@ -143,6 +152,21 @@ func (e *Engine) ForgeLoop(ctx context.Context, d ForgeDriver, opts ForgeLoopOpt
 		}
 		// Periodic reconciliation is the safety net for lost callbacks.
 		observe()
+
+		// FAC-222: periodic fleet-wide feedback census. A lane that goes quiet
+		// is REPORTED rather than discovered by polling. A census failure is
+		// logged, never fatal — it must not stop the forge loop.
+		if opts.Feedback != nil {
+			feedbackInterval := opts.FeedbackInterval
+			if feedbackInterval <= 0 {
+				feedbackInterval = 1
+			}
+			if tick%feedbackInterval == 0 {
+				if ferr := opts.Feedback(ctx); ferr != nil {
+					d.Log(fmt.Sprintf("forge: feedback census failed: %v", ferr))
+				}
+			}
+		}
 
 		// timeout → BLOCKED → recovering (probe) → ok on success.
 		if e.health.isBlocked() {

@@ -68,7 +68,7 @@ func TestBuildTaskPacket_CarriesProviderAndProjectBinding(t *testing.T) {
 	} {
 		t.Run(c.providerType, func(t *testing.T) {
 			packet := buildTaskPacket(task, "herd/fac-155", ".herd/prompts/worker.md",
-				c.providerType, c.project, lane, verification)
+				c.providerType, c.project, lane, verification, ReplyTarget{Name: "coordinator", LeaseGeneration: 1})
 
 			if !strings.Contains(packet, "provider="+c.providerType) {
 				t.Errorf("packet must bind the activated provider:\n%s", packet)

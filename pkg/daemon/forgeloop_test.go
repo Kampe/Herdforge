@@ -2,6 +2,8 @@ package daemon
 
 import (
 	"context"
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -255,5 +257,90 @@ func TestForgeLoopRunsObserveReconciliationAtStartupAndPeriodically(t *testing.T
 	// startup observe + one periodic observe per tick
 	if d.observations != 2 {
 		t.Fatalf("observe calls=%d, want startup+periodic", d.observations)
+	}
+}
+
+// FAC-222: the feedback census is wired into the forge loop so a lane that
+// goes quiet is REPORTED rather than discovered by polling. A nil Feedback
+// preserves the prior behavior (polling-only). A Feedback error is logged,
+// never fatal — a census failure must not stop the forge loop.
+func TestForgeLoopRunsFeedbackCensusPeriodically(t *testing.T) {
+	e := forgeEngine(t)
+	d := &fakeDriver{lanes: LaneState{Max: 1}, completed: map[string]bool{}, verified: map[string]bool{}}
+	var feedbackCalls int
+	feedback := func(context.Context) error {
+		feedbackCalls++
+		return nil
+	}
+	if err := e.ForgeLoop(context.Background(), d, ForgeLoopOptions{
+		Interval:         time.Millisecond,
+		MaxTicks:         3,
+		Feedback:         feedback,
+		FeedbackInterval: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if feedbackCalls != 3 {
+		t.Fatalf("feedback calls=%d, want one per tick (3 ticks)", feedbackCalls)
+	}
+}
+
+func TestForgeLoopFeedbackErrorIsLoggedNotFatal(t *testing.T) {
+	e := forgeEngine(t)
+	d := &fakeDriver{lanes: LaneState{Max: 1}, completed: map[string]bool{}, verified: map[string]bool{}}
+	feedback := func(context.Context) error {
+		return fmt.Errorf("census unavailable")
+	}
+	if err := e.ForgeLoop(context.Background(), d, ForgeLoopOptions{
+		Interval:         time.Millisecond,
+		MaxTicks:         1,
+		Feedback:         feedback,
+		FeedbackInterval: 1,
+	}); err != nil {
+		t.Fatalf("feedback error must not stop the loop: %v", err)
+	}
+	found := false
+	for _, msg := range d.logged {
+		if strings.Contains(msg, "feedback census failed") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("feedback error must be logged, got: %v", d.logged)
+	}
+}
+
+func TestForgeLoopNilFeedbackPreservesPriorBehavior(t *testing.T) {
+	e := forgeEngine(t)
+	d := &fakeDriver{lanes: LaneState{Max: 1}, completed: map[string]bool{}, verified: map[string]bool{}}
+	// Nil Feedback must not panic and must not change the loop's behavior.
+	if err := e.ForgeLoop(context.Background(), d, ForgeLoopOptions{
+		Interval: time.Millisecond,
+		MaxTicks: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestForgeLoopFeedbackIntervalRespected(t *testing.T) {
+	e := forgeEngine(t)
+	d := &fakeDriver{lanes: LaneState{Max: 1}, completed: map[string]bool{}, verified: map[string]bool{}}
+	var feedbackCalls int
+	feedback := func(context.Context) error {
+		feedbackCalls++
+		return nil
+	}
+	if err := e.ForgeLoop(context.Background(), d, ForgeLoopOptions{
+		Interval:         time.Millisecond,
+		MaxTicks:         6,
+		Feedback:         feedback,
+		FeedbackInterval: 2,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// tick 0, 2, 4 → 3 calls (tick 0 is the first tick, feedback runs at startup)
+	if feedbackCalls != 3 {
+		t.Fatalf("feedback calls=%d, want 3 (every 2 ticks over 6)", feedbackCalls)
 	}
 }
