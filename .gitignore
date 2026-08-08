@@ -9,6 +9,21 @@ kaneo.json
 .herd/kaneo.json
 .herd/herd.yaml.local
 
+# Coordinator-held receipt signing key (FAC-145) — never committed
+.herd/receipt.key
+
+# Launch receipt injected into agent worktrees at spawn (FAC-145) — runtime
+# state, never committed; must not dirty worktree evidence
+TASK-CONTEXT.json
+
+# FAC-145 runtime authority state: published verification key, callback bus,
+# and the approval intent journal
+.herd/receipt.pub
+.herd/mail.jsonl
+.herd/mail.jsonl.*
+.herd/approve-intents.jsonl
+.herd/approve-intents.lock
+
 # OS & Editor files
 .DS_Store
 *.swp

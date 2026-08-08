@@ -47,7 +47,7 @@ func TestDispatch_DepsGateBlocksBeforeWorktree(t *testing.T) {
 		Deps:         deps.StoreFor(mp, "test"),
 	}
 
-	_, err := d.Dispatch(context.Background(), DispatchOptions{TicketRef: "FAC-75", NoLaunch: true})
+	_, err := d.Dispatch(context.Background(), DispatchOptions{TicketRef: "FAC-75", NoLaunch: true, LeaseID: "claim:1", LeaseGeneration: 1})
 	if err == nil {
 		t.Fatal("expected dependency block")
 	}
@@ -80,7 +80,7 @@ func TestDispatch_MissingProvenanceBlocksBeforeWorktree(t *testing.T) {
 		Herdr:        &fakeHerdr{available: false},
 		Deps:         deps.StoreFor(mp, "test"),
 	}
-	_, err := d.Dispatch(context.Background(), DispatchOptions{TicketRef: "FAC-75", NoLaunch: true})
+	_, err := d.Dispatch(context.Background(), DispatchOptions{TicketRef: "FAC-75", NoLaunch: true, LeaseID: "claim:1", LeaseGeneration: 1})
 	if err == nil {
 		t.Fatal("missing provenance must fail")
 	}
@@ -126,7 +126,7 @@ func TestDispatch_DepsGateAllowsWhenBlockerDone(t *testing.T) {
 		Deps:         deps.StoreFor(mp, "test"),
 	})
 
-	_, err := d.Dispatch(context.Background(), DispatchOptions{TicketRef: "FAC-75", NoLaunch: true})
+	_, err := d.Dispatch(context.Background(), DispatchOptions{TicketRef: "FAC-75", NoLaunch: true, LeaseID: "claim:1", LeaseGeneration: 1})
 	if mw.calls != 1 {
 		t.Fatalf("expected worktree attempt after green gate, calls=%d err=%v", mw.calls, err)
 	}

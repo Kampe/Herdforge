@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
 )
 
@@ -270,4 +271,68 @@ func (j *JiraProvider) AddComment(ctx context.Context, taskID string, body strin
 		return err
 	}
 	return nil
+}
+
+// ListComments implements CommentReader (FAC-145 exact effect readback).
+// Atlassian document bodies are flattened to their text runs.
+func (j *JiraProvider) ListComments(ctx context.Context, taskID string) ([]string, error) {
+	dls := j.deadlines()
+	ctx, cancel := WithOpDeadline(ctx, dls, OpGet)
+	defer cancel()
+	var out []string
+	startAt := 0
+	for page := 0; page < maxCommentPages; page++ {
+		raw, err := j.doRequest(ctx, "GET", fmt.Sprintf("/rest/api/3/issue/%s/comment?startAt=%d&maxResults=100", taskID, startAt), nil)
+		if err != nil {
+			return nil, fmt.Errorf("jira ListComments failed: %w", err)
+		}
+		page, pErr := parseJiraCommentPage(raw)
+		if pErr != nil {
+			return nil, pErr
+		}
+		out = append(out, page.bodies...)
+		startAt += len(page.bodies)
+		if len(page.bodies) == 0 || startAt >= page.total {
+			return out, nil
+		}
+	}
+	return nil, fmt.Errorf("jira ListComments: exceeded %d pages — refusing a partial readback (FAC-145)", maxCommentPages)
+}
+
+type jiraCommentPage struct {
+	bodies []string
+	total  int
+}
+
+func parseJiraCommentPage(raw []byte) (jiraCommentPage, error) {
+	var payload struct {
+		Total    int `json:"total"`
+		Comments []struct {
+			Body struct {
+				Content []struct {
+					Content []struct {
+						Text string `json:"text"`
+					} `json:"content"`
+				} `json:"content"`
+			} `json:"body"`
+		} `json:"comments"`
+	}
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return jiraCommentPage{}, fmt.Errorf("jira ListComments decode: %w", err)
+	}
+	bodies := make([]string, 0, len(payload.Comments))
+	for _, c := range payload.Comments {
+		var b strings.Builder
+		for _, para := range c.Body.Content {
+			for _, run := range para.Content {
+				b.WriteString(run.Text)
+			}
+		}
+		bodies = append(bodies, b.String())
+	}
+	total := payload.Total
+	if total == 0 {
+		total = len(bodies)
+	}
+	return jiraCommentPage{bodies: bodies, total: total}, nil
 }

@@ -118,6 +118,22 @@ func cloneConsumerState(st consumerState) consumerState {
 	return out
 }
 
+// HighWaterGeneration reports the newest lease generation durably
+// acknowledged for (repo, ref) on the given mailbox — the production
+// CurrentGeneration source for receipt fencing (FAC-145). Zero when the key
+// was never acknowledged or no consumer state exists yet.
+func HighWaterGeneration(mailFile, repo, ref string) int64 {
+	data, err := os.ReadFile(mailFile + ".callback-state.json")
+	if err != nil {
+		return 0
+	}
+	var st consumerState
+	if json.Unmarshal(data, &st) != nil || st.Acked == nil {
+		return 0
+	}
+	return st.Acked[ackKey(repo, ref)].LeaseGeneration
+}
+
 func (c *CallbackConsumer) load() error {
 	st, err := c.readStateFile()
 	if err != nil {

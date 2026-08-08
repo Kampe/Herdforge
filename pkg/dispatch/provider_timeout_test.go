@@ -54,7 +54,7 @@ func TestDispatch_ListTimeout_ProjectsBlocked(t *testing.T) {
 	d := NewDispatcher(cfg, board, nil)
 	d.Compensator = noopComp{}
 	// Worktree nil will fail later — but list happens first.
-	_, err := d.Dispatch(context.Background(), validLaunchOptions(t, "FAC-1"))
+	_, err := d.Dispatch(context.Background(), leasedLaunchOptions(t, "FAC-1"))
 	if err == nil {
 		t.Fatal("expected list timeout error")
 	}

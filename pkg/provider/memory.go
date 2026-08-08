@@ -11,13 +11,13 @@ import (
 type MemoryProvider struct {
 	mu        sync.Mutex
 	tasks     map[string]*Task
+	comments  map[string][]string
 	labels    map[string]TaskLabel
 	nextLabel int
 	attachIDs []string
 	proofed   map[string]bool
 	relations map[string]Relation // id → relation
 	nextRel   int
-	comments  map[string][]string
 }
 
 func (m *MemoryProvider) LabelMutationAuthority() (string, error) {
@@ -250,6 +250,9 @@ func (m *MemoryProvider) AddComment(ctx context.Context, taskID string, body str
 			return fmt.Errorf("task not found: %s", taskID)
 		}
 	}
+	if m.comments == nil {
+		m.comments = map[string][]string{}
+	}
 	m.comments[id] = append(m.comments[id], body)
 	return nil
 }
@@ -404,4 +407,16 @@ func (m *MemoryProvider) resolveIDLocked(idOrRef string) string {
 		}
 	}
 	return ""
+}
+
+// ListComments implements CommentReader for exact effect readback.
+func (m *MemoryProvider) ListComments(_ context.Context, taskID string) ([]string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.tasks[taskID]; !ok {
+		return nil, fmt.Errorf("task not found: %s", taskID)
+	}
+	out := make([]string, len(m.comments[taskID]))
+	copy(out, m.comments[taskID])
+	return out, nil
 }

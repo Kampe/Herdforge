@@ -216,6 +216,15 @@ func validLaunchOptions(t *testing.T, ref string) DispatchOptions {
 	}
 	return DispatchOptions{TicketRef: ref, Decision: d}
 }
+
+// leasedLaunchOptions is validLaunchOptions carrying a real claim-store lease.
+// FAC-145 made LeaseID/LeaseGeneration mandatory on the dispatch path.
+func leasedLaunchOptions(t *testing.T, ref string) DispatchOptions {
+	t.Helper()
+	o := validLaunchOptions(t, ref)
+	o.LeaseID, o.LeaseGeneration = "claim:1", 1
+	return o
+}
 func (f *fakeHerdr) DeliverAndProve(target, text string, _ time.Duration) (*herdr.PromptReceipt, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -281,6 +290,14 @@ func hasCompensateReason(comps []string, reason string) bool {
 func initDispatchRepo(t *testing.T) (repo string, wm *worktree.WorktreeManager) {
 	t.Helper()
 	repo = t.TempDir()
+	// FAC-145: receipt signing must never touch the real ~/.herd key store,
+	// and the key store must carry an EXTERNAL isolation attestation (what
+	// FAC-133's sandbox provides in production).
+	keyDir := t.TempDir()
+	if err := WriteIsolationAttestation(keyDir, "test-sandbox"); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(KeyDirEnv, keyDir)
 	run := func(args ...string) {
 		t.Helper()
 		c := exec.Command(args[0], args[1:]...)
@@ -313,6 +330,17 @@ func initDispatchRepo(t *testing.T) (repo string, wm *worktree.WorktreeManager) 
 		return resources.DiskDecision{Allowed: true, State: resources.DiskReady}
 	})
 	return repo, wm
+}
+
+// repoRootOf resolves the main repository root from a worktree path so
+// identity assertions use the same derivation production does.
+func repoRootOf(t *testing.T, worktreePath string) string {
+	t.Helper()
+	out, err := exec.Command("git", "-C", worktreePath, "rev-parse", "--path-format=absolute", "--git-common-dir").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return filepath.Dir(strings.TrimSpace(string(out)))
 }
 
 func testCfg() *config.Config {
@@ -353,7 +381,7 @@ func TestDispatch_NoLaunch_UsesActualGitBranchAndImmutableBase(t *testing.T) {
 	d.Compensator = comp
 	d.Herdr = &fakeHerdr{available: false}
 
-	res, err := d.Dispatch(context.Background(), DispatchOptions{TicketRef: "FAC-1", NoLaunch: true})
+	res, err := d.Dispatch(context.Background(), DispatchOptions{TicketRef: "FAC-1", NoLaunch: true, LeaseID: "claim:1", LeaseGeneration: 1})
 	if err != nil {
 		t.Fatalf("Dispatch: %v", err)
 	}
@@ -406,7 +434,7 @@ func TestDispatch_Launch_SetsCwdAndProvesPrompt(t *testing.T) {
 	d.Ownership = &fixedGenerationOwnership{generation: 7}
 
 	// Production path: always proves consumption (no SkipPromptVerify).
-	res, err := d.Dispatch(context.Background(), validLaunchOptions(t, "FAC-9"))
+	res, err := d.Dispatch(context.Background(), leasedLaunchOptions(t, "FAC-9"))
 	if err != nil {
 		t.Fatalf("Dispatch: %v", err)
 	}
@@ -487,6 +515,46 @@ func TestDispatch_Launch_SetsCwdAndProvesPrompt(t *testing.T) {
 	}
 }
 
+// FAC-145: launch() must re-stamp the receipt with the resolved herdr
+// workspace and carry the dispatch's lease binding through.
+func TestDispatch_Launch_StampsHerdrWorkspaceIntoReceipt(t *testing.T) {
+	_, wm := initDispatchRepo(t)
+	tp := &statusTrackingProvider{
+		mockTaskProvider: mockTaskProvider{tasks: []*provider.Task{baseTask("FAC-9")}},
+	}
+	// A tab id no other test reserves: the tool-child lifecycle registry is
+	// process-local, so reusing "tab-9" would exercise the collision guard
+	// instead of the workspace stamp this test is about.
+	fh := &fakeHerdr{available: true, workspace: "wHerd", model: "deepseek-v4-flash", tabID: "tab-ws-stamp"}
+	d := NewDispatcher(testCfg(), tp, wm)
+	d.Herdr = fh
+	d.Compensator = &recordingCompensator{}
+
+	// A compiled LaunchDecision is required on the launch path; keep this
+	// test's own lease identity so the generation assertions stay meaningful.
+	opts := validLaunchOptions(t, "FAC-9")
+	opts.LeaseID, opts.LeaseGeneration = "lease-9", 7
+	res, err := d.Dispatch(context.Background(), opts)
+	if err != nil {
+		t.Fatalf("Dispatch: %v", err)
+	}
+	t.Cleanup(func() { os.RemoveAll(res.Worktree) })
+
+	tc, err := ReadTaskContext(res.Worktree)
+	if err != nil {
+		t.Fatalf("receipt unreadable after launch: %v", err)
+	}
+	if tc.HerdrWorkspace != "wHerd" {
+		t.Errorf("herdr workspace not stamped, got %q", tc.HerdrWorkspace)
+	}
+	if tc.LeaseID != "lease-9" || tc.LeaseGeneration != 7 {
+		t.Errorf("lease binding lost: id=%q gen=%d", tc.LeaseID, tc.LeaseGeneration)
+	}
+	if tc.Role != RoleWorker || tc.Repository != RepositoryIdentityOrName(repoRootOf(t, res.Worktree), "Herdforge") {
+		t.Errorf("receipt identity wrong: %+v", tc)
+	}
+}
+
 // TestDispatch_EmptyBranchAfterWorktreeCompensates covers the post-side-effect
 // path where CreateTaskWorktreeFrom returned a real path but empty Branch.
 // Must failOwned("empty_worktree_branch") exactly once and never launch.
@@ -524,7 +592,7 @@ func TestDispatch_EmptyBranchAfterWorktreeCompensates(t *testing.T) {
 		Herdr:        fh,
 	})
 
-	res, err := d.Dispatch(context.Background(), validLaunchOptions(t, "FAC-EMPTY"))
+	res, err := d.Dispatch(context.Background(), leasedLaunchOptions(t, "FAC-EMPTY"))
 	if err == nil {
 		t.Fatal("expected empty-branch failure after worktree side effect")
 	}
@@ -577,7 +645,7 @@ func TestDispatch_MissingVerificationTestCommandFailsClosed(t *testing.T) {
 	d.Compensator = comp
 	d.Herdr = &fakeHerdr{available: false}
 
-	res, err := d.Dispatch(context.Background(), DispatchOptions{TicketRef: "FAC-NOVERIFY", NoLaunch: true})
+	res, err := d.Dispatch(context.Background(), DispatchOptions{TicketRef: "FAC-NOVERIFY", NoLaunch: true, LeaseID: "claim:1", LeaseGeneration: 1})
 	if err == nil {
 		t.Fatal("expected fail-closed error when verification.test_command is unset")
 	}
@@ -604,7 +672,7 @@ func TestDispatch_NilCompensatorFailsClosed(t *testing.T) {
 	}
 	d := NewDispatcher(testCfg(), tp, wm)
 	// Compensator intentionally nil — production path must refuse.
-	_, err := d.Dispatch(context.Background(), DispatchOptions{TicketRef: "FAC-N", NoLaunch: true})
+	_, err := d.Dispatch(context.Background(), DispatchOptions{TicketRef: "FAC-N", NoLaunch: true, LeaseID: "claim:1", LeaseGeneration: 1})
 	if err == nil {
 		t.Fatal("nil compensator must fail closed")
 	}
@@ -633,7 +701,7 @@ func TestDispatch_RecordStepErrorPropagates(t *testing.T) {
 	d.Compensator = comp
 	d.Herdr = &fakeHerdr{available: false}
 
-	res, err := d.Dispatch(context.Background(), DispatchOptions{TicketRef: "FAC-R", NoLaunch: true})
+	res, err := d.Dispatch(context.Background(), DispatchOptions{TicketRef: "FAC-R", NoLaunch: true, LeaseID: "claim:1", LeaseGeneration: 1})
 	if err == nil {
 		t.Fatal("expected RecordStep error to fail closed")
 	}
@@ -665,7 +733,7 @@ func TestDispatch_UpdateStatusErrorCompensates(t *testing.T) {
 	d.Compensator = comp
 	d.Herdr = &fakeHerdr{available: false}
 
-	res, err := d.Dispatch(context.Background(), DispatchOptions{TicketRef: "FAC-US", NoLaunch: true})
+	res, err := d.Dispatch(context.Background(), DispatchOptions{TicketRef: "FAC-US", NoLaunch: true, LeaseID: "claim:1", LeaseGeneration: 1})
 	if err == nil {
 		t.Fatal("expected UpdateStatus failure")
 	}
@@ -708,7 +776,7 @@ func TestDispatch_CompensateErrorPropagates(t *testing.T) {
 	d.Herdr = fh
 	d.Compensator = comp
 
-	res, err := d.Dispatch(context.Background(), validLaunchOptions(t, "FAC-C"))
+	res, err := d.Dispatch(context.Background(), leasedLaunchOptions(t, "FAC-C"))
 	if err == nil {
 		t.Fatal("expected joined primary+compensate error")
 	}
@@ -751,7 +819,7 @@ func TestDispatch_RejectsInvalidPromptSequence(t *testing.T) {
 	d.Herdr = fh
 	d.Compensator = comp
 
-	res, err := d.Dispatch(context.Background(), validLaunchOptions(t, "FAC-SEQ"))
+	res, err := d.Dispatch(context.Background(), leasedLaunchOptions(t, "FAC-SEQ"))
 	if err == nil {
 		t.Fatal("working→working receipt must be rejected on launch path")
 	}
@@ -793,7 +861,7 @@ func TestDispatch_CrashPoint_AgentStartClosesOrphanTab(t *testing.T) {
 	d.Herdr = fh
 	d.Compensator = comp
 
-	res, err := d.Dispatch(context.Background(), validLaunchOptions(t, "FAC-7"))
+	res, err := d.Dispatch(context.Background(), leasedLaunchOptions(t, "FAC-7"))
 	if err == nil {
 		t.Fatal("expected agent start failure")
 	}
@@ -829,7 +897,7 @@ func TestDispatch_AgentStart_TabCloseErrorNotSilent(t *testing.T) {
 	d.Herdr = fh
 	d.Compensator = comp
 
-	res, err := d.Dispatch(context.Background(), validLaunchOptions(t, "FAC-7C"))
+	res, err := d.Dispatch(context.Background(), leasedLaunchOptions(t, "FAC-7C"))
 	if err == nil {
 		t.Fatal("expected failure when start and tab-close both fail")
 	}
@@ -879,7 +947,7 @@ func TestDispatch_CrashPoint_PromptFailureClosesTab(t *testing.T) {
 	d.Herdr = fh
 	d.Compensator = comp
 
-	res, err := d.Dispatch(context.Background(), validLaunchOptions(t, "FAC-8"))
+	res, err := d.Dispatch(context.Background(), leasedLaunchOptions(t, "FAC-8"))
 	if err == nil {
 		t.Fatal("expected prompt failure")
 	}
@@ -912,7 +980,7 @@ func TestDispatch_PromptFailure_TabCloseErrorNotSilent(t *testing.T) {
 	d.Herdr = fh
 	d.Compensator = comp
 
-	res, err := d.Dispatch(context.Background(), validLaunchOptions(t, "FAC-8C"))
+	res, err := d.Dispatch(context.Background(), leasedLaunchOptions(t, "FAC-8C"))
 	if err == nil {
 		t.Fatal("expected failure")
 	}
@@ -954,7 +1022,7 @@ func TestDispatch_UnknownWorkspaceFailsClosed(t *testing.T) {
 	d.Herdr = fh
 	d.Compensator = comp
 
-	res, err := d.Dispatch(context.Background(), validLaunchOptions(t, "FAC-3"))
+	res, err := d.Dispatch(context.Background(), leasedLaunchOptions(t, "FAC-3"))
 	if err == nil {
 		t.Fatal("expected workspace failure")
 	}
@@ -993,7 +1061,7 @@ func TestDispatch_LaunchPath_RejectsSharedRoot(t *testing.T) {
 		AnchorRef: worktree.AnchorRefFor("FAC-ROOT"),
 	}
 	result := &DispatchResult{}
-	err := d.launch(context.Background(), validLaunchOptions(t, "FAC-3"), task, lane, wtInfo, wtInfo.Branch, "packet", result, nil)
+	err := d.launch(context.Background(), leasedLaunchOptions(t, "FAC-3"), task, lane, wtInfo, wtInfo.Branch, "packet", result, nil, validTaskContext())
 	if err == nil {
 		t.Fatal("launch on shared root must fail; production RejectSharedRoot guard missing?")
 	}
@@ -1026,6 +1094,8 @@ func TestDispatch_NoSkipPromptVerifyField(t *testing.T) {
 		TicketRef:           "FAC-X",
 		NoLaunch:            true,
 		PromptVerifyTimeout: time.Second,
+		LeaseID:             "claim:1",
+		LeaseGeneration:     1,
 	}
 	if opts.TicketRef == "" {
 		t.Fatal("sanity")
@@ -1140,7 +1210,7 @@ func TestDispatch_LaunchFailures_ExactlyOneCompensation(t *testing.T) {
 			d := NewDispatcher(cfg, tp, wm)
 			d.Herdr = tc.fh
 			d.Compensator = comp
-			res, err := d.Dispatch(context.Background(), validLaunchOptions(t, tc.ref))
+			res, err := d.Dispatch(context.Background(), leasedLaunchOptions(t, tc.ref))
 			if err == nil {
 				t.Fatal("expected launch failure")
 			}
@@ -1195,7 +1265,7 @@ func TestDispatch_CompensateFailure_RetainsGenerationLease(t *testing.T) {
 	d.Compensator = comp
 	d.Ownership = ownA
 
-	res, err := d.Dispatch(context.Background(), validLaunchOptions(t, "FAC-RET"))
+	res, err := d.Dispatch(context.Background(), leasedLaunchOptions(t, "FAC-RET"))
 	if err == nil {
 		t.Fatal("expected failure")
 	}

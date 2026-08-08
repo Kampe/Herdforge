@@ -2,12 +2,17 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
+	cryptorand "crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -23,6 +28,7 @@ import (
 
 	"github.com/Kampe/Herdforge/pkg/activate"
 	"github.com/Kampe/Herdforge/pkg/attention"
+	"github.com/Kampe/Herdforge/pkg/claim"
 	"github.com/Kampe/Herdforge/pkg/classify"
 	"github.com/Kampe/Herdforge/pkg/config"
 	"github.com/Kampe/Herdforge/pkg/control"
@@ -49,7 +55,6 @@ import (
 	"github.com/Kampe/Herdforge/pkg/resources"
 	"github.com/Kampe/Herdforge/pkg/review"
 	"github.com/Kampe/Herdforge/pkg/reviewingest"
-	"github.com/Kampe/Herdforge/pkg/reviewlaunch"
 	"github.com/Kampe/Herdforge/pkg/reviewledger"
 	"github.com/Kampe/Herdforge/pkg/router"
 	"github.com/Kampe/Herdforge/pkg/scopeauth"
@@ -362,6 +367,23 @@ func main() {
 
 	case "netbroker-serve":
 		runNetbrokerServe()
+
+	case "task":
+		runTaskClient()
+
+	case "receipt":
+		if len(os.Args) > 2 && os.Args[2] == "release" {
+			runReceiptRelease()
+		} else {
+			runReceiptIssue()
+		}
+
+	case "broker":
+		if len(os.Args) > 2 && os.Args[2] == "ensure" {
+			runBrokerEnsure()
+		} else {
+			runBrokerServe()
+		}
 
 	default:
 		fmt.Fprintf(os.Stderr, "unknown subcommand '%s'\nRun 'herd --help' for usage.\n", command)
@@ -1694,17 +1716,17 @@ func runReview() {
 	task := tasks[claimIdx]
 	fmt.Printf("\nSelected [%s] %s for review\n", task.Ref, task.Title)
 
-	if !spawn {
-		// FAC-187: board status must not move to in-review until a reviewer
-		// exists, has the exact task worktree, and has consumed its packet.
-		// Without --spawn this command only selects; it does not claim the
-		// review column. (spawn is a bool from parseReviewArgs — FAC-138.)
-		fmt.Println("review: selected only (pass --spawn for transactional reviewer launch + board transition)")
-		return
+	// FAC-145: the coordinator's bound board provider is resolved BEFORE
+	// any reviewer admission — the transition authority must exist before a
+	// reviewer is created.
+	reviewRoot, rootErr := canonicalHerdRoot()
+	if rootErr != nil {
+		fmt.Fprintf(os.Stderr, "review: cannot resolve canonical root: %v\n", rootErr)
+		os.Exit(1)
 	}
-
-	if !herdr.IsAvailable() {
-		fmt.Fprintf(os.Stderr, "herdr CLI not found\n")
+	btp, _, berr := boundBoardProvider(cfg, tp, reviewRoot, task.Ref)
+	if berr != nil {
+		fmt.Fprintf(os.Stderr, "review status transition unbound (FAC-145): %v\n", berr)
 		os.Exit(1)
 	}
 
@@ -1723,80 +1745,254 @@ func runReview() {
 		os.Exit(1)
 	}
 
-	lane := findLaneForRole(cfg, "reviewer")
-	if lane == nil {
-		fmt.Fprintf(os.Stderr, "no lane configured for role 'reviewer'\n")
-		os.Exit(1)
-	}
-	decision, err := launchAdmissionWithLifecycle(liveLaunchLifecycle{}, cfg, lane.Role, true, routedLaneDecision(context.Background(), task), func(_ *router.LaunchDecision) error {
-		_, listErr := herdr.AgentList()
-		return listErr
-	})
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "review launch route rejected before tab creation: %v\n", err)
-		os.Exit(1)
-	}
-	if err := validateDecisionBeforeSideEffect(decision, task.Ref); err != nil {
-		fmt.Fprintf(os.Stderr, "review launch decision rejected before tab creation: %v\n", err)
-		os.Exit(1)
-	}
+	if spawn {
+		lane := findLaneForRole(cfg, "reviewer")
+		if lane == nil {
+			fmt.Fprintf(os.Stderr, "no lane configured for role 'reviewer'\n")
+			os.Exit(1)
+		}
+		decision, err := launchAdmissionWithLifecycle(liveLaunchLifecycle{}, cfg, lane.Role, true, routedLaneDecision(context.Background(), task), func(_ *router.LaunchDecision) error {
+			_, listErr := herdr.AgentList()
+			return listErr
+		})
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "review launch route rejected before tab creation: %v\n", err)
+			os.Exit(1)
+		}
+		if err := validateDecisionBeforeSideEffect(decision, task.Ref); err != nil {
+			fmt.Fprintf(os.Stderr, "review launch decision rejected before tab creation: %v\n", err)
+			os.Exit(1)
+		}
 
-	// FAC-139: write-capable reviewer launch requires a current artifact
-	// tool-probe PASS for the decision's surface — fail before any tab.
-	if _, probeErr := ensureArtifactToolProbe(context.Background(), decision); probeErr != nil {
-		fmt.Fprintf(os.Stderr, "review launch tool-probe rejected before tab creation: %v\n", probeErr)
-		os.Exit(1)
-	}
+		// FAC-139: write-capable reviewer launch requires a current artifact
+		// tool-probe PASS for the decision's surface — fail before any tab.
+		if _, probeErr := ensureArtifactToolProbe(context.Background(), decision); probeErr != nil {
+			fmt.Fprintf(os.Stderr, "review launch tool-probe rejected before tab creation: %v\n", probeErr)
+			os.Exit(1)
+		}
 
-	// Exact task worktree — never the shared reviewer lane tree (incident:
-	// review-assayer-FAC-151 opened inside the FAC-172 worktree).
-	taskWT := filepath.Join(".herd", "worktrees", strings.ToLower(task.Ref))
-	if fi, statErr := os.Stat(taskWT); statErr != nil || !fi.IsDir() {
-		fmt.Fprintf(os.Stderr, "review launch rejected: exact task worktree %s is required\n", taskWT)
-		os.Exit(1)
-	}
+		// Exact task worktree — never the shared reviewer lane tree (incident:
+		// review-assayer-FAC-151 opened inside the FAC-172 worktree).
+		taskWT := filepath.Join(".herd", "worktrees", strings.ToLower(task.Ref))
+		if fi, statErr := os.Stat(taskWT); statErr != nil || !fi.IsDir() {
+			fmt.Fprintf(os.Stderr, "review launch rejected: exact task worktree %s is required\n", taskWT)
+			os.Exit(1)
+		}
 
-	// FAC-131: tight scoped review packet.
-	testCmd := scopedTestCommand(taskWT)
-	reviewPacket := fmt.Sprintf(`REVIEW %s — verdict ONLY, edit nothing. End with the verdict line.
+		// FAC-145: bind the reviewer to the exact provider/project/task AND
+		// the exact candidate/base commits BEFORE any agent exists, signed
+		// by the coordinator key. An active unexpired receipt for a
+		// DIFFERENT review is never silently rebound. Fail closed before
+		// spawning, delivering, or moving the card.
+		// FAC-145 (blocker 1): the AUTHOR worktree is only the source of
+		// the candidate commit — the reviewer never runs in it. The review
+		// happens in a FRESH isolated worktree checked out DETACHED at the
+		// exact candidate SHA, so review can neither mutate the candidate
+		// branch nor destroy the author's session context.
+		authorDir := filepath.Join(reviewRoot, ".herd", "worktrees", strings.ToLower(hsync.NormalizeRef(task.Ref)))
+		if fi, statErr := os.Stat(authorDir); statErr != nil || !fi.IsDir() {
+			fmt.Fprintf(os.Stderr, "review: no candidate worktree for %s at %s — refusing to review a generic lane HEAD (FAC-145)\n", task.Ref, authorDir)
+			os.Exit(1)
+		}
+		authorGit := func(args ...string) (string, error) {
+			out, err := exec.Command("git", append([]string{"-C", authorDir}, args...)...).Output()
+			return strings.TrimSpace(string(out)), err
+		}
+		branch, gitErr := authorGit("rev-parse", "--abbrev-ref", "HEAD")
+		candidateSHA, cErr := authorGit("rev-parse", "HEAD")
+		baseSHA, bErr := authorGit("rev-parse", "origin/main")
+		if gitErr != nil || cErr != nil || bErr != nil {
+			fmt.Fprintf(os.Stderr, "review: cannot resolve candidate/base commits from %s (FAC-145): %v %v %v\n", authorDir, gitErr, cErr, bErr)
+			os.Exit(1)
+		}
+
+		// The isolated candidate checkout is prepared BEFORE any launcher
+		// dependency: admission is proven even when herdr is unavailable.
+		// One immutable review checkout per (ref, candidate): re-running the
+		// same review reuses it; a different candidate gets its own.
+		worktreeDir := filepath.Join(reviewRoot, ".herd", "reviews",
+			fmt.Sprintf("%s-%s", strings.ToLower(hsync.NormalizeRef(task.Ref)), shortSHA(candidateSHA)))
+		if err := ensureDetachedReviewWorktree(reviewRoot, worktreeDir, candidateSHA); err != nil {
+			fmt.Fprintf(os.Stderr, "review: %v\n", err)
+			os.Exit(1)
+		}
+		if existing, exErr := dispatch.ReadTaskContext(worktreeDir); exErr == nil {
+			sameReview := strings.EqualFold(existing.TaskRef, task.Ref) && existing.CandidateSHA == candidateSHA
+			if !sameReview && time.Now().Before(existing.ExpiresAt) {
+				fmt.Fprintf(os.Stderr, "review worktree %s holds an ACTIVE receipt for %s@%s (expires %s) — refusing to rebind a live review (FAC-145)\n",
+					worktreeDir, existing.TaskRef, existing.CandidateSHA, existing.ExpiresAt.Format(time.RFC3339))
+				os.Exit(1)
+			}
+		}
+		spawnRoot := reviewRoot
+		if !herdr.IsAvailable() {
+			fmt.Fprintf(os.Stderr, "herdr CLI not found\n")
+			os.Exit(1)
+		}
+		signer, signerErr := dispatch.LoadSignerForConfig(cfg.Project.Name, spawnRoot)
+		if signerErr != nil {
+			fmt.Fprintf(os.Stderr, "coordinator signer (FAC-145): %v\n", signerErr)
+			os.Exit(1)
+		}
+		// ONE generation per task: the reviewer JOINS the task's active
+		// lease instead of minting an independent review generation.
+		reviewLeaseRef := hsync.NormalizeRef(task.Ref)
+		reviewLeaseKey := claim.LeaseKey{
+			Repo: dispatch.RepositoryIdentityOrName(spawnRoot, cfg.Project.Name), Provider: cfg.TaskProvider.Type, Project: cfg.TaskProvider.ProjectID, TaskRef: reviewLeaseRef,
+		}
+		leaseID, leaseGen, leaseOwned, leaseErr := acquireOrJoinLease(context.Background(), spawnRoot, reviewLeaseKey, "coordinator-review", dispatch.RoleReviewer)
+		if leaseErr != nil {
+			fmt.Fprintf(os.Stderr, "review: %v\n", leaseErr)
+			os.Exit(1)
+		}
+		// ONE durable admission lifecycle from here: every later failure
+		// unwinds the exact side effects created so far (FAC-145).
+		life := &reviewLifecycle{}
+		// Only a lease this admission ACQUIRED may be released on failure:
+		// releasing a joined task lease would revoke the author's authority.
+		if leaseOwned {
+			life.onFail(func() error {
+				return releaseCoordinationLease(context.Background(), spawnRoot, reviewLeaseKey, "coordinator-review", leaseGen)
+			})
+		}
+
+		reviewerReceipt, signErr := signer.Issue(dispatch.TaskContext{
+			ProviderType:      cfg.TaskProvider.Type,
+			ProjectID:         cfg.TaskProvider.ProjectID,
+			ProviderWorkspace: cfg.TaskProvider.WorkspaceID,
+			ProviderProfile:   cfg.TaskProvider.APIKeyEnv,
+			Repository:        dispatch.RepositoryIdentityOrName(spawnRoot, cfg.Project.Name),
+			Role:              dispatch.RoleReviewer,
+			TaskRef:           task.Ref,
+			TaskID:            task.ID,
+			Branch:            branch,
+			BaseSHA:           baseSHA,
+			CandidateSHA:      candidateSHA,
+			LeaseID:           leaseID,
+			LeaseGeneration:   leaseGen,
+			LeaseTaskRef:      reviewLeaseRef,
+			SessionID:         dispatch.NewSessionID(dispatch.RoleReviewer, task.Ref, candidateSHA, leaseID),
+			AllowedOps:        dispatch.ReviewerOps,
+			ExpiresAt:         time.Now().Add(dispatch.DefaultReceiptTTL),
+		})
+		if signErr != nil {
+			life.fail("failed to issue reviewer task context (FAC-145): %v", signErr)
+		}
+		priorReceipt, hadPrior := os.ReadFile(filepath.Join(worktreeDir, dispatch.TaskContextFile))
+		if err := dispatch.WriteTaskContext(worktreeDir, reviewerReceipt); err != nil {
+			life.fail("failed to write reviewer task context (FAC-145): %v", err)
+		}
+		life.onFail(func() error {
+			path := filepath.Join(worktreeDir, dispatch.TaskContextFile)
+			if hadPrior == nil {
+				return os.WriteFile(path, priorReceipt, 0644)
+			}
+			return os.Remove(path)
+		})
+
+		// Board transition FIRST: a reviewer is never admitted to work a
+		// card that is still In Progress. A later failure moves it back.
+		if err := btp.UpdateStatus(ctx, task.ID, "in-review"); err != nil {
+			life.fail("failed to move card to in-review status (FAC-145): %v", err)
+		}
+		fmt.Printf("  -> moved card [%s] to 'in-review' status\n", task.Ref)
+		life.onFail(func() error { return btp.UpdateStatus(context.Background(), task.ID, "in-progress") })
+
+		// FAC-145: the reviewer's PROCESS cwd is the isolated candidate
+		// checkout — never a standing generic tab that merely gets told to
+		// cd. A dedicated tab is created per (ref, candidate) with
+		// TabCreateForTask so the pane starts inside the pinned worktree,
+		// and the resolved session is bound into the receipt.
+		tabLabel := fmt.Sprintf("review-%s-%s", strings.ToLower(hsync.NormalizeRef(task.Ref)), shortSHA(candidateSHA))
+		if len(tabLabel) > 32 {
+			tabLabel = tabLabel[:32]
+		}
+		ws, wsErr := herdr.RequireWorkspace(reviewRoot)
+		if wsErr != nil {
+			life.fail("review: herdr workspace unresolved (FAC-145): %v", wsErr)
+		}
+		tab, tabErr := herdr.TabCreateForTask(ws, tabLabel, worktreeDir, true)
+		if tabErr != nil {
+			life.fail("failed to create isolated reviewer tab: %v", tabErr)
+		}
+		life.onFail(func() error { return herdr.TabClose(tab.ID) })
+		// The value tab create echoes back is only what we asked for. The
+		// guarantee must rest on the LIVE terminal state, read for the exact
+		// pane INCARNATION we just launched (FAC-145).
+		reviewerSession := herdr.SessionID(tab.Pane)
+		liveCwd, cwdErr := herdr.PaneLiveCwd(reviewerSession)
+		if cwdErr != nil {
+			life.fail("cannot read live reviewer pane cwd (FAC-145): %v", cwdErr)
+		}
+		if !sameDir(liveCwd, worktreeDir) {
+			life.fail("live reviewer pane cwd %q is not the isolated candidate checkout %q (FAC-145)", liveCwd, worktreeDir)
+		}
+		// Start through the compiled LaunchDecision (main's admission path):
+		// the isolated tab is FAC-145's requirement, the decision-bound start
+		// is the launch contract — the reviewer needs both.
+		// The reviewer runs under the TASK's generation, learned only after
+		// the lease was joined above. Rebind the routed capability to that
+		// exact context — lifecycle preparation refuses a task-scoped agent
+		// with no generation, and the request must match the decision.
+		boundDecision, rebindErr := router.RebindDecision(decision, task.Ref, leaseGen)
+		if rebindErr != nil {
+			life.fail("failed to bind reviewer launch to the task lease (FAC-145): %v", rebindErr)
+		}
+		reviewReq := taskLaunchRequest(boundDecision, task.Ref, repositoryIdentityForLaunch(cfg), lane.Name)
+		if err := herdr.StartPreparedAgent(tab.ID, tabLabel, boundDecision.Harness, tab.Pane.ID, reviewReq); err != nil {
+			life.fail("failed to start reviewer agent: %v", err)
+		}
+		targetLabel := tabLabel
+		fmt.Printf("Spawned reviewer '%s' in tab %s (pane %s, cwd %s)\n", tabLabel, tab.ID, tab.Pane.ID, tab.Cwd)
+
+		// Bind the LIVE session into the receipt: the reviewer's authority
+		// names the exact tab/pane INCARNATION it runs in, so the authority
+		// dies with that pane instead of transferring to whatever agent
+		// occupies the slot next (FAC-145).
+		boundReceipt := reviewerReceipt
+		boundReceipt.Signature = ""
+		boundReceipt.AgentSessionID = reviewerSession
+		boundSigned, bindErr := signer.Issue(boundReceipt)
+		if bindErr != nil {
+			life.fail("failed to bind reviewer session (FAC-145): %v", bindErr)
+		}
+		if err := dispatch.WriteTaskContext(worktreeDir, boundSigned); err != nil {
+			life.fail("failed to write session-bound reviewer receipt (FAC-145): %v", err)
+		}
+		if err := dispatch.StoreCanonicalReceipt(reviewRoot, boundSigned); err != nil {
+			life.fail("failed to store canonical reviewer receipt (FAC-145): %v", err)
+		}
+
+		// FAC-131: a TIGHT, SCOPED review packet — no spec dump, only the
+		// changed packages' targeted tests. Scope keeps the review inside
+		// the model's context window. FAC-145: the verdict is filed through
+		// the receipt-gated broker's TYPED reviewer-only operation — free
+		// text can never carry verdict authority.
+		testCmd := scopedTestCommand(worktreeDir)
+		reviewPacket := fmt.Sprintf(`REVIEW %s — verdict ONLY, edit nothing.
 cd %s
 1. git diff origin/main..HEAD --stat  (see ONLY the changed files — review just these)
 2. %s   (targeted tests for the changed packages, not the whole repo)
-3. If a port, spot-check the changed file against ~/Personal/chainseer/bin/ for parity.
-Your FINAL line MUST be exactly one of:
-REVIEW VERDICT %s: APPROVED
-REVIEW VERDICT %s: REJECTED - <numbered fixes>
+File your verdict through the broker (typed, receipt-bound):
+  herd task verdict %s APPROVED
+  herd task verdict %s REJECTED "<numbered fixes>"
 Do not read the whole codebase. Do not run the full suite. Change nothing.`,
-		task.Ref, taskWT, testCmd, task.Ref, task.Ref)
+			task.Ref, worktreeDir, testCmd, task.Ref, task.Ref)
 
-	repoRoot, rootErr := worktree.ResolveCanonicalRoot(ctx, ".", firstEnv("HERD_ROOT", "HERD_REPO_ROOT", ""))
-	if rootErr != nil {
-		repoRoot = "."
+		// An undelivered review packet is a BLOCKED review, not a warning.
+		if _, err := herdr.AgentPrompt(targetLabel, reviewPacket, false); err != nil {
+			life.fail("failed to deliver review packet (FAC-145 BLOCKED): %v", err)
+		}
+		fmt.Printf("  -> delivered review packet to %s\n", targetLabel)
+		return
 	}
-	lr := taskLaunchRequest(decision, task.Ref, repositoryIdentityForLaunch(cfg), lane.Name)
-	receiptPath := filepath.Join(".herd", "state", "reviewlaunch-receipts.jsonl")
-	launcher := &reviewlaunch.Launcher{
-		Herdr:       reviewlaunch.LiveHerdr{},
-		Board:       tp,
-		ReceiptPath: receiptPath,
-	}
-	res, launchErr := launcher.Launch(ctx, reviewlaunch.Request{
-		TaskRef:       task.Ref,
-		TaskID:        task.ID,
-		Role:          lane.Role,
-		Lane:          lane.Name,
-		Repository:    lr.Repository,
-		RepoRoot:      repoRoot,
-		WorktreePath:  taskWT,
-		Packet:        reviewPacket,
-		LaunchRequest: &lr,
-	})
-	if launchErr != nil {
-		fmt.Fprintf(os.Stderr, "review launch failed (board unchanged): %v\n", launchErr)
+
+	// No --spawn: the coordinator still performs the bound transition.
+	if err := btp.UpdateStatus(ctx, task.ID, "in-review"); err != nil {
+		fmt.Fprintf(os.Stderr, "failed to move card to in-review status (FAC-145): %v\n", err)
 		os.Exit(1)
 	}
-	fmt.Printf("Spawned reviewer '%s' in tab %s (pane %s) cwd=%s\n", res.AgentName, res.TabID, res.PaneID, res.Cwd)
-	fmt.Printf("  -> packet consumed (%s); moved card [%s] to %q\n", res.Receipt.SequenceToken, task.Ref, res.BoardTo)
+	fmt.Printf("  -> moved card [%s] to 'in-review' status\n", task.Ref)
 }
 
 // parseApproveArgs parses `herd approve [<ref>] [--receipt <path>] [--override-* ...]`.
@@ -1809,6 +2005,24 @@ func parseApproveArgs(args []string) (ref, receiptPath string, ov overrideFlags)
 	ovFlags := registerOverrideFlags(fs)
 	fs.Parse(leadingPositionalArgs(args))
 	return fs.Arg(0), *receiptFlag, ovFlags
+}
+
+// taskContextFor builds the FAC-145 launch receipt for a task outside the
+// dispatcher (review spawn, coordinator transitions, approve read-back).
+func taskContextFor(cfg *config.Config, task *provider.Task, branch, role string, ops []string) dispatch.TaskContext {
+	return dispatch.TaskContext{
+		ProviderType:      cfg.TaskProvider.Type,
+		ProjectID:         cfg.TaskProvider.ProjectID,
+		ProviderWorkspace: cfg.TaskProvider.WorkspaceID,
+		ProviderProfile:   cfg.TaskProvider.APIKeyEnv,
+		Repository:        cfg.Project.Name,
+		Role:              role,
+		TaskRef:           task.Ref,
+		TaskID:            task.ID,
+		Branch:            branch,
+		AllowedOps:        ops,
+		ExpiresAt:         time.Now().Add(dispatch.DefaultReceiptTTL),
+	}
 }
 
 // runApprove sweeps in-review cards and moves each to done ONLY from a
@@ -1837,6 +2051,58 @@ func runApprove() {
 
 	ctx := context.Background()
 
+	// FAC-145: acquire the CANONICAL transaction lock before scanning, and
+	// hold it across reconcile AND the sweep — two coordinators can never
+	// both capture the same pending set and re-drive a stale intent. The
+	// scan itself runs under the lock (state revalidated after acquisition).
+	root, rootErr := canonicalHerdRoot()
+	if rootErr != nil {
+		fmt.Fprintf(os.Stderr, "approve: cannot resolve canonical root: %v\n", rootErr)
+		os.Exit(1)
+	}
+	release, lockErr := lockApprovals(root)
+	if lockErr != nil {
+		fmt.Fprintf(os.Stderr, "approve: %v\n", lockErr)
+		os.Exit(1)
+	}
+	finish := func(code int) {
+		if err := release(); err != nil {
+			fmt.Fprintf(os.Stderr, "approve: %v\n", err)
+			if code == 0 {
+				code = 1
+			}
+		}
+		if code != 0 {
+			os.Exit(code)
+		}
+	}
+
+	// Complete any interrupted callback+Done transitions BEFORE sweeping —
+	// a crash between the journaled intent, the posted callback, and the
+	// board move leaves a pending intent that is re-driven here
+	// (idempotently), never forgotten.
+	reconcileFailed := 0
+	reconcileSigner, rsErr := dispatch.LoadSignerForConfig(cfg.Project.Name, root)
+	if rsErr != nil {
+		fmt.Fprintf(os.Stderr, "approve: coordinator signer unavailable (FAC-145): %v\n", rsErr)
+		finish(1)
+	}
+	pend, perr := pendingApproveIntents(root, reconcileSigner)
+	if perr != nil {
+		fmt.Fprintf(os.Stderr, "approve: intent journal unreadable (FAC-145): %v\n", perr)
+		finish(1)
+	}
+	for i := range pend {
+		in := pend[i]
+		fmt.Printf("RECONCILE [%s]: completing interrupted approval %s (state %s)\n", in.Ref, in.DedupeID, in.State)
+		// The journal names WHICH operation to finish; the closing authority
+		// is re-read from that ref's completion receipt (FAC-132).
+		if _, err := approveOne(ctx, cfg, tp, root, in.Ref, "", nil, &in); err != nil {
+			fmt.Fprintf(os.Stderr, "ERROR    [%s]: reconcile: %v\n", in.Ref, err)
+			reconcileFailed++
+		}
+	}
+
 	tasks, err := tp.ListTasks(ctx, cfg.TaskProvider.ProjectID, "in-review")
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to list in-review tasks: %v\n", err)
@@ -1854,15 +2120,19 @@ func runApprove() {
 		tasks = filtered
 		if len(tasks) == 0 {
 			fmt.Fprintf(os.Stderr, "no in-review card matches %s\n", want)
-			os.Exit(1)
+			finish(1)
 		}
 	} else if receiptPathArg != "" || override != nil {
 		fmt.Fprintf(os.Stderr, "--receipt and --override-* need a single <ref> argument\n")
-		os.Exit(1)
+		finish(1)
 	}
 
 	if len(tasks) == 0 {
 		fmt.Println("No tasks in review status to approve.")
+		if reconcileFailed > 0 {
+			finish(1)
+		}
+		finish(0)
 		return
 	}
 
@@ -1877,17 +2147,12 @@ func runApprove() {
 	}
 	defer stack.Close()
 
-	approved, refused, failed := 0, 0, 0
+	approved, refused, failed := 0, 0, reconcileFailed
 	for _, task := range tasks {
-		req, closeAuthority, buildErr := buildDoneRequest(".", cfg.TaskProvider.ProjectID, task.Ref, receiptPathArg, override)
-		if buildErr != nil {
-			closeAuthority()
-			fmt.Fprintf(os.Stderr, "ERROR    [%s]: %v\n", task.Ref, buildErr)
-			failed++
-			continue
-		}
-		res, err := fencedBoardDone(ctx, cfg, tp, stack, task, req)
-		closeAuthority()
+		// FAC-145: receipt-bound, callback-coupled approval — missing/
+		// unsigned/tampered receipt, wrong repo/project/task, expiry, stale
+		// generation, or an undeliverable callback all refuse the mutation.
+		res, err := approveOne(ctx, cfg, tp, root, task.Ref, receiptPathArg, override, nil)
 		switch {
 		case err == nil:
 			if res.Idempotent {
@@ -1908,8 +2173,701 @@ func runApprove() {
 
 	fmt.Printf("\nherd approve: approved=%d refused=%d failed=%d\n", approved, refused, failed)
 	if failed > 0 {
-		os.Exit(1)
+		finish(1)
 	}
+	finish(0)
+}
+
+// boundBoardProvider binds board mutations for ref to its launch receipt:
+// the receipt must EXIST in the managed worktree and authenticate against
+// the published coordinator key; the coordinator context is then re-ISSUED
+// (verified, widened, re-signed) by the private-key holder — there is no
+// field-rewrite widening and NO config-derived fallback. A missing,
+// unsigned, tampered, or mis-bound receipt refuses the mutation outright
+// (FAC-145 fail-closed). Returns the issued coordinator context so callbacks
+// share the exact binding. Generation fencing uses the durable callback
+// high-water mark until FAC-147's canonical fence source lands.
+// Every lookup — receipt, signer key, verifier anchor, lease high-water —
+// resolves from the CANONICAL root, never process cwd: a linked reviewer or
+// recovery worktree can no longer read the wrong receipt, key, or fence.
+func boundBoardProvider(cfg *config.Config, tp provider.TaskProvider, root, ref string) (provider.TaskProvider, dispatch.TaskContext, error) {
+	wt := filepath.Join(root, ".herd", "worktrees", strings.ToLower(hsync.NormalizeRef(ref)))
+	tc, err := dispatch.ReadTaskContext(wt)
+	if errors.Is(err, os.ErrNotExist) {
+		// Worktree reaped: recover from the coordinator's DURABLE canonical
+		// receipt store — issued, signed authority, not a config fallback.
+		tc, err = dispatch.LoadCanonicalReceipt(root, hsync.NormalizeRef(ref))
+	}
+	if err != nil {
+		return nil, tc, fmt.Errorf("no usable launch receipt for %s (worktree or canonical store; FAC-145 fail-closed, no config fallback): %w", ref, err)
+	}
+	signer, err := dispatch.LoadSignerForConfig(cfg.Project.Name, root)
+	if err != nil {
+		return nil, tc, fmt.Errorf("coordinator signer unavailable (FAC-145): %w", err)
+	}
+	coord, err := signer.IssueCoordinator(tc)
+	if err != nil {
+		return nil, tc, err
+	}
+	verifier, err := dispatch.LoadVerifier(root)
+	if err != nil {
+		return nil, tc, err
+	}
+	if err := requireLiveLease(context.Background(), root, coord); err != nil {
+		return nil, tc, err
+	}
+	btp, err := dispatch.NewContextBoundProvider(tp, coord, dispatch.AuthorityFromConfigAt(cfg, root), verifier, nil, coord.LeaseGeneration)
+	if err != nil {
+		return nil, tc, err
+	}
+	return btp, coord, nil
+}
+
+// The approval journal durably couples the PASS callback to the board
+// transition (FAC-145). It is the CANONICAL coordinator lifecycle record:
+// resolved from the repository's COMMON root (never process cwd, so every
+// worktree shares one journal and one lock), mode 0600 with ownership
+// audited, appended only under an exclusive cross-process flock that also
+// serializes the whole callback+Done transition, fsynced (file AND
+// directory), and every record is coordinator-SIGNED and HASH-CHAINED
+// (monotonic seq + prev-line hash) with a signed ANCHOR carrying the
+// high-water (seq, hash). Deleting, truncating, reordering, or replaying
+// signed lines breaks the chain or the anchor and fails reconciliation
+// closed. Residual: a same-UID host process rolling back journal AND
+// anchor to an older mutually consistent pair is only closed by FAC-147's
+// durable fenced store — this file lock is local-machine serialization,
+// replaced at that rebase.
+const (
+	approveIntentJournalName = "approve-intents.jsonl"
+	approveIntentAnchorName  = "approve-intents.anchor"
+	approveIntentLockName    = "approve-intents.lock"
+	journalGenesis           = "genesis"
+)
+
+func approvalPath(root, name string) string {
+	return filepath.Join(root, ".herd", name)
+}
+
+// canonicalHerdRoot resolves the repository's common root regardless of
+// which worktree the process runs in.
+func canonicalHerdRoot() (string, error) {
+	return repoRootFromWorktree(".")
+}
+
+// requireLiveLease is the ERROR-RETURNING exact-lease validation against
+// the durable claim store (the FAC-147 canonical-fence seam). The receipt
+// must be backed by the CURRENT ACTIVE lease for its key: exact lease row
+// identity, exact generation equality (a future or fabricated generation
+// fails exactly like a stale one), coordinator-owned, active state, and
+// unexpired. Missing, released, expired, or mismatched authority — and any
+// store read failure — refuses BEFORE provider I/O.
+func requireLiveLease(ctx context.Context, root string, tc dispatch.TaskContext) error {
+	st, err := claim.NewSQLiteLeaseStore(filepath.Join(root, ".herd", "herdforge.db"))
+	if err != nil {
+		return fmt.Errorf("fence store unavailable — refusing unfenced authority (FAC-145): %w", err)
+	}
+	defer st.Close()
+	now := time.Now()
+	leases, err := st.ActiveClaims(ctx, now)
+	if err != nil {
+		return fmt.Errorf("fence read failed — refusing unfenced authority (FAC-145): %w", err)
+	}
+	key := claim.LeaseKey{Repo: tc.Repository, Provider: tc.ProviderType, Project: tc.ProjectID, TaskRef: tc.LeaseTaskRef}
+	var live *claim.Lease
+	for i := range leases {
+		if leases[i].LeaseKey == key {
+			live = leases[i]
+			break
+		}
+	}
+	if live == nil {
+		return fmt.Errorf("no ACTIVE lease for lease key %s — receipt %s lease %s gen %d carries no live authority (FAC-145 fail-closed; released/expired/missing all refuse)", tc.LeaseTaskRef, tc.TaskRef, tc.LeaseID, tc.LeaseGeneration)
+	}
+	if live.Expired(now) {
+		return fmt.Errorf("lease for %s is expired (FAC-145)", tc.TaskRef)
+	}
+	if live.Generation != tc.LeaseGeneration {
+		return fmt.Errorf("receipt lease generation %d does not equal the live lease generation %d for %s — stale or fabricated authority refused (FAC-145)", tc.LeaseGeneration, live.Generation, tc.TaskRef)
+	}
+	if fmt.Sprintf("claim:%d", live.ID) != tc.LeaseID {
+		return fmt.Errorf("receipt lease id %s does not identify the live lease claim:%d for %s (FAC-145)", tc.LeaseID, live.ID, tc.TaskRef)
+	}
+	if !strings.HasPrefix(live.OwnerID, "coordinator-") {
+		return fmt.Errorf("live lease for %s is owned by %q, not a coordinator session (FAC-145)", tc.TaskRef, live.OwnerID)
+	}
+	return nil
+}
+
+// acquireCoordinationLease acquires the durable claim lease that backs a
+// receipt issuance — the real generation, never fabricated.
+func acquireCoordinationLease(ctx context.Context, root string, key claim.LeaseKey, owner, role string) (string, int64, error) {
+	st, err := claim.NewSQLiteLeaseStore(filepath.Join(root, ".herd", "herdforge.db"))
+	if err != nil {
+		return "", 0, fmt.Errorf("claim store unavailable (FAC-145): %w", err)
+	}
+	defer st.Close()
+	lease, err := st.Acquire(ctx, key, owner, role, "", time.Now(), dispatch.DefaultReceiptTTL)
+	if err != nil {
+		return "", 0, fmt.Errorf("claim lease acquisition failed (FAC-145): %w", err)
+	}
+	return fmt.Sprintf("claim:%d", lease.ID), lease.Generation, nil
+}
+
+// approveIntent persists the FULL bound identity of one approval operation
+// (FAC-145): repository, provider, project, task, lease — not just ref/sha
+// — and is keyed by its exact DedupeID, so operations from different
+// projects or lease generations can never collapse onto each other.
+// States: "intent" (internal pending, nothing external published), "done"
+// (fenced board mutation + read-back succeeded), "published" (external
+// completion callback delivered). The externally consumable completion is
+// only ever published from state done.
+type approveIntent struct {
+	Seq             int64  `json:"seq"`
+	PrevHash        string `json:"prev_hash"`
+	Repository      string `json:"repository"`
+	ProviderType    string `json:"provider_type"`
+	ProjectID       string `json:"project_id"`
+	Ref             string `json:"ref"`
+	TaskID          string `json:"task_id"`
+	SHA             string `json:"sha"`
+	LeaseID         string `json:"lease_id"`
+	LeaseGeneration int64  `json:"lease_generation"`
+	DedupeID        string `json:"dedupe_id"`
+	State           string `json:"state"` // "intent" | "done" | "published"
+	At              string `json:"at"`
+	Signature       string `json:"signature"`
+}
+
+// matchesContext rejects resuming an operation whose live receipt identity
+// has drifted from the journaled one (e.g. a lease generation switch
+// during recovery) — reconcile completes the EXACT recorded operation or
+// fails.
+func (r approveIntent) matchesContext(tc dispatch.TaskContext) error {
+	if !strings.EqualFold(r.Repository, tc.Repository) || r.ProviderType != tc.ProviderType ||
+		r.ProjectID != tc.ProjectID || r.TaskID != tc.TaskID ||
+		r.LeaseID != tc.LeaseID || r.LeaseGeneration != tc.LeaseGeneration {
+		return fmt.Errorf("journaled approval %s identity (repo=%s project=%s task=%s lease=%s gen=%d) does not match the live receipt (repo=%s project=%s task=%s lease=%s gen=%d) — refusing to resume a drifted operation (FAC-145)",
+			r.DedupeID, r.Repository, r.ProjectID, r.TaskID, r.LeaseID, r.LeaseGeneration,
+			tc.Repository, tc.ProjectID, tc.TaskID, tc.LeaseID, tc.LeaseGeneration)
+	}
+	return nil
+}
+
+type approveAnchor struct {
+	Seq       int64  `json:"seq"`
+	Hash      string `json:"hash"`
+	Signature string `json:"signature"`
+}
+
+func (r approveIntent) canonical() ([]byte, error) {
+	r.Signature = ""
+	return json.Marshal(r)
+}
+
+func (a approveAnchor) canonical() ([]byte, error) {
+	a.Signature = ""
+	return json.Marshal(a)
+}
+
+func journalLineHash(line []byte) string {
+	h := sha256.Sum256(line)
+	return hex.EncodeToString(h[:])
+}
+
+// auditPrivateFile refuses state files that are group/world accessible or
+// not owned by this coordinator uid. Missing files pass (creation follows).
+func auditPrivateFile(path string) error {
+	fi, err := os.Lstat(path)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("cannot audit %s (FAC-145 fail-closed): %w", path, err)
+	}
+	if fi.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("%s is a symlink — canonical state must not be redirectable (FAC-145)", path)
+	}
+	if !fi.Mode().IsRegular() {
+		return fmt.Errorf("%s is not a regular file (FAC-145)", path)
+	}
+	if fi.Mode().Perm()&0o077 != 0 {
+		return fmt.Errorf("%s is group/world accessible (%v) (FAC-145)", path, fi.Mode().Perm())
+	}
+	if st, ok := fi.Sys().(*syscall.Stat_t); ok && int(st.Uid) != os.Getuid() {
+		return fmt.Errorf("%s owned by uid %d, not this coordinator uid %d (FAC-145)", path, st.Uid, os.Getuid())
+	}
+	return nil
+}
+
+// auditStateDir refuses a .herd state directory not owned by this uid or
+// reachable through a symlink.
+func auditStateDir(root string) error {
+	dir := filepath.Join(root, ".herd")
+	fi, err := os.Lstat(dir)
+	if err != nil {
+		return fmt.Errorf("cannot audit state dir %s (FAC-145 fail-closed): %w", dir, err)
+	}
+	if fi.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("%s is a symlink — canonical state parent must not be redirectable (FAC-145)", dir)
+	}
+	if !fi.IsDir() {
+		return fmt.Errorf("%s is not a directory (FAC-145)", dir)
+	}
+	if st, ok := fi.Sys().(*syscall.Stat_t); ok && int(st.Uid) != os.Getuid() {
+		return fmt.Errorf("%s owned by uid %d, not this coordinator uid %d (FAC-145)", dir, st.Uid, os.Getuid())
+	}
+	return nil
+}
+
+// openNoFollow opens a state file refusing to traverse a symlink at the
+// final component, and re-verifies the opened fd is a regular file
+// (open-fd identity, not just a pre-open stat).
+func openNoFollow(path string, flag int, perm os.FileMode) (*os.File, error) {
+	f, err := os.OpenFile(path, flag|syscall.O_NOFOLLOW, perm)
+	if err != nil {
+		return nil, err
+	}
+	fi, err := f.Stat()
+	if err != nil {
+		f.Close()
+		return nil, fmt.Errorf("cannot verify opened fd for %s (FAC-145): %w", path, err)
+	}
+	if !fi.Mode().IsRegular() {
+		f.Close()
+		return nil, fmt.Errorf("%s resolved to a non-regular file (FAC-145)", path)
+	}
+	return f, nil
+}
+
+// approvalLockTimeout bounds how long an approval waits for the canonical
+// lock: a wedged coordinator surfaces as BLOCKED, never an indefinite park.
+const approvalLockTimeout = 15 * time.Second
+
+// lockApprovals serializes approval scanning AND transitions across
+// processes on the canonical lock (no-follow open, ownership audited,
+// BOUNDED acquisition). The returned release reports unlock and close
+// failures instead of discarding them.
+func lockApprovals(root string) (func() error, error) {
+	if err := auditStateDir(root); err != nil {
+		return nil, err
+	}
+	lockPath := approvalPath(root, approveIntentLockName)
+	if err := auditPrivateFile(lockPath); err != nil {
+		return nil, err
+	}
+	f, err := openNoFollow(lockPath, os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		return nil, fmt.Errorf("open approval lock: %w", err)
+	}
+	deadline := time.Now().Add(approvalLockTimeout)
+	for {
+		flockErr := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+		if flockErr == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			f.Close()
+			return nil, fmt.Errorf("BLOCKED(approval_lock): not acquired within %s — another coordinator holds it (FAC-145)", approvalLockTimeout)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	return func() error {
+		if err := syscall.Flock(int(f.Fd()), syscall.LOCK_UN); err != nil {
+			f.Close()
+			return fmt.Errorf("release approval lock: %w", err)
+		}
+		if err := f.Close(); err != nil {
+			return fmt.Errorf("close approval lock: %w", err)
+		}
+		return nil
+	}, nil
+}
+
+// loadApprovalChain strictly loads and authenticates the journal: every
+// record parses, verifies, chains (seq+1, prev-line hash), and the signed
+// anchor must match the final (seq, hash). A journal with no anchor, an
+// anchor with no journal, or any break is a hard error — deletion,
+// truncation at a line boundary, reordering, and replay of old signed
+// lines all fail closed. Caller must hold the approval lock.
+func loadApprovalChain(root string) (recs []approveIntent, lastSeq int64, lastHash string, reanchor bool, err error) {
+	journalPath := approvalPath(root, approveIntentJournalName)
+	anchorPath := approvalPath(root, approveIntentAnchorName)
+	if err := auditPrivateFile(journalPath); err != nil {
+		return nil, 0, "", false, err
+	}
+	if err := auditPrivateFile(anchorPath); err != nil {
+		return nil, 0, "", false, err
+	}
+
+	data, readErr := os.ReadFile(journalPath)
+	anchorData, anchorErr := os.ReadFile(anchorPath)
+	if os.IsNotExist(readErr) {
+		if anchorErr == nil {
+			return nil, 0, "", false, fmt.Errorf("approval journal missing but anchor present — journal deleted or rolled back (FAC-145 fail-closed)")
+		}
+		return nil, 0, journalGenesis, false, nil
+	}
+	if readErr != nil {
+		return nil, 0, "", false, readErr
+	}
+	verifier, err := dispatch.LoadVerifier(root)
+	if err != nil {
+		return nil, 0, "", false, fmt.Errorf("cannot authenticate approval journal (FAC-145): %w", err)
+	}
+
+	lastHash = journalGenesis
+	for i, line := range strings.Split(string(data), "\n") {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		var rec approveIntent
+		if err := json.Unmarshal([]byte(line), &rec); err != nil {
+			return nil, 0, "", false, fmt.Errorf("approval journal line %d is malformed or torn — refusing reconciliation until repaired (FAC-145 fail-closed): %w", i+1, err)
+		}
+		if rec.Ref == "" || rec.SHA == "" || rec.DedupeID == "" || rec.Repository == "" ||
+			rec.ProviderType == "" || rec.ProjectID == "" || rec.TaskID == "" ||
+			rec.LeaseID == "" || rec.LeaseGeneration < 1 ||
+			(rec.State != "intent" && rec.State != "done" && rec.State != "published") {
+			return nil, 0, "", false, fmt.Errorf("approval journal line %d is incomplete — refusing reconciliation (FAC-145 fail-closed)", i+1)
+		}
+		if rec.Seq != lastSeq+1 {
+			return nil, 0, "", false, fmt.Errorf("approval journal line %d: sequence %d breaks the chain (want %d) — reordered, replayed, or dropped record (FAC-145 fail-closed)", i+1, rec.Seq, lastSeq+1)
+		}
+		if rec.PrevHash != lastHash {
+			return nil, 0, "", false, fmt.Errorf("approval journal line %d: chain hash mismatch — reordered or tampered record (FAC-145 fail-closed)", i+1)
+		}
+		canonical, cErr := rec.canonical()
+		if cErr != nil {
+			return nil, 0, "", false, cErr
+		}
+		if err := verifier.VerifyBytes(canonical, rec.Signature); err != nil {
+			return nil, 0, "", false, fmt.Errorf("approval journal line %d: %w", i+1, err)
+		}
+		recs = append(recs, rec)
+		lastSeq = rec.Seq
+		lastHash = journalLineHash([]byte(line))
+	}
+
+	// Anchor reconciliation. A crash between the journal append (fsynced)
+	// and the anchor rename leaves the anchor exactly ONE record behind the
+	// chain — deterministic torn-append state that is RECOVERABLE (the lock
+	// holder re-anchors before proceeding), never stranded. Anything else —
+	// missing anchor with history, gaps beyond one, hash mismatch — is
+	// rollback or tampering and fails closed.
+	if lastSeq > 0 {
+		if anchorErr != nil {
+			if lastSeq == 1 {
+				return recs, lastSeq, lastHash, true, nil // crash before first anchor
+			}
+			return nil, 0, "", false, fmt.Errorf("approval journal has records but no anchor — rolled back or torn issuance (FAC-145 fail-closed)")
+		}
+		var anchor approveAnchor
+		if err := json.Unmarshal(anchorData, &anchor); err != nil {
+			return nil, 0, "", false, fmt.Errorf("approval anchor is malformed (FAC-145 fail-closed): %w", err)
+		}
+		canonical, cErr := anchor.canonical()
+		if cErr != nil {
+			return nil, 0, "", false, cErr
+		}
+		if err := verifier.VerifyBytes(canonical, anchor.Signature); err != nil {
+			return nil, 0, "", false, fmt.Errorf("approval anchor: %w", err)
+		}
+		switch {
+		case anchor.Seq == lastSeq && anchor.Hash == lastHash:
+			// consistent
+		case anchor.Seq == lastSeq-1 && anchor.Hash == recs[len(recs)-1].PrevHash:
+			reanchor = true // torn append: journal ahead by exactly one
+		default:
+			return nil, 0, "", false, fmt.Errorf("approval journal high-water (seq %d) does not match anchor (seq %d) — truncated or rolled back (FAC-145 fail-closed)", lastSeq, anchor.Seq)
+		}
+	}
+	return recs, lastSeq, lastHash, reanchor, nil
+}
+
+// writeApprovalAnchor atomically publishes the signed high-water.
+func writeApprovalAnchor(root string, signer *dispatch.Signer, seq int64, hash string) error {
+	anchor := approveAnchor{Seq: seq, Hash: hash}
+	aCanonical, err := anchor.canonical()
+	if err != nil {
+		return err
+	}
+	aSig, err := signer.SignBytes(aCanonical)
+	if err != nil {
+		return fmt.Errorf("sign approval anchor: %w", err)
+	}
+	anchor.Signature = aSig
+	anchorData, err := json.Marshal(anchor)
+	if err != nil {
+		return err
+	}
+	anchorPath := approvalPath(root, approveIntentAnchorName)
+	tmp, err := os.CreateTemp(filepath.Dir(anchorPath), approveIntentAnchorName+".tmp-*")
+	if err != nil {
+		return err
+	}
+	if _, err := tmp.Write(append(anchorData, '\n')); err != nil {
+		tmp.Close()
+		os.Remove(tmp.Name())
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		os.Remove(tmp.Name())
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmp.Name())
+		return err
+	}
+	if err := os.Chmod(tmp.Name(), 0600); err != nil {
+		os.Remove(tmp.Name())
+		return err
+	}
+	if err := os.Rename(tmp.Name(), anchorPath); err != nil {
+		os.Remove(tmp.Name())
+		return err
+	}
+	dir, err := os.Open(filepath.Dir(anchorPath))
+	if err != nil {
+		return fmt.Errorf("open journal dir for sync: %w", err)
+	}
+	if err := dir.Sync(); err != nil {
+		dir.Close()
+		return fmt.Errorf("sync journal dir: %w", err)
+	}
+	return dir.Close()
+}
+
+// appendApproveIntent appends one signed, chained record and re-anchors
+// the high-water. It first HEALS a torn append (journal one ahead of the
+// anchor after a crash) by re-anchoring, so the single non-transactional
+// window is deterministically recoverable, never stranded. Caller must
+// hold the approval lock.
+func appendApproveIntent(root string, signer *dispatch.Signer, rec approveIntent) error {
+	_, lastSeq, lastHash, reanchor, err := loadApprovalChain(root)
+	if err != nil {
+		return err
+	}
+	if reanchor {
+		if err := writeApprovalAnchor(root, signer, lastSeq, lastHash); err != nil {
+			return fmt.Errorf("heal torn anchor: %w", err)
+		}
+	}
+	rec.Seq = lastSeq + 1
+	rec.PrevHash = lastHash
+	rec.At = time.Now().UTC().Format(time.RFC3339)
+	canonical, err := rec.canonical()
+	if err != nil {
+		return err
+	}
+	sig, err := signer.SignBytes(canonical)
+	if err != nil {
+		return fmt.Errorf("sign approval record: %w", err)
+	}
+	rec.Signature = sig
+	line, err := json.Marshal(rec)
+	if err != nil {
+		return err
+	}
+
+	journalPath := approvalPath(root, approveIntentJournalName)
+	f, err := openNoFollow(journalPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(append(line, '\n')); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	return writeApprovalAnchor(root, signer, rec.Seq, journalLineHash(line))
+}
+
+// pendingApproveIntents strictly replays the authenticated chain (healing
+// a torn anchor first) and returns every operation — keyed by its EXACT
+// DedupeID — whose latest state is not yet "published". Caller must hold
+// the approval lock.
+func pendingApproveIntents(root string, signer *dispatch.Signer) ([]approveIntent, error) {
+	recs, lastSeq, lastHash, reanchor, err := loadApprovalChain(root)
+	if err != nil {
+		return nil, err
+	}
+	if reanchor {
+		if err := writeApprovalAnchor(root, signer, lastSeq, lastHash); err != nil {
+			return nil, fmt.Errorf("heal torn anchor: %w", err)
+		}
+	}
+	last := map[string]approveIntent{}
+	var order []string
+	for _, rec := range recs {
+		key := rec.DedupeID
+		if _, seen := last[key]; !seen {
+			order = append(order, key)
+		}
+		last[key] = rec
+	}
+	var pend []approveIntent
+	for _, k := range order {
+		if last[k].State != "published" {
+			pend = append(pend, last[k])
+		}
+	}
+	return pend, nil
+}
+
+// approveOne performs one receipt-bound approval as a durable state
+// machine (caller MUST hold the canonical approval lock across scan and
+// drive):
+//  1. journal the INTERNAL "intent" record (full bound identity; nothing
+//     externally consumable is published yet);
+//  2. perform the evidence-gated board mutation WITH read-back;
+//  3. journal "done";
+//  4. only then publish the externally consumable PASS callback (stable
+//     DedupeID) and journal "published".
+//
+// A crash in the post-board/pre-callback window leaves a "done" record the
+// next run completes by publishing only; a crash earlier leaves "intent"
+// re-driven in full. resume, when non-nil, completes the EXACT journaled
+// operation: identity must match the live receipt (a lease-generation
+// switch refuses), the evidence SHA is the recorded one, and no fresh
+// intent is appended.
+func approveOne(ctx context.Context, cfg *config.Config, tp provider.TaskProvider, root, ref, receiptPath string, override *hsync.OverrideRequest, resume *approveIntent) (*hsync.DoneResult, error) {
+	btp, coord, err := boundBoardProvider(cfg, tp, root, ref)
+	if err != nil {
+		return nil, err
+	}
+	signer, err := dispatch.LoadSignerForConfig(cfg.Project.Name, root)
+	if err != nil {
+		return nil, fmt.Errorf("coordinator signer unavailable (FAC-145): %w", err)
+	}
+	mb := mail.NewMailbox(filepath.Join(root, mail.DefaultMailFile))
+
+	publish := func(rec approveIntent, proof string) error {
+		cb, cbErr := coord.BoundCallback(mail.CallbackComplete, rec.SHA, "approved: "+proof)
+		if cbErr != nil {
+			return fmt.Errorf("approval callback binding refused (FAC-145): %w", cbErr)
+		}
+		cb.DedupeID = rec.DedupeID
+		if _, pErr := mb.PostCallback(coord.Role, cb); pErr != nil {
+			return fmt.Errorf("approval callback publication failed (board IS done; next approve republishes): %w", pErr)
+		}
+		rec.State = "published"
+		if jErr := appendApproveIntent(root, signer, rec); jErr != nil {
+			return fmt.Errorf("published but journal record failed (next approve reconciles): %w", jErr)
+		}
+		return nil
+	}
+
+	var rec approveIntent
+	if resume != nil {
+		if err := resume.matchesContext(coord); err != nil {
+			return nil, err
+		}
+		rec = *resume
+		if rec.State == "done" {
+			// Post-board/pre-callback crash window: publication only.
+			if err := publish(rec, "journaled approval "+rec.DedupeID); err != nil {
+				return nil, err
+			}
+			return &hsync.DoneResult{Ref: rec.Ref, TaskID: rec.TaskID, Proof: "journaled approval " + rec.DedupeID, EvidenceSHA: rec.SHA}, nil
+		}
+	}
+
+	// FAC-145 PRODUCTION supersession consumer: when the fleet has recorded
+	// any delivered verdict for this task's candidate, the LATEST one
+	// governs the merge decision — a later REJECTED vetoes an earlier
+	// APPROVED and the approval refuses until a fresh admissible APPROVED
+	// lands. Cards with no recorded verdict keep the receipt-gated path.
+	if coord.CandidateSHA != "" {
+		mbv := mail.NewMailbox(filepath.Join(root, mail.DefaultMailFile))
+		eff, found, vErr := mbv.EffectiveVerdict(coord.Repository, coord.TaskRef, coord.CandidateSHA)
+		if vErr != nil {
+			return nil, fmt.Errorf("verdict state unreadable — refusing approval (FAC-145): %w", vErr)
+		}
+		if found && eff.Kind != mail.CallbackComplete {
+			return nil, fmt.Errorf("effective verdict for %s@%s is %s — refusing approval until a fresh admissible APPROVED supersedes it (FAC-145): %s",
+				coord.TaskRef, coord.CandidateSHA, eff.Kind, eff.Detail)
+		}
+	}
+
+	// FAC-132 owns the closing authority: a task-bound completion receipt or
+	// an explicit policy-limited override. Build it FIRST so the callback can
+	// bind to the same proof commit the board move will use.
+	req, closeAuthority, err := buildDoneRequest(".", cfg.TaskProvider.ProjectID, ref, receiptPath, override)
+	if err != nil {
+		closeAuthority()
+		return nil, err
+	}
+	defer closeAuthority()
+
+	var proof, proofSHA string
+	switch {
+	case req.Receipt != nil:
+		proofSHA = req.Receipt.MergeSHA
+		proof = fmt.Sprintf("completion receipt %s (merge %s)", req.Receipt.Digest, proofSHA)
+	case req.Override != nil:
+		// A manual override has no merge SHA of its own; bind the callback to
+		// the integration state the operator is attesting to.
+		out, gErr := exec.Command("git", "rev-parse", "origin/main").Output()
+		if gErr != nil {
+			return nil, fmt.Errorf("override approve: cannot resolve integration SHA: %w", gErr)
+		}
+		proofSHA = strings.TrimSpace(string(out))
+		proof = "manual override, no completion receipt"
+	default:
+		return nil, fmt.Errorf("%w for %s: no completion receipt and no override", hsync.ErrNoEvidence, ref)
+	}
+	if proofSHA == "" {
+		return nil, fmt.Errorf("%w for %s: closing authority carries no merge commit", hsync.ErrNoEvidence, ref)
+	}
+
+	if resume == nil {
+		rec = approveIntent{
+			Repository:      coord.Repository,
+			ProviderType:    coord.ProviderType,
+			ProjectID:       coord.ProjectID,
+			Ref:             hsync.NormalizeRef(ref),
+			TaskID:          coord.TaskID,
+			SHA:             proofSHA,
+			LeaseID:         coord.LeaseID,
+			LeaseGeneration: coord.LeaseGeneration,
+			DedupeID:        fmt.Sprintf("approve:%s:%s:%s:gen%d", coord.Repository, hsync.NormalizeRef(ref), proofSHA, coord.LeaseGeneration),
+			State:           "intent",
+		}
+		if err := appendApproveIntent(root, signer, rec); err != nil {
+			return nil, fmt.Errorf("approval intent journal write failed — refusing transition (FAC-145): %w", err)
+		}
+	} else if rec.SHA != proofSHA {
+		return nil, fmt.Errorf("journaled approval %s evidence %s no longer proves on origin/main (resolved %s) — refusing drifted resume (FAC-145)", rec.DedupeID, rec.SHA, proofSHA)
+	}
+
+	res, err := hsync.BoardDone(ctx, btp, req)
+	if err != nil {
+		// Internal failure signal only — no completion was ever published.
+		ccb, cErr := coord.BoundCallback(mail.CallbackBlocked, "", fmt.Sprintf("board-done failed for %s: %v", rec.SHA, err))
+		if cErr != nil {
+			return nil, fmt.Errorf("%w; COMPENSATION BINDING ALSO FAILED (%v) — reconcile via herd board-sync", err, cErr)
+		}
+		ccb.DedupeID = rec.DedupeID + ":blocked"
+		if _, pErr := mb.PostCallback(coord.Role, ccb); pErr != nil {
+			return nil, fmt.Errorf("%w; COMPENSATING CALLBACK ALSO FAILED (%v) — reconcile via herd board-sync", err, pErr)
+		}
+		return nil, err
+	}
+	rec.State = "done"
+	if err := appendApproveIntent(root, signer, rec); err != nil {
+		return nil, fmt.Errorf("board done but journal done-record failed (next approve completes publication): %w", err)
+	}
+	if err := publish(rec, proof); err != nil {
+		return nil, err
+	}
+	return res, nil
 }
 
 // runBoardDone is the strict single-card gate: exit 0 only when the card
@@ -1968,27 +2926,24 @@ func runBoardDone() {
 		os.Exit(1)
 	}
 
-	ctx := context.Background()
-	task, err := resolveTaskByRef(ctx, tp, cfg.TaskProvider.ProjectID, ref)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "herd board-done: %v\n", err)
+	// FAC-145: the single-card gate is the same receipt-bound, callback-
+	// coupled approval path as herd approve — locked, journaled, and the
+	// PASS callback can never be silently missing here either.
+	root, rootErr := canonicalHerdRoot()
+	if rootErr != nil {
+		fmt.Fprintf(os.Stderr, "herd board-done: %v\n", rootErr)
 		os.Exit(1)
 	}
-	stack, stackErr := loadClaimStack(tp)
-	if stackErr != nil {
-		fmt.Fprintf(os.Stderr, "herd board-done: claim stack: %v\n", stackErr)
+	release, lockErr := lockApprovals(root)
+	if lockErr != nil {
+		fmt.Fprintf(os.Stderr, "herd board-done: %v\n", lockErr)
 		os.Exit(1)
 	}
-	defer stack.Close()
-
-	req, closeAuthority, buildErr := buildDoneRequest(".", cfg.TaskProvider.ProjectID, ref, *receiptPath, override)
-	if buildErr != nil {
-		closeAuthority()
-		fmt.Fprintf(os.Stderr, "herd board-done: %v\n", buildErr)
+	res, err := approveOne(context.Background(), cfg, tp, root, ref, *receiptPath, override, nil)
+	if relErr := release(); relErr != nil {
+		fmt.Fprintf(os.Stderr, "herd board-done: %v\n", relErr)
 		os.Exit(1)
 	}
-	res, err := fencedBoardDone(ctx, cfg, tp, stack, task, req)
-	closeAuthority()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "herd board-done: %v\n", err)
 		os.Exit(1)
@@ -2749,6 +3704,41 @@ func dispatchTicketDecision(ctx context.Context, req dispatchRequest, announce i
 	if err := admitDispatch(); err != nil {
 		return nil, nil, fmt.Errorf("dispatch hold admission rejected: %w", err)
 	}
+	// FAC-145: dispatch is backed by a REAL acquired claim lease. Acquired
+	// once here so the launch and --no-launch paths below both dispatch under
+	// the same generation.
+	dispatchRoot, rootErr := canonicalHerdRoot()
+	if rootErr != nil {
+		fmt.Fprintf(os.Stderr, "dispatch: cannot resolve canonical root: %v\n", rootErr)
+		os.Exit(1)
+	}
+	// FAC-145: broker ADMISSION precedes the durable claim — a dispatch
+	// that cannot possibly launch a provider-capable agent never strands a
+	// lease on the ticket.
+	if !noLaunch {
+		sock, sockErr := brokerSocketPath(dispatch.RepositoryIdentityOrName(dispatchRoot, cfg.Project.Name))
+		if sockErr != nil {
+			fmt.Fprintf(os.Stderr, "dispatch: %v\n", sockErr)
+			os.Exit(1)
+		}
+		if err := ensureBroker(dispatchRoot, sock); err != nil {
+			fmt.Fprintf(os.Stderr, "dispatch refused — %v\n", err)
+			os.Exit(1)
+		}
+	}
+
+	// FAC-145: dispatch is backed by a REAL acquired claim lease, taken only
+	// after broker admission and shared by both paths below so they dispatch
+	// under the same generation.
+	leaseKey := claim.LeaseKey{
+		Repo: dispatch.RepositoryIdentityOrName(dispatchRoot, cfg.Project.Name), Provider: cfg.TaskProvider.Type, Project: cfg.TaskProvider.ProjectID, TaskRef: hsync.NormalizeRef(ticketRef),
+	}
+	leaseID, leaseGen, leaseErr := acquireCoordinationLease(ctx, dispatchRoot, leaseKey, "coordinator-dispatch", laneName)
+	if leaseErr != nil {
+		fmt.Fprintf(os.Stderr, "dispatch: %v\n", leaseErr)
+		os.Exit(1)
+	}
+
 	if !noLaunch {
 		// canonicalLane.Role, not a second lookup: this is the same lane the hold
 		// gate above already admitted.
@@ -2757,7 +3747,7 @@ func dispatchTicketDecision(ctx context.Context, req dispatchRequest, announce i
 				return err
 			}
 			var dispatchErr error
-			dispatchResult, dispatchErr = d.Dispatch(ctx, dispatch.DispatchOptions{TicketRef: ticketRef, NoLaunch: noLaunch, LaneName: laneName, Decision: admitted})
+			dispatchResult, dispatchErr = d.Dispatch(ctx, dispatch.DispatchOptions{TicketRef: ticketRef, NoLaunch: noLaunch, LaneName: laneName, Decision: admitted, LeaseID: leaseID, LeaseGeneration: leaseGen})
 			return dispatchErr
 		})
 		if err != nil {
@@ -2773,10 +3763,15 @@ func dispatchTicketDecision(ctx context.Context, req dispatchRequest, announce i
 		if err := admitDispatch(); err != nil {
 			return nil, nil, fmt.Errorf("dispatch hold admission rejected: %w", err)
 		}
-		result, err = d.Dispatch(ctx, dispatch.DispatchOptions{TicketRef: ticketRef, NoLaunch: true, LaneName: laneName, Decision: decision})
+		result, err = d.Dispatch(ctx, dispatch.DispatchOptions{TicketRef: ticketRef, NoLaunch: true, LaneName: laneName, Decision: decision, LeaseID: leaseID, LeaseGeneration: leaseGen})
 	}
 	if err != nil {
-		return nil, nil, fmt.Errorf("dispatch failed: %w", err)
+		// Durable compensation: a failed dispatch releases the exact lease
+		// it acquired — the ticket is never stranded behind a dead claim.
+		if relErr := releaseCoordinationLease(ctx, dispatchRoot, leaseKey, "coordinator-dispatch", leaseGen); relErr != nil {
+			return nil, nil, fmt.Errorf("dispatch failed: %w; LEASE COMPENSATION ALSO FAILED: %v", err, relErr)
+		}
+		return nil, nil, fmt.Errorf("dispatch failed (lease released): %w", err)
 	}
 	if result == nil {
 		return nil, nil, fmt.Errorf("dispatch returned no result for %s", ticketRef)
@@ -3426,6 +4421,8 @@ func runForgeE() error {
 		}
 	}
 
+	forgeFailed := false
+
 	fmt.Println("\n=== Forge: Review ===")
 	stack, stackErr := loadClaimStack(tp)
 	if stackErr != nil {
@@ -3437,35 +4434,61 @@ func runForgeE() error {
 	if err == nil && len(tasks) > 0 {
 		t := tasks[0]
 		fmt.Printf("Selected [%s]: %s for review\n", t.Ref, t.Title)
-		if err := fencedBoardStatus(ctx, cfg, stack, t, "reviewer", "in-review"); err != nil {
-			fmt.Printf("  -> fenced in-review failed: %v\n", err)
+		// FAC-145: no raw status writes — the transition is bound to the
+		// task's authenticated receipt; failures propagate.
+		forgeRoot, forgeRootErr := canonicalHerdRoot()
+		if forgeRootErr != nil {
+			fmt.Fprintf(os.Stderr, "  review transition: %v\n", forgeRootErr)
+			forgeFailed = true
+		} else if btp, _, bindErr := boundBoardProvider(cfg, tp, forgeRoot, t.Ref); bindErr != nil {
+			fmt.Fprintf(os.Stderr, "  review transition unbound (FAC-145): %v\n", bindErr)
+			forgeFailed = true
+		} else if err := btp.UpdateStatus(ctx, t.ID, "in-review"); err != nil {
+			fmt.Fprintf(os.Stderr, "  review transition failed (FAC-145): %v\n", err)
+			forgeFailed = true
 		} else {
-			fmt.Printf("  -> moved to 'in-review' status (fenced)\n")
+			fmt.Printf("  -> moved to 'in-review' status\n")
 		}
 	}
 
 	fmt.Println("\n=== Forge: Approve ===")
 	reviewTasks, err := tp.ListTasks(ctx, cfg.TaskProvider.ProjectID, "in-review")
 	if err == nil {
+		root, rootErr := canonicalHerdRoot()
+		if rootErr != nil {
+			fmt.Fprintf(os.Stderr, "forge approve: %v\n", rootErr)
+			os.Exit(1)
+		}
+		release, lockErr := lockApprovals(root)
+		if lockErr != nil {
+			fmt.Fprintf(os.Stderr, "forge approve: %v\n", lockErr)
+			os.Exit(1)
+		}
 		for _, t := range reviewTasks {
-			req, closeAuthority, buildErr := buildDoneRequest(".", cfg.TaskProvider.ProjectID, t.Ref, "", nil)
-			if buildErr != nil {
-				closeAuthority()
-				fmt.Printf("Not approved [%s]: %v\n", t.Ref, buildErr)
-				continue
-			}
-			res, err := fencedBoardDone(ctx, cfg, tp, stack, t, req)
-			closeAuthority()
+			// FAC-145: receipt-bound, callback-coupled approval only.
+			res, err := approveOne(ctx, cfg, tp, root, t.Ref, "", nil, nil)
 			if err != nil {
-				fmt.Printf("Not approved [%s]: %v\n", t.Ref, err)
+				fmt.Fprintf(os.Stderr, "Not approved [%s]: %v\n", t.Ref, err)
+				if !errors.Is(err, hsync.ErrNoEvidence) {
+					forgeFailed = true
+				}
 				continue
 			}
 			fmt.Printf("Approved [%s]: %s (proof: %s)\n", res.Ref, t.Title, res.Proof)
 			releaseScopeClaimQuietly(res.Ref)
 		}
+		if relErr := release(); relErr != nil {
+			fmt.Fprintf(os.Stderr, "forge approve: %v\n", relErr)
+			forgeFailed = true
+		}
 	}
 
 	fmt.Println("\n=== Forge cycle complete ===")
+	// FAC-145: a forge cycle with a real failure exits non-zero (caller
+	// surfaces it); ErrNoEvidence refusals are not cycle failures.
+	if forgeFailed {
+		return fmt.Errorf("forge cycle completed with failures")
+	}
 	return nil
 }
 
@@ -3986,14 +5009,6 @@ func runKick() {
 		os.Exit(1)
 	}
 
-	// FAC-187: durable exclusion markers so a lifted-hold kick never prompts
-	// quarantined/protected task lanes. Missing file is fine (nil markers).
-	markers, markerErr := kick.LoadBroadcastMarkers(filepath.Join(".herd", "state", "broadcast-exclude.json"))
-	if markerErr != nil {
-		fmt.Fprintf(os.Stderr, "herd-kick: broadcast markers: %v\n", markerErr)
-		os.Exit(1)
-	}
-
 	result, err := kick.Run(kick.Options{
 		Names:        args,
 		Force:        *all,
@@ -4002,7 +5017,6 @@ func runKick() {
 		Reason:       *reason,
 		RaiseMissing: !*noRaise,
 		HoldReader:   authority,
-		Markers:      markers,
 		Identity: func(id string) (lifecycle.HoldIdentity, error) {
 			lane, resolveErr := kickRegistry.ResolveLiveAgentID(id)
 			if resolveErr != nil {
@@ -4847,6 +5861,7 @@ func runDrainCommand(args []string, out, errOut io.Writer) int {
 	if *selftest {
 		return runDrainSelftest()
 	}
+	_ = *autoTiers // retained for report/commands compatibility until FAC-184 adapters land
 	if *maxReview < 0 || *maxHarvest < 0 || *maxRelaunch < 0 {
 		fmt.Fprintln(errOut, "herd-drain: max bounds must be non-negative")
 		return 2
@@ -4857,20 +5872,15 @@ func runDrainCommand(args []string, out, errOut io.Writer) int {
 	stale := drainIntEnv("HERD_DRAIN_STALE_BEHIND", 20)
 	root := "."
 	var tp provider.TaskProvider
-	cfg, cfgErr := config.LoadConfig(filepath.Join(root, ".herd", "herd.yaml"))
-	if cfgErr == nil {
+	if cfg, err := config.LoadConfig(filepath.Join(root, ".herd", "herd.yaml")); err == nil {
 		// The action gate accepts only configured standing lane identities.
 		// Evidence is never upgraded into a standing lane by shape alone.
-		var providerErr error
-		tp, providerErr = loadTaskProvider(cfg)
-		if providerErr != nil {
-			tp = nil
-			if !*asJSON {
-				fmt.Fprintf(errOut, "herd-drain: UNKNOWN Kaneo review-cap posture: %v\n", providerErr)
-			}
+		tp, err = loadTaskProvider(cfg)
+		if err != nil && !*asJSON {
+			fmt.Fprintf(errOut, "herd-drain: UNKNOWN Kaneo review-cap posture: %v\n", err)
 		}
 	} else if !*asJSON {
-		fmt.Fprintf(errOut, "herd-drain: UNKNOWN Kaneo review-cap posture: %v\n", cfgErr)
+		fmt.Fprintf(errOut, "herd-drain: UNKNOWN Kaneo review-cap posture: %v\n", err)
 	}
 	h := harvest.NewHarvester(root)
 	harvestResult, err := h.Harvest(context.Background())
@@ -4888,7 +5898,7 @@ func runDrainCommand(args []string, out, errOut io.Writer) int {
 		fmt.Fprintf(errOut, "herd-drain: %v\n", err)
 		return 1
 	}
-	if cfgErr == nil {
+	if cfg, err := config.LoadConfig(filepath.Join(root, ".herd", "herd.yaml")); err == nil {
 		for _, lane := range cfg.Lanes {
 			if lane.Standing {
 				report.StandingLanes = append(report.StandingLanes, lane.Name)
@@ -4916,21 +5926,8 @@ func runDrainCommand(args []string, out, errOut io.Writer) int {
 		printDrainCommandsTo(out, report)
 	}
 	if *act {
-		// Missing authority keeps the fail-closed default hooks: every action
-		// is then refused with the reason, never silently skipped.
-		hooks := defaultDrainActionHooks()
-		adapters, err := newDrainAdapters(root, ledgerPath, cfg, tp, cap)
-		unauthorized := err != nil
-		if unauthorized {
-			fmt.Fprintf(out, "herd-drain: REFUSED --act: %v\n", err)
-		} else {
-			hooks = adapters.hooks()
-		}
-		result := executeDrainActions(context.Background(), report, report.ActionEvidence, *maxReview, *maxHarvest, *maxRelaunch, *autoTiers, out, hooks)
-		if unauthorized || result.Failed {
-			return 1
-		}
-		return drainExitCode(report)
+		fmt.Fprintln(out, "herd-drain: REFUSED --act: FAC-184 compiled review/ledger/harvest/cap adapters are unavailable; FAC-182 durable control-envelope delivery is blocked")
+		return 1
 	}
 	return drainExitCode(report)
 }
@@ -5009,7 +6006,7 @@ func printDrainCommandsTo(out io.Writer, r *review.DrainReport) {
 			fmt.Fprintf(out, "# REFUSED harvest %s: recorded tier and builder family evidence required\n", sha)
 			continue
 		}
-		fmt.Fprintf(out, "herd drain --act --max-harvest 1 --auto-harvest-tiers %s  # harvest lane=%s tier=%s sha=%s\n", e.Tier, e.Lane, e.Tier, sha)
+		fmt.Fprintf(out, "# REFUSED harvest %s: FAC-184 compiled adapter unavailable (lane=%s tier=%s sha=%s)\n", sha, e.Lane, e.Tier, sha)
 	}
 	for _, sha := range r.Shas.NeedReview {
 		e := evidence[sha]
@@ -5021,7 +6018,7 @@ func printDrainCommandsTo(out io.Writer, r *review.DrainReport) {
 		case drainForbiddenBranch(e.Branch):
 			fmt.Fprintf(out, "# REFUSED review %s: forbidden branch %s\n", sha, e.Branch)
 		default:
-			fmt.Fprintf(out, "herd drain --act --max-review 1  # review branch=%s family=%s pin=%s\n", e.Branch, e.BuilderFamily, sha)
+			fmt.Fprintf(out, "# REFUSED review %s: FAC-184 compiled adapter unavailable (branch=%s family=%s pin=%s)\n", sha, e.Branch, e.BuilderFamily, sha)
 		}
 	}
 }
@@ -5052,18 +6049,16 @@ type drainActionResult struct {
 	Failed                               bool
 }
 
-// defaultDrainActionHooks is the no-authority beat: the compiled adapters
-// exist, but nothing wired them, so every action refuses instead of acting.
 func defaultDrainActionHooks() drainActionHooks {
 	return drainActionHooks{
 		launchReview: func(context.Context, drainActionEvidence) error {
-			return errors.New("no compiled review launch authority is configured")
+			return errors.New("FAC-184 compiled review adapter unavailable")
 		},
 		dryRun: func(context.Context, drainActionEvidence) error {
-			return errors.New("no compiled harvest authority is configured")
+			return errors.New("FAC-184 compiled harvest dry-run adapter unavailable")
 		},
 		harvest: func(context.Context, drainActionEvidence) error {
-			return errors.New("no compiled harvest authority is configured")
+			return errors.New("FAC-184 compiled harvest adapter unavailable")
 		},
 	}
 }
@@ -5240,6 +6235,68 @@ func runVerify() {
 	v := verifier.NewVerifier("")
 	c := v.CheckCompletion(context.Background(), wt, *buildCmd, *testCmd)
 
+	// FAC-145: a worktree carrying a launch receipt reports its verify
+	// outcome as a receipt-bound callback, so the worker FAIL signal travels
+	// with the identical repo + lease + task binding the coordinator PASS
+	// callback uses. A managed (.herd/worktrees) worktree without a valid
+	// receipt fails closed — its evidence would be unattributable; only
+	// unmanaged paths with no receipt at all are skipped (legacy spawn).
+	tc, tcErr := dispatch.ReadTaskContext(wt)
+	// FAC-145: verification is an admissible isolated-agent class. A
+	// managed worktree must carry a receipt whose role is allowed to run
+	// the gate — worker (self-verify) or a coordinator-issued verifier
+	// receipt. Any other role is refused.
+	if tcErr == nil && tc.Role != dispatch.RoleWorker && tc.Role != dispatch.RoleVerifier {
+		tcErr = fmt.Errorf("role %q may not run the verification gate (FAC-145: worker self-verify or an issued verifier receipt only)", tc.Role)
+	}
+	// When the published verification key is present (verify running from
+	// the coordinator checkout), the receipt must also authenticate — a
+	// tampered receipt is treated exactly like a missing one. Without the
+	// key (agent-side run inside a worktree) structural validation still
+	// applies and authentication happens at the consuming side.
+	verifyRoot, verifyRootErr := canonicalHerdRoot()
+	if verifyRootErr != nil {
+		fmt.Fprintf(os.Stderr, "herd verify: cannot resolve canonical root: %v\n", verifyRootErr)
+		os.Exit(2)
+	}
+	if tcErr == nil {
+		if _, statErr := os.Stat(filepath.Join(verifyRoot, dispatch.ReceiptPubFile)); statErr == nil {
+			if v, vErr := dispatch.LoadVerifier(verifyRoot); vErr != nil {
+				tcErr = vErr
+			} else {
+				tcErr = v.Verify(tc)
+			}
+		}
+	}
+	switch {
+	case tcErr == nil:
+		kind, detail := mail.CallbackComplete, ""
+		if !c.Passed {
+			kind = mail.CallbackBlocked
+			detail = strings.Join(c.Reasons, "; ")
+		}
+		sha := ""
+		if out, hErr := exec.Command("git", "-C", wt, "rev-parse", "HEAD").Output(); hErr == nil {
+			sha = strings.TrimSpace(string(out))
+		}
+		// FAC-145: a verify whose bound callback cannot be raised has a
+		// broken evidence chain — that is a hard failure, never a warning.
+		if cb, cbErr := tc.BoundCallback(kind, sha, detail); cbErr != nil {
+			fmt.Fprintf(os.Stderr, "herd verify: callback binding refused (FAC-145): %v\n", cbErr)
+			os.Exit(2)
+		} else if _, postErr := mail.NewMailbox(filepath.Join(verifyRoot, mail.DefaultMailFile)).PostCallback(tc.Role, cb); postErr != nil {
+			fmt.Fprintf(os.Stderr, "herd verify: callback post failed (FAC-145): %v\n", postErr)
+			os.Exit(2)
+		}
+	case isManagedWorktree(wt):
+		fmt.Fprintf(os.Stderr, "herd verify: managed worktree %s has no valid launch receipt (FAC-145 fail-closed): %v\n", wt, tcErr)
+		os.Exit(2)
+	case !errors.Is(tcErr, os.ErrNotExist):
+		// A present-but-corrupt receipt is never silently ignored.
+		fmt.Fprintf(os.Stderr, "herd verify: %v\n", tcErr)
+		os.Exit(2)
+	}
+
 	if *asJSON {
 		json.NewEncoder(os.Stdout).Encode(c)
 	} else if c.Passed {
@@ -5253,6 +6310,1281 @@ func runVerify() {
 	if !c.Passed {
 		os.Exit(1)
 	}
+}
+
+// Broker protocol (FAC-145): the agent NEVER executes provider code or
+// holds credentials, config, or verification keys. It presents its signed
+// receipt as a capability over a unix socket; the coordinator-owned broker
+// process authenticates it, enforces authority/role/fence, performs the
+// provider I/O with the coordinator's credentials, and returns the result.
+var cryptoRandRead = cryptorand.Read
+
+type brokerRequest struct {
+	Op string `json:"op"` // "ping" | "get" | "comment" | "verdict"
+	// Nonce is echoed back SIGNED on ping so callers can authenticate the
+	// broker's identity against the published verification key.
+	Nonce string `json:"nonce,omitempty"`
+	Ref   string `json:"ref"`
+	// Body: comment text, or the verdict token (APPROVED | REJECTED).
+	Body string `json:"body,omitempty"`
+	// CandidateSHA must equal the receipt's candidate for op=verdict — the
+	// verdict is bound to the EXACT commit under review.
+	CandidateSHA string `json:"candidate_sha,omitempty"`
+	// WorktreeHEAD is the reviewer checkout's CURRENT HEAD at verdict time.
+	// It must still equal the receipt's candidate: a checkout that moved
+	// between admission and verdict can no longer speak for that candidate.
+	WorktreeHEAD string               `json:"worktree_head,omitempty"`
+	Detail       string               `json:"detail,omitempty"`
+	Receipt      dispatch.TaskContext `json:"receipt"`
+}
+
+// verdictForgeryGuard: free-form agent comments must never be interpretable
+// as reviewer approval — only the broker's typed verdict op composes
+// verdict lines.
+func verdictForgeryGuard(text string) error {
+	if strings.Contains(strings.ToUpper(text), "REVIEW VERDICT") {
+		return fmt.Errorf("free-form comments must not contain verdict phrasing (FAC-145: verdicts are a typed reviewer-only operation)")
+	}
+	return nil
+}
+
+type brokerResponse struct {
+	OK       bool            `json:"ok"`
+	Error    string          `json:"error,omitempty"`
+	NonceSig string          `json:"nonce_sig,omitempty"` // ping: coordinator signature over the nonce
+	Result   json.RawMessage `json:"result,omitempty"`
+}
+
+// brokerSocketPath resolves the coordinator broker socket for a repository:
+// $HERD_BROKER_SOCK override, else ~/.herd/run/herd-<repo>.sock — OUTSIDE
+// the repository tree.
+func brokerSocketPath(repo string) (string, error) {
+	if p := strings.TrimSpace(os.Getenv("HERD_BROKER_SOCK")); p != "" {
+		return p, nil
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("resolve broker socket: %w", err)
+	}
+	return filepath.Join(home, ".herd", "run", "herd-"+strings.ToLower(repo)+".sock"), nil
+}
+
+// runBrokerServe is the COORDINATOR-owned credential broker. It loads
+// config, credentials, and the verification key exactly once, in the
+// coordinator process, and serves capability-checked task reads/comments to
+// sandboxed agents. Agents never receive any of that material.
+func runBrokerServe() {
+	fs := flag.NewFlagSet("broker", flag.ExitOnError)
+	socketFlag := fs.String("socket", "", "unix socket path override (default $HERD_BROKER_SOCK or ~/.herd/run/herd-<repo>.sock)")
+	args := os.Args[2:]
+	if len(args) > 0 && args[0] == "serve" {
+		args = args[1:]
+	}
+	fs.Parse(args)
+
+	root, err := canonicalHerdRoot()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "herd broker: %v\n", err)
+		os.Exit(1)
+	}
+	cfg, err := config.LoadConfig(filepath.Join(root, ".herd", "herd.yaml"))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "herd broker: load config: %v\n", err)
+		os.Exit(1)
+	}
+	verifier, err := dispatch.LoadVerifier(root)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "herd broker: %v\n", err)
+		os.Exit(1)
+	}
+	// The broker signs ping nonces with the coordinator key: readiness is
+	// AUTHENTICATED — an impostor socket cannot mint a valid pong. FAC-133's
+	// sandbox is the containment for the key itself.
+	signer, err := dispatch.LoadSignerForConfig(cfg.Project.Name, root)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "herd broker: %v\n", err)
+		os.Exit(1)
+	}
+	tp, tpErr := loadTaskProvider(cfg)
+	if tpErr != nil {
+		fmt.Fprintf(os.Stderr, "herd broker: task provider: %v\n", tpErr)
+		os.Exit(1)
+	}
+
+	sock := *socketFlag
+	if sock == "" {
+		if sock, err = brokerSocketPath(dispatch.RepositoryIdentityOrName(root, cfg.Project.Name)); err != nil {
+			fmt.Fprintf(os.Stderr, "herd broker: %v\n", err)
+			os.Exit(1)
+		}
+	}
+	if err := os.MkdirAll(filepath.Dir(sock), 0700); err != nil {
+		fmt.Fprintf(os.Stderr, "herd broker: %v\n", err)
+		os.Exit(1)
+	}
+	if err := safeRemoveSocket(sock); err != nil {
+		fmt.Fprintf(os.Stderr, "herd broker: %v\n", err)
+		os.Exit(1)
+	}
+	ln, err := net.Listen("unix", sock)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "herd broker: listen: %v\n", err)
+		os.Exit(1)
+	}
+	if err := os.Chmod(sock, 0600); err != nil {
+		fmt.Fprintf(os.Stderr, "herd broker: chmod socket: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Printf("herd broker: serving %s (repo %s)\n", sock, cfg.Project.Name)
+
+	authority := dispatch.AuthorityFromConfigAt(cfg, root)
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "herd broker: accept: %v\n", err)
+			continue
+		}
+		go serveBrokerConn(conn, root, cfg, authority, verifier, signer, tp)
+	}
+}
+
+func serveBrokerConn(conn net.Conn, root string, cfg *config.Config, authority dispatch.BindingAuthority, verifier *dispatch.Verifier, signer *dispatch.Signer, tp provider.TaskProvider) {
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(30 * time.Second))
+	respond := func(resp brokerResponse) {
+		_ = json.NewEncoder(conn).Encode(resp)
+	}
+	var req brokerRequest
+	if err := json.NewDecoder(conn).Decode(&req); err != nil {
+		respond(brokerResponse{Error: "malformed request"})
+		return
+	}
+	// Liveness probe carries no capability and grants nothing — but the
+	// response AUTHENTICATES the broker: the nonce comes back signed.
+	if req.Op == "ping" {
+		if signer == nil || req.Nonce == "" {
+			respond(brokerResponse{Error: "broker cannot authenticate ping"})
+			return
+		}
+		sig, sErr := signer.SignBytes([]byte("herd-broker-pong:" + req.Nonce))
+		if sErr != nil {
+			respond(brokerResponse{Error: sErr.Error()})
+			return
+		}
+		respond(brokerResponse{OK: true, NonceSig: sig})
+		return
+	}
+	tc := req.Receipt
+	if err := verifier.Verify(tc); err != nil {
+		respond(brokerResponse{Error: err.Error()})
+		return
+	}
+	if !strings.EqualFold(hsync.NormalizeRef(tc.TaskRef), hsync.NormalizeRef(req.Ref)) {
+		respond(brokerResponse{Error: fmt.Sprintf("receipt is bound to %s, not %s (FAC-145: one receipt, one task)", tc.TaskRef, req.Ref)})
+		return
+	}
+	if err := requireLiveLease(context.Background(), root, tc); err != nil {
+		respond(brokerResponse{Error: err.Error()})
+		return
+	}
+	// A session-bound receipt is only valid while its session is LIVE: a
+	// finished or killed agent's authority dies with its pane (FAC-145).
+	if tc.AgentSessionID != "" {
+		alive, sErr := herdr.SessionExists(tc.AgentSessionID)
+		if sErr != nil {
+			respond(brokerResponse{Error: fmt.Sprintf("cannot verify agent session %s — refusing (FAC-145 fail-closed): %v", tc.AgentSessionID, sErr)})
+			return
+		}
+		if !alive {
+			respond(brokerResponse{Error: fmt.Sprintf("agent session %s is no longer live — its receipt carries no authority (FAC-145)", tc.AgentSessionID)})
+			return
+		}
+	}
+	btp, err := dispatch.NewContextBoundProvider(tp, tc, authority, verifier, nil, tc.LeaseGeneration)
+	if err != nil {
+		respond(brokerResponse{Error: err.Error()})
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+	defer cancel()
+	switch req.Op {
+	case "get":
+		task, err := btp.GetTask(ctx, tc.TaskID)
+		if err != nil {
+			respond(brokerResponse{Error: err.Error()})
+			return
+		}
+		raw, err := json.Marshal(task)
+		if err != nil {
+			respond(brokerResponse{Error: err.Error()})
+			return
+		}
+		respond(brokerResponse{OK: true, Result: raw})
+	case "comment":
+		if strings.TrimSpace(req.Body) == "" {
+			respond(brokerResponse{Error: "empty comment body"})
+			return
+		}
+		if err := verdictForgeryGuard(req.Body); err != nil {
+			respond(brokerResponse{Error: err.Error()})
+			return
+		}
+		// Attribution prefix is broker-composed: a note can never
+		// impersonate another role.
+		body := fmt.Sprintf("[note from %s %s] %s", tc.Role, tc.TaskRef, req.Body)
+		if err := btp.AddComment(ctx, tc.TaskID, body); err != nil {
+			respond(brokerResponse{Error: err.Error()})
+			return
+		}
+		respond(brokerResponse{OK: true})
+	case "verdict":
+		// Typed, reviewer-only, exact-candidate verdict (FAC-145): the
+		// broker COMPOSES the verdict line — no agent free-form text can be
+		// or contain one — and records it durably on the coordinator bus.
+		if tc.Role != dispatch.RoleReviewer {
+			respond(brokerResponse{Error: fmt.Sprintf("verdicts are reviewer-only; receipt role is %q (FAC-145)", tc.Role)})
+			return
+		}
+		verdict := strings.ToUpper(strings.TrimSpace(req.Body))
+		if verdict != "APPROVED" && verdict != "REJECTED" {
+			respond(brokerResponse{Error: "verdict must be APPROVED or REJECTED"})
+			return
+		}
+		if req.CandidateSHA == "" || req.CandidateSHA != tc.CandidateSHA {
+			respond(brokerResponse{Error: fmt.Sprintf("verdict candidate %q does not match the receipt's exact candidate %q (FAC-145)", req.CandidateSHA, tc.CandidateSHA)})
+			return
+		}
+		// Re-check at VERDICT time: the reviewer's checkout must still sit
+		// on the exact candidate it was admitted for.
+		if req.WorktreeHEAD == "" || req.WorktreeHEAD != tc.CandidateSHA {
+			respond(brokerResponse{Error: fmt.Sprintf("review checkout HEAD %q is no longer the admitted candidate %q — refusing a verdict over drifted state (FAC-145)", req.WorktreeHEAD, tc.CandidateSHA)})
+			return
+		}
+		if err := verdictForgeryGuard(req.Detail); err != nil {
+			respond(brokerResponse{Error: err.Error()})
+			return
+		}
+		line := fmt.Sprintf("REVIEW VERDICT %s: %s candidate=%s base=%s lease=%s lease_gen=%d reviewer-bound (FAC-145)",
+			tc.TaskRef, verdict, tc.CandidateSHA, tc.BaseSHA, tc.LeaseID, tc.LeaseGeneration)
+		if strings.TrimSpace(req.Detail) != "" {
+			line += " — " + req.Detail
+		}
+		// TRANSACTIONAL order (FAC-145): (1) durable canonical outbox INTENT
+		// first — nothing public exists before the coordinator's own record;
+		// (2) idempotent provider delivery; (3) durable DELIVERED marker.
+		// A crash between any two steps re-runs from the durable intent
+		// (provider delivery is at-least-once; the bus records are exactly-
+		// once per full effect identity). The dedupe identity carries the
+		// FULL authenticated effect — task, exact candidate, lease session,
+		// generation, AND the verdict value — so APPROVED and REJECTED for
+		// the same candidate are distinct effects and a later veto can never
+		// be collapsed into an earlier approval (supersession is by bus
+		// order; see mail.EffectiveVerdict).
+		kind := mail.CallbackBlocked
+		if verdict == "APPROVED" {
+			kind = mail.CallbackComplete
+		}
+		effect := fmt.Sprintf("%s:%s:%s:gen%d:%s:%s", tc.Repository, tc.TaskRef, tc.CandidateSHA, tc.LeaseGeneration, tc.LeaseID, verdict)
+		mb := mail.NewMailbox(filepath.Join(root, mail.DefaultMailFile))
+
+		// UNFORGEABLE effect proof (FAC-145): the delivered comment body is
+		// the canonical line plus a COORDINATOR SIGNATURE over it. An agent
+		// holding OpComment cannot mint that signature, so it cannot
+		// pre-seed a body that would satisfy readback; readback compares the
+		// EXACT canonical body and verifies the signature, never a
+		// substring. The signature is deterministic per effect, so retries
+		// reproduce the identical body.
+		if signer == nil {
+			respond(brokerResponse{Error: "broker cannot sign verdict effects (FAC-145)"})
+			return
+		}
+		effectID := mail.VerdictEffectID(effect)
+		effectSig, sigErr := signer.SignBytes([]byte("herd-verdict-effect:" + effectID + "\n" + line))
+		if sigErr != nil {
+			respond(brokerResponse{Error: fmt.Sprintf("verdict effect signing failed: %v", sigErr)})
+			return
+		}
+		canonicalBody := fmt.Sprintf("%s [effect %s sig=%s]", line, effectID, effectSig)
+		verifyEffectBody := func(body string) bool {
+			if body != canonicalBody {
+				return false
+			}
+			return verifier.VerifyBytes([]byte("herd-verdict-effect:"+effectID+"\n"+line), effectSig) == nil
+		}
+
+		// SERIALIZED delivery: one durable owner per effect across broker
+		// processes. Probe, deliver, and publish happen under an exclusive
+		// per-effect lock, so two coordinators can never both observe
+		// "absent" and both call AddComment.
+		release, lockErr := claimVerdictOwnership(root, tc, effectID)
+		if lockErr != nil {
+			respond(brokerResponse{Error: lockErr.Error()})
+			return
+		}
+		defer func() {
+			if err := release(); err != nil {
+				fmt.Fprintf(os.Stderr, "herd broker: verdict lock release: %v\n", err)
+			}
+		}()
+
+		// EXACTLY-ONCE requires PROVIDER-SIDE effect readback: without the
+		// CommentReader capability the coordinator cannot prove whether a
+		// prior attempt already landed, so no consumable verdict is ever
+		// published for that adapter (FAC-145 fail-closed).
+		// The bound provider always exposes ListComments; it errors when the
+		// underlying adapter lacks the capability, which fails closed.
+		if _, probe := btp.ListComments(ctx, tc.TaskID); probe != nil {
+			respond(brokerResponse{Error: fmt.Sprintf("provider %q cannot read comments back — refusing to publish an unverifiable verdict (FAC-145 fail-closed): %v", tc.ProviderType, probe)})
+			return
+		}
+		effectDelivered := func() (bool, error) {
+			comments, cErr := btp.ListComments(ctx, tc.TaskID)
+			if cErr != nil {
+				return false, cErr
+			}
+			for _, c := range comments {
+				if verifyEffectBody(c) {
+					return true, nil
+				}
+			}
+			return false, nil
+		}
+
+		// CROSS-HOST exclusive ownership (FAC-145): the local lock only
+		// serializes this clone. The PROVIDER is the one medium every
+		// coordinator shares, so ownership is decided there: each
+		// contender writes a signed claim marker, then re-reads; the
+		// EARLIEST claim for this effect wins and only that owner
+		// delivers. A loser never writes a second verdict comment.
+		if owned, ownErr := winVerdictClaim(ctx, btp, signer, verifier, tc, effectID); ownErr != nil {
+			respond(brokerResponse{Error: ownErr.Error()})
+			return
+		} else if !owned {
+			// Another coordinator owns delivery for this exact effect.
+			// Converge on ITS result rather than duplicating the effect.
+			respond(brokerResponse{OK: true})
+			return
+		}
+
+		// Authority-side short circuit first (cheap), then the PROVIDER
+		// truth: a prior attempt that crashed after AddComment but before
+		// the delivered marker is detected here and never re-delivered.
+		_, alreadyDeliveredFound, dErr := mb.HasDeliveredVerdict(effectID)
+		if dErr != nil {
+			respond(brokerResponse{Error: fmt.Sprintf("verdict state unreadable (FAC-145 fail-closed): %v", dErr)})
+			return
+		}
+		providerHas := false
+		if !alreadyDeliveredFound {
+			var pErr error
+			providerHas, pErr = effectDelivered()
+			if pErr != nil {
+				respond(brokerResponse{Error: fmt.Sprintf("provider effect readback failed — refusing verdict (FAC-145 fail-closed): %v", pErr)})
+				return
+			}
+		}
+		if alreadyDeliveredFound {
+			respond(brokerResponse{OK: true})
+			return
+		}
+
+		// (1) NON-CONSUMABLE intent: recorded as blocked/pending under a
+		// distinct id — an intent alone can NEVER read as an approval.
+		intent := mail.Callback{
+			Ref: tc.TaskRef, Kind: mail.CallbackBlocked, SHA: tc.CandidateSHA,
+			Detail: "verdict intent (undelivered): " + line, Repo: tc.Repository,
+			LeaseGeneration: tc.LeaseGeneration, SenderRole: tc.Role,
+			DedupeID: mail.VerdictIntentID(effect),
+		}
+		if _, err := mb.PostCallback(tc.Role, intent); err != nil {
+			respond(brokerResponse{Error: fmt.Sprintf("verdict intent record failed — nothing published (FAC-145): %v", err)})
+			return
+		}
+		// (2) Provider delivery — SKIPPED when the provider already carries
+		// this exact effect (crash between AddComment and the delivered
+		// marker): the readback, not the text, makes this exactly-once.
+		if !providerHas {
+			if err := btp.AddComment(ctx, tc.TaskID, canonicalBody); err != nil {
+				respond(brokerResponse{Error: fmt.Sprintf("verdict intent recorded but provider delivery failed (retry re-delivers; nothing consumable published): %v", err)})
+				return
+			}
+		}
+		// (3) MUTATION readback: the exact effect id must now be present
+		// EXACTLY once on the provider — this distinguishes dropped,
+		// duplicated, and reordered writes; anything else refuses to
+		// publish a consumable verdict.
+		comments, rErr := btp.ListComments(ctx, tc.TaskID)
+		if rErr != nil {
+			respond(brokerResponse{Error: fmt.Sprintf("verdict delivered but effect readback failed — refusing to publish a consumable verdict (FAC-145): %v", rErr)})
+			return
+		}
+		hits := 0
+		for _, c := range comments {
+			if verifyEffectBody(c) {
+				hits++
+			}
+		}
+		if hits != 1 {
+			respond(brokerResponse{Error: fmt.Sprintf("verdict effect readback found %d matching provider comments, want exactly 1 — refusing to publish (FAC-145 fail-closed)", hits)})
+			return
+		}
+		// (4) The ONLY consumable record, written after confirmed delivery.
+		deliveredRec := mail.Callback{
+			Ref: tc.TaskRef, Kind: kind, SHA: tc.CandidateSHA,
+			Detail: canonicalBody, Repo: tc.Repository,
+			LeaseGeneration: tc.LeaseGeneration, SenderRole: tc.Role,
+			DedupeID: effectID,
+		}
+		if _, err := mb.PostCallback(tc.Role, deliveredRec); err != nil {
+			respond(brokerResponse{Error: fmt.Sprintf("verdict delivered to provider but authority record failed (retry reconciles): %v", err)})
+			return
+		}
+		respond(brokerResponse{OK: true})
+	default:
+		respond(brokerResponse{Error: fmt.Sprintf("unknown op %q (ping|get|comment|verdict — mutations are coordinator-owned)", req.Op)})
+	}
+}
+
+// safeRemoveSocket removes a stale broker socket ONLY when the path really
+// is this uid's unix socket — a caller-controlled path can never delete an
+// arbitrary file, and removal errors propagate.
+func safeRemoveSocket(sock string) error {
+	// Pin the PARENT: it must be this uid's directory and not group/world
+	// writable — path substitution through a hostile parent is refused.
+	parent := filepath.Dir(sock)
+	pfi, err := os.Lstat(parent)
+	if err != nil {
+		return fmt.Errorf("audit socket parent: %w", err)
+	}
+	if pfi.Mode()&os.ModeSymlink != 0 || !pfi.IsDir() {
+		return fmt.Errorf("refusing socket parent %s: must be a real directory (FAC-145)", parent)
+	}
+	if st, ok := pfi.Sys().(*syscall.Stat_t); ok && int(st.Uid) != os.Getuid() {
+		return fmt.Errorf("refusing socket parent %s: owned by uid %d (FAC-145)", parent, st.Uid)
+	}
+	if pfi.Mode().Perm()&0o022 != 0 {
+		return fmt.Errorf("refusing socket parent %s: group/world writable (%v) (FAC-145)", parent, pfi.Mode().Perm())
+	}
+	audit := func() error {
+		fi, err := os.Lstat(sock)
+		if os.IsNotExist(err) {
+			return err
+		}
+		if err != nil {
+			return fmt.Errorf("audit socket path: %w", err)
+		}
+		if fi.Mode()&os.ModeSocket == 0 {
+			return fmt.Errorf("refusing to remove %s: not a unix socket (FAC-145)", sock)
+		}
+		if st, ok := fi.Sys().(*syscall.Stat_t); ok && int(st.Uid) != os.Getuid() {
+			return fmt.Errorf("refusing to remove %s: owned by uid %d, not %d (FAC-145)", sock, st.Uid, os.Getuid())
+		}
+		return nil
+	}
+	if err := audit(); err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	// Re-audit immediately before unlink; callers serialize via the ensure
+	// lock, closing the remaining lstat-to-remove window to a single actor.
+	if err := audit(); err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	if err := os.Remove(sock); err != nil {
+		return fmt.Errorf("remove stale socket: %w", err)
+	}
+	return nil
+}
+
+// brokerPing round-trips the broker's typed ping op and AUTHENTICATES the
+// pong: the broker must sign our fresh nonce with the coordinator key. A
+// process that merely binds the socket and answers OK is an impostor.
+func brokerPing(root, sock string) error {
+	verifier, err := dispatch.LoadVerifier(root)
+	if err != nil {
+		return fmt.Errorf("cannot authenticate broker without the published key (FAC-145): %w", err)
+	}
+	nonceRaw := make([]byte, 16)
+	if _, err := cryptoRandRead(nonceRaw); err != nil {
+		return err
+	}
+	nonce := hex.EncodeToString(nonceRaw)
+	conn, err := net.DialTimeout("unix", sock, 2*time.Second)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(3 * time.Second))
+	if err := json.NewEncoder(conn).Encode(brokerRequest{Op: "ping", Nonce: nonce}); err != nil {
+		return err
+	}
+	var resp brokerResponse
+	if err := json.NewDecoder(conn).Decode(&resp); err != nil {
+		return err
+	}
+	if !resp.OK {
+		return fmt.Errorf("broker ping refused: %s", resp.Error)
+	}
+	if err := verifier.VerifyBytes([]byte("herd-broker-pong:"+nonce), resp.NonceSig); err != nil {
+		return fmt.Errorf("broker identity NOT authenticated — impostor socket refused (FAC-145): %w", err)
+	}
+	return nil
+}
+
+// ensureBroker guarantees ONE canonical supervised broker per repo: probe
+// readiness, clear a stale socket safely, spawn a detached broker
+// (self-exec, own session, pidfile beside the socket), and wait for proven
+// readiness. Unavailable after the window is a BOUNDED, fail-closed error —
+// fleet paths that need the broker refuse instead of launching agents
+// without provider access.
+func ensureBroker(root, sock string) error {
+	if err := os.MkdirAll(filepath.Dir(sock), 0700); err != nil {
+		return err
+	}
+	// SERIALIZE concurrent ensure calls: probe, cleanup, spawn, readiness,
+	// and pidfile all happen under one exclusive lock — two racers can never
+	// unlink a live socket or stomp each other's pidfile.
+	lock, err := openNoFollow(sock+".lock", os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		return fmt.Errorf("open ensure lock: %w", err)
+	}
+	defer lock.Close()
+	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX); err != nil {
+		return fmt.Errorf("acquire ensure lock: %w", err)
+	}
+	defer syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
+
+	if err := brokerPing(root, sock); err == nil {
+		return nil
+	}
+	// A live-but-transiently-unreachable broker must NEVER be orphaned: if
+	// the recorded pid is still alive, stop it (and confirm it stopped)
+	// before replacing its socket. An unstoppable live broker is a BLOCKED
+	// state, not a silent double-broker.
+	if pid, ok := readBrokerPid(sock); ok {
+		if err := stopBrokerPid(pid); err != nil {
+			return fmt.Errorf("BLOCKED(broker_unavailable): recorded broker pid %d is unreachable but could not be stopped — refusing to orphan a live credential broker (FAC-145): %w", pid, err)
+		}
+	}
+	if err := safeRemoveSocket(sock); err != nil {
+		return err
+	}
+	self, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("resolve herd binary: %w", err)
+	}
+	logFile, err := openNoFollow(sock+".log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
+	if err != nil {
+		return fmt.Errorf("open broker log: %w", err)
+	}
+	defer logFile.Close()
+	cmd := exec.Command(self, "broker", "serve", "--socket", sock)
+	cmd.Stdout = logFile
+	cmd.Stderr = logFile
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("spawn broker: %w", err)
+	}
+	go func() { _, _ = cmd.Process.Wait() }() // reap if it exits while we live
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if err := brokerPing(root, sock); err == nil {
+			// Pidfile only records a PROVEN-ready broker, written through a
+			// no-follow open so a pre-placed symlink cannot redirect it.
+			pidFile, pErr := openNoFollow(sock+".pid", os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
+			if pErr != nil {
+				return failStartedBroker(cmd, sock, fmt.Errorf("open broker pidfile: %w", pErr))
+			}
+			if _, wErr := pidFile.WriteString(fmt.Sprintf("%d\n", cmd.Process.Pid)); wErr != nil {
+				pidFile.Close()
+				return failStartedBroker(cmd, sock, fmt.Errorf("write broker pidfile: %w", wErr))
+			}
+			if cErr := pidFile.Close(); cErr != nil {
+				return failStartedBroker(cmd, sock, fmt.Errorf("close broker pidfile: %w", cErr))
+			}
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return failStartedBroker(cmd, sock,
+				fmt.Errorf("BLOCKED(broker_unavailable): broker did not become ready within 5s (FAC-145)"))
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+// sameDir compares directories through symlinks (macOS /var vs /private/var).
+func sameDir(a, b string) bool {
+	ra, err := filepath.EvalSymlinks(a)
+	if err != nil {
+		ra = a
+	}
+	rb, err := filepath.EvalSymlinks(b)
+	if err != nil {
+		rb = b
+	}
+	return ra == rb
+}
+
+// shortSHA renders the 12-char prefix used in review checkout names.
+// shortSHA lives in reviewclassify.go (main) — identical semantics; do not
+// re-declare it here.
+
+// ensureDetachedReviewWorktree creates (or validates) an isolated review
+// checkout pinned DETACHED at the exact candidate SHA. Review can never
+// mutate the candidate branch, and the checkout's identity is verified
+// before admission: detached HEAD, exactly the candidate commit (FAC-145).
+func ensureDetachedReviewWorktree(root, dir, candidateSHA string) error {
+	if fi, err := os.Stat(dir); err == nil && fi.IsDir() {
+		return verifyDetachedAt(dir, candidateSHA)
+	}
+	if err := os.MkdirAll(filepath.Dir(dir), 0755); err != nil {
+		return fmt.Errorf("create review worktree parent: %w", err)
+	}
+	cmd := exec.Command("git", "-C", root, "worktree", "add", "--detach", dir, candidateSHA)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("create isolated review worktree at %s pinned to %s: %v: %s", dir, candidateSHA, err, out)
+	}
+	return verifyDetachedAt(dir, candidateSHA)
+}
+
+// verifyDetachedAt proves the review checkout is detached and sits exactly
+// on the candidate commit — the identity that cannot change between
+// admission and verdict.
+func verifyDetachedAt(dir, candidateSHA string) error {
+	head, err := exec.Command("git", "-C", dir, "rev-parse", "HEAD").Output()
+	if err != nil {
+		return fmt.Errorf("review worktree %s unreadable: %w", dir, err)
+	}
+	if got := strings.TrimSpace(string(head)); got != candidateSHA {
+		return fmt.Errorf("review worktree %s is at %s, not the candidate %s (FAC-145)", dir, got, candidateSHA)
+	}
+	ref, err := exec.Command("git", "-C", dir, "symbolic-ref", "-q", "HEAD").Output()
+	if err == nil && strings.TrimSpace(string(ref)) != "" {
+		return fmt.Errorf("review worktree %s is attached to %s — reviews run DETACHED so they cannot mutate the candidate branch (FAC-145)", dir, strings.TrimSpace(string(ref)))
+	}
+	return nil
+}
+
+// reviewLifecycle collects compensations for the review admission
+// sequence: EVERY failure boundary after the lease is acquired unwinds the
+// exact side effects it created (lease released, receipt removed, tab
+// closed) before exiting non-zero — no orphan reviewer, tab, or claim
+// (FAC-145).
+type reviewLifecycle struct {
+	steps []func() error
+}
+
+func (l *reviewLifecycle) onFail(f func() error) { l.steps = append(l.steps, f) }
+
+// fail unwinds in reverse order, reports every compensation error, and
+// exits non-zero.
+func (l *reviewLifecycle) fail(format string, args ...any) {
+	fmt.Fprintf(os.Stderr, format+"\n", args...)
+	for i := len(l.steps) - 1; i >= 0; i-- {
+		if err := l.steps[i](); err != nil {
+			fmt.Fprintf(os.Stderr, "  COMPENSATION FAILED: %v\n", err)
+		}
+	}
+	os.Exit(1)
+}
+
+// releaseCoordinationLease durably releases an acquired coordination lease
+// (dispatch compensation path).
+// acquireOrJoinLease reports whether THIS call acquired the lease (owned)
+// or joined an existing one, so compensation only releases what it created.
+func acquireOrJoinLease(ctx context.Context, root string, key claim.LeaseKey, owner, role string) (string, int64, bool, error) {
+	st, err := claim.NewSQLiteLeaseStore(filepath.Join(root, ".herd", "herdforge.db"))
+	if err != nil {
+		return "", 0, false, fmt.Errorf("claim store unavailable (FAC-145): %w", err)
+	}
+	defer st.Close()
+	if leases, aErr := st.ActiveClaims(ctx, time.Now()); aErr == nil {
+		for _, l := range leases {
+			if l.LeaseKey == key {
+				return fmt.Sprintf("claim:%d", l.ID), l.Generation, false, nil
+			}
+		}
+	}
+	lease, err := st.Acquire(ctx, key, owner, role, "", time.Now(), dispatch.DefaultReceiptTTL)
+	if err != nil {
+		return "", 0, false, fmt.Errorf("claim lease acquisition failed (FAC-145): %w", err)
+	}
+	return fmt.Sprintf("claim:%d", lease.ID), lease.Generation, true, nil
+}
+
+func releaseCoordinationLease(ctx context.Context, root string, key claim.LeaseKey, owner string, generation int64) error {
+	st, err := claim.NewSQLiteLeaseStore(filepath.Join(root, ".herd", "herdforge.db"))
+	if err != nil {
+		return err
+	}
+	defer st.Close()
+	_, _, err = st.Release(ctx, key, owner, generation, time.Now())
+	return err
+}
+
+// verdictClaimPrefix marks provider-side ownership claims.
+const verdictClaimPrefix = "[verdict-claim "
+
+// winVerdictClaim decides cross-host ownership of one verdict effect using
+// the PROVIDER as the shared serializer (FAC-145). Every contender posts a
+// coordinator-SIGNED claim marker naming the effect and its own id, then
+// reads all comments back: the earliest valid claim for that effect wins.
+// Claims are unforgeable (signed) and idempotent (a contender that already
+// claimed does not claim again), so two hosts racing produce exactly one
+// owner and therefore exactly one delivered verdict.
+func winVerdictClaim(ctx context.Context, btp *dispatch.ContextBoundProvider, signer *dispatch.Signer, verifier *dispatch.Verifier, tc dispatch.TaskContext, effectID string) (bool, error) {
+	selfRaw := make([]byte, 12)
+	if _, err := cryptoRandRead(selfRaw); err != nil {
+		return false, err
+	}
+	self := hex.EncodeToString(selfRaw)
+
+	claimBody := func(owner string) (string, error) {
+		sig, err := signer.SignBytes([]byte("herd-verdict-claim:" + effectID + "\n" + owner))
+		if err != nil {
+			return "", err
+		}
+		return fmt.Sprintf("%s%s owner=%s sig=%s]", verdictClaimPrefix, effectID, owner, sig), nil
+	}
+	parseClaim := func(body string) (owner string, ok bool) {
+		if !strings.HasPrefix(body, verdictClaimPrefix+effectID+" owner=") {
+			return "", false
+		}
+		rest := strings.TrimSuffix(strings.TrimPrefix(body, verdictClaimPrefix+effectID+" owner="), "]")
+		parts := strings.SplitN(rest, " sig=", 2)
+		if len(parts) != 2 {
+			return "", false
+		}
+		// Unforgeable: only the coordinator key can mint a valid claim.
+		if verifier.VerifyBytes([]byte("herd-verdict-claim:"+effectID+"\n"+parts[0]), parts[1]) != nil {
+			return "", false
+		}
+		return parts[0], true
+	}
+
+	// A claim already recorded by THIS clone is reused (idempotent retry).
+	comments, err := btp.ListComments(ctx, tc.TaskID)
+	if err != nil {
+		return false, fmt.Errorf("verdict ownership readback failed (FAC-145 fail-closed): %w", err)
+	}
+	for _, c := range comments {
+		if owner, ok := parseClaim(c); ok {
+			// Someone already owns it; we only proceed if it is us.
+			return owner == self, nil
+		}
+	}
+
+	body, err := claimBody(self)
+	if err != nil {
+		return false, err
+	}
+	if err := btp.AddComment(ctx, tc.TaskID, body); err != nil {
+		return false, fmt.Errorf("verdict ownership claim failed (FAC-145): %w", err)
+	}
+	// Re-read: the EARLIEST valid claim in provider order wins.
+	comments, err = btp.ListComments(ctx, tc.TaskID)
+	if err != nil {
+		return false, fmt.Errorf("verdict ownership readback failed after claim (FAC-145): %w", err)
+	}
+	for _, c := range comments {
+		if owner, ok := parseClaim(c); ok {
+			return owner == self, nil
+		}
+	}
+	return false, fmt.Errorf("verdict ownership claim vanished from the provider — refusing (FAC-145 fail-closed)")
+}
+
+// claimVerdictOwnership takes CROSS-HOST exclusive ownership of one verdict
+// effect using the durable claim store (the same authority that fences
+// tasks), so coordinators in separate clones or on separate hosts cannot
+// both publish. The local flock still serializes same-host racers cheaply;
+// the claim lease is what makes ownership global. Returns a release that
+// reports its own failures (FAC-145).
+func claimVerdictOwnership(root string, tc dispatch.TaskContext, effectID string) (func() error, error) {
+	localRelease, err := lockVerdictEffect(root, effectID)
+	if err != nil {
+		return nil, err
+	}
+	st, err := claim.NewSQLiteLeaseStore(filepath.Join(root, ".herd", "herdforge.db"))
+	if err != nil {
+		_ = localRelease()
+		return nil, fmt.Errorf("verdict ownership store unavailable (FAC-145): %w", err)
+	}
+	sum := sha256.Sum256([]byte(effectID))
+	key := claim.LeaseKey{
+		Repo:     tc.Repository,
+		Provider: tc.ProviderType,
+		Project:  tc.ProjectID,
+		TaskRef:  "verdict:" + hex.EncodeToString(sum[:12]),
+	}
+	owner := fmt.Sprintf("coordinator-verdict-%d", os.Getpid())
+	lease, err := st.Acquire(context.Background(), key, owner, "coordinator", "", time.Now(), 5*time.Minute)
+	if err != nil {
+		st.Close()
+		_ = localRelease()
+		return nil, fmt.Errorf("BLOCKED(verdict_owner): another coordinator owns this verdict effect (FAC-145): %w", err)
+	}
+	return func() error {
+		var errs []string
+		if _, _, rErr := st.Release(context.Background(), key, owner, lease.Generation, time.Now()); rErr != nil {
+			errs = append(errs, "release verdict ownership: "+rErr.Error())
+		}
+		if cErr := st.Close(); cErr != nil {
+			errs = append(errs, "close ownership store: "+cErr.Error())
+		}
+		if lErr := localRelease(); lErr != nil {
+			errs = append(errs, lErr.Error())
+		}
+		if len(errs) > 0 {
+			return fmt.Errorf("%s", strings.Join(errs, "; "))
+		}
+		return nil
+	}, nil
+}
+
+// lockVerdictEffect takes the exclusive durable owner lock for one verdict
+// effect at the canonical root, serializing probe/deliver/publish across
+// broker processes (FAC-145). Bounded: a wedged owner surfaces BLOCKED.
+func lockVerdictEffect(root, effectID string) (func() error, error) {
+	dir := filepath.Join(root, ".herd", "verdicts")
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return nil, fmt.Errorf("create verdict lock dir: %w", err)
+	}
+	sum := sha256.Sum256([]byte(effectID))
+	path := filepath.Join(dir, hex.EncodeToString(sum[:16])+".lock")
+	f, err := openNoFollow(path, os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		return nil, fmt.Errorf("open verdict lock: %w", err)
+	}
+	deadline := time.Now().Add(20 * time.Second)
+	for {
+		if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			f.Close()
+			return nil, fmt.Errorf("BLOCKED(verdict_owner): another coordinator holds the delivery lock for this effect (FAC-145)")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	return func() error {
+		if err := syscall.Flock(int(f.Fd()), syscall.LOCK_UN); err != nil {
+			f.Close()
+			return err
+		}
+		return f.Close()
+	}, nil
+}
+
+// readBrokerPid reads the recorded broker pid (no-follow) and reports
+// whether that process is currently alive.
+func readBrokerPid(sock string) (int, bool) {
+	f, err := openNoFollow(sock+".pid", os.O_RDONLY, 0600)
+	if err != nil {
+		return 0, false
+	}
+	defer f.Close()
+	data := make([]byte, 32)
+	n, _ := f.Read(data)
+	var pid int
+	if _, err := fmt.Sscanf(strings.TrimSpace(string(data[:n])), "%d", &pid); err != nil || pid <= 1 {
+		return 0, false
+	}
+	proc, err := os.FindProcess(pid)
+	if err != nil {
+		return 0, false
+	}
+	if err := proc.Signal(syscall.Signal(0)); err != nil {
+		return 0, false // recorded pid is gone
+	}
+	return pid, true
+}
+
+// stopBrokerPid terminates a live broker and CONFIRMS it exited; an
+// unstoppable process is an error, never ignored.
+func stopBrokerPid(pid int) error {
+	proc, err := os.FindProcess(pid)
+	if err != nil {
+		return err
+	}
+	if err := proc.Signal(syscall.SIGTERM); err != nil {
+		return err
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		if err := proc.Signal(syscall.Signal(0)); err != nil {
+			return nil // confirmed gone
+		}
+		if time.Now().After(deadline) {
+			if err := proc.Signal(syscall.SIGKILL); err != nil {
+				return fmt.Errorf("kill broker pid %d: %w", pid, err)
+			}
+			time.Sleep(200 * time.Millisecond)
+			if err := proc.Signal(syscall.Signal(0)); err != nil {
+				return nil
+			}
+			return fmt.Errorf("broker pid %d survived SIGKILL", pid)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+// failStartedBroker tears down a spawned-but-unusable broker, reporting
+// every cleanup failure alongside the original cause.
+func failStartedBroker(cmd *exec.Cmd, sock string, cause error) error {
+	errs := []string{cause.Error()}
+	if err := stopBrokerPid(cmd.Process.Pid); err != nil {
+		errs = append(errs, "stop spawned broker: "+err.Error())
+	}
+	if err := safeRemoveSocket(sock); err != nil {
+		errs = append(errs, "socket cleanup: "+err.Error())
+	}
+	return fmt.Errorf("%s", strings.Join(errs, "; "))
+}
+
+// runBrokerEnsure is the supervised entry: `herd broker ensure` proves a
+// ready canonical broker (spawning/replacing as needed) and exits 0 only on
+// proven readiness.
+func runBrokerEnsure() {
+	fs := flag.NewFlagSet("broker ensure", flag.ExitOnError)
+	socketFlag := fs.String("socket", "", "unix socket path override")
+	fs.Parse(os.Args[3:])
+	root, err := canonicalHerdRoot()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "herd broker ensure: %v\n", err)
+		os.Exit(1)
+	}
+	cfg, err := config.LoadConfig(filepath.Join(root, ".herd", "herd.yaml"))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "herd broker ensure: %v\n", err)
+		os.Exit(1)
+	}
+	sock := *socketFlag
+	if sock == "" {
+		// SAME namespace as serve and the client: stable repository
+		// identity, never the configured name (FAC-145).
+		if sock, err = brokerSocketPath(dispatch.RepositoryIdentityOrName(root, cfg.Project.Name)); err != nil {
+			fmt.Fprintf(os.Stderr, "herd broker ensure: %v\n", err)
+			os.Exit(1)
+		}
+	}
+	if err := ensureBroker(root, sock); err != nil {
+		fmt.Fprintf(os.Stderr, "herd broker ensure: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Printf("herd broker: ready at %s\n", sock)
+}
+
+// runReceiptIssue is the coordinator's explicit ADMISSION command for
+// every isolated agent class that is not launched by dispatch or review:
+// verification gates, recovery sentinels, and harvest/integration owners
+// (FAC-145 "every isolated agent"). It acquires a role-scoped durable
+// lease, issues the signed receipt into the target worktree, and stores
+// the canonical copy — the same authority pipeline dispatch uses.
+//
+//	herd receipt issue --role verifier|recovery|integration <ref> <worktree>
+func runReceiptIssue() {
+	fs := flag.NewFlagSet("receipt issue", flag.ExitOnError)
+	role := fs.String("role", "", "verifier|recovery|integration")
+	args := os.Args[2:]
+	if len(args) > 0 && args[0] == "issue" {
+		args = args[1:]
+	}
+	fs.Parse(args)
+	if fs.NArg() < 2 || *role == "" {
+		fmt.Fprintln(os.Stderr, "usage: herd receipt issue --role verifier|recovery|integration <ref> <worktree>")
+		os.Exit(2)
+	}
+	ref, targetDir := hsync.NormalizeRef(fs.Arg(0)), fs.Arg(1)
+	switch *role {
+	case dispatch.RoleVerifier, dispatch.RoleRecovery, dispatch.RoleIntegration:
+	default:
+		fmt.Fprintf(os.Stderr, "herd receipt: role %q is not an admissible isolated-agent role (FAC-145)\n", *role)
+		os.Exit(2)
+	}
+
+	root, err := canonicalHerdRoot()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "herd receipt: %v\n", err)
+		os.Exit(1)
+	}
+	cfg, err := config.LoadConfig(filepath.Join(root, ".herd", "herd.yaml"))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "herd receipt: %v\n", err)
+		os.Exit(1)
+	}
+	tp, tpErr := loadTaskProvider(cfg)
+	if tpErr != nil {
+		fmt.Fprintf(os.Stderr, "herd receipt: task provider: %v\n", tpErr)
+		os.Exit(1)
+	}
+	tasks, err := tp.ListTasks(context.Background(), cfg.TaskProvider.ProjectID, "")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "herd receipt: %v\n", err)
+		os.Exit(1)
+	}
+	var task *provider.Task
+	for _, t := range tasks {
+		if strings.EqualFold(hsync.NormalizeRef(t.Ref), ref) {
+			task = t
+			break
+		}
+	}
+	if task == nil {
+		fmt.Fprintf(os.Stderr, "herd receipt: no task %s on the board\n", ref)
+		os.Exit(1)
+	}
+
+	gitOut := func(args ...string) string {
+		out, _ := exec.Command("git", append([]string{"-C", targetDir}, args...)...).Output()
+		return strings.TrimSpace(string(out))
+	}
+	branch, candidate, base := gitOut("rev-parse", "--abbrev-ref", "HEAD"), gitOut("rev-parse", "HEAD"), gitOut("rev-parse", "origin/main")
+	if branch == "" || base == "" {
+		fmt.Fprintf(os.Stderr, "herd receipt: %s is not a readable worktree (FAC-145)\n", targetDir)
+		os.Exit(1)
+	}
+
+	// Role-scoped lease key: a session lease must never collide with the
+	// builder's live claim on the same task. Each receipt fences against
+	// its OWN key (LeaseTaskRef); unifying these under one canonical task
+	// fence is FAC-147's authority, consumed at that rebase.
+	leaseRef := ref + ":" + *role
+	leaseKey := claim.LeaseKey{Repo: dispatch.RepositoryIdentityOrName(root, cfg.Project.Name), Provider: cfg.TaskProvider.Type, Project: cfg.TaskProvider.ProjectID, TaskRef: leaseRef}
+	leaseID, leaseGen, leaseErr := acquireCoordinationLease(context.Background(), root, leaseKey, "coordinator-"+*role, *role)
+	if leaseErr != nil {
+		fmt.Fprintf(os.Stderr, "herd receipt: %v\n", leaseErr)
+		os.Exit(1)
+	}
+	signer, err := dispatch.LoadSignerForConfig(cfg.Project.Name, root)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "herd receipt: %v\n", err)
+		os.Exit(1)
+	}
+	receipt, err := signer.Issue(dispatch.TaskContext{
+		ProviderType:      cfg.TaskProvider.Type,
+		ProjectID:         cfg.TaskProvider.ProjectID,
+		ProviderWorkspace: cfg.TaskProvider.WorkspaceID,
+		ProviderProfile:   cfg.TaskProvider.APIKeyEnv,
+		Repository:        dispatch.RepositoryIdentityOrName(root, cfg.Project.Name),
+		Role:              *role,
+		TaskRef:           task.Ref,
+		TaskID:            task.ID,
+		Branch:            branch,
+		BaseSHA:           base,
+		CandidateSHA:      candidate,
+		LeaseID:           leaseID,
+		LeaseGeneration:   leaseGen,
+		LeaseTaskRef:      leaseRef,
+		SessionID:         dispatch.NewSessionID(*role, task.Ref, candidate, leaseID),
+		AllowedOps:        dispatch.OpsForRole(*role),
+		ExpiresAt:         time.Now().Add(dispatch.DefaultReceiptTTL),
+	})
+	if err != nil {
+		if relErr := releaseCoordinationLease(context.Background(), root, leaseKey, "coordinator-"+*role, leaseGen); relErr != nil {
+			fmt.Fprintf(os.Stderr, "herd receipt: %v; LEASE COMPENSATION FAILED: %v\n", err, relErr)
+			os.Exit(1)
+		}
+		fmt.Fprintf(os.Stderr, "herd receipt (lease released): %v\n", err)
+		os.Exit(1)
+	}
+	if err := dispatch.WriteTaskContext(targetDir, receipt); err != nil {
+		if relErr := releaseCoordinationLease(context.Background(), root, leaseKey, "coordinator-"+*role, leaseGen); relErr != nil {
+			fmt.Fprintf(os.Stderr, "herd receipt: %v; LEASE COMPENSATION FAILED: %v\n", err, relErr)
+			os.Exit(1)
+		}
+		fmt.Fprintf(os.Stderr, "herd receipt (lease released): %v\n", err)
+		os.Exit(1)
+	}
+	if err := dispatch.StoreCanonicalReceipt(root, receipt); err != nil {
+		if relErr := releaseCoordinationLease(context.Background(), root, leaseKey, "coordinator-"+*role, leaseGen); relErr != nil {
+			fmt.Fprintf(os.Stderr, "herd receipt: %v; LEASE COMPENSATION FAILED: %v\n", err, relErr)
+			os.Exit(1)
+		}
+		fmt.Fprintf(os.Stderr, "herd receipt (lease released): %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Printf("herd receipt: issued %s session %s for %s into %s (lease %s gen %d)\n",
+		*role, receipt.SessionID, task.Ref, targetDir, leaseID, leaseGen)
+}
+
+// runReceiptRelease is the TERMINAL handback for an issued session: it
+// removes the worktree receipt and releases the session's durable lease,
+// so a finished verifier/recovery/integration agent never holds authority
+// for the rest of the receipt TTL (FAC-145).
+//
+//	herd receipt release --role <role> <ref> <worktree>
+func runReceiptRelease() {
+	fs := flag.NewFlagSet("receipt release", flag.ExitOnError)
+	role := fs.String("role", "", "verifier|recovery|integration")
+	args := os.Args[2:]
+	if len(args) > 0 && args[0] == "release" {
+		args = args[1:]
+	}
+	fs.Parse(args)
+	if fs.NArg() < 2 || *role == "" {
+		fmt.Fprintln(os.Stderr, "usage: herd receipt release --role <role> <ref> <worktree>")
+		os.Exit(2)
+	}
+	ref, targetDir := hsync.NormalizeRef(fs.Arg(0)), fs.Arg(1)
+
+	root, err := canonicalHerdRoot()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "herd receipt release: %v\n", err)
+		os.Exit(1)
+	}
+	cfg, err := config.LoadConfig(filepath.Join(root, ".herd", "herd.yaml"))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "herd receipt release: %v\n", err)
+		os.Exit(1)
+	}
+	tc, err := dispatch.ReadTaskContext(targetDir)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "herd receipt release: %v\n", err)
+		os.Exit(1)
+	}
+	if tc.Role != *role || !strings.EqualFold(hsync.NormalizeRef(tc.TaskRef), ref) {
+		fmt.Fprintf(os.Stderr, "herd receipt release: %s holds a %s receipt for %s, not %s/%s (FAC-145)\n", targetDir, tc.Role, tc.TaskRef, *role, ref)
+		os.Exit(1)
+	}
+	// Lease handback FIRST: if it fails, the receipt survives so the
+	// release can be retried with intact authority (FAC-145).
+	key := claim.LeaseKey{Repo: dispatch.RepositoryIdentityOrName(root, cfg.Project.Name), Provider: cfg.TaskProvider.Type, Project: cfg.TaskProvider.ProjectID, TaskRef: tc.LeaseTaskRef}
+	if err := releaseCoordinationLease(context.Background(), root, key, "coordinator-"+*role, tc.LeaseGeneration); err != nil {
+		fmt.Fprintf(os.Stderr, "herd receipt release: lease handback failed (receipt retained for retry): %v\n", err)
+		os.Exit(1)
+	}
+	if err := os.Remove(filepath.Join(targetDir, dispatch.TaskContextFile)); err != nil {
+		fmt.Fprintf(os.Stderr, "herd receipt release: remove receipt: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Printf("herd receipt: released %s session %s for %s\n", *role, tc.SessionID, tc.TaskRef)
+}
+
+// runTaskClient is the THIN capability client every isolated agent uses:
+// it reads ONLY the worktree's signed receipt and sends it to the
+// coordinator broker as a capability. No config, no verification key, no
+// provider code, and no credentials ever exist in the agent process.
+func runTaskClient() {
+	if len(os.Args) < 4 {
+		fmt.Fprintln(os.Stderr, "usage: herd task get <ref> [--full] | herd task comment <ref> <text...>")
+		os.Exit(2)
+	}
+	sub, ref := os.Args[2], os.Args[3]
+
+	tc, err := dispatch.ReadTaskContext(".")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "herd task: %v\n", err)
+		os.Exit(1)
+	}
+	if !strings.EqualFold(hsync.NormalizeRef(tc.TaskRef), hsync.NormalizeRef(ref)) {
+		fmt.Fprintf(os.Stderr, "herd task: this worktree's receipt is bound to %s, not %s (FAC-145: one receipt, one task)\n", tc.TaskRef, ref)
+		os.Exit(1)
+	}
+
+	req := brokerRequest{Op: "", Ref: ref, Receipt: tc}
+	switch sub {
+	case "get":
+		req.Op = "get"
+	case "verdict":
+		if len(os.Args) < 5 {
+			fmt.Fprintln(os.Stderr, "usage: herd task verdict <ref> APPROVED|REJECTED [detail...]")
+			os.Exit(2)
+		}
+		req.Op = "verdict"
+		req.Body = os.Args[4]
+		req.CandidateSHA = tc.CandidateSHA
+		// The client reports its ACTUAL checkout HEAD; the broker refuses
+		// when it drifts from the admitted candidate.
+		if head, hErr := exec.Command("git", "rev-parse", "HEAD").Output(); hErr == nil {
+			req.WorktreeHEAD = strings.TrimSpace(string(head))
+		}
+		if len(os.Args) > 5 {
+			req.Detail = strings.Join(os.Args[5:], " ")
+		}
+	case "comment":
+		var words []string
+		for _, a := range os.Args[4:] {
+			if !strings.HasPrefix(a, "--") {
+				words = append(words, a)
+			}
+		}
+		req.Op = "comment"
+		req.Body = strings.TrimSpace(strings.Join(words, " "))
+		if req.Body == "" {
+			fmt.Fprintln(os.Stderr, "usage: herd task comment <ref> <text...>")
+			os.Exit(2)
+		}
+	default:
+		fmt.Fprintf(os.Stderr, "herd task: unknown subcommand %q (get|comment|verdict — mutations are coordinator-owned)\n", sub)
+		os.Exit(2)
+	}
+
+	sock, err := brokerSocketPath(tc.Repository)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "herd task: %v\n", err)
+		os.Exit(1)
+	}
+	conn, err := net.DialTimeout("unix", sock, 5*time.Second)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "herd task: coordinator broker unavailable at %s (FAC-145: agents have no direct provider access): %v\n", sock, err)
+		os.Exit(1)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(30 * time.Second))
+	if err := json.NewEncoder(conn).Encode(req); err != nil {
+		fmt.Fprintf(os.Stderr, "herd task: %v\n", err)
+		os.Exit(1)
+	}
+	var resp brokerResponse
+	if err := json.NewDecoder(conn).Decode(&resp); err != nil {
+		fmt.Fprintf(os.Stderr, "herd task: broker response: %v\n", err)
+		os.Exit(1)
+	}
+	if !resp.OK {
+		fmt.Fprintf(os.Stderr, "herd task: %s\n", resp.Error)
+		os.Exit(1)
+	}
+	if req.Op == "verdict" {
+		fmt.Printf("herd task: verdict recorded for %s@%s\n", tc.TaskRef, tc.CandidateSHA)
+		return
+	}
+	if req.Op == "get" {
+		var pretty bytes.Buffer
+		if err := json.Indent(&pretty, resp.Result, "", "  "); err != nil {
+			fmt.Println(string(resp.Result))
+		} else {
+			fmt.Println(pretty.String())
+		}
+		return
+	}
+	fmt.Printf("herd task: comment posted to %s\n", tc.TaskRef)
+}
+
+// repoRootFromWorktree resolves the main repository root from inside any
+// git worktree via the shared common dir.
+func repoRootFromWorktree(dir string) (string, error) {
+	out, err := exec.Command("git", "-C", dir, "rev-parse", "--path-format=absolute", "--git-common-dir").Output()
+	if err != nil {
+		return "", fmt.Errorf("git common dir: %w", err)
+	}
+	return filepath.Dir(strings.TrimSpace(string(out))), nil
+}
+
+// isManagedWorktree reports whether path is one of the fleet's dispatched
+// task worktrees (under .herd/worktrees) — the set FAC-145 guarantees a
+// launch receipt for.
+func isManagedWorktree(path string) bool {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		abs = path
+	}
+	return strings.Contains(filepath.ToSlash(abs), "/.herd/worktrees/")
 }
 
 // runToolProbe (FAC-96): `herd tool-probe <model>` exits 0 only if the model
@@ -5743,13 +8075,13 @@ func forgeLoopMain() int {
 	// looking composed. Do not reopen this gate without task-scoped order
 	// listing and a test that fails when the composition is removed.
 	eng := daemon.NewEngineWithControl(cfg, tp, nil, st, resolveCanonicalWorktreeManager(), nil, nil)
-	driver := &cliForgeDriver{
-		cfg: cfg, maxLanes: *maxLanes,
-		observer: &herdr.ProductionReconciliationObserver{
-			Workspace: cfg.Fleet.HerdrWorkspace,
-			Reader:    herdr.SocketAuthorityReader{},
-			Record:    (&herdr.JSONLRecorder{Path: ".herd/reconciliation.jsonl"}).Record,
-		},
+
+	// Structural composition is checked BEFORE any broker side effect: a run
+	// that can never proceed must not spawn a broker process first. Mirrors
+	// ForgeLoop's own guard so the refusal reason stays the composition one.
+	if eng.ControlRequired && eng.ControlReconciler == nil {
+		fmt.Fprintf(os.Stderr, "forge --loop: forge: durable control reconciler is required before board or lane actions\n")
+		return 1
 	}
 
 	// FAC-222: wire the feedback census into the loop so a lane that goes quiet
@@ -5762,6 +8094,23 @@ func forgeLoopMain() int {
 			Workspace:   cfg.Fleet.HerdrWorkspace,
 		})
 	}
+
+	// FAC-145: the fleet loop owns ONE supervised broker per repo — proven
+	// ready before any tick, re-ensured (and respawned if crashed) by every
+	// dispatch it drives; an unavailable broker blocks the fleet closed.
+	forgeRootForSock, _ := canonicalHerdRoot()
+	if sock, sockErr := brokerSocketPath(dispatch.RepositoryIdentityOrName(forgeRootForSock, cfg.Project.Name)); sockErr != nil {
+		fmt.Fprintf(os.Stderr, "forge --loop: %v\n", sockErr)
+		return 1
+	} else if root, rErr := canonicalHerdRoot(); rErr != nil {
+		fmt.Fprintf(os.Stderr, "forge --loop: %v\n", rErr)
+		return 1
+	} else if err := ensureBroker(root, sock); err != nil {
+		fmt.Fprintf(os.Stderr, "forge --loop refused — %v\n", err)
+		return 1
+	}
+
+	driver := &cliForgeDriver{cfg: cfg, maxLanes: *maxLanes}
 
 	fmt.Printf("herd forge --loop: max-lanes=%d interval=%ds — driving the board autonomously\n", *maxLanes, *interval)
 	err = eng.ForgeLoop(ctx, driver, daemon.ForgeLoopOptions{

@@ -709,3 +709,35 @@ func cliErrMsg(res *CLIResult) string {
 func defaultHTTPClient() *http.Client {
 	return &http.Client{Timeout: DefaultDeadlines().Max() + 5*time.Second}
 }
+
+// ListComments implements CommentReader (FAC-145): exact effect readback
+// for verdict delivery. Comment bodies are returned in board order.
+func (k *KaneoProvider) ListComments(ctx context.Context, taskID string) ([]string, error) {
+	dls := k.deadlines()
+	ctx, cancel := WithOpDeadline(ctx, dls, OpGet)
+	defer cancel()
+	url := fmt.Sprintf("%s/api/task/%s/comment", k.APIURL, taskID)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := k.httpClient().Do(req)
+	if err != nil {
+		return nil, err
+	}
+	var dtos []struct {
+		Content string `json:"content"`
+	}
+	if err := DecodeJSONResponse(resp, &dtos); err != nil {
+		if pe, ok := err.(*ProviderError); ok {
+			pe.Provider = "kaneo"
+			pe.Op = "ListComments"
+		}
+		return nil, err
+	}
+	out := make([]string, 0, len(dtos))
+	for _, d := range dtos {
+		out = append(out, d.Content)
+	}
+	return out, nil
+}

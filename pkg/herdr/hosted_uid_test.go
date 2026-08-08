@@ -202,7 +202,7 @@ func TestTabCreateForTask_WithoutIsolationEnvStillWorks(t *testing.T) {
 	var got []string
 	runHerdr = func(args ...string) (string, error) {
 		got = append([]string{}, args...)
-		return `{"result":{"tab":{"tab_id":"t1","label":"task-fac-1"},"root_pane":{"pane_id":"p1","tab_id":"t1"}}}`, nil
+		return `{"result":{"tab":{"tab_id":"t1","label":"task-fac-1"},"root_pane":{"pane_id":"p1","tab_id":"t1","terminal_id":"term_a"}}}`, nil
 	}
 	tab, err := TabCreateForTask("wABC", "task-fac-1", wt, true)
 	if err != nil {
@@ -319,7 +319,7 @@ func TestTabCreate_HostedUIDProvesAndCleansOnFail(t *testing.T) {
 			return goodCapJSON(), nil
 		}
 		if len(args) >= 2 && args[0] == "tab" && args[1] == "create" {
-			return `{"result":{"tab":{"tab_id":"t1","label":"x"},"root_pane":{"pane_id":"p1","tab_id":"t1"}}}`, nil
+			return `{"result":{"tab":{"tab_id":"t1","label":"x"},"root_pane":{"pane_id":"p1","tab_id":"t1","terminal_id":"term_a"}}}`, nil
 		}
 		if len(args) >= 2 && args[0] == "pane" && args[1] == "process-info" {
 			return `{"result":{"process_info":{"pane_id":"p1","shell_pid":900001,"foreground_processes":[{"pid":900001}]}}}`, nil
@@ -354,7 +354,7 @@ func TestTabCreate_AttachesNegotiatedUIDFlag(t *testing.T) {
 		}
 		if len(args) >= 2 && args[0] == "tab" && args[1] == "create" {
 			createArgs = append([]string{}, args...)
-			return `{"result":{"tab":{"tab_id":"t1","label":"x"},"root_pane":{"pane_id":"p1","tab_id":"t1"}}}`, nil
+			return `{"result":{"tab":{"tab_id":"t1","label":"x"},"root_pane":{"pane_id":"p1","tab_id":"t1","terminal_id":"term_a"}}}`, nil
 		}
 		if len(args) >= 2 && args[0] == "pane" && args[1] == "process-info" {
 			return `{"result":{"process_info":{"pane_id":"p1","shell_pid":900001,"foreground_processes":[{"pid":900001}]}}}`, nil

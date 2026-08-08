@@ -457,3 +457,47 @@ func (l *LinearProvider) AddComment(ctx context.Context, taskID string, body str
 	}
 	return err
 }
+
+// ListComments implements CommentReader (FAC-145 exact effect readback),
+// PAGINATED via GraphQL cursors so a verdict effect stays findable behind
+// any number of earlier comments.
+func (l *LinearProvider) ListComments(ctx context.Context, taskID string) ([]string, error) {
+	dls := l.deadlines()
+	ctx, cancel := WithOpDeadline(ctx, dls, OpGet)
+	defer cancel()
+	const query = `query IssueComments($id: String!, $after: String) { issue(id: $id) { comments(first: 100, after: $after) { nodes { body } pageInfo { hasNextPage endCursor } } } }`
+	var out []string
+	var after any
+	for page := 0; page < maxCommentPages; page++ {
+		var res struct {
+			Data struct {
+				Issue struct {
+					Comments struct {
+						Nodes []struct {
+							Body string `json:"body"`
+						} `json:"nodes"`
+						PageInfo struct {
+							HasNextPage bool   `json:"hasNextPage"`
+							EndCursor   string `json:"endCursor"`
+						} `json:"pageInfo"`
+					} `json:"comments"`
+				} `json:"issue"`
+			} `json:"data"`
+		}
+		vars := map[string]interface{}{"id": taskID}
+		if after != nil {
+			vars["after"] = after
+		}
+		if err := l.doGraphQL(ctx, query, vars, &res); err != nil {
+			return nil, err
+		}
+		for _, n := range res.Data.Issue.Comments.Nodes {
+			out = append(out, n.Body)
+		}
+		if !res.Data.Issue.Comments.PageInfo.HasNextPage || res.Data.Issue.Comments.PageInfo.EndCursor == "" {
+			return out, nil
+		}
+		after = res.Data.Issue.Comments.PageInfo.EndCursor
+	}
+	return nil, fmt.Errorf("linear ListComments: exceeded %d pages — refusing a partial readback (FAC-145)", maxCommentPages)
+}

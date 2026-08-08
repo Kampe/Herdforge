@@ -320,3 +320,19 @@ var errCapability = fmt.Errorf("provider relation capability unsupported")
 var (
 	_ TaskProvider = (*BoundClient)(nil)
 )
+
+// ListComments forwards the CommentReader capability when the wrapped
+// provider supports it (FAC-145 exact effect readback).
+func (b *BoundClient) ListComments(ctx context.Context, taskID string) ([]string, error) {
+	if b == nil || b.Inner == nil {
+		return nil, fmt.Errorf("ListComments: nil provider")
+	}
+	reader, ok := b.Inner.(CommentReader)
+	if !ok {
+		return nil, fmt.Errorf("provider does not support comment readback")
+	}
+	opCtx, cancel := BoundOp(ctx, b.deadlines(), OpGet)
+	defer cancel()
+	out, err := reader.ListComments(opCtx, taskID)
+	return out, b.wrap("ListComments", OpGet, err)
+}

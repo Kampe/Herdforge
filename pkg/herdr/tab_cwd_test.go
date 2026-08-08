@@ -39,7 +39,10 @@ func TestTabCreateForTask_PassesAbsoluteCwd(t *testing.T) {
 	var got []string
 	runHerdr = func(args ...string) (string, error) {
 		got = append([]string(nil), args...)
-		return `{"result":{"tab":{"tab_id":"t1","label":"task-fac-1","cwd":"` + absTmp + `"}}}`, nil
+		// FAC-145: TabCreate now refuses a root pane with no terminal_id, so
+		// the fixture must carry the incarnation token.
+		return `{"result":{"tab":{"tab_id":"t1","label":"task-fac-1","cwd":"` + absTmp +
+			`"},"root_pane":{"pane_id":"p1","tab_id":"t1","terminal_id":"term_a"}}}`, nil
 	}
 
 	tab, err := TabCreateForTask("wABC", "task-fac-1", tmp, true)
@@ -48,6 +51,9 @@ func TestTabCreateForTask_PassesAbsoluteCwd(t *testing.T) {
 	}
 	if tab.Cwd != absTmp {
 		t.Fatalf("tab.Cwd = %q, want exact abs %q", tab.Cwd, absTmp)
+	}
+	if tab.ID != "t1" || tab.Pane.ID != "p1" || tab.Pane.TerminalID != "term_a" {
+		t.Fatalf("unexpected tab: %+v", tab)
 	}
 	joined := strings.Join(got, " ")
 	if !strings.Contains(joined, "--workspace wABC") {
@@ -227,7 +233,8 @@ func TestTabCreateForTask_RelativeDotResolvesToAbs(t *testing.T) {
 	runHerdr = func(args ...string) (string, error) {
 		calls++
 		got = append([]string(nil), args...)
-		return `{"result":{"tab":{"tab_id":"t-dot","label":"task-dot","cwd":"` + wantAbs + `"}}}`, nil
+		return `{"result":{"tab":{"tab_id":"t-dot","label":"task-dot","cwd":"` + wantAbs +
+			`"},"root_pane":{"pane_id":"p-dot","tab_id":"t-dot","terminal_id":"term_dot"}}}`, nil
 	}
 
 	tab, err := TabCreateForTask("wDOT", "task-dot", ".", true)
@@ -356,5 +363,73 @@ func TestTabCreateForTaskEnv_RequiresCwdAndAbsolute(t *testing.T) {
 	}
 	if calls != 0 {
 		t.Fatalf("runHerdr called %d times on non-dir cwd; want 0", calls)
+	}
+}
+
+// FAC-145: tab/pane name a REUSABLE slot. A receipt bound to the slot alone
+// would be revived by whatever agent occupies it next, so the incarnation
+// token is part of the session identity and every liveness/cwd readback
+// must match it. These are the mutation proofs: drop terminal_id from the
+// comparison and the "replaced" cases below start passing.
+func TestSessionIdentity_BoundToPaneIncarnation(t *testing.T) {
+	defer func(old func(args ...string) (string, error)) { runHerdr = old }(runHerdr)
+
+	// The live pane: same tab/pane slot as the launched one, but a NEW
+	// incarnation — herdr respawned it, or an operator started something
+	// else there.
+	listAs := func(terminal, cwd string) {
+		runHerdr = func(args ...string) (string, error) {
+			return `{"result":{"agents":[{"tab_id":"t1","pane_id":"p1","terminal_id":"` +
+				terminal + `","cwd":"` + cwd + `","foreground_cwd":"` + cwd + `"}]}}`, nil
+		}
+	}
+
+	launched := SessionID(PaneInfo{TabID: "t1", ID: "p1", TerminalID: "term_a"})
+	if launched != "t1/p1/term_a" {
+		t.Fatalf("session id = %q", launched)
+	}
+
+	listAs("term_a", "/repo/.herd/reviews/fac-1")
+	if alive, err := SessionExists(launched); err != nil || !alive {
+		t.Fatalf("the launched incarnation must be live: %v %v", alive, err)
+	}
+	if cwd, err := PaneLiveCwd(launched); err != nil || cwd != "/repo/.herd/reviews/fac-1" {
+		t.Fatalf("live cwd = %q, %v", cwd, err)
+	}
+
+	listAs("term_b", "/somewhere/else")
+	if alive, err := SessionExists(launched); err != nil || alive {
+		t.Fatal("a replacement agent in the same tab/pane must NOT revive the launched session")
+	}
+	if _, err := PaneLiveCwd(launched); err == nil {
+		t.Fatal("cwd readback must refuse to answer from a different incarnation")
+	}
+
+	// A slot-only id cannot prove incarnation, so it is refused outright
+	// rather than silently matching whatever holds the slot.
+	listAs("term_a", "/repo/.herd/reviews/fac-1")
+	if _, err := SessionExists("t1/p1"); err == nil {
+		t.Fatal("slot-only session id must be refused")
+	}
+	if _, err := PaneLiveCwd("t1/p1"); err == nil {
+		t.Fatal("slot-only session id must be refused by the cwd readback")
+	}
+	if _, err := SessionExists("t1/p1/"); err == nil {
+		t.Fatal("empty terminal id must be refused")
+	}
+}
+
+// A herdr that returns no terminal_id cannot support incarnation binding;
+// tab create must fail closed rather than hand back a slot-only identity.
+func TestTabCreate_RefusesPaneWithoutTerminalID(t *testing.T) {
+	defer func(old func(args ...string) (string, error)) { runHerdr = old }(runHerdr)
+	runHerdr = func(args ...string) (string, error) {
+		return `{"result":{"tab":{"tab_id":"t1","label":"x"},"root_pane":{"pane_id":"p1","tab_id":"t1"}}}`, nil
+	}
+	// A REAL directory: cwd validation runs before the herdr call, so a
+	// missing path would fail at the wrong guard and make this vacuous.
+	_, err := TabCreateForTask("wABC", "task-fac-1", t.TempDir(), true)
+	if err == nil || !strings.Contains(err.Error(), "terminal_id") {
+		t.Fatalf("expected a terminal_id refusal, got %v", err)
 	}
 }

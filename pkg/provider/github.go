@@ -321,3 +321,44 @@ func (g *GitHubProvider) addCommentOnce(ctx context.Context, taskID, body string
 	}
 	return nil
 }
+
+// ListComments implements CommentReader (FAC-145 exact effect readback).
+func (g *GitHubProvider) ListComments(ctx context.Context, taskID string) ([]string, error) {
+	dls := g.deadlines()
+	ctx, cancel := WithOpDeadline(ctx, dls, OpGet)
+	defer cancel()
+	// PAGINATED: a verdict effect must be findable no matter how many
+	// comments precede it (FAC-145). Pages are walked until short.
+	var out []string
+	const perPage = 100
+	for page := 1; page <= maxCommentPages; page++ {
+		url := fmt.Sprintf("https://api.github.com/repos/%s/%s/issues/%s/comments?per_page=%d&page=%d",
+			g.Owner, g.Repo, taskID, perPage, page)
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Authorization", "Bearer "+g.Token)
+		req.Header.Set("Accept", "application/vnd.github+json")
+		resp, err := g.httpClient().Do(req)
+		if err != nil {
+			return nil, err
+		}
+		var dtos []struct {
+			Body string `json:"body"`
+		}
+		if err := DecodeJSONResponse(resp, &dtos); err != nil {
+			if pe, ok := err.(*ProviderError); ok {
+				pe.Provider, pe.Op = "github", "ListComments"
+			}
+			return nil, err
+		}
+		for _, d := range dtos {
+			out = append(out, d.Body)
+		}
+		if len(dtos) < perPage {
+			return out, nil
+		}
+	}
+	return nil, fmt.Errorf("github ListComments: exceeded %d pages — refusing a partial readback (FAC-145)", maxCommentPages)
+}

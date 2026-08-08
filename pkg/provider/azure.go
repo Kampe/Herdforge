@@ -272,3 +272,74 @@ func (a *AzureDevOpsProvider) AddComment(ctx context.Context, taskID string, bod
 	}
 	return nil
 }
+
+// ListComments implements CommentReader (FAC-145 exact effect readback).
+// Azure writes annotations to System.History, so a symmetric readback must
+// include history revisions as well as the comments API — otherwise a
+// delivered effect written to History is invisible and the coordinator
+// would re-deliver it. Both sources are paginated/bounded.
+func (a *AzureDevOpsProvider) ListComments(ctx context.Context, taskID string) ([]string, error) {
+	dls := a.deadlines()
+	ctx, cancel := WithOpDeadline(ctx, dls, OpGet)
+	defer cancel()
+
+	var out []string
+	// 1. The comments API (newer work-item comments), PAGINATED via
+	// continuation token so an effect behind many comments is still found.
+	skip := 0
+	for page := 0; page < maxCommentPages; page++ {
+		raw, err := a.doRequest(ctx, "GET",
+			fmt.Sprintf("/_apis/wit/workItems/%s/comments?api-version=7.0-preview.3&$top=200&$skip=%d", taskID, skip), nil, "application/json")
+		if err != nil {
+			break // fall through to History, which AddComment actually writes
+		}
+		var payload struct {
+			TotalCount int `json:"totalCount"`
+			Count      int `json:"count"`
+			Comments   []struct {
+				Text string `json:"text"`
+			} `json:"comments"`
+		}
+		if jErr := json.Unmarshal(raw, &payload); jErr != nil {
+			return nil, fmt.Errorf("azure ListComments decode: %w", jErr)
+		}
+		for _, c := range payload.Comments {
+			out = append(out, c.Text)
+		}
+		skip += len(payload.Comments)
+		// A SHORT page is the last page; a full page continues. Without
+		// this a server that ignores $skip would loop forever.
+		if len(payload.Comments) < 200 || (payload.TotalCount > 0 && skip >= payload.TotalCount) {
+			break
+		}
+		if page == maxCommentPages-1 {
+			return nil, fmt.Errorf("azure ListComments: exceeded %d pages — refusing a partial readback (FAC-145)", maxCommentPages)
+		}
+	}
+	// 2. System.History revisions — the field AddComment actually writes.
+	raw, err := a.doRequest(ctx, "GET", fmt.Sprintf("/_apis/wit/workItems/%s/updates?api-version=7.0&$top=200", taskID), nil, "application/json")
+	if err != nil {
+		if len(out) > 0 {
+			return out, nil
+		}
+		return nil, fmt.Errorf("azure ListComments (history) failed: %w", err)
+	}
+	var updates struct {
+		Value []struct {
+			Fields struct {
+				History struct {
+					NewValue string `json:"newValue"`
+				} `json:"System.History"`
+			} `json:"fields"`
+		} `json:"value"`
+	}
+	if jErr := json.Unmarshal(raw, &updates); jErr != nil {
+		return nil, fmt.Errorf("azure ListComments history decode: %w", jErr)
+	}
+	for _, u := range updates.Value {
+		if v := u.Fields.History.NewValue; v != "" {
+			out = append(out, v)
+		}
+	}
+	return out, nil
+}
