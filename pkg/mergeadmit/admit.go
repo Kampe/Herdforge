@@ -118,6 +118,24 @@ func ComputeAcceptanceDigest(ref, taskID, providerRevision string) string {
 	return hex.EncodeToString(h[:])
 }
 
+// TaskContentRevision derives a revision token from the board card content a
+// reviewer actually reads. The provider exposes no revision counter, so the
+// content IS the revision: edit the acceptance criteria and the token changes.
+//
+// That is what makes the acceptance binding bite. In the FAC-150 incident a
+// provider-only PASS was internally valid but did not satisfy the card's
+// production-wiring criterion. With this token, editing or tightening a card's
+// criteria invalidates every verdict minted against the old text, and the work
+// has to be re-reviewed against what the card says now.
+func TaskContentRevision(ref, title, description string) string {
+	h := sha256.Sum256([]byte(strings.Join([]string{
+		strings.ToUpper(strings.TrimSpace(ref)),
+		strings.TrimSpace(title),
+		strings.TrimSpace(description),
+	}, "\x00")))
+	return hex.EncodeToString(h[:])
+}
+
 func (g *Gate) refuse(req Request, code, format string, a ...any) (*Decision, error) {
 	reason := fmt.Sprintf(format, a...)
 	d := &Decision{

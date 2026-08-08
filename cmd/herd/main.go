@@ -189,6 +189,13 @@ func main() {
 	case "harvest-merge":
 		runHarvestMerge()
 
+	// FAC-156: the coordinator's merge authority, as compiled code.
+	case "merge-admit":
+		runMergeAdmit()
+
+	case "merge-complete":
+		runMergeComplete()
+
 	case "hold":
 		runHold()
 
