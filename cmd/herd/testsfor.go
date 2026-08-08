@@ -144,10 +144,18 @@ func runTestsFor() {
 		// candidate introduces cannot exist in an index built at the base.
 		GraphAnchorSHA: candSHA,
 	}
-	if blocked {
+	switch {
+	case blocked:
 		// Broaden rather than emit an empty targeted plan.
 		in.Graph = graph.GraphEvidence{}
 		in.ForceEscalate = "graph integrity unproven: " + strings.Join(blockedReasons, "; ")
+	case len(integ.UnresolvedTargets) > 0:
+		// The index is proven complete, so not_found is authoritative for "this
+		// symbol has no graph node" — a package-level const or var. That makes
+		// its coverage underivable, not proven: keep the graph's real hits and
+		// broaden. Blocking here would fail every change that adds a constant.
+		in.ForceEscalate = "targets absent from a complete index (coverage underivable): " +
+			strings.Join(integ.UnresolvedTargets, ", ")
 	}
 
 	plan, perr := graph.Plan(in)

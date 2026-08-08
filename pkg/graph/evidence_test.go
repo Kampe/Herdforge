@@ -2,6 +2,7 @@ package graph
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -320,6 +321,60 @@ func TestCollectEvidence_AmbiguousQueryIsNotZero(t *testing.T) {
 	}
 }
 
+// TestCollectEvidence_NotFoundIsUnresolvedNotZero pins the third status the
+// CLI can return. A package-level const or var has no graph node, so a
+// complete index answers not_found. That is authoritative for "no graph
+// identity" and therefore says nothing about coverage: it must be recorded as
+// unresolved and never counted as a zero-result query, which would read as
+// proven coverage.
+func TestCollectEvidence_NotFoundIsUnresolvedNotZero(t *testing.T) {
+	t.Parallel()
+	m := manifestOfSize(2)
+	sha := "feedface00000000000000000000000000000000"
+	f := &fakeRunner{replies: map[string]string{
+		"status":          statusJSON(sha, 2, 20),
+		"query tests_for": `{"status": "not_found", "summary": "No node found matching '/repo/pkg/a/a.go::DefaultTool'."}`,
+		"query callers_of": `{
+  "status": "ok",
+  "result_count": 1,
+  "results": [
+    {"kind": "Function", "name": "Caller", "file_path": "/repo/pkg/b/b.go"}
+  ]
+}`,
+	}}
+	ev, integ, err := CollectEvidence(context.Background(), f.run, EvidenceRequest{
+		RepoRoot: "/repo",
+		Commit:   sha,
+		Manifest: m,
+		Targets: []QueryTarget{
+			{Pattern: "tests_for", Target: "/repo/pkg/a/a.go::DefaultTool"},
+			{Pattern: "callers_of", Target: "/repo/pkg/a/a.go::Exported"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A complete index is still trusted; the run must not hard-fail.
+	if !integ.Trusted {
+		t.Fatalf("not_found against a complete index must not reject the run: %v", integ.RejectionReasons)
+	}
+	if len(integ.UnresolvedTargets) != 1 || !strings.Contains(integ.UnresolvedTargets[0], "pkg/a/a.go::DefaultTool") {
+		t.Fatalf("unresolved target not recorded: %+v", integ.UnresolvedTargets)
+	}
+	for _, q := range integ.Queries {
+		if strings.Contains(q, "DefaultTool") {
+			t.Fatalf("not_found must not be recorded as a zero-result query: %q", q)
+		}
+	}
+	// The resolvable query still contributes its evidence.
+	if len(ev.Hits) != 1 || ev.Hits[0].FilePath != "pkg/b/b.go" {
+		t.Fatalf("resolvable queries must still yield hits: %+v", ev.Hits)
+	}
+	if len(integ.Queries) != 1 {
+		t.Fatalf("exactly one query answered ok, got %v", integ.Queries)
+	}
+}
+
 func TestCollectEvidence_StatusFailureRejectsAndHidesHostPaths(t *testing.T) {
 	t.Parallel()
 	f := &fakeRunner{errs: map[string]error{
@@ -397,6 +452,44 @@ func TestLastJSONObject_PrettyAndNoisy(t *testing.T) {
 	one := []byte(`{"nodes": 1}`)
 	if got := string(lastJSONObject(one)); got != `{"nodes": 1}` {
 		t.Fatalf("single-line object not recovered: %q", got)
+	}
+}
+
+// TestLastJSONObject_NestedResultObjects is the regression for the shape a
+// live `code-review-graph query` returns whenever it finds anything: a
+// pretty-printed document whose results array holds indented objects. Matching
+// the last INDENTED brace truncates the document mid-array and decoding fails
+// with "invalid character ']' after top-level value" — which reads as a graph
+// failure and blocks a plan that should have succeeded.
+func TestLastJSONObject_NestedResultObjects(t *testing.T) {
+	t.Parallel()
+	raw := []byte(`INFO: noise on the same stream
+{
+  "status": "ok",
+  "result_count": 2,
+  "results": [
+    {
+      "kind": "Test",
+      "name": "TestOne",
+      "file_path": "/repo/pkg/a/a_test.go"
+    },
+    {
+      "kind": "Test",
+      "name": "TestTwo",
+      "file_path": "/repo/pkg/b/b_test.go"
+    }
+  ]
+}
+`)
+	var res graphQueryResult
+	if err := json.Unmarshal(lastJSONObject(raw), &res); err != nil {
+		t.Fatalf("nested result objects must decode: %v", err)
+	}
+	if res.Status != "ok" || res.ResultCount != 2 || len(res.Results) != 2 {
+		t.Fatalf("decoded %+v", res)
+	}
+	if res.Results[1].Name != "TestTwo" {
+		t.Fatalf("last result lost: %+v", res.Results)
 	}
 }
 

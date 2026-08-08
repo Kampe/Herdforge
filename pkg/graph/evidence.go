@@ -67,19 +67,26 @@ func BuildManifest(tracked []string, exts []string) SourceManifest {
 // the graph counts and the executed query set. Trusted is the only field a
 // consumer may read as "absence is authoritative".
 type GraphIntegrity struct {
-	Tool             string   `json:"tool"`
-	RepoCommit       string   `json:"repo_commit"`
-	GraphBuiltAt     string   `json:"graph_built_at,omitempty"`
-	GraphCurrentSHA  string   `json:"graph_current_sha,omitempty"`
-	ManifestFiles    int      `json:"manifest_files"`
-	ManifestDigest   string   `json:"manifest_digest"`
-	GraphFiles       int      `json:"graph_files"`
-	GraphNodes       int      `json:"graph_nodes"`
-	GraphEdges       int      `json:"graph_edges"`
-	Queries          []string `json:"queries,omitempty"`
-	Rebuilt          bool     `json:"rebuilt"`
-	Trusted          bool     `json:"trusted"`
-	RejectionReasons []string `json:"rejection_reasons,omitempty"`
+	Tool            string   `json:"tool"`
+	RepoCommit      string   `json:"repo_commit"`
+	GraphBuiltAt    string   `json:"graph_built_at,omitempty"`
+	GraphCurrentSHA string   `json:"graph_current_sha,omitempty"`
+	ManifestFiles   int      `json:"manifest_files"`
+	ManifestDigest  string   `json:"manifest_digest"`
+	GraphFiles      int      `json:"graph_files"`
+	GraphNodes      int      `json:"graph_nodes"`
+	GraphEdges      int      `json:"graph_edges"`
+	Queries         []string `json:"queries,omitempty"`
+	// UnresolvedTargets are query targets the index has no node for at all
+	// (status not_found) — typically a package-level const or var, which the
+	// graph does not model as a node. Against a proven-complete index that is
+	// authoritative for "this symbol has no graph identity", which means its
+	// coverage cannot be derived. It is NOT a zero-result query and must never
+	// be counted as one; callers broaden verification instead.
+	UnresolvedTargets []string `json:"unresolved_targets,omitempty"`
+	Rebuilt           bool     `json:"rebuilt"`
+	Trusted           bool     `json:"trusted"`
+	RejectionReasons  []string `json:"rejection_reasons,omitempty"`
 }
 
 // CheckIntegrity returns sorted rejection reasons for graph evidence at commit.
@@ -202,8 +209,9 @@ func CollectEvidence(ctx context.Context, run Runner, req EvidenceRequest) (Grap
 		return GraphEvidence{}, integ, nil
 	}
 
-	hits, queries, qerr := runQueries(ctx, run, tool, req.RepoRoot, req.Targets)
+	hits, queries, unresolved, qerr := runQueries(ctx, run, tool, req.RepoRoot, req.Targets)
 	integ.Queries = queries
+	integ.UnresolvedTargets = unresolved
 	if qerr != nil {
 		integ.RejectionReasons = []string{DisplayTarget("graph query failed: "+qerr.Error(), req.RepoRoot)}
 		return GraphEvidence{}, integ, nil
@@ -228,14 +236,16 @@ func graphStatus(ctx context.Context, run Runner, tool, root string) (GraphStatu
 	return ParseGraphStatusJSON(lastJSONObject(out))
 }
 
-// lastJSONObject returns the buffer from the last line that opens a JSON
-// object through the end. The tool prefixes schema-migration notices on some
-// runs, and emits pretty-printed multi-line objects, so neither "parse the
-// whole buffer" nor "parse the last line" works on its own.
+// lastJSONObject returns the buffer from the last line that opens a TOP-LEVEL
+// JSON object through the end. The tool prefixes schema-migration notices on
+// some runs, so "parse the whole buffer" fails; it also pretty-prints objects,
+// so "parse the last line" fails. The open brace must be at column zero:
+// nested result objects are indented, and matching one of those truncates the
+// document mid-array ("invalid character ']' after top-level value").
 func lastJSONObject(raw []byte) []byte {
 	lines := strings.Split(string(raw), "\n")
 	for i := len(lines) - 1; i >= 0; i-- {
-		if strings.HasPrefix(strings.TrimSpace(lines[i]), "{") {
+		if strings.HasPrefix(lines[i], "{") {
 			return []byte(strings.Join(lines[i:], "\n"))
 		}
 	}
@@ -256,13 +266,24 @@ type graphQueryResult struct {
 	} `json:"results"`
 }
 
-// runQueries executes the query set and returns hits plus the deterministic
-// record of what was asked. `code-review-graph query` exits 0 for ambiguous
-// and not_found alike, so status is checked explicitly: an ambiguous target
-// is an error, never zero results.
-func runQueries(ctx context.Context, run Runner, tool, root string, targets []QueryTarget) ([]GraphHit, []string, error) {
+// runQueries executes the query set and returns hits, the deterministic record
+// of what was asked, and the targets the index holds no node for.
+//
+// `code-review-graph query` exits 0 for ok, ambiguous and not_found alike, so
+// status is checked explicitly and each case is handled differently:
+//
+//   - ok: results become hits and the query count is recorded.
+//   - not_found: the target has no node (a package-level const or var is not
+//     modelled as one). Recorded as unresolved so the caller broadens; it is
+//     never recorded as a zero-result query, which would read as proven
+//     coverage.
+//   - anything else (ambiguous, error): a hard failure. An ambiguous target
+//     means the question was meaningless, and real edges may hide under
+//     another node.
+func runQueries(ctx context.Context, run Runner, tool, root string, targets []QueryTarget) ([]GraphHit, []string, []string, error) {
 	var hits []GraphHit
 	var queries []string
+	var unresolved []string
 	for _, t := range targets {
 		pattern := strings.TrimSpace(t.Pattern)
 		target := strings.TrimSpace(t.Target)
@@ -276,14 +297,18 @@ func runQueries(ctx context.Context, run Runner, tool, root string, targets []Qu
 		argv := append([]string{tool, "query", pattern, target}, repoFlag(root)...)
 		out, err := run(ctx, argv)
 		if err != nil {
-			return nil, queries, fmt.Errorf("%s(%s): %w", pattern, shown, err)
+			return nil, queries, unresolved, fmt.Errorf("%s(%s): %w", pattern, shown, err)
 		}
 		var res graphQueryResult
 		if jerr := json.Unmarshal(lastJSONObject(out), &res); jerr != nil {
-			return nil, queries, fmt.Errorf("%s(%s): decode: %w", pattern, shown, jerr)
+			return nil, queries, unresolved, fmt.Errorf("%s(%s): decode: %w", pattern, shown, jerr)
+		}
+		if res.Status == "not_found" {
+			unresolved = append(unresolved, shown)
+			continue
 		}
 		if res.Status != "ok" {
-			return nil, queries, fmt.Errorf("%s(%s): status=%s %s", pattern, shown, res.Status, DisplayTarget(res.Summary, root))
+			return nil, queries, unresolved, fmt.Errorf("%s(%s): status=%s %s", pattern, shown, res.Status, DisplayTarget(res.Summary, root))
 		}
 		queries = append(queries, pattern+"("+shown+")="+fmt.Sprint(res.ResultCount))
 		for _, r := range res.Results {
@@ -300,7 +325,7 @@ func runQueries(ctx context.Context, run Runner, tool, root string, targets []Qu
 		}
 	}
 	sort.Strings(queries)
-	return hits, queries, nil
+	return hits, queries, uniqueSortedStrings(unresolved), nil
 }
 
 // DisplayTarget strips the worktree root from any text so evidence, receipts
