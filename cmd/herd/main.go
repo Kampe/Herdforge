@@ -5162,6 +5162,21 @@ func (d *cliForgeDriver) Dispatch(ctx context.Context, t *provider.Task) error {
 	return d.herd("dispatch", t.Ref, "--lane", "worker")
 }
 
+// admitReviewHook is the production FAC-144 re-admission path. Tests replace
+// it via setAdmitReviewForTest so argv-order and subprocess-error probes stay
+// hermetic without a full receipt + lifecycle fixture.
+var admitReviewHook = admitWorktreeForReview
+
+func setAdmitReviewForTest(f func(ctx context.Context, cfg *config.Config, ref, wt, digest string) error) func() {
+	old := admitReviewHook
+	if f == nil {
+		admitReviewHook = admitWorktreeForReview
+	} else {
+		admitReviewHook = f
+	}
+	return func() { admitReviewHook = old }
+}
+
 func (d *cliForgeDriver) Review(ctx context.Context, t *provider.Task) error {
 	// FAC-144: re-admit with RequireCurrentPassing before spawning review.
 	// A Signals-time PASS is not sufficient if the candidate moved.
@@ -5169,7 +5184,7 @@ func (d *cliForgeDriver) Review(ctx context.Context, t *provider.Task) error {
 	if !worktreeExists(wt) {
 		return fmt.Errorf("review %s: worktree missing", t.Ref)
 	}
-	if err := admitWorktreeForReview(ctx, d.cfg, t.Ref, wt, ""); err != nil {
+	if err := admitReviewHook(ctx, d.cfg, t.Ref, wt, ""); err != nil {
 		return fmt.Errorf("review %s refused without current PASS receipt: %w", t.Ref, err)
 	}
 	// --spawn BEFORE the ref: flag.Parse stops at the first positional, so the

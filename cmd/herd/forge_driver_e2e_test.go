@@ -12,6 +12,7 @@ import (
 	"testing"
 
 	"github.com/Kampe/Herdforge/internal/testgit"
+	"github.com/Kampe/Herdforge/pkg/config"
 	"github.com/Kampe/Herdforge/pkg/herdr"
 	"github.com/Kampe/Herdforge/pkg/lock"
 	"github.com/Kampe/Herdforge/pkg/provider"
@@ -51,6 +52,29 @@ func TestCliForgeDriver_SignalsUnknownIsError(t *testing.T) {
 	}
 }
 
+// prepareReviewProbe installs a hermetic worktree dir + admission pass so
+// Review can reach the herd subprocess seam. FAC-144 gates spawn on both.
+func prepareReviewProbe(t *testing.T, ref string) {
+	t.Helper()
+	root := t.TempDir()
+	wt := filepath.Join(root, worktreePathForRef(ref))
+	if err := os.MkdirAll(wt, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(root); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(cwd) })
+	restoreAdmit := setAdmitReviewForTest(func(ctx context.Context, cfg *config.Config, r, w, digest string) error {
+		return nil
+	})
+	t.Cleanup(restoreAdmit)
+}
+
 func TestCliForgeDriver_ReviewSpawnBeforeRef(t *testing.T) {
 	// Mutation probe: if reviewArgs puts the ref before --spawn, parseReviewArgs
 	// with trailing-flag form would still work — but the forge loop historically
@@ -60,6 +84,9 @@ func TestCliForgeDriver_ReviewSpawnBeforeRef(t *testing.T) {
 	if strings.Join(got, " ") != strings.Join(want, " ") {
 		t.Fatalf("review argv = %v want %v", got, want)
 	}
+	// FAC-144: Review refuses without worktree + current PASS. Stub both so
+	// this probe measures argv order, not admission fixtures.
+	prepareReviewProbe(t, "FAC-1")
 	// And the driver must emit exactly that argv through the subprocess seam.
 	var recorded []string
 	restore := setHerdSubprocessForTest(func(args ...string) error {
@@ -83,13 +110,95 @@ func TestCliForgeDriver_ReviewSpawnBeforeRef(t *testing.T) {
 
 func TestCliForgeDriver_SwallowedReviewErrorSurfaces(t *testing.T) {
 	// FAC-135: driver must not swallow subprocess failures (FAC-138 residual).
+	// Must pass the FAC-144 worktree+admission gate first or the test would
+	// "pass" on worktree-missing without ever reaching the subprocess.
+	prepareReviewProbe(t, "FAC-9")
 	restore := setHerdSubprocessForTest(func(args ...string) error {
 		return errors.New("reviewer spawn failed")
 	})
 	t.Cleanup(restore)
 	d := &cliForgeDriver{}
-	if err := d.Review(context.Background(), &provider.Task{Ref: "FAC-9"}); err == nil {
+	err := d.Review(context.Background(), &provider.Task{Ref: "FAC-9"})
+	if err == nil {
 		t.Fatal("review failure was swallowed")
+	}
+	if !strings.Contains(err.Error(), "reviewer spawn failed") {
+		t.Fatalf("error = %v; want subprocess failure, not an earlier gate miss", err)
+	}
+}
+
+func TestCliForgeDriver_ReviewRefusesMissingWorktree(t *testing.T) {
+	// FAC-144: no worktree → no spawn. Admission and herd must not run.
+	root := t.TempDir()
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(root); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(cwd) })
+
+	admitCalled := false
+	restoreAdmit := setAdmitReviewForTest(func(ctx context.Context, cfg *config.Config, r, w, digest string) error {
+		admitCalled = true
+		return nil
+	})
+	t.Cleanup(restoreAdmit)
+	herdCalled := false
+	restore := setHerdSubprocessForTest(func(args ...string) error {
+		herdCalled = true
+		return nil
+	})
+	t.Cleanup(restore)
+
+	d := &cliForgeDriver{}
+	err = d.Review(context.Background(), &provider.Task{Ref: "FAC-1"})
+	if err == nil || !strings.Contains(err.Error(), "worktree missing") {
+		t.Fatalf("error = %v; want worktree missing", err)
+	}
+	if admitCalled {
+		t.Fatal("admission ran without a worktree")
+	}
+	if herdCalled {
+		t.Fatal("herd review spawned without a worktree")
+	}
+}
+
+func TestCliForgeDriver_ReviewRefusesWithoutPassReceipt(t *testing.T) {
+	// FAC-144: worktree present but admission fails → no spawn.
+	root := t.TempDir()
+	ref := "FAC-1"
+	if err := os.MkdirAll(filepath.Join(root, worktreePathForRef(ref)), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(root); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(cwd) })
+
+	restoreAdmit := setAdmitReviewForTest(func(ctx context.Context, cfg *config.Config, r, w, digest string) error {
+		return errors.New("no current PASS receipt")
+	})
+	t.Cleanup(restoreAdmit)
+	herdCalled := false
+	restore := setHerdSubprocessForTest(func(args ...string) error {
+		herdCalled = true
+		return nil
+	})
+	t.Cleanup(restore)
+
+	d := &cliForgeDriver{}
+	err = d.Review(context.Background(), &provider.Task{Ref: ref})
+	if err == nil || !strings.Contains(err.Error(), "refused without current PASS receipt") {
+		t.Fatalf("error = %v; want PASS-receipt refusal", err)
+	}
+	if herdCalled {
+		t.Fatal("herd review spawned without a current PASS receipt")
 	}
 }
 
