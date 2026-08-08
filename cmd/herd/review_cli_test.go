@@ -260,6 +260,22 @@ func herdCmd(binary, dir, keyDir string, args ...string) *exec.Cmd {
 
 // herdCmdWithFake is herdCmd plus an injected protocol-faithful herdr fake
 // for tests that exercise real launch paths.
+// prependToPath inserts dir at the front of PATH in cmd.Env so the
+// subprocess can find stub harness binaries (pi, codex, etc.).
+func prependToPath(cmd *exec.Cmd, dir string) {
+	for i, e := range cmd.Env {
+		if strings.HasPrefix(e, "PATH=") {
+			// PathListSeparator (":"), not PathSeparator ("/"). Joining with the
+			// FILE separator produced ONE malformed entry, so the stub dir was
+			// never searched and the launch failed as: lane "assayer" harness
+			// "pi" binary not found in $PATH.
+			cmd.Env[i] = "PATH=" + dir + string(os.PathListSeparator) + strings.TrimPrefix(e, "PATH=")
+			return
+		}
+	}
+	cmd.Env = append(cmd.Env, "PATH="+dir)
+}
+
 func herdCmdWithFake(binary, dir, keyDir, fakeBin, fakeLog string, args ...string) *exec.Cmd {
 	cmd := exec.Command(binary, args...)
 	cmd.Dir = dir
@@ -1282,9 +1298,15 @@ func TestReviewCLI_IsolatedDetachedReviewWorktree(t *testing.T) {
 	censusBefore := liveWorkspaceCensus(t)
 	fakeBin, fakeCalls := installProtocolFakeHerdr(t)
 	fakeLog := os.Getenv("HERD_FAKE_LOG")
+	// The --spawn path checks exec.LookPath for the lane's harness binary
+	// (pi) before creating the isolated checkout. Stub it so the checkout
+	// is created and the spawn exits at the herdr/launcher check instead.
+	stubDir := stubHarnessPATH(t)
+	cmd := herdCmdWithFake(binary, dir, keyDir, fakeBin, fakeLog, "review", "--spawn", "FAC-1")
+	prependToPath(cmd, stubDir)
 	// Flags must precede the positional: Go's flag package stops at the
 	// first non-flag token.
-	out, _ := herdCmdWithFake(binary, dir, keyDir, fakeBin, fakeLog, "review", "--spawn", "FAC-1").CombinedOutput()
+	out, _ := cmd.CombinedOutput()
 	reviewDir := filepath.Join(dir, ".herd", "reviews", "fac-1-"+candidate[:12])
 	if fi, err := os.Stat(reviewDir); err != nil || !fi.IsDir() {
 		t.Fatalf("isolated review worktree missing at %s (out: %s)", reviewDir, out)
