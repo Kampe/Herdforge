@@ -569,7 +569,8 @@ func TestDegradedReceiptDoesNotInvalidateStartedResume(t *testing.T) {
 	path := t.TempDir() + "/receipts.jsonl"
 	t.Setenv("HERD_LAUNCH_RECEIPTS", path)
 	req := good(t)
-	req.TaskRef, req.Name, req.PaneID, req.LeaseGeneration = "FAC-177", "worker", "pane-1", 7
+	// SessionGeneration is main's HasStarted fence (FAC-188); positive generation is required for resume.
+	req.TaskRef, req.Name, req.PaneID, req.LeaseGeneration, req.SessionGeneration = "FAC-177", "worker", "pane-1", 7, 1
 	withHooks(&req, []harness.Hook{{Name: "telemetry", URL: "http://127.0.0.1:1", Requirement: harness.HookOptional}})
 	sink := &JSONLSink{Path: path}
 	if _, err := PreflightHooks(req); err != nil {
