@@ -1,6 +1,7 @@
 package dispatch
 
 import (
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -13,6 +14,7 @@ import (
 // Production write-capable launch without a tool-probe PASS must fail before
 // TabCreateForTask (FAC-139).
 func TestLaunchBoundary_ProductionMissingProbeFailsBeforeTab(t *testing.T) {
+	t.Setenv("HERD_LAUNCH_RECEIPTS", filepath.Join(t.TempDir(), "receipts.jsonl"))
 	d, err := testRouter(t).Decide(router.LaunchRequest{
 		Role: router.RoleWorker, Shape: launch.Implementation,
 		RequestedProvider: testWorkerProvider, RequestedModel: testWorkerModel,
@@ -49,6 +51,7 @@ func TestLaunchBoundary_ProductionMissingProbeFailsBeforeTab(t *testing.T) {
 }
 
 func TestLaunchBoundary_PlanArgvMatchesDecision(t *testing.T) {
+	t.Setenv("HERD_LAUNCH_RECEIPTS", filepath.Join(t.TempDir(), "receipts.jsonl"))
 	now := time.Unix(1_800_000_000, 0).UTC()
 	d, err := testRouter(t).Decide(router.LaunchRequest{
 		Role: router.RoleWorker, Shape: launch.Implementation,
@@ -101,6 +104,7 @@ func TestLaunchBoundary_PlanArgvMatchesDecision(t *testing.T) {
 }
 
 func TestLaunchBoundary_IncapableProbeNeverDispatched(t *testing.T) {
+	t.Setenv("HERD_LAUNCH_RECEIPTS", filepath.Join(t.TempDir(), "receipts.jsonl"))
 	now := time.Unix(1_800_000_000, 0).UTC()
 	d, err := testRouter(t).Decide(router.LaunchRequest{
 		Role: router.RoleWorker, Shape: launch.Implementation,
