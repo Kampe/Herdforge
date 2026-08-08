@@ -509,6 +509,62 @@ func writeCooldown(t *testing.T, dir, name, content string) {
 	}
 }
 
+// TestHeadlessProvidersMatchArgvContract enforces the lockstep between
+// HeadlessProviders and the HeadlessArgvFor switch. Every advertised provider
+// must yield a real argv, and every provider the switch handles must be
+// advertised — otherwise a surface the router can launch headlessly (kimi)
+// silently disappears from shot capability, which is exactly the FAC-224
+// defect this catalog was introduced to prevent.
+func TestHeadlessProvidersMatchArgvContract(t *testing.T) {
+	clearRouteEnv(t)
+	// A representative governed model per provider so the argv is non-nil.
+	models := map[string]string{
+		"agy":      "gemini-3.1-pro-high",
+		"claude":   "claude-sonnet-5",
+		"codex":    "gpt-5.6-luna",
+		"grok":     "grok-4.5",
+		"kimi":     "", // model-default surface
+		"lazer":    "litellm/lazer/grok-4.5",
+		"ollama":   "litellm/ollama/glm-5.2:cloud",
+		"opencode": "opencode/deepseek-v4-flash",
+	}
+	providers := HeadlessProviders()
+	if len(providers) == 0 {
+		t.Fatal("HeadlessProviders must not be empty")
+	}
+	for _, p := range providers {
+		argv, _ := HeadlessArgvFor(p, models[p], "high", "prompt.md")
+		if len(argv) == 0 {
+			t.Errorf("HeadlessArgvFor(%q) returned no argv but HeadlessProviders advertises it", p)
+		}
+	}
+	// Every provider the switch handles must be advertised. A surface added to
+	// the switch but not to HeadlessProviders is the original drift bug.
+	wantSet := map[string]bool{}
+	for p := range models {
+		wantSet[p] = true
+	}
+	gotSet := map[string]bool{}
+	for _, p := range providers {
+		gotSet[p] = true
+	}
+	for p := range wantSet {
+		if !gotSet[p] {
+			t.Errorf("HeadlessArgvFor handles %q but HeadlessProviders omits it", p)
+		}
+	}
+	for p := range gotSet {
+		if !wantSet[p] {
+			t.Errorf("HeadlessProviders advertises %q but no HeadlessArgvFor case is known", p)
+		}
+	}
+	// kimi specifically: the FAC-224 defect was its absence. Pin it so a future
+	// regression that drops it trips here, not seven minutes into a launch.
+	if !gotSet["kimi"] {
+		t.Fatal("kimi must be a headless provider (FAC-224)")
+	}
+}
+
 func TestPiModelForConfiguredFleet(t *testing.T) {
 	cases := []struct{ provider, model, want string }{
 		{"codex", "gpt-5.6-luna", "openai-codex/gpt-5.6-luna"},
