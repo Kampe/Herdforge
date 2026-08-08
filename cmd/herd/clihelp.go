@@ -73,7 +73,7 @@ var subcommandUsage = map[string]string{
 	"board-done": "Usage: herd board-done <ref> [--receipt <path>] [--override-policy <p> --override-actor <who> --override-reason <why> --override-evidence <what>]\n" +
 		"  Close a card from its task-bound completion receipt, or by an attributable manual override.",
 	"board-audit": "Usage: herd board-audit [--json]\n  Report Done cards no completion receipt closed. Read-only; never mutates the board.",
-	"board-sync":    "Usage: herd board-sync [flags]\n  Reconcile multi-board state.",
+	"board-sync":    "Usage: herd board-sync [flags]\n  Reconcile board status against git reality and live lanes (report only).\n  --fix: advance to-do cards to in-progress when a live lane or branch proves work is in flight.",
 	"sh":            "Usage: herd sh\n  Interactive REPL shell (alias: herd repl).",
 	"repl":          "Usage: herd repl\n  Interactive REPL shell (alias: herd sh).",
 	"send":          "Usage: herd send <pane|name> \"<text>\" [--file path] [--no-verify] [--timeout s]\n  Deliver a prompt and verify consumption. Prefer herdr-deliver for durable digests.",

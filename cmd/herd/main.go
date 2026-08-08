@@ -401,7 +401,7 @@ func printUsage() {
 	fmt.Println("  drain      Report coordinator review pile (optional bounded --act)")
 	fmt.Println("  board-done Move one card to done ONLY from a task-bound completion receipt")
 	fmt.Println("  board-audit Report Done cards that no completion receipt closed (read-only)")
-	fmt.Println("  board-sync Reconcile board status against git reality (report only)")
+	fmt.Println("  board-sync Reconcile board against git + live lanes; --fix advances lagging cards")
 	fmt.Println("  sh         Interactive shell: run herd subcommands in a loop")
 	fmt.Println("  send       Submit text to a herdr agent pane and verify consumption")
 	fmt.Println("  herdr-deliver  Durably deliver stdin or --file bytes to one Herdr session (FAC-183)")
@@ -1963,6 +1963,7 @@ func runBoardSync() {
 	intervalSec := fs.Int("interval", 0, "Run continuously at N-second intervals (0 = run once)")
 	ensureDaemon := fs.Bool("ensure-daemon", false, "Not yet implemented: exit 0 and do nothing")
 	selftestFlag := fs.Bool("selftest", false, "Run classification assertions and exit")
+	fixFlag := fs.Bool("fix", false, "Advance to-do cards to in-progress when a live lane or branch proves work is in flight")
 	fs.Parse(os.Args[2:])
 
 	if *selftestFlag {
@@ -2016,6 +2017,12 @@ func runBoardSync() {
 	}
 
 	syncer := hsync.NewBoardSyncer(tp)
+	syncer.Lanes = liveLaneSource{}
+
+	if *fixFlag {
+		code := runBoardSyncFix(syncer, cfg.TaskProvider.ProjectID, *asJSON)
+		os.Exit(code)
+	}
 
 	if *intervalSec > 0 {
 		for {
@@ -2068,6 +2075,64 @@ func runBoardSyncOnce(syncer *hsync.BoardSyncer, projectID string, asJSON bool) 
 	}
 	if drift.Drift > 0 {
 		return 2
+	}
+	return 0
+}
+
+// liveLaneSource adapts herdr.AgentList to the sync.LaneSource interface.
+// It lists live agents and extracts ticket refs from names matching
+// "task-<ref>". When herdr is not installed, ListLanes returns an error
+// (board-sync degrades to git-only reconciliation).
+type liveLaneSource struct{}
+
+func (liveLaneSource) ListLanes() ([]hsync.LaneRef, error) {
+	if !herdr.IsAvailable() {
+		return nil, fmt.Errorf("herdr not available")
+	}
+	agents, err := herdr.AgentList()
+	if err != nil {
+		return nil, err
+	}
+	var lanes []hsync.LaneRef
+	for _, a := range agents {
+		ref := hsync.RefFromAgentName(a.Name)
+		if ref == "" {
+			continue
+		}
+		lanes = append(lanes, hsync.LaneRef{Name: a.Name, Ref: ref})
+	}
+	return lanes, nil
+}
+
+// runBoardSyncFix advances to-do cards to in-progress when a live lane or
+// git branch proves work is in flight, then reports what it did.
+func runBoardSyncFix(syncer *hsync.BoardSyncer, projectID string, asJSON bool) int {
+	result, err := syncer.FixBoardLag(context.Background(), projectID, ".")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "board-sync --fix: %v\n", err)
+		return 1
+	}
+	if asJSON {
+		json.NewEncoder(os.Stdout).Encode(map[string]interface{}{
+			"advanced": result.Advanced,
+			"errors":   result.Errors,
+		})
+	} else {
+		if len(result.Advanced) == 0 && len(result.Errors) == 0 {
+			fmt.Println("board-sync --fix: no BOARD_LAG to advance")
+		}
+		for _, f := range result.Advanced {
+			fmt.Printf("board-sync --fix: advanced %s (%s) to in-progress\n", f.Ref, f.TaskID)
+		}
+		for _, e := range result.Errors {
+			fmt.Fprintf(os.Stderr, "board-sync --fix: %v\n", e)
+		}
+	}
+	if len(result.Errors) > 0 {
+		return 1
+	}
+	if len(result.Advanced) > 0 {
+		return 0
 	}
 	return 0
 }
