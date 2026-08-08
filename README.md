@@ -1,6 +1,6 @@
 # Herdforge
 
-Herdforge is a Go control plane for turning repository work queues into isolated implementation, deterministic verification, independent review, serialized integration, and reconciled board state. It uses Herdr as the agent execution plane and supports pluggable task providers; Linear is the checked-in adapter and Kaneo, Jira, Azure, GitHub Issues and an in-memory store are compiled but dormant.
+Herdforge is a Go control plane for turning repository work queues into isolated implementation, deterministic verification, independent review, serialized integration, and reconciled board state. It uses Herdr as the agent execution plane and supports pluggable task providers; Linear is the checked-in adapter.
 
 [![CI Workflow](https://github.com/Kampe/Herdforge/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Kampe/Herdforge/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
@@ -146,9 +146,17 @@ The repository-local config lives at `.herd/herd.yaml` and describes the project
 ### Task provider
 
 `.herd/herd.yaml` ships with Linear selected. `task_provider.enabled` is an explicit activation
-allowlist (FAC-155): the factory activates `type` only if it is listed there, so the other adapters
-stay dormant and can never be auto-detected, probed, or selected. Changing `type` without moving
-that list fails closed before any board read or mutation.
+allowlist (FAC-155): the factory activates `type` only if it is listed there, so anything else
+can never be auto-detected, probed, or selected. Changing `type` without moving that list fails
+closed before any board read or mutation.
+
+Adapter availability comes in two tiers, and the allowlist only governs the first:
+
+- **Wired into the factory** (`pkg/provider/factory.go`) — `linear`, `kaneo`, `memory`. Selectable
+  by adding the name to `enabled` and setting `type`.
+- **Adapter code present but not wired** — `jira`, `azure`, `github`. These have no factory case,
+  so selecting one fails with `task_provider.type %q is not activated in this build`
+  (`factory.go:90`) even when it is allowlisted. Wiring them up is outstanding work, not config.
 
 To run against a different project without touching the checked-in config, copy the
 credential-free example into the ignored local profile and select it at runtime:
