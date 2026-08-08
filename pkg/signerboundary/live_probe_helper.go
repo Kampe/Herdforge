@@ -18,7 +18,7 @@ func buildLiveProbeHelper() (string, error) {
 		return "", err
 	}
 	bin := filepath.Join(dir, "probe")
-	cmd := exec.Command("go", "build", "-o", bin, src)
+	cmd := exec.Command("go", "build", "-buildvcs=false", "-o", bin, src)
 	cmd.Env = append(os.Environ(), "CGO_ENABLED=0")
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return "", fmt.Errorf("go build probe: %v\n%s", err, out)

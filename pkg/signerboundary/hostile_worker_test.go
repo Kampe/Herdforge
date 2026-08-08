@@ -88,7 +88,7 @@ func TestHostileWorkerProcess_SignVerdictInductionDenied(t *testing.T) {
 		t.Fatal(err)
 	}
 	bin := filepath.Join(t.TempDir(), "hostile-worker")
-	build := exec.Command("go", "build", "-o", bin, helper)
+	build := exec.Command("go", "build", "-buildvcs=false", "-o", bin, helper)
 	build.Env = append(os.Environ(), "CGO_ENABLED=0")
 	if out, err := build.CombinedOutput(); err != nil {
 		t.Fatalf("build hostile worker: %v\n%s", err, out)
