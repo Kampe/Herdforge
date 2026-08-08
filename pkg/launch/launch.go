@@ -343,7 +343,13 @@ func Validate(req Request, sink Sink) error {
 			return reject(req, sink, fmt.Sprintf("no launch argv contract for provider %q", provider))
 		}
 	}
-	if !worker && (len(want) < 2 || want[0] == "" || want[1] != "--model" || !argvCarriesEffort(provider, want, effort)) {
+	// --model must be PRESENT and carry a value; it need not be argv[1]. It was
+	// pinned to index 1, which broke the moment the nested-agent denial work
+	// prepended "--disable multi_agent --disable multi_agent_v2" to the codex
+	// contract: every non-worker launch was then rejected as "missing --model"
+	// while the flag was sitting three positions later. Position is a property
+	// of one vendor's command line; presence is the property this gate is about.
+	if !worker && (len(want) < 2 || want[0] == "" || !argvCarriesModel(want) || !argvCarriesEffort(provider, want, effort)) {
 		return reject(req, sink, "non-worker launch argv must explicitly carry --model and effort")
 	}
 	if len(argv) != len(want) {
@@ -425,6 +431,22 @@ func BindingFromReceipt(r Receipt) agentpolicy.LaunchBinding {
 func VerifyRecoveryBinding(r Receipt, key []byte, generation int64) error {
 	b := BindingFromReceipt(r)
 	return agentpolicy.RequireLaunchBinding(b, key, generation)
+}
+
+// argvCarriesModel reports whether argv names a model explicitly. It looks for
+// the flag anywhere with a non-flag value after it, rather than at a fixed
+// index, so prepended vendor flags cannot make a well-formed argv look
+// model-less.
+func argvCarriesModel(argv []string) bool {
+	for i, a := range argv {
+		if a != "--model" {
+			continue
+		}
+		if i+1 < len(argv) && strings.TrimSpace(argv[i+1]) != "" && !strings.HasPrefix(argv[i+1], "-") {
+			return true
+		}
+	}
+	return false
 }
 
 func argvCarriesEffort(provider string, argv []string, effort string) bool {
