@@ -1,8 +1,10 @@
 package mergeadmit
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -156,6 +158,121 @@ func TestAdmitSelectsByExactSHANotFirstPass(t *testing.T) {
 	mustRefuse(t, g2, okRequest(shaBase, shaOld), CodeHeadMoved)
 }
 
+// appendRawRow appends a ledger row directly, bypassing Ledger.Verdict's
+// same-(sha,reviewer) idempotency guard.
+//
+// This is necessary, not a shortcut. Ledger.Verdict drops any second verdict
+// from the same reviewer for the same sha, so a reviewer CANNOT correct their
+// own FAIL through the normal write path. The corrected-PASS shape that
+// acceptance criterion 1 names is therefore unreachable via the API, and the
+// only way to test that Admit's supersession selection is correct is to
+// construct the row sequence the criterion describes. See
+// TestAdmitSupersessionSelectsLastVerdictPerReviewer.
+func appendRawRow(t *testing.T, dir string, row reviewledger.LedgerRow) {
+	t.Helper()
+	if row.Timestamp == "" {
+		row.Timestamp = "2026-08-07T00:00:00Z"
+	}
+	b, err := json.Marshal(row)
+	if err != nil {
+		t.Fatalf("encode ledger row: %v", err)
+	}
+	f, err := os.OpenFile(filepath.Join(dir, "review-ledger.jsonl"),
+		os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Fatalf("open ledger: %v", err)
+	}
+	defer f.Close()
+	if _, err := f.Write(append(b, '\n')); err != nil {
+		t.Fatalf("append ledger row: %v", err)
+	}
+}
+
+func rawLaunch(sha, reviewer string) reviewledger.LedgerRow {
+	return reviewledger.LedgerRow{
+		Event: string(reviewledger.EventRecord), SHA: sha, Reviewer: reviewer,
+		BuilderFamily: "anthropic", BuilderIdentity: "builder-session-1",
+		ReviewerFamily: "openai", Gate: "independent", Tier: "R3",
+		Task: testRef, Lease: testLease,
+	}
+}
+
+func rawVerdict(sha, reviewer string, v reviewledger.Verdict) reviewledger.LedgerRow {
+	return reviewledger.LedgerRow{
+		Event: string(reviewledger.EventVerdict), SHA: sha, Reviewer: reviewer,
+		Verdict: string(v), ReviewerFamily: "openai", BuilderFamily: "anthropic",
+		Task: testRef, Lease: testLease, PatchURL: testPatchURL,
+		VerificationDigest: testVfy, CandidateSHA: sha,
+	}
+}
+
+// ACCEPTANCE CRITERION 1, the exact three-verdict sequence:
+//
+//	old-sha PASS  →  current-sha FAIL  →  current-sha corrected PASS
+//
+// Selection is by exact sha AND by append order within a reviewer. The old-sha
+// PASS is irrelevant to the current candidate, the FAIL is superseded by the
+// same reviewer's later PASS, and only the final current verdict decides.
+//
+// Removing the exact-sha filter admits on the first PASS in the file (the
+// stale one, which is the FAC-149 incident). Removing last-wins supersession
+// leaves the FAIL standing and refuses. Both mutations are exercised below.
+func TestAdmitSupersessionSelectsLastVerdictPerReviewer(t *testing.T) {
+	dir := t.TempDir()
+	l := newLedger(t, dir)
+
+	appendRawRow(t, dir, rawLaunch(shaOld, "reviewer-a"))
+	appendRawRow(t, dir, rawVerdict(shaOld, "reviewer-a", reviewledger.VerdictPASS))
+	appendRawRow(t, dir, rawLaunch(shaCurrent, "reviewer-a"))
+	appendRawRow(t, dir, rawVerdict(shaCurrent, "reviewer-a", reviewledger.VerdictFAIL))
+	appendRawRow(t, dir, rawVerdict(shaCurrent, "reviewer-a", reviewledger.VerdictPASS))
+
+	g := okGate(t, l, shaBase, shaCurrent)
+	d := mustAdmit(t, g, okRequest(shaBase, shaCurrent))
+	if d.CandidateSHA != shaCurrent {
+		t.Fatalf("admitted %s, want the final current candidate %s", d.CandidateSHA, shaCurrent)
+	}
+
+	// Order is what carries the correction. With the PASS and FAIL swapped,
+	// the standing verdict is a veto and the same ledger must refuse.
+	dir2 := t.TempDir()
+	l2 := newLedger(t, dir2)
+	appendRawRow(t, dir2, rawLaunch(shaOld, "reviewer-a"))
+	appendRawRow(t, dir2, rawVerdict(shaOld, "reviewer-a", reviewledger.VerdictPASS))
+	appendRawRow(t, dir2, rawLaunch(shaCurrent, "reviewer-a"))
+	appendRawRow(t, dir2, rawVerdict(shaCurrent, "reviewer-a", reviewledger.VerdictPASS))
+	appendRawRow(t, dir2, rawVerdict(shaCurrent, "reviewer-a", reviewledger.VerdictFAIL))
+
+	g2 := okGate(t, l2, shaBase, shaCurrent)
+	mustRefuse(t, g2, okRequest(shaBase, shaCurrent), CodeLedgerRefused)
+}
+
+// KNOWN GAP, pinned so it cannot rot silently.
+//
+// Ledger.Verdict is idempotent per (sha, reviewer): a second verdict from the
+// same reviewer for the same sha is DROPPED. Admit's supersession is
+// last-wins, so it would honour a correction — but the write path cannot emit
+// one, which makes the "fresh admissible PASS clears a veto" half of the card
+// unreachable through the API.
+//
+// This test asserts the CURRENT behaviour. When the write path is fixed
+// (a separate change, with its own blast radius across Eligible, PassSHAs and
+// outstandingRejections), this test fails and must be inverted.
+func TestLedgerWritePathCannotSupersedeAReviewersOwnVerdict(t *testing.T) {
+	dir := t.TempDir()
+	l := newLedger(t, dir)
+	launch(t, l, shaCurrent, "reviewer-a", "anthropic", "builder-session-1")
+	verdict(t, l, shaCurrent, "reviewer-a", reviewledger.VerdictFAIL)
+	// The same reviewer tries to correct themselves to PASS.
+	verdict(t, l, shaCurrent, "reviewer-a", reviewledger.VerdictPASS)
+
+	g := okGate(t, l, shaBase, shaCurrent)
+	d := mustRefuse(t, g, okRequest(shaBase, shaCurrent), CodeLedgerRefused)
+	if !strings.Contains(d.Reason, "FAIL") {
+		t.Fatalf("expected the dropped correction to leave the FAIL standing, got: %s", d.Reason)
+	}
+}
+
 // A PASS for one sha grants no authority over another sha, even when the other
 // sha is the one everyone is talking about.
 func TestAdmitRefusesWhenOnlyAnotherSHAHasAPass(t *testing.T) {
@@ -281,6 +398,29 @@ func TestAdmitRefusesWhenLiveStateAdvanced(t *testing.T) {
 			return map[string]string{testCheck: "failure"}, nil
 		}
 		mustRefuse(t, g, req, CodeRequiredCheck)
+	})
+
+	// The claim was re-leased under a new generation while the verdict was in
+	// flight. A verdict is bound to the lease it was produced under; a new
+	// generation means a different claim on the same work.
+	t.Run("lease generation rotated", func(t *testing.T) {
+		g, req := newFixture(t)
+		req.Lease = "lease-4"
+		d := mustRefuse(t, g, req, CodeLedgerRefused)
+		if !strings.Contains(d.Reason, "lease") {
+			t.Fatalf("refusal did not cite the stale lease: %s", d.Reason)
+		}
+	})
+
+	// The patch identity the reviewer bound their verdict to must still be the
+	// candidate's. A rewritten patch under the same sha claim is not reviewed.
+	t.Run("patch identity changed", func(t *testing.T) {
+		g, req := newFixture(t)
+		req.PatchURL = "patch-something-else"
+		d := mustRefuse(t, g, req, CodeLedgerRefused)
+		if !strings.Contains(d.Reason, "patch") {
+			t.Fatalf("refusal did not cite the patch mismatch: %s", d.Reason)
+		}
 	})
 
 	t.Run("required check absent", func(t *testing.T) {
