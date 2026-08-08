@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+
+	"github.com/Kampe/Herdforge/pkg/gitdir"
 )
 
 // dangerousSignalPatterns match host-wide / sentinel kill literals in
@@ -34,6 +36,9 @@ func CheckDangerousSignalLiterals(rootDir string) error {
 			name := info.Name()
 			if name == ".git" || name == "vendor" || name == "node_modules" ||
 				name == "bin" || strings.HasPrefix(name, ".") {
+				return filepath.SkipDir
+			}
+			if gitdir.IsNestedGitDir(path, rootDir) {
 				return filepath.SkipDir
 			}
 			return nil
