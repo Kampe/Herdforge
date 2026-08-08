@@ -29,6 +29,18 @@ If the cwd is the shared checkout, the branch does not match the assignment, or 
 5. Run targeted checks and then the configured repository gate; for Herdforge, use `make ci` unless the packet requires more.
 6. Create an atomic Conventional Commit containing the ticket ref. Do not push, merge, rebase the default branch, or mutate board lifecycle.
 
+## Rejection repair (FAC-140)
+
+A review `FAIL` arrives as a prompt carrying the reviewer's numbered findings and the exact candidate SHA that failed. It is work, not news: repair it without waiting for a coordinator or a human.
+
+1. Fix every numbered finding in your existing worktree and branch. Do not narrow, delete, or weaken a test so a finding stops being caught.
+2. Commit a **new** commit. The repaired candidate must be a fresh SHA, distinct from the FAILed one — never amend the FAILed commit away, since the ledger's rejection is about that SHA.
+3. Re-run the configured gate and `herd verify` until they pass on the fresh SHA.
+4. Push the candidate, then read back that the PR head resolves to that exact SHA and let CI attach to it. A candidate that exists only in your worktree is not reviewable.
+5. Request a fresh review from a family other than the rejecting reviewer's.
+
+Never merge, approve, or move the card. Pushing a candidate grants no merge or Done authority. If a finding is wrong, answer it with evidence in the re-review request — do not silently ignore it.
+
 ## Fleet safety
 
 - Never run `git worktree remove` or `git worktree prune`.

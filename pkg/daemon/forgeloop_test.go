@@ -12,16 +12,20 @@ import (
 // fakeDriver records the actions the loop drives and lets a test script the
 // board's lane state and completion signals per tick.
 type fakeDriver struct {
-	lanes      LaneState
-	laneErr    error
-	signalErr  error
-	completed  map[string]bool
-	verified   map[string]bool
-	actions    []string
-	logged     []string
-	onApprove  func(ref string)
-	onReview   func(ref string)
-	approveErr func(ref string) error
+	lanes        LaneState
+	laneErr      error
+	signalErr    error
+	rejectionErr error
+	completed    map[string]bool
+	verified     map[string]bool
+	rejections   map[string]Rejection
+	delivered    []Rejection
+	actions      []string
+	logged       []string
+	onApprove    func(ref string)
+	onReview     func(ref string)
+	approveErr   func(ref string) error
+	rejectErr    func(ref string) error
 }
 
 func TestForgeLoop_ReconciliationFailureStopsBeforeDriverActions(t *testing.T) {
@@ -84,6 +88,22 @@ func (f *fakeDriver) Approve(_ context.Context, t *provider.Task) error {
 }
 func (f *fakeDriver) Renudge(_ context.Context, t *provider.Task) error {
 	f.actions = append(f.actions, "renudge:"+t.Ref)
+	return nil
+}
+func (f *fakeDriver) Rejections(context.Context) (map[string]Rejection, error) {
+	if f.rejectionErr != nil {
+		return nil, f.rejectionErr
+	}
+	return f.rejections, nil
+}
+func (f *fakeDriver) Reject(_ context.Context, t *provider.Task, r Rejection) error {
+	f.actions = append(f.actions, "reject:"+t.Ref)
+	if f.rejectErr != nil {
+		if err := f.rejectErr(t.Ref); err != nil {
+			return err
+		}
+	}
+	f.delivered = append(f.delivered, r)
 	return nil
 }
 func (f *fakeDriver) Log(msg string) { f.logged = append(f.logged, msg) }
