@@ -314,9 +314,11 @@ func (s *JSONLSink) HasDegraded(req Request) (bool, error) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if err := os.MkdirAll(filepath.Dir(s.Path), 0755); err != nil {
-		return false, fmt.Errorf("create launch receipt directory: %w", err)
-	}
+	// Best-effort directory creation; a READ must not fail closed when the
+	// parent is unwritable (e.g. tests use /dev/null/receipts.jsonl which
+	// reports ENOTDIR from MkdirAll). The stat check below already treats
+	// any unreadable path as "no degraded receipt recorded".
+	_ = os.MkdirAll(filepath.Dir(s.Path), 0755)
 	found := false
 	// A READ of durable state must not fail closed because the state does not
 	// exist. HasDegraded is called from launch.Validate, which runs before the
