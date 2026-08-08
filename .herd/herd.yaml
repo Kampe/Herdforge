@@ -208,6 +208,49 @@ lanes:
     capabilities: ["board-write", "network"]
     incompatible_with: ["worker", "forge-smith"]
 
+  # mender — standing. Fixes the forge itself: the gates, evidence checks
+  # and lifecycle bugs that cost the fleet whole sessions (FAC-211..218). Carries
+  # role "recovery" because that is the only authoring role the canonical lane
+  # registry has left free — one lane per role is enforced, so a third standing
+  # improvement lane is blocked until that invariant is lifted. That is a real
+  # limit, not an oversight; see the note under lanes.
+  - name: "mender"
+    role: "recovery"
+    agent_kind: "pi"
+    harness: "pi"
+    prompt: ".herd/prompts/mender.md"
+    worktree: ".worktrees/mender"
+    provider: "codex"
+    model: "gpt-5.6-luna"
+    effort: "medium"
+    task_shape: "implementation"
+    standing: true
+    authority: "write"
+    capabilities: ["git-write", "fs-write", "shell-exec", "board-write"]
+    incompatible_with: ["reviewer", "harvest"]
+
+# LANE CAPACITY NOTE — why there is only ONE new standing lane, not a roster
+# Two independent limits, both enforced at launch, not just declared:
+#
+#   1. CanonicalLaneRegistry allows one lane per ROLE, so Resolve() can accept a
+#      lane name or a role name unambiguously.
+#   2. validateLaneLaunchConfig (cmd/herd/main.go) accepts only ten roles and
+#      pins each to one task_shape. "assayer" is NOT among them, so a lane cannot
+#      carry it at all; and worker/forge-smith/recovery must be exactly
+#      pi + codex/gpt-5.6-luna/medium.
+#
+# Between them, every configurable role is already occupied except "recovery",
+# which mender now takes. A ci-warden lane was written and had to be withdrawn:
+# there is no role left that a standing lane may legally hold.
+# The lane is named "mender", not "forge-mender": live agent ids are prefixed
+# forge-<lane>, and a lane whose own name starts with forge- is unselectable
+# ("unknown standing selection \"mender\"" when the prefix is stripped).
+#
+# Chainseer runs a dozen domain lanes (api-crusader, security-sentinel,
+# perf-cost-guard, docs-custodian, qa-sentinel, coverage-integrity, ux-comber...)
+# because it is not bound by this registry. Herdforge cannot match that roster
+# until roles may own several lanes.
+
 # Project Verification Suite
 verification:
   test_command: "go test ./..."
