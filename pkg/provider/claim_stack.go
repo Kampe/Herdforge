@@ -167,6 +167,17 @@ func OpenClaimStack(dir string, tp TaskProvider) (*ClaimStack, error) {
 	// unfenced mutates (FAC-147). No-op for MemoryProvider test stacks
 	// that are not Kaneo.
 	AttachAuthoritativeReceiver(tp, fences)
+	// HERD_FENCE_ATOMIC_SERVER declares the upstream Kaneo board enforces
+	// fence+op+op-dedupe with status (hermetic enforcing boards, or a
+	// production Kaneo deployment with native server-side dedupe). Without
+	// this or a live FenceBroker, fenced status writes fail closed.
+	if isRealKaneoProvider(tp) {
+		if os.Getenv("HERD_FENCE_ATOMIC_SERVER") == "1" {
+			if k, ok := UnwrapTaskProvider(tp).(*KaneoProvider); ok && k != nil {
+				k.AtomicFenceServer = true
+			}
+		}
+	}
 	// Worker attach: when HERD_FENCE_BROKER_URL is set, wire the live broker
 	// client so fenced status/comment writes reach the sidecar. Without this
 	// production callers fail closed at mutate time with no remedy.
