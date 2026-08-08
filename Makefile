@@ -8,7 +8,13 @@ HERMETIC_GIT := GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null GIT_CONF
 COVER_DIR ?= $(CURDIR)/.herd/coverage
 COVER_PROFILE ?= $(COVER_DIR)/cover.out
 
-all: preflight test build
+# build runs BEFORE test: pkg/security resolves the herd binary as bin/herd
+# relative to cwd (readiness_attest.go), so tests that shell out to it must run
+# against current source. With test first, they probed whatever binary happened
+# to be left over from a previous build — a stale bin/herd predating a new
+# subcommand failed TestParentDeath_RealLauncherExit with "unknown subcommand
+# 'netbroker-serve'" while CI, which always builds first, stayed green.
+all: preflight build test
 
 # ci mirrors .github/workflows/ci.yml EXACTLY, with a hermetic git
 # environment (no user/system gitconfig) so a dev machine's config cannot
