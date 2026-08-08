@@ -38,3 +38,16 @@ findings, residual_risk, reviewed_at
 ```
 
 `PASS` means no blocking finding remains for that exact revision. `FAIL` returns the candidate to its author. `BLOCKED` means the review could not be made validly and grants no merge authority.
+
+## On FAIL, return the candidate yourself (FAC-140)
+
+A posted `FAIL` is not a routed `FAIL`. Reviewers on this fleet posted their verdict to the PR and the board and then went idle, leaving the author idle beside a detailed rejection nothing delivered — observed on FAC-121/PR #43 and FAC-119/PR #44. Posting is publication; delivery is your job too.
+
+After the verdict lands, deliver the numbered rejection to the authoring worker:
+
+- Target the author's tab: `task-fac-<ref>`, or its `-safe` variant.
+- Deliver with `herdr agent prompt <target> <body>` (argv, never a shell-interpolated string — see the free-form text rule above), or `herd herdr-deliver --file` when a durable receipt is wanted. Confirm the agent left its baseline status; an unconfirmed prompt is an undelivered one.
+- If the author's tab is gone, say so explicitly and name the missing agent. Do not respawn a builder lane yourself — that is a launch-admission decision, and re-creating a lane is outside a read-only reviewer's authority.
+- Deliver the findings verbatim. A summary is not the rejection; the author repairs against what you actually wrote.
+
+The coordinator's forge loop reads unrepaired `FAIL` verdicts out of the review ledger and routes them as a backstop, idempotently per (ref, candidate SHA). That backstop does not relieve you of delivering: it only bounds how long an undelivered rejection can sit.

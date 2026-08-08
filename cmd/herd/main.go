@@ -47,6 +47,8 @@ import (
 	"github.com/Kampe/Herdforge/pkg/resolve"
 	"github.com/Kampe/Herdforge/pkg/resources"
 	"github.com/Kampe/Herdforge/pkg/review"
+	"github.com/Kampe/Herdforge/pkg/reviewingest"
+	"github.com/Kampe/Herdforge/pkg/reviewledger"
 	"github.com/Kampe/Herdforge/pkg/router"
 	"github.com/Kampe/Herdforge/pkg/scopeauth"
 	"github.com/Kampe/Herdforge/pkg/scopefence"
@@ -4993,6 +4995,168 @@ func (d *cliForgeDriver) Approve(ctx context.Context, t *provider.Task) error {
 	}
 	_ = herdr.CloseTabForRef(t.Ref) // FAC-111: close the finished tab
 	return nil
+}
+
+// Rejections reads the review ledger and returns every reviewer FAIL that no
+// later PASS has superseded, keyed by ticket ref.
+//
+// FAC-140: this is the edge that was missing entirely. Reviewers wrote a FAIL
+// verdict, posted it, and went idle; nothing downstream ever read it, so the
+// coordinator kept offering the FAILed card to the merge gate and the worker
+// sat idle holding nothing.
+//
+// A read failure is an error, never an empty map: "no rejection" and "cannot
+// tell" are the same value here, and the second one re-arms the merge gate.
+func (d *cliForgeDriver) Rejections(ctx context.Context) (map[string]daemon.Rejection, error) {
+	l, err := reviewledger.NewReviewLedger(".", filepath.Join(".herd", "review-ledger.jsonl"))
+	if err != nil {
+		return nil, fmt.Errorf("open review ledger: %w", err)
+	}
+	rows, err := l.AllRows()
+	if err != nil {
+		return nil, fmt.Errorf("read review ledger: %w", err)
+	}
+	queue, err := l.QueueRows()
+	if err != nil {
+		return nil, fmt.Errorf("read harvest queue: %w", err)
+	}
+	return outstandingRejections(rows, queue, os.ReadFile), nil
+}
+
+// outstandingRejections is the pure projection behind Rejections, split out so
+// the ledger→rejection rules are testable without a live fleet.
+//
+// Verdict rows carry the sha but not the branch (Ledger.Verdict writes the
+// branch to the QUEUE row instead), so the ref is recovered by joining any row
+// that carries both. readFile loads the reviewer's evidence body.
+func outstandingRejections(rows, queue []reviewledger.LedgerRow, readFile func(string) ([]byte, error)) map[string]daemon.Rejection {
+	refBySHA := map[string]string{}
+	for _, r := range append(append([]reviewledger.LedgerRow{}, rows...), queue...) {
+		if r.SHA == "" {
+			continue
+		}
+		if ref := refForTaskBranch(r.Branch); ref != "" {
+			refBySHA[r.SHA] = ref
+		}
+	}
+
+	out := map[string]daemon.Rejection{}
+	// The ledger is append-only and chronological, so the last verdict row for
+	// a ref is its current standing.
+	for _, r := range rows {
+		if r.Event != string(reviewledger.EventVerdict) {
+			continue
+		}
+		ref := strings.ToUpper(strings.TrimSpace(r.Task))
+		if ref == "" {
+			ref = refBySHA[r.SHA]
+		}
+		if ref == "" {
+			continue
+		}
+		switch reviewledger.Verdict(r.Verdict) {
+		case reviewledger.VerdictPASS:
+			// Only a PASS clears a rejection. A later BLOCKED grants no merge
+			// authority either, so it must not wipe an outstanding FAIL.
+			delete(out, ref)
+		case reviewledger.VerdictFAIL:
+			rj := daemon.Rejection{Ref: ref, SHA: r.SHA, Reviewer: r.Reviewer, Artifact: r.Artifact}
+			if r.Artifact != "" {
+				if body, err := readFile(r.Artifact); err == nil {
+					rj.Findings = reviewingest.Parse(string(body)).Body
+				}
+			}
+			out[ref] = rj
+		}
+	}
+	return out
+}
+
+// refForTaskBranch recovers the ticket ref from a task branch, which
+// worktree.TaskBranch minted as herd/<lowercase ref>. Anything else yields ""
+// rather than a guessed ref.
+func refForTaskBranch(branch string) string {
+	branch = strings.TrimSpace(branch)
+	if !strings.HasPrefix(branch, "herd/") {
+		return ""
+	}
+	return strings.ToUpper(strings.TrimPrefix(branch, "herd/"))
+}
+
+// Reject delivers the reviewer's numbered rejection to the card's authoring
+// worker and proves the worker consumed it (FAC-140). No coordinator or human
+// stands between the FAIL and the repair.
+func (d *cliForgeDriver) Reject(ctx context.Context, t *provider.Task, r daemon.Rejection) error {
+	// "A bare rejection is unactionable" is the review-verdict contract's own
+	// rule; delivering an empty one would satisfy the routing and strand the
+	// worker exactly as before. Checked before the fleet gate so an unreadable
+	// verdict artifact is reported as itself, not as an admission failure.
+	if strings.TrimSpace(r.Findings) == "" {
+		return fmt.Errorf("review FAIL for %s at %s carries no findings body (artifact %q): "+
+			"a bare rejection is unactionable, refusing to deliver it",
+			t.Ref, shortSHA(r.SHA), r.Artifact)
+	}
+	if err := requireFleetAdmission(ctx); err != nil {
+		return err
+	}
+	agent, err := workerAgentForRef(t.Ref)
+	if err != nil {
+		return err
+	}
+	msg := rejectionPrompt(t.Ref, r)
+	// DeliverAndProve, not AgentPrompt: a submit into a dead pane returns a
+	// healthy-looking exit code, and "verified delivered" is an acceptance
+	// criterion here.
+	receipt, err := herdr.DeliverAndProve(agent, msg, 90*time.Second)
+	if err != nil {
+		return fmt.Errorf("delivering the %s rejection to %s: %w", t.Ref, agent, err)
+	}
+	if !receipt.Consumed {
+		return fmt.Errorf("delivering the %s rejection to %s: no consumption proof (%s)",
+			t.Ref, agent, receipt.SequenceToken)
+	}
+	return nil
+}
+
+// workerAgentForRef resolves the live authoring worker tab for a ref —
+// task-fac-<n>, or its -safe variant. A missing tab is reported, never
+// respawned here: re-creating a builder lane is a launch-admission decision
+// (herd dispatch / recovery-sentinel), not something the rejection path may
+// do behind the launch gates.
+func workerAgentForRef(ref string) (string, error) {
+	agents, err := herdr.AgentList()
+	if err != nil {
+		return "", fmt.Errorf("herdr agent list: %w", err)
+	}
+	base := "task-" + strings.ToLower(ref)
+	for _, want := range []string{base, base + "-safe"} {
+		for _, a := range agents {
+			if a.Name == want {
+				return a.Name, nil
+			}
+		}
+	}
+	return "", fmt.Errorf("no live worker tab for %s (looked for %s and %s-safe): "+
+		"respawn the builder into its worktree before the rejection can be routed", ref, base, base)
+}
+
+// rejectionPrompt is the payload the worker receives. It carries the
+// reviewer's findings verbatim and the repair order the worker contract
+// requires: new commit, published, re-verified, re-reviewed — never merged.
+func rejectionPrompt(ref string, r daemon.Rejection) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "REVIEW FAIL — %s\n\n", ref)
+	fmt.Fprintf(&b, "Reviewer %s rejected candidate %s. The findings below are the reviewer's own words:\n\n",
+		r.Reviewer, r.SHA)
+	b.WriteString(strings.TrimSpace(r.Findings))
+	b.WriteString("\n\nRepair order — do all of it, in this order, without asking a coordinator:\n")
+	b.WriteString("1. Fix every numbered finding in your existing worktree and branch.\n")
+	b.WriteString("2. Commit a NEW commit. The repaired candidate must be a fresh SHA, distinct from " + shortSHA(r.SHA) + ".\n")
+	b.WriteString("3. Re-run the configured gate and `herd verify` until they pass on the fresh SHA.\n")
+	b.WriteString("4. Push the candidate and read back that the PR head resolves to that exact SHA.\n")
+	b.WriteString("5. Request a fresh review from a family other than the reviewer's.\n")
+	b.WriteString("Never merge, approve, or move the card yourself. Do not amend the FAILed commit away.\n")
+	return b.String()
 }
 
 func (d *cliForgeDriver) Renudge(ctx context.Context, t *provider.Task) error {

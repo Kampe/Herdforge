@@ -32,6 +32,15 @@ type ForgeDriver interface {
 	// the subset that PASSED herd verify (verified) — drained from the
 	// callback bus + verify runs. An error means the signal set is unknown.
 	Signals(ctx context.Context) (completed, verified map[string]bool, err error)
+	// Rejections returns, keyed by ticket ref, every reviewer FAIL that no
+	// later PASS has superseded. FAC-140: an error means the review state is
+	// UNKNOWN, which must never read as "no card was rejected" — that
+	// silently re-arms the merge gate on a FAILed candidate.
+	Rejections(ctx context.Context) (map[string]Rejection, error)
+	// Reject delivers the reviewer's numbered rejection to the card's
+	// authoring worker and proves the worker consumed it. Delivery that
+	// cannot be proven is an error, never a silent success.
+	Reject(ctx context.Context, t *provider.Task, r Rejection) error
 	// Dispatch claims a to-do card and launches a builder on it.
 	Dispatch(ctx context.Context, t *provider.Task) error
 	// Review hands a verified build to the reviewer lane (card -> in-review).
@@ -75,6 +84,15 @@ func (e *Engine) ForgeLoop(ctx context.Context, d ForgeDriver, opts ForgeLoopOpt
 	// key ("approve:FAC-1", "lanes", "orphan") -> last reason. Cleared when
 	// the same transition succeeds, so a recovered blip does not poison exit.
 	failures := map[string]string{}
+	// routed holds ref -> the FAILed SHA whose rejection this loop already
+	// proved delivered. It is the (ref, SHA) idempotency key: the reviewer's
+	// FAIL stays in the ledger until a fresh candidate earns a fresh PASS, so
+	// without it every tick would re-prompt the worker with the same
+	// rejection.
+	// ponytail: in-memory, per coordinator run. A restart re-delivers a
+	// still-outstanding rejection exactly once, which is recovery, not spam;
+	// make it durable only if restarts become frequent enough to notice.
+	routed := map[string]string{}
 	fail := func(key, reason string) {
 		failures[key] = reason
 		d.Log("forge: " + reason)
@@ -129,8 +147,15 @@ func (e *Engine) ForgeLoop(ctx context.Context, d ForgeDriver, opts ForgeLoopOpt
 			continue
 		}
 		delete(failures, "signals")
+		rejections, err := d.Rejections(ctx)
+		if err != nil {
+			fail("rejections", fmt.Sprintf("BLOCKED(review_state_unknown): review verdicts unreadable, refusing to approve or route: %v", err))
+			sleep(ctx, interval)
+			continue
+		}
+		delete(failures, "rejections")
 
-		action, err := e.ForgeStep(ctx, lanes, completed, verified)
+		action, err := e.ForgeStep(ctx, lanes, completed, verified, rejections)
 		if err != nil {
 			d.Log(fmt.Sprintf("forge: step error (%s): %v", e.ProviderStatus(), err))
 			sleep(ctx, interval)
@@ -147,6 +172,24 @@ func (e *Engine) ForgeLoop(ctx context.Context, d ForgeDriver, opts ForgeLoopOpt
 		case ActionRenudge:
 			d.Log("forge: re-nudge " + action.Ref + " (reported done but failed verify)")
 			act("renudge", action.Ref, func() error { return d.Renudge(ctx, action.Task) })
+		case ActionReject:
+			r := *action.Rejection
+			if routed[action.Ref] == r.SHA {
+				// Already delivered for this exact candidate. Nothing more is
+				// owed until the worker publishes a fresh SHA and a fresh
+				// review lands on it.
+				break
+			}
+			d.Log("forge: route review FAIL for " + action.Ref + " @ " + shortSHA(r.SHA) + " back to its worker")
+			act("reject", action.Ref, func() error {
+				if err := d.Reject(ctx, action.Task, r); err != nil {
+					return err
+				}
+				// Marked only on PROVEN delivery: an unproven prompt must be
+				// retried next tick, not recorded as routed.
+				routed[action.Ref] = r.SHA
+				return nil
+			})
 		case ActionDispatch:
 			if e.health.isBlocked() {
 				d.Log("forge: " + e.ProviderStatus() + " — skip dispatch")
@@ -222,6 +265,13 @@ func unresolvedFailures(failures map[string]string) error {
 		reasons = append(reasons, failures[k])
 	}
 	return fmt.Errorf("forge: %d unresolved transition(s): %s", len(keys), strings.Join(reasons, "; "))
+}
+
+func shortSHA(s string) string {
+	if len(s) > 12 {
+		return s[:12]
+	}
+	return s
 }
 
 func sleep(ctx context.Context, d time.Duration) {

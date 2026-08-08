@@ -24,7 +24,7 @@ func TestForgeStep_ApprovesInReviewFirst(t *testing.T) {
 		&provider.Task{ID: "1", Ref: "FAC-1", Status: "to-do", Priority: provider.PriorityUrgent, Description: "```herd-deps-v1\n{\"version\":1,\"task_ref\":\"FAC-1\",\"task_id\":\"1\",\"edges\":[]}\n```\n"},
 		&provider.Task{ID: "2", Ref: "FAC-2", Status: "in-review", Priority: provider.PriorityLow, Description: "```herd-deps-v1\n{\"version\":1,\"task_ref\":\"FAC-2\",\"task_id\":\"2\",\"edges\":[]}\n```\n"},
 	)
-	a, err := e.ForgeStep(context.Background(), LaneState{Busy: 0, Max: 3}, map[string]bool{}, map[string]bool{})
+	a, err := e.ForgeStep(context.Background(), LaneState{Busy: 0, Max: 3}, map[string]bool{}, map[string]bool{}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -40,7 +40,7 @@ func TestForgeStep_ReviewsCompletedBuild(t *testing.T) {
 		&provider.Task{ID: "2", Ref: "FAC-2", Status: "in-progress", Priority: provider.PriorityHigh, Description: "```herd-deps-v1\n{\"version\":1,\"task_ref\":\"FAC-2\",\"task_id\":\"2\",\"edges\":[]}\n```\n"},
 	)
 	// Only FAC-2's builder reported complete.
-	a, err := e.ForgeStep(context.Background(), LaneState{Busy: 2, Max: 3}, map[string]bool{"FAC-2": true}, map[string]bool{"FAC-2": true})
+	a, err := e.ForgeStep(context.Background(), LaneState{Busy: 2, Max: 3}, map[string]bool{"FAC-2": true}, map[string]bool{"FAC-2": true}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -54,7 +54,7 @@ func TestForgeStep_DispatchesWhenLaneFree(t *testing.T) {
 		&provider.Task{ID: "1", Ref: "FAC-9", Status: "to-do", Priority: provider.PriorityMedium, Description: "```herd-deps-v1\n{\"version\":1,\"task_ref\":\"FAC-9\",\"task_id\":\"1\",\"edges\":[]}\n```\n"},
 		&provider.Task{ID: "2", Ref: "FAC-3", Status: "to-do", Priority: provider.PriorityUrgent, Description: "```herd-deps-v1\n{\"version\":1,\"task_ref\":\"FAC-3\",\"task_id\":\"2\",\"edges\":[]}\n```\n"},
 	)
-	a, err := e.ForgeStep(context.Background(), LaneState{Busy: 1, Max: 3}, map[string]bool{}, map[string]bool{})
+	a, err := e.ForgeStep(context.Background(), LaneState{Busy: 1, Max: 3}, map[string]bool{}, map[string]bool{}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -68,7 +68,7 @@ func TestForgeStep_NoDispatchWhenLanesFull(t *testing.T) {
 	e := forgeEngine(t,
 		&provider.Task{ID: "1", Ref: "FAC-1", Status: "to-do", Priority: provider.PriorityUrgent, Description: "```herd-deps-v1\n{\"version\":1,\"task_ref\":\"FAC-1\",\"task_id\":\"1\",\"edges\":[]}\n```\n"},
 	)
-	a, err := e.ForgeStep(context.Background(), LaneState{Busy: 3, Max: 3}, map[string]bool{}, map[string]bool{})
+	a, err := e.ForgeStep(context.Background(), LaneState{Busy: 3, Max: 3}, map[string]bool{}, map[string]bool{}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -81,7 +81,7 @@ func TestForgeStep_IdleWhenBoardClear(t *testing.T) {
 	e := forgeEngine(t,
 		&provider.Task{ID: "1", Ref: "FAC-1", Status: "done", Priority: provider.PriorityHigh, Description: "```herd-deps-v1\n{\"version\":1,\"task_ref\":\"FAC-1\",\"task_id\":\"1\",\"edges\":[]}\n```\n"},
 	)
-	a, err := e.ForgeStep(context.Background(), LaneState{Busy: 0, Max: 3}, map[string]bool{}, map[string]bool{})
+	a, err := e.ForgeStep(context.Background(), LaneState{Busy: 0, Max: 3}, map[string]bool{}, map[string]bool{}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -96,7 +96,7 @@ func TestForgeStep_UnverifiedBuildIsRenudged(t *testing.T) {
 	)
 	// Builder reported done but did NOT pass verify → renudge, not review.
 	a, err := e.ForgeStep(context.Background(), LaneState{Busy: 1, Max: 3},
-		map[string]bool{"FAC-1": true}, map[string]bool{})
+		map[string]bool{"FAC-1": true}, map[string]bool{}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -110,7 +110,7 @@ func TestForgeStep_VerifiedBuildIsReviewed(t *testing.T) {
 		&provider.Task{ID: "1", Ref: "FAC-1", Status: "in-progress", Priority: provider.PriorityHigh, Description: "```herd-deps-v1\n{\"version\":1,\"task_ref\":\"FAC-1\",\"task_id\":\"1\",\"edges\":[]}\n```\n"},
 	)
 	a, err := e.ForgeStep(context.Background(), LaneState{Busy: 1, Max: 3},
-		map[string]bool{"FAC-1": true}, map[string]bool{"FAC-1": true})
+		map[string]bool{"FAC-1": true}, map[string]bool{"FAC-1": true}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
