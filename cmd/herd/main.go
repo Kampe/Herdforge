@@ -1686,6 +1686,13 @@ func runReview() {
 		os.Exit(1)
 	}
 
+	// FAC-139: write-capable reviewer launch requires a current artifact
+	// tool-probe PASS for the decision's surface — fail before any tab.
+	if _, probeErr := ensureArtifactToolProbe(context.Background(), decision); probeErr != nil {
+		fmt.Fprintf(os.Stderr, "review launch tool-probe rejected before tab creation: %v\n", probeErr)
+		os.Exit(1)
+	}
+
 	// Exact task worktree — never the shared reviewer lane tree (incident:
 	// review-assayer-FAC-151 opened inside the FAC-172 worktree).
 	taskWT := filepath.Join(".herd", "worktrees", strings.ToLower(task.Ref))
