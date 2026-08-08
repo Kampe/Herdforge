@@ -314,6 +314,9 @@ func (s *JSONLSink) HasDegraded(req Request) (bool, error) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := os.MkdirAll(filepath.Dir(s.Path), 0755); err != nil {
+		return false, fmt.Errorf("create launch receipt directory: %w", err)
+	}
 	found := false
 	// A READ of durable state must not fail closed because the state does not
 	// exist. HasDegraded is called from launch.Validate, which runs before the
