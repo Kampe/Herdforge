@@ -58,8 +58,20 @@ var hermeticImagePins = map[string]hermeticImagePin{
 	"amd64": {
 		Platform:     "linux/amd64",
 		Architecture: "amd64",
-		Image:        "golang@sha256:5502b0e56fca23feba76dbc5387ba59c593c02ccc2f0f7355871ea9a0852cebe",
-		ConfigDigest: "sha256:f7414a0dc5a64713686cbc9f1e8a7379b66af63ef9ad15760b43db40e0b15d9c",
+		// The previous Image digest (5502b0e5...) was the multi-arch INDEX, not a
+		// platform image: `docker manifest inspect` shows it carrying 16 manifests
+		// and no config. Docker on Linux then reports Id as the resolved amd64
+		// CONFIG digest, which matched neither the index nor the value pinned as
+		// ConfigDigest -- and that stale value (f7414a0d...) was in fact the amd64
+		// MANIFEST digest, one level off. CI failed as "manifest/config evidence
+		// violates fixed policy" while a Darwin daemon, which reports Id as the
+		// pulled reference, passed.
+		//
+		// Now symmetric with the arm64 pin: Image is the single-platform manifest
+		// digest, ConfigDigest is that manifest's config digest. Both verified via
+		// docker manifest inspect and a --platform linux/amd64 pull.
+		Image:        "golang@sha256:f7414a0dc5a64713686cbc9f1e8a7379b66af63ef9ad15760b43db40e0b15d9c",
+		ConfigDigest: "sha256:749aa15fc6e4fac30c91f785daf525be2b791065e7eb225a43de6492ed2d03c0",
 	},
 }
 
