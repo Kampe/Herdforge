@@ -48,6 +48,7 @@ production:
 
 ```
 $ grep -rnE '\.Register(Detached)?\(' --include='*.go' . | grep -v _test.go
+cmd/herd/main.go:8117 ...                # coordinator.Register, different package
 pkg/mutationprobe/lifecycle.go:232 ...   # unrelated store
 
 $ grep -n '^func runCommandSessions' cmd/herd/commandsessions.go

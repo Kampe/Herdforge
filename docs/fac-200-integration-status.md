@@ -1,23 +1,35 @@
-# FAC-200 integration status: BLOCKED (one criterion)
+# FAC-200 integration status: criterion still OPEN (reasoning superseded)
 
-## BLOCKED
+> **Updated after FAC-198 landed.** The original blocker below was "no code on
+> main creates a hermetic verification container at all". That is no longer
+> true: `pkg/verifier/hermetic_docker_runner.go` is on main and creates one at
+> `hermetic_docker_runner.go:664`. The historical reasoning is kept beneath for
+> provenance, but do not act on it — verify against main.
 
-**Criterion:** "Every Herdforge hermetic/containerized verification owns
-a durable container lifecycle receipt ... register the container ID
-immediately after create, before start or any later failure."
+## Current state
 
-**Status: BLOCKED on this branch.** It cannot be made true here, not
-because of missing effort but because there is no code on `main` or
-`herd/fac-200` that creates a hermetic/containerized verification
-container in the first place. `Register`/`MarkStarted`/`EnsureCleanup`
-have no production caller, and cannot get one without either (a)
-inventing a second, parallel hermetic Docker verification runner that
-duplicates FAC-198's job and will conflict with it at merge time, or (b)
-merging FAC-198's own unreviewed branch into FAC-200's history, which is
-a different ticket's unreviewed work and not something to fold in here.
+**Criterion:** "Every Herdforge hermetic/containerized verification owns a
+durable container lifecycle receipt ... register the container ID immediately
+after create, before start or any later failure."
 
-This is not a "we didn't get to it" gap — it is a hard dependency this
-worktree cannot resolve by itself.
+**Still not met, for a different reason than originally recorded.**
+`pkg/containerlifecycle` now HAS production callers — `cmd/herd/containers.go`
+uses `NewStore`, `Status` and `LabelFAC174Baseline` — so the package is no
+longer dead. But the hermetic runner does not use it: it creates a container
+and calls `Register` zero times. Verified on main:
+
+```
+$ grep -c Register pkg/verifier/hermetic_docker_runner.go
+0
+$ grep -n '"create"' pkg/verifier/hermetic_docker_runner.go
+664:  args := []string{"create", "--pull", "never", ...}
+```
+
+So a hermetic verification container can be created and then orphaned by a
+crash between create and cleanup, with no durable receipt naming it. Tracked as
+FAC-231 rather than left as a stale BLOCKED note on a closed card.
+
+## Historical record (superseded)
 
 ### Evidence
 

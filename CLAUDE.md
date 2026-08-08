@@ -26,7 +26,7 @@ make all
 # Run self-test suite against active repository
 make self-test
 
-# Run unit tests across all 30 packages
+# Run unit tests across all 104 packages
 make test-unit
 
 # Run preflight workspace boundary check

@@ -42,7 +42,12 @@ This contract governs all AI agents (Claude, Gemini, Codex, Grok, Ollama) partic
 
 ---
 
-## 2. Complete Package Ownership Grid (30 Packages)
+## 2. Core Package Ownership Grid (30 of 99 packages)
+
+The grid below covers the 30 load-bearing packages an agent touches most. It is
+deliberately not exhaustive — `ls -d pkg/*/` is the authoritative list, and
+`make test-unit` runs all of them. Do not infer that a package is absent from
+the tree because it is absent from this table.
 
 | Package | Purpose & Scope | Primary Test Target |
 | :--- | :--- | :--- |
