@@ -5718,7 +5718,7 @@ func forgeLoopMain() int {
 	// FAC-222: register the coordinator as a named agent so dispatched packets
 	// carry a reply address and agents report completion/BLOCKED to it instead
 	// of relying on the coordinator to notice by polling.
-	coordReg, regErr := coordinator.Register(".", cfg.Fleet.HerdrWorkspace)
+	coordReg, regErr := coordinator.Register(".", coordinator.CoordinatorName, cfg.Fleet.HerdrWorkspace)
 	if regErr != nil {
 		fmt.Fprintf(os.Stderr, "forge --loop: coordinator registration failed: %v\n", regErr)
 		return 1
@@ -5747,10 +5747,7 @@ func forgeLoopMain() int {
 	// FAC-222: wire the feedback census into the loop so a lane that goes quiet
 	// is REPORTED rather than discovered by polling. The census runs every
 	// feedbackInterval ticks; a failure is logged, never fatal.
-	feedbackInterval := *interval * 60 / int(feedback.DefaultInterval.Seconds())
-	if feedbackInterval < 1 {
-		feedbackInterval = 1
-	}
+	feedbackInterval := feedback.CensusTickInterval(*interval)
 	feedbackRunner := func(ctx context.Context) error {
 		return feedback.Run(ctx, feedback.Options{
 			Coordinator: coordReg.Name,

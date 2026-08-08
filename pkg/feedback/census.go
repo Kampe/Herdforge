@@ -53,6 +53,22 @@ const (
 	EnvWorkspaceLabel = "HERD_WORKSPACE_LABEL"
 )
 
+// CensusTickInterval returns the number of forge-loop ticks between census
+// runs, given the loop tick interval in seconds. A census should open
+// approximately every DefaultInterval (30 min); if the loop ticks every 15 s
+// the result is 120, not 1. A non-positive tick interval clamps to 1 so the
+// census always runs.
+func CensusTickInterval(tickIntervalSeconds int) int {
+	if tickIntervalSeconds <= 0 {
+		return 1
+	}
+	n := int(DefaultInterval.Seconds()) / tickIntervalSeconds
+	if n < 1 {
+		return 1
+	}
+	return n
+}
+
 // CensusState is the durable census record.
 type CensusState struct {
 	Epoch            string   `json:"epoch"`
