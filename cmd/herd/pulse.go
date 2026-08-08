@@ -338,10 +338,16 @@ func readPulseReview() pulse.ReviewObservation {
 	if _, err := os.Stat(path); err != nil {
 		return pulse.ReviewObservation{Known: true, Pending: 0, NeedReview: 0}
 	}
-	// Ledger exists but pulse does not re-implement drain Scan here (FAC-184
-	// adapters still incomplete for --act harvest). Known-empty pending is
-	// honest: we did not observe pressure, so do not invent saturation.
-	// Callers needing the pile still run herd drain.
+	// Ledger exists — verify it is readable. A corrupt ledger must surface
+	// as Known=false so an operator can detect the problem, not silently
+	// report Known=true with zero pending (finding 3).
+	ledger := review.OpenLedger(path)
+	if _, err := ledger.Vetoed(context.Background()); err != nil {
+		return pulse.ReviewObservation{Known: false, Error: fmt.Sprintf("review ledger unreadable: %v", err)}
+	}
+	// Readable ledger: known-empty pending is honest — we did not observe
+	// pressure, so do not invent saturation. Callers needing the pile
+	// still run herd drain.
 	return pulse.ReviewObservation{Known: true, Pending: 0, NeedReview: 0}
 }
 
@@ -526,17 +532,29 @@ func taskRefFromAgentName(name string) string {
 // observations. Each map is nil-safe: a nil map means "no evidence
 // available" and the corresponding field is left unset (fail closed —
 // the lane is not reaped without proof).
+//
+// ledgerCorrupt is the fail-closed KEEP signal: when the review ledger
+// file exists but cannot be read (corrupted JSONL, disk error), we cannot
+// know whether a FAIL/BLOCKED verdict is pending. Any agent with committed
+// work is treated as AwaitingVerdict so the reap planner does not destroy
+// a live lane whose verdict it cannot read. This closes the asymmetry:
+// nil exit-evidence maps correctly cause fail-closed (no reap), but nil
+// vetoedSHAs alone caused fail-open (lost KEEP signal → reap).
 type reapEvidence struct {
-	doneRefs   map[string]bool   // uppercased task refs with done status
-	safeRefs   map[string]string // uppercased task ref -> safe ref name
-	vetoedSHAs map[string]bool   // SHAs with FAIL/BLOCKED verdict
-	headSHAs   map[string]string // agent name -> HEAD SHA
-	committed  map[string]bool   // agent name -> has committed work
+	doneRefs       map[string]bool   // uppercased task refs with done status
+	safeRefs       map[string]string // uppercased task ref -> safe ref name
+	vetoedSHAs     map[string]bool   // SHAs with FAIL/BLOCKED verdict
+	headSHAs       map[string]string // agent name -> HEAD SHA
+	committed      map[string]bool   // agent name -> has committed work
+	ledgerCorrupt  bool              // ledger exists but unreadable — verdict may be pending
 }
 
 // applyReapEvidence fills in CommittedWork, TicketDone, SafeRef, and
 // AwaitingVerdict on one agent observation from pre-loaded evidence.
-// This is a pure function — no I/O — so it is directly unit-testable.
+// When ledgerCorrupt is set, any agent with committed work is marked
+// AwaitingVerdict — a verdict may be pending that cannot be read, so
+// the reap planner must KEEP the lane. This is a pure function — no
+// I/O — so it is directly unit-testable.
 func applyReapEvidence(agent pulse.AgentObservation, ref string, ev reapEvidence) pulse.AgentObservation {
 	if ref != "" {
 		if ev.doneRefs != nil && ev.doneRefs[ref] {
@@ -548,6 +566,9 @@ func applyReapEvidence(agent pulse.AgentObservation, ref string, ev reapEvidence
 	}
 	if ev.committed != nil && ev.committed[agent.Name] {
 		agent.CommittedWork = true
+	}
+	if ev.ledgerCorrupt && agent.CommittedWork {
+		agent.AwaitingVerdict = true
 	}
 	if ev.vetoedSHAs != nil && ev.headSHAs != nil {
 		if sha, ok := ev.headSHAs[agent.Name]; ok && sha != "" && ev.vetoedSHAs[sha] {
@@ -561,14 +582,20 @@ func applyReapEvidence(agent pulse.AgentObservation, ref string, ev reapEvidence
 // It runs git in each agent's Cwd to check for committed work, safe refs, and
 // HEAD SHAs, and reads the review ledger for vetoed SHAs. Any source error
 // leaves the corresponding map nil (fail closed) rather than inventing
-// evidence.
+// evidence. A ledger read error sets ledgerCorrupt so applyReapEvidence can
+// set AwaitingVerdict on committed lanes — a verdict may be pending that
+// cannot be read, and the lane must not be reaped.
 func loadReapEvidence(ctx context.Context, entries []herdr.AgentEntry, doneRefs map[string]bool) reapEvidence {
 	ev := reapEvidence{doneRefs: doneRefs}
 
 	ledgerPath := drainLedgerPath()
 	if _, err := os.Stat(ledgerPath); err == nil {
 		ledger := review.OpenLedger(ledgerPath)
-		if vetoed, err := ledger.Vetoed(ctx); err == nil {
+		vetoed, err := ledger.Vetoed(ctx)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "pulse: review ledger unreadable at %s: %v — treating all committed lanes as awaiting verdict (fail-closed KEEP)\n", ledgerPath, err)
+			ev.ledgerCorrupt = true
+		} else {
 			ev.vetoedSHAs = vetoed
 		}
 	}
