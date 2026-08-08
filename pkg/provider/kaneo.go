@@ -426,15 +426,15 @@ func (l *kaneoLabel) UnmarshalJSON(b []byte) error {
 }
 
 type kaneoTaskDTO struct {
-	ID          string       `json:"id"`
-	Ref         string       `json:"ref"`
-	Title       string       `json:"title"`
-	Description string       `json:"description"`
-	Status      string       `json:"status"`
-	Priority    string       `json:"priority"`
-	ProjectId   string       `json:"projectId"`
-	CreatedAt   string       `json:"createdAt"`
-	UpdatedAt   string       `json:"updatedAt"`
+	ID          string `json:"id"`
+	Ref         string `json:"ref"`
+	Title       string `json:"title"`
+	Description string `json:"description"`
+	Status      string `json:"status"`
+	Priority    string `json:"priority"`
+	ProjectId   string `json:"projectId"`
+	CreatedAt   string `json:"createdAt"`
+	UpdatedAt   string `json:"updatedAt"`
 	// Position is a pointer so JSON null/absent is distinguishable from 0
 	// (board rank 0 is valid and must survive full-schema PUT rebuilds).
 	Position *float64     `json:"position"`
