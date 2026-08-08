@@ -1,6 +1,12 @@
 # Herdforge Makefile
 
-.PHONY: all build test test-unit test-contracts test-hermetic-compile test-coverage test-mutation preflight lint self-test herd-up clean ci
+.PHONY: all build test test-unit test-contracts test-hermetic-compile test-coverage test-mutation test-race test-e2e preflight lint self-test herd-up clean ci
+
+# FAC-135: shared hermetic Git environment for every gate. Host signing, hooks,
+# and ambient credentials must not influence fixtures or coverage.
+HERMETIC_GIT := GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null GIT_CONFIG_NOSYSTEM=1
+COVER_DIR ?= $(CURDIR)/.herd/coverage
+COVER_PROFILE ?= $(COVER_DIR)/cover.out
 
 all: preflight test build
 
@@ -10,7 +16,7 @@ all: preflight test build
 # red here it is red on the runner.
 ci:
 	@echo "==> Running CI-equivalent gate (hermetic git env)..."
-	GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null $(MAKE) lint test-unit preflight
+	$(HERMETIC_GIT) $(MAKE) lint test-unit test-race preflight
 	@echo "==> CI gate PASSED"
 
 build:
@@ -42,7 +48,7 @@ test-unit: test-contracts test-hermetic-compile
 	@echo "==> Running full unit test suite..."
 	# 300s: cmd/herd integration builds the binary multiple times; 180s is
 	# flaky/red on both main and this branch (pre-existing, not FAC-198).
-	go test -count=1 -timeout=300s ./...
+	$(HERMETIC_GIT) go test -count=1 -timeout=300s ./...
 
 # contracts/agentscope is a nested, independently consumable Go module. The
 # root module's `go test ./...` skips nested modules, so this target makes the
@@ -50,23 +56,38 @@ test-unit: test-contracts test-hermetic-compile
 # omitted by `make ci` and CI.
 test-contracts:
 	@echo "==> Running nested contract module tests (contracts/agentscope)..."
-	cd contracts/agentscope && go test -count=1 -timeout=180s ./...
+	$(HERMETIC_GIT) sh -c 'cd contracts/agentscope && go test -count=1 -timeout=180s ./...'
 
+# FAC-135: coverage under a repo-local profile (not host /tmp) plus non-vacuous
+# package floors for core production paths.
 test-coverage:
-	@echo "==> Running coverage analysis..."
-	go test -coverprofile=/tmp/herd-cover.out -count=1 -timeout=180s ./...
-	go tool cover -func=/tmp/herd-cover.out
+	@echo "==> Running coverage analysis (hermetic git env)..."
+	@mkdir -p "$(COVER_DIR)"
+	$(HERMETIC_GIT) go test -coverprofile="$(COVER_PROFILE)" -count=1 -timeout=300s ./...
+	go tool cover -func="$(COVER_PROFILE)"
+	@echo "==> Enforcing coverage floors..."
+	go run ./scripts/check-coverage-floors.go "$(COVER_PROFILE)"
+
+# FAC-135: race detector on core orchestration packages (non-vacuous gate).
+test-race:
+	@echo "==> Running race detector on core packages..."
+	$(HERMETIC_GIT) go test -race -count=1 -timeout=300s ./pkg/lifecycle/ ./pkg/daemon/ ./pkg/claim/ ./pkg/mail/ ./pkg/lock/
 
 test-mutation:
-	@echo "==> Running mutation checks on high-risk packages..."
-	@for pkg in verifier review config; do \
+	@echo "==> Running mutation checks on high-risk packages (hermetic)..."
+	@for pkg in verifier review config preflight; do \
 		echo "--- $$pkg ---"; \
-		go test -count=1 -timeout=120s ./pkg/$$pkg/; \
+		$(HERMETIC_GIT) go test -count=1 -timeout=120s ./pkg/$$pkg/; \
 	done
+
+# FAC-135: compiled-driver factory conformance (cliForgeDriver + fakes).
+test-e2e:
+	@echo "==> Running factory e2e (compiled herd + protocol fakes)..."
+	$(HERMETIC_GIT) go test -count=1 -timeout=300s -run 'FactoryE2E_|CliForgeDriver_' ./cmd/herd/
 
 preflight:
 	@echo "==> Running preflight workspace boundary checks..."
-	go run ./cmd/herd preflight
+	$(HERMETIC_GIT) go run ./cmd/herd preflight
 
 self-test: build
 	@echo "==> Running compiled Herdforge self-test suite against ITSELF..."
@@ -84,4 +105,4 @@ lint:
 
 clean:
 	@echo "==> Cleaning build artifacts..."
-	rm -rf bin
+	rm -rf bin "$(COVER_DIR)"

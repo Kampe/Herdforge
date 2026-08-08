@@ -529,22 +529,27 @@ func TestDaemonTick_TwoConcurrentDaemonsOneWinner(t *testing.T) {
 	hB := &tickFakeHerdr{available: true}
 	// Count starts via wrappers: use shared counter by checking after join.
 
+	// Build both option sets on the test goroutine: baseTickOpts reaches
+	// t.Setenv, which is not safe to call concurrently (it writes testing.T
+	// state) and trips -race. The concurrency under test is RunDaemonTick's
+	// claim, not fixture construction.
+	optsA := baseTickOpts(t, hA, &tickFakeWorktree{root: root, path: filepath.Join(root, "a")})
+	optsB := baseTickOpts(t, hB, &tickFakeWorktree{root: root, path: filepath.Join(root, "b")})
+
 	var wg sync.WaitGroup
 	var errA, errB error
 	var recA, recB *TickReceipt
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		opts := baseTickOpts(t, hA, &tickFakeWorktree{root: root, path: filepath.Join(root, "a")})
-		recA, errA = engA.RunDaemonTick(context.Background(), "worker", opts)
+		recA, errA = engA.RunDaemonTick(context.Background(), "worker", optsA)
 		if errA == nil && recA != nil && recA.Launched {
 			starts.Add(1)
 		}
 	}()
 	go func() {
 		defer wg.Done()
-		opts := baseTickOpts(t, hB, &tickFakeWorktree{root: root, path: filepath.Join(root, "b")})
-		recB, errB = engB.RunDaemonTick(context.Background(), "worker", opts)
+		recB, errB = engB.RunDaemonTick(context.Background(), "worker", optsB)
 		if errB == nil && recB != nil && recB.Launched {
 			starts.Add(1)
 		}

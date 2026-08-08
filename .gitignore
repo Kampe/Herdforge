@@ -1,6 +1,7 @@
 # Binaries and build output
 bin/
 *.out
+.herd/coverage/
 
 # Local machine task provider link files
 .kaneo.json

@@ -29,7 +29,7 @@ jobs:
           cache: true
 
       - name: Build, lint, unit tests, preflight
-        run: make lint test-unit preflight
+        run: make lint test-unit test-race preflight
 
   # FAC-198: the quarantined ownership suite only runs inside the hermetic
   # Docker profile. Compile is already part of test-unit; this job is the
