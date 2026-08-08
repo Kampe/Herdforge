@@ -46,6 +46,11 @@ func writeFileHarvest(t *testing.T, dir, name, content string) {
 
 func addAndCommitHarvest(t *testing.T, dir, msg string, files ...string) string {
 	t.Helper()
+	if len(files) == 0 {
+		// Empty-anchor fixtures intentionally commit no tree delta.
+		gitInHarvest(t, dir, "commit", "--allow-empty", "-q", "-m", msg)
+		return gitInHarvest(t, dir, "rev-parse", "HEAD")
+	}
 	args := append([]string{"add"}, files...)
 	gitInHarvest(t, dir, args...)
 	gitInHarvest(t, dir, "commit", "-q", "-m", msg)
