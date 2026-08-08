@@ -178,19 +178,39 @@ func fixtureSigner(t *testing.T, keyDir, repoDir string) *dispatch.Signer {
 // a provisioned volume every mutation refuses with "run herd fence-provision
 // on the shared volume". Tests provision inside their OWN temp tree, never a
 // shared host path.
-func provisionFence(t *testing.T, binary, dir, keyDir string) {
-	t.Helper()
-	out, err := herdCmd(binary, dir, keyDir, "fence-provision").CombinedOutput()
-	if err != nil {
-		t.Fatalf("fence-provision: %v\n%s", err, out)
+// ensureFenceSeal provisions the claim volume once per test dir and returns the
+// minted seal. Best-effort: a caller that does not need the fence is unaffected.
+func ensureFenceSeal(binary, dir, keyDir string) string {
+	if seal := readMintedSeal(dir); seal != "" {
+		return seal
 	}
-	// fence-provision prints:  export HERD_FENCE_VOLUME_ID="<seal>"
+	c := exec.Command(binary, "fence-provision")
+	c.Dir = dir
+	c.Env = append(os.Environ(),
+		dispatch.KeyDirEnv+"="+keyDir,
+		herdr.NoLiveEnv+"=1",
+		herdr.BinaryEnv+"=",
+		"HERD_CLAIM_DIR="+filepath.Join(dir, "claims"),
+	)
+	out, err := c.CombinedOutput()
+	if err != nil {
+		return ""
+	}
 	m := regexp.MustCompile(`HERD_FENCE_VOLUME_ID="([^"]+)"`).FindStringSubmatch(string(out))
 	if len(m) != 2 {
-		t.Fatalf("fence-provision did not print a volume seal:\n%s", out)
+		return ""
 	}
-	if err := os.WriteFile(filepath.Join(dir, ".fence-seal"), []byte(m[1]), 0o600); err != nil {
-		t.Fatalf("record seal: %v", err)
+	_ = os.WriteFile(filepath.Join(dir, ".fence-seal"), []byte(m[1]), 0o600)
+	return m[1]
+}
+
+// provisionFence guarantees a sealed claim volume. It is idempotent: herdCmd
+// provisions lazily, so a store may already be sealed, and fence-provision
+// correctly refuses to overwrite one.
+func provisionFence(t *testing.T, binary, dir, keyDir string) {
+	t.Helper()
+	if ensureFenceSeal(binary, dir, keyDir) == "" {
+		t.Fatal("fence-provision produced no volume seal")
 	}
 }
 
@@ -220,10 +240,14 @@ func herdCmd(binary, dir, keyDir string, args ...string) *exec.Cmd {
 	)
 	// The volume seal is MINTED by fence-provision, never chosen by the caller:
 	// WriteSharedMarker clears any preset HERD_FENCE_VOLUME_ID so a host cannot
-	// plant a stolen seal. So the test reads the mint back rather than inventing
-	// one -- an invented id fails as "volume_seal mismatch (not this fleet
-	// store; independent/forged store refused)", which is the gate working.
-	if seal := readMintedSeal(dir); seal != "" {
+	// plant a stolen seal. An invented id fails as "volume_seal mismatch (not
+	// this fleet store; independent/forged store refused)" -- the gate working.
+	//
+	// Provisioning is LAZY rather than a call every test must remember: FAC-145
+	// routes provider mutations through the fence authority, so any CLI test
+	// that mutates needs a sealed volume. Doing it here means one place knows
+	// the requirement instead of every fixture shape in the file.
+	if seal := ensureFenceSeal(binary, dir, keyDir); seal != "" {
 		cmd.Env = append(cmd.Env, "HERD_FENCE_VOLUME_ID="+seal)
 	}
 	return cmd
