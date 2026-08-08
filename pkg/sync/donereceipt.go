@@ -23,13 +23,14 @@ import (
 // independently reviewed, integrated into origin/main, and read back from the
 // provider.
 //
-// WHY: pkg/sync.MergeEvidence accepted any origin/main commit naming the ref,
-// or any operator-supplied ancestor. That oracle closed FAC-107, FAC-108,
-// FAC-111, FAC-114, FAC-116, FAC-128 and FAC-129 while their stated acceptance
-// criteria were still unmet — an empty commit whose subject says "FAC-116" is
-// indistinguishable, to a grep, from the work itself. Commit-message matches
-// are now DISCOVERY HINTS ONLY (see MergeEvidence and AuditDone); they carry
-// no closing authority.
+// WHY: the original merge-evidence oracle accepted any origin/main commit
+// naming the ref, or any operator-supplied ancestor. That oracle closed
+// FAC-107, FAC-108, FAC-111, FAC-114, FAC-116, FAC-128 and FAC-129 while their
+// stated acceptance criteria were still unmet — an empty commit whose subject
+// says "FAC-116" is indistinguishable, to a grep, from the work itself.
+// Commit-message matches are now DIAGNOSTIC HINTS ONLY (see commitHint and
+// AuditDone); they carry no closing authority. The sound "did this merge?"
+// check is LandedProof (rebase onto origin/main, require empty diff).
 //
 // The content binding is the patch ID: the receipt names the patch ID of the
 // accepted candidate, and Validate recomputes it from the merge commit that is

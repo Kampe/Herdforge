@@ -3,12 +3,32 @@ package sync
 import (
 	"context"
 	"errors"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/Kampe/Herdforge/pkg/provider"
 )
+
+func gitInTest(t *testing.T, dir string, args ...string) string {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %v in %s: %v\n%s", args, dir, err, out)
+	}
+	return strings.TrimSpace(string(out))
+}
+
+func writeFileTest(t *testing.T, dir, name, body string) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
 
 func TestNormalizeRef(t *testing.T) {
 	cases := map[string]string{
@@ -56,40 +76,196 @@ func fixtureRepo(t *testing.T) (dir, mainSHA, strandedSHA string) {
 	return dir, mainSHA, strandedSHA
 }
 
-func TestMergeEvidence(t *testing.T) {
-	dir, mainSHA, strandedSHA := fixtureRepo(t)
+func TestLandedProof(t *testing.T) {
+	// landedRepo builds a bare origin, a main working clone, and a lane
+	// worktree. The lane starts with one unique commit NOT on origin/main.
+	// Tests merge the lane's work onto main in various modes and then call
+	// LandedProof to verify it detects the landing.
+	landedRepo := func(t *testing.T) (root, origin, lane string) {
+		t.Helper()
+		tmp := t.TempDir()
+		origin = filepath.Join(tmp, "origin.git")
+		root = filepath.Join(tmp, "work")
+		lane = filepath.Join(tmp, "lane")
 
-	t.Run("commit naming ref is proof", func(t *testing.T) {
-		proof, err := MergeEvidence(dir, "FAC-18", "")
-		if err != nil || !strings.Contains(proof, "FAC-18") {
-			t.Fatalf("want proof for FAC-18, got %q err %v", proof, err)
+		run := func(d string, args ...string) string {
+			t.Helper()
+			cmd := exec.Command("git", args...)
+			cmd.Dir = d
+			out, err := cmd.CombinedOutput()
+			if err != nil {
+				t.Fatalf("git %v in %s: %v\n%s", args, d, err, out)
+			}
+			return strings.TrimSpace(string(out))
+		}
+		write := func(d, name, body string) {
+			t.Helper()
+			if err := os.WriteFile(filepath.Join(d, name), []byte(body), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+
+		// Bare origin.
+		run(tmp, "init", "-q", "--bare", "-b", "main", origin)
+		// Main working clone.
+		run(tmp, "clone", "-q", origin, root)
+		run(root, "config", "user.email", "test@herdforge.local")
+		run(root, "config", "user.name", "herdforge-test")
+		run(root, "config", "commit.gpgsign", "false")
+		run(root, "config", "tag.gpgsign", "false")
+		write(root, "base.txt", "base\n")
+		run(root, "add", "-A")
+		run(root, "commit", "-q", "-m", "chore: base")
+		run(root, "push", "-q", "origin", "main")
+
+		// Lane worktree off origin/main.
+		run(root, "worktree", "add", "-b", "herd/lane", lane, "origin/main")
+		run(lane, "config", "user.email", "test@herdforge.local")
+		run(lane, "config", "user.name", "herdforge-test")
+		run(lane, "config", "commit.gpgsign", "false")
+		write(lane, "feature.txt", "the actual work\n")
+		run(lane, "add", "-A")
+		run(lane, "commit", "-q", "-m", "feat: lane work (FAC-213)")
+		return root, origin, lane
+	}
+
+	// mergeLaneToMain cherry-picks the lane tip onto main and pushes, so
+	// origin/main carries the lane's content under the same SHAs (merge-commit
+	// mode).
+	mergeLaneToMain := func(t *testing.T, root, lane string) {
+		t.Helper()
+		laneSHA := gitInTest(t, lane, "rev-parse", "HEAD")
+		gitInTest(t, root, "checkout", "-q", "main")
+		gitInTest(t, root, "cherry-pick", laneSHA)
+		gitInTest(t, root, "push", "-q", "origin", "main")
+	}
+
+	// rebaseMergeLaneToMain simulates GitHub's rebase-merge: replay the lane's
+	// commits onto main with NEW SHAs, then push. The lane's original SHAs are
+	// NOT on origin/main, but the PATCHES are.
+	rebaseMergeLaneToMain := func(t *testing.T, root, lane string) {
+		t.Helper()
+		laneSHA := gitInTest(t, lane, "rev-parse", "HEAD")
+		baseSHA := gitInTest(t, lane, "rev-parse", "origin/main")
+		gitInTest(t, root, "checkout", "-q", "main")
+		// Rebase the lane tip onto main: this creates new SHAs with the same
+		// patches, simulating GitHub's rebase-merge.
+		gitInTest(t, root, "rebase", "--onto", "main", baseSHA, laneSHA)
+		// Move main to the rebased tip and push.
+		newTip := gitInTest(t, root, "rev-parse", "HEAD")
+		gitInTest(t, root, "branch", "-f", "main", newTip)
+		gitInTest(t, root, "push", "-q", "origin", "main")
+		// Return to main (rebase leaves HEAD detached).
+		gitInTest(t, root, "checkout", "-q", "main")
+	}
+
+	// squashMergeLaneToMain simulates GitHub's squash-merge: collapse the
+	// lane's commits into one commit on main, then push. The lane's individual
+	// patch-ids do NOT match the squash commit.
+	squashMergeLaneToMain := func(t *testing.T, root, lane string) {
+		t.Helper()
+		laneSHA := gitInTest(t, lane, "rev-parse", "HEAD")
+		baseSHA := gitInTest(t, lane, "rev-parse", "origin/main")
+		gitInTest(t, root, "checkout", "-q", "main")
+		// Squash the lane's range into one commit on main.
+		gitInTest(t, root, "merge", "--squash", laneSHA)
+		gitInTest(t, root, "commit", "-q", "-m", "feat: squashed lane work (FAC-213)")
+		gitInTest(t, root, "push", "-q", "origin", "main")
+		_ = baseSHA // base is origin/main already
+	}
+
+	t.Run("merge-commit: work on main passes", func(t *testing.T) {
+		root, _, lane := landedRepo(t)
+		mergeLaneToMain(t, root, lane)
+		if err := LandedProof(lane); err != nil {
+			t.Fatalf("LandedProof must pass after merge-commit: %v", err)
 		}
 	})
 
-	t.Run("digit boundary: FAC-1 does not match FAC-18", func(t *testing.T) {
-		proof, err := MergeEvidence(dir, "FAC-1", "")
-		if err != nil || proof != "" {
-			t.Fatalf("FAC-1 must not inherit FAC-18's commit, got %q err %v", proof, err)
+	t.Run("rebase-merge: rewritten SHAs pass", func(t *testing.T) {
+		root, _, lane := landedRepo(t)
+		rebaseMergeLaneToMain(t, root, lane)
+		// The lane's original SHAs are NOT on origin/main (they were
+		// rewritten), but the patches are. LandedProof must still pass.
+		if err := LandedProof(lane); err != nil {
+			t.Fatalf("LandedProof must pass after rebase-merge (SHA rewrite): %v", err)
 		}
 	})
 
-	t.Run("explicit ancestor evidence is proof", func(t *testing.T) {
-		proof, err := MergeEvidence(dir, "FAC-99", mainSHA)
-		if err != nil || !strings.Contains(proof, "ancestor") {
-			t.Fatalf("want ancestor proof, got %q err %v", proof, err)
+	t.Run("squash-merge: combined patch passes", func(t *testing.T) {
+		root, _, lane := landedRepo(t)
+		squashMergeLaneToMain(t, root, lane)
+		// The lane's individual patch-ids do NOT match the squash commit.
+		// LandedProof must still pass because the resulting tree matches.
+		if err := LandedProof(lane); err != nil {
+			t.Fatalf("LandedProof must pass after squash-merge: %v", err)
 		}
 	})
 
-	t.Run("non-ancestor evidence is a hard refusal", func(t *testing.T) {
-		if _, err := MergeEvidence(dir, "FAC-99", strandedSHA); err == nil {
-			t.Fatal("stranded commit must be refused as evidence")
+	t.Run("unmerged work fails", func(t *testing.T) {
+		_, _, lane := landedRepo(t)
+		// Do NOT merge the lane's work to main.
+		err := LandedProof(lane)
+		if err == nil {
+			t.Fatal("LandedProof must fail when work is NOT on origin/main")
+		}
+		if !errors.Is(err, ErrNotLanded) {
+			t.Fatalf("want ErrNotLanded, got %v", err)
 		}
 	})
 
-	t.Run("unmerged ref has no evidence", func(t *testing.T) {
-		proof, err := MergeEvidence(dir, "FAC-99", "")
-		if err != nil || proof != "" {
-			t.Fatalf("FAC-99 is not on origin/main, got %q err %v", proof, err)
+	t.Run("grep false positive does not pass (defect 1)", func(t *testing.T) {
+		root, origin, lane := landedRepo(t)
+		// Add a commit to main whose BODY mentions FAC-213 but whose SUBJECT
+		// names a different ref. The old grep would match FAC-213 in the body.
+		gitInTest(t, root, "checkout", "-q", "main")
+		writeFileTest(t, root, "unrelated.txt", "unrelated\n")
+		gitInTest(t, root, "add", "-A")
+		gitInTest(t, root, "commit", "-q", "-m", "fix: unrelated fix (FAC-999)", "-m", "relates to FAC-213")
+		gitInTest(t, root, "push", "-q", "origin", "main")
+		_ = origin
+		// The lane's FAC-213 work is NOT on main — only a body mention is.
+		// LandedProof must fail; the grep would have falsely passed.
+		err := LandedProof(lane)
+		if err == nil {
+			t.Fatal("LandedProof must fail: a body mention of FAC-213 is not a merge")
+		}
+	})
+
+	t.Run("stale remote branch does not cause false negative (defect 3)", func(t *testing.T) {
+		root, origin, lane := landedRepo(t)
+		// Push the lane branch to origin, then rebase the lane locally (new
+		// SHAs) but do NOT force-push. origin/lane is now stale.
+		gitInTest(t, root, "push", "-q", origin, "herd/lane:herd/lane")
+		// Add a second commit to the lane (so the local lane diverges).
+		writeFileTest(t, lane, "second.txt", "second\n")
+		gitInTest(t, lane, "add", "-A")
+		gitInTest(t, lane, "commit", "-q", "-m", "feat: second lane commit (FAC-213)")
+		// Squash-merge ALL lane work to main.
+		squashMergeLaneToMain(t, root, lane)
+		// The remote origin/lane is stale (it only has the first commit, pre-
+		// squash). LandedProof must still pass because it operates on the
+		// LOCAL worktree, not the stale remote branch.
+		if err := LandedProof(lane); err != nil {
+			t.Fatalf("LandedProof must pass despite stale remote branch: %v", err)
+		}
+	})
+
+	t.Run("fetch failure is a hard error", func(t *testing.T) {
+		// A repo with no remote: fetch fails, and LandedProof must not
+		// degrade to a stale local ref.
+		dir := t.TempDir()
+		gitInTest(t, dir, "init", "-q", "-b", "main")
+		gitInTest(t, dir, "config", "user.email", "t@h.local")
+		gitInTest(t, dir, "config", "user.name", "t")
+		gitInTest(t, dir, "config", "commit.gpgsign", "false")
+		gitInTest(t, dir, "commit", "--allow-empty", "-q", "-m", "base")
+		err := LandedProof(dir)
+		if err == nil {
+			t.Fatal("LandedProof must fail when fetch fails (no remote)")
+		}
+		if !strings.Contains(err.Error(), "fetch") {
+			t.Fatalf("fetch failure must mention fetch, got: %v", err)
 		}
 	})
 }

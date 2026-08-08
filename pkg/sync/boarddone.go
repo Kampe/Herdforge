@@ -25,10 +25,29 @@ import (
 // that too: an arbitrary ancestor says nothing about a specific task, and a
 // commit subject says nothing about what it contains. Closing authority now
 // lives entirely in CompletionReceipt (donereceipt.go).
+//
+// FAC-213: three weaker "did this merge?" checks each falsely closed or
+// reopened a card in one coordinator session:
+//
+//  1. git log --grep=<ref> matched a commit whose subject ends in a DIFFERENT
+//     ref (the grep searches the full message but only the subject is shown).
+//  2. Comparing the pre-rebase local branch tip against main: GitHub's
+//     rebase-merge rewrites every SHA, so the original tip is never on main.
+//  3. Comparing the stale REMOTE branch against main: it was never
+//     force-pushed after its rebase, so it still shows unmerged content.
+//
+// The only check that held: rebase the local worktree onto origin/main and
+// require the diff to be empty. LandedProof is that check, and it is the
+// single implementation used by board-done, harvest-merge, and coordinator
+// tooling.
 
 // ErrNoEvidence marks an honest refusal: nothing proves this task's accepted
 // candidate is on origin/main.
 var ErrNoEvidence = errors.New("no completion receipt proves this task landed")
+
+// ErrNotLanded is the sound refusal from LandedProof: the worktree still has
+// content not on origin/main after a rebase onto it.
+var ErrNotLanded = errors.New("worktree has content not on origin/main after rebase")
 
 var zeroPadRef = regexp.MustCompile(`^([A-Za-z]+-)0+([0-9])`)
 
@@ -45,40 +64,79 @@ func git(repoDir string, args ...string) (string, error) {
 	return strings.TrimSpace(string(out)), err
 }
 
-// MergeEvidence returns a human-readable HINT that ref's work may be on
-// origin/main, or "" when nothing matches. Order:
-//  1. an explicit evidenceSHA that is an ancestor of origin/main (hard error
-//     if given but NOT an ancestor — a wrong claim must not fall through), or
-//  2. a commit on origin/main naming the ref, with an explicit non-digit
-//     boundary so FAC-18 does not match FAC-180 (git's POSIX ERE has no \b).
+// LandedProof is the single sound "did this merge?" check: it rebases the
+// worktree onto a fresh origin/main and requires the diff to be empty.
 //
-// FAC-132: this is a DISCOVERY HINT, not closing authority. Neither form
-// proves a specific task's accepted candidate landed — an empty commit whose
-// subject names the ticket satisfies (2), and any unrelated ancestor satisfies
-// (1). BoardDone no longer consults it; only CompletionReceipt closes a card.
-// It is still used for post-merge ancestry readback in the harvest pipeline
-// and to surface suspicious historical closures in AuditDone.
-func MergeEvidence(repoDir, ref, evidenceSHA string) (string, error) {
-	// Refresh origin/main; offline is fine, we check against the local ref.
-	_, _ = git(repoDir, "fetch", "-q", "origin", "main")
-	if _, err := git(repoDir, "rev-parse", "--verify", "-q", "origin/main"); err != nil {
-		return "", fmt.Errorf("no origin/main in %s", repoDir)
+// The rebase is what makes this sound across all merge modes:
+//   - Merge-commit: the candidate SHAs survive on main. Rebase detects them as
+//     already-upstream (patch-equivalent) and skips them. HEAD == origin/main,
+//     diff empty.
+//   - Rebase-merge: SHAs are rewritten but patches are identical. Rebase skips
+//     the patch-equivalent commits. HEAD == origin/main, diff empty.
+//   - Squash-merge: one commit replaces the range. The branch's individual
+//     commits replay as empty (their changes are already in the squash
+//     commit's tree). The resulting tree matches origin/main, diff empty.
+//
+// A branch whose work is NOT on main retains its unique commits after rebase,
+// and the diff is non-empty.
+//
+// The rebase is non-destructive in the way a hard-reset is not: commits not
+// already on main are replayed on top of it, never dropped. A branch whose
+// work IS on main ends up at origin/main — the correct state for a completed
+// lane.
+//
+// A fetch failure is a HARD error, not a degradation to a stale
+// remote-tracking ref: a stale ref is defect #3 (the remote branch was never
+// force-pushed after its rebase, so it still showed unmerged content).
+func LandedProof(worktreeDir string) error {
+	if worktreeDir == "" {
+		worktreeDir = "."
 	}
 
-	if evidenceSHA != "" {
-		if _, err := git(repoDir, "merge-base", "--is-ancestor", evidenceSHA, "origin/main"); err != nil {
-			return "", fmt.Errorf("REFUSING: evidence %s is not an ancestor of origin/main", evidenceSHA)
-		}
-		short, _ := git(repoDir, "rev-parse", "--short", evidenceSHA)
-		return fmt.Sprintf("explicit evidence commit %s is an ancestor of origin/main", short), nil
+	// Refresh origin/main. A stale remote-tracking ref is defect #3, so a
+	// fetch failure is a hard error — never silently fall back to the local
+	// ref.
+	if out, err := git(worktreeDir, "fetch", "-q", "origin", "main"); err != nil {
+		return fmt.Errorf("landed-proof: fetch origin/main: %s: %w", out, err)
+	}
+	if _, err := git(worktreeDir, "rev-parse", "--verify", "-q", "origin/main"); err != nil {
+		return fmt.Errorf("landed-proof: no origin/main in %s", worktreeDir)
 	}
 
-	return commitHint(repoDir, ref), nil
+	// Rebase onto origin/main. Git detects patch-equivalent commits and skips
+	// them, so a squash-merged or rebase-merged branch collapses to
+	// origin/main regardless of how GitHub published it.
+	out, err := git(worktreeDir, "rebase", "origin/main")
+	if err != nil {
+		// Abort any in-progress rebase so the worktree is not left
+		// conflicted. The abort is best-effort: a rebase that never started
+		// (dirty tree) has nothing to abort.
+		_, _ = git(worktreeDir, "rebase", "--abort")
+		return fmt.Errorf("landed-proof: rebase onto origin/main failed "+
+			"(work may not be on main, or the tree is dirty, or main advanced with conflicting changes): %s: %w", out, err)
+	}
+
+	// Require empty diff: after rebase, the tree must match origin/main. This
+	// is a TREE comparison, not a SHA or commit-range comparison — it is
+	// immune to SHA rewrites and works for all merge modes.
+	diff, err := git(worktreeDir, "diff", "--stat", "origin/main", "HEAD")
+	if err != nil {
+		return fmt.Errorf("landed-proof: git diff origin/main HEAD: %w", err)
+	}
+	if strings.TrimSpace(diff) != "" {
+		return fmt.Errorf("%w:\n%s", ErrNotLanded, diff)
+	}
+	return nil
 }
 
 // commitHint is the commit-subject match on its own, WITHOUT the fetch, so a
 // caller sweeping many refs pays for one refresh instead of one per ref. The
 // non-digit boundary is explicit because git's POSIX ERE has no \b.
+//
+// FAC-213: this is a DIAGNOSTIC ONLY, used by AuditDone to surface suspicious
+// historical closures. It is not and must never be used as merge authority —
+// it is defect #1 (a grep matched a commit whose subject names a different
+// ref because --grep searches the full message but only the subject is shown).
 func commitHint(repoDir, ref string) string {
 	hit, err := git(repoDir, "log", "origin/main", "--format=%h %s", "-E",
 		"--grep="+ref+`([^0-9]|$)`, "-1")
