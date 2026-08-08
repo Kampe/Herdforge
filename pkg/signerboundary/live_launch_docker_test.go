@@ -74,7 +74,11 @@ func TestLiveLaunch_InContainer(t *testing.T) {
 
 	modRoot, _ := filepath.Abs("../..")
 	herdBin := filepath.Join(root, "herd")
-	build := exec.Command("go", "build", "-o", herdBin, "./cmd/herd")
+	// -buildvcs=false: the repo is bind-mounted into the container, so git sees a
+	// directory owned by another uid and refuses it ("dubious ownership"). Go then
+	// fails the whole build with "error obtaining VCS status: exit status 128".
+	// Stamping VCS metadata into a test binary buys nothing.
+	build := exec.Command("go", "build", "-buildvcs=false", "-o", herdBin, "./cmd/herd")
 	build.Dir = modRoot
 	if out, err := build.CombinedOutput(); err != nil {
 		t.Fatalf("build herd: %v\n%s", err, out)

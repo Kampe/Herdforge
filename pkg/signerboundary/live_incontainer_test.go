@@ -76,7 +76,9 @@ func TestLiveThreeUID_InContainer(t *testing.T) {
 		t.Fatal(err)
 	}
 	herdBin := filepath.Join(root, "herd")
-	build := exec.Command("go", "build", "-o", herdBin, "./cmd/herd")
+	// -buildvcs=false: see live_launch_docker_test.go — the bind-mounted repo is
+	// "dubious ownership" to git inside the container and Go fails the build.
+	build := exec.Command("go", "build", "-buildvcs=false", "-o", herdBin, "./cmd/herd")
 	build.Dir = modRoot
 	if out, err := build.CombinedOutput(); err != nil {
 		t.Fatalf("build herd: %v\n%s", err, out)
@@ -159,7 +161,7 @@ func TestLiveThreeUID_InContainer(t *testing.T) {
 		t.Fatal(err)
 	}
 	clientBin := filepath.Join(root, "client")
-	if out, err := exec.Command("go", "build", "-o", clientBin, clientSrc).CombinedOutput(); err != nil {
+	if out, err := exec.Command("go", "build", "-buildvcs=false", "-o", clientBin, clientSrc).CombinedOutput(); err != nil {
 		t.Fatalf("client build: %v\n%s", err, out)
 	}
 

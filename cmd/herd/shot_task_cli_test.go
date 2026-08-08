@@ -42,7 +42,11 @@ func runShotCLI(t *testing.T, binary, dir string, args ...string) (string, int) 
 	cmd := exec.Command(binary, args...)
 	cmd.Dir = dir
 	// XDG_STATE_HOME keeps any ledger write inside the test's own tree.
-	cmd.Env = append(os.Environ(), "XDG_STATE_HOME="+filepath.Join(dir, "state"))
+	// stubHarnessPATH makes routing deterministic: this test is about which LANE
+	// an argument takes, not about what happens to be installed on the host.
+	cmd.Env = append(os.Environ(),
+		"XDG_STATE_HOME="+filepath.Join(dir, "state"),
+		"PATH="+stubHarnessPATH(t)+string(os.PathListSeparator)+os.Getenv("PATH"))
 	out, err := cmd.CombinedOutput()
 	if err == nil {
 		return string(out), 0
@@ -259,4 +263,23 @@ func decodeEvidence(t *testing.T, out string) shot.Evidence {
 		t.Fatalf("evidence is not valid JSON (%v):\n%s", err, out)
 	}
 	return ev
+}
+
+// stubHarnessPATH returns a directory holding no-op harness executables.
+//
+// The router picks a surface by looking the CLI up on PATH. On a developer box
+// codex/claude/grok are installed so a bounded shot always routes; in CI none
+// are, and this test failed with `no eligible surface left for a "bounded" shot
+// (tried 0)` — it was asserting the host's tooling, not the argument routing it
+// claims to cover. The stubs are never executed: --dry-run stops before launch.
+func stubHarnessPATH(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	for _, name := range []string{"codex", "claude", "grok", "pi"} {
+		p := filepath.Join(dir, name)
+		if err := os.WriteFile(p, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+			t.Fatalf("write stub %s: %v", name, err)
+		}
+	}
+	return dir
 }
