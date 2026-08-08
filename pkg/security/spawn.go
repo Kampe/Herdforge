@@ -272,6 +272,16 @@ func LaunchAgent(sp ProcessSpawner, req AgentSpawnRequest) (*AgentSpawnResult, e
 		profilePath = prof
 		wrapperBin = filepath.Join(pathPrefix, req.Kind)
 		env = prependPATH(env, pathPrefix)
+		// Carries FAC-190's PreparedOS.WrapperResolves guarantee into this
+		// path. Install writing the wrapper is not the same as the agent
+		// executing it: if `req.Kind` resolves anywhere earlier on the
+		// constructed PATH, the real binary runs unsandboxed and every
+		// downstream proof attests a wrapper nothing execs.
+		if err := requireWrapperOnPATH(env, req.Kind, wrapperBin); err != nil {
+			_ = cleanupBroker()
+			_ = req.Policy.RecordFatal(EventPolicyBlock, err.Error(), "WrapperResolves")
+			return nil, err
+		}
 		if envFile == "" {
 			envFile = filepath.Join(req.Grant.CWD, ".herd", "contain", "env.list")
 		}
@@ -594,6 +604,58 @@ func memoryFrom(s EventSink) *MemorySink {
 		}
 	}
 	return &MemorySink{}
+}
+
+// requireWrapperOnPATH proves the contained wrapper is what `name` resolves to
+// for the agent: it must be a regular executable file, and it must be the FIRST
+// executable of that name on the constructed env's PATH. Anything shadowing it
+// means the agent execs the real binary outside the seatbelt.
+func requireWrapperOnPATH(env []string, name, wrapperBin string) error {
+	info, err := os.Lstat(wrapperBin)
+	if err != nil {
+		return fmt.Errorf("%w: containment wrapper %q not installed: %v", ErrUnknownPolicy, wrapperBin, err)
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("%w: containment wrapper %q is not a regular file", ErrUnknownPolicy, wrapperBin)
+	}
+	if info.Mode().Perm()&0o111 == 0 {
+		return fmt.Errorf("%w: containment wrapper %q is not executable", ErrUnknownPolicy, wrapperBin)
+	}
+	pathVal := ""
+	for _, e := range env {
+		if strings.HasPrefix(e, "PATH=") {
+			pathVal = strings.TrimPrefix(e, "PATH=")
+		}
+	}
+	if pathVal == "" {
+		return fmt.Errorf("%w: constructed agent env has no PATH for wrapper %q", ErrUnknownPolicy, name)
+	}
+	base := filepath.Base(name)
+	for _, dir := range filepath.SplitList(pathVal) {
+		if dir == "" {
+			continue
+		}
+		cand := filepath.Join(dir, base)
+		st, serr := os.Stat(cand)
+		if serr != nil || st.IsDir() || st.Mode().Perm()&0o111 == 0 {
+			continue
+		}
+		if sameFile(cand, wrapperBin) {
+			return nil
+		}
+		return fmt.Errorf("%w: %q resolves to %q before the containment wrapper %q (agent would run unsandboxed)",
+			ErrUnknownPolicy, base, cand, wrapperBin)
+	}
+	return fmt.Errorf("%w: containment wrapper %q is not reachable on the agent PATH", ErrUnknownPolicy, wrapperBin)
+}
+
+func sameFile(a, b string) bool {
+	ai, aerr := os.Stat(a)
+	bi, berr := os.Stat(b)
+	if aerr != nil || berr != nil {
+		return false
+	}
+	return os.SameFile(ai, bi)
 }
 
 func prependPATH(env []string, prefix string) []string {

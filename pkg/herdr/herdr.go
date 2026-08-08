@@ -544,12 +544,22 @@ func paneProcessInventorySummary(processes []PaneProcess) string {
 	return "[" + strings.Join(parts, "; ") + "]"
 }
 
-// AgentReadyForToolChildBind is the b81bf2e inventory gate for owner bind.
-// Session is provenance only: grok starts healthy/interactive without
-// agent_session.value. Identity is name+pane (matched by the caller) plus a
-// non-empty TabID. Waiting on session here pins the fleet to claude.
+// AgentReadyForToolChildBind is the caf589a2 inventory gate for owner bind:
+// both a tab and an agent_session.value must be present before the caller
+// leaves the poll loop.
+//
+// b81bf2e once relaxed this to tab-only because no non-claude harness reported
+// a session id. caf589a2 superseded that: Session.Value is now the Pi session
+// FILE PATH that herd itself allocates, and bindToolChildLifecycle feeds it
+// straight into routedProcessCandidates -> verifyPiSessionRoute. An empty path
+// there is ErrPiSessionRouteMismatch (a hard return out of the poll loop), not
+// ErrPiSessionNotReady (a retryable wait). Relaxing this gate converts the
+// normal startup window — pi visible in the pane inventory before
+// agent_session.value lands — into an intermittent launch abort on the fleet's
+// only harness. Session is provenance for identity purposes; it is a
+// precondition for routing.
 func AgentReadyForToolChildBind(a AgentEntry) bool {
-	return strings.TrimSpace(a.TabID) != ""
+	return strings.TrimSpace(a.TabID) != "" && strings.TrimSpace(a.Session.Value) != ""
 }
 
 func bindToolChildLifecycle(paneID, name string, req launch.Request) error {
@@ -590,8 +600,8 @@ func bindToolChildLifecycle(paneID, name string, req launch.Request) error {
 			if a.Kind != req.Decision.Harness {
 				return fmt.Errorf("tool-child owner harness mismatch: got %s want %s", a.Kind, req.Decision.Harness)
 			}
-			// Session id is provenance, not identity (b81bf2e): grok starts
-			// healthy without agent_session.value. Require tab only.
+			// Tab AND session must be present: the session value is the Pi
+			// session path routedProcessCandidates attests below (caf589a2).
 			if !AgentReadyForToolChildBind(a) {
 				lastWaitReason = fmt.Sprintf("agent incomplete kind=%q status=%q tab_present=%t session_present=%t", a.Kind, a.Status, a.TabID != "", a.Session.Value != "")
 			} else {

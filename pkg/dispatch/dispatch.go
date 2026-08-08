@@ -1255,10 +1255,24 @@ func (d *Dispatcher) launch(
 		}
 	}
 
-	// FAC-133 least-privilege path when Control plane is wired: authorize
-	// sandbox, LaunchAgent (scrubbed env + optional OS containment), then
-	// bind MAC control to live AgentSessionID. Without Control, retain main's
-	// FAC-190 confinement + TabCreate+AgentStart path.
+	// Two launch paths, and they are mutually EXCLUSIVE by design — correcting
+	// 373ec213's commit message, which claimed FAC-190 confinement still ran
+	// "alongside" this one. It does not, and it must not: both install a
+	// seatbelt PATH wrapper named after the harness, so running both would put
+	// two rival `pi` wrappers on disk with only one reachable on PATH, and
+	// bindConfinement's BindAndProve receipt would attest a wrapper the agent
+	// never execs. A receipt for a dead wrapper is worse than no receipt.
+	//
+	// Production sets HERD_CONTROL_SECRET, so production takes the Control
+	// path. Each FAC-190 guarantee is carried, not dropped:
+	//   seatbelt profile    -> RequireContainment().Install + ProveDenials,
+	//                          which actively probes denials (FAC-190 did not)
+	//   WrapperResolves     -> security.requireWrapperOnPATH, asserted against
+	//                          the constructed agent env inside LaunchAgent
+	//   MAC-authenticated   -> VerifyAndEnforceControl before Install, then
+	//   re-proof               bindLaunchControlKind (IssueAndEnforce + sealed
+	//                          control + profile reinstall) after start
+	// The FAC-190 else-branch remains for non-Control (non-production) callers.
 	var tabID, paneID string
 	var boundSession string
 	var spawner *launcherSpawner
