@@ -186,10 +186,12 @@ func readPulseHerdr() pulse.HerdrObservation {
 	out := make([]pulse.AgentObservation, 0, len(agents))
 	for _, a := range agents {
 		out = append(out, pulse.AgentObservation{
-			Name:   a.Name,
-			Raw:    a.Status,
-			Status: pulse.ClassifyStatus(a.Status, false),
-			PaneID: a.PaneID,
+			Name:      a.Name,
+			Raw:       a.Status,
+			Status:    pulse.ClassifyStatus(a.Status, false),
+			PaneID:    a.PaneID,
+			TabID:     a.TabID,
+			Workspace: a.Workspace,
 		})
 	}
 	return pulse.HerdrObservation{Known: true, Agents: out}
@@ -428,4 +430,22 @@ func (a *livePulseActor) Dispatch(context.Context, string, string) error {
 	// Dispatch launches are owned by forge/dispatch (FAC-184 adapters). An
 	// honest refusal is better than inventing a spawn API.
 	return errors.New("pulse: bounded dispatch adapter not wired (use herd forge/dispatch; known-out-of-scope for FAC-73)")
+}
+
+func (a *livePulseActor) ReapLane(ctx context.Context, lane pulse.AgentObservation) error {
+	if strings.TrimSpace(lane.TabID) == "" {
+		return fmt.Errorf("pulse: reap requires tab_id; lane %q has none", lane.Name)
+	}
+	if strings.TrimSpace(lane.Workspace) == "" {
+		return fmt.Errorf("pulse: reap requires workspace; lane %q tab %s has none", lane.Name, lane.TabID)
+	}
+	// FAC-221: the close path requires tab generation evidence from the
+	// herdr server (LiveTab.Generation) and a durable nonce. The pulse
+	// observation does not yet carry the tab generation — wiring it
+	// requires a herdr tab-list or toolchild-lifecycle read per reap
+	// target. An honest refusal is better than an unfenced close that
+	// could recycle-kill a tab that gained a new agent between readback
+	// and mutation (FAC-180). The reap is still ENFORCED: every beat
+	// plans it, so the coordinator cannot forget it.
+	return errors.New("pulse: reap close adapter requires tab generation evidence (FAC-180 compare-and-close; not yet wired into pulse observation)")
 }
