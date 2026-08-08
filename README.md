@@ -1,6 +1,6 @@
 # Herdforge
 
-Herdforge is a Go control plane for turning repository work queues into isolated implementation, deterministic verification, independent review, serialized integration, and reconciled board state. It uses Herdr as the agent execution plane and supports pluggable task providers such as Kaneo.
+Herdforge is a Go control plane for turning repository work queues into isolated implementation, deterministic verification, independent review, serialized integration, and reconciled board state. It uses Herdr as the agent execution plane and supports pluggable task providers; Linear is the checked-in adapter and Kaneo, Jira, Azure, GitHub Issues and an in-memory store are compiled but dormant.
 
 [![CI Workflow](https://github.com/Kampe/Herdforge/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Kampe/Herdforge/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
@@ -69,7 +69,7 @@ Spawn-ready prompt contracts are in `.herd/prompts/`. Runtime model selection be
 - Go 1.24 or newer
 - Git
 - Herdr
-- a configured task-provider CLI or API; Kaneo is the primary current adapter
+- a configured task-provider CLI or API; Linear is the checked-in adapter (`task_provider.type: "linear"`)
 
 ## Build and inspect
 
@@ -143,9 +143,15 @@ Unknown provider state, failed delivery, stale review SHA, same-family review, d
 
 The repository-local config lives at `.herd/herd.yaml` and describes the project, task provider, lanes, routing candidates, and verification commands. Paths stored in configuration and generated artifacts must remain repository-relative.
 
-### Private Linear profile
+### Task provider
 
-Leave the checked-in Kaneo config unchanged. Copy the credential-free example into the ignored local profile, set its Linear project ID, and select it at runtime:
+`.herd/herd.yaml` ships with Linear selected. `task_provider.enabled` is an explicit activation
+allowlist (FAC-155): the factory activates `type` only if it is listed there, so the other adapters
+stay dormant and can never be auto-detected, probed, or selected. Changing `type` without moving
+that list fails closed before any board read or mutation.
+
+To run against a different project without touching the checked-in config, copy the
+credential-free example into the ignored local profile and select it at runtime:
 
 ```bash
 cp docs/examples/herd.linear.yaml .herd/herd.yaml.local
