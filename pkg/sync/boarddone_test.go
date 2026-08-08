@@ -141,4 +141,68 @@ func TestBoardDone(t *testing.T) {
 			t.Fatal("unknown ref must error")
 		}
 	})
+
+	// FAC-211: a card created directly (coordinator-authored, CI repair, split
+	// ticket) may have an empty Ref field — `kaneo task create` has no --ref
+	// flag. BoardDone must still close it when the provider's GetTask can
+	// resolve the ref. The fallback through GetTask is what makes a card the
+	// provider knows about closeable with evidence.
+	t.Run("directly-created card is closeable via GetTask fallback", func(t *testing.T) {
+		mp := provider.NewMemoryProvider()
+		// Simulate a directly-created card: the kaneo UUID is the ID, Ref is
+		// empty (kaneo task create does not set it), but GetTask can resolve
+		// by the ref the coordinator assigned post-hoc.
+		mp.AddTask(&provider.Task{
+			ID: "kaneo-uuid-211", Ref: "FAC-211",
+			Title: "fix board-done ref resolution", Status: "in-review", ProjectID: "p1",
+		})
+		// Use a provider wrapper that hides the Ref from ListTasks but exposes
+		// it through GetTask — this is the directly-created-card shape.
+		hidden := &refHiddenProvider{MemoryProvider: mp, hiddenRefs: map[string]bool{"kaneo-uuid-211": true}}
+		_, err := BoardDone(ctx, hidden, DoneRequest{
+			RepoDir: dir, ProjectID: "p1", Ref: "FAC-211",
+			Override: &OverrideRequest{Actor: "kampe", Reason: "directly created", Evidence: "sha-211", Policy: "abandoned-scope"},
+		})
+		if err != nil {
+			t.Fatalf("directly-created card must be closeable via GetTask fallback, got %v", err)
+		}
+		got, _ := mp.GetTask(ctx, "kaneo-uuid-211")
+		if got.Status != "done" {
+			t.Fatalf("card must be done, got %q", got.Status)
+		}
+	})
+
+	t.Run("card invisible to both ListTasks and GetTask is refused", func(t *testing.T) {
+		mp := provider.NewMemoryProvider()
+		mp.AddTask(&provider.Task{ID: "t-1", Ref: "FAC-1", Title: "t", Status: "to-do", ProjectID: "p1"})
+		_, err := BoardDone(ctx, mp, DoneRequest{
+			RepoDir: dir, ProjectID: "p1", Ref: "FAC-999",
+			Override: &OverrideRequest{Actor: "kampe", Reason: "test", Evidence: "n/a", Policy: "abandoned-scope"},
+		})
+		if err == nil || !strings.Contains(err.Error(), "no task with ref") {
+			t.Fatalf("want 'no task with ref' refusal, got %v", err)
+		}
+	})
+}
+
+// refHiddenProvider wraps MemoryProvider and strips the Ref from ListTasks
+// output for specified task IDs, while leaving GetTask untouched. This
+// simulates a directly-created kaneo card whose Ref field is empty in list
+// responses but resolvable through GetTask.
+type refHiddenProvider struct {
+	*provider.MemoryProvider
+	hiddenRefs map[string]bool
+}
+
+func (r *refHiddenProvider) ListTasks(ctx context.Context, projectID, status string) ([]*provider.Task, error) {
+	tasks, err := r.MemoryProvider.ListTasks(ctx, projectID, status)
+	if err != nil {
+		return nil, err
+	}
+	for _, t := range tasks {
+		if r.hiddenRefs[t.ID] {
+			t.Ref = ""
+		}
+	}
+	return tasks, nil
 }
