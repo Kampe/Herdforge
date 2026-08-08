@@ -1,6 +1,7 @@
 package reviewingest
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -174,5 +175,57 @@ func TestConflictingDuplicateKeyIsRefused(t *testing.T) {
 		"reviewer-family: moonshot\nbuilder-family: anthropic\nverdict: PASS\n---\n" + longBody
 	if err := Parse(same).Validate(coordinators, exists); err != nil {
 		t.Fatalf("an identical repeated key is unambiguous: %v", err)
+	}
+}
+
+// FAC-212: a PASS verdict for a candidate whose diff against origin/main is
+// empty is not a completed ticket. PR #151 merged with 0 additions, 0
+// deletions, 0 files because the branch held only its anchor commit; the
+// adversarial reviewer returned PASS because an empty diff has nothing wrong
+// with it.
+func TestPassVerdictWithEmptyDiffIsRefused(t *testing.T) {
+	a := Parse(artifact("review-kimi", "moonshot", "anthropic", "PASS", realSHA, longBody))
+	err := a.ValidatePassDiff(func(sha string) (bool, error) { return true, nil })
+	if err == nil || !strings.Contains(err.Error(), "empty") {
+		t.Fatalf("a PASS for an empty-diff candidate must be refused, got %v", err)
+	}
+}
+
+// A FAIL or BLOCKED verdict for an empty diff is correct — the reviewer is
+// refusing, not approving. ValidatePassDiff must not interfere.
+func TestNonPassVerdictWithEmptyDiffIsNotRefused(t *testing.T) {
+	for _, v := range []string{"FAIL", "BLOCKED"} {
+		a := Parse(artifact("review-kimi", "moonshot", "anthropic", v, realSHA, longBody))
+		if err := a.ValidatePassDiff(func(sha string) (bool, error) { return true, nil }); err != nil {
+			t.Fatalf("a %s for an empty-diff candidate must not be refused by ValidatePassDiff: %v", v, err)
+		}
+	}
+}
+
+// A PASS for a candidate WITH a diff is the normal case and must be accepted.
+func TestPassVerdictWithNonEmptyDiffIsAccepted(t *testing.T) {
+	a := Parse(artifact("review-kimi", "moonshot", "anthropic", "PASS", realSHA, longBody))
+	if err := a.ValidatePassDiff(func(sha string) (bool, error) { return false, nil }); err != nil {
+		t.Fatalf("a PASS for a non-empty-diff candidate must be accepted: %v", err)
+	}
+}
+
+// A git failure (e.g. origin/main not fetched) must fail closed, not read as
+// "empty" or "non-empty". A gate that passes because its probe failed is the
+// exact fail-open shape this check exists to prevent.
+func TestPassVerdictDiffProbeFailureFailsClosed(t *testing.T) {
+	a := Parse(artifact("review-kimi", "moonshot", "anthropic", "PASS", realSHA, longBody))
+	err := a.ValidatePassDiff(func(sha string) (bool, error) { return false, fmt.Errorf("no such ref") })
+	if err == nil || !strings.Contains(err.Error(), "cannot verify") {
+		t.Fatalf("a diff probe failure must fail closed, got %v", err)
+	}
+}
+
+// A nil callback skips the check — used by fixtures that don't exercise this
+// path, so existing callers and tests are not broken.
+func TestPassVerdictNilCallbackSkipsCheck(t *testing.T) {
+	a := Parse(artifact("review-kimi", "moonshot", "anthropic", "PASS", realSHA, longBody))
+	if err := a.ValidatePassDiff(nil); err != nil {
+		t.Fatalf("a nil callback must skip the check: %v", err)
 	}
 }
