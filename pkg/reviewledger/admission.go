@@ -29,6 +29,12 @@ type AdmissionResult struct {
 	Tier           string
 	Lease          string
 	PatchURL       string
+	// VerificationDigest is the admitted verdict's own test-gate digest.
+	// Admit already refuses a verdict that lacks one; surfacing it here lets
+	// the completion receipt bind to the digest that was actually admitted
+	// rather than one the caller re-reads (and could re-read from a
+	// different, later verdict row).
+	VerificationDigest string
 }
 
 // admissionRejected is the sentinel error Admit returns alongside a non-nil,
@@ -219,14 +225,15 @@ func (l *Ledger) Admit(opts AdmissionOpts) (*AdmissionResult, error) {
 		}
 
 		return &AdmissionResult{
-			Admitted:       true,
-			Reason:         "validated independent verdict for exact candidate",
-			SHA:            sha,
-			Reviewer:       reviewer,
-			ReviewerFamily: reviewerFamily,
-			Tier:           tier,
-			Lease:          verdict.Lease,
-			PatchURL:       verdict.PatchURL,
+			Admitted:           true,
+			Reason:             "validated independent verdict for exact candidate",
+			SHA:                sha,
+			Reviewer:           reviewer,
+			ReviewerFamily:     reviewerFamily,
+			Tier:               tier,
+			Lease:              verdict.Lease,
+			PatchURL:           verdict.PatchURL,
+			VerificationDigest: verdict.VerificationDigest,
 		}, nil
 	}
 
