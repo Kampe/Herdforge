@@ -28,22 +28,22 @@ import (
 const hermeticContainerEnv = "HERD_HERMETIC_CONTAINER"
 
 const (
-	hermeticContainerUser         = "65532:65532"
-	hermeticPIDLimit              = 64
-	hermeticMemoryLimit           = "512m"
-	hermeticMemoryBytes           = 512 << 20
-	hermeticVerifierTimeout       = 10 * time.Minute
-	hermeticSetupTeardownMargin   = 5 * time.Minute
-	hermeticTimeout               = hermeticVerifierTimeout + hermeticSetupTeardownMargin
-	hermeticSourcePath            = "/tmp/build/source"
-	hermeticBuildPath             = "/tmp/build"
-	hermeticRunPath               = "/tmp/run"
-	hermeticReplayPath            = "/tmp/replay"
-	hermeticReceiptPath           = "/tmp/replay/receipt.json"
+	hermeticContainerUser       = "65532:65532"
+	hermeticPIDLimit            = 64
+	hermeticMemoryLimit         = "512m"
+	hermeticMemoryBytes         = 512 << 20
+	hermeticVerifierTimeout     = 10 * time.Minute
+	hermeticSetupTeardownMargin = 5 * time.Minute
+	hermeticTimeout             = hermeticVerifierTimeout + hermeticSetupTeardownMargin
+	hermeticSourcePath          = "/tmp/build/source"
+	hermeticBuildPath           = "/tmp/build"
+	hermeticRunPath             = "/tmp/run"
+	hermeticReplayPath          = "/tmp/replay"
+	hermeticReceiptPath         = "/tmp/replay/receipt.json"
 	// Compiler scratch can live on noexec /tmp/build (object files only).
 	// Fixture TMPDIR must be exec-capable (/tmp/run) so shell scripts start.
-	hermeticGoCompileTmpDir = hermeticBuildPath + "/gotmp"
-	hermeticGoFixtureTmpDir = hermeticRunPath + "/gotmp"
+	hermeticGoCompileTmpDir       = hermeticBuildPath + "/gotmp"
+	hermeticGoFixtureTmpDir       = hermeticRunPath + "/gotmp"
 	hermeticTestCount             = "1"
 	hermeticTestTimeout           = "10m"
 	maxHermeticSourceArchiveBytes = 64 << 20
@@ -709,7 +709,13 @@ func (d fixedDockerCLI) InspectImage(ctx context.Context) error {
 	if pin.Image == "" || pin.Platform == "" || pin.Architecture == "" {
 		return errors.New("FAC-151 hermetic image pin is unavailable")
 	}
-	result, err := d.run(ctx, nil, []string{"image", "inspect", "--platform", pin.Platform, pin.Image})
+	// No --platform here: `docker image inspect` only accepts it from Docker 28,
+	// and CI runs an older daemon that exits 125 with "unknown flag", failing the
+	// whole hermetic job. Dropping it weakens nothing — the platform is enforced
+	// below against the inspect OUTPUT (Architecture must equal the pin, OS must
+	// be linux), and `pull` still passes --platform, so the locally-stored image
+	// this inspects is the one the pin selected.
+	result, err := d.run(ctx, nil, []string{"image", "inspect", pin.Image})
 	if err != nil {
 		if isDockerImageAbsent(err, pin.Image) {
 			return &dockerImageAbsentError{Reference: pin.Image, Cause: err}
@@ -862,10 +868,10 @@ func runDockerWithProcess(ctx context.Context, input []byte, args []string, proc
 	result, err := process(ctx, input, args)
 	if err != nil {
 		msg := string(result.Stderr)
-	if strings.TrimSpace(msg) == "" {
-		msg = string(result.Stdout)
-	}
-	return result, &dockerCommandError{Operation: dockerOperation(args), ExitCode: result.ExitCode, Stderr: msg, Cause: err}
+		if strings.TrimSpace(msg) == "" {
+			msg = string(result.Stdout)
+		}
+		return result, &dockerCommandError{Operation: dockerOperation(args), ExitCode: result.ExitCode, Stderr: msg, Cause: err}
 	}
 	return result, nil
 }
