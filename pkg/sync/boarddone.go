@@ -192,19 +192,16 @@ func BoardDone(ctx context.Context, tp provider.TaskProvider, req DoneRequest) (
 		}
 	}
 
-	tasks, err := tp.ListTasks(ctx, req.ProjectID, "")
+	// Resolve the ref against the task provider. ListTasks + ref match is the
+	// primary path, but a card created directly (coordinator-authored tickets,
+	// CI repairs, split tickets) may carry an empty Ref field — the kaneo CLI's
+	// `task create` has no --ref flag. GetTask(ref) is a second resolution path
+	// through the same provider: the MemoryProvider resolves by ref, and the
+	// KaneoProvider's decodeKaneoTaskBody matches dto.Ref == wantID. A card the
+	// provider knows about must be closeable with evidence (FAC-211).
+	task, err := resolveTaskByRef(ctx, tp, req.ProjectID, ref)
 	if err != nil {
-		return nil, boardCallErr("list tasks", err)
-	}
-	var task *provider.Task
-	for _, t := range tasks {
-		if strings.EqualFold(NormalizeRef(t.Ref), ref) {
-			task = t
-			break
-		}
-	}
-	if task == nil {
-		return nil, fmt.Errorf("no task with ref %s on the board", ref)
+		return nil, err
 	}
 	// Task binding: the receipt names the provider task it was minted for. A
 	// ref match alone is not enough — refs are re-minted across board
@@ -268,6 +265,28 @@ func shortDigest(s string) string {
 		return s[:16]
 	}
 	return s
+}
+
+// resolveTaskByRef finds the board card for ref through the task provider.
+// It tries ListTasks + Ref field match first, then falls back to GetTask(ref)
+// so a card the provider knows about but whose Ref field is empty (a
+// directly-created card) is still closeable (FAC-211).
+func resolveTaskByRef(ctx context.Context, tp provider.TaskProvider, projectID, ref string) (*provider.Task, error) {
+	tasks, err := tp.ListTasks(ctx, projectID, "")
+	if err != nil {
+		return nil, boardCallErr("list tasks", err)
+	}
+	for _, t := range tasks {
+		if strings.EqualFold(NormalizeRef(t.Ref), ref) {
+			return t, nil
+		}
+	}
+	// Fallback: a directly-created card may have an empty Ref field. GetTask
+	// resolves through the provider's own lookup, which may match by ref or id.
+	if t, err := tp.GetTask(ctx, ref); err == nil && t != nil {
+		return t, nil
+	}
+	return nil, fmt.Errorf("no task with ref %s on the board", ref)
 }
 
 // boardCallErr projects provider timeout/ambiguous as BLOCKED(provider_timeout).
