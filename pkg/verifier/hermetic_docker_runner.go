@@ -20,6 +20,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/Kampe/Herdforge/pkg/containerlifecycle"
 )
 
 // hermeticContainerEnv is set by the FAC-151 Docker runner so ownership
@@ -102,6 +104,7 @@ type hermeticDockerRunner struct {
 	hostCache        func() (verifiedGoCache, error)
 	archive          func(context.Context, string, string) ([]byte, string, error)
 	operationTimeout time.Duration
+	storePath        string
 }
 
 type dockerResult struct {
@@ -218,6 +221,7 @@ func newFAC151DockerRunner(sourceRoot, candidateSHA string) (*hermeticDockerRunn
 		sourceRoot: sourceRoot, candidateSHA: candidateSHA, policy: policy,
 		docker:    fixedDockerCLI{command: runDocker, pin: policy.pin},
 		allowlist: verifyFAC151Allowlist, hostCache: verifiedHostGoCache, archive: archiveCandidateSource,
+		storePath: filepath.Join(sourceRoot, ".herd", "container-lifecycle.db"),
 	}, nil
 }
 
@@ -266,30 +270,59 @@ func (r *hermeticDockerRunner) Run(ctx context.Context) (result FAC151DockerResu
 		return result, fmt.Errorf("generate independent receipt nonce: %w", err)
 	}
 	nonce := hex.EncodeToString(nonceBytes)
+	store, err := containerlifecycle.NewStore(r.storePath)
+	if err != nil {
+		return result, fmt.Errorf("open container lifecycle store: %w", err)
+	}
+	defer store.Close()
 	containerID, err := r.docker.Create(operationCtx)
 	if err != nil {
 		return result, err
 	}
 	result.ContainerID = containerID
-	removed := false
+	if _, err := store.Register(containerlifecycle.Receipt{
+		ContainerID:  containerID,
+		TaskRef:      "FAC-198/FAC-151",
+		Generation:   nonce,
+		ImageDigest:  r.policy.configDigest(),
+		CleanupOwner: "hermetic-docker-runner",
+	}); err != nil {
+		teardownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		_ = r.docker.Remove(teardownCtx, containerID)
+		cancel()
+		return result, fmt.Errorf("register container lifecycle receipt: %w", err)
+	}
 	defer func() {
 		teardownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		removeErr := r.docker.Remove(teardownCtx, containerID)
-		_, inspectErr := r.docker.Inspect(teardownCtx, containerID)
-		removed = isDockerContainerAbsent(inspectErr, containerID)
-		var teardownErr error
-		if removeErr != nil {
-			teardownErr = errors.Join(teardownErr, removeErr)
+		expectedTerminalState := "failed"
+		if err == nil {
+			expectedTerminalState = "success"
 		}
-		if inspectErr != nil && !isDockerContainerAbsent(inspectErr, containerID) {
-			teardownErr = errors.Join(teardownErr, inspectErr)
-		} else if inspectErr == nil {
-			teardownErr = errors.Join(teardownErr, errors.New("container still inspectable after teardown"))
+		var capturedRemoveErr error
+		remover := func(ctx context.Context, id string) error {
+			capturedRemoveErr = r.docker.Remove(ctx, id)
+			return capturedRemoveErr
 		}
-		result.Removed = removed
-		if teardownErr != nil {
-			err = errors.Join(err, teardownErr)
+		absent := func(ctx context.Context, id string) (bool, error) {
+			_, inspectErr := r.docker.Inspect(ctx, id)
+			if isDockerContainerAbsent(inspectErr, id) {
+				return true, nil
+			}
+			if inspectErr != nil {
+				return false, inspectErr
+			}
+			return false, nil
+		}
+		cleanupErr := containerlifecycle.EnsureCleanup(teardownCtx, store, containerID, expectedTerminalState, remover, absent)
+		if cleanupErr != nil {
+			err = errors.Join(err, cleanupErr)
+		}
+		if capturedRemoveErr != nil {
+			err = errors.Join(err, capturedRemoveErr)
+		}
+		if receipt, getErr := store.Get(containerID); getErr == nil && receipt != nil {
+			result.Removed = receipt.State == containerlifecycle.StateRemoved && receipt.AbsenceProved
 		}
 	}()
 	archive := r.archive
@@ -313,6 +346,9 @@ func (r *hermeticDockerRunner) Run(ctx context.Context) (result FAC151DockerResu
 	}
 	if err := r.docker.Start(operationCtx, containerID); err != nil {
 		return result, fmt.Errorf("start fixed build profile: %w", err)
+	}
+	if err := store.MarkStarted(containerID); err != nil {
+		return result, fmt.Errorf("mark container started in lifecycle store: %w", err)
 	}
 	inspected, err = r.docker.Inspect(operationCtx, containerID)
 	if err != nil {
