@@ -1138,9 +1138,9 @@ func TestFAC198PinnedImageCLIArgumentsAndIdentity(t *testing.T) {
 		t.Fatalf("ensureHermeticDockerImage: %v", err)
 	}
 	want := [][]string{
-		{"image", "inspect", "--platform", hermeticDockerPlatform, hermeticDockerImage},
+		{"image", "inspect", hermeticDockerImage},
 		{"pull", "--platform", hermeticDockerPlatform, hermeticDockerImage},
-		{"image", "inspect", "--platform", hermeticDockerPlatform, hermeticDockerImage},
+		{"image", "inspect", hermeticDockerImage},
 	}
 	if !reflect.DeepEqual(calls, want) {
 		t.Fatalf("Docker calls = %#v, want %#v", calls, want)
@@ -1166,7 +1166,7 @@ func TestFAC198PinnedImageIDRepresentations(t *testing.T) {
 				t.Fatal(err)
 			}
 			cli := fixedDockerCLI{command: func(_ context.Context, _ []byte, args []string) (dockerResult, error) {
-				if !reflect.DeepEqual(args, []string{"image", "inspect", "--platform", hermeticDockerPlatform, hermeticDockerImage}) {
+				if !reflect.DeepEqual(args, []string{"image", "inspect", hermeticDockerImage}) {
 					return dockerResult{}, errors.New("unexpected image inspect argv")
 				}
 				return dockerResult{Output: output}, nil
