@@ -1299,24 +1299,12 @@ func TestReviewCLI_IsolatedDetachedReviewWorktree(t *testing.T) {
 	fakeBin, fakeCalls := installProtocolFakeHerdr(t)
 	fakeLog := os.Getenv("HERD_FAKE_LOG")
 	// The --spawn path checks exec.LookPath for the lane's harness binary
-	// (pi) before creating the isolated checkout. Stub it so the checkout
-	// is created and the spawn exits at the herdr/launcher check instead.
+	// (pi) before creating the isolated checkout, and the write-capable tool
+	// probe (pkg/toolprobe) shells `pi` with a sentinel-file prompt. The
+	// stub must be probe-faithful (create PROBE_OK.txt) so the probe passes.
 	stubDir := stubHarnessPATH(t)
-	// Verify the stub binary exists and is executable
-	piPath := filepath.Join(stubDir, "pi")
-	if _, err := os.Stat(piPath); err != nil {
-		t.Fatalf("stub pi binary missing at %s: %v", piPath, err)
-	}
 	cmd := herdCmdWithFake(binary, dir, keyDir, fakeBin, fakeLog, "review", "--spawn", "FAC-1")
 	prependToPath(cmd, stubDir)
-	// Debug: verify the herd binary itself can see pi via PATH
-	dbgCmd2 := exec.Command(binary, "sh", "-c", "echo PATH=$PATH; which pi || echo NOT_FOUND")
-	dbgCmd2.Env = cmd.Env
-	dbgCmd2.Dir = dir
-	dbgOut2, _ := dbgCmd2.CombinedOutput()
-	t.Logf("DEBUG herd sh subprocess: %s", dbgOut2)
-	// Flags must precede the positional: Go's flag package stops at the
-	// first non-flag token.
 	out, _ := cmd.CombinedOutput()
 	reviewDir := filepath.Join(dir, ".herd", "reviews", "fac-1-"+candidate[:12])
 	if fi, err := os.Stat(reviewDir); err != nil || !fi.IsDir() {
