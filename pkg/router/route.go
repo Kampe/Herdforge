@@ -492,6 +492,19 @@ func HeadlessArgvFor(provider, model, effort, promptPath string) (argv []string,
 	return nil, DeliverByStdin
 }
 
+// HeadlessProviders is the canonical set of surfaces that have a
+// HeadlessArgvFor contract — i.e. the providers a headless one-shot can use at
+// all. It is the single source shot capability derives from, so a surface the
+// router can route and launch headlessly (kimi) cannot be silently absent from
+// a second, hand-maintained list the way it was before FAC-224.
+//
+// Keep this in lockstep with the switch above: every entry MUST yield a
+// non-nil argv from HeadlessArgvFor, and every provider case in that switch
+// MUST appear here. TestHeadlessProvidersMatchArgvContract enforces both.
+func HeadlessProviders() []string {
+	return []string{"agy", "claude", "codex", "grok", "kimi", "lazer", "ollama", "opencode"}
+}
+
 // PromptDelivery is how a headless surface accepts its prompt. Getting this
 // wrong is silent: agy ignores stdin entirely and answers as though it were
 // asked nothing at all, which reads as a model failure rather than a wiring bug.

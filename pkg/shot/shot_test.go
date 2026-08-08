@@ -1,8 +1,11 @@
 package shot
 
 import (
+	"sort"
 	"strings"
 	"testing"
+
+	"github.com/Kampe/Herdforge/pkg/router"
 )
 
 // codex exec is sandboxed with networking off, so a research shot routed there
@@ -93,5 +96,44 @@ func TestEligibleIsDeterministic(t *testing.T) {
 		if got := strings.Join(r.Eligible(), ","); got != first {
 			t.Fatalf("eligible set must be stable: %q vs %q", got, first)
 		}
+	}
+}
+
+// TestShotProvidersDeriveFromRouter is the FAC-224 fix: shot capability comes
+// from the router's headless surface catalog, not a second hardcoded list. If
+// this fails, someone re-hardcoded ShotProviders and reintroduced the drift
+// that let the router recommend kimi while shot rejected it.
+func TestShotProvidersDeriveFromRouter(t *testing.T) {
+	want := append([]string(nil), router.HeadlessProviders()...)
+	sort.Strings(want)
+	got := append([]string(nil), ShotProviders...)
+	sort.Strings(got)
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("ShotProviders drifted from router.HeadlessProviders:\n got %v\n want %v", got, want)
+	}
+}
+
+// TestKimiIsShotCapableForNonNetworkShapes is the concrete FAC-224 repro: the
+// router ranks kimi first for adversarial under quota pressure, so shot must
+// accept it. Before the fix, --provider kimi died at ValidatePin with "is not
+// a shot-capable surface", and three reviews relaunched before anyone noticed.
+func TestKimiIsShotCapableForNonNetworkShapes(t *testing.T) {
+	if !contains(ShotProviders, "kimi") {
+		t.Fatal("kimi must be a shot provider (FAC-224)")
+	}
+	// adversarial is NOT a network shape, so the only gate that rejected kimi
+	// was the base ShotProviders list.
+	r := Request{Shape: "adversarial", Provider: "kimi"}
+	if err := r.ValidatePin(); err != nil {
+		t.Fatalf("kimi must validate for an adversarial shot: %v", err)
+	}
+	if !contains(r.Eligible(), "kimi") {
+		t.Fatal("kimi must be eligible for an adversarial shot")
+	}
+	// The router's own recommendation must be executable end to end: kimi has a
+	// headless argv contract, so execShot would not die on "no headless argv".
+	argv, _ := router.HeadlessArgvFor("kimi", router.ModelFor("kimi", "adversarial"), router.EffortFor("adversarial"), "p.md")
+	if len(argv) == 0 {
+		t.Fatal("kimi must have a headless argv for the router's pick to be executable")
 	}
 }

@@ -16,6 +16,8 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+
+	"github.com/Kampe/Herdforge/pkg/router"
 )
 
 // DefaultShape is the cheap read-only lane.
@@ -26,8 +28,13 @@ const DefaultShape = "bounded"
 // a zero exit code.
 const MinReportChars = 200
 
-// ShotProviders are the surfaces a headless shot can use at all.
-var ShotProviders = []string{"claude", "agy", "codex", "ollama", "opencode", "grok", "lazer"}
+// ShotProviders are the surfaces a headless shot can use at all. Derived from
+// the router's headless surface catalog (router.HeadlessProviders) so the two
+// lists can never disagree: a surface the router can route and launch
+// headlessly is shot-capable, full stop. Before FAC-224 this was a second
+// hardcoded list that silently omitted kimi, so under quota pressure the
+// router's own recommendation could not be executed.
+var ShotProviders = router.HeadlessProviders()
 
 // SchemaProviders support constrained structured output.
 var SchemaProviders = []string{"codex", "grok"}
