@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -60,8 +61,10 @@ func registrationPath(root string) string {
 // half-parsed identity behind. The parent directory is created if missing.
 // Overwriting a prior registration is intentional: a new loop instance
 // supersedes a stale one.
-func Register(root, workspace string) (*Registration, error) {
-	name := CoordinatorName
+func Register(root, name, workspace string) (*Registration, error) {
+	if strings.TrimSpace(name) == "" {
+		name = CoordinatorName
+	}
 	reg := &Registration{
 		Name:      name,
 		Workspace: workspace,

@@ -9,7 +9,7 @@ import (
 
 func TestRegisterWritesDurableIdentity(t *testing.T) {
 	dir := t.TempDir()
-	reg, err := Register(dir, "wK")
+	reg, err := Register(dir, "", "wK")
 	if err != nil {
 		t.Fatalf("Register: %v", err)
 	}
@@ -34,7 +34,7 @@ func TestRegisterWritesDurableIdentity(t *testing.T) {
 
 func TestResolveReadsBackRegistration(t *testing.T) {
 	dir := t.TempDir()
-	if _, err := Register(dir, "wF"); err != nil {
+	if _, err := Register(dir, "", "wF"); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 	reg, err := Resolve(dir)
@@ -79,12 +79,12 @@ func TestResolveCorruptFileIsError(t *testing.T) {
 
 func TestRegisterOverwritesStaleRecord(t *testing.T) {
 	dir := t.TempDir()
-	first, err := Register(dir, "wK")
+	first, err := Register(dir, "", "wK")
 	if err != nil {
 		t.Fatalf("first Register: %v", err)
 	}
 	time.Sleep(time.Millisecond)
-	second, err := Register(dir, "wK")
+	second, err := Register(dir, "", "wK")
 	if err != nil {
 		t.Fatalf("second Register: %v", err)
 	}
@@ -110,10 +110,29 @@ func TestRegisterEmptyRootUsesCwd(t *testing.T) {
 	if err := os.Chdir(dir); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := Register("", "wK"); err != nil {
+	if _, err := Register("", "", "wK"); err != nil {
 		t.Fatalf("Register with empty root: %v", err)
 	}
 	if _, err := os.Stat(RegistrationFile); err != nil {
 		t.Fatalf("registration file not written in cwd: %v", err)
+	}
+}
+
+func TestRegisterCustomNameFlowsThroughResolve(t *testing.T) {
+	dir := t.TempDir()
+	custom := "forge-coordinator"
+	reg, err := Register(dir, custom, "wK")
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	if reg.Name != custom {
+		t.Fatalf("Register name = %q, want %q", reg.Name, custom)
+	}
+	resolved, err := Resolve(dir)
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if resolved.Name != custom {
+		t.Fatalf("Resolve name = %q, want %q", resolved.Name, custom)
 	}
 }

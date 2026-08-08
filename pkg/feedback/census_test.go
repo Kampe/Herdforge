@@ -382,3 +382,24 @@ func TestRunDurableSendFailureIsFatal(t *testing.T) {
 		t.Fatalf("a fatal durable-send failure must not persist a false census, err=%v", err)
 	}
 }
+
+func TestCensusTickInterval(t *testing.T) {
+	cases := []struct {
+		tickSec int
+		want    int
+	}{
+		{15, 120},  // 30 min / 15 s = 120 ticks (default forge loop)
+		{30, 60},   // 30 min / 30 s = 60 ticks
+		{60, 30},   // 30 min / 60 s = 30 ticks
+		{1800, 1},  // tick == census interval → every tick
+		{3600, 1},  // tick > census interval → clamp to 1
+		{0, 1},     // non-positive → clamp to 1
+		{-5, 1},    // negative → clamp to 1
+	}
+	for _, c := range cases {
+		got := CensusTickInterval(c.tickSec)
+		if got != c.want {
+			t.Fatalf("CensusTickInterval(%d) = %d, want %d", c.tickSec, got, c.want)
+		}
+	}
+}
