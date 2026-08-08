@@ -1466,3 +1466,115 @@ func TestRunReviewGate_CandidateNotOnCurrentIntegrationTreeRefuses(t *testing.T)
 		t.Fatalf("control: candidate on HEAD with valid receipt must admit, got %+v", onTree)
 	}
 }
+
+// TestIntegrationReadbackPatchNotSubject proves the post-merge readback uses
+// PATCH EQUIVALENCE (git cherry), not a commit-subject log grep. A commit
+// whose subject names the WRONG ticket ref (FAC-155) must still pass
+// readback for the CORRECT ref (FAC-100, derived from the branch name),
+// because the content is what matters, not the prose.
+func TestIntegrationReadbackPatchNotSubject(t *testing.T) {
+	ctx := context.Background()
+	root, _ := setupRepoWithRemote(t)
+
+	wt := createWorktree(t, root, "task/FAC-100-subject")
+	writeFileHarvest(t, wt, "feat.go", "package feat")
+	sha := addAndCommitHarvest(t, wt, "feat: rework for FAC-155 (not the branch ref)", "feat.go")
+
+	l := setupLedger(t, root)
+	recordPass(t, l, sha, "FAC-100")
+
+	fd := &recordingDispatcher{}
+	h := NewHarvester(root)
+	in := NewIntegration(h, nil, fd, l, root, withAdmit("FAC-100"))
+	res, err := in.Run(ctx)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	if len(res.MergedSHAs) != 1 {
+		t.Fatalf("expected 1 merged SHA, got %d (errors: %v)", len(res.MergedSHAs), res.Errors)
+	}
+	if len(fd.calls) != 1 {
+		t.Fatalf("expected 1 board-complete call, got %d (errors: %v)", len(fd.calls), res.Errors)
+	}
+	if fd.calls[0].Ref != "FAC-100" {
+		t.Errorf("expected board-complete for FAC-100 (from branch), got %s", fd.calls[0].Ref)
+	}
+}
+
+// TestIntegrationReadbackSurvivesRebaseRewrite proves the post-merge readback
+// and remote-head check both use PATCH EQUIVALENCE, not SHA equality. When
+// origin/main carries the same content under a DIFFERENT SHA (as GitHub's
+// rebase-merge does), the checks must still pass.
+func TestIntegrationReadbackSurvivesRebaseRewrite(t *testing.T) {
+	ctx := context.Background()
+	root, _ := setupRepoWithRemote(t)
+
+	wt := createWorktree(t, root, "task/FAC-200-rebase")
+	writeFileHarvest(t, wt, "feat.go", "package rebasetest")
+	sha := addAndCommitHarvest(t, wt, "feat: FAC-200 rebase survival", "feat.go")
+
+	l := setupLedger(t, root)
+	recordPass(t, l, sha, "FAC-200")
+
+	fd := &recordingDispatcher{}
+	h := NewHarvester(root)
+	in := NewIntegration(h, nil, fd, l, root, withAdmit("FAC-200"))
+	res, err := in.Run(ctx)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	if len(res.MergedSHAs) != 1 {
+		t.Fatalf("expected 1 merged SHA, got %d (errors: %v)", len(res.MergedSHAs), res.Errors)
+	}
+	localMergeSHA := res.MergedSHAs[0].MergeSHA
+
+	// Simulate GitHub rebase-merge: rewrite the commit on origin/main under
+	// a new SHA with identical content but a different committer date.
+	gitInHarvest(t, root, "fetch", "-q", "origin", "main")
+	gitInHarvest(t, root, "checkout", "-q", "origin/main")
+	gitInHarvest(t, root, "reset", "--hard", "origin/main")
+	parent := gitInHarvest(t, root, "rev-parse", "HEAD~1")
+	gitInHarvest(t, root, "checkout", "-q", parent)
+	tree := gitInHarvest(t, root, "rev-parse", localMergeSHA+"^{tree}")
+	gitInHarvest(t, root, "read-tree", tree)
+	env := append(os.Environ(), "GIT_COMMITTER_DATE=2026-01-01T00:00:01")
+	cmd := testgit.Command(root, "commit-tree", tree, "-p", parent, "-m", "feat: FAC-200 rebased by GitHub")
+	cmd.Env = env
+	rewritten, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("commit-tree: %v\n%s", err, rewritten)
+	}
+	rewrittenSHA := strings.TrimSpace(string(rewritten))
+	gitInHarvest(t, root, "branch", "-f", "main", rewrittenSHA)
+	gitInHarvest(t, root, "push", "-q", "-f", "origin", "main")
+	gitInHarvest(t, root, "checkout", "-q", "main")
+
+	// The localMergeSHA is NOT on origin/main anymore (different SHA), but
+	// its patch IS. ContentMerged must report true.
+	merged, err := ContentMerged(ctx, root, "origin/main", localMergeSHA)
+	if err != nil {
+		t.Fatalf("ContentMerged: %v", err)
+	}
+	if !merged {
+		t.Fatalf("ContentMerged should report true for patch-equivalent commit with different SHA")
+	}
+
+	// ensureRemoteReplayHead must also pass for the local replay head,
+	// even though origin/main now has a different SHA.
+	if err := ensureRemoteReplayHead(ctx, root, localMergeSHA); err != nil {
+		t.Errorf("ensureRemoteReplayHead should pass for patch-equivalent content: %v", err)
+	}
+
+	// Negative control: a commit that is NOT on origin/main and NOT
+	// patch-equivalent must fail.
+	writeFileHarvest(t, root, "other.go", "package other")
+	offMain := addAndCommitHarvest(t, root, "off-main commit", "other.go")
+	if merged, _ := ContentMerged(ctx, root, "origin/main", offMain); merged {
+		t.Fatal("ContentMerged should report false for a commit not on origin/main")
+	}
+	if err := ensureRemoteReplayHead(ctx, root, offMain); err == nil {
+		t.Fatal("ensureRemoteReplayHead should fail for a commit not on origin/main")
+	}
+}

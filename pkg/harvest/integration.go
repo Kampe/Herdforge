@@ -585,12 +585,12 @@ func ensureRemoteReplayHead(ctx context.Context, repo, want string) error {
 	if err := runGit(ctx, repo, "fetch", "-q", "origin", "main"); err != nil {
 		return fmt.Errorf("remote readback fetch: %w", err)
 	}
-	head, err := gitOutput(ctx, repo, "rev-parse", "origin/main")
+	merged, err := ContentMerged(ctx, repo, "origin/main", want)
 	if err != nil {
-		return fmt.Errorf("remote readback head: %w", err)
+		return fmt.Errorf("remote readback: %w", err)
 	}
-	if strings.TrimSpace(head) != strings.TrimSpace(want) {
-		return fmt.Errorf("remote readback head mismatch: got=%s want=%s", strings.TrimSpace(head), strings.TrimSpace(want))
+	if !merged {
+		return fmt.Errorf("remote readback: replay head %s is not patch-equivalent on origin/main", want)
 	}
 	return nil
 }
