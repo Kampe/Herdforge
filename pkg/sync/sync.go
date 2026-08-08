@@ -17,6 +17,7 @@ type bsyncFacts struct {
 	localRefs    string // lowercased ahead-of-main subject+body text
 	workInFlight bool
 	mergedLog    string // lowercased "ct<TAB>subject" entries
+	lanes        string // lowercased normalized refs from live lanes, newline joined
 }
 
 // BoardDrift is the aggregated result of reconciling a board against git
@@ -38,15 +39,48 @@ type BoardFinding struct {
 	Action  string
 }
 
+// LaneRef is a live lane observed by board-sync. Name is the agent/tab label
+// (e.g. "task-fac-225"); Ref is the extracted ticket ref (e.g. "fac-225",
+// lowercased because agent names are lowercased). Board-sync treats a
+// matching live lane as "active" — the same as a matching git branch —
+// so a lane created outside dispatch (herdr tab create + herdr agent
+// start) is still detected as in-progress work.
+type LaneRef struct {
+	Name string
+	Ref  string
+}
+
+// LaneSource lists live lanes for board reconciliation. When non-nil,
+// board-sync reconciles against live agents as well as git, so a lane
+// with no matching in-progress card is reported as BOARD_LAG drift
+// instead of silence. Errors degrade to "no lanes" (same as git failures).
+type LaneSource interface {
+	ListLanes() ([]LaneRef, error)
+}
+
 type BoardSyncer struct {
 	Provider provider.TaskProvider
+	Lanes    LaneSource
 }
 
 func NewBoardSyncer(p provider.TaskProvider) *BoardSyncer {
 	return &BoardSyncer{Provider: p}
 }
 
-// allowedStatuses ports the jq filter `status in (to-do|in-progress|in-review)`.
+// RefFromAgentName extracts the ticket ref from a Herdr agent/tab label.
+// Dispatch names agents "task-<lower-ref>" (e.g. "task-fac-225"). The
+// coordinator's manual path (herdr tab create + herdr agent start) uses
+// the same convention. Returns "" when the name does not match.
+var agentNameRe = regexp.MustCompile(`^task-([a-z]+-[0-9]+)$`)
+
+func RefFromAgentName(name string) string {
+	m := agentNameRe.FindStringSubmatch(strings.ToLower(strings.TrimSpace(name)))
+	if m == nil {
+		return ""
+	}
+	return NormalizeRef(m[1])
+}
+
 var allowedStatuses = map[string]bool{"to-do": true, "in-progress": true, "in-review": true}
 
 // ReconcileBoard reconciles the board against git reality, returning drift
@@ -67,7 +101,7 @@ func (b *BoardSyncer) ReconcileBoard(ctx context.Context, projectID, repoDir str
 		return nil, fmt.Errorf("failed to list tasks for board sync: %w", err)
 	}
 
-	facts := collectFacts(repoDir)
+	facts := collectFacts(repoDir, b.Lanes)
 
 	drift := &BoardDrift{}
 	for _, t := range tasks {
@@ -97,8 +131,23 @@ func (b *BoardSyncer) ReconcileBoard(ctx context.Context, projectID, repoDir str
 // stripped and lowercased); `localRefs` is the concatenation of per-worktree
 // `git -C wt log origin/main..HEAD --pretty=%s%n%b`; `work_in_flight` is
 // true when any worktree is ahead of origin/main or dirty.
-func collectFacts(repoDir string) *bsyncFacts {
+func collectFacts(repoDir string, lanes LaneSource) *bsyncFacts {
 	f := &bsyncFacts{}
+
+	// Live lanes: reconcile against agents as well as git. A lane created
+	// outside dispatch (herdr tab create + herdr agent start) has no
+	// in-progress card, but the agent named task-<ref> proves work is in
+	// flight. Errors degrade to "no lanes" — same as git failures.
+	if lanes != nil {
+		if laneRefs, lerr := lanes.ListLanes(); lerr == nil {
+			for _, lr := range laneRefs {
+				norm := strings.ToLower(NormalizeRef(lr.Ref))
+				if norm != "" {
+					f.lanes += norm + "\n"
+				}
+			}
+		}
+	}
 
 	out, _ := git(repoDir, "worktree", "list", "--porcelain")
 	var wts []string
@@ -139,9 +188,9 @@ func (b *BoardSyncer) classify(ctx context.Context, facts *bsyncFacts, t *provid
 	lref := strings.ToLower(ref)
 	nref := strings.ReplaceAll(lref, "-", "")
 
-	// active = branch-name match OR ref named in unpushed work
+	// active = branch-name match OR ref named in unpushed work OR live lane
 	re := regexp.MustCompile(`(?m)(` + regexp.QuoteMeta(lref) + `|` + regexp.QuoteMeta(nref) + `)([^0-9]|$)`)
-	active := re.MatchString(facts.branches) || re.MatchString(facts.localRefs)
+	active := re.MatchString(facts.branches) || re.MatchString(facts.localRefs) || re.MatchString(facts.lanes)
 
 	// created = 0 disables the date gate (zero time.Time ports `created=0`).
 	var created int64
@@ -182,4 +231,34 @@ func (b *BoardSyncer) classify(ctx context.Context, facts *bsyncFacts, t *provid
 		}
 	}
 	return nil
+}
+
+// FixResult reports what FixBoardLag advanced and what failed.
+type FixResult struct {
+	Advanced []BoardFinding // cards moved to in-progress
+	Errors   []error        // per-card update errors
+}
+
+// FixBoardLag advances to-do cards to in-progress when a live lane or git
+// branch proves work is in flight. It is the reconciliation action for
+// BOARD_LAG findings: any live agent named task-<ref> implies that card
+// is in progress, regardless of whether dispatch was used to create the
+// lane. Cards already in-progress or in-review are not touched.
+func (b *BoardSyncer) FixBoardLag(ctx context.Context, projectID, repoDir string) (*FixResult, error) {
+	drift, err := b.ReconcileBoard(ctx, projectID, repoDir)
+	if err != nil {
+		return nil, err
+	}
+	result := &FixResult{}
+	for _, f := range drift.Findings {
+		if f.Kind != "BOARD_LAG" || f.TaskID == "" {
+			continue
+		}
+		if err := b.Provider.UpdateStatus(ctx, f.TaskID, "in-progress"); err != nil {
+			result.Errors = append(result.Errors, fmt.Errorf("advance %s (%s): %w", f.Ref, f.TaskID, err))
+			continue
+		}
+		result.Advanced = append(result.Advanced, f)
+	}
+	return result, nil
 }
