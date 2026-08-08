@@ -706,6 +706,15 @@ func runPreflight() {
 		os.Exit(1)
 	}
 	fmt.Println("Preflight signal-literal check passed. No host-wide kill literals in production sources.")
+	// FAC-135: lint the repository's declared merge policy. This is a
+	// declaration check, not per-candidate admission: it fails a repo that
+	// claims protection while declaring no required checks or no
+	// different-family review. Runtime admission is reviewledger.Admit.
+	if err := preflight.RefuseAutonomousMerge("."); err != nil {
+		fmt.Fprintf(os.Stderr, "Preflight failed: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Println("Preflight merge-policy check passed. Required CI and different-family review declared.")
 }
 
 func runSelfTest() {
@@ -5002,12 +5011,42 @@ func (d *cliForgeDriver) Signals(ctx context.Context) (map[string]bool, map[stri
 	return completed, verified, nil
 }
 
-func (d *cliForgeDriver) herd(args ...string) error {
-	self, _ := os.Executable()
+// herdSubprocess runs the compiled herd binary (or a test double). Production
+// uses os.Executable; FAC-135 e2e installs a recorder that never touches a
+// live board so arg-order and crash-boundary tests stay hermetic.
+var herdSubprocess = herdSubprocessReal
+
+func herdSubprocessReal(args ...string) error {
+	self, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("herd executable: %w", err)
+	}
 	cmd := exec.Command(self, args...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	return cmd.Run()
+}
+
+// setHerdSubprocessForTest replaces the herd subprocess runner. Restore with
+// the returned function.
+func setHerdSubprocessForTest(f func(args ...string) error) func() {
+	old := herdSubprocess
+	if f == nil {
+		herdSubprocess = herdSubprocessReal
+	} else {
+		herdSubprocess = f
+	}
+	return func() { herdSubprocess = old }
+}
+
+func (d *cliForgeDriver) herd(args ...string) error {
+	return herdSubprocess(args...)
+}
+
+// reviewArgs is the exact argv the production driver must emit. Exposed so
+// FAC-135 can mutation-prove --spawn precedes the ref (FAC-138 regression).
+func reviewArgs(ref string) []string {
+	return []string{"review", "--spawn", ref}
 }
 
 func (d *cliForgeDriver) Dispatch(ctx context.Context, t *provider.Task) error {
@@ -5021,10 +5060,17 @@ func (d *cliForgeDriver) Review(ctx context.Context, t *provider.Task) error {
 	// --spawn BEFORE the ref: flag.Parse stops at the first positional, so the
 	// old trailing form silently parsed spawn=false and no reviewer ever
 	// started. runReview now also normalizes the order (FAC-138).
-	return d.herd("review", "--spawn", t.Ref)
+	return d.herd(reviewArgs(t.Ref)...)
 }
 
 func (d *cliForgeDriver) Approve(ctx context.Context, t *provider.Task) error {
+	// FAC-135: the loop refuses to move a card to Done under a repository that
+	// has not declared the gates. This is a declaration check, NOT per-candidate
+	// admission — that is reviewledger.Admit (exact SHA, different-family
+	// reviewer, unspent lease), and merge evidence is pkg/sync.BoardDone.
+	if err := preflight.RefuseAutonomousMerge("."); err != nil {
+		return fmt.Errorf("approve: %w", err)
+	}
 	// Evidence-gated board move (requires the branch to be merged on
 	// origin/main); harvest/merge stays coordinator-owned git work.
 	if err := d.herd("approve", t.Ref); err != nil {
@@ -5273,6 +5319,11 @@ func forgeLoopMain() int {
 	// coordinator reconciler. Until the authoritative task-scoped composition
 	// is available, NewEngineWithControl makes the command fail closed before
 	// any board or lane action rather than falling back to direct dispatch.
+	//
+	// FAC-135 note: a CoordinatorLoop whose Orders always returns the empty set
+	// is NOT that composition — it restores the exact pre-50a82e3 posture while
+	// looking composed. Do not reopen this gate without task-scoped order
+	// listing and a test that fails when the composition is removed.
 	eng := daemon.NewEngineWithControl(cfg, tp, nil, st, resolveCanonicalWorktreeManager(), nil, nil)
 	driver := &cliForgeDriver{cfg: cfg, maxLanes: *maxLanes}
 

@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Kampe/Herdforge/pkg/config"
 	"github.com/Kampe/Herdforge/pkg/control"
 	"github.com/Kampe/Herdforge/pkg/provider"
 )
@@ -154,4 +155,79 @@ func TestForgeLoop_StopsWhenBoardClear(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("loop did not stop on clear board")
 	}
+}
+
+// FAC-135: one card reaches Done exactly once with matching action receipts.
+// The driver mutates board state so the loop can walk claim→dispatch→verify→
+// review→approve without vacuous fixed-signal tables.
+func TestForgeLoop_HappyPathReachesDoneOnce(t *testing.T) {
+	mp := provider.NewMemoryProvider()
+	task := &provider.Task{
+		ID: "1", Ref: "FAC-9001", Status: "to-do", Priority: provider.PriorityUrgent,
+		ProjectID: "p1",
+		Description: "```herd-deps-v1\n{\"version\":1,\"task_ref\":\"FAC-9001\",\"task_id\":\"1\",\"edges\":[]}\n```\n",
+	}
+	mp.AddTask(task)
+	cfg := &config.Config{TaskProvider: config.TaskProvider{ProjectID: "p1"}}
+	e := NewEngine(cfg, mp, nil, nil, nil, nil)
+
+	d := &fakeDriver{
+		lanes:     LaneState{Busy: 0, Max: 1},
+		completed: map[string]bool{},
+		verified:  map[string]bool{},
+	}
+	// After review: card in-review, signals clear. After approve: done, lane free.
+	d.onReview = func(ref string) {
+		_ = mp.UpdateStatus(context.Background(), "1", "in-review")
+		d.completed = map[string]bool{}
+		d.verified = map[string]bool{}
+		d.lanes.Busy = 0
+	}
+	d.onApprove = func(ref string) {
+		_ = mp.UpdateStatus(context.Background(), "1", "done")
+		d.lanes.Busy = 0
+	}
+	hd := &happyDriver{fakeDriver: d, mp: mp}
+	if err := e.ForgeLoop(context.Background(), hd, ForgeLoopOptions{
+		Interval:  time.Millisecond,
+		MaxTicks:  8,
+		StopEmpty: true,
+	}); err != nil {
+		t.Fatalf("happy path: %v", err)
+	}
+	// Exact receipt: dispatch once, review once, approve once — no renudge.
+	var counts = map[string]int{}
+	for _, a := range hd.actions {
+		counts[a]++
+	}
+	if counts["dispatch:FAC-9001"] != 1 || counts["review:FAC-9001"] != 1 || counts["approve:FAC-9001"] != 1 {
+		t.Fatalf("receipts = %v want one each of dispatch/review/approve", hd.actions)
+	}
+	if counts["renudge:FAC-9001"] != 0 {
+		t.Fatalf("unexpected renudge: %v", hd.actions)
+	}
+	got, err := mp.GetTask(context.Background(), "1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != "done" {
+		t.Fatalf("board status = %q want done", got.Status)
+	}
+}
+
+// happyDriver advances board + lane signals so one groomed card drains to Done.
+type happyDriver struct {
+	*fakeDriver
+	mp *provider.MemoryProvider
+}
+
+func (h *happyDriver) Dispatch(ctx context.Context, t *provider.Task) error {
+	if err := h.fakeDriver.Dispatch(ctx, t); err != nil {
+		return err
+	}
+	_ = h.mp.UpdateStatus(ctx, t.ID, "in-progress")
+	// Next tick: builder finished and verified.
+	h.completed = map[string]bool{t.Ref: true}
+	h.verified = map[string]bool{t.Ref: true}
+	return nil
 }
