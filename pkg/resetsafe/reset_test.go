@@ -305,7 +305,7 @@ func TestRunPropagatesResetFailure(t *testing.T) {
 	}
 	oldRun := gitRunFn
 	gitRunFn = func(ctx context.Context, dir string, args ...string) error {
-		if len(args) >= 2 && args[0] == "reset" && args[1] == "--hard" {
+		if len(args) >= 2 && args[0] == "reset" && args[1] == "--hard" { //hermetic:allow-argv-position mock dispatcher: identifies git reset --hard, not a launch contract
 			return errors.New("injected reset failure")
 		}
 		return oldRun(ctx, dir, args...)

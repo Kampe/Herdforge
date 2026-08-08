@@ -102,6 +102,8 @@ lint:
 	go vet ./...
 	@echo "==> Running go vet on nested contract module (contracts/agentscope)..."
 	cd contracts/agentscope && go vet ./...
+	@echo "==> Running test hermeticity scan (FAC-215)..."
+	go run ./scripts/hermeticity/
 
 clean:
 	@echo "==> Cleaning build artifacts..."

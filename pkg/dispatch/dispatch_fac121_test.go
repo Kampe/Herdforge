@@ -431,7 +431,7 @@ func TestDispatch_Launch_SetsCwdAndProvesPrompt(t *testing.T) {
 	if !reflect.DeepEqual(hav[:5], wantHarnessArgv) {
 		t.Fatalf("decision harness argv base = %#v, want %#v", hav[:5], wantHarnessArgv)
 	}
-	if hav[5] != "--session" {
+	if hav[5] != "--session" { //hermetic:allow-argv-position fixed pi contract: --session is always at index 5 after the 5-element base
 		t.Fatalf("decision harness argv[5] = %q, want --session", hav[5])
 	}
 	if hav[6] == "" || !filepath.IsAbs(hav[6]) {
