@@ -737,8 +737,12 @@ func runStatus() {
 		fmt.Printf("Status: Uninitialized (no valid .herd/herd.yaml found)\n")
 		return
 	}
-	fmt.Printf("Status: Active\nProject: %s\nProvider: %s\nLanes: %d configured\n",
-		cfg.Project.Name, cfg.TaskProvider.Type, len(cfg.Lanes))
+	// FAC-155: print the activated board binding AND the repository's enabled
+	// policy, so a `type` edited away from the operator policy is visible in
+	// status rather than only at the next activation attempt.
+	fmt.Printf("Status: Active\nProject: %s\nProvider: %s (project=%s, enabled=%s)\nLanes: %d configured\n",
+		cfg.Project.Name, cfg.TaskProvider.Type, cfg.TaskProvider.ProjectID,
+		providerPolicySummary(cfg.TaskProvider.Enabled), len(cfg.Lanes))
 	st, err := store.New(".herd/herdforge.db")
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Dependency evidence: UNAVAILABLE (%v)\n", err)
@@ -769,6 +773,15 @@ func runStatus() {
 // deadlines via provider.NewFromHerdConfig. Non-Kaneo types error (FAC-155).
 func loadTaskProvider(cfg *config.Config) (provider.TaskProvider, error) {
 	return provider.NewFromHerdConfig(cfg)
+}
+
+// providerPolicySummary renders task_provider.enabled for status output. An
+// omitted policy means "exactly the declared type" — never a discovered one.
+func providerPolicySummary(enabled []string) string {
+	if len(enabled) == 0 {
+		return "declared-type-only"
+	}
+	return strings.Join(enabled, ",")
 }
 
 func runUsage() {
@@ -2286,7 +2299,9 @@ func runValidateConfig() {
 	fmt.Printf("  Version  : %s\n", cfg.Version)
 	fmt.Printf("  Project  : %s\n", cfg.Project.Name)
 	fmt.Printf("  Branch   : %s\n", cfg.Project.DefaultBranch)
-	fmt.Printf("  Provider : %s\n", cfg.TaskProvider.Type)
+	fmt.Printf("  Provider : %s (project=%s, enabled=%s)\n",
+		cfg.TaskProvider.Type, cfg.TaskProvider.ProjectID,
+		providerPolicySummary(cfg.TaskProvider.Enabled))
 	fmt.Printf("  Lanes    : %d\n", len(cfg.Lanes))
 	for _, lane := range cfg.Lanes {
 		fmt.Printf("    - %s: agent_kind=%s model=%s", lane.Name, lane.AgentKind, lane.Model)

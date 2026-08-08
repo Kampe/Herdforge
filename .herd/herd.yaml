@@ -7,8 +7,14 @@ project:
   repo_url: "https://github.com/Kampe/Herdforge.git"
 
 # Linear Project (Herdforge)
+# FAC-155: `enabled` is this repository's explicit activation policy. The
+# factory activates `type` only if it is listed here; jira, azure, github
+# issues, kaneo and memory adapters stay compiled but dormant and can never be
+# auto-detected, probed, or selected. Flipping `type` without moving this list
+# fails closed before any board read or mutation.
 task_provider:
   type: "linear"
+  enabled: ["linear"]
   project_id: "75548eb4-5382-444e-8dfd-6c6778f3b2d9"
   api_key_env: "LINEAR_API_KEY"
 

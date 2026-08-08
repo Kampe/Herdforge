@@ -253,7 +253,7 @@ func TestBuildTaskPacket(t *testing.T) {
 		Model: "deepseek-v4-flash", Prompt: ".herd/prompts/worker.md",
 	}
 	verification := config.Verification{TestCommand: "go test ./...", PreflightCommand: "go build ./..."}
-	packet := buildTaskPacket(task, "herd/fac-33", ".herd/prompts/worker.md", "kaneo", lane, verification)
+	packet := buildTaskPacket(task, "herd/fac-33", ".herd/prompts/worker.md", "kaneo", "fac-proj", lane, verification)
 	if !strings.Contains(packet, "FAC-33") {
 		t.Error("packet should contain ticket ref")
 	}
@@ -301,7 +301,7 @@ func TestBuildTaskPacket_ProviderNeutralTaskReference(t *testing.T) {
 	verification := config.Verification{TestCommand: "go test ./..."}
 
 	t.Run("kaneo provider gets the kaneo CLI reference", func(t *testing.T) {
-		packet := buildTaskPacket(task, "herd/fac-2", ".herd/prompts/worker.md", "kaneo", lane, verification)
+		packet := buildTaskPacket(task, "herd/fac-2", ".herd/prompts/worker.md", "kaneo", "fac-proj", lane, verification)
 		if !strings.Contains(packet, "kaneo task get FAC-2 --full") {
 			t.Errorf("kaneo provider must reference the kaneo CLI:\n%s", packet)
 		}
@@ -309,7 +309,7 @@ func TestBuildTaskPacket_ProviderNeutralTaskReference(t *testing.T) {
 
 	for _, providerType := range []string{"github", "linear", "jira", "memory", ""} {
 		t.Run(providerType+" provider does not assume kaneo", func(t *testing.T) {
-			packet := buildTaskPacket(task, "herd/fac-2", ".herd/prompts/worker.md", providerType, lane, verification)
+			packet := buildTaskPacket(task, "herd/fac-2", ".herd/prompts/worker.md", providerType, "fac-proj", lane, verification)
 			if strings.Contains(packet, "kaneo task get") || strings.Contains(packet, "kaneo") {
 				t.Errorf("provider %q must not assume ambient kaneo credentials:\n%s", providerType, packet)
 			}
@@ -357,7 +357,7 @@ func TestBuildTaskPacket_RepositoryAgnosticVerification(t *testing.T) {
 
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			packet := buildTaskPacket(task, "herd/fac-1", ".herd/prompts/worker.md", "kaneo", lane, c.verification)
+			packet := buildTaskPacket(task, "herd/fac-1", ".herd/prompts/worker.md", "kaneo", "fac-proj", lane, c.verification)
 			for _, want := range c.wantContains {
 				if !strings.Contains(packet, want) {
 					t.Errorf("packet missing %q:\n%s", want, packet)

@@ -35,9 +35,13 @@ func (s *SelfTestRunner) RunSuite(ctx context.Context) ([]AssertionResult, error
 		Err:    err,
 	})
 
-	// 2. Memory provider contract check
-	mp := provider.NewMemoryProvider()
-	err = provider.VerifyProviderContract(ctx, mp, "selftest-proj")
+	// 2. Provider contract check. FAC-155: even this in-process check goes
+	// through the central factory, so the repo holds no production constructor
+	// call that bypasses activation policy.
+	mp, err := provider.NewProductionProvider(provider.TaskConfig{Type: "memory"})
+	if err == nil {
+		err = provider.VerifyProviderContract(ctx, mp, "selftest-proj")
+	}
 	results = append(results, AssertionResult{
 		Name:   "provider_contract_check",
 		Passed: err == nil,

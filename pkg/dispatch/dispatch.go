@@ -352,12 +352,17 @@ func (d *Dispatcher) ownershipClaimer() (deps.OwnershipClaimer, error) {
 	if err != nil {
 		return nil, fmt.Errorf("dispatch: repository identity: %w", err)
 	}
-	providerType := "memory"
-	project := ""
-	if d.Config != nil {
-		providerType = d.Config.TaskProvider.Type
-		project = d.Config.TaskProvider.ProjectID
+	// FAC-155: the launch lease is keyed by board identity. Defaulting an
+	// absent/blank provider to "memory" silently leased the ticket against a
+	// board nobody configured, so an unbound dispatcher fails closed instead.
+	if d.Config == nil {
+		return nil, fmt.Errorf("dispatch: no repository config; task provider identity is unbound")
 	}
+	providerType := strings.ToLower(strings.TrimSpace(d.Config.TaskProvider.Type))
+	if providerType == "" {
+		return nil, fmt.Errorf("dispatch: task_provider.type is required for launch lease ownership")
+	}
+	project := d.Config.TaskProvider.ProjectID
 	ownership, err := deps.OpenLeaseOwnership(deps.ResolveLaunchLeasePath(root), repo, providerType, project)
 	if err != nil {
 		return nil, err
@@ -702,7 +707,7 @@ func (d *Dispatcher) Dispatch(ctx context.Context, opts DispatchOptions) (*Dispa
 		rolePath = ".herd/prompts/worker.md"
 	}
 
-	packet := buildTaskPacket(task, branch, rolePath, d.Config.TaskProvider.Type, lane, d.Config.Verification)
+	packet := buildTaskPacket(task, branch, rolePath, d.Config.TaskProvider.Type, d.Config.TaskProvider.ProjectID, lane, d.Config.Verification)
 	if depProv != nil {
 		packet = packet + "\n" + deps.PacketSection(depProv)
 	}
@@ -1369,7 +1374,10 @@ func extractIntentFromTitle(title string) string {
 // concrete CLI only for the task provider actually configured (kaneo); any
 // other provider gets a provider-neutral reference instead of an assumed,
 // uncredentialed `kaneo` CLI call.
-func buildTaskPacket(task *provider.Task, branch, rolePath, taskProviderType string, lane *config.LaneDef, verification config.Verification) string {
+// FAC-155: the packet names the configured provider AND its project binding,
+// and forbids every other board tool. A worker that reaches for a different
+// provider CLI is reaching for a board this repository never activated.
+func buildTaskPacket(task *provider.Task, branch, rolePath, taskProviderType, taskProviderProject string, lane *config.LaneDef, verification config.Verification) string {
 	var b strings.Builder
 
 	verifySummary := verification.TestCommand
@@ -1384,12 +1392,15 @@ func buildTaskPacket(task *provider.Task, branch, rolePath, taskProviderType str
 
 	fmt.Fprintf(&b, "Worktree: current directory (Herdr cwd-enforced), branch %s. Work ONLY here — never edit files outside it.\n\n", branch)
 
-	fmt.Fprintf(&b, "Read the full spec yourself (do not wait for it inline) via the configured task provider (%s):\n", taskProviderType)
+	fmt.Fprintf(&b, "Read the full spec yourself (do not wait for it inline) via the configured task provider (provider=%s project=%s):\n", taskProviderType, taskProviderProject)
 	if taskProviderType == "kaneo" {
-		fmt.Fprintf(&b, "  kaneo task get %s --full\n\n", task.Ref)
+		fmt.Fprintf(&b, "  kaneo task get %s --full\n", task.Ref)
 	} else {
-		fmt.Fprintf(&b, "  ref: %s\n\n", task.Ref)
+		fmt.Fprintf(&b, "  ref: %s\n", task.Ref)
 	}
+	// The forbid line names no adapter: enumerating them would both go stale
+	// and hand a non-kaneo worker the string "kaneo" to reach for.
+	fmt.Fprintf(&b, "This repository activates ONLY the provider and project named above. Do NOT read from or write to any other task board, and do NOT invoke any other provider CLI or API — no other provider tool is authorized for this task.\n\n")
 
 	b.WriteString("Completion contract (self-gate, FAC-116):\n")
 	b.WriteString("  1. You are already in the task worktree (Herdr cwd-enforced).\n")
