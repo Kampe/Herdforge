@@ -234,14 +234,19 @@ lanes:
 #
 #   1. CanonicalLaneRegistry allows one lane per ROLE, so Resolve() can accept a
 #      lane name or a role name unambiguously.
-#   2. validateLaneLaunchConfig (cmd/herd/main.go) accepts only ten roles and
-#      pins each to one task_shape. "assayer" is NOT among them, so a lane cannot
-#      carry it at all; and worker/forge-smith/recovery must be exactly
+#   2. validateLaneLaunchConfig (cmd/herd/main.go) accepts eleven roles and
+#      pins each to one task_shape; worker/forge-smith/recovery must be exactly
 #      pi + codex/gpt-5.6-luna/medium.
 #
-# Between them, every configurable role is already occupied except "recovery",
-# which mender now takes. A ci-warden lane was written and had to be withdrawn:
-# there is no role left that a standing lane may legally hold.
+# CORRECTION (2026-08-08): an earlier version of this note claimed the map held
+# only ten roles and that "assayer" was not among them, so no role was left for
+# another standing lane — and a written ci-warden lane was withdrawn on that
+# basis. That was wrong. The map at cmd/herd/main.go:4687 contains eleven
+# entries including launch.AssayerRole ("assayer", task_shape "qa"), and
+# launch.go:913 accepts it alongside orchestrator/reviewer/scout-planner. Ten of
+# the eleven roles are taken by the lanes above; "assayer" is free, so one more
+# standing lane may legally be added carrying role "assayer" with
+# task_shape "qa". Verify against the map before relying on this either way.
 # The lane is named "mender", not "forge-mender": live agent ids are prefixed
 # forge-<lane>, and a lane whose own name starts with forge- is unselectable
 # ("unknown standing selection \"mender\"" when the prefix is stripped).

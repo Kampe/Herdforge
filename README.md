@@ -50,17 +50,33 @@ The project deliberately composes with Herdr instead of copying every Chainseer 
 
 The target fleet is not a fixed three-agent conveyor belt. Control roles may be standing; task roles should normally be ephemeral and bound to one task/revision.
 
-| Role | Purpose |
-| --- | --- |
-| Orchestrator | coordinates capacity and state transitions; does not author, review, or merge |
-| Scout-planner | grooms the queue, identifies dependencies, and proposes deterministic eligible work |
-| Worker | implements a bounded task in an owned worktree |
-| Smith | handles larger or higher-risk implementation in an owned worktree |
-| Verification gate | runs deterministic checks and records evidence for an exact SHA |
-| Reviewer | performs read-only, different-family review of an exact SHA |
-| Review supervisor | moves completed candidates through verification and review queues |
-| Harvest/integration owner | serializes approved merges, reconciles the board, and cleans exact resources |
-| Recovery sentinel | detects lost callbacks, stale leases, root bleed, and stranded work |
+The lanes below are the roster in `.herd/herd.yaml`. "Standing" lanes are raised
+once as control plane (`herd standing`); ephemeral lanes are launched per
+dispatch and bound to one task/revision.
+
+| Role | Lane | Standing | Purpose |
+| --- | --- | --- | --- |
+| Orchestrator | `orchestrator` | yes | coordinates capacity and state transitions; does not author, review, or merge |
+| Scout-planner | `scout-planner` | yes | grooms the queue, identifies dependencies, and proposes deterministic eligible work |
+| Review supervisor | `review-supervisor` | yes | moves completed candidates through verification and review queues |
+| Harvest/integration owner | `harvest` | yes | serializes approved merges, reconciles the board, and cleans exact resources |
+| Recovery sentinel | `recovery-sentinel` | yes | detects lost callbacks, stale leases, root bleed, and stranded work |
+| Recovery (mender) | `mender` | yes | fixes the forge itself — the gates, evidence checks, and lifecycle bugs that cost the fleet whole sessions |
+| Worker | `smith` | no | implements a bounded task in an owned worktree |
+| Forge-smith | `scout` | no | surveys the board and grooms bare cards into dispatch-ready specs |
+| Reviewer | `assayer` | no | performs read-only, different-family review of an exact SHA |
+| Verification gate | `verification-gate` | no | runs deterministic checks and records evidence for an exact SHA |
+
+One lane per role is enforced: `CanonicalLaneRegistry` requires it so a lane may
+be resolved by either its name or its role unambiguously, and
+`validateLaneLaunchConfig` accepts eleven roles, pinning each to exactly one
+task shape. Adding a standing lane therefore needs a free role, not just a new
+config block — which is why the forge-repair lane is named `mender` and carries
+the `recovery` role. Ten of the eleven roles are occupied above; `assayer` is
+the one still free.
+
+Worker, forge-smith, and recovery lanes are additionally pinned to
+`codex`/`gpt-5.6-luna`/`medium`, and every lane must be a Pi harness.
 
 Spawn-ready prompt contracts are in `.herd/prompts/`. Runtime model selection belongs to routing policy; author and reviewer must not be pinned to the same model family for R1–R3 work.
 
@@ -88,10 +104,15 @@ In a repository that will be managed by Herdforge:
 
 ```bash
 herd init --full
-kaneo link -w <workspace-id> -p <project-id>
 herd validate-config
 herd preflight
 ```
+
+`herd init --full` writes a starting `.herd/herd.yaml`. Point its `task_provider`
+block at your board before validating — set `type`, list that same name in
+`enabled`, and set `project_id` plus the `api_key_env` naming the environment
+variable that holds the token. See [Task provider](#task-provider) for which
+adapters are actually selectable.
 
 Review the generated `.herd/herd.yaml` and prompts before launching agents. A dispatchable board card needs acceptance criteria, a role mapping, dependency state, risk information, and operator-owned priority.
 
@@ -180,7 +201,7 @@ Do not treat the model on a lane as permanent identity. Routing must distinguish
 
 ### Worker launch policy (FAC-175)
 
-Every implementation, repair, and recovery worker launch must carry one complete routed decision: role, task shape, provider, model, effort, provenance, and argv. The compiled launch boundary accepts only `codex --model gpt-5.6-luna -c model_reasoning_effort=medium -a never` for worker/forge-smith/recovery roles. Bare launches, coordinator shapes, `gpt-5.6-sol`, `claude-fable-5`, missing effort, and missing provenance fail before tab/process/prompt or board/worktree mutation. Rejections are recorded in the repo-relative `.herd/launch-receipts.jsonl` (override with `HERD_LAUNCH_RECEIPTS`).
+Every implementation, repair, and recovery worker launch must carry one complete routed decision: role, task shape, provider, model, effort, provenance, and argv. The compiled launch boundary accepts only `codex --model gpt-5.6-luna -c model_reasoning_effort=medium -a never` for worker/forge-smith/recovery roles. Bare launches, coordinator shapes, `gpt-5.6-sol`, `gpt-5.6-terra`, `claude-fable-5`, missing effort, and missing provenance fail before tab/process/prompt or board/worktree mutation. Rejections are recorded in the repo-relative `.herd/launch-receipts.jsonl` (override with `HERD_LAUNCH_RECEIPTS`).
 
 Run `herd init --full` to generate a schema-compatible starting point, then review it against the checked-out binary with `herd validate-config`.
 
