@@ -211,8 +211,20 @@ func runHarvestMerge() {
 		os.Exit(1)
 	}
 
+	// Content evidence for the empty-diff gate. A commit COUNT is not a content
+	// check: PR #151 merged 0 additions / 0 deletions / 0 files because the
+	// branch carried only its anchor commit. Computed here rather than passed in
+	// so the gate cannot be bypassed by a caller that simply omits it.
+	diffstatOut, diffErr := exec.Command("git", "diff", "--shortstat", *base+"..."+*branch).Output()
+	if diffErr != nil {
+		fmt.Fprintf(os.Stderr, "herd harvest-merge: git diff --shortstat %s...%s: %v\n", *base, *branch, diffErr)
+		os.Exit(1)
+	}
+	diffstat := strings.TrimSpace(string(diffstatOut))
+
 	plan := harvestmerge.Plan{
-		Lane: lane, Branch: *branch, Title: *title,
+		Diffstat: diffstat,
+		Lane:     lane, Branch: *branch, Title: *title,
 		SHA:     sha,
 		Verdict: ledgerVerdict,
 		Commits: commits,
