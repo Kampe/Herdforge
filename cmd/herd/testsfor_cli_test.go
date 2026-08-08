@@ -20,14 +20,15 @@ type testsForOutput struct {
 	ChangedPaths   []string `json:"changed_paths"`
 	ChangedSymbols []string `json:"changed_symbols"`
 	Integrity      struct {
-		RepoCommit       string   `json:"repo_commit"`
-		ManifestFiles    int      `json:"manifest_files"`
-		ManifestDigest   string   `json:"manifest_digest"`
-		GraphFiles       int      `json:"graph_files"`
-		Queries          []string `json:"queries"`
-		Rebuilt          bool     `json:"rebuilt"`
-		Trusted          bool     `json:"trusted"`
-		RejectionReasons []string `json:"rejection_reasons"`
+		RepoCommit        string   `json:"repo_commit"`
+		ManifestFiles     int      `json:"manifest_files"`
+		ManifestDigest    string   `json:"manifest_digest"`
+		GraphFiles        int      `json:"graph_files"`
+		Queries           []string `json:"queries"`
+		UnresolvedTargets []string `json:"unresolved_targets"`
+		Rebuilt           bool     `json:"rebuilt"`
+		Trusted           bool     `json:"trusted"`
+		RejectionReasons  []string `json:"rejection_reasons"`
 	} `json:"graph_integrity"`
 	Blocked        bool     `json:"blocked"`
 	BlockedReasons []string `json:"blocked_reasons"`
@@ -95,12 +96,32 @@ func stubGraphTool(t *testing.T, files int, testsForHits bool) (path, logPath st
 	path = filepath.Join(dir, "graph-stub")
 	logPath = filepath.Join(dir, "calls.log")
 
-	// The stub answers tests_for with an absolute path, exactly as the real CLI
-	// does, so the adapter's relativization is exercised end to end.
-	testsFor := `printf '{"status": "ok", "result_count": 0, "results": []}\n'`
+	// The stub mirrors the real CLI's wire shape, not a convenient one: query
+	// answers are PRETTY-PRINTED with indented result objects and absolute
+	// file paths. A single-line stub hid a decoder bug that only a live run
+	// surfaced, so the fixture keeps the awkward shape on purpose.
+	testsFor := `cat <<EOF
+{
+  "status": "ok",
+  "result_count": 0,
+  "results": []
+}
+EOF`
 	if testsForHits {
-		testsFor = `printf '{"status": "ok", "result_count": 1, "results": ` +
-			`[{"kind": "Test", "name": "TestExported", "file_path": "%s/pkg/with space/thing_test.go", "is_test": true}]}\n' "$(pwd)"`
+		testsFor = `cat <<EOF
+{
+  "status": "ok",
+  "result_count": 1,
+  "results": [
+    {
+      "kind": "Test",
+      "name": "TestExported",
+      "file_path": "$(pwd)/pkg/with space/thing_test.go",
+      "is_test": true
+    }
+  ]
+}
+EOF`
 	}
 
 	script := fmt.Sprintf(`#!/bin/sh
@@ -115,8 +136,18 @@ case "$1" in
     ;;
   query)
     case "$2" in
-      tests_for) %s ;;
-      *) printf '{"status": "ok", "result_count": 0, "results": []}\n' ;;
+      tests_for)
+%s
+        ;;
+      *)
+cat <<EOF
+{
+  "status": "ok",
+  "result_count": 0,
+  "results": []
+}
+EOF
+        ;;
     esac
     ;;
   *) exit 3 ;;
@@ -353,6 +384,87 @@ func TestTestsFor_UnknownRefFailsClosed(t *testing.T) {
 	}
 	if !strings.Contains(stderr, "nonexistentref") {
 		t.Fatalf("stderr must name the unresolvable ref, got %q", stderr)
+	}
+}
+
+// notFoundGraphTool stubs a complete index whose tests_for answers not_found —
+// the shape a live run returns for a package-level const or var, which has no
+// graph node. The run must broaden, not block: blocking here would fail every
+// change that adds a constant, and treating it as zero would read as coverage.
+func notFoundGraphTool(t *testing.T, files int) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "graph-stub")
+	script := fmt.Sprintf(`#!/bin/sh
+sha=$(git rev-parse HEAD)
+case "$1" in
+  status)
+    printf '{"nodes": 42, "edges": 7, "files": %d, "built_at_commit": "%%s", "current_sha": "%%s"}\n' "$sha" "$sha"
+    ;;
+  build) exit 0 ;;
+  query)
+    case "$2" in
+      tests_for)
+cat <<EOF
+{
+  "status": "not_found",
+  "summary": "No node found matching '$3'."
+}
+EOF
+        ;;
+      *)
+cat <<EOF
+{
+  "status": "ok",
+  "result_count": 0,
+  "results": []
+}
+EOF
+        ;;
+    esac
+    ;;
+  *) exit 3 ;;
+esac
+`, files)
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func TestTestsFor_NotFoundTargetBroadensWithoutBlocking(t *testing.T) {
+	repo, base, cand := fixtureRepo(t)
+	tool := notFoundGraphTool(t, 1)
+
+	out, stderr, code := runTestsForCLI(t, repo, "--graph-tool", tool, base+".."+cand)
+	if code != 0 {
+		t.Fatalf("a target absent from a complete index must not block: exit %d\nstderr: %s", code, stderr)
+	}
+	if out.Blocked || !out.Integrity.Trusted {
+		t.Fatalf("the index itself is complete and must stay trusted: %+v", out.Integrity)
+	}
+	if len(out.Integrity.UnresolvedTargets) == 0 {
+		t.Fatalf("the unresolvable target must be recorded: %+v", out.Integrity)
+	}
+	for _, q := range out.Integrity.Queries {
+		if strings.HasPrefix(q, "tests_for(") {
+			t.Fatalf("not_found must not appear as a zero-result query: %q", q)
+		}
+	}
+	if !out.Plan.Escalated {
+		t.Fatalf("underivable coverage must broaden the plan: %+v", out.Plan)
+	}
+	reasons := strings.Join(out.Plan.EscalationReasons, "; ")
+	if !strings.Contains(reasons, "coverage underivable") {
+		t.Fatalf("escalation must name the unresolved target, got %q", reasons)
+	}
+	full := false
+	for _, c := range out.Plan.Commands {
+		if c.Stage == "full" {
+			full = true
+		}
+	}
+	if !full {
+		t.Fatalf("broadened plan must include the full profile: %+v", out.Plan.Commands)
 	}
 }
 
