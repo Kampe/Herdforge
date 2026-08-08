@@ -248,11 +248,11 @@ func TestJSONAndHumanCountsIdentical(t *testing.T) {
 		t.Fatalf("JSON counts %+v != snap counts %+v", decoded.Counts, snap.Counts)
 	}
 	// Human must embed the same numeric tallies.
-	want := fmt.Sprintf("agents=%d healthy_idle=%d busy=%d blocked=%d done=%d stale=%d unknown=%d actions=%d renew_leases=%d consume_callbacks=%d dispatch=%d would_run=%d reconcile=%d applied=%d",
+	want := fmt.Sprintf("agents=%d healthy_idle=%d busy=%d blocked=%d done=%d stale=%d unknown=%d actions=%d renew_leases=%d consume_callbacks=%d dispatch=%d reap_lanes=%d would_run=%d reconcile=%d applied=%d",
 		snap.Counts.Agents, snap.Counts.HealthyIdle, snap.Counts.Busy, snap.Counts.Blocked,
 		snap.Counts.Done, snap.Counts.Stale, snap.Counts.Unknown, snap.Counts.Actions,
 		snap.Counts.RenewLeases, snap.Counts.ConsumeCallback, snap.Counts.Dispatch,
-		snap.Counts.WouldRun, snap.Counts.Reconcile, snap.Counts.Applied)
+		snap.Counts.ReapLanes, snap.Counts.WouldRun, snap.Counts.Reconcile, snap.Counts.Applied)
 	if !strings.Contains(human, want) {
 		t.Fatalf("human missing counts line %q\n---\n%s", want, human)
 	}
@@ -263,8 +263,11 @@ type recordingActor struct {
 	consumed  []CallbackObservation
 	reconcile int
 	dispatch  int
+	reaped    []AgentObservation
 	// failRenewGeneration when non-zero forces RenewLease to fail for that gen.
 	failRenewGeneration int64
+	// failReapLane forces ReapLane to fail for any lane when true.
+	failReapLane bool
 	// consumeOnce tracks envelope IDs already acked (idempotent).
 	acked map[string]int
 }
@@ -293,6 +296,13 @@ func (a *recordingActor) ConsumeCallback(_ context.Context, cb CallbackObservati
 }
 func (a *recordingActor) Dispatch(context.Context, string, string) error {
 	a.dispatch++
+	return nil
+}
+func (a *recordingActor) ReapLane(_ context.Context, lane AgentObservation) error {
+	if a.failReapLane {
+		return errors.New("reap failed: fencing evidence incomplete")
+	}
+	a.reaped = append(a.reaped, lane)
 	return nil
 }
 
@@ -507,5 +517,190 @@ func TestUnknownCriticalExitCodeIsNonVacuous(t *testing.T) {
 	}
 	if ok.ExitCode != 0 {
 		t.Fatalf("healthy beat exit=%d", ok.ExitCode)
+	}
+}
+
+// --- FAC-221: lane reap enforcement tests ---
+
+// reapObs builds an observation with reap-eligible and keep lanes.
+func reapObs() Observation {
+	return Observation{
+		Provider: ProviderObservation{Known: true, QueueDepth: 0, Claimable: 0},
+		Herdr: HerdrObservation{
+			Known: true,
+			Agents: []AgentObservation{
+				{Name: "idle-committed", Raw: "idle", CommittedWork: true, TabID: "wK:t1", Workspace: "wK"},
+				{Name: "done-ticket", Raw: "done", TicketDone: true, TabID: "wK:t2", Workspace: "wK"},
+				{Name: "idle-saferef", Raw: "idle", SafeRef: "safe/fac-201", TabID: "wK:t3", Workspace: "wK"},
+				{Name: "idle-awaiting-verdict", Raw: "idle", CommittedWork: true, AwaitingVerdict: true, TabID: "wK:t4", Workspace: "wK"},
+				{Name: "busy-worker", Raw: "working", CommittedWork: true, TabID: "wK:t5", Workspace: "wK"},
+				{Name: "idle-no-evidence", Raw: "idle", TabID: "wK:t6", Workspace: "wK"},
+				{Name: "blocked-lane", Raw: "blocked", CommittedWork: true, TabID: "wK:t7", Workspace: "wK"},
+			},
+		},
+		Review:   ReviewObservation{Known: true},
+		Quota:    QuotaObservation{Known: true},
+		WindDown: WindDownObservation{Known: true, Enabled: false},
+	}
+}
+
+func TestPlanReapsIdleLanesWithExitEvidence(t *testing.T) {
+	snap, err := Plan(reapObs(), Options{Act: true, Now: fixedNow})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snap.Counts.ReapLanes != 3 {
+		t.Fatalf("expected 3 reap actions (idle-committed, done-ticket, idle-saferef), got %d: %+v", snap.Counts.ReapLanes, snap.Actions)
+	}
+	for _, a := range snap.Actions {
+		if a.Kind != ActionReapLane {
+			continue
+		}
+		switch a.Target {
+		case "wK:t1", "wK:t2", "wK:t3":
+			if !a.Safe {
+				t.Fatalf("reap action %s must be Safe under --act: %+v", a.Target, a)
+			}
+		default:
+			t.Fatalf("unexpected reap target %q: %+v", a.Target, a)
+		}
+	}
+}
+
+func TestPlanDoesNotReapBusyBlockedOrNoEvidence(t *testing.T) {
+	snap, err := Plan(reapObs(), Options{Act: true, Now: fixedNow})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, a := range snap.Actions {
+		if a.Kind != ActionReapLane {
+			continue
+		}
+		switch a.Target {
+		case "wK:t5", "wK:t6", "wK:t7":
+			t.Fatalf("must not reap busy/no-evidence/blocked lane: %+v", a)
+		}
+	}
+}
+
+func TestPlanKeepsIdleLaneAwaitingVerdict(t *testing.T) {
+	snap, err := Plan(reapObs(), Options{Act: true, Now: fixedNow})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, a := range snap.Actions {
+		if a.Kind == ActionReapLane && a.Target == "wK:t4" {
+			t.Fatalf("must not reap lane awaiting verdict it must act on: %+v", a)
+		}
+	}
+}
+
+func TestPlanObserveReapIsWouldRunNotSafe(t *testing.T) {
+	snap, err := Plan(reapObs(), Options{Now: fixedNow})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snap.Mode != ModeObserve {
+		t.Fatalf("mode=%s", snap.Mode)
+	}
+	for _, a := range snap.Actions {
+		if a.Kind == ActionWouldRun && strings.Contains(a.WouldRun, "reap_lane") {
+			if a.Safe {
+				t.Fatalf("observe reap must not be Safe: %+v", a)
+			}
+		}
+		if a.Kind == ActionReapLane {
+			t.Fatalf("observe must not plan concrete reap: %+v", a)
+		}
+	}
+}
+
+func TestApplyReapsEligibleLanes(t *testing.T) {
+	obs := reapObs()
+	actor := &recordingActor{}
+	snap, err := Beat(context.Background(), obs, Options{Act: true, Now: fixedNow}, actor)
+	if err != nil {
+		t.Fatalf("beat: %v", err)
+	}
+	if len(actor.reaped) != 3 {
+		t.Fatalf("expected 3 reaped lanes, got %d: %+v", len(actor.reaped), actor.reaped)
+	}
+	for _, lane := range actor.reaped {
+		switch lane.TabID {
+		case "wK:t1", "wK:t2", "wK:t3":
+		default:
+			t.Fatalf("unexpected reaped lane: %+v", lane)
+		}
+	}
+	if snap.ExitCode != 0 {
+		t.Fatalf("successful reap beat must exit 0, got %d", snap.ExitCode)
+	}
+	if snap.Counts.Applied < 3 {
+		t.Fatalf("expected at least 3 applied actions (reaps), got %d: %+v", snap.Counts.Applied, snap.Counts)
+	}
+}
+
+func TestApplyReapFailureIsHardError(t *testing.T) {
+	obs := reapObs()
+	actor := &recordingActor{failReapLane: true}
+	snap, err := Beat(context.Background(), obs, Options{Act: true, Now: fixedNow}, actor)
+	if err == nil {
+		t.Fatal("expected hard error from reap failure")
+	}
+	if len(actor.reaped) != 0 {
+		t.Fatalf("no lanes should be reaped on failure, got %d", len(actor.reaped))
+	}
+	if snap.ExitCode == 0 {
+		t.Fatal("reap failure must set non-zero exit")
+	}
+	for _, a := range snap.Actions {
+		if a.Kind == ActionReapLane && a.ApplyError == "" {
+			t.Fatalf("reap action must record apply error: %+v", a)
+		}
+	}
+}
+
+func TestApplyObserveDoesNotReap(t *testing.T) {
+	obs := reapObs()
+	actor := &recordingActor{}
+	snap, err := Beat(context.Background(), obs, Options{Now: fixedNow}, actor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(actor.reaped) != 0 {
+		t.Fatalf("observe must not reap any lanes, got %d", len(actor.reaped))
+	}
+	if snap.ExitCode != 0 {
+		t.Fatalf("observe exit=%d", snap.ExitCode)
+	}
+}
+
+// Mutation guard: if someone silences the reap for awaiting-verdict by
+// clearing AwaitingVerdict, this test proves the reap fires — ensuring the
+// KEEP distinction is non-vacuous.
+func TestReapAwaitingVerdictFlipIsNonVacuous(t *testing.T) {
+	obs := reapObs()
+	snap, err := Plan(obs, Options{Act: true, Now: fixedNow})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, a := range snap.Actions {
+		if a.Kind == ActionReapLane && a.Target == "wK:t4" {
+			t.Fatalf("awaiting-verdict lane must not be reaped: %+v", a)
+		}
+	}
+	obs.Herdr.Agents[3].AwaitingVerdict = false
+	snap2, err := Plan(obs, Options{Act: true, Now: fixedNow})
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, a := range snap2.Actions {
+		if a.Kind == ActionReapLane && a.Target == "wK:t4" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("clearing AwaitingVerdict must produce a reap — KEEP distinction is non-vacuous")
 	}
 }
