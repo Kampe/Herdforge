@@ -482,8 +482,27 @@ type drainDispatcher struct {
 	project string
 }
 
+// BoardComplete closes a card through the same authority `herd board-done` uses.
+//
+// This branch was written against the old positional BoardDone(ctx, tp, root,
+// project, ref, evidenceSHA, force). FAC-132 replaced that with a DoneRequest
+// whose closing authority is a task-bound completion RECEIPT (or an explicit,
+// attributable override) -- a bare evidence SHA is no longer sufficient to move
+// a card. buildDoneRequest is the shared loader that both CLI call sites use, so
+// the drain path cannot close a card by a weaker rule than the CLI.
+//
+// evidenceSHA is retained in the signature because callers still record it, but
+// it is deliberately NOT passed as closing authority: doing so would reintroduce
+// exactly the evidence class FAC-132 removed.
 func (d drainDispatcher) BoardComplete(ctx context.Context, ref, evidenceSHA string) error {
-	res, err := hsync.BoardDone(ctx, d.tasks, d.root, d.project, ref, evidenceSHA, false)
+	_ = evidenceSHA
+	req, closeAuthority, err := buildDoneRequest(d.root, d.project, ref, "", nil)
+	if err != nil {
+		closeAuthority()
+		return err
+	}
+	res, err := hsync.BoardDone(ctx, d.tasks, req)
+	closeAuthority()
 	if err != nil {
 		return err
 	}
