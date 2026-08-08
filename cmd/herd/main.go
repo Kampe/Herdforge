@@ -4563,7 +4563,6 @@ func runDrainCommand(args []string, out, errOut io.Writer) int {
 	if *selftest {
 		return runDrainSelftest()
 	}
-	_ = *autoTiers // retained for report/commands compatibility until FAC-184 adapters land
 	if *maxReview < 0 || *maxHarvest < 0 || *maxRelaunch < 0 {
 		fmt.Fprintln(errOut, "herd-drain: max bounds must be non-negative")
 		return 2
@@ -4574,15 +4573,20 @@ func runDrainCommand(args []string, out, errOut io.Writer) int {
 	stale := drainIntEnv("HERD_DRAIN_STALE_BEHIND", 20)
 	root := "."
 	var tp provider.TaskProvider
-	if cfg, err := config.LoadConfig(filepath.Join(root, ".herd", "herd.yaml")); err == nil {
+	cfg, cfgErr := config.LoadConfig(filepath.Join(root, ".herd", "herd.yaml"))
+	if cfgErr == nil {
 		// The action gate accepts only configured standing lane identities.
 		// Evidence is never upgraded into a standing lane by shape alone.
-		tp, err = loadTaskProvider(cfg)
-		if err != nil && !*asJSON {
-			fmt.Fprintf(errOut, "herd-drain: UNKNOWN Kaneo review-cap posture: %v\n", err)
+		var providerErr error
+		tp, providerErr = loadTaskProvider(cfg)
+		if providerErr != nil {
+			tp = nil
+			if !*asJSON {
+				fmt.Fprintf(errOut, "herd-drain: UNKNOWN Kaneo review-cap posture: %v\n", providerErr)
+			}
 		}
 	} else if !*asJSON {
-		fmt.Fprintf(errOut, "herd-drain: UNKNOWN Kaneo review-cap posture: %v\n", err)
+		fmt.Fprintf(errOut, "herd-drain: UNKNOWN Kaneo review-cap posture: %v\n", cfgErr)
 	}
 	h := harvest.NewHarvester(root)
 	harvestResult, err := h.Harvest(context.Background())
@@ -4600,7 +4604,7 @@ func runDrainCommand(args []string, out, errOut io.Writer) int {
 		fmt.Fprintf(errOut, "herd-drain: %v\n", err)
 		return 1
 	}
-	if cfg, err := config.LoadConfig(filepath.Join(root, ".herd", "herd.yaml")); err == nil {
+	if cfgErr == nil {
 		for _, lane := range cfg.Lanes {
 			if lane.Standing {
 				report.StandingLanes = append(report.StandingLanes, lane.Name)
@@ -4628,8 +4632,21 @@ func runDrainCommand(args []string, out, errOut io.Writer) int {
 		printDrainCommandsTo(out, report)
 	}
 	if *act {
-		fmt.Fprintln(out, "herd-drain: REFUSED --act: FAC-184 compiled review/ledger/harvest/cap adapters are unavailable; FAC-182 durable control-envelope delivery is blocked")
-		return 1
+		// Missing authority keeps the fail-closed default hooks: every action
+		// is then refused with the reason, never silently skipped.
+		hooks := defaultDrainActionHooks()
+		adapters, err := newDrainAdapters(root, ledgerPath, cfg, tp, cap)
+		unauthorized := err != nil
+		if unauthorized {
+			fmt.Fprintf(out, "herd-drain: REFUSED --act: %v\n", err)
+		} else {
+			hooks = adapters.hooks()
+		}
+		result := executeDrainActions(context.Background(), report, report.ActionEvidence, *maxReview, *maxHarvest, *maxRelaunch, *autoTiers, out, hooks)
+		if unauthorized || result.Failed {
+			return 1
+		}
+		return drainExitCode(report)
 	}
 	return drainExitCode(report)
 }
@@ -4708,7 +4725,7 @@ func printDrainCommandsTo(out io.Writer, r *review.DrainReport) {
 			fmt.Fprintf(out, "# REFUSED harvest %s: recorded tier and builder family evidence required\n", sha)
 			continue
 		}
-		fmt.Fprintf(out, "# REFUSED harvest %s: FAC-184 compiled adapter unavailable (lane=%s tier=%s sha=%s)\n", sha, e.Lane, e.Tier, sha)
+		fmt.Fprintf(out, "herd drain --act --max-harvest 1 --auto-harvest-tiers %s  # harvest lane=%s tier=%s sha=%s\n", e.Tier, e.Lane, e.Tier, sha)
 	}
 	for _, sha := range r.Shas.NeedReview {
 		e := evidence[sha]
@@ -4720,7 +4737,7 @@ func printDrainCommandsTo(out io.Writer, r *review.DrainReport) {
 		case drainForbiddenBranch(e.Branch):
 			fmt.Fprintf(out, "# REFUSED review %s: forbidden branch %s\n", sha, e.Branch)
 		default:
-			fmt.Fprintf(out, "# REFUSED review %s: FAC-184 compiled adapter unavailable (branch=%s family=%s pin=%s)\n", sha, e.Branch, e.BuilderFamily, sha)
+			fmt.Fprintf(out, "herd drain --act --max-review 1  # review branch=%s family=%s pin=%s\n", e.Branch, e.BuilderFamily, sha)
 		}
 	}
 }
@@ -4751,16 +4768,18 @@ type drainActionResult struct {
 	Failed                               bool
 }
 
+// defaultDrainActionHooks is the no-authority beat: the compiled adapters
+// exist, but nothing wired them, so every action refuses instead of acting.
 func defaultDrainActionHooks() drainActionHooks {
 	return drainActionHooks{
 		launchReview: func(context.Context, drainActionEvidence) error {
-			return errors.New("FAC-184 compiled review adapter unavailable")
+			return errors.New("no compiled review launch authority is configured")
 		},
 		dryRun: func(context.Context, drainActionEvidence) error {
-			return errors.New("FAC-184 compiled harvest dry-run adapter unavailable")
+			return errors.New("no compiled harvest authority is configured")
 		},
 		harvest: func(context.Context, drainActionEvidence) error {
-			return errors.New("FAC-184 compiled harvest adapter unavailable")
+			return errors.New("no compiled harvest authority is configured")
 		},
 	}
 }
@@ -5448,19 +5467,22 @@ func scopedTestCommand(worktree string) string {
 	sort.Strings(list)
 	return "go test -count=1 " + strings.Join(list, " ")
 }
+
+// runDrainSelftest verifies the drain's own integration seams. git is a hard
+// prerequisite because the report's freshness probes are git reads; herdr is
+// not, because the compiled adapters take a process API as a seam and the live
+// launcher already fails closed when the CLI is absent.
 func runDrainSelftest() int {
 	failed := false
-	for _, tool := range []string{"git", "herdr"} {
-		if _, err := exec.LookPath(tool); err != nil {
-			fmt.Printf("herd-drain selftest FAIL: missing tool %s\n", tool)
-			failed = true
-		}
+	if _, err := exec.LookPath("git"); err != nil {
+		fmt.Printf("herd-drain selftest FAIL: missing tool git: %v\n", err)
+		failed = true
 	}
-	fmt.Println("herd-drain selftest FAIL: FAC-184 compiled review/ledger/harvest/cap adapters are not installed")
-	fmt.Println("herd-drain selftest FAIL: FAC-182 durable control-envelope delivery is blocked")
-	failed = true
+	if drainSelftest(os.Stdout) != 0 {
+		failed = true
+	}
+	fmt.Println("herd-drain selftest: FAC-182 durable rebase control delivery remains blocked; rebase mail stays refused")
 	if failed {
-		fmt.Println("herd-drain selftest: FAIL (fail-closed prerequisite check)")
 		return 1
 	}
 	return 0

@@ -54,19 +54,29 @@ func TestDrainCLI_ExitContracts(t *testing.T) {
 	if len(packet) == 0 || packet["kaneo_ok"] == nil {
 		t.Fatalf("missing fixed packet keys: %s", out)
 	}
+	// --act in a repo with no compiled authority (no .herd/herd.yaml, no board
+	// provider) must refuse and exit non-zero without launching anything.
 	actCmd := exec.Command(binary, "drain", "--act")
 	actCmd.Dir, actCmd.Env = repo, env
 	actOut, actErr := actCmd.CombinedOutput()
-	if actErr == nil || !strings.Contains(string(actOut), "FAC-184") || strings.Contains(string(actOut), "launched_reviews=1") {
+	if actErr == nil || !strings.Contains(string(actOut), "REFUSED --act") || strings.Contains(string(actOut), "act_reviews=1") {
 		t.Fatalf("--act did not fail closed without side effects: %v\n%s", actErr, actOut)
 	}
 
+	// The selftest exercises the compiled adapters hermetically: it passes in a
+	// checkout with an empty bin directory and no fleet, and still reports the
+	// FAC-182 rebase-delivery block honestly.
 	cmd = exec.Command(binary, "drain", "--selftest")
 	cmd.Dir = repo
 	cmd.Env = env
 	out, err = cmd.CombinedOutput()
-	if err == nil || !strings.Contains(string(out), "FAC-184") || !strings.Contains(string(out), "FAC-182") {
-		t.Fatalf("selftest did not fail closed on blocked adapters: %v\n%s", err, out)
+	if err != nil || !strings.Contains(string(out), "selftest: PASS") || !strings.Contains(string(out), "FAC-182") {
+		t.Fatalf("selftest did not complete against compiled adapters: %v\n%s", err, out)
+	}
+	for _, banned := range []string{"bin/herd-review", "bin/herd-harvest-merge", "chainseer"} {
+		if strings.Contains(string(out), banned) {
+			t.Fatalf("selftest depends on %q: %s", banned, out)
+		}
 	}
 
 	cmd = exec.Command(binary, "drain", "--max-review", "-1")
@@ -101,10 +111,10 @@ func TestDrainOutput_UsesEvidenceAndActiveExitWork(t *testing.T) {
 	out.Reset()
 	printDrainCommandsTo(&out, r)
 	text := out.String()
-	if !strings.Contains(text, "# REFUSED review veto-sha: vetoed SHA") || !strings.Contains(text, "FAC-184 compiled adapter unavailable") || !strings.Contains(text, "pin=review-sha") {
+	if !strings.Contains(text, "# REFUSED review veto-sha: vetoed SHA") || !strings.Contains(text, "herd drain --act --max-review 1") || !strings.Contains(text, "pin=review-sha") {
 		t.Fatalf("commands lost evidence gates: %s", text)
 	}
-	if strings.Contains(text, "<branch>") || strings.Contains(text, "bin/herd-review") || strings.Contains(text, "bin/herd-harvest-merge") || !strings.Contains(text, "FAC-184 compiled adapter unavailable (lane=lane-1") {
+	if strings.Contains(text, "<branch>") || strings.Contains(text, "bin/herd-review") || strings.Contains(text, "bin/herd-harvest-merge") || strings.Contains(text, "zsh") || !strings.Contains(text, "harvest lane=lane-1") {
 		t.Fatalf("commands contain fabricated placeholders: %s", text)
 	}
 	if drainExitCode(r) != 1 {
@@ -209,7 +219,7 @@ func TestDrainActions_FAC182RefusalNoSideEffects(t *testing.T) {
 		t.Fatalf("FAC-182 refusal created local state: %v", entries)
 	}
 }
-func TestDrainDefaultActionsRefuseUntilFAC184(t *testing.T) {
+func TestDrainDefaultActionsRefuseWithoutAuthority(t *testing.T) {
 	hooks := defaultDrainActionHooks()
 	for _, tc := range []struct {
 		name string
@@ -220,8 +230,8 @@ func TestDrainDefaultActionsRefuseUntilFAC184(t *testing.T) {
 		{name: "harvest", call: func() error { return hooks.harvest(context.Background(), drainActionEvidence{SHA: "sha"}) }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if err := tc.call(); err == nil || !strings.Contains(err.Error(), "FAC-184") {
-				t.Fatalf("adapter did not fail closed: %v", err)
+			if err := tc.call(); err == nil || !strings.Contains(err.Error(), "no compiled") {
+				t.Fatalf("unwired hook did not fail closed: %v", err)
 			}
 		})
 	}
