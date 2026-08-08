@@ -476,6 +476,7 @@ type fac198DockerFake struct {
 	pullErr          error
 	executionErr     error
 	removeErr        error
+	removeErrButGone bool
 	blockStart       chan struct{}
 	startHook        func(containerID string) error
 	mountInfoHook    func() error
@@ -611,6 +612,13 @@ func (f *fac198DockerFake) Remove(_ context.Context, id string) error {
 	f.removeID = id
 	f.removeAttempted = true
 	if f.removeErr != nil {
+		// removeErrButGone models the race EnsureCleanup exists for: the
+		// remove command reports an error, but the container is genuinely
+		// gone (e.g. an out-of-band removal won the race). An independent
+		// absence check is the only trustworthy signal here.
+		if f.removeErrButGone {
+			f.removed = true
+		}
 		return f.removeErr
 	}
 	f.removed = true
