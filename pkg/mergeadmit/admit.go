@@ -223,9 +223,16 @@ func (g *Gate) Admit(req Request) (*Decision, error) {
 			short(req.ProviderRevision), short(liveRevision))
 	}
 
-	// The acceptance digest must recompute from the LIVE revision, not from
-	// the one the caller asserted. Checking it against the caller's own input
-	// would make this check unable to fail.
+	// Recompute from the LIVE revision. The equality check above has already
+	// forced liveRevision == req.ProviderRevision, so the two sources agree by
+	// this point — the live value is used anyway so that reordering or
+	// removing that check cannot silently leave this one reading the caller's
+	// own assertion back to itself.
+	//
+	// What this check earns ON TOP of the revision check is the rest of the
+	// binding: a digest computed over a different ref or a different task id,
+	// or one that was simply typed in, does not recompute. Both checks are
+	// mutation-verified as individually load-bearing.
 	want := ComputeAcceptanceDigest(req.Ref, req.TaskID, liveRevision)
 	if req.AcceptanceDigest != want {
 		return g.refuse(req, CodeAcceptance,
