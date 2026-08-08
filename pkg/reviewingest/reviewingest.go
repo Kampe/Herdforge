@@ -221,6 +221,34 @@ func (a Artifact) Validate(coordinators map[string]struct{}, commitExists func(s
 	return nil
 }
 
+// ValidatePassDiff refuses a PASS verdict whose candidate has no diff against
+// the integration base. PR #151 (FAC-212) merged with 0 additions, 0
+// deletions, 0 files because the branch held only its anchor commit; the
+// adversarial reviewer returned PASS because an empty diff has nothing wrong
+// with it. A merge that changes no bytes is not a completed ticket.
+//
+// diffEmpty reports whether `git diff origin/main...sha` is empty. A nil
+// callback skips the check (fixtures that don't exercise this path). A
+// non-PASS verdict is never refused — a FAIL or BLOCKED for an empty diff is
+// correct.
+func (a Artifact) ValidatePassDiff(diffEmpty func(sha string) (bool, error)) error {
+	if a.Verdict != "PASS" {
+		return nil
+	}
+	if diffEmpty == nil {
+		return nil
+	}
+	empty, err := diffEmpty(a.SHA)
+	if err != nil {
+		return fmt.Errorf("cannot verify candidate diff for sha %s: %w", shortSHA(a.SHA), err)
+	}
+	if empty {
+		return fmt.Errorf("verdict PASS for sha %s but the candidate diff against origin/main is empty; "+
+			"a merge that changes no bytes is not a completed ticket", shortSHA(a.SHA))
+	}
+	return nil
+}
+
 func orMissing(s string) string {
 	if strings.TrimSpace(s) == "" {
 		return "<missing>"

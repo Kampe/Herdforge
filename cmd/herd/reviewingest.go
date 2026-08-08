@@ -40,6 +40,14 @@ func runReviewIngest() {
 		return exec.Command("git", "rev-parse", "--verify", "-q", sha+"^{commit}").Run() == nil
 	}
 
+	diffEmpty := func(sha string) (bool, error) {
+		out, err := exec.Command("git", "diff", "origin/main..."+sha).Output()
+		if err != nil {
+			return false, fmt.Errorf("git diff origin/main...%s: %w", sha[:min(12, len(sha))], err)
+		}
+		return len(strings.TrimSpace(string(out))) == 0, nil
+	}
+
 	var ledger *reviewledger.Ledger
 	if !*dryRun {
 		var err error
@@ -60,6 +68,11 @@ func runReviewIngest() {
 		}
 		a := reviewingest.Parse(string(body))
 		if err := a.Validate(coordinators, commitExists); err != nil {
+			fmt.Fprintf(os.Stderr, "REFUSED %s: %v\n", filepath.Base(f), err)
+			refused++
+			continue
+		}
+		if err := a.ValidatePassDiff(diffEmpty); err != nil {
 			fmt.Fprintf(os.Stderr, "REFUSED %s: %v\n", filepath.Base(f), err)
 			refused++
 			continue
@@ -186,62 +199,14 @@ func runHarvestMerge() {
 
 	dir := filepath.Join(".herd", "worktrees", "harvest-"+filepath.Base(plan.TempBranch))
 
-	// The harvest body is a closure returning an error rather than calling
-	// os.Exit inline. os.Exit does NOT run deferred functions, so a defer here
-	// plus os.Exit on the failure paths would skip cleanup on exactly the
-	// conflict and marker paths where a leaked worktree matters most — the very
-	// trap chainseer's EXIT trap exists to prevent, reintroduced.
-	err = func() error {
-		if out, addErr := exec.Command("git", "worktree", "add", "-B", plan.TempBranch, dir, *base).CombinedOutput(); addErr != nil {
-			return fmt.Errorf("worktree add: %v: %s", addErr, out)
-		}
-		for _, c := range commits {
-			out, pickErr := exec.Command("git", "-C", dir, "cherry-pick", c).CombinedOutput()
-			if pickErr == nil {
-				continue
-			}
-			// A commit whose content is already upstream applies to nothing and
-			// cherry-pick stops with "nothing to commit". That is NOT a
-			// conflict — the fleet opens every worktree with a reap-safe anchor
-			// commit (FAC-106) that is frequently redundant, so aborting here
-			// made every fleet branch unharvestable. Distinguish by asking git
-			// whether the tree is actually clean rather than by matching text.
-			status, _ := exec.Command("git", "-C", dir, "status", "--porcelain").Output()
-			if len(strings.TrimSpace(string(status))) == 0 {
-				if skipOut, skipErr := exec.Command("git", "-C", dir, "cherry-pick", "--skip").CombinedOutput(); skipErr != nil {
-					exec.Command("git", "-C", dir, "cherry-pick", "--abort").Run()
-					return fmt.Errorf("redundant commit %s could not be skipped:\n%s", c[:min(9, len(c))], skipOut)
-				}
-				fmt.Fprintf(os.Stderr, "herd harvest-merge: skipped %s (already upstream, no content to apply)\n", c[:min(9, len(c))])
-				continue
-			}
-			exec.Command("git", "-C", dir, "cherry-pick", "--abort").Run()
-			return fmt.Errorf("cherry-pick %s conflicted, aborting before any PR:\n%s", c[:min(9, len(c))], out)
-		}
-		// Hard stage gate: a marker in the harvested ADDED lines means the pick
-		// produced a structurally broken diff, and once it is in a PR body
-		// nobody re-reads it.
-		// A hard gate must never pass because its input failed to load: an
-		// empty diff from a failed git call would yield zero markers.
-		staged, diffErr := exec.Command("git", "-C", dir, "diff", *base+"...HEAD").Output()
-		if diffErr != nil {
-			return fmt.Errorf("cannot read the harvested diff to gate it: %w", diffErr)
-		}
-		if markers := harvestmerge.ConflictMarkers(string(staged)); len(markers) > 0 {
-			if !*allowMarkers {
-				return fmt.Errorf("REFUSED — %d conflict marker(s) in the harvested diff:\n  %s\n"+
-					"  If these are fixture CONTENT rather than a broken pick (e.g. a marker parser's\n"+
-					"  own test data), re-run with --allow-markers. There was previously no escape\n"+
-					"  hatch at all, which made pkg/conflict/conflict_test.go unharvestable by this tool.",
-					len(markers), strings.Join(markers, "\n  "))
-			}
-			// Loud and durable in the output: an override on a merge gate must
-			// never be quiet, and the operator must own it explicitly.
-			fmt.Fprintf(os.Stderr, "herd harvest-merge: WARNING --allow-markers OVERRIDE: proceeding despite %d conflict marker(s):\n  %s\n",
-				len(markers), strings.Join(markers, "\n  "))
-		}
-		return nil
-	}()
+	// The harvest body is a named function returning an error rather than
+	// calling os.Exit inline. os.Exit does NOT run deferred functions, so a
+	// defer here plus os.Exit on the failure paths would skip cleanup on
+	// exactly the conflict and marker paths where a leaked worktree matters
+	// most — the very trap chainseer's EXIT trap exists to prevent,
+	// reintroduced. Extraction also makes the body testable without
+	// subprocess orchestration.
+	err = harvestBody(dir, *base, plan.TempBranch, commits, *allowMarkers)
 
 	// Cleanup runs on the FAILURE path only — the worktree is deliberately kept
 	// on success so the coordinator can push from it.
@@ -261,6 +226,66 @@ func runHarvestMerge() {
 	fmt.Printf("  git push -u origin %s && gh pr create --title %q\n", plan.TempBranch, *title)
 	// The worktree is intentionally KEPT on success: the coordinator pushes
 	// from it. Cleanup on success is the caller's, after publishing.
+}
+
+// harvestBody cherry-picks commits into a fresh worktree off base and gates
+// the result. It returns an error rather than calling os.Exit so the caller
+// can run cleanup via a deferred function — os.Exit skips defers, which would
+// leak the worktree on exactly the failure paths where it matters most.
+func harvestBody(dir, base, tempBranch string, commits []string, allowMarkers bool) error {
+	if out, addErr := exec.Command("git", "worktree", "add", "-B", tempBranch, dir, base).CombinedOutput(); addErr != nil {
+		return fmt.Errorf("worktree add: %v: %s", addErr, out)
+	}
+	for _, c := range commits {
+		out, pickErr := exec.Command("git", "-C", dir, "cherry-pick", c).CombinedOutput()
+		if pickErr == nil {
+			continue
+		}
+		// A commit whose content is already upstream applies to nothing and
+		// cherry-pick stops with "nothing to commit". That is NOT a
+		// conflict — the fleet opens every worktree with a reap-safe anchor
+		// commit (FAC-106) that is frequently redundant, so aborting here
+		// made every fleet branch unharvestable. Distinguish by asking git
+		// whether the tree is actually clean rather than by matching text.
+		status, _ := exec.Command("git", "-C", dir, "status", "--porcelain").Output()
+		if len(strings.TrimSpace(string(status))) == 0 {
+			if skipOut, skipErr := exec.Command("git", "-C", dir, "cherry-pick", "--skip").CombinedOutput(); skipErr != nil {
+				exec.Command("git", "-C", dir, "cherry-pick", "--abort").Run()
+				return fmt.Errorf("redundant commit %s could not be skipped:\n%s", c[:min(9, len(c))], skipOut)
+			}
+			fmt.Fprintf(os.Stderr, "herd harvest-merge: skipped %s (already upstream, no content to apply)\n", c[:min(9, len(c))])
+			continue
+		}
+		exec.Command("git", "-C", dir, "cherry-pick", "--abort").Run()
+		return fmt.Errorf("cherry-pick %s conflicted, aborting before any PR:\n%s", c[:min(9, len(c))], out)
+	}
+	// Hard stage gate: a marker in the harvested ADDED lines means the pick
+	// produced a structurally broken diff, and once it is in a PR body
+	// nobody re-reads it.
+	// A hard gate must never pass because its input failed to load: an
+	// empty diff from a failed git call would yield zero markers.
+	staged, diffErr := exec.Command("git", "-C", dir, "diff", base+"...HEAD").Output()
+	if diffErr != nil {
+		return fmt.Errorf("cannot read the harvested diff to gate it: %w", diffErr)
+	}
+	if len(strings.TrimSpace(string(staged))) == 0 {
+		return fmt.Errorf("REFUSED — the harvested diff against %s is empty; "+
+			"a merge that changes no bytes is not a completed ticket (FAC-212)", base)
+	}
+	if markers := harvestmerge.ConflictMarkers(string(staged)); len(markers) > 0 {
+		if !allowMarkers {
+			return fmt.Errorf("REFUSED — %d conflict marker(s) in the harvested diff:\n  %s\n"+
+				"  If these are fixture CONTENT rather than a broken pick (e.g. a marker parser's\n"+
+				"  own test data), re-run with --allow-markers. There was previously no escape\n"+
+				"  hatch at all, which made pkg/conflict/conflict_test.go unharvestable by this tool.",
+				len(markers), strings.Join(markers, "\n  "))
+		}
+		// Loud and durable in the output: an override on a merge gate must
+		// never be quiet, and the operator must own it explicitly.
+		fmt.Fprintf(os.Stderr, "herd harvest-merge: WARNING --allow-markers OVERRIDE: proceeding despite %d conflict marker(s):\n  %s\n",
+			len(markers), strings.Join(markers, "\n  "))
+	}
+	return nil
 }
 
 // harvestMergeVerdict resolves the merge verdict for an exact candidate sha
