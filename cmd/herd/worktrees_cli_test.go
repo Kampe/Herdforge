@@ -365,3 +365,158 @@ func TestHerdWorktreesCLIUnknownPositionalArg(t *testing.T) {
 		t.Errorf("expected 'unknown arg', got:\n%s", out)
 	}
 }
+
+// TestHerdWorktreesCLIJSONFilesEmptyArray verifies that a clean worktree
+// (no ahead commits, no dirty files) serialises files as [] not null in
+// JSON output.  A nil slice marshals to null in Go, which breaks every
+// JSON consumer expecting an array.
+func TestHerdWorktreesCLIJSONFilesEmptyArray(t *testing.T) {
+	binary := buildHerd(t)
+	dir := t.TempDir()
+
+	runGitT(t, dir, "init", "--bare", "bare.git")
+	principal := filepath.Join(dir, "repo")
+	runGitT(t, dir, "clone", "bare.git", "repo")
+	runGitT(t, principal, "checkout", "-b", "main")
+	runGitT(t, principal, "config", "user.email", "t@kampe.kluster")
+	runGitT(t, principal, "config", "user.name", "FAC-104 Test")
+	runGitT(t, principal, "config", "commit.gpgSign", "false")
+	runGitT(t, principal, "config", "tag.gpgSign", "false")
+	writeRepoFile(t, principal, "README.md", "root\n")
+	runGitT(t, principal, "push", "origin", "main")
+
+	cmd := exec.Command(binary, "worktrees", "--json")
+	cmd.Dir = principal
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("worktrees --json failed: %v\n%s", err, out)
+	}
+
+	// The raw JSON must contain "files": [] not "files": null.  We check
+	// the raw bytes because json.Unmarshal into []Row would paper over
+	// the difference (a null slice stays nil, which len()==0 hides).
+	raw := string(out)
+	if strings.Contains(raw, `"files": null`) {
+		t.Errorf("files field is null, expected []\n%s", raw)
+	}
+	if !strings.Contains(raw, `"files": []`) {
+		t.Errorf("expected files: [] in JSON, got:\n%s", raw)
+	}
+
+	// Also verify via typed unmarshal that the row is well-formed.
+	var rows []Row
+	if err := json.Unmarshal(out, &rows); err != nil {
+		t.Fatalf("invalid JSON: %v\n%s", err, out)
+	}
+	if len(rows) == 0 {
+		t.Fatal("expected at least the principal worktree row")
+	}
+	for _, r := range rows {
+		if r.Files == nil {
+			t.Errorf("row branch=%s has nil Files, expected empty slice", r.Branch)
+		}
+	}
+}
+
+// TestHerdWorktreesCLISingleDashHelp verifies that -help (single dash,
+// a valid Go flag synonym) exits 0 like --help.  Previously the pre-parse
+// loop only checked --help and -h; -help fell through to the flag parser
+// which returned flag.ErrHelp, and the error path exited 2.
+func TestHerdWorktreesCLISingleDashHelp(t *testing.T) {
+	binary := buildHerd(t)
+	dir := ftpdHerdWorktreesRepo(t)
+
+	cmd := exec.Command(binary, "worktrees", "-help")
+	cmd.Dir = dir
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("expected exit 0 for -help, got %v\n%s", err, out)
+	}
+	if !strings.Contains(string(out), "herd-worktrees") {
+		t.Errorf("expected herd-worktrees header, got:\n%s", out)
+	}
+}
+
+// TestHerdWorktreesCLIUnknownFlagMessage verifies that an unknown flag
+// produces the spec-contracted stderr message "herd-worktrees: unknown
+// arg X" — not the Go flag package's default "flag provided but not
+// defined: -X".
+func TestHerdWorktreesCLIUnknownFlagMessage(t *testing.T) {
+	binary := buildHerd(t)
+	dir := ftpdHerdWorktreesRepo(t)
+
+	cmd := exec.Command(binary, "worktrees", "--bogus")
+	cmd.Dir = dir
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatal("expected exit 2 for unknown flag")
+	}
+	if ee, ok := err.(*exec.ExitError); !ok || ee.ExitCode() != 2 {
+		t.Fatalf("expected exit code 2, got %v\n%s", err, out)
+	}
+	s := string(out)
+	if !strings.Contains(s, "herd-worktrees: unknown arg --bogus") {
+		t.Errorf("expected 'herd-worktrees: unknown arg --bogus', got:\n%s", s)
+	}
+	// The flag package's default message must NOT appear.
+	if strings.Contains(s, "flag provided but not defined") {
+		t.Errorf("flag package default message leaked, got:\n%s", s)
+	}
+}
+
+// TestHerdWorktreesCLIRebasedBranchAheadZero verifies that a branch whose
+// commits are patch-equivalent to origin/main (e.g. after a rebase-merge)
+// reports ahead=0.  This uses git cherry, not rev-list, because
+// reachability would misreport already-merged branches as ahead.
+func TestHerdWorktreesCLIRebasedBranchAheadZero(t *testing.T) {
+	binary := buildHerd(t)
+	dir := t.TempDir()
+
+	runGitT(t, dir, "init", "--bare", "bare.git")
+	principal := filepath.Join(dir, "repo")
+	runGitT(t, dir, "clone", "bare.git", "repo")
+	runGitT(t, principal, "checkout", "-b", "main")
+	runGitT(t, principal, "config", "user.email", "t@kampe.kluster")
+	runGitT(t, principal, "config", "user.name", "FAC-104 Test")
+	runGitT(t, principal, "config", "commit.gpgSign", "false")
+	runGitT(t, principal, "config", "tag.gpgSign", "false")
+	writeRepoFile(t, principal, "README.md", "root\n")
+	runGitT(t, principal, "push", "origin", "main")
+
+	// Create a branch with one commit that touches a unique file.
+	runGitT(t, principal, "branch", "herd/fac-rebase", "main")
+	wt := filepath.Join(dir, "wt-rebase")
+	runGitT(t, principal, "worktree", "add", wt, "herd/fac-rebase")
+	runGitT(t, wt, "config", "user.email", "t@kampe.kluster")
+	runGitT(t, wt, "config", "user.name", "FAC-104 Test")
+	runGitT(t, wt, "config", "commit.gpgSign", "false")
+	runGitT(t, wt, "config", "tag.gpgSign", "false")
+	writeRepoFile(t, wt, "pkg/rebased.go", "package pkg\n// rebased\n")
+
+	// Cherry-pick that commit onto main so the patches are equivalent.
+	branchHead := strings.TrimSpace(runGitT(t, wt, "rev-parse", "HEAD"))
+	runGitT(t, principal, "cherry-pick", branchHead)
+	runGitT(t, principal, "push", "origin", "main")
+
+	// Now the branch's commit is patch-equivalent to a commit on
+	// origin/main.  git cherry should report 0 ahead.
+	cmd := exec.Command(binary, "worktrees", "--json")
+	cmd.Dir = principal
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("worktrees --json failed: %v\n%s", err, out)
+	}
+	var rows []Row
+	if err := json.Unmarshal(out, &rows); err != nil {
+		t.Fatalf("invalid JSON: %v\n%s", err, out)
+	}
+	for _, r := range rows {
+		if r.Branch == "herd/fac-rebase" {
+			if r.Ahead != 0 {
+				t.Errorf("rebased branch should have ahead=0 (patch-equivalent), got ahead=%d", r.Ahead)
+			}
+			return
+		}
+	}
+	t.Fatal("herd/fac-rebase branch not found in worktree rows")
+}

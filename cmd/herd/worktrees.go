@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -35,7 +36,7 @@ func runWorktrees() {
 	fs := flag.NewFlagSet("worktrees", flag.ContinueOnError)
 	jsonFlag := fs.Bool("json", false, "Output JSON array")
 	filesFlag := fs.Bool("files", false, "Also list per-worktree touched files")
-	fs.Usage = func() {
+	usage := func() {
 		fmt.Println(`herd-worktrees , one-shot collision snapshot across every repo worktree:
   {worktree, branch, ahead-of-origin/main commits, dirty files, touched files}.
   Replaces the coordinator's manual per-worktree ` + "`git log` + `git status`" + `
@@ -47,22 +48,38 @@ func runWorktrees() {
     herd worktrees --json     # machine-readable array
     herd worktrees --files    # also list per-worktree touched files`)
 	}
+	fs.Usage = usage
 
-	// Handle --help before flag parse
+	// Handle --help/-h/-help before flag parse (single-dash -help is a
+	// valid Go flag synonym for --help but the flag package returns
+	// ErrHelp which our error path would exit-code 2; catch it here).
 	for _, a := range os.Args[2:] {
-		if a == "--help" || a == "-h" {
-			fs.Usage()
+		if a == "--help" || a == "-h" || a == "-help" {
+			usage()
 			os.Exit(0)
 		}
 	}
 
+	// Suppress the flag package's own error/usage output so unknown-flag
+	// messages match the zsh contract: stderr "unknown arg X", no usage.
+	fs.SetOutput(io.Discard)
+	fs.Usage = func() {}
+
 	if err := fs.Parse(os.Args[2:]); err != nil {
-		// Print our own error message format matching bin/herd-worktrees
 		if err == flag.ErrHelp {
-			// Already handled above
-		} else {
-			fmt.Fprintf(os.Stderr, "herd-worktrees: %v\n", err)
+			usage()
+			os.Exit(0)
 		}
+		// Identify the first unknown arg from the original argv, not
+		// the flag package's normalised error text.
+		for _, a := range os.Args[2:] {
+			if a == "--json" || a == "--files" || a == "--help" || a == "-h" || a == "-help" {
+				continue
+			}
+			fmt.Fprintf(os.Stderr, "herd-worktrees: unknown arg %s\n", a)
+			os.Exit(2)
+		}
+		fmt.Fprintf(os.Stderr, "herd-worktrees: %v\n", err)
 		os.Exit(2)
 	}
 
@@ -120,7 +137,9 @@ func runWorktrees() {
 		entries = append(entries, wtEntry{Path: path, Locked: locked})
 	}
 
-	var rows []Row
+	// Pre-allocate so JSON marshals to [] not null when no worktrees
+	// survive the missing-dir skip.
+	rows := make([]Row, 0, len(entries))
 
 	for _, e := range entries {
 		// Skip vanished worktree directories
@@ -131,6 +150,7 @@ func runWorktrees() {
 		r := Row{
 			Worktree: e.Path,
 			Locked:   e.Locked,
+			Files:    []string{},
 		}
 
 		r.Branch = runGitOrDefault(ctx, e.Path, "?", "rev-parse", "--abbrev-ref", "HEAD")
