@@ -6,10 +6,11 @@ import (
 	"fmt"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/Kampe/Herdforge/pkg/lifecycle"
-	"time"
 )
 
 // fakeProviderTask models one task's revision/status/highest-accepted
@@ -184,6 +185,88 @@ func newTestOutbox(t *testing.T) *SQLiteOutbox {
 	}
 	t.Cleanup(func() { o.Close() })
 	return o
+}
+
+type countingDurableOutbox struct {
+	*SQLiteOutbox
+	claimCalls atomic.Int32
+}
+
+type releaseErrorLeaseStore struct {
+	*SQLiteLeaseStore
+	err error
+}
+
+func (s *releaseErrorLeaseStore) ReleaseProviderLock(context.Context, LeaseKey, int64, string) error {
+	return s.err
+}
+
+type markFailedErrorOutbox struct {
+	*SQLiteOutbox
+	err error
+}
+
+func (o *markFailedErrorOutbox) MarkFailed(context.Context, string, string, string, time.Time) error {
+	return o.err
+}
+
+func TestCompleteProviderTransitionSurfacesMarkFailedAndReleaseErrors(t *testing.T) {
+	markErr := errors.New("mark failed unavailable")
+	releaseErr := errors.New("provider lock release unavailable")
+	baseStore := newTestStore(t)
+	store := &releaseErrorLeaseStore{SQLiteLeaseStore: baseStore, err: releaseErr}
+	baseOutbox := newTestOutbox(t)
+	outbox := &markFailedErrorOutbox{SQLiteOutbox: baseOutbox, err: markErr}
+	provider := newFakeProviderCAS()
+	provider.seed("FAC-errors", "to-do", 5)
+	mgr := NewClaimManager(store, WithHoldReader(newTransitionHoldAuthority(t)), WithProviderCAS(provider), WithDurableOutbox(outbox))
+	ctx := context.Background()
+	key := testKey("FAC-errors")
+	lease, err := mgr.Claim(ctx, transitionClaim(key, "w1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mgr.BeginProviderTransition(ctx, key, "w1", lease.Generation, "provider_mutation"); err != nil {
+		t.Fatal(err)
+	}
+	rec, err := mgr.CompleteProviderTransition(ctx, key, "w1", lease.Generation, "FAC-errors", "provider_mutation", "1", func(context.Context) error {
+		t.Fatal("stale provider revision must not mutate")
+		return nil
+	})
+	if rec == nil || rec.Status != OutboxInProgress {
+		t.Fatalf("expected preserved in-progress outbox evidence after MarkFailed failure, got %+v", rec)
+	}
+	if !errors.Is(err, ErrProviderRevisionStale) || !errors.Is(err, markErr) || !errors.Is(err, releaseErr) {
+		t.Fatalf("transition lost provider/MarkFailed/release evidence: %v", err)
+	}
+}
+
+func (o *countingDurableOutbox) Claim(ctx context.Context, key, owner string, staleAfter time.Duration, now time.Time) (*OutboxRecord, error) {
+	o.claimCalls.Add(1)
+	return o.SQLiteOutbox.Claim(ctx, key, owner, staleAfter, now)
+}
+
+func TestCompleteProviderTransitionRejectsInvalidSettlerAndTimeoutBeforeOutbox(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		settler string
+		timeout time.Duration
+	}{
+		{name: "invalid settler", settler: " ", timeout: time.Minute},
+		{name: "zero timeout", settler: "settler", timeout: 0},
+		{name: "negative timeout", settler: "settler", timeout: -time.Second},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			outbox := &countingDurableOutbox{SQLiteOutbox: newTestOutbox(t)}
+			mgr := NewClaimManager(newTestStore(t), WithProviderCAS(newFakeProviderCAS()), WithDurableOutbox(outbox), WithSettlerID(tc.settler), WithCapacityClaimTimeout(tc.timeout), WithHoldReader(newTransitionHoldAuthority(t)))
+			if _, err := mgr.CompleteProviderTransition(context.Background(), testKey("FAC-invalid-transition"), "owner", 1, "FAC-invalid-transition", "provider_mutation", "1", func(context.Context) error { return nil }); err == nil {
+				t.Fatal("invalid transition configuration unexpectedly succeeded")
+			}
+			if calls := outbox.claimCalls.Load(); calls != 0 {
+				t.Fatalf("invalid transition configuration reached outbox: %d calls", calls)
+			}
+		})
+	}
 }
 
 func TestClaimManager_ProviderTransition_HappyPath(t *testing.T) {

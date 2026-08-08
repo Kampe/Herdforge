@@ -796,7 +796,9 @@ func (d *Dispatcher) Dispatch(ctx context.Context, opts DispatchOptions) (*Dispa
 	// FAC-147: when Claims is wired, board writes use Begin/Complete + fence.
 	// Tests without Claims keep the unfenced bound path.
 	if d.Claims != nil {
-		if err := d.updateStatusFenced(ctx, task, laneName, "in-progress"); err != nil {
+		// Prefer lane.Role (forge-smith/worker/…), never lane.Name (scout/smith/…).
+		// TaskOwnershipRole only accepts known implementation roles; lane names fail closed.
+		if err := d.updateStatusFenced(ctx, task, claimRole, "in-progress"); err != nil {
 			return nil, failOwned("board_status_failed", formatBoardErr("failed to update ticket status", err))
 		}
 	} else if err := d.updateStatusBound(ctx, task.ID, "in-progress"); err != nil {
@@ -817,7 +819,7 @@ func (d *Dispatcher) Dispatch(ctx context.Context, opts DispatchOptions) (*Dispa
 	comment := fmt.Sprintf("Dispatched to worktree %s on branch %s (base %s anchor %s lease g%d owner %s)",
 		wtInfo.Path, branch, wtInfo.BaseSHA, wtInfo.AnchorRef, tok.Generation, tok.OwnerID)
 	if d.Claims != nil {
-		if err := d.addCommentFenced(ctx, task, laneName, comment); err != nil {
+		if err := d.addCommentFenced(ctx, task, claimRole, comment); err != nil {
 			return nil, failOwned("board_comment_failed", formatBoardErr("failed to add comment", err))
 		}
 	} else if err := d.addCommentBound(ctx, task.ID, comment); err != nil {

@@ -104,9 +104,13 @@ func TestFencedBoardDone_StaleGenerationRejected(t *testing.T) {
 		t.Fatalf("status=%s want done", got.Status)
 	}
 
-	// Stale generation via BoardDoneFenced directly must not re-open.
+	// Stale generation via BoardDoneFenced must be rejected even when the
+	// card is already done (idempotent short-circuit still requires a live lease).
 	key := provider.LeaseKey(".", "memory", "p", "FAC-147x")
 	_, err = hsync.BoardDoneFenced(ctx, mp, stack, key, "stale-owner", 1, req)
+	// May fail for lease-not-current or fence reject; board must stay done.
+||||||| parent of c004531c (fix(fac-147): address FAIL review — vet, fence reject, lane.Role, restore tests)
+	_, err = hsync.BoardDoneFenced(ctx, mp, stack, key, "stale-owner", 1, ".", "p", "FAC-147x", "", true)
 	// May fail for lease-not-current or fence reject; board must stay done.
 	got, _ = mp.GetTask(ctx, "t1")
 	if provider.NormalizeStatus(got.Status) != provider.StatusDone {

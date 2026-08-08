@@ -413,11 +413,16 @@ func BoardDoneFenced(
 	}
 
 	// Already done: idempotent success only for the live lease holder.
+||||||| parent of c004531c (fix(fac-147): address FAIL review — vet, fence reject, lane.Role, restore tests)
+	// Already done: idempotent success without a new fenced mutate (crash
+	// recovery / re-approve must not mint a second board effect).
 	if provider.NormalizeStatus(task.Status) == provider.StatusDone {
 		if err := requireLiveLease(ctx, stack.Manager, key, ownerID, generation); err != nil {
 			return nil, boardCallErr(fmt.Sprintf("fenced done short-circuit for %s", ref), err)
 		}
 		return &DoneResult{Ref: ref, TaskID: task.ID, Proof: proof, Overridden: override != nil}, nil
+||||||| parent of c004531c (fix(fac-147): address FAIL review — vet, fence reject, lane.Role, restore tests)
+		return &DoneResult{Ref: ref, TaskID: task.ID, Proof: proof, Forced: force && !strings.Contains(proof, "origin/main")}, nil
 	}
 
 	if err := stack.Board.MutateStatus(ctx, stack.Manager, key, ownerID, generation, task.ID, "done"); err != nil {
