@@ -94,7 +94,7 @@ func TestUniqueCommitsSkipsAlreadyUpstreamPatches(t *testing.T) {
 }
 
 func TestValidateRefusesUnmergeableHarvests(t *testing.T) {
-	base := Plan{Lane: "smith", Title: "feat: x", Commits: []string{"aaa"}, Verdict: PASS}
+	base := Plan{Lane: "smith", Title: "feat: x", Commits: []string{"aaa"}, Verdict: PASS, Diffstat: " 2 files changed, 10 insertions(+)"}
 	if err := base.Validate(); err != nil {
 		t.Fatalf("a well-formed plan must validate: %v", err)
 	}
@@ -139,5 +139,34 @@ func TestTempBranchNameIsDeterministicAndRefSafe(t *testing.T) {
 	}
 	if strings.ContainsAny(strings.TrimPrefix(a, "harvest/"), "/ ") {
 		t.Fatalf("branch name must be ref-safe: %q", a)
+	}
+}
+
+// An empty diff is not a completed ticket.
+//
+// PR #151 merged 0 additions, 0 deletions, 0 files. The branch carried only its
+// anchor commit, so len(Commits) was 1 and `git cherry` marked it '+' because no
+// patch-equivalent existed upstream. The reviewer returned PASS -- an empty diff
+// has nothing wrong with it -- and the card was nearly closed as done.
+//
+// Non-vacuity: `base` differs from `emptyDiff` ONLY in Diffstat, and base is
+// asserted to validate immediately above, so this cannot pass by accident.
+func TestValidateRefusesABranchThatChangesNoBytes(t *testing.T) {
+	base := Plan{Lane: "smith", Branch: "herd/fac-156", Title: "feat: x", Commits: []string{"aaa"}, Verdict: PASS, Diffstat: " 2 files changed, 10 insertions(+)"}
+	if err := base.Validate(); err != nil {
+		t.Fatalf("a plan with content must validate: %v", err)
+	}
+	for name, stat := range map[string]string{"absent": "", "whitespace": "   \n"} {
+		t.Run(name, func(t *testing.T) {
+			empty := base
+			empty.Diffstat = stat
+			err := empty.Validate()
+			if err == nil {
+				t.Fatal("a branch that changes no bytes must be refused")
+			}
+			if !strings.Contains(err.Error(), "changes no bytes") {
+				t.Fatalf("error must name the reason, got: %v", err)
+			}
+		})
 	}
 }

@@ -91,6 +91,9 @@ type Plan struct {
 	Commits     []string
 	WorktreeDir string
 	TempBranch  string
+	// Diffstat is `git diff --shortstat origin/main...<branch>` for the lane.
+	// Empty means the branch changes no bytes. Required: see Validate.
+	Diffstat string
 }
 
 // Validate refuses a harvest that must not proceed. Every branch here is a
@@ -113,6 +116,20 @@ func (p Plan) Validate() error {
 	}
 	if len(p.Commits) == 0 {
 		return fmt.Errorf("harvest-merge: %s has no unique commits to harvest", p.Lane)
+	}
+	// A commit COUNT is not a content check. PR #151 merged 0 additions, 0
+	// deletions, 0 files: the branch carried its anchor commit, so len(Commits)
+	// was 1 and `git cherry` marked it '+' because no patch-equivalent existed
+	// upstream. The adversarial reviewer returned PASS -- an empty diff has
+	// nothing wrong with it -- and the card was nearly closed as done.
+	//
+	// A merge that changes no bytes is not a completed ticket. An ABSENT
+	// diffstat is refused on the same principle as an absent verdict: the caller
+	// presents content evidence, it is not inferred from silence.
+	if strings.TrimSpace(p.Diffstat) == "" {
+		return fmt.Errorf("harvest-merge: %s changes no bytes against origin/main; "+
+			"an empty diff is not a completed ticket (pass the `git diff --shortstat origin/main...%s` output)",
+			p.Lane, p.Branch)
 	}
 	return nil
 }
