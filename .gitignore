@@ -47,6 +47,22 @@ opencode.json
 .herd/sessions/
 **/.herd/sessions/
 
+# FAC-133 control-plane state. SECRET-BEARING — never stage these:
+#   .herd/control/mac.secret   HMAC secret (WriteControlMACSecret, every prod dispatch)
+#   .herd/brokers/*.ctrl.json  control_token + host_creds ("Bearer $ANTHROPIC_API_KEY", ...)
+# The rest is durable runtime state (sealed envelopes, issuer sequence,
+# readiness attestation, mailboxes) that is per-machine, never reviewable.
+.herd/control/
+**/.herd/control/
+.herd/brokers/
+**/.herd/brokers/
+.herd/readiness/
+**/.herd/readiness/
+.herd/mail.jsonl
+**/.herd/mail.jsonl
+.herd/control-mail.jsonl
+**/.herd/control-mail.jsonl
+
 # compiled binaries must not be tracked
 /herd
 TASK-PACKET.md
