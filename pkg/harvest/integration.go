@@ -30,7 +30,7 @@ import (
 //  3. Merge gate — acquire lock.DirLock (PID-liveness, not timer-only),
 //     checkout main, fetch origin/main, fail-closed serialized Replay,
 //     test gate, push after complete ordered batch.
-//  4. Post-merge — proof-readback via sync.MergeEvidence, board-complete
+//  4. Post-merge — proof-readback via sync.LandedProof, board-complete
 //     via Dispatcher, ledger.Consumed (exactly-once admission spent).
 //  5. Cleanup — remove fully-merged worktrees with dirty/unique-work
 //     protection and session teardown (only after Consumed readback).
@@ -47,7 +47,7 @@ type Integration struct {
 	MaxMergeAge     time.Duration
 	DryRun          bool
 	DiskAdmission   resources.DiskAdmission
-	readback        func(context.Context, string, string, string) (string, error)
+	readback        func(context.Context, string) error
 }
 
 // AdmissionContext is the caller-asserted merge context bound into
@@ -269,11 +269,10 @@ func (in *Integration) Run(ctx context.Context) (*IntegrationResult, error) {
 		ref := hsync.NormalizeRef(branchToRef(group[0].Branch))
 		finalHead := mos[len(mos)-1].MergeSHA
 		batchOK := true
-		for i, mo := range mos {
-			proof, proofErr := in.mergeReadback(ctx, ref, mo.MergeSHA)
-			if proofErr != nil || proof == "" {
+		for i := range mos {
+			if proofErr := in.mergeReadback(ctx, group[0].Worktree); proofErr != nil {
 				batchOK = false
-				res.Errors = append(res.Errors, fmt.Sprintf("merge evidence %s order=%d: %v", ref, i, proofErr))
+				res.Errors = append(res.Errors, fmt.Sprintf("merge readback %s order=%d: %v", ref, i, proofErr))
 			}
 		}
 		if err := ensureRemoteReplayHead(ctx, in.RepoRoot, finalHead); err != nil {
@@ -423,11 +422,11 @@ func allEligible(group []ReviewGateOutcome) bool {
 	return true
 }
 
-func (in *Integration) mergeReadback(ctx context.Context, ref, sha string) (string, error) {
+func (in *Integration) mergeReadback(ctx context.Context, worktreeDir string) error {
 	if in.readback != nil {
-		return in.readback(ctx, in.RepoRoot, ref, sha)
+		return in.readback(ctx, worktreeDir)
 	}
-	return hsync.MergeEvidence(in.RepoRoot, ref, sha)
+	return hsync.LandedProof(worktreeDir)
 }
 
 func (in *Integration) runMergeBatch(ctx context.Context, group []ReviewGateOutcome) ([]MergeOutcome, error) {

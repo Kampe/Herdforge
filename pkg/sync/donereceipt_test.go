@@ -179,12 +179,14 @@ func TestEmptyCommitNamingTicketCannotClose(t *testing.T) {
 
 	t.Run("commit subject alone is not authority", func(t *testing.T) {
 		cp := newReceiptBoard(t, "FAC-777", "task-777")
-		// The commit-subject hint IS there — MergeEvidence still finds it.
-		hint, err := MergeEvidence(dir, "FAC-777", "")
-		if err != nil || !strings.Contains(hint, "FAC-777") {
-			t.Fatalf("fixture must produce a commit-subject hint, got %q err %v", hint, err)
+		// The commit-subject hint IS there — commitHint still finds it.
+		// (FAC-213: MergeEvidence is gone; commitHint is the diagnostic-only
+		// successor that AuditDone uses.)
+		hint := commitHint(dir, "FAC-777")
+		if !strings.Contains(hint, "FAC-777") {
+			t.Fatalf("fixture must produce a commit-subject hint, got %q", hint)
 		}
-		_, err = BoardDone(ctx, cp, DoneRequest{RepoDir: dir, ProjectID: "p1", Ref: "FAC-777"})
+		_, err := BoardDone(ctx, cp, DoneRequest{RepoDir: dir, ProjectID: "p1", Ref: "FAC-777"})
 		if !errors.Is(err, ErrNoEvidence) {
 			t.Fatalf("a commit naming the ticket must not close it, got %v", err)
 		}

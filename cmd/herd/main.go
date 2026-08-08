@@ -394,7 +394,7 @@ func printUsage() {
 	fmt.Println("  scope        Publish the trusted task scope the dispatch fence resolves against")
 	fmt.Println("  review-classify   Deterministic R0-R3 risk floor for review dispatch")
 	fmt.Println("  review-ingest     Validate reviewer verdicts and admit them to the ledger")
-	fmt.Println("  harvest-merge     Cherry-pick a lane's reviewed commits onto a fresh base")
+	fmt.Println("  harvest-merge     Cherry-pick a lane's reviewed commits onto a fresh base (--verify-landed: check if a merge landed)")
 	fmt.Println("  hold       Control durable generation-fenced lane/task hold: on, off, or status")
 	fmt.Println("  review     Claim in-progress tasks for reviewer and advance to review status")
 	fmt.Println("  approve    Move in-review cards to done, gated on merge evidence")
@@ -1889,8 +1889,12 @@ func runBoardDone() {
 				os.Exit(1)
 			}
 		}
-		if _, err := hsync.MergeEvidence(".", "SELFTEST-0", ""); err != nil {
-			fmt.Fprintf(os.Stderr, "board-done selftest FAIL: %v\n", err)
+		// FAC-213: the selftest used to call MergeEvidence (the grep-based
+		// hint). That function is gone — it was defect #1. The selftest now
+		// verifies that origin/main is reachable, which is the precondition
+		// for LandedProof and BoardDone.
+		if out, err := exec.Command("git", "rev-parse", "--verify", "-q", "origin/main").Output(); err != nil || strings.TrimSpace(string(out)) == "" {
+			fmt.Fprintf(os.Stderr, "board-done selftest FAIL: no origin/main: %v\n", err)
 			os.Exit(1)
 		}
 		fmt.Println("board-done selftest PASS")

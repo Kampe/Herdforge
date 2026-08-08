@@ -11,6 +11,7 @@ import (
 	"github.com/Kampe/Herdforge/pkg/harvestmerge"
 	"github.com/Kampe/Herdforge/pkg/reviewingest"
 	"github.com/Kampe/Herdforge/pkg/reviewledger"
+	hsync "github.com/Kampe/Herdforge/pkg/sync"
 )
 
 // runReviewIngest ports bin/herd-review-ingest: validate reviewer verdict
@@ -121,6 +122,10 @@ func runReviewIngest() {
 // Picking onto current main rather than pinning at the lane's older HEAD is
 // what makes this safe: conflicts surface locally and the merge-base stays at
 // origin/main, so the downstream stale-base gate cannot trip on current work.
+//
+// FAC-213: --verify-landed runs the single sound "did this merge?" check
+// (LandedProof) on the lane's worktree instead of cherry-picking. The
+// coordinator uses it after a PR merge to confirm the work is on origin/main.
 func runHarvestMerge() {
 	fs := flag.NewFlagSet("harvest-merge", flag.ExitOnError)
 	branch := fs.String("branch", "", "Lane branch to harvest (required)")
@@ -136,6 +141,8 @@ func runHarvestMerge() {
 	dryRun := fs.Bool("dry-run", false, "Plan and gate without creating the worktree")
 	allowMarkers := fs.Bool("allow-markers", false,
 		"Proceed despite conflict markers in the harvested diff (for files whose CONTENT is marker fixtures)")
+	verifyLanded := fs.Bool("verify-landed", false,
+		"Check whether the lane's work is on origin/main (rebase + empty diff). Use after a PR merge.")
 
 	// Pull the leading positional out BEFORE flag parsing: Go's flag package
 	// stops at the first non-flag argument, so `harvest-merge <lane> --branch x`
@@ -149,6 +156,31 @@ func runHarvestMerge() {
 
 	if lane == "" || *branch == "" {
 		fmt.Fprintln(os.Stderr, "usage: herd harvest-merge <lane> --branch <branch> --title <t> [--verdict PASS]")
+		fmt.Fprintln(os.Stderr, "       herd harvest-merge <lane> --branch <branch> --verify-landed")
+		os.Exit(2)
+	}
+
+	// FAC-213: --verify-landed is the post-merge "did this merge?" check. It
+	// finds the worktree checked out to --branch and runs LandedProof on it.
+	// This replaces the three broken checks (grep, pre-rebase tip ancestry,
+	// stale remote branch comparison) with the single sound implementation.
+	if *verifyLanded {
+		wtDir := worktreeForBranch(*branch)
+		if wtDir == "" {
+			fmt.Fprintf(os.Stderr, "herd harvest-merge: no worktree found for branch %s\n", *branch)
+			os.Exit(1)
+		}
+		if err := hsync.LandedProof(wtDir); err != nil {
+			fmt.Fprintf(os.Stderr, "herd harvest-merge: NOT LANDED — %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("herd harvest-merge: LANDED — %s worktree is on origin/main (rebase + empty diff)\n", *branch)
+		return
+	}
+
+	if *title == "" {
+		fmt.Fprintln(os.Stderr, "usage: herd harvest-merge <lane> --branch <branch> --title <t> [--verdict PASS]")
+		fmt.Fprintln(os.Stderr, "       (or use --verify-landed to check if a merge landed)")
 		os.Exit(2)
 	}
 
@@ -334,4 +366,27 @@ func min(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// worktreeForBranch finds the worktree directory whose checked-out branch
+// matches branch. Returns "" when no worktree holds the branch. Used by
+// harvest-merge --verify-landed to locate the lane's worktree for LandedProof.
+func worktreeForBranch(branch string) string {
+	out, err := exec.Command("git", "worktree", "list", "--porcelain").Output()
+	if err != nil {
+		return ""
+	}
+	var dir string
+	for _, ln := range strings.Split(string(out), "\n") {
+		switch {
+		case strings.HasPrefix(ln, "worktree "):
+			dir = strings.TrimSpace(strings.TrimPrefix(ln, "worktree "))
+		case strings.HasPrefix(ln, "branch "):
+			b := strings.TrimSpace(strings.TrimPrefix(ln, "branch "))
+			if b == "refs/heads/"+branch || b == branch {
+				return dir
+			}
+		}
+	}
+	return ""
 }

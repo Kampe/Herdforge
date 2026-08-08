@@ -736,12 +736,12 @@ func TestIntegrationLaterProofFailureHasNoDownstreamEffects(t *testing.T) {
 	fd := &recordingDispatcher{}
 	in := NewIntegration(NewHarvester(root), nil, fd, l, root, withAdmit("FAC-181"))
 	proofCalls := 0
-	in.readback = func(_ context.Context, _, _ string, sha string) (string, error) {
+	in.readback = func(_ context.Context, _ string) error {
 		proofCalls++
-		if proofCalls == 1 && sha != "" {
-			return "verified-first", nil
+		if proofCalls == 1 {
+			return nil
 		}
-		return "", fmt.Errorf("forced final readback failure for %s", sha)
+		return fmt.Errorf("forced final readback failure")
 	}
 	res, err := in.Run(ctx)
 	if err != nil {
