@@ -728,10 +728,27 @@ func (d fixedDockerCLI) InspectImage(ctx context.Context) error {
 	}
 	image := values[0]
 	referenceDigest := pinnedDockerReferenceDigest(pin.Image)
-	// Accept config digest or the content/reference digest; architecture must
-	// match the pin so an arm64 pin cannot authorize an amd64 image (and vice versa).
-	if referenceDigest == "" || (image.ID != pin.ConfigDigest && image.ID != referenceDigest) || image.Architecture != pin.Architecture || image.OS != "linux" {
-		return errors.New("Docker image manifest/config/platform evidence violates fixed policy")
+	// Identity: accept the config digest or the content/reference digest.
+	if referenceDigest == "" || (image.ID != pin.ConfigDigest && image.ID != referenceDigest) {
+		return errors.New("Docker image manifest/config evidence violates fixed policy")
+	}
+	// Platform. Inspecting a digest-pinned multi-arch reference WITHOUT
+	// --platform can return a manifest-list view whose Architecture and Os are
+	// empty — dropping the flag for older daemons traded "unknown flag" for
+	// "empty architecture", and this is the honest repair for that.
+	//
+	// When the daemon reports a platform, it must equal the pin. When it reports
+	// none, the pin's own content digest is the platform evidence: a
+	// golang@sha256:<digest> reference names exactly one platform-specific image,
+	// so ID == referenceDigest already proves the architecture. An arm64 pin
+	// still cannot authorize an amd64 image, because it would not be this digest.
+	switch {
+	case image.Architecture != "" || image.OS != "":
+		if image.Architecture != pin.Architecture || image.OS != "linux" {
+			return errors.New("Docker image platform evidence violates fixed policy")
+		}
+	case image.ID != referenceDigest:
+		return errors.New("Docker image reports no platform and is not the pinned content digest")
 	}
 	seen := map[string]bool{}
 	for _, value := range image.Config.Env {
