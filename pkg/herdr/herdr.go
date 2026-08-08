@@ -26,7 +26,26 @@ const (
 	// accepts either form). Recognized as already-correct; never written by
 	// this package — new/repaired labels always use herdforgeLabel.
 	herdforgeLabelPipe = "Herdforge | "
+
+	// BinaryEnv overrides the herdr executable (tests inject a
+	// protocol-faithful fake).
+	BinaryEnv = "HERD_HERDR_BIN"
+	// NoLiveEnv is the hermeticity guard: when set, reaching the REAL
+	// herdr CLI is a hard error. Test processes set it so a production
+	// fallback can never touch the operator's live fleet (FAC-145).
+	NoLiveEnv = "HERD_NO_LIVE_HERDR"
 )
+
+// binaryPath resolves the herdr executable, honouring the test override.
+func binaryPath() (string, error) {
+	if override := strings.TrimSpace(os.Getenv(BinaryEnv)); override != "" {
+		return override, nil
+	}
+	if os.Getenv(NoLiveEnv) != "" {
+		return "", fmt.Errorf("refusing to reach the LIVE herdr fleet: %s is set and no %s override was provided (FAC-145 hermeticity guard)", NoLiveEnv, BinaryEnv)
+	}
+	return herdrCLI, nil
+}
 
 // runHerdr is overridable for crash-point / unit tests (FAC-121).
 var runHerdr = runHerdrReal
@@ -841,6 +860,14 @@ type TabInfo struct {
 type PaneInfo struct {
 	ID    string
 	TabID string
+	// TerminalID is herdr's pane INCARNATION token (e.g.
+	// "term_658791cc707d56e"). tab_id/pane_id name a slot that a
+	// replacement agent can occupy; terminal_id is the only field on
+	// herdr's PaneInfo that distinguishes the process we launched from a
+	// later one that took the same slot. It is `required` on the herdr
+	// PaneInfo/AgentInfo schema, so an empty value means we are not
+	// talking to a herdr that can prove incarnation (FAC-145).
+	TerminalID string
 }
 
 // TabRecord is the exact Herdr tab-list socket read model. It intentionally
@@ -947,13 +974,20 @@ func TabCreate(opts TabCreateOptions) (*TabInfo, error) {
 				Label string `json:"label"`
 			} `json:"tab"`
 			RootPane struct {
-				PaneID string `json:"pane_id"`
-				TabID  string `json:"tab_id"`
+				PaneID     string `json:"pane_id"`
+				TabID      string `json:"tab_id"`
+				TerminalID string `json:"terminal_id"`
 			} `json:"root_pane"`
 		} `json:"result"`
 	}
 	if err := json.Unmarshal([]byte(output), &resp); err != nil {
 		return nil, fmt.Errorf("parsing tab create output: %s: %w", output, err)
+	}
+	// terminal_id is required on herdr's PaneInfo schema. Without it we
+	// cannot bind an agent's authority to its incarnation, so fail closed
+	// rather than hand back a slot-only identity (FAC-145).
+	if strings.TrimSpace(resp.Result.RootPane.TerminalID) == "" {
+		return nil, fmt.Errorf("herdr tab create: root pane carries no terminal_id; cannot bind agent incarnation (FAC-145): %s", output)
 	}
 
 	tab := &TabInfo{
@@ -961,8 +995,9 @@ func TabCreate(opts TabCreateOptions) (*TabInfo, error) {
 		Label: resp.Result.Tab.Label,
 		Cwd:   opts.Cwd,
 		Pane: PaneInfo{
-			ID:    resp.Result.RootPane.PaneID,
-			TabID: resp.Result.RootPane.TabID,
+			ID:         resp.Result.RootPane.PaneID,
+			TabID:      resp.Result.RootPane.TabID,
+			TerminalID: resp.Result.RootPane.TerminalID,
 		},
 	}
 	// FAC-172: every HostedUID path proves shell/tree UID after create — not
@@ -974,6 +1009,27 @@ func TabCreate(opts TabCreateOptions) (*TabInfo, error) {
 		}
 	}
 	return tab, nil
+}
+
+// AgentRoleEnv marks every task-agent pane: herdr injects it at tab
+// creation so processes the agent spawns inherit it, and the receipt
+// signer refuses to operate under it. It is a ROLE MARKER, not identity —
+// an ordinary environment variable a determined same-UID process can
+// scrub. Non-bypassable identity containment is FAC-133's sandbox
+// boundary; until that merges, coordinator-only signing rests on the
+// out-of-tree key location plus this marker and the cwd refusal.
+const AgentRoleEnv = "HERD_ROLE=agent"
+
+// TabForAgent creates an agent pane WITHOUT a task worktree cwd (standing
+// agents, pulse/review/forge spawns). It still carries the agent role
+// marker so every agent-facing pane is uniformly marked (FAC-145).
+func TabForAgent(workspaceID, label string, noFocus bool) (*TabInfo, error) {
+	return TabCreate(TabCreateOptions{
+		Workspace: workspaceID,
+		Label:     label,
+		NoFocus:   noFocus,
+		Env:       []string{AgentRoleEnv},
+	})
 }
 
 // TabCreateForTask is the FAC-121 launch entry: requires workspace and cwd.
@@ -990,6 +1046,8 @@ func TabCreate(opts TabCreateOptions) (*TabInfo, error) {
 // Optional env entries are KEY=VALUE pairs passed to herdr tab create --env
 // (FAC-190: PATH must put the confinement agent wrapper first). HostedUID
 // launch env is appended after caller env when isolation is required.
+//
+// FAC-145: every task pane also carries the agent role marker.
 func TabCreateForTask(workspaceID, label, cwd string, noFocus bool, env ...string) (*TabInfo, error) {
 	cwd = strings.TrimSpace(cwd)
 	if cwd == "" {
@@ -1011,7 +1069,9 @@ func TabCreateForTask(workspaceID, label, cwd string, noFocus bool, env ...strin
 		Label:     label,
 		Cwd:       abs,
 		NoFocus:   noFocus,
-		Env:       append([]string(nil), env...),
+		// FAC-145 role marker first; caller env (FAC-190 PATH wrapper) after,
+		// so a caller-supplied value still wins under last-wins env semantics.
+		Env: append([]string{AgentRoleEnv}, env...),
 	}
 	if HostedUIDIsolationRequired() {
 		bUID, err := BuilderUID()
@@ -1294,7 +1354,15 @@ func AgentPrompt(target, text string, wait bool) (string, error) {
 
 // IsAvailable checks whether the herdr CLI is reachable.
 func IsAvailable() bool {
-	_, err := exec.LookPath(herdrCLI)
+	bin, err := binaryPath()
+	if err != nil {
+		return false
+	}
+	if filepath.IsAbs(bin) {
+		fi, sErr := os.Stat(bin)
+		return sErr == nil && !fi.IsDir()
+	}
+	_, err = exec.LookPath(bin)
 	return err == nil
 }
 
@@ -1339,11 +1407,85 @@ type AgentEntry struct {
 	PaneID         string       `json:"pane_id,omitempty"`
 	TabID          string       `json:"tab_id,omitempty"`
 	Workspace      string       `json:"workspace_id,omitempty"`
+	TerminalID     string       `json:"terminal_id,omitempty"`
 	Cwd            string       `json:"cwd,omitempty"`
 	TerminalTitle  string       `json:"terminal_title,omitempty"` // UI title (login/auth detection)
+	ForegroundCwd  string       `json:"foreground_cwd,omitempty"`
 	Session        AgentSession `json:"agent_session,omitempty"`
 	Revision       uint64       `json:"revision,omitempty"`
 	StateChangeSeq uint64       `json:"state_change_seq,omitempty"`
+}
+
+// SessionID renders the launch-time pane identity a receipt binds to.
+// tab/pane alone name a reusable slot, so the incarnation token is part of
+// the identity (FAC-145).
+func SessionID(p PaneInfo) string {
+	return fmt.Sprintf("%s/%s/%s", p.TabID, p.ID, p.TerminalID)
+}
+
+// splitSessionID parses a SessionID. A two-part (slot-only) id is refused:
+// it cannot distinguish the launched agent from its replacement.
+func splitSessionID(sessionID string) (tab, pane, terminal string, err error) {
+	parts := strings.Split(sessionID, "/")
+	if len(parts) != 3 || parts[0] == "" || parts[1] == "" || parts[2] == "" {
+		return "", "", "", fmt.Errorf("malformed agent session id %q: want <tab>/<pane>/<terminal_id> (FAC-145: a slot-only id cannot prove incarnation)", sessionID)
+	}
+	return parts[0], parts[1], parts[2], nil
+}
+
+// findPane locates the live agent entry for an exact incarnation.
+func findPaneIncarnation(tab, pane, terminal string) (*AgentEntry, error) {
+	agents, err := AgentList()
+	if err != nil {
+		return nil, err
+	}
+	for _, a := range agents {
+		if a.TabID == tab && a.PaneID == pane && a.TerminalID == terminal {
+			e := a
+			return &e, nil
+		}
+	}
+	return nil, nil
+}
+
+// PaneLiveCwd reads the LIVE foreground cwd herdr reports for the exact
+// pane incarnation named by sessionID. The value returned by tab create is
+// only the requested cwd echoed back; this is the terminal's actual state,
+// which is what a cwd guarantee must rest on. Matching the incarnation too
+// means a pane replaced between create and readback cannot answer for the
+// pane we launched (FAC-145).
+func PaneLiveCwd(sessionID string) (string, error) {
+	tab, pane, terminal, err := splitSessionID(sessionID)
+	if err != nil {
+		return "", err
+	}
+	a, err := findPaneIncarnation(tab, pane, terminal)
+	if err != nil {
+		return "", err
+	}
+	if a == nil {
+		return "", fmt.Errorf("herdr: no live pane %s", sessionID)
+	}
+	if a.ForegroundCwd != "" {
+		return a.ForegroundCwd, nil
+	}
+	return a.Cwd, nil
+}
+
+// SessionExists reports whether "<tab>/<pane>/<terminal_id>" names a live
+// herdr session. A replacement agent that took the same tab/pane reports a
+// different terminal_id and therefore does NOT revive the dead agent's
+// receipt authority (FAC-145).
+func SessionExists(sessionID string) (bool, error) {
+	tab, pane, terminal, err := splitSessionID(sessionID)
+	if err != nil {
+		return false, err
+	}
+	a, err := findPaneIncarnation(tab, pane, terminal)
+	if err != nil {
+		return false, err
+	}
+	return a != nil, nil
 }
 
 type PaneProcess struct {
@@ -1639,7 +1781,11 @@ func EnsureHerdforgeLabel(label string) string {
 }
 
 func runHerdrReal(args ...string) (string, error) {
-	cmd := exec.Command(herdrCLI, args...)
+	bin, binErr := binaryPath()
+	if binErr != nil {
+		return "", binErr
+	}
+	cmd := exec.Command(bin, args...)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr

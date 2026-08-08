@@ -37,7 +37,7 @@ func TestDispatchAcceptedScopePreWorktreeFailureCompensatesExactlyOnce(t *testin
 	admission := &recordingScopeAdmission{decision: scopefence.Decision{Granted: true}}
 	comp := &recordingCompensator{}
 	d := withTestLease(t, &Dispatcher{Config: scopeDispatchConfig(), TaskProvider: tp, Worktree: &mockWorktree{err: errors.New("before create")}, Compensator: comp, Herdr: &fakeHerdr{}, ScopeFence: admission})
-	if _, err := d.Dispatch(context.Background(), DispatchOptions{TicketRef: "FAC-206", NoLaunch: true}); err == nil {
+	if _, err := d.Dispatch(context.Background(), DispatchOptions{TicketRef: "FAC-206", NoLaunch: true, LeaseID: "claim:1", LeaseGeneration: 1}); err == nil {
 		t.Fatal("expected pre-worktree failure")
 	}
 	if admission.releases != 1 || admission.releaseReq.Authority != scopefence.CompensatedNoCandidate {
@@ -51,7 +51,7 @@ func TestDispatchPostWorktreeAmbiguityRetainsScopeOwnership(t *testing.T) {
 	admission := &recordingScopeAdmission{decision: scopefence.Decision{Granted: true}}
 	comp := &recordingCompensator{}
 	d := withTestLease(t, &Dispatcher{Config: scopeDispatchConfig(), TaskProvider: tp, Worktree: &mockWorktree{root: root, info: &worktree.WorktreeInfo{Path: filepath.Join(root, "wt"), Branch: "herd/fac-207", BaseSHA: "base", AnchorRef: "anchor"}}, Compensator: comp, Herdr: &fakeHerdr{}, ScopeFence: admission})
-	if _, err := d.Dispatch(context.Background(), DispatchOptions{TicketRef: "FAC-207", NoLaunch: true}); err == nil {
+	if _, err := d.Dispatch(context.Background(), DispatchOptions{TicketRef: "FAC-207", NoLaunch: true, LeaseID: "claim:1", LeaseGeneration: 1}); err == nil {
 		t.Fatal("expected board failure after worktree creation")
 	}
 	if admission.releases != 0 {
@@ -67,7 +67,7 @@ func TestProductionDispatchMissingScopeAuthorityFailsBeforeWorktree(t *testing.T
 	d.Compensator = &recordingCompensator{}
 	d.Ownership = &fixedGenerationOwnership{generation: 1}
 	d.Worktree = &mockWorktree{root: root, err: errors.New("must not create worktree")}
-	_, err := d.Dispatch(context.Background(), DispatchOptions{TicketRef: "FAC-212", NoLaunch: true})
+	_, err := d.Dispatch(context.Background(), DispatchOptions{TicketRef: "FAC-212", NoLaunch: true, LeaseID: "claim:1", LeaseGeneration: 1})
 	if err == nil || d.Worktree.(*mockWorktree).calls != 0 {
 		t.Fatalf("missing production scope authority crossed worktree boundary: err=%v calls=%d", err, d.Worktree.(*mockWorktree).calls)
 	}
@@ -75,7 +75,7 @@ func TestProductionDispatchMissingScopeAuthorityFailsBeforeWorktree(t *testing.T
 
 func TestProductionDispatcherNilScopeFenceFailsClosedBeforeProvider(t *testing.T) {
 	d := &Dispatcher{Production: true, Config: scopeDispatchConfig(), Compensator: &recordingCompensator{}, TaskProvider: &mockTaskProvider{}, Worktree: &mockWorktree{err: errors.New("must not create")}}
-	if _, err := d.Dispatch(context.Background(), DispatchOptions{TicketRef: "FAC-215", NoLaunch: true}); err == nil || !strings.Contains(err.Error(), "scope fence is required") {
+	if _, err := d.Dispatch(context.Background(), DispatchOptions{TicketRef: "FAC-215", NoLaunch: true, LeaseID: "claim:1", LeaseGeneration: 1}); err == nil || !strings.Contains(err.Error(), "scope fence is required") {
 		t.Fatal("production dispatcher bypassed nil scope fence")
 	}
 }

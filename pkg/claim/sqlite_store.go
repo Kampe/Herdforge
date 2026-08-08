@@ -313,6 +313,14 @@ func (s *SQLiteLeaseStore) currentActive(ctx context.Context, key LeaseKey) (*Le
 	return l, err
 }
 
+// PeekLatestGeneration exposes the durable per-key generation HIGH-WATER
+// across ALL lease states (active, released, expired) — the fence read
+// consumers must use: a released newer generation still fences out older
+// receipts (FAC-145; FAC-147 canonical-fence seam).
+func (s *SQLiteLeaseStore) PeekLatestGeneration(ctx context.Context, key LeaseKey) (int64, error) {
+	return s.latestGeneration(ctx, key)
+}
+
 func (s *SQLiteLeaseStore) latestGeneration(ctx context.Context, key LeaseKey) (int64, error) {
 	var gen sql.NullInt64
 	err := s.db.QueryRowContext(ctx, `SELECT MAX(generation) FROM leases

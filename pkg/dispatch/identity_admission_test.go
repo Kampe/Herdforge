@@ -58,7 +58,7 @@ func TestLaunchRepositoryIdentityFailureHasZeroHerdrAndCompensatorEffects(t *tes
 	}
 	err = d.launch(context.Background(), DispatchOptions{Decision: decision}, task, lane, &worktree.WorktreeInfo{
 		Path: filepath.Join(repo, "isolated"), Branch: "herd/fac-identity", BaseSHA: "base", AnchorRef: "anchor",
-	}, "herd/fac-identity", "packet", result, nil)
+	}, "herd/fac-identity", "packet", result, nil, validTaskContext())
 	if err == nil {
 		t.Fatal("repository identity failure unexpectedly launched")
 	}

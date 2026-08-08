@@ -226,13 +226,19 @@ type DispatchOptions struct {
 	Probe    *toolprobe.Receipt
 	NoLaunch bool
 	LaneName string
+	// LeaseID/LeaseGeneration bind the launch receipt to the durable claim
+	// fencing this dispatch (FAC-145) AND bind trusted control envelopes for the
+	// launch (FAC-133). Both tickets added this field independently; it is one
+	// value serving both, not two concepts.
+	//
+	// Zero means "unleased" and skips generation fencing downstream — but a
+	// sandboxed write-capable launch requires >0 and fails closed without it.
+	LeaseID         string
+	LeaseGeneration int64
 	// PromptVerifyTimeout bounds DeliverAndProve polling (default 60s).
 	// Production launches always require consumption proof — there is no
 	// SkipPromptVerify bypass (FAC-121 R3 repair).
 	PromptVerifyTimeout time.Duration
-	// LeaseGeneration binds trusted control envelopes for this launch (FAC-133).
-	// Must be >0 for sandboxed write-capable launch (fail-closed; no fabrications).
-	LeaseGeneration int64
 }
 
 type DispatchResult struct {
@@ -629,6 +635,20 @@ func (d *Dispatcher) Dispatch(ctx context.Context, opts DispatchOptions) (*Dispa
 		}
 	}
 
+	// Fail closed before any side effect when the task-provider project is
+	// unknown (FAC-145): an agent spawned without it resolves project_id=NULL
+	// and every downstream board read/mutation becomes nondeterministic.
+	if strings.TrimSpace(d.Config.TaskProvider.ProjectID) == "" {
+		return nil, fmt.Errorf("task_provider.project_id is required in .herd/herd.yaml (FAC-145 fail-closed; isolated agents cannot resolve a NULL project at spawn)")
+	}
+
+	// FAC-145/FAC-147 seam: every dispatch is backed by an ACQUIRED durable
+	// claim lease — no generation is ever fabricated here. The CLI acquires
+	// from the claim store and passes the real lease.
+	if strings.TrimSpace(opts.LeaseID) == "" || opts.LeaseGeneration < 1 {
+		return nil, fmt.Errorf("dispatch requires an acquired claim lease (FAC-145 fail-closed; the canonical fence source is the claim store)")
+	}
+
 	// 1. Fetch ticket from Kaneo (bounded context + health observe, FAC-150)
 	// READ-ONLY — no worktree/status/comment/tab yet (FAC-159).
 	tasks, err := d.listTasksBound(ctx, d.Config.TaskProvider.ProjectID, "")
@@ -941,6 +961,26 @@ func (d *Dispatcher) Dispatch(ctx context.Context, opts DispatchOptions) (*Dispa
 		return nil, failOwned("task_packet_write_failed", fmt.Errorf("failed to write task packet: %w", err))
 	}
 
+	// 7b. Inject the task-provider context receipt (FAC-145): every isolated
+	// agent gets provider + project + task binding at spawn — NoLaunch
+	// worktrees included, so a later manual/review launch inherits it too.
+	baseReceipt := d.taskContext(task, wtInfo, branch, lane, opts)
+	tc0, err := d.signReceipt(baseReceipt)
+	if err != nil {
+		return nil, failOwned("task_context_write_failed",
+			fmt.Errorf("failed to sign task context: %w", err))
+	}
+	if err := WriteTaskContext(wtInfo.Path, tc0); err != nil {
+		return nil, failOwned("task_context_write_failed",
+			fmt.Errorf("failed to write task context: %w", err))
+	}
+	// Durable canonical copy OUTSIDE the ephemeral worktree (FAC-145):
+	// approval/callback/readback bind through it after worktree GC.
+	if err := StoreCanonicalReceipt(d.Worktree.RepoRoot(), tc0); err != nil {
+		return nil, failOwned("task_context_write_failed",
+			fmt.Errorf("failed to store canonical receipt: %w", err))
+	}
+
 	result := &DispatchResult{
 		TicketRef:       task.Ref,
 		TicketTitle:     task.Title,
@@ -969,7 +1009,7 @@ func (d *Dispatcher) Dispatch(ctx context.Context, opts DispatchOptions) (*Dispa
 	// once via failOwned while the generation lease is still held.
 	h := d.launcher()
 	if !opts.NoLaunch && h.Available() {
-		if err := d.launch(ctx, opts, task, lane, wtInfo, branch, packet, result, tok); err != nil {
+		if err := d.launch(ctx, opts, task, lane, wtInfo, branch, packet, result, tok, baseReceipt); err != nil {
 			reason := "agent_launch_failed"
 			var lf *launchFailure
 			if errors.As(err, &lf) && lf.Reason != "" {
@@ -1218,6 +1258,7 @@ func (d *Dispatcher) launch(
 	branch, packet string,
 	result *DispatchResult,
 	tok *deps.OwnershipToken,
+	baseReceipt TaskContext,
 ) error {
 	// Launch does not own shared lifecycle compensation. requireCompensator is
 	// enforced by Dispatch before side effects; record() still needs the hook.
@@ -1272,7 +1313,6 @@ func (d *Dispatcher) launch(
 			Err:    fmt.Errorf("worktree ready but herdr workspace unresolved: %w", err),
 		}
 	}
-
 
 	// Normalize production lease/task identity for confinement + control.
 	if d.Production {
@@ -1458,6 +1498,31 @@ func (d *Dispatcher) launch(
 				if !confPrep.WrapperResolves(n) {
 					return &launchFailure{Reason: "confinement_rejected", Err: fmt.Errorf("confinement: wrapper %q not installed", n)}
 				}
+			}
+		}
+		// Stamp the resolved herdr workspace into the launch receipt (FAC-145)
+		// so the agent's callbacks bind to the exact workspace it lives in.
+		// SAME issued receipt (identical expiry and identity), with only the
+		// sanctioned same-generation transition: the herdr workspace stamp.
+		tc := baseReceipt
+		tc.HerdrWorkspace = ws
+		tc, err = d.signReceipt(tc)
+		if err != nil {
+			return &launchFailure{
+				Reason: "task_context_write_failed",
+				Err:    fmt.Errorf("failed to sign task context: %w", err),
+			}
+		}
+		if err := WriteTaskContext(wtInfo.Path, tc); err != nil {
+			return &launchFailure{
+				Reason: "task_context_write_failed",
+				Err:    fmt.Errorf("failed to stamp herdr workspace into task context: %w", err),
+			}
+		}
+		if err := StoreCanonicalReceipt(d.Worktree.RepoRoot(), tc); err != nil {
+			return &launchFailure{
+				Reason: "task_context_write_failed",
+				Err:    fmt.Errorf("failed to store canonical receipt: %w", err),
 			}
 		}
 		// FAC-139: write-capable Tab creation goes only through the launch boundary
@@ -1694,6 +1759,51 @@ func validateWorkerLaunchRequest(opts DispatchOptions) (launch.Request, error) {
 	return req, nil
 }
 
+// signReceipt issues the receipt with the coordinator's private key (kept
+// outside the repository tree; see authority.go). No signer, no dispatch.
+func (d *Dispatcher) signReceipt(tc TaskContext) (TaskContext, error) {
+	s, err := LoadSignerForConfig(d.Config.Project.Name, d.Worktree.RepoRoot())
+	if err != nil {
+		return tc, fmt.Errorf("receipt signer: %w", err)
+	}
+	return s.Issue(tc)
+}
+
+// taskContext builds the FAC-145 launch receipt for one dispatched task.
+// HerdrWorkspace is stamped later by launch() once RequireWorkspace resolves.
+// Agent receipts never carry the mutate op: board transitions stay
+// coordinator-owned.
+func (d *Dispatcher) taskContext(task *provider.Task, wtInfo *worktree.WorktreeInfo, branch string, lane *config.LaneDef, opts DispatchOptions) TaskContext {
+	// No silent role defaulting: the lane must state a known role, and the
+	// op set follows the role policy strictly.
+	role := ""
+	if lane != nil {
+		role = strings.TrimSpace(lane.Role)
+	}
+	// Every isolated agent role gets its sanctioned op set; an unknown role
+	// yields nil and the receipt fails Validate before any launch.
+	ops := OpsForRole(role)
+	return TaskContext{
+		ProviderType:      d.Config.TaskProvider.Type,
+		ProjectID:         d.Config.TaskProvider.ProjectID,
+		ProviderWorkspace: d.Config.TaskProvider.WorkspaceID,
+		ProviderProfile:   d.Config.TaskProvider.APIKeyEnv,
+		Repository:        RepositoryIdentityOrName(d.Worktree.RepoRoot(), d.Config.Project.Name),
+		Role:              role,
+		TaskRef:           task.Ref,
+		TaskID:            task.ID,
+		Branch:            branch,
+		BaseSHA:           wtInfo.BaseSHA,
+		AnchorRef:         wtInfo.AnchorRef,
+		LeaseID:           opts.LeaseID,
+		LeaseGeneration:   opts.LeaseGeneration,
+		LeaseTaskRef:      task.Ref,
+		SessionID:         NewSessionID(role, task.Ref, wtInfo.BaseSHA, opts.LeaseID),
+		AllowedOps:        ops,
+		ExpiresAt:         time.Now().Add(DefaultReceiptTTL),
+	}
+}
+
 func slugForTask(ref, title string) string {
 	s := strings.ToLower(title)
 	s = strings.TrimSpace(s)
@@ -1766,6 +1876,12 @@ func extractIntentFromTitle(title string) string {
 // FAC-222: the packet carries a ReplyTarget so agents report completion and
 // BLOCKED to the coordinator by name, instead of relying on the coordinator
 // to notice by polling. Polling stays as the backstop, not the primary signal.
+//
+// FAC-145: the read itself goes through the receipt-gated broker
+// (`herd task get`) rather than any direct provider CLI: the broker reads the
+// worktree's signed TASK-CONTEXT.json, so the agent's very first board read
+// binds to the exact provider/project/task with no ambient credentials and no
+// provider-native context file.
 func buildTaskPacket(task *provider.Task, branch, rolePath, taskProviderType, taskProviderProject string, lane *config.LaneDef, verification config.Verification, reply ReplyTarget) string {
 	var b strings.Builder
 
@@ -1781,12 +1897,8 @@ func buildTaskPacket(task *provider.Task, branch, rolePath, taskProviderType, ta
 
 	fmt.Fprintf(&b, "Worktree: current directory (Herdr cwd-enforced), branch %s. Work ONLY here — never edit files outside it.\n\n", branch)
 
-	fmt.Fprintf(&b, "Read the full spec yourself (do not wait for it inline) via the configured task provider (provider=%s project=%s):\n", taskProviderType, taskProviderProject)
-	if taskProviderType == "kaneo" {
-		fmt.Fprintf(&b, "  kaneo task get %s --full\n", task.Ref)
-	} else {
-		fmt.Fprintf(&b, "  ref: %s\n", task.Ref)
-	}
+	fmt.Fprintf(&b, "Read the full spec yourself (do not wait for it inline) via the receipt-gated broker (provider=%s project=%s):\n", taskProviderType, taskProviderProject)
+	fmt.Fprintf(&b, "  herd task get %s --full\n\n", task.Ref)
 	// The forbid line names no adapter: enumerating them would both go stale
 	// and hand a non-kaneo worker the string "kaneo" to reach for.
 	fmt.Fprintf(&b, "This repository activates ONLY the provider and project named above. Do NOT read from or write to any other task board, and do NOT invoke any other provider CLI or API — no other provider tool is authorized for this task.\n\n")

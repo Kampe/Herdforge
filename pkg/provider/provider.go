@@ -47,3 +47,18 @@ type TaskProvider interface {
 	UpdateStatus(ctx context.Context, taskID string, status string) error
 	AddComment(ctx context.Context, taskID string, body string) error
 }
+
+// CommentReader is the OPTIONAL provider capability that makes verdict
+// delivery genuinely exactly-once (FAC-145): the coordinator can read
+// comments back and confirm whether an exact effect id was already
+// delivered. Adapters that cannot expose comments make confirmed delivery
+// impossible, and authority-bearing consumers must fail closed rather than
+// publish an unverifiable verdict.
+// maxCommentPages bounds pagination walks; exceeding it is an explicit
+// refusal, never a silently partial readback (FAC-145).
+const maxCommentPages = 50
+
+type CommentReader interface {
+	// ListComments returns the comment bodies currently visible on taskID.
+	ListComments(ctx context.Context, taskID string) ([]string, error)
+}

@@ -129,6 +129,54 @@ func LandedProof(worktreeDir string) error {
 	return nil
 }
 
+// MergeEvidence returns a human-readable HINT that ref's work may be on
+// origin/main, or "" when nothing matches. See MergeEvidenceCommit for the
+// SHA-carrying variant (FAC-145 callbacks bind to the exact proof commit).
+func MergeEvidence(repoDir, ref, evidenceSHA string) (string, error) {
+	proof, _, err := MergeEvidenceCommit(repoDir, ref, evidenceSHA)
+	return proof, err
+}
+
+// MergeEvidenceCommit returns the hint plus the FULL SHA of the matching
+// commit. Order:
+//  1. an explicit evidenceSHA that is an ancestor of origin/main (hard error
+//     if given but NOT an ancestor — a wrong claim must not fall through), or
+//  2. a commit on origin/main naming the ref, with an explicit non-digit
+//     boundary so FAC-18 does not match FAC-180 (git's POSIX ERE has no \b).
+//
+// FAC-132: this is a DISCOVERY HINT, not closing authority. Neither form
+// proves a specific task's accepted candidate landed — an empty commit whose
+// subject names the ticket satisfies (2), and any unrelated ancestor satisfies
+// (1). BoardDone no longer consults it; only CompletionReceipt closes a card.
+// It is still used for post-merge ancestry readback in the harvest pipeline
+// and to surface suspicious historical closures in AuditDone.
+func MergeEvidenceCommit(repoDir, ref, evidenceSHA string) (proof, sha string, err error) {
+	// Refresh origin/main; offline is fine, we check against the local ref.
+	_, _ = git(repoDir, "fetch", "-q", "origin", "main")
+	if _, rpErr := git(repoDir, "rev-parse", "--verify", "-q", "origin/main"); rpErr != nil {
+		return "", "", fmt.Errorf("no origin/main in %s", repoDir)
+	}
+
+	if evidenceSHA != "" {
+		if _, aErr := git(repoDir, "merge-base", "--is-ancestor", evidenceSHA, "origin/main"); aErr != nil {
+			return "", "", fmt.Errorf("REFUSING: evidence %s is not an ancestor of origin/main", evidenceSHA)
+		}
+		full, _ := git(repoDir, "rev-parse", evidenceSHA)
+		short, _ := git(repoDir, "rev-parse", "--short", evidenceSHA)
+		return fmt.Sprintf("explicit evidence commit %s is an ancestor of origin/main", short), full, nil
+	}
+
+	hit, gErr := git(repoDir, "log", "origin/main", "--format=%H %s", "-E",
+		"--grep="+ref+`([^0-9]|$)`, "-1")
+	if gErr == nil && hit != "" {
+		full := strings.SplitN(hit, " ", 2)[0]
+		short, _ := git(repoDir, "rev-parse", "--short", full)
+		display := short + strings.TrimPrefix(hit, full)
+		return fmt.Sprintf("origin/main carries a commit naming %s: %s", ref, display), full, nil
+	}
+	return "", "", nil
+}
+
 // commitHint is the commit-subject match on its own, WITHOUT the fetch, so a
 // caller sweeping many refs pays for one refresh instead of one per ref. The
 // non-digit boundary is explicit because git's POSIX ERE has no \b.
@@ -147,11 +195,14 @@ func commitHint(repoDir, ref string) string {
 }
 
 // DoneResult reports what BoardDone did and why it was allowed to.
+// EvidenceSHA is the full commit hash of the merge proof ("" only on a
+// forced move with no automatic evidence).
 type DoneResult struct {
 	Ref           string
 	TaskID        string
 	Proof         string
 	Overridden    bool
+	EvidenceSHA   string
 	CommentPosted bool
 	// Idempotent is true when this exact receipt had already been consumed
 	// and no provider mutation was attempted.
@@ -297,7 +348,10 @@ func BoardDone(ctx context.Context, tp provider.TaskProvider, req DoneRequest) (
 		return nil, fmt.Errorf("%s reads back as done but its closure could not be recorded (re-run to record): %w", ref, err)
 	}
 
-	res := &DoneResult{Ref: ref, TaskID: task.ID, Proof: proof, Overridden: override != nil, ReceiptDigest: rec.ReceiptDigest}
+	// FAC-145 callbacks bind to the exact proof commit; under FAC-132 that is
+	// the receipt's merge SHA (empty for a manual override, which has none).
+	res := &DoneResult{Ref: ref, TaskID: task.ID, Proof: proof, Overridden: override != nil,
+		EvidenceSHA: rec.MergeSHA, ReceiptDigest: rec.ReceiptDigest}
 	// Comment is best-effort only when the call is non-timeout; timeout/ambiguous
 	// must not look like success with CommentPosted (FAC-150).
 	if err := tp.AddComment(ctx, task.ID, "board-done: "+proof); err != nil {

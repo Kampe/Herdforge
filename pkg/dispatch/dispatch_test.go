@@ -2,12 +2,14 @@ package dispatch
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Kampe/Herdforge/pkg/config"
 	"github.com/Kampe/Herdforge/pkg/deps"
@@ -163,7 +165,7 @@ func TestFindTicket(t *testing.T) {
 		Herdr:        &fakeHerdr{available: false},
 	})
 
-	_, err := d.Dispatch(context.Background(), DispatchOptions{TicketRef: "FAC-1", NoLaunch: true})
+	_, err := d.Dispatch(context.Background(), DispatchOptions{TicketRef: "FAC-1", NoLaunch: true, LeaseID: "claim:1", LeaseGeneration: 1})
 	// Ticket is found; mock worktree fails after lookup.
 	if err == nil {
 		t.Fatal("expected worktree error after finding ticket")
@@ -175,7 +177,7 @@ func TestFindTicket(t *testing.T) {
 		t.Fatalf("expected one CreateTaskWorktreeFrom(FAC-1), got calls=%d refs=%v", mw.calls, mw.refs)
 	}
 
-	_, err = d.Dispatch(context.Background(), DispatchOptions{TicketRef: "FAC-NONEXIST", NoLaunch: true})
+	_, err = d.Dispatch(context.Background(), DispatchOptions{TicketRef: "FAC-NONEXIST", NoLaunch: true, LeaseID: "claim:1", LeaseGeneration: 1})
 	if err == nil {
 		t.Fatal("expected error for non-existent ticket")
 	}
@@ -193,7 +195,7 @@ func TestDispatchRejectsMissingDecisionBeforeAnyProviderOrWorktreeMutation(t *te
 	tp := &mockTaskProvider{tasks: []*provider.Task{{ID: "1", Ref: "FAC-175"}}}
 	mw := &mockWorktree{err: fmt.Errorf("must not be called")}
 	d := &Dispatcher{Config: &config.Config{TaskProvider: config.TaskProvider{ProjectID: "p"}, Lanes: []config.LaneDef{{Name: "worker"}}}, TaskProvider: tp, Worktree: mw, Compensator: &recordingCompensator{}}
-	if _, err := d.Dispatch(context.Background(), DispatchOptions{TicketRef: "FAC-175"}); err == nil {
+	if _, err := d.Dispatch(context.Background(), DispatchOptions{TicketRef: "FAC-175", LeaseID: "claim:1", LeaseGeneration: 1}); err == nil {
 		t.Fatal("missing routed decision must fail closed")
 	}
 	if mw.calls != 0 {
@@ -213,7 +215,7 @@ func TestDispatchScopeFenceRejectsBeforeWorktreeOrLaunchSideEffects(t *testing.T
 		Herdr:        &fakeHerdr{available: false},
 		ScopeFence:   fence,
 	})
-	_, err := d.Dispatch(context.Background(), DispatchOptions{TicketRef: "FAC-205", NoLaunch: true})
+	_, err := d.Dispatch(context.Background(), DispatchOptions{TicketRef: "FAC-205", NoLaunch: true, LeaseID: "claim:1", LeaseGeneration: 1})
 	if err == nil || !fence.called || mw.calls != 0 {
 		t.Fatalf("scope rejection crossed worktree boundary: err=%v fence_called=%v worktree_calls=%d", err, fence.called, mw.calls)
 	}
@@ -262,8 +264,13 @@ func TestBuildTaskPacket(t *testing.T) {
 	}
 	// FAC-115: reference-based, NOT an inline spec dump — the agent reads the
 	// card itself, and the packet must be tight (context-budget fix).
-	if !strings.Contains(packet, "kaneo task get FAC-33") {
-		t.Error("packet must tell the agent to read the card by reference")
+	// FAC-145: the reference is the receipt-gated broker, never a direct
+	// provider CLI with ambient credentials.
+	if !strings.Contains(packet, "herd task get FAC-33 --full") {
+		t.Error("packet must tell the agent to read the card via the receipt-gated broker")
+	}
+	if strings.Contains(packet, "kaneo task get") || strings.Contains(packet, "--project") {
+		t.Error("packet must not reference a direct provider CLI (FAC-145 broker only)")
 	}
 	if strings.Contains(packet, "Do the thing") {
 		t.Error("packet must NOT dump the card description inline (burns agent context)")
@@ -337,28 +344,22 @@ func TestBuildTaskPacket_ReplyTargetIsNonVacuous(t *testing.T) {
 	})
 }
 
-// TestBuildTaskPacket_ProviderNeutralTaskReference is non-vacuous: it proves
-// the "read the full spec" step only names the `kaneo` CLI when kaneo is the
-// configured task provider. A regression that unconditionally emits `kaneo
-// task get` (FAC-134 review finding #2) breaks the non-kaneo case even
-// though the kaneo case would still pass.
+// TestBuildTaskPacket_ProviderNeutralTaskReference: FAC-145 — EVERY provider
+// gets the receipt-gated broker reference; no provider ever gets a direct
+// CLI reference that would ride ambient credentials outside the receipt.
 func TestBuildTaskPacket_ProviderNeutralTaskReference(t *testing.T) {
 	task := &provider.Task{Ref: "FAC-2", Title: "Task FAC-2"}
 	lane := &config.LaneDef{Name: "worker", Prompt: ".herd/prompts/worker.md"}
 	verification := config.Verification{TestCommand: "go test ./..."}
 
-	t.Run("kaneo provider gets the kaneo CLI reference", func(t *testing.T) {
-		packet := buildTaskPacket(task, "herd/fac-2", ".herd/prompts/worker.md", "kaneo", "fac-proj", lane, verification, ReplyTarget{Name: "coordinator", LeaseGeneration: 1})
-		if !strings.Contains(packet, "kaneo task get FAC-2 --full") {
-			t.Errorf("kaneo provider must reference the kaneo CLI:\n%s", packet)
-		}
-	})
-
-	for _, providerType := range []string{"github", "linear", "jira", "memory", ""} {
-		t.Run(providerType+" provider does not assume kaneo", func(t *testing.T) {
+	for _, providerType := range []string{"kaneo", "github", "linear", "jira", "memory", ""} {
+		t.Run(providerType+" provider uses the broker", func(t *testing.T) {
 			packet := buildTaskPacket(task, "herd/fac-2", ".herd/prompts/worker.md", providerType, "fac-proj", lane, verification, ReplyTarget{Name: "coordinator", LeaseGeneration: 1})
-			if strings.Contains(packet, "kaneo task get") || strings.Contains(packet, "kaneo") {
-				t.Errorf("provider %q must not assume ambient kaneo credentials:\n%s", providerType, packet)
+			if !strings.Contains(packet, "herd task get FAC-2 --full") {
+				t.Errorf("provider %q must reference the receipt-gated broker:\n%s", providerType, packet)
+			}
+			if strings.Contains(packet, "kaneo task get") || strings.Contains(packet, "--project") {
+				t.Errorf("provider %q must not reference a direct provider CLI:\n%s", providerType, packet)
 			}
 			if !strings.Contains(packet, "FAC-2") {
 				t.Errorf("packet must still reference the task ref:\n%s", packet)
@@ -423,6 +424,100 @@ func TestBuildTaskPacket_RepositoryAgnosticVerification(t *testing.T) {
 // the package directory and asserts zero ambient git/worktree side effects.
 // Regression for: go test ./pkg/dispatch creating pkg/dispatch/.herd/worktrees/fac-1
 // and local branch herd/fac-1 (FAC-121 R3 follow-up).
+// FAC-145: dispatch must land a SIGNED provider context receipt (the sole
+// authority file — no provider-native context is seeded) inside the spawned
+// worktree, and must refuse to dispatch at all when the project binding is
+// missing — before any worktree side effect.
+func TestDispatch_PropagatesTaskContextIntoWorktree(t *testing.T) {
+	tp := &mockTaskProvider{tasks: []*provider.Task{
+		// Description carries the herd-deps-v1 provenance fence launch requires.
+		{ID: "42", Ref: "FAC-9", Title: "Ninth task", Status: "to-do", Priority: "high",
+			Description: emptyDepsFence("FAC-9", "42")},
+	}}
+	cfg := &config.Config{
+		Project:      config.ProjectConfig{Name: "t", DefaultBranch: "main"},
+		TaskProvider: config.TaskProvider{Type: "kaneo", ProjectID: "proj-live", WorkspaceID: "ws-live"},
+		Lanes: []config.LaneDef{
+			{Name: "worker", Role: "worker", Model: "m", AgentKind: "opencode", Prompt: ".herd/prompts/worker.md"},
+		},
+		Verification: config.Verification{TestCommand: "go test ./..."},
+	}
+	tmpRepo, wm := initDispatchRepo(t)
+	d := NewDispatcher(cfg, tp, wm)
+	d.Compensator = &recordingCompensator{}
+	d.Herdr = &fakeHerdr{available: false}
+	res, err := d.Dispatch(context.Background(), DispatchOptions{TicketRef: "FAC-9", NoLaunch: true, LeaseID: "claim:1", LeaseGeneration: 1})
+	if err != nil {
+		t.Fatalf("dispatch: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = exec.Command("git", "-C", tmpRepo, "worktree", "remove", "--force", res.Worktree).Run()
+		os.RemoveAll(res.Worktree)
+	})
+
+	data, err := os.ReadFile(filepath.Join(res.Worktree, TaskContextFile))
+	if err != nil {
+		t.Fatalf("receipt missing from worktree: %v", err)
+	}
+	var tc TaskContext
+	if err := json.Unmarshal(data, &tc); err != nil {
+		t.Fatalf("receipt not valid JSON: %v", err)
+	}
+	if tc.ProviderType != "kaneo" || tc.ProjectID != "proj-live" || tc.ProviderWorkspace != "ws-live" ||
+		tc.TaskRef != "FAC-9" || tc.TaskID != "42" || tc.Branch != res.Branch {
+		t.Errorf("receipt binding wrong: %+v", tc)
+	}
+	if _, err := os.Stat(filepath.Join(res.Worktree, ".kaneo.json")); !os.IsNotExist(err) {
+		t.Error("no provider-native context may be seeded — the signed receipt is the sole authority (FAC-145)")
+	}
+	if tc.Repository != RepositoryIdentityOrName(tmpRepo, "t") || tc.Role != RoleWorker {
+		t.Errorf("receipt identity wrong: repo=%q role=%q", tc.Repository, tc.Role)
+	}
+	if strings.TrimSpace(tc.LeaseID) == "" || tc.LeaseGeneration < 1 || tc.BaseSHA == "" {
+		t.Errorf("receipt must carry fenceable lease + base identity: %+v", tc)
+	}
+	if !tc.ExpiresAt.After(time.Now()) {
+		t.Errorf("receipt must carry a future expiry, got %s", tc.ExpiresAt)
+	}
+	for _, op := range tc.AllowedOps {
+		if op == "mutate" {
+			t.Error("agent receipt must never carry the mutate op (board moves stay coordinator-owned)")
+		}
+	}
+	// The receipt is coordinator-signed and verifies against the repo's
+	// published key.
+	verifier, vErr := LoadVerifier(tmpRepo)
+	if vErr != nil {
+		t.Fatalf("published verification key missing after dispatch: %v", vErr)
+	}
+	if err := verifier.Verify(tc); err != nil {
+		t.Fatalf("dispatched receipt must authenticate: %v", err)
+	}
+	packet, err := os.ReadFile(filepath.Join(res.Worktree, "TASK-PACKET.md"))
+	if err != nil {
+		t.Fatalf("packet missing: %v", err)
+	}
+	if !strings.Contains(string(packet), "herd task get FAC-9 --full") {
+		t.Error("packet must direct the agent to the receipt-gated broker (FAC-145)")
+	}
+
+	// Missing project binding fails closed before any worktree side effect.
+	mw := &mockWorktree{}
+	cfgNoProj := *cfg
+	cfgNoProj.TaskProvider.ProjectID = ""
+	dBad := &Dispatcher{
+		Config: &cfgNoProj, TaskProvider: tp, Worktree: mw,
+		Compensator: &recordingCompensator{},
+		Herdr:       &fakeHerdr{available: false},
+	}
+	if _, err := dBad.Dispatch(context.Background(), DispatchOptions{TicketRef: "FAC-9", NoLaunch: true, LeaseID: "claim:1", LeaseGeneration: 1}); err == nil {
+		t.Fatal("empty project_id must fail closed")
+	}
+	if mw.calls != 0 {
+		t.Errorf("fail-closed dispatch still created %d worktree(s)", mw.calls)
+	}
+}
+
 func TestDispatch_PackageCwdNotPolluted(t *testing.T) {
 	pkgDir, err := os.Getwd()
 	if err != nil {
@@ -465,7 +560,7 @@ func TestDispatch_PackageCwdNotPolluted(t *testing.T) {
 		Compensator: &recordingCompensator{},
 		Herdr:       &fakeHerdr{available: false},
 	})
-	res, err := d.Dispatch(context.Background(), DispatchOptions{TicketRef: "FAC-1", NoLaunch: true})
+	res, err := d.Dispatch(context.Background(), DispatchOptions{TicketRef: "FAC-1", NoLaunch: true, LeaseID: "claim:1", LeaseGeneration: 1})
 	if err != nil {
 		t.Fatalf("temp-repo dispatch: %v", err)
 	}
