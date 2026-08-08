@@ -5492,6 +5492,8 @@ func runDrainSelftest() int {
 // the dispatcher binds to exactly what scopefence will resolve against. A
 // mismatch here is rejected as "trusted graph snapshot rejected", so deriving
 // both sides from the same stored row is the only way they cannot disagree.
+// When no graph has been published yet (empty revision), returns empty values;
+// dispatch will auto-publish the graph and scope during the deps gate.
 func publishedGraphBinding(root string) (string, int) {
 	store, err := scopefence.NewSQLiteStore(filepath.Join(root, ".herd", "scopefence.db"))
 	if err != nil {
@@ -5501,7 +5503,7 @@ func publishedGraphBinding(root string) (string, int) {
 	if err != nil {
 		return "", 0
 	}
-	graph, err := store.ReadGraphSnapshot(context.Background(), repository)
+	graph, err := store.ReadLatestGraphSnapshot(context.Background(), repository)
 	if err != nil {
 		return "", 0
 	}

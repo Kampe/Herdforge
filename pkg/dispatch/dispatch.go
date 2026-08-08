@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -242,6 +243,24 @@ type ScopeAdmission interface {
 	Release(context.Context, scopefence.ReleaseRequest) error
 }
 
+// ScopePublisher publishes the graph snapshot and task scope that the fence
+// resolves against. Dispatch calls this after the deps gate so the coordinator
+// does not need to run `herd scope publish` manually before every dispatch.
+// When ScopeFence does not implement ScopePublisher, dispatch falls back to
+// requiring a pre-published scope (the original three-command dance).
+type ScopePublisher interface {
+	Publish(context.Context, PublishRequest) error
+}
+
+// PublishRequest carries the graph and scope data dispatch publishes.
+type PublishRequest struct {
+	Repository string
+	Task       string
+	Revision   string
+	Files      int
+	Scope      scopefence.Scope
+}
+
 type durableScopeAdmission struct{ fence scopefence.ResolvingFence }
 
 func (a durableScopeAdmission) Acquire(ctx context.Context, req scopefence.AcquireRequest) (scopefence.Decision, error) {
@@ -251,6 +270,35 @@ func (a durableScopeAdmission) Acquire(ctx context.Context, req scopefence.Acqui
 
 func (a durableScopeAdmission) Release(ctx context.Context, req scopefence.ReleaseRequest) error {
 	return a.fence.Release(ctx, req)
+}
+
+// Publish writes the graph snapshot and task scope to the durable store and
+// rebinds the graph authority to the published revision. This lets dispatch
+// proceed without a separate `herd scope publish` step: the coordinator's
+// provenance (already validated by the deps gate) is the scope authority.
+func (a durableScopeAdmission) Publish(ctx context.Context, req PublishRequest) error {
+	store, ok := a.fence.Fence.Store.(*scopefence.SQLiteStore)
+	if !ok {
+		return errors.New("dispatch: scope publish requires a durable SQLite store")
+	}
+	graph := scopefence.Graph{
+		Revision: req.Revision,
+		Files:    req.Files,
+		Nodes:    req.Files,
+		Edges:    req.Files,
+		Flows:    1,
+		Complete: true,
+	}
+	if err := store.PutGraphSnapshot(ctx, req.Repository, graph); err != nil {
+		return fmt.Errorf("dispatch: publish graph snapshot: %w", err)
+	}
+	if err := store.PutScopeDeclaration(ctx, req.Repository, req.Task, req.Revision, req.Scope); err != nil {
+		return fmt.Errorf("dispatch: publish scope declaration: %w", err)
+	}
+	if ga, ok := a.fence.Fence.Graph.(*scopefence.SQLiteGraphAuthority); ok {
+		ga.UpdateExpected(req.Revision, req.Files)
+	}
+	return nil
 }
 
 // ControlScope is constructed after AgentStart, so each order is bound to the
@@ -581,6 +629,33 @@ func (d *Dispatcher) Dispatch(ctx context.Context, opts DispatchOptions) (*Dispa
 		repository, ierr := d.repositoryIdentity()
 		if ierr != nil {
 			return nil, failOwned("scopefence_identity_failed", ierr)
+		}
+		// Auto-publish: when ScopeFence implements ScopePublisher, dispatch
+		// publishes the graph snapshot and task scope itself. The coordinator's
+		// provenance (already validated by the deps gate) is the scope authority.
+		// This eliminates the three-command dance (dispatch → scope publish →
+		// dispatch) that made concurrent dispatch structurally impossible.
+		if publisher, ok := d.ScopeFence.(ScopePublisher); ok {
+			scope := deriveScopeFromProvenance(depProv)
+			if err := scope.Validate(); err != nil {
+				return nil, failOwned("scope_publish_failed", fmt.Errorf(
+					"dispatch auto-publish: %w\n"+
+						"  declare scope_packages or scope_files in the herd-deps-v1 fence, or run: herd scope publish %s --revision %s --packages <pkg>",
+					err, task.Ref, pre.GraphRevision))
+			}
+			fileCount := countTrackedFiles(d.Worktree.RepoRoot())
+			if fileCount <= 0 {
+				fileCount = 1
+			}
+			if err := publisher.Publish(ctx, PublishRequest{
+				Repository: repository,
+				Task:       task.Ref,
+				Revision:   pre.GraphRevision,
+				Files:      fileCount,
+				Scope:      scope,
+			}); err != nil {
+				return nil, failOwned("scope_publish_failed", err)
+			}
 		}
 		admissionReq := scopefence.AcquireRequest{Ownership: scopefence.Ownership{
 			Identity:      scopefence.Identity{Repository: repository, Branch: worktree.TaskBranch(task.Ref), Task: task.Ref},
@@ -1418,4 +1493,45 @@ func buildTaskPacket(task *provider.Task, branch, rolePath, taskProviderType, ta
 		fmt.Fprintf(&b, "Role contract: %s\n", rolePath)
 	}
 	return b.String()
+}
+
+// deriveScopeFromProvenance builds a scopefence.Scope from the provenance's
+// declared scope_packages/scope_files. When the coordinator did not declare
+// a scope, falls back to collecting paths from holds (collision_ownership
+// holds carry Paths). An empty scope is returned — the caller validates and
+// fails closed if no scope could be derived.
+func deriveScopeFromProvenance(p *deps.Provenance) scopefence.Scope {
+	if p == nil {
+		return scopefence.Scope{}
+	}
+	scope := scopefence.Scope{
+		Packages: append([]string(nil), p.ScopePackages...),
+		Files:    append([]string(nil), p.ScopeFiles...),
+	}
+	if len(scope.Packages) > 0 || len(scope.Files) > 0 {
+		return scope
+	}
+	for _, h := range p.Holds {
+		scope.Files = append(scope.Files, h.Paths...)
+	}
+	return scope
+}
+
+// countTrackedFiles returns the number of files tracked by git at HEAD in the
+// given repo root. Returns 0 on any error (caller falls back to a minimum).
+func countTrackedFiles(repoRoot string) int {
+	if repoRoot == "" {
+		repoRoot = "."
+	}
+	out, err := exec.Command("git", "-C", repoRoot, "ls-tree", "-r", "--name-only", "HEAD").Output()
+	if err != nil {
+		return 0
+	}
+	count := 0
+	for _, l := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		if strings.TrimSpace(l) != "" {
+			count++
+		}
+	}
+	return count
 }

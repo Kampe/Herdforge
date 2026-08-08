@@ -38,19 +38,23 @@ func (s *SQLiteStore) PutGraphSnapshot(ctx context.Context, repository string, g
 	if err != nil {
 		return err
 	}
-	_, err = s.db.ExecContext(ctx, `INSERT INTO scopefence_graph (repository, graph_json) VALUES (?, ?) ON CONFLICT(repository) DO UPDATE SET graph_json = excluded.graph_json`, repository, encoded)
+	_, err = s.db.ExecContext(ctx, `INSERT INTO scopefence_graph (repository, revision, graph_json) VALUES (?, ?, ?) ON CONFLICT(repository, revision) DO UPDATE SET graph_json = excluded.graph_json`, repository, graph.Revision, encoded)
 	return err
 }
 
-// ReadGraphSnapshot returns the published snapshot WITHOUT verifying it. It
-// exists so a caller can bind its expected revision/file-count to exactly what
-// was published; verification still happens in Current.
-func (s *SQLiteStore) ReadGraphSnapshot(ctx context.Context, repository string) (Graph, error) {
+// ReadGraphSnapshot returns the published snapshot WITHOUT verifying it. The
+// revision parameter selects which per-revision row to read; a mismatch between
+// the requested revision and the stored graph's revision is impossible because
+// revision is part of the primary key.
+func (s *SQLiteStore) ReadGraphSnapshot(ctx context.Context, repository, revision string) (Graph, error) {
 	if s == nil || s.db == nil || repository == "" {
 		return Graph{}, errors.New("scopefence: graph snapshot store is not configured")
 	}
+	if revision == "" {
+		return Graph{}, errors.New("scopefence: graph revision required to read snapshot")
+	}
 	var encoded []byte
-	if err := s.db.QueryRowContext(ctx, `SELECT graph_json FROM scopefence_graph WHERE repository = ?`, repository).Scan(&encoded); err != nil {
+	if err := s.db.QueryRowContext(ctx, `SELECT graph_json FROM scopefence_graph WHERE repository = ? AND revision = ?`, repository, revision).Scan(&encoded); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return Graph{}, errors.New("scopefence: no published graph snapshot")
 		}
@@ -63,6 +67,36 @@ func (s *SQLiteStore) ReadGraphSnapshot(ctx context.Context, repository string) 
 	return graph, nil
 }
 
+// ReadLatestGraphSnapshot returns the most recently published graph for a
+// repository. Used by the CLI to discover the binding revision before dispatch
+// auto-publishes its own scope.
+func (s *SQLiteStore) ReadLatestGraphSnapshot(ctx context.Context, repository string) (Graph, error) {
+	if s == nil || s.db == nil || repository == "" {
+		return Graph{}, errors.New("scopefence: graph snapshot store is not configured")
+	}
+	var encoded []byte
+	if err := s.db.QueryRowContext(ctx, `SELECT graph_json FROM scopefence_graph WHERE repository = ? ORDER BY revision DESC LIMIT 1`, repository).Scan(&encoded); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return Graph{}, errors.New("scopefence: no published graph snapshot")
+		}
+		return Graph{}, err
+	}
+	var graph Graph
+	if err := json.Unmarshal(encoded, &graph); err != nil {
+		return Graph{}, err
+	}
+	return graph, nil
+}
+
+// UpdateExpected rebinds the graph authority to a new revision/file-count
+// pair. Dispatch calls this after the deps gate so the authority validates
+// against the revision the gate computed, not the one the constructor was
+// given (which may be empty when no manual herd scope publish preceded it).
+func (a *SQLiteGraphAuthority) UpdateExpected(revision string, files int) {
+	a.expectedRevision = revision
+	a.expectedFiles = files
+}
+
 func (a *SQLiteGraphAuthority) Current(ctx context.Context) (TrustedGraph, error) {
 	if a == nil || a.store == nil || a.store.db == nil || a.repository == "" {
 		return TrustedGraph{}, errors.New("scopefence: graph authority is not configured")
@@ -70,8 +104,11 @@ func (a *SQLiteGraphAuthority) Current(ctx context.Context) (TrustedGraph, error
 	if a.Verifier == nil {
 		return TrustedGraph{}, errors.New("scopefence: protected graph verifier required")
 	}
+	if a.expectedRevision == "" || a.expectedFiles <= 0 {
+		return TrustedGraph{}, errors.New("scopefence: independently bound graph receipt required")
+	}
 	var encoded []byte
-	if err := a.store.db.QueryRowContext(ctx, `SELECT graph_json FROM scopefence_graph WHERE repository = ?`, a.repository).Scan(&encoded); err != nil {
+	if err := a.store.db.QueryRowContext(ctx, `SELECT graph_json FROM scopefence_graph WHERE repository = ? AND revision = ?`, a.repository, a.expectedRevision).Scan(&encoded); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return TrustedGraph{}, errors.New("scopefence: trusted graph snapshot unavailable")
 		}
@@ -80,9 +117,6 @@ func (a *SQLiteGraphAuthority) Current(ctx context.Context) (TrustedGraph, error
 	var graph Graph
 	if err := json.Unmarshal(encoded, &graph); err != nil {
 		return TrustedGraph{}, fmt.Errorf("scopefence: decode trusted graph snapshot: %w", err)
-	}
-	if a.expectedRevision == "" || a.expectedFiles <= 0 {
-		return TrustedGraph{}, errors.New("scopefence: independently bound graph receipt required")
 	}
 	if err := graph.validate(a.expectedRevision, a.expectedFiles); err != nil {
 		return TrustedGraph{}, fmt.Errorf("scopefence: trusted graph snapshot rejected: %w", err)

@@ -162,3 +162,123 @@ func TestDurableScopeAdmissionTwoOverlappingDispatchesOneWinner(t *testing.T) {
 		t.Fatalf("overlapping durable dispatch admissions won=%d, want exactly one", wins)
 	}
 }
+
+// TestDurableScopeAdmissionAutoPublishProvesNoManualPublishNeeded proves the
+// fix for FAC-217: dispatch.Publish publishes the graph and scope itself, so
+// no manual `herd scope publish` is required before dispatch. Before this
+// fix, every dispatch failed with "trusted task scope unavailable" until the
+// coordinator ran `herd scope publish` by hand with a copied hash.
+func TestDurableScopeAdmissionAutoPublishProvesNoManualPublishNeeded(t *testing.T) {
+	store, err := scopefence.NewSQLiteStore(filepath.Join(t.TempDir(), "scopefence.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	graphAuthority := scopefence.NewSQLiteGraphAuthority(store, "repo", "", 0)
+	graphAuthority.Verifier = testScopeAuthorityVerifier{}
+	scopeAuthority := scopefence.NewSQLiteScopeAuthority(store)
+	scopeAuthority.Verifier = testScopeAuthorityVerifier{}
+	admission := durableScopeAdmission{fence: scopefence.ResolvingFence{
+		Fence:     scopefence.Fence{Store: store, Graph: graphAuthority},
+		Authority: scopeAuthority,
+	}}
+
+	// No graph or scope is pre-published. Auto-publish should make acquire work.
+	scope := scopefence.Scope{Packages: []string{"pkg/auto"}}
+	if err := admission.Publish(context.Background(), PublishRequest{
+		Repository: "repo",
+		Task:       "FAC-AUTO",
+		Revision:   "rev-auto",
+		Files:      2,
+		Scope:      scope,
+	}); err != nil {
+		t.Fatalf("auto-publish failed: %v", err)
+	}
+
+	// Now acquire should succeed — the graph and scope were just published.
+	decision, err := admission.Acquire(context.Background(), scopefence.AcquireRequest{
+		Ownership: scopefence.Ownership{
+			Identity:      scopefence.Identity{Repository: "repo", Branch: worktree.TaskBranch("FAC-AUTO"), Task: "FAC-AUTO"},
+			Generation:    1,
+			State:         scopefence.Active,
+			GraphRevision: "rev-auto",
+		},
+		ExpectedGraphRevision: "rev-auto",
+	})
+	if err != nil {
+		t.Fatalf("acquire after auto-publish failed: %v", err)
+	}
+	if !decision.Granted || decision.Lease == nil {
+		t.Fatalf("auto-publish did not produce a granted lease: %+v", decision)
+	}
+	if !scopefence.ScopeEquals(decision.Lease.Scope, scope) {
+		t.Fatalf("auto-published scope mismatch: got=%+v want=%+v", decision.Lease.Scope, scope)
+	}
+}
+
+// TestDurableScopeAdmissionAutoPublishTwoNonOverlappingTasksBothAcquire proves
+// the fix for FAC-217: two tasks with non-overlapping scopes at the same
+// revision can both acquire without invalidating each other. Before this fix,
+// publishing scope for the second task invalidated the first because
+// scopefence_graph held one row per repository.
+func TestDurableScopeAdmissionAutoPublishTwoNonOverlappingTasksBothAcquire(t *testing.T) {
+	store, err := scopefence.NewSQLiteStore(filepath.Join(t.TempDir(), "scopefence.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	graphAuthority := scopefence.NewSQLiteGraphAuthority(store, "repo", "", 0)
+	graphAuthority.Verifier = testScopeAuthorityVerifier{}
+	scopeAuthority := scopefence.NewSQLiteScopeAuthority(store)
+	scopeAuthority.Verifier = testScopeAuthorityVerifier{}
+	admission := durableScopeAdmission{fence: scopefence.ResolvingFence{
+		Fence:     scopefence.Fence{Store: store, Graph: graphAuthority},
+		Authority: scopeAuthority,
+	}}
+
+	rev := "rev-concurrent"
+	scopeA := scopefence.Scope{Packages: []string{"pkg/alpha"}}
+	scopeB := scopefence.Scope{Packages: []string{"pkg/beta"}}
+
+	for _, tc := range []struct{ task string; scope scopefence.Scope }{
+		{"FAC-A", scopeA},
+		{"FAC-B", scopeB},
+	} {
+		if err := admission.Publish(context.Background(), PublishRequest{
+			Repository: "repo",
+			Task:       tc.task,
+			Revision:   rev,
+			Files:      2,
+			Scope:      tc.scope,
+		}); err != nil {
+			t.Fatalf("publish %s: %v", tc.task, err)
+		}
+	}
+
+	// Both tasks should acquire because their scopes do not overlap.
+	for _, tc := range []struct{ task string; scope scopefence.Scope }{
+		{"FAC-A", scopeA},
+		{"FAC-B", scopeB},
+	} {
+		decision, err := admission.Acquire(context.Background(), scopefence.AcquireRequest{
+			Ownership: scopefence.Ownership{
+				Identity:      scopefence.Identity{Repository: "repo", Branch: worktree.TaskBranch(tc.task), Task: tc.task},
+				Generation:    1,
+				State:         scopefence.Active,
+				GraphRevision: rev,
+			},
+			ExpectedGraphRevision: rev,
+		})
+		if err != nil {
+			t.Fatalf("acquire %s: %v", tc.task, err)
+		}
+		if !decision.Granted || decision.Lease == nil {
+			t.Fatalf("acquire %s not granted: %+v", tc.task, decision)
+		}
+		if !scopefence.ScopeEquals(decision.Lease.Scope, tc.scope) {
+			t.Fatalf("scope %s mismatch: got=%+v want=%+v", tc.task, decision.Lease.Scope, tc.scope)
+		}
+	}
+}
