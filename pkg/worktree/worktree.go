@@ -103,12 +103,15 @@ func (w *WorktreeManager) admitDisk(operation, targetPath string) error {
 // Branch is always the actual Git branch (never a fictional packet name).
 // BaseSHA is the fetched immutable origin/<default> commit used as the base.
 // AnchorRef is the durable ref protecting that base (and tip after anchor commit).
+// SafeRef is the durable ref protecting the lane's working tip from
+// destructive resets (FAC-214); empty when the initial write failed silently.
 type WorktreeInfo struct {
 	Path      string
 	Branch    string
 	Commit    string // worktree HEAD (after FAC-106 anchor commit when created)
 	BaseSHA   string // immutable origin base used at creation
 	AnchorRef string // refs/herd/anchors/<task>
+	SafeRef   string // refs/herd/safe/<task> (FAC-214)
 }
 
 func (w *WorktreeManager) CreateWorktree(ctx context.Context, branch string, targetDir string) error {
@@ -422,6 +425,14 @@ func (w *WorktreeManager) CreateTaskWorktreeFrom(ctx context.Context, taskRef, d
 	if info.Commit != "" {
 		_ = w.updateRef(ctx, anchorRef, info.Commit)
 		info.AnchorRef = anchorRef
+		// FAC-214: write a safe ref capturing the lane tip so a destructive
+		// `git reset --hard origin/main` cannot make real work unreachable.
+		// Best-effort at creation (matching the anchor ref write); the
+		// coordinator advances it via WriteSafeRef before each rebase.
+		safeRef := SafeRefFor(taskRef)
+		if err := w.writeSafeRef(ctx, safeRef, info.Commit); err == nil {
+			info.SafeRef = safeRef
+		}
 	}
 	return info, nil
 }
