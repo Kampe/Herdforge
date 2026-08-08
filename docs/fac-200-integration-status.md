@@ -1,10 +1,15 @@
-# FAC-200 integration status: criterion still OPEN (reasoning superseded)
+# FAC-200 integration status: criterion MET (closed by FAC-231)
 
-> **Updated after FAC-198 landed.** The original blocker below was "no code on
-> main creates a hermetic verification container at all". That is no longer
-> true: `pkg/verifier/hermetic_docker_runner.go` is on main and creates one at
-> `hermetic_docker_runner.go:664`. The historical reasoning is kept beneath for
-> provenance, but do not act on it — verify against main.
+> This document has been wrong twice, in opposite directions. Read the current
+> state and verify against main; treat everything under "Historical record" as
+> provenance only.
+>
+> - Originally: BLOCKED, because no code on main created a hermetic
+>   verification container at all.
+> - After FAC-198 landed: that reason expired — the runner existed and created
+>   a container — but the criterion was still unmet, because the runner never
+>   registered a receipt.
+> - After FAC-231 landed: the criterion is met.
 
 ## Current state
 
@@ -12,22 +17,36 @@
 durable container lifecycle receipt ... register the container ID immediately
 after create, before start or any later failure."
 
-**Still not met, for a different reason than originally recorded.**
-`pkg/containerlifecycle` now HAS production callers — `cmd/herd/containers.go`
-uses `NewStore`, `Status` and `LabelFAC174Baseline` — so the package is no
-longer dead. But the hermetic runner does not use it: it creates a container
-and calls `Register` zero times. Verified on main:
+**Met.** `pkg/verifier/hermetic_docker_runner.go` binds the hermetic runner to
+`pkg/containerlifecycle`:
 
-```
-$ grep -c Register pkg/verifier/hermetic_docker_runner.go
-0
-$ grep -n '"create"' pkg/verifier/hermetic_docker_runner.go
-664:  args := []string{"create", "--pull", "never", ...}
-```
+- The lifecycle store is opened *before* `docker create`, so `Register` can run
+  immediately after the container ID exists.
+- `Register` is called after `Create` and strictly before `Start`. If it fails,
+  the run fails closed: the container is removed and the error returned. A
+  container that exists without a receipt is the bug being prevented, so the
+  code never proceeds past that point.
+- `MarkStarted` records the transition once `Start` succeeds.
+- Teardown routes through `containerlifecycle.EnsureCleanup`, whose return value
+  is the sole authority on whether cleanup succeeded. An independently proved
+  absence is definitive even when `docker rm` itself errors; the remove error is
+  folded into the failure only when EnsureCleanup reports one.
+- `result.Removed` is derived from the receipt (`StateRemoved` +
+  `AbsenceProved`), not from remove-side exit status.
 
-So a hermetic verification container can be created and then orphaned by a
-crash between create and cleanup, with no durable receipt naming it. Tracked as
-FAC-231 rather than left as a stale BLOCKED note on a closed card.
+Receipt fields are chosen for post-crash forensics: `ContainerID` is the exact
+cleanup target, `TaskRef` is `FAC-198/FAC-151`, `Generation` is the per-run
+nonce (so reconciliation can tell a crashed attempt from a live one),
+`ImageDigest` is the resolved image pin config digest, and `CleanupOwner` names
+the owning code path.
+
+`pkg/containerlifecycle` has other production callers too — `cmd/herd/containers.go`
+uses `NewStore`, `Status` and `LabelFAC174Baseline`.
+
+Coverage is in `pkg/verifier/hermetic_docker_lifecycle_test.go`. The tests assert
+ordering rather than only end state: a receipt must exist after `Create` and
+before `Start`, a `Register` failure must fail closed, and a proved absence must
+override a remove error. Each was verified to fail against the pre-fix code.
 
 ## Historical record (superseded)
 
