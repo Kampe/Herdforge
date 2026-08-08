@@ -248,26 +248,29 @@ func TestJSONAndHumanCountsIdentical(t *testing.T) {
 		t.Fatalf("JSON counts %+v != snap counts %+v", decoded.Counts, snap.Counts)
 	}
 	// Human must embed the same numeric tallies.
-	want := fmt.Sprintf("agents=%d healthy_idle=%d busy=%d blocked=%d done=%d stale=%d unknown=%d actions=%d renew_leases=%d consume_callbacks=%d dispatch=%d reap_lanes=%d would_run=%d reconcile=%d applied=%d",
+	want := fmt.Sprintf("agents=%d healthy_idle=%d busy=%d blocked=%d done=%d stale=%d unknown=%d actions=%d renew_leases=%d consume_callbacks=%d dispatch=%d open_review=%d reap_lanes=%d would_run=%d reconcile=%d applied=%d",
 		snap.Counts.Agents, snap.Counts.HealthyIdle, snap.Counts.Busy, snap.Counts.Blocked,
 		snap.Counts.Done, snap.Counts.Stale, snap.Counts.Unknown, snap.Counts.Actions,
 		snap.Counts.RenewLeases, snap.Counts.ConsumeCallback, snap.Counts.Dispatch,
-		snap.Counts.ReapLanes, snap.Counts.WouldRun, snap.Counts.Reconcile, snap.Counts.Applied)
+		snap.Counts.OpenReview, snap.Counts.ReapLanes, snap.Counts.WouldRun, snap.Counts.Reconcile, snap.Counts.Applied)
 	if !strings.Contains(human, want) {
 		t.Fatalf("human missing counts line %q\n---\n%s", want, human)
 	}
 }
 
 type recordingActor struct {
-	renewed   []LeaseObservation
-	consumed  []CallbackObservation
-	reconcile int
-	dispatch  int
-	reaped    []AgentObservation
+	renewed      []LeaseObservation
+	consumed     []CallbackObservation
+	reconcile    int
+	dispatch     int
+	reaped       []AgentObservation
+	openedReview []AgentObservation
 	// failRenewGeneration when non-zero forces RenewLease to fail for that gen.
 	failRenewGeneration int64
 	// failReapLane forces ReapLane to fail for any lane when true.
 	failReapLane bool
+	// failOpenReview forces OpenReview to fail for any lane when true.
+	failOpenReview bool
 	// consumeOnce tracks envelope IDs already acked (idempotent).
 	acked map[string]int
 }
@@ -303,6 +306,13 @@ func (a *recordingActor) ReapLane(_ context.Context, lane AgentObservation) erro
 		return errors.New("reap failed: fencing evidence incomplete")
 	}
 	a.reaped = append(a.reaped, lane)
+	return nil
+}
+func (a *recordingActor) OpenReview(_ context.Context, lane AgentObservation) error {
+	if a.failOpenReview {
+		return errors.New("open_review failed: review supervisor not available")
+	}
+	a.openedReview = append(a.openedReview, lane)
 	return nil
 }
 
@@ -549,15 +559,20 @@ func TestPlanReapsIdleLanesWithExitEvidence(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if snap.Counts.ReapLanes != 3 {
-		t.Fatalf("expected 3 reap actions (idle-committed, done-ticket, idle-saferef), got %d: %+v", snap.Counts.ReapLanes, snap.Actions)
+	// FAC-226: idle-committed is now FINISHED — it gets OpenReview, not Reap.
+	// Only done-ticket and idle-saferef are reaped.
+	if snap.Counts.ReapLanes != 2 {
+		t.Fatalf("expected 2 reap actions (done-ticket, idle-saferef), got %d: %+v", snap.Counts.ReapLanes, snap.Actions)
+	}
+	if snap.Counts.OpenReview != 1 {
+		t.Fatalf("expected 1 open_review action (idle-committed), got %d: %+v", snap.Counts.OpenReview, snap.Actions)
 	}
 	for _, a := range snap.Actions {
 		if a.Kind != ActionReapLane {
 			continue
 		}
 		switch a.Target {
-		case "wK:t1", "wK:t2", "wK:t3":
+		case "wK:t2", "wK:t3":
 			if !a.Safe {
 				t.Fatalf("reap action %s must be Safe under --act: %+v", a.Target, a)
 			}
@@ -622,21 +637,29 @@ func TestApplyReapsEligibleLanes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("beat: %v", err)
 	}
-	if len(actor.reaped) != 3 {
-		t.Fatalf("expected 3 reaped lanes, got %d: %+v", len(actor.reaped), actor.reaped)
+	// FAC-226: idle-committed gets OpenReview, not Reap. Only done-ticket
+	// and idle-saferef are reaped.
+	if len(actor.reaped) != 2 {
+		t.Fatalf("expected 2 reaped lanes, got %d: %+v", len(actor.reaped), actor.reaped)
 	}
 	for _, lane := range actor.reaped {
 		switch lane.TabID {
-		case "wK:t1", "wK:t2", "wK:t3":
+		case "wK:t2", "wK:t3":
 		default:
 			t.Fatalf("unexpected reaped lane: %+v", lane)
 		}
+	}
+	if len(actor.openedReview) != 1 {
+		t.Fatalf("expected 1 open_review lane, got %d: %+v", len(actor.openedReview), actor.openedReview)
+	}
+	if actor.openedReview[0].TabID != "wK:t1" {
+		t.Fatalf("open_review target should be idle-committed wK:t1, got %+v", actor.openedReview[0])
 	}
 	if snap.ExitCode != 0 {
 		t.Fatalf("successful reap beat must exit 0, got %d", snap.ExitCode)
 	}
 	if snap.Counts.Applied < 3 {
-		t.Fatalf("expected at least 3 applied actions (reaps), got %d: %+v", snap.Counts.Applied, snap.Counts)
+		t.Fatalf("expected at least 3 applied actions (1 open_review + 2 reaps), got %d: %+v", snap.Counts.Applied, snap.Counts)
 	}
 }
 
@@ -676,8 +699,9 @@ func TestApplyObserveDoesNotReap(t *testing.T) {
 }
 
 // Mutation guard: if someone silences the reap for awaiting-verdict by
-// clearing AwaitingVerdict, this test proves the reap fires — ensuring the
-// KEEP distinction is non-vacuous.
+// clearing AwaitingVerdict, this test proves an action fires — ensuring the
+// KEEP distinction is non-vacuous. FAC-226: a lane with CommittedWork and no
+// SafeRef gets OpenReview (not Reap) when AwaitingVerdict is cleared.
 func TestReapAwaitingVerdictFlipIsNonVacuous(t *testing.T) {
 	obs := reapObs()
 	snap, err := Plan(obs, Options{Act: true, Now: fixedNow})
@@ -685,8 +709,8 @@ func TestReapAwaitingVerdictFlipIsNonVacuous(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, a := range snap.Actions {
-		if a.Kind == ActionReapLane && a.Target == "wK:t4" {
-			t.Fatalf("awaiting-verdict lane must not be reaped: %+v", a)
+		if (a.Kind == ActionReapLane || a.Kind == ActionOpenReview) && a.Target == "wK:t4" {
+			t.Fatalf("awaiting-verdict lane must not get reap or open_review: %+v", a)
 		}
 	}
 	obs.Herdr.Agents[3].AwaitingVerdict = false
@@ -696,11 +720,224 @@ func TestReapAwaitingVerdictFlipIsNonVacuous(t *testing.T) {
 	}
 	found := false
 	for _, a := range snap2.Actions {
-		if a.Kind == ActionReapLane && a.Target == "wK:t4" {
+		// wK:t4 has CommittedWork=true, no SafeRef, not TicketDone → OpenReview.
+		if a.Kind == ActionOpenReview && a.Target == "wK:t4" {
 			found = true
 		}
 	}
 	if !found {
-		t.Fatal("clearing AwaitingVerdict must produce a reap — KEEP distinction is non-vacuous")
+		t.Fatal("clearing AwaitingVerdict must produce an open_review — KEEP distinction is non-vacuous")
+	}
+}
+
+// --- FAC-226: finished-lane open-review tests ---
+
+// finishedObs builds an observation focused on finished-lane detection.
+func finishedObs() Observation {
+	return Observation{
+		Provider: ProviderObservation{Known: true, QueueDepth: 0, Claimable: 0},
+		Herdr: HerdrObservation{
+			Known: true,
+			Agents: []AgentObservation{
+				// FINISHED: idle + committed work, no SafeRef, not TicketDone.
+				{Name: "finished-lane", Raw: "idle", CommittedWork: true, TabID: "wK:t10", Workspace: "wK"},
+				// Already out for review: should be reaped, not open-reviewed.
+				{Name: "review-pending", Raw: "idle", CommittedWork: true, SafeRef: "safe/fac-200", TabID: "wK:t11", Workspace: "wK"},
+				// Ticket done: should be reaped, not open-reviewed.
+				{Name: "landed-lane", Raw: "done", TicketDone: true, TabID: "wK:t12", Workspace: "wK"},
+				// Awaiting verdict: KEPT — no action.
+				{Name: "verdict-pending", Raw: "idle", CommittedWork: true, AwaitingVerdict: true, TabID: "wK:t13", Workspace: "wK"},
+				// Idle but no committed work: no action.
+				{Name: "idle-empty", Raw: "idle", TabID: "wK:t14", Workspace: "wK"},
+				// Busy: no action.
+				{Name: "busy-lane", Raw: "working", CommittedWork: true, TabID: "wK:t15", Workspace: "wK"},
+			},
+		},
+		Review:   ReviewObservation{Known: true},
+		Quota:    QuotaObservation{Known: true},
+		WindDown: WindDownObservation{Known: true, Enabled: false},
+	}
+}
+
+func TestPlanOpenReviewForFinishedLanes(t *testing.T) {
+	snap, err := Plan(finishedObs(), Options{Act: true, Now: fixedNow})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snap.Counts.OpenReview != 1 {
+		t.Fatalf("expected 1 open_review (finished-lane), got %d: %+v", snap.Counts.OpenReview, snap.Actions)
+	}
+	for _, a := range snap.Actions {
+		if a.Kind == ActionOpenReview {
+			if a.Target != "wK:t10" {
+				t.Fatalf("open_review target should be wK:t10, got %s: %+v", a.Target, a)
+			}
+			if !a.Safe {
+				t.Fatalf("open_review must be Safe under --act: %+v", a)
+			}
+		}
+	}
+}
+
+func TestPlanDoesNotOpenReviewForSafeRefOrTicketDone(t *testing.T) {
+	snap, err := Plan(finishedObs(), Options{Act: true, Now: fixedNow})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, a := range snap.Actions {
+		if a.Kind == ActionOpenReview {
+			switch a.Target {
+			case "wK:t11", "wK:t12":
+				t.Fatalf("must not open_review for SafeRef or TicketDone lane: %+v", a)
+			}
+		}
+	}
+	// review-pending and landed-lane should be reaped instead.
+	if snap.Counts.ReapLanes != 2 {
+		t.Fatalf("expected 2 reaps (review-pending, landed-lane), got %d: %+v", snap.Counts.ReapLanes, snap.Actions)
+	}
+}
+
+func TestPlanDoesNotOpenReviewForAwaitingVerdictOrBusyOrEmpty(t *testing.T) {
+	snap, err := Plan(finishedObs(), Options{Act: true, Now: fixedNow})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, a := range snap.Actions {
+		if a.Kind == ActionOpenReview {
+			switch a.Target {
+			case "wK:t13", "wK:t14", "wK:t15":
+				t.Fatalf("must not open_review for awaiting-verdict/idle-empty/busy lane: %+v", a)
+			}
+		}
+		if a.Kind == ActionReapLane {
+			switch a.Target {
+			case "wK:t13", "wK:t14", "wK:t15":
+				t.Fatalf("must not reap awaiting-verdict/idle-empty/busy lane: %+v", a)
+			}
+		}
+	}
+}
+
+func TestPlanObserveOpenReviewIsWouldRunNotSafe(t *testing.T) {
+	snap, err := Plan(finishedObs(), Options{Now: fixedNow})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snap.Mode != ModeObserve {
+		t.Fatalf("mode=%s", snap.Mode)
+	}
+	for _, a := range snap.Actions {
+		if a.Kind == ActionWouldRun && strings.Contains(a.WouldRun, "open_review") {
+			if a.Safe {
+				t.Fatalf("observe open_review must not be Safe: %+v", a)
+			}
+		}
+		if a.Kind == ActionOpenReview {
+			t.Fatalf("observe must not plan concrete open_review: %+v", a)
+		}
+	}
+}
+
+func TestApplyOpenReviewCallsActor(t *testing.T) {
+	obs := finishedObs()
+	actor := &recordingActor{}
+	snap, err := Beat(context.Background(), obs, Options{Act: true, Now: fixedNow}, actor)
+	if err != nil {
+		t.Fatalf("beat: %v", err)
+	}
+	if len(actor.openedReview) != 1 {
+		t.Fatalf("expected 1 open_review call, got %d: %+v", len(actor.openedReview), actor.openedReview)
+	}
+	if actor.openedReview[0].TabID != "wK:t10" {
+		t.Fatalf("open_review target should be wK:t10, got %+v", actor.openedReview[0])
+	}
+	if snap.ExitCode != 0 {
+		t.Fatalf("successful beat must exit 0, got %d", snap.ExitCode)
+	}
+}
+
+func TestApplyOpenReviewFailureIsHardError(t *testing.T) {
+	obs := finishedObs()
+	actor := &recordingActor{failOpenReview: true}
+	snap, err := Beat(context.Background(), obs, Options{Act: true, Now: fixedNow}, actor)
+	if err == nil {
+		t.Fatal("expected hard error from open_review failure")
+	}
+	if len(actor.openedReview) != 0 {
+		t.Fatalf("no lanes should be opened on failure, got %d", len(actor.openedReview))
+	}
+	if snap.ExitCode == 0 {
+		t.Fatal("open_review failure must set non-zero exit")
+	}
+	for _, a := range snap.Actions {
+		if a.Kind == ActionOpenReview && a.ApplyError == "" {
+			t.Fatalf("open_review action must record apply error: %+v", a)
+		}
+	}
+}
+
+// Mutation guard: if someone removes the CommittedWork check from OpenReview,
+// this test proves the open_review fires only when CommittedWork is true —
+// ensuring the detection is non-vacuous.
+func TestOpenReviewCommittedWorkFlipIsNonVacuous(t *testing.T) {
+	obs := finishedObs()
+	snap, err := Plan(obs, Options{Act: true, Now: fixedNow})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snap.Counts.OpenReview != 1 {
+		t.Fatalf("expected 1 open_review, got %d", snap.Counts.OpenReview)
+	}
+	// Clear CommittedWork — open_review must disappear for that lane.
+	obs.Herdr.Agents[0].CommittedWork = false
+	snap2, err := Plan(obs, Options{Act: true, Now: fixedNow})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, a := range snap2.Actions {
+		if a.Kind == ActionOpenReview && a.Target == "wK:t10" {
+			t.Fatal("clearing CommittedWork must remove open_review — detection is non-vacuous")
+		}
+	}
+}
+
+// Mutation guard: if someone adds a SafeRef to the finished lane, the
+// open_review must turn into a reap — proving the SafeRef distinction is
+// non-vacuous.
+func TestOpenReviewSafeRefFlipIsNonVacuous(t *testing.T) {
+	obs := finishedObs()
+	snap, err := Plan(obs, Options{Act: true, Now: fixedNow})
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, a := range snap.Actions {
+		if a.Kind == ActionOpenReview && a.Target == "wK:t10" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("baseline: finished-lane must get open_review")
+	}
+	// Add SafeRef — open_review must become reap.
+	obs.Herdr.Agents[0].SafeRef = "safe/fac-226"
+	snap2, err := Plan(obs, Options{Act: true, Now: fixedNow})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, a := range snap2.Actions {
+		if a.Kind == ActionOpenReview && a.Target == "wK:t10" {
+			t.Fatal("adding SafeRef must remove open_review — lane is already out for review")
+		}
+	}
+	reaped := false
+	for _, a := range snap2.Actions {
+		if a.Kind == ActionReapLane && a.Target == "wK:t10" {
+			reaped = true
+		}
+	}
+	if !reaped {
+		t.Fatal("adding SafeRef must produce a reap — SafeRef distinction is non-vacuous")
 	}
 }

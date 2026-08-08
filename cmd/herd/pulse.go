@@ -449,3 +449,20 @@ func (a *livePulseActor) ReapLane(ctx context.Context, lane pulse.AgentObservati
 	// plans it, so the coordinator cannot forget it.
 	return errors.New("pulse: reap close adapter requires tab generation evidence (FAC-180 compare-and-close; not yet wired into pulse observation)")
 }
+
+func (a *livePulseActor) OpenReview(ctx context.Context, lane pulse.AgentObservation) error {
+	if strings.TrimSpace(lane.TabID) == "" {
+		return fmt.Errorf("pulse: open_review requires tab_id; lane %q has none", lane.Name)
+	}
+	// FAC-226: the open-review path must resolve the lane's worktree,
+	// verify the rebase-onto-origin/main non-empty diff (the one sound
+	// merge check), and hand off to the review supervisor (Ingest +
+	// LaunchReview with receipt admission). The pulse observation does
+	// not yet carry the worktree path or commit SHA — wiring it requires
+	// a herdr tab-to-worktree resolver and a worktree diff reader. An
+	// honest refusal is better than inventing a review candidate from
+	// incomplete evidence. The open_review is still ENFORCED: every beat
+	// plans it for finished lanes, so the coordinator cannot miss a lane
+	// that needs review.
+	return errors.New("pulse: open_review adapter requires worktree resolver and review-supervisor handoff (FAC-226; not yet wired into pulse observation)")
+}

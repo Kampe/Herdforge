@@ -37,8 +37,9 @@ const (
 	ActionReconcile       ActionKind = "reconcile"
 	ActionRenewLease      ActionKind = "renew_lease"
 	ActionConsumeCallback ActionKind = "consume_callback"
-	ActionDispatch        ActionKind = "dispatch"
+	ActionOpenReview      ActionKind = "open_review"
 	ActionReapLane        ActionKind = "reap_lane"
+	ActionDispatch        ActionKind = "dispatch"
 	ActionWouldRun        ActionKind = "would_run"
 )
 
@@ -58,9 +59,10 @@ var actionKindOrder = map[ActionKind]int{
 	ActionReconcile:       1,
 	ActionRenewLease:      2,
 	ActionConsumeCallback: 3,
-	ActionReapLane:        4,
-	ActionDispatch:        5,
-	ActionWouldRun:        6,
+	ActionOpenReview:      4,
+	ActionReapLane:        5,
+	ActionDispatch:        6,
+	ActionWouldRun:        7,
 }
 
 // Options configure one beat.
@@ -245,6 +247,7 @@ type Counts struct {
 	RenewLeases     int `json:"renew_leases"`
 	ConsumeCallback int `json:"consume_callbacks"`
 	Dispatch        int `json:"dispatch"`
+	OpenReview      int `json:"open_review"`
 	ReapLanes       int `json:"reap_lanes"`
 	WouldRun        int `json:"would_run"`
 	Reconcile       int `json:"reconcile"`
@@ -277,6 +280,14 @@ type Actor interface {
 	Reconcile(ctx context.Context) error
 	RenewLease(ctx context.Context, lease LeaseObservation) error
 	ConsumeCallback(ctx context.Context, cb CallbackObservation) error
+	// OpenReview sends a finished lane's committed work to adversarial review.
+	// FAC-226: this is the event trigger that was missing — every beat detects
+	// finished lanes (idle/done + committed work + not already out for review)
+	// and plans this action so the coordinator cannot miss a lane that needs
+	// review. The implementation must resolve the lane's worktree, verify the
+	// rebase-onto-origin/main non-empty diff, and hand off to the review
+	// supervisor. A nil or error means no review was opened.
+	OpenReview(ctx context.Context, lane AgentObservation) error
 	// ReapLane closes an idle lane's tab. FAC-221: the reap target is the
 	// lane in the observation; the implementation must use generation-fenced
 	// close (TabCloseCAS) and fail closed when fencing evidence is incomplete.
@@ -496,14 +507,15 @@ func Plan(obs Observation, opts Options) (Snapshot, error) {
 		actions = append(actions, a)
 	}
 
-	// FAC-221: Reap idle lanes. A lane exists only while it is doing
-	// something. An idle or done lane with committed work (or a done ticket,
-	// or a safe-ref pinning its branch out for review) is reap-eligible —
-	// close it and respawn on demand. A lane awaiting a verdict it must act
-	// on is KEPT: it is idle but has specific pending work only it can do.
-	// This is code, not coordinator discipline: every beat plans reap
-	// actions for eligible lanes so they cannot be left resident by
-	// forgetfulness.
+	// FAC-226: Detect finished lanes and open review. A lane is FINISHED when
+	// its agent is idle/done AND it has committed work (non-empty diff against
+	// origin/main) AND it is not already out for review (no SafeRef) AND its
+	// ticket is not done (work not yet landed) AND it is not awaiting a verdict
+	// it must act on. At that moment the lane should be sent to adversarial
+	// review and then closed. This is the event trigger that was missing: every
+	// beat plans open_review for finished lanes so the coordinator cannot miss
+	// them. A lane that is already out for review (SafeRef set) or whose ticket
+	// is done (work landed) is reaped instead — see the reap block below.
 	for _, a := range agents {
 		if a.Name == "" {
 			continue
@@ -514,8 +526,59 @@ func Plan(obs Observation, opts Options) (Snapshot, error) {
 		if a.AwaitingVerdict {
 			continue
 		}
-		hasExitEvidence := a.CommittedWork || a.TicketDone || strings.TrimSpace(a.SafeRef) != ""
-		if !hasExitEvidence {
+		if !a.CommittedWork {
+			continue
+		}
+		if strings.TrimSpace(a.SafeRef) != "" {
+			continue
+		}
+		if a.TicketDone {
+			continue
+		}
+		target := a.Name
+		if a.TabID != "" {
+			target = a.TabID
+		}
+		reason := "open review: idle/done lane with committed work not yet out for review"
+		act := Action{
+			Kind:   ActionOpenReview,
+			Target: target,
+			Reason: reason,
+			Safe:   true,
+		}
+		if !opts.Act {
+			act.Kind = ActionWouldRun
+			act.WouldRun = "open_review " + target
+			act.Reason = "would open review for finished lane (--act): " + reason
+			act.Safe = false
+		}
+		actions = append(actions, act)
+	}
+
+	// FAC-221: Reap idle lanes. A lane exists only while it is doing
+	// something. An idle or done lane with a done ticket or a safe-ref pinning
+	// its branch out for review is reap-eligible — close it and respawn on
+	// demand. A lane awaiting a verdict it must act on is KEPT: it is idle but
+	// has specific pending work only it can do. A lane that is FINISHED
+	// (CommittedWork but no SafeRef and not TicketDone) gets OpenReview above,
+	// not ReapLane — it must be sent to review before it is closed. This is
+	// code, not coordinator discipline: every beat plans reap actions for
+	// eligible lanes so they cannot be left resident by forgetfulness.
+	for _, a := range agents {
+		if a.Name == "" {
+			continue
+		}
+		if a.Status != StatusHealthyIdle && a.Status != StatusDone {
+			continue
+		}
+		if a.AwaitingVerdict {
+			continue
+		}
+		// Only reap lanes that are already out for review or whose ticket is
+		// done. Lanes with committed work but no SafeRef and no TicketDone are
+		// FINISHED — they get OpenReview above, not ReapLane.
+		hasReapEvidence := a.TicketDone || strings.TrimSpace(a.SafeRef) != ""
+		if !hasReapEvidence {
 			continue
 		}
 		target := a.Name
@@ -528,8 +591,6 @@ func Plan(obs Observation, opts Options) (Snapshot, error) {
 			reasonParts = append(reasonParts, "ticket done")
 		case strings.TrimSpace(a.SafeRef) != "":
 			reasonParts = append(reasonParts, "branch out for review at "+a.SafeRef)
-		case a.CommittedWork:
-			reasonParts = append(reasonParts, "idle with committed work")
 		}
 		reason := "reap idle lane: " + strings.Join(reasonParts, "; ")
 		act := Action{
@@ -672,6 +733,8 @@ func CountActions(agents []AgentObservation, actions []Action) Counts {
 			c.ConsumeCallback++
 		case ActionDispatch:
 			c.Dispatch++
+		case ActionOpenReview:
+			c.OpenReview++
 		case ActionReapLane:
 			c.ReapLanes++
 		case ActionWouldRun:
@@ -774,14 +837,21 @@ func Apply(ctx context.Context, snap Snapshot, actor Actor) (Snapshot, error) {
 			} else {
 				err = actor.ReapLane(ctx, lane)
 			}
+		case ActionOpenReview:
+			lane, ok := laneByTarget[a.Target]
+			if !ok {
+				err = fmt.Errorf("open_review target %q not in observation", a.Target)
+			} else {
+				err = actor.OpenReview(ctx, lane)
+			}
 		default:
 			continue
 		}
 		if err != nil {
 			a.ApplyError = err.Error()
 			// Missing callback after race is not hard; generation fence errors,
-			// dispatch, reap, and reconcile are.
-			if a.Kind == ActionDispatch || a.Kind == ActionRenewLease || a.Kind == ActionReconcile || a.Kind == ActionReapLane {
+			// dispatch, reap, reconcile, and open-review are.
+			if a.Kind == ActionDispatch || a.Kind == ActionRenewLease || a.Kind == ActionReconcile || a.Kind == ActionReapLane || a.Kind == ActionOpenReview {
 				hardErr = true
 			}
 			continue
@@ -810,9 +880,9 @@ func FormatHuman(snap Snapshot) string {
 	}
 	fmt.Fprintf(&b, "beat_sequence: %d observed_at: %s\n", snap.BeatSequence, snap.ObservedAt.UTC().Format(time.RFC3339Nano))
 	c := snap.Counts
-	fmt.Fprintf(&b, "counts: agents=%d healthy_idle=%d busy=%d blocked=%d done=%d stale=%d unknown=%d actions=%d renew_leases=%d consume_callbacks=%d dispatch=%d reap_lanes=%d would_run=%d reconcile=%d applied=%d\n",
+	fmt.Fprintf(&b, "counts: agents=%d healthy_idle=%d busy=%d blocked=%d done=%d stale=%d unknown=%d actions=%d renew_leases=%d consume_callbacks=%d dispatch=%d open_review=%d reap_lanes=%d would_run=%d reconcile=%d applied=%d\n",
 		c.Agents, c.HealthyIdle, c.Busy, c.Blocked, c.Done, c.Stale, c.Unknown,
-		c.Actions, c.RenewLeases, c.ConsumeCallback, c.Dispatch, c.ReapLanes, c.WouldRun, c.Reconcile, c.Applied)
+		c.Actions, c.RenewLeases, c.ConsumeCallback, c.Dispatch, c.OpenReview, c.ReapLanes, c.WouldRun, c.Reconcile, c.Applied)
 	if snap.UnknownCritical {
 		fmt.Fprintf(&b, "unknown_critical: true\n")
 		for _, r := range snap.UnknownReasons {
