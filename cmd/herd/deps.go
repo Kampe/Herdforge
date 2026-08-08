@@ -262,7 +262,7 @@ workers write/test this command; they never apply live (no sidecar authority)`)
 			os.Exit(1)
 		}
 		writer = deps.MemoryDescriptionWriter{MP: mp}
-	case "kaneo", "":
+	case "kaneo":
 		// Description fences are the only write surface (no unsigned sidecar).
 		writer = deps.KaneoDescriptionWriter{ProjectID: cfg.TaskProvider.ProjectID}
 	default:

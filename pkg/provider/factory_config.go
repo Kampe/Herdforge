@@ -21,6 +21,11 @@ func NewFromHerdConfig(cfg *config.Config) (TaskProvider, error) {
 	}
 
 	providerType := strings.ToLower(strings.TrimSpace(cfg.TaskProvider.Type))
+	// Policy first: a disabled provider must not even reach credential
+	// resolution, let alone a constructor.
+	if err := checkEnabled(providerType, cfg.TaskProvider.Enabled); err != nil {
+		return nil, err
+	}
 	apiKey := ""
 	trustedOrigin := ""
 	switch providerType {
@@ -51,6 +56,7 @@ func NewFromHerdConfig(cfg *config.Config) (TaskProvider, error) {
 		UseCLI:              cfg.TaskProvider.UseCLI,
 		APIKey:              apiKey,
 		APIKeyTrustedOrigin: trustedOrigin,
+		Enabled:             cfg.TaskProvider.Enabled,
 		Get:                 g,
 		List:                l,
 		Mutate:              m,

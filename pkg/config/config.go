@@ -107,6 +107,11 @@ type TaskProvider struct {
 	APIURL      string `yaml:"api_url,omitempty"`
 	APIKeyEnv   string `yaml:"api_key_env,omitempty"`
 	UseCLI      bool   `yaml:"use_cli,omitempty"`
+	// Enabled is the repository's explicit task-provider activation policy
+	// (FAC-155). When set, Type must be a member or activation fails closed.
+	// Omitted means "exactly Type" — no repository ever inherits, discovers,
+	// or probes for a provider.
+	Enabled []string `yaml:"enabled,omitempty"`
 	// Deadlines are optional per-op bounds (Go duration strings, e.g. "15s").
 	// Empty fields fall back to package defaults at the provider boundary
 	// (FAC-150). FAC-155 may centralize activation; parsing lives here.

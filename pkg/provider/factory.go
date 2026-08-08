@@ -20,14 +20,45 @@ type TaskConfig struct {
 	APIKeyTrustedOrigin string
 	// Optional resolved deadline parts (0 = package default).
 	Get, List, Mutate, Comment, Readback time.Duration
+	// Enabled is the repository's explicit activation policy (FAC-155): the
+	// only provider types this repository may activate. Empty means "exactly
+	// the declared Type" — never a discovered or inherited default. A Type
+	// outside a non-empty Enabled list is a hard error, so editing
+	// task_provider.type without also moving the operator policy fails closed
+	// instead of silently pointing the fleet at a different board.
+	Enabled []string
+}
+
+// checkEnabled enforces the activation policy for a normalized provider type.
+func checkEnabled(providerType string, enabled []string) error {
+	if len(enabled) == 0 {
+		// Self-only: the declared type is the policy. No fallback, no probe.
+		return nil
+	}
+	for _, e := range enabled {
+		if strings.ToLower(strings.TrimSpace(e)) == providerType {
+			return nil
+		}
+	}
+	return fmt.Errorf("task_provider.type %q is not in task_provider.enabled %v for this repository", providerType, enabled)
 }
 
 // NewProductionProvider builds the live TaskProvider for herd/daemon/dispatch.
 // Each live provider requires explicit credentials; callers that need in-process
 // tests use NewMemoryProvider / NewBoundClient directly.
 func NewProductionProvider(tc TaskConfig) (TaskProvider, error) {
+	// Normalize here, not only in NewFromHerdConfig: this is the single
+	// activation choke point, so a direct caller passing "Kaneo" must resolve
+	// to the same adapter (and the same policy check) as the config path.
+	providerType := strings.ToLower(strings.TrimSpace(tc.Type))
+	if providerType == "" {
+		return nil, fmt.Errorf("task_provider.type is required")
+	}
+	if err := checkEnabled(providerType, tc.Enabled); err != nil {
+		return nil, err
+	}
 	dls := DeadlinesFromParts(tc.Get, tc.List, tc.Mutate, tc.Comment, tc.Readback)
-	switch tc.Type {
+	switch providerType {
 	case "kaneo":
 		k := NewKaneoProvider(tc.APIURL, tc.ProjectID, tc.UseCLI)
 		if tc.APIKey != "" {
@@ -55,11 +86,8 @@ func NewProductionProvider(tc TaskConfig) (TaskProvider, error) {
 	case "memory":
 		// Explicit test/dev type — still bound so timeouts classify uniformly.
 		return NewBoundClient(NewMemoryProvider(), dls), nil
-	case "":
-
-		return nil, fmt.Errorf("task_provider.type is required")
 	default:
-		return nil, fmt.Errorf("task_provider.type %q is not activated in this build", tc.Type)
+		return nil, fmt.Errorf("task_provider.type %q is not activated in this build", providerType)
 	}
 }
 

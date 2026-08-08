@@ -350,14 +350,17 @@ func (e *Engine) ownershipClaimer() (deps.OwnershipClaimer, error) {
 	if strings.TrimSpace(repo) == "" {
 		return nil, fmt.Errorf("daemon: authenticated repository identity is empty")
 	}
-	providerType := "memory"
-	project := ""
-	if e.Config != nil {
-		if e.Config.TaskProvider.Type != "" {
-			providerType = e.Config.TaskProvider.Type
-		}
-		project = e.Config.TaskProvider.ProjectID
+	// FAC-155: same fail-closed rule as dispatch — no "memory" stand-in for an
+	// unconfigured board, or the daemon and dispatcher lease under an identity
+	// neither of them is actually talking to.
+	if e.Config == nil {
+		return nil, fmt.Errorf("daemon: no repository config; task provider identity is unbound")
 	}
+	providerType := strings.ToLower(strings.TrimSpace(e.Config.TaskProvider.Type))
+	if providerType == "" {
+		return nil, fmt.Errorf("daemon: task_provider.type is required for launch lease ownership")
+	}
+	project := e.Config.TaskProvider.ProjectID
 	ownership, err := deps.OpenLeaseOwnership(deps.ResolveLaunchLeasePath(root), repo, providerType, project)
 	if err != nil {
 		return nil, err
