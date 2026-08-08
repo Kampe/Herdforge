@@ -140,11 +140,51 @@ func CompileClaudeArgs(argv []string) ([]string, error) {
 	return out, nil
 }
 
+// nestedDenyCompiled lists providers with a verified vendor flag contract that
+// RequireNestedDeny asserts on every launch argv.
+var nestedDenyCompiled = map[string]bool{"codex": true, "claude": true}
+
+// nestedDenyUnavailable lists providers the fleet routes today for which no
+// vendor nested-agent denial flag has been verified against that vendor's CLI.
+// Their argv is admitted UNCHANGED.
+//
+// Membership is a declaration that a provider's nested-agent posture is
+// UNGUARDED, not that it is safe. Do not add a provider here to silence a
+// launch refusal, and do not invent a vendor flag to move one to
+// nestedDenyCompiled: the flag must exist in that CLI's real interface.
+var nestedDenyUnavailable = map[string]bool{
+	"agy": true, "grok": true, "kimi": true,
+	"opencode": true, "ollama": true, "lazer": true,
+}
+
+func normalizeProvider(provider string) string {
+	return strings.ToLower(strings.TrimSpace(provider))
+}
+
+// NestedDenyCompiled reports whether provider's launch argv carries a denial
+// that RequireNestedDeny actually asserts.
+func NestedDenyCompiled(provider string) bool {
+	return nestedDenyCompiled[normalizeProvider(provider)]
+}
+
+// NestedDenyUnavailable reports whether provider launches with no verified
+// vendor denial flag, so RequireNestedDeny admits its argv unchanged.
+func NestedDenyUnavailable(provider string) bool {
+	return nestedDenyUnavailable[normalizeProvider(provider)]
+}
+
 // RequireNestedDeny fails closed when a codex/claude argv does not already
-// carry the compiled nested-agent denials. Non-codex/claude providers are
-// not covered by this boundary and return nil.
+// carry the compiled nested-agent denials.
+//
+// A provider that is neither compiled nor explicitly declared unguarded is
+// REFUSED. Adding a provider to the router without deciding its nested-agent
+// posture used to launch it with no denial and no signal; the decision is now
+// forced at the boundary rather than defaulted to allow.
+//
+// Passing this check is not containment — see the package doc. It proves the
+// launched argv carried the flag, not that the vendor honoured it.
 func RequireNestedDeny(provider string, argv []string) error {
-	switch strings.ToLower(strings.TrimSpace(provider)) {
+	switch normalizeProvider(provider) {
 	case "codex":
 		compiled, err := CompileCodexArgs(argv)
 		if err != nil {
@@ -164,7 +204,10 @@ func RequireNestedDeny(provider string, argv []string) error {
 		}
 		return nil
 	default:
-		return nil
+		if nestedDenyUnavailable[normalizeProvider(provider)] {
+			return nil
+		}
+		return fmt.Errorf("agentpolicy: provider %q has no reviewed nested-agent posture", provider)
 	}
 }
 

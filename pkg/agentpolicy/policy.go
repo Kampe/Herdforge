@@ -3,6 +3,25 @@
 // The HMAC in Contract is metadata integrity for handoff/evidence. It is not
 // an OS or tool enforcement boundary; only compiled harness controls can
 // prevent a child tool from being exposed.
+//
+// # Nested-agent policy is ADVISORY until FAC-205 lands
+//
+// What Herdforge actually enforces is its own refusal to launch: Validate
+// runs before any tab or agent is created, and a decision that fails policy
+// never reaches TabCreate or AgentStart. That refusal is real.
+//
+// What Herdforge does NOT enforce is the behaviour of an agent once it is
+// running. A compiled denial (codex --disable multi_agent, claude
+// --disallowed-tools Agent Task ToolSearch) is a flag asking a vendor CLI not
+// to expose its nested-agent tools. Herdforge can prove the flag is in the
+// argv it launched; it cannot prove the vendor honours it, and it cannot
+// observe or stop a child that a running agent spawns anyway.
+//
+// Closing that gap needs herdr-side spawn supervision that durably returns
+// child PID, start token, launch generation, and membership surviving
+// double-fork/setns. That is FAC-205 and it is NOT landed. Until it lands, no
+// caller may record a nested-agent denial as proven containment; the only
+// provable claim is "this argv was refused" or "this argv carried the flag".
 package agentpolicy
 
 import (
