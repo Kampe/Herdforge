@@ -112,7 +112,13 @@ func runHarvestMerge() {
 	fs := flag.NewFlagSet("harvest-merge", flag.ExitOnError)
 	branch := fs.String("branch", "", "Lane branch to harvest (required)")
 	title := fs.String("title", "", "PR title (required)")
-	verdict := fs.String("verdict", "", "Review verdict: PASS merges, FAIL/BLOCKED refuse")
+	// FAC-156: --verdict is no longer merge authority. Consent comes from the
+	// durable review ledger for the exact branch head; this flag can only
+	// REFUSE. The asymmetry is deliberate — an operator saying "don't" is
+	// always safe to honour, an operator saying "do" is the human-supplied
+	// provenance this card exists to remove.
+	verdict := fs.String("verdict", "",
+		"Optional operator VETO (FAIL/BLOCKED refuse). PASS is not accepted here: merge consent comes from the review ledger.")
 	base := fs.String("base", "origin/main", "Base to harvest onto")
 	dryRun := fs.Bool("dry-run", false, "Plan and gate without creating the worktree")
 	allowMarkers := fs.Bool("allow-markers", false,
@@ -140,11 +146,30 @@ func runHarvestMerge() {
 	}
 	commits := harvestmerge.UniqueCommits(string(cherry))
 
-	head, _ := exec.Command("git", "rev-parse", *branch).Output()
+	// A failed rev-parse previously left plan.SHA empty and the harvest ran on
+	// against a candidate nobody could name — the same swallowed-exit-status
+	// shape this card is about.
+	head, headErr := exec.Command("git", "rev-parse", *branch).Output()
+	if headErr != nil {
+		fmt.Fprintf(os.Stderr, "herd harvest-merge: cannot resolve %s: %v\n", *branch, headErr)
+		os.Exit(1)
+	}
+	sha := strings.TrimSpace(string(head))
+	if sha == "" {
+		fmt.Fprintf(os.Stderr, "herd harvest-merge: %s resolved to no commit\n", *branch)
+		os.Exit(1)
+	}
+
+	ledgerVerdict, vErr := harvestMergeVerdict(sha, *verdict)
+	if vErr != nil {
+		fmt.Fprintf(os.Stderr, "herd harvest-merge: %v\n", vErr)
+		os.Exit(1)
+	}
+
 	plan := harvestmerge.Plan{
 		Lane: lane, Branch: *branch, Title: *title,
-		SHA:     strings.TrimSpace(string(head)),
-		Verdict: harvestmerge.Verdict(strings.ToUpper(*verdict)),
+		SHA:     sha,
+		Verdict: ledgerVerdict,
 		Commits: commits,
 	}
 	plan.TempBranch = harvestmerge.TempBranchName(lane, plan.SHA)
@@ -236,6 +261,47 @@ func runHarvestMerge() {
 	fmt.Printf("  git push -u origin %s && gh pr create --title %q\n", plan.TempBranch, *title)
 	// The worktree is intentionally KEPT on success: the coordinator pushes
 	// from it. Cleanup on success is the caller's, after publishing.
+}
+
+// harvestMergeVerdict resolves the merge verdict for an exact candidate sha
+// from the durable review ledger. This is the FAC-156 rule at this call site:
+// merge CONSENT is only ever read out of compiled, structured, exact-sha
+// ledger state, never out of an operator's argv.
+//
+// operatorVeto is honoured in one direction only. FAIL or BLOCKED refuses even
+// when the ledger would admit — a human who says stop is always obeyed. PASS
+// is rejected as an input, because that is the human-supplied provenance the
+// card removes; a coordinator who believes the work passed must get that
+// verdict into the ledger through `herd review-ingest`.
+func harvestMergeVerdict(sha, operatorVeto string) (harvestmerge.Verdict, error) {
+	switch v := harvestmerge.Verdict(strings.ToUpper(strings.TrimSpace(operatorVeto))); v {
+	case "":
+		// No operator opinion; the ledger decides on its own.
+	case harvestmerge.Verdict("FAIL"), harvestmerge.Verdict("BLOCKED"):
+		return v, fmt.Errorf("operator veto %s refuses the merge", v)
+	default:
+		return "", fmt.Errorf("--verdict %s is not accepted: merge consent comes from the review ledger, "+
+			"not the command line. Land the reviewer's verdict with `herd review-ingest` and re-run. "+
+			"Only FAIL/BLOCKED may be supplied here, and only to refuse", v)
+	}
+
+	ledger, err := reviewledger.NewReviewLedger(".", filepath.Join(".herd", "review-ledger.jsonl"))
+	if err != nil {
+		return "", fmt.Errorf("open review ledger: %w", err)
+	}
+	// Empty builder family is the STRICT form: only a cross-family PASS with a
+	// provable launch record counts, and any unsuperseded FAIL/BLOCKED or an
+	// already-consumed admission refuses.
+	eligible, err := ledger.Eligible(sha, "")
+	if err != nil {
+		return "", fmt.Errorf("review ledger refuses %s: %w", sha[:min(12, len(sha))], err)
+	}
+	if !eligible {
+		return "", fmt.Errorf("review ledger holds no admissible independent PASS for exact candidate %s; "+
+			"a verdict for another sha, a superseded verdict, or an already-consumed admission is not consent",
+			sha[:min(12, len(sha))])
+	}
+	return harvestmerge.Verdict("PASS"), nil
 }
 
 func min(a, b int) int {
