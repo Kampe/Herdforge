@@ -955,7 +955,7 @@ func TestFenceBroker_WorkerLaunchEnvCannotDiscoverMint(t *testing.T) {
 		if _, ok := bt.MethodByName(name); ok {
 			t.Fatalf("FenceBroker must not export %s()", name)
 		}
-		if _, ok := reflect.TypeOf(*b).MethodByName(name); ok {
+		if _, ok := reflect.TypeOf(b).Elem().MethodByName(name); ok {
 			t.Fatalf("FenceBroker value must not export %s()", name)
 		}
 	}
