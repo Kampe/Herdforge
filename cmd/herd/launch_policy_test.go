@@ -437,3 +437,52 @@ func TestLaneLaunchDecisionReportsConfiguredProbeFailure(t *testing.T) {
 		t.Fatalf("failed Pi probe invoked native codex: %v", err)
 	}
 }
+
+// TestLaneLaunchDecisionFailsOnMissingHarnessBinary proves the harness binary
+// is checked at config-eval time (before probing), producing an actionable
+// error naming the missing binary — not a confusing probe-exec failure.
+// The test sets PATH to an empty dir so pi is genuinely absent.
+func TestLaneLaunchDecisionFailsOnMissingHarnessBinary(t *testing.T) {
+	emptyDir := t.TempDir()
+	t.Setenv("PATH", emptyDir)
+	t.Setenv("HERDR_ROUTE_STATE_DIR", t.TempDir())
+	lane := &config.LaneDef{
+		Name: "mender", Role: launch.WorkerRole, AgentKind: router.PiHarness, Harness: router.PiHarness,
+		Provider: launch.WorkerProvider, Model: launch.WorkerModel, Effort: launch.WorkerEffort, TaskShape: launch.Implementation,
+	}
+	_, err := laneLaunchDecision(context.Background(), lane, nil)
+	if !errors.Is(err, ErrHarnessBinaryMissing) {
+		t.Fatalf("missing harness binary must fail with ErrHarnessBinaryMissing, got %v", err)
+	}
+	msg := err.Error()
+	for _, want := range []string{lane.Name, router.PiHarness, "not found in $PATH"} {
+		if !strings.Contains(msg, want) {
+			t.Fatalf("error %q missing %q", msg, want)
+		}
+	}
+}
+
+// TestLaneLaunchDecisionSucceedsWithHarnessBinary proves the check does not
+// false-positive when the binary IS present. A fake pi in PATH must allow the
+// route to proceed to the probe (which also uses the fake pi and returns
+// PROBE_OK).
+func TestLaneLaunchDecisionSucceedsWithHarnessBinary(t *testing.T) {
+	dir := t.TempDir()
+	pi := "#!/bin/sh\necho PROBE_OK\n"
+	if err := os.WriteFile(filepath.Join(dir, "pi"), []byte(pi), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir)
+	t.Setenv("HERDR_ROUTE_STATE_DIR", t.TempDir())
+	lane := &config.LaneDef{
+		Name: "smith", Role: launch.WorkerRole, AgentKind: router.PiHarness, Harness: router.PiHarness,
+		Provider: launch.WorkerProvider, Model: launch.WorkerModel, Effort: launch.WorkerEffort, TaskShape: launch.Implementation,
+	}
+	decision, err := laneLaunchDecision(context.Background(), lane, nil)
+	if err != nil {
+		t.Fatalf("harness binary present must not block route: %v", err)
+	}
+	if decision == nil {
+		t.Fatal("expected a launch decision")
+	}
+}

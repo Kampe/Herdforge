@@ -49,6 +49,7 @@ const (
 	OutcomeFailed      Outcome = "failed"
 	OutcomeLive        Outcome = "live"
 	OutcomeMissing     Outcome = "missing"
+	OutcomeUnraiseable Outcome = "unraiseable"
 	OutcomeWouldClose  Outcome = "would_close"
 	OutcomeClosed      Outcome = "closed"
 	OutcomePreserved   Outcome = "preserved"
@@ -102,6 +103,7 @@ type Options struct {
 	RepositoryIdentity func(cfg *config.Config) string
 	PromptReadable     func(path string) error
 	AbsPath            func(path string) (string, error)
+	HarnessPresent     func(harness string) bool
 }
 
 // RoleResult records one standing role's outcome.
@@ -120,16 +122,17 @@ type RoleResult struct {
 
 // Result is the full standing run report.
 type Result struct {
-	Workspace string       `json:"workspace"`
-	Mode      string       `json:"mode"`
-	Roles     []RoleResult `json:"roles"`
-	Raised    int          `json:"raised"`
-	Skipped   int          `json:"skipped"`
-	Failed    int          `json:"failed"`
-	Previewed int          `json:"previewed"`
-	Closed    int          `json:"closed"`
-	Missing   int          `json:"missing"`
-	Live      int          `json:"live"`
+	Workspace   string       `json:"workspace"`
+	Mode        string       `json:"mode"`
+	Roles       []RoleResult `json:"roles"`
+	Raised      int          `json:"raised"`
+	Skipped     int          `json:"skipped"`
+	Failed      int          `json:"failed"`
+	Previewed   int          `json:"previewed"`
+	Closed      int          `json:"closed"`
+	Missing     int          `json:"missing"`
+	Live        int          `json:"live"`
+	Unraiseable int          `json:"unraiseable"`
 }
 
 // NameHeld reports whether an agent_status means the live name is held and
@@ -417,6 +420,10 @@ func runStatus(result *Result, lanes []config.LaneDef, live map[string]Agent, re
 				rr.CWD = a.Cwd
 			}
 			result.Live++
+		} else if opts.HarnessPresent != nil && strings.TrimSpace(lane.Harness) != "" && !opts.HarnessPresent(lane.Harness) {
+			rr.Outcome = OutcomeUnraiseable
+			rr.Reason = fmt.Sprintf("harness %q binary not found on this host — cannot be raised here", lane.Harness)
+			result.Unraiseable++
 		} else {
 			rr.Outcome = OutcomeMissing
 			rr.Reason = "not live — needs raising"
@@ -751,8 +758,8 @@ func Summary(r *Result) string {
 	}
 	switch r.Mode {
 	case "status":
-		return fmt.Sprintf("herd-standing: status workspace=%s live=%d missing=%d failed=%d",
-			r.Workspace, r.Live, r.Missing, r.Failed)
+		return fmt.Sprintf("herd-standing: status workspace=%s live=%d missing=%d unraiseable=%d failed=%d",
+			r.Workspace, r.Live, r.Missing, r.Unraiseable, r.Failed)
 	case "shutdown":
 		return fmt.Sprintf("herd-standing: shutdown workspace=%s closed=%d preserved=%d missing=%d failed=%d",
 			r.Workspace, r.Closed, r.Skipped, r.Missing, r.Failed)

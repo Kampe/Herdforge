@@ -448,6 +448,81 @@ func TestStatusReportsLiveAndMissing(t *testing.T) {
 	}
 }
 
+// TestStatusReportsUnraiseableWhenHarnessMissing proves --status distinguishes
+// "not raised" (could be raised, just isn't) from "cannot be raised on this
+// host" (harness binary missing). When HarnessPresent returns false, missing
+// lanes must report OutcomeUnraiseable, not OutcomeMissing.
+func TestStatusReportsUnraiseableWhenHarnessMissing(t *testing.T) {
+	repo, cfg := standingFixture(t)
+	t.Chdir(repo)
+	opts := baseOpts(t, repo)
+	opts.Mode = ModeStatus
+	opts.HarnessPresent = func(harness string) bool { return false }
+	opts.ListAgents = func() ([]Agent, error) {
+		return []Agent{
+			{Name: "forge-orch", Status: "idle", TabID: "t1", PaneID: "p1", Cwd: filepath.Join(repo, ".worktrees", "orch")},
+		}, nil
+	}
+	r, err := Run(cfg, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.Live != 1 {
+		t.Fatalf("live=%d want 1", r.Live)
+	}
+	if r.Unraiseable != 1 {
+		t.Fatalf("unraiseable=%d want 1 (harvest cannot be raised)", r.Unraiseable)
+	}
+	if r.Missing != 0 {
+		t.Fatalf("missing=%d want 0 — a lane with no harness binary is unraiseable, not missing", r.Missing)
+	}
+	var foundUnraiseable bool
+	for _, rr := range r.Roles {
+		if rr.Outcome == OutcomeUnraiseable {
+			foundUnraiseable = true
+			if !strings.Contains(rr.Reason, "not found on this host") {
+				t.Fatalf("unraiseable reason = %q, want 'not found on this host'", rr.Reason)
+			}
+		}
+	}
+	if !foundUnraiseable {
+		t.Fatal("no role reported OutcomeUnraiseable")
+	}
+	if !strings.Contains(Summary(r), "unraiseable=1") {
+		t.Fatalf("summary must include unraiseable count: %s", Summary(r))
+	}
+}
+
+// TestStatusReportsMissingWhenHarnessPresent proves the distinction works both
+// ways: when HarnessPresent returns true, a not-live lane reports OutcomeMissing
+// (not OutcomeUnraiseable). Without this, the unraiseable path could
+// false-positive on every missing lane.
+func TestStatusReportsMissingWhenHarnessPresent(t *testing.T) {
+	repo, cfg := standingFixture(t)
+	t.Chdir(repo)
+	opts := baseOpts(t, repo)
+	opts.Mode = ModeStatus
+	opts.HarnessPresent = func(harness string) bool { return true }
+	opts.ListAgents = func() ([]Agent, error) {
+		return []Agent{
+			{Name: "forge-orch", Status: "idle", TabID: "t1", PaneID: "p1", Cwd: filepath.Join(repo, ".worktrees", "orch")},
+		}, nil
+	}
+	r, err := Run(cfg, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.Live != 1 {
+		t.Fatalf("live=%d want 1", r.Live)
+	}
+	if r.Missing != 1 {
+		t.Fatalf("missing=%d want 1 (harvest is not live but CAN be raised)", r.Missing)
+	}
+	if r.Unraiseable != 0 {
+		t.Fatalf("unraiseable=%d want 0 — harness is present, lane is merely not raised", r.Unraiseable)
+	}
+}
+
 func TestShutdownTouchesOnlyStanding(t *testing.T) {
 	repo, cfg := standingFixture(t)
 	t.Chdir(repo)

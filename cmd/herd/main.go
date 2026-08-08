@@ -40,7 +40,6 @@ import (
 	"github.com/Kampe/Herdforge/pkg/overlap"
 	"github.com/Kampe/Herdforge/pkg/posture"
 	"github.com/Kampe/Herdforge/pkg/preflight"
-	"github.com/Kampe/Herdforge/pkg/standing"
 	"github.com/Kampe/Herdforge/pkg/process"
 	"github.com/Kampe/Herdforge/pkg/provider"
 	"github.com/Kampe/Herdforge/pkg/resetsafe"
@@ -54,6 +53,7 @@ import (
 	"github.com/Kampe/Herdforge/pkg/scopeauth"
 	"github.com/Kampe/Herdforge/pkg/scopefence"
 	"github.com/Kampe/Herdforge/pkg/selftest"
+	"github.com/Kampe/Herdforge/pkg/standing"
 	"github.com/Kampe/Herdforge/pkg/store"
 	hsync "github.com/Kampe/Herdforge/pkg/sync"
 	"github.com/Kampe/Herdforge/pkg/textdelivery"
@@ -1304,6 +1304,10 @@ func runStandingConfigMode(cfg *config.Config, herdrAvailable bool, mode standin
 			}, nil
 		},
 		RepositoryIdentity: repositoryIdentityForLaunch,
+		HarnessPresent: func(harness string) bool {
+			_, err := exec.LookPath(harness)
+			return err == nil
+		},
 		CreateTab: func(workspace, label, cwd string) (standing.Tab, error) {
 			if lastAdmit.decision == nil || lastAdmit.lane == nil {
 				return standing.Tab{}, errors.New("standing tab create requires prior AdmitRoute decision")
@@ -1368,6 +1372,8 @@ func runStandingConfigMode(cfg *config.Config, herdrAvailable bool, mode standin
 				fmt.Printf("herd-standing: live %s %s cwd=%s\n", rr.AgentName, rr.Reason, rr.CWD)
 			case standing.OutcomeMissing:
 				fmt.Printf("herd-standing: missing %s\n", rr.AgentName)
+			case standing.OutcomeUnraiseable:
+				fmt.Fprintf(os.Stderr, "herd-standing: UNRAISEABLE %s: %s\n", rr.AgentName, rr.Reason)
 			case standing.OutcomeClosed, standing.OutcomeWouldClose:
 				fmt.Printf("herd-standing: %s %s (%s)\n", rr.Outcome, rr.AgentName, rr.Reason)
 			case standing.OutcomePreserved:
@@ -2219,11 +2225,11 @@ func runCleanup() {
 	}
 	if *asJSON {
 		json.NewEncoder(os.Stdout).Encode(map[string]interface{}{
-			"dry_run":    *dryRun,
-			"candidates": cands,
-			"closed":     0, // mutation path is fenced; no silent success
-			"blocked":    !*dryRun && len(errs) > 0,
-			"errors":     errMsgs,
+			"dry_run":     *dryRun,
+			"candidates":  cands,
+			"closed":      0, // mutation path is fenced; no silent success
+			"blocked":     !*dryRun && len(errs) > 0,
+			"errors":      errMsgs,
 			"error_count": len(errs),
 		})
 	} else {
@@ -3368,6 +3374,11 @@ func laneLaunchDecision(ctx context.Context, lane *config.LaneDef, task *provide
 	if err := validateLaneLaunchConfig(lane); err != nil {
 		return nil, err
 	}
+	if harness := strings.TrimSpace(lane.Harness); harness != "" {
+		if _, err := exec.LookPath(harness); err != nil {
+			return nil, fmt.Errorf("%w: lane %q harness %q binary not found in $PATH — install %s or provision the harness before raising lanes", ErrHarnessBinaryMissing, lane.Name, harness, harness)
+		}
+	}
 	role := router.Role(lane.Role)
 	shape := strings.TrimSpace(lane.TaskShape)
 	if shape == "" {
@@ -3496,6 +3507,7 @@ func validateLaneLaunchConfig(lane *config.LaneDef) error {
 
 var ErrWorkerConfigPolicy = errors.New("launch.policy.config_worker_tuple_mismatch")
 var ErrHarnessConfigPolicy = errors.New("launch.policy.config_harness_mismatch")
+var ErrHarnessBinaryMissing = errors.New("launch.policy.harness_binary_missing")
 
 // ErrWorkerModelPolicy rejects forbidden model identity on production
 // pulse/forge paths that bind a ModelRouter from a LaunchDecision (FAC-194).
