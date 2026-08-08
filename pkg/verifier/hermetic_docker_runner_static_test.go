@@ -477,6 +477,8 @@ type fac198DockerFake struct {
 	executionErr     error
 	removeErr        error
 	blockStart       chan struct{}
+	startHook        func(containerID string) error
+	mountInfoHook    func() error
 	copies           []struct {
 		destination string
 		payload     []byte
@@ -541,6 +543,9 @@ func (f *fac198DockerFake) Inspect(_ context.Context, id string) (dockerInspecti
 }
 func (f *fac198DockerFake) Start(ctx context.Context, _ string) error {
 	f.callOrder = append(f.callOrder, "start")
+	if f.startHook != nil {
+		return f.startHook(fac198PrimaryContainerID)
+	}
 	if f.blockStart != nil {
 		close(f.blockStart)
 		<-ctx.Done()
@@ -559,6 +564,11 @@ func (f *fac198DockerFake) Copy(_ context.Context, _ string, destination string,
 func (f *fac198DockerFake) Exec(_ context.Context, _ string, argv []string, _ []byte) (dockerResult, error) {
 	f.execCalls++
 	if len(argv) == 2 && argv[0] == "/bin/cat" && argv[1] == "/proc/self/mountinfo" { //hermetic:allow-argv-position test-fake dispatcher: routes by program+arg, not a launch contract
+		if f.mountInfoHook != nil {
+			if err := f.mountInfoHook(); err != nil {
+				return dockerResult{}, err
+			}
+		}
 		f.mountInfoProbes++
 		f.callOrder = append(f.callOrder, "mountinfo")
 		return dockerResult{Output: append([]byte(nil), f.mountInfo...)}, nil
@@ -650,6 +660,7 @@ func newFAC198FakeRunner(t *testing.T, fake *fac198DockerFake) *hermeticDockerRu
 		t.Fatal(err)
 	}
 	runner.docker = fake
+	runner.storePath = filepath.Join(t.TempDir(), "container-lifecycle.db")
 	runner.allowlist = func(string) error { return nil }
 	runner.hostCache = func() (verifiedGoCache, error) {
 		return verifiedGoCache{Zip: []byte("zip"), ZipHash: []byte("hash"), Mod: []byte("mod"), Info: []byte("info")}, nil
