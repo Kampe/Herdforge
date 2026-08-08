@@ -361,12 +361,10 @@ func (p *TLSMitmProxy) Close() error {
 	conns := p.conns
 	p.conns = nil
 	caDir := p.caDir
-	// Zero CA private key material best-effort.
-	if p.ca != nil {
-		p.ca.key = nil
-		p.ca.leaves = nil
-	}
+	ca := p.ca
 	p.mu.Unlock()
+	// Zero CA key material under the CA's own lock, not the proxy's.
+	ca.zero()
 
 	if ln != nil {
 		_ = ln.Close()
@@ -692,6 +690,34 @@ type mitmCA struct {
 	certPEM []byte
 	mu      sync.Mutex
 	leaves  map[string]*tls.Certificate
+	// zeroed is set by zero() once the CA key material has been destroyed. It is
+	// read under mu so an in-flight leafFor cannot mint against a half-torn-down
+	// CA, which is how a shutdown race became "assignment to entry in nil map".
+	zeroed bool
+}
+
+// zero destroys the CA key material under the CA's OWN lock.
+//
+// Close() used to do this inline while holding the PROXY's mutex:
+//
+//	p.ca.key = nil
+//	p.ca.leaves = nil
+//
+// leafFor guards itself with c.mu, a different mutex, so the two were not
+// mutually exclusive at all. A connection still being served would enter
+// leafFor, find the cache non-nil, mint a certificate, and then write to a map
+// that Close had nilled in between -- panic: assignment to entry in nil map,
+// in pkg/security/hostcreds_mitm.go leafFor. It reproduced in CI, where the
+// runner is slow enough to hold the window open, and never on a dev box.
+func (c *mitmCA) zero() {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.key = nil
+	c.leaves = nil
+	c.zeroed = true
 }
 
 func newMitmCA() (*mitmCA, error) {
@@ -723,6 +749,12 @@ func newMitmCA() (*mitmCA, error) {
 func (c *mitmCA) leafFor(host string) (*tls.Certificate, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	// Fail closed once the CA is torn down: a connection that arrives during
+	// shutdown must be refused, never served with a certificate minted from
+	// destroyed key material.
+	if c.zeroed || c.key == nil || c.leaves == nil {
+		return nil, fmt.Errorf("hostcreds MITM CA is closed")
+	}
 	if leaf, ok := c.leaves[host]; ok {
 		return leaf, nil
 	}
