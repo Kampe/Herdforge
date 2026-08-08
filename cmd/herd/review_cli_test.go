@@ -169,6 +169,21 @@ func fixtureSigner(t *testing.T, keyDir, repoDir string) *dispatch.Signer {
 
 // herdCmd runs the built binary in dir with the coordinator key dir pinned
 // to the test's private location.
+// provisionFence creates the shared fence store the FAC-145 claim stack
+// requires. It is idempotent, so callers can invoke it unconditionally.
+//
+// FAC-145 routes provider mutations through a shared fence authority; without
+// a provisioned volume every mutation refuses with "run herd fence-provision
+// on the shared volume". Tests provision inside their OWN temp tree, never a
+// shared host path.
+func provisionFence(t *testing.T, binary, dir, keyDir string) {
+	t.Helper()
+	out, err := herdCmd(binary, dir, keyDir, "fence-provision").CombinedOutput()
+	if err != nil {
+		t.Fatalf("fence-provision: %v\n%s", err, out)
+	}
+}
+
 func herdCmd(binary, dir, keyDir string, args ...string) *exec.Cmd {
 	cmd := exec.Command(binary, args...)
 	cmd.Dir = dir
@@ -178,6 +193,14 @@ func herdCmd(binary, dir, keyDir string, args ...string) *exec.Cmd {
 		dispatch.KeyDirEnv+"="+keyDir,
 		herdr.NoLiveEnv+"=1",
 		herdr.BinaryEnv+"=",
+		// FAC-145 routes provider mutations through a shared fence authority,
+		// which refuses without a claim volume. Point it inside the test's own
+		// tree so the CLI is fenced but hermetic — never at a shared host path.
+		"HERD_CLAIM_DIR="+filepath.Join(dir, "claims"),
+		// The fence authority also requires a volume id of at least 32 chars.
+		// Deterministic per test dir so a retry reuses the same fence rather
+		// than minting a fresh one and losing generation continuity.
+		"HERD_FENCE_VOLUME_ID=herd-test-fence-volume-0000000000000001",
 	)
 	return cmd
 }
@@ -327,6 +350,8 @@ task_provider:
   type: kaneo
   project_id: %q
   api_url: %q
+verification:
+  test_command: "echo ok"
 lanes:
   - name: assayer
     role: reviewer
@@ -364,9 +389,15 @@ func TestReviewCLI_BoundStatusTransition(t *testing.T) {
 	dir, keyDir := t.TempDir(), t.TempDir()
 	attestKeyDir(t, keyDir)
 	writeReviewConfig(t, dir, server.URL, "proj-x")
+	// The completion gate (admitWorktreeForReview) resolves the candidate
+	// HEAD from the worktree, so the fixture needs a REAL git worktree —
+	// not just a directory with a receipt file.
+	gitIn(t, dir, "commit", "--allow-empty", "-q", "-m", "base")
+	wtDir := filepath.Join(dir, ".herd", "worktrees", "fac-1")
+	gitIn(t, dir, "worktree", "add", "-b", "herd/fac-1", wtDir, "HEAD")
 	// The transition is bound to the dispatched task's own receipt in the
 	// managed worktree (FAC-145 — no config-derived synthetic context).
-	writeSignedReceipt(t, keyDir, dir, filepath.Join(dir, ".herd", "worktrees", "fac-1"), nil)
+	writeSignedReceipt(t, keyDir, dir, wtDir, nil)
 
 	out, err := herdCmd(binary, dir, keyDir, "review", "FAC-1").CombinedOutput()
 	if err != nil {
@@ -571,6 +602,7 @@ func approveFixture(t *testing.T) (dir, keyDir string, fk *fakeKaneo) {
 func TestApproveCLI_BoundMutationAndPassCallback(t *testing.T) {
 	binary := buildHerd(t)
 	dir, keyDir, fk := approveFixture(t)
+	provisionFence(t, binary, dir, keyDir)
 
 	out, err := herdCmd(binary, dir, keyDir, "approve", "FAC-1").CombinedOutput()
 	if err != nil {
@@ -658,6 +690,7 @@ func writeIntentRecord(t *testing.T, dir, keyDir, ref, sha, state string) string
 func TestApproveCLI_ReconcilesInterruptedTransition(t *testing.T) {
 	binary := buildHerd(t)
 	dir, keyDir, fk := approveFixture(t)
+	provisionFence(t, binary, dir, keyDir)
 	sha := fixtureEvidenceSHA(t, dir)
 	dedupeID := writeIntentRecord(t, dir, keyDir, "FAC-1", sha, "intent")
 
@@ -777,6 +810,7 @@ func TestApproveCLI_TornOrTamperedJournalFailsClosed(t *testing.T) {
 func TestApproveCLI_DoneWithoutPublishReconcilesByPublicationOnly(t *testing.T) {
 	binary := buildHerd(t)
 	dir, keyDir, fk := approveFixture(t)
+	provisionFence(t, binary, dir, keyDir)
 	sha := fixtureEvidenceSHA(t, dir)
 	writeIntentRecord(t, dir, keyDir, "FAC-1", sha, "intent")
 	writeIntentRecord(t, dir, keyDir, "FAC-1", sha, "done")
@@ -818,6 +852,7 @@ func TestApproveCLI_DoneWithoutPublishReconcilesByPublicationOnly(t *testing.T) 
 func TestApproveCLI_TornAnchorHealsAndCompletes(t *testing.T) {
 	binary := buildHerd(t)
 	dir, keyDir, fk := approveFixture(t)
+	provisionFence(t, binary, dir, keyDir)
 	sha := fixtureEvidenceSHA(t, dir)
 	writeIntentRecord(t, dir, keyDir, "FAC-1", sha, "intent")
 	// Simulate the crash: the anchor for the single record never landed.
@@ -843,6 +878,7 @@ func TestApproveCLI_TornAnchorHealsAndCompletes(t *testing.T) {
 func TestApproveCLI_RecoversAfterWorktreeLoss(t *testing.T) {
 	binary := buildHerd(t)
 	dir, keyDir, fk := approveFixture(t)
+	provisionFence(t, binary, dir, keyDir)
 	// The whole worktree is gone (GC/reap) — only the canonical copy remains.
 	if err := os.RemoveAll(filepath.Join(dir, ".herd", "worktrees", "fac-1")); err != nil {
 		t.Fatal(err)
@@ -867,6 +903,7 @@ func TestApproveCLI_RecoversAfterWorktreeLoss(t *testing.T) {
 func TestApproveCLI_ReadbackDriftFailsApproval(t *testing.T) {
 	binary := buildHerd(t)
 	dir, keyDir, fk := approveFixture(t)
+	provisionFence(t, binary, dir, keyDir)
 	// Lying board: PATCH is acknowledged and counted but state never moves.
 	fk.mu.Lock()
 	fk.lieOnPatch = true
@@ -906,6 +943,7 @@ func TestApproveCLI_ReadbackDriftFailsApproval(t *testing.T) {
 func TestApproveCLI_ReleasedNewerGenerationStillFences(t *testing.T) {
 	binary := buildHerd(t)
 	dir, keyDir, fk := approveFixture(t)
+	provisionFence(t, binary, dir, keyDir)
 	// Drive the store to generation 4, then RELEASE it (nothing active).
 	bumpClaimGeneration(t, dir, "FAC-1", 4)
 	st, err := claim.NewSQLiteLeaseStore(filepath.Join(dir, ".herd", "herdforge.db"))
@@ -1066,6 +1104,7 @@ func TestBrokerLifecycle_EnsureCrashRestartAndSocketSafety(t *testing.T) {
 func TestReviewCLI_IsolatedDetachedReviewWorktree(t *testing.T) {
 	binary := buildHerd(t)
 	dir, keyDir, fk := approveFixture(t)
+	provisionFence(t, binary, dir, keyDir)
 	// herd review claims in-progress cards.
 	fk.mu.Lock()
 	fk.status = "in-progress"
@@ -1169,6 +1208,7 @@ func runGitOut(t *testing.T, dir string, args ...string) string {
 func TestVerdict_TwoBrokersDeliverExactlyOnce(t *testing.T) {
 	binary := buildHerd(t)
 	dir, keyDir, fk := approveFixture(t)
+	provisionFence(t, binary, dir, keyDir)
 
 	sockA, sockB := shortSocketPath(t), shortSocketPath(t)
 	startBroker(t, binary, dir, keyDir, sockA)
@@ -1291,6 +1331,7 @@ func TestReceiptIssueCLI_AdmitsEveryIsolatedAgentClass(t *testing.T) {
 func TestTaskBrokerCLI_ScopedReviewLeaseWorks(t *testing.T) {
 	binary := buildHerd(t)
 	dir, keyDir, fk := approveFixture(t)
+	provisionFence(t, binary, dir, keyDir)
 	sock := shortSocketPath(t)
 	startBroker(t, binary, dir, keyDir, sock)
 
@@ -1393,6 +1434,7 @@ func TestVerdict_IntentOnlyNeverConsumable(t *testing.T) {
 func TestApproveCLI_RejectedVerdictVetoesApproval(t *testing.T) {
 	binary := buildHerd(t)
 	dir, keyDir, fk := approveFixture(t)
+	provisionFence(t, binary, dir, keyDir)
 	candidate := fixtureEvidenceSHA(t, dir)
 	rc, err := dispatch.LoadCanonicalReceipt(dir, "FAC-1")
 	if err != nil {
@@ -1479,6 +1521,7 @@ func TestDispatchCLI_FailedDispatchReleasesLease(t *testing.T) {
 func TestApproveCLI_CorruptFenceStoreRefused(t *testing.T) {
 	binary := buildHerd(t)
 	dir, keyDir, fk := approveFixture(t)
+	provisionFence(t, binary, dir, keyDir)
 	if err := os.WriteFile(filepath.Join(dir, ".herd", "herdforge.db"), []byte("not a sqlite database"), 0644); err != nil {
 		t.Fatal(err)
 	}
@@ -1571,6 +1614,7 @@ func TestApproveCLI_ChainRollbackReorderReplayRefused(t *testing.T) {
 func TestApproveCLI_ConcurrentApprovesSerializeAndDedupe(t *testing.T) {
 	binary := buildHerd(t)
 	dir, keyDir, fk := approveFixture(t)
+	provisionFence(t, binary, dir, keyDir)
 
 	c1 := herdCmd(binary, dir, keyDir, "approve", "FAC-1")
 	c2 := herdCmd(binary, dir, keyDir, "approve", "FAC-1")
@@ -1604,6 +1648,7 @@ func TestApproveCLI_ConcurrentApprovesSerializeAndDedupe(t *testing.T) {
 func TestApproveCLI_TamperedReceiptRejected(t *testing.T) {
 	binary := buildHerd(t)
 	dir, keyDir, fk := approveFixture(t)
+	provisionFence(t, binary, dir, keyDir)
 
 	receiptPath := filepath.Join(dir, ".herd", "worktrees", "fac-1", "TASK-CONTEXT.json")
 	data, err := os.ReadFile(receiptPath)
@@ -1635,6 +1680,7 @@ func TestApproveCLI_TamperedReceiptRejected(t *testing.T) {
 func TestApproveCLI_MissingReceiptRefusedNoFallback(t *testing.T) {
 	binary := buildHerd(t)
 	dir, keyDir, fk := approveFixture(t)
+	provisionFence(t, binary, dir, keyDir)
 
 	// Simulate a receipt that never existed anywhere: neither the worktree
 	// copy nor the durable canonical copy remains.
@@ -1724,6 +1770,7 @@ func startBrokerCmd(t *testing.T, cmd *exec.Cmd, sock string) {
 func TestTaskBrokerCLI_ReceiptGated(t *testing.T) {
 	binary := buildHerd(t)
 	dir, keyDir, fk := approveFixture(t)
+	provisionFence(t, binary, dir, keyDir)
 	sock := shortSocketPath(t)
 	startBroker(t, binary, dir, keyDir, sock)
 	wt := filepath.Join(dir, ".herd", "worktrees", "fac-1")
@@ -1820,6 +1867,7 @@ func TestTaskBrokerCLI_ReceiptGated(t *testing.T) {
 func TestTaskBrokerCLI_DetachedReviewerReadAndVerdict(t *testing.T) {
 	binary := buildHerd(t)
 	dir, keyDir, fk := approveFixture(t)
+	provisionFence(t, binary, dir, keyDir)
 	sock := shortSocketPath(t)
 	startBroker(t, binary, dir, keyDir, sock)
 
@@ -1875,6 +1923,7 @@ func TestTaskBrokerCLI_DetachedReviewerReadAndVerdict(t *testing.T) {
 func TestApproveCLI_StaleLeaseGenerationFencedOut(t *testing.T) {
 	binary := buildHerd(t)
 	dir, keyDir, fk := approveFixture(t)
+	provisionFence(t, binary, dir, keyDir)
 
 	// The CANONICAL claim store holds a NEWER live lease than the receipt's.
 	bumpClaimGeneration(t, dir, "FAC-1", 5)
