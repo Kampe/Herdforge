@@ -27,6 +27,7 @@ const (
 //  1. Creates fences.db with an internal store_authority.volume_seal row
 //     (trustworthy: seal lives only inside the atomic SQLite store).
 //  2. Writes SHARED human-readable pointer (not the source of truth).
+//
 // ValidateSharedMarker reads the seal FROM THE DB, not from forgeable fields.
 func WriteSharedMarker(dir string) error {
 	if os.Getenv(envProvision) != "1" && os.Getenv(envRotate) != "1" {
