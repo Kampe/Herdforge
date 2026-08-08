@@ -30,8 +30,8 @@ var (
 	// Exclude review markers — a reviewer analyzing rate-limit code should not match QUOTA.
 	reviewMarkerRE = regexp.MustCompile(`(?i)verdict:\s*|merge recommendation:\s*|\bconfirmed\b|\bfindings?\b|reviewing|pass/fail`)
 	// Unconsumed: prompt prefix ❯ with no status/worked-for marker
-	unconsumedRE    = regexp.MustCompile(`(?m)^❯\s`)
-	statusWorkedRE  = regexp.MustCompile(`(?i)Worked for|Status:`)
+	unconsumedRE   = regexp.MustCompile(`(?m)^❯\s`)
+	statusWorkedRE = regexp.MustCompile(`(?i)Worked for|Status:`)
 )
 
 func ClassifyText(text string) Classification {
@@ -64,12 +64,12 @@ func ClassifyText(text string) Classification {
 }
 
 type ProcessingItem struct {
-	PaneID  string         `json:"pane_id"`
-	Name    string         `json:"name"`
-	Status  string         `json:"status"`
-	Class   Classification `json:"class"`
-	Action  string         `json:"action"`
-	Tail    string         `json:"tail"`
+	PaneID string         `json:"pane_id"`
+	Name   string         `json:"name"`
+	Status string         `json:"status"`
+	Class  Classification `json:"class"`
+	Action string         `json:"action"`
+	Tail   string         `json:"tail"`
 }
 
 func ActionForClass(class Classification) string {
