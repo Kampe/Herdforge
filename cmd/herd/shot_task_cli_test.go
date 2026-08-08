@@ -281,5 +281,23 @@ func stubHarnessPATH(t *testing.T) string {
 			t.Fatalf("write stub %s: %v", name, err)
 		}
 	}
+	// opencode gets a PROBE-FAITHFUL stub, not a no-op. The write-capable tool
+	// probe (pkg/herdr/toolprobe.go) shells `opencode run --model <m> <prompt>`
+	// and judges the ARTIFACT, never the model's claim: it requires the file
+	// named in the prompt to exist containing EXECUTED. A stub that merely
+	// exits 0 is correctly judged INCAPABLE — "model described the write but
+	// did not execute the tool" — which is exactly what that gate is for.
+	// So the stub performs the write the probe demands.
+	probe := "#!/bin/sh\n" +
+		"for a in \"$@\"; do\n" +
+		"  for w in $a; do\n" +
+		"    case \"$w\" in */PROBE_OK.txt)\n" +
+		"      mkdir -p \"$(dirname \"$w\")\" && printf 'EXECUTED' > \"$w\" ;;\n" +
+		"    esac\n" +
+		"  done\n" +
+		"done\nexit 0\n"
+	if err := os.WriteFile(filepath.Join(dir, "opencode"), []byte(probe), 0o755); err != nil {
+		t.Fatalf("write opencode probe stub: %v", err)
+	}
 	return dir
 }
