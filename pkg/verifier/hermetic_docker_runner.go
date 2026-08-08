@@ -20,8 +20,6 @@ import (
 	"strconv"
 	"strings"
 	"time"
-
-	"github.com/Kampe/Herdforge/pkg/containerlifecycle"
 )
 
 // hermeticContainerEnv is set by the FAC-151 Docker runner so ownership
@@ -270,7 +268,7 @@ func (r *hermeticDockerRunner) Run(ctx context.Context) (result FAC151DockerResu
 		return result, fmt.Errorf("generate independent receipt nonce: %w", err)
 	}
 	nonce := hex.EncodeToString(nonceBytes)
-	store, err := containerlifecycle.NewStore(r.storePath)
+	store, err := openLifecycleStore(r.storePath)
 	if err != nil {
 		return result, fmt.Errorf("open container lifecycle store: %w", err)
 	}
@@ -280,13 +278,7 @@ func (r *hermeticDockerRunner) Run(ctx context.Context) (result FAC151DockerResu
 		return result, err
 	}
 	result.ContainerID = containerID
-	if _, err := store.Register(containerlifecycle.Receipt{
-		ContainerID:  containerID,
-		TaskRef:      "FAC-198/FAC-151",
-		Generation:   nonce,
-		ImageDigest:  r.policy.configDigest(),
-		CleanupOwner: "hermetic-docker-runner",
-	}); err != nil {
+	if err := store.Register(containerID, "FAC-198/FAC-151", nonce, r.policy.configDigest(), "hermetic-docker-runner"); err != nil {
 		teardownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		_ = r.docker.Remove(teardownCtx, containerID)
 		cancel()
@@ -322,16 +314,14 @@ func (r *hermeticDockerRunner) Run(ctx context.Context) (result FAC151DockerResu
 		// for diagnostics only and must never fail a run on its own; joining
 		// it unconditionally would reintroduce exactly the false failure
 		// EnsureCleanup exists to suppress.
-		cleanupErr := containerlifecycle.EnsureCleanup(teardownCtx, store, containerID, expectedTerminalState, remover, absent)
+		cleanupErr := store.EnsureCleanup(teardownCtx, containerID, expectedTerminalState, remover, absent)
 		if cleanupErr != nil {
 			if capturedRemoveErr != nil {
 				cleanupErr = errors.Join(cleanupErr, capturedRemoveErr)
 			}
 			err = errors.Join(err, cleanupErr)
 		}
-		if receipt, getErr := store.Get(containerID); getErr == nil && receipt != nil {
-			result.Removed = receipt.State == containerlifecycle.StateRemoved && receipt.AbsenceProved
-		}
+		result.Removed = store.RemovedWithProvenAbsence(containerID)
 	}()
 	archive := r.archive
 	if archive == nil {
