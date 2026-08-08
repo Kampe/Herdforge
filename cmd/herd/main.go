@@ -2076,6 +2076,13 @@ func runApprove() {
 		}
 	}
 
+	stack, stackErr := loadClaimStack(tp)
+	if stackErr != nil {
+		fmt.Fprintf(os.Stderr, "claim stack: %v\n", stackErr)
+		os.Exit(1)
+	}
+	defer stack.Close()
+
 	// Complete any interrupted callback+Done transitions BEFORE sweeping —
 	// a crash between the journaled intent, the posted callback, and the
 	// board move leaves a pending intent that is re-driven here
@@ -2096,7 +2103,7 @@ func runApprove() {
 		fmt.Printf("RECONCILE [%s]: completing interrupted approval %s (state %s)\n", in.Ref, in.DedupeID, in.State)
 		// The journal names WHICH operation to finish; the closing authority
 		// is re-read from that ref's completion receipt (FAC-132).
-		if _, err := approveOne(ctx, cfg, tp, root, in.Ref, "", nil, &in); err != nil {
+		if _, err := approveOne(ctx, cfg, tp, stack, root, in.Ref, "", nil, &in); err != nil {
 			fmt.Fprintf(os.Stderr, "ERROR    [%s]: reconcile: %v\n", in.Ref, err)
 			reconcileFailed++
 		}
@@ -2139,19 +2146,12 @@ func runApprove() {
 		return provider.CompareRefs(tasks[i].Ref, tasks[j].Ref) < 0
 	})
 
-	stack, stackErr := loadClaimStack(tp)
-	if stackErr != nil {
-		fmt.Fprintf(os.Stderr, "claim stack: %v\n", stackErr)
-		os.Exit(1)
-	}
-	defer stack.Close()
-
 	approved, refused, failed := 0, 0, reconcileFailed
 	for _, task := range tasks {
 		// FAC-145: receipt-bound, callback-coupled approval — missing/
 		// unsigned/tampered receipt, wrong repo/project/task, expiry, stale
 		// generation, or an undeliverable callback all refuse the mutation.
-		res, err := approveOne(ctx, cfg, tp, root, task.Ref, receiptPathArg, override, nil)
+		res, err := approveOne(ctx, cfg, tp, stack, root, task.Ref, receiptPathArg, override, nil)
 		switch {
 		case err == nil:
 			if res.Idempotent {
@@ -2736,7 +2736,7 @@ func pendingApproveIntents(root string, signer *dispatch.Signer) ([]approveInten
 // operation: identity must match the live receipt (a lease-generation
 // switch refuses), the evidence SHA is the recorded one, and no fresh
 // intent is appended.
-func approveOne(ctx context.Context, cfg *config.Config, tp provider.TaskProvider, root, ref, receiptPath string, override *hsync.OverrideRequest, resume *approveIntent) (*hsync.DoneResult, error) {
+func approveOne(ctx context.Context, cfg *config.Config, tp provider.TaskProvider, stack *provider.ClaimStack, root, ref, receiptPath string, override *hsync.OverrideRequest, resume *approveIntent) (*hsync.DoneResult, error) {
 	btp, coord, err := boundBoardProvider(cfg, tp, root, ref)
 	if err != nil {
 		return nil, err
@@ -2846,7 +2846,31 @@ func approveOne(ctx context.Context, cfg *config.Config, tp provider.TaskProvide
 		return nil, fmt.Errorf("journaled approval %s evidence %s no longer proves on origin/main (resolved %s) — refusing drifted resume (FAC-145)", rec.DedupeID, rec.SHA, proofSHA)
 	}
 
-	res, err := hsync.BoardDone(ctx, btp, req)
+	var res *hsync.DoneResult
+	if stack != nil {
+		owner, oerr := provider.ProcessOwnerID()
+		if oerr != nil {
+			return nil, fmt.Errorf("approve: process owner identity: %w", oerr)
+		}
+		key := provider.LeaseKey(coord.Repository, coord.ProviderType, coord.ProjectID, coord.LeaseTaskRef)
+		taskRole, rerr := provider.TaskOwnershipRole(nil, "worker")
+		if rerr != nil {
+			return nil, rerr
+		}
+		lease, lerr := stack.AcquireLease(ctx, key, owner, taskRole, taskRole)
+		if lerr != nil {
+			return nil, fmt.Errorf("approve refuses mutation without live lease: %w", lerr)
+		}
+		defer func() {
+			_ = stack.Manager.Release(context.Background(), key, owner, lease.Generation)
+		}()
+		if ferr := stack.CAS.AdvanceFence(ctx, coord.TaskID, lease.Generation); ferr != nil {
+			return nil, ferr
+		}
+		res, err = hsync.BoardDoneFenced(ctx, btp, stack, key, owner, lease.Generation, req)
+	} else {
+		res, err = hsync.BoardDone(ctx, btp, req)
+	}
 	if err != nil {
 		// Internal failure signal only — no completion was ever published.
 		ccb, cErr := coord.BoundCallback(mail.CallbackBlocked, "", fmt.Sprintf("board-done failed for %s: %v", rec.SHA, err))
@@ -2938,7 +2962,13 @@ func runBoardDone() {
 		fmt.Fprintf(os.Stderr, "herd board-done: %v\n", lockErr)
 		os.Exit(1)
 	}
-	res, err := approveOne(context.Background(), cfg, tp, root, ref, *receiptPath, override, nil)
+	stack, stackErr := loadClaimStack(tp)
+	if stackErr != nil {
+		fmt.Fprintf(os.Stderr, "claim stack: %v\n", stackErr)
+		os.Exit(1)
+	}
+	defer stack.Close()
+	res, err := approveOne(context.Background(), cfg, tp, stack, root, ref, *receiptPath, override, nil)
 	if relErr := release(); relErr != nil {
 		fmt.Fprintf(os.Stderr, "herd board-done: %v\n", relErr)
 		os.Exit(1)
@@ -4465,7 +4495,7 @@ func runForgeE() error {
 		}
 		for _, t := range reviewTasks {
 			// FAC-145: receipt-bound, callback-coupled approval only.
-			res, err := approveOne(ctx, cfg, tp, root, t.Ref, "", nil, nil)
+			res, err := approveOne(ctx, cfg, tp, stack, root, t.Ref, "", nil, nil)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "Not approved [%s]: %v\n", t.Ref, err)
 				if !errors.Is(err, hsync.ErrNoEvidence) {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/Kampe/Herdforge/pkg/daemon"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -237,6 +238,10 @@ func herdCmd(binary, dir, keyDir string, args ...string) *exec.Cmd {
 		// which refuses without a claim volume. Point it inside the test's own
 		// tree so the CLI is fenced but hermetic — never at a shared host path.
 		"HERD_CLAIM_DIR="+filepath.Join(dir, "claims"),
+		// The fake Kaneo board enforces fence+op with status (it counts
+		// patches and checks state), so declare it as an atomic fence
+		// server for the fenced mutation path.
+		"HERD_FENCE_ATOMIC_SERVER=1",
 	)
 	// The volume seal is MINTED by fence-provision, never chosen by the caller:
 	// WriteSharedMarker clears any preset HERD_FENCE_VOLUME_ID so a host cannot
@@ -358,7 +363,7 @@ func newFakeKaneo() (*fakeKaneo, *httptest.Server) {
 	})
 	mux.HandleFunc("/api/task/t1", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		if r.Method == http.MethodPatch {
+		if r.Method == http.MethodPatch || r.Method == http.MethodPut {
 			var body struct {
 				Status string `json:"status"`
 			}
@@ -430,6 +435,9 @@ lanes:
 // seedReviewAdmission seeds the lifecycle to StateBuilding and runs the
 // completion gate to persist a passing verification receipt, so the
 // subprocess `herd review` can recover the digest and admit the candidate.
+// Idempotent: if the lifecycle already records state for ref (e.g.
+// approveFixture's seedFixtureLifecycle already ran), the chain append
+// is skipped and only the completion gate runs.
 func seedReviewAdmission(t *testing.T, dir, ref string) {
 	t.Helper()
 	wtDir := filepath.Join(dir, ".herd", "worktrees", strings.ToLower(hsync.NormalizeRef(ref)))
@@ -440,32 +448,53 @@ func seedReviewAdmission(t *testing.T, dir, ref string) {
 	candidate := strings.TrimSpace(string(candidateOut))
 	_, leaseGen := acquireFixtureLease(t, dir, ref)
 
-	store, err := lifecycle.NewEventStore(lifecycle.CanonicalStatePath(dir))
-	if err != nil {
-		t.Fatalf("lifecycle store: %v", err)
-	}
-	defer store.Close()
-	tx, err := store.DB().Begin()
-	if err != nil {
-		t.Fatalf("begin: %v", err)
-	}
-	chain := []lifecycle.State{
-		lifecycle.StateEligible, lifecycle.StateClaimed, lifecycle.StateDispatched,
-		lifecycle.StateBuilding,
-	}
-	for i, to := range chain {
-		if _, err := store.AppendTx(tx, lifecycle.AppendIntent{
-			TaskRef: hsync.NormalizeRef(ref), Repo: "herdforge-test", To: to,
-			Actor: "fixture", IdempotencyKey: fmt.Sprintf("fixture-review-%s-%d", ref, i),
-			LeaseGeneration: leaseGen, ProviderRevision: "provider-rev-1",
-			Branch: "herd/fac-1", CandidateSHA: candidate,
-		}); err != nil {
-			_ = tx.Rollback()
-			t.Fatalf("lifecycle append %s: %v", to, err)
+	// Production .gitignore excludes TASK-CONTEXT.json so the verifier's
+	// requireCleanCandidate does not flag the launch receipt as dirty.
+	// A git worktree has its own root, so the repo-root .gitignore does
+	// NOT apply — write one directly into the worktree.
+	gitignorePath := filepath.Join(wtDir, ".gitignore")
+	if _, err := os.Stat(gitignorePath); err != nil {
+		if err := os.WriteFile(gitignorePath, []byte("TASK-CONTEXT.json\n.gitignore\n"), 0644); err != nil {
+			t.Fatal(err)
 		}
 	}
-	if err := tx.Commit(); err != nil {
-		t.Fatalf("commit lifecycle: %v", err)
+
+	// Seed the lifecycle chain to "building" if not already seeded.
+	// approveFixture's seedFixtureLifecycle may have already done this.
+	machine, err := lifecycle.NewMachine(filepath.Join(dir, ".herd", "lifecycle.db"))
+	if err != nil {
+		t.Fatalf("lifecycle machine: %v", err)
+	}
+	st, _ := machine.EventStore().CurrentState(hsync.NormalizeRef(ref))
+	machine.Close()
+	if st == nil || st.LeaseGeneration == 0 {
+		store, err := lifecycle.NewEventStore(filepath.Join(dir, ".herd", "lifecycle.db"))
+		if err != nil {
+			t.Fatalf("lifecycle store: %v", err)
+		}
+		defer store.Close()
+		tx, err := store.DB().Begin()
+		if err != nil {
+			t.Fatalf("begin: %v", err)
+		}
+		chain := []lifecycle.State{
+			lifecycle.StateEligible, lifecycle.StateClaimed, lifecycle.StateDispatched,
+			lifecycle.StateBuilding,
+		}
+		for i, to := range chain {
+			if _, err := store.AppendTx(tx, lifecycle.AppendIntent{
+				TaskRef: hsync.NormalizeRef(ref), Repo: "herdforge-test", To: to,
+				Actor: "fixture", IdempotencyKey: fmt.Sprintf("fixture-review-%s-%d", ref, i),
+				LeaseGeneration: leaseGen, ProviderRevision: "provider-rev-1",
+				Branch: "herd/fac-1", CandidateSHA: candidate,
+			}); err != nil {
+				_ = tx.Rollback()
+				t.Fatalf("lifecycle append %s: %v", to, err)
+			}
+		}
+		if err := tx.Commit(); err != nil {
+			t.Fatalf("commit lifecycle: %v", err)
+		}
 	}
 
 	prev, err := os.Getwd()
@@ -506,6 +535,7 @@ func TestReviewCLI_BoundStatusTransition(t *testing.T) {
 	// The transition is bound to the dispatched task's own receipt in the
 	// managed worktree (FAC-145 — no config-derived synthetic context).
 	writeSignedReceipt(t, keyDir, dir, wtDir, nil)
+	seedReviewAdmission(t, dir, "FAC-1")
 
 	out, err := herdCmd(binary, dir, keyDir, "review", "FAC-1").CombinedOutput()
 	if err != nil {
@@ -701,6 +731,12 @@ func approveFixture(t *testing.T) (dir, keyDir string, fk *fakeKaneo) {
 	// receipt above; these tests are about the FAC-145 machinery around the
 	// move, not about which authority permits it.
 	_, leaseGen := acquireFixtureLease(t, dir, "FAC-1")
+	// FAC-147 binds the completion gate to the LIFECYCLE's recorded lease, not
+	// the claim store's. Acquiring a claim is not enough: bindingForWorktree
+	// reads machine.EventStore().CurrentState(ref).LeaseGeneration and refuses
+	// with "no positive lease generation (lifecycle must record the active
+	// lease)". Seed the same generation into the lifecycle so the two agree.
+	seedFixtureLifecycle(t, dir, "FAC-1", leaseGen)
 	seedCompletionReceipt(t, dir, "FAC-1", leaseGen)
 	return dir, keyDir, fk
 }
@@ -1228,6 +1264,7 @@ func TestReviewCLI_IsolatedDetachedReviewWorktree(t *testing.T) {
 	// Auxiliary (mutate != nil) so the canonical store keeps the fixture's
 	// original receipt; this test only needs the author worktree copy.
 	writeSignedReceipt(t, keyDir, dir, authorDir, func(tc *dispatch.TaskContext) { tc.Branch = "herd/fac-1" })
+	seedReviewAdmission(t, dir, "FAC-1")
 	authorReceiptBefore, err := os.ReadFile(filepath.Join(authorDir, "TASK-CONTEXT.json"))
 	if err != nil {
 		t.Fatal(err)
@@ -2157,4 +2194,19 @@ func TestBroker_SessionAuthorityDiesWithPaneIncarnation(t *testing.T) {
 		t.Fatalf("expected the session-liveness refusal, got:\n%s", out)
 	}
 	assertLiveFleetUntouched(t, censusBefore)
+}
+
+// seedFixtureLifecycle records an active lease in the durable lifecycle store
+// the CLI reads (.herd/lifecycle.db), advancing the task to Building under the
+// SAME generation the claim store holds.
+func seedFixtureLifecycle(t *testing.T, dir, ref string, leaseGen int64) {
+	t.Helper()
+	machine, err := lifecycle.NewMachine(filepath.Join(dir, ".herd", "lifecycle.db"))
+	if err != nil {
+		t.Fatalf("lifecycle machine: %v", err)
+	}
+	defer machine.Close()
+	if err := daemon.SeedLifecycleToBuilding(machine, ref, "herdforge", leaseGen); err != nil {
+		t.Fatalf("seed lifecycle for %s: %v", ref, err)
+	}
 }
