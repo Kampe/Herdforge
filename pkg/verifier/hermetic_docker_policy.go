@@ -40,8 +40,38 @@ const (
 type hermeticImagePin struct {
 	Platform     string // docker --platform value, e.g. linux/arm64
 	Architecture string // docker inspect Architecture, e.g. arm64
-	Image        string // golang@sha256:...
+	Image        string // golang@sha256:... (single-platform manifest digest)
 	ConfigDigest string // image config/id digest accepted by InspectImage
+	MediaType    string // registry mediaType of Image (manifest, not index)
+}
+
+// Known registry media types for Docker/OCI manifests and indexes.
+const (
+	mediaTypeDockerManifest     = "application/vnd.docker.distribution.manifest.v2+json"
+	mediaTypeOCIManifest        = "application/vnd.oci.image.manifest.v1+json"
+	mediaTypeDockerManifestList = "application/vnd.docker.distribution.manifest.list.v2+json"
+	mediaTypeOCIImageIndex      = "application/vnd.oi.image.index.v1+json"
+)
+
+// isImageManifestMediaType returns true for single-platform manifest types
+// and false for multi-arch index types or anything else.
+func isImageManifestMediaType(mt string) bool {
+	switch mt {
+	case mediaTypeDockerManifest, mediaTypeOCIManifest:
+		return true
+	default:
+		return false
+	}
+}
+
+// isImageIndexMediaType returns true for multi-arch index types.
+func isImageIndexMediaType(mt string) bool {
+	switch mt {
+	case mediaTypeDockerManifestList, mediaTypeOCIImageIndex:
+		return true
+	default:
+		return false
+	}
 }
 
 // Pinned official library/golang:1.25.0 images (GOTOOLCHAIN=local). Digests
@@ -51,9 +81,8 @@ var hermeticImagePins = map[string]hermeticImagePin{
 		Platform:     "linux/arm64",
 		Architecture: "arm64",
 		Image:        "golang@sha256:10e3849906212f513e105ab93ade96acd02dc30172adaf346c72ff82b003944b",
-		// Accept either the single-platform content digest (same as Image) or
-		// the historical config digest used by the original pin/tests.
 		ConfigDigest: "sha256:0d8d3155f6d8ef0ddc858877343d69c3683ac0807e218a7b28bb24e31ae9973d",
+		MediaType:    mediaTypeOCIManifest,
 	},
 	"amd64": {
 		Platform:     "linux/amd64",
@@ -72,6 +101,7 @@ var hermeticImagePins = map[string]hermeticImagePin{
 		// docker manifest inspect and a --platform linux/amd64 pull.
 		Image:        "golang@sha256:f7414a0dc5a64713686cbc9f1e8a7379b66af63ef9ad15760b43db40e0b15d9c",
 		ConfigDigest: "sha256:749aa15fc6e4fac30c91f785daf525be2b791065e7eb225a43de6492ed2d03c0",
+		MediaType:    mediaTypeOCIManifest,
 	},
 }
 
@@ -98,7 +128,7 @@ func hermeticImagePinFor(arch string) (hermeticImagePin, error) {
 	switch arch {
 	case "arm64", "amd64":
 		pin, ok := hermeticImagePins[arch]
-		if !ok || pin.Image == "" || pin.Platform == "" || pin.Architecture == "" || pin.ConfigDigest == "" {
+		if !ok || pin.Image == "" || pin.Platform == "" || pin.Architecture == "" || pin.ConfigDigest == "" || pin.MediaType == "" {
 			return hermeticImagePin{}, fmt.Errorf("FAC-151 hermetic image pin for %s is incomplete", arch)
 		}
 		return pin, nil
@@ -162,7 +192,7 @@ func (p hermeticDockerPolicy) platform() string     { return p.pin.Platform }
 func (p hermeticDockerPolicy) configDigest() string { return p.pin.ConfigDigest }
 func (p hermeticDockerPolicy) architecture() string { return p.pin.Architecture }
 func (p hermeticDockerPolicy) valid() bool {
-	return p.pin.Image != "" && p.pin.Platform != "" && p.pin.Architecture != "" && p.pin.ConfigDigest != ""
+	return p.pin.Image != "" && p.pin.Platform != "" && p.pin.Architecture != "" && p.pin.ConfigDigest != "" && p.pin.MediaType != ""
 }
 
 func verifyFAC151Allowlist(sourceRoot string) error {

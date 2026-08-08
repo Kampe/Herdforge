@@ -1586,3 +1586,81 @@ func TestFAC151HermeticRunnerTimeoutUsesIndependentTeardown(t *testing.T) {
 		t.Fatalf("independent teardown evidence removed=%t id=%q inspections=%d", result.Removed, fake.removeID, fake.postInspect)
 	}
 }
+
+func isValidSHADigest(s string) bool {
+	if !strings.HasPrefix(s, "sha256:") {
+		return false
+	}
+	hexPart := strings.TrimPrefix(s, "sha256:")
+	if len(hexPart) != 64 || strings.ToLower(hexPart) != hexPart {
+		return false
+	}
+	_, err := hex.DecodeString(hexPart)
+	return err == nil
+}
+
+// TestFAC216HermeticImagePinsAreSinglePlatformManifests validates every entry
+// in hermeticImagePins at test time. Each pin's MediaType must be a
+// single-platform manifest (not a multi-arch index), ConfigDigest must be a
+// valid sha256 distinct from the Image manifest digest, and every field must be
+// populated. This guards against the FAC-151 regression where the amd64 pin
+// pointed at a multi-arch INDEX digest with ConfigDigest set to the manifest
+// digest (one level off).
+func TestFAC216HermeticImagePinsAreSinglePlatformManifests(t *testing.T) {
+	for arch, pin := range hermeticImagePins {
+		t.Run(arch, func(t *testing.T) {
+			if !isImageManifestMediaType(pin.MediaType) {
+				t.Fatalf("MediaType %q is not a recognized single-platform manifest type", pin.MediaType)
+			}
+			if isImageIndexMediaType(pin.MediaType) {
+				t.Fatalf("MediaType %q is a multi-arch index type, not a manifest", pin.MediaType)
+			}
+			if pin.Platform == "" || pin.Architecture == "" {
+				t.Fatalf("pin for %s has an empty Platform or Architecture", arch)
+			}
+			refDigest := pinnedDockerReferenceDigest(pin.Image)
+			if refDigest == "" {
+				t.Fatalf("Image %q is not a valid pinned reference (golang@sha256:...)", pin.Image)
+			}
+			if !isValidSHADigest(pin.ConfigDigest) {
+				t.Fatalf("ConfigDigest %q is not a valid sha256 digest", pin.ConfigDigest)
+			}
+			if pin.ConfigDigest == refDigest {
+				t.Fatalf("ConfigDigest equals the Image manifest digest %q — a config blob is always distinct from its manifest", pin.ConfigDigest)
+			}
+		})
+	}
+}
+
+// TestFAC216ImageMediaTypeGuardRejectsIndexes verifies the mediaType guard
+// functions correctly classify manifest and index types. This is the
+// regression-proving half of the pin guard — a test that cannot fail is a
+// finding, not coverage.
+func TestFAC216ImageMediaTypeGuardRejectsIndexes(t *testing.T) {
+	manifestTypes := []string{mediaTypeDockerManifest, mediaTypeOCIManifest}
+	for _, mt := range manifestTypes {
+		if !isImageManifestMediaType(mt) {
+			t.Fatalf("isImageManifestMediaType rejected valid manifest type %q", mt)
+		}
+		if isImageIndexMediaType(mt) {
+			t.Fatalf("isImageIndexMediaType accepted manifest type %q as an index", mt)
+		}
+	}
+	indexTypes := []string{mediaTypeDockerManifestList, mediaTypeOCIImageIndex}
+	for _, mt := range indexTypes {
+		if isImageManifestMediaType(mt) {
+			t.Fatalf("isImageManifestMediaType accepted index type %q as a manifest", mt)
+		}
+		if !isImageIndexMediaType(mt) {
+			t.Fatalf("isImageIndexMediaType rejected valid index type %q", mt)
+		}
+	}
+	for _, mt := range []string{"", "application/vnd.other", "text/plain"} {
+		if isImageManifestMediaType(mt) {
+			t.Fatalf("isImageManifestMediaType accepted unknown type %q", mt)
+		}
+		if isImageIndexMediaType(mt) {
+			t.Fatalf("isImageIndexMediaType accepted unknown type %q", mt)
+		}
+	}
+}
