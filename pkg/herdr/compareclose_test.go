@@ -362,10 +362,10 @@ func TestTabCloseCAS_SucceedsOnlyOnFencedClosedOutcome(t *testing.T) {
 
 func TestTabCloseCAS_IncompleteEvidenceFailsClosed(t *testing.T) {
 	cases := []CloseRequest{
-		{TabID: "t", Generation: "1", Nonce: "n"},                       // no workspace
-		{WorkspaceID: "w", TabID: "t", Nonce: "n"},                      // no generation
-		{WorkspaceID: "w", TabID: "t", Generation: "1"},                 // no nonce
-		{WorkspaceID: "w", TabID: "t", Generation: "0", Nonce: "n"},     // zero gen
+		{TabID: "t", Generation: "1", Nonce: "n"},                                   // no workspace
+		{WorkspaceID: "w", TabID: "t", Nonce: "n"},                                  // no generation
+		{WorkspaceID: "w", TabID: "t", Generation: "1"},                             // no nonce
+		{WorkspaceID: "w", TabID: "t", Generation: "0", Nonce: "n"},                 // zero gen
 		{WorkspaceID: "w", TabID: "t", Generation: "1", SessionID: "s", Nonce: "n"}, // session without gen
 	}
 	for i, req := range cases {
