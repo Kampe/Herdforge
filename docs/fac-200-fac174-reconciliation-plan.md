@@ -1,5 +1,30 @@
 # FAC-200: one-time supervised reconciliation plan for the FAC-174 leftovers
 
+> **DISCHARGED 2026-08-08 — no containers remain to reconcile.** Step 1 of the
+> supervised procedure below ("re-confirm existence; if an ID is already gone,
+> cross it off") was executed against all 18 IDs. Every one is absent from the
+> host, so steps 2–6 have nothing to act on and no removal was performed by this
+> plan:
+>
+> ```
+> $ docker ps -aq --no-trunc | sort -u > live
+> $ comm -12 <(the 18 baseline IDs, sorted) live
+> (no output — none of the 18 are present)
+> $ docker ps -aq | wc -l
+> 10          # all unrelated, all Up: the chainseer service stack
+> ```
+>
+> The plan is kept for provenance and because
+> `containerlifecycle.FAC174LegacyBaseline` still pins these 18 IDs, so
+> `herd containers` continues to label them correctly should one ever reappear.
+> A container matching `fac174-*` that shows up now is a NEW situation needing
+> its own audit, exactly as the closing paragraph already says.
+>
+> Note this plan describes the pre-receipt world. Since FAC-231, the hermetic
+> runner registers a durable receipt immediately after create, so this class of
+> unowned leftover is no longer produced — see
+> [fac-200-integration-status.md](./fac-200-integration-status.md).
+
 ## Baseline
 
 Observed live via `docker ps -a --no-trunc` on 2026-08-04, before
