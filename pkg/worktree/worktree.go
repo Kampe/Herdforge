@@ -433,6 +433,12 @@ func (w *WorktreeManager) CreateTaskWorktreeFrom(ctx context.Context, taskRef, d
 		if err := w.writeSafeRef(ctx, safeRef, info.Commit); err == nil {
 			info.SafeRef = safeRef
 		}
+		// FAC-214: install a pre-rebase hook that auto-writes the safe ref
+		// before any rebase. This makes the capture automatic — the
+		// coordinator does not have to remember to call WriteSafeRef. The
+		// hook is best-effort: a failure to install must not block worktree
+		// creation (the coordinator can still call WriteSafeRef manually).
+		_ = w.InstallPreRebaseHook(ctx, targetPath, taskRef)
 	}
 	return info, nil
 }
