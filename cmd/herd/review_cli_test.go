@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -17,6 +18,7 @@ import (
 	"time"
 
 	"github.com/Kampe/Herdforge/pkg/claim"
+	"github.com/Kampe/Herdforge/pkg/config"
 	"github.com/Kampe/Herdforge/pkg/dispatch"
 	"github.com/Kampe/Herdforge/pkg/herdr"
 	"github.com/Kampe/Herdforge/pkg/lifecycle"
@@ -182,6 +184,24 @@ func provisionFence(t *testing.T, binary, dir, keyDir string) {
 	if err != nil {
 		t.Fatalf("fence-provision: %v\n%s", err, out)
 	}
+	// fence-provision prints:  export HERD_FENCE_VOLUME_ID="<seal>"
+	m := regexp.MustCompile(`HERD_FENCE_VOLUME_ID="([^"]+)"`).FindStringSubmatch(string(out))
+	if len(m) != 2 {
+		t.Fatalf("fence-provision did not print a volume seal:\n%s", out)
+	}
+	if err := os.WriteFile(filepath.Join(dir, ".fence-seal"), []byte(m[1]), 0o600); err != nil {
+		t.Fatalf("record seal: %v", err)
+	}
+}
+
+// readMintedSeal returns the seal recorded by provisionFence, or "" before the
+// volume has been provisioned.
+func readMintedSeal(dir string) string {
+	b, err := os.ReadFile(filepath.Join(dir, ".fence-seal"))
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(b))
 }
 
 func herdCmd(binary, dir, keyDir string, args ...string) *exec.Cmd {
@@ -197,11 +217,15 @@ func herdCmd(binary, dir, keyDir string, args ...string) *exec.Cmd {
 		// which refuses without a claim volume. Point it inside the test's own
 		// tree so the CLI is fenced but hermetic — never at a shared host path.
 		"HERD_CLAIM_DIR="+filepath.Join(dir, "claims"),
-		// The fence authority also requires a volume id of at least 32 chars.
-		// Deterministic per test dir so a retry reuses the same fence rather
-		// than minting a fresh one and losing generation continuity.
-		"HERD_FENCE_VOLUME_ID=herd-test-fence-volume-0000000000000001",
 	)
+	// The volume seal is MINTED by fence-provision, never chosen by the caller:
+	// WriteSharedMarker clears any preset HERD_FENCE_VOLUME_ID so a host cannot
+	// plant a stolen seal. So the test reads the mint back rather than inventing
+	// one -- an invented id fails as "volume_seal mismatch (not this fleet
+	// store; independent/forged store refused)", which is the gate working.
+	if seal := readMintedSeal(dir); seal != "" {
+		cmd.Env = append(cmd.Env, "HERD_FENCE_VOLUME_ID="+seal)
+	}
 	return cmd
 }
 
@@ -376,6 +400,66 @@ lanes:
 `, projectID, apiURL)
 	if err := os.WriteFile(filepath.Join(dir, ".herd", "herd.yaml"), []byte(yaml), 0644); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// seedReviewAdmission seeds the lifecycle to StateBuilding and runs the
+// completion gate to persist a passing verification receipt, so the
+// subprocess `herd review` can recover the digest and admit the candidate.
+func seedReviewAdmission(t *testing.T, dir, ref string) {
+	t.Helper()
+	wtDir := filepath.Join(dir, ".herd", "worktrees", strings.ToLower(hsync.NormalizeRef(ref)))
+	candidateOut, err := exec.Command("git", "-C", wtDir, "rev-parse", "HEAD").Output()
+	if err != nil {
+		t.Fatalf("resolve candidate SHA: %v", err)
+	}
+	candidate := strings.TrimSpace(string(candidateOut))
+	_, leaseGen := acquireFixtureLease(t, dir, ref)
+
+	store, err := lifecycle.NewEventStore(lifecycle.CanonicalStatePath(dir))
+	if err != nil {
+		t.Fatalf("lifecycle store: %v", err)
+	}
+	defer store.Close()
+	tx, err := store.DB().Begin()
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	chain := []lifecycle.State{
+		lifecycle.StateEligible, lifecycle.StateClaimed, lifecycle.StateDispatched,
+		lifecycle.StateBuilding,
+	}
+	for i, to := range chain {
+		if _, err := store.AppendTx(tx, lifecycle.AppendIntent{
+			TaskRef: hsync.NormalizeRef(ref), Repo: "herdforge-test", To: to,
+			Actor: "fixture", IdempotencyKey: fmt.Sprintf("fixture-review-%s-%d", ref, i),
+			LeaseGeneration: leaseGen, ProviderRevision: "provider-rev-1",
+			Branch: "herd/fac-1", CandidateSHA: candidate,
+		}); err != nil {
+			_ = tx.Rollback()
+			t.Fatalf("lifecycle append %s: %v", to, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("commit lifecycle: %v", err)
+	}
+
+	prev, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = os.Chdir(prev) }()
+
+	cfg, err := config.LoadConfig(".herd/herd.yaml")
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	wtRel := worktreePathForRef(ref)
+	if _, _, _, err := verifyWorktreeForReview(context.Background(), cfg, ref, wtRel); err != nil {
+		t.Fatalf("seed review admission (completion gate): %v", err)
 	}
 }
 
