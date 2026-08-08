@@ -88,16 +88,37 @@ func fetchViaBinary(provider string) (*UsageSnapshot, error) {
 	return &snap, nil
 }
 
+// nativePollers is the full set of providers pkg/usage can poll without the
+// OpenUsage macOS helper. Grok was the only entry until FAC-229; claude, codex
+// and gemini fell back to shelling the app, so on a host without it those pools
+// reported nothing at all.
+var nativePollers = map[string]func() (ProviderUsage, error){
+	"grok":   grokPoll,
+	"claude": claudePoll,
+	"codex":  codexPoll,
+	"gemini": geminiPoll,
+}
+
 func fetchDirectAll() (*UsageSnapshot, error) {
 	snap := &UsageSnapshot{
 		GeneratedAt: time.Now(),
 		Providers:   make(map[string]ProviderUsage),
 	}
-	grokP, err := grokPoll()
-	if err == nil {
-		grokP.Stale = false
+	// One provider's failure must not blank the others: a missing credential or
+	// an expired token is normal on a machine that does not use that harness.
+	// Absent beats fabricated — a zero-utilization entry would read as "plenty
+	// of quota" and route work at a surface that is actually spent.
+	for name, poll := range nativePollers {
+		p, err := poll()
+		if err != nil {
+			continue
+		}
+		p.Stale = false
+		snap.Providers[name] = p
 	}
-	snap.Providers["grok"] = grokP
+	if len(snap.Providers) == 0 {
+		return snap, fmt.Errorf("no provider could be polled natively")
+	}
 	return snap, nil
 }
 
@@ -106,17 +127,17 @@ func fetchDirectProvider(provider string) (*UsageSnapshot, error) {
 		GeneratedAt: time.Now(),
 		Providers:   make(map[string]ProviderUsage),
 	}
-	switch strings.ToLower(provider) {
-	case "grok":
-		p, err := grokPoll()
-		if err != nil {
-			return nil, err
-		}
-		p.Stale = false
-		snap.Providers["grok"] = p
-	default:
+	name := strings.ToLower(strings.TrimSpace(provider))
+	poll, ok := nativePollers[name]
+	if !ok {
 		return nil, fmt.Errorf("direct polling not available for provider %q", provider)
 	}
+	p, err := poll()
+	if err != nil {
+		return nil, err
+	}
+	p.Stale = false
+	snap.Providers[name] = p
 	return snap, nil
 }
 
