@@ -1652,17 +1652,46 @@ func runHerdrReal(args ...string) (string, error) {
 // TabCreateForTaskEnv is the FAC-133 process-boundary tab create: requires
 // workspace + cwd and injects only the provided KEY=VALUE env pairs (never
 // the parent ambient environment).
+//
+// FAC-172: same absolute-cwd gate and HostedUID isolation as TabCreateForTask.
+// Control-plane launches (HERD_CONTROL_SECRET / launcherSpawner) must not skip
+// tab-level hosted_uid or AgentStart/AssertHostedPaneUID fails closed against
+// a non-hosted shell.
 func TabCreateForTaskEnv(workspaceID, label, cwd string, env []string, noFocus bool) (*TabInfo, error) {
-	if strings.TrimSpace(cwd) == "" {
+	cwd = strings.TrimSpace(cwd)
+	if cwd == "" {
 		return nil, fmt.Errorf("herdr tab create: cwd is required for task agents")
 	}
-	return TabCreate(TabCreateOptions{
+	abs, err := filepath.Abs(cwd)
+	if err != nil {
+		return nil, fmt.Errorf("herdr tab create: resolve cwd %q: %w", cwd, err)
+	}
+	info, err := os.Stat(abs)
+	if err != nil {
+		return nil, fmt.Errorf("herdr tab create: cwd %q: %w", abs, err)
+	}
+	if !info.IsDir() {
+		return nil, fmt.Errorf("herdr tab create: cwd %q is not a directory", abs)
+	}
+	opts := TabCreateOptions{
 		Workspace: workspaceID,
 		Label:     label,
-		Cwd:       cwd,
-		Env:       env,
+		Cwd:       abs,
+		Env:       append([]string(nil), env...),
 		NoFocus:   noFocus,
-	})
+	}
+	if HostedUIDIsolationRequired() {
+		bUID, err := BuilderUID()
+		if err != nil {
+			return nil, fmt.Errorf("herdr tab create: %w", err)
+		}
+		if err := RequireHerdrBuilderSpawnCapability(bUID); err != nil {
+			return nil, fmt.Errorf("herdr tab create: %w", err)
+		}
+		opts.HostedUID = bUID
+		opts.Env = append(opts.Env, hostedUIDLaunchEnv(bUID)...)
+	}
+	return TabCreate(opts)
 }
 
 // LookupAgent returns the live Herdr agent entry for name.

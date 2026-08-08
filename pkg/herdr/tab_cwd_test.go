@@ -293,3 +293,68 @@ func TestTabCreateForTask_RejectsMissingAndNonDirectory(t *testing.T) {
 		t.Fatalf("runHerdr called %d times on non-dir cwd; want 0", calls)
 	}
 }
+
+// FAC-133 control path must share TabCreateForTask's absolute-cwd gate (FAC-172).
+func TestTabCreateForTaskEnv_RequiresCwdAndAbsolute(t *testing.T) {
+	t.Setenv("HERD_BUILDER_UID", "")
+	t.Setenv("HERD_REQUIRE_HOSTED_UID", "")
+
+	_, err := TabCreateForTaskEnv("w1", "task-fac-133", "", nil, true)
+	if err == nil || !strings.Contains(err.Error(), "cwd is required") {
+		t.Fatalf("expected cwd required error, got %v", err)
+	}
+	_, err = TabCreateForTaskEnv("w1", "task-fac-133", "   ", nil, true)
+	if err == nil || !strings.Contains(err.Error(), "cwd is required") {
+		t.Fatalf("expected trimmed blank cwd required error, got %v", err)
+	}
+
+	tmp := t.TempDir()
+	absTmp, err := filepath.Abs(tmp)
+	if err != nil {
+		t.Fatalf("filepath.Abs temp: %v", err)
+	}
+	old := runHerdr
+	defer func() { runHerdr = old }()
+	var got []string
+	runHerdr = func(args ...string) (string, error) {
+		got = append([]string(nil), args...)
+		return `{"result":{"tab":{"tab_id":"t1","label":"task-fac-133","cwd":"` + absTmp + `"}}}`, nil
+	}
+	tab, err := TabCreateForTaskEnv("wABC", "task-fac-133", tmp, []string{"A=B"}, true)
+	if err != nil {
+		t.Fatalf("TabCreateForTaskEnv: %v", err)
+	}
+	if tab.Cwd != absTmp {
+		t.Fatalf("tab.Cwd = %q, want exact abs %q", tab.Cwd, absTmp)
+	}
+	joined := strings.Join(got, " ")
+	if !strings.Contains(joined, "--cwd "+absTmp) {
+		t.Fatalf("missing absolute cwd in args: %v", got)
+	}
+
+	// Missing / non-dir must fail before herdr is contacted.
+	calls := 0
+	runHerdr = func(args ...string) (string, error) {
+		calls++
+		return `{"result":{"tab":{"tab_id":"should-not","label":"x"}}}`, nil
+	}
+	missing := filepath.Join(t.TempDir(), "no-such-dir")
+	if _, err := TabCreateForTaskEnv("w1", "task-missing", missing, nil, true); err == nil {
+		t.Fatal("expected missing cwd error on Env path")
+	}
+	if calls != 0 {
+		t.Fatalf("runHerdr called %d times on missing cwd; want 0", calls)
+	}
+	f, err := os.CreateTemp(t.TempDir(), "not-a-dir-*")
+	if err != nil {
+		t.Fatalf("CreateTemp: %v", err)
+	}
+	filePath := f.Name()
+	_ = f.Close()
+	if _, err := TabCreateForTaskEnv("w1", "task-file", filePath, nil, true); err == nil || !strings.Contains(err.Error(), "not a directory") {
+		t.Fatalf("expected not-a-directory error, got %v", err)
+	}
+	if calls != 0 {
+		t.Fatalf("runHerdr called %d times on non-dir cwd; want 0", calls)
+	}
+}

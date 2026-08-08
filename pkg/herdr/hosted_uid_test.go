@@ -216,6 +216,89 @@ func TestTabCreateForTask_WithoutIsolationEnvStillWorks(t *testing.T) {
 	}
 }
 
+// FAC-133 control-path entry: TabCreateForTaskEnv must not skip FAC-172.
+func TestTabCreateForTaskEnv_BlocksWithoutHostedUIDCapability(t *testing.T) {
+	ResetHostedUIDCapabilityCache()
+	t.Cleanup(ResetHostedUIDCapabilityCache)
+	me := os.Getuid()
+	t.Setenv(EnvBuilderUID, fmt.Sprintf("%d", me+1))
+	t.Setenv(EnvRequireHostedUID, "")
+	wt := t.TempDir()
+	defer func(old func(args ...string) (string, error)) { runHerdr = old }(runHerdr)
+	runHerdr = func(args ...string) (string, error) {
+		if strings.Contains(strings.Join(args, " "), "capabilities") {
+			return "", fmt.Errorf("unknown command")
+		}
+		t.Fatalf("must not create tab without capability; args=%v", args)
+		return "", nil
+	}
+	_, err := TabCreateForTaskEnv("w1", "task-fac-133", wt, []string{"HERD_FOO=bar"}, true)
+	if err == nil || !errorsIsHostedBlocked(err) {
+		t.Fatalf("want FAC-172 BLOCKED on Env path, got %v", err)
+	}
+}
+
+func TestTabCreateForTaskEnv_AttachesHostedUIDWhenIsolationRequired(t *testing.T) {
+	defer func(old func(args ...string) (string, error)) { runHerdr = old }(runHerdr)
+	bUID := os.Getuid() + 11
+	t.Setenv(EnvBuilderUID, fmt.Sprintf("%d", bUID))
+	t.Setenv(EnvRequireHostedUID, "")
+	stubHostedTreeSeams(t, bUID, 42)
+	wt := t.TempDir()
+	var createArgs []string
+	runHerdr = func(args ...string) (string, error) {
+		joined := strings.Join(args, " ")
+		if strings.Contains(joined, "capabilities") {
+			return goodCapJSON(), nil
+		}
+		if len(args) >= 2 && args[0] == "tab" && args[1] == "create" {
+			createArgs = append([]string{}, args...)
+			return `{"result":{"tab":{"tab_id":"t-env","label":"task-fac-133"},"root_pane":{"pane_id":"p-env","tab_id":"t-env"}}}`, nil
+		}
+		if len(args) >= 2 && args[0] == "pane" && args[1] == "process-info" {
+			return `{"result":{"process_info":{"pane_id":"p-env","shell_pid":900001,"foreground_processes":[{"pid":900001}]}}}`, nil
+		}
+		return "", fmt.Errorf("unexpected %v", args)
+	}
+	tab, err := TabCreateForTaskEnv("w1", "task-fac-133", wt, []string{"HERD_SCRUB=1"}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tab == nil || tab.ID != "t-env" {
+		t.Fatalf("tab=%+v", tab)
+	}
+	joined := strings.Join(createArgs, " ")
+	// Non-vacuous: must negotiate --uid <builder> on the control-path entry.
+	if !strings.Contains(joined, "--uid") || !strings.Contains(joined, fmt.Sprintf("%d", bUID)) {
+		t.Fatalf("TabCreateForTaskEnv missing HostedUID flags: %v", createArgs)
+	}
+	if !strings.Contains(joined, "HERD_SCRUB=1") {
+		t.Fatalf("caller scrubbed env must still pass: %v", createArgs)
+	}
+}
+
+func TestTabCreateForTaskEnv_WithoutIsolationEnvStillWorks(t *testing.T) {
+	t.Setenv(EnvBuilderUID, "")
+	t.Setenv(EnvRequireHostedUID, "")
+	wt := t.TempDir()
+	defer func(old func(args ...string) (string, error)) { runHerdr = old }(runHerdr)
+	var got []string
+	runHerdr = func(args ...string) (string, error) {
+		got = append([]string{}, args...)
+		return `{"result":{"tab":{"tab_id":"t1","label":"task-fac-133"},"root_pane":{"pane_id":"p1","tab_id":"t1"}}}`, nil
+	}
+	tab, err := TabCreateForTaskEnv("wABC", "task-fac-133", wt, []string{"K=V"}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tab.ID != "t1" {
+		t.Fatalf("tab=%+v", tab)
+	}
+	if strings.Contains(strings.Join(got, " "), "--uid") {
+		t.Fatalf("must not attach uid flags without isolation: %v", got)
+	}
+}
+
 func TestTabCreate_HostedUIDProvesAndCleansOnFail(t *testing.T) {
 	defer func(old func(args ...string) (string, error)) { runHerdr = old }(runHerdr)
 	defer func(old func(int, syscall.Signal) error) { signalExact = old }(signalExact)

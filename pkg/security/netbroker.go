@@ -573,6 +573,9 @@ func (b *HostAllowBroker) dialAllowed(client net.Conn, target string) error {
 	return nil
 }
 
+// resolveAndPinIP / validateDialIP live in hostcreds_net.go (FAC-170).
+// Netbroker reuses them so DNS-pin policy stays single-source.
+
 func rejectPrivateRebind(host string) error {
 	_, err := resolveAndPinIP(host)
 	return err
