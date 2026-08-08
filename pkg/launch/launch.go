@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Kampe/Herdforge/pkg/agentpolicy"
 	"github.com/Kampe/Herdforge/pkg/router"
 	"github.com/Kampe/Herdforge/pkg/toolpolicy"
 )
@@ -54,6 +55,11 @@ type Request struct {
 	Repository        string
 	Lane              string
 	PacketDigest      string
+	// FleetBinding is the authenticated fleet-execution contract (FAC-173).
+	// When set, Validate and recovery re-proof require it to match the live
+	// lease generation. Nested-agent argv denials are always required for
+	// codex/claude regardless of whether a binding is present.
+	FleetBinding agentpolicy.LaunchBinding
 }
 
 // Receipt is durable evidence for one launch attempt. Validation does not
@@ -83,6 +89,12 @@ type Receipt struct {
 	ProcessIdentity   string    `json:"process_identity,omitempty"`
 	StartToken        string    `json:"start_token,omitempty"`
 	PacketDigest      string    `json:"packet_digest,omitempty"`
+	// Fleet-execution contract fields (FAC-173). Independent of checkout-local
+	// AGENTS files; recovery re-reads these with the exact lease generation.
+	FleetPolicyDigest string `json:"fleet_policy_digest,omitempty"`
+	FleetAuthTag      string `json:"fleet_auth_tag,omitempty"`
+	FleetFamily       string `json:"fleet_parent_family,omitempty"`
+	FleetSurface      string `json:"fleet_allowed_surface,omitempty"`
 }
 
 // Sink makes receipt durability injectable without making process tests touch
@@ -165,16 +177,34 @@ func fields(req Request) (role, shape, provider, model, effort, digest string, a
 	return string(d.Role), d.Shape, d.Provider, d.Model, d.Effort, DecisionDigest(d), clone(d.Argv)
 }
 
+func fleetReceiptFields(req Request) (digest, auth, family, surface string) {
+	b := req.FleetBinding
+	return b.PolicyDigest, b.AuthTag, b.ParentExecutionFamily, b.AllowedHerdrSurface
+}
+
 func reject(req Request, sink Sink, reason string) error {
 	if sink == nil {
 		sink = DefaultSink()
 	}
 	err := fmt.Errorf("launch rejected: %s", reason)
 	role, shape, provider, model, effort, digest, argv := fields(req)
-	if werr := sink.Write(Receipt{CreatedAt: time.Now().UTC(), TaskRef: req.TaskRef, Role: role, TaskShape: shape, Provider: provider, Model: model, Effort: effort, DecisionDigest: digest, Argv: argv, Reason: reason, Name: req.Name, PaneID: req.PaneID, LeaseGeneration: req.LeaseGeneration, SessionGeneration: req.SessionGeneration}); werr != nil {
+	fd, fa, ff, fs := fleetReceiptFields(req)
+	if werr := sink.Write(receiptFrom(req, role, shape, provider, model, effort, digest, argv, false, reason, fd, fa, ff, fs)); werr != nil {
 		return fmt.Errorf("%w; failed to write failed-launch receipt: %v", err, werr)
 	}
 	return err
+}
+
+func receiptFrom(req Request, role, shape, provider, model, effort, digest string, argv []string, accepted bool, reason, fd, fa, ff, fs string) Receipt {
+	return Receipt{
+		CreatedAt: time.Now().UTC(), TaskRef: req.TaskRef, Role: role, TaskShape: shape,
+		Provider: provider, Model: model, Effort: effort, DecisionDigest: digest, Argv: argv,
+		Accepted: accepted, Reason: reason, Name: req.Name, PaneID: req.PaneID,
+		LeaseGeneration: req.LeaseGeneration, SessionGeneration: req.SessionGeneration,
+		Repository: req.Repository, Lane: req.Lane, TabID: req.TabID, HerdrSession: req.HerdrSession,
+		CWD: req.CWD, ProcessIdentity: req.ProcessIdentity, StartToken: req.StartToken,
+		PacketDigest: req.PacketDigest, FleetPolicyDigest: fd, FleetAuthTag: fa, FleetFamily: ff, FleetSurface: fs,
+	}
 }
 
 // RecordStarted is the single acceptance receipt for a process launch.
@@ -183,7 +213,8 @@ func RecordStarted(req Request, sink Sink) error {
 		sink = DefaultSink()
 	}
 	role, shape, provider, model, effort, digest, argv := fields(req)
-	return sink.Write(Receipt{CreatedAt: time.Now().UTC(), TaskRef: req.TaskRef, Role: role, TaskShape: shape, Provider: provider, Model: model, Effort: effort, DecisionDigest: digest, Argv: argv, Accepted: true, Reason: "process started", Name: req.Name, PaneID: req.PaneID, LeaseGeneration: req.LeaseGeneration, SessionGeneration: req.SessionGeneration})
+	fd, fa, ff, fs := fleetReceiptFields(req)
+	return sink.Write(receiptFrom(req, role, shape, provider, model, effort, digest, argv, true, "process started", fd, fa, ff, fs))
 }
 
 func RecordRejected(req Request, sink Sink, reason string) error { return reject(req, sink, reason) }
@@ -334,6 +365,28 @@ func Validate(req Request, sink Sink) error {
 			return reject(req, sink, "codex launch lacks explicit CRG MCP isolation")
 		}
 	}
+	// FAC-173: nested Claude/Codex collaboration tools must be compiled out
+	// of the launch argv before any process starts. Prompt wording is not
+	// an execution control.
+	if err := agentpolicy.RequireNestedDeny(provider, argv); err != nil {
+		return reject(req, sink, "launch lacks nested-agent denial controls")
+	}
+	// When a fleet-execution binding is presented, it must authenticate and
+	// match the exact live lease generation. Callers that mint bindings
+	// (dispatch/recovery) must not proceed with a stale or absent contract.
+	if req.FleetBinding.PolicyDigest != "" || req.FleetBinding.AuthTag != "" {
+		key, keyErr := agentpolicy.KeyFromEnv()
+		if keyErr != nil {
+			return reject(req, sink, "fleet-execution contract key is unenforceable: "+keyErr.Error())
+		}
+		gen := req.LeaseGeneration
+		if gen < 1 && req.FleetBinding.LeaseGeneration > 0 {
+			gen = req.FleetBinding.LeaseGeneration
+		}
+		if err := agentpolicy.RequireLaunchBinding(req.FleetBinding, key, gen); err != nil {
+			return reject(req, sink, "fleet-execution contract is absent, stale, or mismatched: "+err.Error())
+		}
+	}
 	modelIndex := -1
 	for i := range argv {
 		if argv[i] == "--model" && i+1 < len(argv) {
@@ -345,6 +398,33 @@ func Validate(req Request, sink Sink) error {
 		return reject(req, sink, "argv model does not match the routed decision")
 	}
 	return nil
+}
+
+// BindingFromReceipt reconstructs the public fleet binding carried on a
+// launch/recovery receipt. Empty fields yield a zero binding that
+// VerifyFieldsPresent rejects.
+func BindingFromReceipt(r Receipt) agentpolicy.LaunchBinding {
+	return agentpolicy.LaunchBinding{
+		Repository:            r.Repository,
+		Task:                  r.TaskRef,
+		Lane:                  r.Lane,
+		Role:                  r.Role,
+		LeaseGeneration:       r.LeaseGeneration,
+		HerdrSession:          r.HerdrSession,
+		HerdrTab:              r.TabID,
+		HerdrPane:             r.PaneID,
+		ParentExecutionFamily: r.FleetFamily,
+		AllowedHerdrSurface:   r.FleetSurface,
+		PolicyDigest:          r.FleetPolicyDigest,
+		AuthTag:               r.FleetAuthTag,
+	}
+}
+
+// VerifyRecoveryBinding fails closed when a recovery packet cannot re-prove
+// the fleet-execution contract at the exact lease generation.
+func VerifyRecoveryBinding(r Receipt, key []byte, generation int64) error {
+	b := BindingFromReceipt(r)
+	return agentpolicy.RequireLaunchBinding(b, key, generation)
 }
 
 func argvCarriesEffort(provider string, argv []string, effort string) bool {

@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Kampe/Herdforge/pkg/agentpolicy"
 	"github.com/Kampe/Herdforge/pkg/posture"
 	"github.com/Kampe/Herdforge/pkg/toolpolicy"
 	"github.com/Kampe/Herdforge/pkg/usage"
@@ -411,14 +412,28 @@ func ArgvFor(provider, model, effort string) []string {
 	pe := PeerEffort(effort)
 	switch provider {
 	case "claude":
+		var base []string
 		if model == "claude-fable-5" || model == "claude-opus-5" {
-			return []string{"claude", "--model", model, "--effort", effort, "--fallback-model", "claude-sonnet-5"}
+			base = []string{"claude", "--model", model, "--effort", effort, "--fallback-model", "claude-sonnet-5"}
+		} else {
+			base = []string{"claude", "--model", model, "--effort", effort}
 		}
-		return []string{"claude", "--model", model, "--effort", effort}
+		// FAC-173: Agent/Task tools must not be exposed on fleet Claude surfaces.
+		compiled, err := agentpolicy.CompileClaudeArgs(base)
+		if err != nil {
+			return nil
+		}
+		return compiled
 	case "agy":
 		return []string{"agy", "--model", model, "--prompt-interactive"}
 	case "codex":
-		return []string{"codex", "--model", model, "-c", "model_reasoning_effort=" + pe, "-a", "never", "-c", toolpolicy.CodexDisableCodeReviewGraph}
+		base := []string{"codex", "--model", model, "-c", "model_reasoning_effort=" + pe, "-a", "never", "-c", toolpolicy.CodexDisableCodeReviewGraph}
+		// FAC-173: multi_agent collaboration must be disabled before start.
+		compiled, err := agentpolicy.CompileCodexArgs(base)
+		if err != nil {
+			return nil
+		}
+		return compiled
 	case "grok":
 		return []string{"grok", "--model", model, "--reasoning-effort", pe, "--always-approve"}
 	case "kimi":
@@ -455,10 +470,20 @@ func HeadlessArgvFor(provider, model, effort, promptPath string) (argv []string,
 		// a shot is read-only and does not need one.
 		return []string{"agy", "--model", model, "--print"}, DeliverByArg
 	case "claude":
-		return []string{"claude", "--model", model, "--effort", effort, "-p"}, DeliverByStdin
+		base := []string{"claude", "--model", model, "--effort", effort, "-p"}
+		compiled, err := agentpolicy.CompileClaudeArgs(base)
+		if err != nil {
+			return nil, DeliverByStdin
+		}
+		return compiled, DeliverByStdin
 	case "codex":
-		return []string{"codex", "exec", "--model", model,
-			"-c", "model_reasoning_effort=" + pe, "-s", "read-only"}, DeliverByStdin
+		base := []string{"codex", "exec", "--model", model,
+			"-c", "model_reasoning_effort=" + pe, "-s", "read-only"}
+		compiled, err := agentpolicy.CompileCodexArgs(base)
+		if err != nil {
+			return nil, DeliverByStdin
+		}
+		return compiled, DeliverByStdin
 	case "kimi":
 		return []string{"kimi", "--auto"}, DeliverByStdin
 	case "ollama", "opencode", "lazer":

@@ -3,6 +3,7 @@ package launch
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -10,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Kampe/Herdforge/pkg/agentpolicy"
 	"github.com/Kampe/Herdforge/pkg/router"
 )
 
@@ -301,5 +303,78 @@ func TestValidateAcceptsBoundPiSession(t *testing.T) {
 				t.Fatal("mutated bound session accepted")
 			}
 		})
+	}
+}
+
+func TestValidateRejectsMissingNestedAgentDenial(t *testing.T) {
+	req := good(t)
+	// Mutation: strip --disable multi_agent pairs that FAC-173 requires.
+	argv := append([]string(nil), req.Decision.Argv...)
+	stripped := make([]string, 0, len(argv))
+	for i := 0; i < len(argv); i++ {
+		if argv[i] == "--disable" && i+1 < len(argv) && (argv[i+1] == "multi_agent" || argv[i+1] == "multi_agent_v2") {
+			i++
+			continue
+		}
+		stripped = append(stripped, argv[i])
+	}
+	req.Decision.Argv = stripped
+	// Also recompute proof so we exercise the nested-deny gate, not the
+	// digest gate. A full public-field forgery still fails closed via proof;
+	// the point is production argv without multi_agent denials is refused.
+	if err := Validate(req, &MemorySink{}); err == nil {
+		t.Fatal("argv missing nested-agent denials must fail closed")
+	}
+}
+
+func TestFleetBindingOnReceiptAndRecovery(t *testing.T) {
+	key := []byte("launch-fleet-key")
+	t.Setenv(agentpolicy.SecretEnv, string(key))
+	t.Setenv(agentpolicy.SecretEnvFallback, "")
+	req := good(t)
+	// Keep TaskRef/LeaseGeneration zero: good() is a generic (pre-claim)
+	// decision and VerifyDecisionForScope refuses task context on it.
+	// The fleet binding itself carries the exact lease generation that
+	// recovery will re-prove.
+	req.Name, req.PaneID = "worker", "pane-1"
+	req.TabID, req.HerdrSession, req.Repository, req.Lane = "tab-1", "sess-1", "github.com/Kampe/Herdforge", "worker"
+	const leaseGen int64 = 11
+	b, _, err := agentpolicy.BindLaunch(req.Repository, "FAC-173", req.Lane, WorkerRole, leaseGen, req.HerdrSession, req.TabID, req.PaneID, "codex", agentpolicy.SurfaceHerdrDispatch, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.FleetBinding = b
+	if err := Validate(req, &MemorySink{}); err != nil {
+		t.Fatalf("valid fleet binding rejected: %v", err)
+	}
+	s := &MemorySink{}
+	if err := RecordStarted(req, s); err != nil {
+		t.Fatal(err)
+	}
+	if len(s.Receipts) != 1 || s.Receipts[0].FleetPolicyDigest != b.PolicyDigest || s.Receipts[0].FleetAuthTag != b.AuthTag {
+		t.Fatalf("receipt missing fleet contract: %+v", s.Receipts)
+	}
+	// Recovery re-proof uses the binding identity carried on the receipt.
+	rec := s.Receipts[0]
+	rec.TaskRef = "FAC-173"
+	rec.LeaseGeneration = leaseGen
+	if err := VerifyRecoveryBinding(rec, key, leaseGen); err != nil {
+		t.Fatalf("recovery re-proof: %v", err)
+	}
+	if err := VerifyRecoveryBinding(rec, key, leaseGen+1); !errors.Is(err, agentpolicy.ErrInvalidContract) {
+		t.Fatalf("recovery generation drift: %v", err)
+	}
+	// Stale binding fails launch before process start.
+	stale := req
+	stale.FleetBinding.PolicyDigest = "stale"
+	if err := Validate(stale, &MemorySink{}); err == nil {
+		t.Fatal("stale fleet binding must fail closed")
+	}
+}
+
+func TestRoutedWorkerArgvCarriesNestedAgentDenial(t *testing.T) {
+	req := good(t)
+	if err := agentpolicy.RequireNestedDeny(req.Decision.Provider, req.Decision.Argv); err != nil {
+		t.Fatalf("routed worker argv not fleet-safe: %v\nargv=%v", err, req.Decision.Argv)
 	}
 }
