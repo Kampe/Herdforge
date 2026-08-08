@@ -20,6 +20,7 @@ import (
 	"github.com/Kampe/Herdforge/pkg/herdr"
 	"github.com/Kampe/Herdforge/pkg/launch"
 	"github.com/Kampe/Herdforge/pkg/provider"
+	"github.com/Kampe/Herdforge/pkg/resources"
 	"github.com/Kampe/Herdforge/pkg/router"
 	"github.com/Kampe/Herdforge/pkg/worktree"
 )
@@ -307,7 +308,11 @@ func initDispatchRepo(t *testing.T) (repo string, wm *worktree.WorktreeManager) 
 	run("git", "init", "--bare", bare)
 	run("git", "remote", "add", "origin", bare)
 	run("git", "push", "-u", "origin", "main")
-	return repo, worktree.NewWorktreeManager(repo)
+	wm = worktree.NewWorktreeManager(repo)
+	wm.DiskAdmission = resources.DiskAdmissionFunc(func(resources.DiskRequest) resources.DiskDecision {
+		return resources.DiskDecision{Allowed: true, State: resources.DiskReady}
+	})
+	return repo, wm
 }
 
 func testCfg() *config.Config {
