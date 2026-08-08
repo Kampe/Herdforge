@@ -768,7 +768,6 @@ func runPreflight() {
 	}
 	fmt.Println("Preflight merge-policy check passed. Required CI and different-family review declared.")
 
-
 	// FAC-133 fleet readiness: optional live refresh, then consume attestation.
 	// HERD_LIVE_HARNESS_PROOF=1 or HERD_REFRESH_READINESS=1 triggers a single-flight
 	// live proof + durable signed attestation write. Without that, preflight only
@@ -5861,7 +5860,6 @@ func runDrainCommand(args []string, out, errOut io.Writer) int {
 	if *selftest {
 		return runDrainSelftest()
 	}
-	_ = *autoTiers // retained for report/commands compatibility until FAC-184 adapters land
 	if *maxReview < 0 || *maxHarvest < 0 || *maxRelaunch < 0 {
 		fmt.Fprintln(errOut, "herd-drain: max bounds must be non-negative")
 		return 2
@@ -5872,15 +5870,20 @@ func runDrainCommand(args []string, out, errOut io.Writer) int {
 	stale := drainIntEnv("HERD_DRAIN_STALE_BEHIND", 20)
 	root := "."
 	var tp provider.TaskProvider
-	if cfg, err := config.LoadConfig(filepath.Join(root, ".herd", "herd.yaml")); err == nil {
+	cfg, cfgErr := config.LoadConfig(filepath.Join(root, ".herd", "herd.yaml"))
+	if cfgErr == nil {
 		// The action gate accepts only configured standing lane identities.
 		// Evidence is never upgraded into a standing lane by shape alone.
-		tp, err = loadTaskProvider(cfg)
-		if err != nil && !*asJSON {
-			fmt.Fprintf(errOut, "herd-drain: UNKNOWN Kaneo review-cap posture: %v\n", err)
+		var providerErr error
+		tp, providerErr = loadTaskProvider(cfg)
+		if providerErr != nil {
+			tp = nil
+			if !*asJSON {
+				fmt.Fprintf(errOut, "herd-drain: UNKNOWN Kaneo review-cap posture: %v\n", providerErr)
+			}
 		}
 	} else if !*asJSON {
-		fmt.Fprintf(errOut, "herd-drain: UNKNOWN Kaneo review-cap posture: %v\n", err)
+		fmt.Fprintf(errOut, "herd-drain: UNKNOWN Kaneo review-cap posture: %v\n", cfgErr)
 	}
 	h := harvest.NewHarvester(root)
 	harvestResult, err := h.Harvest(context.Background())
@@ -5898,7 +5901,7 @@ func runDrainCommand(args []string, out, errOut io.Writer) int {
 		fmt.Fprintf(errOut, "herd-drain: %v\n", err)
 		return 1
 	}
-	if cfg, err := config.LoadConfig(filepath.Join(root, ".herd", "herd.yaml")); err == nil {
+	if cfgErr == nil {
 		for _, lane := range cfg.Lanes {
 			if lane.Standing {
 				report.StandingLanes = append(report.StandingLanes, lane.Name)
@@ -5926,8 +5929,21 @@ func runDrainCommand(args []string, out, errOut io.Writer) int {
 		printDrainCommandsTo(out, report)
 	}
 	if *act {
-		fmt.Fprintln(out, "herd-drain: REFUSED --act: FAC-184 compiled review/ledger/harvest/cap adapters are unavailable; FAC-182 durable control-envelope delivery is blocked")
-		return 1
+		// Missing authority keeps the fail-closed default hooks: every action
+		// is then refused with the reason, never silently skipped.
+		hooks := defaultDrainActionHooks()
+		adapters, err := newDrainAdapters(root, ledgerPath, cfg, tp, cap)
+		unauthorized := err != nil
+		if unauthorized {
+			fmt.Fprintf(out, "herd-drain: REFUSED --act: %v\n", err)
+		} else {
+			hooks = adapters.hooks()
+		}
+		result := executeDrainActions(context.Background(), report, report.ActionEvidence, *maxReview, *maxHarvest, *maxRelaunch, *autoTiers, out, hooks)
+		if unauthorized || result.Failed {
+			return 1
+		}
+		return drainExitCode(report)
 	}
 	return drainExitCode(report)
 }
@@ -6006,7 +6022,9 @@ func printDrainCommandsTo(out io.Writer, r *review.DrainReport) {
 			fmt.Fprintf(out, "# REFUSED harvest %s: recorded tier and builder family evidence required\n", sha)
 			continue
 		}
-		fmt.Fprintf(out, "# REFUSED harvest %s: FAC-184 compiled adapter unavailable (lane=%s tier=%s sha=%s)\n", sha, e.Lane, e.Tier, sha)
+		// main wired the compiled adapters (FAC-184), so the default beat is the
+		// runnable command, not a refusal. This branch predates that wiring.
+		fmt.Fprintf(out, "herd drain --act --max-harvest 1 --auto-harvest-tiers %s  # harvest lane=%s tier=%s sha=%s\n", e.Tier, e.Lane, e.Tier, sha)
 	}
 	for _, sha := range r.Shas.NeedReview {
 		e := evidence[sha]
@@ -6018,7 +6036,7 @@ func printDrainCommandsTo(out io.Writer, r *review.DrainReport) {
 		case drainForbiddenBranch(e.Branch):
 			fmt.Fprintf(out, "# REFUSED review %s: forbidden branch %s\n", sha, e.Branch)
 		default:
-			fmt.Fprintf(out, "# REFUSED review %s: FAC-184 compiled adapter unavailable (branch=%s family=%s pin=%s)\n", sha, e.Branch, e.BuilderFamily, sha)
+			fmt.Fprintf(out, "herd drain --act --max-review 1  # review branch=%s family=%s pin=%s\n", e.Branch, e.BuilderFamily, sha)
 		}
 	}
 }
@@ -6049,16 +6067,24 @@ type drainActionResult struct {
 	Failed                               bool
 }
 
+// defaultDrainActionHooks is the no-authority beat: the compiled adapters
+// exist, but nothing wired them, so every action refuses instead of acting.
+//
+// The wording is load-bearing. TestDrainDefaultActionsRefuseWithoutAuthority
+// asserts the error contains "no compiled"; this branch carried an older
+// "FAC-184 compiled X adapter unavailable" variant that the rebase preserved,
+// so the hook still failed closed but with text the gate could not recognise.
+// Main's phrasing is the reviewed one.
 func defaultDrainActionHooks() drainActionHooks {
 	return drainActionHooks{
 		launchReview: func(context.Context, drainActionEvidence) error {
-			return errors.New("FAC-184 compiled review adapter unavailable")
+			return errors.New("no compiled review launch authority is configured")
 		},
 		dryRun: func(context.Context, drainActionEvidence) error {
-			return errors.New("FAC-184 compiled harvest dry-run adapter unavailable")
+			return errors.New("no compiled harvest authority is configured")
 		},
 		harvest: func(context.Context, drainActionEvidence) error {
-			return errors.New("FAC-184 compiled harvest adapter unavailable")
+			return errors.New("no compiled harvest authority is configured")
 		},
 	}
 }
