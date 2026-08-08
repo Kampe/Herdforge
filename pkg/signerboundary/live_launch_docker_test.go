@@ -41,10 +41,12 @@ export HERD_FAC169_IN_DOCKER=1
 export HERD_SIGNER_UID=27001 HERD_REQUESTER_UID=27002 HERD_BUILDER_UID=27003 HERD_SIGNER_SOCK_GID=27000
 go test ./pkg/signerboundary/ -count=1 -timeout 180s -run 'TestLiveLaunch_InContainer' -v
 `
-	cmd := exec.Command("docker", "run", "--rm", "--user", "0:0",
+	args := append([]string{"run", "--rm", "--user", "0:0",
 		"-e", "GOTOOLCHAIN=auto",
-		"-v", modRoot+":/src", "-w", "/src",
-		"golang:1.24-bookworm", "bash", "-ec", script)
+		"-v", modRoot + ":/src", "-w", "/src"}, dockerGoCacheArgs(t)...)
+	args = append(args,
+		goDockerImage, "bash", "-ec", script)
+	cmd := exec.Command("docker", args...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		msg := string(out)
@@ -130,3 +132,32 @@ func TestLiveLaunch_InContainer(t *testing.T) {
 func fmtPrintlnLiveLaunchOK() {
 	println("LIVE_LAUNCH_OK")
 }
+
+// dockerGoCacheArgs makes the container build hermetic.
+//
+// The container mounted only the repo, so `go build` inside it had to download
+// every module AND, because the image was golang:1.24 while go.mod requires
+// 1.25, the toolchain itself. That works on a developer box with a warm cache
+// and open network; in CI it failed with "build herd: exit status 1" behind a
+// wall of "go: downloading ...". The test was exercising the network, not the
+// signer boundary.
+//
+// Bind the host module cache read-only and pin GOFLAGS/GOMODCACHE so the build
+// resolves from it. GOPROXY stays reachable rather than off: a cold cache
+// should still work, it just should not be the normal path.
+func dockerGoCacheArgs(t *testing.T) []string {
+	t.Helper()
+	out, err := exec.Command("go", "env", "GOMODCACHE").Output()
+	if err != nil {
+		t.Fatalf("go env GOMODCACHE: %v", err)
+	}
+	cache := strings.TrimSpace(string(out))
+	if cache == "" {
+		t.Fatal("GOMODCACHE is empty; cannot make the container build hermetic")
+	}
+	return []string{"-v", cache + ":/gomodcache", "-e", "GOMODCACHE=/gomodcache", "-e", "GOFLAGS=-mod=mod"}
+}
+
+// goDockerImage matches go.mod's toolchain so GOTOOLCHAIN=auto has nothing to
+// download. The image was golang:1.24 against a go 1.25.0 module.
+const goDockerImage = "golang:1.25-bookworm"

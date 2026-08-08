@@ -35,7 +35,7 @@ func TestLiveThreeUID_Docker(t *testing.T) {
 	}
 
 	// Use official image; allow toolchain download for go.mod 1.25+.
-	img := "golang:1.24-bookworm"
+	img := goDockerImage
 	script := `
 set -eu
 export GOTOOLCHAIN=auto
@@ -56,14 +56,13 @@ export HERD_SIGNER_SOCK_GID=27000
 go test ./pkg/signerboundary/ -count=1 -timeout 180s -run 'TestLiveThreeUID_InContainer' -v
 `
 
-	cmd := exec.Command("docker", "run", "--rm",
+	args := append([]string{"run", "--rm",
 		"--user", "0:0",
 		"-e", "GOTOOLCHAIN=auto",
-		"-v", modRoot+":/src",
-		"-w", "/src",
-		img,
-		"bash", "-ec", script,
-	)
+		"-v", modRoot + ":/src",
+		"-w", "/src"}, dockerGoCacheArgs(t)...)
+	args = append(args, img, "bash", "-ec", script)
+	cmd := exec.Command("docker", args...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		msg := string(out)
