@@ -182,6 +182,13 @@ type ScopeAuthority interface {
 
 var tokenPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._/:-]{0,127}$`)
 
+// Validate is the exported scope validation entry point. Callers outside the
+// package (e.g. dispatch auto-publish) use this to fail early with a clear
+// error before attempting to publish an invalid scope.
+func (s Scope) Validate() error {
+	return s.validate()
+}
+
 func (s Scope) validate() error {
 	if len(s.Packages)+len(s.Files)+len(s.Symbols) == 0 {
 		return errors.New("missing scope")
@@ -354,6 +361,11 @@ func bounded(in []string) []string {
 	}
 	return in
 }
+
+// ScopeEquals is the exported scope comparison. Callers outside the package
+// (e.g. dispatch tests) use this to verify that an acquired lease matches the
+// expected scope.
+func ScopeEquals(a, b Scope) bool { return scopesEqual(a, b) }
 
 func scopesEqual(a, b Scope) bool {
 	return strings.Join(a.Packages, "\x00") == strings.Join(b.Packages, "\x00") && strings.Join(a.Files, "\x00") == strings.Join(b.Files, "\x00") && strings.Join(a.Symbols, "\x00") == strings.Join(b.Symbols, "\x00")

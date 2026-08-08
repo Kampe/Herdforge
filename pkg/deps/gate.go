@@ -233,12 +233,13 @@ func ValidateLaunch(
 		}
 	}
 
-	// Relation-graph revision only (edges + transitive prerequisite statuses). Target task
-	// status is ownership via claim lease generation — including ToDo→InProgress
-	// here would make every successful post-claim check mismatch deterministically.
+	// Relation-graph revision: edges + relation IDs + provider revision only.
+	// Status is excluded so the revision does not churn when a dispatch flips
+	// its own target to in-progress or when a prerequisite changes status.
+	// TOCTOU detection still fires on edge/relation changes.
 	_ = status
 	_ = taskID
-	rev := GraphRevision(snap.Edges, statusBy, snap.ProviderRevision)
+	rev := GraphRevision(snap.Edges, nil, snap.ProviderRevision)
 	rep.GraphRevision = rev
 	rep.ProviderRevision = snap.ProviderRevision
 

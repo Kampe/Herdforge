@@ -820,3 +820,34 @@ func TestFencedClaim_CompensatesOnPostDrift(t *testing.T) {
 		t.Fatalf("want ErrPostClaimDrift, got %v", err)
 	}
 }
+
+// TestGraphRevision_StableAcrossStatusChanges proves the fix for FAC-217: the
+// revision must not churn when a card changes status. Before this fix, every
+// dispatch churned the revision (it set its own target to in-progress), which
+// invalidated every concurrently published scope.
+func TestGraphRevision_StableAcrossStatusChanges(t *testing.T) {
+	edges := []DependencyEdge{{
+		SourceID: "a", TargetID: "b", Type: EdgeBlocks, RelationID: "r1",
+	}}
+	revDone := GraphRevision(edges, map[string]string{"FAC-1": "done"}, "prov-1")
+	revInProgress := GraphRevision(edges, map[string]string{"FAC-1": "in-progress"}, "prov-1")
+	revToDo := GraphRevision(edges, map[string]string{"FAC-1": "to-do"}, "prov-1")
+	revEmpty := GraphRevision(edges, nil, "prov-1")
+	if revDone != revInProgress || revDone != revToDo || revDone != revEmpty {
+		t.Fatalf("revision churned on status change: done=%s in-progress=%s to-do=%s empty=%s",
+			revDone[:12], revInProgress[:12], revToDo[:12], revEmpty[:12])
+	}
+	// But edge changes MUST still churn the revision.
+	revEdgeChanged := GraphRevision([]DependencyEdge{{
+		SourceID: "a", TargetID: "c", Type: EdgeBlocks, RelationID: "r1",
+	}}, map[string]string{"FAC-1": "done"}, "prov-1")
+	if revDone == revEdgeChanged {
+		t.Fatal("revision did not change when edge target changed")
+	}
+	revRelChanged := GraphRevision([]DependencyEdge{{
+		SourceID: "a", TargetID: "b", Type: EdgeBlocks, RelationID: "r2",
+	}}, map[string]string{"FAC-1": "done"}, "prov-1")
+	if revDone == revRelChanged {
+		t.Fatal("revision did not change when relation ID changed")
+	}
+}

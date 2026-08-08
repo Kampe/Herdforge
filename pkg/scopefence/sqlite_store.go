@@ -59,11 +59,33 @@ func (s *SQLiteStore) Close() error {
 }
 
 func (s *SQLiteStore) migrate() error {
+	// Migrate legacy scopefence_graph (repository TEXT PRIMARY KEY) to the
+	// per-revision schema (repository, revision). SQLite cannot ALTER a
+	// primary key, so create the new table, copy, drop, rename.
+	var legacyGraphExists bool
+	row := s.db.QueryRow(`SELECT count(*) FROM sqlite_master WHERE type='table' AND name='scopefence_graph' AND sql LIKE '%repository TEXT PRIMARY KEY%'`)
+	if err := row.Scan(&legacyGraphExists); err != nil {
+		return fmt.Errorf("scopefence: migrate sqlite store: check legacy graph: %w", err)
+	}
+	if legacyGraphExists {
+		if _, err := s.db.Exec(`CREATE TABLE scopefence_graph_new (repository TEXT NOT NULL, revision TEXT NOT NULL, graph_json BLOB NOT NULL, PRIMARY KEY (repository, revision))`); err != nil {
+			return fmt.Errorf("scopefence: migrate sqlite store: create new graph table: %w", err)
+		}
+		if _, err := s.db.Exec(`INSERT OR IGNORE INTO scopefence_graph_new (repository, revision, graph_json) SELECT repository, json_extract(graph_json, '$.revision'), graph_json FROM scopefence_graph WHERE json_extract(graph_json, '$.revision') IS NOT NULL`); err != nil {
+			return fmt.Errorf("scopefence: migrate sqlite store: copy graph rows: %w", err)
+		}
+		if _, err := s.db.Exec(`DROP TABLE scopefence_graph`); err != nil {
+			return fmt.Errorf("scopefence: migrate sqlite store: drop legacy graph: %w", err)
+		}
+		if _, err := s.db.Exec(`ALTER TABLE scopefence_graph_new RENAME TO scopefence_graph`); err != nil {
+			return fmt.Errorf("scopefence: migrate sqlite store: rename graph table: %w", err)
+		}
+	}
 	statements := []string{
 		`CREATE TABLE IF NOT EXISTS scopefence_meta (id INTEGER PRIMARY KEY CHECK (id = 1), revision INTEGER NOT NULL)`,
 		`INSERT OR IGNORE INTO scopefence_meta (id, revision) VALUES (1, 1)`,
 		`CREATE TABLE IF NOT EXISTS scopefence_owners (ordinal INTEGER PRIMARY KEY, ownership_json BLOB NOT NULL, evidence_json BLOB NOT NULL)`,
-		`CREATE TABLE IF NOT EXISTS scopefence_graph (repository TEXT PRIMARY KEY, graph_json BLOB NOT NULL)`,
+		`CREATE TABLE IF NOT EXISTS scopefence_graph (repository TEXT NOT NULL, revision TEXT NOT NULL, graph_json BLOB NOT NULL, PRIMARY KEY (repository, revision))`,
 		`CREATE TABLE IF NOT EXISTS scopefence_scopes (repository TEXT NOT NULL, task TEXT NOT NULL, graph_revision TEXT NOT NULL, scope_json BLOB NOT NULL, PRIMARY KEY (repository, task, graph_revision))`,
 		`CREATE TABLE IF NOT EXISTS scopefence_release_proofs (proof_key TEXT PRIMARY KEY, ownership_json BLOB NOT NULL, authority INTEGER NOT NULL, proof_digest TEXT NOT NULL)`,
 	}

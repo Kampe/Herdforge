@@ -336,3 +336,76 @@ func TestResolvingFenceIgnoresCallerScopeAndUsesRevisionBoundAuthority(t *testin
 		t.Fatalf("caller scope bypassed authority: decision=%+v err=%v", decision, err)
 	}
 }
+
+// TestPerRevisionGraphSnapshotsAllowConcurrentTasks proves the fix for
+// FAC-217: publishing a graph for a second task at a different revision must
+// not invalidate the first task's graph. Before this fix, scopefence_graph
+// held one row per repository, so the second publish overwrote the first.
+func TestPerRevisionGraphSnapshotsAllowConcurrentTasks(t *testing.T) {
+	store, err := NewSQLiteStore(filepath.Join(t.TempDir(), "scopefence.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	graphA := Graph{Revision: "rev-A", Nodes: 10, Edges: 20, Files: 2, Flows: 1, Complete: true}
+	graphB := Graph{Revision: "rev-B", Nodes: 15, Edges: 30, Files: 3, Flows: 2, Complete: true}
+
+	if err := store.PutGraphSnapshot(context.Background(), "repo", graphA); err != nil {
+		t.Fatalf("publish graph A: %v", err)
+	}
+	if err := store.PutGraphSnapshot(context.Background(), "repo", graphB); err != nil {
+		t.Fatalf("publish graph B: %v", err)
+	}
+
+	// Both graphs must still be readable at their respective revisions.
+	gotA, err := store.ReadGraphSnapshot(context.Background(), "repo", "rev-A")
+	if err != nil || gotA != graphA {
+		t.Fatalf("graph A was invalidated by publishing B: got=%+v err=%v", gotA, err)
+	}
+	gotB, err := store.ReadGraphSnapshot(context.Background(), "repo", "rev-B")
+	if err != nil || gotB != graphB {
+		t.Fatalf("graph B not readable: got=%+v err=%v", gotB, err)
+	}
+
+	// Both authorities must validate against their own revision.
+	authA := NewSQLiteGraphAuthority(store, "repo", graphA.Revision, graphA.Files)
+	authA.Verifier = testAuthorityVerifier{}
+	if _, err := authA.Current(context.Background()); err != nil {
+		t.Fatalf("authority A rejected after B published: %v", err)
+	}
+	authB := NewSQLiteGraphAuthority(store, "repo", graphB.Revision, graphB.Files)
+	authB.Verifier = testAuthorityVerifier{}
+	if _, err := authB.Current(context.Background()); err != nil {
+		t.Fatalf("authority B rejected: %v", err)
+	}
+}
+
+// TestGraphAuthorityUpdateExpectedRebindsToNewRevision proves that dispatch
+// can rebind the graph authority to a new revision after the deps gate,
+// enabling auto-publish without a pre-existing manual `herd scope publish`.
+func TestGraphAuthorityUpdateExpectedRebindsToNewRevision(t *testing.T) {
+	store, err := NewSQLiteStore(filepath.Join(t.TempDir(), "scopefence.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	// Start with no published graph — authority has empty expected revision.
+	auth := NewSQLiteGraphAuthority(store, "repo", "", 0)
+	auth.Verifier = testAuthorityVerifier{}
+	if _, err := auth.Current(context.Background()); err == nil {
+		t.Fatal("authority with empty expected revision should reject")
+	}
+
+	// Publish a graph and update the authority's expected binding.
+	graph := Graph{Revision: "rev-auto", Nodes: 10, Edges: 20, Files: 2, Flows: 1, Complete: true}
+	if err := store.PutGraphSnapshot(context.Background(), "repo", graph); err != nil {
+		t.Fatal(err)
+	}
+	auth.UpdateExpected(graph.Revision, graph.Files)
+	trusted, err := auth.Current(context.Background())
+	if err != nil || trusted.Snapshot != graph {
+		t.Fatalf("UpdateExpected did not rebind authority: trusted=%+v err=%v", trusted, err)
+	}
+}

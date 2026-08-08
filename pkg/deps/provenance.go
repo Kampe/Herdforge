@@ -148,10 +148,13 @@ func FormatProvenanceFence(p *Provenance) string {
 		GraphRevision    string           `json:"graph_revision,omitempty"`
 		ProviderRevision string           `json:"provider_revision,omitempty"`
 		RecordedAt       time.Time        `json:"recorded_at,omitempty"`
+		ScopePackages    []string         `json:"scope_packages,omitempty"`
+		ScopeFiles       []string         `json:"scope_files,omitempty"`
 	}{
 		Version: p.Version, TaskRef: p.TaskRef, TaskID: p.TaskID,
 		Edges: p.Edges, Holds: p.Holds, GraphRevision: p.GraphRevision,
 		ProviderRevision: p.ProviderRevision, RecordedAt: p.RecordedAt,
+		ScopePackages: p.ScopePackages, ScopeFiles: p.ScopeFiles,
 	}, "", "  ")
 	if err != nil {
 		return fmt.Sprintf("```%s\n{\"version\":%d,\"error\":\"marshal_failed\"}\n```\n", ProvenanceFence, SchemaVersion)

@@ -139,6 +139,11 @@ type Provenance struct {
 	// ProviderRevision is the provider-side revision token when available.
 	ProviderRevision string    `json:"provider_revision,omitempty"`
 	RecordedAt       time.Time `json:"recorded_at,omitempty"`
+	// ScopePackages / ScopeFiles declare the task's touch surface so dispatch
+	// can auto-publish the scope fence without a separate herd scope publish
+	// step. When empty, dispatch falls back to hold Paths.
+	ScopePackages []string `json:"scope_packages,omitempty"`
+	ScopeFiles    []string `json:"scope_files,omitempty"`
 	// Present is true only when this record was parsed from an explicit
 	// versioned fence/JSON document — never inferred from missing text.
 	Present bool `json:"-"`
@@ -280,14 +285,16 @@ func (e *BlockedError) Error() string {
 }
 
 // GraphRevision computes SHA-256 over canonical immutable IDs, edge relation
-// IDs, status map (including the target task), and provider revision.
+// IDs, and provider revision. Status is deliberately excluded: every dispatch
+// flips its target to in-progress, and if status were part of the hash, the
+// revision would churn on every dispatch — invalidating every concurrently
+// published scope. The statusByRef parameter is retained for callers that
+// still pass it, but it no longer contributes to the digest.
 func GraphRevision(edges []DependencyEdge, statusByRef map[string]string, providerRevision string) string {
-	keys := make([]string, 0, len(edges)+len(statusByRef)+1)
+	_ = statusByRef
+	keys := make([]string, 0, len(edges)+1)
 	for _, e := range edges {
 		keys = append(keys, e.CanonicalKey()+"#"+e.RelationID)
-	}
-	for ref, st := range statusByRef {
-		keys = append(keys, "status|"+ref+"|"+st)
 	}
 	keys = append(keys, "provrev|"+providerRevision)
 	sort.Strings(keys)
@@ -299,22 +306,14 @@ func GraphRevision(edges []DependencyEdge, statusByRef map[string]string, provid
 	return hex.EncodeToString(h.Sum(nil))
 }
 
-// GraphRevisionWithTarget includes the target task's immutable id + status so
-// claim ownership state is part of the fenced revision (not relation-only).
+// GraphRevisionWithTarget is retained for callers that previously needed the
+// target task's identity bound into the revision. Since GraphRevision no longer
+// hashes status, this is now equivalent to GraphRevision with the same edges
+// and provider revision — the target status and ID are irrelevant to the
+// digest. The function exists for backward compatibility.
 func GraphRevisionWithTarget(edges []DependencyEdge, statusByRef map[string]string, providerRevision string, targetID TaskID, targetRef Ref, targetStatus string) string {
-	if statusByRef == nil {
-		statusByRef = map[string]string{}
-	}
-	// Copy so caller map is not mutated.
-	cp := make(map[string]string, len(statusByRef)+2)
-	for k, v := range statusByRef {
-		cp[k] = v
-	}
-	if targetRef.Valid() {
-		cp[string(targetRef)] = targetStatus
-	}
-	if targetID.Valid() {
-		cp["id:"+string(targetID)] = targetStatus
-	}
-	return GraphRevision(edges, cp, providerRevision)
+	_ = targetID
+	_ = targetRef
+	_ = targetStatus
+	return GraphRevision(edges, statusByRef, providerRevision)
 }
