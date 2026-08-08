@@ -446,6 +446,89 @@ func TestLoadReapEvidenceWithRealGitRepo(t *testing.T) {
 	}
 }
 
+// TestReadPulseReviewCorruptLedgerReportsUnknown proves the finding-3 fix:
+// when the ledger file exists but is corrupted, readPulseReview must return
+// Known=false with an error so an operator can detect the problem, not
+// silently report Known=true with zero pending.
+func TestReadPulseReviewCorruptLedgerReportsUnknown(t *testing.T) {
+	ledgerDir := t.TempDir()
+	corruptLedger := filepath.Join(ledgerDir, "corrupt-ledger.jsonl")
+	if err := os.WriteFile(corruptLedger, []byte("{not valid json\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HERD_REVIEW_LEDGER", corruptLedger)
+
+	obs := readPulseReview()
+	if obs.Known {
+		t.Fatal("corrupt ledger must produce Known=false, not silently Known=true with zero pending")
+	}
+	if obs.Error == "" {
+		t.Fatal("corrupt ledger must populate Error for operator visibility")
+	}
+}
+
+// TestReadPulseReviewAbsentLedgerReportsKnownEmpty proves the non-vacuous
+// flip: when the ledger file does not exist, review is known-empty (Known=true,
+// Pending=0), not unknown.
+func TestReadPulseReviewAbsentLedgerReportsKnownEmpty(t *testing.T) {
+	t.Setenv("HERD_REVIEW_LEDGER", filepath.Join(t.TempDir(), "no-ledger.jsonl"))
+
+	obs := readPulseReview()
+	if !obs.Known {
+		t.Fatal("absent ledger must produce Known=true (known-empty), not unknown")
+	}
+	if obs.Pending != 0 || obs.NeedReview != 0 {
+		t.Fatalf("absent ledger must report zero pending/needReview: %+v", obs)
+	}
+}
+
+// TestLoadReapEvidenceCorruptLedgerSetsAwaitingVerdict proves the fail-closed
+// fix for the KEEP signal: when the review ledger file exists but is corrupted
+// (unreadable JSONL), loadReapEvidence must signal that a verdict may be
+// pending, and applyReapEvidence must set AwaitingVerdict on agents with
+// committed work — so the reap planner does NOT destroy a live lane whose
+// FAIL/BLOCKED verdict it cannot read.
+//
+// Against the unfixed code, Vetoed returns an error that is silently dropped,
+// vetoedSHAs stays nil, AwaitingVerdict is never set, and the lane is reaped.
+// This test fails on that code and passes after the fix.
+func TestLoadReapEvidenceCorruptLedgerSetsAwaitingVerdict(t *testing.T) {
+	// Corrupted ledger: file exists but contains invalid JSONL.
+	ledgerDir := t.TempDir()
+	corruptLedger := filepath.Join(ledgerDir, "corrupt-ledger.jsonl")
+	if err := os.WriteFile(corruptLedger, []byte("{not valid json\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HERD_REVIEW_LEDGER", corruptLedger)
+
+	// Build a real git worktree with committed work so CommittedWork is true.
+	dir := t.TempDir()
+	runGitT(t, dir, "init", "-q", "-b", "main")
+	runGitT(t, dir, "config", "user.email", "reap@test")
+	runGitT(t, dir, "config", "user.name", "reap")
+	runGitT(t, dir, "config", "core.hooksPath", "/dev/null")
+	runGitT(t, dir, "config", "commit.gpgsign", "false")
+	writeRepoFile(t, dir, "base.txt", "base\n")
+	baseSHA := strings.TrimSpace(runGitT(t, dir, "rev-parse", "HEAD"))
+	runGitT(t, dir, "update-ref", "refs/remotes/origin/main", baseSHA)
+	runGitT(t, dir, "commit", "--allow-empty", "-m", "feat: real work")
+
+	entries := []herdr.AgentEntry{
+		{Name: "task-fac-218", Cwd: dir},
+	}
+	ev := loadReapEvidence(context.Background(), entries, nil)
+
+	agent := pulse.AgentObservation{Name: "task-fac-218"}
+	agent = applyReapEvidence(agent, "FAC-218", ev)
+
+	if !agent.CommittedWork {
+		t.Fatal("expected CommittedWork=true (prerequisite for the KEEP signal)")
+	}
+	if !agent.AwaitingVerdict {
+		t.Fatal("corrupt ledger must set AwaitingVerdict: a verdict may be pending that cannot be read (fail-closed KEEP signal)")
+	}
+}
+
 // TestHasCommittedWorkExcludesAnchorAndWip proves that anchor and wip commits
 // do not count as committed work — only real feature commits do.
 func TestHasCommittedWorkExcludesAnchorAndWip(t *testing.T) {
