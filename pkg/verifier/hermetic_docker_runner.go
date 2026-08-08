@@ -314,12 +314,20 @@ func (r *hermeticDockerRunner) Run(ctx context.Context) (result FAC151DockerResu
 			}
 			return false, nil
 		}
+		// EnsureCleanup's return value is the sole authority on whether
+		// teardown failed. It deliberately treats an independently proved
+		// absence as definitive even when remove() itself errored (see
+		// containerlifecycle/cleanup.go) — docker's remove-side error text
+		// is not a safe failure signal. capturedRemoveErr is therefore kept
+		// for diagnostics only and must never fail a run on its own; joining
+		// it unconditionally would reintroduce exactly the false failure
+		// EnsureCleanup exists to suppress.
 		cleanupErr := containerlifecycle.EnsureCleanup(teardownCtx, store, containerID, expectedTerminalState, remover, absent)
 		if cleanupErr != nil {
+			if capturedRemoveErr != nil {
+				cleanupErr = errors.Join(cleanupErr, capturedRemoveErr)
+			}
 			err = errors.Join(err, cleanupErr)
-		}
-		if capturedRemoveErr != nil {
-			err = errors.Join(err, capturedRemoveErr)
 		}
 		if receipt, getErr := store.Get(containerID); getErr == nil && receipt != nil {
 			result.Removed = receipt.State == containerlifecycle.StateRemoved && receipt.AbsenceProved

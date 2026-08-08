@@ -261,3 +261,48 @@ func TestFAC231ReceiptFieldsAreMeaningful(t *testing.T) {
 
 	_, _ = runner.Run(context.Background())
 }
+
+// TestFAC231ProvenAbsenceOverridesRemoveError proves a remove error does
+// NOT fail the run when the container's absence is independently proved.
+//
+// containerlifecycle.EnsureCleanup is explicit that "an independently
+// proved absence is definitive even if remove() itself errored (e.g. it
+// lost a race with an out-of-band removal)". If the runner joins the
+// remove error on top of EnsureCleanup's verdict, it reintroduces exactly
+// the false failure EnsureCleanup exists to suppress: a teardown that
+// genuinely succeeded still fails the run because docker rm printed
+// something. The receipt must be StateRemoved with AbsenceProved, the run
+// must carry no teardown error, and result.Removed must be true.
+func TestFAC231ProvenAbsenceOverridesRemoveError(t *testing.T) {
+	removeErr := errors.New("Error response from daemon: removal already in progress")
+	fake := &fac198DockerFake{removeErr: removeErr, removeErrButGone: true}
+	runner := newFAC198FakeRunner(t, fake)
+
+	result, runErr := runner.Run(context.Background())
+	if runErr != nil && errors.Is(runErr, removeErr) {
+		t.Fatalf("run error contains removeErr (%v), want teardown treated as successful: an independently proved absence is definitive", runErr)
+	}
+	if !result.Removed {
+		t.Fatal("result.Removed = false, want true (absence was independently proved despite the remove error)")
+	}
+
+	store, err := containerlifecycle.NewStore(runner.storePath)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	defer store.Close()
+
+	receipt, err := store.Get(fac198PrimaryContainerID)
+	if err != nil {
+		t.Fatalf("store.Get: %v", err)
+	}
+	if receipt == nil {
+		t.Fatal("no receipt after teardown")
+	}
+	if receipt.State != containerlifecycle.StateRemoved {
+		t.Fatalf("receipt state = %s, want %s (proved absence is terminal, not quarantine)", receipt.State, containerlifecycle.StateRemoved)
+	}
+	if !receipt.AbsenceProved {
+		t.Fatal("AbsenceProved = false, want true")
+	}
+}
