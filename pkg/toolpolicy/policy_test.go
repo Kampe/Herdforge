@@ -27,7 +27,7 @@ func TestCodexPolicyDisablesInheritedMCPKeepsCLI(t *testing.T) {
 	if !cfg.Valid() || cfg.MCPServers[toolpolicy.CodeReviewGraph] || !cfg.CLI[toolpolicy.CodeReviewGraph] {
 		t.Fatalf("bad effective config: %+v", cfg)
 	}
-	if len(argv) != 5 || argv[3] != "-c" || argv[4] != "mcp_servers.code-review-graph={command=\"false\",enabled=false}" {
+	if len(argv) != 5 || argv[3] != "-c" || argv[4] != "mcp_servers.code-review-graph={command=\"false\",enabled=false}" { //hermetic:allow-argv-position fixed compiled contract: Require outputs exactly [codex, --model, <model>, -c, <override>]
 		t.Fatalf("missing compiled override: %v", argv)
 	}
 }

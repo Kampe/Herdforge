@@ -558,7 +558,7 @@ func (f *fac198DockerFake) Copy(_ context.Context, _ string, destination string,
 }
 func (f *fac198DockerFake) Exec(_ context.Context, _ string, argv []string, _ []byte) (dockerResult, error) {
 	f.execCalls++
-	if len(argv) == 2 && argv[0] == "/bin/cat" && argv[1] == "/proc/self/mountinfo" {
+	if len(argv) == 2 && argv[0] == "/bin/cat" && argv[1] == "/proc/self/mountinfo" { //hermetic:allow-argv-position test-fake dispatcher: routes by program+arg, not a launch contract
 		f.mountInfoProbes++
 		f.callOrder = append(f.callOrder, "mountinfo")
 		return dockerResult{Output: append([]byte(nil), f.mountInfo...)}, nil

@@ -32,6 +32,14 @@ This contract governs all AI agents (Claude, Gemini, Codex, Grok, Ollama) partic
    - **Mechanical/R0 (Docs, Markdown, Unit Tests)**: May be auto-merged via AST / deterministic test verification.
    - **Code/R1-R3 (Core Logic, Infrastructure, Auth)**: Must be reviewed and approved by a **different model family** than the author (e.g., Anthropic author $\rightarrow$ Gemini reviewer).
 
+6. **Test Hermeticity (FAC-215)**:
+   - CI runs on a clean Linux box with no installed AI CLIs, no Docker daemon in the unit gate, and an older Docker daemon in the hermetic gate. Six consecutive CI breaks in one session were all tests that asserted a property of the machine they ran on.
+   - `exec.LookPath` in a test **must** be followed by `t.Skip`/`t.Skipf` on error — never `t.Fatal`. A missing binary is an environment difference, not a test failure.
+   - `exec.Command` on a binary not guaranteed on CI (docker, pg_ctl, psql, codex, claude, grok, herdr, python3, jq, etc.) **must** be preceded by a `LookPath`+`t.Skip` guard in the same function. `git`, `go`, `sh`, `echo`, `sleep` are always present and exempt.
+   - Never assert `argv[N] == "--flag"` at a fixed index `N > 0`. Search for the flag by iterating: `for i := range argv { if argv[i] == "--flag" { ... } }`. Position is a property of one vendor's command line; presence is the property the gate is about. Suppress a legitimate fixed-contract assertion with `//hermetic:allow-argv-position`.
+   - Never use `docker image inspect --platform` — the flag is Docker 28+ only. Pass `--platform` to `docker pull` only, and verify the architecture from the inspect output.
+   - Enforced by `go run ./scripts/hermeticity/` in `make lint`.
+
 ---
 
 ## 2. Complete Package Ownership Grid (30 Packages)

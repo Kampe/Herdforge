@@ -171,7 +171,7 @@ type fakeRunner struct {
 
 func (f *fakeRunner) key(argv []string) string {
 	// tool + subcommand (+ pattern for query) identifies the reply slot.
-	if len(argv) >= 3 && argv[1] == "query" {
+	if len(argv) >= 3 && argv[1] == "query" { //hermetic:allow-argv-position test-fake dispatcher: routes by subcommand name, not a launch contract
 		return "query " + argv[2]
 	}
 	if len(argv) >= 2 {

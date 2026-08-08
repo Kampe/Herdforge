@@ -49,7 +49,7 @@ func TestSystemPIDArgvPreservesArguments(t *testing.T) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	if len(argv) != 2 || argv[1] != "2" {
+	if len(argv) != 2 || argv[1] != "2" { //hermetic:allow-argv-position tests systemPIDArgv round-trip: position IS the thing being verified
 		t.Fatalf("system argv = %q, want executable plus exact argument 2", argv)
 	}
 }
