@@ -568,13 +568,6 @@ func (g *CompletionGate) recordNonPass(bind CompletionBinding, receipt *verifier
 	return res.Replayed, nil
 }
 
-func shortSHA(sha string) string {
-	if len(sha) >= 12 {
-		return sha[:12]
-	}
-	return sha
-}
-
 // safeReason strips absolute host paths from error text so rejection
 // reasons can be logged and mailed without leaking the operator host.
 func safeReason(err error, worktreeDir string) string {
