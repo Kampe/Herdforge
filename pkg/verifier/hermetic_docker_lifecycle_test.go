@@ -1,3 +1,13 @@
+//go:build !fac151_hermetic_integration
+
+// These tests exercise the durable SQLite-backed lifecycle store directly,
+// so they must be excluded from the FAC-151 hermetic profile: that profile
+// compiles this package (tests included, via `go test -c`) inside the
+// verification container, which has no network and a module cache seeded
+// with exactly one hash-pinned module. Importing pkg/containerlifecycle from
+// a test file pulls modernc.org/sqlite into that compile and fails with
+// "module lookup disabled by GOPROXY=off". See lifecycle_store.go.
+
 package verifier
 
 import (
