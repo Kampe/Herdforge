@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os/exec"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Kampe/Herdforge/pkg/control"
@@ -82,6 +83,187 @@ func (r *FamilyRegistry) KnownFamilies() []ModelFamily {
 		}
 	}
 	return result
+}
+
+// ReviewFunc is the per-reviewer execution boundary. Production wires this
+// to the harness adapter; tests inject a fake. Each call runs one reviewer
+// on fresh context — the jury's whole point is that no reviewer sees
+// another's work, and the author never grades its own exam.
+type ReviewFunc func(ctx context.Context, reviewerModel string, packet Packet) (ReviewVerdict, error)
+
+// JuryVerdict is the structured outcome of a multi-reviewer jury vote.
+type JuryVerdict struct {
+	Packet   Packet          `json:"packet"`
+	Verdict  ReviewVerdict   `json:"verdict"`
+	Votes    []JuryVote      `json:"votes"`
+	JurySize int             `json:"jury_size"`
+	Passes   int             `json:"passes"`
+	Fails    int             `json:"fails"`
+	Stales   int             `json:"stales"`
+}
+
+// JuryVote is one reviewer's verdict.
+type JuryVote struct {
+	Reviewer string        `json:"reviewer"`
+	Family   ModelFamily   `json:"family"`
+	Verdict  ReviewVerdict `json:"verdict"`
+	Err      string        `json:"err,omitempty"`
+}
+
+// JurySize is the default number of reviewers for an R3 jury.
+const JurySize = 3
+
+// SelectJury picks `size` reviewers from `available`, each from a different
+// model family than the author and, where possible, from different families
+// than each other. This is the "fresh context, outsider" rule: the maker
+// never grades its own exam, and no two jurors share a family to avoid
+// correlated bias (e.g. two Anthropic models both preferring Anthropic output).
+//
+// Fallback: if fewer distinct families are available than `size`, the
+// remaining slots are filled with cross-family reviewers (different from
+// the author) without the distinct-family constraint, so a jury can still
+// form when only two families are available.
+func SelectJury(authorModel string, available []string, size int) ([]string, error) {
+	if size <= 0 {
+		size = JurySize
+	}
+	reg := NewFamilyRegistry()
+	authorFamily := reg.Lookup(authorModel)
+
+	usedFamilies := map[ModelFamily]bool{authorFamily: true}
+	var jury []string
+
+	for _, rev := range available {
+		if len(jury) >= size {
+			break
+		}
+		fam := reg.Lookup(rev)
+		if fam == authorFamily {
+			continue
+		}
+		if !usedFamilies[fam] {
+			jury = append(jury, rev)
+			usedFamilies[fam] = true
+		}
+	}
+
+	if len(jury) < size {
+		for _, rev := range available {
+			if len(jury) >= size {
+				break
+			}
+			fam := reg.Lookup(rev)
+			if fam == authorFamily {
+				continue
+			}
+			alreadySelected := false
+			for _, j := range jury {
+				if j == rev {
+					alreadySelected = true
+					break
+				}
+			}
+			if !alreadySelected {
+				jury = append(jury, rev)
+			}
+		}
+	}
+
+	if len(jury) == 0 {
+		return nil, fmt.Errorf("jury: no cross-family reviewers available for author family %s", authorModel)
+	}
+	return jury, nil
+}
+
+// EvaluateJury runs `size` reviewers in parallel on fresh context and
+// requires majority consensus. A PASS requires >50% of non-stale votes to
+// be PASS. A FAIL requires >50% to be FAIL. If no majority is reached
+// (including all-stale or a tie), the verdict is FAIL — fail-closed is
+// the article's "fresh context is what turns a check into an actual check."
+//
+// The author model is excluded from the jury by construction (SelectJury
+// filters it). Each reviewer runs independently; no reviewer sees another's
+// output before casting its vote.
+func EvaluateJury(ctx context.Context, packet Packet, authorModel string, available []string, size int, review ReviewFunc) (*JuryVerdict, error) {
+	if review == nil {
+		return nil, fmt.Errorf("jury: review function is required")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	jury, err := SelectJury(authorModel, available, size)
+	if err != nil {
+		return nil, err
+	}
+	if len(jury) < size {
+		return nil, fmt.Errorf("jury: quorum not met: requested %d reviewers, only %d cross-family available", size, len(jury))
+	}
+
+	reg := NewFamilyRegistry()
+	votes := make([]JuryVote, len(jury))
+	var wg sync.WaitGroup
+
+	for i, model := range jury {
+		wg.Add(1)
+		go func(idx int, m string) {
+			defer wg.Done()
+			verdict, vErr := review(ctx, m, packet)
+			v := JuryVote{
+				Reviewer: m,
+				Family:   reg.Lookup(m),
+				Verdict:  verdict,
+			}
+		if vErr != nil {
+			v.Err = vErr.Error()
+			v.Verdict = VerdictFail
+		}
+			votes[idx] = v
+		}(i, model)
+	}
+	wg.Wait()
+
+	jv := &JuryVerdict{
+		Packet:   packet,
+		Votes:    votes,
+		JurySize: len(jury),
+	}
+	for _, v := range votes {
+		switch v.Verdict {
+		case VerdictPass:
+			jv.Passes++
+		case VerdictFail:
+			jv.Fails++
+		case VerdictStale:
+			jv.Stales++
+		default:
+			jv.Fails++
+		}
+	}
+	jv.Verdict = majorityVerdict(jv.Passes, jv.Fails, jv.Stales)
+	return jv, nil
+}
+
+// majorityVerdict computes the jury's consensus. Fail-closed: ties and
+// all-stale produce FAIL, never PASS.
+func majorityVerdict(passes, fails, stales int) ReviewVerdict {
+	total := passes + fails + stales
+	if total == 0 {
+		return VerdictFail
+	}
+	threshold := total / 2
+	if passes > threshold {
+		return VerdictPass
+	}
+	return VerdictFail
+}
+
+// ShouldUseJury reports whether a risk tier requires a jury review rather
+// than a single cross-family reviewer. R3 (auth, secrets, money, security-
+// critical logic) requires a jury; R0-R2 use the existing single-reviewer
+// or mechanical-merge paths.
+func ShouldUseJury(tier RiskTier) bool {
+	return tier == TierR3RiskCritical
 }
 
 type RiskTier string
