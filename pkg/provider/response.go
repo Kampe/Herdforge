@@ -71,7 +71,7 @@ func NormalizeStatus(raw string) string {
 		return StatusToDo
 	case "planned", "planning":
 		return StatusPlanned
-	case "in-progress", "inprogress", "doing", "active", "started", "wip":
+	case "in-progress", "inprogress", "doing", "active", "started", "wip", "in-development", "development":
 		return StatusInProgress
 	case "in-review", "review", "code-review", "pr-review":
 		return StatusInReview
