@@ -17,6 +17,16 @@ task_provider:
   enabled: ["kaneo"]
   project_id: "b939c5jzixruza3vvywrg1hs"
 
+# FAC-245: every admitted task worktree gets an isolated Go module/build cache
+# keyed by the resolved Go toolchain. The receipt is durable and idempotent;
+# a changed toolchain or declaration repairs stale per-worktree artifacts
+# before a worker can start. argv is intentional: no shell profile or
+# expansion is part of this repository contract.
+worktree_bootstrap:
+  version: "v1"
+  toolchain: "go"
+  command: ["go", "mod", "download"]
+
 # The forge fleet — the complete role roster (FAC-127). Soft model pins below
 # are roster defaults only. FAC-142 SurfaceRouter.Decide owns the live
 # provider/model/effort/pool for every worker and reviewer launch; FAC-139

@@ -29,6 +29,7 @@ import (
 	"github.com/Kampe/Herdforge/pkg/toolchild"
 	"github.com/Kampe/Herdforge/pkg/toolprobe"
 	"github.com/Kampe/Herdforge/pkg/worktree"
+	"github.com/Kampe/Herdforge/pkg/worktreebootstrap"
 )
 
 // AuthenticatedRepositoryIdentity is the sole production repository binding
@@ -370,9 +371,34 @@ type Dispatcher struct {
 	// EnvironmentPlans is the FAC-241 durable capability authority. It is
 	// consulted before scope, worktree, board, harness, or credential effects.
 	EnvironmentPlans *envplan.Store
+	// Bootstrap executes the repository-declared worktree bootstrap only after
+	// dispatch owns the task and has admitted its worktree. Nil uses the
+	// production-safe executor; tests may inject an attributable failure seam.
+	Bootstrap WorktreeBootstrapper
 
 	// health projects BLOCKED(provider_timeout) for board calls (FAC-150).
 	health dispatchHealth
+}
+
+// WorktreeBootstrapper is deliberately narrower than the dispatcher: the
+// bootstrap contract receives only the admitted worktree and validated config.
+// It cannot create a worktree, claim a task, or launch an agent.
+type WorktreeBootstrapper interface {
+	Execute(context.Context, string, config.WorktreeBootstrap) (*worktreebootstrap.Result, error)
+}
+
+func (d *Dispatcher) bootstrapWorktree(ctx context.Context, worktreePath string) error {
+	if d.Config == nil || !d.Config.WorktreeBootstrap.Enabled() {
+		return nil
+	}
+	runner := d.Bootstrap
+	if runner == nil {
+		runner = worktreebootstrap.Executor{}
+	}
+	if _, err := runner.Execute(ctx, worktreePath, d.Config.WorktreeBootstrap); err != nil {
+		return fmt.Errorf("worktree bootstrap failed: %w\n  recovery: inspect .herd/bootstrap/receipt.json and repair the declared worktree_bootstrap command", err)
+	}
+	return nil
 }
 
 // coordinatorName returns the reply target name for packets. An explicitly
@@ -958,6 +984,13 @@ func (d *Dispatcher) Dispatch(ctx context.Context, opts DispatchOptions) (*Dispa
 	// 6. Preflight in worktree
 	if err := preflight.CheckWorktreeBoundary(wtInfo.Path); err != nil {
 		return nil, failOwned("preflight_failed", fmt.Errorf("preflight failed in worktree: %w", err))
+	}
+	// 6b. Execute the repository-declared bootstrap only after ownership,
+	// scope admission, worktree creation, and worktree boundary admission.
+	// A failed or stale bootstrap is an attributable recovery state and must
+	// never fall through to a write-capable agent launch.
+	if err := d.bootstrapWorktree(ctx, wtInfo.Path); err != nil {
+		return nil, failOwned("worktree_bootstrap_failed", err)
 	}
 
 	// 7. Write TASK-PACKET.md — packet branch MUST equal Git branch

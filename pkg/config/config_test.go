@@ -126,6 +126,25 @@ task_provider:
 	}
 }
 
+func TestWorktreeBootstrapValidationRejectsUnsafeDeclarations(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		value WorktreeBootstrap
+	}{
+		{"unsupported version", WorktreeBootstrap{Version: "v2", Toolchain: "go", Command: []string{"go", "mod", "download"}}},
+		{"absolute toolchain", WorktreeBootstrap{Version: "v1", Toolchain: "/usr/local/bin/go", Command: []string{"go", "mod", "download"}}},
+		{"absolute command argument", WorktreeBootstrap{Version: "v1", Toolchain: "go", Command: []string{"go", "/tmp/out"}}},
+		{"escaping command", WorktreeBootstrap{Version: "v1", Toolchain: "go", Command: []string{"../outside/bootstrap"}}},
+		{"missing command", WorktreeBootstrap{Version: "v1", Toolchain: "go"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := tc.value.Validate(); err == nil {
+				t.Fatalf("unsafe bootstrap declaration accepted: %+v", tc.value)
+			}
+		})
+	}
+}
+
 func TestLoadConfig_LaneRequiresAgentKind(t *testing.T) {
 	tmpDir := t.TempDir()
 	cfgPath := filepath.Join(tmpDir, "herd.yaml")
