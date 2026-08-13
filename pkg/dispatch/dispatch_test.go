@@ -258,6 +258,31 @@ func TestProductionDispatchMissingRunStateFailsBeforeWorktree(t *testing.T) {
 	}
 }
 
+func TestProductionDispatchMissingEnvironmentPlanFailsBeforeWorktree(t *testing.T) {
+	task := &provider.Task{ID: "envplan-id", Ref: "FAC-241", Status: "to-do", Description: emptyDepsFence("FAC-241", "envplan-id")}
+	repo, _ := initDispatchRepo(t)
+	mw := &mockWorktree{root: repo, err: fmt.Errorf("environment plan must block before worktree")}
+	states, err := runstate.Open(filepath.Join(t.TempDir(), "dispatch-runs.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = states.Close() })
+	d := withTestLease(t, &Dispatcher{
+		Production:   true,
+		Config:       &config.Config{TaskProvider: config.TaskProvider{Type: "memory", ProjectID: "test"}, Lanes: []config.LaneDef{{Name: "worker", Role: "worker"}}},
+		TaskProvider: &mockTaskProvider{tasks: []*provider.Task{task}}, Worktree: mw,
+		Compensator: &recordingCompensator{}, ScopeFence: &recordingScopeAdmission{decision: scopefence.Decision{Granted: true}},
+		RunStates: states, RunStateGraph: func(context.Context) (string, error) { return "graph-fac-241", nil },
+	})
+	_, err = d.Dispatch(context.Background(), DispatchOptions{TicketRef: task.Ref, NoLaunch: true, LeaseID: "claim:1", LeaseGeneration: 1})
+	if err == nil || !strings.Contains(err.Error(), "environment plan store is required") {
+		t.Fatalf("missing environment plan error=%v", err)
+	}
+	if mw.calls != 0 {
+		t.Fatalf("missing environment plan crossed worktree boundary: calls=%d", mw.calls)
+	}
+}
+
 func TestDispatchRejectsMissingDecisionBeforeAnyProviderOrWorktreeMutation(t *testing.T) {
 	t.Setenv("HERD_LAUNCH_RECEIPTS", filepath.Join(t.TempDir(), "receipts.jsonl"))
 	tp := &mockTaskProvider{tasks: []*provider.Task{{ID: "1", Ref: "FAC-175"}}}

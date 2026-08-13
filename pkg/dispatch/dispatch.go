@@ -17,6 +17,7 @@ import (
 	"github.com/Kampe/Herdforge/pkg/confinement"
 	"github.com/Kampe/Herdforge/pkg/control"
 	"github.com/Kampe/Herdforge/pkg/deps"
+	"github.com/Kampe/Herdforge/pkg/envplan"
 	"github.com/Kampe/Herdforge/pkg/herdr"
 	"github.com/Kampe/Herdforge/pkg/launch"
 	"github.com/Kampe/Herdforge/pkg/preflight"
@@ -226,7 +227,10 @@ type DispatchOptions struct {
 	// to Decision only in that mode.
 	Probe    *toolprobe.Receipt
 	NoLaunch bool
-	LaneName string
+	// EnvironmentPlanID is the durable operator-approved environment plan for
+	// this dispatch. It is required for production external actions.
+	EnvironmentPlanID string
+	LaneName          string
 	// LeaseID/LeaseGeneration bind the launch receipt to the durable claim
 	// fencing this dispatch (FAC-145) AND bind trusted control envelopes for the
 	// launch (FAC-133). Both tickets added this field independently; it is one
@@ -363,6 +367,9 @@ type Dispatcher struct {
 	// stale, or ambiguous saved state therefore cannot enter redispatch.
 	RunStates     *runstate.Store
 	RunStateGraph runstate.GraphAuthority
+	// EnvironmentPlans is the FAC-241 durable capability authority. It is
+	// consulted before scope, worktree, board, harness, or credential effects.
+	EnvironmentPlans *envplan.Store
 
 	// health projects BLOCKED(provider_timeout) for board calls (FAC-150).
 	health dispatchHealth
@@ -674,7 +681,11 @@ func (d *Dispatcher) Dispatch(ctx context.Context, opts DispatchOptions) (*Dispa
 	if task == nil {
 		return nil, fmt.Errorf("ticket %s not found", opts.TicketRef)
 	}
-	if err := d.admitRunState(ctx, task); err != nil {
+	_, err = d.admitRunState(ctx, task)
+	if err != nil {
+		return nil, err
+	}
+	if err := d.admitEnvironmentPlan(ctx, task, opts); err != nil {
 		return nil, err
 	}
 
@@ -1038,18 +1049,18 @@ func (d *Dispatcher) Dispatch(ctx context.Context, opts DispatchOptions) (*Dispa
 // admitRunState is deliberately placed after the read-only task lookup and
 // before every dispatch mutation (scope publication, worktree, board, packet,
 // or launcher). The task ID makes a durable record exact-bound across retries.
-func (d *Dispatcher) admitRunState(ctx context.Context, task *provider.Task) error {
+func (d *Dispatcher) admitRunState(ctx context.Context, task *provider.Task) (*runstate.RunState, error) {
 	if d.RunStates == nil {
 		if d.Production {
-			return errors.New("dispatch runstate: durable run-state store is required in production")
+			return nil, errors.New("dispatch runstate: durable run-state store is required in production")
 		}
-		return nil
+		return nil, nil
 	}
 	if task == nil || strings.TrimSpace(task.ID) == "" || strings.TrimSpace(task.Ref) == "" {
-		return fmt.Errorf("dispatch runstate: %w: incomplete task identity", runstate.ErrAmbiguous)
+		return nil, fmt.Errorf("dispatch runstate: %w: incomplete task identity", runstate.ErrAmbiguous)
 	}
 	if d.RunStateGraph == nil {
-		return fmt.Errorf("dispatch runstate: %w: missing graph authority", runstate.ErrAmbiguous)
+		return nil, fmt.Errorf("dispatch runstate: %w: missing graph authority", runstate.ErrAmbiguous)
 	}
 	id := "dispatch:" + task.ID
 	authority := runstate.Authority{Tasks: d.TaskProvider, Graph: d.RunStateGraph}
@@ -1058,24 +1069,91 @@ func (d *Dispatcher) admitRunState(ctx context.Context, task *provider.Task) err
 		graph, graphErr := d.RunStateGraph(ctx)
 		if graphErr != nil || strings.TrimSpace(graph) == "" {
 			if graphErr != nil {
-				return fmt.Errorf("dispatch runstate graph authority: %w", graphErr)
+				return nil, fmt.Errorf("dispatch runstate graph authority: %w", graphErr)
 			}
-			return fmt.Errorf("dispatch runstate: %w: empty graph revision", runstate.ErrAmbiguous)
+			return nil, fmt.Errorf("dispatch runstate: %w: empty graph revision", runstate.ErrAmbiguous)
 		}
 		next, buildErr := runstate.FromTasks(id, "dispatch", task.Ref, graph, runstate.Policy{Lane: "dispatch", Model: "dispatch"}, 0, 0, []*provider.Task{task})
 		if buildErr != nil {
-			return fmt.Errorf("dispatch runstate build: %w", buildErr)
+			return nil, fmt.Errorf("dispatch runstate build: %w", buildErr)
 		}
 		if _, checkpointErr := d.RunStates.Checkpoint(ctx, next, 0); checkpointErr != nil {
-			return fmt.Errorf("dispatch runstate checkpoint: %w", checkpointErr)
+			return nil, fmt.Errorf("dispatch runstate checkpoint: %w", checkpointErr)
 		}
 		state, err = d.RunStates.Resume(ctx, id, authority)
 	}
 	if err != nil {
-		return fmt.Errorf("dispatch runstate resume: %w", err)
+		return nil, fmt.Errorf("dispatch runstate resume: %w", err)
 	}
 	if err := state.Dispatchable(task.Ref); err != nil {
-		return fmt.Errorf("dispatch runstate gate: %w", err)
+		return nil, fmt.Errorf("dispatch runstate gate: %w", err)
+	}
+	return state, nil
+}
+
+// admitEnvironmentPlan derives the live FAC-235 binding and checks all plan
+// requests before scope admission. It deliberately has no side effects.
+func (d *Dispatcher) admitEnvironmentPlan(ctx context.Context, task *provider.Task, opts DispatchOptions) error {
+	if !d.Production {
+		return nil
+	}
+	if d.EnvironmentPlans == nil {
+		return errors.New("dispatch envplan: durable environment plan store is required in production")
+	}
+	if strings.TrimSpace(opts.EnvironmentPlanID) == "" {
+		return errors.New("dispatch envplan: plan id is required in production")
+	}
+	if task == nil || d.RunStates == nil || d.RunStateGraph == nil {
+		return errors.New("dispatch envplan: task and runstate authorities are required")
+	}
+	run, err := d.RunStates.Resume(ctx, "dispatch:"+task.ID, runstate.Authority{Tasks: d.TaskProvider, Graph: d.RunStateGraph})
+	if err != nil {
+		return fmt.Errorf("dispatch envplan runstate: %w", err)
+	}
+	var saved *runstate.TaskState
+	for i := range run.Tasks {
+		if run.Tasks[i].ID == task.ID && run.Tasks[i].Ref == task.Ref {
+			saved = &run.Tasks[i]
+			break
+		}
+	}
+	if saved == nil {
+		return fmt.Errorf("dispatch envplan: %w: task absent from run", envplan.ErrStale)
+	}
+	binding := envplan.Binding{TaskRef: task.Ref, TaskID: task.ID, Provider: d.Config.TaskProvider.Type, ProviderRevision: saved.ProviderRevision, GraphRevision: run.DependencyGraphRevision, RunID: run.ID, RunRevision: run.Revision}
+	plan, err := d.EnvironmentPlans.Load(ctx, opts.EnvironmentPlanID)
+	if err != nil {
+		return fmt.Errorf("dispatch envplan load: %w", err)
+	}
+	for _, request := range plan.Requests {
+		if err := d.EnvironmentPlans.Authorize(ctx, plan.ID, binding, request.Capability, time.Now().UTC()); err != nil {
+			return fmt.Errorf("dispatch envplan admission %s: %w", request.Capability, err)
+		}
+	}
+	// External effects dispatch will perform must be explicitly planned too;
+	// Authorize returns ErrUnplanned when an empty/least-privilege plan omits one.
+	required := []envplan.Capability{envplan.CapabilityBoardWrite}
+	if !opts.NoLaunch {
+		required = append(required, envplan.CapabilityCredential)
+		laneName := opts.LaneName
+		if laneName == "" {
+			laneName = "worker"
+		}
+		lane, err := config.ResolveLane(d.Config, laneName)
+		if err != nil {
+			return fmt.Errorf("dispatch envplan lane: %w", err)
+		}
+		for _, cap := range lane.Capabilities {
+			if cap == config.CapabilityNetwork {
+				required = append(required, envplan.CapabilityNetwork)
+				break
+			}
+		}
+	}
+	for _, cap := range required {
+		if err := d.EnvironmentPlans.Authorize(ctx, plan.ID, binding, cap, time.Now().UTC()); err != nil {
+			return fmt.Errorf("dispatch envplan required %s: %w", cap, err)
+		}
 	}
 	return nil
 }
