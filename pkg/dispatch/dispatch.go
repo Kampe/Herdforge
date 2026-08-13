@@ -23,6 +23,7 @@ import (
 	"github.com/Kampe/Herdforge/pkg/preflight"
 	"github.com/Kampe/Herdforge/pkg/provider"
 	"github.com/Kampe/Herdforge/pkg/recovery"
+	"github.com/Kampe/Herdforge/pkg/residual"
 	"github.com/Kampe/Herdforge/pkg/router"
 	"github.com/Kampe/Herdforge/pkg/runstate"
 	"github.com/Kampe/Herdforge/pkg/scopefence"
@@ -1011,6 +1012,13 @@ func (d *Dispatcher) Dispatch(ctx context.Context, opts DispatchOptions) (*Dispa
 		Name:            d.coordinatorName(),
 		LeaseGeneration: tok.Generation,
 	})
+	if len(task.Residuals) > 0 {
+		section, residualErr := residual.PacketSection(task.Residuals)
+		if residualErr != nil {
+			return nil, failOwned("residual_packet_invalid", residualErr)
+		}
+		packet += "\nResidual work (does not waive acceptance criteria):\n" + section
+	}
 	if depProv != nil {
 		packet = packet + "\n" + deps.PacketSection(depProv)
 	}

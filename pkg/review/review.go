@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/Kampe/Herdforge/pkg/control"
+	"github.com/Kampe/Herdforge/pkg/residual"
 )
 
 // ModelFamily maps a provider or model prefix to a canonical family name.
@@ -93,13 +94,13 @@ type ReviewFunc func(ctx context.Context, reviewerModel string, packet Packet) (
 
 // JuryVerdict is the structured outcome of a multi-reviewer jury vote.
 type JuryVerdict struct {
-	Packet   Packet          `json:"packet"`
-	Verdict  ReviewVerdict   `json:"verdict"`
-	Votes    []JuryVote      `json:"votes"`
-	JurySize int             `json:"jury_size"`
-	Passes   int             `json:"passes"`
-	Fails    int             `json:"fails"`
-	Stales   int             `json:"stales"`
+	Packet   Packet        `json:"packet"`
+	Verdict  ReviewVerdict `json:"verdict"`
+	Votes    []JuryVote    `json:"votes"`
+	JurySize int           `json:"jury_size"`
+	Passes   int           `json:"passes"`
+	Fails    int           `json:"fails"`
+	Stales   int           `json:"stales"`
 }
 
 // JuryVote is one reviewer's verdict.
@@ -214,10 +215,10 @@ func EvaluateJury(ctx context.Context, packet Packet, authorModel string, availa
 				Family:   reg.Lookup(m),
 				Verdict:  verdict,
 			}
-		if vErr != nil {
-			v.Err = vErr.Error()
-			v.Verdict = VerdictFail
-		}
+			if vErr != nil {
+				v.Err = vErr.Error()
+				v.Verdict = VerdictFail
+			}
 			votes[idx] = v
 		}(i, model)
 	}
@@ -293,6 +294,9 @@ type Packet struct {
 	Verdict     ReviewVerdict `json:"verdict"`
 	Reviewer    string        `json:"reviewer"`
 	SubmittedAt time.Time     `json:"submitted_at"`
+	// Residuals are reviewed as context; they cannot turn a required criterion
+	// into a PASS. Merge admission verifies their linkage independently.
+	Residuals []residual.Record `json:"residuals,omitempty"`
 }
 
 type HarvestResult struct {

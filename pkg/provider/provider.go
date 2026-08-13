@@ -3,6 +3,8 @@ package provider
 import (
 	"context"
 	"time"
+
+	"github.com/Kampe/Herdforge/pkg/residual"
 )
 
 type Priority string
@@ -37,6 +39,9 @@ type Task struct {
 	// zero is a valid board rank and must not be confused with "unknown".
 	Position    float64 `json:"-"`
 	HasPosition bool    `json:"-"`
+	// Residuals are revision-bound incompleteness records propagated into every
+	// dependent task packet. They never grant completion authority.
+	Residuals []residual.Record `json:"residuals,omitempty"`
 }
 
 // TaskProvider defines the interface for task tracking backends (Kaneo, GitHub, Linear)

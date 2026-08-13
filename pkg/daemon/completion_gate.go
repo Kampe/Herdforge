@@ -11,6 +11,7 @@ import (
 
 	"github.com/Kampe/Herdforge/pkg/lifecycle"
 	"github.com/Kampe/Herdforge/pkg/outbox"
+	"github.com/Kampe/Herdforge/pkg/residual"
 	"github.com/Kampe/Herdforge/pkg/verifier"
 )
 
@@ -67,6 +68,39 @@ type CompletionDecision struct {
 	// ReviewReady is true only when Outcome is PASS and the digest was
 	// admitted and recorded for review enqueue.
 	ReviewReady bool
+	// Residuals are the provider-read-back scope-reduction context. A required
+	// criterion can never appear here as a successful completion substitute.
+	Residuals []residual.Record
+}
+
+// HandleScopeReduced is the only nonterminal scope-reduction exit. It creates
+// (or deterministically reuses) exactly one provider-linked follow-up per
+// record, verifies provider readback, and then refuses required criteria.
+// Callers persist/project the returned records into task/review/merge context.
+func (g *CompletionGate) HandleScopeReduced(ctx context.Context, p residual.Provider, acceptanceRevision string, records []residual.Record) ([]residual.Record, error) {
+	if g == nil {
+		return nil, errors.New("completion: nil gate")
+	}
+	if len(records) == 0 {
+		return nil, fmt.Errorf("%w: scope-reduced outcome has no residual record", residual.ErrMissingLinkage)
+	}
+	linked := make([]residual.Record, 0, len(records))
+	seen := make(map[string]struct{}, len(records))
+	for _, record := range records {
+		if _, ok := seen[record.ID]; ok {
+			return nil, fmt.Errorf("%w: duplicate residual %s", residual.ErrMissingLinkage, record.ID)
+		}
+		seen[record.ID] = struct{}{}
+		bound, err := residual.EnsureFollowUp(ctx, p, record)
+		if err != nil {
+			return nil, err
+		}
+		linked = append(linked, bound)
+	}
+	if err := residual.ValidateExit(linked, acceptanceRevision); err != nil {
+		return nil, err
+	}
+	return linked, nil
 }
 
 // reviewEnqueuePayload is the outbox payload for a review-spawn intent.
