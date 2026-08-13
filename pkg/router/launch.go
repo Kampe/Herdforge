@@ -387,6 +387,36 @@ func BindHarnessSession(d *LaunchDecision, sessionPath string) (*LaunchDecision,
 	return &bound, nil
 }
 
+// BindVendorHarness re-issues a router decision for a lane that explicitly
+// declares a direct vendor harness. It leaves the router's default Pi route
+// untouched for callers without an authoritative lane configuration.
+func BindVendorHarness(d *LaunchDecision, harness string) (*LaunchDecision, error) {
+	if d == nil {
+		return nil, fmt.Errorf("launch decision is required")
+	}
+	if err := VerifyDecision(d, d.TaskRef, d.LeaseGeneration); err != nil {
+		return nil, err
+	}
+	harness = strings.ToLower(strings.TrimSpace(harness))
+	provider := strings.ToLower(strings.TrimSpace(d.Provider))
+	if !IsVendorHarness(harness) || harness != provider {
+		return nil, fmt.Errorf("configured vendor harness %q must match routed provider %q", harness, d.Provider)
+	}
+	argv := ArgvFor(provider, d.Model, d.Effort)
+	if len(argv) == 0 || argv[0] != harness {
+		return nil, fmt.Errorf("no direct harness argv contract for %s/%s", provider, d.Model)
+	}
+	bound := *d
+	bound.Harness = harness
+	bound.HarnessArgv = append([]string(nil), argv...)
+	bound.HarnessSession = ""
+	if _, err := cryptorand.Read(bound.issuanceToken[:]); err != nil {
+		return nil, fmt.Errorf("issue vendor-harness launch capability: %w", err)
+	}
+	bound.Proof = decisionProof(bound)
+	return &bound, nil
+}
+
 // ProbeKey returns the stable probe identity for a provider/model tuple.
 // FAC-139 binds tool-probe receipts to this key.
 func ProbeKey(provider, model string) string {

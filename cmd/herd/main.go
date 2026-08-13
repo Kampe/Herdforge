@@ -4562,6 +4562,10 @@ func routedLaneDecision(ctx context.Context, task *provider.Task) func(*config.L
 }
 
 func laneLaunchDecision(ctx context.Context, lane *config.LaneDef, task *provider.Task) (*router.LaunchDecision, error) {
+	return laneLaunchDecisionWithProbe(ctx, lane, task, herdr.ProbeProviderModel)
+}
+
+func laneLaunchDecisionWithProbe(ctx context.Context, lane *config.LaneDef, task *provider.Task, probeModel func(context.Context, string, string, string) herdr.ProbeResult) (*router.LaunchDecision, error) {
 	if lane == nil {
 		return nil, fmt.Errorf("launch route requires a configured lane")
 	}
@@ -4640,10 +4644,10 @@ func laneLaunchDecision(ctx context.Context, lane *config.LaneDef, task *provide
 		if _, done := probes[key]; done {
 			continue
 		}
-		probes[key] = herdr.ProbeProviderModel(ctx, cp, cm, lane.Effort).Available
+		probes[key] = probeModel(ctx, cp, cm, lane.Effort).Available
 	}
 	if router.ModelRequiresProbe(model) {
-		probe := herdr.ProbeProviderModel(ctx, provider, model, lane.Effort)
+		probe := probeModel(ctx, provider, model, lane.Effort)
 		probes[router.ProbeKey(provider, model)] = probe.Available
 		if pinnedBuilder && !probe.Available {
 			reason := strings.TrimSpace(probe.Reason)
@@ -4656,15 +4660,23 @@ func laneLaunchDecision(ctx context.Context, lane *config.LaneDef, task *provide
 	if len(probes) > 0 {
 		request.ProbeResults = probes
 	}
-	decision, err := router.NewRouter(nil, nil).Decide(request)
+	r := router.NewRouter(nil, nil)
+	// The lane's configured harness was LookPath-checked above. Do not let the
+	// router's legacy Pi availability probe veto this direct vendor launch.
+	r.Probes = &router.Probes{CLIPresent: func(string) bool { return true }, Now: time.Now}
+	decision, err := r.Decide(request)
 	if err != nil {
 		return nil, err
+	}
+	decision, err = router.BindVendorHarness(decision, lane.Harness)
+	if err != nil {
+		return nil, fmt.Errorf("lane %q bind configured harness: %w", lane.Name, err)
 	}
 	if decision.Shape != lane.TaskShape {
 		return nil, fmt.Errorf("lane %q routed shape drift: configured %s, got %s", lane.Name, lane.TaskShape, decision.Shape)
 	}
-	if decision.Harness != router.PiHarness {
-		return nil, fmt.Errorf("lane %q routed harness drift: got %s, want %s", lane.Name, decision.Harness, router.PiHarness)
+	if decision.Harness != strings.ToLower(strings.TrimSpace(lane.Harness)) {
+		return nil, fmt.Errorf("lane %q routed harness drift: got %s, want %s", lane.Name, decision.Harness, lane.Harness)
 	}
 	if pinnedBuilder {
 		if decision.Provider != lane.Provider || decision.Model != lane.Model || decision.Effort != lane.Effort {
@@ -4695,19 +4707,14 @@ func validateLaneLaunchConfig(lane *config.LaneDef) error {
 	}
 	if role == launch.WorkerRole || role == launch.ForgeSmithRole || role == launch.RecoveryRole {
 		if lane.Provider != launch.WorkerProvider || lane.Model != launch.WorkerModel || lane.Effort != launch.WorkerEffort {
-			return fmt.Errorf("%w: lane %q must explicitly be Pi harness with codex/gpt-5.6-luna/medium", ErrWorkerConfigPolicy, lane.Name)
+			return fmt.Errorf("%w: lane %q must explicitly be codex with codex/gpt-5.6-luna/medium", ErrWorkerConfigPolicy, lane.Name)
 		}
 	}
 	return nil
 }
 
 func supportedVendorHarness(harness string) bool {
-	switch harness {
-	case "codex", "claude", "grok", "agy", "opencode":
-		return true
-	default:
-		return false
-	}
+	return router.IsVendorHarness(harness)
 }
 
 var ErrWorkerConfigPolicy = errors.New("launch.policy.config_worker_tuple_mismatch")

@@ -299,6 +299,18 @@ func AgyGeminiPoolFallback(shape string) string {
 
 const PiHarness = "pi"
 
+// IsVendorHarness reports whether a harness is a directly supported fleet
+// surface. Pi remains available for legacy router decisions, but lane-bound
+// launches use this closed set.
+func IsVendorHarness(harness string) bool {
+	switch strings.ToLower(strings.TrimSpace(harness)) {
+	case "codex", "claude", "grok", "agy", "opencode":
+		return true
+	default:
+		return false
+	}
+}
+
 // PiModelFor maps a routed provider/model to Pi's exact provider-qualified model.
 func PiModelFor(provider, model string) (string, error) {
 	provider = strings.ToLower(strings.TrimSpace(provider))

@@ -1118,14 +1118,14 @@ func (d *Dispatcher) prepareConfinementOS(
 		taskRef = "unknown-task"
 	}
 	branch := wtInfo.Branch
-	// Production starts herdr kind = Decision.Harness ("pi"). A PATH wrapper
-	// with that exact name is required or sandbox-exec never wraps the agent.
+	// Production starts herdr kind = Decision.Harness. A PATH wrapper with that
+	// exact name is required or sandbox-exec never wraps the agent.
 	harness := strings.TrimSpace(request.Decision.Harness)
 	if harness == "" {
-		return nil, nil, fmt.Errorf("confinement: decision harness is required (production launches pi)")
+		return nil, nil, fmt.Errorf("confinement: decision harness is required")
 	}
-	if harness != router.PiHarness {
-		return nil, nil, fmt.Errorf("confinement: harness %q unsupported; production requires %q", harness, router.PiHarness)
+	if harness != router.PiHarness && !router.IsVendorHarness(harness) {
+		return nil, nil, fmt.Errorf("confinement: harness %q unsupported", harness)
 	}
 	realAgent := harness
 	if len(request.Decision.HarnessArgv) > 0 && strings.TrimSpace(request.Decision.HarnessArgv[0]) != "" {
