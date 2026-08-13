@@ -14,7 +14,7 @@ import (
 // FAC-240: controlSurfaceVersion is a compatibility boundary, not a display
 // number. Any command-contract change must add its new fingerprint below and
 // increment this value; ValidateControlSurfaceManifest rejects silent drift.
-const controlSurfaceVersion = 1
+const controlSurfaceVersion = 2
 
 type commandClass string
 
@@ -48,7 +48,7 @@ type controlSurfaceManifest struct {
 // list only: validation rejects omissions and duplicate classifications.
 var commandNamesByClass = map[commandClass][]string{
 	classPublicAgent: {
-		"board-audit", "control-surface", "preflight", "process", "resources", "route", "scope", "selftest", "status", "tests-for", "throughput", "tool-probe", "unmerged", "verify", "worktrees",
+		"board-audit", "control-surface", "preflight", "process", "resources", "route", "scope", "selftest", "status", "tests-for", "throughput", "timeline", "tool-probe", "unmerged", "verify", "worktrees",
 	},
 	classCoordinatorOnly: {
 		"activate", "approve", "attention", "board-done", "board-freeze", "board-frozen", "board-sync", "claude-only", "cleanup", "command", "commands", "containers", "control", "daemon", "deps", "dispatch", "doctor-models", "drain", "feedback", "fence-provision", "forge", "fresh-build", "harvest", "harvest-merge", "herdr-deliver", "hold", "kick", "labels", "lifecycle", "lock", "lost", "merge-admit", "merge-complete", "next", "no-claude", "overlap", "park", "posture", "pulse", "quota", "quota-supervisor", "receipt", "repl", "rescue", "reset-safe", "resolve-lane", "review", "review-classify", "review-ingest", "review-ledger", "send", "sh", "shoot", "shot", "spin", "standing", "stop", "task", "up", "usage", "watch", "wave", "wind-down", "verify-fac151",
@@ -66,7 +66,7 @@ func commandMutates(name string) bool {
 		"board-audit": true, "board-frozen": true, "control-surface": true, "preflight": true,
 		"process": true, "resources": true, "route": true, "scope": true, "selftest": true,
 		"status": true, "tests-for": true, "throughput": true, "tool-probe": true,
-		"unmerged": true, "verify": true, "worktrees": true, "usage": true,
+		"timeline": true, "unmerged": true, "verify": true, "worktrees": true, "usage": true,
 	}
 	return !readOnly[name]
 }
@@ -111,6 +111,7 @@ func controlSurface() controlSurfaceManifest {
 // explicitly increments controlSurfaceVersion and records the new hash.
 var controlSurfaceCompatibility = map[int]string{
 	1: "ec8bcd82bb03cc6e33e6a87515cbd9236aa997a2efca802f5d800b8ba0afe121",
+	2: "96f0e6e4ef2653c583b4580efe3ea5d5b6d537dfc8282e2eda62c0905dcd5287",
 }
 
 func controlSurfaceFingerprint(m controlSurfaceManifest) (string, error) {
