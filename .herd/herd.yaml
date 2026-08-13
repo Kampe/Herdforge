@@ -6,17 +6,16 @@ project:
   default_branch: "main"
   repo_url: "https://github.com/Kampe/Herdforge.git"
 
-# Linear Project (Herdforge)
+# Kaneo FAC Project (Herdforge)
 # FAC-155: `enabled` is this repository's explicit activation policy. The
 # factory activates `type` only if it is listed here; jira, azure, github
-# issues, kaneo and memory adapters stay compiled but dormant and can never be
+# issues, linear and memory adapters stay compiled but dormant and can never be
 # auto-detected, probed, or selected. Flipping `type` without moving this list
 # fails closed before any board read or mutation.
 task_provider:
-  type: "linear"
-  enabled: ["linear"]
-  project_id: "75548eb4-5382-444e-8dfd-6c6778f3b2d9"
-  api_key_env: "LINEAR_API_KEY"
+  type: "kaneo"
+  enabled: ["kaneo"]
+  project_id: "b939c5jzixruza3vvywrg1hs"
 
 # The forge fleet — the complete role roster (FAC-127). Soft model pins below
 # are roster defaults only. FAC-142 SurfaceRouter.Decide owns the live
@@ -45,8 +44,8 @@ lanes:
   # into dispatch-ready specs, feeding the forge loop what to forge next.
   - name: "scout"
     role: "forge-smith"
-    agent_kind: "pi"
-    harness: "pi"
+    agent_kind: "codex"
+    harness: "codex"
     prompt: ".herd/prompts/smith.md"
     worktree: ".worktrees/scout"
     provider: "codex"
@@ -62,8 +61,8 @@ lanes:
   # per card (task-fac-<ref>) using router LaunchDecision, not harness defaults.
   - name: "smith"
     role: "worker"
-    agent_kind: "pi"
-    harness: "pi"
+    agent_kind: "codex"
+    harness: "codex"
     prompt: ".herd/prompts/worker.md"
     worktree: ".worktrees/smith"
     provider: "codex"
@@ -76,13 +75,13 @@ lanes:
     incompatible_with: ["reviewer"]
 
   # assayer — independent review. Reviewer independence is enforced from
-  # candidate provenance. Worker/forge lanes use a Pi harness with the explicit
-  # Codex/Luna/medium route; review effort is medium by default and high only
+  # candidate provenance. Worker/forge lanes use the Codex harness with the
+  # explicit Codex/Luna/medium route; review effort is medium by default and high only
   # for final-pass/critical R2/R3 work (FAC-142).
   - name: "assayer"
     role: "reviewer"
-    agent_kind: "pi"
-    harness: "pi"
+    agent_kind: "claude"
+    harness: "claude"
     prompt: ".herd/prompts/reviewer.md"
     worktree: ".worktrees/assayer"
     provider: "claude"
@@ -100,8 +99,8 @@ lanes:
   # implements, reviews, or merges a candidate itself (.herd/prompts/orchestrator.md).
   - name: "orchestrator"
     role: "orchestrator"
-    agent_kind: "pi"
-    harness: "pi"
+    agent_kind: "claude"
+    harness: "claude"
     prompt: ".herd/prompts/orchestrator.md"
     worktree: ".worktrees/orchestrator"
     provider: "claude"
@@ -118,8 +117,8 @@ lanes:
   # (.herd/prompts/scout-planner.md).
   - name: "scout-planner"
     role: "scout-planner"
-    agent_kind: "pi"
-    harness: "pi"
+    agent_kind: "claude"
+    harness: "claude"
     prompt: ".herd/prompts/scout-planner.md"
     worktree: ".worktrees/scout-planner"
     provider: "claude"
@@ -140,8 +139,8 @@ lanes:
   # elsewhere. claude/claude-haiku-4-5 is the real bounded claude model.
   - name: "verification-gate"
     role: "verification-gate"
-    agent_kind: "pi"
-    harness: "pi"
+    agent_kind: "claude"
+    harness: "claude"
     prompt: ".herd/prompts/verification-gate.md"
     worktree: ".worktrees/verification-gate"
     provider: "claude"
@@ -158,8 +157,8 @@ lanes:
   # the single integration queue (.herd/prompts/review-supervisor.md).
   - name: "review-supervisor"
     role: "review-supervisor"
-    agent_kind: "pi"
-    harness: "pi"
+    agent_kind: "claude"
+    harness: "claude"
     prompt: ".herd/prompts/review-supervisor.md"
     worktree: ".worktrees/review-supervisor"
     provider: "claude"
@@ -177,8 +176,8 @@ lanes:
   # rejected).
   - name: "harvest"
     role: "harvest"
-    agent_kind: "pi"
-    harness: "pi"
+    agent_kind: "claude"
+    harness: "claude"
     prompt: ".herd/prompts/harvest.md"
     worktree: ".worktrees/harvest"
     provider: "claude"
@@ -195,8 +194,8 @@ lanes:
   # unique work (.herd/prompts/recovery-sentinel.md).
   - name: "recovery-sentinel"
     role: "recovery-sentinel"
-    agent_kind: "pi"
-    harness: "pi"
+    agent_kind: "claude"
+    harness: "claude"
     prompt: ".herd/prompts/recovery-sentinel.md"
     worktree: ".worktrees/recovery-sentinel"
     provider: "claude"
@@ -216,8 +215,8 @@ lanes:
   # limit, not an oversight; see the note under lanes.
   - name: "mender"
     role: "recovery"
-    agent_kind: "pi"
-    harness: "pi"
+    agent_kind: "codex"
+    harness: "codex"
     prompt: ".herd/prompts/mender.md"
     worktree: ".worktrees/mender"
     provider: "codex"
@@ -236,7 +235,7 @@ lanes:
 #      lane name or a role name unambiguously.
 #   2. validateLaneLaunchConfig (cmd/herd/main.go) accepts eleven roles and
 #      pins each to one task_shape; worker/forge-smith/recovery must be exactly
-#      pi + codex/gpt-5.6-luna/medium.
+#      codex + codex/gpt-5.6-luna/medium.
 #
 # CORRECTION (2026-08-08): an earlier version of this note claimed the map held
 # only ten roles and that "assayer" was not among them, so no role was left for

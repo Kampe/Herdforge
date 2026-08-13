@@ -4688,8 +4688,10 @@ func validateLaneLaunchConfig(lane *config.LaneDef) error {
 	if expected, ok := expectedShapes[role]; !ok || lane.TaskShape != expected {
 		return fmt.Errorf("%w: lane %q has invalid task_shape %q for role %q", ErrWorkerConfigPolicy, lane.Name, lane.TaskShape, role)
 	}
-	if strings.TrimSpace(lane.AgentKind) != router.PiHarness || strings.TrimSpace(lane.Harness) != router.PiHarness {
-		return fmt.Errorf("%w: lane %q agent kind %q harness %q must both be %q", ErrHarnessConfigPolicy, lane.Name, lane.AgentKind, lane.Harness, router.PiHarness)
+	agentKind := strings.ToLower(strings.TrimSpace(lane.AgentKind))
+	harness := strings.ToLower(strings.TrimSpace(lane.Harness))
+	if agentKind != harness || !supportedVendorHarness(harness) {
+		return fmt.Errorf("%w: lane %q agent kind %q harness %q must match one supported vendor harness (codex, claude, grok, agy, opencode)", ErrHarnessConfigPolicy, lane.Name, lane.AgentKind, lane.Harness)
 	}
 	if role == launch.WorkerRole || role == launch.ForgeSmithRole || role == launch.RecoveryRole {
 		if lane.Provider != launch.WorkerProvider || lane.Model != launch.WorkerModel || lane.Effort != launch.WorkerEffort {
@@ -4697,6 +4699,15 @@ func validateLaneLaunchConfig(lane *config.LaneDef) error {
 		}
 	}
 	return nil
+}
+
+func supportedVendorHarness(harness string) bool {
+	switch harness {
+	case "codex", "claude", "grok", "agy", "opencode":
+		return true
+	default:
+		return false
+	}
 }
 
 var ErrWorkerConfigPolicy = errors.New("launch.policy.config_worker_tuple_mismatch")
