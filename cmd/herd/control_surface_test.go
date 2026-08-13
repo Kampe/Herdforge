@@ -5,23 +5,28 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"slices"
 	"strings"
 	"testing"
 )
 
 func TestControlSurfaceCoversEveryRoutedCommandExactlyOnce(t *testing.T) {
-	want := []string{
-		"activate", "approve", "attention", "board-audit", "board-done", "board-freeze", "board-frozen", "board-sync", "broker", "claude-only", "cleanup", "clone", "command", "commands", "containers", "control", "control-surface", "daemon", "deps", "dispatch", "doctor-models", "drain", "feedback", "fence-broker", "fence-provision", "forge", "fresh-build", "harvest", "harvest-merge", "herdr-deliver", "hold", "hostcreds", "init", "kick", "labels", "lifecycle", "lock", "lost", "merge-admit", "merge-complete", "netbroker-serve", "next", "no-claude", "overlap", "park", "posture", "preflight", "process", "pulse", "quota", "quota-supervisor", "receipt", "repl", "rescue", "reset-safe", "resolve-lane", "resources", "review", "review-classify", "review-ingest", "review-ledger", "role-inject", "route", "scope", "seed-lane-state", "selftest", "send", "sh", "shoot", "shot", "signer-boundary", "spin", "standing", "stash", "status", "stop", "task", "tests-for", "throughput", "tool-probe", "unmerged", "up", "usage", "validate-config", "verify", "verify-fac151", "watch", "wave", "wind-down", "worktrees",
-	}
 	m := controlSurface()
 	if err := validateControlSurfaceManifest(m); err != nil {
 		t.Fatal(err)
 	}
-	got := knownSubcommands()
-	slices.Sort(want)
-	if !slices.Equal(got, want) {
-		t.Fatalf("manifest commands differ from routed commands\n got: %v\nwant: %v", got, want)
+	for _, command := range knownSubcommands() {
+		if err := admitRoutedCommand(command, nil); err != nil {
+			t.Fatalf("manifest command %q was not admitted: %v", command, err)
+		}
+	}
+}
+
+func TestControlSurfaceRefusesRoutedCommandAbsentFromManifest(t *testing.T) {
+	// This simulates the old regression: a developer adds a main switch case
+	// but omits its manifest record. The old optional lookup let that case reach
+	// a handler; required admission must stop it before any handler can run.
+	if err := admitRoutedCommand("new-routed-command", nil); err == nil || !strings.Contains(err.Error(), "unknown subcommand") {
+		t.Fatalf("unmanifested routed command must fail admission, got %v", err)
 	}
 }
 

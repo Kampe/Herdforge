@@ -95,25 +95,21 @@ func main() {
 	// FAC-189: every subcommand recognizes -h/--help before positional
 	// payloads or any provider/Herdr/git/outbox/claim/worktree side effect.
 	// Literal payloads equal to --help require `--` or an explicit flag
-	// (see parseTicketRef / dispatch --ticket=).
-	if _, known := commandContractFor(command); known {
-		// This is an argument-only gate. It rejects unavailable discovery
-		// requests before manifest validation, filesystem reads, or any
-		// process-launching command handler can be reached.
-		if command == "control-surface" && !controlSurfaceArgsAllowed(os.Args[2:]) {
-			fmt.Fprintln(os.Stderr, "control-surface: only --json is supported")
+	// (see parseTicketRef / dispatch --ticket=). Manifest admission is
+	// mandatory: a new switch case cannot bypass its contract.
+	if err := admitRoutedCommand(command, os.Args[2:]); err != nil {
+		if command == "control-surface" && strings.HasPrefix(err.Error(), "control-surface:") {
+			fmt.Fprintln(os.Stderr, err)
 			os.Exit(2)
 		}
-		if err := validateControlSurfaceManifest(controlSurface()); err != nil {
-			fmt.Fprintf(os.Stderr, "herd: %v\n", err)
-			os.Exit(1)
-		}
-		if exitIfHelp(command, os.Args[2:]) {
-			return
-		}
-		// Probe after the help gate so help tests observe zero entries.
-		markOperational(command)
+		fmt.Fprintf(os.Stderr, "herd: %v\n", err)
+		os.Exit(1)
 	}
+	if exitIfHelp(command, os.Args[2:]) {
+		return
+	}
+	// Probe after the help gate so help tests observe zero entries.
+	markOperational(command)
 
 	switch command {
 	case "control-surface":

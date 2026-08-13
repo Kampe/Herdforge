@@ -155,6 +155,27 @@ func commandContractFor(name string) (commandContract, bool) {
 	return commandContract{}, false
 }
 
+// admitRoutedCommand makes the manifest the authority boundary for main's
+// command switch. A new switch case cannot reach a handler until it is first
+// declared in the manifest (and therefore participates in compatibility and
+// discovery validation).
+//
+// The control-surface argument gate intentionally runs before manifest
+// validation so unavailable discovery requests cause no filesystem or process
+// side effects.
+func admitRoutedCommand(command string, args []string) error {
+	if _, known := commandContractFor(command); !known {
+		return fmt.Errorf("unknown subcommand %q", command)
+	}
+	if command == "control-surface" && !controlSurfaceArgsAllowed(args) {
+		return errors.New("control-surface: only --json is supported")
+	}
+	if err := validateControlSurfaceManifest(controlSurface()); err != nil {
+		return fmt.Errorf("control surface: %w", err)
+	}
+	return nil
+}
+
 func knownSubcommands() []string {
 	m := controlSurface()
 	names := make([]string, 0, len(m.Commands))
