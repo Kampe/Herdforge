@@ -113,8 +113,13 @@ func TestActivationPolicy_DisabledNeverResolvesCredentials(t *testing.T) {
 	// And the same config with linear enabled must still work, or the test
 	// above would pass for the wrong reason (e.g. a blanket refusal).
 	cfg.TaskProvider.Enabled = []string{"linear"}
-	if _, err := NewFromHerdConfig(cfg); err != nil {
+	tp, err = NewFromHerdConfig(cfg)
+	if err != nil {
 		t.Fatalf("enabled linear must activate: %v", err)
+	}
+	bound, ok := tp.(*BoundClient)
+	if !ok || typeName(bound.Inner) != "*provider.LinearProvider" {
+		t.Fatalf("explicit Linear config must select Linear without Kaneo fallback, got %T", tp)
 	}
 }
 
@@ -133,6 +138,9 @@ func TestActivationPolicy_LiveRepoConfigActivatesExactlyOneAdapter(t *testing.T)
 		t.Fatalf("repo must enable exactly one provider, got %v", cfg.TaskProvider.Enabled)
 	}
 	configured := strings.ToLower(strings.TrimSpace(cfg.TaskProvider.Type))
+	if configured != "kaneo" || cfg.TaskProvider.ProjectID != "b939c5jzixruza3vvywrg1hs" {
+		t.Fatalf("repo must bind the linked Kaneo FAC board, got type=%q project=%q", configured, cfg.TaskProvider.ProjectID)
+	}
 	if strings.ToLower(strings.TrimSpace(cfg.TaskProvider.Enabled[0])) != configured {
 		t.Fatalf("task_provider.type %q is not the enabled provider %v", configured, cfg.TaskProvider.Enabled)
 	}

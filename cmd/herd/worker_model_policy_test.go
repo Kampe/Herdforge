@@ -166,7 +166,7 @@ func TestApplyWorkerModelRouterBeforeClaimIsProductionSeam(t *testing.T) {
 // the effect body where a rejection can actually suppress the increment.
 func TestLaunchAdmissionLifecycleComposesModelGateBeforeClaim(t *testing.T) {
 	lane := config.LaneDef{
-		Name: "worker", Role: "worker", AgentKind: router.PiHarness, Harness: router.PiHarness,
+		Name: "worker", Role: "worker", AgentKind: "codex", Harness: "codex",
 		Provider: launch.WorkerProvider, Model: launch.WorkerModel, Effort: launch.WorkerEffort,
 		TaskShape: launch.Implementation,
 	}
@@ -226,7 +226,7 @@ func TestLaunchAdmissionLifecycleComposesModelGateBeforeClaim(t *testing.T) {
 // effect (pre-existing launch policy; still holds after FAC-194).
 func TestForgeAdmissionRejectsBeforeClaimWhenLaneForbidden(t *testing.T) {
 	cfg := &config.Config{Lanes: []config.LaneDef{{
-		Name: "bad-forge", Role: "worker", AgentKind: router.PiHarness, Harness: router.PiHarness,
+		Name: "bad-forge", Role: "worker", AgentKind: "codex", Harness: "codex",
 		Provider: "codex", Model: "gpt-5.6-sol", Effort: "medium", TaskShape: "implementation",
 	}}}
 	claimed := false

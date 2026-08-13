@@ -1,6 +1,7 @@
 package main
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -24,6 +25,7 @@ func TestEveryConfiguredLaneLaunchesOnItsConfiguredModel(t *testing.T) {
 	if len(cfg.Lanes) == 0 {
 		t.Fatal("roster has no lanes")
 	}
+	supportedHarnesses := map[string]bool{"codex": true, "claude": true, "grok": true, "agy": true, "opencode": true}
 
 	// Every surface healthy and present, so any divergence is the routing
 	// mechanism rather than quota or a missing CLI.
@@ -35,6 +37,10 @@ func TestEveryConfiguredLaneLaunchesOnItsConfiguredModel(t *testing.T) {
 	for _, lane := range cfg.Lanes {
 		lane := lane
 		t.Run(lane.Name, func(t *testing.T) {
+			harness := strings.ToLower(strings.TrimSpace(lane.Harness))
+			if !supportedHarnesses[harness] || strings.ToLower(strings.TrimSpace(lane.AgentKind)) != harness {
+				t.Fatalf("roster lane must use one matching supported vendor harness, got agent_kind=%q harness=%q", lane.AgentKind, lane.Harness)
+			}
 			t.Setenv("HERDR_ROUTE_STATE_DIR", t.TempDir())
 			r := router.NewRouter(usage.NewQuotaEngine(), healthy)
 			r.Probes = &router.Probes{

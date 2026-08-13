@@ -36,7 +36,7 @@ func testLaunchRouter(t *testing.T) *router.SurfaceRouter {
 }
 
 func TestWorkerConfigDriftRejectsBeforeLaunch(t *testing.T) {
-	lane := &config.LaneDef{Name: "mutant", Role: "worker", AgentKind: router.PiHarness, Harness: router.PiHarness, Provider: "codex", Model: "gpt-5.6-sol", Effort: "medium", TaskShape: "implementation"}
+	lane := &config.LaneDef{Name: "mutant", Role: "worker", AgentKind: "codex", Harness: "codex", Provider: "codex", Model: "gpt-5.6-sol", Effort: "medium", TaskShape: "implementation"}
 	err := validateLaneLaunchConfig(lane)
 	if !errors.Is(err, ErrWorkerConfigPolicy) {
 		t.Fatalf("drift must fail at worker policy boundary, got %v", err)
@@ -49,7 +49,7 @@ func TestWorkerConfigDriftRejectsBeforeLaunch(t *testing.T) {
 // because the role was simply absent and every shape was rejected. Now it
 // must fail on the shape mismatch, not on the role being unknown.
 func TestAssayerRoleRejectsWrongTaskShape(t *testing.T) {
-	lane := &config.LaneDef{Name: "ci-warden", Role: launch.AssayerRole, AgentKind: router.PiHarness, Harness: router.PiHarness, Provider: "claude", Model: "claude-sonnet-5", Effort: "medium", TaskShape: "implementation"}
+	lane := &config.LaneDef{Name: "ci-warden", Role: launch.AssayerRole, AgentKind: "claude", Harness: "claude", Provider: "claude", Model: "claude-sonnet-5", Effort: "medium", TaskShape: "implementation"}
 	err := validateLaneLaunchConfig(lane)
 	if !errors.Is(err, ErrWorkerConfigPolicy) {
 		t.Fatalf("assayer with wrong task_shape must fail at worker policy boundary, got %v", err)
@@ -78,7 +78,7 @@ func (r *fakeLaunchLifecycle) Run(decision *router.LaunchDecision, effect func(*
 }
 
 func TestLaunchAdmissionRejectsBeforeCompiledLifecycleSeams(t *testing.T) {
-	cfg := &config.Config{Lanes: []config.LaneDef{{Name: "mutant", Role: "worker", AgentKind: router.PiHarness, Harness: router.PiHarness, Provider: "codex", Model: "gpt-5.6-sol", Effort: "medium", TaskShape: "implementation"}}}
+	cfg := &config.Config{Lanes: []config.LaneDef{{Name: "mutant", Role: "worker", AgentKind: "codex", Harness: "codex", Provider: "codex", Model: "gpt-5.6-sol", Effort: "medium", TaskShape: "implementation"}}}
 	rec := &fakeLaunchLifecycle{}
 	valid, err := testLaunchRouter(t).Decide(router.LaunchRequest{Role: router.RoleWorker, Shape: launch.Implementation, RequestedProvider: testWorkerProvider, RequestedModel: testWorkerModel, RequestedEffort: testWorkerEffort, TaskRef: "worker", Scope: router.ScopeLane, ProbeResults: map[string]bool{router.ProbeKey(testWorkerProvider, testWorkerModel): true}})
 	if err != nil {
@@ -99,7 +99,7 @@ func TestLaunchAdmissionRejectsBeforeCompiledLifecycleSeams(t *testing.T) {
 }
 
 func TestLaunchAdmissionPassesExactDecisionToLifecycle(t *testing.T) {
-	lane := config.LaneDef{Name: "worker", Role: "worker", AgentKind: router.PiHarness, Harness: router.PiHarness, Provider: "codex", Model: "gpt-5.6-luna", Effort: "medium", TaskShape: "implementation"}
+	lane := config.LaneDef{Name: "worker", Role: "worker", AgentKind: "codex", Harness: "codex", Provider: "codex", Model: "gpt-5.6-luna", Effort: "medium", TaskShape: "implementation"}
 	cfg := &config.Config{Lanes: []config.LaneDef{lane}}
 	valid, err := testLaunchRouter(t).Decide(router.LaunchRequest{Role: router.RoleWorker, Shape: launch.Implementation, RequestedProvider: testWorkerProvider, RequestedModel: testWorkerModel, RequestedEffort: testWorkerEffort, TaskRef: "worker", Scope: router.ScopeLane, ProbeResults: map[string]bool{router.ProbeKey(testWorkerProvider, testWorkerModel): true}})
 	if err != nil {
@@ -118,7 +118,7 @@ func TestLaunchAdmissionPassesExactDecisionToLifecycle(t *testing.T) {
 }
 
 func TestLaunchAdmissionValidatesDecisionContextByScope(t *testing.T) {
-	lane := config.LaneDef{Name: "reviewer", Role: "reviewer", AgentKind: router.PiHarness, Harness: router.PiHarness, Provider: "codex", Model: "gpt-5.6-luna", Effort: "medium", TaskShape: "qa"}
+	lane := config.LaneDef{Name: "reviewer", Role: "reviewer", AgentKind: "codex", Harness: "codex", Provider: "codex", Model: "gpt-5.6-luna", Effort: "medium", TaskShape: "qa"}
 	cfg := &config.Config{Lanes: []config.LaneDef{lane}}
 	newDecision := func(t *testing.T, taskRef string) *router.LaunchDecision {
 		t.Helper()
@@ -186,7 +186,7 @@ func TestWorkerUnprobedFallbackRejectsBeforeAnySideEffect(t *testing.T) {
 	for _, role := range roles {
 		t.Run(role, func(t *testing.T) {
 			t.Setenv("HERDR_ROUTE_STATE_DIR", t.TempDir())
-			lane := config.LaneDef{Name: role, Role: role, AgentKind: router.PiHarness, Harness: router.PiHarness, Provider: launch.WorkerProvider, Model: launch.WorkerModel, Effort: launch.WorkerEffort, TaskShape: launch.Implementation}
+			lane := config.LaneDef{Name: role, Role: role, AgentKind: "codex", Harness: "codex", Provider: launch.WorkerProvider, Model: launch.WorkerModel, Effort: launch.WorkerEffort, TaskShape: launch.Implementation}
 			cfg := &config.Config{Lanes: []config.LaneDef{lane}}
 			r := router.NewRouter(usage.NewQuotaEngine(), map[string]usage.BurnState{
 				"codex": {
@@ -300,7 +300,7 @@ func TestPrepareStandingWorktreePropagatesFailure(t *testing.T) {
 }
 
 func TestStandingEntryPointReturnsPolicyFailureBeforeHerdr(t *testing.T) {
-	cfg := &config.Config{Lanes: []config.LaneDef{{Name: "bad-standing", Role: "worker", Standing: true, AgentKind: router.PiHarness, Harness: router.PiHarness, Provider: "codex", Model: "gpt-5.6-sol", Effort: "medium", TaskShape: "implementation"}}}
+	cfg := &config.Config{Lanes: []config.LaneDef{{Name: "bad-standing", Role: "worker", Standing: true, AgentKind: "codex", Harness: "codex", Provider: "codex", Model: "gpt-5.6-sol", Effort: "medium", TaskShape: "implementation"}}}
 	err := runStandingConfig(cfg, true)
 	if !errors.Is(err, ErrWorkerConfigPolicy) {
 		t.Fatalf("standing entrypoint must return worker policy failure: %v", err)
@@ -308,7 +308,7 @@ func TestStandingEntryPointReturnsPolicyFailureBeforeHerdr(t *testing.T) {
 }
 
 func TestForgeEntryPointReturnsPolicyFailureBeforeClaim(t *testing.T) {
-	cfg := &config.Config{Lanes: []config.LaneDef{{Name: "bad-forge", Role: "worker", AgentKind: router.PiHarness, Harness: router.PiHarness, Provider: "codex", Model: "gpt-5.6-sol", Effort: "medium", TaskShape: "implementation"}}}
+	cfg := &config.Config{Lanes: []config.LaneDef{{Name: "bad-forge", Role: "worker", AgentKind: "codex", Harness: "codex", Provider: "codex", Model: "gpt-5.6-sol", Effort: "medium", TaskShape: "implementation"}}}
 	claimed := false
 	_, err := forgeLaunchAdmission(cfg, &cfg.Lanes[0], context.Background(), func(*router.LaunchDecision) error {
 		claimed = true
@@ -322,43 +322,59 @@ func TestForgeEntryPointReturnsPolicyFailureBeforeClaim(t *testing.T) {
 	}
 }
 
-func TestNativeHarnessConfigRejectsBeforeLifecycle(t *testing.T) {
-	cfg := &config.Config{Lanes: []config.LaneDef{{Name: "native-mutant", Role: launch.WorkerRole, AgentKind: "codex", Harness: "codex", Provider: launch.WorkerProvider, Model: launch.WorkerModel, Effort: launch.WorkerEffort, TaskShape: launch.Implementation}}}
+func TestUnsupportedHarnessConfigRejectsBeforeLifecycle(t *testing.T) {
+	cfg := &config.Config{Lanes: []config.LaneDef{{Name: "pi-mutant", Role: launch.WorkerRole, AgentKind: router.PiHarness, Harness: router.PiHarness, Provider: launch.WorkerProvider, Model: launch.WorkerModel, Effort: launch.WorkerEffort, TaskShape: launch.Implementation}}}
 	valid, err := testLaunchRouter(t).Decide(router.LaunchRequest{Role: router.RoleWorker, Shape: launch.Implementation, RequestedProvider: launch.WorkerProvider, RequestedModel: launch.WorkerModel, RequestedEffort: launch.WorkerEffort, TaskRef: "worker", Scope: router.ScopeLane, ProbeResults: map[string]bool{router.ProbeKey(launch.WorkerProvider, launch.WorkerModel): true}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	rec := &fakeLaunchLifecycle{}
 	_, err = launchAdmissionWithLifecycle(rec, cfg, launch.WorkerRole, true, func(*config.LaneDef) (*router.LaunchDecision, error) { return valid, nil }, func(*router.LaunchDecision) error {
-		t.Fatal("native harness reached lifecycle")
+		t.Fatal("unsupported harness reached lifecycle")
 		return nil
 	})
 	if !errors.Is(err, ErrHarnessConfigPolicy) {
-		t.Fatalf("native harness error = %v", err)
+		t.Fatalf("unsupported harness error = %v", err)
 	}
 	if *rec != (fakeLaunchLifecycle{}) {
-		t.Fatalf("native harness caused lifecycle effects: %+v", rec)
+		t.Fatalf("unsupported harness caused lifecycle effects: %+v", rec)
 	}
 }
 
 func TestConfiguredRolePoliciesAreComplete(t *testing.T) {
 	cases := []config.LaneDef{
-		{Name: "worker", Role: "worker", AgentKind: router.PiHarness, Harness: router.PiHarness, Provider: "codex", Model: "gpt-5.6-luna", Effort: "medium", TaskShape: "implementation"},
-		{Name: "forge", Role: "forge-smith", AgentKind: router.PiHarness, Harness: router.PiHarness, Provider: "codex", Model: "gpt-5.6-luna", Effort: "medium", TaskShape: "implementation"},
-		{Name: "recovery-worker", Role: "recovery", AgentKind: router.PiHarness, Harness: router.PiHarness, Provider: "codex", Model: "gpt-5.6-luna", Effort: "medium", TaskShape: "implementation"},
-		{Name: "reviewer", Role: "reviewer", AgentKind: router.PiHarness, Harness: router.PiHarness, Provider: "claude", Model: "claude-sonnet-5", Effort: "medium", TaskShape: "qa"},
-		{Name: "assayer", Role: "assayer", AgentKind: router.PiHarness, Harness: router.PiHarness, Provider: "claude", Model: "claude-sonnet-5", Effort: "medium", TaskShape: "qa"},
-		{Name: "orchestrator", Role: "orchestrator", AgentKind: router.PiHarness, Harness: router.PiHarness, Provider: "claude", Model: "claude-opus-5", Effort: "medium", TaskShape: "coordinator"},
-		{Name: "scout-planner", Role: "scout-planner", AgentKind: router.PiHarness, Harness: router.PiHarness, Provider: "claude", Model: "claude-opus-5", Effort: "medium", TaskShape: "architecture"},
-		{Name: "verification", Role: "verification-gate", AgentKind: router.PiHarness, Harness: router.PiHarness, Provider: "opencode", Model: "opencode/kimi-k3", Effort: "medium", TaskShape: "bounded"},
-		{Name: "supervisor", Role: "review-supervisor", AgentKind: router.PiHarness, Harness: router.PiHarness, Provider: "claude", Model: "claude-sonnet-5", Effort: "medium", TaskShape: "coordinator"},
-		{Name: "harvest", Role: "harvest", AgentKind: router.PiHarness, Harness: router.PiHarness, Provider: "claude", Model: "claude-sonnet-5", Effort: "medium", TaskShape: "bounded"},
-		{Name: "sentinel", Role: "recovery-sentinel", AgentKind: router.PiHarness, Harness: router.PiHarness, Provider: "claude", Model: "claude-sonnet-5", Effort: "medium", TaskShape: "bounded"},
+		{Name: "worker", Role: "worker", AgentKind: "codex", Harness: "codex", Provider: "codex", Model: "gpt-5.6-luna", Effort: "medium", TaskShape: "implementation"},
+		{Name: "forge", Role: "forge-smith", AgentKind: "codex", Harness: "codex", Provider: "codex", Model: "gpt-5.6-luna", Effort: "medium", TaskShape: "implementation"},
+		{Name: "recovery-worker", Role: "recovery", AgentKind: "codex", Harness: "codex", Provider: "codex", Model: "gpt-5.6-luna", Effort: "medium", TaskShape: "implementation"},
+		{Name: "reviewer", Role: "reviewer", AgentKind: "claude", Harness: "claude", Provider: "claude", Model: "claude-sonnet-5", Effort: "medium", TaskShape: "qa"},
+		{Name: "assayer", Role: "assayer", AgentKind: "claude", Harness: "claude", Provider: "claude", Model: "claude-sonnet-5", Effort: "medium", TaskShape: "qa"},
+		{Name: "orchestrator", Role: "orchestrator", AgentKind: "claude", Harness: "claude", Provider: "claude", Model: "claude-opus-5", Effort: "medium", TaskShape: "coordinator"},
+		{Name: "scout-planner", Role: "scout-planner", AgentKind: "claude", Harness: "claude", Provider: "claude", Model: "claude-opus-5", Effort: "medium", TaskShape: "architecture"},
+		{Name: "verification", Role: "verification-gate", AgentKind: "opencode", Harness: "opencode", Provider: "opencode", Model: "opencode/kimi-k3", Effort: "medium", TaskShape: "bounded"},
+		{Name: "supervisor", Role: "review-supervisor", AgentKind: "claude", Harness: "claude", Provider: "claude", Model: "claude-sonnet-5", Effort: "medium", TaskShape: "coordinator"},
+		{Name: "harvest", Role: "harvest", AgentKind: "claude", Harness: "claude", Provider: "claude", Model: "claude-sonnet-5", Effort: "medium", TaskShape: "bounded"},
+		{Name: "sentinel", Role: "recovery-sentinel", AgentKind: "claude", Harness: "claude", Provider: "claude", Model: "claude-sonnet-5", Effort: "medium", TaskShape: "bounded"},
 	}
 	for _, lane := range cases {
 		if err := validateLaneLaunchConfig(&lane); err != nil {
 			t.Errorf("%s: %v", lane.Role, err)
 		}
+	}
+}
+
+func TestLaneLaunchConfigVendorHarnesses(t *testing.T) {
+	for _, harness := range []string{"codex", "claude", "grok", "agy", "opencode"} {
+		t.Run(harness, func(t *testing.T) {
+			lane := &config.LaneDef{Name: harness + "-reviewer", Role: launch.ReviewerRole, AgentKind: harness, Harness: harness, Provider: harness, Model: "test-model", Effort: "medium", TaskShape: "qa"}
+			if err := validateLaneLaunchConfig(lane); err != nil {
+				t.Fatalf("supported harness rejected: %v", err)
+			}
+		})
+	}
+
+	pi := &config.LaneDef{Name: "pi-reviewer", Role: launch.ReviewerRole, AgentKind: router.PiHarness, Harness: router.PiHarness, Provider: "codex", Model: "test-model", Effort: "medium", TaskShape: "qa"}
+	if err := validateLaneLaunchConfig(pi); !errors.Is(err, ErrHarnessConfigPolicy) {
+		t.Fatalf("Pi must fail closed as an unsupported harness: %v", err)
 	}
 }
 
@@ -377,7 +393,7 @@ func TestLaneLaunchDecisionProbesExactCodexProvider(t *testing.T) {
 	}
 	t.Setenv("PATH", dir)
 	t.Setenv("HERDR_ROUTE_STATE_DIR", t.TempDir())
-	lane := &config.LaneDef{Name: "smith", Role: launch.WorkerRole, AgentKind: router.PiHarness, Harness: router.PiHarness, Provider: launch.WorkerProvider, Model: launch.WorkerModel, Effort: launch.WorkerEffort, TaskShape: launch.Implementation}
+	lane := &config.LaneDef{Name: "smith", Role: launch.WorkerRole, AgentKind: "codex", Harness: "codex", Provider: launch.WorkerProvider, Model: launch.WorkerModel, Effort: launch.WorkerEffort, TaskShape: launch.Implementation}
 
 	decision, err := laneLaunchDecision(context.Background(), lane, nil)
 	if err != nil {
@@ -418,7 +434,7 @@ func TestLaneLaunchDecisionReportsConfiguredProbeFailure(t *testing.T) {
 	}
 	t.Setenv("PATH", dir)
 	t.Setenv("HERDR_ROUTE_STATE_DIR", t.TempDir())
-	lane := &config.LaneDef{Name: "smith", Role: launch.WorkerRole, AgentKind: router.PiHarness, Harness: router.PiHarness, Provider: launch.WorkerProvider, Model: launch.WorkerModel, Effort: launch.WorkerEffort, TaskShape: launch.Implementation}
+	lane := &config.LaneDef{Name: "smith", Role: launch.WorkerRole, AgentKind: "codex", Harness: "codex", Provider: launch.WorkerProvider, Model: launch.WorkerModel, Effort: launch.WorkerEffort, TaskShape: launch.Implementation}
 
 	_, err := laneLaunchDecision(context.Background(), lane, nil)
 	if err == nil {
@@ -441,13 +457,13 @@ func TestLaneLaunchDecisionReportsConfiguredProbeFailure(t *testing.T) {
 // TestLaneLaunchDecisionFailsOnMissingHarnessBinary proves the harness binary
 // is checked at config-eval time (before probing), producing an actionable
 // error naming the missing binary — not a confusing probe-exec failure.
-// The test sets PATH to an empty dir so pi is genuinely absent.
+// The test sets PATH to an empty dir so the configured Codex harness is absent.
 func TestLaneLaunchDecisionFailsOnMissingHarnessBinary(t *testing.T) {
 	emptyDir := t.TempDir()
 	t.Setenv("PATH", emptyDir)
 	t.Setenv("HERDR_ROUTE_STATE_DIR", t.TempDir())
 	lane := &config.LaneDef{
-		Name: "mender", Role: launch.WorkerRole, AgentKind: router.PiHarness, Harness: router.PiHarness,
+		Name: "mender", Role: launch.WorkerRole, AgentKind: "codex", Harness: "codex",
 		Provider: launch.WorkerProvider, Model: launch.WorkerModel, Effort: launch.WorkerEffort, TaskShape: launch.Implementation,
 	}
 	_, err := laneLaunchDecision(context.Background(), lane, nil)
@@ -455,7 +471,7 @@ func TestLaneLaunchDecisionFailsOnMissingHarnessBinary(t *testing.T) {
 		t.Fatalf("missing harness binary must fail with ErrHarnessBinaryMissing, got %v", err)
 	}
 	msg := err.Error()
-	for _, want := range []string{lane.Name, router.PiHarness, "not found in $PATH"} {
+	for _, want := range []string{lane.Name, "codex", "not found in $PATH"} {
 		if !strings.Contains(msg, want) {
 			t.Fatalf("error %q missing %q", msg, want)
 		}
@@ -463,19 +479,21 @@ func TestLaneLaunchDecisionFailsOnMissingHarnessBinary(t *testing.T) {
 }
 
 // TestLaneLaunchDecisionSucceedsWithHarnessBinary proves the check does not
-// false-positive when the binary IS present. A fake pi in PATH must allow the
-// route to proceed to the probe (which also uses the fake pi and returns
-// PROBE_OK).
+// false-positive when the configured binary IS present. The existing router
+// still probes through Pi, so both fakes are supplied without changing routing.
 func TestLaneLaunchDecisionSucceedsWithHarnessBinary(t *testing.T) {
 	dir := t.TempDir()
 	pi := "#!/bin/sh\necho PROBE_OK\n"
 	if err := os.WriteFile(filepath.Join(dir, "pi"), []byte(pi), 0o755); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.WriteFile(filepath.Join(dir, "codex"), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
 	t.Setenv("PATH", dir)
 	t.Setenv("HERDR_ROUTE_STATE_DIR", t.TempDir())
 	lane := &config.LaneDef{
-		Name: "smith", Role: launch.WorkerRole, AgentKind: router.PiHarness, Harness: router.PiHarness,
+		Name: "smith", Role: launch.WorkerRole, AgentKind: "codex", Harness: "codex",
 		Provider: launch.WorkerProvider, Model: launch.WorkerModel, Effort: launch.WorkerEffort, TaskShape: launch.Implementation,
 	}
 	decision, err := laneLaunchDecision(context.Background(), lane, nil)
