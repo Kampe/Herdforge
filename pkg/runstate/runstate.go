@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/Kampe/Herdforge/pkg/provider"
+	"github.com/Kampe/Herdforge/pkg/residual"
 	_ "modernc.org/sqlite"
 )
 
@@ -38,12 +39,13 @@ type Policy struct {
 // TaskState is a provider identity plus the exact revision observed at a run
 // boundary. Terminal is monotonic: a checkpoint may never turn it back off.
 type TaskState struct {
-	Ref              string   `json:"ref"`
-	ID               string   `json:"id"`
-	ProviderRevision string   `json:"provider_revision"`
-	Status           string   `json:"status"`
-	Terminal         bool     `json:"terminal"`
-	DependsOn        []string `json:"depends_on,omitempty"`
+	Ref              string            `json:"ref"`
+	ID               string            `json:"id"`
+	ProviderRevision string            `json:"provider_revision"`
+	Status           string            `json:"status"`
+	Terminal         bool              `json:"terminal"`
+	DependsOn        []string          `json:"depends_on,omitempty"`
+	Residuals        []residual.Record `json:"residuals,omitempty"`
 }
 
 // BuildRun is the immutable scheduling snapshot plus mutable per-task states.
@@ -222,7 +224,7 @@ func FromTasks(id, goal, ref, graph string, policy Policy, wave, level int, task
 		if t == nil {
 			return RunState{}, fmt.Errorf("%w: nil task", ErrAmbiguous)
 		}
-		r.Tasks = append(r.Tasks, TaskState{Ref: t.Ref, ID: t.ID, ProviderRevision: string(provider.EncodeRevision(t)), Status: provider.NormalizeStatus(t.Status), Terminal: terminal(t.Status)})
+		r.Tasks = append(r.Tasks, TaskState{Ref: t.Ref, ID: t.ID, ProviderRevision: string(provider.EncodeRevision(t)), Status: provider.NormalizeStatus(t.Status), Terminal: terminal(t.Status), Residuals: append([]residual.Record(nil), t.Residuals...)})
 	}
 	if err := validate(&r.BuildRun); err != nil {
 		return RunState{}, err
@@ -268,6 +270,14 @@ func validate(r *BuildRun) error {
 		seenRefs[t.Ref] = true
 		if t.Terminal != terminal(t.Status) {
 			return fmt.Errorf("%w: terminal flag mismatch for %s", ErrAmbiguous, t.Ref)
+		}
+		for _, residual := range t.Residuals {
+			if err := residual.Validate(); err != nil {
+				return fmt.Errorf("%w: residual for %s: %v", ErrAmbiguous, t.Ref, err)
+			}
+			if residual.TaskID != t.ID || residual.TaskRef != t.Ref || residual.AcceptanceRevision != t.ProviderRevision {
+				return fmt.Errorf("%w: residual binding mismatch for %s", ErrAmbiguous, t.Ref)
+			}
 		}
 	}
 	byID := make(map[string]bool, len(r.Tasks))

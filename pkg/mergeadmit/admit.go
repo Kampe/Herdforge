@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/Kampe/Herdforge/pkg/preflight"
+	"github.com/Kampe/Herdforge/pkg/residual"
 	"github.com/Kampe/Herdforge/pkg/reviewledger"
 )
 
@@ -27,6 +28,7 @@ const (
 	CodeLedgerRefused   = "ledger_refused"
 	CodeProofFailed     = "integration_proof_failed"
 	CodeReceiptReadback = "receipt_readback_failed"
+	CodeResidual        = "residual_linkage_missing"
 )
 
 // ErrRestartAdmission marks the class of refusal where nothing is wrong with
@@ -67,6 +69,9 @@ type Request struct {
 	// Mode is how the merge will be published, which selects the proof that
 	// Complete will later demand.
 	Mode Mode
+	// Residuals are exact board-revision context. Admission requires linked
+	// provider readback and refuses any still-required acceptance criterion.
+	Residuals []residual.Record
 }
 
 // Decision is the structured admission outcome. Callers gate SOLELY on
@@ -160,6 +165,9 @@ func (g *Gate) refuse(req Request, code, format string, a ...any) (*Decision, er
 func (g *Gate) Admit(req Request) (*Decision, error) {
 	if g == nil {
 		return nil, fmt.Errorf("herd-merge-admission: no gate configured")
+	}
+	if err := residual.ValidateExit(req.Residuals, req.ProviderRevision); err != nil {
+		return g.refuse(req, CodeResidual, "residual gate refused merge: %v", err)
 	}
 	for _, f := range []struct{ name, val string }{
 		{"ref", req.Ref},
