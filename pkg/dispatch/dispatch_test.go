@@ -15,6 +15,7 @@ import (
 	"github.com/Kampe/Herdforge/pkg/config"
 	"github.com/Kampe/Herdforge/pkg/deps"
 	"github.com/Kampe/Herdforge/pkg/provider"
+	"github.com/Kampe/Herdforge/pkg/recovery"
 	"github.com/Kampe/Herdforge/pkg/runstate"
 	"github.com/Kampe/Herdforge/pkg/scopefence"
 	"github.com/Kampe/Herdforge/pkg/worktree"
@@ -293,6 +294,39 @@ func TestProductionDispatchMissingEnvironmentPlanFailsBeforeWorktree(t *testing.
 	}
 	if mw.calls != 0 {
 		t.Fatalf("missing environment plan crossed worktree boundary: calls=%d", mw.calls)
+	}
+}
+
+func TestDispatchRecoveryAttemptBudgetBlocksBeforeWorktree(t *testing.T) {
+	task := &provider.Task{ID: "recovery-id", Ref: "FAC-236", Status: provider.StatusToDo, Description: emptyDepsFence("FAC-236", "recovery-id")}
+	states, err := runstate.Open(filepath.Join(t.TempDir(), "runs.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = states.Close() })
+	recoveries, err := recovery.Open(filepath.Join(t.TempDir(), "recovery.json"), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mw := &mockWorktree{err: fmt.Errorf("recovery budget must block before worktree")}
+	d := withTestLease(t, &Dispatcher{
+		Production:   true,
+		Config:       &config.Config{TaskProvider: config.TaskProvider{Type: "memory", ProjectID: "test"}, Lanes: []config.LaneDef{{Name: "worker", Role: "worker"}}},
+		TaskProvider: &mockTaskProvider{tasks: []*provider.Task{task}}, Worktree: mw,
+		Compensator: &recordingCompensator{}, ScopeFence: &recordingScopeAdmission{decision: scopefence.Decision{Granted: true}},
+		RunStates: states, RunStateGraph: func(context.Context) (string, error) { return "graph-fac-236", nil }, Recovery: recoveries,
+	})
+	opts := DispatchOptions{TicketRef: task.Ref, NoLaunch: true, LeaseID: "claim:1", LeaseGeneration: 1}
+	_, firstErr := d.Dispatch(context.Background(), opts)
+	if firstErr == nil || !strings.Contains(firstErr.Error(), "environment plan store is required") {
+		t.Fatalf("first dispatch should stop after consuming its bounded attempt: %v", firstErr)
+	}
+	_, secondErr := d.Dispatch(context.Background(), opts)
+	if !errors.Is(secondErr, recovery.ErrMaxAttempts) {
+		t.Fatalf("restart-equivalent dispatch error=%v", secondErr)
+	}
+	if mw.calls != 0 {
+		t.Fatalf("recovery budget crossed worktree boundary: calls=%d", mw.calls)
 	}
 }
 

@@ -9,16 +9,23 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+
+	"github.com/Kampe/Herdforge/pkg/runstate"
 )
 
 type Disposition string
 
 const (
-	Retry    Disposition = "retry"
-	Replan   Disposition = "replan"
-	Skip     Disposition = "skip"
-	Escalate Disposition = "escalate"
-	Abandon  Disposition = "abandon"
+	RetrySameEvidence Disposition = "retry_same_evidence"
+	RetryNewApproach  Disposition = "retry_new_approach"
+	Split             Disposition = "split"
+	Escalation        Disposition = "escalation"
+	Abort             Disposition = "abort"
+	Retry                         = RetrySameEvidence
+	Replan                        = RetryNewApproach
+	Skip                          = Split
+	Escalate                      = Escalation
+	Abandon                       = Abort
 )
 
 var (
@@ -27,6 +34,8 @@ var (
 	ErrCycle       = errors.New("recovery: plan contains a cycle")
 	ErrOrphan      = errors.New("recovery: plan contains an orphan")
 	ErrMaxAttempts = errors.New("recovery: maximum attempts exceeded")
+	ErrStale       = errors.New("recovery: revision-bound evidence is stale")
+	ErrBlocked     = errors.New("recovery: disposition blocks dispatch")
 )
 
 type Decision struct {
@@ -35,6 +44,17 @@ type Decision struct {
 	Actor       string      `json:"actor"`
 	Evidence    string      `json:"evidence"`
 	Disposition Disposition `json:"disposition"`
+	Revision    int64       `json:"revision"`
+	Graph       string      `json:"graph"`
+}
+
+type Packet struct {
+	Run      string
+	Task     string
+	Actor    string
+	Evidence string
+	Revision int64
+	Graph    string
 }
 
 type Task struct {
@@ -44,7 +64,9 @@ type Task struct {
 }
 
 type Plan struct {
-	Tasks []Task `json:"tasks"`
+	Tasks    []Task `json:"tasks"`
+	Revision int64  `json:"revision"`
+	Graph    string `json:"graph"`
 }
 
 type state struct {
@@ -88,6 +110,16 @@ func Open(path string, maxAttempts ...int) (*Store, error) {
 	if x.s.Plans == nil {
 		x.s.Plans = map[string]Plan{}
 	}
+	for _, d := range x.s.Decisions {
+		if err := validateDecision(d); err != nil {
+			return nil, fmt.Errorf("recovery: malformed decision: %w", err)
+		}
+	}
+	for run, p := range x.s.Plans {
+		if err := validatePlan(p); err != nil {
+			return nil, fmt.Errorf("recovery: malformed plan %s: %w", run, err)
+		}
+	}
 	return x, nil
 }
 
@@ -112,17 +144,58 @@ func (s *Store) persist() error {
 
 func validDisposition(d Disposition) bool {
 	switch d {
-	case Retry, Replan, Skip, Escalate, Abandon:
+	case RetrySameEvidence, RetryNewApproach, Split, Escalation, Abort:
 		return true
 	}
 	return false
 }
 
 func validateDecision(d Decision) error {
-	if strings.TrimSpace(d.Run) == "" || strings.TrimSpace(d.Task) == "" || strings.TrimSpace(d.Actor) == "" || strings.TrimSpace(d.Evidence) == "" || !validDisposition(d.Disposition) {
+	if strings.TrimSpace(d.Run) == "" || strings.TrimSpace(d.Task) == "" || strings.TrimSpace(d.Actor) == "" || strings.TrimSpace(d.Evidence) == "" || d.Revision < 1 || strings.TrimSpace(d.Graph) == "" || !validDisposition(d.Disposition) {
 		return fmt.Errorf("%w: decision requires run, task, actor, evidence, and a known disposition", ErrInvalid)
 	}
 	return nil
+}
+
+func validatePacket(p Packet) error {
+	if strings.TrimSpace(p.Run) == "" || strings.TrimSpace(p.Task) == "" || strings.TrimSpace(p.Actor) == "" || strings.TrimSpace(p.Evidence) == "" || p.Revision < 1 || strings.TrimSpace(p.Graph) == "" {
+		return fmt.Errorf("%w: malformed or incomplete evidence packet", ErrInvalid)
+	}
+	return nil
+}
+
+func (s *Store) ValidatePacket(p Packet) error {
+	if s == nil {
+		return fmt.Errorf("%w: nil store", ErrInvalid)
+	}
+	if err := validatePacket(p); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var latest *Decision
+	for i := range s.s.Decisions {
+		if s.s.Decisions[i].Run == p.Run && s.s.Decisions[i].Task == p.Task {
+			latest = &s.s.Decisions[i]
+		}
+	}
+	if latest == nil {
+		return nil
+	}
+	if latest.Revision != p.Revision || latest.Graph != p.Graph || latest.Evidence != p.Evidence {
+		return ErrStale
+	}
+	if latest.Disposition == Escalation || latest.Disposition == Abort {
+		return fmt.Errorf("%w: %s", ErrBlocked, latest.Disposition)
+	}
+	return nil
+}
+
+func (s *Store) BeginAttempt(p Packet) (int, error) {
+	if err := s.ValidatePacket(p); err != nil {
+		return 0, err
+	}
+	return s.Attempt(p.Run, p.Task)
 }
 
 func (s *Store) Decide(d Decision) error {
@@ -267,6 +340,58 @@ func (s *Store) Replan(run string, p Plan) error {
 		return err
 	}
 	return nil
+}
+
+// ReplanBuildRun produces the next durable run revision while preserving every
+// terminal task exactly. The caller persists it with Checkpoint using the
+// current revision as the compare-and-swap value.
+func ReplanBuildRun(current runstate.RunState, p Plan) (runstate.RunState, error) {
+	if current.Revision < 1 || strings.TrimSpace(current.DependencyGraphRevision) == "" {
+		return runstate.RunState{}, fmt.Errorf("%w: incomplete run revision", ErrInvalid)
+	}
+	if p.Revision != current.Revision || p.Graph != current.DependencyGraphRevision {
+		return runstate.RunState{}, ErrStale
+	}
+	if err := validatePlan(p); err != nil {
+		return runstate.RunState{}, err
+	}
+	byID := make(map[string]Task, len(p.Tasks))
+	for _, task := range p.Tasks {
+		byID[task.ID] = task
+	}
+	next := current
+	next.Revision++
+	next.Tasks = make([]runstate.TaskState, 0, len(p.Tasks))
+	for _, old := range current.Tasks {
+		if !old.Terminal {
+			continue
+		}
+		task, ok := byID[old.ID]
+		if !ok || !task.Terminal {
+			return runstate.RunState{}, fmt.Errorf("%w: terminal task %s changed", ErrInvalid, old.ID)
+		}
+		next.Tasks = append(next.Tasks, old)
+	}
+	for _, task := range p.Tasks {
+		var old *runstate.TaskState
+		for i := range current.Tasks {
+			if current.Tasks[i].ID == task.ID {
+				old = &current.Tasks[i]
+				break
+			}
+		}
+		if old == nil {
+			next.Tasks = append(next.Tasks, runstate.TaskState{ID: task.ID, Ref: task.ID, ProviderRevision: fmt.Sprintf("replan:%d", current.Revision+1), Status: "to-do", DependsOn: append([]string(nil), task.Depends...)})
+		} else if !old.Terminal {
+			copy := *old
+			copy.DependsOn = append([]string(nil), task.Depends...)
+			next.Tasks = append(next.Tasks, copy)
+		}
+	}
+	if len(next.Tasks) == 0 {
+		return runstate.RunState{}, fmt.Errorf("%w: replan removed every task", ErrInvalid)
+	}
+	return next, nil
 }
 
 func (s *Store) Plan(run string) (Plan, error) {

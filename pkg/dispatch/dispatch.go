@@ -22,6 +22,7 @@ import (
 	"github.com/Kampe/Herdforge/pkg/launch"
 	"github.com/Kampe/Herdforge/pkg/preflight"
 	"github.com/Kampe/Herdforge/pkg/provider"
+	"github.com/Kampe/Herdforge/pkg/recovery"
 	"github.com/Kampe/Herdforge/pkg/router"
 	"github.com/Kampe/Herdforge/pkg/runstate"
 	"github.com/Kampe/Herdforge/pkg/scopefence"
@@ -368,6 +369,8 @@ type Dispatcher struct {
 	// stale, or ambiguous saved state therefore cannot enter redispatch.
 	RunStates     *runstate.Store
 	RunStateGraph runstate.GraphAuthority
+	Recovery      *recovery.Store
+	RecoveryActor string
 	// EnvironmentPlans is the FAC-241 durable capability authority. It is
 	// consulted before scope, worktree, board, harness, or credential effects.
 	EnvironmentPlans *envplan.Store
@@ -1120,6 +1123,16 @@ func (d *Dispatcher) admitRunState(ctx context.Context, task *provider.Task) (*r
 	}
 	if err := state.Dispatchable(task.Ref); err != nil {
 		return nil, fmt.Errorf("dispatch runstate gate: %w", err)
+	}
+	if d.Recovery != nil {
+		actor := d.RecoveryActor
+		if strings.TrimSpace(actor) == "" {
+			actor = "dispatch"
+		}
+		packet := recovery.Packet{Run: id, Task: task.ID, Actor: actor, Evidence: task.Ref, Revision: state.Revision, Graph: state.DependencyGraphRevision}
+		if _, err := d.Recovery.BeginAttempt(packet); err != nil {
+			return nil, fmt.Errorf("dispatch recovery gate: %w", err)
+		}
 	}
 	return state, nil
 }
