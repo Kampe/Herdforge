@@ -612,16 +612,30 @@ func Validate(req Request, sink Sink) error {
 	if err := router.VerifyDecisionForScope(req.Decision, req.TaskRef, req.LeaseGeneration, req.Scope); err != nil {
 		return reject(req, sink, err.Error())
 	}
-	wantHarness, wantHarnessArgv, err := router.HarnessArgvFor(provider, model, effort)
-	if err != nil {
-		return reject(req, sink, "launch harness does not match routed provider/model/effort")
-	}
-	if req.Decision.HarnessSession != "" {
-		sessionPath := filepath.Clean(strings.TrimSpace(req.Decision.HarnessSession))
-		if sessionPath == "." || !filepath.IsAbs(sessionPath) {
-			return reject(req, sink, "launch harness session path is not absolute")
+	wantHarness := ""
+	var wantHarnessArgv []string
+	if router.IsVendorHarness(req.Decision.Harness) {
+		if normalized(req.Decision.Harness) != normalized(provider) || req.Decision.HarnessSession != "" {
+			return reject(req, sink, "launch vendor harness does not match routed provider or carries a session")
 		}
-		wantHarnessArgv = append(wantHarnessArgv, "--session", sessionPath)
+		wantHarness = normalized(provider)
+		wantHarnessArgv = router.ArgvFor(provider, model, effort)
+		if len(wantHarnessArgv) == 0 || normalized(wantHarnessArgv[0]) != wantHarness {
+			return reject(req, sink, "launch vendor harness does not match routed provider/model/effort")
+		}
+	} else {
+		var err error
+		wantHarness, wantHarnessArgv, err = router.HarnessArgvFor(provider, model, effort)
+		if err != nil {
+			return reject(req, sink, "launch harness does not match routed provider/model/effort")
+		}
+		if req.Decision.HarnessSession != "" {
+			sessionPath := filepath.Clean(strings.TrimSpace(req.Decision.HarnessSession))
+			if sessionPath == "." || !filepath.IsAbs(sessionPath) {
+				return reject(req, sink, "launch harness session path is not absolute")
+			}
+			wantHarnessArgv = append(wantHarnessArgv, "--session", sessionPath)
+		}
 	}
 	if normalized(req.Decision.Harness) != normalized(wantHarness) || !equalStrings(req.Decision.HarnessArgv, wantHarnessArgv) {
 		return reject(req, sink, "launch harness does not match routed provider/model/effort/session")

@@ -142,7 +142,7 @@ func TestProductionConfinementRequiresHarness(t *testing.T) {
 	}
 }
 
-func TestProductionConfinementRejectsNonPiHarness(t *testing.T) {
+func TestProductionConfinementAcceptsVendorHarness(t *testing.T) {
 	shared := t.TempDir()
 	issuer, _ := confinement.NewHMACIssuer([]byte("s"))
 	d := &Dispatcher{
@@ -154,11 +154,15 @@ func TestProductionConfinementRejectsNonPiHarness(t *testing.T) {
 		TaskRef: "FAC-190", LeaseGeneration: 1,
 		Decision: &router.LaunchDecision{
 			Provider: "codex", Harness: "codex", Model: "m", Effort: "medium",
-			Argv: []string{"codex"},
+			Argv: []string{"codex"}, HarnessArgv: []string{"codex"},
 		},
 	}
-	if _, _, err := d.prepareConfinementOS(req, &worktree.WorktreeInfo{Path: filepath.Join(shared, "wt")}); err == nil {
-		t.Fatal("non-pi harness accepted")
+	_, prep, err := d.prepareConfinementOS(req, &worktree.WorktreeInfo{Path: filepath.Join(shared, "wt")})
+	if err != nil {
+		t.Fatalf("configured vendor harness rejected: %v", err)
+	}
+	if prep == nil || !prep.WrapperResolves("codex") {
+		t.Fatalf("configured vendor harness wrapper missing: %+v", prep)
 	}
 }
 

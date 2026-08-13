@@ -16,8 +16,7 @@ import (
 	"github.com/Kampe/Herdforge/pkg/usage"
 )
 
-// Authorized fixed builder logical tuple for launch-policy tests.
-// Pi is the actual harness; these are the logical provider/model/effort pins.
+// Authorized fixed builder tuple for launch-policy tests.
 const (
 	testWorkerProvider = "codex"
 	testWorkerModel    = "gpt-5.6-luna"
@@ -378,46 +377,30 @@ func TestLaneLaunchConfigVendorHarnesses(t *testing.T) {
 	}
 }
 
-func TestLaneLaunchDecisionProbesExactCodexProvider(t *testing.T) {
+func TestLaneLaunchDecisionBindsConfiguredCodexHarnessWithoutPi(t *testing.T) {
 	dir := t.TempDir()
-	argsPath := filepath.Join(dir, "pi.args")
-	codexMarker := filepath.Join(dir, "codex.called")
-	opencodeMarker := filepath.Join(dir, "opencode.called")
-	pi := "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"" + argsPath + "\"\necho PROBE_OK\n"
-	codex := "#!/bin/sh\necho called > \"" + codexMarker + "\"\nexit 91\n"
-	opencode := "#!/bin/sh\necho called > \"" + opencodeMarker + "\"\nexit 91\n"
-	for name, body := range map[string]string{"pi": pi, "codex": codex, "opencode": opencode} {
-		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o755); err != nil {
-			t.Fatal(err)
-		}
+	if err := os.WriteFile(filepath.Join(dir, "codex"), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
 	}
 	t.Setenv("PATH", dir)
 	t.Setenv("HERDR_ROUTE_STATE_DIR", t.TempDir())
 	lane := &config.LaneDef{Name: "smith", Role: launch.WorkerRole, AgentKind: "codex", Harness: "codex", Provider: launch.WorkerProvider, Model: launch.WorkerModel, Effort: launch.WorkerEffort, TaskShape: launch.Implementation}
 
-	decision, err := laneLaunchDecision(context.Background(), lane, nil)
+	decision, err := laneLaunchDecisionWithProbe(context.Background(), lane, nil, func(_ context.Context, _, model, _ string) herdr.ProbeResult {
+		return herdr.ProbeResult{Model: model, Available: true}
+	})
 	if err != nil {
 		t.Fatalf("configured Codex route rejected: %v", err)
 	}
-	if decision.Provider != launch.WorkerProvider || decision.Model != launch.WorkerModel || decision.Effort != launch.WorkerEffort || decision.Harness != router.PiHarness {
+	if decision.Provider != launch.WorkerProvider || decision.Model != launch.WorkerModel || decision.Effort != launch.WorkerEffort || decision.Harness != "codex" {
 		t.Fatalf("routed tuple drifted: %+v", decision)
 	}
-	wantHarnessArgv := []string{"pi", "--model", "openai-codex/gpt-5.6-luna", "--thinking", "medium"}
+	wantHarnessArgv := router.ArgvFor("codex", launch.WorkerModel, launch.WorkerEffort)
 	if strings.Join(decision.HarnessArgv, "\n") != strings.Join(wantHarnessArgv, "\n") {
 		t.Fatalf("harness argv = %q, want %q", decision.HarnessArgv, wantHarnessArgv)
 	}
-	raw, err := os.ReadFile(argsPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	wantProbeArgv := []string{"--no-session", "--no-approve", "--no-context-files", "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-tools", "--model", "openai-codex/gpt-5.6-luna", "--thinking", "medium", "-p", "Reply with exactly: PROBE_OK"}
-	if got, want := strings.TrimSuffix(string(raw), "\n"), strings.Join(wantProbeArgv, "\n"); got != want {
-		t.Fatalf("Pi probe argv = %q, want %q", got, want)
-	}
-	for name, marker := range map[string]string{"codex": codexMarker, "opencode": opencodeMarker} {
-		if _, err := os.Stat(marker); !os.IsNotExist(err) {
-			t.Fatalf("lane route invoked %s: %v", name, err)
-		}
+	if err := launch.Validate(launch.Request{Decision: decision, TaskRef: lane.Name, Scope: router.ScopeLane}, nil); err != nil {
+		t.Fatalf("direct Codex launch decision must validate: %v", err)
 	}
 }
 
@@ -479,14 +462,10 @@ func TestLaneLaunchDecisionFailsOnMissingHarnessBinary(t *testing.T) {
 }
 
 // TestLaneLaunchDecisionSucceedsWithHarnessBinary proves the check does not
-// false-positive when the configured binary IS present. The existing router
-// still probes through Pi, so both fakes are supplied without changing routing.
+// false-positive when the configured binary IS present. Its injected healthy
+// probe keeps this launch-surface test hermetic and independent of Pi.
 func TestLaneLaunchDecisionSucceedsWithHarnessBinary(t *testing.T) {
 	dir := t.TempDir()
-	pi := "#!/bin/sh\necho PROBE_OK\n"
-	if err := os.WriteFile(filepath.Join(dir, "pi"), []byte(pi), 0o755); err != nil {
-		t.Fatal(err)
-	}
 	if err := os.WriteFile(filepath.Join(dir, "codex"), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -496,11 +475,16 @@ func TestLaneLaunchDecisionSucceedsWithHarnessBinary(t *testing.T) {
 		Name: "smith", Role: launch.WorkerRole, AgentKind: "codex", Harness: "codex",
 		Provider: launch.WorkerProvider, Model: launch.WorkerModel, Effort: launch.WorkerEffort, TaskShape: launch.Implementation,
 	}
-	decision, err := laneLaunchDecision(context.Background(), lane, nil)
+	decision, err := laneLaunchDecisionWithProbe(context.Background(), lane, nil, func(_ context.Context, _, model, _ string) herdr.ProbeResult {
+		return herdr.ProbeResult{Model: model, Available: true}
+	})
 	if err != nil {
 		t.Fatalf("harness binary present must not block route: %v", err)
 	}
 	if decision == nil {
 		t.Fatal("expected a launch decision")
+	}
+	if decision.Harness != "codex" || len(decision.HarnessArgv) == 0 || decision.HarnessArgv[0] != "codex" {
+		t.Fatalf("decision must launch configured Codex harness: %+v", decision)
 	}
 }
