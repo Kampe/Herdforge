@@ -38,11 +38,12 @@ type Policy struct {
 // TaskState is a provider identity plus the exact revision observed at a run
 // boundary. Terminal is monotonic: a checkpoint may never turn it back off.
 type TaskState struct {
-	Ref              string `json:"ref"`
-	ID               string `json:"id"`
-	ProviderRevision string `json:"provider_revision"`
-	Status           string `json:"status"`
-	Terminal         bool   `json:"terminal"`
+	Ref              string   `json:"ref"`
+	ID               string   `json:"id"`
+	ProviderRevision string   `json:"provider_revision"`
+	Status           string   `json:"status"`
+	Terminal         bool     `json:"terminal"`
+	DependsOn        []string `json:"depends_on,omitempty"`
 }
 
 // BuildRun is the immutable scheduling snapshot plus mutable per-task states.
@@ -259,15 +260,56 @@ func validate(r *BuildRun) error {
 	if r == nil || r.SchemaVersion != SchemaVersion || strings.TrimSpace(r.ID) == "" || strings.TrimSpace(r.Goal) == "" || strings.TrimSpace(r.Ref) == "" || strings.TrimSpace(r.DependencyGraphRevision) == "" || strings.TrimSpace(r.Policy.Lane) == "" || strings.TrimSpace(r.Policy.Model) == "" || r.Wave < 0 || r.Level < 0 || len(r.Tasks) == 0 {
 		return fmt.Errorf("%w: incomplete build run", ErrAmbiguous)
 	}
-	seen := map[string]bool{}
+	seenRefs := map[string]bool{}
 	for _, t := range r.Tasks {
-		if t.Ref == "" || t.ID == "" || t.ProviderRevision == "" || t.Status == "" || seen[t.Ref] {
+		if t.Ref == "" || t.ID == "" || t.ProviderRevision == "" || t.Status == "" || seenRefs[t.Ref] {
 			return fmt.Errorf("%w: invalid or duplicate task", ErrAmbiguous)
 		}
-		seen[t.Ref] = true
+		seenRefs[t.Ref] = true
 		if t.Terminal != terminal(t.Status) {
 			return fmt.Errorf("%w: terminal flag mismatch for %s", ErrAmbiguous, t.Ref)
 		}
+	}
+	byID := make(map[string]bool, len(r.Tasks))
+	for _, t := range r.Tasks {
+		if byID[t.ID] {
+			return fmt.Errorf("%w: duplicate task id %s", ErrAmbiguous, t.ID)
+		}
+		byID[t.ID] = true
+	}
+	indeg := make(map[string]int, len(r.Tasks))
+	for _, t := range r.Tasks {
+		for _, dep := range t.DependsOn {
+			if !byID[dep] {
+				return fmt.Errorf("%w: orphan dependency %s for %s", ErrAmbiguous, dep, t.ID)
+			}
+			indeg[t.ID]++
+		}
+	}
+	queue := make([]string, 0)
+	for id := range byID {
+		if indeg[id] == 0 {
+			queue = append(queue, id)
+		}
+	}
+	count := 0
+	for len(queue) > 0 {
+		id := queue[0]
+		queue = queue[1:]
+		count++
+		for _, t := range r.Tasks {
+			for _, dep := range t.DependsOn {
+				if dep == id {
+					indeg[t.ID]--
+					if indeg[t.ID] == 0 {
+						queue = append(queue, t.ID)
+					}
+				}
+			}
+		}
+	}
+	if count != len(r.Tasks) {
+		return fmt.Errorf("%w: dependency cycle", ErrAmbiguous)
 	}
 	sort.Slice(r.Tasks, func(i, j int) bool { return r.Tasks[i].Ref < r.Tasks[j].Ref })
 	return nil
