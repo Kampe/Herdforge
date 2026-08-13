@@ -57,6 +57,7 @@ import (
 	"github.com/Kampe/Herdforge/pkg/reviewingest"
 	"github.com/Kampe/Herdforge/pkg/reviewledger"
 	"github.com/Kampe/Herdforge/pkg/router"
+	"github.com/Kampe/Herdforge/pkg/runstate"
 	"github.com/Kampe/Herdforge/pkg/scopeauth"
 	"github.com/Kampe/Herdforge/pkg/scopefence"
 	"github.com/Kampe/Herdforge/pkg/security"
@@ -3684,6 +3685,18 @@ func dispatchTicketDecision(ctx context.Context, req dispatchRequest, announce i
 	expectedRevision, expectedFiles := publishedGraphBinding(".")
 	d := dispatch.NewProductionDispatcherWithAuthorities(cfg, tp, wm,
 		scopeVerifier, scopeVerifier, expectedRevision, expectedFiles)
+	runStates, err := runstate.Open(filepath.Join(".herd", "dispatch-runs.db"))
+	if err != nil {
+		return nil, nil, fmt.Errorf("dispatch runstate store: %w", err)
+	}
+	defer runStates.Close()
+	d.RunStates = runStates
+	d.RunStateGraph = func(context.Context) (string, error) {
+		if strings.TrimSpace(expectedRevision) == "" {
+			return "", errors.New("published dependency graph revision is empty")
+		}
+		return expectedRevision, nil
+	}
 	// FAC-147: production board mutations go through ClaimStack Begin/Complete.
 	stack, stackErr := loadClaimStack(tp)
 	if stackErr != nil {

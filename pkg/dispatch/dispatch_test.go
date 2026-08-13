@@ -3,6 +3,7 @@ package dispatch
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -14,6 +15,7 @@ import (
 	"github.com/Kampe/Herdforge/pkg/config"
 	"github.com/Kampe/Herdforge/pkg/deps"
 	"github.com/Kampe/Herdforge/pkg/provider"
+	"github.com/Kampe/Herdforge/pkg/runstate"
 	"github.com/Kampe/Herdforge/pkg/scopefence"
 	"github.com/Kampe/Herdforge/pkg/worktree"
 )
@@ -187,6 +189,46 @@ func TestFindTicket(t *testing.T) {
 	// Non-existent ticket must not touch worktree service.
 	if mw.calls != 1 {
 		t.Fatalf("missing ticket must not create worktree; calls=%d", mw.calls)
+	}
+}
+
+// TestDispatchRunStateGateBlocksTerminalTaskBeforeMutations exercises the
+// production Dispatcher path, including durable checkpoint/load/resume, rather
+// than only RunState.Dispatchable in isolation. The worktree assertion is the
+// non-vacuous mutation boundary: it would be one on the pre-gate dispatcher.
+func TestDispatchRunStateGateBlocksTerminalTaskBeforeMutations(t *testing.T) {
+	terminal := &provider.Task{ID: "terminal-id", Ref: "FAC-235", Status: provider.StatusDone, Description: emptyDepsFence("FAC-235", "terminal-id")}
+	tp := &mockTaskProvider{tasks: []*provider.Task{terminal}}
+	mw := &mockWorktree{err: fmt.Errorf("terminal task must never create a worktree")}
+	states, err := runstate.Open(filepath.Join(t.TempDir(), "dispatch-runs.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = states.Close() })
+	d := withTestLease(t, &Dispatcher{
+		Production:    true,
+		Config:        &config.Config{TaskProvider: config.TaskProvider{Type: "memory", ProjectID: "test"}, Lanes: []config.LaneDef{{Name: "worker", Role: "worker"}}},
+		TaskProvider:  tp,
+		Worktree:      mw,
+		Compensator:   &recordingCompensator{},
+		ScopeFence:    &recordingScopeAdmission{},
+		RunStates:     states,
+		RunStateGraph: func(context.Context) (string, error) { return "graph-fac-235", nil },
+	})
+
+	_, err = d.Dispatch(context.Background(), DispatchOptions{TicketRef: terminal.Ref, NoLaunch: true, LeaseID: "claim:1", LeaseGeneration: 1})
+	if !errors.Is(err, runstate.ErrTerminal) {
+		t.Fatalf("terminal redispatch error=%v, want ErrTerminal", err)
+	}
+	if mw.calls != 0 {
+		t.Fatalf("terminal run crossed worktree mutation boundary: calls=%d", mw.calls)
+	}
+	saved, err := states.Load(context.Background(), "dispatch:"+terminal.ID)
+	if err != nil {
+		t.Fatalf("durable terminal evidence missing: %v", err)
+	}
+	if len(saved.Tasks) != 1 || !saved.Tasks[0].Terminal || saved.Tasks[0].Ref != terminal.Ref {
+		t.Fatalf("durable terminal evidence=%+v", saved.Tasks)
 	}
 }
 
