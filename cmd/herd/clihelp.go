@@ -3,7 +3,6 @@ package main
 import (
 	"fmt"
 	"os"
-	"sort"
 	"strings"
 )
 
@@ -51,32 +50,33 @@ func markOperational(command string) {
 // Missing keys fall back to a generic line so the global help gate never
 // reaches operational parsers for unknown-but-routed names.
 var subcommandUsage = map[string]string{
-	"init":          "Usage: herd init [--full]\n  Scaffold .herd/ config (optionally full 3-lane forge).",
-	"clone":         "Usage: herd clone <repo-url> [target-dir]\n  Clone a repository and run herd init --full.",
-	"preflight":     "Usage: herd preflight\n  Workspace boundary and absolute-path leak scanner.",
-	"verify":        "Usage: herd verify [--build cmd] [--test cmd] [worktree]\n  Completion gate: real commits + build + tests.",
-	"selftest":      "Usage: herd selftest\n  Run self-test assertion suite against the active repository.",
-	"status":        "Usage: herd status\n  Show herd workspace / daemon status.",
-	"pulse":         "Usage: herd pulse [--act [--spawn]] [--json] [--quiet] [--reason TEXT]\n  Coordinator heartbeat: observe by default; --act applies bounded renewals/callbacks.",
-	"wind-down":     "Usage: herd wind-down <on|off|status> [flags]\n  Control durable fleet launch posture.",
-	"posture":       "Usage: herd posture <claude-only|no-claude|clear|status> [flags]\n  Durable provider-family execution policy.",
-	"hold":          "Usage: herd hold <task> on|off|status --lane <name> --owner <role> [flags]\n  Generation-fenced lane/task hold.",
-	"standing": "Usage: herd standing [--dry-run|--status|--shutdown] [--only id,...] [id ...]\n  Raise, report, or shut down declarative standing control roles (not ephemeral workers).",
-	"wave":     "Usage: herd wave [--standing|--up] [--json]\n  Pre-wave readiness report; optional standing raise after gates pass.",
-	"daemon":   "Usage: herd daemon [flags]\n  Run the orchestration daemon.",
-	"usage":         "Usage: herd usage\n  Show harness quota usage from OpenUsage CLI.",
-	"quota":         "Usage: herd quota [flags]\n  Quota inspection helpers.",
-	"review":        "Usage: herd review [ref] [--spawn]\n  Adversarial review pipeline for in-progress work.",
-	"review-ledger": "Usage: herd review-ledger [flags]\n  Append-only review ledger operations.",
-	"drain":         "Usage: herd drain [flags]\n  Drain control / review backlog.",
-	"approve":       "Usage: herd approve [flags]\n  Approve a reviewed candidate.",
+	"control-surface": "Usage: herd control-surface [--json]\n  Machine-readable discovery of public-agent operations only.",
+	"init":            "Usage: herd init [--full]\n  Scaffold .herd/ config (optionally full 3-lane forge).",
+	"clone":           "Usage: herd clone <repo-url> [target-dir]\n  Clone a repository and run herd init --full.",
+	"preflight":       "Usage: herd preflight\n  Workspace boundary and absolute-path leak scanner.",
+	"verify":          "Usage: herd verify [--build cmd] [--test cmd] [worktree]\n  Completion gate: real commits + build + tests.",
+	"selftest":        "Usage: herd selftest\n  Run self-test assertion suite against the active repository.",
+	"status":          "Usage: herd status\n  Show herd workspace / daemon status.",
+	"pulse":           "Usage: herd pulse [--act [--spawn]] [--json] [--quiet] [--reason TEXT]\n  Coordinator heartbeat: observe by default; --act applies bounded renewals/callbacks.",
+	"wind-down":       "Usage: herd wind-down <on|off|status> [flags]\n  Control durable fleet launch posture.",
+	"posture":         "Usage: herd posture <claude-only|no-claude|clear|status> [flags]\n  Durable provider-family execution policy.",
+	"hold":            "Usage: herd hold <task> on|off|status --lane <name> --owner <role> [flags]\n  Generation-fenced lane/task hold.",
+	"standing":        "Usage: herd standing [--dry-run|--status|--shutdown] [--only id,...] [id ...]\n  Raise, report, or shut down declarative standing control roles (not ephemeral workers).",
+	"wave":            "Usage: herd wave [--standing|--up] [--json]\n  Pre-wave readiness report; optional standing raise after gates pass.",
+	"daemon":          "Usage: herd daemon [flags]\n  Run the orchestration daemon.",
+	"usage":           "Usage: herd usage\n  Show harness quota usage from OpenUsage CLI.",
+	"quota":           "Usage: herd quota [flags]\n  Quota inspection helpers.",
+	"review":          "Usage: herd review [ref] [--spawn]\n  Adversarial review pipeline for in-progress work.",
+	"review-ledger":   "Usage: herd review-ledger [flags]\n  Append-only review ledger operations.",
+	"drain":           "Usage: herd drain [flags]\n  Drain control / review backlog.",
+	"approve":         "Usage: herd approve [flags]\n  Approve a reviewed candidate.",
 	"board-done": "Usage: herd board-done <ref> [--receipt <path>] [--override-policy <p> --override-actor <who> --override-reason <why> --override-evidence <what>]\n" +
 		"  Close a card from its task-bound completion receipt, or by an attributable manual override.",
 	"board-audit": "Usage: herd board-audit [--json]\n  Report Done cards no completion receipt closed. Read-only; never mutates the board.",
-	"board-sync":    "Usage: herd board-sync [flags]\n  Reconcile board status against git reality and live lanes (report only).\n  --fix: advance to-do cards to in-progress when a live lane or branch proves work is in flight.",
-	"sh":            "Usage: herd sh\n  Interactive REPL shell (alias: herd repl).",
-	"repl":          "Usage: herd repl\n  Interactive REPL shell (alias: herd sh).",
-	"send":          "Usage: herd send <pane|name> \"<text>\" [--file path] [--no-verify] [--timeout s]\n  Deliver a prompt and verify consumption. Prefer herdr-deliver for durable digests.",
+	"board-sync":  "Usage: herd board-sync [flags]\n  Reconcile board status against git reality and live lanes (report only).\n  --fix: advance to-do cards to in-progress when a live lane or branch proves work is in flight.",
+	"sh":          "Usage: herd sh\n  Interactive REPL shell (alias: herd repl).",
+	"repl":        "Usage: herd repl\n  Interactive REPL shell (alias: herd sh).",
+	"send":        "Usage: herd send <pane|name> \"<text>\" [--file path] [--no-verify] [--timeout s]\n  Deliver a prompt and verify consumption. Prefer herdr-deliver for durable digests.",
 	"herdr-deliver": `Usage: herd herdr-deliver --key <op> --generation <n> --target <name> [--session <id>] [--file path] [--wait] [--timeout s] [--state path]
   Durably deliver exact prompt bytes from stdin or --file to one Herdr session.
   Positional free-form text is rejected (FAC-183 shell-literal incident class).`,
@@ -179,17 +179,6 @@ Commands:
 		"        --max-attempts 1 --disposition stop-on-first-failure -- go test ./pkg/x\n" +
 		"    herd command run --id C1 --lane worker-a --session S -- go test ./pkg/x\n" +
 		"    herd command receipts --id C1 [--json]",
-}
-
-// knownSubcommands is the deterministic set of routed herd subcommands.
-// Used by the global help gate and table-driven help tests.
-func knownSubcommands() []string {
-	names := make([]string, 0, len(subcommandUsage))
-	for name := range subcommandUsage {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-	return names
 }
 
 func usageFor(command string) string {

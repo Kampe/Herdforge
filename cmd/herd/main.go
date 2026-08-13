@@ -96,7 +96,18 @@ func main() {
 	// payloads or any provider/Herdr/git/outbox/claim/worktree side effect.
 	// Literal payloads equal to --help require `--` or an explicit flag
 	// (see parseTicketRef / dispatch --ticket=).
-	if _, known := subcommandUsage[command]; known {
+	if _, known := commandContractFor(command); known {
+		// This is an argument-only gate. It rejects unavailable discovery
+		// requests before manifest validation, filesystem reads, or any
+		// process-launching command handler can be reached.
+		if command == "control-surface" && !controlSurfaceArgsAllowed(os.Args[2:]) {
+			fmt.Fprintln(os.Stderr, "control-surface: only --json is supported")
+			os.Exit(2)
+		}
+		if err := validateControlSurfaceManifest(controlSurface()); err != nil {
+			fmt.Fprintf(os.Stderr, "herd: %v\n", err)
+			os.Exit(1)
+		}
 		if exitIfHelp(command, os.Args[2:]) {
 			return
 		}
@@ -105,6 +116,9 @@ func main() {
 	}
 
 	switch command {
+	case "control-surface":
+		runControlSurface()
+
 	case "init":
 		runInit()
 
