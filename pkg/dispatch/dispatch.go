@@ -1040,6 +1040,9 @@ func (d *Dispatcher) Dispatch(ctx context.Context, opts DispatchOptions) (*Dispa
 // or launcher). The task ID makes a durable record exact-bound across retries.
 func (d *Dispatcher) admitRunState(ctx context.Context, task *provider.Task) error {
 	if d.RunStates == nil {
+		if d.Production {
+			return errors.New("dispatch runstate: durable run-state store is required in production")
+		}
 		return nil
 	}
 	if task == nil || strings.TrimSpace(task.ID) == "" || strings.TrimSpace(task.Ref) == "" {
