@@ -82,16 +82,63 @@ func validCapability(c Capability) bool {
 }
 
 type Config struct {
-	Version      string        `yaml:"version"`
-	Project      ProjectConfig `yaml:"project"`
-	TaskProvider TaskProvider  `yaml:"task_provider"`
-	Fleet        FleetConfig   `yaml:"fleet,omitempty"`
-	Lanes        []LaneDef     `yaml:"lanes"`
-	Verification Verification  `yaml:"verification,omitempty"`
+	Version           string            `yaml:"version"`
+	Project           ProjectConfig     `yaml:"project"`
+	TaskProvider      TaskProvider      `yaml:"task_provider"`
+	Fleet             FleetConfig       `yaml:"fleet,omitempty"`
+	WorktreeBootstrap WorktreeBootstrap `yaml:"worktree_bootstrap,omitempty"`
+	Lanes             []LaneDef         `yaml:"lanes"`
+	Verification      Verification      `yaml:"verification,omitempty"`
 }
 
 type FleetConfig struct {
 	HerdrWorkspace string `yaml:"herdr_workspace,omitempty"`
+}
+
+// WorktreeBootstrap is a repository-declared, versioned setup contract for
+// task worktrees. It deliberately accepts argv, not shell text: bootstrap
+// declarations cannot inherit ambient shell expansion or profiles.
+//
+// The contract is optional for compatibility. Once declared, version,
+// toolchain, and command are all required and validated fail-closed.
+type WorktreeBootstrap struct {
+	Version   string   `yaml:"version,omitempty"`
+	Toolchain string   `yaml:"toolchain,omitempty"`
+	Command   []string `yaml:"command,omitempty"`
+}
+
+func (b WorktreeBootstrap) Enabled() bool {
+	return b.Version != "" || b.Toolchain != "" || len(b.Command) != 0
+}
+
+func (b WorktreeBootstrap) Validate() error {
+	if !b.Enabled() {
+		return nil
+	}
+	if b.Version != "v1" {
+		return fmt.Errorf("worktree_bootstrap.version: unsupported version %q", b.Version)
+	}
+	if strings.TrimSpace(b.Toolchain) == "" || filepath.IsAbs(b.Toolchain) || strings.ContainsAny(b.Toolchain, `/\\`) {
+		return fmt.Errorf("worktree_bootstrap.toolchain: must be a bare executable name")
+	}
+	if len(b.Command) == 0 {
+		return fmt.Errorf("worktree_bootstrap.command: is required")
+	}
+	for i, arg := range b.Command {
+		if strings.TrimSpace(arg) == "" {
+			return fmt.Errorf("worktree_bootstrap.command[%d]: must not be empty", i)
+		}
+		if filepath.IsAbs(arg) {
+			return fmt.Errorf("worktree_bootstrap.command[%d]: absolute paths are not allowed", i)
+		}
+		if i == 0 && strings.ContainsAny(arg, `/\\`) {
+			clean := filepath.Clean(arg)
+			if clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
+				return fmt.Errorf("worktree_bootstrap.command[0]: must remain within the worktree")
+			}
+		}
+	}
+	return nil
 }
 
 type ProjectConfig struct {
@@ -258,6 +305,9 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("missing required field: task_provider.project_id for linear")
 	}
 	if _, _, _, _, _, err := c.TaskProvider.Deadlines.Resolved(); err != nil {
+		return err
+	}
+	if err := c.WorktreeBootstrap.Validate(); err != nil {
 		return err
 	}
 	roles := make(map[string]bool, len(c.Lanes))

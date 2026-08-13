@@ -18,6 +18,7 @@ import (
 	"github.com/Kampe/Herdforge/pkg/runstate"
 	"github.com/Kampe/Herdforge/pkg/scopefence"
 	"github.com/Kampe/Herdforge/pkg/worktree"
+	"github.com/Kampe/Herdforge/pkg/worktreebootstrap"
 )
 
 // withTestLease injects a durable SQLite launch lease (temp path) so Dispatch
@@ -94,6 +95,18 @@ type mockWorktree struct {
 	err   error
 	calls int
 	refs  []string // task refs requested
+}
+
+type failingWorktreeBootstrap struct {
+	calls int
+	path  string
+	err   error
+}
+
+func (b *failingWorktreeBootstrap) Execute(_ context.Context, path string, _ config.WorktreeBootstrap) (*worktreebootstrap.Result, error) {
+	b.calls++
+	b.path = path
+	return nil, b.err
 }
 
 type recordingScopeAdmission struct {
@@ -608,6 +621,38 @@ func TestDispatch_PropagatesTaskContextIntoWorktree(t *testing.T) {
 	}
 	if mw.calls != 0 {
 		t.Errorf("fail-closed dispatch still created %d worktree(s)", mw.calls)
+	}
+}
+
+// TestDispatchBootstrapFailureBlocksAgentLaunch is non-vacuous: before the
+// FAC-245 boundary, this exact fixture reaches fakeHerdr.AgentStart. The
+// bootstrap failure must retain attributable recovery context, compensate the
+// owned dispatch, and prevent the first agent side effect.
+func TestDispatchBootstrapFailureBlocksAgentLaunch(t *testing.T) {
+	_, wm := initDispatchRepo(t)
+	tp := &statusTrackingProvider{mockTaskProvider: mockTaskProvider{tasks: []*provider.Task{baseTask("FAC-BOOT")}}}
+	cfg := testCfg()
+	cfg.WorktreeBootstrap = config.WorktreeBootstrap{Version: "v1", Toolchain: "go", Command: []string{"go", "mod", "download"}}
+	comp := &recordingCompensator{}
+	fh := &fakeHerdr{available: true, workspace: "bootstrap-test", model: "m"}
+	bootstrap := &failingWorktreeBootstrap{err: errors.New("module mirror unavailable")}
+	d := NewDispatcher(cfg, tp, wm)
+	d.Compensator = comp
+	d.Herdr = fh
+	d.Bootstrap = bootstrap
+
+	_, err := d.Dispatch(context.Background(), leasedLaunchOptions(t, "FAC-BOOT"))
+	if err == nil || !strings.Contains(err.Error(), "module mirror unavailable") || !strings.Contains(err.Error(), "recovery:") {
+		t.Fatalf("bootstrap failure must provide attributable recovery: %v", err)
+	}
+	if bootstrap.calls != 1 || bootstrap.path == "" {
+		t.Fatalf("bootstrap calls/path = %d/%q, want 1/admitted worktree", bootstrap.calls, bootstrap.path)
+	}
+	if fh.startCalls != 0 || fh.tabCwd != "" {
+		t.Fatalf("bootstrap failure crossed agent launch boundary: starts=%d tab=%q", fh.startCalls, fh.tabCwd)
+	}
+	if !hasCompensateReason(comp.compsCopy(), "worktree_bootstrap_failed") {
+		t.Fatalf("bootstrap failure was not retained for recovery: %v", comp.compsCopy())
 	}
 }
 
