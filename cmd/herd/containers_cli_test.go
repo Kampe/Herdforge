@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -58,6 +59,38 @@ func TestHerdContainersCLIHelp(t *testing.T) {
 	}
 	if !strings.Contains(string(out), "herd-containers") {
 		t.Errorf("expected herd-containers header, got:\n%s", out)
+	}
+}
+
+// TestHerdContainersNestedHelpPreservesHandler proves manifest admission does
+// not replace the container command's status or nested reconcile help with the
+// generic global fallback. Both handlers must exit before the help probe is
+// marked, which would fail on e8e7894b's global-help regression.
+func TestHerdContainersNestedHelpPreservesHandler(t *testing.T) {
+	binary := buildHerd(t)
+	for _, tc := range []struct {
+		name string
+		args []string
+		want string
+	}{
+		{name: "status", args: []string{"containers", "--help"}, want: "durable container lifecycle status"},
+		{name: "reconcile", args: []string{"containers", "reconcile", "--help"}, want: "coordinator recovery sweep"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			probe := filepath.Join(t.TempDir(), "probe")
+			cmd := exec.Command(binary, tc.args...)
+			cmd.Env = append(os.Environ(), helpProbeEnv+"="+probe)
+			out, err := cmd.CombinedOutput()
+			if err != nil {
+				t.Fatalf("herd %s failed: %v\n%s", strings.Join(tc.args, " "), err, out)
+			}
+			if !strings.Contains(string(out), tc.want) {
+				t.Fatalf("help did not preserve container handler text %q:\n%s", tc.want, out)
+			}
+			if data, err := os.ReadFile(probe); err == nil && strings.TrimSpace(string(data)) != "" {
+				t.Fatalf("container help entered operational code: %q", data)
+			}
+		})
 	}
 }
 

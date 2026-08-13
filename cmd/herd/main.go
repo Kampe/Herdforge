@@ -105,11 +105,18 @@ func main() {
 		fmt.Fprintf(os.Stderr, "herd: %v\n", err)
 		os.Exit(1)
 	}
-	if exitIfHelp(command, os.Args[2:]) {
+	// Containers owns both its top-level and reconcile help text. Let its
+	// nested dispatcher preserve that contract after manifest admission, while
+	// still keeping help before its receipt-store or Docker paths.
+	containersOwnsHelp := command == "containers"
+	if !containersOwnsHelp && exitIfHelp(command, os.Args[2:]) {
 		return
 	}
-	// Probe after the help gate so help tests observe zero entries.
-	markOperational(command)
+	// Containers performs its own help gate in runContainersStatus and
+	// runContainersReconcile; do not record an operational entry for either.
+	if !containersOwnsHelp || !argsWantHelp(os.Args[2:]) {
+		markOperational(command)
+	}
 
 	switch command {
 	case "control-surface":
