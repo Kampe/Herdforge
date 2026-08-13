@@ -22,6 +22,7 @@ import (
 	"github.com/Kampe/Herdforge/pkg/preflight"
 	"github.com/Kampe/Herdforge/pkg/provider"
 	"github.com/Kampe/Herdforge/pkg/router"
+	"github.com/Kampe/Herdforge/pkg/runstate"
 	"github.com/Kampe/Herdforge/pkg/scopefence"
 	"github.com/Kampe/Herdforge/pkg/security"
 	"github.com/Kampe/Herdforge/pkg/toolchild"
@@ -356,6 +357,13 @@ type Dispatcher struct {
 	// name "coordinator" (matching mail.CoordinatorInbox).
 	CoordinatorName string
 
+	// RunStates is the revision-bound resume authority for dispatch. When set,
+	// Dispatch checkpoints the first exact task observation, then always resumes
+	// it against live provider and graph evidence before any mutation. A terminal,
+	// stale, or ambiguous saved state therefore cannot enter redispatch.
+	RunStates     *runstate.Store
+	RunStateGraph runstate.GraphAuthority
+
 	// health projects BLOCKED(provider_timeout) for board calls (FAC-150).
 	health dispatchHealth
 }
@@ -665,6 +673,9 @@ func (d *Dispatcher) Dispatch(ctx context.Context, opts DispatchOptions) (*Dispa
 	}
 	if task == nil {
 		return nil, fmt.Errorf("ticket %s not found", opts.TicketRef)
+	}
+	if err := d.admitRunState(ctx, task); err != nil {
+		return nil, err
 	}
 
 	// FAC-133: provider title/description stay untrusted at the write-capable
@@ -1022,6 +1033,48 @@ func (d *Dispatcher) Dispatch(ctx context.Context, opts DispatchOptions) (*Dispa
 	// Success path: keep the generation lease for the live run (FAC-120/147).
 	// Release is on completion/recovery paths, not here.
 	return result, nil
+}
+
+// admitRunState is deliberately placed after the read-only task lookup and
+// before every dispatch mutation (scope publication, worktree, board, packet,
+// or launcher). The task ID makes a durable record exact-bound across retries.
+func (d *Dispatcher) admitRunState(ctx context.Context, task *provider.Task) error {
+	if d.RunStates == nil {
+		return nil
+	}
+	if task == nil || strings.TrimSpace(task.ID) == "" || strings.TrimSpace(task.Ref) == "" {
+		return fmt.Errorf("dispatch runstate: %w: incomplete task identity", runstate.ErrAmbiguous)
+	}
+	if d.RunStateGraph == nil {
+		return fmt.Errorf("dispatch runstate: %w: missing graph authority", runstate.ErrAmbiguous)
+	}
+	id := "dispatch:" + task.ID
+	authority := runstate.Authority{Tasks: d.TaskProvider, Graph: d.RunStateGraph}
+	state, err := d.RunStates.Resume(ctx, id, authority)
+	if errors.Is(err, runstate.ErrNotFound) {
+		graph, graphErr := d.RunStateGraph(ctx)
+		if graphErr != nil || strings.TrimSpace(graph) == "" {
+			if graphErr != nil {
+				return fmt.Errorf("dispatch runstate graph authority: %w", graphErr)
+			}
+			return fmt.Errorf("dispatch runstate: %w: empty graph revision", runstate.ErrAmbiguous)
+		}
+		next, buildErr := runstate.FromTasks(id, "dispatch", task.Ref, graph, runstate.Policy{Lane: "dispatch", Model: "dispatch"}, 0, 0, []*provider.Task{task})
+		if buildErr != nil {
+			return fmt.Errorf("dispatch runstate build: %w", buildErr)
+		}
+		if _, checkpointErr := d.RunStates.Checkpoint(ctx, next, 0); checkpointErr != nil {
+			return fmt.Errorf("dispatch runstate checkpoint: %w", checkpointErr)
+		}
+		state, err = d.RunStates.Resume(ctx, id, authority)
+	}
+	if err != nil {
+		return fmt.Errorf("dispatch runstate resume: %w", err)
+	}
+	if err := state.Dispatchable(task.Ref); err != nil {
+		return fmt.Errorf("dispatch runstate gate: %w", err)
+	}
+	return nil
 }
 
 // launchFailure is intent-only: launch never calls Compensator.Compensate.
