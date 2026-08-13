@@ -232,6 +232,32 @@ func TestDispatchRunStateGateBlocksTerminalTaskBeforeMutations(t *testing.T) {
 	}
 }
 
+// TestProductionDispatchMissingRunStateFailsBeforeWorktree proves the nil
+// store guard is a real mutation boundary. Before FAC-235's production guard,
+// this fixture reaches mockWorktree.CreateTaskWorktreeFrom and increments
+// calls, so the assertion fails against that regression.
+func TestProductionDispatchMissingRunStateFailsBeforeWorktree(t *testing.T) {
+	task := &provider.Task{ID: "missing-state-id", Ref: "FAC-235", Status: "to-do", Description: emptyDepsFence("FAC-235", "missing-state-id")}
+	repo, _ := initDispatchRepo(t)
+	mw := &mockWorktree{root: repo, err: fmt.Errorf("missing run-state store must not create a worktree")}
+	d := withTestLease(t, &Dispatcher{
+		Production:   true,
+		Config:       &config.Config{TaskProvider: config.TaskProvider{Type: "memory", ProjectID: "test"}, Lanes: []config.LaneDef{{Name: "worker", Role: "worker"}}},
+		TaskProvider: &mockTaskProvider{tasks: []*provider.Task{task}},
+		Worktree:     mw,
+		Compensator:  &recordingCompensator{},
+		ScopeFence:   &recordingScopeAdmission{decision: scopefence.Decision{Granted: true}},
+	})
+
+	_, err := d.Dispatch(context.Background(), DispatchOptions{TicketRef: task.Ref, NoLaunch: true, LeaseID: "claim:1", LeaseGeneration: 1})
+	if err == nil || !strings.Contains(err.Error(), "durable run-state store is required") {
+		t.Fatalf("missing production run-state store error=%v", err)
+	}
+	if mw.calls != 0 {
+		t.Fatalf("missing production run-state store crossed worktree boundary: calls=%d", mw.calls)
+	}
+}
+
 func TestDispatchRejectsMissingDecisionBeforeAnyProviderOrWorktreeMutation(t *testing.T) {
 	t.Setenv("HERD_LAUNCH_RECEIPTS", filepath.Join(t.TempDir(), "receipts.jsonl"))
 	tp := &mockTaskProvider{tasks: []*provider.Task{{ID: "1", Ref: "FAC-175"}}}
