@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/Kampe/Herdforge/pkg/outbox"
+	"github.com/Kampe/Herdforge/pkg/timeline"
 )
 
 func tempMachine(t *testing.T) *Machine {
@@ -42,6 +43,32 @@ func TestMachine_TransitionFromDraftToEligible(t *testing.T) {
 	}
 	if ts.State != StateEligible {
 		t.Errorf("expected eligible, got %s", ts.State)
+	}
+}
+
+func TestMachine_EmitsCommittedLifecycleObservationWithoutReplacingAuthority(t *testing.T) {
+	m := tempMachine(t)
+	sink, err := timeline.Open(filepath.Join(t.TempDir(), "timeline.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	binding := timeline.Binding{BuildRun: "run-1", Task: "FAC-1", Attempt: "1", Lane: "build", Session: "s-1", Model: "model", Provider: "provider"}
+	if err := m.AttachTimeline(sink, binding); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.Transition(TransitionRequest{TaskRef: "FAC-1", Repo: "herdforge", To: StateEligible, Actor: "worker", IdempotencyKey: "timeline-1"}); err != nil {
+		t.Fatal(err)
+	}
+	events, err := sink.Read(timeline.Filter{Task: "FAC-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 1 || events[0].Source != "lifecycle" || events[0].Type != "transition.eligible" {
+		t.Fatalf("timeline events = %+v", events)
+	}
+	state, err := m.EventStore().CurrentState("FAC-1")
+	if err != nil || state == nil || state.State != StateEligible {
+		t.Fatalf("lifecycle authority changed or missing: state=%+v err=%v", state, err)
 	}
 }
 
