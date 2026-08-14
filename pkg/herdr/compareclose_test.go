@@ -25,7 +25,6 @@ func fixtureRequest() CompareAndCloseRequest {
 		Nonce: "n1",
 	}
 }
-
 func fixtureLive() LiveTab {
 	req := fixtureRequest()
 	return LiveTab{
@@ -576,5 +575,13 @@ func TestFAC158_ReconciliationClosesOnlyViaCompareAndClose(t *testing.T) {
 	}
 	if !srv.IsClosed("t") {
 		t.Fatal("only CAS path should close")
+	}
+}
+
+func TestSystemClock_NowMS(t *testing.T) {
+	clock := SystemClock{}
+	ms := clock.NowMS()
+	if ms == 0 {
+		t.Fatal("expected positive timestamp in ms")
 	}
 }
