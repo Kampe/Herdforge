@@ -57,6 +57,7 @@ var (
 	processIsZombieFn = processIsZombie
 	pidfdOpenFn       = pidfdOpen
 	pidfdSendSignalFn = pidfdSendSignal
+	pidfdExitedFn     = pidfdExited
 	processSnapshotFn = snapshotProcesses
 )
 
