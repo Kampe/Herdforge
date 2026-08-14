@@ -56,8 +56,22 @@ func TestMachine_EmitsCommittedLifecycleObservationWithoutReplacingAuthority(t *
 	if err := m.AttachTimeline(sink, binding); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := m.Transition(TransitionRequest{TaskRef: "FAC-1", Repo: "herdforge", To: StateEligible, Actor: "worker", IdempotencyKey: "timeline-1"}); err != nil {
+	wrong := TransitionRequest{TaskRef: "FAC-2", Repo: "herdforge", To: StateEligible, Actor: "worker", IdempotencyKey: "timeline-wrong"}
+	if _, err := m.Transition(wrong); !errors.Is(err, ErrTimelineBindingTaskMismatch) {
+		t.Fatalf("cross-task transition error = %v, want binding mismatch", err)
+	}
+	if state, err := m.EventStore().CurrentState("FAC-2"); err != nil || state != nil {
+		t.Fatalf("cross-task transition mutated lifecycle: state=%+v err=%v", state, err)
+	}
+	if events, err := sink.Read(timeline.Filter{}); err != nil || len(events) != 0 {
+		t.Fatalf("cross-task transition emitted timeline event: events=%+v err=%v", events, err)
+	}
+	valid := TransitionRequest{TaskRef: "FAC-1", Repo: "herdforge", To: StateEligible, Actor: "worker", IdempotencyKey: "timeline-1"}
+	if _, err := m.Transition(valid); err != nil {
 		t.Fatal(err)
+	}
+	if replay, err := m.Transition(valid); err != nil || !replay.Replayed {
+		t.Fatalf("valid timeline-bound replay = %+v, %v", replay, err)
 	}
 	events, err := sink.Read(timeline.Filter{Task: "FAC-1"})
 	if err != nil {
