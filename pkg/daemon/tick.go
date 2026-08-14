@@ -16,6 +16,7 @@ import (
 	"github.com/Kampe/Herdforge/pkg/herdr"
 	"github.com/Kampe/Herdforge/pkg/launch"
 	"github.com/Kampe/Herdforge/pkg/lifecycle"
+	"github.com/Kampe/Herdforge/pkg/memory"
 	"github.com/Kampe/Herdforge/pkg/provider"
 	"github.com/Kampe/Herdforge/pkg/router"
 	"github.com/Kampe/Herdforge/pkg/worktree"
@@ -96,35 +97,42 @@ type TickOptions struct {
 	// for DeliverAndProve; production should still land TASK-PACKET.md via Dispatch
 	// or write it before prove. Tests inject fixed packets for digest proof.
 	Packet func(task *provider.Task, lane *config.LaneDef, worktreePath string) string
+	// ScopedMemory optionally injects reviewed/global or task-authorized memory
+	// into the default packet. Nil preserves the historic packet unchanged.
+	// The caller supplies the authenticated actor and durable run ID; the daemon
+	// supplies the claimed task ref, lane role, and live graph revision.
+	ScopedMemory      *memory.ScopedMemoryStore
+	ScopedMemoryActor memory.Actor
+	ScopedMemoryRunID string
 	// DefaultBranch is used for worktree create (default origin/main's branch name).
 	DefaultBranch string
 }
 
 // TickReceipt binds every identity of a successful claim-to-dispatch tick.
 type TickReceipt struct {
-	TaskRef           string
-	TaskID            string
-	LeaseGeneration   int64
-	GraphRevision     string
-	ProviderRevision  string
-	Repository        string
-	Lane              string
-	Worktree          string
-	Branch            string
-	TabID             string
-	PaneID            string
-	SessionID         string
-	AgentName         string
-	Model             string
-	Effort            string
-	Harness           string
-	Argv              []string
-	PacketDigest      string
-	PromptSequence    string
-	Launched          bool
-	ReusedStanding    bool
-	LifecycleState    lifecycle.State
-	OwnershipOwnerID  string
+	TaskRef          string
+	TaskID           string
+	LeaseGeneration  int64
+	GraphRevision    string
+	ProviderRevision string
+	Repository       string
+	Lane             string
+	Worktree         string
+	Branch           string
+	TabID            string
+	PaneID           string
+	SessionID        string
+	AgentName        string
+	Model            string
+	Effort           string
+	Harness          string
+	Argv             []string
+	PacketDigest     string
+	PromptSequence   string
+	Launched         bool
+	ReusedStanding   bool
+	LifecycleState   lifecycle.State
+	OwnershipOwnerID string
 }
 
 // RunDaemonTick is the FAC-196 claim-to-dispatch transaction for herd daemon.
@@ -307,7 +315,11 @@ func (e *Engine) launchAfterClaim(ctx context.Context, task *provider.Task, tok 
 	if opts.Packet != nil {
 		packet = opts.Packet(task, opts.Lane, wtPath)
 	} else {
-		packet = defaultDaemonPacket(task, opts.Lane, wtPath)
+		var packetErr error
+		packet, packetErr = daemonPacketWithMemory(task, opts.Lane, wtPath, tok.GraphRev, opts.ScopedMemory, opts.ScopedMemoryActor, opts.ScopedMemoryRunID)
+		if packetErr != nil {
+			return nil, packetErr
+		}
 	}
 	digest := packetDigest(packet)
 	req.PacketDigest = digest
@@ -547,6 +559,39 @@ func defaultDaemonPacket(task *provider.Task, lane *config.LaneDef, worktreePath
 	}
 	return fmt.Sprintf("Task [%s]: %s\nWorktree: %s\nLane: %s\nRead TASK-PACKET.md and execute the workflow.\n",
 		task.Ref, task.Title, worktreePath, laneName)
+}
+
+// daemonPacketWithMemory is the sole default packet construction path. It is
+// intentionally optional to preserve legacy daemon callers, and uses the
+// post-claim task/ref revision rather than untrusted caller-selected values.
+// A stale memory store is excluded (not promoted into a packet); other store
+// failures fail closed before a worker receives a partially-authorized packet.
+func daemonPacketWithMemory(task *provider.Task, lane *config.LaneDef, worktreePath, revision string, store *memory.ScopedMemoryStore, actor memory.Actor, runID string) (string, error) {
+	packet := defaultDaemonPacket(task, lane, worktreePath)
+	if store == nil {
+		return packet, nil
+	}
+	role := ""
+	if lane != nil {
+		role = lane.Name
+	}
+	entries, err := store.Inject(memory.ReadRequest{Actor: actor, RunID: runID, TaskID: task.Ref, Role: role, Revision: revision, ReadAt: time.Now().UTC()})
+	if errors.Is(err, memory.ErrStaleRevision) {
+		return packet + "Scoped memory excluded: stale revision.\n", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("daemon: inject scoped memory: %w", err)
+	}
+	if len(entries) == 0 {
+		return packet, nil
+	}
+	var b strings.Builder
+	b.WriteString(packet)
+	b.WriteString("Authorized scoped memory:\n")
+	for _, entry := range entries {
+		fmt.Fprintf(&b, "- [%s] %s\n", entry.ID, entry.Content)
+	}
+	return b.String(), nil
 }
 
 func packetDigest(packet string) string {
