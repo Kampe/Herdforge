@@ -814,10 +814,7 @@ func runPreflight() {
 	if fr, err := security.EvaluateFleetReadiness(); err != nil {
 		fmt.Fprintf(os.Stderr, "%s\n", security.FormatReadinessReport(fr))
 		fmt.Fprintf(os.Stderr, "FAC-133 readiness: BLOCKED (refresh with HERD_LIVE_HARNESS_PROOF=1 herd preflight)\n")
-		// Fail closed when control plane is configured — same gate as dispatch.
-		if strings.TrimSpace(os.Getenv("HERD_CONTROL_SECRET")) != "" {
-			os.Exit(1)
-		}
+		os.Exit(1)
 	} else {
 		fmt.Print(security.FormatReadinessReport(fr))
 		fmt.Println("FAC-133 readiness: OK (durable attestation)")

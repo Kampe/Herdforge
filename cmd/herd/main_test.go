@@ -242,8 +242,9 @@ func TestFreshClonePreflightAndRuntimeMigrationLeaveTrackedStateClean(t *testing
 	preflight := exec.Command(binary, "preflight")
 	preflight.Dir = clone
 	preflight.Env = append(os.Environ(), "HERD_CONTROL_SECRET=", "HERD_LIVE_HARNESS_PROOF=", "HERD_REFRESH_READINESS=")
-	if output, err := preflight.CombinedOutput(); err != nil {
-		t.Fatalf("fresh clone preflight: %v: %s", err, output)
+	output, err := preflight.CombinedOutput()
+	if err == nil {
+		t.Fatalf("fresh clone preflight expected exit status 1 on blocked readiness, got success: %s", output)
 	}
 	clean("preflight")
 
@@ -253,6 +254,22 @@ func TestFreshClonePreflightAndRuntimeMigrationLeaveTrackedStateClean(t *testing
 		t.Fatalf("runtime migration: %v: %s", err, output)
 	}
 	clean("runtime migration")
+}
+
+func TestPreflightBlockedReadinessExitsNonZero(t *testing.T) {
+	binary := buildHerd(t)
+	tmpDir := t.TempDir()
+	// Preflight without durable attestation must fail closed and exit non-zero.
+	cmd := exec.Command(binary, "preflight")
+	cmd.Dir = tmpDir
+	cmd.Env = append(os.Environ(), "HERD_CONTROL_SECRET=", "HERD_LIVE_HARNESS_PROOF=", "HERD_REFRESH_READINESS=")
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("preflight must exit non-zero when readiness is blocked; got success: %s", out)
+	}
+	if !strings.Contains(string(out), "FAC-133 readiness: BLOCKED") {
+		t.Fatalf("expected BLOCKED readiness in output, got: %s", out)
+	}
 }
 
 func TestStatusEvidenceFailureExitsNonZero(t *testing.T) {
