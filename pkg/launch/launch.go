@@ -858,7 +858,16 @@ func hookReceiptKey(req Request, code harness.HookCode, name string) string {
 }
 
 func recordHookFailure(req Request, sink Sink, code harness.HookCode, name string, endpoint harness.EndpointClass, authority string) error {
-	receipt := Receipt{CreatedAt: time.Now().UTC(), Kind: "launch_rejected", TaskRef: req.TaskRef, LeaseGeneration: req.LeaseGeneration, PolicyRevision: req.HookPolicyRevision, DecisionDigest: DecisionDigest(req.Decision), HookCode: string(code), HookName: name, EndpointClass: string(endpoint), RedactedAuthority: authority, ReceiptKey: hookReceiptKey(req, code, name)}
+	role, shape, provider, model, effort, digest, argv := fields(req)
+	fd, fa, ff, fs := fleetReceiptFields(req)
+	receipt := receiptFrom(req, role, shape, provider, model, effort, digest, argv, false, fmt.Sprintf("launch hook preflight failed: %s", code), fd, fa, ff, fs)
+	receipt.Kind = "launch_rejected"
+	receipt.PolicyRevision = req.HookPolicyRevision
+	receipt.HookCode = string(code)
+	receipt.HookName = name
+	receipt.EndpointClass = string(endpoint)
+	receipt.RedactedAuthority = authority
+	receipt.ReceiptKey = hookReceiptKey(req, code, name)
 	if _, err := writeOnce(sink, receipt); err != nil {
 		return fmt.Errorf("launch hook preflight failed: %s", code)
 	}
@@ -879,7 +888,16 @@ func recordHookDegraded(req Request, sink Sink, report harness.HookReport) (bool
 	if len(names) == 0 {
 		return false, nil
 	}
-	receipt := Receipt{CreatedAt: time.Now().UTC(), Kind: "hook_degraded", TaskRef: req.TaskRef, LeaseGeneration: req.LeaseGeneration, PolicyRevision: req.HookPolicyRevision, DecisionDigest: DecisionDigest(req.Decision), HookCode: string(harness.HookCodeDegraded), HookName: strings.Join(names, ","), EndpointClass: strings.Join(classes, ","), RedactedAuthority: strings.Join(authorities, ","), ReceiptKey: hookReceiptKey(req, harness.HookCodeDegraded, strings.Join(names, ","))}
+	role, shape, provider, model, effort, digest, argv := fields(req)
+	fd, fa, ff, fs := fleetReceiptFields(req)
+	receipt := receiptFrom(req, role, shape, provider, model, effort, digest, argv, false, "hook degraded", fd, fa, ff, fs)
+	receipt.Kind = "hook_degraded"
+	receipt.PolicyRevision = req.HookPolicyRevision
+	receipt.HookCode = string(harness.HookCodeDegraded)
+	receipt.HookName = strings.Join(names, ",")
+	receipt.EndpointClass = strings.Join(classes, ",")
+	receipt.RedactedAuthority = strings.Join(authorities, ",")
+	receipt.ReceiptKey = hookReceiptKey(req, harness.HookCodeDegraded, strings.Join(names, ","))
 	written, err := writeOnce(sink, receipt)
 	if err != nil {
 		return false, fmt.Errorf("launch hook preflight failed: %s", harness.HookCodeDegraded)
@@ -899,7 +917,15 @@ func recordHookRecovered(req Request, sink Sink) error {
 	if err != nil || !hasDegraded {
 		return err
 	}
-	receipt := Receipt{CreatedAt: time.Now().UTC(), Kind: "hook_recovered", TaskRef: req.TaskRef, LeaseGeneration: req.LeaseGeneration, PolicyRevision: req.HookPolicyRevision, DecisionDigest: DecisionDigest(req.Decision), HookCode: "hook.recovered", HookName: "all", EndpointClass: "local", ReceiptKey: hookReceiptKey(req, harness.HookCode("hook.recovered"), "all")}
+	role, shape, provider, model, effort, digest, argv := fields(req)
+	fd, fa, ff, fs := fleetReceiptFields(req)
+	receipt := receiptFrom(req, role, shape, provider, model, effort, digest, argv, true, "hook recovered", fd, fa, ff, fs)
+	receipt.Kind = "hook_recovered"
+	receipt.PolicyRevision = req.HookPolicyRevision
+	receipt.HookCode = "hook.recovered"
+	receipt.HookName = "all"
+	receipt.EndpointClass = "local"
+	receipt.ReceiptKey = hookReceiptKey(req, harness.HookCode("hook.recovered"), "all")
 	if _, err := writeOnce(sink, receipt); err != nil {
 		return fmt.Errorf("launch hook preflight failed: hook.recovered")
 	}
