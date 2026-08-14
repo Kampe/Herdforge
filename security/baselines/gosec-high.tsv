@@ -77,6 +77,8 @@ G101	pkg/security/env.go	22	eee154b902c5c4e1a18706891fe5ca60662f3e9171cfbbf04532
 G101	pkg/security/hostcreds_authority.go	44	076c77e42afb33419998c835932c0af0b2afedc5298737aa3862d7219ea4f3e0	opaque-handle environment variable name only	hostcreds-maintainers	2026-12-31
 G101	pkg/security/hostcreds_types.go	35	13541011f25f2a60d93a87e3f24253fc59d11a0b9fe54f39e3f5c79e002cbea3	public block-reason label only	hostcreds-maintainers	2026-12-31
 G101	pkg/verifier/lifecycle.go	159-183	7e70472cbc8bdc0ae9b9222821003dc0fbca3d9a5431b38b3fe81aaaa374e04a	wrapper-shell variable is command path, never credential	verifier-maintainers	2026-12-31
+G101	contracts/agentscope/trusted_job.go	89	a790a64522d45a97d5a76a67b08c1fe46fd88172d387fdfc67ba34d727b51936	violation-code label only; no credential value	security-maintainers	2026-12-31
 G122	pkg/memory/memory.go	77	03cce687a63d5c6b129a06634b4818cdd96bd4e6afc8749f5bd49be0446c5eb6	read-only local memory search; follow-up should migrate traversal to descriptor-rooted reads	memory-maintainers	2026-12-31
+
 G122	pkg/preflight/preflight.go	41	5c8876062c39bfb493ec2a3fe51556b9512b85caef5f48d426674c2dbf95adc0	walk does not follow symlinks and reads only discovered regular source files	preflight-maintainers	2026-12-31
 G122	pkg/preflight/signal_literals.go	52	799a101a33d4ba122c4cefba9120adb6be40c3538c397253a5d43524e7e7064a	walk does not follow symlinks and reads only discovered regular source files	preflight-maintainers	2026-12-31
