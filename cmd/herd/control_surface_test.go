@@ -52,13 +52,23 @@ func TestControlSurfaceDiscoveryIsPublicAgentOnly(t *testing.T) {
 	if got.Version != controlSurfaceVersion || len(got.Commands) == 0 {
 		t.Fatalf("unexpected public manifest: %+v", got)
 	}
+	sawMail, sawControl := false, false
 	for _, c := range got.Commands {
 		if c.Classification != classPublicAgent {
 			t.Fatalf("discovery leaked %s command %q", c.Classification, c.Command)
 		}
+		if c.Command == "mail" {
+			sawMail = true
+		}
+		if c.Command == "control" {
+			sawControl = true
+		}
 		if len(c.Audience) == 0 || len(c.Roles) == 0 || len(c.Evidence) == 0 || c.Input == "" || c.Output == "" {
 			t.Fatalf("incomplete public contract: %+v", c)
 		}
+	}
+	if !sawMail || sawControl {
+		t.Fatalf("public discovery mail=%t control=%t, want mail=true control=false", sawMail, sawControl)
 	}
 
 	// --all was the old-style capability escalation path. It is rejected by
