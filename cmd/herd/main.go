@@ -386,6 +386,9 @@ func main() {
 	case "control":
 		runControl()
 
+	case "mail":
+		runMail()
+
 	case "netbroker-serve":
 		runNetbrokerServe()
 
