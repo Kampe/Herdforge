@@ -1,6 +1,6 @@
 # Herdforge Makefile
 
-.PHONY: all build test test-unit test-contracts test-hermetic-compile test-coverage test-mutation test-race test-e2e preflight lint self-test herd-up clean ci
+.PHONY: all build test test-unit test-contracts test-hermetic-compile test-coverage test-mutation test-race test-e2e preflight lint security-deps self-test herd-up clean ci
 
 # FAC-135: shared hermetic Git environment for every gate. Host signing, hooks,
 # and ambient credentials must not influence fixtures or coverage.
@@ -110,6 +110,13 @@ lint:
 	cd contracts/agentscope && go vet ./...
 	@echo "==> Running test hermeticity scan (FAC-215)..."
 	go run ./scripts/hermeticity/
+	$(MAKE) security-deps
+
+# Scan the deterministically sorted set of tracked Go modules. The script uses
+# `git ls-files`, so untracked .worktrees and .herd runtime trees are never
+# traversed; it has no severity or vulnerability suppressions.
+security-deps:
+	./scripts/check-go-dependencies.zsh
 
 clean:
 	@echo "==> Cleaning build artifacts..."
