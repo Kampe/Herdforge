@@ -57,3 +57,24 @@ func TestRequiredBrokerHostsForKind_KindAuthSurface(t *testing.T) {
 		t.Fatal("unknown")
 	}
 }
+
+func TestDiagnoseKindAuthReadiness_AGYNative(t *testing.T) {
+	for _, kind := range []string{"agy", "antigravity"} {
+		d := DiagnoseKindAuthReadiness(kind)
+		if !d.Brokerable {
+			t.Fatalf("%s must be brokerable via native auth classification", kind)
+		}
+		if d.AuthorityClass != "native" {
+			t.Fatalf("%s authority class = %q, want native", kind, d.AuthorityClass)
+		}
+		if d.Class != KindAuthOK {
+			t.Fatalf("%s class = %q, want ok", kind, d.Class)
+		}
+		if d.ReasonCode != "native_auth" {
+			t.Fatalf("%s reason code = %q, want native_auth", kind, d.ReasonCode)
+		}
+		if d.Blocker != "" {
+			t.Fatalf("%s blocker = %q, want empty", kind, d.Blocker)
+		}
+	}
+}

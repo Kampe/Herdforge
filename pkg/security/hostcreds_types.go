@@ -109,6 +109,7 @@ const (
 	AuthorKindGrok   = "grok"
 	AuthorKindClaude = "claude"
 	AuthorKindCodex  = "codex"
+	AuthorKindAGY    = "agy"
 )
 
 // RequestRule is exact allowlisted host + method + path + action (deny-by-default).

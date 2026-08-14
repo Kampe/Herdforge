@@ -827,7 +827,7 @@ func ResolveAgentBinary(kind string) (string, error) {
 		candidates = []string{"codex"}
 	case "grok":
 		candidates = []string{"grok"}
-	case "agy":
+	case "agy", "antigravity":
 		candidates = []string{"agy", "antigravity"}
 	case "true":
 		candidates = []string{"true", "/usr/bin/true", "/bin/true"}

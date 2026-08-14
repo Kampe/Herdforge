@@ -150,3 +150,60 @@ func TestClaimAuthority_NoAssumedClaimsDB(t *testing.T) {
 		t.Fatalf("want claim/leases.db, got %s", path)
 	}
 }
+
+func TestProbeHarnessSurvival_AGYFailClosedWithoutLive(t *testing.T) {
+	_ = os.Unsetenv("HERD_LIVE_HARNESS_PROOF")
+	r, err := ProbeHarnessSurvival("agy")
+	if r == nil {
+		t.Fatal("nil result")
+	}
+	if r.Usable || r.RealHerdrSession {
+		t.Fatal("agy must not be marked usable or real herdr session without live proof")
+	}
+	if err == nil {
+		t.Fatal("expected error without live proof")
+	}
+	if err := AssertNotSyntheticallyUsable(r); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestResolveRequiredHarnessKinds_DerivesFromConfig(t *testing.T) {
+	tmpDir := t.TempDir()
+	herdDir := filepath.Join(tmpDir, ".herd")
+	if err := os.MkdirAll(herdDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	content := `version: "1"
+project:
+  name: "test-project"
+task_provider:
+  type: "kaneo"
+  project_id: "test-id"
+lanes:
+  - name: "smith"
+    agent_kind: "codex"
+    harness: "codex"
+    model: "gpt-5"
+    prompt: "p.md"
+  - name: "assayer"
+    agent_kind: "agy"
+    harness: "agy"
+    model: "gemini-3"
+    prompt: "p.md"
+`
+	if err := os.WriteFile(filepath.Join(herdDir, "herd.yaml"), []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	kinds := ResolveRequiredHarnessKinds(tmpDir)
+	if len(kinds) != 2 || kinds[0] != "agy" || kinds[1] != "codex" {
+		t.Fatalf("ResolveRequiredHarnessKinds = %v, want [agy codex]", kinds)
+	}
+
+	// Missing config falls back to SupportedHarnessKinds
+	fallbackKinds := ResolveRequiredHarnessKinds(t.TempDir())
+	if len(fallbackKinds) != len(SupportedHarnessKinds) {
+		t.Fatalf("fallback kinds = %v, want %v", fallbackKinds, SupportedHarnessKinds)
+	}
+}

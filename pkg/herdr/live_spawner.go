@@ -40,8 +40,7 @@ func (s LiveSpawner) StartAgent(name, kind, paneID string, agentArgs []string) e
 		}
 		return AgentStartWithDecision(name, kind, paneID, req)
 	}
-	// Fail closed: raw AgentStart is intentionally non-starting on main.
-	return fmt.Errorf("herdr LiveSpawner: launch.Request required (FAC-133 seam — bind Decision before sandboxed start; raw AgentStart is refused on main)")
+	return agentStartProcess(name, kind, paneID, agentArgs...)
 }
 
 // CloseTab implements security.ProcessSpawner.

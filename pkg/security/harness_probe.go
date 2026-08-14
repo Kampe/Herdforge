@@ -10,10 +10,11 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/Kampe/Herdforge/pkg/config"
 )
 
-// SupportedHarnessKinds are production agent kinds that must be Usable for
-// readiness, or the fleet is BLOCKED (nonzero).
+// SupportedHarnessKinds are default production agent kinds used as fallback.
 var SupportedHarnessKinds = []string{"claude", "codex", "grok"}
 
 // HarnessProbeResult records non-vacuous survival evidence.
@@ -161,11 +162,26 @@ func proveViaLiveHerdr(kind, realBin, tmp string) (modelOK, toolOK, viaLA, conta
 	return proveLiveHerdrSession(kind, realBin, tmp)
 }
 
-// ProbeAllSupportedHarnessesLive runs live proofs for all kinds (refresh only).
-func ProbeAllSupportedHarnessesLive() ([]HarnessProbeResult, error) {
+// ResolveRequiredHarnessKinds derives required live harness kinds from the
+// validated configured lane harnesses in .herd/herd.yaml. If unconfigured or
+// during hermetic unit tests where config is absent, it falls back to
+// SupportedHarnessKinds.
+func ResolveRequiredHarnessKinds(root string) []string {
+	kinds, err := config.ConfiguredHarnessKindsFor(root)
+	if err == nil && len(kinds) > 0 {
+		return kinds
+	}
+	return SupportedHarnessKinds
+}
+
+// ProbeAllConfiguredHarnessesLive runs live proofs for the specified kinds (refresh only).
+func ProbeAllConfiguredHarnessesLive(kinds []string) ([]HarnessProbeResult, error) {
+	if len(kinds) == 0 {
+		kinds = ResolveRequiredHarnessKinds(ResolveReadinessRoot())
+	}
 	var out []HarnessProbeResult
 	usable := 0
-	for _, k := range SupportedHarnessKinds {
+	for _, k := range kinds {
 		r, _ := ProbeHarnessSurvivalLive(k)
 		if r == nil {
 			r = &HarnessProbeResult{Kind: k, TicketScopedBlocker: "FAC-133: nil probe"}
@@ -176,9 +192,14 @@ func ProbeAllSupportedHarnessesLive() ([]HarnessProbeResult, error) {
 		}
 	}
 	if usable == 0 {
-		return out, fmt.Errorf("FAC-133 BLOCKED: zero usable harnesses among %v after live proof", SupportedHarnessKinds)
+		return out, fmt.Errorf("FAC-133 BLOCKED: zero usable harnesses among %v after live proof", kinds)
 	}
 	return out, nil
+}
+
+// ProbeAllSupportedHarnessesLive runs live proofs for all derived kinds (refresh only).
+func ProbeAllSupportedHarnessesLive() ([]HarnessProbeResult, error) {
+	return ProbeAllConfiguredHarnessesLive(ResolveRequiredHarnessKinds(ResolveReadinessRoot()))
 }
 
 // ProbeAllSupportedHarnesses is the non-live status path: binary/version only,
@@ -187,9 +208,10 @@ func ProbeAllSupportedHarnessesLive() ([]HarnessProbeResult, error) {
 // Calling Live from this function previously forced every unit suite into
 // full herdr/model proofs; that is reserved for the explicit Live entrypoint.
 func ProbeAllSupportedHarnesses() ([]HarnessProbeResult, error) {
+	kinds := ResolveRequiredHarnessKinds(ResolveReadinessRoot())
 	var out []HarnessProbeResult
 	usable := 0
-	for _, k := range SupportedHarnessKinds {
+	for _, k := range kinds {
 		r, _ := ProbeHarnessSurvival(k)
 		if r == nil {
 			r = &HarnessProbeResult{Kind: k, TicketScopedBlocker: "FAC-133: nil probe"}
@@ -200,7 +222,7 @@ func ProbeAllSupportedHarnesses() ([]HarnessProbeResult, error) {
 		}
 	}
 	if usable == 0 {
-		return out, fmt.Errorf("FAC-133 BLOCKED: zero usable harnesses among %v without live proof (use RefreshFleetAttestationLive)", SupportedHarnessKinds)
+		return out, fmt.Errorf("FAC-133 BLOCKED: zero usable harnesses among %v without live proof (use RefreshFleetAttestationLive)", kinds)
 	}
 	return out, nil
 }

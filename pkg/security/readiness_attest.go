@@ -110,9 +110,8 @@ func FileSHA256Hex(path string) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// CurrentReadinessBinding digests herd + all supported harness binaries + containment.
-// Missing a supported harness binary is recorded as empty digest (usable that kind impossible).
-func CurrentReadinessBinding() (herdDigest string, harness map[string]string, containment string, err error) {
+// CurrentReadinessBindingFor digests herd + the specified harness binaries + containment.
+func CurrentReadinessBindingFor(kinds []string) (herdDigest string, harness map[string]string, containment string, err error) {
 	harness = map[string]string{}
 	if self, e := os.Executable(); e == nil {
 		herdDigest = FileSHA256Hex(self)
@@ -125,7 +124,10 @@ func CurrentReadinessBinding() (herdDigest string, harness map[string]string, co
 	if herdDigest == "" {
 		return "", harness, "unavailable", fmt.Errorf("%w: herd binary digest unavailable", ErrFleetBlocked)
 	}
-	for _, k := range SupportedHarnessKinds {
+	if len(kinds) == 0 {
+		kinds = ResolveRequiredHarnessKinds(ResolveReadinessRoot())
+	}
+	for _, k := range kinds {
 		bin, berr := ResolveAgentBinary(k)
 		if berr != nil || bin == "" {
 			harness[k] = ""
@@ -149,6 +151,12 @@ func CurrentReadinessBinding() (herdDigest string, harness map[string]string, co
 		}
 	}
 	return herdDigest, harness, containment, err
+}
+
+// CurrentReadinessBinding digests herd + all required harness binaries + containment.
+// Missing a required harness binary is recorded as empty digest (usable that kind impossible).
+func CurrentReadinessBinding() (herdDigest string, harness map[string]string, containment string, err error) {
+	return CurrentReadinessBindingFor(ResolveRequiredHarnessKinds(ResolveReadinessRoot()))
 }
 
 // FleetAttestationSecret returns the MAC secret for readiness (control secret).
@@ -298,7 +306,12 @@ func ValidateFleetAttestation(a *FleetAttestation, now time.Time, secret string)
 	if !a.ExpiresAt.IsZero() && now.After(a.ExpiresAt) {
 		return fmt.Errorf("%w: attestation expired at %s", ErrFleetBlocked, a.ExpiresAt.Format(time.RFC3339))
 	}
-	herd, harness, containment, berr := CurrentReadinessBinding()
+	keys := make([]string, 0, len(a.HarnessDigests))
+	for k := range a.HarnessDigests {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	herd, harness, containment, berr := CurrentReadinessBindingFor(keys)
 	if berr != nil || containment == "" || containment == "unavailable" {
 		return fmt.Errorf("%w: containment/binding unavailable: %v", ErrFleetBlocked, berr)
 	}
@@ -311,9 +324,9 @@ func ValidateFleetAttestation(a *FleetAttestation, now time.Time, secret string)
 	if a.HerdBinaryDigest == "" || herd == "" || a.HerdBinaryDigest != herd {
 		return fmt.Errorf("%w: herd binary digest mismatch/missing", ErrFleetBlocked)
 	}
-	// Every SupportedHarnessKind must have a live digest match when attestation
-	// records that kind as usable; all attested digests must match live exactly.
-	for _, k := range SupportedHarnessKinds {
+	// Every attested harness digest must have a live digest match;
+	// all usable results must have matching non-empty digests.
+	for _, k := range keys {
 		liveDig, ok := harness[k]
 		attDig, has := a.HarnessDigests[k]
 		// If result claims usable for kind, both digests required and equal.
@@ -473,6 +486,11 @@ func allowLiveHarnessRefresh() bool {
 
 // BuildFleetAttestationFromResults creates a MAC-signed durable attestation.
 func BuildFleetAttestationFromResults(results []HarnessProbeResult, ttl time.Duration) (*FleetAttestation, error) {
+	return BuildFleetAttestationFromResultsFor(results, ttl, ResolveRequiredHarnessKinds(ResolveReadinessRoot()))
+}
+
+// BuildFleetAttestationFromResultsFor creates a MAC-signed durable attestation for the specified harness kinds.
+func BuildFleetAttestationFromResultsFor(results []HarnessProbeResult, ttl time.Duration, kinds []string) (*FleetAttestation, error) {
 	if ttl <= 0 {
 		ttl = DefaultFleetAttestationTTL
 	}
@@ -480,7 +498,23 @@ func BuildFleetAttestationFromResults(results []HarnessProbeResult, ttl time.Dur
 	if err != nil {
 		return nil, err
 	}
-	herd, harness, containment, cerr := CurrentReadinessBinding()
+	seen := make(map[string]bool, len(kinds)+len(results))
+	var allKinds []string
+	for _, k := range kinds {
+		if k != "" && !seen[k] {
+			seen[k] = true
+			allKinds = append(allKinds, k)
+		}
+	}
+	for _, r := range results {
+		if r.Kind != "" && !seen[r.Kind] {
+			seen[r.Kind] = true
+			allKinds = append(allKinds, r.Kind)
+		}
+	}
+	sort.Strings(allKinds)
+
+	herd, harness, containment, cerr := CurrentReadinessBindingFor(allKinds)
 	if cerr != nil || containment == "" || containment == "unavailable" {
 		return nil, fmt.Errorf("%w: cannot attest without real containment: %v", ErrFleetBlocked, cerr)
 	}
@@ -572,7 +606,8 @@ func RefreshFleetAttestationLive(root string) (*FleetReadiness, error) {
 		return fr, nil
 	}
 
-	results, err := ProbeAllSupportedHarnessesLive()
+	kinds := ResolveRequiredHarnessKinds(root)
+	results, err := ProbeAllConfiguredHarnessesLive(kinds)
 	fr := &FleetReadiness{Results: results}
 	fr.Usable = countValidatedUsable(results)
 	if err != nil || fr.Usable == 0 {
@@ -584,7 +619,7 @@ func RefreshFleetAttestationLive(root string) (*FleetReadiness, error) {
 		}
 		return fr, fmt.Errorf("%w: %s", ErrFleetBlocked, fr.Reason)
 	}
-	att, aerr := BuildFleetAttestationFromResults(results, DefaultFleetAttestationTTL)
+	att, aerr := BuildFleetAttestationFromResultsFor(results, DefaultFleetAttestationTTL, kinds)
 	if aerr != nil {
 		fr.Blocked = true
 		fr.Reason = aerr.Error()
