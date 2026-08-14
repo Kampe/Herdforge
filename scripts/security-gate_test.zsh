@@ -32,12 +32,16 @@ print -- "github_token = \"${token_prefix}${token_suffix}\"" > .worktrees/live/s
 ./scripts/security-gate.zsh >/dev/null
 
 # A syntactically valid finding that gosec did not report must fail closed as
-# stale; after its removal, the current empty fixture baseline passes again.
-stale_fingerprint=$(print -rn -- 'G702|fixture.go|999' | shasum -a 256 | awk '{print $1}')
-print -- "G702\tfixture.go\t999\t$stale_fingerprint\tfixture stale-entry regression\tsecurity-maintainers\t2026-12-31" >> security/baselines/gosec-high.tsv
+# stale; every stale entry must be diagnosed in one run (FAC-285). After their
+# removal, the current empty fixture baseline passes again.
+stale_fp1=$(print -rn -- 'G702|fixture.go|999' | shasum -a 256 | awk '{print $1}')
+stale_fp2=$(print -rn -- 'G703|fixture.go|888' | shasum -a 256 | awk '{print $1}')
+print -- "G702\tfixture.go\t999\t$stale_fp1\tfixture stale-entry regression 1\tsecurity-maintainers\t2026-12-31" >> security/baselines/gosec-high.tsv
+print -- "G703\tfixture.go\t888\t$stale_fp2\tfixture stale-entry regression 2\tsecurity-maintainers\t2026-12-31" >> security/baselines/gosec-high.tsv
 stale_report="$tmp/stale-gosec.out"
 if ./scripts/security-gate.zsh >"$stale_report" 2>&1; then exit 1; fi
-grep -F -- "error: stale baseline entry $stale_fingerprint" "$stale_report" >/dev/null || exit 1
+grep -F -- "error: stale baseline entry $stale_fp1" "$stale_report" >/dev/null || exit 1
+grep -F -- "error: stale baseline entry $stale_fp2" "$stale_report" >/dev/null || exit 1
 print '# rule\tfile\tline\tfingerprint\trationale\towner\texpiry' > security/baselines/gosec-high.tsv
 ./scripts/security-gate.zsh >/dev/null
 
