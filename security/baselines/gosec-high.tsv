@@ -1,8 +1,8 @@
 # rule	file	line	fingerprint	rationale	owner	expires (UTC)
 # Entries are generated from rule|repo-relative-file|line with SHA-256.  They
 # must exactly match every unresolved HIGH/CRITICAL gosec finding.
-G702	cmd/herd/main.go	3437	51193ecccbc446032edad5daba1ca017d027a7fbe6e0e7aecdbb251865843d4d	interactive herd shell re-execs only the current executable; arguments are not interpreted by a shell	cli-maintainers	2026-12-31
-G702	cmd/herd/main.go	5832	3acb824c6e7f67e8226b5062c40bebd0edb03fb67021bcab781ab61dc068cc77	locked-child executor uses a binary selected from the fixed allowed map and protocol-vetted arguments; no shell	cli-maintainers	2026-12-31
+G702	cmd/herd/main.go	3440	c3c28f7deae4bb9ec2d78348d1f0bedd3854a230d870d3fecfb0ce0294bc9cdd	interactive herd shell re-execs only the current executable; arguments are not interpreted by a shell	cli-maintainers	2026-12-31
+G702	cmd/herd/main.go	5835	bbafb41ad8dc35cefd049a3b33ae4731d9cefacab966d01f4759e29fa2a5bb84	locked-child executor uses a binary selected from the fixed allowed map and protocol-vetted arguments; no shell	cli-maintainers	2026-12-31
 G702	cmd/herd/reviewclassify.go	128	a8dcbccbba9abde1aae6ed5a7a66c7ecc6c0f40c09de4e40e1d1208b6308830a	git binary is fixed; base and target are review protocol revisions, never shell-interpreted	cli-maintainers	2026-12-31
 G702	cmd/herd/reviewingest.go	258	748f7a75ddee522ef8f86de0132f16958bac2121b740faecc9179560db49d695	worktree path follows git --; branch follows git -- and is internal temporary plan data	cli-maintainers	2026-12-31
 G702	cmd/herd/reviewingest.go	280	5bf9dbfb23cbc31b4aeb1731b5b3169ccfab78f145788defd3f2c5487a59b393	-B branch is internally generated; worktree path and base revision follow git --	cli-maintainers	2026-12-31
@@ -21,9 +21,9 @@ G702	pkg/signerboundary/launch.go	454	78d6d8bc4dcaafa5bc46e85d5623e63d0e60f7429c
 G702	pkg/signerboundary/rotate.go	299	0b0428224364111f2728ccdfbe6bc34a2ea8b8dce3fa41ed12959ed40b0d7ca0	current herd executable is resolved fail-closed; signer key/socket/ledger paths are controlled boundary state	signerboundary-maintainers	2026-12-31
 G703	cmd/herd/clihelp.go	41	a45f948b9a0057f0dd051012e16eedd20a247fca37c02055195b9ef1efbde04b	HERD_HELP_PROBE is a test-only observability path and does not alter normal help behavior	cli-maintainers	2026-12-31
 G703	cmd/herd/drainadapt.go	418	fd8086147e22d9e2ed8976c9378a089cedb346e50e5cc4001ad52d01311a4df2	launch receipt path is coordinator-configured provenance input; default is repo-local durable receipt state	cli-maintainers	2026-12-31
-G703	cmd/herd/main.go	1908	d9c5d1931aa697451aba9620d1c2381429eaa07b78cbbc5d6aa44f5db5169cba	rollback path derives from validated reviewer worktree and fixed TaskContextFile; restores prior receipt	cli-maintainers	2026-12-31
-G703	cmd/herd/main.go	5638	ad24f4341bd22ca18587084656534119546aeb311d9d4e19757fa3dc3a43fd97	canonical root is launcher-provided shared checkout identity and accepted only when it exists as a directory	cli-maintainers	2026-12-31
-G703	cmd/herd/main.go	760	1c9ae05c0ea284a328509dc76a65dc5ace41e4ee953475b08d0935be2080124e	read-only existence check under the just-created clone target directory	cli-maintainers	2026-12-31
+G703	cmd/herd/main.go	1911	3053027d59cf50079e443acc6dfaccea823d47835bc097fcb496749dd80eb520	rollback path derives from validated reviewer worktree and fixed TaskContextFile; restores prior receipt	cli-maintainers	2026-12-31
+G703	cmd/herd/main.go	5641	032e17cd34b6019b636deff508621dba1a5ec630c4932b7d26d16339c7074465	canonical root is launcher-provided shared checkout identity and accepted only when it exists as a directory	cli-maintainers	2026-12-31
+G703	cmd/herd/main.go	763	3cb300a33ca3b520d5f043426d0c1d4fc17b9d6a141268ae7cc8553bd4a67f2e	read-only existence check under the just-created clone target directory	cli-maintainers	2026-12-31
 G703	cmd/herd/roleinject.go	47	a01508ddf0491a4b7d6846843ac51990d180265a85235f57fc1f28c5a4607683	read-only diagnostic existence check for lane-bound repository-relative files	cli-maintainers	2026-12-31
 G703	pkg/activate/activate.go	437	9ebc75336d35863948dc8b7cb3381c2198bceb81ce3afa7b570286bedd2545fd	read-only file existence helper; callers retain path authorization	activate-maintainers	2026-12-31
 G703	pkg/confinement/os.go	375	ad62f4d6a5661a2b613a238c6822e4c360f93b5e78c23f9c8b14d6c77b6c1a33	best-effort restoration of a probe file previously constrained by writeUnder profile and validated worktree path	confinement-maintainers	2026-12-31
