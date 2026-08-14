@@ -457,9 +457,9 @@ func scopeMatchesRequest(s Scope, r ReadRequest) bool {
 	case ScopeRun:
 		return s.RunID == r.RunID
 	case ScopeTask:
-		return s.TaskID == r.TaskID
+		return s.RunID == r.RunID && s.TaskID == r.TaskID
 	case ScopeRole:
-		return s.TaskID == r.TaskID && s.Role == r.Role
+		return s.RunID == r.RunID && s.TaskID == r.TaskID && s.Role == r.Role
 	}
 	return false
 }
@@ -467,7 +467,7 @@ func scopeAccessible(relations map[string]ScopeRelation, scope Scope, request Re
 	if scopeMatchesRequest(scope, request) {
 		return true
 	}
-	if scope.Kind != ScopeTask || scope.Revision != request.Revision {
+	if scope.Kind != ScopeTask || scope.RunID != request.RunID || scope.Revision != request.Revision {
 		return false
 	}
 	_, ok := relations[relationKey(ScopeRelation{FromTask: request.TaskID, ToTask: scope.TaskID, Revision: request.Revision})]
