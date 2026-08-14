@@ -23,23 +23,27 @@ import (
 // Worker session and lease are resolved from live Herdr + FAC-147 claim authority.
 // Caller flags must match live state or be omitted.
 func runControl() {
-	if len(os.Args) < 3 {
+	runControlArgs(os.Args[2:])
+}
+
+func runControlArgs(args []string) {
+	if len(args) == 0 {
 		fmt.Fprintln(os.Stderr, controlUsage)
 		os.Exit(2)
 	}
-	switch os.Args[2] {
+	switch args[0] {
 	case "issue":
-		runControlIssue(os.Args[3:])
+		runControlIssue(args[1:])
 	case "drain":
-		runControlDrain(os.Args[3:])
+		runControlDrain(args[1:])
 	case "verify-sealed":
-		runControlVerifySealed(os.Args[3:])
+		runControlVerifySealed(args[1:])
 	case "classify":
-		runControlClassify(os.Args[3:])
+		runControlClassify(args[1:])
 	case "-h", "--help", "help":
 		fmt.Println(controlUsage)
 	default:
-		fmt.Fprintf(os.Stderr, "control: unknown mode %q\n%s\n", os.Args[2], controlUsage)
+		fmt.Fprintf(os.Stderr, "control: unknown mode %q\n%s\n", args[0], controlUsage)
 		os.Exit(2)
 	}
 }

@@ -163,6 +163,16 @@ Commands:
 	"lifecycle":    "Usage: herd lifecycle [flags]\n  Lifecycle inspection.",
 	"resources":    "Usage: herd resources [flags]\n  Resource inventory.",
 	"lock":         "Usage: herd lock <acquire|release|status|with> [flags]\n  Shared-checkout dir lock.",
+	"mail": `Usage:
+  herd mail send --from NAME --to RECIPIENT --body TEXT [--subject TEXT] [--mail path]
+  herd mail inbox --recipient NAME [--mail path]
+  herd mail read --recipient NAME [--mail path]
+  herd mail control <issue|drain> [flags]
+
+Ordinary durable messages use the local mailbox and are not authenticated control.
+Privileged authenticated control callbacks/envelopes are available only through
+herd mail control, which delegates to the existing herd control issue/drain
+validation, generation fences, deduplication, and delivery path.`,
 	// Byte-stable contract with reset_safe_cli_test.go (exact single line).
 	"reset-safe": resetSafeUsage,
 	"fresh-build": "Usage: herd fresh-build <pkg-or-path> [--dry-run]\n" +
