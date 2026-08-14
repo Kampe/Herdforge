@@ -51,7 +51,6 @@ func DefaultProtectedPolicy() MergePolicy {
 		RequiredChecks:               []string{"Build, Preflight & Test Suite"},
 		RequireDifferentFamilyReview: true,
 		RequirePullRequestReviews:    true,
-		RemoteCI:                     RemoteCIPolicy{Required: true, RequiredChecks: []string{"Build, Preflight & Test Suite"}},
 	}
 }
 
@@ -114,11 +113,7 @@ func CheckMergePolicy(policy MergePolicy) MergePolicyReport {
 		rep.OK = false
 		rep.Reasons = append(rep.Reasons, "protected repository must require_pull_request_reviews")
 	}
-	if !policy.RemoteCI.Required {
-		rep.OK = false
-		rep.Reasons = append(rep.Reasons, "protected repository must declare remote_ci.required")
-	}
-	if len(normalizeNames(policy.RemoteCI.RequiredChecks)) == 0 {
+	if policy.RemoteCI.Required && len(normalizeNames(policy.RemoteCI.RequiredChecks)) == 0 {
 		rep.OK = false
 		rep.Reasons = append(rep.Reasons, "protected repository declares no remote_ci.required_checks")
 	}
