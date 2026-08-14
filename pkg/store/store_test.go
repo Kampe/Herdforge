@@ -29,6 +29,18 @@ func TestNewStore(t *testing.T) {
 	}
 }
 
+func TestNewStoreCreatesParentDirectory(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "runtime", "state", "herdforge.db")
+	s, err := New(path)
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("runtime database was not created on demand: %v", err)
+	}
+}
+
 func TestRecordPulse(t *testing.T) {
 	s := tempStore(t)
 	rec, err := s.RecordPulse("FAC-1", "t-1", "worker")

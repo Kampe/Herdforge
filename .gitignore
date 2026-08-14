@@ -85,7 +85,12 @@ TASK-PACKET.md
 # go test -c artifacts (never commit)
 *.test
 
-# runtime sqlite state created by preflight/pulse/verification runs.
-# .herd/herdforge.db is tracked deliberately; these are not.
+# Runtime SQLite state is created on demand and must never be committed.
+.herd/herdforge.db
+.herd/herdforge.db-*
+**/.herd/herdforge.db
+**/.herd/herdforge.db-*
+.herd/reconciliation.jsonl
+**/.herd/reconciliation.jsonl
 .herd/command-sessions.db
 .herd/container-lifecycle.db

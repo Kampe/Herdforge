@@ -208,9 +208,9 @@ func (e *Enforcer) BindAndProve(id LaunchIdentity, prep *PreparedOS) (*Binding, 
 		return nil, fmt.Errorf("confinement: policy self-check: %w", err)
 	}
 	if id.SharedRoot != "" {
-		incident := filepath.Join(id.SharedRoot, filepath.FromSlash(SharedRootIncidentRel))
+		incident := filepath.Join(id.SharedRoot, filepath.FromSlash(SharedRootResidualArtifactRel))
 		if err := binding.Boundary.AuthorizeWrite(binding.Capability, incident); err == nil {
-			return nil, fmt.Errorf("%w: policy accepted shared-root incident path", ErrOutsideRoot)
+			return nil, fmt.Errorf("%w: policy accepted shared-root residual artifact path", ErrOutsideRoot)
 		}
 	}
 	osb := e.OS
