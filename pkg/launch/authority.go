@@ -237,11 +237,18 @@ func (a *Authority) mutate(fn func(Snapshot) (Snapshot, error)) error {
 
 func cloneReceipt(r Receipt) Receipt { r.Argv = clone(r.Argv); return r }
 
+func nextEventSequence(events []Event) uint64 {
+	if len(events) == 0 {
+		return 1
+	}
+	return events[len(events)-1].Sequence + 1
+}
+
 func (a *Authority) appendEvent(kind string, r Receipt) error {
 	return a.mutate(func(s Snapshot) (Snapshot, error) {
 		r = cloneReceipt(r)
 		r.CreatedAt = r.CreatedAt.UTC()
-		s.Events = append(s.Events, Event{Sequence: uint64(len(s.Events) + 1), Kind: kind, Receipt: r})
+		s.Events = append(s.Events, Event{Sequence: nextEventSequence(s.Events), Kind: kind, Receipt: r})
 		return s, nil
 	})
 }
@@ -279,7 +286,7 @@ func (a *Authority) Reserve(req Request, packetDigest string) (Receipt, error) {
 		}
 		base.Generation = max + 1
 		result = cloneReceipt(base)
-		s.Events = append(s.Events, Event{Sequence: uint64(len(s.Events) + 1), Kind: "reserved", Receipt: base})
+		s.Events = append(s.Events, Event{Sequence: nextEventSequence(s.Events), Kind: "reserved", Receipt: base})
 		return s, nil
 	})
 	return result, err
@@ -319,7 +326,7 @@ func (a *Authority) Accept(r Receipt) error {
 				return s, errors.New("launch generation is stale")
 			}
 		}
-		s.Events = append(s.Events, Event{Sequence: uint64(len(s.Events) + 1), Kind: "accepted", Receipt: cloneReceipt(r)})
+		s.Events = append(s.Events, Event{Sequence: nextEventSequence(s.Events), Kind: "accepted", Receipt: cloneReceipt(r)})
 		older := map[int64]Event{}
 		for _, e := range s.Events[:len(s.Events)-1] {
 			if identityKey(e.Receipt) == identityKey(r) && e.Receipt.Generation < r.Generation {
@@ -328,7 +335,7 @@ func (a *Authority) Accept(r Receipt) error {
 		}
 		for _, old := range older {
 			if old.Kind == "accepted" || old.Kind == "reserved" {
-				s.Events = append(s.Events, Event{Sequence: uint64(len(s.Events) + 1), Kind: "superseded", Receipt: old.Receipt})
+				s.Events = append(s.Events, Event{Sequence: nextEventSequence(s.Events), Kind: "superseded", Receipt: old.Receipt})
 			}
 		}
 		return s, nil
@@ -372,7 +379,7 @@ func (a *Authority) Reject(r Receipt, reason string) error {
 		if !found {
 			return s, errors.New("launch generation was not reserved or accepted")
 		}
-		s.Events = append(s.Events, Event{Sequence: uint64(len(s.Events) + 1), Kind: "rejected", Receipt: cloneReceipt(r)})
+		s.Events = append(s.Events, Event{Sequence: nextEventSequence(s.Events), Kind: "rejected", Receipt: cloneReceipt(r)})
 		return s, nil
 	})
 }
