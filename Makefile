@@ -92,8 +92,8 @@ test-e2e:
 	$(HERMETIC_GIT) go test -count=1 -timeout=300s -run 'FactoryE2E_|CliForgeDriver_' ./cmd/herd/
 
 preflight:
-	@echo "==> Running preflight workspace boundary checks..."
-	$(HERMETIC_GIT) go run ./cmd/herd preflight
+	@echo "==> Running preflight static workspace boundary and merge-policy checks..."
+	$(HERMETIC_GIT) go run ./cmd/herd preflight-static
 
 self-test: build
 	@echo "==> Running compiled Herdforge self-test suite against ITSELF..."
