@@ -50,13 +50,16 @@ func peerPIDOfSocket(socketPath string) int {
 		return 0
 	}
 	for i, c := range path {
+		if c > 127 {
+			return 0
+		}
 		addr.Path[i] = int8(c)
 	}
 	_, _, errno := syscall.Syscall(syscall.SYS_CONNECT, uintptr(fd), uintptr(unsafe.Pointer(&addr)), unsafe.Sizeof(addr))
 	// Even if connect fails (auth), we may not get peer. Use getsockopt after successful dial in client.
 	_ = errno
 	// Fallback: lsof
-	out, err := exec.Command("/usr/sbin/lsof", "-t", socketPath).Output()
+	out, err := exec.Command("/usr/sbin/lsof", "-t", "--", socketPath).Output()
 	if err != nil {
 		return 0
 	}

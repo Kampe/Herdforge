@@ -19,10 +19,11 @@ func parseKERNProcargs2(data []byte) ([]string, error) {
 	if len(data) < 4 {
 		return nil, fmt.Errorf("procargs2 buffer too short: %d", len(data))
 	}
-	argc := int(int32(binary.LittleEndian.Uint32(data[:4])))
-	if argc <= 0 || argc > 4096 {
-		return nil, fmt.Errorf("procargs2 argc invalid: %d", argc)
+	argcRaw := binary.LittleEndian.Uint32(data[:4])
+	if argcRaw == 0 || argcRaw > 4096 {
+		return nil, fmt.Errorf("procargs2 argc invalid: %d", argcRaw)
 	}
+	argc := int(argcRaw)
 
 	i := 4
 	// Executable path.

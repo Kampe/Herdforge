@@ -50,7 +50,7 @@ func openKeyVerified(path string, wantUID int) (*os.File, error) {
 		_ = f.Close()
 		return nil, fmt.Errorf("%w: cannot recheck inode", ErrProvisioning)
 	}
-	if uint64(lst.Dev) != uint64(st.Dev) || uint64(lst.Ino) != uint64(st.Ino) {
+	if lst.Dev < 0 || st.Dev < 0 || lst.Ino < 0 || st.Ino < 0 || uint64(lst.Dev) != uint64(st.Dev) || uint64(lst.Ino) != uint64(st.Ino) {
 		_ = f.Close()
 		return nil, fmt.Errorf("%w: path replaced between open and recheck (TOCTOU)", ErrKeyExposed)
 	}

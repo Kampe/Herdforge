@@ -28,6 +28,14 @@ jobs:
           go-version: "1.26"
           cache: true
 
+      - name: Set up pinned gosec
+        run: go install github.com/securego/gosec/v2/cmd/gosec@v2.22.10
+
+      # Gitleaks v2 (resolved 2026-08-14); immutable revision for the
+      # history/current-source gate executed by make security.
+      - name: Set up pinned Gitleaks
+        uses: gitleaks/gitleaks-action@dcedce43c6f43de0b836d1fe38946645c9c638dc
+
       # Pinned to setup-trivy v0.3.1. This installs the scanner consumed by
       # make lint's tracked-module HIGH/CRITICAL dependency gate.
       - name: Set up Trivy

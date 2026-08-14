@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 
 	"github.com/Kampe/Herdforge/pkg/claim"
@@ -365,7 +366,7 @@ func (k *KaneoProvider) mutateStatusFullSchemaPUT(ctx context.Context, taskID, s
 		}
 	}
 	body, _ := json.Marshal(payload)
-	url := fmt.Sprintf("%s/api/task/%s", strings.TrimRight(apiURL, "/"), taskID)
+	url := fmt.Sprintf("%s/api/task/%s", strings.TrimRight(apiURL, "/"), url.PathEscape(taskID))
 	req, err := http.NewRequestWithContext(ctx, http.MethodPut, url, bytes.NewBuffer(body))
 	if err != nil {
 		return err
@@ -409,7 +410,7 @@ func (k *KaneoProvider) postCommentDirect(ctx context.Context, taskID, body stri
 		}
 		return k.runCLIMutate(ctx, args...)
 	}
-	url := fmt.Sprintf("%s/api/task/%s/comment", k.APIURL, taskID)
+	url := fmt.Sprintf("%s/api/task/%s/comment", k.APIURL, url.PathEscape(taskID))
 	payload := map[string]string{"body": body}
 	buf, _ := json.Marshal(payload)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewBuffer(buf))
