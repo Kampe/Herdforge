@@ -358,6 +358,9 @@ func main() {
 	case "lifecycle":
 		runLifecycle()
 
+	case "timeline":
+		runTimeline()
+
 	case "resources":
 		runResources()
 

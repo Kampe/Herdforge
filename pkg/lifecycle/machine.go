@@ -5,8 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/Kampe/Herdforge/pkg/outbox"
+	"github.com/Kampe/Herdforge/pkg/timeline"
 )
 
 var (
@@ -29,6 +31,9 @@ var (
 	// with a fresh Machine.Transition call — never resume this one, since
 	// whatever it decided (FromState, seq) was based on stale data.
 	ErrConcurrentModification = errors.New("lifecycle: concurrent modification detected")
+	// ErrTimelineBindingTaskMismatch refuses a transition that would be
+	// observed under another task's trusted timeline binding.
+	ErrTimelineBindingTaskMismatch = errors.New("lifecycle: timeline binding task does not match transition task")
 )
 
 // TransitionRequest describes one attempted state change. Every mutating
@@ -75,10 +80,12 @@ type TransitionResult struct {
 // behind one atomic operation: validate, append, enqueue side effects,
 // commit.
 type Machine struct {
-	mu     sync.Mutex
-	db     *sql.DB
-	events *EventStore
-	out    *outbox.Store
+	mu       sync.Mutex
+	db       *sql.DB
+	events   *EventStore
+	out      *outbox.Store
+	timeline *timeline.Store
+	binding  timeline.Binding
 }
 
 // NewMachine opens (or creates) a SQLite database at path, applies the
@@ -107,6 +114,21 @@ func NewMachineWithDB(db *sql.DB) (*Machine, error) {
 
 // EventStore returns the underlying event store (read model + history).
 func (m *Machine) EventStore() *EventStore { return m.events }
+
+// AttachTimeline adds a secondary execution observation log. Lifecycle remains
+// the authority: the sink observes only committed lifecycle events.
+func (m *Machine) AttachTimeline(sink *timeline.Store, binding timeline.Binding) error {
+	if sink == nil {
+		return fmt.Errorf("lifecycle timeline: store is required")
+	}
+	if _, err := timeline.FromLifecycle(binding, timeline.LifecycleEvent{ID: 1, ToState: "probe", Time: time.Now().UTC()}); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.timeline, m.binding = sink, binding
+	return nil
+}
 
 // Outbox returns the underlying transactional outbox (for a Relay to
 // drain, or for tests/inspection).
@@ -144,6 +166,12 @@ func (m *Machine) Transition(req TransitionRequest) (TransitionResult, error) {
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	// A configured timeline binding is an exact correlation fence, not a
+	// display label. Check before beginning a transaction so a cross-task
+	// request cannot mutate lifecycle state or create an observation.
+	if m.timeline != nil && req.TaskRef != m.binding.Task {
+		return TransitionResult{}, fmt.Errorf("%w: binding=%q request=%q", ErrTimelineBindingTaskMismatch, m.binding.Task, req.TaskRef)
+	}
 
 	tx, err := m.db.Begin()
 	if err != nil {
@@ -157,6 +185,18 @@ func (m *Machine) Transition(req TransitionRequest) (TransitionResult, error) {
 	}
 	if err := tx.Commit(); err != nil {
 		return TransitionResult{}, fmt.Errorf("transition: commit: %w", err)
+	}
+	if m.timeline != nil {
+		envelope, err := timeline.FromLifecycle(m.binding, timeline.LifecycleEvent{
+			ID: result.Event.ID, ToState: string(result.Event.ToState), Actor: result.Event.Actor,
+			Evidence: result.Event.EvidenceDigest, Time: result.Event.CreatedAt,
+		})
+		if err != nil {
+			return TransitionResult{}, err
+		}
+		if err := m.timeline.Append(envelope); err != nil {
+			return TransitionResult{}, fmt.Errorf("transition: append timeline event: %w", err)
+		}
 	}
 	return result, nil
 }
