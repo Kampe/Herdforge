@@ -31,6 +31,9 @@ var (
 	// with a fresh Machine.Transition call — never resume this one, since
 	// whatever it decided (FromState, seq) was based on stale data.
 	ErrConcurrentModification = errors.New("lifecycle: concurrent modification detected")
+	// ErrTimelineBindingTaskMismatch refuses a transition that would be
+	// observed under another task's trusted timeline binding.
+	ErrTimelineBindingTaskMismatch = errors.New("lifecycle: timeline binding task does not match transition task")
 )
 
 // TransitionRequest describes one attempted state change. Every mutating
@@ -163,6 +166,12 @@ func (m *Machine) Transition(req TransitionRequest) (TransitionResult, error) {
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	// A configured timeline binding is an exact correlation fence, not a
+	// display label. Check before beginning a transaction so a cross-task
+	// request cannot mutate lifecycle state or create an observation.
+	if m.timeline != nil && req.TaskRef != m.binding.Task {
+		return TransitionResult{}, fmt.Errorf("%w: binding=%q request=%q", ErrTimelineBindingTaskMismatch, m.binding.Task, req.TaskRef)
+	}
 
 	tx, err := m.db.Begin()
 	if err != nil {
