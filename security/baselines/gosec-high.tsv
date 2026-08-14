@@ -57,7 +57,6 @@ G703	pkg/toolchild/inventory.go	612	c0a04ad91f62313cd91c57658c6a7c8e4b1667a98a0b
 G703	pkg/toolchild/inventory.go	867	555a843d9409c501866cc088327fea962d62e1e86c2d23d164cd584c526cfb19	reads a lock-held receipt path after unsafe-teardown validation	toolchild-maintainers	2026-12-31
 G703	scripts/check-coverage-floors.go	32	66752bfa1007d92a83a16ecfedba4a64a442d2a1d6dfffc92de2d90ab7382383	read-only coverage profile supplied by the controlled Makefile coverage target	build-maintainers	2026-12-31
 G703	scripts/hermeticity/check.go	123	848e0bb533e28d97dc04f66e802003fcdef79d881412e69002942409a480f0b6	read-only source walk rooted by the hermeticity gate; excludes generated and VCS trees	build-maintainers	2026-12-31
-G704	pkg/provider/kaneo.go	564	deb56120a855a381faffc8e8663219951201d9479970ff232142fa02b932ca0a	Kaneo task identifier is URL-path-escaped before constructing the configured API request	provider-maintainers	2026-12-31
 G704	pkg/provider/kaneo.go	569	9eab346acbfc851be3ca1992d49b7f840b5cd91ff35f7e8fb2ee9bf8b251921e	authorized request targets configured Kaneo API origin with path-escaped task identifier	provider-maintainers	2026-12-31
 G704	pkg/provider/kaneo_fence.go	370	10a7ab35edea771e89670596e2c2ad8f252078929e0f6ed50d967b4542c39d8c	path-escaped task request targets configured Kaneo API origin	provider-maintainers	2026-12-31
 G704	pkg/provider/kaneo_fence.go	377	22aa1414590c56ae28d46911eb7eaaf67a4b2ae9c5d0eeb5f5bb3b6bc945cd48	authorized fence-header request targets configured Kaneo API origin with escaped task identifier	provider-maintainers	2026-12-31
