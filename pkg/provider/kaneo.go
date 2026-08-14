@@ -560,7 +560,7 @@ func (k *KaneoProvider) getTaskOnce(ctx context.Context, id string) (*Task, erro
 		return dtoToTask(dto), nil
 	}
 
-	url := fmt.Sprintf("%s/api/task/%s", k.APIURL, id)
+	url := fmt.Sprintf("%s/api/task/%s", k.APIURL, url.PathEscape(id))
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, err

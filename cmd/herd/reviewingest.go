@@ -255,8 +255,8 @@ func runHarvestMerge() {
 	// Cleanup runs on the FAILURE path only — the worktree is deliberately kept
 	// on success so the coordinator can push from it.
 	cleanup := func() {
-		exec.Command("git", "worktree", "remove", "--force", dir).Run()
-		exec.Command("git", "branch", "-D", plan.TempBranch).Run()
+		exec.Command("git", "worktree", "remove", "--force", "--", dir).Run()
+		exec.Command("git", "branch", "-D", "--", plan.TempBranch).Run()
 	}
 
 	if err != nil {
@@ -277,11 +277,11 @@ func runHarvestMerge() {
 // can run cleanup via a deferred function — os.Exit skips defers, which would
 // leak the worktree on exactly the failure paths where it matters most.
 func harvestBody(dir, base, tempBranch string, commits []string, allowMarkers bool) error {
-	if out, addErr := exec.Command("git", "worktree", "add", "-B", tempBranch, dir, base).CombinedOutput(); addErr != nil {
+	if out, addErr := exec.Command("git", "worktree", "add", "-B", tempBranch, "--", dir, base).CombinedOutput(); addErr != nil {
 		return fmt.Errorf("worktree add: %v: %s", addErr, out)
 	}
 	for _, c := range commits {
-		out, pickErr := exec.Command("git", "-C", dir, "cherry-pick", c).CombinedOutput()
+		out, pickErr := exec.Command("git", "-C", dir, "cherry-pick", "--", c).CombinedOutput()
 		if pickErr == nil {
 			continue
 		}

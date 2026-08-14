@@ -1,7 +1,6 @@
 package security
 
 import (
-	"crypto/tls"
 	"io"
 	"net"
 	"net/http"
@@ -79,7 +78,9 @@ func ProveExactSessionHostCreds(sess *HostCredsSession, secret, allowedMarker st
 		}
 	}
 	sess.Oracle.allowLoopback = true
-	sess.Oracle.upstreamTLS = &tls.Config{InsecureSkipVerify: true, MinVersion: tls.VersionTLS12, ServerName: "127.0.0.1"}
+	// Reuse the httptest server's root CA instead of disabling verification.
+	// The dial hook below still proves the oracle can only reach loopback.
+	sess.Oracle.upstreamTLS = upstream.Client().Transport.(*http.Transport).TLSClientConfig.Clone()
 	sess.Oracle.dialHook = func(network, addr string) (net.Conn, error) {
 		return net.Dial("tcp", net.JoinHostPort("127.0.0.1", upPort))
 	}
