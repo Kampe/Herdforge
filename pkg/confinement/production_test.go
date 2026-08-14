@@ -44,6 +44,10 @@ func gitInit(t *testing.T, dir string) {
 	run(dir, "git", "init")
 	run(dir, "git", "config", "user.email", "fac190@test.local")
 	run(dir, "git", "config", "user.name", "fac190")
+	// These fixtures must not inherit a developer's signing agent or hooks.
+	// They exercise confinement behavior, not local Git policy.
+	run(dir, "git", "config", "commit.gpgsign", "false")
+	run(dir, "git", "config", "core.hooksPath", "/dev/null")
 	run(dir, "git", "commit", "--allow-empty", "-m", "init")
 }
 
