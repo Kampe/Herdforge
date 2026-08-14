@@ -21,7 +21,6 @@ G702	pkg/signerboundary/rotate.go	299	0b0428224364111f2728ccdfbe6bc34a2ea8b8dce3
 G703	cmd/herd/clihelp.go	41	a45f948b9a0057f0dd051012e16eedd20a247fca37c02055195b9ef1efbde04b	HERD_HELP_PROBE is a test-only observability path and does not alter normal help behavior	cli-maintainers	2026-12-31
 G703	cmd/herd/drainadapt.go	418	fd8086147e22d9e2ed8976c9378a089cedb346e50e5cc4001ad52d01311a4df2	launch receipt path is coordinator-configured provenance input; default is repo-local durable receipt state	cli-maintainers	2026-12-31
 G703	cmd/herd/main.go	1911	3053027d59cf50079e443acc6dfaccea823d47835bc097fcb496749dd80eb520	rollback path derives from validated reviewer worktree and fixed TaskContextFile; restores prior receipt	cli-maintainers	2026-12-31
-G703	cmd/herd/main.go	5641	032e17cd34b6019b636deff508621dba1a5ec630c4932b7d26d16339c7074465	canonical root is launcher-provided shared checkout identity and accepted only when it exists as a directory	cli-maintainers	2026-12-31
 G703	cmd/herd/main.go	763	3cb300a33ca3b520d5f043426d0c1d4fc17b9d6a141268ae7cc8553bd4a67f2e	read-only existence check under the just-created clone target directory	cli-maintainers	2026-12-31
 G703	cmd/herd/roleinject.go	47	a01508ddf0491a4b7d6846843ac51990d180265a85235f57fc1f28c5a4607683	read-only diagnostic existence check for lane-bound repository-relative files	cli-maintainers	2026-12-31
 G703	pkg/activate/activate.go	437	9ebc75336d35863948dc8b7cb3381c2198bceb81ce3afa7b570286bedd2545fd	read-only file existence helper; callers retain path authorization	activate-maintainers	2026-12-31
