@@ -36,6 +36,15 @@ func TestWaitHandleGoneUsesPidfdOverReusedPIDToken(t *testing.T) {
 	}
 }
 
+func TestPidfdExitedHandlesInvalidFD(t *testing.T) {
+	if _, err := pidfdExited(-1); !errors.Is(err, errPidfdUnsupported) {
+		t.Fatalf("negative fd got %v, want %v", err, errPidfdUnsupported)
+	}
+	if _, err := pidfdExited(1 << 31); !errors.Is(err, errPidfdUnsupported) {
+		t.Fatalf("overflow fd got %v, want %v", err, errPidfdUnsupported)
+	}
+}
+
 func TestOwnedHandlePidfdSignalsOnlyLiveExactToken(t *testing.T) {
 	previousToken, previousZombie, previousSignal := tokenOfFn, processIsZombieFn, pidfdSendSignalFn
 	t.Cleanup(func() {

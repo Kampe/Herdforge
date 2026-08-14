@@ -119,7 +119,7 @@ func pidfdSendSignal(fd int, sig syscall.Signal) error {
 // exited. Unlike /proc start-time tokens, a pidfd cannot be confused with a
 // rapidly reused numeric PID.
 func pidfdExited(fd int) (bool, error) {
-	if fd < 0 {
+	if fd < 0 || fd > 1<<31-1 {
 		return false, errPidfdUnsupported
 	}
 	ready, err := unix.Poll([]unix.PollFd{{Fd: int32(fd), Events: unix.POLLIN}}, 0)
