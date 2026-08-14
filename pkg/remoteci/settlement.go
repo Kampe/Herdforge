@@ -38,10 +38,11 @@ var exactSHA = regexp.MustCompile(`^[0-9a-f]{40}$`)
 
 // Binding identifies the one immutable candidate a remote-CI result may settle.
 type Binding struct {
-	Repository     string `json:"repository"`
-	CandidateSHA   string `json:"candidate_sha"`
-	PolicyRevision string `json:"policy_revision"`
-	Attempt        int64  `json:"attempt"`
+	Repository     string   `json:"repository"`
+	CandidateSHA   string   `json:"candidate_sha"`
+	PolicyRevision string   `json:"policy_revision"`
+	Attempt        int64    `json:"attempt"`
+	RequiredChecks []string `json:"required_checks"`
 }
 
 // Settlement is the minimal durable, versioned remote-CI result.
@@ -58,6 +59,17 @@ func (b Binding) Validate() error {
 	}
 	if !exactSHA.MatchString(b.CandidateSHA) {
 		return fmt.Errorf("%w: candidate must be an exact lowercase immutable SHA", ErrInvalid)
+	}
+	if len(b.RequiredChecks) == 0 {
+		return fmt.Errorf("%w: required checks are required", ErrInvalid)
+	}
+	seen := map[string]bool{}
+	for _, check := range b.RequiredChecks {
+		name := strings.TrimSpace(check)
+		if name == "" || seen[strings.ToLower(name)] {
+			return fmt.Errorf("%w: required checks must be unique and non-empty", ErrInvalid)
+		}
+		seen[strings.ToLower(name)] = true
 	}
 	return nil
 }
@@ -85,7 +97,7 @@ func Settle(watch Binding, settlement Settlement) error {
 	if err := settlement.Validate(); err != nil {
 		return err
 	}
-	if watch != settlement.Binding {
+	if !sameBinding(watch, settlement.Binding) {
 		if watch.CandidateSHA != settlement.Binding.CandidateSHA {
 			return fmt.Errorf("%w: watch candidate %s does not match settlement candidate %s", ErrStale, watch.CandidateSHA, settlement.Binding.CandidateSHA)
 		}
@@ -143,7 +155,7 @@ func (s *Store) Register(binding Binding) (Settlement, bool, error) {
 		if watchKey(prior.Binding) != key {
 			continue
 		}
-		if prior.Binding != binding {
+		if !sameBinding(prior.Binding, binding) {
 			return Settlement{}, false, fmt.Errorf("%w: candidate/policy watch already belongs to another binding", ErrInvalid)
 		}
 		return prior, false, nil
@@ -180,7 +192,7 @@ func (s *Store) PersistTerminal(settlement Settlement) (bool, error) {
 		if watchKey(prior.Binding) != key {
 			continue
 		}
-		if prior.Binding != settlement.Binding {
+		if !sameBinding(prior.Binding, settlement.Binding) {
 			return false, fmt.Errorf("%w: settlement binding does not match registered watch", ErrInvalid)
 		}
 		found = true
@@ -219,7 +231,7 @@ func (s *Store) Load(binding Binding) (Settlement, error) {
 		if watchKey(prior.Binding) != key {
 			continue
 		}
-		if prior.Binding != binding {
+		if !sameBinding(prior.Binding, binding) {
 			return Settlement{}, fmt.Errorf("%w: candidate/policy watch belongs to another binding", ErrInvalid)
 		}
 		return prior, nil
@@ -248,7 +260,7 @@ func (s *Store) readLocked() ([]Settlement, error) {
 		}
 		key := watchKey(r.Settlement.Binding)
 		if prior, ok := byKey[key]; ok {
-			if prior.Binding != r.Settlement.Binding {
+			if !sameBinding(prior.Binding, r.Settlement.Binding) {
 				return nil, fmt.Errorf("%w: conflicting watch binding", ErrInvalid)
 			}
 			if prior.State != StatePending && r.Kind == "settlement" {
@@ -291,6 +303,18 @@ func (s *Store) appendLocked(r record) error {
 func watchKey(b Binding) string {
 	sum := sha256.Sum256([]byte(b.Repository + "\x00" + b.CandidateSHA + "\x00" + b.PolicyRevision))
 	return hex.EncodeToString(sum[:])
+}
+
+func sameBinding(left, right Binding) bool {
+	if left.Repository != right.Repository || left.CandidateSHA != right.CandidateSHA || left.PolicyRevision != right.PolicyRevision || left.Attempt != right.Attempt || len(left.RequiredChecks) != len(right.RequiredChecks) {
+		return false
+	}
+	for i := range left.RequiredChecks {
+		if left.RequiredChecks[i] != right.RequiredChecks[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // Revision creates an opaque deterministic revision for a policy snapshot.

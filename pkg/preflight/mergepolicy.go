@@ -35,7 +35,13 @@ type MergePolicy struct {
 
 	// RequirePullRequestReviews is the branch-protection analogue: a human or
 	// agent review verdict must exist. Defaults true for protected repos.
-	RequirePullRequestReviews bool `yaml:"require_pull_request_reviews"`
+	RequirePullRequestReviews bool           `yaml:"require_pull_request_reviews"`
+	RemoteCI                  RemoteCIPolicy `yaml:"remote_ci"`
+}
+
+type RemoteCIPolicy struct {
+	Required       bool     `yaml:"required"`
+	RequiredChecks []string `yaml:"required_checks"`
 }
 
 // DefaultProtectedPolicy is the fail-closed baseline when no policy file exists.
@@ -45,6 +51,7 @@ func DefaultProtectedPolicy() MergePolicy {
 		RequiredChecks:               []string{"Build, Preflight & Test Suite"},
 		RequireDifferentFamilyReview: true,
 		RequirePullRequestReviews:    true,
+		RemoteCI:                     RemoteCIPolicy{Required: true, RequiredChecks: []string{"Build, Preflight & Test Suite"}},
 	}
 }
 
@@ -106,6 +113,14 @@ func CheckMergePolicy(policy MergePolicy) MergePolicyReport {
 	if !policy.RequirePullRequestReviews {
 		rep.OK = false
 		rep.Reasons = append(rep.Reasons, "protected repository must require_pull_request_reviews")
+	}
+	if !policy.RemoteCI.Required {
+		rep.OK = false
+		rep.Reasons = append(rep.Reasons, "protected repository must declare remote_ci.required")
+	}
+	if len(normalizeNames(policy.RemoteCI.RequiredChecks)) == 0 {
+		rep.OK = false
+		rep.Reasons = append(rep.Reasons, "protected repository declares no remote_ci.required_checks")
 	}
 
 	if !rep.OK && len(rep.Reasons) == 0 {
