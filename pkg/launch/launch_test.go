@@ -450,7 +450,7 @@ func TestOrdinaryRequestCannotBypassProductionDiscovery(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), string(harness.HookCodeUnavailable)) {
 		t.Fatalf("ordinary request discovery result = %v", err)
 	}
-	if len(sink.Receipts) != 1 || sink.Receipts[0].HookCode != string(harness.HookCodeUnavailable) || sink.Receipts[0].Reason != "" {
+	if len(sink.Receipts) != 1 || sink.Receipts[0].HookCode != string(harness.HookCodeUnavailable) || !strings.HasPrefix(sink.Receipts[0].Reason, "launch hook preflight failed:") {
 		t.Fatalf("discovery failure receipt = %+v", sink.Receipts)
 	}
 }
@@ -504,7 +504,7 @@ func TestClaudeCommandIncidentRequiresBoundHealthPolicyBeforeEffects(t *testing.
 			break
 		}
 	}
-	if rejection.Kind != "launch_rejected" || rejection.HookCode != string(harness.HookCodeUnavailable) || !strings.HasPrefix(rejection.HookName, "claude:") || len(rejection.HookName) < len("claude:")+64 || rejection.PolicyRevision == "" {
+	if rejection.Kind != "launch_rejected" || rejection.HookCode != string(harness.HookCodeHealthMalformed) || !strings.HasPrefix(rejection.HookName, "claude:") || len(rejection.HookName) < len("claude:")+64 || rejection.PolicyRevision == "" || rejection.Role == "" || rejection.TaskShape == "" || rejection.Provider == "" || rejection.Model == "" || rejection.Effort == "" || rejection.DecisionDigest == "" {
 		t.Fatalf("rejection attribution lost full digest/revision: %+v", sink.Receipts)
 	}
 }
@@ -520,7 +520,7 @@ func TestHookReceiptRedactsAuthorityAndIsStable(t *testing.T) {
 		t.Fatalf("receipts = %+v", sink.Receipts)
 	}
 	receipt := sink.Receipts[0]
-	if receipt.Reason != "" || strings.Contains(receipt.RedactedAuthority, "secret") || strings.Contains(receipt.RedactedAuthority, "http") || receipt.HookCode == "" {
+	if !strings.HasPrefix(receipt.Reason, "launch hook preflight failed:") || strings.Contains(receipt.RedactedAuthority, "secret") || strings.Contains(receipt.RedactedAuthority, "http") || receipt.HookCode == "" {
 		t.Fatalf("unredacted hook receipt = %+v", receipt)
 	}
 }
