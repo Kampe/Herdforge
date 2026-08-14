@@ -1,51 +1,6 @@
 # rule	file	line	fingerprint	rationale	owner	expires (UTC)
 # Entries are generated from rule|repo-relative-file|line with SHA-256.  They
 # must exactly match every unresolved HIGH/CRITICAL gosec finding.
-G702	cmd/herd/main.go	3440	c3c28f7deae4bb9ec2d78348d1f0bedd3854a230d870d3fecfb0ce0294bc9cdd	interactive herd shell re-execs only the current executable; arguments are not interpreted by a shell	cli-maintainers	2026-12-31
-G702	cmd/herd/main.go	5835	bbafb41ad8dc35cefd049a3b33ae4731d9cefacab966d01f4759e29fa2a5bb84	locked-child executor uses a binary selected from the fixed allowed map and protocol-vetted arguments; no shell	cli-maintainers	2026-12-31
-G702	cmd/herd/reviewclassify.go	128	a8dcbccbba9abde1aae6ed5a7a66c7ecc6c0f40c09de4e40e1d1208b6308830a	git binary is fixed; base and target are review protocol revisions, never shell-interpreted	cli-maintainers	2026-12-31
-G702	cmd/herd/reviewingest.go	258	748f7a75ddee522ef8f86de0132f16958bac2121b740faecc9179560db49d695	worktree path follows git --; branch follows git -- and is internal temporary plan data	cli-maintainers	2026-12-31
-G702	cmd/herd/reviewingest.go	294	29613e021a663b8b76a6f926563ff296fdaba08fbed07c1ed3474b67abd82848	git status has fixed arguments and runs only in the bound worktree directory	cli-maintainers	2026-12-31
-G702	cmd/herd/reviewingest.go	296	32fa72df94f4ac92fdf11940817c98a38e1667d18fb023bbd7538029ec4ae2b7	git cherry-pick --skip has fixed arguments and runs only in the bound worktree directory	cli-maintainers	2026-12-31
-G702	cmd/herd/reviewingest.go	297	a7ac5df3a461284c242b2963c3e862ca91f35bd88a0b883eca73dc24e3e2cd3f	git cherry-pick --abort has fixed arguments and runs only in the bound worktree directory	cli-maintainers	2026-12-31
-G702	cmd/herd/reviewingest.go	303	70354f11abb4e617356e5f9323936074cbc016b52e673c50905235ffb6ea8b21	git cherry-pick --abort has fixed arguments and runs only in the bound worktree directory	cli-maintainers	2026-12-31
-G702	cmd/herd/reviewingest.go	311	3606aa3b030ef0fed668cff0e3b6786ad6eff8c2d92c99d0f916f18efbbdbe46	git binary is fixed; worktree directory is bound and comparison is internal base-to-HEAD	cli-maintainers	2026-12-31
-G702	pkg/signerboundary/attach_darwin.go	62	7ebf926b4e98c2a9c721c8bc485b5234ec55444231442e8ad8853bc73a737ee5	fixed absolute lsof binary; trusted Unix socket operand follows --	signerboundary-maintainers	2026-12-31
-G702	pkg/signerboundary/launch.go	442	7b7dc0e53bcd5bff348178de26bbff9c51ec50179489b118da96917bf52b28be	direct-argv signer launcher; executable and arguments are validated by the signer launch policy	 signerboundary-maintainers	2026-12-31
-G703	cmd/herd/clihelp.go	41	a45f948b9a0057f0dd051012e16eedd20a247fca37c02055195b9ef1efbde04b	HERD_HELP_PROBE is a test-only observability path and does not alter normal help behavior	cli-maintainers	2026-12-31
-G703	cmd/herd/drainadapt.go	418	fd8086147e22d9e2ed8976c9378a089cedb346e50e5cc4001ad52d01311a4df2	launch receipt path is coordinator-configured provenance input; default is repo-local durable receipt state	cli-maintainers	2026-12-31
-G703	cmd/herd/main.go	1911	3053027d59cf50079e443acc6dfaccea823d47835bc097fcb496749dd80eb520	rollback path derives from validated reviewer worktree and fixed TaskContextFile; restores prior receipt	cli-maintainers	2026-12-31
-G703	cmd/herd/roleinject.go	47	a01508ddf0491a4b7d6846843ac51990d180265a85235f57fc1f28c5a4607683	read-only diagnostic existence check for lane-bound repository-relative files	cli-maintainers	2026-12-31
-G703	pkg/activate/activate.go	437	9ebc75336d35863948dc8b7cb3381c2198bceb81ce3afa7b570286bedd2545fd	read-only file existence helper; callers retain path authorization	activate-maintainers	2026-12-31
-G703	pkg/confinement/os.go	375	ad62f4d6a5661a2b613a238c6822e4c360f93b5e78c23f9c8b14d6c77b6c1a33	best-effort restoration of a probe file previously constrained by writeUnder profile and validated worktree path	confinement-maintainers	2026-12-31
-G703	pkg/confinement/os.go	382	09ce171266310df22de749ee200b034c93c562af6c9f64596bb64705ad2864a1	best-effort restoration of the same constrained probe file after post-write verification	confinement-maintainers	2026-12-31
-G703	pkg/credits/identity.go	18	e88e0e945ee00a5281dc6a84fb83676c060c5ef3fb3bc53d913812533d086e13	read-only local Claude account identity sidecar; directory is explicit or user-local configuration	credits-maintainers	2026-12-31
-G703	pkg/harness/harness.go	278	ff3aa7c9a39c759dc15a00373701dafb4d88fec66a00994102f59029330224e4	read-only existence check before fail-closed override discovery of harness hook configuration	harness-maintainers	2026-12-31
-G703	pkg/lanestate/lanestate.go	131	614c8e1cbaf7b3ae1b970baba54ff4e6159158b11e156badab5ac5446f656cda	restores verified-good lane artifact from durable snapshot to the lane state destination	lanestate-maintainers	2026-12-31
-G703	pkg/lifecycle/lifecycle.go	352	f3e610002de5e70594424134f186cc5357460d20a43960b5bfcadd65b76966c8	atomic lifecycle artifact write using validated root and deterministic filename	lifecycle-maintainers	2026-12-31
-G703	pkg/lifecycle/lifecycle.go	964	f5e7ed1c7d1fdd74191b1fcbadbf2033425cb5d14ff0fa6adf79ef52eea5e5af	read-only lane progress file beneath validated worktree and lifecycle state roots	lifecycle-maintainers	2026-12-31
-G703	pkg/security/broker_control.go	64	5840d20d4175cac1e2c1cc31609d7b6878ed4f5ec0b00ac83b7b46e1981728eb	read-only coordinator control-state decoder; caller supplies the broker-bound durable state path	security-maintainers	2026-12-31
-G703	pkg/security/contain.go	520	6288fe8d679734599613e4afe9c7395ade4421ea594bd3f168d85042a6b0113f	updates generated containment profile after caller-bound profile read; executable literal is policy-approved	security-maintainers	2026-12-31
-G703	pkg/security/durable_broker.go	156	f694565aa6e3b3abe28c2d79e03a2e082f631154c4a80a0dcfc5afc5daa9f753	read-only durable broker state before coordinator-only shutdown and sibling cleanup	security-maintainers	2026-12-31
-G703	pkg/security/durable_broker.go	176	1263df67af7d3aefe04645eeb4e7ea33d0caaff6afd6b680e66ee7d0e2955e79	removes stale broker state only when recorded PID is non-positive and control state cannot be read	security-maintainers	2026-12-31
-G703	pkg/security/durable_broker.go	185	65abf4555ad9a6ffc6474f7c4a9021be954a19123882016c6d9d49146a660ad7	cleans stale sibling control file only after recorded broker PID is confirmed dead	security-maintainers	2026-12-31
-G703	pkg/security/durable_broker.go	196	33dd0304eb56d48b935322af8b87d10096c087a5054635704d79ca59134ff604	removes stale broker state only after authenticated control ping fails and PID is not alive	security-maintainers	2026-12-31
-G703	pkg/security/durable_broker.go	222	fa135326a5a3e8b5238eec1dea1ff51729af9e935d115cc86bf16f5aec6f316b	removes broker state only after broker control shutdown and process termination are proven	security-maintainers	2026-12-31
-G703	pkg/security/durable_broker.go	250	ed0bd652f38ae308780475b82568bdd70be8365889ff1fc58763fdb099b0f90a	removes sibling control file only after authenticated ping failure and dead-process liveness check	security-maintainers	2026-12-31
-G703	pkg/security/durable_broker.go	276	ad4783ccf68e5b4c57dc241db1bddcee01636cca43ae10953dac05b88d3a7d25	removes sibling control file only after control shutdown and dead-process liveness check	security-maintainers	2026-12-31
-G703	pkg/security/durable_broker.go	536	6c7b0b356a6a58a50b8024d2ebfb225d07e6f2f64a6032e2ffdfc33b32dcb2d5	read-only durable broker state decoder; caller supplies broker-bound state path	security-maintainers	2026-12-31
-G703	pkg/security/hostcreds_author_causal.go	127	efe2480836ad31e6cda04d655e3af06bf3ff60cca1b29be2bf781e4d5097a17c	read-only operator SSL_CERT_FILE trust-store override; certificate parsing must succeed before use	hostcreds-maintainers	2026-12-31
-G703	pkg/signerboundary/rotate.go	184	14342f242cd46355c8a5cdd7194ef68cd37f2dc13293cc523ad3eaac3e4bd763	removes controlled signer socket after terminating its recorded process	signerboundary-maintainers	2026-12-31
-G703	pkg/signerboundary/rotate.go	185	28700491842e597372dc55bdc4a6a471b8cbf319b6d079174d603d917824bbaf	removes controlled signer nonce sidecar after terminating its recorded process	signerboundary-maintainers	2026-12-31
-G703	pkg/signerboundary/rotate.go	321	890093b931c2b4f8be7fc1b1a6275387592b23a645df141c888f43261255d359	verifies controlled signer socket creation after restarting the boundary service	signerboundary-maintainers	2026-12-31
-G703	pkg/toolchild/inventory.go	612	c0a04ad91f62313cd91c57658c6a7c8e4b1667a98a0b88bc7c196889287f7eb3	creates a mode-0600 lock sidecar for the caller-authorized receipt path	toolchild-maintainers	2026-12-31
-G703	pkg/toolchild/inventory.go	867	555a843d9409c501866cc088327fea962d62e1e86c2d23d164cd584c526cfb19	reads a lock-held receipt path after unsafe-teardown validation	toolchild-maintainers	2026-12-31
-G703	scripts/hermeticity/check.go	123	848e0bb533e28d97dc04f66e802003fcdef79d881412e69002942409a480f0b6	read-only source walk rooted by the hermeticity gate; excludes generated and VCS trees	build-maintainers	2026-12-31
-G704	pkg/provider/kaneo.go	569	9eab346acbfc851be3ca1992d49b7f840b5cd91ff35f7e8fb2ee9bf8b251921e	authorized request targets configured Kaneo API origin with path-escaped task identifier	provider-maintainers	2026-12-31
-G704	pkg/provider/kaneo_fence.go	370	10a7ab35edea771e89670596e2c2ad8f252078929e0f6ed50d967b4542c39d8c	path-escaped task request targets configured Kaneo API origin	provider-maintainers	2026-12-31
-G704	pkg/provider/kaneo_fence.go	377	22aa1414590c56ae28d46911eb7eaaf67a4b2ae9c5d0eeb5f5bb3b6bc945cd48	authorized fence-header request targets configured Kaneo API origin with escaped task identifier	provider-maintainers	2026-12-31
-G704	pkg/provider/kaneo_fence.go	526	81b3f83535a1122d3d3bd77512a8979c8cee801721e62ba8ed1be604f3769ba4	Kaneo comment request path-escapes task identifier before configured API request construction	provider-maintainers	2026-12-31
-G704	pkg/provider/kaneo_fence.go	532	0c3b853cc61c16ef61710b38d547583f521429dee1291c7a849a0fc24f7396e2	authorized comment request targets configured Kaneo API origin with escaped task identifier	provider-maintainers	2026-12-31
 G101	cmd/herd/hostcreds.go	262	da49ffbd1ec9368041bfff7c4345a1cd55ba539a8a2da2fca004326e8440d10b	deterministic self-test bearer value	hostcreds-maintainers	2026-12-31
 G101	pkg/agentpolicy/enforce.go	14	e61726f2a438054615e49439bb48420246827ce448ef634cdf5c50ef4f641fc6	environment variable name only	security-maintainers	2026-12-31
 G101	pkg/envplan/envplan.go	36	1bd68f2084d85b2a890bd0cfd9017eeffc207af2197440d935c3797dd8472405	capability label only	envplan-maintainers	2026-12-31
@@ -59,6 +14,3 @@ G101	pkg/security/hostcreds_types.go	35	13541011f25f2a60d93a87e3f24253fc59d11a0b
 G101	pkg/verifier/lifecycle.go	159-183	7e70472cbc8bdc0ae9b9222821003dc0fbca3d9a5431b38b3fe81aaaa374e04a	wrapper-shell variable is command path, never credential	verifier-maintainers	2026-12-31
 G101	contracts/agentscope/trusted_job.go	89	a790a64522d45a97d5a76a67b08c1fe46fd88172d387fdfc67ba34d727b51936	violation-code label only; no credential value	security-maintainers	2026-12-31
 G101	contracts/agentscope/types.go	197	aa9e9e12814ff9aa84daa8100814a1890ff27646d5e139ce301a3ffa090962f3	violation-code label only; no credential value	security-maintainers	2026-12-31
-G122	pkg/memory/memory.go	77	03cce687a63d5c6b129a06634b4818cdd96bd4e6afc8749f5bd49be0446c5eb6	read-only local memory search; follow-up should migrate traversal to descriptor-rooted reads	memory-maintainers	2026-12-31
-
-G122	pkg/preflight/signal_literals.go	52	799a101a33d4ba122c4cefba9120adb6be40c3538c397253a5d43524e7e7064a	walk does not follow symlinks and reads only discovered regular source files	preflight-maintainers	2026-12-31
