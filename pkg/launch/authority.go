@@ -141,10 +141,12 @@ func validateSnapshot(s Snapshot) error {
 	}
 	states := map[string]state{}
 	max := map[string]int64{}
-	for i, e := range s.Events {
-		if e.Sequence != uint64(i)+1 {
+	var expectedSequence uint64 = 1
+	for _, e := range s.Events {
+		if e.Sequence != expectedSequence {
 			return errors.New("corrupt launch state: invalid event sequence")
 		}
+		expectedSequence++
 		if e.Kind != "reserved" && e.Kind != "accepted" && e.Kind != "rejected" && e.Kind != "superseded" && e.Kind != "terminal" {
 			return errors.New("corrupt launch state: unknown transition")
 		}
