@@ -51,7 +51,6 @@ G703	pkg/signerboundary/rotate.go	185	28700491842e597372dc55bdc4a6a471b8cbf319b6
 G703	pkg/signerboundary/rotate.go	321	890093b931c2b4f8be7fc1b1a6275387592b23a645df141c888f43261255d359	verifies controlled signer socket creation after restarting the boundary service	signerboundary-maintainers	2026-12-31
 G703	pkg/toolchild/inventory.go	612	c0a04ad91f62313cd91c57658c6a7c8e4b1667a98a0b88bc7c196889287f7eb3	creates a mode-0600 lock sidecar for the caller-authorized receipt path	toolchild-maintainers	2026-12-31
 G703	pkg/toolchild/inventory.go	867	555a843d9409c501866cc088327fea962d62e1e86c2d23d164cd584c526cfb19	reads a lock-held receipt path after unsafe-teardown validation	toolchild-maintainers	2026-12-31
-G703	scripts/check-coverage-floors.go	32	66752bfa1007d92a83a16ecfedba4a64a442d2a1d6dfffc92de2d90ab7382383	read-only coverage profile supplied by the controlled Makefile coverage target	build-maintainers	2026-12-31
 G703	scripts/hermeticity/check.go	123	848e0bb533e28d97dc04f66e802003fcdef79d881412e69002942409a480f0b6	read-only source walk rooted by the hermeticity gate; excludes generated and VCS trees	build-maintainers	2026-12-31
 G704	pkg/provider/kaneo.go	569	9eab346acbfc851be3ca1992d49b7f840b5cd91ff35f7e8fb2ee9bf8b251921e	authorized request targets configured Kaneo API origin with path-escaped task identifier	provider-maintainers	2026-12-31
 G704	pkg/provider/kaneo_fence.go	370	10a7ab35edea771e89670596e2c2ad8f252078929e0f6ed50d967b4542c39d8c	path-escaped task request targets configured Kaneo API origin	provider-maintainers	2026-12-31
