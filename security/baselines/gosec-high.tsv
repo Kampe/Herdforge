@@ -69,5 +69,4 @@ G101	contracts/agentscope/trusted_job.go	89	a790a64522d45a97d5a76a67b08c1fe46fd8
 G101	contracts/agentscope/types.go	197	aa9e9e12814ff9aa84daa8100814a1890ff27646d5e139ce301a3ffa090962f3	violation-code label only; no credential value	security-maintainers	2026-12-31
 G122	pkg/memory/memory.go	77	03cce687a63d5c6b129a06634b4818cdd96bd4e6afc8749f5bd49be0446c5eb6	read-only local memory search; follow-up should migrate traversal to descriptor-rooted reads	memory-maintainers	2026-12-31
 
-G122	pkg/preflight/preflight.go	41	5c8876062c39bfb493ec2a3fe51556b9512b85caef5f48d426674c2dbf95adc0	walk does not follow symlinks and reads only discovered regular source files	preflight-maintainers	2026-12-31
 G122	pkg/preflight/signal_literals.go	52	799a101a33d4ba122c4cefba9120adb6be40c3538c397253a5d43524e7e7064a	walk does not follow symlinks and reads only discovered regular source files	preflight-maintainers	2026-12-31
