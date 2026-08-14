@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/Kampe/Herdforge/pkg/preflight"
+	"github.com/Kampe/Herdforge/pkg/remoteci"
 	"github.com/Kampe/Herdforge/pkg/residual"
 	"github.com/Kampe/Herdforge/pkg/reviewledger"
 )
@@ -29,6 +30,7 @@ const (
 	CodeProofFailed     = "integration_proof_failed"
 	CodeReceiptReadback = "receipt_readback_failed"
 	CodeResidual        = "residual_linkage_missing"
+	CodeRemoteCI        = "remote_ci_not_settled"
 )
 
 // ErrRestartAdmission marks the class of refusal where nothing is wrong with
@@ -72,6 +74,9 @@ type Request struct {
 	// Residuals are exact board-revision context. Admission requires linked
 	// provider readback and refuses any still-required acceptance criterion.
 	Residuals []residual.Record
+	// RemoteCI is the exact candidate, policy, repository, and attempt-bound
+	// settlement that policy requires before a local admission may proceed.
+	RemoteCI *remoteci.Settlement
 }
 
 // Decision is the structured admission outcome. Callers gate SOLELY on
@@ -107,6 +112,10 @@ type Gate struct {
 	// Policy is the repository's declared merge contract. Load it with
 	// preflight.LoadMergePolicy; the zero value is refused.
 	Policy preflight.MergePolicy
+	// RemoteCIPolicyRevision is the compiled revision of the admission policy.
+	// When non-empty it requires a passed remote settlement bound to this repo.
+	RemoteCIRepository     string
+	RemoteCIPolicyRevision string
 }
 
 // ComputeAcceptanceDigest binds a merge to one exact board card revision. A
@@ -202,6 +211,21 @@ func (g *Gate) Admit(req Request) (*Decision, error) {
 	// merged autonomously under it (FAC-135).
 	if rep := preflight.CheckMergePolicy(g.Policy); !rep.OK {
 		return g.refuse(req, CodeNotDeclared, "autonomous merge refused: %s", strings.Join(rep.Reasons, "; "))
+	}
+	if g.RemoteCIPolicyRevision != "" {
+		if req.RemoteCI == nil {
+			return g.refuse(req, CodeRemoteCI, "remote CI settlement is required by merge policy")
+		}
+		if err := req.RemoteCI.Validate(); err != nil {
+			return g.refuse(req, CodeRemoteCI, "remote CI settlement is invalid: %v", err)
+		}
+		if req.RemoteCI.State != remoteci.StatePassed {
+			return g.refuse(req, CodeRemoteCI, "remote CI state %q is not a passing terminal settlement", req.RemoteCI.State)
+		}
+		b := req.RemoteCI.Binding
+		if b.Repository != g.RemoteCIRepository || b.PolicyRevision != g.RemoteCIPolicyRevision || b.CandidateSHA != req.CandidateSHA {
+			return g.refuse(req, CodeRemoteCI, "remote CI settlement is not bound to this repository, policy, and exact candidate")
+		}
 	}
 
 	// --- live re-read, immediately before merge ---
