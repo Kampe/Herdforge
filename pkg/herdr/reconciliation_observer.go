@@ -161,7 +161,46 @@ func (o *ProductionReconciliationObserver) ObserveReconciliation(ctx context.Con
 			return fmt.Errorf("reconciliation BLOCKED: tab %s: %s", d.TabID, d.Evidence)
 		}
 	}
+	if _, err := o.ReapCompletedTaskLanes(ctx); err != nil {
+		return fmt.Errorf("auto-reap completed task lanes: %w", err)
+	}
 	return nil
+}
+
+// ReapResult records the outcome of an automated task lane reap attempt.
+type ReapResult struct {
+	Reaped []string `json:"reaped"`
+	Errs   []error  `json:"errors,omitempty"`
+}
+
+// ReapCompletedTaskLanes iterates over eligible reconciliation decisions and executes
+// an atomic FAC-180 compare-and-close (TabCloseCAS) for safe finished/orphan task lanes.
+// Live, active, user shell, standing, blocked, or preserved tabs are strictly retained.
+func (o *ProductionReconciliationObserver) ReapCompletedTaskLanes(ctx context.Context) (ReapResult, error) {
+	if o == nil {
+		return ReapResult{}, fmt.Errorf("reconciliation observer is nil")
+	}
+	res := ReapResult{}
+	for _, d := range o.Last.Decisions {
+		if !d.CloseEligible || (d.Class != TabSafeFinished && d.Class != TabSafeOrphan) {
+			continue
+		}
+		req := CloseRequest{
+			WorkspaceID: o.Workspace,
+			TabID:       d.TabID,
+			Generation:  d.Generation,
+			Nonce:       fmt.Sprintf("reap-%s-%s", d.TabID, d.Generation),
+		}
+		if err := TabCloseCAS(req); err != nil {
+			res.Errs = append(res.Errs, fmt.Errorf("tab %s (gen %s): %w", d.TabID, d.Generation, err))
+		} else {
+			res.Reaped = append(res.Reaped, d.TabID)
+		}
+	}
+	if len(res.Errs) > 0 {
+		return res, fmt.Errorf("reap completed task lanes: %d failed", len(res.Errs))
+	}
+	return res, nil
 }
 
 func (o *ProductionReconciliationObserver) Decisions() []TabDecision {

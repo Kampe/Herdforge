@@ -2,6 +2,7 @@ package herdr
 
 import (
 	"context"
+	"errors"
 	"os"
 	"testing"
 )
@@ -130,5 +131,73 @@ func TestTabListSocketFixtureDoesNotInventAgentFields(t *testing.T) {
 	agents, err := AgentList()
 	if err != nil || len(agents) != 1 || agents[0].Name != "shell" {
 		t.Fatalf("agents=%+v err=%v", agents, err)
+	}
+}
+
+func TestReapCompletedTaskLanes_ReapsSafeAndPreservesActive(t *testing.T) {
+	srv := NewFakeCompareCloseServer()
+	srv.PutTab(LiveTab{WorkspaceID: "wF", TabID: "t-done", Generation: 1})
+	srv.PutTab(LiveTab{WorkspaceID: "wF", TabID: "t-active", Generation: 2})
+	restore := SetCompareCloseTransportForTest(func(req CompareAndCloseRequest) (CloseReceipt, error) {
+		return srv.CompareAndClose(req), nil
+	})
+	defer restore()
+
+	o := &ProductionReconciliationObserver{
+		Workspace: "wF",
+		Last: ReconciliationResult{
+			Decisions: []TabDecision{
+				{TabID: "t-done", Generation: "1", Class: TabSafeFinished, CloseEligible: true},
+				{TabID: "t-active", Generation: "2", Class: TabActive, CloseEligible: false},
+				{TabID: "t-blocked", Generation: "3", Class: TabBlocked, CloseEligible: false},
+				{TabID: "t-standing", Generation: "4", Class: TabStanding, CloseEligible: false},
+			},
+		},
+	}
+
+	res, err := o.ReapCompletedTaskLanes(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected reap error: %v (errs: %+v)", err, res.Errs)
+	}
+	if len(res.Reaped) != 1 || res.Reaped[0] != "t-done" {
+		t.Fatalf("reaped=%v, want [t-done]", res.Reaped)
+	}
+	if len(res.Errs) != 0 {
+		t.Fatalf("unexpected reap errors: %v", res.Errs)
+	}
+}
+
+func TestObserveReconciliation_InvokesAutoReapAndFailsClosed(t *testing.T) {
+	srv := NewFakeCompareCloseServer()
+	srv.PutTab(LiveTab{WorkspaceID: "wF", TabID: "wF:t1", Generation: 1})
+	restore := SetCompareCloseTransportForTest(func(req CompareAndCloseRequest) (CloseReceipt, error) {
+		return srv.CompareAndClose(req), nil
+	})
+	defer restore()
+
+	r := fixtureReader{
+		tabs:    present([]TabRecord{{TabID: "wF:t1", WorkspaceID: "wF", Label: "task tab"}}),
+		agents:  present([]AgentEntry{}),
+		board:   present(BoardTruth{TaskRef: "FAC-72", Status: "to-do"}),
+		binding: present(TabBinding{TabID: "wF:t1", Generation: "1", TaskRef: "FAC-72", PaneID: "wF:p1"}),
+	}
+	o := &ProductionReconciliationObserver{Workspace: "wF", Reader: r}
+
+	if err := o.ObserveReconciliation(context.Background()); err != nil {
+		t.Fatalf("ObserveReconciliation failed to reap: %v", err)
+	}
+
+	// Verify tab was reaped from server state
+	if !srv.IsClosed("wF:t1") {
+		t.Fatal("ObserveReconciliation must reap safe orphan/finished tab")
+	}
+
+	// Negative assertion: when reap fails (e.g. transport failure), ObserveReconciliation must fail closed
+	failRestore := SetCompareCloseTransportForTest(func(req CompareAndCloseRequest) (CloseReceipt, error) {
+		return CloseReceipt{}, errors.New("injected transport failure")
+	})
+	defer failRestore()
+	if err := o.ObserveReconciliation(context.Background()); err == nil {
+		t.Fatal("ObserveReconciliation must return error and fail closed when CAS reap fails")
 	}
 }
