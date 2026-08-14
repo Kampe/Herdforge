@@ -115,6 +115,20 @@ func pidfdSendSignal(fd int, sig syscall.Signal) error {
 	return unix.PidfdSendSignal(fd, sig, nil, 0)
 }
 
+// pidfdExited asks the kernel whether this exact process incarnation has
+// exited. Unlike /proc start-time tokens, a pidfd cannot be confused with a
+// rapidly reused numeric PID.
+func pidfdExited(fd int) (bool, error) {
+	if fd < 0 {
+		return false, errPidfdUnsupported
+	}
+	ready, err := unix.Poll([]unix.PollFd{{Fd: int32(fd), Events: unix.POLLIN}}, 0)
+	if err != nil {
+		return false, err
+	}
+	return ready > 0, nil
+}
+
 func isNotExistPidfd(err error) bool {
 	return errors.Is(err, unix.ESRCH) || errors.Is(err, unix.EINVAL)
 }

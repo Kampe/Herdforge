@@ -967,6 +967,18 @@ func closeOwnedAfterWait(cmd *exec.Cmd) error {
 func waitHandleGone(h ownedHandle, bound time.Duration) error {
 	deadline := time.Now().Add(bound)
 	for {
+		// A pidfd is the authoritative identity on Linux. Do not let a
+		// same-tick PID reuse make the coarser /proc token appear live after
+		// the owned process has exited.
+		if h.fd >= 0 {
+			exited, err := pidfdExitedFn(h.fd)
+			if err != nil && !errors.Is(err, errPidfdUnsupported) {
+				return fmt.Errorf("pidfd exit probe pid %d: %w", h.tok.pid, err)
+			}
+			if err == nil && exited {
+				return nil
+			}
+		}
 		if !h.tok.stillSame() || processIsZombie(h.tok.pid) {
 			return nil
 		}

@@ -24,6 +24,8 @@ func pidfdOpen(pid int) (int, error) { return -1, errPidfdUnsupported }
 
 func pidfdSendSignal(fd int, sig syscall.Signal) error { return errPidfdUnsupported }
 
+func pidfdExited(fd int) (bool, error) { return false, errPidfdUnsupported }
+
 func isNotExistPidfd(err error) bool { return errors.Is(err, errPidfdUnsupported) }
 
 func syscallSIGKILL() syscall.Signal { return syscall.SIGKILL }
