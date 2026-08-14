@@ -135,3 +135,51 @@ func TestScopedMemory_ReopenRetainsPromotionIdempotence(t *testing.T) {
 		t.Fatalf("promotion lost idempotence after reopen: %q != %q", first.ID, second.ID)
 	}
 }
+
+func TestScopedMemory_DeniesCrossRunAndRoleMismatch(t *testing.T) {
+	store, scope, worker, now := scopedFixture(t)
+	p, err := store.Propose(ProposalRequest{Scope: scope, Actor: worker, Content: "run-one-only", SourceEvidence: "receipt", CreatedAt: now, ExpiresAt: now.Add(time.Hour), RetainUntil: now.Add(2 * time.Hour)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	entries, err := store.Inject(ReadRequest{Actor: worker, RunID: "run-2", TaskID: scope.TaskID, Role: scope.Role, Revision: scope.Revision, ReadAt: now.Add(time.Minute)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("cross-run read leaked proposal %s: %+v", p.ID, entries)
+	}
+	roleScope := Scope{Kind: ScopeRole, RunID: scope.RunID, TaskID: scope.TaskID, Role: "reviewer", Revision: scope.Revision, Readers: []string{worker.ID}}
+	if scopeMatchesRequest(roleScope, ReadRequest{RunID: scope.RunID, TaskID: scope.TaskID, Role: "worker"}) {
+		t.Fatal("role scope matched a different role")
+	}
+}
+
+func TestScopedMemory_RelationRequiresExactRevision(t *testing.T) {
+	store, scope, worker, now := scopedFixture(t)
+	p, err := store.Propose(ProposalRequest{Scope: scope, Actor: worker, Content: "related-task-only", SourceEvidence: "receipt", CreatedAt: now, ExpiresAt: now.Add(time.Hour), RetainUntil: now.Add(2 * time.Hour)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.AuthorizeRelation(ScopeRelation{FromTask: "FAC-240", ToTask: scope.TaskID, Revision: "other-revision"}); err != nil {
+		t.Fatal(err)
+	}
+	request := ReadRequest{Actor: worker, RunID: scope.RunID, TaskID: "FAC-240", Role: scope.Role, Revision: scope.Revision, ReadAt: now.Add(time.Minute)}
+	entries, err := store.Inject(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("relation with different revision leaked proposal %s: %+v", p.ID, entries)
+	}
+	if err := store.AuthorizeRelation(ScopeRelation{FromTask: "FAC-240", ToTask: scope.TaskID, Revision: scope.Revision}); err != nil {
+		t.Fatal(err)
+	}
+	entries, err = store.Inject(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].ID != p.ID {
+		t.Fatalf("same-revision relation did not authorize exact proposal: %+v", entries)
+	}
+}
