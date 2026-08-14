@@ -561,7 +561,7 @@ func parseTmpfsSizeBytes(value string) (int64, error) {
 			if raw == "" {
 				return 0, errors.New("invalid tmpfs size option")
 			}
-			multiplier := uint64(1)
+			var multiplier int64 = 1
 			digits := raw
 			switch raw[len(raw)-1] {
 			case 'k':
@@ -584,11 +584,11 @@ func parseTmpfsSizeBytes(value string) (int64, error) {
 					return 0, errors.New("invalid tmpfs size option")
 				}
 			}
-			number, err := strconv.ParseUint(digits, 10, 63)
-			if err != nil || number > uint64(maxInt64)/multiplier {
+			number, err := strconv.ParseInt(digits, 10, 64)
+			if err != nil || number < 0 || number > maxInt64/multiplier {
 				return 0, errors.New("invalid tmpfs size option")
 			}
-			parsed = int64(number) * int64(multiplier)
+			parsed = number * multiplier
 		}
 	}
 	if !seen {
