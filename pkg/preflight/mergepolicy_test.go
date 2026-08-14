@@ -53,6 +53,21 @@ func TestCheckMergePolicy_CompletePolicyPasses(t *testing.T) {
 	}
 }
 
+func TestCheckMergePolicy_RemoteCIIsOptInButRequiresChecksWhenEnabled(t *testing.T) {
+	policy := DefaultProtectedPolicy()
+	if rep := CheckMergePolicy(policy); !rep.OK {
+		t.Fatalf("remote CI opt-out policy refused: %v", rep.Reasons)
+	}
+	policy.RemoteCI.Required = true
+	if rep := CheckMergePolicy(policy); rep.OK {
+		t.Fatal("remote CI without declared checks was accepted")
+	}
+	policy.RemoteCI.RequiredChecks = []string{"remote-gate"}
+	if rep := CheckMergePolicy(policy); !rep.OK {
+		t.Fatalf("declared remote CI policy refused: %v", rep.Reasons)
+	}
+}
+
 // The single edit that would neutralise every other gate. If `protected: false`
 // ever returns OK again, the whole check becomes unable to refuse anything.
 func TestCheckMergePolicy_UnprotectedIsRefusedNotOpen(t *testing.T) {
@@ -106,7 +121,7 @@ func TestLoadMergePolicy_MalformedYAMLIsAnError(t *testing.T) {
 // complete one passes. Same root, same call — if any weakening ever returns nil,
 // the gate has stopped discriminating.
 func TestRefuseAutonomousMerge_EveryWeakenedDeclarationIsBlocked(t *testing.T) {
-	const complete = "protected: true\nrequired_checks:\n  - gate-a\nrequire_different_family_review: true\nrequire_pull_request_reviews: true\n"
+	const complete = "protected: true\nrequired_checks:\n  - gate-a\nrequire_different_family_review: true\nrequire_pull_request_reviews: true\nremote_ci:\n  required: true\n  required_checks:\n    - gate-a\n"
 	weakened := map[string]string{
 		"unprotected":        "protected: false\nrequired_checks:\n  - gate-a\nrequire_different_family_review: true\nrequire_pull_request_reviews: true\n",
 		"no required checks": "protected: true\nrequired_checks: []\nrequire_different_family_review: true\nrequire_pull_request_reviews: true\n",
