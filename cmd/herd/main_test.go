@@ -189,6 +189,72 @@ func TestStatusInitialized(t *testing.T) {
 	}
 }
 
+func TestFreshClonePreflightAndRuntimeMigrationLeaveTrackedStateClean(t *testing.T) {
+	binary := buildHerd(t)
+	repoRootCmd := exec.Command("git", "rev-parse", "--show-toplevel")
+	repoRootCmd.Dir = "."
+	repoRootOut, err := repoRootCmd.Output()
+	if err != nil {
+		t.Fatalf("resolve repository root: %v", err)
+	}
+	repoRoot := strings.TrimSpace(string(repoRootOut))
+	seed := filepath.Join(t.TempDir(), "seed")
+	if err := os.MkdirAll(filepath.Join(seed, ".herd"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, rel := range []string{".gitignore", ".herd/herd.yaml", ".herd/merge-policy.yaml"} {
+		contents, err := os.ReadFile(filepath.Join(repoRoot, rel))
+		if err != nil {
+			t.Fatalf("read %s: %v", rel, err)
+		}
+		if err := os.WriteFile(filepath.Join(seed, rel), contents, 0o644); err != nil {
+			t.Fatalf("write %s: %v", rel, err)
+		}
+	}
+	git := func(dir string, args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = dir
+		if output, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v: %s", args, err, output)
+		}
+	}
+	git(seed, "init", "--quiet")
+	git(seed, "config", "user.email", "runtime-hygiene@test.invalid")
+	git(seed, "config", "user.name", "runtime hygiene")
+	git(seed, "add", ".")
+	git(seed, "commit", "--quiet", "-m", "test fixture")
+
+	clone := filepath.Join(t.TempDir(), "clone")
+	git(".", "clone", "--quiet", "--no-local", seed, clone)
+	clean := func(stage string) {
+		t.Helper()
+		cmd := exec.Command("git", "status", "--porcelain", "--untracked-files=all")
+		cmd.Dir = clone
+		output, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("%s status: %v: %s", stage, err, output)
+		}
+		if string(output) != "" {
+			t.Fatalf("%s dirtied tracked runtime state: %s", stage, output)
+		}
+	}
+	preflight := exec.Command(binary, "preflight")
+	preflight.Dir = clone
+	preflight.Env = append(os.Environ(), "HERD_CONTROL_SECRET=", "HERD_LIVE_HARNESS_PROOF=", "HERD_REFRESH_READINESS=")
+	if output, err := preflight.CombinedOutput(); err != nil {
+		t.Fatalf("fresh clone preflight: %v: %s", err, output)
+	}
+	clean("preflight")
+
+	status := exec.Command(binary, "status")
+	status.Dir = clone
+	if output, err := status.CombinedOutput(); err != nil {
+		t.Fatalf("runtime migration: %v: %s", err, output)
+	}
+	clean("runtime migration")
+}
+
 func TestStatusEvidenceFailureExitsNonZero(t *testing.T) {
 	binary := buildHerd(t)
 	tmpDir := t.TempDir()
