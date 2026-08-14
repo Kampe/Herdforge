@@ -326,7 +326,7 @@ func goZipHash(content []byte) (string, error) {
 		if closeErr != nil {
 			return "", closeErr
 		}
-		if count > int64(maxZipFileBytes) || uint64(count) != file.UncompressedSize64 {
+		if count < 0 || count > int64(maxZipFileBytes) || uint64(count) != file.UncompressedSize64 {
 			return "", errors.New("Go cache zip entry size mismatch")
 		}
 		totalBytes += uint64(count)

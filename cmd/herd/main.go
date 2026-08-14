@@ -737,7 +737,7 @@ func runClone() {
 
 	fmt.Printf("Cloning %s into %s...\n", repoURL, targetDir)
 
-	cmd := exec.Command("git", "clone", repoURL, targetDir)
+	cmd := exec.Command("git", "clone", "--", repoURL, targetDir) // #nosec G702 -- user values follow git -- and cannot be parsed as options
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {
@@ -746,7 +746,7 @@ func runClone() {
 	}
 
 	// Run herd init --full in the cloned directory
-	initCmd := exec.Command(os.Args[0], "init", "--full")
+	initCmd := exec.Command(os.Args[0], "init", "--full") // #nosec G702 -- re-executes the current herd binary with fixed arguments
 	initCmd.Dir = targetDir
 	initOut, err := initCmd.CombinedOutput()
 	if err != nil {
@@ -3885,6 +3885,15 @@ func configureProductionControl(d *dispatch.Dispatcher, root string) (func() err
 		mailPath := strings.TrimSpace(os.Getenv("HERD_MAIL_FILE"))
 		if mailPath == "" {
 			mailPath = filepath.Join(root, ".herd", "mail.jsonl")
+		} else {
+			if filepath.IsAbs(mailPath) {
+				return nil, fmt.Errorf("HERD_MAIL_FILE must be relative to workspace root")
+			}
+			mailPath = filepath.Clean(filepath.Join(root, mailPath))
+			rel, relErr := filepath.Rel(root, mailPath)
+			if relErr != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+				return nil, fmt.Errorf("HERD_MAIL_FILE escapes workspace root")
+			}
 		}
 		_ = os.MkdirAll(filepath.Dir(mailPath), 0o755)
 		issuer := strings.TrimSpace(os.Getenv("HERD_CONTROL_ISSUER"))
@@ -4008,8 +4017,8 @@ func runThroughput() {
 	// main-ref commits in window: %H\t%cI\t%s. 2>/dev/null semantics — a
 	// missing ref must not abort.
 	var commits []throughput.CommitLine
-	logCmd := exec.Command("git", "log", mainRef, "--format=%H%x09%cI%x09%s",
-		"--since="+since, "--until="+until)
+	logCmd := exec.Command("git", "log", "--format=%H%x09%cI%x09%s", // #nosec G702 -- mainRef follows git --end-of-options and cannot inject flags
+		"--since="+since, "--until="+until, "--end-of-options", mainRef)
 	if out, err := logCmd.Output(); err == nil {
 		for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
 			if line == "" {

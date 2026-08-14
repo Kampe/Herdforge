@@ -40,3 +40,38 @@ func TestProductionControlFactoryScopesSequentialIdentities(t *testing.T) {
 		t.Fatalf("stale sequential task reached sender: %v", err)
 	}
 }
+
+func TestConfigureProductionControlRejectsEscapingMailPath(t *testing.T) {
+	for _, mailPath := range []string{"../mail.jsonl", "/tmp/mail.jsonl"} {
+		t.Run(mailPath, func(t *testing.T) {
+			t.Setenv("HERD_CONTROL_SECRET", "test-control-secret")
+			t.Setenv("HERD_MAIL_FILE", mailPath)
+			root := t.TempDir()
+			if err := os.Mkdir(filepath.Join(root, ".herd"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			d := dispatch.NewProductionDispatcher(nil, nil, nil)
+			if _, err := configureProductionControl(d, root); err == nil {
+				t.Fatal("expected escaping mailbox path rejection")
+			}
+		})
+	}
+}
+
+func TestConfigureProductionControlAcceptsRelativeMailPath(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Mkdir(filepath.Join(root, ".herd"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HERD_CONTROL_SECRET", "test-control-secret")
+	t.Setenv("HERD_MAIL_FILE", "nested/mail.jsonl")
+	d := dispatch.NewProductionDispatcher(nil, nil, nil)
+	closeControl, err := configureProductionControl(d, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeControl()
+	if d.Control == nil || d.Control.Mailbox == nil {
+		t.Fatal("control mailbox was not configured")
+	}
+}

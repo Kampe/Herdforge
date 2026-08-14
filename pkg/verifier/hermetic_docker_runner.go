@@ -588,7 +588,7 @@ func parseTmpfsSizeBytes(value string) (int64, error) {
 			if err != nil || number > uint64(maxInt64)/multiplier {
 				return 0, errors.New("invalid tmpfs size option")
 			}
-			parsed = int64(number * multiplier)
+			parsed = int64(number) * int64(multiplier)
 		}
 	}
 	if !seen {

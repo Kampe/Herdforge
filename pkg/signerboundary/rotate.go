@@ -284,7 +284,7 @@ func restartServe(herdBin, keyPath, sock, led string, topo Topology, sk SessionK
 		var err error
 		herdBin, err = os.Executable()
 		if err != nil {
-			herdBin = "herd"
+			return 0, fmt.Errorf("resolve herd executable: %w", err)
 		}
 	}
 	env := append(os.Environ(),
