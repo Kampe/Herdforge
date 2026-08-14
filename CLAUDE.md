@@ -46,7 +46,7 @@ make preflight
 | Topic | Reference Document |
 | :--- | :--- |
 | **Agent Skill & Integration Guide** | [SKILL.md](SKILL.md) / [.herd/skills/herd.md](.herd/skills/herd.md) |
-| **Agent Prompts & Contracts** | [examples/prompts/](examples/prompts/) / [.herd/prompts/](.herd/prompts/) |
+| **Agent Prompts & Contracts** | [.herd/prompts/](.herd/prompts/) |
 | **Agent Governance & Invariants** | [AGENTS.md](AGENTS.md) |
 | **Architecture & API Specs** | [docs/architecture/AGENT-IMPLEMENTATION-GUIDE.md](docs/architecture/AGENT-IMPLEMENTATION-GUIDE.md) |
 | **System RFC & Design** | [docs/rfcs/RFC-001-HERD-DAEMON.md](docs/rfcs/RFC-001-HERD-DAEMON.md) |
