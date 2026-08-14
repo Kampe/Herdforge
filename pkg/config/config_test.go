@@ -392,3 +392,53 @@ lanes:
 		t.Fatalf("expected validation error for missing model")
 	}
 }
+
+func TestConfiguredHarnessKinds(t *testing.T) {
+	cfg := &Config{
+		Lanes: []LaneDef{
+			{Name: "lane1", AgentKind: "codex", Harness: "codex"},
+			{Name: "lane2", AgentKind: "claude", Harness: "claude"},
+			{Name: "lane3", AgentKind: "agy", Harness: "agy"},
+			{Name: "lane4", AgentKind: "claude", Harness: ""},
+		},
+	}
+	kinds := cfg.ConfiguredHarnessKinds()
+	if len(kinds) != 3 || kinds[0] != "agy" || kinds[1] != "claude" || kinds[2] != "codex" {
+		t.Fatalf("unexpected configured kinds: %v, want [agy claude codex]", kinds)
+	}
+
+	tmpDir := t.TempDir()
+	herdDir := filepath.Join(tmpDir, ".herd")
+	if err := os.MkdirAll(herdDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	content := `version: "1"
+project:
+  name: "test-project"
+task_provider:
+  type: "kaneo"
+  project_id: "test-id"
+lanes:
+  - name: "smith"
+    agent_kind: "codex"
+    harness: "codex"
+    model: "gpt-5"
+    prompt: "p.md"
+  - name: "assayer"
+    agent_kind: "agy"
+    harness: "agy"
+    model: "gemini-3"
+    prompt: "p.md"
+`
+	if err := os.WriteFile(filepath.Join(herdDir, "herd.yaml"), []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := ConfiguredHarnessKindsFor(tmpDir)
+	if err != nil {
+		t.Fatalf("ConfiguredHarnessKindsFor: %v", err)
+	}
+	if len(got) != 2 || got[0] != "agy" || got[1] != "codex" {
+		t.Fatalf("unexpected kinds from file: %v, want [agy codex]", got)
+	}
+}

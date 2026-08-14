@@ -83,3 +83,44 @@ func TestRejectNonModelSession_NoRealSession(t *testing.T) {
 		t.Fatalf("blocker=%q err=%v", blocker, err)
 	}
 }
+
+func TestRejectNonModelSession_AGYLoginBlocks(t *testing.T) {
+	old := runHerdr
+	t.Cleanup(func() { runHerdr = old })
+	runHerdr = func(args ...string) (string, error) {
+		joined := strings.Join(args, " ")
+		if strings.HasPrefix(joined, "agent list") {
+			return `{"result":{"agents":[{"name":"lp-agy","agent":"agy","agent_status":"idle","tab_id":"wF:t52","terminal_title":"Sign in with Google","agent_session":{"value":"ses_x"}}],"type":"agent_list"}}`, nil
+		}
+		if strings.HasPrefix(joined, "agent read") {
+			return "Please sign in to continue with Google Antigravity", nil
+		}
+		return "", fmt.Errorf("unexpected herdr argv: %v", args)
+	}
+	blocker, err := rejectNonModelSession("lp-agy", "wF:t52", "ses_x")
+	if err == nil {
+		t.Fatal("expected login/auth failure for AGY from rejectNonModelSession")
+	}
+	if !strings.Contains(blocker, "login/auth") && !strings.Contains(blocker, "FAC-133 BLOCKED") {
+		t.Fatalf("blocker=%q", blocker)
+	}
+}
+
+func TestRejectNonModelSession_AGYNoRealSession(t *testing.T) {
+	old := runHerdr
+	t.Cleanup(func() { runHerdr = old })
+	runHerdr = func(args ...string) (string, error) {
+		joined := strings.Join(args, " ")
+		if strings.HasPrefix(joined, "agent list") {
+			return `{"result":{"agents":[{"name":"lp-agy","agent":"agy","agent_status":"idle","tab_id":"t1","agent_session":{"value":"herdr-term:pane1"}}],"type":"agent_list"}}`, nil
+		}
+		if strings.HasPrefix(joined, "agent read") {
+			return "ready", nil
+		}
+		return "", fmt.Errorf("unexpected: %v", args)
+	}
+	blocker, err := rejectNonModelSession("lp-agy", "t1", "herdr-term:pane1")
+	if err == nil || !strings.Contains(blocker, "no real model") {
+		t.Fatalf("blocker=%q err=%v", blocker, err)
+	}
+}

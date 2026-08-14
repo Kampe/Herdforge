@@ -42,11 +42,18 @@ func (f fixtureReader) Protection(context.Context, TabBinding) Authority[Protect
 }
 
 func TestProductionObserverUsesExactTabRegistryBinding(t *testing.T) {
+	srv := NewFakeCompareCloseServer()
+	srv.PutTab(LiveTab{WorkspaceID: "wF", TabID: "wF:t1", Generation: 1})
+	restore := SetCompareCloseTransportForTest(func(req CompareAndCloseRequest) (CloseReceipt, error) {
+		return srv.CompareAndClose(req), nil
+	})
+	defer restore()
+
 	r := fixtureReader{
 		tabs:    present([]TabRecord{{TabID: "wF:t1", WorkspaceID: "wF", Label: "misleading label"}}),
 		agents:  present([]AgentEntry{}),
 		board:   present(BoardTruth{TaskRef: "FAC-72", Status: "to-do"}),
-		binding: present(TabBinding{TabID: "wF:t1", Generation: "g1", TaskRef: "FAC-72", PaneID: "wF:p1"}),
+		binding: present(TabBinding{TabID: "wF:t1", Generation: "1", TaskRef: "FAC-72", PaneID: "wF:p1"}),
 	}
 	o := &ProductionReconciliationObserver{Workspace: "wF", Reader: r}
 	if err := o.ObserveReconciliation(context.Background()); err != nil {
@@ -55,6 +62,9 @@ func TestProductionObserverUsesExactTabRegistryBinding(t *testing.T) {
 	decisions := o.Decisions()
 	if len(decisions) != 1 || decisions[0].Class != TabSafeOrphan {
 		t.Fatalf("decisions=%+v", decisions)
+	}
+	if !srv.IsClosed("wF:t1") {
+		t.Fatal("expected safe orphan tab to be reaped")
 	}
 }
 

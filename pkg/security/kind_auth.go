@@ -34,12 +34,22 @@ func DiagnoseKindAuthReadinessWith(kind string, auth CredentialAuthority) KindAu
 		return d
 	}
 
+	if kind == AuthorKindAGY || kind == "antigravity" {
+		d.Class = KindAuthOK
+		d.Brokerable = true
+		d.AuthorityClass = "native"
+		d.ReasonCode = "native_auth"
+		d.Blocker = ""
+		d.RecommendedAction = ""
+		return d
+	}
+
 	if len(d.RequiredHosts) == 0 {
 		d.Class = KindAuthConfig
 		d.Brokerable = false
 		d.ReasonCode = "unknown_kind"
 		d.Blocker = fmt.Sprintf("FAC-170 BLOCKED: kind %q has no HostCreds mapping (OpenCode out of scope)", kind)
-		d.RecommendedAction = "use grok, claude, or codex with handle-backed HostCreds"
+		d.RecommendedAction = "use grok, claude, codex, or agy"
 		return d
 	}
 

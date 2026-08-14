@@ -134,3 +134,35 @@ func TestFleetAttestationPath_RepoRelative(t *testing.T) {
 		t.Fatalf("%s", p)
 	}
 }
+
+func TestBuildFleetAttestation_WithConfiguredKinds(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("HERD_READINESS_ROOT", root)
+	t.Setenv("HERD_ROOT", root)
+	t.Setenv("HERD_CONTROL_SECRET", "attest-secret")
+
+	binDir := filepath.Join(root, "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	fakeBin := filepath.Join(binDir, "agy")
+	if err := os.WriteFile(fakeBin, []byte("#!/bin/sh\necho 1.0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+":"+os.Getenv("PATH"))
+
+	if _, _, c, err := CurrentReadinessBindingFor([]string{"agy"}); err != nil || c == "unavailable" {
+		t.Skip("containment required for full binding test")
+	}
+
+	a, err := BuildFleetAttestationFromResultsFor([]HarnessProbeResult{validUsableResult("agy")}, time.Hour, []string{"agy"})
+	if err != nil {
+		t.Fatalf("BuildFleetAttestationFromResultsFor: %v", err)
+	}
+	if a.HarnessDigests["agy"] == "" {
+		t.Fatal("expected non-empty digest for agy")
+	}
+	if err := ValidateFleetAttestation(a, time.Now().UTC(), "attest-secret"); err != nil {
+		t.Fatalf("ValidateFleetAttestation: %v", err)
+	}
+}

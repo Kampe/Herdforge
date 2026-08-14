@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -383,3 +384,43 @@ var (
 	DefaultConfigPath = filepath.Join(".herd", "herd.yaml")
 	DefaultHerdDir    = ".herd"
 )
+
+// ConfiguredHarnessKinds returns the deduplicated, sorted list of harness kinds
+// declared across all configured lanes.
+func (c *Config) ConfiguredHarnessKinds() []string {
+	if c == nil || len(c.Lanes) == 0 {
+		return nil
+	}
+	seen := make(map[string]bool, len(c.Lanes))
+	var kinds []string
+	for _, lane := range c.Lanes {
+		k := strings.ToLower(strings.TrimSpace(lane.Harness))
+		if k == "" {
+			k = strings.ToLower(strings.TrimSpace(lane.AgentKind))
+		}
+		if k != "" && !seen[k] {
+			seen[k] = true
+			kinds = append(kinds, k)
+		}
+	}
+	sort.Strings(kinds)
+	return kinds
+}
+
+// ConfiguredHarnessKindsFor resolves and returns the configured harness kinds
+// for the repository at root, or an error if config is invalid or missing.
+func ConfiguredHarnessKindsFor(root string) ([]string, error) {
+	cfgPath := filepath.Join(root, DefaultConfigPath)
+	if root == "" || root == "." {
+		cfgPath = RuntimeConfigPath()
+	}
+	cfg, err := LoadConfig(cfgPath)
+	if err != nil {
+		return nil, err
+	}
+	kinds := cfg.ConfiguredHarnessKinds()
+	if len(kinds) == 0 {
+		return nil, fmt.Errorf("no configured harness kinds found in %s", cfgPath)
+	}
+	return kinds, nil
+}
