@@ -123,7 +123,11 @@ func (c *FixedClock) NowMS() uint64 { return c.MS }
 type SystemClock struct{}
 
 func (SystemClock) NowMS() uint64 {
-	return uint64(time.Now().UnixMilli())
+	ms := time.Now().UnixMilli()
+	if ms < 0 {
+		return 0
+	}
+	return uint64(ms)
 }
 
 // MemoryReceiptStore is the hermetic receipt store used by unit tests and the
