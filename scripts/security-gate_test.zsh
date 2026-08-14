@@ -24,11 +24,14 @@ git add -A
 git -c commit.gpgsign=false commit -qm 'test: current FAC-251 gate fixture'
 print '# fingerprint\tclassification\towner\texpiry' > security/baselines/gitleaks.tsv
 mkdir -p .worktrees/live
-# Proven by a disposable `gitleaks git` fixture: this matches github-pat.
-printf '%s\n' 'github_token = "ghp_012345678901234567890123456789012345"' > .worktrees/live/secret.txt
+# Proven by a disposable `gitleaks git` fixture: the assembled value matches
+# github-pat, but no token-shaped literal is committed with this test harness.
+token_prefix='ghp_'
+token_suffix='012345678901234567890123456789012345'
+print -- "github_token = \"${token_prefix}${token_suffix}\"" > .worktrees/live/secret.txt
 ./scripts/security-gate.zsh >/dev/null
 
-printf '%s\n' 'github_token = "ghp_012345678901234567890123456789012345"' > tracked-secret.txt
+print -- "github_token = \"${token_prefix}${token_suffix}\"" > tracked-secret.txt
 git add tracked-secret.txt
 git -c commit.gpgsign=false commit -qm 'test: introduce detected secret'
 fixture_report="$tmp/gitleaks.json"
