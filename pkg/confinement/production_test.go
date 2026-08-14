@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
 	"testing"
@@ -135,12 +136,12 @@ func TestBindAndProvePolicyDeniesIncidentPath(t *testing.T) {
 	if prep.Session.Root == "" || isPathPrefix(prep.Session.Root, root) {
 		t.Fatalf("session inside worktree: %+v", prep.Session)
 	}
-	// Bind must not create FAC-188 residual under shared.
+	// Bind must not create a residual artifact under shared.
 	binding, err := enf.BindAndProve(productionIdentity(t, root, shared), prep)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Stat(filepath.Join(shared, filepath.FromSlash(SharedRootIncidentRel))); err == nil {
+	if _, err := os.Stat(filepath.Join(shared, filepath.FromSlash(SharedRootResidualArtifactRel))); err == nil {
 		t.Fatal("Bind created residual under shared")
 	}
 	if !binding.OSProved || !binding.WrapperInstalled || binding.ProfileDigest == "" || binding.ReceiptMACHex == "" {
@@ -156,7 +157,7 @@ func TestBindAndProvePolicyDeniesIncidentPath(t *testing.T) {
 	if err := forged.VerifyReceiptMAC(issuer); err == nil {
 		t.Fatal("forged receipt MAC accepted")
 	}
-	incident := filepath.Join(shared, filepath.FromSlash(SharedRootIncidentRel))
+	incident := filepath.Join(shared, filepath.FromSlash(SharedRootResidualArtifactRel))
 	if err := binding.Boundary.AuthorizeWrite(binding.Capability, incident); err == nil {
 		t.Fatal("policy accepted shared-root incident path")
 	}
@@ -215,8 +216,8 @@ func TestDarwinSeatbeltProveWriteDenials(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Session integrity store is under shared/.herd/confine-sessions (allowed);
-	// residual .herd/FAC-188 must not appear.
-	if _, err := os.Stat(filepath.Join(shared, filepath.FromSlash(SharedRootIncidentRel))); err == nil {
+	// residual artifact boundary must not appear.
+	if _, err := os.Stat(filepath.Join(shared, filepath.FromSlash(SharedRootResidualArtifactRel))); err == nil {
 		t.Fatal("Prepare created residual under shared")
 	}
 	if err := osb.ProveWriteDenials(root, shared, profile, session); err != nil {
@@ -589,7 +590,7 @@ func TestCheckSharedRootResidualStableUnderHerdChurn(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Coordinator-like volatile files under .herd must not cause false rejection.
-	// Residual check only Lstats the FAC-188 incident path — not WAL/locks.
+	// Residual check only Lstats the boundary marker — not WAL/locks.
 	_ = os.MkdirAll(filepath.Join(shared, ".herd"), 0o755)
 	_ = os.WriteFile(filepath.Join(shared, ".herd", "launch-claims.db-wal"), []byte("x"), 0o644)
 	_ = os.WriteFile(filepath.Join(shared, ".herd", "mail.lock"), []byte("y"), 0o644)
@@ -597,7 +598,7 @@ func TestCheckSharedRootResidualStableUnderHerdChurn(t *testing.T) {
 		t.Fatalf("residual check failed on coordinator churn: %v", err)
 	}
 	// Live failure mode: incident path present must be rejected (non-tautological).
-	incident := filepath.Join(shared, filepath.FromSlash(SharedRootIncidentRel))
+	incident := filepath.Join(shared, filepath.FromSlash(SharedRootResidualArtifactRel))
 	if err := os.MkdirAll(filepath.Dir(incident), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -717,10 +718,16 @@ func TestCheckSharedRootResidualReadOnly(t *testing.T) {
 	if len(after) != len(before) {
 		t.Fatal("CheckSharedRootResidual wrote under shared")
 	}
-	p := filepath.Join(shared, filepath.FromSlash(SharedRootIncidentRel))
+	p := filepath.Join(shared, filepath.FromSlash(SharedRootResidualArtifactRel))
 	_ = os.MkdirAll(filepath.Dir(p), 0o755)
 	_ = os.WriteFile(p, []byte("x"), 0o600)
 	if err := CheckSharedRootResidual(shared); err == nil {
 		t.Fatal("incident path not rejected")
+	}
+}
+
+func TestSharedRootResidualArtifactBoundaryIsTicketNeutral(t *testing.T) {
+	if regexp.MustCompile(`(?i)FAC-[0-9]+`).MatchString(filepath.Base(SharedRootResidualArtifactRel)) {
+		t.Fatalf("production residual artifact boundary must not require a ticket-numbered filename: %q", SharedRootResidualArtifactRel)
 	}
 }

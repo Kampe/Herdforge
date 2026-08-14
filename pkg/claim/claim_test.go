@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
@@ -37,6 +38,30 @@ func newTestStore(t *testing.T) *SQLiteLeaseStore {
 	}
 	t.Cleanup(func() { store.Close() })
 	return store
+}
+
+func TestNewSQLiteLeaseStoreCreatesParentDirectory(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "runtime", "state", "leases.db")
+	store, err := NewSQLiteLeaseStore(path)
+	if err != nil {
+		t.Fatalf("new lease store: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("runtime lease database was not created on demand: %v", err)
+	}
+}
+
+func TestNewSQLiteOutboxCreatesParentDirectory(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "runtime", "state", "outbox.db")
+	outbox, err := NewSQLiteOutbox(path)
+	if err != nil {
+		t.Fatalf("new outbox: %v", err)
+	}
+	t.Cleanup(func() { _ = outbox.Close() })
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("runtime outbox database was not created on demand: %v", err)
+	}
 }
 
 func newTestHoldAuthority(t *testing.T) *lifecycle.HoldAuthority {

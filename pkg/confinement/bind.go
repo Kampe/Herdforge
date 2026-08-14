@@ -226,7 +226,7 @@ func (b *Binding) AuthorizeRelativeWrite(path string) error {
 	return b.Boundary.AuthorizeWrite(b.Capability, path)
 }
 
-// CheckSharedRoot re-checks that the FAC-188 residual path is still absent.
+// CheckSharedRoot re-checks that the residual artifact boundary is still absent.
 func (b *Binding) CheckSharedRoot() error {
 	if b == nil {
 		return ErrUnauthenticated

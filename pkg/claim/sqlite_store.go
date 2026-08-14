@@ -4,6 +4,8 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -27,6 +29,9 @@ type SQLiteLeaseStore struct {
 // SQLITE_BUSY/"database is locked" so a first-writer-wins WAL-mode
 // conversion race on a fresh file doesn't surface as an open error.
 func NewSQLiteLeaseStore(path string) (*SQLiteLeaseStore, error) {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return nil, fmt.Errorf("create lease store directory: %w", err)
+	}
 	dsn := fmt.Sprintf("file:%s?_pragma=busy_timeout(10000)&_pragma=journal_mode(WAL)", path)
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {

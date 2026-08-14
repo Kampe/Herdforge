@@ -4,6 +4,8 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"os"
+	"path/filepath"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -92,6 +94,9 @@ type SQLiteOutbox struct {
 
 // NewSQLiteOutbox opens (creating if needed) an outbox database at path.
 func NewSQLiteOutbox(path string) (*SQLiteOutbox, error) {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return nil, fmt.Errorf("create outbox directory: %w", err)
+	}
 	dsn := fmt.Sprintf("file:%s?_pragma=busy_timeout(10000)&_pragma=journal_mode(WAL)", path)
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {

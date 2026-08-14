@@ -235,7 +235,7 @@ func (d DarwinSeatbelt) ProveWriteDenials(worktree, sharedRoot, profilePath stri
 		return fmt.Errorf("%w: probe root collides with worktree", ErrOSProbeFailed)
 	}
 
-	outside := filepath.Join(probeRoot, "shared-root", ".herd", "FAC-188-R2-RESIDUAL.md")
+	outside := filepath.Join(probeRoot, "shared-root", filepath.FromSlash(SharedRootResidualArtifactRel))
 	if err := os.MkdirAll(filepath.Dir(outside), 0o755); err != nil {
 		return err
 	}
@@ -265,7 +265,7 @@ func (d DarwinSeatbelt) ProveWriteDenials(worktree, sharedRoot, profilePath stri
 		return fmt.Errorf("%w: sibling inode created", ErrOSProbeFailed)
 	}
 
-	// Denied: FAC-188 incident path under the real shared root (no MkdirAll).
+	// Denied: residual artifact path under the real shared root (no MkdirAll).
 	// Parent shared root already exists; tee cannot create intermediate dirs.
 	if strings.TrimSpace(sharedRoot) != "" {
 		absShared, err := realPath(sharedRoot)
