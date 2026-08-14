@@ -4,7 +4,37 @@ import (
 	"errors"
 	"syscall"
 	"testing"
+	"time"
 )
+
+func TestWaitHandleGoneUsesPidfdOverReusedPIDToken(t *testing.T) {
+	previousToken, previousZombie, previousExited := tokenOfFn, processIsZombieFn, pidfdExitedFn
+	t.Cleanup(func() {
+		tokenOfFn, processIsZombieFn, pidfdExitedFn = previousToken, previousZombie, previousExited
+	})
+
+	// Simulate a new, live process that reused the numeric PID in the same
+	// observable /proc start-time tick. The old token-only wait reaches its
+	// timeout and turns a successful verification into BLOCKED; the pidfd is
+	// bound to the original process and reports that it has exited.
+	tok := procToken{pid: 42, startSec: 7, startUsec: 0}
+	tokenOfFn = func(int) (procToken, error) { return tok, nil }
+	processIsZombieFn = func(int) bool { return false }
+	pidfdExitedFn = func(fd int) (bool, error) {
+		if fd != 17 {
+			t.Fatalf("pidfd exit probe fd=%d, want 17", fd)
+		}
+		return true, nil
+	}
+
+	started := time.Now()
+	if err := waitHandleGone(ownedHandle{tok: tok, fd: 17}, 50*time.Millisecond); err != nil {
+		t.Fatalf("exited pidfd must close ownership: %v", err)
+	}
+	if elapsed := time.Since(started); elapsed >= 50*time.Millisecond {
+		t.Fatalf("pidfd exit proof waited for stale token timeout: %s", elapsed)
+	}
+}
 
 func TestOwnedHandlePidfdSignalsOnlyLiveExactToken(t *testing.T) {
 	previousToken, previousZombie, previousSignal := tokenOfFn, processIsZombieFn, pidfdSendSignalFn
