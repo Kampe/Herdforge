@@ -22,20 +22,13 @@ func (OSBackend) StatFS(path string) (Capacity, error) {
 	blockSize := uint64(stat.Bsize)
 	fsid := fmt.Sprintf("%d:%d", stat.Fsid.Val[0], stat.Fsid.Val[1])
 
-	toUint64 := func(v int64) uint64 {
-		if v < 0 {
-			return 0
-		}
-		return uint64(v)
-	}
-
 	return capacityFromStatfs(
 		fsid,
 		fmt.Sprintf("%d", stat.Type),
-		toUint64(int64(stat.Blocks)),
-		toUint64(int64(stat.Bavail)),
+		uint64(stat.Blocks),
+		uint64(stat.Bavail),
 		blockSize,
-		toUint64(int64(stat.Files)),
-		toUint64(int64(stat.Ffree)),
+		uint64(stat.Files),
+		uint64(stat.Ffree),
 	)
 }
