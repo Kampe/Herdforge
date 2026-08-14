@@ -31,6 +31,16 @@ token_suffix='012345678901234567890123456789012345'
 print -- "github_token = \"${token_prefix}${token_suffix}\"" > .worktrees/live/secret.txt
 ./scripts/security-gate.zsh >/dev/null
 
+# A syntactically valid finding that gosec did not report must fail closed as
+# stale; after its removal, the current empty fixture baseline passes again.
+stale_fingerprint=$(print -rn -- 'G702|fixture.go|999' | shasum -a 256 | awk '{print $1}')
+print -- "G702\tfixture.go\t999\t$stale_fingerprint\tfixture stale-entry regression\tsecurity-maintainers\t2026-12-31" >> security/baselines/gosec-high.tsv
+stale_report="$tmp/stale-gosec.out"
+if ./scripts/security-gate.zsh >"$stale_report" 2>&1; then exit 1; fi
+grep -F -- "error: stale baseline entry $stale_fingerprint" "$stale_report" >/dev/null || exit 1
+print '# rule\tfile\tline\tfingerprint\trationale\towner\texpiry' > security/baselines/gosec-high.tsv
+./scripts/security-gate.zsh >/dev/null
+
 print -- "github_token = \"${token_prefix}${token_suffix}\"" > tracked-secret.txt
 git add tracked-secret.txt
 git -c commit.gpgsign=false commit -qm 'test: introduce detected secret'
