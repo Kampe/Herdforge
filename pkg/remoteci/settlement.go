@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 )
@@ -237,6 +238,31 @@ func (s *Store) Load(binding Binding) (Settlement, error) {
 		return prior, nil
 	}
 	return Settlement{}, fmt.Errorf("%w: no registered watch", ErrInvalid)
+}
+
+// List returns every current settlement in deterministic binding order. It is
+// read-only and deliberately leaves policy interpretation to its caller.
+func (s *Store) List() ([]Settlement, error) {
+	if s == nil {
+		return nil, fmt.Errorf("%w: nil store", ErrInvalid)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	records, err := s.readLocked()
+	if err != nil {
+		return nil, err
+	}
+	sort.Slice(records, func(i, j int) bool {
+		left, right := records[i].Binding, records[j].Binding
+		if left.CandidateSHA != right.CandidateSHA {
+			return left.CandidateSHA < right.CandidateSHA
+		}
+		if left.PolicyRevision != right.PolicyRevision {
+			return left.PolicyRevision < right.PolicyRevision
+		}
+		return left.Attempt < right.Attempt
+	})
+	return records, nil
 }
 
 func (s *Store) readLocked() ([]Settlement, error) {
