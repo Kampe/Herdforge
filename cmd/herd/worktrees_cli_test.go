@@ -1,12 +1,17 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/Kampe/Herdforge/pkg/claim"
+	"github.com/Kampe/Herdforge/pkg/remoteci"
 )
 
 // ftpdHerdWorktreesRepo builds a hermetic repo with origin/main and two
@@ -105,6 +110,23 @@ func TestHerdWorktreesCLIBasic(t *testing.T) {
 	}
 }
 
+func TestHerdWorktreesCLIHumanReportsUnavailableFleetEvidence(t *testing.T) {
+	binary := buildHerd(t)
+	dir := ftpdHerdWorktreesRepo(t)
+
+	cmd := exec.Command(binary, "worktrees")
+	cmd.Dir = dir
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatal("expected collision exit")
+	}
+	for _, want := range []string{"lease=unavailable", "safe-ref=unavailable", "session=unavailable", "retention=unavailable", "ci=unavailable"} {
+		if !strings.Contains(string(out), want) {
+			t.Errorf("human snapshot missing %q:\n%s", want, out)
+		}
+	}
+}
+
 func TestHerdWorktreesCLIJSON(t *testing.T) {
 	binary := buildHerd(t)
 	dir := ftpdHerdWorktreesRepo(t)
@@ -115,10 +137,14 @@ func TestHerdWorktreesCLIJSON(t *testing.T) {
 	if err != nil {
 		t.Fatalf("expected exit 0 for --json, got %v\n%s", err, out)
 	}
-	var rows []Row
-	if err := json.Unmarshal(out, &rows); err != nil {
+	var snapshot Snapshot
+	if err := json.Unmarshal(out, &snapshot); err != nil {
 		t.Fatalf("expected valid JSON: %v\n%s", err, out)
 	}
+	if snapshot.SchemaVersion != worktreesSchemaVersion {
+		t.Fatalf("schema version = %d, want %d", snapshot.SchemaVersion, worktreesSchemaVersion)
+	}
+	rows := snapshot.Worktrees
 	if len(rows) == 0 {
 		t.Fatal("expected at least one row")
 	}
@@ -132,6 +158,9 @@ func TestHerdWorktreesCLIJSON(t *testing.T) {
 		}
 		if r.Head == "" || r.Head == "?" {
 			t.Error("every row must have a non-empty HEAD")
+		}
+		if r.Fleet.Lease.State != "unavailable" || r.Fleet.SafeRef.State != "unavailable" || r.Fleet.Session.State != "unavailable" || r.Fleet.Retention.State != "unavailable" || r.Fleet.CI.State != "unavailable" {
+			t.Errorf("missing fleet sources must be explicit unavailable: %+v", r.Fleet)
 		}
 		for _, f := range r.Files {
 			if f == "pkg/shared.go" {
@@ -177,10 +206,11 @@ func TestHerdWorktreesCLIJSONFiles(t *testing.T) {
 	if err != nil {
 		t.Fatalf("expected exit 0 for --json --files, got %v\n%s", err, out)
 	}
-	var rows []Row
-	if err := json.Unmarshal(out, &rows); err != nil {
+	var snapshot Snapshot
+	if err := json.Unmarshal(out, &snapshot); err != nil {
 		t.Fatalf("expected valid JSON: %v\n%s", err, out)
 	}
+	rows := snapshot.Worktrees
 	// --files flag should be ignored when --json is set; files are always included in JSON
 	if len(rows) == 0 {
 		t.Fatal("expected rows")
@@ -252,10 +282,11 @@ func TestHerdWorktreesCLIVanishedWorktree(t *testing.T) {
 	if err != nil {
 		t.Fatalf("initial worktrees failed: %v\n%s", err, out)
 	}
-	var before []Row
-	if err := json.Unmarshal(out, &before); err != nil {
+	var beforeSnapshot Snapshot
+	if err := json.Unmarshal(out, &beforeSnapshot); err != nil {
 		t.Fatalf("invalid JSON: %v\n%s", err, out)
 	}
+	before := beforeSnapshot.Worktrees
 
 	// Delete the first non-principal worktree directory
 	for _, r := range before {
@@ -274,10 +305,11 @@ func TestHerdWorktreesCLIVanishedWorktree(t *testing.T) {
 	if err != nil {
 		t.Fatalf("second worktrees failed: %v\n%s", err, out2)
 	}
-	var after []Row
-	if err := json.Unmarshal(out2, &after); err != nil {
+	var afterSnapshot Snapshot
+	if err := json.Unmarshal(out2, &afterSnapshot); err != nil {
 		t.Fatalf("invalid JSON after vanished: %v\n%s", err, out2)
 	}
+	after := afterSnapshot.Worktrees
 	if len(after) >= len(before) {
 		t.Errorf("expected fewer rows after deleting a worktree dir: before=%d after=%d", len(before), len(after))
 	}
@@ -293,10 +325,11 @@ func TestHerdWorktreesCLILocked(t *testing.T) {
 	if err != nil {
 		t.Fatalf("worktrees failed: %v\n%s", err, out)
 	}
-	var rows []Row
-	if err := json.Unmarshal(out, &rows); err != nil {
+	var snapshot Snapshot
+	if err := json.Unmarshal(out, &snapshot); err != nil {
 		t.Fatalf("invalid JSON: %v\n%s", err, out)
 	}
+	rows := snapshot.Worktrees
 	foundLocked := false
 	for _, r := range rows {
 		if r.Locked {
@@ -345,6 +378,102 @@ func TestHerdWorktreesCLINoCollisions(t *testing.T) {
 	}
 	if !strings.Contains(string(out), "COLLISIONS: none") {
 		t.Errorf("expected COLLISIONS: none, got:\n%s", out)
+	}
+}
+
+func TestHerdWorktreesJSONFleetEvidenceIsExactAndUnavailableIsExplicit(t *testing.T) {
+	binary := buildHerd(t)
+	dir := ftpdHerdWorktreesRepo(t)
+	wt101 := filepath.Join(filepath.Dir(dir), "wt101")
+	candidateOut, err := exec.Command("git", "-C", wt101, "rev-parse", "HEAD").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidate := strings.TrimSpace(string(candidateOut))
+
+	leaseStore, err := claim.NewSQLiteLeaseStore(filepath.Join(dir, ".herd", "herdforge.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer leaseStore.Close()
+	if _, err := leaseStore.Acquire(context.Background(), claim.LeaseKey{Repo: "repo", Provider: "kaneo", Project: "project", TaskRef: "FAC-101"}, "owner-101", "worker", wt101, time.Now(), time.Hour); err != nil {
+		t.Fatal(err)
+	}
+
+	ciStore, err := remoteci.Open(filepath.Join(dir, ".herd", "remote-ci.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	match := remoteci.Binding{Repository: "repo", CandidateSHA: candidate, PolicyRevision: "policy-a", Attempt: 1, RequiredChecks: []string{"unit"}}
+	if _, _, err := ciStore.Register(match); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ciStore.PersistTerminal(remoteci.Settlement{Version: remoteci.Version1, Binding: match, State: remoteci.StatePassed}); err != nil {
+		t.Fatal(err)
+	}
+	mismatch := remoteci.Binding{Repository: "repo", CandidateSHA: strings.Repeat("a", 40), PolicyRevision: "policy-b", Attempt: 1, RequiredChecks: []string{"unit"}}
+	if _, _, err := ciStore.Register(mismatch); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ciStore.PersistTerminal(remoteci.Settlement{Version: remoteci.Version1, Binding: mismatch, State: remoteci.StatePassed}); err != nil {
+		t.Fatal(err)
+	}
+
+	cmd := exec.Command(binary, "worktrees", "--json")
+	cmd.Dir = dir
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("worktrees --json: %v\n%s", err, out)
+	}
+	var snapshot Snapshot
+	if err := json.Unmarshal(out, &snapshot); err != nil {
+		t.Fatalf("decode snapshot: %v\n%s", err, out)
+	}
+	var matched, other *Row
+	for i := range snapshot.Worktrees {
+		row := &snapshot.Worktrees[i]
+		switch row.Branch {
+		case "herd/fac-101":
+			matched = row
+		case "herd/fac-102":
+			other = row
+		}
+	}
+	if matched == nil || other == nil {
+		t.Fatalf("expected fixture rows, got %+v", snapshot.Worktrees)
+	}
+	if matched.CandidateSHA != candidate || len(matched.Fleet.Verification) != 1 || matched.Fleet.Verification[0].State != string(remoteci.StatePassed) || matched.Fleet.Verification[0].CandidateSHA != candidate {
+		t.Fatalf("matching candidate did not retain exact CI evidence: %+v", matched)
+	}
+	if matched.Fleet.Lease.State != "available" || matched.Fleet.Lease.Owner != "owner-101" || matched.Fleet.Lease.Role != "worker" {
+		t.Fatalf("matching worktree did not retain lease ownership: %+v", matched.Fleet.Lease)
+	}
+	if len(other.Fleet.Verification) != 0 {
+		t.Fatalf("different candidate inherited CI evidence: %+v", other.Fleet.Verification)
+	}
+	if other.Fleet.CI.State != "available" {
+		t.Fatalf("present CI ledger must be available even when no settlement matches: %+v", other.Fleet)
+	}
+	if other.Fleet.Session.State != "unavailable" || other.Fleet.Retention.State != "unavailable" || other.Fleet.SafeRef.State != "unavailable" {
+		t.Fatalf("unreadable evidence must remain unavailable: %+v", other.Fleet)
+	}
+}
+
+func TestHerdWorktreesJSONOrderIsDeterministic(t *testing.T) {
+	binary := buildHerd(t)
+	dir := ftpdHerdWorktreesRepo(t)
+	run := func() []byte {
+		cmd := exec.Command(binary, "worktrees", "--json")
+		cmd.Dir = dir
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("worktrees --json: %v\n%s", err, out)
+		}
+		return out
+	}
+	first, second := run(), run()
+	if string(first) != string(second) {
+		t.Fatalf("JSON output is nondeterministic:\nfirst=%s\nsecond=%s", first, second)
 	}
 }
 

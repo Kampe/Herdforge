@@ -12,18 +12,70 @@ import (
 	"sort"
 	"strings"
 	"text/tabwriter"
+	"time"
+
+	"github.com/Kampe/Herdforge/pkg/claim"
+	"github.com/Kampe/Herdforge/pkg/remoteci"
+	"github.com/Kampe/Herdforge/pkg/worktree"
 )
+
+const worktreesSchemaVersion = 2
+
+// Snapshot is the versioned machine-readable contract emitted by
+// `herd worktrees --json`.
+type Snapshot struct {
+	SchemaVersion int   `json:"schema_version"`
+	Worktrees     []Row `json:"worktrees"`
+}
 
 // Row is a single worktree snapshot. Fields match the JSON schema from
 // bin/herd-worktrees and the human column-t table.
 type Row struct {
-	Worktree string   `json:"worktree"`
-	Branch   string   `json:"branch"`
-	Head     string   `json:"head"`
-	Locked   bool     `json:"locked"`
-	Ahead    int      `json:"ahead"`
-	Dirty    int      `json:"dirty"`
-	Files    []string `json:"files"`
+	Worktree     string        `json:"worktree"`
+	Branch       string        `json:"branch"`
+	Head         string        `json:"head"`
+	Locked       bool          `json:"locked"`
+	Ahead        int           `json:"ahead"`
+	Dirty        int           `json:"dirty"`
+	Files        []string      `json:"files"`
+	CandidateSHA string        `json:"candidate_sha"`
+	Fleet        FleetSnapshot `json:"fleet"`
+}
+
+// FleetSnapshot contains only authoritative values this command directly
+// reads. "unavailable" never means a pass or an absent owner.
+type FleetSnapshot struct {
+	Lease        LeaseSnapshot       `json:"lease"`
+	Session      EvidenceState       `json:"session"`
+	SafeRef      SafeRefSnapshot     `json:"safe_ref"`
+	Retention    EvidenceState       `json:"retention"`
+	CI           EvidenceState       `json:"ci"`
+	Verification []VerificationState `json:"verification"`
+}
+
+type EvidenceState struct {
+	State string `json:"state"`
+}
+
+type LeaseSnapshot struct {
+	State      string `json:"state"`
+	Lane       string `json:"lane,omitempty"`
+	Owner      string `json:"owner,omitempty"`
+	Role       string `json:"role,omitempty"`
+	Generation int64  `json:"generation,omitempty"`
+}
+
+type SafeRefSnapshot struct {
+	State string `json:"state"`
+	Ref   string `json:"ref,omitempty"`
+	SHA   string `json:"sha,omitempty"`
+}
+
+type VerificationState struct {
+	State          string `json:"state"`
+	CandidateSHA   string `json:"candidate_sha"`
+	PolicyRevision string `json:"policy_revision"`
+	Attempt        int64  `json:"attempt"`
 }
 
 // collision maps a file path to the set of worktree branches that touch it.
@@ -155,6 +207,7 @@ func runWorktrees() {
 
 		r.Branch = runGitOrDefault(ctx, e.Path, "?", "rev-parse", "--abbrev-ref", "HEAD")
 		r.Head = runGitOrDefault(ctx, e.Path, "?", "rev-parse", "--short", "HEAD")
+		r.CandidateSHA = runGitOrDefault(ctx, e.Path, "", "rev-parse", "HEAD")
 
 		// Patch-equivalence count via git cherry
 		r.Ahead = countCherryAhead(ctx, e.Path, base)
@@ -208,12 +261,21 @@ func runWorktrees() {
 
 		rows = append(rows, r)
 	}
+	sort.Slice(rows, func(i, j int) bool {
+		if rows[i].Branch != rows[j].Branch {
+			return rows[i].Branch < rows[j].Branch
+		}
+		return rows[i].Worktree < rows[j].Worktree
+	})
+	for i := range rows {
+		rows[i].Fleet = loadFleetSnapshot(ctx, absRoot, rows[i])
+	}
 
 	// Early exit for --json
 	if *jsonFlag {
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")
-		_ = enc.Encode(rows)
+		_ = enc.Encode(Snapshot{SchemaVersion: worktreesSchemaVersion, Worktrees: rows})
 		os.Exit(0)
 	}
 
@@ -232,6 +294,104 @@ func runWorktrees() {
 	fmt.Println("COLLISIONS: none")
 }
 
+func unavailableFleetSnapshot() FleetSnapshot {
+	return FleetSnapshot{
+		Lease:        LeaseSnapshot{State: "unavailable"},
+		Session:      EvidenceState{State: "unavailable"},
+		SafeRef:      SafeRefSnapshot{State: "unavailable"},
+		Retention:    EvidenceState{State: "unavailable"},
+		CI:           EvidenceState{State: "unavailable"},
+		Verification: []VerificationState{},
+	}
+}
+
+func loadFleetSnapshot(ctx context.Context, root string, row Row) FleetSnapshot {
+	snapshot := unavailableFleetSnapshot()
+	loadLeaseSnapshot(ctx, root, row.Worktree, &snapshot)
+	loadSafeRefSnapshot(ctx, root, row.Branch, &snapshot)
+	loadVerificationSnapshot(root, row.CandidateSHA, &snapshot)
+	return snapshot
+}
+
+func loadLeaseSnapshot(ctx context.Context, root, path string, snapshot *FleetSnapshot) {
+	dbPath := filepath.Join(root, ".herd", "herdforge.db")
+	if _, err := os.Stat(dbPath); err != nil {
+		return
+	}
+	store, err := claim.NewSQLiteLeaseStore(dbPath)
+	if err != nil {
+		return
+	}
+	defer store.Close()
+	leases, err := store.ActiveClaims(ctx, time.Now())
+	if err != nil {
+		return
+	}
+	for _, lease := range leases {
+		if lease == nil || !sameWorktreePath(lease.WorktreePath, path) {
+			continue
+		}
+		snapshot.Lease = LeaseSnapshot{State: "available", Lane: lease.HoldLane, Owner: lease.OwnerID, Role: lease.Role, Generation: lease.Generation}
+		return
+	}
+}
+
+func loadSafeRefSnapshot(ctx context.Context, root, branch string, snapshot *FleetSnapshot) {
+	ref, ok := taskSafeRef(branch)
+	if !ok {
+		return
+	}
+	sha := runGitOrDefault(ctx, root, "", "rev-parse", "--verify", ref)
+	if sha != "" {
+		snapshot.SafeRef = SafeRefSnapshot{State: "available", Ref: ref, SHA: sha}
+	}
+}
+
+func taskSafeRef(branch string) (string, bool) {
+	const prefix = "herd/"
+	if !strings.HasPrefix(strings.ToLower(branch), prefix) {
+		return "", false
+	}
+	ref := strings.TrimSpace(branch[len(prefix):])
+	if ref == "" {
+		return "", false
+	}
+	return worktree.SafeRefFor(ref), true
+}
+
+func loadVerificationSnapshot(root, candidateSHA string, snapshot *FleetSnapshot) {
+	if len(candidateSHA) != 40 {
+		return
+	}
+	ledgerPath := filepath.Join(root, ".herd", "remote-ci.jsonl")
+	if _, err := os.Stat(ledgerPath); err != nil {
+		return
+	}
+	store, err := remoteci.Open(ledgerPath)
+	if err != nil {
+		return
+	}
+	settlements, err := store.List()
+	if err != nil {
+		return
+	}
+	snapshot.CI = EvidenceState{State: "available"}
+	for _, settlement := range settlements {
+		if settlement.Binding.CandidateSHA == candidateSHA {
+			snapshot.Verification = append(snapshot.Verification, VerificationState{
+				State: string(settlement.State), CandidateSHA: settlement.Binding.CandidateSHA,
+				PolicyRevision: settlement.Binding.PolicyRevision, Attempt: settlement.Binding.Attempt,
+			})
+		}
+	}
+}
+
+func sameWorktreePath(left, right string) bool {
+	a, errA := filepath.Abs(left)
+	b, errB := filepath.Abs(right)
+	return errA == nil && errB == nil && filepath.Clean(a) == filepath.Clean(b)
+}
+
 func printHuman(rows []Row, showFiles bool) {
 	tw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
 	for _, r := range rows {
@@ -239,6 +399,7 @@ func printHuman(rows []Row, showFiles bool) {
 		if r.Locked {
 			line += "\tlocked"
 		}
+		line += "\t" + humanFleetState(r.Fleet)
 		fmt.Fprintln(tw, line)
 	}
 	tw.Flush()
@@ -254,6 +415,29 @@ func printHuman(rows []Row, showFiles bool) {
 			}
 		}
 	}
+}
+
+func humanFleetState(fleet FleetSnapshot) string {
+	lease := "lease=unavailable"
+	if fleet.Lease.State == "available" {
+		lease = fmt.Sprintf("lease=available lane=%s owner=%s role=%s generation=%d", fleet.Lease.Lane, fleet.Lease.Owner, fleet.Lease.Role, fleet.Lease.Generation)
+	}
+	safeRef := "safe-ref=unavailable"
+	if fleet.SafeRef.State == "available" {
+		safeRef = fmt.Sprintf("safe-ref=available ref=%s sha=%s", fleet.SafeRef.Ref, fleet.SafeRef.SHA)
+	}
+	ci := "ci=unavailable"
+	if fleet.CI.State == "available" {
+		ci = "ci=unknown"
+		if len(fleet.Verification) > 0 {
+			states := make([]string, 0, len(fleet.Verification))
+			for _, verification := range fleet.Verification {
+				states = append(states, fmt.Sprintf("%s@%s policy=%s attempt=%d", verification.State, verification.CandidateSHA, verification.PolicyRevision, verification.Attempt))
+			}
+			ci = "ci=" + strings.Join(states, ",")
+		}
+	}
+	return strings.Join([]string{lease, safeRef, "session=" + fleet.Session.State, "retention=" + fleet.Retention.State, ci}, " ")
 }
 
 func computeCollisions(rows []Row) []collision {
