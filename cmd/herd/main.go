@@ -131,6 +131,9 @@ func main() {
 	case "preflight":
 		runPreflight()
 
+	case "preflight-static":
+		runPreflightStatic()
+
 	case "verify":
 		runVerify()
 
@@ -422,7 +425,8 @@ func printUsage() {
 	fmt.Println("\nCommands:")
 	fmt.Println("  init       Scaffold default .herd/herd.yaml configuration file")
 	fmt.Println("  clone      Clone a Herdforge repository and bootstrap the forge")
-	fmt.Println("  preflight  Run workspace boundary and repo-relative path verification")
+	fmt.Println("  preflight         Run workspace boundary, merge policy, and fleet readiness verification")
+	fmt.Println("  preflight-static  Run static workspace boundary, signal literal, and merge policy scanner (no readiness)")
 	fmt.Println("  selftest   Run core orchestration behavior self-test suite")
 	fmt.Println("  status     Display current orchestration engine status")
 	fmt.Println("  pulse      Coordinator heartbeat (observe default; --act mutates bounded steps)")
@@ -771,7 +775,7 @@ func runClone() {
 	fmt.Println("Run: cd", targetDir, "&& herd standing")
 }
 
-func runPreflight() {
+func runPreflightStatic() {
 	if err := preflight.CheckWorktreeBoundary("."); err != nil {
 		fmt.Fprintf(os.Stderr, "Preflight failed: %v\n", err)
 		os.Exit(1)
@@ -791,6 +795,10 @@ func runPreflight() {
 		os.Exit(1)
 	}
 	fmt.Println("Preflight merge-policy check passed. Required CI and different-family review declared.")
+}
+
+func runPreflight() {
+	runPreflightStatic()
 
 	// FAC-133 fleet readiness: optional live refresh, then consume attestation.
 	// HERD_LIVE_HARNESS_PROOF=1 or HERD_REFRESH_READINESS=1 triggers a single-flight

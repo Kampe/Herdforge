@@ -239,14 +239,12 @@ func TestFreshClonePreflightAndRuntimeMigrationLeaveTrackedStateClean(t *testing
 			t.Fatalf("%s dirtied tracked runtime state: %s", stage, output)
 		}
 	}
-	preflight := exec.Command(binary, "preflight")
-	preflight.Dir = clone
-	preflight.Env = append(os.Environ(), "HERD_CONTROL_SECRET=", "HERD_LIVE_HARNESS_PROOF=", "HERD_REFRESH_READINESS=")
-	output, err := preflight.CombinedOutput()
-	if err == nil {
-		t.Fatalf("fresh clone preflight expected exit status 1 on blocked readiness, got success: %s", output)
+	preflightStatic := exec.Command(binary, "preflight-static")
+	preflightStatic.Dir = clone
+	if output, err := preflightStatic.CombinedOutput(); err != nil {
+		t.Fatalf("fresh clone preflight-static: %v: %s", err, output)
 	}
-	clean("preflight")
+	clean("preflight-static")
 
 	status := exec.Command(binary, "status")
 	status.Dir = clone
@@ -256,16 +254,28 @@ func TestFreshClonePreflightAndRuntimeMigrationLeaveTrackedStateClean(t *testing
 	clean("runtime migration")
 }
 
-func TestPreflightBlockedReadinessExitsNonZero(t *testing.T) {
+func TestPreflightStaticAndOperationalReadinessGates(t *testing.T) {
 	binary := buildHerd(t)
 	tmpDir := t.TempDir()
-	// Preflight without durable attestation must fail closed and exit non-zero.
+	// 1. Static preflight succeeds without any fleet attestation or environment variables.
+	staticCmd := exec.Command(binary, "preflight-static")
+	staticCmd.Dir = tmpDir
+	staticCmd.Env = append(os.Environ(), "HERD_CONTROL_SECRET=", "HERD_LIVE_HARNESS_PROOF=", "HERD_REFRESH_READINESS=")
+	staticOut, err := staticCmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("preflight-static must succeed without attestation; got error: %v: %s", err, staticOut)
+	}
+	if !strings.Contains(string(staticOut), "Preflight boundary check passed.") {
+		t.Fatalf("expected preflight boundary check pass output, got: %s", staticOut)
+	}
+
+	// 2. Operational preflight without durable attestation must fail closed and exit non-zero.
 	cmd := exec.Command(binary, "preflight")
 	cmd.Dir = tmpDir
 	cmd.Env = append(os.Environ(), "HERD_CONTROL_SECRET=", "HERD_LIVE_HARNESS_PROOF=", "HERD_REFRESH_READINESS=")
 	out, err := cmd.CombinedOutput()
 	if err == nil {
-		t.Fatalf("preflight must exit non-zero when readiness is blocked; got success: %s", out)
+		t.Fatalf("operational preflight must exit non-zero when readiness is blocked; got success: %s", out)
 	}
 	if !strings.Contains(string(out), "FAC-133 readiness: BLOCKED") {
 		t.Fatalf("expected BLOCKED readiness in output, got: %s", out)
