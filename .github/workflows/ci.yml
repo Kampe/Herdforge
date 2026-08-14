@@ -35,6 +35,8 @@ jobs:
       # history/current-source gate executed by make security.
       - name: Set up pinned Gitleaks
         uses: gitleaks/gitleaks-action@dcedce43c6f43de0b836d1fe38946645c9c638dc
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       # Pinned to setup-trivy v0.3.1. This installs the scanner consumed by
       # make lint's tracked-module HIGH/CRITICAL dependency gate.
