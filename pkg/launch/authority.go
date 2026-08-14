@@ -142,7 +142,7 @@ func validateSnapshot(s Snapshot) error {
 	states := map[string]state{}
 	max := map[string]int64{}
 	for i, e := range s.Events {
-		if e.Sequence != uint64(i+1) {
+		if e.Sequence != uint64(i)+1 {
 			return errors.New("corrupt launch state: invalid event sequence")
 		}
 		if e.Kind != "reserved" && e.Kind != "accepted" && e.Kind != "rejected" && e.Kind != "superseded" && e.Kind != "terminal" {
