@@ -53,6 +53,21 @@ func TestCheckMergePolicy_CompletePolicyPasses(t *testing.T) {
 	}
 }
 
+func TestCheckMergePolicy_RemoteCIIsOptInButRequiresChecksWhenEnabled(t *testing.T) {
+	policy := DefaultProtectedPolicy()
+	if rep := CheckMergePolicy(policy); !rep.OK {
+		t.Fatalf("remote CI opt-out policy refused: %v", rep.Reasons)
+	}
+	policy.RemoteCI.Required = true
+	if rep := CheckMergePolicy(policy); rep.OK {
+		t.Fatal("remote CI without declared checks was accepted")
+	}
+	policy.RemoteCI.RequiredChecks = []string{"remote-gate"}
+	if rep := CheckMergePolicy(policy); !rep.OK {
+		t.Fatalf("declared remote CI policy refused: %v", rep.Reasons)
+	}
+}
+
 // The single edit that would neutralise every other gate. If `protected: false`
 // ever returns OK again, the whole check becomes unable to refuse anything.
 func TestCheckMergePolicy_UnprotectedIsRefusedNotOpen(t *testing.T) {
