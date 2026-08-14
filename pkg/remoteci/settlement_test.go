@@ -13,13 +13,13 @@ import (
 func TestSettleRejectsStaleCandidateSHA(t *testing.T) {
 	watch := Binding{
 		Repository: "github.com/Kampe/Herdforge", CandidateSHA: strings.Repeat("a", 40),
-		PolicyRevision: "policy-v1", Attempt: 1,
+		PolicyRevision: "policy-v1", Attempt: 1, RequiredChecks: []string{"gate"},
 	}
 	settlement := Settlement{
 		Version: Version1,
 		Binding: Binding{
 			Repository: "github.com/Kampe/Herdforge", CandidateSHA: strings.Repeat("b", 40),
-			PolicyRevision: "policy-v1", Attempt: 1,
+			PolicyRevision: "policy-v1", Attempt: 1, RequiredChecks: []string{"gate"},
 		},
 		State: StatePassed,
 	}
@@ -33,14 +33,14 @@ func TestStoreDeduplicatesCandidateAndPolicyAndRedactsDiagnostics(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	binding := Binding{Repository: "github.com/Kampe/Herdforge", CandidateSHA: strings.Repeat("c", 40), PolicyRevision: "policy-v1", Attempt: 1}
+	binding := Binding{Repository: "github.com/Kampe/Herdforge", CandidateSHA: strings.Repeat("c", 40), PolicyRevision: "policy-v1", Attempt: 1, RequiredChecks: []string{"gate"}}
 	if _, created, err := store.Register(binding); err != nil || !created {
 		t.Fatalf("Register first = created=%v err=%v", created, err)
 	}
 	if _, created, err := store.Register(binding); err != nil || created {
 		t.Fatalf("Register duplicate = created=%v err=%v", created, err)
 	}
-	if _, _, err := store.Register(Binding{Repository: binding.Repository, CandidateSHA: binding.CandidateSHA, PolicyRevision: binding.PolicyRevision, Attempt: 2}); !errors.Is(err, ErrInvalid) {
+	if _, _, err := store.Register(Binding{Repository: binding.Repository, CandidateSHA: binding.CandidateSHA, PolicyRevision: binding.PolicyRevision, Attempt: 2, RequiredChecks: []string{"gate"}}); !errors.Is(err, ErrInvalid) {
 		t.Fatalf("Register changed attempt = %v, want ErrInvalid", err)
 	}
 	written, err := store.PersistTerminal(Settlement{Version: Version1, Binding: binding, State: StateFailed, Diagnostic: "Authorization: secret-token\n" + strings.Repeat("x", 2048)})
@@ -60,7 +60,7 @@ func TestStoreDeduplicatesCandidateAndPolicyAndRedactsDiagnostics(t *testing.T) 
 }
 
 func TestGitHubActionsFailsClosedAndRequiresExactCandidate(t *testing.T) {
-	binding := Binding{Repository: "github.com/Kampe/Herdforge", CandidateSHA: strings.Repeat("d", 40), PolicyRevision: "p", Attempt: 1}
+	binding := Binding{Repository: "github.com/Kampe/Herdforge", CandidateSHA: strings.Repeat("d", 40), PolicyRevision: "p", Attempt: 1, RequiredChecks: []string{"gate"}}
 	for name, tc := range map[string]struct {
 		output string
 		err    error
@@ -68,14 +68,39 @@ func TestGitHubActionsFailsClosedAndRequiresExactCandidate(t *testing.T) {
 	}{
 		"unavailable": {err: errors.New("no auth"), want: ErrUnavailable},
 		"no checks":   {output: "[]", want: ErrNoChecks},
-		"pending":     {output: `[{"headSha":"` + binding.CandidateSHA + `","status":"in_progress","conclusion":""}]`, want: ErrPending},
-		"stale SHA":   {output: `[{"headSha":"` + strings.Repeat("e", 40) + `","status":"completed","conclusion":"success"}]`, want: ErrStale},
+		"pending":     {output: `[{"name":"gate","headSha":"` + binding.CandidateSHA + `","status":"in_progress","conclusion":""}]`, want: ErrPending},
+		"stale SHA":   {output: `[{"name":"gate","headSha":"` + strings.Repeat("e", 40) + `","status":"completed","conclusion":"success"}]`, want: ErrStale},
 	} {
 		t.Run(name, func(t *testing.T) {
 			g := GitHubActions{Execute: func(context.Context, string, ...string) ([]byte, error) { return []byte(tc.output), tc.err }}
 			_, err := g.Watch(context.Background(), binding)
 			if !errors.Is(err, tc.want) {
 				t.Fatalf("Watch error = %v, want %v", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestGitHubActionsRequiresEveryDeclaredCheckToPass(t *testing.T) {
+	binding := Binding{Repository: "github.com/Kampe/Herdforge", CandidateSHA: strings.Repeat("9", 40), PolicyRevision: "p", Attempt: 1, RequiredChecks: []string{"build", "lint"}}
+	for name, tc := range map[string]struct {
+		output string
+		want   error
+	}{
+		"missing required": {output: `[{"name":"build","headSha":"` + binding.CandidateSHA + `","status":"completed","conclusion":"success"}]`, want: ErrNoChecks},
+		"failed required":  {output: `[{"name":"build","headSha":"` + binding.CandidateSHA + `","status":"completed","conclusion":"success"},{"name":"lint","headSha":"` + binding.CandidateSHA + `","status":"completed","conclusion":"failure"}]`},
+	} {
+		t.Run(name, func(t *testing.T) {
+			g := GitHubActions{Execute: func(context.Context, string, ...string) ([]byte, error) { return []byte(tc.output), nil }}
+			settlement, err := g.Watch(context.Background(), binding)
+			if tc.want != nil {
+				if !errors.Is(err, tc.want) {
+					t.Fatalf("Watch error = %v, want %v", err, tc.want)
+				}
+				return
+			}
+			if err != nil || settlement.State != StateFailed {
+				t.Fatalf("Watch = %+v, %v; want terminal failure", settlement, err)
 			}
 		})
 	}
@@ -90,7 +115,7 @@ func TestTerminalFailureRoutesToRecoveryOnce(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	binding := Binding{Repository: "github.com/Kampe/Herdforge", CandidateSHA: strings.Repeat("f", 40), PolicyRevision: "p", Attempt: 1}
+	binding := Binding{Repository: "github.com/Kampe/Herdforge", CandidateSHA: strings.Repeat("f", 40), PolicyRevision: "p", Attempt: 1, RequiredChecks: []string{"gate"}}
 	if _, _, err := store.Register(binding); err != nil {
 		t.Fatal(err)
 	}
@@ -109,7 +134,7 @@ func TestTerminalFailureRoutesToRecoveryOnce(t *testing.T) {
 
 func TestSettlementRequiresExactBinding(t *testing.T) {
 	settlement := Settlement{Version: Version1, Binding: Binding{
-		Repository: "github.com/Kampe/Herdforge", CandidateSHA: "refs/heads/main", PolicyRevision: "policy-v1", Attempt: 1,
+		Repository: "github.com/Kampe/Herdforge", CandidateSHA: "refs/heads/main", PolicyRevision: "policy-v1", Attempt: 1, RequiredChecks: []string{"gate"},
 	}, State: StatePassed}
 	if err := settlement.Validate(); !errors.Is(err, ErrInvalid) {
 		t.Fatalf("Validate error = %v, want ErrInvalid", err)

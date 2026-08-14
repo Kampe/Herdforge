@@ -8,14 +8,17 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/Kampe/Herdforge/pkg/config"
 	"github.com/Kampe/Herdforge/pkg/mergeadmit"
 	"github.com/Kampe/Herdforge/pkg/preflight"
 	"github.com/Kampe/Herdforge/pkg/provider"
+	"github.com/Kampe/Herdforge/pkg/remoteci"
 	"github.com/Kampe/Herdforge/pkg/reviewledger"
 	hsync "github.com/Kampe/Herdforge/pkg/sync"
+	"github.com/Kampe/Herdforge/pkg/toolchild"
 )
 
 // FAC-156: the coordinator's merge step is compiled code, reachable from a
@@ -50,6 +53,8 @@ type mergeAdmitFlags struct {
 	authorFamily, authorIdentity     *string
 	leaseGeneration                  *int64
 	pr                               *int
+	remoteCIAttempt                  *int64
+	remoteCIFile                     *string
 	asJSON                           *bool
 }
 
@@ -64,11 +69,13 @@ func registerMergeAdmitFlags(fs *flag.FlagSet) *mergeAdmitFlags {
 		patchID:         fs.String("patch-id", "", "Patch identity bound into the reviewer's verdict (required)"),
 		acceptance: fs.String("acceptance-digest", "",
 			"Acceptance digest carried from review time (required). Compute with `herd merge-admit --show-acceptance --ref X`."),
-		authorFamily:   fs.String("author-family", "", "Builder model family (required)"),
-		authorIdentity: fs.String("author-identity", "", "Builder session identity (required)"),
-		mode:           fs.String("mode", "", "How the merge will be published: merge, rebase, or squash (required)"),
-		pr:             fs.Int("pr", 0, "Pull request number to probe for head/mergeability/CI (required)"),
-		asJSON:         fs.Bool("json", false, "Emit the decision as JSON"),
+		authorFamily:    fs.String("author-family", "", "Builder model family (required)"),
+		authorIdentity:  fs.String("author-identity", "", "Builder session identity (required)"),
+		mode:            fs.String("mode", "", "How the merge will be published: merge, rebase, or squash (required)"),
+		pr:              fs.Int("pr", 0, "Pull request number to probe for head/mergeability/CI (required)"),
+		remoteCIAttempt: fs.Int64("remote-ci-attempt", 0, "Remote CI attempt bound to this candidate (required)"),
+		remoteCIFile:    fs.String("remote-ci-file", ".herd/remote-ci.jsonl", "Durable remote CI settlement ledger"),
+		asJSON:          fs.Bool("json", false, "Emit the decision as JSON"),
 	}
 }
 
@@ -102,11 +109,15 @@ func runMergeAdmit() {
 
 	gate, err := buildMergeGate(*mf.ref, *mf.taskID, *mf.pr)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "herd merge-admit: %v\n", err)
+		fmt.Fprintf(os.Stderr, "REFUSED  [%s] %s: %v\n", hsync.NormalizeRef(*mf.ref), mergeadmit.CodeRemoteCI, err)
 		os.Exit(1)
 	}
 
 	req := mf.request()
+	if err := bindRemoteCIAdmission(gate, &req, *mf.remoteCIFile, *mf.remoteCIAttempt); err != nil {
+		fmt.Fprintf(os.Stderr, "herd merge-admit: %v\n", err)
+		os.Exit(1)
+	}
 	decision, admitErr := gate.Admit(req)
 
 	if *mf.asJSON {
@@ -140,6 +151,39 @@ func runMergeAdmit() {
 		decision.Reviewer, decision.ReviewerFam, decision.Tier, decision.Reason)
 	fmt.Printf("  decision recorded at %s\n", admissionRecordPath(".", decision.Ref))
 	fmt.Println("  merge now, then run: herd merge-complete --ref " + decision.Ref)
+}
+
+// bindRemoteCIAdmission constructs the exact policy/repository/candidate
+// binding from the declared merge policy and loads its durable settlement.
+func bindRemoteCIAdmission(gate *mergeadmit.Gate, req *mergeadmit.Request, ledgerPath string, attempt int64) error {
+	if gate == nil || req == nil {
+		return fmt.Errorf("remote CI admission requires gate and request")
+	}
+	if !gate.Policy.RemoteCI.Required {
+		return nil
+	}
+	if attempt < 1 {
+		return fmt.Errorf("remote CI attempt is required and must be positive")
+	}
+	repo, err := toolchild.RepositoryIdentity(".")
+	if err != nil {
+		return fmt.Errorf("remote CI repository identity: %w", err)
+	}
+	checks := append([]string(nil), gate.Policy.RemoteCI.RequiredChecks...)
+	sort.Strings(checks)
+	policyRevision := remoteci.Revision("merge-policy-v1", strings.Join(checks, "\x00"))
+	binding := remoteci.Binding{Repository: repo, CandidateSHA: req.CandidateSHA, PolicyRevision: policyRevision, Attempt: attempt, RequiredChecks: checks}
+	gate.RemoteCIRepository, gate.RemoteCIPolicyRevision = repo, policyRevision
+	store, err := remoteci.Open(ledgerPath)
+	if err != nil {
+		return err
+	}
+	settlement, err := store.Load(binding)
+	if err != nil {
+		return fmt.Errorf("remote CI settlement: %w", err)
+	}
+	req.RemoteCI = &settlement
+	return nil
 }
 
 // runMergeComplete is phase two: prove the merge landed the reviewed content

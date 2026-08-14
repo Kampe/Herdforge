@@ -14,6 +14,7 @@ type Executor func(context.Context, string, ...string) ([]byte, error)
 type GitHubActions struct{ Execute Executor }
 
 type githubRun struct {
+	Name       string `json:"name"`
 	HeadSHA    string `json:"headSha"`
 	Status     string `json:"status"`
 	Conclusion string `json:"conclusion"`
@@ -26,7 +27,7 @@ func (g GitHubActions) Watch(ctx context.Context, binding Binding) (Settlement, 
 	if g.Execute == nil {
 		return Settlement{}, fmt.Errorf("%w: gh executor is not configured", ErrUnavailable)
 	}
-	out, err := g.Execute(ctx, "gh", "run", "list", "--repo", binding.Repository, "--commit", binding.CandidateSHA, "--json", "headSha,status,conclusion", "--limit", "100")
+	out, err := g.Execute(ctx, "gh", "run", "list", "--repo", binding.Repository, "--commit", binding.CandidateSHA, "--json", "name,headSha,status,conclusion", "--limit", "100")
 	if err != nil {
 		return Settlement{}, fmt.Errorf("%w: gh run list: %v", ErrUnavailable, err)
 	}
@@ -37,15 +38,25 @@ func (g GitHubActions) Watch(ctx context.Context, binding Binding) (Settlement, 
 	if len(runs) == 0 {
 		return Settlement{}, ErrNoChecks
 	}
+	byName := map[string]githubRun{}
 	for _, run := range runs {
 		if run.HeadSHA != binding.CandidateSHA {
 			return Settlement{}, fmt.Errorf("%w: gh returned a run for a different candidate", ErrStale)
+		}
+		if strings.TrimSpace(run.Name) != "" {
+			byName[strings.ToLower(strings.TrimSpace(run.Name))] = run
+		}
+	}
+	for _, required := range binding.RequiredChecks {
+		run, ok := byName[strings.ToLower(strings.TrimSpace(required))]
+		if !ok {
+			return Settlement{}, fmt.Errorf("%w: required check %q was not reported", ErrNoChecks, required)
 		}
 		if strings.EqualFold(run.Status, "queued") || strings.EqualFold(run.Status, "in_progress") || strings.TrimSpace(run.Conclusion) == "" {
 			return Settlement{Version: Version1, Binding: binding, State: StatePending}, ErrPending
 		}
 		if !strings.EqualFold(run.Conclusion, "success") && !strings.EqualFold(run.Conclusion, "neutral") {
-			return Settlement{Version: Version1, Binding: binding, State: StateFailed, Diagnostic: redactBounded("GitHub Actions conclusion: " + run.Conclusion)}, nil
+			return Settlement{Version: Version1, Binding: binding, State: StateFailed, Diagnostic: redactBounded("GitHub Actions required check " + required + " conclusion: " + run.Conclusion)}, nil
 		}
 	}
 	return Settlement{Version: Version1, Binding: binding, State: StatePassed}, nil

@@ -21,13 +21,13 @@ func TestAdmitRequiresPassedRemoteCISettlementBoundToExactCandidate(t *testing.T
 
 	req.RemoteCI = &remoteci.Settlement{Version: remoteci.Version1, Binding: remoteci.Binding{
 		Repository: gate.RemoteCIRepository, CandidateSHA: strings.Repeat("a", 40),
-		PolicyRevision: gate.RemoteCIPolicyRevision, Attempt: 1,
+		PolicyRevision: gate.RemoteCIPolicyRevision, Attempt: 1, RequiredChecks: []string{"build"},
 	}, State: remoteci.StatePassed}
 	mustRefuse(t, gate, req, CodeRemoteCI)
 
 	req.RemoteCI = &remoteci.Settlement{Version: remoteci.Version1, Binding: remoteci.Binding{
 		Repository: gate.RemoteCIRepository, CandidateSHA: shaCurrent,
-		PolicyRevision: gate.RemoteCIPolicyRevision, Attempt: 1,
+		PolicyRevision: gate.RemoteCIPolicyRevision, Attempt: 1, RequiredChecks: []string{"build"},
 	}, State: remoteci.StatePassed}
 	mustAdmit(t, gate, req)
 }
