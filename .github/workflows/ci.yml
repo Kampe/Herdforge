@@ -28,6 +28,13 @@ jobs:
           go-version: "1.26"
           cache: true
 
+      # Pinned to setup-trivy v0.3.1. This installs the scanner consumed by
+      # make lint's tracked-module HIGH/CRITICAL dependency gate.
+      - name: Set up Trivy
+        uses: aquasecurity/setup-trivy@81e514348e19b6112ce2a7e3ecbafe19c1e1f567
+        with:
+          version: v0.74.0
+
       - name: Build, lint, unit tests, preflight
         run: make lint test-unit test-race preflight
 
