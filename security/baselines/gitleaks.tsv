@@ -11,4 +11,3 @@ a93d4272bf97d2605d082d949cd6d392ca93e82b:pkg/signerboundary/worker_cannot_sign_t
 5fa59e27de8ec5972ec6d0e1c5ec405f5b62a476:pkg/agentscope/trusted_job_submission_test.go:generic-api-key:529	legacy fixture	security-maintainers	2026-12-31
 c02da6326a18d9bbf5c53a1c5fe04268e55fd039:pkg/router/launch.go:generic-api-key:118	legacy fixture	security-maintainers	2026-12-31
 bc13493057e5684569e3eff7a78b70ac27920358:pkg/router/launch.go:generic-api-key:118	legacy fixture	security-maintainers	2026-12-31
-8d04ca92bb7f0db8dab57de029710621e40a99f8:pkg/herdr/delivery_test.go:generic-api-key:101	fixture history	security-maintainers	2026-12-31
