@@ -7,16 +7,23 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strings"
 
 	"github.com/Kampe/Herdforge/pkg/lifecycle"
+	"github.com/Kampe/Herdforge/pkg/overlap"
 	"github.com/Kampe/Herdforge/pkg/worktree"
 )
 
 var errGlobalAutoReapDisabled = errors.New("global auto-reap disabled")
 
+// OverlapReport is the result of an unmerged-branch convergence scan.
+// OverlappingFiles maps each hot filepath to the list of branch names
+// touching it (first-seen order per tip). ScannedTips is the count of
+// distinct unmerged tips that participated in the census. BaseRef is the
+// integration point the tips were measured against.
 type OverlapReport struct {
 	OverlappingFiles map[string][]string // filepath -> list of branches touching it
+	ScannedTips      int                 // distinct unmerged tips scanned
+	BaseRef          string              // base ref used for the ahead-of check
 }
 
 type GCManager struct {
@@ -52,37 +59,72 @@ func NewGCManager(repoRoot string, wm *worktree.WorktreeManager) *GCManager {
 	}
 }
 
-// ScanOverlap scans active git worktree branches for unmerged overlapping file modifications (porting bin/herd-overlap)
+// ScanOverlap surfaces files that minTips or more distinct unmerged branches
+// are editing, before those branches collide at merge. It delegates to the
+// authoritative pkg/overlap engine (the Go port of bin/herd-overlap) so the
+// census, tip de-duplication, exclusion registry, and deterministic ranking
+// are shared with the herd overlap CLI.
+//
+// The scan measures branches ahead of a base ref, not worktree directories.
+// A detached-HEAD worktree carries no branch ref and therefore cannot
+// contribute a phantom overlap. A missing worktree (pruned directory) is
+// irrelevant: the census reads refs/heads, not the worktree registry.
+//
+// FAC-299: the previous stub parsed `git worktree list --porcelain`, discarded
+// the data, ignored minTips, and always returned an empty report. This
+// implementation never returns empty success on a failure — a missing base
+// ref, a non-git directory, or an engine error is propagated as a non-nil
+// error.
 func (g *GCManager) ScanOverlap(ctx context.Context, minTips int) (*OverlapReport, error) {
-	cmd := exec.CommandContext(ctx, "git", "worktree", "list", "--porcelain")
-	cmd.Dir = g.RepoRoot
+	if g == nil {
+		return nil, errors.New("gc: nil manager")
+	}
+	if minTips < 1 {
+		return nil, fmt.Errorf("gc: minTips must be >= 1, got %d", minTips)
+	}
 
-	out, err := cmd.Output()
+	baseRef := resolveOverlapBaseRef(ctx, g.RepoRoot)
+	if baseRef == "" {
+		return nil, fmt.Errorf("gc: no base ref found for overlap scan; set HERD_OVERLAP_MAIN_REF or fetch origin/main")
+	}
+
+	engine := overlap.NewOverlap(g.RepoRoot)
+	hots, scanned, err := engine.FileOverlaps(ctx, baseRef, minTips, nil)
 	if err != nil {
-		return nil, fmt.Errorf("failed to list worktrees for overlap scan: %w", err)
+		return nil, fmt.Errorf("gc: overlap scan against %s: %w", baseRef, err)
 	}
 
 	report := &OverlapReport{
-		OverlappingFiles: make(map[string][]string),
+		OverlappingFiles: make(map[string][]string, len(hots)),
+		ScannedTips:      scanned,
+		BaseRef:          baseRef,
 	}
+	for _, h := range hots {
+		report.OverlappingFiles[h.File] = h.Branches
+	}
+	return report, nil
+}
 
-	lines := strings.Split(string(out), "\n")
-	var currentWT string
-	var currentBranch string
-
-	for _, line := range lines {
-		if strings.HasPrefix(line, "worktree ") {
-			currentWT = strings.TrimPrefix(line, "worktree ")
-		} else if strings.HasPrefix(line, "branch ") {
-			currentBranch = strings.TrimPrefix(line, "branch refs/heads/")
-			if currentWT != "" && currentBranch != "" {
-				// Record branch association
-				_ = currentWT
-			}
+// resolveOverlapBaseRef finds the integration point that unmerged branches are
+// ahead of. The CLI uses origin/main; a library function must also work against
+// a local-only repo, so the chain falls back through common defaults. Returns
+// "" when no candidate ref exists, which the caller treats as a hard error.
+func resolveOverlapBaseRef(ctx context.Context, repoRoot string) string {
+	if v := os.Getenv("HERD_OVERLAP_MAIN_REF"); v != "" && refExists(ctx, repoRoot, v) {
+		return v
+	}
+	for _, ref := range []string{"origin/main", "origin/master", "main", "master"} {
+		if refExists(ctx, repoRoot, ref) {
+			return ref
 		}
 	}
+	return ""
+}
 
-	return report, nil
+func refExists(ctx context.Context, repoRoot, ref string) bool {
+	cmd := exec.CommandContext(ctx, "git", "rev-parse", "--verify", "--quiet", ref)
+	cmd.Dir = repoRoot
+	return cmd.Run() == nil
 }
 
 // PruneStaleWorktrees cleans up merged or orphaned worktree directories (porting bin/herd-gc)
