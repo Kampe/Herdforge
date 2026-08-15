@@ -14,4 +14,3 @@ G101	pkg/security/hostcreds_types.go	35	13541011f25f2a60d93a87e3f24253fc59d11a0b
 G101	pkg/verifier/lifecycle.go	159-183	7e70472cbc8bdc0ae9b9222821003dc0fbca3d9a5431b38b3fe81aaaa374e04a	wrapper-shell variable is command path, never credential	verifier-maintainers	2026-12-31
 G101	contracts/agentscope/trusted_job.go	89	a790a64522d45a97d5a76a67b08c1fe46fd88172d387fdfc67ba34d727b51936	violation-code label only; no credential value	security-maintainers	2026-12-31
 G101	contracts/agentscope/types.go	197	aa9e9e12814ff9aa84daa8100814a1890ff27646d5e139ce301a3ffa090962f3	violation-code label only; no credential value	security-maintainers	2026-12-31
-G702	pkg/gc/gc.go	125	95f0daaeea53d2e5c2f8a3685c6e53eeb24d1e7ca6c5a04369ccd7fc8c4df648	ref is a git ref name passed as single exec arg; no shell; matches pkg/overlap pattern	gc-maintainers	2026-12-31
