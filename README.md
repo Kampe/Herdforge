@@ -1,6 +1,6 @@
 # Herdforge
 
-Herdforge is a Go control plane for turning repository work queues into isolated implementation, deterministic verification, independent review, serialized integration, and reconciled board state. It uses Herdr as the agent execution plane and supports pluggable task providers; Linear is the checked-in adapter.
+Herdforge is a Go control plane for turning repository work queues into isolated implementation, deterministic verification, independent review, serialized integration, and reconciled board state. It uses Herdr as the agent execution plane and supports pluggable task providers; Kaneo is the checked-in default.
 
 [![CI Workflow](https://github.com/Kampe/Herdforge/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Kampe/Herdforge/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
@@ -75,8 +75,11 @@ config block — which is why the forge-repair lane is named `mender` and carrie
 the `recovery` role. Ten of the eleven roles are occupied above; `assayer` is
 the one still free.
 
-Worker, forge-smith, and recovery lanes are additionally pinned to
-`codex`/`gpt-5.6-luna`/`medium`, and every lane must be a Pi harness.
+Worker, forge-smith, and recovery lanes have checked-in Codex/Luna defaults,
+but live routing may select another configured vendor harness and model. Pi is
+not part of the supported fleet. Runtime model selection belongs to routing
+policy; author and reviewer must not be pinned to the same model family for
+R1–R3 work.
 
 Spawn-ready prompt contracts are in `.herd/prompts/`. Runtime model selection belongs to routing policy; author and reviewer must not be pinned to the same model family for R1–R3 work.
 
@@ -85,7 +88,9 @@ Spawn-ready prompt contracts are in `.herd/prompts/`. Runtime model selection be
 - Go 1.24 or newer
 - Git
 - Herdr
-- a configured task-provider CLI or API; Linear is the checked-in adapter (`task_provider.type: "linear"`)
+- a configured task-provider CLI or API; Kaneo is the checked-in default
+  (`task_provider.type: "kaneo"`), while Linear and other wired providers are
+  opt-in through an explicit local configuration
 
 ## Build and inspect
 
@@ -166,7 +171,7 @@ The repository-local config lives at `.herd/herd.yaml` and describes the project
 
 ### Task provider
 
-`.herd/herd.yaml` ships with Linear selected. `task_provider.enabled` is an explicit activation
+`.herd/herd.yaml` ships with Kaneo selected. `task_provider.enabled` is an explicit activation
 allowlist (FAC-155): the factory activates `type` only if it is listed there, so anything else
 can never be auto-detected, probed, or selected. Changing `type` without moving that list fails
 closed before any board read or mutation.
