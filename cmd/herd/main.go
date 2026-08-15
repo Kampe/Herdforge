@@ -28,6 +28,7 @@ import (
 
 	"github.com/Kampe/Herdforge/pkg/activate"
 	"github.com/Kampe/Herdforge/pkg/attention"
+	"github.com/Kampe/Herdforge/pkg/candidateindex"
 	"github.com/Kampe/Herdforge/pkg/claim"
 	"github.com/Kampe/Herdforge/pkg/classify"
 	"github.com/Kampe/Herdforge/pkg/config"
@@ -1687,6 +1688,10 @@ func runReview() {
 		fmt.Fprintf(os.Stderr, "task provider: %v\n", tpErr)
 		os.Exit(1)
 	}
+	if strings.TrimSpace(cfg.TaskProvider.ProjectID) == "" {
+		fmt.Fprintf(os.Stderr, "task provider: project_id is required\n")
+		os.Exit(1)
+	}
 
 	ctx := context.Background()
 
@@ -1697,42 +1702,63 @@ func runReview() {
 		os.Exit(1)
 	}
 
-	if refArg != "" {
-		want := hsync.NormalizeRef(refArg)
-		var filtered []*provider.Task
-		for _, t := range tasks {
-			if strings.EqualFold(hsync.NormalizeRef(t.Ref), want) {
-				filtered = append(filtered, t)
-			}
-		}
-		tasks = filtered
+	reviewRoot, rootErr := canonicalHerdRoot()
+	if rootErr != nil {
+		fmt.Fprintf(os.Stderr, "review: cannot resolve canonical root: %v\n", rootErr)
+		os.Exit(1)
 	}
 
-	if len(tasks) == 0 {
+	idx := candidateindex.New(candidateindex.IndexOptions{
+		RepoRoot:     reviewRoot,
+		Config:       cfg,
+		TaskProvider: tp,
+	})
+	cands, candsErr := idx.BuildIndex(ctx)
+	if candsErr != nil {
+		fmt.Fprintf(os.Stderr, "failed to build candidate index: %v\n", candsErr)
+		os.Exit(1)
+	}
+
+	if refArg != "" {
+		want := hsync.NormalizeRef(refArg)
+		var filtered []*candidateindex.Candidate
+		for _, c := range cands {
+			if strings.EqualFold(hsync.NormalizeRef(c.Ref), want) {
+				filtered = append(filtered, c)
+			}
+		}
+		cands = filtered
+	}
+
+	// Also build task map for metadata lookup
+	taskMap := make(map[string]*provider.Task)
+	for _, t := range tasks {
+		taskMap[hsync.NormalizeRef(t.Ref)] = t
+	}
+
+	if len(cands) == 0 {
 		fmt.Println("No tasks in-progress to review.")
 		return
 	}
 
-	// Sort deterministically: Priority DESC, Ref ASC
-	sort.SliceStable(tasks, func(i, j int) bool {
-		priorityRank := map[provider.Priority]int{
-			provider.PriorityUrgent: 4,
-			provider.PriorityHigh:   3,
-			provider.PriorityMedium: 2,
-			provider.PriorityLow:    1,
-		}
-		pi := priorityRank[tasks[i].Priority]
-		pj := priorityRank[tasks[j].Priority]
-		if pi != pj {
-			return pi > pj
-		}
-		return provider.CompareRefs(tasks[i].Ref, tasks[j].Ref) < 0
-	})
-
 	claimIdx := -1
-	for i, task := range tasks {
-		fmt.Printf("[%d] [%s] %s (priority=%s)\n", i, task.Ref, task.Title, task.Priority)
-		if claimIdx < 0 {
+	for i, c := range cands {
+		title := c.Title
+		if title == "" {
+			if t, ok := taskMap[hsync.NormalizeRef(c.Ref)]; ok {
+				title = t.Title
+			}
+		}
+		shaInfo := ""
+		if c.CandidateSHA != "" {
+			shaInfo = fmt.Sprintf(" sha=%s", shortSHA(c.CandidateSHA))
+		}
+		statusInfo := ""
+		if c.State == candidateindex.StateBlocked {
+			statusInfo = fmt.Sprintf(" [BLOCKED: %s]", strings.Join(c.BlockedEvidence, "; "))
+		}
+		fmt.Printf("[%d] [%s] %s (priority=%s%s)%s\n", i, c.Ref, title, c.Priority, shaInfo, statusInfo)
+		if claimIdx < 0 && c.State != candidateindex.StateBlocked {
 			claimIdx = i
 		}
 	}
@@ -1741,17 +1767,24 @@ func runReview() {
 		return
 	}
 
-	task := tasks[claimIdx]
+	selectedCand := cands[claimIdx]
+	selectedTitle := selectedCand.Title
+	if selectedTitle == "" {
+		if t, ok := taskMap[hsync.NormalizeRef(selectedCand.Ref)]; ok {
+			selectedTitle = t.Title
+		}
+	}
+	task := taskMap[hsync.NormalizeRef(selectedCand.Ref)]
+	if task == nil {
+		task = &provider.Task{
+			Ref:       selectedCand.Ref,
+			Title:     selectedTitle,
+			Priority:  selectedCand.Priority,
+			ProjectID: cfg.TaskProvider.ProjectID,
+		}
+	}
 	fmt.Printf("\nSelected [%s] %s for review\n", task.Ref, task.Title)
 
-	// FAC-145: the coordinator's bound board provider is resolved BEFORE
-	// any reviewer admission — the transition authority must exist before a
-	// reviewer is created.
-	reviewRoot, rootErr := canonicalHerdRoot()
-	if rootErr != nil {
-		fmt.Fprintf(os.Stderr, "review: cannot resolve canonical root: %v\n", rootErr)
-		os.Exit(1)
-	}
 	btp, _, berr := boundBoardProvider(cfg, tp, reviewRoot, task.Ref)
 	if berr != nil {
 		fmt.Fprintf(os.Stderr, "review status transition unbound (FAC-145): %v\n", berr)
