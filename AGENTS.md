@@ -42,46 +42,53 @@ This contract governs all AI agents (Claude, Codex, Grok, AGY, and OpenCode) par
 
 ---
 
-## 2. Core Package Ownership Grid (30 of 99 packages)
+## 2. Core Package Ownership Grid (31 of 109 packages)
 
-The grid below covers the 30 load-bearing packages an agent touches most. It is
-deliberately not exhaustive — `ls -d pkg/*/` is the authoritative list, and
-`make test-unit` runs all of them. Do not infer that a package is absent from
-the tree because it is absent from this table.
+The grid below covers the 31 load-bearing packages an agent touches most. It is
+deliberately not exhaustive — `ls -d pkg/*/` is the authoritative list (109
+packages at last count), and `make test-unit` runs all of them. Do not infer
+that a package is absent from the tree because it is absent from this table.
 
-| Package | Purpose & Scope | Primary Test Target |
-| :--- | :--- | :--- |
-| `cmd/herd` | CLI entry point & subcommand router (`init`, `preflight`, `selftest`, `status`, `pulse`, `sh`) | `go test ./cmd/herd` |
-| `pkg/budget` | Dollar ($USD) and token spend governance manager | `go test ./pkg/budget` |
-| `pkg/claim` | Atomic task claiming & mutex scope lock manager | `go test ./pkg/claim` |
-| `pkg/config` | Declarative `.herd/herd.yaml` parser & validator | `go test ./pkg/config` |
-| `pkg/conflict` | LLM semantic git merge conflict resolver | `go test ./pkg/conflict` |
-| `pkg/cron` | Distributed agent scheduled task cron engine | `go test ./pkg/cron` |
-| `pkg/daemon` | Core orchestration daemon & heartbeat engine | `go test ./pkg/daemon` |
-| `pkg/gc` | Ephemeral git worktree garbage collector | `go test ./pkg/gc` |
-| `pkg/graph` | Multi-repo workspace dependency graph engine | `go test ./pkg/graph` |
-| `pkg/harness` | Universal AI harness adapter (`claude`, `codex`, `opencode`, `grok`, `agy`) | `go test ./pkg/harness` |
-| `pkg/llm` | Local Ollama and vLLM provider adapter | `go test ./pkg/llm` |
-| `pkg/mail` | Inter-agent durable JSONL mailbox protocol | `go test ./pkg/mail` |
-| `pkg/memory` | Knowledge-graph & error pattern session memory store | `go test ./pkg/memory` |
-| `pkg/metrics` | Prometheus metrics exporter (`/metrics`) | `go test ./pkg/metrics` |
-| `pkg/notifier` | Multi-platform notifier (Slack, Discord, Teams) | `go test ./pkg/notifier` |
-| `pkg/plugin` | WASM verifier plugin execution engine | `go test ./pkg/plugin` |
-| `pkg/preflight` | Workspace boundary & absolute path leak scanner | `go test ./pkg/preflight` |
-| `pkg/provider` | Pluggable task engine (Kaneo, Linear, GitHub, Jira, Azure, Memory) | `go test ./pkg/provider` |
-| `pkg/release` | Conventional commit log parser & CHANGELOG generator | `go test ./pkg/release` |
-| `pkg/review` | Adversarial risk classification & review pipeline | `go test ./pkg/review` |
-| `pkg/router` | Multi-provider LLM load balancer & 429 cooldowns | `go test ./pkg/router` |
-| `pkg/security` | Secret-scanning & credential leak guardrails | `go test ./pkg/security` |
-| `pkg/selftest` | Self-test assertion engine & boundary runner | `go test ./pkg/selftest` |
-| `pkg/server` | OpenAPI 3.0 REST control server (`/v1/status`) | `go test ./pkg/server` |
-| `pkg/skill` | WASM sandboxed dynamic skill runner | `go test ./pkg/skill` |
-| `pkg/sync` | Multi-board state reconciliation engine | `go test ./pkg/sync` |
-| `pkg/tui` | Live fleet operations dashboard & REPL shell (`herd sh`) | `go test ./pkg/tui` |
-| `pkg/verifier` | Language-agnostic test harness runner | `go test ./pkg/verifier` |
-| `pkg/webhook` | Event-driven HMAC webhook receiver engine | `go test ./pkg/webhook` |
-| `pkg/worker` | Worker lane process supervisor | `go test ./pkg/worker` |
-| `pkg/worktree` | Git worktree creation, isolation, & pruning | `go test ./pkg/worktree` |
+The **Reach** column is derived from the FAC-301 graph-backed package inventory
+(`make package-inventory`, baseline at `scripts/packageinventory/baseline.json`):
+- **prod** — reachable from the primary binary (`cmd/herd`) non-test build.
+- **unwired** — not wired into any binary; has own tests but is not yet imported
+  by production code. These are designed-but-not-yet-integrated packages, not
+  dead code. Do not delete them speculatively.
+
+| Package | Purpose & Scope | Primary Test Target | Reach |
+| :--- | :--- | :--- | :--- |
+| `cmd/herd` | CLI entry point & subcommand router (`init`, `preflight`, `selftest`, `status`, `pulse`, `sh`) | `go test ./cmd/herd` | prod |
+| `pkg/budget` | Dollar ($USD) and token spend governance manager | `go test ./pkg/budget` | unwired |
+| `pkg/claim` | Atomic task claiming & mutex scope lock manager | `go test ./pkg/claim` | prod |
+| `pkg/config` | Declarative `.herd/herd.yaml` parser & validator | `go test ./pkg/config` | prod |
+| `pkg/conflict` | LLM semantic git merge conflict resolver | `go test ./pkg/conflict` | unwired |
+| `pkg/cron` | Distributed agent scheduled task cron engine | `go test ./pkg/cron` | unwired |
+| `pkg/daemon` | Core orchestration daemon & heartbeat engine | `go test ./pkg/daemon` | prod |
+| `pkg/gc` | Ephemeral git worktree garbage collector | `go test ./pkg/gc` | unwired |
+| `pkg/graph` | Multi-repo workspace dependency graph engine | `go test ./pkg/graph` | prod |
+| `pkg/harness` | Universal AI harness adapter (`claude`, `codex`, `opencode`, `grok`, `agy`) | `go test ./pkg/harness` | prod |
+| `pkg/llm` | Local Ollama and vLLM provider adapter | `go test ./pkg/llm` | unwired |
+| `pkg/mail` | Inter-agent durable JSONL mailbox protocol | `go test ./pkg/mail` | prod |
+| `pkg/memory` | Knowledge-graph & error pattern session memory store | `go test ./pkg/memory` | prod |
+| `pkg/metrics` | Prometheus metrics exporter (`/metrics`) | `go test ./pkg/metrics` | unwired |
+| `pkg/notifier` | Multi-platform notifier (Slack, Discord, Teams) | `go test ./pkg/notifier` | unwired |
+| `pkg/plugin` | WASM verifier plugin execution engine | `go test ./pkg/plugin` | unwired |
+| `pkg/preflight` | Workspace boundary & absolute path leak scanner | `go test ./pkg/preflight` | prod |
+| `pkg/provider` | Pluggable task engine (Kaneo, Linear, GitHub, Jira, Azure, Memory) | `go test ./pkg/provider` | prod |
+| `pkg/release` | Conventional commit log parser & CHANGELOG generator | `go test ./pkg/release` | unwired |
+| `pkg/review` | Adversarial risk classification & review pipeline | `go test ./pkg/review` | prod |
+| `pkg/router` | Multi-provider LLM load balancer & 429 cooldowns | `go test ./pkg/router` | prod |
+| `pkg/security` | Secret-scanning & credential leak guardrails | `go test ./pkg/security` | prod |
+| `pkg/selftest` | Self-test assertion engine & boundary runner | `go test ./pkg/selftest` | prod |
+| `pkg/server` | OpenAPI 3.0 REST control server (`/v1/status`) | `go test ./pkg/server` | unwired |
+| `pkg/skill` | WASM sandboxed dynamic skill runner | `go test ./pkg/skill` | unwired |
+| `pkg/sync` | Multi-board state reconciliation engine | `go test ./pkg/sync` | prod |
+| `pkg/tui` | Live fleet operations dashboard & REPL shell (`herd sh`) | `go test ./pkg/tui` | unwired |
+| `pkg/verifier` | Language-agnostic test harness runner | `go test ./pkg/verifier` | prod |
+| `pkg/webhook` | Event-driven HMAC webhook receiver engine | `go test ./pkg/webhook` | unwired |
+| `pkg/worker` | Worker lane process supervisor | `go test ./pkg/worker` | unwired |
+| `pkg/worktree` | Git worktree creation, isolation, & pruning | `go test ./pkg/worktree` | prod |
 
 ---
 
