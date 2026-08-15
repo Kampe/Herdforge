@@ -13,6 +13,26 @@ import (
 	"github.com/Kampe/Herdforge/pkg/metrics"
 )
 
+const (
+	DefaultReadHeaderTimeout = 5 * time.Second
+	DefaultReadTimeout       = 10 * time.Second
+	DefaultWriteTimeout      = 10 * time.Second
+	DefaultIdleTimeout       = 60 * time.Second
+	DefaultShutdownTimeout   = 5 * time.Second
+
+	MinReadHeaderTimeout = 10 * time.Millisecond
+	MaxReadHeaderTimeout = 60 * time.Second
+
+	MinReadTimeout = 10 * time.Millisecond
+	MaxReadTimeout = 5 * time.Minute
+
+	MinWriteTimeout = 10 * time.Millisecond
+	MaxWriteTimeout = 5 * time.Minute
+
+	MinIdleTimeout = 10 * time.Millisecond
+	MaxIdleTimeout = 15 * time.Minute
+)
+
 type ServerStatusResponse struct {
 	Status     string                  `json:"status"`
 	Version    string                  `json:"version"`
@@ -26,6 +46,80 @@ type ServerStatusResponse struct {
 	Conditions []metrics.ConditionCode `json:"condition_codes"`
 }
 
+// Config defines the configuration for ControlServer including bounded timeouts.
+type Config struct {
+	Addr              string
+	ReadHeaderTimeout time.Duration
+	ReadTimeout       time.Duration
+	WriteTimeout      time.Duration
+	IdleTimeout       time.Duration
+	ShutdownTimeout   time.Duration
+	Metrics           *metrics.MetricsExporter
+	Now               func() time.Time
+}
+
+// DefaultConfig returns a Config populated with default timeouts.
+func DefaultConfig(addr string) Config {
+	return Config{
+		Addr:              addr,
+		ReadHeaderTimeout: DefaultReadHeaderTimeout,
+		ReadTimeout:       DefaultReadTimeout,
+		WriteTimeout:      DefaultWriteTimeout,
+		IdleTimeout:       DefaultIdleTimeout,
+		ShutdownTimeout:   DefaultShutdownTimeout,
+		Now:               time.Now,
+	}
+}
+
+// Validate ensures that configured timeouts are within safe and bounded limits.
+func (c Config) Validate() error {
+	if c.ReadHeaderTimeout < 0 {
+		return fmt.Errorf("read header timeout cannot be negative: %v", c.ReadHeaderTimeout)
+	}
+	if c.ReadHeaderTimeout > 0 && c.ReadHeaderTimeout < MinReadHeaderTimeout {
+		return fmt.Errorf("read header timeout %v is below minimum %v", c.ReadHeaderTimeout, MinReadHeaderTimeout)
+	}
+	if c.ReadHeaderTimeout > MaxReadHeaderTimeout {
+		return fmt.Errorf("read header timeout %v exceeds maximum %v", c.ReadHeaderTimeout, MaxReadHeaderTimeout)
+	}
+
+	if c.ReadTimeout < 0 {
+		return fmt.Errorf("read timeout cannot be negative: %v", c.ReadTimeout)
+	}
+	if c.ReadTimeout > 0 && c.ReadTimeout < MinReadTimeout {
+		return fmt.Errorf("read timeout %v is below minimum %v", c.ReadTimeout, MinReadTimeout)
+	}
+	if c.ReadTimeout > MaxReadTimeout {
+		return fmt.Errorf("read timeout %v exceeds maximum %v", c.ReadTimeout, MaxReadTimeout)
+	}
+
+	if c.WriteTimeout < 0 {
+		return fmt.Errorf("write timeout cannot be negative: %v", c.WriteTimeout)
+	}
+	if c.WriteTimeout > 0 && c.WriteTimeout < MinWriteTimeout {
+		return fmt.Errorf("write timeout %v is below minimum %v", c.WriteTimeout, MinWriteTimeout)
+	}
+	if c.WriteTimeout > MaxWriteTimeout {
+		return fmt.Errorf("write timeout %v exceeds maximum %v", c.WriteTimeout, MaxWriteTimeout)
+	}
+
+	if c.IdleTimeout < 0 {
+		return fmt.Errorf("idle timeout cannot be negative: %v", c.IdleTimeout)
+	}
+	if c.IdleTimeout > 0 && c.IdleTimeout < MinIdleTimeout {
+		return fmt.Errorf("idle timeout %v is below minimum %v", c.IdleTimeout, MinIdleTimeout)
+	}
+	if c.IdleTimeout > MaxIdleTimeout {
+		return fmt.Errorf("idle timeout %v exceeds maximum %v", c.IdleTimeout, MaxIdleTimeout)
+	}
+
+	if c.ShutdownTimeout < 0 {
+		return fmt.Errorf("shutdown timeout cannot be negative: %v", c.ShutdownTimeout)
+	}
+
+	return nil
+}
+
 type ControlServer struct {
 	mu        sync.Mutex
 	Addr      string
@@ -34,25 +128,73 @@ type ControlServer struct {
 	metrics   *metrics.MetricsExporter
 	now       func() time.Time
 	serveErr  error
+	config    Config
 }
 
+// NewControlServer initializes a ControlServer with standard default bounded timeouts.
 func NewControlServer(addr string) *ControlServer {
-	return &ControlServer{
-		Addr:      addr,
-		StartTime: time.Now(),
-		metrics:   metrics.NewMetricsExporter(),
-		now:       time.Now,
-	}
+	return NewControlServerWithMetrics(addr, nil, nil)
 }
 
+// NewControlServerWithMetrics initializes a ControlServer with exporter and clock.
 func NewControlServerWithMetrics(addr string, exporter *metrics.MetricsExporter, now func() time.Time) *ControlServer {
-	if exporter == nil {
-		exporter = metrics.NewMetricsExporter()
+	cfg := DefaultConfig(addr)
+	cfg.Metrics = exporter
+	if now != nil {
+		cfg.Now = now
 	}
-	if now == nil {
-		now = time.Now
+	srv, _ := NewControlServerWithConfig(cfg)
+	return srv
+}
+
+// NewControlServerWithConfig initializes and validates a ControlServer with the provided Config.
+func NewControlServerWithConfig(cfg Config) (*ControlServer, error) {
+	if err := cfg.Validate(); err != nil {
+		return nil, err
 	}
-	return &ControlServer{Addr: addr, StartTime: now(), metrics: exporter, now: now}
+	if cfg.ReadHeaderTimeout == 0 {
+		cfg.ReadHeaderTimeout = DefaultReadHeaderTimeout
+	}
+	if cfg.ReadTimeout == 0 {
+		cfg.ReadTimeout = DefaultReadTimeout
+	}
+	if cfg.WriteTimeout == 0 {
+		cfg.WriteTimeout = DefaultWriteTimeout
+	}
+	if cfg.IdleTimeout == 0 {
+		cfg.IdleTimeout = DefaultIdleTimeout
+	}
+	if cfg.ShutdownTimeout == 0 {
+		cfg.ShutdownTimeout = DefaultShutdownTimeout
+	}
+	if cfg.Metrics == nil {
+		cfg.Metrics = metrics.NewMetricsExporter()
+	}
+	if cfg.Now == nil {
+		cfg.Now = time.Now
+	}
+
+	return &ControlServer{
+		Addr:      cfg.Addr,
+		StartTime: cfg.Now(),
+		metrics:   cfg.Metrics,
+		now:       cfg.Now,
+		config:    cfg,
+	}, nil
+}
+
+// Config returns a copy of the ControlServer configuration.
+func (s *ControlServer) Config() Config {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.config
+}
+
+// HTTPServer returns the active http.Server instance if running, or nil.
+func (s *ControlServer) HTTPServer() *http.Server {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.httpSrv
 }
 
 func (s *ControlServer) Start(ctx context.Context) error {
@@ -62,9 +204,17 @@ func (s *ControlServer) Start(ctx context.Context) error {
 	mux.HandleFunc("/openapi.json", s.handleOpenAPI)
 	mux.Handle("/metrics", s.metrics.Handler())
 
+	s.mu.Lock()
+	cfg := s.config
+	s.mu.Unlock()
+
 	httpSrv := &http.Server{
-		Addr:    s.Addr,
-		Handler: mux,
+		Addr:              s.Addr,
+		Handler:           mux,
+		ReadHeaderTimeout: cfg.ReadHeaderTimeout,
+		ReadTimeout:       cfg.ReadTimeout,
+		WriteTimeout:      cfg.WriteTimeout,
+		IdleTimeout:       cfg.IdleTimeout,
 	}
 	s.mu.Lock()
 	s.httpSrv = httpSrv
@@ -74,6 +224,11 @@ func (s *ControlServer) Start(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("failed to listen on %s: %w", s.Addr, err)
 	}
+
+	s.mu.Lock()
+	s.Addr = listener.Addr().String()
+	s.config.Addr = s.Addr
+	s.mu.Unlock()
 
 	go func() {
 		if err := httpSrv.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -97,8 +252,18 @@ func (s *ControlServer) ServeError() error {
 func (s *ControlServer) Stop(ctx context.Context) error {
 	s.mu.Lock()
 	httpSrv := s.httpSrv
+	cfg := s.config
 	s.mu.Unlock()
 	if httpSrv != nil {
+		if ctx == nil {
+			var cancel context.CancelFunc
+			timeout := cfg.ShutdownTimeout
+			if timeout == 0 {
+				timeout = DefaultShutdownTimeout
+			}
+			ctx, cancel = context.WithTimeout(context.Background(), timeout)
+			defer cancel()
+		}
 		return httpSrv.Shutdown(ctx)
 	}
 	return nil
