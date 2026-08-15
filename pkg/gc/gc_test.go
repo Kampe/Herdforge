@@ -9,8 +9,8 @@ import (
 	"testing"
 
 	"github.com/Kampe/Herdforge/internal/testgit"
-	"github.com/Kampe/Herdforge/pkg/worktree"
 	"github.com/Kampe/Herdforge/pkg/lifecycle"
+	"github.com/Kampe/Herdforge/pkg/worktree"
 )
 
 // FAC-178: this test must remain disposable. It intentionally proves that the
