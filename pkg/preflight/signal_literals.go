@@ -2,6 +2,7 @@ package preflight
 
 import (
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -28,18 +29,28 @@ var dangerousSignalPatterns = []*regexp.Regexp{
 // unguarded FakeBackend behavior without tripping the gate.
 func CheckDangerousSignalLiterals(rootDir string) error {
 	var hits []string
-	err := filepath.Walk(rootDir, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
+	root, err := os.OpenRoot(rootDir)
+	if err != nil {
+		return fmt.Errorf("signal-literal preflight open root: %w", err)
+	}
+	defer root.Close()
+
+	err = fs.WalkDir(root.FS(), ".", func(path string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
 		}
-		if info.IsDir() {
-			name := info.Name()
+		if d.IsDir() {
+			if path == "." {
+				return nil
+			}
+			name := d.Name()
 			if name == ".git" || name == "vendor" || name == "node_modules" ||
 				name == "bin" || strings.HasPrefix(name, ".") {
-				return filepath.SkipDir
+				return fs.SkipDir
 			}
-			if gitdir.IsNestedGitDir(path, rootDir) {
-				return filepath.SkipDir
+			fullPath := filepath.Join(rootDir, path)
+			if gitdir.IsNestedGitDir(fullPath, rootDir) {
+				return fs.SkipDir
 			}
 			return nil
 		}
@@ -49,15 +60,14 @@ func CheckDangerousSignalLiterals(rootDir string) error {
 		// Skip the procsignal host backend implementation file: it is the
 		// single authorized syscall.Kill site and does not embed -1 literals.
 		// (Defense remains runtime validateKillArg.)
-		data, err := os.ReadFile(path)
+		data, err := root.ReadFile(path)
 		if err != nil {
 			return nil
 		}
 		content := string(data)
-		rel, _ := filepath.Rel(rootDir, path)
 		for _, re := range dangerousSignalPatterns {
 			if re.MatchString(content) {
-				hits = append(hits, fmt.Sprintf("%s (pattern %s)", rel, re.String()))
+				hits = append(hits, fmt.Sprintf("%s (pattern %s)", path, re.String()))
 				break
 			}
 		}

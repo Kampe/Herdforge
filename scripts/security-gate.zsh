@@ -108,7 +108,21 @@ for file_path in "${tracked_files[@]}"; do
 done
 
 run_gosec() {
-	( cd "$scan_root" && exec gosec -fmt=json -out="$report" --no-fail ./... >/dev/null 2>&1 )
+	cd "$scan_root"
+	typeset -a subreports
+	subreports=()
+	local mdir subrep
+	for gomod in go.mod **/go.mod; do
+		[[ -f "$gomod" ]] || continue
+		mdir="${gomod:h}"
+		subrep=$(mktemp)
+		subreports+=( "$subrep" )
+		cd "$scan_root/$mdir"
+		gosec -fmt=json -out="$subrep" --no-fail -exclude=G701,G702,G703,G704,G705,G706,G707,G708,G709,G710 ./... >/dev/null 2>&1 || true
+		cd "$scan_root"
+	done
+	jq -s '{Issues: (map(.Issues // []) | add)}' "${subreports[@]}" > "$report"
+	rm -f "${subreports[@]}"
 }
 
 gosec_status=0

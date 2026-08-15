@@ -2,6 +2,7 @@ package preflight
 
 import (
 	"fmt"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -14,31 +15,38 @@ import (
 func CheckWorktreeBoundary(rootDir string) error {
 	var absoluteLeakes []string
 
-	err := filepath.Walk(rootDir, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
+	root, err := os.OpenRoot(rootDir)
+	if err != nil {
+		return fmt.Errorf("failed to open repository root: %w", err)
+	}
+	defer root.Close()
+
+	err = fs.WalkDir(root.FS(), ".", func(path string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
 		}
-		if info.IsDir() {
-			name := info.Name()
+		if d.IsDir() {
+			name := d.Name()
 			if name == ".git" || name == "node_modules" || name == "vendor" ||
 				name == ".gemini" || name == ".qoder" || name == ".vscode" ||
 				name == ".claude" || name == ".codebuddy" || name == ".kiro" {
-				return filepath.SkipDir
+				return fs.SkipDir
 			}
-			if gitdir.IsNestedGitDir(path, rootDir) {
-				return filepath.SkipDir
+			fullPath := filepath.Join(rootDir, path)
+			if gitdir.IsNestedGitDir(fullPath, rootDir) {
+				return fs.SkipDir
 			}
 			return nil
 		}
 
-		if info.Name() == ".mcp.json" {
+		if d.Name() == ".mcp.json" {
 			return nil
 		}
 
 		// Only check text / config / markdown / code files
 		ext := filepath.Ext(path)
 		if ext == ".go" || ext == ".yaml" || ext == ".yml" || ext == ".md" || ext == ".json" {
-			data, err := os.ReadFile(path)
+			data, err := root.ReadFile(path)
 			if err != nil {
 				return nil
 			}
@@ -47,7 +55,7 @@ func CheckWorktreeBoundary(rootDir string) error {
 			isPreflightTest := strings.HasSuffix(path, "_test.go") && strings.Contains(path, "preflight")
 			if (strings.Contains(content, "/Users/") || strings.Contains(content, "/home/") || strings.Contains(content, "C:\\")) &&
 				!strings.HasSuffix(path, "AGENTS.md") && !strings.HasSuffix(path, "preflight.go") && !isPreflightTest {
-				absoluteLeakes = append(absoluteLeakes, path)
+				absoluteLeakes = append(absoluteLeakes, filepath.Join(rootDir, path))
 			}
 		}
 		return nil
