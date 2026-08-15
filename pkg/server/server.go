@@ -264,6 +264,10 @@ func (s *ControlServer) Stop(ctx context.Context) error {
 			ctx, cancel = context.WithTimeout(context.Background(), timeout)
 			defer cancel()
 		}
+		if err := ctx.Err(); err != nil {
+			_ = httpSrv.Close()
+			return err
+		}
 		return httpSrv.Shutdown(ctx)
 	}
 	return nil
