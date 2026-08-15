@@ -80,6 +80,28 @@ if [[ -f "$mock_gosec_pid" ]]; then
 	fi
 fi
 
+# Test SECURITY_GATE_TIMEOUT fallback for gosec
+gosec_shared_timeout_out="$tmp/gosec-shared-timeout.out"
+if PATH="$mock_bin:$PATH" SECURITY_GATE_TIMEOUT=1 ./scripts/security-gate.zsh >"$gosec_shared_timeout_out" 2>&1; then
+	print -u2 "error: security-gate did not fail closed on shared SECURITY_GATE_TIMEOUT for gosec"
+	exit 1
+fi
+grep -F -- "error: gosec timed out after 1s" "$gosec_shared_timeout_out" >/dev/null || {
+	print -u2 "error: missing gosec shared timeout diagnostic in output"
+	exit 1
+}
+
+# Test GOSEC_TIMEOUT precedence over SECURITY_GATE_TIMEOUT
+gosec_precedence_out="$tmp/gosec-precedence.out"
+if PATH="$mock_bin:$PATH" GOSEC_TIMEOUT=1 SECURITY_GATE_TIMEOUT=99 ./scripts/security-gate.zsh >"$gosec_precedence_out" 2>&1; then
+	print -u2 "error: security-gate did not respect GOSEC_TIMEOUT precedence"
+	exit 1
+fi
+grep -F -- "error: gosec timed out after 1s" "$gosec_precedence_out" >/dev/null || {
+	print -u2 "error: missing gosec precedence timeout diagnostic in output"
+	exit 1
+}
+
 # 2. Test gitleaks timeout enforcement and child process cleanup
 cat << 'EOF' > "$mock_bin/gosec"
 #!/usr/bin/env zsh
@@ -119,6 +141,28 @@ if [[ -f "$mock_gitleaks_pid" ]]; then
 		exit 1
 	fi
 fi
+
+# Test SECURITY_GATE_TIMEOUT fallback for gitleaks
+gitleaks_shared_timeout_out="$tmp/gitleaks-shared-timeout.out"
+if PATH="$mock_bin:$PATH" SECURITY_GATE_TIMEOUT=1 ./scripts/security-gate.zsh >"$gitleaks_shared_timeout_out" 2>&1; then
+	print -u2 "error: security-gate did not fail closed on shared SECURITY_GATE_TIMEOUT for gitleaks"
+	exit 1
+fi
+grep -F -- "error: gitleaks timed out after 1s" "$gitleaks_shared_timeout_out" >/dev/null || {
+	print -u2 "error: missing gitleaks shared timeout diagnostic in output"
+	exit 1
+}
+
+# Test GITLEAKS_TIMEOUT precedence over SECURITY_GATE_TIMEOUT
+gitleaks_precedence_out="$tmp/gitleaks-precedence.out"
+if PATH="$mock_bin:$PATH" GITLEAKS_TIMEOUT=1 SECURITY_GATE_TIMEOUT=99 ./scripts/security-gate.zsh >"$gitleaks_precedence_out" 2>&1; then
+	print -u2 "error: security-gate did not respect GITLEAKS_TIMEOUT precedence"
+	exit 1
+fi
+grep -F -- "error: gitleaks timed out after 1s" "$gitleaks_precedence_out" >/dev/null || {
+	print -u2 "error: missing gitleaks precedence timeout diagnostic in output"
+	exit 1
+}
 
 # 3. Test mock success within timeout
 cat << 'EOF' > "$mock_bin/gitleaks"

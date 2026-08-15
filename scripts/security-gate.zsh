@@ -8,13 +8,15 @@ cd "$repo_root"
 (( $+commands[gosec] )) || { print -u2 'error: pinned gosec is required'; exit 1; }
 (( $+commands[jq] )) || { print -u2 'error: jq is required'; exit 1; }
 
-gosec_timeout=${GOSEC_TIMEOUT:-${SECURITY_GATE_TIMEOUT:-120}}
-gitleaks_timeout=${GITLEAKS_TIMEOUT:-${SECURITY_GATE_TIMEOUT:-120}}
+# Default to 300s (5m) to accommodate repository scale and multi-package AST
+# traversal on shared CI runners without masking hangs; preserve environment overrides.
+gosec_timeout=${GOSEC_TIMEOUT:-${SECURITY_GATE_TIMEOUT:-300}}
+gitleaks_timeout=${GITLEAKS_TIMEOUT:-${SECURITY_GATE_TIMEOUT:-300}}
 if ! [[ "$gosec_timeout" =~ ^[1-9][0-9]*$ ]]; then
-	gosec_timeout=120
+	gosec_timeout=300
 fi
 if ! [[ "$gitleaks_timeout" =~ ^[1-9][0-9]*$ ]]; then
-	gitleaks_timeout=120
+	gitleaks_timeout=300
 fi
 
 # Copy only paths Git currently tracks.  In particular, do not walk the
