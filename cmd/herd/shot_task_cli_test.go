@@ -275,15 +275,15 @@ func decodeEvidence(t *testing.T, out string) shot.Evidence {
 func stubHarnessPATH(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()
-	for _, name := range []string{"codex", "claude", "grok"} {
+	for _, name := range []string{"claude", "grok"} {
 		p := filepath.Join(dir, name)
 		if err := os.WriteFile(p, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
 			t.Fatalf("write stub %s: %v", name, err)
 		}
 	}
-	// pi and opencode get PROBE-FAITHFUL stubs, not no-ops. The write-capable
-	// tool probe (pkg/toolprobe/probe.go recipeCommand) shells `pi` for
-	// harness="pi"/provider="codex" and `opencode` for harness="opencode".
+	// codex, pi, and opencode get PROBE-FAITHFUL stubs, not no-ops. The write-capable
+	// tool probe (pkg/toolprobe/probe.go recipeCommand) shells `pi` or `codex` for
+	// harness="codex"/harness="pi"/provider="codex" and `opencode` for harness="opencode".
 	// Both judge the ARTIFACT, never the model's claim: they require the file
 	// named in the prompt to exist containing EXECUTED. A stub that merely
 	// exits 0 is correctly judged INCAPABLE — "model described the write but
@@ -296,8 +296,10 @@ func stubHarnessPATH(t *testing.T) string {
 		"      mkdir -p \"$(dirname \"$w\")\" && printf 'EXECUTED' > \"$w\" ;;\n" +
 		"    esac\n" +
 		"  done\n" +
-		"done\nexit 0\n"
-	for _, name := range []string{"pi", "opencode"} {
+		"done\n" +
+		"printf 'PROBE_OK\\n'\n" +
+		"exit 0\n"
+	for _, name := range []string{"codex", "pi", "opencode"} {
 		if err := os.WriteFile(filepath.Join(dir, name), []byte(probe), 0o755); err != nil {
 			t.Fatalf("write %s probe stub: %v", name, err)
 		}
