@@ -506,3 +506,38 @@ func TestScheduler_ConcurrentRace(t *testing.T) {
 
 	wg.Wait()
 }
+
+func TestSafeNarrowingHelpers(t *testing.T) {
+	// Test toUint32
+	if v, err := toUint32(0); err != nil || v != 0 {
+		t.Errorf("toUint32(0) unexpected: v=%d, err=%v", v, err)
+	}
+	if v, err := toUint32(0xFFFFFFFF); err != nil || v != 0xFFFFFFFF {
+		t.Errorf("toUint32(MaxUint32) unexpected: v=%d, err=%v", v, err)
+	}
+	if _, err := toUint32(0x100000000); err == nil {
+		t.Errorf("toUint32(MaxUint32+1) expected error, got nil")
+	}
+
+	// Test toUint16
+	if v, err := toUint16(0); err != nil || v != 0 {
+		t.Errorf("toUint16(0) unexpected: v=%d, err=%v", v, err)
+	}
+	if v, err := toUint16(0xFFFF); err != nil || v != 0xFFFF {
+		t.Errorf("toUint16(MaxUint16) unexpected: v=%d, err=%v", v, err)
+	}
+	if _, err := toUint16(0x10000); err == nil {
+		t.Errorf("toUint16(MaxUint16+1) expected error, got nil")
+	}
+
+	// Test toUint8
+	if v, err := toUint8(0); err != nil || v != 0 {
+		t.Errorf("toUint8(0) unexpected: v=%d, err=%v", v, err)
+	}
+	if v, err := toUint8(0xFF); err != nil || v != 0xFF {
+		t.Errorf("toUint8(MaxUint8) unexpected: v=%d, err=%v", v, err)
+	}
+	if _, err := toUint8(0x100); err == nil {
+		t.Errorf("toUint8(MaxUint8+1) expected error, got nil")
+	}
+}

@@ -3,6 +3,7 @@ package cron
 import (
 	"context"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 	"sync"
@@ -32,18 +33,18 @@ func (s Schedule) Matches(t time.Time) bool {
 	month := int(t.Month())
 	dow := int(t.Weekday())
 
-	if (s.minutes & (uint64(1) << minute)) == 0 {
+	if minute < 0 || minute > 59 || (s.minutes&(uint64(1)<<uint(minute))) == 0 {
 		return false
 	}
-	if (s.hours & (uint32(1) << hour)) == 0 {
+	if hour < 0 || hour > 23 || (s.hours&(uint32(1)<<uint(hour))) == 0 {
 		return false
 	}
-	if (s.months & (uint16(1) << month)) == 0 {
+	if month < 1 || month > 12 || (s.months&(uint16(1)<<uint(month))) == 0 {
 		return false
 	}
 
-	domMatch := (s.dom & (uint32(1) << dom)) != 0
-	dowMatch := (s.dow & (uint8(1) << dow)) != 0
+	domMatch := dom >= 1 && dom <= 31 && (s.dom&(uint32(1)<<uint(dom))) != 0
+	dowMatch := dow >= 0 && dow <= 6 && (s.dow&(uint8(1)<<uint(dow))) != 0
 
 	// POSIX/Vixie cron DOM & DOW matching semantics:
 	// If both DOM and DOW are wildcard '*', any day matches.
@@ -72,6 +73,29 @@ var dowNames = map[string]int{
 	"THU": 4, "FRI": 5, "SAT": 6,
 }
 
+// Safe narrowing helpers for integer conversions to prevent G115 integer overflow vulnerabilities.
+
+func toUint32(v uint64) (uint32, error) {
+	if v > math.MaxUint32 {
+		return 0, fmt.Errorf("integer overflow narrowing %d to uint32", v)
+	}
+	return uint32(v), nil
+}
+
+func toUint16(v uint64) (uint16, error) {
+	if v > math.MaxUint16 {
+		return 0, fmt.Errorf("integer overflow narrowing %d to uint16", v)
+	}
+	return uint16(v), nil
+}
+
+func toUint8(v uint64) (uint8, error) {
+	if v > math.MaxUint8 {
+		return 0, fmt.Errorf("integer overflow narrowing %d to uint8", v)
+	}
+	return uint8(v), nil
+}
+
 // ParseSchedule parses and validates a standard 5-field cron spec string:
 // "minute hour day-of-month month day-of-week"
 func ParseSchedule(spec string) (Schedule, error) {
@@ -89,8 +113,16 @@ func ParseSchedule(spec string) (Schedule, error) {
 	if err != nil {
 		return Schedule{}, fmt.Errorf("invalid hour field %q: %w", fields[1], err)
 	}
+	hours, err := toUint32(hourBits)
+	if err != nil {
+		return Schedule{}, fmt.Errorf("invalid hour field %q: %w", fields[1], err)
+	}
 
 	domBits, domStar, err := parseField(fields[2], 1, 31, nil, false)
+	if err != nil {
+		return Schedule{}, fmt.Errorf("invalid day-of-month field %q: %w", fields[2], err)
+	}
+	dom, err := toUint32(domBits)
 	if err != nil {
 		return Schedule{}, fmt.Errorf("invalid day-of-month field %q: %w", fields[2], err)
 	}
@@ -99,18 +131,26 @@ func ParseSchedule(spec string) (Schedule, error) {
 	if err != nil {
 		return Schedule{}, fmt.Errorf("invalid month field %q: %w", fields[3], err)
 	}
+	months, err := toUint16(monthBits)
+	if err != nil {
+		return Schedule{}, fmt.Errorf("invalid month field %q: %w", fields[3], err)
+	}
 
 	dowBits, dowStar, err := parseField(fields[4], 0, 7, dowNames, true)
+	if err != nil {
+		return Schedule{}, fmt.Errorf("invalid day-of-week field %q: %w", fields[4], err)
+	}
+	dow, err := toUint8(dowBits)
 	if err != nil {
 		return Schedule{}, fmt.Errorf("invalid day-of-week field %q: %w", fields[4], err)
 	}
 
 	return Schedule{
 		minutes: minBits,
-		hours:   uint32(hourBits),
-		dom:     uint32(domBits),
-		months:  uint16(monthBits),
-		dow:     uint8(dowBits),
+		hours:   hours,
+		dom:     dom,
+		months:  months,
+		dow:     dow,
 		domStar: domStar,
 		dowStar: dowStar,
 	}, nil
@@ -128,7 +168,9 @@ func parseField(fieldStr string, min, max int, names map[string]int, isDOW bool)
 			effMax = 6
 		}
 		for i := min; i <= effMax; i++ {
-			bits |= uint64(1) << uint(i)
+			if i >= 0 && i < 64 {
+				bits |= uint64(1) << uint(i)
+			}
 		}
 		return bits, true, nil
 	}
@@ -204,7 +246,9 @@ func parseField(fieldStr string, min, max int, names map[string]int, isDOW bool)
 			if isDOW && target == 7 {
 				target = 0
 			}
-			bitset |= uint64(1) << uint(target)
+			if target >= 0 && target < 64 {
+				bitset |= uint64(1) << uint(target)
+			}
 		}
 	}
 
