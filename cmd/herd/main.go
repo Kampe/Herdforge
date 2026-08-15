@@ -3353,7 +3353,9 @@ func runHerdrDeliver() {
 
 // runCleanup ports bin/herd-cleanup: one agent = one tab — close tabs of
 // finished one-off agents. Standing lanes, working agents, orchestrators,
-// and unnamed panes are never touched.
+// and unnamed panes are never touched. FAC-302: mutation mode executes
+// fenced compare-and-close via TabCloseCAS with absence readback and
+// deterministic receipts/counts. Dry-run is report-only.
 func runCleanup() {
 	fs := flag.NewFlagSet("cleanup", flag.ExitOnError)
 	dryRun := fs.Bool("dry-run", false, "List what would be closed without closing")
@@ -3372,45 +3374,47 @@ func runCleanup() {
 		}
 	}
 
-	cands, errs := herdr.Cleanup(standing, *dryRun)
-	// FAC-180: Cleanup mutation mode never closes without compare-and-close.
-	// Report honestly — never print "closed" when nothing was closed.
-	errMsgs := make([]string, 0, len(errs))
-	for _, e := range errs {
-		if e != nil {
-			errMsgs = append(errMsgs, e.Error())
-		}
-	}
+	res, err := herdr.CleanupFenced(standing, *dryRun)
 	if *asJSON {
-		json.NewEncoder(os.Stdout).Encode(map[string]interface{}{
-			"dry_run":     *dryRun,
-			"candidates":  cands,
-			"closed":      0, // mutation path is fenced; no silent success
-			"blocked":     !*dryRun && len(errs) > 0,
-			"errors":      errMsgs,
-			"error_count": len(errs),
-		})
+		out := map[string]interface{}{
+			"dry_run":     res.DryRun,
+			"candidates":  res.Candidates,
+			"attempts":    res.Attempts,
+			"closed":      res.Closed,
+			"blocked":     res.Blocked,
+			"errored":     res.Errored,
+			"error_count": len(res.Attempts) - res.Closed - res.Blocked,
+		}
+		if err != nil {
+			out["error"] = err.Error()
+		}
+		json.NewEncoder(os.Stdout).Encode(out)
 	} else {
-		if len(cands) == 0 && len(errs) == 0 {
+		if len(res.Candidates) == 0 && err == nil {
 			fmt.Println("herd cleanup: nothing to close")
 		}
-		if *dryRun {
-			for _, c := range cands {
+		if res.DryRun {
+			for _, c := range res.Candidates {
 				fmt.Printf("herd cleanup: would close %s (tab %s) — %s\n", c.Name, c.TabID, c.Reason)
 			}
 		} else {
-			for _, c := range cands {
-				fmt.Printf("herd cleanup: BLOCKED %s (tab %s) — FAC-180 compare-and-close required; not closed\n", c.Name, c.TabID)
+			for _, att := range res.Attempts {
+				switch att.Outcome {
+				case herdr.CleanupClosed:
+					fmt.Printf("herd cleanup: closed %s (tab %s) — %s\n", att.Name, att.TabID, att.Reason)
+				case herdr.CleanupBlocked:
+					fmt.Printf("herd cleanup: BLOCKED %s (tab %s) — %s\n", att.Name, att.TabID, att.Reason)
+				case herdr.CleanupError:
+					fmt.Fprintf(os.Stderr, "herd cleanup: ERROR %s (tab %s) — %s\n", att.Name, att.TabID, att.Reason)
+				}
 			}
-			for _, e := range errs {
-				fmt.Fprintf(os.Stderr, "herd cleanup: error — %v\n", e)
-			}
-			if len(cands) > 0 || len(errs) > 0 {
-				fmt.Printf("herd cleanup: closed=0 blocked=%d candidates=%d\n", len(errs), len(cands))
+			if len(res.Candidates) > 0 {
+				fmt.Printf("herd cleanup: closed=%d blocked=%d errored=%d candidates=%d\n",
+					res.Closed, res.Blocked, res.Errored, len(res.Candidates))
 			}
 		}
 	}
-	if len(errs) > 0 {
+	if err != nil {
 		os.Exit(1)
 	}
 }

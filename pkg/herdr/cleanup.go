@@ -1,8 +1,11 @@
 package herdr
 
 import (
+	"errors"
 	"fmt"
+	"sort"
 	"strings"
+	"sync"
 
 	"github.com/Kampe/Herdforge/pkg/toolchild"
 )
@@ -447,6 +450,182 @@ func Cleanup(standing map[string]bool, dryRun bool) ([]CleanupCandidate, []error
 		})
 	}
 	return cands, errs
+}
+
+// ---------------------------------------------------------------------------
+// FAC-302: Fenced cleanup — generation/session/revision/pane-fenced
+// compare-and-close via TabCloseCAS, with absence readback, deterministic
+// receipts/counts, dry-run report-only, and fail-closed protection.
+// ---------------------------------------------------------------------------
+
+// CleanupOutcome is the typed result of one fenced cleanup close attempt.
+type CleanupOutcome string
+
+const (
+	CleanupClosed  CleanupOutcome = "closed"
+	CleanupBlocked CleanupOutcome = "blocked"
+	CleanupError   CleanupOutcome = "error"
+)
+
+// CleanupAttempt is the deterministic receipt for one candidate's fenced
+// close attempt. Every mutation-mode candidate produces exactly one attempt.
+type CleanupAttempt struct {
+	Name    string         `json:"name"`
+	TabID   string         `json:"tab_id"`
+	Outcome CleanupOutcome `json:"outcome"`
+	Reason  string         `json:"reason"`
+}
+
+// CleanupResult is the deterministic fenced sweep result with explicit counts
+// that callers can audit without re-deriving from the attempt list.
+type CleanupResult struct {
+	DryRun     bool               `json:"dry_run"`
+	Candidates []CleanupCandidate `json:"candidates"`
+	Attempts   []CleanupAttempt   `json:"attempts"`
+	Closed     int                `json:"closed"`
+	Blocked    int                `json:"blocked"`
+	Errored    int                `json:"errored"`
+}
+
+// cleanupCloseFunc is the injectable execution seam for one fenced close
+// attempt. The default builds a CloseRequest from the agent entry and calls
+// TabCloseCAS, then does absence readback. Tests inject a fake.
+type cleanupCloseFunc func(agent AgentEntry) CleanupAttempt
+
+var (
+	cleanupCloseMu   sync.Mutex
+	cleanupCloseImpl cleanupCloseFunc = defaultCleanupClose
+)
+
+// SetCleanupCloseForTest installs a hermetic cleanup close seam. Restore with
+// the returned func.
+func SetCleanupCloseForTest(fn cleanupCloseFunc) func() {
+	cleanupCloseMu.Lock()
+	old := cleanupCloseImpl
+	if fn != nil {
+		cleanupCloseImpl = fn
+	} else {
+		cleanupCloseImpl = defaultCleanupClose
+	}
+	cleanupCloseMu.Unlock()
+	return func() {
+		cleanupCloseMu.Lock()
+		cleanupCloseImpl = old
+		cleanupCloseMu.Unlock()
+	}
+}
+
+func currentCleanupClose() cleanupCloseFunc {
+	cleanupCloseMu.Lock()
+	defer cleanupCloseMu.Unlock()
+	return cleanupCloseImpl
+}
+
+// defaultCleanupClose builds a CloseRequest from the agent entry and calls
+// TabCloseCAS. The agent list wire format has no generation field, so
+// ExpandCloseRequest fails closed — correct behavior for a status-based
+// sweep that lacks durable binding evidence. On success, absence readback
+// confirms the tab is gone from the live agent list.
+func defaultCleanupClose(agent AgentEntry) CleanupAttempt {
+	req := CloseRequest{
+		WorkspaceID: agent.Workspace,
+		TabID:       agent.TabID,
+		TabRevision: agent.Revision,
+		Nonce:       fmt.Sprintf("cleanup-%s-%d", agent.TabID, agent.Revision),
+	}
+	if agent.PaneID != "" {
+		req.PaneIDs = []string{agent.PaneID}
+	}
+	if agent.Session.Value != "" {
+		req.SessionID = agent.Session.Value
+	}
+	if agent.Kind != "" {
+		req.Agent = agent.Kind
+	}
+	// Generation intentionally absent — the agent list wire format has no
+	// generation field. ExpandCloseRequest fails closed without it.
+	err := TabCloseCAS(req)
+	if err != nil {
+		var blocked *CloseUnavailableError
+		if errors.As(err, &blocked) {
+			return CleanupAttempt{
+				Name: agent.Name, TabID: agent.TabID,
+				Outcome: CleanupBlocked, Reason: blocked.Reason,
+			}
+		}
+		return CleanupAttempt{
+			Name: agent.Name, TabID: agent.TabID,
+			Outcome: CleanupError, Reason: err.Error(),
+		}
+	}
+	// Absence readback: confirm the tab is gone from the live fleet.
+	live, rbErr := AgentList()
+	if rbErr != nil {
+		return CleanupAttempt{
+			Name: agent.Name, TabID: agent.TabID,
+			Outcome: CleanupError, Reason: "absence readback: " + rbErr.Error(),
+		}
+	}
+	for _, a := range live {
+		if a.TabID == agent.TabID {
+			return CleanupAttempt{
+				Name: agent.Name, TabID: agent.TabID,
+				Outcome: CleanupError, Reason: "absence readback: tab still present after close",
+			}
+		}
+	}
+	return CleanupAttempt{
+		Name: agent.Name, TabID: agent.TabID,
+		Outcome: CleanupClosed, Reason: "fenced compare-and-close; absence confirmed",
+	}
+}
+
+// CleanupFenced is the FAC-302 fenced cleanup sweep. Dry-run returns
+// observe-only candidates with zero attempts. Mutation mode attempts fenced
+// compare-and-close for each candidate via the execution seam, with absence
+// readback and deterministic receipts/counts. Fail-closed: incomplete
+// evidence (no generation) yields BLOCKED, never a silent close.
+func CleanupFenced(standing map[string]bool, dryRun bool) (CleanupResult, error) {
+	agents, err := AgentList()
+	if err != nil {
+		return CleanupResult{}, err
+	}
+	cands := SelectCleanupCandidates(agents, standing)
+	sort.Slice(cands, func(i, j int) bool {
+		if cands[i].TabID != cands[j].TabID {
+			return cands[i].TabID < cands[j].TabID
+		}
+		return cands[i].Name < cands[j].Name
+	})
+	res := CleanupResult{DryRun: dryRun, Candidates: cands}
+	if dryRun || len(cands) == 0 {
+		return res, nil
+	}
+	closeFn := currentCleanupClose()
+	agentByTab := map[string]AgentEntry{}
+	for _, a := range agents {
+		if a.TabID != "" {
+			agentByTab[a.TabID] = a
+		}
+	}
+	for _, c := range cands {
+		agent := agentByTab[c.TabID]
+		agent.Name = c.Name
+		att := closeFn(agent)
+		res.Attempts = append(res.Attempts, att)
+		switch att.Outcome {
+		case CleanupClosed:
+			res.Closed++
+		case CleanupBlocked:
+			res.Blocked++
+		default:
+			res.Errored++
+		}
+	}
+	if res.Errored > 0 {
+		return res, fmt.Errorf("cleanup: %d errored", res.Errored)
+	}
+	return res, nil
 }
 
 // CloseTabForRef closes the herdr tab of the builder agent working a given
