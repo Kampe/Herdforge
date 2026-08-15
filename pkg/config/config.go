@@ -86,10 +86,60 @@ type Config struct {
 	Version           string            `yaml:"version"`
 	Project           ProjectConfig     `yaml:"project"`
 	TaskProvider      TaskProvider      `yaml:"task_provider"`
+	MergePolicy       *MergePolicy      `yaml:"merge_policy,omitempty"`
 	Fleet             FleetConfig       `yaml:"fleet,omitempty"`
 	WorktreeBootstrap WorktreeBootstrap `yaml:"worktree_bootstrap,omitempty"`
 	Lanes             []LaneDef         `yaml:"lanes"`
 	Verification      Verification      `yaml:"verification,omitempty"`
+}
+
+// MergePolicy is the repository's autonomous-merge admission contract. It is
+// part of the live herd.yaml so provider, lane, and merge settings are read
+// from one operator-selected configuration profile.
+type MergePolicy struct {
+	Protected                    bool           `yaml:"protected" json:"protected"`
+	RequiredChecks               []string       `yaml:"required_checks" json:"required_checks"`
+	RequireDifferentFamilyReview bool           `yaml:"require_different_family_review" json:"require_different_family_review"`
+	RequirePullRequestReviews    bool           `yaml:"require_pull_request_reviews" json:"require_pull_request_reviews"`
+	RemoteCI                     RemoteCIPolicy `yaml:"remote_ci" json:"remote_ci"`
+}
+
+type RemoteCIPolicy struct {
+	Required       bool     `yaml:"required" json:"required"`
+	RequiredChecks []string `yaml:"required_checks" json:"required_checks"`
+}
+
+// Validate enforces the fail-closed shape of a declared merge contract. The
+// preflight package still returns the detailed operator-facing report; this
+// method keeps generic config loading from accepting a policy that can never
+// authorize a merge.
+func (p MergePolicy) Validate() error {
+	if !p.Protected {
+		return fmt.Errorf("protected must be true")
+	}
+	if len(nonBlank(p.RequiredChecks)) == 0 {
+		return fmt.Errorf("required_checks must contain at least one name")
+	}
+	if !p.RequireDifferentFamilyReview {
+		return fmt.Errorf("require_different_family_review must be true")
+	}
+	if !p.RequirePullRequestReviews {
+		return fmt.Errorf("require_pull_request_reviews must be true")
+	}
+	if p.RemoteCI.Required && len(nonBlank(p.RemoteCI.RequiredChecks)) == 0 {
+		return fmt.Errorf("remote_ci.required_checks must contain at least one name when remote_ci.required is true")
+	}
+	return nil
+}
+
+func nonBlank(values []string) []string {
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			out = append(out, value)
+		}
+	}
+	return out
 }
 
 type FleetConfig struct {
@@ -310,6 +360,11 @@ func (c *Config) Validate() error {
 	}
 	if err := c.WorktreeBootstrap.Validate(); err != nil {
 		return err
+	}
+	if c.MergePolicy != nil {
+		if err := c.MergePolicy.Validate(); err != nil {
+			return fmt.Errorf("merge_policy: %w", err)
+		}
 	}
 	roles := make(map[string]bool, len(c.Lanes))
 	for _, lane := range c.Lanes {

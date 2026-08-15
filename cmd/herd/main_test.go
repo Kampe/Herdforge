@@ -202,7 +202,7 @@ func TestFreshClonePreflightAndRuntimeMigrationLeaveTrackedStateClean(t *testing
 	if err := os.MkdirAll(filepath.Join(seed, ".herd"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	for _, rel := range []string{".gitignore", ".herd/herd.yaml", ".herd/merge-policy.yaml"} {
+	for _, rel := range []string{".gitignore", ".herd/herd.yaml"} {
 		contents, err := os.ReadFile(filepath.Join(repoRoot, rel))
 		if err != nil {
 			t.Fatalf("read %s: %v", rel, err)

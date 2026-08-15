@@ -99,6 +99,10 @@ type Decision struct {
 	// VerificationDigest is the admitted verdict's test-gate digest, carried
 	// forward so Complete binds the receipt to the digest that was admitted.
 	VerificationDigest string `json:"verification_digest,omitempty"`
+	// PolicyRevision pins the merge contract used for this admission. A live
+	// config change cannot silently alter the contract between admission and
+	// completion.
+	PolicyRevision string `json:"policy_revision,omitempty"`
 }
 
 // Gate is the single compiled merge authority. Construct one per repository.
@@ -109,8 +113,9 @@ type Gate struct {
 	Ledger *reviewledger.Ledger
 	// Live supplies the state re-read immediately before merging.
 	Live LiveState
-	// Policy is the repository's declared merge contract. Load it with
-	// preflight.LoadMergePolicy; the zero value is refused.
+	// Policy is the repository's declared merge contract. Load it from the
+	// active herd.yaml profile with preflight.LoadMergePolicy; the zero value is
+	// refused.
 	Policy preflight.MergePolicy
 	// RemoteCIPolicyRevision is the compiled revision of the admission policy.
 	// When non-empty it requires a passed remote settlement bound to this repo.
@@ -313,16 +318,17 @@ func (g *Gate) Admit(req Request) (*Decision, error) {
 	}
 
 	return &Decision{
-		Admitted:     true,
-		Reason:       fmt.Sprintf("exact-sha verdict admitted: %s", result.Reason),
-		Ref:          req.Ref,
-		CandidateSHA: req.CandidateSHA,
-		BaseSHA:      req.BaseSHA,
-		Reviewer:     result.Reviewer,
-		ReviewerFam:  result.ReviewerFamily,
-		Tier:         result.Tier,
-		Mode:         req.Mode,
-		Checks:       checks,
+		Admitted:       true,
+		Reason:         fmt.Sprintf("exact-sha verdict admitted: %s", result.Reason),
+		Ref:            req.Ref,
+		CandidateSHA:   req.CandidateSHA,
+		BaseSHA:        req.BaseSHA,
+		Reviewer:       result.Reviewer,
+		ReviewerFam:    result.ReviewerFamily,
+		Tier:           result.Tier,
+		Mode:           req.Mode,
+		Checks:         checks,
+		PolicyRevision: preflight.PolicyRevision(g.Policy),
 
 		VerificationDigest: result.VerificationDigest,
 	}, nil

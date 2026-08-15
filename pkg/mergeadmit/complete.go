@@ -5,6 +5,7 @@ import (
 	"os"
 	"strings"
 
+	"github.com/Kampe/Herdforge/pkg/preflight"
 	hsync "github.com/Kampe/Herdforge/pkg/sync"
 	"github.com/Kampe/Herdforge/pkg/toolchild"
 )
@@ -42,6 +43,13 @@ func (g *Gate) Complete(d *Decision, req Request) (*hsync.CompletionReceipt, err
 	if !sameSHA(d.CandidateSHA, req.CandidateSHA) || !sameSHA(d.BaseSHA, req.BaseSHA) {
 		return nil, fmt.Errorf("herd-merge-completion: decision covers candidate %s on base %s, not %s on %s",
 			short(d.CandidateSHA), short(d.BaseSHA), short(req.CandidateSHA), short(req.BaseSHA))
+	}
+	if strings.TrimSpace(d.PolicyRevision) == "" {
+		return nil, fmt.Errorf("herd-merge-completion: admitted decision carries no policy revision")
+	}
+	if current := preflight.PolicyRevision(g.Policy); current != d.PolicyRevision {
+		return nil, fmt.Errorf("herd-merge-completion: merge policy changed after admission (admitted %s, current %s); re-run admission",
+			short(d.PolicyRevision), short(current))
 	}
 	if strings.TrimSpace(d.VerificationDigest) == "" {
 		return nil, fmt.Errorf("herd-merge-completion: admitted verdict carries no verification digest")
