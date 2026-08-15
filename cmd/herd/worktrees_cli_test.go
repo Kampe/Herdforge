@@ -522,7 +522,7 @@ func TestHerdWorktreesCLIJSONFilesEmptyArray(t *testing.T) {
 	}
 
 	// The raw JSON must contain "files": [] not "files": null.  We check
-	// the raw bytes because json.Unmarshal into []Row would paper over
+	// the raw bytes because json.Unmarshal into Snapshot would paper over
 	// the difference (a null slice stays nil, which len()==0 hides).
 	raw := string(out)
 	if strings.Contains(raw, `"files": null`) {
@@ -533,16 +533,23 @@ func TestHerdWorktreesCLIJSONFilesEmptyArray(t *testing.T) {
 	}
 
 	// Also verify via typed unmarshal that the row is well-formed.
-	var rows []Row
-	if err := json.Unmarshal(out, &rows); err != nil {
+	var snapshot Snapshot
+	if err := json.Unmarshal(out, &snapshot); err != nil {
 		t.Fatalf("invalid JSON: %v\n%s", err, out)
 	}
+	if snapshot.SchemaVersion != worktreesSchemaVersion {
+		t.Fatalf("schema version = %d, want %d", snapshot.SchemaVersion, worktreesSchemaVersion)
+	}
+	rows := snapshot.Worktrees
 	if len(rows) == 0 {
 		t.Fatal("expected at least the principal worktree row")
 	}
 	for _, r := range rows {
 		if r.Files == nil {
 			t.Errorf("row branch=%s has nil Files, expected empty slice", r.Branch)
+		}
+		if r.Fleet.Lease.State != "unavailable" || r.Fleet.SafeRef.State != "unavailable" || r.Fleet.Session.State != "unavailable" || r.Fleet.Retention.State != "unavailable" || r.Fleet.CI.State != "unavailable" {
+			t.Errorf("missing fleet sources must be explicit unavailable: %+v", r.Fleet)
 		}
 	}
 }
@@ -635,14 +642,20 @@ func TestHerdWorktreesCLIRebasedBranchAheadZero(t *testing.T) {
 	if err != nil {
 		t.Fatalf("worktrees --json failed: %v\n%s", err, out)
 	}
-	var rows []Row
-	if err := json.Unmarshal(out, &rows); err != nil {
+	var snapshot Snapshot
+	if err := json.Unmarshal(out, &snapshot); err != nil {
 		t.Fatalf("invalid JSON: %v\n%s", err, out)
 	}
-	for _, r := range rows {
+	if snapshot.SchemaVersion != worktreesSchemaVersion {
+		t.Fatalf("schema version = %d, want %d", snapshot.SchemaVersion, worktreesSchemaVersion)
+	}
+	for _, r := range snapshot.Worktrees {
 		if r.Branch == "herd/fac-rebase" {
 			if r.Ahead != 0 {
 				t.Errorf("rebased branch should have ahead=0 (patch-equivalent), got ahead=%d", r.Ahead)
+			}
+			if r.Fleet.Lease.State != "unavailable" || r.Fleet.SafeRef.State != "unavailable" || r.Fleet.Session.State != "unavailable" || r.Fleet.Retention.State != "unavailable" || r.Fleet.CI.State != "unavailable" {
+				t.Errorf("missing fleet sources must be explicit unavailable: %+v", r.Fleet)
 			}
 			return
 		}
