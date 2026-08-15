@@ -387,9 +387,38 @@ func loadVerificationSnapshot(root, candidateSHA string, snapshot *FleetSnapshot
 }
 
 func sameWorktreePath(left, right string) bool {
-	a, errA := filepath.Abs(left)
-	b, errB := filepath.Abs(right)
-	return errA == nil && errB == nil && filepath.Clean(a) == filepath.Clean(b)
+	if strings.TrimSpace(left) == "" || strings.TrimSpace(right) == "" {
+		return false
+	}
+	normLeft, errLeft := normalizeWorktreePath(left)
+	normRight, errRight := normalizeWorktreePath(right)
+	return errLeft == nil && errRight == nil && normLeft == normRight
+}
+
+func normalizeWorktreePath(p string) (string, error) {
+	if strings.TrimSpace(p) == "" {
+		return "", fmt.Errorf("empty path")
+	}
+	abs, err := filepath.Abs(p)
+	if err != nil {
+		return "", err
+	}
+	if resolved, err := filepath.EvalSymlinks(abs); err == nil {
+		return filepath.Clean(resolved), nil
+	}
+	dir := abs
+	suffix := ""
+	for {
+		if resolved, err := filepath.EvalSymlinks(dir); err == nil {
+			return filepath.Clean(filepath.Join(resolved, suffix)), nil
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return filepath.Clean(abs), nil
+		}
+		suffix = filepath.Join(filepath.Base(dir), suffix)
+		dir = parent
+	}
 }
 
 func printHuman(rows []Row, showFiles bool) {

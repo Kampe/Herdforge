@@ -662,3 +662,100 @@ func TestHerdWorktreesCLIRebasedBranchAheadZero(t *testing.T) {
 	}
 	t.Fatal("herd/fac-rebase branch not found in worktree rows")
 }
+
+func TestSameWorktreePath_SymlinkEquivalence(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "target")
+	if err := os.MkdirAll(target, 0755); err != nil {
+		t.Fatal(err)
+	}
+	symlink := filepath.Join(dir, "symlink")
+	if err := os.Symlink(target, symlink); err != nil {
+		t.Skipf("symlinks not supported: %v", err)
+	}
+
+	// Direct symlink vs target
+	if !sameWorktreePath(target, symlink) {
+		t.Errorf("sameWorktreePath(%q, %q) = false, want true", target, symlink)
+	}
+	if !sameWorktreePath(symlink, target) {
+		t.Errorf("sameWorktreePath(%q, %q) = false, want true", symlink, target)
+	}
+
+	// Non-existent child under symlink parent (walk parent symlinks)
+	targetChild := filepath.Join(target, "nonexistent", "subpath")
+	symlinkChild := filepath.Join(symlink, "nonexistent", "subpath")
+	if !sameWorktreePath(targetChild, symlinkChild) {
+		t.Errorf("sameWorktreePath(%q, %q) = false for nonexistent subpath, want true", targetChild, symlinkChild)
+	}
+
+	// Same non-existent paths with lexical fallback
+	ghost1 := filepath.Join(dir, "ghost", "path")
+	ghost2 := filepath.Join(dir, "ghost", "path")
+	if !sameWorktreePath(ghost1, ghost2) {
+		t.Errorf("sameWorktreePath(%q, %q) = false for identical missing path, want true", ghost1, ghost2)
+	}
+
+	// Distinct paths must not match
+	distinct := filepath.Join(dir, "other")
+	if sameWorktreePath(target, distinct) {
+		t.Errorf("sameWorktreePath(%q, %q) = true, want false", target, distinct)
+	}
+
+	// Fail-closed on empty/whitespace
+	if sameWorktreePath("", target) {
+		t.Errorf("sameWorktreePath(\"\", %q) = true, want false", target)
+	}
+	if sameWorktreePath("   ", target) {
+		t.Errorf("sameWorktreePath(\"   \", %q) = true, want false", target)
+	}
+	if sameWorktreePath("", "") {
+		t.Error("sameWorktreePath(\"\", \"\") = true, want false")
+	}
+}
+
+func TestHerdWorktreesCLILeaseThroughSymlinkPath(t *testing.T) {
+	binary := buildHerd(t)
+	dir := ftpdHerdWorktreesRepo(t)
+	wt101 := filepath.Join(filepath.Dir(dir), "wt101")
+
+	// Create a symlink alias to the worktree
+	symlinkWT := filepath.Join(filepath.Dir(dir), "wt101-symlink")
+	if err := os.Symlink(wt101, symlinkWT); err != nil {
+		t.Skipf("symlinks not supported: %v", err)
+	}
+
+	// Store lease under the symlinked path
+	leaseStore, err := claim.NewSQLiteLeaseStore(filepath.Join(dir, ".herd", "herdforge.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer leaseStore.Close()
+	if _, err := leaseStore.Acquire(context.Background(), claim.LeaseKey{Repo: "repo", Provider: "kaneo", Project: "project", TaskRef: "FAC-101"}, "owner-symlink", "worker", symlinkWT, time.Now(), time.Hour); err != nil {
+		t.Fatal(err)
+	}
+
+	cmd := exec.Command(binary, "worktrees", "--json")
+	cmd.Dir = dir
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("worktrees --json: %v\n%s", err, out)
+	}
+	var snapshot Snapshot
+	if err := json.Unmarshal(out, &snapshot); err != nil {
+		t.Fatalf("decode snapshot: %v\n%s", err, out)
+	}
+	var matched *Row
+	for i := range snapshot.Worktrees {
+		if snapshot.Worktrees[i].Branch == "herd/fac-101" {
+			matched = &snapshot.Worktrees[i]
+			break
+		}
+	}
+	if matched == nil {
+		t.Fatalf("expected herd/fac-101 row, got %+v", snapshot.Worktrees)
+	}
+	if matched.Fleet.Lease.State != "available" || matched.Fleet.Lease.Owner != "owner-symlink" {
+		t.Fatalf("lease acquired through symlink was not resolved as available: %+v", matched.Fleet.Lease)
+	}
+}
