@@ -1,13 +1,13 @@
 # Herdforge Agentic Worker Contract
 
-This contract governs all AI agents (Claude, Gemini, Codex, Grok, Ollama) participating in the **Herdforge** software factory fleet.
+This contract governs all AI agents (Claude, Codex, Grok, AGY, and OpenCode) participating in the **Herdforge** software factory fleet.
 
 ---
 
 ## 1. Core Engineering Invariants & Rules
 
 0. **Fleet-Only Forging (FAC-113, hard invariant)**:
-   - Herdforge forges itself with its own **herdr fleet** (opencode/deepseek agents in herdr tabs, driven by `herd dispatch`/`herd send`/`herd review`). This is the entire point of the repo: the product must be exercised on itself.
+   - Herdforge forges itself with its own **Herdr fleet** (configured vendor harnesses in Herdr tabs, driven by `herd dispatch`/`herd send`/`herd review`). This is the entire point of the repo: the product must be exercised on itself.
    - **NEVER** use Claude subagents (the Agent tool: general-purpose, Explore, etc.) to build, fix, review, or audit anything in this repo. Using them defeats the dogfooding premise and stops testing the actual system.
    - The coordinator dispatches to the fleet and owns git plumbing (harvest → PR → merge → `herd approve`). Fleet agents commit in their worktree and report; they never push or merge. When an agent stalls, the fix is a firmer packet / `herd kick` / the completion self-gate (`herd verify`), never routing around the fleet.
 
@@ -60,7 +60,7 @@ the tree because it is absent from this table.
 | `pkg/daemon` | Core orchestration daemon & heartbeat engine | `go test ./pkg/daemon` |
 | `pkg/gc` | Ephemeral git worktree garbage collector | `go test ./pkg/gc` |
 | `pkg/graph` | Multi-repo workspace dependency graph engine | `go test ./pkg/graph` |
-| `pkg/harness` | Universal AI harness adapter (`claude`, `codex`, `opencode`, `grok`, `kimi`, `agy`, `pi`) | `go test ./pkg/harness` |
+| `pkg/harness` | Universal AI harness adapter (`claude`, `codex`, `opencode`, `grok`, `agy`) | `go test ./pkg/harness` |
 | `pkg/llm` | Local Ollama and vLLM provider adapter | `go test ./pkg/llm` |
 | `pkg/mail` | Inter-agent durable JSONL mailbox protocol | `go test ./pkg/mail` |
 | `pkg/memory` | Knowledge-graph & error pattern session memory store | `go test ./pkg/memory` |
@@ -92,11 +92,11 @@ the tree because it is absent from this table.
 3. **Verification**: Run `make lint all` and ensure zero test failures.
 4. **Commit**: Format commit message using Conventional Commits (`feat: ...`, `fix: ...`, `docs: ...`).
 
-<!-- code-review-graph MCP tools -->
-## MCP Tools: code-review-graph
+<!-- code-review-graph CLI -->
+## Code intelligence: code-review-graph CLI
 
 **IMPORTANT: This project has a knowledge graph. ALWAYS use the
-code-review-graph MCP tools BEFORE using Grep/Glob/Read to explore
+`code-review-graph` CLI BEFORE using Grep/Glob/Read to explore
 the codebase.** The graph is faster, cheaper (fewer tokens), and gives
 you structural context (callers, dependents, test coverage) that file
 scanning cannot.

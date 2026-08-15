@@ -26,7 +26,7 @@ make all
 # Run self-test suite against active repository
 make self-test
 
-# Run unit tests across all 104 packages
+# Run unit tests across all packages
 make test-unit
 
 # Run preflight workspace boundary check
@@ -51,11 +51,11 @@ make preflight
 | **Architecture & API Specs** | [docs/architecture/AGENT-IMPLEMENTATION-GUIDE.md](docs/architecture/AGENT-IMPLEMENTATION-GUIDE.md) |
 | **System RFC & Design** | [docs/rfcs/RFC-001-HERD-DAEMON.md](docs/rfcs/RFC-001-HERD-DAEMON.md) |
 
-<!-- code-review-graph MCP tools -->
-## MCP Tools: code-review-graph
+<!-- code-review-graph CLI -->
+## Code intelligence: code-review-graph CLI
 
 **IMPORTANT: This project has a knowledge graph. ALWAYS use the
-code-review-graph MCP tools BEFORE using Grep/Glob/Read to explore
+`code-review-graph` CLI BEFORE using Grep/Glob/Read to explore
 the codebase.** The graph is faster, cheaper (fewer tokens), and gives
 you structural context (callers, dependents, test coverage) that file
 scanning cannot.
