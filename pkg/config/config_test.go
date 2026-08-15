@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -48,6 +49,11 @@ project:
 task_provider:
   type: "kaneo"
   project_id: "test-id"
+merge_policy:
+  protected: true
+  required_checks: ["Build"]
+  require_different_family_review: true
+  require_pull_request_reviews: true
 lanes:
   - name: "worker"
     role: "worker"
@@ -68,6 +74,9 @@ verification:
 
 	if cfg.Project.Name != "test-project" {
 		t.Errorf("expected project name 'test-project', got '%s'", cfg.Project.Name)
+	}
+	if cfg.MergePolicy == nil || len(cfg.MergePolicy.RequiredChecks) != 1 || cfg.MergePolicy.RequiredChecks[0] != "Build" {
+		t.Fatalf("merge policy was not loaded from herd.yaml: %+v", cfg.MergePolicy)
 	}
 	if len(cfg.Lanes) != 1 {
 		t.Fatalf("expected 1 lane, got %d", len(cfg.Lanes))
@@ -97,6 +106,29 @@ task_provider:
 	_, err := LoadConfig(cfgPath)
 	if err == nil {
 		t.Fatalf("expected validation error, got nil")
+	}
+}
+
+func TestLoadConfig_InvalidMergePolicyFailsClosed(t *testing.T) {
+	tmpDir := t.TempDir()
+	cfgPath := filepath.Join(tmpDir, "herd.yaml")
+	content := `
+version: "1"
+project:
+  name: "test-project"
+task_provider:
+  type: "kaneo"
+merge_policy:
+  protected: true
+  required_checks: []
+  require_different_family_review: true
+  require_pull_request_reviews: true
+`
+	if err := os.WriteFile(cfgPath, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadConfig(cfgPath); err == nil || !strings.Contains(err.Error(), "merge_policy") {
+		t.Fatalf("invalid merge policy was accepted: %v", err)
 	}
 }
 

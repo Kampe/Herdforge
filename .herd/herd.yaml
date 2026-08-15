@@ -17,6 +17,20 @@ task_provider:
   enabled: ["kaneo"]
   project_id: "b939c5jzixruza3vvywrg1hs"
 
+# Autonomous merge admission contract. This is intentionally in the live
+# profile so provider, fleet, and merge settings change as one reviewed unit.
+# Admission binds remote-CI evidence to a content revision of this section.
+merge_policy:
+  protected: true
+  required_checks:
+    - "Build, Preflight & Test Suite"
+  require_different_family_review: true
+  require_pull_request_reviews: true
+  remote_ci:
+    required: true
+    required_checks:
+      - "Build, Preflight & Test Suite"
+
 # FAC-245: every admitted task worktree gets an isolated Go module/build cache
 # keyed by the resolved Go toolchain. The receipt is durable and idempotent;
 # a changed toolchain or declaration repairs stale per-worktree artifacts

@@ -116,6 +116,16 @@ func TestCompleteMintsAReceiptBoardDoneAccepts(t *testing.T) {
 	}
 }
 
+func TestCompleteRefusesWhenMergePolicyChangesAfterAdmission(t *testing.T) {
+	f := newCompleteFixture(t, ModeMerge)
+	d := mustAdmit(t, f.gate, f.req)
+	f.gate.Policy.RequiredChecks = append(f.gate.Policy.RequiredChecks, "new-gate")
+	f.merged()
+	if _, err := f.gate.Complete(d, f.req); err == nil || !strings.Contains(err.Error(), "policy changed") {
+		t.Fatalf("policy change was not refused: %v", err)
+	}
+}
+
 // THE LOOP-CLOSING TEST. Everything else in this file checks fields; this one
 // hands the minted receipt to the ACTUAL validator BoardDone gates on and
 // requires it to pass. If Complete ever mints something BoardDone would

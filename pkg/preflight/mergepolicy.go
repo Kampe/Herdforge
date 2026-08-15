@@ -8,43 +8,26 @@
 package preflight
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 
+	"github.com/Kampe/Herdforge/pkg/config"
 	"gopkg.in/yaml.v3"
 )
 
-// MergePolicy is the repository's declared merge admission contract.
-// Loaded from .herd/merge-policy.yaml when present.
-type MergePolicy struct {
-	// Protected must be true for autonomous merge. Absence of the policy file
-	// defaults it true (LoadMergePolicy), and an explicit false is a refusal,
-	// not an opt-out — see CheckMergePolicy.
-	Protected bool `yaml:"protected"`
+// Keep the preflight package's public names source-compatible while the
+// configuration package owns the single on-disk representation.
+type MergePolicy = config.MergePolicy
+type RemoteCIPolicy = config.RemoteCIPolicy
 
-	// RequiredChecks are CI job/check names that must be present and green
-	// before autonomous merge. Empty is invalid for a protected repository.
-	RequiredChecks []string `yaml:"required_checks"`
-
-	// RequireDifferentFamilyReview requires R1–R3 evidence from a model
-	// family different from the author before autonomous merge.
-	RequireDifferentFamilyReview bool `yaml:"require_different_family_review"`
-
-	// RequirePullRequestReviews is the branch-protection analogue: a human or
-	// agent review verdict must exist. Defaults true for protected repos.
-	RequirePullRequestReviews bool           `yaml:"require_pull_request_reviews"`
-	RemoteCI                  RemoteCIPolicy `yaml:"remote_ci"`
-}
-
-type RemoteCIPolicy struct {
-	Required       bool     `yaml:"required"`
-	RequiredChecks []string `yaml:"required_checks"`
-}
-
-// DefaultProtectedPolicy is the fail-closed baseline when no policy file exists.
+// DefaultProtectedPolicy is the fail-closed baseline when merge_policy is
+// omitted from herd.yaml.
 func DefaultProtectedPolicy() MergePolicy {
 	return MergePolicy{
 		Protected:                    true,
@@ -54,10 +37,14 @@ func DefaultProtectedPolicy() MergePolicy {
 	}
 }
 
-// LoadMergePolicy reads .herd/merge-policy.yaml under root. Missing file yields
-// DefaultProtectedPolicy so absence cannot silently open autonomous merge.
+// LoadMergePolicy reads merge_policy from .herd/herd.yaml. Missing config or
+// omitted merge_policy yields DefaultProtectedPolicy so absence cannot
+// silently open autonomous merge.
 func LoadMergePolicy(root string) (MergePolicy, error) {
-	path := filepath.Join(root, ".herd", "merge-policy.yaml")
+	path := filepath.Join(root, ".herd", "herd.yaml")
+	if root == "" || root == "." {
+		path = config.RuntimeConfigPath()
+	}
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -65,11 +52,33 @@ func LoadMergePolicy(root string) (MergePolicy, error) {
 		}
 		return MergePolicy{}, fmt.Errorf("read merge policy: %w", err)
 	}
-	var p MergePolicy
-	if err := yaml.Unmarshal(data, &p); err != nil {
+	var envelope struct {
+		MergePolicy *MergePolicy `yaml:"merge_policy"`
+	}
+	if err := yaml.Unmarshal(data, &envelope); err != nil {
 		return MergePolicy{}, fmt.Errorf("parse merge policy %s: %w", path, err)
 	}
-	return p, nil
+	if envelope.MergePolicy == nil {
+		legacy := filepath.Join(filepath.Dir(path), "merge-policy.yaml")
+		if _, legacyErr := os.Stat(legacy); legacyErr == nil {
+			return MergePolicy{}, fmt.Errorf("legacy merge policy %s is still present; move its contents under merge_policy in %s", legacy, path)
+		} else if !os.IsNotExist(legacyErr) {
+			return MergePolicy{}, fmt.Errorf("inspect legacy merge policy %s: %w", legacy, legacyErr)
+		}
+		return DefaultProtectedPolicy(), nil
+	}
+	return *envelope.MergePolicy, nil
+}
+
+// PolicyRevision is a stable content digest used to bind remote CI evidence
+// to the exact merge contract that was active when it was settled.
+func PolicyRevision(policy MergePolicy) string {
+	canonical := policy
+	canonical.RequiredChecks = normalizeNames(policy.RequiredChecks)
+	canonical.RemoteCI.RequiredChecks = normalizeNames(policy.RemoteCI.RequiredChecks)
+	data, _ := json.Marshal(canonical)
+	sum := sha256.Sum256(data)
+	return "merge-policy-v2:" + hex.EncodeToString(sum[:])
 }
 
 // MergePolicyReport is the structured result of CheckMergePolicy.

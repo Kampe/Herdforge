@@ -116,6 +116,39 @@ func TestLoadMergePolicy_MalformedYAMLIsAnError(t *testing.T) {
 	}
 }
 
+func TestLoadMergePolicyHonorsRuntimeProfile(t *testing.T) {
+	root := t.TempDir()
+	profile := filepath.Join(t.TempDir(), "herd.yaml")
+	if err := os.WriteFile(profile, []byte("merge_policy:\n  protected: true\n  required_checks: [profile-gate]\n  require_different_family_review: true\n  require_pull_request_reviews: true\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HERD_CONFIG_PATH", profile)
+	t.Chdir(root)
+	p, err := LoadMergePolicy(".")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(p.RequiredChecks) != 1 || p.RequiredChecks[0] != "profile-gate" {
+		t.Fatalf("runtime profile was ignored: %+v", p)
+	}
+}
+
+func TestLoadMergePolicyRejectsUnmigratedLegacyFile(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, ".herd"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, ".herd", "herd.yaml"), []byte("version: \"1\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, ".herd", "merge-policy.yaml"), []byte("required_checks: [legacy-gate]\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadMergePolicy(root); err == nil || !strings.Contains(err.Error(), "legacy merge policy") {
+		t.Fatalf("unmigrated legacy policy was not rejected: %v", err)
+	}
+}
+
 // The gate's entire scope is the DECLARATION, so the thing to prove is that it
 // discriminates: every way of weakening the declaration is refused, and only the
 // complete one passes. Same root, same call — if any weakening ever returns nil,
@@ -147,8 +180,8 @@ func TestRefuseAutonomousMerge_EveryWeakenedDeclarationIsBlocked(t *testing.T) {
 }
 
 // The repository's own committed policy must satisfy the gate `make preflight`
-// runs. This fails if .herd/merge-policy.yaml is deleted-weakened rather than
-// deleted outright (deletion falls back to DefaultProtectedPolicy).
+// runs. This fails if merge_policy is deleted-weakened rather than omitted
+// (omission falls back to DefaultProtectedPolicy).
 func TestRefuseAutonomousMerge_ThisRepositoryPasses(t *testing.T) {
 	if err := RefuseAutonomousMerge("../.."); err != nil {
 		t.Fatalf("repository merge policy is not admissible: %v", err)
@@ -169,12 +202,41 @@ func TestCheckMergePolicy_EmptyChecksIsNotOK(t *testing.T) {
 	}
 }
 
+func TestPolicyRevisionChangesWhenMergeContractChanges(t *testing.T) {
+	base := DefaultProtectedPolicy()
+	got := PolicyRevision(base)
+	if got == "" || !strings.HasPrefix(got, "merge-policy-v2:") {
+		t.Fatalf("revision = %q, want versioned digest", got)
+	}
+	base.RequiredChecks = append(base.RequiredChecks, "Hermetic")
+	if changed := PolicyRevision(base); changed == got {
+		t.Fatal("merge policy revision did not change after contract change")
+	}
+}
+
+func TestPolicyRevisionNormalizesCheckOrderAndWhitespace(t *testing.T) {
+	a := DefaultProtectedPolicy()
+	a.RequiredChecks = []string{" Gate ", "Build"}
+	b := a
+	b.RequiredChecks = []string{"Build", "Gate"}
+	if PolicyRevision(a) != PolicyRevision(b) {
+		t.Fatal("equivalent required check declarations produced different revisions")
+	}
+}
+
 func writePolicy(t *testing.T, root, body string) {
 	t.Helper()
 	if err := os.MkdirAll(filepath.Join(root, ".herd"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(root, ".herd", "merge-policy.yaml"), []byte(body), 0o644); err != nil {
+	var b strings.Builder
+	b.WriteString("version: \"1\"\nmerge_policy:\n")
+	for _, line := range strings.Split(strings.TrimSuffix(body, "\n"), "\n") {
+		b.WriteString("  ")
+		b.WriteString(line)
+		b.WriteByte('\n')
+	}
+	if err := os.WriteFile(filepath.Join(root, ".herd", "herd.yaml"), []byte(b.String()), 0o644); err != nil {
 		t.Fatal(err)
 	}
 }

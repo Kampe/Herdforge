@@ -171,7 +171,7 @@ func bindRemoteCIAdmission(gate *mergeadmit.Gate, req *mergeadmit.Request, ledge
 	}
 	checks := append([]string(nil), gate.Policy.RemoteCI.RequiredChecks...)
 	sort.Strings(checks)
-	policyRevision := remoteci.Revision("merge-policy-v1", strings.Join(checks, "\x00"))
+	policyRevision := remoteci.Revision(preflight.PolicyRevision(gate.Policy), strings.Join(checks, "\x00"))
 	binding := remoteci.Binding{Repository: repo, CandidateSHA: req.CandidateSHA, PolicyRevision: policyRevision, Attempt: attempt, RequiredChecks: checks}
 	gate.RemoteCIRepository, gate.RemoteCIPolicyRevision = repo, policyRevision
 	store, err := remoteci.Open(ledgerPath)

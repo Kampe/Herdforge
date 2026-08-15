@@ -24,7 +24,7 @@ func TestMergeAdmitPolicyRequiredRemoteCIMissingSettlementBlocks(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	binding := remoteci.Binding{Repository: repo, CandidateSHA: req.CandidateSHA, PolicyRevision: remoteci.Revision("merge-policy-v1", "build"), Attempt: 1, RequiredChecks: []string{"build"}}
+	binding := remoteci.Binding{Repository: repo, CandidateSHA: req.CandidateSHA, PolicyRevision: remoteci.Revision(preflight.PolicyRevision(gate.Policy), "build"), Attempt: 1, RequiredChecks: []string{"build"}}
 	store, err := remoteci.Open(ledgerPath)
 	if err != nil {
 		t.Fatal(err)

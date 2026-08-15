@@ -208,8 +208,8 @@ func TestCliForgeDriver_ApproveBlockedByIncompleteMergePolicy(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Explicit protected policy with empty checks — must refuse.
-	bad := "protected: true\nrequired_checks: []\nrequire_different_family_review: true\nrequire_pull_request_reviews: true\n"
-	if err := os.WriteFile(filepath.Join(root, ".herd", "merge-policy.yaml"), []byte(bad), 0o644); err != nil {
+	herdYAML := "version: \"1\"\nproject:\n  name: test\ntask_provider:\n  type: memory\nmerge_policy:\n  protected: true\n  required_checks: []\n  require_different_family_review: true\n  require_pull_request_reviews: true\n"
+	if err := os.WriteFile(filepath.Join(root, ".herd", "herd.yaml"), []byte(herdYAML), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	cwd, err := os.Getwd()
@@ -491,7 +491,19 @@ lanes:
 	}
 	// Complete merge policy so local approve preflight can pass when intentional.
 	mp := "protected: true\nrequired_checks:\n  - gate\nrequire_different_family_review: true\nrequire_pull_request_reviews: true\nremote_ci:\n  required: true\n  required_checks:\n    - gate\n"
-	if err := os.WriteFile(filepath.Join(root, ".herd", "merge-policy.yaml"), []byte(mp), 0o644); err != nil {
+	var policy strings.Builder
+	policy.WriteString("\nmerge_policy:\n")
+	for _, line := range strings.Split(strings.TrimSuffix(mp, "\n"), "\n") {
+		policy.WriteString("  ")
+		policy.WriteString(line)
+		policy.WriteByte('\n')
+	}
+	herdPath := filepath.Join(root, ".herd", "herd.yaml")
+	current, err := os.ReadFile(herdPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(herdPath, append(current, []byte(policy.String())...), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	// Wind-down explicitly disabled so fleet admission passes.
