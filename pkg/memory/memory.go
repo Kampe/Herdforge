@@ -3,6 +3,7 @@ package memory
 import (
 	"encoding/json"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -32,8 +33,18 @@ func (m *MemoryStore) RecordErrorPattern(domain, slug, summary, fix string) (*Er
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	dir := filepath.Join(m.MemoryDir, "errors", domain)
-	if err := os.MkdirAll(dir, 0755); err != nil {
+	errorsDir := filepath.Join(m.MemoryDir, "errors")
+	if err := os.MkdirAll(errorsDir, 0755); err != nil {
+		return nil, fmt.Errorf("failed to create memory domain dir: %w", err)
+	}
+
+	root, err := os.OpenRoot(errorsDir)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open memory errors root: %w", err)
+	}
+	defer root.Close()
+
+	if err := root.MkdirAll(domain, 0755); err != nil {
 		return nil, fmt.Errorf("failed to create memory domain dir: %w", err)
 	}
 
@@ -46,13 +57,13 @@ func (m *MemoryStore) RecordErrorPattern(domain, slug, summary, fix string) (*Er
 		CreatedAt:  time.Now(),
 	}
 
-	filePath := filepath.Join(dir, fmt.Sprintf("%s.json", slug))
+	filePath := filepath.Join(domain, fmt.Sprintf("%s.json", slug))
 	data, err := json.MarshalIndent(pat, "", "  ")
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal error pattern: %w", err)
 	}
 
-	if err := os.WriteFile(filePath, data, 0644); err != nil {
+	if err := root.WriteFile(filePath, data, 0644); err != nil {
 		return nil, fmt.Errorf("failed to write error pattern file: %w", err)
 	}
 
@@ -64,17 +75,22 @@ func (m *MemoryStore) QueryRelevantPatterns(query string) ([]*ErrorPattern, erro
 	defer m.mu.RUnlock()
 
 	errorsDir := filepath.Join(m.MemoryDir, "errors")
-	if _, err := os.Stat(errorsDir); os.IsNotExist(err) {
-		return nil, nil
+	root, err := os.OpenRoot(errorsDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("failed to open memory errors root: %w", err)
 	}
+	defer root.Close()
 
 	var matched []*ErrorPattern
-	err := filepath.Walk(errorsDir, func(path string, info os.FileInfo, err error) error {
-		if err != nil || info.IsDir() || !strings.HasSuffix(path, ".json") {
+	err = fs.WalkDir(root.FS(), ".", func(path string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil || d.IsDir() || !strings.HasSuffix(path, ".json") {
 			return nil
 		}
 
-		data, err := os.ReadFile(path)
+		data, err := root.ReadFile(path)
 		if err != nil {
 			return nil
 		}
