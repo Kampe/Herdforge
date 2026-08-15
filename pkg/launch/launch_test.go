@@ -480,7 +480,7 @@ func TestClaudeCommandIncidentRequiresBoundHealthPolicyBeforeEffects(t *testing.
 	req := good(t)
 	var policies []harness.HookPolicy
 	for _, hook := range discovered.Hooks {
-		policies = append(policies, harness.HookPolicy{HandlerDigest: hook.Name, Requirement: hook.Requirement, HealthURL: "http://127.0.0.1:8790/health"})
+		policies = append(policies, harness.HookPolicy{HandlerDigest: hook.Name, Requirement: hook.Requirement, HealthURL: "http://127.0.0.1:1/health"})
 	}
 	policyDiscovery, err := (harness.ClaudeDiscovery{Paths: []string{settingsPath}, Policies: policies}).Discover("claude")
 	if err != nil {
@@ -504,7 +504,7 @@ func TestClaudeCommandIncidentRequiresBoundHealthPolicyBeforeEffects(t *testing.
 			break
 		}
 	}
-	if rejection.Kind != "launch_rejected" || rejection.HookCode != string(harness.HookCodeHealthMalformed) || !strings.HasPrefix(rejection.HookName, "claude:") || len(rejection.HookName) < len("claude:")+64 || rejection.PolicyRevision == "" || rejection.Role == "" || rejection.TaskShape == "" || rejection.Provider == "" || rejection.Model == "" || rejection.Effort == "" || rejection.DecisionDigest == "" {
+	if rejection.Kind != "launch_rejected" || rejection.HookCode != string(harness.HookCodeUnavailable) || !strings.HasPrefix(rejection.HookName, "claude:") || len(rejection.HookName) < len("claude:")+64 || rejection.PolicyRevision == "" || rejection.Role == "" || rejection.TaskShape == "" || rejection.Provider == "" || rejection.Model == "" || rejection.Effort == "" || rejection.DecisionDigest == "" {
 		t.Fatalf("rejection attribution lost full digest/revision: %+v", sink.Receipts)
 	}
 }
