@@ -1,4 +1,6 @@
 # fingerprint	classification	owner	expiry
+3386534260b90a0b40552c5169233e79144beb29:scripts/security-gate_test.zsh:github-pat:28	fixture history	security-maintainers	2026-12-31
+3386534260b90a0b40552c5169233e79144beb29:scripts/security-gate_test.zsh:github-pat:31	fixture history	security-maintainers	2026-12-31
 352601b8f78cf7d2bddc928de9ad61d989e48917:scripts/security-gate_test.zsh:github-pat:28	fixture history	security-maintainers	2026-12-31
 352601b8f78cf7d2bddc928de9ad61d989e48917:scripts/security-gate_test.zsh:github-pat:31	fixture history	security-maintainers	2026-12-31
 00d9f7fa92c7eb417629098034b066e6b31c20cb:pkg/envelope/envelope_test.go:generic-api-key:669	fixture	security-maintainers	2026-12-31
