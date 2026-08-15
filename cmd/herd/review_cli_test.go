@@ -2245,3 +2245,46 @@ func seedFixtureLifecycle(t *testing.T, dir, ref string, leaseGen int64) {
 		t.Fatalf("seed lifecycle for %s: %v", ref, err)
 	}
 }
+
+// TestReviewCLI_CandidateIndexMergedDiscovery verifies that `herd review`
+// lists both Kaneo tasks and unintegrated candidates with deterministic ordering
+// and structured BLOCKED reasons.
+func TestReviewCLI_CandidateIndexMergedDiscovery(t *testing.T) {
+	binary := buildHerd(t)
+	fk, server := newFakeKaneo()
+	defer server.Close()
+
+	dir, keyDir := t.TempDir(), t.TempDir()
+	attestKeyDir(t, keyDir)
+	writeReviewConfig(t, dir, server.URL, "proj-x")
+
+	// 1. Post a blocked mail callback for FAC-2
+	mb := mail.NewMailbox(filepath.Join(dir, ".herd", "mail.jsonl"))
+	cb := mail.Callback{
+		Ref:    "FAC-2",
+		Kind:   mail.CallbackBlocked,
+		SHA:    "2222333344445555666677778888999900001111",
+		Detail: "missing verification evidence",
+	}
+	body, _ := json.Marshal(cb)
+	_, _ = mb.SendMessage("worker", mail.CoordinatorInbox, "blocked: FAC-2", string(body))
+
+	cmd := herdCmd(binary, dir, keyDir, "review")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("herd review failed: %v\n%s", err, out)
+	}
+	outStr := string(out)
+	if !strings.Contains(outStr, "[FAC-1]") {
+		t.Fatalf("expected FAC-1 in review listing, got:\n%s", outStr)
+	}
+	if !strings.Contains(outStr, "[FAC-2]") {
+		t.Fatalf("expected FAC-2 in review listing, got:\n%s", outStr)
+	}
+	if !strings.Contains(outStr, "[BLOCKED: callback blocked: missing verification evidence]") {
+		t.Fatalf("expected structured blocked evidence for FAC-2, got:\n%s", outStr)
+	}
+	if got := atomic.LoadInt32(&fk.patches); got != 0 {
+		t.Fatalf("read-only listing must not mutate provider, saw %d patches", got)
+	}
+}

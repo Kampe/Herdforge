@@ -1,10 +1,10 @@
 {
   "module": "github.com/Kampe/Herdforge",
   "primary_entry": "github.com/Kampe/Herdforge/cmd/herd",
-  "generated_by": "scripts/package-inventory.go",
+  "generated_by": "scripts/packageinventory/inventory.go",
   "class_counts": {
     "internal": 1,
-    "production": 87,
+    "production": 88,
     "secondary": 1,
     "unwired": 23
   },
@@ -76,6 +76,12 @@
       "has_own_tests": true
     },
     {
+      "path": "github.com/Kampe/Herdforge/pkg/candidateindex",
+      "class": "production",
+      "test_importers": 0,
+      "has_own_tests": true
+    },
+    {
       "path": "github.com/Kampe/Herdforge/pkg/claim",
       "class": "production",
       "test_importers": 4,
@@ -102,7 +108,7 @@
     {
       "path": "github.com/Kampe/Herdforge/pkg/config",
       "class": "production",
-      "test_importers": 10,
+      "test_importers": 11,
       "has_own_tests": true
     },
     {
@@ -300,7 +306,7 @@
     {
       "path": "github.com/Kampe/Herdforge/pkg/mail",
       "class": "production",
-      "test_importers": 4,
+      "test_importers": 5,
       "has_own_tests": true
     },
     {
@@ -390,7 +396,7 @@
     {
       "path": "github.com/Kampe/Herdforge/pkg/provider",
       "class": "production",
-      "test_importers": 10,
+      "test_importers": 11,
       "has_own_tests": true
     },
     {
@@ -474,7 +480,7 @@
     {
       "path": "github.com/Kampe/Herdforge/pkg/reviewledger",
       "class": "production",
-      "test_importers": 3,
+      "test_importers": 4,
       "has_own_tests": true
     },
     {
