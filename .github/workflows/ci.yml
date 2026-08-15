@@ -48,6 +48,8 @@ jobs:
         with:
           version: v0.74.0
 
+      # make lint runs go vet, the hermeticity scan (FAC-215), the package
+      # inventory drift check (FAC-301), and the security gates.
       - name: Build, lint, unit tests, preflight
         run: make lint test-unit test-race preflight
 

@@ -1,6 +1,6 @@
 # Herdforge Makefile
 
-.PHONY: all build test test-unit test-contracts test-hermetic-compile test-coverage test-mutation test-race test-e2e preflight lint security security-test security-deps self-test herd-up clean ci
+.PHONY: all build test test-unit test-contracts test-hermetic-compile test-coverage test-mutation test-race test-e2e preflight lint security security-test security-deps self-test herd-up clean ci package-inventory
 
 # FAC-135: shared hermetic Git environment for every gate. Host signing, hooks,
 # and ambient credentials must not influence fixtures or coverage.
@@ -110,6 +110,8 @@ lint:
 	cd contracts/agentscope && go vet ./...
 	@echo "==> Running test hermeticity scan (FAC-215)..."
 	go run ./scripts/hermeticity/
+	@echo "==> Checking package inventory drift (FAC-301)..."
+	$(MAKE) package-inventory
 	$(MAKE) security
 	$(MAKE) security-deps
 
@@ -124,6 +126,16 @@ security-test:
 # traversed; it has no severity or vulnerability suppressions.
 security-deps:
 	./scripts/check-go-dependencies.zsh
+
+# FAC-301: graph-backed package reachability/classification inventory. Validates
+# the live import graph against the checked-in baseline, catching both broken
+# wiring (production package regresses to unwired) and unintended growth (new
+# unwired package not recorded in baseline). The baseline lives at
+# scripts/packageinventory/baseline.json; regenerate with:
+#   go run ./scripts/packageinventory/ --generate scripts/packageinventory/baseline.json
+package-inventory:
+	@echo "==> Checking package reachability inventory (FAC-301)..."
+	$(HERMETIC_GIT) go run ./scripts/packageinventory/ --check scripts/packageinventory/baseline.json
 
 clean:
 	@echo "==> Cleaning build artifacts..."

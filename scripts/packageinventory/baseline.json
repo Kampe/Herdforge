@@ -1,0 +1,685 @@
+{
+  "module": "github.com/Kampe/Herdforge",
+  "primary_entry": "github.com/Kampe/Herdforge/cmd/herd",
+  "generated_by": "scripts/package-inventory.go",
+  "class_counts": {
+    "internal": 1,
+    "production": 87,
+    "secondary": 1,
+    "unwired": 23
+  },
+  "packages": [
+    {
+      "path": "github.com/Kampe/Herdforge/cmd/herd",
+      "class": "production",
+      "test_importers": 0,
+      "has_own_tests": true
+    },
+    {
+      "path": "github.com/Kampe/Herdforge/cmd/herd-hook-inventory",
+      "class": "secondary",
+      "test_importers": 0,
+      "has_own_tests": true
+    },
+    {
+      "path": "github.com/Kampe/Herdforge/internal/testgit",
+      "class": "internal",
+      "test_importers": 11,
+      "has_own_tests": true
+    },
+    {
+      "path": "github.com/Kampe/Herdforge/pkg/activate",
+      "class": "production",
+      "test_importers": 0,
+      "has_own_tests": true
+    },
+    {
+      "path": "github.com/Kampe/Herdforge/pkg/agentpolicy",
+      "class": "production",
+      "test_importers": 2,
+      "has_own_tests": true
+    },
+    {
+      "path": "github.com/Kampe/Herdforge/pkg/attention",
+      "class": "production",
+      "test_importers": 0,
+      "has_own_tests": true
+    },
+    {
+      "path": "github.com/Kampe/Herdforge/pkg/backfill",
+      "class": "unwired",
+      "test_importers": 0,
+      "has_own_tests": true
+    },
+    {
+      "path": "github.com/Kampe/Herdforge/pkg/boardfreeze",
+      "class": "production",
+      "test_importers": 1,
+      "has_own_tests": true
+    },
+    {
+      "path": "github.com/Kampe/Herdforge/pkg/boardproj",
+      "class": "unwired",
+      "test_importers": 0,
+      "has_own_tests": true
+    },
+    {
+      "path": "github.com/Kampe/Herdforge/pkg/broadcast",
+      "class": "production",
+      "test_importers": 1,
+      "has_own_tests": true
+    },
+    {
+      "path": "github.com/Kampe/Herdforge/pkg/budget",
+      "class": "unwired",
+      "test_importers": 0,
+      "has_own_tests": true
+    },
+    {
+      "path": "github.com/Kampe/Herdforge/pkg/claim",
+      "class": "production",
+      "test_importers": 4,
+      "has_own_tests": true
+    },
+    {
+      "path": "github.com/Kampe/Herdforge/pkg/classify",
+      "class": "production",
+      "test_importers": 1,
+      "has_own_tests": true
+    },
+    {
+      "path": "github.com/Kampe/Herdforge/pkg/cmdauth",
+      "class": "production",
+      "test_importers": 1,
+      "has_own_tests": true
+    },
+    {
+      "path": "github.com/Kampe/Herdforge/pkg/cmdsession",
+      "class": "production",
+      "test_importers": 1,
+      "has_own_tests": true
+    },
+    {
+      "path": "github.com/Kampe/Herdforge/pkg/config",
+      "class": "production",
+      "test_importers": 10,
+      "has_own_tests": true
+    },
+    {
+      "path": "github.com/Kampe/Herdforge/pkg/confinement",
+      "class": "production",
+      "test_importers": 1,
+      "has_own_tests": true
+    },
+    {
+      "path": "github.com/Kampe/Herdforge/pkg/conflict",
+      "class": "unwired",
+      "test_importers": 0,
+      "has_own_tests": true
+    },
+    {
+      "path": "github.com/Kampe/Herdforge/pkg/containerlifecycle",
+      "class": "production",
+      "test_importers": 1,
+      "has_own_tests": true
+    },
+    {
+      "path": "github.com/Kampe/Herdforge/pkg/control",
+      "class": "production",
+      "test_importers": 3,
+      "has_own_tests": true
+    },
+    {
+      "path": "github.com/Kampe/Herdforge/pkg/coordinator",
+      "class": "production",
+      "test_importers": 0,
+      "has_own_tests": true
+    },
+    {
+      "path": "github.com/Kampe/Herdforge/pkg/credits",
+      "class": "production",
+      "test_importers": 0,
+      "has_own_tests": true
+    },
+    {
+      "path": "github.com/Kampe/Herdforge/pkg/criticalpath",
+      "class": "unwired",
+      "test_importers": 0,
+      "has_own_tests": true
+    },
+    {
+      "path": "github.com/Kampe/Herdforge/pkg/cron",
+      "class": "unwired",
+      "test_importers": 0,
+      "has_own_tests": true
+    },
+    {
+      "path": "github.com/Kampe/Herdforge/pkg/daemon",
+      "class": "production",
+      "test_importers": 1,
+      "has_own_tests": true
+    },
+    {
+      "path": "github.com/Kampe/Herdforge/pkg/deps",
+      "class": "production",
+      "test_importers": 3,
+      "has_own_tests": true
+    },
+    {
+      "path": "github.com/Kampe/Herdforge/pkg/dispatch",
+      "class": "production",
+      "test_importers": 1,
+      "has_own_tests": true
+    },
+    {
+      "path": "github.com/Kampe/Herdforge/pkg/eligibility",
+      "class": "production",
+      "test_importers": 1,
+      "has_own_tests": true
+    },
+    {
+      "path": "github.com/Kampe/Herdforge/pkg/envelope",
+      "class": "production",
+      "test_importers": 3,
+      "has_own_tests": true
+    },
+    {
+      "path": "github.com/Kampe/Herdforge/pkg/envplan",
+      "class": "production",
+      "test_importers": 0,
+      "has_own_tests": true
+    },
+    {
+      "path": "github.com/Kampe/Herdforge/pkg/fanout",
+      "class": "unwired",
+      "test_importers": 0,
+      "has_own_tests": true
+    },
+    {
+      "path": "github.com/Kampe/Herdforge/pkg/feedback",
+      "class": "production",
+      "test_importers": 0,
+      "has_own_tests": true
+    },
+    {
+      "path": "github.com/Kampe/Herdforge/pkg/freshbuild",
+      "class": "production",
+      "test_importers": 0,
+      "has_own_tests": true
+    },
+    {
+      "path": "github.com/Kampe/Herdforge/pkg/gc",
+      "class": "unwired",
+      "test_importers": 0,
+      "has_own_tests": true
+    },
+    {
+      "path": "github.com/Kampe/Herdforge/pkg/gitdir",
+      "class": "production",
+      "test_importers": 3,
+      "has_own_tests": true
+    },
+    {
+      "path": "github.com/Kampe/Herdforge/pkg/graph",
+      "class": "production",
+      "test_importers": 0,
+      "has_own_tests": true
+    },
+    {
+      "path": "github.com/Kampe/Herdforge/pkg/harness",
+      "class": "production",
+      "test_importers": 1,
+      "has_own_tests": true
+    },
+    {
+      "path": "github.com/Kampe/Herdforge/pkg/harvest",
+      "class": "production",
+      "test_importers": 2,
+      "has_own_tests": true
+    },
+    {
+      "path": "github.com/Kampe/Herdforge/pkg/harvestmerge",
+      "class": "production",
+      "test_importers": 0,
+      "has_own_tests": true
+    },
+    {
+      "path": "github.com/Kampe/Herdforge/pkg/herdr",
+      "class": "production",
+      "test_importers": 5,
+      "has_own_tests": true
+    },
+    {
+      "path": "github.com/Kampe/Herdforge/pkg/kick",
+      "class": "production",
+      "test_importers": 1,
+      "has_own_tests": true
+    },
+    {
+      "path": "github.com/Kampe/Herdforge/pkg/lanestate",
+      "class": "production",
+      "test_importers": 0,
+      "has_own_tests": true
+    },
+    {
+      "path": "github.com/Kampe/Herdforge/pkg/launch",
+      "class": "production",
+      "test_importers": 5,
+      "has_own_tests": true
+    },
+    {
+      "path": "github.com/Kampe/Herdforge/pkg/ledger",
+      "class": "production",
+      "test_importers": 1,
+      "has_own_tests": true
+    },
+    {
+      "path": "github.com/Kampe/Herdforge/pkg/lifecycle",
+      "class": "production",
+      "test_importers": 7,
+      "has_own_tests": true
+    },
+    {
+      "path": "github.com/Kampe/Herdforge/pkg/llm",
+      "class": "unwired",
+      "test_importers": 0,
+      "has_own_tests": true
+    },
+    {
+      "path": "github.com/Kampe/Herdforge/pkg/lock",
+      "class": "production",
+      "test_importers": 1,
+      "has_own_tests": true
+    },
+    {
+      "path": "github.com/Kampe/Herdforge/pkg/lost",
+      "class": "production",
+      "test_importers": 0,
+      "has_own_tests": true
+    },
+    {
+      "path": "github.com/Kampe/Herdforge/pkg/mail",
+      "class": "production",
+      "test_importers": 4,
+      "has_own_tests": true
+    },
+    {
+      "path": "github.com/Kampe/Herdforge/pkg/memory",
+      "class": "production",
+      "test_importers": 1,
+      "has_own_tests": true
+    },
+    {
+      "path": "github.com/Kampe/Herdforge/pkg/mergeadmit",
+      "class": "production",
+      "test_importers": 1,
+      "has_own_tests": true
+    },
+    {
+      "path": "github.com/Kampe/Herdforge/pkg/metrics",
+      "class": "unwired",
+      "test_importers": 0,
+      "has_own_tests": true
+    },
+    {
+      "path": "github.com/Kampe/Herdforge/pkg/mutationprobe",
+      "class": "unwired",
+      "test_importers": 0,
+      "has_own_tests": true
+    },
+    {
+      "path": "github.com/Kampe/Herdforge/pkg/next",
+      "class": "production",
+      "test_importers": 0,
+      "has_own_tests": true
+    },
+    {
+      "path": "github.com/Kampe/Herdforge/pkg/notifier",
+      "class": "unwired",
+      "test_importers": 0,
+      "has_own_tests": true
+    },
+    {
+      "path": "github.com/Kampe/Herdforge/pkg/outbox",
+      "class": "production",
+      "test_importers": 3,
+      "has_own_tests": true
+    },
+    {
+      "path": "github.com/Kampe/Herdforge/pkg/overlap",
+      "class": "production",
+      "test_importers": 0,
+      "has_own_tests": true
+    },
+    {
+      "path": "github.com/Kampe/Herdforge/pkg/park",
+      "class": "production",
+      "test_importers": 0,
+      "has_own_tests": true
+    },
+    {
+      "path": "github.com/Kampe/Herdforge/pkg/plugin",
+      "class": "unwired",
+      "test_importers": 0,
+      "has_own_tests": true
+    },
+    {
+      "path": "github.com/Kampe/Herdforge/pkg/posture",
+      "class": "production",
+      "test_importers": 0,
+      "has_own_tests": true
+    },
+    {
+      "path": "github.com/Kampe/Herdforge/pkg/preflight",
+      "class": "production",
+      "test_importers": 2,
+      "has_own_tests": true
+    },
+    {
+      "path": "github.com/Kampe/Herdforge/pkg/process",
+      "class": "production",
+      "test_importers": 0,
+      "has_own_tests": true
+    },
+    {
+      "path": "github.com/Kampe/Herdforge/pkg/procsignal",
+      "class": "production",
+      "test_importers": 1,
+      "has_own_tests": true
+    },
+    {
+      "path": "github.com/Kampe/Herdforge/pkg/provider",
+      "class": "production",
+      "test_importers": 10,
+      "has_own_tests": true
+    },
+    {
+      "path": "github.com/Kampe/Herdforge/pkg/pulse",
+      "class": "production",
+      "test_importers": 1,
+      "has_own_tests": true
+    },
+    {
+      "path": "github.com/Kampe/Herdforge/pkg/quotasup",
+      "class": "production",
+      "test_importers": 0,
+      "has_own_tests": true
+    },
+    {
+      "path": "github.com/Kampe/Herdforge/pkg/recovery",
+      "class": "production",
+      "test_importers": 2,
+      "has_own_tests": true
+    },
+    {
+      "path": "github.com/Kampe/Herdforge/pkg/release",
+      "class": "unwired",
+      "test_importers": 0,
+      "has_own_tests": true
+    },
+    {
+      "path": "github.com/Kampe/Herdforge/pkg/remoteci",
+      "class": "production",
+      "test_importers": 2,
+      "has_own_tests": true
+    },
+    {
+      "path": "github.com/Kampe/Herdforge/pkg/resetsafe",
+      "class": "production",
+      "test_importers": 0,
+      "has_own_tests": true
+    },
+    {
+      "path": "github.com/Kampe/Herdforge/pkg/residual",
+      "class": "production",
+      "test_importers": 2,
+      "has_own_tests": true
+    },
+    {
+      "path": "github.com/Kampe/Herdforge/pkg/resolve",
+      "class": "production",
+      "test_importers": 0,
+      "has_own_tests": true
+    },
+    {
+      "path": "github.com/Kampe/Herdforge/pkg/resources",
+      "class": "production",
+      "test_importers": 4,
+      "has_own_tests": true
+    },
+    {
+      "path": "github.com/Kampe/Herdforge/pkg/retention",
+      "class": "unwired",
+      "test_importers": 0,
+      "has_own_tests": true
+    },
+    {
+      "path": "github.com/Kampe/Herdforge/pkg/review",
+      "class": "production",
+      "test_importers": 1,
+      "has_own_tests": true
+    },
+    {
+      "path": "github.com/Kampe/Herdforge/pkg/reviewingest",
+      "class": "production",
+      "test_importers": 0,
+      "has_own_tests": true
+    },
+    {
+      "path": "github.com/Kampe/Herdforge/pkg/reviewlaunch",
+      "class": "unwired",
+      "test_importers": 0,
+      "has_own_tests": true
+    },
+    {
+      "path": "github.com/Kampe/Herdforge/pkg/reviewledger",
+      "class": "production",
+      "test_importers": 3,
+      "has_own_tests": true
+    },
+    {
+      "path": "github.com/Kampe/Herdforge/pkg/reviewsup",
+      "class": "unwired",
+      "test_importers": 0,
+      "has_own_tests": true
+    },
+    {
+      "path": "github.com/Kampe/Herdforge/pkg/router",
+      "class": "production",
+      "test_importers": 8,
+      "has_own_tests": true
+    },
+    {
+      "path": "github.com/Kampe/Herdforge/pkg/runstate",
+      "class": "production",
+      "test_importers": 2,
+      "has_own_tests": true
+    },
+    {
+      "path": "github.com/Kampe/Herdforge/pkg/scope",
+      "class": "unwired",
+      "test_importers": 0,
+      "has_own_tests": true
+    },
+    {
+      "path": "github.com/Kampe/Herdforge/pkg/scopeauth",
+      "class": "production",
+      "test_importers": 0,
+      "has_own_tests": false
+    },
+    {
+      "path": "github.com/Kampe/Herdforge/pkg/scopefence",
+      "class": "production",
+      "test_importers": 1,
+      "has_own_tests": true
+    },
+    {
+      "path": "github.com/Kampe/Herdforge/pkg/security",
+      "class": "production",
+      "test_importers": 2,
+      "has_own_tests": true
+    },
+    {
+      "path": "github.com/Kampe/Herdforge/pkg/selftest",
+      "class": "production",
+      "test_importers": 0,
+      "has_own_tests": true
+    },
+    {
+      "path": "github.com/Kampe/Herdforge/pkg/server",
+      "class": "unwired",
+      "test_importers": 0,
+      "has_own_tests": true
+    },
+    {
+      "path": "github.com/Kampe/Herdforge/pkg/shot",
+      "class": "production",
+      "test_importers": 1,
+      "has_own_tests": true
+    },
+    {
+      "path": "github.com/Kampe/Herdforge/pkg/signerboundary",
+      "class": "production",
+      "test_importers": 0,
+      "has_own_tests": true
+    },
+    {
+      "path": "github.com/Kampe/Herdforge/pkg/skill",
+      "class": "unwired",
+      "test_importers": 0,
+      "has_own_tests": true
+    },
+    {
+      "path": "github.com/Kampe/Herdforge/pkg/spin",
+      "class": "production",
+      "test_importers": 1,
+      "has_own_tests": true
+    },
+    {
+      "path": "github.com/Kampe/Herdforge/pkg/standing",
+      "class": "production",
+      "test_importers": 0,
+      "has_own_tests": true
+    },
+    {
+      "path": "github.com/Kampe/Herdforge/pkg/stash",
+      "class": "production",
+      "test_importers": 0,
+      "has_own_tests": true
+    },
+    {
+      "path": "github.com/Kampe/Herdforge/pkg/stop",
+      "class": "production",
+      "test_importers": 0,
+      "has_own_tests": true
+    },
+    {
+      "path": "github.com/Kampe/Herdforge/pkg/store",
+      "class": "production",
+      "test_importers": 2,
+      "has_own_tests": true
+    },
+    {
+      "path": "github.com/Kampe/Herdforge/pkg/sync",
+      "class": "production",
+      "test_importers": 2,
+      "has_own_tests": true
+    },
+    {
+      "path": "github.com/Kampe/Herdforge/pkg/textdelivery",
+      "class": "production",
+      "test_importers": 3,
+      "has_own_tests": true
+    },
+    {
+      "path": "github.com/Kampe/Herdforge/pkg/throughput",
+      "class": "production",
+      "test_importers": 0,
+      "has_own_tests": true
+    },
+    {
+      "path": "github.com/Kampe/Herdforge/pkg/timeline",
+      "class": "production",
+      "test_importers": 2,
+      "has_own_tests": true
+    },
+    {
+      "path": "github.com/Kampe/Herdforge/pkg/toolchild",
+      "class": "production",
+      "test_importers": 3,
+      "has_own_tests": true
+    },
+    {
+      "path": "github.com/Kampe/Herdforge/pkg/toolpolicy",
+      "class": "production",
+      "test_importers": 0,
+      "has_own_tests": true
+    },
+    {
+      "path": "github.com/Kampe/Herdforge/pkg/toolprobe",
+      "class": "production",
+      "test_importers": 3,
+      "has_own_tests": true
+    },
+    {
+      "path": "github.com/Kampe/Herdforge/pkg/tui",
+      "class": "unwired",
+      "test_importers": 0,
+      "has_own_tests": true
+    },
+    {
+      "path": "github.com/Kampe/Herdforge/pkg/usage",
+      "class": "production",
+      "test_importers": 3,
+      "has_own_tests": true
+    },
+    {
+      "path": "github.com/Kampe/Herdforge/pkg/verifier",
+      "class": "production",
+      "test_importers": 2,
+      "has_own_tests": true
+    },
+    {
+      "path": "github.com/Kampe/Herdforge/pkg/watch",
+      "class": "production",
+      "test_importers": 0,
+      "has_own_tests": true
+    },
+    {
+      "path": "github.com/Kampe/Herdforge/pkg/wave",
+      "class": "production",
+      "test_importers": 0,
+      "has_own_tests": true
+    },
+    {
+      "path": "github.com/Kampe/Herdforge/pkg/webhook",
+      "class": "unwired",
+      "test_importers": 0,
+      "has_own_tests": true
+    },
+    {
+      "path": "github.com/Kampe/Herdforge/pkg/winddown",
+      "class": "production",
+      "test_importers": 2,
+      "has_own_tests": true
+    },
+    {
+      "path": "github.com/Kampe/Herdforge/pkg/worker",
+      "class": "unwired",
+      "test_importers": 0,
+      "has_own_tests": true
+    },
+    {
+      "path": "github.com/Kampe/Herdforge/pkg/worktree",
+      "class": "production",
+      "test_importers": 2,
+      "has_own_tests": true
+    },
+    {
+      "path": "github.com/Kampe/Herdforge/pkg/worktreebootstrap",
+      "class": "production",
+      "test_importers": 1,
+      "has_own_tests": true
+    }
+  ]
+}
