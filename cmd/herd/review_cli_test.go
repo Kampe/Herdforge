@@ -424,8 +424,8 @@ verification:
 lanes:
   - name: assayer
     role: reviewer
-    agent_kind: "pi"
-    harness: "pi"
+    agent_kind: "codex"
+    harness: "codex"
     provider: "codex"
     model: "gpt-5.6-luna"
     effort: "medium"
@@ -434,8 +434,8 @@ lanes:
     worktree: .worktrees/assayer
   - name: smith
     role: worker
-    agent_kind: "pi"
-    harness: "pi"
+    agent_kind: "codex"
+    harness: "codex"
     provider: "codex"
     model: "gpt-5.6-luna"
     effort: "medium"
@@ -1299,9 +1299,9 @@ func TestReviewCLI_IsolatedDetachedReviewWorktree(t *testing.T) {
 	fakeBin, fakeCalls := installProtocolFakeHerdr(t)
 	fakeLog := os.Getenv("HERD_FAKE_LOG")
 	// The --spawn path checks exec.LookPath for the lane's harness binary
-	// (pi) before creating the isolated checkout, and the write-capable tool
-	// probe (pkg/toolprobe) shells `pi` with a sentinel-file prompt. The
-	// stub must be probe-faithful (create PROBE_OK.txt) so the probe passes.
+	// (codex) before creating the isolated checkout, and the write-capable tool
+	// probe (pkg/toolprobe) shells the probe command with a sentinel-file prompt. The
+	// stub must be probe-faithful (create PROBE_OK.txt and output PROBE_OK) so the probe passes.
 	stubDir := stubHarnessPATH(t)
 	cmd := herdCmdWithFake(binary, dir, keyDir, fakeBin, fakeLog, "review", "--spawn", "FAC-1")
 	prependToPath(cmd, stubDir)
