@@ -170,10 +170,10 @@ func (k *KaneoProvider) ListProjectRelations(ctx context.Context, projectID stri
 		return nil, fmt.Errorf("%w (use_cli=%v api_url=%q)", ErrGraphCredentialsRequired, k.UseCLI, k.APIURL)
 	}
 	dls := k.deadlines()
-	ctx, cancel := WithOpDeadline(ctx, dls, OpList)
-	defer cancel()
+	listCtx, listCancel := WithOpDeadline(ctx, dls, OpList)
 
-	tasks, err := k.ListTasks(ctx, projectID, "")
+	tasks, err := k.ListTasks(listCtx, projectID, "")
+	listCancel()
 	if err != nil {
 		return nil, fmt.Errorf("kaneo ListProjectRelations list tasks: %w", err)
 	}
@@ -198,6 +198,15 @@ func (k *KaneoProvider) ListProjectRelations(ctx context.Context, projectID stri
 	if conc > len(ids) && len(ids) > 0 {
 		conc = len(ids)
 	}
+	// The relation API is task-addressed, so even bounded concurrency can need
+	// more than the ordinary list window. Give graph snapshots their own larger
+	// bounded window; ordinary list operations remain on the normal deadline.
+	graphDeadline := dls.For(OpList)
+	if len(ids) >= 64 && graphDeadline < 2*time.Minute {
+		graphDeadline = 2 * time.Minute
+	}
+	graphCtx, graphCancel := context.WithTimeout(ctx, graphDeadline)
+	defer graphCancel()
 
 	type result struct {
 		taskID string
@@ -207,7 +216,7 @@ func (k *KaneoProvider) ListProjectRelations(ctx context.Context, projectID stri
 	jobs := make(chan string)
 	outCh := make(chan result, conc)
 	var wg sync.WaitGroup
-	workerCtx, workerCancel := context.WithCancel(ctx)
+	workerCtx, workerCancel := context.WithCancel(graphCtx)
 	defer workerCancel()
 
 	worker := func() {
@@ -219,7 +228,7 @@ func (k *KaneoProvider) ListProjectRelations(ctx context.Context, projectID stri
 			}
 			rels, e := k.listRelationsHTTPOnly(workerCtx, id)
 			if e != nil {
-				outCh <- result{taskID: id, err: AsTimeout("kaneo", "ListProjectRelations", OpList, dls.For(OpList), e)}
+				outCh <- result{taskID: id, err: AsTimeout("kaneo", "ListProjectRelations", OpList, graphDeadline, e)}
 				workerCancel()
 				return
 			}
@@ -254,7 +263,7 @@ func (k *KaneoProvider) ListProjectRelations(ctx context.Context, projectID stri
 		}
 		byTask[r.taskID] = r.rels
 	}
-	if err := ctx.Err(); err != nil {
+	if err := graphCtx.Err(); err != nil {
 		return nil, AsTimeout("kaneo", "ListProjectRelations", OpList, dls.For(OpList), err)
 	}
 

@@ -707,7 +707,10 @@ func cliErrMsg(res *CLIResult) string {
 // any single caller context — a safety net for hung bodies/connections.
 // Per-op bounds still come from WithOpDeadline on the request context.
 func defaultHTTPClient() *http.Client {
-	return &http.Client{Timeout: DefaultDeadlines().Max() + 5*time.Second}
+	// Ordinary operations remain bounded by their per-operation contexts. The
+	// larger transport ceiling is needed by the explicitly bounded large-board
+	// relation snapshot path, which may use a two-minute graph context.
+	return &http.Client{Timeout: 2*time.Minute + 5*time.Second}
 }
 
 // ListComments implements CommentReader (FAC-145): exact effect readback

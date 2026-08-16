@@ -15,7 +15,11 @@ project:
 task_provider:
   type: "kaneo"
   enabled: ["kaneo"]
+  api_url: "https://kanban-api.kampe.kluster"
   project_id: "b939c5jzixruza3vvywrg1hs"
+  # Use the authenticated Kaneo CLI profile; relation snapshots still use
+  # the explicit API origin above.
+  use_cli: true
 
 # Autonomous merge admission contract. This is intentionally in the live
 # profile so provider, fleet, and merge settings change as one reviewed unit.

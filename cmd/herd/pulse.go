@@ -205,6 +205,13 @@ func readPulseHerdr(ctx context.Context, doneRefs map[string]bool) pulse.HerdrOb
 	if err != nil {
 		return pulse.HerdrObservation{Known: false, Error: err.Error()}
 	}
+	// AgentList is intentionally fleet-wide in Herdr. Pulse must scope that
+	// inventory to this repository's configured workspace before deriving
+	// capacity or reap evidence; otherwise a focused workspace from another
+	// checkout (for example Chainseer) is treated as Herdforge's fleet.
+	if workspace := pulseHerdrWorkspace(); workspace != "" {
+		agents = filterPulseAgentsWorkspace(agents, workspace)
+	}
 	ev := loadReapEvidence(ctx, agents, doneRefs)
 	out := make([]pulse.AgentObservation, 0, len(agents))
 	for _, a := range agents {
@@ -223,6 +230,32 @@ func readPulseHerdr(ctx context.Context, doneRefs map[string]bool) pulse.HerdrOb
 		out = append(out, agent)
 	}
 	return pulse.HerdrObservation{Known: true, Agents: out}
+}
+
+func pulseHerdrWorkspace() string {
+	if cfg, err := config.LoadConfig(".herd/herd.yaml"); err == nil {
+		if ws := strings.TrimSpace(cfg.Fleet.HerdrWorkspace); ws != "" {
+			return ws
+		}
+		if entries, listErr := herdr.WorkspaceList(); listErr == nil {
+			if root, rootErr := os.Getwd(); rootErr == nil {
+				if id, ok := herdr.PickWorkspaceStrict(entries, filepath.Base(root)); ok {
+					return id
+				}
+			}
+		}
+	}
+	return strings.TrimSpace(os.Getenv("HERD_WORKSPACE"))
+}
+
+func filterPulseAgentsWorkspace(agents []herdr.AgentEntry, workspace string) []herdr.AgentEntry {
+	filtered := make([]herdr.AgentEntry, 0, len(agents))
+	for _, agent := range agents {
+		if strings.TrimSpace(agent.Workspace) == workspace {
+			filtered = append(filtered, agent)
+		}
+	}
+	return filtered
 }
 
 func leaseDBPath() string {
@@ -541,12 +574,12 @@ func taskRefFromAgentName(name string) string {
 // nil exit-evidence maps correctly cause fail-closed (no reap), but nil
 // vetoedSHAs alone caused fail-open (lost KEEP signal → reap).
 type reapEvidence struct {
-	doneRefs       map[string]bool   // uppercased task refs with done status
-	safeRefs       map[string]string // uppercased task ref -> safe ref name
-	vetoedSHAs     map[string]bool   // SHAs with FAIL/BLOCKED verdict
-	headSHAs       map[string]string // agent name -> HEAD SHA
-	committed      map[string]bool   // agent name -> has committed work
-	ledgerCorrupt  bool              // ledger exists but unreadable — verdict may be pending
+	doneRefs      map[string]bool   // uppercased task refs with done status
+	safeRefs      map[string]string // uppercased task ref -> safe ref name
+	vetoedSHAs    map[string]bool   // SHAs with FAIL/BLOCKED verdict
+	headSHAs      map[string]string // agent name -> HEAD SHA
+	committed     map[string]bool   // agent name -> has committed work
+	ledgerCorrupt bool              // ledger exists but unreadable — verdict may be pending
 }
 
 // applyReapEvidence fills in CommittedWork, TicketDone, SafeRef, and

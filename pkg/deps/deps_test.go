@@ -13,6 +13,12 @@ import (
 	"github.com/Kampe/Herdforge/pkg/provider"
 )
 
+func TestMapRelTypeStrictTreatsSubtaskAsNonBlockingContext(t *testing.T) {
+	if got := mapRelTypeStrict(provider.RelationSubtask); got != EdgeRelated {
+		t.Fatalf("subtask mapped to %q, want %q", got, EdgeRelated)
+	}
+}
+
 func seedBoard(t *testing.T) *MemoryStore {
 	t.Helper()
 	m := NewMemoryStore()

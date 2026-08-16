@@ -16,6 +16,18 @@ import (
 	"github.com/Kampe/Herdforge/pkg/winddown"
 )
 
+func TestFilterPulseAgentsWorkspace(t *testing.T) {
+	agents := []herdr.AgentEntry{
+		{Name: "herdforge-worker", Workspace: "wK"},
+		{Name: "chainseer-worker", Workspace: "wB"},
+		{Name: "unknown-workspace"},
+	}
+	got := filterPulseAgentsWorkspace(agents, "wK")
+	if len(got) != 1 || got[0].Name != "herdforge-worker" {
+		t.Fatalf("workspace filter returned %#v", got)
+	}
+}
+
 // TestLeaseDBPathDefaultsToProductionLaunchClaims is the non-vacuous guard for
 // review HIGH #2: a wrong default (.herd/leases.db) silently empties renewals.
 func TestLeaseDBPathDefaultsToProductionLaunchClaims(t *testing.T) {

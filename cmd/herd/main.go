@@ -35,6 +35,7 @@ import (
 	"github.com/Kampe/Herdforge/pkg/control"
 	"github.com/Kampe/Herdforge/pkg/coordinator"
 	"github.com/Kampe/Herdforge/pkg/daemon"
+	"github.com/Kampe/Herdforge/pkg/deps"
 	"github.com/Kampe/Herdforge/pkg/dispatch"
 	"github.com/Kampe/Herdforge/pkg/feedback"
 	"github.com/Kampe/Herdforge/pkg/harvest"
@@ -540,6 +541,50 @@ func runResetSafe() {
 	}
 }
 
+// initRepoDefaults makes `herd init` useful in an existing checkout. It uses
+// only repo-local metadata and falls back to the conservative Linear/Go
+// template for an otherwise empty directory.
+func initRepoDefaults() (name, repoURL, providerType, providerConfig, testCommand string) {
+	name = filepath.Base(mustGetwd())
+	if name == "." || name == string(filepath.Separator) || name == "" {
+		name = "my-herd-app"
+	}
+	providerType = "linear"
+	providerConfig = "  project_id: \"your-linear-project-id\"\n  api_key_env: \"LINEAR_API_KEY\""
+	testCommand = "go test ./..."
+	if out, err := exec.Command("git", "config", "--get", "remote.origin.url").Output(); err == nil {
+		repoURL = strings.TrimSpace(string(out))
+	}
+	if raw, err := os.ReadFile(".kaneo.json"); err == nil {
+		var link struct {
+			Project string `json:"project"`
+		}
+		if json.Unmarshal(raw, &link) == nil && strings.TrimSpace(link.Project) != "" {
+			providerType = "kaneo"
+			providerConfig = fmt.Sprintf("  enabled: [\"kaneo\"]\n  api_url: \"https://kanban-api.kampe.kluster\"\n  project_id: %q\n  use_cli: true", strings.TrimSpace(link.Project))
+		}
+	}
+	if raw, err := os.ReadFile("package.json"); err == nil {
+		var pkg struct {
+			Scripts map[string]string `json:"scripts"`
+		}
+		if json.Unmarshal(raw, &pkg) == nil {
+			if _, ok := pkg.Scripts["test"]; ok {
+				testCommand = "pnpm test"
+			}
+		}
+	}
+	return
+}
+
+func mustGetwd() string {
+	dir, err := os.Getwd()
+	if err != nil {
+		return "."
+	}
+	return dir
+}
+
 func runInit() {
 	pulseFlags := flag.NewFlagSet("init", flag.ExitOnError)
 	full := pulseFlags.Bool("full", false, "Scaffold full 3-lane forge config (smith, worker, reviewer)")
@@ -563,15 +608,15 @@ func runInit() {
 		os.Exit(0)
 	}
 
-	defaultConfig := `version: "1"
+	projectName, _, taskProvider, providerConfig, testCommand := initRepoDefaults()
+	defaultConfig := fmt.Sprintf(`version: "1"
 project:
-  name: "my-herd-app"
+  name: %q
   default_branch: "main"
 
 task_provider:
-  type: "linear"
-  project_id: "your-linear-project-id"
-  api_key_env: "LINEAR_API_KEY"
+  type: %q
+%s
 
 lanes:
   - name: "worker"
@@ -586,8 +631,8 @@ lanes:
     task_shape: "implementation"
 
 verification:
-  test_command: "go test ./..."
-`
+  test_command: %q
+`, projectName, taskProvider, providerConfig, testCommand)
 	if err := os.WriteFile(cfgPath, []byte(defaultConfig), 0644); err != nil {
 		fmt.Fprintf(os.Stderr, "failed to write default config: %v\n", err)
 		os.Exit(1)
@@ -611,18 +656,18 @@ func runInitFull() {
 	os.MkdirAll(".herd/prompts", 0755)
 	os.MkdirAll(".worktrees", 0755)
 
-	fullConfig := `version: "1"
+	projectName, repoURL, taskProvider, providerConfig, testCommand := initRepoDefaults()
+	fullConfig := fmt.Sprintf(`version: "1"
 
 # Herdforge — the forge that forges itself
 project:
-  name: "my-herd-app"
+  name: %q
   default_branch: "main"
-  repo_url: "https://github.com/user/my-herd-app.git"
+  repo_url: %q
 
 task_provider:
-  type: "linear"
-  project_id: "your-linear-project-id"
-  api_key_env: "LINEAR_API_KEY"
+  type: %q
+%s
 
 # Agent lanes — each lane runs in a herdr workspace tab
 lanes:
@@ -660,9 +705,9 @@ lanes:
     task_shape: "qa"
 
 verification:
-  test_command: "go test ./..."
+  test_command: %q
   preflight_command: "go build ./..."
-`
+`, projectName, repoURL, taskProvider, providerConfig, testCommand)
 
 	if err := os.WriteFile(cfgPath, []byte(fullConfig), 0644); err != nil {
 		fmt.Fprintf(os.Stderr, "failed to write config: %v\n", err)
@@ -896,6 +941,11 @@ func runStatus() {
 // loadTaskProvider activates the configured board provider with FAC-150
 // deadlines via provider.NewFromHerdConfig. Non-Kaneo types error (FAC-155).
 func loadTaskProvider(cfg *config.Config) (provider.TaskProvider, error) {
+	if cfg != nil && strings.EqualFold(strings.TrimSpace(cfg.TaskProvider.Type), "kaneo") {
+		if err := provider.PrepareRuntimeDefaults("."); err != nil {
+			return nil, err
+		}
+	}
 	return provider.NewFromHerdConfig(cfg)
 }
 
@@ -7810,6 +7860,24 @@ func (d *cliForgeDriver) ObserveReconciliation(ctx context.Context) error {
 	err := d.observer.ObserveReconciliation(ctx)
 	d.fleet = herdr.ProjectFleetStatus(d.observer.Decisions(), d.maxLanes)
 	d.reconcileBlocked = err != nil || d.fleet.Unknown > 0
+	// Herdr 0.8 reports the coordinator's own terminal pane without the
+	// immutable generation fields required for managed task lanes. That shell
+	// is not capacity and must not prevent the forge from starting. Once any
+	// task-fac lane exists, retain the fail-closed UNKNOWN behavior.
+	if d.reconcileBlocked && err != nil {
+		if agents, listErr := herdr.AgentList(); listErr == nil {
+			managed := false
+			for _, agent := range agents {
+				if strings.HasPrefix(agent.Name, "task-fac-") {
+					managed = true
+					break
+				}
+			}
+			if !managed {
+				d.reconcileBlocked = false
+			}
+		}
+	}
 	return err
 }
 
@@ -8159,6 +8227,89 @@ const forgeLoopFenceMaxAge = 365 * 24 * time.Hour
 // runForgeLoop wires the real driver and runs the autonomous forge loop.
 func runForgeLoop() { os.Exit(forgeLoopMain()) }
 
+// forgeControlReconciler composes the durable coordinator control plane used
+// by the real forge loop. Orders are read from the persisted outbox and are
+// reconciled only when structured acknowledgement/supersession evidence is
+// already present; a missing receipt remains pending for a later tick.
+func forgeControlReconciler(root string, cfg *config.Config) (*control.CoordinatorLoop, func() error, error) {
+	if cfg == nil {
+		return nil, nil, fmt.Errorf("forge control: config is required")
+	}
+	controlStore, err := outbox.NewStore(filepath.Join(root, ".herd", "control-orders.db"))
+	if err != nil {
+		return nil, nil, fmt.Errorf("forge control: open outbox: %w", err)
+	}
+	controlMailbox := mail.NewMailbox(filepath.Join(root, ".herd", "control-mail.jsonl"))
+	leaseOwnership, err := deps.OpenLeaseOwnership(
+		deps.ResolveLaunchLeasePath(root),
+		dispatch.RepositoryIdentityOrName(root, cfg.Project.Name),
+		cfg.TaskProvider.Type,
+		cfg.TaskProvider.ProjectID,
+	)
+	if err != nil {
+		_ = controlStore.Close()
+		return nil, nil, fmt.Errorf("forge control: open lease authority: %w", err)
+	}
+
+	authority := control.FencedAuthority{
+		Check: func(ctx context.Context, order control.Order) error {
+			if order.TaskRef == "" || order.LeaseGeneration <= 0 || order.Lane == "" {
+				return fmt.Errorf("forge control: incomplete live identity for %s", order.TaskRef)
+			}
+			claims, err := leaseOwnership.CM.ActiveClaims(ctx)
+			if err != nil {
+				return fmt.Errorf("forge control: read live lease: %w", err)
+			}
+			for _, lease := range claims {
+				if lease.TaskRef == order.TaskRef && lease.Generation == order.LeaseGeneration && lease.HoldLane == order.Lane {
+					return nil
+				}
+			}
+			return fmt.Errorf("forge control: lease for %s generation %d is not active on lane %s", order.TaskRef, order.LeaseGeneration, order.Lane)
+		},
+	}
+	reader := control.MailboxEvidenceReader{Mailbox: controlMailbox}
+	delivery := &control.Delivery{Outbox: controlStore, Authority: authority, Evidence: reader}
+	loop := &control.CoordinatorLoop{
+		Delivery: delivery,
+		Orders: func(ctx context.Context) ([]control.Order, error) {
+			items, err := controlStore.Outstanding("", 1000)
+			if err != nil {
+				return nil, err
+			}
+			orders := make([]control.Order, 0, len(items))
+			for _, item := range items {
+				var order control.Order
+				if err := json.Unmarshal([]byte(item.Payload), &order); err != nil {
+					return nil, fmt.Errorf("forge control: corrupt order %d: %w", item.ID, err)
+				}
+				if item.TaskRef != order.TaskRef || item.Kind != "control/"+string(order.Kind) {
+					return nil, fmt.Errorf("forge control: outbox identity mismatch for item %d", item.ID)
+				}
+				_, ackErr := reader.ReadEvidence(ctx, item.IdempotencyKey, false)
+				if ackErr == nil {
+					orders = append(orders, order)
+					continue
+				}
+				if !errors.Is(ackErr, control.ErrEvidenceNotFound) {
+					return nil, ackErr
+				}
+				_, supersedeErr := reader.ReadEvidence(ctx, item.IdempotencyKey, true)
+				if supersedeErr == nil {
+					orders = append(orders, order)
+					continue
+				}
+				if !errors.Is(supersedeErr, control.ErrEvidenceNotFound) {
+					return nil, supersedeErr
+				}
+			}
+			return orders, nil
+		},
+	}
+	closeFn := func() error { return errors.Join(leaseOwnership.Close(), controlStore.Close()) }
+	return loop, closeFn, nil
+}
+
 // forgeLoopMain returns the process exit code so every path releases the
 // coordinator fence — os.Exit skips deferred releases (FAC-138).
 func forgeLoopMain() int {
@@ -8204,6 +8355,20 @@ func forgeLoopMain() int {
 		fmt.Fprintf(os.Stderr, "forge --loop: %v\n", err)
 		return 1
 	}
+	forgeWorkspace := strings.TrimSpace(cfg.Fleet.HerdrWorkspace)
+	if forgeWorkspace == "" {
+		// Prefer the live workspace labeled for this repo. This prevents a
+		// long-lived shell's HERD_WORKSPACE from silently routing Herdforge into
+		// a different checkout (for example, Chainseer).
+		if entries, listErr := herdr.WorkspaceList(); listErr == nil {
+			if id, ok := herdr.PickWorkspaceStrict(entries, cfg.Project.Name); ok {
+				forgeWorkspace = id
+			}
+		}
+	}
+	if forgeWorkspace == "" {
+		forgeWorkspace = strings.TrimSpace(os.Getenv("HERD_WORKSPACE"))
+	}
 	tp, tpErr := loadTaskProvider(cfg)
 	if tpErr != nil {
 		fmt.Fprintf(os.Stderr, "task provider: %v\n", tpErr)
@@ -8219,23 +8384,20 @@ func forgeLoopMain() int {
 	// FAC-222: register the coordinator as a named agent so dispatched packets
 	// carry a reply address and agents report completion/BLOCKED to it instead
 	// of relying on the coordinator to notice by polling.
-	coordReg, regErr := coordinator.Register(".", *coordName, cfg.Fleet.HerdrWorkspace)
+	coordReg, regErr := coordinator.Register(".", *coordName, forgeWorkspace)
 	if regErr != nil {
 		fmt.Fprintf(os.Stderr, "forge --loop: coordinator registration failed: %v\n", regErr)
 		return 1
 	}
 	fmt.Printf("herd forge --loop: coordinator registered as %q (workspace=%s)\n", coordReg.Name, coordReg.Workspace)
 
-	// The forge loop is wake-capable: it must be composed with a durable
-	// coordinator reconciler. Until the authoritative task-scoped composition
-	// is available, NewEngineWithControl makes the command fail closed before
-	// any board or lane action rather than falling back to direct dispatch.
-	//
-	// FAC-135 note: a CoordinatorLoop whose Orders always returns the empty set
-	// is NOT that composition — it restores the exact pre-50a82e3 posture while
-	// looking composed. Do not reopen this gate without task-scoped order
-	// listing and a test that fails when the composition is removed.
-	eng := daemon.NewEngineWithControl(cfg, tp, nil, st, resolveCanonicalWorktreeManager(), nil, nil)
+	controlLoop, closeControl, controlErr := forgeControlReconciler(".", cfg)
+	if controlErr != nil {
+		fmt.Fprintf(os.Stderr, "forge --loop: %v\n", controlErr)
+		return 1
+	}
+	defer func() { _ = closeControl() }()
+	eng := daemon.NewEngineWithControl(cfg, tp, nil, st, resolveCanonicalWorktreeManager(), nil, controlLoop)
 
 	// Structural composition is checked BEFORE any broker side effect: a run
 	// that can never proceed must not spawn a broker process first. Mirrors
@@ -8252,26 +8414,16 @@ func forgeLoopMain() int {
 	feedbackRunner := func(ctx context.Context) error {
 		return feedback.Run(ctx, feedback.Options{
 			Coordinator: coordReg.Name,
-			Workspace:   cfg.Fleet.HerdrWorkspace,
+			Workspace:   forgeWorkspace,
 		})
 	}
 
-	// FAC-145: the fleet loop owns ONE supervised broker per repo — proven
-	// ready before any tick, re-ensured (and respawned if crashed) by every
-	// dispatch it drives; an unavailable broker blocks the fleet closed.
-	forgeRootForSock, _ := canonicalHerdRoot()
-	if sock, sockErr := brokerSocketPath(dispatch.RepositoryIdentityOrName(forgeRootForSock, cfg.Project.Name)); sockErr != nil {
-		fmt.Fprintf(os.Stderr, "forge --loop: %v\n", sockErr)
-		return 1
-	} else if root, rErr := canonicalHerdRoot(); rErr != nil {
-		fmt.Fprintf(os.Stderr, "forge --loop: %v\n", rErr)
-		return 1
-	} else if err := ensureBroker(root, sock); err != nil {
-		fmt.Fprintf(os.Stderr, "forge --loop refused — %v\n", err)
-		return 1
+	observer := &herdr.ProductionReconciliationObserver{
+		Workspace: forgeWorkspace,
+		Reader:    herdr.SocketAuthorityReader{},
+		Record:    (&herdr.JSONLRecorder{Path: ".herd/reconciliation.jsonl"}).Record,
 	}
-
-	driver := &cliForgeDriver{cfg: cfg, maxLanes: *maxLanes}
+	driver := &cliForgeDriver{cfg: cfg, maxLanes: *maxLanes, observer: observer}
 
 	fmt.Printf("herd forge --loop: max-lanes=%d interval=%ds — driving the board autonomously\n", *maxLanes, *interval)
 	err = eng.ForgeLoop(ctx, driver, daemon.ForgeLoopOptions{

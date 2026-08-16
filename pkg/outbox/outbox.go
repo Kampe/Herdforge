@@ -452,6 +452,44 @@ func (s *Store) Pending(kind string, limit int, now time.Time) ([]Item, error) {
 	return items, rows.Err()
 }
 
+// Outstanding returns delivered control items that have not reached a
+// terminal acknowledgement state. It is intentionally read-only: the
+// coordinator reconciler decides whether durable evidence permits the CAS.
+func (s *Store) Outstanding(kind string, limit int) ([]Item, error) {
+	if s == nil || s.db == nil {
+		return nil, fmt.Errorf("outbox: store is required")
+	}
+	if limit <= 0 {
+		limit = 1000
+	}
+	query := `SELECT id, idempotency_key, task_ref, kind, payload, status, attempts, last_error, next_attempt_at, created_at, updated_at, owner, claimed_at, message_id, sequence
+		FROM outbox_items WHERE status = ?`
+	args := []any{StatusSent}
+	if kind != "" {
+		query += " AND kind = ?"
+		args = append(args, kind)
+	}
+	query += " ORDER BY id ASC LIMIT ?"
+	args = append(args, limit)
+	rows, err := s.db.Query(query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("outstanding: %w", err)
+	}
+	defer rows.Close()
+	var items []Item
+	for rows.Next() {
+		item, err := scanItem(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan outstanding item: %w", err)
+		}
+		items = append(items, *item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("outstanding rows: %w", err)
+	}
+	return items, nil
+}
+
 // Claim atomically moves one item from pending to in_flight. Exactly one
 // caller wins a given item: the UPDATE is conditioned on status='pending',
 // so a second Relay racing for the same row gets ErrNotClaimable and must
