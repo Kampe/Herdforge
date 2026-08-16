@@ -60,6 +60,7 @@ var subcommandUsage = map[string]string{
 	"status":           "Usage: herd status\n  Show herd workspace / daemon status.",
 	"timeline":         "Usage: herd timeline [--file path] [--task ref] [--lane name] [--source name] [--type type]\n  Read chronological, filterable execution-event envelopes.",
 	"pulse":            "Usage: herd pulse [--act [--spawn]] [--json] [--quiet] [--reason TEXT]\n  Coordinator heartbeat: observe by default; --act applies bounded renewals/callbacks.",
+	"goal-guard":       "Usage: herd goal-guard (--set|--check|--clear) [flags]\n  Durable standing-lane continuation guard.",
 	"wind-down":        "Usage: herd wind-down <on|off|status> [flags]\n  Control durable fleet launch posture.",
 	"posture":          "Usage: herd posture <claude-only|no-claude|clear|status> [flags]\n  Durable provider-family execution policy.",
 	"hold":             "Usage: herd hold <task> on|off|status --lane <name> --owner <role> [flags]\n  Generation-fenced lane/task hold.",
