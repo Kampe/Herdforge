@@ -366,7 +366,28 @@ func recordShotLifecycleLease(root, ref string, lease int64, sha string) error {
 			return fmt.Errorf("shot: lifecycle lease generation %d conflicts with reported %d", current.LeaseGeneration, lease)
 		}
 		if current.CandidateSHA != "" && current.CandidateSHA != sha {
-			return fmt.Errorf("shot: lifecycle candidate %s conflicts with reported %s", current.CandidateSHA, sha)
+			// An eligible row can be left behind when a worker is retried
+			// without a fresh dispatch event. Preserve the lease fence while
+			// moving through the canonical recovery state to bind the callback
+			// to the candidate that actually completed. Once work has advanced
+			// beyond eligibility, a same-generation SHA change is still a
+			// conflict and must fail closed.
+			if current.State != lifecycle.StateEligible {
+				return fmt.Errorf("shot: lifecycle candidate %s conflicts with reported %s", current.CandidateSHA, sha)
+			}
+			if _, err := machine.Transition(lifecycle.TransitionRequest{
+				TaskRef:         ref,
+				Repo:            "herdforge",
+				To:              lifecycle.StateRecovering,
+				Actor:           "worker",
+				IdempotencyKey:  fmt.Sprintf("shot:%s:lease:%d:recovery-candidate:%s", strings.ToLower(ref), lease, sha),
+				LeaseGeneration: lease,
+				Branch:          "herd/" + strings.ToLower(ref),
+				CandidateSHA:    sha,
+			}); err != nil {
+				return fmt.Errorf("shot: update lifecycle candidate: %w", err)
+			}
+			return nil
 		}
 		return nil
 	}
