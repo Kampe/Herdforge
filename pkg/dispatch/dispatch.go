@@ -1126,6 +1126,30 @@ func (d *Dispatcher) admitRunState(ctx context.Context, task *provider.Task) (*r
 		}
 		state, err = d.RunStates.Resume(ctx, id, authority)
 	}
+	if err != nil && !d.Production && errors.Is(err, runstate.ErrStale) {
+		// A local retry owns this checkout and may have changed the board while
+		// recovering a failed pane. Discard only the stale local snapshot and
+		// rebuild it from the current provider evidence; hosted mode remains
+		// strictly fail-closed.
+		if delErr := d.RunStates.Delete(ctx, id); delErr != nil {
+			return nil, fmt.Errorf("dispatch runstate stale recovery: %w", delErr)
+		}
+		graph, graphErr := d.RunStateGraph(ctx)
+		if graphErr != nil || strings.TrimSpace(graph) == "" {
+			if graphErr != nil {
+				return nil, fmt.Errorf("dispatch runstate graph authority: %w", graphErr)
+			}
+			return nil, fmt.Errorf("dispatch runstate: %w: empty graph revision", runstate.ErrAmbiguous)
+		}
+		next, buildErr := runstate.FromTasks(id, "dispatch", task.Ref, graph, runstate.Policy{Lane: "dispatch", Model: "dispatch"}, 0, 0, []*provider.Task{task})
+		if buildErr != nil {
+			return nil, fmt.Errorf("dispatch runstate build: %w", buildErr)
+		}
+		if _, checkpointErr := d.RunStates.Checkpoint(ctx, next, 0); checkpointErr != nil {
+			return nil, fmt.Errorf("dispatch runstate checkpoint: %w", checkpointErr)
+		}
+		state, err = d.RunStates.Resume(ctx, id, authority)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("dispatch runstate resume: %w", err)
 	}
