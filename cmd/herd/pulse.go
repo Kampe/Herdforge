@@ -215,21 +215,67 @@ func readPulseHerdr(ctx context.Context, doneRefs map[string]bool) pulse.HerdrOb
 	ev := loadReapEvidence(ctx, agents, doneRefs)
 	out := make([]pulse.AgentObservation, 0, len(agents))
 	for _, a := range agents {
+		paneBody := ""
+		if a.PaneID != "" {
+			if body, readErr := herdr.PaneRead(a.PaneID, 40); readErr == nil {
+				paneBody = body
+			}
+		}
+		processName := ""
+		if a.PaneID != "" {
+			if processes, processErr := herdr.PaneProcessInfo(a.PaneID); processErr == nil && len(processes) > 0 {
+				processName = processes[0].Name
+			}
+		}
+		explainTarget := a.Name
+		if strings.TrimSpace(explainTarget) == "" {
+			explainTarget = a.PaneID
+		}
+		explain, explainErr := herdr.ExplainAgent(explainTarget)
 		agent := pulse.AgentObservation{
-			Name:          a.Name,
-			Raw:           a.Status,
-			Status:        pulse.ClassifyStatus(a.Status, false),
-			PaneID:        a.PaneID,
-			TabID:         a.TabID,
-			Workspace:     a.Workspace,
-			TabGeneration: a.StateChangeSeq,
-			TabRevision:   a.Revision,
+			Name:              a.Name,
+			Raw:               a.Status,
+			Status:            pulse.ClassifyStatus(a.Status, false),
+			PaneID:            a.PaneID,
+			PaneState:         a.Status,
+			ForegroundProcess: processName,
+			TabID:             a.TabID,
+			Workspace:         a.Workspace,
+			TabGeneration:     a.StateChangeSeq,
+			TabRevision:       a.Revision,
+		}
+		if warning := herdr.DetectContextWarning(paneBody); warning != "" {
+			agent.ContextWarning = warning
+		}
+		if explainErr != nil {
+			agent.LastError = explainErr.Error()
+			agent.PacketPending = true
+		} else {
+			agent.PaneState = explain.State
+			agent.LastError = strings.TrimSpace(explain.Warning)
+			if agent.LastError == "" {
+				agent.LastError = strings.TrimSpace(explain.FallbackReason)
+			}
+			if a.Status == "done" {
+				agent.ExitReason = "agent reported done"
+			} else if explain.State == "blocked" || explain.VisibleBlocker {
+				agent.ExitReason = "agent detector reports blocked"
+			} else if explain.State == "unknown" {
+				agent.ExitReason = "pane state unknown"
+			}
+			// If neither visible idle nor visible working is proven, the pane
+			// may still hold an unconsumed composer or goal. Keep it resident.
+			agent.PacketPending = packetPendingFromExplain(explain)
 		}
 		ref := taskRefFromAgentName(a.Name)
 		agent = applyReapEvidence(agent, ref, ev)
 		out = append(out, agent)
 	}
 	return pulse.HerdrObservation{Known: true, Agents: out}
+}
+
+func packetPendingFromExplain(explain herdr.AgentExplain) bool {
+	return !explain.VisibleIdle && !explain.VisibleWorking
 }
 
 func pulseHerdrWorkspace() string {
