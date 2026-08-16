@@ -88,3 +88,25 @@ func TestGrantIsIdempotentAndNeverStoresCredentials(t *testing.T) {
 		t.Fatalf("unexpected grant material: %+v", raw)
 	}
 }
+
+func TestRevokeRemovesGrantAndReturnsToFailClosed(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "plans.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	now := time.Now().UTC()
+	p, err := s.Create(context.Background(), Plan{Binding: binding(), Requests: []Request{request(CapabilityNetwork)}, CreatedAt: now, ExpiresAt: now.Add(time.Hour)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Grant(context.Background(), p.ID, CapabilityNetwork, "operator", now.Add(30*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Revoke(context.Background(), p.ID, CapabilityNetwork); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Authorize(context.Background(), p.ID, binding(), CapabilityNetwork, now); !errors.Is(err, ErrDenied) {
+		t.Fatalf("revoked capability authorization=%v, want ErrDenied", err)
+	}
+}

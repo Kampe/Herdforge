@@ -14,7 +14,7 @@ import (
 // FAC-240: controlSurfaceVersion is a compatibility boundary, not a display
 // number. Any command-contract change must add its new fingerprint below and
 // increment this value; ValidateControlSurfaceManifest rejects silent drift.
-const controlSurfaceVersion = 5
+const controlSurfaceVersion = 6
 
 type commandClass string
 
@@ -54,7 +54,7 @@ var commandNamesByClass = map[commandClass][]string{
 		"activate", "approve", "attention", "board-done", "board-freeze", "board-frozen", "board-sync", "claude-only", "cleanup", "command", "commands", "containers", "control", "daemon", "deps", "dispatch", "doctor-models", "drain", "feedback", "fence-provision", "forge", "fresh-build", "harvest", "harvest-merge", "herdr-deliver", "hold", "kick", "labels", "lifecycle", "lock", "lost", "merge-admit", "merge-complete", "next", "no-claude", "overlap", "park", "posture", "pulse", "quota", "quota-supervisor", "receipt", "repl", "rescue", "reset-safe", "resolve-lane", "review", "review-classify", "review-ingest", "review-ledger", "send", "sh", "shoot", "shot", "spin", "standing", "stop", "task", "up", "usage", "watch", "wave", "wind-down", "verify-fac151",
 	},
 	classOperatorOnly: {
-		"clone", "hostcreds", "init", "seed-lane-state", "signer-boundary", "stash", "validate-config",
+		"clone", "envplan", "hostcreds", "init", "seed-lane-state", "signer-boundary", "stash", "validate-config",
 	},
 	classInternal: {
 		"broker", "fence-broker", "netbroker-serve", "role-inject",
@@ -115,6 +115,7 @@ var controlSurfaceCompatibility = map[int]string{
 	3: "d2e75d61dec1d2cd0dac05dac7b3515ef6d7f113a52a08d8e0735447e040be80",
 	4: "2383e2f7e6de2ebeff22f7d042cc13895be1016e46a5f1726b97b8b235c851b3",
 	5: "c784289659d0339bf5b5b418473fb4595ab8ef1d8cb73416f474e628bfdf5a25",
+	6: "e23d5531ac1723c79d6c225c5b838490dfc3d4d118ccca05644119157c74bc24",
 }
 
 func controlSurfaceFingerprint(m controlSurfaceManifest) (string, error) {
