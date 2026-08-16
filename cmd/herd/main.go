@@ -6088,6 +6088,7 @@ func runLocked(child []string, lockdir string) int {
 //
 //	herd review-ledger list|queued|pending   — read the ledger as JSON
 //	herd review-ledger tier <sha>            — resolved risk tier for a sha
+//	herd review-ledger drift                — report standing builder-family drift
 func runReviewLedger() {
 	ledgerPath := os.Getenv("HERD_REVIEW_LEDGER")
 	if ledgerPath == "" {
@@ -6098,7 +6099,7 @@ func runReviewLedger() {
 		}
 		ledgerPath = filepath.Join(base, "herdforge", "review-ledger.jsonl")
 	}
-	l, err := review.NewReviewLedger(".", ledgerPath)
+	l, err := reviewledger.NewReviewLedger(".", ledgerPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "review-ledger: %v\n", err)
 		os.Exit(1)
@@ -6140,12 +6141,54 @@ func runReviewLedger() {
 			os.Exit(1)
 		}
 		fmt.Println(tier)
+	case "drift":
+		cfg, err := config.LoadConfig(".herd/herd.yaml")
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "review-ledger drift: load config: %v\n", err)
+			os.Exit(1)
+		}
+		rows, err := l.AllRows()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "review-ledger drift: read ledger: %v\n", err)
+			os.Exit(1)
+		}
+		findings, err := reportStandingBuilderFamilyDrift(cfg, rows, herdr.AgentList)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "review-ledger drift: %v\n", err)
+			os.Exit(1)
+		}
+		for _, finding := range findings {
+			fmt.Printf("builder-family drift: lane=%s agent=%s recorded=%s live=%s\n", finding.Lane, finding.Identity, finding.Recorded, finding.Live)
+		}
 	case "-h", "--help":
-		fmt.Println("Usage: herd review-ledger list|queued|pending|tier <sha>")
+		fmt.Println("Usage: herd review-ledger list|queued|pending|tier <sha>|drift")
 	default:
 		fmt.Fprintf(os.Stderr, "review-ledger: unknown mode %q\n", mode)
 		os.Exit(2)
 	}
+}
+
+// reportStandingBuilderFamilyDrift resolves live Herdr provider evidence and
+// compares it with durable review-ledger evidence. An unreadable inventory is
+// an error, never an empty fleet: agreement can be silent only after both
+// evidence sources were read successfully.
+func reportStandingBuilderFamilyDrift(cfg *config.Config, rows []reviewledger.LedgerRow, listAgents func() ([]herdr.AgentEntry, error)) ([]reviewledger.BuilderFamilyDrift, error) {
+	if listAgents == nil {
+		return nil, errors.New("live agent inventory unavailable: reader is required")
+	}
+	agents, err := listAgents()
+	if err != nil {
+		return nil, fmt.Errorf("live agent inventory unavailable: %w", err)
+	}
+	live := make([]reviewledger.LiveBuilder, 0, len(agents))
+	for _, agent := range agents {
+		family := router.FamilyFor(agent.Kind, "")
+		if family == "" {
+			return nil, fmt.Errorf("live agent %q has unmappable provider %q", agent.Name, agent.Kind)
+		}
+		live = append(live, reviewledger.LiveBuilder{Identity: agent.Name, Family: family})
+	}
+	return reviewledger.CompareStandingBuilderFamilies(cfg, rows, live)
 }
 
 func drainLedgerPath() string {

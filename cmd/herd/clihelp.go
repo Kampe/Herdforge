@@ -71,7 +71,7 @@ var subcommandUsage = map[string]string{
 	"usage":            "Usage: herd usage\n  Show harness quota usage from OpenUsage CLI.",
 	"quota":            "Usage: herd quota [flags]\n  Quota inspection helpers.",
 	"review":           "Usage: herd review [ref] [--spawn]\n  Adversarial review pipeline for in-progress work.",
-	"review-ledger":    "Usage: herd review-ledger [flags]\n  Append-only review ledger operations.",
+	"review-ledger":    "Usage: herd review-ledger list|queued|pending|tier <sha>|drift\n  Append-only review ledger operations; drift reports live standing builder-family mismatches.",
 	"drain":            "Usage: herd drain [flags]\n  Drain control / review backlog.",
 	"approve":          "Usage: herd approve [flags]\n  Approve a reviewed candidate.",
 	"board-done": "Usage: herd board-done <ref> [--receipt <path>] [--override-policy <p> --override-actor <who> --override-reason <why> --override-evidence <what>]\n" +
