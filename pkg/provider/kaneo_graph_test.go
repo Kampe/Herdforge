@@ -167,8 +167,9 @@ func TestKaneoListProjectRelations_WithKey_HTTPFanoutNotCLI(t *testing.T) {
 	if cliRel.Load() != 0 {
 		t.Fatalf("must not use CLI rel list when HTTP credentials present, got %d", cliRel.Load())
 	}
-	if cliList.Load() != 3 || strings.Join(cliPages, ",") != "1,2,3" {
-		t.Fatalf("want real 100+66+empty pagination pages 1,2,3; calls=%d pages=%v", cliList.Load(), cliPages)
+	wantPages := strings.TrimSuffix(strings.Repeat("1,2,3,", 6), ",")
+	if cliList.Load() != 18 || strings.Join(cliPages, ",") != wantPages {
+		t.Fatalf("want complete-status 100+66+empty pagination pages; calls=%d pages=%v", cliList.Load(), cliPages)
 	}
 	// One HTTP GET per task id (fan-out), not sequential CLI.
 	if httpRels.Load() != int64(n) {
