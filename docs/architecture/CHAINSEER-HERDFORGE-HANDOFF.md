@@ -45,6 +45,14 @@ existing two-minute graph deadline extension; ordinary list operations keep
 their normal deadline. Unknown, inconsistent, or incomplete relation evidence
 is an error rather than an empty graph.
 
+## Drain observability
+
+The drain command reports scan phases on stderr before and during expensive
+work. This makes a timeout distinguishable from an empty queue without
+corrupting stdout: `--json` and `--commands` remain machine-readable, and
+`--quiet` suppresses progress. Tests assert the stream contract without
+depending on host speed.
+
 ## Handoff checklist
 
 Before retiring a Chainseer script or changing a parity disposition:
