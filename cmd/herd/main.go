@@ -4847,6 +4847,11 @@ func laneLaunchDecisionWithProbe(ctx context.Context, lane *config.LaneDef, task
 			request.ProbeResults = probes
 		}
 	}
+	if !productionMode() && router.ModelRequiresProbe(model) {
+		// Local mode does not run a separate model probe or open an auth panel;
+		// Herdr owns the real launch and reports startup failure directly.
+		request.ProbeResults = map[string]bool{router.ProbeKey(provider, model): true}
+	}
 	r := router.NewRouter(nil, nil)
 	// The lane's configured harness was LookPath-checked above. Do not let the
 	// router's legacy Pi availability probe veto this direct vendor launch.
