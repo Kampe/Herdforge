@@ -169,6 +169,22 @@ Unknown provider state, failed delivery, stale review SHA, same-family review, d
 
 The repository-local config lives at `.herd/herd.yaml` and describes the project, task provider, lanes, routing candidates, and verification commands. Paths stored in configuration and generated artifacts must remain repository-relative.
 
+### Local Herdr mode
+
+From a checkout with Herdr installed, the normal developer path is:
+
+```sh
+herd forge --loop
+```
+
+Herdforge reads the single Kanban binding in `.herd/herd.yaml`, asks the Herdr
+router for the configured harness/model, and starts the agent through Herdr's
+tab API. Local mode is the default and does not require provider API keys in
+the agent environment, live harness-proof panels, or kernel signer setup.
+
+Hosted control-plane deployments can opt into the stricter signer, attestation,
+and MAC gates with `HERD_MODE=production` (or `HERD_CONTROL_SECRET`).
+
 ### Task provider
 
 `.herd/herd.yaml` ships with Kaneo selected. `task_provider.enabled` is an explicit activation
