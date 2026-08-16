@@ -6,6 +6,18 @@ import (
 	"testing"
 )
 
+func TestLiveProofAgentNameFitsHerdrContract(t *testing.T) {
+	for _, kind := range []string{"claude", "codex", "opencode"} {
+		name := liveProofAgentName(kind)
+		if len(name) > 32 {
+			t.Fatalf("%s name %q exceeds Herdr's 32-character limit", kind, name)
+		}
+		if !strings.HasPrefix(name, "lp-"+kind+"-") {
+			t.Fatalf("unexpected live proof name %q", name)
+		}
+	}
+}
+
 func TestLoginOrAuthScreen_DetectsCodexBrowserLogin(t *testing.T) {
 	cases := []struct {
 		title, body string

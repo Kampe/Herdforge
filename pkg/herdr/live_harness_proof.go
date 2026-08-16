@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -102,6 +103,13 @@ func randomNonce(n int) string {
 		return fmt.Sprintf("%d", time.Now().UnixNano())
 	}
 	return hex.EncodeToString(b)
+}
+
+// liveProofAgentName stays within Herdr's 32-character name contract. A full
+// decimal UnixNano plus nonce used to exceed that limit, so every live proof
+// failed before the harness process could start.
+func liveProofAgentName(kind string) string {
+	return fmt.Sprintf("lp-%s-%s", strings.ToLower(strings.TrimSpace(kind)), strconv.FormatInt(time.Now().UnixNano(), 36))
 }
 
 // rejectNonModelSession fails closed when the pane is a login/auth UI or lacks
@@ -234,7 +242,7 @@ func proveLiveHarness(kind, realBin, tmp string) (modelOK, toolOK, viaLA, contai
 			"FAC-133 BLOCKED: herdr workspace unknown (set HERD_WORKSPACE; no first-entry fallback)", err
 	}
 
-	name := fmt.Sprintf("lp-%s-%d-%s", kind, time.Now().UnixNano(), randomNonce(4))
+	name := liveProofAgentName(kind)
 	nonce := randomNonce(8)
 	var spawn *security.AgentSpawnResult
 	tabID := ""
