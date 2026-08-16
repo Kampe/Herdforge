@@ -37,6 +37,7 @@ import (
 	"github.com/Kampe/Herdforge/pkg/daemon"
 	"github.com/Kampe/Herdforge/pkg/deps"
 	"github.com/Kampe/Herdforge/pkg/dispatch"
+	"github.com/Kampe/Herdforge/pkg/envplan"
 	"github.com/Kampe/Herdforge/pkg/feedback"
 	"github.com/Kampe/Herdforge/pkg/harvest"
 	"github.com/Kampe/Herdforge/pkg/herdr"
@@ -331,6 +332,9 @@ func main() {
 
 	case "dispatch":
 		runDispatch()
+
+	case "envplan":
+		runEnvPlan()
 
 	case "deps":
 		runDeps()
@@ -3678,10 +3682,11 @@ func runNext() {
 // dispatchRequest is the parsed, side-effect-free CLI contract for dispatch.
 // Parsing never loads config, claims work, or opens durable stores.
 type dispatchRequest struct {
-	TicketRef    string
-	NoLaunch     bool
-	LaneName     string
-	LaneExplicit bool
+	TicketRef         string
+	NoLaunch          bool
+	LaneName          string
+	LaneExplicit      bool
+	EnvironmentPlanID string
 }
 
 // parseDispatchArgs routes flags through a real FlagSet before any operational
@@ -3694,6 +3699,7 @@ func parseDispatchArgs(args []string) (dispatchRequest, error) {
 	fs.SetOutput(io.Discard)
 	noLaunch := fs.Bool("no-launch", false, "Skip agent launch")
 	laneName := fs.String("lane", "worker", "Lane name from config")
+	planID := fs.String("environment-plan", "", "Exact operator-managed environment plan ID")
 	ticketFlag := fs.String("ticket", "", "Ticket ref (required when the value begins with '-')")
 
 	parse := func(in []string) error {
@@ -3730,10 +3736,11 @@ func parseDispatchArgs(args []string) (dispatchRequest, error) {
 		return dispatchRequest{}, err
 	}
 	return dispatchRequest{
-		TicketRef:    ref,
-		NoLaunch:     *noLaunch,
-		LaneName:     *laneName,
-		LaneExplicit: laneExplicit,
+		TicketRef:         ref,
+		NoLaunch:          *noLaunch,
+		LaneName:          *laneName,
+		LaneExplicit:      laneExplicit,
+		EnvironmentPlanID: strings.TrimSpace(*planID),
 	}, nil
 }
 
@@ -3849,6 +3856,12 @@ func dispatchTicketDecision(ctx context.Context, req dispatchRequest, announce i
 	}
 	defer runStates.Close()
 	d.RunStates = runStates
+	plans, err := envplan.Open(filepath.Join(".herd", "environment-plans.db"))
+	if err != nil {
+		return nil, nil, fmt.Errorf("environment plan store: %w", err)
+	}
+	defer plans.Close()
+	d.EnvironmentPlans = plans
 	d.RunStateGraph = func(context.Context) (string, error) {
 		if strings.TrimSpace(expectedRevision) != "" {
 			return expectedRevision, nil
@@ -3975,7 +3988,7 @@ func dispatchTicketDecision(ctx context.Context, req dispatchRequest, announce i
 				return err
 			}
 			var dispatchErr error
-			dispatchResult, dispatchErr = d.Dispatch(ctx, dispatch.DispatchOptions{TicketRef: ticketRef, NoLaunch: noLaunch, LaneName: laneName, Decision: admitted, LeaseID: leaseID, LeaseGeneration: leaseGen})
+			dispatchResult, dispatchErr = d.Dispatch(ctx, dispatch.DispatchOptions{TicketRef: ticketRef, NoLaunch: noLaunch, LaneName: laneName, Decision: admitted, EnvironmentPlanID: req.EnvironmentPlanID, LeaseID: leaseID, LeaseGeneration: leaseGen})
 			return dispatchErr
 		})
 		if err != nil {
@@ -3997,7 +4010,7 @@ func dispatchTicketDecision(ctx context.Context, req dispatchRequest, announce i
 		if err := admitDispatch(); err != nil {
 			return nil, nil, fmt.Errorf("dispatch hold admission rejected: %w", err)
 		}
-		result, err = d.Dispatch(ctx, dispatch.DispatchOptions{TicketRef: ticketRef, NoLaunch: true, LaneName: laneName, Decision: decision, LeaseID: leaseID, LeaseGeneration: leaseGen})
+		result, err = d.Dispatch(ctx, dispatch.DispatchOptions{TicketRef: ticketRef, NoLaunch: true, LaneName: laneName, Decision: decision, EnvironmentPlanID: req.EnvironmentPlanID, LeaseID: leaseID, LeaseGeneration: leaseGen})
 	}
 	if err != nil {
 		// Durable compensation: a failed dispatch releases the exact lease
@@ -8036,11 +8049,12 @@ func runShoot() {
 // cliForgeDriver implements daemon.ForgeDriver by driving the herd binary and
 // herdr fleet — the real side-effecting layer for `herd forge --loop`.
 type cliForgeDriver struct {
-	cfg              *config.Config
-	maxLanes         int
-	observer         *herdr.ProductionReconciliationObserver
-	fleet            herdr.FleetStatus
-	reconcileBlocked bool
+	cfg               *config.Config
+	maxLanes          int
+	environmentPlanID string
+	observer          *herdr.ProductionReconciliationObserver
+	fleet             herdr.FleetStatus
+	reconcileBlocked  bool
 }
 
 // newProductionForgeObserver is the one production composition for the
@@ -8365,7 +8379,11 @@ func (d *cliForgeDriver) Dispatch(ctx context.Context, t *provider.Task) error {
 			lane = worker.Name
 		}
 	}
-	return d.herd("dispatch", t.Ref, "--lane", lane)
+	args := []string{"dispatch", t.Ref, "--lane", lane}
+	if strings.TrimSpace(d.environmentPlanID) != "" {
+		args = append(args, "--environment-plan", d.environmentPlanID)
+	}
+	return d.herd(args...)
 }
 
 // admitReviewHook is the production FAC-144 re-admission path. Tests replace
@@ -8692,6 +8710,7 @@ func forgeLoopMain() int {
 	fs := flag.NewFlagSet("forge-loop", flag.ExitOnError)
 	_ = fs.Bool("loop", true, "run the autonomous loop")
 	maxLanes := fs.Int("max-lanes", 3, "max concurrent builder lanes")
+	environmentPlanID := fs.String("environment-plan", "", "Exact operator-managed environment plan ID for dispatched work")
 	interval := fs.Int("interval", 15, "seconds between ticks")
 	ticks := fs.Int("ticks", 0, "stop after N ticks (0 = run until drained)")
 	stopEmpty := fs.Bool("stop-empty", true, "stop when the board is clear and no lane is busy")
@@ -8814,7 +8833,8 @@ func forgeLoopMain() int {
 		fmt.Fprintf(os.Stderr, "forge --loop: %v\n", observerErr)
 		return 1
 	}
-	driver := &cliForgeDriver{cfg: cfg, maxLanes: *maxLanes, observer: observer}
+	driver := &cliForgeDriver{cfg: cfg, maxLanes: *maxLanes, environmentPlanID: strings.TrimSpace(*environmentPlanID)}
+	driver.observer = observer
 
 	fmt.Printf("herd forge --loop: max-lanes=%d interval=%ds — driving the board autonomously\n", *maxLanes, *interval)
 	err = eng.ForgeLoop(ctx, driver, daemon.ForgeLoopOptions{

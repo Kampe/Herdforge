@@ -118,12 +118,16 @@ Prompt lane flags: --task <shape> --provider <name> --schema <file>
 Flags:
   --no-launch       Create worktree and packet only, no agent
   --lane <name>     Lane name from config (default: worker)
+	  --environment-plan <id> Exact operator-granted environment plan ID (required in production)
   --ticket <ref>    Ticket ref when the value begins with '-' (or use -- <ref>)
 
 Help is reserved: -h / --help never become the ticket. A literal payload equal
 to --help is accepted only as:
   herd dispatch -- --help
-  herd dispatch --ticket=--help`,
+	  herd dispatch --ticket=--help`,
+	"envplan": `Usage: herd envplan <create|inspect|grant|revoke> [flags]
+  Operator-managed, repository-relative environment capability plans. Plans
+  record capability evidence and bindings only; credential values are refused.`,
 	"deps": `Usage: herd deps <selftest|check|reconcile|migrate> [args]
   Packet↔board dependency-graph conformance (FAC-159).
 
