@@ -159,6 +159,12 @@ func main() {
 	case "pulse":
 		runPulse()
 
+	case "goal-guard":
+		if err := runGoalGuard(); err != nil {
+			fmt.Fprintf(os.Stderr, "goal-guard: %v\n", err)
+			os.Exit(1)
+		}
+
 	case "wind-down":
 		runWindDown()
 
