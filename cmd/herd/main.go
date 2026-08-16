@@ -8442,6 +8442,13 @@ func forgeLoopMain() int {
 	if forgeWorkspace == "" {
 		forgeWorkspace = strings.TrimSpace(os.Getenv("HERD_WORKSPACE"))
 	}
+	if forgeWorkspace != "" {
+		// Child `herd dispatch` processes inherit the coordinator's resolved
+		// workspace. Without this, a stale HERD_WORKSPACE from another repo
+		// (Chainseer commonly uses wB) launches Herdforge tasks into the wrong
+		// Herdr panel while the board still records them as this repo's work.
+		_ = os.Setenv("HERD_WORKSPACE", forgeWorkspace)
+	}
 	tp, tpErr := loadTaskProvider(cfg)
 	if tpErr != nil {
 		fmt.Fprintf(os.Stderr, "task provider: %v\n", tpErr)
