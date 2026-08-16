@@ -8006,7 +8006,13 @@ func (d *cliForgeDriver) Dispatch(ctx context.Context, t *provider.Task) error {
 	// FAC-159: wave/forge always route through `herd dispatch`, which runs
 	// RequireTaskLaunch (selection + re-read) before worktree/status/tab and
 	// post-validates with compensation on graph drift.
-	return d.herd("dispatch", t.Ref, "--lane", "worker")
+	lane := "worker"
+	if d.cfg != nil {
+		if worker := findLaneForRole(d.cfg, "worker"); worker != nil && strings.TrimSpace(worker.Name) != "" {
+			lane = worker.Name
+		}
+	}
+	return d.herd("dispatch", t.Ref, "--lane", lane)
 }
 
 // admitReviewHook is the production FAC-144 re-admission path. Tests replace
