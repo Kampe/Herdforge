@@ -4815,35 +4815,37 @@ func laneLaunchDecisionWithProbe(ctx context.Context, lane *config.LaneDef, task
 	// and unknown-probe fails closed — so removing the codex pin accidentally
 	// made codex unreachable from every lane whose configured model was not
 	// itself the probe-gated one.
-	candidates, wfErr := router.Waterfall(shape)
-	if wfErr != nil {
-		return nil, wfErr
-	}
-	probes := map[string]bool{}
-	for _, cp := range candidates {
-		cm := router.ModelFor(cp, shape)
-		if cm == "" || !router.ModelRequiresProbe(cm) {
-			continue
+	if productionMode() {
+		candidates, wfErr := router.Waterfall(shape)
+		if wfErr != nil {
+			return nil, wfErr
 		}
-		key := router.ProbeKey(cp, cm)
-		if _, done := probes[key]; done {
-			continue
-		}
-		probes[key] = probeModel(ctx, cp, cm, lane.Effort).Available
-	}
-	if router.ModelRequiresProbe(model) {
-		probe := probeModel(ctx, provider, model, lane.Effort)
-		probes[router.ProbeKey(provider, model)] = probe.Available
-		if pinnedBuilder && !probe.Available {
-			reason := strings.TrimSpace(probe.Reason)
-			if reason == "" {
-				reason = "unknown probe failure"
+		probes := map[string]bool{}
+		for _, cp := range candidates {
+			cm := router.ModelFor(cp, shape)
+			if cm == "" || !router.ModelRequiresProbe(cm) {
+				continue
 			}
-			return nil, fmt.Errorf("lane %q configured probe %s/%s unavailable: %s", lane.Name, provider, model, reason)
+			key := router.ProbeKey(cp, cm)
+			if _, done := probes[key]; done {
+				continue
+			}
+			probes[key] = probeModel(ctx, cp, cm, lane.Effort).Available
 		}
-	}
-	if len(probes) > 0 {
-		request.ProbeResults = probes
+		if router.ModelRequiresProbe(model) {
+			probe := probeModel(ctx, provider, model, lane.Effort)
+			probes[router.ProbeKey(provider, model)] = probe.Available
+			if pinnedBuilder && !probe.Available {
+				reason := strings.TrimSpace(probe.Reason)
+				if reason == "" {
+					reason = "unknown probe failure"
+				}
+				return nil, fmt.Errorf("lane %q configured probe %s/%s unavailable: %s", lane.Name, provider, model, reason)
+			}
+		}
+		if len(probes) > 0 {
+			request.ProbeResults = probes
+		}
 	}
 	r := router.NewRouter(nil, nil)
 	// The lane's configured harness was LookPath-checked above. Do not let the
