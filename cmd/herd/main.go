@@ -3813,6 +3813,12 @@ func dispatchTicketDecision(ctx context.Context, req dispatchRequest, announce i
 		// receipt evidence, while avoiding hosted-only MAC/signer/confinement
 		// prerequisites that cannot exist on a normal single-user checkout.
 		d = dispatch.NewDispatcher(cfg, tp, wm)
+		compensator, compErr := dispatch.NewOutboxCompensator(filepath.Join(".herd", "dispatch-outbox.db"))
+		if compErr != nil {
+			return nil, nil, fmt.Errorf("local dispatch outbox: %w", compErr)
+		}
+		d.Compensator = compensator
+		defer compensator.Close()
 	}
 	// A fresh checkout may not have a previously published scopefence row.
 	// Dispatch's dependency gate can still establish the authoritative graph,
