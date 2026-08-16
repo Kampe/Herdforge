@@ -49,6 +49,27 @@ func TestResolveReadsBackRegistration(t *testing.T) {
 	}
 }
 
+func TestBindTabPersistsExactControlIncarnation(t *testing.T) {
+	dir := t.TempDir()
+	if _, err := Register(dir, "coordinator", "wK"); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	reg, err := BindTab(dir, "wK", "wK:t2", "wK:p2", "term-coordinator")
+	if err != nil {
+		t.Fatalf("BindTab: %v", err)
+	}
+	if reg.TabID != "wK:t2" || reg.PaneID != "wK:p2" || reg.TerminalID != "term-coordinator" {
+		t.Fatalf("binding=%+v, want exact control incarnation", reg)
+	}
+	readback, err := Resolve(dir)
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if readback.TabID != reg.TabID || readback.PaneID != reg.PaneID || readback.TerminalID != reg.TerminalID {
+		t.Fatalf("readback=%+v, want persisted control binding", readback)
+	}
+}
+
 func TestResolveAbsentFileReturnsDefaultName(t *testing.T) {
 	dir := t.TempDir()
 	reg, err := Resolve(dir)

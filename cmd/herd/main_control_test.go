@@ -75,3 +75,21 @@ func TestConfigureProductionControlAcceptsRelativeMailPath(t *testing.T) {
 		t.Fatal("control mailbox was not configured")
 	}
 }
+
+func TestCoordinatorControlReconcilerDoesNotRequireTaskTabGeneration(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Mkdir(filepath.Join(root, ".herd"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	loop, closeControl, err := newCoordinatorControlReconciler(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeControl()
+	// A coordinator has no managed task-tab lease. An empty durable outbox is
+	// still a real reconciliation pass and must not consult Herdr or invent a
+	// generation merely to make startup appear composed.
+	if err := loop.RunOnce(context.Background()); err != nil {
+		t.Fatalf("coordinator reconciliation: %v", err)
+	}
+}

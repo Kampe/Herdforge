@@ -63,14 +63,17 @@ type Authority[T any] struct {
 }
 
 type TabBinding struct {
-	TabID       string
-	Workspace   string
-	Generation  string
-	TaskRef     string
-	PaneID      string
-	Label       string
-	Role        string
-	ControlSeat bool
+	TabID           string
+	Workspace       string
+	Generation      string
+	TaskRef         string
+	CandidateSHA    string
+	LeaseGeneration int64
+	PaneID          string
+	TerminalID      string
+	Label           string
+	Role            string
+	ControlSeat     bool
 }
 
 type BoardTruth struct{ TaskRef, Status string }

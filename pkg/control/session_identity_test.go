@@ -166,6 +166,35 @@ func TestPromptTargetPrefersPaneID(t *testing.T) {
 	}
 }
 
+func TestRevalidatingAuthorityUsesOrderIdentityWithoutTabGeneration(t *testing.T) {
+	order := Order{LaneIdentity: LaneIdentity{Repository: "repo", TaskRef: "FAC-304", Lane: "worker", LeaseGeneration: 7, CandidateSHA: "sha"}, Kind: KindRepair, Body: "repair"}
+	called := false
+	a := RevalidatingAuthority{Check: func(_ context.Context, got Order) error {
+		called = true
+		if got != order {
+			t.Fatalf("check received %+v, want %+v", got, order)
+		}
+		return nil
+	}}
+	identity, err := a.Resolve(context.Background(), order)
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if !called || identity != order.LaneIdentity {
+		t.Fatalf("identity=%+v called=%v", identity, called)
+	}
+
+	for _, want := range []error{ErrStaleIdentity, errors.New("claim unavailable")} {
+		want := want
+		t.Run(want.Error(), func(t *testing.T) {
+			got, err := (RevalidatingAuthority{Check: func(context.Context, Order) error { return want }}).Resolve(context.Background(), order)
+			if !errors.Is(err, want) || got != (LaneIdentity{}) {
+				t.Fatalf("got identity=%+v err=%v", got, err)
+			}
+		})
+	}
+}
+
 func TestHerdrWaker_NeverCallsPromptDelivery(t *testing.T) {
 	restore := herdr.SetRunHerdrForTest(func(args ...string) (string, error) {
 		if len(args) >= 2 && args[0] == "agent" && args[1] == "prompt-delivery" {

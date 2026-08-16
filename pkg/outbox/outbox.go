@@ -490,6 +490,41 @@ func (s *Store) Outstanding(kind string, limit int) ([]Item, error) {
 	return items, nil
 }
 
+// Sent returns durable delivery intents that reached transport successfully
+// but have not yet reached a terminal acknowledgement state. Coordinator
+// restart reconciliation consumes this narrow view; pending and in-flight
+// rows remain owned by the delivery/relay recovery path because they do not
+// carry proof that a mailbox delivery happened.
+func (s *Store) Sent(limit int) ([]Item, error) {
+	if s == nil || s.db == nil {
+		return nil, fmt.Errorf("sent: outbox store is required")
+	}
+	if limit <= 0 {
+		return nil, fmt.Errorf("sent: positive limit is required")
+	}
+	rows, err := s.db.Query(
+		`SELECT id, idempotency_key, task_ref, kind, payload, status, attempts, last_error, next_attempt_at, created_at, updated_at, owner, claimed_at, message_id, sequence
+		 FROM outbox_items WHERE status = ? ORDER BY id ASC LIMIT ?`, StatusSent, limit,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("sent: %w", err)
+	}
+	defer rows.Close()
+
+	items := make([]Item, 0)
+	for rows.Next() {
+		item, err := scanItem(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan sent outbox item: %w", err)
+		}
+		items = append(items, *item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("sent rows: %w", err)
+	}
+	return items, nil
+}
+
 // Claim atomically moves one item from pending to in_flight. Exactly one
 // caller wins a given item: the UPDATE is conditioned on status='pending',
 // so a second Relay racing for the same row gets ErrNotClaimable and must

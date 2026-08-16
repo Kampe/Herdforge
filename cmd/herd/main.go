@@ -4073,6 +4073,66 @@ func configureProductionControl(d *dispatch.Dispatcher, root string) (func() err
 	}, nil
 }
 
+// newCoordinatorControlReconciler composes the coordinator's restart path
+// independently of worker wake delivery. A coordinator is a control process,
+// not a managed task lane: it has no task claim or Herdr lease generation to
+// bind. Reconciliation therefore reads only orders already proven sent by
+// the durable outbox and validates their task-scoped identity against the
+// live claim authority before terminal state can change.
+func newCoordinatorControlReconciler(root string) (*control.CoordinatorLoop, func() error, error) {
+	controlStore, err := outbox.NewStore(filepath.Join(root, ".herd", "control-orders.db"))
+	if err != nil {
+		return nil, nil, err
+	}
+	controlMailbox := mail.NewMailbox(filepath.Join(root, ".herd", "control-mail.jsonl"))
+	lookup := func(ctx context.Context, order control.Order) error {
+		claims := security.ResolveClaimLookup()
+		if claims == nil {
+			return fmt.Errorf("control: live task claim authority is required for coordinator reconciliation")
+		}
+		rec, err := claims.LookupActiveClaim(ctx, order.TaskRef)
+		if err != nil {
+			return err
+		}
+		if rec == nil || rec.TaskRef != order.TaskRef || rec.Generation != order.LeaseGeneration {
+			return control.ErrStaleIdentity
+		}
+		return nil
+	}
+	delivery := &control.Delivery{
+		Outbox:   controlStore,
+		Evidence: control.MailboxEvidenceReader{Mailbox: controlMailbox},
+		Authority: control.RevalidatingAuthority{
+			Check: func(ctx context.Context, order control.Order) error {
+				return lookup(ctx, order)
+			},
+		},
+	}
+	orders := func(_ context.Context) ([]control.Order, error) {
+		items, err := controlStore.Sent(1000)
+		if err != nil {
+			return nil, err
+		}
+		out := make([]control.Order, 0, len(items))
+		for _, item := range items {
+			if item.Payload == "" || item.TaskRef == "" {
+				return nil, fmt.Errorf("control: sent order %d is missing task identity or payload", item.ID)
+			}
+			var order control.Order
+			if err := json.Unmarshal([]byte(item.Payload), &order); err != nil {
+				return nil, fmt.Errorf("control: decode sent order %d: %w", item.ID, err)
+			}
+			if order.TaskRef != item.TaskRef || item.Kind != "control/"+string(order.Kind) {
+				return nil, fmt.Errorf("control: sent order %d identity does not match outbox metadata", item.ID)
+			}
+			out = append(out, order)
+		}
+		return out, nil
+	}
+	closeControl := func() error { return controlStore.Close() }
+	return &control.CoordinatorLoop{Delivery: delivery, Orders: orders}, closeControl, nil
+}
+
 func runHarvest() {
 	harvestFlags := flag.NewFlagSet("harvest", flag.ExitOnError)
 	quiet := harvestFlags.Bool("quiet", false, "Show summary counts only")
@@ -7917,6 +7977,183 @@ type cliForgeDriver struct {
 	reconcileBlocked bool
 }
 
+// newProductionForgeObserver is the one production composition for the
+// forge driver's fleet census. The socket reader is authoritative for the
+// live Herdr workspace, while the JSONL recorder preserves the observe-only
+// evidence used to explain a blocked or recovering tick.
+func newProductionForgeObserver(cfg *config.Config) (*herdr.ProductionReconciliationObserver, error) {
+	if cfg == nil {
+		return nil, fmt.Errorf("forge reconciliation observer: config is required")
+	}
+	workspace := strings.TrimSpace(cfg.Fleet.HerdrWorkspace)
+	if workspace == "" {
+		workspace = strings.TrimSpace(os.Getenv("HERDR_WORKSPACE_ID"))
+	}
+	if workspace == "" {
+		return nil, fmt.Errorf("forge reconciliation observer: Herdr workspace is required")
+	}
+	registration, err := coordinator.Resolve(".")
+	if err != nil {
+		return nil, fmt.Errorf("forge reconciliation observer: coordinator binding: %w", err)
+	}
+	control := herdr.TabBinding{}
+	if registration.Workspace == workspace && registration.TabID != "" && registration.PaneID != "" && registration.TerminalID != "" {
+		control = herdr.TabBinding{
+			TabID: registration.TabID, Workspace: registration.Workspace, PaneID: registration.PaneID,
+			TerminalID: registration.TerminalID, Role: "coordinator", ControlSeat: true,
+		}
+	}
+	root, err := canonicalHerdRoot()
+	if err != nil {
+		return nil, fmt.Errorf("forge reconciliation observer: repository root: %w", err)
+	}
+	completion := &herdrControlCompletionProof{mailbox: mail.NewMailbox(filepath.Join(root, ".herd", "control-mail.jsonl"))}
+	return &herdr.ProductionReconciliationObserver{
+		Workspace: workspace, ControlBinding: control,
+		Reader: herdr.SocketAuthorityReader{}, Record: (&herdr.JSONLRecorder{Path: ".herd/reconciliation.jsonl"}).Record,
+		TaskBinding: func(_ context.Context, tab herdr.TabRecord, agent herdr.AgentEntry) herdr.Authority[herdr.TabBinding] {
+			if strings.TrimSpace(agent.Cwd) == "" {
+				return herdr.Authority[herdr.TabBinding]{State: herdr.EvidenceError, Detail: "task context cwd is unavailable"}
+			}
+			tc, readErr := dispatch.ReadTaskContext(agent.Cwd)
+			if readErr != nil {
+				return herdr.Authority[herdr.TabBinding]{State: herdr.EvidenceError, Detail: readErr.Error()}
+			}
+			verifier, verifyErr := dispatch.LoadVerifier(root)
+			if verifyErr != nil {
+				return herdr.Authority[herdr.TabBinding]{State: herdr.EvidenceError, Detail: verifyErr.Error()}
+			}
+			if verifyErr = verifier.Verify(tc); verifyErr != nil {
+				return herdr.Authority[herdr.TabBinding]{State: herdr.EvidenceError, Detail: verifyErr.Error()}
+			}
+			candidateSHA, candidateErr := verifiedTaskCandidate(agent.Cwd, tc.CandidateSHA)
+			if candidateErr != nil {
+				return herdr.Authority[herdr.TabBinding]{State: herdr.EvidenceError, Detail: candidateErr.Error()}
+			}
+			return herdr.Authority[herdr.TabBinding]{State: herdr.EvidencePresent, Value: herdr.TabBinding{
+				TabID: tab.TabID, Workspace: tab.WorkspaceID, PaneID: agent.PaneID, TaskRef: tc.TaskRef, CandidateSHA: candidateSHA, LeaseGeneration: tc.LeaseGeneration, Role: tc.Role,
+			}}
+		},
+		Completion: completion,
+	}, nil
+}
+
+type herdrControlCompletionProof struct {
+	mailbox *mail.Mailbox
+}
+
+// verifiedTaskCandidate authenticates a task candidate against its managed
+// worktree. Generationless contexts may derive the candidate from a clean
+// HEAD; signed candidates only require that HEAD still names that candidate.
+func verifiedTaskCandidate(worktree, candidateSHA string) (string, error) {
+	if candidateSHA == "" {
+		return verifiedTaskHead(worktree)
+	}
+	head, err := taskWorktreeHead(worktree)
+	if err != nil {
+		return "", err
+	}
+	if candidateSHA != head {
+		return "", fmt.Errorf("task context candidate %s does not match worktree HEAD %s", candidateSHA, head)
+	}
+	return candidateSHA, nil
+}
+
+// verifiedTaskHead authenticates the candidate identity against the actual
+// managed worktree. A signed context with no candidate_sha is completed by
+// HEAD only when the worktree is clean; a dirty tree or unreadable git state
+// cannot authorize generationless reconciliation.
+func verifiedTaskHead(worktree string) (string, error) {
+	statusCmd := exec.Command("git", "-C", worktree, "status", "--porcelain", "--untracked-files=all")
+	status, err := statusCmd.CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("read task worktree status: %w", err)
+	}
+	if strings.TrimSpace(string(status)) != "" {
+		return "", fmt.Errorf("task worktree is dirty; refusing completion fallback")
+	}
+	return taskWorktreeHead(worktree)
+}
+
+func taskWorktreeHead(worktree string) (string, error) {
+	headCmd := exec.Command("git", "-C", worktree, "rev-parse", "HEAD")
+	head, err := headCmd.CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("read task worktree HEAD: %w", err)
+	}
+	sha := strings.TrimSpace(string(head))
+	if sha == "" {
+		return "", fmt.Errorf("task worktree HEAD is empty")
+	}
+	return sha, nil
+}
+
+func (p *herdrControlCompletionProof) CompletedTaskProof(ctx context.Context, req herdr.CompletedTaskProofRequest) herdr.Authority[herdr.CompletedTaskProof] {
+	if p == nil || p.mailbox == nil || req.TaskRef == "" || req.LeaseGeneration <= 0 {
+		return herdr.Authority[herdr.CompletedTaskProof]{State: herdr.EvidenceError, Detail: "completion proof request is incomplete"}
+	}
+	envelopes, err := p.mailbox.ReadInboxContext(ctx, mail.CoordinatorInbox)
+	if err != nil {
+		return herdr.Authority[herdr.CompletedTaskProof]{State: herdr.EvidenceError, Detail: err.Error()}
+	}
+	var best mail.Callback
+	var bestSeq int64
+	for _, envelope := range envelopes {
+		if !strings.HasPrefix(envelope.Subject, string(mail.CallbackComplete)+":") {
+			continue
+		}
+		var callback mail.Callback
+		if err := json.Unmarshal([]byte(envelope.Body), &callback); err != nil {
+			return herdr.Authority[herdr.CompletedTaskProof]{State: herdr.EvidenceError, Detail: fmt.Sprintf("completion callback %s is corrupt: %v", envelope.ID, err)}
+		}
+		if callback.Kind == mail.CallbackComplete && callback.Ref == req.TaskRef && callback.SHA != "" && callback.LeaseGeneration == req.LeaseGeneration && (req.CandidateSHA == "" || callback.SHA == req.CandidateSHA) && envelope.Sequence >= bestSeq {
+			best, bestSeq = callback, envelope.Sequence
+		}
+	}
+	if best.Ref == "" {
+		return herdr.Authority[herdr.CompletedTaskProof]{State: herdr.EvidenceAbsent, Detail: "no exact durable completion callback"}
+	}
+	return herdr.Authority[herdr.CompletedTaskProof]{State: herdr.EvidencePresent, Value: herdr.CompletedTaskProof{
+		TaskRef: best.Ref, CandidateSHA: best.SHA, Complete: true, Authenticated: true,
+	}}
+}
+
+func deriveCoordinatorControlBinding(root, workspace string, agents []herdr.AgentEntry) (herdr.TabBinding, error) {
+	root = filepath.Clean(root)
+	var matches []herdr.AgentEntry
+	for _, agent := range agents {
+		if agent.Workspace == workspace && agent.Name == "" && agent.Kind != "" &&
+			agent.TabID != "" && agent.PaneID != "" && agent.TerminalID != "" &&
+			filepath.Clean(agent.Cwd) == root && filepath.Clean(agent.ForegroundCwd) == root {
+			matches = append(matches, agent)
+		}
+	}
+	if len(matches) != 1 {
+		return herdr.TabBinding{}, fmt.Errorf("coordinator control binding: expected one canonical-root agent, found %d", len(matches))
+	}
+	agent := matches[0]
+	return herdr.TabBinding{TabID: agent.TabID, Workspace: workspace, PaneID: agent.PaneID, TerminalID: agent.TerminalID, Role: "coordinator", ControlSeat: true}, nil
+}
+
+func bindCoordinatorControlTab(root, workspace string) (herdr.TabBinding, error) {
+	canonicalRoot, err := canonicalHerdRoot()
+	if err != nil {
+		return herdr.TabBinding{}, fmt.Errorf("coordinator control binding: resolve root: %w", err)
+	}
+	agents, err := herdr.AgentList()
+	if err != nil {
+		return herdr.TabBinding{}, fmt.Errorf("coordinator control binding: agent inventory: %w", err)
+	}
+	binding, err := deriveCoordinatorControlBinding(canonicalRoot, workspace, agents)
+	if err != nil {
+		return herdr.TabBinding{}, err
+	}
+	if _, err := coordinator.BindTab(root, workspace, binding.TabID, binding.PaneID, binding.TerminalID); err != nil {
+		return herdr.TabBinding{}, err
+	}
+	return binding, nil
+}
+
 func (d *cliForgeDriver) Log(msg string) { fmt.Println(msg) }
 
 func (d *cliForgeDriver) ObserveReconciliation(ctx context.Context) error {
@@ -8470,6 +8707,14 @@ func forgeLoopMain() int {
 		return 1
 	}
 	fmt.Printf("herd forge --loop: coordinator registered as %q (workspace=%s)\n", coordReg.Name, coordReg.Workspace)
+	workspace := strings.TrimSpace(cfg.Fleet.HerdrWorkspace)
+	if workspace == "" {
+		workspace = strings.TrimSpace(os.Getenv("HERDR_WORKSPACE_ID"))
+	}
+	if _, bindErr := bindCoordinatorControlTab(".", workspace); bindErr != nil {
+		fmt.Fprintf(os.Stderr, "forge --loop: coordinator control binding failed: %v\n", bindErr)
+		return 1
+	}
 
 	controlLoop, closeControl, controlErr := forgeControlReconciler(".", cfg)
 	if controlErr != nil {
@@ -8498,10 +8743,10 @@ func forgeLoopMain() int {
 		})
 	}
 
-	observer := &herdr.ProductionReconciliationObserver{
-		Workspace: forgeWorkspace,
-		Reader:    herdr.SocketAuthorityReader{},
-		Record:    (&herdr.JSONLRecorder{Path: ".herd/reconciliation.jsonl"}).Record,
+	observer, observerErr := newProductionForgeObserver(cfg)
+	if observerErr != nil {
+		fmt.Fprintf(os.Stderr, "forge --loop: %v\n", observerErr)
+		return 1
 	}
 	driver := &cliForgeDriver{cfg: cfg, maxLanes: *maxLanes, observer: observer}
 

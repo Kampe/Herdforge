@@ -8,6 +8,9 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	"github.com/Kampe/Herdforge/pkg/config"
+	"github.com/Kampe/Herdforge/pkg/herdr"
 )
 
 // The CLI tests exec the built binary ~70 times. Linking it once keeps the
@@ -39,6 +42,110 @@ func TestForgeDriverBlocksCapacityWhenReconciliationUnavailable(t *testing.T) {
 	}
 	if state.Busy != 3 || state.Max != 3 {
 		t.Fatalf("blocked reconciliation exposed capacity: %+v", state)
+	}
+}
+
+func TestNewProductionForgeObserverBindsWorkspaceAndDurableRecorder(t *testing.T) {
+	observer, err := newProductionForgeObserver(&config.Config{Fleet: config.FleetConfig{HerdrWorkspace: "wK"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if observer.Workspace != "wK" {
+		t.Fatalf("workspace = %q, want wK", observer.Workspace)
+	}
+	if _, ok := observer.Reader.(herdr.SocketAuthorityReader); !ok {
+		t.Fatalf("reader = %T, want SocketAuthorityReader", observer.Reader)
+	}
+	if observer.Record == nil {
+		t.Fatal("production observer has no JSONL recorder")
+	}
+}
+
+func TestNewProductionForgeObserverUsesAuthoritativeWorkspaceFallback(t *testing.T) {
+	t.Setenv("HERDR_WORKSPACE_ID", "wK")
+	observer, err := newProductionForgeObserver(&config.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if observer.Workspace != "wK" {
+		t.Fatalf("workspace = %q, want wK", observer.Workspace)
+	}
+}
+
+func TestDeriveCoordinatorControlBindingFromLiveWKTabShape(t *testing.T) {
+	root := filepath.Clean(t.TempDir())
+	binding, err := deriveCoordinatorControlBinding(root, "wK", []herdr.AgentEntry{
+		{Kind: "codex", TabID: "wK:t2", PaneID: "wK:p2", TerminalID: "term_65903f1bf062c1f", Workspace: "wK", Cwd: root, ForegroundCwd: root, Status: "working"},
+		{Kind: "codex", Name: "task-fac-304", TabID: "wK:t60", PaneID: "wK:p60", TerminalID: "term_task", Workspace: "wK", Cwd: root + "/.herd/worktrees/fac-304", ForegroundCwd: root + "/.herd/worktrees/fac-304", Status: "working"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if binding.TabID != "wK:t2" || binding.PaneID != "wK:p2" || binding.TerminalID == "" || !binding.ControlSeat || binding.Role != "coordinator" {
+		t.Fatalf("binding=%+v, want exact coordinator control incarnation", binding)
+	}
+}
+
+func TestVerifiedTaskHeadDerivesEmptyCandidateSHAFromCleanTempGit(t *testing.T) {
+	root := t.TempDir()
+	for _, args := range [][]string{{"init", "-q"}, {"config", "user.email", "test@example.invalid"}, {"config", "user.name", "test"}, {"config", "commit.gpgSign", "false"}} {
+		if out, err := exec.Command("git", append([]string{"-C", root}, args...)...).CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v (%s)", args, err, out)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(root, "TASK-CONTEXT.json"), []byte("fixture"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command("git", "-C", root, "add", "TASK-CONTEXT.json").CombinedOutput(); err != nil {
+		t.Fatalf("git add: %v (%s)", err, out)
+	}
+	if out, err := exec.Command("git", "-C", root, "commit", "-qm", "fixture").CombinedOutput(); err != nil {
+		t.Fatalf("git commit: %v (%s)", err, out)
+	}
+	head, err := exec.Command("git", "-C", root, "rev-parse", "HEAD").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := verifiedTaskHead(root)
+	if err != nil || got != strings.TrimSpace(string(head)) {
+		t.Fatalf("verifiedTaskHead=%q err=%v, want %q", got, err, strings.TrimSpace(string(head)))
+	}
+	if err := os.WriteFile(filepath.Join(root, "dirty"), []byte("no fallback"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := verifiedTaskHead(root); err == nil {
+		t.Fatal("dirty task worktree must fail closed")
+	}
+}
+
+func TestVerifiedTaskCandidateChecksSignedHEADWithoutRejectingUntrackedFiles(t *testing.T) {
+	root := t.TempDir()
+	for _, args := range [][]string{{"init", "-q"}, {"config", "user.email", "test@example.invalid"}, {"config", "user.name", "test"}, {"config", "commit.gpgSign", "false"}} {
+		if out, err := exec.Command("git", append([]string{"-C", root}, args...)...).CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v (%s)", args, err, out)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(root, "fixture"), []byte("fixture"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command("git", "-C", root, "add", "fixture").CombinedOutput(); err != nil {
+		t.Fatalf("git add: %v (%s)", err, out)
+	}
+	if out, err := exec.Command("git", "-C", root, "commit", "-qm", "fixture").CombinedOutput(); err != nil {
+		t.Fatalf("git commit: %v (%s)", err, out)
+	}
+	head, err := taskWorktreeHead(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "unrelated"), []byte("untracked"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := verifiedTaskCandidate(root, head); err != nil || got != head {
+		t.Fatalf("verifiedTaskCandidate=%q err=%v, want signed HEAD %q despite untracked files", got, err, head)
+	}
+	if _, err := verifiedTaskCandidate(root, "0000000000000000000000000000000000000000"); err == nil {
+		t.Fatal("signed candidate mismatch must fail closed")
 	}
 }
 

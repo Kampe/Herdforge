@@ -14,6 +14,14 @@ type fixtureReader struct {
 	binding Authority[TabBinding]
 }
 
+type fixtureCompletionProof struct {
+	proof Authority[CompletedTaskProof]
+}
+
+func (f fixtureCompletionProof) CompletedTaskProof(context.Context, CompletedTaskProofRequest) Authority[CompletedTaskProof] {
+	return f.proof
+}
+
 func (f fixtureReader) ListTabs(context.Context, string) (Authority[[]TabRecord], error) {
 	return f.tabs, nil
 }
@@ -86,6 +94,105 @@ func TestProductionObserverUnavailableAuthorityBlocks(t *testing.T) {
 	}
 	if data, err := os.ReadFile(path); err != nil || len(data) == 0 {
 		t.Fatalf("missing durable blocked evidence: err=%v bytes=%d", err, len(data))
+	}
+}
+
+func TestProductionObserverRecognizesDurableCoordinatorControlBindingWithoutGeneration(t *testing.T) {
+	r := fixtureReader{
+		tabs:   present([]TabRecord{{TabID: "wK:t2", WorkspaceID: "wK", Label: "1", AgentStatus: "working"}}),
+		agents: present([]AgentEntry{{Kind: "codex", TabID: "wK:t2", PaneID: "wK:p2", TerminalID: "term-coordinator", Workspace: "wK", Status: "working"}}),
+	}
+	o := &ProductionReconciliationObserver{
+		Workspace: "wK", Reader: r,
+		ControlBinding: TabBinding{TabID: "wK:t2", Workspace: "wK", PaneID: "wK:p2", TerminalID: "term-coordinator", Role: "coordinator", ControlSeat: true},
+	}
+	if err := o.ObserveReconciliation(context.Background()); err != nil {
+		t.Fatalf("coordinator control tab must not require a task generation: %v", err)
+	}
+	decisions := o.Decisions()
+	if len(decisions) != 1 || decisions[0].Class != TabStanding || decisions[0].CloseEligible {
+		t.Fatalf("decisions=%+v, want preserved standing control seat", decisions)
+	}
+}
+
+func TestProductionObserverStillBlocksWorkerWithoutGeneration(t *testing.T) {
+	r := fixtureReader{
+		tabs:    present([]TabRecord{{TabID: "wK:t60", WorkspaceID: "wK", Label: "Herdforge · task-fac-304", AgentStatus: "working"}}),
+		agents:  present([]AgentEntry{{Kind: "codex", Name: "task-fac-304", TabID: "wK:t60", PaneID: "wK:p60", TerminalID: "term-worker", Workspace: "wK", Status: "working"}}),
+		binding: present(TabBinding{TabID: "wK:t60", Workspace: "wK", PaneID: "wK:p60", TaskRef: "FAC-304"}),
+	}
+	o := &ProductionReconciliationObserver{
+		Workspace: "wK", Reader: r,
+		ControlBinding: TabBinding{TabID: "wK:t2", Workspace: "wK", PaneID: "wK:p2", TerminalID: "term-coordinator", Role: "coordinator", ControlSeat: true},
+	}
+	if err := o.ObserveReconciliation(context.Background()); err == nil {
+		t.Fatal("worker tab without durable immutable generation must remain blocked")
+	}
+	if got := o.Decisions()[0]; got.Class != TabBlocked || got.Evidence[0] != "BLOCKED: missing immutable tab generation" {
+		t.Fatalf("decision=%+v, want missing-generation block", got)
+	}
+}
+
+func TestProductionObserverAllowsIdleGenerationlessTaskWithDurableCompletionProof(t *testing.T) {
+	const candidate = "53f868c9"
+	r := fixtureReader{
+		tabs:   present([]TabRecord{{TabID: "wK:t60", WorkspaceID: "wK", Label: "Herdforge · task-fac-304", AgentStatus: "idle"}}),
+		agents: present([]AgentEntry{{Kind: "codex", Name: "task-fac-304", TabID: "wK:t60", PaneID: "wK:p60", Workspace: "wK", Status: "idle"}}),
+	}
+	o := &ProductionReconciliationObserver{
+		Workspace: "wK", Reader: r,
+		TaskBinding: func(context.Context, TabRecord, AgentEntry) Authority[TabBinding] {
+			return present(TabBinding{TabID: "wK:t60", Workspace: "wK", PaneID: "wK:p60", TaskRef: "FAC-304", CandidateSHA: candidate, LeaseGeneration: 10, Role: "worker"})
+		},
+		Completion: fixtureCompletionProof{proof: present(CompletedTaskProof{TaskRef: "FAC-304", CandidateSHA: candidate, Complete: true, Authenticated: true})},
+	}
+	if err := o.ObserveReconciliation(context.Background()); err != nil {
+		t.Fatalf("durably completed idle lane must not block reconciliation: %v", err)
+	}
+	decisions := o.Decisions()
+	if len(decisions) != 1 || decisions[0].Class != TabSafeFinished || decisions[0].CloseEligible || decisions[0].Generation != "" {
+		t.Fatalf("decisions=%+v, want retained generationless safe-finished lane", decisions)
+	}
+}
+
+func TestProductionObserverAllowsDoneGenerationlessTaskWithEmptyContextCandidate(t *testing.T) {
+	const candidate = "a55955a2"
+	r := fixtureReader{
+		tabs:   present([]TabRecord{{TabID: "wK:t60", WorkspaceID: "wK", Label: "Herdforge · task-fac-304", AgentStatus: "done"}}),
+		agents: present([]AgentEntry{{Kind: "codex", Name: "task-fac-304", TabID: "wK:t60", PaneID: "wK:p60", Workspace: "wK", Status: "done"}}),
+	}
+	o := &ProductionReconciliationObserver{
+		Workspace: "wK", Reader: r,
+		TaskBinding: func(context.Context, TabRecord, AgentEntry) Authority[TabBinding] {
+			return present(TabBinding{TabID: "wK:t60", Workspace: "wK", PaneID: "wK:p60", TaskRef: "FAC-304", LeaseGeneration: 10, Role: "worker"})
+		},
+		Completion: fixtureCompletionProof{proof: present(CompletedTaskProof{TaskRef: "FAC-304", CandidateSHA: candidate, Complete: true, Authenticated: true})},
+	}
+	if err := o.ObserveReconciliation(context.Background()); err != nil {
+		t.Fatalf("done generationless lane with HEAD-derived candidate must not block: %v", err)
+	}
+	if got := o.Decisions()[0]; got.Class != TabSafeFinished || got.CloseEligible || got.Generation != "" {
+		t.Fatalf("decision=%+v, want retained generationless safe-finished lane", got)
+	}
+}
+
+func TestProductionObserverDoesNotUseCompletionProofForActiveGenerationlessTask(t *testing.T) {
+	r := fixtureReader{
+		tabs:   present([]TabRecord{{TabID: "wK:t60", WorkspaceID: "wK", AgentStatus: "working"}}),
+		agents: present([]AgentEntry{{Kind: "codex", Name: "task-fac-304", TabID: "wK:t60", PaneID: "wK:p60", Workspace: "wK", Status: "working"}}),
+	}
+	o := &ProductionReconciliationObserver{
+		Workspace: "wK", Reader: r,
+		TaskBinding: func(context.Context, TabRecord, AgentEntry) Authority[TabBinding] {
+			return present(TabBinding{TabID: "wK:t60", Workspace: "wK", PaneID: "wK:p60", TaskRef: "FAC-304", CandidateSHA: "53f868c9", LeaseGeneration: 10, Role: "worker"})
+		},
+		Completion: fixtureCompletionProof{proof: present(CompletedTaskProof{TaskRef: "FAC-304", CandidateSHA: "53f868c9", Complete: true, Authenticated: true})},
+	}
+	if err := o.ObserveReconciliation(context.Background()); err == nil {
+		t.Fatal("active generationless worker must remain blocked")
+	}
+	if got := o.Decisions()[0]; got.Class != TabBlocked || got.Evidence[0] != "BLOCKED: missing immutable tab generation" {
+		t.Fatalf("decision=%+v, want missing-generation block", got)
 	}
 }
 
