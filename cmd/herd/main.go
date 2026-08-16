@@ -3800,6 +3800,12 @@ func dispatchTicketDecision(ctx context.Context, req dispatchRequest, announce i
 	expectedRevision, expectedFiles := publishedGraphBinding(".")
 	d := dispatch.NewProductionDispatcherWithAuthorities(cfg, tp, wm,
 		scopeVerifier, scopeVerifier, expectedRevision, expectedFiles)
+	// A fresh checkout may not have a previously published scopefence row.
+	// Dispatch's dependency gate can still establish the authoritative graph,
+	// so bind run-state admission to that same provider-backed snapshot instead
+	// of rejecting the first dispatch with an empty published revision.
+	depStore := deps.StoreFor(tp, cfg.TaskProvider.ProjectID)
+	d.Deps = depStore
 	runStates, err := runstate.Open(filepath.Join(".herd", "dispatch-runs.db"))
 	if err != nil {
 		return nil, nil, fmt.Errorf("dispatch runstate store: %w", err)
@@ -3807,10 +3813,21 @@ func dispatchTicketDecision(ctx context.Context, req dispatchRequest, announce i
 	defer runStates.Close()
 	d.RunStates = runStates
 	d.RunStateGraph = func(context.Context) (string, error) {
-		if strings.TrimSpace(expectedRevision) == "" {
-			return "", errors.New("published dependency graph revision is empty")
+		if strings.TrimSpace(expectedRevision) != "" {
+			return expectedRevision, nil
 		}
-		return expectedRevision, nil
+		snapshot, snapshotErr := depStore.SnapshotGraph(context.Background())
+		if snapshotErr != nil {
+			return "", fmt.Errorf("dependency graph snapshot: %w", snapshotErr)
+		}
+		if snapshot == nil {
+			return "", errors.New("dependency graph snapshot returned empty revision")
+		}
+		revision := deps.GraphRevision(snapshot.Edges, nil, snapshot.ProviderRevision)
+		if strings.TrimSpace(revision) == "" {
+			return "", errors.New("dependency graph snapshot returned empty revision")
+		}
+		return revision, nil
 	}
 	// FAC-147: production board mutations go through ClaimStack Begin/Complete.
 	stack, stackErr := loadClaimStack(tp)
