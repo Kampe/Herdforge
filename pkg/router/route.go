@@ -405,6 +405,17 @@ func PiBareModel(model string) string {
 
 // HarnessArgvFor returns the signed Pi harness and exact interactive argv.
 func HarnessArgvFor(provider, model, effort string) (string, []string, error) {
+	// Local Herdr mode launches the routed vendor CLI directly. The Pi adapter
+	// is retained for hosted/legacy sessions, but requiring it on a developer
+	// machine makes a perfectly healthy native Codex/Claude install look
+	// unavailable and can open the wrong authentication surface.
+	if localDirectHarness() {
+		argv := ArgvFor(provider, model, effort)
+		if len(argv) == 0 {
+			return "", nil, fmt.Errorf("no direct harness argv contract for %s/%s", provider, model)
+		}
+		return strings.ToLower(strings.TrimSpace(provider)), argv, nil
+	}
 	piModel, err := PiModelFor(provider, model)
 	if err != nil {
 		return "", nil, err
@@ -580,6 +591,9 @@ func NewRouter(engine *usage.QuotaEngine, computed map[string]usage.BurnState) *
 }
 
 func cliFor(provider string) string {
+	if localDirectHarness() {
+		return provider
+	}
 	switch provider {
 	case "codex":
 		return PiHarness
@@ -587,6 +601,11 @@ func cliFor(provider string) string {
 		return "opencode"
 	}
 	return provider
+}
+
+func localDirectHarness() bool {
+	mode := strings.ToLower(strings.TrimSpace(os.Getenv("HERD_MODE")))
+	return mode == "local" || mode == "dev" || mode == "development"
 }
 
 // GlobalStateDir mirrors herdr_global_state_dir. Exported so writers of the

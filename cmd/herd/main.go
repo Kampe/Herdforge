@@ -3950,6 +3950,12 @@ func dispatchTicketDecision(ctx context.Context, req dispatchRequest, announce i
 			return dispatchErr
 		})
 		if err != nil {
+			// launchAdmission can fail after the coordination lease is acquired
+			// (for example, a missing native harness probe). Release that exact
+			// lease before returning so a failed launch never blocks the next tick.
+			if relErr := releaseCoordinationLease(ctx, dispatchRoot, leaseKey, "coordinator-dispatch", leaseGen); relErr != nil {
+				return nil, nil, fmt.Errorf("dispatch launch failed: %w; LEASE COMPENSATION ALSO FAILED: %v", err, relErr)
+			}
 			return nil, nil, fmt.Errorf("dispatch launch failed: %w", err)
 		}
 		// launchAdmission already validated lane capability before any side effect.
