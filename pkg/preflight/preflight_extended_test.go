@@ -40,6 +40,20 @@ func TestCheckWorktreeBoundary_SkipsVendor(t *testing.T) {
 	}
 }
 
+func TestCheckWorktreeBoundary_SkipsGeneratedHerdBootstrap(t *testing.T) {
+	tmpDir := t.TempDir()
+	bootstrap := filepath.Join(tmpDir, ".herd", "bootstrap", "cache", "module.go")
+	if err := os.MkdirAll(filepath.Dir(bootstrap), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(bootstrap, []byte("// generated cache: /Users/toolchain\npackage cache\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := CheckWorktreeBoundary(tmpDir); err != nil {
+		t.Fatalf("expected generated .herd/bootstrap cache to be skipped, got: %v", err)
+	}
+}
+
 func TestCheckWorktreeBoundary_IgnoresNonCheckedExts(t *testing.T) {
 	tmpDir := t.TempDir()
 	// .png files with absolute paths should be ignored

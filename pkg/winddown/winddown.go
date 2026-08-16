@@ -67,6 +67,25 @@ func New(path string, clock Clock) (*Authority, error) {
 	return &Authority{path: path, clock: clock, local: make(chan struct{}, 1)}, nil
 }
 
+// Initialize creates the first safe, disabled posture when state is missing.
+// Existing valid state is preserved so initialization is restart-safe; corrupt
+// or unreadable state is returned to the caller rather than repaired blindly.
+// The actor and reason become durable audit evidence for the initialization.
+func (a *Authority) Initialize(ctx context.Context, actor, reason string) (State, error) {
+	if err := ctx.Err(); err != nil {
+		return State{}, err
+	}
+	state, err := a.Read(ctx)
+	switch {
+	case err == nil:
+		return state, nil
+	case !errors.Is(err, ErrStateMissing):
+		return State{}, err
+	default:
+		return a.Update(ctx, false, actor, reason, 1, nil)
+	}
+}
+
 // Update applies a posture at generation. Equal retries are idempotent; every other
 // update must fence the currently durable generation with a strictly larger token.
 func (a *Authority) Update(ctx context.Context, enabled bool, actor, reason string, generation uint64, deadline *time.Time) (State, error) {

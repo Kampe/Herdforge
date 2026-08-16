@@ -32,6 +32,12 @@ func CheckWorktreeBoundary(rootDir string) error {
 				name == ".claude" || name == ".codebuddy" || name == ".kiro" {
 				return fs.SkipDir
 			}
+			// .herd/bootstrap is a generated dependency cache. Its mirrored
+			// module sources may contain host paths by design; the tracked
+			// repository boundary remains covered outside this runtime subtree.
+			if path == filepath.Join(".herd", "bootstrap") {
+				return fs.SkipDir
+			}
 			fullPath := filepath.Join(rootDir, path)
 			if gitdir.IsNestedGitDir(fullPath, rootDir) {
 				return fs.SkipDir

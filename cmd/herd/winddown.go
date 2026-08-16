@@ -31,6 +31,14 @@ func newWinddownAuthority() (*winddown.Authority, error) {
 	return winddown.New(path, nil)
 }
 
+func initializeWinddownState() (winddown.State, error) {
+	a, err := newWinddownAuthority()
+	if err != nil {
+		return winddown.State{}, err
+	}
+	return a.Initialize(context.Background(), "herd-init", "initialized")
+}
+
 // requireFleetAdmission is the one production posture gate for work that can
 // claim or re-engage fleet capacity. Missing, corrupt, and unreadable state
 // are deliberately rejected by Authority.Gate.

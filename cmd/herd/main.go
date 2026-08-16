@@ -607,6 +607,10 @@ func runInit() {
 		fmt.Fprintf(os.Stderr, "failed to create .herd directory: %v\n", err)
 		os.Exit(1)
 	}
+	if _, err := initializeWinddownState(); err != nil {
+		fmt.Fprintf(os.Stderr, "failed to initialize wind-down state: %v\n", err)
+		os.Exit(1)
+	}
 
 	if _, err := os.Stat(cfgPath); err == nil {
 		fmt.Println(".herd/herd.yaml already exists.")
@@ -655,6 +659,10 @@ func runInitFull() {
 
 	if err := os.MkdirAll(herdDir, 0755); err != nil {
 		fmt.Fprintf(os.Stderr, "failed to create .herd directory: %v\n", err)
+		os.Exit(1)
+	}
+	if _, err := initializeWinddownState(); err != nil {
+		fmt.Fprintf(os.Stderr, "failed to initialize wind-down state: %v\n", err)
 		os.Exit(1)
 	}
 

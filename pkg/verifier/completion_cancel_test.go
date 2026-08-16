@@ -18,6 +18,13 @@ func TestRunShell_NilContextFailsClosed(t *testing.T) {
 	}
 }
 
+func TestRunShellUsesHermeticGitConfiguration(t *testing.T) {
+	t.Setenv("GIT_CONFIG_GLOBAL", "/tmp/host-gitconfig")
+	if !runShell(context.Background(), t.TempDir(), `sh -c 'test "$GIT_CONFIG_GLOBAL" = /dev/null && test "$GIT_CONFIG_SYSTEM" = /dev/null && test "$GIT_CONFIG_NOSYSTEM" = 1'`) {
+		t.Fatal("completion gate inherited host Git configuration")
+	}
+}
+
 // TestRunShellCancellationKillsProcessGroup proves FAC-192: completion-gate
 // cancel reaps the full Setpgid tree via procsignal, not leader-only kill.
 // Wait for a live background child, then cancel — same barrier as execute.
