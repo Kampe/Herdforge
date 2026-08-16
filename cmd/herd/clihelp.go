@@ -56,6 +56,7 @@ var subcommandUsage = map[string]string{
 	"preflight":        "Usage: herd preflight\n  Workspace boundary, merge policy, and fleet readiness scanner.",
 	"preflight-static": "Usage: herd preflight-static\n  Workspace boundary, signal literal, and merge policy scanner.",
 	"verify":           "Usage: herd verify [--build cmd] [--test cmd] [worktree]\n  Completion gate: real commits + build + tests.",
+	"finish":           "Usage: herd finish <ref> --landed-sha <sha> [--receipt path] [--branch branch] [--worktree path]\n  Coordinator-only post-merge readiness gate; never mutates the board.",
 	"selftest":         "Usage: herd selftest\n  Run self-test assertion suite against the active repository.",
 	"status":           "Usage: herd status\n  Show herd workspace / daemon status.",
 	"timeline":         "Usage: herd timeline [--file path] [--task ref] [--lane name] [--source name] [--type type]\n  Read chronological, filterable execution-event envelopes.",
