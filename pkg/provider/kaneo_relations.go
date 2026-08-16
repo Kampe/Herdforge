@@ -113,6 +113,11 @@ func (k *KaneoProvider) preferHTTPForRelations() bool {
 // otherwise fall through to N CLI subprocesses (use_cli without API key).
 var ErrGraphCredentialsRequired = errors.New("kaneo: project graph snapshot requires HTTP credentials (KANEO_API_KEY or kaneo profile api_key); refusing silent CLI relation fan-out")
 
+const (
+	KaneoGraphDeadlineThreshold = 64
+	KaneoGraphMinDeadline       = 2 * time.Minute
+)
+
 func (k *KaneoProvider) listRelationsHTTPOnly(ctx context.Context, taskID string) ([]Relation, error) {
 	// Single-task HTTP list: credentials optional (authorize when present).
 	// Project fan-out credentials are enforced in ListProjectRelations only.
@@ -170,10 +175,14 @@ func (k *KaneoProvider) ListProjectRelations(ctx context.Context, projectID stri
 		return nil, fmt.Errorf("%w (use_cli=%v api_url=%q)", ErrGraphCredentialsRequired, k.UseCLI, k.APIURL)
 	}
 	dls := k.deadlines()
-	ctx, cancel := WithOpDeadline(ctx, dls, OpList)
+	// Keep ordinary task listing on the configured list deadline. Relation
+	// snapshots are a separate, bounded graph operation and retain the
+	// large-board extension: boards with 64+ tasks get at least two minutes
+	// for the relation fan-out, while a caller deadline still wins.
+	listCtx, cancel := WithOpDeadline(ctx, dls, OpList)
 	defer cancel()
 
-	tasks, err := k.ListTasks(ctx, projectID, "")
+	tasks, err := k.ListTasks(listCtx, projectID, "")
 	if err != nil {
 		return nil, fmt.Errorf("kaneo ListProjectRelations list tasks: %w", err)
 	}
@@ -190,6 +199,12 @@ func (k *KaneoProvider) ListProjectRelations(ctx context.Context, projectID stri
 		ids = append(ids, t.ID)
 	}
 	sort.Strings(ids)
+	graphDeadline := dls.For(OpList)
+	if len(ids) >= KaneoGraphDeadlineThreshold && graphDeadline < KaneoGraphMinDeadline {
+		graphDeadline = KaneoGraphMinDeadline
+	}
+	graphCtx, graphCancel := context.WithTimeout(ctx, graphDeadline)
+	defer graphCancel()
 
 	conc := k.BulkConcurrency
 	if conc <= 0 {
@@ -220,7 +235,7 @@ func (k *KaneoProvider) ListProjectRelations(ctx context.Context, projectID stri
 		if end > len(ids) {
 			end = len(ids)
 		}
-		batchCtx, batchCancel := context.WithCancel(ctx)
+		batchCtx, batchCancel := context.WithCancel(graphCtx)
 		jobs := make(chan string)
 		outCh := make(chan result, end-start)
 		var wg sync.WaitGroup
@@ -237,7 +252,7 @@ func (k *KaneoProvider) ListProjectRelations(ctx context.Context, projectID stri
 					}
 					rels, e := k.listRelationsHTTPOnly(batchCtx, id)
 					if e != nil {
-						outCh <- result{taskID: id, err: AsTimeout("kaneo", "ListProjectRelations", OpList, dls.For(OpList), e)}
+						outCh <- result{taskID: id, err: AsTimeout("kaneo", "ListProjectRelations", OpList, graphDeadline, e)}
 						batchCancel()
 						return
 					}
@@ -268,12 +283,12 @@ func (k *KaneoProvider) ListProjectRelations(ctx context.Context, projectID stri
 			}
 			byTask[r.taskID] = r.rels
 		}
-		if err := ctx.Err(); err != nil {
-			return nil, AsTimeout("kaneo", "ListProjectRelations", OpList, dls.For(OpList), err)
+		if err := graphCtx.Err(); err != nil {
+			return nil, AsTimeout("kaneo", "ListProjectRelations", OpList, graphDeadline, err)
 		}
 	}
-	if err := ctx.Err(); err != nil {
-		return nil, AsTimeout("kaneo", "ListProjectRelations", OpList, dls.For(OpList), err)
+	if err := graphCtx.Err(); err != nil {
+		return nil, AsTimeout("kaneo", "ListProjectRelations", OpList, graphDeadline, err)
 	}
 
 	// Dual-end agreement: every relation id must appear with identical fields
