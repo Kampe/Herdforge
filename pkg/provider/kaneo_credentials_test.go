@@ -425,6 +425,35 @@ func TestNewFromHerdConfig_CustomKeyEnvUsesOperatorOrigin(t *testing.T) {
 	}
 }
 
+func TestNewFromHerdConfig_UsesAuthenticatedProfileWhenEnvUnset(t *testing.T) {
+	root := t.TempDir()
+	withUserConfigDir(t, root)
+	writeKaneoConfig(t, root, kaneoCLIAuthConfig{
+		DefaultProfile: "default",
+		Profiles: map[string]kaneoCLIProfile{
+			"default": {APIKey: "profile-key", APIURL: "https://kanban.example.test"},
+		},
+	})
+	t.Setenv("KANEO_API_KEY", "")
+	t.Setenv("KANEO_API_URL", "")
+
+	tp, err := NewFromHerdConfig(&config.Config{TaskProvider: config.TaskProvider{
+		Type: "kaneo", ProjectID: "proj", UseCLI: true,
+		APIURL: "https://kanban.example.test",
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	k := tp.(*BoundClient).Inner.(*KaneoProvider)
+	if k.APIKey != "profile-key" {
+		t.Fatalf("profile credential not loaded")
+	}
+	want, _ := canonicalizeHTTPOrigin("https://kanban.example.test")
+	if k.KeyTrustedOrigin != want {
+		t.Fatalf("profile origin = %q, want %q", k.KeyTrustedOrigin, want)
+	}
+}
+
 // TestCanonicalizeHTTPOrigin_EffectivePortAndRejects.
 func TestCanonicalizeHTTPOrigin_EffectivePortAndRejects(t *testing.T) {
 	o1, err := canonicalizeHTTPOrigin("https://Example.COM/path")

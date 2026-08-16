@@ -47,6 +47,16 @@ func NewFromHerdConfig(cfg *config.Config) (TaskProvider, error) {
 		}
 		if apiKey != "" {
 			trustedOrigin = resolveOperatorTrustedOrigin()
+		} else {
+			// Reuse the authenticated Kaneo CLI profile when its origin matches
+			// the independently configured provider origin. Never scan arbitrary
+			// profiles or trust the repository URL as an authority.
+			profile := ResolveKaneoProfileCred()
+			configuredOrigin, originErr := canonicalizeHTTPOrigin(cfg.TaskProvider.APIURL)
+			if profile.Key != "" && originErr == nil && profile.TrustedOrigin == configuredOrigin {
+				apiKey = profile.Key
+				trustedOrigin = profile.TrustedOrigin
+			}
 		}
 	}
 	return NewProductionProvider(TaskConfig{
