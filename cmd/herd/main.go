@@ -144,6 +144,9 @@ func main() {
 	case "verify":
 		runVerify()
 
+	case "finish":
+		runFinish()
+
 	case "verify-fac151":
 		runFAC151Hermetic()
 
