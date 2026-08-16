@@ -133,6 +133,9 @@ func TestInit(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(tmpDir, ".herd", "herd.yaml")); os.IsNotExist(err) {
 		t.Error(".herd/herd.yaml should exist")
 	}
+	if _, err := os.Stat(filepath.Join(tmpDir, ".herd", "winddown.json")); os.IsNotExist(err) {
+		t.Error(".herd/winddown.json should exist")
+	}
 }
 
 func TestInitTwice(t *testing.T) {
