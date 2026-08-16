@@ -3849,14 +3849,20 @@ func dispatchTicketDecision(ctx context.Context, req dispatchRequest, announce i
 		}
 		return revision, nil
 	}
-	// FAC-147: production board mutations go through ClaimStack Begin/Complete.
-	stack, stackErr := loadClaimStack(tp)
-	if stackErr != nil {
-		fmt.Fprintf(os.Stderr, "claim stack: %v\n", stackErr)
-		os.Exit(1)
+	// FAC-147: hosted board mutations go through ClaimStack Begin/Complete.
+	// Local Herdr mode uses the authenticated single-user Kaneo client directly;
+	// requiring a separate fence broker would turn a local checkout into a
+	// hosted control plane before it can launch its first task.
+	var stack *provider.ClaimStack
+	if production {
+		stack, err = loadClaimStack(tp)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "claim stack: %v\n", err)
+			os.Exit(1)
+		}
+		defer stack.Close()
+		d.Claims = stack
 	}
-	defer stack.Close()
-	d.Claims = stack
 	// FAC-222: embed the coordinator's reply target in every TASK-PACKET.md.
 	// Resolve from the durable registration; absence falls back to the
 	// well-known default name (dispatch.coordinatorName handles that).
