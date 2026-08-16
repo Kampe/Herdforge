@@ -15,6 +15,7 @@ import (
 	"github.com/Kampe/Herdforge/pkg/config"
 	"github.com/Kampe/Herdforge/pkg/deps"
 	"github.com/Kampe/Herdforge/pkg/eligibility"
+	"github.com/Kampe/Herdforge/pkg/lifecycle"
 	"github.com/Kampe/Herdforge/pkg/mail"
 	"github.com/Kampe/Herdforge/pkg/reviewledger"
 	"github.com/Kampe/Herdforge/pkg/router"
@@ -314,6 +315,9 @@ func postShotCallback(root, ref, kind, sha, detail string, lease int64) error {
 		if cb.SHA == "" {
 			return fmt.Errorf("--report complete requires --sha <exact 40-character commit SHA>")
 		}
+		if err := recordShotLifecycleLease(root, ref, lease, cb.SHA); err != nil {
+			return err
+		}
 	case string(mail.CallbackBlocked):
 		cb.Kind = mail.CallbackBlocked
 		if cb.Detail == "" {
@@ -327,6 +331,70 @@ func postShotCallback(root, ref, kind, sha, detail string, lease int64) error {
 		return fmt.Errorf("post callback: %w", err)
 	}
 	return nil
+}
+
+// recordShotLifecycleLease makes the builder callback's lease evidence visible
+// to the canonical completion/review path. Dispatch normally creates this
+// state before launch; the callback is also the recovery boundary for older
+// worktrees that have a valid signed task receipt but no lifecycle row yet.
+// Same-generation retries are idempotent; stale or conflicting evidence is
+// rejected rather than overwriting the durable record.
+func recordShotLifecycleLease(root, ref string, lease int64, sha string) error {
+	if strings.TrimSpace(root) == "" || strings.TrimSpace(ref) == "" {
+		return fmt.Errorf("shot: lifecycle evidence requires repository root and task ref")
+	}
+	if lease <= 0 {
+		return fmt.Errorf("shot: lifecycle evidence requires a positive lease generation")
+	}
+	if !validShotSHA(strings.TrimSpace(sha)) {
+		return fmt.Errorf("shot: lifecycle evidence requires an exact candidate SHA")
+	}
+	if err := os.MkdirAll(filepath.Join(root, ".herd"), 0o700); err != nil {
+		return fmt.Errorf("shot: create lifecycle state directory: %w", err)
+	}
+	machine, err := lifecycle.NewMachine(filepath.Join(root, ".herd", "lifecycle.db"))
+	if err != nil {
+		return fmt.Errorf("shot: open lifecycle machine: %w", err)
+	}
+	defer machine.Close()
+	current, err := machine.EventStore().CurrentState(ref)
+	if err != nil {
+		return fmt.Errorf("shot: read lifecycle state: %w", err)
+	}
+	if current != nil {
+		if current.LeaseGeneration != lease {
+			return fmt.Errorf("shot: lifecycle lease generation %d conflicts with reported %d", current.LeaseGeneration, lease)
+		}
+		if current.CandidateSHA != "" && current.CandidateSHA != sha {
+			return fmt.Errorf("shot: lifecycle candidate %s conflicts with reported %s", current.CandidateSHA, sha)
+		}
+		return nil
+	}
+	if _, err := machine.Transition(lifecycle.TransitionRequest{
+		TaskRef:         ref,
+		Repo:            "herdforge",
+		To:              lifecycle.StateEligible,
+		Actor:           "worker",
+		IdempotencyKey:  fmt.Sprintf("shot:%s:lease:%d:candidate:%s", strings.ToLower(ref), lease, sha),
+		LeaseGeneration: lease,
+		Branch:          "herd/" + strings.ToLower(ref),
+		CandidateSHA:    sha,
+	}); err != nil {
+		return fmt.Errorf("shot: record lifecycle lease: %w", err)
+	}
+	return nil
+}
+
+func validShotSHA(value string) bool {
+	if len(value) != 40 {
+		return false
+	}
+	for _, r := range value {
+		if !(r >= '0' && r <= '9') && !(r >= 'a' && r <= 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 // shotVerify runs the configured verification command against the exact
