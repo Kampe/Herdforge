@@ -43,16 +43,23 @@ func TestDrainCLI_ExitContracts(t *testing.T) {
 
 	cmd := exec.Command(binary, "drain", "--json")
 	cmd.Dir, cmd.Env = repo, env
-	out, err := cmd.CombinedOutput()
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	err := cmd.Run()
 	if err != nil {
-		t.Fatalf("json must exit 0: %v\n%s", err, out)
+		t.Fatalf("json must exit 0: %v\nstdout:\n%s\nstderr:\n%s", err, stdout.String(), stderr.String())
 	}
 	var packet map[string]json.RawMessage
-	if err := json.Unmarshal(out, &packet); err != nil {
-		t.Fatalf("invalid JSON: %v\n%s", err, out)
+	if err := json.Unmarshal(stdout.Bytes(), &packet); err != nil {
+		t.Fatalf("invalid JSON: %v\n%s", err, stdout.String())
 	}
 	if len(packet) == 0 || packet["kaneo_ok"] == nil {
-		t.Fatalf("missing fixed packet keys: %s", out)
+		t.Fatalf("missing fixed packet keys: %s", stdout.String())
+	}
+	for _, phase := range []string{"phase=harvest-scan", "phase=review-scan"} {
+		if !strings.Contains(stderr.String(), phase) {
+			t.Fatalf("stderr missing %q: %s", phase, stderr.String())
+		}
 	}
 	// --act in a repo with no compiled authority (no .herd/herd.yaml, no board
 	// provider) must refuse and exit non-zero without launching anything.
@@ -69,7 +76,7 @@ func TestDrainCLI_ExitContracts(t *testing.T) {
 	cmd = exec.Command(binary, "drain", "--selftest")
 	cmd.Dir = repo
 	cmd.Env = env
-	out, err = cmd.CombinedOutput()
+	out, err := cmd.CombinedOutput()
 	if err != nil || !strings.Contains(string(out), "selftest: PASS") || !strings.Contains(string(out), "FAC-182") {
 		t.Fatalf("selftest did not complete against compiled adapters: %v\n%s", err, out)
 	}
@@ -85,6 +92,94 @@ func TestDrainCLI_ExitContracts(t *testing.T) {
 		t.Fatalf("negative bounds must fail: %s", out)
 	} else if ee, ok := err.(*exec.ExitError); !ok || ee.ExitCode() != 2 {
 		t.Fatalf("negative bound exit=%v output=%s", err, out)
+	}
+}
+
+func TestDrainCLI_ProgressUsesStderrAndQuietSuppressesIt(t *testing.T) {
+	t.Setenv("GIT_CONFIG_GLOBAL", filepath.Join(t.TempDir(), "gitconfig"))
+	binary := buildHerd(t)
+	repo := t.TempDir()
+	runGitT(t, repo, "init", "-q", "-b", "main")
+	runGitT(t, repo, "config", "user.email", "drain-progress@test")
+	runGitT(t, repo, "config", "user.name", "drain-progress")
+	runGitT(t, repo, "commit", "--allow-empty", "-q", "-m", "base")
+	runGitT(t, repo, "update-ref", "refs/remotes/origin/main", "HEAD")
+	ledger := filepath.Join(repo, "ledger.jsonl")
+	if err := os.WriteFile(ledger, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	env := append(os.Environ(), "HERD_REVIEW_LEDGER="+ledger, "HERD_STATE_DIR="+filepath.Join(repo, "state"))
+
+	run := func(args ...string) (string, string, error) {
+		t.Helper()
+		cmd := exec.Command(binary, args...)
+		cmd.Dir, cmd.Env = repo, env
+		var stdout, stderr bytes.Buffer
+		cmd.Stdout, cmd.Stderr = &stdout, &stderr
+		err := cmd.Run()
+		return stdout.String(), stderr.String(), err
+	}
+
+	for _, tc := range []struct {
+		name  string
+		args  []string
+		check func(t *testing.T, stdout string)
+	}{
+		{
+			name: "normal",
+			args: []string{"drain"},
+			check: func(t *testing.T, stdout string) {
+				t.Helper()
+				if !strings.Contains(stdout, "=== server faster: review pile ===") {
+					t.Fatalf("normal report missing from stdout: %s", stdout)
+				}
+			},
+		},
+		{
+			name: "json",
+			args: []string{"drain", "--json"},
+			check: func(t *testing.T, stdout string) {
+				t.Helper()
+				var packet map[string]json.RawMessage
+				if err := json.Unmarshal([]byte(stdout), &packet); err != nil || packet["kaneo_ok"] == nil {
+					t.Fatalf("stdout is not the fixed JSON packet: %v\n%s", err, stdout)
+				}
+			},
+		},
+		{
+			name: "commands",
+			args: []string{"drain", "--commands"},
+			check: func(t *testing.T, stdout string) {
+				t.Helper()
+				if !strings.Contains(stdout, "=== server faster: review pile ===") {
+					t.Fatalf("commands report missing from stdout: %s", stdout)
+				}
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			stdout, stderr, err := run(tc.args...)
+			if tc.name == "json" && err != nil {
+				t.Fatalf("JSON drain must exit 0: %v\nstdout:\n%s\nstderr:\n%s", err, stdout, stderr)
+			}
+			tc.check(t, stdout)
+			if strings.Contains(stdout, "phase=") {
+				t.Fatalf("phase progress leaked to stdout: %s", stdout)
+			}
+			for _, phase := range []string{"phase=harvest-scan", "phase=review-scan"} {
+				if !strings.Contains(stderr, phase) {
+					t.Fatalf("stderr missing %q: %s", phase, stderr)
+				}
+			}
+		})
+	}
+
+	stdout, stderr, _ := run("drain", "--quiet")
+	if !strings.Contains(stdout, "herd-drain: pressure=") {
+		t.Fatalf("quiet summary missing from stdout: %s", stdout)
+	}
+	if strings.Contains(stderr, "phase=") {
+		t.Fatalf("quiet output must suppress phase progress: %s", stderr)
 	}
 }
 

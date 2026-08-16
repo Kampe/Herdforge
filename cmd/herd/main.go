@@ -6214,6 +6214,9 @@ func runDrainCommand(args []string, out, errOut io.Writer) int {
 	} else if !*asJSON {
 		fmt.Fprintf(errOut, "herd-drain: UNKNOWN Kaneo review-cap posture: %v\n", cfgErr)
 	}
+	if !*quiet {
+		fmt.Fprintln(errOut, "herd-drain: phase=harvest-scan")
+	}
 	h := harvest.NewHarvester(root)
 	harvestResult, err := h.Harvest(context.Background())
 	if err != nil {
@@ -6225,6 +6228,9 @@ func runDrainCommand(args []string, out, errOut io.Writer) int {
 		fmt.Fprintf(errOut, "herd-drain: UNKNOWN harvest input: %s\n", harvestErr)
 	}
 	d := review.Drain{RepoRoot: root, StateDir: os.Getenv("HERD_STATE_DIR"), LedgerPath: ledgerPath, Cap: cap, StaleBehind: stale, Provider: tp}
+	if !*quiet {
+		fmt.Fprintln(errOut, "herd-drain: phase=review-scan")
+	}
 	report, err := d.Scan(context.Background(), harvestResult.UnmergedWorktrees)
 	if err != nil {
 		fmt.Fprintf(errOut, "herd-drain: %v\n", err)
