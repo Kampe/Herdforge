@@ -2,8 +2,8 @@
   "version": 1,
   "task": "FAC-309",
   "source_root": "chainseer/bin",
-  "source_revision": "527371eb580112f54c1c92785b86885b1510e9bb",
-  "source_executable_count": 123,
+  "source_revision": "ad284cc5d599229affa04c84114875f1ca9b4b71",
+  "source_executable_count": 124,
   "entries": [
     {
       "path": "bin/agent-finish",
@@ -780,6 +780,17 @@
       "path": "bin/install-shared-checkout-hooks",
       "disposition": "chainseer_product_exemption",
       "rationale": "Chainseer product, deployment, data, release, or repository-specific wrapper; it is not a Herdforge control-plane surface."
+    },
+    {
+      "path": "bin/lane-stash-guard",
+      "disposition": "generic_capability",
+      "capability_tickets": [
+        "FAC-304",
+        "FAC-306",
+        "FAC-307",
+        "FAC-308"
+      ],
+      "rationale": "Generic worker or control-plane capability is tracked for Herdforge parity and has no exact command replacement yet."
     },
     {
       "path": "bin/merge-matrix-append",
