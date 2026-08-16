@@ -61,11 +61,8 @@ func hardCloseTab(tabID, name string) error {
 	if tabID == "" && name == "" {
 		return fmt.Errorf("hard close: empty tab and name")
 	}
-	var closeErr error
-	if tabID != "" {
-		closeErr = TabClose(tabID)
-	}
 	deadline := time.Now().Add(12 * time.Second)
+	closeAttempted := false
 	for time.Now().Before(deadline) {
 		agents, err := AgentList()
 		if err != nil {
@@ -75,24 +72,28 @@ func hardCloseTab(tabID, name string) error {
 		for _, a := range agents {
 			if (tabID != "" && a.TabID == tabID) || (name != "" && a.Name == name) {
 				found = true
-				// Retry close if still present.
-				if a.TabID != "" {
-					_ = TabClose(a.TabID)
+				if !closeAttempted {
+					if a.StateChangeSeq == 0 {
+						return fmt.Errorf("FAC-133 cleanup: tab %s has no immutable generation", a.TabID)
+					}
+					if err := TabCloseCAS(CloseRequest{
+						WorkspaceID: a.Workspace,
+						TabID:       a.TabID,
+						Generation:  strconv.FormatUint(a.StateChangeSeq, 10),
+						TabRevision: a.Revision,
+						Nonce:       "live-proof-close-" + strconv.FormatInt(time.Now().UnixNano(), 36),
+					}); err != nil {
+						return fmt.Errorf("FAC-133 cleanup compare-and-close: %w", err)
+					}
+					closeAttempted = true
 				}
 				break
 			}
 		}
 		if !found {
-			if closeErr != nil {
-				// Close reported error but agent is gone — absence is what matters.
-				return nil
-			}
 			return nil
 		}
 		time.Sleep(150 * time.Millisecond)
-	}
-	if closeErr != nil {
-		return fmt.Errorf("FAC-133 cleanup: tab %s / name %s still present after close (%v)", tabID, name, closeErr)
 	}
 	return fmt.Errorf("FAC-133 cleanup: tab %s / name %s still present after close", tabID, name)
 }
