@@ -3890,6 +3890,14 @@ func dispatchTicketDecision(ctx context.Context, req dispatchRequest, announce i
 	// that cannot possibly launch a provider-capable agent never strands a
 	// lease on the ticket.
 	if !noLaunch {
+		// The broker authenticates receipt-bound requests and therefore needs
+		// the coordinator's published verification key before self-start. Load
+		// the isolated coordinator signer here; dispatch later reuses it for
+		// the task receipt and never exposes the private key to a worker.
+		if _, signerErr := dispatch.LoadSignerForConfig(cfg.Project.Name, dispatchRoot); signerErr != nil {
+			fmt.Fprintf(os.Stderr, "dispatch refused — receipt authority: %v\n", signerErr)
+			os.Exit(1)
+		}
 		sock, sockErr := brokerSocketPath(dispatch.RepositoryIdentityOrName(dispatchRoot, cfg.Project.Name))
 		if sockErr != nil {
 			fmt.Fprintf(os.Stderr, "dispatch: %v\n", sockErr)
