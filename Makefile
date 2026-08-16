@@ -1,6 +1,6 @@
 # Herdforge Makefile
 
-.PHONY: all build test test-unit test-contracts test-hermetic-compile test-coverage test-mutation test-race test-e2e preflight lint security security-test security-deps self-test herd-up clean ci package-inventory
+.PHONY: all build test test-unit test-contracts test-hermetic-compile test-coverage test-mutation test-race test-e2e preflight lint security security-test security-deps self-test herd-up clean ci package-inventory bin-parity
 
 # FAC-135: shared hermetic Git environment for every gate. Host signing, hooks,
 # and ambient credentials must not influence fixtures or coverage.
@@ -114,6 +114,11 @@ lint:
 	$(MAKE) package-inventory
 	$(MAKE) security
 	$(MAKE) security-deps
+	$(MAKE) bin-parity
+
+bin-parity:
+	@echo "==> Checking Chainseer executable parity provenance (FAC-309)..."
+	CHAINSEER_BIN="$${CHAINSEER_BIN:-../../../../chainseer/bin}" $(HERMETIC_GIT) go run ./scripts/binparity
 
 security:
 	./scripts/security-gate.zsh
