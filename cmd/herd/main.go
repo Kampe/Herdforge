@@ -78,6 +78,11 @@ import (
 const version = "0.2.0-dev"
 
 func main() {
+	// A normal checkout is a local Herdr client. Hosted control-plane behavior
+	// remains explicit via HERD_MODE=production (or HERD_CONTROL_SECRET).
+	if _, set := os.LookupEnv("HERD_MODE"); !set && strings.TrimSpace(os.Getenv("HERD_CONTROL_SECRET")) == "" {
+		_ = os.Setenv("HERD_MODE", "local")
+	}
 	if len(os.Args) < 2 {
 		printUsage()
 		os.Exit(0)
@@ -3798,8 +3803,17 @@ func dispatchTicketDecision(ctx context.Context, req dispatchRequest, announce i
 	// the published graph snapshot carries. herd scope publish prints it.
 	scopeVerifier := scopeauth.New()
 	expectedRevision, expectedFiles := publishedGraphBinding(".")
-	d := dispatch.NewProductionDispatcherWithAuthorities(cfg, tp, wm,
-		scopeVerifier, scopeVerifier, expectedRevision, expectedFiles)
+	production := productionMode()
+	var d *dispatch.Dispatcher
+	if production {
+		d = dispatch.NewProductionDispatcherWithAuthorities(cfg, tp, wm,
+			scopeVerifier, scopeVerifier, expectedRevision, expectedFiles)
+	} else {
+		// Local mode keeps the same router, worktree isolation, Herdr API, and
+		// receipt evidence, while avoiding hosted-only MAC/signer/confinement
+		// prerequisites that cannot exist on a normal single-user checkout.
+		d = dispatch.NewDispatcher(cfg, tp, wm)
+	}
 	// A fresh checkout may not have a previously published scopefence row.
 	// Dispatch's dependency gate can still establish the authoritative graph,
 	// so bind run-state admission to that same provider-backed snapshot instead
@@ -3843,9 +3857,12 @@ func dispatchTicketDecision(ctx context.Context, req dispatchRequest, announce i
 	if reg, rerr := coordinator.Resolve("."); rerr == nil {
 		d.CoordinatorName = reg.Name
 	}
-	closeControl, err := configureProductionControl(d, ".")
-	if err != nil {
-		return nil, nil, fmt.Errorf("control store init failed: %w", err)
+	closeControl := func() error { return nil }
+	if production {
+		closeControl, err = configureProductionControl(d, ".")
+		if err != nil {
+			return nil, nil, fmt.Errorf("control store init failed: %w", err)
+		}
 	}
 	defer closeControl()
 	var decision *router.LaunchDecision
@@ -3889,7 +3906,7 @@ func dispatchTicketDecision(ctx context.Context, req dispatchRequest, announce i
 	// FAC-145: broker ADMISSION precedes the durable claim — a dispatch
 	// that cannot possibly launch a provider-capable agent never strands a
 	// lease on the ticket.
-	if !noLaunch {
+	if !noLaunch && production {
 		// The broker authenticates receipt-bound requests and therefore needs
 		// the coordinator's published verification key before self-start. Load
 		// the isolated coordinator signer here; dispatch later reuses it for
