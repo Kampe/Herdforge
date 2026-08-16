@@ -3,8 +3,11 @@ package candidateindex
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -204,4 +207,282 @@ reviewed-head: 123-bad-sha
 			t.Errorf("candidate %s expected blocked reasons, got empty", c.Ref)
 		}
 	}
+}
+
+func TestCandidateIndex_SelectsNewestCandidateEvidenceDeterministically(t *testing.T) {
+	dir := t.TempDir()
+	ledgerPath := filepath.Join(dir, "ledger.jsonl")
+	queuePath := filepath.Join(dir, "queue.jsonl")
+
+	oldSHA := "1111111111111111111111111111111111111111"
+	newSHA := "2222222222222222222222222222222222222222"
+	rows := []reviewledger.LedgerRow{
+		{Timestamp: "2026-08-16T00:00:00Z", Event: string(reviewledger.EventRecord), SHA: oldSHA, Task: "FAC-312"},
+		{Timestamp: "2026-08-16T01:00:00Z", Event: string(reviewledger.EventVerdict), SHA: oldSHA, Task: "FAC-312", Verdict: string(reviewledger.VerdictFAIL)},
+		{Timestamp: "2026-08-16T02:00:00Z", Event: string(reviewledger.EventRecord), SHA: newSHA, Task: "FAC-312"},
+		{Timestamp: "2026-08-16T03:00:00Z", Event: string(reviewledger.EventVerdict), SHA: newSHA, Task: "FAC-312", Verdict: string(reviewledger.VerdictPASS)},
+	}
+	f, err := os.Create(ledgerPath)
+	if err != nil {
+		t.Fatalf("create ledger: %v", err)
+	}
+	enc := json.NewEncoder(f)
+	for _, row := range rows {
+		if err := enc.Encode(row); err != nil {
+			t.Fatalf("write ledger row: %v", err)
+		}
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("close ledger: %v", err)
+	}
+	if err := os.WriteFile(queuePath, nil, 0644); err != nil {
+		t.Fatalf("create queue: %v", err)
+	}
+
+	idx := New(IndexOptions{RepoRoot: dir, LedgerPath: ledgerPath, QueuePath: queuePath})
+	for run := 0; run < 100; run++ {
+		cands, err := idx.BuildIndex(context.Background())
+		if err != nil {
+			t.Fatalf("BuildIndex run %d: %v", run, err)
+		}
+		if len(cands) != 1 {
+			t.Fatalf("run %d: expected one candidate, got %d", run, len(cands))
+		}
+		if got := cands[0].CandidateSHA; got != newSHA {
+			t.Fatalf("run %d: expected newest SHA %s, got %s", run, newSHA, got)
+		}
+		if got := cands[0].Verdict; got != string(reviewledger.VerdictPASS) {
+			t.Fatalf("run %d: expected newest PASS verdict, got %s", run, got)
+		}
+		if got := cands[0].State; got != StateEligible {
+			t.Fatalf("run %d: expected newest candidate eligible, got %s", run, got)
+		}
+	}
+}
+
+func TestCandidateIndex_WorktreeHEADSupersedesStaleBlockedCallback(t *testing.T) {
+	dir := t.TempDir()
+	mailPath := filepath.Join(dir, "mail.jsonl")
+	worktreesDir := filepath.Join(dir, "worktrees")
+	worktree := filepath.Join(worktreesDir, "fac-304")
+	if err := os.MkdirAll(worktree, 0755); err != nil {
+		t.Fatalf("create worktree: %v", err)
+	}
+	runGit := func(args ...string) {
+		cmd := exec.Command("git", append([]string{"-c", "core.hooksPath=/dev/null", "-c", "commit.gpgsign=false", "-C", worktree}, args...)...)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+	runGit("init", "-q")
+	runGit("config", "user.email", "test@example.invalid")
+	runGit("config", "user.name", "candidate-index-test")
+	if err := os.WriteFile(filepath.Join(worktree, "candidate.txt"), []byte("current\n"), 0644); err != nil {
+		t.Fatalf("write candidate: %v", err)
+	}
+	runGit("add", "candidate.txt")
+	runGit("commit", "-qm", "current candidate")
+	out, err := exec.Command("git", "-C", worktree, "rev-parse", "HEAD").Output()
+	if err != nil {
+		t.Fatalf("resolve current candidate: %v", err)
+	}
+	currentSHA := strings.TrimSpace(string(out))
+	anchorSHA := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	callbackBody, err := json.Marshal(mail.Callback{
+		Ref:             "FAC-304",
+		Kind:            mail.CallbackBlocked,
+		SHA:             anchorSHA,
+		Detail:          "stale anchor callback",
+		LeaseGeneration: 10,
+	})
+	if err != nil {
+		t.Fatalf("marshal callback: %v", err)
+	}
+	mailFile, err := os.Create(mailPath)
+	if err != nil {
+		t.Fatalf("create mail: %v", err)
+	}
+	if err := json.NewEncoder(mailFile).Encode(mail.Envelope{
+		ID:        "stale-anchor",
+		Sequence:  1,
+		Sender:    "worker",
+		Recipient: mail.CoordinatorInbox,
+		Subject:   "blocked: FAC-304",
+		Body:      string(callbackBody),
+		Timestamp: time.Date(2026, 8, 16, 0, 0, 0, 0, time.UTC),
+	}); err != nil {
+		t.Fatalf("write callback: %v", err)
+	}
+	if err := mailFile.Close(); err != nil {
+		t.Fatalf("close mail: %v", err)
+	}
+
+	idx := New(IndexOptions{RepoRoot: dir, MailPath: mailPath, WorktreesDir: worktreesDir})
+	cands, err := idx.BuildIndex(context.Background())
+	if err != nil {
+		t.Fatalf("BuildIndex failed: %v", err)
+	}
+	if len(cands) != 1 {
+		t.Fatalf("expected one candidate, got %d", len(cands))
+	}
+	c := cands[0]
+	if c.CandidateSHA != currentSHA {
+		t.Fatalf("expected live worktree SHA %s, got %s", currentSHA, c.CandidateSHA)
+	}
+	if c.State == StateBlocked || len(c.BlockedReasons) != 0 {
+		t.Fatalf("stale callback blocked current candidate: state=%s reasons=%v evidence=%v", c.State, c.BlockedReasons, c.BlockedEvidence)
+	}
+	if !containsCandidateSource(c.Sources, SourceWorktree) {
+		t.Fatalf("expected worktree provenance, got %v", c.Sources)
+	}
+	if c.WorktreePath != worktree {
+		t.Fatalf("expected worktree path %s, got %s", worktree, c.WorktreePath)
+	}
+}
+
+func TestCandidateIndex_SelectsNewestAcrossCallbackLedgerAndWorktree(t *testing.T) {
+	dir := t.TempDir()
+	mailPath := filepath.Join(dir, "mail.jsonl")
+	ledgerPath := filepath.Join(dir, "ledger.jsonl")
+	queuePath := filepath.Join(dir, "queue.jsonl")
+	worktree := filepath.Join(dir, "worktrees", "fac-312")
+	if err := os.MkdirAll(worktree, 0755); err != nil {
+		t.Fatalf("create worktree: %v", err)
+	}
+	runGit := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", append([]string{"-c", "core.hooksPath=/dev/null", "-c", "commit.gpgsign=false", "-C", worktree}, args...)...)
+		cmd.Env = append(os.Environ(), "GIT_AUTHOR_DATE=2026-08-15T00:00:00Z", "GIT_COMMITTER_DATE=2026-08-15T00:00:00Z")
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+	runGit("init", "-q")
+	runGit("config", "user.email", "test@example.invalid")
+	runGit("config", "user.name", "candidate-index-test")
+	if err := os.WriteFile(filepath.Join(worktree, "candidate.txt"), []byte("old worktree candidate\n"), 0644); err != nil {
+		t.Fatalf("write candidate: %v", err)
+	}
+	runGit("add", "candidate.txt")
+	runGit("commit", "-qm", "old worktree candidate")
+	worktreeOut, err := exec.Command("git", "-C", worktree, "rev-parse", "HEAD").Output()
+	if err != nil {
+		t.Fatalf("resolve worktree candidate: %v", err)
+	}
+	worktreeSHA := strings.TrimSpace(string(worktreeOut))
+
+	callbackSHA := "1111111111111111111111111111111111111111"
+	ledgerSHA := "2222222222222222222222222222222222222222"
+	callbackBody, err := json.Marshal(mail.Callback{Ref: "FAC-312", Kind: mail.CallbackBlocked, SHA: callbackSHA, Detail: "old callback failure"})
+	if err != nil {
+		t.Fatalf("marshal callback: %v", err)
+	}
+	callbackFile, err := os.Create(mailPath)
+	if err != nil {
+		t.Fatalf("create mail: %v", err)
+	}
+	if err := json.NewEncoder(callbackFile).Encode(mail.Envelope{ID: "old-callback", Sequence: 1, Sender: "worker", Recipient: mail.CoordinatorInbox, Body: string(callbackBody), Timestamp: time.Date(2026, 8, 16, 1, 0, 0, 0, time.UTC)}); err != nil {
+		t.Fatalf("write callback: %v", err)
+	}
+	if err := callbackFile.Close(); err != nil {
+		t.Fatalf("close mail: %v", err)
+	}
+
+	ledgerFile, err := os.Create(ledgerPath)
+	if err != nil {
+		t.Fatalf("create ledger: %v", err)
+	}
+	if err := json.NewEncoder(ledgerFile).Encode(reviewledger.LedgerRow{Timestamp: "2026-08-16T02:00:00Z", Event: string(reviewledger.EventVerdict), SHA: ledgerSHA, Task: "FAC-312", Verdict: string(reviewledger.VerdictPASS)}); err != nil {
+		t.Fatalf("write ledger: %v", err)
+	}
+	if err := ledgerFile.Close(); err != nil {
+		t.Fatalf("close ledger: %v", err)
+	}
+	if err := os.WriteFile(queuePath, nil, 0644); err != nil {
+		t.Fatalf("create queue: %v", err)
+	}
+
+	idx := New(IndexOptions{RepoRoot: dir, MailPath: mailPath, LedgerPath: ledgerPath, QueuePath: queuePath, WorktreesDir: filepath.Join(dir, "worktrees")})
+	for run := 0; run < 100; run++ {
+		cands, err := idx.BuildIndex(context.Background())
+		if err != nil {
+			t.Fatalf("BuildIndex run %d: %v", run, err)
+		}
+		if len(cands) != 1 {
+			t.Fatalf("run %d: expected one candidate, got %d", run, len(cands))
+		}
+		c := cands[0]
+		if c.CandidateSHA != ledgerSHA {
+			t.Fatalf("run %d: expected newest ledger SHA %s, got %s (worktree=%s)", run, ledgerSHA, c.CandidateSHA, worktreeSHA)
+		}
+		if c.State != StateEligible || c.Verdict != string(reviewledger.VerdictPASS) {
+			t.Fatalf("run %d: newest candidate lost its PASS evidence: state=%s verdict=%s", run, c.State, c.Verdict)
+		}
+		if len(c.BlockedReasons) != 0 || len(c.BlockedEvidence) != 0 {
+			t.Fatalf("run %d: old callback evidence leaked onto newest SHA: reasons=%v evidence=%v", run, c.BlockedReasons, c.BlockedEvidence)
+		}
+	}
+}
+
+func TestCandidateIndex_LaterCompleteCallbackClearsSameLeaseBlock(t *testing.T) {
+	dir := t.TempDir()
+	mailPath := filepath.Join(dir, "mail.jsonl")
+	sha := "a0e39c7b67456121199180aba5fb758c9e03bf32"
+	mailFile, err := os.Create(mailPath)
+	if err != nil {
+		t.Fatalf("create mail: %v", err)
+	}
+	writeCallback := func(sequence int64, kind mail.CallbackKind, detail string) {
+		t.Helper()
+		body, marshalErr := json.Marshal(mail.Callback{
+			Ref:             "FAC-312",
+			Kind:            kind,
+			SHA:             sha,
+			Detail:          detail,
+			LeaseGeneration: 2,
+		})
+		if marshalErr != nil {
+			t.Fatalf("marshal callback: %v", marshalErr)
+		}
+		if encodeErr := json.NewEncoder(mailFile).Encode(mail.Envelope{
+			ID:        fmt.Sprintf("callback-%d", sequence),
+			Sequence:  sequence,
+			Sender:    "worker",
+			Recipient: mail.CoordinatorInbox,
+			Subject:   string(kind) + ": FAC-312",
+			Body:      string(body),
+			Timestamp: time.Unix(sequence, 0).UTC(),
+		}); encodeErr != nil {
+			t.Fatalf("write callback: %v", encodeErr)
+		}
+	}
+	writeCallback(10, mail.CallbackBlocked, "transient test failure")
+	writeCallback(11, mail.CallbackComplete, "")
+	if err := mailFile.Close(); err != nil {
+		t.Fatalf("close mail: %v", err)
+	}
+
+	cands, err := New(IndexOptions{RepoRoot: dir, MailPath: mailPath}).BuildIndex(context.Background())
+	if err != nil {
+		t.Fatalf("BuildIndex failed: %v", err)
+	}
+	if len(cands) != 1 {
+		t.Fatalf("expected one candidate, got %d", len(cands))
+	}
+	c := cands[0]
+	if c.CandidateSHA != sha || c.LeaseGeneration != 2 {
+		t.Fatalf("candidate identity changed while coalescing callbacks: %+v", c)
+	}
+	if c.State == StateBlocked || len(c.BlockedReasons) != 0 || len(c.BlockedEvidence) != 0 {
+		t.Fatalf("later complete callback did not clear same-lease block: state=%s reasons=%v evidence=%v", c.State, c.BlockedReasons, c.BlockedEvidence)
+	}
+}
+
+func containsCandidateSource(sources []CandidateSource, want CandidateSource) bool {
+	for _, source := range sources {
+		if source == want {
+			return true
+		}
+	}
+	return false
 }
