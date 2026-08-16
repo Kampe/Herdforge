@@ -1168,7 +1168,18 @@ func AgentStartWithDecision(name, kind, paneID string, req launch.Request) error
 		return fmt.Errorf("durable Herdr session generation is unavailable")
 	}
 	if lc == nil && localDirectMode() {
-		return agentStartProcess(name, kind, paneID, req.Decision.HarnessArgv[1:]...)
+		if err := agentStartProcess(name, kind, paneID, req.Decision.HarnessArgv[1:]...); err != nil {
+			return err
+		}
+		observation, err := verifyAgentLaunch(name, paneID, 15*time.Second)
+		if err != nil {
+			cleanupErr := compensateStartedProcessExact(name, paneID)
+			if cleanupErr != nil {
+				return errors.Join(fmt.Errorf("herdr launch %s: %w (%s)", observation.State, err, observation.Reason), fmt.Errorf("launch cleanup: %w", cleanupErr))
+			}
+			return fmt.Errorf("herdr launch %s: %w (%s)", observation.State, err, observation.Reason)
+		}
+		return nil
 	}
 	if lc == nil {
 		return fmt.Errorf("prepared tool-child lifecycle is required before process start")
