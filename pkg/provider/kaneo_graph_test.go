@@ -309,3 +309,87 @@ func TestKaneoListProjectRelations_DeadlineCancel(t *testing.T) {
 		t.Fatalf("no handler may complete normally after deadline, got %d", completed.Load())
 	}
 }
+
+// TestKaneoListProjectRelations_LargeBoardUsesBoundedBurst proves the large
+// board strategy scales the Kaneo-only fan-out without changing the ordinary
+// list deadline or allowing an unbounded number of requests in flight.
+func TestKaneoListProjectRelations_LargeBoardUsesBoundedBurst(t *testing.T) {
+	const n = 1500
+	var httpRels, inFlight, maxInFlight atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.Contains(r.URL.Path, "/api/task-relation/") {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		httpRels.Add(1)
+		current := inFlight.Add(1)
+		for {
+			old := maxInFlight.Load()
+			if current <= old || maxInFlight.CompareAndSwap(old, current) {
+				break
+			}
+		}
+		defer inFlight.Add(-1)
+		select {
+		case <-r.Context().Done():
+			return
+		case <-time.After(100 * time.Millisecond):
+		}
+		w.Header().Set("Content-Type", "application/json")
+		id := strings.TrimPrefix(r.URL.Path, "/api/task-relation/")
+		if id == "id-1" || id == fmt.Sprintf("id-%d", n) {
+			_, _ = fmt.Fprintf(w, `[{"id":"rel-1","sourceTaskId":"id-1","targetTaskId":"id-%d","relationType":"blocks"}]`, n)
+			return
+		}
+		_, _ = w.Write([]byte(`[]`))
+	}))
+	defer server.Close()
+
+	old := kaneoRunCLI
+	kaneoRunCLI = func(ctx context.Context, name string, args ...string) (*CLIResult, error) {
+		page := 1
+		for i, arg := range args {
+			if arg == "--page" && i+1 < len(args) {
+				_, _ = fmt.Sscanf(args[i+1], "%d", &page)
+			}
+		}
+		if page == 16 {
+			return &CLIResult{Stdout: []byte(`[]`)}, nil
+		}
+		if page < 1 || page > 15 {
+			t.Fatalf("unexpected task-list page %d", page)
+		}
+		tasks := make([]map[string]string, 0, 100)
+		for i := (page-1)*100 + 1; i <= page*100; i++ {
+			tasks = append(tasks, map[string]string{
+				"id": fmt.Sprintf("id-%d", i), "ref": fmt.Sprintf("FAC-%d", i),
+				"status": "to-do", "title": "t", "projectId": "proj",
+			})
+		}
+		body, _ := json.Marshal(tasks)
+		return &CLIResult{Stdout: body}, nil
+	}
+	defer func() { kaneoRunCLI = old }()
+
+	withUserConfigDir(t, t.TempDir())
+	t.Setenv("KANEO_API_KEY", "large-board-key")
+	t.Setenv("KANEO_API_URL", server.URL)
+	k := NewKaneoProvider(server.URL, "proj", true)
+	start := time.Now()
+	rels, err := k.ListProjectRelations(context.Background(), "proj")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rels) != 1 || rels[0].ID != "rel-1" {
+		t.Fatalf("want one dual-end relation, got %+v", rels)
+	}
+	if httpRels.Load() != n {
+		t.Fatalf("want %d relation reads, got %d", n, httpRels.Load())
+	}
+	if maxInFlight.Load() > DefaultKaneoLargeBoardConcurrency {
+		t.Fatalf("in-flight relation reads exceeded large-board bound: %d", maxInFlight.Load())
+	}
+	if elapsed := time.Since(start); elapsed >= 5*time.Second {
+		t.Fatalf("large-board snapshot did not finish in bounded time: %v", elapsed)
+	}
+}

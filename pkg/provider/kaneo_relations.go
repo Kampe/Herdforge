@@ -170,10 +170,10 @@ func (k *KaneoProvider) ListProjectRelations(ctx context.Context, projectID stri
 		return nil, fmt.Errorf("%w (use_cli=%v api_url=%q)", ErrGraphCredentialsRequired, k.UseCLI, k.APIURL)
 	}
 	dls := k.deadlines()
-	listCtx, listCancel := WithOpDeadline(ctx, dls, OpList)
+	ctx, cancel := WithOpDeadline(ctx, dls, OpList)
+	defer cancel()
 
-	tasks, err := k.ListTasks(listCtx, projectID, "")
-	listCancel()
+	tasks, err := k.ListTasks(ctx, projectID, "")
 	if err != nil {
 		return nil, fmt.Errorf("kaneo ListProjectRelations list tasks: %w", err)
 	}
@@ -194,76 +194,85 @@ func (k *KaneoProvider) ListProjectRelations(ctx context.Context, projectID stri
 	conc := k.BulkConcurrency
 	if conc <= 0 {
 		conc = DefaultBulkRelationConcurrency
+		if len(ids) > KaneoLargeBoardThreshold {
+			conc = DefaultKaneoLargeBoardConcurrency
+		}
+	}
+	if conc > MaxKaneoGraphConcurrency {
+		conc = MaxKaneoGraphConcurrency
 	}
 	if conc > len(ids) && len(ids) > 0 {
 		conc = len(ids)
 	}
-	// The relation API is task-addressed, so even bounded concurrency can need
-	// more than the ordinary list window. Give graph snapshots their own larger
-	// bounded window; ordinary list operations remain on the normal deadline.
-	graphDeadline := dls.For(OpList)
-	if len(ids) >= 64 && graphDeadline < 2*time.Minute {
-		graphDeadline = 2 * time.Minute
-	}
-	graphCtx, graphCancel := context.WithTimeout(ctx, graphDeadline)
-	defer graphCancel()
 
 	type result struct {
 		taskID string
 		rels   []Relation
 		err    error
 	}
-	jobs := make(chan string)
-	outCh := make(chan result, conc)
-	var wg sync.WaitGroup
-	workerCtx, workerCancel := context.WithCancel(graphCtx)
-	defer workerCancel()
-
-	worker := func() {
-		defer wg.Done()
-		for id := range jobs {
-			if workerCtx.Err() != nil {
-				outCh <- result{taskID: id, err: workerCtx.Err()}
-				return
-			}
-			rels, e := k.listRelationsHTTPOnly(workerCtx, id)
-			if e != nil {
-				outCh <- result{taskID: id, err: AsTimeout("kaneo", "ListProjectRelations", OpList, graphDeadline, e)}
-				workerCancel()
-				return
-			}
-			outCh <- result{taskID: id, rels: rels}
-		}
-	}
-	for i := 0; i < conc; i++ {
-		wg.Add(1)
-		go worker()
-	}
-	go func() {
-		defer close(jobs)
-		for _, id := range ids {
-			select {
-			case <-workerCtx.Done():
-				return
-			case jobs <- id:
-			}
-		}
-	}()
-	go func() {
-		wg.Wait()
-		close(outCh)
-	}()
-
+	// Process bounded batches instead of placing the entire board on one work
+	// queue. This keeps cancellation and in-flight request cardinality bounded
+	// for boards with thousands of tasks while preserving deterministic result
+	// assembly below.
 	byTask := map[string][]Relation{}
-	for r := range outCh {
-		if r.err != nil {
-			// Drain remaining without blocking forever.
-			workerCancel()
-			return nil, fmt.Errorf("kaneo ListProjectRelations task %s: %w", r.taskID, r.err)
+	for start := 0; start < len(ids); start += KaneoGraphBatchSize {
+		end := start + KaneoGraphBatchSize
+		if end > len(ids) {
+			end = len(ids)
 		}
-		byTask[r.taskID] = r.rels
+		batchCtx, batchCancel := context.WithCancel(ctx)
+		jobs := make(chan string)
+		outCh := make(chan result, end-start)
+		var wg sync.WaitGroup
+
+		worker := func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-batchCtx.Done():
+					return
+				case id, ok := <-jobs:
+					if !ok {
+						return
+					}
+					rels, e := k.listRelationsHTTPOnly(batchCtx, id)
+					if e != nil {
+						outCh <- result{taskID: id, err: AsTimeout("kaneo", "ListProjectRelations", OpList, dls.For(OpList), e)}
+						batchCancel()
+						return
+					}
+					outCh <- result{taskID: id, rels: rels}
+				}
+			}
+		}
+		for i := 0; i < conc; i++ {
+			wg.Add(1)
+			go worker()
+		}
+		go func() {
+			defer close(jobs)
+			for _, id := range ids[start:end] {
+				select {
+				case <-batchCtx.Done():
+					return
+				case jobs <- id:
+				}
+			}
+		}()
+		wg.Wait()
+		batchCancel()
+		close(outCh)
+		for r := range outCh {
+			if r.err != nil {
+				return nil, fmt.Errorf("kaneo ListProjectRelations task %s: %w", r.taskID, r.err)
+			}
+			byTask[r.taskID] = r.rels
+		}
+		if err := ctx.Err(); err != nil {
+			return nil, AsTimeout("kaneo", "ListProjectRelations", OpList, dls.For(OpList), err)
+		}
 	}
-	if err := graphCtx.Err(); err != nil {
+	if err := ctx.Err(); err != nil {
 		return nil, AsTimeout("kaneo", "ListProjectRelations", OpList, dls.For(OpList), err)
 	}
 
