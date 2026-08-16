@@ -2,6 +2,7 @@ package verifier
 
 import (
 	"context"
+	"os"
 	"os/exec"
 	"strings"
 	"syscall"
@@ -102,6 +103,14 @@ func runShell(ctx context.Context, dir, command string) bool {
 	}
 	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
 	cmd.Dir = dir
+	// Completion verification must not inherit host Git signing, hooks, or
+	// config. A worker/coordinator gate is about the candidate's build and
+	// tests, not availability of an operator's credential agent.
+	cmd.Env = append(os.Environ(),
+		"GIT_CONFIG_GLOBAL=/dev/null",
+		"GIT_CONFIG_SYSTEM=/dev/null",
+		"GIT_CONFIG_NOSYSTEM=1",
+	)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Cancel = func() error {
 		if cmd.Process == nil {
