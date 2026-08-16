@@ -36,6 +36,11 @@ const (
 	NoLiveEnv = "HERD_NO_LIVE_HERDR"
 )
 
+func localDirectMode() bool {
+	mode := strings.ToLower(strings.TrimSpace(os.Getenv("HERD_MODE")))
+	return mode == "local" || mode == "dev" || mode == "development"
+}
+
 // binaryPath resolves the herdr executable, honouring the test override.
 func binaryPath() (string, error) {
 	if override := strings.TrimSpace(os.Getenv(BinaryEnv)); override != "" {
@@ -146,8 +151,13 @@ func PrepareToolChildLifecycle(tabID, paneID string, req *launch.Request, name s
 			return fmt.Errorf("durable Herdr session generation: %w", err)
 		}
 	}
-	if req.Decision.Harness != router.PiHarness {
+	if req.Decision.Harness != router.PiHarness && !localDirectMode() {
 		return fmt.Errorf("tool-child lifecycle requires Pi harness")
+	}
+	if req.Decision.Harness != router.PiHarness && localDirectMode() {
+		// Native local lanes are owned by Herdr's vendor process directly; the
+		// hosted Pi session ledger is not a prerequisite for a single-user pane.
+		return nil
 	}
 	if req.Decision.HarnessSession != "" {
 		return fmt.Errorf("tool-child lifecycle requires an unbound Pi session decision")
@@ -1156,6 +1166,9 @@ func AgentStartWithDecision(name, kind, paneID string, req launch.Request) error
 	}
 	if req.SessionGeneration <= 0 {
 		return fmt.Errorf("durable Herdr session generation is unavailable")
+	}
+	if lc == nil && localDirectMode() {
+		return agentStartProcess(name, kind, paneID, req.Decision.HarnessArgv[1:]...)
 	}
 	if lc == nil {
 		return fmt.Errorf("prepared tool-child lifecycle is required before process start")
