@@ -428,6 +428,8 @@ func main() {
 	case "receipt":
 		if len(os.Args) > 2 && os.Args[2] == "release" {
 			runReceiptRelease()
+		} else if len(os.Args) > 2 && os.Args[2] == "recover" {
+			runReceiptRecover()
 		} else {
 			runReceiptIssue()
 		}
@@ -443,6 +445,52 @@ func main() {
 		fmt.Fprintf(os.Stderr, "unknown subcommand '%s'\nRun 'herd --help' for usage.\n", command)
 		os.Exit(1)
 	}
+}
+
+// runReceiptRecover restores the signed canonical launch receipt into a
+// re-created worktree. It deliberately copies authenticated authority rather
+// than re-issuing or widening it, so recovery remains exact-SHA and
+// generation-fenced.
+func runReceiptRecover() {
+	fs := flag.NewFlagSet("receipt recover", flag.ExitOnError)
+	args := os.Args[2:]
+	if len(args) > 0 && args[0] == "recover" {
+		args = args[1:]
+	}
+	fs.Parse(args)
+	if fs.NArg() < 2 {
+		fmt.Fprintln(os.Stderr, "usage: herd receipt recover <ref> <worktree>")
+		os.Exit(2)
+	}
+	ref, target := hsync.NormalizeRef(fs.Arg(0)), fs.Arg(1)
+	root, err := canonicalHerdRoot()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "herd receipt recover: %v\n", err)
+		os.Exit(1)
+	}
+	tc, err := dispatch.LoadCanonicalReceipt(root, ref)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "herd receipt recover: %v\n", err)
+		os.Exit(1)
+	}
+	verifier, err := dispatch.LoadVerifier(root)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "herd receipt recover: %v\n", err)
+		os.Exit(1)
+	}
+	if err := verifier.Verify(tc); err != nil {
+		fmt.Fprintf(os.Stderr, "herd receipt recover: canonical receipt authentication failed: %v\n", err)
+		os.Exit(1)
+	}
+	if !strings.EqualFold(hsync.NormalizeRef(tc.TaskRef), ref) {
+		fmt.Fprintf(os.Stderr, "herd receipt recover: receipt task %s does not match %s\n", tc.TaskRef, ref)
+		os.Exit(1)
+	}
+	if err := dispatch.WriteTaskContext(target, tc); err != nil {
+		fmt.Fprintf(os.Stderr, "herd receipt recover: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Printf("herd receipt: recovered signed %s session %s for %s into %s\n", tc.Role, tc.SessionID, tc.TaskRef, target)
 }
 
 func printUsage() {
@@ -486,6 +534,7 @@ func printUsage() {
 	fmt.Println("  approve    Move in-review cards to done, gated on merge evidence")
 	fmt.Println("  drain      Report coordinator review pile (optional bounded --act)")
 	fmt.Println("  board-done Move one card to done ONLY from a task-bound completion receipt")
+	fmt.Println("  receipt    Issue, recover, or release signed task receipts")
 	fmt.Println("  board-audit Report Done cards that no completion receipt closed (read-only)")
 	fmt.Println("  board-sync Reconcile board against git + live lanes; --fix advances lagging cards")
 	fmt.Println("  sh         Interactive shell: run herd subcommands in a loop")
@@ -5146,6 +5195,12 @@ func selectForgeReviewTask(ctx context.Context, cfg *config.Config, tp provider.
 		if candidate == nil || candidate.State == candidateindex.StateBlocked || candidate.State == candidateindex.StateConsumed || strings.TrimSpace(candidate.CandidateSHA) == "" {
 			continue
 		}
+		// A candidate without a durable canonical receipt is not recoverable
+		// after worktree reap. Keep it out of review selection so one legacy
+		// pin cannot monopolize the supervisor queue.
+		if _, receiptErr := dispatch.LoadCanonicalReceipt(root, candidate.Ref); receiptErr != nil {
+			continue
+		}
 		if task := byRef[hsync.NormalizeRef(candidate.Ref)]; task != nil {
 			return task, nil
 		}
@@ -5277,8 +5332,9 @@ func forgeLaunchAdmission(cfg *config.Config, lane *config.LaneDef, ctx context.
 }
 
 func findLaneForRole(cfg *config.Config, role string) *config.LaneDef {
+	want := strings.ToLower(strings.TrimSpace(role))
 	for i := range cfg.Lanes {
-		if cfg.Lanes[i].Role == role {
+		if strings.ToLower(strings.TrimSpace(cfg.Lanes[i].Role)) == want {
 			return &cfg.Lanes[i]
 		}
 	}
