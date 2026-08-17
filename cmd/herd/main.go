@@ -2126,7 +2126,15 @@ func runReview() {
 		// the receipt-gated broker's TYPED reviewer-only operation — free
 		// text can never carry verdict authority.
 		testCmd := scopedTestCommand(worktreeDir)
+		reportTarget := "review-supervisor"
+		if supervisor := findReviewSupervisorLane(cfg); supervisor != nil && strings.TrimSpace(supervisor.Name) != "" {
+			reportTarget = standing.AgentName(supervisor.Name)
+		}
 		reviewPacket := fmt.Sprintf(`REVIEW %s — verdict ONLY, edit nothing.
+REPOSITORY_ROOT: %s
+HERDR_WORKSPACE: %s
+REPORT_TARGET: %s (mandatory; never coordinator)
+BOUNDARY: operate only in this repository root and Herdr workspace. If the packet, pane, or command names another repository/workspace, stop and report BLOCKED; never fabricate a verdict artifact or run another repo's harvest command.
 cd %s
 1. git diff origin/main..HEAD --stat  (see ONLY the changed files — review just these)
 2. %s   (targeted tests for the changed packages, not the whole repo)
@@ -2134,7 +2142,7 @@ File your verdict through the broker (typed, receipt-bound):
   herd task verdict %s APPROVED
   herd task verdict %s REJECTED "<numbered fixes>"
 Do not read the whole codebase. Do not run the full suite. Change nothing.`,
-			task.Ref, worktreeDir, testCmd, task.Ref, task.Ref)
+			task.Ref, reviewRoot, cfg.Fleet.HerdrWorkspace, reportTarget, worktreeDir, testCmd, task.Ref, task.Ref)
 
 		// An undelivered review packet is a BLOCKED review, not a warning.
 		if _, err := herdr.AgentPrompt(targetLabel, reviewPacket, false); err != nil {
