@@ -533,6 +533,63 @@ func TestCandidateIndex_LaterCompleteCallbackClearsSameLeaseBlock(t *testing.T) 
 	}
 }
 
+func TestCandidateIndex_DefaultCallbackMailboxClearsBlockedEvidence(t *testing.T) {
+	dir := t.TempDir()
+	mailPath := mail.CallbackMailPath(dir)
+	sha := "b0e39c7b67456121199180aba5fb758c9e03bf32"
+	if err := os.MkdirAll(filepath.Dir(mailPath), 0o755); err != nil {
+		t.Fatalf("create callback mailbox directory: %v", err)
+	}
+	mailFile, err := os.Create(mailPath)
+	if err != nil {
+		t.Fatalf("create canonical callback mailbox: %v", err)
+	}
+	writeCallback := func(sequence int64, kind mail.CallbackKind, detail string) {
+		t.Helper()
+		body, marshalErr := json.Marshal(mail.Callback{
+			Ref:             "FAC-360",
+			Kind:            kind,
+			SHA:             sha,
+			Detail:          detail,
+			LeaseGeneration: 2,
+		})
+		if marshalErr != nil {
+			t.Fatalf("marshal callback: %v", marshalErr)
+		}
+		if encodeErr := json.NewEncoder(mailFile).Encode(mail.Envelope{
+			ID:        fmt.Sprintf("fac-360-callback-%d", sequence),
+			Sequence:  sequence,
+			Sender:    "worker",
+			Recipient: mail.CoordinatorInbox,
+			Subject:   string(kind) + ": FAC-360",
+			Body:      string(body),
+			Timestamp: time.Unix(sequence, 0).UTC(),
+		}); encodeErr != nil {
+			t.Fatalf("write callback: %v", encodeErr)
+		}
+	}
+	writeCallback(10, mail.CallbackBlocked, "transient test failure")
+	writeCallback(11, mail.CallbackComplete, "")
+	if err := mailFile.Close(); err != nil {
+		t.Fatalf("close callback mailbox: %v", err)
+	}
+
+	cands, err := New(IndexOptions{RepoRoot: dir}).BuildIndex(context.Background())
+	if err != nil {
+		t.Fatalf("BuildIndex failed: %v", err)
+	}
+	if len(cands) != 1 {
+		t.Fatalf("expected one candidate from the canonical callback mailbox, got %d", len(cands))
+	}
+	c := cands[0]
+	if c.CandidateSHA != sha || c.LeaseGeneration != 2 {
+		t.Fatalf("candidate identity changed while coalescing canonical callbacks: %+v", c)
+	}
+	if c.State == StateBlocked || len(c.BlockedReasons) != 0 || len(c.BlockedEvidence) != 0 {
+		t.Fatalf("complete callback did not clear same-lease block on canonical mailbox: state=%s reasons=%v evidence=%v", c.State, c.BlockedReasons, c.BlockedEvidence)
+	}
+}
+
 func containsCandidateSource(sources []CandidateSource, want CandidateSource) bool {
 	for _, source := range sources {
 		if source == want {
