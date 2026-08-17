@@ -4962,7 +4962,7 @@ func notifyReviewSupervisor(cfg *config.Config, task *provider.Task) error {
 		return errors.New("herdr CLI not found")
 	}
 	name := standing.AgentName(lane.Name)
-	packet := fmt.Sprintf("REVIEW SUPERVISOR REQUEST\nTask: %s — %s\n\nThe task has entered in-review. You own the review loop: inspect the exact candidate receipt/worktree, spawn a reviewer from a different model family, deliver findings back to the author lane, and re-ping the reviewer after fixes. Repeat until APPROVED. Only after exact PASS evidence, notify the coordinator that this task is ready to merge. Do not ask the coordinator to perform review work.\n\nTask description:\n%s", task.Ref, task.Title, strings.TrimSpace(task.Description))
+	packet := fmt.Sprintf("REVIEW SUPERVISOR REQUEST\nTask: %s — %s\n\nThe task has entered in-review. You own the review loop: inspect the exact candidate receipt/worktree, spawn a reviewer from a different model family, deliver findings back to the author lane, and re-ping the reviewer after fixes. Repeat until APPROVED. Only after exact PASS evidence, notify the coordinator that this task is ready to merge. Do not ask the coordinator to perform review work.\n\nAfter the coordinator confirms merge/approval, clean up the finished review lane and any ephemeral implementation lane that has no standing owner, using generation-fenced cleanup only. Preserve standing lanes and any lane with unconsumed review/goal evidence.\n\nTask description:\n%s", task.Ref, task.Title, strings.TrimSpace(task.Description))
 	if _, err := herdr.AgentPrompt(name, packet, false); err != nil {
 		return fmt.Errorf("deliver to %s: %w", name, err)
 	}
