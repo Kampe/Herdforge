@@ -37,6 +37,7 @@ const (
 	EventRefutation       EventType = "refutation"
 	EventLaunchFailed     EventType = "launch_failed"
 	EventRouteBlocked     EventType = "route_blocked"
+	EventDispatchBlocked  EventType = "dispatch_blocked"
 )
 
 type Verdict string
@@ -106,6 +107,7 @@ const (
 	QueueAuthorNotified   QueueState = "author-notified"
 	QueueHarvestReady     QueueState = "harvest-ready"
 	QueueCleanupCandidate QueueState = "cleanup-candidate"
+	QueueBlocked          QueueState = "blocked"
 	QueueClosed           QueueState = "closed"
 )
 
@@ -148,6 +150,8 @@ type Candidate struct {
 	Ingested         bool
 	HarvestReady     bool
 	CleanupCandidate bool
+	DispatchBlocked  bool
+	DispatchReason   string
 }
 
 func queueState(c *Candidate) QueueState {
@@ -159,6 +163,9 @@ func queueState(c *Candidate) QueueState {
 	}
 	if c.CleanupCandidate {
 		return QueueCleanupCandidate
+	}
+	if c.DispatchBlocked {
+		return QueueBlocked
 	}
 	if c.HarvestReady {
 		return QueueHarvestReady
@@ -202,7 +209,11 @@ func (sv *ReviewSupervisor) QueueSnapshot() []QueueEntry {
 		if c == nil {
 			continue
 		}
-		out = append(out, QueueEntry{SHA: c.SHA, Branch: c.Branch, State: queueState(c), Reviewer: c.Reviewer, Attempts: c.Attempts, Reason: c.BlockedReason, UpdatedAt: c.UpdatedAt})
+		reason := c.DispatchReason
+		if reason == "" {
+			reason = c.BlockedReason
+		}
+		out = append(out, QueueEntry{SHA: c.SHA, Branch: c.Branch, State: queueState(c), Reviewer: c.Reviewer, Attempts: c.Attempts, Reason: reason, UpdatedAt: c.UpdatedAt})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].SHA < out[j].SHA })
 	return out
@@ -274,6 +285,7 @@ type Config struct {
 	MaxPendingReviews int
 	StaleDuration     time.Duration
 	RetryLimit        int
+	DispatchTimeout   time.Duration
 	LeaseDuration     time.Duration
 	Now               func() time.Time
 	Orders            *control.CoordinatorOrders
@@ -292,6 +304,7 @@ func DefaultConfig(ledgerDir string) Config {
 		MaxPendingReviews: 3,
 		StaleDuration:     24 * time.Hour,
 		RetryLimit:        3,
+		DispatchTimeout:   30 * time.Second,
 		LeaseDuration:     30 * time.Minute,
 		Now:               time.Now,
 	}
@@ -409,6 +422,27 @@ type CompletionCallback struct {
 	// Ingest refuses an empty digest so CheckCompletion-only callbacks
 	// cannot enter the review queue (FAC-144).
 	ReceiptDigest string
+}
+
+// DispatchRequest describes one independent candidate admission attempt. Each
+// request gets its own timeout and retry budget; a slow route cannot hold up a
+// different candidate.
+type DispatchRequest struct {
+	SHA         string
+	Reviewers   []ReviewerEntry
+	MaxAttempts int
+	Timeout     time.Duration
+	Launch      func(context.Context, string, ReviewerEntry) error
+}
+
+// DispatchResult is the durable outcome of one request. SHA is always the
+// exact candidate identity that was dispatched or blocked.
+type DispatchResult struct {
+	SHA      string
+	State    QueueState
+	Reviewer string
+	Attempts int
+	Reason   string
 }
 
 func (sv *ReviewSupervisor) Ingest(cb CompletionCallback) (accepted bool, staleSHA string, err error) {
@@ -618,56 +652,84 @@ func (sv *ReviewSupervisor) blockRouteLocked(cand *Candidate, reason string) err
 }
 
 func (sv *ReviewSupervisor) LaunchReview(candidateSHA, reviewer, reviewModel string) error {
-	sv.mu.Lock()
-	defer sv.mu.Unlock()
+	return sv.LaunchReviewContext(context.Background(), candidateSHA, reviewer, reviewModel)
+}
 
+// LaunchReviewContext is the cancellable form used by bounded dispatch. The
+// legacy LaunchReview API remains a background-context wrapper.
+func (sv *ReviewSupervisor) LaunchReviewContext(ctx context.Context, candidateSHA, reviewer, reviewModel string) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	sv.mu.Lock()
 	cand, ok := sv.cands[candidateSHA]
 	if !ok {
+		sv.mu.Unlock()
 		return fmt.Errorf("reviewsup: unknown candidate %s", candidateSHA)
 	}
 	if cand.State == StateReviewing && strings.TrimSpace(cand.Reviewer) == strings.TrimSpace(reviewer) {
 		// Idempotent exact-SHA + reviewer admission. A supervisor retry must
 		// reuse the existing reviewer heartbeat/pane rather than launch a
 		// duplicate reviewer for the same candidate identity.
+		sv.mu.Unlock()
 		return nil
 	}
 	if cand.State != StatePending {
+		sv.mu.Unlock()
 		return fmt.Errorf("reviewsup: candidate %s is not pending (state=%s)", candidateSHA, cand.State)
 	}
 	if allowed, reason := router.ReviewRouteAdmission(router.ReviewProviderForModel(reviewModel), reviewModel, classify.Tier(cand.Tier)); !allowed {
-		if err := sv.blockRouteLocked(cand, reason); err != nil {
-			return err
+		blockErr := sv.blockRouteLocked(cand, reason)
+		sv.mu.Unlock()
+		if blockErr != nil {
+			return blockErr
 		}
 		return fmt.Errorf("reviewsup: review route refused for %s: %s", candidateSHA, reason)
 	}
 	if strings.TrimSpace(cand.ReceiptDigest) == "" {
+		sv.mu.Unlock()
 		return fmt.Errorf("reviewsup: candidate %s has no verification receipt digest", candidateSHA)
 	}
 	// FAC-144: RequireCurrentPassing (or equivalent) before review spawn.
 	// A nil admit is a miscomposition, not a free pass.
 	if sv.cfg.AdmitReceipt == nil {
+		sv.mu.Unlock()
 		return fmt.Errorf("reviewsup: receipt admission is not configured — refusing to spawn review for %s", candidateSHA)
 	}
+	receiptDigest := cand.ReceiptDigest
+	authorModel := cand.AuthorModel
+	tier := cand.Tier
+	admitReceipt := sv.cfg.AdmitReceipt
+	worktreeFor := sv.cfg.WorktreeFor
 	dir := ""
-	if sv.cfg.WorktreeFor != nil {
+	sv.mu.Unlock()
+	if worktreeFor != nil {
 		var err error
-		dir, err = sv.cfg.WorktreeFor(candidateSHA)
+		dir, err = worktreeFor(candidateSHA)
 		if err != nil {
 			return fmt.Errorf("reviewsup: resolve worktree for %s: %w", candidateSHA, err)
 		}
 	}
-	if err := sv.cfg.AdmitReceipt(context.Background(), dir, cand.ReceiptDigest); err != nil {
+	if err := admitReceipt(ctx, dir, receiptDigest); err != nil {
 		return fmt.Errorf("reviewsup: receipt admission refused for %s: %w", candidateSHA, err)
 	}
 
 	reviewFamily := lookupFamily(reviewModel)
-	authorFamily := lookupFamily(cand.AuthorModel)
-	needsCross := RequireCrossFamily(cand.Tier)
+	authorFamily := lookupFamily(authorModel)
+	needsCross := RequireCrossFamily(tier)
 
 	if needsCross && !CrossFamilyOK(authorFamily, reviewFamily) {
 		return fmt.Errorf("reviewsup: candidate %s requires cross-family review (author=%s, reviewer=%s)", candidateSHA, authorFamily, reviewFamily)
 	}
 
+	sv.mu.Lock()
+	defer sv.mu.Unlock()
+	// The candidate may have been superseded while the receipt admission was
+	// running. Never attach a reviewer lease to a stale SHA.
+	cand, ok = sv.cands[candidateSHA]
+	if !ok || cand.State != StatePending || cand.ReceiptDigest != receiptDigest {
+		return fmt.Errorf("reviewsup: candidate %s changed while admission was in flight", candidateSHA)
+	}
 	cand.State = StateReviewing
 	cand.Reviewer = reviewer
 	cand.ReviewFamily = string(reviewFamily)
@@ -698,7 +760,7 @@ func (sv *ReviewSupervisor) LaunchReview(candidateSHA, reviewer, reviewModel str
 		return fmt.Errorf("reviewsup: append review row: %w", err)
 	}
 	if sv.cfg.Orders != nil {
-		if _, err := sv.cfg.Orders.ReviewCorrection(context.Background(), fmt.Sprintf("review candidate %s by %s", candidateSHA, reviewer)); err != nil {
+		if _, err := sv.cfg.Orders.ReviewCorrection(ctx, fmt.Sprintf("review candidate %s by %s", candidateSHA, reviewer)); err != nil {
 			cand.State = StatePending
 			cand.Reviewer = ""
 			cand.ReviewFamily = ""
@@ -747,6 +809,124 @@ func (sv *ReviewSupervisor) CompensateLaunch(candidateSHA, reason string) error 
 		cand.ReviewFamily = prevFamily
 		cand.UpdatedAt = sv.now()
 		return fmt.Errorf("reviewsup: append launch_failed row: %w", err)
+	}
+	return nil
+}
+
+// Dispatch admits candidates independently. Each request runs in its own
+// bounded route call, and results are sorted by exact SHA for deterministic
+// queue reporting. Exhausted routes receive a durable blocked record.
+func (sv *ReviewSupervisor) Dispatch(ctx context.Context, requests []DispatchRequest) []DispatchResult {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	results := make(chan DispatchResult, len(requests))
+	var wg sync.WaitGroup
+	for _, request := range requests {
+		req := request
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			results <- sv.dispatchOne(ctx, req)
+		}()
+	}
+	wg.Wait()
+	close(results)
+	out := make([]DispatchResult, 0, len(requests))
+	for result := range results {
+		out = append(out, result)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].SHA < out[j].SHA })
+	return out
+}
+
+func (sv *ReviewSupervisor) dispatchOne(parent context.Context, req DispatchRequest) DispatchResult {
+	result := DispatchResult{SHA: req.SHA}
+	attempts := req.MaxAttempts
+	if attempts <= 0 {
+		attempts = sv.cfg.RetryLimit
+	}
+	if attempts <= 0 {
+		attempts = 1
+	}
+	timeout := req.Timeout
+	if timeout <= 0 {
+		timeout = sv.cfg.DispatchTimeout
+	}
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+	var lastReason string
+	for attempt := 1; attempt <= attempts; attempt++ {
+		if err := parent.Err(); err != nil {
+			lastReason = "dispatch canceled: " + err.Error()
+			break
+		}
+		reviewer, err := sv.SelectReviewer(req.SHA, req.Reviewers)
+		if err != nil {
+			lastReason = err.Error()
+			break
+		}
+		if reviewer == nil {
+			lastReason = "no routable reviewer available"
+			continue
+		}
+		launch := req.Launch
+		if launch == nil {
+			launch = func(ctx context.Context, sha string, entry ReviewerEntry) error {
+				return sv.LaunchReviewContext(ctx, sha, entry.Name, entry.Model)
+			}
+		}
+		callCtx, cancel := context.WithTimeout(parent, timeout)
+		err = launch(callCtx, req.SHA, *reviewer)
+		cancel()
+		result.Attempts = attempt
+		if err == nil {
+			result.State = QueueLaunched
+			result.Reviewer = reviewer.Name
+			return result
+		}
+		lastReason = err.Error()
+	}
+	result.Attempts = attempts
+	result.Reason = fmt.Sprintf("no routable review surface after %d attempts: %s", attempts, lastReason)
+	if err := sv.markDispatchBlocked(req.SHA, result.Reason, attempts); err != nil {
+		result.Reason += "; durable record failed: " + err.Error()
+	}
+	result.State = QueueBlocked
+	return result
+}
+
+func (sv *ReviewSupervisor) markDispatchBlocked(sha, reason string, attempts int) error {
+	sv.mu.Lock()
+	defer sv.mu.Unlock()
+	cand, ok := sv.cands[sha]
+	if !ok {
+		return fmt.Errorf("reviewsup: unknown candidate %s", sha)
+	}
+	if cand.DispatchBlocked {
+		return nil
+	}
+	oldState, oldVerdict := cand.State, cand.Verdict
+	oldAttempts, oldUpdated := cand.Attempts, cand.UpdatedAt
+	cand.DispatchBlocked = true
+	cand.DispatchReason = reason
+	cand.State = StateBlocked
+	cand.Verdict = VerdictBLOCKED
+	cand.Attempts = attempts
+	cand.UpdatedAt = sv.now()
+	if sv.pendingCount > 0 {
+		sv.pendingCount--
+	}
+	if err := sv.appendRow(&Row{Event: string(EventDispatchBlocked), SHA: sha, Reason: reason, Attempts: attempts}); err != nil {
+		cand.DispatchBlocked = false
+		cand.DispatchReason = ""
+		cand.State = oldState
+		cand.Verdict = oldVerdict
+		cand.Attempts = oldAttempts
+		cand.UpdatedAt = oldUpdated
+		sv.pendingCount++
+		return fmt.Errorf("reviewsup: append dispatch blocked row: %w", err)
 	}
 	return nil
 }
@@ -1345,6 +1525,18 @@ func (sv *ReviewSupervisor) Reconstruct() (int, error) {
 		case EventCleanupCandidate:
 			if cand, ok := sv.cands[r.SHA]; ok {
 				cand.CleanupCandidate = true
+			}
+
+		case EventDispatchBlocked:
+			if cand, ok := sv.cands[r.SHA]; ok {
+				if cand.State == StatePending || cand.State == StateReviewing || cand.State == StatePass {
+					sv.pendingCount--
+				}
+				cand.DispatchBlocked = true
+				cand.DispatchReason = r.Reason
+				cand.State = StateBlocked
+				cand.Verdict = VerdictBLOCKED
+				cand.Attempts = r.Attempts
 			}
 
 		case EventClosed:
