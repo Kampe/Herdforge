@@ -290,9 +290,24 @@ func (s *Store) RecordBlockedSelections(items []BlockedSelection) ([]BlockedReco
 
 // BlockedSelectionHistory returns durable dependency holds newest first.
 func (s *Store) BlockedSelectionHistory(limit int) ([]BlockedRecord, error) {
-	rows, err := s.db.Query(`SELECT id, ref, task_id, entrypoint, code, reason,
-		graph_revision, provider_revision, recorded_at, recency_seq FROM blocked_selection_history
-		ORDER BY recency_seq DESC, id DESC LIMIT ?`, limit)
+	return s.BlockedSelectionHistorySince(limit, time.Time{})
+}
+
+// BlockedSelectionHistorySince returns dependency holds newer than since,
+// newest first. A zero since preserves the full-history behavior for callers
+// that need audit data; operational status should pass a bounded window so
+// resolved outages do not remain as live-looking ghosts indefinitely.
+func (s *Store) BlockedSelectionHistorySince(limit int, since time.Time) ([]BlockedRecord, error) {
+	query := `SELECT id, ref, task_id, entrypoint, code, reason,
+		graph_revision, provider_revision, recorded_at, recency_seq FROM blocked_selection_history`
+	args := []any{}
+	if !since.IsZero() {
+		query += ` WHERE recorded_at >= ?`
+		args = append(args, since)
+	}
+	query += ` ORDER BY recency_seq DESC, id DESC LIMIT ?`
+	args = append(args, limit)
+	rows, err := s.db.Query(query, args...)
 	if err != nil {
 		return nil, err
 	}

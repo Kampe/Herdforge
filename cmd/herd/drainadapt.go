@@ -382,7 +382,12 @@ cd %s
 Your FINAL line MUST be exactly one of:
 REVIEW VERDICT %s: APPROVED
 REVIEW VERDICT %s: REJECTED - <numbered fixes>
-Do not read the whole codebase. Do not run the full suite. Change nothing.`,
+Do not read the whole codebase. Do not run the full suite. Change nothing.
+
+SUPERVISOR LOOP: You own this review until it passes. If rejected, send the
+numbered findings to the author lane, wait for its replacement candidate, then
+spawn or re-ping a reviewer against that exact SHA. Do not hand review work to
+the coordinator. After APPROVED, report merge-ready evidence to the coordinator.`,
 		ref, sha, worktree, sha, scopedTestCommand(worktree), ref, ref)
 }
 
@@ -535,9 +540,9 @@ func newDrainAdapters(root, ledgerPath string, cfg *config.Config, tp provider.T
 	if tp == nil {
 		return nil, fmt.Errorf("no board provider authority")
 	}
-	lane := findLaneForRole(cfg, launch.ReviewerRole)
+	lane := findReviewSupervisorLane(cfg)
 	if lane == nil {
-		return nil, fmt.Errorf("no lane configured for role %q", launch.ReviewerRole)
+		return nil, fmt.Errorf("no standing review supervisor lane configured (roles: review-supervisor, reviewer, harvest)")
 	}
 	if strings.TrimSpace(lane.Worktree) == "" {
 		return nil, fmt.Errorf("reviewer lane %q has no isolated worktree", lane.Name)

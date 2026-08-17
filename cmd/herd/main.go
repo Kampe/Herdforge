@@ -943,12 +943,15 @@ func runStatus() {
 		os.Exit(1)
 	}
 	defer st.Close()
-	blocked, err := st.BlockedSelectionHistory(10)
+	// Dependency blocks are audit evidence, not permanent attention. Keep the
+	// operator-facing status window bounded so resolved provider outages and
+	// repaired provenance do not continue to look active for days.
+	blocked, err := st.BlockedSelectionHistorySince(10, time.Now().Add(-time.Hour))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Dependency evidence: UNREADABLE (%v)\n", err)
 		os.Exit(1)
 	}
-	fmt.Printf("Dependency BLOCKED evidence: %d recent\n", len(blocked))
+	fmt.Printf("Dependency BLOCKED evidence: %d recent (last hour)\n", len(blocked))
 	for _, record := range blocked {
 		fmt.Printf("  BLOCKED %s [%s] %s\n", record.Ref, record.Code, record.Reason)
 	}
@@ -4766,22 +4769,35 @@ func runForgeE() error {
 	defer stack.Close()
 	tasks, err := tp.ListTasks(ctx, cfg.TaskProvider.ProjectID, "in-progress")
 	if err == nil && len(tasks) > 0 {
-		t := tasks[0]
-		fmt.Printf("Selected [%s]: %s for review\n", t.Ref, t.Title)
-		// FAC-145: no raw status writes — the transition is bound to the
-		// task's authenticated receipt; failures propagate.
-		forgeRoot, forgeRootErr := canonicalHerdRoot()
-		if forgeRootErr != nil {
-			fmt.Fprintf(os.Stderr, "  review transition: %v\n", forgeRootErr)
+		t, selectErr := selectForgeReviewTask(ctx, cfg, tp, tasks)
+		if selectErr != nil {
+			fmt.Fprintf(os.Stderr, "  review selection blocked: %v\n", selectErr)
 			forgeFailed = true
-		} else if btp, _, bindErr := boundBoardProvider(cfg, tp, forgeRoot, t.Ref); bindErr != nil {
-			fmt.Fprintf(os.Stderr, "  review transition unbound (FAC-145): %v\n", bindErr)
-			forgeFailed = true
-		} else if err := btp.UpdateStatus(ctx, t.ID, "in-review"); err != nil {
-			fmt.Fprintf(os.Stderr, "  review transition failed (FAC-145): %v\n", err)
-			forgeFailed = true
+		} else if t == nil {
+			fmt.Println("  no reviewable in-progress candidate (skipping cards without an exact candidate SHA)")
 		} else {
-			fmt.Printf("  -> moved to 'in-review' status\n")
+			fmt.Printf("Selected [%s]: %s for review\n", t.Ref, t.Title)
+			// FAC-145: no raw status writes — the transition is bound to the
+			// task's authenticated receipt; failures propagate.
+			forgeRoot, forgeRootErr := canonicalHerdRoot()
+			if forgeRootErr != nil {
+				fmt.Fprintf(os.Stderr, "  review transition: %v\n", forgeRootErr)
+				forgeFailed = true
+			} else if btp, _, bindErr := boundBoardProvider(cfg, tp, forgeRoot, t.Ref); bindErr != nil {
+				fmt.Fprintf(os.Stderr, "  review transition unbound (FAC-145): %v\n", bindErr)
+				forgeFailed = true
+			} else if err := btp.UpdateStatus(ctx, t.ID, "in-review"); err != nil {
+				fmt.Fprintf(os.Stderr, "  review transition failed (FAC-145): %v\n", err)
+				forgeFailed = true
+			} else {
+				fmt.Printf("  -> moved to 'in-review' status\n")
+				if pingErr := notifyReviewSupervisor(cfg, t); pingErr != nil {
+					fmt.Fprintf(os.Stderr, "  review supervisor notification failed: %v\n", pingErr)
+					forgeFailed = true
+				} else {
+					fmt.Println("  -> review supervisor notified; coordinator remains out of review")
+				}
+			}
 		}
 	}
 
@@ -4824,6 +4840,37 @@ func runForgeE() error {
 		return fmt.Errorf("forge cycle completed with failures")
 	}
 	return nil
+}
+
+// selectForgeReviewTask admits only an indexed candidate with a candidate SHA. Raw
+// in-progress board order also contains standing epics and planning cards
+// without a candidate SHA; attempting a receipt-bound review for those cards
+// can never succeed and used to poison every forge cycle.
+func selectForgeReviewTask(ctx context.Context, cfg *config.Config, tp provider.TaskProvider, tasks []*provider.Task) (*provider.Task, error) {
+	root, err := canonicalHerdRoot()
+	if err != nil {
+		return nil, err
+	}
+	idx := candidateindex.New(candidateindex.IndexOptions{RepoRoot: root, Config: cfg, TaskProvider: tp})
+	candidates, err := idx.BuildIndex(ctx)
+	if err != nil {
+		return nil, err
+	}
+	byRef := make(map[string]*provider.Task, len(tasks))
+	for _, task := range tasks {
+		if task != nil {
+			byRef[hsync.NormalizeRef(task.Ref)] = task
+		}
+	}
+	for _, candidate := range candidates {
+		if candidate == nil || candidate.State == candidateindex.StateBlocked || candidate.State == candidateindex.StateConsumed || strings.TrimSpace(candidate.CandidateSHA) == "" {
+			continue
+		}
+		if task := byRef[hsync.NormalizeRef(candidate.Ref)]; task != nil {
+			return task, nil
+		}
+	}
+	return nil, nil
 }
 
 // persistForgeTaskReceipt closes the authority gap between forge's compact
@@ -4886,6 +4933,38 @@ func findLaneForRole(cfg *config.Config, role string) *config.LaneDef {
 		if cfg.Lanes[i].Role == role {
 			return &cfg.Lanes[i]
 		}
+	}
+	return nil
+}
+
+// findReviewSupervisorLane keeps review traffic on the standing review
+// supervisor when a repository declares one. Older rosters may only have a
+// reviewer or harvest lane, so those remain explicit fallbacks. The
+// coordinator is never selected by this helper.
+func findReviewSupervisorLane(cfg *config.Config) *config.LaneDef {
+	for _, role := range []string{"review-supervisor", "review_harvest_supervisor", "harvest-supervisor", "reviewer", "harvest"} {
+		if lane := findLaneForRole(cfg, role); lane != nil {
+			return lane
+		}
+	}
+	return nil
+}
+
+func notifyReviewSupervisor(cfg *config.Config, task *provider.Task) error {
+	if cfg == nil || task == nil {
+		return errors.New("review supervisor notification requires config and task")
+	}
+	lane := findReviewSupervisorLane(cfg)
+	if lane == nil {
+		return errors.New("no review supervisor lane configured")
+	}
+	if !herdr.IsAvailable() {
+		return errors.New("herdr CLI not found")
+	}
+	name := standing.AgentName(lane.Name)
+	packet := fmt.Sprintf("REVIEW SUPERVISOR REQUEST\nTask: %s — %s\n\nThe task has entered in-review. You own the review loop: inspect the exact candidate receipt/worktree, spawn a reviewer from a different model family, deliver findings back to the author lane, and re-ping the reviewer after fixes. Repeat until APPROVED. Only after exact PASS evidence, notify the coordinator that this task is ready to merge. Do not ask the coordinator to perform review work.\n\nTask description:\n%s", task.Ref, task.Title, strings.TrimSpace(task.Description))
+	if _, err := herdr.AgentPrompt(name, packet, false); err != nil {
+		return fmt.Errorf("deliver to %s: %w", name, err)
 	}
 	return nil
 }
@@ -8213,7 +8292,7 @@ func newProductionForgeObserver(cfg *config.Config) (*herdr.ProductionReconcilia
 				return herdr.Authority[herdr.TabBinding]{State: herdr.EvidenceError, Detail: candidateErr.Error()}
 			}
 			return herdr.Authority[herdr.TabBinding]{State: herdr.EvidencePresent, Value: herdr.TabBinding{
-				TabID: tab.TabID, Workspace: tab.WorkspaceID, PaneID: agent.PaneID, TaskRef: tc.TaskRef, CandidateSHA: candidateSHA, LeaseGeneration: tc.LeaseGeneration, Role: tc.Role,
+				TabID: tab.TabID, Generation: tab.Generation, Workspace: tab.WorkspaceID, PaneID: agent.PaneID, TaskRef: tc.TaskRef, CandidateSHA: candidateSHA, LeaseGeneration: tc.LeaseGeneration, Role: tc.Role,
 			}}
 		},
 		Completion: completion,

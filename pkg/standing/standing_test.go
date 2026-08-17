@@ -173,6 +173,7 @@ func TestRepeatedRaiseProducesOneOwner(t *testing.T) {
 	t.Chdir(repo)
 
 	var creates, starts, prompts int
+	var promptTexts []string
 	live := map[string]Agent{}
 	opts := baseOpts(t, repo)
 	opts.Mode = ModeRaise
@@ -203,6 +204,7 @@ func TestRepeatedRaiseProducesOneOwner(t *testing.T) {
 	}
 	opts.PromptAgent = func(agentName, text string) error {
 		prompts++
+		promptTexts = append(promptTexts, text)
 		if text == "" {
 			return errors.New("empty prompt")
 		}
@@ -219,6 +221,11 @@ func TestRepeatedRaiseProducesOneOwner(t *testing.T) {
 	}
 	if creates != 2 || starts != 2 || prompts != 2 {
 		t.Fatalf("side effects creates=%d starts=%d prompts=%d", creates, starts, prompts)
+	}
+	for _, text := range promptTexts {
+		if !strings.Contains(text, "/goal Continue as the standing") {
+			t.Fatalf("standing prompt missing continuation goal: %q", text)
+		}
 	}
 
 	// Second raise must be idempotent — no new tabs.

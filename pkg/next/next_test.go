@@ -66,8 +66,8 @@ func TestEval_NeedReview(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if act.Type != ActionNeed {
-		t.Errorf("expected ActionNeed with in-progress tasks, got %s", act.Type)
+	if act.Type != ActionClaim {
+		t.Errorf("expected ActionClaim when in-progress task has no candidate SHA, got %s", act.Type)
 	}
 }
 

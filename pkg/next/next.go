@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/Kampe/Herdforge/pkg/candidateindex"
 	"github.com/Kampe/Herdforge/pkg/config"
 	"github.com/Kampe/Herdforge/pkg/provider"
 )
@@ -118,7 +119,7 @@ func (p *NextPicker) evalAll(ctx context.Context) ([]*NextAction, error) {
 	}
 
 	// Priority 4-5: Review pipeline
-	inReview, needReview, err := reviewPipelineCounts(ctx, p.TaskProvider, p.Config)
+	inReview, needReview, blockedReview, err := reviewPipelineCounts(ctx, p.TaskProvider, p.Config)
 	if err != nil {
 		return nil, err
 	}
@@ -136,7 +137,7 @@ func (p *NextPicker) evalAll(ctx context.Context) ([]*NextAction, error) {
 		actions = append(actions, &NextAction{
 			Type:        ActionNeed,
 			Priority:    5,
-			Description: fmt.Sprintf("%d unreviewed tip(s) need reviewer", needReview),
+			Description: reviewNeedDescription(needReview, blockedReview),
 			Command:     "herd review --spawn",
 			AutoSafe:    false,
 		})
@@ -177,29 +178,90 @@ func drainSummary(ctx context.Context, tp provider.TaskProvider, cfg *config.Con
 	for _, t := range tasks {
 		total++
 		switch t.Status {
-		case "review":
+		case "review", "in-review":
 			inReview++
-		case "in-progress":
-			needReview++
 		}
+	}
+	needReview, _, err = countReviewableAndBlockedTips(ctx, tp, cfg, tasks)
+	if err != nil {
+		return 0, 0, 0, 0, 0, err
 	}
 	return harvestReady, rebaseNeeded, inReview, needReview, total, nil
 }
 
-func reviewPipelineCounts(ctx context.Context, tp provider.TaskProvider, cfg *config.Config) (inReview int, needReview int, err error) {
+func reviewPipelineCounts(ctx context.Context, tp provider.TaskProvider, cfg *config.Config) (inReview int, needReview int, blockedReview int, err error) {
 	tasks, err := tp.ListTasks(ctx, cfg.TaskProvider.ProjectID, "")
 	if err != nil {
-		return 0, 0, err
+		return 0, 0, 0, err
 	}
 	for _, t := range tasks {
 		switch t.Status {
-		case "review":
+		case "review", "in-review":
 			inReview++
-		case "in-progress":
-			needReview++
 		}
 	}
-	return inReview, needReview, nil
+	needReview, blockedReview, err = countReviewableAndBlockedTips(ctx, tp, cfg, tasks)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	return inReview, needReview, blockedReview, nil
+}
+
+func reviewNeedDescription(needReview, blockedReview int) string {
+	if blockedReview == 0 {
+		return fmt.Sprintf("%d unreviewed tip(s) need reviewer", needReview)
+	}
+	return fmt.Sprintf("%d unreviewed tip(s) need reviewer (%d active candidate(s) blocked by provenance/review gates)", needReview, blockedReview)
+}
+
+// countReviewableTips excludes planning/standing cards that have no exact
+// candidate SHA. Those cards remain visible to the dependency/provenance
+// gates, but must not inflate the P5 reviewer signal.
+func countReviewableTips(ctx context.Context, tp provider.TaskProvider, cfg *config.Config, tasks []*provider.Task) (int, error) {
+	reviewable, _, err := countReviewableAndBlockedTips(ctx, tp, cfg, tasks)
+	return reviewable, err
+}
+
+// countReviewableAndBlockedTips returns both actionable review tips and active
+// candidates held by a review/provenance gate. Keeping the blocked count
+// visible prevents the coordinator from mistaking a quiet reviewer queue for
+// a healthy claim surface.
+func countReviewableAndBlockedTips(ctx context.Context, tp provider.TaskProvider, cfg *config.Config, tasks []*provider.Task) (int, int, error) {
+	root, err := os.Getwd()
+	if err != nil {
+		return 0, 0, err
+	}
+	idx := candidateindex.New(candidateindex.IndexOptions{RepoRoot: root, Config: cfg, TaskProvider: tp})
+	candidates, err := idx.BuildIndex(ctx)
+	if err != nil {
+		return 0, 0, err
+	}
+	active := make(map[string]bool, len(tasks))
+	for _, task := range tasks {
+		if task != nil && task.Status == "in-progress" {
+			active[strings.ToUpper(strings.TrimSpace(task.Ref))] = true
+		}
+	}
+	count, blocked := 0, 0
+	seen := make(map[string]bool)
+	for _, candidate := range candidates {
+		if candidate == nil || strings.TrimSpace(candidate.CandidateSHA) == "" || !active[strings.ToUpper(strings.TrimSpace(candidate.Ref))] {
+			continue
+		}
+		ref := strings.ToUpper(strings.TrimSpace(candidate.Ref))
+		if seen[ref] {
+			continue
+		}
+		seen[ref] = true
+		// PASS/FAIL/BLOCKED candidates already have a review outcome; only
+		// pending candidates need a reviewer signal.
+		if candidate.State == candidateindex.StatePending {
+			count++
+		} else if candidate.State == candidateindex.StateBlocked {
+			blocked++
+		}
+	}
+	return count, blocked, nil
 }
 
 func (a *NextAction) String() string {
