@@ -30,6 +30,23 @@ func TestControlSurfaceRefusesRoutedCommandAbsentFromManifest(t *testing.T) {
 	}
 }
 
+func TestLegacyReceiptsManifestAdmissionAndHelp(t *testing.T) {
+	if _, ok := commandContractFor("legacy-receipts"); !ok {
+		t.Fatal("legacy-receipts must have a signed control-surface contract")
+	}
+	if err := admitRoutedCommand("legacy-receipts", []string{"--help"}); err != nil {
+		t.Fatalf("legacy-receipts admission: %v", err)
+	}
+	binary := buildHerd(t)
+	out, err := exec.Command(binary, "legacy-receipts", "--help").CombinedOutput()
+	if err != nil {
+		t.Fatalf("legacy-receipts help failed: %v\n%s", err, out)
+	}
+	if strings.Contains(string(out), "unknown subcommand") || !strings.Contains(string(out), "Usage: herd legacy-receipts") {
+		t.Fatalf("legacy-receipts help did not reach its contract: %s", out)
+	}
+}
+
 func TestControlSurfaceContractMutationRequiresVersionBump(t *testing.T) {
 	m := controlSurface()
 	m.Commands[0].Output = "mutated contract"
