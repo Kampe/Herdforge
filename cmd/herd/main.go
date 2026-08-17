@@ -885,6 +885,13 @@ func runPreflightStatic() {
 
 func runPreflight() {
 	runPreflightStatic()
+	if !productionMode() {
+		// FAC-367: local Herdr panes do not have hosted HostCreds or fleet
+		// attestation state. Static boundary, signal, and merge-policy checks
+		// remain mandatory, while production keeps the signed readiness gate.
+		fmt.Println("FAC-133 hosted fleet readiness skipped in local mode.")
+		return
+	}
 
 	// FAC-133 fleet readiness: optional live refresh, then consume attestation.
 	// HERD_LIVE_HARNESS_PROOF=1 or HERD_REFRESH_READINESS=1 triggers a single-flight
