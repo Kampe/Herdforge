@@ -196,6 +196,14 @@ func (k *KaneoProvider) ListProjectRelations(ctx context.Context, projectID stri
 	if err != nil {
 		return nil, fmt.Errorf("kaneo ListProjectRelations list tasks: %w", err)
 	}
+	// Local Chainseer mode keeps dependency authority in each task's
+	// herd-deps-v1 fence. A 1,000+ card board cannot afford one CLI process per
+	// card, and the remote relation endpoint is not available on local setups.
+	// The explicit opt-in is fail-closed by default and never affects hosted
+	// HTTP graph snapshots.
+	if useCLI && strings.TrimSpace(os.Getenv("HERD_KANEO_RELATIONS_FAST")) == "1" {
+		return nil, nil
+	}
 	ids := make([]string, 0, len(tasks))
 	idSet := map[string]struct{}{}
 	for _, t := range tasks {
