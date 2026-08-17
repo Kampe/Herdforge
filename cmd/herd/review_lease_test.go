@@ -162,6 +162,18 @@ func TestRecoverVerificationDigest_RestampsLegacyPassReceipt(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(root, ".herd", "verification-receipts", "legacy.json"), data, 0600); err != nil {
 		t.Fatal(err)
 	}
+	// A prior failed attempt for the same candidate must not shadow the later
+	// PASS. Receipt directory order is not a recency contract.
+	failed := receipt
+	failed.Outcome = verifier.OutcomeFAIL
+	failed.Digest = failed.ComputeDigest()
+	failedData, err := json.Marshal(failed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, ".herd", "verification-receipts", "aaa-failed.json"), failedData, 0600); err != nil {
+		t.Fatal(err)
+	}
 
 	digest, err := recoverVerificationDigest(context.Background(), root, "FAC-327", root, sha, 7)
 	if err != nil {

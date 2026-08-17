@@ -176,6 +176,7 @@ func recoverVerificationDigest(ctx context.Context, root, ref, wt, candidateSHA 
 		return "", fmt.Errorf("verification receipt store unavailable: %w", err)
 	}
 	wantGeneration := fmt.Sprintf("%d", leaseGeneration)
+	var rejectedOutcome verifier.Outcome
 	for _, entry := range entries {
 		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
 			continue
@@ -192,7 +193,11 @@ func recoverVerificationDigest(ctx context.Context, root, ref, wt, candidateSHA 
 			continue
 		}
 		if receipt.Outcome != verifier.OutcomePASS {
-			return "", fmt.Errorf("matching verification receipt outcome is %s, not PASS", receipt.Outcome)
+			// The store is append-only and may contain an earlier FAIL/BLOCKED
+			// attempt for the same candidate. Keep scanning for a later PASS;
+			// directory order is not a recency or precedence contract.
+			rejectedOutcome = receipt.Outcome
+			continue
 		}
 		if receipt.Digest == "" {
 			receipt.Digest = receipt.ComputeDigest()
@@ -210,6 +215,9 @@ func recoverVerificationDigest(ctx context.Context, root, ref, wt, candidateSHA 
 			return "", fmt.Errorf("restamp verification receipt: %w", err)
 		}
 		return receipt.Digest, nil
+	}
+	if rejectedOutcome != "" {
+		return "", fmt.Errorf("matching verification receipt outcome is %s, not PASS", rejectedOutcome)
 	}
 	return "", fmt.Errorf("no PASS verification receipt for %s candidate %s generation %d", ref, shortSHA(candidateSHA), leaseGeneration)
 }
