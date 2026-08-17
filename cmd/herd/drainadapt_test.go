@@ -281,7 +281,7 @@ func TestNewDrainAdaptersFailsClosedOnMissingAuthority(t *testing.T) {
 	}{
 		{name: "no config", tp: &fakeDrainProvider{}, want: "no compiled config authority"},
 		{name: "no provider", cfg: &config.Config{Lanes: []config.LaneDef{reviewerLane}}, want: "no board provider authority"},
-		{name: "no reviewer lane", cfg: &config.Config{}, tp: &fakeDrainProvider{}, want: "no lane configured"},
+		{name: "no reviewer lane", cfg: &config.Config{}, tp: &fakeDrainProvider{}, want: "no standing review supervisor lane configured"},
 		{name: "reviewer lane without worktree", cfg: &config.Config{Lanes: []config.LaneDef{{Name: "review", Role: launch.ReviewerRole}}}, tp: &fakeDrainProvider{}, want: "no isolated worktree"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
