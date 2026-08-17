@@ -67,6 +67,67 @@ func TestTabCreateForTask_PassesAbsoluteCwd(t *testing.T) {
 	}
 }
 
+func TestTabCreateForTask_BindsChildWorkspaceIdentity(t *testing.T) {
+	tests := []struct {
+		name       string
+		workspace  string
+		ambientEnv string
+	}{
+		{name: "first-repository", workspace: "w-herdforge", ambientEnv: "w-chainseer"},
+		{name: "second-repository", workspace: "w-chainseer", ambientEnv: "w-herdforge"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			wt := t.TempDir()
+			defer func(old func(args ...string) (string, error)) { runHerdr = old }(runHerdr)
+			var got []string
+			runHerdr = func(args ...string) (string, error) {
+				got = append([]string(nil), args...)
+				return `{"result":{"tab":{"tab_id":"t1","label":"worker"},"root_pane":{"pane_id":"p1","tab_id":"t1","terminal_id":"term_a"}}}`, nil
+			}
+			t.Setenv("HERD_WORKSPACE", tt.ambientEnv)
+
+			if _, err := TabCreateForTask(tt.workspace, "worker", wt, true); err != nil {
+				t.Fatalf("TabCreateForTask: %v", err)
+			}
+
+			env := envArgs(got)
+			wantRoot, err := filepath.Abs(wt)
+			if err != nil {
+				t.Fatalf("filepath.Abs: %v", err)
+			}
+			want := map[string]string{
+				"HERD_ROOT":                       wantRoot,
+				"HERD_WORKSPACE":                  tt.workspace,
+				"HERDR_WORKSPACE_ID":              tt.workspace,
+				"HERD_WORKSPACE_SOURCE":           "launch-target",
+				"HERD_WORKSPACE_OVERRIDE_IGNORED": tt.ambientEnv,
+			}
+			for key, value := range want {
+				if env[key] != value {
+					t.Errorf("%s = %q, want %q; env=%v", key, env[key], value, env)
+				}
+			}
+		})
+	}
+}
+
+func envArgs(args []string) map[string]string {
+	env := make(map[string]string)
+	for i := range args {
+		if args[i] != "--env" || i+1 >= len(args) {
+			continue
+		}
+		entry := args[i+1]
+		key, value, ok := strings.Cut(entry, "=")
+		if ok {
+			env[key] = value
+		}
+	}
+	return env
+}
+
 func TestConsumptionProven(t *testing.T) {
 	cases := []struct {
 		baseline, observed string
