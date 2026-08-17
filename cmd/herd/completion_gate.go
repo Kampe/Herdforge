@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -159,6 +160,57 @@ func signedLaunchReceiptForReview(root, ref, wt string) (dispatch.TaskContext, e
 	return tc, nil
 }
 
+// recoverVerificationDigest restores the review admission handle for a
+// legacy completion receipt. Old forge runs could persist a valid PASS body
+// without its redundant digest field or under a non-digest filename. We scan
+// only the repo-local receipt store, bind every field to this exact task,
+// generation, and candidate, recompute the self-authenticating digest, then
+// persist the canonical filename before returning it to ReceiptAdmission.
+func recoverVerificationDigest(ctx context.Context, root, ref, wt, candidateSHA string, leaseGeneration int64) (string, error) {
+	dir := filepath.Join(root, defaultReceiptDir)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return "", fmt.Errorf("verification receipt store unavailable: %w", err)
+	}
+	wantGeneration := fmt.Sprintf("%d", leaseGeneration)
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+			continue
+		}
+		data, readErr := os.ReadFile(filepath.Join(dir, entry.Name()))
+		if readErr != nil {
+			return "", fmt.Errorf("read legacy verification receipt: %w", readErr)
+		}
+		var receipt verifier.Receipt
+		if err := json.Unmarshal(data, &receipt); err != nil {
+			return "", fmt.Errorf("decode legacy verification receipt: %w", err)
+		}
+		if receipt.TaskRef != ref || receipt.CandidateSHA != candidateSHA || receipt.LeaseGeneration != wantGeneration {
+			continue
+		}
+		if receipt.Outcome != verifier.OutcomePASS {
+			return "", fmt.Errorf("matching verification receipt outcome is %s, not PASS", receipt.Outcome)
+		}
+		if receipt.Digest == "" {
+			receipt.Digest = receipt.ComputeDigest()
+		} else if err := receipt.ValidateDigest(); err != nil {
+			return "", fmt.Errorf("matching verification receipt digest invalid: %w", err)
+		}
+		if err := receipt.ValidateReceipt(ctx, wt); err != nil {
+			return "", fmt.Errorf("matching verification receipt is no longer current: %w", err)
+		}
+		store, err := verifier.NewFileReceiptStore(dir)
+		if err != nil {
+			return "", err
+		}
+		if err := store.Persist(ctx, receipt); err != nil {
+			return "", fmt.Errorf("restamp verification receipt: %w", err)
+		}
+		return receipt.Digest, nil
+	}
+	return "", fmt.Errorf("no PASS verification receipt for %s candidate %s generation %d", ref, shortSHA(candidateSHA), leaseGeneration)
+}
+
 // verifyWorktreeForReview runs the FAC-144 gate and reports whether the
 // candidate is review-ready. Errors are hard failures (not soft skips).
 func verifyWorktreeForReview(ctx context.Context, cfg *config.Config, ref, wt string) (ready bool, digest string, reason string, err error) {
@@ -235,6 +287,16 @@ func admitWorktreeForReview(ctx context.Context, cfg *config.Config, ref, wt, di
 					break
 				}
 			}
+		}
+	}
+	if digest == "" {
+		root, rootErr := canonicalHerdRoot()
+		if rootErr != nil {
+			return rootErr
+		}
+		digest, err = recoverVerificationDigest(ctx, root, ref, wt, bind.CandidateSHA, bind.LeaseGeneration)
+		if err != nil {
+			return fmt.Errorf("missing receipt digest and legacy recovery refused: %w", err)
 		}
 	}
 	if _, err := gate.AdmitReview(ctx, bind, digest); err != nil {
