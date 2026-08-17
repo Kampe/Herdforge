@@ -969,7 +969,7 @@ func runStatus() {
 	}
 	fmt.Println(line)
 	observer := &herdr.ProductionReconciliationObserver{Workspace: cfg.Fleet.HerdrWorkspace,
-		Reader: herdr.SocketAuthorityReader{}, Record: (&herdr.JSONLRecorder{Path: ".herd/reconciliation.jsonl"}).Record}
+		Reader: herdr.SocketAuthorityReader{}, LegacyStore: &herdr.JSONLLegacyTabStateStore{Path: ".herd/legacy-tab-state.jsonl"}, Record: (&herdr.JSONLRecorder{Path: ".herd/reconciliation.jsonl"}).Record}
 	if err := observer.ObserveReconciliation(context.Background()); err != nil {
 		fleet := herdr.ProjectFleetStatus(observer.Decisions(), len(cfg.Lanes))
 		fmt.Printf("Reconciliation: BLOCKED (%v)\nFleet: working=%d capacity=%d standing=%d preserved=%d recovering=%d control=%d unknown=%d\n",

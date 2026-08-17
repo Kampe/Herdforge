@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"strings"
 	"testing"
 )
 
@@ -331,5 +332,69 @@ func TestObserveReconciliation_InvokesAutoReapAndFailsClosed(t *testing.T) {
 	defer failRestore()
 	if err := o.ObserveReconciliation(context.Background()); err == nil {
 		t.Fatal("ObserveReconciliation must return error and fail closed when CAS reap fails")
+	}
+}
+
+func TestLegacyTabMigration_BackfillsExactGenerationAndSurvivesRestart(t *testing.T) {
+	store := &JSONLLegacyTabStateStore{Path: t.TempDir() + "/legacy.jsonl"}
+	srv := NewFakeCompareCloseServer()
+	srv.PutTab(LiveTab{WorkspaceID: "wK", TabID: "wK:t2W2", Generation: 42})
+	restore := SetCompareCloseTransportForTest(func(req CompareAndCloseRequest) (CloseReceipt, error) {
+		return srv.CompareAndClose(req), nil
+	})
+	defer restore()
+
+	reader := fixtureReader{
+		tabs:    present([]TabRecord{{TabID: "wK:t2W2", WorkspaceID: "wK", Generation: "42", AgentStatus: "idle"}}),
+		agents:  present([]AgentEntry{}),
+		board:   present(BoardTruth{TaskRef: "FAC-355", Status: "to-do"}),
+		binding: present(TabBinding{TabID: "wK:t2W2", Workspace: "wK", PaneID: "wK:p2W2", TaskRef: "FAC-355"}),
+	}
+	first := &ProductionReconciliationObserver{Workspace: "wK", Reader: reader, LegacyStore: store}
+	if err := first.ObserveReconciliation(context.Background()); err != nil {
+		t.Fatalf("first migration: %v", err)
+	}
+	state, ok, err := store.Lookup(context.Background(), "wK", "wK:t2W2")
+	if err != nil || !ok || state.Action != legacyActionBackfill || state.Binding.Generation != "42" {
+		t.Fatalf("backfill state=%+v found=%t err=%v", state, ok, err)
+	}
+
+	// A fresh observer has no process-local binding. It must recover the
+	// exact persisted binding after restart, not emit the old missing-generation
+	// block again.
+	restartedReader := reader
+	restartedReader.binding = Authority[TabBinding]{State: EvidenceAbsent}
+	restartedReader.tabs = present([]TabRecord{{TabID: "wK:t2W2", WorkspaceID: "wK", AgentStatus: "idle"}})
+	second := &ProductionReconciliationObserver{Workspace: "wK", Reader: restartedReader, LegacyStore: store}
+	if err := second.ObserveReconciliation(context.Background()); err != nil {
+		t.Fatalf("restart migration: %v", err)
+	}
+	if got := second.Decisions()[0].Class; got != TabSafeOrphan {
+		t.Fatalf("restart decision=%s, want safe-orphan from durable backfill", got)
+	}
+}
+
+func TestLegacyTabMigration_TombstoneIsOneShotAndSuppressesRepeatedBlock(t *testing.T) {
+	store := &JSONLLegacyTabStateStore{Path: t.TempDir() + "/legacy.jsonl"}
+	reader := fixtureReader{
+		tabs:    present([]TabRecord{{TabID: "wK:t2W2", WorkspaceID: "wK", AgentStatus: "idle"}}),
+		agents:  present([]AgentEntry{{Name: "task-fac-355", TabID: "wK:t2W2", PaneID: "wK:p2W2", Workspace: "wK", Status: "idle"}}),
+		binding: present(TabBinding{TabID: "wK:t2W2", Workspace: "wK", PaneID: "wK:p2W2", TaskRef: "FAC-355"}),
+	}
+	for cycle := 0; cycle < 2; cycle++ {
+		o := &ProductionReconciliationObserver{Workspace: "wK", Reader: reader, LegacyStore: store}
+		if err := o.ObserveReconciliation(context.Background()); err != nil {
+			t.Fatalf("cycle %d: tombstoned legacy tab must converge: %v", cycle, err)
+		}
+		if got := o.Decisions()[0]; got.Class != TabLegacyCleanup || strings.Contains(strings.Join(got.Evidence, " "), "BLOCKED:") {
+			t.Fatalf("cycle %d decision=%+v, want non-blocking tombstone", cycle, got)
+		}
+	}
+	b, err := os.ReadFile(store.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lines := strings.Count(strings.TrimSpace(string(b)), "\n") + 1; lines != 1 {
+		t.Fatalf("tombstone records=%d, want one durable record; %s", lines, b)
 	}
 }

@@ -65,6 +65,7 @@ type ProductionReconciliationObserver struct {
 	Record         func(context.Context, []TabDecision) error
 	TaskBinding    func(context.Context, TabRecord, AgentEntry) Authority[TabBinding]
 	Completion     CompletedTaskProofReader
+	LegacyStore    LegacyTabStateStore
 }
 
 // SocketAuthorityReader is the real Herdr transport adapter. It only claims
@@ -158,6 +159,12 @@ func (o *ProductionReconciliationObserver) ObserveReconciliation(ctx context.Con
 	for _, tab := range tabs.Value {
 		bindingAuth := o.Reader.Binding(ctx, tab)
 		agent, found := byTab[tab.TabID]
+		if decision, handled, err := o.reconcileLegacyTab(ctx, tab, agent, found, bindingAuth); err != nil {
+			return recordBlocked("legacy tab state: " + err.Error())
+		} else if handled {
+			decisions = append(decisions, decision)
+			continue
+		}
 		// Herdr 0.8 can report a terminal tab created before immutable tab
 		// generations existed. It is not safe for CAS close, but it is also not
 		// a live reconciliation blocker: retain one durable cleanup candidate and
@@ -224,6 +231,70 @@ func (o *ProductionReconciliationObserver) ObserveReconciliation(ctx context.Con
 		return fmt.Errorf("auto-reap completed task lanes: %w", err)
 	}
 	return nil
+}
+
+func (o *ProductionReconciliationObserver) reconcileLegacyTab(ctx context.Context, tab TabRecord, agent AgentEntry, found bool, bindingAuth Authority[TabBinding]) (TabDecision, bool, error) {
+	if o.LegacyStore == nil || tab.TabID == "" || !legacyCandidate(tab, agent, found, bindingAuth) {
+		return TabDecision{}, false, nil
+	}
+	state, exists, err := o.LegacyStore.Lookup(ctx, o.Workspace, tab.TabID)
+	if err != nil {
+		return TabDecision{}, false, err
+	}
+	if exists {
+		if state.Action == legacyActionBackfill && exactLegacyIdentity(tab, agent, found, state.Binding) {
+			return TabDecision{}, false, nil
+		}
+		return legacyDecision(tab, state), true, nil
+	}
+	binding := bindingAuth.Value
+	if binding.TabID == "" {
+		binding.TabID = tab.TabID
+	}
+	binding.Workspace = legacyFirstNonEmpty(binding.Workspace, tab.WorkspaceID, o.Workspace)
+	binding.Label = tab.Label
+	if bindingAuth.State == EvidencePresent && exactLegacyIdentity(tab, agent, found, binding) && binding.Generation != "" {
+		if err := o.LegacyStore.Record(ctx, LegacyTabState{Workspace: o.Workspace, TabID: tab.TabID, PaneID: binding.PaneID, Action: legacyActionBackfill, Binding: binding, Reason: "authenticated exact Herdr identity backfilled"}); err != nil {
+			return TabDecision{}, false, err
+		}
+		return TabDecision{}, false, nil
+	}
+	state = LegacyTabState{Workspace: o.Workspace, TabID: tab.TabID, PaneID: binding.PaneID, Action: legacyActionTombstone, Binding: binding, Reason: "immutable tab generation unavailable from authenticated exact Herdr identity"}
+	if err := o.LegacyStore.Record(ctx, state); err != nil {
+		return TabDecision{}, false, err
+	}
+	return legacyDecision(tab, state), true, nil
+}
+
+func legacyCandidate(tab TabRecord, agent AgentEntry, found bool, binding Authority[TabBinding]) bool {
+	if tab.Generation != "" && (binding.State != EvidencePresent || binding.Value.Generation != "") {
+		return false
+	}
+	return (binding.State == EvidencePresent && binding.Value.TaskRef != "") || (found && agent.Name != "") || strings.HasPrefix(tab.Label, herdforgeLabel)
+}
+
+func exactLegacyIdentity(tab TabRecord, agent AgentEntry, found bool, binding TabBinding) bool {
+	if binding.TabID != tab.TabID || (binding.Workspace != "" && binding.Workspace != tab.WorkspaceID) {
+		return false
+	}
+	return !found || binding.PaneID == "" || agent.PaneID == "" || binding.PaneID == agent.PaneID
+}
+
+func legacyDecision(tab TabRecord, state LegacyTabState) TabDecision {
+	reason := state.Reason
+	if reason == "" {
+		reason = "legacy tab migration state recorded"
+	}
+	return TabDecision{TabID: tab.TabID, Generation: state.Binding.Generation, Class: TabLegacyCleanup, Evidence: []string{"legacy tab state: " + state.Action + ": " + reason}}
+}
+
+func legacyFirstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 func isTerminalAgent(status string) bool {
