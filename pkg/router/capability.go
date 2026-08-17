@@ -24,7 +24,10 @@ var surfaceCapabilities = []SurfaceCapability{
 	{Provider: "claude", Harness: "claude", CLI: "claude", VendorHarness: true, Headless: true},
 	{Provider: "codex", Harness: "codex", CLI: "codex", VendorHarness: true, Headless: true},
 	{Provider: "grok", Harness: "grok", CLI: "grok", VendorHarness: true, Headless: true},
-	{Provider: "kimi", Harness: "kimi", CLI: "kimi", VendorHarness: true, Headless: true, ModelOptional: true},
+	// Kimi is headless-only until Herdr advertises a native kimi tab kind.
+	// Keeping it in the surface table lets shot routing use its argv while
+	// preventing READY routes from reaching a lane launcher that cannot spawn it.
+	{Provider: "kimi", Harness: "kimi", CLI: "kimi", Headless: true, ModelOptional: true},
 	{Provider: "lazer", Harness: "opencode", CLI: "opencode", Headless: true},
 	{Provider: "ollama", Harness: "opencode", CLI: "opencode", Headless: true},
 	{Provider: "opencode", Harness: "opencode", CLI: "opencode", VendorHarness: true, Headless: true},
@@ -42,7 +45,12 @@ func SurfaceCapabilities() []SurfaceCapability {
 func SurfaceFor(name string) (SurfaceCapability, bool) {
 	name = strings.ToLower(strings.TrimSpace(name))
 	for _, surface := range surfaceCapabilities {
-		if surface.Provider == name || surface.Harness == name {
+		if surface.Provider == name {
+			return surface, true
+		}
+	}
+	for _, surface := range surfaceCapabilities {
+		if surface.Harness == name {
 			return surface, true
 		}
 	}

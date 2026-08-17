@@ -234,16 +234,20 @@ func (o *ProductionReconciliationObserver) ObserveReconciliation(ctx context.Con
 }
 
 func (o *ProductionReconciliationObserver) reconcileLegacyTab(ctx context.Context, tab TabRecord, agent AgentEntry, found bool, bindingAuth Authority[TabBinding]) (TabDecision, bool, error) {
-	if o.LegacyStore == nil || tab.TabID == "" || !legacyCandidate(tab, agent, found, bindingAuth) {
+	if o.LegacyStore == nil || tab.TabID == "" {
 		return TabDecision{}, false, nil
 	}
 	state, exists, err := o.LegacyStore.Lookup(ctx, o.Workspace, tab.TabID)
 	if err != nil {
 		return TabDecision{}, false, err
 	}
+	if !legacyCandidate(tab, agent, found, bindingAuth) && !exists {
+		return TabDecision{}, false, nil
+	}
 	if exists {
 		if state.Action == legacyActionBackfill && exactLegacyIdentity(tab, agent, found, state.Binding) {
-			return TabDecision{}, false, nil
+			return TabDecision{TabID: tab.TabID, Generation: state.Binding.Generation, Class: TabSafeOrphan,
+				Evidence: []string{"authenticated legacy tab generation recovered from durable backfill"}}, true, nil
 		}
 		return legacyDecision(tab, state), true, nil
 	}
@@ -253,11 +257,15 @@ func (o *ProductionReconciliationObserver) reconcileLegacyTab(ctx context.Contex
 	}
 	binding.Workspace = legacyFirstNonEmpty(binding.Workspace, tab.WorkspaceID, o.Workspace)
 	binding.Label = tab.Label
+	if binding.Generation == "" {
+		binding.Generation = tab.Generation
+	}
 	if bindingAuth.State == EvidencePresent && exactLegacyIdentity(tab, agent, found, binding) && binding.Generation != "" {
 		if err := o.LegacyStore.Record(ctx, LegacyTabState{Workspace: o.Workspace, TabID: tab.TabID, PaneID: binding.PaneID, Action: legacyActionBackfill, Binding: binding, Reason: "authenticated exact Herdr identity backfilled"}); err != nil {
 			return TabDecision{}, false, err
 		}
-		return TabDecision{}, false, nil
+		return TabDecision{TabID: tab.TabID, Generation: binding.Generation, Class: TabSafeOrphan,
+			Evidence: []string{"authenticated exact Herdr identity backfilled"}}, true, nil
 	}
 	state = LegacyTabState{Workspace: o.Workspace, TabID: tab.TabID, PaneID: binding.PaneID, Action: legacyActionTombstone, Binding: binding, Reason: "immutable tab generation unavailable from authenticated exact Herdr identity"}
 	if err := o.LegacyStore.Record(ctx, state); err != nil {
@@ -267,7 +275,7 @@ func (o *ProductionReconciliationObserver) reconcileLegacyTab(ctx context.Contex
 }
 
 func legacyCandidate(tab TabRecord, agent AgentEntry, found bool, binding Authority[TabBinding]) bool {
-	if tab.Generation != "" && (binding.State != EvidencePresent || binding.Value.Generation != "") {
+	if tab.Generation != "" && binding.State == EvidencePresent && binding.Value.Generation != "" {
 		return false
 	}
 	return (binding.State == EvidencePresent && binding.Value.TaskRef != "") || (found && agent.Name != "") || strings.HasPrefix(tab.Label, herdforgeLabel)

@@ -31,17 +31,13 @@ func TestSurfaceCapabilityTableIsInternallyLaunchable(t *testing.T) {
 	}
 }
 
-func TestKimiIsACompleteDirectLaunchSurface(t *testing.T) {
+func TestKimiIsHeadlessOnlyUntilHerdrSupportsItsKind(t *testing.T) {
 	surface, ok := SurfaceFor("kimi")
-	if !ok || !surface.VendorHarness || !surface.ModelOptional {
+	if !ok || surface.VendorHarness || !surface.ModelOptional || !surface.Headless {
 		t.Fatalf("kimi capability = %+v, present=%t", surface, ok)
 	}
-	harness, argv, err := HarnessArgvFor("kimi", "", "medium")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if harness != "kimi" || len(argv) != 2 || argv[0] != "kimi" || argv[1] != "--auto" {
-		t.Fatalf("kimi launch = %s %v", harness, argv)
+	if harness, _, err := HarnessArgvFor("kimi", "", "medium"); err == nil || harness != "" {
+		t.Fatalf("kimi unexpectedly admitted as lane harness: %s %v", harness, err)
 	}
 }
 
