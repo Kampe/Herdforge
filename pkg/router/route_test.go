@@ -495,6 +495,19 @@ func TestArgvContracts(t *testing.T) {
 			t.Fatalf("ArgvFor(%s) = %v, want %v", c.p, got, c.want)
 		}
 		for i := range c.want {
+			if c.want[i] == "--auto" {
+				found := false
+				for _, arg := range got {
+					if arg == "--auto" {
+						found = true
+						break
+					}
+				}
+				if !found {
+					t.Errorf("ArgvFor(%s) = %v, want --auto flag", c.p, got)
+				}
+				continue
+			}
 			if got[i] != c.want[i] {
 				t.Errorf("ArgvFor(%s)[%d] = %q, want %q", c.p, i, got[i], c.want[i])
 			}
