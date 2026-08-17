@@ -1,0 +1,146 @@
+{
+  "providers": {
+    "claude": {
+      "hooks": [],
+      "approved_local_authorities": [],
+      "policies": [
+        {
+          "handler_digest": "claude:lifecycle:0a16a5a1470fc47fe97f40e379f4a59660866d64c4b645299fb67148f2a3bc39",
+          "requirement": "optional",
+          "health_url": ""
+        },
+        {
+          "handler_digest": "claude:lifecycle:1a0bcf0e83def40ec23574065d3fbcd03e14b7eba85396d0e04b3e22cb385c36",
+          "requirement": "optional",
+          "health_url": ""
+        },
+        {
+          "handler_digest": "claude:lifecycle:36392c209524eb9e0f86f27883cf9435113dde433d404092c046d034d07cb23a",
+          "requirement": "optional",
+          "health_url": ""
+        },
+        {
+          "handler_digest": "claude:lifecycle:3a0bdc625aa30281b7f8c6425e72b6c79c712cc760148bdd3d07abfefa1bb40c",
+          "requirement": "optional",
+          "health_url": ""
+        },
+        {
+          "handler_digest": "claude:lifecycle:5d43d35667d8670d66450ff5e3bcf6277667ec358b4ffcbb56641ca93569a7e9",
+          "requirement": "optional",
+          "health_url": ""
+        },
+        {
+          "handler_digest": "claude:lifecycle:8d073569b572566d0b1b397d8f96ac57066a937e11aa21b69fcd91c908fe274e",
+          "requirement": "optional",
+          "health_url": ""
+        },
+        {
+          "handler_digest": "claude:lifecycle:973576d5b380b5434987c0058d82fb882d13e294fd2126991cc87dc7f0819b39",
+          "requirement": "optional",
+          "health_url": ""
+        },
+        {
+          "handler_digest": "claude:lifecycle:a5b5e2c933452107afa0ff2af765aa908dae39e29507870f2a2c77752e46b0fa",
+          "requirement": "optional",
+          "health_url": ""
+        },
+        {
+          "handler_digest": "claude:lifecycle:bf4be2301bef7062f81a7fad852cd8054f0844c0f775c05c808feb9df526359b",
+          "requirement": "optional",
+          "health_url": ""
+        },
+        {
+          "handler_digest": "claude:lifecycle:dcba00ddd5e3217bf9e49774b9bbbafedb93f70aeabd0ad62287dcc770a67c2b",
+          "requirement": "optional",
+          "health_url": ""
+        },
+        {
+          "handler_digest": "claude:lifecycle:e17b004affd832cc8a4cfe6e967c22e63119f4b3139685917356a8367cf67aaa",
+          "requirement": "optional",
+          "health_url": ""
+        },
+        {
+          "handler_digest": "claude:lifecycle:e8576ac78319bbe66652774994978188db3fea0aaa63794b89992c5d82fd5423",
+          "requirement": "optional",
+          "health_url": ""
+        },
+        {
+          "handler_digest": "claude:lifecycle:edffe06f1875deb63883ad091e004464df6ceed52c5e200447a0f648744417f1",
+          "requirement": "optional",
+          "health_url": ""
+        },
+        {
+          "handler_digest": "claude:lifecycle:ef3f67c5702b942ce54497d6683651ec06f01c433c016462774ba7b1559b260c",
+          "requirement": "optional",
+          "health_url": ""
+        },
+        {
+          "handler_digest": "claude:permission:18eca422652c002cef59eb9442d090c177a5be8ec3f60bb1698529e972ea45b3",
+          "requirement": "optional",
+          "health_url": ""
+        },
+        {
+          "handler_digest": "claude:permission:fca11f4b90b2478a7f15a75c4de875c86496b74dea5e3cb249ee199a1e9754c6",
+          "requirement": "optional",
+          "health_url": ""
+        },
+        {
+          "handler_digest": "claude:pre-tool:1010a4eebe1ee1b8f0747247ffbe41c271359f70634674cc712a81e6d69fad66",
+          "requirement": "optional",
+          "health_url": ""
+        },
+        {
+          "handler_digest": "claude:pre-tool:1b4a05661f4110f2000509b6db93beb576433d5558286f60694b1ec3139b31c7",
+          "requirement": "optional",
+          "health_url": ""
+        },
+        {
+          "handler_digest": "claude:pre-tool:33ea1f1e908fd64b50207b4962b598cc25d9fbcb5251e5ce3db8ad3010a4d9b6",
+          "requirement": "optional",
+          "health_url": ""
+        },
+        {
+          "handler_digest": "claude:pre-tool:4037325a13304d48839bbb564053ef334f30ab6671e1767a3e72ad61ae48dcb1",
+          "requirement": "optional",
+          "health_url": ""
+        },
+        {
+          "handler_digest": "claude:pre-tool:a881055c8b2194e3a0a176db78a352bf33f0909bd80867b9443e90a50f93b1e9",
+          "requirement": "optional",
+          "health_url": ""
+        },
+        {
+          "handler_digest": "claude:prompt:9a26193f5f67340aaace10e4ede3ee511765556795f4beb922565d925bdee9b9",
+          "requirement": "optional",
+          "health_url": ""
+        },
+        {
+          "handler_digest": "claude:prompt:b7bd6aca520f722dea8063d35b1dcd2b22eeb8b2bc2504cee36b962ed0373647",
+          "requirement": "optional",
+          "health_url": ""
+        },
+        {
+          "handler_digest": "claude:prompt:ca3e8c624971a500f2f20e54a3734b520c124c76d5b07a8d7335ba8c8b7e5b88",
+          "requirement": "optional",
+          "health_url": ""
+        },
+        {
+          "handler_digest": "claude:stop:84584938c79999f17dcd07efb306de464001345b3b8e9f9106e5281efcbcedad",
+          "requirement": "optional",
+          "health_url": ""
+        },
+        {
+          "handler_digest": "claude:stop:b156eefdb0693cfca0c43ade4c099aff459f3ef2d98004ede5c05ccd97eba1a9",
+          "requirement": "optional",
+          "health_url": ""
+        },
+        {
+          "handler_digest": "claude:stop:c92a8710abfb8cbf59cd4836cba31b4b6c722cebe89fd3df4e13ec2fe9fd4a69",
+          "requirement": "optional",
+          "health_url": ""
+        }
+      ]
+    }
+  }
+}
+
