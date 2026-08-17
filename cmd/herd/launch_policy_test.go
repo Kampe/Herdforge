@@ -416,6 +416,7 @@ func TestLaneLaunchDecisionReportsConfiguredProbeFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", dir)
+	t.Setenv("HERD_MODE", "production")
 	t.Setenv("HERDR_ROUTE_STATE_DIR", t.TempDir())
 	lane := &config.LaneDef{Name: "smith", Role: launch.WorkerRole, AgentKind: "codex", Harness: "codex", Provider: launch.WorkerProvider, Model: launch.WorkerModel, Effort: launch.WorkerEffort, TaskShape: launch.Implementation}
 
