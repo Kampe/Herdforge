@@ -4176,6 +4176,10 @@ func parseDispatchArgs(args []string) (dispatchRequest, error) {
 }
 
 func runDispatch() {
+	if len(os.Args) > 2 && os.Args[2] == "cancel" {
+		runDispatchCancel()
+		return
+	}
 	req, err := parseDispatchArgs(os.Args[2:])
 	if err != nil {
 		fmt.Fprintln(os.Stderr, usageFor("dispatch"))
@@ -4184,7 +4188,9 @@ func runDispatch() {
 		}
 		os.Exit(1)
 	}
-	result, _, err := dispatchTicketDecision(context.Background(), req, os.Stdout)
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	result, _, err := dispatchTicketDecision(ctx, req, os.Stdout)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "%v\n", err)
 		os.Exit(1)
@@ -4199,6 +4205,96 @@ func runDispatch() {
 	} else {
 		fmt.Printf("  Agent    : Not launched (use --no-launch or see TASK-PACKET.md)\n")
 	}
+}
+
+type dispatchCancelRequest struct {
+	TicketRef       string
+	LeaseGeneration int64
+}
+
+// parseDispatchCancelArgs accepts the operator's exact-generation handback
+// request without entering any provider or worktree code. The generation is
+// mandatory so a cancellation can never release a later incarnation.
+func parseDispatchCancelArgs(args []string) (dispatchCancelRequest, error) {
+	var req dispatchCancelRequest
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		switch {
+		case arg == "--lease":
+			if i+1 >= len(args) {
+				return dispatchCancelRequest{}, errors.New("dispatch cancel: --lease requires a generation")
+			}
+			i++
+			generation, err := strconv.ParseInt(args[i], 10, 64)
+			if err != nil || generation < 1 {
+				return dispatchCancelRequest{}, fmt.Errorf("dispatch cancel: invalid lease generation %q", args[i])
+			}
+			if req.LeaseGeneration != 0 {
+				return dispatchCancelRequest{}, errors.New("dispatch cancel: --lease may be specified once")
+			}
+			req.LeaseGeneration = generation
+		case strings.HasPrefix(arg, "--lease="):
+			generation, err := strconv.ParseInt(strings.TrimPrefix(arg, "--lease="), 10, 64)
+			if err != nil || generation < 1 {
+				return dispatchCancelRequest{}, fmt.Errorf("dispatch cancel: invalid lease generation %q", strings.TrimPrefix(arg, "--lease="))
+			}
+			if req.LeaseGeneration != 0 {
+				return dispatchCancelRequest{}, errors.New("dispatch cancel: --lease may be specified once")
+			}
+			req.LeaseGeneration = generation
+		case arg == "--":
+			if i+1 >= len(args) || req.TicketRef != "" {
+				return dispatchCancelRequest{}, errors.New("dispatch cancel: expected one ticket ref")
+			}
+			req.TicketRef = args[i+1]
+			i++
+		case strings.HasPrefix(arg, "-"):
+			return dispatchCancelRequest{}, fmt.Errorf("dispatch cancel: unknown flag %q", arg)
+		case req.TicketRef == "":
+			req.TicketRef = arg
+		default:
+			return dispatchCancelRequest{}, errors.New("dispatch cancel: expected one ticket ref")
+		}
+	}
+	if strings.TrimSpace(req.TicketRef) == "" {
+		return dispatchCancelRequest{}, errors.New("dispatch cancel: ticket ref is required")
+	}
+	if req.LeaseGeneration < 1 {
+		return dispatchCancelRequest{}, errors.New("dispatch cancel: --lease generation is required")
+	}
+	return req, nil
+}
+
+// runDispatchCancel is a bounded, operator-invoked recovery for a packet-only
+// dispatch that will not be launched. It is fenced by the exact lease
+// generation and coordinator owner, so it cannot release a later claimant.
+func runDispatchCancel() {
+	req, err := parseDispatchCancelArgs(os.Args[3:])
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%v\nusage: herd dispatch cancel <TASK-REF> --lease <generation>\n", err)
+		os.Exit(2)
+	}
+	root, err := canonicalHerdRoot()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "dispatch cancel: canonical root: %v\n", err)
+		os.Exit(1)
+	}
+	cfg, err := config.LoadConfig(filepath.Join(root, ".herd", "herd.yaml"))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "dispatch cancel: config: %v\n", err)
+		os.Exit(1)
+	}
+	repository, err := dispatch.AuthenticatedRepositoryIdentity(root)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "dispatch cancel: repository identity: %v\n", err)
+		os.Exit(1)
+	}
+	key := claim.LeaseKey{Repo: repository, Provider: cfg.TaskProvider.Type, Project: cfg.TaskProvider.ProjectID, TaskRef: hsync.NormalizeRef(req.TicketRef)}
+	if err := releaseCoordinationLeaseBounded(root, key, "coordinator-dispatch", req.LeaseGeneration); err != nil {
+		fmt.Fprintf(os.Stderr, "dispatch cancel: release %s generation %d: %v\n", req.TicketRef, req.LeaseGeneration, err)
+		os.Exit(1)
+	}
+	fmt.Printf("dispatch cancel: released %s generation %d\n", req.TicketRef, req.LeaseGeneration)
 }
 
 // dispatchTicketDecision is the production claim + isolated dispatch for ONE
@@ -4426,7 +4522,7 @@ func dispatchTicketDecision(ctx context.Context, req dispatchRequest, announce i
 			// launchAdmission can fail after the coordination lease is acquired
 			// (for example, a missing native harness probe). Release that exact
 			// lease before returning so a failed launch never blocks the next tick.
-			if relErr := releaseCoordinationLease(ctx, dispatchRoot, leaseKey, "coordinator-dispatch", leaseGen); relErr != nil {
+			if relErr := releaseCoordinationLeaseBounded(dispatchRoot, leaseKey, "coordinator-dispatch", leaseGen); relErr != nil {
 				return nil, nil, fmt.Errorf("dispatch launch failed: %w; LEASE COMPENSATION ALSO FAILED: %v", err, relErr)
 			}
 			return nil, nil, fmt.Errorf("dispatch launch failed: %w", err)
@@ -4439,6 +4535,9 @@ func dispatchTicketDecision(ctx context.Context, req dispatchRequest, announce i
 	result := dispatchResult
 	if noLaunch {
 		if err := admitDispatch(); err != nil {
+			if relErr := releaseCoordinationLeaseBounded(dispatchRoot, leaseKey, "coordinator-dispatch", leaseGen); relErr != nil {
+				return nil, nil, fmt.Errorf("dispatch hold admission rejected: %w; LEASE COMPENSATION ALSO FAILED: %v", err, relErr)
+			}
 			return nil, nil, fmt.Errorf("dispatch hold admission rejected: %w", err)
 		}
 		result, err = d.Dispatch(ctx, dispatch.DispatchOptions{TicketRef: ticketRef, NoLaunch: true, LaneName: laneName, Decision: decision, EnvironmentPlanID: req.EnvironmentPlanID, LeaseID: leaseID, LeaseGeneration: leaseGen})
@@ -4446,7 +4545,7 @@ func dispatchTicketDecision(ctx context.Context, req dispatchRequest, announce i
 	if err != nil {
 		// Durable compensation: a failed dispatch releases the exact lease
 		// it acquired — the ticket is never stranded behind a dead claim.
-		if relErr := releaseCoordinationLease(ctx, dispatchRoot, leaseKey, "coordinator-dispatch", leaseGen); relErr != nil {
+		if relErr := releaseCoordinationLeaseBounded(dispatchRoot, leaseKey, "coordinator-dispatch", leaseGen); relErr != nil {
 			return nil, nil, fmt.Errorf("dispatch failed: %w; LEASE COMPENSATION ALSO FAILED: %v", err, relErr)
 		}
 		return nil, nil, fmt.Errorf("dispatch failed (lease released): %w", err)
@@ -8410,6 +8509,18 @@ func releaseCoordinationLease(ctx context.Context, root string, key claim.LeaseK
 	defer st.Close()
 	_, _, err = st.Release(ctx, key, owner, generation, time.Now())
 	return err
+}
+
+const dispatchCompensationTimeout = 5 * time.Second
+
+// releaseCoordinationLeaseBounded deliberately ignores an interrupted
+// operation's cancelled context. Compensation is a new authority operation;
+// it gets a short, independent deadline so SIGTERM/context cancellation
+// cannot strand the exact generation that was just acquired.
+func releaseCoordinationLeaseBounded(root string, key claim.LeaseKey, owner string, generation int64) error {
+	ctx, cancel := context.WithTimeout(context.Background(), dispatchCompensationTimeout)
+	defer cancel()
+	return releaseCoordinationLease(ctx, root, key, owner, generation)
 }
 
 // verdictClaimPrefix marks provider-side ownership claims.

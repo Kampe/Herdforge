@@ -125,7 +125,11 @@ Flags:
 Help is reserved: -h / --help never become the ticket. A literal payload equal
 to --help is accepted only as:
   herd dispatch -- --help
-	  herd dispatch --ticket=--help`,
+	  herd dispatch --ticket=--help
+
+Recovery:
+  herd dispatch cancel <ticket-ref> --lease <generation>
+  Releases only that coordinator-dispatch lease generation.`,
 	"envplan": `Usage: herd envplan <create|inspect|grant|revoke> [flags]
   Operator-managed, repository-relative environment capability plans. Plans
   record capability evidence and bindings only; credential values are refused.`,
