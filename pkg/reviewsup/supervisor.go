@@ -14,6 +14,7 @@ import (
 
 	"github.com/Kampe/Herdforge/pkg/classify"
 	"github.com/Kampe/Herdforge/pkg/control"
+	"github.com/Kampe/Herdforge/pkg/reviewingest"
 	"github.com/Kampe/Herdforge/pkg/router"
 )
 
@@ -80,6 +81,9 @@ type Row struct {
 	LeaseID       string `json:"lease_id,omitempty"`
 	Generation    int64  `json:"generation,omitempty"`
 	ReceiptDigest string `json:"receipt_digest,omitempty"`
+	// Artifact is the repo-relative durable review-inbox path retained before
+	// cleanup-candidate admission (FAC-373).
+	Artifact string `json:"artifact,omitempty"`
 }
 
 type CandidateState string
@@ -146,6 +150,9 @@ type Candidate struct {
 	// admitted this candidate. LaunchReview re-checks it; empty digest
 	// never enters review.
 	ReceiptDigest    string
+	// Artifact is the durable .herd/review/inbox path proven before a PASS
+	// may become cleanup-candidate (FAC-373).
+	Artifact         string
 	VerdictRetained  bool
 	Ingested         bool
 	HarvestReady     bool
@@ -280,6 +287,10 @@ func RequireCrossFamily(tier RiskTier) bool {
 type ReceiptAdmit func(ctx context.Context, worktreeDir, digest string) error
 
 type Config struct {
+	// RepoRoot is the git repository root used for durable review-inbox
+	// retention (.herd/review/inbox). PASS cannot become cleanup-candidate
+	// without a retained artifact under this root (FAC-373).
+	RepoRoot          string
 	LedgerPath        string
 	QueuePath         string
 	MaxPendingReviews int
@@ -299,6 +310,7 @@ type Config struct {
 
 func DefaultConfig(ledgerDir string) Config {
 	return Config{
+		RepoRoot:          ledgerDir,
 		LedgerPath:        filepath.Join(ledgerDir, "supervisor-ledger.jsonl"),
 		QueuePath:         filepath.Join(ledgerDir, "harvest-evidence-queue.jsonl"),
 		MaxPendingReviews: 3,
@@ -961,6 +973,10 @@ type ReviewVerdict struct {
 	Reviewer string
 	Verdict  Verdict
 	Reason   string
+	// Artifact is the path of the reviewer verdict body. For PASS it may be an
+	// ephemeral temp path; SubmitVerdict retains it under the repo review
+	// inbox before any cleanup-candidate transition (FAC-373).
+	Artifact string
 }
 
 func (sv *ReviewSupervisor) SubmitVerdict(v ReviewVerdict) (newState CandidateState, err error) {
@@ -995,9 +1011,24 @@ func (sv *ReviewSupervisor) SubmitVerdict(v ReviewVerdict) (newState CandidateSt
 		return "", fmt.Errorf("reviewsup: candidate %s received verdict from same-family reviewer (author=%s, reviewer=%s)", v.SHA, authorFamily, reviewFamily)
 	}
 
+	// FAC-373: a PASS is not cleanup-ready until the exact-SHA artifact is
+	// durably retained under .herd/review/inbox. Missing or vanished sources
+	// become one durable BLOCKED state — never a coordinator-directed PASS.
+	var retainedArtifact string
+	if v.Verdict == VerdictPASS {
+		retained, retainErr := sv.retainPASSArtifact(v)
+		if retainErr != nil {
+			return sv.blockMissingArtifact(cand, v, retainErr)
+		}
+		retainedArtifact = retained
+	}
+
 	cand.Verdict = v.Verdict
 	cand.VerdictReason = v.Reason
 	cand.UpdatedAt = sv.now()
+	if retainedArtifact != "" {
+		cand.Artifact = retainedArtifact
+	}
 
 	if err := sv.appendRow(&Row{
 		Event:    string(EventVerdict),
@@ -1005,9 +1036,11 @@ func (sv *ReviewSupervisor) SubmitVerdict(v ReviewVerdict) (newState CandidateSt
 		Reviewer: v.Reviewer,
 		Verdict:  string(v.Verdict),
 		Reason:   v.Reason,
+		Artifact: retainedArtifact,
 	}); err != nil {
 		cand.Verdict = ""
 		cand.VerdictReason = ""
+		cand.Artifact = ""
 		cand.UpdatedAt = sv.now()
 		return "", fmt.Errorf("reviewsup: append verdict row: %w", err)
 	}
@@ -1018,6 +1051,7 @@ func (sv *ReviewSupervisor) SubmitVerdict(v ReviewVerdict) (newState CandidateSt
 		Verdict:       string(v.Verdict),
 		Reason:        v.Reason,
 		ReceiptDigest: cand.ReceiptDigest,
+		Artifact:      retainedArtifact,
 	}); err != nil {
 		return "", fmt.Errorf("reviewsup: retain verdict row: %w", err)
 	}
@@ -1033,20 +1067,23 @@ func (sv *ReviewSupervisor) SubmitVerdict(v ReviewVerdict) (newState CandidateSt
 			ReviewFamily: cand.ReviewFamily,
 			Tier:         string(cand.Tier),
 			Attempts:     cand.Attempts,
+			Artifact:     retainedArtifact,
 		}); err != nil {
 			sv.pendingCount++
 			cand.Verdict = ""
 			cand.VerdictReason = ""
+			cand.Artifact = ""
 			cand.UpdatedAt = sv.now()
 			return "", fmt.Errorf("reviewsup: append harvest row: %w", err)
 		}
 		cand.VerdictRetained = true
 		cand.Ingested = true
 		cand.HarvestReady = true
-		if err := sv.appendRow(&Row{Event: string(EventIngested), SHA: v.SHA, Reviewer: v.Reviewer, ReceiptDigest: cand.ReceiptDigest}); err != nil {
+		if err := sv.appendRow(&Row{Event: string(EventIngested), SHA: v.SHA, Reviewer: v.Reviewer, ReceiptDigest: cand.ReceiptDigest, Artifact: retainedArtifact}); err != nil {
 			return "", fmt.Errorf("reviewsup: retain ingested event: %w", err)
 		}
-		if err := sv.appendRow(&Row{Event: string(EventCleanupCandidate), SHA: v.SHA, Reviewer: v.Reviewer, Reason: "verdict retained; coordinator may close exact tab after harvest"}); err != nil {
+		// Cleanup is admitted only after durable retain + ingest proof.
+		if err := sv.appendRow(&Row{Event: string(EventCleanupCandidate), SHA: v.SHA, Reviewer: v.Reviewer, Artifact: retainedArtifact, Reason: "exact-SHA artifact retained under review inbox; coordinator may close exact tab after harvest"}); err != nil {
 			return "", fmt.Errorf("reviewsup: append cleanup candidate: %w", err)
 		}
 		cand.State = StateHarvested
@@ -1111,6 +1148,94 @@ func (sv *ReviewSupervisor) SubmitVerdict(v ReviewVerdict) (newState CandidateSt
 	}
 
 	return cand.State, nil
+}
+
+// retainPASSArtifact copies the reviewer verdict into the durable review
+// inbox and re-stats it. Ephemeral temp paths (chainseer-herd-review, /tmp)
+// are never cleanup authority.
+func (sv *ReviewSupervisor) retainPASSArtifact(v ReviewVerdict) (string, error) {
+	root := strings.TrimSpace(sv.cfg.RepoRoot)
+	if root == "" {
+		return "", fmt.Errorf("RepoRoot required for durable PASS retention")
+	}
+	source := strings.TrimSpace(v.Artifact)
+	if source == "" {
+		return "", fmt.Errorf("missing PASS verdict artifact for %s", v.SHA)
+	}
+	// Allow either an absolute ephemeral path or a repo-relative path.
+	if !filepath.IsAbs(source) {
+		source = filepath.Join(root, source)
+	}
+	retained, err := reviewingest.RetainArtifact(root, source, v.SHA, v.Reviewer)
+	if err != nil {
+		return "", err
+	}
+	if !reviewingest.IsInboxPath(retained) {
+		return "", fmt.Errorf("retain produced non-inbox path %q", retained)
+	}
+	dst := filepath.Join(root, filepath.FromSlash(retained))
+	info, err := os.Stat(dst)
+	if err != nil {
+		return "", fmt.Errorf("retained artifact vanished before cleanup gate: %w", err)
+	}
+	if info.Size() == 0 {
+		return "", fmt.Errorf("retained artifact is empty")
+	}
+	return retained, nil
+}
+
+// blockMissingArtifact records one durable BLOCKED state when a claimed PASS
+// cannot prove a durable inbox artifact. The candidate never becomes
+// cleanup-candidate or harvest-ready.
+func (sv *ReviewSupervisor) blockMissingArtifact(cand *Candidate, v ReviewVerdict, cause error) (CandidateState, error) {
+	reason := fmt.Sprintf("PASS refused: durable review-inbox artifact required before cleanup (%v)", cause)
+	cand.Verdict = VerdictBLOCKED
+	cand.VerdictReason = reason
+	cand.UpdatedAt = sv.now()
+	cand.VerdictRetained = false
+	cand.Ingested = false
+	cand.HarvestReady = false
+	cand.CleanupCandidate = false
+	cand.Artifact = ""
+
+	if err := sv.appendRow(&Row{
+		Event:    string(EventVerdict),
+		SHA:      v.SHA,
+		Reviewer: v.Reviewer,
+		Verdict:  string(VerdictBLOCKED),
+		Reason:   reason,
+	}); err != nil {
+		cand.Verdict = ""
+		cand.VerdictReason = ""
+		cand.UpdatedAt = sv.now()
+		return "", fmt.Errorf("reviewsup: append missing-artifact BLOCKED: %w", err)
+	}
+	sv.pendingCount--
+	if err := sv.appendRow(&Row{
+		Event:    string(EventBuilderCallback),
+		SHA:      v.SHA,
+		Reviewer: v.Reviewer,
+		Verdict:  string(VerdictBLOCKED),
+		Reason:   reason,
+		Attempts: cand.Attempts,
+	}); err != nil {
+		sv.pendingCount++
+		cand.Verdict = ""
+		cand.VerdictReason = ""
+		cand.UpdatedAt = sv.now()
+		return "", fmt.Errorf("reviewsup: append missing-artifact builder callback: %w", err)
+	}
+	if err := sv.appendRow(&Row{
+		Event:    string(EventAuthorNotified),
+		SHA:      v.SHA,
+		Reviewer: v.Reviewer,
+		Verdict:  string(VerdictBLOCKED),
+		Reason:   reason,
+	}); err != nil {
+		return "", fmt.Errorf("reviewsup: append missing-artifact author notification: %w", err)
+	}
+	cand.State = StateBlocked
+	return StateBlocked, fmt.Errorf("reviewsup: %s", reason)
 }
 
 func (sv *ReviewSupervisor) PendingCount() int {
@@ -1540,16 +1665,30 @@ func (sv *ReviewSupervisor) Reconstruct() (int, error) {
 				cand.VerdictRetained = true
 				cand.Verdict = Verdict(r.Verdict)
 				cand.VerdictReason = r.Reason
+				if r.Artifact != "" {
+					cand.Artifact = r.Artifact
+				}
 			}
 
 		case EventIngested:
 			if cand, ok := sv.cands[r.SHA]; ok {
 				cand.Ingested = true
+				if r.Artifact != "" {
+					cand.Artifact = r.Artifact
+				}
 			}
 
 		case EventCleanupCandidate:
 			if cand, ok := sv.cands[r.SHA]; ok {
+				// FAC-373: cleanup-candidate is only authoritative when the
+				// retained inbox artifact path is still on the row (and was
+				// recorded with a real retain). Legacy rows without Artifact
+				// still project cleanup so MarkClosed can recover them, but
+				// new PASS paths always carry the path.
 				cand.CleanupCandidate = true
+				if r.Artifact != "" {
+					cand.Artifact = r.Artifact
+				}
 			}
 
 		case EventDispatchBlocked:

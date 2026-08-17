@@ -1,10 +1,8 @@
 package main
 
 import (
-	"crypto/sha256"
 	"flag"
 	"fmt"
-	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -90,8 +88,9 @@ func runReviewIngest() {
 		// Retain the validated artifact inside the repository before writing its
 		// ledger row. Reviewer panes use ephemeral /tmp worktrees and cleanup
 		// may race ingest; a ledger row pointing at a vanished path is not
-		// durable review authority.
-		retained, retainErr := retainVerdictArtifact(".", f, a.SHA, a.Reviewer)
+		// durable review authority. Native review-ingest is the only PASS
+		// admission path and prints ADMITTED only after this retain (FAC-373).
+		retained, retainErr := reviewingest.RetainArtifact(".", f, a.SHA, a.Reviewer)
 		if retainErr != nil {
 			fmt.Fprintf(os.Stderr, "herd review-ingest: retain artifact FAILED for %s: %v\n", filepath.Base(f), retainErr)
 			os.Exit(1)
@@ -137,69 +136,6 @@ func runReviewIngest() {
 	if refused > 0 {
 		os.Exit(1)
 	}
-}
-
-// retainVerdictArtifact copies a validated verdict into the repo-local review
-// inbox using a content-addressed filename. The returned path is relative to
-// the repo root so the ledger remains portable across worktrees.
-func retainVerdictArtifact(root, source, sha, reviewer string) (string, error) {
-	if strings.TrimSpace(root) == "" || strings.TrimSpace(source) == "" || strings.TrimSpace(sha) == "" {
-		return "", fmt.Errorf("root, source, and candidate sha are required")
-	}
-	in, err := os.Open(source)
-	if err != nil {
-		return "", err
-	}
-	defer in.Close()
-	digest := sha256.New()
-	if _, err := io.Copy(digest, in); err != nil {
-		return "", fmt.Errorf("hash verdict artifact: %w", err)
-	}
-	if _, err := in.Seek(0, 0); err != nil {
-		return "", fmt.Errorf("rewind verdict artifact: %w", err)
-	}
-	name := strings.ToLower(strings.TrimSpace(reviewer))
-	var b strings.Builder
-	for _, r := range name {
-		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-' || r == '_' {
-			b.WriteRune(r)
-		} else {
-			b.WriteByte('-')
-		}
-	}
-	name = strings.Trim(b.String(), "-")
-	if name == "" {
-		name = "reviewer"
-	}
-	if len(name) > 32 {
-		name = name[:32]
-	}
-	rel := filepath.Join(".herd", "review", "inbox", fmt.Sprintf("%s-%s-%s.md", strings.ToLower(shortSHA(sha)), name, fmt.Sprintf("%x", digest.Sum(nil))[:16]))
-	dst := filepath.Join(root, rel)
-	if err := os.MkdirAll(filepath.Dir(dst), 0o700); err != nil {
-		return "", fmt.Errorf("create review inbox: %w", err)
-	}
-	tmp, err := os.CreateTemp(filepath.Dir(dst), ".verdict-*.tmp")
-	if err != nil {
-		return "", fmt.Errorf("create retained artifact: %w", err)
-	}
-	tmpName := tmp.Name()
-	defer os.Remove(tmpName)
-	if _, err := io.Copy(tmp, in); err != nil {
-		_ = tmp.Close()
-		return "", fmt.Errorf("copy verdict artifact: %w", err)
-	}
-	if err := tmp.Chmod(0o600); err != nil {
-		_ = tmp.Close()
-		return "", fmt.Errorf("secure retained artifact: %w", err)
-	}
-	if err := tmp.Close(); err != nil {
-		return "", fmt.Errorf("close retained artifact: %w", err)
-	}
-	if err := os.Rename(tmpName, dst); err != nil {
-		return "", fmt.Errorf("publish retained artifact: %w", err)
-	}
-	return filepath.ToSlash(rel), nil
 }
 
 // runHarvestMerge ports bin/herd-harvest-merge: cherry-pick a lane's unique
