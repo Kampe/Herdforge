@@ -274,7 +274,7 @@ func shotConfigPath(root string) string {
 // control plane already uses; mail routes by recipient and DrainCallbacks
 // filters by subject, so agent callbacks and coordinator orders coexist in it.
 func shotMailbox(root string) *mail.Mailbox {
-	return mail.NewMailbox(filepath.Join(root, ".herd", "control-mail.jsonl"))
+	return mail.NewMailbox(mail.CallbackMailPath(root))
 }
 
 // awaitShotCallback blocks until a callback bound to THIS ref and lease lands,

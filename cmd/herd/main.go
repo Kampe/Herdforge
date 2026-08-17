@@ -7226,7 +7226,7 @@ func runVerify() {
 		if cb, cbErr := tc.BoundCallback(kind, sha, detail); cbErr != nil {
 			fmt.Fprintf(os.Stderr, "herd verify: callback binding refused (FAC-145): %v\n", cbErr)
 			os.Exit(2)
-		} else if _, postErr := mail.NewMailbox(filepath.Join(verifyRoot, mail.DefaultMailFile)).PostCallback(tc.Role, cb); postErr != nil {
+		} else if _, postErr := mail.NewMailbox(mail.CallbackMailPath(verifyRoot)).PostCallback(tc.Role, cb); postErr != nil {
 			fmt.Fprintf(os.Stderr, "herd verify: callback post failed (FAC-145): %v\n", postErr)
 			os.Exit(2)
 		}
