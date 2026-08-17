@@ -2,14 +2,17 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/Kampe/Herdforge/pkg/config"
 	"github.com/Kampe/Herdforge/pkg/daemon"
+	"github.com/Kampe/Herdforge/pkg/dispatch"
 	"github.com/Kampe/Herdforge/pkg/lifecycle"
 	"github.com/Kampe/Herdforge/pkg/verifier"
 )
@@ -58,6 +61,14 @@ func worktreeHeadSHA(wt string) (string, error) {
 }
 
 func bindingForWorktree(cfg *config.Config, machine *lifecycle.Machine, ref, wt string) (daemon.CompletionBinding, error) {
+	root, err := canonicalHerdRoot()
+	if err != nil {
+		return daemon.CompletionBinding{}, err
+	}
+	return bindingForWorktreeAtRoot(cfg, machine, ref, wt, root)
+}
+
+func bindingForWorktreeAtRoot(cfg *config.Config, machine *lifecycle.Machine, ref, wt, root string) (daemon.CompletionBinding, error) {
 	sha, err := worktreeHeadSHA(wt)
 	if err != nil {
 		return daemon.CompletionBinding{}, err
@@ -91,9 +102,61 @@ func bindingForWorktree(cfg *config.Config, machine *lifecycle.Machine, ref, wt 
 		}
 	}
 	if bind.LeaseGeneration <= 0 {
-		return daemon.CompletionBinding{}, fmt.Errorf("no positive lease generation for %s (lifecycle must record the active lease)", ref)
+		// Forge's early claim path predated lifecycle projection. A signed,
+		// unexpired launch receipt is the only safe compatibility source for
+		// those claims; unsigned or conflicting receipts never get promoted.
+		tc, receiptErr := signedLaunchReceiptForReview(root, ref, wt)
+		if receiptErr == nil {
+			bind.LeaseGeneration = tc.LeaseGeneration
+			if tc.Branch != "" {
+				bind.Branch = tc.Branch
+			}
+			if tc.Repository != "" {
+				bind.Repo = tc.Repository
+			}
+		} else {
+			return daemon.CompletionBinding{}, fmt.Errorf("no positive lease generation for %s (lifecycle missing and signed receipt fallback refused: %v)", ref, receiptErr)
+		}
 	}
 	return bind, nil
+}
+
+// signedLaunchReceiptForReview authenticates the durable forge launch receipt
+// before using its lease generation as a legacy lifecycle fallback. The
+// canonical receipt is authoritative; a worktree copy is only considered when
+// the canonical store has no entry (for example, an interrupted legacy write).
+func signedLaunchReceiptForReview(root, ref, wt string) (dispatch.TaskContext, error) {
+	var (
+		tc  dispatch.TaskContext
+		err error
+	)
+	tc, err = dispatch.LoadCanonicalReceipt(root, ref)
+	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			return tc, err
+		}
+		tc, err = dispatch.ReadTaskContext(wt)
+	}
+	if err != nil {
+		return tc, err
+	}
+	if tc.TaskRef != ref {
+		return tc, fmt.Errorf("receipt task ref %q does not match %q", tc.TaskRef, ref)
+	}
+	if !tc.ExpiresAt.After(time.Now()) {
+		return tc, fmt.Errorf("receipt expired at %s", tc.ExpiresAt.UTC().Format(time.RFC3339))
+	}
+	verifier, err := dispatch.LoadVerifier(root)
+	if err != nil {
+		return tc, err
+	}
+	if err := verifier.Verify(tc); err != nil {
+		return tc, err
+	}
+	if tc.LeaseGeneration <= 0 {
+		return tc, fmt.Errorf("receipt has no positive lease generation")
+	}
+	return tc, nil
 }
 
 // verifyWorktreeForReview runs the FAC-144 gate and reports whether the

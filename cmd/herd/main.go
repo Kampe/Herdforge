@@ -4947,7 +4947,75 @@ func persistForgeTaskReceipt(cfg *config.Config, task *provider.Task, lane *conf
 	if err := dispatch.StoreCanonicalReceipt(root, signed); err != nil {
 		return err
 	}
+	// Forge claims bypass daemon.Engine's lifecycle projection, so record the
+	// same claim/dispatch/building path before exposing the task to review.
+	// This is idempotent and preserves the signed receipt fallback for legacy
+	// claims whose lifecycle row predates this projection.
+	if err := recordForgeLifecycle(root, task.Ref, repository, tok, branch, base); err != nil {
+		return fmt.Errorf("record forge lifecycle: %w", err)
+	}
 	return nil
+}
+
+func recordForgeLifecycle(root, ref, repo string, tok *deps.OwnershipToken, branch, base string) error {
+	if tok == nil || tok.Generation <= 0 {
+		return errors.New("forge lifecycle requires a positive lease generation")
+	}
+	machine, err := lifecycle.NewMachine(filepath.Join(root, defaultLifecycleDB))
+	if err != nil {
+		return err
+	}
+	defer machine.Close()
+	steps := []lifecycle.State{
+		lifecycle.StateEligible,
+		lifecycle.StateClaimed,
+		lifecycle.StateDispatched,
+		lifecycle.StateBuilding,
+	}
+	for i, target := range steps {
+		current, stateErr := machine.EventStore().CurrentState(ref)
+		if stateErr != nil {
+			return stateErr
+		}
+		if current != nil {
+			if current.LeaseGeneration > tok.Generation {
+				return fmt.Errorf("lifecycle lease generation %d is newer than forge generation %d", current.LeaseGeneration, tok.Generation)
+			}
+			if forgeLifecycleRank(current.State) >= forgeLifecycleRank(target) {
+				continue
+			}
+		}
+		if _, err := machine.Transition(lifecycle.TransitionRequest{
+			TaskRef: ref, Repo: repo, To: target, Actor: "forge",
+			IdempotencyKey:  fmt.Sprintf("forge-claim:%s:g%d:%s", ref, tok.Generation, target),
+			LeaseGeneration: tok.Generation, Branch: branch, CandidateSHA: base,
+			Payload: fmt.Sprintf("step=%d", i),
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func forgeLifecycleRank(state lifecycle.State) int {
+	for i, candidate := range []lifecycle.State{
+		lifecycle.StateDraft,
+		lifecycle.StateEligible,
+		lifecycle.StateClaimed,
+		lifecycle.StateDispatched,
+		lifecycle.StateBuilding,
+		lifecycle.StateVerifying,
+		lifecycle.StateReviewing,
+		lifecycle.StateIntegrationQueued,
+		lifecycle.StateIntegrated,
+		lifecycle.StateReconciled,
+		lifecycle.StateCleaned,
+	} {
+		if state == candidate {
+			return i
+		}
+	}
+	return -1
 }
 
 func forgeGitOutput(dir string, args ...string) string {

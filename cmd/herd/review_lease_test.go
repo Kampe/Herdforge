@@ -9,7 +9,9 @@ import (
 	"time"
 
 	"github.com/Kampe/Herdforge/pkg/claim"
+	"github.com/Kampe/Herdforge/pkg/deps"
 	"github.com/Kampe/Herdforge/pkg/dispatch"
+	"github.com/Kampe/Herdforge/pkg/lifecycle"
 )
 
 func TestRequireLiveLeaseReacquiresReviewLeaseAfterWorkerRelease(t *testing.T) {
@@ -46,5 +48,75 @@ func TestRequireLiveLeaseReacquiresReviewLeaseAfterWorkerRelease(t *testing.T) {
 	}
 	if review == nil || review.Status != claim.StatusActive || review.Role != dispatch.RoleWorker {
 		t.Fatalf("review lease not active: %+v", review)
+	}
+}
+
+func TestBindingForWorktree_UsesAuthenticatedReceiptForLegacyLifecycle(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, ".herd"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, root, "init", "-b", "main")
+	gitIn(t, root, "config", "user.email", "test@example.invalid")
+	gitIn(t, root, "config", "user.name", "test")
+	if err := os.WriteFile(filepath.Join(root, "candidate.txt"), []byte("candidate\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, root, "add", "candidate.txt")
+	gitIn(t, root, "commit", "-m", "feat: legacy candidate")
+
+	keyDir := t.TempDir()
+	signer := fixtureSigner(t, keyDir, root)
+	tc := dispatch.TaskContext{
+		ProviderType: "kaneo", ProjectID: "proj-x", Repository: dispatch.RepositoryIdentityOrName(root, "herdforge-test"),
+		Role: dispatch.RoleWorker, TaskRef: "FAC-326", TaskID: "task-326", Branch: "herd/fac-326", BaseSHA: "base",
+		LeaseID: "claim:326", LeaseGeneration: 7, LeaseTaskRef: "FAC-326", SessionID: "legacy-worker",
+		AllowedOps: dispatch.WorkerOps, ExpiresAt: time.Now().Add(time.Hour),
+	}
+	signed, err := signer.Issue(tc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := dispatch.StoreCanonicalReceipt(root, signed); err != nil {
+		t.Fatal(err)
+	}
+	machine, err := lifecycle.NewMachine(filepath.Join(root, ".herd", "lifecycle.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer machine.Close()
+
+	bind, err := bindingForWorktreeAtRoot(nil, machine, "FAC-326", root, root)
+	if err != nil {
+		t.Fatalf("legacy receipt fallback refused: %v", err)
+	}
+	if bind.LeaseGeneration != 7 || bind.Branch != tc.Branch || bind.Repo != tc.Repository {
+		t.Fatalf("binding did not inherit authenticated receipt: %+v", bind)
+	}
+}
+
+func TestRecordForgeLifecycle_ProjectsClaimThroughBuilding(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, ".herd"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	tok := &deps.OwnershipToken{Generation: 3}
+	if err := recordForgeLifecycle(root, "FAC-326", "herdforge", tok, "herd/fac-326", "base-sha"); err != nil {
+		t.Fatal(err)
+	}
+	machine, err := lifecycle.NewMachine(filepath.Join(root, ".herd", "lifecycle.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer machine.Close()
+	state, err := machine.EventStore().CurrentState("FAC-326")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state == nil || state.State != lifecycle.StateBuilding || state.LeaseGeneration != 3 {
+		t.Fatalf("forge lifecycle state = %+v, want building/gen3", state)
+	}
+	if err := recordForgeLifecycle(root, "FAC-326", "herdforge", tok, "herd/fac-326", "base-sha"); err != nil {
+		t.Fatalf("idempotent lifecycle projection: %v", err)
 	}
 }
