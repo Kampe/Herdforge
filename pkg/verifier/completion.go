@@ -2,6 +2,8 @@ package verifier
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"strings"
@@ -24,6 +26,14 @@ type CompletionCheck struct {
 	Builds     bool
 	TestsPass  bool
 	Reasons    []string // human-readable failures, each carrying the fix
+}
+
+// CompletionReceipts contains the durable evidence produced by the build and
+// test legs of a managed completion check. The receipts are kept separate so
+// review admission can identify the exact command evidence it is consuming.
+type CompletionReceipts struct {
+	Build *Receipt
+	Test  *Receipt
 }
 
 func gitOut(dir string, args ...string) (string, error) {
@@ -78,6 +88,43 @@ func (v *Verifier) CheckCompletion(ctx context.Context, worktree, buildCmd, test
 
 	c.Passed = c.HasCommits && c.Builds && c.TestsPass
 	return c
+}
+
+// CheckCompletionAndPersist runs the same build/test completion gate while
+// persisting every terminal command outcome. Managed worktrees must use this
+// path: a callback without a receipt cannot be admitted for exact-SHA review.
+// Commands are parsed as argv and never passed through a shell.
+func (v *Verifier) CheckCompletionAndPersist(ctx context.Context, worktree, buildCmd, testCmd string, req VerificationRequest, store ReceiptStore) (*CompletionCheck, *CompletionReceipts, error) {
+	if store == nil {
+		return nil, nil, errors.New("completion receipts: receipt store is required")
+	}
+	c := &CompletionCheck{}
+	c.HasCommits = hasRealCommits(worktree)
+	if !c.HasCommits {
+		c.Reasons = append(c.Reasons,
+			"no real commits ahead of origin/main (only anchor/wip) — the agent did not produce work; re-dispatch or finish it")
+	}
+	receipts := &CompletionReceipts{}
+	buildReceipt, err := NewVerifier(buildCmd).VerifyAndPersist(ctx, worktree, req, store)
+	if err != nil {
+		return nil, nil, fmt.Errorf("persist build verification: %w", err)
+	}
+	receipts.Build = buildReceipt
+	c.Builds = buildReceipt.Outcome == OutcomePASS
+	if !c.Builds {
+		c.Reasons = append(c.Reasons, "build failed ("+buildCmd+") — fix compile errors before this can complete")
+	}
+	testReceipt, err := NewVerifier(testCmd).VerifyAndPersist(ctx, worktree, req, store)
+	if err != nil {
+		return nil, nil, fmt.Errorf("persist test verification: %w", err)
+	}
+	receipts.Test = testReceipt
+	c.TestsPass = testReceipt.Outcome == OutcomePASS
+	if !c.TestsPass {
+		c.Reasons = append(c.Reasons, "tests failed ("+testCmd+") — fix the failing tests before this can complete")
+	}
+	c.Passed = c.HasCommits && c.Builds && c.TestsPass
+	return c, receipts, nil
 }
 
 // runShell runs a non-shell argv string in dir and reports success. Empty or
