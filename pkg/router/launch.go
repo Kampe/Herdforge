@@ -462,6 +462,15 @@ func CapabilityOf(model string) CapabilityTier {
 	}
 }
 
+// CapabilityOfSurface applies the provider's canonical default capability
+// when its CLI intentionally owns model selection (currently Kimi).
+func CapabilityOfSurface(provider, model string) CapabilityTier {
+	if strings.TrimSpace(model) == "" && ModelOptional(provider) {
+		return CapFrontier
+	}
+	return CapabilityOf(model)
+}
+
 // ModelRequiresProbe reports whether a model may only launch after a current
 // tool-probe PASS. Luna is always gated; deepseek write surfaces are gated.
 func ModelRequiresProbe(model string) bool {
@@ -766,6 +775,7 @@ func (r *SurfaceRouter) Decide(req LaunchRequest) (*LaunchDecision, error) {
 	}
 	var picks []scored
 	modelOverride := map[string]string{}
+	var launchabilityFailure string
 
 	for pref, provider := range candidates {
 		model := ModelFor(provider, shape)
@@ -817,6 +827,12 @@ func (r *SurfaceRouter) Decide(req LaunchRequest) (*LaunchDecision, error) {
 		if !ok {
 			continue
 		}
+		if r.Probes != nil && r.Probes.Launchable != nil {
+			if launchable, reason := r.Probes.Launchable(provider, model); !launchable {
+				launchabilityFailure = fmt.Sprintf("%s/%s: %s", provider, model, reason)
+				continue
+			}
+		}
 
 		// Weekly-cap hard skip: lose to a healthy compatible alternative.
 		st, haveQuota := r.quotaState(provider, pool)
@@ -842,7 +858,7 @@ func (r *SurfaceRouter) Decide(req LaunchRequest) (*LaunchDecision, error) {
 		if ForbiddenDeepSeek(model) {
 			continue
 		}
-		cap := CapabilityOf(model)
+		cap := CapabilityOfSurface(provider, model)
 		if cap == CapUnknown {
 			continue
 		}
@@ -947,6 +963,9 @@ func (r *SurfaceRouter) Decide(req LaunchRequest) (*LaunchDecision, error) {
 		if mode == posture.ModeNoClaude {
 			return nil, fmt.Errorf("herd-route: no-claude posture has no healthy non-Anthropic route for role=%s shape=%s", req.Role, shape)
 		}
+		if launchabilityFailure != "" {
+			return nil, fmt.Errorf("herd-route: no launchable candidate for role=%s shape=%s: %s", req.Role, shape, launchabilityFailure)
+		}
 		return nil, fmt.Errorf("herd-route: no healthy launch candidate for role=%s shape=%s", req.Role, shape)
 	}
 
@@ -962,7 +981,7 @@ func (r *SurfaceRouter) Decide(req LaunchRequest) (*LaunchDecision, error) {
 	if ov, ok := modelOverride[best.provider]; ok {
 		model = ov
 		best.family = FamilyFor(best.provider, model)
-		best.cap = CapabilityOf(model)
+		best.cap = CapabilityOfSurface(best.provider, model)
 		best.pool = QuotaPoolFor(best.provider, model)
 		best.probeReq = ModelRequiresProbe(model)
 		if best.probeReq {
