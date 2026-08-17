@@ -735,6 +735,23 @@ func (k *KaneoProvider) ListComments(ctx context.Context, taskID string) ([]stri
 	dls := k.deadlines()
 	ctx, cancel := WithOpDeadline(ctx, dls, OpGet)
 	defer cancel()
+	if k.UseCLI {
+		res, err := kaneoRunCLI(ctx, "kaneo", "task", "comment", "list", taskID, "--json")
+		if err != nil {
+			return nil, fmt.Errorf("kaneo task comment list: %w", err)
+		}
+		var dtos []struct {
+			Content string `json:"content"`
+		}
+		if err := json.Unmarshal(res.Stdout, &dtos); err != nil {
+			return nil, fmt.Errorf("kaneo task comment list decode: %w", err)
+		}
+		out := make([]string, 0, len(dtos))
+		for _, d := range dtos {
+			out = append(out, d.Content)
+		}
+		return out, nil
+	}
 	url := fmt.Sprintf("%s/api/task/%s/comment", k.APIURL, taskID)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
