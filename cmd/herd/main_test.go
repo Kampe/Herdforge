@@ -24,6 +24,12 @@ var (
 )
 
 func TestMain(m *testing.M) {
+	// Reviewer panes carry HERD_ROLE=agent as launch metadata. The CLI suite
+	// creates coordinator-signed fixtures in-process and launches child CLIs;
+	// keep that pane marker out of both test contexts while leaving the
+	// production signer-boundary check unchanged.
+	_ = os.Unsetenv("HERD_ROLE")
+
 	code := m.Run()
 	if dir := filepath.Dir(herdBinary); herdBinary != "" {
 		_ = os.RemoveAll(dir)
