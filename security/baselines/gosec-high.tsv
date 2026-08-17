@@ -4,7 +4,7 @@
 G101	cmd/herd/hostcreds.go	262	da49ffbd1ec9368041bfff7c4345a1cd55ba539a8a2da2fca004326e8440d10b	deterministic self-test bearer value	hostcreds-maintainers	2026-12-31
 G101	pkg/agentpolicy/enforce.go	14	e61726f2a438054615e49439bb48420246827ce448ef634cdf5c50ef4f641fc6	environment variable name only	security-maintainers	2026-12-31
 G101	pkg/envplan/envplan.go	36	1bd68f2084d85b2a890bd0cfd9017eeffc207af2197440d935c3797dd8472405	capability label only	envplan-maintainers	2026-12-31
-G101	pkg/herdr/live_harness_proof.go	204	42deb1476a952d243b002b7bb7aee07c59b69233a84836b006d22de215753b1a	deterministic live-proof control value	herdr-maintainers	2026-12-31
+G101	pkg/herdr/live_harness_proof.go	213	05a989e5262d07923b902fee313e1be5ca84f1d391d6d8ef0d3a68dc9be6f31b	deterministic live-proof control value	herdr-maintainers	2026-12-31
 G101	pkg/provider/fence_broker.go	663	8e045ff429401216be4b20cc65b6c2592f2208d9a77441f33e98f4d0d11b0b5e	credential-file leaf name only	provider-maintainers	2026-12-31
 G101	pkg/provider/fence_broker_minter.go	34	596f15a370440558a4f522a536fee8b556c63276b69adac1ea0543dbb9eeb491	file-path environment variable name only	provider-maintainers	2026-12-31
 G101	pkg/provider/shared_marker.go	23	75281048d701c9b695a0cf0f1c20e25eb9d7a5de797dd512ef80db7ec1c4b79b	provision-token environment variable name only	provider-maintainers	2026-12-31

@@ -15,7 +15,14 @@ func TestExplainAgentDecodesStructuredDetection(t *testing.T) {
 	old := runHerdr
 	defer func() { runHerdr = old }()
 	runHerdr = func(args ...string) (string, error) {
-		if len(args) != 4 || args[0] != "agent" || args[1] != "explain" || args[2] != "--json" || args[3] != "worker" {
+		jsonFlag := false
+		for _, arg := range args {
+			if arg == "--json" {
+				jsonFlag = true
+				break
+			}
+		}
+		if len(args) != 4 || args[0] != "agent" || args[1] != "explain" || !jsonFlag || args[3] != "worker" {
 			t.Fatalf("args=%v", args)
 		}
 		return `{"state":"blocked","visible_blocker":true,"matched_rule":{"id":"auth","state":"blocked"}}`, nil
