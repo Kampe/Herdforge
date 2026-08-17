@@ -2,6 +2,7 @@
 bin/
 *.out
 .herd/coverage/
+.herd/bootstrap/
 
 # Local machine task provider link files
 .kaneo.json
