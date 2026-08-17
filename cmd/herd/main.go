@@ -7067,6 +7067,7 @@ func runVerify() {
 			c, _, persistErr = verifier.NewVerifier("").CheckCompletionAndPersist(context.Background(), wt, *buildCmd, *testCmd, verifier.VerificationRequest{
 				TaskRef: tc.TaskRef, LeaseGeneration: fmt.Sprintf("%d", tc.LeaseGeneration),
 				CandidateSHA: sha, BaseSHA: baseSHA, EnvironmentPolicy: verifier.EnvironmentPolicyInherited,
+				Artifacts: []string{"profile:" + verificationProfile},
 			}, store)
 			if persistErr != nil {
 				fmt.Fprintf(os.Stderr, "herd verify: persist verification receipts: %v\n", persistErr)
