@@ -22,6 +22,7 @@ import (
 	"github.com/Kampe/Herdforge/pkg/pulse"
 	"github.com/Kampe/Herdforge/pkg/quotasup"
 	"github.com/Kampe/Herdforge/pkg/review"
+	"github.com/Kampe/Herdforge/pkg/standing"
 	"github.com/Kampe/Herdforge/pkg/usage"
 	"github.com/Kampe/Herdforge/pkg/winddown"
 	"github.com/Kampe/Herdforge/pkg/worktree"
@@ -748,15 +749,25 @@ func (a *livePulseActor) OpenReview(ctx context.Context, lane pulse.AgentObserva
 	if strings.TrimSpace(lane.TabID) == "" {
 		return fmt.Errorf("pulse: open_review requires tab_id; lane %q has none", lane.Name)
 	}
-	// FAC-226: the open-review path must resolve the lane's worktree,
-	// verify the rebase-onto-origin/main non-empty diff (the one sound
-	// merge check), and hand off to the review supervisor (Ingest +
-	// LaunchReview with receipt admission). The pulse observation does
-	// not yet carry the worktree path or commit SHA — wiring it requires
-	// a herdr tab-to-worktree resolver and a worktree diff reader. An
-	// honest refusal is better than inventing a review candidate from
-	// incomplete evidence. The open_review is still ENFORCED: every beat
-	// plans it for finished lanes, so the coordinator cannot miss a lane
-	// that needs review.
-	return errors.New("pulse: open_review adapter requires worktree resolver and review-supervisor handoff (FAC-226; not yet wired into pulse observation)")
+	// Pulse observes a lane but intentionally does not invent a candidate SHA.
+	// Hand the exact tab identity to the standing review supervisor, which owns
+	// candidate discovery, receipt admission, reviewer dispatch, and retries.
+	cfg, err := config.LoadConfig(filepath.Join(".herd", "herd.yaml"))
+	if err != nil {
+		return fmt.Errorf("pulse: load config for review supervisor: %w", err)
+	}
+	supervisor := findReviewSupervisorLane(cfg)
+	if supervisor == nil {
+		return errors.New("pulse: no standing review supervisor configured")
+	}
+	if !herdr.IsAvailable() {
+		return errors.New("pulse: herdr CLI not found")
+	}
+	target := standing.AgentName(supervisor.Name)
+	packet := fmt.Sprintf("PULSE REVIEW HANDOFF\nLane: %s\nTab: %s\nWorkspace: %s\n\nInspect this finished lane's exact worktree and candidate receipt. Admit and review only an exact candidate SHA with valid verification evidence. You own reviewer dispatch, retries, verdict ingest, and reviewer-pane cleanup; send only a merge-ready PASS handoff to the coordinator. Do not ask the coordinator to perform review work.", lane.Name, lane.TabID, lane.Workspace)
+	if _, err := herdr.AgentPrompt(target, packet, false); err != nil {
+		return fmt.Errorf("pulse: notify review supervisor %s: %w", target, err)
+	}
+	_ = ctx
+	return nil
 }
