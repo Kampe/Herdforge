@@ -3193,6 +3193,23 @@ func approveOne(ctx context.Context, cfg *config.Config, tp provider.TaskProvide
 		}
 		return nil, err
 	}
+	// FAC-353: the builder's authenticated launch receipt is the only source
+	// of the lane identity. Automatic completion receipts provide the exact
+	// reviewed candidate and base; an override has no reviewed builder
+	// candidate and therefore does not receive a fabricated notification.
+	if req.Receipt != nil && strings.TrimSpace(coord.AgentSessionID) != "" {
+		if _, nErr := mb.PostMergeNotification("coordinator", mail.MergeNotification{
+			TaskRef:      coord.TaskRef,
+			CandidateSHA: req.Receipt.CandidateSHA,
+			LandedCommit: rec.SHA,
+			BaseSHA:      req.Receipt.BaseSHA,
+			Branch:       coord.Branch,
+			Repository:   coord.Repository,
+			BuilderID:    coord.AgentSessionID,
+		}); nErr != nil {
+			return nil, fmt.Errorf("merge notification delivery failed (board IS done; next approve retries): %w", nErr)
+		}
+	}
 	rec.State = "done"
 	if err := appendApproveIntent(root, signer, rec); err != nil {
 		return nil, fmt.Errorf("board done but journal done-record failed (next approve completes publication): %w", err)
