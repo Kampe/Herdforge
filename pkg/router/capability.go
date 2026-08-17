@@ -4,7 +4,20 @@ import (
 	"fmt"
 	"os/exec"
 	"strings"
+
+	"github.com/Kampe/Herdforge/pkg/classify"
 )
+
+// ReviewCapability is the shared admission table for review routes. Keeping
+// risk admission beside the launch-surface table prevents a supervisor from
+// selecting a route that the launcher cannot create or that is too weak for
+// the candidate's risk tier.
+type ReviewCapability struct {
+	Provider    string
+	Harness     string
+	Family      string
+	MinimumRisk classify.Tier
+}
 
 // SurfaceCapability is the single admission record for a routed execution
 // surface. Consumers must use this record instead of maintaining provider
@@ -31,6 +44,73 @@ var surfaceCapabilities = []SurfaceCapability{
 	{Provider: "lazer", Harness: "opencode", CLI: "opencode", Headless: true},
 	{Provider: "ollama", Harness: "opencode", CLI: "opencode", Headless: true},
 	{Provider: "opencode", Harness: "opencode", CLI: "opencode", VendorHarness: true, Headless: true},
+}
+
+var reviewCapabilities = []ReviewCapability{
+	{Provider: "agy", Harness: "agy", Family: "google", MinimumRisk: classify.TierR1},
+	{Provider: "claude", Harness: "claude", Family: "anthropic", MinimumRisk: classify.TierR1},
+	{Provider: "codex", Harness: "codex", Family: "codex", MinimumRisk: classify.TierR1},
+	{Provider: "grok", Harness: "grok", Family: "grok", MinimumRisk: classify.TierR1},
+	{Provider: "opencode", Harness: "opencode", Family: "lazer", MinimumRisk: classify.TierR1},
+}
+
+// ReviewCapabilities returns a stable copy of the single review admission
+// table used by routing and the review supervisor.
+func ReviewCapabilities() []ReviewCapability {
+	result := make([]ReviewCapability, len(reviewCapabilities))
+	copy(result, reviewCapabilities)
+	return result
+}
+
+// ReviewProviderForModel maps the native vendor model prefixes to their
+// launch provider. An explicit provider remains authoritative for aliases.
+func ReviewProviderForModel(model string) string {
+	m := strings.ToLower(strings.TrimSpace(model))
+	switch {
+	case strings.Contains(m, "claude"), strings.Contains(m, "anthropic"):
+		return "claude"
+	case strings.Contains(m, "gemini"), strings.Contains(m, "google"), strings.Contains(m, "agy"):
+		return "agy"
+	case strings.Contains(m, "gpt"), strings.Contains(m, "openai"), strings.Contains(m, "codex"):
+		return "codex"
+	case strings.Contains(m, "grok"), strings.Contains(m, "xai"):
+		return "grok"
+	case strings.Contains(m, "deepseek"), strings.Contains(m, "lazer"), strings.Contains(m, "opencode"):
+		return "opencode"
+	default:
+		return ""
+	}
+}
+
+// ReviewRouteAdmission checks the exact provider/model route against the
+// shared risk table. Unknown providers, unknown models, and risk tiers outside
+// R0-R3 are refused rather than guessed.
+func ReviewRouteAdmission(provider, model string, risk classify.Tier) (bool, string) {
+	provider = strings.ToLower(strings.TrimSpace(provider))
+	if provider == "" {
+		provider = ReviewProviderForModel(model)
+	}
+	if provider == "" {
+		return false, "review route has no known provider"
+	}
+	if risk == "" {
+		return false, "review route has no risk tier"
+	}
+	for _, capability := range reviewCapabilities {
+		if capability.Provider != provider {
+			continue
+		}
+		if model == "" {
+			return false, fmt.Sprintf("review provider %q requires a model", provider)
+		}
+		// R0 is compatible with every known vendor surface; higher-risk work
+		// must meet the table's minimum admission tier.
+		if risk != classify.TierR0 && risk < capability.MinimumRisk {
+			return false, fmt.Sprintf("review route %s/%s is not admitted for %s", provider, model, risk)
+		}
+		return true, ""
+	}
+	return false, fmt.Sprintf("review provider %q is not a configured vendor harness", provider)
 }
 
 // SurfaceCapabilities returns a stable, sorted snapshot for validation and

@@ -12,7 +12,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Kampe/Herdforge/pkg/classify"
 	"github.com/Kampe/Herdforge/pkg/control"
+	"github.com/Kampe/Herdforge/pkg/router"
 )
 
 type EventType string
@@ -34,6 +36,7 @@ const (
 	EventClosed           EventType = "closed"
 	EventRefutation       EventType = "refutation"
 	EventLaunchFailed     EventType = "launch_failed"
+	EventRouteBlocked     EventType = "route_blocked"
 )
 
 type Verdict string
@@ -63,6 +66,8 @@ type Row struct {
 	AuthorFamily  string `json:"author_family,omitempty"`
 	Reviewer      string `json:"reviewer,omitempty"`
 	ReviewFamily  string `json:"review_family,omitempty"`
+	Provider      string `json:"provider,omitempty"`
+	Harness       string `json:"harness,omitempty"`
 	Tier          string `json:"tier,omitempty"`
 	Verdict       string `json:"verdict,omitempty"`
 	Reason        string `json:"reason,omitempty"`
@@ -110,6 +115,7 @@ type QueueEntry struct {
 	State     QueueState `json:"state"`
 	Reviewer  string     `json:"reviewer,omitempty"`
 	Attempts  int        `json:"attempts,omitempty"`
+	Reason    string     `json:"reason,omitempty"`
 	UpdatedAt time.Time  `json:"updated_at"`
 }
 
@@ -125,6 +131,9 @@ type Candidate struct {
 	VerdictReason string
 	Reviewer      string
 	ReviewFamily  string
+	Provider      string
+	Harness       string
+	BlockedReason string
 	Attempts      int
 	IngestedAt    time.Time
 	UpdatedAt     time.Time
@@ -193,7 +202,7 @@ func (sv *ReviewSupervisor) QueueSnapshot() []QueueEntry {
 		if c == nil {
 			continue
 		}
-		out = append(out, QueueEntry{SHA: c.SHA, Branch: c.Branch, State: queueState(c), Reviewer: c.Reviewer, Attempts: c.Attempts, UpdatedAt: c.UpdatedAt})
+		out = append(out, QueueEntry{SHA: c.SHA, Branch: c.Branch, State: queueState(c), Reviewer: c.Reviewer, Attempts: c.Attempts, Reason: c.BlockedReason, UpdatedAt: c.UpdatedAt})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].SHA < out[j].SHA })
 	return out
@@ -512,15 +521,20 @@ func (sv *ReviewSupervisor) Ingest(cb CompletionCallback) (accepted bool, staleS
 }
 
 type ReviewerEntry struct {
-	Name  string
-	Model string
+	Name          string
+	Model         string
+	Provider      string
+	Harness       string
+	Preferred     bool
+	Unavailable   bool
+	Refused       bool
+	RefusalReason string
 }
 
 func (sv *ReviewSupervisor) SelectReviewer(candidateSHA string, pool []ReviewerEntry) (*ReviewerEntry, error) {
-	sv.mu.RLock()
+	sv.mu.Lock()
+	defer sv.mu.Unlock()
 	cand, ok := sv.cands[candidateSHA]
-	sv.mu.RUnlock()
-
 	if !ok {
 		return nil, fmt.Errorf("reviewsup: unknown candidate %s", candidateSHA)
 	}
@@ -532,15 +546,75 @@ func (sv *ReviewSupervisor) SelectReviewer(candidateSHA string, pool []ReviewerE
 	authorFamily := lookupFamily(cand.AuthorModel)
 	needsCross := RequireCrossFamily(cand.Tier)
 
-	for _, r := range pool {
-		rFamily := lookupFamily(r.Model)
-		if needsCross && !CrossFamilyOK(authorFamily, rFamily) {
+	// An empty pool represents backpressure, not an exhausted route space.
+	if len(pool) == 0 {
+		return nil, nil
+	}
+	ordered := append([]ReviewerEntry(nil), pool...)
+	sort.SliceStable(ordered, func(i, j int) bool {
+		if ordered[i].Preferred != ordered[j].Preferred {
+			return ordered[i].Preferred
+		}
+		li := strings.ToLower(ordered[i].Provider + "|" + ordered[i].Model + "|" + ordered[i].Name)
+		lj := strings.ToLower(ordered[j].Provider + "|" + ordered[j].Model + "|" + ordered[j].Name)
+		return li < lj
+	})
+	var reasons []string
+	for _, r := range ordered {
+		if r.Unavailable || r.Refused {
+			reason := r.RefusalReason
+			if reason == "" {
+				reason = "route unavailable"
+			}
+			reasons = append(reasons, r.Name+": "+reason)
 			continue
 		}
-		return &r, nil
+		rFamily := lookupFamily(r.Model)
+		if needsCross && !CrossFamilyOK(authorFamily, rFamily) {
+			reasons = append(reasons, r.Name+": same-family or unknown-family route")
+			continue
+		}
+		allowed, reason := router.ReviewRouteAdmission(r.Provider, r.Model, classify.Tier(cand.Tier))
+		if !allowed {
+			reasons = append(reasons, r.Name+": "+reason)
+			continue
+		}
+		selected := r
+		if selected.Provider == "" {
+			selected.Provider = router.ReviewProviderForModel(r.Model)
+		}
+		if surface, ok := router.SurfaceFor(selected.Provider); ok {
+			selected.Harness = surface.Harness
+		}
+		return &selected, nil
 	}
 
+	if err := sv.blockRouteLocked(cand, strings.Join(reasons, "; ")); err != nil {
+		return nil, err
+	}
 	return nil, nil
+}
+
+// blockRouteLocked records one terminal route decision. It is idempotent so a
+// retrying supervisor cannot wedge a pin with repeated refused attempts.
+func (sv *ReviewSupervisor) blockRouteLocked(cand *Candidate, reason string) error {
+	if cand.State == StateBlocked {
+		return nil
+	}
+	if reason == "" {
+		reason = "no compatible review route"
+	}
+	if cand.State == StatePending || cand.State == StateReviewing || cand.State == StatePass {
+		sv.pendingCount--
+	}
+	cand.State = StateBlocked
+	cand.Verdict = VerdictBLOCKED
+	cand.BlockedReason = reason
+	cand.UpdatedAt = sv.now()
+	if err := sv.appendRow(&Row{Event: string(EventRouteBlocked), SHA: cand.SHA, Tier: string(cand.Tier), Verdict: string(VerdictBLOCKED), Reason: reason}); err != nil {
+		return fmt.Errorf("reviewsup: persist blocked route for %s: %w", cand.SHA, err)
+	}
+	return nil
 }
 
 func (sv *ReviewSupervisor) LaunchReview(candidateSHA, reviewer, reviewModel string) error {
@@ -559,6 +633,12 @@ func (sv *ReviewSupervisor) LaunchReview(candidateSHA, reviewer, reviewModel str
 	}
 	if cand.State != StatePending {
 		return fmt.Errorf("reviewsup: candidate %s is not pending (state=%s)", candidateSHA, cand.State)
+	}
+	if allowed, reason := router.ReviewRouteAdmission(router.ReviewProviderForModel(reviewModel), reviewModel, classify.Tier(cand.Tier)); !allowed {
+		if err := sv.blockRouteLocked(cand, reason); err != nil {
+			return err
+		}
+		return fmt.Errorf("reviewsup: review route refused for %s: %s", candidateSHA, reason)
 	}
 	if strings.TrimSpace(cand.ReceiptDigest) == "" {
 		return fmt.Errorf("reviewsup: candidate %s has no verification receipt digest", candidateSHA)
@@ -591,6 +671,10 @@ func (sv *ReviewSupervisor) LaunchReview(candidateSHA, reviewer, reviewModel str
 	cand.State = StateReviewing
 	cand.Reviewer = reviewer
 	cand.ReviewFamily = string(reviewFamily)
+	cand.Provider = router.ReviewProviderForModel(reviewModel)
+	if surface, ok := router.SurfaceFor(cand.Provider); ok {
+		cand.Harness = surface.Harness
+	}
 	cand.UpdatedAt = sv.now()
 	cand.Attempts++
 	if err := sv.appendRow(&Row{
@@ -598,6 +682,8 @@ func (sv *ReviewSupervisor) LaunchReview(candidateSHA, reviewer, reviewModel str
 		SHA:           candidateSHA,
 		Reviewer:      reviewer,
 		ReviewFamily:  string(reviewFamily),
+		Provider:      cand.Provider,
+		Harness:       cand.Harness,
 		Tier:          string(cand.Tier),
 		Attempts:      cand.Attempts,
 		ReceiptDigest: cand.ReceiptDigest,
@@ -605,6 +691,8 @@ func (sv *ReviewSupervisor) LaunchReview(candidateSHA, reviewer, reviewModel str
 		cand.State = StatePending
 		cand.Reviewer = ""
 		cand.ReviewFamily = ""
+		cand.Provider = ""
+		cand.Harness = ""
 		cand.Attempts--
 		cand.UpdatedAt = sv.now()
 		return fmt.Errorf("reviewsup: append review row: %w", err)
@@ -614,6 +702,8 @@ func (sv *ReviewSupervisor) LaunchReview(candidateSHA, reviewer, reviewModel str
 			cand.State = StatePending
 			cand.Reviewer = ""
 			cand.ReviewFamily = ""
+			cand.Provider = ""
+			cand.Harness = ""
 			cand.Attempts--
 			cand.UpdatedAt = sv.now()
 			return fmt.Errorf("reviewsup: durable review correction order: %w", err)
@@ -1198,6 +1288,8 @@ func (sv *ReviewSupervisor) Reconstruct() (int, error) {
 					cand.State = StateReviewing
 					cand.Reviewer = r.Reviewer
 					cand.ReviewFamily = r.ReviewFamily
+					cand.Provider = r.Provider
+					cand.Harness = r.Harness
 					cand.Attempts = r.Attempts
 				}
 			}
@@ -1284,6 +1376,16 @@ func (sv *ReviewSupervisor) Reconstruct() (int, error) {
 
 		case EventBuilderAck:
 			lastAckAt[r.SHA] = i
+
+		case EventRouteBlocked:
+			if cand, ok := sv.cands[r.SHA]; ok {
+				if cand.State == StatePending || cand.State == StateReviewing || cand.State == StatePass {
+					sv.pendingCount--
+				}
+				cand.State = StateBlocked
+				cand.Verdict = VerdictBLOCKED
+				cand.BlockedReason = r.Reason
+			}
 
 		case EventCapacity:
 		}

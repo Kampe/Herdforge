@@ -228,6 +228,48 @@ func TestSelectReviewerCrossFamily(t *testing.T) {
 	}
 }
 
+func TestSelectReviewerFallsBackFromRefusedPreferredRoute(t *testing.T) {
+	sv := svc(t)
+	rev, err := sv.SelectReviewer("aaa111", []ReviewerEntry{
+		{Name: "anthropic-preferred", Model: "claude-sonnet-5", Provider: "claude", Preferred: true, Refused: true, RefusalReason: "risk tier refused before pane creation"},
+		{Name: "grok-fallback", Model: "grok-3", Provider: "grok"},
+	})
+	if err != nil {
+		t.Fatalf("SelectReviewer: %v", err)
+	}
+	if rev == nil || rev.Name != "grok-fallback" || rev.Harness != "grok" {
+		t.Fatalf("fallback = %+v, want deterministic grok vendor route", rev)
+	}
+	if got := sv.Candidate("aaa111").State; got != StatePending {
+		t.Fatalf("fallback selection changed state to %s", got)
+	}
+}
+
+func TestSelectReviewerPersistsBlockedWhenNoRouteIsAdmissible(t *testing.T) {
+	sv := svc(t)
+	rev, err := sv.SelectReviewer("aaa111", []ReviewerEntry{
+		{Name: "anthropic-preferred", Model: "claude-sonnet-5", Provider: "claude", Preferred: true, Refused: true, RefusalReason: "risk tier refused"},
+		{Name: "unknown-fallback", Model: "mystery-model", Provider: ""},
+	})
+	if err != nil || rev != nil {
+		t.Fatalf("selection = %+v, err=%v; want durable blocked outcome", rev, err)
+	}
+	c := sv.Candidate("aaa111")
+	if c.State != StateBlocked || c.Verdict != VerdictBLOCKED || c.BlockedReason == "" {
+		t.Fatalf("candidate = %+v, want visible blocked route", c)
+	}
+	if _, err := sv.SelectReviewer("aaa111", []ReviewerEntry{{Name: "retry", Model: "grok-3", Provider: "grok"}}); err == nil {
+		t.Fatal("blocked candidate was eligible for a retry")
+	}
+	restarted := New(sv.cfg)
+	if _, err := restarted.Reconstruct(); err != nil {
+		t.Fatalf("Reconstruct: %v", err)
+	}
+	if got := restarted.Candidate("aaa111"); got == nil || got.State != StateBlocked || got.BlockedReason == "" {
+		t.Fatalf("reconstructed candidate = %+v, want durable blocked state", got)
+	}
+}
+
 func TestSelectReviewerSameFamilyR1Rejected(t *testing.T) {
 	sv := svc(t)
 	rev, err := sv.SelectReviewer("aaa111", []ReviewerEntry{
