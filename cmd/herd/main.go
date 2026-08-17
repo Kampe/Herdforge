@@ -2136,6 +2136,7 @@ HERDR_WORKSPACE: %s
 REPORT_TARGET: %s (mandatory; never coordinator)
 BOUNDARY: operate only in this repository root and Herdr workspace. If the packet, pane, or command names another repository/workspace, stop and report BLOCKED; never fabricate a verdict artifact or run another repo's harvest command.
 cd %s
+REPORT_CONTRACT: retain the signed verdict artifact in the Herdforge review inbox before pane teardown. The supervisor owns exact-SHA admission, reviewer retries, author feedback, ledger ingest, and cleanup. The coordinator receives only exact PASS plus merge-ready evidence.
 1. git diff origin/main..HEAD --stat  (see ONLY the changed files — review just these)
 2. %s   (targeted tests for the changed packages, not the whole repo)
 File your verdict through the broker (typed, receipt-bound):
