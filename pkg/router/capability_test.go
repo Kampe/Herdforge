@@ -4,7 +4,30 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/Kampe/Herdforge/pkg/classify"
 )
+
+func TestReviewRouteAdmissionUsesSharedRiskTable(t *testing.T) {
+	tests := []struct {
+		name, provider, model string
+		risk                  classify.Tier
+		want                  bool
+	}{
+		{"r0 known vendor", "claude", "claude-3-5-haiku", classify.TierR0, true},
+		{"r2 known vendor", "grok", "grok-3", classify.TierR2, true},
+		{"unknown model", "", "mystery-model", classify.TierR2, false},
+		{"unknown risk", "grok", "grok-3", "", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, _ := ReviewRouteAdmission(tt.provider, tt.model, tt.risk)
+			if got != tt.want {
+				t.Fatalf("ReviewRouteAdmission(%q, %q, %q) = %v, want %v", tt.provider, tt.model, tt.risk, got, tt.want)
+			}
+		})
+	}
+}
 
 func TestSurfaceCapabilityTableIsInternallyLaunchable(t *testing.T) {
 	for _, surface := range SurfaceCapabilities() {
