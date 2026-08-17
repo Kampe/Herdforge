@@ -8934,9 +8934,20 @@ func herdSubprocessReal(args ...string) error {
 		return fmt.Errorf("herd executable: %w", err)
 	}
 	cmd := exec.Command(self, args...)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	return cmd.Run()
+	var output bytes.Buffer
+	writer := io.MultiWriter(os.Stdout, &output)
+	cmd.Stdout = writer
+	cmd.Stderr = writer
+	if err := cmd.Run(); err != nil {
+		// The forge loop needs a typed refusal to persist legacy receiptless
+		// suppression. Preserve the child output while retaining the original
+		// fail-closed exit error for every other approval refusal.
+		if strings.Contains(strings.ToLower(output.String()), "no completion receipt") {
+			return fmt.Errorf("%w: %s", hsync.ErrNoEvidence, strings.TrimSpace(output.String()))
+		}
+		return err
+	}
+	return nil
 }
 
 // setHerdSubprocessForTest replaces the herd subprocess runner. Restore with
@@ -9306,6 +9317,7 @@ func forgeLoopMain() int {
 	interval := fs.Int("interval", 15, "seconds between ticks")
 	ticks := fs.Int("ticks", 0, "stop after N ticks (0 = run until drained)")
 	stopEmpty := fs.Bool("stop-empty", true, "stop when the board is clear and no lane is busy")
+	retryApprove := fs.String("retry-approve", "", "explicitly retry a suppressed legacy approval for this task ref")
 	// --coordinator-name is what makes ReplyTarget.Name real. A reviewer caught
 	// that Register was called with the constant, so Dispatcher.CoordinatorName,
 	// ReplyTarget.Name and the non-default branch of coordinatorName() worked in
@@ -9431,11 +9443,13 @@ func forgeLoopMain() int {
 
 	fmt.Printf("herd forge --loop: max-lanes=%d interval=%ds — driving the board autonomously\n", *maxLanes, *interval)
 	err = eng.ForgeLoop(ctx, driver, daemon.ForgeLoopOptions{
-		Interval:         time.Duration(*interval) * time.Second,
-		MaxTicks:         *ticks,
-		StopEmpty:        *stopEmpty,
-		Feedback:         feedbackRunner,
-		FeedbackInterval: feedbackInterval,
+		Interval:               time.Duration(*interval) * time.Second,
+		MaxTicks:               *ticks,
+		StopEmpty:              *stopEmpty,
+		Feedback:               feedbackRunner,
+		FeedbackInterval:       feedbackInterval,
+		ApproveSuppressionPath: ".herd/forge-approve-suppressions.json",
+		ApproveRetryRefs:       map[string]bool{strings.ToUpper(strings.TrimSpace(*retryApprove)): true},
 	})
 	switch {
 	case err == nil:
