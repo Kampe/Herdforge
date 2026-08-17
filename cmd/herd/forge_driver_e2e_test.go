@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -544,7 +545,8 @@ func TestFactoryE2E_CoordinatorFenceBlocksSecondLoop(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	installFakeHerdr(t, `{"result":{"type":"agent_list","agents":[]}}`, canonicalRoot)
+	seededCoordinator := fmt.Sprintf(`{"result":{"type":"agent_list","agents":[{"name":"coordinator","agent":"codex","agent_status":"working","tab_id":"tFake","pane_id":"pFake","terminal_id":"termFake","workspace_id":"fixture-workspace","cwd":%q,"foreground_cwd":%q}]}}`, canonicalRoot, canonicalRoot)
+	installFakeHerdr(t, seededCoordinator, canonicalRoot)
 	stateDir := t.TempDir()
 	writeGroomedBoard(t, stateDir)
 	installFakeKaneo(t, stateDir)
@@ -557,10 +559,8 @@ func TestFactoryE2E_CoordinatorFenceBlocksSecondLoop(t *testing.T) {
 	binary := buildHerd(t)
 	env := append(os.Environ(),
 		"HERD_WINDDOWN_STATE="+filepath.Join(root, ".herd", "winddown.json"),
-		// The coordinator route is deliberately forced to a candidate in the
-		// coordinator waterfall. This exercises production route validation
-		// without depending on provider CLIs or host health in CI.
-		"HERD_AVAILABLE_PROVIDERS=codex",
+		"HERD_WORKSPACE=fixture-workspace",
+		"HERDR_WORKSPACE_ID=fixture-workspace",
 		"PATH="+os.Getenv("PATH"),
 	)
 	run := func() (string, error) {
