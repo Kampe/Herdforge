@@ -646,8 +646,8 @@ task_provider:
 lanes:
   - name: "worker"
     role: "worker"
-    agent_kind: "pi"
-    harness: "pi"
+    agent_kind: "codex"
+    harness: "codex"
     prompt: ".herd/prompts/worker.md"
     worktree: ".worktrees/worker"
     provider: "codex"
@@ -702,8 +702,8 @@ task_provider:
 lanes:
   - name: "forge-smith"
     role: "forge-smith"
-    agent_kind: "pi"
-    harness: "pi"
+    agent_kind: "codex"
+    harness: "codex"
     prompt: ".herd/prompts/smith.md"
     worktree: ".worktrees/smith"
     provider: "codex"
@@ -713,8 +713,8 @@ lanes:
 
   - name: "worker"
     role: "worker"
-    agent_kind: "pi"
-    harness: "pi"
+    agent_kind: "claude"
+    harness: "claude"
     prompt: ".herd/prompts/worker.md"
     worktree: ".worktrees/worker"
     provider: "codex"
@@ -724,8 +724,8 @@ lanes:
 
   - name: "reviewer"
     role: "reviewer"
-    agent_kind: "pi"
-    harness: "pi"
+    agent_kind: "codex"
+    harness: "codex"
     prompt: ".herd/prompts/reviewer.md"
     worktree: ".worktrees/reviewer"
     provider: "claude"
