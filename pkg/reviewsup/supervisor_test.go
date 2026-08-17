@@ -89,6 +89,32 @@ func TestNewDefaultConfig(t *testing.T) {
 	}
 }
 
+func TestWatchdogReportsStaleReviewWithoutLiveReviewer(t *testing.T) {
+	now := fixedNow()
+	dir := t.TempDir()
+	cfg := DefaultConfig(dir)
+	cfg.Now = func() time.Time { return now }
+	cfg.AdmitReceipt = testAdmitReceipt
+	sv := New(cfg)
+	if _, _, err := sv.Ingest(withDigest(CompletionCallback{
+		SHA: "watchdog-sha", Branch: "feat/watchdog", PatchID: "watchdog",
+		AuthorModel: "claude-3-7-sonnet", Tier: TierR1,
+	})); err != nil {
+		t.Fatalf("Ingest: %v", err)
+	}
+	if err := sv.LaunchReview("watchdog-sha", "reviewer-1", "gemini-2.5-flash"); err != nil {
+		t.Fatalf("LaunchReview: %v", err)
+	}
+	now = now.Add(11 * time.Minute)
+	alerts := sv.Watchdog(10*time.Minute, func(string) bool { return false })
+	if len(alerts) != 1 || alerts[0].SHA != "watchdog-sha" || alerts[0].Reason != "reviewer not live" {
+		t.Fatalf("alerts = %+v, want one dead-reviewer alert", alerts)
+	}
+	if got := sv.Watchdog(10*time.Minute, func(string) bool { return true }); len(got) != 0 {
+		t.Fatalf("live reviewer still alerted: %+v", got)
+	}
+}
+
 func TestIngest(t *testing.T) {
 	sv := svc(t)
 	if sv.PendingCount() != 2 {
@@ -789,8 +815,8 @@ func TestCandidateUnknown(t *testing.T) {
 func TestSubmitVerdictUnknownCandidate(t *testing.T) {
 	sv := svc(t)
 	_, err := sv.SubmitVerdict(ReviewVerdict{
-		SHA:      "unknown",
-		Verdict:  VerdictPASS,
+		SHA:     "unknown",
+		Verdict: VerdictPASS,
 	})
 	if err == nil {
 		t.Fatal("expected error for unknown candidate")

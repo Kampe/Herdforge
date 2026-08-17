@@ -179,3 +179,11 @@ func TestRecoverVerificationDigest_RestampsLegacyPassReceipt(t *testing.T) {
 		t.Fatalf("restamped receipt load = %+v, %v", loaded, err)
 	}
 }
+
+func TestRecoverVerificationDigest_MissingStoreIsCleanRefusal(t *testing.T) {
+	root := t.TempDir()
+	_, err := recoverVerificationDigest(context.Background(), root, "FAC-327", root, "deadbeef", 1)
+	if err == nil || err.Error() != "no legacy verification receipt found for FAC-327" {
+		t.Fatalf("missing store error = %v, want clean legacy refusal", err)
+	}
+}

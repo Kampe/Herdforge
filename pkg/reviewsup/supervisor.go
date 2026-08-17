@@ -105,6 +105,17 @@ type Candidate struct {
 	ReceiptDigest string
 }
 
+// WatchdogAlert identifies an in-review candidate that has outlived the
+// supervisor's bounded dispatch window. Review progress must not depend on a
+// fleet-feedback census; callers can use this read-only signal to re-dispatch
+// a reviewer or page the coordinator.
+type WatchdogAlert struct {
+	SHA      string
+	Reviewer string
+	Age      time.Duration
+	Reason   string
+}
+
 type ModelFamily string
 
 const (
@@ -663,6 +674,42 @@ func (sv *ReviewSupervisor) AvailableCapacity() int {
 		return 0
 	}
 	return free
+}
+
+// Watchdog reports review pins that have had no state transition for at least
+// timeout. When reviewerLive is supplied, an alert is emitted only when the
+// assigned reviewer is not live; with no liveness provider, stale pins are
+// still returned with an explicit liveness-unknown reason so a caller cannot
+// mistake an unobserved fleet for an empty queue.
+func (sv *ReviewSupervisor) Watchdog(timeout time.Duration, reviewerLive func(string) bool) []WatchdogAlert {
+	if timeout <= 0 {
+		timeout = 10 * time.Minute
+	}
+	now := sv.now()
+	sv.mu.RLock()
+	defer sv.mu.RUnlock()
+	alerts := make([]WatchdogAlert, 0)
+	for _, cand := range sv.cands {
+		if cand == nil || cand.State != StateReviewing {
+			continue
+		}
+		age := now.Sub(cand.UpdatedAt)
+		if age < timeout {
+			continue
+		}
+		if reviewerLive != nil && cand.Reviewer != "" && reviewerLive(cand.Reviewer) {
+			continue
+		}
+		reason := "review dispatch overdue"
+		if reviewerLive == nil {
+			reason = "reviewer liveness unknown"
+		} else if cand.Reviewer == "" || !reviewerLive(cand.Reviewer) {
+			reason = "reviewer not live"
+		}
+		alerts = append(alerts, WatchdogAlert{SHA: cand.SHA, Reviewer: cand.Reviewer, Age: age, Reason: reason})
+	}
+	sort.Slice(alerts, func(i, j int) bool { return alerts[i].SHA < alerts[j].SHA })
+	return alerts
 }
 
 type HarvestCandidate struct {

@@ -170,6 +170,9 @@ func recoverVerificationDigest(ctx context.Context, root, ref, wt, candidateSHA 
 	dir := filepath.Join(root, defaultReceiptDir)
 	entries, err := os.ReadDir(dir)
 	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return "", fmt.Errorf("no legacy verification receipt found for %s", ref)
+		}
 		return "", fmt.Errorf("verification receipt store unavailable: %w", err)
 	}
 	wantGeneration := fmt.Sprintf("%d", leaseGeneration)
