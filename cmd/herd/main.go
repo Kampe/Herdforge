@@ -2112,7 +2112,7 @@ func runReview() {
 		// guarantee must rest on the LIVE terminal state, read for the exact
 		// pane INCARNATION we just launched (FAC-145).
 		reviewerSession := herdr.SessionID(tab.Pane)
-		liveCwd, cwdErr := herdr.PaneLiveCwd(reviewerSession)
+		liveCwd, cwdErr := waitForReviewerPaneCwd(reviewerSession, worktreeDir, 6*time.Second)
 		if cwdErr != nil {
 			life.fail("cannot read live reviewer pane cwd (FAC-145): %v", cwdErr)
 		}
@@ -2187,6 +2187,29 @@ File your verdict through the broker (typed, receipt-bound):
 		os.Exit(1)
 	}
 	fmt.Printf("  -> moved card [%s] to 'in-review' status\n", task.Ref)
+}
+
+// waitForReviewerPaneCwd closes the create/readback race in Herdr: tab create
+// returns the requested pane incarnation before agent-list has necessarily
+// published that same terminal. Readiness is bounded and exact-incarnation;
+// a replacement pane can never satisfy the original review receipt.
+func waitForReviewerPaneCwd(sessionID, want string, timeout time.Duration) (string, error) {
+	if timeout <= 0 {
+		timeout = 6 * time.Second
+	}
+	deadline := time.Now().Add(timeout)
+	var lastErr error
+	for {
+		cwd, err := herdr.PaneLiveCwd(sessionID)
+		if err == nil {
+			return cwd, nil
+		}
+		lastErr = err
+		if time.Now().After(deadline) {
+			return "", fmt.Errorf("reviewer pane readiness timeout for %s (want %s): %w", sessionID, want, lastErr)
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
 }
 
 // reviewEligibleTaskStatus permits explicit NEEDS_REVIEW/ready cards while
