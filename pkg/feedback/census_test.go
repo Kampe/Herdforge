@@ -140,7 +140,7 @@ func TestNeedsWakeOnlyForSettledAgents(t *testing.T) {
 
 func TestRequestBodyNamesTheCountableReplyShape(t *testing.T) {
 	body := RequestBody("E1", "orchestrator")
-	for _, want := range []string{"FLEET_FEEDBACK E1", "HERD_LANE=<your-lane> bin/herd-mail send orchestrator", "NONE"} {
+	for _, want := range []string{"FLEET_FEEDBACK E1", "HERD_LANE=<your-lane> herd send orchestrator", "NONE", "durable inbox record"} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("request body missing %q: %s", want, body)
 		}
@@ -447,5 +447,20 @@ func TestCensusTickInterval(t *testing.T) {
 		if got != c.want {
 			t.Fatalf("CensusTickInterval(%d) = %d, want %d", c.tickSec, got, c.want)
 		}
+	}
+}
+
+func TestEpochKnownTreatsWakeOnlyEpochAsVoid(t *testing.T) {
+	stateDir := t.TempDir()
+	if err := Save(stateDir, &CensusState{Epoch: "20260817T060000Z", RequestedAtEpoch: 1, Lanes: []string{"smith"}}); err != nil {
+		t.Fatal(err)
+	}
+	known, err := EpochKnown(stateDir, "20260817T060000Z")
+	if err != nil || !known {
+		t.Fatalf("known epoch=%v err=%v", known, err)
+	}
+	ghost, err := EpochKnown(stateDir, "20260817T061837Z")
+	if err != nil || ghost {
+		t.Fatalf("ghost epoch=%v err=%v, want false", ghost, err)
 	}
 }

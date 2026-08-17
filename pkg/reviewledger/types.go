@@ -6,12 +6,14 @@ import "time"
 type Event string
 
 const (
-	EventRecord   Event = "record"
-	EventVerdict  Event = "verdict"
-	EventRepair   Event = "repair"
-	EventConsumed Event = "consumed"
-	EventEnqueue  Event = "enqueue"
-	EventRevoked  Event = "revoked"
+	EventRecord       Event = "record"
+	EventVerdict      Event = "verdict"
+	EventRepair       Event = "repair"
+	EventConsumed     Event = "consumed"
+	EventEnqueue      Event = "enqueue"
+	EventRevoked      Event = "revoked"
+	EventRefutation   Event = "refutation"
+	EventSupersession Event = "supersession"
 )
 
 // Verdict values.
@@ -67,6 +69,7 @@ type LedgerRow struct {
 	VerificationDigest string `json:"verification_digest,omitempty"`
 	FindingsRef        string `json:"findings_ref,omitempty"`
 	CandidateSHA       string `json:"candidate_sha,omitempty"`
+	Reason             string `json:"reason,omitempty"`
 }
 
 // familyResolve represents the 3-state family resolution.

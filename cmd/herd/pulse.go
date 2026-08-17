@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -422,13 +423,33 @@ func readPulseReview() pulse.ReviewObservation {
 	// as Known=false so an operator can detect the problem, not silently
 	// report Known=true with zero pending (finding 3).
 	ledger := review.OpenLedger(path)
-	if _, err := ledger.Vetoed(context.Background()); err != nil {
+	ctx := context.Background()
+	pending, err := ledger.Pending()
+	if err != nil {
 		return pulse.ReviewObservation{Known: false, Error: fmt.Sprintf("review ledger unreadable: %v", err)}
 	}
-	// Readable ledger: known-empty pending is honest — we did not observe
-	// pressure, so do not invent saturation. Callers needing the pile
-	// still run herd drain.
-	return pulse.ReviewObservation{Known: true, Pending: 0, NeedReview: 0}
+	vetoed, err := ledger.Vetoed(ctx)
+	if err != nil {
+		return pulse.ReviewObservation{Known: false, Error: fmt.Sprintf("review ledger unreadable: %v", err)}
+	}
+	pendingRefs := make([]string, 0, len(pending))
+	for _, row := range pending {
+		if strings.TrimSpace(row.SHA) != "" {
+			pendingRefs = append(pendingRefs, row.SHA)
+		}
+	}
+	needReviewRefs := make([]string, 0, len(vetoed))
+	for sha := range vetoed {
+		if strings.TrimSpace(sha) != "" {
+			needReviewRefs = append(needReviewRefs, sha)
+		}
+	}
+	sort.Strings(pendingRefs)
+	sort.Strings(needReviewRefs)
+	return pulse.ReviewObservation{
+		Known: true, Pending: len(pendingRefs), PendingRefs: pendingRefs,
+		NeedReview: len(needReviewRefs), NeedReviewRefs: needReviewRefs,
+	}
 }
 
 func readPulseQuota() pulse.QuotaObservation {

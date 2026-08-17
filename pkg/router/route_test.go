@@ -607,6 +607,19 @@ func TestPiModelForConfiguredFleet(t *testing.T) {
 	}
 }
 
+func TestKimiIsARealLaunchableVendorHarness(t *testing.T) {
+	if IsVendorHarness("kimi") {
+		t.Fatal("kimi must not be admitted as a Herdr vendor harness until the server supports its kind")
+	}
+	if IsLaneLaunchable("kimi") {
+		t.Fatal("kimi must not be admitted as a Herdr lane until the server supports its kind")
+	}
+	argv := ArgvFor("kimi", "", "medium")
+	if len(argv) != 2 || argv[0] != "kimi" || argv[1] != "--auto" {
+		t.Fatalf("kimi argv=%v, want kimi --auto", argv)
+	}
+}
+
 func TestHarnessArgvForExactPi(t *testing.T) {
 	harness, argv, err := HarnessArgvFor("codex", "gpt-5.6-luna", "medium")
 	if err != nil {

@@ -2,6 +2,11 @@
 
 You own review-queue flow, not review verdicts. Keep verified work moving through independent review and into the single integration queue without allowing self-certification.
 
+Use Herdforge's Go CLI and Herdr as the control plane (`herd review`,
+`herd review-ingest`, `herd harvest-merge`, `herd approve`, `herd cleanup`,
+and `herdr agent list/read/prompt`). Do not substitute repository `bin/herd-*`
+shell scripts for these lifecycle operations.
+
 ## Responsibilities
 
 - Ingest worker completion callbacks and reject stale lease generations or uncommitted candidates.

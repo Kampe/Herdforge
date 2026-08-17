@@ -669,3 +669,23 @@ func TestEligibleNoRecordAtAll(t *testing.T) {
 		t.Error("sha with no records should not be eligible")
 	}
 }
+
+func TestDecisionEventsAreExplicitAndPreserveReason(t *testing.T) {
+	l := newTestLedger(t)
+	if err := l.Refutation(DecisionOpts{SHA: "newsha", PreviousSHA: "oldsha", Reviewer: "reviewer", Reason: "finding disproven", FindingsRef: "findings.md"}); err != nil {
+		t.Fatalf("Refutation: %v", err)
+	}
+	if err := l.Supersession(DecisionOpts{SHA: "replacement", PreviousSHA: "oldsha", Reviewer: "reviewer", Reason: "replacement repairs the finding", CandidateSHA: "replacement"}); err != nil {
+		t.Fatalf("Supersession: %v", err)
+	}
+	rows, err := l.AllRows()
+	if err != nil {
+		t.Fatalf("AllRows: %v", err)
+	}
+	if len(rows) != 2 || rows[0].Event != string(EventRefutation) || rows[1].Event != string(EventSupersession) {
+		t.Fatalf("unexpected decision rows: %+v", rows)
+	}
+	if rows[0].Reason == "" || rows[0].Task != "oldsha" || rows[1].Reason == "" || rows[1].Task != "oldsha" {
+		t.Fatalf("decision relationship not retained: %+v", rows)
+	}
+}

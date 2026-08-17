@@ -1,5 +1,14 @@
 # Herdforge Smith Agent Contract
 
+## Control-plane contract (mandatory)
+
+Use Herdforge's Go CLI and Herdr directly; never use repository `bin/herd-*`
+orchestration scripts. Work only in the assigned worktree, use router-selected
+Codex, Claude, Grok, AGY, or OpenCode, and deliver completion through Herdforge
+receipts. Send review-ready work to the review supervisor. On a FAIL, make a
+new SHA and report it back through Herdr. Continue the injected `/goal` when
+the assigned card is complete.
+
 You are the senior builder for larger R2/R3 implementation tasks. You have the same isolation and completion obligations as a worker, with additional responsibility for architecture and migration safety.
 
 ## Responsibilities

@@ -127,6 +127,21 @@ func Save(stateDir string, s *CensusState) error {
 	return nil
 }
 
+// EpochKnown is the durable registry check lanes and supervisors use before
+// waiting on a feedback request. Herdr wake delivery is only a hint; an epoch
+// absent from the repo-local census state is void and must be discarded
+// immediately rather than creating a permanent FEEDBACK_MISSING ghost.
+func EpochKnown(stateDir, epoch string) (bool, error) {
+	if strings.TrimSpace(epoch) == "" {
+		return false, nil
+	}
+	s, err := Load(stateDir)
+	if err != nil {
+		return false, err
+	}
+	return s.Epoch == epoch, nil
+}
+
 // Epoch stamps a census. Callers pass the clock so this stays testable.
 func Epoch(now time.Time) string { return now.UTC().Format("20060102T150405Z") }
 
@@ -229,9 +244,9 @@ func RequestBody(epoch, coordinator string) string {
 		"FLEET FEEDBACK REQUEST %s. Before your next handoff, inspect beyond your assigned task and report: "+
 			"blocker or underutilized capacity; any prompt that was not consumed; quota/provider state that "+
 			"disagrees with pane status; and anything the coordinator or herd tooling missed. "+
-			"Reply exactly with: HERD_LANE=<your-lane> bin/herd-mail send %s --summary 'FLEET_FEEDBACK %s <your-lane>' "+
+			"Reply exactly with: HERD_LANE=<your-lane> herd send %s \"FLEET_FEEDBACK %s <your-lane>\" "+
 			"'blocker=<...>; delivery=<...>; quota=<...>; coordinator_blind_spot=<...>' "+
-			"Use NONE explicitly for each empty field. Do not mutate outside your assigned worktree.",
+			"Use NONE explicitly for each empty field. Before waiting, verify a durable inbox record for this exact epoch; if none exists, treat the request as VOID and continue. Do not mutate outside your assigned worktree.",
 		epoch, coordinator, epoch)
 }
 
@@ -378,7 +393,7 @@ func defaultFleetStateDir(repoRoot string) string {
 
 // Selftest verifies the load-bearing commitments this port must preserve:
 // the outbound request still carries the FLEET_FEEDBACK subject and names
-// herd-mail as the durable reply channel, and HERD_FEEDBACK_INTERVAL is
+// herd send as the reply channel, and HERD_FEEDBACK_INTERVAL is
 // actually read by the interval resolver — a behavioral check, not a
 // literal-vs-literal comparison that can only fail by editing both sides.
 // It is the in-process equivalent of bin/herd-feedback's own `grep` selftest.
@@ -387,8 +402,8 @@ func Selftest() error {
 	if !strings.Contains(body, SubjectPrefix) {
 		return fmt.Errorf("request body lost the %s subject", SubjectPrefix)
 	}
-	if !strings.Contains(body, "herd-mail") {
-		return fmt.Errorf("request body lost the herd-mail reply command")
+	if !strings.Contains(body, "herd send") {
+		return fmt.Errorf("request body lost the herd send reply command")
 	}
 	old, had := os.LookupEnv(EnvInterval)
 	os.Setenv(EnvInterval, "4242")
