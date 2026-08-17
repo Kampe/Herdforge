@@ -840,6 +840,15 @@ func (sv *ReviewSupervisor) Dispatch(ctx context.Context, requests []DispatchReq
 	return out
 }
 
+func (sv *ReviewSupervisor) currentQueueState(sha string) QueueState {
+	sv.mu.RLock()
+	defer sv.mu.RUnlock()
+	if cand, ok := sv.cands[sha]; ok {
+		return queueState(cand)
+	}
+	return QueueAdmitted
+}
+
 func (sv *ReviewSupervisor) dispatchOne(parent context.Context, req DispatchRequest) DispatchResult {
 	result := DispatchResult{SHA: req.SHA}
 	attempts := req.MaxAttempts
@@ -859,13 +868,21 @@ func (sv *ReviewSupervisor) dispatchOne(parent context.Context, req DispatchRequ
 	var lastReason string
 	for attempt := 1; attempt <= attempts; attempt++ {
 		if err := parent.Err(); err != nil {
-			lastReason = "dispatch canceled: " + err.Error()
-			break
+			return DispatchResult{
+				SHA:      req.SHA,
+				State:    sv.currentQueueState(req.SHA),
+				Attempts: attempt - 1,
+				Reason:   "dispatch canceled: " + err.Error(),
+			}
 		}
 		reviewer, err := sv.SelectReviewer(req.SHA, req.Reviewers)
 		if err != nil {
-			lastReason = err.Error()
-			break
+			return DispatchResult{
+				SHA:      req.SHA,
+				State:    sv.currentQueueState(req.SHA),
+				Attempts: attempt - 1,
+				Reason:   err.Error(),
+			}
 		}
 		if reviewer == nil {
 			lastReason = "no routable reviewer available"
@@ -886,12 +903,22 @@ func (sv *ReviewSupervisor) dispatchOne(parent context.Context, req DispatchRequ
 			result.Reviewer = reviewer.Name
 			return result
 		}
+		if parentErr := parent.Err(); parentErr != nil {
+			return DispatchResult{
+				SHA:      req.SHA,
+				State:    sv.currentQueueState(req.SHA),
+				Attempts: attempt,
+				Reason:   "dispatch canceled: " + parentErr.Error(),
+			}
+		}
 		lastReason = err.Error()
 	}
 	result.Attempts = attempts
 	result.Reason = fmt.Sprintf("no routable review surface after %d attempts: %s", attempts, lastReason)
 	if err := sv.markDispatchBlocked(req.SHA, result.Reason, attempts); err != nil {
+		result.State = sv.currentQueueState(req.SHA)
 		result.Reason += "; durable record failed: " + err.Error()
+		return result
 	}
 	result.State = QueueBlocked
 	return result
@@ -904,8 +931,8 @@ func (sv *ReviewSupervisor) markDispatchBlocked(sha, reason string, attempts int
 	if !ok {
 		return fmt.Errorf("reviewsup: unknown candidate %s", sha)
 	}
-	if cand.DispatchBlocked {
-		return nil
+	if cand.State != StatePending {
+		return fmt.Errorf("reviewsup: candidate %s is not pending (state=%s)", sha, cand.State)
 	}
 	oldState, oldVerdict := cand.State, cand.Verdict
 	oldAttempts, oldUpdated := cand.Attempts, cand.UpdatedAt
@@ -915,9 +942,7 @@ func (sv *ReviewSupervisor) markDispatchBlocked(sha, reason string, attempts int
 	cand.Verdict = VerdictBLOCKED
 	cand.Attempts = attempts
 	cand.UpdatedAt = sv.now()
-	if sv.pendingCount > 0 {
-		sv.pendingCount--
-	}
+	sv.pendingCount--
 	if err := sv.appendRow(&Row{Event: string(EventDispatchBlocked), SHA: sha, Reason: reason, Attempts: attempts}); err != nil {
 		cand.DispatchBlocked = false
 		cand.DispatchReason = ""
@@ -1529,9 +1554,10 @@ func (sv *ReviewSupervisor) Reconstruct() (int, error) {
 
 		case EventDispatchBlocked:
 			if cand, ok := sv.cands[r.SHA]; ok {
-				if cand.State == StatePending || cand.State == StateReviewing || cand.State == StatePass {
-					sv.pendingCount--
+				if cand.State != StatePending {
+					break
 				}
+				sv.pendingCount--
 				cand.DispatchBlocked = true
 				cand.DispatchReason = r.Reason
 				cand.State = StateBlocked
