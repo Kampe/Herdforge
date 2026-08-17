@@ -1943,6 +1943,8 @@ func runReview() {
 			fmt.Fprintf(os.Stderr, "no lane configured for role 'reviewer'\n")
 			os.Exit(1)
 		}
+		restoreHooks := useHarnessHooksFromWorktree(wt)
+		defer restoreHooks()
 		decision, err := launchAdmissionWithLifecycle(liveLaunchLifecycle{}, cfg, lane.Role, true, routedLaneDecision(context.Background(), task), func(_ *router.LaunchDecision) error {
 			_, listErr := herdr.AgentList()
 			return listErr
