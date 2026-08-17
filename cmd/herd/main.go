@@ -7011,8 +7011,7 @@ func runVerify() {
 		os.Exit(2)
 	}
 
-	v := verifier.NewVerifier("")
-	c := v.CheckCompletion(context.Background(), wt, *buildCmd, *testCmd)
+	var c *verifier.CompletionCheck
 
 	// FAC-145: a worktree carrying a launch receipt reports its verify
 	// outcome as a receipt-bound callback, so the worker FAIL signal travels
@@ -7046,6 +7045,36 @@ func runVerify() {
 				tcErr = v.Verify(tc)
 			}
 		}
+	}
+	if tcErr == nil {
+		sha, shaErr := worktreeHeadSHA(wt)
+		if shaErr != nil {
+			// A malformed/empty managed worktree can still emit its bound
+			// BLOCKED callback. There is no candidate to receipt-bind, and
+			// forcing a SHA here would hide the actionable callback.
+			c = verifier.NewVerifier("").CheckCompletion(context.Background(), wt, *buildCmd, *testCmd)
+		} else {
+			baseSHA := tc.BaseSHA
+			if len(baseSHA) != 40 {
+				baseSHA = ""
+			}
+			store, storeErr := verifier.NewFileReceiptStore(filepath.Join(verifyRoot, defaultReceiptDir))
+			if storeErr != nil {
+				fmt.Fprintf(os.Stderr, "herd verify: cannot open receipt store: %v\n", storeErr)
+				os.Exit(2)
+			}
+			var persistErr error
+			c, _, persistErr = verifier.NewVerifier("").CheckCompletionAndPersist(context.Background(), wt, *buildCmd, *testCmd, verifier.VerificationRequest{
+				TaskRef: tc.TaskRef, LeaseGeneration: fmt.Sprintf("%d", tc.LeaseGeneration),
+				CandidateSHA: sha, BaseSHA: baseSHA, EnvironmentPolicy: verifier.EnvironmentPolicyInherited,
+			}, store)
+			if persistErr != nil {
+				fmt.Fprintf(os.Stderr, "herd verify: persist verification receipts: %v\n", persistErr)
+				os.Exit(2)
+			}
+		}
+	} else {
+		c = verifier.NewVerifier("").CheckCompletion(context.Background(), wt, *buildCmd, *testCmd)
 	}
 	switch {
 	case tcErr == nil:
