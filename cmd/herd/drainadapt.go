@@ -63,6 +63,7 @@ type drainAdapters struct {
 	repository string
 	cap        int
 	lane       *config.LaneDef
+	supervisor string
 	tasks      provider.TaskProvider
 	ledger     *reviewledger.Ledger
 	launcher   drainLauncher
@@ -169,7 +170,7 @@ func (a *drainAdapters) launchReview(ctx context.Context, e drainActionEvidence)
 		return fmt.Errorf("review launch: reviewer family %q must differ from builder family %q", decision.Family, family)
 	}
 	req := taskLaunchRequest(decision, task.Ref, a.repository, a.lane.Name)
-	proof, err := a.launcher.LaunchReviewer(ctx, req, drainReviewPacket(task.Ref, sha, a.lane.Worktree, standing.AgentName(a.lane.Name)))
+	proof, err := a.launcher.LaunchReviewer(ctx, req, drainReviewPacket(task.Ref, sha, a.lane.Worktree, a.supervisor))
 	if err != nil {
 		return fmt.Errorf("review launch: %w", err)
 	}
@@ -545,8 +546,15 @@ func newDrainAdapters(root, ledgerPath string, cfg *config.Config, tp provider.T
 	if tp == nil {
 		return nil, fmt.Errorf("no board provider authority")
 	}
-	lane := findReviewSupervisorLane(cfg)
+	lane := findLaneForRole(cfg, launch.ReviewerRole)
 	if lane == nil {
+		lane = findLaneForRole(cfg, launch.AssayerRole)
+	}
+	if lane == nil {
+		return nil, fmt.Errorf("no reviewer lane configured (roles: reviewer, assayer)")
+	}
+	supervisorLane := findReviewSupervisorLane(cfg)
+	if supervisorLane == nil {
 		return nil, fmt.Errorf("no standing review supervisor lane configured (roles: review-supervisor, reviewer, harvest)")
 	}
 	if strings.TrimSpace(lane.Worktree) == "" {
@@ -566,6 +574,7 @@ func newDrainAdapters(root, ledgerPath string, cfg *config.Config, tp provider.T
 		repository:  repositoryIdentityForLaunch(cfg),
 		cap:         reviewCap,
 		lane:        lane,
+		supervisor:  standing.AgentName(supervisorLane.Name),
 		tasks:       tp,
 		ledger:      ledger,
 		launcher:    liveDrainLauncher{lane: lane.Name},

@@ -87,6 +87,7 @@ func newDrainSelftestAdapters(dir string) (*drainAdapters, *fakeDrainProvider, *
 		repository: "selftest-repo",
 		cap:        2,
 		lane:       &config.LaneDef{Name: "review", Role: launch.ReviewerRole, Worktree: ".herd/worktrees/review"},
+		supervisor: "forge-review-supervisor",
 		tasks:      tasks,
 		ledger:     ledger,
 		launcher:   launcher,
