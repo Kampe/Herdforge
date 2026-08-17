@@ -5385,6 +5385,11 @@ func laneLaunchDecisionWithProbe(ctx context.Context, lane *config.LaneDef, task
 	if err != nil {
 		return nil, err
 	}
+	if surface, ok := router.SurfaceFor(decision.Provider); !ok {
+		return nil, fmt.Errorf("lane %q routed unsupported provider %q before pane creation", lane.Name, decision.Provider)
+	} else if launchable, reason := router.ProbeSurface(surface); !launchable {
+		return nil, fmt.Errorf("lane %q routed %s/%s but it is not launchable before pane creation: %s", lane.Name, decision.Provider, decision.Model, reason)
+	}
 	bindHarness := lane.Harness
 	if !pinnedBuilder {
 		// Review and assayer lanes may be rerouted by quota. Bind the harness

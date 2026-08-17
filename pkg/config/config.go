@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Kampe/Herdforge/pkg/router"
 	"gopkg.in/yaml.v3"
 )
 
@@ -503,6 +504,12 @@ func ConfiguredHarnessKindsFor(root string) ([]string, error) {
 	kinds := cfg.ConfiguredHarnessKinds()
 	if len(kinds) == 0 {
 		return nil, fmt.Errorf("no configured harness kinds found in %s", cfgPath)
+	}
+	for _, kind := range kinds {
+		surface, ok := router.SurfaceFor(kind)
+		if !ok || !surface.VendorHarness {
+			return nil, fmt.Errorf("unsupported configured harness %q", kind)
+		}
 	}
 	return kinds, nil
 }

@@ -606,8 +606,11 @@ func equalStrings(a, b []string) bool {
 // narrow: coordinator-only models can never enter a worker boundary.
 func Validate(req Request, sink Sink) error {
 	role, shape, provider, model, effort, _, argv := fields(req)
-	if req.Decision == nil || role == "" || shape == "" || provider == "" || model == "" || effort == "" || len(argv) == 0 || strings.TrimSpace(req.Decision.Harness) == "" || len(req.Decision.HarnessArgv) == 0 {
+	if req.Decision == nil || role == "" || shape == "" || provider == "" || (!router.ModelOptional(provider) && model == "") || effort == "" || len(argv) == 0 || strings.TrimSpace(req.Decision.Harness) == "" || len(req.Decision.HarnessArgv) == 0 {
 		return reject(req, sink, "an actual compiled LaunchDecision with role, task shape, provider, model, effort, and argv is required")
+	}
+	if err := router.ValidateSurface(provider, req.Decision.Harness); err != nil {
+		return reject(req, sink, err.Error())
 	}
 	if err := router.VerifyDecisionForScope(req.Decision, req.TaskRef, req.LeaseGeneration, req.Scope); err != nil {
 		return reject(req, sink, err.Error())
@@ -659,7 +662,7 @@ func Validate(req Request, sink Sink) error {
 		// No vendor tuple: the routed decision already came from the live
 		// quota-ranked implementation waterfall. Validate that it is coherent,
 		// not that it names one preordained provider.
-		if strings.TrimSpace(provider) == "" || strings.TrimSpace(model) == "" || strings.TrimSpace(effort) == "" {
+		if strings.TrimSpace(provider) == "" || (!router.ModelOptional(provider) && strings.TrimSpace(model) == "") || strings.TrimSpace(effort) == "" {
 			return reject(req, sink, "worker launch decision is missing provider, model, or effort")
 		}
 	} else if !controlRole(role) {
@@ -681,7 +684,7 @@ func Validate(req Request, sink Sink) error {
 	// contract: every non-worker launch was then rejected as "missing --model"
 	// while the flag was sitting three positions later. Position is a property
 	// of one vendor's command line; presence is the property this gate is about.
-	if !worker && (len(want) < 2 || want[0] == "" || !argvCarriesModel(want) || !argvCarriesEffort(provider, want, effort)) {
+	if !worker && (len(want) < 1 || want[0] == "" || (!router.ModelOptional(provider) && !argvCarriesModel(want)) || !router.ModelOptional(provider) && !argvCarriesEffort(provider, want, effort)) {
 		return reject(req, sink, "non-worker launch argv must explicitly carry --model and effort")
 	}
 	if len(argv) != len(want) {
@@ -732,7 +735,7 @@ func Validate(req Request, sink Sink) error {
 			break
 		}
 	}
-	if modelIndex < 0 || normalized(argv[modelIndex]) != model {
+	if !router.ModelOptional(provider) && (modelIndex < 0 || normalized(argv[modelIndex]) != model) {
 		return reject(req, sink, "argv model does not match the routed decision")
 	}
 	return nil
