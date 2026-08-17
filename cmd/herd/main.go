@@ -2112,13 +2112,6 @@ func runReview() {
 		// guarantee must rest on the LIVE terminal state, read for the exact
 		// pane INCARNATION we just launched (FAC-145).
 		reviewerSession := herdr.SessionID(tab.Pane)
-		liveCwd, cwdErr := waitForReviewerPaneCwd(reviewerSession, worktreeDir, 6*time.Second)
-		if cwdErr != nil {
-			life.fail("cannot read live reviewer pane cwd (FAC-145): %v", cwdErr)
-		}
-		if !sameDir(liveCwd, worktreeDir) {
-			life.fail("live reviewer pane cwd %q is not the isolated candidate checkout %q (FAC-145)", liveCwd, worktreeDir)
-		}
 		// Start through the compiled LaunchDecision (main's admission path):
 		// the isolated tab is FAC-145's requirement, the decision-bound start
 		// is the launch contract — the reviewer needs both.
@@ -2133,6 +2126,17 @@ func runReview() {
 		reviewReq := taskLaunchRequest(boundDecision, task.Ref, repositoryIdentityForLaunch(cfg), lane.Name)
 		if err := herdr.StartPreparedAgent(tab.ID, tabLabel, boundDecision.Harness, tab.Pane.ID, reviewReq); err != nil {
 			life.fail("failed to start reviewer agent: %v", err)
+		}
+		// Herdr 0.8 publishes a tab's root pane to agent-list only after the
+		// harness starts. Read the live cwd after that transition, with a
+		// bounded exact-incarnation wait; checking before start races a valid
+		// pane that is not an agent yet.
+		liveCwd, cwdErr := waitForReviewerPaneCwd(reviewerSession, worktreeDir, 6*time.Second)
+		if cwdErr != nil {
+			life.fail("cannot read live reviewer pane cwd (FAC-145): %v", cwdErr)
+		}
+		if !sameDir(liveCwd, worktreeDir) {
+			life.fail("live reviewer pane cwd %q is not the isolated candidate checkout %q (FAC-145)", liveCwd, worktreeDir)
 		}
 		targetLabel := tabLabel
 		fmt.Printf("Spawned reviewer '%s' in tab %s (pane %s, cwd %s)\n", tabLabel, tab.ID, tab.Pane.ID, tab.Cwd)
