@@ -437,17 +437,28 @@ func readPulseQuota() pulse.QuotaObservation {
 	}
 	eng := usage.NewQuotaEngine()
 	computed := eng.ComputeAll(snap)
-	exhausted, atRisk := false, false
-	for _, st := range computed {
+	// Quota is a routing constraint, not an AND over every provider. One
+	// exhausted surface must not block a healthy sibling (for example Codex at
+	// its weekly limit while Grok remains available). Dispatch is exhausted
+	// only when every native provider surface is exhausted or unavailable.
+	exhausted, atRisk := true, false
+	knownSurface := false
+	for _, provider := range []string{"codex", "grok", "claude", "agy"} {
+		st, ok := computed[provider]
+		if !ok {
+			continue
+		}
+		knownSurface = true
+		if st.Available {
+			exhausted = false
+		}
 		switch quotasup.Classify(&st, quotasup.DefaultWarnRunwayMinutes) {
-		case quotasup.Exhausted:
-			exhausted = true
 		case quotasup.AtRisk:
 			atRisk = true
-		case quotasup.Unknown, quotasup.Untracked:
-			// A single unknown pool does not poison the whole beat, but
-			// exhaust/risk from any pool still gates dispatch.
 		}
+	}
+	if !knownSurface {
+		exhausted = false
 	}
 	return pulse.QuotaObservation{Known: true, Exhausted: exhausted, AtRisk: atRisk}
 }
