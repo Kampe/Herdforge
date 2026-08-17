@@ -764,10 +764,14 @@ func (a *livePulseActor) OpenReview(ctx context.Context, lane pulse.AgentObserva
 		return errors.New("pulse: herdr CLI not found")
 	}
 	target := standing.AgentName(supervisor.Name)
-	packet := fmt.Sprintf("PULSE REVIEW HANDOFF\nLane: %s\nTab: %s\nWorkspace: %s\n\nInspect this finished lane's exact worktree and candidate receipt. Admit and review only an exact candidate SHA with valid verification evidence. You own reviewer dispatch, retries, verdict ingest, and reviewer-pane cleanup; send only a merge-ready PASS handoff to the coordinator. Do not ask the coordinator to perform review work.", lane.Name, lane.TabID, lane.Workspace)
+	packet := pulseReviewPacket(lane)
 	if _, err := herdr.AgentPrompt(target, packet, false); err != nil {
 		return fmt.Errorf("pulse: notify review supervisor %s: %w", target, err)
 	}
 	_ = ctx
 	return nil
+}
+
+func pulseReviewPacket(lane pulse.AgentObservation) string {
+	return fmt.Sprintf("PULSE REVIEW HANDOFF\nLane: %s\nTab: %s\nWorkspace: %s\n\nInspect this finished lane's exact worktree and candidate receipt. Admit and review only an exact candidate SHA with valid verification evidence. You own reviewer dispatch, retries, verdict ingest, and reviewer-pane cleanup; send only a merge-ready PASS handoff to the coordinator. Do not ask the coordinator to perform review work.", lane.Name, lane.TabID, lane.Workspace)
 }
