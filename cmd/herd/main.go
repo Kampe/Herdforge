@@ -1993,11 +1993,11 @@ func runReview() {
 		}
 		// ONE generation per task: the reviewer JOINS the task's active
 		// lease instead of minting an independent review generation.
-		reviewLeaseRef := hsync.NormalizeRef(task.Ref)
+		reviewLeaseRef := reviewLeaseTaskRef(task.Ref)
 		reviewLeaseKey := claim.LeaseKey{
 			Repo: dispatch.RepositoryIdentityOrName(spawnRoot, cfg.Project.Name), Provider: cfg.TaskProvider.Type, Project: cfg.TaskProvider.ProjectID, TaskRef: reviewLeaseRef,
 		}
-		leaseID, leaseGen, leaseOwned, leaseErr := acquireOrJoinLease(context.Background(), spawnRoot, reviewLeaseKey, "coordinator-review", dispatch.RoleReviewer)
+		leaseID, leaseGen, leaseOwned, leaseErr := acquireOrJoinLease(context.Background(), spawnRoot, reviewLeaseKey, "coordinator-review", dispatch.RoleWorker)
 		if leaseErr != nil {
 			fmt.Fprintf(os.Stderr, "review: %v\n", leaseErr)
 			os.Exit(1)
@@ -2380,6 +2380,13 @@ func boundBoardProvider(cfg *config.Config, tp provider.TaskProvider, root, ref 
 	return btp, coord, nil
 }
 
+// reviewLeaseTaskRef isolates post-build review/approve authority from the
+// worker's claim lease. A completed worker is expected to release its claim;
+// reviewers must not revive that worker lease or race a new worker generation.
+func reviewLeaseTaskRef(ref string) string {
+	return strings.ToLower(hsync.NormalizeRef(ref)) + ":review"
+}
+
 // The approval journal durably couples the PASS callback to the board
 // transition (FAC-145). It is the CANONICAL coordinator lifecycle record:
 // resolved from the repository's COMMON root (never process cwd, so every
@@ -2438,7 +2445,24 @@ func requireLiveLease(ctx context.Context, root string, tc dispatch.TaskContext)
 		}
 	}
 	if live == nil {
-		return fmt.Errorf("no ACTIVE lease for lease key %s — receipt %s lease %s gen %d carries no live authority (FAC-145 fail-closed; released/expired/missing all refuse)", tc.LeaseTaskRef, tc.TaskRef, tc.LeaseID, tc.LeaseGeneration)
+		// A worker's claim is normally released when its build finishes. The
+		// signed, unexpired receipt plus the discovered candidate authorizes a
+		// fresh review-scoped lease; it never revives the worker lease and does
+		// not alter the receipt's generation. Force-expired receipts remain
+		// fenced by the receipt expiry below.
+		if time.Now().After(tc.ExpiresAt) {
+			return fmt.Errorf("receipt %s expired at %s — review authority refused (FAC-145)", tc.TaskRef, tc.ExpiresAt.Format(time.RFC3339))
+		}
+		reviewKey := key
+		reviewKey.TaskRef = reviewLeaseTaskRef(tc.LeaseTaskRef)
+		if review, reviewErr := st.CurrentLease(ctx, reviewKey); reviewErr != nil {
+			return fmt.Errorf("review lease read failed — refusing unfenced authority (FAC-145): %w", reviewErr)
+		} else if review == nil || review.Status != claim.StatusActive || review.Expired(time.Now()) {
+			if _, acquireErr := st.Acquire(ctx, reviewKey, "coordinator-review", dispatch.RoleWorker, "", time.Now(), dispatch.DefaultReceiptTTL); acquireErr != nil {
+				return fmt.Errorf("no ACTIVE worker lease and review lease acquisition failed for %s (FAC-145): %w", tc.TaskRef, acquireErr)
+			}
+		}
+		return nil
 	}
 	if live.Expired(now) {
 		return fmt.Errorf("lease for %s is expired (FAC-145)", tc.TaskRef)
@@ -3010,7 +3034,7 @@ func approveOne(ctx context.Context, cfg *config.Config, tp provider.TaskProvide
 		if oerr != nil {
 			return nil, fmt.Errorf("approve: process owner identity: %w", oerr)
 		}
-		key := provider.LeaseKey(coord.Repository, coord.ProviderType, coord.ProjectID, coord.LeaseTaskRef)
+		key := provider.LeaseKey(coord.Repository, coord.ProviderType, coord.ProjectID, reviewLeaseTaskRef(coord.LeaseTaskRef))
 		taskRole, rerr := provider.TaskOwnershipRole(nil, "worker")
 		if rerr != nil {
 			return nil, rerr
@@ -9087,6 +9111,7 @@ func forgeLoopMain() int {
 		return feedback.Run(ctx, feedback.Options{
 			Coordinator: coordReg.Name,
 			Workspace:   forgeWorkspace,
+			Roster:      configuredFeedbackRoster(cfg, coordReg.Name),
 		})
 	}
 

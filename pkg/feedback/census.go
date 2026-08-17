@@ -154,9 +154,22 @@ func Missing(requested, replied []string) []string {
 // the original expectation and fail closed rather than treating an outage as
 // retirement.
 func ActiveRequestedLanes(requested []string, agents []herdr.AgentEntry, workspace string) []string {
+	return ActiveRequestedLanesForRoster(requested, agents, workspace, nil)
+}
+
+// ActiveRequestedLanesForRoster applies an optional configured standing
+// roster in addition to the workspace filter. Ephemeral task/reviewer panes
+// are not census participants when a roster is supplied.
+func ActiveRequestedLanesForRoster(requested []string, agents []herdr.AgentEntry, workspace string, roster []string) []string {
+	allowed := make(map[string]bool, len(roster))
+	for _, name := range roster {
+		if strings.TrimSpace(name) != "" {
+			allowed[name] = true
+		}
+	}
 	active := make(map[string]bool, len(agents))
 	for _, agent := range agents {
-		if strings.TrimSpace(agent.Name) == "" || (workspace != "" && agent.Workspace != workspace) {
+		if strings.TrimSpace(agent.Name) == "" || (workspace != "" && agent.Workspace != workspace) || (len(allowed) > 0 && !allowed[agent.Name]) {
 			continue
 		}
 		active[agent.Name] = true
@@ -171,8 +184,21 @@ func ActiveRequestedLanes(requested []string, agents []herdr.AgentEntry, workspa
 }
 
 func hasActiveWorkspaceAgent(agents []herdr.AgentEntry, workspace string) bool {
+	return hasActiveWorkspaceAgentForRoster(agents, workspace, nil)
+}
+
+func hasActiveWorkspaceAgentForRoster(agents []herdr.AgentEntry, workspace string, roster []string) bool {
 	for _, agent := range agents {
-		if strings.TrimSpace(agent.Name) != "" && (workspace == "" || agent.Workspace == workspace) {
+		if strings.TrimSpace(agent.Name) != "" && (workspace == "" || agent.Workspace == workspace) && (len(roster) == 0 || containsName(roster, agent.Name)) {
+			return true
+		}
+	}
+	return false
+}
+
+func containsName(names []string, want string) bool {
+	for _, name := range names {
+		if name == want {
 			return true
 		}
 	}
@@ -238,6 +264,9 @@ type Options struct {
 	Workspace      string // pre-resolved workspace id; empty resolves via ResolveWorkspace
 	WorkspaceLabel string // empty resolves from HERD_WORKSPACE_LABEL
 	Coordinator    string // pre-resolved coordinator; empty resolves via CoordinatorTarget
+	// Roster limits requests and census expectations to configured standing
+	// lanes. An empty roster preserves the generic all-agent behavior.
+	Roster []string
 
 	Now            func() time.Time
 	ListWorkspaces func() ([]herdr.WorkspaceEntry, error)
@@ -418,8 +447,8 @@ func Run(ctx context.Context, opts Options) error {
 	now := opts.Now()
 	if state.Epoch != "" {
 		replyLanes := state.Lanes
-		if agents, listErr := opts.ListAgents(); listErr == nil && hasActiveWorkspaceAgent(agents, workspace) {
-			replyLanes = ActiveRequestedLanes(state.Lanes, agents, workspace)
+		if agents, listErr := opts.ListAgents(); listErr == nil && hasActiveWorkspaceAgentForRoster(agents, workspace, opts.Roster) {
+			replyLanes = ActiveRequestedLanesForRoster(state.Lanes, agents, workspace, opts.Roster)
 			if len(replyLanes) != len(state.Lanes) {
 				fmt.Fprintf(opts.Stdout, "herd-feedback: retired lanes removed from census=%d\n", len(state.Lanes)-len(replyLanes))
 				state.Lanes = replyLanes
@@ -489,7 +518,7 @@ func Run(ctx context.Context, opts Options) error {
 
 	var lanes []string
 	for _, a := range agents {
-		if a.Workspace != workspace || strings.TrimSpace(a.Name) == "" || a.Name == coordinator {
+		if a.Workspace != workspace || strings.TrimSpace(a.Name) == "" || a.Name == coordinator || (len(opts.Roster) > 0 && !containsName(opts.Roster, a.Name)) {
 			continue
 		}
 		// Durable delivery is the authoritative half of the census: a

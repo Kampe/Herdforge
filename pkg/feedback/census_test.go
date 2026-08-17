@@ -47,6 +47,20 @@ func TestActiveRequestedLanesDropsRetiredWorkers(t *testing.T) {
 	}
 }
 
+func TestActiveRequestedLanesForRosterExcludesEphemeralReviewer(t *testing.T) {
+	requested := []string{"coordinator", "review-harvest-supervisor", "review-fix-grok46-dc9f7f1"}
+	agents := []herdr.AgentEntry{
+		{Name: "coordinator", Workspace: "wB"},
+		{Name: "review-harvest-supervisor", Workspace: "wB"},
+		{Name: "review-fix-grok46-dc9f7f1", Workspace: "wB"},
+	}
+	got := ActiveRequestedLanesForRoster(requested, agents, "wB", []string{"coordinator", "review-harvest-supervisor"})
+	want := []string{"coordinator", "review-harvest-supervisor"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("roster lanes=%v, want %v", got, want)
+	}
+}
+
 func TestMissingIsSetDifferenceAndDeterministic(t *testing.T) {
 	got := Missing([]string{"smith", "scout", "assayer"}, []string{"scout"})
 	want := []string{"assayer", "smith"}

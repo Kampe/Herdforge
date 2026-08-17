@@ -6,8 +6,11 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strings"
 
+	"github.com/Kampe/Herdforge/pkg/config"
 	"github.com/Kampe/Herdforge/pkg/feedback"
+	"github.com/Kampe/Herdforge/pkg/standing"
 )
 
 // runFeedback ports bin/herd-feedback: the periodic fleet-wide control-plane
@@ -40,6 +43,9 @@ func runFeedback() {
 		StateDir: *stateDir,
 		MailDir:  *mailDir,
 	}
+	if cfg, cfgErr := config.LoadConfig(".herd/herd.yaml"); cfgErr == nil {
+		opts.Roster = configuredFeedbackRoster(cfg, "")
+	}
 	if err := feedback.Run(context.Background(), opts); err != nil {
 		// The workspace-unresolved path already printed its exact required
 		// refusal text inside Run; every other error still needs a message
@@ -49,4 +55,25 @@ func runFeedback() {
 		}
 		os.Exit(1)
 	}
+}
+
+func configuredFeedbackRoster(cfg *config.Config, coordinator string) []string {
+	seen := map[string]bool{}
+	var roster []string
+	add := func(name string) {
+		if strings.TrimSpace(name) != "" && !seen[name] {
+			seen[name] = true
+			roster = append(roster, name)
+		}
+	}
+	add(coordinator)
+	if cfg != nil {
+		for _, lane := range cfg.Lanes {
+			if lane.Standing {
+				add(lane.Name)
+				add(standing.AgentName(lane.Name))
+			}
+		}
+	}
+	return roster
 }
