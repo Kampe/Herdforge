@@ -84,6 +84,36 @@ func TestExecuteRepairsMismatchedToolchainArtifacts(t *testing.T) {
 	}
 }
 
+func TestExecuteRepairsReadOnlyCacheArtifacts(t *testing.T) {
+	root := t.TempDir()
+	runner := &recordingRunner{}
+	exec := Executor{Resolver: fakeResolver{identity: "go1"}, Runner: runner}
+	first, err := exec.Execute(context.Background(), root, testContract())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cacheRoot := filepath.Join(root, first.Receipt.CacheDir)
+	stale := filepath.Join(cacheRoot, "decode_test.go")
+	if err := os.WriteFile(stale, []byte("old"), 0o400); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(cacheRoot, 0o500); err != nil {
+		t.Fatal(err)
+	}
+
+	exec.Resolver = fakeResolver{identity: "go2"}
+	second, err := exec.Execute(context.Background(), root, testContract())
+	if err != nil {
+		t.Fatalf("read-only cache repair failed: %v", err)
+	}
+	if second.Reused || runner.calls != 2 {
+		t.Fatalf("read-only cache repair reused=%v calls=%d, want false/2", second.Reused, runner.calls)
+	}
+	if _, err := os.Stat(stale); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("read-only cache was not replaced: stat=%v", err)
+	}
+}
+
 func TestExecuteDoesNotWriteReceiptWhenBootstrapFails(t *testing.T) {
 	root := t.TempDir()
 	exec := Executor{Resolver: fakeResolver{identity: "go1"}, Runner: &recordingRunner{err: errors.New("network unavailable")}}
