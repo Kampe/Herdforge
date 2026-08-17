@@ -887,14 +887,16 @@ type TabRecord struct {
 	TabID       string `json:"tab_id"`
 	WorkspaceID string `json:"workspace_id"`
 	Label       string `json:"label"`
-	// Generation is optional because Herdr 0.8 does not expose immutable tab
-	// generations in tab list/create responses. When a newer Herdr provides it,
-	// callers can bind it directly; an absent value must remain fail-closed.
-	Generation  string `json:"generation,omitempty"`
-	Number      int    `json:"number"`
-	PaneCount   int    `json:"pane_count"`
-	Focused     bool   `json:"focused"`
-	AgentStatus string `json:"agent_status"`
+	// Generation is optional because older Herdr versions do not expose
+	// immutable tab generations in tab-list responses. Newer versions may use
+	// either generation or tab_generation; TabList normalizes both to this
+	// field so reconciliation consumes the live identity surface.
+	Generation    string `json:"generation,omitempty"`
+	TabGeneration string `json:"tab_generation,omitempty"`
+	Number        int    `json:"number"`
+	PaneCount     int    `json:"pane_count"`
+	Focused       bool   `json:"focused"`
+	AgentStatus   string `json:"agent_status"`
 }
 
 // TabList reads durable tab metadata. It is read-only and deliberately does
@@ -914,6 +916,11 @@ func TabList(workspace string) ([]TabRecord, error) {
 	}
 	if err := json.Unmarshal([]byte(out), &resp); err != nil {
 		return nil, fmt.Errorf("parsing tab list: %w", err)
+	}
+	for i := range resp.Result.Tabs {
+		if strings.TrimSpace(resp.Result.Tabs[i].Generation) == "" {
+			resp.Result.Tabs[i].Generation = strings.TrimSpace(resp.Result.Tabs[i].TabGeneration)
+		}
 	}
 	return resp.Result.Tabs, nil
 }
@@ -1430,8 +1437,9 @@ type AgentSession struct {
 	Value  string `json:"value,omitempty"`
 }
 
-// AgentEntry matches live herdr 0.7.x agent list rows. Real counters are
-// Revision and StateChangeSeq — the wire has no generation field. Optional
+// AgentEntry matches live herdr agent list rows. Revision and StateChangeSeq
+// are mutable counters; TabGeneration, when present, is the immutable tab
+// identity surface and must not be substituted with either counter. Optional
 // FAC-158 observation fields are filled by authority adapters / fixtures,
 // never invented from the raw agent list.
 type AgentEntry struct {
@@ -1448,6 +1456,10 @@ type AgentEntry struct {
 	Session        AgentSession `json:"agent_session,omitempty"`
 	Revision       uint64       `json:"revision,omitempty"`
 	StateChangeSeq uint64       `json:"state_change_seq,omitempty"`
+	// TabGeneration is the immutable tab identity exposed by newer Herdr
+	// pulse/agent-list surfaces. It is deliberately distinct from
+	// StateChangeSeq, which only counts agent state transitions.
+	TabGeneration uint64 `json:"tab_generation,omitempty"`
 }
 
 // SessionID renders the launch-time pane identity a receipt binds to.

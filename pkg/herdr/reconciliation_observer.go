@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 )
@@ -159,6 +160,9 @@ func (o *ProductionReconciliationObserver) ObserveReconciliation(ctx context.Con
 	for _, tab := range tabs.Value {
 		bindingAuth := o.Reader.Binding(ctx, tab)
 		agent, found := byTab[tab.TabID]
+		if tab.Generation == "" && found && agent.TabGeneration > 0 {
+			tab.Generation = strconv.FormatUint(agent.TabGeneration, 10)
+		}
 		if decision, handled, err := o.reconcileLegacyTab(ctx, tab, agent, found, bindingAuth); err != nil {
 			return recordBlocked("legacy tab state: " + err.Error())
 		} else if handled {
@@ -190,6 +194,9 @@ func (o *ProductionReconciliationObserver) ObserveReconciliation(ctx context.Con
 		binding := bindingAuth.Value
 		if binding.TabID == "" {
 			binding.TabID = tab.TabID
+		}
+		if binding.Generation == "" {
+			binding.Generation = tab.Generation
 		}
 		binding.Label = tab.Label
 		if duplicateTabs[tab.TabID] {

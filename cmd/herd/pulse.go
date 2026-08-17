@@ -243,7 +243,7 @@ func readPulseHerdr(ctx context.Context, doneRefs map[string]bool) pulse.HerdrOb
 			ForegroundProcess: processName,
 			TabID:             a.TabID,
 			Workspace:         a.Workspace,
-			TabGeneration:     a.StateChangeSeq,
+			TabGeneration:     a.TabGeneration,
 			TabRevision:       a.Revision,
 		}
 		if warning := herdr.DetectContextWarning(paneBody); warning != "" {

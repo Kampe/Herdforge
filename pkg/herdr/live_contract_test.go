@@ -177,7 +177,7 @@ func TestAgentList_DecodesSessionAndCounters(t *testing.T) {
 	defer func() { runHerdr = old }()
 	runHerdr = func(args ...string) (string, error) {
 		return `{"result":{"agents":[
-			{"name":"c","agent":"claude","agent_status":"idle","pane_id":"p1","tab_id":"t1","workspace_id":"w1","revision":3,"state_change_seq":10,"agent_session":{"source":"herdr:claude","kind":"id","value":"sess"}},
+			{"name":"c","agent":"claude","agent_status":"idle","pane_id":"p1","tab_id":"t1","workspace_id":"w1","revision":3,"state_change_seq":10,"tab_generation":42,"agent_session":{"source":"herdr:claude","kind":"id","value":"sess"}},
 			{"name":"g","agent":"grok","agent_status":"working","pane_id":"p2","tab_id":"t2","workspace_id":"w1","revision":5,"state_change_seq":20}
 		]}}`, nil
 	}
@@ -185,7 +185,7 @@ func TestAgentList_DecodesSessionAndCounters(t *testing.T) {
 	if err != nil || len(agents) != 2 {
 		t.Fatalf("AgentList: %v %#v", err, agents)
 	}
-	if agents[0].Session.Value != "sess" || agents[0].StateChangeSeq != 10 {
+	if agents[0].Session.Value != "sess" || agents[0].StateChangeSeq != 10 || agents[0].TabGeneration != 42 {
 		t.Fatalf("claude row: %+v", agents[0])
 	}
 	if agents[1].Session.Value != "" || agents[1].StateChangeSeq != 20 {
