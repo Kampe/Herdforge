@@ -44,10 +44,15 @@ process count becomes visible. Eleven agents were left resident in one session b
 sweep; a lane sitting at an idle prompt holds a full harness process and its MCP sessions.
 
 CLOSE a lane when any of these is true:
-- its ticket is done;
-- its branch is out for review — the work is committed and pinned at `safe/fac-<ref>`, so the
-  agent has nothing to do until a verdict returns;
-- the agent is idle or done at an empty prompt with its work committed.
+- its ticket has a supervisor-recorded PASS, the coordinator has merged the exact SHA, and
+  generation-fenced cleanup has proved the implementation/review worktrees are safe to remove;
+- the agent is idle or done at an empty prompt with its work committed and no review repair can
+  still be delivered to it.
+
+Do NOT close an implementation lane merely because its branch entered review: a FAIL must be
+delivered back to that lane for repair. The review supervisor closes ephemeral reviewer panes
+after verdict ingestion; the coordinator closes the implementation/review panes and removes
+their one-off worktrees only after merge proof. Never close standing lanes.
 
 KEEP a lane only while its agent is actively `working`, or while it is genuinely waiting on input
 that only it can act on.
