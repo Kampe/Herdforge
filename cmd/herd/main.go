@@ -5354,14 +5354,20 @@ func laneLaunchDecisionWithProbe(ctx context.Context, lane *config.LaneDef, task
 	if err != nil {
 		return nil, err
 	}
-	decision, err = router.BindVendorHarness(decision, lane.Harness)
+	bindHarness := lane.Harness
+	if !pinnedBuilder {
+		// Review and assayer lanes may be rerouted by quota. Bind the harness
+		// selected by the router so the launch tuple remains coherent.
+		bindHarness = decision.Provider
+	}
+	decision, err = router.BindVendorHarness(decision, bindHarness)
 	if err != nil {
-		return nil, fmt.Errorf("lane %q bind configured harness: %w", lane.Name, err)
+		return nil, fmt.Errorf("lane %q bind vendor harness: %w", lane.Name, err)
 	}
 	if decision.Shape != lane.TaskShape {
 		return nil, fmt.Errorf("lane %q routed shape drift: configured %s, got %s", lane.Name, lane.TaskShape, decision.Shape)
 	}
-	if decision.Harness != strings.ToLower(strings.TrimSpace(lane.Harness)) {
+	if pinnedBuilder && decision.Harness != strings.ToLower(strings.TrimSpace(lane.Harness)) {
 		return nil, fmt.Errorf("lane %q routed harness drift: got %s, want %s", lane.Name, decision.Harness, lane.Harness)
 	}
 	if pinnedBuilder {
