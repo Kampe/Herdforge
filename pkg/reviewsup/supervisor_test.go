@@ -71,6 +71,33 @@ func svc(t *testing.T) *ReviewSupervisor {
 	return sv
 }
 
+// ephemeralPASSArtifact writes a chainseer-style temp-path verdict body. FAC-373
+// requires the supervisor to retain it under .herd/review/inbox before any
+// cleanup-candidate transition; the temp file may vanish after pane exit.
+func ephemeralPASSArtifact(t *testing.T, sha string) string {
+	t.Helper()
+	dir := filepath.Join(t.TempDir(), "chainseer-herd-review")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "verdict-"+sha+".md")
+	body := "sha: " + sha + "\nverdict: PASS\n---\n" + strings.Repeat("independent review evidence ", 20)
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func passVerdict(sha, reviewer string, t *testing.T) ReviewVerdict {
+	t.Helper()
+	return ReviewVerdict{
+		SHA:      sha,
+		Reviewer: reviewer,
+		Verdict:  VerdictPASS,
+		Artifact: ephemeralPASSArtifact(t, sha),
+	}
+}
+
 func TestNewDefaultConfig(t *testing.T) {
 	dir := t.TempDir()
 	cfg := DefaultConfig(dir)
@@ -422,6 +449,7 @@ func TestSubmitVerdictUsesStoredReviewFamily_RepairProbe(t *testing.T) {
 		SHA:      "sha1",
 		Reviewer: "gpt-shadow-reviewer",
 		Verdict:  VerdictPASS,
+		Artifact: ephemeralPASSArtifact(t, "sha1"),
 	})
 	if err != nil {
 		t.Fatalf("SubmitVerdict: %v (verdict gate must trust cand.ReviewFamily, not the reviewer label)", err)
@@ -432,11 +460,7 @@ func TestSubmitVerdictPASS(t *testing.T) {
 	sv := svc(t)
 	sv.LaunchReview("aaa111", "gemini", "gemini-2.5-flash")
 
-	_, err := sv.SubmitVerdict(ReviewVerdict{
-		SHA:      "aaa111",
-		Reviewer: "gemini",
-		Verdict:  VerdictPASS,
-	})
+	_, err := sv.SubmitVerdict(passVerdict("aaa111", "gemini", t))
 	if err != nil {
 		t.Fatalf("SubmitVerdict: %v", err)
 	}
@@ -475,7 +499,7 @@ func TestSubmitVerdictPASS(t *testing.T) {
 func TestMarkClosedProjectsCleanupCandidateToClosed(t *testing.T) {
 	sv := svc(t)
 	sv.LaunchReview("aaa111", "gemini", "gemini-2.5-flash")
-	if _, err := sv.SubmitVerdict(ReviewVerdict{SHA: "aaa111", Reviewer: "gemini", Verdict: VerdictPASS}); err != nil {
+	if _, err := sv.SubmitVerdict(passVerdict("aaa111", "gemini", t)); err != nil {
 		t.Fatalf("SubmitVerdict: %v", err)
 	}
 	if err := sv.MarkClosed("aaa111"); err != nil {
@@ -509,7 +533,7 @@ func TestReconstructThenMarkClosed(t *testing.T) {
 	if err := sv.LaunchReview("restart-sha", "gemini", "gemini-2.5-flash"); err != nil {
 		t.Fatalf("LaunchReview: %v", err)
 	}
-	if _, err := sv.SubmitVerdict(ReviewVerdict{SHA: "restart-sha", Reviewer: "gemini", Verdict: VerdictPASS}); err != nil {
+	if _, err := sv.SubmitVerdict(passVerdict("restart-sha", "gemini", t)); err != nil {
 		t.Fatalf("SubmitVerdict: %v", err)
 	}
 
@@ -646,7 +670,7 @@ func TestVerdictReleasesCapacity(t *testing.T) {
 	}
 
 	sv.LaunchReview("aaa111", "gemini", "gemini-2.5-flash")
-	sv.SubmitVerdict(ReviewVerdict{SHA: "aaa111", Reviewer: "gemini", Verdict: VerdictPASS})
+	sv.SubmitVerdict(passVerdict("aaa111", "gemini", t))
 
 	if sv.PendingCount() != 2 {
 		t.Errorf("PendingCount = %d, want 2", sv.PendingCount())
@@ -659,7 +683,7 @@ func TestVerdictReleasesCapacity(t *testing.T) {
 func TestMarkHarvested(t *testing.T) {
 	sv := svc(t)
 	sv.LaunchReview("aaa111", "gemini", "gemini-2.5-flash")
-	sv.SubmitVerdict(ReviewVerdict{SHA: "aaa111", Reviewer: "gemini", Verdict: VerdictPASS})
+	sv.SubmitVerdict(passVerdict("aaa111", "gemini", t))
 
 	ready, _ := sv.ReadyForHarvest(10)
 	if len(ready) != 1 {
@@ -720,7 +744,7 @@ func TestReconstructFromLedger(t *testing.T) {
 	sv.Ingest(withDigest(CompletionCallback{SHA: "aaa111", AuthorModel: "claude", Tier: TierR1, PatchID: "p1"}))
 	sv.Ingest(withDigest(CompletionCallback{SHA: "bbb222", AuthorModel: "gemini", Tier: TierR3, PatchID: "p2"}))
 	sv.LaunchReview("aaa111", "gemini", "gemini-2.5-flash")
-	sv.SubmitVerdict(ReviewVerdict{SHA: "aaa111", Reviewer: "gemini", Verdict: VerdictPASS})
+	sv.SubmitVerdict(passVerdict("aaa111", "gemini", t))
 
 	sv2 := New(cfg)
 	n, err := sv2.Reconstruct()
@@ -790,7 +814,7 @@ func TestReconstructWithQueueState(t *testing.T) {
 
 	sv.Ingest(withDigest(CompletionCallback{SHA: "aaa111", AuthorModel: "claude", Tier: TierR1}))
 	sv.LaunchReview("aaa111", "gemini", "gemini-2.5-flash")
-	sv.SubmitVerdict(ReviewVerdict{SHA: "aaa111", Reviewer: "gemini", Verdict: VerdictPASS})
+	sv.SubmitVerdict(passVerdict("aaa111", "gemini", t))
 	sv.MarkHarvested("aaa111")
 
 	sv2 := New(cfg)
@@ -818,7 +842,7 @@ func TestReadyForHarvestReturnsSorted(t *testing.T) {
 			mod = "claude-3-7-sonnet"
 		}
 		sv.LaunchReview(sha, rev, mod)
-		sv.SubmitVerdict(ReviewVerdict{SHA: sha, Reviewer: rev, Verdict: VerdictPASS})
+		sv.SubmitVerdict(passVerdict(sha, rev, t))
 	}
 
 	ready, _ := sv.ReadyForHarvest(10)
@@ -833,9 +857,9 @@ func TestReadyForHarvestReturnsSorted(t *testing.T) {
 func TestReadyForHarvestLimit(t *testing.T) {
 	sv := svc(t)
 	sv.LaunchReview("aaa111", "gemini", "gemini-2.5-flash")
-	sv.SubmitVerdict(ReviewVerdict{SHA: "aaa111", Reviewer: "gemini", Verdict: VerdictPASS})
+	sv.SubmitVerdict(passVerdict("aaa111", "gemini", t))
 	sv.LaunchReview("bbb222", "claude", "claude-3-7-sonnet")
-	sv.SubmitVerdict(ReviewVerdict{SHA: "bbb222", Reviewer: "claude", Verdict: VerdictPASS})
+	sv.SubmitVerdict(passVerdict("bbb222", "claude", t))
 
 	ready, _ := sv.ReadyForHarvest(1)
 	if len(ready) != 1 {
@@ -972,14 +996,14 @@ func TestSubmitVerdictFAILReturnsFindingsToBuilder(t *testing.T) {
 func TestDuplicateVerdictNoDoubleHarvest(t *testing.T) {
 	sv := svc(t)
 	sv.LaunchReview("aaa111", "gemini", "gemini-2.5-flash")
-	sv.SubmitVerdict(ReviewVerdict{SHA: "aaa111", Reviewer: "gemini", Verdict: VerdictPASS})
+	sv.SubmitVerdict(passVerdict("aaa111", "gemini", t))
 
 	ready, _ := sv.ReadyForHarvest(10)
 	if len(ready) != 1 {
 		t.Fatalf("expected 1 ready, got %d", len(ready))
 	}
 
-	sv.SubmitVerdict(ReviewVerdict{SHA: "aaa111", Reviewer: "gemini", Verdict: VerdictPASS})
+	sv.SubmitVerdict(passVerdict("aaa111", "gemini", t))
 	ready2, _ := sv.ReadyForHarvest(10)
 	if len(ready2) != 1 {
 		t.Errorf("expected still 1 ready (no duplicate), got %d", len(ready2))
@@ -1057,7 +1081,7 @@ func TestLedgerFileCreation(t *testing.T) {
 
 	sv.Ingest(withDigest(CompletionCallback{SHA: "aaa111", AuthorModel: "claude", Tier: TierR1}))
 	sv.LaunchReview("aaa111", "gemini", "gemini-2.5-flash")
-	sv.SubmitVerdict(ReviewVerdict{SHA: "aaa111", Reviewer: "gemini", Verdict: VerdictPASS})
+	sv.SubmitVerdict(passVerdict("aaa111", "gemini", t))
 
 	rows, err := readRows(cfg.LedgerPath)
 	if err != nil {
@@ -1079,7 +1103,7 @@ func TestLedgerFileCreation(t *testing.T) {
 func TestMarkHarvestedUpdatesState(t *testing.T) {
 	sv := svc(t)
 	sv.LaunchReview("aaa111", "gemini", "gemini-2.5-flash")
-	sv.SubmitVerdict(ReviewVerdict{SHA: "aaa111", Reviewer: "gemini", Verdict: VerdictPASS})
+	sv.SubmitVerdict(passVerdict("aaa111", "gemini", t))
 
 	sv.MarkHarvested("aaa111")
 	c := sv.Candidate("aaa111")
@@ -1677,5 +1701,144 @@ func TestDispatchStateErrorsDoNotMutateCandidates(t *testing.T) {
 		if row.Event == string(EventDispatchBlocked) {
 			t.Fatal("state errors must not append dispatch_blocked evidence")
 		}
+	}
+}
+
+// TestSubmitVerdictPASSRetainsInboxBeforeCleanupCandidate is the green path
+// for FAC-373: a PASS reported from an ephemeral chainseer-style temp path
+// becomes cleanup-candidate only after the exact-SHA body is retained under
+// .herd/review/inbox, and ReadyForHarvest (coordinator merge-ready) requires
+// that same retained state.
+func TestSubmitVerdictPASSRetainsInboxBeforeCleanupCandidate(t *testing.T) {
+	sv, root := newTestSupervisor(t)
+	if _, _, err := sv.Ingest(withDigest(CompletionCallback{
+		SHA: "retain-sha", Branch: "herd/fac-373", AuthorModel: "claude", Tier: TierR1,
+	})); err != nil {
+		t.Fatalf("Ingest: %v", err)
+	}
+	if err := sv.LaunchReview("retain-sha", "gemini", "gemini-2.5-flash"); err != nil {
+		t.Fatalf("LaunchReview: %v", err)
+	}
+	src := ephemeralPASSArtifact(t, "retain-sha")
+	if _, err := sv.SubmitVerdict(ReviewVerdict{
+		SHA: "retain-sha", Reviewer: "gemini", Verdict: VerdictPASS, Artifact: src,
+	}); err != nil {
+		t.Fatalf("SubmitVerdict: %v", err)
+	}
+	// Simulate reviewer pane cleanup racing after retain: temp source vanishes.
+	if err := os.Remove(src); err != nil {
+		t.Fatal(err)
+	}
+	c := sv.Candidate("retain-sha")
+	if c == nil || c.State != StateHarvested || !c.CleanupCandidate || !c.VerdictRetained || !c.Ingested {
+		t.Fatalf("candidate after PASS = %+v, want harvested cleanup-candidate with retain+ingest", c)
+	}
+	if c.Artifact == "" || !strings.HasPrefix(c.Artifact, ".herd/review/inbox/") {
+		t.Fatalf("artifact = %q, want durable inbox path", c.Artifact)
+	}
+	if _, err := os.Stat(filepath.Join(root, filepath.FromSlash(c.Artifact))); err != nil {
+		t.Fatalf("durable inbox artifact must survive source cleanup: %v", err)
+	}
+	ready, err := sv.ReadyForHarvest(10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ready) != 1 || ready[0].SHA != "retain-sha" {
+		t.Fatalf("coordinator merge-ready harvest = %+v, want exact retained PASS", ready)
+	}
+}
+
+// TestSubmitVerdictPASSMissingArtifactIsDurableBlocked proves the red-then-green
+// race: when cleanup (or a missing handoff) leaves no retainable source, the
+// supervisor records one durable BLOCKED state and never projects cleanup-
+// candidate or coordinator-directed PASS/harvest.
+func TestSubmitVerdictPASSMissingArtifactIsDurableBlocked(t *testing.T) {
+	sv, _ := newTestSupervisor(t)
+	if _, _, err := sv.Ingest(withDigest(CompletionCallback{
+		SHA: "race-sha", Branch: "herd/fac-373", AuthorModel: "claude", Tier: TierR1,
+	})); err != nil {
+		t.Fatalf("Ingest: %v", err)
+	}
+	if err := sv.LaunchReview("race-sha", "gemini", "gemini-2.5-flash"); err != nil {
+		t.Fatalf("LaunchReview: %v", err)
+	}
+
+	// RED path: claimed PASS with no artifact (vanished temp path).
+	st, err := sv.SubmitVerdict(ReviewVerdict{
+		SHA: "race-sha", Reviewer: "gemini", Verdict: VerdictPASS, Artifact: "",
+	})
+	if err == nil {
+		t.Fatal("missing artifact must fail closed")
+	}
+	if st != StateBlocked {
+		t.Fatalf("state = %s, want BLOCKED", st)
+	}
+	c := sv.Candidate("race-sha")
+	if c.State != StateBlocked || c.CleanupCandidate || c.HarvestReady || c.Ingested {
+		t.Fatalf("candidate = %+v, want durable BLOCKED without cleanup/harvest", c)
+	}
+	if c.Verdict != VerdictBLOCKED {
+		t.Fatalf("verdict = %s, want BLOCKED", c.Verdict)
+	}
+	ready, err := sv.ReadyForHarvest(10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ready) != 0 {
+		t.Fatalf("coordinator must not see merge-ready PASS after vanished artifact: %+v", ready)
+	}
+	for _, e := range sv.QueueSnapshot() {
+		if e.SHA == "race-sha" && e.State == QueueCleanupCandidate {
+			t.Fatalf("queue projected cleanup-candidate without retention: %+v", e)
+		}
+	}
+
+	// Reconstruct must preserve the single durable BLOCKED, not invent PASS.
+	restarted := New(sv.cfg)
+	if _, err := restarted.Reconstruct(); err != nil {
+		t.Fatalf("Reconstruct: %v", err)
+	}
+	rc := restarted.Candidate("race-sha")
+	if rc == nil || rc.State != StateBlocked || rc.CleanupCandidate {
+		t.Fatalf("reconstructed = %+v, want durable BLOCKED", rc)
+	}
+}
+
+// TestSubmitVerdictPASSVanishedSourceDuringCleanupRace covers the live
+// Chainseer failure mode: a temp path under chainseer-herd-review is reported
+// then deleted before retain completes. Result must be BLOCKED, never cleanup.
+func TestSubmitVerdictPASSVanishedSourceDuringCleanupRace(t *testing.T) {
+	sv, root := newTestSupervisor(t)
+	if _, _, err := sv.Ingest(withDigest(CompletionCallback{
+		SHA: "vanish-sha", Branch: "herd/fac-373", AuthorModel: "claude", Tier: TierR1,
+	})); err != nil {
+		t.Fatalf("Ingest: %v", err)
+	}
+	if err := sv.LaunchReview("vanish-sha", "gemini", "gemini-2.5-flash"); err != nil {
+		t.Fatalf("LaunchReview: %v", err)
+	}
+	src := ephemeralPASSArtifact(t, "vanish-sha")
+	if err := os.Remove(src); err != nil {
+		t.Fatal(err)
+	}
+	st, err := sv.SubmitVerdict(ReviewVerdict{
+		SHA: "vanish-sha", Reviewer: "gemini", Verdict: VerdictPASS, Artifact: src,
+	})
+	if err == nil {
+		t.Fatal("vanished source must fail closed")
+	}
+	if st != StateBlocked {
+		t.Fatalf("state = %s, want BLOCKED", st)
+	}
+	inbox := filepath.Join(root, ".herd", "review", "inbox")
+	if entries, err := os.ReadDir(inbox); err == nil && len(entries) != 0 {
+		t.Fatalf("failed retain must not leave inbox entries: %v", entries)
+	}
+	ready, err := sv.ReadyForHarvest(10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ready) != 0 {
+		t.Fatalf("vanished artifact must not be merge-ready: %+v", ready)
 	}
 }

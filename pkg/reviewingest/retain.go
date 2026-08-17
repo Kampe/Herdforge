@@ -1,0 +1,125 @@
+package reviewingest
+
+import (
+	"crypto/sha256"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"strings"
+)
+
+// InboxRel is the repository-relative durable review inbox. Reviewer panes
+// write ephemeral temp-path artifacts; only copies under this directory are
+// review authority after pane cleanup (FAC-373).
+const InboxRel = ".herd/review/inbox"
+
+// RetainArtifact copies a validated verdict into the repo-local review inbox
+// using a content-addressed filename. The returned path is relative to root
+// (slash-separated) so the ledger remains portable across worktrees.
+//
+// Callers must retain before treating a PASS as cleanup-ready: ephemeral
+// /tmp or chainseer-herd-review paths may vanish the moment the reviewer
+// pane exits.
+func RetainArtifact(root, source, sha, reviewer string) (string, error) {
+	root = strings.TrimSpace(root)
+	source = strings.TrimSpace(source)
+	sha = strings.TrimSpace(sha)
+	if root == "" || source == "" || sha == "" {
+		return "", fmt.Errorf("root, source, and candidate sha are required")
+	}
+	in, err := os.Open(source)
+	if err != nil {
+		return "", fmt.Errorf("open verdict artifact: %w", err)
+	}
+	defer in.Close()
+	digest := sha256.New()
+	if _, err := io.Copy(digest, in); err != nil {
+		return "", fmt.Errorf("hash verdict artifact: %w", err)
+	}
+	if _, err := in.Seek(0, 0); err != nil {
+		return "", fmt.Errorf("rewind verdict artifact: %w", err)
+	}
+	name := sanitizeReviewerName(reviewer)
+	contentDigest := fmt.Sprintf("%x", digest.Sum(nil))[:16]
+	rel := filepath.ToSlash(filepath.Join(InboxRel, fmt.Sprintf("%s-%s-%s.md", strings.ToLower(shortSHA(sha)), name, contentDigest)))
+	dst := filepath.Join(root, filepath.FromSlash(rel))
+	if err := os.MkdirAll(filepath.Dir(dst), 0o700); err != nil {
+		return "", fmt.Errorf("create review inbox: %w", err)
+	}
+	// Idempotent same-content hit: a prior retain already published this
+	// digest for the exact candidate. Do not rewrite review evidence.
+	if existing, err := os.ReadFile(dst); err == nil {
+		sum := sha256.Sum256(existing)
+		if fmt.Sprintf("%x", sum)[:16] == contentDigest {
+			if _, err := os.Stat(dst); err != nil {
+				return "", fmt.Errorf("retained artifact vanished after read: %w", err)
+			}
+			return rel, nil
+		}
+		return "", fmt.Errorf("retained artifact %s exists with different content", rel)
+	} else if !os.IsNotExist(err) {
+		return "", fmt.Errorf("stat retained artifact: %w", err)
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(dst), ".verdict-*.tmp")
+	if err != nil {
+		return "", fmt.Errorf("create retained artifact: %w", err)
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+	if _, err := io.Copy(tmp, in); err != nil {
+		_ = tmp.Close()
+		return "", fmt.Errorf("copy verdict artifact: %w", err)
+	}
+	if err := tmp.Chmod(0o600); err != nil {
+		_ = tmp.Close()
+		return "", fmt.Errorf("secure retained artifact: %w", err)
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return "", fmt.Errorf("sync retained artifact: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return "", fmt.Errorf("close retained artifact: %w", err)
+	}
+	if err := os.Rename(tmpName, dst); err != nil {
+		return "", fmt.Errorf("publish retained artifact: %w", err)
+	}
+	// Re-stat after publish: a concurrent cleanup of the destination (or a
+	// flaky FS) must never become coordinator-facing PASS evidence.
+	info, err := os.Stat(dst)
+	if err != nil {
+		return "", fmt.Errorf("retained artifact vanished after publish: %w", err)
+	}
+	if info.Size() == 0 {
+		return "", fmt.Errorf("retained artifact is empty after publish")
+	}
+	return rel, nil
+}
+
+// IsInboxPath reports whether path is a repository-relative durable review
+// inbox artifact (slash or OS separators accepted).
+func IsInboxPath(path string) bool {
+	p := filepath.ToSlash(strings.TrimSpace(path))
+	return strings.HasPrefix(p, InboxRel+"/") || p == InboxRel
+}
+
+func sanitizeReviewerName(reviewer string) string {
+	name := strings.ToLower(strings.TrimSpace(reviewer))
+	var b strings.Builder
+	for _, r := range name {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-' || r == '_' {
+			b.WriteRune(r)
+		} else {
+			b.WriteByte('-')
+		}
+	}
+	name = strings.Trim(b.String(), "-")
+	if name == "" {
+		name = "reviewer"
+	}
+	if len(name) > 32 {
+		name = name[:32]
+	}
+	return name
+}
