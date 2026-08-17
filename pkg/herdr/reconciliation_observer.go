@@ -278,7 +278,10 @@ func legacyCandidate(tab TabRecord, agent AgentEntry, found bool, binding Author
 	if tab.Generation != "" && binding.State == EvidencePresent && binding.Value.Generation != "" {
 		return false
 	}
-	return (binding.State == EvidencePresent && binding.Value.TaskRef != "") || (found && agent.Name != "") || strings.HasPrefix(tab.Label, herdforgeLabel)
+	// Labels are mutable and coordinator labels share the Herdforge prefix;
+	// never treat a label alone as a legacy worker candidate. Require either a
+	// bound task or an attached named agent.
+	return (binding.State == EvidencePresent && binding.Value.TaskRef != "") || (found && agent.Name != "")
 }
 
 func exactLegacyIdentity(tab TabRecord, agent AgentEntry, found bool, binding TabBinding) bool {
