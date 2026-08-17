@@ -63,7 +63,7 @@ func (k *KaneoProvider) listRelationsOnce(ctx context.Context, taskID string) ([
 	// preflight. Prefer exact-origin HTTP whenever authorized, even with
 	// use_cli=true, so post-fence closure proof never incurs 4s CLI subprocesses.
 	// Single-card callers without authorized HTTP retain the CLI fallback.
-	if k.UseCLI && !k.preferHTTPForRelations() {
+	if k.UseCLI && (!k.preferHTTPForRelations() || strings.TrimSpace(os.Getenv(EnvKaneoRelationsCLI)) == "1") {
 		args := []string{"task", "rel", "list", taskID, "--json"}
 		if k.ProjectID != "" {
 			args = append(args, "--project", k.ProjectID)
