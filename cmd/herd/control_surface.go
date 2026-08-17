@@ -14,7 +14,7 @@ import (
 // FAC-240: controlSurfaceVersion is a compatibility boundary, not a display
 // number. Any command-contract change must add its new fingerprint below and
 // increment this value; ValidateControlSurfaceManifest rejects silent drift.
-const controlSurfaceVersion = 8
+const controlSurfaceVersion = 9
 
 type commandClass string
 
@@ -51,7 +51,7 @@ var commandNamesByClass = map[commandClass][]string{
 		"board-audit", "control-surface", "mail", "preflight", "preflight-static", "process", "resources", "route", "scope", "selftest", "status", "tests-for", "throughput", "timeline", "tool-probe", "unmerged", "verify", "worktrees",
 	},
 	classCoordinatorOnly: {
-		"activate", "approve", "attention", "board-done", "board-freeze", "board-frozen", "board-sync", "claude-only", "cleanup", "command", "commands", "containers", "control", "daemon", "deps", "dispatch", "doctor-models", "drain", "feedback", "fence-provision", "forge", "fresh-build", "goal-guard", "harvest", "harvest-merge", "herdr-deliver", "hold", "kick", "labels", "lifecycle", "lock", "lost", "merge-admit", "merge-complete", "next", "no-claude", "overlap", "park", "posture", "pulse", "quota", "quota-supervisor", "receipt", "repl", "rescue", "reset-safe", "resolve-lane", "review", "review-classify", "review-ingest", "review-ledger", "send", "sh", "shoot", "shot", "spin", "standing", "stop", "task", "up", "usage", "watch", "wave", "wind-down", "verify-fac151",
+		"activate", "approve", "attention", "board-done", "board-freeze", "board-frozen", "board-sync", "claude-only", "cleanup", "command", "commands", "containers", "control", "daemon", "deps", "dispatch", "doctor-models", "drain", "feedback", "fence-provision", "forge", "fresh-build", "goal-guard", "harvest", "harvest-merge", "herdr-deliver", "hold", "kick", "labels", "legacy-receipts", "lifecycle", "lock", "lost", "merge-admit", "merge-complete", "next", "no-claude", "overlap", "park", "posture", "pulse", "quota", "quota-supervisor", "receipt", "repl", "rescue", "reset-safe", "resolve-lane", "review", "review-classify", "review-ingest", "review-ledger", "send", "sh", "shoot", "shot", "spin", "standing", "stop", "task", "up", "usage", "watch", "wave", "wind-down", "verify-fac151",
 	},
 	classOperatorOnly: {
 		"clone", "envplan", "hostcreds", "init", "seed-lane-state", "signer-boundary", "stash", "validate-config",
@@ -118,6 +118,7 @@ var controlSurfaceCompatibility = map[int]string{
 	6: "d1f5c427cf2144bac25bd6aaa31d309da9a01978b12b385ad75e53b9ea7b50d5",
 	7: "8213c48a046f7686baac098199f9a1f5ac345d061882fc229535089a9e185355",
 	8: "ac11d8f8a90c9197fe927ae9dfa8790f49d5b3f8f57691ae5a27d252026a5331",
+	9: "a0065bf1cd7871a1ad75cd79cacb7c9ef40222978c36dfffae53d24ccd340c54",
 }
 
 func controlSurfaceFingerprint(m controlSurfaceManifest) (string, error) {

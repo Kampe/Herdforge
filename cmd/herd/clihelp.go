@@ -86,6 +86,7 @@ var subcommandUsage = map[string]string{
   Positional free-form text is rejected (FAC-183 shell-literal incident class).`,
 	"cleanup":         "Usage: herd cleanup [flags]\n  One-shot tab / worktree cleanup sweep.",
 	"forge":           "Usage: herd forge [--loop] [--retry-approve <ref>] [flags]\n  Forge orchestration entrypoints. Legacy receiptless approvals are suppressed durably; --retry-approve explicitly re-attempts one.",
+	"legacy-receipts": "Usage: herd legacy-receipts [--json] [--tombstone <ref> --reason <text>]\n  Audit or tombstone receiptless legacy in-progress tasks (fail-closed).",
 	"up":              "Usage: herd up <lane-name>\n  Bring up a configured lane.",
 	"activate":        "Usage: herd activate [flags]\n  Activate fleet / lane posture.",
 	"validate-config": "Usage: herd validate-config [path]\n  Validate .herd/herd.yaml.",
