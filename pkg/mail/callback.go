@@ -19,7 +19,7 @@ import (
 const CoordinatorInbox = "coordinator"
 
 // DefaultMailFile is the legacy repo-relative mailbox used by ordinary
-// control-plane traffic.
+// explicitly configured mail traffic.
 const DefaultMailFile = ".herd/mail.jsonl"
 
 // DefaultCallbackMailFile is the canonical repo-relative callback mailbox.

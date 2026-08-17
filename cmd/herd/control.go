@@ -59,7 +59,7 @@ Optional --worker/--lease must match live state (invented values fail closed).
 
 Env:
   HERD_CONTROL_SECRET   shared MAC secret (required for issue/drain)
-  HERD_MAIL_FILE        mailbox path (default .herd/mail.jsonl)
+  HERD_MAIL_FILE        canonical callback/control mailbox path (default .herd/control-mail.jsonl)
   HERD_CONTROL_ISSUER   issuer session id (default coordinator)
   HERD_CLAIMS_DB        optional override for FAC-147 lease DB`
 
@@ -74,7 +74,7 @@ func controlMailPath(override string) string {
 	if v := strings.TrimSpace(os.Getenv("HERD_MAIL_FILE")); v != "" {
 		return v
 	}
-	return filepath.Join(".herd", "mail.jsonl")
+	return mail.CallbackMailPath(".")
 }
 
 func newControlPlane(mailPath string) (*dispatch.ControlPlane, error) {

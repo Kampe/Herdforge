@@ -3055,7 +3055,7 @@ func approveOne(ctx context.Context, cfg *config.Config, tp provider.TaskProvide
 	if err != nil {
 		return nil, fmt.Errorf("coordinator signer unavailable (FAC-145): %w", err)
 	}
-	mb := mail.NewMailbox(filepath.Join(root, mail.DefaultMailFile))
+	mb := mail.NewMailbox(mail.CallbackMailPath(root))
 
 	publish := func(rec approveIntent, proof string) error {
 		cb, cbErr := coord.BoundCallback(mail.CallbackComplete, rec.SHA, "approved: "+proof)
@@ -3094,7 +3094,7 @@ func approveOne(ctx context.Context, cfg *config.Config, tp provider.TaskProvide
 	// APPROVED and the approval refuses until a fresh admissible APPROVED
 	// lands. Cards with no recorded verdict keep the receipt-gated path.
 	if coord.CandidateSHA != "" {
-		mbv := mail.NewMailbox(filepath.Join(root, mail.DefaultMailFile))
+		mbv := mail.NewMailbox(mail.CallbackMailPath(root))
 		eff, found, vErr := mbv.EffectiveVerdict(coord.Repository, coord.TaskRef, coord.CandidateSHA)
 		if vErr != nil {
 			return nil, fmt.Errorf("verdict state unreadable — refusing approval (FAC-145): %w", vErr)
@@ -4238,7 +4238,7 @@ func configureProductionControl(d *dispatch.Dispatcher, root string) (func() err
 	if err != nil {
 		return nil, err
 	}
-	controlMailbox := mail.NewMailbox(filepath.Join(root, ".herd", "control-mail.jsonl"))
+	controlMailbox := mail.NewMailbox(mail.CallbackMailPath(root))
 	d.ControlFactory = func(_ context.Context, scope dispatch.ControlScope) (*control.CoordinatorOrders, error) {
 		owner, err := control.NewOwnerToken()
 		if err != nil {
@@ -4276,7 +4276,7 @@ func configureProductionControl(d *dispatch.Dispatcher, root string) (func() err
 	if secret := strings.TrimSpace(os.Getenv("HERD_CONTROL_SECRET")); secret != "" {
 		mailPath := strings.TrimSpace(os.Getenv("HERD_MAIL_FILE"))
 		if mailPath == "" {
-			mailPath = filepath.Join(root, ".herd", "mail.jsonl")
+			mailPath = mail.CallbackMailPath(root)
 		} else {
 			if filepath.IsAbs(mailPath) {
 				return nil, fmt.Errorf("HERD_MAIL_FILE must be relative to workspace root")
@@ -4321,7 +4321,7 @@ func newCoordinatorControlReconciler(root string) (*control.CoordinatorLoop, fun
 	if err != nil {
 		return nil, nil, err
 	}
-	controlMailbox := mail.NewMailbox(filepath.Join(root, ".herd", "control-mail.jsonl"))
+	controlMailbox := mail.NewMailbox(mail.CallbackMailPath(root))
 	lookup := func(ctx context.Context, order control.Order) error {
 		claims := security.ResolveClaimLookup()
 		if claims == nil {
@@ -7534,7 +7534,7 @@ func serveBrokerConn(conn net.Conn, root string, cfg *config.Config, authority d
 			kind = mail.CallbackComplete
 		}
 		effect := fmt.Sprintf("%s:%s:%s:gen%d:%s:%s", tc.Repository, tc.TaskRef, tc.CandidateSHA, tc.LeaseGeneration, tc.LeaseID, verdict)
-		mb := mail.NewMailbox(filepath.Join(root, mail.DefaultMailFile))
+		mb := mail.NewMailbox(mail.CallbackMailPath(root))
 
 		// UNFORGEABLE effect proof (FAC-145): the delivered comment body is
 		// the canonical line plus a COORDINATOR SIGNATURE over it. An agent
@@ -8619,7 +8619,7 @@ func newProductionForgeObserver(cfg *config.Config) (*herdr.ProductionReconcilia
 	if err != nil {
 		return nil, fmt.Errorf("forge reconciliation observer: repository root: %w", err)
 	}
-	completion := &herdrControlCompletionProof{mailbox: mail.NewMailbox(filepath.Join(root, ".herd", "control-mail.jsonl"))}
+	completion := &herdrControlCompletionProof{mailbox: mail.NewMailbox(mail.CallbackMailPath(root))}
 	return &herdr.ProductionReconciliationObserver{
 		Workspace: workspace, ControlBinding: control,
 		Reader: herdr.SocketAuthorityReader{}, Record: (&herdr.JSONLRecorder{Path: ".herd/reconciliation.jsonl"}).Record,
@@ -9248,7 +9248,7 @@ func forgeControlReconciler(root string, cfg *config.Config) (*control.Coordinat
 	if err != nil {
 		return nil, nil, fmt.Errorf("forge control: open outbox: %w", err)
 	}
-	controlMailbox := mail.NewMailbox(filepath.Join(root, ".herd", "control-mail.jsonl"))
+	controlMailbox := mail.NewMailbox(mail.CallbackMailPath(root))
 	leaseOwnership, err := deps.OpenLeaseOwnership(
 		deps.ResolveLaunchLeasePath(root),
 		dispatch.RepositoryIdentityOrName(root, cfg.Project.Name),
