@@ -112,6 +112,34 @@ func TestCheckWorktreeBoundary_DetectHomeLeak(t *testing.T) {
 	}
 }
 
+func TestCheckWorktreeBoundary_AllowsRepoDeclaredFile(t *testing.T) {
+	tmpDir := t.TempDir()
+	path := filepath.Join(tmpDir, "docs", "runbook.md")
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("checkout: /Users/operator/repo\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := CheckWorktreeBoundaryWithAllowlist(tmpDir, []string{"docs/runbook.md"}); err != nil {
+		t.Fatalf("declared relative allowlist should admit the file: %v", err)
+	}
+}
+
+func TestCheckWorktreeBoundary_AllowlistCannotEscapeRoot(t *testing.T) {
+	tmpDir := t.TempDir()
+	path := filepath.Join(tmpDir, "docs", "runbook.md")
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("checkout: /Users/operator/repo\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := CheckWorktreeBoundaryWithAllowlist(tmpDir, []string{"../**"}); err == nil {
+		t.Fatal("parent traversal allowlist must not suppress a leak")
+	}
+}
+
 func TestCheckWorktreeBoundary_SkipsPreflightTest(t *testing.T) {
 	tmpDir := t.TempDir()
 	// File named preflight_something_test.go should be skipped even with /Users/ content

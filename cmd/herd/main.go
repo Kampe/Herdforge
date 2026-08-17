@@ -854,7 +854,11 @@ func runClone() {
 }
 
 func runPreflightStatic() {
-	if err := preflight.CheckWorktreeBoundary("."); err != nil {
+	var allowlist []string
+	if cfg, err := config.LoadConfig(filepath.Join(".herd", "herd.yaml")); err == nil {
+		allowlist = cfg.WorktreeBoundary.AllowedAbsolutePaths
+	}
+	if err := preflight.CheckWorktreeBoundaryWithAllowlist(".", allowlist); err != nil {
 		fmt.Fprintf(os.Stderr, "Preflight failed: %v\n", err)
 		os.Exit(1)
 	}
@@ -4744,6 +4748,9 @@ func runForgeE() error {
 				if _, promptErr := herdr.AgentPrompt(tabLabel, packet, false); promptErr != nil {
 					return compensateLaunchFailure(fmt.Errorf("forge prompt failed: %w", promptErr))
 				}
+				if receiptErr := persistForgeTaskReceipt(cfg, task, lane, forgeDecision, eng.LastClaimToken()); receiptErr != nil {
+					return compensateLaunchFailure(fmt.Errorf("forge launch receipt failed: %w", receiptErr))
+				}
 			}
 		}
 	}
@@ -4817,6 +4824,57 @@ func runForgeE() error {
 		return fmt.Errorf("forge cycle completed with failures")
 	}
 	return nil
+}
+
+// persistForgeTaskReceipt closes the authority gap between forge's compact
+// claim-and-launch path and dispatch's canonical FAC-145 receipt pipeline.
+// Forge launches do not construct a Dispatcher, so they must issue the same
+// signed worker context explicitly before the cycle can expose the task to
+// review or approval.
+func persistForgeTaskReceipt(cfg *config.Config, task *provider.Task, lane *config.LaneDef, decision *router.LaunchDecision, tok *deps.OwnershipToken) error {
+	if cfg == nil || task == nil || lane == nil || decision == nil || tok == nil || tok.LeaseID <= 0 {
+		return errors.New("forge receipt requires task, lane, decision, and durable lease identity")
+	}
+	root, err := canonicalHerdRoot()
+	if err != nil {
+		return err
+	}
+	worktreePath := filepath.Join(root, lane.Worktree)
+	branch := strings.TrimSpace(forgeGitOutput(worktreePath, "rev-parse", "--abbrev-ref", "HEAD"))
+	base := strings.TrimSpace(forgeGitOutput(worktreePath, "rev-parse", "HEAD"))
+	if branch == "" || base == "" {
+		return fmt.Errorf("forge receipt worktree %s has no readable branch or HEAD", worktreePath)
+	}
+	repository := dispatch.RepositoryIdentityOrName(root, cfg.Project.Name)
+	leaseID := strconv.FormatInt(tok.LeaseID, 10)
+	tc := dispatch.TaskContext{
+		ProviderType: cfg.TaskProvider.Type, ProjectID: cfg.TaskProvider.ProjectID,
+		ProviderWorkspace: cfg.TaskProvider.WorkspaceID, ProviderProfile: cfg.TaskProvider.APIKeyEnv,
+		Repository: repository, Role: dispatch.RoleWorker, TaskRef: task.Ref, TaskID: task.ID,
+		Branch: branch, BaseSHA: base, LeaseID: leaseID, LeaseGeneration: tok.Generation,
+		LeaseTaskRef: task.Ref, SessionID: dispatch.NewSessionID(dispatch.RoleWorker, task.Ref, base, leaseID),
+		AllowedOps: dispatch.OpsForRole(dispatch.RoleWorker), ExpiresAt: time.Now().Add(dispatch.DefaultReceiptTTL),
+	}
+	signer, err := dispatch.LoadSignerForConfig(cfg.Project.Name, root)
+	if err != nil {
+		return err
+	}
+	signed, err := signer.Issue(tc)
+	if err != nil {
+		return err
+	}
+	if err := dispatch.WriteTaskContext(worktreePath, signed); err != nil {
+		return err
+	}
+	if err := dispatch.StoreCanonicalReceipt(root, signed); err != nil {
+		return err
+	}
+	return nil
+}
+
+func forgeGitOutput(dir string, args ...string) string {
+	out, _ := exec.Command("git", append([]string{"-C", dir}, args...)...).Output()
+	return strings.TrimSpace(string(out))
 }
 
 func forgeLaunchAdmission(cfg *config.Config, lane *config.LaneDef, ctx context.Context, effect func(*router.LaunchDecision) error) (*router.LaunchDecision, error) {

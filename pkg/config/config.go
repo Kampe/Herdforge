@@ -89,8 +89,32 @@ type Config struct {
 	MergePolicy       *MergePolicy      `yaml:"merge_policy,omitempty"`
 	Fleet             FleetConfig       `yaml:"fleet,omitempty"`
 	WorktreeBootstrap WorktreeBootstrap `yaml:"worktree_bootstrap,omitempty"`
+	WorktreeBoundary  WorktreeBoundary  `yaml:"worktree_boundary,omitempty"`
 	Lanes             []LaneDef         `yaml:"lanes"`
 	Verification      Verification      `yaml:"verification,omitempty"`
+}
+
+// WorktreeBoundary declares repository-owned exceptions for the portable
+// absolute-path scanner. Entries are repo-relative file names or filepath
+// globs; absolute patterns and parent traversal are rejected. This keeps
+// operational documents that intentionally name a host checkout explicit,
+// reviewable, and portable across worktrees.
+type WorktreeBoundary struct {
+	AllowedAbsolutePaths []string `yaml:"allowed_absolute_paths,omitempty"`
+}
+
+func (b WorktreeBoundary) Validate() error {
+	for i, pattern := range b.AllowedAbsolutePaths {
+		pattern = strings.TrimSpace(pattern)
+		if pattern == "" || filepath.IsAbs(pattern) {
+			return fmt.Errorf("worktree_boundary.allowed_absolute_paths[%d]: must be a non-empty repo-relative pattern", i)
+		}
+		clean := filepath.Clean(filepath.FromSlash(pattern))
+		if clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
+			return fmt.Errorf("worktree_boundary.allowed_absolute_paths[%d]: parent traversal is not allowed", i)
+		}
+	}
+	return nil
 }
 
 // MergePolicy is the repository's autonomous-merge admission contract. It is
@@ -359,6 +383,9 @@ func (c *Config) Validate() error {
 		return err
 	}
 	if err := c.WorktreeBootstrap.Validate(); err != nil {
+		return err
+	}
+	if err := c.WorktreeBoundary.Validate(); err != nil {
 		return err
 	}
 	if c.MergePolicy != nil {
