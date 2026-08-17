@@ -166,8 +166,17 @@ func TestDrainReviewRecordsExactLaunchProvenance(t *testing.T) {
 	if err != nil {
 		t.Fatalf("wire adapters: %v", err)
 	}
+	var routedLane *config.LaneDef
+	originalRoute := a.route
+	a.route = func(lane *config.LaneDef, task *provider.Task) (*router.LaunchDecision, error) {
+		routedLane = lane
+		return originalRoute(lane, task)
+	}
 	if err := a.launchReview(context.Background(), drainSelftestEvidence()); err != nil {
 		t.Fatalf("review launch: %v", err)
+	}
+	if routedLane == nil || routedLane.Name != "review" || routedLane.Role != launch.ReviewerRole {
+		t.Fatalf("review launch routed through non-review lane: %+v", routedLane)
 	}
 	rows, err := a.ledger.AllRows()
 	if err != nil {
@@ -187,6 +196,9 @@ func TestDrainReviewRecordsExactLaunchProvenance(t *testing.T) {
 	}
 	if len(launcher.packets) != 1 || !strings.Contains(launcher.packets[0], drainSelftestSHA) || !strings.Contains(launcher.packets[0], "FAC-1") {
 		t.Fatalf("review packet did not carry the exact candidate: %v", launcher.packets)
+	}
+	if !strings.Contains(launcher.packets[0], "REPORT_TARGET: forge-review-supervisor") || strings.Contains(launcher.packets[0], "REPORT_TARGET: coordinator") {
+		t.Fatalf("review packet supervisor target drifted: %s", launcher.packets[0])
 	}
 	for _, banned := range []string{"chainseer", "bin/herd-", "zsh"} {
 		if strings.Contains(launcher.packets[0], banned) {
@@ -291,7 +303,7 @@ func TestNewDrainAdaptersFailsClosedOnMissingAuthority(t *testing.T) {
 	}{
 		{name: "no config", tp: &fakeDrainProvider{}, want: "no compiled config authority"},
 		{name: "no provider", cfg: &config.Config{Lanes: []config.LaneDef{reviewerLane}}, want: "no board provider authority"},
-		{name: "no reviewer lane", cfg: &config.Config{}, tp: &fakeDrainProvider{}, want: "no standing review supervisor lane configured"},
+		{name: "no reviewer lane", cfg: &config.Config{}, tp: &fakeDrainProvider{}, want: "no reviewer lane configured"},
 		{name: "reviewer lane without worktree", cfg: &config.Config{Lanes: []config.LaneDef{{Name: "review", Role: launch.ReviewerRole}}}, tp: &fakeDrainProvider{}, want: "no isolated worktree"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
