@@ -34,7 +34,7 @@ func TestCompileClaudeArgsInjectsDisallowedTools(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []string{"claude", "--mcp-config", "{}", "--strict-mcp-config", "--disable-slash-commands", "--disallowed-tools", "Agent", "Task", "ToolSearch", "--model", "claude-sonnet-5", "--effort", "high"}
+	want := []string{"claude", "--mcp-config", `{"mcpServers":{}}`, "--strict-mcp-config", "--disable-slash-commands", "--disallowed-tools", "Agent", "Task", "ToolSearch", "--model", "claude-sonnet-5", "--effort", "high"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("got %v want %v", got, want)
 	}
