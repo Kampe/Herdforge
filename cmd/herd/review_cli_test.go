@@ -170,6 +170,43 @@ func fixtureSigner(t *testing.T, keyDir, repoDir string) *dispatch.Signer {
 	return signer
 }
 
+// reviewTestEnv keeps reviewer-lane tests independent of the role marker on
+// the pane running the suite. HERD_ROLE is diagnostic launch metadata in
+// production, but signer-boundary test fixtures intentionally exercise the
+// coordinator path from their child CLI processes.
+func reviewTestEnv() []string {
+	env := make([]string, 0, len(os.Environ()))
+	for _, entry := range os.Environ() {
+		if strings.HasPrefix(entry, "HERD_ROLE=") {
+			continue
+		}
+		env = append(env, entry)
+	}
+	return env
+}
+
+func TestReviewTestEnv_StripsInheritedAgentRole(t *testing.T) {
+	t.Setenv("HERD_ROLE", "agent")
+	t.Setenv("HERD_FAC356_TEST_SENTINEL", "preserved")
+
+	env := reviewTestEnv()
+	for _, entry := range env {
+		if strings.HasPrefix(entry, "HERD_ROLE=") {
+			t.Fatalf("review test subprocess environment leaked %q", entry)
+		}
+	}
+	found := false
+	for _, entry := range env {
+		if entry == "HERD_FAC356_TEST_SENTINEL=preserved" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatal("review test environment dropped unrelated inherited variables")
+	}
+}
+
 // herdCmd runs the built binary in dir with the coordinator key dir pinned
 // to the test's private location.
 // provisionFence creates the shared fence store the FAC-145 claim stack
@@ -187,7 +224,7 @@ func ensureFenceSeal(binary, dir, keyDir string) string {
 	}
 	c := exec.Command(binary, "fence-provision")
 	c.Dir = dir
-	c.Env = append(os.Environ(),
+	c.Env = append(reviewTestEnv(),
 		dispatch.KeyDirEnv+"="+keyDir,
 		herdr.NoLiveEnv+"=1",
 		herdr.BinaryEnv+"=",
@@ -230,7 +267,7 @@ func herdCmd(binary, dir, keyDir string, args ...string) *exec.Cmd {
 	cmd.Dir = dir
 	// FAC-145 hermeticity: a child CLI can NEVER reach the operator's live
 	// herdr fleet. Without an explicit fake, any herdr call fails closed.
-	cmd.Env = append(os.Environ(),
+	cmd.Env = append(reviewTestEnv(),
 		dispatch.KeyDirEnv+"="+keyDir,
 		herdr.NoLiveEnv+"=1",
 		herdr.BinaryEnv+"=",
@@ -279,7 +316,7 @@ func prependToPath(cmd *exec.Cmd, dir string) {
 func herdCmdWithFake(binary, dir, keyDir, fakeBin, fakeLog string, args ...string) *exec.Cmd {
 	cmd := exec.Command(binary, args...)
 	cmd.Dir = dir
-	cmd.Env = append(os.Environ(), dispatch.KeyDirEnv+"="+keyDir)
+ cmd.Env = append(reviewTestEnv(), dispatch.KeyDirEnv+"="+keyDir)
 	// Review commands may chdir into an isolated detached worktree. Keep the
 	// provider's shared claim fence anchored to the fixture repository rather
 	// than making the review checkout provision a second authority.
