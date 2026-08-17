@@ -46,6 +46,17 @@ type mockTaskProvider struct {
 	relations []provider.Relation
 }
 
+func TestReviewSupervisorNamePrefersStandingSupervisorOverAssayer(t *testing.T) {
+	d := &Dispatcher{Config: &config.Config{Lanes: []config.LaneDef{
+		{Name: "assayer", Role: "assayer"},
+		{Name: "review-supervisor", Role: "review-supervisor"},
+	}}}
+
+	if got := d.reviewSupervisorName(); got != "forge-review-supervisor" {
+		t.Fatalf("review supervisor name = %q, want forge-review-supervisor", got)
+	}
+}
+
 func (m *mockTaskProvider) GetTask(_ context.Context, id string) (*provider.Task, error) {
 	for _, t := range m.tasks {
 		if t.ID == id || t.Ref == id {
