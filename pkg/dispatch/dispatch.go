@@ -277,8 +277,9 @@ type DispatchResult struct {
 // packet carried a reply address — the coordinator discovered every finished
 // branch by polling git state, late and lossy.
 type ReplyTarget struct {
-	Name            string // the coordinator's stable name (never empty)
-	LeaseGeneration int64  // the lease generation the agent must cite in callbacks
+	Name             string // the coordinator's stable name (never empty)
+	ReviewSupervisor string // standing supervisor that owns review handoffs
+	LeaseGeneration  int64  // the lease generation the agent must cite in callbacks
 }
 
 // WorktreeService is the isolation surface Dispatch uses (FAC-121).
@@ -414,6 +415,21 @@ func (d *Dispatcher) coordinatorName() string {
 		return name
 	}
 	return "coordinator"
+}
+
+func (d *Dispatcher) reviewSupervisorName() string {
+	if d.Config == nil {
+		return "review-supervisor"
+	}
+	for _, lane := range d.Config.Lanes {
+		switch strings.ToLower(strings.TrimSpace(lane.Role)) {
+		case "review-supervisor", "review_harvest_supervisor", "harvest-supervisor", "reviewer", "harvest":
+			if strings.TrimSpace(lane.Name) != "" {
+				return "forge-" + strings.TrimSpace(lane.Name)
+			}
+		}
+	}
+	return "review-supervisor"
 }
 
 type ScopeAdmission interface {
@@ -1009,8 +1025,9 @@ func (d *Dispatcher) Dispatch(ctx context.Context, opts DispatchOptions) (*Dispa
 	}
 
 	packet := buildTaskPacket(task, branch, rolePath, d.Config.TaskProvider.Type, d.Config.TaskProvider.ProjectID, lane, d.Config.Verification, ReplyTarget{
-		Name:            d.coordinatorName(),
-		LeaseGeneration: tok.Generation,
+		Name:             d.coordinatorName(),
+		ReviewSupervisor: d.reviewSupervisorName(),
+		LeaseGeneration:  tok.Generation,
 	})
 	if len(task.Residuals) > 0 {
 		section, residualErr := residual.PacketSection(task.Residuals)
@@ -2126,16 +2143,20 @@ func buildTaskPacket(task *provider.Task, branch, rolePath, taskProviderType, ta
 	fmt.Fprintf(&b, "  5. git add -A && git commit -m \"<msg containing %s>\" (no AI-attribution trailers).\n", task.Ref)
 	fmt.Fprintf(&b, "  6. Final message: `BUILD COMPLETE %s` + `git rev-parse HEAD`.\n\n", task.Ref)
 
-	// FAC-222: reply target. Agents report to the coordinator by name instead
-	// of relying on the coordinator to notice by polling. The lease generation
-	// binds the report to this dispatch so a stale or duplicate redelivery is
-	// distinguishable from real progress.
+	// FAC-222: completion authority remains the coordinator, while review
+	// handoff authority is the standing review supervisor. Keeping those
+	// addresses distinct prevents the coordinator from becoming a review queue.
 	coordinatorName := reply.Name
 	if coordinatorName == "" {
 		coordinatorName = "coordinator"
 	}
 	fmt.Fprintf(&b, "Report to the coordinator (%s) — do not wait to be asked:\n", coordinatorName)
-	fmt.Fprintf(&b, "  READY-FOR-REVIEW: herd shot %s --report complete --sha <sha> --lease %d\n", task.Ref, reply.LeaseGeneration)
+	reviewSupervisor := reply.ReviewSupervisor
+	if strings.TrimSpace(reviewSupervisor) == "" {
+		reviewSupervisor = "review-supervisor"
+	}
+	fmt.Fprintf(&b, "  READY-FOR-REVIEW: post the completion callback, then ping the review supervisor (%s) with the exact SHA; do not ask the coordinator to run review.\n", reviewSupervisor)
+	fmt.Fprintf(&b, "  Completion callback: herd shot %s --report complete --sha <sha> --lease %d\n", task.Ref, reply.LeaseGeneration)
 	fmt.Fprintf(&b, "  BLOCKED: herd shot %s --report blocked --detail \"<why>\" --lease %d\n", task.Ref, reply.LeaseGeneration)
 	b.WriteString("Report as soon as the condition is true. Polling is the backstop, not the primary signal.\n\n")
 

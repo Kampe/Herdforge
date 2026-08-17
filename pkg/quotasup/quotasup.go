@@ -150,7 +150,8 @@ type Assignment struct {
 	// means Pool is the provider's default by fallback, not by evidence —
 	// this lane's contribution to a pool's active count is a guess, and the
 	// snapshot says so rather than letting it read as an observation.
-	ModelResolved bool `json:"model_resolved"`
+	ModelResolved bool   `json:"model_resolved"`
+	ProviderError string `json:"provider_error,omitempty"`
 }
 
 // Surface is the metered surface this agent bills against.

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/Kampe/Herdforge/pkg/herdr"
+	herdprocess "github.com/Kampe/Herdforge/pkg/process"
 	"github.com/Kampe/Herdforge/pkg/quotasup"
 	"github.com/Kampe/Herdforge/pkg/router"
 	"github.com/Kampe/Herdforge/pkg/usage"
@@ -78,6 +79,7 @@ func runQuotaSupervisor() {
 	// provider's default pool.
 	active := map[quotasup.Surface]int{}
 	models := map[quotasup.Surface]map[string]bool{}
+	providerErrors := map[quotasup.Surface][]string{}
 	for _, a := range agents {
 		if a.Workspace != workspace || strings.TrimSpace(a.Name) == "" {
 			continue
@@ -91,6 +93,18 @@ func runQuotaSupervisor() {
 			Provider: provider, QuotaProvider: qp, Model: model, ModelResolved: resolved,
 			Family: router.FamilyFor(strings.ToLower(provider), model), Pool: pool,
 			Capacity: quotasup.Classify(quotasup.BurnFor(computed, quotasup.Surface{Provider: qp, Pool: pool}), *warn),
+		}
+		// Herdr status can remain "working" after a provider has stopped
+		// accepting requests. Read the recent pane tail and treat an explicit
+		// quota/rate-limit failure as authoritative live evidence.
+		if a.PaneID != "" {
+			if tail, readErr := herdr.PaneRead(a.PaneID, 80); readErr == nil {
+				if reason := herdprocess.ProviderExhaustionReason(tail); reason != "" {
+					assignment.ProviderError = reason
+					assignment.Capacity = quotasup.Exhausted
+					providerErrors[assignment.Surface()] = append(providerErrors[assignment.Surface()], a.Name+": "+reason)
+				}
+			}
 		}
 		current.Agents = append(current.Agents, assignment)
 
@@ -118,12 +132,13 @@ func runQuotaSupervisor() {
 	}
 	for _, s := range quotasup.Surfaces(computed, live) {
 		ev := quotasup.Observation{
-			Surface:  s,
-			Burn:     quotasup.BurnFor(computed, s),
-			SourceAt: snap.GeneratedAt,
-			Cooldown: quotasup.SurfaceCooldown(now, s),
-			Active:   active[s],
-			Models:   sortedKeys(models[s]),
+			Surface:        s,
+			Burn:           quotasup.BurnFor(computed, s),
+			SourceAt:       snap.GeneratedAt,
+			Cooldown:       quotasup.SurfaceCooldown(now, s),
+			Active:         active[s],
+			Models:         sortedKeys(models[s]),
+			ProviderErrors: providerErrors[s],
 		}.Grade(now, *warn, *maxAge)
 		current.Decisions = append(current.Decisions,
 			quotasup.Decide(s, ev, quotasup.PriorState(prior, s)))

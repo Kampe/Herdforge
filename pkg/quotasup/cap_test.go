@@ -67,6 +67,19 @@ func TestMissingSourceTimestampIsUnknown(t *testing.T) {
 	}
 }
 
+func TestLiveProviderErrorOverridesHealthyLedger(t *testing.T) {
+	o := obs(healthy(usage.BurnUnderspent, 4))
+	o.ProviderErrors = []string{"coverage-integrity: provider quota or rate limit reported"}
+	e := o.Grade(fakeNow, DefaultWarnRunwayMinutes, 0)
+	if e.Capacity != Exhausted {
+		t.Fatalf("provider error graded %q, want exhausted", e.Capacity)
+	}
+	cap, why := TargetCap(e)
+	if cap != 0 || !strings.Contains(why, "live provider error") {
+		t.Fatalf("cap=%d reason=%q, want blocked with live error", cap, why)
+	}
+}
+
 // A caller must not be able to switch the freshness gate off by leaving the
 // field at its zero value.
 func TestZeroMaxAgeFallsBackToTheDefaultRatherThanNoLimit(t *testing.T) {
