@@ -178,6 +178,11 @@ func ProjectFleetStatus(decisions []TabDecision, maxLanes int) FleetStatus {
 		if d.Class == TabBlocked {
 			p.Unknown++
 		}
+		if d.Class == TabLegacyCleanup {
+			// A tombstone suppresses repeated noise, but it does not prove
+			// capacity: the legacy tab remains unverifiable and uncloseable.
+			p.Unknown++
+		}
 		if d.Class == TabStanding {
 			p.Standing++
 		}
