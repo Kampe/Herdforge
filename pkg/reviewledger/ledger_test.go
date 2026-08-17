@@ -134,6 +134,30 @@ func TestRecord(t *testing.T) {
 	}
 }
 
+func TestEnsureRecordIsIdempotent(t *testing.T) {
+	l := newTestLedger(t)
+	opts := RecordOpts{SHA: "abc123", Branch: "herd/fac-345", BuilderFamily: "openai", ReviewerFamily: "anthropic", Reviewer: "reviewer-1", Gate: "independent"}
+	if err := l.EnsureRecord(opts); err != nil {
+		t.Fatalf("first EnsureRecord: %v", err)
+	}
+	if err := l.EnsureRecord(opts); err != nil {
+		t.Fatalf("second EnsureRecord: %v", err)
+	}
+	rows, err := l.AllRows()
+	if err != nil {
+		t.Fatal(err)
+	}
+	count := 0
+	for _, row := range rows {
+		if row.Event == string(EventRecord) && row.SHA == opts.SHA && row.Reviewer == opts.Reviewer {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Fatalf("record count = %d, want 1", count)
+	}
+}
+
 func TestVerdict(t *testing.T) {
 	t.Run("PASS enqueues and queue row is written", func(t *testing.T) {
 		l := newTestLedger(t)

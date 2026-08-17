@@ -155,6 +155,21 @@ func TestProductionObserverAllowsIdleGenerationlessTaskWithDurableCompletionProo
 	}
 }
 
+func TestProductionObserverDoesNotBlockTerminalLegacyGenerationlessTab(t *testing.T) {
+	r := fixtureReader{
+		tabs:    present([]TabRecord{{TabID: "wK:t2W2", WorkspaceID: "wK", Label: "legacy-worker", AgentStatus: "idle"}}),
+		agents:  present([]AgentEntry{{Kind: "codex", Name: "task-fac-103", TabID: "wK:t2W2", PaneID: "wK:p2W2", Workspace: "wK", Status: "idle"}}),
+		binding: present(TabBinding{TabID: "wK:t2W2", Workspace: "wK", PaneID: "wK:p2W2", TaskRef: "FAC-103"}),
+	}
+	o := &ProductionReconciliationObserver{Workspace: "wK", Reader: r}
+	if err := o.ObserveReconciliation(context.Background()); err != nil {
+		t.Fatalf("terminal legacy tab must be a cleanup candidate, not a loop blocker: %v", err)
+	}
+	if got := o.Decisions()[0]; got.Class != TabLegacyCleanup || got.CloseEligible {
+		t.Fatalf("decision=%+v, want non-closeable legacy cleanup candidate", got)
+	}
+}
+
 func TestProductionObserverAllowsDoneGenerationlessTaskWithEmptyContextCandidate(t *testing.T) {
 	const candidate = "a55955a2"
 	r := fixtureReader{
