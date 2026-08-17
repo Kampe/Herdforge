@@ -8227,7 +8227,7 @@ func deriveCoordinatorControlBinding(root, workspace string, agents []herdr.Agen
 	root = filepath.Clean(root)
 	var matches []herdr.AgentEntry
 	for _, agent := range agents {
-		if agent.Workspace == workspace && agent.Name == "" && agent.Kind != "" &&
+		if agent.Workspace == workspace && agent.Kind != "" &&
 			agent.TabID != "" && agent.PaneID != "" && agent.TerminalID != "" &&
 			filepath.Clean(agent.Cwd) == root && filepath.Clean(agent.ForegroundCwd) == root {
 			matches = append(matches, agent)
