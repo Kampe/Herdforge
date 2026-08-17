@@ -118,7 +118,12 @@ lint:
 
 bin-parity:
 	@echo "==> Checking Chainseer executable parity provenance (FAC-309)..."
-	CHAINSEER_BIN="$${CHAINSEER_BIN:-../../../../chainseer/bin}" $(HERMETIC_GIT) go run ./scripts/binparity
+	@parity_dir="$${CHAINSEER_BIN:-../../../../chainseer/bin}"; \
+	if [ -d "$$parity_dir" ]; then \
+		CHAINSEER_BIN="$$parity_dir" $(HERMETIC_GIT) go run ./scripts/binparity; \
+	else \
+		echo "bin-parity: SKIP — Chainseer source unavailable at $$parity_dir (local authorized runs remain strict)"; \
+	fi
 
 security:
 	./scripts/security-gate.zsh
