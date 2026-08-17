@@ -318,12 +318,8 @@ func IsVendorHarness(harness string) bool {
 // server advertises that kind. Keeping this predicate beside IsVendorHarness
 // prevents router READY state from outrunning launch capability.
 func IsLaneLaunchable(provider string) bool {
-	switch strings.ToLower(strings.TrimSpace(provider)) {
-	case "codex", "claude", "grok", "agy", "opencode", "ollama", "lazer":
-		return true
-	default:
-		return false
-	}
+	surface, ok := SurfaceFor(provider)
+	return ok && surface.VendorHarness
 }
 
 // PiModelFor maps a routed provider/model to Pi's exact provider-qualified model.
