@@ -479,7 +479,7 @@ func printUsage() {
 	fmt.Println("  scope        Publish the trusted task scope the dispatch fence resolves against")
 	fmt.Println("  review-classify   Deterministic R0-R3 risk floor for review dispatch")
 	fmt.Println("  review-ingest     Validate reviewer verdicts and admit them to the ledger")
-	fmt.Println("  harvest-merge     Cherry-pick a lane's reviewed commits onto a fresh base (--verify-landed: check if a merge landed)")
+	fmt.Println("  harvest-merge     Cherry-pick a lane's reviewed commits onto a fresh base (--verify-landed: prove landing + mint sealed completion receipt)")
 	fmt.Println("  hold       Control durable generation-fenced lane/task hold: on, off, or status")
 	fmt.Println("  review     Claim in-progress tasks for reviewer and advance to review status")
 	fmt.Println("  approve    Move in-review cards to done, gated on merge evidence")
