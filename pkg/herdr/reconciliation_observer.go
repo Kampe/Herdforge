@@ -158,6 +158,16 @@ func (o *ProductionReconciliationObserver) ObserveReconciliation(ctx context.Con
 	for _, tab := range tabs.Value {
 		bindingAuth := o.Reader.Binding(ctx, tab)
 		agent, found := byTab[tab.TabID]
+		// Herdr 0.8 can report a terminal tab created before immutable tab
+		// generations existed. It is not safe for CAS close, but it is also not
+		// a live reconciliation blocker: retain one durable cleanup candidate and
+		// let the explicit cleanup path delegate the exact tab id to Herdr.
+		// Active generationless workers remain fail-closed below.
+		if tab.Generation == "" && found && isTerminalAgent(agent.Status) && bindingAuth.State == EvidencePresent && bindingAuth.Value.TaskRef != "" {
+			decisions = append(decisions, TabDecision{TabID: tab.TabID, Class: TabLegacyCleanup,
+				Evidence: []string{"legacy terminal tab has no immutable generation; exact Herdr tab close is a cleanup candidate"}})
+			continue
+		}
 		if bindingAuth.State != EvidencePresent && found && isTerminalAgent(agent.Status) && o.TaskBinding != nil {
 			fallback := o.TaskBinding(ctx, tab, agent)
 			if fallback.State == EvidencePresent && fallback.Value.TabID == tab.TabID && fallback.Value.TaskRef != "" && fallback.Value.LeaseGeneration > 0 && o.Completion != nil {

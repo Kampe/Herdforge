@@ -95,6 +95,22 @@ func runReviewIngest() {
 			fmt.Fprintf(os.Stderr, "herd review-ingest: retain artifact FAILED for %s: %v\n", filepath.Base(f), retainErr)
 			os.Exit(1)
 		}
+		// A reviewer artifact is the durable handoff from the supervisor. Make
+		// its exact-SHA admission record idempotently before the verdict row so
+		// harvest-merge can prove independent provenance even when the ephemeral
+		// launch pane has already been cleaned up.
+		gate := "independent"
+		if strings.EqualFold(a.ReviewerFamily, "mechanical") || strings.EqualFold(a.BuilderFamily, "mechanical") {
+			gate = "mechanical"
+		}
+		if err := ledger.EnsureRecord(reviewledger.RecordOpts{
+			SHA: a.SHA, Branch: a.Branch, BuilderFamily: a.BuilderFamily,
+			ReviewerFamily: a.ReviewerFamily, Reviewer: a.Reviewer,
+			Artifact: retained, Gate: gate, Task: a.Branch,
+		}); err != nil {
+			fmt.Fprintf(os.Stderr, "herd review-ingest: admission record FAILED for %s: %v\n", filepath.Base(f), err)
+			os.Exit(1)
+		}
 		enqueued, err := ledger.Verdict(reviewledger.VerdictOpts{
 			SHA:            a.SHA,
 			Reviewer:       a.Reviewer,

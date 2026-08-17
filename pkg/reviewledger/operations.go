@@ -60,6 +60,24 @@ func (l *Ledger) Record(opts RecordOpts) error {
 	return l.appendRow(l.Path, row)
 }
 
+// EnsureRecord makes reviewer admission provenance durable and idempotent.
+// Some supervisors retain a valid broker verdict after the launch pane has
+// already gone away; ingesting that artifact must not leave an otherwise
+// admissible PASS permanently unharvestable merely because the launch record
+// was not copied into the local ledger first.
+func (l *Ledger) EnsureRecord(opts RecordOpts) error {
+	rows, err := readRows(l.Path)
+	if err != nil {
+		return err
+	}
+	for _, row := range rows {
+		if row.Event == string(EventRecord) && row.SHA == opts.SHA && row.Reviewer == opts.Reviewer {
+			return nil
+		}
+	}
+	return l.Record(opts)
+}
+
 // Tier returns the newest recorded tier for a sha, or empty string.
 func (l *Ledger) Tier(sha string) (string, error) {
 	rows, err := readRows(l.Path)

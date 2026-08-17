@@ -108,6 +108,23 @@ func TestReplyFromLanesDedupesRepeatedReplies(t *testing.T) {
 	}
 }
 
+func TestReplyFromLanesIgnoresRetiredLaneReplies(t *testing.T) {
+	inbox := writeInbox(t,
+		`{"from":"live","summary":"FLEET_FEEDBACK E1 live"}`,
+		`{"from":"retired-worker","summary":"FLEET_FEEDBACK E1 retired-worker"}`,
+	)
+	got, missing, err := ReplyFromLanes(inbox, "E1", []string{"live"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, []string{"live"}) {
+		t.Fatalf("got = %v, want only current roster lane", got)
+	}
+	if len(missing) != 0 {
+		t.Fatalf("missing = %v, want none", missing)
+	}
+}
+
 func TestReplyFromLanesMalformedLineFailsClosed(t *testing.T) {
 	inbox := writeInbox(t, `{not json`)
 	got, missing, err := ReplyFromLanes(inbox, "E1", []string{"a"})

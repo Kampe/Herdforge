@@ -2380,12 +2380,34 @@ func runApprove() {
 		return
 	}
 
+	// Receiptless cards created before the completion-receipt gate are a
+	// durable migration class, not a transient retry. Record a one-shot
+	// tombstone after the first refusal and suppress subsequent autonomous
+	// cycles until a real completion receipt appears. This keeps the gate
+	// fail-closed while preventing a legacy card from producing an ERROR every
+	// forge interval.
+	legacyLog := filepath.Join(root, legacyReceiptLog)
+	legacyTombstones, legacyErr := readLegacyReceiptTombstones(legacyLog)
+	if legacyErr != nil {
+		fmt.Fprintf(os.Stderr, "approve: legacy receipt tombstones unreadable: %v\n", legacyErr)
+		finish(1)
+	}
+
 	sort.SliceStable(tasks, func(i, j int) bool {
 		return provider.CompareRefs(tasks[i].Ref, tasks[j].Ref) < 0
 	})
 
-	approved, refused, failed := 0, 0, reconcileFailed
+	approved, refused, failed, suppressed := 0, 0, reconcileFailed, 0
 	for _, task := range tasks {
+		if receiptPathArg == "" {
+			if tombstone, ok := legacyTombstones[strings.ToUpper(task.Ref)]; ok {
+				if _, statErr := os.Stat(hsync.ReceiptPath(root, task.Ref)); errors.Is(statErr, os.ErrNotExist) {
+					fmt.Printf("LEGACY-SKIP [%s]: %s\n  tombstoned once: %s\n", task.Ref, task.Title, tombstone.Reason)
+					suppressed++
+					continue
+				}
+			}
+		}
 		// FAC-145: receipt-bound, callback-coupled approval — missing/
 		// unsigned/tampered receipt, wrong repo/project/task, expiry, stale
 		// generation, or an undeliverable callback all refuse the mutation.
@@ -2402,13 +2424,25 @@ func runApprove() {
 		case errors.Is(err, hsync.ErrNoEvidence):
 			fmt.Printf("REFUSED  [%s]: %s\n  %v\n", task.Ref, task.Title, err)
 			refused++
+			if receiptPathArg == "" {
+				if _, statErr := os.Stat(hsync.ReceiptPath(root, task.Ref)); errors.Is(statErr, os.ErrNotExist) {
+					rec := legacyReceiptTombstone{TaskRef: task.Ref, TaskID: task.ID, Reason: "pre-completion-receipt task; re-dispatch or provide a verified completion receipt", Actor: "forge-approve"}
+					if tombErr := appendLegacyReceiptTombstone(legacyLog, rec); tombErr != nil {
+						fmt.Fprintf(os.Stderr, "ERROR    [%s]: legacy tombstone write failed: %v\n", task.Ref, tombErr)
+						failed++
+					} else {
+						legacyTombstones[strings.ToUpper(task.Ref)] = rec
+						fmt.Printf("LEGACY-TOMBSTONE [%s]: approval retry suppressed until a completion receipt exists\n", task.Ref)
+					}
+				}
+			}
 		default:
 			fmt.Fprintf(os.Stderr, "ERROR    [%s]: %v\n", task.Ref, err)
 			failed++
 		}
 	}
 
-	fmt.Printf("\nherd approve: approved=%d refused=%d failed=%d\n", approved, refused, failed)
+	fmt.Printf("\nherd approve: approved=%d refused=%d suppressed=%d failed=%d\n", approved, refused, suppressed, failed)
 	if failed > 0 {
 		finish(1)
 	}

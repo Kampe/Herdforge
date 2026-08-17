@@ -38,6 +38,7 @@ const (
 	TabUserShell       TabClass = "user-shell"
 	TabSafeFinished    TabClass = "safe-finished"
 	TabSafeOrphan      TabClass = "safe-orphan"
+	TabLegacyCleanup   TabClass = "legacy-cleanup"
 	TabRecovering      TabClass = "recovering"
 	TabBlocked         TabClass = "unknown/BLOCKED"
 )

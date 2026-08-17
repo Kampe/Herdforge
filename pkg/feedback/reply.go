@@ -27,7 +27,21 @@ func ReplyFromLanes(mailFile, epoch string, want []string) (got, missing []strin
 	if err != nil {
 		return nil, nil, err
 	}
-	return replied, Missing(want, replied), nil
+	// Replies are evidence only for lanes in this epoch's live expectation.
+	// The inbox is append-only and may retain a reply from a lane retired (or
+	// rotated) after the request was sent. Returning that stale sender in got
+	// made the census print replies greater than its denominator.
+	requested := make(map[string]struct{}, len(want))
+	for _, lane := range want {
+		requested[lane] = struct{}{}
+	}
+	filtered := make([]string, 0, len(replied))
+	for _, lane := range replied {
+		if _, ok := requested[lane]; ok {
+			filtered = append(filtered, lane)
+		}
+	}
+	return filtered, Missing(want, filtered), nil
 }
 
 func repliedLanes(mailFile, epoch string) ([]string, error) {
