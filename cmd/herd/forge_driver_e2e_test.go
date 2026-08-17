@@ -327,22 +327,36 @@ func (s hostSnapshot) assertUnchanged(t *testing.T) {
 
 // installFakeHerdr puts a protocol-faithful herdr on PATH. It never opens a
 // live socket. Invocations are appended to logPath.
-func installFakeHerdr(t *testing.T, agentJSON string) (binDir, logPath string) {
+func installFakeHerdr(t *testing.T, agentJSON, root string) (binDir, logPath string) {
 	t.Helper()
 	if runtime.GOOS == "windows" {
 		t.Skip("PATH shell-stub is POSIX-only")
 	}
 	binDir = t.TempDir()
 	logPath = filepath.Join(binDir, "herdr.log")
+	statePath := filepath.Join(binDir, "coordinator-started")
 	// Quote paths for the shell script carefully; TempDir has no spaces.
 	script := `#!/bin/sh
 printf '%s\n' "$*" >> "` + logPath + `"
 case "$1 $2" in
-  "workspace list") printf '{"result":{"workspaces":[{"workspace_id":"wT","label":"wT","focused":true}]}}' ;;
-  "agent list") printf '%s' '` + agentJSON + `' ;;
+  "workspace list") printf '{"result":{"workspaces":[{"workspace_id":"%s","label":"%s","focused":true}]}}' "${HERD_WORKSPACE:-${HERDR_WORKSPACE_ID:-fixture-workspace}}" "${HERD_WORKSPACE:-${HERDR_WORKSPACE_ID:-fixture-workspace}}" ;;
+  "agent list")
+    if [ -f "` + statePath + `" ]; then
+      workspace=$(cat "` + statePath + `")
+      printf '{"result":{"type":"agent_list","agents":[{"name":"coordinator","agent":"grok","agent_status":"working","tab_id":"tFake","pane_id":"pFake","terminal_id":"termFake","workspace_id":"%s","cwd":"` + root + `","foreground_cwd":"` + root + `"}]}}' "$workspace"
+    else
+      printf '%s' '` + agentJSON + `'
+    fi ;;
   "agent prompt") printf 'ok' ;;
   "agent start") printf 'ok' ;;
-  "tab create") printf '{"result":{"type":"tab_create","tab":{"tab_id":"tFake"},"root_pane":{"tab_id":"tFake","pane_id":"pFake","terminal_id":"termFake"}}}' ;;
+  "tab create")
+    workspace=""
+    while [ $# -gt 0 ]; do
+      if [ "$1" = "--workspace" ] && [ $# -gt 1 ]; then workspace="$2"; shift 2; continue; fi
+      shift
+    done
+    printf '%s' "$workspace" > "` + statePath + `"
+    printf '{"result":{"type":"tab_create","tab":{"tab_id":"tFake"},"root_pane":{"tab_id":"tFake","pane_id":"pFake","terminal_id":"termFake"}}}' ;;
   "tab close") printf 'ok' ;;
   *) printf 'unsupported %s\n' "$*" >&2; exit 64 ;;
 esac
@@ -526,10 +540,19 @@ func TestFactoryE2E_CoordinatorFenceBlocksSecondLoop(t *testing.T) {
 	t.Cleanup(func() { snap.assertUnchanged(t) })
 
 	root := factoryFixtureRepo(t)
-	installFakeHerdr(t, `{"result":{"type":"agent_list","agents":[]}}`)
+	canonicalRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	installFakeHerdr(t, `{"result":{"type":"agent_list","agents":[]}}`, canonicalRoot)
 	stateDir := t.TempDir()
 	writeGroomedBoard(t, stateDir)
 	installFakeKaneo(t, stateDir)
+	// This test proves coordinator fence release and readiness, not dispatch;
+	// keep the post-release loop on the deterministic drained-board path.
+	if err := os.WriteFile(filepath.Join(stateDir, "tasks.json"), []byte("[]"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 
 	binary := buildHerd(t)
 	env := append(os.Environ(),
@@ -541,7 +564,20 @@ func TestFactoryE2E_CoordinatorFenceBlocksSecondLoop(t *testing.T) {
 		cmd := exec.Command(binary, "forge", "--loop", "--ticks", "1", "--interval", "1")
 		cmd.Dir = root
 		cmd.Env = env
-		out, err := cmd.CombinedOutput()
+		output, err := os.CreateTemp(t.TempDir(), "forge-loop-output-*")
+		if err != nil {
+			t.Fatal(err)
+		}
+		cmd.Stdout = output
+		cmd.Stderr = output
+		err = cmd.Run()
+		if closeErr := output.Close(); err == nil && closeErr != nil {
+			err = closeErr
+		}
+		out, readErr := os.ReadFile(output.Name())
+		if err == nil && readErr != nil {
+			err = readErr
+		}
 		return string(out), err
 	}
 
