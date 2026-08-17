@@ -269,6 +269,16 @@ func TestDrainExactSHARejectsShortPins(t *testing.T) {
 	}
 }
 
+func TestDrainReviewPacketTargetsConfiguredSupervisor(t *testing.T) {
+	packet := drainReviewPacket("FAC-349", drainSelftestSHA, ".herd/worktrees/review", "forge-review-supervisor")
+	if !strings.Contains(packet, "REPORT_TARGET: forge-review-supervisor (mandatory; never coordinator)") {
+		t.Fatalf("packet must target configured standing supervisor:\n%s", packet)
+	}
+	if strings.Contains(packet, "REPORT_TARGET: review-harvest-supervisor") || strings.Contains(packet, "REPORT_TARGET: coordinator") {
+		t.Fatalf("packet must exclude legacy supervisor and coordinator targets:\n%s", packet)
+	}
+}
+
 func TestNewDrainAdaptersFailsClosedOnMissingAuthority(t *testing.T) {
 	dir := t.TempDir()
 	ledger := filepath.Join(dir, "ledger.jsonl")
