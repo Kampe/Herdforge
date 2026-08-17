@@ -121,30 +121,14 @@ func (e *Engine) ForgeStep(ctx context.Context, lanes LaneState, completed, veri
 	}
 
 	// 3. Review any completed in-progress build.
-	if len(completed) > 0 {
-		inProgress, err := e.listTasksBound(ctx, projectID, "in-progress")
-		if err != nil {
-			return nil, formatProviderStepError("list in-progress", err)
-		}
-		var ready, failed []*provider.Task
-		for _, t := range inProgress {
-			if !completed[t.Ref] {
-				continue
-			}
-			if verified[t.Ref] {
-				ready = append(ready, t)
-			} else {
-				failed = append(failed, t)
-			}
-		}
+	completion, err := e.completionAction(ctx, completed, verified)
+	if err != nil {
+		return nil, err
+	}
+	if completion != nil {
 		// Verified builds go to review; unverified "done" builds get re-nudged
 		// (self-gate) — review only sees work that actually passed verify.
-		if t := firstByPriority(ready); t != nil {
-			return &ForgeAction{Kind: ActionReview, Ref: t.Ref, Task: t}, nil
-		}
-		if t := firstByPriority(failed); t != nil {
-			return &ForgeAction{Kind: ActionRenudge, Ref: t.Ref, Task: t}, nil
-		}
+		return completion, nil
 	}
 
 	// 4. Dispatch the next to-do when a lane is free.

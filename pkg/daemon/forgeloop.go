@@ -217,6 +217,26 @@ func (e *Engine) ForgeLoop(ctx context.Context, d ForgeDriver, opts ForgeLoopOpt
 			sleep(ctx, interval)
 			continue
 		}
+		// Approval is deliberately the highest-priority board transition, but
+		// it must not be allowed to strand a newer worker completion. Admit one
+		// verified (or re-nudge one unverified) completion before attempting an
+		// approval, so a receiptless legacy refusal cannot end the tick before
+		// callback processing and review admission have happened.
+		if action.Kind == ActionApprove {
+			callbackAction, callbackErr := e.completionAction(ctx, completed, verified)
+			if callbackErr != nil {
+				fail("completion", fmt.Sprintf("completion admission failed: %v", callbackErr))
+			} else if callbackAction != nil {
+				switch callbackAction.Kind {
+				case ActionReview:
+					d.Log("forge: review " + callbackAction.Ref + " (before approve)")
+					act("review", callbackAction.Ref, func() error { return d.Review(ctx, callbackAction.Task) })
+				case ActionRenudge:
+					d.Log("forge: re-nudge " + callbackAction.Ref + " (reported done but failed verify; before approve)")
+					act("renudge", callbackAction.Ref, func() error { return d.Renudge(ctx, callbackAction.Task) })
+				}
+			}
+		}
 
 		switch action.Kind {
 		case ActionApprove:
@@ -335,6 +355,39 @@ func (e *Engine) ForgeLoop(ctx context.Context, d ForgeDriver, opts ForgeLoopOpt
 		sleep(ctx, interval)
 	}
 	return unresolvedFailures(failures)
+}
+
+// completionAction selects the highest-priority completed in-progress card
+// without considering approval, dispatch, or rejection state. ForgeStep uses
+// the same selector for its normal precedence, while ForgeLoop also invokes it
+// ahead of approval so a legacy approval refusal cannot suppress a fresh
+// completion in the current tick.
+func (e *Engine) completionAction(ctx context.Context, completed, verified map[string]bool) (*ForgeAction, error) {
+	if len(completed) == 0 {
+		return nil, nil
+	}
+	inProgress, err := e.listTasksBound(ctx, e.Config.TaskProvider.ProjectID, "in-progress")
+	if err != nil {
+		return nil, formatProviderStepError("list in-progress", err)
+	}
+	var ready, failed []*provider.Task
+	for _, t := range inProgress {
+		if !completed[t.Ref] {
+			continue
+		}
+		if verified[t.Ref] {
+			ready = append(ready, t)
+		} else {
+			failed = append(failed, t)
+		}
+	}
+	if t := firstByPriority(ready); t != nil {
+		return &ForgeAction{Kind: ActionReview, Ref: t.Ref, Task: t}, nil
+	}
+	if t := firstByPriority(failed); t != nil {
+		return &ForgeAction{Kind: ActionRenudge, Ref: t.Ref, Task: t}, nil
+	}
+	return nil, nil
 }
 
 // inProgressRefs lists the refs the board still holds in-progress. Used as the
