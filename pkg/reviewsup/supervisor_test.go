@@ -1602,3 +1602,80 @@ func TestDispatchBlockedRouteReconstructsDurableReason(t *testing.T) {
 		t.Fatalf("reconstructed queue = %+v, want durable blocked reason", q)
 	}
 }
+
+func TestDispatchCancellationLeavesCandidatePending(t *testing.T) {
+	sv, _ := newTestSupervisor(t)
+	if _, _, err := sv.Ingest(withDigest(CompletionCallback{SHA: "cancel-sha", AuthorModel: "claude", Tier: TierR2})); err != nil {
+		t.Fatalf("Ingest: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	results := sv.Dispatch(ctx, []DispatchRequest{
+		{SHA: "cancel-sha", Reviewers: []ReviewerEntry{{Name: "gemini", Model: "gemini-2.5-flash"}}, MaxAttempts: 2},
+	})
+	if len(results) != 1 || results[0].State == QueueBlocked {
+		t.Fatalf("dispatch result = %+v, cancellation must not be durable blocked state", results)
+	}
+	c := sv.Candidate("cancel-sha")
+	if c == nil || c.State != StatePending {
+		t.Fatalf("candidate after cancellation = %+v, want pending", c)
+	}
+	if got := sv.PendingCount(); got != 1 {
+		t.Fatalf("pending count after cancellation = %d, want 1", got)
+	}
+	rows, err := readRows(sv.cfg.LedgerPath)
+	if err != nil {
+		t.Fatalf("readRows: %v", err)
+	}
+	for _, row := range rows {
+		if row.Event == string(EventDispatchBlocked) {
+			t.Fatal("cancellation must not append dispatch_blocked evidence")
+		}
+	}
+}
+
+func TestDispatchStateErrorsDoNotMutateCandidates(t *testing.T) {
+	sv, _ := newTestSupervisor(t)
+	if _, _, err := sv.Ingest(withDigest(CompletionCallback{SHA: "reviewing-sha", AuthorModel: "claude", Tier: TierR2})); err != nil {
+		t.Fatalf("Ingest: %v", err)
+	}
+	if err := sv.LaunchReview("reviewing-sha", "gemini", "gemini-2.5-flash"); err != nil {
+		t.Fatalf("LaunchReview: %v", err)
+	}
+
+	tests := []struct {
+		name string
+		sha  string
+	}{
+		{name: "unknown", sha: "missing-sha"},
+		{name: "not pending", sha: "reviewing-sha"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			results := sv.Dispatch(context.Background(), []DispatchRequest{
+				{SHA: tt.sha, Reviewers: []ReviewerEntry{{Name: "gemini", Model: "gemini-2.5-flash"}}, MaxAttempts: 1},
+			})
+			if len(results) != 1 || results[0].State == QueueBlocked {
+				t.Fatalf("dispatch result = %+v, state error must not be durable blocked", results)
+			}
+		})
+	}
+
+	c := sv.Candidate("reviewing-sha")
+	if c == nil || c.State != StateReviewing {
+		t.Fatalf("candidate after state errors = %+v, want reviewing", c)
+	}
+	if got := sv.PendingCount(); got != 1 {
+		t.Fatalf("pending count after state errors = %d, want 1", got)
+	}
+	rows, err := readRows(sv.cfg.LedgerPath)
+	if err != nil {
+		t.Fatalf("readRows: %v", err)
+	}
+	for _, row := range rows {
+		if row.Event == string(EventDispatchBlocked) {
+			t.Fatal("state errors must not append dispatch_blocked evidence")
+		}
+	}
+}
