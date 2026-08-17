@@ -253,12 +253,12 @@ func TestTabListSocketFixtureDoesNotInventAgentFields(t *testing.T) {
 	defer func() { runHerdr = old }()
 	runHerdr = func(args ...string) (string, error) {
 		if len(args) >= 2 && args[0] == "tab" && args[1] == "list" {
-			return `{"result":{"tabs":[{"tab_id":"t1","workspace_id":"wF","label":"Herdforge · FAC-72","number":1,"pane_count":1,"focused":false,"agent_status":"unknown"}]}}`, nil
+			return `{"result":{"tabs":[{"tab_id":"t1","workspace_id":"wF","label":"Herdforge · FAC-72","tab_generation":"42","number":1,"pane_count":1,"focused":false,"agent_status":"unknown"}]}}`, nil
 		}
 		return `{"result":{"agents":[{"name":"shell","agent_status":"unknown","tab_id":"t1"}]}}`, nil
 	}
 	tabs, err := TabList("wF")
-	if err != nil || len(tabs) != 1 || tabs[0].Label != "Herdforge · FAC-72" || tabs[0].PaneCount != 1 {
+	if err != nil || len(tabs) != 1 || tabs[0].Label != "Herdforge · FAC-72" || tabs[0].PaneCount != 1 || tabs[0].Generation != "42" {
 		t.Fatalf("tabs=%+v err=%v", tabs, err)
 	}
 	agents, err := AgentList()
