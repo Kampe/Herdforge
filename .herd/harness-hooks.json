@@ -15,6 +15,11 @@
           "health_url": ""
         },
         {
+          "handler_digest": "claude:lifecycle:324eab260da3a2a7327eb0d5d3284f822bb32c945811a45f6152eacc97c8c7f4",
+          "requirement": "optional",
+          "health_url": ""
+        },
+        {
           "handler_digest": "claude:lifecycle:36392c209524eb9e0f86f27883cf9435113dde433d404092c046d034d07cb23a",
           "requirement": "optional",
           "health_url": ""
@@ -46,6 +51,11 @@
         },
         {
           "handler_digest": "claude:lifecycle:bf4be2301bef7062f81a7fad852cd8054f0844c0f775c05c808feb9df526359b",
+          "requirement": "optional",
+          "health_url": ""
+        },
+        {
+          "handler_digest": "claude:lifecycle:c5d8de5a1fb13152d6d6e2576edf9a96a296346425755a473db77e3e12c1ef17",
           "requirement": "optional",
           "health_url": ""
         },
