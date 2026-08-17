@@ -552,6 +552,20 @@ func (e *Engine) compensateAfterClaim(ctx context.Context, task *provider.Task, 
 	return nil
 }
 
+// CompensateLastClaim releases the most recent pulse claim after a forge-side
+// launch failure. It is the coordinator-facing wrapper around the same
+// generation-fenced compensation used by the daemon tick path.
+func (e *Engine) CompensateLastClaim(ctx context.Context, task *provider.Task, reason string) error {
+	if e == nil {
+		return fmt.Errorf("daemon compensate: missing engine")
+	}
+	tok := e.LastClaimToken()
+	if tok == nil {
+		return fmt.Errorf("daemon compensate: no live claim")
+	}
+	return e.compensateAfterClaim(ctx, task, tok, reason)
+}
+
 func defaultDaemonPacket(task *provider.Task, lane *config.LaneDef, worktreePath string) string {
 	laneName := ""
 	if lane != nil {

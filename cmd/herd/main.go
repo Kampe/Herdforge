@@ -4701,6 +4701,12 @@ func runForgeE() error {
 		// Fall through to review step
 	} else {
 		fmt.Printf("Claimed [%s]: %s\n", task.Ref, task.Title)
+		compensateLaunchFailure := func(launchErr error) error {
+			if releaseErr := eng.CompensateLastClaim(ctx, task, "forge_launch_failed"); releaseErr != nil {
+				return errors.Join(launchErr, fmt.Errorf("release failed claim: %w", releaseErr))
+			}
+			return launchErr
+		}
 
 		// Spawn worker only after the pre-claim route and availability checks.
 		if herdr.IsAvailable() {
@@ -4708,11 +4714,11 @@ func runForgeE() error {
 			if lane != nil {
 				decision, bindErr := rebindDecisionForTask(forgeDecision, task.Ref, forgeLeaseGeneration)
 				if bindErr != nil {
-					return fmt.Errorf("forge launch decision rejected after claim: %w", bindErr)
+					return compensateLaunchFailure(fmt.Errorf("forge launch decision rejected after claim: %w", bindErr))
 				}
 				standingName := fmt.Sprintf("forge-%s", lane.Name)
 				if lane.Worktree == "" {
-					return fmt.Errorf("forge launch requires an isolated worktree")
+					return compensateLaunchFailure(fmt.Errorf("forge launch requires an isolated worktree"))
 				}
 				tabLabel, resolveErr := herdr.ResolveAgentTabWithDecision(standingName, taskLaunchRequest(decision, task.Ref, repositoryIdentityForLaunch(cfg), lane.Name))
 				if resolveErr != nil {
@@ -4728,16 +4734,15 @@ func runForgeE() error {
 					_, tab, tabErr := openWriteCapableTab(decision, req, lane, herdr.ResolveWorkspace("."), tabLabel, cwd)
 					if tabErr == nil {
 						if err := herdr.StartPreparedAgent(tab.ID, tabLabel, decision.Harness, tab.Pane.ID, req); err != nil {
-							return fmt.Errorf("launch failed: %w", err)
+							return compensateLaunchFailure(fmt.Errorf("launch failed: %w", err))
 						}
 					} else {
-						return fmt.Errorf("create forge tab: %w", tabErr)
+						return compensateLaunchFailure(fmt.Errorf("create forge tab: %w", tabErr))
 					}
 				}
 				packet := fmt.Sprintf(`Task [%s]: %s\n\n%s\n\nWorktree: %s`, task.Ref, task.Title, task.Description, lane.Worktree)
 				if _, promptErr := herdr.AgentPrompt(tabLabel, packet, false); promptErr != nil {
-					fmt.Fprintf(os.Stderr, "forge prompt failed: %v\n", promptErr)
-					os.Exit(1)
+					return compensateLaunchFailure(fmt.Errorf("forge prompt failed: %w", promptErr))
 				}
 			}
 		}
