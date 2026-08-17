@@ -312,6 +312,9 @@ func main() {
 			os.Exit(1)
 		}
 
+	case "legacy-receipts":
+		runLegacyReceipts()
+
 	case "up":
 		runUp()
 
@@ -490,6 +493,7 @@ func printUsage() {
 	fmt.Println("  cleanup    Close finished one-off agent tabs (standing fleet exempt)")
 	fmt.Println("  labels     Reconcile drifted Herdforge tab labels in place (FAC-199)")
 	fmt.Println("  forge      Full cycle: pulse worker + review + approve")
+	fmt.Println("  legacy-receipts  Audit/tombstone receiptless legacy in-progress tasks (fail-closed)")
 	fmt.Println("  standing   Raise/status/shutdown declarative standing control roles")
 	fmt.Println("  daemon     Start the long-running orchestration daemon (infinite pulse loop)")
 	fmt.Println("  usage      Show harness quota usage from OpenUsage CLI")
