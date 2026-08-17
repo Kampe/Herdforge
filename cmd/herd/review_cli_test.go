@@ -26,6 +26,7 @@ import (
 	"github.com/Kampe/Herdforge/pkg/mail"
 	hsync "github.com/Kampe/Herdforge/pkg/sync"
 	"github.com/Kampe/Herdforge/pkg/toolchild"
+	"github.com/Kampe/Herdforge/pkg/verifier"
 	"github.com/Kampe/Herdforge/pkg/winddown"
 )
 
@@ -2162,6 +2163,58 @@ func TestApproveCLI_StaleLeaseGenerationFencedOut(t *testing.T) {
 	}
 	if got := atomic.LoadInt32(&fk.patches); got != 0 {
 		t.Fatalf("fenced-out receipt still performed %d status write(s)", got)
+	}
+}
+
+// FAC-342: a managed PASS verify persists both command receipts with the
+// launch receipt's exact task and lease binding, making the candidate
+// admissible to native review without a legacy receipt fallback.
+func TestVerifyCLI_ManagedPassPersistsAdmissibleReceipts(t *testing.T) {
+	binary := buildHerd(t)
+	dir, keyDir := t.TempDir(), t.TempDir()
+	attestKeyDir(t, keyDir)
+	gitIn(t, dir, "init", "-b", "main")
+	if err := os.WriteFile(filepath.Join(dir, ".gitignore"), []byte("**/TASK-CONTEXT.json\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, dir, "add", ".gitignore")
+	gitIn(t, dir, "commit", "-q", "-m", "base")
+	gitIn(t, dir, "update-ref", "refs/remotes/origin/main", "HEAD")
+	wt := filepath.Join(dir, ".herd", "worktrees", "fac-1")
+	gitIn(t, dir, "worktree", "add", "-b", "herd/fac-1", wt, "HEAD")
+	gitIn(t, wt, "commit", "--allow-empty", "-q", "-m", "feat: verified work (FAC-342)")
+	writeSignedReceipt(t, keyDir, dir, wt, nil)
+
+	out, err := herdCmd(binary, dir, keyDir, "verify", "--build", "true", "--test", "true", filepath.Join(".herd", "worktrees", "fac-1")).CombinedOutput()
+	if err != nil {
+		t.Fatalf("managed PASS verify failed: %v\n%s", err, out)
+	}
+
+	candidate := gitIn(t, wt, "rev-parse", "HEAD")
+	store, err := verifier.NewFileReceiptStore(filepath.Join(dir, ".herd", "verification-receipts"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	entries, err := os.ReadDir(filepath.Join(dir, ".herd", "verification-receipts"))
+	if err != nil {
+		t.Fatalf("receipt store was not created: %v", err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("got %d persisted receipts, want build and test receipts", len(entries))
+	}
+	admission := verifier.NewReceiptAdmission(store)
+	for _, entry := range entries {
+		digest := "sha256:" + strings.TrimSuffix(entry.Name(), filepath.Ext(entry.Name()))
+		receipt, err := store.Load(context.Background(), digest)
+		if err != nil {
+			t.Fatalf("load persisted receipt %s: %v", entry.Name(), err)
+		}
+		if receipt.TaskRef != "FAC-1" || receipt.LeaseGeneration == "" || receipt.CandidateSHA != candidate {
+			t.Fatalf("receipt lost exact binding: %+v", receipt)
+		}
+		if _, err := admission.RequireCurrentPassing(context.Background(), wt, digest); err != nil {
+			t.Fatalf("receipt %s was not natively admissible: %v", digest, err)
+		}
 	}
 }
 
