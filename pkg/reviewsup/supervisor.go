@@ -947,7 +947,12 @@ func (sv *ReviewSupervisor) MarkClosed(sha string) error {
 	if !ok {
 		return fmt.Errorf("reviewsup: unknown candidate %s", sha)
 	}
-	if cand.State != StateHarvested && cand.State != StateEvicted {
+	// Reconstruct replays the durable verdict before it can observe the queue
+	// row's harvested bit, so a retained PASS may temporarily have StatePass.
+	// The cleanup-candidate event is the authoritative admission proof across a
+	// restart; requiring StateHarvested here made a valid pane impossible to
+	// close after supervisor recovery.
+	if cand.State != StateHarvested && !(cand.State == StatePass && cand.CleanupCandidate) && cand.State != StateEvicted {
 		return fmt.Errorf("reviewsup: candidate %s is not cleanup-ready (state=%s)", sha, cand.State)
 	}
 	if err := sv.appendRow(&Row{Event: string(EventClosed), SHA: sha, Reason: "coordinator confirmed exact-tab and worktree cleanup"}); err != nil {

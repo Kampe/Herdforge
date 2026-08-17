@@ -451,6 +451,42 @@ func TestMarkClosedProjectsCleanupCandidateToClosed(t *testing.T) {
 	}
 }
 
+// TestReconstructThenMarkClosed proves the cleanup handoff survives a
+// supervisor restart. Before the durable-state fix this was the observed
+// failure: Reconstruct restored StatePass while MarkClosed required
+// StateHarvested, leaving every retained reviewer pane stuck open.
+func TestReconstructThenMarkClosed(t *testing.T) {
+	dir := t.TempDir()
+	cfg := DefaultConfig(dir)
+	cfg.Now = fixedNow
+	cfg.AdmitReceipt = testAdmitReceipt
+	sv := New(cfg)
+	if _, _, err := sv.Ingest(withDigest(CompletionCallback{SHA: "restart-sha", Branch: "feat/restart", AuthorModel: "claude", Tier: TierR1})); err != nil {
+		t.Fatalf("Ingest: %v", err)
+	}
+	if err := sv.LaunchReview("restart-sha", "gemini", "gemini-2.5-flash"); err != nil {
+		t.Fatalf("LaunchReview: %v", err)
+	}
+	if _, err := sv.SubmitVerdict(ReviewVerdict{SHA: "restart-sha", Reviewer: "gemini", Verdict: VerdictPASS}); err != nil {
+		t.Fatalf("SubmitVerdict: %v", err)
+	}
+
+	restarted := New(cfg)
+	if _, err := restarted.Reconstruct(); err != nil {
+		t.Fatalf("Reconstruct: %v", err)
+	}
+	entries := restarted.QueueSnapshot()
+	if len(entries) != 1 || entries[0].State != QueueCleanupCandidate {
+		t.Fatalf("reconstructed queue = %+v, want cleanup-candidate", entries)
+	}
+	if err := restarted.MarkClosed("restart-sha"); err != nil {
+		t.Fatalf("MarkClosed after reconstruct: %v", err)
+	}
+	if got := restarted.QueueSnapshot()[0].State; got != QueueClosed {
+		t.Fatalf("queue after reconstructed close = %s, want %s", got, QueueClosed)
+	}
+}
+
 func TestSubmitVerdictFAILReturnsToPending(t *testing.T) {
 	sv := svc(t)
 	sv.LaunchReview("aaa111", "gemini", "gemini-2.5-flash")
