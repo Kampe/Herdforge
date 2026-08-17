@@ -316,7 +316,7 @@ func prependToPath(cmd *exec.Cmd, dir string) {
 func herdCmdWithFake(binary, dir, keyDir, fakeBin, fakeLog string, args ...string) *exec.Cmd {
 	cmd := exec.Command(binary, args...)
 	cmd.Dir = dir
- cmd.Env = append(reviewTestEnv(), dispatch.KeyDirEnv+"="+keyDir)
+	cmd.Env = append(reviewTestEnv(), dispatch.KeyDirEnv+"="+keyDir)
 	// Review commands may chdir into an isolated detached worktree. Keep the
 	// provider's shared claim fence anchored to the fixture repository rather
 	// than making the review checkout provision a second authority.
