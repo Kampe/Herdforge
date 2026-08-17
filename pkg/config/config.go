@@ -223,6 +223,15 @@ type ProjectConfig struct {
 	RepoURL       string `yaml:"repo_url,omitempty"`
 }
 
+// StandingRolePolicy maps a repository-local standing role to a native
+// Herdforge launch role. The repository role remains the durable lane label;
+// NativeRole supplies the router and launch-boundary policy used to admit it.
+// This is intentionally explicit so a foreign roster cannot smuggle an
+// arbitrary role through the native launch contracts.
+type StandingRolePolicy struct {
+	NativeRole string `yaml:"native_role"`
+}
+
 type TaskProvider struct {
 	Type        string `yaml:"type"`
 	ProjectID   string `yaml:"project_id"`
@@ -311,6 +320,10 @@ type LaneDef struct {
 	// …) leave this false/omitted and are launched ephemerally per dispatch.
 	// This field IS enforced today: pkg/kick.StandingIDs() filters on it.
 	Standing bool `yaml:"standing,omitempty"`
+	// StandingRolePolicy is required for a custom role on a standing lane.
+	// Canonical Herdforge roles use their built-in policy and must not provide
+	// an alias that could change their role contract.
+	StandingRolePolicy *StandingRolePolicy `yaml:"standing_role_policy,omitempty"`
 	// Authority is this lane's repository write authority (read|write).
 	// Optional for backward compatibility; validated when present.
 	// Enforced at the FAC-139 launch boundary: authority=read cannot open a

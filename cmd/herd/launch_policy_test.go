@@ -105,6 +105,71 @@ func TestConfiguredCustomRoleAcceptsKnownTaskShape(t *testing.T) {
 	}
 }
 
+func TestCustomStandingRoleUsesExplicitNativeWorkerPolicy(t *testing.T) {
+	lane := &config.LaneDef{
+		Name: "docs-custodian", Role: "docs-custodian", Standing: true,
+		StandingRolePolicy: &config.StandingRolePolicy{NativeRole: launch.WorkerRole},
+		AgentKind:          "codex", Harness: "codex", Provider: testWorkerProvider,
+		Model: testWorkerModel, Effort: testWorkerEffort, TaskShape: "implementation",
+	}
+	if err := validateLaneLaunchConfig(lane); err != nil {
+		t.Fatalf("custom standing role should validate through its explicit native policy: %v", err)
+	}
+	role, err := nativeLaunchRole(lane)
+	if err != nil || role != router.RoleWorker {
+		t.Fatalf("native role = %q, err = %v; want worker", role, err)
+	}
+}
+
+func TestCustomStandingRoleRejectsMalformedNativeWorkerTuple(t *testing.T) {
+	lane := &config.LaneDef{
+		Name: "docs-custodian", Role: "docs-custodian", Standing: true,
+		StandingRolePolicy: &config.StandingRolePolicy{NativeRole: launch.WorkerRole},
+		AgentKind:          "codex", Harness: "codex", Provider: testWorkerProvider,
+		Model: "gpt-5.6-sol", Effort: testWorkerEffort, TaskShape: "implementation",
+	}
+	err := validateLaneLaunchConfig(lane)
+	if !errors.Is(err, ErrWorkerConfigPolicy) {
+		t.Fatalf("malformed native worker tuple must fail worker policy, got %v", err)
+	}
+}
+
+func TestCustomStandingRoleRequiresExplicitPolicy(t *testing.T) {
+	lane := &config.LaneDef{
+		Name: "docs-custodian", Role: "docs-custodian", Standing: true,
+		AgentKind: "codex", Harness: "codex", Provider: testWorkerProvider,
+		Model: testWorkerModel, Effort: testWorkerEffort, TaskShape: "implementation",
+	}
+	err := validateLaneLaunchConfig(lane)
+	if !errors.Is(err, ErrWorkerConfigPolicy) {
+		t.Fatalf("custom standing role without policy must fail closed, got %v", err)
+	}
+}
+
+func TestCustomStandingRoleRoutesThroughNativeWorkerAuthority(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "codex"), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir)
+	t.Setenv("HERDR_ROUTE_STATE_DIR", t.TempDir())
+	lane := &config.LaneDef{
+		Name: "docs-custodian", Role: "docs-custodian", Standing: true,
+		StandingRolePolicy: &config.StandingRolePolicy{NativeRole: launch.WorkerRole},
+		AgentKind:          "codex", Harness: "codex", Provider: testWorkerProvider,
+		Model: testWorkerModel, Effort: testWorkerEffort, TaskShape: "implementation",
+	}
+	decision, err := laneLaunchDecisionWithProbe(context.Background(), lane, nil, func(_ context.Context, _, model, _ string) herdr.ProbeResult {
+		return herdr.ProbeResult{Model: model, Available: true}
+	})
+	if err != nil {
+		t.Fatalf("custom standing route rejected: %v", err)
+	}
+	if decision.Role != router.RoleWorker || decision.Shape != launch.Implementation {
+		t.Fatalf("native standing decision = role %q shape %q; want worker/implementation", decision.Role, decision.Shape)
+	}
+}
+
 type fakeLaunchLifecycle struct {
 	providerList, claim, status, comment, worktree, tab, process, prompt int
 	decision                                                             *router.LaunchDecision
