@@ -67,6 +67,10 @@ func TestRealRoster_AllPromptsRegisteredOrTemplated(t *testing.T) {
 	// Explicitly documented one-off templates — not standing role contracts.
 	templates := map[string]bool{
 		"critical-wave-coordinator.md": true,
+		// Shared mutable routing contract referenced by every lane packet. It
+		// intentionally has no standing role of its own; lane packets resolve
+		// its current targets at kick time.
+		"routing.md": true,
 		// The artifact contract `herd review-ingest` enforces. Not a lane
 		// contract — it briefs reviewers on the seven accepted front-matter
 		// keys. The gate refuses any other key, so the accepted set must be
