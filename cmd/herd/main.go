@@ -4863,6 +4863,22 @@ func runForgeE() error {
 			forgeFailed = true
 		}
 	}
+	// Coordinator-owned backstop: after PASS approvals, reap only fenced
+	// ephemeral panes whose durable review/worktree evidence says they are
+	// finished. Standing lanes and lanes with unconsumed repair evidence stay
+	// resident; cleanup failure is visible rather than silently leaking panes.
+	if cfg != nil && herdr.IsAvailable() {
+		standingAgents := map[string]bool{}
+		for _, lane := range cfg.Lanes {
+			standingAgents[standing.AgentName(lane.Name)] = true
+		}
+		if cleaned, cleanupErr := herdr.CleanupFenced(standingAgents, false); cleanupErr != nil {
+			fmt.Fprintf(os.Stderr, "forge cleanup: %v\n", cleanupErr)
+			forgeFailed = true
+		} else if cleaned.Closed > 0 {
+			fmt.Printf("forge cleanup: closed=%d blocked=%d candidates=%d\n", cleaned.Closed, cleaned.Blocked, len(cleaned.Candidates))
+		}
+	}
 
 	fmt.Println("\n=== Forge cycle complete ===")
 	// FAC-145: a forge cycle with a real failure exits non-zero (caller
