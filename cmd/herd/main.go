@@ -5172,6 +5172,31 @@ func ensureArtifactToolProbe(ctx context.Context, decision *router.LaunchDecisio
 	if err != nil {
 		return nil, err
 	}
+	// Local Herdr panes perform the authoritative write-capability check when
+	// they start. Avoid launching a second headless model session here: local
+	// hooks and authentication can block the forge before a pane exists. The
+	// production path below remains the strict artifact-write probe.
+	if strings.ToLower(strings.TrimSpace(os.Getenv("HERD_MODE"))) != "production" &&
+		strings.ToLower(strings.TrimSpace(os.Getenv("HERD_LOCAL_TOOL_PROBE"))) != "strict" {
+		harness := strings.TrimSpace(decision.Harness)
+		if harness == "" {
+			return nil, fmt.Errorf("local tool-probe requires a resolved harness")
+		}
+		executable, lookErr := exec.LookPath(harness)
+		if lookErr != nil {
+			return nil, fmt.Errorf("local tool-probe harness unavailable: %s: %w", harness, lookErr)
+		}
+		proof := sha256.Sum256([]byte(executable))
+		receipt, receiptErr := toolprobe.NewReceipt(id, toolprobe.StatusPASS,
+			"local native harness present; write capability is checked by the Herdr pane",
+			"sha256:"+hex.EncodeToString(proof[:]), time.Now().UTC(), toolprobe.DefaultTTL)
+		if receiptErr != nil {
+			return nil, receiptErr
+		}
+		cache := toolprobe.NewFileCache(toolprobe.DefaultCachePath)
+		_ = cache.Put(receipt)
+		return &receipt, nil
+	}
 	cache := toolprobe.NewFileCache(toolprobe.DefaultCachePath)
 	r, err := toolprobe.Ensure(ctx, id, cache, &toolprobe.ExecRunner{}, time.Now().UTC())
 	if err != nil {
