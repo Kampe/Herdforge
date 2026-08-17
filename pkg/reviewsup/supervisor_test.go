@@ -1528,3 +1528,77 @@ func TestCompensateLaunch_ReconstructDoesNotLeaveInReview(t *testing.T) {
 		t.Fatalf("replayed LAUNCH_FAILED left in-review state: %+v", c)
 	}
 }
+
+func TestDispatchIndependentCandidateIsNotBlockedBySlowRoute(t *testing.T) {
+	sv, _ := newTestSupervisor(t)
+	for _, sha := range []string{"slow-sha", "safe-sha"} {
+		if _, _, err := sv.Ingest(withDigest(CompletionCallback{
+			SHA: sha, AuthorModel: "claude-3-7-sonnet", Tier: TierR1,
+		})); err != nil {
+			t.Fatalf("Ingest %s: %v", sha, err)
+		}
+	}
+	reviewer := ReviewerEntry{Name: "gemini-reviewer", Model: "gemini-2.5-flash"}
+	results := sv.Dispatch(context.Background(), []DispatchRequest{
+		{
+			SHA: "slow-sha", Reviewers: []ReviewerEntry{reviewer}, MaxAttempts: 1,
+			Timeout: 20 * time.Millisecond,
+			Launch: func(ctx context.Context, _ string, _ ReviewerEntry) error {
+				<-ctx.Done()
+				return ctx.Err()
+			},
+		},
+		{
+			SHA: "safe-sha", Reviewers: []ReviewerEntry{reviewer}, MaxAttempts: 1,
+			Launch: func(ctx context.Context, sha string, entry ReviewerEntry) error {
+				return sv.LaunchReviewContext(ctx, sha, entry.Name, entry.Model)
+			},
+		},
+	})
+	if len(results) != 2 || results[0].SHA != "safe-sha" || results[1].SHA != "slow-sha" {
+		t.Fatalf("results = %+v, want deterministic exact-SHA order", results)
+	}
+	if results[0].State != QueueLaunched || results[0].Reviewer != reviewer.Name {
+		t.Fatalf("safe result = %+v, want launched reviewer", results[0])
+	}
+	if results[1].State != QueueBlocked || !strings.Contains(results[1].Reason, "no routable review surface") {
+		t.Fatalf("slow result = %+v, want durable blocked reason", results[1])
+	}
+	q := sv.QueueSnapshot()
+	if len(q) != 2 || q[0].SHA != "safe-sha" || q[0].State != QueueLaunched || q[1].State != QueueBlocked {
+		t.Fatalf("queue snapshot = %+v, want exact refs and states", q)
+	}
+	if q[1].Reason == "" {
+		t.Fatal("blocked queue entry lost durable no-route reason")
+	}
+	if sv.PendingCount() != 1 {
+		t.Fatalf("pending count = %d, want only safe candidate", sv.PendingCount())
+	}
+}
+
+func TestDispatchBlockedRouteReconstructsDurableReason(t *testing.T) {
+	dir := t.TempDir()
+	cfg := DefaultConfig(dir)
+	cfg.Now = fixedNow
+	cfg.RetryLimit = 2
+	cfg.AdmitReceipt = testAdmitReceipt
+	sv := New(cfg)
+	if _, _, err := sv.Ingest(withDigest(CompletionCallback{SHA: "refused-sha", AuthorModel: "claude", Tier: TierR2})); err != nil {
+		t.Fatalf("Ingest: %v", err)
+	}
+	results := sv.Dispatch(context.Background(), []DispatchRequest{
+		{SHA: "refused-sha", Reviewers: []ReviewerEntry{{Name: "gemini", Model: "gemini-2.5-flash"}}, MaxAttempts: 2,
+			Launch: func(context.Context, string, ReviewerEntry) error { return errors.New("route refused") }},
+	})
+	if len(results) != 1 || results[0].State != QueueBlocked || results[0].Attempts != 2 {
+		t.Fatalf("dispatch result = %+v, want two-attempt blocked result", results)
+	}
+	restarted := New(cfg)
+	if _, err := restarted.Reconstruct(); err != nil {
+		t.Fatalf("Reconstruct: %v", err)
+	}
+	q := restarted.QueueSnapshot()
+	if len(q) != 1 || q[0].State != QueueBlocked || !strings.Contains(q[0].Reason, "route refused") {
+		t.Fatalf("reconstructed queue = %+v, want durable blocked reason", q)
+	}
+}
