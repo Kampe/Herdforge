@@ -10,6 +10,7 @@ import (
 
 	"github.com/Kampe/Herdforge/pkg/candidateindex"
 	"github.com/Kampe/Herdforge/pkg/config"
+	"github.com/Kampe/Herdforge/pkg/deps"
 	"github.com/Kampe/Herdforge/pkg/provider"
 )
 
@@ -143,16 +144,81 @@ func (p *NextPicker) evalAll(ctx context.Context) ([]*NextAction, error) {
 		})
 	}
 
-	// Priority 6: Claim new task (default if nothing blocking)
+	// Priority 6: Claim new task (default if nothing blocking). Preview the
+	// provenance gate before presenting a claim action so missing herd-deps-v1
+	// is repaired before a Forge cycle spends a lease and then fails.
+	preview, err := PreviewClaimQueue(ctx, p.TaskProvider, p.Config)
+	if err != nil {
+		return nil, err
+	}
+	claimCommand := "herd pulse --spawn"
+	if preview.Claimable == 0 && preview.ProvenanceBlocked > 0 {
+		claimCommand = "herd deps migrate"
+	}
 	actions = append(actions, &NextAction{
 		Type:        ActionClaim,
 		Priority:    100,
-		Description: "No blocking actions — claim next pending task",
-		Command:     "herd pulse --spawn",
+		Description: preview.Description(),
+		Command:     claimCommand,
 		AutoSafe:    false,
 	})
 
 	return actions, nil
+}
+
+// ClaimPreview is the pre-claim admission summary. It reports what can be
+// proven from board descriptions before lease/worker side effects occur.
+type ClaimPreview struct {
+	Claimable         int
+	ProvenanceBlocked int
+	BlockedRefs       []string
+}
+
+func (p ClaimPreview) Description() string {
+	if p.Claimable == 0 && p.ProvenanceBlocked > 0 {
+		return fmt.Sprintf("No claimable task yet — repair provenance for %d blocked card(s): %s", p.ProvenanceBlocked, strings.Join(p.BlockedRefs, ", "))
+	}
+	if p.ProvenanceBlocked == 0 {
+		return fmt.Sprintf("No blocking actions — %d claimable pending task(s)", p.Claimable)
+	}
+	return fmt.Sprintf("Claim next pending task (%d claimable, %d blocked by missing/invalid herd-deps-v1: %s)", p.Claimable, p.ProvenanceBlocked, strings.Join(p.BlockedRefs, ", "))
+}
+
+// PreviewClaimQueue performs the cheap, deterministic portion of claim
+// admission. It is not a replacement for deps.ValidateClaim; it exposes
+// obvious provenance omissions before a Forge cycle reports a late failure.
+func PreviewClaimQueue(ctx context.Context, tp provider.TaskProvider, cfg *config.Config) (ClaimPreview, error) {
+	if tp == nil || cfg == nil {
+		return ClaimPreview{}, fmt.Errorf("claim preview requires provider and config")
+	}
+	tasks, err := tp.ListTasks(ctx, cfg.TaskProvider.ProjectID, "to-do")
+	if err != nil {
+		return ClaimPreview{}, err
+	}
+	sort.SliceStable(tasks, func(i, j int) bool {
+		if tasks[i] == nil || tasks[j] == nil {
+			return tasks[i] != nil
+		}
+		pi, pj := candidateindex.PriorityRank(tasks[i].Priority), candidateindex.PriorityRank(tasks[j].Priority)
+		if pi != pj {
+			return pi > pj
+		}
+		return provider.CompareRefs(tasks[i].Ref, tasks[j].Ref) < 0
+	})
+	preview := ClaimPreview{}
+	for _, task := range tasks {
+		if task == nil || strings.TrimSpace(task.Ref) == "" {
+			continue
+		}
+		prov, provErr := deps.ExtractProvenanceFromText(task.Description)
+		if provErr != nil || prov == nil || !prov.Present {
+			preview.ProvenanceBlocked++
+			preview.BlockedRefs = append(preview.BlockedRefs, task.Ref)
+			continue
+		}
+		preview.Claimable++
+	}
+	return preview, nil
 }
 
 func (p *NextPicker) pendingVerdicts() []string {

@@ -3,6 +3,7 @@ package next
 import (
 	"context"
 	"os"
+	"strings"
 	"testing"
 )
 
@@ -35,6 +36,24 @@ func TestEval_VerdictArtifacts(t *testing.T) {
 	}
 	if act.Type != ActionIngest {
 		t.Errorf("expected ActionIngest with verdict present, got %s", act.Type)
+	}
+}
+
+func TestPreviewClaimQueueSeparatesProvenanceBlocked(t *testing.T) {
+	cfg := testConfig()
+	tasks := []testTask{
+		{ref: "FAC-9", status: "to-do", priority: "urgent", description: "missing fence"},
+		{ref: "FAC-10", status: "to-do", priority: "high", description: "```herd-deps-v1\n{\"version\":1,\"task_ref\":\"FAC-10\",\"task_id\":\"t10\",\"edges\":[]}\n```"},
+	}
+	preview, err := PreviewClaimQueue(context.Background(), newTestProvider(tasks), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if preview.Claimable != 1 || preview.ProvenanceBlocked != 1 || len(preview.BlockedRefs) != 1 || preview.BlockedRefs[0] != "FAC-9" {
+		t.Fatalf("unexpected preview: %+v", preview)
+	}
+	if !strings.Contains(preview.Description(), "FAC-9") {
+		t.Fatalf("description omitted blocked ref: %s", preview.Description())
 	}
 }
 
