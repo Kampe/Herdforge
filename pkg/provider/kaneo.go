@@ -743,7 +743,10 @@ func (k *KaneoProvider) ListComments(ctx context.Context, taskID string) ([]stri
 		var dtos []struct {
 			Content string `json:"content"`
 		}
-		if err := json.Unmarshal(res.Stdout, &dtos); err != nil {
+		// CLI stdout is the same provider boundary as HTTP responses: a
+		// successful process can still emit a structured error payload. Do not
+		// let that payload become an empty/invalid verdict readback.
+		if err := DecodeJSONBytes(http.StatusOK, res.Stdout, &dtos); err != nil {
 			return nil, fmt.Errorf("kaneo task comment list decode: %w", err)
 		}
 		out := make([]string, 0, len(dtos))
@@ -757,6 +760,7 @@ func (k *KaneoProvider) ListComments(ctx context.Context, taskID string) ([]stri
 	if err != nil {
 		return nil, err
 	}
+	k.authorizeKaneo(req)
 	resp, err := k.httpClient().Do(req)
 	if err != nil {
 		return nil, err
