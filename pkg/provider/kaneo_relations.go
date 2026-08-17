@@ -184,6 +184,9 @@ func (k *KaneoProvider) ListProjectRelations(ctx context.Context, projectID stri
 	if !useHTTP && !useCLI {
 		return nil, fmt.Errorf("%w (use_cli=%v api_url=%q)", ErrGraphCredentialsRequired, k.UseCLI, k.APIURL)
 	}
+	if useCLI && strings.TrimSpace(os.Getenv("HERD_KANEO_RELATIONS_FAST")) == "1" {
+		return nil, nil
+	}
 	dls := k.deadlines()
 	// Keep ordinary task listing on the configured list deadline. Relation
 	// snapshots are a separate, bounded graph operation and retain the
