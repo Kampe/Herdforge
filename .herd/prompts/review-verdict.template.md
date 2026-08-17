@@ -8,6 +8,8 @@ reviewed-head: <output of `git rev-parse HEAD` in the tree you actually read>
 ---
 Your evidence goes here, below the `---`.
 
+Delivery: send this verdict and its findings to the standing review supervisor. The coordinator receives only the supervisor's merge-ready PASS handoff.
+
 # The seven keys above are the COMPLETE accepted set
 
 `herd review-ingest` refuses an artifact carrying any other key. That is
