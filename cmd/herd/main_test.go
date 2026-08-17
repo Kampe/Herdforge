@@ -24,6 +24,11 @@ var (
 )
 
 func TestMain(m *testing.M) {
+	// Herdr marks reviewer panes with HERD_ROLE=agent. The CLI suite exercises
+	// coordinator-owned signing and broker setup, so a pane diagnostic must not
+	// turn those fixtures into signer-boundary failures. Tests that need to
+	// assert the role boundary set it explicitly in their own subprocess.
+	_ = os.Setenv("HERD_ROLE", "")
 	code := m.Run()
 	if dir := filepath.Dir(herdBinary); herdBinary != "" {
 		_ = os.RemoveAll(dir)
