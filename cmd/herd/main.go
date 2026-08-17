@@ -4719,7 +4719,7 @@ func runForgeE() error {
 					if gateErr := authorizeEphemeralTaskAgent(resolveErr); gateErr != nil {
 						return fmt.Errorf("standing forge agent %s blocked: %w", standingName, resolveErr)
 					}
-					tabLabel = fmt.Sprintf("forge-%s-%s", lane.Name, task.Ref)
+					tabLabel = fmt.Sprintf("forge-%s-%s", strings.ToLower(lane.Name), strings.ToLower(task.Ref))
 					cwd := "."
 					if lane.Worktree != "" {
 						cwd = filepath.Join(".", lane.Worktree)
