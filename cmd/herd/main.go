@@ -8287,9 +8287,23 @@ func provisionCoordinatorAgent(root, workspace string) (herdr.TabBinding, error)
 	if err := promptFile.Close(); err != nil {
 		return herdr.TabBinding{}, fmt.Errorf("close coordinator prompt: %w", err)
 	}
-	cmd := exec.Command("herdr-dispatch", "coordinator", "--task", "coordinator", "--workspace", workspace, "--cwd", root, "--prompt-file", promptPath)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return herdr.TabBinding{}, fmt.Errorf("start native Sol/Fable coordinator: %w: %s", err, strings.TrimSpace(string(out)))
+	args := []string{"coordinator", "--task", "coordinator", "--workspace", workspace, "--cwd", root, "--prompt-file", promptPath}
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		cmd := exec.Command("herdr-dispatch", args...)
+		out, runErr := cmd.CombinedOutput()
+		if runErr == nil {
+			lastErr = nil
+			break
+		}
+		lastErr = fmt.Errorf("%w: %s", runErr, strings.TrimSpace(string(out)))
+		if !strings.Contains(string(out), "agent_pane_busy") {
+			break
+		}
+		time.Sleep(time.Second)
+	}
+	if lastErr != nil {
+		return herdr.TabBinding{}, fmt.Errorf("start native Sol/Fable coordinator: %w", lastErr)
 	}
 	deadline := time.Now().Add(30 * time.Second)
 	for time.Now().Before(deadline) {
