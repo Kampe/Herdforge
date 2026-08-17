@@ -111,6 +111,34 @@ func TestForgeLoop_ActionFailureAffectsExitStatus(t *testing.T) {
 	}
 }
 
+// A refused legacy approval must not strand a newer completion that arrived
+// in the same forge tick. Completion admission runs independently before the
+// approval transition, so the callback can reach review even though the
+// legacy card remains a bounded failure.
+func TestForgeLoop_RefusedApproveDoesNotBlockFreshCompletionAdmission(t *testing.T) {
+	e := forgeEngine(t,
+		inReviewTask("FAC-367", "367", provider.PriorityUrgent),
+		&provider.Task{ID: "359", Ref: "FAC-359", Status: "in-progress", Priority: provider.PriorityHigh,
+			Description: "```herd-deps-v1\n{\"version\":1,\"task_ref\":\"FAC-359\",\"task_id\":\"359\",\"edges\":[]}\n```\n"},
+	)
+	d := &fakeDriver{
+		lanes:     LaneState{Busy: 1, Max: 1},
+		completed: map[string]bool{"FAC-359": true},
+		verified:  map[string]bool{"FAC-359": true},
+		approveErr: func(string) error {
+			return hsync.ErrNoEvidence
+		},
+	}
+
+	err := e.ForgeLoop(context.Background(), d, fastLoop(1))
+	if err == nil || !strings.Contains(err.Error(), "approve FAC-367 failed") {
+		t.Fatalf("legacy approval refusal must remain a bounded failure, got %v", err)
+	}
+	if len(d.actions) != 2 || d.actions[0] != "review:FAC-359" || d.actions[1] != "approve:FAC-367" {
+		t.Fatalf("fresh completion was not admitted before refused approval: %v", d.actions)
+	}
+}
+
 // ...but a transition that later succeeds is resolved, not held against the
 // run. Approve fails on the first attempt and succeeds on the second.
 func TestForgeLoop_SucceededRetryClearsFailure(t *testing.T) {
