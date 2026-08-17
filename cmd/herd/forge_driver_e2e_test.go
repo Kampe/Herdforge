@@ -342,7 +342,7 @@ case "$1 $2" in
   "agent list") printf '%s' '` + agentJSON + `' ;;
   "agent prompt") printf 'ok' ;;
   "agent start") printf 'ok' ;;
-  "tab create") printf '{"result":{"type":"tab_create","tab_id":"tFake","pane_id":"pFake"}}' ;;
+  "tab create") printf '{"result":{"type":"tab_create","tab":{"tab_id":"tFake"},"root_pane":{"tab_id":"tFake","pane_id":"pFake","terminal_id":"termFake"}}}' ;;
   "tab close") printf 'ok' ;;
   *) printf 'unsupported %s\n' "$*" >&2; exit 64 ;;
 esac
