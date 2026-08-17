@@ -103,15 +103,12 @@ func runReviewIngest() {
 		if strings.EqualFold(a.ReviewerFamily, "mechanical") || strings.EqualFold(a.BuilderFamily, "mechanical") {
 			gate = "mechanical"
 		}
-		if err := ledger.EnsureRecord(reviewledger.RecordOpts{
+		recordOpts := reviewledger.RecordOpts{
 			SHA: a.SHA, Branch: a.Branch, BuilderFamily: a.BuilderFamily,
 			ReviewerFamily: a.ReviewerFamily, Reviewer: a.Reviewer,
 			Artifact: retained, Gate: gate, Task: a.Branch,
-		}); err != nil {
-			fmt.Fprintf(os.Stderr, "herd review-ingest: admission record FAILED for %s: %v\n", filepath.Base(f), err)
-			os.Exit(1)
 		}
-		enqueued, err := ledger.Verdict(reviewledger.VerdictOpts{
+		verdictOpts := reviewledger.VerdictOpts{
 			SHA:            a.SHA,
 			Reviewer:       a.Reviewer,
 			Verdict:        reviewledger.Verdict(a.Verdict),
@@ -120,11 +117,10 @@ func runReviewIngest() {
 			BuilderFamily:  a.BuilderFamily,
 			Branch:         a.Branch,
 			CandidateSHA:   a.SHA,
-		})
+		}
+		enqueued, err := ledger.Ingest(reviewledger.IngestOpts{Record: recordOpts, Verdict: verdictOpts})
 		if err != nil {
-			// A ledger write that fails must not be reported as admitted:
-			// the verdict does not exist until it is durable.
-			fmt.Fprintf(os.Stderr, "herd review-ingest: ledger write FAILED for %s: %v\n", filepath.Base(f), err)
+			fmt.Fprintf(os.Stderr, "herd review-ingest: admission/verdict write FAILED for %s: %v\n", filepath.Base(f), err)
 			os.Exit(1)
 		}
 		fmt.Printf("ADMITTED %s verdict=%s reviewer=%s sha=%s enqueued=%v\n",

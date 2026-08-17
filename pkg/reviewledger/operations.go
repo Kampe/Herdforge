@@ -25,8 +25,23 @@ type RecordOpts struct {
 	Lease           string
 }
 
+// IngestOpts is the authenticated handoff from a reviewer verdict artifact.
+// The record and verdict identities must describe the same exact candidate and
+// reviewer; callers must not create a PASS row without its admission
+// provenance.
+type IngestOpts struct {
+	Record  RecordOpts
+	Verdict VerdictOpts
+}
+
 // Record appends a record event. Validates builder family on independent gates.
 func (l *Ledger) Record(opts RecordOpts) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.record(opts)
+}
+
+func (l *Ledger) record(opts RecordOpts) error {
 	if opts.Gate == "mechanical" {
 		if opts.BuilderFamily != "" && opts.BuilderFamily != "mechanical" {
 			return fmt.Errorf("mechanical record must not carry builder family %q", opts.BuilderFamily)
@@ -66,6 +81,12 @@ func (l *Ledger) Record(opts RecordOpts) error {
 // admissible PASS permanently unharvestable merely because the launch record
 // was not copied into the local ledger first.
 func (l *Ledger) EnsureRecord(opts RecordOpts) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.ensureRecord(opts)
+}
+
+func (l *Ledger) ensureRecord(opts RecordOpts) error {
 	rows, err := readRows(l.Path)
 	if err != nil {
 		return err
@@ -75,7 +96,37 @@ func (l *Ledger) EnsureRecord(opts RecordOpts) error {
 			return nil
 		}
 	}
-	return l.Record(opts)
+	return l.record(opts)
+}
+
+// Ingest ensures the matching exact-SHA admission record before persisting a
+// PASS verdict. Provenance validation happens before either row is written;
+// repeating an accepted handoff is idempotent.
+func (l *Ledger) Ingest(opts IngestOpts) (bool, error) {
+	if opts.Verdict.Verdict == VerdictPASS {
+		if strings.TrimSpace(opts.Record.SHA) == "" || opts.Record.SHA != opts.Verdict.SHA {
+			return false, fmt.Errorf("review ingest refused: admission and verdict must bind the exact same sha")
+		}
+		if strings.TrimSpace(opts.Record.Reviewer) == "" || opts.Record.Reviewer != opts.Verdict.Reviewer {
+			return false, fmt.Errorf("review ingest refused: admission and verdict must bind the same reviewer")
+		}
+		if strings.TrimSpace(opts.Record.Branch) == "" {
+			return false, fmt.Errorf("review ingest refused: missing branch provenance")
+		}
+		if strings.TrimSpace(opts.Record.Artifact) == "" || opts.Record.Artifact != opts.Verdict.Artifact {
+			return false, fmt.Errorf("review ingest refused: missing or mismatched authenticated verdict artifact")
+		}
+		if opts.Record.Gate != "mechanical" && (strings.TrimSpace(opts.Record.BuilderFamily) == "" || strings.TrimSpace(opts.Verdict.ReviewerFamily) == "") {
+			return false, fmt.Errorf("review ingest refused: missing independent reviewer provenance")
+		}
+	}
+
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if err := l.ensureRecord(opts.Record); err != nil {
+		return false, err
+	}
+	return l.verdict(opts.Verdict)
 }
 
 // Tier returns the newest recorded tier for a sha, or empty string.
@@ -115,6 +166,12 @@ type VerdictOpts struct {
 // Verdict appends a verdict event and side-writes to the queue.
 // Duplicate verdicts (same SHA+Reviewer) are idempotent — second call is a no-op.
 func (l *Ledger) Verdict(opts VerdictOpts) (enqueued bool, err error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.verdict(opts)
+}
+
+func (l *Ledger) verdict(opts VerdictOpts) (enqueued bool, err error) {
 	if err := ValidVerdict(opts.Verdict); err != nil {
 		return false, err
 	}

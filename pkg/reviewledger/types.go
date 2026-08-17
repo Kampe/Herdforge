@@ -1,6 +1,9 @@
 package reviewledger
 
-import "time"
+import (
+	"sync"
+	"time"
+)
 
 // Event types for the append-only ledger.
 type Event string
@@ -95,6 +98,7 @@ var DefaultCoordinators = map[string]struct{}{
 
 // Ledger is an append-only JSONL review-verdict ledger with a harvest queue.
 type Ledger struct {
+	mu           sync.Mutex
 	RepoRoot     string
 	Path         string
 	QueuePath    string
