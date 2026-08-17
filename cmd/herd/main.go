@@ -2167,8 +2167,13 @@ func runReview() {
 		// the receipt-gated broker's TYPED reviewer-only operation — free
 		// text can never carry verdict authority.
 		testCmd := scopedTestCommand(worktreeDir)
+		reviewSupervisor := findReviewSupervisorLane(cfg)
+		if reviewSupervisor == nil {
+			life.fail("review: no standing review supervisor lane configured")
+		}
+		reportTarget := standing.AgentName(reviewSupervisor.Name)
 		reviewPacket := fmt.Sprintf(`REVIEW %s — verdict ONLY, edit nothing.
-REPORT_TARGET: review-harvest-supervisor (mandatory; never coordinator)
+REPORT_TARGET: %s (mandatory; never coordinator)
 REPORT_CONTRACT: retain the signed verdict artifact in the Herdforge review inbox before pane teardown. The supervisor owns exact-SHA admission, reviewer retries, author feedback, ledger ingest, and cleanup. The coordinator receives only exact PASS plus merge-ready evidence.
 	cd %s
 1. git diff origin/main..HEAD --stat  (see ONLY the changed files — review just these)
@@ -2177,7 +2182,7 @@ File your verdict through the broker (typed, receipt-bound):
   herd task verdict %s APPROVED
   herd task verdict %s REJECTED "<numbered fixes>"
 	Do not read the whole codebase. Do not run the full suite. Change nothing. Do not use repository bin/herd-* orchestration scripts.`,
-			task.Ref, worktreeDir, testCmd, task.Ref, task.Ref)
+			task.Ref, reportTarget, worktreeDir, testCmd, task.Ref, task.Ref)
 
 		// An undelivered review packet is a BLOCKED review, not a warning.
 		if _, err := herdr.AgentPrompt(targetLabel, reviewPacket, false); err != nil {

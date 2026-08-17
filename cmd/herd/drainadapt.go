@@ -34,6 +34,7 @@ import (
 	"github.com/Kampe/Herdforge/pkg/review"
 	"github.com/Kampe/Herdforge/pkg/reviewledger"
 	"github.com/Kampe/Herdforge/pkg/router"
+	"github.com/Kampe/Herdforge/pkg/standing"
 	hsync "github.com/Kampe/Herdforge/pkg/sync"
 	"github.com/Kampe/Herdforge/pkg/verifier"
 )
@@ -168,7 +169,7 @@ func (a *drainAdapters) launchReview(ctx context.Context, e drainActionEvidence)
 		return fmt.Errorf("review launch: reviewer family %q must differ from builder family %q", decision.Family, family)
 	}
 	req := taskLaunchRequest(decision, task.Ref, a.repository, a.lane.Name)
-	proof, err := a.launcher.LaunchReviewer(ctx, req, drainReviewPacket(task.Ref, sha, a.lane.Worktree))
+	proof, err := a.launcher.LaunchReviewer(ctx, req, drainReviewPacket(task.Ref, sha, a.lane.Worktree, standing.AgentName(a.lane.Name)))
 	if err != nil {
 		return fmt.Errorf("review launch: %w", err)
 	}
@@ -374,9 +375,9 @@ func drainCandidateTask(t *provider.Task, family, model, sha string) *provider.T
 	return &candidate
 }
 
-func drainReviewPacket(ref, sha, worktree string) string {
+func drainReviewPacket(ref, sha, worktree, reportTarget string) string {
 	return fmt.Sprintf(`REVIEW %s candidate %s — verdict ONLY, edit nothing. End with the verdict line.
-REPORT_TARGET: review-harvest-supervisor (mandatory; never coordinator)
+REPORT_TARGET: %s (mandatory; never coordinator)
 REPORT_CONTRACT: deliver the signed verdict artifact to the review supervisor. The supervisor owns retries, author feedback, exact-SHA ledger ingest, and reviewer-tab cleanup. The coordinator receives only an exact PASS plus merge-ready handoff.
 cd %s
 1. git diff origin/main..%s --stat  (review ONLY these changed files)
@@ -392,7 +393,7 @@ Do not read the whole codebase. Do not run the full suite. Change nothing.
  artifact and notifying the supervisor. The coordinator performs post-merge
  generation-fenced cleanup; preserve standing lanes and lanes with unconsumed
  review/goal evidence.`,
-		ref, sha, worktree, sha, scopedTestCommand(worktree), ref, ref)
+		ref, sha, reportTarget, worktree, sha, scopedTestCommand(worktree), ref, ref)
 }
 
 // ---- live seams ------------------------------------------------------------
