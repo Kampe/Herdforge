@@ -5000,8 +5000,16 @@ func validateLaneLaunchConfig(lane *config.LaneDef) error {
 		return fmt.Errorf("%w: lane %q agent kind %q harness %q must match one supported vendor harness (codex, claude, grok, agy, opencode)", ErrHarnessConfigPolicy, lane.Name, lane.AgentKind, lane.Harness)
 	}
 	if role == launch.WorkerRole || role == launch.ForgeSmithRole || role == launch.RecoveryRole {
-		if lane.Provider != launch.WorkerProvider || lane.Model != launch.WorkerModel || lane.Effort != launch.WorkerEffort {
-			return fmt.Errorf("%w: lane %q must explicitly be codex with codex/gpt-5.6-luna/medium", ErrWorkerConfigPolicy, lane.Name)
+		if lane.Provider == launch.WorkerProvider {
+			if lane.Model != launch.WorkerModel || lane.Effort != launch.WorkerEffort {
+				return fmt.Errorf("%w: lane %q codex workers must use codex/gpt-5.6-luna/medium", ErrWorkerConfigPolicy, lane.Name)
+			}
+		} else if lane.Provider == "grok" {
+			if strings.TrimSpace(lane.Model) == "" || strings.TrimSpace(lane.Effort) == "" {
+				return fmt.Errorf("%w: lane %q grok workers require an explicit model and effort", ErrWorkerConfigPolicy, lane.Name)
+			}
+		} else {
+			return fmt.Errorf("%w: lane %q must use codex/gpt-5.6-luna/medium or an explicit Grok model", ErrWorkerConfigPolicy, lane.Name)
 		}
 	}
 	return nil
