@@ -59,14 +59,15 @@ const (
 // Evidence is every input behind one surface's cap, kept verbatim so a
 // persisted decision can be audited without re-running the supervisor.
 type Evidence struct {
-	Capacity      Capacity        `json:"capacity"`
-	BurnClass     usage.BurnClass `json:"burn_class,omitempty"`
-	LedgerReason  string          `json:"ledger_reason,omitempty"`
-	UsedPct       float64         `json:"used_pct"`
-	Window        string          `json:"window,omitempty"`
-	ResetAt       string          `json:"reset_at,omitempty"`
-	WindowSeconds int             `json:"window_seconds,omitempty"`
-	RunwayMinutes *int            `json:"runway_minutes,omitempty"`
+	Capacity      Capacity          `json:"capacity"`
+	BurnClass     usage.BurnClass   `json:"burn_class,omitempty"`
+	LedgerReason  string            `json:"ledger_reason,omitempty"`
+	UsedPct       float64           `json:"used_pct"`
+	Window        string            `json:"window,omitempty"`
+	ResetAt       string            `json:"reset_at,omitempty"`
+	WindowSeconds int               `json:"window_seconds,omitempty"`
+	Windows       []usage.BurnState `json:"windows,omitempty"`
+	RunwayMinutes *int              `json:"runway_minutes,omitempty"`
 	// SourceAt is when the quota provider generated the reading, NOT when the
 	// supervisor ran. Recording the supervisor's own clock here would make
 	// every observation look fresh no matter how stale the ledger is.
@@ -119,6 +120,7 @@ func (o Observation) Grade(now time.Time, warnRunwayMinutes int, maxAge time.Dur
 		e.Window = o.Burn.Window
 		e.ResetAt = o.Burn.ResetsAt
 		e.WindowSeconds = o.Burn.WindowSeconds
+		e.Windows = append([]usage.BurnState(nil), o.Burn.Windows...)
 		e.RunwayMinutes = o.Burn.RunwayMinutes
 		e.Stale = o.Burn.Stale
 	}

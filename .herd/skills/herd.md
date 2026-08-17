@@ -5,6 +5,8 @@ description: Operate and inspect the Herdforge repository-local multi-agent cont
 
 # Herdforge Agent Skill Guide
 
+Use `.herd/prompts/routing.md` as the mutable routing and persistence contract for every lane and kick.
+
 Use `herd` for repository workflow policy and Herdr for agent-session mechanics.
 The commands below are the live contract; keep evidence checks around every
 mutation.

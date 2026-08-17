@@ -166,13 +166,14 @@ func (a Assignment) Surface() Surface {
 // what makes the next run's caps continuous with this one's instead of
 // restarting the ratchet from cold every time the process bounces.
 type Snapshot struct {
-	ObservedAt        string       `json:"observed_at"`
-	SourceAt          string       `json:"source_at,omitempty"`
-	Workspace         string       `json:"workspace"`
-	WarnRunwayMinutes int          `json:"warn_runway_minutes"`
-	Agents            []Assignment `json:"agents"`
-	Decisions         []Decision   `json:"decisions,omitempty"`
-	Wake              *WakePlan    `json:"wake,omitempty"`
+	ObservedAt        string         `json:"observed_at"`
+	SourceAt          string         `json:"source_at,omitempty"`
+	Workspace         string         `json:"workspace"`
+	WarnRunwayMinutes int            `json:"warn_runway_minutes"`
+	Agents            []Assignment   `json:"agents"`
+	Decisions         []Decision     `json:"decisions,omitempty"`
+	Wake              *WakePlan      `json:"wake,omitempty"`
+	Recovery          []RecoveryPlan `json:"recovery,omitempty"`
 }
 
 // WakePlan is a durable, deduplicable self-wake hint for a coordinator. It is
@@ -184,6 +185,56 @@ type WakePlan struct {
 	Window   string    `json:"window"`
 	ResetAt  time.Time `json:"reset_at"`
 	Reason   string    `json:"reason"`
+}
+
+// RecoveryPlan distinguishes a short five-hour exhaustion from a weekly cap.
+// The coordinator keeps its identity while routing around the exhausted pool;
+// only a five-hour reset gets a precise self-wake.
+type RecoveryPlan struct {
+	Provider string    `json:"provider"`
+	Pool     string    `json:"pool"`
+	Window   string    `json:"window"`
+	ResetAt  time.Time `json:"reset_at"`
+	Action   string    `json:"action"`
+	Reason   string    `json:"reason"`
+}
+
+// PlanRecovery preserves nested quota-window evidence and returns the
+// deterministic failover action for an exhausted surface.
+func PlanRecovery(now time.Time, d Decision) *RecoveryPlan {
+	windows := append([]usage.BurnState(nil), d.Evidence.Windows...)
+	if len(windows) == 0 && d.Evidence.Window != "" {
+		windows = append(windows, usage.BurnState{Window: d.Evidence.Window, WindowSeconds: d.Evidence.WindowSeconds, ResetsAt: d.Evidence.ResetAt, Class: usage.BurnExhausted})
+	}
+	var best *RecoveryPlan
+	for _, w := range windows {
+		if w.Class != usage.BurnExhausted && d.Evidence.Capacity != Exhausted {
+			continue
+		}
+		reset, err := time.Parse(time.RFC3339, strings.TrimSpace(w.ResetsAt))
+		if err != nil || !reset.After(now) {
+			continue
+		}
+		window := strings.ToLower(strings.TrimSpace(w.Window))
+		switch {
+		case w.WindowSeconds == usage.Window5h || window == "5h" || window == "five_hour":
+			window = "5h"
+		case w.WindowSeconds == usage.WindowWeekly || window == "weekly" || window == "7d":
+			window = "weekly"
+		default:
+			continue
+		}
+		action := "reroute-until-reset"
+		if window == "5h" {
+			action = "reroute-and-self-wake"
+		}
+		candidate := &RecoveryPlan{Provider: d.Surface.Provider, Pool: d.Surface.Pool, Window: window, ResetAt: reset.UTC(), Action: action,
+			Reason: fmt.Sprintf("%s quota exhausted; keep coordinator identity and fail over to a healthy surface", window)}
+		if best == nil || candidate.ResetAt.Before(best.ResetAt) {
+			best = candidate
+		}
+	}
+	return best
 }
 
 // PlanClaudeFiveHourWake returns the earliest future Claude five-hour reset

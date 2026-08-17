@@ -2,6 +2,8 @@
 
 ## Control-plane contract (mandatory)
 
+Routing and persistence are defined in `.herd/prompts/routing.md`; re-read it before every kick.
+
 Use Herdforge and Herdr directly (`herd pulse`, `herd spin`, `herd rescue`,
 `herd quota-supervisor`, `herd cleanup --dry-run`, and
 `herdr agent list/read/prompt`). Never replace these with `bin/herd-*` shell
