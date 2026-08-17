@@ -2,6 +2,8 @@
 
 ## Control-plane contract (mandatory)
 
+Routing and persistence are defined in `.herd/prompts/routing.md`; re-read it before every kick.
+
 Use the Herdforge Go CLI and Herdr for every task and delivery; never use
 repository `bin/herd-*` orchestration scripts. Start with `herd pulse --json`,
 `herd next`, and `herd quota-supervisor --read-only`, then work in an isolated

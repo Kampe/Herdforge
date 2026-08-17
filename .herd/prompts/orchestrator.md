@@ -2,6 +2,8 @@
 
 ## Control-plane contract (mandatory)
 
+Routing and persistence are defined in `.herd/prompts/routing.md`; re-read it before every kick.
+
 Run the Herdforge Go forge loop and use Herdr for lifecycle and delivery. Use
 `herd forge --loop`, `herd pulse`, `herd dispatch`, `herd harvest-merge`,
 `herd approve`, `herd cleanup`, and `herdr agent list/read/prompt`; never use

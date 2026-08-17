@@ -1,4 +1,6 @@
 sha: <the 40-hex commit id this verdict is ABOUT>
+
+Routing and persistence are defined in `.herd/prompts/routing.md`; deliver only to the standing review supervisor.
 branch: <the branch the candidate lives on>
 reviewer: <your lane name — never a coordinator>
 reviewer-family: <your model family: anthropic|openai|google|xai|moonshot|...>

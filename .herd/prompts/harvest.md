@@ -2,6 +2,8 @@
 
 ## Control-plane contract (mandatory)
 
+Routing and persistence are defined in `.herd/prompts/routing.md`; re-read it before every kick.
+
 Use Herdforge's Go commands and Herdr directly: `herd harvest-merge`,
 `herd review-ingest`, `herd approve`, `herd cleanup`, and
 `herdr agent list/read/prompt`. Do not use repository `bin/herd-*` scripts.
