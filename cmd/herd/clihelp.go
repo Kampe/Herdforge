@@ -85,7 +85,7 @@ var subcommandUsage = map[string]string{
   Durably deliver exact prompt bytes from stdin or --file to one Herdr session.
   Positional free-form text is rejected (FAC-183 shell-literal incident class).`,
 	"cleanup":         "Usage: herd cleanup [flags]\n  One-shot tab / worktree cleanup sweep.",
-	"forge":           "Usage: herd forge [--loop] [flags]\n  Forge orchestration entrypoints.",
+	"forge":           "Usage: herd forge [--loop] [--retry-approve <ref>] [flags]\n  Forge orchestration entrypoints. Legacy receiptless approvals are suppressed durably; --retry-approve explicitly re-attempts one.",
 	"up":              "Usage: herd up <lane-name>\n  Bring up a configured lane.",
 	"activate":        "Usage: herd activate [flags]\n  Activate fleet / lane posture.",
 	"validate-config": "Usage: herd validate-config [path]\n  Validate .herd/herd.yaml.",

@@ -2,12 +2,14 @@ package daemon
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
 	"time"
 
 	"github.com/Kampe/Herdforge/pkg/provider"
+	hsync "github.com/Kampe/Herdforge/pkg/sync"
 )
 
 // FAC-128: the RUNNING forge loop. ForgeStep decides the next action; this
@@ -73,8 +75,16 @@ type ForgeLoopOptions struct {
 	// the prior behavior (polling-only) — it is the backstop, not the primary
 	// signal. A Feedback error is logged, never fatal: a census failure must
 	// not stop the forge loop the way a transition failure does.
-	Feedback          func(ctx context.Context) error
-	FeedbackInterval  int // call Feedback every N ticks (default 0 = every tick when Feedback is set)
+	Feedback         func(ctx context.Context) error
+	FeedbackInterval int // call Feedback every N ticks (default 0 = every tick when Feedback is set)
+
+	// ApproveSuppressionPath persists receiptless legacy approve tombstones.
+	// Empty keeps the ledger process-local, which is useful for embedders and
+	// tests; production forge-loop supplies a repo-relative path.
+	ApproveSuppressionPath string
+	// ApproveRetryRefs is an explicit operator request to clear suppression for
+	// a ref and try approval once more.
+	ApproveRetryRefs map[string]bool
 }
 
 // ForgeLoop runs the async orchestration cycle: each tick it reads lane state
@@ -100,6 +110,10 @@ func (e *Engine) ForgeLoop(ctx context.Context, d ForgeDriver, opts ForgeLoopOpt
 	// key ("approve:FAC-1", "lanes", "orphan") -> last reason. Cleared when
 	// the same transition succeeds, so a recovered blip does not poison exit.
 	failures := map[string]string{}
+	approveSuppressions, err := loadApproveSuppressionLedger(opts.ApproveSuppressionPath)
+	if err != nil {
+		return fmt.Errorf("forge: approve suppression state unavailable: %w", err)
+	}
 	// routed holds ref -> the FAILed SHA whose rejection this loop already
 	// proved delivered. It is the (ref, SHA) idempotency key: the reviewer's
 	// FAIL stays in the ledger until a fresh candidate earns a fresh PASS, so
@@ -207,7 +221,52 @@ func (e *Engine) ForgeLoop(ctx context.Context, d ForgeDriver, opts ForgeLoopOpt
 		switch action.Kind {
 		case ActionApprove:
 			d.Log("forge: approve " + action.Ref)
-			act("approve", action.Ref, func() error { return d.Approve(ctx, action.Task) })
+			candidateState, receiptState := approveSuppressionState(action.Task)
+			legacyKey := approveSuppressionKey(action.Ref, hsync.ErrNoEvidence.Error(), candidateState, receiptState)
+			explicitRetry := opts.ApproveRetryRefs[action.Ref]
+			if explicitRetry {
+				if err := approveSuppressions.removeRef(action.Ref); err != nil {
+					reason := fmt.Sprintf("approve %s retry state reset failed: %v", action.Ref, err)
+					failures["approve:"+action.Ref] = reason
+					d.Log("forge: " + reason)
+					break
+				}
+				d.Log("forge: approve " + action.Ref + " explicit operator retry")
+			}
+			if !explicitRetry && approveSuppressions.has(legacyKey) {
+				d.Log(fmt.Sprintf("forge: approve %s suppressed BLOCKED-legacy (receiptless refusal; state unchanged)", action.Ref))
+				if _, alreadyBlocked := failures["approve:"+action.Ref]; !alreadyBlocked {
+					failures["approve:"+action.Ref] = fmt.Sprintf("approve %s BLOCKED-legacy suppressed (receiptless refusal; state unchanged)", action.Ref)
+				}
+				break
+			}
+			approveErr := d.Approve(ctx, action.Task)
+			if approveErr == nil {
+				if err := approveSuppressions.removeRef(action.Ref); err != nil {
+					reason := fmt.Sprintf("approve %s suppression cleanup failed: %v", action.Ref, err)
+					failures["approve:"+action.Ref] = reason
+					d.Log("forge: " + reason)
+				} else {
+					delete(failures, "approve:"+action.Ref)
+				}
+				// Post-merge board/session/worktree truth is observed before the
+				// next capacity decision; no cleanup mutation occurs here.
+				observe()
+				break
+			}
+			if errors.Is(approveErr, hsync.ErrNoEvidence) {
+				if err := approveSuppressions.record(approveSuppression{
+					Key: legacyKey, Ref: action.Ref, Reason: hsync.ErrNoEvidence.Error(), CandidateState: candidateState,
+					ReceiptState: receiptState, BlockedAt: time.Now().UTC().Format(time.RFC3339Nano),
+				}); err != nil {
+					approveErr = fmt.Errorf("legacy refusal could not be persisted: %w", err)
+				} else {
+					d.Log(fmt.Sprintf("forge: approve %s recorded BLOCKED-legacy (receiptless refusal)", action.Ref))
+				}
+			}
+			reason := fmt.Sprintf("approve %s failed: %v", action.Ref, approveErr)
+			failures["approve:"+action.Ref] = reason
+			d.Log("forge: " + reason)
 			// Post-merge board/session/worktree truth is observed before the
 			// next capacity decision; no cleanup mutation occurs here.
 			observe()

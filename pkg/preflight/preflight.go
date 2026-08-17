@@ -34,6 +34,9 @@ func CheckWorktreeBoundaryWithAllowlist(rootDir string, allowlist []string) erro
 		}
 		if d.IsDir() {
 			name := d.Name()
+			if path == ".herd/bootstrap" {
+				return fs.SkipDir
+			}
 			if name == ".git" || name == "node_modules" || name == "vendor" ||
 				name == ".gemini" || name == ".qoder" || name == ".vscode" ||
 				name == ".claude" || name == ".codebuddy" || name == ".kiro" {
