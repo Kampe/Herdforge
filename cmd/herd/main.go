@@ -8261,6 +8261,9 @@ func bindCoordinatorControlTab(root, workspace string) (herdr.TabBinding, error)
 		return herdr.TabBinding{}, fmt.Errorf("coordinator control binding: agent inventory: %w", err)
 	}
 	binding, err := deriveCoordinatorControlBinding(canonicalRoot, workspace, agents)
+	if err != nil && strings.Contains(err.Error(), "expected one canonical-root agent, found 0") {
+		binding, err = provisionCoordinatorAgent(canonicalRoot, workspace)
+	}
 	if err != nil {
 		return herdr.TabBinding{}, err
 	}
@@ -8268,6 +8271,37 @@ func bindCoordinatorControlTab(root, workspace string) (herdr.TabBinding, error)
 		return herdr.TabBinding{}, err
 	}
 	return binding, nil
+}
+
+func provisionCoordinatorAgent(root, workspace string) (herdr.TabBinding, error) {
+	promptFile, err := os.CreateTemp("", "herd-coordinator-*.md")
+	if err != nil {
+		return herdr.TabBinding{}, fmt.Errorf("create coordinator prompt: %w", err)
+	}
+	promptPath := promptFile.Name()
+	defer os.Remove(promptPath)
+	if _, err := promptFile.WriteString("You are the durable Herdforge coordinator. Drive the forge loop, dispatch work through Herdr, and report blockers. Do not edit the shared root checkout.\n"); err != nil {
+		promptFile.Close()
+		return herdr.TabBinding{}, fmt.Errorf("write coordinator prompt: %w", err)
+	}
+	if err := promptFile.Close(); err != nil {
+		return herdr.TabBinding{}, fmt.Errorf("close coordinator prompt: %w", err)
+	}
+	cmd := exec.Command("herdr-dispatch", "coordinator", "--task", "coordinator", "--workspace", workspace, "--cwd", root, "--prompt-file", promptPath)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return herdr.TabBinding{}, fmt.Errorf("start native Sol/Fable coordinator: %w: %s", err, strings.TrimSpace(string(out)))
+	}
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		agents, listErr := herdr.AgentList()
+		if listErr == nil {
+			if binding, bindErr := deriveCoordinatorControlBinding(root, workspace, agents); bindErr == nil {
+				return binding, nil
+			}
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+	return herdr.TabBinding{}, fmt.Errorf("native coordinator started but did not become READY in 30s")
 }
 
 func (d *cliForgeDriver) Log(msg string) { fmt.Println(msg) }
