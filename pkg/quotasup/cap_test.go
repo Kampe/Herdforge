@@ -40,6 +40,23 @@ func TestPlanClaudeFiveHourWakeChoosesEarliestFutureReset(t *testing.T) {
 	}
 }
 
+func TestPlanRecoveryDistinguishesFiveHourAndWeekly(t *testing.T) {
+	now := time.Date(2026, 8, 17, 1, 0, 0, 0, time.UTC)
+	base := Decision{Surface: Surface{Provider: "anthropic", Pool: "fable"}, Evidence: Evidence{Capacity: Exhausted, Windows: []usage.BurnState{
+		{Window: "weekly", WindowSeconds: usage.WindowWeekly, Class: usage.BurnExhausted, ResetsAt: "2026-08-24T01:00:00Z"},
+		{Window: "5h", WindowSeconds: usage.Window5h, Class: usage.BurnExhausted, ResetsAt: "2026-08-17T05:00:00Z"},
+	}}}
+	short := PlanRecovery(now, base)
+	if short == nil || short.Window != "5h" || short.Action != "reroute-and-self-wake" {
+		t.Fatalf("short recovery=%+v, want five-hour self-wake", short)
+	}
+	base.Evidence.Windows = []usage.BurnState{{Window: "weekly", WindowSeconds: usage.WindowWeekly, Class: usage.BurnExhausted, ResetsAt: "2026-08-24T01:00:00Z"}}
+	weekly := PlanRecovery(now, base)
+	if weekly == nil || weekly.Window != "weekly" || weekly.Action != "reroute-until-reset" {
+		t.Fatalf("weekly recovery=%+v, want long-window reroute", weekly)
+	}
+}
+
 // Quota nobody refreshed is not evidence that headroom still exists.
 func TestObservationAgeBoundaryFlipsToUnknown(t *testing.T) {
 	cases := []struct {

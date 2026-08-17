@@ -403,6 +403,16 @@ func TestSubmitVerdictPASS(t *testing.T) {
 	if c.State != StateHarvested {
 		t.Errorf("state = %s, want harvested", c.State)
 	}
+	q := sv.QueueSnapshot()
+	var qentry QueueEntry
+	for _, entry := range q {
+		if entry.SHA == "aaa111" {
+			qentry = entry
+		}
+	}
+	if qentry.State != QueueCleanupCandidate {
+		t.Fatalf("queue after PASS = %+v, want one cleanup candidate", q)
+	}
 
 	ready, err := sv.ReadyForHarvest(10)
 	if err != nil {
@@ -417,6 +427,27 @@ func TestSubmitVerdictPASS(t *testing.T) {
 	}
 	if !found {
 		t.Error("aaa111 not found in harvest queue after PASS")
+	}
+}
+
+func TestMarkClosedProjectsCleanupCandidateToClosed(t *testing.T) {
+	sv := svc(t)
+	sv.LaunchReview("aaa111", "gemini", "gemini-2.5-flash")
+	if _, err := sv.SubmitVerdict(ReviewVerdict{SHA: "aaa111", Reviewer: "gemini", Verdict: VerdictPASS}); err != nil {
+		t.Fatalf("SubmitVerdict: %v", err)
+	}
+	if err := sv.MarkClosed("aaa111"); err != nil {
+		t.Fatalf("MarkClosed: %v", err)
+	}
+	q := sv.QueueSnapshot()
+	var found QueueEntry
+	for _, entry := range q {
+		if entry.SHA == "aaa111" {
+			found = entry
+		}
+	}
+	if found.State != QueueClosed {
+		t.Fatalf("queue after close = %+v, want closed", q)
 	}
 }
 

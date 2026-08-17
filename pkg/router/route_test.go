@@ -143,7 +143,7 @@ func TestEffortForTable(t *testing.T) {
 func TestWaterfallTables(t *testing.T) {
 	clearRouteEnv(t)
 	want := map[string][]string{
-		"coordinator":    {"codex", "claude"},
+		"coordinator":    {"codex", "claude", "grok"},
 		"architecture":   {"claude", "agy", "codex", "grok", "ollama", "lazer"},
 		"implementation": {"claude", "grok", "codex", "ollama", "agy", "lazer"},
 		"research":       {"claude", "agy", "ollama", "grok", "codex", "lazer"},

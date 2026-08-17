@@ -28,6 +28,7 @@ const (
 	EventBuilderCallback  EventType = "builder_callback"
 	EventBuilderAck       EventType = "builder_ack"
 	EventVerdictRetained  EventType = "verdict_retained"
+	EventIngested         EventType = "ingested"
 	EventAuthorNotified   EventType = "author_notified"
 	EventCleanupCandidate EventType = "cleanup_candidate"
 	EventClosed           EventType = "closed"
@@ -132,12 +133,31 @@ type Candidate struct {
 	// ReceiptDigest is the FAC-122 verification receipt digest that
 	// admitted this candidate. LaunchReview re-checks it; empty digest
 	// never enters review.
-	ReceiptDigest string
+	ReceiptDigest    string
+	VerdictRetained  bool
+	Ingested         bool
+	HarvestReady     bool
+	CleanupCandidate bool
 }
 
 func queueState(c *Candidate) QueueState {
 	if c == nil {
 		return QueueClosed
+	}
+	if c.State == StateEvicted {
+		return QueueClosed
+	}
+	if c.CleanupCandidate {
+		return QueueCleanupCandidate
+	}
+	if c.HarvestReady {
+		return QueueHarvestReady
+	}
+	if c.Ingested {
+		return QueueIngested
+	}
+	if c.VerdictRetained {
+		return QueueVerdictRetained
 	}
 	switch c.State {
 	case StatePending:
@@ -686,10 +706,17 @@ func (sv *ReviewSupervisor) SubmitVerdict(v ReviewVerdict) (newState CandidateSt
 			cand.UpdatedAt = sv.now()
 			return "", fmt.Errorf("reviewsup: append harvest row: %w", err)
 		}
+		cand.VerdictRetained = true
+		cand.Ingested = true
+		cand.HarvestReady = true
+		if err := sv.appendRow(&Row{Event: string(EventIngested), SHA: v.SHA, Reviewer: v.Reviewer, ReceiptDigest: cand.ReceiptDigest}); err != nil {
+			return "", fmt.Errorf("reviewsup: retain ingested event: %w", err)
+		}
 		if err := sv.appendRow(&Row{Event: string(EventCleanupCandidate), SHA: v.SHA, Reviewer: v.Reviewer, Reason: "verdict retained; coordinator may close exact tab after harvest"}); err != nil {
 			return "", fmt.Errorf("reviewsup: append cleanup candidate: %w", err)
 		}
 		cand.State = StateHarvested
+		cand.CleanupCandidate = true
 
 	case VerdictFAIL:
 		effective := VerdictFAIL
@@ -907,6 +934,28 @@ func (sv *ReviewSupervisor) MarkHarvested(sha string) error {
 			return fmt.Errorf("reviewsup: durable callback order: %w", err)
 		}
 	}
+	return nil
+}
+
+// MarkClosed records the final coordinator-owned cleanup transition after the
+// exact Herdr reviewer tab and its worktree have been closed. Reviewers never
+// close their own panes; this method makes that handoff durable and queryable.
+func (sv *ReviewSupervisor) MarkClosed(sha string) error {
+	sv.mu.Lock()
+	defer sv.mu.Unlock()
+	cand, ok := sv.cands[sha]
+	if !ok {
+		return fmt.Errorf("reviewsup: unknown candidate %s", sha)
+	}
+	if cand.State != StateHarvested && cand.State != StateEvicted {
+		return fmt.Errorf("reviewsup: candidate %s is not cleanup-ready (state=%s)", sha, cand.State)
+	}
+	if err := sv.appendRow(&Row{Event: string(EventClosed), SHA: sha, Reason: "coordinator confirmed exact-tab and worktree cleanup"}); err != nil {
+		return fmt.Errorf("reviewsup: append closed event: %w", err)
+	}
+	cand.State = StateEvicted
+	cand.CleanupCandidate = false
+	cand.UpdatedAt = sv.now()
 	return nil
 }
 
@@ -1135,6 +1184,29 @@ func (sv *ReviewSupervisor) Reconstruct() (int, error) {
 					cand.State = StateBlocked
 					sv.pendingCount--
 				}
+			}
+
+		case EventVerdictRetained:
+			if cand, ok := sv.cands[r.SHA]; ok {
+				cand.VerdictRetained = true
+				cand.Verdict = Verdict(r.Verdict)
+				cand.VerdictReason = r.Reason
+			}
+
+		case EventIngested:
+			if cand, ok := sv.cands[r.SHA]; ok {
+				cand.Ingested = true
+			}
+
+		case EventCleanupCandidate:
+			if cand, ok := sv.cands[r.SHA]; ok {
+				cand.CleanupCandidate = true
+			}
+
+		case EventClosed:
+			if cand, ok := sv.cands[r.SHA]; ok {
+				cand.State = StateEvicted
+				cand.CleanupCandidate = false
 			}
 
 		case EventSupersede:

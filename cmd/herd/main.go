@@ -8634,20 +8634,18 @@ func provisionCoordinatorAgent(root, workspace string) (herdr.TabBinding, error)
 		return herdr.TabBinding{}, fmt.Errorf("create coordinator tab returned incomplete identity: %s", strings.TrimSpace(string(tabOut)))
 	}
 	time.Sleep(time.Second)
-	routeCmd := exec.Command("herdr-route", "--task", "coordinator", "--json")
-	routeOut, routeErr := routeCmd.Output()
+	// Route in-process so coordinator provisioning cannot drift from the
+	// launch surface used by forge workers. The router includes Grok as a
+	// native fallback when Codex/Claude are exhausted; the coordinator
+	// registration and control tab remain the same across that failover.
+	route, routeErr := router.NewRouter(nil, nil).Pick("coordinator", "", "")
 	if routeErr != nil {
 		return herdr.TabBinding{}, fmt.Errorf("route native coordinator: %w", routeErr)
 	}
-	var route struct {
-		Provider string   `json:"provider"`
-		Kind     string   `json:"kind"`
-		Argv     []string `json:"argv"`
+	if !router.IsLaneLaunchable(route.Provider) || len(route.Argv) < 1 {
+		return herdr.TabBinding{}, fmt.Errorf("coordinator route is not a launchable Herdr surface: provider=%s model=%s", route.Provider, route.Model)
 	}
-	if err := json.Unmarshal(routeOut, &route); err != nil || (route.Kind != "codex" && route.Kind != "claude") || len(route.Argv) < 1 {
-		return herdr.TabBinding{}, fmt.Errorf("coordinator route must be native Codex Sol or Claude Fable: %s", strings.TrimSpace(string(routeOut)))
-	}
-	startArgs := []string{"herdr", "agent", "start", "coordinator", "--kind", route.Kind, "--pane", tabResp.Result.Pane.PaneID, "--timeout", "120000", "--"}
+	startArgs := []string{"herdr", "agent", "start", "coordinator", "--kind", route.Provider, "--pane", tabResp.Result.Pane.PaneID, "--timeout", "120000", "--"}
 	startArgs = append(startArgs, route.Argv[1:]...)
 	if out, startErr := exec.Command(startArgs[0], startArgs[1:]...).CombinedOutput(); startErr != nil {
 		return herdr.TabBinding{}, fmt.Errorf("start native Sol/Fable coordinator: %w: %s", startErr, strings.TrimSpace(string(out)))

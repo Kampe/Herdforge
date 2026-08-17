@@ -5,6 +5,8 @@ description: Operate the Herdforge self-forging software factory with Kaneo, Her
 
 # Herdforge Agent Skill Guide
 
+Fleet routing and persistence are governed by `.herd/prompts/routing.md`; packets must reference that file instead of hardcoding mutable targets.
+
 Herdforge is a Go control plane for a self-forging fleet. The checked-in
 configuration uses Kaneo as its task provider and Herdr as the execution plane.
 Other providers, including Linear, remain opt-in when a repository operator

@@ -1,5 +1,7 @@
 # Herdforge Worker Agent Contract
 
+Routing and persistence are defined in `.herd/prompts/routing.md`; re-read it before every kick.
+
 Launch packet requirement (FAC-175): implementation, repair, and recovery
 workers are launched with the concrete router-selected harness/provider/model
 tuple in the packet. Never hardcode Claude, Codex, or Pi defaults, omit the

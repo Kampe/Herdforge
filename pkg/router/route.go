@@ -46,7 +46,10 @@ func AllShapes() []string {
 func Waterfall(shape string) ([]string, error) {
 	switch shape {
 	case "coordinator":
-		return []string{"codex", "claude"}, nil
+		// Coordinator identity is stable across provider failover. Keep the
+		// preferred Codex/Claude surfaces first, but include Grok as a real
+		// native fallback when a five-hour or weekly Claude window is spent.
+		return []string{"codex", "claude", "grok"}, nil
 	case "architecture":
 		return []string{"claude", "agy", "codex", "grok", "ollama", "lazer"}, nil
 	case "implementation":

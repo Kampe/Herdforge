@@ -142,6 +142,11 @@ func runQuotaSupervisor() {
 			quotasup.Decide(s, ev, quotasup.PriorState(prior, s)))
 	}
 	current.Wake = quotasup.PlanClaudeFiveHourWake(now, current.Decisions)
+	for _, d := range current.Decisions {
+		if recovery := quotasup.PlanRecovery(now, d); recovery != nil {
+			current.Recovery = append(current.Recovery, *recovery)
+		}
+	}
 
 	for _, a := range current.Agents {
 		old := quotasup.Prior(prior, a.Name)
@@ -213,6 +218,10 @@ func runQuotaSupervisor() {
 	if current.Wake != nil {
 		fmt.Printf("SELF_WAKE provider=%s window=%s reset=%s key=%s command=herd forge --loop\n",
 			current.Wake.Provider, current.Wake.Window, current.Wake.ResetAt.Format(time.RFC3339), current.Wake.Key)
+	}
+	for _, recovery := range current.Recovery {
+		fmt.Printf("FAILOVER provider=%s pool=%s window=%s action=%s reset=%s reason=%s\n",
+			recovery.Provider, recovery.Pool, recovery.Window, recovery.Action, recovery.ResetAt.Format(time.RFC3339), recovery.Reason)
 	}
 }
 
