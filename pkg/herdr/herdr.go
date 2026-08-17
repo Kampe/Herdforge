@@ -1047,6 +1047,42 @@ func TabCreate(opts TabCreateOptions) (*TabInfo, error) {
 // out-of-tree key location plus this marker and the cwd refusal.
 const AgentRoleEnv = "HERD_ROLE=agent"
 
+const (
+	childWorkspaceSourceEnv       = "HERD_WORKSPACE_SOURCE"
+	childWorkspaceOverrideIgnored = "HERD_WORKSPACE_OVERRIDE_IGNORED"
+)
+
+// bindChildWorkspaceEnv makes the launch target the sole source of workspace
+// identity for a child pane. Herdr's --workspace flag selects the tab, but it
+// does not rewrite the shell environment inherited by that tab. Keep the
+// identity values last so a stale operator export or caller-provided value
+// cannot route callbacks and receipts to another repository.
+//
+// HERD_WORKSPACE_OVERRIDE_IGNORED is durable child evidence that an inherited
+// HERD_WORKSPACE was present and deliberately superseded.
+func bindChildWorkspaceEnv(root, workspace string, env []string) []string {
+	root = strings.TrimSpace(root)
+	workspace = strings.TrimSpace(workspace)
+	bound := append([]string(nil), env...)
+	ignored := strings.TrimSpace(os.Getenv("HERD_WORKSPACE"))
+	for _, entry := range env {
+		key, value, ok := strings.Cut(entry, "=")
+		if ok && key == "HERD_WORKSPACE" && strings.TrimSpace(value) != "" {
+			ignored = strings.TrimSpace(value)
+		}
+	}
+	bound = append(bound,
+		"HERD_ROOT="+root,
+		"HERD_WORKSPACE="+workspace,
+		"HERDR_WORKSPACE_ID="+workspace,
+		childWorkspaceSourceEnv+"=launch-target",
+	)
+	if ignored != "" {
+		bound = append(bound, childWorkspaceOverrideIgnored+"="+ignored)
+	}
+	return bound
+}
+
 // TabForAgent creates an agent pane WITHOUT a task worktree cwd (standing
 // agents, pulse/review/forge spawns). It still carries the agent role
 // marker so every agent-facing pane is uniformly marked (FAC-145).
@@ -1096,9 +1132,9 @@ func TabCreateForTask(workspaceID, label, cwd string, noFocus bool, env ...strin
 		Label:     label,
 		Cwd:       abs,
 		NoFocus:   noFocus,
-		// FAC-145 role marker first; caller env (FAC-190 PATH wrapper) after,
-		// so a caller-supplied value still wins under last-wins env semantics.
-		Env: append([]string{AgentRoleEnv}, env...),
+		// FAC-145 role marker first; caller env (FAC-190 PATH wrapper) follows,
+		// then bindChildWorkspaceEnv appends the launch identity last.
+		Env: bindChildWorkspaceEnv(abs, workspaceID, append([]string{AgentRoleEnv}, env...)),
 	}
 	if HostedUIDIsolationRequired() {
 		bUID, err := BuilderUID()
@@ -1879,7 +1915,7 @@ func TabCreateForTaskEnv(workspaceID, label, cwd string, env []string, noFocus b
 		Workspace: workspaceID,
 		Label:     label,
 		Cwd:       abs,
-		Env:       append([]string(nil), env...),
+		Env:       bindChildWorkspaceEnv(abs, workspaceID, env),
 		NoFocus:   noFocus,
 	}
 	if HostedUIDIsolationRequired() {
