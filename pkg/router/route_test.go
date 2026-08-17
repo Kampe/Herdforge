@@ -628,7 +628,17 @@ func TestKimiIsARealLaunchableVendorHarness(t *testing.T) {
 		t.Fatal("kimi must not be admitted as a Herdr lane until the server supports its kind")
 	}
 	argv := ArgvFor("kimi", "", "medium")
-	if len(argv) != 2 || argv[0] != "kimi" || argv[1] != "--auto" {
+	if len(argv) != 2 || argv[0] != "kimi" {
+		t.Fatalf("kimi argv=%v, want kimi --auto", argv)
+	}
+	hasAuto := false
+	for _, arg := range argv {
+		if arg == "--auto" {
+			hasAuto = true
+			break
+		}
+	}
+	if !hasAuto {
 		t.Fatalf("kimi argv=%v, want kimi --auto", argv)
 	}
 }
