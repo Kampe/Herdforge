@@ -2167,18 +2167,7 @@ func runReview() {
 		// the receipt-gated broker's TYPED reviewer-only operation — free
 		// text can never carry verdict authority.
 		testCmd := scopedTestCommand(worktreeDir)
-		reviewPacket := fmt.Sprintf(`REVIEW %s — verdict ONLY, edit nothing.
-REPORT_TARGET: review-harvest-supervisor (mandatory; never coordinator)
-REPORT_CONTRACT: retain the signed verdict artifact in the Herdforge review inbox before pane teardown. The supervisor owns exact-SHA admission, reviewer retries, author feedback, ledger ingest, and cleanup. The coordinator receives only exact PASS plus merge-ready evidence.
-	cd %s
-1. git diff origin/main..HEAD --stat  (see ONLY the changed files — review just these)
-2. %s   (targeted tests for the changed packages, not the whole repo)
-File your verdict through the broker (typed, receipt-bound):
-  herd task verdict %s APPROVED
-  herd task verdict %s REJECTED "<numbered fixes>"
-	Do not read the whole codebase. Do not run the full suite. Change nothing. Do not use repository bin/herd-* orchestration scripts.`,
-			task.Ref, worktreeDir, testCmd, task.Ref, task.Ref)
-
+		reviewPacket := reviewSpawnPacket(cfg, task, worktreeDir, testCmd)
 		// An undelivered review packet is a BLOCKED review, not a warning.
 		if _, err := herdr.AgentPrompt(targetLabel, reviewPacket, false); err != nil {
 			life.fail("failed to deliver review packet (FAC-145 BLOCKED): %v", err)
@@ -2193,6 +2182,24 @@ File your verdict through the broker (typed, receipt-bound):
 		os.Exit(1)
 	}
 	fmt.Printf("  -> moved card [%s] to 'in-review' status\n", task.Ref)
+}
+
+func reviewSpawnPacket(cfg *config.Config, task *provider.Task, worktreeDir, testCmd string) string {
+	supervisor := standing.AgentName("review-supervisor")
+	if lane := findReviewSupervisorLane(cfg); lane != nil && strings.TrimSpace(lane.Name) != "" {
+		supervisor = standing.AgentName(lane.Name)
+	}
+	return fmt.Sprintf(`REVIEW %s — verdict ONLY, edit nothing.
+REPORT_TARGET: %s (mandatory; never coordinator)
+REPORT_CONTRACT: retain the signed verdict artifact in the Herdforge review inbox before pane teardown. The supervisor owns exact-SHA admission, reviewer retries, author feedback, ledger ingest, and cleanup. The coordinator receives only exact PASS plus merge-ready evidence.
+	cd %s
+1. git diff origin/main..HEAD --stat  (see ONLY the changed files — review just these)
+2. %s   (targeted tests for the changed packages, not the whole repo)
+File your verdict through the broker (typed, receipt-bound):
+  herd task verdict %s APPROVED
+  herd task verdict %s REJECTED "<numbered fixes>"
+	Do not read the whole codebase. Do not run the full suite. Change nothing. Do not use repository bin/herd-* orchestration scripts.`,
+		task.Ref, supervisor, worktreeDir, testCmd, task.Ref, task.Ref)
 }
 
 // waitForReviewerPaneCwd closes the create/readback race in Herdr: tab create
