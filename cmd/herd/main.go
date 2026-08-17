@@ -2558,13 +2558,6 @@ func requireLiveLease(ctx context.Context, root string, tc dispatch.TaskContext)
 		return fmt.Errorf("fence read failed — refusing unfenced authority (FAC-145): %w", err)
 	}
 	key := claim.LeaseKey{Repo: tc.Repository, Provider: tc.ProviderType, Project: tc.ProjectID, TaskRef: tc.LeaseTaskRef}
-	latestGeneration, err := st.PeekLatestGeneration(ctx, key)
-	if err != nil {
-		return fmt.Errorf("lease high-water read failed — refusing unfenced authority (FAC-145): %w", err)
-	}
-	if latestGeneration > tc.LeaseGeneration {
-		return fmt.Errorf("no ACTIVE lease for %s and durable lease generation %d exceeds receipt generation %d — stale authority refused (FAC-145)", tc.TaskRef, latestGeneration, tc.LeaseGeneration)
-	}
 	var live *claim.Lease
 	for i := range leases {
 		if leases[i].LeaseKey == key {
@@ -2573,6 +2566,13 @@ func requireLiveLease(ctx context.Context, root string, tc dispatch.TaskContext)
 		}
 	}
 	if live == nil {
+		latestGeneration, err := st.PeekLatestGeneration(ctx, key)
+		if err != nil {
+			return fmt.Errorf("lease high-water read failed — refusing unfenced authority (FAC-145): %w", err)
+		}
+		if latestGeneration > tc.LeaseGeneration {
+			return fmt.Errorf("no ACTIVE lease (no live lease) for %s and durable lease generation %d exceeds receipt generation %d — stale authority refused (FAC-145)", tc.TaskRef, latestGeneration, tc.LeaseGeneration)
+		}
 		// A worker's claim is normally released when its build finishes. The
 		// signed, unexpired receipt plus the discovered candidate authorizes a
 		// fresh review-scoped lease; it never revives the worker lease and does
