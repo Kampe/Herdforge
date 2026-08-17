@@ -7117,6 +7117,10 @@ func runVerify() {
 	}
 
 	var c *verifier.CompletionCheck
+	// Keep the candidate identity used by persisted receipts. Re-reading HEAD
+	// after the commands finish can observe a concurrent movement and publish
+	// a callback for a different candidate than the one actually verified.
+	verifiedCandidateSHA := ""
 
 	// FAC-145: a worktree carrying a launch receipt reports its verify
 	// outcome as a receipt-bound callback, so the worker FAIL signal travels
@@ -7187,6 +7191,7 @@ func runVerify() {
 				CandidateSHA: sha, BaseSHA: baseSHA, EnvironmentPolicy: verifier.EnvironmentPolicyInherited,
 				Artifacts: []string{"profile:" + verificationProfileName},
 			}
+			verifiedCandidateSHA = req.CandidateSHA
 			preflightPassed := true
 			if preflightCommand != "" {
 				preReceipt, preErr := verifier.NewVerifier(preflightCommand).VerifyAndPersist(context.Background(), wt, req, store)
@@ -7217,9 +7222,11 @@ func runVerify() {
 			kind = mail.CallbackBlocked
 			detail = strings.Join(c.Reasons, "; ")
 		}
-		sha := ""
-		if out, hErr := exec.Command("git", "-C", wt, "rev-parse", "HEAD").Output(); hErr == nil {
-			sha = strings.TrimSpace(string(out))
+		sha := verifiedCandidateSHA
+		if sha == "" {
+			if out, hErr := exec.Command("git", "-C", wt, "rev-parse", "HEAD").Output(); hErr == nil {
+				sha = strings.TrimSpace(string(out))
+			}
 		}
 		// FAC-145: a verify whose bound callback cannot be raised has a
 		// broken evidence chain — that is a hard failure, never a warning.
