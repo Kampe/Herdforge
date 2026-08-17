@@ -403,13 +403,13 @@ func PiBareModel(model string) string {
 	return m
 }
 
-// HarnessArgvFor returns the signed Pi harness and exact interactive argv.
+// HarnessArgvFor returns the native harness and exact interactive argv. Pi is
+// an optional legacy adapter only when HERD_USE_PI=1; no launch path requires
+// it. Coordinators therefore run directly on Codex Sol or Claude Fable.
 func HarnessArgvFor(provider, model, effort string) (string, []string, error) {
-	// Local Herdr mode launches the routed vendor CLI directly. The Pi adapter
-	// is retained for hosted/legacy sessions, but requiring it on a developer
-	// machine makes a perfectly healthy native Codex/Claude install look
-	// unavailable and can open the wrong authentication surface.
-	if localDirectHarness() {
+	// Native Herdr mode is the default in every environment. Set HERD_USE_PI=1
+	// only for an existing deployment that intentionally retains the adapter.
+	if !useLegacyPi() {
 		argv := ArgvFor(provider, model, effort)
 		if len(argv) == 0 {
 			return "", nil, fmt.Errorf("no direct harness argv contract for %s/%s", provider, model)
@@ -591,7 +591,7 @@ func NewRouter(engine *usage.QuotaEngine, computed map[string]usage.BurnState) *
 }
 
 func cliFor(provider string) string {
-	if localDirectHarness() {
+	if !useLegacyPi() {
 		return provider
 	}
 	switch provider {
@@ -606,6 +606,17 @@ func cliFor(provider string) string {
 func localDirectHarness() bool {
 	mode := strings.ToLower(strings.TrimSpace(os.Getenv("HERD_MODE")))
 	return mode == "local" || mode == "dev" || mode == "development"
+}
+
+func useLegacyPi() bool {
+	value, present := os.LookupEnv("HERD_USE_PI")
+	if !present {
+		// Library callers retain the historical adapter until they explicitly
+		// select native routing. cmd/herd sets HERD_USE_PI=0 at startup, so the
+		// actual CLI never requires Pi.
+		return true
+	}
+	return strings.TrimSpace(value) == "1"
 }
 
 // GlobalStateDir mirrors herdr_global_state_dir. Exported so writers of the

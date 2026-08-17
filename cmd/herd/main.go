@@ -84,6 +84,9 @@ func main() {
 	if _, set := os.LookupEnv("HERD_MODE"); !set && strings.TrimSpace(os.Getenv("HERD_CONTROL_SECRET")) == "" {
 		_ = os.Setenv("HERD_MODE", "local")
 	}
+	if _, set := os.LookupEnv("HERD_USE_PI"); !set {
+		_ = os.Setenv("HERD_USE_PI", "0")
+	}
 	if len(os.Args) < 2 {
 		printUsage()
 		os.Exit(0)
