@@ -252,13 +252,13 @@ func (o *Options) setDefaults() {
 		o.StateDir = strings.TrimSpace(os.Getenv(EnvFeedbackDir))
 	}
 	if strings.TrimSpace(o.StateDir) == "" {
-		o.StateDir = filepath.Join(posture.StateDir(), "feedback")
+		o.StateDir = filepath.Join(defaultFleetStateDir(o.RepoRoot), "feedback")
 	}
 	if strings.TrimSpace(o.MailDir) == "" {
 		o.MailDir = strings.TrimSpace(os.Getenv(EnvMailDir))
 	}
 	if strings.TrimSpace(o.MailDir) == "" {
-		o.MailDir = filepath.Join(posture.StateDir(), "mail")
+		o.MailDir = filepath.Join(defaultFleetStateDir(o.RepoRoot), "mail")
 	}
 	if strings.TrimSpace(o.WindDown) == "" {
 		o.WindDown = strings.TrimSpace(os.Getenv(EnvWindDown))
@@ -284,6 +284,35 @@ func (o *Options) setDefaults() {
 	if o.Stderr == nil {
 		o.Stderr = os.Stderr
 	}
+}
+
+// defaultFleetStateDir mirrors the shell fleet's repo-scoped default. A Go
+// binary launched from a foreign repository must not silently write control
+// mail under Herdforge's own state namespace, because the repository's
+// coordinator and supervisors read the namespace derived from that repo.
+// HERD_STATE_DIR remains the explicit cross-repo override and is handled by
+// posture.StateDir.
+func defaultFleetStateDir(repoRoot string) string {
+	if strings.TrimSpace(os.Getenv("HERD_STATE_DIR")) != "" {
+		return posture.StateDir()
+	}
+	abs, err := filepath.Abs(repoRoot)
+	if err != nil {
+		return posture.StateDir()
+	}
+	repoName := strings.ToLower(strings.TrimSpace(filepath.Base(abs)))
+	if repoName == "" || repoName == "." || repoName == "herdforge" {
+		return posture.StateDir()
+	}
+	base := strings.TrimSpace(os.Getenv("XDG_STATE_HOME"))
+	if base == "" {
+		home, homeErr := os.UserHomeDir()
+		if homeErr != nil || strings.TrimSpace(home) == "" {
+			return posture.StateDir()
+		}
+		base = filepath.Join(home, ".local", "state")
+	}
+	return filepath.Join(base, repoName, "herd")
 }
 
 // Selftest verifies the load-bearing commitments this port must preserve:

@@ -15,6 +15,24 @@ import (
 	"github.com/Kampe/Herdforge/pkg/winddown"
 )
 
+func TestDefaultFleetStateDirScopesForeignRepo(t *testing.T) {
+	t.Setenv("HERD_STATE_DIR", "")
+	t.Setenv("XDG_STATE_HOME", filepath.Join(t.TempDir(), "state"))
+	got := defaultFleetStateDir(filepath.Join("/tmp", "chainseer"))
+	want := filepath.Join(os.Getenv("XDG_STATE_HOME"), "chainseer", "herd")
+	if got != want {
+		t.Fatalf("foreign repo state dir=%q, want %q", got, want)
+	}
+}
+
+func TestDefaultFleetStateDirHonorsExplicitOverride(t *testing.T) {
+	override := filepath.Join(t.TempDir(), "shared-herd-state")
+	t.Setenv("HERD_STATE_DIR", override)
+	if got := defaultFleetStateDir(filepath.Join("/tmp", "chainseer")); got != override {
+		t.Fatalf("state override=%q, want %q", got, override)
+	}
+}
+
 func TestMissingIsSetDifferenceAndDeterministic(t *testing.T) {
 	got := Missing([]string{"smith", "scout", "assayer"}, []string{"scout"})
 	want := []string{"assayer", "smith"}
@@ -388,13 +406,13 @@ func TestCensusTickInterval(t *testing.T) {
 		tickSec int
 		want    int
 	}{
-		{15, 120},  // 30 min / 15 s = 120 ticks (default forge loop)
-		{30, 60},   // 30 min / 30 s = 60 ticks
-		{60, 30},   // 30 min / 60 s = 30 ticks
-		{1800, 1},  // tick == census interval → every tick
-		{3600, 1},  // tick > census interval → clamp to 1
-		{0, 1},     // non-positive → clamp to 1
-		{-5, 1},    // negative → clamp to 1
+		{15, 120}, // 30 min / 15 s = 120 ticks (default forge loop)
+		{30, 60},  // 30 min / 30 s = 60 ticks
+		{60, 30},  // 30 min / 60 s = 30 ticks
+		{1800, 1}, // tick == census interval → every tick
+		{3600, 1}, // tick > census interval → clamp to 1
+		{0, 1},    // non-positive → clamp to 1
+		{-5, 1},   // negative → clamp to 1
 	}
 	for _, c := range cases {
 		got := CensusTickInterval(c.tickSec)
