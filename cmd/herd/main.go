@@ -5360,7 +5360,10 @@ func laneLaunchDecisionWithProbe(ctx context.Context, lane *config.LaneDef, task
 			return nil, fmt.Errorf("%w: lane %q harness %q binary not found in $PATH — install %s or provision the harness before raising lanes", ErrHarnessBinaryMissing, lane.Name, harness, harness)
 		}
 	}
-	role := router.Role(lane.Role)
+	role, err := nativeLaunchRole(lane)
+	if err != nil {
+		return nil, err
+	}
 	shape := strings.TrimSpace(lane.TaskShape)
 	if shape == "" {
 		return nil, fmt.Errorf("lane %q has no authoritative task_shape", lane.Name)
@@ -5492,16 +5495,59 @@ func laneLaunchDecisionWithProbe(ctx context.Context, lane *config.LaneDef, task
 	return decision, nil
 }
 
+func nativeLaunchRole(lane *config.LaneDef) (router.Role, error) {
+	if lane == nil {
+		return "", fmt.Errorf("launch route requires a configured lane")
+	}
+	role := strings.TrimSpace(lane.Role)
+	if role == "" {
+		return "", fmt.Errorf("lane %q has no role", lane.Name)
+	}
+	if lane.StandingRolePolicy == nil {
+		return router.Role(role), nil
+	}
+	if !lane.Standing {
+		return "", fmt.Errorf("%w: lane %q declares standing_role_policy but is not standing", ErrWorkerConfigPolicy, lane.Name)
+	}
+	native := strings.TrimSpace(lane.StandingRolePolicy.NativeRole)
+	if !knownLaunchRole(native) {
+		return "", fmt.Errorf("%w: lane %q standing role %q maps to unknown native role %q", ErrWorkerConfigPolicy, lane.Name, role, native)
+	}
+	if knownLaunchRole(role) {
+		return "", fmt.Errorf("%w: lane %q canonical role %q cannot declare standing_role_policy", ErrWorkerConfigPolicy, lane.Name, role)
+	}
+	return router.Role(native), nil
+}
+
+func knownLaunchRole(role string) bool {
+	switch router.Role(strings.TrimSpace(role)) {
+	case router.RoleWorker, router.RoleForgeSmith, router.RoleRecovery,
+		router.RoleReviewer, router.RoleAssayer, router.RoleOrchestrator,
+		router.RoleScoutPlanner, router.RoleVerificationGate,
+		router.RoleReviewSupervisor, router.RoleHarvest, router.RoleRecoverySentinel:
+		return true
+	default:
+		return false
+	}
+}
+
 func validateLaneLaunchConfig(lane *config.LaneDef) error {
+	if lane == nil {
+		return fmt.Errorf("lane launch config is required")
+	}
 	role := strings.TrimSpace(lane.Role)
 	if role == "" || strings.TrimSpace(lane.AgentKind) == "" || strings.TrimSpace(lane.Provider) == "" || strings.TrimSpace(lane.Model) == "" || strings.TrimSpace(lane.Harness) == "" || strings.TrimSpace(lane.Effort) == "" || strings.TrimSpace(lane.TaskShape) == "" {
 		return fmt.Errorf("lane %q has incomplete launch authority", lane.Name)
 	}
+	nativeRole, roleErr := nativeLaunchRole(lane)
+	if roleErr != nil {
+		return roleErr
+	}
 	expectedShapes := map[string]string{launch.WorkerRole: "implementation", launch.ForgeSmithRole: "implementation", launch.RecoveryRole: "implementation", launch.ReviewerRole: "qa", launch.AssayerRole: "qa", launch.OrchestratorRole: "coordinator", launch.ScoutPlannerRole: "architecture", launch.VerificationGateRole: "bounded", launch.ReviewSupervisorRole: "coordinator", launch.HarvestRole: "bounded", launch.RecoverySentinelRole: "bounded"}
-	if expected, ok := expectedShapes[role]; ok && lane.TaskShape != expected {
+	if expected, ok := expectedShapes[string(nativeRole)]; ok && lane.TaskShape != expected {
 		return fmt.Errorf("%w: lane %q has invalid task_shape %q for role %q", ErrWorkerConfigPolicy, lane.Name, lane.TaskShape, role)
 	}
-	if _, ok := expectedShapes[role]; !ok && !knownLaneTaskShape(lane.TaskShape) {
+	if _, ok := expectedShapes[string(nativeRole)]; !ok && !knownLaneTaskShape(lane.TaskShape) {
 		return fmt.Errorf("%w: lane %q has invalid task_shape %q for role %q", ErrWorkerConfigPolicy, lane.Name, lane.TaskShape, role)
 	}
 	agentKind := strings.ToLower(strings.TrimSpace(lane.AgentKind))
@@ -5509,7 +5555,7 @@ func validateLaneLaunchConfig(lane *config.LaneDef) error {
 	if agentKind != harness || !supportedVendorHarness(harness) {
 		return fmt.Errorf("%w: lane %q agent kind %q harness %q must match one supported vendor harness (codex, claude, grok, agy, opencode)", ErrHarnessConfigPolicy, lane.Name, lane.AgentKind, lane.Harness)
 	}
-	if role == launch.WorkerRole || role == launch.ForgeSmithRole || role == launch.RecoveryRole {
+	if nativeRole == launch.WorkerRole || nativeRole == launch.ForgeSmithRole || nativeRole == launch.RecoveryRole {
 		if lane.Provider == launch.WorkerProvider {
 			if lane.Model != launch.WorkerModel || lane.Effort != launch.WorkerEffort {
 				return fmt.Errorf("%w: lane %q codex workers must use codex/gpt-5.6-luna/medium", ErrWorkerConfigPolicy, lane.Name)
