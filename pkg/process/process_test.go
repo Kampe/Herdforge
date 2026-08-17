@@ -57,6 +57,18 @@ func TestClassify(t *testing.T) {
 	}
 }
 
+func TestProviderExhaustionReason(t *testing.T) {
+	if got := ProviderExhaustionReason("OpenCode: weekly quota exceeded; retry later"); got == "" {
+		t.Fatal("quota failure was not detected")
+	}
+	if got := ProviderExhaustionReason("OpenCode: out of quota until reset"); got == "" {
+		t.Fatal("out-of-quota failure was not detected")
+	}
+	if got := ProviderExhaustionReason("CONFIRMED: the rate limit exceeded path is covered"); got != "" {
+		t.Fatalf("review prose classified as provider failure: %q", got)
+	}
+}
+
 func TestActionFor(t *testing.T) {
 	tests := []struct {
 		c               Classification

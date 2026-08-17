@@ -180,6 +180,27 @@ func (s *Store) Grant(ctx context.Context, id string, cap Capability, operator s
 	return s.replace(ctx, *p)
 }
 
+// Revoke removes every active grant for one requested capability. It never
+// changes the plan binding or requested capability set, so a later grant is a
+// new attributable operator decision rather than a silent renewal.
+func (s *Store) Revoke(ctx context.Context, id string, cap Capability) (*Plan, error) {
+	p, err := s.Load(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	if !requested(p.Requests, cap) {
+		return nil, fmt.Errorf("%w: %s", ErrUnplanned, cap)
+	}
+	grants := p.Grants[:0]
+	for _, grant := range p.Grants {
+		if grant.Capability != cap {
+			grants = append(grants, grant)
+		}
+	}
+	p.Grants = grants
+	return s.replace(ctx, *p)
+}
+
 // Authorize is the sole action gate.  The caller supplies freshly observed
 // FAC-235 binding; any drift, expiry, unplanned action, or missing grant fails.
 func (s *Store) Authorize(ctx context.Context, id string, live Binding, cap Capability, now time.Time) error {

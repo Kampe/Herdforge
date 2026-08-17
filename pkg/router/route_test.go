@@ -143,7 +143,7 @@ func TestEffortForTable(t *testing.T) {
 func TestWaterfallTables(t *testing.T) {
 	clearRouteEnv(t)
 	want := map[string][]string{
-		"coordinator":    {"codex", "claude"},
+		"coordinator":    {"codex", "claude", "grok"},
 		"architecture":   {"claude", "agy", "codex", "grok", "ollama", "lazer"},
 		"implementation": {"claude", "grok", "codex", "ollama", "agy", "lazer"},
 		"research":       {"claude", "agy", "ollama", "grok", "codex", "lazer"},
@@ -474,9 +474,9 @@ func TestArgvContracts(t *testing.T) {
 		want    []string
 	}{
 		{"claude", "claude-fable-5", "medium",
-			[]string{"claude", "--mcp-config", "{}", "--strict-mcp-config", "--disable-slash-commands", "--disallowed-tools", "Agent", "Task", "ToolSearch", "--model", "claude-fable-5", "--effort", "medium", "--fallback-model", "claude-sonnet-5"}},
+			[]string{"claude", "--mcp-config", `{"mcpServers":{}}`, "--strict-mcp-config", "--disable-slash-commands", "--disallowed-tools", "Agent", "Task", "ToolSearch", "--model", "claude-fable-5", "--effort", "medium", "--fallback-model", "claude-sonnet-5"}},
 		{"claude", "claude-sonnet-5", "high",
-			[]string{"claude", "--mcp-config", "{}", "--strict-mcp-config", "--disable-slash-commands", "--disallowed-tools", "Agent", "Task", "ToolSearch", "--model", "claude-sonnet-5", "--effort", "high"}},
+			[]string{"claude", "--mcp-config", `{"mcpServers":{}}`, "--strict-mcp-config", "--disable-slash-commands", "--disallowed-tools", "Agent", "Task", "ToolSearch", "--model", "claude-sonnet-5", "--effort", "high"}},
 		{"codex", "gpt-5.6-luna", "xhigh",
 			[]string{"codex", "--disable", "multi_agent", "--disable", "multi_agent_v2", "--model", "gpt-5.6-luna", "-c", "model_reasoning_effort=high", "-a", "never", "-c", "mcp_servers.code-review-graph={command=\"false\",enabled=false}"}},
 		{"grok", "grok-4.5", "max",
@@ -604,6 +604,19 @@ func TestPiModelForConfiguredFleet(t *testing.T) {
 				t.Fatalf("PiModelFor(%s,%s) accepted, want error", tc.provider, tc.model)
 			}
 		})
+	}
+}
+
+func TestKimiIsARealLaunchableVendorHarness(t *testing.T) {
+	if IsVendorHarness("kimi") {
+		t.Fatal("kimi must not be admitted as a Herdr vendor harness until the server supports its kind")
+	}
+	if IsLaneLaunchable("kimi") {
+		t.Fatal("kimi must not be admitted as a Herdr lane until the server supports its kind")
+	}
+	argv := ArgvFor("kimi", "", "medium")
+	if len(argv) != 2 || argv[0] != "kimi" || argv[1] != "--auto" {
+		t.Fatalf("kimi argv=%v, want kimi --auto", argv)
 	}
 }
 

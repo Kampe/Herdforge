@@ -3,6 +3,7 @@ package next
 import (
 	"context"
 	"os"
+	"strings"
 	"testing"
 )
 
@@ -38,6 +39,24 @@ func TestEval_VerdictArtifacts(t *testing.T) {
 	}
 }
 
+func TestPreviewClaimQueueSeparatesProvenanceBlocked(t *testing.T) {
+	cfg := testConfig()
+	tasks := []testTask{
+		{ref: "FAC-9", status: "to-do", priority: "urgent", description: "missing fence"},
+		{ref: "FAC-10", status: "to-do", priority: "high", description: "```herd-deps-v1\n{\"version\":1,\"task_ref\":\"FAC-10\",\"task_id\":\"t10\",\"edges\":[]}\n```"},
+	}
+	preview, err := PreviewClaimQueue(context.Background(), newTestProvider(tasks), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if preview.Claimable != 1 || preview.ProvenanceBlocked != 1 || len(preview.BlockedRefs) != 1 || preview.BlockedRefs[0] != "FAC-9" {
+		t.Fatalf("unexpected preview: %+v", preview)
+	}
+	if !strings.Contains(preview.Description(), "FAC-9") {
+		t.Fatalf("description omitted blocked ref: %s", preview.Description())
+	}
+}
+
 func TestEval_ReviewAtCap(t *testing.T) {
 	cfg := testConfig()
 	// 3 tasks in review hits the cap of 3
@@ -66,8 +85,8 @@ func TestEval_NeedReview(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if act.Type != ActionNeed {
-		t.Errorf("expected ActionNeed with in-progress tasks, got %s", act.Type)
+	if act.Type != ActionClaim {
+		t.Errorf("expected ActionClaim when in-progress task has no candidate SHA, got %s", act.Type)
 	}
 }
 

@@ -819,6 +819,38 @@ func TestPlanDoesNotOpenReviewForAwaitingVerdictOrBusyOrEmpty(t *testing.T) {
 	}
 }
 
+func TestPlanKeepsPacketPendingIdleLane(t *testing.T) {
+	obs := healthyObs()
+	obs.Herdr.Agents = []AgentObservation{{
+		Name: "packet-pending", Raw: "idle", Status: StatusHealthyIdle,
+		CommittedWork: true, PacketPending: true, TicketDone: true,
+		TabID: "tab-packet", Workspace: "w", PaneID: "pane-packet",
+	}}
+	plan, err := Plan(obs, Options{Act: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, action := range plan.Actions {
+		if action.Target == "tab-packet" && (action.Kind == ActionReapLane || action.Kind == ActionOpenReview) {
+			t.Fatalf("packet-pending lane was acted on: %+v", action)
+		}
+	}
+	obs.Herdr.Agents[0].PacketPending = false
+	plan, err = Plan(obs, Options{Act: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, action := range plan.Actions {
+		if action.Target == "tab-packet" && action.Kind == ActionReapLane {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("clearing PacketPending must make the done lane reap-eligible")
+	}
+}
+
 func TestPlanObserveOpenReviewIsWouldRunNotSafe(t *testing.T) {
 	snap, err := Plan(finishedObs(), Options{Now: fixedNow})
 	if err != nil {

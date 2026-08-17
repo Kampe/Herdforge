@@ -16,6 +16,28 @@ import (
 	"github.com/Kampe/Herdforge/pkg/winddown"
 )
 
+func TestPulseReviewPacketRoutesToSupervisor(t *testing.T) {
+	packet := pulseReviewPacket(pulse.AgentObservation{Name: "api-crusader", TabID: "wB:t2WF", Workspace: "wB"})
+	if !strings.Contains(packet, "PULSE REVIEW HANDOFF") || !strings.Contains(packet, "wB:t2WF") {
+		t.Fatalf("packet lacks exact lane identity: %s", packet)
+	}
+	if !strings.Contains(packet, "reviewer dispatch, retries, verdict ingest") || !strings.Contains(packet, "Do not ask the coordinator") {
+		t.Fatalf("packet does not assign review lifecycle to supervisor: %s", packet)
+	}
+}
+
+func TestFilterPulseAgentsWorkspace(t *testing.T) {
+	agents := []herdr.AgentEntry{
+		{Name: "herdforge-worker", Workspace: "wK"},
+		{Name: "chainseer-worker", Workspace: "wB"},
+		{Name: "unknown-workspace"},
+	}
+	got := filterPulseAgentsWorkspace(agents, "wK")
+	if len(got) != 1 || got[0].Name != "herdforge-worker" {
+		t.Fatalf("workspace filter returned %#v", got)
+	}
+}
+
 // TestLeaseDBPathDefaultsToProductionLaunchClaims is the non-vacuous guard for
 // review HIGH #2: a wrong default (.herd/leases.db) silently empties renewals.
 func TestLeaseDBPathDefaultsToProductionLaunchClaims(t *testing.T) {

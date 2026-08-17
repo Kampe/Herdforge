@@ -151,3 +151,31 @@ func TestIdentityFromDecision(t *testing.T) {
 	// Avoid importing full router Decide; construct minimal decision-like fields
 	// via IdentityFromDecision requires *router.LaunchDecision — tested in launch package.
 }
+
+func TestRecipeCommandUsesNativeCodexForCodexLane(t *testing.T) {
+	name, args, err := recipeCommand(Identity{Provider: "codex", Model: "gpt-5.6-luna", Harness: "codex", Recipe: RecipeArtifactWrite, Toolchain: ToolchainV1}, "create sentinel")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if name != "codex" {
+		t.Fatalf("probe executable = %q, want codex", name)
+	}
+	for _, arg := range args {
+		if arg == "pi" {
+			t.Fatal("native Codex probe must not invoke pi")
+		}
+	}
+	if len(args) == 0 || args[0] != "exec" {
+		t.Fatalf("codex probe args = %#v, want exec invocation", args)
+	}
+}
+
+func TestRecipeCommandKeepsLegacyPiExplicit(t *testing.T) {
+	name, _, err := recipeCommand(Identity{Provider: "codex", Model: "gpt-5.6-luna", Harness: "pi", Recipe: RecipeArtifactWrite, Toolchain: ToolchainV1}, "create sentinel")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if name != "pi" {
+		t.Fatalf("legacy probe executable = %q, want pi", name)
+	}
+}

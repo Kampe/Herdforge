@@ -59,12 +59,15 @@ const (
 // Evidence is every input behind one surface's cap, kept verbatim so a
 // persisted decision can be audited without re-running the supervisor.
 type Evidence struct {
-	Capacity      Capacity        `json:"capacity"`
-	BurnClass     usage.BurnClass `json:"burn_class,omitempty"`
-	LedgerReason  string          `json:"ledger_reason,omitempty"`
-	UsedPct       float64         `json:"used_pct"`
-	Window        string          `json:"window,omitempty"`
-	RunwayMinutes *int            `json:"runway_minutes,omitempty"`
+	Capacity      Capacity          `json:"capacity"`
+	BurnClass     usage.BurnClass   `json:"burn_class,omitempty"`
+	LedgerReason  string            `json:"ledger_reason,omitempty"`
+	UsedPct       float64           `json:"used_pct"`
+	Window        string            `json:"window,omitempty"`
+	ResetAt       string            `json:"reset_at,omitempty"`
+	WindowSeconds int               `json:"window_seconds,omitempty"`
+	Windows       []usage.BurnState `json:"windows,omitempty"`
+	RunwayMinutes *int              `json:"runway_minutes,omitempty"`
 	// SourceAt is when the quota provider generated the reading, NOT when the
 	// supervisor ran. Recording the supervisor's own clock here would make
 	// every observation look fresh no matter how stale the ledger is.
@@ -74,20 +77,22 @@ type Evidence struct {
 	// Cooldown is the routing store's own reason string, verbatim. The
 	// expiry is deliberately not mirrored here: the router owns when a cool
 	// lifts, and a second copy of that deadline is a second thing to drift.
-	Cooldown string   `json:"cooldown,omitempty"`
-	Active   int      `json:"active_agents"`
-	Models   []string `json:"models,omitempty"`
+	Cooldown       string   `json:"cooldown,omitempty"`
+	Active         int      `json:"active_agents"`
+	Models         []string `json:"models,omitempty"`
+	ProviderErrors []string `json:"provider_errors,omitempty"`
 }
 
 // Observation is the raw evidence gathered for one surface, before grading.
 type Observation struct {
 	Surface Surface
 	// Burn is the ledger row for this exact pool. Nil means no row at all.
-	Burn     *usage.BurnState
-	SourceAt time.Time
-	Cooldown string
-	Active   int
-	Models   []string
+	Burn           *usage.BurnState
+	SourceAt       time.Time
+	Cooldown       string
+	Active         int
+	Models         []string
+	ProviderErrors []string
 }
 
 // Grade classifies a raw observation at the supplied instant.
@@ -99,20 +104,29 @@ func (o Observation) Grade(now time.Time, warnRunwayMinutes int, maxAge time.Dur
 		maxAge = DefaultMaxObservationAge
 	}
 	e := Evidence{
-		Capacity: Classify(o.Burn, warnRunwayMinutes),
-		SourceAt: o.SourceAt,
-		Cooldown: strings.TrimSpace(o.Cooldown),
-		Active:   o.Active,
-		Models:   append([]string(nil), o.Models...),
+		Capacity:       Classify(o.Burn, warnRunwayMinutes),
+		SourceAt:       o.SourceAt,
+		Cooldown:       strings.TrimSpace(o.Cooldown),
+		Active:         o.Active,
+		Models:         append([]string(nil), o.Models...),
+		ProviderErrors: append([]string(nil), o.ProviderErrors...),
 	}
 	sort.Strings(e.Models)
+	sort.Strings(e.ProviderErrors)
 	if o.Burn != nil {
 		e.BurnClass = o.Burn.Class
 		e.LedgerReason = o.Burn.Reason
 		e.UsedPct = o.Burn.Used
 		e.Window = o.Burn.Window
+		e.ResetAt = o.Burn.ResetsAt
+		e.WindowSeconds = o.Burn.WindowSeconds
+		e.Windows = append([]usage.BurnState(nil), o.Burn.Windows...)
 		e.RunwayMinutes = o.Burn.RunwayMinutes
 		e.Stale = o.Burn.Stale
+	}
+	if len(e.ProviderErrors) > 0 {
+		e.Capacity = Exhausted
+		e.LedgerReason = "live provider error: " + strings.Join(e.ProviderErrors, "; ")
 	}
 
 	// An unset source timestamp is not "just now" — it is a reading whose
@@ -178,6 +192,9 @@ func TargetCap(e Evidence) (int, string) {
 	}
 	switch e.Capacity {
 	case Exhausted:
+		if len(e.ProviderErrors) > 0 {
+			return 0, e.LedgerReason
+		}
 		return 0, fmt.Sprintf("exhausted (%.0f%% used, window %s)", e.UsedPct, orDash(e.Window))
 	case Unknown:
 		return 0, fmt.Sprintf("UNKNOWN quota (%s, observation age %s)",

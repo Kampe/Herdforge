@@ -35,7 +35,9 @@ import (
 	"github.com/Kampe/Herdforge/pkg/control"
 	"github.com/Kampe/Herdforge/pkg/coordinator"
 	"github.com/Kampe/Herdforge/pkg/daemon"
+	"github.com/Kampe/Herdforge/pkg/deps"
 	"github.com/Kampe/Herdforge/pkg/dispatch"
+	"github.com/Kampe/Herdforge/pkg/envplan"
 	"github.com/Kampe/Herdforge/pkg/feedback"
 	"github.com/Kampe/Herdforge/pkg/harvest"
 	"github.com/Kampe/Herdforge/pkg/herdr"
@@ -77,6 +79,14 @@ import (
 const version = "0.2.0-dev"
 
 func main() {
+	// A normal checkout is a local Herdr client. Hosted control-plane behavior
+	// remains explicit via HERD_MODE=production (or HERD_CONTROL_SECRET).
+	if _, set := os.LookupEnv("HERD_MODE"); !set && strings.TrimSpace(os.Getenv("HERD_CONTROL_SECRET")) == "" {
+		_ = os.Setenv("HERD_MODE", "local")
+	}
+	if _, set := os.LookupEnv("HERD_USE_PI"); !set {
+		_ = os.Setenv("HERD_USE_PI", "0")
+	}
 	if len(os.Args) < 2 {
 		printUsage()
 		os.Exit(0)
@@ -138,6 +148,9 @@ func main() {
 	case "verify":
 		runVerify()
 
+	case "finish":
+		runFinish()
+
 	case "verify-fac151":
 		runFAC151Hermetic()
 
@@ -149,6 +162,12 @@ func main() {
 
 	case "pulse":
 		runPulse()
+
+	case "goal-guard":
+		if err := runGoalGuard(); err != nil {
+			fmt.Fprintf(os.Stderr, "goal-guard: %v\n", err)
+			os.Exit(1)
+		}
 
 	case "wind-down":
 		runWindDown()
@@ -293,6 +312,9 @@ func main() {
 			os.Exit(1)
 		}
 
+	case "legacy-receipts":
+		runLegacyReceipts()
+
 	case "up":
 		runUp()
 
@@ -316,6 +338,9 @@ func main() {
 
 	case "dispatch":
 		runDispatch()
+
+	case "envplan":
+		runEnvPlan()
 
 	case "deps":
 		runDeps()
@@ -468,6 +493,7 @@ func printUsage() {
 	fmt.Println("  cleanup    Close finished one-off agent tabs (standing fleet exempt)")
 	fmt.Println("  labels     Reconcile drifted Herdforge tab labels in place (FAC-199)")
 	fmt.Println("  forge      Full cycle: pulse worker + review + approve")
+	fmt.Println("  legacy-receipts  Audit/tombstone receiptless legacy in-progress tasks (fail-closed)")
 	fmt.Println("  standing   Raise/status/shutdown declarative standing control roles")
 	fmt.Println("  daemon     Start the long-running orchestration daemon (infinite pulse loop)")
 	fmt.Println("  usage      Show harness quota usage from OpenUsage CLI")
@@ -540,6 +566,53 @@ func runResetSafe() {
 	}
 }
 
+// initRepoDefaults makes `herd init` useful in an existing checkout. It uses
+// only repo-local metadata and falls back to the conservative Linear/Go
+// template for an otherwise empty directory.
+func initRepoDefaults() (name, repoURL, providerType, providerConfig, testCommand string) {
+	name = filepath.Base(mustGetwd())
+	if name == "." || name == string(filepath.Separator) || name == "" {
+		name = "my-herd-app"
+	}
+	// A foreign repo must be runnable immediately without inventing a remote
+	// board or prompting for credentials. Memory is an honest empty board;
+	// explicit .kaneo.json or later config can opt into a real provider.
+	providerType = "memory"
+	providerConfig = ""
+	testCommand = "go test ./..."
+	if out, err := exec.Command("git", "config", "--get", "remote.origin.url").Output(); err == nil {
+		repoURL = strings.TrimSpace(string(out))
+	}
+	if raw, err := os.ReadFile(".kaneo.json"); err == nil {
+		var link struct {
+			Project string `json:"project"`
+		}
+		if json.Unmarshal(raw, &link) == nil && strings.TrimSpace(link.Project) != "" {
+			providerType = "kaneo"
+			providerConfig = fmt.Sprintf("  enabled: [\"kaneo\"]\n  api_url: \"https://kanban-api.kampe.kluster\"\n  project_id: %q\n  use_cli: true", strings.TrimSpace(link.Project))
+		}
+	}
+	if raw, err := os.ReadFile("package.json"); err == nil {
+		var pkg struct {
+			Scripts map[string]string `json:"scripts"`
+		}
+		if json.Unmarshal(raw, &pkg) == nil {
+			if _, ok := pkg.Scripts["test"]; ok {
+				testCommand = "pnpm test"
+			}
+		}
+	}
+	return
+}
+
+func mustGetwd() string {
+	dir, err := os.Getwd()
+	if err != nil {
+		return "."
+	}
+	return dir
+}
+
 func runInit() {
 	pulseFlags := flag.NewFlagSet("init", flag.ExitOnError)
 	full := pulseFlags.Bool("full", false, "Scaffold full 3-lane forge config (smith, worker, reviewer)")
@@ -557,27 +630,31 @@ func runInit() {
 		fmt.Fprintf(os.Stderr, "failed to create .herd directory: %v\n", err)
 		os.Exit(1)
 	}
+	if _, err := initializeWinddownState(); err != nil {
+		fmt.Fprintf(os.Stderr, "failed to initialize wind-down state: %v\n", err)
+		os.Exit(1)
+	}
 
 	if _, err := os.Stat(cfgPath); err == nil {
 		fmt.Println(".herd/herd.yaml already exists.")
 		os.Exit(0)
 	}
 
-	defaultConfig := `version: "1"
+	projectName, _, taskProvider, providerConfig, testCommand := initRepoDefaults()
+	defaultConfig := fmt.Sprintf(`version: "1"
 project:
-  name: "my-herd-app"
+  name: %q
   default_branch: "main"
 
 task_provider:
-  type: "linear"
-  project_id: "your-linear-project-id"
-  api_key_env: "LINEAR_API_KEY"
+  type: %q
+%s
 
 lanes:
   - name: "worker"
     role: "worker"
-    agent_kind: "pi"
-    harness: "pi"
+    agent_kind: "codex"
+    harness: "codex"
     prompt: ".herd/prompts/worker.md"
     worktree: ".worktrees/worker"
     provider: "codex"
@@ -586,8 +663,8 @@ lanes:
     task_shape: "implementation"
 
 verification:
-  test_command: "go test ./..."
-`
+  test_command: %q
+`, projectName, taskProvider, providerConfig, testCommand)
 	if err := os.WriteFile(cfgPath, []byte(defaultConfig), 0644); err != nil {
 		fmt.Fprintf(os.Stderr, "failed to write default config: %v\n", err)
 		os.Exit(1)
@@ -607,29 +684,33 @@ func runInitFull() {
 		fmt.Fprintf(os.Stderr, "failed to create .herd directory: %v\n", err)
 		os.Exit(1)
 	}
+	if _, err := initializeWinddownState(); err != nil {
+		fmt.Fprintf(os.Stderr, "failed to initialize wind-down state: %v\n", err)
+		os.Exit(1)
+	}
 
 	os.MkdirAll(".herd/prompts", 0755)
 	os.MkdirAll(".worktrees", 0755)
 
-	fullConfig := `version: "1"
+	projectName, repoURL, taskProvider, providerConfig, testCommand := initRepoDefaults()
+	fullConfig := fmt.Sprintf(`version: "1"
 
 # Herdforge — the forge that forges itself
 project:
-  name: "my-herd-app"
+  name: %q
   default_branch: "main"
-  repo_url: "https://github.com/user/my-herd-app.git"
+  repo_url: %q
 
 task_provider:
-  type: "linear"
-  project_id: "your-linear-project-id"
-  api_key_env: "LINEAR_API_KEY"
+  type: %q
+%s
 
 # Agent lanes — each lane runs in a herdr workspace tab
 lanes:
   - name: "forge-smith"
     role: "forge-smith"
-    agent_kind: "pi"
-    harness: "pi"
+    agent_kind: "codex"
+    harness: "codex"
     prompt: ".herd/prompts/smith.md"
     worktree: ".worktrees/smith"
     provider: "codex"
@@ -639,8 +720,8 @@ lanes:
 
   - name: "worker"
     role: "worker"
-    agent_kind: "pi"
-    harness: "pi"
+    agent_kind: "claude"
+    harness: "claude"
     prompt: ".herd/prompts/worker.md"
     worktree: ".worktrees/worker"
     provider: "codex"
@@ -650,8 +731,8 @@ lanes:
 
   - name: "reviewer"
     role: "reviewer"
-    agent_kind: "pi"
-    harness: "pi"
+    agent_kind: "codex"
+    harness: "codex"
     prompt: ".herd/prompts/reviewer.md"
     worktree: ".worktrees/reviewer"
     provider: "claude"
@@ -660,9 +741,9 @@ lanes:
     task_shape: "qa"
 
 verification:
-  test_command: "go test ./..."
+  test_command: %q
   preflight_command: "go build ./..."
-`
+`, projectName, repoURL, taskProvider, providerConfig, testCommand)
 
 	if err := os.WriteFile(cfgPath, []byte(fullConfig), 0644); err != nil {
 		fmt.Fprintf(os.Stderr, "failed to write config: %v\n", err)
@@ -777,7 +858,11 @@ func runClone() {
 }
 
 func runPreflightStatic() {
-	if err := preflight.CheckWorktreeBoundary("."); err != nil {
+	var allowlist []string
+	if cfg, err := config.LoadConfig(filepath.Join(".herd", "herd.yaml")); err == nil {
+		allowlist = cfg.WorktreeBoundary.AllowedAbsolutePaths
+	}
+	if err := preflight.CheckWorktreeBoundaryWithAllowlist(".", allowlist); err != nil {
 		fmt.Fprintf(os.Stderr, "Preflight failed: %v\n", err)
 		os.Exit(1)
 	}
@@ -862,12 +947,15 @@ func runStatus() {
 		os.Exit(1)
 	}
 	defer st.Close()
-	blocked, err := st.BlockedSelectionHistory(10)
+	// Dependency blocks are audit evidence, not permanent attention. Keep the
+	// operator-facing status window bounded so resolved provider outages and
+	// repaired provenance do not continue to look active for days.
+	blocked, err := st.BlockedSelectionHistorySince(10, time.Now().Add(-time.Hour))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Dependency evidence: UNREADABLE (%v)\n", err)
 		os.Exit(1)
 	}
-	fmt.Printf("Dependency BLOCKED evidence: %d recent\n", len(blocked))
+	fmt.Printf("Dependency BLOCKED evidence: %d recent (last hour)\n", len(blocked))
 	for _, record := range blocked {
 		fmt.Printf("  BLOCKED %s [%s] %s\n", record.Ref, record.Code, record.Reason)
 	}
@@ -896,6 +984,11 @@ func runStatus() {
 // loadTaskProvider activates the configured board provider with FAC-150
 // deadlines via provider.NewFromHerdConfig. Non-Kaneo types error (FAC-155).
 func loadTaskProvider(cfg *config.Config) (provider.TaskProvider, error) {
+	if cfg != nil && strings.EqualFold(strings.TrimSpace(cfg.TaskProvider.Type), "kaneo") {
+		if err := provider.PrepareRuntimeDefaults("."); err != nil {
+			return nil, err
+		}
+	}
 	return provider.NewFromHerdConfig(cfg)
 }
 
@@ -1695,11 +1788,46 @@ func runReview() {
 
 	ctx := context.Background()
 
-	// Find tasks in "in-progress" status
-	tasks, err := tp.ListTasks(ctx, cfg.TaskProvider.ProjectID, "in-progress")
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "failed to list in-progress tasks: %v\n", err)
-		os.Exit(1)
+	// A targeted review may be reported as NEEDS_REVIEW before the board
+	// provider has moved the card to in-progress. Resolve that exact ref first
+	// so review admission is driven by the candidate SHA and canonical receipt,
+	// not by a lossy board-status precondition. The un-targeted queue remains
+	// limited to in-progress work to avoid scanning every board card.
+	var tasks []*provider.Task
+	if refArg != "" {
+		task, getErr := tp.GetTask(ctx, refArg)
+		if getErr != nil {
+			// Some providers expose an eventually-consistent GetTask endpoint
+			// while their list endpoint already contains the card. Fall back to
+			// that list, and finally admit the exact ref with a minimal task
+			// envelope so candidate SHA/receipt evidence remains authoritative.
+			listed, listErr := tp.ListTasks(ctx, cfg.TaskProvider.ProjectID, "in-progress")
+			if listErr != nil {
+				task = &provider.Task{Ref: refArg, Status: "in-progress"}
+			} else {
+				for _, candidate := range listed {
+					if strings.EqualFold(hsync.NormalizeRef(candidate.Ref), hsync.NormalizeRef(refArg)) {
+						task = candidate
+						break
+					}
+				}
+				if task == nil {
+					task = &provider.Task{Ref: refArg, Status: "in-progress"}
+				}
+			}
+		}
+		if !reviewEligibleTaskStatus(task.Status) {
+			fmt.Fprintf(os.Stderr, "review: task %s has terminal/non-reviewable status %q\n", task.Ref, task.Status)
+			os.Exit(1)
+		}
+		tasks = []*provider.Task{task}
+	} else {
+		// Find tasks in "in-progress" status for the queue form.
+		tasks, err = tp.ListTasks(ctx, cfg.TaskProvider.ProjectID, "in-progress")
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "failed to list in-progress tasks: %v\n", err)
+			os.Exit(1)
+		}
 	}
 
 	reviewRoot, rootErr := canonicalHerdRoot()
@@ -1793,7 +1921,10 @@ func runReview() {
 
 	// FAC-144: RequireCurrentPassing before any reviewer tab is created.
 	// CheckCompletion is not sufficient authority for review spawn.
-	wt := worktreePathForRef(task.Ref)
+	wt := strings.TrimSpace(selectedCand.WorktreePath)
+	if wt == "" {
+		wt = worktreePathForRef(task.Ref)
+	}
 	if !worktreeExists(wt) {
 		// Fall back to configured reviewer lane worktree only for
 		// isolated standing reviewers — still require admission against
@@ -1812,6 +1943,8 @@ func runReview() {
 			fmt.Fprintf(os.Stderr, "no lane configured for role 'reviewer'\n")
 			os.Exit(1)
 		}
+		restoreHooks := useHarnessHooksFromWorktree(wt)
+		defer restoreHooks()
 		decision, err := launchAdmissionWithLifecycle(liveLaunchLifecycle{}, cfg, lane.Role, true, routedLaneDecision(context.Background(), task), func(_ *router.LaunchDecision) error {
 			_, listErr := herdr.AgentList()
 			return listErr
@@ -1834,9 +1967,9 @@ func runReview() {
 
 		// Exact task worktree — never the shared reviewer lane tree (incident:
 		// review-assayer-FAC-151 opened inside the FAC-172 worktree).
-		taskWT := filepath.Join(".herd", "worktrees", strings.ToLower(task.Ref))
+		taskWT := wt
 		if fi, statErr := os.Stat(taskWT); statErr != nil || !fi.IsDir() {
-			fmt.Fprintf(os.Stderr, "review launch rejected: exact task worktree %s is required\n", taskWT)
+			fmt.Fprintf(os.Stderr, "review launch rejected: candidate worktree %s is required\n", taskWT)
 			os.Exit(1)
 		}
 
@@ -1850,7 +1983,7 @@ func runReview() {
 		// happens in a FRESH isolated worktree checked out DETACHED at the
 		// exact candidate SHA, so review can neither mutate the candidate
 		// branch nor destroy the author's session context.
-		authorDir := filepath.Join(reviewRoot, ".herd", "worktrees", strings.ToLower(hsync.NormalizeRef(task.Ref)))
+		authorDir := wt
 		if fi, statErr := os.Stat(authorDir); statErr != nil || !fi.IsDir() {
 			fmt.Fprintf(os.Stderr, "review: no candidate worktree for %s at %s — refusing to review a generic lane HEAD (FAC-145)\n", task.Ref, authorDir)
 			os.Exit(1)
@@ -1897,11 +2030,11 @@ func runReview() {
 		}
 		// ONE generation per task: the reviewer JOINS the task's active
 		// lease instead of minting an independent review generation.
-		reviewLeaseRef := hsync.NormalizeRef(task.Ref)
+		reviewLeaseRef := reviewLeaseTaskRef(task.Ref)
 		reviewLeaseKey := claim.LeaseKey{
 			Repo: dispatch.RepositoryIdentityOrName(spawnRoot, cfg.Project.Name), Provider: cfg.TaskProvider.Type, Project: cfg.TaskProvider.ProjectID, TaskRef: reviewLeaseRef,
 		}
-		leaseID, leaseGen, leaseOwned, leaseErr := acquireOrJoinLease(context.Background(), spawnRoot, reviewLeaseKey, "coordinator-review", dispatch.RoleReviewer)
+		leaseID, leaseGen, leaseOwned, leaseErr := acquireOrJoinLease(context.Background(), spawnRoot, reviewLeaseKey, "coordinator-review", dispatch.RoleWorker)
 		if leaseErr != nil {
 			fmt.Fprintf(os.Stderr, "review: %v\n", leaseErr)
 			os.Exit(1)
@@ -1981,13 +2114,6 @@ func runReview() {
 		// guarantee must rest on the LIVE terminal state, read for the exact
 		// pane INCARNATION we just launched (FAC-145).
 		reviewerSession := herdr.SessionID(tab.Pane)
-		liveCwd, cwdErr := herdr.PaneLiveCwd(reviewerSession)
-		if cwdErr != nil {
-			life.fail("cannot read live reviewer pane cwd (FAC-145): %v", cwdErr)
-		}
-		if !sameDir(liveCwd, worktreeDir) {
-			life.fail("live reviewer pane cwd %q is not the isolated candidate checkout %q (FAC-145)", liveCwd, worktreeDir)
-		}
 		// Start through the compiled LaunchDecision (main's admission path):
 		// the isolated tab is FAC-145's requirement, the decision-bound start
 		// is the launch contract — the reviewer needs both.
@@ -2002,6 +2128,17 @@ func runReview() {
 		reviewReq := taskLaunchRequest(boundDecision, task.Ref, repositoryIdentityForLaunch(cfg), lane.Name)
 		if err := herdr.StartPreparedAgent(tab.ID, tabLabel, boundDecision.Harness, tab.Pane.ID, reviewReq); err != nil {
 			life.fail("failed to start reviewer agent: %v", err)
+		}
+		// Herdr 0.8 publishes a tab's root pane to agent-list only after the
+		// harness starts. Read the live cwd after that transition, with a
+		// bounded exact-incarnation wait; checking before start races a valid
+		// pane that is not an agent yet.
+		liveCwd, cwdErr := waitForReviewerPaneCwd(reviewerSession, worktreeDir, 6*time.Second)
+		if cwdErr != nil {
+			life.fail("cannot read live reviewer pane cwd (FAC-145): %v", cwdErr)
+		}
+		if !sameDir(liveCwd, worktreeDir) {
+			life.fail("live reviewer pane cwd %q is not the isolated candidate checkout %q (FAC-145)", liveCwd, worktreeDir)
 		}
 		targetLabel := tabLabel
 		fmt.Printf("Spawned reviewer '%s' in tab %s (pane %s, cwd %s)\n", tabLabel, tab.ID, tab.Pane.ID, tab.Cwd)
@@ -2031,13 +2168,15 @@ func runReview() {
 		// text can never carry verdict authority.
 		testCmd := scopedTestCommand(worktreeDir)
 		reviewPacket := fmt.Sprintf(`REVIEW %s — verdict ONLY, edit nothing.
-cd %s
+REPORT_TARGET: review-harvest-supervisor (mandatory; never coordinator)
+REPORT_CONTRACT: retain the signed verdict artifact in the Herdforge review inbox before pane teardown. The supervisor owns exact-SHA admission, reviewer retries, author feedback, ledger ingest, and cleanup. The coordinator receives only exact PASS plus merge-ready evidence.
+	cd %s
 1. git diff origin/main..HEAD --stat  (see ONLY the changed files — review just these)
 2. %s   (targeted tests for the changed packages, not the whole repo)
 File your verdict through the broker (typed, receipt-bound):
   herd task verdict %s APPROVED
   herd task verdict %s REJECTED "<numbered fixes>"
-Do not read the whole codebase. Do not run the full suite. Change nothing.`,
+	Do not read the whole codebase. Do not run the full suite. Change nothing. Do not use repository bin/herd-* orchestration scripts.`,
 			task.Ref, worktreeDir, testCmd, task.Ref, task.Ref)
 
 		// An undelivered review packet is a BLOCKED review, not a warning.
@@ -2054,6 +2193,43 @@ Do not read the whole codebase. Do not run the full suite. Change nothing.`,
 		os.Exit(1)
 	}
 	fmt.Printf("  -> moved card [%s] to 'in-review' status\n", task.Ref)
+}
+
+// waitForReviewerPaneCwd closes the create/readback race in Herdr: tab create
+// returns the requested pane incarnation before agent-list has necessarily
+// published that same terminal. Readiness is bounded and exact-incarnation;
+// a replacement pane can never satisfy the original review receipt.
+func waitForReviewerPaneCwd(sessionID, want string, timeout time.Duration) (string, error) {
+	if timeout <= 0 {
+		timeout = 6 * time.Second
+	}
+	deadline := time.Now().Add(timeout)
+	var lastErr error
+	for {
+		cwd, err := herdr.PaneLiveCwd(sessionID)
+		if err == nil {
+			return cwd, nil
+		}
+		lastErr = err
+		if time.Now().After(deadline) {
+			return "", fmt.Errorf("reviewer pane readiness timeout for %s (want %s): %w", sessionID, want, lastErr)
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+}
+
+// reviewEligibleTaskStatus permits explicit NEEDS_REVIEW/ready cards while
+// keeping terminal cards fail-closed. Providers normalize unknown custom
+// statuses with an "unknown:" prefix, so do not mistake that evidence for a
+// terminal state; the exact candidate receipt remains the real admission gate.
+func reviewEligibleTaskStatus(status string) bool {
+	s := strings.ToLower(strings.TrimSpace(strings.ReplaceAll(status, "_", "-")))
+	switch s {
+	case "done", "closed", "complete", "completed", "merged", "resolved", "archived", "planned", "planning":
+		return false
+	default:
+		return s != ""
+	}
 }
 
 // parseApproveArgs parses `herd approve [<ref>] [--receipt <path>] [--override-* ...]`.
@@ -2204,12 +2380,34 @@ func runApprove() {
 		return
 	}
 
+	// Receiptless cards created before the completion-receipt gate are a
+	// durable migration class, not a transient retry. Record a one-shot
+	// tombstone after the first refusal and suppress subsequent autonomous
+	// cycles until a real completion receipt appears. This keeps the gate
+	// fail-closed while preventing a legacy card from producing an ERROR every
+	// forge interval.
+	legacyLog := filepath.Join(root, legacyReceiptLog)
+	legacyTombstones, legacyErr := readLegacyReceiptTombstones(legacyLog)
+	if legacyErr != nil {
+		fmt.Fprintf(os.Stderr, "approve: legacy receipt tombstones unreadable: %v\n", legacyErr)
+		finish(1)
+	}
+
 	sort.SliceStable(tasks, func(i, j int) bool {
 		return provider.CompareRefs(tasks[i].Ref, tasks[j].Ref) < 0
 	})
 
-	approved, refused, failed := 0, 0, reconcileFailed
+	approved, refused, failed, suppressed := 0, 0, reconcileFailed, 0
 	for _, task := range tasks {
+		if receiptPathArg == "" {
+			if tombstone, ok := legacyTombstones[strings.ToUpper(task.Ref)]; ok {
+				if _, statErr := os.Stat(hsync.ReceiptPath(root, task.Ref)); errors.Is(statErr, os.ErrNotExist) {
+					fmt.Printf("LEGACY-SKIP [%s]: %s\n  tombstoned once: %s\n", task.Ref, task.Title, tombstone.Reason)
+					suppressed++
+					continue
+				}
+			}
+		}
 		// FAC-145: receipt-bound, callback-coupled approval — missing/
 		// unsigned/tampered receipt, wrong repo/project/task, expiry, stale
 		// generation, or an undeliverable callback all refuse the mutation.
@@ -2226,13 +2424,25 @@ func runApprove() {
 		case errors.Is(err, hsync.ErrNoEvidence):
 			fmt.Printf("REFUSED  [%s]: %s\n  %v\n", task.Ref, task.Title, err)
 			refused++
+			if receiptPathArg == "" {
+				if _, statErr := os.Stat(hsync.ReceiptPath(root, task.Ref)); errors.Is(statErr, os.ErrNotExist) {
+					rec := legacyReceiptTombstone{TaskRef: task.Ref, TaskID: task.ID, Reason: "pre-completion-receipt task; re-dispatch or provide a verified completion receipt", Actor: "forge-approve"}
+					if tombErr := appendLegacyReceiptTombstone(legacyLog, rec); tombErr != nil {
+						fmt.Fprintf(os.Stderr, "ERROR    [%s]: legacy tombstone write failed: %v\n", task.Ref, tombErr)
+						failed++
+					} else {
+						legacyTombstones[strings.ToUpper(task.Ref)] = rec
+						fmt.Printf("LEGACY-TOMBSTONE [%s]: approval retry suppressed until a completion receipt exists\n", task.Ref)
+					}
+				}
+			}
 		default:
 			fmt.Fprintf(os.Stderr, "ERROR    [%s]: %v\n", task.Ref, err)
 			failed++
 		}
 	}
 
-	fmt.Printf("\nherd approve: approved=%d refused=%d failed=%d\n", approved, refused, failed)
+	fmt.Printf("\nherd approve: approved=%d refused=%d suppressed=%d failed=%d\n", approved, refused, suppressed, failed)
 	if failed > 0 {
 		finish(1)
 	}
@@ -2282,6 +2492,13 @@ func boundBoardProvider(cfg *config.Config, tp provider.TaskProvider, root, ref 
 		return nil, tc, err
 	}
 	return btp, coord, nil
+}
+
+// reviewLeaseTaskRef isolates post-build review/approve authority from the
+// worker's claim lease. A completed worker is expected to release its claim;
+// reviewers must not revive that worker lease or race a new worker generation.
+func reviewLeaseTaskRef(ref string) string {
+	return strings.ToLower(hsync.NormalizeRef(ref)) + ":review"
 }
 
 // The approval journal durably couples the PASS callback to the board
@@ -2342,7 +2559,24 @@ func requireLiveLease(ctx context.Context, root string, tc dispatch.TaskContext)
 		}
 	}
 	if live == nil {
-		return fmt.Errorf("no ACTIVE lease for lease key %s — receipt %s lease %s gen %d carries no live authority (FAC-145 fail-closed; released/expired/missing all refuse)", tc.LeaseTaskRef, tc.TaskRef, tc.LeaseID, tc.LeaseGeneration)
+		// A worker's claim is normally released when its build finishes. The
+		// signed, unexpired receipt plus the discovered candidate authorizes a
+		// fresh review-scoped lease; it never revives the worker lease and does
+		// not alter the receipt's generation. Force-expired receipts remain
+		// fenced by the receipt expiry below.
+		if time.Now().After(tc.ExpiresAt) {
+			return fmt.Errorf("receipt %s expired at %s — review authority refused (FAC-145)", tc.TaskRef, tc.ExpiresAt.Format(time.RFC3339))
+		}
+		reviewKey := key
+		reviewKey.TaskRef = reviewLeaseTaskRef(tc.LeaseTaskRef)
+		if review, reviewErr := st.CurrentLease(ctx, reviewKey); reviewErr != nil {
+			return fmt.Errorf("review lease read failed — refusing unfenced authority (FAC-145): %w", reviewErr)
+		} else if review == nil || review.Status != claim.StatusActive || review.Expired(time.Now()) {
+			if _, acquireErr := st.Acquire(ctx, reviewKey, "coordinator-review", dispatch.RoleWorker, "", time.Now(), dispatch.DefaultReceiptTTL); acquireErr != nil {
+				return fmt.Errorf("no ACTIVE worker lease and review lease acquisition failed for %s (FAC-145): %w", tc.TaskRef, acquireErr)
+			}
+		}
+		return nil
 	}
 	if live.Expired(now) {
 		return fmt.Errorf("lease for %s is expired (FAC-145)", tc.TaskRef)
@@ -2914,7 +3148,7 @@ func approveOne(ctx context.Context, cfg *config.Config, tp provider.TaskProvide
 		if oerr != nil {
 			return nil, fmt.Errorf("approve: process owner identity: %w", oerr)
 		}
-		key := provider.LeaseKey(coord.Repository, coord.ProviderType, coord.ProjectID, coord.LeaseTaskRef)
+		key := provider.LeaseKey(coord.Repository, coord.ProviderType, coord.ProjectID, reviewLeaseTaskRef(coord.LeaseTaskRef))
 		taskRole, rerr := provider.TaskOwnershipRole(nil, "worker")
 		if rerr != nil {
 			return nil, rerr
@@ -3369,9 +3603,7 @@ func runCleanup() {
 
 	standing := map[string]bool{}
 	if cfg, err := config.LoadConfig(".herd/herd.yaml"); err == nil {
-		for _, lane := range cfg.Lanes {
-			standing["forge-"+lane.Name] = true
-		}
+		standing = configuredStandingAgentNames(cfg)
 	}
 
 	res, err := herdr.CleanupFenced(standing, *dryRun)
@@ -3417,6 +3649,26 @@ func runCleanup() {
 	if err != nil {
 		os.Exit(1)
 	}
+}
+
+// configuredStandingAgentNames accepts both naming forms used by Herdr
+// versions and repository rosters. Older Chainseer sessions expose the bare
+// configured lane name; newer Herdforge sessions prefix it with forge-. A
+// cleanup policy that protects only one form can reap a standing lane.
+func configuredStandingAgentNames(cfg *config.Config) map[string]bool {
+	out := map[string]bool{}
+	if cfg == nil {
+		return out
+	}
+	for _, lane := range cfg.Lanes {
+		name := strings.TrimSpace(lane.Name)
+		if name == "" {
+			continue
+		}
+		out[name] = true
+		out[standing.AgentName(name)] = true
+	}
+	return out
 }
 
 // runLabels ports the FAC-199 acceptance criterion "live readback shows no
@@ -3606,10 +3858,11 @@ func runNext() {
 // dispatchRequest is the parsed, side-effect-free CLI contract for dispatch.
 // Parsing never loads config, claims work, or opens durable stores.
 type dispatchRequest struct {
-	TicketRef    string
-	NoLaunch     bool
-	LaneName     string
-	LaneExplicit bool
+	TicketRef         string
+	NoLaunch          bool
+	LaneName          string
+	LaneExplicit      bool
+	EnvironmentPlanID string
 }
 
 // parseDispatchArgs routes flags through a real FlagSet before any operational
@@ -3622,6 +3875,7 @@ func parseDispatchArgs(args []string) (dispatchRequest, error) {
 	fs.SetOutput(io.Discard)
 	noLaunch := fs.Bool("no-launch", false, "Skip agent launch")
 	laneName := fs.String("lane", "worker", "Lane name from config")
+	planID := fs.String("environment-plan", "", "Exact operator-managed environment plan ID")
 	ticketFlag := fs.String("ticket", "", "Ticket ref (required when the value begins with '-')")
 
 	parse := func(in []string) error {
@@ -3658,10 +3912,11 @@ func parseDispatchArgs(args []string) (dispatchRequest, error) {
 		return dispatchRequest{}, err
 	}
 	return dispatchRequest{
-		TicketRef:    ref,
-		NoLaunch:     *noLaunch,
-		LaneName:     *laneName,
-		LaneExplicit: laneExplicit,
+		TicketRef:         ref,
+		NoLaunch:          *noLaunch,
+		LaneName:          *laneName,
+		LaneExplicit:      laneExplicit,
+		EnvironmentPlanID: strings.TrimSpace(*planID),
 	}, nil
 }
 
@@ -3748,37 +4003,84 @@ func dispatchTicketDecision(ctx context.Context, req dispatchRequest, announce i
 	// the published graph snapshot carries. herd scope publish prints it.
 	scopeVerifier := scopeauth.New()
 	expectedRevision, expectedFiles := publishedGraphBinding(".")
-	d := dispatch.NewProductionDispatcherWithAuthorities(cfg, tp, wm,
-		scopeVerifier, scopeVerifier, expectedRevision, expectedFiles)
+	production := productionMode()
+	var d *dispatch.Dispatcher
+	if production {
+		d = dispatch.NewProductionDispatcherWithAuthorities(cfg, tp, wm,
+			scopeVerifier, scopeVerifier, expectedRevision, expectedFiles)
+	} else {
+		// Local mode keeps the same router, worktree isolation, Herdr API, and
+		// receipt evidence, while avoiding hosted-only MAC/signer/confinement
+		// prerequisites that cannot exist on a normal single-user checkout.
+		d = dispatch.NewDispatcher(cfg, tp, wm)
+		compensator, compErr := dispatch.NewOutboxCompensator(filepath.Join(".herd", "dispatch-outbox.db"))
+		if compErr != nil {
+			return nil, nil, fmt.Errorf("local dispatch outbox: %w", compErr)
+		}
+		d.Compensator = compensator
+		defer compensator.Close()
+	}
+	// A fresh checkout may not have a previously published scopefence row.
+	// Dispatch's dependency gate can still establish the authoritative graph,
+	// so bind run-state admission to that same provider-backed snapshot instead
+	// of rejecting the first dispatch with an empty published revision.
+	depStore := deps.StoreFor(tp, cfg.TaskProvider.ProjectID)
+	d.Deps = depStore
 	runStates, err := runstate.Open(filepath.Join(".herd", "dispatch-runs.db"))
 	if err != nil {
 		return nil, nil, fmt.Errorf("dispatch runstate store: %w", err)
 	}
 	defer runStates.Close()
 	d.RunStates = runStates
+	plans, err := envplan.Open(filepath.Join(".herd", "environment-plans.db"))
+	if err != nil {
+		return nil, nil, fmt.Errorf("environment plan store: %w", err)
+	}
+	defer plans.Close()
+	d.EnvironmentPlans = plans
 	d.RunStateGraph = func(context.Context) (string, error) {
-		if strings.TrimSpace(expectedRevision) == "" {
-			return "", errors.New("published dependency graph revision is empty")
+		if strings.TrimSpace(expectedRevision) != "" {
+			return expectedRevision, nil
 		}
-		return expectedRevision, nil
+		snapshot, snapshotErr := depStore.SnapshotGraph(context.Background())
+		if snapshotErr != nil {
+			return "", fmt.Errorf("dependency graph snapshot: %w", snapshotErr)
+		}
+		if snapshot == nil {
+			return "", errors.New("dependency graph snapshot returned empty revision")
+		}
+		revision := deps.GraphRevision(snapshot.Edges, nil, snapshot.ProviderRevision)
+		if strings.TrimSpace(revision) == "" {
+			return "", errors.New("dependency graph snapshot returned empty revision")
+		}
+		return revision, nil
 	}
-	// FAC-147: production board mutations go through ClaimStack Begin/Complete.
-	stack, stackErr := loadClaimStack(tp)
-	if stackErr != nil {
-		fmt.Fprintf(os.Stderr, "claim stack: %v\n", stackErr)
-		os.Exit(1)
+	// FAC-147: hosted board mutations go through ClaimStack Begin/Complete.
+	// Local Herdr mode uses the authenticated single-user Kaneo client directly;
+	// requiring a separate fence broker would turn a local checkout into a
+	// hosted control plane before it can launch its first task.
+	var stack *provider.ClaimStack
+	if production {
+		stack, err = loadClaimStack(tp)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "claim stack: %v\n", err)
+			os.Exit(1)
+		}
+		defer stack.Close()
+		d.Claims = stack
 	}
-	defer stack.Close()
-	d.Claims = stack
 	// FAC-222: embed the coordinator's reply target in every TASK-PACKET.md.
 	// Resolve from the durable registration; absence falls back to the
 	// well-known default name (dispatch.coordinatorName handles that).
 	if reg, rerr := coordinator.Resolve("."); rerr == nil {
 		d.CoordinatorName = reg.Name
 	}
-	closeControl, err := configureProductionControl(d, ".")
-	if err != nil {
-		return nil, nil, fmt.Errorf("control store init failed: %w", err)
+	closeControl := func() error { return nil }
+	if production {
+		closeControl, err = configureProductionControl(d, ".")
+		if err != nil {
+			return nil, nil, fmt.Errorf("control store init failed: %w", err)
+		}
 	}
 	defer closeControl()
 	var decision *router.LaunchDecision
@@ -3822,7 +4124,15 @@ func dispatchTicketDecision(ctx context.Context, req dispatchRequest, announce i
 	// FAC-145: broker ADMISSION precedes the durable claim — a dispatch
 	// that cannot possibly launch a provider-capable agent never strands a
 	// lease on the ticket.
-	if !noLaunch {
+	if !noLaunch && production {
+		// The broker authenticates receipt-bound requests and therefore needs
+		// the coordinator's published verification key before self-start. Load
+		// the isolated coordinator signer here; dispatch later reuses it for
+		// the task receipt and never exposes the private key to a worker.
+		if _, signerErr := dispatch.LoadSignerForConfig(cfg.Project.Name, dispatchRoot); signerErr != nil {
+			fmt.Fprintf(os.Stderr, "dispatch refused — receipt authority: %v\n", signerErr)
+			os.Exit(1)
+		}
 		sock, sockErr := brokerSocketPath(dispatch.RepositoryIdentityOrName(dispatchRoot, cfg.Project.Name))
 		if sockErr != nil {
 			fmt.Fprintf(os.Stderr, "dispatch: %v\n", sockErr)
@@ -3854,10 +4164,16 @@ func dispatchTicketDecision(ctx context.Context, req dispatchRequest, announce i
 				return err
 			}
 			var dispatchErr error
-			dispatchResult, dispatchErr = d.Dispatch(ctx, dispatch.DispatchOptions{TicketRef: ticketRef, NoLaunch: noLaunch, LaneName: laneName, Decision: admitted, LeaseID: leaseID, LeaseGeneration: leaseGen})
+			dispatchResult, dispatchErr = d.Dispatch(ctx, dispatch.DispatchOptions{TicketRef: ticketRef, NoLaunch: noLaunch, LaneName: laneName, Decision: admitted, EnvironmentPlanID: req.EnvironmentPlanID, LeaseID: leaseID, LeaseGeneration: leaseGen})
 			return dispatchErr
 		})
 		if err != nil {
+			// launchAdmission can fail after the coordination lease is acquired
+			// (for example, a missing native harness probe). Release that exact
+			// lease before returning so a failed launch never blocks the next tick.
+			if relErr := releaseCoordinationLease(ctx, dispatchRoot, leaseKey, "coordinator-dispatch", leaseGen); relErr != nil {
+				return nil, nil, fmt.Errorf("dispatch launch failed: %w; LEASE COMPENSATION ALSO FAILED: %v", err, relErr)
+			}
 			return nil, nil, fmt.Errorf("dispatch launch failed: %w", err)
 		}
 		// launchAdmission already validated lane capability before any side effect.
@@ -3870,7 +4186,7 @@ func dispatchTicketDecision(ctx context.Context, req dispatchRequest, announce i
 		if err := admitDispatch(); err != nil {
 			return nil, nil, fmt.Errorf("dispatch hold admission rejected: %w", err)
 		}
-		result, err = d.Dispatch(ctx, dispatch.DispatchOptions{TicketRef: ticketRef, NoLaunch: true, LaneName: laneName, Decision: decision, LeaseID: leaseID, LeaseGeneration: leaseGen})
+		result, err = d.Dispatch(ctx, dispatch.DispatchOptions{TicketRef: ticketRef, NoLaunch: true, LaneName: laneName, Decision: decision, EnvironmentPlanID: req.EnvironmentPlanID, LeaseID: leaseID, LeaseGeneration: leaseGen})
 	}
 	if err != nil {
 		// Durable compensation: a failed dispatch releases the exact lease
@@ -3961,6 +4277,66 @@ func configureProductionControl(d *dispatch.Dispatcher, root string) (func() err
 	return func() error {
 		return errors.Join(compensator.Close(), controlStore.Close())
 	}, nil
+}
+
+// newCoordinatorControlReconciler composes the coordinator's restart path
+// independently of worker wake delivery. A coordinator is a control process,
+// not a managed task lane: it has no task claim or Herdr lease generation to
+// bind. Reconciliation therefore reads only orders already proven sent by
+// the durable outbox and validates their task-scoped identity against the
+// live claim authority before terminal state can change.
+func newCoordinatorControlReconciler(root string) (*control.CoordinatorLoop, func() error, error) {
+	controlStore, err := outbox.NewStore(filepath.Join(root, ".herd", "control-orders.db"))
+	if err != nil {
+		return nil, nil, err
+	}
+	controlMailbox := mail.NewMailbox(filepath.Join(root, ".herd", "control-mail.jsonl"))
+	lookup := func(ctx context.Context, order control.Order) error {
+		claims := security.ResolveClaimLookup()
+		if claims == nil {
+			return fmt.Errorf("control: live task claim authority is required for coordinator reconciliation")
+		}
+		rec, err := claims.LookupActiveClaim(ctx, order.TaskRef)
+		if err != nil {
+			return err
+		}
+		if rec == nil || rec.TaskRef != order.TaskRef || rec.Generation != order.LeaseGeneration {
+			return control.ErrStaleIdentity
+		}
+		return nil
+	}
+	delivery := &control.Delivery{
+		Outbox:   controlStore,
+		Evidence: control.MailboxEvidenceReader{Mailbox: controlMailbox},
+		Authority: control.RevalidatingAuthority{
+			Check: func(ctx context.Context, order control.Order) error {
+				return lookup(ctx, order)
+			},
+		},
+	}
+	orders := func(_ context.Context) ([]control.Order, error) {
+		items, err := controlStore.Sent(1000)
+		if err != nil {
+			return nil, err
+		}
+		out := make([]control.Order, 0, len(items))
+		for _, item := range items {
+			if item.Payload == "" || item.TaskRef == "" {
+				return nil, fmt.Errorf("control: sent order %d is missing task identity or payload", item.ID)
+			}
+			var order control.Order
+			if err := json.Unmarshal([]byte(item.Payload), &order); err != nil {
+				return nil, fmt.Errorf("control: decode sent order %d: %w", item.ID, err)
+			}
+			if order.TaskRef != item.TaskRef || item.Kind != "control/"+string(order.Kind) {
+				return nil, fmt.Errorf("control: sent order %d identity does not match outbox metadata", item.ID)
+			}
+			out = append(out, order)
+		}
+		return out, nil
+	}
+	closeControl := func() error { return controlStore.Close() }
+	return &control.CoordinatorLoop{Delivery: delivery, Orders: orders}, closeControl, nil
 }
 
 func runHarvest() {
@@ -4495,6 +4871,12 @@ func runForgeE() error {
 		// Fall through to review step
 	} else {
 		fmt.Printf("Claimed [%s]: %s\n", task.Ref, task.Title)
+		compensateLaunchFailure := func(launchErr error) error {
+			if releaseErr := eng.CompensateLastClaim(ctx, task, "forge_launch_failed"); releaseErr != nil {
+				return errors.Join(launchErr, fmt.Errorf("release failed claim: %w", releaseErr))
+			}
+			return launchErr
+		}
 
 		// Spawn worker only after the pre-claim route and availability checks.
 		if herdr.IsAvailable() {
@@ -4502,18 +4884,18 @@ func runForgeE() error {
 			if lane != nil {
 				decision, bindErr := rebindDecisionForTask(forgeDecision, task.Ref, forgeLeaseGeneration)
 				if bindErr != nil {
-					return fmt.Errorf("forge launch decision rejected after claim: %w", bindErr)
+					return compensateLaunchFailure(fmt.Errorf("forge launch decision rejected after claim: %w", bindErr))
 				}
 				standingName := fmt.Sprintf("forge-%s", lane.Name)
 				if lane.Worktree == "" {
-					return fmt.Errorf("forge launch requires an isolated worktree")
+					return compensateLaunchFailure(fmt.Errorf("forge launch requires an isolated worktree"))
 				}
 				tabLabel, resolveErr := herdr.ResolveAgentTabWithDecision(standingName, taskLaunchRequest(decision, task.Ref, repositoryIdentityForLaunch(cfg), lane.Name))
 				if resolveErr != nil {
 					if gateErr := authorizeEphemeralTaskAgent(resolveErr); gateErr != nil {
 						return fmt.Errorf("standing forge agent %s blocked: %w", standingName, resolveErr)
 					}
-					tabLabel = fmt.Sprintf("forge-%s-%s", lane.Name, task.Ref)
+					tabLabel = fmt.Sprintf("forge-%s-%s", strings.ToLower(lane.Name), strings.ToLower(task.Ref))
 					cwd := "."
 					if lane.Worktree != "" {
 						cwd = filepath.Join(".", lane.Worktree)
@@ -4522,16 +4904,18 @@ func runForgeE() error {
 					_, tab, tabErr := openWriteCapableTab(decision, req, lane, herdr.ResolveWorkspace("."), tabLabel, cwd)
 					if tabErr == nil {
 						if err := herdr.StartPreparedAgent(tab.ID, tabLabel, decision.Harness, tab.Pane.ID, req); err != nil {
-							return fmt.Errorf("launch failed: %w", err)
+							return compensateLaunchFailure(fmt.Errorf("launch failed: %w", err))
 						}
 					} else {
-						return fmt.Errorf("create forge tab: %w", tabErr)
+						return compensateLaunchFailure(fmt.Errorf("create forge tab: %w", tabErr))
 					}
 				}
 				packet := fmt.Sprintf(`Task [%s]: %s\n\n%s\n\nWorktree: %s`, task.Ref, task.Title, task.Description, lane.Worktree)
 				if _, promptErr := herdr.AgentPrompt(tabLabel, packet, false); promptErr != nil {
-					fmt.Fprintf(os.Stderr, "forge prompt failed: %v\n", promptErr)
-					os.Exit(1)
+					return compensateLaunchFailure(fmt.Errorf("forge prompt failed: %w", promptErr))
+				}
+				if receiptErr := persistForgeTaskReceipt(cfg, task, lane, forgeDecision, eng.LastClaimToken()); receiptErr != nil {
+					return compensateLaunchFailure(fmt.Errorf("forge launch receipt failed: %w", receiptErr))
 				}
 			}
 		}
@@ -4548,22 +4932,35 @@ func runForgeE() error {
 	defer stack.Close()
 	tasks, err := tp.ListTasks(ctx, cfg.TaskProvider.ProjectID, "in-progress")
 	if err == nil && len(tasks) > 0 {
-		t := tasks[0]
-		fmt.Printf("Selected [%s]: %s for review\n", t.Ref, t.Title)
-		// FAC-145: no raw status writes — the transition is bound to the
-		// task's authenticated receipt; failures propagate.
-		forgeRoot, forgeRootErr := canonicalHerdRoot()
-		if forgeRootErr != nil {
-			fmt.Fprintf(os.Stderr, "  review transition: %v\n", forgeRootErr)
+		t, selectErr := selectForgeReviewTask(ctx, cfg, tp, tasks)
+		if selectErr != nil {
+			fmt.Fprintf(os.Stderr, "  review selection blocked: %v\n", selectErr)
 			forgeFailed = true
-		} else if btp, _, bindErr := boundBoardProvider(cfg, tp, forgeRoot, t.Ref); bindErr != nil {
-			fmt.Fprintf(os.Stderr, "  review transition unbound (FAC-145): %v\n", bindErr)
-			forgeFailed = true
-		} else if err := btp.UpdateStatus(ctx, t.ID, "in-review"); err != nil {
-			fmt.Fprintf(os.Stderr, "  review transition failed (FAC-145): %v\n", err)
-			forgeFailed = true
+		} else if t == nil {
+			fmt.Println("  no reviewable in-progress candidate (skipping cards without an exact candidate SHA)")
 		} else {
-			fmt.Printf("  -> moved to 'in-review' status\n")
+			fmt.Printf("Selected [%s]: %s for review\n", t.Ref, t.Title)
+			// FAC-145: no raw status writes — the transition is bound to the
+			// task's authenticated receipt; failures propagate.
+			forgeRoot, forgeRootErr := canonicalHerdRoot()
+			if forgeRootErr != nil {
+				fmt.Fprintf(os.Stderr, "  review transition: %v\n", forgeRootErr)
+				forgeFailed = true
+			} else if btp, _, bindErr := boundBoardProvider(cfg, tp, forgeRoot, t.Ref); bindErr != nil {
+				fmt.Fprintf(os.Stderr, "  review transition unbound (FAC-145): %v\n", bindErr)
+				forgeFailed = true
+			} else if err := btp.UpdateStatus(ctx, t.ID, "in-review"); err != nil {
+				fmt.Fprintf(os.Stderr, "  review transition failed (FAC-145): %v\n", err)
+				forgeFailed = true
+			} else {
+				fmt.Printf("  -> moved to 'in-review' status\n")
+				if pingErr := notifyReviewSupervisor(cfg, t); pingErr != nil {
+					fmt.Fprintf(os.Stderr, "  review supervisor notification failed: %v\n", pingErr)
+					forgeFailed = true
+				} else {
+					fmt.Println("  -> review supervisor notified; coordinator remains out of review")
+				}
+			}
 		}
 	}
 
@@ -4598,6 +4995,19 @@ func runForgeE() error {
 			forgeFailed = true
 		}
 	}
+	// Coordinator-owned backstop: after PASS approvals, reap only fenced
+	// ephemeral panes whose durable review/worktree evidence says they are
+	// finished. Standing lanes and lanes with unconsumed repair evidence stay
+	// resident; cleanup failure is visible rather than silently leaking panes.
+	if cfg != nil && herdr.IsAvailable() {
+		standingAgents := configuredStandingAgentNames(cfg)
+		if cleaned, cleanupErr := herdr.CleanupFenced(standingAgents, false); cleanupErr != nil {
+			fmt.Fprintf(os.Stderr, "forge cleanup: %v\n", cleanupErr)
+			forgeFailed = true
+		} else if cleaned.Closed > 0 {
+			fmt.Printf("forge cleanup: closed=%d blocked=%d candidates=%d\n", cleaned.Closed, cleaned.Blocked, len(cleaned.Candidates))
+		}
+	}
 
 	fmt.Println("\n=== Forge cycle complete ===")
 	// FAC-145: a forge cycle with a real failure exits non-zero (caller
@@ -4606,6 +5016,156 @@ func runForgeE() error {
 		return fmt.Errorf("forge cycle completed with failures")
 	}
 	return nil
+}
+
+// selectForgeReviewTask admits only an indexed candidate with a candidate SHA. Raw
+// in-progress board order also contains standing epics and planning cards
+// without a candidate SHA; attempting a receipt-bound review for those cards
+// can never succeed and used to poison every forge cycle.
+func selectForgeReviewTask(ctx context.Context, cfg *config.Config, tp provider.TaskProvider, tasks []*provider.Task) (*provider.Task, error) {
+	root, err := canonicalHerdRoot()
+	if err != nil {
+		return nil, err
+	}
+	idx := candidateindex.New(candidateindex.IndexOptions{RepoRoot: root, Config: cfg, TaskProvider: tp})
+	candidates, err := idx.BuildIndex(ctx)
+	if err != nil {
+		return nil, err
+	}
+	byRef := make(map[string]*provider.Task, len(tasks))
+	for _, task := range tasks {
+		if task != nil {
+			byRef[hsync.NormalizeRef(task.Ref)] = task
+		}
+	}
+	for _, candidate := range candidates {
+		if candidate == nil || candidate.State == candidateindex.StateBlocked || candidate.State == candidateindex.StateConsumed || strings.TrimSpace(candidate.CandidateSHA) == "" {
+			continue
+		}
+		if task := byRef[hsync.NormalizeRef(candidate.Ref)]; task != nil {
+			return task, nil
+		}
+	}
+	return nil, nil
+}
+
+// persistForgeTaskReceipt closes the authority gap between forge's compact
+// claim-and-launch path and dispatch's canonical FAC-145 receipt pipeline.
+// Forge launches do not construct a Dispatcher, so they must issue the same
+// signed worker context explicitly before the cycle can expose the task to
+// review or approval.
+func persistForgeTaskReceipt(cfg *config.Config, task *provider.Task, lane *config.LaneDef, decision *router.LaunchDecision, tok *deps.OwnershipToken) error {
+	if cfg == nil || task == nil || lane == nil || decision == nil || tok == nil || tok.LeaseID <= 0 {
+		return errors.New("forge receipt requires task, lane, decision, and durable lease identity")
+	}
+	root, err := canonicalHerdRoot()
+	if err != nil {
+		return err
+	}
+	worktreePath := filepath.Join(root, lane.Worktree)
+	branch := strings.TrimSpace(forgeGitOutput(worktreePath, "rev-parse", "--abbrev-ref", "HEAD"))
+	base := strings.TrimSpace(forgeGitOutput(worktreePath, "rev-parse", "HEAD"))
+	if branch == "" || base == "" {
+		return fmt.Errorf("forge receipt worktree %s has no readable branch or HEAD", worktreePath)
+	}
+	repository := dispatch.RepositoryIdentityOrName(root, cfg.Project.Name)
+	leaseID := strconv.FormatInt(tok.LeaseID, 10)
+	tc := dispatch.TaskContext{
+		ProviderType: cfg.TaskProvider.Type, ProjectID: cfg.TaskProvider.ProjectID,
+		ProviderWorkspace: cfg.TaskProvider.WorkspaceID, ProviderProfile: cfg.TaskProvider.APIKeyEnv,
+		Repository: repository, Role: dispatch.RoleWorker, TaskRef: task.Ref, TaskID: task.ID,
+		Branch: branch, BaseSHA: base, LeaseID: leaseID, LeaseGeneration: tok.Generation,
+		LeaseTaskRef: task.Ref, SessionID: dispatch.NewSessionID(dispatch.RoleWorker, task.Ref, base, leaseID),
+		AllowedOps: dispatch.OpsForRole(dispatch.RoleWorker), ExpiresAt: time.Now().Add(dispatch.DefaultReceiptTTL),
+	}
+	signer, err := dispatch.LoadSignerForConfig(cfg.Project.Name, root)
+	if err != nil {
+		return err
+	}
+	signed, err := signer.Issue(tc)
+	if err != nil {
+		return err
+	}
+	if err := dispatch.WriteTaskContext(worktreePath, signed); err != nil {
+		return err
+	}
+	if err := dispatch.StoreCanonicalReceipt(root, signed); err != nil {
+		return err
+	}
+	// Forge claims bypass daemon.Engine's lifecycle projection, so record the
+	// same claim/dispatch/building path before exposing the task to review.
+	// This is idempotent and preserves the signed receipt fallback for legacy
+	// claims whose lifecycle row predates this projection.
+	if err := recordForgeLifecycle(root, task.Ref, repository, tok, branch, base); err != nil {
+		return fmt.Errorf("record forge lifecycle: %w", err)
+	}
+	return nil
+}
+
+func recordForgeLifecycle(root, ref, repo string, tok *deps.OwnershipToken, branch, base string) error {
+	if tok == nil || tok.Generation <= 0 {
+		return errors.New("forge lifecycle requires a positive lease generation")
+	}
+	machine, err := lifecycle.NewMachine(filepath.Join(root, defaultLifecycleDB))
+	if err != nil {
+		return err
+	}
+	defer machine.Close()
+	steps := []lifecycle.State{
+		lifecycle.StateEligible,
+		lifecycle.StateClaimed,
+		lifecycle.StateDispatched,
+		lifecycle.StateBuilding,
+	}
+	for i, target := range steps {
+		current, stateErr := machine.EventStore().CurrentState(ref)
+		if stateErr != nil {
+			return stateErr
+		}
+		if current != nil {
+			if current.LeaseGeneration > tok.Generation {
+				return fmt.Errorf("lifecycle lease generation %d is newer than forge generation %d", current.LeaseGeneration, tok.Generation)
+			}
+			if forgeLifecycleRank(current.State) >= forgeLifecycleRank(target) {
+				continue
+			}
+		}
+		if _, err := machine.Transition(lifecycle.TransitionRequest{
+			TaskRef: ref, Repo: repo, To: target, Actor: "forge",
+			IdempotencyKey:  fmt.Sprintf("forge-claim:%s:g%d:%s", ref, tok.Generation, target),
+			LeaseGeneration: tok.Generation, Branch: branch, CandidateSHA: base,
+			Payload: fmt.Sprintf("step=%d", i),
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func forgeLifecycleRank(state lifecycle.State) int {
+	for i, candidate := range []lifecycle.State{
+		lifecycle.StateDraft,
+		lifecycle.StateEligible,
+		lifecycle.StateClaimed,
+		lifecycle.StateDispatched,
+		lifecycle.StateBuilding,
+		lifecycle.StateVerifying,
+		lifecycle.StateReviewing,
+		lifecycle.StateIntegrationQueued,
+		lifecycle.StateIntegrated,
+		lifecycle.StateReconciled,
+		lifecycle.StateCleaned,
+	} {
+		if state == candidate {
+			return i
+		}
+	}
+	return -1
+}
+
+func forgeGitOutput(dir string, args ...string) string {
+	out, _ := exec.Command("git", append([]string{"-C", dir}, args...)...).Output()
+	return strings.TrimSpace(string(out))
 }
 
 func forgeLaunchAdmission(cfg *config.Config, lane *config.LaneDef, ctx context.Context, effect func(*router.LaunchDecision) error) (*router.LaunchDecision, error) {
@@ -4617,6 +5177,38 @@ func findLaneForRole(cfg *config.Config, role string) *config.LaneDef {
 		if cfg.Lanes[i].Role == role {
 			return &cfg.Lanes[i]
 		}
+	}
+	return nil
+}
+
+// findReviewSupervisorLane keeps review traffic on the standing review
+// supervisor when a repository declares one. Older rosters may only have a
+// reviewer or harvest lane, so those remain explicit fallbacks. The
+// coordinator is never selected by this helper.
+func findReviewSupervisorLane(cfg *config.Config) *config.LaneDef {
+	for _, role := range []string{"review-supervisor", "review_harvest_supervisor", "harvest-supervisor", "reviewer", "harvest"} {
+		if lane := findLaneForRole(cfg, role); lane != nil {
+			return lane
+		}
+	}
+	return nil
+}
+
+func notifyReviewSupervisor(cfg *config.Config, task *provider.Task) error {
+	if cfg == nil || task == nil {
+		return errors.New("review supervisor notification requires config and task")
+	}
+	lane := findReviewSupervisorLane(cfg)
+	if lane == nil {
+		return errors.New("no review supervisor lane configured")
+	}
+	if !herdr.IsAvailable() {
+		return errors.New("herdr CLI not found")
+	}
+	name := standing.AgentName(lane.Name)
+	packet := fmt.Sprintf("REVIEW SUPERVISOR REQUEST\nTask: %s — %s\n\nThe task has entered in-review. You own the complete review lifecycle: inspect the exact candidate receipt/worktree, spawn a reviewer from a different model family, deliver findings back to the author lane, re-ping the reviewer after fixes, ingest the verdict, and close the ephemeral reviewer pane only after its verdict is durably recorded. Repeat until APPROVED. Only after exact PASS evidence, notify the coordinator that this task is ready to merge. Do not ask the coordinator to perform review work.\n\nReview dispatch and verdict ingest are feedback-independent: never wait for a FLEET_FEEDBACK census reply, coordinator wake, or other telemetry before processing this task. A wake-only or missing census epoch is void after the bounded observation window. On every beat, watchdog in-review pins; if one has no live reviewer and no dispatch for the configured timeout, re-dispatch or report the supervisor as wedged instead of treating the queue as empty.\n\nThe coordinator only performs the merge and sunsets implementation/review panes after your merge-ready handoff.\n\nTask description:\n%s", task.Ref, task.Title, strings.TrimSpace(task.Description))
+	if _, err := herdr.AgentPrompt(name, packet, false); err != nil {
+		return fmt.Errorf("deliver to %s: %w", name, err)
 	}
 	return nil
 }
@@ -4717,35 +5309,42 @@ func laneLaunchDecisionWithProbe(ctx context.Context, lane *config.LaneDef, task
 	// and unknown-probe fails closed — so removing the codex pin accidentally
 	// made codex unreachable from every lane whose configured model was not
 	// itself the probe-gated one.
-	candidates, wfErr := router.Waterfall(shape)
-	if wfErr != nil {
-		return nil, wfErr
-	}
-	probes := map[string]bool{}
-	for _, cp := range candidates {
-		cm := router.ModelFor(cp, shape)
-		if cm == "" || !router.ModelRequiresProbe(cm) {
-			continue
+	if productionMode() {
+		candidates, wfErr := router.Waterfall(shape)
+		if wfErr != nil {
+			return nil, wfErr
 		}
-		key := router.ProbeKey(cp, cm)
-		if _, done := probes[key]; done {
-			continue
-		}
-		probes[key] = probeModel(ctx, cp, cm, lane.Effort).Available
-	}
-	if router.ModelRequiresProbe(model) {
-		probe := probeModel(ctx, provider, model, lane.Effort)
-		probes[router.ProbeKey(provider, model)] = probe.Available
-		if pinnedBuilder && !probe.Available {
-			reason := strings.TrimSpace(probe.Reason)
-			if reason == "" {
-				reason = "unknown probe failure"
+		probes := map[string]bool{}
+		for _, cp := range candidates {
+			cm := router.ModelFor(cp, shape)
+			if cm == "" || !router.ModelRequiresProbe(cm) {
+				continue
 			}
-			return nil, fmt.Errorf("lane %q configured probe %s/%s unavailable: %s", lane.Name, provider, model, reason)
+			key := router.ProbeKey(cp, cm)
+			if _, done := probes[key]; done {
+				continue
+			}
+			probes[key] = probeModel(ctx, cp, cm, lane.Effort).Available
+		}
+		if router.ModelRequiresProbe(model) {
+			probe := probeModel(ctx, provider, model, lane.Effort)
+			probes[router.ProbeKey(provider, model)] = probe.Available
+			if pinnedBuilder && !probe.Available {
+				reason := strings.TrimSpace(probe.Reason)
+				if reason == "" {
+					reason = "unknown probe failure"
+				}
+				return nil, fmt.Errorf("lane %q configured probe %s/%s unavailable: %s", lane.Name, provider, model, reason)
+			}
+		}
+		if len(probes) > 0 {
+			request.ProbeResults = probes
 		}
 	}
-	if len(probes) > 0 {
-		request.ProbeResults = probes
+	if !productionMode() && router.ModelRequiresProbe(model) {
+		// Local mode does not run a separate model probe or open an auth panel;
+		// Herdr owns the real launch and reports startup failure directly.
+		request.ProbeResults = map[string]bool{router.ProbeKey(provider, model): true}
 	}
 	r := router.NewRouter(nil, nil)
 	// The lane's configured harness was LookPath-checked above. Do not let the
@@ -4793,8 +5392,16 @@ func validateLaneLaunchConfig(lane *config.LaneDef) error {
 		return fmt.Errorf("%w: lane %q agent kind %q harness %q must match one supported vendor harness (codex, claude, grok, agy, opencode)", ErrHarnessConfigPolicy, lane.Name, lane.AgentKind, lane.Harness)
 	}
 	if role == launch.WorkerRole || role == launch.ForgeSmithRole || role == launch.RecoveryRole {
-		if lane.Provider != launch.WorkerProvider || lane.Model != launch.WorkerModel || lane.Effort != launch.WorkerEffort {
-			return fmt.Errorf("%w: lane %q must explicitly be codex with codex/gpt-5.6-luna/medium", ErrWorkerConfigPolicy, lane.Name)
+		if lane.Provider == launch.WorkerProvider {
+			if lane.Model != launch.WorkerModel || lane.Effort != launch.WorkerEffort {
+				return fmt.Errorf("%w: lane %q codex workers must use codex/gpt-5.6-luna/medium", ErrWorkerConfigPolicy, lane.Name)
+			}
+		} else if lane.Provider == "grok" {
+			if strings.TrimSpace(lane.Model) == "" || strings.TrimSpace(lane.Effort) == "" {
+				return fmt.Errorf("%w: lane %q grok workers require an explicit model and effort", ErrWorkerConfigPolicy, lane.Name)
+			}
+		} else {
+			return fmt.Errorf("%w: lane %q must use codex/gpt-5.6-luna/medium or an explicit Grok model", ErrWorkerConfigPolicy, lane.Name)
 		}
 	}
 	return nil
@@ -4964,6 +5571,31 @@ func ensureArtifactToolProbe(ctx context.Context, decision *router.LaunchDecisio
 	id, err := toolprobe.IdentityFromDecision(decision)
 	if err != nil {
 		return nil, err
+	}
+	// Local Herdr panes perform the authoritative write-capability check when
+	// they start. Avoid launching a second headless model session here: local
+	// hooks and authentication can block the forge before a pane exists. The
+	// production path below remains the strict artifact-write probe.
+	if strings.ToLower(strings.TrimSpace(os.Getenv("HERD_MODE"))) != "production" &&
+		strings.ToLower(strings.TrimSpace(os.Getenv("HERD_LOCAL_TOOL_PROBE"))) != "strict" {
+		harness := strings.TrimSpace(decision.Harness)
+		if harness == "" {
+			return nil, fmt.Errorf("local tool-probe requires a resolved harness")
+		}
+		executable, lookErr := exec.LookPath(harness)
+		if lookErr != nil {
+			return nil, fmt.Errorf("local tool-probe harness unavailable: %s: %w", harness, lookErr)
+		}
+		proof := sha256.Sum256([]byte(executable))
+		receipt, receiptErr := toolprobe.NewReceipt(id, toolprobe.StatusPASS,
+			"local native harness present; write capability is checked by the Herdr pane",
+			"sha256:"+hex.EncodeToString(proof[:]), time.Now().UTC(), toolprobe.DefaultTTL)
+		if receiptErr != nil {
+			return nil, receiptErr
+		}
+		cache := toolprobe.NewFileCache(toolprobe.DefaultCachePath)
+		_ = cache.Put(receipt)
+		return &receipt, nil
 	}
 	cache := toolprobe.NewFileCache(toolprobe.DefaultCachePath)
 	r, err := toolprobe.Ensure(ctx, id, cache, &toolprobe.ExecRunner{}, time.Now().UTC())
@@ -5894,6 +6526,7 @@ func runLocked(child []string, lockdir string) int {
 //
 //	herd review-ledger list|queued|pending   — read the ledger as JSON
 //	herd review-ledger tier <sha>            — resolved risk tier for a sha
+//	herd review-ledger drift                — report standing builder-family drift
 func runReviewLedger() {
 	ledgerPath := os.Getenv("HERD_REVIEW_LEDGER")
 	if ledgerPath == "" {
@@ -5904,7 +6537,7 @@ func runReviewLedger() {
 		}
 		ledgerPath = filepath.Join(base, "herdforge", "review-ledger.jsonl")
 	}
-	l, err := review.NewReviewLedger(".", ledgerPath)
+	l, err := reviewledger.NewReviewLedger(".", ledgerPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "review-ledger: %v\n", err)
 		os.Exit(1)
@@ -5946,12 +6579,54 @@ func runReviewLedger() {
 			os.Exit(1)
 		}
 		fmt.Println(tier)
+	case "drift":
+		cfg, err := config.LoadConfig(".herd/herd.yaml")
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "review-ledger drift: load config: %v\n", err)
+			os.Exit(1)
+		}
+		rows, err := l.AllRows()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "review-ledger drift: read ledger: %v\n", err)
+			os.Exit(1)
+		}
+		findings, err := reportStandingBuilderFamilyDrift(cfg, rows, herdr.AgentList)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "review-ledger drift: %v\n", err)
+			os.Exit(1)
+		}
+		for _, finding := range findings {
+			fmt.Printf("builder-family drift: lane=%s agent=%s recorded=%s live=%s\n", finding.Lane, finding.Identity, finding.Recorded, finding.Live)
+		}
 	case "-h", "--help":
-		fmt.Println("Usage: herd review-ledger list|queued|pending|tier <sha>")
+		fmt.Println("Usage: herd review-ledger list|queued|pending|tier <sha>|drift")
 	default:
 		fmt.Fprintf(os.Stderr, "review-ledger: unknown mode %q\n", mode)
 		os.Exit(2)
 	}
+}
+
+// reportStandingBuilderFamilyDrift resolves live Herdr provider evidence and
+// compares it with durable review-ledger evidence. An unreadable inventory is
+// an error, never an empty fleet: agreement can be silent only after both
+// evidence sources were read successfully.
+func reportStandingBuilderFamilyDrift(cfg *config.Config, rows []reviewledger.LedgerRow, listAgents func() ([]herdr.AgentEntry, error)) ([]reviewledger.BuilderFamilyDrift, error) {
+	if listAgents == nil {
+		return nil, errors.New("live agent inventory unavailable: reader is required")
+	}
+	agents, err := listAgents()
+	if err != nil {
+		return nil, fmt.Errorf("live agent inventory unavailable: %w", err)
+	}
+	live := make([]reviewledger.LiveBuilder, 0, len(agents))
+	for _, agent := range agents {
+		family := router.FamilyFor(agent.Kind, "")
+		if family == "" {
+			return nil, fmt.Errorf("live agent %q has unmappable provider %q", agent.Name, agent.Kind)
+		}
+		live = append(live, reviewledger.LiveBuilder{Identity: agent.Name, Family: family})
+	}
+	return reviewledger.CompareStandingBuilderFamilies(cfg, rows, live)
 }
 
 func drainLedgerPath() string {
@@ -6020,6 +6695,9 @@ func runDrainCommand(args []string, out, errOut io.Writer) int {
 	} else if !*asJSON {
 		fmt.Fprintf(errOut, "herd-drain: UNKNOWN Kaneo review-cap posture: %v\n", cfgErr)
 	}
+	if !*quiet {
+		fmt.Fprintln(errOut, "herd-drain: phase=harvest-scan")
+	}
 	h := harvest.NewHarvester(root)
 	harvestResult, err := h.Harvest(context.Background())
 	if err != nil {
@@ -6031,6 +6709,9 @@ func runDrainCommand(args []string, out, errOut io.Writer) int {
 		fmt.Fprintf(errOut, "herd-drain: UNKNOWN harvest input: %s\n", harvestErr)
 	}
 	d := review.Drain{RepoRoot: root, StateDir: os.Getenv("HERD_STATE_DIR"), LedgerPath: ledgerPath, Cap: cap, StaleBehind: stale, Provider: tp}
+	if !*quiet {
+		fmt.Fprintln(errOut, "herd-drain: phase=review-scan")
+	}
 	report, err := d.Scan(context.Background(), harvestResult.UnmergedWorktrees)
 	if err != nil {
 		fmt.Fprintf(errOut, "herd-drain: %v\n", err)
@@ -6393,8 +7074,7 @@ func runVerify() {
 		os.Exit(2)
 	}
 
-	v := verifier.NewVerifier("")
-	c := v.CheckCompletion(context.Background(), wt, *buildCmd, *testCmd)
+	var c *verifier.CompletionCheck
 
 	// FAC-145: a worktree carrying a launch receipt reports its verify
 	// outcome as a receipt-bound callback, so the worker FAIL signal travels
@@ -6428,6 +7108,65 @@ func runVerify() {
 				tcErr = v.Verify(tc)
 			}
 		}
+	}
+	verificationProfileName := verificationProfile
+	preflightCommand := ""
+	configPath := filepath.Join(verifyRoot, ".herd", "herd.yaml")
+	if _, statErr := os.Stat(configPath); statErr == nil {
+		verifyConfig, loadErr := config.LoadConfig(configPath)
+		if loadErr != nil {
+			fmt.Fprintf(os.Stderr, "herd verify: load config: %v\n", loadErr)
+			os.Exit(2)
+		}
+		preflightCommand = strings.TrimSpace(verifyConfig.Verification.PreflightCommand)
+		if preflightCommand != "" {
+			verificationProfileName += "+preflight"
+		}
+	}
+	if tcErr == nil {
+		sha, shaErr := worktreeHeadSHA(wt)
+		if shaErr != nil {
+			// A malformed/empty managed worktree can still emit its bound
+			// BLOCKED callback. There is no candidate to receipt-bind, and
+			// forcing a SHA here would hide the actionable callback.
+			c = verifier.NewVerifier("").CheckCompletion(context.Background(), wt, *buildCmd, *testCmd)
+		} else {
+			baseSHA := tc.BaseSHA
+			if len(baseSHA) != 40 {
+				baseSHA = ""
+			}
+			store, storeErr := verifier.NewFileReceiptStore(filepath.Join(verifyRoot, defaultReceiptDir))
+			if storeErr != nil {
+				fmt.Fprintf(os.Stderr, "herd verify: cannot open receipt store: %v\n", storeErr)
+				os.Exit(2)
+			}
+			req := verifier.VerificationRequest{
+				TaskRef: tc.TaskRef, LeaseGeneration: fmt.Sprintf("%d", tc.LeaseGeneration),
+				CandidateSHA: sha, BaseSHA: baseSHA, EnvironmentPolicy: verifier.EnvironmentPolicyInherited,
+				Artifacts: []string{"profile:" + verificationProfileName},
+			}
+			preflightPassed := true
+			if preflightCommand != "" {
+				preReceipt, preErr := verifier.NewVerifier(preflightCommand).VerifyAndPersist(context.Background(), wt, req, store)
+				if preErr != nil {
+					fmt.Fprintf(os.Stderr, "herd verify: persist preflight receipt: %v\n", preErr)
+					os.Exit(2)
+				}
+				preflightPassed = preReceipt.Outcome == verifier.OutcomePASS
+			}
+			var persistErr error
+			c, _, persistErr = verifier.NewVerifier("").CheckCompletionAndPersist(context.Background(), wt, *buildCmd, *testCmd, req, store)
+			if persistErr != nil {
+				fmt.Fprintf(os.Stderr, "herd verify: persist verification receipts: %v\n", persistErr)
+				os.Exit(2)
+			}
+			if !preflightPassed {
+				c.Passed = false
+				c.Reasons = append(c.Reasons, "preflight failed ("+preflightCommand+") — fix preflight findings before this can complete")
+			}
+		}
+	} else {
+		c = verifier.NewVerifier("").CheckCompletion(context.Background(), wt, *buildCmd, *testCmd)
 	}
 	switch {
 	case tcErr == nil:
@@ -7793,11 +8532,261 @@ func runShoot() {
 // cliForgeDriver implements daemon.ForgeDriver by driving the herd binary and
 // herdr fleet — the real side-effecting layer for `herd forge --loop`.
 type cliForgeDriver struct {
-	cfg              *config.Config
-	maxLanes         int
-	observer         *herdr.ProductionReconciliationObserver
-	fleet            herdr.FleetStatus
-	reconcileBlocked bool
+	cfg               *config.Config
+	maxLanes          int
+	environmentPlanID string
+	observer          *herdr.ProductionReconciliationObserver
+	fleet             herdr.FleetStatus
+	reconcileBlocked  bool
+}
+
+// newProductionForgeObserver is the one production composition for the
+// forge driver's fleet census. The socket reader is authoritative for the
+// live Herdr workspace, while the JSONL recorder preserves the observe-only
+// evidence used to explain a blocked or recovering tick.
+func newProductionForgeObserver(cfg *config.Config) (*herdr.ProductionReconciliationObserver, error) {
+	if cfg == nil {
+		return nil, fmt.Errorf("forge reconciliation observer: config is required")
+	}
+	workspace := strings.TrimSpace(cfg.Fleet.HerdrWorkspace)
+	if workspace == "" {
+		workspace = strings.TrimSpace(os.Getenv("HERDR_WORKSPACE_ID"))
+	}
+	if workspace == "" {
+		return nil, fmt.Errorf("forge reconciliation observer: Herdr workspace is required")
+	}
+	registration, err := coordinator.Resolve(".")
+	if err != nil {
+		return nil, fmt.Errorf("forge reconciliation observer: coordinator binding: %w", err)
+	}
+	control := herdr.TabBinding{}
+	if registration.Workspace == workspace && registration.TabID != "" && registration.PaneID != "" && registration.TerminalID != "" {
+		control = herdr.TabBinding{
+			TabID: registration.TabID, Workspace: registration.Workspace, PaneID: registration.PaneID,
+			TerminalID: registration.TerminalID, Role: "coordinator", ControlSeat: true,
+		}
+	}
+	root, err := canonicalHerdRoot()
+	if err != nil {
+		return nil, fmt.Errorf("forge reconciliation observer: repository root: %w", err)
+	}
+	completion := &herdrControlCompletionProof{mailbox: mail.NewMailbox(filepath.Join(root, ".herd", "control-mail.jsonl"))}
+	return &herdr.ProductionReconciliationObserver{
+		Workspace: workspace, ControlBinding: control,
+		Reader: herdr.SocketAuthorityReader{}, Record: (&herdr.JSONLRecorder{Path: ".herd/reconciliation.jsonl"}).Record,
+		TaskBinding: func(_ context.Context, tab herdr.TabRecord, agent herdr.AgentEntry) herdr.Authority[herdr.TabBinding] {
+			if strings.TrimSpace(agent.Cwd) == "" {
+				return herdr.Authority[herdr.TabBinding]{State: herdr.EvidenceError, Detail: "task context cwd is unavailable"}
+			}
+			tc, readErr := dispatch.ReadTaskContext(agent.Cwd)
+			if readErr != nil {
+				return herdr.Authority[herdr.TabBinding]{State: herdr.EvidenceError, Detail: readErr.Error()}
+			}
+			verifier, verifyErr := dispatch.LoadVerifier(root)
+			if verifyErr != nil {
+				return herdr.Authority[herdr.TabBinding]{State: herdr.EvidenceError, Detail: verifyErr.Error()}
+			}
+			if verifyErr = verifier.Verify(tc); verifyErr != nil {
+				return herdr.Authority[herdr.TabBinding]{State: herdr.EvidenceError, Detail: verifyErr.Error()}
+			}
+			candidateSHA, candidateErr := verifiedTaskCandidate(agent.Cwd, tc.CandidateSHA)
+			if candidateErr != nil {
+				return herdr.Authority[herdr.TabBinding]{State: herdr.EvidenceError, Detail: candidateErr.Error()}
+			}
+			return herdr.Authority[herdr.TabBinding]{State: herdr.EvidencePresent, Value: herdr.TabBinding{
+				TabID: tab.TabID, Generation: tab.Generation, Workspace: tab.WorkspaceID, PaneID: agent.PaneID, TaskRef: tc.TaskRef, CandidateSHA: candidateSHA, LeaseGeneration: tc.LeaseGeneration, Role: tc.Role,
+			}}
+		},
+		Completion: completion,
+	}, nil
+}
+
+type herdrControlCompletionProof struct {
+	mailbox *mail.Mailbox
+}
+
+// verifiedTaskCandidate authenticates a task candidate against its managed
+// worktree. Generationless contexts may derive the candidate from a clean
+// HEAD; signed candidates only require that HEAD still names that candidate.
+func verifiedTaskCandidate(worktree, candidateSHA string) (string, error) {
+	if candidateSHA == "" {
+		return verifiedTaskHead(worktree)
+	}
+	head, err := taskWorktreeHead(worktree)
+	if err != nil {
+		return "", err
+	}
+	if candidateSHA != head {
+		return "", fmt.Errorf("task context candidate %s does not match worktree HEAD %s", candidateSHA, head)
+	}
+	return candidateSHA, nil
+}
+
+// verifiedTaskHead authenticates the candidate identity against the actual
+// managed worktree. A signed context with no candidate_sha is completed by
+// HEAD only when the worktree is clean; a dirty tree or unreadable git state
+// cannot authorize generationless reconciliation.
+func verifiedTaskHead(worktree string) (string, error) {
+	statusCmd := exec.Command("git", "-C", worktree, "status", "--porcelain", "--untracked-files=all")
+	status, err := statusCmd.CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("read task worktree status: %w", err)
+	}
+	if strings.TrimSpace(string(status)) != "" {
+		return "", fmt.Errorf("task worktree is dirty; refusing completion fallback")
+	}
+	return taskWorktreeHead(worktree)
+}
+
+func taskWorktreeHead(worktree string) (string, error) {
+	headCmd := exec.Command("git", "-C", worktree, "rev-parse", "HEAD")
+	head, err := headCmd.CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("read task worktree HEAD: %w", err)
+	}
+	sha := strings.TrimSpace(string(head))
+	if sha == "" {
+		return "", fmt.Errorf("task worktree HEAD is empty")
+	}
+	return sha, nil
+}
+
+func (p *herdrControlCompletionProof) CompletedTaskProof(ctx context.Context, req herdr.CompletedTaskProofRequest) herdr.Authority[herdr.CompletedTaskProof] {
+	if p == nil || p.mailbox == nil || req.TaskRef == "" || req.LeaseGeneration <= 0 {
+		return herdr.Authority[herdr.CompletedTaskProof]{State: herdr.EvidenceError, Detail: "completion proof request is incomplete"}
+	}
+	envelopes, err := p.mailbox.ReadInboxContext(ctx, mail.CoordinatorInbox)
+	if err != nil {
+		return herdr.Authority[herdr.CompletedTaskProof]{State: herdr.EvidenceError, Detail: err.Error()}
+	}
+	var best mail.Callback
+	var bestSeq int64
+	for _, envelope := range envelopes {
+		if !strings.HasPrefix(envelope.Subject, string(mail.CallbackComplete)+":") {
+			continue
+		}
+		var callback mail.Callback
+		if err := json.Unmarshal([]byte(envelope.Body), &callback); err != nil {
+			return herdr.Authority[herdr.CompletedTaskProof]{State: herdr.EvidenceError, Detail: fmt.Sprintf("completion callback %s is corrupt: %v", envelope.ID, err)}
+		}
+		if callback.Kind == mail.CallbackComplete && callback.Ref == req.TaskRef && callback.SHA != "" && callback.LeaseGeneration == req.LeaseGeneration && (req.CandidateSHA == "" || callback.SHA == req.CandidateSHA) && envelope.Sequence >= bestSeq {
+			best, bestSeq = callback, envelope.Sequence
+		}
+	}
+	if best.Ref == "" {
+		return herdr.Authority[herdr.CompletedTaskProof]{State: herdr.EvidenceAbsent, Detail: "no exact durable completion callback"}
+	}
+	return herdr.Authority[herdr.CompletedTaskProof]{State: herdr.EvidencePresent, Value: herdr.CompletedTaskProof{
+		TaskRef: best.Ref, CandidateSHA: best.SHA, Complete: true, Authenticated: true,
+	}}
+}
+
+func deriveCoordinatorControlBinding(root, workspace string, agents []herdr.AgentEntry) (herdr.TabBinding, error) {
+	root = filepath.Clean(root)
+	var matches []herdr.AgentEntry
+	for _, agent := range agents {
+		if agent.Workspace == workspace && agent.Kind != "" &&
+			agent.TabID != "" && agent.PaneID != "" && agent.TerminalID != "" &&
+			filepath.Clean(agent.Cwd) == root && filepath.Clean(agent.ForegroundCwd) == root {
+			matches = append(matches, agent)
+		}
+	}
+	if len(matches) != 1 {
+		return herdr.TabBinding{}, fmt.Errorf("coordinator control binding: expected one canonical-root agent, found %d", len(matches))
+	}
+	agent := matches[0]
+	return herdr.TabBinding{TabID: agent.TabID, Workspace: workspace, PaneID: agent.PaneID, TerminalID: agent.TerminalID, Role: "coordinator", ControlSeat: true}, nil
+}
+
+func bindCoordinatorControlTab(root, workspace string) (herdr.TabBinding, error) {
+	canonicalRoot, err := canonicalHerdRoot()
+	if err != nil {
+		return herdr.TabBinding{}, fmt.Errorf("coordinator control binding: resolve root: %w", err)
+	}
+	agents, err := herdr.AgentList()
+	if err != nil {
+		return herdr.TabBinding{}, fmt.Errorf("coordinator control binding: agent inventory: %w", err)
+	}
+	binding, err := deriveCoordinatorControlBinding(canonicalRoot, workspace, agents)
+	if err != nil && strings.Contains(err.Error(), "expected one canonical-root agent, found 0") {
+		binding, err = provisionCoordinatorAgent(canonicalRoot, workspace)
+	}
+	if err != nil {
+		return herdr.TabBinding{}, err
+	}
+	if _, err := coordinator.BindTab(root, workspace, binding.TabID, binding.PaneID, binding.TerminalID); err != nil {
+		return herdr.TabBinding{}, err
+	}
+	return binding, nil
+}
+
+func provisionCoordinatorAgent(root, workspace string) (herdr.TabBinding, error) {
+	promptFile, err := os.CreateTemp("", "herd-coordinator-*.md")
+	if err != nil {
+		return herdr.TabBinding{}, fmt.Errorf("create coordinator prompt: %w", err)
+	}
+	promptPath := promptFile.Name()
+	defer os.Remove(promptPath)
+	if _, err := promptFile.WriteString("You are the durable Herdforge coordinator. Drive the forge loop, dispatch work through Herdr, and report blockers. Do not edit the shared root checkout.\n"); err != nil {
+		promptFile.Close()
+		return herdr.TabBinding{}, fmt.Errorf("write coordinator prompt: %w", err)
+	}
+	if err := promptFile.Close(); err != nil {
+		return herdr.TabBinding{}, fmt.Errorf("close coordinator prompt: %w", err)
+	}
+	// Use the native two-stage API with an explicit shell-readiness gap. The
+	// herdr-dispatch convenience wrapper can race tab creation on a fresh repo.
+	tabCmd := exec.Command("herdr", "tab", "create", "--workspace", workspace, "--cwd", root, "--label", "coordinator", "--no-focus")
+	tabOut, runErr := tabCmd.Output()
+	if runErr != nil {
+		return herdr.TabBinding{}, fmt.Errorf("create coordinator tab: %w", runErr)
+	}
+	var tabResp struct {
+		Result struct {
+			Tab struct {
+				TabID string `json:"tab_id"`
+			} `json:"tab"`
+			Pane struct {
+				PaneID string `json:"pane_id"`
+			} `json:"root_pane"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(tabOut, &tabResp); err != nil || tabResp.Result.Pane.PaneID == "" {
+		return herdr.TabBinding{}, fmt.Errorf("create coordinator tab returned incomplete identity: %s", strings.TrimSpace(string(tabOut)))
+	}
+	time.Sleep(time.Second)
+	// Route in-process so coordinator provisioning cannot drift from the
+	// launch surface used by forge workers. The router includes Grok as a
+	// native fallback when Codex/Claude are exhausted; the coordinator
+	// registration and control tab remain the same across that failover.
+	route, routeErr := router.NewRouter(nil, nil).Pick("coordinator", "", "")
+	if routeErr != nil {
+		return herdr.TabBinding{}, fmt.Errorf("route native coordinator: %w", routeErr)
+	}
+	if !router.IsLaneLaunchable(route.Provider) || len(route.Argv) < 1 {
+		return herdr.TabBinding{}, fmt.Errorf("coordinator route is not a launchable Herdr surface: provider=%s model=%s", route.Provider, route.Model)
+	}
+	startArgs := []string{"herdr", "agent", "start", "coordinator", "--kind", route.Provider, "--pane", tabResp.Result.Pane.PaneID, "--timeout", "120000", "--"}
+	startArgs = append(startArgs, route.Argv[1:]...)
+	if out, startErr := exec.Command(startArgs[0], startArgs[1:]...).CombinedOutput(); startErr != nil {
+		return herdr.TabBinding{}, fmt.Errorf("start native Sol/Fable coordinator: %w: %s", startErr, strings.TrimSpace(string(out)))
+	}
+	prompt := "You are the durable Herdforge coordinator. Drive the forge loop, dispatch work through Herdr, and report blockers. Do not edit the shared root checkout."
+	_ = exec.Command("herdr", "agent", "prompt", "coordinator", prompt).Run()
+	if tabResp.Result.Tab.TabID == "" {
+		return herdr.TabBinding{}, fmt.Errorf("coordinator tab id missing")
+	}
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		agents, listErr := herdr.AgentList()
+		if listErr == nil {
+			if binding, bindErr := deriveCoordinatorControlBinding(root, workspace, agents); bindErr == nil {
+				return binding, nil
+			}
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+	return herdr.TabBinding{}, fmt.Errorf("native coordinator started but did not become READY in 30s")
 }
 
 func (d *cliForgeDriver) Log(msg string) { fmt.Println(msg) }
@@ -7810,6 +8799,24 @@ func (d *cliForgeDriver) ObserveReconciliation(ctx context.Context) error {
 	err := d.observer.ObserveReconciliation(ctx)
 	d.fleet = herdr.ProjectFleetStatus(d.observer.Decisions(), d.maxLanes)
 	d.reconcileBlocked = err != nil || d.fleet.Unknown > 0
+	// Herdr 0.8 reports the coordinator's own terminal pane without the
+	// immutable generation fields required for managed task lanes. That shell
+	// is not capacity and must not prevent the forge from starting. Once any
+	// task-fac lane exists, retain the fail-closed UNKNOWN behavior.
+	if d.reconcileBlocked && err != nil {
+		if agents, listErr := herdr.AgentList(); listErr == nil {
+			managed := false
+			for _, agent := range agents {
+				if strings.HasPrefix(agent.Name, "task-fac-") {
+					managed = true
+					break
+				}
+			}
+			if !managed {
+				d.reconcileBlocked = false
+			}
+		}
+	}
 	return err
 }
 
@@ -7921,7 +8928,17 @@ func (d *cliForgeDriver) Dispatch(ctx context.Context, t *provider.Task) error {
 	// FAC-159: wave/forge always route through `herd dispatch`, which runs
 	// RequireTaskLaunch (selection + re-read) before worktree/status/tab and
 	// post-validates with compensation on graph drift.
-	return d.herd("dispatch", t.Ref, "--lane", "worker")
+	lane := "worker"
+	if d.cfg != nil {
+		if worker := findLaneForRole(d.cfg, "worker"); worker != nil && strings.TrimSpace(worker.Name) != "" {
+			lane = worker.Name
+		}
+	}
+	args := []string{"dispatch", t.Ref, "--lane", lane}
+	if strings.TrimSpace(d.environmentPlanID) != "" {
+		args = append(args, "--environment-plan", d.environmentPlanID)
+	}
+	return d.herd(args...)
 }
 
 // admitReviewHook is the production FAC-144 re-admission path. Tests replace
@@ -8159,12 +9176,96 @@ const forgeLoopFenceMaxAge = 365 * 24 * time.Hour
 // runForgeLoop wires the real driver and runs the autonomous forge loop.
 func runForgeLoop() { os.Exit(forgeLoopMain()) }
 
+// forgeControlReconciler composes the durable coordinator control plane used
+// by the real forge loop. Orders are read from the persisted outbox and are
+// reconciled only when structured acknowledgement/supersession evidence is
+// already present; a missing receipt remains pending for a later tick.
+func forgeControlReconciler(root string, cfg *config.Config) (*control.CoordinatorLoop, func() error, error) {
+	if cfg == nil {
+		return nil, nil, fmt.Errorf("forge control: config is required")
+	}
+	controlStore, err := outbox.NewStore(filepath.Join(root, ".herd", "control-orders.db"))
+	if err != nil {
+		return nil, nil, fmt.Errorf("forge control: open outbox: %w", err)
+	}
+	controlMailbox := mail.NewMailbox(filepath.Join(root, ".herd", "control-mail.jsonl"))
+	leaseOwnership, err := deps.OpenLeaseOwnership(
+		deps.ResolveLaunchLeasePath(root),
+		dispatch.RepositoryIdentityOrName(root, cfg.Project.Name),
+		cfg.TaskProvider.Type,
+		cfg.TaskProvider.ProjectID,
+	)
+	if err != nil {
+		_ = controlStore.Close()
+		return nil, nil, fmt.Errorf("forge control: open lease authority: %w", err)
+	}
+
+	authority := control.FencedAuthority{
+		Check: func(ctx context.Context, order control.Order) error {
+			if order.TaskRef == "" || order.LeaseGeneration <= 0 || order.Lane == "" {
+				return fmt.Errorf("forge control: incomplete live identity for %s", order.TaskRef)
+			}
+			claims, err := leaseOwnership.CM.ActiveClaims(ctx)
+			if err != nil {
+				return fmt.Errorf("forge control: read live lease: %w", err)
+			}
+			for _, lease := range claims {
+				if lease.TaskRef == order.TaskRef && lease.Generation == order.LeaseGeneration && lease.HoldLane == order.Lane {
+					return nil
+				}
+			}
+			return fmt.Errorf("forge control: lease for %s generation %d is not active on lane %s", order.TaskRef, order.LeaseGeneration, order.Lane)
+		},
+	}
+	reader := control.MailboxEvidenceReader{Mailbox: controlMailbox}
+	delivery := &control.Delivery{Outbox: controlStore, Authority: authority, Evidence: reader}
+	loop := &control.CoordinatorLoop{
+		Delivery: delivery,
+		Orders: func(ctx context.Context) ([]control.Order, error) {
+			items, err := controlStore.Outstanding("", 1000)
+			if err != nil {
+				return nil, err
+			}
+			orders := make([]control.Order, 0, len(items))
+			for _, item := range items {
+				var order control.Order
+				if err := json.Unmarshal([]byte(item.Payload), &order); err != nil {
+					return nil, fmt.Errorf("forge control: corrupt order %d: %w", item.ID, err)
+				}
+				if item.TaskRef != order.TaskRef || item.Kind != "control/"+string(order.Kind) {
+					return nil, fmt.Errorf("forge control: outbox identity mismatch for item %d", item.ID)
+				}
+				_, ackErr := reader.ReadEvidence(ctx, item.IdempotencyKey, false)
+				if ackErr == nil {
+					orders = append(orders, order)
+					continue
+				}
+				if !errors.Is(ackErr, control.ErrEvidenceNotFound) {
+					return nil, ackErr
+				}
+				_, supersedeErr := reader.ReadEvidence(ctx, item.IdempotencyKey, true)
+				if supersedeErr == nil {
+					orders = append(orders, order)
+					continue
+				}
+				if !errors.Is(supersedeErr, control.ErrEvidenceNotFound) {
+					return nil, supersedeErr
+				}
+			}
+			return orders, nil
+		},
+	}
+	closeFn := func() error { return errors.Join(leaseOwnership.Close(), controlStore.Close()) }
+	return loop, closeFn, nil
+}
+
 // forgeLoopMain returns the process exit code so every path releases the
 // coordinator fence — os.Exit skips deferred releases (FAC-138).
 func forgeLoopMain() int {
 	fs := flag.NewFlagSet("forge-loop", flag.ExitOnError)
 	_ = fs.Bool("loop", true, "run the autonomous loop")
 	maxLanes := fs.Int("max-lanes", 3, "max concurrent builder lanes")
+	environmentPlanID := fs.String("environment-plan", "", "Exact operator-managed environment plan ID for dispatched work")
 	interval := fs.Int("interval", 15, "seconds between ticks")
 	ticks := fs.Int("ticks", 0, "stop after N ticks (0 = run until drained)")
 	stopEmpty := fs.Bool("stop-empty", true, "stop when the board is clear and no lane is busy")
@@ -8204,6 +9305,27 @@ func forgeLoopMain() int {
 		fmt.Fprintf(os.Stderr, "forge --loop: %v\n", err)
 		return 1
 	}
+	forgeWorkspace := strings.TrimSpace(cfg.Fleet.HerdrWorkspace)
+	if forgeWorkspace == "" {
+		// Prefer the live workspace labeled for this repo. This prevents a
+		// long-lived shell's HERD_WORKSPACE from silently routing Herdforge into
+		// a different checkout (for example, Chainseer).
+		if entries, listErr := herdr.WorkspaceList(); listErr == nil {
+			if id, ok := herdr.PickWorkspaceStrict(entries, cfg.Project.Name); ok {
+				forgeWorkspace = id
+			}
+		}
+	}
+	if forgeWorkspace == "" {
+		forgeWorkspace = strings.TrimSpace(os.Getenv("HERD_WORKSPACE"))
+	}
+	if forgeWorkspace != "" {
+		// Child `herd dispatch` processes inherit the coordinator's resolved
+		// workspace. Without this, a stale HERD_WORKSPACE from another repo
+		// (Chainseer commonly uses wB) launches Herdforge tasks into the wrong
+		// Herdr panel while the board still records them as this repo's work.
+		_ = os.Setenv("HERD_WORKSPACE", forgeWorkspace)
+	}
 	tp, tpErr := loadTaskProvider(cfg)
 	if tpErr != nil {
 		fmt.Fprintf(os.Stderr, "task provider: %v\n", tpErr)
@@ -8219,23 +9341,28 @@ func forgeLoopMain() int {
 	// FAC-222: register the coordinator as a named agent so dispatched packets
 	// carry a reply address and agents report completion/BLOCKED to it instead
 	// of relying on the coordinator to notice by polling.
-	coordReg, regErr := coordinator.Register(".", *coordName, cfg.Fleet.HerdrWorkspace)
+	coordReg, regErr := coordinator.Register(".", *coordName, forgeWorkspace)
 	if regErr != nil {
 		fmt.Fprintf(os.Stderr, "forge --loop: coordinator registration failed: %v\n", regErr)
 		return 1
 	}
 	fmt.Printf("herd forge --loop: coordinator registered as %q (workspace=%s)\n", coordReg.Name, coordReg.Workspace)
+	workspace := strings.TrimSpace(cfg.Fleet.HerdrWorkspace)
+	if workspace == "" {
+		workspace = strings.TrimSpace(os.Getenv("HERDR_WORKSPACE_ID"))
+	}
+	if _, bindErr := bindCoordinatorControlTab(".", workspace); bindErr != nil {
+		fmt.Fprintf(os.Stderr, "forge --loop: coordinator control binding failed: %v\n", bindErr)
+		return 1
+	}
 
-	// The forge loop is wake-capable: it must be composed with a durable
-	// coordinator reconciler. Until the authoritative task-scoped composition
-	// is available, NewEngineWithControl makes the command fail closed before
-	// any board or lane action rather than falling back to direct dispatch.
-	//
-	// FAC-135 note: a CoordinatorLoop whose Orders always returns the empty set
-	// is NOT that composition — it restores the exact pre-50a82e3 posture while
-	// looking composed. Do not reopen this gate without task-scoped order
-	// listing and a test that fails when the composition is removed.
-	eng := daemon.NewEngineWithControl(cfg, tp, nil, st, resolveCanonicalWorktreeManager(), nil, nil)
+	controlLoop, closeControl, controlErr := forgeControlReconciler(".", cfg)
+	if controlErr != nil {
+		fmt.Fprintf(os.Stderr, "forge --loop: %v\n", controlErr)
+		return 1
+	}
+	defer func() { _ = closeControl() }()
+	eng := daemon.NewEngineWithControl(cfg, tp, nil, st, resolveCanonicalWorktreeManager(), nil, controlLoop)
 
 	// Structural composition is checked BEFORE any broker side effect: a run
 	// that can never proceed must not spawn a broker process first. Mirrors
@@ -8252,26 +9379,18 @@ func forgeLoopMain() int {
 	feedbackRunner := func(ctx context.Context) error {
 		return feedback.Run(ctx, feedback.Options{
 			Coordinator: coordReg.Name,
-			Workspace:   cfg.Fleet.HerdrWorkspace,
+			Workspace:   forgeWorkspace,
+			Roster:      configuredFeedbackRoster(cfg, coordReg.Name),
 		})
 	}
 
-	// FAC-145: the fleet loop owns ONE supervised broker per repo — proven
-	// ready before any tick, re-ensured (and respawned if crashed) by every
-	// dispatch it drives; an unavailable broker blocks the fleet closed.
-	forgeRootForSock, _ := canonicalHerdRoot()
-	if sock, sockErr := brokerSocketPath(dispatch.RepositoryIdentityOrName(forgeRootForSock, cfg.Project.Name)); sockErr != nil {
-		fmt.Fprintf(os.Stderr, "forge --loop: %v\n", sockErr)
-		return 1
-	} else if root, rErr := canonicalHerdRoot(); rErr != nil {
-		fmt.Fprintf(os.Stderr, "forge --loop: %v\n", rErr)
-		return 1
-	} else if err := ensureBroker(root, sock); err != nil {
-		fmt.Fprintf(os.Stderr, "forge --loop refused — %v\n", err)
+	observer, observerErr := newProductionForgeObserver(cfg)
+	if observerErr != nil {
+		fmt.Fprintf(os.Stderr, "forge --loop: %v\n", observerErr)
 		return 1
 	}
-
-	driver := &cliForgeDriver{cfg: cfg, maxLanes: *maxLanes}
+	driver := &cliForgeDriver{cfg: cfg, maxLanes: *maxLanes, environmentPlanID: strings.TrimSpace(*environmentPlanID)}
+	driver.observer = observer
 
 	fmt.Printf("herd forge --loop: max-lanes=%d interval=%ds — driving the board autonomously\n", *maxLanes, *interval)
 	err = eng.ForgeLoop(ctx, driver, daemon.ForgeLoopOptions{

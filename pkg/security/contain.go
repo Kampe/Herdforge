@@ -496,11 +496,28 @@ func buildNetprobe(binDir string) (string, error) {
 		return "", err
 	}
 	cmd := exec.Command("go", "build", "-o", dst, src)
-	cmd.Env = append(os.Environ(), "CGO_ENABLED=0")
+	// A long-lived shell can export a GOROOT from a different Go install than
+	// the `go` binary on PATH. That makes live FAC-133 proofs fail while
+	// compiling the disposable netprobe (stdlib packages report mixed tool
+	// versions). Let the selected Go binary resolve its own root.
+	cmd.Env = hermeticGoBuildEnv()
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return "", fmt.Errorf("go build netprobe: %v: %s", err, out)
 	}
 	return dst, nil
+}
+
+func hermeticGoBuildEnv() []string {
+	base := os.Environ()
+	env := make([]string, 0, len(base)+2)
+	for _, entry := range base {
+		if strings.HasPrefix(entry, "GOROOT=") || strings.HasPrefix(entry, "GOTOOLDIR=") {
+			continue
+		}
+		env = append(env, entry)
+	}
+	env = append(env, "CGO_ENABLED=0", "GOTOOLCHAIN=local")
+	return env
 }
 
 func brokerPortOnly(endpoint string) string {

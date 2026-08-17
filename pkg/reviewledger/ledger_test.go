@@ -134,6 +134,30 @@ func TestRecord(t *testing.T) {
 	}
 }
 
+func TestEnsureRecordIsIdempotent(t *testing.T) {
+	l := newTestLedger(t)
+	opts := RecordOpts{SHA: "abc123", Branch: "herd/fac-345", BuilderFamily: "openai", ReviewerFamily: "anthropic", Reviewer: "reviewer-1", Gate: "independent"}
+	if err := l.EnsureRecord(opts); err != nil {
+		t.Fatalf("first EnsureRecord: %v", err)
+	}
+	if err := l.EnsureRecord(opts); err != nil {
+		t.Fatalf("second EnsureRecord: %v", err)
+	}
+	rows, err := l.AllRows()
+	if err != nil {
+		t.Fatal(err)
+	}
+	count := 0
+	for _, row := range rows {
+		if row.Event == string(EventRecord) && row.SHA == opts.SHA && row.Reviewer == opts.Reviewer {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Fatalf("record count = %d, want 1", count)
+	}
+}
+
 func TestVerdict(t *testing.T) {
 	t.Run("PASS enqueues and queue row is written", func(t *testing.T) {
 		l := newTestLedger(t)
@@ -667,5 +691,25 @@ func TestEligibleNoRecordAtAll(t *testing.T) {
 	}
 	if eligible {
 		t.Error("sha with no records should not be eligible")
+	}
+}
+
+func TestDecisionEventsAreExplicitAndPreserveReason(t *testing.T) {
+	l := newTestLedger(t)
+	if err := l.Refutation(DecisionOpts{SHA: "newsha", PreviousSHA: "oldsha", Reviewer: "reviewer", Reason: "finding disproven", FindingsRef: "findings.md"}); err != nil {
+		t.Fatalf("Refutation: %v", err)
+	}
+	if err := l.Supersession(DecisionOpts{SHA: "replacement", PreviousSHA: "oldsha", Reviewer: "reviewer", Reason: "replacement repairs the finding", CandidateSHA: "replacement"}); err != nil {
+		t.Fatalf("Supersession: %v", err)
+	}
+	rows, err := l.AllRows()
+	if err != nil {
+		t.Fatalf("AllRows: %v", err)
+	}
+	if len(rows) != 2 || rows[0].Event != string(EventRefutation) || rows[1].Event != string(EventSupersession) {
+		t.Fatalf("unexpected decision rows: %+v", rows)
+	}
+	if rows[0].Reason == "" || rows[0].Task != "oldsha" || rows[1].Reason == "" || rows[1].Task != "oldsha" {
+		t.Fatalf("decision relationship not retained: %+v", rows)
 	}
 }

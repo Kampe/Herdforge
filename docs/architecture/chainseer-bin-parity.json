@@ -1,0 +1,856 @@
+{
+  "version": 1,
+  "task": "FAC-309",
+  "source_root": "chainseer/bin",
+  "source_revision": "ad284cc5d599229affa04c84114875f1ca9b4b71",
+  "source_executable_count": 124,
+  "entries": [
+    {
+      "path": "bin/agent-finish",
+      "disposition": "generic_capability",
+      "capability_tickets": [
+        "FAC-304",
+        "FAC-306",
+        "FAC-307",
+        "FAC-308"
+      ],
+      "rationale": "Generic worker or control-plane capability is tracked for Herdforge parity and has no exact command replacement yet."
+    },
+    {
+      "path": "bin/agent-lib.sh",
+      "disposition": "generic_capability",
+      "capability_tickets": [
+        "FAC-304",
+        "FAC-306",
+        "FAC-307",
+        "FAC-308"
+      ],
+      "rationale": "Generic worker or control-plane capability is tracked for Herdforge parity and has no exact command replacement yet."
+    },
+    {
+      "path": "bin/agent-pr-merge",
+      "disposition": "generic_capability",
+      "capability_tickets": [
+        "FAC-304",
+        "FAC-306",
+        "FAC-307",
+        "FAC-308"
+      ],
+      "rationale": "Generic worker or control-plane capability is tracked for Herdforge parity and has no exact command replacement yet."
+    },
+    {
+      "path": "bin/agent-preflight",
+      "disposition": "generic_capability",
+      "capability_tickets": [
+        "FAC-304",
+        "FAC-306",
+        "FAC-307",
+        "FAC-308"
+      ],
+      "rationale": "Generic worker or control-plane capability is tracked for Herdforge parity and has no exact command replacement yet."
+    },
+    {
+      "path": "bin/apply-migrations",
+      "disposition": "chainseer_product_exemption",
+      "rationale": "Chainseer product, deployment, data, release, or repository-specific wrapper; it is not a Herdforge control-plane surface."
+    },
+    {
+      "path": "bin/check-barrel-exports",
+      "disposition": "chainseer_product_exemption",
+      "rationale": "Chainseer product, deployment, data, release, or repository-specific wrapper; it is not a Herdforge control-plane surface."
+    },
+    {
+      "path": "bin/check-bridge-registry",
+      "disposition": "chainseer_product_exemption",
+      "rationale": "Chainseer product, deployment, data, release, or repository-specific wrapper; it is not a Herdforge control-plane surface."
+    },
+    {
+      "path": "bin/check-changed-tests",
+      "disposition": "chainseer_product_exemption",
+      "rationale": "Chainseer product, deployment, data, release, or repository-specific wrapper; it is not a Herdforge control-plane surface."
+    },
+    {
+      "path": "bin/check-compose-ov-registry",
+      "disposition": "chainseer_product_exemption",
+      "rationale": "Chainseer product, deployment, data, release, or repository-specific wrapper; it is not a Herdforge control-plane surface."
+    },
+    {
+      "path": "bin/check-coupling-seams",
+      "disposition": "chainseer_product_exemption",
+      "rationale": "Chainseer product, deployment, data, release, or repository-specific wrapper; it is not a Herdforge control-plane surface."
+    },
+    {
+      "path": "bin/check-generated-drift",
+      "disposition": "chainseer_product_exemption",
+      "rationale": "Chainseer product, deployment, data, release, or repository-specific wrapper; it is not a Herdforge control-plane surface."
+    },
+    {
+      "path": "bin/check-phantom-deps",
+      "disposition": "chainseer_product_exemption",
+      "rationale": "Chainseer product, deployment, data, release, or repository-specific wrapper; it is not a Herdforge control-plane surface."
+    },
+    {
+      "path": "bin/check-recon-manifests",
+      "disposition": "chainseer_product_exemption",
+      "rationale": "Chainseer product, deployment, data, release, or repository-specific wrapper; it is not a Herdforge control-plane surface."
+    },
+    {
+      "path": "bin/check-surface-tests",
+      "disposition": "chainseer_product_exemption",
+      "rationale": "Chainseer product, deployment, data, release, or repository-specific wrapper; it is not a Herdforge control-plane surface."
+    },
+    {
+      "path": "bin/check-unbound-vars",
+      "disposition": "chainseer_product_exemption",
+      "rationale": "Chainseer product, deployment, data, release, or repository-specific wrapper; it is not a Herdforge control-plane surface."
+    },
+    {
+      "path": "bin/check-workspace-links",
+      "disposition": "chainseer_product_exemption",
+      "rationale": "Chainseer product, deployment, data, release, or repository-specific wrapper; it is not a Herdforge control-plane surface."
+    },
+    {
+      "path": "bin/check-worktree-dependencies",
+      "disposition": "chainseer_product_exemption",
+      "rationale": "Chainseer product, deployment, data, release, or repository-specific wrapper; it is not a Herdforge control-plane surface."
+    },
+    {
+      "path": "bin/ci-local",
+      "disposition": "chainseer_product_exemption",
+      "rationale": "Chainseer product, deployment, data, release, or repository-specific wrapper; it is not a Herdforge control-plane surface."
+    },
+    {
+      "path": "bin/compose-guard",
+      "disposition": "chainseer_product_exemption",
+      "rationale": "Chainseer product, deployment, data, release, or repository-specific wrapper; it is not a Herdforge control-plane surface."
+    },
+    {
+      "path": "bin/cs",
+      "disposition": "chainseer_product_exemption",
+      "rationale": "Chainseer product, deployment, data, release, or repository-specific wrapper; it is not a Herdforge control-plane surface."
+    },
+    {
+      "path": "bin/cs-release",
+      "disposition": "chainseer_product_exemption",
+      "rationale": "Chainseer product, deployment, data, release, or repository-specific wrapper; it is not a Herdforge control-plane surface."
+    },
+    {
+      "path": "bin/datalake-lint",
+      "disposition": "chainseer_product_exemption",
+      "rationale": "Chainseer product, deployment, data, release, or repository-specific wrapper; it is not a Herdforge control-plane surface."
+    },
+    {
+      "path": "bin/dev-down",
+      "disposition": "chainseer_product_exemption",
+      "rationale": "Chainseer product, deployment, data, release, or repository-specific wrapper; it is not a Herdforge control-plane surface."
+    },
+    {
+      "path": "bin/dev-up",
+      "disposition": "chainseer_product_exemption",
+      "rationale": "Chainseer product, deployment, data, release, or repository-specific wrapper; it is not a Herdforge control-plane surface."
+    },
+    {
+      "path": "bin/dev-verify",
+      "disposition": "chainseer_product_exemption",
+      "rationale": "Chainseer product, deployment, data, release, or repository-specific wrapper; it is not a Herdforge control-plane surface."
+    },
+    {
+      "path": "bin/docs-check",
+      "disposition": "chainseer_product_exemption",
+      "rationale": "Chainseer product, deployment, data, release, or repository-specific wrapper; it is not a Herdforge control-plane surface."
+    },
+    {
+      "path": "bin/docs-lint",
+      "disposition": "chainseer_product_exemption",
+      "rationale": "Chainseer product, deployment, data, release, or repository-specific wrapper; it is not a Herdforge control-plane surface."
+    },
+    {
+      "path": "bin/em-dash-guard",
+      "disposition": "chainseer_product_exemption",
+      "rationale": "Chainseer product, deployment, data, release, or repository-specific wrapper; it is not a Herdforge control-plane surface."
+    },
+    {
+      "path": "bin/fixture-wallets-prune",
+      "disposition": "chainseer_product_exemption",
+      "rationale": "Chainseer product, deployment, data, release, or repository-specific wrapper; it is not a Herdforge control-plane surface."
+    },
+    {
+      "path": "bin/gitleaks-scan",
+      "disposition": "chainseer_product_exemption",
+      "rationale": "Chainseer product, deployment, data, release, or repository-specific wrapper; it is not a Herdforge control-plane surface."
+    },
+    {
+      "path": "bin/herd-activate",
+      "disposition": "herdforge_command_replacement",
+      "replacement": "herd activate",
+      "ticket": "FAC-309",
+      "rationale": "Herdforge exposes the corresponding control-plane command."
+    },
+    {
+      "path": "bin/herd-allocator-lib.sh",
+      "disposition": "generic_capability",
+      "capability_tickets": [
+        "FAC-304",
+        "FAC-306",
+        "FAC-307",
+        "FAC-308"
+      ],
+      "rationale": "Generic worker or control-plane capability is tracked for Herdforge parity and has no exact command replacement yet."
+    },
+    {
+      "path": "bin/herd-attention",
+      "disposition": "herdforge_command_replacement",
+      "replacement": "herd attention",
+      "ticket": "FAC-309",
+      "rationale": "Herdforge exposes the corresponding control-plane command."
+    },
+    {
+      "path": "bin/herd-blackbox",
+      "disposition": "chainseer_product_exemption",
+      "rationale": "Chainseer product, deployment, data, release, or repository-specific wrapper; it is not a Herdforge control-plane surface."
+    },
+    {
+      "path": "bin/herd-blackbox-reap",
+      "disposition": "chainseer_product_exemption",
+      "rationale": "Chainseer product, deployment, data, release, or repository-specific wrapper; it is not a Herdforge control-plane surface."
+    },
+    {
+      "path": "bin/herd-board-done",
+      "disposition": "herdforge_command_replacement",
+      "replacement": "herd board-done",
+      "ticket": "FAC-309",
+      "rationale": "Herdforge exposes the corresponding control-plane command."
+    },
+    {
+      "path": "bin/herd-board-frozen",
+      "disposition": "herdforge_command_replacement",
+      "replacement": "herd board-frozen",
+      "ticket": "FAC-309",
+      "rationale": "Herdforge exposes the corresponding control-plane command."
+    },
+    {
+      "path": "bin/herd-board-sync",
+      "disposition": "herdforge_command_replacement",
+      "replacement": "herd board-sync",
+      "ticket": "FAC-309",
+      "rationale": "Herdforge exposes the corresponding control-plane command."
+    },
+    {
+      "path": "bin/herd-build",
+      "disposition": "chainseer_product_exemption",
+      "rationale": "Chainseer product, deployment, data, release, or repository-specific wrapper; it is not a Herdforge control-plane surface."
+    },
+    {
+      "path": "bin/herd-claim",
+      "disposition": "generic_capability",
+      "capability_tickets": [
+        "FAC-304",
+        "FAC-306",
+        "FAC-307",
+        "FAC-308"
+      ],
+      "rationale": "Generic worker or control-plane capability is tracked for Herdforge parity and has no exact command replacement yet."
+    },
+    {
+      "path": "bin/herd-claim-jq",
+      "disposition": "generic_capability",
+      "capability_tickets": [
+        "FAC-304",
+        "FAC-306",
+        "FAC-307",
+        "FAC-308"
+      ],
+      "rationale": "Generic worker or control-plane capability is tracked for Herdforge parity and has no exact command replacement yet."
+    },
+    {
+      "path": "bin/herd-claude-only",
+      "disposition": "herdforge_command_replacement",
+      "replacement": "herd claude-only",
+      "ticket": "FAC-309",
+      "rationale": "Herdforge exposes the corresponding control-plane command."
+    },
+    {
+      "path": "bin/herd-cleanup",
+      "disposition": "herdforge_command_replacement",
+      "replacement": "herd cleanup",
+      "ticket": "FAC-309",
+      "rationale": "Herdforge exposes the corresponding control-plane command."
+    },
+    {
+      "path": "bin/herd-credits",
+      "disposition": "chainseer_product_exemption",
+      "rationale": "Chainseer product, deployment, data, release, or repository-specific wrapper; it is not a Herdforge control-plane surface."
+    },
+    {
+      "path": "bin/herd-dispatch",
+      "disposition": "chainseer_product_exemption",
+      "rationale": "Chainseer product, deployment, data, release, or repository-specific wrapper; it is not a Herdforge control-plane surface."
+    },
+    {
+      "path": "bin/herd-drain",
+      "disposition": "herdforge_command_replacement",
+      "replacement": "herd drain",
+      "ticket": "FAC-309",
+      "rationale": "Herdforge exposes the corresponding control-plane command."
+    },
+    {
+      "path": "bin/herd-ensure-watch",
+      "disposition": "generic_capability",
+      "capability_tickets": [
+        "FAC-304",
+        "FAC-306",
+        "FAC-307",
+        "FAC-308"
+      ],
+      "rationale": "Generic worker or control-plane capability is tracked for Herdforge parity and has no exact command replacement yet."
+    },
+    {
+      "path": "bin/herd-feedback",
+      "disposition": "herdforge_command_replacement",
+      "replacement": "herd feedback",
+      "ticket": "FAC-309",
+      "rationale": "Herdforge exposes the corresponding control-plane command."
+    },
+    {
+      "path": "bin/herd-fresh-build",
+      "disposition": "herdforge_command_replacement",
+      "replacement": "herd fresh-build",
+      "ticket": "FAC-309",
+      "rationale": "Herdforge exposes the corresponding control-plane command."
+    },
+    {
+      "path": "bin/herd-fswatch",
+      "disposition": "generic_capability",
+      "capability_tickets": [
+        "FAC-304",
+        "FAC-306",
+        "FAC-307",
+        "FAC-308"
+      ],
+      "rationale": "Generic worker or control-plane capability is tracked for Herdforge parity and has no exact command replacement yet."
+    },
+    {
+      "path": "bin/herd-gc",
+      "disposition": "chainseer_product_exemption",
+      "rationale": "Chainseer product, deployment, data, release, or repository-specific wrapper; it is not a Herdforge control-plane surface."
+    },
+    {
+      "path": "bin/herd-goal-guard",
+      "disposition": "chainseer_product_exemption",
+      "rationale": "Chainseer product, deployment, data, release, or repository-specific wrapper; it is not a Herdforge control-plane surface."
+    },
+    {
+      "path": "bin/herd-graph",
+      "disposition": "generic_capability",
+      "capability_tickets": [
+        "FAC-304",
+        "FAC-306",
+        "FAC-307",
+        "FAC-308"
+      ],
+      "rationale": "Generic worker or control-plane capability is tracked for Herdforge parity and has no exact command replacement yet."
+    },
+    {
+      "path": "bin/herd-grok-skills",
+      "disposition": "generic_capability",
+      "capability_tickets": [
+        "FAC-304",
+        "FAC-306",
+        "FAC-307",
+        "FAC-308"
+      ],
+      "rationale": "Generic worker or control-plane capability is tracked for Herdforge parity and has no exact command replacement yet."
+    },
+    {
+      "path": "bin/herd-harvest",
+      "disposition": "herdforge_command_replacement",
+      "replacement": "herd harvest",
+      "ticket": "FAC-309",
+      "rationale": "Herdforge exposes the corresponding control-plane command."
+    },
+    {
+      "path": "bin/herd-harvest-merge",
+      "disposition": "herdforge_command_replacement",
+      "replacement": "herd harvest-merge",
+      "ticket": "FAC-309",
+      "rationale": "Herdforge exposes the corresponding control-plane command."
+    },
+    {
+      "path": "bin/herd-hold",
+      "disposition": "herdforge_command_replacement",
+      "replacement": "herd hold",
+      "ticket": "FAC-309",
+      "rationale": "Herdforge exposes the corresponding control-plane command."
+    },
+    {
+      "path": "bin/herd-json-sanitize",
+      "disposition": "generic_capability",
+      "capability_tickets": [
+        "FAC-304",
+        "FAC-306",
+        "FAC-307",
+        "FAC-308"
+      ],
+      "rationale": "Generic worker or control-plane capability is tracked for Herdforge parity and has no exact command replacement yet."
+    },
+    {
+      "path": "bin/herd-kaneo",
+      "disposition": "generic_capability",
+      "capability_tickets": [
+        "FAC-304",
+        "FAC-306",
+        "FAC-307",
+        "FAC-308"
+      ],
+      "rationale": "Generic worker or control-plane capability is tracked for Herdforge parity and has no exact command replacement yet."
+    },
+    {
+      "path": "bin/herd-kick",
+      "disposition": "herdforge_command_replacement",
+      "replacement": "herd kick",
+      "ticket": "FAC-309",
+      "rationale": "Herdforge exposes the corresponding control-plane command."
+    },
+    {
+      "path": "bin/herd-kick-daemon",
+      "disposition": "generic_capability",
+      "capability_tickets": [
+        "FAC-304",
+        "FAC-306",
+        "FAC-307",
+        "FAC-308"
+      ],
+      "rationale": "Generic worker or control-plane capability is tracked for Herdforge parity and has no exact command replacement yet."
+    },
+    {
+      "path": "bin/herd-lib.zsh",
+      "disposition": "chainseer_product_exemption",
+      "rationale": "Chainseer product, deployment, data, release, or repository-specific wrapper; it is not a Herdforge control-plane surface."
+    },
+    {
+      "path": "bin/herd-lifecycle",
+      "disposition": "herdforge_command_replacement",
+      "replacement": "herd lifecycle",
+      "ticket": "FAC-309",
+      "rationale": "Herdforge exposes the corresponding control-plane command."
+    },
+    {
+      "path": "bin/herd-lost",
+      "disposition": "herdforge_command_replacement",
+      "replacement": "herd lost",
+      "ticket": "FAC-309",
+      "rationale": "Herdforge exposes the corresponding control-plane command."
+    },
+    {
+      "path": "bin/herd-mail",
+      "disposition": "chainseer_product_exemption",
+      "rationale": "Chainseer product, deployment, data, release, or repository-specific wrapper; it is not a Herdforge control-plane surface."
+    },
+    {
+      "path": "bin/herd-next",
+      "disposition": "chainseer_product_exemption",
+      "rationale": "Chainseer product, deployment, data, release, or repository-specific wrapper; it is not a Herdforge control-plane surface."
+    },
+    {
+      "path": "bin/herd-no-claude",
+      "disposition": "herdforge_command_replacement",
+      "replacement": "herd no-claude",
+      "ticket": "FAC-309",
+      "rationale": "Herdforge exposes the corresponding control-plane command."
+    },
+    {
+      "path": "bin/herd-overlap",
+      "disposition": "herdforge_command_replacement",
+      "replacement": "herd overlap",
+      "ticket": "FAC-309",
+      "rationale": "Herdforge exposes the corresponding control-plane command."
+    },
+    {
+      "path": "bin/herd-park",
+      "disposition": "herdforge_command_replacement",
+      "replacement": "herd park",
+      "ticket": "FAC-309",
+      "rationale": "Herdforge exposes the corresponding control-plane command."
+    },
+    {
+      "path": "bin/herd-process",
+      "disposition": "herdforge_command_replacement",
+      "replacement": "herd process",
+      "ticket": "FAC-309",
+      "rationale": "Herdforge exposes the corresponding control-plane command."
+    },
+    {
+      "path": "bin/herd-pulse",
+      "disposition": "herdforge_command_replacement",
+      "replacement": "herd pulse",
+      "ticket": "FAC-309",
+      "rationale": "Herdforge exposes the corresponding control-plane command."
+    },
+    {
+      "path": "bin/herd-quota",
+      "disposition": "herdforge_command_replacement",
+      "replacement": "herd quota",
+      "ticket": "FAC-309",
+      "rationale": "Herdforge exposes the corresponding control-plane command."
+    },
+    {
+      "path": "bin/herd-quota-supervisor",
+      "disposition": "herdforge_command_replacement",
+      "replacement": "herd quota-supervisor",
+      "ticket": "FAC-309",
+      "rationale": "Herdforge exposes the corresponding control-plane command."
+    },
+    {
+      "path": "bin/herd-rescue",
+      "disposition": "herdforge_command_replacement",
+      "replacement": "herd rescue",
+      "ticket": "FAC-309",
+      "rationale": "Herdforge exposes the corresponding control-plane command."
+    },
+    {
+      "path": "bin/herd-reset-safe",
+      "disposition": "herdforge_command_replacement",
+      "replacement": "herd reset-safe",
+      "ticket": "FAC-309",
+      "rationale": "Herdforge exposes the corresponding control-plane command."
+    },
+    {
+      "path": "bin/herd-resolve-lane",
+      "disposition": "herdforge_command_replacement",
+      "replacement": "herd resolve-lane",
+      "ticket": "FAC-309",
+      "rationale": "Herdforge exposes the corresponding control-plane command."
+    },
+    {
+      "path": "bin/herd-resources",
+      "disposition": "herdforge_command_replacement",
+      "replacement": "herd resources",
+      "ticket": "FAC-309",
+      "rationale": "Herdforge exposes the corresponding control-plane command."
+    },
+    {
+      "path": "bin/herd-review",
+      "disposition": "herdforge_command_replacement",
+      "replacement": "herd review",
+      "ticket": "FAC-309",
+      "rationale": "Herdforge exposes the corresponding control-plane command."
+    },
+    {
+      "path": "bin/herd-review-classify",
+      "disposition": "herdforge_command_replacement",
+      "replacement": "herd review-classify",
+      "ticket": "FAC-309",
+      "rationale": "Herdforge exposes the corresponding control-plane command."
+    },
+    {
+      "path": "bin/herd-review-ingest",
+      "disposition": "herdforge_command_replacement",
+      "replacement": "herd review-ingest",
+      "ticket": "FAC-309",
+      "rationale": "Herdforge exposes the corresponding control-plane command."
+    },
+    {
+      "path": "bin/herd-review-ledger",
+      "disposition": "herdforge_command_replacement",
+      "replacement": "herd review-ledger",
+      "ticket": "FAC-309",
+      "rationale": "Herdforge exposes the corresponding control-plane command."
+    },
+    {
+      "path": "bin/herd-review-mechanical",
+      "disposition": "generic_capability",
+      "capability_tickets": [
+        "FAC-304",
+        "FAC-306",
+        "FAC-307",
+        "FAC-308"
+      ],
+      "rationale": "Generic worker or control-plane capability is tracked for Herdforge parity and has no exact command replacement yet."
+    },
+    {
+      "path": "bin/herd-review-supervisor",
+      "disposition": "generic_capability",
+      "capability_tickets": [
+        "FAC-304",
+        "FAC-306",
+        "FAC-307",
+        "FAC-308"
+      ],
+      "rationale": "Generic worker or control-plane capability is tracked for Herdforge parity and has no exact command replacement yet."
+    },
+    {
+      "path": "bin/herd-review-surface",
+      "disposition": "generic_capability",
+      "capability_tickets": [
+        "FAC-304",
+        "FAC-306",
+        "FAC-307",
+        "FAC-308"
+      ],
+      "rationale": "Generic worker or control-plane capability is tracked for Herdforge parity and has no exact command replacement yet."
+    },
+    {
+      "path": "bin/herd-role-inject",
+      "disposition": "herdforge_command_replacement",
+      "replacement": "herd role-inject",
+      "ticket": "FAC-309",
+      "rationale": "Herdforge exposes the corresponding control-plane command."
+    },
+    {
+      "path": "bin/herd-route",
+      "disposition": "herdforge_command_replacement",
+      "replacement": "herd route",
+      "ticket": "FAC-309",
+      "rationale": "Herdforge exposes the corresponding control-plane command."
+    },
+    {
+      "path": "bin/herd-seed-lane-state",
+      "disposition": "herdforge_command_replacement",
+      "replacement": "herd seed-lane-state",
+      "ticket": "FAC-309",
+      "rationale": "Herdforge exposes the corresponding control-plane command."
+    },
+    {
+      "path": "bin/herd-selftest",
+      "disposition": "herdforge_command_replacement",
+      "replacement": "herd selftest",
+      "ticket": "FAC-309",
+      "rationale": "Herdforge exposes the corresponding control-plane command."
+    },
+    {
+      "path": "bin/herd-send",
+      "disposition": "herdforge_command_replacement",
+      "replacement": "herd send",
+      "ticket": "FAC-309",
+      "rationale": "Herdforge exposes the corresponding control-plane command."
+    },
+    {
+      "path": "bin/herd-shared-checkout-lock",
+      "disposition": "chainseer_product_exemption",
+      "rationale": "Chainseer product, deployment, data, release, or repository-specific wrapper; it is not a Herdforge control-plane surface."
+    },
+    {
+      "path": "bin/herd-shoot",
+      "disposition": "herdforge_command_replacement",
+      "replacement": "herd shoot",
+      "ticket": "FAC-309",
+      "rationale": "Herdforge exposes the corresponding control-plane command."
+    },
+    {
+      "path": "bin/herd-shot",
+      "disposition": "herdforge_command_replacement",
+      "replacement": "herd shot",
+      "ticket": "FAC-309",
+      "rationale": "Herdforge exposes the corresponding control-plane command."
+    },
+    {
+      "path": "bin/herd-spark-rotate",
+      "disposition": "generic_capability",
+      "capability_tickets": [
+        "FAC-304",
+        "FAC-306",
+        "FAC-307",
+        "FAC-308"
+      ],
+      "rationale": "Generic worker or control-plane capability is tracked for Herdforge parity and has no exact command replacement yet."
+    },
+    {
+      "path": "bin/herd-spin",
+      "disposition": "herdforge_command_replacement",
+      "replacement": "herd spin",
+      "ticket": "FAC-309",
+      "rationale": "Herdforge exposes the corresponding control-plane command."
+    },
+    {
+      "path": "bin/herd-standing",
+      "disposition": "herdforge_command_replacement",
+      "replacement": "herd standing",
+      "ticket": "FAC-309",
+      "rationale": "Herdforge exposes the corresponding control-plane command."
+    },
+    {
+      "path": "bin/herd-stash",
+      "disposition": "herdforge_command_replacement",
+      "replacement": "herd stash",
+      "ticket": "FAC-309",
+      "rationale": "Herdforge exposes the corresponding control-plane command."
+    },
+    {
+      "path": "bin/herd-stop",
+      "disposition": "herdforge_command_replacement",
+      "replacement": "herd stop",
+      "ticket": "FAC-309",
+      "rationale": "Herdforge exposes the corresponding control-plane command."
+    },
+    {
+      "path": "bin/herd-tests-for",
+      "disposition": "herdforge_command_replacement",
+      "replacement": "herd tests-for",
+      "ticket": "FAC-309",
+      "rationale": "Herdforge exposes the corresponding control-plane command."
+    },
+    {
+      "path": "bin/herd-throughput",
+      "disposition": "herdforge_command_replacement",
+      "replacement": "herd throughput",
+      "ticket": "FAC-309",
+      "rationale": "Herdforge exposes the corresponding control-plane command."
+    },
+    {
+      "path": "bin/herd-tool-probe",
+      "disposition": "herdforge_command_replacement",
+      "replacement": "herd tool-probe",
+      "ticket": "FAC-309",
+      "rationale": "Herdforge exposes the corresponding control-plane command."
+    },
+    {
+      "path": "bin/herd-unmerged",
+      "disposition": "herdforge_command_replacement",
+      "replacement": "herd unmerged",
+      "ticket": "FAC-309",
+      "rationale": "Herdforge exposes the corresponding control-plane command."
+    },
+    {
+      "path": "bin/herd-up",
+      "disposition": "herdforge_command_replacement",
+      "replacement": "herd up",
+      "ticket": "FAC-309",
+      "rationale": "Herdforge exposes the corresponding control-plane command."
+    },
+    {
+      "path": "bin/herd-verify",
+      "disposition": "herdforge_command_replacement",
+      "replacement": "herd verify",
+      "ticket": "FAC-309",
+      "rationale": "Herdforge exposes the corresponding control-plane command."
+    },
+    {
+      "path": "bin/herd-watch",
+      "disposition": "herdforge_command_replacement",
+      "replacement": "herd watch",
+      "ticket": "FAC-309",
+      "rationale": "Herdforge exposes the corresponding control-plane command."
+    },
+    {
+      "path": "bin/herd-wave",
+      "disposition": "herdforge_command_replacement",
+      "replacement": "herd wave",
+      "ticket": "FAC-309",
+      "rationale": "Herdforge exposes the corresponding control-plane command."
+    },
+    {
+      "path": "bin/herd-wind-down",
+      "disposition": "herdforge_command_replacement",
+      "replacement": "herd wind-down",
+      "ticket": "FAC-309",
+      "rationale": "Herdforge exposes the corresponding control-plane command."
+    },
+    {
+      "path": "bin/herd-worktrees",
+      "disposition": "herdforge_command_replacement",
+      "replacement": "herd worktrees",
+      "ticket": "FAC-309",
+      "rationale": "Herdforge exposes the corresponding control-plane command."
+    },
+    {
+      "path": "bin/herd-ws",
+      "disposition": "generic_capability",
+      "capability_tickets": [
+        "FAC-304",
+        "FAC-306",
+        "FAC-307",
+        "FAC-308"
+      ],
+      "rationale": "Generic worker or control-plane capability is tracked for Herdforge parity and has no exact command replacement yet."
+    },
+    {
+      "path": "bin/herdr-agent-tab",
+      "disposition": "generic_capability",
+      "capability_tickets": [
+        "FAC-306"
+      ],
+      "rationale": "Generic Herdr session management capability; no exact public Herdforge command replacement is currently declared."
+    },
+    {
+      "path": "bin/hooks/post-merge",
+      "disposition": "chainseer_product_exemption",
+      "rationale": "Chainseer product, deployment, data, release, or repository-specific wrapper; it is not a Herdforge control-plane surface."
+    },
+    {
+      "path": "bin/install-shared-checkout-hooks",
+      "disposition": "chainseer_product_exemption",
+      "rationale": "Chainseer product, deployment, data, release, or repository-specific wrapper; it is not a Herdforge control-plane surface."
+    },
+    {
+      "path": "bin/lane-stash-guard",
+      "disposition": "generic_capability",
+      "capability_tickets": [
+        "FAC-304",
+        "FAC-306",
+        "FAC-307",
+        "FAC-308"
+      ],
+      "rationale": "Generic worker or control-plane capability is tracked for Herdforge parity and has no exact command replacement yet."
+    },
+    {
+      "path": "bin/merge-matrix-append",
+      "disposition": "chainseer_product_exemption",
+      "rationale": "Chainseer product, deployment, data, release, or repository-specific wrapper; it is not a Herdforge control-plane surface."
+    },
+    {
+      "path": "bin/next-defi-version",
+      "disposition": "chainseer_product_exemption",
+      "rationale": "Chainseer product, deployment, data, release, or repository-specific wrapper; it is not a Herdforge control-plane surface."
+    },
+    {
+      "path": "bin/next-test-row",
+      "disposition": "chainseer_product_exemption",
+      "rationale": "Chainseer product, deployment, data, release, or repository-specific wrapper; it is not a Herdforge control-plane surface."
+    },
+    {
+      "path": "bin/nightly-datastore-tiers",
+      "disposition": "chainseer_product_exemption",
+      "rationale": "Chainseer product, deployment, data, release, or repository-specific wrapper; it is not a Herdforge control-plane surface."
+    },
+    {
+      "path": "bin/nightly-real-datastore",
+      "disposition": "chainseer_product_exemption",
+      "rationale": "Chainseer product, deployment, data, release, or repository-specific wrapper; it is not a Herdforge control-plane surface."
+    },
+    {
+      "path": "bin/nightly-real-datastore-probe.mjs",
+      "disposition": "chainseer_product_exemption",
+      "rationale": "Chainseer product, deployment, data, release, or repository-specific wrapper; it is not a Herdforge control-plane surface."
+    },
+    {
+      "path": "bin/platform-guardian",
+      "disposition": "chainseer_product_exemption",
+      "rationale": "Chainseer product, deployment, data, release, or repository-specific wrapper; it is not a Herdforge control-plane surface."
+    },
+    {
+      "path": "bin/shared-checkout-pre-commit",
+      "disposition": "chainseer_product_exemption",
+      "rationale": "Chainseer product, deployment, data, release, or repository-specific wrapper; it is not a Herdforge control-plane surface."
+    },
+    {
+      "path": "bin/shared-checkout-pre-push",
+      "disposition": "chainseer_product_exemption",
+      "rationale": "Chainseer product, deployment, data, release, or repository-specific wrapper; it is not a Herdforge control-plane surface."
+    },
+    {
+      "path": "bin/sync-defillama-adapters",
+      "disposition": "chainseer_product_exemption",
+      "rationale": "Chainseer product, deployment, data, release, or repository-specific wrapper; it is not a Herdforge control-plane surface."
+    },
+    {
+      "path": "bin/sync-defillama-upstream",
+      "disposition": "chainseer_product_exemption",
+      "rationale": "Chainseer product, deployment, data, release, or repository-specific wrapper; it is not a Herdforge control-plane surface."
+    },
+    {
+      "path": "bin/zsh-reserved-lint",
+      "disposition": "chainseer_product_exemption",
+      "rationale": "Chainseer product, deployment, data, release, or repository-specific wrapper; it is not a Herdforge control-plane surface."
+    }
+  ]
+}

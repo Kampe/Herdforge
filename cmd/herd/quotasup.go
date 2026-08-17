@@ -8,9 +8,11 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Kampe/Herdforge/pkg/herdr"
+	herdprocess "github.com/Kampe/Herdforge/pkg/process"
 	"github.com/Kampe/Herdforge/pkg/quotasup"
 	"github.com/Kampe/Herdforge/pkg/router"
 	"github.com/Kampe/Herdforge/pkg/usage"
@@ -78,6 +80,8 @@ func runQuotaSupervisor() {
 	// provider's default pool.
 	active := map[quotasup.Surface]int{}
 	models := map[quotasup.Surface]map[string]bool{}
+	providerErrors := map[quotasup.Surface][]string{}
+	paneErrors := collectPaneProviderErrors(agents, workspace)
 	for _, a := range agents {
 		if a.Workspace != workspace || strings.TrimSpace(a.Name) == "" {
 			continue
@@ -91,6 +95,14 @@ func runQuotaSupervisor() {
 			Provider: provider, QuotaProvider: qp, Model: model, ModelResolved: resolved,
 			Family: router.FamilyFor(strings.ToLower(provider), model), Pool: pool,
 			Capacity: quotasup.Classify(quotasup.BurnFor(computed, quotasup.Surface{Provider: qp, Pool: pool}), *warn),
+		}
+		// Herdr status can remain "working" after a provider has stopped
+		// accepting requests. Read the recent pane tail and treat an explicit
+		// quota/rate-limit failure as authoritative live evidence.
+		if reason := paneErrors[a.Name]; reason != "" {
+			assignment.ProviderError = reason
+			assignment.Capacity = quotasup.Exhausted
+			providerErrors[assignment.Surface()] = append(providerErrors[assignment.Surface()], a.Name+": "+reason)
 		}
 		current.Agents = append(current.Agents, assignment)
 
@@ -118,15 +130,22 @@ func runQuotaSupervisor() {
 	}
 	for _, s := range quotasup.Surfaces(computed, live) {
 		ev := quotasup.Observation{
-			Surface:  s,
-			Burn:     quotasup.BurnFor(computed, s),
-			SourceAt: snap.GeneratedAt,
-			Cooldown: quotasup.SurfaceCooldown(now, s),
-			Active:   active[s],
-			Models:   sortedKeys(models[s]),
+			Surface:        s,
+			Burn:           quotasup.BurnFor(computed, s),
+			SourceAt:       snap.GeneratedAt,
+			Cooldown:       quotasup.SurfaceCooldown(now, s),
+			Active:         active[s],
+			Models:         sortedKeys(models[s]),
+			ProviderErrors: providerErrors[s],
 		}.Grade(now, *warn, *maxAge)
 		current.Decisions = append(current.Decisions,
 			quotasup.Decide(s, ev, quotasup.PriorState(prior, s)))
+	}
+	current.Wake = quotasup.PlanClaudeFiveHourWake(now, current.Decisions)
+	for _, d := range current.Decisions {
+		if recovery := quotasup.PlanRecovery(now, d); recovery != nil {
+			current.Recovery = append(current.Recovery, *recovery)
+		}
 	}
 
 	for _, a := range current.Agents {
@@ -163,7 +182,16 @@ func runQuotaSupervisor() {
 			if body, err := json.Marshal(current); err == nil {
 				tmp := stateFile + ".tmp"
 				if os.WriteFile(tmp, body, 0o600) == nil {
-					os.Rename(tmp, stateFile)
+					_ = os.Rename(tmp, stateFile)
+				}
+			}
+		}
+		if current.Wake != nil {
+			wakeFile := filepath.Join(".herd", "quota-wake.json")
+			if body, err := json.MarshalIndent(current.Wake, "", "  "); err == nil {
+				tmp := wakeFile + ".tmp"
+				if os.WriteFile(tmp, body, 0o600) == nil {
+					_ = os.Rename(tmp, wakeFile)
 				}
 			}
 		}
@@ -187,6 +215,54 @@ func runQuotaSupervisor() {
 		fmt.Printf("  %-24s cap=%d/%d posture=%-7s active=%d  %s\n",
 			d.Surface, d.Cap, d.Target, d.Posture, d.Evidence.Active, d.Reason)
 	}
+	if current.Wake != nil {
+		fmt.Printf("SELF_WAKE provider=%s window=%s reset=%s key=%s command=herd forge --loop\n",
+			current.Wake.Provider, current.Wake.Window, current.Wake.ResetAt.Format(time.RFC3339), current.Wake.Key)
+	}
+	for _, recovery := range current.Recovery {
+		fmt.Printf("FAILOVER provider=%s pool=%s window=%s action=%s reset=%s reason=%s\n",
+			recovery.Provider, recovery.Pool, recovery.Window, recovery.Action, recovery.ResetAt.Format(time.RFC3339), recovery.Reason)
+	}
+}
+
+// collectPaneProviderErrors reads pane tails concurrently. A Chainseer
+// workspace can have dozens of standing/reviewer panes; invoking the Herdr
+// CLI serially made a quota sweep take longer than its operator timeout and
+// caused the supervisor to miss the very stalls it was meant to catch.
+func collectPaneProviderErrors(agents []herdr.AgentEntry, workspace string) map[string]string {
+	type result struct{ name, reason string }
+	jobs := make(chan herdr.AgentEntry)
+	results := make(chan result, len(agents))
+	const workers = 6
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for a := range jobs {
+				if tail, err := herdr.PaneRead(a.PaneID, 80); err == nil {
+					if reason := herdprocess.ProviderExhaustionReason(tail); reason != "" {
+						results <- result{name: a.Name, reason: reason}
+					}
+				}
+			}
+		}()
+	}
+	go func() {
+		for _, a := range agents {
+			if a.Workspace == workspace && strings.TrimSpace(a.Name) != "" && strings.TrimSpace(a.PaneID) != "" {
+				jobs <- a
+			}
+		}
+		close(jobs)
+		wg.Wait()
+		close(results)
+	}()
+	out := make(map[string]string)
+	for r := range results {
+		out[r.name] = r.reason
+	}
+	return out
 }
 
 // laneModel recovers a running lane's model from its own process argv, the

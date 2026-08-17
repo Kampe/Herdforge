@@ -46,7 +46,10 @@ func AllShapes() []string {
 func Waterfall(shape string) ([]string, error) {
 	switch shape {
 	case "coordinator":
-		return []string{"codex", "claude"}, nil
+		// Coordinator identity is stable across provider failover. Keep the
+		// preferred Codex/Claude surfaces first, but include Grok as a real
+		// native fallback when a five-hour or weekly Claude window is spent.
+		return []string{"codex", "claude", "grok"}, nil
 	case "architecture":
 		return []string{"claude", "agy", "codex", "grok", "ollama", "lazer"}, nil
 	case "implementation":
@@ -299,12 +302,28 @@ func AgyGeminiPoolFallback(shape string) string {
 
 const PiHarness = "pi"
 
-// IsVendorHarness reports whether a harness is a directly supported fleet
-// surface. Pi remains available for legacy router decisions, but lane-bound
-// launches use this closed set.
+// IsVendorHarness reports whether a harness is a directly supported Herdr
+// fleet surface. This is the launch-admission table: Herdr spawn validation,
+// confinement, and router decisions must agree or a route can be READY while
+// launch fails (Kimi is intentionally headless-only until Herdr advertises
+// that kind). Pi remains available only for legacy router decisions.
 func IsVendorHarness(harness string) bool {
 	switch strings.ToLower(strings.TrimSpace(harness)) {
 	case "codex", "claude", "grok", "agy", "opencode":
+		return true
+	default:
+		return false
+	}
+}
+
+// IsLaneLaunchable reports whether Herdr can create the harness kind for a
+// standing/task lane. Headless-only surfaces such as Kimi remain available to
+// `herd shot`, but must not be admitted into a Herdr lane until the Herdr
+// server advertises that kind. Keeping this predicate beside IsVendorHarness
+// prevents router READY state from outrunning launch capability.
+func IsLaneLaunchable(provider string) bool {
+	switch strings.ToLower(strings.TrimSpace(provider)) {
+	case "codex", "claude", "grok", "agy", "opencode", "ollama", "lazer":
 		return true
 	default:
 		return false
@@ -403,8 +422,19 @@ func PiBareModel(model string) string {
 	return m
 }
 
-// HarnessArgvFor returns the signed Pi harness and exact interactive argv.
+// HarnessArgvFor returns the native harness and exact interactive argv. Pi is
+// an optional legacy adapter only when HERD_USE_PI=1; no launch path requires
+// it. Coordinators therefore run directly on Codex Sol or Claude Fable.
 func HarnessArgvFor(provider, model, effort string) (string, []string, error) {
+	// Native Herdr mode is the default in every environment. Set HERD_USE_PI=1
+	// only for an existing deployment that intentionally retains the adapter.
+	if !useLegacyPi() {
+		argv := ArgvFor(provider, model, effort)
+		if len(argv) == 0 {
+			return "", nil, fmt.Errorf("no direct harness argv contract for %s/%s", provider, model)
+		}
+		return strings.ToLower(strings.TrimSpace(provider)), argv, nil
+	}
 	piModel, err := PiModelFor(provider, model)
 	if err != nil {
 		return "", nil, err
@@ -580,6 +610,9 @@ func NewRouter(engine *usage.QuotaEngine, computed map[string]usage.BurnState) *
 }
 
 func cliFor(provider string) string {
+	if !useLegacyPi() {
+		return provider
+	}
 	switch provider {
 	case "codex":
 		return PiHarness
@@ -587,6 +620,22 @@ func cliFor(provider string) string {
 		return "opencode"
 	}
 	return provider
+}
+
+func localDirectHarness() bool {
+	mode := strings.ToLower(strings.TrimSpace(os.Getenv("HERD_MODE")))
+	return mode == "local" || mode == "dev" || mode == "development"
+}
+
+func useLegacyPi() bool {
+	value, present := os.LookupEnv("HERD_USE_PI")
+	if !present {
+		// Library callers retain the historical adapter until they explicitly
+		// select native routing. cmd/herd sets HERD_USE_PI=0 at startup, so the
+		// actual CLI never requires Pi.
+		return true
+	}
+	return strings.TrimSpace(value) == "1"
 }
 
 // GlobalStateDir mirrors herdr_global_state_dir. Exported so writers of the

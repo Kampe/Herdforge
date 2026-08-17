@@ -61,5 +61,18 @@ type BulkRelationProvider interface {
 }
 
 // DefaultBulkRelationConcurrency bounds concurrent per-task relation fetches
-// for O(board) project graph snapshots (measured ~4s for 164 tasks @16).
+// for ordinary O(board) project graph snapshots (measured ~4s for 164 tasks
+// @16). Kaneo uses a larger, still bounded pool for genuinely large boards;
+// see the Kaneo-specific constants below.
 const DefaultBulkRelationConcurrency = 16
+
+// Large-board Kaneo snapshots need more parallelism because Kaneo exposes no
+// project-level relation endpoint. Keep the increase provider-specific and
+// capped: ordinary list deadlines remain unchanged and a large board cannot
+// turn into an unbounded request storm.
+const (
+	KaneoLargeBoardThreshold          = 500
+	DefaultKaneoLargeBoardConcurrency = 64
+	MaxKaneoGraphConcurrency          = 128
+	KaneoGraphBatchSize               = 256
+)

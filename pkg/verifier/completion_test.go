@@ -2,6 +2,7 @@ package verifier
 
 import (
 	"context"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -59,5 +60,33 @@ func TestCheckCompletion_EmptyCmdsFailClosed(t *testing.T) {
 	c := v.CheckCompletion(context.Background(), dir, "", "")
 	if c.Passed || c.Builds || c.TestsPass {
 		t.Fatalf("empty build/test commands must fail closed: %+v", c)
+	}
+}
+
+func TestCheckCompletionAndPersist_WritesAdmissibleBuildAndTestReceipts(t *testing.T) {
+	dir := completionRepo(t, "feat: receipt-backed work (FAC-342)")
+	candidate, err := currentSHA(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := NewFileReceiptStore(filepath.Join(t.TempDir(), "verification-receipts"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, receipts, err := NewVerifier("").CheckCompletionAndPersist(context.Background(), dir, "true", "true", VerificationRequest{
+		TaskRef: "FAC-342", LeaseGeneration: "2", CandidateSHA: candidate,
+		EnvironmentPolicy: EnvironmentPolicyInherited,
+	}, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !c.Passed || receipts.Build == nil || receipts.Test == nil {
+		t.Fatalf("completion=%+v receipts=%+v", c, receipts)
+	}
+	admission := NewReceiptAdmission(store)
+	for _, receipt := range []*Receipt{receipts.Build, receipts.Test} {
+		if _, err := admission.RequireCurrentPassing(context.Background(), dir, receipt.Digest); err != nil {
+			t.Fatalf("receipt %s was not admissible: %v", receipt.Digest, err)
+		}
 	}
 }

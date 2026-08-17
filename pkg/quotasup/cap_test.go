@@ -24,6 +24,39 @@ func obs(b *usage.BurnState) Observation {
 	return Observation{Surface: Surface{Provider: "claude", Pool: "default"}, Burn: b, SourceAt: fakeNow}
 }
 
+func TestPlanClaudeFiveHourWakeChoosesEarliestFutureReset(t *testing.T) {
+	now := time.Date(2026, 8, 17, 1, 0, 0, 0, time.UTC)
+	decisions := []Decision{
+		{Surface: Surface{Provider: "anthropic", Pool: "default"}, Evidence: Evidence{Window: "5h", ResetAt: "2026-08-17T06:00:00Z"}},
+		{Surface: Surface{Provider: "anthropic", Pool: "fable"}, Evidence: Evidence{WindowSeconds: usage.Window5h, ResetAt: "2026-08-17T05:00:00Z"}},
+		{Surface: Surface{Provider: "grok", Pool: "default"}, Evidence: Evidence{Window: "5h", ResetAt: "2026-08-17T02:00:00Z"}},
+	}
+	wake := PlanClaudeFiveHourWake(now, decisions)
+	if wake == nil || !wake.ResetAt.Equal(time.Date(2026, 8, 17, 5, 0, 0, 0, time.UTC)) {
+		t.Fatalf("wake=%+v, want earliest Claude reset", wake)
+	}
+	if wake.Key == "" {
+		t.Fatal("wake key must be stable and non-empty")
+	}
+}
+
+func TestPlanRecoveryDistinguishesFiveHourAndWeekly(t *testing.T) {
+	now := time.Date(2026, 8, 17, 1, 0, 0, 0, time.UTC)
+	base := Decision{Surface: Surface{Provider: "anthropic", Pool: "fable"}, Evidence: Evidence{Capacity: Exhausted, Windows: []usage.BurnState{
+		{Window: "weekly", WindowSeconds: usage.WindowWeekly, Class: usage.BurnExhausted, ResetsAt: "2026-08-24T01:00:00Z"},
+		{Window: "5h", WindowSeconds: usage.Window5h, Class: usage.BurnExhausted, ResetsAt: "2026-08-17T05:00:00Z"},
+	}}}
+	short := PlanRecovery(now, base)
+	if short == nil || short.Window != "5h" || short.Action != "reroute-and-self-wake" {
+		t.Fatalf("short recovery=%+v, want five-hour self-wake", short)
+	}
+	base.Evidence.Windows = []usage.BurnState{{Window: "weekly", WindowSeconds: usage.WindowWeekly, Class: usage.BurnExhausted, ResetsAt: "2026-08-24T01:00:00Z"}}
+	weekly := PlanRecovery(now, base)
+	if weekly == nil || weekly.Window != "weekly" || weekly.Action != "reroute-until-reset" {
+		t.Fatalf("weekly recovery=%+v, want long-window reroute", weekly)
+	}
+}
+
 // Quota nobody refreshed is not evidence that headroom still exists.
 func TestObservationAgeBoundaryFlipsToUnknown(t *testing.T) {
 	cases := []struct {
@@ -64,6 +97,19 @@ func TestMissingSourceTimestampIsUnknown(t *testing.T) {
 	}
 	if cap, why := TargetCap(e); cap != 0 || !strings.Contains(why, "UNKNOWN") {
 		t.Fatalf("cap=%d why=%q, want 0 and an UNKNOWN reason", cap, why)
+	}
+}
+
+func TestLiveProviderErrorOverridesHealthyLedger(t *testing.T) {
+	o := obs(healthy(usage.BurnUnderspent, 4))
+	o.ProviderErrors = []string{"coverage-integrity: provider quota or rate limit reported"}
+	e := o.Grade(fakeNow, DefaultWarnRunwayMinutes, 0)
+	if e.Capacity != Exhausted {
+		t.Fatalf("provider error graded %q, want exhausted", e.Capacity)
+	}
+	cap, why := TargetCap(e)
+	if cap != 0 || !strings.Contains(why, "live provider error") {
+		t.Fatalf("cap=%d reason=%q, want blocked with live error", cap, why)
 	}
 }
 

@@ -36,10 +36,32 @@ const RegistrationFile = ".herd/coordinator.json"
 
 // Registration is the durable coordinator identity record.
 type Registration struct {
-	Name      string    `json:"name"`
-	Workspace string    `json:"workspace,omitempty"`
-	StartedAt time.Time `json:"started_at"`
-	PID       int       `json:"pid,omitempty"`
+	Name       string    `json:"name"`
+	Workspace  string    `json:"workspace,omitempty"`
+	TabID      string    `json:"tab_id,omitempty"`
+	PaneID     string    `json:"pane_id,omitempty"`
+	TerminalID string    `json:"terminal_id,omitempty"`
+	StartedAt  time.Time `json:"started_at"`
+	PID        int       `json:"pid,omitempty"`
+}
+
+// BindTab persists the exact Herdr incarnation occupied by this coordinator.
+// The terminal token is required because workspace/tab/pane slots are
+// reusable. This binding is control-plane provenance only; it is never used
+// as a worker lease or a close-generation fence.
+func BindTab(root, workspace, tabID, paneID, terminalID string) (*Registration, error) {
+	if strings.TrimSpace(workspace) == "" || strings.TrimSpace(tabID) == "" || strings.TrimSpace(paneID) == "" || strings.TrimSpace(terminalID) == "" {
+		return nil, fmt.Errorf("coordinator: workspace, tab, pane, and terminal binding are required")
+	}
+	reg, err := Resolve(root)
+	if err != nil {
+		return nil, err
+	}
+	reg.Workspace = workspace
+	reg.TabID = tabID
+	reg.PaneID = paneID
+	reg.TerminalID = terminalID
+	return writeRegistration(root, reg)
 }
 
 // registrationPath returns the absolute path to the registration file under
@@ -71,6 +93,10 @@ func Register(root, name, workspace string) (*Registration, error) {
 		StartedAt: time.Now().UTC(),
 		PID:       os.Getpid(),
 	}
+	return writeRegistration(root, reg)
+}
+
+func writeRegistration(root string, reg *Registration) (*Registration, error) {
 	path := registrationPath(root)
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return nil, fmt.Errorf("coordinator: create registration dir: %w", err)

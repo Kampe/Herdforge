@@ -420,6 +420,12 @@ func (r Receipt) ValidateDigest() error {
 	return nil
 }
 
+// ComputeDigest returns the self-authenticating digest for this receipt body.
+// It is exposed for one-shot recovery of pre-FAC-144 receipt files that were
+// durably written without the redundant digest field; callers must still run
+// ValidateDigest and candidate admission before trusting the result.
+func (r Receipt) ComputeDigest() string { return digestReceipt(r) }
+
 // DetectLanguage inspects file extensions to determine testing toolchain.
 func DetectLanguage(filePath string) Language {
 	switch {

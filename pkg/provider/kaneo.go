@@ -608,51 +608,67 @@ func (k *KaneoProvider) ListTasks(ctx context.Context, projectID string, status 
 
 func (k *KaneoProvider) listTasksOnce(ctx context.Context, projectID, status string) ([]*Task, error) {
 	if k.UseCLI {
+		// Kaneo's unfiltered list is a board-view subset, not a complete task
+		// inventory: an in-progress card can be absent despite task get resolving
+		// it. Walk every canonical column when callers require the unfiltered
+		// inventory used by dispatch and dependency fences.
+		statuses := []string{status}
+		if status == "" {
+			statuses = []string{StatusToDo, StatusInProgress, StatusInReview, StatusDone, StatusPlanned, StatusArchived}
+		}
+
 		// Terminate only on EMPTY page; short pages continue. Duplicate pages
-		// and the page cap without empty termination are hard errors.
-		// Server may cap below --limit (observed 99/100), so short-page stop
-		// hides later cards (FAC-106 / board-done regressions).
+		// and the page cap without empty termination are hard errors. Server may
+		// cap below --limit (observed 99/100), so short-page stop hides later cards.
 		const pageSize = 100
 		var all []kaneoTaskDTO
 		acc := NewPageAccumulator()
-		for page := 1; page <= DefaultMaxListPages; page++ {
-			if err := ctx.Err(); err != nil {
-				return nil, AsTimeout("kaneo", "ListTasks", OpList, k.deadlines().For(OpList), err)
-			}
-			args := []string{"task", "list", "--project", projectID, "--json",
-				"--limit", fmt.Sprint(pageSize), "--page", fmt.Sprint(page)}
-			if status != "" {
-				args = append(args, "--status", status)
-			}
-			res, err := kaneoRunCLI(ctx, "kaneo", args...)
-			if err != nil {
-				return nil, fmt.Errorf("kaneo task list (page %d): %w", page, err)
-			}
-			var dtos []kaneoTaskDTO
-			if err := DecodeJSONBytes(http.StatusOK, res.Stdout, &dtos); err != nil {
-				if pe, ok := err.(*ProviderError); ok {
-					pe.Provider = "kaneo"
-					pe.Op = "ListTasks"
+		for _, listStatus := range statuses {
+			terminated := false
+			pageAcc := NewPageAccumulator()
+			for page := 1; page <= DefaultMaxListPages; page++ {
+				if err := ctx.Err(); err != nil {
+					return nil, AsTimeout("kaneo", "ListTasks", OpList, k.deadlines().For(OpList), err)
 				}
-				return nil, fmt.Errorf("kaneo task list (page %d): %w", page, err)
-			}
-			fresh := 0
-			for _, d := range dtos {
-				if !acc.Add(d.ID) {
-					continue
+				args := []string{"task", "list", "--project", projectID, "--json",
+					"--limit", fmt.Sprint(pageSize), "--page", fmt.Sprint(page), "--status", listStatus}
+				res, err := kaneoRunCLI(ctx, "kaneo", args...)
+				if err != nil {
+					return nil, fmt.Errorf("kaneo task list (status %s, page %d): %w", listStatus, page, err)
 				}
-				all = append(all, d)
-				fresh++
+				var dtos []kaneoTaskDTO
+				if err := DecodeJSONBytes(http.StatusOK, res.Stdout, &dtos); err != nil {
+					if pe, ok := err.(*ProviderError); ok {
+						pe.Provider = "kaneo"
+						pe.Op = "ListTasks"
+					}
+					return nil, fmt.Errorf("kaneo task list (status %s, page %d): %w", listStatus, page, err)
+				}
+				fresh := 0
+				for _, d := range dtos {
+					if pageAcc.Add(d.ID) {
+						fresh++
+					}
+					if acc.Add(d.ID) {
+						all = append(all, d)
+					}
+				}
+				dec := DecidePagination(len(dtos), fresh)
+				switch dec {
+				case PageStopEmpty:
+					terminated = true
+				case PageStopDuplicate:
+					return nil, fmt.Errorf("kaneo task list (status %s, page %d): %w", listStatus, page, ErrDuplicatePage)
+				}
+				if terminated {
+					break
+				}
 			}
-			dec := DecidePagination(len(dtos), fresh)
-			switch dec {
-			case PageStopEmpty:
-				return filterTasks(all, status), nil
-			case PageStopDuplicate:
-				return nil, fmt.Errorf("kaneo task list (page %d): %w", page, ErrDuplicatePage)
+			if !terminated {
+				return nil, fmt.Errorf("kaneo task list (status %s): %w (maxPages=%d)", listStatus, ErrPaginationCap, DefaultMaxListPages)
 			}
 		}
-		return nil, fmt.Errorf("kaneo task list: %w (maxPages=%d)", ErrPaginationCap, DefaultMaxListPages)
+		return filterTasks(all, status), nil
 	}
 
 	url := fmt.Sprintf("%s/api/task?projectId=%s", k.APIURL, projectID)
@@ -707,7 +723,10 @@ func cliErrMsg(res *CLIResult) string {
 // any single caller context — a safety net for hung bodies/connections.
 // Per-op bounds still come from WithOpDeadline on the request context.
 func defaultHTTPClient() *http.Client {
-	return &http.Client{Timeout: DefaultDeadlines().Max() + 5*time.Second}
+	// Ordinary operations remain bounded by their per-operation contexts. The
+	// larger transport ceiling is needed by the explicitly bounded large-board
+	// relation snapshot path, which may use a two-minute graph context.
+	return &http.Client{Timeout: 2*time.Minute + 5*time.Second}
 }
 
 // ListComments implements CommentReader (FAC-145): exact effect readback
@@ -716,6 +735,23 @@ func (k *KaneoProvider) ListComments(ctx context.Context, taskID string) ([]stri
 	dls := k.deadlines()
 	ctx, cancel := WithOpDeadline(ctx, dls, OpGet)
 	defer cancel()
+	if k.UseCLI {
+		res, err := kaneoRunCLI(ctx, "kaneo", "task", "comment", "list", taskID, "--json")
+		if err != nil {
+			return nil, fmt.Errorf("kaneo task comment list: %w", err)
+		}
+		var dtos []struct {
+			Content string `json:"content"`
+		}
+		if err := json.Unmarshal(res.Stdout, &dtos); err != nil {
+			return nil, fmt.Errorf("kaneo task comment list decode: %w", err)
+		}
+		out := make([]string, 0, len(dtos))
+		for _, d := range dtos {
+			out = append(out, d.Content)
+		}
+		return out, nil
+	}
 	url := fmt.Sprintf("%s/api/task/%s/comment", k.APIURL, taskID)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {

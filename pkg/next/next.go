@@ -8,7 +8,9 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/Kampe/Herdforge/pkg/candidateindex"
 	"github.com/Kampe/Herdforge/pkg/config"
+	"github.com/Kampe/Herdforge/pkg/deps"
 	"github.com/Kampe/Herdforge/pkg/provider"
 )
 
@@ -118,7 +120,7 @@ func (p *NextPicker) evalAll(ctx context.Context) ([]*NextAction, error) {
 	}
 
 	// Priority 4-5: Review pipeline
-	inReview, needReview, err := reviewPipelineCounts(ctx, p.TaskProvider, p.Config)
+	inReview, needReview, blockedReview, err := reviewPipelineCounts(ctx, p.TaskProvider, p.Config)
 	if err != nil {
 		return nil, err
 	}
@@ -136,22 +138,87 @@ func (p *NextPicker) evalAll(ctx context.Context) ([]*NextAction, error) {
 		actions = append(actions, &NextAction{
 			Type:        ActionNeed,
 			Priority:    5,
-			Description: fmt.Sprintf("%d unreviewed tip(s) need reviewer", needReview),
+			Description: reviewNeedDescription(needReview, blockedReview),
 			Command:     "herd review --spawn",
 			AutoSafe:    false,
 		})
 	}
 
-	// Priority 6: Claim new task (default if nothing blocking)
+	// Priority 6: Claim new task (default if nothing blocking). Preview the
+	// provenance gate before presenting a claim action so missing herd-deps-v1
+	// is repaired before a Forge cycle spends a lease and then fails.
+	preview, err := PreviewClaimQueue(ctx, p.TaskProvider, p.Config)
+	if err != nil {
+		return nil, err
+	}
+	claimCommand := "herd pulse --spawn"
+	if preview.Claimable == 0 && preview.ProvenanceBlocked > 0 {
+		claimCommand = "herd deps migrate"
+	}
 	actions = append(actions, &NextAction{
 		Type:        ActionClaim,
 		Priority:    100,
-		Description: "No blocking actions — claim next pending task",
-		Command:     "herd pulse --spawn",
+		Description: preview.Description(),
+		Command:     claimCommand,
 		AutoSafe:    false,
 	})
 
 	return actions, nil
+}
+
+// ClaimPreview is the pre-claim admission summary. It reports what can be
+// proven from board descriptions before lease/worker side effects occur.
+type ClaimPreview struct {
+	Claimable         int
+	ProvenanceBlocked int
+	BlockedRefs       []string
+}
+
+func (p ClaimPreview) Description() string {
+	if p.Claimable == 0 && p.ProvenanceBlocked > 0 {
+		return fmt.Sprintf("No claimable task yet — repair provenance for %d blocked card(s): %s", p.ProvenanceBlocked, strings.Join(p.BlockedRefs, ", "))
+	}
+	if p.ProvenanceBlocked == 0 {
+		return fmt.Sprintf("No blocking actions — %d claimable pending task(s)", p.Claimable)
+	}
+	return fmt.Sprintf("Claim next pending task (%d claimable, %d blocked by missing/invalid herd-deps-v1: %s)", p.Claimable, p.ProvenanceBlocked, strings.Join(p.BlockedRefs, ", "))
+}
+
+// PreviewClaimQueue performs the cheap, deterministic portion of claim
+// admission. It is not a replacement for deps.ValidateClaim; it exposes
+// obvious provenance omissions before a Forge cycle reports a late failure.
+func PreviewClaimQueue(ctx context.Context, tp provider.TaskProvider, cfg *config.Config) (ClaimPreview, error) {
+	if tp == nil || cfg == nil {
+		return ClaimPreview{}, fmt.Errorf("claim preview requires provider and config")
+	}
+	tasks, err := tp.ListTasks(ctx, cfg.TaskProvider.ProjectID, "to-do")
+	if err != nil {
+		return ClaimPreview{}, err
+	}
+	sort.SliceStable(tasks, func(i, j int) bool {
+		if tasks[i] == nil || tasks[j] == nil {
+			return tasks[i] != nil
+		}
+		pi, pj := candidateindex.PriorityRank(tasks[i].Priority), candidateindex.PriorityRank(tasks[j].Priority)
+		if pi != pj {
+			return pi > pj
+		}
+		return provider.CompareRefs(tasks[i].Ref, tasks[j].Ref) < 0
+	})
+	preview := ClaimPreview{}
+	for _, task := range tasks {
+		if task == nil || strings.TrimSpace(task.Ref) == "" {
+			continue
+		}
+		prov, provErr := deps.ExtractProvenanceFromText(task.Description)
+		if provErr != nil || prov == nil || !prov.Present {
+			preview.ProvenanceBlocked++
+			preview.BlockedRefs = append(preview.BlockedRefs, task.Ref)
+			continue
+		}
+		preview.Claimable++
+	}
+	return preview, nil
 }
 
 func (p *NextPicker) pendingVerdicts() []string {
@@ -177,29 +244,90 @@ func drainSummary(ctx context.Context, tp provider.TaskProvider, cfg *config.Con
 	for _, t := range tasks {
 		total++
 		switch t.Status {
-		case "review":
+		case "review", "in-review":
 			inReview++
-		case "in-progress":
-			needReview++
 		}
+	}
+	needReview, _, err = countReviewableAndBlockedTips(ctx, tp, cfg, tasks)
+	if err != nil {
+		return 0, 0, 0, 0, 0, err
 	}
 	return harvestReady, rebaseNeeded, inReview, needReview, total, nil
 }
 
-func reviewPipelineCounts(ctx context.Context, tp provider.TaskProvider, cfg *config.Config) (inReview int, needReview int, err error) {
+func reviewPipelineCounts(ctx context.Context, tp provider.TaskProvider, cfg *config.Config) (inReview int, needReview int, blockedReview int, err error) {
 	tasks, err := tp.ListTasks(ctx, cfg.TaskProvider.ProjectID, "")
 	if err != nil {
-		return 0, 0, err
+		return 0, 0, 0, err
 	}
 	for _, t := range tasks {
 		switch t.Status {
-		case "review":
+		case "review", "in-review":
 			inReview++
-		case "in-progress":
-			needReview++
 		}
 	}
-	return inReview, needReview, nil
+	needReview, blockedReview, err = countReviewableAndBlockedTips(ctx, tp, cfg, tasks)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	return inReview, needReview, blockedReview, nil
+}
+
+func reviewNeedDescription(needReview, blockedReview int) string {
+	if blockedReview == 0 {
+		return fmt.Sprintf("%d unreviewed tip(s) need reviewer", needReview)
+	}
+	return fmt.Sprintf("%d unreviewed tip(s) need reviewer (%d active candidate(s) blocked by provenance/review gates)", needReview, blockedReview)
+}
+
+// countReviewableTips excludes planning/standing cards that have no exact
+// candidate SHA. Those cards remain visible to the dependency/provenance
+// gates, but must not inflate the P5 reviewer signal.
+func countReviewableTips(ctx context.Context, tp provider.TaskProvider, cfg *config.Config, tasks []*provider.Task) (int, error) {
+	reviewable, _, err := countReviewableAndBlockedTips(ctx, tp, cfg, tasks)
+	return reviewable, err
+}
+
+// countReviewableAndBlockedTips returns both actionable review tips and active
+// candidates held by a review/provenance gate. Keeping the blocked count
+// visible prevents the coordinator from mistaking a quiet reviewer queue for
+// a healthy claim surface.
+func countReviewableAndBlockedTips(ctx context.Context, tp provider.TaskProvider, cfg *config.Config, tasks []*provider.Task) (int, int, error) {
+	root, err := os.Getwd()
+	if err != nil {
+		return 0, 0, err
+	}
+	idx := candidateindex.New(candidateindex.IndexOptions{RepoRoot: root, Config: cfg, TaskProvider: tp})
+	candidates, err := idx.BuildIndex(ctx)
+	if err != nil {
+		return 0, 0, err
+	}
+	active := make(map[string]bool, len(tasks))
+	for _, task := range tasks {
+		if task != nil && task.Status == "in-progress" {
+			active[strings.ToUpper(strings.TrimSpace(task.Ref))] = true
+		}
+	}
+	count, blocked := 0, 0
+	seen := make(map[string]bool)
+	for _, candidate := range candidates {
+		if candidate == nil || strings.TrimSpace(candidate.CandidateSHA) == "" || !active[strings.ToUpper(strings.TrimSpace(candidate.Ref))] {
+			continue
+		}
+		ref := strings.ToUpper(strings.TrimSpace(candidate.Ref))
+		if seen[ref] {
+			continue
+		}
+		seen[ref] = true
+		// PASS/FAIL/BLOCKED candidates already have a review outcome; only
+		// pending candidates need a reviewer signal.
+		if candidate.State == candidateindex.StatePending {
+			count++
+		} else if candidate.State == candidateindex.StateBlocked {
+			blocked++
+		}
+	}
+	return count, blocked, nil
 }
 
 func (a *NextAction) String() string {

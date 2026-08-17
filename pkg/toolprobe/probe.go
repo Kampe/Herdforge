@@ -106,9 +106,9 @@ func recipeCommand(id Identity, prompt string) (string, []string, error) {
 	if model == "" {
 		return "", nil, fmt.Errorf("probe model is required")
 	}
-	// Pi harness (logical codex/claude/grok routes): enable tools and run once.
-	if harness == "pi" || provider == "codex" || provider == "claude" || provider == "grok" {
-		// Prefer the real harness binary (pi). Model is the logical model id.
+	// Pi is the legacy hosted adapter. Keep it explicit: a native vendor lane
+	// must probe the same executable Herdr will launch, not silently require pi.
+	if harness == "pi" {
 		return "pi", []string{
 			"--no-session",
 			"--no-approve",
@@ -118,6 +118,36 @@ func recipeCommand(id Identity, prompt string) (string, []string, error) {
 			"--no-prompt-templates",
 			"--model", model,
 			"-p", prompt,
+		}, nil
+	}
+	// Native Codex lanes use the non-interactive CLI so the probe exercises the
+	// actual local harness and its write capability. The probe runs in a fresh
+	// scratch directory and is deliberately unattended.
+	if harness == "codex" || provider == "codex" {
+		return "codex", []string{
+			"exec",
+			"--model", model,
+			"--sandbox", "danger-full-access",
+			"--skip-git-repo-check",
+			prompt,
+		}, nil
+	}
+	// Native Claude lanes use print mode with permission bypass, matching the
+	// local fleet's write-capable harness rather than routing through pi.
+	if harness == "claude" || provider == "claude" {
+		return "claude", []string{
+			"--model", model,
+			"--print",
+			"--dangerously-skip-permissions",
+			prompt,
+		}, nil
+	}
+	// Grok's non-interactive command accepts the prompt as its final argument.
+	if harness == "grok" || provider == "grok" {
+		return "grok", []string{
+			"--model", model,
+			"--always-approve",
+			prompt,
 		}, nil
 	}
 	// OpenCode-backed surfaces (opencode/ollama/lazer).

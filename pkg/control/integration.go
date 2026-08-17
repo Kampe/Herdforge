@@ -35,6 +35,25 @@ func (a FencedAuthority) Resolve(ctx context.Context, o Order) (LaneIdentity, er
 	return a.Identity, nil
 }
 
+// RevalidatingAuthority is for coordinator restart reconciliation. Unlike a
+// worker binding it has no one captured lane identity: each durable order
+// supplies its own task identity and the live check authorizes that exact
+// order. This keeps the coordinator independent from a Herdr task-tab lease
+// generation while retaining the task lease fence for managed workers.
+type RevalidatingAuthority struct {
+	Check func(context.Context, Order) error
+}
+
+func (a RevalidatingAuthority) Resolve(ctx context.Context, o Order) (LaneIdentity, error) {
+	if a.Check == nil {
+		return LaneIdentity{}, fmt.Errorf("control: live identity check is required")
+	}
+	if err := a.Check(ctx, o); err != nil {
+		return LaneIdentity{}, err
+	}
+	return o.LaneIdentity, nil
+}
+
 // NewOwnerToken creates a unique token per delivery instance. It is never a
 // process-wide default, so an expired owner cannot mutate a later takeover.
 func NewOwnerToken() (string, error) {

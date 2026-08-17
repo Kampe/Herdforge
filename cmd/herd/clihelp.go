@@ -56,10 +56,12 @@ var subcommandUsage = map[string]string{
 	"preflight":        "Usage: herd preflight\n  Workspace boundary, merge policy, and fleet readiness scanner.",
 	"preflight-static": "Usage: herd preflight-static\n  Workspace boundary, signal literal, and merge policy scanner.",
 	"verify":           "Usage: herd verify [--build cmd] [--test cmd] [worktree]\n  Completion gate: real commits + build + tests.",
+	"finish":           "Usage: herd finish <ref> --landed-sha <sha> [--receipt path] [--branch branch] [--worktree path]\n  Coordinator-only post-merge readiness gate; never mutates the board.",
 	"selftest":         "Usage: herd selftest\n  Run self-test assertion suite against the active repository.",
 	"status":           "Usage: herd status\n  Show herd workspace / daemon status.",
 	"timeline":         "Usage: herd timeline [--file path] [--task ref] [--lane name] [--source name] [--type type]\n  Read chronological, filterable execution-event envelopes.",
 	"pulse":            "Usage: herd pulse [--act [--spawn]] [--json] [--quiet] [--reason TEXT]\n  Coordinator heartbeat: observe by default; --act applies bounded renewals/callbacks.",
+	"goal-guard":       "Usage: herd goal-guard (--set|--check|--clear) [flags]\n  Durable standing-lane continuation guard.",
 	"wind-down":        "Usage: herd wind-down <on|off|status> [flags]\n  Control durable fleet launch posture.",
 	"posture":          "Usage: herd posture <claude-only|no-claude|clear|status> [flags]\n  Durable provider-family execution policy.",
 	"hold":             "Usage: herd hold <task> on|off|status --lane <name> --owner <role> [flags]\n  Generation-fenced lane/task hold.",
@@ -69,7 +71,7 @@ var subcommandUsage = map[string]string{
 	"usage":            "Usage: herd usage\n  Show harness quota usage from OpenUsage CLI.",
 	"quota":            "Usage: herd quota [flags]\n  Quota inspection helpers.",
 	"review":           "Usage: herd review [ref] [--spawn]\n  Adversarial review pipeline for in-progress work.",
-	"review-ledger":    "Usage: herd review-ledger [flags]\n  Append-only review ledger operations.",
+	"review-ledger":    "Usage: herd review-ledger list|queued|pending|tier <sha>|drift\n  Append-only review ledger operations; drift reports live standing builder-family mismatches.",
 	"drain":            "Usage: herd drain [flags]\n  Drain control / review backlog.",
 	"approve":          "Usage: herd approve [flags]\n  Approve a reviewed candidate.",
 	"board-done": "Usage: herd board-done <ref> [--receipt <path>] [--override-policy <p> --override-actor <who> --override-reason <why> --override-evidence <what>]\n" +
@@ -116,12 +118,16 @@ Prompt lane flags: --task <shape> --provider <name> --schema <file>
 Flags:
   --no-launch       Create worktree and packet only, no agent
   --lane <name>     Lane name from config (default: worker)
+	  --environment-plan <id> Exact operator-granted environment plan ID (required in production)
   --ticket <ref>    Ticket ref when the value begins with '-' (or use -- <ref>)
 
 Help is reserved: -h / --help never become the ticket. A literal payload equal
 to --help is accepted only as:
   herd dispatch -- --help
-  herd dispatch --ticket=--help`,
+	  herd dispatch --ticket=--help`,
+	"envplan": `Usage: herd envplan <create|inspect|grant|revoke> [flags]
+  Operator-managed, repository-relative environment capability plans. Plans
+  record capability evidence and bindings only; credential values are refused.`,
 	"deps": `Usage: herd deps <selftest|check|reconcile|migrate> [args]
   Packet↔board dependency-graph conformance (FAC-159).
 

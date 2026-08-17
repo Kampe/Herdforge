@@ -15,6 +15,52 @@ import (
 	"github.com/Kampe/Herdforge/pkg/winddown"
 )
 
+func TestDefaultFleetStateDirScopesForeignRepo(t *testing.T) {
+	t.Setenv("HERD_STATE_DIR", "")
+	t.Setenv("XDG_STATE_HOME", filepath.Join(t.TempDir(), "state"))
+	got := defaultFleetStateDir(filepath.Join("/tmp", "chainseer"))
+	want := filepath.Join(os.Getenv("XDG_STATE_HOME"), "chainseer", "herd")
+	if got != want {
+		t.Fatalf("foreign repo state dir=%q, want %q", got, want)
+	}
+}
+
+func TestDefaultFleetStateDirHonorsExplicitOverride(t *testing.T) {
+	override := filepath.Join(t.TempDir(), "shared-herd-state")
+	t.Setenv("HERD_STATE_DIR", override)
+	if got := defaultFleetStateDir(filepath.Join("/tmp", "chainseer")); got != override {
+		t.Fatalf("state override=%q, want %q", got, override)
+	}
+}
+
+func TestActiveRequestedLanesDropsRetiredWorkers(t *testing.T) {
+	requested := []string{"coordinator", "forge-worker-cha-1633", "review-harvest-supervisor"}
+	agents := []herdr.AgentEntry{
+		{Name: "coordinator", Workspace: "wB"},
+		{Name: "review-harvest-supervisor", Workspace: "wB"},
+		{Name: "other-repo-worker", Workspace: "wC"},
+	}
+	got := ActiveRequestedLanes(requested, agents, "wB")
+	want := []string{"coordinator", "review-harvest-supervisor"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("active lanes=%v, want %v", got, want)
+	}
+}
+
+func TestActiveRequestedLanesForRosterExcludesEphemeralReviewer(t *testing.T) {
+	requested := []string{"coordinator", "review-harvest-supervisor", "review-fix-grok46-dc9f7f1"}
+	agents := []herdr.AgentEntry{
+		{Name: "coordinator", Workspace: "wB"},
+		{Name: "review-harvest-supervisor", Workspace: "wB"},
+		{Name: "review-fix-grok46-dc9f7f1", Workspace: "wB"},
+	}
+	got := ActiveRequestedLanesForRoster(requested, agents, "wB", []string{"coordinator", "review-harvest-supervisor"})
+	want := []string{"coordinator", "review-harvest-supervisor"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("roster lanes=%v, want %v", got, want)
+	}
+}
+
 func TestMissingIsSetDifferenceAndDeterministic(t *testing.T) {
 	got := Missing([]string{"smith", "scout", "assayer"}, []string{"scout"})
 	want := []string{"assayer", "smith"}
@@ -94,7 +140,7 @@ func TestNeedsWakeOnlyForSettledAgents(t *testing.T) {
 
 func TestRequestBodyNamesTheCountableReplyShape(t *testing.T) {
 	body := RequestBody("E1", "orchestrator")
-	for _, want := range []string{"FLEET_FEEDBACK E1", "HERD_LANE=<your-lane> bin/herd-mail send orchestrator", "NONE"} {
+	for _, want := range []string{"FLEET_FEEDBACK E1", "HERD_LANE=<your-lane> herd send orchestrator", "NONE", "durable inbox record"} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("request body missing %q: %s", want, body)
 		}
@@ -388,18 +434,33 @@ func TestCensusTickInterval(t *testing.T) {
 		tickSec int
 		want    int
 	}{
-		{15, 120},  // 30 min / 15 s = 120 ticks (default forge loop)
-		{30, 60},   // 30 min / 30 s = 60 ticks
-		{60, 30},   // 30 min / 60 s = 30 ticks
-		{1800, 1},  // tick == census interval → every tick
-		{3600, 1},  // tick > census interval → clamp to 1
-		{0, 1},     // non-positive → clamp to 1
-		{-5, 1},    // negative → clamp to 1
+		{15, 120}, // 30 min / 15 s = 120 ticks (default forge loop)
+		{30, 60},  // 30 min / 30 s = 60 ticks
+		{60, 30},  // 30 min / 60 s = 30 ticks
+		{1800, 1}, // tick == census interval → every tick
+		{3600, 1}, // tick > census interval → clamp to 1
+		{0, 1},    // non-positive → clamp to 1
+		{-5, 1},   // negative → clamp to 1
 	}
 	for _, c := range cases {
 		got := CensusTickInterval(c.tickSec)
 		if got != c.want {
 			t.Fatalf("CensusTickInterval(%d) = %d, want %d", c.tickSec, got, c.want)
 		}
+	}
+}
+
+func TestEpochKnownTreatsWakeOnlyEpochAsVoid(t *testing.T) {
+	stateDir := t.TempDir()
+	if err := Save(stateDir, &CensusState{Epoch: "20260817T060000Z", RequestedAtEpoch: 1, Lanes: []string{"smith"}}); err != nil {
+		t.Fatal(err)
+	}
+	known, err := EpochKnown(stateDir, "20260817T060000Z")
+	if err != nil || !known {
+		t.Fatalf("known epoch=%v err=%v", known, err)
+	}
+	ghost, err := EpochKnown(stateDir, "20260817T061837Z")
+	if err != nil || ghost {
+		t.Fatalf("ghost epoch=%v err=%v, want false", ghost, err)
 	}
 }

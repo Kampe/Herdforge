@@ -48,10 +48,19 @@ jobs:
         with:
           version: v0.74.0
 
+      - name: Checkout Chainseer parity source
+        uses: actions/checkout@v4
+        with:
+          repository: Kampe/chainseer
+          path: chainseer
+          fetch-depth: 1
+
       # make lint runs go vet, the hermeticity scan (FAC-215), the package
       # inventory drift check (FAC-301), and the security gates.
       - name: Build, lint, unit tests, preflight
         run: make lint test-unit test-race preflight
+        env:
+          CHAINSEER_BIN: chainseer/bin
 
   # FAC-198: the quarantined ownership suite only runs inside the hermetic
   # Docker profile. Compile is already part of test-unit; this job is the

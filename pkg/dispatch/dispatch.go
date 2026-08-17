@@ -277,8 +277,9 @@ type DispatchResult struct {
 // packet carried a reply address — the coordinator discovered every finished
 // branch by polling git state, late and lossy.
 type ReplyTarget struct {
-	Name            string // the coordinator's stable name (never empty)
-	LeaseGeneration int64  // the lease generation the agent must cite in callbacks
+	Name             string // the coordinator's stable name (never empty)
+	ReviewSupervisor string // standing supervisor that owns review handoffs
+	LeaseGeneration  int64  // the lease generation the agent must cite in callbacks
 }
 
 // WorktreeService is the isolation surface Dispatch uses (FAC-121).
@@ -414,6 +415,21 @@ func (d *Dispatcher) coordinatorName() string {
 		return name
 	}
 	return "coordinator"
+}
+
+func (d *Dispatcher) reviewSupervisorName() string {
+	if d.Config == nil {
+		return "review-supervisor"
+	}
+	for _, lane := range d.Config.Lanes {
+		switch strings.ToLower(strings.TrimSpace(lane.Role)) {
+		case "review-supervisor", "review_harvest_supervisor", "harvest-supervisor", "reviewer", "harvest":
+			if strings.TrimSpace(lane.Name) != "" {
+				return "forge-" + strings.TrimSpace(lane.Name)
+			}
+		}
+	}
+	return "review-supervisor"
 }
 
 type ScopeAdmission interface {
@@ -986,7 +1002,7 @@ func (d *Dispatcher) Dispatch(ctx context.Context, opts DispatchOptions) (*Dispa
 	}
 
 	// 6. Preflight in worktree
-	if err := preflight.CheckWorktreeBoundary(wtInfo.Path); err != nil {
+	if err := preflight.CheckWorktreeBoundaryWithAllowlist(wtInfo.Path, d.Config.WorktreeBoundary.AllowedAbsolutePaths); err != nil {
 		return nil, failOwned("preflight_failed", fmt.Errorf("preflight failed in worktree: %w", err))
 	}
 	// 6b. Execute the repository-declared bootstrap only after ownership,
@@ -1009,8 +1025,9 @@ func (d *Dispatcher) Dispatch(ctx context.Context, opts DispatchOptions) (*Dispa
 	}
 
 	packet := buildTaskPacket(task, branch, rolePath, d.Config.TaskProvider.Type, d.Config.TaskProvider.ProjectID, lane, d.Config.Verification, ReplyTarget{
-		Name:            d.coordinatorName(),
-		LeaseGeneration: tok.Generation,
+		Name:             d.coordinatorName(),
+		ReviewSupervisor: d.reviewSupervisorName(),
+		LeaseGeneration:  tok.Generation,
 	})
 	if len(task.Residuals) > 0 {
 		section, residualErr := residual.PacketSection(task.Residuals)
@@ -1110,6 +1127,30 @@ func (d *Dispatcher) admitRunState(ctx context.Context, task *provider.Task) (*r
 	authority := runstate.Authority{Tasks: d.TaskProvider, Graph: d.RunStateGraph}
 	state, err := d.RunStates.Resume(ctx, id, authority)
 	if errors.Is(err, runstate.ErrNotFound) {
+		graph, graphErr := d.RunStateGraph(ctx)
+		if graphErr != nil || strings.TrimSpace(graph) == "" {
+			if graphErr != nil {
+				return nil, fmt.Errorf("dispatch runstate graph authority: %w", graphErr)
+			}
+			return nil, fmt.Errorf("dispatch runstate: %w: empty graph revision", runstate.ErrAmbiguous)
+		}
+		next, buildErr := runstate.FromTasks(id, "dispatch", task.Ref, graph, runstate.Policy{Lane: "dispatch", Model: "dispatch"}, 0, 0, []*provider.Task{task})
+		if buildErr != nil {
+			return nil, fmt.Errorf("dispatch runstate build: %w", buildErr)
+		}
+		if _, checkpointErr := d.RunStates.Checkpoint(ctx, next, 0); checkpointErr != nil {
+			return nil, fmt.Errorf("dispatch runstate checkpoint: %w", checkpointErr)
+		}
+		state, err = d.RunStates.Resume(ctx, id, authority)
+	}
+	if err != nil && !d.Production && errors.Is(err, runstate.ErrStale) {
+		// A local retry owns this checkout and may have changed the board while
+		// recovering a failed pane. Discard only the stale local snapshot and
+		// rebuild it from the current provider evidence; hosted mode remains
+		// strictly fail-closed.
+		if delErr := d.RunStates.Delete(ctx, id); delErr != nil {
+			return nil, fmt.Errorf("dispatch runstate stale recovery: %w", delErr)
+		}
 		graph, graphErr := d.RunStateGraph(ctx)
 		if graphErr != nil || strings.TrimSpace(graph) == "" {
 			if graphErr != nil {
@@ -2102,16 +2143,20 @@ func buildTaskPacket(task *provider.Task, branch, rolePath, taskProviderType, ta
 	fmt.Fprintf(&b, "  5. git add -A && git commit -m \"<msg containing %s>\" (no AI-attribution trailers).\n", task.Ref)
 	fmt.Fprintf(&b, "  6. Final message: `BUILD COMPLETE %s` + `git rev-parse HEAD`.\n\n", task.Ref)
 
-	// FAC-222: reply target. Agents report to the coordinator by name instead
-	// of relying on the coordinator to notice by polling. The lease generation
-	// binds the report to this dispatch so a stale or duplicate redelivery is
-	// distinguishable from real progress.
+	// FAC-222: completion authority remains the coordinator, while review
+	// handoff authority is the standing review supervisor. Keeping those
+	// addresses distinct prevents the coordinator from becoming a review queue.
 	coordinatorName := reply.Name
 	if coordinatorName == "" {
 		coordinatorName = "coordinator"
 	}
 	fmt.Fprintf(&b, "Report to the coordinator (%s) — do not wait to be asked:\n", coordinatorName)
-	fmt.Fprintf(&b, "  READY-FOR-REVIEW: herd shot %s --report complete --sha <sha> --lease %d\n", task.Ref, reply.LeaseGeneration)
+	reviewSupervisor := reply.ReviewSupervisor
+	if strings.TrimSpace(reviewSupervisor) == "" {
+		reviewSupervisor = "review-supervisor"
+	}
+	fmt.Fprintf(&b, "  READY-FOR-REVIEW: post the completion callback, then ping the review supervisor (%s) with the exact SHA; do not ask the coordinator to run review.\n", reviewSupervisor)
+	fmt.Fprintf(&b, "  Completion callback: herd shot %s --report complete --sha <sha> --lease %d\n", task.Ref, reply.LeaseGeneration)
 	fmt.Fprintf(&b, "  BLOCKED: herd shot %s --report blocked --detail \"<why>\" --lease %d\n", task.Ref, reply.LeaseGeneration)
 	b.WriteString("Report as soon as the condition is true. Polling is the backstop, not the primary signal.\n\n")
 

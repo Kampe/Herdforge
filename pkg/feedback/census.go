@@ -127,6 +127,21 @@ func Save(stateDir string, s *CensusState) error {
 	return nil
 }
 
+// EpochKnown is the durable registry check lanes and supervisors use before
+// waiting on a feedback request. Herdr wake delivery is only a hint; an epoch
+// absent from the repo-local census state is void and must be discarded
+// immediately rather than creating a permanent FEEDBACK_MISSING ghost.
+func EpochKnown(stateDir, epoch string) (bool, error) {
+	if strings.TrimSpace(epoch) == "" {
+		return false, nil
+	}
+	s, err := Load(stateDir)
+	if err != nil {
+		return false, err
+	}
+	return s.Epoch == epoch, nil
+}
+
 // Epoch stamps a census. Callers pass the clock so this stays testable.
 func Epoch(now time.Time) string { return now.UTC().Format("20060102T150405Z") }
 
@@ -145,6 +160,64 @@ func Missing(requested, replied []string) []string {
 	}
 	sort.Strings(missing)
 	return missing
+}
+
+// ActiveRequestedLanes removes lanes that no longer exist in the target
+// workspace. Ephemeral forge workers are intentionally absent after they are
+// retired; keeping their names in the current census makes every later tick
+// report a permanent missing reply. If agent enumeration fails, callers keep
+// the original expectation and fail closed rather than treating an outage as
+// retirement.
+func ActiveRequestedLanes(requested []string, agents []herdr.AgentEntry, workspace string) []string {
+	return ActiveRequestedLanesForRoster(requested, agents, workspace, nil)
+}
+
+// ActiveRequestedLanesForRoster applies an optional configured standing
+// roster in addition to the workspace filter. Ephemeral task/reviewer panes
+// are not census participants when a roster is supplied.
+func ActiveRequestedLanesForRoster(requested []string, agents []herdr.AgentEntry, workspace string, roster []string) []string {
+	allowed := make(map[string]bool, len(roster))
+	for _, name := range roster {
+		if strings.TrimSpace(name) != "" {
+			allowed[name] = true
+		}
+	}
+	active := make(map[string]bool, len(agents))
+	for _, agent := range agents {
+		if strings.TrimSpace(agent.Name) == "" || (workspace != "" && agent.Workspace != workspace) || (len(allowed) > 0 && !allowed[agent.Name]) {
+			continue
+		}
+		active[agent.Name] = true
+	}
+	out := make([]string, 0, len(requested))
+	for _, lane := range requested {
+		if active[lane] {
+			out = append(out, lane)
+		}
+	}
+	return out
+}
+
+func hasActiveWorkspaceAgent(agents []herdr.AgentEntry, workspace string) bool {
+	return hasActiveWorkspaceAgentForRoster(agents, workspace, nil)
+}
+
+func hasActiveWorkspaceAgentForRoster(agents []herdr.AgentEntry, workspace string, roster []string) bool {
+	for _, agent := range agents {
+		if strings.TrimSpace(agent.Name) != "" && (workspace == "" || agent.Workspace == workspace) && (len(roster) == 0 || containsName(roster, agent.Name)) {
+			return true
+		}
+	}
+	return false
+}
+
+func containsName(names []string, want string) bool {
+	for _, name := range names {
+		if name == want {
+			return true
+		}
+	}
+	return false
 }
 
 // Due reports whether a new census should open.
@@ -171,9 +244,9 @@ func RequestBody(epoch, coordinator string) string {
 		"FLEET FEEDBACK REQUEST %s. Before your next handoff, inspect beyond your assigned task and report: "+
 			"blocker or underutilized capacity; any prompt that was not consumed; quota/provider state that "+
 			"disagrees with pane status; and anything the coordinator or herd tooling missed. "+
-			"Reply exactly with: HERD_LANE=<your-lane> bin/herd-mail send %s --summary 'FLEET_FEEDBACK %s <your-lane>' "+
+			"Reply exactly with: HERD_LANE=<your-lane> herd send %s \"FLEET_FEEDBACK %s <your-lane>\" "+
 			"'blocker=<...>; delivery=<...>; quota=<...>; coordinator_blind_spot=<...>' "+
-			"Use NONE explicitly for each empty field. Do not mutate outside your assigned worktree.",
+			"Use NONE explicitly for each empty field. Before waiting, verify a durable inbox record for this exact epoch; if none exists, treat the request as VOID and continue. Do not mutate outside your assigned worktree.",
 		epoch, coordinator, epoch)
 }
 
@@ -206,6 +279,9 @@ type Options struct {
 	Workspace      string // pre-resolved workspace id; empty resolves via ResolveWorkspace
 	WorkspaceLabel string // empty resolves from HERD_WORKSPACE_LABEL
 	Coordinator    string // pre-resolved coordinator; empty resolves via CoordinatorTarget
+	// Roster limits requests and census expectations to configured standing
+	// lanes. An empty roster preserves the generic all-agent behavior.
+	Roster []string
 
 	Now            func() time.Time
 	ListWorkspaces func() ([]herdr.WorkspaceEntry, error)
@@ -252,13 +328,13 @@ func (o *Options) setDefaults() {
 		o.StateDir = strings.TrimSpace(os.Getenv(EnvFeedbackDir))
 	}
 	if strings.TrimSpace(o.StateDir) == "" {
-		o.StateDir = filepath.Join(posture.StateDir(), "feedback")
+		o.StateDir = filepath.Join(defaultFleetStateDir(o.RepoRoot), "feedback")
 	}
 	if strings.TrimSpace(o.MailDir) == "" {
 		o.MailDir = strings.TrimSpace(os.Getenv(EnvMailDir))
 	}
 	if strings.TrimSpace(o.MailDir) == "" {
-		o.MailDir = filepath.Join(posture.StateDir(), "mail")
+		o.MailDir = filepath.Join(defaultFleetStateDir(o.RepoRoot), "mail")
 	}
 	if strings.TrimSpace(o.WindDown) == "" {
 		o.WindDown = strings.TrimSpace(os.Getenv(EnvWindDown))
@@ -286,9 +362,38 @@ func (o *Options) setDefaults() {
 	}
 }
 
+// defaultFleetStateDir mirrors the shell fleet's repo-scoped default. A Go
+// binary launched from a foreign repository must not silently write control
+// mail under Herdforge's own state namespace, because the repository's
+// coordinator and supervisors read the namespace derived from that repo.
+// HERD_STATE_DIR remains the explicit cross-repo override and is handled by
+// posture.StateDir.
+func defaultFleetStateDir(repoRoot string) string {
+	if strings.TrimSpace(os.Getenv("HERD_STATE_DIR")) != "" {
+		return posture.StateDir()
+	}
+	abs, err := filepath.Abs(repoRoot)
+	if err != nil {
+		return posture.StateDir()
+	}
+	repoName := strings.ToLower(strings.TrimSpace(filepath.Base(abs)))
+	if repoName == "" || repoName == "." || repoName == "herdforge" {
+		return posture.StateDir()
+	}
+	base := strings.TrimSpace(os.Getenv("XDG_STATE_HOME"))
+	if base == "" {
+		home, homeErr := os.UserHomeDir()
+		if homeErr != nil || strings.TrimSpace(home) == "" {
+			return posture.StateDir()
+		}
+		base = filepath.Join(home, ".local", "state")
+	}
+	return filepath.Join(base, repoName, "herd")
+}
+
 // Selftest verifies the load-bearing commitments this port must preserve:
 // the outbound request still carries the FLEET_FEEDBACK subject and names
-// herd-mail as the durable reply channel, and HERD_FEEDBACK_INTERVAL is
+// herd send as the reply channel, and HERD_FEEDBACK_INTERVAL is
 // actually read by the interval resolver — a behavioral check, not a
 // literal-vs-literal comparison that can only fail by editing both sides.
 // It is the in-process equivalent of bin/herd-feedback's own `grep` selftest.
@@ -297,8 +402,8 @@ func Selftest() error {
 	if !strings.Contains(body, SubjectPrefix) {
 		return fmt.Errorf("request body lost the %s subject", SubjectPrefix)
 	}
-	if !strings.Contains(body, "herd-mail") {
-		return fmt.Errorf("request body lost the herd-mail reply command")
+	if !strings.Contains(body, "herd send") {
+		return fmt.Errorf("request body lost the herd send reply command")
 	}
 	old, had := os.LookupEnv(EnvInterval)
 	os.Setenv(EnvInterval, "4242")
@@ -356,8 +461,19 @@ func Run(ctx context.Context, opts Options) error {
 
 	now := opts.Now()
 	if state.Epoch != "" {
+		replyLanes := state.Lanes
+		if agents, listErr := opts.ListAgents(); listErr == nil && hasActiveWorkspaceAgentForRoster(agents, workspace, opts.Roster) {
+			replyLanes = ActiveRequestedLanesForRoster(state.Lanes, agents, workspace, opts.Roster)
+			if len(replyLanes) != len(state.Lanes) {
+				fmt.Fprintf(opts.Stdout, "herd-feedback: retired lanes removed from census=%d\n", len(state.Lanes)-len(replyLanes))
+				state.Lanes = replyLanes
+				if saveErr := Save(opts.StateDir, state); saveErr != nil {
+					return saveErr
+				}
+			}
+		}
 		mailFile := filepath.Join(opts.MailDir, coordinator+".jsonl")
-		replied, missing, rerr := ReplyFromLanes(mailFile, state.Epoch, state.Lanes)
+		replied, missing, rerr := ReplyFromLanes(mailFile, state.Epoch, replyLanes)
 		if rerr != nil {
 			return fmt.Errorf("herd-feedback: reply census: %w", rerr)
 		}
@@ -417,7 +533,7 @@ func Run(ctx context.Context, opts Options) error {
 
 	var lanes []string
 	for _, a := range agents {
-		if a.Workspace != workspace || strings.TrimSpace(a.Name) == "" || a.Name == coordinator {
+		if a.Workspace != workspace || strings.TrimSpace(a.Name) == "" || a.Name == coordinator || (len(opts.Roster) > 0 && !containsName(opts.Roster, a.Name)) {
 			continue
 		}
 		// Durable delivery is the authoritative half of the census: a

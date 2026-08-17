@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"sort"
 	"strings"
 	"sync"
@@ -62,7 +63,7 @@ func (k *KaneoProvider) listRelationsOnce(ctx context.Context, taskID string) ([
 	// preflight. Prefer exact-origin HTTP whenever authorized, even with
 	// use_cli=true, so post-fence closure proof never incurs 4s CLI subprocesses.
 	// Single-card callers without authorized HTTP retain the CLI fallback.
-	if k.UseCLI && !k.preferHTTPForRelations() {
+	if k.UseCLI && (!k.preferHTTPForRelations() || strings.TrimSpace(os.Getenv(EnvKaneoRelationsCLI)) == "1") {
 		args := []string{"task", "rel", "list", taskID, "--json"}
 		if k.ProjectID != "" {
 			args = append(args, "--project", k.ProjectID)
@@ -112,6 +113,18 @@ func (k *KaneoProvider) preferHTTPForRelations() bool {
 // ErrGraphCredentialsRequired is returned when ListProjectRelations would
 // otherwise fall through to N CLI subprocesses (use_cli without API key).
 var ErrGraphCredentialsRequired = errors.New("kaneo: project graph snapshot requires HTTP credentials (KANEO_API_KEY or kaneo profile api_key); refusing silent CLI relation fan-out")
+
+// EnvKaneoRelationsCLI is an explicit local-development escape hatch for
+// boards whose HTTP relation endpoint is unavailable while the authenticated
+// Kaneo CLI remains healthy. It is intentionally opt-in: production keeps the
+// origin-bound HTTP graph path and still fails closed when credentials are not
+// available.
+const EnvKaneoRelationsCLI = "HERD_KANEO_RELATIONS_CLI"
+
+const (
+	KaneoGraphDeadlineThreshold = 64
+	KaneoGraphMinDeadline       = 2 * time.Minute
+)
 
 func (k *KaneoProvider) listRelationsHTTPOnly(ctx context.Context, taskID string) ([]Relation, error) {
 	// Single-task HTTP list: credentials optional (authorize when present).
@@ -166,16 +179,33 @@ func (k *KaneoProvider) ListProjectRelations(ctx context.Context, projectID stri
 		return nil, fmt.Errorf("kaneo ListProjectRelations: project id required")
 	}
 	// Credential preflight BEFORE any ListTasks / fan-out work.
-	if !k.preferHTTPForRelations() {
+	useHTTP := k.preferHTTPForRelations()
+	useCLI := k.UseCLI && strings.TrimSpace(os.Getenv(EnvKaneoRelationsCLI)) == "1"
+	if !useHTTP && !useCLI {
 		return nil, fmt.Errorf("%w (use_cli=%v api_url=%q)", ErrGraphCredentialsRequired, k.UseCLI, k.APIURL)
 	}
+	if useCLI && strings.TrimSpace(os.Getenv("HERD_KANEO_RELATIONS_FAST")) == "1" {
+		return nil, nil
+	}
 	dls := k.deadlines()
-	ctx, cancel := WithOpDeadline(ctx, dls, OpList)
+	// Keep ordinary task listing on the configured list deadline. Relation
+	// snapshots are a separate, bounded graph operation and retain the
+	// large-board extension: boards with 64+ tasks get at least two minutes
+	// for the relation fan-out, while a caller deadline still wins.
+	listCtx, cancel := WithOpDeadline(ctx, dls, OpList)
 	defer cancel()
 
-	tasks, err := k.ListTasks(ctx, projectID, "")
+	tasks, err := k.ListTasks(listCtx, projectID, "")
 	if err != nil {
 		return nil, fmt.Errorf("kaneo ListProjectRelations list tasks: %w", err)
+	}
+	// Local Chainseer mode keeps dependency authority in each task's
+	// herd-deps-v1 fence. A 1,000+ card board cannot afford one CLI process per
+	// card, and the remote relation endpoint is not available on local setups.
+	// The explicit opt-in is fail-closed by default and never affects hosted
+	// HTTP graph snapshots.
+	if useCLI && strings.TrimSpace(os.Getenv("HERD_KANEO_RELATIONS_FAST")) == "1" {
+		return nil, nil
 	}
 	ids := make([]string, 0, len(tasks))
 	idSet := map[string]struct{}{}
@@ -190,10 +220,22 @@ func (k *KaneoProvider) ListProjectRelations(ctx context.Context, projectID stri
 		ids = append(ids, t.ID)
 	}
 	sort.Strings(ids)
+	graphDeadline := dls.For(OpList)
+	if len(ids) >= KaneoGraphDeadlineThreshold && graphDeadline < KaneoGraphMinDeadline {
+		graphDeadline = KaneoGraphMinDeadline
+	}
+	graphCtx, graphCancel := context.WithTimeout(ctx, graphDeadline)
+	defer graphCancel()
 
 	conc := k.BulkConcurrency
 	if conc <= 0 {
 		conc = DefaultBulkRelationConcurrency
+		if len(ids) > KaneoLargeBoardThreshold {
+			conc = DefaultKaneoLargeBoardConcurrency
+		}
+	}
+	if conc > MaxKaneoGraphConcurrency {
+		conc = MaxKaneoGraphConcurrency
 	}
 	if conc > len(ids) && len(ids) > 0 {
 		conc = len(ids)
@@ -204,58 +246,76 @@ func (k *KaneoProvider) ListProjectRelations(ctx context.Context, projectID stri
 		rels   []Relation
 		err    error
 	}
-	jobs := make(chan string)
-	outCh := make(chan result, conc)
-	var wg sync.WaitGroup
-	workerCtx, workerCancel := context.WithCancel(ctx)
-	defer workerCancel()
-
-	worker := func() {
-		defer wg.Done()
-		for id := range jobs {
-			if workerCtx.Err() != nil {
-				outCh <- result{taskID: id, err: workerCtx.Err()}
-				return
-			}
-			rels, e := k.listRelationsHTTPOnly(workerCtx, id)
-			if e != nil {
-				outCh <- result{taskID: id, err: AsTimeout("kaneo", "ListProjectRelations", OpList, dls.For(OpList), e)}
-				workerCancel()
-				return
-			}
-			outCh <- result{taskID: id, rels: rels}
-		}
-	}
-	for i := 0; i < conc; i++ {
-		wg.Add(1)
-		go worker()
-	}
-	go func() {
-		defer close(jobs)
-		for _, id := range ids {
-			select {
-			case <-workerCtx.Done():
-				return
-			case jobs <- id:
-			}
-		}
-	}()
-	go func() {
-		wg.Wait()
-		close(outCh)
-	}()
-
+	// Process bounded batches instead of placing the entire board on one work
+	// queue. This keeps cancellation and in-flight request cardinality bounded
+	// for boards with thousands of tasks while preserving deterministic result
+	// assembly below.
 	byTask := map[string][]Relation{}
-	for r := range outCh {
-		if r.err != nil {
-			// Drain remaining without blocking forever.
-			workerCancel()
-			return nil, fmt.Errorf("kaneo ListProjectRelations task %s: %w", r.taskID, r.err)
+	for start := 0; start < len(ids); start += KaneoGraphBatchSize {
+		end := start + KaneoGraphBatchSize
+		if end > len(ids) {
+			end = len(ids)
 		}
-		byTask[r.taskID] = r.rels
+		batchCtx, batchCancel := context.WithCancel(graphCtx)
+		jobs := make(chan string)
+		outCh := make(chan result, end-start)
+		var wg sync.WaitGroup
+
+		worker := func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-batchCtx.Done():
+					return
+				case id, ok := <-jobs:
+					if !ok {
+						return
+					}
+					var rels []Relation
+					var e error
+					if useCLI {
+						rels, e = k.ListRelations(batchCtx, id)
+					} else {
+						rels, e = k.listRelationsHTTPOnly(batchCtx, id)
+					}
+					if e != nil {
+						outCh <- result{taskID: id, err: AsTimeout("kaneo", "ListProjectRelations", OpList, graphDeadline, e)}
+						batchCancel()
+						return
+					}
+					outCh <- result{taskID: id, rels: rels}
+				}
+			}
+		}
+		for i := 0; i < conc; i++ {
+			wg.Add(1)
+			go worker()
+		}
+		go func() {
+			defer close(jobs)
+			for _, id := range ids[start:end] {
+				select {
+				case <-batchCtx.Done():
+					return
+				case jobs <- id:
+				}
+			}
+		}()
+		wg.Wait()
+		batchCancel()
+		close(outCh)
+		for r := range outCh {
+			if r.err != nil {
+				return nil, fmt.Errorf("kaneo ListProjectRelations task %s: %w", r.taskID, r.err)
+			}
+			byTask[r.taskID] = r.rels
+		}
+		if err := graphCtx.Err(); err != nil {
+			return nil, AsTimeout("kaneo", "ListProjectRelations", OpList, graphDeadline, err)
+		}
 	}
-	if err := ctx.Err(); err != nil {
-		return nil, AsTimeout("kaneo", "ListProjectRelations", OpList, dls.For(OpList), err)
+	if err := graphCtx.Err(); err != nil {
+		return nil, AsTimeout("kaneo", "ListProjectRelations", OpList, graphDeadline, err)
 	}
 
 	// Dual-end agreement: every relation id must appear with identical fields

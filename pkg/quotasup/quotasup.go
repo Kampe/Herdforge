@@ -8,8 +8,10 @@
 package quotasup
 
 import (
+	"fmt"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/Kampe/Herdforge/pkg/router"
 	"github.com/Kampe/Herdforge/pkg/usage"
@@ -150,7 +152,8 @@ type Assignment struct {
 	// means Pool is the provider's default by fallback, not by evidence —
 	// this lane's contribution to a pool's active count is a guess, and the
 	// snapshot says so rather than letting it read as an observation.
-	ModelResolved bool `json:"model_resolved"`
+	ModelResolved bool   `json:"model_resolved"`
+	ProviderError string `json:"provider_error,omitempty"`
 }
 
 // Surface is the metered surface this agent bills against.
@@ -163,12 +166,105 @@ func (a Assignment) Surface() Surface {
 // what makes the next run's caps continuous with this one's instead of
 // restarting the ratchet from cold every time the process bounces.
 type Snapshot struct {
-	ObservedAt        string       `json:"observed_at"`
-	SourceAt          string       `json:"source_at,omitempty"`
-	Workspace         string       `json:"workspace"`
-	WarnRunwayMinutes int          `json:"warn_runway_minutes"`
-	Agents            []Assignment `json:"agents"`
-	Decisions         []Decision   `json:"decisions,omitempty"`
+	ObservedAt        string         `json:"observed_at"`
+	SourceAt          string         `json:"source_at,omitempty"`
+	Workspace         string         `json:"workspace"`
+	WarnRunwayMinutes int            `json:"warn_runway_minutes"`
+	Agents            []Assignment   `json:"agents"`
+	Decisions         []Decision     `json:"decisions,omitempty"`
+	Wake              *WakePlan      `json:"wake,omitempty"`
+	Recovery          []RecoveryPlan `json:"recovery,omitempty"`
+}
+
+// WakePlan is a durable, deduplicable self-wake hint for a coordinator. It is
+// a plan rather than a scheduler side effect; callers persist it and arm the
+// platform's cron/launchd adapter using the stable Key.
+type WakePlan struct {
+	Key      string    `json:"key"`
+	Provider string    `json:"provider"`
+	Window   string    `json:"window"`
+	ResetAt  time.Time `json:"reset_at"`
+	Reason   string    `json:"reason"`
+}
+
+// RecoveryPlan distinguishes a short five-hour exhaustion from a weekly cap.
+// The coordinator keeps its identity while routing around the exhausted pool;
+// only a five-hour reset gets a precise self-wake.
+type RecoveryPlan struct {
+	Provider string    `json:"provider"`
+	Pool     string    `json:"pool"`
+	Window   string    `json:"window"`
+	ResetAt  time.Time `json:"reset_at"`
+	Action   string    `json:"action"`
+	Reason   string    `json:"reason"`
+}
+
+// PlanRecovery preserves nested quota-window evidence and returns the
+// deterministic failover action for an exhausted surface.
+func PlanRecovery(now time.Time, d Decision) *RecoveryPlan {
+	windows := append([]usage.BurnState(nil), d.Evidence.Windows...)
+	if len(windows) == 0 && d.Evidence.Window != "" {
+		windows = append(windows, usage.BurnState{Window: d.Evidence.Window, WindowSeconds: d.Evidence.WindowSeconds, ResetsAt: d.Evidence.ResetAt, Class: usage.BurnExhausted})
+	}
+	var best *RecoveryPlan
+	for _, w := range windows {
+		if w.Class != usage.BurnExhausted && d.Evidence.Capacity != Exhausted {
+			continue
+		}
+		reset, err := time.Parse(time.RFC3339, strings.TrimSpace(w.ResetsAt))
+		if err != nil || !reset.After(now) {
+			continue
+		}
+		window := strings.ToLower(strings.TrimSpace(w.Window))
+		switch {
+		case w.WindowSeconds == usage.Window5h || window == "5h" || window == "five_hour":
+			window = "5h"
+		case w.WindowSeconds == usage.WindowWeekly || window == "weekly" || window == "7d":
+			window = "weekly"
+		default:
+			continue
+		}
+		action := "reroute-until-reset"
+		if window == "5h" {
+			action = "reroute-and-self-wake"
+		}
+		candidate := &RecoveryPlan{Provider: d.Surface.Provider, Pool: d.Surface.Pool, Window: window, ResetAt: reset.UTC(), Action: action,
+			Reason: fmt.Sprintf("%s quota exhausted; keep coordinator identity and fail over to a healthy surface", window)}
+		if best == nil || candidate.ResetAt.Before(best.ResetAt) {
+			best = candidate
+		}
+	}
+	return best
+}
+
+// PlanClaudeFiveHourWake returns the earliest future Claude five-hour reset
+// among observed surfaces. A reset without a parseable timestamp is not a
+// wake plan: coordinators must never arm a timer from an invented deadline.
+func PlanClaudeFiveHourWake(now time.Time, decisions []Decision) *WakePlan {
+	var best *WakePlan
+	for _, d := range decisions {
+		provider := strings.ToLower(strings.TrimSpace(d.Surface.Provider))
+		if provider != "anthropic" && provider != "claude" {
+			continue
+		}
+		e := d.Evidence
+		if e.WindowSeconds != usage.Window5h && !strings.EqualFold(e.Window, "5h") && !strings.EqualFold(e.Window, "five_hour") {
+			continue
+		}
+		reset, err := time.Parse(time.RFC3339, strings.TrimSpace(e.ResetAt))
+		if err != nil || !reset.After(now) {
+			continue
+		}
+		candidate := &WakePlan{
+			Key:      fmt.Sprintf("%s/5h/%s", provider, reset.UTC().Format(time.RFC3339)),
+			Provider: provider, Window: "5h", ResetAt: reset.UTC(),
+			Reason: "Claude five-hour quota window reset; re-read live quota before dispatch",
+		}
+		if best == nil || candidate.ResetAt.Before(best.ResetAt) {
+			best = candidate
+		}
+	}
+	return best
 }
 
 // UnresolvedModels names the lanes whose pool is a fallback rather than an

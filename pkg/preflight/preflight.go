@@ -13,6 +13,13 @@ import (
 
 // CheckWorktreeBoundary verifies that no absolute paths leak into git tracking or config files
 func CheckWorktreeBoundary(rootDir string) error {
+	return CheckWorktreeBoundaryWithAllowlist(rootDir, nil)
+}
+
+// CheckWorktreeBoundaryWithAllowlist is the configurable form of the
+// boundary check. Allowlist entries are repo-relative file names or globs;
+// they never grant permission to scan outside rootDir.
+func CheckWorktreeBoundaryWithAllowlist(rootDir string, allowlist []string) error {
 	var absoluteLeakes []string
 
 	root, err := os.OpenRoot(rootDir)
@@ -30,6 +37,12 @@ func CheckWorktreeBoundary(rootDir string) error {
 			if name == ".git" || name == "node_modules" || name == "vendor" ||
 				name == ".gemini" || name == ".qoder" || name == ".vscode" ||
 				name == ".claude" || name == ".codebuddy" || name == ".kiro" {
+				return fs.SkipDir
+			}
+			// .herd/bootstrap is a generated dependency cache. Its mirrored
+			// module sources may contain host paths by design; the tracked
+			// repository boundary remains covered outside this runtime subtree.
+			if path == filepath.Join(".herd", "bootstrap") {
 				return fs.SkipDir
 			}
 			fullPath := filepath.Join(rootDir, path)
@@ -55,7 +68,9 @@ func CheckWorktreeBoundary(rootDir string) error {
 			isPreflightTest := strings.HasSuffix(path, "_test.go") && strings.Contains(path, "preflight")
 			if (strings.Contains(content, "/Users/") || strings.Contains(content, "/home/") || strings.Contains(content, "C:\\")) &&
 				!strings.HasSuffix(path, "AGENTS.md") && !strings.HasSuffix(path, "preflight.go") && !isPreflightTest {
-				absoluteLeakes = append(absoluteLeakes, filepath.Join(rootDir, path))
+				if !allowedAbsolutePath(path, allowlist) {
+					absoluteLeakes = append(absoluteLeakes, filepath.Join(rootDir, path))
+				}
 			}
 		}
 		return nil
@@ -70,6 +85,23 @@ func CheckWorktreeBoundary(rootDir string) error {
 	}
 
 	return nil
+}
+
+func allowedAbsolutePath(path string, allowlist []string) bool {
+	path = filepath.ToSlash(filepath.Clean(path))
+	for _, raw := range allowlist {
+		pattern := filepath.ToSlash(filepath.Clean(strings.TrimSpace(raw)))
+		if pattern == "" || filepath.IsAbs(pattern) || pattern == ".." || strings.HasPrefix(pattern, "../") {
+			continue
+		}
+		if ok, err := filepath.Match(pattern, path); err == nil && ok {
+			return true
+		}
+		if pattern == path {
+			return true
+		}
+	}
+	return false
 }
 
 // CheckAgentStayedInWorktree returns an error if the git working tree at

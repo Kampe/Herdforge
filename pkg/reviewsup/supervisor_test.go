@@ -89,6 +89,32 @@ func TestNewDefaultConfig(t *testing.T) {
 	}
 }
 
+func TestWatchdogReportsStaleReviewWithoutLiveReviewer(t *testing.T) {
+	now := fixedNow()
+	dir := t.TempDir()
+	cfg := DefaultConfig(dir)
+	cfg.Now = func() time.Time { return now }
+	cfg.AdmitReceipt = testAdmitReceipt
+	sv := New(cfg)
+	if _, _, err := sv.Ingest(withDigest(CompletionCallback{
+		SHA: "watchdog-sha", Branch: "feat/watchdog", PatchID: "watchdog",
+		AuthorModel: "claude-3-7-sonnet", Tier: TierR1,
+	})); err != nil {
+		t.Fatalf("Ingest: %v", err)
+	}
+	if err := sv.LaunchReview("watchdog-sha", "reviewer-1", "gemini-2.5-flash"); err != nil {
+		t.Fatalf("LaunchReview: %v", err)
+	}
+	now = now.Add(11 * time.Minute)
+	alerts := sv.Watchdog(10*time.Minute, func(string) bool { return false })
+	if len(alerts) != 1 || alerts[0].SHA != "watchdog-sha" || alerts[0].Reason != "reviewer not live" {
+		t.Fatalf("alerts = %+v, want one dead-reviewer alert", alerts)
+	}
+	if got := sv.Watchdog(10*time.Minute, func(string) bool { return true }); len(got) != 0 {
+		t.Fatalf("live reviewer still alerted: %+v", got)
+	}
+}
+
 func TestIngest(t *testing.T) {
 	sv := svc(t)
 	if sv.PendingCount() != 2 {
@@ -377,6 +403,16 @@ func TestSubmitVerdictPASS(t *testing.T) {
 	if c.State != StateHarvested {
 		t.Errorf("state = %s, want harvested", c.State)
 	}
+	q := sv.QueueSnapshot()
+	var qentry QueueEntry
+	for _, entry := range q {
+		if entry.SHA == "aaa111" {
+			qentry = entry
+		}
+	}
+	if qentry.State != QueueCleanupCandidate {
+		t.Fatalf("queue after PASS = %+v, want one cleanup candidate", q)
+	}
 
 	ready, err := sv.ReadyForHarvest(10)
 	if err != nil {
@@ -391,6 +427,63 @@ func TestSubmitVerdictPASS(t *testing.T) {
 	}
 	if !found {
 		t.Error("aaa111 not found in harvest queue after PASS")
+	}
+}
+
+func TestMarkClosedProjectsCleanupCandidateToClosed(t *testing.T) {
+	sv := svc(t)
+	sv.LaunchReview("aaa111", "gemini", "gemini-2.5-flash")
+	if _, err := sv.SubmitVerdict(ReviewVerdict{SHA: "aaa111", Reviewer: "gemini", Verdict: VerdictPASS}); err != nil {
+		t.Fatalf("SubmitVerdict: %v", err)
+	}
+	if err := sv.MarkClosed("aaa111"); err != nil {
+		t.Fatalf("MarkClosed: %v", err)
+	}
+	q := sv.QueueSnapshot()
+	var found QueueEntry
+	for _, entry := range q {
+		if entry.SHA == "aaa111" {
+			found = entry
+		}
+	}
+	if found.State != QueueClosed {
+		t.Fatalf("queue after close = %+v, want closed", q)
+	}
+}
+
+// TestReconstructThenMarkClosed proves the cleanup handoff survives a
+// supervisor restart. Before the durable-state fix this was the observed
+// failure: Reconstruct restored StatePass while MarkClosed required
+// StateHarvested, leaving every retained reviewer pane stuck open.
+func TestReconstructThenMarkClosed(t *testing.T) {
+	dir := t.TempDir()
+	cfg := DefaultConfig(dir)
+	cfg.Now = fixedNow
+	cfg.AdmitReceipt = testAdmitReceipt
+	sv := New(cfg)
+	if _, _, err := sv.Ingest(withDigest(CompletionCallback{SHA: "restart-sha", Branch: "feat/restart", AuthorModel: "claude", Tier: TierR1})); err != nil {
+		t.Fatalf("Ingest: %v", err)
+	}
+	if err := sv.LaunchReview("restart-sha", "gemini", "gemini-2.5-flash"); err != nil {
+		t.Fatalf("LaunchReview: %v", err)
+	}
+	if _, err := sv.SubmitVerdict(ReviewVerdict{SHA: "restart-sha", Reviewer: "gemini", Verdict: VerdictPASS}); err != nil {
+		t.Fatalf("SubmitVerdict: %v", err)
+	}
+
+	restarted := New(cfg)
+	if _, err := restarted.Reconstruct(); err != nil {
+		t.Fatalf("Reconstruct: %v", err)
+	}
+	entries := restarted.QueueSnapshot()
+	if len(entries) != 1 || entries[0].State != QueueCleanupCandidate {
+		t.Fatalf("reconstructed queue = %+v, want cleanup-candidate", entries)
+	}
+	if err := restarted.MarkClosed("restart-sha"); err != nil {
+		t.Fatalf("MarkClosed after reconstruct: %v", err)
+	}
+	if got := restarted.QueueSnapshot()[0].State; got != QueueClosed {
+		t.Fatalf("queue after reconstructed close = %s, want %s", got, QueueClosed)
 	}
 }
 
@@ -789,8 +882,8 @@ func TestCandidateUnknown(t *testing.T) {
 func TestSubmitVerdictUnknownCandidate(t *testing.T) {
 	sv := svc(t)
 	_, err := sv.SubmitVerdict(ReviewVerdict{
-		SHA:      "unknown",
-		Verdict:  VerdictPASS,
+		SHA:     "unknown",
+		Verdict: VerdictPASS,
 	})
 	if err == nil {
 		t.Fatal("expected error for unknown candidate")

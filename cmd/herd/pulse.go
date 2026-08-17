@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -22,6 +23,7 @@ import (
 	"github.com/Kampe/Herdforge/pkg/pulse"
 	"github.com/Kampe/Herdforge/pkg/quotasup"
 	"github.com/Kampe/Herdforge/pkg/review"
+	"github.com/Kampe/Herdforge/pkg/standing"
 	"github.com/Kampe/Herdforge/pkg/usage"
 	"github.com/Kampe/Herdforge/pkg/winddown"
 	"github.com/Kampe/Herdforge/pkg/worktree"
@@ -205,24 +207,103 @@ func readPulseHerdr(ctx context.Context, doneRefs map[string]bool) pulse.HerdrOb
 	if err != nil {
 		return pulse.HerdrObservation{Known: false, Error: err.Error()}
 	}
+	// AgentList is intentionally fleet-wide in Herdr. Pulse must scope that
+	// inventory to this repository's configured workspace before deriving
+	// capacity or reap evidence; otherwise a focused workspace from another
+	// checkout (for example Chainseer) is treated as Herdforge's fleet.
+	if workspace := pulseHerdrWorkspace(); workspace != "" {
+		agents = filterPulseAgentsWorkspace(agents, workspace)
+	}
 	ev := loadReapEvidence(ctx, agents, doneRefs)
 	out := make([]pulse.AgentObservation, 0, len(agents))
 	for _, a := range agents {
+		paneBody := ""
+		if a.PaneID != "" {
+			if body, readErr := herdr.PaneRead(a.PaneID, 40); readErr == nil {
+				paneBody = body
+			}
+		}
+		processName := ""
+		if a.PaneID != "" {
+			if processes, processErr := herdr.PaneProcessInfo(a.PaneID); processErr == nil && len(processes) > 0 {
+				processName = processes[0].Name
+			}
+		}
+		explainTarget := a.Name
+		if strings.TrimSpace(explainTarget) == "" {
+			explainTarget = a.PaneID
+		}
+		explain, explainErr := herdr.ExplainAgent(explainTarget)
 		agent := pulse.AgentObservation{
-			Name:          a.Name,
-			Raw:           a.Status,
-			Status:        pulse.ClassifyStatus(a.Status, false),
-			PaneID:        a.PaneID,
-			TabID:         a.TabID,
-			Workspace:     a.Workspace,
-			TabGeneration: a.StateChangeSeq,
-			TabRevision:   a.Revision,
+			Name:              a.Name,
+			Raw:               a.Status,
+			Status:            pulse.ClassifyStatus(a.Status, false),
+			PaneID:            a.PaneID,
+			PaneState:         a.Status,
+			ForegroundProcess: processName,
+			TabID:             a.TabID,
+			Workspace:         a.Workspace,
+			TabGeneration:     a.StateChangeSeq,
+			TabRevision:       a.Revision,
+		}
+		if warning := herdr.DetectContextWarning(paneBody); warning != "" {
+			agent.ContextWarning = warning
+		}
+		if explainErr != nil {
+			agent.LastError = explainErr.Error()
+			agent.PacketPending = true
+		} else {
+			agent.PaneState = explain.State
+			agent.LastError = strings.TrimSpace(explain.Warning)
+			if agent.LastError == "" {
+				agent.LastError = strings.TrimSpace(explain.FallbackReason)
+			}
+			if a.Status == "done" {
+				agent.ExitReason = "agent reported done"
+			} else if explain.State == "blocked" || explain.VisibleBlocker {
+				agent.ExitReason = "agent detector reports blocked"
+			} else if explain.State == "unknown" {
+				agent.ExitReason = "pane state unknown"
+			}
+			// If neither visible idle nor visible working is proven, the pane
+			// may still hold an unconsumed composer or goal. Keep it resident.
+			agent.PacketPending = packetPendingFromExplain(explain)
 		}
 		ref := taskRefFromAgentName(a.Name)
 		agent = applyReapEvidence(agent, ref, ev)
 		out = append(out, agent)
 	}
 	return pulse.HerdrObservation{Known: true, Agents: out}
+}
+
+func packetPendingFromExplain(explain herdr.AgentExplain) bool {
+	return !explain.VisibleIdle && !explain.VisibleWorking
+}
+
+func pulseHerdrWorkspace() string {
+	if cfg, err := config.LoadConfig(".herd/herd.yaml"); err == nil {
+		if ws := strings.TrimSpace(cfg.Fleet.HerdrWorkspace); ws != "" {
+			return ws
+		}
+		if entries, listErr := herdr.WorkspaceList(); listErr == nil {
+			if root, rootErr := os.Getwd(); rootErr == nil {
+				if id, ok := herdr.PickWorkspaceStrict(entries, filepath.Base(root)); ok {
+					return id
+				}
+			}
+		}
+	}
+	return strings.TrimSpace(os.Getenv("HERD_WORKSPACE"))
+}
+
+func filterPulseAgentsWorkspace(agents []herdr.AgentEntry, workspace string) []herdr.AgentEntry {
+	filtered := make([]herdr.AgentEntry, 0, len(agents))
+	for _, agent := range agents {
+		if strings.TrimSpace(agent.Workspace) == workspace {
+			filtered = append(filtered, agent)
+		}
+	}
+	return filtered
 }
 
 func leaseDBPath() string {
@@ -342,13 +423,33 @@ func readPulseReview() pulse.ReviewObservation {
 	// as Known=false so an operator can detect the problem, not silently
 	// report Known=true with zero pending (finding 3).
 	ledger := review.OpenLedger(path)
-	if _, err := ledger.Vetoed(context.Background()); err != nil {
+	ctx := context.Background()
+	pending, err := ledger.Pending()
+	if err != nil {
 		return pulse.ReviewObservation{Known: false, Error: fmt.Sprintf("review ledger unreadable: %v", err)}
 	}
-	// Readable ledger: known-empty pending is honest — we did not observe
-	// pressure, so do not invent saturation. Callers needing the pile
-	// still run herd drain.
-	return pulse.ReviewObservation{Known: true, Pending: 0, NeedReview: 0}
+	vetoed, err := ledger.Vetoed(ctx)
+	if err != nil {
+		return pulse.ReviewObservation{Known: false, Error: fmt.Sprintf("review ledger unreadable: %v", err)}
+	}
+	pendingRefs := make([]string, 0, len(pending))
+	for _, row := range pending {
+		if strings.TrimSpace(row.SHA) != "" {
+			pendingRefs = append(pendingRefs, row.SHA)
+		}
+	}
+	needReviewRefs := make([]string, 0, len(vetoed))
+	for sha := range vetoed {
+		if strings.TrimSpace(sha) != "" {
+			needReviewRefs = append(needReviewRefs, sha)
+		}
+	}
+	sort.Strings(pendingRefs)
+	sort.Strings(needReviewRefs)
+	return pulse.ReviewObservation{
+		Known: true, Pending: len(pendingRefs), PendingRefs: pendingRefs,
+		NeedReview: len(needReviewRefs), NeedReviewRefs: needReviewRefs,
+	}
 }
 
 func readPulseQuota() pulse.QuotaObservation {
@@ -358,17 +459,28 @@ func readPulseQuota() pulse.QuotaObservation {
 	}
 	eng := usage.NewQuotaEngine()
 	computed := eng.ComputeAll(snap)
-	exhausted, atRisk := false, false
-	for _, st := range computed {
+	// Quota is a routing constraint, not an AND over every provider. One
+	// exhausted surface must not block a healthy sibling (for example Codex at
+	// its weekly limit while Grok remains available). Dispatch is exhausted
+	// only when every native provider surface is exhausted or unavailable.
+	exhausted, atRisk := true, false
+	knownSurface := false
+	for _, provider := range []string{"codex", "grok", "claude", "agy"} {
+		st, ok := computed[provider]
+		if !ok {
+			continue
+		}
+		knownSurface = true
+		if st.Available {
+			exhausted = false
+		}
 		switch quotasup.Classify(&st, quotasup.DefaultWarnRunwayMinutes) {
-		case quotasup.Exhausted:
-			exhausted = true
 		case quotasup.AtRisk:
 			atRisk = true
-		case quotasup.Unknown, quotasup.Untracked:
-			// A single unknown pool does not poison the whole beat, but
-			// exhaust/risk from any pool still gates dispatch.
 		}
+	}
+	if !knownSurface {
+		exhausted = false
 	}
 	return pulse.QuotaObservation{Known: true, Exhausted: exhausted, AtRisk: atRisk}
 }
@@ -541,12 +653,12 @@ func taskRefFromAgentName(name string) string {
 // nil exit-evidence maps correctly cause fail-closed (no reap), but nil
 // vetoedSHAs alone caused fail-open (lost KEEP signal → reap).
 type reapEvidence struct {
-	doneRefs       map[string]bool   // uppercased task refs with done status
-	safeRefs       map[string]string // uppercased task ref -> safe ref name
-	vetoedSHAs     map[string]bool   // SHAs with FAIL/BLOCKED verdict
-	headSHAs       map[string]string // agent name -> HEAD SHA
-	committed      map[string]bool   // agent name -> has committed work
-	ledgerCorrupt  bool              // ledger exists but unreadable — verdict may be pending
+	doneRefs      map[string]bool   // uppercased task refs with done status
+	safeRefs      map[string]string // uppercased task ref -> safe ref name
+	vetoedSHAs    map[string]bool   // SHAs with FAIL/BLOCKED verdict
+	headSHAs      map[string]string // agent name -> HEAD SHA
+	committed     map[string]bool   // agent name -> has committed work
+	ledgerCorrupt bool              // ledger exists but unreadable — verdict may be pending
 }
 
 // applyReapEvidence fills in CommittedWork, TicketDone, SafeRef, and
@@ -658,15 +770,29 @@ func (a *livePulseActor) OpenReview(ctx context.Context, lane pulse.AgentObserva
 	if strings.TrimSpace(lane.TabID) == "" {
 		return fmt.Errorf("pulse: open_review requires tab_id; lane %q has none", lane.Name)
 	}
-	// FAC-226: the open-review path must resolve the lane's worktree,
-	// verify the rebase-onto-origin/main non-empty diff (the one sound
-	// merge check), and hand off to the review supervisor (Ingest +
-	// LaunchReview with receipt admission). The pulse observation does
-	// not yet carry the worktree path or commit SHA — wiring it requires
-	// a herdr tab-to-worktree resolver and a worktree diff reader. An
-	// honest refusal is better than inventing a review candidate from
-	// incomplete evidence. The open_review is still ENFORCED: every beat
-	// plans it for finished lanes, so the coordinator cannot miss a lane
-	// that needs review.
-	return errors.New("pulse: open_review adapter requires worktree resolver and review-supervisor handoff (FAC-226; not yet wired into pulse observation)")
+	// Pulse observes a lane but intentionally does not invent a candidate SHA.
+	// Hand the exact tab identity to the standing review supervisor, which owns
+	// candidate discovery, receipt admission, reviewer dispatch, and retries.
+	cfg, err := config.LoadConfig(filepath.Join(".herd", "herd.yaml"))
+	if err != nil {
+		return fmt.Errorf("pulse: load config for review supervisor: %w", err)
+	}
+	supervisor := findReviewSupervisorLane(cfg)
+	if supervisor == nil {
+		return errors.New("pulse: no standing review supervisor configured")
+	}
+	if !herdr.IsAvailable() {
+		return errors.New("pulse: herdr CLI not found")
+	}
+	target := standing.AgentName(supervisor.Name)
+	packet := pulseReviewPacket(lane)
+	if _, err := herdr.AgentPrompt(target, packet, false); err != nil {
+		return fmt.Errorf("pulse: notify review supervisor %s: %w", target, err)
+	}
+	_ = ctx
+	return nil
+}
+
+func pulseReviewPacket(lane pulse.AgentObservation) string {
+	return fmt.Sprintf("PULSE REVIEW HANDOFF\nLane: %s\nTab: %s\nWorkspace: %s\n\nInspect this finished lane's exact worktree and candidate receipt. Admit and review only an exact candidate SHA with valid verification evidence. You own reviewer dispatch, retries, verdict ingest, and reviewer-pane cleanup; send only a merge-ready PASS handoff to the coordinator. Do not ask the coordinator to perform review work.", lane.Name, lane.TabID, lane.Workspace)
 }

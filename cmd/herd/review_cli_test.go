@@ -280,6 +280,13 @@ func herdCmdWithFake(binary, dir, keyDir, fakeBin, fakeLog string, args ...strin
 	cmd := exec.Command(binary, args...)
 	cmd.Dir = dir
 	cmd.Env = append(os.Environ(), dispatch.KeyDirEnv+"="+keyDir)
+	// Review commands may chdir into an isolated detached worktree. Keep the
+	// provider's shared claim fence anchored to the fixture repository rather
+	// than making the review checkout provision a second authority.
+	cmd.Env = append(cmd.Env, "HERD_CLAIM_DIR="+filepath.Join(dir, "claims"))
+	if seal := readMintedSeal(dir); seal != "" {
+		cmd.Env = append(cmd.Env, "HERD_FENCE_VOLUME_ID="+seal)
+	}
 	cmd.Env = append(cmd.Env, hermeticHerdrEnv(fakeBin, fakeLog)...)
 	// Pi session allocation and route state must stay inside the fixture:
 	// the operator's ~/.pi is neither present in CI nor ours to touch.
