@@ -36,6 +36,11 @@ const (
 	NoLiveEnv = "HERD_NO_LIVE_HERDR"
 )
 
+func localDirectMode() bool {
+	mode := strings.ToLower(strings.TrimSpace(os.Getenv("HERD_MODE")))
+	return mode == "local" || mode == "dev" || mode == "development"
+}
+
 // binaryPath resolves the herdr executable, honouring the test override.
 func binaryPath() (string, error) {
 	if override := strings.TrimSpace(os.Getenv(BinaryEnv)); override != "" {
@@ -146,8 +151,13 @@ func PrepareToolChildLifecycle(tabID, paneID string, req *launch.Request, name s
 			return fmt.Errorf("durable Herdr session generation: %w", err)
 		}
 	}
-	if req.Decision.Harness != router.PiHarness {
+	if req.Decision.Harness != router.PiHarness && !localDirectMode() {
 		return fmt.Errorf("tool-child lifecycle requires Pi harness")
+	}
+	if req.Decision.Harness != router.PiHarness && localDirectMode() {
+		// Native local lanes are owned by Herdr's vendor process directly; the
+		// hosted Pi session ledger is not a prerequisite for a single-user pane.
+		return nil
 	}
 	if req.Decision.HarnessSession != "" {
 		return fmt.Errorf("tool-child lifecycle requires an unbound Pi session decision")
@@ -877,6 +887,10 @@ type TabRecord struct {
 	TabID       string `json:"tab_id"`
 	WorkspaceID string `json:"workspace_id"`
 	Label       string `json:"label"`
+	// Generation is optional because Herdr 0.8 does not expose immutable tab
+	// generations in tab list/create responses. When a newer Herdr provides it,
+	// callers can bind it directly; an absent value must remain fail-closed.
+	Generation  string `json:"generation,omitempty"`
 	Number      int    `json:"number"`
 	PaneCount   int    `json:"pane_count"`
 	Focused     bool   `json:"focused"`
@@ -970,8 +984,10 @@ func TabCreate(opts TabCreateOptions) (*TabInfo, error) {
 	var resp struct {
 		Result struct {
 			Tab struct {
-				TabID string `json:"tab_id"`
-				Label string `json:"label"`
+				TabID         string `json:"tab_id"`
+				Label         string `json:"label"`
+				Generation    string `json:"generation,omitempty"`
+				TabGeneration string `json:"tab_generation,omitempty"`
 			} `json:"tab"`
 			RootPane struct {
 				PaneID     string `json:"pane_id"`
@@ -991,14 +1007,18 @@ func TabCreate(opts TabCreateOptions) (*TabInfo, error) {
 	}
 
 	tab := &TabInfo{
-		ID:    resp.Result.Tab.TabID,
-		Label: resp.Result.Tab.Label,
-		Cwd:   opts.Cwd,
+		ID:         resp.Result.Tab.TabID,
+		Label:      resp.Result.Tab.Label,
+		Generation: strings.TrimSpace(resp.Result.Tab.Generation),
+		Cwd:        opts.Cwd,
 		Pane: PaneInfo{
 			ID:         resp.Result.RootPane.PaneID,
 			TabID:      resp.Result.RootPane.TabID,
 			TerminalID: resp.Result.RootPane.TerminalID,
 		},
+	}
+	if tab.Generation == "" {
+		tab.Generation = strings.TrimSpace(resp.Result.Tab.TabGeneration)
 	}
 	// FAC-172: every HostedUID path proves shell/tree UID after create — not
 	// flag-and-trust-daemon. Proof failure kills bound PIDs and closes the tab.
@@ -1156,6 +1176,20 @@ func AgentStartWithDecision(name, kind, paneID string, req launch.Request) error
 	}
 	if req.SessionGeneration <= 0 {
 		return fmt.Errorf("durable Herdr session generation is unavailable")
+	}
+	if lc == nil && localDirectMode() {
+		if err := agentStartProcess(name, kind, paneID, req.Decision.HarnessArgv[1:]...); err != nil {
+			return err
+		}
+		observation, err := verifyAgentLaunch(name, paneID, 15*time.Second)
+		if err != nil {
+			cleanupErr := compensateStartedProcessExact(name, paneID)
+			if cleanupErr != nil {
+				return errors.Join(fmt.Errorf("herdr launch %s: %w (%s)", observation.State, err, observation.Reason), fmt.Errorf("launch cleanup: %w", cleanupErr))
+			}
+			return fmt.Errorf("herdr launch %s: %w (%s)", observation.State, err, observation.Reason)
+		}
+		return nil
 	}
 	if lc == nil {
 		return fmt.Errorf("prepared tool-child lifecycle is required before process start")

@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -60,11 +61,8 @@ func hardCloseTab(tabID, name string) error {
 	if tabID == "" && name == "" {
 		return fmt.Errorf("hard close: empty tab and name")
 	}
-	var closeErr error
-	if tabID != "" {
-		closeErr = TabClose(tabID)
-	}
 	deadline := time.Now().Add(12 * time.Second)
+	closeAttempted := false
 	for time.Now().Before(deadline) {
 		agents, err := AgentList()
 		if err != nil {
@@ -74,24 +72,28 @@ func hardCloseTab(tabID, name string) error {
 		for _, a := range agents {
 			if (tabID != "" && a.TabID == tabID) || (name != "" && a.Name == name) {
 				found = true
-				// Retry close if still present.
-				if a.TabID != "" {
-					_ = TabClose(a.TabID)
+				if !closeAttempted {
+					if a.StateChangeSeq == 0 {
+						return fmt.Errorf("FAC-133 cleanup: tab %s has no immutable generation", a.TabID)
+					}
+					if err := TabCloseCAS(CloseRequest{
+						WorkspaceID: a.Workspace,
+						TabID:       a.TabID,
+						Generation:  strconv.FormatUint(a.StateChangeSeq, 10),
+						TabRevision: a.Revision,
+						Nonce:       "live-proof-close-" + strconv.FormatInt(time.Now().UnixNano(), 36),
+					}); err != nil {
+						return fmt.Errorf("FAC-133 cleanup compare-and-close: %w", err)
+					}
+					closeAttempted = true
 				}
 				break
 			}
 		}
 		if !found {
-			if closeErr != nil {
-				// Close reported error but agent is gone — absence is what matters.
-				return nil
-			}
 			return nil
 		}
 		time.Sleep(150 * time.Millisecond)
-	}
-	if closeErr != nil {
-		return fmt.Errorf("FAC-133 cleanup: tab %s / name %s still present after close (%v)", tabID, name, closeErr)
 	}
 	return fmt.Errorf("FAC-133 cleanup: tab %s / name %s still present after close", tabID, name)
 }
@@ -102,6 +104,13 @@ func randomNonce(n int) string {
 		return fmt.Sprintf("%d", time.Now().UnixNano())
 	}
 	return hex.EncodeToString(b)
+}
+
+// liveProofAgentName stays within Herdr's 32-character name contract. A full
+// decimal UnixNano plus nonce used to exceed that limit, so every live proof
+// failed before the harness process could start.
+func liveProofAgentName(kind string) string {
+	return fmt.Sprintf("lp-%s-%s", strings.ToLower(strings.TrimSpace(kind)), strconv.FormatInt(time.Now().UnixNano(), 36))
 }
 
 // rejectNonModelSession fails closed when the pane is a login/auth UI or lacks
@@ -234,7 +243,7 @@ func proveLiveHarness(kind, realBin, tmp string) (modelOK, toolOK, viaLA, contai
 			"FAC-133 BLOCKED: herdr workspace unknown (set HERD_WORKSPACE; no first-entry fallback)", err
 	}
 
-	name := fmt.Sprintf("lp-%s-%d-%s", kind, time.Now().UnixNano(), randomNonce(4))
+	name := liveProofAgentName(kind)
 	nonce := randomNonce(8)
 	var spawn *security.AgentSpawnResult
 	tabID := ""

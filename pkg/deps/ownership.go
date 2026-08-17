@@ -27,6 +27,7 @@ var ErrAlreadyClaimed = errors.New("deps: task already leased")
 // by generation (not a process-local map).
 type OwnershipToken struct {
 	Key         claim.LeaseKey
+	LeaseID     int64
 	TaskID      TaskID
 	TaskRef     Ref
 	OwnerID     string
@@ -194,6 +195,7 @@ func (o *LeaseOwnership) ClaimExclusive(ctx context.Context, taskID TaskID, task
 	}
 	return &OwnershipToken{
 		Key:         key,
+		LeaseID:     lease.ID,
 		TaskID:      taskID,
 		TaskRef:     taskRef,
 		OwnerID:     lease.OwnerID,

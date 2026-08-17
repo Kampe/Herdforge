@@ -848,6 +848,11 @@ func mapRelTypeStrict(t provider.RelationType) EdgeType {
 	switch t {
 	case provider.RelationRelated:
 		return EdgeRelated
+	case provider.RelationSubtask:
+		// Kaneo exposes parent/child structure as `subtask`. It is useful
+		// context, but it must not become an eligibility blocker in the
+		// provider-neutral graph.
+		return EdgeRelated
 	case provider.RelationBlocks:
 		return EdgeBlocks
 	default:

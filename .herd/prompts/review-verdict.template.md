@@ -1,4 +1,6 @@
 sha: <the 40-hex commit id this verdict is ABOUT>
+
+Routing and persistence are defined in `.herd/prompts/routing.md`; deliver only to the standing review supervisor.
 branch: <the branch the candidate lives on>
 reviewer: <your lane name — never a coordinator>
 reviewer-family: <your model family: anthropic|openai|google|xai|moonshot|...>
@@ -7,6 +9,13 @@ verdict: PASS | FAIL | BLOCKED
 reviewed-head: <output of `git rev-parse HEAD` in the tree you actually read>
 ---
 Your evidence goes here, below the `---`.
+
+Delivery: send this verdict and its findings to the standing review supervisor. The coordinator receives only the supervisor's merge-ready PASS handoff.
+
+Use the Herdforge/Herdr delivery path (`herdr agent prompt` or
+`herd herdr-deliver --file`). Do not send verdicts through repository
+`bin/herd-*` scripts or directly to the coordinator. The supervisor owns the
+exact-SHA ledger row, retry loop, author feedback, and reviewer-tab cleanup.
 
 # The seven keys above are the COMPLETE accepted set
 

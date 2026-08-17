@@ -45,7 +45,10 @@ func (s LiveSpawner) StartAgent(name, kind, paneID string, agentArgs []string) e
 
 // CloseTab implements security.ProcessSpawner.
 func (LiveSpawner) CloseTab(tabID string) error {
-	return TabClose(tabID)
+	// Live launches must never fall back to an unfenced close. A raw close can
+	// tear down a recycled tab while its broker/CA is still referenced by the
+	// child, leaving the harness with a stale SSL_CERT_FILE and an auth loop.
+	return hardCloseTab(tabID, "")
 }
 
 // LiveResolver implements security.LiveAgentResolver against herdr.
@@ -74,7 +77,7 @@ func (LiveResolver) Lookup(name string) (*security.LiveAgentIdentity, error) {
 
 // CloseTab implements security.LiveAgentResolver.
 func (LiveResolver) CloseTab(tabID string) error {
-	return TabClose(tabID)
+	return hardCloseTab(tabID, "")
 }
 
 // AgentRead returns recent terminal output for a live agent (login/auth detection).

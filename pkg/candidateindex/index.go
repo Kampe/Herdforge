@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/Kampe/Herdforge/pkg/config"
+	"github.com/Kampe/Herdforge/pkg/dispatch"
 	"github.com/Kampe/Herdforge/pkg/mail"
 	"github.com/Kampe/Herdforge/pkg/provider"
 	"github.com/Kampe/Herdforge/pkg/reviewingest"
@@ -48,17 +49,17 @@ const (
 type BlockedReason string
 
 const (
-	BlockedMissingCandidateSHA BlockedReason = "missing_candidate_sha"
-	BlockedMalformedSHA        BlockedReason = "malformed_sha"
-	BlockedMissingTaskRef      BlockedReason = "missing_task_ref"
-	BlockedStaleCandidate      BlockedReason = "stale_candidate"
+	BlockedMissingCandidateSHA  BlockedReason = "missing_candidate_sha"
+	BlockedMalformedSHA         BlockedReason = "malformed_sha"
+	BlockedMissingTaskRef       BlockedReason = "missing_task_ref"
+	BlockedStaleCandidate       BlockedReason = "stale_candidate"
 	BlockedUnpublishedCandidate BlockedReason = "unpublished_candidate"
-	BlockedMalformedEvidence   BlockedReason = "malformed_evidence"
-	BlockedVetoVerdict         BlockedReason = "veto_verdict"
-	BlockedNoPassingVerdict    BlockedReason = "no_passing_verdict"
-	BlockedAlreadyConsumed     BlockedReason = "already_consumed"
-	BlockedMissingWorktree     BlockedReason = "missing_worktree"
-	BlockedMissingReceipt      BlockedReason = "missing_receipt"
+	BlockedMalformedEvidence    BlockedReason = "malformed_evidence"
+	BlockedVetoVerdict          BlockedReason = "veto_verdict"
+	BlockedNoPassingVerdict     BlockedReason = "no_passing_verdict"
+	BlockedAlreadyConsumed      BlockedReason = "already_consumed"
+	BlockedMissingWorktree      BlockedReason = "missing_worktree"
+	BlockedMissingReceipt       BlockedReason = "missing_receipt"
 )
 
 // Candidate represents an unintegrated or active review candidate.
@@ -92,12 +93,29 @@ type IndexOptions struct {
 	QueuePath    string
 	InboxDir     string
 	WorktreesDir string
-	Now          func() time.Time
+	// LaneWorktrees are configured standing-lane checkouts. Forge may launch
+	// an ephemeral task into one of these instead of creating
+	// .herd/worktrees/<ref>; the signed TASK-CONTEXT.json is the only authority
+	// used to associate such a checkout with a task ref.
+	LaneWorktrees []string
+	Now           func() time.Time
 }
 
 // CandidateIndex builds and serves a deterministic read-only view of review candidates.
 type CandidateIndex struct {
 	opts IndexOptions
+}
+
+type candidateKey struct {
+	ref string
+	sha string
+}
+
+type candidateEvidence struct {
+	observedAt time.Time
+	source     CandidateSource
+	sequence   int64
+	ordinal    int
 }
 
 // New creates a new CandidateIndex.
@@ -119,6 +137,18 @@ func New(opts IndexOptions) *CandidateIndex {
 	}
 	if opts.WorktreesDir == "" && opts.RepoRoot != "" {
 		opts.WorktreesDir = filepath.Join(opts.RepoRoot, ".herd", "worktrees")
+	}
+	if len(opts.LaneWorktrees) == 0 && opts.Config != nil && opts.RepoRoot != "" {
+		for _, lane := range opts.Config.Lanes {
+			path := strings.TrimSpace(lane.Worktree)
+			if path == "" {
+				continue
+			}
+			if !filepath.IsAbs(path) {
+				path = filepath.Join(opts.RepoRoot, path)
+			}
+			opts.LaneWorktrees = append(opts.LaneWorktrees, filepath.Clean(path))
+		}
 	}
 	return &CandidateIndex{opts: opts}
 }
@@ -159,15 +189,17 @@ func SortCandidates(cands []*Candidate) {
 // deduplicates records by (TaskRef, CandidateSHA), validates exact SHA and evidence integrity,
 // and returns deterministically sorted candidates.
 func (idx *CandidateIndex) BuildIndex(ctx context.Context) ([]*Candidate, error) {
-	type candKey struct {
-		ref string
-		sha string
+	merged := make(map[candidateKey]*Candidate)
+	sourceMap := make(map[candidateKey]map[CandidateSource]bool)
+	evidence := make(map[candidateKey]candidateEvidence)
+	type callbackBlock struct {
+		sequence int64
+		lease    int64
 	}
+	callbackBlocks := make(map[candidateKey]callbackBlock)
+	var evidenceOrdinal int
 
-	merged := make(map[candKey]*Candidate)
-	sourceMap := make(map[candKey]map[CandidateSource]bool)
-
-	addSource := func(k candKey, src CandidateSource) {
+	addSource := func(k candidateKey, src CandidateSource) {
 		if sourceMap[k] == nil {
 			sourceMap[k] = make(map[CandidateSource]bool)
 		}
@@ -175,7 +207,7 @@ func (idx *CandidateIndex) BuildIndex(ctx context.Context) ([]*Candidate, error)
 	}
 
 	getOrCreate := func(ref, sha string, priority provider.Priority) *Candidate {
-		k := candKey{ref: strings.TrimSpace(ref), sha: strings.TrimSpace(sha)}
+		k := candidateKey{ref: strings.TrimSpace(ref), sha: strings.TrimSpace(sha)}
 		c, ok := merged[k]
 		if !ok {
 			c = &Candidate{
@@ -192,6 +224,14 @@ func (idx *CandidateIndex) BuildIndex(ctx context.Context) ([]*Candidate, error)
 		}
 		return c
 	}
+	observe := func(ref, sha string, source CandidateSource, observedAt time.Time, sequence int64) {
+		key := candidateKey{ref: strings.TrimSpace(ref), sha: strings.TrimSpace(sha)}
+		evidenceOrdinal++
+		candidate := candidateEvidence{observedAt: observedAt, source: source, sequence: sequence, ordinal: evidenceOrdinal}
+		if previous, ok := evidence[key]; !ok || newerEvidence(candidate, previous) {
+			evidence[key] = candidate
+		}
+	}
 
 	// 1. Scan Provider Tasks in "in-progress" status
 	if idx.opts.TaskProvider != nil && idx.opts.Config != nil && idx.opts.Config.TaskProvider.ProjectID != "" {
@@ -204,12 +244,13 @@ func (idx *CandidateIndex) BuildIndex(ctx context.Context) ([]*Candidate, error)
 			if ref == "" {
 				continue
 			}
-			k := candKey{ref: ref, sha: ""}
+			k := candidateKey{ref: ref, sha: ""}
 			c := getOrCreate(ref, "", t.Priority)
 			c.TaskID = t.ID
 			c.Title = t.Title
 			c.UpdatedAt = t.UpdatedAt
 			addSource(k, SourceProviderTask)
+			observe(ref, "", SourceProviderTask, t.UpdatedAt, 0)
 		}
 	}
 
@@ -222,6 +263,7 @@ func (idx *CandidateIndex) BuildIndex(ctx context.Context) ([]*Candidate, error)
 					var cb mail.Callback
 					if err := json.Unmarshal([]byte(env.Body), &cb); err == nil && cb.Ref != "" {
 						c := getOrCreate(cb.Ref, cb.SHA, provider.PriorityMedium)
+						key := candidateKey{ref: strings.TrimSpace(cb.Ref), sha: strings.TrimSpace(cb.SHA)}
 						if cb.LeaseGeneration > c.LeaseGeneration {
 							c.LeaseGeneration = cb.LeaseGeneration
 						}
@@ -229,8 +271,17 @@ func (idx *CandidateIndex) BuildIndex(ctx context.Context) ([]*Candidate, error)
 							c.State = StateBlocked
 							c.BlockedReasons = append(c.BlockedReasons, BlockedVetoVerdict)
 							c.BlockedEvidence = append(c.BlockedEvidence, fmt.Sprintf("callback blocked: %s", cb.Detail))
+							callbackBlocks[key] = callbackBlock{sequence: env.Sequence, lease: cb.LeaseGeneration}
+						} else if cb.Kind == mail.CallbackComplete {
+							if block, ok := callbackBlocks[key]; ok && env.Sequence > block.sequence && cb.LeaseGeneration == block.lease {
+								c.State = StatePending
+								c.BlockedReasons = removeBlockedReason(c.BlockedReasons, BlockedVetoVerdict)
+								c.BlockedEvidence = removeCallbackBlockedEvidence(c.BlockedEvidence)
+								delete(callbackBlocks, key)
+							}
 						}
-						addSource(candKey{ref: cb.Ref, sha: cb.SHA}, SourceReviewMail)
+						addSource(key, SourceReviewMail)
+						observe(cb.Ref, cb.SHA, SourceReviewMail, env.Timestamp, env.Sequence)
 					}
 				}
 			}
@@ -253,7 +304,7 @@ func (idx *CandidateIndex) BuildIndex(ctx context.Context) ([]*Candidate, error)
 				}
 			}
 
-			for _, r := range rows {
+			for rowIndex, r := range rows {
 				ref := r.Task
 				sha := r.SHA
 				if sha == "" {
@@ -278,7 +329,9 @@ func (idx *CandidateIndex) BuildIndex(ctx context.Context) ([]*Candidate, error)
 				if consumed[sha] {
 					c.State = StateConsumed
 				}
-				addSource(candKey{ref: ref, sha: sha}, SourceReviewLedger)
+				addSource(candidateKey{ref: ref, sha: sha}, SourceReviewLedger)
+				observedAt, _ := time.Parse(time.RFC3339Nano, r.Timestamp)
+				observe(ref, sha, SourceReviewLedger, observedAt, int64(rowIndex))
 			}
 		}
 	}
@@ -296,12 +349,17 @@ func (idx *CandidateIndex) BuildIndex(ctx context.Context) ([]*Candidate, error)
 					continue
 				}
 				art := reviewingest.Parse(string(data))
+				var observedAt time.Time
+				if info, statErr := entry.Info(); statErr == nil {
+					observedAt = info.ModTime()
+				}
 				if art.MalformedHeaderRegion || len(art.ConflictingHeaders) > 0 {
 					c := getOrCreate(entry.Name(), art.SHA, provider.PriorityMedium)
 					c.State = StateBlocked
 					c.BlockedReasons = append(c.BlockedReasons, BlockedMalformedEvidence)
 					c.BlockedEvidence = append(c.BlockedEvidence, fmt.Sprintf("inbox artifact %s has malformed/conflicting headers", entry.Name()))
-					addSource(candKey{ref: entry.Name(), sha: art.SHA}, SourceReviewInbox)
+					addSource(candidateKey{ref: entry.Name(), sha: art.SHA}, SourceReviewInbox)
+					observe(entry.Name(), art.SHA, SourceReviewInbox, observedAt, 0)
 					continue
 				}
 				if art.SHA != "" {
@@ -323,7 +381,8 @@ func (idx *CandidateIndex) BuildIndex(ctx context.Context) ([]*Candidate, error)
 						c.BlockedReasons = append(c.BlockedReasons, BlockedMalformedEvidence)
 						c.BlockedEvidence = append(c.BlockedEvidence, fmt.Sprintf("verdict validation failed: %v", valErr))
 					}
-					addSource(candKey{ref: entry.Name(), sha: art.SHA}, SourceReviewInbox)
+					addSource(candidateKey{ref: entry.Name(), sha: art.SHA}, SourceReviewInbox)
+					observe(entry.Name(), art.SHA, SourceReviewInbox, observedAt, 0)
 				}
 			}
 		}
@@ -337,19 +396,68 @@ func (idx *CandidateIndex) BuildIndex(ctx context.Context) ([]*Candidate, error)
 
 	var candidates []*Candidate
 	for ref, list := range byRef {
-		var resolvedSHA, resolvedTitle, resolvedTaskID string
+		var resolvedTitle, resolvedTaskID string
 		var bestPriority provider.Priority
-		var resolvedVerdict, resolvedReviewer, resolvedReviewerFamily, resolvedAuthorFamily string
-		var resolvedLease int64
-		var hasBlockedState bool
-		var accumulatedBlockedReasons []BlockedReason
-		var accumulatedBlockedEvidence []string
 		srcSet := make(map[CandidateSource]bool)
+		var worktreePath string
 
-		for _, item := range list {
-			if item.CandidateSHA != "" && resolvedSHA == "" {
-				resolvedSHA = item.CandidateSHA
+		// A callback can name an anchor or an otherwise stale candidate. The
+		// task worktree is the live checkout used for review, so always add
+		// its exact HEAD as evidence before coalescing. Previously this was
+		// consulted only when no callback/ledger SHA existed, allowing a stale
+		// callback to hide the current worktree candidate.
+		worktrees := make([]string, 0, 1+len(idx.opts.LaneWorktrees))
+		if idx.opts.WorktreesDir != "" && ref != "" {
+			worktrees = append(worktrees, filepath.Join(idx.opts.WorktreesDir, strings.ToLower(hsync.NormalizeRef(ref))))
+		}
+		worktrees = append(worktrees, idx.opts.LaneWorktrees...)
+		seenWorktrees := make(map[string]bool, len(worktrees))
+		for _, wt := range worktrees {
+			wt = filepath.Clean(wt)
+			if seenWorktrees[wt] || wt == "" {
+				continue
 			}
+			seenWorktrees[wt] = true
+			if fi, err := os.Stat(wt); err == nil && fi.IsDir() {
+				// A shared lane worktree is admitted only when its signed
+				// task context names this exact ref. Never treat a generic
+				// standing-lane HEAD as task evidence.
+				if !strings.EqualFold(filepath.Base(wt), strings.ToLower(hsync.NormalizeRef(ref))) {
+					tc, tcErr := dispatch.ReadTaskContext(wt)
+					if tcErr != nil || !strings.EqualFold(tc.TaskRef, ref) {
+						continue
+					}
+				}
+				if worktreePath == "" {
+					worktreePath = wt
+				}
+				if out, gerr := exec.Command("git", "-C", wt, "rev-parse", "HEAD").Output(); gerr == nil {
+					head := strings.TrimSpace(string(out))
+					if sha40Re.MatchString(head) {
+						worktreeCandidate := getOrCreate(ref, head, provider.PriorityMedium)
+						addSource(candidateKey{ref: ref, sha: head}, SourceWorktree)
+						observedAt := time.Time{}
+						if out, showErr := exec.Command("git", "-C", wt, "show", "-s", "--format=%cI", head).Output(); showErr == nil {
+							observedAt, _ = time.Parse(time.RFC3339, strings.TrimSpace(string(out)))
+						}
+						observe(ref, head, SourceWorktree, observedAt, 0)
+						list = append(list, worktreeCandidate)
+					}
+				}
+			}
+		}
+
+		selected := authoritativeCandidate(list, evidence)
+		resolvedSHA := selected.CandidateSHA
+		resolvedVerdict := selected.Verdict
+		resolvedReviewer := selected.Reviewer
+		resolvedReviewerFamily := selected.ReviewerFamily
+		resolvedAuthorFamily := selected.AuthorFamily
+		resolvedLease := selected.LeaseGeneration
+		selectedBlockedReasons := append([]BlockedReason(nil), selected.BlockedReasons...)
+		selectedBlockedEvidence := append([]string(nil), selected.BlockedEvidence...)
+		hasBlockedState := selected.State == StateBlocked
+		for _, item := range list {
 			if item.Title != "" && resolvedTitle == "" {
 				resolvedTitle = item.Title
 			}
@@ -359,46 +467,15 @@ func (idx *CandidateIndex) BuildIndex(ctx context.Context) ([]*Candidate, error)
 			if PriorityRank(item.Priority) > PriorityRank(bestPriority) {
 				bestPriority = item.Priority
 			}
-			if item.Verdict != "" {
-				resolvedVerdict = item.Verdict
-			}
-			if item.Reviewer != "" {
-				resolvedReviewer = item.Reviewer
-			}
-			if item.ReviewerFamily != "" {
-				resolvedReviewerFamily = item.ReviewerFamily
-			}
-			if item.AuthorFamily != "" {
-				resolvedAuthorFamily = item.AuthorFamily
-			}
-			if item.LeaseGeneration > resolvedLease {
-				resolvedLease = item.LeaseGeneration
-			}
-			if item.State == StateBlocked {
-				hasBlockedState = true
-			}
-			accumulatedBlockedReasons = append(accumulatedBlockedReasons, item.BlockedReasons...)
-			accumulatedBlockedEvidence = append(accumulatedBlockedEvidence, item.BlockedEvidence...)
-			k := candKey{ref: item.Ref, sha: item.CandidateSHA}
+			k := candidateKey{ref: item.Ref, sha: item.CandidateSHA}
 			for s := range sourceMap[k] {
 				srcSet[s] = true
 			}
 		}
 
-		// If candidate SHA was not found in mail/ledger/inbox, check task worktree HEAD
-		var worktreePath string
-		if idx.opts.WorktreesDir != "" && ref != "" {
-			wt := filepath.Join(idx.opts.WorktreesDir, strings.ToLower(hsync.NormalizeRef(ref)))
-			if fi, err := os.Stat(wt); err == nil && fi.IsDir() {
-				worktreePath = wt
-				if resolvedSHA == "" {
-					if out, gerr := exec.Command("git", "-C", wt, "rev-parse", "HEAD").Output(); gerr == nil {
-						resolvedSHA = strings.TrimSpace(string(out))
-						srcSet[SourceWorktree] = true
-					}
-				}
-			}
-		}
+		// Evidence fields below are intentionally taken only from the
+		// authoritative SHA. Mixing a verdict or block reason from an older
+		// SHA with the newest candidate would break exact SHA fencing.
 
 		c := &Candidate{
 			Ref:             ref,
@@ -413,8 +490,8 @@ func (idx *CandidateIndex) BuildIndex(ctx context.Context) ([]*Candidate, error)
 			LeaseGeneration: resolvedLease,
 			State:           StatePending,
 			WorktreePath:    worktreePath,
-			BlockedReasons:  accumulatedBlockedReasons,
-			BlockedEvidence: accumulatedBlockedEvidence,
+			BlockedReasons:  selectedBlockedReasons,
+			BlockedEvidence: selectedBlockedEvidence,
 		}
 		if hasBlockedState {
 			c.State = StateBlocked
@@ -465,4 +542,84 @@ func dedupReasons(reasons []BlockedReason) []BlockedReason {
 		}
 	}
 	return out
+}
+
+func removeBlockedReason(reasons []BlockedReason, want BlockedReason) []BlockedReason {
+	out := reasons[:0]
+	for _, reason := range reasons {
+		if reason != want {
+			out = append(out, reason)
+		}
+	}
+	return out
+}
+
+func removeCallbackBlockedEvidence(evidence []string) []string {
+	out := evidence[:0]
+	for _, item := range evidence {
+		if !strings.HasPrefix(item, "callback blocked:") {
+			out = append(out, item)
+		}
+	}
+	return out
+}
+
+func evidenceSourceRank(source CandidateSource) int {
+	switch source {
+	case SourceWorktree:
+		return 6
+	case SourceReviewLedger:
+		return 5
+	case SourceReviewMail:
+		return 4
+	case SourceReviewInbox:
+		return 2
+	case SourceProviderTask:
+		return 1
+	default:
+		return 0
+	}
+}
+
+func newerEvidence(candidate, previous candidateEvidence) bool {
+	if !candidate.observedAt.Equal(previous.observedAt) {
+		return candidate.observedAt.After(previous.observedAt)
+	}
+	if evidenceSourceRank(candidate.source) != evidenceSourceRank(previous.source) {
+		return evidenceSourceRank(candidate.source) > evidenceSourceRank(previous.source)
+	}
+	if candidate.sequence != previous.sequence {
+		return candidate.sequence > previous.sequence
+	}
+	return candidate.ordinal > previous.ordinal
+}
+
+func authoritativeCandidate(list []*Candidate, evidence map[candidateKey]candidateEvidence) *Candidate {
+	var selected *Candidate
+	var selectedEvidence candidateEvidence
+	for _, candidate := range list {
+		key := candidateKey{ref: candidate.Ref, sha: candidate.CandidateSHA}
+		current, ok := evidence[key]
+		if !ok {
+			current = candidateEvidence{}
+		}
+		if selected == nil || candidateIsNewer(candidate, current, selected, selectedEvidence) {
+			selected = candidate
+			selectedEvidence = current
+		}
+	}
+	return selected
+}
+
+func candidateIsNewer(candidate *Candidate, current candidateEvidence, selected *Candidate, previous candidateEvidence) bool {
+	if (candidate.CandidateSHA != "") != (selected.CandidateSHA != "") {
+		return candidate.CandidateSHA != ""
+	}
+	if newerEvidence(current, previous) {
+		return true
+	}
+	if newerEvidence(previous, current) {
+		return false
+	}
+	return candidate.CandidateSHA < selected.CandidateSHA
 }

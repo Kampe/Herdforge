@@ -228,6 +228,14 @@ type isolationAttestation struct {
 // processes cannot read it. Absence of that attestation is a refusal, not
 // a default-allow.
 func requireIsolatedKeyStore(keyDir string) error {
+	// Local developer mode still signs receipts so the existing evidence and
+	// verification code remains useful, but it does not pretend that a
+	// single-user Mac has a separate kernel-isolated signer identity. Hosted
+	// deployments opt into the strict boundary with HERD_MODE=production.
+	mode := strings.ToLower(strings.TrimSpace(os.Getenv("HERD_MODE")))
+	if mode == "local" || mode == "dev" || mode == "development" {
+		return nil
+	}
 	fi, err := os.Lstat(keyDir)
 	if os.IsNotExist(err) {
 		return nil // first use: creation below applies 0700 + attestation

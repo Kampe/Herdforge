@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -68,6 +69,38 @@ func TestKaneoListProjectRelations_NoCredentials_RefusesCLIFanout(t *testing.T) 
 	}
 	if elapsed > 200*time.Millisecond {
 		t.Fatalf("fail-closed must be immediate, took %v", elapsed)
+	}
+}
+
+func TestKaneoListProjectRelations_ExplicitCLIMode(t *testing.T) {
+	t.Setenv(EnvKaneoRelationsCLI, "1")
+	t.Setenv("KANEO_API_KEY", "")
+	withUserConfigDir(t, t.TempDir())
+	var relCalls, listCalls atomic.Int64
+	old := kaneoRunCLI
+	kaneoRunCLI = func(_ context.Context, _ string, args ...string) (*CLIResult, error) {
+		if len(args) >= 2 && args[0] == "task" && args[1] == "list" {
+			if listCalls.Add(1) > 1 {
+				return &CLIResult{Stdout: []byte(`[]`)}, nil
+			}
+			return &CLIResult{Stdout: []byte(`[{"id":"task-1","ref":"CHA-1","status":"to-do","title":"t","projectId":"project"}]`)}, nil
+		}
+		if len(args) >= 3 && args[0] == "task" && args[1] == "rel" {
+			relCalls.Add(1)
+			return &CLIResult{Stdout: []byte(`[]`)}, nil
+		}
+		return &CLIResult{Stdout: []byte(`[]`)}, nil
+	}
+	t.Cleanup(func() { kaneoRunCLI = old })
+	k := NewKaneoProvider("https://kanban.example", "project", true)
+	if !k.UseCLI || os.Getenv(EnvKaneoRelationsCLI) != "1" {
+		t.Fatal("explicit CLI relation mode was not enabled")
+	}
+	if _, err := k.ListProjectRelations(context.Background(), "project"); err != nil {
+		t.Fatalf("explicit CLI relation mode: %v", err)
+	}
+	if relCalls.Load() != 1 {
+		t.Fatalf("want one CLI relation read, got %d", relCalls.Load())
 	}
 }
 
@@ -167,8 +200,9 @@ func TestKaneoListProjectRelations_WithKey_HTTPFanoutNotCLI(t *testing.T) {
 	if cliRel.Load() != 0 {
 		t.Fatalf("must not use CLI rel list when HTTP credentials present, got %d", cliRel.Load())
 	}
-	if cliList.Load() != 3 || strings.Join(cliPages, ",") != "1,2,3" {
-		t.Fatalf("want real 100+66+empty pagination pages 1,2,3; calls=%d pages=%v", cliList.Load(), cliPages)
+	wantPages := strings.TrimSuffix(strings.Repeat("1,2,3,", 6), ",")
+	if cliList.Load() != 18 || strings.Join(cliPages, ",") != wantPages {
+		t.Fatalf("want complete-status 100+66+empty pagination pages; calls=%d pages=%v", cliList.Load(), cliPages)
 	}
 	// One HTTP GET per task id (fan-out), not sequential CLI.
 	if httpRels.Load() != int64(n) {
@@ -307,5 +341,89 @@ func TestKaneoListProjectRelations_DeadlineCancel(t *testing.T) {
 	}
 	if completed.Load() != 0 {
 		t.Fatalf("no handler may complete normally after deadline, got %d", completed.Load())
+	}
+}
+
+// TestKaneoListProjectRelations_LargeBoardUsesBoundedBurst proves the large
+// board strategy scales the Kaneo-only fan-out without changing the ordinary
+// list deadline or allowing an unbounded number of requests in flight.
+func TestKaneoListProjectRelations_LargeBoardUsesBoundedBurst(t *testing.T) {
+	const n = 1500
+	var httpRels, inFlight, maxInFlight atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.Contains(r.URL.Path, "/api/task-relation/") {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		httpRels.Add(1)
+		current := inFlight.Add(1)
+		for {
+			old := maxInFlight.Load()
+			if current <= old || maxInFlight.CompareAndSwap(old, current) {
+				break
+			}
+		}
+		defer inFlight.Add(-1)
+		select {
+		case <-r.Context().Done():
+			return
+		case <-time.After(100 * time.Millisecond):
+		}
+		w.Header().Set("Content-Type", "application/json")
+		id := strings.TrimPrefix(r.URL.Path, "/api/task-relation/")
+		if id == "id-1" || id == fmt.Sprintf("id-%d", n) {
+			_, _ = fmt.Fprintf(w, `[{"id":"rel-1","sourceTaskId":"id-1","targetTaskId":"id-%d","relationType":"blocks"}]`, n)
+			return
+		}
+		_, _ = w.Write([]byte(`[]`))
+	}))
+	defer server.Close()
+
+	old := kaneoRunCLI
+	kaneoRunCLI = func(ctx context.Context, name string, args ...string) (*CLIResult, error) {
+		page := 1
+		for i, arg := range args {
+			if arg == "--page" && i+1 < len(args) {
+				_, _ = fmt.Sscanf(args[i+1], "%d", &page)
+			}
+		}
+		if page == 16 {
+			return &CLIResult{Stdout: []byte(`[]`)}, nil
+		}
+		if page < 1 || page > 15 {
+			t.Fatalf("unexpected task-list page %d", page)
+		}
+		tasks := make([]map[string]string, 0, 100)
+		for i := (page-1)*100 + 1; i <= page*100; i++ {
+			tasks = append(tasks, map[string]string{
+				"id": fmt.Sprintf("id-%d", i), "ref": fmt.Sprintf("FAC-%d", i),
+				"status": "to-do", "title": "t", "projectId": "proj",
+			})
+		}
+		body, _ := json.Marshal(tasks)
+		return &CLIResult{Stdout: body}, nil
+	}
+	defer func() { kaneoRunCLI = old }()
+
+	withUserConfigDir(t, t.TempDir())
+	t.Setenv("KANEO_API_KEY", "large-board-key")
+	t.Setenv("KANEO_API_URL", server.URL)
+	k := NewKaneoProvider(server.URL, "proj", true)
+	start := time.Now()
+	rels, err := k.ListProjectRelations(context.Background(), "proj")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rels) != 1 || rels[0].ID != "rel-1" {
+		t.Fatalf("want one dual-end relation, got %+v", rels)
+	}
+	if httpRels.Load() != n {
+		t.Fatalf("want %d relation reads, got %d", n, httpRels.Load())
+	}
+	if maxInFlight.Load() > DefaultKaneoLargeBoardConcurrency {
+		t.Fatalf("in-flight relation reads exceeded large-board bound: %d", maxInFlight.Load())
+	}
+	if elapsed := time.Since(start); elapsed >= 5*time.Second {
+		t.Fatalf("large-board snapshot did not finish in bounded time: %v", elapsed)
 	}
 }

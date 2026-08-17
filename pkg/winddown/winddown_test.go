@@ -59,6 +59,71 @@ func TestAuthorityRestartAndIdempotentRetry(t *testing.T) {
 	}
 }
 
+func TestAuthorityInitializeMissingCreatesAuditedDisabledState(t *testing.T) {
+	a, c, path := newAuthority(t)
+	got, err := a.Initialize(context.Background(), "herd-init", "initialized")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Enabled || got.Generation != 1 || got.Actor != "herd-init" || got.Reason != "initialized" {
+		t.Fatalf("initialized state = %#v, want disabled generation-one audit evidence", got)
+	}
+	if got.Timestamp.IsZero() || !got.Timestamp.Equal(c.now) {
+		t.Fatalf("initialized timestamp = %v, want %v", got.Timestamp, c.now)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("initialized state was not persisted: %v", err)
+	}
+}
+
+func TestAuthorityInitializeIsIdempotentAndPreservesValidState(t *testing.T) {
+	a, _, _ := newAuthority(t)
+	first, err := a.Initialize(context.Background(), "herd-init", "initialized")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := a.Initialize(context.Background(), "different", "different")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second != first {
+		t.Fatalf("reinitialization changed valid state: first=%#v second=%#v", first, second)
+	}
+}
+
+func TestAuthorityInitializeRejectsCorruptState(t *testing.T) {
+	a, _, path := newAuthority(t)
+	if err := os.WriteFile(path, []byte(`{"enabled":false}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.Initialize(context.Background(), "herd-init", "initialized"); !errors.Is(err, ErrStateCorrupt) {
+		t.Fatalf("corrupt initialization error = %v, want %v", err, ErrStateCorrupt)
+	}
+}
+
+func TestAuthorityInitializeRecoversAfterMissingState(t *testing.T) {
+	a, _, path := newAuthority(t)
+	if _, err := a.Read(context.Background()); !errors.Is(err, ErrStateMissing) {
+		t.Fatalf("initial read = %v, want %v", err, ErrStateMissing)
+	}
+	if _, err := a.Initialize(context.Background(), "herd-init", "recovered"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.Initialize(context.Background(), "herd-init", "recovered-again"); err != nil {
+		t.Fatal(err)
+	}
+	state, err := a.Read(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.Enabled || state.Generation != 1 || state.Reason != "recovered-again" {
+		t.Fatalf("recovered state = %#v", state)
+	}
+}
+
 func TestAuthorityRejectsStaleAndConflictingGenerations(t *testing.T) {
 	a, _, _ := newAuthority(t)
 	apply(t, a, true, 4, nil)

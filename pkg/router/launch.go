@@ -731,6 +731,23 @@ func (r *SurfaceRouter) Decide(req LaunchRequest) (*LaunchDecision, error) {
 	if err != nil {
 		return nil, err
 	}
+	for _, provider := range candidates {
+		if !IsLaneLaunchable(provider) {
+			if req.RequestedProvider != "" {
+				return nil, fmt.Errorf("herd-route: provider %q is not launchable as a Herdr lane; choose a supported harness (codex, claude, grok, agy, or opencode)", provider)
+			}
+		}
+	}
+	launchable := candidates[:0]
+	for _, provider := range candidates {
+		if IsLaneLaunchable(provider) {
+			launchable = append(launchable, provider)
+		}
+	}
+	if len(launchable) == 0 {
+		return nil, fmt.Errorf("herd-route: no launchable Herdr surface for shape %q", shape)
+	}
+	candidates = launchable
 
 	fitWeight := fitWeightFor(shape)
 	floor := pressureFloor()

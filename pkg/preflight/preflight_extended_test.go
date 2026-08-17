@@ -40,6 +40,20 @@ func TestCheckWorktreeBoundary_SkipsVendor(t *testing.T) {
 	}
 }
 
+func TestCheckWorktreeBoundary_SkipsGeneratedHerdBootstrap(t *testing.T) {
+	tmpDir := t.TempDir()
+	bootstrap := filepath.Join(tmpDir, ".herd", "bootstrap", "cache", "module.go")
+	if err := os.MkdirAll(filepath.Dir(bootstrap), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(bootstrap, []byte("// generated cache: /Users/toolchain\npackage cache\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := CheckWorktreeBoundary(tmpDir); err != nil {
+		t.Fatalf("expected generated .herd/bootstrap cache to be skipped, got: %v", err)
+	}
+}
+
 func TestCheckWorktreeBoundary_IgnoresNonCheckedExts(t *testing.T) {
 	tmpDir := t.TempDir()
 	// .png files with absolute paths should be ignored
@@ -95,6 +109,34 @@ func TestCheckWorktreeBoundary_DetectHomeLeak(t *testing.T) {
 	err := CheckWorktreeBoundary(tmpDir)
 	if err == nil {
 		t.Fatal("expected leak detection for /home/ path in .yaml file")
+	}
+}
+
+func TestCheckWorktreeBoundary_AllowsRepoDeclaredFile(t *testing.T) {
+	tmpDir := t.TempDir()
+	path := filepath.Join(tmpDir, "docs", "runbook.md")
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("checkout: /Users/operator/repo\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := CheckWorktreeBoundaryWithAllowlist(tmpDir, []string{"docs/runbook.md"}); err != nil {
+		t.Fatalf("declared relative allowlist should admit the file: %v", err)
+	}
+}
+
+func TestCheckWorktreeBoundary_AllowlistCannotEscapeRoot(t *testing.T) {
+	tmpDir := t.TempDir()
+	path := filepath.Join(tmpDir, "docs", "runbook.md")
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("checkout: /Users/operator/repo\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := CheckWorktreeBoundaryWithAllowlist(tmpDir, []string{"../**"}); err == nil {
+		t.Fatal("parent traversal allowlist must not suppress a leak")
 	}
 }
 

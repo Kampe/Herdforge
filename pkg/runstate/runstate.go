@@ -105,6 +105,22 @@ func (s *Store) Close() error {
 	return s.db.Close()
 }
 
+// Delete removes a stale local run snapshot so a developer can retry a
+// failed launch after the provider or graph has legitimately changed. Hosted
+// callers keep the fail-closed stale refusal and never use this recovery path.
+func (s *Store) Delete(ctx context.Context, id string) error {
+	if s == nil || s.db == nil {
+		return errors.New("runstate: nil store")
+	}
+	if strings.TrimSpace(id) == "" {
+		return fmt.Errorf("%w: empty run id", ErrAmbiguous)
+	}
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM build_runs WHERE id=?`, id); err != nil {
+		return fmt.Errorf("delete runstate: %w", err)
+	}
+	return nil
+}
+
 // Checkpoint atomically writes next only if ExpectedRevision remains current.
 // Use ExpectedRevision 0 only to create a new run.
 func (s *Store) Checkpoint(ctx context.Context, next RunState, expectedRevision int64) (*RunState, error) {

@@ -24,18 +24,18 @@ const (
 
 // Target is one attention target's digest result.
 type Target struct {
-	PaneID string       `json:"pane_id"`
-	Name   string       `json:"name"`
-	Status string       `json:"status"`
+	PaneID string         `json:"pane_id"`
+	Name   string         `json:"name"`
+	Status string         `json:"status"`
 	Class  Classification `json:"class"`
-	Action string       `json:"action"`
-	Tail   string       `json:"tail,omitempty"`
+	Action string         `json:"action"`
+	Tail   string         `json:"tail,omitempty"`
 }
 
 // Digest is the complete harvest digest.
 type Digest struct {
-	WorkspaceID  string   `json:"workspace_id"`
-	Items        []Target `json:"items"`
+	WorkspaceID   string   `json:"workspace_id"`
+	Items         []Target `json:"items"`
 	MultiPaneTabs []string `json:"multi_pane_tabs,omitempty"`
 }
 
@@ -49,12 +49,9 @@ func classifyText(text string) Classification {
 	// QUOTA is a PROVIDER-EXHAUSTION runner signal, NOT review content
 	// that merely discusses rate limiting (CHA-281). Require genuine
 	// exhaustion phrasing AND exclude text carrying review markers.
-	quotaPat := regexp.MustCompile(`(?i)out of credits|too many requests|429 too many|(rate.?limit|usage limit|weekly limit|daily limit|monthly limit|token quota|api quota|quota)[^.]{0,24}(exceeded|reached|throttled|hit)|exceeded your (quota|rate|usage|limit)`)
-	hasReviewMarker := regexp.MustCompile(`(?i)verdict:|merge recommendation:|\bconfirmed\b|\bfindings?\b|reviewing|pass/fail`)
-
-	// MUST check QUOTA exclusions before NEES_REVIEW/PASS/FAIL, because
-	// a reviewer quoting 429/quota text must NOT match the QUOTA pattern.
-	isQuota := quotaPat.MatchString(text) && !hasReviewMarker.MatchString(text)
+	// MUST check QUOTA exclusions before NEEDS_REVIEW/PASS/FAIL, because a
+	// reviewer quoting 429/quota text must NOT match the QUOTA pattern.
+	isQuota := ProviderExhaustionReason(text) != ""
 
 	if regexp.MustCompile(`(?i)NEEDS_REVIEW|Status:\s*NEEDS_REVIEW`).MatchString(text) {
 		return NeedsReview
@@ -78,6 +75,21 @@ func classifyText(text string) Classification {
 		return Unconsumed
 	}
 	return Unknown
+}
+
+// ProviderExhaustionReason reports whether terminal output contains a live
+// provider quota/rate-limit failure. Review prose is excluded so a reviewer
+// discussing a 429 does not poison the surface's capacity evidence.
+func ProviderExhaustionReason(text string) string {
+	if strings.TrimSpace(text) == "" {
+		return ""
+	}
+	quotaPat := regexp.MustCompile(`(?i)out of credits|out of quota|too many requests|429 too many|(rate.?limit|usage limit|weekly limit|daily limit|monthly limit|token quota|api quota|quota)[^.]{0,24}(exceeded|reached|throttled|hit|exhausted)|exceeded your (quota|rate|usage|limit)`)
+	hasReviewMarker := regexp.MustCompile(`(?i)verdict:|merge recommendation:|\bconfirmed\b|\bfindings?\b|reviewing|pass/fail`)
+	if quotaPat.MatchString(text) && !hasReviewMarker.MatchString(text) {
+		return "provider quota or rate limit reported"
+	}
+	return ""
 }
 
 // actionFor returns the recommended action string for a classification.

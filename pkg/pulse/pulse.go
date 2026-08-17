@@ -123,10 +123,15 @@ type HerdrObservation struct {
 
 // AgentObservation is one standing or one-off lane.
 type AgentObservation struct {
-	Name   string      `json:"name"`
-	Status AgentStatus `json:"status"`
-	Raw    string      `json:"raw_status,omitempty"`
-	PaneID string      `json:"pane_id,omitempty"`
+	Name              string      `json:"name"`
+	Status            AgentStatus `json:"status"`
+	Raw               string      `json:"raw_status,omitempty"`
+	PaneID            string      `json:"pane_id,omitempty"`
+	PaneState         string      `json:"pane_state,omitempty"`
+	ForegroundProcess string      `json:"foreground_process,omitempty"`
+	ExitReason        string      `json:"exit_reason,omitempty"`
+	LastError         string      `json:"last_error,omitempty"`
+	ContextWarning    string      `json:"context_warning,omitempty"`
 	// Stale is set when the source marks the lane past its progress bound.
 	Stale bool `json:"stale,omitempty"`
 	// FAC-221: reap evidence. Filled by the caller from worktree, board,
@@ -148,6 +153,9 @@ type AgentObservation struct {
 	// agent must act on (e.g. "changes requested"). This is the KEEP signal:
 	// the lane is idle but it has specific pending work only it can do.
 	AwaitingVerdict bool `json:"awaiting_verdict,omitempty"`
+	// PacketPending is the fail-closed signal that Herdr has not exposed a
+	// consumed goal/packet for this pane. Reapers must keep such a lane.
+	PacketPending bool `json:"packet_pending,omitempty"`
 	// TabGeneration is the herdr tab lifecycle generation at observation time.
 	// The reap close path requires this for FAC-180 compare-and-close fencing.
 	// Zero means unknown; ReapLane will fail closed rather than close unfenced.
@@ -184,11 +192,13 @@ type CallbackObservation struct {
 
 // ReviewObservation is one read of review-pile pressure.
 type ReviewObservation struct {
-	Known      bool   `json:"known"`
-	Error      string `json:"error,omitempty"`
-	Pending    int    `json:"pending"`
-	NeedReview int    `json:"need_review"`
-	Saturated  bool   `json:"saturated,omitempty"`
+	Known          bool     `json:"known"`
+	Error          string   `json:"error,omitempty"`
+	Pending        int      `json:"pending"`
+	PendingRefs    []string `json:"pending_refs,omitempty"`
+	NeedReview     int      `json:"need_review"`
+	NeedReviewRefs []string `json:"need_review_refs,omitempty"`
+	Saturated      bool     `json:"saturated,omitempty"`
 }
 
 // QuotaObservation is one read of capacity/quota posture.
@@ -370,19 +380,25 @@ func Plan(obs Observation, opts Options) (Snapshot, error) {
 			st = StatusStale
 		}
 		agents = append(agents, AgentObservation{
-			Name:            name,
-			Status:          st,
-			Raw:             raw,
-			PaneID:          a.PaneID,
-			Stale:           a.Stale || st == StatusStale,
-			TabID:           a.TabID,
-			Workspace:       a.Workspace,
-			CommittedWork:   a.CommittedWork,
-			TicketDone:      a.TicketDone,
-			SafeRef:         a.SafeRef,
-			AwaitingVerdict: a.AwaitingVerdict,
-			TabGeneration:   a.TabGeneration,
-			TabRevision:     a.TabRevision,
+			Name:              name,
+			Status:            st,
+			Raw:               raw,
+			PaneID:            a.PaneID,
+			PaneState:         a.PaneState,
+			ForegroundProcess: a.ForegroundProcess,
+			ExitReason:        a.ExitReason,
+			LastError:         a.LastError,
+			ContextWarning:    a.ContextWarning,
+			Stale:             a.Stale || st == StatusStale,
+			TabID:             a.TabID,
+			Workspace:         a.Workspace,
+			CommittedWork:     a.CommittedWork,
+			TicketDone:        a.TicketDone,
+			SafeRef:           a.SafeRef,
+			AwaitingVerdict:   a.AwaitingVerdict,
+			PacketPending:     a.PacketPending,
+			TabGeneration:     a.TabGeneration,
+			TabRevision:       a.TabRevision,
 		})
 	}
 	sort.Slice(agents, func(i, j int) bool {
@@ -534,6 +550,9 @@ func Plan(obs Observation, opts Options) (Snapshot, error) {
 		if a.AwaitingVerdict {
 			continue
 		}
+		if a.PacketPending {
+			continue
+		}
 		if !a.CommittedWork {
 			continue
 		}
@@ -580,6 +599,9 @@ func Plan(obs Observation, opts Options) (Snapshot, error) {
 			continue
 		}
 		if a.AwaitingVerdict {
+			continue
+		}
+		if a.PacketPending {
 			continue
 		}
 		// Only reap lanes that are already out for review or whose ticket is

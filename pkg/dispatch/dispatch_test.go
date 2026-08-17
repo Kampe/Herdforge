@@ -463,12 +463,15 @@ func TestBuildTaskPacket_ReplyTargetIsNonVacuous(t *testing.T) {
 
 	t.Run("named coordinator and lease are embedded", func(t *testing.T) {
 		packet := buildTaskPacket(task, "herd/fac-222", ".herd/prompts/worker.md", "kaneo", "fac-proj", lane, verification,
-			ReplyTarget{Name: "forge-coordinator", LeaseGeneration: 42})
+			ReplyTarget{Name: "forge-coordinator", ReviewSupervisor: "forge-review-harvest-supervisor", LeaseGeneration: 42})
 		if !strings.Contains(packet, "forge-coordinator") {
 			t.Errorf("packet must carry the named coordinator:\n%s", packet)
 		}
 		if !strings.Contains(packet, "--lease 42") {
 			t.Errorf("packet must carry lease generation 42:\n%s", packet)
+		}
+		if !strings.Contains(packet, "forge-review-harvest-supervisor") {
+			t.Errorf("packet must route review handoff to the supervisor:\n%s", packet)
 		}
 	})
 

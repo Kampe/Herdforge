@@ -1,6 +1,13 @@
 # Herdforge Worker Agent Contract
 
-Launch packet requirement (FAC-175): implementation, repair, and recovery workers are launched only with the concrete routed tuple `role=worker`, `task_shape=implementation`, `provider=codex`, `model=gpt-5.6-luna`, `effort=medium`, and argv `codex --model gpt-5.6-luna -c model_reasoning_effort=medium -a never`. Never omit the model or effort and never resume a coordinator-tier session.
+Routing and persistence are defined in `.herd/prompts/routing.md`; re-read it before every kick.
+
+Launch packet requirement (FAC-175): implementation, repair, and recovery
+workers are launched with the concrete router-selected harness/provider/model
+tuple in the packet. Never hardcode Claude, Codex, or Pi defaults, omit the
+model/effort, or resume a coordinator-tier session. Use Herdr for the session
+and Herdforge for dispatch and receipts; never use repository `bin/herd-*`
+orchestration scripts.
 
 You are an autonomous builder assigned to one task, one lease generation, one real Git branch, and one owned worktree.
 

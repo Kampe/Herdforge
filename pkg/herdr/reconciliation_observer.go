@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 )
 
@@ -24,6 +25,31 @@ type ReconciliationReader interface {
 	Protection(context.Context, TabBinding) Authority[ProtectionTruth]
 }
 
+// CompletedTaskProof is the durable completion evidence for a managed lane.
+// It is intentionally separate from Herdr tab generations: a completion
+// proof may clear an idle lane from reconciliation, but it never authorizes
+// closing a generationless tab.
+type CompletedTaskProof struct {
+	TaskRef       string
+	CandidateSHA  string
+	Complete      bool
+	Authenticated bool
+}
+
+type CompletedTaskProofRequest struct {
+	TaskRef         string
+	CandidateSHA    string
+	LeaseGeneration int64
+}
+
+// CompletedTaskProofReader is the narrow control/mail evidence seam. The
+// production adapter is responsible for authenticating the task context and
+// checking the durable completion callback; fixtures can provide deterministic
+// in-memory evidence.
+type CompletedTaskProofReader interface {
+	CompletedTaskProof(context.Context, CompletedTaskProofRequest) Authority[CompletedTaskProof]
+}
+
 type ReconciliationResult struct {
 	Decisions []TabDecision
 }
@@ -32,10 +58,13 @@ type ReconciliationResult struct {
 // It is concrete and wired into the daemon, while FAC-180 remains the only
 // owner allowed to perform a close mutation.
 type ProductionReconciliationObserver struct {
-	Workspace string
-	Reader    ReconciliationReader
-	Last      ReconciliationResult
-	Record    func(context.Context, []TabDecision) error
+	Workspace      string
+	Reader         ReconciliationReader
+	ControlBinding TabBinding
+	Last           ReconciliationResult
+	Record         func(context.Context, []TabDecision) error
+	TaskBinding    func(context.Context, TabRecord, AgentEntry) Authority[TabBinding]
+	Completion     CompletedTaskProofReader
 }
 
 // SocketAuthorityReader is the real Herdr transport adapter. It only claims
@@ -128,6 +157,29 @@ func (o *ProductionReconciliationObserver) ObserveReconciliation(ctx context.Con
 	decisions := make([]TabDecision, 0)
 	for _, tab := range tabs.Value {
 		bindingAuth := o.Reader.Binding(ctx, tab)
+		agent, found := byTab[tab.TabID]
+		// Herdr 0.8 can report a terminal tab created before immutable tab
+		// generations existed. It is not safe for CAS close, but it is also not
+		// a live reconciliation blocker: retain one durable cleanup candidate and
+		// let the explicit cleanup path delegate the exact tab id to Herdr.
+		// Active generationless workers remain fail-closed below.
+		if tab.Generation == "" && found && isTerminalAgent(agent.Status) && bindingAuth.State == EvidencePresent && bindingAuth.Value.TaskRef != "" {
+			decisions = append(decisions, TabDecision{TabID: tab.TabID, Class: TabLegacyCleanup,
+				Evidence: []string{"legacy terminal tab has no immutable generation; exact Herdr tab close is a cleanup candidate"}})
+			continue
+		}
+		if bindingAuth.State != EvidencePresent && found && isTerminalAgent(agent.Status) && o.TaskBinding != nil {
+			fallback := o.TaskBinding(ctx, tab, agent)
+			if fallback.State == EvidencePresent && fallback.Value.TabID == tab.TabID && fallback.Value.TaskRef != "" && fallback.Value.LeaseGeneration > 0 && o.Completion != nil {
+				proof := o.Completion.CompletedTaskProof(ctx, CompletedTaskProofRequest{TaskRef: fallback.Value.TaskRef, CandidateSHA: fallback.Value.CandidateSHA, LeaseGeneration: fallback.Value.LeaseGeneration})
+				candidateMatches := fallback.Value.CandidateSHA == "" || proof.Value.CandidateSHA == fallback.Value.CandidateSHA
+				if proof.State == EvidencePresent && proof.Value.Complete && proof.Value.Authenticated && proof.Value.TaskRef == fallback.Value.TaskRef && proof.Value.CandidateSHA != "" && candidateMatches {
+					decisions = append(decisions, TabDecision{TabID: tab.TabID, Class: TabSafeFinished,
+						Evidence: []string{"durable task context and authenticated completion proof; idle generationless tab retained"}})
+					continue
+				}
+			}
+		}
 		binding := bindingAuth.Value
 		if binding.TabID == "" {
 			binding.TabID = tab.TabID
@@ -136,10 +188,17 @@ func (o *ProductionReconciliationObserver) ObserveReconciliation(ctx context.Con
 		if duplicateTabs[tab.TabID] {
 			bindingAuth = Authority[TabBinding]{State: EvidenceError, Detail: "duplicate agent attachments for tab"}
 		}
-		agent, found := byTab[tab.TabID]
 		ag := Authority[AgentTruth]{State: EvidenceAbsent}
 		if found {
 			ag = Authority[AgentTruth]{State: EvidencePresent, Value: AgentTruth{Status: agent.Status, PaneID: agent.PaneID}}
+		}
+		if o.isExactControlTab(tab, agent, found) {
+			decisions = append(decisions, TabDecision{
+				TabID:    tab.TabID,
+				Class:    TabStanding,
+				Evidence: []string{"durable coordinator control binding; no task lease generation required"},
+			})
+			continue
 		}
 		taskRef := binding.TaskRef
 		a := AuthoritySnapshot{Agent: ag, Board: o.Reader.Board(ctx, taskRef), Lifecycle: o.Reader.Lifecycle(ctx, taskRef),
@@ -165,6 +224,27 @@ func (o *ProductionReconciliationObserver) ObserveReconciliation(ctx context.Con
 		return fmt.Errorf("auto-reap completed task lanes: %w", err)
 	}
 	return nil
+}
+
+func isTerminalAgent(status string) bool {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "idle", "done", "complete", "completed":
+		return true
+	default:
+		return false
+	}
+}
+
+// isExactControlTab recognizes only the durable coordinator registration's
+// complete Herdr incarnation. It deliberately does not infer control status
+// from labels, cwd, agent kind, or a missing task binding: those are mutable
+// or ambiguous and worker fencing must remain fail-closed.
+func (o *ProductionReconciliationObserver) isExactControlTab(tab TabRecord, agent AgentEntry, found bool) bool {
+	b := o.ControlBinding
+	return found && b.ControlSeat && b.Workspace == o.Workspace && b.TabID == tab.TabID &&
+		b.TabID == agent.TabID && b.PaneID != "" && b.PaneID == agent.PaneID &&
+		b.Role == "coordinator" && b.Generation == "" && b.TerminalID != "" &&
+		b.TerminalID == agent.TerminalID
 }
 
 // ReapResult records the outcome of an automated task lane reap attempt.

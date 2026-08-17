@@ -132,6 +132,37 @@ func TestStore_EnqueuePersistsItem(t *testing.T) {
 	}
 }
 
+func TestStoreSentReturnsOnlyTransportProvenRows(t *testing.T) {
+	s := tempStore(t)
+	pending, err := s.Enqueue(Item{IdempotencyKey: "pending", TaskRef: "FAC-1", Kind: "control/repair", Payload: "pending"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sent, err := s.Enqueue(Item{IdempotencyKey: "sent", TaskRef: "FAC-2", Kind: "control/repair", Payload: "sent"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.ClaimOwned(sent.ID, "owner", time.Minute, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RecordDelivery(sent.ID, "owner", "message", 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.MarkSentOwned(sent.ID, "owner"); err != nil {
+		t.Fatal(err)
+	}
+	items, err := s.Sent(10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 1 || items[0].ID != sent.ID || items[0].Status != StatusSent {
+		t.Fatalf("sent items = %+v", items)
+	}
+	if pending.ID == items[0].ID {
+		t.Fatal("pending order was returned as sent")
+	}
+}
+
 func TestStore_EnqueueRequiresIdempotencyKeyAndKind(t *testing.T) {
 	s := tempStore(t)
 	if _, err := s.Enqueue(Item{TaskRef: "FAC-1", Kind: "herdr"}); err == nil {

@@ -151,6 +151,19 @@ func AgentName(laneName string) string {
 	return ForgePrefix + strings.TrimSpace(laneName)
 }
 
+// withContinuationGoal makes the standing contract explicit in the first
+// packet delivered to a freshly raised lane. A standing lane must keep making
+// useful progress when its current board card is absent or complete: inspect
+// the repository and board, mint the next actionable ticket, claim it, and
+// continue until an explicit stop condition is reported. The /goal marker is
+// understood by the supported harnesses and is intentionally part of the
+// prompt rather than an out-of-band shell command.
+func withContinuationGoal(lane config.LaneDef, prompt string) string {
+	return strings.TrimSpace(prompt) + fmt.Sprintf(`
+
+/goal Continue as the standing %s lane. When the current assignment is complete or there is no ticket, inspect the repo and board, create the next actionable ticket with provenance, claim it, and work it in an isolated worktree. Report progress and blockers to the coordinator/review supervisor; stop only on an explicit stop, lease loss, or wind-down condition.`, strings.TrimSpace(lane.Role))
+}
+
 // StandingLanes returns standing control roles in config declaration order.
 // Order is deterministic: the roster array order from herd.yaml, never sorted
 // by name (kick.StandingIDs sorts agent ids for kick; raise follows config).
@@ -719,7 +732,7 @@ func runRaise(result *Result, cfg *config.Config, lanes []config.LaneDef, repoRo
 			result.Roles = append(result.Roles, rr)
 			continue
 		}
-		promptText := strings.TrimSpace(string(promptBytes))
+		promptText := withContinuationGoal(*lane, string(promptBytes))
 		if promptText == "" {
 			rr.Outcome = OutcomeFailed
 			rr.Reason = "prompt file is empty"

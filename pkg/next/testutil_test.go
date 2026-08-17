@@ -9,10 +9,11 @@ import (
 )
 
 type testTask struct {
-	ref      string
-	title    string
-	status   string
-	priority string
+	ref         string
+	title       string
+	status      string
+	priority    string
+	description string
 }
 
 type testProvider struct {
@@ -30,11 +31,12 @@ func (tp *testProvider) GetTask(_ context.Context, id string) (*provider.Task, e
 	for _, t := range tp.tasks {
 		if t.ref == id {
 			return &provider.Task{
-				ID:       t.ref,
-				Ref:      t.ref,
-				Title:    t.title,
-				Status:   t.status,
-				Priority: provider.Priority(t.priority),
+				ID:          t.ref,
+				Ref:         t.ref,
+				Title:       t.title,
+				Status:      t.status,
+				Priority:    provider.Priority(t.priority),
+				Description: t.description,
 			}, nil
 		}
 	}
@@ -47,11 +49,12 @@ func (tp *testProvider) ListTasks(_ context.Context, _, statusFilter string) ([]
 	for _, t := range tp.tasks {
 		if statusFilter == "" || t.status == statusFilter {
 			out = append(out, &provider.Task{
-				ID:       t.ref,
-				Ref:      t.ref,
-				Title:    t.title,
-				Status:   t.status,
-				Priority: provider.Priority(t.priority),
+				ID:          t.ref,
+				Ref:         t.ref,
+				Title:       t.title,
+				Status:      t.status,
+				Priority:    provider.Priority(t.priority),
+				Description: t.description,
 			})
 		}
 	}

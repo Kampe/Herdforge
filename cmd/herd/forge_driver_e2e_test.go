@@ -512,6 +512,12 @@ lanes:
 	if err := os.WriteFile(filepath.Join(root, ".herd", "winddown.json"), []byte(wd), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	claimDir := filepath.Join(root, ".herd", "claim")
+	t.Setenv("HERD_FENCE_PROVISION", "1")
+	t.Setenv("HERD_CLAIM_DIR", claimDir)
+	if err := provider.WriteSharedMarker(claimDir); err != nil {
+		t.Fatalf("provision fixture claim fence: %v", err)
+	}
 	return root
 }
 
@@ -530,16 +536,13 @@ func TestFactoryE2E_CoordinatorFenceBlocksSecondLoop(t *testing.T) {
 		"HERD_WINDDOWN_STATE="+filepath.Join(root, ".herd", "winddown.json"),
 		"PATH="+os.Getenv("PATH"),
 	)
-	run := func() string {
+	run := func() (string, error) {
 		t.Helper()
 		cmd := exec.Command(binary, "forge", "--loop", "--ticks", "1", "--interval", "1")
 		cmd.Dir = root
 		cmd.Env = env
 		out, err := cmd.CombinedOutput()
-		if err == nil {
-			t.Fatalf("forge --loop exited 0; want a refusal\n%s", out)
-		}
-		return string(out)
+		return string(out), err
 	}
 
 	// Hold the fence from the test process rather than racing a subprocess that
@@ -550,27 +553,25 @@ func TestFactoryE2E_CoordinatorFenceBlocksSecondLoop(t *testing.T) {
 	if err := fence.Acquire(context.Background(), 0, "e2e fence holder"); err != nil {
 		t.Fatalf("acquire forge fence: %v", err)
 	}
-	if out := run(); !strings.Contains(out, "another coordinator is active") {
+	if out, err := run(); err == nil || !strings.Contains(out, "another coordinator is active") {
 		t.Fatalf("second coordinator was not refused by the fence:\n%s", out)
 	}
 
-	// Control arm, and a gate in its own right. With the fence released the same
-	// command must fail for a DIFFERENT, named reason — otherwise this test
-	// would also pass against a binary that refuses every invocation regardless
-	// of the fence.
-	//
-	// That reason is 50a82e3's posture: `forge --loop` is composed with a nil
-	// control reconciler and fails closed before any board or lane action. A
-	// stub reconciler whose Orders always returns the empty set silences this
-	// message while restoring the exact pre-50a82e3 behaviour, so this
-	// assertion is what turns such a composition red.
+	// With the fence released, the command starts successfully without requiring
+	// signer authority up front. Dispatch remains the operation-level gate.
 	fence.Release()
-	out := run()
+	out, err := run()
+	if err != nil {
+		t.Fatalf("forge --loop failed to start without signer admission:\n%s", out)
+	}
 	if strings.Contains(out, "another coordinator is active") {
 		t.Fatalf("fence refusal persisted after release:\n%s", out)
 	}
-	if !strings.Contains(out, "durable control reconciler is required") {
-		t.Fatalf("forge --loop did not fail closed on control composition:\n%s", out)
+	if strings.Contains(out, "durable control reconciler is required") {
+		t.Fatalf("forge --loop still refused before control composition:\n%s", out)
+	}
+	if !strings.Contains(out, "driving the board autonomously") {
+		t.Fatalf("forge --loop did not start the autonomous loop:\n%s", out)
 	}
 }
 

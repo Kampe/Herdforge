@@ -60,6 +60,24 @@ func (l *Ledger) Record(opts RecordOpts) error {
 	return l.appendRow(l.Path, row)
 }
 
+// EnsureRecord makes reviewer admission provenance durable and idempotent.
+// Some supervisors retain a valid broker verdict after the launch pane has
+// already gone away; ingesting that artifact must not leave an otherwise
+// admissible PASS permanently unharvestable merely because the launch record
+// was not copied into the local ledger first.
+func (l *Ledger) EnsureRecord(opts RecordOpts) error {
+	rows, err := readRows(l.Path)
+	if err != nil {
+		return err
+	}
+	for _, row := range rows {
+		if row.Event == string(EventRecord) && row.SHA == opts.SHA && row.Reviewer == opts.Reviewer {
+			return nil
+		}
+	}
+	return l.Record(opts)
+}
+
 // Tier returns the newest recorded tier for a sha, or empty string.
 func (l *Ledger) Tier(sha string) (string, error) {
 	rows, err := readRows(l.Path)
@@ -163,6 +181,45 @@ type RepairOpts struct {
 	RepairAuthor string
 	Branch       string
 	RepairFamily string
+}
+
+// DecisionOpts records an explicit relationship between review decisions.
+// These events are deliberately separate from verdicts: a PASS on a later
+// candidate does not silently supersede a FAIL on an unrelated candidate.
+type DecisionOpts struct {
+	SHA          string
+	PreviousSHA  string
+	Reviewer     string
+	Reason       string
+	FindingsRef  string
+	CandidateSHA string
+}
+
+// Refutation records why an earlier review finding was rejected or disproven.
+// It never changes the verdict row; consumers must interpret the relationship
+// explicitly and retain the original evidence.
+func (l *Ledger) Refutation(opts DecisionOpts) error {
+	if strings.TrimSpace(opts.SHA) == "" || strings.TrimSpace(opts.Reason) == "" {
+		return fmt.Errorf("refutation requires sha and reason")
+	}
+	return l.appendRow(l.Path, &LedgerRow{
+		Event: string(EventRefutation), SHA: opts.SHA, CandidateSHA: opts.CandidateSHA,
+		Reviewer: opts.Reviewer, FindingsRef: opts.FindingsRef, Reason: opts.Reason, Status: "refuted",
+		Task: opts.PreviousSHA, // previous decision/candidate reference
+	})
+}
+
+// Supersession records a deliberate replacement relationship. It is not
+// inferred from chronology, so an unrelated PASS cannot erase an older FAIL.
+func (l *Ledger) Supersession(opts DecisionOpts) error {
+	if strings.TrimSpace(opts.SHA) == "" || strings.TrimSpace(opts.PreviousSHA) == "" || strings.TrimSpace(opts.Reason) == "" {
+		return fmt.Errorf("supersession requires sha, previous sha, and reason")
+	}
+	return l.appendRow(l.Path, &LedgerRow{
+		Event: string(EventSupersession), SHA: opts.SHA, CandidateSHA: opts.CandidateSHA,
+		Reviewer: opts.Reviewer, FindingsRef: opts.FindingsRef, Reason: opts.Reason, Status: "superseded",
+		Task: opts.PreviousSHA,
+	})
 }
 
 // Repair appends a repair event.
