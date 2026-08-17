@@ -158,6 +158,10 @@ func attestKeyDir(t *testing.T, keyDir string) {
 
 func fixtureSigner(t *testing.T, keyDir, repoDir string) *dispatch.Signer {
 	t.Helper()
+	// Review panes inherit HERD_ROLE=agent from Herdr. This helper models the
+	// coordinator-owned signer setup; do not let the pane's diagnostic role
+	// turn every fixture into a false signer-boundary failure.
+	t.Setenv("HERD_ROLE", "")
 	attestKeyDir(t, keyDir)
 	identity, err := dispatch.RepositoryIdentity(repoDir, "herdforge-test")
 	if err != nil {
@@ -187,7 +191,7 @@ func ensureFenceSeal(binary, dir, keyDir string) string {
 	}
 	c := exec.Command(binary, "fence-provision")
 	c.Dir = dir
-	c.Env = append(os.Environ(),
+	c.Env = append(filterEnv(os.Environ(), "HERD_ROLE"),
 		dispatch.KeyDirEnv+"="+keyDir,
 		herdr.NoLiveEnv+"=1",
 		herdr.BinaryEnv+"=",
@@ -230,7 +234,7 @@ func herdCmd(binary, dir, keyDir string, args ...string) *exec.Cmd {
 	cmd.Dir = dir
 	// FAC-145 hermeticity: a child CLI can NEVER reach the operator's live
 	// herdr fleet. Without an explicit fake, any herdr call fails closed.
-	cmd.Env = append(os.Environ(),
+	cmd.Env = append(filterEnv(os.Environ(), "HERD_ROLE"),
 		dispatch.KeyDirEnv+"="+keyDir,
 		herdr.NoLiveEnv+"=1",
 		herdr.BinaryEnv+"=",
@@ -279,7 +283,7 @@ func prependToPath(cmd *exec.Cmd, dir string) {
 func herdCmdWithFake(binary, dir, keyDir, fakeBin, fakeLog string, args ...string) *exec.Cmd {
 	cmd := exec.Command(binary, args...)
 	cmd.Dir = dir
-	cmd.Env = append(os.Environ(), dispatch.KeyDirEnv+"="+keyDir)
+	cmd.Env = append(filterEnv(os.Environ(), "HERD_ROLE"), dispatch.KeyDirEnv+"="+keyDir)
 	// Review commands may chdir into an isolated detached worktree. Keep the
 	// provider's shared claim fence anchored to the fixture repository rather
 	// than making the review checkout provision a second authority.
