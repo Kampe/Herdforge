@@ -48,7 +48,7 @@ type mockTaskProvider struct {
 
 func TestReviewSupervisorNamePrefersStandingSupervisorOverAssayer(t *testing.T) {
 	d := &Dispatcher{Config: &config.Config{Lanes: []config.LaneDef{
-		{Name: "assayer", Role: "assayer"},
+		{Name: "assayer", Role: "reviewer"},
 		{Name: "review-supervisor", Role: "review-supervisor"},
 	}}}
 
