@@ -570,8 +570,11 @@ func initRepoDefaults() (name, repoURL, providerType, providerConfig, testComman
 	if name == "." || name == string(filepath.Separator) || name == "" {
 		name = "my-herd-app"
 	}
-	providerType = "linear"
-	providerConfig = "  project_id: \"your-linear-project-id\"\n  api_key_env: \"LINEAR_API_KEY\""
+	// A foreign repo must be runnable immediately without inventing a remote
+	// board or prompting for credentials. Memory is an honest empty board;
+	// explicit .kaneo.json or later config can opt into a real provider.
+	providerType = "memory"
+	providerConfig = ""
 	testCommand = "go test ./..."
 	if out, err := exec.Command("git", "config", "--get", "remote.origin.url").Output(); err == nil {
 		repoURL = strings.TrimSpace(string(out))
