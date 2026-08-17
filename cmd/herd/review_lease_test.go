@@ -102,6 +102,71 @@ func TestBindingForWorktree_UsesAuthenticatedReceiptForLegacyLifecycle(t *testin
 	}
 }
 
+func TestBindingForWorktree_PrefersWorkerContextOverNewerReviewerReceipt(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, ".herd"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, root, "init", "-b", "main")
+	gitIn(t, root, "config", "user.email", "test@example.invalid")
+	gitIn(t, root, "config", "user.name", "test")
+	if err := os.WriteFile(filepath.Join(root, ".gitignore"), []byte(".herd/\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, root, "add", ".gitignore")
+	gitIn(t, root, "commit", "-m", "chore: ignore runtime state")
+	if err := os.WriteFile(filepath.Join(root, "candidate.txt"), []byte("candidate\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, root, "add", "candidate.txt")
+	gitIn(t, root, "commit", "-m", "feat: candidate")
+
+	keyDir := t.TempDir()
+	signer := fixtureSigner(t, keyDir, root)
+	worker := dispatch.TaskContext{
+		ProviderType: "kaneo", ProjectID: "proj-x", Repository: dispatch.RepositoryIdentityOrName(root, "herdforge-test"),
+		Role: dispatch.RoleWorker, TaskRef: "FAC-340", TaskID: "task-340", Branch: "herd/fac-340", BaseSHA: "base",
+		LeaseID: "claim:2", LeaseGeneration: 2, LeaseTaskRef: "FAC-340", SessionID: "worker-session",
+		AllowedOps: dispatch.WorkerOps, ExpiresAt: time.Now().Add(time.Hour),
+	}
+	signedWorker, err := signer.Issue(worker)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := dispatch.WriteTaskContext(root, signedWorker); err != nil {
+		t.Fatal(err)
+	}
+	// A later review launch leaves a newer canonical reviewer receipt. It
+	// must not replace the worker lease that owns the verification evidence.
+	reviewer := worker
+	reviewer.Role = dispatch.RoleReviewer
+	reviewer.CandidateSHA = gitIn(t, root, "rev-parse", "HEAD")
+	reviewer.LeaseID = "claim:4"
+	reviewer.LeaseGeneration = 4
+	reviewer.LeaseTaskRef = reviewLeaseTaskRef("FAC-340")
+	reviewer.SessionID = "reviewer-session"
+	signedReviewer, err := signer.Issue(reviewer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := dispatch.StoreCanonicalReceipt(root, signedReviewer); err != nil {
+		t.Fatal(err)
+	}
+
+	machine, err := lifecycle.NewMachine(filepath.Join(root, ".herd", "lifecycle.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer machine.Close()
+	bind, err := bindingForWorktreeAtRoot(nil, machine, "FAC-340", root, root)
+	if err != nil {
+		t.Fatalf("worker receipt fallback refused: %v", err)
+	}
+	if bind.LeaseGeneration != worker.LeaseGeneration {
+		t.Fatalf("binding used reviewer generation %d, want worker generation %d", bind.LeaseGeneration, worker.LeaseGeneration)
+	}
+}
+
 func TestRecordForgeLifecycle_ProjectsClaimThroughBuilding(t *testing.T) {
 	root := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(root, ".herd"), 0755); err != nil {
