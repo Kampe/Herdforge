@@ -8290,23 +8290,49 @@ func provisionCoordinatorAgent(root, workspace string) (herdr.TabBinding, error)
 	if err := promptFile.Close(); err != nil {
 		return herdr.TabBinding{}, fmt.Errorf("close coordinator prompt: %w", err)
 	}
-	args := []string{"coordinator", "--task", "coordinator", "--workspace", workspace, "--cwd", root, "--prompt-file", promptPath}
-	var lastErr error
-	for attempt := 0; attempt < 3; attempt++ {
-		cmd := exec.Command("herdr-dispatch", args...)
-		out, runErr := cmd.CombinedOutput()
-		if runErr == nil {
-			lastErr = nil
-			break
-		}
-		lastErr = fmt.Errorf("%w: %s", runErr, strings.TrimSpace(string(out)))
-		if !strings.Contains(string(out), "agent_pane_busy") {
-			break
-		}
-		time.Sleep(time.Second)
+	// Use the native two-stage API with an explicit shell-readiness gap. The
+	// herdr-dispatch convenience wrapper can race tab creation on a fresh repo.
+	tabCmd := exec.Command("herdr", "tab", "create", "--workspace", workspace, "--cwd", root, "--label", "coordinator", "--no-focus")
+	tabOut, runErr := tabCmd.Output()
+	if runErr != nil {
+		return herdr.TabBinding{}, fmt.Errorf("create coordinator tab: %w", runErr)
 	}
-	if lastErr != nil {
-		return herdr.TabBinding{}, fmt.Errorf("start native Sol/Fable coordinator: %w", lastErr)
+	var tabResp struct {
+		Result struct {
+			Tab struct {
+				TabID string `json:"tab_id"`
+			} `json:"tab"`
+			Pane struct {
+				PaneID string `json:"pane_id"`
+			} `json:"root_pane"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(tabOut, &tabResp); err != nil || tabResp.Result.Pane.PaneID == "" {
+		return herdr.TabBinding{}, fmt.Errorf("create coordinator tab returned incomplete identity: %s", strings.TrimSpace(string(tabOut)))
+	}
+	time.Sleep(time.Second)
+	routeCmd := exec.Command("herdr-route", "--task", "coordinator", "--json")
+	routeOut, routeErr := routeCmd.Output()
+	if routeErr != nil {
+		return herdr.TabBinding{}, fmt.Errorf("route native coordinator: %w", routeErr)
+	}
+	var route struct {
+		Provider string   `json:"provider"`
+		Kind     string   `json:"kind"`
+		Argv     []string `json:"argv"`
+	}
+	if err := json.Unmarshal(routeOut, &route); err != nil || (route.Kind != "codex" && route.Kind != "claude") || len(route.Argv) < 1 {
+		return herdr.TabBinding{}, fmt.Errorf("coordinator route must be native Codex Sol or Claude Fable: %s", strings.TrimSpace(string(routeOut)))
+	}
+	startArgs := []string{"herdr", "agent", "start", "coordinator", "--kind", route.Kind, "--pane", tabResp.Result.Pane.PaneID, "--timeout", "120000", "--"}
+	startArgs = append(startArgs, route.Argv[1:]...)
+	if out, startErr := exec.Command(startArgs[0], startArgs[1:]...).CombinedOutput(); startErr != nil {
+		return herdr.TabBinding{}, fmt.Errorf("start native Sol/Fable coordinator: %w: %s", startErr, strings.TrimSpace(string(out)))
+	}
+	prompt := "You are the durable Herdforge coordinator. Drive the forge loop, dispatch work through Herdr, and report blockers. Do not edit the shared root checkout."
+	_ = exec.Command("herdr", "agent", "prompt", "coordinator", prompt).Run()
+	if tabResp.Result.Tab.TabID == "" {
+		return herdr.TabBinding{}, fmt.Errorf("coordinator tab id missing")
 	}
 	deadline := time.Now().Add(30 * time.Second)
 	for time.Now().Before(deadline) {
