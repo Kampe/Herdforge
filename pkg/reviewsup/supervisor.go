@@ -18,15 +18,20 @@ import (
 type EventType string
 
 const (
-	EventCompletion      EventType = "completion"
-	EventReview          EventType = "review"
-	EventVerdict         EventType = "verdict"
-	EventSupersede       EventType = "supersede"
-	EventEvict           EventType = "evict"
-	EventHarvest         EventType = "harvest"
-	EventCapacity        EventType = "capacity"
-	EventBuilderCallback EventType = "builder_callback"
-	EventBuilderAck      EventType = "builder_ack"
+	EventCompletion       EventType = "completion"
+	EventReview           EventType = "review"
+	EventVerdict          EventType = "verdict"
+	EventSupersede        EventType = "supersede"
+	EventEvict            EventType = "evict"
+	EventHarvest          EventType = "harvest"
+	EventCapacity         EventType = "capacity"
+	EventBuilderCallback  EventType = "builder_callback"
+	EventBuilderAck       EventType = "builder_ack"
+	EventVerdictRetained  EventType = "verdict_retained"
+	EventAuthorNotified   EventType = "author_notified"
+	EventCleanupCandidate EventType = "cleanup_candidate"
+	EventClosed           EventType = "closed"
+	EventRefutation       EventType = "refutation"
 )
 
 type Verdict string
@@ -81,6 +86,31 @@ const (
 	StateEvicted   CandidateState = "evicted"
 )
 
+// QueueState is the durable supervisor-facing lifecycle. CandidateState is
+// retained for compatibility with the older API; QueueState makes the
+// operator contract explicit and gives pulse/batch callers exact references.
+type QueueState string
+
+const (
+	QueueAdmitted         QueueState = "admitted"
+	QueueLaunched         QueueState = "launched"
+	QueueVerdictRetained  QueueState = "verdict-retained"
+	QueueIngested         QueueState = "ingested"
+	QueueAuthorNotified   QueueState = "author-notified"
+	QueueHarvestReady     QueueState = "harvest-ready"
+	QueueCleanupCandidate QueueState = "cleanup-candidate"
+	QueueClosed           QueueState = "closed"
+)
+
+type QueueEntry struct {
+	SHA       string     `json:"sha"`
+	Branch    string     `json:"branch,omitempty"`
+	State     QueueState `json:"state"`
+	Reviewer  string     `json:"reviewer,omitempty"`
+	Attempts  int        `json:"attempts,omitempty"`
+	UpdatedAt time.Time  `json:"updated_at"`
+}
+
 type Candidate struct {
 	SHA           string
 	Branch        string
@@ -103,6 +133,49 @@ type Candidate struct {
 	// admitted this candidate. LaunchReview re-checks it; empty digest
 	// never enters review.
 	ReceiptDigest string
+}
+
+func queueState(c *Candidate) QueueState {
+	if c == nil {
+		return QueueClosed
+	}
+	switch c.State {
+	case StatePending:
+		if c.Verdict == VerdictFAIL {
+			return QueueAuthorNotified
+		}
+		return QueueAdmitted
+	case StateReviewing:
+		return QueueLaunched
+	case StatePass:
+		return QueueVerdictRetained
+	case StateFail, StateBlocked:
+		return QueueAuthorNotified
+	case StateHarvested:
+		return QueueHarvestReady
+	case StateEvicted:
+		return QueueClosed
+	default:
+		return QueueAdmitted
+	}
+}
+
+// QueueSnapshot returns a deterministic exact-SHA view of every active review
+// candidate. It is intentionally read-only and independent of fleet-feedback
+// census, so a supervisor can batch-dispatch independent stacks while one
+// blocked stack remains unresolved.
+func (sv *ReviewSupervisor) QueueSnapshot() []QueueEntry {
+	sv.mu.RLock()
+	defer sv.mu.RUnlock()
+	out := make([]QueueEntry, 0, len(sv.cands))
+	for _, c := range sv.cands {
+		if c == nil {
+			continue
+		}
+		out = append(out, QueueEntry{SHA: c.SHA, Branch: c.Branch, State: queueState(c), Reviewer: c.Reviewer, Attempts: c.Attempts, UpdatedAt: c.UpdatedAt})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].SHA < out[j].SHA })
+	return out
 }
 
 // WatchdogAlert identifies an in-review candidate that has outlived the
@@ -457,6 +530,12 @@ func (sv *ReviewSupervisor) LaunchReview(candidateSHA, reviewer, reviewModel str
 	if !ok {
 		return fmt.Errorf("reviewsup: unknown candidate %s", candidateSHA)
 	}
+	if cand.State == StateReviewing && strings.TrimSpace(cand.Reviewer) == strings.TrimSpace(reviewer) {
+		// Idempotent exact-SHA + reviewer admission. A supervisor retry must
+		// reuse the existing reviewer heartbeat/pane rather than launch a
+		// duplicate reviewer for the same candidate identity.
+		return nil
+	}
 	if cand.State != StatePending {
 		return fmt.Errorf("reviewsup: candidate %s is not pending (state=%s)", candidateSHA, cand.State)
 	}
@@ -578,6 +657,16 @@ func (sv *ReviewSupervisor) SubmitVerdict(v ReviewVerdict) (newState CandidateSt
 		cand.UpdatedAt = sv.now()
 		return "", fmt.Errorf("reviewsup: append verdict row: %w", err)
 	}
+	if err := sv.appendRow(&Row{
+		Event:         string(EventVerdictRetained),
+		SHA:           v.SHA,
+		Reviewer:      v.Reviewer,
+		Verdict:       string(v.Verdict),
+		Reason:        v.Reason,
+		ReceiptDigest: cand.ReceiptDigest,
+	}); err != nil {
+		return "", fmt.Errorf("reviewsup: retain verdict row: %w", err)
+	}
 
 	switch v.Verdict {
 	case VerdictPASS:
@@ -596,6 +685,9 @@ func (sv *ReviewSupervisor) SubmitVerdict(v ReviewVerdict) (newState CandidateSt
 			cand.VerdictReason = ""
 			cand.UpdatedAt = sv.now()
 			return "", fmt.Errorf("reviewsup: append harvest row: %w", err)
+		}
+		if err := sv.appendRow(&Row{Event: string(EventCleanupCandidate), SHA: v.SHA, Reviewer: v.Reviewer, Reason: "verdict retained; coordinator may close exact tab after harvest"}); err != nil {
+			return "", fmt.Errorf("reviewsup: append cleanup candidate: %w", err)
 		}
 		cand.State = StateHarvested
 
@@ -620,6 +712,9 @@ func (sv *ReviewSupervisor) SubmitVerdict(v ReviewVerdict) (newState CandidateSt
 			cand.VerdictReason = ""
 			cand.UpdatedAt = sv.now()
 			return "", fmt.Errorf("reviewsup: append builder callback row: %w", err)
+		}
+		if err := sv.appendRow(&Row{Event: string(EventAuthorNotified), SHA: v.SHA, Reviewer: v.Reviewer, Verdict: string(effective), Reason: v.Reason}); err != nil {
+			return "", fmt.Errorf("reviewsup: append author notification: %w", err)
 		}
 		if effective == VerdictBLOCKED {
 			cand.State = StateBlocked
@@ -647,6 +742,9 @@ func (sv *ReviewSupervisor) SubmitVerdict(v ReviewVerdict) (newState CandidateSt
 			cand.VerdictReason = ""
 			cand.UpdatedAt = sv.now()
 			return "", fmt.Errorf("reviewsup: append builder callback row: %w", err)
+		}
+		if err := sv.appendRow(&Row{Event: string(EventAuthorNotified), SHA: v.SHA, Reviewer: v.Reviewer, Verdict: string(VerdictBLOCKED), Reason: v.Reason}); err != nil {
+			return "", fmt.Errorf("reviewsup: append author notification: %w", err)
 		}
 		cand.State = StateBlocked
 	}

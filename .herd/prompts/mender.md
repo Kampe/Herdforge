@@ -1,5 +1,14 @@
 # mender — standing lane
 
+## Control-plane contract (mandatory)
+
+Use the Herdforge Go CLI and Herdr for every task and delivery; never use
+repository `bin/herd-*` orchestration scripts. Start with `herd pulse --json`,
+`herd next`, and `herd quota-supervisor --read-only`, then work in an isolated
+worktree. File defects with herd-deps-v1 provenance, use the review supervisor
+for review, and use `/goal` continuation to select the next forge defect when
+the current ticket is complete.
+
 You fix **the forge itself**: the gates, evidence checks and lifecycle bugs that cost the fleet
 whole sessions. You are not a ticket worker; your backlog is the forge's own defects.
 

@@ -64,9 +64,15 @@ func TestCleanupFenced_DryRunNoCandidatesIsNotError(t *testing.T) {
 }
 
 func TestCleanupFenced_MutationFailsClosedWithoutGeneration(t *testing.T) {
-	stubAgentList(t, fencedAgentListJSON(
-		`[{"name":"task-fac-1","agent_status":"done","tab_id":"t1","pane_id":"p1","workspace_id":"w","revision":3}]`,
-	))
+	old := runHerdr
+	t.Cleanup(func() { runHerdr = old })
+	list := fencedAgentListJSON(`[{"name":"task-fac-1","agent_status":"done","tab_id":"t1","pane_id":"p1","workspace_id":"w","revision":3}]`)
+	runHerdr = func(args ...string) (string, error) {
+		if len(args) >= 2 && args[0] == "agent" && args[1] == "list" {
+			return list, nil
+		}
+		return "", errors.New("delegated close unavailable")
+	}
 	res, err := CleanupFenced(nil, false)
 	if err != nil {
 		t.Fatalf("BLOCKED candidates must not set error: %v", err)
@@ -232,8 +238,8 @@ func TestDefaultCleanupClose_WithErrorIsNotBlocked(t *testing.T) {
 }
 
 // Mutation oracle: a broken executor that skips generation evidence would
-// close. The real default path blocks. This proves the BLOCKED outcome is
-// load-bearing, not vacuous.
+// close. When Herdr cannot accept exact-tab delegation the real default path
+// blocks; this proves the BLOCKED outcome remains load-bearing.
 func TestCleanupFenced_MutationOracle_BrokenExecutorWouldClose(t *testing.T) {
 	agentList := fencedAgentListJSON(
 		`[{"name":"task-fac-1","agent_status":"done","tab_id":"t1","pane_id":"p1","workspace_id":"w","revision":3}]`,
@@ -244,13 +250,16 @@ func TestCleanupFenced_MutationOracle_BrokenExecutorWouldClose(t *testing.T) {
 		if len(args) >= 2 && args[0] == "agent" && args[1] == "list" {
 			return agentList, nil
 		}
-		return `{}`, nil
+		return "tab close unavailable", errors.New("tab close unavailable")
 	}
-	// Real path: default executor, no generation → BLOCKED.
+	// Real path: default executor, no generation and delegated close unavailable
+	// → BLOCKED.
+	closeCalls := 0
 	realRes, realErr := CleanupFenced(nil, false)
 	if realErr != nil {
 		t.Fatalf("real path: %v", realErr)
 	}
+	_ = closeCalls
 	if realRes.Attempts[0].Outcome != CleanupBlocked {
 		t.Fatalf("real path must BLOCK: %+v", realRes.Attempts)
 	}

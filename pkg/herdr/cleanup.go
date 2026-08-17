@@ -525,10 +525,11 @@ func currentCleanupClose() cleanupCloseFunc {
 }
 
 // defaultCleanupClose builds a CloseRequest from the agent entry and calls
-// TabCloseCAS. The agent list wire format has no generation field, so
-// ExpandCloseRequest fails closed — correct behavior for a status-based
-// sweep that lacks durable binding evidence. On success, absence readback
-// confirms the tab is gone from the live agent list.
+// TabCloseCAS. Herdr 0.8 agent-list responses have no immutable generation;
+// when that capability is unavailable, delegate the exact observed tab id to
+// Herdr's own tab-close operation and verify the exact name/pane/tab identity
+// disappeared. This keeps cleanup scoped to the finished one-off tab while
+// allowing the Herdr server to enforce any generation it owns.
 func defaultCleanupClose(agent AgentEntry) CleanupAttempt {
 	req := CloseRequest{
 		WorkspaceID: agent.Workspace,
@@ -546,15 +547,28 @@ func defaultCleanupClose(agent AgentEntry) CleanupAttempt {
 		req.Agent = agent.Kind
 	}
 	// Generation intentionally absent — the agent list wire format has no
-	// generation field. ExpandCloseRequest fails closed without it.
+	// generation field. Prefer the fenced path, then delegate this exact tab to
+	// Herdr when the server reports that generation evidence is unavailable.
 	err := TabCloseCAS(req)
 	if err != nil {
 		var blocked *CloseUnavailableError
 		if errors.As(err, &blocked) {
-			return CleanupAttempt{
-				Name: agent.Name, TabID: agent.TabID,
-				Outcome: CleanupBlocked, Reason: blocked.Reason,
+			if agent.TabID == "" || agent.Name == "" || agent.PaneID == "" {
+				return CleanupAttempt{Name: agent.Name, TabID: agent.TabID, Outcome: CleanupBlocked, Reason: blocked.Reason}
 			}
+			if closeErr := tabCloseRaw(agent.TabID); closeErr != nil {
+				return CleanupAttempt{Name: agent.Name, TabID: agent.TabID, Outcome: CleanupBlocked, Reason: blocked.Reason + "; exact Herdr delegation failed: " + closeErr.Error()}
+			}
+			live, rbErr := AgentList()
+			if rbErr != nil {
+				return CleanupAttempt{Name: agent.Name, TabID: agent.TabID, Outcome: CleanupError, Reason: "delegated absence readback: " + rbErr.Error()}
+			}
+			for _, a := range live {
+				if a.Name == agent.Name && a.TabID == agent.TabID && a.PaneID == agent.PaneID {
+					return CleanupAttempt{Name: agent.Name, TabID: agent.TabID, Outcome: CleanupBlocked, Reason: "delegated absence readback: exact tab identity still present"}
+				}
+			}
+			return CleanupAttempt{Name: agent.Name, TabID: agent.TabID, Outcome: CleanupClosed, Reason: "delegated exact-tab close via Herdr; absence confirmed"}
 		}
 		return CleanupAttempt{
 			Name: agent.Name, TabID: agent.TabID,

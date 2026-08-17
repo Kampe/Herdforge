@@ -64,6 +64,8 @@ type Evidence struct {
 	LedgerReason  string          `json:"ledger_reason,omitempty"`
 	UsedPct       float64         `json:"used_pct"`
 	Window        string          `json:"window,omitempty"`
+	ResetAt       string          `json:"reset_at,omitempty"`
+	WindowSeconds int             `json:"window_seconds,omitempty"`
 	RunwayMinutes *int            `json:"runway_minutes,omitempty"`
 	// SourceAt is when the quota provider generated the reading, NOT when the
 	// supervisor ran. Recording the supervisor's own clock here would make
@@ -115,6 +117,8 @@ func (o Observation) Grade(now time.Time, warnRunwayMinutes int, maxAge time.Dur
 		e.LedgerReason = o.Burn.Reason
 		e.UsedPct = o.Burn.Used
 		e.Window = o.Burn.Window
+		e.ResetAt = o.Burn.ResetsAt
+		e.WindowSeconds = o.Burn.WindowSeconds
 		e.RunwayMinutes = o.Burn.RunwayMinutes
 		e.Stale = o.Burn.Stale
 	}

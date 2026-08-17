@@ -376,6 +376,8 @@ func drainCandidateTask(t *provider.Task, family, model, sha string) *provider.T
 
 func drainReviewPacket(ref, sha, worktree string) string {
 	return fmt.Sprintf(`REVIEW %s candidate %s — verdict ONLY, edit nothing. End with the verdict line.
+REPORT_TARGET: review-harvest-supervisor (mandatory; never coordinator)
+REPORT_CONTRACT: deliver the signed verdict artifact to the review supervisor. The supervisor owns retries, author feedback, exact-SHA ledger ingest, and reviewer-tab cleanup. The coordinator receives only an exact PASS plus merge-ready handoff.
 cd %s
 1. git diff origin/main..%s --stat  (review ONLY these changed files)
 2. %s   (targeted tests for the changed packages, not the whole repo)
@@ -384,13 +386,12 @@ REVIEW VERDICT %s: APPROVED
 REVIEW VERDICT %s: REJECTED - <numbered fixes>
 Do not read the whole codebase. Do not run the full suite. Change nothing.
 
-SUPERVISOR LOOP: You own this review until it passes. If rejected, send the
-numbered findings to the author lane, wait for its replacement candidate, then
-spawn or re-ping a reviewer against that exact SHA. Do not hand review work to
-the coordinator. After APPROVED, report merge-ready evidence and cleanup
-candidates to the coordinator. The coordinator performs post-merge
-generation-fenced cleanup; preserve standing lanes and lanes with unconsumed
-review/goal evidence.`,
+
+ Do not run a retry loop yourself. On FAIL, include numbered findings and stop;
+ the supervisor re-dispatches the fresh SHA. On PASS, stop after retaining the
+ artifact and notifying the supervisor. The coordinator performs post-merge
+ generation-fenced cleanup; preserve standing lanes and lanes with unconsumed
+ review/goal evidence.`,
 		ref, sha, worktree, sha, scopedTestCommand(worktree), ref, ref)
 }
 

@@ -8,8 +8,10 @@
 package quotasup
 
 import (
+	"fmt"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/Kampe/Herdforge/pkg/router"
 	"github.com/Kampe/Herdforge/pkg/usage"
@@ -170,6 +172,48 @@ type Snapshot struct {
 	WarnRunwayMinutes int          `json:"warn_runway_minutes"`
 	Agents            []Assignment `json:"agents"`
 	Decisions         []Decision   `json:"decisions,omitempty"`
+	Wake              *WakePlan    `json:"wake,omitempty"`
+}
+
+// WakePlan is a durable, deduplicable self-wake hint for a coordinator. It is
+// a plan rather than a scheduler side effect; callers persist it and arm the
+// platform's cron/launchd adapter using the stable Key.
+type WakePlan struct {
+	Key      string    `json:"key"`
+	Provider string    `json:"provider"`
+	Window   string    `json:"window"`
+	ResetAt  time.Time `json:"reset_at"`
+	Reason   string    `json:"reason"`
+}
+
+// PlanClaudeFiveHourWake returns the earliest future Claude five-hour reset
+// among observed surfaces. A reset without a parseable timestamp is not a
+// wake plan: coordinators must never arm a timer from an invented deadline.
+func PlanClaudeFiveHourWake(now time.Time, decisions []Decision) *WakePlan {
+	var best *WakePlan
+	for _, d := range decisions {
+		provider := strings.ToLower(strings.TrimSpace(d.Surface.Provider))
+		if provider != "anthropic" && provider != "claude" {
+			continue
+		}
+		e := d.Evidence
+		if e.WindowSeconds != usage.Window5h && !strings.EqualFold(e.Window, "5h") && !strings.EqualFold(e.Window, "five_hour") {
+			continue
+		}
+		reset, err := time.Parse(time.RFC3339, strings.TrimSpace(e.ResetAt))
+		if err != nil || !reset.After(now) {
+			continue
+		}
+		candidate := &WakePlan{
+			Key:      fmt.Sprintf("%s/5h/%s", provider, reset.UTC().Format(time.RFC3339)),
+			Provider: provider, Window: "5h", ResetAt: reset.UTC(),
+			Reason: "Claude five-hour quota window reset; re-read live quota before dispatch",
+		}
+		if best == nil || candidate.ResetAt.Before(best.ResetAt) {
+			best = candidate
+		}
+	}
+	return best
 }
 
 // UnresolvedModels names the lanes whose pool is a fallback rather than an
