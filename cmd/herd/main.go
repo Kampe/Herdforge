@@ -1650,6 +1650,15 @@ func runUp() {
 		os.Exit(1)
 	}
 	tabLabel := fmt.Sprintf("forge-%s", lane.Name)
+	ready, readyErr := waitExactPaneBeforeStart(tab, nativePaneReadyTimeout)
+	if readyErr != nil {
+		closeErr := compensateExactLaunchTab(herdr.ResolveWorkspace("."), tab)
+		fmt.Fprintf(os.Stderr, "LAUNCH_FAILED: %s\n", ready.Reason)
+		if closeErr != nil {
+			fmt.Fprintf(os.Stderr, "  COMPENSATION FAILED: %v\n", closeErr)
+		}
+		os.Exit(1)
+	}
 	if err := herdr.StartPreparedAgent(tab.ID, tabLabel, decision.Harness, tab.Pane.ID, launch.Request{Decision: decision, TaskRef: lane.Name, Scope: router.ScopeLane, Repository: repository, Lane: lane.Name}); err != nil {
 		fmt.Fprintf(os.Stderr, "failed to start agent: %v\n", err)
 		os.Exit(1)
@@ -2116,11 +2125,19 @@ func runReview() {
 		if tabErr != nil {
 			life.fail("failed to create isolated reviewer tab: %v", tabErr)
 		}
-		life.onFail(func() error { return herdr.TabClose(tab.ID) })
+		life.onFail(func() error { return compensateExactLaunchTab(ws, tab) })
 		// The value tab create echoes back is only what we asked for. The
 		// guarantee must rest on the LIVE terminal state, read for the exact
-		// pane INCARNATION we just launched (FAC-145).
+		// pane INCARNATION we just launched (FAC-145). Poll that pane until a
+		// readable shell and cwd exist before starting the harness (FAC-369).
 		reviewerSession := herdr.SessionID(tab.Pane)
+		ready, readyErr := waitExactPaneBeforeStart(tab, nativePaneReadyTimeout)
+		if readyErr != nil {
+			life.fail("LAUNCH_FAILED: %s", ready.Reason)
+		}
+		if ready.Cwd != "" && !sameDir(ready.Cwd, worktreeDir) {
+			life.fail("LAUNCH_FAILED: live reviewer pane cwd %q is not the isolated candidate checkout %q (FAC-145)", ready.Cwd, worktreeDir)
+		}
 		// Start through the compiled LaunchDecision (main's admission path):
 		// the isolated tab is FAC-145's requirement, the decision-bound start
 		// is the launch contract — the reviewer needs both.
@@ -2135,17 +2152,6 @@ func runReview() {
 		reviewReq := taskLaunchRequest(boundDecision, task.Ref, repositoryIdentityForLaunch(cfg), lane.Name)
 		if err := herdr.StartPreparedAgent(tab.ID, tabLabel, boundDecision.Harness, tab.Pane.ID, reviewReq); err != nil {
 			life.fail("failed to start reviewer agent: %v", err)
-		}
-		// Herdr 0.8 publishes a tab's root pane to agent-list only after the
-		// harness starts. Read the live cwd after that transition, with a
-		// bounded exact-incarnation wait; checking before start races a valid
-		// pane that is not an agent yet.
-		liveCwd, cwdErr := waitForReviewerPaneCwd(reviewerSession, worktreeDir, 6*time.Second)
-		if cwdErr != nil {
-			life.fail("cannot read live reviewer pane cwd (FAC-145): %v", cwdErr)
-		}
-		if !sameDir(liveCwd, worktreeDir) {
-			life.fail("live reviewer pane cwd %q is not the isolated candidate checkout %q (FAC-145)", liveCwd, worktreeDir)
 		}
 		targetLabel := tabLabel
 		fmt.Printf("Spawned reviewer '%s' in tab %s (pane %s, cwd %s)\n", tabLabel, tab.ID, tab.Pane.ID, tab.Cwd)
@@ -2207,29 +2213,6 @@ File your verdict through the broker (typed, receipt-bound):
   herd task verdict %s REJECTED "<numbered fixes>"
 	Do not read the whole codebase. Do not run the full suite. Change nothing. Do not use repository bin/herd-* orchestration scripts.`,
 		task.Ref, supervisor, worktreeDir, testCmd, task.Ref, task.Ref)
-}
-
-// waitForReviewerPaneCwd closes the create/readback race in Herdr: tab create
-// returns the requested pane incarnation before agent-list has necessarily
-// published that same terminal. Readiness is bounded and exact-incarnation;
-// a replacement pane can never satisfy the original review receipt.
-func waitForReviewerPaneCwd(sessionID, want string, timeout time.Duration) (string, error) {
-	if timeout <= 0 {
-		timeout = 6 * time.Second
-	}
-	deadline := time.Now().Add(timeout)
-	var lastErr error
-	for {
-		cwd, err := herdr.PaneLiveCwd(sessionID)
-		if err == nil {
-			return cwd, nil
-		}
-		lastErr = err
-		if time.Now().After(deadline) {
-			return "", fmt.Errorf("reviewer pane readiness timeout for %s (want %s): %w", sessionID, want, lastErr)
-		}
-		time.Sleep(200 * time.Millisecond)
-	}
 }
 
 // reviewEligibleTaskStatus permits explicit NEEDS_REVIEW/ready cards while
@@ -4944,8 +4927,14 @@ func runForgeE() error {
 						cwd = filepath.Join(".", lane.Worktree)
 					}
 					req := taskLaunchRequest(decision, task.Ref, repositoryIdentityForLaunch(cfg), lane.Name)
-					_, tab, tabErr := openWriteCapableTab(decision, req, lane, herdr.ResolveWorkspace("."), tabLabel, cwd)
+					ws := herdr.ResolveWorkspace(".")
+					_, tab, tabErr := openWriteCapableTab(decision, req, lane, ws, tabLabel, cwd)
 					if tabErr == nil {
+						ready, readyErr := waitExactPaneBeforeStart(tab, nativePaneReadyTimeout)
+						if readyErr != nil {
+							closeErr := compensateExactLaunchTab(ws, tab)
+							return compensateLaunchFailure(errors.Join(fmt.Errorf("LAUNCH_FAILED: %s", ready.Reason), closeErr))
+						}
 						if err := herdr.StartPreparedAgent(tab.ID, tabLabel, decision.Harness, tab.Pane.ID, req); err != nil {
 							return compensateLaunchFailure(fmt.Errorf("launch failed: %w", err))
 						}
