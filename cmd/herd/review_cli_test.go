@@ -91,7 +91,7 @@ func acquireFixtureLease(t *testing.T, dir, ref string) (string, int64) {
 }
 
 func mailPost(dir, sender, subject, body string) (*mail.Envelope, error) {
-	return mail.NewMailbox(filepath.Join(dir, ".herd", "mail.jsonl")).SendMessage(sender, "coordinator", subject, body)
+	return mail.NewMailbox(mail.CallbackMailPath(dir)).SendMessage(sender, "coordinator", subject, body)
 }
 
 // writeSignedReceipt issues a coordinator-signed FAC-1 receipt into wt: the
@@ -627,7 +627,7 @@ func TestVerifyCLI_PostsReceiptBoundFailCallback(t *testing.T) {
 		t.Fatalf("verify of an empty worktree must fail:\n%s", out)
 	}
 
-	data, err := os.ReadFile(filepath.Join(dir, ".herd", "mail.jsonl"))
+	data, err := os.ReadFile(mail.CallbackMailPath(dir))
 	if err != nil {
 		t.Fatalf("no callback posted to the coordinator mailbox: %v\n%s", err, out)
 	}
@@ -819,7 +819,7 @@ func TestApproveCLI_BoundMutationAndPassCallback(t *testing.T) {
 		t.Fatalf("expected exactly 1 status write, saw %d", got)
 	}
 
-	data, err := os.ReadFile(filepath.Join(dir, ".herd", "mail.jsonl"))
+	data, err := os.ReadFile(mail.CallbackMailPath(dir))
 	if err != nil {
 		t.Fatalf("coordinator PASS callback not posted: %v", err)
 	}
@@ -932,7 +932,7 @@ func TestApproveCLI_ReconcilesInterruptedTransition(t *testing.T) {
 
 	// Stable dedupe: the replayed PASS callback converged on the crashed
 	// run's envelope — exactly ONE complete callback on the bus.
-	mailData, err := os.ReadFile(filepath.Join(dir, ".herd", "mail.jsonl"))
+	mailData, err := os.ReadFile(mail.CallbackMailPath(dir))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1033,7 +1033,7 @@ func TestApproveCLI_DoneWithoutPublishReconcilesByPublicationOnly(t *testing.T) 
 	if got := atomic.LoadInt32(&fk.patches); got != 0 {
 		t.Fatalf("publication-only reconcile must not touch the board, saw %d write(s)", got)
 	}
-	mailData, err := os.ReadFile(filepath.Join(dir, ".herd", "mail.jsonl"))
+	mailData, err := os.ReadFile(mail.CallbackMailPath(dir))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1121,7 +1121,7 @@ func TestApproveCLI_ReadbackDriftFailsApproval(t *testing.T) {
 		t.Fatalf("expected readback drift refusal, got:\n%s", out)
 	}
 
-	mailData, err := os.ReadFile(filepath.Join(dir, ".herd", "mail.jsonl"))
+	mailData, err := os.ReadFile(mail.CallbackMailPath(dir))
 	if err != nil {
 		t.Fatalf("compensating callback missing: %v", err)
 	}
@@ -1475,7 +1475,7 @@ func TestVerdict_TwoBrokersDeliverExactlyOnce(t *testing.T) {
 		t.Fatalf("two coordinators produced %d verdict comments, want exactly 1:\n%v", got, bodies)
 	}
 	// Exactly one consumable authority record too.
-	mailData, err := os.ReadFile(filepath.Join(dir, ".herd", "mail.jsonl"))
+	mailData, err := os.ReadFile(mail.CallbackMailPath(dir))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1662,7 +1662,7 @@ func TestApproveCLI_RejectedVerdictVetoesApproval(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	mb := mail.NewMailbox(filepath.Join(dir, ".herd", "mail.jsonl"))
+	mb := mail.NewMailbox(mail.CallbackMailPath(dir))
 	if _, err := mb.PostCallback("reviewer", mail.Callback{
 		Ref: "FAC-1", Kind: mail.CallbackBlocked, SHA: candidate, Repo: dispatch.RepositoryIdentityOrName(dir, "herdforge-test"),
 		LeaseGeneration: rc.LeaseGeneration, SenderRole: "reviewer",
@@ -1843,7 +1843,7 @@ func TestApproveCLI_ConcurrentApprovesSerializeAndDedupe(t *testing.T) {
 	if got := atomic.LoadInt32(&fk.patches); got != 1 {
 		t.Fatalf("concurrent approves performed %d board writes, want exactly 1", got)
 	}
-	mailData, err := os.ReadFile(filepath.Join(dir, ".herd", "mail.jsonl"))
+	mailData, err := os.ReadFile(mail.CallbackMailPath(dir))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2134,7 +2134,7 @@ func TestTaskBrokerCLI_DetachedReviewerReadAndVerdict(t *testing.T) {
 		t.Fatalf("provider must receive the canonical verdict line %q, got:\n%s", want, verdictBody)
 	}
 	// Durable coordinator-side verdict record on the bus.
-	mailData, err := os.ReadFile(filepath.Join(dir, ".herd", "mail.jsonl"))
+	mailData, err := os.ReadFile(mail.CallbackMailPath(dir))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2304,7 +2304,7 @@ func TestReviewCLI_CandidateIndexMergedDiscovery(t *testing.T) {
 	writeReviewConfig(t, dir, server.URL, "proj-x")
 
 	// 1. Post a blocked mail callback for FAC-2
-	mb := mail.NewMailbox(filepath.Join(dir, ".herd", "mail.jsonl"))
+	mb := mail.NewMailbox(mail.CallbackMailPath(dir))
 	cb := mail.Callback{
 		Ref:    "FAC-2",
 		Kind:   mail.CallbackBlocked,

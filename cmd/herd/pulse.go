@@ -356,13 +356,7 @@ func readPulseLeases(ctx context.Context) ([]pulse.LeaseObservation, *claim.Clai
 }
 
 func pulseMailPath() string {
-	if p := strings.TrimSpace(os.Getenv("HERD_MAIL_FILE")); p != "" {
-		return p
-	}
-	if d := strings.TrimSpace(os.Getenv("HERD_MAIL_DIR")); d != "" {
-		return filepath.Join(d, "mail.jsonl")
-	}
-	return filepath.Join(".herd", "mail.jsonl")
+	return mail.CallbackMailPath(".")
 }
 
 func readPulseCallbacks(ctx context.Context, act bool) ([]pulse.CallbackObservation, *mail.CallbackConsumer, error) {
