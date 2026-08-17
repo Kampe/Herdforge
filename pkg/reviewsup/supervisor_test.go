@@ -1417,3 +1417,72 @@ func TestLaunchReview_AdmitRefuses_BlocksSpawn(t *testing.T) {
 		t.Fatalf("candidate must remain pending after refused launch, got %+v", c)
 	}
 }
+
+func TestCompensateLaunch_RevertsReviewingOnLaunchFailed(t *testing.T) {
+	sv, dir := newTestSupervisor(t)
+	if _, _, err := sv.Ingest(withDigest(CompletionCallback{
+		SHA: "launch-fail-sha", Branch: "herd/fac-369", PatchID: "fac-369",
+		AuthorModel: "claude-3-7-sonnet", Tier: TierR2,
+	})); err != nil {
+		t.Fatalf("Ingest: %v", err)
+	}
+	if err := sv.LaunchReview("launch-fail-sha", "gemini-reviewer", "gemini-2.5-flash"); err != nil {
+		t.Fatalf("LaunchReview: %v", err)
+	}
+	if got := sv.Candidate("launch-fail-sha"); got == nil || got.State != StateReviewing {
+		t.Fatalf("precondition: want reviewing, got %+v", got)
+	}
+	if err := sv.CompensateLaunch("launch-fail-sha", "LAUNCH_FAILED: unknown pane"); err != nil {
+		t.Fatalf("CompensateLaunch: %v", err)
+	}
+	c := sv.Candidate("launch-fail-sha")
+	if c == nil || c.State != StatePending {
+		t.Fatalf("LAUNCH_FAILED must not leave an in-review candidate: %+v", c)
+	}
+	if c.Reviewer != "" {
+		t.Fatalf("compensated launch must clear reviewer, got %q", c.Reviewer)
+	}
+	if q := sv.QueueSnapshot(); len(q) != 1 || q[0].State != QueueAdmitted {
+		t.Fatalf("queue after compensate = %+v, want admitted", q)
+	}
+	rows, err := readRows(filepath.Join(dir, "supervisor-ledger.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, r := range rows {
+		if r.Event == string(EventLaunchFailed) && r.SHA == "launch-fail-sha" && strings.Contains(r.Reason, "LAUNCH_FAILED") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("ledger missing durable LAUNCH_FAILED row: %+v", rows)
+	}
+}
+
+func TestCompensateLaunch_ReconstructDoesNotLeaveInReview(t *testing.T) {
+	sv, dir := newTestSupervisor(t)
+	if _, _, err := sv.Ingest(withDigest(CompletionCallback{
+		SHA: "replay-sha", Branch: "herd/fac-369", PatchID: "replay",
+		AuthorModel: "claude-3-7-sonnet", Tier: TierR1,
+	})); err != nil {
+		t.Fatalf("Ingest: %v", err)
+	}
+	if err := sv.LaunchReview("replay-sha", "gemini", "gemini-2.5-flash"); err != nil {
+		t.Fatalf("LaunchReview: %v", err)
+	}
+	if err := sv.CompensateLaunch("replay-sha", "LAUNCH_FAILED: pane is at a login or authentication screen"); err != nil {
+		t.Fatalf("CompensateLaunch: %v", err)
+	}
+	cfg := DefaultConfig(dir)
+	cfg.Now = fixedNow
+	cfg.AdmitReceipt = testAdmitReceipt
+	replay := New(cfg)
+	if _, err := replay.Reconstruct(); err != nil {
+		t.Fatalf("Reconstruct: %v", err)
+	}
+	c := replay.Candidate("replay-sha")
+	if c == nil || c.State != StatePending || c.Reviewer != "" {
+		t.Fatalf("replayed LAUNCH_FAILED left in-review state: %+v", c)
+	}
+}

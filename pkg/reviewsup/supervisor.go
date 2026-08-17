@@ -33,6 +33,7 @@ const (
 	EventCleanupCandidate EventType = "cleanup_candidate"
 	EventClosed           EventType = "closed"
 	EventRefutation       EventType = "refutation"
+	EventLaunchFailed     EventType = "launch_failed"
 )
 
 type Verdict string
@@ -622,6 +623,44 @@ func (sv *ReviewSupervisor) LaunchReview(candidateSHA, reviewer, reviewModel str
 	return nil
 }
 
+// CompensateLaunch reverts a reviewing candidate after a bounded native
+// launch failure. The card must not remain in-review without a live reviewer.
+func (sv *ReviewSupervisor) CompensateLaunch(candidateSHA, reason string) error {
+	sv.mu.Lock()
+	defer sv.mu.Unlock()
+
+	cand, ok := sv.cands[candidateSHA]
+	if !ok {
+		return fmt.Errorf("reviewsup: unknown candidate %s", candidateSHA)
+	}
+	if cand.State != StateReviewing {
+		return fmt.Errorf("reviewsup: candidate %s is not reviewing (state=%s)", candidateSHA, cand.State)
+	}
+	if strings.TrimSpace(reason) == "" {
+		reason = "LAUNCH_FAILED"
+	}
+	prevReviewer := cand.Reviewer
+	prevFamily := cand.ReviewFamily
+	cand.State = StatePending
+	cand.Reviewer = ""
+	cand.ReviewFamily = ""
+	cand.UpdatedAt = sv.now()
+	if err := sv.appendRow(&Row{
+		Event:    string(EventLaunchFailed),
+		SHA:      candidateSHA,
+		Reviewer: prevReviewer,
+		Reason:   reason,
+		Attempts: cand.Attempts,
+	}); err != nil {
+		cand.State = StateReviewing
+		cand.Reviewer = prevReviewer
+		cand.ReviewFamily = prevFamily
+		cand.UpdatedAt = sv.now()
+		return fmt.Errorf("reviewsup: append launch_failed row: %w", err)
+	}
+	return nil
+}
+
 type ReviewVerdict struct {
 	SHA      string
 	Reviewer string
@@ -1161,6 +1200,14 @@ func (sv *ReviewSupervisor) Reconstruct() (int, error) {
 					cand.ReviewFamily = r.ReviewFamily
 					cand.Attempts = r.Attempts
 				}
+			}
+
+		case EventLaunchFailed:
+			if cand, ok := sv.cands[r.SHA]; ok {
+				cand.State = StatePending
+				cand.Reviewer = ""
+				cand.ReviewFamily = ""
+				cand.VerdictReason = r.Reason
 			}
 
 		case EventVerdict:
