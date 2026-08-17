@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/Kampe/Herdforge/pkg/config"
+	"github.com/Kampe/Herdforge/pkg/dispatch"
 	"github.com/Kampe/Herdforge/pkg/mail"
 	"github.com/Kampe/Herdforge/pkg/provider"
 	"github.com/Kampe/Herdforge/pkg/reviewledger"
@@ -61,6 +62,60 @@ func TestCandidateIndex_DeterministicSorting(t *testing.T) {
 		if cands[i].Ref != exp {
 			t.Fatalf("expected index %d to be %s, got %s", i, exp, cands[i].Ref)
 		}
+	}
+}
+
+func TestCandidateIndexDiscoversForgeTaskInConfiguredLaneWorktree(t *testing.T) {
+	dir := t.TempDir()
+	lane := filepath.Join(dir, "chainseer-forge-worker-live")
+	if err := os.MkdirAll(lane, 0755); err != nil {
+		t.Fatal(err)
+	}
+	git := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", append([]string{"-c", "core.hooksPath=/dev/null", "-c", "commit.gpgsign=false", "-C", lane}, args...)...)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+	git("init", "-q")
+	git("config", "user.email", "candidate-index@example.invalid")
+	git("config", "user.name", "candidate-index")
+	if err := os.WriteFile(filepath.Join(lane, "change.txt"), []byte("forge change\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	git("add", "change.txt")
+	git("commit", "-qm", "forge candidate")
+	out, err := exec.Command("git", "-C", lane, "rev-parse", "HEAD").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantSHA := strings.TrimSpace(string(out))
+	tc := dispatch.TaskContext{
+		ProviderType: "memory", ProjectID: "project", Repository: "repo", Role: dispatch.RoleWorker,
+		TaskRef: "FAC-1723", TaskID: "task-1723", Branch: "standing/worker", BaseSHA: wantSHA,
+		LeaseID: "1", LeaseGeneration: 1, LeaseTaskRef: "FAC-1723", SessionID: "worker-session",
+		AllowedOps: dispatch.WorkerOps, ExpiresAt: time.Now().Add(time.Hour),
+	}
+	body, err := json.Marshal(tc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(lane, dispatch.TaskContextFile), body, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	idx := New(IndexOptions{
+		RepoRoot:     dir,
+		Config:       &config.Config{TaskProvider: config.TaskProvider{ProjectID: "project"}, Lanes: []config.LaneDef{{Name: "forge-worker", Worktree: "chainseer-forge-worker-live"}}},
+		TaskProvider: &mockProvider{tasks: []*provider.Task{{ID: "task-1723", Ref: "FAC-1723", Status: "in-progress", Priority: provider.PriorityHigh}}},
+	})
+	cands, err := idx.BuildIndex(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cands) != 1 || cands[0].CandidateSHA != wantSHA || cands[0].WorktreePath != lane {
+		t.Fatalf("lane worktree candidate not discovered: %+v", cands)
 	}
 }
 

@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/Kampe/Herdforge/pkg/config"
+	"github.com/Kampe/Herdforge/pkg/dispatch"
 	"github.com/Kampe/Herdforge/pkg/mail"
 	"github.com/Kampe/Herdforge/pkg/provider"
 	"github.com/Kampe/Herdforge/pkg/reviewingest"
@@ -92,7 +93,12 @@ type IndexOptions struct {
 	QueuePath    string
 	InboxDir     string
 	WorktreesDir string
-	Now          func() time.Time
+	// LaneWorktrees are configured standing-lane checkouts. Forge may launch
+	// an ephemeral task into one of these instead of creating
+	// .herd/worktrees/<ref>; the signed TASK-CONTEXT.json is the only authority
+	// used to associate such a checkout with a task ref.
+	LaneWorktrees []string
+	Now           func() time.Time
 }
 
 // CandidateIndex builds and serves a deterministic read-only view of review candidates.
@@ -131,6 +137,18 @@ func New(opts IndexOptions) *CandidateIndex {
 	}
 	if opts.WorktreesDir == "" && opts.RepoRoot != "" {
 		opts.WorktreesDir = filepath.Join(opts.RepoRoot, ".herd", "worktrees")
+	}
+	if len(opts.LaneWorktrees) == 0 && opts.Config != nil && opts.RepoRoot != "" {
+		for _, lane := range opts.Config.Lanes {
+			path := strings.TrimSpace(lane.Worktree)
+			if path == "" {
+				continue
+			}
+			if !filepath.IsAbs(path) {
+				path = filepath.Join(opts.RepoRoot, path)
+			}
+			opts.LaneWorktrees = append(opts.LaneWorktrees, filepath.Clean(path))
+		}
 	}
 	return &CandidateIndex{opts: opts}
 }
@@ -388,10 +406,31 @@ func (idx *CandidateIndex) BuildIndex(ctx context.Context) ([]*Candidate, error)
 		// its exact HEAD as evidence before coalescing. Previously this was
 		// consulted only when no callback/ledger SHA existed, allowing a stale
 		// callback to hide the current worktree candidate.
+		worktrees := make([]string, 0, 1+len(idx.opts.LaneWorktrees))
 		if idx.opts.WorktreesDir != "" && ref != "" {
-			wt := filepath.Join(idx.opts.WorktreesDir, strings.ToLower(hsync.NormalizeRef(ref)))
+			worktrees = append(worktrees, filepath.Join(idx.opts.WorktreesDir, strings.ToLower(hsync.NormalizeRef(ref))))
+		}
+		worktrees = append(worktrees, idx.opts.LaneWorktrees...)
+		seenWorktrees := make(map[string]bool, len(worktrees))
+		for _, wt := range worktrees {
+			wt = filepath.Clean(wt)
+			if seenWorktrees[wt] || wt == "" {
+				continue
+			}
+			seenWorktrees[wt] = true
 			if fi, err := os.Stat(wt); err == nil && fi.IsDir() {
-				worktreePath = wt
+				// A shared lane worktree is admitted only when its signed
+				// task context names this exact ref. Never treat a generic
+				// standing-lane HEAD as task evidence.
+				if !strings.EqualFold(filepath.Base(wt), strings.ToLower(hsync.NormalizeRef(ref))) {
+					tc, tcErr := dispatch.ReadTaskContext(wt)
+					if tcErr != nil || !strings.EqualFold(tc.TaskRef, ref) {
+						continue
+					}
+				}
+				if worktreePath == "" {
+					worktreePath = wt
+				}
 				if out, gerr := exec.Command("git", "-C", wt, "rev-parse", "HEAD").Output(); gerr == nil {
 					head := strings.TrimSpace(string(out))
 					if sha40Re.MatchString(head) {

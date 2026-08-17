@@ -147,6 +147,38 @@ func Missing(requested, replied []string) []string {
 	return missing
 }
 
+// ActiveRequestedLanes removes lanes that no longer exist in the target
+// workspace. Ephemeral forge workers are intentionally absent after they are
+// retired; keeping their names in the current census makes every later tick
+// report a permanent missing reply. If agent enumeration fails, callers keep
+// the original expectation and fail closed rather than treating an outage as
+// retirement.
+func ActiveRequestedLanes(requested []string, agents []herdr.AgentEntry, workspace string) []string {
+	active := make(map[string]bool, len(agents))
+	for _, agent := range agents {
+		if strings.TrimSpace(agent.Name) == "" || (workspace != "" && agent.Workspace != workspace) {
+			continue
+		}
+		active[agent.Name] = true
+	}
+	out := make([]string, 0, len(requested))
+	for _, lane := range requested {
+		if active[lane] {
+			out = append(out, lane)
+		}
+	}
+	return out
+}
+
+func hasActiveWorkspaceAgent(agents []herdr.AgentEntry, workspace string) bool {
+	for _, agent := range agents {
+		if strings.TrimSpace(agent.Name) != "" && (workspace == "" || agent.Workspace == workspace) {
+			return true
+		}
+	}
+	return false
+}
+
 // Due reports whether a new census should open.
 func Due(last time.Time, now time.Time, interval time.Duration) bool {
 	if last.IsZero() {
@@ -385,8 +417,19 @@ func Run(ctx context.Context, opts Options) error {
 
 	now := opts.Now()
 	if state.Epoch != "" {
+		replyLanes := state.Lanes
+		if agents, listErr := opts.ListAgents(); listErr == nil && hasActiveWorkspaceAgent(agents, workspace) {
+			replyLanes = ActiveRequestedLanes(state.Lanes, agents, workspace)
+			if len(replyLanes) != len(state.Lanes) {
+				fmt.Fprintf(opts.Stdout, "herd-feedback: retired lanes removed from census=%d\n", len(state.Lanes)-len(replyLanes))
+				state.Lanes = replyLanes
+				if saveErr := Save(opts.StateDir, state); saveErr != nil {
+					return saveErr
+				}
+			}
+		}
 		mailFile := filepath.Join(opts.MailDir, coordinator+".jsonl")
-		replied, missing, rerr := ReplyFromLanes(mailFile, state.Epoch, state.Lanes)
+		replied, missing, rerr := ReplyFromLanes(mailFile, state.Epoch, replyLanes)
 		if rerr != nil {
 			return fmt.Errorf("herd-feedback: reply census: %w", rerr)
 		}

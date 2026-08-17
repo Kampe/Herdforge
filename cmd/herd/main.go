@@ -1886,7 +1886,10 @@ func runReview() {
 
 	// FAC-144: RequireCurrentPassing before any reviewer tab is created.
 	// CheckCompletion is not sufficient authority for review spawn.
-	wt := worktreePathForRef(task.Ref)
+	wt := strings.TrimSpace(selectedCand.WorktreePath)
+	if wt == "" {
+		wt = worktreePathForRef(task.Ref)
+	}
 	if !worktreeExists(wt) {
 		// Fall back to configured reviewer lane worktree only for
 		// isolated standing reviewers — still require admission against
@@ -1927,9 +1930,9 @@ func runReview() {
 
 		// Exact task worktree — never the shared reviewer lane tree (incident:
 		// review-assayer-FAC-151 opened inside the FAC-172 worktree).
-		taskWT := filepath.Join(".herd", "worktrees", strings.ToLower(task.Ref))
+		taskWT := wt
 		if fi, statErr := os.Stat(taskWT); statErr != nil || !fi.IsDir() {
-			fmt.Fprintf(os.Stderr, "review launch rejected: exact task worktree %s is required\n", taskWT)
+			fmt.Fprintf(os.Stderr, "review launch rejected: candidate worktree %s is required\n", taskWT)
 			os.Exit(1)
 		}
 
@@ -1943,7 +1946,7 @@ func runReview() {
 		// happens in a FRESH isolated worktree checked out DETACHED at the
 		// exact candidate SHA, so review can neither mutate the candidate
 		// branch nor destroy the author's session context.
-		authorDir := filepath.Join(reviewRoot, ".herd", "worktrees", strings.ToLower(hsync.NormalizeRef(task.Ref)))
+		authorDir := wt
 		if fi, statErr := os.Stat(authorDir); statErr != nil || !fi.IsDir() {
 			fmt.Fprintf(os.Stderr, "review: no candidate worktree for %s at %s — refusing to review a generic lane HEAD (FAC-145)\n", task.Ref, authorDir)
 			os.Exit(1)

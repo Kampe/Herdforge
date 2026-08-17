@@ -33,6 +33,20 @@ func TestDefaultFleetStateDirHonorsExplicitOverride(t *testing.T) {
 	}
 }
 
+func TestActiveRequestedLanesDropsRetiredWorkers(t *testing.T) {
+	requested := []string{"coordinator", "forge-worker-cha-1633", "review-harvest-supervisor"}
+	agents := []herdr.AgentEntry{
+		{Name: "coordinator", Workspace: "wB"},
+		{Name: "review-harvest-supervisor", Workspace: "wB"},
+		{Name: "other-repo-worker", Workspace: "wC"},
+	}
+	got := ActiveRequestedLanes(requested, agents, "wB")
+	want := []string{"coordinator", "review-harvest-supervisor"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("active lanes=%v, want %v", got, want)
+	}
+}
+
 func TestMissingIsSetDifferenceAndDeterministic(t *testing.T) {
 	got := Missing([]string{"smith", "scout", "assayer"}, []string{"scout"})
 	want := []string{"assayer", "smith"}
