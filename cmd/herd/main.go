@@ -7046,6 +7046,20 @@ func runVerify() {
 			}
 		}
 	}
+	verificationProfileName := verificationProfile
+	preflightCommand := ""
+	configPath := filepath.Join(verifyRoot, ".herd", "herd.yaml")
+	if _, statErr := os.Stat(configPath); statErr == nil {
+		verifyConfig, loadErr := config.LoadConfig(configPath)
+		if loadErr != nil {
+			fmt.Fprintf(os.Stderr, "herd verify: load config: %v\n", loadErr)
+			os.Exit(2)
+		}
+		preflightCommand = strings.TrimSpace(verifyConfig.Verification.PreflightCommand)
+		if preflightCommand != "" {
+			verificationProfileName += "+preflight"
+		}
+	}
 	if tcErr == nil {
 		sha, shaErr := worktreeHeadSHA(wt)
 		if shaErr != nil {
@@ -7063,15 +7077,29 @@ func runVerify() {
 				fmt.Fprintf(os.Stderr, "herd verify: cannot open receipt store: %v\n", storeErr)
 				os.Exit(2)
 			}
-			var persistErr error
-			c, _, persistErr = verifier.NewVerifier("").CheckCompletionAndPersist(context.Background(), wt, *buildCmd, *testCmd, verifier.VerificationRequest{
+			req := verifier.VerificationRequest{
 				TaskRef: tc.TaskRef, LeaseGeneration: fmt.Sprintf("%d", tc.LeaseGeneration),
 				CandidateSHA: sha, BaseSHA: baseSHA, EnvironmentPolicy: verifier.EnvironmentPolicyInherited,
-				Artifacts: []string{"profile:" + verificationProfile},
-			}, store)
+				Artifacts: []string{"profile:" + verificationProfileName},
+			}
+			preflightPassed := true
+			if preflightCommand != "" {
+				preReceipt, preErr := verifier.NewVerifier(preflightCommand).VerifyAndPersist(context.Background(), wt, req, store)
+				if preErr != nil {
+					fmt.Fprintf(os.Stderr, "herd verify: persist preflight receipt: %v\n", preErr)
+					os.Exit(2)
+				}
+				preflightPassed = preReceipt.Outcome == verifier.OutcomePASS
+			}
+			var persistErr error
+			c, _, persistErr = verifier.NewVerifier("").CheckCompletionAndPersist(context.Background(), wt, *buildCmd, *testCmd, req, store)
 			if persistErr != nil {
 				fmt.Fprintf(os.Stderr, "herd verify: persist verification receipts: %v\n", persistErr)
 				os.Exit(2)
+			}
+			if !preflightPassed {
+				c.Passed = false
+				c.Reasons = append(c.Reasons, "preflight failed ("+preflightCommand+") — fix preflight findings before this can complete")
 			}
 		}
 	} else {
