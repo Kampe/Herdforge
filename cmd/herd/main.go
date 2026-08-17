@@ -3489,9 +3489,7 @@ func runCleanup() {
 
 	standing := map[string]bool{}
 	if cfg, err := config.LoadConfig(".herd/herd.yaml"); err == nil {
-		for _, lane := range cfg.Lanes {
-			standing["forge-"+lane.Name] = true
-		}
+		standing = configuredStandingAgentNames(cfg)
 	}
 
 	res, err := herdr.CleanupFenced(standing, *dryRun)
@@ -3537,6 +3535,26 @@ func runCleanup() {
 	if err != nil {
 		os.Exit(1)
 	}
+}
+
+// configuredStandingAgentNames accepts both naming forms used by Herdr
+// versions and repository rosters. Older Chainseer sessions expose the bare
+// configured lane name; newer Herdforge sessions prefix it with forge-. A
+// cleanup policy that protects only one form can reap a standing lane.
+func configuredStandingAgentNames(cfg *config.Config) map[string]bool {
+	out := map[string]bool{}
+	if cfg == nil {
+		return out
+	}
+	for _, lane := range cfg.Lanes {
+		name := strings.TrimSpace(lane.Name)
+		if name == "" {
+			continue
+		}
+		out[name] = true
+		out[standing.AgentName(name)] = true
+	}
+	return out
 }
 
 // runLabels ports the FAC-199 acceptance criterion "live readback shows no
@@ -4868,10 +4886,7 @@ func runForgeE() error {
 	// finished. Standing lanes and lanes with unconsumed repair evidence stay
 	// resident; cleanup failure is visible rather than silently leaking panes.
 	if cfg != nil && herdr.IsAvailable() {
-		standingAgents := map[string]bool{}
-		for _, lane := range cfg.Lanes {
-			standingAgents[standing.AgentName(lane.Name)] = true
-		}
+		standingAgents := configuredStandingAgentNames(cfg)
 		if cleaned, cleanupErr := herdr.CleanupFenced(standingAgents, false); cleanupErr != nil {
 			fmt.Fprintf(os.Stderr, "forge cleanup: %v\n", cleanupErr)
 			forgeFailed = true
