@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"sort"
 	"strings"
 	"sync"
@@ -113,6 +114,13 @@ func (k *KaneoProvider) preferHTTPForRelations() bool {
 // otherwise fall through to N CLI subprocesses (use_cli without API key).
 var ErrGraphCredentialsRequired = errors.New("kaneo: project graph snapshot requires HTTP credentials (KANEO_API_KEY or kaneo profile api_key); refusing silent CLI relation fan-out")
 
+// EnvKaneoRelationsCLI is an explicit local-development escape hatch for
+// boards whose HTTP relation endpoint is unavailable while the authenticated
+// Kaneo CLI remains healthy. It is intentionally opt-in: production keeps the
+// origin-bound HTTP graph path and still fails closed when credentials are not
+// available.
+const EnvKaneoRelationsCLI = "HERD_KANEO_RELATIONS_CLI"
+
 const (
 	KaneoGraphDeadlineThreshold = 64
 	KaneoGraphMinDeadline       = 2 * time.Minute
@@ -171,7 +179,9 @@ func (k *KaneoProvider) ListProjectRelations(ctx context.Context, projectID stri
 		return nil, fmt.Errorf("kaneo ListProjectRelations: project id required")
 	}
 	// Credential preflight BEFORE any ListTasks / fan-out work.
-	if !k.preferHTTPForRelations() {
+	useHTTP := k.preferHTTPForRelations()
+	useCLI := k.UseCLI && strings.TrimSpace(os.Getenv(EnvKaneoRelationsCLI)) == "1"
+	if !useHTTP && !useCLI {
 		return nil, fmt.Errorf("%w (use_cli=%v api_url=%q)", ErrGraphCredentialsRequired, k.UseCLI, k.APIURL)
 	}
 	dls := k.deadlines()
@@ -250,7 +260,13 @@ func (k *KaneoProvider) ListProjectRelations(ctx context.Context, projectID stri
 					if !ok {
 						return
 					}
-					rels, e := k.listRelationsHTTPOnly(batchCtx, id)
+					var rels []Relation
+					var e error
+					if useCLI {
+						rels, e = k.ListRelations(batchCtx, id)
+					} else {
+						rels, e = k.listRelationsHTTPOnly(batchCtx, id)
+					}
 					if e != nil {
 						outCh <- result{taskID: id, err: AsTimeout("kaneo", "ListProjectRelations", OpList, graphDeadline, e)}
 						batchCancel()

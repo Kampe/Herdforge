@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -68,6 +69,38 @@ func TestKaneoListProjectRelations_NoCredentials_RefusesCLIFanout(t *testing.T) 
 	}
 	if elapsed > 200*time.Millisecond {
 		t.Fatalf("fail-closed must be immediate, took %v", elapsed)
+	}
+}
+
+func TestKaneoListProjectRelations_ExplicitCLIMode(t *testing.T) {
+	t.Setenv(EnvKaneoRelationsCLI, "1")
+	t.Setenv("KANEO_API_KEY", "")
+	withUserConfigDir(t, t.TempDir())
+	var relCalls, listCalls atomic.Int64
+	old := kaneoRunCLI
+	kaneoRunCLI = func(_ context.Context, _ string, args ...string) (*CLIResult, error) {
+		if len(args) >= 2 && args[0] == "task" && args[1] == "list" {
+			if listCalls.Add(1) > 1 {
+				return &CLIResult{Stdout: []byte(`[]`)}, nil
+			}
+			return &CLIResult{Stdout: []byte(`[{"id":"task-1","ref":"CHA-1","status":"to-do","title":"t","projectId":"project"}]`)}, nil
+		}
+		if len(args) >= 3 && args[0] == "task" && args[1] == "rel" {
+			relCalls.Add(1)
+			return &CLIResult{Stdout: []byte(`[]`)}, nil
+		}
+		return &CLIResult{Stdout: []byte(`[]`)}, nil
+	}
+	t.Cleanup(func() { kaneoRunCLI = old })
+	k := NewKaneoProvider("https://kanban.example", "project", true)
+	if !k.UseCLI || os.Getenv(EnvKaneoRelationsCLI) != "1" {
+		t.Fatal("explicit CLI relation mode was not enabled")
+	}
+	if _, err := k.ListProjectRelations(context.Background(), "project"); err != nil {
+		t.Fatalf("explicit CLI relation mode: %v", err)
+	}
+	if relCalls.Load() != 1 {
+		t.Fatalf("want one CLI relation read, got %d", relCalls.Load())
 	}
 }
 
