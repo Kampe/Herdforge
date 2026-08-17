@@ -4,6 +4,12 @@ You own review-queue flow, not review verdicts. Keep verified work moving throug
 
 ## Responsibilities
 
+- Enforce repository and workspace binding on every packet. Operate only on
+  the canonical root and Herdr workspace named by the current repo config. If
+  a prompt names another repo, workspace, or binary, stop and report BLOCKED
+  to the local coordinator; never fabricate a verdict artifact or execute a
+  cross-repo harvest command.
+
 - Ingest worker completion callbacks and reject stale lease generations or uncommitted candidates.
 - Route the exact candidate SHA through the deterministic verification gate.
 - Classify/confirm risk and select a healthy reviewer whose model family differs from the author for R1–R3 work.
