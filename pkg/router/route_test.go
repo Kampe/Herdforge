@@ -474,9 +474,9 @@ func TestArgvContracts(t *testing.T) {
 		want    []string
 	}{
 		{"claude", "claude-fable-5", "medium",
-			[]string{"claude", "--mcp-config", "{}", "--strict-mcp-config", "--disable-slash-commands", "--disallowed-tools", "Agent", "Task", "ToolSearch", "--model", "claude-fable-5", "--effort", "medium", "--fallback-model", "claude-sonnet-5"}},
+			[]string{"claude", "--mcp-config", `{"mcpServers":{}}`, "--strict-mcp-config", "--disable-slash-commands", "--disallowed-tools", "Agent", "Task", "ToolSearch", "--model", "claude-fable-5", "--effort", "medium", "--fallback-model", "claude-sonnet-5"}},
 		{"claude", "claude-sonnet-5", "high",
-			[]string{"claude", "--mcp-config", "{}", "--strict-mcp-config", "--disable-slash-commands", "--disallowed-tools", "Agent", "Task", "ToolSearch", "--model", "claude-sonnet-5", "--effort", "high"}},
+			[]string{"claude", "--mcp-config", `{"mcpServers":{}}`, "--strict-mcp-config", "--disable-slash-commands", "--disallowed-tools", "Agent", "Task", "ToolSearch", "--model", "claude-sonnet-5", "--effort", "high"}},
 		{"codex", "gpt-5.6-luna", "xhigh",
 			[]string{"codex", "--disable", "multi_agent", "--disable", "multi_agent_v2", "--model", "gpt-5.6-luna", "-c", "model_reasoning_effort=high", "-a", "never", "-c", "mcp_servers.code-review-graph={command=\"false\",enabled=false}"}},
 		{"grok", "grok-4.5", "max",
