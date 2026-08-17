@@ -167,6 +167,43 @@ func TestBindingForWorktree_PrefersWorkerContextOverNewerReviewerReceipt(t *test
 	}
 }
 
+func TestUseHarnessHooksFromWorktreeUsesCandidatePolicyByDefault(t *testing.T) {
+	wt := t.TempDir()
+	hooks := filepath.Join(wt, ".herd", "harness-hooks.json")
+	if err := os.MkdirAll(filepath.Dir(hooks), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(hooks, []byte(`{"providers":{}}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HERD_HARNESS_HOOKS_FILE", "")
+	restore := useHarnessHooksFromWorktree(wt)
+	if got := os.Getenv("HERD_HARNESS_HOOKS_FILE"); got != hooks {
+		t.Fatalf("hook policy path = %q, want %q", got, hooks)
+	}
+	restore()
+	if got := os.Getenv("HERD_HARNESS_HOOKS_FILE"); got != "" {
+		t.Fatalf("hook policy override not restored: %q", got)
+	}
+}
+
+func TestUseHarnessHooksFromWorktreePreservesExplicitOverride(t *testing.T) {
+	wt := t.TempDir()
+	hooks := filepath.Join(wt, ".herd", "harness-hooks.json")
+	if err := os.MkdirAll(filepath.Dir(hooks), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(hooks, []byte(`{"providers":{}}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HERD_HARNESS_HOOKS_FILE", "explicit-policy.json")
+	restore := useHarnessHooksFromWorktree(wt)
+	if got := os.Getenv("HERD_HARNESS_HOOKS_FILE"); got != "explicit-policy.json" {
+		t.Fatalf("explicit hook policy path changed: %q", got)
+	}
+	restore()
+}
+
 func TestRecordForgeLifecycle_ProjectsClaimThroughBuilding(t *testing.T) {
 	root := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(root, ".herd"), 0755); err != nil {
