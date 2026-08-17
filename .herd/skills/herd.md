@@ -5,7 +5,9 @@ description: Operate and inspect the Herdforge repository-local multi-agent cont
 
 # Herdforge Agent Skill Guide
 
-Use `herd` for repository workflow policy and Herdr for agent-session mechanics. The target lifecycle is documented in `docs/architecture/TARGET-WORKFLOW.md`; current commands are still being integrated and should be operated with explicit evidence checks.
+Use `herd` for repository workflow policy and Herdr for agent-session mechanics.
+The commands below are the live contract; keep evidence checks around every
+mutation.
 
 ## Start safely
 
@@ -14,6 +16,7 @@ herd --help
 herd validate-config
 herd preflight
 herd status
+herd forge --loop
 ```
 
 For Herdforge development, the hermetic repository gate is:
@@ -44,11 +47,42 @@ Use `herd <command> --help` at the checked-out revision before a mutation. Commo
 ```bash
 herd pulse --role worker --spawn
 herd dispatch FAC-123
-herd review --spawn
+herd review FAC-123
+herd review-ingest <verdict-file>
+herd harvest-merge FAC-123
+herd approve FAC-123
 herd board-done FAC-123
 ```
 
-Do not treat a successful claim as successful dispatch, an `in-progress` card as worker completion, or an `in-review` card as a valid verdict. The target gates require an active lease, cwd-bound task worktree, consumed delivery receipt, committed candidate SHA, deterministic verification, different-family review, serialized integration, `origin/main` proof, and provider readback.
+Do not treat a successful claim as successful dispatch, an `in-progress` card as
+worker completion, or an `in-review` card as a valid verdict. The gates require
+an active lease, cwd-bound task worktree, consumed delivery receipt, committed
+candidate SHA, deterministic verification, different-family review, serialized
+integration, `origin/main` proof, and provider readback.
+
+The standing review-harvest supervisor owns review admission, reviewer launch,
+bounded retries, verdict ingest, author feedback, and ephemeral reviewer-tab
+cleanup. It sends only merge-ready PASS handoffs to the coordinator. The
+coordinator merges, approves, and generation-fenced-cleans implementation
+panes and one-off worktrees; standing lanes remain open. Feedback census never
+blocks review dispatch.
+
+Review state is durable per exact SHA: admitted, launched, verdict-retained,
+author-notified, harvest-ready, cleanup-candidate, and closed. Pulse reports
+the refs behind pending and needs-review counts. Refutation and supersession
+must be explicit ledger events; chronology alone never replaces a FAIL.
+
+Use Herdr directly for lifecycle and delivery (`herdr agent list/read/prompt`,
+`herdr tab close`). Do not route Herdforge work through repository `bin/herd-*`
+shell scripts. Harness selection is router-driven across Codex, Claude, Grok,
+AGY, and OpenCode; Pi is neither required nor a default.
+
+Run `herd quota-supervisor --read-only` and `herd pulse --json` during a wave.
+The quota supervisor reads bounded recent pane output so a lane marked
+`working` but stalled on provider quota is rerouted with durable evidence.
+The writable quota supervisor records `.herd/quota-wake.json` for the next
+Claude five-hour reset. Treat its stable key as an idempotent scheduler job,
+and re-read quota before sending work after the wake.
 
 ## Agent invariants
 

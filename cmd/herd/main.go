@@ -1788,11 +1788,46 @@ func runReview() {
 
 	ctx := context.Background()
 
-	// Find tasks in "in-progress" status
-	tasks, err := tp.ListTasks(ctx, cfg.TaskProvider.ProjectID, "in-progress")
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "failed to list in-progress tasks: %v\n", err)
-		os.Exit(1)
+	// A targeted review may be reported as NEEDS_REVIEW before the board
+	// provider has moved the card to in-progress. Resolve that exact ref first
+	// so review admission is driven by the candidate SHA and canonical receipt,
+	// not by a lossy board-status precondition. The un-targeted queue remains
+	// limited to in-progress work to avoid scanning every board card.
+	var tasks []*provider.Task
+	if refArg != "" {
+		task, getErr := tp.GetTask(ctx, refArg)
+		if getErr != nil {
+			// Some providers expose an eventually-consistent GetTask endpoint
+			// while their list endpoint already contains the card. Fall back to
+			// that list, and finally admit the exact ref with a minimal task
+			// envelope so candidate SHA/receipt evidence remains authoritative.
+			listed, listErr := tp.ListTasks(ctx, cfg.TaskProvider.ProjectID, "in-progress")
+			if listErr != nil {
+				task = &provider.Task{Ref: refArg, Status: "in-progress"}
+			} else {
+				for _, candidate := range listed {
+					if strings.EqualFold(hsync.NormalizeRef(candidate.Ref), hsync.NormalizeRef(refArg)) {
+						task = candidate
+						break
+					}
+				}
+				if task == nil {
+					task = &provider.Task{Ref: refArg, Status: "in-progress"}
+				}
+			}
+		}
+		if !reviewEligibleTaskStatus(task.Status) {
+			fmt.Fprintf(os.Stderr, "review: task %s has terminal/non-reviewable status %q\n", task.Ref, task.Status)
+			os.Exit(1)
+		}
+		tasks = []*provider.Task{task}
+	} else {
+		// Find tasks in "in-progress" status for the queue form.
+		tasks, err = tp.ListTasks(ctx, cfg.TaskProvider.ProjectID, "in-progress")
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "failed to list in-progress tasks: %v\n", err)
+			os.Exit(1)
+		}
 	}
 
 	reviewRoot, rootErr := canonicalHerdRoot()
@@ -2127,13 +2162,15 @@ func runReview() {
 		// text can never carry verdict authority.
 		testCmd := scopedTestCommand(worktreeDir)
 		reviewPacket := fmt.Sprintf(`REVIEW %s — verdict ONLY, edit nothing.
-cd %s
+REPORT_TARGET: review-harvest-supervisor (mandatory; never coordinator)
+REPORT_CONTRACT: retain the signed verdict artifact in the Herdforge review inbox before pane teardown. The supervisor owns exact-SHA admission, reviewer retries, author feedback, ledger ingest, and cleanup. The coordinator receives only exact PASS plus merge-ready evidence.
+	cd %s
 1. git diff origin/main..HEAD --stat  (see ONLY the changed files — review just these)
 2. %s   (targeted tests for the changed packages, not the whole repo)
 File your verdict through the broker (typed, receipt-bound):
   herd task verdict %s APPROVED
   herd task verdict %s REJECTED "<numbered fixes>"
-Do not read the whole codebase. Do not run the full suite. Change nothing.`,
+	Do not read the whole codebase. Do not run the full suite. Change nothing. Do not use repository bin/herd-* orchestration scripts.`,
 			task.Ref, worktreeDir, testCmd, task.Ref, task.Ref)
 
 		// An undelivered review packet is a BLOCKED review, not a warning.
@@ -2150,6 +2187,20 @@ Do not read the whole codebase. Do not run the full suite. Change nothing.`,
 		os.Exit(1)
 	}
 	fmt.Printf("  -> moved card [%s] to 'in-review' status\n", task.Ref)
+}
+
+// reviewEligibleTaskStatus permits explicit NEEDS_REVIEW/ready cards while
+// keeping terminal cards fail-closed. Providers normalize unknown custom
+// statuses with an "unknown:" prefix, so do not mistake that evidence for a
+// terminal state; the exact candidate receipt remains the real admission gate.
+func reviewEligibleTaskStatus(status string) bool {
+	s := strings.ToLower(strings.TrimSpace(strings.ReplaceAll(status, "_", "-")))
+	switch s {
+	case "done", "closed", "complete", "completed", "merged", "resolved", "archived", "planned", "planning":
+		return false
+	default:
+		return s != ""
+	}
 }
 
 // parseApproveArgs parses `herd approve [<ref>] [--receipt <path>] [--override-* ...]`.

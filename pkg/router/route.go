@@ -299,12 +299,28 @@ func AgyGeminiPoolFallback(shape string) string {
 
 const PiHarness = "pi"
 
-// IsVendorHarness reports whether a harness is a directly supported fleet
-// surface. Pi remains available for legacy router decisions, but lane-bound
-// launches use this closed set.
+// IsVendorHarness reports whether a harness is a directly supported Herdr
+// fleet surface. This is the launch-admission table: Herdr spawn validation,
+// confinement, and router decisions must agree or a route can be READY while
+// launch fails (Kimi is intentionally headless-only until Herdr advertises
+// that kind). Pi remains available only for legacy router decisions.
 func IsVendorHarness(harness string) bool {
 	switch strings.ToLower(strings.TrimSpace(harness)) {
 	case "codex", "claude", "grok", "agy", "opencode":
+		return true
+	default:
+		return false
+	}
+}
+
+// IsLaneLaunchable reports whether Herdr can create the harness kind for a
+// standing/task lane. Headless-only surfaces such as Kimi remain available to
+// `herd shot`, but must not be admitted into a Herdr lane until the Herdr
+// server advertises that kind. Keeping this predicate beside IsVendorHarness
+// prevents router READY state from outrunning launch capability.
+func IsLaneLaunchable(provider string) bool {
+	switch strings.ToLower(strings.TrimSpace(provider)) {
+	case "codex", "claude", "grok", "agy", "opencode", "ollama", "lazer":
 		return true
 	default:
 		return false

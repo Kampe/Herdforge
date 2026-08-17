@@ -10,6 +10,11 @@ Your evidence goes here, below the `---`.
 
 Delivery: send this verdict and its findings to the standing review supervisor. The coordinator receives only the supervisor's merge-ready PASS handoff.
 
+Use the Herdforge/Herdr delivery path (`herdr agent prompt` or
+`herd herdr-deliver --file`). Do not send verdicts through repository
+`bin/herd-*` scripts or directly to the coordinator. The supervisor owns the
+exact-SHA ledger row, retry loop, author feedback, and reviewer-tab cleanup.
+
 # The seven keys above are the COMPLETE accepted set
 
 `herd review-ingest` refuses an artifact carrying any other key. That is
