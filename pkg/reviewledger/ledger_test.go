@@ -158,6 +158,84 @@ func TestEnsureRecordIsIdempotent(t *testing.T) {
 	}
 }
 
+func TestIngestEnsuresExactAdmissionBeforePassAndIsIdempotent(t *testing.T) {
+	l := newTestLedger(t)
+	const sha = "0123456789012345678901234567890123456789"
+	opts := IngestOpts{
+		Record: RecordOpts{
+			SHA: sha, Branch: "herd/fac-372", BuilderFamily: "anthropic",
+			ReviewerFamily: "openai", Reviewer: "reviewer-foreign",
+			Artifact: ".herd/review/inbox/verdict.md", Gate: "independent",
+		},
+		Verdict: VerdictOpts{
+			SHA: sha, Reviewer: "reviewer-foreign", Verdict: VerdictPASS,
+			ReviewerFamily: "openai", BuilderFamily: "anthropic",
+			Artifact: ".herd/review/inbox/verdict.md", Branch: "herd/fac-372",
+		},
+	}
+	for attempt := 0; attempt < 2; attempt++ {
+		enqueued, err := l.Ingest(opts)
+		if err != nil {
+			t.Fatalf("ingest attempt %d: %v", attempt+1, err)
+		}
+		if !enqueued {
+			t.Fatalf("ingest attempt %d did not report PASS queued", attempt+1)
+		}
+	}
+	rows, err := l.AllRows()
+	if err != nil {
+		t.Fatal(err)
+	}
+	records, verdicts := 0, 0
+	for _, row := range rows {
+		if row.SHA != sha || row.Reviewer != opts.Verdict.Reviewer {
+			continue
+		}
+		switch row.Event {
+		case string(EventRecord):
+			records++
+		case string(EventVerdict):
+			verdicts++
+		}
+	}
+	if records != 1 || verdicts != 1 {
+		t.Fatalf("exact admission/verdict rows = %d/%d, want 1/1; rows=%+v", records, verdicts, rows)
+	}
+}
+
+func TestIngestRefusesPassWithoutAuthenticatedExactProvenance(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*IngestOpts)
+	}{
+		{"sha mismatch", func(o *IngestOpts) { o.Verdict.SHA = "ffffffffffffffffffffffffffffffffffffffff" }},
+		{"reviewer mismatch", func(o *IngestOpts) { o.Verdict.Reviewer = "other-reviewer" }},
+		{"missing branch", func(o *IngestOpts) { o.Record.Branch = "" }},
+		{"missing artifact", func(o *IngestOpts) { o.Record.Artifact = "" }},
+		{"artifact mismatch", func(o *IngestOpts) { o.Verdict.Artifact = ".herd/review/inbox/other.md" }},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			l := newTestLedger(t)
+			opts := IngestOpts{
+				Record:  RecordOpts{SHA: "0123456789012345678901234567890123456789", Branch: "herd/fac-372", BuilderFamily: "anthropic", ReviewerFamily: "openai", Reviewer: "reviewer-foreign", Artifact: ".herd/review/inbox/verdict.md", Gate: "independent"},
+				Verdict: VerdictOpts{SHA: "0123456789012345678901234567890123456789", Reviewer: "reviewer-foreign", Verdict: VerdictPASS, ReviewerFamily: "openai", BuilderFamily: "anthropic", Artifact: ".herd/review/inbox/verdict.md"},
+			}
+			tc.mutate(&opts)
+			if _, err := l.Ingest(opts); err == nil {
+				t.Fatal("invalid provenance admitted")
+			}
+			rows, err := l.AllRows()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(rows) != 0 {
+				t.Fatalf("invalid provenance wrote ledger rows: %+v", rows)
+			}
+		})
+	}
+}
+
 func TestVerdict(t *testing.T) {
 	t.Run("PASS enqueues and queue row is written", func(t *testing.T) {
 		l := newTestLedger(t)
