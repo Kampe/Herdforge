@@ -1925,6 +1925,7 @@ func startBroker(t *testing.T, binary, dir, keyDir, sock string) {
 // fake, for the paths where the broker itself queries the live fleet.
 func startBrokerWithFake(t *testing.T, binary, dir, keyDir, fakeBin, fakeLog, sock string) {
 	t.Helper()
+	provisionFence(t, binary, dir, keyDir)
 	startBrokerCmd(t, herdCmdWithFake(binary, dir, keyDir, fakeBin, fakeLog, "broker", "--socket", sock), sock)
 }
 
