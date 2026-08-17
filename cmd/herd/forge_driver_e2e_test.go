@@ -557,6 +557,10 @@ func TestFactoryE2E_CoordinatorFenceBlocksSecondLoop(t *testing.T) {
 	binary := buildHerd(t)
 	env := append(os.Environ(),
 		"HERD_WINDDOWN_STATE="+filepath.Join(root, ".herd", "winddown.json"),
+		// The coordinator route is deliberately forced to a candidate in the
+		// coordinator waterfall. This exercises production route validation
+		// without depending on provider CLIs or host health in CI.
+		"HERD_AVAILABLE_PROVIDERS=codex",
 		"PATH="+os.Getenv("PATH"),
 	)
 	run := func() (string, error) {
