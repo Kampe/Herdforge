@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Kampe/Herdforge/pkg/budget"
 	"github.com/Kampe/Herdforge/pkg/provider"
 	hsync "github.com/Kampe/Herdforge/pkg/sync"
 )
@@ -85,7 +86,25 @@ type ForgeLoopOptions struct {
 	// ApproveRetryRefs is an explicit operator request to clear suppression for
 	// a ref and try approval once more.
 	ApproveRetryRefs map[string]bool
+
+	// Budget stops the loop at a tick boundary once its spend is exhausted.
+	// A nil manager preserves the existing unbounded behaviour.
+	Budget *budget.BudgetManager
+
+	// Blockers reports currently unresolvable blockers as ref -> stable code.
+	// A blocker must be present with the same code for BlockerThreshold
+	// consecutive ticks before the loop stops. A nil callback or non-positive
+	// threshold preserves the existing behaviour.
+	Blockers         func(context.Context) (map[string]string, error)
+	BlockerThreshold int
 }
+
+// ErrBudgetExhausted identifies a bounded forge stop caused by spend policy.
+var ErrBudgetExhausted = errors.New("forge: budget exhausted")
+
+// ErrRepeatedBlocker identifies a bounded forge stop caused by a blocker that
+// has remained unchanged for the configured number of ticks.
+var ErrRepeatedBlocker = errors.New("forge: repeated blocker")
 
 // ForgeLoop runs the async orchestration cycle: each tick it reads lane state
 // and completion signals, asks ForgeStep for the next action, and executes it
@@ -123,6 +142,7 @@ func (e *Engine) ForgeLoop(ctx context.Context, d ForgeDriver, opts ForgeLoopOpt
 	// still-outstanding rejection exactly once, which is recovery, not spam;
 	// make it durable only if restarts become frequent enough to notice.
 	routed := map[string]string{}
+	blockerRuns := map[string]int{}
 	fail := func(key, reason string) {
 		failures[key] = reason
 		d.Log("forge: " + reason)
@@ -147,6 +167,39 @@ func (e *Engine) ForgeLoop(ctx context.Context, d ForgeDriver, opts ForgeLoopOpt
 	observe()
 
 	for tick := 0; opts.MaxTicks == 0 || tick < opts.MaxTicks; tick++ {
+		if opts.Budget != nil && opts.Budget.IsExhausted() {
+			d.Log("forge: budget exhausted — stopping between ticks")
+			return ErrBudgetExhausted
+		}
+		if opts.Blockers != nil && opts.BlockerThreshold > 0 {
+			blockers, blockerErr := opts.Blockers(ctx)
+			if blockerErr != nil {
+				return fmt.Errorf("forge: blocker state unavailable: %w", blockerErr)
+			}
+			current := make(map[string]bool, len(blockers))
+			keys := make([]string, 0, len(blockers))
+			for ref, code := range blockers {
+				key := ref + "\x00" + code
+				current[key] = true
+				blockerRuns[key]++
+				keys = append(keys, key)
+			}
+			for key := range blockerRuns {
+				if !current[key] {
+					delete(blockerRuns, key)
+				}
+			}
+			sort.Strings(keys)
+			for _, key := range keys {
+				if blockerRuns[key] < opts.BlockerThreshold {
+					continue
+				}
+				parts := strings.SplitN(key, "\x00", 2)
+				reason := fmt.Sprintf("%s (%s)", parts[0], parts[1])
+				d.Log("forge: repeated blocker " + reason + " — stopping between ticks")
+				return fmt.Errorf("%w: %s", ErrRepeatedBlocker, reason)
+			}
+		}
 		select {
 		case <-ctx.Done():
 			if err := unresolvedFailures(failures); err != nil {
@@ -353,6 +406,10 @@ func (e *Engine) ForgeLoop(ctx context.Context, d ForgeDriver, opts ForgeLoopOpt
 			}
 		}
 		sleep(ctx, interval)
+		if opts.Budget != nil && opts.Budget.IsExhausted() {
+			d.Log("forge: budget exhausted — stopping between ticks")
+			return ErrBudgetExhausted
+		}
 	}
 	return unresolvedFailures(failures)
 }
