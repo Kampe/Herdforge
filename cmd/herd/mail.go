@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -40,12 +41,41 @@ func runMailSend(args []string) {
 	recipient := fs.String("to", "", "message recipient")
 	subject := fs.String("subject", "", "optional message subject")
 	body := fs.String("body", "", "message body")
+	bodyFile := fs.String("file", "", "read message body bytes from a file; use - for stdin")
 	mailPath := fs.String("mail", "", "mailbox path override")
 	if err := fs.Parse(args); err != nil {
 		os.Exit(2)
 	}
-	if strings.TrimSpace(*sender) == "" || strings.TrimSpace(*recipient) == "" || strings.TrimSpace(*body) == "" {
-		fmt.Fprintln(os.Stderr, "mail send: --from, --to, and --body are required")
+	if strings.TrimSpace(*sender) == "" || strings.TrimSpace(*recipient) == "" {
+		fmt.Fprintln(os.Stderr, "mail send: --from and --to are required")
+		os.Exit(2)
+	}
+	if *body != "" && *bodyFile != "" {
+		fmt.Fprintln(os.Stderr, "mail send: use only one of --body, --file, or stdin")
+		os.Exit(2)
+	}
+	payload := []byte(*body)
+	if *bodyFile != "" {
+		var err error
+		if *bodyFile == "-" {
+			payload, err = io.ReadAll(os.Stdin)
+		} else {
+			payload, err = os.ReadFile(*bodyFile)
+		}
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "mail send: read body: %v\n", err)
+			os.Exit(1)
+		}
+	} else if *body == "" {
+		var err error
+		payload, err = io.ReadAll(os.Stdin)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "mail send: read stdin: %v\n", err)
+			os.Exit(1)
+		}
+	}
+	if len(payload) == 0 {
+		fmt.Fprintln(os.Stderr, "mail send: a non-empty body is required via --body, --file, or stdin")
 		os.Exit(2)
 	}
 	path, err := controlMailPath(*mailPath)
@@ -57,7 +87,7 @@ func runMailSend(args []string) {
 		fmt.Fprintf(os.Stderr, "mail send: %v\n", err)
 		os.Exit(1)
 	}
-	env, err := mail.NewMailbox(path).SendMessage(strings.TrimSpace(*sender), strings.TrimSpace(*recipient), *subject, *body)
+	env, err := mail.NewMailbox(path).SendMessage(strings.TrimSpace(*sender), strings.TrimSpace(*recipient), *subject, string(payload))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "mail send: %v\n", err)
 		os.Exit(1)

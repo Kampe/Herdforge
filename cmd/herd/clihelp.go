@@ -171,12 +171,13 @@ Commands:
 	"resources":    "Usage: herd resources [flags]\n  Resource inventory.",
 	"lock":         "Usage: herd lock <acquire|release|status|with> [flags]\n  Shared-checkout dir lock.",
 	"mail": `Usage:
-  herd mail send --from NAME --to RECIPIENT --body TEXT [--subject TEXT] [--mail path]
+  herd mail send --from NAME --to RECIPIENT (--body TEXT | --file path | stdin) [--subject TEXT] [--mail path]
   herd mail inbox --recipient NAME [--mail path]
   herd mail read --recipient NAME [--mail path]
   herd mail control <issue|drain> [flags]
 
 Ordinary durable messages use the local mailbox and are not authenticated control.
+The body may be supplied byte-for-byte with --file, --file -, or stdin; do not combine payload sources.
 Privileged authenticated control callbacks/envelopes are available only through
 herd mail control, which delegates to the existing herd control issue/drain
 validation, generation fences, deduplication, and delivery path.`,

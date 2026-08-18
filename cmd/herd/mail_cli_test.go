@@ -1,8 +1,10 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -97,6 +99,71 @@ func TestMailCLISendsAndReadsDurableMessage(t *testing.T) {
 	if len(inbox) != 1 || inbox[0].Recipient != "worker-a" || inbox[0].Body != "ready" {
 		t.Fatalf("unexpected inbox: %+v", inbox)
 	}
+}
+
+func TestMailCLISendPreservesPayloadSourcesByteForByte(t *testing.T) {
+	const body = "literal `identifier` and $(printf truncated)\nsecond line"
+
+	tests := []struct {
+		name  string
+		args  func(mailFile, payloadFile string) []string
+		stdin bool
+	}{
+		{
+			name: "file",
+			args: func(mailFile, payloadFile string) []string {
+				return []string{"mail", "send", "--from", "coordinator", "--to", "worker-file", "--file", payloadFile, "--mail", mailFile}
+			},
+		},
+		{
+			name: "stdin",
+			args: func(mailFile, _ string) []string {
+				return []string{"mail", "send", "--from", "coordinator", "--to", "worker-stdin", "--mail", mailFile}
+			},
+			stdin: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := sandbox(t)
+			mailFile := filepath.Join(dir, ".herd", "mail.jsonl")
+			payloadFile := filepath.Join(dir, "payload.txt")
+			if err := os.WriteFile(payloadFile, []byte(body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			var stdin []byte
+			if tt.stdin {
+				stdin = []byte(body)
+			}
+			if out, err := runHerdWithStdin(t, dir, stdin, tt.args(mailFile, payloadFile)...); err != nil {
+				t.Fatalf("herd mail send: %v\n%s", err, out)
+			}
+
+			out, err := runHerd(t, dir, nil, "mail", "inbox", "--recipient", map[bool]string{true: "worker-stdin", false: "worker-file"}[tt.stdin], "--mail", mailFile)
+			if err != nil {
+				t.Fatalf("herd mail inbox: %v\n%s", err, out)
+			}
+			var inbox []struct {
+				Body string `json:"body"`
+			}
+			if err := json.Unmarshal(out, &inbox); err != nil {
+				t.Fatalf("decode inbox output: %v\n%s", err, out)
+			}
+			if len(inbox) != 1 || inbox[0].Body != body {
+				t.Fatalf("payload was not delivered byte-for-byte: %+v", inbox)
+			}
+		})
+	}
+}
+
+func runHerdWithStdin(t *testing.T, dir string, stdin []byte, args ...string) ([]byte, error) {
+	t.Helper()
+	cmd := exec.Command(buildHerd(t), args...)
+	cmd.Dir = dir
+	cmd.Env = os.Environ()
+	cmd.Stdin = bytes.NewReader(stdin)
+	return cmd.CombinedOutput()
 }
 
 func TestMailCLIRejectsInvalidRecipientAndMalformedControlEnvelope(t *testing.T) {
