@@ -3627,15 +3627,23 @@ func runCleanup() {
 		standing = configuredStandingAgentNames(cfg)
 	}
 
-	workspace, workspaceErr := herdr.RequireWorkspace(".")
+	workspace, workspaceErr := herdr.RequireCleanupWorkspace(".")
 	if workspaceErr != nil {
 		fmt.Fprintf(os.Stderr, "herd cleanup: %v\n", workspaceErr)
 		os.Exit(1)
 	}
+	repository, repositoryErr := filepath.Abs(".")
+	if repositoryErr != nil {
+		fmt.Fprintf(os.Stderr, "herd cleanup: resolve repository: %v\n", repositoryErr)
+		os.Exit(1)
+	}
 	res, err := herdr.CleanupFencedInWorkspace(workspace, standing, *dryRun)
+	res.Repository = repository
 	if *asJSON {
 		out := map[string]interface{}{
 			"dry_run":     res.DryRun,
+			"workspace":   res.Workspace,
+			"repository":  res.Repository,
 			"candidates":  res.Candidates,
 			"attempts":    res.Attempts,
 			"closed":      res.Closed,
@@ -3648,6 +3656,9 @@ func runCleanup() {
 		}
 		json.NewEncoder(os.Stdout).Encode(out)
 	} else {
+		if res.DryRun {
+			fmt.Printf("herd cleanup: target workspace=%s repo=%s\n", res.Workspace, res.Repository)
+		}
 		if len(res.Candidates) == 0 && err == nil {
 			fmt.Println("herd cleanup: nothing to close")
 		}

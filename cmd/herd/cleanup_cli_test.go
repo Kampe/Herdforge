@@ -60,6 +60,12 @@ func TestCleanupCLI_DryRunJSON(t *testing.T) {
 	if pkt["dry_run"] != true {
 		t.Fatalf("dry_run must be true: %s", out)
 	}
+	if pkt["workspace"] != "w" {
+		t.Fatalf("workspace=%v want w: %s", pkt["workspace"], out)
+	}
+	if repository, ok := pkt["repository"].(string); !ok || repository == "" {
+		t.Fatalf("dry-run must report repository: %s", out)
+	}
 	cands, ok := pkt["candidates"].([]interface{})
 	if !ok || len(cands) != 1 {
 		t.Fatalf("candidates=%v want 1: %s", pkt["candidates"], out)
@@ -70,6 +76,22 @@ func TestCleanupCLI_DryRunJSON(t *testing.T) {
 	attempts, _ := pkt["attempts"].([]interface{})
 	if len(attempts) != 0 {
 		t.Fatalf("dry-run must not produce attempts: %s", out)
+	}
+}
+
+func TestCleanupCLI_RejectsInheritedHerdrWorkspace(t *testing.T) {
+	binary := buildHerd(t)
+	fake := cleanupFakeHerdr(t, `{"result":{"agents":[],"type":"agents"}}`)
+	env := cleanupEnv(fake)
+	env = append(env, "HERDR_WORKSPACE_ID=wB")
+	cmd := exec.Command(binary, "cleanup", "--dry-run", "--json")
+	cmd.Env = env
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("cleanup must reject inherited Herdr workspace: %s", out)
+	}
+	if !strings.Contains(string(out), "HERDR_WORKSPACE_ID=\"wB\"") {
+		t.Fatalf("mismatch must name inherited Herdr workspace: %s", out)
 	}
 }
 

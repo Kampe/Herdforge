@@ -489,6 +489,8 @@ type CleanupAttempt struct {
 // that callers can audit without re-deriving from the attempt list.
 type CleanupResult struct {
 	DryRun     bool               `json:"dry_run"`
+	Workspace  string             `json:"workspace"`
+	Repository string             `json:"repository,omitempty"`
 	Candidates []CleanupCandidate `json:"candidates"`
 	Attempts   []CleanupAttempt   `json:"attempts"`
 	Closed     int                `json:"closed"`
@@ -670,7 +672,9 @@ func CleanupFencedInWorkspace(workspace string, standing map[string]bool, dryRun
 			filtered = append(filtered, agent)
 		}
 	}
-	return cleanupFencedAgents(filtered, standing, dryRun)
+	res, err := cleanupFencedAgents(filtered, standing, dryRun)
+	res.Workspace = workspace
+	return res, err
 }
 
 func cleanupFencedAgents(agents []AgentEntry, standing map[string]bool, dryRun bool) (CleanupResult, error) {
