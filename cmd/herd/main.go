@@ -890,6 +890,17 @@ func runPreflightStatic() {
 
 func runPreflight() {
 	runPreflightStatic()
+	// Static preflight is also useful in an uninitialised directory. Only run
+	// the ref comparison when the command is operating inside a Git worktree.
+	// Once refs exist, missing or divergent refs remain hard failures.
+	if _, err := exec.Command("git", "rev-parse", "--is-inside-work-tree").Output(); err == nil {
+		if report, err := preflight.CheckMainOriginDivergence("."); err != nil {
+			fmt.Fprintf(os.Stderr, "Preflight failed: %v\n", err)
+			os.Exit(1)
+		} else {
+			fmt.Printf("Preflight main/origin-main check passed. main ahead=%d, origin/main ahead=%d.\n", report.LocalAhead, report.RemoteAhead)
+		}
+	}
 	if !productionMode() {
 		// FAC-367: local Herdr panes do not have hosted HostCreds or fleet
 		// attestation state. Static boundary, signal, and merge-policy checks
