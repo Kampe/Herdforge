@@ -29,6 +29,30 @@ type CandidatePin struct {
 	Branch string
 }
 
+// CandidateRange is the exact reviewed history slice to harvest. Base and SHA
+// are kept as user-supplied git revisions so the caller can resolve them in
+// the repository where the harvest is running.
+type CandidateRange struct {
+	Base string
+	SHA  string
+}
+
+// ParseCandidateRange parses the two-dot range accepted by harvest-merge.
+// Three-dot ranges and empty revisions are rejected because they do not name
+// the exact linear history slice that the review covered.
+func ParseCandidateRange(value string) (CandidateRange, error) {
+	value = strings.TrimSpace(value)
+	if strings.Count(value, "..") != 1 || strings.Contains(value, "...") {
+		return CandidateRange{}, fmt.Errorf("harvest-merge: --candidate-range must be <base>..<sha>")
+	}
+	parts := strings.SplitN(value, "..", 2)
+	if strings.TrimSpace(parts[0]) == "" || strings.TrimSpace(parts[1]) == "" ||
+		strings.ContainsAny(parts[0], " \t\r\n") || strings.ContainsAny(parts[1], " \t\r\n") {
+		return CandidateRange{}, fmt.Errorf("harvest-merge: --candidate-range must contain non-empty revisions")
+	}
+	return CandidateRange{Base: parts[0], SHA: parts[1]}, nil
+}
+
 // Valid reports whether the pin names both an exact candidate and its source
 // branch.
 func (p CandidatePin) Valid() bool {
