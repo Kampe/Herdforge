@@ -35,6 +35,14 @@ merge_policy:
     required_checks:
       - "Build, Preflight & Test Suite"
 
+# FAC-363 follow-up: pin this repo's Herdr workspace explicitly so dispatch
+# and review launches never fall through to a focused-but-unrelated
+# workspace (observed 2026-08-18: builder tabs landed in chainseer's "wB"
+# instead of this repo's own "wK" because HERD_WORKSPACE isn't persistent
+# across separate tool invocations and live-list fallback picked "focused").
+fleet:
+  herdr_workspace: "wK"
+
 # FAC-245: every admitted task worktree gets an isolated Go module/build cache
 # keyed by the resolved Go toolchain. The receipt is durable and idempotent;
 # a changed toolchain or declaration repairs stale per-worktree artifacts
@@ -95,6 +103,87 @@ lanes:
     worktree: ".worktrees/smith"
     provider: "codex"
     model: "gpt-5.6-luna"
+    effort: "medium"
+    task_shape: "implementation"
+    standing: false
+    authority: "write"
+    capabilities: ["git-write", "fs-write", "shell-exec"]
+    incompatible_with: ["reviewer"]
+
+  # smith-grok / smith-claude — additional worker-role capacity so more than
+  # one urgent to-do card can build in parallel. Codex's weekly pool is
+  # exhausted at the time these were added; grok and claude are healthy.
+  - name: "smith-grok"
+    role: "worker"
+    agent_kind: "grok"
+    harness: "grok"
+    prompt: ".herd/prompts/worker.md"
+    worktree: ".worktrees/smith-grok"
+    provider: "grok"
+    model: "grok-4.6"
+    effort: "medium"
+    task_shape: "implementation"
+    standing: false
+    authority: "write"
+    capabilities: ["git-write", "fs-write", "shell-exec"]
+    incompatible_with: ["reviewer"]
+
+  - name: "smith-claude"
+    role: "worker"
+    agent_kind: "claude"
+    harness: "claude"
+    prompt: ".herd/prompts/worker.md"
+    worktree: ".worktrees/smith-claude"
+    provider: "claude"
+    model: "claude-sonnet-5"
+    effort: "medium"
+    task_shape: "implementation"
+    standing: false
+    authority: "write"
+    capabilities: ["git-write", "fs-write", "shell-exec"]
+    incompatible_with: ["reviewer"]
+
+  # smith-grok-2 / smith-agy / smith-claude-2 — scaling parallel builder
+  # capacity further so the coordinator isn't the bottleneck rebasing one
+  # candidate at a time. agy uses the healthy nonGemini pool.
+  - name: "smith-grok-2"
+    role: "worker"
+    agent_kind: "grok"
+    harness: "grok"
+    prompt: ".herd/prompts/worker.md"
+    worktree: ".worktrees/smith-grok-2"
+    provider: "grok"
+    model: "grok-4.6"
+    effort: "medium"
+    task_shape: "implementation"
+    standing: false
+    authority: "write"
+    capabilities: ["git-write", "fs-write", "shell-exec"]
+    incompatible_with: ["reviewer"]
+
+  - name: "smith-agy"
+    role: "worker"
+    agent_kind: "agy"
+    harness: "agy"
+    prompt: ".herd/prompts/worker.md"
+    worktree: ".worktrees/smith-agy"
+    provider: "agy"
+    model: "claude-opus-4-6-thinking"
+    effort: "medium"
+    task_shape: "implementation"
+    standing: false
+    authority: "write"
+    capabilities: ["git-write", "fs-write", "shell-exec"]
+    incompatible_with: ["reviewer"]
+
+  - name: "smith-claude-2"
+    role: "worker"
+    agent_kind: "claude"
+    harness: "claude"
+    prompt: ".herd/prompts/worker.md"
+    worktree: ".worktrees/smith-claude-2"
+    provider: "claude"
+    model: "claude-sonnet-5"
     effort: "medium"
     task_shape: "implementation"
     standing: false
