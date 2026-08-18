@@ -362,6 +362,9 @@ func main() {
 	case "worktrees":
 		runWorktrees()
 
+	case "pool":
+		runPool()
+
 	case "containers":
 		runContainers()
 
