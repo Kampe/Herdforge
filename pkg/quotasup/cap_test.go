@@ -24,6 +24,22 @@ func obs(b *usage.BurnState) Observation {
 	return Observation{Surface: Surface{Provider: "claude", Pool: "default"}, Burn: b, SourceAt: fakeNow}
 }
 
+func TestPlanClaudeFiveHourWakeChoosesEarliestFutureReset(t *testing.T) {
+	now := time.Date(2026, 8, 17, 1, 0, 0, 0, time.UTC)
+	decisions := []Decision{
+		{Surface: Surface{Provider: "anthropic", Pool: "default"}, Evidence: Evidence{Window: "5h", ResetAt: "2026-08-17T06:00:00Z"}},
+		{Surface: Surface{Provider: "anthropic", Pool: "fable"}, Evidence: Evidence{WindowSeconds: usage.Window5h, ResetAt: "2026-08-17T05:00:00Z"}},
+		{Surface: Surface{Provider: "grok", Pool: "default"}, Evidence: Evidence{Window: "5h", ResetAt: "2026-08-17T02:00:00Z"}},
+	}
+	wake := PlanClaudeFiveHourWake(now, decisions)
+	if wake == nil || !wake.ResetAt.Equal(time.Date(2026, 8, 17, 5, 0, 0, 0, time.UTC)) {
+		t.Fatalf("wake=%+v, want earliest Claude reset", wake)
+	}
+	if wake.Key == "" {
+		t.Fatal("wake key must be stable and non-empty")
+	}
+}
+
 // Quota nobody refreshed is not evidence that headroom still exists.
 func TestObservationAgeBoundaryFlipsToUnknown(t *testing.T) {
 	cases := []struct {

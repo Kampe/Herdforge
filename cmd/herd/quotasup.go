@@ -141,6 +141,7 @@ func runQuotaSupervisor() {
 		current.Decisions = append(current.Decisions,
 			quotasup.Decide(s, ev, quotasup.PriorState(prior, s)))
 	}
+	current.Wake = quotasup.PlanClaudeFiveHourWake(now, current.Decisions)
 
 	for _, a := range current.Agents {
 		old := quotasup.Prior(prior, a.Name)
@@ -176,7 +177,16 @@ func runQuotaSupervisor() {
 			if body, err := json.Marshal(current); err == nil {
 				tmp := stateFile + ".tmp"
 				if os.WriteFile(tmp, body, 0o600) == nil {
-					os.Rename(tmp, stateFile)
+					_ = os.Rename(tmp, stateFile)
+				}
+			}
+		}
+		if current.Wake != nil {
+			wakeFile := filepath.Join(".herd", "quota-wake.json")
+			if body, err := json.MarshalIndent(current.Wake, "", "  "); err == nil {
+				tmp := wakeFile + ".tmp"
+				if os.WriteFile(tmp, body, 0o600) == nil {
+					_ = os.Rename(tmp, wakeFile)
 				}
 			}
 		}
@@ -199,6 +209,10 @@ func runQuotaSupervisor() {
 	for _, d := range current.Decisions {
 		fmt.Printf("  %-24s cap=%d/%d posture=%-7s active=%d  %s\n",
 			d.Surface, d.Cap, d.Target, d.Posture, d.Evidence.Active, d.Reason)
+	}
+	if current.Wake != nil {
+		fmt.Printf("SELF_WAKE provider=%s window=%s reset=%s key=%s command=herd forge --loop\n",
+			current.Wake.Provider, current.Wake.Window, current.Wake.ResetAt.Format(time.RFC3339), current.Wake.Key)
 	}
 }
 

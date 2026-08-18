@@ -192,11 +192,13 @@ type CallbackObservation struct {
 
 // ReviewObservation is one read of review-pile pressure.
 type ReviewObservation struct {
-	Known      bool   `json:"known"`
-	Error      string `json:"error,omitempty"`
-	Pending    int    `json:"pending"`
-	NeedReview int    `json:"need_review"`
-	Saturated  bool   `json:"saturated,omitempty"`
+	Known          bool     `json:"known"`
+	Error          string   `json:"error,omitempty"`
+	Pending        int      `json:"pending"`
+	PendingRefs    []string `json:"pending_refs,omitempty"`
+	NeedReview     int      `json:"need_review"`
+	NeedReviewRefs []string `json:"need_review_refs,omitempty"`
+	Saturated      bool     `json:"saturated,omitempty"`
 }
 
 // QuotaObservation is one read of capacity/quota posture.
