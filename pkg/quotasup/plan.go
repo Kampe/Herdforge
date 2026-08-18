@@ -6,11 +6,70 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/Kampe/Herdforge/pkg/router"
 	"github.com/Kampe/Herdforge/pkg/usage"
 )
+
+type LaneRaise struct {
+	Provider string `json:"provider"`
+	Count    int    `json:"count"`
+}
+
+type LanePlan struct {
+	Desired int         `json:"desired"`
+	Raises  []LaneRaise `json:"raises,omitempty"`
+}
+
+// PlanLanes returns deterministic provider raises for queued work. Existing
+// active work is preserved; only headroom on admitting surfaces is eligible.
+func PlanLanes(queue int, decisions []Decision, roster []string) LanePlan {
+	if queue <= 0 {
+		return LanePlan{}
+	}
+	allowed := make(map[string]bool, len(roster))
+	for _, provider := range roster {
+		if provider = strings.ToLower(strings.TrimSpace(provider)); provider != "" {
+			allowed[provider] = true
+		}
+	}
+	filterRoster := len(allowed) > 0
+	type capacity struct{ headroom int }
+	byProvider := make(map[string]capacity)
+	for _, d := range decisions {
+		provider := strings.ToLower(strings.TrimSpace(d.Surface.Provider))
+		if provider == "" || (filterRoster && !allowed[provider]) || !d.Admits() {
+			continue
+		}
+		c := byProvider[provider]
+		if room := d.Cap - d.Evidence.Active; room > 0 {
+			c.headroom += room
+		}
+		byProvider[provider] = c
+	}
+	providers := make([]string, 0, len(byProvider))
+	for provider, c := range byProvider {
+		if c.headroom > 0 {
+			providers = append(providers, provider)
+		}
+	}
+	sort.Strings(providers)
+	plan := LanePlan{}
+	for _, provider := range providers {
+		raise := byProvider[provider].headroom
+		if raise > queue-plan.Desired {
+			raise = queue - plan.Desired
+		}
+		if raise <= 0 {
+			break
+		}
+		plan.Raises = append(plan.Raises, LaneRaise{Provider: provider, Count: raise})
+		plan.Desired += raise
+	}
+	return plan
+}
 
 // BurnFor resolves the ledger row for one surface.
 //
