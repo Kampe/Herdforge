@@ -5381,7 +5381,7 @@ func laneLaunchDecisionWithProbe(ctx context.Context, lane *config.LaneDef, task
 		}
 	}
 	pinnedBuilder := role == router.RoleWorker || role == router.RoleForgeSmith || role == router.RoleRecovery
-	request := router.LaunchRequest{Role: role, Shape: shape, TaskRef: contextRef, Scope: scope, Risk: classify.TierR1}
+	request := router.LaunchRequest{Role: router.Role(strings.TrimSpace(lane.Role)), NativeRole: role, Shape: shape, TaskRef: contextRef, Scope: scope, Risk: classify.TierR1}
 	if pinnedBuilder {
 		request.RequestedProvider = provider
 		request.RequestedModel = lane.Model
@@ -5504,6 +5504,9 @@ func nativeLaunchRole(lane *config.LaneDef) (router.Role, error) {
 		return "", fmt.Errorf("lane %q has no role", lane.Name)
 	}
 	if lane.StandingRolePolicy == nil {
+		if lane.Standing && !knownLaunchRole(role) {
+			return "", fmt.Errorf("%w: lane %q custom standing role %q requires standing_role_policy.native_role", ErrWorkerConfigPolicy, lane.Name, role)
+		}
 		return router.Role(role), nil
 	}
 	if !lane.Standing {
@@ -5520,15 +5523,7 @@ func nativeLaunchRole(lane *config.LaneDef) (router.Role, error) {
 }
 
 func knownLaunchRole(role string) bool {
-	switch router.Role(strings.TrimSpace(role)) {
-	case router.RoleWorker, router.RoleForgeSmith, router.RoleRecovery,
-		router.RoleReviewer, router.RoleAssayer, router.RoleOrchestrator,
-		router.RoleScoutPlanner, router.RoleVerificationGate,
-		router.RoleReviewSupervisor, router.RoleHarvest, router.RoleRecoverySentinel:
-		return true
-	default:
-		return false
-	}
+	return router.KnownRole(router.Role(strings.TrimSpace(role)))
 }
 
 func validateLaneLaunchConfig(lane *config.LaneDef) error {

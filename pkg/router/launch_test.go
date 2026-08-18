@@ -148,6 +148,35 @@ func TestUnknownRoleRejectedBeforeSignedDecision(t *testing.T) {
 	}
 }
 
+func TestCustomRoleUsesNativeRolePolicy(t *testing.T) {
+	d, err := testRouter(nil, "codex").Decide(LaunchRequest{
+		Role:              Role("docs-custodian"),
+		NativeRole:        RoleWorker,
+		Shape:             "implementation",
+		RequestedProvider: "codex",
+		RequestedModel:    "gpt-5.6-luna",
+		RequestedEffort:   "medium",
+		ProbeResults:      map[string]bool{ProbeKey("codex", "gpt-5.6-luna"): true},
+	})
+	if err != nil {
+		t.Fatalf("custom role with native worker policy rejected: %v", err)
+	}
+	if d.Role != RoleWorker {
+		t.Fatalf("decision role = %q, want %q", d.Role, RoleWorker)
+	}
+}
+
+func TestCustomRoleRejectsUnknownNativeRole(t *testing.T) {
+	_, err := testRouter(nil, "codex").Decide(LaunchRequest{
+		Role:       Role("docs-custodian"),
+		NativeRole: Role("not-configured"),
+		Shape:      "implementation",
+	})
+	if !errors.Is(err, ErrRolePolicy) {
+		t.Fatalf("unknown native role error = %v, want %v", err, ErrRolePolicy)
+	}
+}
+
 func TestEffortLadderReviewer(t *testing.T) {
 	clearRouteEnv(t)
 	cases := []struct {
