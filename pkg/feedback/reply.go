@@ -32,7 +32,7 @@ func ReplyFromLanes(mailFile, epoch string, want []string) (got, missing []strin
 	// rotated) after the request was sent. Returning that stale sender in got
 	// made the census print replies greater than its denominator.
 	requested := make(map[string]struct{}, len(want))
-	for _, lane := range want {
+	for _, lane := range normalizeLanes(want) {
 		requested[lane] = struct{}{}
 	}
 	filtered := make([]string, 0, len(replied))

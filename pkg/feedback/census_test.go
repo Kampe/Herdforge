@@ -72,6 +72,13 @@ func TestMissingIsSetDifferenceAndDeterministic(t *testing.T) {
 	}
 }
 
+func TestMissingIgnoresRepliesOutsideDenominator(t *testing.T) {
+	got := Missing([]string{"active"}, []string{"active", "retired", "retired"})
+	if len(got) != 0 {
+		t.Fatalf("missing = %v, want none", got)
+	}
+}
+
 func TestDueAndOverdueWindows(t *testing.T) {
 	now := time.Unix(1_800_000_000, 0).UTC()
 	if !Due(time.Time{}, now, DefaultInterval) {
@@ -215,6 +222,39 @@ func TestRunOpensCensusWhenDue(t *testing.T) {
 	}
 	if !reflect.DeepEqual(got.Lanes, want) {
 		t.Fatalf("persisted lanes = %v, want %v", got.Lanes, want)
+	}
+}
+
+func TestRunCensusDedupesRotatedStandingIdentity(t *testing.T) {
+	now := time.Unix(1_800_000_000, 0).UTC()
+	stateDir := t.TempDir()
+	var sent []string
+	opts := Options{
+		Interval: 1800, Grace: 600, StateDir: stateDir, MailDir: t.TempDir(),
+		Workspace: "wF", Coordinator: "coordinator-1", Now: fixedNow(now),
+		ListAgents: func() ([]herdr.AgentEntry, error) {
+			return []herdr.AgentEntry{
+				{Name: "standing-reviewer", Workspace: "wF", TabID: "tab", PaneID: "pane", Session: herdr.AgentSession{Value: "old-session"}},
+				{Name: "standing-reviewer", Workspace: "wF", TabID: "tab", PaneID: "pane", Session: herdr.AgentSession{Value: "new-session"}},
+			}, nil
+		},
+		DurableMail:   func(ctx context.Context, to, summary, body string) error { sent = append(sent, to); return nil },
+		Wake:          func(ctx context.Context, lane, nudge string) error { return nil },
+		AdmissionGate: func(ctx context.Context) error { return nil },
+		Stdout:        &bytes.Buffer{},
+	}
+	if err := Run(context.Background(), opts); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(sent, []string{"standing-reviewer"}) {
+		t.Fatalf("sent = %v, want one reply identity after rotation", sent)
+	}
+	state, err := Load(stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(state.Lanes, []string{"standing-reviewer"}) {
+		t.Fatalf("persisted lanes = %v, want one standing identity", state.Lanes)
 	}
 }
 

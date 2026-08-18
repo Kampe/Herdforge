@@ -103,6 +103,7 @@ func Load(stateDir string) (*CensusState, error) {
 	if err := json.Unmarshal(raw, &s); err != nil {
 		return nil, fmt.Errorf("feedback: corrupt census %s: %w", path, err)
 	}
+	s.Lanes = normalizeLanes(s.Lanes)
 	return &s, nil
 }
 
@@ -113,7 +114,12 @@ func Save(stateDir string, s *CensusState) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return fmt.Errorf("feedback: create state dir: %w", err)
 	}
-	body, err := json.Marshal(s)
+	if s == nil {
+		return fmt.Errorf("feedback: cannot save nil census")
+	}
+	canonical := *s
+	canonical.Lanes = normalizeLanes(s.Lanes)
+	body, err := json.Marshal(&canonical)
 	if err != nil {
 		return fmt.Errorf("feedback: marshal census: %w", err)
 	}
@@ -142,14 +148,43 @@ func EpochKnown(stateDir, epoch string) (bool, error) {
 	return s.Epoch == epoch, nil
 }
 
+// normalizeLanes is the census identity boundary. A lane name is the durable
+// standing identity: its pane/session may rotate, but an old observation must
+// not create a second denominator slot. Preserve the live roster's order so
+// the request and persisted state remain useful for operator comparison.
+func normalizeLanes(lanes []string) []string {
+	seen := make(map[string]struct{}, len(lanes))
+	canonical := make([]string, 0, len(lanes))
+	for _, lane := range lanes {
+		lane = strings.TrimSpace(lane)
+		if lane == "" {
+			continue
+		}
+		if _, ok := seen[lane]; ok {
+			continue
+		}
+		seen[lane] = struct{}{}
+		canonical = append(canonical, lane)
+	}
+	return canonical
+}
+
 // Epoch stamps a census. Callers pass the clock so this stays testable.
 func Epoch(now time.Time) string { return now.UTC().Format("20060102T150405Z") }
 
 // Missing returns requested lanes that have not replied, deterministically
 // sorted so two runs of the same state produce identical output.
 func Missing(requested, replied []string) []string {
+	requested = normalizeLanes(requested)
 	got := make(map[string]bool, len(replied))
+	allowed := make(map[string]struct{}, len(requested))
+	for _, want := range requested {
+		allowed[want] = struct{}{}
+	}
 	for _, r := range replied {
+		if _, ok := allowed[r]; !ok {
+			continue
+		}
 		got[r] = true
 	}
 	var missing []string
@@ -532,10 +567,16 @@ func Run(ctx context.Context, opts Options) error {
 	subject := Subject(epoch)
 
 	var lanes []string
+	seenLanes := make(map[string]struct{})
 	for _, a := range agents {
-		if a.Workspace != workspace || strings.TrimSpace(a.Name) == "" || a.Name == coordinator || (len(opts.Roster) > 0 && !containsName(opts.Roster, a.Name)) {
+		lane := strings.TrimSpace(a.Name)
+		if a.Workspace != workspace || lane == "" || lane == coordinator || (len(opts.Roster) > 0 && !containsName(opts.Roster, lane)) {
 			continue
 		}
+		if _, seen := seenLanes[lane]; seen {
+			continue
+		}
+		seenLanes[lane] = struct{}{}
 		// Durable delivery is the authoritative half of the census: a
 		// census that cannot fuse a lane's inbox is a false census, so a
 		// failed durable send is fatal rather than silently dropping the
@@ -544,11 +585,11 @@ func Run(ctx context.Context, opts Options) error {
 			fmt.Fprintf(opts.Stderr, "herd-feedback: durable send to %s failed: %v\n", a.Name, err)
 			return fmt.Errorf("herd-feedback: durable send to %s: %w", a.Name, err)
 		}
-		lanes = append(lanes, a.Name)
+		lanes = append(lanes, lane)
 		if NeedsWake(a.Status) {
 			nudge := fmt.Sprintf("Read and answer the %s request in your durable inbox before taking more work.", subject)
-			if err := wake(ctx, a.Name, nudge); err != nil {
-				fmt.Fprintf(opts.Stderr, "herd-feedback: WARN could not prove wake delivery to %s (durable inbox copy exists): %v\n", a.Name, err)
+			if err := wake(ctx, lane, nudge); err != nil {
+				fmt.Fprintf(opts.Stderr, "herd-feedback: WARN could not prove wake delivery to %s (durable inbox copy exists): %v\n", lane, err)
 			}
 		}
 	}
