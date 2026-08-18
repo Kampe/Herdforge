@@ -221,6 +221,10 @@ func deliverOperator(ctx context.Context, d OperatorDelivery, executor textdeliv
 		if _, err := executor.Execute(execCtx, command); err != nil {
 			return nil, err
 		}
+		// Herdr may acknowledge the text write before the pane composer handles
+		// submission.  An immediate Enter makes the send-text/send-keys
+		// sequence reliable (FAC-388); status polling remains authoritative.
+		_ = SendKeys(d.Target, "Enter")
 		proof, err := waitForOperatorConsumption(execCtx, d.Key, d.Target, d.Session, baseline, textdelivery.Digest(body), timeout)
 		if err != nil {
 			return nil, err
