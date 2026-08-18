@@ -1337,10 +1337,9 @@ func TestReviewCLI_IsolatedDetachedReviewWorktree(t *testing.T) {
 
 	// herdr is absent in tests, so --spawn exits at the herdr check AFTER
 	// the isolated checkout is created; drive the admission directly.
-	// The live fleet must be untouched by this test: a protocol-faithful
-	// fake herdr is injected, and the operator's workspace census is
-	// compared before/after (FAC-145 hermeticity).
-	censusBefore := liveWorkspaceCensus(t)
+	// A protocol-faithful fake herdr is injected. The fake's call log is the
+	// hermeticity boundary; do not census the operator's live fleet because
+	// unrelated coordination sessions may legitimately change it.
 	fakeBin, fakeCalls := installProtocolFakeHerdr(t)
 	fakeLog := os.Getenv("HERD_FAKE_LOG")
 	// The --spawn path checks exec.LookPath for the lane's harness binary
@@ -1402,7 +1401,6 @@ func TestReviewCLI_IsolatedDetachedReviewWorktree(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(reviewDir, dispatch.TaskContextFile)); !os.IsNotExist(err) {
 		t.Fatalf("failed reviewer admission must leave no receipt behind: %v", err)
 	}
-	assertLiveFleetUntouched(t, censusBefore)
 }
 
 func runGitOut(t *testing.T, dir string, args ...string) string {

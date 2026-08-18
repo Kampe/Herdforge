@@ -78,6 +78,7 @@ opencode.json
 **/.herd/mail.jsonl
 .herd/control-mail.jsonl
 **/.herd/control-mail.jsonl
+.herd/legacy-tab-state.jsonl
 
 # compiled binaries must not be tracked
 /herd

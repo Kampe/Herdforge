@@ -73,6 +73,12 @@ func attestedKeyDir(t *testing.T) string {
 func testSignerVerifier(t *testing.T) (*Signer, *Verifier) {
 	t.Helper()
 	root := t.TempDir()
+	// Signing fixtures exercise receipt validation, not the ambient worker
+	// boundary. Keep them outside managed worktrees and clear the inherited
+	// Herdr agent marker; TestSignerBoundary_AgentRoleEnvRefused covers that
+	// boundary explicitly.
+	t.Chdir(root)
+	t.Setenv("HERD_ROLE", "")
 	s, err := LoadOrCreateSigner(attestedKeyDir(t), "herdforge", root)
 	if err != nil {
 		t.Fatalf("signer: %v", err)
