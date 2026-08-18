@@ -69,7 +69,7 @@ func CheckWorktreeBoundaryWithAllowlist(rootDir string, allowlist []string) erro
 			content := string(data)
 			// Check for forbidden absolute path patterns (excluding self-check logic strings)
 			isPreflightTest := strings.HasSuffix(path, "_test.go") && strings.Contains(path, "preflight")
-			if (strings.Contains(content, "/Users/") || strings.Contains(content, "/home/") || strings.Contains(content, "C:\\")) &&
+			if containsAbsolutePathLeak(content) &&
 				!strings.HasSuffix(path, "AGENTS.md") && !strings.HasSuffix(path, "preflight.go") && !isPreflightTest {
 				if !allowedAbsolutePath(path, allowlist) {
 					absoluteLeakes = append(absoluteLeakes, filepath.Join(rootDir, path))
@@ -88,6 +88,37 @@ func CheckWorktreeBoundaryWithAllowlist(rootDir string, allowlist []string) erro
 	}
 
 	return nil
+}
+
+// containsAbsolutePathLeak reports filesystem path markers unless the marker
+// is part of a URL path. URLs commonly contain path segments such as /home/ or
+// /Users/, but those are not host-specific paths leaking from the worktree.
+func containsAbsolutePathLeak(content string) bool {
+	markers := []string{"/Users/", "/home/", "C:\\"}
+	for _, line := range strings.Split(content, "\n") {
+		for _, marker := range markers {
+			for offset := 0; offset < len(line); {
+				relative := strings.Index(line[offset:], marker)
+				if relative < 0 {
+					break
+				}
+				index := offset + relative
+				if !isURLPathSegment(line, index) {
+					return true
+				}
+				offset = index + len(marker)
+			}
+		}
+	}
+	return false
+}
+
+func isURLPathSegment(line string, index int) bool {
+	separator := strings.LastIndex(line[:index], "://")
+	if separator < 0 {
+		return false
+	}
+	return !strings.ContainsAny(line[separator+3:index], " \t\r")
 }
 
 func allowedAbsolutePath(path string, allowlist []string) bool {
