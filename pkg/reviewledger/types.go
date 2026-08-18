@@ -17,6 +17,10 @@ const (
 	EventRevoked      Event = "revoked"
 	EventRefutation   Event = "refutation"
 	EventSupersession Event = "supersession"
+	// EventReconstruction records an operator-attested replacement identity
+	// used when a reviewed candidate was harvested by content-preserving
+	// reconstruction rather than literal ancestry.
+	EventReconstruction Event = "reconstruction"
 )
 
 // Verdict values.
@@ -73,6 +77,7 @@ type LedgerRow struct {
 	FindingsRef        string `json:"findings_ref,omitempty"`
 	CandidateSHA       string `json:"candidate_sha,omitempty"`
 	Reason             string `json:"reason,omitempty"`
+	ContentProof       string `json:"content_proof,omitempty"`
 }
 
 // familyResolve represents the 3-state family resolution.

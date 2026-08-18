@@ -135,6 +135,56 @@ func TestResolveHarvestCandidatePinsReviewedSHAAcrossTipDrift(t *testing.T) {
 	}
 }
 
+func TestResolveHarvestCandidateAcceptsAttestedReconstruction(t *testing.T) {
+	t.Chdir(t.TempDir())
+	gitCandidateTest(t, "init", "-q", "-b", "main")
+	gitCandidateTest(t, "config", "user.email", "test@example.com")
+	gitCandidateTest(t, "config", "user.name", "test")
+	gitCandidateTest(t, "commit", "--allow-empty", "-q", "-m", "base")
+	gitCandidateTest(t, "branch", "standing/lane")
+	gitCandidateTest(t, "checkout", "-q", "standing/lane")
+	writeCandidateFile(t, "reviewed.go", "package reviewed\n")
+	gitCandidateTest(t, "add", "reviewed.go")
+	gitCandidateTest(t, "commit", "-q", "-m", "reviewed")
+	reviewed := gitCandidateOutput(t, "rev-parse", "HEAD")
+	gitCandidateTest(t, "checkout", "-q", "main")
+	writeCandidateFile(t, "reconstructed.go", "package reconstructed\n")
+	gitCandidateTest(t, "add", "reconstructed.go")
+	gitCandidateTest(t, "commit", "-q", "-m", "reconstructed")
+	reconstructed := gitCandidateOutput(t, "rev-parse", "HEAD")
+	gitCandidateTest(t, "branch", "-f", "standing/lane", reconstructed)
+
+	l, err := reviewledger.NewReviewLedger(".", filepath.Join(".herd", "review-ledger.jsonl"))
+	if err != nil {
+		t.Fatalf("open ledger: %v", err)
+	}
+	addCandidatePass(t, l, reviewed, "standing/lane")
+	if _, err := resolveHarvestCandidate("standing/lane", reviewed); err == nil {
+		t.Fatal("default candidate resolution must retain the ancestry refusal")
+	}
+
+	got, err := resolveHarvestCandidateWithReconstruction("standing/lane", reviewed, reconstructed, "reviewed content was reconstructed exactly")
+	if err != nil {
+		t.Fatalf("attested reconstruction: %v", err)
+	}
+	if !got.Eligible || got.Pin.SHA != reviewed || got.ReconstructedSHA != reconstructed {
+		t.Fatalf("report = %+v, want reviewed=%s reconstructed=%s eligible", got, reviewed, reconstructed)
+	}
+	if err := l.Reconstruction(reviewledger.ReconstructionOpts{
+		SHA: reconstructed, CandidateSHA: reviewed, Branch: "standing/lane",
+		ContentProof: "reviewed content was reconstructed exactly",
+	}); err != nil {
+		t.Fatalf("record reconstruction: %v", err)
+	}
+	rows, err := l.AllRows()
+	if err != nil {
+		t.Fatalf("read ledger: %v", err)
+	}
+	if len(rows) != 2 || rows[1].Event != string(reviewledger.EventReconstruction) || rows[1].SHA != reconstructed || rows[1].CandidateSHA != reviewed || rows[1].ContentProof != "reviewed content was reconstructed exactly" {
+		t.Fatalf("reconstruction ledger rows = %+v", rows)
+	}
+}
+
 func addCandidatePass(t *testing.T, l *reviewledger.Ledger, sha, branch string) {
 	t.Helper()
 	if err := l.Record(reviewledger.RecordOpts{
