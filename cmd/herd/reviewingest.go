@@ -169,6 +169,7 @@ func runHarvestMerge() {
 		"Optional operator VETO (FAIL/BLOCKED refuse). PASS is not accepted here: merge consent comes from the review ledger.")
 	base := fs.String("base", "origin/main", "Base to harvest onto")
 	candidate := fs.String("candidate", "", "Exact reviewed candidate SHA to harvest (required when the branch tip moved)")
+	candidateRange := fs.String("candidate-range", "", "Exact reviewed range to harvest (<base>..<sha>); limits cherry-picks to that range")
 	dryRun := fs.Bool("dry-run", false, "Plan and gate without creating the worktree")
 	allowMarkers := fs.Bool("allow-markers", false,
 		"Proceed despite conflict markers in the harvested diff (for files whose CONTENT is marker fixtures)")
@@ -203,7 +204,7 @@ func runHarvestMerge() {
 	fs.Parse(args)
 
 	if lane == "" || *branch == "" {
-		fmt.Fprintln(os.Stderr, "usage: herd harvest-merge <lane> --branch <branch> --title <t> [--verdict PASS]")
+		fmt.Fprintln(os.Stderr, "usage: herd harvest-merge <lane> --branch <branch> --title <t> [--candidate-range <base>..<sha>] [--verdict PASS]")
 		fmt.Fprintln(os.Stderr, "       herd harvest-merge <lane> --branch <branch> --verify-landed --ref <FAC-x> [...]")
 		os.Exit(2)
 	}
@@ -226,17 +227,30 @@ func runHarvestMerge() {
 	}
 
 	if *title == "" {
-		fmt.Fprintln(os.Stderr, "usage: herd harvest-merge <lane> --branch <branch> --title <t> [--verdict PASS]")
+		fmt.Fprintln(os.Stderr, "usage: herd harvest-merge <lane> --branch <branch> --title <t> [--candidate-range <base>..<sha>] [--verdict PASS]")
 		fmt.Fprintln(os.Stderr, "       (or use --verify-landed to check if a merge landed)")
 		os.Exit(2)
 	}
 
-	cherry, err := exec.Command("git", "cherry", *base, *branch).Output()
+	rangeSpec := harvestmerge.CandidateRange{}
+	if strings.TrimSpace(*candidateRange) != "" {
+		parsed, parseErr := harvestmerge.ParseCandidateRange(*candidateRange)
+		if parseErr != nil {
+			fmt.Fprintln(os.Stderr, parseErr)
+			os.Exit(2)
+		}
+		rangeSpec = parsed
+		if strings.TrimSpace(*candidate) != "" && strings.TrimSpace(*candidate) != rangeSpec.SHA {
+			fmt.Fprintf(os.Stderr, "herd harvest-merge: --candidate %s disagrees with --candidate-range endpoint %s\n", *candidate, rangeSpec.SHA)
+			os.Exit(2)
+		}
+		*candidate = rangeSpec.SHA
+	}
+	commits, err := harvestCommits(*base, *branch, rangeSpec)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "herd harvest-merge: git cherry %s %s: %v\n", *base, *branch, err)
+		fmt.Fprintf(os.Stderr, "herd harvest-merge: %v\n", err)
 		os.Exit(1)
 	}
-	commits := harvestmerge.UniqueCommits(string(cherry))
 
 	report, err := resolveHarvestCandidate(*branch, *candidate)
 	if err != nil {
@@ -264,9 +278,13 @@ func runHarvestMerge() {
 	// check: PR #151 merged 0 additions / 0 deletions / 0 files because the
 	// branch carried only its anchor commit. Computed here rather than passed in
 	// so the gate cannot be bypassed by a caller that simply omits it.
-	diffstatOut, diffErr := exec.Command("git", "diff", "--shortstat", *base+"..."+*branch).Output()
+	diffTarget := *branch
+	if rangeSpec.SHA != "" {
+		diffTarget = rangeSpec.SHA
+	}
+	diffstatOut, diffErr := exec.Command("git", "diff", "--shortstat", *base+"..."+diffTarget).Output()
 	if diffErr != nil {
-		fmt.Fprintf(os.Stderr, "herd harvest-merge: git diff --shortstat %s...%s: %v\n", *base, *branch, diffErr)
+		fmt.Fprintf(os.Stderr, "herd harvest-merge: git diff --shortstat %s...%s: %v\n", *base, diffTarget, diffErr)
 		os.Exit(1)
 	}
 	diffstat := strings.TrimSpace(string(diffstatOut))
@@ -319,6 +337,21 @@ func runHarvestMerge() {
 	fmt.Printf("  git push -u origin %s && gh pr create --title %q\n", plan.TempBranch, *title)
 	// The worktree is intentionally KEPT on success: the coordinator pushes
 	// from it. Cleanup on success is the caller's, after publishing.
+}
+
+// harvestCommits selects only the commits represented by the reviewed range
+// when scoped mode is requested. Without a range it preserves the historical
+// branch-wide behavior, including its conflict self-abort gate.
+func harvestCommits(base, branch string, reviewed harvestmerge.CandidateRange) ([]string, error) {
+	cherryBase, target := base, branch
+	if reviewed.SHA != "" {
+		cherryBase, target = reviewed.Base, reviewed.SHA
+	}
+	cherry, err := exec.Command("git", "cherry", cherryBase, target).Output()
+	if err != nil {
+		return nil, fmt.Errorf("git cherry %s %s: %w", cherryBase, target, err)
+	}
+	return harvestmerge.UniqueCommits(string(cherry)), nil
 }
 
 // harvestCandidateReport is the provenance-first decision made before any

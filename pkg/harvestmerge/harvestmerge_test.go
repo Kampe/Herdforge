@@ -161,6 +161,36 @@ func TestUniqueCommitsSkipsAlreadyUpstreamPatches(t *testing.T) {
 	}
 }
 
+func TestParseCandidateRange(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  CandidateRange
+		bad   bool
+	}{
+		{name: "exact range", input: "origin/main..abc123", want: CandidateRange{Base: "origin/main", SHA: "abc123"}},
+		{name: "trim outer whitespace", input: "  base..sha  ", want: CandidateRange{Base: "base", SHA: "sha"}},
+		{name: "missing base", input: "..sha", bad: true},
+		{name: "missing candidate", input: "base..", bad: true},
+		{name: "symmetric range", input: "base...sha", bad: true},
+		{name: "embedded whitespace", input: "base..sha value", bad: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := ParseCandidateRange(tt.input)
+			if tt.bad {
+				if err == nil {
+					t.Fatalf("ParseCandidateRange(%q) unexpectedly succeeded: %+v", tt.input, got)
+				}
+				return
+			}
+			if err != nil || got != tt.want {
+				t.Fatalf("ParseCandidateRange(%q) = %+v, %v; want %+v", tt.input, got, err, tt.want)
+			}
+		})
+	}
+}
+
 func TestValidateRefusesUnmergeableHarvests(t *testing.T) {
 	base := Plan{Lane: "smith", Title: "feat: x", Commits: []string{"aaa"}, Verdict: PASS, Diffstat: " 2 files changed, 10 insertions(+)"}
 	if err := base.Validate(); err != nil {

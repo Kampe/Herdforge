@@ -7,8 +7,67 @@ import (
 	"testing"
 
 	"github.com/Kampe/Herdforge/internal/testgit"
+	"github.com/Kampe/Herdforge/pkg/harvestmerge"
 	"github.com/Kampe/Herdforge/pkg/reviewledger"
 )
+
+// A standing branch may contain deliberately conflicting history after the
+// reviewed candidate. Scoped mode must not select that history; the default
+// branch-wide mode must continue selecting it so harvestBody can self-abort.
+func TestHarvestCommitsCandidateRangeExcludesOutOfScopeHistory(t *testing.T) {
+	t.Chdir(t.TempDir())
+	gitCandidateTest(t, "init", "-q", "-b", "main")
+	gitCandidateTest(t, "config", "user.email", "test@example.com")
+	gitCandidateTest(t, "config", "user.name", "test")
+	writeCandidateFile(t, "shared.txt", "base\n")
+	gitCandidateTest(t, "add", "shared.txt")
+	gitCandidateTest(t, "commit", "-q", "-m", "base")
+	baseSHA := gitCandidateOutput(t, "rev-parse", "HEAD")
+	gitCandidateTest(t, "branch", "standing/lane")
+	gitCandidateTest(t, "checkout", "-q", "standing/lane")
+	writeCandidateFile(t, "reviewed.txt", "reviewed\n")
+	gitCandidateTest(t, "add", "reviewed.txt")
+	gitCandidateTest(t, "commit", "-q", "-m", "reviewed")
+	reviewed := gitCandidateOutput(t, "rev-parse", "HEAD")
+	gitCandidateTest(t, "checkout", "-q", "main")
+	writeCandidateFile(t, "shared.txt", "main landing change\n")
+	gitCandidateTest(t, "add", "shared.txt")
+	gitCandidateTest(t, "commit", "-q", "-m", "main landing")
+	gitCandidateTest(t, "checkout", "-q", "standing/lane")
+	writeCandidateFile(t, "shared.txt", "out-of-scope conflicting rewrite\n")
+	gitCandidateTest(t, "add", "shared.txt")
+	gitCandidateTest(t, "commit", "-q", "-m", "stale conflict")
+
+	scoped, err := harvestCommits("main", "standing/lane", harvestmerge.CandidateRange{Base: baseSHA, SHA: reviewed})
+	if err != nil {
+		t.Fatalf("scoped selection: %v", err)
+	}
+	if len(scoped) != 1 || scoped[0] == "" {
+		t.Fatalf("scoped commits = %v, want only reviewed commit", scoped)
+	}
+	unscoped, err := harvestCommits("main", "standing/lane", harvestmerge.CandidateRange{})
+	if err != nil {
+		t.Fatalf("unscoped selection: %v", err)
+	}
+	if len(unscoped) != 2 {
+		t.Fatalf("unscoped commits = %v, want reviewed and out-of-scope commits", unscoped)
+	}
+
+	scopedDir := filepath.Join(t.TempDir(), "scoped")
+	if err := harvestBody(scopedDir, "main", "harvest/scoped", scoped, false); err != nil {
+		t.Fatalf("scoped harvest must apply cleanly: %v", err)
+	}
+	gitCandidateTest(t, "worktree", "remove", "--force", scopedDir)
+	gitCandidateTest(t, "branch", "-D", "harvest/scoped")
+
+	unscopedDir := filepath.Join(t.TempDir(), "unscoped")
+	err = harvestBody(unscopedDir, "main", "harvest/unscoped", unscoped, false)
+	if err == nil || !strings.Contains(err.Error(), "conflicted") {
+		t.Fatalf("unscoped harvest must preserve conflict self-abort, got %v", err)
+	}
+	gitCandidateTest(t, "worktree", "remove", "--force", unscopedDir)
+	gitCandidateTest(t, "branch", "-D", "harvest/unscoped")
+}
 
 func TestResolveHarvestCandidatePinsReviewedSHAAcrossTipDrift(t *testing.T) {
 	t.Chdir(t.TempDir())
