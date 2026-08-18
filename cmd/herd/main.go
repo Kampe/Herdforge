@@ -718,6 +718,7 @@ lanes:
 
 verification:
   test_command: %q
+  test_timeout: "30m"
 `, projectName, taskProvider, providerConfig, testCommand)
 	if err := os.WriteFile(cfgPath, []byte(defaultConfig), 0644); err != nil {
 		fmt.Fprintf(os.Stderr, "failed to write default config: %v\n", err)
@@ -7329,6 +7330,7 @@ func verificationCommandProfile(root string) (verifier.CommandProfile, string, e
 		ID:           verificationProfile,
 		BuildCommand: "go build ./...",
 		TestCommand:  "go test ./...",
+		TestTimeout:  30 * time.Minute,
 	}
 	path := filepath.Join(root, ".herd", "herd.yaml")
 	data, err := os.ReadFile(path)
@@ -7346,6 +7348,12 @@ func verificationCommandProfile(root string) (verifier.CommandProfile, string, e
 		return profile, "", errors.New("verification.test_command is required")
 	}
 	profile.TestCommand = strings.TrimSpace(cfg.Verification.TestCommand)
+	if raw := strings.TrimSpace(cfg.Verification.TestTimeout); raw != "" {
+		profile.TestTimeout, err = time.ParseDuration(raw)
+		if err != nil || profile.TestTimeout <= 0 {
+			return profile, "", fmt.Errorf("verification.test_timeout must be a positive Go duration: %q", raw)
+		}
+	}
 	profile.PreflightCommand = strings.TrimSpace(cfg.Verification.PreflightCommand)
 	sum := sha256.Sum256(data)
 	return profile, "sha256:" + hex.EncodeToString(sum[:]), nil
@@ -7440,6 +7448,13 @@ func runVerify() {
 		// explicit command flags and bind receipts to exactly what ran.
 		executionProfile.BuildCommand = strings.TrimSpace(*buildCmd)
 		executionProfile.TestCommand = strings.TrimSpace(*testCmd)
+	} else {
+		var timeoutErr error
+		executionProfile.TestCommand, timeoutErr = verifier.ApplyTestTimeout(executionProfile.TestCommand, executionProfile.TestTimeout)
+		if timeoutErr != nil {
+			fmt.Fprintf(os.Stderr, "herd verify: apply test timeout: %v\n", timeoutErr)
+			os.Exit(2)
+		}
 	}
 	if tcErr == nil {
 		// A checkout without a repository profile is local-development mode;

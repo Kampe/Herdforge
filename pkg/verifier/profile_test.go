@@ -1,6 +1,31 @@
 package verifier
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
+
+func TestApplyTestTimeout(t *testing.T) {
+	tests := []struct {
+		name, command, want string
+	}{
+		{name: "go test gets configured timeout", command: "go test ./...", want: "go test -timeout=30m0s ./..."},
+		{name: "existing timeout is preserved", command: "go test -timeout=45m ./...", want: "go test -timeout=45m ./..."},
+		{name: "split timeout is preserved", command: "go test -timeout 45m ./...", want: "go test -timeout 45m ./..."},
+		{name: "non go command is unchanged", command: "npm test", want: "npm test"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := ApplyTestTimeout(tt.command, 30*time.Minute)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != tt.want {
+				t.Fatalf("ApplyTestTimeout(%q) = %q, want %q", tt.command, got, tt.want)
+			}
+		})
+	}
+}
 
 func TestCommandProfileMatchesConfiguredCommands(t *testing.T) {
 	profile := CommandProfile{

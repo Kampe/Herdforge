@@ -345,6 +345,7 @@ type LaneDef struct {
 
 type Verification struct {
 	TestCommand      string `yaml:"test_command"`
+	TestTimeout      string `yaml:"test_timeout,omitempty"`
 	PreflightCommand string `yaml:"preflight_command,omitempty"`
 }
 
@@ -395,6 +396,12 @@ func (c *Config) Validate() error {
 	}
 	if _, _, _, _, _, err := c.TaskProvider.Deadlines.Resolved(); err != nil {
 		return err
+	}
+	if raw := strings.TrimSpace(c.Verification.TestTimeout); raw != "" {
+		d, err := time.ParseDuration(raw)
+		if err != nil || d <= 0 {
+			return fmt.Errorf("verification.test_timeout must be a positive Go duration: %q", raw)
+		}
 	}
 	if err := c.WorktreeBootstrap.Validate(); err != nil {
 		return err
