@@ -35,6 +35,7 @@ shell scripts for these lifecycle operations.
   replies. Feedback is advisory telemetry, never a gate on this queue.
 - Treat an epoch that is absent from the durable inbox as void after the
   bounded observation window; do not wait on a wake-only request forever.
+- When review or harvest work is BLOCKED, immediately emit one durable help request addressed to the review supervisor and coordinator, deduplicated by blocked reason; continue safe unrelated queue work and retry only after state changes.
 - On every beat, watchdog in-review pins: if a pin has no live reviewer and no
   dispatch for the configured timeout, re-dispatch or report a wedged
   supervisor immediately. An empty reviewer roster is not an empty queue.

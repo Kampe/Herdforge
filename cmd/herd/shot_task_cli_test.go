@@ -156,6 +156,13 @@ func TestShotReportBlockedCarriesDetail(t *testing.T) {
 	if callbacks[0].Detail != "waiting on FAC-172" {
 		t.Fatalf("blocked callback lost its detail: %+v", callbacks[0])
 	}
+	help, err := mail.NewMailbox(filepath.Join(repo, ".herd", "control-mail.jsonl")).DrainHelpRequests("supervisor")
+	if err != nil {
+		t.Fatalf("drain help requests: %v", err)
+	}
+	if len(help) != 1 || help[0].TaskRef != "FAC-89" || help[0].Capability != "implementation" || help[0].SuggestedHelper != "domain-lane" {
+		t.Fatalf("blocked report did not route targeted implementation help: %+v", help)
+	}
 }
 
 // An unfenced or unanchored report is refused, and nothing reaches the mailbox.

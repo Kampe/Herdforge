@@ -330,6 +330,24 @@ func postShotCallback(root, ref, kind, sha, detail string, lease int64) error {
 	if _, err := shotMailbox(root).PostCallback("shot:"+strings.ToLower(ref), cb); err != nil {
 		return fmt.Errorf("post callback: %w", err)
 	}
+	if cb.Kind == mail.CallbackBlocked {
+		kind := router.HelpKindForReason(cb.Detail)
+		route, routeErr := router.DefaultHelpRoute(kind)
+		if routeErr != nil {
+			return fmt.Errorf("route blocked help request: %w", routeErr)
+		}
+		req := mail.HelpRequest{
+			Lane:            "shot:" + strings.ToLower(ref),
+			TaskRef:         ref,
+			Reason:          cb.Detail,
+			Capability:      route.Capability,
+			SuggestedHelper: route.Target,
+			SuggestedFamily: route.Family,
+		}
+		if _, helpErr := shotMailbox(root).PostHelpRequest(req.Lane, req); helpErr != nil {
+			return fmt.Errorf("post blocked help request: %w", helpErr)
+		}
+	}
 	return nil
 }
 
