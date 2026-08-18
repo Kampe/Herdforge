@@ -31,12 +31,12 @@ type BoardDrift struct {
 // BoardFinding is one classified drift. Action holds the exact remediation
 // text, matching the zsh findings verbatim where one exists.
 type BoardFinding struct {
-	Kind    string // SHIPPED, UNKNOWN, STALE, BOARD_LAG
-	Ref     string
-	TaskID  string
-	Status  string
-	Title   string
-	Action  string
+	Kind   string // SHIPPED, UNKNOWN, STALE, BOARD_LAG
+	Ref    string
+	TaskID string
+	Status string
+	Title  string
+	Action string
 }
 
 // LaneRef is a live lane observed by board-sync. Name is the agent/tab label
@@ -202,13 +202,13 @@ func (b *BoardSyncer) classify(ctx context.Context, facts *bsyncFacts, t *provid
 	switch t.Status {
 	case "in-progress", "in-review":
 		switch {
-		case active:
-			return nil // being worked, board is honest
 		case merged:
 			return &BoardFinding{
 				Kind: "SHIPPED", Ref: ref, TaskID: t.ID, Status: t.Status, Title: t.Title,
 				Action: "verify, then: kaneo task status " + t.ID + " done",
 			}
+		case active:
+			return nil // being worked, board is honest
 		case facts.workInFlight:
 			// Cannot prove death while lanes hold unpushed or uncommitted
 			// work; degrade to a LABELLED UNKNOWN with no status-flip remedy.
