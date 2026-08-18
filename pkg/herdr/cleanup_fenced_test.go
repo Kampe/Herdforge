@@ -63,6 +63,29 @@ func TestCleanupFenced_DryRunNoCandidatesIsNotError(t *testing.T) {
 	}
 }
 
+func TestCleanupFencedInWorkspace_ExcludesForeignWorkspaceBeforeMutation(t *testing.T) {
+	stubAgentList(t, fencedAgentListJSON(`[
+		{"name":"task-fac-local","agent_status":"done","tab_id":"local","pane_id":"p1","workspace_id":"wK","revision":1},
+		{"name":"task-chainseer","agent_status":"done","tab_id":"foreign","pane_id":"p2","workspace_id":"wB","revision":1}
+	]`))
+	var closed []string
+	restore := SetCleanupCloseForTest(func(agent AgentEntry) CleanupAttempt {
+		closed = append(closed, agent.TabID)
+		return CleanupAttempt{Name: agent.Name, TabID: agent.TabID, Outcome: CleanupClosed, Reason: "test close"}
+	})
+	defer restore()
+	res, err := CleanupFencedInWorkspace("wK", nil, false)
+	if err != nil {
+		t.Fatalf("workspace cleanup: %v", err)
+	}
+	if len(res.Candidates) != 1 || res.Candidates[0].TabID != "local" {
+		t.Fatalf("candidates crossed workspace fence: %+v", res.Candidates)
+	}
+	if len(closed) != 1 || closed[0] != "local" {
+		t.Fatalf("mutations crossed workspace fence: %v", closed)
+	}
+}
+
 func TestCleanupFenced_MutationFailsClosedWithoutGeneration(t *testing.T) {
 	old := runHerdr
 	t.Cleanup(func() { runHerdr = old })
