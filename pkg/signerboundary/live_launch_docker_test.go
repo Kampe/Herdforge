@@ -12,6 +12,14 @@ import (
 // ProvisionAndLaunch path inside Docker (not the hand-rolled serve setup).
 // Proves ledger ACL chown, sealed session, RunAs B/R prove, no session hex.
 func TestLiveLaunch_CompiledProvisionAndLaunch(t *testing.T) {
+	// FAC-421: this test bind-mounts the entire module root into a privileged
+	// (--user 0:0) container and runs go build/go test against it. Running
+	// unconditionally whenever Docker happens to be present made it fire
+	// during ordinary `go test ./...` in a live builder worktree, corrupting
+	// sibling worktrees' on-disk state. Opt-in only.
+	if os.Getenv("HERD_FAC169_RUN_DOCKER") != "1" {
+		t.Skip("set HERD_FAC169_RUN_DOCKER=1 to run this container-mounting test")
+	}
 	if os.Getenv("HERD_FAC169_SKIP_DOCKER") == "1" {
 		t.Skip("skip docker")
 	}

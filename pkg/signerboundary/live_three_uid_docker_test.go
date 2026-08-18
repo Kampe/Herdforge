@@ -15,6 +15,12 @@ import (
 // Skip when docker unavailable or HERD_FAC169_SKIP_DOCKER=1.
 
 func TestLiveThreeUID_Docker(t *testing.T) {
+	// FAC-421: this test bind-mounts the entire module root into a privileged
+	// (--user 0:0) container. See TestLiveLaunch_CompiledProvisionAndLaunch
+	// for the incident this opt-in gate prevents.
+	if os.Getenv("HERD_FAC169_RUN_DOCKER") != "1" {
+		t.Skip("set HERD_FAC169_RUN_DOCKER=1 to run this container-mounting test")
+	}
 	if os.Getenv("HERD_FAC169_SKIP_DOCKER") == "1" {
 		t.Skip("HERD_FAC169_SKIP_DOCKER=1")
 	}
