@@ -5274,7 +5274,7 @@ func findLaneForRole(cfg *config.Config, role string) *config.LaneDef {
 // reviewer or harvest lane, so those remain explicit fallbacks. The
 // coordinator is never selected by this helper.
 func findReviewSupervisorLane(cfg *config.Config) *config.LaneDef {
-	for _, role := range []string{"review-supervisor", "review_harvest_supervisor", "harvest-supervisor", "reviewer", "harvest"} {
+	for _, role := range []string{"review-supervisor", "review-harvest-supervisor", "review_harvest_supervisor", "harvest-supervisor", "reviewer", "harvest"} {
 		if lane := findLaneForRole(cfg, role); lane != nil {
 			return lane
 		}
