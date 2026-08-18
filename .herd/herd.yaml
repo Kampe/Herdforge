@@ -176,6 +176,40 @@ lanes:
     capabilities: ["git-write", "fs-write", "shell-exec"]
     incompatible_with: ["reviewer"]
 
+  # smith-agy — capacity on a healthy pool when grok/codex are
+  # weekly-exhausted (2026-08-18) and claude is at its concurrency cap.
+  - name: "smith-agy"
+    role: "worker"
+    agent_kind: "agy"
+    harness: "agy"
+    prompt: ".herd/prompts/worker.md"
+    worktree: ".worktrees/smith-agy"
+    provider: "agy"
+    model: "claude-opus-4-6-thinking"
+    effort: "medium"
+    task_shape: "implementation"
+    standing: false
+    authority: "write"
+    capabilities: ["git-write", "fs-write", "shell-exec"]
+    incompatible_with: ["reviewer"]
+
+  # smith-opencode — opencode's LiteLLM gateway (GLM-5.2, Qwen3.5, etc.),
+  # extra capacity independent of the native provider quota pools above.
+  - name: "smith-opencode"
+    role: "worker"
+    agent_kind: "opencode"
+    harness: "opencode"
+    prompt: ".herd/prompts/worker.md"
+    worktree: ".worktrees/smith-opencode"
+    provider: "opencode-ollama"
+    model: "litellm/ollama/glm-5.2:cloud"
+    effort: "medium"
+    task_shape: "implementation"
+    standing: false
+    authority: "write"
+    capabilities: ["git-write", "fs-write", "shell-exec"]
+    incompatible_with: ["reviewer"]
+
   # assayer — independent review. Reviewer independence is enforced from
   # candidate provenance. Worker/forge lanes use the Codex harness with the
   # explicit Codex/Luna/medium route; review effort is medium by default and high only
@@ -190,8 +224,15 @@ lanes:
     model: "claude-sonnet-5"
     effort: "medium"
     task_shape: "qa"
+    # 2026-08-18: codex is quota-exhausted and excluded from review routing
+    # via herdr-route cooldown. claude-sonnet-5/grok-4.5 can be
+    # concurrency-capped by this fleet's own builder lanes, so fall back to
+    # genuinely-free capacity (agy, then lazer's GLM-5.2) rather than
+    # stalling on a saturated pool.
     fallback_models:
       - "grok-4.5"
+      - "claude-opus-4-6-thinking"
+      - "glm-5.2"
     standing: false
     authority: "read"
     capabilities: ["network"]
