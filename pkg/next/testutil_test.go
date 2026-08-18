@@ -13,6 +13,7 @@ type testTask struct {
 	title       string
 	status      string
 	priority    string
+	labels      []string
 	description string
 }
 
@@ -36,6 +37,7 @@ func (tp *testProvider) GetTask(_ context.Context, id string) (*provider.Task, e
 				Title:       t.title,
 				Status:      t.status,
 				Priority:    provider.Priority(t.priority),
+				Labels:      t.labels,
 				Description: t.description,
 			}, nil
 		}
@@ -54,6 +56,7 @@ func (tp *testProvider) ListTasks(_ context.Context, _, statusFilter string) ([]
 				Title:       t.title,
 				Status:      t.status,
 				Priority:    provider.Priority(t.priority),
+				Labels:      t.labels,
 				Description: t.description,
 			})
 		}

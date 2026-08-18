@@ -41,6 +41,7 @@ type NextAction struct {
 type NextPicker struct {
 	Config         *config.Config
 	TaskProvider   provider.TaskProvider
+	Role           string
 	ReviewArtifact string
 	InboxDir       string
 }
@@ -147,7 +148,7 @@ func (p *NextPicker) evalAll(ctx context.Context) ([]*NextAction, error) {
 	// Priority 6: Claim new task (default if nothing blocking). Preview the
 	// provenance gate before presenting a claim action so missing herd-deps-v1
 	// is repaired before a Forge cycle spends a lease and then fails.
-	preview, err := PreviewClaimQueue(ctx, p.TaskProvider, p.Config)
+	preview, err := PreviewClaimQueue(ctx, p.TaskProvider, p.Config, p.Role)
 	if err != nil {
 		return nil, err
 	}
@@ -187,9 +188,16 @@ func (p ClaimPreview) Description() string {
 // PreviewClaimQueue performs the cheap, deterministic portion of claim
 // admission. It is not a replacement for deps.ValidateClaim; it exposes
 // obvious provenance omissions before a Forge cycle reports a late failure.
-func PreviewClaimQueue(ctx context.Context, tp provider.TaskProvider, cfg *config.Config) (ClaimPreview, error) {
+func PreviewClaimQueue(ctx context.Context, tp provider.TaskProvider, cfg *config.Config, roles ...string) (ClaimPreview, error) {
 	if tp == nil || cfg == nil {
 		return ClaimPreview{}, fmt.Errorf("claim preview requires provider and config")
+	}
+	role := ""
+	if len(roles) > 1 {
+		return ClaimPreview{}, fmt.Errorf("claim preview accepts at most one role filter")
+	}
+	if len(roles) == 1 {
+		role = strings.TrimSpace(roles[0])
 	}
 	tasks, err := tp.ListTasks(ctx, cfg.TaskProvider.ProjectID, "to-do")
 	if err != nil {
@@ -210,6 +218,9 @@ func PreviewClaimQueue(ctx context.Context, tp provider.TaskProvider, cfg *confi
 		if task == nil || strings.TrimSpace(task.Ref) == "" {
 			continue
 		}
+		if role != "" && !taskMatchesRole(task, role) {
+			continue
+		}
 		prov, provErr := deps.ExtractProvenanceFromText(task.Description)
 		if provErr != nil || prov == nil || !prov.Present {
 			preview.ProvenanceBlocked++
@@ -219,6 +230,18 @@ func PreviewClaimQueue(ctx context.Context, tp provider.TaskProvider, cfg *confi
 		preview.Claimable++
 	}
 	return preview, nil
+}
+
+func taskMatchesRole(task *provider.Task, role string) bool {
+	if task == nil || len(task.Labels) == 0 {
+		return true
+	}
+	for _, label := range task.Labels {
+		if strings.EqualFold(strings.TrimSpace(label), role) {
+			return true
+		}
+	}
+	return false
 }
 
 func (p *NextPicker) pendingVerdicts() []string {
