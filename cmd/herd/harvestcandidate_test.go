@@ -180,7 +180,7 @@ func TestResolveHarvestCandidateAcceptsAttestedReconstruction(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read ledger: %v", err)
 	}
-	if len(rows) != 2 || rows[1].Event != string(reviewledger.EventReconstruction) || rows[1].SHA != reconstructed || rows[1].CandidateSHA != reviewed || rows[1].ContentProof != "reviewed content was reconstructed exactly" {
+	if len(rows) != 3 || rows[2].Event != string(reviewledger.EventReconstruction) || rows[2].SHA != reconstructed || rows[2].CandidateSHA != reviewed || rows[2].ContentProof != "reviewed content was reconstructed exactly" {
 		t.Fatalf("reconstruction ledger rows = %+v", rows)
 	}
 }
