@@ -145,6 +145,14 @@ func (l *Ledger) Tier(sha string) (string, error) {
 	return tier, nil
 }
 
+// TierReport is the durable evidence surfaced by the review-ledger CLI.
+// Keeping the candidate SHA alongside its tier prevents an empty tier from
+// being mistaken for a successful lookup of a different candidate.
+type TierReport struct {
+	SHA  string `json:"sha"`
+	Tier string `json:"tier"`
+}
+
 // VerdictOpts carries fields for Verdict.
 type VerdictOpts struct {
 	SHA            string
@@ -366,14 +374,30 @@ func resolveFamily(lbf, lrf, vbf, vrf string) familyState {
 func (l *Ledger) Eligible(sha, builderFamily string) (bool, error) {
 	rows, err := readRows(l.Path)
 	if err != nil {
-		return false, err
+		return false, fmt.Errorf("herd-review-ledger: refuse sha=%s reason=ledger read error: %w", sha, err)
 	}
 	qrows, err := readRows(l.QueuePath)
 	if err != nil {
-		return false, err
+		return false, fmt.Errorf("herd-review-ledger: refuse sha=%s reason=queue read error: %w", sha, err)
 	}
 
 	sha = l.NormalizeSHA(sha)
+	hasRecord := false
+	superseded := false
+	for _, r := range rows {
+		if r.Event == string(EventRecord) && r.SHA == sha {
+			hasRecord = true
+		}
+		if r.Event == string(EventSupersession) && r.Task == sha {
+			superseded = true
+		}
+	}
+	if superseded {
+		return false, fmt.Errorf("herd-review-ledger: refuse sha=%s reason=superseded", sha)
+	}
+	if !hasRecord {
+		return false, fmt.Errorf("herd-review-ledger: refuse sha=%s reason=no record", sha)
+	}
 
 	launch := make(map[string]LedgerRow)
 	for _, r := range rows {
@@ -399,7 +423,7 @@ func (l *Ledger) Eligible(sha, builderFamily string) (bool, error) {
 	}
 
 	if done[sha] {
-		return false, nil
+		return false, fmt.Errorf("herd-review-ledger: refuse sha=%s reason=consumed", sha)
 	}
 
 	// SHA-level veto: any FAIL/BLOCKED from a valid reviewer blocks eligibility.
@@ -427,10 +451,11 @@ func (l *Ledger) Eligible(sha, builderFamily string) (bool, error) {
 		}
 	}
 	if hasVeto {
-		return false, nil
+		return false, fmt.Errorf("herd-review-ledger: refuse sha=%s reason=review veto (FAIL or BLOCKED)", sha)
 	}
 
 	hasPass := false
+	familyMismatch := false
 	for k, verdict := range latest {
 		sparts := strings.SplitN(k, ":", 2)
 		if len(sparts) != 2 || sparts[0] != sha {
@@ -476,6 +501,7 @@ func (l *Ledger) Eligible(sha, builderFamily string) (bool, error) {
 				hasPass = true
 				continue
 			}
+			familyMismatch = true
 			continue
 		}
 
@@ -483,6 +509,7 @@ func (l *Ledger) Eligible(sha, builderFamily string) (bool, error) {
 			hasPass = true
 			continue
 		}
+		familyMismatch = true
 	}
 
 	if !hasPass {
@@ -506,7 +533,10 @@ func (l *Ledger) Eligible(sha, builderFamily string) (bool, error) {
 				}
 			}
 		}
-		return false, fmt.Errorf("herd-review-ledger: refuse sha=%s", sha)
+		if familyMismatch {
+			return false, fmt.Errorf("herd-review-ledger: refuse sha=%s reason=family mismatch", sha)
+		}
+		return false, fmt.Errorf("herd-review-ledger: refuse sha=%s reason=no qualifying PASS", sha)
 	}
 
 	return true, nil
@@ -616,7 +646,7 @@ func (l *Ledger) Queued() ([]LedgerRow, error) {
 		}
 	}
 
-	var result []LedgerRow
+	result := make([]LedgerRow, 0, len(shaEnqueues))
 	for sha, eq := range shaEnqueues {
 		if done[sha] {
 			continue
