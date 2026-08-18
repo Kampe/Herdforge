@@ -58,6 +58,41 @@ func TestTestRouterAvailabilityFixtureIsHermetic(t *testing.T) {
 	}
 }
 
+func TestPickCountsExactLiveModelAndRecoversAfterAgentExit(t *testing.T) {
+	clearRouteEnv(t)
+	computed := map[string]usage.BurnState{
+		"claude": {Pools: map[string]usage.BurnState{
+			"fable": {Class: usage.BurnOnpace, Available: true},
+		}},
+	}
+	r := testRouter(computed, "claude")
+	active := true
+	r.Probes.LiveCount = func(provider, model, pool string) (int, error) {
+		if provider != "claude" || model != "claude-fable-5" || pool != "fable" {
+			t.Fatalf("live probe received %s/%s/%s", provider, model, pool)
+		}
+		if active {
+			return 2, nil
+		}
+		return 0, nil
+	}
+	if _, err := r.Pick("coordinator", "claude", ""); err == nil || !strings.Contains(err.Error(), "no healthy provider") {
+		t.Fatalf("full live fable pool must block routing, got %v", err)
+	}
+
+	active = false // models an uncleanly exited coordinator disappearing from Herdr.
+	route, err := r.Pick("coordinator", "claude", "")
+	if err != nil {
+		t.Fatalf("route should recover after the live agent disappears: %v", err)
+	}
+	if route.Provider != "claude" || route.Model != "claude-fable-5" {
+		t.Fatalf("recovered route=%s/%s, want claude/claude-fable-5", route.Provider, route.Model)
+	}
+	if !strings.Contains(route.Availability, "live=0") {
+		t.Fatalf("route omitted reconciled live count: %q", route.Availability)
+	}
+}
+
 // The verbatim tables from bin/herd-route. If one of these fails, the port
 // has drifted from the shell contract.
 func TestModelForTable(t *testing.T) {

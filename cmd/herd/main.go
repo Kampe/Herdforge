@@ -54,6 +54,7 @@ import (
 	"github.com/Kampe/Herdforge/pkg/process"
 	"github.com/Kampe/Herdforge/pkg/provenance"
 	"github.com/Kampe/Herdforge/pkg/provider"
+	"github.com/Kampe/Herdforge/pkg/quotasup"
 	"github.com/Kampe/Herdforge/pkg/resetsafe"
 	"github.com/Kampe/Herdforge/pkg/resolve"
 	"github.com/Kampe/Herdforge/pkg/resources"
@@ -6376,6 +6377,42 @@ func liveScorer() resolve.RouteScorer {
 	}
 }
 
+// liveRouteCount reconciles concurrency against the live Herdr roster. The
+// roster only identifies the harness; pane argv supplies the routed model.
+// Counting by harness alone lets unrelated Claude lanes consume the
+// coordinator's Fable slots and permanently strand a relaunch after a crash.
+func liveRouteCount(provider, model, pool string) (int, error) {
+	agents, err := herdr.AgentList()
+	if err != nil {
+		return 0, err
+	}
+	count := 0
+	for _, agent := range agents {
+		if agent.Status != "working" && agent.Status != "starting" {
+			continue
+		}
+		if !strings.EqualFold(agent.Kind, provider) {
+			continue
+		}
+		processes, processErrs := herdr.PaneProcessArgv(agent.PaneID)
+		if len(processErrs) > 0 && len(processes) == 0 {
+			return 0, fmt.Errorf("agent %q process argv: %v", agent.Name, processErrs[0])
+		}
+		matched := false
+		for _, process := range processes {
+			routedModel := quotasup.ModelFromArgv(process.Argv)
+			if routedModel == model && quotasup.QuotaPool(provider, routedModel) == pool {
+				matched = true
+				break
+			}
+		}
+		if matched {
+			count++
+		}
+	}
+	return count, nil
+}
+
 // runRoute is the herd-route CLI: pick a surface for a task shape.
 func runRoute() {
 	fs := flag.NewFlagSet("route", flag.ExitOnError)
@@ -6400,6 +6437,7 @@ func runRoute() {
 		computed = e.ComputeAll(snap)
 	}
 	sr := router.NewRouter(e, computed)
+	sr.Probes.LiveCount = liveRouteCount
 
 	rt, err := sr.Pick(shape, *provider, *excludeFamily)
 	if err != nil {
