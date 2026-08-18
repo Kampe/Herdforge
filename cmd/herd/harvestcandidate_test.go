@@ -17,6 +17,7 @@ func TestResolveHarvestCandidatePinsReviewedSHAAcrossTipDrift(t *testing.T) {
 	gitCandidateTest(t, "config", "user.name", "test")
 	gitCandidateTest(t, "commit", "--allow-empty", "-q", "-m", "base")
 	gitCandidateTest(t, "branch", "standing/lane")
+	gitCandidateTest(t, "checkout", "-q", "standing/lane")
 	writeCandidateFile(t, "reviewed.go", "package reviewed\n")
 	gitCandidateTest(t, "add", "reviewed.go")
 	gitCandidateTest(t, "commit", "-q", "-m", "reviewed")
