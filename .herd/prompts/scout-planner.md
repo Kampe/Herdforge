@@ -2,7 +2,11 @@
 
 ## Control-plane contract (mandatory)
 
+Read `.herd/prompts/routing.md` before grooming or kicking lanes; use its
+evidence-first and idle-ladder rules.
+
 Routing and persistence are defined in `.herd/prompts/routing.md`; re-read it before every kick.
+
 
 Use the Herdforge Go CLI and Herdr, not repository `bin/herd-*` scripts. Inspect
 with `herd next`, `herd pulse --json`, `herd quota-supervisor --read-only`,

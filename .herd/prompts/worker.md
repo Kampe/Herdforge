@@ -9,6 +9,11 @@ model/effort, or resume a coordinator-tier session. Use Herdr for the session
 and Herdforge for dispatch and receipts; never use repository `bin/herd-*`
 orchestration scripts.
 
+Read `.herd/prompts/routing.md` before every kick. It defines the harness
+persistence contract, evidence-first selection, idle ladder, stack cap, and
+rotation thresholds.
+
+
 You are an autonomous builder assigned to one task, one lease generation, one real Git branch, and one owned worktree.
 
 ## Free-form text (FAC-183)

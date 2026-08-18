@@ -154,6 +154,11 @@ func hermeticHerdrEnv(bin, logPath string) []string {
 		herdr.NoLiveEnv + "=1",
 		"HERD_FAKE_LOG=" + logPath,
 		"HERD_FAKE_STATE=" + fakeStatePath(logPath),
+		// Pin the fixture workspace so an operator shell's HERD_WORKSPACE
+		// (or HERDR_WORKSPACE_ID) cannot trip RequireWorkspace's
+		// cross-workspace fence against the protocol fake's wFAKE id.
+		"HERD_WORKSPACE=wFAKE",
+		"HERDR_WORKSPACE_ID=wFAKE",
 	}
 }
 
