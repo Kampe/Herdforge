@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/Kampe/Herdforge/pkg/agentpolicy"
+	"github.com/Kampe/Herdforge/pkg/credits"
 	"github.com/Kampe/Herdforge/pkg/posture"
 	"github.com/Kampe/Herdforge/pkg/toolpolicy"
 	"github.com/Kampe/Herdforge/pkg/usage"
@@ -589,6 +590,10 @@ type Probes struct {
 	Launchable func(provider, model string) (bool, string)
 	// Now supplies the clock for cooldown expiry.
 	Now func() time.Time
+	// LiveCount reports the number of live agents using the exact routed
+	// provider/model/pool tuple. A nil function preserves library callers that
+	// do not have a live Herdr roster; production route commands install it.
+	LiveCount func(provider, model, pool string) (int, error)
 }
 
 func defaultProbes() *Probes {
@@ -825,6 +830,20 @@ func (r *SurfaceRouter) available(provider, model, pool string) (bool, string) {
 		if !st.Available && st.Reason != "no-quota-data" {
 			return false, "quota " + st.Reason
 		}
+	}
+	if r.Probes.LiveCount != nil {
+		live, err := r.Probes.LiveCount(provider, model, pool)
+		if err != nil {
+			return false, "live concurrency unknown: " + err.Error()
+		}
+		cap := 2
+		if st, ok := r.quotaState(provider, pool); ok {
+			cap = credits.ClassConcurrency(credits.PaceClass(st.Class))
+		}
+		if live >= cap {
+			return false, fmt.Sprintf("at concurrency cap live=%d cap=%d", live, cap)
+		}
+		return true, fmt.Sprintf("available live=%d cap=%d", live, cap)
 	}
 	return true, "available"
 }
