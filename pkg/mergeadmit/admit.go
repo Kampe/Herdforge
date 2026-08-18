@@ -76,7 +76,13 @@ type Request struct {
 	Residuals []residual.Record
 	// RemoteCI is the exact candidate, policy, repository, and attempt-bound
 	// settlement that policy requires before a local admission may proceed.
-	RemoteCI *remoteci.Settlement
+	RemoteCI          *remoteci.Settlement
+	ReducedProvenance *ReducedProvenance
+}
+
+type ReducedProvenance struct {
+	PullRequest  int
+	VerifyLanded bool
 }
 
 // Decision is the structured admission outcome. Callers gate SOLELY on

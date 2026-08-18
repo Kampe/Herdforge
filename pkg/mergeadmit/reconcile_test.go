@@ -181,3 +181,44 @@ func TestReconcileLandedIsIdempotent(t *testing.T) {
 		t.Fatalf("replay minted a different receipt: %s vs %s", short(first.Digest), short(second.Digest))
 	}
 }
+
+func TestReconcileLandedReducedProvenanceUsesExactVerdictAndProof(t *testing.T) {
+	dir := gitRepo(t)
+	base := commit(t, dir, "a.txt", "one\n", "base")
+	run(t, dir, "git", "checkout", "-q", "-b", "work")
+	candidate := commit(t, dir, "b.txt", "two\n", "candidate")
+	landed := rewriteOnto(t, dir, "landed", base, []string{candidate})
+	l := newLedger(t, dir)
+	launch(t, l, candidate, "reviewer-a", "anthropic", "builder-session-1")
+	verdict(t, l, candidate, "reviewer-a", reviewledger.VerdictPASS)
+	g := &Gate{RepoDir: dir, Ledger: l, Policy: testPolicy(), Live: LiveState{OriginMain: StaticProbe(landed)}}
+	req := Request{Ref: testRef, CandidateSHA: candidate, BaseSHA: base, ReducedProvenance: &ReducedProvenance{PullRequest: 2864, VerifyLanded: true}}
+	receipt, err := g.ReconcileLanded(req)
+	if err != nil {
+		t.Fatalf("reduced reconcile: %v", err)
+	}
+	if receipt.ProvenanceMode != hsync.ProvenanceReduced || receipt.PullRequest != 2864 {
+		t.Fatalf("reduced receipt provenance = %q/%d", receipt.ProvenanceMode, receipt.PullRequest)
+	}
+	if receipt.TaskID != "" || receipt.ProviderRevision != "" || receipt.AcceptanceDigest != "" {
+		t.Fatal("reduced receipt fabricated omitted provenance")
+	}
+	if receipt.Digest == "" || receipt.Digest != receipt.ComputeDigest() {
+		t.Fatal("reduced receipt is not sealed")
+	}
+}
+
+func TestReconcileLandedReducedProvenanceRefusesMissingMinimum(t *testing.T) {
+	g := &Gate{Ledger: &reviewledger.Ledger{}, Policy: testPolicy()}
+	for name, rp := range map[string]*ReducedProvenance{
+		"missing pr":    {VerifyLanded: true},
+		"missing proof": {PullRequest: 2864},
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := g.ReconcileLanded(Request{Ref: testRef, CandidateSHA: shaCurrent, BaseSHA: shaBase, ReducedProvenance: rp})
+			if err == nil || !strings.Contains(err.Error(), "reduced provenance requires") {
+				t.Fatalf("expected hard refusal, got %v", err)
+			}
+		})
+	}
+}
