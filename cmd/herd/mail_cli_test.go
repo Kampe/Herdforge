@@ -2,10 +2,56 @@ package main
 
 import (
 	"encoding/json"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/Kampe/Herdforge/pkg/mail"
 )
+
+func TestControlMailPathUsesRepositoryCommonRoot(t *testing.T) {
+	root, err := canonicalHerdRoot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HERD_MAIL_FILE", "nested/shared-mail.jsonl")
+
+	got, err := controlMailPath("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := filepath.Join(root, "nested", "shared-mail.jsonl")
+	if got != want {
+		t.Fatalf("shared mail path = %q, want %q", got, want)
+	}
+	if _, err := os.Stat(filepath.Dir(got)); !os.IsNotExist(err) {
+		t.Fatalf("path resolver unexpectedly created %q", filepath.Dir(got))
+	}
+}
+
+func TestControlMailPathRejectsAbsoluteEnvironmentPath(t *testing.T) {
+	t.Setenv("HERD_MAIL_FILE", filepath.Join(t.TempDir(), "mail.jsonl"))
+	if _, err := controlMailPath(""); err == nil {
+		t.Fatal("absolute HERD_MAIL_FILE must be rejected")
+	}
+}
+
+func TestSharedMailPathRoundTripsAcrossLaneHandles(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "nested", "shared-mail.jsonl")
+	planner := mail.NewMailbox(path)
+	supervisor := mail.NewMailbox(path)
+	if _, err := planner.SendMessage("scout-planner", "forge-review-harvest-supervisor", "handoff", "merge-ready"); err != nil {
+		t.Fatal(err)
+	}
+	inbox, err := supervisor.ReadInbox("forge-review-harvest-supervisor")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(inbox) != 1 || inbox[0].Body != "merge-ready" {
+		t.Fatalf("supervisor did not receive planner bytes: %+v", inbox)
+	}
+}
 
 func TestMailCLIHelpDistinguishesOrdinaryAndControlMail(t *testing.T) {
 	out, err := runHerd(t, sandbox(t), nil, "mail", "--help")

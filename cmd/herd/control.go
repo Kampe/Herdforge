@@ -67,14 +67,32 @@ func controlSecret() string {
 	return strings.TrimSpace(os.Getenv("HERD_CONTROL_SECRET"))
 }
 
-func controlMailPath(override string) string {
-	if override != "" {
-		return override
+// controlMailPath resolves the native mail bus from the repository's common
+// root, not the current worktree. Herdr launches planner and supervisor lanes
+// in separate worktrees, so cwd-relative defaults would silently create split
+// brain mailboxes. Explicit --mail paths remain an operator/test escape hatch;
+// environment configuration is always scoped to the common root below.
+func controlMailPath(override string) (string, error) {
+	if strings.TrimSpace(override) != "" {
+		return override, nil
 	}
-	if v := strings.TrimSpace(os.Getenv("HERD_MAIL_FILE")); v != "" {
-		return v
+	root, err := canonicalHerdRoot()
+	if err != nil {
+		return "", fmt.Errorf("resolve shared mail root: %w", err)
 	}
-	return mail.CallbackMailPath(".")
+	configured := strings.TrimSpace(os.Getenv("HERD_MAIL_FILE"))
+	if configured == "" {
+		return mail.CallbackMailPath(root), nil
+	}
+	if filepath.IsAbs(configured) {
+		return "", fmt.Errorf("HERD_MAIL_FILE must be relative to the repository root")
+	}
+	path := filepath.Clean(filepath.Join(root, configured))
+	rel, err := filepath.Rel(root, path)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("HERD_MAIL_FILE escapes the repository root")
+	}
+	return path, nil
 }
 
 func newControlPlane(mailPath string) (*dispatch.ControlPlane, error) {
@@ -134,7 +152,12 @@ func runControlIssue(args []string) {
 		fmt.Fprintln(os.Stderr, "control issue: --agent or --worker required")
 		os.Exit(2)
 	}
-	cp, err := newControlPlane(controlMailPath(*mailPath))
+	path, err := controlMailPath(*mailPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "control issue: %v\n", err)
+		os.Exit(1)
+	}
+	cp, err := newControlPlane(path)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "control issue: %v\n", err)
 		os.Exit(1)
@@ -197,7 +220,12 @@ func runControlDrain(args []string) {
 		fmt.Fprintln(os.Stderr, "control drain: --agent or --worker required")
 		os.Exit(2)
 	}
-	cp, err := newControlPlane(controlMailPath(*mailPath))
+	path, err := controlMailPath(*mailPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "control drain: %v\n", err)
+		os.Exit(1)
+	}
+	cp, err := newControlPlane(path)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "control drain: %v\n", err)
 		os.Exit(1)

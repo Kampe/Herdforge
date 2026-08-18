@@ -48,7 +48,11 @@ func runMailSend(args []string) {
 		fmt.Fprintln(os.Stderr, "mail send: --from, --to, and --body are required")
 		os.Exit(2)
 	}
-	path := controlMailPath(*mailPath)
+	path, err := controlMailPath(*mailPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "mail send: %v\n", err)
+		os.Exit(1)
+	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		fmt.Fprintf(os.Stderr, "mail send: %v\n", err)
 		os.Exit(1)
@@ -75,7 +79,12 @@ func runMailInbox(args []string) {
 		fmt.Fprintln(os.Stderr, "mail inbox: --recipient is required")
 		os.Exit(2)
 	}
-	envelopes, err := mail.NewMailbox(controlMailPath(*mailPath)).ReadInbox(strings.TrimSpace(*recipient))
+	path, err := controlMailPath(*mailPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "mail inbox: %v\n", err)
+		os.Exit(1)
+	}
+	envelopes, err := mail.NewMailbox(path).ReadInbox(strings.TrimSpace(*recipient))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "mail inbox: %v\n", err)
 		os.Exit(1)
