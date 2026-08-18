@@ -110,3 +110,64 @@ func TestHarvestBodyAcceptsNonEmptyDiff(t *testing.T) {
 		t.Fatalf("a non-empty-diff harvest must pass the empty-diff gate: %v", err)
 	}
 }
+
+func TestHarvestBodyUnionMergesConfiguredAppendOnlyFile(t *testing.T) {
+	dir := t.TempDir()
+	run := func(args ...string) {
+		t.Helper()
+		if out, err := testgit.Command(dir, args...).CombinedOutput(); err != nil {
+			t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, out)
+		}
+	}
+	run("init", "-q", "--initial-branch=main")
+	run("config", "user.name", "Herdforge Test")
+	run("config", "user.email", "herdforge-test@example.invalid")
+	run("config", "commit.gpgSign", "false")
+	run("config", "core.hooksPath", "./.herd-test-no-hooks-do-not-create")
+	if err := os.MkdirAll(filepath.Join(dir, "docs"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "docs", "plan.md"), []byte("base\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run("add", "docs/plan.md")
+	run("commit", "-q", "-m", "main: plan")
+	run("branch", "lane-a")
+	run("checkout", "-q", "lane-a")
+	if err := os.WriteFile(filepath.Join(dir, "docs", "plan.md"), []byte("base\nA\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run("commit", "-qam", "lane: A")
+	a, err := testgit.Command(dir, "rev-parse", "HEAD").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	run("checkout", "-q", "main")
+	run("branch", "lane-b")
+	run("checkout", "-q", "lane-b")
+	if err := os.WriteFile(filepath.Join(dir, "docs", "plan.md"), []byte("base\nB\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run("commit", "-qam", "lane: B")
+	b, err := testgit.Command(dir, "rev-parse", "HEAD").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	run("checkout", "-q", "main")
+	t.Chdir(dir)
+	workdir := filepath.Join(dir, ".herd", "worktrees", "harvest-union")
+	t.Cleanup(func() {
+		testgit.Command(dir, "worktree", "remove", "--force", workdir).Run()
+		testgit.Command(dir, "branch", "-D", "harvest/union").Run()
+	})
+	if err := harvestBody(workdir, "main", "harvest/union", []string{strings.TrimSpace(string(a)), strings.TrimSpace(string(b))}, false, []string{"docs/plan.md"}); err != nil {
+		t.Fatalf("configured append-only conflict must resolve: %v", err)
+	}
+	merged, err := os.ReadFile(filepath.Join(workdir, "docs", "plan.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(merged) != "base\nA\nB\n" {
+		t.Fatalf("union merge = %q", merged)
+	}
+}

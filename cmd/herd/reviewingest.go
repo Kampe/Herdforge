@@ -236,6 +236,11 @@ func runHarvestMerge() {
 	dryRun := fs.Bool("dry-run", false, "Plan and gate without creating the worktree")
 	allowMarkers := fs.Bool("allow-markers", false,
 		"Proceed despite conflict markers in the harvested diff (for files whose CONTENT is marker fixtures)")
+	var unionMergePaths []string
+	fs.Func("union-merge-path", "Append-only repository-relative path to union when lanes conflict (repeatable)", func(path string) error {
+		unionMergePaths = append(unionMergePaths, path)
+		return nil
+	})
 	verifyLanded := fs.Bool("verify-landed", false,
 		"Check whether the lane's work is on origin/main (rebase + empty diff) and mint/reconcile the sealed completion receipt.")
 	verifyRef := fs.String("ref", "", "Task ref for --verify-landed receipt reconcile (loads merge-admission or explicit binding flags)")
@@ -358,7 +363,7 @@ func runHarvestMerge() {
 	// most — the very trap chainseer's EXIT trap exists to prevent,
 	// reintroduced. Extraction also makes the body testable without
 	// subprocess orchestration.
-	err = harvestBody(dir, *base, plan.TempBranch, commits, *allowMarkers)
+	err = harvestBody(dir, *base, plan.TempBranch, commits, *allowMarkers, unionMergePaths)
 
 	// Cleanup runs on the FAILURE path only — the worktree is deliberately kept
 	// on success so the coordinator can push from it.
@@ -463,13 +468,23 @@ func resolveHarvestCandidate(branch, requested string) (harvestCandidateReport, 
 // the result. It returns an error rather than calling os.Exit so the caller
 // can run cleanup via a deferred function — os.Exit skips defers, which would
 // leak the worktree on exactly the failure paths where it matters most.
-func harvestBody(dir, base, tempBranch string, commits []string, allowMarkers bool) error {
+func harvestBody(dir, base, tempBranch string, commits []string, allowMarkers bool, configuredUnionPaths ...[]string) error {
+	unionConfig := harvestmerge.UnionMergeConfig{}
+	if len(configuredUnionPaths) > 0 {
+		unionConfig.Paths = configuredUnionPaths[0]
+	}
 	if out, addErr := exec.Command("git", "worktree", "add", "-B", tempBranch, "--", dir, base).CombinedOutput(); addErr != nil {
 		return fmt.Errorf("worktree add: %v: %s", addErr, out)
 	}
 	for _, c := range commits {
 		out, pickErr := exec.Command("git", "-C", dir, "cherry-pick", "--", c).CombinedOutput()
 		if pickErr == nil {
+			continue
+		}
+		if resolved, resolveErr := resolveUnionMergeConflicts(dir, base, unionConfig); resolveErr != nil {
+			exec.Command("git", "-C", dir, "cherry-pick", "--abort").Run()
+			return resolveErr
+		} else if resolved {
 			continue
 		}
 		// A commit whose content is already upstream applies to nothing and
@@ -517,6 +532,61 @@ func harvestBody(dir, base, tempBranch string, commits []string, allowMarkers bo
 			len(markers), strings.Join(markers, "\n  "))
 	}
 	return nil
+}
+
+// resolveUnionMergeConflicts repairs only configured append-only files in an
+// in-progress cherry-pick. Any unconfigured conflict remains a hard failure.
+func resolveUnionMergeConflicts(dir, base string, cfg harvestmerge.UnionMergeConfig) (bool, error) {
+	resolved := false
+	for _, path := range cfg.SortedPaths() {
+		if !cfg.Enabled(path) {
+			return false, fmt.Errorf("harvest-merge: invalid union-merge path %q; paths must be repo-relative", path)
+		}
+		unmerged, err := exec.Command("git", "-C", dir, "diff", "--name-only", "--diff-filter=U", "--", path).Output()
+		if err != nil {
+			return false, fmt.Errorf("harvest-merge: inspect union conflict %q: %w", path, err)
+		}
+		if strings.TrimSpace(string(unmerged)) == "" {
+			continue
+		}
+		readStage := func(stage string) (string, error) {
+			out, readErr := exec.Command("git", "-C", dir, "show", stage+":"+path).Output()
+			if readErr != nil {
+				return "", fmt.Errorf("harvest-merge: read %s stage for %q: %w", stage, path, readErr)
+			}
+			return string(out), nil
+		}
+		ours, err := readStage(":2")
+		if err != nil {
+			return false, err
+		}
+		theirs, err := readStage(":3")
+		if err != nil {
+			return false, err
+		}
+		baseContent, err := exec.Command("git", "-C", dir, "show", base+":"+path).Output()
+		if err != nil {
+			return false, fmt.Errorf("harvest-merge: read base for %q: %w", path, err)
+		}
+		merged, err := harvestmerge.UnionMerge(string(baseContent), ours, theirs)
+		if err != nil {
+			return false, fmt.Errorf("harvest-merge: union merge %q: %w", path, err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, filepath.FromSlash(path)), []byte(merged), 0o644); err != nil {
+			return false, fmt.Errorf("harvest-merge: write union merge %q: %w", path, err)
+		}
+		if out, addErr := exec.Command("git", "-C", dir, "add", "--", path).CombinedOutput(); addErr != nil {
+			return false, fmt.Errorf("harvest-merge: stage union merge %q: %v: %s", path, addErr, out)
+		}
+		resolved = true
+	}
+	if !resolved {
+		return false, nil
+	}
+	if out, err := exec.Command("git", "-C", dir, "-c", "core.editor=true", "cherry-pick", "--continue").CombinedOutput(); err != nil {
+		return false, fmt.Errorf("harvest-merge: continue union merge: %v: %s", err, out)
+	}
+	return true, nil
 }
 
 // harvestMergeVerdict resolves the merge verdict for an exact candidate sha

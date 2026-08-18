@@ -1,9 +1,77 @@
 package harvestmerge
 
 import (
+	"path/filepath"
 	"strings"
 	"testing"
 )
+
+func TestUnionMergeAppendsBothLanes(t *testing.T) {
+	base := "# Plan\n\nExisting\n"
+	got, err := UnionMerge(base, base+"Lane A\n", base+"Lane B\n")
+	if err != nil {
+		t.Fatalf("union merge: %v", err)
+	}
+	if got != base+"Lane A\nLane B\n" {
+		t.Fatalf("merged content = %q", got)
+	}
+}
+
+func TestUnionMergeRejectsChangedBase(t *testing.T) {
+	_, err := UnionMerge("base\n", "changed\n", "base\nlane\n")
+	if err == nil {
+		t.Fatal("a non-append edit must refuse union merge")
+	}
+}
+
+func TestUnionMergePathsAreRepoRelativeAndExact(t *testing.T) {
+	cfg := UnionMergeConfig{Paths: []string{"docs/MASTER-TEST-PLAN.md"}}
+	if !cfg.Enabled("docs/MASTER-TEST-PLAN.md") {
+		t.Fatal("configured path must be enabled")
+	}
+	for _, path := range []string{"./docs/MASTER-TEST-PLAN.md", "../docs/MASTER-TEST-PLAN.md", "/tmp/MASTER-TEST-PLAN.md", "docs/other.md"} {
+		if cfg.Enabled(path) {
+			t.Fatalf("path %q must not match the configured repo-relative path", path)
+		}
+	}
+}
+
+func TestMatrixIDAllocatorIsUniqueConcurrently(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "matrix-ids")
+	const n = 32
+	ids := make(chan string, n)
+	errs := make(chan error, n)
+	for i := 0; i < n; i++ {
+		go func() {
+			id, err := AllocateMatrixID(path, "U")
+			if err != nil {
+				errs <- err
+				return
+			}
+			ids <- id
+		}()
+	}
+	seen := make(map[string]bool, n)
+	for i := 0; i < n; i++ {
+		select {
+		case err := <-errs:
+			t.Fatal(err)
+		case id := <-ids:
+			if seen[id] {
+				t.Fatalf("duplicate matrix ID %q", id)
+			}
+			seen[id] = true
+		}
+	}
+	if len(seen) != n {
+		t.Fatalf("allocated %d unique IDs, want %d", len(seen), n)
+	}
+	for id := range seen {
+		if !strings.HasPrefix(id, "U-") {
+			t.Fatalf("ID %q has wrong prefix", id)
+		}
+	}
+}
 
 // Anything that is not an explicit PASS is not consent to merge.
 func TestOnlyExplicitPassAllowsMerge(t *testing.T) {
