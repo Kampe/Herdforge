@@ -240,7 +240,8 @@ func runHarvestMerge() {
 		"Check whether the lane's work is on origin/main (rebase + empty diff) and mint/reconcile the sealed completion receipt.")
 	verifyRef := fs.String("ref", "", "Task ref for --verify-landed receipt reconcile (loads merge-admission or explicit binding flags)")
 	verifyTaskID := fs.String("task-id", "", "Provider task id (required with --verify-landed when no merge-admission is on disk)")
-	verifyCandidate := fs.String("candidate", "", "Exact reviewed candidate sha (defaults to branch tip before LandedProof)")
+	// --candidate is shared with the harvest path (registered above); a second
+	// fs.String here panics with "flag redefined" on every invocation.
 	verifyBaseSHA := fs.String("base-sha", "", "Base sha the candidate was reviewed against")
 	verifyLease := fs.String("lease", "", "Claim lease token bound into the ledger verdict")
 	verifyLeaseGen := fs.Int64("lease-generation", 0, "Claim lease generation bound into the completion receipt")
@@ -270,7 +271,7 @@ func runHarvestMerge() {
 	// check, then the sealed completion-receipt reconcile for approve.
 	if *verifyLanded {
 		binding := verifyLandedBinding{
-			Ref: *verifyRef, TaskID: *verifyTaskID, Candidate: *verifyCandidate,
+			Ref: *verifyRef, TaskID: *verifyTaskID, Candidate: *candidate,
 			BaseSHA: *verifyBaseSHA, Lease: *verifyLease, LeaseGeneration: *verifyLeaseGen,
 			PatchID: *verifyPatchID, AcceptanceDigest: *verifyAcceptance,
 			AuthorFamily: *verifyAuthorFamily, AuthorIdentity: *verifyAuthorIdentity,
