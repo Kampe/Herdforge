@@ -169,6 +169,8 @@ func runHarvestMerge() {
 		"Optional operator VETO (FAIL/BLOCKED refuse). PASS is not accepted here: merge consent comes from the review ledger.")
 	base := fs.String("base", "origin/main", "Base to harvest onto")
 	candidate := fs.String("candidate", "", "Exact reviewed candidate SHA to harvest (required when the branch tip moved)")
+	reconstructedFrom := fs.String("reconstructed-from", "", "Harvest identity reconstructed from the reviewed candidate (requires --content-proof)")
+	contentProof := fs.String("content-proof", "", "Operator attestation that reviewed and reconstructed identities are content-equivalent")
 	candidateRange := fs.String("candidate-range", "", "Exact reviewed range to harvest (<base>..<sha>); limits cherry-picks to that range")
 	dryRun := fs.Bool("dry-run", false, "Plan and gate without creating the worktree")
 	allowMarkers := fs.Bool("allow-markers", false,
@@ -252,7 +254,7 @@ func runHarvestMerge() {
 		os.Exit(1)
 	}
 
-	report, err := resolveHarvestCandidate(*branch, *candidate)
+	report, err := resolveHarvestCandidateWithReconstruction(*branch, *candidate, *reconstructedFrom, *contentProof)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "herd harvest-merge: %v\n", err)
 		os.Exit(1)
@@ -267,7 +269,6 @@ func runHarvestMerge() {
 		fmt.Fprintf(os.Stderr, "herd harvest-merge: exact reviewed candidate is not eligible; branch tip drift requires --candidate <last_pass_sha> or a new PASS\n")
 		os.Exit(1)
 	}
-
 	ledgerVerdict, vErr := harvestMergeVerdict(sha, *verdict)
 	if vErr != nil {
 		fmt.Fprintf(os.Stderr, "herd harvest-merge: %v\n", vErr)
@@ -331,6 +332,20 @@ func runHarvestMerge() {
 		fmt.Fprintf(os.Stderr, "herd harvest-merge: %v\n", err)
 		os.Exit(1)
 	}
+	if report.ReconstructedSHA != "" {
+		ledger, ledgerErr := reviewledger.NewReviewLedger(".", filepath.Join(".herd", "review-ledger.jsonl"))
+		if ledgerErr != nil {
+			fmt.Fprintf(os.Stderr, "herd harvest-merge: open review ledger for reconstruction: %v\n", ledgerErr)
+			os.Exit(1)
+		}
+		if ledgerErr = ledger.Reconstruction(reviewledger.ReconstructionOpts{
+			SHA: report.ReconstructedSHA, CandidateSHA: report.Pin.SHA,
+			Branch: *branch, ContentProof: strings.TrimSpace(*contentProof),
+		}); ledgerErr != nil {
+			fmt.Fprintf(os.Stderr, "herd harvest-merge: record reconstruction: %v\n", ledgerErr)
+			os.Exit(1)
+		}
+	}
 
 	fmt.Printf("herd harvest-merge: harvested %d commit(s) clean onto %s at %s\n", len(commits), *base, dir)
 	fmt.Println("herd harvest-merge: gates passed. Publish and merge is the coordinator's explicit action:")
@@ -357,10 +372,11 @@ func harvestCommits(base, branch string, reviewed harvestmerge.CandidateRange) (
 // harvestCandidateReport is the provenance-first decision made before any
 // cherry-pick. Tip is observational; LastPassSHA comes from the durable queue.
 type harvestCandidateReport struct {
-	Pin         harvestmerge.CandidatePin
-	Tip         string
-	LastPassSHA string
-	Eligible    bool
+	Pin              harvestmerge.CandidatePin
+	Tip              string
+	LastPassSHA      string
+	Eligible         bool
+	ReconstructedSHA string
 }
 
 // resolveHarvestCandidate keeps a moving standing branch from silently
@@ -369,6 +385,15 @@ type harvestCandidateReport struct {
 // permits an older reviewed ancestor, but still requires exact queue and
 // ledger evidence for that SHA.
 func resolveHarvestCandidate(branch, requested string) (harvestCandidateReport, error) {
+	return resolveHarvestCandidateWithReconstruction(branch, requested, "", "")
+}
+
+// resolveHarvestCandidateWithReconstruction preserves the normal ancestry
+// gate. When both reconstruction fields are supplied, the reviewed candidate
+// remains the identity whose PASS is required, while reconstructedSHA must be
+// a real commit reachable from the harvest branch. The substitution is only
+// accepted with a non-empty operator content-equality proof.
+func resolveHarvestCandidateWithReconstruction(branch, requested, reconstructedSHA, contentProof string) (harvestCandidateReport, error) {
 	branch = strings.TrimSpace(branch)
 	if branch == "" {
 		return harvestCandidateReport{}, fmt.Errorf("branch is required")
@@ -406,12 +431,28 @@ func resolveHarvestCandidate(branch, requested string) (harvestCandidateReport, 
 	}
 
 	sha := strings.TrimSpace(requested)
+	reconstructedSHA = strings.TrimSpace(reconstructedSHA)
+	contentProof = strings.TrimSpace(contentProof)
+	if (reconstructedSHA == "") != (contentProof == "") {
+		return harvestCandidateReport{}, fmt.Errorf("--reconstructed-from and --content-proof must be provided together")
+	}
+	if reconstructedSHA != "" {
+		if sha == "" {
+			return harvestCandidateReport{}, fmt.Errorf("--candidate is required with --reconstructed-from")
+		}
+		if _, err := exec.Command("git", "rev-parse", "--verify", reconstructedSHA+"^{commit}").Output(); err != nil {
+			return harvestCandidateReport{}, fmt.Errorf("reconstructed harvest %s is not a commit: %w", reconstructedSHA, err)
+		}
+		if err := exec.Command("git", "merge-base", "--is-ancestor", reconstructedSHA, branch).Run(); err != nil {
+			return harvestCandidateReport{}, fmt.Errorf("reconstructed harvest %s is not reachable from branch %s", reconstructedSHA, branch)
+		}
+	}
 	if sha == "" {
 		sha = report.Tip
 		if report.LastPassSHA != report.Tip {
 			return report, nil
 		}
-	} else {
+	} else if reconstructedSHA == "" {
 		if _, err := exec.Command("git", "rev-parse", "--verify", sha+"^{commit}").Output(); err != nil {
 			return harvestCandidateReport{}, fmt.Errorf("candidate %s is not a commit: %w", sha, err)
 		}
@@ -430,6 +471,7 @@ func resolveHarvestCandidate(branch, requested string) (harvestCandidateReport, 
 	}
 	report.Pin = harvestmerge.CandidatePin{SHA: sha, Branch: branch}
 	report.Eligible = eligible
+	report.ReconstructedSHA = reconstructedSHA
 	return report, nil
 }
 

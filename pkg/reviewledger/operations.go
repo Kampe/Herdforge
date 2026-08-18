@@ -260,6 +260,37 @@ type DecisionOpts struct {
 	CandidateSHA string
 }
 
+// ReconstructionOpts records an explicit, operator-attested identity
+// substitution. SHA is the harvested identity and CandidateSHA is the
+// originally reviewed identity; Reason is the content-equality attestation.
+type ReconstructionOpts struct {
+	SHA          string
+	CandidateSHA string
+	Branch       string
+	Reason       string
+	ContentProof string
+}
+
+// Reconstruction appends a distinct audit event for a reconstructed harvest.
+// It never changes review eligibility or verdict state by itself.
+func (l *Ledger) Reconstruction(opts ReconstructionOpts) error {
+	if strings.TrimSpace(opts.SHA) == "" || strings.TrimSpace(opts.CandidateSHA) == "" {
+		return fmt.Errorf("reconstruction requires harvested and reviewed sha")
+	}
+	proof := strings.TrimSpace(opts.ContentProof)
+	if proof == "" {
+		proof = strings.TrimSpace(opts.Reason)
+	}
+	if proof == "" {
+		return fmt.Errorf("reconstruction requires content-equality attestation")
+	}
+	return l.appendRow(l.Path, &LedgerRow{
+		Event: string(EventReconstruction), SHA: opts.SHA,
+		CandidateSHA: opts.CandidateSHA, Branch: opts.Branch,
+		Reason: opts.Reason, ContentProof: proof, Status: "attested",
+	})
+}
+
 // Refutation records why an earlier review finding was rejected or disproven.
 // It never changes the verdict row; consumers must interpret the relationship
 // explicitly and retain the original evidence.
