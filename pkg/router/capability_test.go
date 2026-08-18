@@ -44,7 +44,7 @@ func TestSurfaceCapabilityTableIsInternallyLaunchable(t *testing.T) {
 		if !surface.ModelOptional {
 			model := map[string]string{
 				"agy": "gemini-3.1-pro-high", "claude": "claude-sonnet-5",
-				"codex": "gpt-5.6-luna", "grok": "grok-4.5", "lazer": "litellm/lazer/grok-4.5",
+				"codex": "gpt-5.6-luna", "grok": "grok-4.6", "lazer": "litellm/lazer/grok-4.6",
 				"ollama": "litellm/ollama/glm-5.2:cloud", "opencode": "opencode/deepseek-v4-pro",
 			}[surface.Provider]
 			if _, _, err := HarnessArgvFor(surface.Provider, model, "medium"); err != nil {

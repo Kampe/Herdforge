@@ -17,7 +17,7 @@ func TestQuotaPoolMapsIndependentlyMeteredPools(t *testing.T) {
 		{"claude", "claude-sonnet-5", "default"},
 		{"agy", "gemini-3-pro", "gemini"},
 		{"agy", "claude-opus-4-6-thinking", "nonGemini"},
-		{"grok", "grok-4.5", "default"},
+		{"grok", "grok-4.6", "default"},
 		{"CODEX", "GPT-5.3-CODEX-SPARK", "spark"},
 	}
 	for _, c := range cases {
@@ -155,7 +155,7 @@ func TestQuotaPoolAgreesWithTheRouterOnCanonicalModels(t *testing.T) {
 		{"claude", "claude-fable-5"}, {"claude", "claude-sonnet-5"},
 		{"agy", "gemini-3.1-pro-high"}, {"agy", "claude-opus-4-6-thinking"},
 		{"codex", "gpt-5.3-codex-spark"}, {"codex", "gpt-5.6-luna"},
-		{"grok", "grok-4.5"}, {"kimi", ""},
+		{"grok", "grok-4.6"}, {"kimi", ""},
 	} {
 		if got, want := QuotaPool(c.provider, c.model), router.QuotaPoolFor(c.provider, c.model); got != want {
 			t.Errorf("QuotaPool(%s,%s) = %q but the router bills %q",
@@ -180,11 +180,11 @@ func TestPiHarnessArgvBillsTheRoutedPool(t *testing.T) {
 		{"agy", "gemini-3.1-pro-high", "gemini"},
 		{"codex", "gpt-5.3-codex-spark", "spark"},
 		{"codex", "gpt-5.6-luna", "default"},
-		{"grok", "grok-4.5", "default"},
+		{"grok", "grok-4.6", "default"},
 		// opencode and lazer models are their own routed names; Pi passes
 		// them through, so nothing may be stripped off them either.
 		{"opencode", "opencode/kimi-k3", "default"},
-		{"lazer", "litellm/lazer/grok-4.5", "default"},
+		{"lazer", "litellm/lazer/grok-4.6", "default"},
 	} {
 		harness, argv, err := router.HarnessArgvFor(c.provider, c.model, "high")
 		if err != nil {

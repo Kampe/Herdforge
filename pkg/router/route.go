@@ -135,7 +135,7 @@ func ModelFor(provider, shape string) string {
 		}
 		return "litellm/ollama/glm-5.2:cloud"
 	case "grok":
-		return "grok-4.5"
+		return "grok-4.6"
 	case "lazer":
 		switch shape {
 		case "coordinator", "architecture":
@@ -147,7 +147,7 @@ func ModelFor(provider, shape string) string {
 		case "qa-light":
 			return "litellm/lazer/qwen-3.7-plus"
 		case "qa", "adversarial":
-			return "litellm/lazer/grok-4.5"
+			return "litellm/lazer/grok-4.6"
 		case "bounded":
 			return "litellm/lazer/qwen-3.7-plus"
 		}

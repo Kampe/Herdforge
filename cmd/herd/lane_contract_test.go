@@ -60,7 +60,7 @@ func TestEveryConfiguredLaneLaunchesOnItsConfiguredModel(t *testing.T) {
 			// Reviewers need author provenance; give them a disjoint family.
 			if req.Role == router.RoleReviewer || req.Role == router.RoleAssayer {
 				req.AuthorFamily = "xai"
-				req.AuthorModel = "grok-4.5"
+				req.AuthorModel = "grok-4.6"
 				req.CandidateSHA = "0123456789abcdef0123456789abcdef01234567"
 				req.Scope = router.ScopeCandidate
 			}

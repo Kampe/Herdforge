@@ -120,7 +120,7 @@ lanes:
     prompt: ".herd/prompts/worker.md"
     worktree: ".worktrees/smith-grok"
     provider: "grok"
-    model: "grok-4.5"
+    model: "grok-4.6"
     effort: "medium"
     task_shape: "implementation"
     standing: false
@@ -153,7 +153,7 @@ lanes:
     prompt: ".herd/prompts/worker.md"
     worktree: ".worktrees/smith-grok-2"
     provider: "grok"
-    model: "grok-4.5"
+    model: "grok-4.6"
     effort: "medium"
     task_shape: "implementation"
     standing: false
@@ -191,12 +191,12 @@ lanes:
     effort: "medium"
     task_shape: "qa"
     # 2026-08-18: codex is quota-exhausted and excluded from review routing
-    # via herdr-route cooldown. claude-sonnet-5/grok-4.5 can be
+    # via herdr-route cooldown. claude-sonnet-5/grok-4.6 can be
     # concurrency-capped by this fleet's own builder lanes, so fall back to
     # genuinely-free capacity (agy, then lazer's GLM-5.2) rather than
     # stalling on a saturated pool.
     fallback_models:
-      - "grok-4.5"
+      - "grok-4.6"
       - "claude-opus-4-6-thinking"
       - "glm-5.2"
     standing: false
