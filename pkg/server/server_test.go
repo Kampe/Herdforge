@@ -1,14 +1,22 @@
 package server
 
 import (
+	"bytes"
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/Kampe/Herdforge/pkg/metrics"
+	"github.com/Kampe/Herdforge/pkg/webhook"
 )
 
 func TestStatusSchemaPreservesLivenessReadinessAndUnknownPressure(t *testing.T) {
@@ -205,5 +213,109 @@ func TestControlServer_StartAndEndpoints(t *testing.T) {
 	metricsResp, err := http.Get("http://127.0.0.1:18899/metrics")
 	if err != nil || metricsResp.StatusCode != http.StatusOK {
 		t.Fatalf("expected 200 OK from /metrics, got code %d (err: %v)", metricsResp.StatusCode, err)
+	}
+}
+
+func TestControlServer_WebhookRejectsUnsignedDelivery(t *testing.T) {
+	cfg := DefaultConfig("127.0.0.1:0")
+	cfg.WebhookEnabled = true
+	cfg.WebhookSecret = "test-secret"
+	cfg.WebhookStorePath = filepath.Join(t.TempDir(), "webhook.db")
+	srv, err := NewControlServerWithConfig(cfg)
+	if err != nil {
+		t.Fatalf("create server: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := srv.Start(ctx); err != nil {
+		t.Fatalf("start server: %v", err)
+	}
+	defer srv.Stop(ctx)
+
+	resp, err := http.Post("http://"+srv.Addr+"/v1/webhook", "application/json", strings.NewReader(`{"type":"task.created"}`))
+	if err != nil {
+		t.Fatalf("post unsigned delivery: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusOK {
+		t.Fatal("unsigned delivery must not be accepted")
+	}
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("unsigned delivery status = %d, want %d", resp.StatusCode, http.StatusUnauthorized)
+	}
+}
+
+func TestControlServer_WebhookEnabledRequiresSecret(t *testing.T) {
+	cfg := DefaultConfig("127.0.0.1:0")
+	cfg.WebhookEnabled = true
+	cfg.WebhookStorePath = filepath.Join(t.TempDir(), "webhook.db")
+	if _, err := NewControlServerWithConfig(cfg); err == nil {
+		t.Fatal("expected enabled webhook without a secret to fail closed")
+	}
+}
+
+func TestControlServer_WebhookPersistsAndDeduplicatesDelivery(t *testing.T) {
+	const secret = "server-test-secret"
+	storePath := filepath.Join(t.TempDir(), "webhook.db")
+	cfg := DefaultConfig("127.0.0.1:0")
+	cfg.WebhookEnabled = true
+	cfg.WebhookSecret = secret
+	cfg.WebhookStorePath = storePath
+	srv, err := NewControlServerWithConfig(cfg)
+	if err != nil {
+		t.Fatalf("create server: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := srv.Start(ctx); err != nil {
+		t.Fatalf("start server: %v", err)
+	}
+
+	body := []byte(`{"provider":"kaneo","type":"task.created","task_ref":"FAC-415","project_id":"p1","payload":{}}`)
+	timestamp := strconv.FormatInt(time.Now().Unix(), 10)
+	deliveryID := "server-delivery-1"
+	mac := hmac.New(sha256.New, []byte(secret))
+	_, _ = mac.Write([]byte(timestamp + "." + deliveryID + "." + string(body)))
+	signature := "sha256=" + hex.EncodeToString(mac.Sum(nil))
+	post := func() *http.Response {
+		req, reqErr := http.NewRequest(http.MethodPost, "http://"+srv.Addr+WebhookPath, bytes.NewReader(body))
+		if reqErr != nil {
+			t.Fatalf("create request: %v", reqErr)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set(webhook.HeaderTimestamp, timestamp)
+		req.Header.Set(webhook.HeaderDeliveryID, deliveryID)
+		req.Header.Set(webhook.HeaderSignature, signature)
+		resp, reqErr := http.DefaultClient.Do(req)
+		if reqErr != nil {
+			t.Fatalf("post delivery: %v", reqErr)
+		}
+		return resp
+	}
+	first := post()
+	if first.StatusCode != http.StatusOK {
+		t.Fatalf("first delivery status = %d, want 200", first.StatusCode)
+	}
+	_ = first.Body.Close()
+	second := post()
+	if second.StatusCode != http.StatusOK {
+		t.Fatalf("duplicate delivery status = %d, want 200", second.StatusCode)
+	}
+	_ = second.Body.Close()
+	if err := srv.Stop(ctx); err != nil {
+		t.Fatalf("stop server: %v", err)
+	}
+
+	store, err := webhook.NewStore(storePath)
+	if err != nil {
+		t.Fatalf("reopen webhook store: %v", err)
+	}
+	defer store.Close()
+	event, err := store.Get(deliveryID)
+	if err != nil {
+		t.Fatalf("get persisted delivery: %v", err)
+	}
+	if event == nil || event.Status != webhook.StatusProcessed {
+		t.Fatalf("persisted delivery = %+v, want processed event", event)
 	}
 }

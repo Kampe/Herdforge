@@ -7,11 +7,17 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/Kampe/Herdforge/pkg/metrics"
+	"github.com/Kampe/Herdforge/pkg/webhook"
 )
+
+const WebhookPath = "/v1/webhook"
 
 const (
 	DefaultReadHeaderTimeout = 5 * time.Second
@@ -56,6 +62,10 @@ type Config struct {
 	ShutdownTimeout   time.Duration
 	Metrics           *metrics.MetricsExporter
 	Now               func() time.Time
+	WebhookEnabled    bool
+	WebhookSecret     string
+	WebhookStorePath  string
+	WebhookConfig     *webhook.Config
 }
 
 // DefaultConfig returns a Config populated with default timeouts.
@@ -129,6 +139,10 @@ type ControlServer struct {
 	now       func() time.Time
 	serveErr  error
 	config    Config
+	webhook   *webhook.Receiver
+	webhookDB *webhook.Store
+	closeOnce sync.Once
+	closeErr  error
 }
 
 // NewControlServer initializes a ControlServer with standard default bounded timeouts.
@@ -174,12 +188,44 @@ func NewControlServerWithConfig(cfg Config) (*ControlServer, error) {
 		cfg.Now = time.Now
 	}
 
+	var receiver *webhook.Receiver
+	var store *webhook.Store
+	if cfg.WebhookEnabled {
+		secret := strings.TrimSpace(cfg.WebhookSecret)
+		if secret == "" {
+			secret = strings.TrimSpace(os.Getenv("HERD_WEBHOOK_SECRET"))
+		}
+		if secret == "" {
+			return nil, errors.New("server: webhook secret is required when webhook is enabled (fail-closed)")
+		}
+		storePath := strings.TrimSpace(cfg.WebhookStorePath)
+		if storePath == "" {
+			storePath = strings.TrimSpace(os.Getenv("HERD_WEBHOOK_STORE_PATH"))
+		}
+		if storePath == "" {
+			storePath = filepath.Join(".", ".herd", "webhook.db")
+		}
+		var err error
+		store, err = webhook.NewStore(storePath)
+		if err != nil {
+			return nil, fmt.Errorf("server: open webhook store: %w", err)
+		}
+		receiver, err = webhook.NewReceiver(secret, store, cfg.WebhookConfig)
+		if err != nil {
+			_ = store.Close()
+			return nil, fmt.Errorf("server: configure webhook receiver: %w", err)
+		}
+		receiver.RegisterHandler(func(*webhook.WebhookEvent) error { return nil })
+	}
+
 	return &ControlServer{
 		Addr:      cfg.Addr,
 		StartTime: cfg.Now(),
 		metrics:   cfg.Metrics,
 		now:       cfg.Now,
 		config:    cfg,
+		webhook:   receiver,
+		webhookDB: store,
 	}, nil
 }
 
@@ -203,6 +249,9 @@ func (s *ControlServer) Start(ctx context.Context) error {
 	mux.HandleFunc("/v1/status", s.handleStatus)
 	mux.HandleFunc("/openapi.json", s.handleOpenAPI)
 	mux.Handle("/metrics", s.metrics.Handler())
+	if s.webhook != nil {
+		mux.Handle(WebhookPath, s.webhook)
+	}
 
 	s.mu.Lock()
 	cfg := s.config
@@ -268,9 +317,22 @@ func (s *ControlServer) Stop(ctx context.Context) error {
 			_ = httpSrv.Close()
 			return err
 		}
-		return httpSrv.Shutdown(ctx)
+		err := httpSrv.Shutdown(ctx)
+		return s.closeWebhookStore(err)
 	}
-	return nil
+	return s.closeWebhookStore(nil)
+}
+
+func (s *ControlServer) closeWebhookStore(serverErr error) error {
+	s.closeOnce.Do(func() {
+		if s.webhookDB != nil {
+			s.closeErr = s.webhookDB.Close()
+		}
+	})
+	if serverErr != nil {
+		return serverErr
+	}
+	return s.closeErr
 }
 
 func (s *ControlServer) handleStatus(w http.ResponseWriter, r *http.Request) {
@@ -333,6 +395,14 @@ func (s *ControlServer) handleOpenAPI(w http.ResponseWriter, r *http.Request) {
 				},
 			},
 		},
+	}
+	if s.webhook != nil {
+		openAPISpec["paths"].(map[string]interface{})[WebhookPath] = map[string]interface{}{
+			"post": map[string]interface{}{
+				"summary":   "Receive authenticated and durably persisted provider deliveries",
+				"responses": map[string]string{"200": "Delivery accepted", "401": "Invalid or missing signature", "413": "Payload too large"},
+			},
+		}
 	}
 	payload, err := json.Marshal(openAPISpec)
 	if err != nil {
