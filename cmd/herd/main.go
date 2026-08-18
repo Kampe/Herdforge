@@ -7110,6 +7110,33 @@ func containsDrainSHA(shas []string, want string) bool {
 	return false
 }
 
+func verificationCommandProfile(root string) (verifier.CommandProfile, string, error) {
+	profile := verifier.CommandProfile{
+		ID:           verificationProfile,
+		BuildCommand: "go build ./...",
+		TestCommand:  "go test ./...",
+	}
+	path := filepath.Join(root, ".herd", "herd.yaml")
+	data, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return profile, "default", nil
+	}
+	if err != nil {
+		return profile, "", fmt.Errorf("read verification config: %w", err)
+	}
+	cfg, err := config.ParseConfig(data)
+	if err != nil {
+		return profile, "", err
+	}
+	if strings.TrimSpace(cfg.Verification.TestCommand) == "" {
+		return profile, "", errors.New("verification.test_command is required")
+	}
+	profile.TestCommand = strings.TrimSpace(cfg.Verification.TestCommand)
+	profile.PreflightCommand = strings.TrimSpace(cfg.Verification.PreflightCommand)
+	sum := sha256.Sum256(data)
+	return profile, "sha256:" + hex.EncodeToString(sum[:]), nil
+}
+
 // runVerify is the FAC-98/FAC-116 completion gate: `herd verify <worktree>`
 // exits 0 only when the worktree has real committed work, builds, and tests
 // pass — the check an agent must pass before reporting done, and the forge
@@ -7171,21 +7198,31 @@ func runVerify() {
 			}
 		}
 	}
-	verificationProfileName := verificationProfile
-	preflightCommand := ""
-	configPath := filepath.Join(verifyRoot, ".herd", "herd.yaml")
-	if _, statErr := os.Stat(configPath); statErr == nil {
-		verifyConfig, loadErr := config.LoadConfig(configPath)
-		if loadErr != nil {
-			fmt.Fprintf(os.Stderr, "herd verify: load config: %v\n", loadErr)
-			os.Exit(2)
-		}
-		preflightCommand = strings.TrimSpace(verifyConfig.Verification.PreflightCommand)
-		if preflightCommand != "" {
-			verificationProfileName += "+preflight"
-		}
+	profile, configRevision, profileErr := verificationCommandProfile(verifyRoot)
+	if profileErr != nil {
+		fmt.Fprintf(os.Stderr, "herd verify: load verification profile: %v\n", profileErr)
+		os.Exit(2)
+	}
+	verificationProfileName := profile.ID
+	preflightCommand := profile.PreflightCommand
+	if preflightCommand != "" {
+		verificationProfileName += "+preflight"
+	}
+	executionProfile := profile
+	if configRevision == "default" {
+		// Local development has no repository-owned profile, so retain the
+		// explicit command flags and bind receipts to exactly what ran.
+		executionProfile.BuildCommand = strings.TrimSpace(*buildCmd)
+		executionProfile.TestCommand = strings.TrimSpace(*testCmd)
 	}
 	if tcErr == nil {
+		// A checkout without a repository profile is local-development mode;
+		// preserve its historical explicit command flags. Once the repository
+		// declares a profile, managed evidence must use it exactly.
+		if configRevision != "default" && !profile.Matches(*buildCmd, *testCmd, preflightCommand) {
+			fmt.Fprintf(os.Stderr, "herd verify: managed verification commands must match repository profile %s (FAC-377)\n", profile.Digest())
+			os.Exit(2)
+		}
 		sha, shaErr := worktreeHeadSHA(wt)
 		if shaErr != nil {
 			// A malformed/empty managed worktree can still emit its bound
@@ -7205,6 +7242,8 @@ func runVerify() {
 			req := verifier.VerificationRequest{
 				TaskRef: tc.TaskRef, LeaseGeneration: fmt.Sprintf("%d", tc.LeaseGeneration),
 				CandidateSHA: sha, BaseSHA: baseSHA, EnvironmentPolicy: verifier.EnvironmentPolicyInherited,
+				VerificationProfile: verificationProfileName,
+				ProfileDigest:       executionProfile.Digest(), ConfigRevision: configRevision,
 				Artifacts: []string{"profile:" + verificationProfileName},
 			}
 			verifiedCandidateSHA = req.CandidateSHA
@@ -7218,7 +7257,7 @@ func runVerify() {
 				preflightPassed = preReceipt.Outcome == verifier.OutcomePASS
 			}
 			var persistErr error
-			c, _, persistErr = verifier.NewVerifier("").CheckCompletionAndPersist(context.Background(), wt, *buildCmd, *testCmd, req, store)
+			c, _, persistErr = verifier.NewVerifier("").CheckCompletionAndPersist(context.Background(), wt, executionProfile.BuildCommand, executionProfile.TestCommand, req, store)
 			if persistErr != nil {
 				fmt.Fprintf(os.Stderr, "herd verify: persist verification receipts: %v\n", persistErr)
 				os.Exit(2)

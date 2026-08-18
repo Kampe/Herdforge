@@ -311,6 +311,16 @@ func TestCompletionGate_PolicyChange_Invalidates(t *testing.T) {
 	if _, err := g.AdmitReview(context.Background(), changed, d.Digest); !errors.Is(err, ErrBindingMismatch) {
 		t.Fatalf("provider revision change: want ErrBindingMismatch, got %v", err)
 	}
+	changed = bind
+	changed.ProfileDigest = "sha256:" + strings.Repeat("d", 64)
+	if _, err := g.AdmitReview(context.Background(), changed, d.Digest); !errors.Is(err, ErrBindingMismatch) {
+		t.Fatalf("profile digest change: want ErrBindingMismatch, got %v", err)
+	}
+	changed = bind
+	changed.ConfigRevision = "sha256:" + strings.Repeat("e", 64)
+	if _, err := g.AdmitReview(context.Background(), changed, d.Digest); !errors.Is(err, ErrBindingMismatch) {
+		t.Fatalf("config revision change: want ErrBindingMismatch, got %v", err)
+	}
 }
 
 func TestCompletionGate_RejectionReasonHasNoHostPath(t *testing.T) {

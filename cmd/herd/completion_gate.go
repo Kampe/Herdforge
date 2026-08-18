@@ -69,21 +69,28 @@ func bindingForWorktree(cfg *config.Config, machine *lifecycle.Machine, ref, wt 
 	return bindingForWorktreeAtRoot(cfg, machine, ref, wt, root)
 }
 
-func bindingForWorktreeAtRoot(cfg *config.Config, machine *lifecycle.Machine, ref, wt, root string) (daemon.CompletionBinding, error) {
+func bindingForWorktreeAtRoot(_ *config.Config, machine *lifecycle.Machine, ref, wt, root string) (daemon.CompletionBinding, error) {
 	sha, err := worktreeHeadSHA(wt)
 	if err != nil {
 		return daemon.CompletionBinding{}, err
+	}
+	profile, configRevision, profileErr := verificationCommandProfile(root)
+	if profileErr != nil {
+		return daemon.CompletionBinding{}, fmt.Errorf("load verification profile: %w", profileErr)
+	}
+	profileName := profile.ID
+	if profile.PreflightCommand != "" {
+		profileName += "+preflight"
 	}
 	bind := daemon.CompletionBinding{
 		TaskRef:             ref,
 		Repo:                "herdforge",
 		CandidateSHA:        sha,
 		WorktreeDir:         wt,
-		VerificationProfile: verificationProfile,
+		VerificationProfile: profileName,
+		ProfileDigest:       profile.Digest(),
+		ConfigRevision:      configRevision,
 		Branch:              "herd/" + strings.ToLower(ref),
-	}
-	if cfg != nil && cfg.Verification.PreflightCommand != "" {
-		bind.VerificationProfile = verificationProfile + "+preflight"
 	}
 	if machine != nil {
 		if ts, err := machine.EventStore().CurrentState(ref); err == nil && ts != nil {
