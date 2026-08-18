@@ -21,6 +21,7 @@ const (
 	// used when a reviewed candidate was harvested by content-preserving
 	// reconstruction rather than literal ancestry.
 	EventReconstruction Event = "reconstruction"
+	EventRetired        Event = "retired"
 )
 
 // Verdict values.
@@ -78,6 +79,7 @@ type LedgerRow struct {
 	CandidateSHA       string `json:"candidate_sha,omitempty"`
 	Reason             string `json:"reason,omitempty"`
 	ContentProof       string `json:"content_proof,omitempty"`
+	Authority          string `json:"authority,omitempty"`
 }
 
 // familyResolve represents the 3-state family resolution.

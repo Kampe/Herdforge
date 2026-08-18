@@ -85,6 +85,15 @@ func TestOnlyExplicitPassAllowsMerge(t *testing.T) {
 	}
 }
 
+func TestRetiredIsTerminalButNeverMergeConsent(t *testing.T) {
+	if !Terminal(RETIRED) {
+		t.Fatal("RETIRED must settle the branch for audit/drain projections")
+	}
+	if MergeAllowed(RETIRED) {
+		t.Fatal("RETIRED must never authorize a merge")
+	}
+}
+
 // A cherry-pick that leaves markers behind produces a structurally broken diff
 // that nobody re-reads once it is in a PR.
 func TestConflictMarkersInAddedLinesAbort(t *testing.T) {

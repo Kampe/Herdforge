@@ -52,6 +52,35 @@ func TestCoordinatorSelfVerdictIsRefused(t *testing.T) {
 	}
 }
 
+func TestCoordinatorRetirementRationaleIsAcceptedWithoutReviewVerdict(t *testing.T) {
+	a := Parse(`sha: 0123456789012345678901234567890123456789
+branch: herd/fac-411
+authority: coordinator
+verdict: RETIRED
+---
+All commits are already landed or are destructive stale content; this branch is settled by coordinator content verification. The coordinator compared every commit against the integrated history and confirmed that no unreviewed bytes remain to be harvested, so this record makes the settlement auditable without presenting it as independent review evidence.`)
+	if err := a.Validate(map[string]struct{}{"coordinator": {}}, nil); err != nil {
+		t.Fatalf("retirement rationale rejected: %v", err)
+	}
+	if a.Verdict != "RETIRED" || a.Authority != "coordinator" {
+		t.Fatalf("parsed retirement = %+v", a)
+	}
+}
+
+func TestCoordinatorPassShapedArtifactStillRefused(t *testing.T) {
+	a := Parse(`sha: 0123456789012345678901234567890123456789
+branch: herd/fac-411
+reviewer: coordinator
+builder-family: anthropic
+reviewer-family: google
+verdict: PASS
+---
+This is deliberately a long enough rationale that only the family-disjoint policy decides this is invalid review provenance, rather than the evidence floor.`)
+	if err := a.Validate(map[string]struct{}{"coordinator": {}}, nil); err == nil {
+		t.Fatal("coordinator-authored PASS-shaped artifact was accepted")
+	}
+}
+
 func TestSameFamilyIsNotAnIndependentReview(t *testing.T) {
 	a := Parse(artifact("review-x", "anthropic", "anthropic", "PASS", realSHA, longBody))
 	err := a.Validate(coordinators, exists)

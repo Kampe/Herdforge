@@ -95,6 +95,18 @@ func runReviewIngest() {
 			fmt.Fprintf(os.Stderr, "herd review-ingest: retain artifact FAILED for %s: %v\n", filepath.Base(f), retainErr)
 			os.Exit(1)
 		}
+		if a.Verdict == "RETIRED" {
+			if _, err := ledger.Ingest(reviewledger.IngestOpts{Retired: &reviewledger.RetireOpts{
+				SHA: a.SHA, Branch: a.Branch, Authority: a.Authority,
+				Reason: a.Body, Artifact: retained,
+			}}); err != nil {
+				fmt.Fprintf(os.Stderr, "herd review-ingest: retirement write FAILED for %s: %v\n", filepath.Base(f), err)
+				os.Exit(1)
+			}
+			fmt.Printf("RETIRED %s authority=%s sha=%s\n", filepath.Base(f), a.Authority, a.SHA[:12])
+			admitted++
+			continue
+		}
 		// A reviewer artifact is the durable handoff from the supervisor. Make
 		// its exact-SHA admission record idempotently before the verdict row so
 		// harvest-merge can prove independent provenance even when the ephemeral
@@ -264,6 +276,10 @@ func runHarvestMerge() {
 	sha := report.Pin.SHA
 	fmt.Printf("herd harvest-merge: tip=%s last_pass_sha=%s eligible=%t\n",
 		shortSHA12(report.Tip), shortSHA12(report.LastPassSHA), report.Eligible)
+	if report.Retired {
+		fmt.Printf("herd harvest-merge: branch %s is settled as RETIRED at %s; no merge is authorized\n", *branch, shortSHA12(report.Pin.SHA))
+		return
+	}
 	if !report.Eligible {
 		if *dryRun {
 			return
@@ -379,6 +395,7 @@ type harvestCandidateReport struct {
 	LastPassSHA      string
 	Eligible         bool
 	ReconstructedSHA string
+	Retired          bool
 }
 
 // resolveHarvestCandidate keeps a moving standing branch from silently
@@ -412,6 +429,22 @@ func resolveHarvestCandidateWithReconstruction(branch, requested, reconstructedS
 	ledger, err := reviewledger.NewReviewLedger(".", filepath.Join(".herd", "review-ledger.jsonl"))
 	if err != nil {
 		return harvestCandidateReport{}, fmt.Errorf("open review ledger: %w", err)
+	}
+	rows, err := ledger.AllRows()
+	if err != nil {
+		return harvestCandidateReport{}, fmt.Errorf("read review ledger: %w", err)
+	}
+	for i := len(rows) - 1; i >= 0; i-- {
+		row := rows[i]
+		if row.Event != string(reviewledger.EventRetired) || row.Branch != branch {
+			continue
+		}
+		if requested != "" && requested != row.SHA {
+			break
+		}
+		report.Pin = harvestmerge.CandidatePin{SHA: row.SHA, Branch: branch}
+		report.Retired = true
+		return report, nil
 	}
 	queued, err := ledger.Queued()
 	if err != nil {

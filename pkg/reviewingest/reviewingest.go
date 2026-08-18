@@ -31,6 +31,7 @@ type Artifact struct {
 	SHA            string
 	Branch         string
 	Reviewer       string
+	Authority      string
 	ReviewerFamily string
 	BuilderFamily  string
 	Verdict        string
@@ -113,6 +114,8 @@ func Parse(text string) Artifact {
 				a.Branch = value
 			case "reviewer":
 				a.Reviewer = value
+			case "authority", "asserting-authority":
+				a.Authority = value
 			case "reviewer-family":
 				a.ReviewerFamily = value
 			case "builder-family":
@@ -168,7 +171,7 @@ func (a Artifact) Validate(coordinators map[string]struct{}, commitExists func(s
 	// unwritten contract would make every reviewer's first artifact a guess.
 	if len(a.UnknownHeaders) > 0 {
 		return fmt.Errorf("unrecognised front-matter key(s): %s; accepted keys are "+
-			"sha, branch, reviewer, reviewer-family, builder-family, verdict, reviewed-head "+
+			"sha, branch, reviewer, authority, asserting-authority, reviewer-family, builder-family, verdict, reviewed-head "+
 			"(see .herd/prompts/review-verdict.template.md); a misspelled gate key silently "+
 			"disables its gate, so this is refused rather than ignored",
 			strings.Join(a.UnknownHeaders, ", "))
@@ -179,6 +182,20 @@ func (a Artifact) Validate(coordinators map[string]struct{}, commitExists func(s
 	}
 	if commitExists != nil && !commitExists(a.SHA) {
 		return fmt.Errorf("sha %s does not resolve to a commit in this repo", a.SHA)
+	}
+	if a.Verdict == "RETIRED" {
+		if strings.TrimSpace(a.Authority) == "" {
+			return fmt.Errorf("retirement authority is missing")
+		}
+		for c := range coordinators {
+			if strings.EqualFold(strings.TrimSpace(a.Authority), strings.TrimSpace(c)) {
+				if n := a.BodyChars(); n < MinBodyChars {
+					return fmt.Errorf("retirement rationale is %d chars, below the %d-char evidence floor", n, MinBodyChars)
+				}
+				return nil
+			}
+		}
+		return fmt.Errorf("retirement authority %q is not a coordinator", a.Authority)
 	}
 	if strings.TrimSpace(a.Reviewer) == "" {
 		return fmt.Errorf("reviewer is missing")
