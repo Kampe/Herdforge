@@ -19,9 +19,8 @@ func TestVerdict_Table(t *testing.T) {
 		{"very low free, no swap — TIGHT not ALERT", 2, 0, "TIGHT"},
 		{"zero free, no swap — TIGHT not ALERT", 0, 0, "TIGHT"},
 		{"good free, swap at alert threshold", 80, 2048, "OK"},
-		{"good free, swap above alert", 80, 2049, "ALERT"},
-		{"good free, huge swap", 80, 30720, "ALERT"},
-		{"low free AND high swap — ALERT wins", 5, 5000, "ALERT"},
+		{"swap is informational", 80, 30720, "OK"},
+		{"low free with high swap remains TIGHT", 5, 5000, "TIGHT"},
 		{"exactly at swap alert — not alert (>)", 80, 2048, "OK"},
 	}
 	for _, c := range cases {
@@ -49,8 +48,8 @@ func TestVerdict_EnvOverrides(t *testing.T) {
 	t.Run("custom swap alert", func(t *testing.T) {
 		clearEnv(t)
 		t.Setenv("HERD_SWAP_ALERT_MB", "512")
-		if got := Verdict(80, 600); got != "ALERT" {
-			t.Errorf("with swap_alert=512, Verdict(80, 600) = %q, want ALERT", got)
+		if got := Verdict(80, 600); got != "OK" {
+			t.Errorf("with swap_alert=512, Verdict(80, 600) = %q, want OK: swap is informational", got)
 		}
 		if got := Verdict(80, 512); got != "OK" {
 			t.Errorf("with swap_alert=512, Verdict(80, 512) = %q, want OK", got)
@@ -60,8 +59,8 @@ func TestVerdict_EnvOverrides(t *testing.T) {
 		clearEnv(t)
 		t.Setenv("HERD_MEM_WARN_FREE_PCT", "30")
 		t.Setenv("HERD_SWAP_ALERT_MB", "100")
-		if got := Verdict(10, 200); got != "ALERT" {
-			t.Errorf("with warn=30 swap_alert=100, Verdict(10, 200) = %q, want ALERT", got)
+		if got := Verdict(10, 200); got != "TIGHT" {
+			t.Errorf("with warn=30 swap_alert=100, Verdict(10, 200) = %q, want TIGHT", got)
 		}
 		if got := Verdict(10, 50); got != "TIGHT" {
 			t.Errorf("with warn=30 swap_alert=100, Verdict(10, 50) = %q, want TIGHT", got)
@@ -149,6 +148,27 @@ func TestSnapshot_SafeOnProbeFailure(t *testing.T) {
 	}
 	if v := Verdict(snap.FreePct, snap.SwapMB); v != "OK" {
 		t.Errorf("expected OK verdict on safe values, got %s", v)
+	}
+}
+
+func TestDarwinSnapshot_MemoryPressureHealthyAfterVmStatLowMemory(t *testing.T) {
+	clearEnv(t)
+	snap := snapshotWithDarwinProbes(
+		func() (string, error) {
+			return "The system has 51539607552 (3145728 pages with a page size of 16384).\nSystem-wide memory free percentage: 67%\n", nil
+		},
+		func() (string, error) {
+			return "total = 4096.00M  used = 3770.00M  free = 326.00M", nil
+		},
+	)
+	if snap.FreePct != 67 {
+		t.Fatalf("FreePct = %d, want 67 from memory_pressure", snap.FreePct)
+	}
+	if snap.SwapMB != 3770 {
+		t.Fatalf("SwapMB = %d, want 3770 informational reading", snap.SwapMB)
+	}
+	if snap.Verdict != VerdictOK {
+		t.Fatalf("Verdict = %q, want %q: healthy memory_pressure must clear the gate despite sticky swap", snap.Verdict, VerdictOK)
 	}
 }
 

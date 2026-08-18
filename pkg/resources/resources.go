@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"runtime"
 	"strconv"
 	"strings"
 )
@@ -71,24 +72,18 @@ func swapAlertMB() int {
 	return n
 }
 
-// verdict grades free-memory headroom against explicit thresholds. It is
-// the pure, side-effect-free core: swap_mb above the alert threshold =>
-// ALERT; otherwise free_pct below the warn threshold => TIGHT; otherwise
-// OK. ALERT keys on swap only (operator directive 2026-07-29).
+// verdict grades free-memory headroom against explicit thresholds. Swap is
+// deliberately excluded: macOS swap allocation is sticky and is retained as
+// an informational trend in Snapshot only.
 func verdict(freePct, swapMB, warnFreePct, swapAlertMB int) string {
-	if swapMB > swapAlertMB {
-		return VerdictAlert
-	}
 	if freePct < warnFreePct {
 		return VerdictTight
 	}
 	return VerdictOK
 }
 
-// Verdict grades free-memory headroom. swap_mb above the alert threshold
-// => ALERT; otherwise free_pct below the warn threshold => TIGHT; otherwise
-// OK. Thresholds come from the ambient environment
-// (HERD_MEM_WARN_FREE_PCT / HERD_SWAP_ALERT_MB) with package defaults.
+// Verdict grades free-memory headroom from free_pct. swap_mb is retained in
+// the signature for API compatibility but is informational, not a gate input.
 func Verdict(freePct, swapMB int) string {
 	return verdict(freePct, swapMB, warnFreePct(), swapAlertMB())
 }
@@ -107,10 +102,13 @@ func TakeSnapshot() Snapshot {
 	return s
 }
 
-// gatherMetrics shells out to macOS probes. On any probe failure it returns a
+// gatherMetrics shells out to platform probes. On any probe failure it returns a
 // SAFE value (free_pct=100, swap_mb=0) so a broken probe never falsely refuses
 // heavy operations.
 func gatherMetrics() (freePct, swapMB int) {
+	if runtime.GOOS == "darwin" {
+		return gatherDarwinMetrics()
+	}
 	vmStatOut, err1 := runProbe("vm_stat")
 	memSizeOut, err2 := runProbe("sysctl", "-n", "hw.memsize")
 	if err1 != nil || err2 != nil {
@@ -124,6 +122,26 @@ func gatherMetrics() (freePct, swapMB int) {
 		swapMB = parseSwapUsedMB(swapOut)
 	}
 	return freePct, swapMB
+}
+
+func gatherDarwinMetrics() (freePct, swapMB int) {
+	return gatherDarwinMetricsWithProbes(
+		func() (string, error) { return runProbe("memory_pressure", "-Q") },
+		func() (string, error) { return runProbe("sysctl", "-n", "vm.swapusage") },
+	)
+}
+
+func gatherDarwinMetricsWithProbes(memoryPressureFn, swapFn func() (string, error)) (int, int) {
+	memoryPressureOut, err := memoryPressureFn()
+	if err != nil {
+		return 100, 0
+	}
+	freePct := parseMemoryPressureFreePct(memoryPressureOut)
+	swapOut, err := swapFn()
+	if err != nil {
+		return freePct, 0
+	}
+	return freePct, parseSwapUsedMB(swapOut)
 }
 
 func runProbe(name string, args ...string) (string, error) {
@@ -147,6 +165,15 @@ func snapshotWithProbes(vmFreeFn, memSizeFn func() (string, error)) Snapshot {
 	freePct := parseFreePct(vmStatOut, memSizeOut)
 	s := Snapshot{FreePct: freePct}
 	s.Verdict = Verdict(freePct, 0)
+	s.Thresholds.WarnFreePct = warnFreePct()
+	s.Thresholds.SwapAlertMB = swapAlertMB()
+	return s
+}
+
+func snapshotWithDarwinProbes(memoryPressureFn, swapFn func() (string, error)) Snapshot {
+	freePct, swapMB := gatherDarwinMetricsWithProbes(memoryPressureFn, swapFn)
+	s := Snapshot{FreePct: freePct, SwapMB: swapMB}
+	s.Verdict = Verdict(freePct, swapMB)
 	s.Thresholds.WarnFreePct = warnFreePct()
 	s.Thresholds.SwapAlertMB = swapAlertMB()
 	return s
@@ -198,6 +225,33 @@ func parseFreePct(vmStat, memSize string) int {
 	return int(pct)
 }
 
+func parseMemoryPressureFreePct(output string) int {
+	for _, line := range strings.Split(output, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.Contains(strings.ToLower(line), "memory free percentage:") {
+			continue
+		}
+		percent := strings.IndexByte(line, '%')
+		if percent < 0 {
+			return 100
+		}
+		prefix := strings.TrimSpace(line[:percent])
+		start := len(prefix)
+		for start > 0 && prefix[start-1] >= '0' && prefix[start-1] <= '9' {
+			start--
+		}
+		if start == len(prefix) {
+			return 100
+		}
+		n, err := strconv.Atoi(prefix[start:])
+		if err != nil || n < 0 || n > 100 {
+			return 100
+		}
+		return n
+	}
+	return 100
+}
+
 func parseSwapUsedMB(swapOutput string) int {
 	for _, line := range strings.Split(swapOutput, "\n") {
 		line = strings.TrimSpace(line)
@@ -244,8 +298,7 @@ func SelfTest() []SelfTestResult {
 		{"TIGHT: below warn, no swap", 10, 0, VerdictTight},
 		{"TIGHT: zero free, no swap (not ALERT)", 0, 0, VerdictTight},
 		{"OK: high free, swap at alert threshold", 80, 2048, VerdictOK},
-		{"ALERT: swap above alert", 80, 2049, VerdictAlert},
-		{"ALERT wins over TIGHT", 5, 5000, VerdictAlert},
+		{"swap is informational", 80, 30720, VerdictOK},
 	}
 	// Assert the pure core against the pinned defaults so the selftest is
 	// deterministic regardless of ambient env (a hostile
