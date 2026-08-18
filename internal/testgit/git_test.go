@@ -2,6 +2,8 @@ package testgit
 
 import (
 	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -118,5 +120,39 @@ func TestCommandUsesSafeGitArguments(t *testing.T) {
 	}
 	if got := strings.Join(cmd.Args, "\x00"); got != strings.Join(want, "\x00") {
 		t.Fatalf("argv = %q, want %q", cmd.Args, want)
+	}
+}
+
+func TestCommandCommitIgnoresHostileGlobalSigningConfig(t *testing.T) {
+	global := filepath.Join(t.TempDir(), "hostile.gitconfig")
+	if err := os.WriteFile(global, []byte("[commit]\n\tgpgsign = true\n[gpg]\n\tprogram = /bin/false\n[user]\n\tname = Host\n\temail = host@example.invalid\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	if out, err := Command(dir, "init", "-q", "-b", "main").CombinedOutput(); err != nil {
+		t.Fatalf("init fixture: %v\n%s", err, out)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "fixture.txt"), []byte("fixture\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := Command(dir, "add", "fixture.txt").CombinedOutput(); err != nil {
+		t.Fatalf("stage fixture: %v\n%s", err, out)
+	}
+
+	// Establish that the hostile configuration really blocks an unguarded
+	// commit; otherwise this regression test could pass vacuously.
+	unguarded := exec.Command("git", "commit", "-q", "-m", "unguarded")
+	unguarded.Dir = dir
+	unguarded.Env = append(os.Environ(), "GIT_CONFIG_GLOBAL="+global, "GIT_CONFIG_SYSTEM="+os.DevNull, "GIT_CONFIG_NOSYSTEM=1")
+	if out, err := unguarded.CombinedOutput(); err == nil {
+		t.Fatalf("unguarded commit unexpectedly succeeded under hostile signing config\n%s", out)
+	}
+
+	guarded := Command(dir, "commit", "-q", "-m", "guarded")
+	if out, err := guarded.CombinedOutput(); err != nil {
+		t.Fatalf("hermetic commit failed under hostile signing config: %v\n%s", err, out)
+	}
+	if out, err := Command(dir, "log", "-1", "--format=%s").Output(); err != nil || strings.TrimSpace(string(out)) != "guarded" {
+		t.Fatalf("guarded commit was not recorded: %v %q", err, out)
 	}
 }
