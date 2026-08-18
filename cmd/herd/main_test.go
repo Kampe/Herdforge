@@ -14,6 +14,24 @@ import (
 	"github.com/Kampe/Herdforge/pkg/herdr"
 )
 
+func TestParseMaxLanes(t *testing.T) {
+	for _, tc := range []struct {
+		raw  string
+		want int
+		auto bool
+	}{{"3", 3, false}, {" auto ", 0, true}, {"0", 0, false}} {
+		got, auto, err := parseMaxLanes(tc.raw)
+		if err != nil || got != tc.want || auto != tc.auto {
+			t.Errorf("parseMaxLanes(%q) = (%d, %v, %v)", tc.raw, got, auto, err)
+		}
+	}
+	for _, raw := range []string{"", "-1", "three"} {
+		if _, _, err := parseMaxLanes(raw); err == nil {
+			t.Errorf("parseMaxLanes(%q) accepted invalid input", raw)
+		}
+	}
+}
+
 // The CLI tests exec the built binary ~70 times. Linking it once keeps the
 // package inside the suite's timeout; every caller only ever runs it, so a
 // shared artifact is equivalent to a per-test one.

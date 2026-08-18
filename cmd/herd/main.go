@@ -9689,12 +9689,56 @@ func forgeControlReconciler(root string, cfg *config.Config) (*control.Coordinat
 	return loop, closeFn, nil
 }
 
+func parseMaxLanes(raw string) (int, bool, error) {
+	raw = strings.TrimSpace(raw)
+	if strings.EqualFold(raw, "auto") {
+		return 0, true, nil
+	}
+	limit, err := strconv.Atoi(raw)
+	if err != nil || limit < 0 {
+		return 0, false, fmt.Errorf("--max-lanes must be a non-negative integer or auto, got %q", raw)
+	}
+	return limit, false, nil
+}
+
+func deriveAutoMaxLanes(ctx context.Context, cfg *config.Config, tp provider.TaskProvider) (int, error) {
+	if cfg == nil || tp == nil {
+		return 0, fmt.Errorf("config and task provider are required")
+	}
+	queued, err := tp.ListTasks(ctx, cfg.TaskProvider.ProjectID, "to-do")
+	if err != nil {
+		return 0, fmt.Errorf("read to-do queue: %w", err)
+	}
+	body, err := os.ReadFile(filepath.Join(".herd", "quota-supervisor.json"))
+	if err != nil {
+		return 0, fmt.Errorf("read live quota snapshot: %w", err)
+	}
+	var snapshot quotasup.Snapshot
+	if err := json.Unmarshal(body, &snapshot); err != nil {
+		return 0, fmt.Errorf("decode live quota snapshot: %w", err)
+	}
+	roster := make([]string, 0, len(cfg.Lanes))
+	for _, lane := range cfg.Lanes {
+		if !lane.Standing && strings.EqualFold(strings.TrimSpace(lane.Role), "worker") {
+			roster = append(roster, lane.Provider)
+		}
+	}
+	plan := quotasup.PlanLanes(len(queued), snapshot.Decisions, roster)
+	active := 0
+	for _, d := range snapshot.Decisions {
+		if d.Evidence.Active > 0 {
+			active += d.Evidence.Active
+		}
+	}
+	return active + plan.Desired, nil
+}
+
 // forgeLoopMain returns the process exit code so every path releases the
 // coordinator fence — os.Exit skips deferred releases (FAC-138).
 func forgeLoopMain() int {
 	fs := flag.NewFlagSet("forge-loop", flag.ExitOnError)
 	_ = fs.Bool("loop", true, "run the autonomous loop")
-	maxLanes := fs.Int("max-lanes", 3, "max concurrent builder lanes")
+	maxLanesArg := fs.String("max-lanes", "3", "max concurrent builder lanes, or auto")
 	environmentPlanID := fs.String("environment-plan", "", "Exact operator-managed environment plan ID for dispatched work")
 	interval := fs.Int("interval", 15, "seconds between ticks")
 	ticks := fs.Int("ticks", 0, "stop after N ticks (0 = run until drained)")
@@ -9709,6 +9753,11 @@ func forgeLoopMain() int {
 	coordName := fs.String("coordinator-name", coordinator.CoordinatorName,
 		"durable coordinator identity agents report to (must match the mail inbox)")
 	fs.Parse(leadingPositionalArgs(os.Args[2:]))
+	maxLanes, autoLanes, parseErr := parseMaxLanes(*maxLanesArg)
+	if parseErr != nil {
+		fmt.Fprintf(os.Stderr, "forge --loop: %v\n", parseErr)
+		return 2
+	}
 
 	// Signal-aware: SIGINT/SIGTERM cancels the loop's context so the current
 	// tick unwinds and the fence is released, instead of dying mid-transition.
@@ -9752,6 +9801,13 @@ func forgeLoopMain() int {
 	if tpErr != nil {
 		fmt.Fprintf(os.Stderr, "task provider: %v\n", tpErr)
 		return 1
+	}
+	if autoLanes {
+		maxLanes, err = deriveAutoMaxLanes(context.Background(), cfg, tp)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "forge --loop: auto lane plan unavailable: %v\n", err)
+			return 1
+		}
 	}
 	st, err := store.New(".herd/herdforge.db")
 	if err != nil {
@@ -9807,10 +9863,10 @@ func forgeLoopMain() int {
 		fmt.Fprintf(os.Stderr, "forge --loop: %v\n", observerErr)
 		return 1
 	}
-	driver := &cliForgeDriver{cfg: cfg, maxLanes: *maxLanes, environmentPlanID: strings.TrimSpace(*environmentPlanID)}
+	driver := &cliForgeDriver{cfg: cfg, maxLanes: maxLanes, environmentPlanID: strings.TrimSpace(*environmentPlanID)}
 	driver.observer = observer
 
-	fmt.Printf("herd forge --loop: max-lanes=%d interval=%ds — driving the board autonomously\n", *maxLanes, *interval)
+	fmt.Printf("herd forge --loop: max-lanes=%d interval=%ds — driving the board autonomously\n", maxLanes, *interval)
 	err = eng.ForgeLoop(ctx, driver, daemon.ForgeLoopOptions{
 		Interval:               time.Duration(*interval) * time.Second,
 		MaxTicks:               *ticks,
