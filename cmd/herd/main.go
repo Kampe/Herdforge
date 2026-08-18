@@ -6723,12 +6723,15 @@ func runReviewLedger() {
 		}
 		json.NewEncoder(os.Stdout).Encode(rows)
 	case "queued":
-		rows, err := l.QueueRows()
+		rows, err := l.Queued()
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "review-ledger: %v\n", err)
 			os.Exit(1)
 		}
-		json.NewEncoder(os.Stdout).Encode(rows)
+		if err := json.NewEncoder(os.Stdout).Encode(rows); err != nil {
+			fmt.Fprintf(os.Stderr, "review-ledger: encode queued report: %v\n", err)
+			os.Exit(1)
+		}
 	case "pending":
 		rows, err := l.Pending()
 		if err != nil {
@@ -6746,7 +6749,11 @@ func runReviewLedger() {
 			fmt.Fprintf(os.Stderr, "review-ledger: %v\n", err)
 			os.Exit(1)
 		}
-		fmt.Println(tier)
+		report := reviewledger.TierReport{SHA: os.Args[3], Tier: tier}
+		if err := json.NewEncoder(os.Stdout).Encode(report); err != nil {
+			fmt.Fprintf(os.Stderr, "review-ledger: encode tier report: %v\n", err)
+			os.Exit(1)
+		}
 	case "drift":
 		cfg, err := config.LoadConfig(".herd/herd.yaml")
 		if err != nil {

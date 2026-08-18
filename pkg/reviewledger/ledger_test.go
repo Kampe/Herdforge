@@ -335,7 +335,7 @@ func TestEligible(t *testing.T) {
 				mustErr(l.Record(RecordOpts{SHA: failSHA, Branch: "main", BuilderFamily: "anthropic", Reviewer: "reviewer-1"}))
 				must2(l.Verdict(VerdictOpts{SHA: failSHA, Reviewer: "reviewer-1", Verdict: VerdictFAIL, ReviewerFamily: "google"}))
 			},
-			sha: failSHA, wantEligible: false,
+			sha: failSHA, wantEligible: false, wantErr: true, wantErrMsg: "veto",
 		},
 		{
 			name: "mechanical PASS is eligible",
@@ -384,7 +384,7 @@ func TestEligible(t *testing.T) {
 				mustErr(l.Record(RecordOpts{SHA: passSHA, Branch: "main", BuilderFamily: "anthropic", Reviewer: "reviewer-2"}))
 				must2(l.Verdict(VerdictOpts{SHA: passSHA, Reviewer: "reviewer-2", Verdict: VerdictFAIL, ReviewerFamily: "google"}))
 			},
-			sha: passSHA, wantEligible: false,
+			sha: passSHA, wantEligible: false, wantErr: true, wantErrMsg: "veto",
 		},
 		{
 			name: "BLOCKED from one reviewer blocks eligibility",
@@ -392,7 +392,7 @@ func TestEligible(t *testing.T) {
 				mustErr(l.Record(RecordOpts{SHA: passSHA, Branch: "main", BuilderFamily: "anthropic", Reviewer: "reviewer-1"}))
 				must2(l.Verdict(VerdictOpts{SHA: passSHA, Reviewer: "reviewer-1", Verdict: VerdictBLOCKED, ReviewerFamily: "google"}))
 			},
-			sha: passSHA, wantEligible: false,
+			sha: passSHA, wantEligible: false, wantErr: true, wantErrMsg: "veto",
 		},
 		{
 			name: "consumed sha is not eligible",
@@ -401,7 +401,7 @@ func TestEligible(t *testing.T) {
 				must2(l.Verdict(VerdictOpts{SHA: passSHA, Reviewer: "reviewer-1", Verdict: VerdictPASS, ReviewerFamily: "google"}))
 				mustErr(l.Consumed(passSHA, "deadbeef"))
 			},
-			sha: passSHA, wantEligible: false,
+			sha: passSHA, wantEligible: false, wantErr: true, wantErrMsg: "consumed",
 		},
 	}
 	for _, tc := range tests {
@@ -493,8 +493,8 @@ func TestConsumed(t *testing.T) {
 	mustErr(l.Consumed("abc123", "deadbeef"))
 
 	eligible, err := l.Eligible("abc123", "")
-	if err != nil {
-		t.Fatalf("Eligible: %v", err)
+	if err == nil || !strings.Contains(err.Error(), "consumed") {
+		t.Fatalf("Eligible = %v, %v; want consumed refusal", eligible, err)
 	}
 	if eligible {
 		t.Error("consumed sha is still eligible")
@@ -769,6 +769,65 @@ func TestEligibleNoRecordAtAll(t *testing.T) {
 	}
 	if eligible {
 		t.Error("sha with no records should not be eligible")
+	}
+}
+
+func TestEligibleRefusalReasons(t *testing.T) {
+	tests := []struct {
+		name  string
+		setup func(*testing.T, *Ledger, string)
+		want  string
+	}{
+		{
+			name: "superseded",
+			setup: func(t *testing.T, l *Ledger, sha string) {
+				mustErr(l.Record(RecordOpts{SHA: sha, Branch: "main", BuilderFamily: "anthropic", Reviewer: "reviewer"}))
+				mustErr(l.Supersession(DecisionOpts{SHA: "replacement", PreviousSHA: sha, Reason: "fixed"}))
+			},
+			want: "superseded",
+		},
+		{
+			name: "family mismatch",
+			setup: func(t *testing.T, l *Ledger, sha string) {
+				mustErr(l.Record(RecordOpts{SHA: sha, Branch: "main", BuilderFamily: "anthropic", Reviewer: "reviewer"}))
+				must2(l.Verdict(VerdictOpts{SHA: sha, Reviewer: "reviewer", Verdict: VerdictPASS, ReviewerFamily: "anthropic"}))
+			},
+			want: "family mismatch",
+		},
+		{
+			name: "consumed",
+			setup: func(t *testing.T, l *Ledger, sha string) {
+				mustErr(l.Record(RecordOpts{SHA: sha, Branch: "main", BuilderFamily: "anthropic", Reviewer: "reviewer"}))
+				must2(l.Verdict(VerdictOpts{SHA: sha, Reviewer: "reviewer", Verdict: VerdictPASS, ReviewerFamily: "google"}))
+				mustErr(l.Consumed(sha, "merge-sha"))
+			},
+			want: "consumed",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			l := newTestLedger(t)
+			sha := "reason-" + strings.ReplaceAll(tc.name, " ", "-")
+			tc.setup(t, l, sha)
+			eligible, err := l.Eligible(sha, "anthropic")
+			if eligible || err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("Eligible = %v, %v; want refusal containing %q", eligible, err, tc.want)
+			}
+		})
+	}
+}
+
+func TestEligibleReportsQueueReadError(t *testing.T) {
+	l := newTestLedger(t)
+	if err := os.Remove(l.QueuePath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(l.QueuePath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	eligible, err := l.Eligible("queue-error", "")
+	if eligible || err == nil || !strings.Contains(err.Error(), "queue read error") {
+		t.Fatalf("Eligible = %v, %v; want queue read error", eligible, err)
 	}
 }
 
