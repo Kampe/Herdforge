@@ -15,5 +15,15 @@ func TestMain(m *testing.M) {
 	if os.Getenv("HERD_LAUNCH_RECEIPTS") == "" {
 		os.Setenv("HERD_LAUNCH_RECEIPTS", filepath.Join(os.TempDir(), "herd-dispatch-test-receipts.jsonl"))
 	}
-	os.Exit(m.Run())
+	// Dispatch tests exercise receipt validation and launch orchestration, not
+	// the coordinator boundary of the ambient worker process. Keep the suite
+	// outside managed worktrees and clear Herdr's inherited agent marker.
+	testCWD, err := os.MkdirTemp("", "herd-dispatch-tests-")
+	if err != nil || os.Chdir(testCWD) != nil {
+		os.Exit(1)
+	}
+	os.Unsetenv("HERD_ROLE")
+	code := m.Run()
+	_ = os.RemoveAll(testCWD)
+	os.Exit(code)
 }
