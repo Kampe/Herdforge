@@ -53,6 +53,7 @@ opencode.json
 .herd/worktrees/
 .herd/launch-receipts.jsonl
 .herd/quota-supervisor.json
+.herd/legacy-tab-state.jsonl
 **/.herd/launch-receipts.jsonl
 .herd/legacy-tab-state.jsonl
 **/.herd/legacy-tab-state.jsonl
