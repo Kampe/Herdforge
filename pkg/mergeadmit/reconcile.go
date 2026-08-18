@@ -32,6 +32,9 @@ func (g *Gate) ReconcileLanded(req Request) (*hsync.CompletionReceipt, error) {
 	if g.Ledger == nil {
 		return nil, fmt.Errorf("herd-merge-reconcile: no review ledger configured; with no ledger there is no verdict, and no verdict is not a PASS")
 	}
+	if req.ReducedProvenance != nil {
+		return g.reconcileLandedReduced(req)
+	}
 	for _, f := range []struct{ name, val string }{
 		{"ref", req.Ref},
 		{"task_id", req.TaskID},
@@ -168,6 +171,66 @@ func (g *Gate) ReconcileLanded(req Request) (*hsync.CompletionReceipt, error) {
 			CodeReceiptReadback, path, short(back.Digest), short(receipt.Digest))
 	}
 
+	if err := g.Ledger.Consumed(req.CandidateSHA, proof.MergeSHA); err != nil {
+		return nil, fmt.Errorf("herd-merge-reconcile: mark admission consumed: %w", err)
+	}
+	return back, nil
+}
+
+func (g *Gate) reconcileLandedReduced(req Request) (*hsync.CompletionReceipt, error) {
+	rp := req.ReducedProvenance
+	if strings.TrimSpace(req.Ref) == "" || strings.TrimSpace(req.CandidateSHA) == "" {
+		return nil, fmt.Errorf("herd-merge-reconcile: reduced provenance requires verdict ref and exact candidate sha")
+	}
+	if rp.PullRequest <= 0 || !rp.VerifyLanded {
+		return nil, fmt.Errorf("herd-merge-reconcile: reduced provenance requires a positive pull request number and verify-landed proof")
+	}
+	if strings.TrimSpace(req.BaseSHA) == "" {
+		return nil, fmt.Errorf("herd-merge-reconcile: reduced provenance requires the reviewed base sha")
+	}
+	if rep := preflight.CheckMergePolicy(g.Policy); !rep.OK {
+		return nil, fmt.Errorf("herd-merge-reconcile: autonomous merge refused: %s", strings.Join(rep.Reasons, "; "))
+	}
+	result, ledgerErr := g.Ledger.AdmitReduced(reviewledger.ReducedAdmissionOpts{CandidateSHA: req.CandidateSHA})
+	if result == nil || !result.Admitted {
+		reason := "review ledger refused this candidate"
+		if result != nil && result.Reason != "" {
+			reason = result.Reason
+		} else if ledgerErr != nil {
+			reason = ledgerErr.Error()
+		}
+		return nil, fmt.Errorf("herd-merge-reconcile: %s: %s", CodeLedgerRefused, reason)
+	}
+	landed, err := g.Live.OriginMain.Read("origin_main_post_merge")
+	if err != nil {
+		return nil, fmt.Errorf("herd-merge-reconcile: %w", err)
+	}
+	proof, err := ProveEquivalentLanded(g.RepoDir, ProofRequest{BaseSHA: req.BaseSHA, CandidateSHA: req.CandidateSHA, LandedSHA: landed})
+	if err != nil {
+		return nil, fmt.Errorf("herd-merge-reconcile: %s: %w", CodeProofFailed, err)
+	}
+	repoID, err := toolchild.RepositoryIdentity(g.RepoDir)
+	if err != nil {
+		return nil, fmt.Errorf("herd-merge-reconcile: resolve repository identity: %w", err)
+	}
+	receipt := &hsync.CompletionReceipt{RepoID: repoID, TaskRef: hsync.NormalizeRef(req.Ref), BaseSHA: proof.BaseSHA, CandidateSHA: proof.CandidateSHA, MergeSHA: proof.MergeSHA, PatchID: proof.PatchID, VerificationDigest: result.VerificationDigest, RiskTier: result.Tier, AuthorFamily: result.AuthorFamily, ReviewerFamily: result.ReviewerFamily, Verdict: "PASS", IntegrationResult: hsync.IntegrationMerged, ProvenanceMode: hsync.ProvenanceReduced, PullRequest: rp.PullRequest}
+	receipt.Seal()
+	path := hsync.ReceiptPath(g.RepoDir, receipt.TaskRef)
+	if existing, loadErr := hsync.LoadReceipt(path); loadErr == nil {
+		if existing.Digest != receipt.Digest {
+			return nil, fmt.Errorf("herd-merge-reconcile: %s already holds a different receipt; refusing to overwrite", path)
+		}
+		return existing, nil
+	} else if !os.IsNotExist(rootCause(loadErr)) {
+		return nil, fmt.Errorf("herd-merge-reconcile: %s exists but could not be read: %w", path, loadErr)
+	}
+	if err := writeReceipt(g.RepoDir, receipt); err != nil {
+		return nil, fmt.Errorf("herd-merge-reconcile: persist receipt: %w", err)
+	}
+	back, err := hsync.LoadReceipt(path)
+	if err != nil || back.Digest != receipt.Digest || back.Digest != back.ComputeDigest() {
+		return nil, fmt.Errorf("herd-merge-reconcile: %s: reduced receipt failed read-back", CodeReceiptReadback)
+	}
 	if err := g.Ledger.Consumed(req.CandidateSHA, proof.MergeSHA); err != nil {
 		return nil, fmt.Errorf("herd-merge-reconcile: mark admission consumed: %w", err)
 	}

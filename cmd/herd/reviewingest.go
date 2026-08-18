@@ -194,6 +194,7 @@ func runHarvestMerge() {
 	verifyAuthorFamily := fs.String("author-family", "", "Builder model family")
 	verifyAuthorIdentity := fs.String("author-identity", "", "Builder session identity")
 	verifyProviderRev := fs.String("provider-revision", "", "Board card revision the reviewer bound")
+	verifyPR := fs.Int("pr", 0, "Pull request number for reduced-provenance verify-landed reconciliation")
 
 	// Pull the leading positional out BEFORE flag parsing: Go's flag package
 	// stops at the first non-flag argument, so `harvest-merge <lane> --branch x`
@@ -220,6 +221,7 @@ func runHarvestMerge() {
 			PatchID: *verifyPatchID, AcceptanceDigest: *verifyAcceptance,
 			AuthorFamily: *verifyAuthorFamily, AuthorIdentity: *verifyAuthorIdentity,
 			ProviderRevision: *verifyProviderRev,
+			PullRequest:      *verifyPR,
 		}
 		if err := runHarvestVerifyLanded(*branch, binding); err != nil {
 			fmt.Fprintf(os.Stderr, "herd harvest-merge: %v\n", err)
@@ -656,6 +658,7 @@ type verifyLandedBinding struct {
 	Lease, PatchID, AcceptanceDigest string
 	AuthorFamily, AuthorIdentity     string
 	ProviderRevision                 string
+	PullRequest                      int
 	LeaseGeneration                  int64
 }
 
@@ -735,6 +738,10 @@ func resolveVerifyLandedRequest(binding verifyLandedBinding, candidate string) (
 		BaseSHA: binding.BaseSHA, Lease: binding.Lease, LeaseGeneration: binding.LeaseGeneration,
 		PatchURL: binding.PatchID, AuthorFamily: binding.AuthorFamily,
 		AuthorIdentity: binding.AuthorIdentity, Mode: mergeadmit.ModeRebase,
+	}
+	if binding.PullRequest > 0 {
+		req.ReducedProvenance = &mergeadmit.ReducedProvenance{PullRequest: binding.PullRequest, VerifyLanded: true}
+		return req, nil
 	}
 	for _, f := range []struct{ name, val string }{
 		{"task-id", req.TaskID},

@@ -35,6 +35,77 @@ type AdmissionResult struct {
 	// rather than one the caller re-reads (and could re-read from a
 	// different, later verdict row).
 	VerificationDigest string
+	AuthorFamily       string
+}
+
+type ReducedAdmissionOpts struct{ CandidateSHA string }
+
+// AdmitReduced preserves exact-SHA and independent-review evidence for
+// legacy verdicts that predate lease and patch bindings. It never fabricates
+// those absent fields and is separate from the full Admit gate.
+func (l *Ledger) AdmitReduced(opts ReducedAdmissionOpts) (*AdmissionResult, error) {
+	if opts.CandidateSHA == "" {
+		return reject("", "candidate sha required")
+	}
+	sha := l.NormalizeSHA(opts.CandidateSHA)
+	rows, err := readRows(l.Path)
+	if err != nil {
+		return nil, err
+	}
+	qrows, err := readRows(l.QueuePath)
+	if err != nil {
+		return nil, err
+	}
+	for _, row := range qrows {
+		if row.Event == string(EventConsumed) && row.SHA == sha {
+			return reject(sha, "candidate already consumed (exactly-once admission spent)")
+		}
+	}
+	launch := map[string]LedgerRow{}
+	for _, r := range rows {
+		if r.Event == string(EventRecord) && r.SHA == sha {
+			launch[r.SHA+":"+r.Reviewer] = r
+		}
+	}
+	if len(launch) == 0 {
+		return reject(sha, "no launch record for exact candidate sha")
+	}
+	latest := map[string]LedgerRow{}
+	for _, r := range rows {
+		if r.Event == string(EventVerdict) && r.SHA == sha {
+			latest[r.SHA+":"+r.Reviewer] = r
+		}
+	}
+	for key, verdict := range latest {
+		if (verdict.Verdict == string(VerdictFAIL) || verdict.Verdict == string(VerdictBLOCKED)) && !l.isCoordinator(verdict.Reviewer) {
+			if launchRow, ok := launch[key]; ok && launchRow.BuilderFamily != "" && FamilyAllowlist[launchRow.BuilderFamily] {
+				return reject(sha, fmt.Sprintf("unsuperseded %s veto from reviewer=%s", verdict.Verdict, verdict.Reviewer))
+			}
+		}
+		if verdict.Verdict != string(VerdictPASS) || l.isCoordinator(verdict.Reviewer) {
+			continue
+		}
+		launchRow, ok := launch[key]
+		if !ok || launchRow.BuilderFamily == "" || !FamilyAllowlist[launchRow.BuilderFamily] {
+			continue
+		}
+		families := resolveFamily(launchRow.BuilderFamily, launchRow.ReviewerFamily, verdict.BuilderFamily, verdict.ReviewerFamily)
+		if families.State != familySet || families.Value == launchRow.BuilderFamily || !FamilyAllowlist[families.Value] {
+			continue
+		}
+		if verdict.Reviewer == "" || (launchRow.BuilderIdentity != "" && verdict.Reviewer == launchRow.BuilderIdentity) || verdict.VerificationDigest == "" {
+			continue
+		}
+		tier, err := l.Tier(sha)
+		if err != nil {
+			return nil, err
+		}
+		if tier == "" {
+			continue
+		}
+		return &AdmissionResult{Admitted: true, Reason: "validated independent verdict for exact candidate (reduced provenance)", SHA: sha, Reviewer: verdict.Reviewer, ReviewerFamily: families.Value, Tier: tier, VerificationDigest: verdict.VerificationDigest, AuthorFamily: launchRow.BuilderFamily}, nil
+	}
+	return reject(sha, "no independent PASS verdict with durable verification evidence")
 }
 
 // admissionRejected is the sentinel error Admit returns alongside a non-nil,
@@ -234,6 +305,7 @@ func (l *Ledger) Admit(opts AdmissionOpts) (*AdmissionResult, error) {
 			Lease:              verdict.Lease,
 			PatchURL:           verdict.PatchURL,
 			VerificationDigest: verdict.VerificationDigest,
+			AuthorFamily:       launchRow.BuilderFamily,
 		}, nil
 	}
 

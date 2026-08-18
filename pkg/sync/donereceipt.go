@@ -40,6 +40,8 @@ import (
 // CompletionReceiptVersion is the only receipt schema this build accepts.
 const CompletionReceiptVersion = 1
 
+const ProvenanceReduced = "reduced"
+
 // CompletionReceipt is the task-bound proof of completion. It is produced by
 // whatever integrated the candidate (the harvest/merge pipeline) and consumed
 // exactly once by BoardDone.
@@ -67,6 +69,8 @@ type CompletionReceipt struct {
 	ReviewerFamily     string `json:"reviewer_family"`
 	Verdict            string `json:"verdict"`
 	IntegrationResult  string `json:"integration_result"`
+	ProvenanceMode     string `json:"provenance_mode,omitempty"`
+	PullRequest        int    `json:"pull_request,omitempty"`
 	Digest             string `json:"digest"`
 }
 
@@ -90,6 +94,8 @@ type receiptForDigest struct {
 	ReviewerFamily     string `json:"reviewer_family"`
 	Verdict            string `json:"verdict"`
 	IntegrationResult  string `json:"integration_result"`
+	ProvenanceMode     string `json:"provenance_mode,omitempty"`
+	PullRequest        int    `json:"pull_request,omitempty"`
 }
 
 // ComputeDigest returns SHA-256 over the canonical JSON form of the receipt
@@ -103,6 +109,7 @@ func (r CompletionReceipt) ComputeDigest() string {
 		VerificationDigest: r.VerificationDigest, RiskTier: r.RiskTier,
 		AuthorFamily: r.AuthorFamily, ReviewerFamily: r.ReviewerFamily,
 		Verdict: r.Verdict, IntegrationResult: r.IntegrationResult,
+		ProvenanceMode: r.ProvenanceMode, PullRequest: r.PullRequest,
 	})
 	sum := sha256.Sum256(b)
 	return hex.EncodeToString(sum[:])
@@ -142,6 +149,7 @@ func (r CompletionReceipt) Validate(repoDir, ref string, st *lifecycle.TaskState
 	if !strings.EqualFold(NormalizeRef(r.TaskRef), ref) {
 		return fmt.Errorf("receipt is bound to %s, not %s", r.TaskRef, ref)
 	}
+	reduced := r.ProvenanceMode == ProvenanceReduced
 	for _, f := range []struct{ name, val string }{
 		{"task_id", r.TaskID},
 		{"provider_revision", r.ProviderRevision},
@@ -152,11 +160,17 @@ func (r CompletionReceipt) Validate(repoDir, ref string, st *lifecycle.TaskState
 		{"author_family", r.AuthorFamily},
 		{"reviewer_family", r.ReviewerFamily},
 	} {
+		if reduced && (f.name == "task_id" || f.name == "provider_revision" || f.name == "acceptance_digest") {
+			continue
+		}
 		if strings.TrimSpace(f.val) == "" {
 			return fmt.Errorf("receipt is missing %s", f.name)
 		}
 	}
-	if r.LeaseGeneration <= 0 {
+	if reduced && r.PullRequest <= 0 {
+		return fmt.Errorf("reduced receipt is missing a positive pull request number")
+	}
+	if !reduced && r.LeaseGeneration <= 0 {
 		return fmt.Errorf("receipt is missing a lease generation")
 	}
 	if r.Verdict != string(reviewledger.VerdictPASS) {
