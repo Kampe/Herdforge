@@ -13,9 +13,9 @@ import (
 // It creates origin/main with one shipped commit and returns facts for
 // test setup.
 type bsyncRepo struct {
-	dir      string
-	mainSHA  string
-	shipped  string // SHA naming a shipped ref
+	dir     string
+	mainSHA string
+	shipped string // SHA naming a shipped ref
 }
 
 func newBsyncRepo(t *testing.T) *bsyncRepo {
@@ -155,14 +155,39 @@ func TestReconcileBoard_ShippedInProgress(t *testing.T) {
 	}
 }
 
+func TestReconcileBoard_ShippedWinsOverLiveLane(t *testing.T) {
+	// A standing lane can remain live after its card's commit lands on main.
+	// Merged evidence is authoritative and must win over the liveness heuristic.
+	repo := newBsyncRepo(t)
+	wt := t.TempDir()
+	repo.addWorktree(t, wt, "fac-18-standing-lane", "")
+	repo.addMergedCommit(t, "feat: finish widget renderer (FAC-18)")
+
+	mp := newBoard(&provider.Task{
+		ID: "id-1", Ref: "FAC-18", Title: "widget renderer", Status: "in-progress", ProjectID: "p1",
+	})
+	syncer := NewBoardSyncer(mp)
+
+	drift, err := syncer.ReconcileBoard(context.Background(), "p1", repo.dir)
+	if err != nil {
+		t.Fatalf("ReconcileBoard: %v", err)
+	}
+	if drift.Drift != 1 {
+		t.Fatalf("expected 1 drift, got %d", drift.Drift)
+	}
+	if got := drift.Findings[0].Kind; got != "SHIPPED" {
+		t.Fatalf("expected SHIPPED despite live lane, got %s", got)
+	}
+}
+
 func TestReconcileBoard_ActiveInProgressHonest(t *testing.T) {
 	// A card in in-progress with a live worktree branch: board is honest.
 	repo := newBsyncRepo(t)
 	wt := t.TempDir()
-	repo.addWorktree(t, wt, "fac-18-widget-renderer", "feat: work in progress on FAC-18")
+	repo.addWorktree(t, wt, "fac-77-widget-renderer", "feat: work in progress on FAC-77")
 
 	mp := newBoard(&provider.Task{
-		ID: "id-1", Ref: "FAC-18", Title: "widget renderer", Status: "in-progress", ProjectID: "p1",
+		ID: "id-1", Ref: "FAC-77", Title: "widget renderer", Status: "in-progress", ProjectID: "p1",
 	})
 	syncer := NewBoardSyncer(mp)
 
@@ -179,10 +204,10 @@ func TestReconcileBoard_ActiveInReviewHonest(t *testing.T) {
 	// A card in in-review with a live branch: board is honest.
 	repo := newBsyncRepo(t)
 	wt := t.TempDir()
-	repo.addWorktree(t, wt, "fac-18-widget", "feat: widget in review for FAC-18")
+	repo.addWorktree(t, wt, "fac-77-widget", "feat: widget in review for FAC-77")
 
 	mp := newBoard(&provider.Task{
-		ID: "id-1", Ref: "FAC-18", Title: "widget", Status: "in-review", ProjectID: "p1",
+		ID: "id-1", Ref: "FAC-77", Title: "widget", Status: "in-review", ProjectID: "p1",
 	})
 	syncer := NewBoardSyncer(mp)
 
