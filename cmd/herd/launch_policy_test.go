@@ -35,6 +35,30 @@ func testLaunchRouter(t *testing.T) *router.SurfaceRouter {
 	return r
 }
 
+func TestBuilderWorkspaceUsesRegisteredBinding(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Mkdir(filepath.Join(root, ".herd"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	configData := []byte("version: \"1\"\nproject:\n  name: Herdforge\ntask_provider:\n  type: kaneo\n  project_id: project\nfleet:\n  herdr_workspace: wK\n")
+	if err := os.WriteFile(filepath.Join(root, ".herd", "herd.yaml"), configData, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	restore := herdr.SetRunHerdrForTest(func(args ...string) (string, error) {
+		return `{"result":{"workspaces":[{"workspace_id":"wF","label":"focused","focused":true},{"workspace_id":"wK","label":"other"}]}}`, nil
+	})
+	t.Cleanup(restore)
+	t.Setenv("HERD_WORKSPACE", "")
+
+	got, err := resolveBuilderWorkspace(root)
+	if err != nil {
+		t.Fatalf("resolveBuilderWorkspace: %v", err)
+	}
+	if got != "wK" {
+		t.Fatalf("builder workspace = %q, want registered workspace wK instead of focused wF", got)
+	}
+}
+
 func TestWorkerConfigDriftRejectsBeforeLaunch(t *testing.T) {
 	lane := &config.LaneDef{Name: "mutant", Role: "worker", AgentKind: "codex", Harness: "codex", Provider: "codex", Model: "gpt-5.6-sol", Effort: "medium", TaskShape: "implementation"}
 	err := validateLaneLaunchConfig(lane)

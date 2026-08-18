@@ -1647,6 +1647,11 @@ func runUp() {
 		fmt.Fprintf(os.Stderr, "herdr CLI not found\n")
 		os.Exit(1)
 	}
+	workspace, workspaceErr := resolveBuilderWorkspace(".")
+	if workspaceErr != nil {
+		fmt.Fprintf(os.Stderr, "launch rejected before tab creation: %v\n", workspaceErr)
+		os.Exit(1)
+	}
 	repository := repositoryIdentityForLaunch(cfg)
 	if repository == "" {
 		fmt.Fprintf(os.Stderr, "launch rejected before tab creation: repository identity unavailable\n")
@@ -1664,7 +1669,7 @@ func runUp() {
 			cwd = filepath.Join(".", lane.Worktree)
 		}
 		req := launch.Request{Decision: admitted, TaskRef: lane.Name, Scope: router.ScopeLane, Repository: repository, Lane: lane.Name}
-		_, tab, tabErr = openWriteCapableTab(admitted, req, lane, herdr.ResolveWorkspace("."), fmt.Sprintf("forge-%s", lane.Name), cwd)
+		_, tab, tabErr = openWriteCapableTab(admitted, req, lane, workspace, fmt.Sprintf("forge-%s", lane.Name), cwd)
 		return tabErr
 	})
 	if err != nil {
@@ -1678,7 +1683,7 @@ func runUp() {
 	tabLabel := fmt.Sprintf("forge-%s", lane.Name)
 	ready, readyErr := waitExactPaneBeforeStart(tab, nativePaneReadyTimeout)
 	if readyErr != nil {
-		closeErr := compensateExactLaunchTab(herdr.ResolveWorkspace("."), tab)
+		closeErr := compensateExactLaunchTab(workspace, tab)
 		fmt.Fprintf(os.Stderr, "LAUNCH_FAILED: %s\n", ready.Reason)
 		if closeErr != nil {
 			fmt.Fprintf(os.Stderr, "  COMPENSATION FAILED: %v\n", closeErr)
@@ -1691,6 +1696,13 @@ func runUp() {
 	}
 
 	fmt.Printf("Lane '%s' started: tab=%s pane=%s agent=%s\n", lane.Name, tab.ID, tab.Pane.ID, tabLabel)
+}
+
+// resolveBuilderWorkspace is the single workspace boundary for builder-lane
+// launches. RequireWorkspace honors the repository's registered binding and
+// fails closed instead of silently routing a tab to the focused workspace.
+func resolveBuilderWorkspace(repoRoot string) (string, error) {
+	return herdr.RequireWorkspace(repoRoot)
 }
 
 func runActivate() {
@@ -4964,7 +4976,10 @@ func runForgeE() error {
 						cwd = filepath.Join(".", lane.Worktree)
 					}
 					req := taskLaunchRequest(decision, task.Ref, repositoryIdentityForLaunch(cfg), lane.Name)
-					ws := herdr.ResolveWorkspace(".")
+					ws, workspaceErr := resolveBuilderWorkspace(".")
+					if workspaceErr != nil {
+						return compensateLaunchFailure(fmt.Errorf("resolve builder workspace: %w", workspaceErr))
+					}
 					_, tab, tabErr := openWriteCapableTab(decision, req, lane, ws, tabLabel, cwd)
 					if tabErr == nil {
 						ready, readyErr := waitExactPaneBeforeStart(tab, nativePaneReadyTimeout)
