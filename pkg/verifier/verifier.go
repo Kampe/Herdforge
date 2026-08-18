@@ -78,46 +78,55 @@ type MutationResult struct {
 // to. CandidateSHA must be the full 40-character commit SHA. BaseSHA is
 // optional, but when present it has the same exact-SHA requirement.
 type VerificationRequest struct {
-	TaskRef           string
-	LeaseGeneration   string
-	CandidateSHA      string
-	BaseSHA           string
-	EnvironmentPolicy EnvironmentPolicy
-	Artifacts         []string
+	TaskRef             string
+	LeaseGeneration     string
+	CandidateSHA        string
+	BaseSHA             string
+	EnvironmentPolicy   EnvironmentPolicy
+	Artifacts           []string
+	VerificationProfile string
+	ProfileDigest       string
+	ConfigRevision      string
 }
 
 // Receipt is durable evidence for one command run against one candidate.
 // Digest is SHA-256 over the canonical JSON form of the receipt with Digest
 // omitted. Output is represented by OutputDigest so receipts stay bounded.
 type Receipt struct {
-	Version           int               `json:"version"`
-	TaskRef           string            `json:"task_ref"`
-	LeaseGeneration   string            `json:"lease_generation"`
-	CandidateSHA      string            `json:"candidate_sha"`
-	BaseSHA           string            `json:"base_sha,omitempty"`
-	Command           []string          `json:"argv"`
-	ExitCode          int               `json:"exit_code"`
-	Duration          time.Duration     `json:"duration_ns"`
-	EnvironmentPolicy EnvironmentPolicy `json:"environment_policy"`
-	Artifacts         []string          `json:"artifacts,omitempty"`
-	OutputDigest      string            `json:"output_digest,omitempty"`
-	Outcome           Outcome           `json:"outcome"`
-	Digest            string            `json:"digest"`
+	Version             int               `json:"version"`
+	TaskRef             string            `json:"task_ref"`
+	LeaseGeneration     string            `json:"lease_generation"`
+	CandidateSHA        string            `json:"candidate_sha"`
+	BaseSHA             string            `json:"base_sha,omitempty"`
+	Command             []string          `json:"argv"`
+	ExitCode            int               `json:"exit_code"`
+	Duration            time.Duration     `json:"duration_ns"`
+	EnvironmentPolicy   EnvironmentPolicy `json:"environment_policy"`
+	Artifacts           []string          `json:"artifacts,omitempty"`
+	OutputDigest        string            `json:"output_digest,omitempty"`
+	Outcome             Outcome           `json:"outcome"`
+	VerificationProfile string            `json:"verification_profile,omitempty"`
+	ProfileDigest       string            `json:"profile_digest,omitempty"`
+	ConfigRevision      string            `json:"config_revision,omitempty"`
+	Digest              string            `json:"digest"`
 }
 
 type receiptForDigest struct {
-	Version           int               `json:"version"`
-	TaskRef           string            `json:"task_ref"`
-	LeaseGeneration   string            `json:"lease_generation"`
-	CandidateSHA      string            `json:"candidate_sha"`
-	BaseSHA           string            `json:"base_sha,omitempty"`
-	Command           []string          `json:"argv"`
-	ExitCode          int               `json:"exit_code"`
-	Duration          time.Duration     `json:"duration_ns"`
-	EnvironmentPolicy EnvironmentPolicy `json:"environment_policy"`
-	Artifacts         []string          `json:"artifacts,omitempty"`
-	OutputDigest      string            `json:"output_digest,omitempty"`
-	Outcome           Outcome           `json:"outcome"`
+	Version             int               `json:"version"`
+	TaskRef             string            `json:"task_ref"`
+	LeaseGeneration     string            `json:"lease_generation"`
+	CandidateSHA        string            `json:"candidate_sha"`
+	BaseSHA             string            `json:"base_sha,omitempty"`
+	Command             []string          `json:"argv"`
+	ExitCode            int               `json:"exit_code"`
+	Duration            time.Duration     `json:"duration_ns"`
+	EnvironmentPolicy   EnvironmentPolicy `json:"environment_policy"`
+	Artifacts           []string          `json:"artifacts,omitempty"`
+	OutputDigest        string            `json:"output_digest,omitempty"`
+	Outcome             Outcome           `json:"outcome"`
+	VerificationProfile string            `json:"verification_profile,omitempty"`
+	ProfileDigest       string            `json:"profile_digest,omitempty"`
+	ConfigRevision      string            `json:"config_revision,omitempty"`
 }
 
 type Verifier struct {
@@ -578,18 +587,21 @@ func makeReceipt(req VerificationRequest, argv []string, result *Result, outcome
 		outputDigest = digestBytes([]byte(result.Output))
 	}
 	receipt := Receipt{
-		Version:           1,
-		TaskRef:           req.TaskRef,
-		LeaseGeneration:   req.LeaseGeneration,
-		CandidateSHA:      req.CandidateSHA,
-		BaseSHA:           req.BaseSHA,
-		Command:           append([]string(nil), argv...),
-		ExitCode:          result.ExitCode,
-		Duration:          result.Duration,
-		EnvironmentPolicy: req.EnvironmentPolicy,
-		Artifacts:         append([]string(nil), req.Artifacts...),
-		OutputDigest:      outputDigest,
-		Outcome:           outcome,
+		Version:             1,
+		TaskRef:             req.TaskRef,
+		LeaseGeneration:     req.LeaseGeneration,
+		CandidateSHA:        req.CandidateSHA,
+		BaseSHA:             req.BaseSHA,
+		Command:             append([]string(nil), argv...),
+		ExitCode:            result.ExitCode,
+		Duration:            result.Duration,
+		EnvironmentPolicy:   req.EnvironmentPolicy,
+		Artifacts:           append([]string(nil), req.Artifacts...),
+		OutputDigest:        outputDigest,
+		Outcome:             outcome,
+		VerificationProfile: req.VerificationProfile,
+		ProfileDigest:       req.ProfileDigest,
+		ConfigRevision:      req.ConfigRevision,
 	}
 	receipt.Digest = digestReceipt(receipt)
 	return receipt
@@ -611,18 +623,21 @@ func blockedReceipt(req VerificationRequest, argv []string, exitCode int, output
 
 func digestReceipt(receipt Receipt) string {
 	payload := receiptForDigest{
-		Version:           receipt.Version,
-		TaskRef:           receipt.TaskRef,
-		LeaseGeneration:   receipt.LeaseGeneration,
-		CandidateSHA:      receipt.CandidateSHA,
-		BaseSHA:           receipt.BaseSHA,
-		Command:           append([]string(nil), receipt.Command...),
-		ExitCode:          receipt.ExitCode,
-		Duration:          receipt.Duration,
-		EnvironmentPolicy: receipt.EnvironmentPolicy,
-		Artifacts:         append([]string(nil), receipt.Artifacts...),
-		OutputDigest:      receipt.OutputDigest,
-		Outcome:           receipt.Outcome,
+		Version:             receipt.Version,
+		TaskRef:             receipt.TaskRef,
+		LeaseGeneration:     receipt.LeaseGeneration,
+		CandidateSHA:        receipt.CandidateSHA,
+		BaseSHA:             receipt.BaseSHA,
+		Command:             append([]string(nil), receipt.Command...),
+		ExitCode:            receipt.ExitCode,
+		Duration:            receipt.Duration,
+		EnvironmentPolicy:   receipt.EnvironmentPolicy,
+		Artifacts:           append([]string(nil), receipt.Artifacts...),
+		OutputDigest:        receipt.OutputDigest,
+		Outcome:             receipt.Outcome,
+		VerificationProfile: receipt.VerificationProfile,
+		ProfileDigest:       receipt.ProfileDigest,
+		ConfigRevision:      receipt.ConfigRevision,
 	}
 	data, _ := json.Marshal(payload)
 	return "sha256:" + digestBytes(data)

@@ -52,6 +52,8 @@ type CompletionBinding struct {
 	PatchID             string
 	ClassifierVersion   string
 	VerificationProfile string // stable identity of the verification argv/profile
+	ProfileDigest       string // digest of the configured command profile
+	ConfigRevision      string // digest of the repository configuration
 	Branch              string
 	// WorktreeDir is the candidate checkout. It is never copied into
 	// operator-facing rejection reasons.
@@ -113,6 +115,8 @@ type reviewEnqueuePayload struct {
 	PatchID          string `json:"patch_id,omitempty"`
 	Classifier       string `json:"classifier_version,omitempty"`
 	Profile          string `json:"verification_profile,omitempty"`
+	ProfileDigest    string `json:"profile_digest,omitempty"`
+	ConfigRevision   string `json:"config_revision,omitempty"`
 }
 
 // CompletionGate is the production authority between builder completion
@@ -316,12 +320,15 @@ func verificationRequest(b CompletionBinding) verifier.VerificationRequest {
 		artifacts = append(artifacts, "lease_owner:"+b.LeaseOwner)
 	}
 	return verifier.VerificationRequest{
-		TaskRef:           b.TaskRef,
-		LeaseGeneration:   gen,
-		CandidateSHA:      b.CandidateSHA,
-		BaseSHA:           b.BaseSHA,
-		EnvironmentPolicy: verifier.EnvironmentPolicyInherited,
-		Artifacts:         artifacts,
+		TaskRef:             b.TaskRef,
+		LeaseGeneration:     gen,
+		CandidateSHA:        b.CandidateSHA,
+		BaseSHA:             b.BaseSHA,
+		EnvironmentPolicy:   verifier.EnvironmentPolicyInherited,
+		Artifacts:           artifacts,
+		VerificationProfile: b.VerificationProfile,
+		ProfileDigest:       b.ProfileDigest,
+		ConfigRevision:      b.ConfigRevision,
 	}
 }
 
@@ -341,6 +348,15 @@ func (g *CompletionGate) bindMatchesReceipt(b CompletionBinding, r *verifier.Rec
 	wantGen := strconv.FormatInt(b.LeaseGeneration, 10)
 	if r.LeaseGeneration != "" && r.LeaseGeneration != wantGen {
 		return fmt.Errorf("lease_generation receipt=%s live=%s", r.LeaseGeneration, wantGen)
+	}
+	if b.VerificationProfile != "" && r.VerificationProfile != b.VerificationProfile {
+		return fmt.Errorf("verification profile receipt=%s live=%s", r.VerificationProfile, b.VerificationProfile)
+	}
+	if b.ProfileDigest != "" && r.ProfileDigest != b.ProfileDigest {
+		return errors.New("verification profile digest binding no longer matches receipt")
+	}
+	if b.ConfigRevision != "" && r.ConfigRevision != b.ConfigRevision {
+		return errors.New("verification config revision binding no longer matches receipt")
 	}
 	// Artifact-bound fields: when the live binding supplies them, the
 	// receipt must carry the same values (invalidation on change).
@@ -453,6 +469,8 @@ func (g *CompletionGate) recordPassing(bind CompletionBinding, receipt *verifier
 		PatchID:          bind.PatchID,
 		Classifier:       bind.ClassifierVersion,
 		Profile:          bind.VerificationProfile,
+		ProfileDigest:    bind.ProfileDigest,
+		ConfigRevision:   bind.ConfigRevision,
 	})
 	// Idempotency is keyed on task + candidate + digest so a restart after
 	// verify-before-commit converges without double consumption.
