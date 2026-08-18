@@ -176,40 +176,6 @@ lanes:
     capabilities: ["git-write", "fs-write", "shell-exec"]
     incompatible_with: ["reviewer"]
 
-  # smith-agy — capacity on a healthy pool when grok/codex are
-  # weekly-exhausted (2026-08-18) and claude is at its concurrency cap.
-  - name: "smith-agy"
-    role: "worker"
-    agent_kind: "agy"
-    harness: "agy"
-    prompt: ".herd/prompts/worker.md"
-    worktree: ".worktrees/smith-agy"
-    provider: "agy"
-    model: "claude-opus-4-6-thinking"
-    effort: "medium"
-    task_shape: "implementation"
-    standing: false
-    authority: "write"
-    capabilities: ["git-write", "fs-write", "shell-exec"]
-    incompatible_with: ["reviewer"]
-
-  # smith-opencode — opencode's LiteLLM gateway (GLM-5.2, Qwen3.5, etc.),
-  # extra capacity independent of the native provider quota pools above.
-  - name: "smith-opencode"
-    role: "worker"
-    agent_kind: "opencode"
-    harness: "opencode"
-    prompt: ".herd/prompts/worker.md"
-    worktree: ".worktrees/smith-opencode"
-    provider: "opencode-ollama"
-    model: "litellm/ollama/glm-5.2:cloud"
-    effort: "medium"
-    task_shape: "implementation"
-    standing: false
-    authority: "write"
-    capabilities: ["git-write", "fs-write", "shell-exec"]
-    incompatible_with: ["reviewer"]
-
   # assayer — independent review. Reviewer independence is enforced from
   # candidate provenance. Worker/forge lanes use the Codex harness with the
   # explicit Codex/Luna/medium route; review effort is medium by default and high only
