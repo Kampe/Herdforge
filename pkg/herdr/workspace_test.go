@@ -9,6 +9,39 @@ import (
 	"github.com/Kampe/Herdforge/pkg/config"
 )
 
+func TestAuditWorkspaceDriftFlagsMismatchedWorkspace(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, ".herd"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	config := "version: \"1\"\nproject:\n  name: Herdforge\ntask_provider:\n  type: kaneo\n  project_id: project\nfleet:\n  herdr_workspace: w-herdforge\n"
+	if err := os.WriteFile(filepath.Join(root, ".herd", "herd.yaml"), []byte(config), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	worktree := filepath.Join(root, ".herd", "worktrees", "fac-420")
+	if err := os.MkdirAll(worktree, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	drift := AuditWorkspaceDrift([]AgentEntry{{Name: "healthy", Workspace: "w-herdforge", ForegroundCwd: worktree}, {Name: "stranded", Workspace: "w-marina", ForegroundCwd: worktree}}, []WorkspaceEntry{{WorkspaceID: "w-herdforge", Label: "Herdforge"}, {WorkspaceID: "w-marina", Label: "marina-infra"}})
+	if len(drift) != 1 {
+		t.Fatalf("drift = %#v, want one finding", drift)
+	}
+	if drift[0].Agent != "stranded" || drift[0].ExpectedWorkspace != "w-herdforge" {
+		t.Fatalf("drift = %#v, want stranded agent bound to w-herdforge", drift[0])
+	}
+}
+
+func TestAuditWorkspaceDriftDoesNotFlagHealthyUnregisteredWorkspace(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	drift := AuditWorkspaceDrift([]AgentEntry{{Name: "chainseer", Workspace: "w-chainseer", ForegroundCwd: root}}, []WorkspaceEntry{{WorkspaceID: "w-chainseer", Label: filepath.Base(root)}})
+	if len(drift) != 0 {
+		t.Fatalf("healthy unregistered fleet produced drift: %#v", drift)
+	}
+}
+
 func workspaceBindingRepo(t *testing.T, workspace string) string {
 	t.Helper()
 	root := t.TempDir()

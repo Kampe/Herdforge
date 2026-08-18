@@ -1086,6 +1086,37 @@ func runStatus() {
 		fmt.Printf("Reconciliation: observed\nFleet: working=%d capacity=%d standing=%d preserved=%d recovering=%d control=%d unknown=%d\n",
 			fleet.Working, fleet.Capacity, fleet.Standing, fleet.Preserved, fleet.Recovering, fleet.ControlSeats, fleet.Unknown)
 	}
+	reportWorkspacePlacement()
+}
+
+// reportWorkspacePlacement is deliberately read-only. Herdr tab placement is
+// operator-owned state; status can expose drift but must never move or close
+// the affected pane as a side effect of diagnosis.
+func reportWorkspacePlacement() {
+	if !herdr.IsAvailable() {
+		fmt.Println("Workspace placement: UNAVAILABLE (herdr is not reachable)")
+		return
+	}
+	agents, err := herdr.AgentList()
+	if err != nil {
+		fmt.Printf("Workspace placement: UNAVAILABLE (%v)\n", err)
+		return
+	}
+	workspaces, err := herdr.WorkspaceList()
+	if err != nil {
+		fmt.Printf("Workspace placement: UNAVAILABLE (%v)\n", err)
+		return
+	}
+	drift := herdr.AuditWorkspaceDrift(agents, workspaces)
+	if len(drift) == 0 {
+		fmt.Println("Workspace placement: OK")
+		return
+	}
+	fmt.Printf("Workspace placement: DRIFT (%d agent(s))\n", len(drift))
+	for _, finding := range drift {
+		fmt.Printf("  DRIFT agent=%s workspace=%s expected=%s foreground_cwd=%s\n",
+			finding.Agent, finding.Workspace, finding.ExpectedWorkspace, finding.ForegroundCwd)
+	}
 }
 
 // loadTaskProvider activates the configured board provider with FAC-150

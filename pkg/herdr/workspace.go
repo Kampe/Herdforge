@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/Kampe/Herdforge/pkg/config"
@@ -14,12 +15,92 @@ import (
 type WorkspaceEntry struct {
 	WorkspaceID string `json:"workspace_id"`
 	Label       string `json:"label"`
+	Name        string `json:"name,omitempty"`
 	Focused     bool   `json:"focused"`
 	// Cwd is the workspace's working directory, when herdr reports one.
 	// Absent from every fixture seen so far in this repo; consumers that
 	// match on it (e.g. pkg/feedback's workspace cascade) must treat an
 	// empty value as "no cwd match available", never as a match.
 	Cwd string `json:"cwd,omitempty"`
+}
+
+// WorkspaceDrift is a read-only finding from the live agent/workspace audit.
+// It intentionally contains no remediation operation: moving or closing a
+// stranded tab requires an operator or coordinator decision.
+type WorkspaceDrift struct {
+	Agent             string
+	Workspace         string
+	ExpectedWorkspace string
+	ForegroundCwd     string
+}
+
+// AuditWorkspaceDrift identifies agents whose foreground cwd belongs to a
+// repository registered for a different Herdr workspace. Repositories with a
+// local fleet binding are authoritative even when the cwd is a task
+// worktree. For repositories without a binding, a workspace label matching
+// the cwd basename is sufficient evidence of a healthy placement; unknown
+// layouts are ignored to avoid false positives.
+func AuditWorkspaceDrift(agents []AgentEntry, workspaces []WorkspaceEntry) []WorkspaceDrift {
+	findings := make([]WorkspaceDrift, 0)
+	for _, agent := range agents {
+		workspace := strings.TrimSpace(agent.Workspace)
+		cwd := strings.TrimSpace(agent.ForegroundCwd)
+		if workspace == "" || cwd == "" {
+			continue
+		}
+		expected, known := registeredWorkspaceForCwd(cwd)
+		if !known {
+			expected, known = workspaceForCwdLabel(cwd, workspaces)
+		}
+		if !known || workspace == expected {
+			continue
+		}
+		findings = append(findings, WorkspaceDrift{Agent: agent.Name, Workspace: workspace, ExpectedWorkspace: expected, ForegroundCwd: cwd})
+	}
+	sort.SliceStable(findings, func(i, j int) bool {
+		if findings[i].Agent != findings[j].Agent {
+			return findings[i].Agent < findings[j].Agent
+		}
+		return findings[i].ForegroundCwd < findings[j].ForegroundCwd
+	})
+	return findings
+}
+
+func registeredWorkspaceForCwd(cwd string) (string, bool) {
+	abs, err := filepath.Abs(cwd)
+	if err != nil {
+		return "", false
+	}
+	for dir := abs; ; dir = filepath.Dir(dir) {
+		configPath := filepath.Join(dir, ".herd", "herd.yaml")
+		if _, statErr := os.Stat(configPath); statErr == nil {
+			cfg, loadErr := config.LoadConfig(configPath)
+			if loadErr != nil {
+				return "", false
+			}
+			workspace := strings.TrimSpace(cfg.Fleet.HerdrWorkspace)
+			return workspace, workspace != ""
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			break
+		}
+	}
+	return "", false
+}
+
+func workspaceForCwdLabel(cwd string, workspaces []WorkspaceEntry) (string, bool) {
+	name := filepath.Base(filepath.Clean(cwd))
+	for _, workspace := range workspaces {
+		label := workspace.Label
+		if strings.TrimSpace(label) == "" {
+			label = workspace.Name
+		}
+		if workspace.WorkspaceID != "" && strings.EqualFold(strings.TrimSpace(label), name) {
+			return workspace.WorkspaceID, true
+		}
+	}
+	return "", false
 }
 
 // WorkspaceList returns all herdr workspaces.
