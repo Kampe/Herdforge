@@ -631,3 +631,26 @@ func TestReviewerLaunchDecisionBindsReroutedVendorHarness(t *testing.T) {
 		t.Fatalf("rerouted reviewer tuple is incoherent: %+v", decision)
 	}
 }
+
+func TestStandingGrokLaneCannotRerouteToClaude(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "grok"), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir)
+	t.Setenv("HERD_MODE", "local")
+	t.Setenv("HERD_USE_PI", "0")
+	lane := &config.LaneDef{
+		Name: "scout-planner", Role: launch.ScoutPlannerRole, AgentKind: "grok", Harness: "grok",
+		Provider: "grok", Model: "grok-4.6", Effort: "medium", TaskShape: "architecture", Standing: true,
+	}
+	d, err := laneLaunchDecisionWithProbe(context.Background(), lane, nil, func(_ context.Context, _, model, _ string) herdr.ProbeResult {
+		return herdr.ProbeResult{Model: model, Available: true}
+	})
+	if err != nil {
+		t.Fatalf("standing Grok route rejected: %v", err)
+	}
+	if d.Provider != "grok" || d.Model != "grok-4.6" || d.Harness != "grok" {
+		t.Fatalf("standing route was rerouted from its explicit tuple: %+v", d)
+	}
+}

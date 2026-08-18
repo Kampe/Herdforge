@@ -2,6 +2,8 @@ package router
 
 import (
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -87,6 +89,53 @@ func TestWorkerDecideReroutesOnQuotaExhaustion(t *testing.T) {
 	}
 	if d.Shape != "implementation" {
 		t.Fatalf("rerouted worker lost its shape: %s", d.Shape)
+	}
+}
+
+func TestStandingRouteHonorsProviderAndModelWithoutCrossFamilyFallback(t *testing.T) {
+	clearRouteEnv(t)
+	t.Setenv("HERD_USE_PI", "0")
+	r := testRouter(map[string]usage.BurnState{
+		"claude": {Available: true, Pressure: 1},
+		"grok":   {Available: true, Pressure: 100},
+	}, "claude", "grok")
+	d, err := r.Decide(LaunchRequest{
+		Role: RoleScoutPlanner, Shape: "architecture", Scope: ScopeLane,
+		TaskRef: "scout-planner", Standing: true,
+		PreferredProvider: "grok", PreferredModel: "grok-4.6",
+	})
+	if err != nil {
+		t.Fatalf("standing route rejected: %v", err)
+	}
+	if d.Provider != "grok" || d.Model != "grok-4.6" || d.Harness != "grok" {
+		t.Fatalf("standing route crossed or changed its configured tuple: %+v", d)
+	}
+}
+
+func TestStandingRouteUsesSameProviderFallbackModel(t *testing.T) {
+	clearRouteEnv(t)
+	t.Setenv("HERD_USE_PI", "0")
+	stateDir := t.TempDir()
+	t.Setenv("HERDR_ROUTE_STATE_DIR", stateDir)
+	if err := os.WriteFile(filepath.Join(stateDir, "grok--model--grok-4.6.cooldown.json"), []byte(`{"expiresAt":4102444800,"provider":"grok","model":"grok-4.6","reason":"exhausted"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	r := testRouter(map[string]usage.BurnState{
+		"grok": {Available: true, Pressure: 10, Pools: map[string]usage.BurnState{
+			"default": {Available: true, Pressure: 10},
+		}},
+	}, "grok")
+	d, err := r.Decide(LaunchRequest{
+		Role: RoleScoutPlanner, Shape: "architecture", Scope: ScopeLane,
+		TaskRef: "scout-planner", Standing: true,
+		PreferredProvider: "grok", PreferredModel: "grok-4.6",
+		PreferredFallbackModels: []string{"grok-4.5"},
+	})
+	if err != nil {
+		t.Fatalf("standing fallback rejected: %v", err)
+	}
+	if d.Provider != "grok" || d.Model != "grok-4.5" {
+		t.Fatalf("standing fallback crossed provider or did not select sibling model: %+v", d)
 	}
 }
 

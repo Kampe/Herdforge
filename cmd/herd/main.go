@@ -5443,6 +5443,7 @@ func laneLaunchDecisionWithProbe(ctx context.Context, lane *config.LaneDef, task
 	}
 	pinnedBuilder := role == router.RoleWorker || role == router.RoleForgeSmith || role == router.RoleRecovery
 	request := router.LaunchRequest{Role: router.Role(strings.TrimSpace(lane.Role)), NativeRole: role, Shape: shape, TaskRef: contextRef, Scope: scope, Risk: classify.TierR1}
+	request.Standing = lane.Standing
 	if pinnedBuilder {
 		request.RequestedProvider = provider
 		request.RequestedModel = lane.Model
@@ -5450,6 +5451,10 @@ func laneLaunchDecisionWithProbe(ctx context.Context, lane *config.LaneDef, task
 	} else {
 		request.PreferredProvider = provider
 		request.PreferredModel = lane.Model
+		request.PreferredFallbackModels = append([]string(nil), lane.FallbackModels...)
+		if lane.Standing {
+			request.RequestedEffort = lane.Effort
+		}
 	}
 	if role == router.RoleReviewer || role == router.RoleAssayer {
 		if task == nil {
