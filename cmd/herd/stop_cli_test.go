@@ -192,6 +192,7 @@ func TestStopCLIMakesWinddownDurableAndDestroysNoWork(t *testing.T) {
 		case line == "", strings.HasPrefix(line, "agent list"),
 			strings.HasPrefix(line, "workspace list"),
 			strings.HasPrefix(line, "agent prompt"),
+			strings.HasPrefix(line, "agent send-keys"),
 			strings.HasPrefix(line, "tab close"):
 		default:
 			t.Fatalf("stop invoked an unexpected herdr command: %q\nlog:\n%s", line, log)

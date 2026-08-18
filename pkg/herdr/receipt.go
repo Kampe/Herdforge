@@ -75,13 +75,16 @@ func DeliverAndProve(target, text string, timeout time.Duration) (*PromptReceipt
 			SequenceToken:  sequenceToken(baseline, ""),
 		}, err
 	}
+	// The prompt transport may finish before the pane has consumed the
+	// composer text.  Press Enter immediately to close that race (FAC-388).
+	_ = SendKeys(target, "Enter")
 
 	if timeout <= 0 {
 		timeout = 60 * time.Second
 	}
 	poll := 2 * time.Second
 	deadline := time.Now().Add(timeout)
-	nudged := false
+	nudged := true
 	last := baseline
 	sawWorking := baseline == "working"
 	for time.Now().Before(deadline) {

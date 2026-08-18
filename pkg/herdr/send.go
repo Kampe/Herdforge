@@ -53,13 +53,17 @@ func Send(target, text string, verify bool, timeout time.Duration) (string, erro
 	if _, err := AgentPrompt(target, text, false); err != nil {
 		return "", err
 	}
+	// Herdr can return after writing TEXT while the pane composer is still
+	// processing it.  Submit once immediately so a following status poll does
+	// not observe text stranded in the composer (FAC-388).
+	_ = SendKeys(target, "Enter")
 	if !verify {
 		return "submitted", nil
 	}
 
 	poll := 2 * time.Second
 	deadline := time.Now().Add(timeout)
-	nudged := false
+	nudged := true
 	last := "unknown"
 	for time.Now().Before(deadline) {
 		st, err := liveStatus(target)
