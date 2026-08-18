@@ -120,7 +120,7 @@ lanes:
     prompt: ".herd/prompts/worker.md"
     worktree: ".worktrees/smith-grok"
     provider: "grok"
-    model: "grok-4.6"
+    model: "grok-4.5"
     effort: "medium"
     task_shape: "implementation"
     standing: false
@@ -153,22 +153,7 @@ lanes:
     prompt: ".herd/prompts/worker.md"
     worktree: ".worktrees/smith-grok-2"
     provider: "grok"
-    model: "grok-4.6"
-    effort: "medium"
-    task_shape: "implementation"
-    standing: false
-    authority: "write"
-    capabilities: ["git-write", "fs-write", "shell-exec"]
-    incompatible_with: ["reviewer"]
-
-  - name: "smith-agy"
-    role: "worker"
-    agent_kind: "agy"
-    harness: "agy"
-    prompt: ".herd/prompts/worker.md"
-    worktree: ".worktrees/smith-agy"
-    provider: "agy"
-    model: "claude-opus-4-6-thinking"
+    model: "grok-4.5"
     effort: "medium"
     task_shape: "implementation"
     standing: false
