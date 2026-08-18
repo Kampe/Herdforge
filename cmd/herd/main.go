@@ -5467,7 +5467,10 @@ func validateLaneLaunchConfig(lane *config.LaneDef) error {
 		return fmt.Errorf("lane %q has incomplete launch authority", lane.Name)
 	}
 	expectedShapes := map[string]string{launch.WorkerRole: "implementation", launch.ForgeSmithRole: "implementation", launch.RecoveryRole: "implementation", launch.ReviewerRole: "qa", launch.AssayerRole: "qa", launch.OrchestratorRole: "coordinator", launch.ScoutPlannerRole: "architecture", launch.VerificationGateRole: "bounded", launch.ReviewSupervisorRole: "coordinator", launch.HarvestRole: "bounded", launch.RecoverySentinelRole: "bounded"}
-	if expected, ok := expectedShapes[role]; !ok || lane.TaskShape != expected {
+	if expected, ok := expectedShapes[role]; ok && lane.TaskShape != expected {
+		return fmt.Errorf("%w: lane %q has invalid task_shape %q for role %q", ErrWorkerConfigPolicy, lane.Name, lane.TaskShape, role)
+	}
+	if _, ok := expectedShapes[role]; !ok && !knownLaneTaskShape(lane.TaskShape) {
 		return fmt.Errorf("%w: lane %q has invalid task_shape %q for role %q", ErrWorkerConfigPolicy, lane.Name, lane.TaskShape, role)
 	}
 	agentKind := strings.ToLower(strings.TrimSpace(lane.AgentKind))
@@ -5489,6 +5492,15 @@ func validateLaneLaunchConfig(lane *config.LaneDef) error {
 		}
 	}
 	return nil
+}
+
+func knownLaneTaskShape(shape string) bool {
+	for _, known := range router.AllShapes() {
+		if shape == known {
+			return true
+		}
+	}
+	return false
 }
 
 func supportedVendorHarness(harness string) bool {

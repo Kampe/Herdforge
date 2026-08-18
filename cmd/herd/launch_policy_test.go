@@ -59,6 +59,28 @@ func TestAssayerRoleRejectsWrongTaskShape(t *testing.T) {
 	}
 }
 
+func TestConfiguredCustomRoleAcceptsKnownTaskShape(t *testing.T) {
+	tests := []struct {
+		name      string
+		role      string
+		shape     string
+		wantError bool
+	}{
+		{name: "bounded", role: "docs-custodian", shape: "bounded"},
+		{name: "qa", role: "api-crusader", shape: "qa"},
+		{name: "unknown shape", role: "docs-custodian", shape: "not-a-task-shape", wantError: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			lane := &config.LaneDef{Name: tt.role, Role: tt.role, AgentKind: "codex", Harness: "codex", Provider: "codex", Model: testWorkerModel, Effort: testWorkerEffort, TaskShape: tt.shape}
+			err := validateLaneLaunchConfig(lane)
+			if (err != nil) != tt.wantError {
+				t.Fatalf("validateLaneLaunchConfig() error = %v, wantError %t", err, tt.wantError)
+			}
+		})
+	}
+}
+
 type fakeLaunchLifecycle struct {
 	providerList, claim, status, comment, worktree, tab, process, prompt int
 	decision                                                             *router.LaunchDecision
