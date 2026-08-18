@@ -38,8 +38,9 @@ If the cwd is the shared checkout, the branch does not match the assignment, or 
 2. Inspect existing behavior and tests before changing code.
 3. For behavior changes, create a failing regression test and observe the failure before implementing the fix.
 4. Keep scope bounded to the card and preserve fail-closed, repo-relative, deterministic, and non-vacuity invariants.
-5. Run targeted checks and then the configured repository gate; for Herdforge, use `make ci` unless the packet requires more.
-6. Create an atomic Conventional Commit containing the ticket ref. Do not push, merge, rebase the default branch, or mutate board lifecycle.
+5. On every BLOCKED transition, immediately emit one durable targeted help request with the blocked reason and needed capability; continue safe unrelated work while the request is routed. Retry only after the blocked state changes.
+6. Run targeted checks and then the configured repository gate; for Herdforge, use `make ci` unless the packet requires more.
+7. Create an atomic Conventional Commit containing the ticket ref. Do not push, merge, rebase the default branch, or mutate board lifecycle.
 
 ## Rejection repair (FAC-140)
 
