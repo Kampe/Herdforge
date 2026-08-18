@@ -5,7 +5,62 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
+
+	"github.com/Kampe/Herdforge/pkg/claim"
 )
+
+func TestWorktreeRemovalRefusesLiveLease(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		task       string
+		leasePath  string
+		leaseStart time.Time
+		leaseTTL   time.Duration
+		wantRefuse bool
+	}{
+		{name: "live lease", task: "FAC-421", wantRefuse: true, leaseStart: time.Now(), leaseTTL: time.Hour},
+		{name: "expired lease", task: "FAC-422", wantRefuse: false, leaseStart: time.Now().Add(-2 * time.Hour), leaseTTL: time.Hour},
+		{name: "different worktree", task: "FAC-423", wantRefuse: false, leasePath: ".herd/worktrees/fac-423", leaseStart: time.Now(), leaseTTL: time.Hour},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			if err := os.MkdirAll(filepath.Join(root, ".herd"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			store, err := claim.NewSQLiteLeaseStore(filepath.Join(root, ".herd", "herdforge.db"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer store.Close()
+
+			target := filepath.Join(root, ".herd", "worktrees", "fac-421")
+			leasePath := tc.leasePath
+			if leasePath == "" {
+				leasePath = target
+			}
+			if _, err := store.Acquire(context.Background(), claim.LeaseKey{
+				Repo: "herdforge", Provider: "kaneo", Project: "project", TaskRef: tc.task,
+			}, "worker", "builder", leasePath, tc.leaseStart, tc.leaseTTL); err != nil {
+				t.Fatal(err)
+			}
+
+			called := false
+			manager := NewWorktreeManager(root)
+			manager.RemoveWorktreeFunc = func(context.Context, string) error {
+				called = true
+				return nil
+			}
+			err = manager.RemoveWorktree(context.Background(), target)
+			if tc.wantRefuse != (err != nil) {
+				t.Fatalf("removal error = %v, want refusal=%t", err, tc.wantRefuse)
+			}
+			if called == tc.wantRefuse {
+				t.Fatalf("removal mutation called=%t, want %t", called, !tc.wantRefuse)
+			}
+		})
+	}
+}
 
 // TestWorktreePool_CreateAndList uses a temp-origin fixture (FAC-152):
 // pointing a WorktreeManager at "." would run "git worktree list" with

@@ -14,6 +14,7 @@ import (
 	"github.com/Kampe/Herdforge/pkg/resources"
 	"github.com/Kampe/Herdforge/pkg/reviewledger"
 	hsync "github.com/Kampe/Herdforge/pkg/sync"
+	"github.com/Kampe/Herdforge/pkg/worktree"
 )
 
 // Integration implements the README contract: a serialized merge pipeline
@@ -596,6 +597,9 @@ func ensureRemoteReplayHead(ctx context.Context, repo, want string) error {
 }
 
 func (in *Integration) runCleanup(ctx context.Context, uw UnmergedWork) (bool, error) {
+	if err := worktree.RefuseRemovalWithLiveLease(ctx, in.RepoRoot, uw.WorktreePath); err != nil {
+		return false, err
+	}
 	// Refuse if the worktree is dirty.
 	statusOut, err := gitOutput(ctx, uw.WorktreePath, "status", "--porcelain")
 	if err != nil {
