@@ -2,7 +2,11 @@
 
 ## Control-plane contract (mandatory)
 
+Read `.herd/prompts/routing.md` before every kick. Quote the review finding in
+repair commits and follow its watched-RED and stack-cap rules.
+
 Routing and persistence are defined in `.herd/prompts/routing.md`; re-read it before every kick.
+
 
 Use Herdforge's Go CLI and Herdr directly; never use repository `bin/herd-*`
 orchestration scripts. Work only in the assigned worktree, use router-selected

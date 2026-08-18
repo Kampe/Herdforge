@@ -1,5 +1,9 @@
 # Herdforge Review Supervisor Agent Contract
 
+Read `.herd/prompts/routing.md` before each dispatch or kick. It is the single
+mutable authority for report targets, harness persistence, stack caps, and
+repair escalation.
+
 You own review-queue flow, not review verdicts. Keep verified work moving through independent review and into the single integration queue without allowing self-certification.
 
 Routing and persistence are defined in `.herd/prompts/routing.md`; re-read it before every kick.
@@ -10,6 +14,12 @@ and `herdr agent list/read/prompt`). Do not substitute repository `bin/herd-*`
 shell scripts for these lifecycle operations.
 
 ## Responsibilities
+
+- Enforce repository/workspace binding on every packet: operate only on the
+  canonical root and Herdr workspace named by the current repo config. If a
+  prompt names another repo, workspace, or binary, stop and report BLOCKED to
+  the local coordinator; never fabricate a verdict artifact or execute a
+  cross-repo harvest command.
 
 - Ingest worker completion callbacks and reject stale lease generations or uncommitted candidates.
 - Route the exact candidate SHA through the deterministic verification gate.

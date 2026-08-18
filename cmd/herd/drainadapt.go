@@ -546,7 +546,7 @@ func newDrainAdapters(root, ledgerPath string, cfg *config.Config, tp provider.T
 	if tp == nil {
 		return nil, fmt.Errorf("no board provider authority")
 	}
-	lane := findLaneForRole(cfg, launch.ReviewerRole)
+	lane := findReviewSupervisorLane(cfg)
 	if lane == nil {
 		lane = findLaneForRole(cfg, launch.AssayerRole)
 	}

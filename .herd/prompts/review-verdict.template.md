@@ -10,6 +10,8 @@ reviewed-head: <output of `git rev-parse HEAD` in the tree you actually read>
 ---
 Your evidence goes here, below the `---`.
 
+Read `.herd/prompts/routing.md`; deliver only to its current supervisor target.
+
 Delivery: send this verdict and its findings to the standing review supervisor. The coordinator receives only the supervisor's merge-ready PASS handoff.
 
 Use the Herdforge/Herdr delivery path (`herdr agent prompt` or
