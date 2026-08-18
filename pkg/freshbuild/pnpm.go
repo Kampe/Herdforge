@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/Kampe/Herdforge/pkg/slot"
 	"io"
 	"os"
 	"os/exec"
@@ -164,22 +165,37 @@ func (p PnpmProfile) Build(ctx context.Context, root, pkg string, log io.Writer)
 		ctx = context.Background()
 	}
 	filter := pkg + "..."
-	cmd := exec.CommandContext(ctx, p.bin(), "--filter", filter, "run", "build")
-	cmd.Dir = root
-	cmd.Stdout = log
-	cmd.Stderr = log
-	err := cmd.Run()
+	var err error
+	var rc int
+	semaphore, semErr := slot.Default()
+	if semErr != nil {
+		return 1, semErr
+	}
+	err = semaphore.With(ctx, "fresh-build: pnpm", slot.DefaultTimeout, func() error {
+		cmd := exec.CommandContext(ctx, p.bin(), "--filter", filter, "run", "build")
+		cmd.Dir = root
+		cmd.Stdout = log
+		cmd.Stderr = log
+		err = cmd.Run()
+		if err == nil {
+			rc = 0
+			return nil
+		}
+		if ee, ok := err.(*exec.ExitError); ok {
+			rc = ee.ExitCode()
+			if rc < 0 {
+				rc = 1
+			}
+		}
+		return err
+	})
+	if semErr := err; semErr != nil && rc == 0 {
+		return 1, semErr
+	}
 	if err == nil {
 		return 0, nil
 	}
-	if ee, ok := err.(*exec.ExitError); ok {
-		rc := ee.ExitCode()
-		if rc < 0 {
-			rc = 1
-		}
-		return rc, err
-	}
-	return 1, err
+	return rc, err
 }
 
 // cannotFindModule re matches the TypeScript/Node diagnostic used by the zsh

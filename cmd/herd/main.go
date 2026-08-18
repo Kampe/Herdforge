@@ -398,6 +398,9 @@ func main() {
 	case "lock":
 		runLock()
 
+	case "slot":
+		runSlot()
+
 	case "reset-safe":
 		runResetSafe()
 

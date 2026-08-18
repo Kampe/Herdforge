@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/Kampe/Herdforge/pkg/resources"
+	"github.com/Kampe/Herdforge/pkg/slot"
 )
 
 type Language string
@@ -180,6 +181,22 @@ func (v *Verifier) execute(ctx context.Context, dir string, policy EnvironmentPo
 	if err := validateEnvironmentPolicy(policy); err != nil {
 		return nil, err
 	}
+	heavy, err := slot.Default()
+	if err != nil {
+		return nil, err
+	}
+	wait := slot.DefaultTimeout
+	if raw := strings.TrimSpace(os.Getenv(slot.EnvTimeout)); raw != "" {
+		wait, err = time.ParseDuration(raw)
+		if err != nil || wait < 0 {
+			return nil, fmt.Errorf("verification: invalid %s=%q", slot.EnvTimeout, raw)
+		}
+	}
+	lease, err := heavy.Acquire(ctx, "verification: "+v.Argv[0], wait)
+	if err != nil {
+		return &Result{Outcome: OutcomeBLOCKED, Output: err.Error(), OutputDigest: digestBytes([]byte(err.Error())), ExitCode: -1}, nil
+	}
+	defer func() { _ = lease.Release() }()
 
 	started := time.Now()
 	commandPath := v.Argv[0]
@@ -217,6 +234,11 @@ func (v *Verifier) execute(ctx context.Context, dir string, policy EnvironmentPo
 			Duration:     time.Since(started),
 		}, nil
 	}
+	childEnv := cmd.Env
+	if childEnv == nil {
+		childEnv = os.Environ()
+	}
+	cmd.Env = append(childEnv, slot.EnvHeld+"=1")
 	cmd.Cancel = func() error {
 		if cmd.Process == nil {
 			return nil
