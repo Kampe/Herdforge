@@ -3644,7 +3644,12 @@ func runCleanup() {
 		standing = configuredStandingAgentNames(cfg)
 	}
 
-	res, err := herdr.CleanupFenced(standing, *dryRun)
+	workspace, workspaceErr := herdr.RequireWorkspace(".")
+	if workspaceErr != nil {
+		fmt.Fprintf(os.Stderr, "herd cleanup: %v\n", workspaceErr)
+		os.Exit(1)
+	}
+	res, err := herdr.CleanupFencedInWorkspace(workspace, standing, *dryRun)
 	if *asJSON {
 		out := map[string]interface{}{
 			"dry_run":     res.DryRun,
@@ -5039,7 +5044,11 @@ func runForgeE() error {
 	// resident; cleanup failure is visible rather than silently leaking panes.
 	if cfg != nil && herdr.IsAvailable() {
 		standingAgents := configuredStandingAgentNames(cfg)
-		if cleaned, cleanupErr := herdr.CleanupFenced(standingAgents, false); cleanupErr != nil {
+		workspace, workspaceErr := herdr.RequireWorkspace(".")
+		if workspaceErr != nil {
+			fmt.Fprintf(os.Stderr, "forge cleanup: %v\n", workspaceErr)
+			forgeFailed = true
+		} else if cleaned, cleanupErr := herdr.CleanupFencedInWorkspace(workspace, standingAgents, false); cleanupErr != nil {
 			fmt.Fprintf(os.Stderr, "forge cleanup: %v\n", cleanupErr)
 			forgeFailed = true
 		} else if cleaned.Closed > 0 {
@@ -9373,19 +9382,10 @@ func forgeLoopMain() int {
 		fmt.Fprintf(os.Stderr, "forge --loop: %v\n", err)
 		return 1
 	}
-	forgeWorkspace := strings.TrimSpace(cfg.Fleet.HerdrWorkspace)
-	if forgeWorkspace == "" {
-		// Prefer the live workspace labeled for this repo. This prevents a
-		// long-lived shell's HERD_WORKSPACE from silently routing Herdforge into
-		// a different checkout (for example, Chainseer).
-		if entries, listErr := herdr.WorkspaceList(); listErr == nil {
-			if id, ok := herdr.PickWorkspaceStrict(entries, cfg.Project.Name); ok {
-				forgeWorkspace = id
-			}
-		}
-	}
-	if forgeWorkspace == "" {
-		forgeWorkspace = strings.TrimSpace(os.Getenv("HERD_WORKSPACE"))
+	forgeWorkspace, workspaceErr := herdr.RequireWorkspace(".")
+	if workspaceErr != nil {
+		fmt.Fprintf(os.Stderr, "forge --loop: workspace resolution failed before fleet mutation: %v\n", workspaceErr)
+		return 1
 	}
 	if forgeWorkspace != "" {
 		// Child `herd dispatch` processes inherit the coordinator's resolved
@@ -9415,11 +9415,7 @@ func forgeLoopMain() int {
 		return 1
 	}
 	fmt.Printf("herd forge --loop: coordinator registered as %q (workspace=%s)\n", coordReg.Name, coordReg.Workspace)
-	workspace := strings.TrimSpace(cfg.Fleet.HerdrWorkspace)
-	if workspace == "" {
-		workspace = strings.TrimSpace(os.Getenv("HERDR_WORKSPACE_ID"))
-	}
-	if _, bindErr := bindCoordinatorControlTab(".", workspace); bindErr != nil {
+	if _, bindErr := bindCoordinatorControlTab(".", forgeWorkspace); bindErr != nil {
 		fmt.Fprintf(os.Stderr, "forge --loop: coordinator control binding failed: %v\n", bindErr)
 		return 1
 	}

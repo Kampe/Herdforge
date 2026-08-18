@@ -651,6 +651,67 @@ func CleanupFenced(standing map[string]bool, dryRun bool) (CleanupResult, error)
 	return res, nil
 }
 
+// CleanupFencedInWorkspace applies the fenced cleanup policy only to the
+// repository's already-validated Herdr workspace. The workspace filter is
+// performed before candidate selection and before any close callback, so a
+// cross-repository agent can never become a mutation candidate.
+func CleanupFencedInWorkspace(workspace string, standing map[string]bool, dryRun bool) (CleanupResult, error) {
+	workspace = strings.TrimSpace(workspace)
+	if workspace == "" {
+		return CleanupResult{}, fmt.Errorf("cleanup: workspace is required")
+	}
+	agents, err := AgentList()
+	if err != nil {
+		return CleanupResult{}, err
+	}
+	filtered := make([]AgentEntry, 0, len(agents))
+	for _, agent := range agents {
+		if agent.Workspace == workspace {
+			filtered = append(filtered, agent)
+		}
+	}
+	return cleanupFencedAgents(filtered, standing, dryRun)
+}
+
+func cleanupFencedAgents(agents []AgentEntry, standing map[string]bool, dryRun bool) (CleanupResult, error) {
+	cands := SelectCleanupCandidates(agents, standing)
+	sort.Slice(cands, func(i, j int) bool {
+		if cands[i].TabID != cands[j].TabID {
+			return cands[i].TabID < cands[j].TabID
+		}
+		return cands[i].Name < cands[j].Name
+	})
+	res := CleanupResult{DryRun: dryRun, Candidates: cands}
+	if dryRun || len(cands) == 0 {
+		return res, nil
+	}
+	closeFn := currentCleanupClose()
+	agentByTab := map[string]AgentEntry{}
+	for _, a := range agents {
+		if a.TabID != "" {
+			agentByTab[a.TabID] = a
+		}
+	}
+	for _, c := range cands {
+		agent := agentByTab[c.TabID]
+		agent.Name = c.Name
+		att := closeFn(agent)
+		res.Attempts = append(res.Attempts, att)
+		switch att.Outcome {
+		case CleanupClosed:
+			res.Closed++
+		case CleanupBlocked:
+			res.Blocked++
+		default:
+			res.Errored++
+		}
+	}
+	if res.Errored > 0 {
+		return res, fmt.Errorf("cleanup: %d errored", res.Errored)
+	}
+	return res, nil
+}
+
 // CloseTabForRef closes the herdr tab of the builder agent working a given
 // card ref (FAC-111). Legacy name/ref lookup cannot establish the exact
 // durable generation/session binding FAC-180 requires, so this path fails

@@ -1,10 +1,38 @@
 package herdr
 
 import (
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/Kampe/Herdforge/pkg/config"
 )
+
+func workspaceBindingRepo(t *testing.T, workspace string) string {
+	t.Helper()
+	root := t.TempDir()
+	if err := os.Mkdir(filepath.Join(root, ".herd"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	data := "version: \"1\"\nproject:\n  name: Herdforge\ntask_provider:\n  type: kaneo\n  project_id: project\nfleet:\n  herdr_workspace: " + workspace + "\n"
+	if err := os.WriteFile(filepath.Join(root, ".herd", "herd.yaml"), []byte(data), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return root
+}
+
+func stubWorkspaceList(t *testing.T, payload string) {
+	t.Helper()
+	old := runHerdr
+	runHerdr = func(args ...string) (string, error) {
+		if len(args) == 2 && args[0] == "workspace" && args[1] == "list" {
+			return payload, nil
+		}
+		return `{}`, nil
+	}
+	t.Cleanup(func() { runHerdr = old })
+}
 
 func TestPickWorkspace(t *testing.T) {
 	entries := []WorkspaceEntry{
@@ -40,6 +68,7 @@ func TestPickWorkspaceStrict_NoHardcodedFallback(t *testing.T) {
 }
 
 func TestRequireWorkspace_EnvWins(t *testing.T) {
+	stubWorkspaceList(t, `{"result":{"workspaces":[{"workspace_id":"wExplicit","label":"other"}]}}`)
 	t.Setenv("HERD_WORKSPACE", "wExplicit")
 	id, err := RequireWorkspace(".")
 	if err != nil {
@@ -57,6 +86,30 @@ func TestRequireWorkspace_UnknownFailsClosed(t *testing.T) {
 	_, err := RequireWorkspace("/tmp/no-such-herdforge-repo-xyz")
 	if err == nil {
 		t.Fatal("expected fail-closed error when workspace cannot be resolved")
+	}
+}
+
+func TestRequireWorkspace_RejectsInheritedCrossWorkspaceOverride(t *testing.T) {
+	root := workspaceBindingRepo(t, "wK")
+	stubWorkspaceList(t, `{"result":{"workspaces":[{"workspace_id":"wK","label":"Herdforge"},{"workspace_id":"wB","label":"Chainseer"}]}}`)
+	t.Setenv("HERD_WORKSPACE", "wB")
+	if _, err := RequireWorkspace(root); err == nil {
+		t.Fatal("expected inherited workspace mismatch to fail closed")
+	} else if !strings.Contains(err.Error(), `HERD_WORKSPACE="wB"`) || !strings.Contains(err.Error(), `registered workspace="wK"`) {
+		t.Fatalf("mismatch error omitted both workspace ids: %v", err)
+	}
+}
+
+func TestRequireWorkspace_AllowsExplicitOverrideOnlyWhenItMatchesBinding(t *testing.T) {
+	root := workspaceBindingRepo(t, "wK")
+	stubWorkspaceList(t, `{"result":{"workspaces":[{"workspace_id":"wK","label":"Herdforge"}]}}`)
+	t.Setenv("HERD_WORKSPACE", "wK")
+	got, err := RequireWorkspace(root)
+	if err != nil {
+		t.Fatalf("matching workspace rejected: %v", err)
+	}
+	if got != "wK" {
+		t.Fatalf("workspace=%q, want wK", got)
 	}
 }
 
