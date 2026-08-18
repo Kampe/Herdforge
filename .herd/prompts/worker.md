@@ -42,6 +42,16 @@ If the cwd is the shared checkout, the branch does not match the assignment, or 
 6. Run targeted checks and then the configured repository gate; for Herdforge, use `make ci` unless the packet requires more.
 7. Create an atomic Conventional Commit containing the ticket ref. Do not push, merge, rebase the default branch, or mutate board lifecycle.
 
+## Test cadence
+
+While iterating, scope Go tests to the packages and tests changed by the current edit: run commands such as `go test ./<changed-package>/... -run <TestName>`. Run the broader or full suite only once, immediately before the final `herd verify` and `herd shot --report complete` call. These five failures are known pre-existing environment failures; do not self-block on them without first confirming that your diff did not cause them:
+
+- `TestFactoryE2E_CoordinatorFenceBlocksSecondLoop`
+- `TestApproveCLI_ReleasedNewerGenerationStillFences`
+- `TestBroker_SessionAuthorityDiesWithPaneIncarnation`
+- `TestLaneLaunchDecisionReportsConfiguredProbeFailure`
+- `TestNewDrainAdaptersFailsClosedOnMissingAuthority/no_reviewer_lane`
+
 ## Rejection repair (FAC-140)
 
 A review `FAIL` arrives as a prompt carrying the reviewer's numbered findings and the exact candidate SHA that failed. It is work, not news: repair it without waiting for a coordinator or a human.

@@ -762,6 +762,9 @@ You are the **Forge-Smith Planner Agent** in the Herdforge network.
 3. Review completed work for correctness and coherence.
 4. Decide when completed work is ready for final review.
 5. Work exclusively inside your assigned worktree.
+
+## Test cadence
+While iterating, scope Go tests to changed packages and tests (for example, go test ./<changed-package>/... -run <TestName>). Run the broader or full suite only once, immediately before the final herd verify and herd shot --report complete call. Do not self-block on these known pre-existing failures without confirming your diff did not cause them: TestFactoryE2E_CoordinatorFenceBlocksSecondLoop, TestApproveCLI_ReleasedNewerGenerationStillFences, TestBroker_SessionAuthorityDiesWithPaneIncarnation, TestLaneLaunchDecisionReportsConfiguredProbeFailure, and TestNewDrainAdaptersFailsClosedOnMissingAuthority/no_reviewer_lane.
 `)
 	writePrompt(".herd/prompts/worker.md", `# Herdforge Worker Agent Contract
 
@@ -770,9 +773,11 @@ You are an **Autonomous Builder Agent** operating in a dedicated git worktree.
 ## Core Rules & Invariants
 1. **Worktree Isolation**: Work exclusively inside your designated worktree path.
 2. **Test-Driven Development**: Write failing tests first, then implement.
-3. **Fail-Closed Verification**: Run 'go test ./...' before signalling completion.
+3. **Fail-Closed Verification**: Scope Go tests to changed packages and tests while iterating (for example, go test ./<changed-package>/... -run <TestName>), then run the broader or full suite only once immediately before the final herd verify and herd shot --report complete call.
 4. **No Absolute Paths**: All file paths must be repository-relative.
 5. **Conventional Commits**: Write clean atomic commit messages.
+
+Known pre-existing failures that must not self-block a builder without confirming the diff did not cause them: TestFactoryE2E_CoordinatorFenceBlocksSecondLoop, TestApproveCLI_ReleasedNewerGenerationStillFences, TestBroker_SessionAuthorityDiesWithPaneIncarnation, TestLaneLaunchDecisionReportsConfiguredProbeFailure, and TestNewDrainAdaptersFailsClosedOnMissingAuthority/no_reviewer_lane.
 `)
 	writePrompt(".herd/prompts/reviewer.md", `# Herdforge Reviewer Agent Contract
 
