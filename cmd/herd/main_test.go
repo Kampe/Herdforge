@@ -484,6 +484,43 @@ func TestInitFull(t *testing.T) {
 	}
 }
 
+func TestInitFullPromptsUseScopedTestCadence(t *testing.T) {
+	binary := buildHerd(t)
+	tmpDir := t.TempDir()
+	cmd := exec.Command(binary, "init", "--full")
+	cmd.Dir = tmpDir
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("init --full failed: %v, output: %s", err, out)
+	}
+
+	want := []string{
+		"go test ./<changed-package>/... -run <TestName>",
+		"herd verify",
+		"TestFactoryE2E_CoordinatorFenceBlocksSecondLoop",
+		"TestApproveCLI_ReleasedNewerGenerationStillFences",
+		"TestBroker_SessionAuthorityDiesWithPaneIncarnation",
+		"TestLaneLaunchDecisionReportsConfiguredProbeFailure",
+		"TestNewDrainAdaptersFailsClosedOnMissingAuthority/no_reviewer_lane",
+	}
+	for _, prompt := range []string{".herd/prompts/worker.md", ".herd/prompts/smith.md"} {
+		t.Run(prompt, func(t *testing.T) {
+			data, err := os.ReadFile(filepath.Join(tmpDir, prompt))
+			if err != nil {
+				t.Fatal(err)
+			}
+			content := string(data)
+			for _, marker := range want {
+				if !strings.Contains(content, marker) {
+					t.Errorf("fresh %s is missing scoped-test marker %q", prompt, marker)
+				}
+			}
+			if strings.Contains(content, "Run 'go test ./...' before signalling completion") {
+				t.Errorf("fresh %s still mandates full tests during iteration", prompt)
+			}
+		})
+	}
+}
+
 func TestInitFullTwice(t *testing.T) {
 	binary := buildHerd(t)
 	tmpDir := t.TempDir()
