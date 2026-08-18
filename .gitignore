@@ -93,5 +93,7 @@ TASK-PACKET.md
 **/.herd/herdforge.db-*
 .herd/reconciliation.jsonl
 **/.herd/reconciliation.jsonl
+.herd/legacy-tab-state.jsonl
+**/.herd/legacy-tab-state.jsonl
 .herd/command-sessions.db
 .herd/container-lifecycle.db
