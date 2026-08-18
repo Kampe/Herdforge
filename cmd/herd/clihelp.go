@@ -112,7 +112,7 @@ Builder half of the loop (run from the task worktree):
 
 Prompt lane flags: --task <shape> --provider <name> --schema <file>
                    --timeout <s> --dry-run`,
-	"next": "Usage: herd next [flags]\n  Deterministic next-task selection.",
+	"next": "Usage: herd next [--role <role>] [--lane <lane>]\n  Deterministic next-task selection scoped to claimable candidates.",
 	"dispatch": `Usage: herd dispatch <ticket-ref> [flags]
   Dispatch a ticket to a worktree and launch an agent.
 

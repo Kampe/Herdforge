@@ -57,6 +57,33 @@ func TestPreviewClaimQueueSeparatesProvenanceBlocked(t *testing.T) {
 	}
 }
 
+func TestPreviewClaimQueueRoleFilter(t *testing.T) {
+	cases := []struct {
+		name      string
+		role      string
+		claimable int
+	}{
+		{name: "forge smith", role: "forge-smith", claimable: 1},
+		{name: "reviewer", role: "reviewer", claimable: 1},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := testConfig()
+			tasks := []testTask{
+				{ref: "FAC-9", status: "to-do", priority: "high", labels: []string{"forge-smith"}, description: "```herd-deps-v1\n{\"version\":1,\"task_ref\":\"FAC-9\",\"task_id\":\"t9\",\"edges\":[]}\n```"},
+				{ref: "FAC-10", status: "to-do", priority: "high", labels: []string{"reviewer"}, description: "```herd-deps-v1\n{\"version\":1,\"task_ref\":\"FAC-10\",\"task_id\":\"t10\",\"edges\":[]}\n```"},
+			}
+			preview, err := PreviewClaimQueue(context.Background(), newTestProvider(tasks), cfg, tc.role)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if preview.Claimable != tc.claimable || preview.ProvenanceBlocked != 0 {
+				t.Fatalf("role filter selected wrong candidates: %+v", preview)
+			}
+		})
+	}
+}
+
 func TestEval_ReviewAtCap(t *testing.T) {
 	cfg := testConfig()
 	// 3 tasks in review hits the cap of 3

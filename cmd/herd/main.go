@@ -336,7 +336,7 @@ func main() {
 		runShoot()
 
 	case "next":
-		runNext()
+		runNext(os.Args[2:])
 
 	case "dispatch":
 		runDispatch()
@@ -3968,11 +3968,51 @@ func runValidateConfig() {
 	}
 }
 
-func runNext() {
+type nextRequest struct {
+	Role string
+	Lane string
+}
+
+func parseNextArgs(args []string) (nextRequest, error) {
+	fs := flag.NewFlagSet("next", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	role := fs.String("role", "", "Only show claimable tasks for this role")
+	lane := fs.String("lane", "", "Only show claimable tasks for this configured lane")
+	if err := fs.Parse(args); err != nil {
+		return nextRequest{}, err
+	}
+	if fs.NArg() != 0 {
+		return nextRequest{}, fmt.Errorf("next: unexpected argument %q", fs.Arg(0))
+	}
+	return nextRequest{Role: strings.TrimSpace(*role), Lane: strings.TrimSpace(*lane)}, nil
+}
+
+func runNext(args []string) {
 	cfg, err := config.LoadConfig(".herd/herd.yaml")
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to load config: %v\n", err)
 		os.Exit(1)
+	}
+	req, reqErr := parseNextArgs(args)
+	if reqErr != nil {
+		fmt.Fprintf(os.Stderr, "%v\n", reqErr)
+		os.Exit(1)
+	}
+	if req.Lane != "" {
+		lane, laneErr := config.ResolveLane(cfg, req.Lane)
+		if laneErr != nil {
+			fmt.Fprintf(os.Stderr, "next: %v\n", laneErr)
+			os.Exit(1)
+		}
+		if strings.TrimSpace(lane.Role) == "" {
+			fmt.Fprintf(os.Stderr, "next: lane %q has no role and cannot scope task discovery\n", req.Lane)
+			os.Exit(1)
+		}
+		if req.Role != "" && !strings.EqualFold(req.Role, lane.Role) {
+			fmt.Fprintf(os.Stderr, "next: --role %q does not match lane %q role %q\n", req.Role, req.Lane, lane.Role)
+			os.Exit(1)
+		}
+		req.Role = lane.Role
 	}
 
 	tp, tpErr := loadTaskProvider(cfg)
@@ -3982,6 +4022,7 @@ func runNext() {
 	}
 
 	picker := next.NewNextPicker(cfg, tp)
+	picker.Role = req.Role
 	actions, evalErr := picker.EvalAll(context.Background())
 	if evalErr != nil {
 		fmt.Fprintf(os.Stderr, "next eval failed: %v\n", evalErr)
