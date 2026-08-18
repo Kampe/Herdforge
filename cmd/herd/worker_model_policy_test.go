@@ -24,7 +24,7 @@ func TestGateAcceptsLiveQuotaRoutedIdentities(t *testing.T) {
 		{"codex", "gpt-5.6-luna", "medium"},
 		{"codex", "gpt-5.6-luna", "high"}, // EffortFor("implementation") default
 		{"claude", "claude-sonnet-5", "medium"},
-		{"grok", "grok-4.5", "high"},
+		{"grok", "grok-4.6", "high"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.provider+"/"+tc.model+"/"+tc.effort, func(t *testing.T) {

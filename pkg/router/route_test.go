@@ -128,15 +128,15 @@ func TestModelForTable(t *testing.T) {
 		{"ollama", "qa"}:               "litellm/ollama/glm-5.2:cloud",
 		{"ollama", "qa-light"}:         "litellm/ollama/qwen3.5:cloud",
 		{"ollama", "bounded"}:          "litellm/ollama/qwen3.5:cloud",
-		{"grok", "qa"}:                 "grok-4.5",
+		{"grok", "qa"}:                 "grok-4.6",
 		{"lazer", "coordinator"}:       "litellm/lazer/claude-fable-5",
 		{"lazer", "architecture"}:      "litellm/lazer/claude-fable-5",
 		{"lazer", "implementation"}:    "litellm/lazer/gpt-5.6-sol",
 		{"lazer", "research"}:          "litellm/lazer/kimi-k3",
 		{"lazer", "qa-light"}:          "litellm/lazer/qwen-3.7-plus",
 		{"lazer", "bounded"}:           "litellm/lazer/qwen-3.7-plus",
-		{"lazer", "qa"}:                "litellm/lazer/grok-4.5",
-		{"lazer", "adversarial"}:       "litellm/lazer/grok-4.5",
+		{"lazer", "qa"}:                "litellm/lazer/grok-4.6",
+		{"lazer", "adversarial"}:       "litellm/lazer/grok-4.6",
 	}
 	for k, want := range cases {
 		if got := ModelFor(k[0], k[1]); got != want {
@@ -215,7 +215,7 @@ func TestQuotaPoolFor(t *testing.T) {
 		{"agy", "claude-opus-4-6-thinking", "nonGemini"},
 		{"codex", "gpt-5.3-codex-spark", "spark"},
 		{"codex", "gpt-5.6-luna", "default"},
-		{"grok", "grok-4.5", "default"},
+		{"grok", "grok-4.6", "default"},
 	}
 	for _, c := range cases {
 		if got := QuotaPoolFor(c.p, c.m); got != c.want {
@@ -514,8 +514,8 @@ func TestArgvContracts(t *testing.T) {
 			[]string{"claude", "--mcp-config", `{"mcpServers":{}}`, "--strict-mcp-config", "--disable-slash-commands", "--disallowed-tools", "Agent", "Task", "ToolSearch", "--model", "claude-sonnet-5", "--effort", "high"}},
 		{"codex", "gpt-5.6-luna", "xhigh",
 			[]string{"codex", "--disable", "multi_agent", "--disable", "multi_agent_v2", "--model", "gpt-5.6-luna", "-c", "model_reasoning_effort=high", "-a", "never", "-c", "mcp_servers.code-review-graph={command=\"false\",enabled=false}"}},
-		{"grok", "grok-4.5", "max",
-			[]string{"grok", "--model", "grok-4.5", "--reasoning-effort", "high", "--always-approve"}},
+		{"grok", "grok-4.6", "max",
+			[]string{"grok", "--model", "grok-4.6", "--reasoning-effort", "high", "--always-approve"}},
 		{"kimi", "", "high", []string{"kimi", "--auto"}},
 		{"agy", "claude-opus-4-6-thinking", "high",
 			[]string{"agy", "--model", "claude-opus-4-6-thinking", "--prompt-interactive"}},
@@ -570,9 +570,9 @@ func TestHeadlessProvidersMatchArgvContract(t *testing.T) {
 		"agy":      "gemini-3.1-pro-high",
 		"claude":   "claude-sonnet-5",
 		"codex":    "gpt-5.6-luna",
-		"grok":     "grok-4.5",
+		"grok":     "grok-4.6",
 		"kimi":     "", // model-default surface
-		"lazer":    "litellm/lazer/grok-4.5",
+		"lazer":    "litellm/lazer/grok-4.6",
 		"ollama":   "litellm/ollama/glm-5.2:cloud",
 		"opencode": "opencode/deepseek-v4-flash",
 	}
@@ -618,7 +618,7 @@ func TestPiModelForConfiguredFleet(t *testing.T) {
 		{"codex", "gpt-5.6-luna", "openai-codex/gpt-5.6-luna"},
 		{"claude", "claude-sonnet-5", "anthropic/claude-sonnet-5"},
 		{"agy", "gemini-3.1-pro-high", "google/gemini-3.1-pro-high"},
-		{"grok", "grok-4.5", "xai/grok-4.5"},
+		{"grok", "grok-4.6", "xai/grok-4.6"},
 		{"opencode", "opencode/kimi-k3", "opencode/kimi-k3"},
 		{"lazer", "litellm/lazer/gpt-5.6-sol", "litellm/lazer/gpt-5.6-sol"},
 		{"ollama", "litellm/ollama/glm-5.2:cloud", "litellm/ollama/glm-5.2:cloud"},
