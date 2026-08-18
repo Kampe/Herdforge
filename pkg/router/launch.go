@@ -61,6 +61,10 @@ const (
 type LaunchRequest struct {
 	// Role selects worker vs reviewer policy (effort ladder, family gates).
 	Role Role
+	// NativeRole is the canonical policy role for a repository-defined standing
+	// role. When set, it is validated and used for routing while Role preserves
+	// the configured lane label for provenance.
+	NativeRole Role
 	// Shape is the herd-route task shape (implementation, qa, adversarial, …).
 	// Empty defaults: worker/forge-smith → implementation; reviewer/assayer → qa.
 	Shape string
@@ -243,7 +247,8 @@ func authoringVerb(role Role) string {
 	return "build"
 }
 
-func knownRole(role Role) bool {
+// KnownRole reports whether role has a native Herdforge launch policy.
+func KnownRole(role Role) bool {
 	switch role {
 	case RoleWorker, RoleForgeSmith, RoleRecovery, RoleReviewer, RoleAssayer,
 		RoleOrchestrator, RoleScoutPlanner, RoleVerificationGate, RoleReviewSupervisor,
@@ -253,6 +258,8 @@ func knownRole(role Role) bool {
 		return false
 	}
 }
+
+func knownRole(role Role) bool { return KnownRole(role) }
 
 func decisionProof(d LaunchDecision) string {
 	norm := func(v string) string {
@@ -688,6 +695,12 @@ func (r *SurfaceRouter) Decide(req LaunchRequest) (*LaunchDecision, error) {
 	}
 	if (req.Scope == ScopeLane || req.Scope == ScopeTask || req.Scope == ScopeCandidate) && strings.TrimSpace(req.TaskRef) == "" {
 		return nil, fmt.Errorf("herd-route: scoped launch requires context")
+	}
+	if req.NativeRole != "" {
+		if !KnownRole(req.NativeRole) {
+			return nil, fmt.Errorf("%w: native role %s", ErrRolePolicy, req.NativeRole)
+		}
+		req.Role = req.NativeRole
 	}
 	if !knownRole(req.Role) {
 		return nil, fmt.Errorf("%w: %s", ErrRolePolicy, req.Role)
