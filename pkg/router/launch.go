@@ -100,6 +100,13 @@ type LaunchRequest struct {
 	// one still reroutes instead of failing closed.
 	PreferredProvider string
 	PreferredModel    string
+	// PreferredFallbackModels are same-provider alternatives for an explicit
+	// standing route when its configured model is unavailable.
+	PreferredFallbackModels []string
+	// Standing makes PreferredProvider a hard provider-family boundary. A
+	// standing lane may fall back within that provider, but never into the
+	// global waterfall.
+	Standing bool
 	// RequestedModel pins the configured model when a lane policy requires it.
 	RequestedModel  string
 	RequestedEffort string
@@ -535,6 +542,11 @@ func FlashFrontierHighForbidden(authorCap CapabilityTier, reviewerCap Capability
 // Small-delta re-reviews stay medium unless risk classification changed into
 // a critical/final path. Workers use the shape ladder (EffortFor).
 func EffortForRequest(req LaunchRequest) string {
+	if req.Standing {
+		if requested := strings.ToLower(strings.TrimSpace(req.RequestedEffort)); requested != "" {
+			return requested
+		}
+	}
 	switch req.Role {
 	case RoleReviewer, RoleAssayer:
 		return reviewerEffort(req)
@@ -749,7 +761,11 @@ func (r *SurfaceRouter) Decide(req LaunchRequest) (*LaunchDecision, error) {
 	if modeErr != nil {
 		return nil, fmt.Errorf("herd-route: family posture: %w", modeErr)
 	}
-	candidates, err := r.candidateProviders(mode, shape, req.RequestedProvider)
+	requestedProvider := req.RequestedProvider
+	if req.Standing && strings.TrimSpace(req.PreferredProvider) != "" {
+		requestedProvider = req.PreferredProvider
+	}
+	candidates, err := r.candidateProviders(mode, shape, requestedProvider)
 	if err != nil {
 		return nil, err
 	}
@@ -795,7 +811,7 @@ func (r *SurfaceRouter) Decide(req LaunchRequest) (*LaunchDecision, error) {
 		if req.RequestedModel != "" {
 			model = req.RequestedModel
 		} else if req.PreferredModel != "" && strings.EqualFold(provider, req.PreferredProvider) &&
-			KnownRoutableModel(req.PreferredModel) {
+			(req.Standing || KnownRoutableModel(req.PreferredModel)) {
 			// A soft preference has to be EXPRESSIBLE, not merely rankable. A
 			// rank bonus alone gave a lane its configured model only when that
 			// model already was the waterfall head, so six of nine lanes still
@@ -814,6 +830,18 @@ func (r *SurfaceRouter) Decide(req LaunchRequest) (*LaunchDecision, error) {
 		}
 		pool := QuotaPoolFor(provider, model)
 		ok, detail := r.available(provider, model, pool)
+		if !ok && req.Standing && strings.EqualFold(provider, req.PreferredProvider) {
+			for _, fallback := range req.PreferredFallbackModels {
+				fallback = strings.TrimSpace(fallback)
+				if fallback == "" || QuotaPoolFor(provider, fallback) != pool {
+					continue
+				}
+				if fallbackOK, fallbackDetail := r.available(provider, fallback, pool); fallbackOK {
+					model, detail, ok = fallback, fallbackDetail, true
+					break
+				}
+			}
+		}
 
 		if !ok && req.RequestedModel == "" && provider == "codex" && model != "gpt-5.3-codex-spark" &&
 			strings.Contains(detail, "exhausted") {
