@@ -232,6 +232,7 @@ func runHarvestMerge() {
 	verdict := fs.String("verdict", "",
 		"Optional operator VETO (FAIL/BLOCKED refuse). PASS is not accepted here: merge consent comes from the review ledger.")
 	base := fs.String("base", "origin/main", "Base to harvest onto")
+	candidate := fs.String("candidate", "", "Exact reviewed candidate SHA to harvest (required when the branch tip moved)")
 	dryRun := fs.Bool("dry-run", false, "Plan and gate without creating the worktree")
 	allowMarkers := fs.Bool("allow-markers", false,
 		"Proceed despite conflict markers in the harvested diff (for files whose CONTENT is marker fixtures)")
@@ -295,17 +296,19 @@ func runHarvestMerge() {
 	}
 	commits := harvestmerge.UniqueCommits(string(cherry))
 
-	// A failed rev-parse previously left plan.SHA empty and the harvest ran on
-	// against a candidate nobody could name — the same swallowed-exit-status
-	// shape this card is about.
-	head, headErr := exec.Command("git", "rev-parse", *branch).Output()
-	if headErr != nil {
-		fmt.Fprintf(os.Stderr, "herd harvest-merge: cannot resolve %s: %v\n", *branch, headErr)
+	report, err := resolveHarvestCandidate(*branch, *candidate)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "herd harvest-merge: %v\n", err)
 		os.Exit(1)
 	}
-	sha := strings.TrimSpace(string(head))
-	if sha == "" {
-		fmt.Fprintf(os.Stderr, "herd harvest-merge: %s resolved to no commit\n", *branch)
+	sha := report.Pin.SHA
+	fmt.Printf("herd harvest-merge: tip=%s last_pass_sha=%s eligible=%t\n",
+		shortSHA12(report.Tip), shortSHA12(report.LastPassSHA), report.Eligible)
+	if !report.Eligible {
+		if *dryRun {
+			return
+		}
+		fmt.Fprintf(os.Stderr, "herd harvest-merge: exact reviewed candidate is not eligible; branch tip drift requires --candidate <last_pass_sha> or a new PASS\n")
 		os.Exit(1)
 	}
 
@@ -374,6 +377,85 @@ func runHarvestMerge() {
 	fmt.Printf("  git push -u origin %s && gh pr create --title %q\n", plan.TempBranch, *title)
 	// The worktree is intentionally KEPT on success: the coordinator pushes
 	// from it. Cleanup on success is the caller's, after publishing.
+}
+
+// harvestCandidateReport is the provenance-first decision made before any
+// cherry-pick. Tip is observational; LastPassSHA comes from the durable queue.
+type harvestCandidateReport struct {
+	Pin         harvestmerge.CandidatePin
+	Tip         string
+	LastPassSHA string
+	Eligible    bool
+}
+
+// resolveHarvestCandidate keeps a moving standing branch from silently
+// replacing the reviewed candidate. Without an explicit pin, only a branch
+// whose current tip is the latest queued PASS may proceed. An explicit pin
+// permits an older reviewed ancestor, but still requires exact queue and
+// ledger evidence for that SHA.
+func resolveHarvestCandidate(branch, requested string) (harvestCandidateReport, error) {
+	branch = strings.TrimSpace(branch)
+	if branch == "" {
+		return harvestCandidateReport{}, fmt.Errorf("branch is required")
+	}
+	head, err := exec.Command("git", "rev-parse", "--verify", branch+"^{commit}").Output()
+	if err != nil {
+		return harvestCandidateReport{}, fmt.Errorf("cannot resolve %s: %w", branch, err)
+	}
+	report := harvestCandidateReport{Tip: strings.TrimSpace(string(head))}
+	if report.Tip == "" {
+		return harvestCandidateReport{}, fmt.Errorf("%s resolved to no commit", branch)
+	}
+
+	ledger, err := reviewledger.NewReviewLedger(".", filepath.Join(".herd", "review-ledger.jsonl"))
+	if err != nil {
+		return harvestCandidateReport{}, fmt.Errorf("open review ledger: %w", err)
+	}
+	queued, err := ledger.Queued()
+	if err != nil {
+		return harvestCandidateReport{}, fmt.Errorf("read harvest queue: %w", err)
+	}
+	var latest reviewledger.LedgerRow
+	queuedBySHA := make(map[string]reviewledger.LedgerRow)
+	for _, row := range queued {
+		if row.Branch != branch {
+			continue
+		}
+		queuedBySHA[row.SHA] = row
+		if row.Timestamp >= latest.Timestamp {
+			latest = row
+		}
+	}
+	if latest.SHA != "" {
+		report.LastPassSHA = latest.SHA
+	}
+
+	sha := strings.TrimSpace(requested)
+	if sha == "" {
+		sha = report.Tip
+		if report.LastPassSHA != report.Tip {
+			return report, nil
+		}
+	} else {
+		if _, err := exec.Command("git", "rev-parse", "--verify", sha+"^{commit}").Output(); err != nil {
+			return harvestCandidateReport{}, fmt.Errorf("candidate %s is not a commit: %w", sha, err)
+		}
+		if err := exec.Command("git", "merge-base", "--is-ancestor", sha, branch).Run(); err != nil {
+			return harvestCandidateReport{}, fmt.Errorf("candidate %s is not reachable from branch %s", sha, branch)
+		}
+	}
+
+	queuedCandidate, found := queuedBySHA[sha]
+	if !found || queuedCandidate.Branch != branch {
+		return report, nil
+	}
+	eligible, err := ledger.Eligible(sha, "")
+	if err != nil {
+		return harvestCandidateReport{}, fmt.Errorf("review ledger refuses %s: %w", shortSHA12(sha), err)
+	}
+	report.Pin = harvestmerge.CandidatePin{SHA: sha, Branch: branch}
+	report.Eligible = eligible
+	return report, nil
 }
 
 // harvestBody cherry-picks commits into a fresh worktree off base and gates

@@ -21,6 +21,20 @@ import (
 // Verdict gates the merge.
 type Verdict string
 
+// CandidatePin is the immutable review candidate selected for harvest. The
+// branch is only its provenance; it is never permission to substitute the
+// branch tip for SHA.
+type CandidatePin struct {
+	SHA    string
+	Branch string
+}
+
+// Valid reports whether the pin names both an exact candidate and its source
+// branch.
+func (p CandidatePin) Valid() bool {
+	return strings.TrimSpace(p.SHA) != "" && strings.TrimSpace(p.Branch) != ""
+}
+
 const (
 	PASS    Verdict = "PASS"
 	FAIL    Verdict = "FAIL"
