@@ -52,6 +52,7 @@ import (
 	"github.com/Kampe/Herdforge/pkg/posture"
 	"github.com/Kampe/Herdforge/pkg/preflight"
 	"github.com/Kampe/Herdforge/pkg/process"
+	"github.com/Kampe/Herdforge/pkg/provenance"
 	"github.com/Kampe/Herdforge/pkg/provider"
 	"github.com/Kampe/Herdforge/pkg/resetsafe"
 	"github.com/Kampe/Herdforge/pkg/resolve"
@@ -858,6 +859,10 @@ func runClone() {
 }
 
 func runPreflightStatic() {
+	if err := reportCurrentProvenance("."); err != nil {
+		fmt.Fprintf(os.Stderr, "Preflight failed: %v\n", err)
+		os.Exit(1)
+	}
 	var allowlist []string
 	if cfg, err := config.LoadConfig(filepath.Join(".herd", "herd.yaml")); err == nil {
 		allowlist = cfg.WorktreeBoundary.AllowedAbsolutePaths
@@ -923,6 +928,10 @@ func runPreflight() {
 }
 
 func runSelfTest() {
+	if err := reportCurrentProvenance("."); err != nil {
+		fmt.Fprintf(os.Stderr, "Self-test failed: %v\n", err)
+		os.Exit(1)
+	}
 	runner := selftest.NewSelfTestRunner(".")
 	results, err := runner.RunSuite(context.Background())
 	if err != nil {
@@ -934,6 +943,23 @@ func runSelfTest() {
 		fmt.Printf("[PASS] %s\n", res.Name)
 	}
 	fmt.Println("\nAll self-test assertions passed cleanly.")
+}
+
+func reportCurrentProvenance(root string) error {
+	info, err := provenance.Read(root)
+	if err != nil {
+		// A new directory without Git has no source revision to compare. Once
+		// Git identifies a source, missing binary metadata is fail-closed.
+		if strings.Contains(err.Error(), "source revision") {
+			return nil
+		}
+		return err
+	}
+	fmt.Println(provenance.Format(info))
+	if err := provenance.Validate(info, info.SourceRevision); err != nil && managedSelfGateExecutable(root) {
+		return err
+	}
+	return nil
 }
 
 func runStatus() {
@@ -7158,6 +7184,18 @@ func runVerify() {
 		fmt.Fprintf(os.Stderr, "herd verify: %q is not a directory\n", wt)
 		os.Exit(2)
 	}
+	if managedSelfGateExecutable(wt) {
+		info, err := provenance.Read(wt)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "herd verify: provenance unavailable: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Println(provenance.Format(info))
+		if err := provenance.Validate(info, info.SourceRevision); err != nil {
+			fmt.Fprintf(os.Stderr, "herd verify: %v\n", err)
+			os.Exit(1)
+		}
+	}
 
 	var c *verifier.CompletionCheck
 	// Keep the candidate identity used by persisted receipts. Re-reading HEAD
@@ -7314,6 +7352,31 @@ func runVerify() {
 	if !c.Passed {
 		os.Exit(1)
 	}
+}
+
+func managedSelfGateExecutable(root string) bool {
+	self, err := os.Executable()
+	if err != nil {
+		return false
+	}
+	if explicit := strings.TrimSpace(os.Getenv("HERD_BIN")); explicit != "" {
+		abs, _ := filepath.Abs(explicit)
+		return filepath.Clean(abs) == filepath.Clean(self)
+	}
+	if root != "" {
+		absRoot, _ := filepath.Abs(root)
+		absSelf, _ := filepath.Abs(self)
+		binRoot := filepath.Join(absRoot, "bin") + string(filepath.Separator)
+		if strings.HasPrefix(absSelf, binRoot) {
+			return true
+		}
+	}
+	path, err := exec.LookPath("herd")
+	if err != nil {
+		return false
+	}
+	abs, _ := filepath.Abs(path)
+	return filepath.Clean(abs) == filepath.Clean(self)
 }
 
 // Broker protocol (FAC-145): the agent NEVER executes provider code or

@@ -20,6 +20,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/Kampe/Herdforge/pkg/provenance"
 )
 
 // BrokerReceipt is a redacted, single-consume record of one authorized inject.
@@ -784,7 +786,7 @@ func (c *mitmCA) leafFor(host string) (*tls.Certificate, error) {
 
 // findHerdOrBuild returns a herd binary for worker-probe subprocesses.
 func findHerdOrBuild(tmpDir string) (string, error) {
-	if p, err := exec.LookPath("herd"); err == nil {
+	if p, err := provenance.Resolve(findModuleRoot()); err == nil {
 		return p, nil
 	}
 	// Build from module (tests run from package dir).

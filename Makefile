@@ -28,7 +28,8 @@ ci:
 build:
 	@echo "==> Building herd binary..."
 	@mkdir -p bin
-	go build -o bin/herd ./cmd/herd
+	@rev=$$(git rev-parse HEAD) && now=$$(date -u +%Y-%m-%dT%H:%M:%SZ) && \
+	go build -ldflags "-X github.com/Kampe/Herdforge/pkg/provenance.BinaryRevision=$$rev -X github.com/Kampe/Herdforge/pkg/provenance.BinaryBuildTime=$$now" -o bin/herd ./cmd/herd
 
 test: test-unit
 
