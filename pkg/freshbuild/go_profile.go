@@ -3,6 +3,7 @@ package freshbuild
 import (
 	"context"
 	"fmt"
+	"github.com/Kampe/Herdforge/pkg/slot"
 	"io"
 	"os"
 	"os/exec"
@@ -150,22 +151,37 @@ func (g GoProfile) Build(ctx context.Context, root, pkg string, log io.Writer) (
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	cmd := exec.CommandContext(ctx, g.bin(), "build", pkg)
-	cmd.Dir = root
-	cmd.Stdout = log
-	cmd.Stderr = log
-	err := cmd.Run()
+	var err error
+	var rc int
+	semaphore, semErr := slot.Default()
+	if semErr != nil {
+		return 1, semErr
+	}
+	err = semaphore.With(ctx, "fresh-build: go", slot.DefaultTimeout, func() error {
+		cmd := exec.CommandContext(ctx, g.bin(), "build", pkg)
+		cmd.Dir = root
+		cmd.Stdout = log
+		cmd.Stderr = log
+		err = cmd.Run()
+		if err == nil {
+			rc = 0
+			return nil
+		}
+		if ee, ok := err.(*exec.ExitError); ok {
+			rc = ee.ExitCode()
+			if rc < 0 {
+				rc = 1
+			}
+		}
+		return err
+	})
+	if semErr := err; semErr != nil && rc == 0 {
+		return 1, semErr
+	}
 	if err == nil {
 		return 0, nil
 	}
-	if ee, ok := err.(*exec.ExitError); ok {
-		rc := ee.ExitCode()
-		if rc < 0 {
-			rc = 1
-		}
-		return rc, err
-	}
-	return 1, err
+	return rc, err
 }
 
 func (g GoProfile) ClassifyFailure(root string, log []byte, rc int) (VerdictKind, string) {

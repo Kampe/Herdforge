@@ -14,7 +14,7 @@ import (
 // FAC-240: controlSurfaceVersion is a compatibility boundary, not a display
 // number. Any command-contract change must add its new fingerprint below and
 // increment this value; ValidateControlSurfaceManifest rejects silent drift.
-const controlSurfaceVersion = 9
+const controlSurfaceVersion = 10
 
 type commandClass string
 
@@ -51,7 +51,7 @@ var commandNamesByClass = map[commandClass][]string{
 		"board-audit", "control-surface", "mail", "preflight", "preflight-static", "process", "resources", "route", "scope", "selftest", "status", "tests-for", "throughput", "timeline", "tool-probe", "unmerged", "verify", "worktrees",
 	},
 	classCoordinatorOnly: {
-		"activate", "approve", "attention", "board-done", "board-freeze", "board-frozen", "board-sync", "claude-only", "cleanup", "command", "commands", "containers", "control", "daemon", "deps", "dispatch", "doctor-models", "drain", "feedback", "fence-provision", "forge", "fresh-build", "goal-guard", "harvest", "harvest-merge", "herdr-deliver", "hold", "kick", "labels", "legacy-receipts", "lifecycle", "lock", "lost", "merge-admit", "merge-complete", "next", "no-claude", "overlap", "park", "posture", "pulse", "quota", "quota-supervisor", "receipt", "repl", "rescue", "reset-safe", "resolve-lane", "review", "review-classify", "review-ingest", "review-ledger", "send", "sh", "shoot", "shot", "spin", "standing", "stop", "task", "up", "usage", "watch", "wave", "wind-down", "verify-fac151",
+		"activate", "approve", "attention", "board-done", "board-freeze", "board-frozen", "board-sync", "claude-only", "cleanup", "command", "commands", "containers", "control", "daemon", "deps", "dispatch", "doctor-models", "drain", "feedback", "fence-provision", "forge", "fresh-build", "goal-guard", "harvest", "harvest-merge", "herdr-deliver", "hold", "kick", "labels", "legacy-receipts", "lifecycle", "lock", "lost", "merge-admit", "merge-complete", "next", "no-claude", "overlap", "park", "posture", "pulse", "quota", "quota-supervisor", "receipt", "repl", "rescue", "reset-safe", "resolve-lane", "review", "review-classify", "review-ingest", "review-ledger", "send", "sh", "shoot", "shot", "slot", "spin", "standing", "stop", "task", "up", "usage", "watch", "wave", "wind-down", "verify-fac151",
 	},
 	classOperatorOnly: {
 		"clone", "envplan", "hostcreds", "init", "seed-lane-state", "signer-boundary", "stash", "validate-config",
@@ -110,15 +110,16 @@ func controlSurface() controlSurfaceManifest {
 // or reclassifying a command changes the hash and fails tests until the author
 // explicitly increments controlSurfaceVersion and records the new hash.
 var controlSurfaceCompatibility = map[int]string{
-	1: "ec8bcd82bb03cc6e33e6a87515cbd9236aa997a2efca802f5d800b8ba0afe121",
-	2: "96f0e6e4ef2653c583b4580efe3ea5d5b6d537dfc8282e2eda62c0905dcd5287",
-	3: "d2e75d61dec1d2cd0dac05dac7b3515ef6d7f113a52a08d8e0735447e040be80",
-	4: "2383e2f7e6de2ebeff22f7d042cc13895be1016e46a5f1726b97b8b235c851b3",
-	5: "c784289659d0339bf5b5b418473fb4595ab8ef1d8cb73416f474e628bfdf5a25",
-	6: "d1f5c427cf2144bac25bd6aaa31d309da9a01978b12b385ad75e53b9ea7b50d5",
-	7: "8213c48a046f7686baac098199f9a1f5ac345d061882fc229535089a9e185355",
-	8: "ac11d8f8a90c9197fe927ae9dfa8790f49d5b3f8f57691ae5a27d252026a5331",
-	9: "a0065bf1cd7871a1ad75cd79cacb7c9ef40222978c36dfffae53d24ccd340c54",
+	1:  "ec8bcd82bb03cc6e33e6a87515cbd9236aa997a2efca802f5d800b8ba0afe121",
+	2:  "96f0e6e4ef2653c583b4580efe3ea5d5b6d537dfc8282e2eda62c0905dcd5287",
+	3:  "d2e75d61dec1d2cd0dac05dac7b3515ef6d7f113a52a08d8e0735447e040be80",
+	4:  "2383e2f7e6de2ebeff22f7d042cc13895be1016e46a5f1726b97b8b235c851b3",
+	5:  "c784289659d0339bf5b5b418473fb4595ab8ef1d8cb73416f474e628bfdf5a25",
+	6:  "d1f5c427cf2144bac25bd6aaa31d309da9a01978b12b385ad75e53b9ea7b50d5",
+	7:  "8213c48a046f7686baac098199f9a1f5ac345d061882fc229535089a9e185355",
+	8:  "ac11d8f8a90c9197fe927ae9dfa8790f49d5b3f8f57691ae5a27d252026a5331",
+	9:  "a0065bf1cd7871a1ad75cd79cacb7c9ef40222978c36dfffae53d24ccd340c54",
+	10: "081f52ef2421bbe00e12b839d4e9d2ccc36298106f3c9876c73424ec8484e5b9",
 }
 
 func controlSurfaceFingerprint(m controlSurfaceManifest) (string, error) {

@@ -171,6 +171,7 @@ Commands:
 	"lifecycle":    "Usage: herd lifecycle [flags]\n  Lifecycle inspection.",
 	"resources":    "Usage: herd resources [flags]\n  Resource inventory.",
 	"lock":         "Usage: herd lock <acquire|release|status|with> [flags]\n  Shared-checkout dir lock.",
+	"slot":         "Usage: herd slot <acquire|release|status|with> [flags]\n  Machine-wide heavy-phase semaphore.",
 	"mail": `Usage:
   herd mail send --from NAME --to RECIPIENT (--body TEXT | --file path | stdin) [--subject TEXT] [--mail path]
   herd mail inbox --recipient NAME [--mail path]
