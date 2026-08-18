@@ -63,11 +63,18 @@ const (
 	PASS    Verdict = "PASS"
 	FAIL    Verdict = "FAIL"
 	BLOCKED Verdict = "BLOCKED"
+	RETIRED Verdict = "RETIRED"
 )
 
 // MergeAllowed reports whether a verdict permits merging. Anything that is not
 // an explicit PASS refuses: an unknown or absent verdict is not consent.
 func MergeAllowed(v Verdict) bool { return v == PASS }
+
+// Terminal reports whether the ledger state settles a branch. RETIRED is a
+// terminal audit/drain state, but deliberately does not grant merge authority.
+func Terminal(v Verdict) bool {
+	return v == PASS || v == FAIL || v == BLOCKED || v == RETIRED
+}
 
 // conflictMarkerRe matches git conflict markers at line start.
 //

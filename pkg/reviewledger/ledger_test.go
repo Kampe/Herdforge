@@ -443,6 +443,39 @@ func TestPending(t *testing.T) {
 	}
 }
 
+func TestRetireCoordinatorRationaleSettlesBranchWithoutReviewVerdict(t *testing.T) {
+	l := newTestLedger(t)
+	sha := "retired-sha"
+	mustErr(l.Record(RecordOpts{SHA: sha, Branch: "herd/fac-411", BuilderFamily: "anthropic", Reviewer: "worker-1"}))
+	if err := l.Retire(RetireOpts{
+		SHA: sha, Branch: "herd/fac-411", Authority: "coordinator",
+		Reason:   "all commits are already landed or destructive stale content",
+		Artifact: ".herd/review/blocked/fac-411-RETIRED-coordinator-rationale.md",
+	}); err != nil {
+		t.Fatalf("Retire: %v", err)
+	}
+
+	rows, err := l.AllRows()
+	if err != nil {
+		t.Fatalf("AllRows: %v", err)
+	}
+	if len(rows) != 2 || rows[1].Event != string(EventRetired) {
+		t.Fatalf("rows = %+v, want record followed by retired event", rows)
+	}
+	if rows[1].Authority != "coordinator" || rows[1].Reason == "" || rows[1].Artifact == "" {
+		t.Fatalf("retirement provenance not preserved: %+v", rows[1])
+	}
+	if pending, err := l.Pending(); err != nil || len(pending) != 0 {
+		t.Fatalf("Pending = %+v, %v; retired branch must be settled", pending, err)
+	}
+	if queued, err := l.Queued(); err != nil || len(queued) != 0 {
+		t.Fatalf("Queued = %+v, %v; retired branch must not drain", queued, err)
+	}
+	if eligible, err := l.Eligible(sha, ""); err == nil || eligible || !strings.Contains(err.Error(), "retired") {
+		t.Fatalf("Eligible = %v, %v; want retired refusal", eligible, err)
+	}
+}
+
 func TestPendingOrder(t *testing.T) {
 	l := newTestLedger(t)
 	now := fixedNow()

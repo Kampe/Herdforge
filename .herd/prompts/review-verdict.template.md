@@ -19,7 +19,11 @@ Use the Herdforge/Herdr delivery path (`herdr agent prompt` or
 `bin/herd-*` scripts or directly to the coordinator. The supervisor owns the
 exact-SHA ledger row, retry loop, author feedback, and reviewer-tab cleanup.
 
-# The seven keys above are the COMPLETE accepted set
+Coordinator retirement artifacts use `verdict: RETIRED` and
+`authority: <coordinator name>`. RETIRED settles a branch for audit/drain
+purposes; it is not an independent review verdict.
+
+# The accepted keys above (plus `authority` for RETIRED) are the COMPLETE set
 
 `herd review-ingest` refuses an artifact carrying any other key. That is
 deliberate: a misspelled `reviewed-head` silently disables the gate that catches

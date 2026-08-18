@@ -32,6 +32,42 @@ type RecordOpts struct {
 type IngestOpts struct {
 	Record  RecordOpts
 	Verdict VerdictOpts
+	Retired *RetireOpts
+}
+
+// RetireOpts records a coordinator assertion that a branch is settled without
+// claiming that an independent reviewer examined it.
+type RetireOpts struct {
+	SHA       string
+	Branch    string
+	Reason    string
+	Artifact  string
+	Authority string
+}
+
+// Retire appends a terminal retirement event. Retirement is intentionally not
+// a verdict and never creates a harvest queue entry.
+func (l *Ledger) Retire(opts RetireOpts) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if strings.TrimSpace(opts.SHA) == "" || strings.TrimSpace(opts.Branch) == "" ||
+		strings.TrimSpace(opts.Reason) == "" || strings.TrimSpace(opts.Authority) == "" {
+		return fmt.Errorf("retirement requires sha, branch, reason, and authority")
+	}
+	rows, err := readRows(l.Path)
+	if err != nil {
+		return err
+	}
+	for _, row := range rows {
+		if row.Event == string(EventRetired) && row.SHA == opts.SHA && row.Authority == opts.Authority {
+			return nil
+		}
+	}
+	return l.appendRow(l.Path, &LedgerRow{
+		Event: string(EventRetired), SHA: opts.SHA, Branch: opts.Branch,
+		Reason: opts.Reason, Artifact: opts.Artifact, Authority: opts.Authority,
+		Status: "settled",
+	})
 }
 
 // Record appends a record event. Validates builder family on independent gates.
@@ -103,6 +139,12 @@ func (l *Ledger) ensureRecord(opts RecordOpts) error {
 // PASS verdict. Provenance validation happens before either row is written;
 // repeating an accepted handoff is idempotent.
 func (l *Ledger) Ingest(opts IngestOpts) (bool, error) {
+	if opts.Retired != nil {
+		if opts.Verdict.Verdict != "" {
+			return false, fmt.Errorf("retirement must not carry a review verdict")
+		}
+		return false, l.Retire(*opts.Retired)
+	}
 	if opts.Verdict.Verdict == VerdictPASS {
 		if strings.TrimSpace(opts.Record.SHA) == "" || opts.Record.SHA != opts.Verdict.SHA {
 			return false, fmt.Errorf("review ingest refused: admission and verdict must bind the exact same sha")
@@ -419,6 +461,9 @@ func (l *Ledger) Eligible(sha, builderFamily string) (bool, error) {
 		if r.Event == string(EventRecord) && r.SHA == sha {
 			hasRecord = true
 		}
+		if r.Event == string(EventRetired) && r.SHA == sha {
+			return false, fmt.Errorf("herd-review-ledger: refuse sha=%s reason=retired", sha)
+		}
 		if r.Event == string(EventSupersession) && r.Task == sha {
 			superseded = true
 		}
@@ -432,6 +477,9 @@ func (l *Ledger) Eligible(sha, builderFamily string) (bool, error) {
 
 	launch := make(map[string]LedgerRow)
 	for _, r := range rows {
+		if r.Event == string(EventRetired) {
+			continue
+		}
 		if r.Event == string(EventRecord) {
 			k := r.SHA + ":" + r.Reviewer
 			launch[k] = r
@@ -440,6 +488,9 @@ func (l *Ledger) Eligible(sha, builderFamily string) (bool, error) {
 
 	latest := make(map[string]LedgerRow)
 	for _, r := range rows {
+		if r.Event == string(EventRetired) {
+			continue
+		}
 		if r.Event == string(EventVerdict) {
 			k := r.SHA + ":" + r.Reviewer
 			latest[k] = r
@@ -652,6 +703,9 @@ func (l *Ledger) Queued() ([]LedgerRow, error) {
 
 	launch := make(map[string]LedgerRow)
 	for _, r := range rows {
+		if r.Event == string(EventRetired) {
+			continue
+		}
 		if r.Event == string(EventRecord) {
 			k := r.SHA + ":" + r.Reviewer
 			launch[k] = r
@@ -660,6 +714,9 @@ func (l *Ledger) Queued() ([]LedgerRow, error) {
 
 	latest := make(map[string]LedgerRow)
 	for _, r := range rows {
+		if r.Event == string(EventRetired) {
+			continue
+		}
 		if r.Event == string(EventVerdict) {
 			k := r.SHA + ":" + r.Reviewer
 			latest[k] = r
@@ -700,8 +757,12 @@ func (l *Ledger) Pending() ([]LedgerRow, error) {
 		return nil, err
 	}
 
+	retired := make(map[string]bool)
 	verdictIdx := make(map[string]int)
 	for i, r := range rows {
+		if r.Event == string(EventRetired) {
+			retired[r.SHA] = true
+		}
 		if r.Event == string(EventVerdict) {
 			k := r.SHA + ":" + r.Reviewer
 			verdictIdx[k] = i
@@ -722,6 +783,9 @@ func (l *Ledger) Pending() ([]LedgerRow, error) {
 
 	var pending []LedgerRow
 	for k, rec := range newestRec {
+		if retired[rec.row.SHA] {
+			continue
+		}
 		vi, hasVerdict := verdictIdx[k]
 		if !hasVerdict || vi < rec.index {
 			pending = append(pending, rec.row)
