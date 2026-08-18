@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"os"
@@ -13,6 +14,7 @@ import (
 	"github.com/Kampe/Herdforge/pkg/reviewingest"
 	"github.com/Kampe/Herdforge/pkg/reviewledger"
 	hsync "github.com/Kampe/Herdforge/pkg/sync"
+	"github.com/Kampe/Herdforge/pkg/worktree"
 )
 
 // runReviewIngest ports bin/herd-review-ingest: validate reviewer verdict
@@ -341,6 +343,10 @@ func runHarvestMerge() {
 	// Cleanup runs on the FAILURE path only — the worktree is deliberately kept
 	// on success so the coordinator can push from it.
 	cleanup := func() {
+		if guardErr := worktree.RefuseRemovalWithLiveLease(context.Background(), ".", dir); guardErr != nil {
+			fmt.Fprintf(os.Stderr, "herd harvest-merge: cleanup refused: %v\n", guardErr)
+			return
+		}
 		exec.Command("git", "worktree", "remove", "--force", "--", dir).Run()
 		exec.Command("git", "branch", "-D", "--", plan.TempBranch).Run()
 	}

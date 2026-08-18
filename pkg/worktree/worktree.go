@@ -127,6 +127,9 @@ func (w *WorktreeManager) CreateWorktree(ctx context.Context, branch string, tar
 }
 
 func (w *WorktreeManager) RemoveWorktree(ctx context.Context, targetDir string) error {
+	if err := RefuseRemovalWithLiveLease(ctx, w.RepoRoot, targetDir); err != nil {
+		return err
+	}
 	if w.RemoveWorktreeFunc != nil {
 		return w.RemoveWorktreeFunc(ctx, targetDir)
 	}
@@ -142,6 +145,9 @@ func (w *WorktreeManager) RemoveWorktree(ctx context.Context, targetDir string) 
 // RemoveWorktree helper, this path never uses --force and is reserved for the
 // exact-bound reap action.
 func (w *WorktreeManager) RemoveWorktreeSafely(ctx context.Context, targetDir string) error {
+	if err := RefuseRemovalWithLiveLease(ctx, w.RepoRoot, targetDir); err != nil {
+		return err
+	}
 	if w.RemoveWorktreeFunc != nil {
 		return w.RemoveWorktreeFunc(ctx, targetDir)
 	}

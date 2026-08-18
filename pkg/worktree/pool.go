@@ -237,6 +237,9 @@ func (p *Pool) GC(ctx context.Context) error {
 			if slot.LeaseID != "" {
 				return fmt.Errorf("worktree pool: gc refused while slot %s is leased", slot.Name)
 			}
+			if err := RefuseRemovalWithLiveLease(ctx, p.RepoRoot, slot.Path); err != nil {
+				return fmt.Errorf("worktree pool: gc lease fence for %s: %w", slot.Name, err)
+			}
 			cmd := exec.CommandContext(ctx, "git", "-C", p.RepoRoot, "worktree", "remove", "--force", slot.Path)
 			if out, err := cmd.CombinedOutput(); err != nil && !strings.Contains(string(out), "is not a working tree") {
 				return fmt.Errorf("worktree pool: remove %s: %v (%s)", slot.Name, err, strings.TrimSpace(string(out)))
