@@ -151,6 +151,46 @@ func RequireWorkspace(repoRoot string) (string, error) {
 	return id, nil
 }
 
+// RequireCleanupWorkspace binds cleanup to every workspace identity that can
+// influence the process. Cleanup is destructive, so an explicit runtime
+// target, repository registration, and Herdr's selected workspace must agree
+// whenever they are present. This prevents an inherited workspace from one
+// checkout from turning a repo-local cleanup into a cross-repository close.
+func RequireCleanupWorkspace(repoRoot string) (string, error) {
+	runtimeWS := strings.TrimSpace(os.Getenv("HERD_WORKSPACE"))
+	herdrWS := strings.TrimSpace(os.Getenv("HERDR_WORKSPACE_ID"))
+	registeredWS, err := registeredWorkspace(repoRoot)
+	if err != nil {
+		return "", err
+	}
+
+	identities := []struct {
+		name  string
+		value string
+	}{
+		{"HERD_WORKSPACE", runtimeWS},
+		{"registered workspace", registeredWS},
+		{"HERDR_WORKSPACE_ID", herdrWS},
+	}
+	selectedName, selected := "", ""
+	for _, identity := range identities {
+		if identity.value == "" {
+			continue
+		}
+		if selected == "" {
+			selectedName, selected = identity.name, identity.value
+			continue
+		}
+		if identity.value != selected {
+			return "", fmt.Errorf("herd cleanup workspace mismatch for repo %q: %s=%q, registered workspace=%q, HERDR_WORKSPACE_ID=%q; refusing cross-workspace mutation", filepath.Base(repoRoot), selectedName, selected, registeredWS, herdrWS)
+		}
+	}
+	if selected != "" {
+		return selected, nil
+	}
+	return RequireWorkspace(repoRoot)
+}
+
 // registeredWorkspace reads the repository-local Herdr binding. An explicit
 // environment value is only an override when it names this repository's
 // registered workspace; otherwise it is ambient state from another checkout.

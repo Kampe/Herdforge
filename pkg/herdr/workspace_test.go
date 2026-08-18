@@ -113,6 +113,18 @@ func TestRequireWorkspace_AllowsExplicitOverrideOnlyWhenItMatchesBinding(t *test
 	}
 }
 
+func TestRequireCleanupWorkspace_RejectsRuntimeRepoAndHerdrDisagreement(t *testing.T) {
+	root := workspaceBindingRepo(t, "wK")
+	stubWorkspaceList(t, `{"result":{"workspaces":[{"workspace_id":"wK","label":"Herdforge"},{"workspace_id":"wB","label":"Chainseer"}]}}`)
+	t.Setenv("HERD_WORKSPACE", "wK")
+	t.Setenv("HERDR_WORKSPACE_ID", "wB")
+	if _, err := RequireCleanupWorkspace(root); err == nil {
+		t.Fatal("cleanup must reject a Herdr workspace that disagrees with runtime and repo binding")
+	} else if !strings.Contains(err.Error(), `HERD_WORKSPACE="wK"`) || !strings.Contains(err.Error(), `registered workspace="wK"`) || !strings.Contains(err.Error(), `HERDR_WORKSPACE_ID="wB"`) {
+		t.Fatalf("mismatch error omitted workspace identities: %v", err)
+	}
+}
+
 func TestResolveWorkspace_EnvWins(t *testing.T) {
 	t.Setenv("HERD_WORKSPACE", "wOverride")
 	got := ResolveWorkspace("/tmp")
