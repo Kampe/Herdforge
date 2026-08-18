@@ -324,6 +324,111 @@ func (s *ProviderStore) SnapshotGraph(ctx context.Context) (*GraphSnapshot, erro
 		}
 	}
 
+	return s.snapshotFromRelations(ctx, rels)
+}
+
+// SnapshotGraphForTask returns the complete relation component containing the
+// launch task and the task refs named by its provenance. Launch eligibility
+// needs global closure only within that component: disconnected board
+// components cannot introduce a cycle or prerequisite for this task. Keeping
+// this walk on the per-task relation surface avoids Kaneo's O(board) bulk
+// fan-out on large projects while retaining fail-closed behavior for every
+// relation read and endpoint hydration.
+func (s *ProviderStore) SnapshotGraphForTask(ctx context.Context, taskRef Ref, taskID TaskID, desired []DependencyEdge) (*GraphSnapshot, error) {
+	if s == nil || s.TP == nil {
+		return nil, ErrCapabilityUnknown
+	}
+	if fence := FenceFrom(ctx); fence != nil {
+		if snap := fence.GetSnap(); snap != nil {
+			return snap, nil
+		}
+	}
+	rp, err := s.rel()
+	if err != nil {
+		return nil, err
+	}
+	if err := s.hydrateFresh(ctx); err != nil {
+		return nil, err
+	}
+
+	s.mu.Lock()
+	projectIDs := make(map[string]struct{}, len(s.idCache))
+	for id := range s.idCache {
+		projectIDs[id] = struct{}{}
+	}
+	s.mu.Unlock()
+
+	queue := make([]string, 0, 1+len(desired)*2)
+	seenTasks := map[string]bool{}
+	addTask := func(id TaskID, ref Ref) error {
+		if !id.Valid() && ref.Valid() {
+			s.mu.Lock()
+			t := s.refCache[string(ref)]
+			s.mu.Unlock()
+			if t == nil {
+				return fmt.Errorf("deps: scoped graph endpoint %s is not in project", ref)
+			}
+			id = TaskID(t.ID)
+		}
+		if !id.Valid() {
+			return fmt.Errorf("deps: scoped graph endpoint identity missing for %s", ref)
+		}
+		if _, ok := projectIDs[string(id)]; !ok {
+			return fmt.Errorf("deps: scoped graph endpoint %s is not in project", id)
+		}
+		if !seenTasks[string(id)] {
+			seenTasks[string(id)] = true
+			queue = append(queue, string(id))
+		}
+		return nil
+	}
+	if err := addTask(taskID, taskRef); err != nil {
+		return nil, err
+	}
+	for _, e := range desired {
+		if err := addTask(e.SourceID, e.SourceRef); err != nil {
+			return nil, err
+		}
+		if err := addTask(e.TargetID, e.TargetRef); err != nil {
+			return nil, err
+		}
+	}
+
+	seenRelations := map[string]provider.Relation{}
+	for len(queue) > 0 {
+		id := queue[0]
+		queue = queue[1:]
+		s.ListRelCalls.Add(1)
+		rels, lerr := rp.ListRelations(ctx, id)
+		if lerr != nil {
+			return nil, fmt.Errorf("deps: scoped graph list %s: %w", id, lerr)
+		}
+		for _, r := range rels {
+			if r.ID == "" || (r.SourceTaskID != id && r.TargetTaskID != id) {
+				return nil, fmt.Errorf("deps: scoped graph relation %q is unrelated to task %s", r.ID, id)
+			}
+			if prior, exists := seenRelations[r.ID]; exists && !relationEqual(prior, r) {
+				return nil, fmt.Errorf("deps: scoped graph relation %s disagrees across endpoint listings", r.ID)
+			}
+			seenRelations[r.ID] = r
+			if _, ok := projectIDs[r.SourceTaskID]; ok && !seenTasks[r.SourceTaskID] {
+				seenTasks[r.SourceTaskID] = true
+				queue = append(queue, r.SourceTaskID)
+			}
+			if _, ok := projectIDs[r.TargetTaskID]; ok && !seenTasks[r.TargetTaskID] {
+				seenTasks[r.TargetTaskID] = true
+				queue = append(queue, r.TargetTaskID)
+			}
+		}
+	}
+	rels := make([]provider.Relation, 0, len(seenRelations))
+	for _, r := range seenRelations {
+		rels = append(rels, r)
+	}
+	return s.snapshotFromRelations(ctx, rels)
+}
+
+func (s *ProviderStore) snapshotFromRelations(ctx context.Context, rels []provider.Relation) (*GraphSnapshot, error) {
 	out := make([]DependencyEdge, 0, len(rels))
 	for _, r := range rels {
 		e, merr := s.mapEdgeStrict(ctx, r)

@@ -368,3 +368,34 @@ func TestSnapshotGraph_NonBulkSequentialIsDetectablySlow(t *testing.T) {
 		t.Fatalf("expected sequential delay to accumulate, got %v", elapsed)
 	}
 }
+
+// TestSnapshotGraphForTask_SkipsSlowUnrelatedProjectFanout is the FAC-382
+// regression: a large board with a slow project listing must still resolve a
+// task whose connected component is small.
+func TestSnapshotGraphForTask_SkipsSlowUnrelatedProjectFanout(t *testing.T) {
+	const n = 1900
+	p := newDelayedBoard(n, 0, 5*time.Second, true)
+	store := NewProviderStore(p, "proj")
+	provenance, err := ExtractProvenanceFromText(p.tasks[n-1].Description)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	start := time.Now()
+	gate, err := RequireTaskLaunch(context.Background(), store, EntryDispatch, Ref(fmt.Sprintf("FAC-%d", n)), provenance, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gate == nil || gate.Report == nil || len(gate.Report.ManagedBoard) != 1 {
+		t.Fatalf("want one component edge, got %+v", gate)
+	}
+	if p.bulkCalls.Load() != 0 {
+		t.Fatalf("scoped graph must not invoke slow project fanout, got %d calls", p.bulkCalls.Load())
+	}
+	if got := p.listRelCalls.Load(); got != 2 {
+		t.Fatalf("want the two connected component relation reads, got %d", got)
+	}
+	if elapsed := time.Since(start); elapsed >= time.Second {
+		t.Fatalf("scoped graph followed slow full-board path: %v", elapsed)
+	}
+}
