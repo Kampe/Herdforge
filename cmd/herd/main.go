@@ -28,6 +28,7 @@ import (
 
 	"github.com/Kampe/Herdforge/pkg/activate"
 	"github.com/Kampe/Herdforge/pkg/attention"
+	"github.com/Kampe/Herdforge/pkg/budget"
 	"github.com/Kampe/Herdforge/pkg/candidateindex"
 	"github.com/Kampe/Herdforge/pkg/claim"
 	"github.com/Kampe/Herdforge/pkg/classify"
@@ -9743,6 +9744,8 @@ func forgeLoopMain() int {
 	interval := fs.Int("interval", 15, "seconds between ticks")
 	ticks := fs.Int("ticks", 0, "stop after N ticks (0 = run until drained)")
 	stopEmpty := fs.Bool("stop-empty", true, "stop when the board is clear and no lane is busy")
+	maxBudgetUSD := fs.Float64("max-budget-usd", 0, "stop when recorded spend reaches this USD limit (0 = unlimited)")
+	blockerThreshold := fs.Int("blocker-threshold", 3, "stop after this many consecutive identical BLOCKED ref/code observations (0 = disabled)")
 	retryApprove := fs.String("retry-approve", "", "explicitly retry a suppressed legacy approval for this task ref")
 	// --coordinator-name is what makes ReplyTarget.Name real. A reviewer caught
 	// that Register was called with the constant, so Dispatcher.CoordinatorName,
@@ -9865,6 +9868,24 @@ func forgeLoopMain() int {
 	}
 	driver := &cliForgeDriver{cfg: cfg, maxLanes: maxLanes, environmentPlanID: strings.TrimSpace(*environmentPlanID)}
 	driver.observer = observer
+	forgeBudget := budget.NewBudgetManager(*maxBudgetUSD)
+	blockers := func(ctx context.Context) (map[string]string, error) {
+		tasks, listErr := tp.ListTasks(ctx, cfg.TaskProvider.ProjectID, "")
+		if listErr != nil {
+			return nil, fmt.Errorf("list blocker states: %w", listErr)
+		}
+		result := make(map[string]string)
+		for _, task := range tasks {
+			if task == nil {
+				continue
+			}
+			status := strings.ToLower(strings.TrimSpace(task.Status))
+			if strings.HasPrefix(status, "blocked") {
+				result[task.Ref] = status
+			}
+		}
+		return result, nil
+	}
 
 	fmt.Printf("herd forge --loop: max-lanes=%d interval=%ds — driving the board autonomously\n", maxLanes, *interval)
 	err = eng.ForgeLoop(ctx, driver, daemon.ForgeLoopOptions{
@@ -9875,6 +9896,9 @@ func forgeLoopMain() int {
 		FeedbackInterval:       feedbackInterval,
 		ApproveSuppressionPath: ".herd/forge-approve-suppressions.json",
 		ApproveRetryRefs:       map[string]bool{strings.ToUpper(strings.TrimSpace(*retryApprove)): true},
+		Budget:                 forgeBudget,
+		Blockers:               blockers,
+		BlockerThreshold:       *blockerThreshold,
 	})
 	switch {
 	case err == nil:
