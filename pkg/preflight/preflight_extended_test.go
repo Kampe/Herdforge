@@ -112,6 +112,49 @@ func TestCheckWorktreeBoundary_DetectHomeLeak(t *testing.T) {
 	}
 }
 
+func TestCheckWorktreeBoundary_URLPathSegmentsAreNotLeaks(t *testing.T) {
+	tests := []struct {
+		name    string
+		content string
+		wantErr bool
+	}{
+		{
+			name:    "URL home segment",
+			content: "docs: https://docs.example.org/x/home/guide\n",
+			wantErr: false,
+		},
+		{
+			name:    "URL Users segment",
+			content: "docs: https://docs.example.org/Users/guide\n",
+			wantErr: false,
+		},
+		{
+			name:    "bare home path",
+			content: "path: /home/ec2-user/secret\n",
+			wantErr: true,
+		},
+		{
+			name:    "bare Users path",
+			content: "path: /Users/kampe/secret\n",
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tmpDir := t.TempDir()
+			if err := os.WriteFile(filepath.Join(tmpDir, "config.yaml"), []byte(tt.content), 0o644); err != nil {
+				t.Fatal(err)
+			}
+
+			err := CheckWorktreeBoundary(tmpDir)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("CheckWorktreeBoundary() error = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
 func TestCheckWorktreeBoundary_AllowsRepoDeclaredFile(t *testing.T) {
 	tmpDir := t.TempDir()
 	path := filepath.Join(tmpDir, "docs", "runbook.md")
