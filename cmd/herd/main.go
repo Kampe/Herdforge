@@ -479,7 +479,7 @@ func printUsage() {
 	fmt.Println("  scope        Publish the trusted task scope the dispatch fence resolves against")
 	fmt.Println("  review-classify   Deterministic R0-R3 risk floor for review dispatch")
 	fmt.Println("  review-ingest     Validate reviewer verdicts and admit them to the ledger")
-	fmt.Println("  harvest-merge     Cherry-pick a lane's reviewed commits onto a fresh base (--verify-landed: check if a merge landed)")
+	fmt.Println("  harvest-merge     Cherry-pick a lane's reviewed commits onto a fresh base (--verify-landed: prove landing + mint sealed completion receipt)")
 	fmt.Println("  hold       Control durable generation-fenced lane/task hold: on, off, or status")
 	fmt.Println("  review     Claim in-progress tasks for reviewer and advance to review status")
 	fmt.Println("  approve    Move in-review cards to done, gated on merge evidence")
@@ -885,6 +885,13 @@ func runPreflightStatic() {
 
 func runPreflight() {
 	runPreflightStatic()
+	if !productionMode() {
+		// FAC-367: local Herdr panes do not have hosted HostCreds or fleet
+		// attestation state. Static boundary, signal, and merge-policy checks
+		// remain mandatory, while production keeps the signed readiness gate.
+		fmt.Println("FAC-133 hosted fleet readiness skipped in local mode.")
+		return
+	}
 
 	// FAC-133 fleet readiness: optional live refresh, then consume attestation.
 	// HERD_LIVE_HARNESS_PROOF=1 or HERD_REFRESH_READINESS=1 triggers a single-flight
@@ -969,7 +976,7 @@ func runStatus() {
 	}
 	fmt.Println(line)
 	observer := &herdr.ProductionReconciliationObserver{Workspace: cfg.Fleet.HerdrWorkspace,
-		Reader: herdr.SocketAuthorityReader{}, Record: (&herdr.JSONLRecorder{Path: ".herd/reconciliation.jsonl"}).Record}
+		Reader: herdr.SocketAuthorityReader{}, LegacyStore: &herdr.JSONLLegacyTabStateStore{Path: ".herd/legacy-tab-state.jsonl"}, Record: (&herdr.JSONLRecorder{Path: ".herd/reconciliation.jsonl"}).Record}
 	if err := observer.ObserveReconciliation(context.Background()); err != nil {
 		fleet := herdr.ProjectFleetStatus(observer.Decisions(), len(cfg.Lanes))
 		fmt.Printf("Reconciliation: BLOCKED (%v)\nFleet: working=%d capacity=%d standing=%d preserved=%d recovering=%d control=%d unknown=%d\n",
@@ -1643,6 +1650,15 @@ func runUp() {
 		os.Exit(1)
 	}
 	tabLabel := fmt.Sprintf("forge-%s", lane.Name)
+	ready, readyErr := waitExactPaneBeforeStart(tab, nativePaneReadyTimeout)
+	if readyErr != nil {
+		closeErr := compensateExactLaunchTab(herdr.ResolveWorkspace("."), tab)
+		fmt.Fprintf(os.Stderr, "LAUNCH_FAILED: %s\n", ready.Reason)
+		if closeErr != nil {
+			fmt.Fprintf(os.Stderr, "  COMPENSATION FAILED: %v\n", closeErr)
+		}
+		os.Exit(1)
+	}
 	if err := herdr.StartPreparedAgent(tab.ID, tabLabel, decision.Harness, tab.Pane.ID, launch.Request{Decision: decision, TaskRef: lane.Name, Scope: router.ScopeLane, Repository: repository, Lane: lane.Name}); err != nil {
 		fmt.Fprintf(os.Stderr, "failed to start agent: %v\n", err)
 		os.Exit(1)
@@ -1943,6 +1959,8 @@ func runReview() {
 			fmt.Fprintf(os.Stderr, "no lane configured for role 'reviewer'\n")
 			os.Exit(1)
 		}
+		restoreHooks := useHarnessHooksFromWorktree(wt)
+		defer restoreHooks()
 		decision, err := launchAdmissionWithLifecycle(liveLaunchLifecycle{}, cfg, lane.Role, true, routedLaneDecision(context.Background(), task), func(_ *router.LaunchDecision) error {
 			_, listErr := herdr.AgentList()
 			return listErr
@@ -2107,17 +2125,18 @@ func runReview() {
 		if tabErr != nil {
 			life.fail("failed to create isolated reviewer tab: %v", tabErr)
 		}
-		life.onFail(func() error { return herdr.TabClose(tab.ID) })
+		life.onFail(func() error { return compensateExactLaunchTab(ws, tab) })
 		// The value tab create echoes back is only what we asked for. The
 		// guarantee must rest on the LIVE terminal state, read for the exact
-		// pane INCARNATION we just launched (FAC-145).
+		// pane INCARNATION we just launched (FAC-145). Poll that pane until a
+		// readable shell and cwd exist before starting the harness (FAC-369).
 		reviewerSession := herdr.SessionID(tab.Pane)
-		liveCwd, cwdErr := herdr.PaneLiveCwd(reviewerSession)
-		if cwdErr != nil {
-			life.fail("cannot read live reviewer pane cwd (FAC-145): %v", cwdErr)
+		ready, readyErr := waitExactPaneBeforeStart(tab, nativePaneReadyTimeout)
+		if readyErr != nil {
+			life.fail("LAUNCH_FAILED: %s", ready.Reason)
 		}
-		if !sameDir(liveCwd, worktreeDir) {
-			life.fail("live reviewer pane cwd %q is not the isolated candidate checkout %q (FAC-145)", liveCwd, worktreeDir)
+		if ready.Cwd != "" && !sameDir(ready.Cwd, worktreeDir) {
+			life.fail("LAUNCH_FAILED: live reviewer pane cwd %q is not the isolated candidate checkout %q (FAC-145)", ready.Cwd, worktreeDir)
 		}
 		// Start through the compiled LaunchDecision (main's admission path):
 		// the isolated tab is FAC-145's requirement, the decision-bound start
@@ -2161,18 +2180,7 @@ func runReview() {
 		// the receipt-gated broker's TYPED reviewer-only operation — free
 		// text can never carry verdict authority.
 		testCmd := scopedTestCommand(worktreeDir)
-		reviewPacket := fmt.Sprintf(`REVIEW %s — verdict ONLY, edit nothing.
-REPORT_TARGET: review-harvest-supervisor (mandatory; never coordinator)
-REPORT_CONTRACT: retain the signed verdict artifact in the Herdforge review inbox before pane teardown. The supervisor owns exact-SHA admission, reviewer retries, author feedback, ledger ingest, and cleanup. The coordinator receives only exact PASS plus merge-ready evidence.
-	cd %s
-1. git diff origin/main..HEAD --stat  (see ONLY the changed files — review just these)
-2. %s   (targeted tests for the changed packages, not the whole repo)
-File your verdict through the broker (typed, receipt-bound):
-  herd task verdict %s APPROVED
-  herd task verdict %s REJECTED "<numbered fixes>"
-	Do not read the whole codebase. Do not run the full suite. Change nothing. Do not use repository bin/herd-* orchestration scripts.`,
-			task.Ref, worktreeDir, testCmd, task.Ref, task.Ref)
-
+		reviewPacket := reviewSpawnPacket(cfg, task, worktreeDir, testCmd)
 		// An undelivered review packet is a BLOCKED review, not a warning.
 		if _, err := herdr.AgentPrompt(targetLabel, reviewPacket, false); err != nil {
 			life.fail("failed to deliver review packet (FAC-145 BLOCKED): %v", err)
@@ -2187,6 +2195,24 @@ File your verdict through the broker (typed, receipt-bound):
 		os.Exit(1)
 	}
 	fmt.Printf("  -> moved card [%s] to 'in-review' status\n", task.Ref)
+}
+
+func reviewSpawnPacket(cfg *config.Config, task *provider.Task, worktreeDir, testCmd string) string {
+	supervisor := standing.AgentName("review-supervisor")
+	if lane := findReviewSupervisorLane(cfg); lane != nil && strings.TrimSpace(lane.Name) != "" {
+		supervisor = standing.AgentName(lane.Name)
+	}
+	return fmt.Sprintf(`REVIEW %s — verdict ONLY, edit nothing.
+REPORT_TARGET: %s (mandatory; never coordinator)
+REPORT_CONTRACT: retain the signed verdict artifact in the Herdforge review inbox before pane teardown. The supervisor owns exact-SHA admission, reviewer retries, author feedback, ledger ingest, and cleanup. The coordinator receives only exact PASS plus merge-ready evidence.
+	cd %s
+1. git diff origin/main..HEAD --stat  (see ONLY the changed files — review just these)
+2. %s   (targeted tests for the changed packages, not the whole repo)
+File your verdict through the broker (typed, receipt-bound):
+  herd task verdict %s APPROVED
+  herd task verdict %s REJECTED "<numbered fixes>"
+	Do not read the whole codebase. Do not run the full suite. Change nothing. Do not use repository bin/herd-* orchestration scripts.`,
+		task.Ref, supervisor, worktreeDir, testCmd, task.Ref, task.Ref)
 }
 
 // reviewEligibleTaskStatus permits explicit NEEDS_REVIEW/ready cards while
@@ -2351,12 +2377,34 @@ func runApprove() {
 		return
 	}
 
+	// Receiptless cards created before the completion-receipt gate are a
+	// durable migration class, not a transient retry. Record a one-shot
+	// tombstone after the first refusal and suppress subsequent autonomous
+	// cycles until a real completion receipt appears. This keeps the gate
+	// fail-closed while preventing a legacy card from producing an ERROR every
+	// forge interval.
+	legacyLog := filepath.Join(root, legacyReceiptLog)
+	legacyTombstones, legacyErr := readLegacyReceiptTombstones(legacyLog)
+	if legacyErr != nil {
+		fmt.Fprintf(os.Stderr, "approve: legacy receipt tombstones unreadable: %v\n", legacyErr)
+		finish(1)
+	}
+
 	sort.SliceStable(tasks, func(i, j int) bool {
 		return provider.CompareRefs(tasks[i].Ref, tasks[j].Ref) < 0
 	})
 
-	approved, refused, failed := 0, 0, reconcileFailed
+	approved, refused, failed, suppressed := 0, 0, reconcileFailed, 0
 	for _, task := range tasks {
+		if receiptPathArg == "" {
+			if tombstone, ok := legacyTombstones[strings.ToUpper(task.Ref)]; ok {
+				if _, statErr := os.Stat(hsync.ReceiptPath(root, task.Ref)); errors.Is(statErr, os.ErrNotExist) {
+					fmt.Printf("LEGACY-SKIP [%s]: %s\n  tombstoned once: %s\n", task.Ref, task.Title, tombstone.Reason)
+					suppressed++
+					continue
+				}
+			}
+		}
 		// FAC-145: receipt-bound, callback-coupled approval — missing/
 		// unsigned/tampered receipt, wrong repo/project/task, expiry, stale
 		// generation, or an undeliverable callback all refuse the mutation.
@@ -2373,13 +2421,25 @@ func runApprove() {
 		case errors.Is(err, hsync.ErrNoEvidence):
 			fmt.Printf("REFUSED  [%s]: %s\n  %v\n", task.Ref, task.Title, err)
 			refused++
+			if receiptPathArg == "" {
+				if _, statErr := os.Stat(hsync.ReceiptPath(root, task.Ref)); errors.Is(statErr, os.ErrNotExist) {
+					rec := legacyReceiptTombstone{TaskRef: task.Ref, TaskID: task.ID, Reason: "pre-completion-receipt task; re-dispatch or provide a verified completion receipt", Actor: "forge-approve"}
+					if tombErr := appendLegacyReceiptTombstone(legacyLog, rec); tombErr != nil {
+						fmt.Fprintf(os.Stderr, "ERROR    [%s]: legacy tombstone write failed: %v\n", task.Ref, tombErr)
+						failed++
+					} else {
+						legacyTombstones[strings.ToUpper(task.Ref)] = rec
+						fmt.Printf("LEGACY-TOMBSTONE [%s]: approval retry suppressed until a completion receipt exists\n", task.Ref)
+					}
+				}
+			}
 		default:
 			fmt.Fprintf(os.Stderr, "ERROR    [%s]: %v\n", task.Ref, err)
 			failed++
 		}
 	}
 
-	fmt.Printf("\nherd approve: approved=%d refused=%d failed=%d\n", approved, refused, failed)
+	fmt.Printf("\nherd approve: approved=%d refused=%d suppressed=%d failed=%d\n", approved, refused, suppressed, failed)
 	if failed > 0 {
 		finish(1)
 	}
@@ -2496,6 +2556,13 @@ func requireLiveLease(ctx context.Context, root string, tc dispatch.TaskContext)
 		}
 	}
 	if live == nil {
+		latestGeneration, err := st.PeekLatestGeneration(ctx, key)
+		if err != nil {
+			return fmt.Errorf("lease high-water read failed — refusing unfenced authority (FAC-145): %w", err)
+		}
+		if latestGeneration > tc.LeaseGeneration {
+			return fmt.Errorf("no ACTIVE lease (no live lease) for %s and durable lease generation %d exceeds receipt generation %d — stale authority refused (FAC-145)", tc.TaskRef, latestGeneration, tc.LeaseGeneration)
+		}
 		// A worker's claim is normally released when its build finishes. The
 		// signed, unexpired receipt plus the discovered candidate authorizes a
 		// fresh review-scoped lease; it never revives the worker lease and does
@@ -2978,7 +3045,7 @@ func approveOne(ctx context.Context, cfg *config.Config, tp provider.TaskProvide
 	if err != nil {
 		return nil, fmt.Errorf("coordinator signer unavailable (FAC-145): %w", err)
 	}
-	mb := mail.NewMailbox(filepath.Join(root, mail.DefaultMailFile))
+	mb := mail.NewMailbox(mail.CallbackMailPath(root))
 
 	publish := func(rec approveIntent, proof string) error {
 		cb, cbErr := coord.BoundCallback(mail.CallbackComplete, rec.SHA, "approved: "+proof)
@@ -3017,7 +3084,7 @@ func approveOne(ctx context.Context, cfg *config.Config, tp provider.TaskProvide
 	// APPROVED and the approval refuses until a fresh admissible APPROVED
 	// lands. Cards with no recorded verdict keep the receipt-gated path.
 	if coord.CandidateSHA != "" {
-		mbv := mail.NewMailbox(filepath.Join(root, mail.DefaultMailFile))
+		mbv := mail.NewMailbox(mail.CallbackMailPath(root))
 		eff, found, vErr := mbv.EffectiveVerdict(coord.Repository, coord.TaskRef, coord.CandidateSHA)
 		if vErr != nil {
 			return nil, fmt.Errorf("verdict state unreadable — refusing approval (FAC-145): %w", vErr)
@@ -3115,6 +3182,23 @@ func approveOne(ctx context.Context, cfg *config.Config, tp provider.TaskProvide
 			return nil, fmt.Errorf("%w; COMPENSATING CALLBACK ALSO FAILED (%v) — reconcile via herd board-sync", err, pErr)
 		}
 		return nil, err
+	}
+	// FAC-353: the builder's authenticated launch receipt is the only source
+	// of the lane identity. Automatic completion receipts provide the exact
+	// reviewed candidate and base; an override has no reviewed builder
+	// candidate and therefore does not receive a fabricated notification.
+	if req.Receipt != nil && strings.TrimSpace(coord.AgentSessionID) != "" {
+		if _, nErr := mb.PostMergeNotification("coordinator", mail.MergeNotification{
+			TaskRef:      coord.TaskRef,
+			CandidateSHA: req.Receipt.CandidateSHA,
+			LandedCommit: rec.SHA,
+			BaseSHA:      req.Receipt.BaseSHA,
+			Branch:       coord.Branch,
+			Repository:   coord.Repository,
+			BuilderID:    coord.AgentSessionID,
+		}); nErr != nil {
+			return nil, fmt.Errorf("merge notification delivery failed (board IS done; next approve retries): %w", nErr)
+		}
 	}
 	rec.State = "done"
 	if err := appendApproveIntent(root, signer, rec); err != nil {
@@ -3543,7 +3627,12 @@ func runCleanup() {
 		standing = configuredStandingAgentNames(cfg)
 	}
 
-	res, err := herdr.CleanupFenced(standing, *dryRun)
+	workspace, workspaceErr := herdr.RequireWorkspace(".")
+	if workspaceErr != nil {
+		fmt.Fprintf(os.Stderr, "herd cleanup: %v\n", workspaceErr)
+		os.Exit(1)
+	}
+	res, err := herdr.CleanupFencedInWorkspace(workspace, standing, *dryRun)
 	if *asJSON {
 		out := map[string]interface{}{
 			"dry_run":     res.DryRun,
@@ -4144,7 +4233,7 @@ func configureProductionControl(d *dispatch.Dispatcher, root string) (func() err
 	if err != nil {
 		return nil, err
 	}
-	controlMailbox := mail.NewMailbox(filepath.Join(root, ".herd", "control-mail.jsonl"))
+	controlMailbox := mail.NewMailbox(mail.CallbackMailPath(root))
 	d.ControlFactory = func(_ context.Context, scope dispatch.ControlScope) (*control.CoordinatorOrders, error) {
 		owner, err := control.NewOwnerToken()
 		if err != nil {
@@ -4182,7 +4271,7 @@ func configureProductionControl(d *dispatch.Dispatcher, root string) (func() err
 	if secret := strings.TrimSpace(os.Getenv("HERD_CONTROL_SECRET")); secret != "" {
 		mailPath := strings.TrimSpace(os.Getenv("HERD_MAIL_FILE"))
 		if mailPath == "" {
-			mailPath = filepath.Join(root, ".herd", "mail.jsonl")
+			mailPath = mail.CallbackMailPath(root)
 		} else {
 			if filepath.IsAbs(mailPath) {
 				return nil, fmt.Errorf("HERD_MAIL_FILE must be relative to workspace root")
@@ -4227,7 +4316,7 @@ func newCoordinatorControlReconciler(root string) (*control.CoordinatorLoop, fun
 	if err != nil {
 		return nil, nil, err
 	}
-	controlMailbox := mail.NewMailbox(filepath.Join(root, ".herd", "control-mail.jsonl"))
+	controlMailbox := mail.NewMailbox(mail.CallbackMailPath(root))
 	lookup := func(ctx context.Context, order control.Order) error {
 		claims := security.ResolveClaimLookup()
 		if claims == nil {
@@ -4838,8 +4927,14 @@ func runForgeE() error {
 						cwd = filepath.Join(".", lane.Worktree)
 					}
 					req := taskLaunchRequest(decision, task.Ref, repositoryIdentityForLaunch(cfg), lane.Name)
-					_, tab, tabErr := openWriteCapableTab(decision, req, lane, herdr.ResolveWorkspace("."), tabLabel, cwd)
+					ws := herdr.ResolveWorkspace(".")
+					_, tab, tabErr := openWriteCapableTab(decision, req, lane, ws, tabLabel, cwd)
 					if tabErr == nil {
+						ready, readyErr := waitExactPaneBeforeStart(tab, nativePaneReadyTimeout)
+						if readyErr != nil {
+							closeErr := compensateExactLaunchTab(ws, tab)
+							return compensateLaunchFailure(errors.Join(fmt.Errorf("LAUNCH_FAILED: %s", ready.Reason), closeErr))
+						}
 						if err := herdr.StartPreparedAgent(tab.ID, tabLabel, decision.Harness, tab.Pane.ID, req); err != nil {
 							return compensateLaunchFailure(fmt.Errorf("launch failed: %w", err))
 						}
@@ -4938,7 +5033,11 @@ func runForgeE() error {
 	// resident; cleanup failure is visible rather than silently leaking panes.
 	if cfg != nil && herdr.IsAvailable() {
 		standingAgents := configuredStandingAgentNames(cfg)
-		if cleaned, cleanupErr := herdr.CleanupFenced(standingAgents, false); cleanupErr != nil {
+		workspace, workspaceErr := herdr.RequireWorkspace(".")
+		if workspaceErr != nil {
+			fmt.Fprintf(os.Stderr, "forge cleanup: %v\n", workspaceErr)
+			forgeFailed = true
+		} else if cleaned, cleanupErr := herdr.CleanupFencedInWorkspace(workspace, standingAgents, false); cleanupErr != nil {
 			fmt.Fprintf(os.Stderr, "forge cleanup: %v\n", cleanupErr)
 			forgeFailed = true
 		} else if cleaned.Closed > 0 {
@@ -5291,14 +5390,25 @@ func laneLaunchDecisionWithProbe(ctx context.Context, lane *config.LaneDef, task
 	if err != nil {
 		return nil, err
 	}
-	decision, err = router.BindVendorHarness(decision, lane.Harness)
+	if surface, ok := router.SurfaceFor(decision.Provider); !ok {
+		return nil, fmt.Errorf("lane %q routed unsupported provider %q before pane creation", lane.Name, decision.Provider)
+	} else if launchable, reason := router.ProbeSurface(surface); !launchable {
+		return nil, fmt.Errorf("lane %q routed %s/%s but it is not launchable before pane creation: %s", lane.Name, decision.Provider, decision.Model, reason)
+	}
+	bindHarness := lane.Harness
+	if !pinnedBuilder {
+		// Review and assayer lanes may be rerouted by quota. Bind the harness
+		// selected by the router so the launch tuple remains coherent.
+		bindHarness = decision.Provider
+	}
+	decision, err = router.BindVendorHarness(decision, bindHarness)
 	if err != nil {
-		return nil, fmt.Errorf("lane %q bind configured harness: %w", lane.Name, err)
+		return nil, fmt.Errorf("lane %q bind vendor harness: %w", lane.Name, err)
 	}
 	if decision.Shape != lane.TaskShape {
 		return nil, fmt.Errorf("lane %q routed shape drift: configured %s, got %s", lane.Name, lane.TaskShape, decision.Shape)
 	}
-	if decision.Harness != strings.ToLower(strings.TrimSpace(lane.Harness)) {
+	if pinnedBuilder && decision.Harness != strings.ToLower(strings.TrimSpace(lane.Harness)) {
 		return nil, fmt.Errorf("lane %q routed harness drift: got %s, want %s", lane.Name, decision.Harness, lane.Harness)
 	}
 	if pinnedBuilder {
@@ -7011,8 +7121,11 @@ func runVerify() {
 		os.Exit(2)
 	}
 
-	v := verifier.NewVerifier("")
-	c := v.CheckCompletion(context.Background(), wt, *buildCmd, *testCmd)
+	var c *verifier.CompletionCheck
+	// Keep the candidate identity used by persisted receipts. Re-reading HEAD
+	// after the commands finish can observe a concurrent movement and publish
+	// a callback for a different candidate than the one actually verified.
+	verifiedCandidateSHA := ""
 
 	// FAC-145: a worktree carrying a launch receipt reports its verify
 	// outcome as a receipt-bound callback, so the worker FAIL signal travels
@@ -7047,6 +7160,66 @@ func runVerify() {
 			}
 		}
 	}
+	verificationProfileName := verificationProfile
+	preflightCommand := ""
+	configPath := filepath.Join(verifyRoot, ".herd", "herd.yaml")
+	if _, statErr := os.Stat(configPath); statErr == nil {
+		verifyConfig, loadErr := config.LoadConfig(configPath)
+		if loadErr != nil {
+			fmt.Fprintf(os.Stderr, "herd verify: load config: %v\n", loadErr)
+			os.Exit(2)
+		}
+		preflightCommand = strings.TrimSpace(verifyConfig.Verification.PreflightCommand)
+		if preflightCommand != "" {
+			verificationProfileName += "+preflight"
+		}
+	}
+	if tcErr == nil {
+		sha, shaErr := worktreeHeadSHA(wt)
+		if shaErr != nil {
+			// A malformed/empty managed worktree can still emit its bound
+			// BLOCKED callback. There is no candidate to receipt-bind, and
+			// forcing a SHA here would hide the actionable callback.
+			c = verifier.NewVerifier("").CheckCompletion(context.Background(), wt, *buildCmd, *testCmd)
+		} else {
+			baseSHA := tc.BaseSHA
+			if len(baseSHA) != 40 {
+				baseSHA = ""
+			}
+			store, storeErr := verifier.NewFileReceiptStore(filepath.Join(verifyRoot, defaultReceiptDir))
+			if storeErr != nil {
+				fmt.Fprintf(os.Stderr, "herd verify: cannot open receipt store: %v\n", storeErr)
+				os.Exit(2)
+			}
+			req := verifier.VerificationRequest{
+				TaskRef: tc.TaskRef, LeaseGeneration: fmt.Sprintf("%d", tc.LeaseGeneration),
+				CandidateSHA: sha, BaseSHA: baseSHA, EnvironmentPolicy: verifier.EnvironmentPolicyInherited,
+				Artifacts: []string{"profile:" + verificationProfileName},
+			}
+			verifiedCandidateSHA = req.CandidateSHA
+			preflightPassed := true
+			if preflightCommand != "" {
+				preReceipt, preErr := verifier.NewVerifier(preflightCommand).VerifyAndPersist(context.Background(), wt, req, store)
+				if preErr != nil {
+					fmt.Fprintf(os.Stderr, "herd verify: persist preflight receipt: %v\n", preErr)
+					os.Exit(2)
+				}
+				preflightPassed = preReceipt.Outcome == verifier.OutcomePASS
+			}
+			var persistErr error
+			c, _, persistErr = verifier.NewVerifier("").CheckCompletionAndPersist(context.Background(), wt, *buildCmd, *testCmd, req, store)
+			if persistErr != nil {
+				fmt.Fprintf(os.Stderr, "herd verify: persist verification receipts: %v\n", persistErr)
+				os.Exit(2)
+			}
+			if !preflightPassed {
+				c.Passed = false
+				c.Reasons = append(c.Reasons, "preflight failed ("+preflightCommand+") — fix preflight findings before this can complete")
+			}
+		}
+	} else {
+		c = verifier.NewVerifier("").CheckCompletion(context.Background(), wt, *buildCmd, *testCmd)
+	}
 	switch {
 	case tcErr == nil:
 		kind, detail := mail.CallbackComplete, ""
@@ -7054,16 +7227,18 @@ func runVerify() {
 			kind = mail.CallbackBlocked
 			detail = strings.Join(c.Reasons, "; ")
 		}
-		sha := ""
-		if out, hErr := exec.Command("git", "-C", wt, "rev-parse", "HEAD").Output(); hErr == nil {
-			sha = strings.TrimSpace(string(out))
+		sha := verifiedCandidateSHA
+		if sha == "" {
+			if out, hErr := exec.Command("git", "-C", wt, "rev-parse", "HEAD").Output(); hErr == nil {
+				sha = strings.TrimSpace(string(out))
+			}
 		}
 		// FAC-145: a verify whose bound callback cannot be raised has a
 		// broken evidence chain — that is a hard failure, never a warning.
 		if cb, cbErr := tc.BoundCallback(kind, sha, detail); cbErr != nil {
 			fmt.Fprintf(os.Stderr, "herd verify: callback binding refused (FAC-145): %v\n", cbErr)
 			os.Exit(2)
-		} else if _, postErr := mail.NewMailbox(filepath.Join(verifyRoot, mail.DefaultMailFile)).PostCallback(tc.Role, cb); postErr != nil {
+		} else if _, postErr := mail.NewMailbox(mail.CallbackMailPath(verifyRoot)).PostCallback(tc.Role, cb); postErr != nil {
 			fmt.Fprintf(os.Stderr, "herd verify: callback post failed (FAC-145): %v\n", postErr)
 			os.Exit(2)
 		}
@@ -7364,7 +7539,7 @@ func serveBrokerConn(conn net.Conn, root string, cfg *config.Config, authority d
 			kind = mail.CallbackComplete
 		}
 		effect := fmt.Sprintf("%s:%s:%s:gen%d:%s:%s", tc.Repository, tc.TaskRef, tc.CandidateSHA, tc.LeaseGeneration, tc.LeaseID, verdict)
-		mb := mail.NewMailbox(filepath.Join(root, mail.DefaultMailFile))
+		mb := mail.NewMailbox(mail.CallbackMailPath(root))
 
 		// UNFORGEABLE effect proof (FAC-145): the delivered comment body is
 		// the canonical line plus a COORDINATOR SIGNATURE over it. An agent
@@ -8449,7 +8624,7 @@ func newProductionForgeObserver(cfg *config.Config) (*herdr.ProductionReconcilia
 	if err != nil {
 		return nil, fmt.Errorf("forge reconciliation observer: repository root: %w", err)
 	}
-	completion := &herdrControlCompletionProof{mailbox: mail.NewMailbox(filepath.Join(root, ".herd", "control-mail.jsonl"))}
+	completion := &herdrControlCompletionProof{mailbox: mail.NewMailbox(mail.CallbackMailPath(root))}
 	return &herdr.ProductionReconciliationObserver{
 		Workspace: workspace, ControlBinding: control,
 		Reader: herdr.SocketAuthorityReader{}, Record: (&herdr.JSONLRecorder{Path: ".herd/reconciliation.jsonl"}).Record,
@@ -8634,20 +8809,18 @@ func provisionCoordinatorAgent(root, workspace string) (herdr.TabBinding, error)
 		return herdr.TabBinding{}, fmt.Errorf("create coordinator tab returned incomplete identity: %s", strings.TrimSpace(string(tabOut)))
 	}
 	time.Sleep(time.Second)
-	routeCmd := exec.Command("herdr-route", "--task", "coordinator", "--json")
-	routeOut, routeErr := routeCmd.Output()
+	// Route in-process so coordinator provisioning cannot drift from the
+	// launch surface used by forge workers. The router includes Grok as a
+	// native fallback when Codex/Claude are exhausted; the coordinator
+	// registration and control tab remain the same across that failover.
+	route, routeErr := router.NewRouter(nil, nil).Pick("coordinator", "", "")
 	if routeErr != nil {
 		return herdr.TabBinding{}, fmt.Errorf("route native coordinator: %w", routeErr)
 	}
-	var route struct {
-		Provider string   `json:"provider"`
-		Kind     string   `json:"kind"`
-		Argv     []string `json:"argv"`
+	if !router.IsLaneLaunchable(route.Provider) || len(route.Argv) < 1 {
+		return herdr.TabBinding{}, fmt.Errorf("coordinator route is not a launchable Herdr surface: provider=%s model=%s", route.Provider, route.Model)
 	}
-	if err := json.Unmarshal(routeOut, &route); err != nil || (route.Kind != "codex" && route.Kind != "claude") || len(route.Argv) < 1 {
-		return herdr.TabBinding{}, fmt.Errorf("coordinator route must be native Codex Sol or Claude Fable: %s", strings.TrimSpace(string(routeOut)))
-	}
-	startArgs := []string{"herdr", "agent", "start", "coordinator", "--kind", route.Kind, "--pane", tabResp.Result.Pane.PaneID, "--timeout", "120000", "--"}
+	startArgs := []string{"herdr", "agent", "start", "coordinator", "--kind", route.Provider, "--pane", tabResp.Result.Pane.PaneID, "--timeout", "120000", "--"}
 	startArgs = append(startArgs, route.Argv[1:]...)
 	if out, startErr := exec.Command(startArgs[0], startArgs[1:]...).CombinedOutput(); startErr != nil {
 		return herdr.TabBinding{}, fmt.Errorf("start native Sol/Fable coordinator: %w: %s", startErr, strings.TrimSpace(string(out)))
@@ -8778,9 +8951,20 @@ func herdSubprocessReal(args ...string) error {
 		return fmt.Errorf("herd executable: %w", err)
 	}
 	cmd := exec.Command(self, args...)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	return cmd.Run()
+	var output bytes.Buffer
+	writer := io.MultiWriter(os.Stdout, &output)
+	cmd.Stdout = writer
+	cmd.Stderr = writer
+	if err := cmd.Run(); err != nil {
+		// The forge loop needs a typed refusal to persist legacy receiptless
+		// suppression. Preserve the child output while retaining the original
+		// fail-closed exit error for every other approval refusal.
+		if strings.Contains(strings.ToLower(output.String()), "no completion receipt") {
+			return fmt.Errorf("%w: %s", hsync.ErrNoEvidence, strings.TrimSpace(output.String()))
+		}
+		return err
+	}
+	return nil
 }
 
 // setHerdSubprocessForTest replaces the herd subprocess runner. Restore with
@@ -9069,7 +9253,7 @@ func forgeControlReconciler(root string, cfg *config.Config) (*control.Coordinat
 	if err != nil {
 		return nil, nil, fmt.Errorf("forge control: open outbox: %w", err)
 	}
-	controlMailbox := mail.NewMailbox(filepath.Join(root, ".herd", "control-mail.jsonl"))
+	controlMailbox := mail.NewMailbox(mail.CallbackMailPath(root))
 	leaseOwnership, err := deps.OpenLeaseOwnership(
 		deps.ResolveLaunchLeasePath(root),
 		dispatch.RepositoryIdentityOrName(root, cfg.Project.Name),
@@ -9150,6 +9334,7 @@ func forgeLoopMain() int {
 	interval := fs.Int("interval", 15, "seconds between ticks")
 	ticks := fs.Int("ticks", 0, "stop after N ticks (0 = run until drained)")
 	stopEmpty := fs.Bool("stop-empty", true, "stop when the board is clear and no lane is busy")
+	retryApprove := fs.String("retry-approve", "", "explicitly retry a suppressed legacy approval for this task ref")
 	// --coordinator-name is what makes ReplyTarget.Name real. A reviewer caught
 	// that Register was called with the constant, so Dispatcher.CoordinatorName,
 	// ReplyTarget.Name and the non-default branch of coordinatorName() worked in
@@ -9186,19 +9371,10 @@ func forgeLoopMain() int {
 		fmt.Fprintf(os.Stderr, "forge --loop: %v\n", err)
 		return 1
 	}
-	forgeWorkspace := strings.TrimSpace(cfg.Fleet.HerdrWorkspace)
-	if forgeWorkspace == "" {
-		// Prefer the live workspace labeled for this repo. This prevents a
-		// long-lived shell's HERD_WORKSPACE from silently routing Herdforge into
-		// a different checkout (for example, Chainseer).
-		if entries, listErr := herdr.WorkspaceList(); listErr == nil {
-			if id, ok := herdr.PickWorkspaceStrict(entries, cfg.Project.Name); ok {
-				forgeWorkspace = id
-			}
-		}
-	}
-	if forgeWorkspace == "" {
-		forgeWorkspace = strings.TrimSpace(os.Getenv("HERD_WORKSPACE"))
+	forgeWorkspace, workspaceErr := herdr.RequireWorkspace(".")
+	if workspaceErr != nil {
+		fmt.Fprintf(os.Stderr, "forge --loop: workspace resolution failed before fleet mutation: %v\n", workspaceErr)
+		return 1
 	}
 	if forgeWorkspace != "" {
 		// Child `herd dispatch` processes inherit the coordinator's resolved
@@ -9228,11 +9404,7 @@ func forgeLoopMain() int {
 		return 1
 	}
 	fmt.Printf("herd forge --loop: coordinator registered as %q (workspace=%s)\n", coordReg.Name, coordReg.Workspace)
-	workspace := strings.TrimSpace(cfg.Fleet.HerdrWorkspace)
-	if workspace == "" {
-		workspace = strings.TrimSpace(os.Getenv("HERDR_WORKSPACE_ID"))
-	}
-	if _, bindErr := bindCoordinatorControlTab(".", workspace); bindErr != nil {
+	if _, bindErr := bindCoordinatorControlTab(".", forgeWorkspace); bindErr != nil {
 		fmt.Fprintf(os.Stderr, "forge --loop: coordinator control binding failed: %v\n", bindErr)
 		return 1
 	}
@@ -9275,11 +9447,13 @@ func forgeLoopMain() int {
 
 	fmt.Printf("herd forge --loop: max-lanes=%d interval=%ds — driving the board autonomously\n", *maxLanes, *interval)
 	err = eng.ForgeLoop(ctx, driver, daemon.ForgeLoopOptions{
-		Interval:         time.Duration(*interval) * time.Second,
-		MaxTicks:         *ticks,
-		StopEmpty:        *stopEmpty,
-		Feedback:         feedbackRunner,
-		FeedbackInterval: feedbackInterval,
+		Interval:               time.Duration(*interval) * time.Second,
+		MaxTicks:               *ticks,
+		StopEmpty:              *stopEmpty,
+		Feedback:               feedbackRunner,
+		FeedbackInterval:       feedbackInterval,
+		ApproveSuppressionPath: ".herd/forge-approve-suppressions.json",
+		ApproveRetryRefs:       map[string]bool{strings.ToUpper(strings.TrimSpace(*retryApprove)): true},
 	})
 	switch {
 	case err == nil:

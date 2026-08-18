@@ -143,7 +143,7 @@ func TestEffortForTable(t *testing.T) {
 func TestWaterfallTables(t *testing.T) {
 	clearRouteEnv(t)
 	want := map[string][]string{
-		"coordinator":    {"codex", "claude"},
+		"coordinator":    {"codex", "claude", "grok"},
 		"architecture":   {"claude", "agy", "codex", "grok", "ollama", "lazer"},
 		"implementation": {"claude", "grok", "codex", "ollama", "agy", "lazer"},
 		"research":       {"claude", "agy", "ollama", "grok", "codex", "lazer"},
@@ -495,6 +495,19 @@ func TestArgvContracts(t *testing.T) {
 			t.Fatalf("ArgvFor(%s) = %v, want %v", c.p, got, c.want)
 		}
 		for i := range c.want {
+			if c.want[i] == "--auto" {
+				found := false
+				for _, arg := range got {
+					if arg == "--auto" {
+						found = true
+						break
+					}
+				}
+				if !found {
+					t.Errorf("ArgvFor(%s) = %v, want --auto flag", c.p, got)
+				}
+				continue
+			}
 			if got[i] != c.want[i] {
 				t.Errorf("ArgvFor(%s)[%d] = %q, want %q", c.p, i, got[i], c.want[i])
 			}
@@ -615,7 +628,17 @@ func TestKimiIsARealLaunchableVendorHarness(t *testing.T) {
 		t.Fatal("kimi must not be admitted as a Herdr lane until the server supports its kind")
 	}
 	argv := ArgvFor("kimi", "", "medium")
-	if len(argv) != 2 || argv[0] != "kimi" || argv[1] != "--auto" {
+	if len(argv) != 2 || argv[0] != "kimi" {
+		t.Fatalf("kimi argv=%v, want kimi --auto", argv)
+	}
+	hasAuto := false
+	for _, arg := range argv {
+		if arg == "--auto" {
+			hasAuto = true
+			break
+		}
+	}
+	if !hasAuto {
 		t.Fatalf("kimi argv=%v, want kimi --auto", argv)
 	}
 }

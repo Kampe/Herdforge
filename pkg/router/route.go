@@ -46,7 +46,10 @@ func AllShapes() []string {
 func Waterfall(shape string) ([]string, error) {
 	switch shape {
 	case "coordinator":
-		return []string{"codex", "claude"}, nil
+		// Coordinator identity is stable across provider failover. Keep the
+		// preferred Codex/Claude surfaces first, but include Grok as a real
+		// native fallback when a five-hour or weekly Claude window is spent.
+		return []string{"codex", "claude", "grok"}, nil
 	case "architecture":
 		return []string{"claude", "agy", "codex", "grok", "ollama", "lazer"}, nil
 	case "implementation":
@@ -305,12 +308,8 @@ const PiHarness = "pi"
 // launch fails (Kimi is intentionally headless-only until Herdr advertises
 // that kind). Pi remains available only for legacy router decisions.
 func IsVendorHarness(harness string) bool {
-	switch strings.ToLower(strings.TrimSpace(harness)) {
-	case "codex", "claude", "grok", "agy", "opencode":
-		return true
-	default:
-		return false
-	}
+	surface, ok := SurfaceFor(harness)
+	return ok && surface.VendorHarness
 }
 
 // IsLaneLaunchable reports whether Herdr can create the harness kind for a
@@ -319,12 +318,8 @@ func IsVendorHarness(harness string) bool {
 // server advertises that kind. Keeping this predicate beside IsVendorHarness
 // prevents router READY state from outrunning launch capability.
 func IsLaneLaunchable(provider string) bool {
-	switch strings.ToLower(strings.TrimSpace(provider)) {
-	case "codex", "claude", "grok", "agy", "opencode", "ollama", "lazer":
-		return true
-	default:
-		return false
-	}
+	surface, ok := SurfaceFor(provider)
+	return ok && surface.VendorHarness
 }
 
 // PiModelFor maps a routed provider/model to Pi's exact provider-qualified model.
@@ -423,6 +418,10 @@ func PiBareModel(model string) string {
 // an optional legacy adapter only when HERD_USE_PI=1; no launch path requires
 // it. Coordinators therefore run directly on Codex Sol or Claude Fable.
 func HarnessArgvFor(provider, model, effort string) (string, []string, error) {
+	provider = strings.ToLower(strings.TrimSpace(provider))
+	if surface, ok := SurfaceFor(provider); !ok || (!surface.VendorHarness && !useLegacyPi()) {
+		return "", nil, fmt.Errorf("unsupported launch provider %q", provider)
+	}
 	// Native Herdr mode is the default in every environment. Set HERD_USE_PI=1
 	// only for an existing deployment that intentionally retains the adapter.
 	if !useLegacyPi() {
@@ -541,7 +540,13 @@ func HeadlessArgvFor(provider, model, effort, promptPath string) (argv []string,
 // non-nil argv from HeadlessArgvFor, and every provider case in that switch
 // MUST appear here. TestHeadlessProvidersMatchArgvContract enforces both.
 func HeadlessProviders() []string {
-	return []string{"agy", "claude", "codex", "grok", "kimi", "lazer", "ollama", "opencode"}
+	result := make([]string, 0, len(SurfaceCapabilities()))
+	for _, surface := range SurfaceCapabilities() {
+		if surface.Headless {
+			result = append(result, surface.Provider)
+		}
+	}
+	return result
 }
 
 // PromptDelivery is how a headless surface accepts its prompt. Getting this
@@ -580,6 +585,8 @@ type Route struct {
 type Probes struct {
 	// CLIPresent reports whether the required launch/probe surface CLI exists.
 	CLIPresent func(cli string) bool
+	// Launchable checks the exact provider/model tuple before a pane is created.
+	Launchable func(provider, model string) (bool, string)
 	// Now supplies the clock for cooldown expiry.
 	Now func() time.Time
 }
@@ -589,6 +596,13 @@ func defaultProbes() *Probes {
 		CLIPresent: func(cli string) bool {
 			_, err := exec.LookPath(cli)
 			return err == nil
+		},
+		Launchable: func(provider, _ string) (bool, string) {
+			surface, ok := SurfaceFor(provider)
+			if !ok {
+				return false, fmt.Sprintf("unsupported routed provider %q", provider)
+			}
+			return ProbeSurface(surface)
 		},
 		Now: time.Now,
 	}

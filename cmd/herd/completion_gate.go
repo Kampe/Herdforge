@@ -131,18 +131,32 @@ func signedLaunchReceiptForReview(root, ref, wt string) (dispatch.TaskContext, e
 		tc  dispatch.TaskContext
 		err error
 	)
-	tc, err = dispatch.LoadCanonicalReceipt(root, ref)
-	if err != nil {
-		if !errors.Is(err, os.ErrNotExist) {
+	// The candidate worktree's signed worker context is the authority for
+	// completion evidence. A later reviewer launch writes its own canonical
+	// receipt for the same task, often with a newer review-lease generation;
+	// selecting that receipt here makes the worker's verification receipts
+	// appear stale and blocks an otherwise valid re-review. Prefer the local
+	// context whenever the file exists, then fall back to the canonical store
+	// only for legacy worktrees that predate TASK-CONTEXT.json.
+	localPath := filepath.Join(wt, dispatch.TaskContextFile)
+	if _, statErr := os.Stat(localPath); statErr == nil {
+		tc, err = dispatch.ReadTaskContext(wt)
+		if err != nil {
 			return tc, err
 		}
-		tc, err = dispatch.ReadTaskContext(wt)
-	}
-	if err != nil {
-		return tc, err
-	}
-	if tc.TaskRef != ref {
-		return tc, fmt.Errorf("receipt task ref %q does not match %q", tc.TaskRef, ref)
+		if tc.TaskRef != ref {
+			return tc, fmt.Errorf("receipt task ref %q does not match %q", tc.TaskRef, ref)
+		}
+		if tc.Role != dispatch.RoleWorker && tc.Role != dispatch.RoleVerifier {
+			return tc, fmt.Errorf("worktree receipt role %q cannot authorize review admission", tc.Role)
+		}
+	} else if errors.Is(statErr, os.ErrNotExist) {
+		tc, err = dispatch.LoadCanonicalReceipt(root, ref)
+		if err != nil {
+			return tc, err
+		}
+	} else {
+		return tc, fmt.Errorf("stat task context: %w", statErr)
 	}
 	if !tc.ExpiresAt.After(time.Now()) {
 		return tc, fmt.Errorf("receipt expired at %s", tc.ExpiresAt.UTC().Format(time.RFC3339))
@@ -315,4 +329,31 @@ func worktreePathForRef(ref string) string {
 func worktreeExists(path string) bool {
 	fi, err := os.Stat(path)
 	return err == nil && fi.IsDir()
+}
+
+// useHarnessHooksFromWorktree supplies the repository-declared hook policy
+// when a coordinator is reviewing a candidate before that candidate has
+// landed on the coordinator's checkout. The candidate worktree is already
+// authenticated by review admission; using its .herd/harness-hooks.json
+// keeps native Herdr launches independent of an operator-set environment
+// variable while preserving an explicit override when one is present.
+func useHarnessHooksFromWorktree(wt string) func() {
+	if strings.TrimSpace(os.Getenv("HERD_HARNESS_HOOKS_FILE")) != "" {
+		return func() {}
+	}
+	path := filepath.Join(wt, ".herd", "harness-hooks.json")
+	if info, err := os.Stat(path); err != nil || !info.Mode().IsRegular() {
+		return func() {}
+	}
+	previous, hadPrevious := os.LookupEnv("HERD_HARNESS_HOOKS_FILE")
+	if err := os.Setenv("HERD_HARNESS_HOOKS_FILE", path); err != nil {
+		return func() {}
+	}
+	return func() {
+		if hadPrevious {
+			_ = os.Setenv("HERD_HARNESS_HOOKS_FILE", previous)
+		} else {
+			_ = os.Unsetenv("HERD_HARNESS_HOOKS_FILE")
+		}
+	}
 }

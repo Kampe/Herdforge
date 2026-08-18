@@ -1,6 +1,7 @@
 package herdr
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -15,7 +16,28 @@ const (
 	LaunchReady   LaunchState = "READY"
 	LaunchRefused LaunchState = "REFUSED"
 	LaunchDied    LaunchState = "DIED"
+	// LaunchFailed is the terminal pre-start outcome for an exact pane that
+	// never became a readable shell (unknown, dead, or authentication).
+	LaunchFailed LaunchState = "LAUNCH_FAILED"
 )
+
+// ErrLaunchFailed is the durable sentinel for a bounded native launch refusal.
+// One reason string rides on the wrapped error; callers must not retry the
+// same pane after this error.
+var ErrLaunchFailed = errors.New("LAUNCH_FAILED")
+
+// IsLaunchFailed reports whether err is a terminal pre-start launch failure.
+func IsLaunchFailed(err error) bool {
+	return errors.Is(err, ErrLaunchFailed)
+}
+
+func launchFailed(obs LaunchObservation) error {
+	reason := strings.TrimSpace(obs.Reason)
+	if reason == "" {
+		reason = "exact pane was not launch-ready"
+	}
+	return fmt.Errorf("%w: %s", ErrLaunchFailed, reason)
+}
 
 // LaunchObservation records the evidence used for the derived launch state.
 type LaunchObservation struct {
@@ -24,6 +46,7 @@ type LaunchObservation struct {
 	PaneID      string
 	TabID       string
 	TerminalID  string
+	Cwd         string
 	AgentStatus string
 	Reason      string
 }
@@ -119,6 +142,169 @@ func VerifyAgentLaunch(name, paneID string, timeout time.Duration) (LaunchObserv
 
 func verifyAgentLaunch(name, paneID string, timeout time.Duration) (LaunchObservation, error) {
 	return VerifyAgentLaunch(name, paneID, timeout)
+}
+
+const defaultPaneReadyTimeout = 8 * time.Second
+
+// WaitExactPaneReady polls the exact Herdr pane (via pane list, not agent
+// list) until a readable shell and cwd exist. It must run after tab create
+// and before harness start. An unknown pane is retried until the bound
+// expires; login/auth screens and dead panes are immediate LAUNCH_FAILED.
+func WaitExactPaneReady(tabID, paneID, terminalID string, timeout time.Duration) (LaunchObservation, error) {
+	last := LaunchObservation{State: LaunchFailed, TabID: tabID, PaneID: paneID, TerminalID: terminalID, Reason: "exact pane id is required"}
+	if strings.TrimSpace(paneID) == "" {
+		return last, launchFailed(last)
+	}
+	if timeout <= 0 {
+		timeout = defaultPaneReadyTimeout
+	}
+	deadline := time.Now().Add(timeout)
+	last.Reason = "unknown pane"
+	for {
+		panes, err := PaneList()
+		if err != nil {
+			last.Reason = fmt.Sprintf("pane inventory unavailable: %v", err)
+			if !sleepUntilReady(deadline) {
+				return last, launchFailed(last)
+			}
+			continue
+		}
+		var found *PaneEntry
+		for i := range panes {
+			pane := panes[i]
+			if pane.PaneID != paneID {
+				continue
+			}
+			if tabID != "" && pane.TabID != "" && pane.TabID != tabID {
+				continue
+			}
+			if terminalID != "" && pane.TerminalID != "" && pane.TerminalID != terminalID {
+				last.State = LaunchFailed
+				last.TabID, last.TerminalID = pane.TabID, pane.TerminalID
+				last.Reason = fmt.Sprintf("pane incarnation changed: want %q got %q", terminalID, pane.TerminalID)
+				return last, launchFailed(last)
+			}
+			copy := pane
+			found = &copy
+			break
+		}
+		if found == nil {
+			last.State = LaunchFailed
+			last.Reason = "unknown pane"
+			if !sleepUntilReady(deadline) {
+				return last, launchFailed(last)
+			}
+			continue
+		}
+		last.TabID, last.TerminalID = found.TabID, found.TerminalID
+		body, _ := PaneRead(paneID, 20)
+		if LoginOrAuthScreen(found.TerminalTitle, body) {
+			last.State = LaunchFailed
+			last.Reason = "pane is at a login or authentication screen"
+			return last, launchFailed(last)
+		}
+		cwd := strings.TrimSpace(found.ForegroundCwd)
+		if cwd == "" {
+			cwd = strings.TrimSpace(found.Cwd)
+		}
+		processes, processErr := PaneProcessInfo(paneID)
+		if processErr != nil {
+			if errors.Is(processErr, ErrPaneNotFound) {
+				last.State = LaunchFailed
+				last.Reason = "dead pane: exact pane disappeared"
+				if !sleepUntilReady(deadline) {
+					return last, launchFailed(last)
+				}
+				continue
+			}
+			last.Reason = fmt.Sprintf("pane process inventory unavailable: %v", processErr)
+		} else if !hasReadableShell(processes) {
+			last.State = LaunchFailed
+			last.Reason = "dead pane: no readable shell"
+		} else if cwd == "" {
+			last.State = LaunchFailed
+			last.Reason = "pane cwd is not readable"
+		} else {
+			last.State = LaunchReady
+			last.Cwd = cwd
+			last.Reason = "exact pane has readable shell and cwd"
+			return last, nil
+		}
+		if !sleepUntilReady(deadline) {
+			if last.State == "" {
+				last.State = LaunchFailed
+			}
+			return last, launchFailed(last)
+		}
+	}
+}
+
+func sleepUntilReady(deadline time.Time) bool {
+	if !time.Now().Before(deadline) {
+		return false
+	}
+	time.Sleep(250 * time.Millisecond)
+	return true
+}
+
+// CompensateExactTab closes the exact launch-owned tab with generation-safe
+// compare-and-close. Public TabClose stays refused. When Herdr has not yet
+// published a generation for a tab we just created, the exact tab id is
+// closed and absence is read back.
+func CompensateExactTab(req CloseRequest) error {
+	if strings.TrimSpace(req.TabID) == "" {
+		return &CloseUnavailableError{Reason: "exact tab id is required"}
+	}
+	if strings.TrimSpace(req.Nonce) == "" {
+		req.Nonce = "launch-fail-" + req.TabID
+	}
+	if req.Generation == "" && req.WorkspaceID != "" {
+		if tabs, err := TabList(req.WorkspaceID); err == nil {
+			for _, tab := range tabs {
+				if tab.TabID == req.TabID && strings.TrimSpace(tab.Generation) != "" {
+					req.Generation = strings.TrimSpace(tab.Generation)
+					break
+				}
+			}
+		}
+	}
+	if req.Generation != "" {
+		if strings.TrimSpace(req.WorkspaceID) == "" {
+			return &CloseUnavailableError{TabID: req.TabID, Reason: "workspace_id is required"}
+		}
+		return TabCloseCAS(req)
+	}
+	closeErr := tabCloseRaw(req.TabID)
+	if req.WorkspaceID == "" {
+		return closeErr
+	}
+	tabs, err := TabList(req.WorkspaceID)
+	if err != nil {
+		if closeErr != nil {
+			return fmt.Errorf("compensate exact tab %s: %w (absence readback: %v)", req.TabID, closeErr, err)
+		}
+		return fmt.Errorf("compensate exact tab %s: absence readback: %w", req.TabID, err)
+	}
+	for _, tab := range tabs {
+		if tab.TabID == req.TabID {
+			if closeErr != nil {
+				return closeErr
+			}
+			return fmt.Errorf("compensate exact tab %s: still present after close", req.TabID)
+		}
+	}
+	return nil
+}
+
+func hasReadableShell(processes []PaneProcess) bool {
+	for _, process := range processes {
+		name := strings.ToLower(strings.TrimSpace(process.Name))
+		switch name {
+		case "zsh", "bash", "sh", "fish", "-zsh", "-bash", "-sh", "-fish":
+			return true
+		}
+	}
+	return false
 }
 
 func hasForegroundAgentProcess(processes []PaneProcess) bool {

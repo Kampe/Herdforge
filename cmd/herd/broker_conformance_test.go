@@ -504,7 +504,7 @@ func TestBrokerConformance_AllProviders(t *testing.T) {
 
 	// Supersession on the durable bus: REJECTED (posted after any earlier
 	// APPROVED for the same candidate) is the effective verdict.
-	mb := mail.NewMailbox(filepath.Join(root, mail.DefaultMailFile))
+	mb := mail.NewMailbox(mail.CallbackMailPath(root))
 	eff, found, err := mb.EffectiveVerdict("herdforge", "FAC-145", "cafe1234beef")
 	if err != nil || !found {
 		t.Fatalf("verdict record must exist for readback-capable adapters: found=%v err=%v", found, err)

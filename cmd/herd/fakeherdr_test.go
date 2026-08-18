@@ -58,6 +58,7 @@ case "$1 $2" in
     printf '{"result":{"tab":{"tab_id":"fakeT1","label":"%s"},"root_pane":{"pane_id":"fakeP1","tab_id":"fakeT1","terminal_id":"fakeTERM1"}}}\n' "$label"
     ;;
   "tab close") : > "$STATE"; printf '{"result":{"closed":true}}\n' ;;
+  "tab compare-close") : > "$STATE"; printf '{"result":{"receipt":{"outcome":"closed","resulting_absence":true}}}\n' ;;
   "agent start") printf '{"result":{"started":true}}\n' ;;
   "agent prompt") printf '{"result":{"delivered":true}}\n' ;;
   "agent list")
@@ -66,6 +67,27 @@ case "$1 $2" in
       printf '{"result":{"agents":[{"tab_id":"%s","pane_id":"%s","terminal_id":"%s","workspace_id":"wFAKE","cwd":"%s","foreground_cwd":"%s","agent_status":"idle","revision":1,"focused":false}],"type":"agents"}}\n' "$t" "$p" "$term" "$cwd" "$cwd"
     else
       printf '{"result":{"agents":[],"type":"agents"}}\n'
+    fi
+    ;;
+  "pane list")
+    if [ "${HERD_FAKE_PANE_MODE:-}" = "unknown" ]; then
+      printf '{"result":{"panes":[]}}\n'
+    elif [ -s "$STATE" ]; then
+      IFS='|' read -r t p term cwd < "$STATE"
+      title="${HERD_FAKE_PANE_TITLE:-}"
+      printf '{"result":{"panes":[{"pane_id":"%s","tab_id":"%s","terminal_id":"%s","cwd":"%s","foreground_cwd":"%s","terminal_title":"%s"}]}}\n' "$p" "$t" "$term" "$cwd" "$cwd" "$title"
+    else
+      printf '{"result":{"panes":[]}}\n'
+    fi
+    ;;
+  "pane read")
+    printf '{"result":{"text":"%s"}}\n' "${HERD_FAKE_PANE_BODY:-ready}"
+    ;;
+  "pane process-info")
+    if [ "${HERD_FAKE_PANE_MODE:-}" = "dead" ]; then
+      printf '{"result":{"process_info":{"foreground_processes":[]}}}\n'
+    else
+      printf '{"result":{"process_info":{"foreground_processes":[{"pid":1,"name":"zsh"}]}}}\n'
     fi
     ;;
   "workspace list") printf '{"result":{"workspaces":[{"workspace_id":"wFAKE","name":"fake"}]}}\n' ;;
@@ -132,6 +154,11 @@ func hermeticHerdrEnv(bin, logPath string) []string {
 		herdr.NoLiveEnv + "=1",
 		"HERD_FAKE_LOG=" + logPath,
 		"HERD_FAKE_STATE=" + fakeStatePath(logPath),
+		// Pin the fixture workspace so an operator shell's HERD_WORKSPACE
+		// (or HERDR_WORKSPACE_ID) cannot trip RequireWorkspace's
+		// cross-workspace fence against the protocol fake's wFAKE id.
+		"HERD_WORKSPACE=wFAKE",
+		"HERDR_WORKSPACE_ID=wFAKE",
 	}
 }
 

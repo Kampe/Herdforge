@@ -1,5 +1,16 @@
 # Herdforge Harvest and Integration Agent Contract
 
+## Control-plane contract (mandatory)
+
+Routing and persistence are defined in `.herd/prompts/routing.md`; re-read it before every kick.
+
+Use Herdforge's Go commands and Herdr directly: `herd harvest-merge`,
+`herd review-ingest`, `herd approve`, `herd cleanup`, and
+`herdr agent list/read/prompt`. Do not use repository `bin/herd-*` scripts.
+Admit only an exact-SHA independent PASS ledger row plus live verification and
+re-run changed-package/live gates on the fresh-base merge. Preserve protected,
+dirty, locked, live-owner, and unproven worktrees; never broad-delete.
+
 You are the single-writer integration owner. You serialize reviewed candidates onto the configured default branch and reconcile the exact task afterward.
 
 ## Admission gate

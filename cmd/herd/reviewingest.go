@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/Kampe/Herdforge/pkg/harvestmerge"
+	"github.com/Kampe/Herdforge/pkg/mergeadmit"
 	"github.com/Kampe/Herdforge/pkg/reviewingest"
 	"github.com/Kampe/Herdforge/pkg/reviewledger"
 	hsync "github.com/Kampe/Herdforge/pkg/sync"
@@ -95,7 +96,20 @@ func runReviewIngest() {
 			fmt.Fprintf(os.Stderr, "herd review-ingest: retain artifact FAILED for %s: %v\n", filepath.Base(f), retainErr)
 			os.Exit(1)
 		}
-		enqueued, err := ledger.Verdict(reviewledger.VerdictOpts{
+		// A reviewer artifact is the durable handoff from the supervisor. Make
+		// its exact-SHA admission record idempotently before the verdict row so
+		// harvest-merge can prove independent provenance even when the ephemeral
+		// launch pane has already been cleaned up.
+		gate := "independent"
+		if strings.EqualFold(a.ReviewerFamily, "mechanical") || strings.EqualFold(a.BuilderFamily, "mechanical") {
+			gate = "mechanical"
+		}
+		recordOpts := reviewledger.RecordOpts{
+			SHA: a.SHA, Branch: a.Branch, BuilderFamily: a.BuilderFamily,
+			ReviewerFamily: a.ReviewerFamily, Reviewer: a.Reviewer,
+			Artifact: retained, Gate: gate, Task: a.Branch,
+		}
+		verdictOpts := reviewledger.VerdictOpts{
 			SHA:            a.SHA,
 			Reviewer:       a.Reviewer,
 			Verdict:        reviewledger.Verdict(a.Verdict),
@@ -104,11 +118,10 @@ func runReviewIngest() {
 			BuilderFamily:  a.BuilderFamily,
 			Branch:         a.Branch,
 			CandidateSHA:   a.SHA,
-		})
+		}
+		enqueued, err := ledger.Ingest(reviewledger.IngestOpts{Record: recordOpts, Verdict: verdictOpts})
 		if err != nil {
-			// A ledger write that fails must not be reported as admitted:
-			// the verdict does not exist until it is durable.
-			fmt.Fprintf(os.Stderr, "herd review-ingest: ledger write FAILED for %s: %v\n", filepath.Base(f), err)
+			fmt.Fprintf(os.Stderr, "herd review-ingest: admission/verdict write FAILED for %s: %v\n", filepath.Base(f), err)
 			os.Exit(1)
 		}
 		fmt.Printf("ADMITTED %s verdict=%s reviewer=%s sha=%s enqueued=%v\n",
@@ -200,6 +213,13 @@ func retainVerdictArtifact(root, source, sha, reviewer string) (string, error) {
 // FAC-213: --verify-landed runs the single sound "did this merge?" check
 // (LandedProof) on the lane's worktree instead of cherry-picking. The
 // coordinator uses it after a PR merge to confirm the work is on origin/main.
+//
+// FAC-379: when LandedProof succeeds for an exact reviewed candidate whose
+// equivalent patch already sits on origin/main under a different merge SHA,
+// verify-landed also mints/reconciles the sealed task-bound completion
+// receipt approve/board-done consume — the same receipt a successful
+// merge-complete would write. Binding comes from a recorded merge-admission
+// (--ref) or the explicit merge-admit fields.
 func runHarvestMerge() {
 	fs := flag.NewFlagSet("harvest-merge", flag.ExitOnError)
 	branch := fs.String("branch", "", "Lane branch to harvest (required)")
@@ -216,7 +236,18 @@ func runHarvestMerge() {
 	allowMarkers := fs.Bool("allow-markers", false,
 		"Proceed despite conflict markers in the harvested diff (for files whose CONTENT is marker fixtures)")
 	verifyLanded := fs.Bool("verify-landed", false,
-		"Check whether the lane's work is on origin/main (rebase + empty diff). Use after a PR merge.")
+		"Check whether the lane's work is on origin/main (rebase + empty diff) and mint/reconcile the sealed completion receipt.")
+	verifyRef := fs.String("ref", "", "Task ref for --verify-landed receipt reconcile (loads merge-admission or explicit binding flags)")
+	verifyTaskID := fs.String("task-id", "", "Provider task id (required with --verify-landed when no merge-admission is on disk)")
+	verifyCandidate := fs.String("candidate", "", "Exact reviewed candidate sha (defaults to branch tip before LandedProof)")
+	verifyBaseSHA := fs.String("base-sha", "", "Base sha the candidate was reviewed against")
+	verifyLease := fs.String("lease", "", "Claim lease token bound into the ledger verdict")
+	verifyLeaseGen := fs.Int64("lease-generation", 0, "Claim lease generation bound into the completion receipt")
+	verifyPatchID := fs.String("patch-id", "", "Patch identity bound into the ledger verdict")
+	verifyAcceptance := fs.String("acceptance-digest", "", "Acceptance digest bound at review time")
+	verifyAuthorFamily := fs.String("author-family", "", "Builder model family")
+	verifyAuthorIdentity := fs.String("author-identity", "", "Builder session identity")
+	verifyProviderRev := fs.String("provider-revision", "", "Board card revision the reviewer bound")
 
 	// Pull the leading positional out BEFORE flag parsing: Go's flag package
 	// stops at the first non-flag argument, so `harvest-merge <lane> --branch x`
@@ -230,25 +261,24 @@ func runHarvestMerge() {
 
 	if lane == "" || *branch == "" {
 		fmt.Fprintln(os.Stderr, "usage: herd harvest-merge <lane> --branch <branch> --title <t> [--verdict PASS]")
-		fmt.Fprintln(os.Stderr, "       herd harvest-merge <lane> --branch <branch> --verify-landed")
+		fmt.Fprintln(os.Stderr, "       herd harvest-merge <lane> --branch <branch> --verify-landed --ref <FAC-x> [...]")
 		os.Exit(2)
 	}
 
-	// FAC-213: --verify-landed is the post-merge "did this merge?" check. It
-	// finds the worktree checked out to --branch and runs LandedProof on it.
-	// This replaces the three broken checks (grep, pre-rebase tip ancestry,
-	// stale remote branch comparison) with the single sound implementation.
+	// FAC-213 + FAC-379: --verify-landed is the post-merge "did this merge?"
+	// check, then the sealed completion-receipt reconcile for approve.
 	if *verifyLanded {
-		wtDir := worktreeForBranch(*branch)
-		if wtDir == "" {
-			fmt.Fprintf(os.Stderr, "herd harvest-merge: no worktree found for branch %s\n", *branch)
+		binding := verifyLandedBinding{
+			Ref: *verifyRef, TaskID: *verifyTaskID, Candidate: *verifyCandidate,
+			BaseSHA: *verifyBaseSHA, Lease: *verifyLease, LeaseGeneration: *verifyLeaseGen,
+			PatchID: *verifyPatchID, AcceptanceDigest: *verifyAcceptance,
+			AuthorFamily: *verifyAuthorFamily, AuthorIdentity: *verifyAuthorIdentity,
+			ProviderRevision: *verifyProviderRev,
+		}
+		if err := runHarvestVerifyLanded(*branch, binding); err != nil {
+			fmt.Fprintf(os.Stderr, "herd harvest-merge: %v\n", err)
 			os.Exit(1)
 		}
-		if err := hsync.LandedProof(wtDir); err != nil {
-			fmt.Fprintf(os.Stderr, "herd harvest-merge: NOT LANDED — %v\n", err)
-			os.Exit(1)
-		}
-		fmt.Printf("herd harvest-merge: LANDED — %s worktree is on origin/main (rebase + empty diff)\n", *branch)
 		return
 	}
 
@@ -452,6 +482,117 @@ func min(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// verifyLandedBinding carries the task-bound fields FAC-379 needs to mint the
+// sealed completion receipt after LandedProof. Prefer a recorded merge-admission
+// for --ref; otherwise every field must be supplied explicitly.
+type verifyLandedBinding struct {
+	Ref, TaskID, Candidate, BaseSHA  string
+	Lease, PatchID, AcceptanceDigest string
+	AuthorFamily, AuthorIdentity     string
+	ProviderRevision                 string
+	LeaseGeneration                  int64
+}
+
+// runHarvestVerifyLanded proves the branch content is on origin/main, then
+// mints/reconciles the sealed completion receipt through mergeadmit so
+// approve/board-done have the same closing authority as a normal harvest.
+func runHarvestVerifyLanded(branch string, binding verifyLandedBinding) error {
+	wtDir := worktreeForBranch(branch)
+	if wtDir == "" {
+		return fmt.Errorf("no worktree found for branch %s", branch)
+	}
+
+	// Capture the reviewed tip BEFORE LandedProof rebases the worktree onto
+	// origin/main (after which HEAD is no longer the candidate object).
+	candidate := strings.TrimSpace(binding.Candidate)
+	if candidate == "" {
+		out, err := exec.Command("git", "-C", wtDir, "rev-parse", "HEAD").Output()
+		if err != nil {
+			return fmt.Errorf("resolve candidate tip on %s: %w", branch, err)
+		}
+		candidate = strings.TrimSpace(string(out))
+	}
+	if candidate == "" {
+		return fmt.Errorf("candidate sha is required for --verify-landed receipt reconcile")
+	}
+
+	if err := hsync.LandedProof(wtDir); err != nil {
+		return fmt.Errorf("NOT LANDED — %v", err)
+	}
+	fmt.Printf("herd harvest-merge: LANDED — %s worktree is on origin/main (rebase + empty diff)\n", branch)
+
+	req, err := resolveVerifyLandedRequest(binding, candidate)
+	if err != nil {
+		return err
+	}
+
+	gate, err := buildMergeGate(req.Ref, req.TaskID, 0)
+	if err != nil {
+		return fmt.Errorf("receipt reconcile: %w", err)
+	}
+	receipt, err := gate.ReconcileLanded(req)
+	if err != nil {
+		return fmt.Errorf("receipt reconcile: %w", err)
+	}
+	fmt.Printf("herd harvest-merge: RECEIPT — %s candidate %s landed as %s\n  receipt %s at %s\n",
+		receipt.TaskRef, shortSHA12(receipt.CandidateSHA), shortSHA12(receipt.MergeSHA),
+		shortSHA12(receipt.Digest), hsync.ReceiptPath(".", receipt.TaskRef))
+	fmt.Println("  close the card with: herd approve " + receipt.TaskRef)
+	return nil
+}
+
+// resolveVerifyLandedRequest prefers a durable merge-admission record for the
+// ref (the same handoff merge-complete consumes). When none exists it requires
+// the full explicit binding — never invents lease, patch, or family provenance.
+func resolveVerifyLandedRequest(binding verifyLandedBinding, candidate string) (mergeadmit.Request, error) {
+	ref := strings.TrimSpace(binding.Ref)
+	if ref == "" {
+		return mergeadmit.Request{}, fmt.Errorf("NOT RECONCILED — --ref is required to mint the sealed completion receipt\n" +
+			"durable action: re-run with --verify-landed --ref <FAC-x> after `herd merge-admit`, or supply the full binding flags\n" +
+			"(--task-id --base-sha --lease --lease-generation --patch-id --acceptance-digest --author-family --author-identity --provider-revision)")
+	}
+
+	if rec, err := readAdmissionRecord(".", ref); err == nil {
+		req := rec.Request
+		if strings.TrimSpace(req.CandidateSHA) == "" {
+			req.CandidateSHA = candidate
+		}
+		if strings.TrimSpace(binding.Candidate) != "" {
+			req.CandidateSHA = strings.TrimSpace(binding.Candidate)
+		}
+		return req, nil
+	}
+
+	req := mergeadmit.Request{
+		Ref: ref, TaskID: binding.TaskID, ProviderRevision: binding.ProviderRevision,
+		AcceptanceDigest: binding.AcceptanceDigest, CandidateSHA: candidate,
+		BaseSHA: binding.BaseSHA, Lease: binding.Lease, LeaseGeneration: binding.LeaseGeneration,
+		PatchURL: binding.PatchID, AuthorFamily: binding.AuthorFamily,
+		AuthorIdentity: binding.AuthorIdentity, Mode: mergeadmit.ModeRebase,
+	}
+	for _, f := range []struct{ name, val string }{
+		{"task-id", req.TaskID},
+		{"base-sha", req.BaseSHA},
+		{"lease", req.Lease},
+		{"patch-id", req.PatchURL},
+		{"acceptance-digest", req.AcceptanceDigest},
+		{"author-family", req.AuthorFamily},
+		{"author-identity", req.AuthorIdentity},
+		{"provider-revision", req.ProviderRevision},
+	} {
+		if strings.TrimSpace(f.val) == "" {
+			return mergeadmit.Request{}, fmt.Errorf("NOT RECONCILED — no merge-admission at %s and --%s is missing\n"+
+				"durable action: run `herd merge-admit --ref %s ...` before merge, or re-run --verify-landed with the full binding flags",
+				admissionRecordPath(".", ref), f.name, ref)
+		}
+	}
+	if req.LeaseGeneration <= 0 {
+		return mergeadmit.Request{}, fmt.Errorf("NOT RECONCILED — no merge-admission at %s and --lease-generation is missing/invalid\n"+
+			"durable action: re-run --verify-landed with --lease-generation <n>", admissionRecordPath(".", ref))
+	}
+	return req, nil
 }
 
 // worktreeForBranch finds the worktree directory whose checked-out branch

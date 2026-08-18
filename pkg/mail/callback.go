@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 )
 
@@ -17,10 +18,28 @@ import (
 // CoordinatorInbox is the recipient every agent callback is addressed to.
 const CoordinatorInbox = "coordinator"
 
-// DefaultMailFile is the conventional repo-relative mailbox path production
-// callers share (FAC-145). One file, one bus: producers (herd verify,
-// approve) and the forge-loop consumer must agree on it.
+// DefaultMailFile is the legacy repo-relative mailbox used by ordinary
+// explicitly configured mail traffic.
 const DefaultMailFile = ".herd/mail.jsonl"
+
+// DefaultCallbackMailFile is the canonical repo-relative callback mailbox.
+// Callback producers and candidate/review consumers must share this path;
+// ordinary control traffic may continue using DefaultMailFile for compatibility.
+const DefaultCallbackMailFile = ".herd/control-mail.jsonl"
+
+// CallbackMailPath resolves the one configured callback bus for a repository.
+// HERD_MAIL_FILE is intentionally shared by every callback producer and
+// consumer, while the default preserves the existing shot/forge callback bus.
+func CallbackMailPath(root string) string {
+	path := strings.TrimSpace(os.Getenv("HERD_MAIL_FILE"))
+	if path == "" {
+		path = DefaultCallbackMailFile
+	}
+	if filepath.IsAbs(path) || root == "" {
+		return filepath.Clean(path)
+	}
+	return filepath.Join(root, path)
+}
 
 // CallbackKind is what an agent is reporting.
 type CallbackKind string

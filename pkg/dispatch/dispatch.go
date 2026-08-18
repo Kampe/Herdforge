@@ -421,10 +421,9 @@ func (d *Dispatcher) reviewSupervisorName() string {
 	if d.Config == nil {
 		return "review-supervisor"
 	}
-	for _, lane := range d.Config.Lanes {
-		switch strings.ToLower(strings.TrimSpace(lane.Role)) {
-		case "review-supervisor", "review_harvest_supervisor", "harvest-supervisor", "reviewer", "harvest":
-			if strings.TrimSpace(lane.Name) != "" {
+	for _, role := range []string{"review-supervisor", "review_harvest_supervisor", "harvest-supervisor", "reviewer", "harvest"} {
+		for _, lane := range d.Config.Lanes {
+			if strings.ToLower(strings.TrimSpace(lane.Role)) == role && strings.TrimSpace(lane.Name) != "" {
 				return "forge-" + strings.TrimSpace(lane.Name)
 			}
 		}

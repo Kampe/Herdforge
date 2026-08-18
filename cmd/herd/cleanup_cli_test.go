@@ -22,6 +22,7 @@ func cleanupFakeHerdr(t *testing.T, agentListJSON string) string {
 	script := `#!/bin/sh
 case "$1 $2" in
   "agent list") printf '%s\n' '` + agentListJSON + `' ;;
+  "workspace list") printf '{"result":{"workspaces":[{"workspace_id":"w","label":"other"}]}}\n' ;;
   *) printf '{"result":{}}\n' ;;
 esac
 exit 0
@@ -37,6 +38,7 @@ func cleanupEnv(fakeBin string) []string {
 	return []string{
 		herdr.BinaryEnv + "=" + fakeBin,
 		herdr.NoLiveEnv + "=1",
+		"HERD_WORKSPACE=w",
 		"PATH=/usr/bin:/bin",
 	}
 }

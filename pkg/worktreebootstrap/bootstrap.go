@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -223,11 +224,49 @@ func repair(root string, receipt Receipt) error {
 		if err != nil {
 			return fmt.Errorf("bootstrap receipt artifact invalid: %w", err)
 		}
-		if err := os.RemoveAll(path); err != nil {
+		if err := removeOwnedTree(path); err != nil {
 			return fmt.Errorf("repair bootstrap artifact: %w", err)
 		}
 	}
 	return nil
+}
+
+// removeOwnedTree makes only the declared artifact root removable. WalkDir
+// does not follow symlinks, so a cache artifact cannot cause chmod to reach
+// outside the worktree or the authenticated artifact root.
+func removeOwnedTree(path string) error {
+	if _, err := os.Lstat(path); errors.Is(err, os.ErrNotExist) {
+		return nil
+	} else if err != nil {
+		return err
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		return err
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("bootstrap artifact is a symlink: %q", path)
+	}
+	if err := filepath.WalkDir(path, func(current string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if entry.Type()&os.ModeSymlink != 0 {
+			return fs.SkipDir
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		mode := info.Mode().Perm() | 0o200
+		if entry.IsDir() {
+			mode |= 0o100
+		}
+		return os.Chmod(current, mode)
+	}); err != nil {
+		return err
+	}
+	return os.RemoveAll(path)
 }
 
 func safeChild(root, rel string) (string, error) {

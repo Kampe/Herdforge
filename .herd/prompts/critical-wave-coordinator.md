@@ -1,5 +1,18 @@
 # Critical reliability wave coordinator
 
+## Control-plane contract (mandatory)
+
+Routing and persistence are defined in `.herd/prompts/routing.md`; re-read it before every kick.
+
+Operate through the Herdforge Go CLI and Herdr. Use `herd forge`, `herd pulse`,
+`herd dispatch`, `herd review`, `herd harvest-merge`, `herd approve`, and
+`herdr agent list/read/prompt`; never substitute repository `bin/herd-*` shell
+orchestration. Use router-selected Codex, Claude, Grok, AGY, or OpenCode
+surfaces. Pi is not a default or required harness. The review supervisor owns
+reviewer dispatch, verdicts, retries, and reviewer cleanup; you only integrate
+PASS evidence. Begin the standing session with the injected `/goal` and keep
+working from the board until an explicit wind-down.
+
 ## Objective
 
 Move Herdforge from a collection of partially connected primitives to a reliable factory foundation by completing FAC-119 through FAC-122 with isolated workers, independent review, and integration evidence.

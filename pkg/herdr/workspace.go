@@ -92,6 +92,16 @@ func ResolveWorkspaceWithConfig(repoRoot string, cfg *config.Config) string {
 // dispatch must not silently adopt a soft config override without env/list proof.
 func RequireWorkspace(repoRoot string) (string, error) {
 	envWS := strings.TrimSpace(os.Getenv("HERD_WORKSPACE"))
+	registeredWS, configErr := registeredWorkspace(repoRoot)
+	if configErr != nil {
+		return "", configErr
+	}
+	if registeredWS != "" {
+		if envWS != "" && envWS != registeredWS {
+			return "", fmt.Errorf("herdr workspace mismatch for repo %q: HERD_WORKSPACE=%q, registered workspace=%q; refusing cross-workspace mutation", filepath.Base(repoRoot), envWS, registeredWS)
+		}
+		return registeredWS, nil
+	}
 
 	abs, err := filepath.Abs(repoRoot)
 	if err != nil {
@@ -118,11 +128,17 @@ func RequireWorkspace(repoRoot string) (string, error) {
 	if envWS != "" {
 		for _, e := range entries {
 			if e.WorkspaceID == envWS {
+				if id, ok := PickWorkspaceStrict(entries, repoName); ok && id != envWS {
+					return "", fmt.Errorf("herdr workspace mismatch for repo %q: HERD_WORKSPACE=%q, registered workspace=%q; refusing cross-workspace mutation", repoName, envWS, id)
+				}
 				return envWS, nil
 			}
 		}
 		hint := ""
 		if id, ok := PickWorkspaceStrict(entries, repoName); ok {
+			if id != envWS {
+				return "", fmt.Errorf("herdr workspace mismatch for repo %q: HERD_WORKSPACE=%q, registered workspace=%q; refusing cross-workspace mutation", repoName, envWS, id)
+			}
 			hint = fmt.Sprintf("; this repo labels to %s", id)
 		}
 		fmt.Fprintf(os.Stderr, "herdr: WARN HERD_WORKSPACE=%s is not in the live workspace list%s — the fleet will look empty (unset the stale export or correct it)\n", envWS, hint)
@@ -133,6 +149,31 @@ func RequireWorkspace(repoRoot string) (string, error) {
 		return "", fmt.Errorf("herdr workspace unknown for repo %q: set HERD_WORKSPACE or label a workspace; refusing hardcoded fallback", repoName)
 	}
 	return id, nil
+}
+
+// registeredWorkspace reads the repository-local Herdr binding. An explicit
+// environment value is only an override when it names this repository's
+// registered workspace; otherwise it is ambient state from another checkout.
+// A missing config or an empty binding preserves the legacy live-list
+// resolution for repositories that predate the registration field.
+func registeredWorkspace(repoRoot string) (string, error) {
+	root, err := filepath.Abs(repoRoot)
+	if err != nil {
+		return "", fmt.Errorf("herdr workspace: resolve repository root: %w", err)
+	}
+	cfg, err := config.LoadConfig(filepath.Join(root, ".herd", "herd.yaml"))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", nil
+		}
+		// Worktree callers may provide a root without a Herdforge config. Keep
+		// resolution compatible, but never hide a malformed existing config.
+		if _, statErr := os.Stat(filepath.Join(root, ".herd", "herd.yaml")); statErr == nil {
+			return "", fmt.Errorf("herdr workspace: load repository binding: %w", err)
+		}
+		return "", nil
+	}
+	return strings.TrimSpace(cfg.Fleet.HerdrWorkspace), nil
 }
 
 // PickWorkspace is the pure selection: label match beats focused beats first.

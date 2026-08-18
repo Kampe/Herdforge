@@ -131,7 +131,11 @@ func CompileClaudeArgs(argv []string) ([]string, error) {
 	out := make([]string, 0, len(stripped)+8)
 	out = append(out, stripped[0])
 	out = append(out,
-		"--mcp-config", "{}",
+		// Claude validates this as a full MCP config object even when strict
+		// mode is used. `{}` is rejected by current Claude releases because
+		// mcpServers must be a record; an empty record preserves the fleet
+		// nested-tool boundary without killing the pane at startup.
+		"--mcp-config", `{"mcpServers":{}}`,
 		"--strict-mcp-config",
 		"--disable-slash-commands",
 		"--disallowed-tools", ClaudeToolAgent, ClaudeToolTask, ClaudeToolSearch,

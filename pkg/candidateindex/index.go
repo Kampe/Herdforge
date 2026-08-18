@@ -124,7 +124,7 @@ func New(opts IndexOptions) *CandidateIndex {
 		opts.Now = time.Now
 	}
 	if opts.MailPath == "" && opts.RepoRoot != "" {
-		opts.MailPath = filepath.Join(opts.RepoRoot, mail.DefaultMailFile)
+		opts.MailPath = mail.CallbackMailPath(opts.RepoRoot)
 	}
 	if opts.LedgerPath == "" && opts.RepoRoot != "" {
 		opts.LedgerPath = filepath.Join(opts.RepoRoot, ".herd", "review", "ledger.jsonl")

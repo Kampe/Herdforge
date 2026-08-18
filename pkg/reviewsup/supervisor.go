@@ -28,10 +28,12 @@ const (
 	EventBuilderCallback  EventType = "builder_callback"
 	EventBuilderAck       EventType = "builder_ack"
 	EventVerdictRetained  EventType = "verdict_retained"
+	EventIngested         EventType = "ingested"
 	EventAuthorNotified   EventType = "author_notified"
 	EventCleanupCandidate EventType = "cleanup_candidate"
 	EventClosed           EventType = "closed"
 	EventRefutation       EventType = "refutation"
+	EventLaunchFailed     EventType = "launch_failed"
 )
 
 type Verdict string
@@ -132,12 +134,31 @@ type Candidate struct {
 	// ReceiptDigest is the FAC-122 verification receipt digest that
 	// admitted this candidate. LaunchReview re-checks it; empty digest
 	// never enters review.
-	ReceiptDigest string
+	ReceiptDigest    string
+	VerdictRetained  bool
+	Ingested         bool
+	HarvestReady     bool
+	CleanupCandidate bool
 }
 
 func queueState(c *Candidate) QueueState {
 	if c == nil {
 		return QueueClosed
+	}
+	if c.State == StateEvicted {
+		return QueueClosed
+	}
+	if c.CleanupCandidate {
+		return QueueCleanupCandidate
+	}
+	if c.HarvestReady {
+		return QueueHarvestReady
+	}
+	if c.Ingested {
+		return QueueIngested
+	}
+	if c.VerdictRetained {
+		return QueueVerdictRetained
 	}
 	switch c.State {
 	case StatePending:
@@ -602,6 +623,44 @@ func (sv *ReviewSupervisor) LaunchReview(candidateSHA, reviewer, reviewModel str
 	return nil
 }
 
+// CompensateLaunch reverts a reviewing candidate after a bounded native
+// launch failure. The card must not remain in-review without a live reviewer.
+func (sv *ReviewSupervisor) CompensateLaunch(candidateSHA, reason string) error {
+	sv.mu.Lock()
+	defer sv.mu.Unlock()
+
+	cand, ok := sv.cands[candidateSHA]
+	if !ok {
+		return fmt.Errorf("reviewsup: unknown candidate %s", candidateSHA)
+	}
+	if cand.State != StateReviewing {
+		return fmt.Errorf("reviewsup: candidate %s is not reviewing (state=%s)", candidateSHA, cand.State)
+	}
+	if strings.TrimSpace(reason) == "" {
+		reason = "LAUNCH_FAILED"
+	}
+	prevReviewer := cand.Reviewer
+	prevFamily := cand.ReviewFamily
+	cand.State = StatePending
+	cand.Reviewer = ""
+	cand.ReviewFamily = ""
+	cand.UpdatedAt = sv.now()
+	if err := sv.appendRow(&Row{
+		Event:    string(EventLaunchFailed),
+		SHA:      candidateSHA,
+		Reviewer: prevReviewer,
+		Reason:   reason,
+		Attempts: cand.Attempts,
+	}); err != nil {
+		cand.State = StateReviewing
+		cand.Reviewer = prevReviewer
+		cand.ReviewFamily = prevFamily
+		cand.UpdatedAt = sv.now()
+		return fmt.Errorf("reviewsup: append launch_failed row: %w", err)
+	}
+	return nil
+}
+
 type ReviewVerdict struct {
 	SHA      string
 	Reviewer string
@@ -686,10 +745,17 @@ func (sv *ReviewSupervisor) SubmitVerdict(v ReviewVerdict) (newState CandidateSt
 			cand.UpdatedAt = sv.now()
 			return "", fmt.Errorf("reviewsup: append harvest row: %w", err)
 		}
+		cand.VerdictRetained = true
+		cand.Ingested = true
+		cand.HarvestReady = true
+		if err := sv.appendRow(&Row{Event: string(EventIngested), SHA: v.SHA, Reviewer: v.Reviewer, ReceiptDigest: cand.ReceiptDigest}); err != nil {
+			return "", fmt.Errorf("reviewsup: retain ingested event: %w", err)
+		}
 		if err := sv.appendRow(&Row{Event: string(EventCleanupCandidate), SHA: v.SHA, Reviewer: v.Reviewer, Reason: "verdict retained; coordinator may close exact tab after harvest"}); err != nil {
 			return "", fmt.Errorf("reviewsup: append cleanup candidate: %w", err)
 		}
 		cand.State = StateHarvested
+		cand.CleanupCandidate = true
 
 	case VerdictFAIL:
 		effective := VerdictFAIL
@@ -910,6 +976,33 @@ func (sv *ReviewSupervisor) MarkHarvested(sha string) error {
 	return nil
 }
 
+// MarkClosed records the final coordinator-owned cleanup transition after the
+// exact Herdr reviewer tab and its worktree have been closed. Reviewers never
+// close their own panes; this method makes that handoff durable and queryable.
+func (sv *ReviewSupervisor) MarkClosed(sha string) error {
+	sv.mu.Lock()
+	defer sv.mu.Unlock()
+	cand, ok := sv.cands[sha]
+	if !ok {
+		return fmt.Errorf("reviewsup: unknown candidate %s", sha)
+	}
+	// Reconstruct replays the durable verdict before it can observe the queue
+	// row's harvested bit, so a retained PASS may temporarily have StatePass.
+	// The cleanup-candidate event is the authoritative admission proof across a
+	// restart; requiring StateHarvested here made a valid pane impossible to
+	// close after supervisor recovery.
+	if cand.State != StateHarvested && !(cand.State == StatePass && cand.CleanupCandidate) && cand.State != StateEvicted {
+		return fmt.Errorf("reviewsup: candidate %s is not cleanup-ready (state=%s)", sha, cand.State)
+	}
+	if err := sv.appendRow(&Row{Event: string(EventClosed), SHA: sha, Reason: "coordinator confirmed exact-tab and worktree cleanup"}); err != nil {
+		return fmt.Errorf("reviewsup: append closed event: %w", err)
+	}
+	cand.State = StateEvicted
+	cand.CleanupCandidate = false
+	cand.UpdatedAt = sv.now()
+	return nil
+}
+
 // BuilderHandoff is a durable repair packet returned to the owning builder
 // after a FAIL or BLOCKED verdict.
 type BuilderHandoff struct {
@@ -1109,6 +1202,14 @@ func (sv *ReviewSupervisor) Reconstruct() (int, error) {
 				}
 			}
 
+		case EventLaunchFailed:
+			if cand, ok := sv.cands[r.SHA]; ok {
+				cand.State = StatePending
+				cand.Reviewer = ""
+				cand.ReviewFamily = ""
+				cand.VerdictReason = r.Reason
+			}
+
 		case EventVerdict:
 			if cand, ok := sv.cands[r.SHA]; ok {
 				cand.Verdict = Verdict(r.Verdict)
@@ -1135,6 +1236,29 @@ func (sv *ReviewSupervisor) Reconstruct() (int, error) {
 					cand.State = StateBlocked
 					sv.pendingCount--
 				}
+			}
+
+		case EventVerdictRetained:
+			if cand, ok := sv.cands[r.SHA]; ok {
+				cand.VerdictRetained = true
+				cand.Verdict = Verdict(r.Verdict)
+				cand.VerdictReason = r.Reason
+			}
+
+		case EventIngested:
+			if cand, ok := sv.cands[r.SHA]; ok {
+				cand.Ingested = true
+			}
+
+		case EventCleanupCandidate:
+			if cand, ok := sv.cands[r.SHA]; ok {
+				cand.CleanupCandidate = true
+			}
+
+		case EventClosed:
+			if cand, ok := sv.cands[r.SHA]; ok {
+				cand.State = StateEvicted
+				cand.CleanupCandidate = false
 			}
 
 		case EventSupersede:

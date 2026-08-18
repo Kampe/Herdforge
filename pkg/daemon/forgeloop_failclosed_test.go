@@ -3,11 +3,13 @@ package daemon
 import (
 	"context"
 	"errors"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/Kampe/Herdforge/pkg/provider"
+	hsync "github.com/Kampe/Herdforge/pkg/sync"
 )
 
 // FAC-138: the coordinator must never mistake an unreadable fleet, a failed
@@ -109,6 +111,34 @@ func TestForgeLoop_ActionFailureAffectsExitStatus(t *testing.T) {
 	}
 }
 
+// A refused legacy approval must not strand a newer completion that arrived
+// in the same forge tick. Completion admission runs independently before the
+// approval transition, so the callback can reach review even though the
+// legacy card remains a bounded failure.
+func TestForgeLoop_RefusedApproveDoesNotBlockFreshCompletionAdmission(t *testing.T) {
+	e := forgeEngine(t,
+		inReviewTask("FAC-367", "367", provider.PriorityUrgent),
+		&provider.Task{ID: "359", Ref: "FAC-359", Status: "in-progress", Priority: provider.PriorityHigh,
+			Description: "```herd-deps-v1\n{\"version\":1,\"task_ref\":\"FAC-359\",\"task_id\":\"359\",\"edges\":[]}\n```\n"},
+	)
+	d := &fakeDriver{
+		lanes:     LaneState{Busy: 1, Max: 1},
+		completed: map[string]bool{"FAC-359": true},
+		verified:  map[string]bool{"FAC-359": true},
+		approveErr: func(string) error {
+			return hsync.ErrNoEvidence
+		},
+	}
+
+	err := e.ForgeLoop(context.Background(), d, fastLoop(1))
+	if err == nil || !strings.Contains(err.Error(), "approve FAC-367 failed") {
+		t.Fatalf("legacy approval refusal must remain a bounded failure, got %v", err)
+	}
+	if len(d.actions) != 2 || d.actions[0] != "review:FAC-359" || d.actions[1] != "approve:FAC-367" {
+		t.Fatalf("fresh completion was not admitted before refused approval: %v", d.actions)
+	}
+}
+
 // ...but a transition that later succeeds is resolved, not held against the
 // run. Approve fails on the first attempt and succeeds on the second.
 func TestForgeLoop_SucceededRetryClearsFailure(t *testing.T) {
@@ -127,10 +157,61 @@ func TestForgeLoop_SucceededRetryClearsFailure(t *testing.T) {
 		}}
 
 	if err := e.ForgeLoop(context.Background(), d, fastLoop(2)); err != nil {
-		t.Fatalf("a retried-and-succeeded approve must exit 0: %v", err)
+		t.Fatalf("a retried-and-succeeded approve must exit 0: %v actions=%v logs=%v", err, d.actions, d.logged)
 	}
 	if attempts != 2 {
 		t.Fatalf("want 2 approve attempts, got %d", attempts)
+	}
+}
+
+// FAC-354: a receiptless legacy approval is a durable blocked state, not a
+// reason to invoke the same failing approval every forge tick. A fresh loop
+// (simulated restart) must retain the tombstone, while changed board evidence
+// must make the approval eligible again.
+func TestForgeLoop_LegacyApproveRefusalSuppressesAcrossRestartUntilStateChanges(t *testing.T) {
+	task := &provider.Task{ID: "354", Ref: "FAC-354", Status: "in-review", Priority: provider.PriorityHigh,
+		Description: "legacy candidate state A"}
+	e := forgeEngine(t, task)
+	path := filepath.Join(t.TempDir(), "approve-suppressions.json")
+	attempts := 0
+	newDriver := func() *fakeDriver {
+		return &fakeDriver{lanes: LaneState{Busy: 0, Max: 1}, completed: map[string]bool{}, verified: map[string]bool{},
+			approveErr: func(string) error {
+				attempts++
+				return hsync.ErrNoEvidence
+			}}
+	}
+	first := newDriver()
+	firstErr := e.ForgeLoop(context.Background(), first, ForgeLoopOptions{Interval: time.Millisecond, MaxTicks: 3, ApproveSuppressionPath: path})
+	if firstErr == nil || !strings.Contains(firstErr.Error(), "approve FAC-354 failed") {
+		t.Fatalf("first receiptless refusal must remain blocked, got %v", firstErr)
+	}
+	if attempts != 1 {
+		t.Fatalf("repeated legacy refusal was not suppressed in one run: attempts=%d logs=%v", attempts, first.logged)
+	}
+	if !strings.Contains(strings.Join(first.logged, "\n"), "BLOCKED-legacy") {
+		t.Fatalf("suppression was not visible in loop output: %v", first.logged)
+	}
+
+	second := newDriver()
+	secondErr := e.ForgeLoop(context.Background(), second, ForgeLoopOptions{Interval: time.Millisecond, MaxTicks: 1, ApproveSuppressionPath: path})
+	if secondErr == nil {
+		t.Fatal("persisted receiptless refusal must remain blocked after restart")
+	}
+	if attempts != 1 {
+		t.Fatalf("persisted legacy refusal was retried after restart: attempts=%d", attempts)
+	}
+	retry := newDriver()
+	_ = e.ForgeLoop(context.Background(), retry, ForgeLoopOptions{Interval: time.Millisecond, MaxTicks: 1, ApproveSuppressionPath: path, ApproveRetryRefs: map[string]bool{"FAC-354": true}})
+	if attempts != 2 {
+		t.Fatalf("explicit operator retry did not bypass suppression: attempts=%d", attempts)
+	}
+
+	task.Description = "legacy candidate state B"
+	third := newDriver()
+	_ = e.ForgeLoop(context.Background(), third, ForgeLoopOptions{Interval: time.Millisecond, MaxTicks: 1, ApproveSuppressionPath: path})
+	if attempts != 3 {
+		t.Fatalf("changed candidate/receipt state did not re-arm approval: attempts=%d", attempts)
 	}
 }
 

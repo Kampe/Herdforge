@@ -12,6 +12,7 @@ import (
 	"github.com/Kampe/Herdforge/pkg/config"
 	"github.com/Kampe/Herdforge/pkg/herdr"
 	"github.com/Kampe/Herdforge/pkg/launch"
+	"github.com/Kampe/Herdforge/pkg/provider"
 	"github.com/Kampe/Herdforge/pkg/router"
 	"github.com/Kampe/Herdforge/pkg/usage"
 )
@@ -416,6 +417,7 @@ func TestLaneLaunchDecisionReportsConfiguredProbeFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", dir)
+	t.Setenv("HERD_MODE", "production")
 	t.Setenv("HERDR_ROUTE_STATE_DIR", t.TempDir())
 	lane := &config.LaneDef{Name: "smith", Role: launch.WorkerRole, AgentKind: "codex", Harness: "codex", Provider: launch.WorkerProvider, Model: launch.WorkerModel, Effort: launch.WorkerEffort, TaskShape: launch.Implementation}
 
@@ -486,5 +488,35 @@ func TestLaneLaunchDecisionSucceedsWithHarnessBinary(t *testing.T) {
 	}
 	if decision.Harness != "codex" || len(decision.HarnessArgv) == 0 || decision.HarnessArgv[0] != "codex" {
 		t.Fatalf("decision must launch configured Codex harness: %+v", decision)
+	}
+}
+
+func TestReviewerLaunchDecisionBindsReroutedVendorHarness(t *testing.T) {
+	dir := t.TempDir()
+	for _, harness := range []string{"claude", "grok"} {
+		if err := os.WriteFile(filepath.Join(dir, harness), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv("PATH", dir)
+	t.Setenv("HERD_MODE", "local")
+	t.Setenv("HERD_USE_PI", "0")
+	routeDir := t.TempDir()
+	t.Setenv("HERDR_ROUTE_STATE_DIR", routeDir)
+	if err := os.WriteFile(filepath.Join(routeDir, "claude.cooldown.json"), []byte(`{"expiresAt":4102444800,"provider":"claude","reason":"exhausted"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HERD_ERA_PROVIDERS", "claude grok")
+	lane := &config.LaneDef{Name: "reviewer", Role: launch.ReviewerRole, AgentKind: "claude", Harness: "claude", Provider: "claude", Model: "claude-sonnet-5", Effort: "medium", TaskShape: "qa"}
+	task := &provider.Task{Ref: "FAC-REROUTE", Labels: []string{"author-family:anthropic", "author-model:claude-sonnet-5", "candidate-sha:" + strings.Repeat("a", 40)}}
+
+	decision, err := laneLaunchDecisionWithProbe(context.Background(), lane, task, func(_ context.Context, _, model, _ string) herdr.ProbeResult {
+		return herdr.ProbeResult{Model: model, Available: true}
+	})
+	if err != nil {
+		t.Fatalf("reviewer reroute rejected: %v", err)
+	}
+	if decision.Provider != "grok" || decision.Harness != "grok" || decision.Model != router.ModelFor("grok", "qa") {
+		t.Fatalf("rerouted reviewer tuple is incoherent: %+v", decision)
 	}
 }

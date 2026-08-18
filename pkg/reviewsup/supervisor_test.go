@@ -403,6 +403,16 @@ func TestSubmitVerdictPASS(t *testing.T) {
 	if c.State != StateHarvested {
 		t.Errorf("state = %s, want harvested", c.State)
 	}
+	q := sv.QueueSnapshot()
+	var qentry QueueEntry
+	for _, entry := range q {
+		if entry.SHA == "aaa111" {
+			qentry = entry
+		}
+	}
+	if qentry.State != QueueCleanupCandidate {
+		t.Fatalf("queue after PASS = %+v, want one cleanup candidate", q)
+	}
 
 	ready, err := sv.ReadyForHarvest(10)
 	if err != nil {
@@ -417,6 +427,63 @@ func TestSubmitVerdictPASS(t *testing.T) {
 	}
 	if !found {
 		t.Error("aaa111 not found in harvest queue after PASS")
+	}
+}
+
+func TestMarkClosedProjectsCleanupCandidateToClosed(t *testing.T) {
+	sv := svc(t)
+	sv.LaunchReview("aaa111", "gemini", "gemini-2.5-flash")
+	if _, err := sv.SubmitVerdict(ReviewVerdict{SHA: "aaa111", Reviewer: "gemini", Verdict: VerdictPASS}); err != nil {
+		t.Fatalf("SubmitVerdict: %v", err)
+	}
+	if err := sv.MarkClosed("aaa111"); err != nil {
+		t.Fatalf("MarkClosed: %v", err)
+	}
+	q := sv.QueueSnapshot()
+	var found QueueEntry
+	for _, entry := range q {
+		if entry.SHA == "aaa111" {
+			found = entry
+		}
+	}
+	if found.State != QueueClosed {
+		t.Fatalf("queue after close = %+v, want closed", q)
+	}
+}
+
+// TestReconstructThenMarkClosed proves the cleanup handoff survives a
+// supervisor restart. Before the durable-state fix this was the observed
+// failure: Reconstruct restored StatePass while MarkClosed required
+// StateHarvested, leaving every retained reviewer pane stuck open.
+func TestReconstructThenMarkClosed(t *testing.T) {
+	dir := t.TempDir()
+	cfg := DefaultConfig(dir)
+	cfg.Now = fixedNow
+	cfg.AdmitReceipt = testAdmitReceipt
+	sv := New(cfg)
+	if _, _, err := sv.Ingest(withDigest(CompletionCallback{SHA: "restart-sha", Branch: "feat/restart", AuthorModel: "claude", Tier: TierR1})); err != nil {
+		t.Fatalf("Ingest: %v", err)
+	}
+	if err := sv.LaunchReview("restart-sha", "gemini", "gemini-2.5-flash"); err != nil {
+		t.Fatalf("LaunchReview: %v", err)
+	}
+	if _, err := sv.SubmitVerdict(ReviewVerdict{SHA: "restart-sha", Reviewer: "gemini", Verdict: VerdictPASS}); err != nil {
+		t.Fatalf("SubmitVerdict: %v", err)
+	}
+
+	restarted := New(cfg)
+	if _, err := restarted.Reconstruct(); err != nil {
+		t.Fatalf("Reconstruct: %v", err)
+	}
+	entries := restarted.QueueSnapshot()
+	if len(entries) != 1 || entries[0].State != QueueCleanupCandidate {
+		t.Fatalf("reconstructed queue = %+v, want cleanup-candidate", entries)
+	}
+	if err := restarted.MarkClosed("restart-sha"); err != nil {
+		t.Fatalf("MarkClosed after reconstruct: %v", err)
+	}
+	if got := restarted.QueueSnapshot()[0].State; got != QueueClosed {
+		t.Fatalf("queue after reconstructed close = %s, want %s", got, QueueClosed)
 	}
 }
 
@@ -1348,5 +1415,74 @@ func TestLaunchReview_AdmitRefuses_BlocksSpawn(t *testing.T) {
 	c := sv.Candidate("aaa111")
 	if c == nil || c.State != StatePending {
 		t.Fatalf("candidate must remain pending after refused launch, got %+v", c)
+	}
+}
+
+func TestCompensateLaunch_RevertsReviewingOnLaunchFailed(t *testing.T) {
+	sv, dir := newTestSupervisor(t)
+	if _, _, err := sv.Ingest(withDigest(CompletionCallback{
+		SHA: "launch-fail-sha", Branch: "herd/fac-369", PatchID: "fac-369",
+		AuthorModel: "claude-3-7-sonnet", Tier: TierR2,
+	})); err != nil {
+		t.Fatalf("Ingest: %v", err)
+	}
+	if err := sv.LaunchReview("launch-fail-sha", "gemini-reviewer", "gemini-2.5-flash"); err != nil {
+		t.Fatalf("LaunchReview: %v", err)
+	}
+	if got := sv.Candidate("launch-fail-sha"); got == nil || got.State != StateReviewing {
+		t.Fatalf("precondition: want reviewing, got %+v", got)
+	}
+	if err := sv.CompensateLaunch("launch-fail-sha", "LAUNCH_FAILED: unknown pane"); err != nil {
+		t.Fatalf("CompensateLaunch: %v", err)
+	}
+	c := sv.Candidate("launch-fail-sha")
+	if c == nil || c.State != StatePending {
+		t.Fatalf("LAUNCH_FAILED must not leave an in-review candidate: %+v", c)
+	}
+	if c.Reviewer != "" {
+		t.Fatalf("compensated launch must clear reviewer, got %q", c.Reviewer)
+	}
+	if q := sv.QueueSnapshot(); len(q) != 1 || q[0].State != QueueAdmitted {
+		t.Fatalf("queue after compensate = %+v, want admitted", q)
+	}
+	rows, err := readRows(filepath.Join(dir, "supervisor-ledger.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, r := range rows {
+		if r.Event == string(EventLaunchFailed) && r.SHA == "launch-fail-sha" && strings.Contains(r.Reason, "LAUNCH_FAILED") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("ledger missing durable LAUNCH_FAILED row: %+v", rows)
+	}
+}
+
+func TestCompensateLaunch_ReconstructDoesNotLeaveInReview(t *testing.T) {
+	sv, dir := newTestSupervisor(t)
+	if _, _, err := sv.Ingest(withDigest(CompletionCallback{
+		SHA: "replay-sha", Branch: "herd/fac-369", PatchID: "replay",
+		AuthorModel: "claude-3-7-sonnet", Tier: TierR1,
+	})); err != nil {
+		t.Fatalf("Ingest: %v", err)
+	}
+	if err := sv.LaunchReview("replay-sha", "gemini", "gemini-2.5-flash"); err != nil {
+		t.Fatalf("LaunchReview: %v", err)
+	}
+	if err := sv.CompensateLaunch("replay-sha", "LAUNCH_FAILED: pane is at a login or authentication screen"); err != nil {
+		t.Fatalf("CompensateLaunch: %v", err)
+	}
+	cfg := DefaultConfig(dir)
+	cfg.Now = fixedNow
+	cfg.AdmitReceipt = testAdmitReceipt
+	replay := New(cfg)
+	if _, err := replay.Reconstruct(); err != nil {
+		t.Fatalf("Reconstruct: %v", err)
+	}
+	c := replay.Candidate("replay-sha")
+	if c == nil || c.State != StatePending || c.Reviewer != "" {
+		t.Fatalf("replayed LAUNCH_FAILED left in-review state: %+v", c)
 	}
 }

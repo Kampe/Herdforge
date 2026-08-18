@@ -102,6 +102,119 @@ func TestBindingForWorktree_UsesAuthenticatedReceiptForLegacyLifecycle(t *testin
 	}
 }
 
+func TestBindingForWorktree_PreservesWorkerAuthorityAcrossReviewerRetries(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, ".herd"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, root, "init", "-b", "main")
+	gitIn(t, root, "config", "user.email", "test@example.invalid")
+	gitIn(t, root, "config", "user.name", "test")
+	if err := os.WriteFile(filepath.Join(root, ".gitignore"), []byte(".herd/\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, root, "add", ".gitignore")
+	gitIn(t, root, "commit", "-m", "chore: ignore runtime state")
+	if err := os.WriteFile(filepath.Join(root, "candidate.txt"), []byte("candidate\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, root, "add", "candidate.txt")
+	gitIn(t, root, "commit", "-m", "feat: candidate")
+
+	keyDir := t.TempDir()
+	signer := fixtureSigner(t, keyDir, root)
+	worker := dispatch.TaskContext{
+		ProviderType: "kaneo", ProjectID: "proj-x", Repository: dispatch.RepositoryIdentityOrName(root, "herdforge-test"),
+		Role: dispatch.RoleWorker, TaskRef: "FAC-343", TaskID: "task-343", Branch: "herd/fac-343", BaseSHA: "base",
+		LeaseID: "claim:2", LeaseGeneration: 2, LeaseTaskRef: "FAC-343", SessionID: "worker-session",
+		AllowedOps: dispatch.WorkerOps, ExpiresAt: time.Now().Add(time.Hour),
+	}
+	signedWorker, err := signer.Issue(worker)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := dispatch.WriteTaskContext(root, signedWorker); err != nil {
+		t.Fatal(err)
+	}
+	machine, err := lifecycle.NewMachine(filepath.Join(root, ".herd", "lifecycle.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer machine.Close()
+	for _, retry := range []struct {
+		name       string
+		generation int64
+		leaseID    string
+	}{
+		{name: "first review", generation: 4, leaseID: "claim:4"},
+		{name: "second review retry", generation: 5, leaseID: "claim:5"},
+	} {
+		t.Run(retry.name, func(t *testing.T) {
+			// Each later review launch leaves a newer canonical reviewer receipt.
+			// It must not replace the worker lease owning verification evidence.
+			reviewer := worker
+			reviewer.Role = dispatch.RoleReviewer
+			reviewer.CandidateSHA = gitIn(t, root, "rev-parse", "HEAD")
+			reviewer.LeaseID = retry.leaseID
+			reviewer.LeaseGeneration = retry.generation
+			reviewer.LeaseTaskRef = reviewLeaseTaskRef("FAC-343")
+			reviewer.SessionID = retry.name
+			signedReviewer, err := signer.Issue(reviewer)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := dispatch.StoreCanonicalReceipt(root, signedReviewer); err != nil {
+				t.Fatal(err)
+			}
+
+			bind, err := bindingForWorktreeAtRoot(nil, machine, "FAC-343", root, root)
+			if err != nil {
+				t.Fatalf("worker receipt fallback refused: %v", err)
+			}
+			if bind.LeaseGeneration != worker.LeaseGeneration {
+				t.Fatalf("binding used reviewer generation %d, want worker generation %d", bind.LeaseGeneration, worker.LeaseGeneration)
+			}
+		})
+	}
+}
+
+func TestUseHarnessHooksFromWorktreeUsesCandidatePolicyByDefault(t *testing.T) {
+	wt := t.TempDir()
+	hooks := filepath.Join(wt, ".herd", "harness-hooks.json")
+	if err := os.MkdirAll(filepath.Dir(hooks), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(hooks, []byte(`{"providers":{}}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HERD_HARNESS_HOOKS_FILE", "")
+	restore := useHarnessHooksFromWorktree(wt)
+	if got := os.Getenv("HERD_HARNESS_HOOKS_FILE"); got != hooks {
+		t.Fatalf("hook policy path = %q, want %q", got, hooks)
+	}
+	restore()
+	if got := os.Getenv("HERD_HARNESS_HOOKS_FILE"); got != "" {
+		t.Fatalf("hook policy override not restored: %q", got)
+	}
+}
+
+func TestUseHarnessHooksFromWorktreePreservesExplicitOverride(t *testing.T) {
+	wt := t.TempDir()
+	hooks := filepath.Join(wt, ".herd", "harness-hooks.json")
+	if err := os.MkdirAll(filepath.Dir(hooks), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(hooks, []byte(`{"providers":{}}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HERD_HARNESS_HOOKS_FILE", "explicit-policy.json")
+	restore := useHarnessHooksFromWorktree(wt)
+	if got := os.Getenv("HERD_HARNESS_HOOKS_FILE"); got != "explicit-policy.json" {
+		t.Fatalf("explicit hook policy path changed: %q", got)
+	}
+	restore()
+}
+
 func TestRecordForgeLifecycle_ProjectsClaimThroughBuilding(t *testing.T) {
 	root := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(root, ".herd"), 0755); err != nil {

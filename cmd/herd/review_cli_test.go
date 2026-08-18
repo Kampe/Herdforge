@@ -26,6 +26,7 @@ import (
 	"github.com/Kampe/Herdforge/pkg/mail"
 	hsync "github.com/Kampe/Herdforge/pkg/sync"
 	"github.com/Kampe/Herdforge/pkg/toolchild"
+	"github.com/Kampe/Herdforge/pkg/verifier"
 	"github.com/Kampe/Herdforge/pkg/winddown"
 )
 
@@ -91,7 +92,7 @@ func acquireFixtureLease(t *testing.T, dir, ref string) (string, int64) {
 }
 
 func mailPost(dir, sender, subject, body string) (*mail.Envelope, error) {
-	return mail.NewMailbox(filepath.Join(dir, ".herd", "mail.jsonl")).SendMessage(sender, "coordinator", subject, body)
+	return mail.NewMailbox(mail.CallbackMailPath(dir)).SendMessage(sender, "coordinator", subject, body)
 }
 
 // writeSignedReceipt issues a coordinator-signed FAC-1 receipt into wt: the
@@ -170,6 +171,43 @@ func fixtureSigner(t *testing.T, keyDir, repoDir string) *dispatch.Signer {
 	return signer
 }
 
+// reviewTestEnv keeps reviewer-lane tests independent of the role marker on
+// the pane running the suite. HERD_ROLE is diagnostic launch metadata in
+// production, but signer-boundary test fixtures intentionally exercise the
+// coordinator path from their child CLI processes.
+func reviewTestEnv() []string {
+	env := make([]string, 0, len(os.Environ()))
+	for _, entry := range os.Environ() {
+		if strings.HasPrefix(entry, "HERD_ROLE=") {
+			continue
+		}
+		env = append(env, entry)
+	}
+	return env
+}
+
+func TestReviewTestEnv_StripsInheritedAgentRole(t *testing.T) {
+	t.Setenv("HERD_ROLE", "agent")
+	t.Setenv("HERD_FAC356_TEST_SENTINEL", "preserved")
+
+	env := reviewTestEnv()
+	for _, entry := range env {
+		if strings.HasPrefix(entry, "HERD_ROLE=") {
+			t.Fatalf("review test subprocess environment leaked %q", entry)
+		}
+	}
+	found := false
+	for _, entry := range env {
+		if entry == "HERD_FAC356_TEST_SENTINEL=preserved" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatal("review test environment dropped unrelated inherited variables")
+	}
+}
+
 // herdCmd runs the built binary in dir with the coordinator key dir pinned
 // to the test's private location.
 // provisionFence creates the shared fence store the FAC-145 claim stack
@@ -187,7 +225,7 @@ func ensureFenceSeal(binary, dir, keyDir string) string {
 	}
 	c := exec.Command(binary, "fence-provision")
 	c.Dir = dir
-	c.Env = append(os.Environ(),
+	c.Env = append(reviewTestEnv(),
 		dispatch.KeyDirEnv+"="+keyDir,
 		herdr.NoLiveEnv+"=1",
 		herdr.BinaryEnv+"=",
@@ -230,7 +268,7 @@ func herdCmd(binary, dir, keyDir string, args ...string) *exec.Cmd {
 	cmd.Dir = dir
 	// FAC-145 hermeticity: a child CLI can NEVER reach the operator's live
 	// herdr fleet. Without an explicit fake, any herdr call fails closed.
-	cmd.Env = append(os.Environ(),
+	cmd.Env = append(reviewTestEnv(),
 		dispatch.KeyDirEnv+"="+keyDir,
 		herdr.NoLiveEnv+"=1",
 		herdr.BinaryEnv+"=",
@@ -279,7 +317,7 @@ func prependToPath(cmd *exec.Cmd, dir string) {
 func herdCmdWithFake(binary, dir, keyDir, fakeBin, fakeLog string, args ...string) *exec.Cmd {
 	cmd := exec.Command(binary, args...)
 	cmd.Dir = dir
-	cmd.Env = append(os.Environ(), dispatch.KeyDirEnv+"="+keyDir)
+	cmd.Env = append(reviewTestEnv(), dispatch.KeyDirEnv+"="+keyDir)
 	// Review commands may chdir into an isolated detached worktree. Keep the
 	// provider's shared claim fence anchored to the fixture repository rather
 	// than making the review checkout provision a second authority.
@@ -590,7 +628,7 @@ func TestVerifyCLI_PostsReceiptBoundFailCallback(t *testing.T) {
 		t.Fatalf("verify of an empty worktree must fail:\n%s", out)
 	}
 
-	data, err := os.ReadFile(filepath.Join(dir, ".herd", "mail.jsonl"))
+	data, err := os.ReadFile(mail.CallbackMailPath(dir))
 	if err != nil {
 		t.Fatalf("no callback posted to the coordinator mailbox: %v\n%s", err, out)
 	}
@@ -782,7 +820,7 @@ func TestApproveCLI_BoundMutationAndPassCallback(t *testing.T) {
 		t.Fatalf("expected exactly 1 status write, saw %d", got)
 	}
 
-	data, err := os.ReadFile(filepath.Join(dir, ".herd", "mail.jsonl"))
+	data, err := os.ReadFile(mail.CallbackMailPath(dir))
 	if err != nil {
 		t.Fatalf("coordinator PASS callback not posted: %v", err)
 	}
@@ -895,7 +933,7 @@ func TestApproveCLI_ReconcilesInterruptedTransition(t *testing.T) {
 
 	// Stable dedupe: the replayed PASS callback converged on the crashed
 	// run's envelope — exactly ONE complete callback on the bus.
-	mailData, err := os.ReadFile(filepath.Join(dir, ".herd", "mail.jsonl"))
+	mailData, err := os.ReadFile(mail.CallbackMailPath(dir))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -996,7 +1034,7 @@ func TestApproveCLI_DoneWithoutPublishReconcilesByPublicationOnly(t *testing.T) 
 	if got := atomic.LoadInt32(&fk.patches); got != 0 {
 		t.Fatalf("publication-only reconcile must not touch the board, saw %d write(s)", got)
 	}
-	mailData, err := os.ReadFile(filepath.Join(dir, ".herd", "mail.jsonl"))
+	mailData, err := os.ReadFile(mail.CallbackMailPath(dir))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1084,7 +1122,7 @@ func TestApproveCLI_ReadbackDriftFailsApproval(t *testing.T) {
 		t.Fatalf("expected readback drift refusal, got:\n%s", out)
 	}
 
-	mailData, err := os.ReadFile(filepath.Join(dir, ".herd", "mail.jsonl"))
+	mailData, err := os.ReadFile(mail.CallbackMailPath(dir))
 	if err != nil {
 		t.Fatalf("compensating callback missing: %v", err)
 	}
@@ -1438,7 +1476,7 @@ func TestVerdict_TwoBrokersDeliverExactlyOnce(t *testing.T) {
 		t.Fatalf("two coordinators produced %d verdict comments, want exactly 1:\n%v", got, bodies)
 	}
 	// Exactly one consumable authority record too.
-	mailData, err := os.ReadFile(filepath.Join(dir, ".herd", "mail.jsonl"))
+	mailData, err := os.ReadFile(mail.CallbackMailPath(dir))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1625,7 +1663,7 @@ func TestApproveCLI_RejectedVerdictVetoesApproval(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	mb := mail.NewMailbox(filepath.Join(dir, ".herd", "mail.jsonl"))
+	mb := mail.NewMailbox(mail.CallbackMailPath(dir))
 	if _, err := mb.PostCallback("reviewer", mail.Callback{
 		Ref: "FAC-1", Kind: mail.CallbackBlocked, SHA: candidate, Repo: dispatch.RepositoryIdentityOrName(dir, "herdforge-test"),
 		LeaseGeneration: rc.LeaseGeneration, SenderRole: "reviewer",
@@ -1806,7 +1844,7 @@ func TestApproveCLI_ConcurrentApprovesSerializeAndDedupe(t *testing.T) {
 	if got := atomic.LoadInt32(&fk.patches); got != 1 {
 		t.Fatalf("concurrent approves performed %d board writes, want exactly 1", got)
 	}
-	mailData, err := os.ReadFile(filepath.Join(dir, ".herd", "mail.jsonl"))
+	mailData, err := os.ReadFile(mail.CallbackMailPath(dir))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1925,6 +1963,7 @@ func startBroker(t *testing.T, binary, dir, keyDir, sock string) {
 // fake, for the paths where the broker itself queries the live fleet.
 func startBrokerWithFake(t *testing.T, binary, dir, keyDir, fakeBin, fakeLog, sock string) {
 	t.Helper()
+	provisionFence(t, binary, dir, keyDir)
 	startBrokerCmd(t, herdCmdWithFake(binary, dir, keyDir, fakeBin, fakeLog, "broker", "--socket", sock), sock)
 }
 
@@ -2096,7 +2135,7 @@ func TestTaskBrokerCLI_DetachedReviewerReadAndVerdict(t *testing.T) {
 		t.Fatalf("provider must receive the canonical verdict line %q, got:\n%s", want, verdictBody)
 	}
 	// Durable coordinator-side verdict record on the bus.
-	mailData, err := os.ReadFile(filepath.Join(dir, ".herd", "mail.jsonl"))
+	mailData, err := os.ReadFile(mail.CallbackMailPath(dir))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2124,6 +2163,58 @@ func TestApproveCLI_StaleLeaseGenerationFencedOut(t *testing.T) {
 	}
 	if got := atomic.LoadInt32(&fk.patches); got != 0 {
 		t.Fatalf("fenced-out receipt still performed %d status write(s)", got)
+	}
+}
+
+// FAC-342: a managed PASS verify persists both command receipts with the
+// launch receipt's exact task and lease binding, making the candidate
+// admissible to native review without a legacy receipt fallback.
+func TestVerifyCLI_ManagedPassPersistsAdmissibleReceipts(t *testing.T) {
+	binary := buildHerd(t)
+	dir, keyDir := t.TempDir(), t.TempDir()
+	attestKeyDir(t, keyDir)
+	gitIn(t, dir, "init", "-b", "main")
+	if err := os.WriteFile(filepath.Join(dir, ".gitignore"), []byte("**/TASK-CONTEXT.json\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, dir, "add", ".gitignore")
+	gitIn(t, dir, "commit", "-q", "-m", "base")
+	gitIn(t, dir, "update-ref", "refs/remotes/origin/main", "HEAD")
+	wt := filepath.Join(dir, ".herd", "worktrees", "fac-1")
+	gitIn(t, dir, "worktree", "add", "-b", "herd/fac-1", wt, "HEAD")
+	gitIn(t, wt, "commit", "--allow-empty", "-q", "-m", "feat: verified work (FAC-342)")
+	writeSignedReceipt(t, keyDir, dir, wt, nil)
+
+	out, err := herdCmd(binary, dir, keyDir, "verify", "--build", "true", "--test", "true", filepath.Join(".herd", "worktrees", "fac-1")).CombinedOutput()
+	if err != nil {
+		t.Fatalf("managed PASS verify failed: %v\n%s", err, out)
+	}
+
+	candidate := gitIn(t, wt, "rev-parse", "HEAD")
+	store, err := verifier.NewFileReceiptStore(filepath.Join(dir, ".herd", "verification-receipts"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	entries, err := os.ReadDir(filepath.Join(dir, ".herd", "verification-receipts"))
+	if err != nil {
+		t.Fatalf("receipt store was not created: %v", err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("got %d persisted receipts, want build and test receipts", len(entries))
+	}
+	admission := verifier.NewReceiptAdmission(store)
+	for _, entry := range entries {
+		digest := "sha256:" + strings.TrimSuffix(entry.Name(), filepath.Ext(entry.Name()))
+		receipt, err := store.Load(context.Background(), digest)
+		if err != nil {
+			t.Fatalf("load persisted receipt %s: %v", entry.Name(), err)
+		}
+		if receipt.TaskRef != "FAC-1" || receipt.LeaseGeneration == "" || receipt.CandidateSHA != candidate {
+			t.Fatalf("receipt lost exact binding: %+v", receipt)
+		}
+		if _, err := admission.RequireCurrentPassing(context.Background(), wt, digest); err != nil {
+			t.Fatalf("receipt %s was not natively admissible: %v", digest, err)
+		}
 	}
 }
 
@@ -2266,7 +2357,7 @@ func TestReviewCLI_CandidateIndexMergedDiscovery(t *testing.T) {
 	writeReviewConfig(t, dir, server.URL, "proj-x")
 
 	// 1. Post a blocked mail callback for FAC-2
-	mb := mail.NewMailbox(filepath.Join(dir, ".herd", "mail.jsonl"))
+	mb := mail.NewMailbox(mail.CallbackMailPath(dir))
 	cb := mail.Callback{
 		Ref:    "FAC-2",
 		Kind:   mail.CallbackBlocked,

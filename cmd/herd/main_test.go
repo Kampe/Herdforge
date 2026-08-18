@@ -24,6 +24,12 @@ var (
 )
 
 func TestMain(m *testing.M) {
+	// Reviewer panes carry HERD_ROLE=agent as launch metadata. The CLI suite
+	// creates coordinator-signed fixtures in-process and launches child CLIs;
+	// keep that pane marker out of both test contexts while leaving the
+	// production signer-boundary check unchanged.
+	_ = os.Unsetenv("HERD_ROLE")
+
 	code := m.Run()
 	if dir := filepath.Dir(herdBinary); herdBinary != "" {
 		_ = os.RemoveAll(dir)
@@ -379,16 +385,41 @@ func TestPreflightStaticAndOperationalReadinessGates(t *testing.T) {
 		t.Fatalf("expected preflight boundary check pass output, got: %s", staticOut)
 	}
 
-	// 2. Operational preflight without durable attestation must fail closed and exit non-zero.
-	cmd := exec.Command(binary, "preflight")
-	cmd.Dir = tmpDir
-	cmd.Env = append(os.Environ(), "HERD_CONTROL_SECRET=", "HERD_LIVE_HARNESS_PROOF=", "HERD_REFRESH_READINESS=")
-	out, err := cmd.CombinedOutput()
-	if err == nil {
-		t.Fatalf("operational preflight must exit non-zero when readiness is blocked; got success: %s", out)
-	}
-	if !strings.Contains(string(out), "FAC-133 readiness: BLOCKED") {
-		t.Fatalf("expected BLOCKED readiness in output, got: %s", out)
+	for _, tc := range []struct {
+		name       string
+		mode       string
+		secret     string
+		wantErr    bool
+		wantOutput string
+	}{
+		{name: "local skips hosted readiness", mode: "local", wantOutput: "Preflight merge-policy check passed."},
+		{name: "production requires readiness", mode: "production", wantErr: true, wantOutput: "FAC-133 readiness: BLOCKED"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			readinessRoot := filepath.Join(tmpDir, tc.name, ".herd")
+			cmd := exec.Command(binary, "preflight")
+			cmd.Dir = tmpDir
+			cmd.Env = append(os.Environ(),
+				"HERD_MODE="+tc.mode,
+				"HERD_CONTROL_SECRET="+tc.secret,
+				"HERD_READINESS_ROOT="+readinessRoot,
+				"HERD_LIVE_HARNESS_PROOF=",
+				"HERD_REFRESH_READINESS=",
+			)
+			out, err := cmd.CombinedOutput()
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("preflight error=%v, wantErr=%v: %s", err, tc.wantErr, out)
+			}
+			if !strings.Contains(string(out), tc.wantOutput) {
+				t.Fatalf("expected output %q, got: %s", tc.wantOutput, out)
+			}
+			if tc.mode != "production" && strings.Contains(string(out), "FAC-133 readiness:") {
+				t.Fatalf("local preflight must not run hosted readiness: %s", out)
+			}
+			if _, statErr := os.Stat(readinessRoot); !os.IsNotExist(statErr) {
+				t.Fatalf("local preflight must not create readiness state, stat error=%v", statErr)
+			}
+		})
 	}
 }
 

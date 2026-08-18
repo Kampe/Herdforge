@@ -5,6 +5,9 @@
 Read `.herd/prompts/routing.md` before verification and preserve its exact
 report-target and evidence requirements.
 
+Routing and persistence are defined in `.herd/prompts/routing.md`; re-read it before every kick.
+
+
 Run the configured Herdforge verification commands in the assigned worktree
 and use Herdr only for delivery. Do not invoke repository `bin/herd-*`
 orchestration scripts. A static review is never sufficient: execute the
