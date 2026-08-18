@@ -367,4 +367,5 @@ lanes:
 # Project Verification Suite
 verification:
   test_command: "go test ./..."
+  test_timeout: "30m"
   preflight_command: "go build ./..."
