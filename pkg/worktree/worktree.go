@@ -412,7 +412,8 @@ func (w *WorktreeManager) CreateTaskWorktreeFrom(ctx context.Context, taskRef, d
 	// the working tree. Best-effort relative to reap safety; creation already
 	// succeeded from the immutable base.
 	anchor := execCommandContext(ctx, "git", "-C", targetPath,
-		"commit", "--allow-empty", "-q", "-m",
+		"-c", "commit.gpgsign=false", "commit", "--no-gpg-sign",
+		"--allow-empty", "-q", "-m",
 		fmt.Sprintf("chore: anchor %s worktree (FAC-106 reap-safe)", strings.ToUpper(taskRef)))
 	_ = anchor.Run()
 

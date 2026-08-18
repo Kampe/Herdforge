@@ -2,11 +2,11 @@ package main
 
 import (
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/Kampe/Herdforge/internal/testgit"
 	"github.com/Kampe/Herdforge/pkg/reviewledger"
 )
 
@@ -101,7 +101,7 @@ func writeCandidateFile(t *testing.T, name, content string) {
 
 func gitCandidateTest(t *testing.T, args ...string) {
 	t.Helper()
-	cmd := exec.Command("git", args...)
+	cmd := testgit.Command(".", args...)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, out)
 	}
@@ -109,7 +109,7 @@ func gitCandidateTest(t *testing.T, args ...string) {
 
 func gitCandidateOutput(t *testing.T, args ...string) string {
 	t.Helper()
-	out, err := exec.Command("git", args...).Output()
+	out, err := testgit.Command(".", args...).Output()
 	if err != nil {
 		t.Fatalf("git %s: %v", strings.Join(args, " "), err)
 	}

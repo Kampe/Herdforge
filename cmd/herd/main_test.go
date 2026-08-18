@@ -9,6 +9,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/Kampe/Herdforge/internal/testgit"
 	"github.com/Kampe/Herdforge/pkg/config"
 	"github.com/Kampe/Herdforge/pkg/herdr"
 )
@@ -329,8 +330,7 @@ func TestFreshClonePreflightAndRuntimeMigrationLeaveTrackedStateClean(t *testing
 	}
 	git := func(dir string, args ...string) {
 		t.Helper()
-		cmd := exec.Command("git", args...)
-		cmd.Dir = dir
+		cmd := testgit.Command(dir, args...)
 		if output, err := cmd.CombinedOutput(); err != nil {
 			t.Fatalf("git %v: %v: %s", args, err, output)
 		}
