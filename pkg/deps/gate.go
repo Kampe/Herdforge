@@ -117,12 +117,26 @@ func ValidateLaunch(
 		}
 	}
 
-	// Authoritative full project closure for cycle detection + revision.
-	// Cold SnapshotGraph is honest O(board) concurrent HTTP under list deadline
-	// (Kaneo exposes only per-task relation GETs). Fence reuses that snapshot;
-	// post-selection TOCTOU re-reads the prerequisite closure only (fixed-point
-	// expand), not unrelated board components.
-	snap, err := store.SnapshotGraph(ctx)
+	desiredEdges, derr := desired.DesiredBlocks()
+	if derr != nil {
+		return nil, &BlockedError{
+			Ref: taskRef, Code: "missing_provenance",
+			Reason: derr.Error(),
+		}
+	}
+
+	// Launch gates need only the candidate's connected component. Providers
+	// without the optional scoped surface retain the authoritative full graph
+	// behavior; ProviderStore uses per-task relation reads for Kaneo so a large
+	// unrelated board cannot time out eligibility.
+	var snap *GraphSnapshot
+	if scoped, ok := store.(interface {
+		SnapshotGraphForTask(context.Context, Ref, TaskID, []DependencyEdge) (*GraphSnapshot, error)
+	}); ok {
+		snap, err = scoped.SnapshotGraphForTask(ctx, taskRef, taskID, desiredEdges)
+	} else {
+		snap, err = store.SnapshotGraph(ctx)
+	}
 	if err != nil {
 		return nil, &BlockedError{
 			Ref: taskRef, Code: "stale",
@@ -150,14 +164,6 @@ func ValidateLaunch(
 
 	// Per-task board edges by ref AND immutable ID (never drop ID-only matches).
 	board := FilterInvolvingTask(snap.Edges, taskRef, taskID)
-
-	desiredEdges, derr := desired.DesiredBlocks()
-	if derr != nil {
-		return nil, &BlockedError{
-			Ref: taskRef, Code: "missing_provenance",
-			Reason: derr.Error(),
-		}
-	}
 
 	rep := Reconcile(taskRef, desiredEdges, board, ReconcileOpts{
 		FullClosure:        snap.Edges,
