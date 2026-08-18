@@ -36,7 +36,7 @@ func runHerd(t *testing.T, dir string, env []string, args ...string) ([]byte, er
 
 // installFakeGit puts a fake `git` on PATH returning porcelain for any call,
 // so the dirty gate never touches a real repository.
-func installFakeGit(t *testing.T, dir, porcelain string) func() {
+func installFakeGit(t *testing.T, dir, porcelain string) {
 	t.Helper()
 	binDir := filepath.Join(dir, "fakebin")
 	if err := os.MkdirAll(binDir, 0o755); err != nil {
@@ -46,11 +46,7 @@ func installFakeGit(t *testing.T, dir, porcelain string) func() {
 	if err := os.WriteFile(filepath.Join(binDir, "git"), []byte(content), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	old := os.Getenv("PATH")
-	if err := os.Setenv("PATH", binDir+":"+old); err != nil {
-		t.Fatal(err)
-	}
-	return func() { os.Setenv("PATH", old) }
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 }
 
 func exitCode(err error) int {
@@ -201,8 +197,7 @@ func TestLockWithNoCommandUsage(t *testing.T) {
 
 func TestLockDirtyGateRefuses(t *testing.T) {
 	dir := sandbox(t)
-	cleanup := installFakeGit(t, dir, "!! fake.go\n?? new.txt\n")
-	defer cleanup()
+	installFakeGit(t, dir, "!! fake.go\n?? new.txt\n")
 	out, err := runHerd(t, dir, nil, "lock", "with", "--wait", "1", "--reason", "r", "--", "git", "pull")
 	if exitCode(err) != 3 {
 		t.Fatalf("dirty gate exit = %d, want 3 (out=%s)", exitCode(err), out)
@@ -217,8 +212,7 @@ func TestLockDirtyGateRefuses(t *testing.T) {
 
 func TestLockDirtyOKBypass(t *testing.T) {
 	dir := sandbox(t)
-	cleanup := installFakeGit(t, dir, "!! fake.go\n")
-	defer cleanup()
+	installFakeGit(t, dir, "!! fake.go\n")
 	out, err := runHerd(t, dir, []string{"HERD_SHARED_DIRTY_OK=1"}, "lock", "with", "--reason", "r", "--", "git", "pull")
 	if err != nil {
 		t.Fatalf("HERD_SHARED_DIRTY_OK=1 bypass failed: %v (out=%s)", err, out)

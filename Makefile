@@ -55,7 +55,7 @@ test-unit: test-contracts test-hermetic-compile
 	@echo "==> Running full unit test suite..."
 	# 300s: cmd/herd integration builds the binary multiple times; 180s is
 	# flaky/red on both main and this branch (pre-existing, not FAC-198).
-	$(HERMETIC_GIT) go test -count=1 -timeout=300s ./...
+	$(HERMETIC_GIT) go test -count=1 -shuffle=on -timeout=300s ./...
 
 # contracts/agentscope is a nested, independently consumable Go module. The
 # root module's `go test ./...` skips nested modules, so this target makes the
