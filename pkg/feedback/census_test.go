@@ -412,6 +412,7 @@ func TestRunDefaultAdmissionGateHonorsRealWinddownState(t *testing.T) {
 
 	stateDir := t.TempDir()
 	var sent []string
+	var stdout bytes.Buffer
 	opts := Options{
 		Interval: 1800, Grace: 600, StateDir: stateDir, MailDir: t.TempDir(),
 		Workspace: "wF", Coordinator: "coordinator-1", Now: fixedNow(now),
@@ -421,7 +422,7 @@ func TestRunDefaultAdmissionGateHonorsRealWinddownState(t *testing.T) {
 		DurableMail: func(ctx context.Context, to, summary, body string) error { sent = append(sent, to); return nil },
 		// Kept hermetic: no real herdr wake call from a unit test.
 		Wake:   func(ctx context.Context, lane, nudge string) error { return nil },
-		Stdout: &bytes.Buffer{},
+		Stdout: &stdout,
 	}
 	// No winddown state file exists yet: missing state is deliberately
 	// rejected, same as cmd/herd's requireFleetAdmission.
@@ -430,6 +431,12 @@ func TestRunDefaultAdmissionGateHonorsRealWinddownState(t *testing.T) {
 	}
 	if len(sent) != 0 {
 		t.Fatalf("missing winddown state must refuse a new census, sent=%v", sent)
+	}
+	message := stdout.String()
+	for _, want := range []string{statePath, "herd wind-down off", "--reason initialized"} {
+		if !strings.Contains(message, want) {
+			t.Fatalf("missing-state admission message = %q, want it to contain %q", message, want)
+		}
 	}
 
 	a, err := winddown.New(statePath, nil)
