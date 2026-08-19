@@ -24,6 +24,32 @@ func TestParseReviewArgs_SpawnAfterRef(t *testing.T) {
 	}
 }
 
+func TestReviewRefShapeAndVerboseMode(t *testing.T) {
+	cases := []struct {
+		name string
+		ref  string
+		want reviewRefShape
+	}{
+		{name: "task ref", ref: "FAC-437", want: reviewRefTask},
+		{name: "commit sha", ref: "0123456789abcdef0123456789abcdef01234567", want: reviewRefSHA},
+		{name: "herdr tab", ref: "wB:t365", want: reviewRefTab},
+		{name: "invalid", ref: "not a ref", want: reviewRefInvalid},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := classifyReviewRef(tc.ref); got != tc.want {
+				t.Fatalf("classifyReviewRef(%q) = %q, want %q", tc.ref, got, tc.want)
+			}
+		})
+	}
+	if !reviewVerboseMode([]string{"FAC-437", "--verbose"}) {
+		t.Fatal("--verbose after the ref must be recognized")
+	}
+	if reviewVerboseMode([]string{"FAC-437"}) {
+		t.Fatal("verbose mode must be opt-in")
+	}
+}
+
 // Same swallowed-flag defect on the approve path the loop drives. FAC-132
 // replaced --force/--evidence with --receipt and the --override-* quartet;
 // the property under test is unchanged — a flag placed AFTER the ref must
