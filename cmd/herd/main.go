@@ -928,6 +928,10 @@ func runPreflightStatic() {
 		fmt.Fprintf(os.Stderr, "Preflight failed: %v\n", err)
 		os.Exit(1)
 	}
+	if err := preflight.CheckGoToolchain(); err != nil {
+		fmt.Fprintf(os.Stderr, "Preflight failed: %v\n", err)
+		os.Exit(1)
+	}
 	var allowlist []string
 	if cfg, err := config.LoadConfig(filepath.Join(".herd", "herd.yaml")); err == nil {
 		allowlist = cfg.WorktreeBoundary.AllowedAbsolutePaths

@@ -84,3 +84,54 @@ func TestCheckWorktreeBoundary_LeakDetected(t *testing.T) {
 		t.Errorf("expected leak detection error for absolute path, got nil")
 	}
 }
+
+func TestCheckGoToolchain_ReportsExportedGOROOTMismatch(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "VERSION"), []byte("go1.26.2\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	env := []string{"PATH=/opt/homebrew/bin:/usr/bin", "GOROOT=" + root}
+	probe := func(probeEnv []string, args ...string) (string, error) {
+		if _, ok := lookupEnv(probeEnv, "GOROOT"); ok {
+			t.Fatal("probe environment still contains GOROOT")
+		}
+		if strings.Join(args, " ") == "env GOROOT" {
+			return "/opt/homebrew/Cellar/go/1.26.6/libexec\n", nil
+		}
+		return "go version go1.26.6 darwin/arm64\n", nil
+	}
+
+	err := checkGoToolchain(env, probe)
+	if err == nil {
+		t.Fatal("mismatched exported GOROOT was accepted")
+	}
+	message := err.Error()
+	for _, want := range []string{"GOROOT", "go1.26.2", "go1.26.6", "env -u GOROOT make build"} {
+		if !strings.Contains(message, want) {
+			t.Errorf("error = %q, want it to contain %q", message, want)
+		}
+	}
+}
+
+func TestCheckGoToolchain_AllowsUnsetAndMatchingGOROOT(t *testing.T) {
+	probe := func(_ []string, args ...string) (string, error) {
+		if strings.Join(args, " ") == "env GOROOT" {
+			return "/opt/homebrew/Cellar/go/1.26.6/libexec\n", nil
+		}
+		return "go version go1.26.6 darwin/arm64\n", nil
+	}
+
+	for _, tc := range []struct {
+		name string
+		env  []string
+	}{
+		{name: "unset", env: []string{"PATH=/usr/bin"}},
+		{name: "matching", env: []string{"PATH=/usr/bin", "GOROOT=/opt/homebrew/Cellar/go/1.26.6/libexec"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := checkGoToolchain(tc.env, probe); err != nil {
+				t.Fatalf("checkGoToolchain() error = %v", err)
+			}
+		})
+	}
+}
