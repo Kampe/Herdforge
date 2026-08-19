@@ -25,10 +25,41 @@ import (
 func runReviewIngest() {
 	fs := flag.NewFlagSet("review-ingest", flag.ExitOnError)
 	dryRun := fs.Bool("dry-run", false, "Validate without writing to the ledger")
+	audit := fs.Bool("audit", false, "Audit ingested artifacts for missing ledger verdicts")
+	auditRoot := fs.String("audit-root", filepath.Join(".herd", "review"), "Root containing ingested artifact directories")
 	ledgerPath := fs.String("ledger", filepath.Join(".herd", "review-ledger.jsonl"), "Ledger path")
 	fs.Parse(os.Args[2:])
 
 	files := fs.Args()
+	if *audit {
+		if len(files) != 0 || *dryRun {
+			fmt.Fprintln(os.Stderr, "usage: herd review-ingest --audit [--audit-root <dir>]")
+			os.Exit(2)
+		}
+		ledger, err := reviewledger.NewReviewLedger(".", *ledgerPath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "herd review-ingest: open ledger: %v\n", err)
+			os.Exit(1)
+		}
+		rows, err := ledger.AllRows()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "herd review-ingest: read ledger for audit: %v\n", err)
+			os.Exit(1)
+		}
+		findings, err := reviewingest.AuditIngested(*auditRoot, rows)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "herd review-ingest: audit failed: %v\n", err)
+			os.Exit(1)
+		}
+		for _, finding := range findings {
+			fmt.Printf("STRANDED path=%s sha=%s reason=%s\n", finding.Path, finding.SHA, finding.Reason)
+		}
+		fmt.Printf("herd review-ingest: audit findings=%d\n", len(findings))
+		if len(findings) > 0 {
+			os.Exit(1)
+		}
+		return
+	}
 	if len(files) == 0 {
 		fmt.Fprintln(os.Stderr, "usage: herd review-ingest <verdict-artifact>... [--dry-run]")
 		os.Exit(2)
@@ -132,7 +163,7 @@ func runReviewIngest() {
 			Branch:         a.Branch,
 			CandidateSHA:   a.SHA,
 		}
-		enqueued, err := ledger.Ingest(reviewledger.IngestOpts{Record: recordOpts, Verdict: verdictOpts})
+		enqueued, err := admitVerdictAndMove(ledger, reviewledger.IngestOpts{Record: recordOpts, Verdict: verdictOpts}, f, a.SHA)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "herd review-ingest: admission/verdict write FAILED for %s: %v\n", filepath.Base(f), err)
 			os.Exit(1)
@@ -150,6 +181,30 @@ func runReviewIngest() {
 	if refused > 0 {
 		os.Exit(1)
 	}
+}
+
+type reviewIngestLedger interface {
+	Ingest(reviewledger.IngestOpts) (bool, error)
+	VerdictFor(string) (reviewledger.LedgerRow, bool, error)
+}
+
+// admitVerdictAndMove makes the ledger row observable before moving the source
+// artifact. An append acknowledgement alone is not sufficient admission
+// evidence: a failed read-back must leave the artifact available for retry.
+func admitVerdictAndMove(ledger reviewIngestLedger, opts reviewledger.IngestOpts, source, sha string) (bool, error) {
+	enqueued, err := ledger.Ingest(opts)
+	if err != nil {
+		return false, err
+	}
+	if _, found, err := ledger.VerdictFor(sha); err != nil {
+		return false, fmt.Errorf("read back ledger verdict: %w", err)
+	} else if !found {
+		return false, fmt.Errorf("read back ledger verdict: sha %s not found", sha)
+	}
+	if _, err := reviewingest.MoveToIngested(source); err != nil {
+		return false, fmt.Errorf("move admitted artifact: %w", err)
+	}
+	return enqueued, nil
 }
 
 // runHarvestMerge ports bin/herd-harvest-merge: cherry-pick a lane's unique
