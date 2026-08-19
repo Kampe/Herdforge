@@ -65,11 +65,21 @@ func runGoalGuard() error {
 		return writeGoalJSON(os.Stdout, g)
 	}
 	if *stopHook {
-		return runGoalGuardStopHook(s)
+		return runGoalGuardStopHook(s, nil)
+	}
+	raw, err := io.ReadAll(io.LimitReader(os.Stdin, 64*1024))
+	if err != nil {
+		return fmt.Errorf("read stdin: %w", err)
 	}
 	var evidence goalguard.Evidence
-	if err := json.NewDecoder(io.LimitReader(os.Stdin, 64*1024)).Decode(&evidence); err != nil {
+	if err := json.Unmarshal(raw, &evidence); err != nil {
 		return fmt.Errorf("decode evidence: %w", err)
+	}
+	if strings.TrimSpace(evidence.Lane) == "" {
+		// stdin is not Evidence JSON — it is a Claude Stop hook payload.
+		// --check wired as a Stop hook must behave like --stop-hook, not
+		// spam "incomplete evidence" on every session end.
+		return runGoalGuardStopHook(s, raw)
 	}
 	decision, err := s.Evaluate(evidence)
 	if errors.Is(err, goalguard.ErrMissing) {
@@ -85,11 +95,23 @@ func runGoalGuard() error {
 }
 
 // runGoalGuardStopHook adapts the guard to Claude Code's Stop hook contract:
-// stdin is the hook payload (ignored), no durable goal means nothing to guard
-// (silent exit 0, stop allowed), and an active goal blocks the stop via
-// {"decision":"block"} so the agent keeps working until the goal is met.
-func runGoalGuardStopHook(s *goalguard.Store) error {
-	_, _ = io.Copy(io.Discard, io.LimitReader(os.Stdin, 64*1024))
+// no durable goal means nothing to guard (silent exit 0, stop allowed), and an
+// active goal blocks the stop via {"decision":"block"} so the agent keeps
+// working until the goal is met. When the payload carries stop_hook_active the
+// previous block in this turn was already delivered, so return success —
+// re-blocking loops until the harness force-overrides. The nudge repeats on
+// the agent's next natural stop instead.
+func runGoalGuardStopHook(s *goalguard.Store, payload []byte) error {
+	if payload == nil {
+		payload, _ = io.ReadAll(io.LimitReader(os.Stdin, 64*1024))
+	}
+	var hook struct {
+		StopHookActive bool `json:"stop_hook_active"`
+	}
+	_ = json.Unmarshal(payload, &hook)
+	if hook.StopHookActive {
+		return nil
+	}
 	g, err := s.Load()
 	if errors.Is(err, goalguard.ErrMissing) {
 		return nil
