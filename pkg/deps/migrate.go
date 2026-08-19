@@ -37,7 +37,7 @@ type MigrateItem struct {
 	Ref            string           `json:"ref"`
 	TaskID         string           `json:"task_id"`
 	Status         string           `json:"status"`
-	Action         string           `json:"action"` // skip_fresh | repair_stale | write_empty | write_from_board | error
+	Action         string           `json:"action"` // skip_fresh | repair_stale | write_empty | write_from_board | skip_container | error
 	AlreadyPresent bool             `json:"already_present"`
 	EdgeCount      int              `json:"edge_count"`
 	IntendedEdges  []DependencyEdge `json:"intended_edges,omitempty"`
@@ -172,11 +172,33 @@ func planOne(t *provider.Task, snap *GraphSnapshot) MigrateItem {
 		return item
 	}
 	if len(intended) == 0 {
+		if isContainerCard(t.Labels) {
+			// FAC-458: a container/epic-scoping card is unclaimable by
+			// design; writing an empty herd-deps-v1 fence onto it removes
+			// the "missing structured provenance" refusal that keeps it
+			// unclaimable, silently unblocking governance-critical or
+			// hard-invariant-adjacent epics. Skip instead of writing.
+			item.Action = "skip_container"
+			return item
+		}
 		item.Action = "write_empty"
 	} else {
 		item.Action = "write_from_board"
 	}
 	return item
+}
+
+// isContainerCard reports whether labels mark a card as intentionally
+// unclaimable by design (children get claimed individually; the container
+// itself never should be). Mirrors pkg/lifecycle's isBounded label set.
+func isContainerCard(labels []string) bool {
+	for _, l := range labels {
+		switch l {
+		case "epic", "epic-needs-scoping", "standing-epic":
+			return true
+		}
+	}
+	return false
 }
 
 func intendedBoardEdges(all []DependencyEdge, ref Ref, id TaskID) []DependencyEdge {
