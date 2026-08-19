@@ -1925,8 +1925,61 @@ func parseReviewArgs(args []string) (ref string, spawn bool) {
 	fs := flag.NewFlagSet("review", flag.ExitOnError)
 	spawnFlag := fs.Bool("spawn", false, "Spawn reviewer agent in herdr")
 	_ = fs.Bool("pool", false, "Use the warm-pool review surface path (no signer admission)")
+	_ = fs.Bool("verbose", false, "Show ref parsing and candidate search diagnostics")
 	fs.Parse(leadingPositionalArgs(args))
 	return fs.Arg(0), *spawnFlag
+}
+
+type reviewRefShape string
+
+const (
+	reviewRefTask    reviewRefShape = "task-ref"
+	reviewRefSHA     reviewRefShape = "commit-sha"
+	reviewRefTab     reviewRefShape = "herdr-tab-id"
+	reviewRefInvalid reviewRefShape = "invalid"
+)
+
+// classifyReviewRef describes the input form before the provider is queried.
+// Keeping this separate from candidate discovery makes malformed refs
+// distinguishable from well-formed refs that simply have no candidate.
+func classifyReviewRef(ref string) reviewRefShape {
+	ref = strings.TrimSpace(ref)
+	if ref == "" {
+		return reviewRefInvalid
+	}
+	if len(ref) == 40 && strings.IndexFunc(ref, func(r rune) bool {
+		return !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'f') || (r >= 'A' && r <= 'F'))
+	}) == -1 {
+		return reviewRefSHA
+	}
+	if colon := strings.IndexByte(ref, ':'); colon > 0 && colon < len(ref)-1 &&
+		isReviewRefPart(ref[:colon]) && isReviewRefPart(ref[colon+1:]) {
+		return reviewRefTab
+	}
+	dash := strings.LastIndexByte(ref, '-')
+	if dash > 0 && dash < len(ref)-1 && isReviewRefPart(ref[:dash]) && isReviewRefDigits(ref[dash+1:]) {
+		return reviewRefTask
+	}
+	return reviewRefInvalid
+}
+
+func isReviewRefPart(s string) bool {
+	return s != "" && strings.IndexFunc(s, func(r rune) bool {
+		return !((r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9'))
+	}) == -1
+}
+
+func isReviewRefDigits(s string) bool {
+	return s != "" && strings.IndexFunc(s, func(r rune) bool { return r < '0' || r > '9' }) == -1
+}
+
+func reviewVerboseMode(args []string) bool {
+	for _, arg := range args {
+		if arg == "--verbose" || arg == "--verbose=true" {
+			return true
+		}
+	}
+	return false
 }
 
 func reviewPoolMode(args []string) bool {
@@ -1946,6 +1999,15 @@ func runReview() {
 			os.Exit(1)
 		}
 		return
+	}
+	verbose := reviewVerboseMode(os.Args[2:])
+	refShape := reviewRefShape("queue")
+	if refArg != "" {
+		refShape = classifyReviewRef(refArg)
+		if refShape == reviewRefInvalid {
+			fmt.Fprintf(os.Stderr, "review: invalid ref syntax %q (expected TASK-<number>, a 40-character commit SHA, or a Herdr tab ID such as wB:t365)\n", refArg)
+			os.Exit(1)
+		}
 	}
 	if spawn {
 		if err := requireFleetAdmission(context.Background()); err != nil {
@@ -2031,6 +2093,7 @@ func runReview() {
 		os.Exit(1)
 	}
 
+	discoveredCandidates := len(cands)
 	if refArg != "" {
 		want := hsync.NormalizeRef(refArg)
 		var filtered []*candidateindex.Candidate
@@ -2048,8 +2111,15 @@ func runReview() {
 		taskMap[hsync.NormalizeRef(t.Ref)] = t
 	}
 
+	if verbose {
+		fmt.Printf("review verbose: parsed ref shape=%s; candidate set=provider in-progress tasks + review callbacks + review ledger + review inbox + worktrees; candidates discovered=%d; matches=%d\n", refShape, discoveredCandidates, len(cands))
+	}
 	if len(cands) == 0 {
-		fmt.Println("No tasks in-progress to review.")
+		if refArg != "" {
+			fmt.Printf("No in-progress review candidate matched ref %q (parsed as %s).\n", refArg, refShape)
+		} else {
+			fmt.Println("No tasks in-progress to review.")
+		}
 		return
 	}
 
