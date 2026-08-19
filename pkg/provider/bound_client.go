@@ -96,6 +96,23 @@ func (b *BoundClient) ListTasks(ctx context.Context, projectID, status string) (
 	return tasks, nil
 }
 
+func (b *BoundClient) CreateTask(ctx context.Context, task *Task) (*Task, error) {
+	if b == nil || b.Inner == nil {
+		return nil, fmt.Errorf("CreateTask: nil provider")
+	}
+	if err := freezeGate("CreateTask"); err != nil {
+		return nil, err
+	}
+	creator, ok := b.Inner.(TaskCreator)
+	if !ok {
+		return nil, fmt.Errorf("CreateTask: provider does not support task creation")
+	}
+	opCtx, cancel := BoundOp(ctx, b.deadlines(), OpMutate)
+	defer cancel()
+	created, err := creator.CreateTask(opCtx, task)
+	return created, b.wrap("CreateTask", OpMutate, err)
+}
+
 func (b *BoundClient) ClaimTask(ctx context.Context, taskID, role string) error {
 	if b == nil || b.Inner == nil {
 		return fmt.Errorf("ClaimTask: nil provider")
