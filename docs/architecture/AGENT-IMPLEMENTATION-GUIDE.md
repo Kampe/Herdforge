@@ -62,6 +62,8 @@ Canonical statuses are `to-do`, `in-progress`, `in-review`, and `done`. Adapters
 
 Free-form coordinator text (comments, prompts, review packets) is transported as data via direct process argv, stdin, or file-backed payloads (`pkg/textdelivery`, `herd herdr-deliver --file`, provider HTTP/CLI with a single body argv element). Shell concatenation (`zsh -c`, `eval`, double-quoted bodies with backticks) is forbidden: Markdown and task-supplied text must never be interpreted by a shell (FAC-183 / FAC-151). Existing `AddComment` / `AgentPrompt` / `DeliverAndProve` paths remain operational and already use direct argv; prefer `herdr-deliver` when a durable content digest and readback receipt are required.
 
+For peer-to-peer lane reports, use `herd send <pane|name> "<text>"` when the recipient is live and must see the report in its pane. Use `herd mail send` only for durable mailbox delivery. Durable mail is not surfaced in the recipient pane, so the recipient's durable inbox must be read when that path is used.
+
 ## Deterministic eligibility
 
 Candidate order is:

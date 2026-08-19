@@ -148,6 +148,24 @@ func TestSendHelpDocumentsDeliveryOutcomes(t *testing.T) {
 	}
 }
 
+func TestSendHelpNamesDurableMailAlternative(t *testing.T) {
+	help := strings.ToLower(usageFor("send"))
+	for _, want := range []string{"herd mail send", "durable"} {
+		if !strings.Contains(help, want) {
+			t.Errorf("send help missing durable-mail cross-reference %q:\n%s", want, help)
+		}
+	}
+}
+
+func TestMailHelpNamesPaneSendAlternative(t *testing.T) {
+	help := strings.ToLower(usageFor("mail"))
+	for _, want := range []string{"herd send", "pane"} {
+		if !strings.Contains(help, want) {
+			t.Errorf("mail help missing pane-send cross-reference %q:\n%s", want, help)
+		}
+	}
+}
+
 func TestUnknownHelpFallbackIsHonest(t *testing.T) {
 	got := usageFor("not-a-real-command")
 	if strings.Contains(got, "Run 'herd --help'") {

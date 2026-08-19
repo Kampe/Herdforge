@@ -113,10 +113,18 @@ func warnUnknownMailParticipants(sender, recipient string) {
 		return
 	}
 	known := make(map[string]struct{}, len(agents))
+	var recipientAgent *herdr.AgentEntry
 	for _, agent := range agents {
 		if name := strings.TrimSpace(agent.Name); name != "" {
 			known[name] = struct{}{}
+			if name == recipient {
+				candidate := agent
+				recipientAgent = &candidate
+			}
 		}
+	}
+	if recipientAgent != nil && recipientAgent.PaneID != "" && recipientAgent.Status != "done" {
+		fmt.Fprintf(os.Stderr, "mail send: hint: recipient %q has a live pane; durable-only mail is not surfaced there; use herd send for pane delivery\n", recipient)
 	}
 	for _, participant := range []struct {
 		role string
