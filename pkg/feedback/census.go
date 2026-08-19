@@ -25,6 +25,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Kampe/Herdforge/pkg/config"
 	"github.com/Kampe/Herdforge/pkg/herdr"
 	"github.com/Kampe/Herdforge/pkg/posture"
 	"github.com/Kampe/Herdforge/pkg/winddown"
@@ -411,7 +412,13 @@ func defaultFleetStateDir(repoRoot string) string {
 	if err != nil {
 		return posture.StateDir()
 	}
-	repoName := strings.ToLower(strings.TrimSpace(filepath.Base(abs)))
+	repoName := ""
+	if cfg, cfgErr := config.LoadConfig(filepath.Join(abs, config.DefaultConfigPath)); cfgErr == nil && cfg != nil {
+		repoName = strings.ToLower(strings.TrimSpace(cfg.Project.Name))
+	}
+	if repoName == "" {
+		repoName = strings.ToLower(strings.TrimSpace(filepath.Base(abs)))
+	}
 	if repoName == "" || repoName == "." || repoName == "herdforge" {
 		return posture.StateDir()
 	}
