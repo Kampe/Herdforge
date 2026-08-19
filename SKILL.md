@@ -56,6 +56,39 @@ herd approve FAC-123
 herd board-done FAC-123
 ```
 
+### Durable goal guard
+
+`herd goal-guard` protects a lane from stopping before its durable goal is
+met. It stores the goal in the current worktree at `.herd/goal-guard.json` by
+default, so each lane has isolated state. Select exactly one mode:
+
+```bash
+herd goal-guard --set --lane <lane> --task <task> --owner <owner> --generation <n> [--max <n>] [--expires <RFC3339>]
+herd goal-guard --check < evidence.json
+herd goal-guard --stop-hook
+herd goal-guard --clear
+```
+
+`--set` creates or replaces the durable goal; `--check` evaluates evidence
+JSON (and also accepts a Claude Stop hook payload); `--stop-hook` evaluates the
+goal using Claude's Stop hook contract; and `--clear` removes the goal.
+`--max 0` (the default) allows continuation until a stop condition is met;
+positive values bound the number of continuations.
+
+The Stop hook exits quietly with no decision when no goal exists, and returns
+`{"decision":"block"}` while an active goal is not met. It stops blocking
+once the goal is completed, the lease is lost, the lane is held or winding
+down, the goal expires, or its continuation limit is reached. When the input
+contains `stop_hook_active`, the previous block has already been delivered for
+that stop attempt, so the hook exits successfully to avoid a re-block loop.
+After completion, clear the durable state with `herd goal-guard --clear`.
+
+Goal guards are not installed for ordinary `herd dispatch` workers. The
+current `herd standing` raise path makes a best-effort `--set` call for raised
+standing lanes; an installation failure leaves the lane running with the
+Stop hook's quiet no-goal behavior. Wiring guards into other launch paths is a
+separate design decision.
+
 The review-harvest supervisor owns candidate admission, reviewer dispatch and
 retry, verdict ingest, author feedback, and ephemeral reviewer cleanup. It
 sends only an exact PASS plus merge-ready handoff to the coordinator. The
