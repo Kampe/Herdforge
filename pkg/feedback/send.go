@@ -41,6 +41,13 @@ type mailEnvelope struct {
 // lane's inbox during a census. Adopt the fuller protocol if a second
 // concurrent writer to the same inbox ever needs to be made safe here.
 func DefaultDurableMail(mailDir, coordinator string) func(context.Context, string, string, string) error {
+	return DurableMail(mailDir, coordinator)
+}
+
+// DurableMail returns an append-only sender for the herd-mail wire shape.
+// The sender is explicit because a feedback reply is written by a lane, while
+// the census request is written by the coordinator.
+func DurableMail(mailDir, sender string) func(context.Context, string, string, string) error {
 	return func(_ context.Context, to, summary, body string) error {
 		if strings.TrimSpace(to) == "" {
 			return fmt.Errorf("recipient lane is required")
@@ -59,7 +66,7 @@ func DefaultDurableMail(mailDir, coordinator string) func(context.Context, strin
 			return fmt.Errorf("read inbox %s: %w", path, err)
 		}
 		env := mailEnvelope{
-			ID: id, Type: "message", From: coordinator, To: to,
+			ID: id, Type: "message", From: sender, To: to,
 			Timestamp: time.Now().UTC().Format("2006-01-02T15:04:05Z"),
 			Summary:   summary, Message: body, Category: "informational",
 		}
@@ -77,6 +84,34 @@ func DefaultDurableMail(mailDir, coordinator string) func(context.Context, strin
 		}
 		return f.Sync()
 	}
+}
+
+// RecordReply records the documented `herd send <coordinator>
+// "FLEET_FEEDBACK <epoch> <lane>" <body>` reply in the coordinator's durable
+// inbox. It returns nil for ordinary herd-send text so callers can use this as
+// a narrowly-scoped compatibility bridge without changing normal sends.
+func RecordReply(ctx context.Context, mailDir, lane, coordinator, text string) error {
+	fields := strings.Fields(text)
+	if len(fields) < 3 || fields[0] != SubjectPrefix {
+		return nil
+	}
+	if strings.TrimSpace(lane) == "" || strings.TrimSpace(coordinator) == "" {
+		return fmt.Errorf("feedback reply requires lane and coordinator")
+	}
+	if fields[2] != lane {
+		return fmt.Errorf("feedback reply lane %q does not match HERD_LANE %q", fields[2], lane)
+	}
+	summary := strings.Join(fields[:3], " ")
+	body := strings.TrimSpace(strings.TrimPrefix(text, summary))
+	return DurableMail(mailDir, lane)(ctx, coordinator, summary, body)
+}
+
+// DefaultMailDir resolves the same repo-scoped default used by the census.
+func DefaultMailDir(repoRoot string) string {
+	if configured := strings.TrimSpace(os.Getenv(EnvMailDir)); configured != "" {
+		return configured
+	}
+	return filepath.Join(defaultFleetStateDir(repoRoot), "mail")
 }
 
 func nextMailID(path string) (int64, error) {

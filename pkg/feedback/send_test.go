@@ -51,6 +51,33 @@ func TestDefaultDurableMailRequiresRecipient(t *testing.T) {
 	}
 }
 
+func TestRecordReplyIsCountedByReplyFromLanes(t *testing.T) {
+	mailDir := t.TempDir()
+	if err := RecordReply(context.Background(), mailDir, "lane-a", "coordinator", "FLEET_FEEDBACK E1 lane-a blocker=NONE"); err != nil {
+		t.Fatal(err)
+	}
+	got, missing, err := ReplyFromLanes(filepath.Join(mailDir, "coordinator.jsonl"), "E1", []string{"lane-a"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0] != "lane-a" {
+		t.Fatalf("got replies = %v, want [lane-a]", got)
+	}
+	if len(missing) != 0 {
+		t.Fatalf("missing = %v, want none", missing)
+	}
+}
+
+func TestRecordReplyIgnoresOrdinarySend(t *testing.T) {
+	mailDir := t.TempDir()
+	if err := RecordReply(context.Background(), mailDir, "lane-a", "coordinator", "ordinary prompt"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(mailDir, "coordinator.jsonl")); !os.IsNotExist(err) {
+		t.Fatalf("ordinary send created durable reply inbox: %v", err)
+	}
+}
+
 func TestDefaultWakeUsesConfiguredBinaryWhenSet(t *testing.T) {
 	script := filepath.Join(t.TempDir(), "fake-send.sh")
 	if err := os.WriteFile(script, []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {

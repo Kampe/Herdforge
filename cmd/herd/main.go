@@ -3696,6 +3696,12 @@ func runSend() {
 		fmt.Fprintf(os.Stderr, "herd send: %v\n", err)
 		os.Exit(1)
 	}
+	if lane := strings.TrimSpace(os.Getenv("HERD_LANE")); lane != "" {
+		if err := feedback.RecordReply(context.Background(), feedback.DefaultMailDir("."), lane, target, text); err != nil {
+			fmt.Fprintf(os.Stderr, "herd send: record feedback reply: %v\n", err)
+			os.Exit(1)
+		}
+	}
 	fmt.Printf("herd send: %s -> %s\n", target, status)
 }
 
