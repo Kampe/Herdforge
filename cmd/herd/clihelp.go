@@ -112,7 +112,16 @@ var subcommandUsage = map[string]string{
 	"board-sync":  "Usage: herd board-sync [flags]\n  Reconcile board status against git reality and live lanes (report only).\n  --fix: advance to-do cards to in-progress when a live lane or branch proves work is in flight.",
 	"sh":          "Usage: herd sh\n  Interactive REPL shell (alias: herd repl).",
 	"repl":        "Usage: herd repl\n  Interactive REPL shell (alias: herd sh).",
-	"send":        "Usage: herd send <pane|name> \"<text>\" [--file path] [--no-verify] [--timeout s]\n  Deliver a prompt and verify consumption. Prefer herdr-deliver for durable digests.",
+	"send": `Usage: herd send <pane|name> "<text>" [--file path] [--no-verify] [--timeout s]
+  Deliver a prompt and report whether the agent consumed it.
+
+Outcomes:
+  -> working  delivery confirmed; do not re-send.
+  -> done     delivery confirmed; do not re-send.
+  -> submitted  UNVERIFIED (--no-verify); delivery is unknown, so re-send if needed.
+  no result line  the pane never flipped; exits 1 and re-send is appropriate.
+
+Prefer herdr-deliver for durable digests.`,
 	"herdr-deliver": `Usage: herd herdr-deliver --key <op> --generation <n> --target <name> [--session <id>] [--file path] [--wait] [--timeout s] [--state path]
   Durably deliver exact prompt bytes from stdin or --file to one Herdr session.
   Positional free-form text is rejected (FAC-183 shell-literal incident class).`,

@@ -3801,7 +3801,7 @@ func runSend() {
 			os.Exit(1)
 		}
 	}
-	fmt.Printf("herd send: %s -> %s\n", target, status)
+	fmt.Println(herdr.FormatSendResult(target, status))
 }
 
 // runHerdrDeliver is the durable operator boundary for free-form prompt bytes.

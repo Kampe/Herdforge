@@ -156,6 +156,18 @@ func SendInWorkspace(target, text string, verify bool, timeout time.Duration, wo
 	return sendInWorkspace(target, text, verify, timeout, workspace)
 }
 
+// FormatSendResult renders the operator-facing delivery result.
+func FormatSendResult(target, status string) string {
+	qualifier := ""
+	switch status {
+	case "working", "done":
+		qualifier = " (delivery confirmed)"
+	case "submitted":
+		qualifier = " (UNVERIFIED: --no-verify)"
+	}
+	return fmt.Sprintf("herd send: %s -> %s%s", target, status, qualifier)
+}
+
 func sendInWorkspace(target, text string, verify bool, timeout time.Duration, workspace string) (string, error) {
 	resolved, err := requireAgentWorkspaceIn(target, workspace)
 	if err != nil {

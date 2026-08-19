@@ -26,6 +26,27 @@ func TestStatusFromList(t *testing.T) {
 	}
 }
 
+func TestFormatSendResultExplainsDeliveryGuarantee(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name   string
+		status string
+		want   string
+	}{
+		{name: "working", status: "working", want: "herd send: worker -> working (delivery confirmed)"},
+		{name: "done", status: "done", want: "herd send: worker -> done (delivery confirmed)"},
+		{name: "submitted", status: "submitted", want: "herd send: worker -> submitted (UNVERIFIED: --no-verify)"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := FormatSendResult("worker", tc.status); got != tc.want {
+				t.Fatalf("FormatSendResult(%q) = %q, want %q", tc.status, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestSendPressesEnterImmediatelyAfterPrompt(t *testing.T) {
 	t.Setenv("HERD_WORKSPACE", "wK")
 	oldRun := runHerdr
