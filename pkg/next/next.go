@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"sort"
 	"strings"
 
@@ -12,6 +13,8 @@ import (
 	"github.com/Kampe/Herdforge/pkg/config"
 	"github.com/Kampe/Herdforge/pkg/deps"
 	"github.com/Kampe/Herdforge/pkg/provider"
+	"github.com/Kampe/Herdforge/pkg/reviewingest"
+	"github.com/Kampe/Herdforge/pkg/reviewledger"
 )
 
 type Priority int
@@ -44,6 +47,7 @@ type NextPicker struct {
 	Role           string
 	ReviewArtifact string
 	InboxDir       string
+	LedgerPath     string
 }
 
 func NewNextPicker(cfg *config.Config, tp provider.TaskProvider) *NextPicker {
@@ -52,6 +56,7 @@ func NewNextPicker(cfg *config.Config, tp provider.TaskProvider) *NextPicker {
 		TaskProvider:   tp,
 		ReviewArtifact: ".herd/review/inbox",
 		InboxDir:       ".herd/review/inbox",
+		LedgerPath:     filepath.Join(".herd", "review-ledger.jsonl"),
 	}
 }
 
@@ -249,9 +254,31 @@ func (p *NextPicker) pendingVerdicts() []string {
 	if err != nil {
 		return nil
 	}
+	admitted := make(map[string]struct{})
+	if strings.TrimSpace(p.LedgerPath) != "" {
+		ledger := &reviewledger.Ledger{Path: p.LedgerPath}
+		if rows, err := ledger.AllRows(); err == nil {
+			for _, row := range rows {
+				sha := strings.TrimSpace(row.SHA)
+				if sha == "" {
+					sha = strings.TrimSpace(row.CandidateSHA)
+				}
+				if sha != "" {
+					admitted[strings.ToLower(sha)] = struct{}{}
+				}
+			}
+		}
+	}
 	var verdicts []string
 	for _, e := range entries {
 		if strings.HasSuffix(e.Name(), "-verdict.md") {
+			artifact, err := os.ReadFile(filepath.Join(p.InboxDir, e.Name()))
+			if err == nil {
+				parsed := reviewingest.Parse(string(artifact))
+				if _, ok := admitted[strings.ToLower(strings.TrimSpace(parsed.SHA))]; ok {
+					continue
+				}
+			}
 			verdicts = append(verdicts, e.Name())
 		}
 	}
