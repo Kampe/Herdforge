@@ -20,9 +20,12 @@ import (
 	"os/exec"
 	"sort"
 	"strings"
+	"time"
 
+	"github.com/Kampe/Herdforge/pkg/boardfreeze"
 	"github.com/Kampe/Herdforge/pkg/broadcast"
 	"github.com/Kampe/Herdforge/pkg/lifecycle"
+	"github.com/Kampe/Herdforge/pkg/posture"
 )
 
 // The canonical standing fleet roster is derived at runtime by StandingIDs()
@@ -86,6 +89,16 @@ type Options struct {
 	// prompt; BoundIdentities supplies the bound side of the fence.
 	LiveIdentity    func(context.Context, broadcast.Target) (broadcast.PromptIdentity, error)
 	BoundIdentities map[string]broadcast.PromptIdentity
+	// Cadence is the minimum interval between kicks. LaneCadence overrides it
+	// for a named lane. A zero duration disables cadence throttling.
+	Cadence     time.Duration
+	LaneCadence map[string]time.Duration
+	LastKick    map[string]time.Time
+	Now         func() time.Time
+	// Repair bypasses the fleet freeze gate. Repair prompts are safe to send
+	// during a freeze because they restore an already-authorized change.
+	Repair bool
+	Freeze func() (bool, string, error)
 }
 
 // Result holds counts for one kick run.
@@ -216,12 +229,46 @@ func Run(opts Options) (*Result, error) {
 	if opts.Identity == nil {
 		return nil, fmt.Errorf("kick: complete hold identity resolver is required")
 	}
-	// Determine target names.
+	now := time.Now
+	if opts.Now != nil {
+		now = opts.Now
+	}
+	if opts.LastKick == nil {
+		opts.LastKick = make(map[string]time.Time)
+	}
+	// Determine target names before policy gates so a fleet-wide freeze can
+	// report every standing lane, including the implicit default roster.
 	names := opts.Names
 	if len(names) == 0 {
 		names = append([]string(nil), StandingIDs()...)
 	}
-
+	if !opts.Repair {
+		freeze := opts.Freeze
+		if freeze == nil {
+			freeze = func() (bool, string, error) {
+				if trigger, active := posture.BoardFrozen("."); active {
+					return true, trigger, nil
+				}
+				_, active, err := boardfreeze.Active(now())
+				return active, "board freeze", err
+			}
+		}
+		active, detail, freezeErr := freeze()
+		if freezeErr != nil {
+			return nil, fmt.Errorf("kick: freeze authority: %w", freezeErr)
+		}
+		if active {
+			if strings.TrimSpace(detail) == "" {
+				detail = "board freeze active"
+			}
+			result := &Result{}
+			for _, id := range names {
+				result.Skipped++
+				result.Entries = append(result.Entries, EntryResult{Name: id, Result: "skipped", Reason: "freeze: " + detail})
+			}
+			return result, nil
+		}
+	}
 	// Sort deterministically.
 	if !sorted(names, StandingIDs()) {
 		sort.Strings(names)
@@ -304,6 +351,13 @@ func Run(opts Options) (*Result, error) {
 			result.Entries = append(result.Entries, EntryResult{Name: id, Result: "skipped", Reason: "broadcast:" + reason})
 			continue
 		}
+		if interval := cadenceFor(opts, id); interval > 0 {
+			if previous, ok := opts.LastKick[id]; ok && now().Sub(previous) < interval {
+				result.Skipped++
+				result.Entries = append(result.Entries, EntryResult{Name: id, Result: "skipped", Reason: fmt.Sprintf("cadence: next kick in %s", interval-now().Sub(previous))})
+				continue
+			}
+		}
 		st, paneID, found := LookupAgent(agents, id)
 		if !found || paneID == "" {
 			if !opts.Quiet {
@@ -333,6 +387,7 @@ func Run(opts Options) (*Result, error) {
 						fmt.Printf("herd-kick: DRY %s (missing, would raise)\n", id)
 					}
 					result.Kicked++
+					opts.LastKick[id] = now()
 					result.Entries = append(result.Entries, EntryResult{
 						Name:   id,
 						Result: "dry-run",
@@ -431,6 +486,7 @@ func Run(opts Options) (*Result, error) {
 				fmt.Printf("  msg: %s\n", truncated)
 			}
 			result.Kicked++
+			opts.LastKick[id] = now()
 			result.Entries = append(result.Entries, EntryResult{
 				Name:   id,
 				Status: st,
@@ -461,6 +517,7 @@ func Run(opts Options) (*Result, error) {
 			fmt.Printf("herd-kick: kicked %s (%s → working) pane=%s\n", id, st, paneID)
 		}
 		result.Kicked++
+		opts.LastKick[id] = now()
 		result.Entries = append(result.Entries, EntryResult{
 			Name:   id,
 			Status: st,
@@ -474,6 +531,13 @@ func Run(opts Options) (*Result, error) {
 	}
 
 	return result, nil
+}
+
+func cadenceFor(opts Options, id string) time.Duration {
+	if d, ok := opts.LaneCadence[id]; ok {
+		return d
+	}
+	return opts.Cadence
 }
 
 func sorted(slice, reference []string) bool {

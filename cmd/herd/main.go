@@ -6178,6 +6178,9 @@ func runKick() {
 	quiet := kickFlags.Bool("quiet", false, "Suppress non-error output")
 	reason := kickFlags.String("reason", "", "Override default kick context message")
 	noRaise := kickFlags.Bool("no-raise", false, "Skip raising missing agents via herd-standing")
+	cadence := kickFlags.Duration("cadence", 0, "Minimum interval between kicks (for example 15m)")
+	repair := kickFlags.Bool("repair", false, "Allow a repair kick while the fleet freeze is active")
+	repairKick := kickFlags.Bool("repair-kick", false, "Alias for --repair")
 	selftestFlag := kickFlags.Bool("selftest", false, "Run kick message selftest and exit")
 	kickFlags.Parse(os.Args[2:])
 
@@ -6229,6 +6232,8 @@ func runKick() {
 		Quiet:        *quiet,
 		Reason:       *reason,
 		RaiseMissing: !*noRaise,
+		Cadence:      *cadence,
+		Repair:       *repair || *repairKick,
 		HoldReader:   authority,
 		Identity: func(id string) (lifecycle.HoldIdentity, error) {
 			lane, resolveErr := kickRegistry.ResolveLiveAgentID(id)
