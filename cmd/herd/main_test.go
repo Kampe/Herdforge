@@ -11,6 +11,7 @@ import (
 
 	"github.com/Kampe/Herdforge/internal/testgit"
 	"github.com/Kampe/Herdforge/pkg/config"
+	"github.com/Kampe/Herdforge/pkg/coordinator"
 	"github.com/Kampe/Herdforge/pkg/herdr"
 )
 
@@ -29,6 +30,27 @@ func TestParseMaxLanes(t *testing.T) {
 		if _, _, err := parseMaxLanes(raw); err == nil {
 			t.Errorf("parseMaxLanes(%q) accepted invalid input", raw)
 		}
+	}
+}
+
+func TestCoordinatorControlBindingSurvivesCompletedCoordinatorTab(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Mkdir(filepath.Join(root, ".herd"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := coordinator.Register(root, "coordinator", "wB"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := coordinator.BindTab(root, "wB", "wB:t353", "wB:p353", "term-coordinator"); err != nil {
+		t.Fatal(err)
+	}
+
+	binding, err := coordinatorControlBinding(root, "wB")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !binding.ControlSeat || binding.TabID != "wB:t353" || binding.PaneID != "wB:p353" || binding.TerminalID != "term-coordinator" || binding.Generation != "" {
+		t.Fatalf("binding=%+v, want control-plane provenance without task generation", binding)
 	}
 }
 
