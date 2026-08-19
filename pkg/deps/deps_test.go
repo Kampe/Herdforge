@@ -79,6 +79,21 @@ func TestProviderStore_ConcurrentSnapshotAndNewTask(t *testing.T) {
 	}
 }
 
+// FAC-464: a provider snapshot containing no relations and the SHA-256
+// revision of an empty stream is not evidence that the dependency graph was
+// successfully read. The launch gate must fail closed instead of approving
+// every task against a vacuous graph.
+func TestRejectEmptyProviderGraph(t *testing.T) {
+	if err := RejectEmptyProviderGraph(&GraphSnapshot{
+		ProviderRevision: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+	}); err == nil || !strings.Contains(err.Error(), "empty provider graph") {
+		t.Fatalf("empty provider graph error = %v", err)
+	}
+	if err := RejectEmptyProviderGraph(&GraphSnapshot{ProviderRevision: "real-revision"}); err != nil {
+		t.Fatalf("non-empty provider revision rejected: %v", err)
+	}
+}
+
 func TestMigrate_DryRunAndApply(t *testing.T) {
 	mp := provider.NewMemoryProvider()
 	mp.AddTask(&provider.Task{ID: "t1", Ref: "FAC-1", Status: "to-do", ProjectID: "p", Title: "a"})

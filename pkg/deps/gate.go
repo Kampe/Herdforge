@@ -149,7 +149,6 @@ func ValidateLaunch(
 			Reason: "full graph snapshot returned nil",
 		}
 	}
-
 	// Post-selection TOCTOU: re-validate entire prerequisite closure under budget.
 	if selectionRevision != "" {
 		if ps, ok := store.(*ProviderStore); ok {
