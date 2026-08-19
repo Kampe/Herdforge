@@ -203,7 +203,7 @@ Commands:
 	"process":      "Usage: herd process [flags]\n  Process-engine inspection.",
 	"resolve-lane": "Usage: herd resolve-lane [flags]\n  Resolve canonical lane identity.",
 	"route":        "Usage: herd route [flags]\n  Model / surface routing helpers.",
-	"kick":         "Usage: herd kick [flags]\n  Nudge a stalled lane / agent.",
+	"kick":         "Usage: herd kick [flags]\n  Nudge a stalled lane / agent; --cadence throttles repeat kicks and --repair bypasses freeze.",
 	"lifecycle":    "Usage: herd lifecycle [flags]\n  Lifecycle inspection.",
 	"resources":    "Usage: herd resources [flags]\n  Resource inventory.",
 	"lock":         "Usage: herd lock <acquire|release|status|with> [flags]\n  Shared-checkout dir lock.",

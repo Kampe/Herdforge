@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Kampe/Herdforge/pkg/broadcast"
 	"github.com/Kampe/Herdforge/pkg/lifecycle"
@@ -286,6 +287,48 @@ func TestRun_DryRun(t *testing.T) {
 	}
 	if result.Entries[0].Result != "dry-run" {
 		t.Fatalf("expected dry-run result, got %s", result.Entries[0].Result)
+	}
+}
+
+func TestRun_CadenceSuppressesSecondKick(t *testing.T) {
+	now := time.Date(2026, time.August, 18, 12, 0, 0, 0, time.UTC)
+	last := map[string]time.Time{}
+	opts := Options{
+		Names: []string{"forge-worker"}, DryRun: true, Quiet: true, RaiseMissing: false,
+		Cadence: 10 * time.Minute, LastKick: last, Now: func() time.Time { return now },
+		Freeze:     func() (bool, string, error) { return false, "", nil },
+		HoldReader: allowAllHolds{}, Identity: testIdentity, ActiveTasks: testActiveTasks,
+		Generation: testGeneration, FetchAgents: emptyAgentList,
+	}
+	first, err := Run(opts)
+	if err != nil || first.Kicked != 1 {
+		t.Fatalf("first kick=%+v err=%v", first, err)
+	}
+	now = now.Add(5 * time.Minute)
+	second, err := Run(opts)
+	if err != nil || second.Kicked != 0 || second.Skipped != 1 {
+		t.Fatalf("second kick=%+v err=%v", second, err)
+	}
+	if !strings.Contains(second.Entries[0].Reason, "cadence:") {
+		t.Fatalf("reason=%q", second.Entries[0].Reason)
+	}
+}
+
+func TestRun_FreezeSuppressesWorkButAllowsRepair(t *testing.T) {
+	frozen := func() (bool, string, error) { return true, "incident-427", nil }
+	base := Options{
+		Names: []string{"forge-worker"}, DryRun: true, Quiet: true, RaiseMissing: false,
+		HoldReader: allowAllHolds{}, Identity: testIdentity, ActiveTasks: testActiveTasks,
+		Generation: testGeneration, FetchAgents: emptyAgentList, Freeze: frozen,
+	}
+	work, err := Run(base)
+	if err != nil || work.Kicked != 0 || work.Skipped != 1 {
+		t.Fatalf("work kick=%+v err=%v", work, err)
+	}
+	base.Repair = true
+	repair, err := Run(base)
+	if err != nil || repair.Kicked != 1 || repair.Skipped != 0 {
+		t.Fatalf("repair kick=%+v err=%v", repair, err)
 	}
 }
 
