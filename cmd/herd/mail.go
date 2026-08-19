@@ -9,8 +9,11 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/Kampe/Herdforge/pkg/herdr"
 	"github.com/Kampe/Herdforge/pkg/mail"
 )
+
+var listMailAgents = herdr.AgentList
 
 // runMail exposes ordinary durable mailbox operations. Privileged control
 // envelopes remain owned by runControlArgs so their validation cannot drift.
@@ -78,6 +81,7 @@ func runMailSend(args []string) {
 		fmt.Fprintln(os.Stderr, "mail send: a non-empty body is required via --body, --file, or stdin")
 		os.Exit(2)
 	}
+	warnUnknownMailParticipants(strings.TrimSpace(*sender), strings.TrimSpace(*recipient))
 	path, err := controlMailPath(*mailPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "mail send: %v\n", err)
@@ -95,6 +99,32 @@ func runMailSend(args []string) {
 	if err := json.NewEncoder(os.Stdout).Encode(env); err != nil {
 		fmt.Fprintf(os.Stderr, "mail send: encode response: %v\n", err)
 		os.Exit(1)
+	}
+}
+
+// warnUnknownMailParticipants keeps ordinary mail permissive for future lanes,
+// while giving senders an immediate signal when a typo or stale rename would
+// otherwise create an orphaned mailbox. AgentList includes current and
+// recently-live Herdr rows, which is the namespace used by fleet dispatch.
+func warnUnknownMailParticipants(sender, recipient string) {
+	agents, err := listMailAgents()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "mail send: recipient liveness unavailable: %v\n", err)
+		return
+	}
+	known := make(map[string]struct{}, len(agents))
+	for _, agent := range agents {
+		if name := strings.TrimSpace(agent.Name); name != "" {
+			known[name] = struct{}{}
+		}
+	}
+	for _, participant := range []struct {
+		role string
+		name string
+	}{{"sender", sender}, {"recipient", recipient}} {
+		if _, ok := known[participant.name]; !ok {
+			fmt.Fprintf(os.Stderr, "mail send: warning: %s %q is not a known live or recently-live Herdr agent; message will still be filed\n", participant.role, participant.name)
+		}
 	}
 }
 
