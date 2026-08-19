@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -538,6 +539,54 @@ func cadenceFor(opts Options, id string) time.Duration {
 		return d
 	}
 	return opts.Cadence
+}
+
+// CadenceStatePath is the default durable location for LastKick timestamps.
+// Cadence throttling only suppresses a real repeat kick if this state
+// survives across separate `herd kick` process invocations, so callers
+// should load it with LoadLastKick before Run and persist it with
+// SaveLastKick after.
+func CadenceStatePath() string {
+	return filepath.Join(posture.StateDir(), "kick-cadence.json")
+}
+
+// LoadLastKick reads a durable LastKick map from path. A missing file
+// returns an empty, ready-to-use map rather than an error.
+func LoadLastKick(path string) (map[string]time.Time, error) {
+	data, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return map[string]time.Time{}, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("kick: read cadence state: %w", err)
+	}
+	last := map[string]time.Time{}
+	if len(data) > 0 {
+		if err := json.Unmarshal(data, &last); err != nil {
+			return nil, fmt.Errorf("kick: parse cadence state: %w", err)
+		}
+	}
+	return last, nil
+}
+
+// SaveLastKick durably persists a LastKick map to path, replacing it
+// atomically so a crash mid-write cannot leave a truncated state file.
+func SaveLastKick(path string, last map[string]time.Time) error {
+	data, err := json.Marshal(last)
+	if err != nil {
+		return fmt.Errorf("kick: encode cadence state: %w", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return fmt.Errorf("kick: cadence state dir: %w", err)
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+		return fmt.Errorf("kick: write cadence state: %w", err)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		return fmt.Errorf("kick: commit cadence state: %w", err)
+	}
+	return nil
 }
 
 func sorted(slice, reference []string) bool {
