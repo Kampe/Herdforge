@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/Kampe/Herdforge/pkg/metrics"
+	"github.com/Kampe/Herdforge/pkg/provider"
 	"github.com/Kampe/Herdforge/pkg/webhook"
 )
 
@@ -54,18 +55,20 @@ type ServerStatusResponse struct {
 
 // Config defines the configuration for ControlServer including bounded timeouts.
 type Config struct {
-	Addr              string
-	ReadHeaderTimeout time.Duration
-	ReadTimeout       time.Duration
-	WriteTimeout      time.Duration
-	IdleTimeout       time.Duration
-	ShutdownTimeout   time.Duration
-	Metrics           *metrics.MetricsExporter
-	Now               func() time.Time
-	WebhookEnabled    bool
-	WebhookSecret     string
-	WebhookStorePath  string
-	WebhookConfig     *webhook.Config
+	Addr               string
+	ReadHeaderTimeout  time.Duration
+	ReadTimeout        time.Duration
+	WriteTimeout       time.Duration
+	IdleTimeout        time.Duration
+	ShutdownTimeout    time.Duration
+	Metrics            *metrics.MetricsExporter
+	Now                func() time.Time
+	WebhookEnabled     bool
+	WebhookSecret      string
+	WebhookStorePath   string
+	WebhookConfig      *webhook.Config
+	WebhookTaskCreator provider.TaskCreator
+	WebhookProjectID   string
 }
 
 // DefaultConfig returns a Config populated with default timeouts.
@@ -215,7 +218,11 @@ func NewControlServerWithConfig(cfg Config) (*ControlServer, error) {
 			_ = store.Close()
 			return nil, fmt.Errorf("server: configure webhook receiver: %w", err)
 		}
-		receiver.RegisterHandler(func(*webhook.WebhookEvent) error { return nil })
+		if cfg.WebhookTaskCreator != nil {
+			receiver.RegisterHandler(webhook.NewTaskCreatedHandler(cfg.WebhookTaskCreator, cfg.WebhookProjectID))
+		} else {
+			receiver.RegisterHandler(func(*webhook.WebhookEvent) error { return nil })
+		}
 	}
 
 	return &ControlServer{

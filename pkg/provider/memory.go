@@ -145,6 +145,29 @@ func (m *MemoryProvider) AddTask(t *Task) {
 	m.tasks[t.ID] = t
 }
 
+func (m *MemoryProvider) CreateTask(_ context.Context, task *Task) (*Task, error) {
+	if task == nil || task.Title == "" || task.ProjectID == "" {
+		return nil, fmt.Errorf("create task: title and project are required")
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	copy := *task
+	if copy.ID == "" {
+		copy.ID = fmt.Sprintf("memory-task-%d", len(m.tasks)+1)
+	}
+	if copy.Ref == "" {
+		copy.Ref = copy.ID
+	}
+	copy.Status = NormalizeStatus(copy.Status)
+	if copy.Status == StatusUnknown {
+		copy.Status = StatusToDo
+	}
+	copy.CreatedAt = time.Now().UTC()
+	m.tasks[copy.ID] = &copy
+	returnCopy := copy
+	return &returnCopy, nil
+}
+
 // Comments returns recorded comments for tests (FAC-147 fence coverage).
 func (m *MemoryProvider) Comments(taskID string) []string {
 	m.mu.Lock()

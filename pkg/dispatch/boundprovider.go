@@ -183,6 +183,10 @@ func (p *ContextBoundProvider) ListTasks(ctx context.Context, projectID, status 
 	return p.inner.ListTasks(ctx, projectID, status)
 }
 
+func (p *ContextBoundProvider) CreateTask(context.Context, *provider.Task) (*provider.Task, error) {
+	return nil, fmt.Errorf("CreateTask: context-bound providers cannot create cards")
+}
+
 func (p *ContextBoundProvider) ClaimTask(ctx context.Context, taskID, role string) error {
 	if err := p.check(provider.OpMutate, taskID); err != nil {
 		return err

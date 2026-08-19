@@ -44,6 +44,13 @@ type Task struct {
 	Residuals []residual.Record `json:"residuals,omitempty"`
 }
 
+// TaskCreator creates one board card from an already-normalized task shape.
+// ID, Ref, and timestamps are provider-owned on input and may be ignored by
+// providers that mint those values.
+type TaskCreator interface {
+	CreateTask(context.Context, *Task) (*Task, error)
+}
+
 // TaskProvider defines the interface for task tracking backends (Kaneo, GitHub, Linear)
 type TaskProvider interface {
 	GetTask(ctx context.Context, id string) (*Task, error)

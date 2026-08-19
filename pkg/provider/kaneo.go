@@ -539,6 +539,56 @@ func (k *KaneoProvider) GetTask(ctx context.Context, id string) (*Task, error) {
 	return task, err
 }
 
+// CreateTask creates a backlog card through Kaneo's authenticated API.
+func (k *KaneoProvider) CreateTask(ctx context.Context, task *Task) (*Task, error) {
+	if k == nil || task == nil || strings.TrimSpace(task.Title) == "" {
+		return nil, fmt.Errorf("kaneo CreateTask: title is required")
+	}
+	projectID := strings.TrimSpace(task.ProjectID)
+	if projectID == "" {
+		projectID = strings.TrimSpace(k.ProjectID)
+	}
+	if projectID == "" {
+		return nil, fmt.Errorf("kaneo CreateTask: project is required")
+	}
+	if k.UseCLI {
+		return nil, fmt.Errorf("kaneo CreateTask: CLI task creation is unsupported; use the authenticated API")
+	}
+	ctx, cancel := WithOpDeadline(ctx, k.deadlines(), OpMutate)
+	defer cancel()
+	body, err := json.Marshal(map[string]interface{}{
+		"title": task.Title, "description": task.Description,
+		"projectId": projectID, "status": StatusToDo,
+		"priority": string(task.Priority), "labels": task.Labels,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("kaneo CreateTask: marshal: %w", err)
+	}
+	endpoint := fmt.Sprintf("%s/api/task", strings.TrimRight(k.APIURL, "/"))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	k.authorizeKaneo(req)
+	resp, err := k.httpClient().Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	var dto kaneoTaskDTO
+	if err := DecodeJSONResponse(resp, &dto); err != nil {
+		if pe, ok := err.(*ProviderError); ok {
+			pe.Provider, pe.Op = "kaneo", "CreateTask"
+		}
+		return nil, err
+	}
+	if dto.ID == "" || dto.Ref == "" {
+		return nil, fmt.Errorf("kaneo CreateTask: response missing task identity")
+	}
+	return dtoToTask(dto), nil
+}
+
 // kaneoRunCLI is the CLI runner for Kaneo production UseCLI mode. Tests may
 // swap it for a hermetic counter; production uses process-group RunCLI.
 var kaneoRunCLI = RunCLI
