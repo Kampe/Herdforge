@@ -22,6 +22,10 @@ each kick and after a provider or lane-role change.
   coordinator. The coordinator merges, approves, and closes finished panes.
 - No lane sets a board card done. Lanes send evidence; the coordinator projects
   done only after origin/main proves the delivery.
+- For peer-to-peer reporting, use `herd send <pane|name> "<text>"` when the
+  recipient is live and must see the report in its pane. Use `herd mail send`
+  only for durable mailbox delivery, which is not surfaced in the pane; read
+  the recipient's durable inbox when using that path.
 
 ## Work discipline
 

@@ -121,6 +121,7 @@ Outcomes:
   -> submitted  UNVERIFIED (--no-verify); delivery is unknown, so re-send if needed.
   no result line  the pane never flipped; exits 1 and re-send is appropriate.
 
+Use herd mail send for durable mailbox delivery; it is not surfaced in the recipient pane.
 Prefer herdr-deliver for durable digests.`,
 	"herdr-deliver": `Usage: herd herdr-deliver --key <op> --generation <n> --target <name> [--session <id>] [--file path] [--wait] [--timeout s] [--state path]
   Durably deliver exact prompt bytes from stdin or --file to one Herdr session.
@@ -224,6 +225,7 @@ Commands:
   herd mail control <issue|drain> [flags]
 
 Ordinary durable messages use the local mailbox and are not authenticated control.
+herd send delivers to a pane and verifies consumption; herd mail send is durable-only and is not surfaced in the pane.
 The body may be supplied byte-for-byte with --file, --file -, or stdin; do not combine payload sources.
 Privileged authenticated control callbacks/envelopes are available only through
 herd mail control, which delegates to the existing herd control issue/drain

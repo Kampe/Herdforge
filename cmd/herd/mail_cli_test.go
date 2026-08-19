@@ -84,6 +84,26 @@ func TestWarnUnknownMailParticipantsKeepsSendPermissiveWhenHerdrUnavailable(t *t
 	}
 }
 
+func TestWarnUnknownMailParticipantsExplainsLivePaneSplit(t *testing.T) {
+	restore := listMailAgents
+	defer func() { listMailAgents = restore }()
+	listMailAgents = func() ([]herdr.AgentEntry, error) {
+		return []herdr.AgentEntry{
+			{Name: "coordinator", Status: "working", PaneID: "pane-1"},
+			{Name: "worker", Status: "idle", PaneID: "pane-2"},
+		}, nil
+	}
+
+	output := captureStderr(t, func() {
+		warnUnknownMailParticipants("worker", "coordinator")
+	})
+	for _, want := range []string{"recipient \"coordinator\" has a live pane", "durable-only", "herd send"} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("live-pane hint %q missing from %q", want, output)
+		}
+	}
+}
+
 func captureStderr(t *testing.T, fn func()) string {
 	t.Helper()
 	read, write, err := os.Pipe()
