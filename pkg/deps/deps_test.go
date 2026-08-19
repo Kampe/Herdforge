@@ -501,14 +501,27 @@ func TestReconcile_DuplicateAndCycle(t *testing.T) {
 }
 
 func TestGate_RequiresProvenance(t *testing.T) {
-	m := seedBoard(t)
-	_, err := ValidateLaunch(context.Background(), m, EntryDispatch, "FAC-75", nil, "")
-	if err == nil {
-		t.Fatal("missing provenance must fail")
-	}
-	var be *BlockedError
-	if !errors.As(err, &be) || be.Code != "missing_provenance" {
-		t.Fatalf("code=%v", err)
+	for name, desired := range map[string]*Provenance{
+		"nil":    nil,
+		"absent": {Present: false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			m := seedBoard(t)
+			_, err := ValidateLaunch(context.Background(), m, EntryDispatch, "FAC-75", desired, "")
+			if err == nil {
+				t.Fatal("missing provenance must fail")
+			}
+			var be *BlockedError
+			if !errors.As(err, &be) || be.Code != "missing_provenance" {
+				t.Fatalf("code=%v", err)
+			}
+			if !strings.Contains(be.Reason, "herd deps migrate --apply") {
+				t.Fatalf("missing coordinator remediation in reason: %q", be.Reason)
+			}
+			if !strings.Contains(be.Reason, "coordinator-only") {
+				t.Fatalf("missing coordinator ownership in reason: %q", be.Reason)
+			}
+		})
 	}
 }
 

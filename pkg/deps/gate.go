@@ -97,7 +97,7 @@ func ValidateLaunch(
 	if desired == nil || !desired.Present {
 		return nil, &BlockedError{
 			Ref: taskRef, Code: "missing_provenance",
-			Reason: ErrMissingProvenance.Error() + "; attach versioned herd-deps-v1 record",
+			Reason: ErrMissingProvenance.Error() + "; coordinator-only remediation: run `herd deps migrate` (dry-run), then `HERD_DEPS_MIGRATE_APPLY=1 herd deps migrate --apply`",
 		}
 	}
 
