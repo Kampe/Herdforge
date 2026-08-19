@@ -23,6 +23,12 @@ func Command(dir string, args ...string) *exec.Cmd {
 		"-c", "user.signingKey=",
 		"-c", "user.name=Herdforge Test",
 		"-c", "user.email=herdforge-test@example.invalid",
+		// A fixture must never be able to turn an accidentally inherited
+		// GitHub origin into a real network read or push. Local bare remotes
+		// used by tests do not match these URL forms and remain usable.
+		"-c", "url.file:///dev/null.insteadOf=https://github.com/",
+		"-c", "url.file:///dev/null.insteadOf=ssh://git@github.com/",
+		"-c", "url.file:///dev/null.insteadOf=git@github.com:",
 	}
 	cmd := exec.Command("git", append(config, args...)...)
 	cmd.Dir = dir

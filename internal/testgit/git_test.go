@@ -116,10 +116,46 @@ func TestCommandUsesSafeGitArguments(t *testing.T) {
 		"-c", "user.signingKey=",
 		"-c", "user.name=Herdforge Test",
 		"-c", "user.email=herdforge-test@example.invalid",
+		"-c", "url.file:///dev/null.insteadOf=https://github.com/",
+		"-c", "url.file:///dev/null.insteadOf=ssh://git@github.com/",
+		"-c", "url.file:///dev/null.insteadOf=git@github.com:",
 		"commit", "-m", "message",
 	}
 	if got := strings.Join(cmd.Args, "\x00"); got != strings.Join(want, "\x00") {
 		t.Fatalf("argv = %q, want %q", cmd.Args, want)
+	}
+}
+
+func TestCommandRedirectsGitHubRemotesAwayFromTheNetwork(t *testing.T) {
+	tests := []struct {
+		name string
+		url  string
+	}{
+		{name: "https", url: "https://github.com/Kampe/Herdforge.git"},
+		{name: "ssh URL", url: "ssh://git@github.com/Kampe/Herdforge.git"},
+		{name: "scp", url: "git@github.com:Kampe/Herdforge.git"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			if out, err := Command(dir, "init", "-q", "-b", "main").CombinedOutput(); err != nil {
+				t.Fatalf("init fixture: %v\n%s", err, out)
+			}
+			if out, err := Command(dir, "remote", "add", "origin", tt.url).CombinedOutput(); err != nil {
+				t.Fatalf("add remote: %v\n%s", err, out)
+			}
+
+			// This command would contact the real GitHub remote without the
+			// rewrite. The /dev/null diagnostic proves Git resolved the URL
+			// to the sink instead of merely failing for an unrelated reason.
+			out, err := Command(dir, "ls-remote", "origin").CombinedOutput()
+			if err == nil {
+				t.Fatalf("GitHub remote unexpectedly succeeded: %s", out)
+			}
+			if !strings.Contains(string(out), "/dev/null") {
+				t.Fatalf("GitHub remote was not redirected to sink: %v\n%s", err, out)
+			}
+		})
 	}
 }
 
