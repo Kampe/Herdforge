@@ -712,7 +712,7 @@ func TestSigner_RefusesNonIsolatedKeyStore(t *testing.T) {
 	bare := t.TempDir()
 	if _, err := LoadOrCreateSigner(bare, "herdforge", root); err == nil {
 		t.Fatal("unattested key store must refuse to sign")
-	} else if !strings.Contains(err.Error(), "no isolation attestation") {
+	} else if !strings.Contains(err.Error(), "attest key not established") {
 		t.Fatalf("expected the missing-attestation refusal, got: %v", err)
 	}
 
