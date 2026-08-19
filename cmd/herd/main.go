@@ -1090,7 +1090,12 @@ func runStatus() {
 		os.Exit(1)
 	}
 	fmt.Println(line)
-	observer := &herdr.ProductionReconciliationObserver{Workspace: cfg.Fleet.HerdrWorkspace,
+	control, controlErr := coordinatorControlBinding(root, cfg.Fleet.HerdrWorkspace)
+	if controlErr != nil {
+		fmt.Fprintf(os.Stderr, "Reconciliation: BLOCKED (coordinator binding: %v)\n", controlErr)
+		return
+	}
+	observer := &herdr.ProductionReconciliationObserver{Workspace: cfg.Fleet.HerdrWorkspace, ControlBinding: control,
 		Reader: herdr.SocketAuthorityReader{}, LegacyStore: &herdr.JSONLLegacyTabStateStore{Path: filepath.Join(root, ".herd", "legacy-tab-state.jsonl")}, Record: (&herdr.JSONLRecorder{Path: filepath.Join(root, ".herd", "reconciliation.jsonl")}).Record}
 	err = observer.ObserveReconciliation(context.Background())
 	fleet := herdr.ProjectFleetStatus(observer.Decisions(), len(cfg.Lanes))
@@ -9294,16 +9299,9 @@ func newProductionForgeObserver(cfg *config.Config) (*herdr.ProductionReconcilia
 	if workspace == "" {
 		return nil, fmt.Errorf("forge reconciliation observer: Herdr workspace is required")
 	}
-	registration, err := coordinator.Resolve(".")
+	control, err := coordinatorControlBinding(".", workspace)
 	if err != nil {
 		return nil, fmt.Errorf("forge reconciliation observer: coordinator binding: %w", err)
-	}
-	control := herdr.TabBinding{}
-	if registration.Workspace == workspace && registration.TabID != "" && registration.PaneID != "" && registration.TerminalID != "" {
-		control = herdr.TabBinding{
-			TabID: registration.TabID, Workspace: registration.Workspace, PaneID: registration.PaneID,
-			TerminalID: registration.TerminalID, Role: "coordinator", ControlSeat: true,
-		}
 	}
 	root, err := canonicalHerdRoot()
 	if err != nil {
@@ -9337,6 +9335,20 @@ func newProductionForgeObserver(cfg *config.Config) (*herdr.ProductionReconcilia
 			}}
 		},
 		Completion: completion,
+	}, nil
+}
+
+func coordinatorControlBinding(root, workspace string) (herdr.TabBinding, error) {
+	registration, err := coordinator.Resolve(root)
+	if err != nil {
+		return herdr.TabBinding{}, err
+	}
+	if registration.Workspace != workspace || registration.TabID == "" || registration.PaneID == "" || registration.TerminalID == "" {
+		return herdr.TabBinding{}, nil
+	}
+	return herdr.TabBinding{
+		TabID: registration.TabID, Workspace: registration.Workspace, PaneID: registration.PaneID,
+		TerminalID: registration.TerminalID, Role: "coordinator", ControlSeat: true,
 	}, nil
 }
 
