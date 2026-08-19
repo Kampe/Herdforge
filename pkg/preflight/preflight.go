@@ -118,13 +118,46 @@ func checkWorktreeBoundaryFiles(rootDir string, paths []string, allowlist []stri
 	return nil
 }
 
+// changedPaths returns the files a lane has touched relative to its base
+// branch: committed changes since the merge-base with origin/main, plus
+// anything still uncommitted. Scoping to `git status` alone drops coverage
+// to zero the instant a lane commits its own work, defeating the point of
+// scoped scanning (FAC-431 follow-up).
 func changedPaths(rootDir string) ([]string, error) {
-	status, err := runCmd(rootDir, "git", "status", "--porcelain", "--untracked-files=all")
-	if err != nil {
-		return nil, err
-	}
 	paths := make([]string, 0)
 	seen := map[string]struct{}{}
+	add := func(path string) {
+		path = filepath.ToSlash(filepath.Clean(path))
+		if path == "." || path == "" {
+			return
+		}
+		if _, ok := seen[path]; ok {
+			return
+		}
+		seen[path] = struct{}{}
+		paths = append(paths, path)
+	}
+
+	if base, err := runCmd(rootDir, "git", "merge-base", "HEAD", "origin/main"); err == nil {
+		base = strings.TrimSpace(base)
+		if base != "" {
+			if diff, diffErr := runCmd(rootDir, "git", "diff", "--name-only", base, "HEAD"); diffErr == nil {
+				for _, line := range strings.Split(diff, "\n") {
+					if line = strings.TrimSpace(line); line != "" {
+						add(line)
+					}
+				}
+			}
+		}
+	}
+
+	status, err := runCmd(rootDir, "git", "status", "--porcelain", "--untracked-files=all")
+	if err != nil {
+		if len(paths) > 0 {
+			return paths, nil
+		}
+		return nil, err
+	}
 	for _, line := range strings.Split(status, "\n") {
 		if len(line) < 3 {
 			continue
@@ -133,15 +166,7 @@ func changedPaths(rootDir string) ([]string, error) {
 		if arrow := strings.LastIndex(path, " -> "); arrow >= 0 {
 			path = path[arrow+4:]
 		}
-		path = filepath.ToSlash(filepath.Clean(path))
-		if path == "." || path == "" {
-			continue
-		}
-		if _, ok := seen[path]; ok {
-			continue
-		}
-		seen[path] = struct{}{}
-		paths = append(paths, path)
+		add(path)
 	}
 	return paths, nil
 }
