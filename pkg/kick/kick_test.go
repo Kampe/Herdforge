@@ -314,6 +314,80 @@ func TestRun_CadenceSuppressesSecondKick(t *testing.T) {
 	}
 }
 
+func TestSaveLoadLastKick_RoundTrips(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "cadence.json")
+	want := map[string]time.Time{
+		"forge-worker": time.Date(2026, time.August, 18, 12, 0, 0, 0, time.UTC),
+	}
+	if err := SaveLastKick(path, want); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	got, err := LoadLastKick(path)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if !got["forge-worker"].Equal(want["forge-worker"]) {
+		t.Fatalf("loaded = %v, want %v", got["forge-worker"], want["forge-worker"])
+	}
+}
+
+func TestLoadLastKick_MissingFileReturnsEmptyMap(t *testing.T) {
+	got, err := LoadLastKick(filepath.Join(t.TempDir(), "does-not-exist.json"))
+	if err != nil {
+		t.Fatalf("load missing: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("loaded = %v, want empty", got)
+	}
+}
+
+// TestRun_CadenceSurvivesAcrossSeparateProcessInvocations is the FAC-427
+// regression: a bare in-memory LastKick map only throttles kicks within one
+// Run call. The real herd-kick CLI is invoked repeatedly as separate
+// processes (by pulse/cron), so cadence must survive a save/reload cycle
+// between two independent Run calls, not just two calls sharing one map.
+func TestRun_CadenceSurvivesAcrossSeparateProcessInvocations(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "cadence.json")
+	now := time.Date(2026, time.August, 18, 12, 0, 0, 0, time.UTC)
+
+	loaded, err := LoadLastKick(path)
+	if err != nil {
+		t.Fatalf("initial load: %v", err)
+	}
+	first, err := Run(Options{
+		Names: []string{"forge-worker"}, DryRun: true, Quiet: true, RaiseMissing: false,
+		Cadence: 10 * time.Minute, LastKick: loaded, Now: func() time.Time { return now },
+		Freeze:     func() (bool, string, error) { return false, "", nil },
+		HoldReader: allowAllHolds{}, Identity: testIdentity, ActiveTasks: testActiveTasks,
+		Generation: testGeneration, FetchAgents: emptyAgentList,
+	})
+	if err != nil || first.Kicked != 1 {
+		t.Fatalf("first kick=%+v err=%v", first, err)
+	}
+	if err := SaveLastKick(path, loaded); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+
+	// Simulate a brand-new `herd kick` process 5 minutes later: fresh Go
+	// map, reloaded from the durable state file rather than shared in
+	// memory with the first Run call.
+	reloaded, err := LoadLastKick(path)
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	now = now.Add(5 * time.Minute)
+	second, err := Run(Options{
+		Names: []string{"forge-worker"}, DryRun: true, Quiet: true, RaiseMissing: false,
+		Cadence: 10 * time.Minute, LastKick: reloaded, Now: func() time.Time { return now },
+		Freeze:     func() (bool, string, error) { return false, "", nil },
+		HoldReader: allowAllHolds{}, Identity: testIdentity, ActiveTasks: testActiveTasks,
+		Generation: testGeneration, FetchAgents: emptyAgentList,
+	})
+	if err != nil || second.Kicked != 0 || second.Skipped != 1 {
+		t.Fatalf("second kick=%+v err=%v, want suppressed by reloaded cadence state", second, err)
+	}
+}
+
 func TestRun_FreezeSuppressesWorkButAllowsRepair(t *testing.T) {
 	frozen := func() (bool, string, error) { return true, "incident-427", nil }
 	base := Options{

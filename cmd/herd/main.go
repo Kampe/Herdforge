@@ -6295,6 +6295,13 @@ func runKick() {
 		os.Exit(1)
 	}
 
+	cadenceStatePath := kick.CadenceStatePath()
+	lastKick, err := kick.LoadLastKick(cadenceStatePath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "herd-kick: %v\n", err)
+		os.Exit(1)
+	}
+
 	result, err := kick.Run(kick.Options{
 		Names:        args,
 		Force:        *all,
@@ -6303,6 +6310,7 @@ func runKick() {
 		Reason:       *reason,
 		RaiseMissing: !*noRaise,
 		Cadence:      *cadence,
+		LastKick:     lastKick,
 		Repair:       *repair || *repairKick,
 		HoldReader:   authority,
 		Identity: func(id string) (lifecycle.HoldIdentity, error) {
@@ -6317,6 +6325,15 @@ func runKick() {
 		},
 		ActiveTasks: activeResolver,
 	})
+	// Persist regardless of err: Run mutates lastKick in place for every
+	// kick it actually sent before any later failure. --dry-run never sends
+	// anything real, so it must never durably suppress a future live kick.
+	if !*dryRun {
+		if saveErr := kick.SaveLastKick(cadenceStatePath, lastKick); saveErr != nil {
+			fmt.Fprintf(os.Stderr, "herd-kick: %v\n", saveErr)
+			os.Exit(1)
+		}
+	}
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "herd-kick: error — %v\n", err)
 		os.Exit(1)
