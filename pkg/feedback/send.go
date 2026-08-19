@@ -92,8 +92,14 @@ func DurableMail(mailDir, sender string) func(context.Context, string, string, s
 // a narrowly-scoped compatibility bridge without changing normal sends.
 func RecordReply(ctx context.Context, mailDir, lane, coordinator, text string) error {
 	fields := strings.Fields(text)
-	if len(fields) < 3 || fields[0] != SubjectPrefix {
+	if len(fields) == 0 || fields[0] != SubjectPrefix {
 		return nil
+	}
+	if len(fields) < 3 {
+		return fmt.Errorf("feedback reply requires epoch and lane")
+	}
+	if fields[1] == "" || fields[2] == "" {
+		return fmt.Errorf("feedback reply requires epoch and lane")
 	}
 	if strings.TrimSpace(lane) == "" || strings.TrimSpace(coordinator) == "" {
 		return fmt.Errorf("feedback reply requires lane and coordinator")

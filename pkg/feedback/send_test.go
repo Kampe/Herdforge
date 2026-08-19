@@ -51,7 +51,31 @@ func TestDefaultDurableMailRequiresRecipient(t *testing.T) {
 	}
 }
 
-func TestRecordReplyIsCountedByReplyFromLanes(t *testing.T) {
+func TestRecordReply(t *testing.T) {
+	tests := []struct {
+		name       string
+		text       string
+		wantErr    bool
+		wantRecord bool
+	}{
+		{name: "feedback reply", text: "FLEET_FEEDBACK E1 lane-a blocker=NONE", wantRecord: true},
+		{name: "ordinary send", text: "ordinary prompt"},
+		{name: "missing epoch", text: "FLEET_FEEDBACK lane-a", wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mailDir := t.TempDir()
+			err := RecordReply(context.Background(), mailDir, "lane-a", "coordinator", tt.text)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("RecordReply() error = %v, wantErr %v", err, tt.wantErr)
+			}
+			_, statErr := os.Stat(filepath.Join(mailDir, "coordinator.jsonl"))
+			if (statErr == nil) != tt.wantRecord {
+				t.Fatalf("durable record exists = %v, want %v (stat error: %v)", statErr == nil, tt.wantRecord, statErr)
+			}
+		})
+	}
+
 	mailDir := t.TempDir()
 	if err := RecordReply(context.Background(), mailDir, "lane-a", "coordinator", "FLEET_FEEDBACK E1 lane-a blocker=NONE"); err != nil {
 		t.Fatal(err)
@@ -60,21 +84,8 @@ func TestRecordReplyIsCountedByReplyFromLanes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(got) != 1 || got[0] != "lane-a" {
-		t.Fatalf("got replies = %v, want [lane-a]", got)
-	}
-	if len(missing) != 0 {
-		t.Fatalf("missing = %v, want none", missing)
-	}
-}
-
-func TestRecordReplyIgnoresOrdinarySend(t *testing.T) {
-	mailDir := t.TempDir()
-	if err := RecordReply(context.Background(), mailDir, "lane-a", "coordinator", "ordinary prompt"); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := os.Stat(filepath.Join(mailDir, "coordinator.jsonl")); !os.IsNotExist(err) {
-		t.Fatalf("ordinary send created durable reply inbox: %v", err)
+	if len(got) != 1 || got[0] != "lane-a" || len(missing) != 0 {
+		t.Fatalf("reply census = got %v, missing %v; want got [lane-a], missing none", got, missing)
 	}
 }
 
