@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -121,6 +123,40 @@ func TestMigrate_DryRunAndApply(t *testing.T) {
 	}
 	if err := p.BindAndValidate("FAC-1", "t1"); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestApplyMigrationReportsPeriodicProgress(t *testing.T) {
+	mp := provider.NewMemoryProvider()
+	for i := 1; i <= 10; i++ {
+		ref := fmt.Sprintf("FAC-%d", i)
+		mp.AddTask(&provider.Task{ID: "id-" + ref, Ref: ref, Status: "to-do", ProjectID: "p"})
+	}
+	store := StoreFor(mp, "p")
+
+	read, write, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldStderr := os.Stderr
+	os.Stderr = write
+	defer func() {
+		os.Stderr = oldStderr
+	}()
+
+	_, applyErr := ApplyMigration(context.Background(), store, mp, "p", MemoryDescriptionWriter{MP: mp}, t.TempDir())
+	if closeErr := write.Close(); closeErr != nil {
+		t.Fatal(closeErr)
+	}
+	progress, readErr := io.ReadAll(read)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if applyErr != nil {
+		t.Fatal(applyErr)
+	}
+	if got := string(progress); !strings.Contains(got, "herd deps migrate apply: processed 10/10 cards (current=FAC-10)") {
+		t.Fatalf("progress output = %q, want periodic processed/total line with current ref", got)
 	}
 }
 
