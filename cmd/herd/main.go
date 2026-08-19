@@ -7149,15 +7149,7 @@ func runLocked(child []string, lockdir string) int {
 //	herd review-ledger tier <sha>            — resolved risk tier for a sha
 //	herd review-ledger drift                — report standing builder-family drift
 func runReviewLedger() {
-	ledgerPath := os.Getenv("HERD_REVIEW_LEDGER")
-	if ledgerPath == "" {
-		base := os.Getenv("XDG_STATE_HOME")
-		if base == "" {
-			home, _ := os.UserHomeDir()
-			base = filepath.Join(home, ".local", "state")
-		}
-		ledgerPath = filepath.Join(base, "herdforge", "review-ledger.jsonl")
-	}
+	ledgerPath := reviewLedgerPath()
 	l, err := reviewledger.NewReviewLedger(".", ledgerPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "review-ledger: %v\n", err)
@@ -7232,6 +7224,16 @@ func runReviewLedger() {
 		fmt.Fprintf(os.Stderr, "review-ledger: unknown mode %q\n", mode)
 		os.Exit(2)
 	}
+}
+
+// reviewLedgerPath is the shared default for review-ingest and the
+// review-ledger inspection commands. Review evidence is repository-scoped so
+// a worktree cannot silently inspect a different, empty state ledger.
+func reviewLedgerPath() string {
+	if path := strings.TrimSpace(os.Getenv("HERD_REVIEW_LEDGER")); path != "" {
+		return path
+	}
+	return filepath.Join(".herd", "review-ledger.jsonl")
 }
 
 // reportStandingBuilderFamilyDrift resolves live Herdr provider evidence and
