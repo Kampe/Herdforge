@@ -6769,6 +6769,12 @@ func runRoute() {
 		fmt.Fprintf(os.Stderr, "herd route: %v\n", err)
 		os.Exit(1)
 	}
+	routeLog := firstEnv("HERD_ROUTE_DECISION_LOG", "HERD_THROUGHPUT_ROUTE_LOG",
+		filepath.Join(stateDir(), "route-decisions.log"))
+	if err := router.AppendRouteDecision(routeLog, rt, time.Now); err != nil {
+		fmt.Fprintf(os.Stderr, "herd route: %v\n", err)
+		os.Exit(1)
+	}
 	if *wantJSON {
 		json.NewEncoder(os.Stdout).Encode(rt)
 		return

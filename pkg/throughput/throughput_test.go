@@ -49,13 +49,15 @@ func TestCountRouteLines(t *testing.T) {
 	lines := []string{
 		"2026-08-01T10:00:00Z route claude",
 		"2026-08-01T11:00:00Z route codex",
+		`{"timestamp":"2026-08-01T12:00:00Z","provider":"grok","reason":"fallback"}`,
+		`{"timestamp":"2026-08-03T12:00:00Z","provider":"grok"}`,
 		"2026-07-01T10:00:00Z route old",
 		"no timestamp here",
 		"",
 	}
 	got := CountRouteLines(lines, "2026-08-01T00:00:00Z", "2026-08-02T00:00:00Z")
-	if got != 2 {
-		t.Errorf("want 2 in-window T lines, got %d", got)
+	if got != 3 {
+		t.Errorf("want 3 in-window route lines, got %d", got)
 	}
 }
 
