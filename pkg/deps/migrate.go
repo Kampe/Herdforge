@@ -113,19 +113,26 @@ const migrationSnapshotRetryBackoff = 100 * time.Millisecond
 // second failed snapshot remains a hard error: migration must never infer an
 // empty or partial graph from an unavailable relation surface.
 func snapshotForMigration(ctx context.Context, store RelationStore) (*GraphSnapshot, error) {
-	snap, err := store.SnapshotGraph(ctx)
-	if err == nil || provider.ClassifyOpError(err) != provider.OpTimeout {
-		return snap, err
+	const maxAttempts = 2
+	var snap *GraphSnapshot
+	var err error
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		snap, err = store.SnapshotGraph(ctx)
+		if err == nil || provider.ClassifyOpError(err) != provider.OpTimeout {
+			return snap, err
+		}
+		if attempt == maxAttempts {
+			break
+		}
+		timer := time.NewTimer(migrationSnapshotRetryBackoff)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, ctx.Err()
+		case <-timer.C:
+		}
 	}
-
-	timer := time.NewTimer(migrationSnapshotRetryBackoff)
-	defer timer.Stop()
-	select {
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	case <-timer.C:
-	}
-	return store.SnapshotGraph(ctx)
+	return nil, err
 }
 
 func planOne(t *provider.Task, snap *GraphSnapshot) MigrateItem {
