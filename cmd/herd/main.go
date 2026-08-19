@@ -1045,7 +1045,10 @@ func reportCurrentProvenance(root string) error {
 }
 
 func runStatus() {
-	cfg, err := config.LoadConfig(".herd/herd.yaml")
+	_, canonicalErr := canonicalHerdRoot()
+	root := statusRepoRoot()
+	var err error
+	cfg, err := config.LoadConfig(filepath.Join(root, ".herd", "herd.yaml"))
 	if err != nil {
 		fmt.Printf("Status: Uninitialized (no valid .herd/herd.yaml found)\n")
 		return
@@ -1056,7 +1059,7 @@ func runStatus() {
 	fmt.Printf("Status: Active\nProject: %s\nProvider: %s (project=%s, enabled=%s)\nLanes: %d configured\n",
 		cfg.Project.Name, cfg.TaskProvider.Type, cfg.TaskProvider.ProjectID,
 		providerPolicySummary(cfg.TaskProvider.Enabled), len(cfg.Lanes))
-	st, err := store.New(".herd/herdforge.db")
+	st, err := store.New(filepath.Join(root, ".herd", "herdforge.db"))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Dependency evidence: UNAVAILABLE (%v)\n", err)
 		os.Exit(1)
@@ -1077,14 +1080,18 @@ func runStatus() {
 	// FAC-193: a completed tool call must not be able to hide a live
 	// background terminal behind an agent-level working state, so fleet
 	// status reports retained command sessions alongside lane evidence.
-	line, err := commandSessionStatusLine(commandSessionDBPath(""), time.Now)
+	sessionDB := commandSessionDBPath("")
+	if canonicalErr == nil {
+		sessionDB = filepath.Join(root, ".herd", "command-sessions.db")
+	}
+	line, err := commandSessionStatusLine(sessionDB, time.Now)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Retained command sessions: UNREADABLE (%v)\n", err)
 		os.Exit(1)
 	}
 	fmt.Println(line)
 	observer := &herdr.ProductionReconciliationObserver{Workspace: cfg.Fleet.HerdrWorkspace,
-		Reader: herdr.SocketAuthorityReader{}, LegacyStore: &herdr.JSONLLegacyTabStateStore{Path: ".herd/legacy-tab-state.jsonl"}, Record: (&herdr.JSONLRecorder{Path: ".herd/reconciliation.jsonl"}).Record}
+		Reader: herdr.SocketAuthorityReader{}, LegacyStore: &herdr.JSONLLegacyTabStateStore{Path: filepath.Join(root, ".herd", "legacy-tab-state.jsonl")}, Record: (&herdr.JSONLRecorder{Path: filepath.Join(root, ".herd", "reconciliation.jsonl")}).Record}
 	err = observer.ObserveReconciliation(context.Background())
 	fleet := herdr.ProjectFleetStatus(observer.Decisions(), len(cfg.Lanes))
 	if len(observer.LiveAgents()) > 0 {
@@ -1102,6 +1109,20 @@ func runStatus() {
 			fleet.Working, fleet.Capacity, fleet.Standing, fleet.Preserved, fleet.Recovering, fleet.ControlSeats, fleet.Unknown)
 	}
 	reportWorkspacePlacement()
+}
+
+// statusRepoRoot prefers the canonical checkout for linked worktrees, while
+// retaining status's historical local-directory behavior for uninitialized
+// or synthetic fixtures that are not Git repositories.
+func statusRepoRoot() string {
+	if root, err := canonicalHerdRoot(); err == nil {
+		return root
+	}
+	root, err := filepath.Abs(".")
+	if err != nil {
+		return "."
+	}
+	return root
 }
 
 // reportWorkspacePlacement is deliberately read-only. Herdr tab placement is
@@ -4780,9 +4801,9 @@ func runHarvest() {
 	asJSON := harvestFlags.Bool("json", false, "Output JSON")
 	harvestFlags.Parse(os.Args[2:])
 
-	repoRoot := "."
-	if err := os.Chdir(repoRoot); err != nil {
-		fmt.Fprintf(os.Stderr, "failed to change dir: %v\n", err)
+	repoRoot, err := canonicalHerdRoot()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "herd-harvest: cannot resolve canonical repository root: %v\n", err)
 		os.Exit(1)
 	}
 	h := harvest.NewHarvester(repoRoot)
@@ -5191,7 +5212,12 @@ func runUnmerged() {
 	}
 
 	ctx := context.Background()
-	h := harvest.NewHarvester(".")
+	repoRoot, err := canonicalHerdRoot()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "herd-unmerged: cannot resolve canonical repository root: %v\n", err)
+		os.Exit(1)
+	}
+	h := harvest.NewHarvester(repoRoot)
 
 	switch args[0] {
 	case "-h", "--help":

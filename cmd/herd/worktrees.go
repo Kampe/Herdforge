@@ -140,8 +140,13 @@ func runWorktrees() {
 		os.Exit(2)
 	}
 
-	// Resolve repo root
-	repoRoot := firstEnv("HERD_ROOT", "HERD_REPO_ROOT", ".")
+	// Resolve the canonical repo root so fleet evidence is shared when this
+	// command runs from a standing lane's linked worktree.
+	repoRoot, err := canonicalHerdRoot()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "herd-worktrees: cannot resolve canonical repository root: %v\n", err)
+		os.Exit(1)
+	}
 	absRoot, err := filepath.Abs(repoRoot)
 	if err != nil {
 		absRoot = repoRoot
