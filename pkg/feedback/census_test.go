@@ -25,6 +25,32 @@ func TestDefaultFleetStateDirScopesForeignRepo(t *testing.T) {
 	}
 }
 
+func TestDefaultFleetStateDirUsesProjectNameAcrossWorktrees(t *testing.T) {
+	stateHome := filepath.Join(t.TempDir(), "state")
+	t.Setenv("HERD_STATE_DIR", "")
+	t.Setenv("XDG_STATE_HOME", stateHome)
+
+	worktreeA := t.TempDir()
+	worktreeB := t.TempDir()
+	for _, root := range []string{worktreeA, worktreeB} {
+		herdDir := filepath.Join(root, ".herd")
+		if err := os.Mkdir(herdDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		config := []byte("version: \"1\"\nproject:\n  name: \"chainseer\"\ntask_provider:\n  type: \"kaneo\"\n")
+		if err := os.WriteFile(filepath.Join(herdDir, "herd.yaml"), config, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	gotA := defaultFleetStateDir(worktreeA)
+	gotB := defaultFleetStateDir(worktreeB)
+	want := filepath.Join(stateHome, "chainseer", "herd")
+	if gotA != want || gotB != want {
+		t.Fatalf("worktree state dirs = %q and %q, want both %q", gotA, gotB, want)
+	}
+}
+
 func TestDefaultFleetStateDirHonorsExplicitOverride(t *testing.T) {
 	override := filepath.Join(t.TempDir(), "shared-herd-state")
 	t.Setenv("HERD_STATE_DIR", override)
