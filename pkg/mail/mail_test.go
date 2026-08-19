@@ -123,6 +123,40 @@ func TestMailbox_EmptyInbox(t *testing.T) {
 	}
 }
 
+func TestMailbox_ReadInboxStatusReportsRecipientHistory(t *testing.T) {
+	tests := []struct {
+		name         string
+		setup        func(*Mailbox) error
+		recipient    string
+		wantSeen     bool
+		wantMessages int
+	}{
+		{name: "missing recipient", recipient: "no-one", wantSeen: false},
+		{name: "recipient with message", recipient: "agent-bar", wantSeen: true, wantMessages: 1,
+			setup: func(mb *Mailbox) error {
+				_, err := mb.SendMessage("agent-foo", "agent-bar", "Subj", "Body")
+				return err
+			}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mb := NewMailbox(filepath.Join(t.TempDir(), "herd-mail.jsonl"))
+			if tt.setup != nil {
+				if err := tt.setup(mb); err != nil {
+					t.Fatal(err)
+				}
+			}
+			result, err := mb.ReadInboxStatus(tt.recipient)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if result.RecipientSeen != tt.wantSeen || len(result.Envelopes) != tt.wantMessages {
+				t.Fatalf("result = %+v, want seen=%t messages=%d", result, tt.wantSeen, tt.wantMessages)
+			}
+		})
+	}
+}
+
 func TestSplitLines(t *testing.T) {
 	tests := []struct {
 		name string
