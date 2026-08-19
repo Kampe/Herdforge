@@ -2077,6 +2077,10 @@ func runReview() {
 		}
 	}
 	fmt.Printf("\nSelected [%s] %s for review\n", task.Ref, task.Title)
+	if err := dispatch.CheckSignerBoundary(reviewRoot); err != nil {
+		fmt.Fprintf(os.Stderr, "review signer boundary BLOCKED (FAC-145): %v\n", err)
+		os.Exit(1)
+	}
 
 	btp, _, berr := boundBoardProvider(cfg, tp, reviewRoot, task.Ref)
 	if berr != nil {

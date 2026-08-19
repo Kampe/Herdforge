@@ -238,7 +238,7 @@ func runSignerBoundaryStatus(args []string) {
 	}
 	att, err := signerboundary.RequireReady(dir)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "NOT READY: %v\n", err)
+		fmt.Fprintf(os.Stderr, "NOT READY: signer boundary not established: %v\n", err)
 		os.Exit(1)
 	}
 	out := att

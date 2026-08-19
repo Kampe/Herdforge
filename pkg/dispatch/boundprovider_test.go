@@ -209,6 +209,25 @@ func TestContextBoundProvider_FailsClosedBeforeProviderCall(t *testing.T) {
 	}
 }
 
+func TestCheckSignerBoundary_DiagnosesMissingAttestation(t *testing.T) {
+	keyDir := t.TempDir()
+	repoRoot := t.TempDir()
+	t.Setenv(KeyDirEnv, keyDir)
+	t.Setenv("HERD_MODE", "production")
+
+	err := CheckSignerBoundary(repoRoot)
+	if err == nil {
+		t.Fatal("missing attestation must block signer-boundary readiness")
+	}
+	msg := err.Error()
+	want := []string{"attest key not established at", filepath.Join(keyDir, IsolationAttestFile), "herd signer-boundary establish"}
+	for _, fragment := range want {
+		if !strings.Contains(msg, fragment) {
+			t.Fatalf("diagnosis missing %q: %s", fragment, msg)
+		}
+	}
+}
+
 // A receipt that does not match the CANONICAL repository/provider/project/
 // workspace/profile authority is rejected at construction — a differently
 // focused repo or workspace can never redirect provider traffic (FAC-145

@@ -36,7 +36,11 @@ func RequireReady(keyDir string) (Attestation, error) {
 	path := attestationPath(keyDir)
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return Attestation{}, fmt.Errorf("%w: no isolation attestation at %s: %v",
+		if os.IsNotExist(err) {
+			return Attestation{}, fmt.Errorf("%w: attest key not established at %s; run `herd signer-boundary establish` to establish it: %v",
+				ErrBoundaryNotEstablished, path, err)
+		}
+		return Attestation{}, fmt.Errorf("%w: cannot read isolation attestation at %s: %v",
 			ErrBoundaryNotEstablished, path, err)
 	}
 	var att Attestation
