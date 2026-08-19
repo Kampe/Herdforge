@@ -7,7 +7,92 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/Kampe/Herdforge/pkg/reviewledger"
 )
+
+// IngestedAuditFinding identifies an artifact under an ingested directory
+// that has no matching durable verdict event.
+type IngestedAuditFinding struct {
+		Path   string `json:"path"`
+		SHA    string `json:"sha,omitempty"`
+		Reason string `json:"reason"`
+}
+
+// AuditIngested walks ingested directories directly. It deliberately does not
+// derive its candidate set from record events: an artifact with no record is
+// itself an audit finding.
+func AuditIngested(root string, rows []reviewledger.LedgerRow) ([]IngestedAuditFinding, error) {
+	root = strings.TrimSpace(root)
+	if root == "" {
+		return nil, fmt.Errorf("audit root is required")
+	}
+	verdicts := make(map[string]struct{})
+	for _, row := range rows {
+		if row.Event == string(reviewledger.EventVerdict) && strings.TrimSpace(row.SHA) != "" {
+			verdicts[row.SHA] = struct{}{}
+		}
+	}
+	var findings []IngestedAuditFinding
+	err := filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if entry.IsDir() || filepath.Base(filepath.Dir(path)) != "ingested" {
+			return nil
+		}
+		body, readErr := os.ReadFile(path)
+		if readErr != nil {
+			findings = append(findings, IngestedAuditFinding{Path: filepath.ToSlash(path), Reason: fmt.Sprintf("read artifact: %v", readErr)})
+			return nil
+		}
+		a := Parse(string(body))
+		if _, ok := verdicts[a.SHA]; !ok {
+			reason := "no matching verdict event"
+			if strings.TrimSpace(a.SHA) == "" {
+				reason = "artifact has no candidate sha"
+			}
+			findings = append(findings, IngestedAuditFinding{Path: filepath.ToSlash(path), SHA: a.SHA, Reason: reason})
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("walk ingested artifacts: %w", err)
+	}
+	return findings, nil
+}
+
+// MoveToIngested moves an artifact only after its caller has proved ledger
+// admission. Existing same-content destinations are treated idempotently.
+func MoveToIngested(source string) (string, error) {
+	source = strings.TrimSpace(source)
+	if source == "" {
+		return "", fmt.Errorf("artifact source is required")
+	}
+	if filepath.Base(filepath.Dir(source)) == "ingested" {
+		return source, nil
+	}
+	dst := filepath.Join(filepath.Dir(source), "ingested", filepath.Base(source))
+	if err := os.MkdirAll(filepath.Dir(dst), 0o700); err != nil {
+		return "", fmt.Errorf("create ingested directory: %w", err)
+	}
+	if existing, err := os.ReadFile(dst); err == nil {
+		incoming, readErr := os.ReadFile(source)
+		if readErr != nil {
+			return "", fmt.Errorf("read artifact before idempotent move: %w", readErr)
+		}
+		if string(existing) != string(incoming) {
+			return "", fmt.Errorf("ingested artifact %s exists with different content", dst)
+		}
+		return dst, nil
+	} else if !os.IsNotExist(err) {
+		return "", fmt.Errorf("check ingested artifact: %w", err)
+	}
+	if err := os.Rename(source, dst); err != nil {
+		return "", fmt.Errorf("move artifact into ingested: %w", err)
+	}
+	return dst, nil
+}
 
 // InboxRel is the repository-relative durable review inbox. Reviewer panes
 // write ephemeral temp-path artifacts; only copies under this directory are

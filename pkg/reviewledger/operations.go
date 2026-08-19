@@ -187,6 +187,24 @@ func (l *Ledger) Tier(sha string) (string, error) {
 	return tier, nil
 }
 
+// VerdictFor reads back the durable verdict admission for an exact candidate.
+// A successful append is not sufficient evidence for callers that gate a
+// subsequent mutation: the row must be observable from the ledger after the
+// write completes.
+func (l *Ledger) VerdictFor(sha string) (LedgerRow, bool, error) {
+	rows, err := l.AllRows()
+	if err != nil {
+		return LedgerRow{}, false, err
+	}
+	for i := len(rows) - 1; i >= 0; i-- {
+		row := rows[i]
+		if row.Event == string(EventVerdict) && row.SHA == sha && strings.TrimSpace(row.Verdict) != "" {
+			return row, true, nil
+		}
+	}
+	return LedgerRow{}, false, nil
+}
+
 // TierReport is the durable evidence surfaced by the review-ledger CLI.
 // Keeping the candidate SHA alongside its tier prevents an empty tier from
 // being mistaken for a successful lookup of a different candidate.
