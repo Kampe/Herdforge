@@ -98,6 +98,21 @@ func TestProductionObserverUnavailableAuthorityBlocks(t *testing.T) {
 	}
 }
 
+func TestProductionObserverDropsTabAbsentFromLiveAgentInventory(t *testing.T) {
+	r := fixtureReader{
+		tabs:    present([]TabRecord{{TabID: "wB:t20V", WorkspaceID: "wB", Label: "stale"}}),
+		agents:  present([]AgentEntry{}),
+		binding: Authority[TabBinding]{State: EvidenceUnknown, Detail: "no durable binding"},
+	}
+	o := &ProductionReconciliationObserver{Workspace: "wB", Reader: r}
+	if err := o.ObserveReconciliation(context.Background()); err != nil {
+		t.Fatalf("stale tab must not block reconciliation: %v", err)
+	}
+	if got := o.Decisions(); len(got) != 0 {
+		t.Fatalf("stale tab decision=%+v, want no retained phantom decision", got)
+	}
+}
+
 func TestProductionObserverRecognizesDurableCoordinatorControlBindingWithoutGeneration(t *testing.T) {
 	r := fixtureReader{
 		tabs:   present([]TabRecord{{TabID: "wK:t2", WorkspaceID: "wK", Label: "1", AgentStatus: "working"}}),

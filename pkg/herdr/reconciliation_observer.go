@@ -52,7 +52,8 @@ type CompletedTaskProofReader interface {
 }
 
 type ReconciliationResult struct {
-	Decisions []TabDecision
+	Decisions  []TabDecision
+	LiveAgents []AgentEntry
 }
 
 // ProductionReconciliationObserver performs the complete read-only sweep.
@@ -120,7 +121,7 @@ func (o *ProductionReconciliationObserver) ObserveReconciliation(ctx context.Con
 	recordBlocked := func(reason string) error {
 		d := TabDecision{TabID: "__reconciliation__", Class: TabBlocked, Evidence: []string{"BLOCKED: " + reason}}
 		if o != nil {
-			o.Last = ReconciliationResult{Decisions: []TabDecision{d}}
+			o.Last = ReconciliationResult{Decisions: []TabDecision{d}, LiveAgents: o.Last.LiveAgents}
 		}
 		if o != nil && o.Record != nil {
 			if err := o.Record(ctx, []TabDecision{d}); err != nil {
@@ -146,6 +147,7 @@ func (o *ProductionReconciliationObserver) ObserveReconciliation(ctx context.Con
 	if agents.State != EvidencePresent {
 		return recordBlocked("agents: " + agents.Detail)
 	}
+	o.Last = ReconciliationResult{LiveAgents: agents.Value}
 	byTab := map[string]AgentEntry{}
 	duplicateTabs := map[string]bool{}
 	for _, agent := range agents.Value {
@@ -167,6 +169,13 @@ func (o *ProductionReconciliationObserver) ObserveReconciliation(ctx context.Con
 			return recordBlocked("legacy tab state: " + err.Error())
 		} else if handled {
 			decisions = append(decisions, decision)
+			continue
+		}
+		// A tab without a live agent and without an authoritative binding is
+		// stale registry state (or an operator-owned tab). It cannot identify a
+		// managed lane and must not keep reconciliation blocked forever. Managed
+		// no-agent tabs still proceed when their durable binding is present.
+		if !found && bindingAuth.State != EvidencePresent {
 			continue
 		}
 		// Herdr 0.8 can report a terminal tab created before immutable tab
@@ -223,7 +232,7 @@ func (o *ProductionReconciliationObserver) ObserveReconciliation(ctx context.Con
 		}
 		decisions = append(decisions, ReconcileTabs([]TabObservation{AssembleBoundObservation(binding, a)})[0])
 	}
-	o.Last = ReconciliationResult{Decisions: decisions}
+	o.Last = ReconciliationResult{Decisions: decisions, LiveAgents: agents.Value}
 	if o.Record != nil {
 		if err := o.Record(ctx, decisions); err != nil {
 			return fmt.Errorf("reconciliation record: %w", err)
@@ -382,6 +391,16 @@ func (o *ProductionReconciliationObserver) Decisions() []TabDecision {
 		return nil
 	}
 	return append([]TabDecision(nil), o.Last.Decisions...)
+}
+
+// LiveAgents returns the inventory captured during the latest observation.
+// It lets status render the same live census used by reconciliation without a
+// second fleet query.
+func (o *ProductionReconciliationObserver) LiveAgents() []AgentEntry {
+	if o == nil {
+		return nil
+	}
+	return append([]AgentEntry(nil), o.Last.LiveAgents...)
 }
 
 // JSONLRecorder provides durable observe-mode evidence without any close

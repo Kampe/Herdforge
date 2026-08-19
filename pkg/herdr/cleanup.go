@@ -206,6 +206,51 @@ func ProjectFleetStatus(decisions []TabDecision, maxLanes int) FleetStatus {
 	return p
 }
 
+// ProjectLiveFleetStatus is the read-only census used by operator status.
+// Live Herdr inventory is sufficient to classify a lane for display; requiring
+// the cleanup reconciler's durable task, process, and worktree authorities here
+// turns healthy live lanes into unknown merely because those adapters are not
+// available in the socket reader.
+func ProjectLiveFleetStatus(agents []AgentEntry, standing map[string]bool, workspace string, maxLanes int) FleetStatus {
+	p := FleetStatus{Classes: map[TabClass]int{}}
+	for _, agent := range agents {
+		if workspace != "" && agent.Workspace != workspace {
+			continue
+		}
+		var class TabClass
+		switch {
+		case agent.Name == "":
+			class = TabUserShell
+		case standing[agent.Name]:
+			class = TabStanding
+		case NormalizeTaskStatus(agent.Status) == "in-progress":
+			class = TabActive
+		case NormalizeTaskStatus(agent.Status) == "recovering":
+			class = TabRecovering
+		default:
+			class = TabBlocked
+		}
+		p.Classes[class]++
+		switch class {
+		case TabActive:
+			p.Working++
+		case TabStanding:
+			p.Standing++
+		case TabRecovering:
+			p.Recovering++
+		case TabUserShell:
+			p.ControlSeats++
+		case TabBlocked:
+			p.Unknown++
+		}
+	}
+	p.Capacity = maxLanes - p.Working - p.Recovering
+	if p.Unknown > 0 || p.Capacity < 0 {
+		p.Capacity = 0
+	}
+	return p
+}
+
 func authorityReady[T any](a Authority[T]) bool {
 	return a.State == EvidenceAbsent || a.State == EvidencePresent
 }

@@ -1085,12 +1085,19 @@ func runStatus() {
 	fmt.Println(line)
 	observer := &herdr.ProductionReconciliationObserver{Workspace: cfg.Fleet.HerdrWorkspace,
 		Reader: herdr.SocketAuthorityReader{}, LegacyStore: &herdr.JSONLLegacyTabStateStore{Path: ".herd/legacy-tab-state.jsonl"}, Record: (&herdr.JSONLRecorder{Path: ".herd/reconciliation.jsonl"}).Record}
-	if err := observer.ObserveReconciliation(context.Background()); err != nil {
-		fleet := herdr.ProjectFleetStatus(observer.Decisions(), len(cfg.Lanes))
+	err = observer.ObserveReconciliation(context.Background())
+	fleet := herdr.ProjectFleetStatus(observer.Decisions(), len(cfg.Lanes))
+	if len(observer.LiveAgents()) > 0 {
+		standingNames := make(map[string]bool)
+		for _, lane := range standing.StandingLanes(cfg) {
+			standingNames[standing.AgentName(lane.Name)] = true
+		}
+		fleet = herdr.ProjectLiveFleetStatus(observer.LiveAgents(), standingNames, cfg.Fleet.HerdrWorkspace, len(cfg.Lanes))
+	}
+	if err != nil {
 		fmt.Printf("Reconciliation: BLOCKED (%v)\nFleet: working=%d capacity=%d standing=%d preserved=%d recovering=%d control=%d unknown=%d\n",
 			err, fleet.Working, fleet.Capacity, fleet.Standing, fleet.Preserved, fleet.Recovering, fleet.ControlSeats, fleet.Unknown)
 	} else {
-		fleet := herdr.ProjectFleetStatus(observer.Decisions(), len(cfg.Lanes))
 		fmt.Printf("Reconciliation: observed\nFleet: working=%d capacity=%d standing=%d preserved=%d recovering=%d control=%d unknown=%d\n",
 			fleet.Working, fleet.Capacity, fleet.Standing, fleet.Preserved, fleet.Recovering, fleet.ControlSeats, fleet.Unknown)
 	}

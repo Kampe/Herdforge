@@ -266,6 +266,24 @@ func TestFleetProjectionFailsClosedOnUnknown(t *testing.T) {
 	}
 }
 
+func TestProjectLiveFleetStatusClassifiesLiveAgentsWithoutReconciliationAuthorities(t *testing.T) {
+	got := ProjectLiveFleetStatus([]AgentEntry{
+		{Name: "forge-reviewer", Status: "idle", Workspace: "wF"},
+		{Name: "forge-builder", Status: "working", Workspace: "wF"},
+		{Name: "task-fac-1", Status: "working", Workspace: "wF"},
+		{Name: "task-fac-2", Status: "idle", Workspace: "wF"},
+		{Name: "", Status: "working", Workspace: "wF"},
+		{Name: "foreign", Status: "working", Workspace: "wOther"},
+	}, map[string]bool{"forge-reviewer": true}, "wF", 4)
+
+	if got.Working != 2 || got.Standing != 1 || got.ControlSeats != 1 || got.Unknown != 1 {
+		t.Fatalf("live fleet=%+v, want working=2 standing=1 control=1 unknown=1", got)
+	}
+	if got.Capacity != 0 {
+		t.Fatalf("capacity=%d, want 0 while unknown live state remains", got.Capacity)
+	}
+}
+
 func TestActiveProjectionRequiresExactSessionProcessAndPane(t *testing.T) {
 	tests := []struct {
 		name  string
