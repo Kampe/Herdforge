@@ -25,7 +25,7 @@ func TestParseDispatchCancelArgsRequiresExactLeaseGeneration(t *testing.T) {
 
 func TestReleaseCoordinationLeaseBoundedRefusesStaleGeneration(t *testing.T) {
 	root := t.TempDir()
-	store, err := claim.NewSQLiteLeaseStore(filepath.Join(root, "herdforge.db"))
+	store, err := claim.NewSQLiteLeaseStore(filepath.Join(root, ".herd", "herdforge.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -42,8 +42,8 @@ func TestReleaseCoordinationLeaseBoundedRefusesStaleGeneration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := releaseCoordinationLeaseBounded(root, key, "coordinator-dispatch", first.Generation); err == nil {
-		t.Fatal("stale generation cancellation released a later lease")
+	if err := releaseCoordinationLeaseBounded(root, key, "coordinator-dispatch", first.Generation); err != nil {
+		t.Fatalf("idempotent stale-generation cancellation: %v", err)
 	}
 	active, err := store.ActiveClaims(context.Background(), time.Now())
 	if err != nil {
@@ -51,5 +51,30 @@ func TestReleaseCoordinationLeaseBoundedRefusesStaleGeneration(t *testing.T) {
 	}
 	if len(active) != 1 || active[0].Generation != second.Generation {
 		t.Fatalf("active leases after stale cancellation = %+v, want generation %d", active, second.Generation)
+	}
+}
+
+func TestReleaseCoordinationLeaseCancellationLeavesNoActiveLease(t *testing.T) {
+	root := t.TempDir()
+	store, err := claim.NewSQLiteLeaseStore(filepath.Join(root, ".herd", "herdforge.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	key := claim.LeaseKey{Repo: "repo", Provider: "kaneo", Project: "project", TaskRef: "FAC-350"}
+	lease, err := store.Acquire(context.Background(), key, "coordinator-dispatch", "worker", "", time.Now(), time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := releaseCoordinationLeaseBounded(root, key, "coordinator-dispatch", lease.Generation); err != nil {
+		t.Fatalf("cancel release: %v", err)
+	}
+	active, err := store.ActiveClaims(context.Background(), time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(active) != 0 {
+		t.Fatalf("active leases after cancellation = %+v, want none", active)
 	}
 }
