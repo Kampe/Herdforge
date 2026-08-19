@@ -3,14 +3,109 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/Kampe/Herdforge/pkg/herdr"
 	"github.com/Kampe/Herdforge/pkg/mail"
 )
+
+func TestWarnUnknownMailParticipants(t *testing.T) {
+	tests := []struct {
+		name         string
+		sender       string
+		recipient    string
+		agents       []herdr.AgentEntry
+		wantWarnings []string
+	}{
+		{
+			name:      "both participants are known",
+			sender:    "coordinator",
+			recipient: "forge-worker",
+			agents: []herdr.AgentEntry{
+				{Name: "coordinator", Status: "working"},
+				{Name: "forge-worker", Status: "done"},
+			},
+		},
+		{
+			name:         "unknown recipient is warned but permitted",
+			sender:       "coordinator",
+			recipient:    "typo-worker",
+			agents:       []herdr.AgentEntry{{Name: "coordinator", Status: "working"}},
+			wantWarnings: []string{"recipient \"typo-worker\"", "message will still be filed"},
+		},
+		{
+			name:         "unknown sender and recipient are both diagnosed",
+			sender:       "old-coordinator",
+			recipient:    "old-worker",
+			agents:       []herdr.AgentEntry{{Name: "forge-worker", Status: "idle"}},
+			wantWarnings: []string{"sender \"old-coordinator\"", "recipient \"old-worker\""},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			restore := listMailAgents
+			defer func() { listMailAgents = restore }()
+			listMailAgents = func() ([]herdr.AgentEntry, error) { return tt.agents, nil }
+
+			output := captureStderr(t, func() {
+				warnUnknownMailParticipants(tt.sender, tt.recipient)
+			})
+			for _, warning := range tt.wantWarnings {
+				if !strings.Contains(output, warning) {
+					t.Fatalf("warning output %q does not contain %q", output, warning)
+				}
+			}
+			if len(tt.wantWarnings) == 0 && output != "" {
+				t.Fatalf("known participants produced warning: %q", output)
+			}
+		})
+	}
+}
+
+func TestWarnUnknownMailParticipantsKeepsSendPermissiveWhenHerdrUnavailable(t *testing.T) {
+	restore := listMailAgents
+	defer func() { listMailAgents = restore }()
+	listMailAgents = func() ([]herdr.AgentEntry, error) { return nil, os.ErrNotExist }
+
+	output := captureStderr(t, func() {
+		warnUnknownMailParticipants("coordinator", "future-lane")
+	})
+	if !strings.Contains(output, "recipient liveness unavailable") {
+		t.Fatalf("missing unavailable-census diagnostic: %q", output)
+	}
+	if strings.Contains(output, "message will still be filed") {
+		t.Fatalf("unavailable census was reported as a definitive unknown: %q", output)
+	}
+}
+
+func captureStderr(t *testing.T, fn func()) string {
+	t.Helper()
+	read, write, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	original := os.Stderr
+	os.Stderr = write
+	defer func() { os.Stderr = original }()
+	fn()
+	if err := write.Close(); err != nil {
+		t.Fatal(err)
+	}
+	output, err := io.ReadAll(read)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := read.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return string(output)
+}
 
 func TestControlMailPathUsesRepositoryCommonRoot(t *testing.T) {
 	root, err := canonicalHerdRoot()
