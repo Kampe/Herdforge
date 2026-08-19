@@ -6772,8 +6772,10 @@ func runRoute() {
 	routeLog := firstEnv("HERD_ROUTE_DECISION_LOG", "HERD_THROUGHPUT_ROUTE_LOG",
 		filepath.Join(stateDir(), "route-decisions.log"))
 	if err := router.AppendRouteDecision(routeLog, rt, time.Now); err != nil {
-		fmt.Fprintf(os.Stderr, "herd route: %v\n", err)
-		os.Exit(1)
+		// FAC-462 follow-up: a route decision was already computed
+		// successfully; a failure to durably log it is an audit-trail
+		// gap, not a routing failure, so it must not fail the command.
+		fmt.Fprintf(os.Stderr, "herd route: warning: route decision log: %v\n", err)
 	}
 	if *wantJSON {
 		json.NewEncoder(os.Stdout).Encode(rt)
