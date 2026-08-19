@@ -90,10 +90,14 @@ TASK-PACKET.md
 *.test
 
 # Runtime SQLite state is created on demand and must never be committed.
-.herd/herdforge.db
-.herd/herdforge.db-*
-**/.herd/herdforge.db
-**/.herd/herdforge.db-*
+# Broad pattern: named entries below kept drifting behind new runtime
+# databases (launch-claims.db, claims.db, leases.db, and others were
+# untracked-but-unignored, one accidental `git add -A` away from landing on
+# main) as new .db files were added without a matching gitignore update.
+.herd/*.db
+.herd/*.db-*
+**/.herd/*.db
+**/.herd/*.db-*
 .herd/reconciliation.jsonl
 **/.herd/reconciliation.jsonl
 .herd/legacy-tab-state.jsonl
