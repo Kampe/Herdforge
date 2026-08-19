@@ -27,7 +27,7 @@ func runMail() {
 	case "send":
 		runMailSend(args[1:])
 	case "inbox", "read":
-		runMailInbox(args[1:])
+		runMailInbox(args[0], args[1:])
 	case "control":
 		runControlArgs(args[1:])
 	case "help", "--help", "-h":
@@ -128,29 +128,36 @@ func warnUnknownMailParticipants(sender, recipient string) {
 	}
 }
 
-func runMailInbox(args []string) {
-	fs := flag.NewFlagSet("mail inbox", flag.ContinueOnError)
+func runMailInbox(mode string, args []string) {
+	fs := flag.NewFlagSet("mail "+mode, flag.ContinueOnError)
 	recipient := fs.String("recipient", "", "inbox recipient")
 	mailPath := fs.String("mail", "", "mailbox path override")
 	if err := fs.Parse(args); err != nil {
 		os.Exit(2)
 	}
 	if strings.TrimSpace(*recipient) == "" {
-		fmt.Fprintln(os.Stderr, "mail inbox: --recipient is required")
+		fmt.Fprintf(os.Stderr, "mail %s: --recipient is required\n", mode)
 		os.Exit(2)
 	}
 	path, err := controlMailPath(*mailPath)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "mail inbox: %v\n", err)
+		fmt.Fprintf(os.Stderr, "mail %s: %v\n", mode, err)
 		os.Exit(1)
 	}
-	envelopes, err := mail.NewMailbox(path).ReadInbox(strings.TrimSpace(*recipient))
+	result, err := mail.NewMailbox(path).ReadInboxStatus(strings.TrimSpace(*recipient))
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "mail inbox: %v\n", err)
+		fmt.Fprintf(os.Stderr, "mail %s: %v\n", mode, err)
 		os.Exit(1)
+	}
+	if !result.RecipientSeen {
+		fmt.Fprintf(os.Stderr, "mail %s: recipient %q has no mailbox history\n", mode, strings.TrimSpace(*recipient))
+	}
+	envelopes := result.Envelopes
+	if envelopes == nil {
+		envelopes = make([]*mail.Envelope, 0)
 	}
 	if err := json.NewEncoder(os.Stdout).Encode(envelopes); err != nil {
-		fmt.Fprintf(os.Stderr, "mail inbox: encode response: %v\n", err)
+		fmt.Fprintf(os.Stderr, "mail %s: encode response: %v\n", mode, err)
 		os.Exit(1)
 	}
 }

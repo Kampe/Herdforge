@@ -326,12 +326,35 @@ func (m *Mailbox) markSeenLocked(id string) {
 // error: a malformed record that can't even be quarantined is a fail-closed
 // condition, not something to swallow the way a normal parse failure is.
 func (m *Mailbox) ReadInbox(recipient string) ([]*Envelope, error) {
-	return m.ReadInboxContext(context.Background(), recipient)
+	result, err := m.ReadInboxStatus(recipient)
+	return result.Envelopes, err
 }
 
 // ReadInboxContext is ReadInbox with deadline inheritance for quarantine
 // lock acquisition (same fail-closed quarantine semantics).
 func (m *Mailbox) ReadInboxContext(ctx context.Context, recipient string) ([]*Envelope, error) {
+	result, err := m.ReadInboxStatusContext(ctx, recipient)
+	return result.Envelopes, err
+}
+
+// InboxRead describes a recipient-filtered mailbox read. RecipientSeen is
+// true when the mailbox contains at least one message addressed directly to
+// recipient.
+type InboxRead struct {
+	Envelopes     []*Envelope
+	RecipientSeen bool
+}
+
+// ReadInboxStatus returns the envelopes addressed to recipient and whether
+// that recipient has appeared in the durable mailbox history.
+func (m *Mailbox) ReadInboxStatus(recipient string) (InboxRead, error) {
+	return m.ReadInboxStatusContext(context.Background(), recipient)
+}
+
+// ReadInboxStatusContext is ReadInboxStatus with deadline inheritance for
+// quarantine lock acquisition.
+func (m *Mailbox) ReadInboxStatusContext(ctx context.Context, recipient string) (InboxRead, error) {
+	result := InboxRead{}
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -339,15 +362,14 @@ func (m *Mailbox) ReadInboxContext(ctx context.Context, recipient string) ([]*En
 	defer m.mu.RUnlock()
 
 	if _, err := os.Stat(m.MailFile); os.IsNotExist(err) {
-		return nil, nil
+		return result, nil
 	}
 
 	data, err := os.ReadFile(m.MailFile)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read mail file: %w", err)
+		return result, fmt.Errorf("failed to read mail file: %w", err)
 	}
 
-	var res []*Envelope
 	var quarantineErrs []error
 
 	rawLines := splitLines(string(data))
@@ -362,15 +384,18 @@ func (m *Mailbox) ReadInboxContext(ctx context.Context, recipient string) ([]*En
 			}
 			continue
 		}
+		if env.Recipient == recipient {
+			result.RecipientSeen = true
+		}
 		if recipient == "" || env.Recipient == recipient || env.Recipient == "all" {
-			res = append(res, &env)
+			result.Envelopes = append(result.Envelopes, &env)
 		}
 	}
 
 	if len(quarantineErrs) > 0 {
-		return res, fmt.Errorf("failed to durably quarantine %d malformed record(s): %w", len(quarantineErrs), errors.Join(quarantineErrs...))
+		return result, fmt.Errorf("failed to durably quarantine %d malformed record(s): %w", len(quarantineErrs), errors.Join(quarantineErrs...))
 	}
-	return res, nil
+	return result, nil
 }
 
 // quarantineLine durably records a line ReadInbox could not parse and bumps

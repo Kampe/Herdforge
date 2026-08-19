@@ -196,6 +196,18 @@ func TestMailCLISendsAndReadsDurableMessage(t *testing.T) {
 	}
 }
 
+func TestMailCLIEmptyInboxUsesEmptyJSONArray(t *testing.T) {
+	dir := sandbox(t)
+	mailFile := filepath.Join(dir, ".herd", "mail.jsonl")
+	out, err := runHerd(t, dir, nil, "mail", "inbox", "--recipient", "never-seen", "--mail", mailFile)
+	if err != nil {
+		t.Fatalf("herd mail inbox: %v\n%s", err, out)
+	}
+	if !strings.Contains(string(out), `mail inbox: recipient "never-seen" has no mailbox history`) || !bytes.HasSuffix(out, []byte("[]\n")) {
+		t.Fatalf("empty inbox output = %q, want an unseen-recipient warning followed by []", out)
+	}
+}
+
 func TestMailCLISendPreservesPayloadSourcesByteForByte(t *testing.T) {
 	const body = "literal `identifier` and $(printf truncated)\nsecond line"
 
