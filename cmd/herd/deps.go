@@ -124,6 +124,15 @@ func runDepsCheck() {
 		fmt.Fprintf(os.Stderr, "provenance extract: %v\n", xerr)
 		os.Exit(1)
 	}
+	snap, serr := store.SnapshotGraph(context.Background())
+	if serr != nil {
+		fmt.Fprintf(os.Stderr, "snapshot graph: %v\n", serr)
+		os.Exit(1)
+	}
+	if serr := deps.RejectEmptyProviderGraph(snap); serr != nil {
+		fmt.Fprintf(os.Stderr, "BLOCKED %s: %v; relation snapshot contained no provider data\n", ref, serr)
+		os.Exit(1)
+	}
 
 	ep := deps.LaunchEntrypoint(*entry)
 	gr, err := deps.RequireTaskLaunch(context.Background(), store, ep, deps.Ref(ref), desired, "")
