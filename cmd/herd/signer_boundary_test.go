@@ -37,6 +37,11 @@ func TestSignerBoundaryCLI_StatusFailClosed(t *testing.T) {
 	if !strings.Contains(string(out), "NOT READY") {
 		t.Fatalf("status must report NOT READY, got: %s", out)
 	}
+	if !strings.Contains(string(out), "signer boundary not established") ||
+		!strings.Contains(string(out), "isolation.json") ||
+		!strings.Contains(string(out), "herd signer-boundary establish") {
+		t.Fatalf("status must diagnose missing attestation and remediation, got: %s", out)
+	}
 }
 
 func TestSignerBoundaryCLI_Help(t *testing.T) {

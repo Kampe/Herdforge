@@ -113,6 +113,20 @@ func LoadOrCreateSigner(keyDir, repoName, repoRoot string) (*Signer, error) {
 	return finishSigner(seed, repoRoot)
 }
 
+// CheckSignerBoundary verifies the external signer attestation without
+// creating keys or publishing repository state. Callers that are about to
+// claim review work can use this as a proactive readiness gate.
+func CheckSignerBoundary(repoRoot string) error {
+	keyDir, err := resolveKeyDir()
+	if err != nil {
+		return err
+	}
+	if err := signerBoundaryCheck(keyDir, repoRoot); err != nil {
+		return err
+	}
+	return requireIsolatedKeyStore(keyDir)
+}
+
 // RepositoryIdentity is a STABLE identity for the repository at root: the
 // normalized origin remote plus the configured name, hashed. Two different
 // repositories that happen to share a configured name get different
@@ -261,7 +275,7 @@ func requireIsolatedKeyStore(keyDir string) error {
 	}
 	data, err := os.ReadFile(attestPath)
 	if os.IsNotExist(err) {
-		return fmt.Errorf("key store %s has no isolation attestation at %s — same-uid agents can read it, so signing is REFUSED until an external boundary (FAC-133 sandbox, OS keychain, or operator attestation) is in force (FAC-145 fail-closed)", keyDir, attestPath)
+		return fmt.Errorf("attest key not established at %s; run `herd signer-boundary establish` to establish it — same-uid agents can read it, so signing is REFUSED until an external boundary is in force (FAC-145 fail-closed)", attestPath)
 	}
 	if err != nil {
 		return fmt.Errorf("cannot read key store attestation (FAC-145 fail-closed): %w", err)
