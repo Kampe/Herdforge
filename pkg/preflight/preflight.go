@@ -118,11 +118,10 @@ func checkWorktreeBoundaryFiles(rootDir string, paths []string, allowlist []stri
 	return nil
 }
 
-// changedPaths returns the files a lane has touched relative to its base
+// changedPaths returns tracked files a lane has touched relative to its base
 // branch: committed changes since the merge-base with origin/main, plus
-// anything still uncommitted. Scoping to `git status` alone drops coverage
-// to zero the instant a lane commits its own work, defeating the point of
-// scoped scanning (FAC-431 follow-up).
+// tracked files still uncommitted. Untracked and ignored files are lane-local
+// scratch state and must not be reported as fleet-blocking leaks (FAC-443).
 func changedPaths(rootDir string) ([]string, error) {
 	paths := make([]string, 0)
 	seen := map[string]struct{}{}
@@ -151,7 +150,7 @@ func changedPaths(rootDir string) ([]string, error) {
 		}
 	}
 
-	status, err := runCmd(rootDir, "git", "status", "--porcelain", "--untracked-files=all")
+	status, err := runCmd(rootDir, "git", "status", "--porcelain", "--untracked-files=no")
 	if err != nil {
 		if len(paths) > 0 {
 			return paths, nil

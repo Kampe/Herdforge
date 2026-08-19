@@ -171,6 +171,9 @@ func TestCheckWorktreeBoundaryChanged_ScopesToChangedFiles(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(tmpDir, "unrelated.yaml"), []byte("path: /Users/other/secret\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.WriteFile(filepath.Join(tmpDir, "touched.yaml"), []byte("path: ./safe\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	runGitDivergenceTest(t, tmpDir, "add", ".")
 	runGitDivergenceTest(t, tmpDir, "commit", "-m", "base")
 	if err := os.WriteFile(filepath.Join(tmpDir, "unrelated.yaml"), []byte("path: /Users/other/secret\n"), 0o644); err != nil {
@@ -185,8 +188,14 @@ func TestCheckWorktreeBoundaryChanged_ScopesToChangedFiles(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(tmpDir, "touched.yaml"), []byte("path: ./safe\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.WriteFile(filepath.Join(tmpDir, ".git", "info", "exclude"), []byte("ignored.yaml\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(tmpDir, "ignored.yaml"), []byte("path: /Users/lane/ignored\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	if err := CheckWorktreeBoundaryChanged(tmpDir, nil); err != nil {
-		t.Fatalf("unrelated leak failed scan: %v", err)
+		t.Fatalf("untracked or ignored leak failed scan: %v", err)
 	}
 }
 
