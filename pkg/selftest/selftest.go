@@ -3,6 +3,7 @@ package selftest
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 
 	"github.com/Kampe/Herdforge/pkg/config"
 	"github.com/Kampe/Herdforge/pkg/preflight"
@@ -28,7 +29,15 @@ func (s *SelfTestRunner) RunSuite(ctx context.Context) ([]AssertionResult, error
 	results := []AssertionResult{}
 
 	// 1. Boundary check
-	err := preflight.CheckWorktreeBoundary(s.RepoRoot)
+	var allowlist []string
+	configPath := filepath.Join(s.RepoRoot, config.DefaultConfigPath)
+	if s.RepoRoot == "" || s.RepoRoot == "." {
+		configPath = config.DefaultConfigPath
+	}
+	if cfg, configErr := config.LoadConfig(configPath); configErr == nil {
+		allowlist = cfg.WorktreeBoundary.AllowedAbsolutePaths
+	}
+	err := preflight.CheckWorktreeBoundaryWithAllowlist(s.RepoRoot, allowlist)
 	results = append(results, AssertionResult{
 		Name:   "preflight_boundary_check",
 		Passed: err == nil,
