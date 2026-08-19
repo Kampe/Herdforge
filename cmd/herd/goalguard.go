@@ -72,6 +72,12 @@ func runGoalGuard() error {
 		return fmt.Errorf("decode evidence: %w", err)
 	}
 	decision, err := s.Evaluate(evidence)
+	if errors.Is(err, goalguard.ErrMissing) {
+		// No durable goal means there is nothing to guard. Stop hooks run
+		// --check on every session end; absence is a quiet no-decision, not
+		// an error to spam.
+		return writeGoalJSON(os.Stdout, goalguard.Decision{Reason: "no_goal"})
+	}
 	if err != nil {
 		return err
 	}
