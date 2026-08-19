@@ -70,7 +70,7 @@ var subcommandUsage = map[string]string{
 	"daemon":           "Usage: herd daemon [flags]\n  Run the orchestration daemon.",
 	"usage":            "Usage: herd usage\n  Show harness quota usage from OpenUsage CLI.",
 	"quota":            "Usage: herd quota [flags]\n  Quota inspection helpers.",
-	"review":           "Usage: herd review [ref] [--spawn]\n  Adversarial review pipeline for in-progress work.",
+	"review":           "Usage: herd review [ref] [--spawn|--pool]\n  Signed review admission, or warm-pool review surface dispatch when signer admission is unavailable.",
 	"review-ledger":    "Usage: herd review-ledger list|queued|pending|tier <sha>|drift\n  Append-only review ledger operations; drift reports live standing builder-family mismatches.",
 	"drain":            "Usage: herd drain [flags]\n  Drain control / review backlog.",
 	"approve":          "Usage: herd approve [flags]\n  Approve a reviewed candidate.",

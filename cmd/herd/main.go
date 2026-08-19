@@ -539,6 +539,7 @@ func printUsage() {
 	fmt.Println("  harvest-merge     Cherry-pick reviewed commits onto a fresh base (--candidate-range <base>..<sha> scopes standing-lane harvests; --verify-landed proves landing)")
 	fmt.Println("  hold       Control durable generation-fenced lane/task hold: on, off, or status")
 	fmt.Println("  review     Claim in-progress tasks for reviewer and advance to review status")
+	fmt.Println("              --pool <ref> leases a warm worktree, creates a repo-relative surface symlink, and launches persistent OpenCode")
 	fmt.Println("  approve    Move in-review cards to done, gated on merge evidence")
 	fmt.Println("  drain      Report coordinator review pile (optional bounded --act)")
 	fmt.Println("  board-done Move one card to done ONLY from a task-bound completion receipt")
@@ -1922,12 +1923,29 @@ func notRunningOr(res *activate.Result, fallback string) string {
 func parseReviewArgs(args []string) (ref string, spawn bool) {
 	fs := flag.NewFlagSet("review", flag.ExitOnError)
 	spawnFlag := fs.Bool("spawn", false, "Spawn reviewer agent in herdr")
+	_ = fs.Bool("pool", false, "Use the warm-pool review surface path (no signer admission)")
 	fs.Parse(leadingPositionalArgs(args))
 	return fs.Arg(0), *spawnFlag
 }
 
+func reviewPoolMode(args []string) bool {
+	for _, arg := range args {
+		if arg == "--pool" || arg == "--pool=true" {
+			return true
+		}
+	}
+	return false
+}
+
 func runReview() {
 	refArg, spawn := parseReviewArgs(os.Args[2:])
+	if reviewPoolMode(os.Args[2:]) {
+		if err := runPoolReview(refArg); err != nil {
+			fmt.Fprintf(os.Stderr, "review --pool: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
 	if spawn {
 		if err := requireFleetAdmission(context.Background()); err != nil {
 			fmt.Fprintf(os.Stderr, "review: %v\n", err)
