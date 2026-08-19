@@ -524,3 +524,43 @@ func TestDiskEvidenceNextActionIsStableAndPathFree(t *testing.T) {
 		t.Fatalf("invalid-policy action = %+v", invalid)
 	}
 }
+
+func TestDiskAdmissionErrorExplainsRecoveryAction(t *testing.T) {
+	tests := []struct {
+		name       string
+		nextAction string
+		want       string
+		avoid      string
+	}{
+		{
+			name:       "capacity recovery",
+			nextAction: DiskActionRecoverSpace,
+			want:       "host-level intervention is required; contact your operator",
+		},
+		{
+			name:       "capacity probe retry",
+			nextAction: DiskActionRetryProbe,
+			avoid:      "host-level intervention is required; contact your operator",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := (&DiskAdmissionError{
+				Scope: "opaque-scope",
+				Decision: DiskDecision{
+					State: DiskBlocked,
+					Evidence: DiskEvidence{
+						Kind:       "disk_pressure",
+						NextAction: tt.nextAction,
+					},
+				},
+			}).Error()
+			if tt.want != "" && !strings.Contains(err, tt.want) {
+				t.Fatalf("error = %q, want recovery pointer %q", err, tt.want)
+			}
+			if tt.avoid != "" && strings.Contains(err, tt.avoid) {
+				t.Fatalf("error = %q, must not claim host intervention for %s", err, tt.nextAction)
+			}
+		})
+	}
+}
