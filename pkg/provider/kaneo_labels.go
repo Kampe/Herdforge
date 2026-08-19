@@ -70,6 +70,61 @@ func (k *KaneoProvider) ListTaskLabels(ctx context.Context, taskID string) ([]Ta
 	return nil, fmt.Errorf("kaneo task label list over HTTP is unsupported without a proven contract")
 }
 
+// ListTaskLabelsBulk uses the labels already projected by task list. It is a
+// single provider operation instead of one task label command per identity.
+// Missing identities are returned as an explicit truncated result so callers
+// cannot mistake a partial board scan for a complete one.
+func (k *KaneoProvider) ListTaskLabelsBulk(ctx context.Context, taskIDs []string) (BulkTaskLabels, error) {
+	result := BulkTaskLabels{
+		Labels:    make(map[string][]TaskLabel, len(taskIDs)),
+		Requested: len(taskIDs),
+	}
+	seen := make(map[string]struct{}, len(taskIDs))
+	for _, id := range taskIDs {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			return BulkTaskLabels{}, fmt.Errorf("kaneo bulk task label list: task identity required")
+		}
+		if _, ok := seen[id]; ok {
+			return BulkTaskLabels{}, fmt.Errorf("kaneo bulk task label list: duplicate task identity %q", id)
+		}
+		seen[id] = struct{}{}
+		result.Labels[id] = nil
+	}
+	if len(taskIDs) == 0 {
+		result.Complete = true
+		return result, nil
+	}
+
+	tasks, err := k.ListTasks(ctx, "", "")
+	if err != nil {
+		return BulkTaskLabels{}, fmt.Errorf("kaneo bulk task label list: %w", err)
+	}
+	for _, task := range tasks {
+		if task == nil {
+			continue
+		}
+		var requested string
+		if _, ok := seen[task.ID]; ok {
+			requested = task.ID
+		} else if _, ok := seen[task.Ref]; ok {
+			requested = task.Ref
+		}
+		if requested == "" {
+			continue
+		}
+		labels := make([]TaskLabel, 0, len(task.Labels))
+		for _, name := range task.Labels {
+			labels = append(labels, TaskLabel{Name: name, TaskID: task.ID})
+		}
+		result.Labels[requested] = labels
+		result.Retrieved++
+	}
+	result.Complete = result.Retrieved == result.Requested
+	result.Truncated = !result.Complete
+	return result, nil
+}
+
 func (k *KaneoProvider) CreateTaskLabel(ctx context.Context, taskID, name string) (TaskLabel, error) {
 	if name == "" {
 		return TaskLabel{}, fmt.Errorf("label name required")

@@ -173,6 +173,23 @@ func (b *BoundClient) ListTaskLabels(ctx context.Context, taskID string) ([]Task
 	rows, e := p.ListTaskLabels(opCtx, taskID)
 	return rows, b.wrap("ListTaskLabels", OpList, e)
 }
+
+func (b *BoundClient) ListTaskLabelsBulk(ctx context.Context, taskIDs []string) (BulkTaskLabels, error) {
+	if b == nil || b.Inner == nil {
+		return BulkTaskLabels{}, fmt.Errorf("ListTaskLabelsBulk: nil provider")
+	}
+	p, ok := b.Inner.(BulkTaskLabelProvider)
+	if !ok {
+		return BulkTaskLabels{}, fmt.Errorf("ListTaskLabelsBulk: provider unsupported")
+	}
+	opCtx, cancel := BoundOp(ctx, b.deadlines(), OpList)
+	defer cancel()
+	result, err := p.ListTaskLabelsBulk(opCtx, taskIDs)
+	if err != nil {
+		return BulkTaskLabels{}, b.wrap("ListTaskLabelsBulk", OpList, err)
+	}
+	return result, nil
+}
 func (b *BoundClient) CreateTaskLabel(ctx context.Context, taskID, name string) (TaskLabel, error) {
 	p, err := b.labelProvider()
 	if err != nil {

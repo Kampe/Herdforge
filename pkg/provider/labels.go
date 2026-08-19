@@ -94,6 +94,27 @@ type TaskLabelProvider interface {
 	DeleteTaskLabel(context.Context, string) error
 }
 
+// BulkTaskLabels is the result of a board-wide label read. Complete is based
+// on the requested task identities, not on whether the provider returned an
+// error. Consumers must check it before using Labels for board analytics.
+// Truncated is kept as an explicit positive marker for JSON/reporting paths
+// where a missing task would otherwise look like an empty label set.
+type BulkTaskLabels struct {
+	Labels    map[string][]TaskLabel `json:"labels"`
+	Requested int                    `json:"requested"`
+	Retrieved int                    `json:"retrieved"`
+	Complete  bool                   `json:"complete"`
+	Truncated bool                   `json:"truncated"`
+}
+
+// BulkTaskLabelProvider is optional so providers without a native task-list
+// label projection remain compatible and fail closed at the capability
+// boundary. The input identities may be provider IDs or human-readable refs;
+// the result preserves each requested identity as a map key.
+type BulkTaskLabelProvider interface {
+	ListTaskLabelsBulk(context.Context, []string) (BulkTaskLabels, error)
+}
+
 var (
 	ErrLabelOwnershipUnknown   = errors.New("label ownership unknown")
 	ErrLabelTransactionBlocked = errors.New("label transaction durably blocked")
