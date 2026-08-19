@@ -92,6 +92,34 @@ func TestSendRejectsCrossWorkspaceDuplicateName(t *testing.T) {
 	}
 }
 
+func TestSendRejectsAmbiguousBareLabelAcrossForgeDerivation(t *testing.T) {
+	t.Setenv("HERD_WORKSPACE", "wK")
+	prev := runHerdr
+	t.Cleanup(func() { runHerdr = prev })
+	prompted := false
+	runHerdr = func(args ...string) (string, error) {
+		if len(args) >= 2 && args[0] == "agent" && args[1] == "list" {
+			return `{"result":{"agents":[
+				{"name":"scout-planner","pane_id":"pane-chainseer","workspace_id":"wC","agent_status":"idle"},
+				{"name":"forge-scout-planner","pane_id":"pane-herdforge","workspace_id":"wK","agent_status":"idle"}
+			]}}`, nil
+		}
+		if len(args) >= 2 && args[0] == "agent" && args[1] == "prompt" {
+			prompted = true
+		}
+		return "{}", nil
+	}
+
+	if _, err := Send("scout-planner", "do not misdeliver", false, time.Second); err == nil {
+		t.Fatal("bare label with exact and forge-derived live agents must be rejected")
+	} else if !strings.Contains(err.Error(), "ambiguous") || !strings.Contains(err.Error(), "forge-scout-planner") {
+		t.Fatalf("error = %v; want an explicit ambiguous forge-derived candidate error", err)
+	}
+	if prompted {
+		t.Fatal("ambiguous target must be rejected before prompt")
+	}
+}
+
 func TestSendAllowsSameWorkspaceDelivery(t *testing.T) {
 	t.Setenv("HERD_WORKSPACE", "wK")
 	prev := runHerdr
