@@ -164,9 +164,12 @@ func TestMailCLIHelpDistinguishesOrdinaryAndControlMail(t *testing.T) {
 func TestMailCLISendsAndReadsDurableMessage(t *testing.T) {
 	dir := sandbox(t)
 	mailFile := filepath.Join(dir, ".herd", "mail.jsonl")
-	out, err := runHerd(t, dir, nil, "mail", "send", "--from", "coordinator", "--to", "worker-a", "--subject", "handoff", "--body", "ready", "--mail", mailFile)
+	out, stderr, err := runHerdWithSeparateOutput(t, dir, nil, "mail", "send", "--from", "coordinator", "--to", "worker-a", "--subject", "handoff", "--body", "ready", "--mail", mailFile)
 	if err != nil {
-		t.Fatalf("herd mail send: %v\n%s", err, out)
+		t.Fatalf("herd mail send: %v\nstdout=%s\nstderr=%s", err, out, stderr)
+	}
+	if !strings.Contains(string(stderr), `recipient "worker-a"`) {
+		t.Fatalf("herd mail send did not preserve unknown-recipient warning on stderr: %s", stderr)
 	}
 	var sent struct {
 		Recipient string `json:"recipient"`
@@ -194,6 +197,21 @@ func TestMailCLISendsAndReadsDurableMessage(t *testing.T) {
 	if len(inbox) != 1 || inbox[0].Recipient != "worker-a" || inbox[0].Body != "ready" {
 		t.Fatalf("unexpected inbox: %+v", inbox)
 	}
+}
+
+// runHerdWithSeparateOutput keeps machine-readable stdout independent from
+// diagnostics. Mail send deliberately warns about unknown participants on
+// stderr, and callers must not have that warning corrupt a JSON response.
+func runHerdWithSeparateOutput(t *testing.T, dir string, env []string, args ...string) ([]byte, []byte, error) {
+	t.Helper()
+	cmd := exec.Command(buildHerd(t), args...)
+	cmd.Dir = dir
+	cmd.Env = append(os.Environ(), env...)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	err := cmd.Run()
+	return stdout.Bytes(), stderr.Bytes(), err
 }
 
 func TestMailCLIEmptyInboxUsesEmptyJSONArray(t *testing.T) {
