@@ -46,11 +46,10 @@ If the cwd is the shared checkout, the branch does not match the assignment, or 
 
 While iterating, scope Go tests to the packages and tests changed by the current edit: run commands such as `go test ./<changed-package>/... -run <TestName>`. Run the broader or full suite only once, immediately before the final `herd verify` and `herd shot --report complete` call. These five failures are known pre-existing environment failures; do not self-block on them without first confirming that your diff did not cause them:
 
-- `TestFactoryE2E_CoordinatorFenceBlocksSecondLoop`
-- `TestApproveCLI_ReleasedNewerGenerationStillFences`
-- `TestBroker_SessionAuthorityDiesWithPaneIncarnation`
-- `TestLaneLaunchDecisionReportsConfiguredProbeFailure`
-- `TestNewDrainAdaptersFailsClosedOnMissingAuthority/no_reviewer_lane`
+- `TestShotReportPostsDurableCallback`
+- `TestShotReportBlockedCarriesDetail`
+- `TestShotRefusesDuplicateInvocation`
+- `TestStopCLIMakesWinddownDurableAndDestroysNoWork`
 
 ## Rejection repair (FAC-140)
 
