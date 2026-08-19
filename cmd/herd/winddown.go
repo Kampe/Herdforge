@@ -20,6 +20,9 @@ func winddownStatePath() string {
 	if path := strings.TrimSpace(os.Getenv("HERD_WINDDOWN_STATE")); path != "" {
 		return path
 	}
+	if root, err := canonicalHerdRoot(); err == nil {
+		return filepath.Join(root, defaultWinddownStatePath)
+	}
 	return defaultWinddownStatePath
 }
 
