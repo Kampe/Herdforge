@@ -51,6 +51,13 @@ func markOperational(command string) {
 // reaches operational parsers for unknown-but-routed names.
 var subcommandUsage = map[string]string{
 	"control-surface":  "Usage: herd control-surface [--json]\n  Machine-readable discovery of public-agent operations only.",
+	"board-freeze":     "Usage: herd board-freeze [status|on|off]\n  Durable provider-mutation freeze; on requires --actor and --reason.",
+	"board-frozen":     "Usage: herd board-frozen\n  Exit 0 with the durable board-freeze trigger when mutations are frozen.",
+	"broker":           "Usage: herd broker [ensure]\n  Serve or ensure the local broker runtime.",
+	"claude-only":      "Usage: herd claude-only <on|off|status>\n  Legacy alias for herd posture claude-only.",
+	"commands":         "Usage: herd commands [flags]\n  Inspect retained command sessions and run recovery sweeps.",
+	"containers":       "Usage: herd containers [status|reconcile] [flags]\n  Inspect durable container lifecycle state and unowned containers.",
+	"control":          "Usage: herd control <issue|drain> [flags]\n  Issue or drain authenticated control envelopes.",
 	"init":             "Usage: herd init [--full]\n  Scaffold .herd/ config (optionally full 3-lane forge).",
 	"clone":            "Usage: herd clone <repo-url> [target-dir]\n  Clone a repository and run herd init --full.",
 	"preflight":        "Usage: herd preflight [--full-tree]\n  Workspace boundary, merge policy, and fleet readiness scanner.",
@@ -74,6 +81,31 @@ var subcommandUsage = map[string]string{
 	"review-ledger":    "Usage: herd review-ledger list|queued|pending|tier <sha>|drift\n  Append-only review ledger operations; drift reports live standing builder-family mismatches.",
 	"drain":            "Usage: herd drain [flags]\n  Drain control / review backlog.",
 	"approve":          "Usage: herd approve [flags]\n  Approve a reviewed candidate.",
+	"feedback":         "Usage: herd feedback [flags]\n  Census fleet-wide control-plane feedback.",
+	"fence-broker":     "Usage: herd fence-broker [flags]\n  Inspect or enforce the broker authority fence.",
+	"fence-provision":  "Usage: herd fence-provision [flags]\n  Provision the coordinator fence authority.",
+	"harvest-merge":    "Usage: herd harvest-merge [flags]\n  Cherry-pick reviewed commits onto a fresh base.",
+	"hostcreds":        "Usage: herd hostcreds <diagnose|session|selftest> [flags]\n  Query the host credentials oracle without launching OpenCode.",
+	"labels":           "Usage: herd labels [flags]\n  Reconcile drifted Herdforge tab labels in place.",
+	"merge-admit":      "Usage: herd merge-admit [flags]\n  Admit a reviewed candidate to the coordinator merge path.",
+	"merge-complete":   "Usage: herd merge-complete [flags]\n  Record and validate completion of an admitted merge.",
+	"netbroker-serve":  "Usage: herd netbroker-serve [flags]\n  Run the durable network allowlist broker process.",
+	"no-claude":        "Usage: herd no-claude <on|off|status>\n  Legacy alias for herd posture no-claude.",
+	"park":             "Usage: herd park park <slug> <sha> -m <message> | list [--json]\n  Make parked work durable and auditable.",
+	"quota-supervisor": "Usage: herd quota-supervisor [flags]\n  Convert quota and process evidence into surface concurrency caps.",
+	"receipt":          "Usage: herd receipt <issue|recover|release> [flags]\n  Issue, recover, or release signed task receipts.",
+	"review-classify":  "Usage: herd review-classify <branch> [--tier R0|R1|R2|R3] [--pin SHA] [--json]\n  Classify candidate risk before review dispatch.",
+	"review-ingest":    "Usage: herd review-ingest [flags]\n  Validate, admit, and audit reviewer verdict artifacts.",
+	"role-inject":      "Usage: herd role-inject [flags]\n  Bind a session to its worker contract at session start.",
+	"scope":            "Usage: herd scope [flags]\n  Publish the trusted task scope resolved by dispatch.",
+	"seed-lane-state":  "Usage: herd seed-lane-state [flags]\n  Restore or seed lane state artifacts without overwriting existing state.",
+	"signer-boundary":  "Usage: herd signer-boundary <serve|establish|status|prove|sign> [flags]\n  Operate the OS signing boundary.",
+	"spin":             "Usage: herd spin [flags]\n  Detect stalled or spinning agent panes.",
+	"stash":            "Usage: herd stash push [-m <msg>] [-- <paths>...] | pop | apply | list\n  Use a worktree-scoped private stash namespace.",
+	"stop":             "Usage: herd stop [flags]\n  Stop the herd without deleting worktrees; dry-run by default.",
+	"task":             "Usage: herd task <get|comment|verdict> [flags]\n  Access the receipt-gated task broker.",
+	"verify-fac151":    "Usage: herd verify-fac151 [flags]\n  Run the fixed hermetic FAC-151 verifier profile.",
+	"watch":            "Usage: herd watch [--stream] [flags]\n  Fire when an agent settles and optionally feed harvest triggers.",
 	"board-done": "Usage: herd board-done <ref> [--receipt <path>] [--override-policy <p> --override-actor <who> --override-reason <why> --override-evidence <what>]\n" +
 		"  Close a card from its task-bound completion receipt, or by an attributable manual override.",
 	"board-audit": "Usage: herd board-audit [--json]\n  Report Done cards no completion receipt closed. Read-only; never mutates the board.",
@@ -210,7 +242,7 @@ func usageFor(command string) string {
 	if u, ok := subcommandUsage[command]; ok {
 		return u
 	}
-	return fmt.Sprintf("Usage: herd %s [args]\n  Run 'herd --help' for the command list.", command)
+	return fmt.Sprintf("Usage: herd %s [args]\n  No detailed help is registered for this command.", command)
 }
 
 // exitIfHelp prints subcommand usage and exits 0 when args request help.

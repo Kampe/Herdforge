@@ -121,25 +121,25 @@ func TestParseTicketRefExplicitAndDelimiter(t *testing.T) {
 }
 
 func TestKnownSubcommandsCoverRoutedCommands(t *testing.T) {
-	// Keep the catalog honest: every name in printUsage surface that is a
-	// real subcommand must appear in subcommandUsage.
-	required := []string{
-		"init", "clone", "preflight", "selftest", "status", "pulse", "wind-down",
-		"hold", "review", "approve", "drain", "board-done", "board-sync", "sh",
-		"send", "cleanup", "forge", "standing", "daemon", "usage", "quota", "up",
-		"activate", "validate-config", "doctor-models", "next", "dispatch", "deps",
-		"harvest", "unmerged", "lost", "throughput", "worktrees", "overlap",
-		"attention", "process", "resolve-lane", "route", "kick", "lifecycle",
-		"resources", "lock", "reset-safe", "verify", "tool-probe", "shoot",
-		"review-ledger", "repl", "fresh-build", "tests-for",
-	}
-	for _, name := range required {
+	// Keep the catalog honest: every admitted routed command must have
+	// command-specific help, not the generic fallback.
+	for _, name := range knownSubcommands() {
 		if _, ok := subcommandUsage[name]; !ok {
 			t.Errorf("subcommandUsage missing %q", name)
 		}
 	}
-	if len(knownSubcommands()) < len(required) {
-		t.Fatalf("knownSubcommands()=%d want >= %d", len(knownSubcommands()), len(required))
+	if len(knownSubcommands()) == 0 {
+		t.Fatal("knownSubcommands() is empty")
+	}
+}
+
+func TestUnknownHelpFallbackIsHonest(t *testing.T) {
+	got := usageFor("not-a-real-command")
+	if strings.Contains(got, "Run 'herd --help'") {
+		t.Fatalf("fallback points at a help surface without command details: %q", got)
+	}
+	if !strings.Contains(got, "No detailed help is registered") {
+		t.Fatalf("fallback does not explain missing detail: %q", got)
 	}
 }
 
@@ -261,6 +261,9 @@ func TestRootHelpAndVersionUnaffected(t *testing.T) {
 		out, err := c.CombinedOutput()
 		if err != nil {
 			t.Fatalf("%v: %v\n%s", args, err, out)
+		}
+		if (args[0] == "--help" || args[0] == "-h") && !strings.Contains(string(out), "herdr") {
+			t.Fatalf("root help must direct agent/pane operations to herdr: %s", out)
 		}
 		if data, readErr := os.ReadFile(probe); readErr == nil && len(strings.TrimSpace(string(data))) > 0 {
 			t.Fatalf("%v wrote probe: %q", args, data)
