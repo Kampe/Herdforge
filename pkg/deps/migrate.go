@@ -77,7 +77,7 @@ func PlanMigration(ctx context.Context, store RelationStore, tp provider.TaskPro
 	if err != nil || !ok {
 		return nil, fmt.Errorf("deps migrate: relation capability required: %v", err)
 	}
-	snap, err := store.SnapshotGraph(ctx)
+	snap, err := snapshotForMigration(ctx, store)
 	if err != nil {
 		return nil, fmt.Errorf("deps migrate: snapshot: %w", err)
 	}
@@ -105,6 +105,27 @@ func PlanMigration(ctx context.Context, store RelationStore, tp provider.TaskPro
 		plan.Items = append(plan.Items, item)
 	}
 	return plan, nil
+}
+
+const migrationSnapshotRetryBackoff = 100 * time.Millisecond
+
+// snapshotForMigration tolerates one transient provider read timeout. A
+// second failed snapshot remains a hard error: migration must never infer an
+// empty or partial graph from an unavailable relation surface.
+func snapshotForMigration(ctx context.Context, store RelationStore) (*GraphSnapshot, error) {
+	snap, err := store.SnapshotGraph(ctx)
+	if err == nil || provider.ClassifyOpError(err) != provider.OpTimeout {
+		return snap, err
+	}
+
+	timer := time.NewTimer(migrationSnapshotRetryBackoff)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-timer.C:
+	}
+	return store.SnapshotGraph(ctx)
 }
 
 func planOne(t *provider.Task, snap *GraphSnapshot) MigrateItem {

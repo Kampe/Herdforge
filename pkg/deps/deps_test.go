@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Kampe/Herdforge/pkg/claim"
 	"github.com/Kampe/Herdforge/pkg/provider"
@@ -121,6 +122,53 @@ func TestMigrate_DryRunAndApply(t *testing.T) {
 	if err := p.BindAndValidate("FAC-1", "t1"); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func TestPlanMigration_RetriesTransientSnapshotTimeout(t *testing.T) {
+	mp := provider.NewMemoryProvider()
+	mp.AddTask(&provider.Task{ID: "t1", Ref: "FAC-1", Status: "to-do", ProjectID: "p"})
+	base := StoreFor(mp, "p")
+	store := &retrySnapshotStore{RelationStore: base, failures: 1}
+
+	plan, err := PlanMigration(context.Background(), store, mp, "p")
+	if err != nil {
+		t.Fatalf("transient snapshot timeout should recover: %v", err)
+	}
+	if !plan.OK || store.calls != 2 {
+		t.Fatalf("plan=%+v snapshot calls=%d, want successful second attempt", plan, store.calls)
+	}
+}
+
+func TestPlanMigration_DoesNotTreatRepeatedSnapshotTimeoutAsEmptyGraph(t *testing.T) {
+	mp := provider.NewMemoryProvider()
+	mp.AddTask(&provider.Task{ID: "t1", Ref: "FAC-1", Status: "to-do", ProjectID: "p"})
+	store := &retrySnapshotStore{RelationStore: StoreFor(mp, "p"), failures: 2}
+
+	plan, err := PlanMigration(context.Background(), store, mp, "p")
+	if err == nil || plan != nil {
+		t.Fatalf("repeated snapshot timeout must remain a hard error: plan=%+v err=%v", plan, err)
+	}
+	if store.calls != 2 {
+		t.Fatalf("snapshot calls=%d, want exactly one retry", store.calls)
+	}
+	if provider.ClassifyOpError(err) != provider.OpTimeout {
+		t.Fatalf("error class=%q, want provider_timeout: %v", provider.ClassifyOpError(err), err)
+	}
+}
+
+type retrySnapshotStore struct {
+	RelationStore
+	failures int
+	calls    int
+}
+
+func (s *retrySnapshotStore) SnapshotGraph(ctx context.Context) (*GraphSnapshot, error) {
+	s.calls++
+	if s.failures > 0 {
+		s.failures--
+		return nil, provider.AsTimeout("kaneo", "ListProjectRelations", provider.OpList, time.Minute, context.DeadlineExceeded)
+	}
+	return s.RelationStore.SnapshotGraph(ctx)
 }
 
 func TestEdgeMultisetEqual_CountsDuplicates(t *testing.T) {
