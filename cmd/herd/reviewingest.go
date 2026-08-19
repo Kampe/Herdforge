@@ -514,9 +514,6 @@ func resolveHarvestCandidateWithReconstruction(branch, requested, reconstructedS
 	var latest reviewledger.LedgerRow
 	queuedBySHA := make(map[string]reviewledger.LedgerRow)
 	for _, row := range queued {
-		if row.Branch != branch {
-			continue
-		}
 		queuedBySHA[row.SHA] = row
 		if row.Timestamp >= latest.Timestamp {
 			latest = row
@@ -557,8 +554,8 @@ func resolveHarvestCandidateWithReconstruction(branch, requested, reconstructedS
 		}
 	}
 
-	queuedCandidate, found := queuedBySHA[sha]
-	if !found || queuedCandidate.Branch != branch {
+	_, found := queuedBySHA[sha]
+	if !found {
 		return report, nil
 	}
 	eligible, err := ledger.Eligible(sha, "")
