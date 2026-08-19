@@ -4551,7 +4551,10 @@ func dispatchTicketDecision(ctx context.Context, req dispatchRequest, announce i
 		return nil, nil, fmt.Errorf("dispatch failed (lease released): %w", err)
 	}
 	if result == nil {
-		return nil, nil, fmt.Errorf("dispatch returned no result for %s", ticketRef)
+		if relErr := releaseCoordinationLeaseBounded(dispatchRoot, leaseKey, "coordinator-dispatch", leaseGen); relErr != nil {
+			return nil, nil, fmt.Errorf("dispatch returned no result for %s; LEASE COMPENSATION ALSO FAILED: %v", ticketRef, relErr)
+		}
+		return nil, nil, fmt.Errorf("dispatch returned no result for %s (lease released)", ticketRef)
 	}
 	return result, decision, nil
 }
