@@ -455,6 +455,7 @@ func TestUnsupportedHarnessConfigRejectsBeforeLifecycle(t *testing.T) {
 func TestConfiguredRolePoliciesAreComplete(t *testing.T) {
 	cases := []config.LaneDef{
 		{Name: "worker", Role: "worker", AgentKind: "codex", Harness: "codex", Provider: "codex", Model: "gpt-5.6-luna", Effort: "medium", TaskShape: "implementation"},
+		{Name: "claude-worker", Role: "worker", AgentKind: "claude", Harness: "claude", Provider: "claude", Model: "claude-sonnet-5", Effort: "medium", TaskShape: "implementation"},
 		{Name: "forge", Role: "forge-smith", AgentKind: "codex", Harness: "codex", Provider: "codex", Model: "gpt-5.6-luna", Effort: "medium", TaskShape: "implementation"},
 		{Name: "recovery-worker", Role: "recovery", AgentKind: "codex", Harness: "codex", Provider: "codex", Model: "gpt-5.6-luna", Effort: "medium", TaskShape: "implementation"},
 		{Name: "reviewer", Role: "reviewer", AgentKind: "claude", Harness: "claude", Provider: "claude", Model: "claude-sonnet-5", Effort: "medium", TaskShape: "qa"},

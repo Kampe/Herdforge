@@ -5908,8 +5908,12 @@ func validateLaneLaunchConfig(lane *config.LaneDef) error {
 			if strings.TrimSpace(lane.Model) == "" || strings.TrimSpace(lane.Effort) == "" {
 				return fmt.Errorf("%w: lane %q grok workers require an explicit model and effort", ErrWorkerConfigPolicy, lane.Name)
 			}
+		} else if lane.Provider == "claude" {
+			if strings.TrimSpace(lane.Model) == "" || strings.TrimSpace(lane.Effort) == "" {
+				return fmt.Errorf("%w: lane %q claude workers require an explicit model and effort", ErrWorkerConfigPolicy, lane.Name)
+			}
 		} else {
-			return fmt.Errorf("%w: lane %q must use codex/gpt-5.6-luna/medium or an explicit Grok model", ErrWorkerConfigPolicy, lane.Name)
+			return fmt.Errorf("%w: lane %q must use codex/gpt-5.6-luna/medium or an explicit Grok or Claude model", ErrWorkerConfigPolicy, lane.Name)
 		}
 	}
 	return nil
