@@ -1708,6 +1708,20 @@ func runStandingConfigMode(cfg *config.Config, herdrAvailable bool, mode standin
 			_, err := herdr.AgentPrompt(agentName, promptText, false)
 			return err
 		},
+		SetGoal: func(cwd, lane, task, owner string) error {
+			self, err := os.Executable()
+			if err != nil {
+				return fmt.Errorf("resolve self for goal-guard: %w", err)
+			}
+			cmd := exec.Command(self, "goal-guard", "--set",
+				"--lane", lane, "--task", task, "--owner", owner, "--generation", "1")
+			cmd.Dir = cwd
+			out, err := cmd.CombinedOutput()
+			if err != nil {
+				return fmt.Errorf("goal-guard --set: %w: %s", err, strings.TrimSpace(string(out)))
+			}
+			return nil
+		},
 		CloseTab: func(tabID string) error {
 			// Best-effort: StartPreparedAgent already reconciles most start
 			// failures. A second close of a gone tab must not mask the
@@ -1725,6 +1739,7 @@ func runStandingConfigMode(cfg *config.Config, herdrAvailable bool, mode standin
 		opts.StartAgent = nil
 		opts.PromptAgent = nil
 		opts.CloseTab = nil
+		opts.SetGoal = nil
 	}
 
 	result, err := standing.Run(cfg, opts)
