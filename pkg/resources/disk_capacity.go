@@ -226,7 +226,11 @@ type DiskAdmissionError struct {
 
 func (e *DiskAdmissionError) Error() string {
 	evidence := marshalDiskEvidence(e.Decision.Evidence)
-	return fmt.Sprintf("disk capacity gate blocked scope %s: state=%s evidence=%s", e.Scope, e.Decision.State, evidence)
+	message := fmt.Sprintf("disk capacity gate blocked scope %s: state=%s evidence=%s", e.Scope, e.Decision.State, evidence)
+	if e.Decision.Evidence.NextAction == DiskActionRecoverSpace {
+		message += "; next step: host-level intervention is required; contact your operator"
+	}
+	return message
 }
 
 func marshalDiskEvidence(evidence DiskEvidence) []byte {
