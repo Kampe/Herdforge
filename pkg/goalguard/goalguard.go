@@ -78,7 +78,19 @@ type Decision struct {
 // write. The path is intentionally injectable for hermetic tests.
 type Store struct{ path string }
 
-func DefaultPath() string { return filepath.Join(posture.StateDir(), "goal-guard.json") }
+// DefaultPath is cwd-relative, not the shared posture.StateDir(): a standing
+// lane's Stop hook always runs with its own worktree as cwd, so this alone
+// gives per-lane isolation without any lane-name plumbing through the hook
+// config. A single shared home-based path would make every lane's launch
+// and every lane's Stop hook read/write the same file, corrupting whichever
+// lane set its goal last. Falls back to posture.StateDir() only when cwd is
+// unavailable (e.g. a deleted worktree).
+func DefaultPath() string {
+	if cwd, err := os.Getwd(); err == nil {
+		return filepath.Join(cwd, ".herd", "goal-guard.json")
+	}
+	return filepath.Join(posture.StateDir(), "goal-guard.json")
+}
 
 func Open(path string) (*Store, error) {
 	if strings.TrimSpace(path) == "" {
