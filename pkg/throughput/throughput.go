@@ -9,6 +9,7 @@
 package throughput
 
 import (
+	"encoding/json"
 	"regexp"
 	"sort"
 	"strconv"
@@ -108,7 +109,17 @@ func CountRouteLines(lines []string, since, until string) int {
 		if indexByte(l, 'T') < 0 {
 			continue
 		}
-		if l >= since && l <= until {
+		stamp := l
+		// Current route logs are JSONL so the event remains queryable. Keep
+		// accepting the historical ISO-prefixed plain lines while extracting
+		// the timestamp from the structured form for window comparisons.
+		var event struct {
+			Timestamp string `json:"timestamp"`
+		}
+		if err := json.Unmarshal([]byte(l), &event); err == nil && event.Timestamp != "" {
+			stamp = event.Timestamp
+		}
+		if stamp >= since && stamp <= until {
 			n++
 		}
 	}
