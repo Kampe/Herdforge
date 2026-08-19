@@ -65,6 +65,8 @@ type Journal struct {
 	Entries          []JournalEntry `json:"entries"`
 }
 
+const migrationProgressEvery = 10
+
 // PlanMigration builds a revision-fenced dry-run from a fresh snapshot.
 // Description fences + board relations only. Stale fences (missing task_id,
 // edge multiset mismatch) are repair_stale, not skip.
@@ -271,7 +273,11 @@ func ApplyMigration(ctx context.Context, store RelationStore, tp provider.TaskPr
 	jPath := filepath.Join(journalDir, fmt.Sprintf("apply-%d.json", time.Now().UnixNano()))
 	plan.JournalPath = jPath
 
-	for _, planned := range base.Items {
+	for processed, planned := range base.Items {
+		processed++
+		if processed == 1 || processed%migrationProgressEvery == 0 || processed == len(base.Items) {
+			fmt.Fprintf(os.Stderr, "herd deps migrate apply: processed %d/%d cards (current=%s)\n", processed, len(base.Items), planned.Ref)
+		}
 		item := planned
 		if item.Action != "write_empty" && item.Action != "write_from_board" && item.Action != "repair_stale" {
 			plan.Items = append(plan.Items, item)
