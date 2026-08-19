@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -10,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Kampe/Herdforge/pkg/claim"
 	"github.com/Kampe/Herdforge/pkg/goalguard"
 )
 
@@ -119,7 +121,11 @@ func runGoalGuardStopHook(s *goalguard.Store, payload []byte) error {
 	if err != nil {
 		return err
 	}
-	evidence := goalguard.Evidence{Lane: g.Lane, Task: g.Task, Owner: g.Owner, Generation: g.Generation, LeaseHeld: true, Now: time.Now().UTC()}
+	leaseHeld, err := goalGuardLeaseHeld(g)
+	if err != nil {
+		return err
+	}
+	evidence := goalguard.Evidence{Lane: g.Lane, Task: g.Task, Owner: g.Owner, Generation: g.Generation, LeaseHeld: leaseHeld, Now: time.Now().UTC()}
 	decision, err := s.Evaluate(evidence)
 	if err != nil {
 		return err
@@ -132,6 +138,34 @@ func runGoalGuardStopHook(s *goalguard.Store, payload []byte) error {
 		"reason":   fmt.Sprintf("goal-guard: goal %q on lane %q is not met (continuation %d). Keep working toward the goal; stop only when it is complete, then run `herd goal-guard --clear`.", g.Task, g.Lane, decision.Continuations),
 	}
 	return writeGoalJSON(os.Stdout, block)
+}
+
+// goalGuardLeaseHeld reads the same durable launch lease store used by the
+// coordinator and pulse. A missing store has no live lease, while an existing
+// store that cannot be read is an error so the Stop hook never invents live
+// authority from an unavailable claim database.
+func goalGuardLeaseHeld(g goalguard.Goal) (bool, error) {
+	path := leaseDBPath()
+	if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	} else if err != nil {
+		return false, fmt.Errorf("goal-guard: inspect lease store: %w", err)
+	}
+	store, err := claim.NewSQLiteLeaseStore(path)
+	if err != nil {
+		return false, fmt.Errorf("goal-guard: open lease store: %w", err)
+	}
+	defer store.Close()
+	leases, err := store.ActiveClaims(context.Background(), time.Now().UTC())
+	if err != nil {
+		return false, fmt.Errorf("goal-guard: read lease store: %w", err)
+	}
+	for _, lease := range leases {
+		if lease != nil && lease.TaskRef == g.Task && lease.Generation == g.Generation && lease.HoldLane == g.Lane {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func writeGoalJSON(w io.Writer, value any) error {
