@@ -203,7 +203,7 @@ func (s *Store) Evaluate(e Evidence) (Decision, error) {
 	if g.Stop.WindDown || e.WindDown {
 		return Decision{Reason: "wind_down", Continuations: g.Continuations}, nil
 	}
-	if g.Continuations >= g.MaxContinuations {
+	if g.MaxContinuations > 0 && g.Continuations >= g.MaxContinuations {
 		return Decision{Reason: "max_continuations", Continuations: g.Continuations}, nil
 	}
 	g.Continuations++
@@ -215,7 +215,9 @@ func (s *Store) Evaluate(e Evidence) (Decision, error) {
 }
 
 func validate(g Goal) error {
-	if g.SchemaVersion != SchemaVersion || strings.TrimSpace(g.Lane) == "" || strings.TrimSpace(g.Task) == "" || strings.TrimSpace(g.Owner) == "" || g.Generation < 1 || g.MaxContinuations < 1 || g.Continuations < 0 || g.Continuations > g.MaxContinuations || g.CreatedAt.IsZero() || g.UpdatedAt.IsZero() {
+	// MaxContinuations == 0 means unbounded: the goal runs until a stop
+	// condition (completed/held/lease/expiry) is met, never a budget.
+	if g.SchemaVersion != SchemaVersion || strings.TrimSpace(g.Lane) == "" || strings.TrimSpace(g.Task) == "" || strings.TrimSpace(g.Owner) == "" || g.Generation < 1 || g.MaxContinuations < 0 || g.Continuations < 0 || (g.MaxContinuations > 0 && g.Continuations > g.MaxContinuations) || g.CreatedAt.IsZero() || g.UpdatedAt.IsZero() {
 		return fmt.Errorf("goalguard: incomplete or contradictory goal")
 	}
 	if g.ExpiresAt != nil && g.ExpiresAt.IsZero() {

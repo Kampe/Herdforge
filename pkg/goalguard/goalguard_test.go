@@ -118,7 +118,31 @@ func TestContradictoryGoalCannotBePersisted(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Set(Goal{Lane: "lane", Task: "task", Owner: "owner", Generation: 1, MaxContinuations: 0}); err == nil {
-		t.Fatal("zero continuation budget must be rejected")
+	if err := s.Set(Goal{Lane: "lane", Task: "task", Owner: "owner", Generation: 1, MaxContinuations: -1}); err == nil {
+		t.Fatal("negative continuation budget must be rejected")
+	}
+	if err := s.Set(Goal{Lane: "lane", Task: "task", Owner: "owner", Generation: 1, MaxContinuations: 0}); err != nil {
+		t.Fatalf("zero budget means unbounded and must persist, got %v", err)
+	}
+}
+
+func TestUnboundedGoalContinuesUntilStopCondition(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "goal.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Set(Goal{Lane: "lane", Task: "task", Owner: "owner", Generation: 1, MaxContinuations: 0}); err != nil {
+		t.Fatal(err)
+	}
+	e := Evidence{Lane: "lane", Task: "task", Owner: "owner", Generation: 1, LeaseHeld: true, Now: time.Now().UTC()}
+	for i := 0; i < 50; i++ {
+		d, err := s.Evaluate(e)
+		if err != nil || !d.Continue {
+			t.Fatalf("iteration %d: decision=%+v err=%v, want unbounded continue", i, d, err)
+		}
+	}
+	e.Completed = true
+	if d, err := s.Evaluate(e); err != nil || d.Continue || d.Reason != "completed" {
+		t.Fatalf("completed evidence must stop: decision=%+v err=%v", d, err)
 	}
 }

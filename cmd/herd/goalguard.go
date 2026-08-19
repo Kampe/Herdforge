@@ -18,24 +18,25 @@ func runGoalGuard() error {
 	state := fs.String("state", goalguard.DefaultPath(), "durable goal state path")
 	set := fs.Bool("set", false, "create or replace a standing goal")
 	check := fs.Bool("check", false, "evaluate evidence JSON from stdin")
+	stopHook := fs.Bool("stop-hook", false, "Claude Stop hook mode: silent when no goal, block stop while goal is active")
 	clear := fs.Bool("clear", false, "remove the durable goal")
 	lane := fs.String("lane", "", "standing lane identity")
 	task := fs.String("task", "", "task identity")
 	owner := fs.String("owner", "", "goal owner")
 	generation := fs.Int64("generation", 0, "lease generation")
-	max := fs.Int("max", 8, "maximum continuations")
+	max := fs.Int("max", 0, "maximum continuations (0 = unbounded: run until the goal is met)")
 	expires := fs.String("expires", "", "RFC3339 expiry")
 	if err := fs.Parse(os.Args[2:]); err != nil {
 		return err
 	}
 	modeCount := 0
-	for _, mode := range []bool{*set, *check, *clear} {
+	for _, mode := range []bool{*set, *check, *clear, *stopHook} {
 		if mode {
 			modeCount++
 		}
 	}
 	if modeCount != 1 {
-		return errors.New("exactly one of --set, --check, or --clear is required")
+		return errors.New("exactly one of --set, --check, --stop-hook, or --clear is required")
 	}
 	s, err := goalguard.Open(*state)
 	if err != nil {
@@ -63,6 +64,9 @@ func runGoalGuard() error {
 		}
 		return writeGoalJSON(os.Stdout, g)
 	}
+	if *stopHook {
+		return runGoalGuardStopHook(s)
+	}
 	var evidence goalguard.Evidence
 	if err := json.NewDecoder(io.LimitReader(os.Stdin, 64*1024)).Decode(&evidence); err != nil {
 		return fmt.Errorf("decode evidence: %w", err)
@@ -72,6 +76,34 @@ func runGoalGuard() error {
 		return err
 	}
 	return writeGoalJSON(os.Stdout, decision)
+}
+
+// runGoalGuardStopHook adapts the guard to Claude Code's Stop hook contract:
+// stdin is the hook payload (ignored), no durable goal means nothing to guard
+// (silent exit 0, stop allowed), and an active goal blocks the stop via
+// {"decision":"block"} so the agent keeps working until the goal is met.
+func runGoalGuardStopHook(s *goalguard.Store) error {
+	_, _ = io.Copy(io.Discard, io.LimitReader(os.Stdin, 64*1024))
+	g, err := s.Load()
+	if errors.Is(err, goalguard.ErrMissing) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	evidence := goalguard.Evidence{Lane: g.Lane, Task: g.Task, Owner: g.Owner, Generation: g.Generation, LeaseHeld: true, Now: time.Now().UTC()}
+	decision, err := s.Evaluate(evidence)
+	if err != nil {
+		return err
+	}
+	if !decision.Continue {
+		return writeGoalJSON(os.Stdout, decision)
+	}
+	block := map[string]string{
+		"decision": "block",
+		"reason":   fmt.Sprintf("goal-guard: goal %q on lane %q is not met (continuation %d). Keep working toward the goal; stop only when it is complete, then run `herd goal-guard --clear`.", g.Task, g.Lane, decision.Continuations),
+	}
+	return writeGoalJSON(os.Stdout, block)
 }
 
 func writeGoalJSON(w io.Writer, value any) error {
