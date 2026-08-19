@@ -83,11 +83,36 @@ func requireAgentInWorkspace(target, expected string) (AgentEntry, error) {
 		return AgentEntry{}, err
 	}
 
-	var matches []AgentEntry
+	// A bare lane label has two plausible live names: the label itself and
+	// Herdforge's canonical forge-<label> standing name. Resolve both before
+	// applying workspace filtering. Otherwise an exact registration in one
+	// repository can hide a forge-derived registration in another repository,
+	// making a successful prompt look like proof of correct delivery.
+	exactMatches := make([]AgentEntry, 0, 1)
+	derivedMatches := make([]AgentEntry, 0, 1)
 	for _, agent := range agents {
 		if agent.Name == target || agent.PaneID == target {
-			matches = append(matches, agent)
+			exactMatches = append(exactMatches, agent)
 		}
+	}
+	if !strings.Contains(target, ":") && !strings.HasPrefix(target, "forge-") {
+		derived := "forge-" + target
+		for _, agent := range agents {
+			if agent.Name == derived {
+				derivedMatches = append(derivedMatches, agent)
+			}
+		}
+	}
+	if len(exactMatches) == 1 && len(derivedMatches) > 0 {
+		return AgentEntry{}, fmt.Errorf("agent '%s' is ambiguous: exact live agent %q and forge-derived live agent %q; specify the registered name explicitly", target, exactMatches[0].Name, derivedMatches[0].Name)
+	}
+	if len(exactMatches) == 0 && len(derivedMatches) > 1 {
+		return AgentEntry{}, fmt.Errorf("agent '%s' is ambiguous: forge-derived name matches %d live agents; specify the registered name explicitly", target, len(derivedMatches))
+	}
+
+	matches := exactMatches
+	if len(matches) == 0 {
+		matches = derivedMatches
 	}
 	if len(matches) == 0 {
 		return AgentEntry{}, fmt.Errorf("no agent '%s' found", target)
@@ -132,16 +157,21 @@ func SendInWorkspace(target, text string, verify bool, timeout time.Duration, wo
 }
 
 func sendInWorkspace(target, text string, verify bool, timeout time.Duration, workspace string) (string, error) {
-	if _, err := requireAgentWorkspaceIn(target, workspace); err != nil {
+	resolved, err := requireAgentWorkspaceIn(target, workspace)
+	if err != nil {
 		return "", err
 	}
-	if _, err := AgentPrompt(target, text, false); err != nil {
+	resolvedTarget := resolved.Name
+	if resolvedTarget == "" {
+		resolvedTarget = target
+	}
+	if _, err := AgentPrompt(resolvedTarget, text, false); err != nil {
 		return "", err
 	}
 	// Herdr can return after writing TEXT while the pane composer is still
 	// processing it.  Submit once immediately so a following status poll does
 	// not observe text stranded in the composer (FAC-388).
-	_ = SendKeys(target, "Enter")
+	_ = SendKeys(resolvedTarget, "Enter")
 	if !verify {
 		return "submitted", nil
 	}
@@ -151,7 +181,7 @@ func sendInWorkspace(target, text string, verify bool, timeout time.Duration, wo
 	nudged := true
 	last := "unknown"
 	for time.Now().Before(deadline) {
-		st, err := liveStatusScopedIn(target, workspace)
+		st, err := liveStatusScopedIn(resolvedTarget, workspace)
 		if err == nil {
 			last = st
 			if st == "working" || st == "done" {
@@ -160,10 +190,10 @@ func sendInWorkspace(target, text string, verify bool, timeout time.Duration, wo
 		}
 		if !nudged && time.Now().Add(poll).After(deadline.Add(-timeout/2)) {
 			// Halfway through the window with no flip: one Enter nudge.
-			_ = SendKeys(target, "Enter")
+			_ = SendKeys(resolvedTarget, "Enter")
 			nudged = true
 		}
 		time.Sleep(poll)
 	}
-	return last, fmt.Errorf("agent '%s' never confirmed consumption (last status %q)", target, last)
+	return last, fmt.Errorf("agent '%s' never confirmed consumption (last status %q)", resolvedTarget, last)
 }
