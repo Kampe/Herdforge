@@ -56,6 +56,38 @@ herd approve FAC-123
 herd board-done FAC-123
 ```
 
+## Durable goal guard
+
+`herd goal-guard` is the durable continuation guard for a lane. By default it
+stores state in `.herd/goal-guard.json` under the current worktree. Select one
+mode per invocation:
+
+```bash
+herd goal-guard --set --lane <lane> --task <task> --owner <owner> --generation <n> [--max <n>] [--expires <RFC3339>]
+herd goal-guard --check < evidence.json
+herd goal-guard --stop-hook
+herd goal-guard --clear
+```
+
+`--set` creates or replaces a goal, `--check` evaluates evidence JSON (or a
+Claude Stop hook payload), `--stop-hook` applies the Claude Stop hook adapter,
+and `--clear` removes the goal. `--max 0` is the default and means continue
+until a stop condition is met; a positive `--max` bounds continuations.
+
+The Stop hook is silent and exits successfully when no goal exists. For an
+active unmet goal it returns `{"decision":"block"}` so the agent continues
+working. It allows stopping when the goal is completed, the lease is lost, the
+lane is held or winding down, the goal expires, or the continuation limit is
+reached. If the payload has `stop_hook_active`, the prior block was already
+delivered for that stop attempt, so the hook exits successfully instead of
+looping. Clear completed state with `herd goal-guard --clear`.
+
+Ordinary `herd dispatch` workers do not receive a goal automatically. The
+current `herd standing` raise path best-effort installs one with `--set` for
+each raised standing lane; if that write fails, the lane continues and the
+Stop hook remains quiet. Adding automatic guards to other launch paths is
+still a separate design decision.
+
 Do not treat a successful claim as successful dispatch, an `in-progress` card as
 worker completion, or an `in-review` card as a valid verdict. The gates require
 an active lease, cwd-bound task worktree, consumed delivery receipt, committed
