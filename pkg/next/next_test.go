@@ -3,8 +3,11 @@ package next
 import (
 	"context"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/Kampe/Herdforge/pkg/reviewledger"
 )
 
 func TestEval_NoTasks(t *testing.T) {
@@ -36,6 +39,43 @@ func TestEval_VerdictArtifacts(t *testing.T) {
 	}
 	if act.Type != ActionIngest {
 		t.Errorf("expected ActionIngest with verdict present, got %s", act.Type)
+	}
+}
+
+func TestPendingVerdictsExcludesArtifactsAlreadyInLedger(t *testing.T) {
+	dir := t.TempDir()
+	inbox := filepath.Join(dir, "inbox")
+	if err := os.MkdirAll(inbox, 0755); err != nil {
+		t.Fatal(err)
+	}
+	admittedSHA := "1111111111111111111111111111111111111111"
+	freshSHA := "2222222222222222222222222222222222222222"
+	if err := os.WriteFile(filepath.Join(inbox, "admitted-verdict.md"), []byte("sha: "+admittedSHA+"\n---\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(inbox, "fresh-verdict.md"), []byte("sha: "+freshSHA+"\n---\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	ledgerPath := filepath.Join(dir, "review-ledger.jsonl")
+	ledger, err := reviewledger.NewReviewLedger(dir, ledgerPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ledger.Record(reviewledger.RecordOpts{
+		SHA:           admittedSHA,
+		BuilderFamily: "openai",
+		Task:          "FAC-463",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	p := NewNextPicker(testConfig(), newTestProvider(nil))
+	p.InboxDir = inbox
+	p.LedgerPath = ledgerPath
+	got := p.pendingVerdicts()
+	if len(got) != 1 || got[0] != "fresh-verdict.md" {
+		t.Fatalf("pending verdicts = %v, want only fresh-verdict.md", got)
 	}
 }
 
