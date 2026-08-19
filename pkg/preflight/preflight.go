@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 
 	"github.com/Kampe/Herdforge/pkg/gitdir"
@@ -115,11 +116,16 @@ func containsAbsolutePathLeak(content string) bool {
 
 func isURLPathSegment(line string, index int) bool {
 	separator := strings.LastIndex(line[:index], "://")
-	if separator < 0 {
-		return false
+	if separator >= 0 {
+		return !strings.ContainsAny(line[separator+3:index], " \t\r")
 	}
-	return !strings.ContainsAny(line[separator+3:index], " \t\r")
+
+	// Bare-domain URLs omit a scheme, but still have a domain immediately
+	// before the path marker (for example, docs.example.org/home/guide).
+	return bareDomainURLPrefix.MatchString(line[:index])
 }
+
+var bareDomainURLPrefix = regexp.MustCompile(`([A-Za-z0-9-]+\.)+[A-Za-z]{2,}$`)
 
 func allowedAbsolutePath(path string, allowlist []string) bool {
 	path = filepath.ToSlash(filepath.Clean(path))

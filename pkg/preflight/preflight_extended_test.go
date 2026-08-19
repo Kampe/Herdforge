@@ -3,6 +3,7 @@ package preflight
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -129,6 +130,11 @@ func TestCheckWorktreeBoundary_URLPathSegmentsAreNotLeaks(t *testing.T) {
 			wantErr: false,
 		},
 		{
+			name:    "bare domain home segment",
+			content: "see docs.m0.org/home/resources/addresses/\n",
+			wantErr: false,
+		},
+		{
 			name:    "bare home path",
 			content: "path: /home/ec2-user/secret\n",
 			wantErr: true,
@@ -150,6 +156,42 @@ func TestCheckWorktreeBoundary_URLPathSegmentsAreNotLeaks(t *testing.T) {
 			err := CheckWorktreeBoundary(tmpDir)
 			if (err != nil) != tt.wantErr {
 				t.Fatalf("CheckWorktreeBoundary() error = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestIsURLPathSegment_BareDomain(t *testing.T) {
+	tests := []struct {
+		name string
+		line string
+		want bool
+	}{
+		{
+			name: "bare domain",
+			line: "see docs.m0.org/home/resources/addresses/",
+			want: true,
+		},
+		{
+			name: "scheme URL",
+			line: "see https://docs.example.org/home/resources/",
+			want: true,
+		},
+		{
+			name: "host path",
+			line: "path: /home/ec2-user/secret",
+			want: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			index := strings.Index(tt.line, "/home/")
+			if index < 0 {
+				t.Fatalf("test input does not contain marker: %q", tt.line)
+			}
+			if got := isURLPathSegment(tt.line, index); got != tt.want {
+				t.Fatalf("isURLPathSegment() = %v, want %v", got, tt.want)
 			}
 		})
 	}
