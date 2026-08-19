@@ -32,6 +32,22 @@ type Info struct {
 	Current        bool
 }
 
+// CurrentExecutable returns metadata embedded in the running executable.
+// Unlike Read, it does not require the current directory to be a Git
+// checkout, so callers such as `herd version` can report build identity from
+// any working directory.
+func CurrentExecutable() (Info, error) {
+	path, err := os.Executable()
+	if err != nil {
+		return Info{}, fmt.Errorf("provenance: executable: %w", err)
+	}
+	if resolved, err := filepath.EvalSymlinks(path); err == nil {
+		path = resolved
+	}
+	revision, buildTime := binaryValuesFrom(path)
+	return Info{Path: path, BinaryRevision: revision, BuildTime: buildTime}, nil
+}
+
 // Read returns the executable and source identity for root.
 func Read(root string) (Info, error) {
 	path, err := os.Executable()

@@ -205,7 +205,12 @@ func buildHerd(t *testing.T) string {
 			return
 		}
 		binary := filepath.Join(dir, "herd")
-		herdBinaryOut, herdBinaryErr = exec.Command("go", "build", "-buildvcs=false", "-o", binary, ".").CombinedOutput()
+		revision, err := exec.Command("git", "rev-parse", "HEAD").Output()
+		if err != nil {
+			herdBinaryErr = err
+			return
+		}
+		herdBinaryOut, herdBinaryErr = exec.Command("go", "build", "-buildvcs=false", "-ldflags", "-X github.com/Kampe/Herdforge/pkg/provenance.BinaryRevision="+strings.TrimSpace(string(revision)), "-o", binary, ".").CombinedOutput()
 		if herdBinaryErr == nil {
 			herdBinary = binary
 		}
@@ -222,7 +227,11 @@ func TestVersionFlag(t *testing.T) {
 	if err != nil {
 		t.Fatalf("herd --version failed: %v", err)
 	}
-	if !strings.Contains(string(out), "herd version") {
+	revision, err := exec.Command("git", "rev-parse", "HEAD").Output()
+	if err != nil {
+		t.Fatalf("git rev-parse HEAD: %v", err)
+	}
+	if !strings.Contains(string(out), "herd version") || !strings.Contains(string(out), "revision "+strings.TrimSpace(string(revision))) {
 		t.Errorf("expected version output, got %s", string(out))
 	}
 }

@@ -98,7 +98,12 @@ func main() {
 	command := os.Args[1]
 	switch command {
 	case "--version", "-v":
-		fmt.Printf("herd version %s\n", version)
+		info, err := provenance.CurrentExecutable()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "herd version: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("herd version %s (revision %s, build time %s)\n", version, valueOrUnknown(info.BinaryRevision), valueOrUnknown(info.BuildTime))
 		os.Exit(0)
 
 	case "--help", "-h":
@@ -1046,6 +1051,13 @@ func reportCurrentProvenance(root string) error {
 		return err
 	}
 	return nil
+}
+
+func valueOrUnknown(value string) string {
+	if trimmed := strings.TrimSpace(value); trimmed != "" {
+		return trimmed
+	}
+	return "unknown"
 }
 
 func runStatus() {
