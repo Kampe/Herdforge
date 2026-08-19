@@ -144,6 +144,7 @@ func TestCheckWorktreeBoundary_URLPathSegmentsAreNotLeaks(t *testing.T) {
 			content: "path: /Users/kampe/secret\n",
 			wantErr: true,
 		},
+		{name: "embedded Users path segment", content: "citation: vendor/Users/kampe/guide\n", wantErr: false},
 	}
 
 	for _, tt := range tests {
@@ -158,6 +159,34 @@ func TestCheckWorktreeBoundary_URLPathSegmentsAreNotLeaks(t *testing.T) {
 				t.Fatalf("CheckWorktreeBoundary() error = %v, wantErr %v", err, tt.wantErr)
 			}
 		})
+	}
+}
+
+func TestCheckWorktreeBoundaryChanged_ScopesToChangedFiles(t *testing.T) {
+	tmpDir := t.TempDir()
+	runGitDivergenceTest(t, tmpDir, "init")
+	runGitDivergenceTest(t, tmpDir, "config", "user.email", "test@example.com")
+	runGitDivergenceTest(t, tmpDir, "config", "user.name", "Preflight Test")
+	writeDivergenceTestFile(t, tmpDir, "base")
+	if err := os.WriteFile(filepath.Join(tmpDir, "unrelated.yaml"), []byte("path: /Users/other/secret\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGitDivergenceTest(t, tmpDir, "add", ".")
+	runGitDivergenceTest(t, tmpDir, "commit", "-m", "base")
+	if err := os.WriteFile(filepath.Join(tmpDir, "unrelated.yaml"), []byte("path: /Users/other/secret\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(tmpDir, "touched.yaml"), []byte("path: /Users/lane/secret\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := CheckWorktreeBoundaryChanged(tmpDir, nil); err == nil {
+		t.Fatal("changed-file scan accepted touched leak")
+	}
+	if err := os.WriteFile(filepath.Join(tmpDir, "touched.yaml"), []byte("path: ./safe\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := CheckWorktreeBoundaryChanged(tmpDir, nil); err != nil {
+		t.Fatalf("unrelated leak failed scan: %v", err)
 	}
 }
 

@@ -930,7 +930,13 @@ func runPreflightStatic() {
 	if cfg, err := config.LoadConfig(filepath.Join(".herd", "herd.yaml")); err == nil {
 		allowlist = cfg.WorktreeBoundary.AllowedAbsolutePaths
 	}
-	if err := preflight.CheckWorktreeBoundaryWithAllowlist(".", allowlist); err != nil {
+	boundaryCheck := preflight.CheckWorktreeBoundaryChanged
+	for _, arg := range os.Args[2:] {
+		if arg == "--full-tree" {
+			boundaryCheck = preflight.CheckWorktreeBoundaryFull
+		}
+	}
+	if err := boundaryCheck(".", allowlist); err != nil {
 		fmt.Fprintf(os.Stderr, "Preflight failed: %v\n", err)
 		os.Exit(1)
 	}

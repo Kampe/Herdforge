@@ -1001,7 +1001,7 @@ func (d *Dispatcher) Dispatch(ctx context.Context, opts DispatchOptions) (*Dispa
 	}
 
 	// 6. Preflight in worktree
-	if err := preflight.CheckWorktreeBoundaryWithAllowlist(wtInfo.Path, d.Config.WorktreeBoundary.AllowedAbsolutePaths); err != nil {
+	if err := preflight.CheckWorktreeBoundaryChanged(wtInfo.Path, d.Config.WorktreeBoundary.AllowedAbsolutePaths); err != nil {
 		return nil, failOwned("preflight_failed", fmt.Errorf("preflight failed in worktree: %w", err))
 	}
 	// 6b. Execute the repository-declared bootstrap only after ownership,

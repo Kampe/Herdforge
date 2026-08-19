@@ -14,13 +14,33 @@ import (
 
 // CheckWorktreeBoundary verifies that no absolute paths leak into git tracking or config files
 func CheckWorktreeBoundary(rootDir string) error {
-	return CheckWorktreeBoundaryWithAllowlist(rootDir, nil)
+	return CheckWorktreeBoundaryFull(rootDir, nil)
+}
+
+// CheckWorktreeBoundaryFull performs an explicit full-tree audit.
+func CheckWorktreeBoundaryFull(rootDir string, allowlist []string) error {
+	return checkWorktreeBoundaryFiles(rootDir, nil, allowlist)
+}
+
+// CheckWorktreeBoundaryChanged checks only staged, modified, and untracked files.
+func CheckWorktreeBoundaryChanged(rootDir string, allowlist []string) error {
+	paths, err := changedPaths(rootDir)
+	if err != nil {
+		// Static preflight also supports a newly scaffolded directory before
+		// Git has been initialized; the full-tree audit remains fail-closed.
+		return CheckWorktreeBoundaryFull(rootDir, allowlist)
+	}
+	return checkWorktreeBoundaryFiles(rootDir, paths, allowlist)
 }
 
 // CheckWorktreeBoundaryWithAllowlist is the configurable form of the
 // boundary check. Allowlist entries are repo-relative file names or globs;
 // they never grant permission to scan outside rootDir.
 func CheckWorktreeBoundaryWithAllowlist(rootDir string, allowlist []string) error {
+	return CheckWorktreeBoundaryFull(rootDir, allowlist)
+}
+
+func checkWorktreeBoundaryFiles(rootDir string, paths []string, allowlist []string) error {
 	var absoluteLeakes []string
 
 	root, err := os.OpenRoot(rootDir)
@@ -29,56 +49,63 @@ func CheckWorktreeBoundaryWithAllowlist(rootDir string, allowlist []string) erro
 	}
 	defer root.Close()
 
-	err = fs.WalkDir(root.FS(), ".", func(path string, d fs.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
-		if d.IsDir() {
-			name := d.Name()
-			if path == ".herd/bootstrap" {
-				return fs.SkipDir
-			}
-			if name == ".git" || name == "node_modules" || name == "vendor" ||
-				name == ".gemini" || name == ".qoder" || name == ".vscode" ||
-				name == ".claude" || name == ".codebuddy" || name == ".kiro" {
-				return fs.SkipDir
-			}
-			// .herd/bootstrap is a generated dependency cache. Its mirrored
-			// module sources may contain host paths by design; the tracked
-			// repository boundary remains covered outside this runtime subtree.
-			if path == filepath.Join(".herd", "bootstrap") {
-				return fs.SkipDir
-			}
-			fullPath := filepath.Join(rootDir, path)
-			if gitdir.IsNestedGitDir(fullPath, rootDir) {
-				return fs.SkipDir
-			}
-			return nil
-		}
-
-		if d.Name() == ".mcp.json" {
-			return nil
-		}
-
-		// Only check text / config / markdown / code files
+	checkFile := func(path string) error {
 		ext := filepath.Ext(path)
-		if ext == ".go" || ext == ".yaml" || ext == ".yml" || ext == ".md" || ext == ".json" {
-			data, err := root.ReadFile(path)
-			if err != nil {
-				return nil
-			}
-			content := string(data)
-			// Check for forbidden absolute path patterns (excluding self-check logic strings)
-			isPreflightTest := strings.HasSuffix(path, "_test.go") && strings.Contains(path, "preflight")
-			if containsAbsolutePathLeak(content) &&
-				!strings.HasSuffix(path, "AGENTS.md") && !strings.HasSuffix(path, "preflight.go") && !isPreflightTest {
-				if !allowedAbsolutePath(path, allowlist) {
-					absoluteLeakes = append(absoluteLeakes, filepath.Join(rootDir, path))
-				}
-			}
+		if filepath.IsAbs(path) || path == ".." || strings.HasPrefix(filepath.ToSlash(path), "../") || (ext != ".go" && ext != ".yaml" && ext != ".yml" && ext != ".md" && ext != ".json") || filepath.Base(path) == ".mcp.json" {
+			return nil
+		}
+		data, err := root.ReadFile(path)
+		if err != nil {
+			return nil
+		}
+		content := string(data)
+		isPreflightTest := strings.HasSuffix(path, "_test.go") && strings.Contains(path, "preflight")
+		if containsAbsolutePathLeak(content) && !strings.HasSuffix(path, "AGENTS.md") && !strings.HasSuffix(path, "preflight.go") && !isPreflightTest && !allowedAbsolutePath(path, allowlist) {
+			absoluteLeakes = append(absoluteLeakes, filepath.Join(rootDir, path))
 		}
 		return nil
-	})
+	}
+	if paths != nil {
+		for _, path := range paths {
+			if err := checkFile(path); err != nil {
+				return err
+			}
+		}
+	} else {
+		err = fs.WalkDir(root.FS(), ".", func(path string, d fs.DirEntry, walkErr error) error {
+			if walkErr != nil {
+				return walkErr
+			}
+			if d.IsDir() {
+				name := d.Name()
+				if path == ".herd/bootstrap" {
+					return fs.SkipDir
+				}
+				if name == ".git" || name == "node_modules" || name == "vendor" ||
+					name == ".gemini" || name == ".qoder" || name == ".vscode" ||
+					name == ".claude" || name == ".codebuddy" || name == ".kiro" {
+					return fs.SkipDir
+				}
+				// .herd/bootstrap is a generated dependency cache. Its mirrored
+				// module sources may contain host paths by design; the tracked
+				// repository boundary remains covered outside this runtime subtree.
+				if path == filepath.Join(".herd", "bootstrap") {
+					return fs.SkipDir
+				}
+				fullPath := filepath.Join(rootDir, path)
+				if gitdir.IsNestedGitDir(fullPath, rootDir) {
+					return fs.SkipDir
+				}
+				return nil
+			}
+
+			if d.Name() == ".mcp.json" {
+				return nil
+			}
+
+			return checkFile(path)
+		})
+	}
 
 	if err != nil {
 		return fmt.Errorf("failed to walk repository tree: %w", err)
@@ -89,6 +116,34 @@ func CheckWorktreeBoundaryWithAllowlist(rootDir string, allowlist []string) erro
 	}
 
 	return nil
+}
+
+func changedPaths(rootDir string) ([]string, error) {
+	status, err := runCmd(rootDir, "git", "status", "--porcelain", "--untracked-files=all")
+	if err != nil {
+		return nil, err
+	}
+	paths := make([]string, 0)
+	seen := map[string]struct{}{}
+	for _, line := range strings.Split(status, "\n") {
+		if len(line) < 3 {
+			continue
+		}
+		path := strings.TrimSpace(line[2:])
+		if arrow := strings.LastIndex(path, " -> "); arrow >= 0 {
+			path = path[arrow+4:]
+		}
+		path = filepath.ToSlash(filepath.Clean(path))
+		if path == "." || path == "" {
+			continue
+		}
+		if _, ok := seen[path]; ok {
+			continue
+		}
+		seen[path] = struct{}{}
+		paths = append(paths, path)
+	}
+	return paths, nil
 }
 
 // containsAbsolutePathLeak reports filesystem path markers unless the marker
@@ -104,7 +159,7 @@ func containsAbsolutePathLeak(content string) bool {
 					break
 				}
 				index := offset + relative
-				if !isURLPathSegment(line, index) {
+				if hasPathSegmentBoundary(line, index) && !isURLPathSegment(line, index) {
 					return true
 				}
 				offset = index + len(marker)
@@ -112,6 +167,14 @@ func containsAbsolutePathLeak(content string) bool {
 		}
 	}
 	return false
+}
+
+func hasPathSegmentBoundary(line string, index int) bool {
+	if index == 0 {
+		return true
+	}
+	p := line[index-1]
+	return !((p >= 'a' && p <= 'z') || (p >= 'A' && p <= 'Z') || (p >= '0' && p <= '9') || p == '/' || p == '_' || p == '-' || p == '.')
 }
 
 func isURLPathSegment(line string, index int) bool {
