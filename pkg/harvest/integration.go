@@ -276,9 +276,17 @@ func (in *Integration) Run(ctx context.Context) (*IntegrationResult, error) {
 				res.Errors = append(res.Errors, fmt.Sprintf("merge readback %s order=%d: %v", ref, i, proofErr))
 			}
 		}
+		remoteLanded := true
 		if err := ensureRemoteReplayHead(ctx, in.RepoRoot, finalHead); err != nil {
+			remoteLanded = false
 			batchOK = false
 			res.Errors = append(res.Errors, err.Error())
+		}
+		if remoteLanded {
+			if err := advanceLaneRemoteRef(ctx, in.RepoRoot, group[0].Branch, finalHead); err != nil {
+				batchOK = false
+				res.Errors = append(res.Errors, fmt.Sprintf("advance lane ref %s: %v", group[0].Branch, err))
+			}
 		}
 		if !batchOK {
 			continue
@@ -592,6 +600,26 @@ func ensureRemoteReplayHead(ctx context.Context, repo, want string) error {
 	}
 	if !merged {
 		return fmt.Errorf("remote readback: replay head %s is not patch-equivalent on origin/main", want)
+	}
+	return nil
+}
+
+// advanceLaneRemoteRef reconciles the local remote-tracking lane ref after a
+// replay lands its content under a new SHA. Without this write,
+// origin/standing/<lane> keeps the pre-merge object and later eligibility
+// checks report false branch drift even though the lane is already on main.
+func advanceLaneRemoteRef(ctx context.Context, repo, branch, want string) error {
+	branch = strings.TrimSpace(strings.TrimPrefix(branch, "refs/heads/"))
+	want = strings.TrimSpace(want)
+	if branch == "" || want == "" {
+		return fmt.Errorf("lane branch and landed tip are required")
+	}
+	ref := "refs/remotes/origin/" + branch
+	if err := runGit(ctx, repo, "check-ref-format", ref); err != nil {
+		return fmt.Errorf("invalid lane remote ref %q: %w", ref, err)
+	}
+	if err := runGit(ctx, repo, "update-ref", "--no-deref", ref, want); err != nil {
+		return fmt.Errorf("update %s: %w", ref, err)
 	}
 	return nil
 }

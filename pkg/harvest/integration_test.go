@@ -1475,8 +1475,10 @@ func TestRunReviewGate_CandidateNotOnCurrentIntegrationTreeRefuses(t *testing.T)
 func TestIntegrationReadbackPatchNotSubject(t *testing.T) {
 	ctx := context.Background()
 	root, _ := setupRepoWithRemote(t)
+	base := gitInHarvest(t, root, "rev-parse", "origin/main")
 
 	wt := createWorktree(t, root, "task/FAC-100-subject")
+	gitInHarvest(t, root, "update-ref", "refs/remotes/origin/task/FAC-100-subject", base)
 	writeFileHarvest(t, wt, "feat.go", "package feat")
 	sha := addAndCommitHarvest(t, wt, "feat: rework for FAC-155 (not the branch ref)", "feat.go")
 
@@ -1499,6 +1501,9 @@ func TestIntegrationReadbackPatchNotSubject(t *testing.T) {
 	}
 	if fd.calls[0].Ref != "FAC-100" {
 		t.Errorf("expected board-complete for FAC-100 (from branch), got %s", fd.calls[0].Ref)
+	}
+	if got := gitInHarvest(t, root, "rev-parse", "refs/remotes/origin/task/FAC-100-subject"); got != res.MergedSHAs[0].MergeSHA {
+		t.Errorf("lane remote ref = %s, want landed tip %s", got, res.MergedSHAs[0].MergeSHA)
 	}
 }
 
@@ -1576,5 +1581,22 @@ func TestIntegrationReadbackSurvivesRebaseRewrite(t *testing.T) {
 	}
 	if err := ensureRemoteReplayHead(ctx, root, offMain); err == nil {
 		t.Fatal("ensureRemoteReplayHead should fail for a commit not on origin/main")
+	}
+}
+
+func TestAdvanceLaneRemoteRefAfterLanding(t *testing.T) {
+	ctx := context.Background()
+	root, _ := setupRepoWithRemote(t)
+	base := gitInHarvest(t, root, "rev-parse", "HEAD")
+
+	writeFileHarvest(t, root, "lane.go", "package lane")
+	tip := addAndCommitHarvest(t, root, "feat: FAC-468 landed lane", "lane.go")
+	gitInHarvest(t, root, "update-ref", "refs/remotes/origin/standing/lane", base)
+
+	if err := advanceLaneRemoteRef(ctx, root, "standing/lane", tip); err != nil {
+		t.Fatalf("advanceLaneRemoteRef: %v", err)
+	}
+	if got := gitInHarvest(t, root, "rev-parse", "refs/remotes/origin/standing/lane"); got != tip {
+		t.Fatalf("lane remote ref = %s, want %s", got, tip)
 	}
 }
