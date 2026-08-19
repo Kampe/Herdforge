@@ -1,10 +1,16 @@
 package main
 
 import (
+	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/Kampe/Herdforge/pkg/claim"
 )
 
 func TestGoalGuardCLISetCheckAndClear(t *testing.T) {
@@ -66,4 +72,68 @@ func TestGoalGuardCLIMalformedEvidenceFailsClosed(t *testing.T) {
 		t.Fatal("malformed evidence must fail closed")
 	}
 	_ = input.Close()
+}
+
+func TestGoalGuardStopHookAllowsStopWhenLeaseIsLost(t *testing.T) {
+	dir := t.TempDir()
+	state := filepath.Join(dir, "goal.json")
+	dbPath := filepath.Join(dir, ".herd", "launch-claims.db")
+	t.Setenv("HERD_LEASE_DB", dbPath)
+
+	store, err := claim.NewSQLiteLeaseStore(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease, err := store.AcquireWithIdentity(context.Background(), claim.LeaseKey{
+		Repo: "repo", Provider: "kaneo", Project: "project", TaskRef: "FAC-472",
+	}, "owner-472", "worker", "", "repo", "worker", "forge-worker", time.Now(), time.Hour)
+	if err != nil {
+		_ = store.Close()
+		t.Fatal(err)
+	}
+	if _, changed, err := store.Release(context.Background(), lease.LeaseKey, lease.OwnerID, lease.Generation, time.Now()); err != nil || !changed {
+		_ = store.Close()
+		t.Fatalf("release lease: changed=%v err=%v", changed, err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	oldArgs, oldStdin, oldStdout := os.Args, os.Stdin, os.Stdout
+	defer func() { os.Args, os.Stdin, os.Stdout = oldArgs, oldStdin, oldStdout }()
+	os.Args = []string{"herd", "goal-guard", "--set", "--state", state, "--lane", "forge-worker", "--task", "FAC-472", "--owner", "coordinator", "--generation", strconv.FormatInt(lease.Generation, 10), "--max", "1"}
+	if err := runGoalGuard(); err != nil {
+		t.Fatal(err)
+	}
+
+	input, err := os.CreateTemp(dir, "stop-hook-input-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer input.Close()
+	os.Stdin = input
+	read, write, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stdout = write
+	os.Args = []string{"herd", "goal-guard", "--stop-hook", "--state", state}
+	if err := runGoalGuard(); err != nil {
+		_ = write.Close()
+		_ = read.Close()
+		t.Fatal(err)
+	}
+	if err := write.Close(); err != nil {
+		t.Fatal(err)
+	}
+	var decision struct {
+		Continue bool   `json:"continue"`
+		Reason   string `json:"reason"`
+	}
+	if err := json.NewDecoder(read).Decode(&decision); err != nil {
+		t.Fatal(err)
+	}
+	if decision.Continue || decision.Reason != "lease_lost" {
+		t.Fatalf("stop-hook decision = %+v, want non-continuing lease_lost", decision)
+	}
 }
