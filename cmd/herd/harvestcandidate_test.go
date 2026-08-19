@@ -135,6 +135,46 @@ func TestResolveHarvestCandidatePinsReviewedSHAAcrossTipDrift(t *testing.T) {
 	}
 }
 
+func TestResolveHarvestCandidateUsesCandidateSHAWhenQueueBranchIsReviewerTask(t *testing.T) {
+	t.Chdir(t.TempDir())
+	gitCandidateTest(t, "init", "-q", "-b", "main")
+	gitCandidateTest(t, "config", "user.email", "test@example.com")
+	gitCandidateTest(t, "config", "user.name", "test")
+	gitCandidateTest(t, "commit", "--allow-empty", "-q", "-m", "base")
+	gitCandidateTest(t, "branch", "standing/nft-data-engineer")
+	gitCandidateTest(t, "checkout", "-q", "standing/nft-data-engineer")
+	writeCandidateFile(t, "reviewed.go", "package reviewed\n")
+	gitCandidateTest(t, "add", "reviewed.go")
+	gitCandidateTest(t, "commit", "-q", "-m", "reviewed")
+	reviewed := gitCandidateOutput(t, "rev-parse", "HEAD")
+
+	l, err := reviewledger.NewReviewLedger(".", filepath.Join(".herd", "review-ledger.jsonl"))
+	if err != nil {
+		t.Fatalf("open ledger: %v", err)
+	}
+	const reviewerTask = "review-nftdataeng3"
+	if err := l.Record(reviewledger.RecordOpts{
+		SHA: reviewed, Branch: reviewerTask, Reviewer: "reviewer", BuilderFamily: "anthropic",
+		ReviewerFamily: "openai", Gate: "independent", Tier: "R2",
+	}); err != nil {
+		t.Fatalf("record: %v", err)
+	}
+	if _, err := l.Verdict(reviewledger.VerdictOpts{
+		SHA: reviewed, Branch: reviewerTask, Reviewer: "reviewer", Verdict: reviewledger.VerdictPASS,
+		ReviewerFamily: "openai", BuilderFamily: "anthropic",
+	}); err != nil {
+		t.Fatalf("verdict: %v", err)
+	}
+
+	got, err := resolveHarvestCandidate("standing/nft-data-engineer", "")
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	if !got.Eligible || got.Pin.SHA != reviewed || got.LastPassSHA != reviewed {
+		t.Fatalf("report = %+v, want eligible reviewed candidate %s despite queue branch %q", got, reviewed, reviewerTask)
+	}
+}
+
 func TestResolveHarvestCandidateAcceptsAttestedReconstruction(t *testing.T) {
 	t.Chdir(t.TempDir())
 	gitCandidateTest(t, "init", "-q", "-b", "main")
