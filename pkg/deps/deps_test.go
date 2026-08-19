@@ -139,6 +139,43 @@ func TestPlanMigration_RetriesTransientSnapshotTimeout(t *testing.T) {
 	}
 }
 
+// FAC-458: deps migrate --apply must never write an empty herd-deps-v1 fence
+// onto an epic-needs-scoping (or other container-class) card. An empty fence
+// clears the "missing structured provenance" refusal that keeps a container
+// unclaimable by design, silently unblocking governance-critical epics.
+func TestPlanMigration_SkipsContainerCardsInsteadOfWritingEmptyFence(t *testing.T) {
+	mp := provider.NewMemoryProvider()
+	mp.AddTask(&provider.Task{ID: "epic1", Ref: "CHA-63", Status: "to-do", ProjectID: "p", Labels: []string{"epic-needs-scoping"}})
+	mp.AddTask(&provider.Task{ID: "t1", Ref: "FAC-1", Status: "to-do", ProjectID: "p"})
+	store := StoreFor(mp, "p")
+
+	plan, err := PlanMigration(context.Background(), store, mp, "p")
+	if err != nil {
+		t.Fatalf("PlanMigration: %v", err)
+	}
+	var epicItem, ordinaryItem *MigrateItem
+	for i := range plan.Items {
+		switch plan.Items[i].Ref {
+		case "CHA-63":
+			epicItem = &plan.Items[i]
+		case "FAC-1":
+			ordinaryItem = &plan.Items[i]
+		}
+	}
+	if epicItem == nil {
+		t.Fatal("epic card missing from plan")
+	}
+	if epicItem.Action != "skip_container" {
+		t.Fatalf("epic-needs-scoping card action = %q, want skip_container (must never write_empty)", epicItem.Action)
+	}
+	if ordinaryItem == nil {
+		t.Fatal("ordinary card missing from plan")
+	}
+	if ordinaryItem.Action != "write_empty" {
+		t.Fatalf("ordinary card action = %q, want write_empty (unaffected by container guard)", ordinaryItem.Action)
+	}
+}
+
 func TestPlanMigration_DoesNotTreatRepeatedSnapshotTimeoutAsEmptyGraph(t *testing.T) {
 	mp := provider.NewMemoryProvider()
 	mp.AddTask(&provider.Task{ID: "t1", Ref: "FAC-1", Status: "to-do", ProjectID: "p"})
