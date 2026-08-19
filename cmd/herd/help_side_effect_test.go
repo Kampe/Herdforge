@@ -133,6 +133,21 @@ func TestKnownSubcommandsCoverRoutedCommands(t *testing.T) {
 	}
 }
 
+func TestSendHelpDocumentsDeliveryOutcomes(t *testing.T) {
+	t.Parallel()
+	help := usageFor("send")
+	for _, want := range []string{
+		"working  delivery confirmed",
+		"done     delivery confirmed",
+		"submitted  UNVERIFIED (--no-verify)",
+		"exits 1 and re-send is appropriate",
+	} {
+		if !strings.Contains(help, want) {
+			t.Errorf("send help missing %q:\n%s", want, help)
+		}
+	}
+}
+
 func TestUnknownHelpFallbackIsHonest(t *testing.T) {
 	got := usageFor("not-a-real-command")
 	if strings.Contains(got, "Run 'herd --help'") {
