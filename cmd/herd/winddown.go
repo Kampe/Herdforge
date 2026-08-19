@@ -108,7 +108,7 @@ func runWindDown() {
 	if action == "status" {
 		state, readErr := a.Read(ctx)
 		if readErr != nil {
-			fmt.Fprintf(os.Stderr, "wind-down status: %v\n", readErr)
+			fmt.Fprintf(os.Stderr, "wind-down status: %v\n", winddown.ExplainError(winddownStatePath(), readErr))
 			os.Exit(1)
 		}
 		if err := json.NewEncoder(os.Stdout).Encode(state); err != nil {

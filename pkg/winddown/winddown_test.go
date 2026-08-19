@@ -29,6 +29,20 @@ func newAuthority(t *testing.T) (*Authority, *fakeClock, string) {
 	}
 	return a, c, path
 }
+
+func TestExplainErrorMissingStateNamesArtifactAndRemediation(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "winddown.json")
+	err := ExplainError(path, ErrStateMissing)
+	if !errors.Is(err, ErrStateMissing) {
+		t.Fatalf("error = %v, want ErrStateMissing to remain discoverable", err)
+	}
+	message := err.Error()
+	for _, want := range []string{path, "herd wind-down off", "--reason initialized"} {
+		if !strings.Contains(message, want) {
+			t.Fatalf("error = %q, want it to contain %q", message, want)
+		}
+	}
+}
 func apply(t *testing.T, a *Authority, enabled bool, gen uint64, deadline *time.Time) State {
 	t.Helper()
 	s, err := a.Update(context.Background(), enabled, "worker", "maintenance", gen, deadline)

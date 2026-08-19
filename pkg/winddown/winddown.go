@@ -237,6 +237,24 @@ func DefaultStatePath() string {
 	return ".herd/winddown.json"
 }
 
+// ExplainError adds the operator context needed to recover from a wind-down
+// posture error without hiding the sentinel used by callers and tests.
+func ExplainError(path string, err error) error {
+	if err == nil {
+		return nil
+	}
+	if strings.TrimSpace(path) == "" {
+		path = DefaultStatePath()
+	}
+	if errors.Is(err, ErrStateMissing) {
+		return fmt.Errorf("winddown state is missing at %q; provision it with `herd wind-down off --reason initialized`: %w", path, err)
+	}
+	if errors.Is(err, ErrStateCorrupt) {
+		return fmt.Errorf("winddown state at %q is corrupt; inspect or replace it with `herd wind-down off --reason initialized`: %w", path, err)
+	}
+	return err
+}
+
 // RequireAdmission is the one production posture gate for work that can
 // claim or re-engage fleet capacity: missing, corrupt, or unreadable state
 // is deliberately rejected, same as cmd/herd's requireFleetAdmission. An
@@ -252,7 +270,7 @@ func RequireAdmission(ctx context.Context, path string) error {
 	if err != nil {
 		return err
 	}
-	return a.Gate(ctx)
+	return ExplainError(path, a.Gate(ctx))
 }
 
 func (a *Authority) read() (State, error) {
