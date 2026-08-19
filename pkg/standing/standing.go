@@ -104,6 +104,14 @@ type Options struct {
 	PromptReadable     func(path string) error
 	AbsPath            func(path string) (string, error)
 	HarnessPresent     func(harness string) bool
+
+	// SetGoal installs the durable goal-guard.json a raised lane's Stop hook
+	// checks. It runs in the lane's own worktree cwd (never the coordinator's)
+	// so it resolves that lane's own state dir. Nil means no goal-guard wiring
+	// (e.g. tests that don't exercise it); a non-nil error here does not fail
+	// the raise, since a missing goal degrades to the Stop hook's quiet
+	// no-goal path rather than blocking the agent.
+	SetGoal func(cwd, lane, task, owner string) error
 }
 
 // RoleResult records one standing role's outcome.
@@ -750,6 +758,14 @@ func runRaise(result *Result, cfg *config.Config, lanes []config.LaneDef, repoRo
 				result.Roles = append(result.Roles, rr)
 				continue
 			}
+		}
+
+		if opts.SetGoal != nil {
+			task := fmt.Sprintf("standing %s: continue until an explicit stop, lease loss, or wind-down condition", strings.TrimSpace(lane.Role))
+			// Best-effort: a lane launches successfully either way. Without a
+			// durable goal its Stop hook degrades to the quiet no-goal path
+			// rather than blocking, so a write failure here is not fatal.
+			_ = opts.SetGoal(cwd, lane.Name, task, "coordinator")
 		}
 
 		rr.Outcome = OutcomeRaised
