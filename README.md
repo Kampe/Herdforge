@@ -143,8 +143,15 @@ Task operations should be run with their help output and target evidence checked
 herd pulse --role worker --spawn
 herd dispatch FAC-123
 herd review --spawn
+herd review FAC-123 --pool
 herd board-done FAC-123
 ```
+
+`herd review <ref> --pool` is the signer-independent reviewer path. It pins
+the candidate into a clean warm-pool slot, creates a relative symlink under
+`.herd/review-surfaces/`, starts persistent OpenCode in a Herdr tab, and
+delivers the review packet. The lease remains held until verdict ingest and
+release; use `--no-launch` to prepare the surface without starting Herdr.
 
 The exact command surface is evolving quickly while the Chainseer workflow is ported. `herd --help` is authoritative for the binary at the checked-out revision.
 
