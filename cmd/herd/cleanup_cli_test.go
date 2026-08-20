@@ -191,3 +191,67 @@ func TestCleanupCLI_HerdrNotFoundExitsNonZero(t *testing.T) {
 		t.Fatalf("expected 'herdr CLI not found': %s", out)
 	}
 }
+
+func TestCleanupCLI_DelegatesToRepoReaperReportOnly(t *testing.T) {
+	binary := buildHerd(t)
+	repo := t.TempDir()
+	binDir := filepath.Join(repo, "bin")
+	if err := os.Mkdir(binDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	reaper := filepath.Join(binDir, "verify-stack-reap")
+	if err := os.WriteFile(reaper, []byte("#!/bin/sh\nprintf 'WouldReap verify-old\\n'\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	fake := cleanupFakeHerdr(t, `{"result":{"agents":[],"type":"agents"}}`)
+	cmd := exec.Command(binary, "cleanup", "--dry-run", "--json")
+	cmd.Dir = repo
+	cmd.Env = cleanupEnv(fake)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("cleanup with repo reaper: %v\n%s", err, out)
+	}
+	var packet map[string]interface{}
+	if err := json.Unmarshal(out, &packet); err != nil {
+		t.Fatalf("invalid JSON: %v\n%s", err, out)
+	}
+	reaperPacket, ok := packet["verify_reaper"].(map[string]interface{})
+	if !ok || reaperPacket["present"] != true || reaperPacket["applied"] != false {
+		t.Fatalf("unexpected reaper report: %s", out)
+	}
+	if !strings.Contains(reaperPacket["output"].(string), "WouldReap verify-old") {
+		t.Fatalf("reaper output missing: %s", out)
+	}
+}
+
+func TestCleanupCLI_ReportsRepoReaperFailureAfterCleanup(t *testing.T) {
+	binary := buildHerd(t)
+	repo := t.TempDir()
+	binDir := filepath.Join(repo, "bin")
+	if err := os.Mkdir(binDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	reaper := filepath.Join(binDir, "verify-stack-reap")
+	if err := os.WriteFile(reaper, []byte("#!/bin/sh\nprintf 'reaper failed\\n'\nexit 7\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	fake := cleanupFakeHerdr(t, `{"result":{"agents":[{"name":"task-fac-1","agent_status":"done","tab_id":"t1","pane_id":"p1","workspace_id":"w","revision":3}],"type":"agents"}}`)
+	cmd := exec.Command(binary, "cleanup", "--dry-run", "--json")
+	cmd.Dir = repo
+	cmd.Env = cleanupEnv(fake)
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("reaper failure must be reported: %s", out)
+	}
+	var packet map[string]interface{}
+	if jsonErr := json.Unmarshal(out, &packet); jsonErr != nil {
+		t.Fatalf("invalid JSON: %v\n%s", jsonErr, out)
+	}
+	reaperPacket := packet["verify_reaper"].(map[string]interface{})
+	if reaperPacket["exit_code"].(float64) != 7 {
+		t.Fatalf("unexpected reaper exit code: %s", out)
+	}
+	if packet["error"] == nil || packet["candidates"].([]interface{}) == nil {
+		t.Fatalf("cleanup result omitted reaper error or tab cleanup: %s", out)
+	}
+}
