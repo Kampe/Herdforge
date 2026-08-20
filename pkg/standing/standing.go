@@ -387,6 +387,22 @@ func indexAgents(agents []Agent, workspace, repoRoot string) map[string]Agent {
 	return idx
 }
 
+// standingAgent returns the qualified owner first and adopts the legacy
+// unqualified owner only when no qualified record exists. The fallback keeps
+// lanes raised before repository-qualified naming from being reported missing
+// or raised a second time during the naming transition.
+func standingAgent(live map[string]Agent, laneName, repository string) (string, Agent, bool) {
+	qualified := AgentNameForRepository(laneName, repository)
+	if agent, ok := live[qualified]; ok {
+		return qualified, agent, true
+	}
+	legacy := AgentName(laneName)
+	if agent, ok := live[legacy]; ok {
+		return legacy, agent, true
+	}
+	return qualified, Agent{}, false
+}
+
 func authorizedAgent(agent Agent, workspace, repoRoot string) bool {
 	workspace = strings.TrimSpace(workspace)
 	if workspace == "" || strings.TrimSpace(agent.Workspace) != workspace || strings.TrimSpace(agent.Cwd) == "" {
@@ -510,7 +526,8 @@ func runStatus(result *Result, lanes []config.LaneDef, live map[string]Agent, re
 			result.Roles = append(result.Roles, rr)
 			continue
 		}
-		if a, ok := live[agentName]; ok && NameHeld(a.Status) {
+		if actualName, a, ok := standingAgent(live, lane.Name, repository); ok && NameHeld(a.Status) {
+			rr.AgentName = actualName
 			rr.Outcome = OutcomeLive
 			rr.Reason = "status=" + a.Status
 			rr.TabID = a.TabID
@@ -544,7 +561,7 @@ func runShutdown(result *Result, lanes []config.LaneDef, live map[string]Agent, 
 	for _, lane := range lanes {
 		agentName := AgentNameForRepository(lane.Name, repository)
 		rr := RoleResult{LaneName: lane.Name, AgentName: agentName, Role: lane.Role}
-		a, ok := live[agentName]
+		actualName, a, ok := standingAgent(live, lane.Name, repository)
 		if !ok || a.TabID == "" {
 			rr.Outcome = OutcomeMissing
 			rr.Reason = "not live"
@@ -552,6 +569,7 @@ func runShutdown(result *Result, lanes []config.LaneDef, live map[string]Agent, 
 			result.Roles = append(result.Roles, rr)
 			continue
 		}
+		rr.AgentName = actualName
 		rr.TabID = a.TabID
 		rr.PaneID = a.PaneID
 		// Active standing agents are preserved (same safety as herd stop)
@@ -605,7 +623,7 @@ func runShutdown(result *Result, lanes []config.LaneDef, live map[string]Agent, 
 			result.Roles = append(result.Roles, rr)
 			continue
 		}
-		if _, stillLive := indexAgents(remaining, result.Workspace, repoRoot)[agentName]; stillLive {
+		if _, stillLive := indexAgents(remaining, result.Workspace, repoRoot)[actualName]; stillLive {
 			rr.Outcome = OutcomeFailed
 			rr.Reason = "standing owner still present after close"
 			result.Failed++
@@ -711,7 +729,8 @@ func runRaise(result *Result, cfg *config.Config, lanes []config.LaneDef, repoRo
 			result.Roles = append(result.Roles, rr)
 			continue
 		}
-		if a, ok := live[agentName]; ok && NameHeld(a.Status) {
+		if actualName, a, ok := standingAgent(live, lane.Name, repository); ok && NameHeld(a.Status) {
+			rr.AgentName = actualName
 			if strings.EqualFold(strings.TrimSpace(a.Status), "done") && opts.CloseTab != nil {
 				if err := opts.CloseTab(a.TabID); err != nil {
 					rr.Outcome = OutcomeFailed
@@ -738,7 +757,7 @@ func runRaise(result *Result, cfg *config.Config, lanes []config.LaneDef, repoRo
 					result.Roles = append(result.Roles, rr)
 					continue
 				}
-				delete(live, agentName)
+				delete(live, actualName)
 			} else {
 				rr.Outcome = OutcomeSkippedLive
 				rr.Reason = "already live status=" + a.Status
