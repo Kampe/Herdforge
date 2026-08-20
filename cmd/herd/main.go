@@ -1082,6 +1082,12 @@ func runStatus() {
 	fmt.Printf("Status: Active\nProject: %s\nProvider: %s (project=%s, enabled=%s)\nLanes: %d configured\n",
 		cfg.Project.Name, cfg.TaskProvider.Type, cfg.TaskProvider.ProjectID,
 		providerPolicySummary(cfg.TaskProvider.Enabled), len(cfg.Lanes))
+	broker := readBrokerHealth(root, cfg)
+	if broker.Serving {
+		fmt.Printf("Broker: serving (%s)\n", broker.Socket)
+	} else {
+		fmt.Printf("Broker: UNAVAILABLE (%s)\n", broker.Detail)
+	}
 	st, err := store.New(filepath.Join(root, ".herd", "herdforge.db"))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Dependency evidence: UNAVAILABLE (%v)\n", err)
@@ -1646,6 +1652,14 @@ func runStandingE() error {
 	cfg, err := config.LoadConfig(".herd/herd.yaml")
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
+	}
+	if mode == standing.ModeStatus {
+		broker := readBrokerHealth(".", cfg)
+		if broker.Serving {
+			fmt.Printf("Broker: serving (%s)\n", broker.Socket)
+		} else {
+			fmt.Printf("Broker: UNAVAILABLE (%s)\n", broker.Detail)
+		}
 	}
 	return runStandingConfigMode(cfg, herdr.IsAvailable(), mode, onlyList, *quiet, *dryRun && *shutdown)
 }
@@ -4835,7 +4849,7 @@ func dispatchTicketDecision(ctx context.Context, req dispatchRequest, announce i
 			fmt.Fprintf(os.Stderr, "dispatch: %v\n", sockErr)
 			os.Exit(1)
 		}
-		if err := ensureBroker(dispatchRoot, sock); err != nil {
+		if err := requireServingBroker(dispatchRoot, sock); err != nil {
 			fmt.Fprintf(os.Stderr, "dispatch refused — %v\n", err)
 			os.Exit(1)
 		}
@@ -8285,6 +8299,37 @@ func brokerSocketPath(repo string) (string, error) {
 	return filepath.Join(home, ".herd", "run", "herd-"+strings.ToLower(repo)+".sock"), nil
 }
 
+type brokerHealth struct {
+	Socket  string
+	Serving bool
+	Detail  string
+}
+
+func readBrokerHealth(root string, cfg *config.Config) brokerHealth {
+	repo := ""
+	if cfg != nil {
+		repo = cfg.Project.Name
+	}
+	sock, err := brokerSocketPath(dispatch.RepositoryIdentityOrName(root, repo))
+	if err != nil {
+		return brokerHealth{Detail: err.Error()}
+	}
+	if err := brokerPing(root, sock); err != nil {
+		return brokerHealth{Socket: sock, Detail: err.Error()}
+	}
+	return brokerHealth{Socket: sock, Serving: true}
+}
+
+// requireServingBroker is admission-only: it probes the coordinator-owned
+// broker and never starts one. Dispatch must not launch a lane that cannot
+// read its assignment through FAC-145's provider isolation boundary.
+func requireServingBroker(root, sock string) error {
+	if err := brokerPing(root, sock); err != nil {
+		return fmt.Errorf("broker unavailable at %s (start the coordinator with `herd forge --loop` or `herd broker ensure`): %w", sock, err)
+	}
+	return nil
+}
+
 // runBrokerServe is the COORDINATOR-owned credential broker. It loads
 // config, credentials, and the verification key exactly once, in the
 // coordinator process, and serves capability-checked task reads/comments to
@@ -9460,7 +9505,12 @@ func runTaskClient() {
 	}
 	conn, err := net.DialTimeout("unix", sock, 5*time.Second)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "herd task: coordinator broker unavailable at %s (FAC-145: agents have no direct provider access): %v\n", sock, err)
+		reportErr := reportBrokerUnavailable(ref, sock, err)
+		if reportErr != nil {
+			fmt.Fprintf(os.Stderr, "herd task: coordinator broker unavailable at %s (FAC-145: agents have no direct provider access): %v; coordinator escalation failed: %v\n", sock, err, reportErr)
+		} else {
+			fmt.Fprintf(os.Stderr, "herd task: coordinator broker unavailable at %s (FAC-145: agents have no direct provider access): %v; coordinator notified\n", sock, err)
+		}
 		os.Exit(1)
 	}
 	defer conn.Close()
@@ -9492,6 +9542,28 @@ func runTaskClient() {
 		return
 	}
 	fmt.Printf("herd task: comment posted to %s\n", tc.TaskRef)
+}
+
+func reportBrokerUnavailable(ref, sock string, cause error) error {
+	root, err := repoRootFromWorktree(".")
+	if err != nil {
+		return fmt.Errorf("resolve repository root: %w", err)
+	}
+	reg, err := coordinator.Resolve(root)
+	if err != nil {
+		return err
+	}
+	reason := fmt.Sprintf("coordinator broker unavailable at %s: %v", sock, cause)
+	req := mail.HelpRequest{
+		Lane:            "task:" + strings.ToLower(strings.TrimSpace(ref)),
+		TaskRef:         ref,
+		Reason:          reason,
+		Capability:      "broker",
+		SuggestedHelper: reg.Name,
+		SuggestedFamily: "coordinator",
+	}
+	_, err = mail.NewMailbox(mail.CallbackMailPath(root)).PostHelpRequest(req.Lane, req)
+	return err
 }
 
 // repoRootFromWorktree resolves the main repository root from inside any
@@ -10443,6 +10515,18 @@ func forgeLoopMain() int {
 		return 1
 	}
 	fmt.Printf("herd forge --loop: coordinator registered as %q (workspace=%s)\n", coordReg.Name, coordReg.Workspace)
+	// The coordinator owns the provider broker lifecycle. Make that control
+	// plane prerequisite explicit at startup so workers are never dispatched
+	// into a repository whose receipt-gated task path is unavailable.
+	brokerSock, brokerSockErr := brokerSocketPath(dispatch.RepositoryIdentityOrName(".", cfg.Project.Name))
+	if brokerSockErr != nil {
+		fmt.Fprintf(os.Stderr, "forge --loop: broker path: %v\n", brokerSockErr)
+	} else if err := ensureBroker(".", brokerSock); err != nil {
+		fmt.Fprintf(os.Stderr, "forge --loop: coordinator broker unavailable: %v\n", err)
+		fmt.Fprintln(os.Stderr, "forge --loop: broker health is BLOCKED; dispatch will refuse until the coordinator broker is serving")
+	} else {
+		fmt.Printf("herd forge --loop: coordinator broker serving %s\n", brokerSock)
+	}
 	if _, bindErr := bindCoordinatorControlTab(".", forgeWorkspace); bindErr != nil {
 		fmt.Fprintf(os.Stderr, "forge --loop: coordinator control binding failed: %v\n", bindErr)
 		return 1
