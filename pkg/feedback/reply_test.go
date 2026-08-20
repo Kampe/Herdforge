@@ -38,6 +38,22 @@ func TestReplyFromLanesAllReplied(t *testing.T) {
 	}
 }
 
+func TestObserveHandoffsRejectsRepeatedContentAsProgress(t *testing.T) {
+	mailFile := writeInbox(t,
+		`{"from":"lane-a","summary":"FLEET_FEEDBACK E1 lane-a","message":"poll=1 blocker: none"}`,
+		`{"from":"lane-a","summary":"FLEET_FEEDBACK E2 lane-a","message":"poll=2 blocker: none"}`,
+	)
+	tracker := NewHandoffTracker()
+	first, err := ObserveHandoffs(mailFile, "E1", []string{"lane-a"}, tracker)
+	if err != nil || len(first) != 1 || !first[0].Observation.Progress {
+		t.Fatalf("first handoff = %+v, err=%v", first, err)
+	}
+	second, err := ObserveHandoffs(mailFile, "E2", []string{"lane-a"}, tracker)
+	if err != nil || len(second) != 1 || second[0].Observation.Progress || !second[0].Observation.Refocus {
+		t.Fatalf("repeated handoff = %+v, err=%v", second, err)
+	}
+}
+
 func TestReplyFromLanesStaleEpochDoesNotCount(t *testing.T) {
 	inbox := writeInbox(t, `{"from":"a","summary":"FLEET_FEEDBACK E0 a"}`)
 	got, missing, err := ReplyFromLanes(inbox, "E1", []string{"a"})
