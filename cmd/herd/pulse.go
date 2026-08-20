@@ -7,6 +7,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -112,6 +113,21 @@ func gatherPulseObservation(ctx context.Context, act bool) (pulse.Observation, p
 	// refs for reap evidence — a lane whose ticket is done is reap-eligible.
 	providerObs, doneRefs := readPulseProvider(ctx)
 	obs.Provider = providerObs
+	actor.dispatchRef = providerObs.NextTaskRef
+	actor.dispatch = func(dispatchCtx context.Context, target, reason string) error {
+		if strings.TrimSpace(providerObs.NextTaskRef) == "" {
+			return errors.New("pulse: no claimable task ref available for bounded dispatch")
+		}
+		_, _, err := dispatchTicketDecision(dispatchCtx, dispatchRequest{
+			TicketRef:    providerObs.NextTaskRef,
+			LaneName:     target,
+			LaneExplicit: true,
+		}, io.Discard)
+		if err != nil {
+			return fmt.Errorf("pulse: bounded dispatch %s: %w", providerObs.NextTaskRef, err)
+		}
+		return nil
+	}
 
 	// Herdr fleet (one AgentList) + reap evidence enrichment (FAC-218).
 	// Evidence gathering fills CommittedWork, TicketDone, SafeRef,
@@ -172,6 +188,7 @@ func readPulseProvider(ctx context.Context) (pulse.ProviderObservation, map[stri
 	}
 	var claimable, inProgress int64
 	doneRefs := make(map[string]bool)
+	claimableTasks := make([]*provider.Task, 0)
 	for _, t := range tasks {
 		if t == nil {
 			continue
@@ -179,6 +196,7 @@ func readPulseProvider(ctx context.Context) (pulse.ProviderObservation, map[stri
 		switch t.Status {
 		case provider.StatusToDo, "":
 			claimable++
+			claimableTasks = append(claimableTasks, t)
 		case provider.StatusInProgress:
 			inProgress++
 		case provider.StatusDone:
@@ -188,12 +206,47 @@ func readPulseProvider(ctx context.Context) (pulse.ProviderObservation, map[stri
 			}
 		}
 	}
-	return pulse.ProviderObservation{
+	obs := pulse.ProviderObservation{
 		Known:      true,
 		QueueDepth: int64(len(tasks)),
 		Claimable:  claimable,
 		InProgress: inProgress,
-	}, doneRefs
+	}
+	if next := selectPulseDispatchTask(claimableTasks); next != nil {
+		obs.NextTaskRef = strings.TrimSpace(next.Ref)
+	}
+	return obs, doneRefs
+}
+
+// selectPulseDispatchTask keeps pulse's one-dispatch bound deterministic and
+// aligned with the fleet task-selection contract: priority descending, then
+// ticket reference ascending. Nil and ref-less tasks cannot be dispatched.
+func selectPulseDispatchTask(tasks []*provider.Task) *provider.Task {
+	priority := func(p provider.Priority) int {
+		switch p {
+		case provider.PriorityUrgent:
+			return 4
+		case provider.PriorityHigh:
+			return 3
+		case provider.PriorityMedium:
+			return 2
+		case provider.PriorityLow:
+			return 1
+		default:
+			return 0
+		}
+	}
+	var best *provider.Task
+	for _, task := range tasks {
+		if task == nil || (task.Status != "" && task.Status != provider.StatusToDo) || strings.TrimSpace(task.Ref) == "" {
+			continue
+		}
+		if best == nil || priority(task.Priority) > priority(best.Priority) ||
+			(priority(task.Priority) == priority(best.Priority) && strings.TrimSpace(task.Ref) < strings.TrimSpace(best.Ref)) {
+			best = task
+		}
+	}
+	return best
 }
 
 // readPulseHerdr reads the live fleet and enriches each agent with reap
@@ -529,9 +582,11 @@ func pulseNeedsReconcile() bool {
 
 // livePulseActor applies renewals and callback acks against real stores.
 type livePulseActor struct {
-	leases    *claim.ClaimManager
-	callbacks *mail.CallbackConsumer
-	reconcile func(context.Context) error
+	leases      *claim.ClaimManager
+	callbacks   *mail.CallbackConsumer
+	reconcile   func(context.Context) error
+	dispatch    func(context.Context, string, string) error
+	dispatchRef string
 }
 
 func (a *livePulseActor) Reconcile(ctx context.Context) error {
@@ -566,10 +621,14 @@ func (a *livePulseActor) ConsumeCallback(ctx context.Context, cb pulse.CallbackO
 	return a.callbacks.AckContext(ctx, cb.EnvelopeID)
 }
 
-func (a *livePulseActor) Dispatch(context.Context, string, string) error {
-	// Dispatch launches are owned by forge/dispatch (FAC-184 adapters). An
-	// honest refusal is better than inventing a spawn API.
-	return errors.New("pulse: bounded dispatch adapter not wired (use herd forge/dispatch; known-out-of-scope for FAC-73)")
+func (a *livePulseActor) Dispatch(ctx context.Context, target, reason string) error {
+	if a.dispatch == nil {
+		return errors.New("pulse: bounded dispatch adapter unavailable")
+	}
+	if strings.TrimSpace(a.dispatchRef) == "" {
+		return errors.New("pulse: no claimable task ref available for bounded dispatch")
+	}
+	return a.dispatch(ctx, target, reason)
 }
 
 func (a *livePulseActor) ReapLane(ctx context.Context, lane pulse.AgentObservation) error {
