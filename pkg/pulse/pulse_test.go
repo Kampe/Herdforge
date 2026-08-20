@@ -504,6 +504,51 @@ func TestActSpawnWithAllIdleLanesHeldReportsNoEligibleTarget(t *testing.T) {
 	}
 }
 
+func TestActSpawnWithNoHealthyIdleAgentsReportsNoEligibleTarget(t *testing.T) {
+	obs := healthyObs()
+	obs.Herdr.Agents = []AgentObservation{
+		{Name: "forge-herd-smith", Raw: "working"},
+		{Name: "forge-platform-ops", Raw: "working"},
+	}
+
+	snap, err := Plan(obs, Options{Act: true, Spawn: true, Now: fixedNow})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snap.Counts.HealthyIdle != 0 {
+		t.Fatalf("healthy idle count=%d want 0: %+v", snap.Counts.HealthyIdle, snap)
+	}
+	if snap.Counts.Dispatch != 0 {
+		t.Fatalf("busy fleet must not consume dispatch budget: %+v", snap)
+	}
+	for _, action := range snap.Actions {
+		if action.Kind == ActionDispatch {
+			t.Fatalf("busy fleet must not plan dispatch target %q: %+v", action.Target, action)
+		}
+	}
+
+	actor := &recordingActor{}
+	out, err := Apply(context.Background(), snap, actor)
+	if err != nil {
+		t.Fatalf("saturated fleet should be a successful beat: %v", err)
+	}
+	if actor.dispatch != 0 {
+		t.Fatalf("saturated fleet must not invoke dispatch: %d calls", actor.dispatch)
+	}
+	if out.ExitCode != 0 {
+		t.Fatalf("saturated fleet beat exit=%d want 0: %+v", out.ExitCode, out)
+	}
+	found := false
+	for _, action := range out.Actions {
+		if action.Kind == ActionWouldRun && strings.Contains(action.Reason, "no eligible target") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("missing no-eligible-target report: %+v", out.Actions)
+	}
+}
+
 func TestNeedsReconcilePlansReconcileAction(t *testing.T) {
 	obs := healthyObs()
 	obs.NeedsReconcile = true
