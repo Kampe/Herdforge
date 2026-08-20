@@ -4005,6 +4005,8 @@ func runCleanup() {
 	fs := flag.NewFlagSet("cleanup", flag.ExitOnError)
 	dryRun := fs.Bool("dry-run", false, "List what would be closed without closing")
 	asJSON := fs.Bool("json", false, "Output JSON")
+	stackAge := fs.Duration("verify-stack-age", time.Hour, "Minimum age before a finished verify-harness Compose stack may be reaped")
+	applyVerifyStacks := fs.Bool("reap-verify-stacks", false, "Actually reap eligible verify-harness Compose stacks (default is report-only)")
 	fs.Parse(os.Args[2:])
 
 	if !herdr.IsAvailable() {
@@ -4029,17 +4031,22 @@ func runCleanup() {
 	}
 	res, err := herdr.CleanupFencedInWorkspace(workspace, standing, *dryRun)
 	res.Repository = repository
+	stackReport, stackErr := reapVerifyStacks(*dryRun || !*applyVerifyStacks, *stackAge)
+	if err == nil {
+		err = stackErr
+	}
 	if *asJSON {
 		out := map[string]interface{}{
-			"dry_run":     res.DryRun,
-			"workspace":   res.Workspace,
-			"repository":  res.Repository,
-			"candidates":  res.Candidates,
-			"attempts":    res.Attempts,
-			"closed":      res.Closed,
-			"blocked":     res.Blocked,
-			"errored":     res.Errored,
-			"error_count": len(res.Attempts) - res.Closed - res.Blocked,
+			"dry_run":       res.DryRun,
+			"workspace":     res.Workspace,
+			"repository":    res.Repository,
+			"candidates":    res.Candidates,
+			"attempts":      res.Attempts,
+			"closed":        res.Closed,
+			"blocked":       res.Blocked,
+			"errored":       res.Errored,
+			"error_count":   len(res.Attempts) - res.Closed - res.Blocked,
+			"verify_stacks": stackReport,
 		}
 		if err != nil {
 			out["error"] = err.Error()
@@ -4071,6 +4078,11 @@ func runCleanup() {
 				fmt.Printf("herd cleanup: closed=%d blocked=%d errored=%d candidates=%d\n",
 					res.Closed, res.Blocked, res.Errored, len(res.Candidates))
 			}
+		}
+		if stackReport.DryRun {
+			fmt.Printf("herd cleanup: verify stacks would_reap=%d skipped=%d blocked=%d\n", len(stackReport.WouldReap), len(stackReport.Skipped), len(stackReport.Blocked))
+		} else {
+			fmt.Printf("herd cleanup: verify stacks reaped=%d skipped=%d blocked=%d\n", len(stackReport.Reaped), len(stackReport.Skipped), len(stackReport.Blocked))
 		}
 	}
 	if err != nil {
