@@ -65,6 +65,22 @@ func TestCheckRootGitConfigRejectsCoreWorktreeRedirect(t *testing.T) {
 	}
 }
 
+func TestCheckRootGitConfigRejectsCorruptedGitConfig(t *testing.T) {
+	root := t.TempDir()
+	runGitDivergenceTest(t, root, "init", "-b", "main")
+	if err := os.WriteFile(filepath.Join(root, ".git", "config"), []byte("[core\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	err := CheckRootGitConfig(root)
+	if err == nil {
+		t.Fatal("corrupted Git config was accepted")
+	}
+	if !strings.Contains(err.Error(), "inspect Git checkout") {
+		t.Fatalf("error = %q, want corrupted-checkout diagnostic", err)
+	}
+}
+
 func writeDivergenceTestFile(t *testing.T, root, contents string) {
 	t.Helper()
 	if err := os.WriteFile(filepath.Join(root, "state.txt"), []byte(contents+"\n"), 0o644); err != nil {
