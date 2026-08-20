@@ -210,6 +210,46 @@ exec /usr/bin/sandbox-exec -f "$PROFILE" /usr/bin/env -i "$@"
 	if err := os.WriteFile(wrapper, []byte(script), 0o755); err != nil {
 		return "", "", "", err
 	}
+	// Builder-role control launches share this PATH, so install immutable
+	// command gates alongside the harness wrapper. Review/control roles do not.
+	if strings.EqualFold(policy.Role, RoleWorker) || strings.EqualFold(policy.Role, "forge-smith") || strings.EqualFold(policy.Role, "recovery") {
+		for _, command := range []string{"gh", "git"} {
+			target, err := exec.LookPath(command)
+			if err != nil {
+				continue
+			}
+			gate := filepath.Join(binDir, command)
+			gateScript := fmt.Sprintf(`#!/bin/sh
+set -e
+case "${0##*/}" in
+gh)
+  previous=""
+  for argument in "$@"; do
+    if [ "$previous" = pr ] && { [ "$argument" = merge ] || [ "$argument" = close ]; }; then
+      echo 'builder lane: gh pr merge/close is coordinator-only' >&2
+      exit 126
+    fi
+    previous="$argument"
+  done
+  ;;
+git)
+  pushing="false"
+  for argument in "$@"; do
+    [ "$argument" = push ] && pushing="true" && continue
+    if [ "$pushing" = true ] && { [ "$argument" = main ] || [ "$argument" = master ] || [ "${argument#*:}" = main ] || [ "${argument#*:}" = master ]; }; then
+      echo 'builder lane: direct push to the default branch is coordinator-only' >&2
+      exit 126
+    fi
+  done
+  ;;
+esac
+exec %q "$@"
+`, target)
+			if err := os.WriteFile(gate, []byte(gateScript), 0o755); err != nil {
+				return "", "", "", err
+			}
+		}
+	}
 	return binDir, profilePath, envFile, nil
 }
 
