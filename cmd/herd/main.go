@@ -2808,7 +2808,7 @@ func runApprove() {
 		fmt.Printf("RECONCILE [%s]: completing interrupted approval %s (state %s)\n", in.Ref, in.DedupeID, in.State)
 		// The journal names WHICH operation to finish; the closing authority
 		// is re-read from that ref's completion receipt (FAC-132).
-		if _, err := approveOne(ctx, cfg, tp, stack, root, in.Ref, "", nil, &in); err != nil {
+		if _, err := approveOne(ctx, cfg, tp, stack, root, in.Ref, "", "", nil, &in); err != nil {
 			fmt.Fprintf(os.Stderr, "ERROR    [%s]: reconcile: %v\n", in.Ref, err)
 			reconcileFailed++
 		}
@@ -2878,7 +2878,7 @@ func runApprove() {
 		// FAC-145: receipt-bound, callback-coupled approval — missing/
 		// unsigned/tampered receipt, wrong repo/project/task, expiry, stale
 		// generation, or an undeliverable callback all refuse the mutation.
-		res, err := approveOne(ctx, cfg, tp, stack, root, task.Ref, receiptPathArg, override, nil)
+		res, err := approveOne(ctx, cfg, tp, stack, root, task.Ref, receiptPathArg, "", override, nil)
 		switch {
 		case err == nil:
 			if res.Idempotent {
@@ -3506,7 +3506,7 @@ func pendingApproveIntents(root string, signer *dispatch.Signer) ([]approveInten
 // operation: identity must match the live receipt (a lease-generation
 // switch refuses), the evidence SHA is the recorded one, and no fresh
 // intent is appended.
-func approveOne(ctx context.Context, cfg *config.Config, tp provider.TaskProvider, stack *provider.ClaimStack, root, ref, receiptPath string, override *hsync.OverrideRequest, resume *approveIntent) (*hsync.DoneResult, error) {
+func approveOne(ctx context.Context, cfg *config.Config, tp provider.TaskProvider, stack *provider.ClaimStack, root, ref, receiptPath, acceptanceEvidence string, override *hsync.OverrideRequest, resume *approveIntent) (*hsync.DoneResult, error) {
 	btp, coord, err := boundBoardProvider(cfg, tp, root, ref)
 	if err != nil {
 		return nil, err
@@ -3568,7 +3568,7 @@ func approveOne(ctx context.Context, cfg *config.Config, tp provider.TaskProvide
 	// FAC-132 owns the closing authority: a task-bound completion receipt or
 	// an explicit policy-limited override. Build it FIRST so the callback can
 	// bind to the same proof commit the board move will use.
-	req, closeAuthority, err := buildDoneRequest(".", cfg.TaskProvider.ProjectID, ref, receiptPath, override)
+	req, closeAuthority, err := buildDoneRequest(".", cfg.TaskProvider.ProjectID, ref, receiptPath, acceptanceEvidence, override)
 	if err != nil {
 		closeAuthority()
 		return nil, err
@@ -3685,6 +3685,7 @@ func approveOne(ctx context.Context, cfg *config.Config, tp provider.TaskProvide
 func runBoardDone() {
 	fs := flag.NewFlagSet("board-done", flag.ExitOnError)
 	receiptPath := fs.String("receipt", "", "Completion receipt path (default .herd/receipts/<REF>.json)")
+	acceptancePath := fs.String("acceptance-output", "", "Path to pasted output for every command in the card's acceptance block")
 	ovFlags := registerOverrideFlags(fs)
 	selftestFlag := fs.Bool("selftest", false, "Run normalization/repo assertions and exit")
 	// Pull the leading positional out BEFORE parsing. Go's flag package stops
@@ -3723,6 +3724,15 @@ func runBoardDone() {
 		fmt.Fprintf(os.Stderr, "herd board-done: %v\n", ovErr)
 		os.Exit(1)
 	}
+	acceptanceEvidence := ""
+	if *acceptancePath != "" {
+		b, readErr := os.ReadFile(*acceptancePath)
+		if readErr != nil {
+			fmt.Fprintf(os.Stderr, "herd board-done: read acceptance output: %v\n", readErr)
+			os.Exit(1)
+		}
+		acceptanceEvidence = string(b)
+	}
 
 	cfg, err := config.LoadConfig(".herd/herd.yaml")
 	if err != nil {
@@ -3755,7 +3765,7 @@ func runBoardDone() {
 		os.Exit(1)
 	}
 	defer stack.Close()
-	res, err := approveOne(context.Background(), cfg, tp, stack, root, ref, *receiptPath, override, nil)
+	res, err := approveOne(context.Background(), cfg, tp, stack, root, ref, *receiptPath, acceptanceEvidence, override, nil)
 	if relErr := release(); relErr != nil {
 		fmt.Fprintf(os.Stderr, "herd board-done: %v\n", relErr)
 		os.Exit(1)
@@ -5717,7 +5727,7 @@ func runForgeE() error {
 		}
 		for _, t := range reviewTasks {
 			// FAC-145: receipt-bound, callback-coupled approval only.
-			res, err := approveOne(ctx, cfg, tp, stack, root, t.Ref, "", nil, nil)
+			res, err := approveOne(ctx, cfg, tp, stack, root, t.Ref, "", "", nil, nil)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "Not approved [%s]: %v\n", t.Ref, err)
 				if !errors.Is(err, hsync.ErrNoEvidence) {

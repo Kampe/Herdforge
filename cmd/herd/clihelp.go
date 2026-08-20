@@ -113,7 +113,7 @@ var subcommandUsage = map[string]string{
 	"task":             "Usage: herd task <get|comment|verdict> [flags]\n  Access the receipt-gated task broker.",
 	"verify-fac151":    "Usage: herd verify-fac151 [flags]\n  Run the fixed hermetic FAC-151 verifier profile.",
 	"watch":            "Usage: herd watch [--stream] [flags]\n  Fire when an agent settles and optionally feed harvest triggers.",
-	"board-done": "Usage: herd board-done <ref> [--receipt <path>] [--override-policy <p> --override-actor <who> --override-reason <why> --override-evidence <what>]\n" +
+	"board-done": "Usage: herd board-done <ref> [--receipt <path>] [--acceptance-output <path>] [--override-policy <p> --override-actor <who> --override-reason <why> --override-evidence <what>]\n" +
 		"  Close a card from its task-bound completion receipt, or by an attributable manual override.",
 	"board-audit": "Usage: herd board-audit [--json]\n  Report Done cards no completion receipt closed. Read-only; never mutates the board.",
 	"board-sync":  "Usage: herd board-sync [flags]\n  Reconcile board status against git reality and live lanes (report only).\n  --fix: advance to-do cards to in-progress when a live lane or branch proves work is in flight.",

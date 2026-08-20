@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 
 	"github.com/Kampe/Herdforge/pkg/config"
 	"github.com/Kampe/Herdforge/pkg/lifecycle"
@@ -94,8 +95,9 @@ func openLifecycleAuthority(repoDir string) (hsync.LifecycleAuthority, func(), e
 
 // buildDoneRequest assembles the request for one card. It opens the lifecycle
 // store only when there is a receipt to check against it.
-func buildDoneRequest(repoDir, projectID, ref, receiptPath string, override *hsync.OverrideRequest) (hsync.DoneRequest, func(), error) {
+func buildDoneRequest(repoDir, projectID, ref, receiptPath, acceptanceEvidence string, override *hsync.OverrideRequest) (hsync.DoneRequest, func(), error) {
 	req := hsync.DoneRequest{RepoDir: repoDir, ProjectID: projectID, Ref: ref, Override: override}
+	req.AcceptanceEvidence = acceptanceEvidence
 	closer := func() {}
 	if override != nil {
 		return req, closer, nil
@@ -112,6 +114,9 @@ func buildDoneRequest(repoDir, projectID, ref, receiptPath string, override *hsy
 		return req, func() {}, err
 	}
 	req.Receipt = receipt
+	if strings.TrimSpace(req.AcceptanceEvidence) == "" {
+		req.AcceptanceEvidence = receipt.AcceptanceEvidence
+	}
 	req.Lifecycle = authority
 	return req, closer, nil
 }

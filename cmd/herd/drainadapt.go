@@ -511,7 +511,7 @@ type drainDispatcher struct {
 // exactly the evidence class FAC-132 removed.
 func (d drainDispatcher) BoardComplete(ctx context.Context, ref, evidenceSHA string) error {
 	_ = evidenceSHA
-	req, closeAuthority, err := buildDoneRequest(d.root, d.project, ref, "", nil)
+	req, closeAuthority, err := buildDoneRequest(d.root, d.project, ref, "", "", nil)
 	if err != nil {
 		closeAuthority()
 		return err

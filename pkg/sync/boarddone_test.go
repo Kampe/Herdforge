@@ -276,7 +276,7 @@ func TestBoardDone(t *testing.T) {
 
 	newBoard := func(ref string) *provider.MemoryProvider {
 		mp := provider.NewMemoryProvider()
-		mp.AddTask(&provider.Task{ID: "id-" + ref, Ref: ref, Title: "t", Status: "in-review", ProjectID: "p1"})
+		mp.AddTask(&provider.Task{ID: "id-" + ref, Ref: ref, Title: "t", Status: "in-review", ProjectID: "p1", Description: testAcceptanceDescription})
 		return mp
 	}
 
@@ -331,13 +331,15 @@ func TestBoardDone(t *testing.T) {
 		mp.AddTask(&provider.Task{
 			ID: "kaneo-uuid-211", Ref: "FAC-211",
 			Title: "fix board-done ref resolution", Status: "in-review", ProjectID: "p1",
+			Description: testAcceptanceDescription,
 		})
 		// Use a provider wrapper that hides the Ref from ListTasks but exposes
 		// it through GetTask — this is the directly-created-card shape.
 		hidden := &refHiddenProvider{MemoryProvider: mp, hiddenRefs: map[string]bool{"kaneo-uuid-211": true}}
 		_, err := BoardDone(ctx, hidden, DoneRequest{
 			RepoDir: dir, ProjectID: "p1", Ref: "FAC-211",
-			Override: &OverrideRequest{Actor: "kampe", Reason: "directly created", Evidence: "sha-211", Policy: "abandoned-scope"},
+			AcceptanceEvidence: testAcceptanceEvidence,
+			Override:           &OverrideRequest{Actor: "kampe", Reason: "directly created", Evidence: "sha-211", Policy: "abandoned-scope"},
 		})
 		if err != nil {
 			t.Fatalf("directly-created card must be closeable via GetTask fallback, got %v", err)
