@@ -44,6 +44,25 @@ func TestWorktreeRemovalRefusesLiveLease(t *testing.T) {
 			}, "worker", "builder", leasePath, tc.leaseStart, tc.leaseTTL); err != nil {
 				t.Fatal(err)
 			}
+			if leasePath != target {
+				// FAC-453: removal now also requires the target path to have
+				// *some* lease history (active or released), not just "no
+				// active claim." This case is about an active lease on a
+				// DIFFERENT path not blocking removal of target -- so target
+				// itself needs its own (dispatched-and-released) history,
+				// same as any real task worktree whose lane finished.
+				own, err := store.Acquire(context.Background(), claim.LeaseKey{
+					Repo: "herdforge", Provider: "kaneo", Project: "project", TaskRef: "FAC-421",
+				}, "worker", "builder", target, time.Now(), time.Hour)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, _, err := store.Release(context.Background(), claim.LeaseKey{
+					Repo: "herdforge", Provider: "kaneo", Project: "project", TaskRef: "FAC-421",
+				}, "worker", own.Generation, time.Now()); err != nil {
+					t.Fatal(err)
+				}
+			}
 
 			called := false
 			manager := NewWorktreeManager(root)
