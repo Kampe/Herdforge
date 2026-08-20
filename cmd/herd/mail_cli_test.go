@@ -182,6 +182,7 @@ func TestMailCLIHelpDistinguishesOrdinaryAndControlMail(t *testing.T) {
 }
 
 func TestMailCLISendsAndReadsDurableMessage(t *testing.T) {
+	requireHerdrForLiveTest(t)
 	dir := sandbox(t)
 	mailFile := filepath.Join(dir, ".herd", "mail.jsonl")
 	out, stderr, err := runHerdWithSeparateOutput(t, dir, nil, "mail", "send", "--from", "coordinator", "--to", "worker-a", "--subject", "handoff", "--body", "ready", "--mail", mailFile)
