@@ -106,7 +106,11 @@ make build
 `make build` installs the single executable at `bin/herd` and refreshes the
 repository-root `herd` symlink used by cross-repository wrappers such as
 Chainseer’s `bin/herdforge`. Both paths therefore always select the same
-revision; use either path only after the build completes.
+revision; use either path only after the build completes. The build first
+creates and smoke-tests a temporary executable, then atomically renames it into
+place. A failed compile or `herd --version` check leaves the previous binary
+untouched. If every `herd` command suddenly exits with `SIGKILL`/137 and emits
+no output, suspect a corrupted in-place rebuild—not OOM and not a parser bug.
 
 ## Repository setup
 
