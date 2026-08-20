@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/Kampe/Herdforge/pkg/claim"
 )
 
 func TestPoolLeaseReleaseAndDirtyRefusal(t *testing.T) {
@@ -100,5 +102,33 @@ func TestSeedCloneCopiesWarmTree(t *testing.T) {
 	}
 	if string(data) != "built" {
 		t.Fatalf("copied data = %q", data)
+	}
+}
+
+// FAC-453 regression: Pool slots are tracked entirely through their own
+// slot.LeaseID bookkeeping, never through pkg/claim.Acquire. GC must still
+// succeed for an unleased slot even when a real .herd/herdforge.db exists
+// (the removal_guard fence must not require pkg/claim lease history for
+// pool-managed paths, only for herd-dispatched task worktrees).
+func TestPoolGCSucceedsWithoutClaimLeaseHistory(t *testing.T) {
+	root := t.TempDir()
+	initRepo(t, root)
+
+	// A real claims database, with zero rows -- matches production: the
+	// database exists (herd has run dispatch commands before) but this
+	// specific pool slot path was never given a pkg/claim lease.
+	dbPath := filepath.Join(root, ".herd", "herdforge.db")
+	store, err := claim.NewSQLiteLeaseStore(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.Close()
+
+	pool := NewPool(root, filepath.Join(root, ".herd", "pool"), 1)
+	if err := pool.Ensure(context.Background()); err != nil {
+		t.Fatalf("Ensure: %v", err)
+	}
+	if err := pool.GC(context.Background()); err != nil {
+		t.Fatalf("GC on an unleased, never-pkg/claim-tracked pool slot must succeed, got: %v", err)
 	}
 }
