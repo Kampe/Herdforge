@@ -25,6 +25,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/Kampe/Herdforge/pkg/config"
 	"github.com/Kampe/Herdforge/pkg/harvest"
@@ -465,7 +466,7 @@ func (l liveDrainLauncher) LaunchReviewer(_ context.Context, req launch.Request,
 	if _, err := herdr.ResolveAgentTabWithDecision(name, req); err != nil {
 		return drainLaunchProof{}, fmt.Errorf("standing reviewer %s has no proven durable launch identity: %w", name, err)
 	}
-	if _, err := herdr.AgentPrompt(name, packet, false); err != nil {
+	if _, err := herdr.Send(name, packet, true, 30*time.Second); err != nil {
 		return drainLaunchProof{}, fmt.Errorf("deliver review packet to %s: %w", name, err)
 	}
 	return drainLaunchProof{Agent: name, Receipt: launch.DecisionDigest(req.Decision)}, nil

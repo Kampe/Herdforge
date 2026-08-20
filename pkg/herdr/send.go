@@ -8,10 +8,10 @@ import (
 )
 
 // Port of bin/herd-send: submit text to a herdr agent pane and confirm the
-// agent CONSUMED it (flipped to working — or done, for agents that finish the
-// ask inside the poll window). A submit that lands in a dead pane looks
-// identical to a delivered one, which is how packets silently vanished; the
-// verify loop is the point of this command.
+// agent CONSUMED it. Status is only one part of the proof: verified delivery
+// also requires the submitted task text to appear in pane readback. A submit
+// that lands in a dead pane, or remains staged as pasted text, must not look
+// successful.
 
 // StatusFromList extracts the agent_status for a target (name or pane id).
 // Pure so the selftest can pin extraction without a live herdr.
@@ -142,18 +142,34 @@ func SendKeys(target, keys string) error {
 }
 
 // Send submits text via `herdr agent prompt` and, when verify is set, polls
-// up to timeout for the pane to report working/done. If it never flips, it
-// presses Enter once and re-checks. Returns the final observed status; error
-// when consumption was never confirmed so a caller can escalate. It does NOT
-// answer trust/approval dialogs.
+// up to timeout for prompt-correlated pane evidence. The agent must report a
+// consumption transition relative to the pre-send baseline, and the exact
+// task text must appear in pane readback. If it never proves consumption, it
+// returns an error so a caller can escalate. It does NOT answer trust/approval
+// dialogs.
 func Send(target, text string, verify bool, timeout time.Duration) (string, error) {
 	return sendInWorkspace(target, text, verify, timeout, "")
+}
+
+// SendStatus is the status-only delivery path for operator control nudges
+// (stop, spin, and feedback). Those messages are not task assignments and do
+// not have task-specific pane text to prove. Assignment delivery must use
+// Send, which requires both the baseline-correlated status transition and
+// pane readback of the submitted task text.
+func SendStatus(target, text string, verify bool, timeout time.Duration) (string, error) {
+	return sendStatusInWorkspace(target, text, verify, timeout, "")
 }
 
 // SendInWorkspace submits to a target already selected from an explicit
 // workspace, as used by stop and other workspace-scoped operators.
 func SendInWorkspace(target, text string, verify bool, timeout time.Duration, workspace string) (string, error) {
 	return sendInWorkspace(target, text, verify, timeout, workspace)
+}
+
+// SendStatusInWorkspace is the workspace-scoped control-nudge variant of
+// SendInWorkspace.
+func SendStatusInWorkspace(target, text string, verify bool, timeout time.Duration, workspace string) (string, error) {
+	return sendStatusInWorkspace(target, text, verify, timeout, workspace)
 }
 
 // FormatSendResult renders the operator-facing delivery result.
@@ -173,7 +189,7 @@ func formatSendResult(target, workspace, status string) string {
 	qualifier := ""
 	switch status {
 	case "working", "done":
-		qualifier = " (delivery confirmed)"
+		qualifier = " (consumption confirmed; task text observed in pane)"
 	case "submitted":
 		qualifier = " (UNVERIFIED: --no-verify)"
 	}
@@ -184,6 +200,38 @@ func formatSendResult(target, workspace, status string) string {
 	return fmt.Sprintf("herd send: %s -> %s%s", route, status, qualifier)
 }
 
+// taskTextObserved reports whether pane readback contains the submitted task
+// or one of its executable command lines. Long packets are often wrapped or
+// clipped from the recent pane tail, so requiring the entire packet would
+// reject a genuinely consumed assignment. The baseline comparison remains
+// mandatory at the call site, which prevents old pane text from proving a new
+// delivery.
+func taskTextObserved(text, pane string) bool {
+	if strings.TrimSpace(text) == "" || strings.Contains(pane, text) {
+		return strings.TrimSpace(text) == "" || strings.Contains(pane, text)
+	}
+	for _, raw := range strings.Split(text, "\n") {
+		line := strings.TrimSpace(raw)
+		line = strings.TrimLeft(line, "`>*-0123456789. )\t")
+		if len(line) < 4 || !isExecutableTaskLine(line) {
+			continue
+		}
+		if strings.Contains(pane, line) {
+			return true
+		}
+	}
+	return false
+}
+
+func isExecutableTaskLine(line string) bool {
+	for _, prefix := range []string{"go ", "git ", "make ", "herd ", "cd ", "./", "bash ", "zsh "} {
+		if strings.HasPrefix(line, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
 func sendInWorkspace(target, text string, verify bool, timeout time.Duration, workspace string) (string, error) {
 	resolved, err := requireAgentWorkspaceIn(target, workspace)
 	if err != nil {
@@ -192,6 +240,13 @@ func sendInWorkspace(target, text string, verify bool, timeout time.Duration, wo
 	resolvedTarget := resolved.Name
 	if resolvedTarget == "" {
 		resolvedTarget = target
+	}
+	baselinePane := ""
+	if verify {
+		baselinePane, err = PaneRead(resolved.PaneID, 120)
+		if err != nil {
+			return "", fmt.Errorf("agent '%s' pre-send pane readback failed: %w", resolvedTarget, err)
+		}
 	}
 	if _, err := AgentPrompt(resolvedTarget, text, false); err != nil {
 		return "", err
@@ -208,11 +263,19 @@ func sendInWorkspace(target, text string, verify bool, timeout time.Duration, wo
 	deadline := time.Now().Add(timeout)
 	nudged := true
 	last := "unknown"
+	lastPane := ""
+	staged := false
 	for time.Now().Before(deadline) {
 		st, err := liveStatusScopedIn(resolvedTarget, workspace)
 		if err == nil {
 			last = st
-			if st == "working" || st == "done" {
+			pane, paneErr := PaneRead(resolved.PaneID, 120)
+			if paneErr == nil {
+				lastPane = pane
+				staged = strings.Contains(strings.ToLower(pane), "pasted text") && !taskTextObserved(text, pane)
+			}
+			if (st == "working" || st == "done") && paneErr == nil &&
+				!taskTextObserved(text, baselinePane) && taskTextObserved(text, pane) {
 				return st, nil
 			}
 		}
@@ -222,6 +285,43 @@ func sendInWorkspace(target, text string, verify bool, timeout time.Duration, wo
 			nudged = true
 		}
 		time.Sleep(poll)
+	}
+	if staged || strings.Contains(strings.ToLower(lastPane), "pasted text") {
+		return last, fmt.Errorf("agent '%s' did not confirm consumption: task text remained staged/unsubmitted in the pane (last status %q)", resolvedTarget, last)
+	}
+	return last, fmt.Errorf("agent '%s' never confirmed task-specific consumption (last status %q; task text not observed in pane)", resolvedTarget, last)
+}
+
+func sendStatusInWorkspace(target, text string, verify bool, timeout time.Duration, workspace string) (string, error) {
+	resolved, err := requireAgentWorkspaceIn(target, workspace)
+	if err != nil {
+		return "", err
+	}
+	resolvedTarget := resolved.Name
+	if resolvedTarget == "" {
+		resolvedTarget = target
+	}
+	if _, err := AgentPrompt(resolvedTarget, text, false); err != nil {
+		return "", err
+	}
+	_ = SendKeys(resolvedTarget, "Enter")
+	if !verify {
+		return "submitted", nil
+	}
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+	deadline := time.Now().Add(timeout)
+	last := "unknown"
+	for time.Now().Before(deadline) {
+		st, statusErr := liveStatusScopedIn(resolvedTarget, workspace)
+		if statusErr == nil {
+			last = st
+			if st == "working" || st == "done" {
+				return st, nil
+			}
+		}
+		time.Sleep(2 * time.Second)
 	}
 	return last, fmt.Errorf("agent '%s' never confirmed consumption (last status %q)", resolvedTarget, last)
 }

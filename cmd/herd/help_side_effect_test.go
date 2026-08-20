@@ -137,8 +137,8 @@ func TestSendHelpDocumentsDeliveryOutcomes(t *testing.T) {
 	t.Parallel()
 	help := usageFor("send")
 	for _, want := range []string{
-		"working  delivery confirmed",
-		"done     delivery confirmed",
+		"working  task text observed in the pane after consumption",
+		"done     task text observed in the pane after consumption",
 		"submitted  UNVERIFIED (--no-verify)",
 		"exits 1 and re-send is appropriate",
 	} {
