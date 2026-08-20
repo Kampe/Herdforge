@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "command": "go test -count=1 -shuffle=on -timeout=300s ./cmd/herd/ ./pkg/verifier/",
+  "failures": [
+    {"package": "github.com/Kampe/Herdforge/cmd/herd", "test": "TestHostCredsCLI_Selftest"},
+    {"package": "github.com/Kampe/Herdforge/cmd/herd", "test": "TestShotReportBlockedCarriesDetail"},
+    {"package": "github.com/Kampe/Herdforge/cmd/herd", "test": "TestShotReportPostsDurableCallback"},
+    {"package": "github.com/Kampe/Herdforge/cmd/herd", "test": "TestShotRefusesDuplicateInvocation"},
+    {"package": "github.com/Kampe/Herdforge/cmd/herd", "test": "TestStopCLIMakesWinddownDurableAndDestroysNoWork"},
+    {"package": "github.com/Kampe/Herdforge/pkg/verifier", "test": "TestStaticRecoveryCrossFileClassesAndControls"},
+    {"package": "github.com/Kampe/Herdforge/pkg/verifier", "test": "TestStaticRecoveryModuleImporter"}
+  ]
+}
