@@ -2153,7 +2153,16 @@ func buildTaskPacket(task *provider.Task, branch, rolePath, taskProviderType, ta
 	fmt.Fprintf(&b, "BUILD %s — EXECUTE. No menus, no questions. Do not stop until "+
 		"`%s` passes AND you have committed.\n\n", task.Ref, verifySummary)
 
-	fmt.Fprintf(&b, "Worktree: current directory (Herdr cwd-enforced), branch %s. Work ONLY here — never edit files outside it.\n\n", branch)
+	fmt.Fprintf(&b, "Worktree: current directory (Herdr cwd-enforced), branch %s. Work ONLY here — never edit files outside it.\n", branch)
+	// The wake is delivered through the same pane as automated Stop-hook
+	// output. Put the assignment's provenance in the lane-local packet so the
+	// lane can verify it from its own context instead of trusting transport
+	// wording. Keep this compact: packets are deliberately context-light.
+	coordinator := reply.Name
+	if coordinator == "" {
+		coordinator = "coordinator"
+	}
+	fmt.Fprintf(&b, "ASSIGNMENT ENVELOPE: ADDRESSED ASSIGNMENT; issuer: %s; task_ref: %s; task_id: %s; lease_generation: %d; ASSIGNMENT ENVELOPE END.\n", coordinator, task.Ref, task.ID, reply.LeaseGeneration)
 
 	fmt.Fprintf(&b, "Read the full spec yourself (do not wait for it inline) via the receipt-gated broker (provider=%s project=%s):\n", taskProviderType, taskProviderProject)
 	fmt.Fprintf(&b, "  herd task get %s --full\n\n", task.Ref)

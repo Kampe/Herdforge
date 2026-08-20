@@ -400,6 +400,7 @@ func TestSlugForTask(t *testing.T) {
 
 func TestBuildTaskPacket(t *testing.T) {
 	task := &provider.Task{
+		ID:          "task-33",
 		Ref:         "FAC-33",
 		Title:       "Test task",
 		Description: "Do the thing",
@@ -415,6 +416,11 @@ func TestBuildTaskPacket(t *testing.T) {
 	packet := buildTaskPacket(task, "herd/fac-33", ".herd/prompts/worker.md", "kaneo", "fac-proj", lane, verification, ReplyTarget{Name: "coordinator", LeaseGeneration: 1})
 	if !strings.Contains(packet, "FAC-33") {
 		t.Error("packet should contain ticket ref")
+	}
+	for _, want := range []string{"ASSIGNMENT ENVELOPE", "issuer: coordinator", "task_id: task-33", "lease_generation: 1", "ASSIGNMENT ENVELOPE END"} {
+		if !strings.Contains(packet, want) {
+			t.Errorf("packet missing independently checkable assignment provenance %q:\n%s", want, packet)
+		}
 	}
 	if !strings.Contains(packet, "herd/fac-33") {
 		t.Error("packet must carry the actual Git branch name")

@@ -31,6 +31,11 @@ func TestEveryWakeDirectsTheAgentToItsPacketAndKeepsProvenance(t *testing.T) {
 					t.Errorf("wake lost provenance %q: %s", want, tc.text)
 				}
 			}
+			for _, want := range []string{"ADDRESSED ASSIGNMENT", "issuer: coordinator", "NOT AUTOMATED STOP-HOOK OUTPUT"} {
+				if !contains(tc.text, want) {
+					t.Errorf("wake does not identify addressed assignment provenance %q: %s", want, tc.text)
+				}
+			}
 			// The regression was the message READING as an order to consume an
 			// envelope. Reject the verb ANYWHERE, not as a prefix, so merely
 			// moving it does not slip past.

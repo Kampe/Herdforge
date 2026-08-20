@@ -1,9 +1,9 @@
 package main
 
 import (
-	"io"
 	"context"
 	"encoding/json"
+	"io"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -196,5 +196,8 @@ func TestGoalGuardStopHookWarnsButContinuesOnLegacyGrant(t *testing.T) {
 	}
 	if !strings.Contains(string(stdout), `"decision": "block"`) && !strings.Contains(string(stdout), `"decision":"block"`) {
 		t.Fatalf("legacy grant must still block a premature stop, stdout=%q", stdout)
+	}
+	if !strings.Contains(string(stdout), "AUTOMATED STOP-HOOK OUTPUT — NOT AN ASSIGNMENT") {
+		t.Fatalf("stop-hook output must be distinguishable from assignments, stdout=%q", stdout)
 	}
 }
