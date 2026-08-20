@@ -119,11 +119,21 @@ func runReviewIngest() {
 			refused++
 			continue
 		}
+		artifactName := reviewingest.RetainedArtifactName(a.SHA, a.Reviewer, body)
 		if parsed.dryRun {
+			if err := reviewingest.CheckMoveToIngested(f, artifactName); err != nil {
+				fmt.Fprintf(os.Stderr, "REFUSED %s: %v\n", filepath.Base(f), err)
+				refused++
+				continue
+			}
 			fmt.Printf("WOULD_ADMIT %s verdict=%s reviewer=%s sha=%s\n",
 				filepath.Base(f), a.Verdict, a.Reviewer, a.SHA[:12])
 			admitted++
 			continue
+		}
+		if err := reviewingest.CheckMoveToIngested(f, artifactName); err != nil {
+			fmt.Fprintf(os.Stderr, "herd review-ingest: preflight artifact move FAILED for %s: %v\n", filepath.Base(f), err)
+			os.Exit(1)
 		}
 		// Retain the validated artifact inside the repository before writing its
 		// ledger row. Reviewer panes use ephemeral /tmp worktrees and cleanup
@@ -171,7 +181,7 @@ func runReviewIngest() {
 			CandidateSHA:   a.SHA,
 			RetryOf:        a.RetryOf,
 		}
-		enqueued, err := admitVerdictAndMove(ledger, reviewledger.IngestOpts{Record: recordOpts, Verdict: verdictOpts}, f, a.SHA)
+		enqueued, err := admitVerdictAndMove(ledger, reviewledger.IngestOpts{Record: recordOpts, Verdict: verdictOpts}, f, artifactName)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "herd review-ingest: admission/verdict write FAILED for %s: %v\n", filepath.Base(f), err)
 			os.Exit(1)
@@ -269,7 +279,11 @@ type reviewIngestLedger interface {
 // admitVerdictAndMove makes the ledger row observable before moving the source
 // artifact. An append acknowledgement alone is not sufficient admission
 // evidence: a failed read-back must leave the artifact available for retry.
-func admitVerdictAndMove(ledger reviewIngestLedger, opts reviewledger.IngestOpts, source, sha string) (bool, error) {
+func admitVerdictAndMove(ledger reviewIngestLedger, opts reviewledger.IngestOpts, source, destinationName string) (bool, error) {
+	sha := opts.Verdict.SHA
+	if sha == "" {
+		sha = destinationName
+	}
 	if opts.Verdict.Reviewer != "" {
 		if prior, found, err := ledger.VerdictForReviewer(sha, opts.Verdict.Reviewer); err != nil {
 			return false, fmt.Errorf("read existing ledger verdict: %w", err)
@@ -279,17 +293,30 @@ func admitVerdictAndMove(ledger reviewIngestLedger, opts reviewledger.IngestOpts
 			return false, nil
 		}
 	}
+	if err := reviewingest.CheckMoveToIngested(source, destinationName); err != nil {
+		return false, fmt.Errorf("preflight artifact move: %w", err)
+	}
+	destination, err := reviewingest.MoveToIngestedNamed(source, destinationName)
+	if err != nil {
+		return false, fmt.Errorf("move admitted artifact: %w", err)
+	}
 	enqueued, err := ledger.Ingest(opts)
 	if err != nil {
+		if destination != source {
+			_ = os.Rename(destination, source)
+		}
 		return false, err
 	}
 	if _, found, err := ledger.VerdictFor(sha); err != nil {
+		if destination != source {
+			_ = os.Rename(destination, source)
+		}
 		return false, fmt.Errorf("read back ledger verdict: %w", err)
 	} else if !found {
+		if destination != source {
+			_ = os.Rename(destination, source)
+		}
 		return false, fmt.Errorf("read back ledger verdict: sha %s not found", sha)
-	}
-	if _, err := reviewingest.MoveToIngested(source); err != nil {
-		return false, fmt.Errorf("move admitted artifact: %w", err)
 	}
 	return enqueued, nil
 }
