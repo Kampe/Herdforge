@@ -128,6 +128,7 @@ var subcommandUsage = map[string]string{
 Outcomes:
   -> working  task text observed in the pane after consumption; do not re-send.
   -> done     task text observed in the pane after consumption; do not re-send.
+  -> queued   assignment is visible or staged but not consumed; exits 1 and requires retry or explicit deferral.
   -> submitted  UNVERIFIED (--no-verify); delivery is unknown, so re-send if needed.
   no result line  the pane never flipped; exits 1 and re-send is appropriate.
 

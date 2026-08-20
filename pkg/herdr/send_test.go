@@ -35,6 +35,7 @@ func TestFormatSendResultExplainsDeliveryGuarantee(t *testing.T) {
 	}{
 		{name: "working", status: "working", want: "herd send: worker -> working (consumption confirmed; task text observed in pane)"},
 		{name: "done", status: "done", want: "herd send: worker -> done (consumption confirmed; task text observed in pane)"},
+		{name: "queued", status: "queued", want: "herd send: worker -> queued (queued but not consumed; explicit retry or defer required)"},
 		{name: "submitted", status: "submitted", want: "herd send: worker -> submitted (UNVERIFIED: --no-verify)"},
 	}
 	for _, tc := range cases {
@@ -126,7 +127,11 @@ func TestSendAcceptsBusyLaneOnlyWithTaskTextPaneEvidence(t *testing.T) {
 	oldRun := runHerdr
 	t.Cleanup(func() { runHerdr = oldRun })
 	paneReads := 0
+	var transport []string
 	runHerdr = func(args ...string) (string, error) {
+		if len(args) >= 2 && args[0] == "agent" && (args[1] == "send-keys" || args[1] == "prompt") {
+			transport = append(transport, strings.Join(args, " "))
+		}
 		if len(args) >= 2 && args[0] == "agent" && args[1] == "list" {
 			return `{"result":{"agents":[{"name":"worker","pane_id":"pane-busy","workspace_id":"wK","agent_status":"working"}]}}`, nil
 		}
@@ -143,6 +148,34 @@ func TestSendAcceptsBusyLaneOnlyWithTaskTextPaneEvidence(t *testing.T) {
 	got, err := Send("worker", "assigned command: go test ./pkg/herdr", true, time.Second)
 	if err != nil || got != "working" {
 		t.Fatalf("busy delivery = %q, %v; want task-specific pane proof", got, err)
+	}
+	if len(transport) < 3 || !strings.HasPrefix(transport[0], "agent send-keys worker Escape") ||
+		!strings.HasPrefix(transport[1], "agent prompt worker assigned command") ||
+		!strings.HasPrefix(transport[2], "agent send-keys worker Enter") {
+		t.Fatalf("busy assignment transport = %#v; want Escape, prompt, Enter", transport)
+	}
+}
+
+func TestSendRefusesAssignmentWhenStandingGoalCannotBePreempted(t *testing.T) {
+	t.Setenv("HERD_WORKSPACE", "wK")
+	oldRun := runHerdr
+	t.Cleanup(func() { runHerdr = oldRun })
+	runHerdr = func(args ...string) (string, error) {
+		if len(args) >= 2 && args[0] == "agent" && args[1] == "list" {
+			return `{"result":{"agents":[{"name":"worker","pane_id":"pane-busy","workspace_id":"wK","agent_status":"working"}]}}`, nil
+		}
+		if len(args) >= 2 && args[0] == "pane" && args[1] == "read" {
+			return `{"result":{"text":"empty pane"}}`, nil
+		}
+		if len(args) >= 2 && args[0] == "agent" && args[1] == "send-keys" {
+			return "standing goal could not be interrupted", fmt.Errorf("send-keys refused")
+		}
+		return "{}", nil
+	}
+
+	status, err := Send("worker", "assigned command: go test ./pkg/herdr", true, time.Second)
+	if err == nil || status != "deferred" || !strings.Contains(err.Error(), "explicitly deferred") {
+		t.Fatalf("preemption refusal = status %q err %v; want explicit deferred failure", status, err)
 	}
 }
 
@@ -166,7 +199,7 @@ func TestSendRejectsStagedTextEvenWhenPaneStatusLooksHealthy(t *testing.T) {
 	}
 
 	_, err := Send("worker", "assigned command: go test ./pkg/herdr", true, time.Millisecond)
-	if err == nil || !strings.Contains(err.Error(), "staged/unsubmitted") {
+	if err == nil || !strings.Contains(err.Error(), "queued-but-not-consumed") || !strings.Contains(err.Error(), "staged/unsubmitted") {
 		t.Fatalf("staged delivery error = %v; want explicit staged/unsubmitted failure", err)
 	}
 }

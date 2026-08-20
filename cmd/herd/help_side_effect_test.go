@@ -139,6 +139,7 @@ func TestSendHelpDocumentsDeliveryOutcomes(t *testing.T) {
 	for _, want := range []string{
 		"working  task text observed in the pane after consumption",
 		"done     task text observed in the pane after consumption",
+		"queued   assignment is visible or staged but not consumed",
 		"submitted  UNVERIFIED (--no-verify)",
 		"exits 1 and re-send is appropriate",
 	} {
