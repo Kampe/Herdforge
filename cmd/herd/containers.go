@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/Kampe/Herdforge/pkg/containerlifecycle"
@@ -213,20 +214,43 @@ func runContainersReconcile(args []string) {
 	}
 }
 
-// reapVerifyStacks is shared by `herd cleanup` so the normal cleanup sweep
-// accounts for ephemeral verification Compose projects as well as Herdr tabs.
-func reapVerifyStacks(dryRun bool, maxAge time.Duration) (containerlifecycle.ReapVerifyStacksReport, error) {
-	if _, err := exec.LookPath("docker"); err != nil {
-		// A host without Docker cannot establish stack ownership or liveness.
-		// Report the uncertainty and leave everything untouched; tab cleanup
-		// remains useful in the same invocation.
-		return containerlifecycle.ReapVerifyStacksReport{
-			DryRun:  dryRun,
-			Blocked: []string{"docker-unavailable"},
-		}, nil
+type verifyReaperReport struct {
+	Present  bool   `json:"present"`
+	Applied  bool   `json:"applied"`
+	Output   string `json:"output,omitempty"`
+	ExitCode int    `json:"exit_code,omitempty"`
+	Error    string `json:"error,omitempty"`
+}
+
+// runRepoVerifyReaper delegates stack ownership, liveness, and selection to
+// the repository that created the verify harness. The absent-reaper case is
+// deliberately successful: a repository without a verify harness still gets
+// its normal tab/worktree cleanup.
+func runRepoVerifyReaper(ctx context.Context, repository string, apply bool) (verifyReaperReport, error) {
+	const relativeReaper = "./bin/verify-stack-reap"
+	path := filepath.Join(repository, "bin", "verify-stack-reap")
+	info, err := os.Stat(path)
+	if os.IsNotExist(err) || (err == nil && (info.IsDir() || info.Mode()&0o111 == 0)) {
+		return verifyReaperReport{Output: "no repo reaper"}, nil
 	}
-	return containerlifecycle.ReapVerifyStacks(context.Background(), containerlifecycle.NewDockerComposeStackClient(), containerlifecycle.ReapVerifyStacksOptions{
-		DryRun: dryRun,
-		MaxAge: maxAge,
-	})
+	if err != nil {
+		return verifyReaperReport{}, fmt.Errorf("inspect repo reaper: %w", err)
+	}
+
+	args := []string{}
+	if apply {
+		args = append(args, "--apply")
+	}
+	cmd := exec.CommandContext(ctx, relativeReaper, args...)
+	cmd.Dir = repository
+	out, runErr := cmd.CombinedOutput()
+	report := verifyReaperReport{Present: true, Applied: apply, Output: strings.TrimSpace(string(out))}
+	if runErr == nil {
+		return report, nil
+	}
+	report.Error = runErr.Error()
+	if exitErr, ok := runErr.(*exec.ExitError); ok {
+		report.ExitCode = exitErr.ExitCode()
+	}
+	return report, fmt.Errorf("repo reaper failed: %w", runErr)
 }
