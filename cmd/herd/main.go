@@ -1990,6 +1990,15 @@ func parseReviewArgs(args []string) (ref string, spawn bool) {
 	spawnFlag := fs.Bool("spawn", false, "Spawn reviewer agent in herdr")
 	_ = fs.Bool("pool", false, "Use the warm-pool review surface path (no signer admission)")
 	_ = fs.Bool("verbose", false, "Show ref parsing and candidate search diagnostics")
+	// Register pool options here as well as in runPoolReview. The outer parser
+	// owns ExitOnError semantics and must accept the complete review command
+	// line before dispatching the pool-specific tail.
+	_ = fs.String("sha", "", "Exact candidate commit")
+	_ = fs.String("model", "", "Persistent reviewer model")
+	_ = fs.String("pool-root", "", "Warm review pool root")
+	_ = fs.String("surface-root", "", "Review surface symlink root")
+	_ = fs.String("packet-root", "", "Review packet root")
+	_ = fs.Bool("no-launch", false, "Prepare and print the surface without starting Herdr")
 	fs.Parse(leadingPositionalArgs(args))
 	return fs.Arg(0), *spawnFlag
 }

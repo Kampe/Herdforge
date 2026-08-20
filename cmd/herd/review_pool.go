@@ -22,18 +22,26 @@ func runPoolReview(ref string) error {
 	if strings.TrimSpace(ref) == "" {
 		return errors.New("candidate ref is required (usage: herd review <ref> --pool)")
 	}
+	parsedRef, parsedSHA, err := parseReviewPoolArgs(os.Args[2:])
+	if err != nil {
+		return err
+	}
+	if parsedRef != "" {
+		ref = parsedRef
+	}
 	fs := flag.NewFlagSet("review --pool", flag.ContinueOnError)
-	shaFlag := fs.String("sha", "", "Exact candidate commit (default: HEAD of .herd/worktrees/<ref>)")
+	shaFlag := fs.String("sha", parsedSHA, "Exact candidate commit (default: HEAD of .herd/worktrees/<ref>)")
 	model := fs.String("model", "litellm/ollama/glm-5.2:cloud", "Persistent OpenCode model")
 	poolRoot := fs.String("pool-root", filepath.Join(".herd", "pool"), "Warm review pool root")
 	surfaceRoot := fs.String("surface-root", filepath.Join(".herd", "review-surfaces"), "Review surface symlink root")
 	packetRoot := fs.String("packet-root", filepath.Join(".herd", "review-packets"), "Review packet root")
 	noLaunch := fs.Bool("no-launch", false, "Prepare and print the surface without starting Herdr")
+	// The command line was validated and parsed above. Parse the operational
+	// options again to retain their defaults and values for this invocation;
+	// --pool is deliberately registered so the selector is consumed here too.
+	_ = fs.Bool("pool", false, "Select the warm-pool review path")
 	if err := fs.Parse(leadingPositionalArgs(os.Args[2:])); err != nil {
 		return err
-	}
-	if fs.NArg() > 0 {
-		ref = fs.Arg(0)
 	}
 	root := firstEnv("HERD_ROOT", "HERD_REPO_ROOT", ".")
 	candidateDir, err := resolvePoolReviewCandidate(root, ref)
@@ -204,6 +212,29 @@ func checkedOutBranchWorktree(root, ref string) (string, error) {
 		return matched, nil
 	}
 	return "", nil
+}
+
+// parseReviewPoolArgs parses the review command's pool selector and the
+// options that are meaningful only on the warm-pool path. The outer review
+// parser also registers these flags so ExitOnError does not reject them before
+// this ContinueOnError parser can produce a normal error.
+func parseReviewPoolArgs(args []string) (ref, sha string, err error) {
+	fs := flag.NewFlagSet("review --pool", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	_ = fs.Bool("pool", false, "Select the warm-pool review path")
+	shaFlag := fs.String("sha", "", "Exact candidate commit")
+	_ = fs.String("model", "", "Persistent reviewer model")
+	_ = fs.String("pool-root", "", "Warm review pool root")
+	_ = fs.String("surface-root", "", "Review surface symlink root")
+	_ = fs.String("packet-root", "", "Review packet root")
+	_ = fs.Bool("no-launch", false, "Prepare and print the surface without starting Herdr")
+	if err := fs.Parse(leadingPositionalArgs(args)); err != nil {
+		return "", "", err
+	}
+	if fs.NArg() > 0 {
+		ref = fs.Arg(0)
+	}
+	return ref, *shaFlag, nil
 }
 
 func safeReviewSurfacePart(ref string) string {

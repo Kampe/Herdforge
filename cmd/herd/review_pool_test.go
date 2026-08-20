@@ -76,3 +76,34 @@ func TestResolvePoolReviewCandidateTicketAndBranchWorktrees(t *testing.T) {
 		t.Fatalf("branch candidate = %q, want %q", gotReal, wantReal)
 	}
 }
+
+func TestParseReviewPoolArgs(t *testing.T) {
+	sha := "0123456789abcdef0123456789abcdef01234567"
+	tests := []struct {
+		name    string
+		args    []string
+		wantRef string
+		wantSHA string
+		wantErr bool
+	}{
+		{name: "selector after ref", args: []string{"FAC-478", "--pool", "--sha", sha}, wantRef: "FAC-478", wantSHA: sha},
+		{name: "unknown flag", args: []string{"FAC-478", "--pool", "--not-a-review-option"}, wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotRef, gotSHA, err := parseReviewPoolArgs(tt.args)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatal("unknown flag was accepted")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if gotRef != tt.wantRef || gotSHA != tt.wantSHA {
+				t.Fatalf("parseReviewPoolArgs(%v) = (%q, %q), want (%q, %q)", tt.args, gotRef, gotSHA, tt.wantRef, tt.wantSHA)
+			}
+		})
+	}
+}

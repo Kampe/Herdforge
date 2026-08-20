@@ -24,6 +24,15 @@ func TestParseReviewArgs_SpawnAfterRef(t *testing.T) {
 	}
 }
 
+func TestParseReviewArgs_PoolFlagsAfterRef(t *testing.T) {
+	ref, spawn := parseReviewArgs([]string{
+		"FAC-478", "--pool", "--sha", "0123456789abcdef0123456789abcdef01234567",
+	})
+	if ref != "FAC-478" || spawn {
+		t.Fatalf("pool review args were not accepted: ref=%q spawn=%v", ref, spawn)
+	}
+}
+
 func TestReviewRefShapeAndVerboseMode(t *testing.T) {
 	cases := []struct {
 		name string
