@@ -93,7 +93,7 @@ func (m *Mailbox) PostCallbackContext(ctx context.Context, sender string, cb Cal
 		return nil, err
 	}
 	subject := string(cb.Kind) + ": " + cb.Ref
-	if cb.DedupeID == "" {
+	if cb.DedupeID == "" && (cb.Kind != CallbackComplete || cb.LeaseGeneration <= 0) {
 		return m.SendMessageContext(ctx, sender, CoordinatorInbox, subject, string(body))
 	}
 
@@ -167,6 +167,17 @@ func (m *Mailbox) scanCallbackDedupeLocked(cb Callback) (*Envelope, error) {
 		var c Callback
 		if err := json.Unmarshal([]byte(env.Body), &c); err != nil {
 			return nil, fmt.Errorf("mailbox line %d callback body is malformed — refusing dedupe decision on corrupt state (FAC-145 fail-closed): %w", i+1, err)
+		}
+		// Completion is an effect keyed by the task ref and lease fence. A
+		// producer retry must converge even when it did not provide a
+		// caller-generated DedupeID (or generated a different one).
+		if cb.Kind == CallbackComplete && c.Kind == CallbackComplete &&
+			c.Ref == cb.Ref && c.LeaseGeneration == cb.LeaseGeneration {
+			e := env
+			return &e, nil
+		}
+		if cb.DedupeID == "" {
+			continue
 		}
 		if c.DedupeID != cb.DedupeID {
 			continue
