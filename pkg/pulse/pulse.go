@@ -665,7 +665,7 @@ func Plan(obs Observation, opts Options) (Snapshot, error) {
 				break
 			}
 		}
-		if target != "queue" || !hasIdleLane {
+		if target != "queue" && hasIdleLane {
 			actions = append(actions, Action{
 				Kind:   ActionDispatch,
 				Target: target,
@@ -673,10 +673,14 @@ func Plan(obs Observation, opts Options) (Snapshot, error) {
 				Safe:   true,
 			})
 		} else {
+			reason := "dispatch withheld: no eligible target; all healthy idle lanes are held"
+			if !hasIdleLane {
+				reason = "dispatch withheld: no eligible target; no healthy idle lanes"
+			}
 			actions = append(actions, Action{
 				Kind:     ActionWouldRun,
 				Target:   "dispatch",
-				Reason:   "dispatch withheld: no eligible target; all healthy idle lanes are held",
+				Reason:   reason,
 				WouldRun: "dispatch withheld",
 				Safe:     false,
 			})
