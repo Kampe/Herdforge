@@ -12,6 +12,7 @@ import (
 	"github.com/Kampe/Herdforge/pkg/claim"
 	"github.com/Kampe/Herdforge/pkg/deps"
 	"github.com/Kampe/Herdforge/pkg/herdr"
+	"github.com/Kampe/Herdforge/pkg/lifecycle"
 	"github.com/Kampe/Herdforge/pkg/provider"
 	"github.com/Kampe/Herdforge/pkg/pulse"
 	"github.com/Kampe/Herdforge/pkg/winddown"
@@ -59,6 +60,44 @@ func TestLivePulseActorDispatchUsesSharedDecision(t *testing.T) {
 	}
 	if got.TicketRef != "FAC-479" || got.LaneName != "smith" || !got.LaneExplicit {
 		t.Fatalf("dispatch request=%+v", got)
+	}
+}
+
+func TestResolvePulseDispatchLaneUsesCanonicalLaneForLiveAgentID(t *testing.T) {
+	registry, err := lifecycle.NewCanonicalLaneRegistry([]lifecycle.CanonicalLane{
+		{Name: "api-crusader", Role: "forge"},
+		{Name: "smith", Role: "worker"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		name    string
+		liveID  string
+		want    string
+		wantErr bool
+	}{
+		{name: "known live agent", liveID: "forge-api-crusader", want: "api-crusader"},
+		{name: "unknown live agent", liveID: "forge-missing", wantErr: true},
+		{name: "configured lane without live prefix", liveID: "api-crusader", wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := resolvePulseDispatchLane(registry, tt.liveID)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("resolvePulseDispatchLane(%q) succeeded with %q; want fail-closed error", tt.liveID, got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("resolvePulseDispatchLane(%q): %v", tt.liveID, err)
+			}
+			if got != tt.want {
+				t.Fatalf("resolvePulseDispatchLane(%q)=%q want %q", tt.liveID, got, tt.want)
+			}
+		})
 	}
 }
 
