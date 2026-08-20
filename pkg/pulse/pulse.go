@@ -194,15 +194,17 @@ type CallbackObservation struct {
 	Attempt         int    `json:"attempt,omitempty"`
 }
 
-// ReviewObservation is one read of review-pile pressure.
+// ReviewObservation is one read of review-pile pressure. RawVetoed is the
+// unfiltered, unexpired SHA set from the review ledger; it is intentionally
+// distinct from drain's NeedReview, which is the live unmerged-candidate set.
 type ReviewObservation struct {
-	Known          bool     `json:"known"`
-	Error          string   `json:"error,omitempty"`
-	Pending        int      `json:"pending"`
-	PendingRefs    []string `json:"pending_refs,omitempty"`
-	NeedReview     int      `json:"need_review"`
-	NeedReviewRefs []string `json:"need_review_refs,omitempty"`
-	Saturated      bool     `json:"saturated,omitempty"`
+	Known         bool     `json:"known"`
+	Error         string   `json:"error,omitempty"`
+	Pending       int      `json:"pending"`
+	PendingRefs   []string `json:"pending_refs,omitempty"`
+	RawVetoed     int      `json:"raw_vetoed"`
+	RawVetoedRefs []string `json:"raw_vetoed_refs,omitempty"`
+	Saturated     bool     `json:"saturated,omitempty"`
 }
 
 // QuotaObservation is one read of capacity/quota posture.

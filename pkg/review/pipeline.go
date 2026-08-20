@@ -59,6 +59,9 @@ type DrainShas struct {
 	RebaseNeeded  []string `json:"rebase_needed_shas"`
 }
 
+// DrainReport.NeedReview is the live unmerged-candidate set discovered by the
+// drain scan. It is distinct from pulse.ReviewObservation.RawVetoed, which is
+// the review ledger's unfiltered, unexpired vetoed-SHA set.
 type DrainReport struct {
 	WindDown                                                                                                                                                    bool `json:"wind_down"`
 	Pending, HarvestQueue, RefactoringCount, Harvestable, NeedReview, ReviewPass, HarvestReady, ContentMerged, KaneoInReview, Cap, RebaseNeeded, StaleBehindMax int

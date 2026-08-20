@@ -37,7 +37,7 @@ func healthyObs() Observation {
 			{EnvelopeID: "env-1", Sequence: 10, Ref: "FAC-1", Kind: "complete", LeaseGeneration: 3},
 			{EnvelopeID: "env-2", Sequence: 11, Ref: "FAC-2", Kind: "blocked", LeaseGeneration: 1},
 		},
-		Review:   ReviewObservation{Known: true, Pending: 0, NeedReview: 0},
+		Review:   ReviewObservation{Known: true, Pending: 0, RawVetoed: 0},
 		Quota:    QuotaObservation{Known: true},
 		WindDown: WindDownObservation{Known: true, Enabled: false},
 	}

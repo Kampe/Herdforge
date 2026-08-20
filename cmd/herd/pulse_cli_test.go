@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"os"
@@ -15,6 +16,7 @@ import (
 	"github.com/Kampe/Herdforge/pkg/lifecycle"
 	"github.com/Kampe/Herdforge/pkg/provider"
 	"github.com/Kampe/Herdforge/pkg/pulse"
+	"github.com/Kampe/Herdforge/pkg/review"
 	"github.com/Kampe/Herdforge/pkg/winddown"
 )
 
@@ -574,8 +576,48 @@ func TestReadPulseReviewAbsentLedgerReportsKnownEmpty(t *testing.T) {
 	if !obs.Known {
 		t.Fatal("absent ledger must produce Known=true (known-empty), not unknown")
 	}
-	if obs.Pending != 0 || obs.NeedReview != 0 {
-		t.Fatalf("absent ledger must report zero pending/needReview: %+v", obs)
+	if obs.Pending != 0 || obs.RawVetoed != 0 {
+		t.Fatalf("absent ledger must report zero pending/rawVetoed: %+v", obs)
+	}
+}
+
+func TestReadPulseReviewNamesRawVetoedSetExplicitly(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "review-ledger.jsonl")
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	enc := json.NewEncoder(f)
+	for _, row := range []review.LedgerRow{
+		{Event: string(review.EventVerdict), SHA: "merged-fail", Reviewer: "r1", Verdict: string(review.VerdictFAIL)},
+		{Event: string(review.EventVerdict), SHA: "live-fail", Reviewer: "r2", Verdict: string(review.VerdictBLOCKED)},
+	} {
+		if err := enc.Encode(row); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HERD_REVIEW_LEDGER", path)
+
+	obs := readPulseReview()
+	if obs.RawVetoed != 2 || len(obs.RawVetoedRefs) != 2 {
+		t.Fatalf("raw vetoed set must retain both ledger SHAs: %+v", obs)
+	}
+	encoded, err := json.Marshal(obs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(encoded, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := payload["raw_vetoed"]; !ok {
+		t.Fatalf("pulse schema missing raw_vetoed: %s", encoded)
+	}
+	if _, ok := payload["need_review"]; ok {
+		t.Fatalf("pulse schema still exposes ambiguous need_review: %s", encoded)
 	}
 }
 
