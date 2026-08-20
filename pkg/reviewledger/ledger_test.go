@@ -55,6 +55,23 @@ func TestNewReviewLedger(t *testing.T) {
 	}
 }
 
+func TestNewReadOnlyReviewLedgerDoesNotCreateFiles(t *testing.T) {
+	dir := t.TempDir()
+	ledgerPath := filepath.Join(dir, ".herd", "review-ledger.jsonl")
+	l, err := NewReadOnlyReviewLedger(dir, ledgerPath)
+	if err != nil {
+		t.Fatalf("NewReadOnlyReviewLedger: %v", err)
+	}
+	if l.Path != ledgerPath {
+		t.Fatalf("Path = %s, want %s", l.Path, ledgerPath)
+	}
+	for _, path := range []string{ledgerPath, l.QueuePath} {
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Fatalf("read-only ledger created %s: %v", path, err)
+		}
+	}
+}
+
 func TestRecord(t *testing.T) {
 	tests := []struct {
 		name    string

@@ -29,7 +29,45 @@ func (f *fakeReviewIngestLedger) VerdictFor(sha string) (reviewledger.LedgerRow,
 }
 
 func (f *fakeReviewIngestLedger) VerdictForReviewer(sha, reviewer string) (reviewledger.LedgerRow, bool, error) {
-	return f.VerdictFor(sha)
+	if !f.readable {
+		return reviewledger.LedgerRow{}, false, errors.New("simulated ledger read failure")
+	}
+	if f.reviewer == "" || f.reviewer != reviewer {
+		return reviewledger.LedgerRow{}, false, nil
+	}
+	return reviewledger.LedgerRow{Event: string(reviewledger.EventVerdict), SHA: sha, Reviewer: reviewer, Verdict: "PASS"}, true, nil
+}
+
+func TestReviewIngestAdmissionDecisionParity(t *testing.T) {
+	const sha = "0123456789012345678901234567890123456789"
+	for _, tc := range []struct {
+		name          string
+		priorReviewer string
+		reviewer      string
+		want          reviewIngestDecision
+	}{
+		{name: "duplicate reviewer", priorReviewer: "reviewer-a", reviewer: "reviewer-a", want: reviewIngestSkipDuplicate},
+		{name: "new artifact", reviewer: "reviewer-a", want: reviewIngestAdmit},
+		{name: "different reviewer", priorReviewer: "reviewer-a", reviewer: "reviewer-b", want: reviewIngestAdmit},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			source := filepath.Join(root, "review.md")
+			if err := os.WriteFile(source, []byte("verdict"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			ledger := &fakeReviewIngestLedger{readable: true, reviewer: tc.priorReviewer}
+			got, err := reviewIngestAdmissionDecision(ledger, reviewledger.IngestOpts{
+				Verdict: reviewledger.VerdictOpts{SHA: sha, Reviewer: tc.reviewer},
+			}, source, "review.md")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != tc.want {
+				t.Fatalf("decision = %v, want %v", got, tc.want)
+			}
+		})
+	}
 }
 
 func TestReviewIngestDuplicateDoesNotMoveArtifact(t *testing.T) {
