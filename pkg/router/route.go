@@ -590,6 +590,8 @@ type Probes struct {
 	CLIPresent func(cli string) bool
 	// Launchable checks the exact provider/model tuple before a pane is created.
 	Launchable func(provider, model string) (bool, string)
+	// ProviderProbe performs a real request against the exact tuple.
+	ProviderProbe func(provider, model string) (bool, string)
 	// Now supplies the clock for cooldown expiry.
 	Now func() time.Time
 	// LiveCount reports the number of live agents using the exact routed
@@ -599,26 +601,34 @@ type Probes struct {
 }
 
 func defaultProbes() *Probes {
-	return &Probes{
+	p := &Probes{
 		CLIPresent: func(cli string) bool {
 			_, err := exec.LookPath(cli)
 			return err == nil
 		},
-		Launchable: func(provider, _ string) (bool, string) {
-			surface, ok := SurfaceFor(provider)
-			if !ok {
-				return false, fmt.Sprintf("unsupported routed provider %q", provider)
-			}
-			// Kimi is intentionally not configured on this host. A present CLI is
-			// not evidence of an account or usable provider, so keep it out of
-			// advertised routes unless an operator explicitly enables it.
-			if provider == "kimi" && os.Getenv("HERD_KIMI_ENABLED") != "1" {
-				return false, "kimi provider is not configured"
-			}
-			return ProbeSurface(surface)
-		},
-		Now: time.Now,
+		ProviderProbe: defaultProviderProbe,
+		Now:           time.Now,
 	}
+	p.Launchable = func(provider, model string) (bool, string) {
+		surface, ok := SurfaceFor(provider)
+		if !ok {
+			return false, fmt.Sprintf("unsupported routed provider %q", provider)
+		}
+		// Kimi is intentionally not configured on this host. A present CLI is
+		// not evidence of an account or usable provider, so keep it out of
+		// advertised routes unless an operator explicitly enables it.
+		if provider == "kimi" && os.Getenv("HERD_KIMI_ENABLED") != "1" {
+			return false, "kimi provider is not configured"
+		}
+		if launchable, reason := ProbeSurface(surface); !launchable {
+			return false, reason
+		}
+		if p.ProviderProbe == nil {
+			return false, "provider probe is not configured"
+		}
+		return p.ProviderProbe(provider, model)
+	}
+	return p
 }
 
 // SurfaceRouter picks execution surfaces using live quota + the verbatim tables.
