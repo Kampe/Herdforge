@@ -34,6 +34,15 @@ func Command(dir string, args ...string) *exec.Cmd {
 	cmd.Dir = dir
 	blocked := map[string]struct{}{
 		"GIT_CONFIG_GLOBAL": {}, "GIT_CONFIG_SYSTEM": {}, "GIT_CONFIG_NOSYSTEM": {},
+		// Repository-selection and object-store variables must not leak into a
+		// fixture. An inherited GIT_DIR/GIT_COMMON_DIR can make a worktree
+		// command operate on another test's repository even when cmd.Dir is
+		// pinned to the fixture path.
+		"GIT_DIR": {}, "GIT_WORK_TREE": {}, "GIT_COMMON_DIR": {},
+		"GIT_INDEX_FILE": {}, "GIT_OBJECT_DIRECTORY": {},
+		"GIT_ALTERNATE_OBJECT_DIRECTORIES": {}, "GIT_OBJECT_DIRECTORY_RELATIVE": {},
+		"GIT_GRAFT_FILE": {}, "GIT_SHALLOW_FILE": {}, "GIT_NAMESPACE": {},
+		"GIT_CEILING_DIRECTORIES": {}, "GIT_DISCOVERY_ACROSS_FILESYSTEM": {},
 		"GNUPGHOME": {}, "GCM_INTERACTIVE": {}, "GCM_GUI_PROMPT": {},
 		"GIT_ASKPASS": {}, "SSH_ASKPASS": {}, "GIT_TERMINAL_PROMPT": {},
 		"GIT_EDITOR": {}, "GIT_SEQUENCE_EDITOR": {}, "GIT_PAGER": {}, "PAGER": {},
