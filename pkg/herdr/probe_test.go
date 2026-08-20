@@ -49,6 +49,18 @@ func TestProbeModel_QuotaSignal(t *testing.T) {
 	}
 }
 
+func TestProbeModel_PeriodLimitSignals(t *testing.T) {
+	for _, period := range []string{"weekly", "daily", "monthly"} {
+		t.Run(period, func(t *testing.T) {
+			withStubOpencode(t, `echo "You hit your `+period+` limit"; exit 1`)
+			r := ProbeModel(context.Background(), "m")
+			if r.Available || r.Reason != period+" limit" {
+				t.Fatalf("period limit must be exhausted, got %+v", r)
+			}
+		})
+	}
+}
+
 func TestResolveHealthyModel_FailsOver(t *testing.T) {
 	// Primary emits an exhaustion signal; the fallback echoes PROBE_OK. The
 	// stub distinguishes by the --model arg.

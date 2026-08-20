@@ -40,6 +40,9 @@ var exhaustionSignals = []string{
 	"429",
 	"billing",
 	"usage limit",
+	"weekly limit",
+	"daily limit",
+	"monthly limit",
 }
 
 // ProbeModel preserves the legacy OpenCode-backed model probe API.
