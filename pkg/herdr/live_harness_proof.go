@@ -105,6 +105,13 @@ func CloseTabVerified(tabID string) error {
 	return hardCloseTab(tabID, "")
 }
 
+// CloseReviewTab is the fenced compensation path for a reviewer launch that
+// did not reach readiness or packet delivery. It is intentionally separate
+// from the legacy unfenced TabClose API.
+func CloseReviewTab(tabID, name string) error {
+	return hardCloseTab(tabID, name)
+}
+
 func randomNonce(n int) string {
 	b := make([]byte, n)
 	if _, err := rand.Read(b); err != nil {
