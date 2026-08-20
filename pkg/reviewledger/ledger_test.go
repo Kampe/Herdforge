@@ -256,6 +256,35 @@ func TestIngestRefusesPassWithoutAuthenticatedExactProvenance(t *testing.T) {
 	}
 }
 
+func TestValidateMatchesIngestForUnknownBuilderFamily(t *testing.T) {
+	opts := IngestOpts{
+		Record: RecordOpts{
+			SHA: "0123456789012345678901234567890123456789", Branch: "herd/fac-531",
+			BuilderFamily: "unspecified", ReviewerFamily: "openai", Reviewer: "reviewer-1",
+			Artifact: ".herd/review/inbox/verdict.md", Gate: "independent",
+		},
+		Verdict: VerdictOpts{
+			SHA: "0123456789012345678901234567890123456789", Reviewer: "reviewer-1",
+			Verdict: VerdictPASS, ReviewerFamily: "openai", BuilderFamily: "unspecified",
+			Artifact: ".herd/review/inbox/verdict.md", Branch: "herd/fac-531",
+		},
+	}
+	validateLedger := newTestLedger(t)
+	if err := validateLedger.Validate(opts); err == nil || !strings.Contains(err.Error(), "unknown builder family") {
+		t.Fatalf("Validate error = %v, want unknown builder family refusal", err)
+	}
+	if rows, err := validateLedger.AllRows(); err != nil || len(rows) != 0 {
+		t.Fatalf("Validate wrote rows=%d err=%v", len(rows), err)
+	}
+	ingestLedger := newTestLedger(t)
+	if _, err := ingestLedger.Ingest(opts); err == nil || !strings.Contains(err.Error(), "unknown builder family") {
+		t.Fatalf("Ingest error = %v, want same refusal", err)
+	}
+	if rows, err := ingestLedger.AllRows(); err != nil || len(rows) != 0 {
+		t.Fatalf("Ingest wrote rows=%d err=%v", len(rows), err)
+	}
+}
+
 func TestVerdict(t *testing.T) {
 	t.Run("PASS enqueues and queue row is written", func(t *testing.T) {
 		l := newTestLedger(t)

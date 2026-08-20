@@ -11,9 +11,10 @@ import (
 )
 
 type fakeReviewIngestLedger struct {
-	readable bool
-	reviewer string
-	ingests  int
+	readable    bool
+	reviewer    string
+	ingests     int
+	validateErr error
 }
 
 func (f *fakeReviewIngestLedger) Ingest(reviewledger.IngestOpts) (bool, error) {
@@ -21,11 +22,30 @@ func (f *fakeReviewIngestLedger) Ingest(reviewledger.IngestOpts) (bool, error) {
 	return true, nil
 }
 
+func (f *fakeReviewIngestLedger) Validate(reviewledger.IngestOpts) error {
+	return f.validateErr
+}
+
 func (f *fakeReviewIngestLedger) VerdictFor(sha string) (reviewledger.LedgerRow, bool, error) {
 	if !f.readable {
 		return reviewledger.LedgerRow{}, false, errors.New("simulated ledger read failure")
 	}
 	return reviewledger.LedgerRow{Event: string(reviewledger.EventVerdict), SHA: sha, Reviewer: f.reviewer, Verdict: "PASS"}, true, nil
+}
+
+func TestReviewIngestAdmissionDecisionRefusesLedgerValidationFailure(t *testing.T) {
+	root := t.TempDir()
+	source := filepath.Join(root, "review.md")
+	if err := os.WriteFile(source, []byte("verdict"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ledger := &fakeReviewIngestLedger{
+		readable:    true,
+		validateErr: errors.New(`unknown builder family "unspecified" (refusing unprovable review provenance)`),
+	}
+	if _, err := reviewIngestAdmissionDecision(ledger, reviewledger.IngestOpts{}, source, "review.md"); err == nil || !strings.Contains(err.Error(), "unknown builder family") {
+		t.Fatalf("validation error = %v, want builder-family refusal", err)
+	}
 }
 
 func (f *fakeReviewIngestLedger) VerdictForReviewer(sha, reviewer string) (reviewledger.LedgerRow, bool, error) {

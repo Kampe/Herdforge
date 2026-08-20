@@ -78,19 +78,10 @@ func (l *Ledger) Record(opts RecordOpts) error {
 }
 
 func (l *Ledger) record(opts RecordOpts) error {
-	if opts.Gate == "mechanical" {
-		if opts.BuilderFamily != "" && opts.BuilderFamily != "mechanical" {
-			return fmt.Errorf("mechanical record must not carry builder family %q", opts.BuilderFamily)
-		}
-	} else {
-		if opts.BuilderFamily == "" {
-			return fmt.Errorf("record needs --builder-family for an independent review")
-		}
-		if !FamilyAllowlist[opts.BuilderFamily] {
-			return fmt.Errorf("unknown builder family %q (refusing unprovable review provenance)", opts.BuilderFamily)
-		}
+	if err := validateRecord(opts); err != nil {
+		return err
 	}
-	row := &LedgerRow{
+	return l.appendRow(l.Path, &LedgerRow{
 		Event:           string(EventRecord),
 		SHA:             opts.SHA,
 		Branch:          opts.Branch,
@@ -107,8 +98,23 @@ func (l *Ledger) record(opts RecordOpts) error {
 		Tier:            opts.Tier,
 		Task:            opts.Task,
 		Lease:           opts.Lease,
+	})
+}
+
+func validateRecord(opts RecordOpts) error {
+	if opts.Gate == "mechanical" {
+		if opts.BuilderFamily != "" && opts.BuilderFamily != "mechanical" {
+			return fmt.Errorf("mechanical record must not carry builder family %q", opts.BuilderFamily)
+		}
+	} else {
+		if opts.BuilderFamily == "" {
+			return fmt.Errorf("record needs --builder-family for an independent review")
+		}
+		if !FamilyAllowlist[opts.BuilderFamily] {
+			return fmt.Errorf("unknown builder family %q (refusing unprovable review provenance)", opts.BuilderFamily)
+		}
 	}
-	return l.appendRow(l.Path, row)
+	return nil
 }
 
 // EnsureRecord makes reviewer admission provenance durable and idempotent.
@@ -145,22 +151,8 @@ func (l *Ledger) Ingest(opts IngestOpts) (bool, error) {
 		}
 		return false, l.Retire(*opts.Retired)
 	}
-	if opts.Verdict.Verdict == VerdictPASS {
-		if strings.TrimSpace(opts.Record.SHA) == "" || opts.Record.SHA != opts.Verdict.SHA {
-			return false, fmt.Errorf("review ingest refused: admission and verdict must bind the exact same sha")
-		}
-		if strings.TrimSpace(opts.Record.Reviewer) == "" || opts.Record.Reviewer != opts.Verdict.Reviewer {
-			return false, fmt.Errorf("review ingest refused: admission and verdict must bind the same reviewer")
-		}
-		if strings.TrimSpace(opts.Record.Branch) == "" {
-			return false, fmt.Errorf("review ingest refused: missing branch provenance")
-		}
-		if strings.TrimSpace(opts.Record.Artifact) == "" || opts.Record.Artifact != opts.Verdict.Artifact {
-			return false, fmt.Errorf("review ingest refused: missing or mismatched authenticated verdict artifact")
-		}
-		if opts.Record.Gate != "mechanical" && (strings.TrimSpace(opts.Record.BuilderFamily) == "" || strings.TrimSpace(opts.Verdict.ReviewerFamily) == "") {
-			return false, fmt.Errorf("review ingest refused: missing independent reviewer provenance")
-		}
+	if err := l.Validate(opts); err != nil {
+		return false, err
 	}
 
 	l.mu.Lock()
@@ -169,6 +161,44 @@ func (l *Ledger) Ingest(opts IngestOpts) (bool, error) {
 		return false, err
 	}
 	return l.verdict(opts.Verdict)
+}
+
+// Validate checks every refusal reason used by Ingest without reading or
+// writing ledger state. Dry-run uses this same validator as real ingestion.
+func (l *Ledger) Validate(opts IngestOpts) error {
+	if opts.Retired != nil {
+		if opts.Verdict.Verdict != "" {
+			return fmt.Errorf("retirement must not carry a review verdict")
+		}
+		return nil
+	}
+	if opts.Verdict.Verdict == VerdictPASS {
+		if strings.TrimSpace(opts.Record.SHA) == "" || opts.Record.SHA != opts.Verdict.SHA {
+			return fmt.Errorf("review ingest refused: admission and verdict must bind the exact same sha")
+		}
+		if strings.TrimSpace(opts.Record.Reviewer) == "" || opts.Record.Reviewer != opts.Verdict.Reviewer {
+			return fmt.Errorf("review ingest refused: admission and verdict must bind the same reviewer")
+		}
+		if strings.TrimSpace(opts.Record.Branch) == "" {
+			return fmt.Errorf("review ingest refused: missing branch provenance")
+		}
+		if strings.TrimSpace(opts.Record.Artifact) == "" || opts.Record.Artifact != opts.Verdict.Artifact {
+			return fmt.Errorf("review ingest refused: missing or mismatched authenticated verdict artifact")
+		}
+		if opts.Record.Gate != "mechanical" && (strings.TrimSpace(opts.Record.BuilderFamily) == "" || strings.TrimSpace(opts.Verdict.ReviewerFamily) == "") {
+			return fmt.Errorf("review ingest refused: missing independent reviewer provenance")
+		}
+	}
+	if err := validateRecord(opts.Record); err != nil {
+		return err
+	}
+	if err := ValidVerdict(opts.Verdict.Verdict); err != nil {
+		return err
+	}
+	if opts.Verdict.ReviewerFamily != "" && !FamilyAllowlist[opts.Verdict.ReviewerFamily] {
+		return fmt.Errorf("unknown reviewer family %q (refusing unprovable review provenance)", opts.Verdict.ReviewerFamily)
+	}
+	return nil
 }
 
 // Tier returns the newest recorded tier for a sha, or empty string.
