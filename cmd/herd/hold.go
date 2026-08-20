@@ -94,6 +94,7 @@ type holdAuthorityBoundary interface {
 	Check(context.Context, lifecycle.HoldIdentity, int64) (lifecycle.HoldDecision, error)
 	Hold(context.Context, lifecycle.HoldIdentity, string, string, string, int64, *time.Time) (lifecycle.HoldRecord, error)
 	Release(context.Context, lifecycle.HoldIdentity, string, string, string, int64) (lifecycle.HoldRecord, error)
+	ReleaseAndRearm(context.Context, lifecycle.HoldIdentity, string, string, int64) (lifecycle.LoopState, error)
 }
 
 type holdCommandRequest struct {
@@ -222,6 +223,14 @@ func executeHoldCommand(ctx context.Context, req holdCommandRequest, deps holdCo
 		}
 		receipt = record
 	case "off":
+		if identity.Scope == "lane" {
+			state, releaseErr := authority.ReleaseAndRearm(ctx, identity, req.Actor, req.Reason, gen)
+			if releaseErr != nil {
+				return releaseErr
+			}
+			receipt = state
+			break
+		}
 		record, releaseErr := authority.Release(ctx, identity, req.Actor, req.Reason, "operator_release", gen)
 		if releaseErr != nil {
 			return releaseErr
