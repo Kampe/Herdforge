@@ -167,11 +167,14 @@ type AgentObservation struct {
 
 // LeaseObservation is one durable claim lease row.
 type LeaseObservation struct {
-	Repo       string    `json:"repo"`
-	Provider   string    `json:"provider"`
-	Project    string    `json:"project"`
-	TaskRef    string    `json:"task_ref"`
-	OwnerID    string    `json:"owner_id"`
+	Repo     string `json:"repo"`
+	Provider string `json:"provider"`
+	Project  string `json:"project"`
+	TaskRef  string `json:"task_ref"`
+	OwnerID  string `json:"owner_id"`
+	// HoldLane is the canonical lane identity protected by this lease's hold.
+	// It lets dispatch planning exclude held capacity before spending the beat.
+	HoldLane   string    `json:"hold_lane,omitempty"`
 	Generation int64     `json:"generation"`
 	Held       bool      `json:"held,omitempty"`
 	ExpiresAt  time.Time `json:"expires_at"`
@@ -641,20 +644,43 @@ func Plan(obs Observation, opts Options) (Snapshot, error) {
 
 	// Dispatch: only when act+spawn and not blocked. Observe/act print would-run.
 	if opts.Act && opts.Spawn && !snap.DispatchBlocked {
-		// Prefer a healthy idle lane as target; else generic queue.
+		// Prefer a healthy idle lane as target; else generic queue. A held lease
+		// names the canonical lane it protects, so exclude it before selecting
+		// the one bounded dispatch target for this beat.
+		heldLanes := make(map[string]bool)
+		for _, lease := range obs.Leases {
+			if lease.Held && strings.TrimSpace(lease.HoldLane) != "" {
+				heldLanes[strings.TrimSpace(lease.HoldLane)] = true
+			}
+		}
 		target := "queue"
+		hasIdleLane := false
 		for _, a := range agents {
-			if a.Status == StatusHealthyIdle && a.Name != "" {
+			if a.Status != StatusHealthyIdle || a.Name == "" {
+				continue
+			}
+			hasIdleLane = true
+			if !heldLanes[a.Name] {
 				target = a.Name
 				break
 			}
 		}
-		actions = append(actions, Action{
-			Kind:   ActionDispatch,
-			Target: target,
-			Reason: "safe bounded dispatch: capacity known, no critical unknown",
-			Safe:   true,
-		})
+		if target != "queue" || !hasIdleLane {
+			actions = append(actions, Action{
+				Kind:   ActionDispatch,
+				Target: target,
+				Reason: "safe bounded dispatch: capacity known, no critical unknown",
+				Safe:   true,
+			})
+		} else {
+			actions = append(actions, Action{
+				Kind:     ActionWouldRun,
+				Target:   "dispatch",
+				Reason:   "dispatch withheld: no eligible target; all healthy idle lanes are held",
+				WouldRun: "dispatch withheld",
+				Safe:     false,
+			})
+		}
 	} else if opts.Spawn || (opts.Act && opts.Spawn) {
 		// unreachable spawn-without-act already rejected
 	} else {

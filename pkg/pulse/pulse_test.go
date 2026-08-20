@@ -453,6 +453,57 @@ func TestActSpawnPlansDispatchWhenHealthy(t *testing.T) {
 	}
 }
 
+func TestActSpawnSkipsHeldIdleLaneAndDispatchesNextEligibleLane(t *testing.T) {
+	obs := healthyObs()
+	obs.Herdr.Agents = []AgentObservation{
+		{Name: "forge-herd-smith", Raw: "idle"},
+		{Name: "forge-platform-ops", Raw: "idle"},
+	}
+	obs.Leases = []LeaseObservation{{Held: true, HoldLane: "forge-herd-smith"}}
+
+	snap, err := Plan(obs, Options{Act: true, Spawn: true, Now: fixedNow})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snap.Counts.Dispatch != 1 {
+		t.Fatalf("expected one dispatch, counts=%+v actions=%+v", snap.Counts, snap.Actions)
+	}
+	for _, action := range snap.Actions {
+		if action.Kind == ActionDispatch && action.Target != "forge-platform-ops" {
+			t.Fatalf("dispatch target=%q want forge-platform-ops: %+v", action.Target, action)
+		}
+	}
+}
+
+func TestActSpawnWithAllIdleLanesHeldReportsNoEligibleTarget(t *testing.T) {
+	obs := healthyObs()
+	obs.Herdr.Agents = []AgentObservation{
+		{Name: "forge-herd-smith", Raw: "idle"},
+		{Name: "forge-platform-ops", Raw: "idle"},
+	}
+	obs.Leases = []LeaseObservation{
+		{Held: true, HoldLane: "forge-herd-smith"},
+		{Held: true, HoldLane: "forge-platform-ops"},
+	}
+
+	snap, err := Plan(obs, Options{Act: true, Spawn: true, Now: fixedNow})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snap.Counts.Dispatch != 0 {
+		t.Fatalf("held lanes must not consume dispatch budget: %+v", snap)
+	}
+	found := false
+	for _, action := range snap.Actions {
+		if action.Kind == ActionWouldRun && strings.Contains(action.Reason, "all healthy idle lanes are held") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("missing no-eligible-target report: %+v", snap.Actions)
+	}
+}
+
 func TestNeedsReconcilePlansReconcileAction(t *testing.T) {
 	obs := healthyObs()
 	obs.NeedsReconcile = true

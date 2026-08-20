@@ -422,6 +422,7 @@ func readPulseLeases(ctx context.Context) ([]pulse.LeaseObservation, *claim.Clai
 			Project:    l.Project,
 			TaskRef:    l.TaskRef,
 			OwnerID:    l.OwnerID,
+			HoldLane:   l.HoldLane,
 			Generation: l.Generation,
 			Held:       l.Held,
 			ExpiresAt:  l.ExpiresAt,
