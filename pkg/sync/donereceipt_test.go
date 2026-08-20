@@ -104,7 +104,8 @@ func validReceipt(t *testing.T, dir, ref, mergeSHA, baseSHA string) *CompletionR
 		ProviderRevision: "provider-rev-1", LeaseGeneration: testLeaseGen,
 		BaseSHA: baseSHA, CandidateSHA: testCandSHA, MergeSHA: mergeSHA,
 		PatchID: pid, AcceptanceDigest: "acceptance-digest-1", VerificationDigest: "verification-digest-1",
-		RiskTier: "R3", AuthorFamily: "anthropic", ReviewerFamily: "openai",
+		AcceptanceEvidence: testAcceptanceEvidence,
+		RiskTier:           "R3", AuthorFamily: "anthropic", ReviewerFamily: "openai",
 		Verdict: "PASS", IntegrationResult: IntegrationMerged,
 	}
 	r.Seal()
@@ -158,7 +159,7 @@ func (c *countingProvider) AddComment(ctx context.Context, taskID, body string) 
 func newReceiptBoard(t *testing.T, ref, taskID string) *countingProvider {
 	t.Helper()
 	mp := provider.NewMemoryProvider()
-	mp.AddTask(&provider.Task{ID: taskID, Ref: ref, Title: "receipt gate", Status: "in-review", ProjectID: "p1"})
+	mp.AddTask(&provider.Task{ID: taskID, Ref: ref, Title: "receipt gate", Status: "in-review", ProjectID: "p1", Description: testAcceptanceDescription})
 	return &countingProvider{MemoryProvider: mp}
 }
 
@@ -483,7 +484,7 @@ func TestManualOverrideIsExplicitPolicyLimitedAndAttributable(t *testing.T) {
 		cp := newReceiptBoard(t, "FAC-132", testTaskID)
 		req := full
 		req.Evidence = omerge
-		res, err := BoardDone(ctx, cp, DoneRequest{RepoDir: odir, ProjectID: "p1", Ref: "FAC-132", Override: &req})
+		res, err := BoardDone(ctx, cp, DoneRequest{RepoDir: odir, ProjectID: "p1", Ref: "FAC-132", Override: &req, AcceptanceEvidence: testAcceptanceEvidence})
 		if err != nil {
 			t.Fatalf("complete override must close the card: %v", err)
 		}
@@ -588,10 +589,10 @@ func TestAuditDoneReportsSuspiciousClosuresWithoutMutating(t *testing.T) {
 	ctx := context.Background()
 
 	mp := provider.NewMemoryProvider()
-	mp.AddTask(&provider.Task{ID: testTaskID, Ref: "FAC-132", Title: "closed by receipt", Status: "in-review", ProjectID: "p1"})
+	mp.AddTask(&provider.Task{ID: testTaskID, Ref: "FAC-132", Title: "closed by receipt", Status: "in-review", ProjectID: "p1", Description: testAcceptanceDescription})
 	mp.AddTask(&provider.Task{ID: "task-777", Ref: "FAC-777", Title: "closed by an old commit-subject oracle", Status: "done", ProjectID: "p1"})
 	mp.AddTask(&provider.Task{ID: "task-500", Ref: "FAC-500", Title: "closed by nothing at all", Status: "done", ProjectID: "p1"})
-	mp.AddTask(&provider.Task{ID: "task-321", Ref: "FAC-321", Title: "closed by override", Status: "in-review", ProjectID: "p1"})
+	mp.AddTask(&provider.Task{ID: "task-321", Ref: "FAC-321", Title: "closed by override", Status: "in-review", ProjectID: "p1", Description: testAcceptanceDescription})
 	mp.AddTask(&provider.Task{ID: "task-222", Ref: "FAC-222", Title: "still open", Status: "in-progress", ProjectID: "p1"})
 	cp := &countingProvider{MemoryProvider: mp}
 
@@ -604,7 +605,7 @@ func TestAuditDoneReportsSuspiciousClosuresWithoutMutating(t *testing.T) {
 	}
 	if _, err := BoardDone(ctx, cp, DoneRequest{
 		RepoDir: dir, ProjectID: "p1", Ref: "FAC-321",
-		Override: &OverrideRequest{Actor: "kampe", Reason: "duplicate of FAC-132", Evidence: mergeSHA, Policy: "duplicate-card"},
+		Override: &OverrideRequest{Actor: "kampe", Reason: "duplicate of FAC-132", Evidence: mergeSHA, Policy: "duplicate-card"}, AcceptanceEvidence: testAcceptanceEvidence,
 	}); err != nil {
 		t.Fatalf("override close: %v", err)
 	}

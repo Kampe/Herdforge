@@ -63,6 +63,7 @@ type CompletionReceipt struct {
 	MergeSHA           string `json:"merge_sha"`
 	PatchID            string `json:"patch_id"`
 	AcceptanceDigest   string `json:"acceptance_digest"`
+	AcceptanceEvidence string `json:"acceptance_evidence,omitempty"`
 	VerificationDigest string `json:"verification_digest"`
 	RiskTier           string `json:"risk_tier"`
 	AuthorFamily       string `json:"author_family"`
@@ -88,6 +89,7 @@ type receiptForDigest struct {
 	MergeSHA           string `json:"merge_sha"`
 	PatchID            string `json:"patch_id"`
 	AcceptanceDigest   string `json:"acceptance_digest"`
+	AcceptanceEvidence string `json:"acceptance_evidence,omitempty"`
 	VerificationDigest string `json:"verification_digest"`
 	RiskTier           string `json:"risk_tier"`
 	AuthorFamily       string `json:"author_family"`
@@ -106,6 +108,7 @@ func (r CompletionReceipt) ComputeDigest() string {
 		ProviderRevision: r.ProviderRevision, LeaseGeneration: r.LeaseGeneration,
 		BaseSHA: r.BaseSHA, CandidateSHA: r.CandidateSHA, MergeSHA: r.MergeSHA,
 		PatchID: r.PatchID, AcceptanceDigest: r.AcceptanceDigest,
+		AcceptanceEvidence: r.AcceptanceEvidence,
 		VerificationDigest: r.VerificationDigest, RiskTier: r.RiskTier,
 		AuthorFamily: r.AuthorFamily, ReviewerFamily: r.ReviewerFamily,
 		Verdict: r.Verdict, IntegrationResult: r.IntegrationResult,

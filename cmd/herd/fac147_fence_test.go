@@ -65,6 +65,7 @@ func TestFencedBoardDone_StaleGenerationRejected(t *testing.T) {
 	mp.AddTask(&provider.Task{
 		ID: "t1", Ref: "FAC-147x", Title: "x", Status: "in-review",
 		ProjectID: "p", Labels: []string{"worker"}, UpdatedAt: now, CreatedAt: now,
+		Description: "```herd-acceptance-v1\n{\"commands\":[{\"command\":\"go test ./...\",\"context\":\"Herdforge worktree\"}]}\n```",
 	})
 
 	claimDir := t.TempDir()
@@ -86,6 +87,7 @@ func TestFencedBoardDone_StaleGenerationRejected(t *testing.T) {
 
 	req := hsync.DoneRequest{
 		RepoDir: ".", ProjectID: "p", Ref: "FAC-147x",
+		AcceptanceEvidence: "context: Herdforge worktree\n$ go test ./...\nPASS",
 		Override: &hsync.OverrideRequest{
 			Policy: "abandoned-scope", Actor: "test", Reason: "unit", Evidence: "test",
 		},

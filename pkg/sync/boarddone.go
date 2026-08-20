@@ -227,6 +227,10 @@ type DoneRequest struct {
 	// Override is the manual authority: explicit, policy-limited,
 	// attributable, and appended to the append-only done log.
 	Override *OverrideRequest
+	// AcceptanceEvidence is the literal pasted output from every command in
+	// the card's herd-acceptance-v1 block. It is required for every closure,
+	// including policy-limited manual overrides.
+	AcceptanceEvidence string
 }
 
 // BoardDone moves the ticket with the given ref to done, gated on a task-bound
@@ -242,7 +246,10 @@ func BoardDone(ctx context.Context, tp provider.TaskProvider, req DoneRequest) (
 	if repoDir == "" {
 		repoDir = "."
 	}
-
+	task, err := resolveTaskByRef(ctx, tp, req.ProjectID, ref)
+	if err != nil {
+		return nil, err
+	}
 	var proof string
 	var override *OverrideRecord
 	switch {
@@ -282,6 +289,13 @@ func BoardDone(ctx context.Context, tp provider.TaskProvider, req DoneRequest) (
 			"--override-policy/--override-actor/--override-reason/--override-evidence",
 			ErrNoEvidence, ref, ReceiptPath(repoDir, ref))
 	}
+	evidence := req.AcceptanceEvidence
+	if strings.TrimSpace(evidence) == "" && req.Receipt != nil {
+		evidence = req.Receipt.AcceptanceEvidence
+	}
+	if err := ValidateAcceptanceEvidence(task.Description, evidence); err != nil {
+		return nil, fmt.Errorf("%w for %s: %v", ErrNoEvidence, ref, err)
+	}
 
 	// Exactly-once: a receipt already recorded in the append-only done log
 	// never advances the card a second time. Read errors refuse rather than
@@ -308,10 +322,6 @@ func BoardDone(ctx context.Context, tp provider.TaskProvider, req DoneRequest) (
 	// through the same provider: the MemoryProvider resolves by ref, and the
 	// KaneoProvider's decodeKaneoTaskBody matches dto.Ref == wantID. A card the
 	// provider knows about must be closeable with evidence (FAC-211).
-	task, err := resolveTaskByRef(ctx, tp, req.ProjectID, ref)
-	if err != nil {
-		return nil, err
-	}
 	// Task binding: the receipt names the provider task it was minted for. A
 	// ref match alone is not enough — refs are re-minted across board
 	// rollbacks, and a re-minted card is a different task.
@@ -464,6 +474,17 @@ func BoardDoneFenced(
 	if repoDir == "" {
 		repoDir = "."
 	}
+	task, err := resolveTaskByRef(ctx, tp, req.ProjectID, ref)
+	if err != nil {
+		return nil, err
+	}
+	evidence := req.AcceptanceEvidence
+	if strings.TrimSpace(evidence) == "" && req.Receipt != nil {
+		evidence = req.Receipt.AcceptanceEvidence
+	}
+	if err := ValidateAcceptanceEvidence(task.Description, evidence); err != nil {
+		return nil, fmt.Errorf("%w for %s: %v", ErrNoEvidence, ref, err)
+	}
 
 	var proof string
 	var override *OverrideRecord
@@ -524,20 +545,6 @@ func BoardDoneFenced(
 		}
 	}
 
-	tasks, err := tp.ListTasks(ctx, req.ProjectID, "")
-	if err != nil {
-		return nil, boardCallErr("list tasks", err)
-	}
-	var task *provider.Task
-	for _, t := range tasks {
-		if strings.EqualFold(NormalizeRef(t.Ref), ref) {
-			task = t
-			break
-		}
-	}
-	if task == nil {
-		return nil, fmt.Errorf("no task with ref %s on the board", ref)
-	}
 	if req.Receipt != nil && req.Receipt.TaskID != task.ID {
 		return nil, fmt.Errorf("%w for %s: receipt is bound to task id %s but the board card is %s",
 			ErrNoEvidence, ref, req.Receipt.TaskID, task.ID)

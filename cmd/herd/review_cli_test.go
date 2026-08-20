@@ -373,7 +373,8 @@ func (fk *fakeKaneo) taskJSON() string {
 		}
 		labels = "[" + strings.Join(quoted, ",") + "]"
 	}
-	return fmt.Sprintf(`{"id":"t1","ref":"FAC-1","title":"One","status":%q,"priority":"high","projectId":"proj-x","labels":%s}`, fk.status, labels)
+	description := "```herd-acceptance-v1\n{\"commands\":[{\"command\":\"go test ./...\",\"context\":\"Herdforge worktree\"}]}\n```"
+	return fmt.Sprintf(`{"id":"t1","ref":"FAC-1","title":"One","status":%q,"priority":"high","projectId":"proj-x","labels":%s,"description":%q}`, fk.status, labels, description)
 }
 
 // setLabels publishes review provenance (author-family/author-model/
@@ -699,6 +700,7 @@ func seedCompletionReceipt(t *testing.T, dir, ref string, leaseGen int64) {
 		ProviderRevision: "provider-rev-1", LeaseGeneration: leaseGen,
 		BaseSHA: base, CandidateSHA: merge, MergeSHA: merge,
 		PatchID: patch, AcceptanceDigest: "acceptance-digest-1",
+		AcceptanceEvidence: "context: Herdforge worktree\n$ go test ./...\nPASS",
 		VerificationDigest: "verification-digest-1", RiskTier: "R3",
 		AuthorFamily: "anthropic", ReviewerFamily: "openai",
 		Verdict: "PASS", IntegrationResult: hsync.IntegrationMerged,

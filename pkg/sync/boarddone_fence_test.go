@@ -66,7 +66,7 @@ func TestBoardDoneFenced_StaleGenerationRejected(t *testing.T) {
 	mp.AddTask(&provider.Task{
 		ID: "bd-1", Ref: "FAC-147f", Title: "board done fence",
 		Status: "in-review", Priority: provider.PriorityHigh,
-		ProjectID: "p1", Labels: []string{"worker"},
+		ProjectID: "p1", Labels: []string{"worker"}, Description: testAcceptanceDescription,
 		CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC(),
 	})
 
@@ -96,7 +96,7 @@ func TestBoardDoneFenced_StaleGenerationRejected(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	req := DoneRequest{RepoDir: repo, ProjectID: "p1", Ref: "FAC-147f", Override: testOverride()}
+	req := DoneRequest{RepoDir: repo, ProjectID: "p1", Ref: "FAC-147f", Override: testOverride(), AcceptanceEvidence: testAcceptanceEvidence}
 
 	// Stale owner+generation must not mark done.
 	_, err = BoardDoneFenced(ctx, mp, stack, key, "owner-1", lease.Generation, req)
@@ -135,7 +135,7 @@ func TestBoardDoneFenced_RequiresLiveLease(t *testing.T) {
 	mp := provider.NewMemoryProvider()
 	mp.AddTask(&provider.Task{
 		ID: "bd-2", Ref: "FAC-147g", Status: "in-review", ProjectID: "p1",
-		Labels: []string{"worker"},
+		Labels: []string{"worker"}, Description: testAcceptanceDescription,
 	})
 	stack, err := provider.OpenClaimStack(t.TempDir(), mp)
 	if err != nil {
@@ -143,7 +143,7 @@ func TestBoardDoneFenced_RequiresLiveLease(t *testing.T) {
 	}
 	defer stack.Close()
 	key := provider.LeaseKey(".", "kaneo", "p1", "FAC-147g")
-	req := DoneRequest{RepoDir: repo, ProjectID: "p1", Ref: "FAC-147g", Override: testOverride()}
+	req := DoneRequest{RepoDir: repo, ProjectID: "p1", Ref: "FAC-147g", Override: testOverride(), AcceptanceEvidence: testAcceptanceEvidence}
 	if _, err := BoardDoneFenced(ctx, mp, stack, key, "", 0, req); err == nil {
 		t.Fatal("expected fail-closed without live lease")
 	}
