@@ -11,6 +11,8 @@
 package standing
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
@@ -157,6 +159,20 @@ func NameHeld(status string) bool {
 // AgentName returns the live herdr name for a configured lane.
 func AgentName(laneName string) string {
 	return ForgePrefix + strings.TrimSpace(laneName)
+}
+
+// AgentNameForRepository qualifies a standing lane with its stable repository
+// identity. Herdr names are fleet-global, while lane names are intentionally
+// shared by every repository. The short digest keeps the name readable and
+// within Herdr's practical label limits without exposing the identity itself.
+func AgentNameForRepository(laneName, repository string) string {
+	laneName = strings.TrimSpace(laneName)
+	repository = strings.TrimSpace(repository)
+	if repository == "" {
+		return AgentName(laneName)
+	}
+	sum := sha256.Sum256([]byte(repository))
+	return fmt.Sprintf("%s%s-%s", ForgePrefix, laneName, hex.EncodeToString(sum[:])[:10])
 }
 
 // withContinuationGoal makes the standing contract explicit in the first
@@ -419,6 +435,10 @@ func Run(cfg *config.Config, opts Options) (*Result, error) {
 
 	modeName := modeString(opts.Mode)
 	result := &Result{Mode: modeName, Roles: make([]RoleResult, 0, len(lanes))}
+	repository := ""
+	if opts.RepositoryIdentity != nil {
+		repository = opts.RepositoryIdentity(cfg)
+	}
 
 	switch opts.Mode {
 	case ModeStatus, ModeShutdown:
@@ -444,12 +464,12 @@ func Run(cfg *config.Config, opts Options) (*Result, error) {
 		result.Workspace = strings.TrimSpace(ws)
 		live := indexAgents(agents, result.Workspace, repoRoot)
 		if opts.Mode == ModeStatus {
-			return runStatus(result, lanes, live, repoRoot, opts)
+			return runStatus(result, lanes, live, repoRoot, repository, opts)
 		}
-		return runShutdown(result, lanes, live, opts)
+		return runShutdown(result, lanes, live, repoRoot, repository, opts)
 	case ModeDryRun, ModeRaise:
 		// No herdr inventory or workspace resolution until policy admits.
-		return runRaise(result, cfg, lanes, repoRoot, opts)
+		return runRaise(result, cfg, lanes, repoRoot, repository, opts)
 	default:
 		return nil, fmt.Errorf("standing: unknown mode %d", opts.Mode)
 	}
@@ -468,11 +488,11 @@ func modeString(m Mode) string {
 	}
 }
 
-func runStatus(result *Result, lanes []config.LaneDef, live map[string]Agent, repoRoot string, opts Options) (*Result, error) {
+func runStatus(result *Result, lanes []config.LaneDef, live map[string]Agent, repoRoot, repository string, opts Options) (*Result, error) {
 	var failures []error
 	for i := range lanes {
 		lane := lanes[i]
-		agentName := AgentName(lane.Name)
+		agentName := AgentNameForRepository(lane.Name, repository)
 		cwd, verr := ValidateLane(lane, repoRoot, opts.PromptReadable, opts.AbsPath)
 		rr := RoleResult{LaneName: lane.Name, AgentName: agentName, Role: lane.Role, CWD: cwd}
 		if verr != nil {
@@ -506,16 +526,16 @@ func runStatus(result *Result, lanes []config.LaneDef, live map[string]Agent, re
 	return result, errors.Join(failures...)
 }
 
-func runShutdown(result *Result, lanes []config.LaneDef, live map[string]Agent, opts Options) (*Result, error) {
+func runShutdown(result *Result, lanes []config.LaneDef, live map[string]Agent, repoRoot, repository string, opts Options) (*Result, error) {
 	// Exact shutdown: only configured standing agent names. Ephemeral task
 	// workers (task-*, non-standing forge-*) are never selected.
 	standingNames := map[string]struct{}{}
 	for _, lane := range lanes {
-		standingNames[AgentName(lane.Name)] = struct{}{}
+		standingNames[AgentNameForRepository(lane.Name, repository)] = struct{}{}
 	}
 	var failures []error
 	for _, lane := range lanes {
-		agentName := AgentName(lane.Name)
+		agentName := AgentNameForRepository(lane.Name, repository)
 		rr := RoleResult{LaneName: lane.Name, AgentName: agentName, Role: lane.Role}
 		a, ok := live[agentName]
 		if !ok || a.TabID == "" {
@@ -561,6 +581,31 @@ func runShutdown(result *Result, lanes []config.LaneDef, live map[string]Agent, 
 			result.Roles = append(result.Roles, rr)
 			continue
 		}
+		if opts.ListAgents == nil {
+			rr.Outcome = OutcomeFailed
+			rr.Reason = "standing owner close lacks absence verification"
+			result.Failed++
+			failures = append(failures, fmt.Errorf("%s close: absence verification unavailable", agentName))
+			result.Roles = append(result.Roles, rr)
+			continue
+		}
+		remaining, listErr := opts.ListAgents()
+		if listErr != nil {
+			rr.Outcome = OutcomeFailed
+			rr.Reason = "absence readback: " + listErr.Error()
+			result.Failed++
+			failures = append(failures, fmt.Errorf("%s close absence readback: %w", agentName, listErr))
+			result.Roles = append(result.Roles, rr)
+			continue
+		}
+		if _, stillLive := indexAgents(remaining, result.Workspace, repoRoot)[agentName]; stillLive {
+			rr.Outcome = OutcomeFailed
+			rr.Reason = "standing owner still present after close"
+			result.Failed++
+			failures = append(failures, fmt.Errorf("%s close: agent remains present", agentName))
+			result.Roles = append(result.Roles, rr)
+			continue
+		}
 		rr.Outcome = OutcomeClosed
 		rr.Reason = "standing owner closed"
 		result.Closed++
@@ -579,14 +624,9 @@ func isActive(status string) bool {
 	}
 }
 
-func runRaise(result *Result, cfg *config.Config, lanes []config.LaneDef, repoRoot string, opts Options) (*Result, error) {
+func runRaise(result *Result, cfg *config.Config, lanes []config.LaneDef, repoRoot, repository string, opts Options) (*Result, error) {
 	dry := opts.Mode == ModeDryRun
 	var failures []error
-
-	repository := ""
-	if opts.RepositoryIdentity != nil {
-		repository = opts.RepositoryIdentity(cfg)
-	}
 
 	// Lazy fleet inventory: loaded only after the first successful AdmitRoute
 	// so a policy-only failure never pays for (or is masked by) herdr agent list.
@@ -621,7 +661,7 @@ func runRaise(result *Result, cfg *config.Config, lanes []config.LaneDef, repoRo
 
 	for i := range lanes {
 		lane := &lanes[i]
-		agentName := AgentName(lane.Name)
+		agentName := AgentNameForRepository(lane.Name, repository)
 		rr := RoleResult{LaneName: lane.Name, AgentName: agentName, Role: lane.Role}
 
 		// Route admission (role/shape/provider policy + live route) runs
@@ -665,28 +705,57 @@ func runRaise(result *Result, cfg *config.Config, lanes []config.LaneDef, repoRo
 			continue
 		}
 		if a, ok := live[agentName]; ok && NameHeld(a.Status) {
-			rr.Outcome = OutcomeSkippedLive
-			rr.Reason = "already live status=" + a.Status
-			rr.TabID = a.TabID
-			rr.PaneID = a.PaneID
-			if a.Cwd != "" {
-				rr.CWD = a.Cwd
-			}
-			if opts.SetGoal != nil {
-				// Re-raising is also a policy refresh. Set replaces the atomic
-				// goal file, so a later corrective instruction cannot be shadowed
-				// by the previous durable wording.
-				goalCWD := rr.CWD
-				if goalCWD == "" {
-					goalCWD, _ = ValidateLane(*lane, repoRoot, opts.PromptReadable, opts.AbsPath)
+			if strings.EqualFold(strings.TrimSpace(a.Status), "done") && opts.CloseTab != nil {
+				if err := opts.CloseTab(a.TabID); err != nil {
+					rr.Outcome = OutcomeFailed
+					rr.Reason = "retired owner close: " + err.Error()
+					result.Failed++
+					failures = append(failures, fmt.Errorf("%s: %w", lane.Name, err))
+					result.Roles = append(result.Roles, rr)
+					continue
 				}
-				if goalCWD != "" {
-					_ = opts.SetGoal(goalCWD, lane.Name, durableGoalTask(*lane), "coordinator")
+				remaining, listErr := opts.ListAgents()
+				if listErr != nil {
+					rr.Outcome = OutcomeFailed
+					rr.Reason = "retired owner absence readback: " + listErr.Error()
+					result.Failed++
+					failures = append(failures, fmt.Errorf("%s: retired owner absence readback: %w", lane.Name, listErr))
+					result.Roles = append(result.Roles, rr)
+					continue
 				}
+				if _, stillLive := indexAgents(remaining, result.Workspace, repoRoot)[agentName]; stillLive {
+					rr.Outcome = OutcomeFailed
+					rr.Reason = "retired owner still present after close"
+					result.Failed++
+					failures = append(failures, fmt.Errorf("%s: retired owner remains present", lane.Name))
+					result.Roles = append(result.Roles, rr)
+					continue
+				}
+				delete(live, agentName)
+			} else {
+				rr.Outcome = OutcomeSkippedLive
+				rr.Reason = "already live status=" + a.Status
+				rr.TabID = a.TabID
+				rr.PaneID = a.PaneID
+				if a.Cwd != "" {
+					rr.CWD = a.Cwd
+				}
+				if opts.SetGoal != nil {
+					// Re-raising is also a policy refresh. Set replaces the atomic
+					// goal file, so a later corrective instruction cannot be shadowed
+					// by the previous durable wording.
+					goalCWD := rr.CWD
+					if goalCWD == "" {
+						goalCWD, _ = ValidateLane(*lane, repoRoot, opts.PromptReadable, opts.AbsPath)
+					}
+					if goalCWD != "" {
+						_ = opts.SetGoal(goalCWD, lane.Name, durableGoalTask(*lane), "coordinator")
+					}
+				}
+				result.Skipped++
+				result.Roles = append(result.Roles, rr)
+				continue
 			}
-			result.Skipped++
-			result.Roles = append(result.Roles, rr)
-			continue
 		}
 
 		cwd, verr := ValidateLane(*lane, repoRoot, opts.PromptReadable, opts.AbsPath)

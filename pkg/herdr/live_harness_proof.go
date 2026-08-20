@@ -98,6 +98,13 @@ func hardCloseTab(tabID, name string) error {
 	return fmt.Errorf("FAC-133 cleanup: tab %s / name %s still present after close", tabID, name)
 }
 
+// CloseTabVerified closes an exact tab through the fenced path and confirms
+// absence. Standing shutdown uses this instead of treating a close request as
+// proof that Herdr released the name.
+func CloseTabVerified(tabID string) error {
+	return hardCloseTab(tabID, "")
+}
+
 func randomNonce(n int) string {
 	b := make([]byte, n)
 	if _, err := rand.Read(b); err != nil {
