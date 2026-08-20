@@ -4028,7 +4028,11 @@ func runSend() {
 		status, err = herdr.Send(target, text, !*noVerify, time.Duration(*timeoutSec)*time.Second)
 	}
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "herd send: %v\n", err)
+		if status == "queued" || status == "deferred" {
+			fmt.Fprintf(os.Stderr, "herd send: -> %s: %v\n", status, err)
+		} else {
+			fmt.Fprintf(os.Stderr, "herd send: %v\n", err)
+		}
 		os.Exit(1)
 	}
 	if lane := strings.TrimSpace(os.Getenv("HERD_LANE")); lane != "" {

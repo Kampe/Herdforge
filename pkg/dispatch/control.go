@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/Kampe/Herdforge/pkg/envelope"
 	"github.com/Kampe/Herdforge/pkg/herdr"
@@ -300,7 +301,7 @@ func DefaultHerdrDeliver(agentSessionOrName, prompt string) error {
 	if strings.TrimSpace(agentSessionOrName) == "" || strings.TrimSpace(prompt) == "" {
 		return fmt.Errorf("deliver: agent and prompt required")
 	}
-	_, err := herdr.AgentPrompt(agentSessionOrName, prompt, false)
+	_, err := herdr.Send(agentSessionOrName, prompt, true, 30*time.Second)
 	return err
 }
 

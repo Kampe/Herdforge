@@ -192,6 +192,8 @@ func formatSendResult(target, workspace, status string) string {
 		qualifier = " (consumption confirmed; task text observed in pane)"
 	case "submitted":
 		qualifier = " (UNVERIFIED: --no-verify)"
+	case "queued":
+		qualifier = " (queued but not consumed; explicit retry or defer required)"
 	}
 	route := target
 	if strings.TrimSpace(workspace) != "" {
@@ -248,6 +250,16 @@ func sendInWorkspace(target, text string, verify bool, timeout time.Duration, wo
 			return "", fmt.Errorf("agent '%s' pre-send pane readback failed: %w", resolvedTarget, err)
 		}
 	}
+	// A working standing lane may be inside its durable /goal turn. An
+	// addressed assignment must own the next turn, not sit behind that goal;
+	// Escape pauses the standing turn before the assignment is written. If the
+	// preemption cannot be delivered, refuse loudly instead of reporting a
+	// successful send for text that can only remain queued.
+	if strings.EqualFold(strings.TrimSpace(resolved.Status), "working") {
+		if err := SendKeys(resolvedTarget, "Escape"); err != nil {
+			return "deferred", fmt.Errorf("agent '%s' assignment explicitly deferred: cannot preempt standing goal: %w", resolvedTarget, err)
+		}
+	}
 	if _, err := AgentPrompt(resolvedTarget, text, false); err != nil {
 		return "", err
 	}
@@ -287,9 +299,9 @@ func sendInWorkspace(target, text string, verify bool, timeout time.Duration, wo
 		time.Sleep(poll)
 	}
 	if staged || strings.Contains(strings.ToLower(lastPane), "pasted text") {
-		return last, fmt.Errorf("agent '%s' did not confirm consumption: task text remained staged/unsubmitted in the pane (last status %q)", resolvedTarget, last)
+		return "queued", fmt.Errorf("agent '%s' queued-but-not-consumed: task text remained staged/unsubmitted in the pane (last status %q)", resolvedTarget, last)
 	}
-	return last, fmt.Errorf("agent '%s' never confirmed task-specific consumption (last status %q; task text not observed in pane)", resolvedTarget, last)
+	return "queued", fmt.Errorf("agent '%s' queued-but-not-consumed: task-specific consumption was not observed in the pane (last status %q)", resolvedTarget, last)
 }
 
 func sendStatusInWorkspace(target, text string, verify bool, timeout time.Duration, workspace string) (string, error) {
