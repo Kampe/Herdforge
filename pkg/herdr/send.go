@@ -158,6 +158,18 @@ func SendInWorkspace(target, text string, verify bool, timeout time.Duration, wo
 
 // FormatSendResult renders the operator-facing delivery result.
 func FormatSendResult(target, status string) string {
+	return formatSendResult(target, "", status)
+}
+
+// FormatSendResultInWorkspace renders an explicitly authorized cross-workspace
+// delivery with the workspace in the receipt. Keeping this separate from the
+// ordinary formatter makes the authorization visible to operators and leaves
+// existing same-workspace output stable.
+func FormatSendResultInWorkspace(target, workspace, status string) string {
+	return formatSendResult(target, workspace, status)
+}
+
+func formatSendResult(target, workspace, status string) string {
 	qualifier := ""
 	switch status {
 	case "working", "done":
@@ -165,7 +177,11 @@ func FormatSendResult(target, status string) string {
 	case "submitted":
 		qualifier = " (UNVERIFIED: --no-verify)"
 	}
-	return fmt.Sprintf("herd send: %s -> %s%s", target, status, qualifier)
+	route := target
+	if strings.TrimSpace(workspace) != "" {
+		route = fmt.Sprintf("%s [workspace=%s]", target, workspace)
+	}
+	return fmt.Sprintf("herd send: %s -> %s%s", route, status, qualifier)
 }
 
 func sendInWorkspace(target, text string, verify bool, timeout time.Duration, workspace string) (string, error) {
