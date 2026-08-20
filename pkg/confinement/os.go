@@ -596,13 +596,31 @@ func wrapperScript(profilePath, digest, realAgent string, fake bool) string {
 		"  ;;\n" +
 		"git)\n" +
 		"  pushing=\"false\"\n" +
+		"  explicit_default=\"false\"\n" +
 		"  for argument in \"$@\"; do\n" +
 		"    [ \"$argument\" = push ] && pushing=\"true\" && continue\n" +
-		"    if [ \"$pushing\" = true ] && { [ \"$argument\" = main ] || [ \"$argument\" = master ] || [ \"${argument#*:}\" = main ] || [ \"${argument#*:}\" = master ]; }; then\n" +
-		"      echo 'builder lane: direct push to the default branch is coordinator-only' >&2\n" +
-		"      exit 126\n" +
+		"    if [ \"$pushing\" = true ]; then\n" +
+		"      candidate=\"${argument#*:}\"\n" +
+		"      candidate=\"${candidate#refs/heads/}\"\n" +
+		"      case \"$candidate\" in */*) candidate=\"${candidate##*/}\" ;; esac\n" +
+		"      if [ \"$candidate\" = main ] || [ \"$candidate\" = master ]; then\n" +
+		"        explicit_default=\"true\"\n" +
+		"      fi\n" +
 		"    fi\n" +
 		"  done\n" +
+		"  # A push with no explicit ref (bare push, or push to a remote\n" +
+		"  # with no branch named) implicitly targets the current branch;\n" +
+		"  # argv scanning alone cannot see that, so ask the real git.\n" +
+		"  if [ \"$pushing\" = true ] && [ \"$explicit_default\" = false ]; then\n" +
+		"    current=\"$(\"$REAL\" symbolic-ref --short HEAD 2>/dev/null)\"\n" +
+		"    if [ \"$current\" = main ] || [ \"$current\" = master ]; then\n" +
+		"      explicit_default=\"true\"\n" +
+		"    fi\n" +
+		"  fi\n" +
+		"  if [ \"$explicit_default\" = true ]; then\n" +
+		"    echo 'builder lane: direct push to the default branch is coordinator-only' >&2\n" +
+		"    exit 126\n" +
+		"  fi\n" +
 		"  ;;\n" +
 		"esac\n" +
 		"ACTUAL=$(/usr/bin/shasum -a 256 \"$PROFILE\" 2>/dev/null | /usr/bin/awk '{print $1}')\n" +

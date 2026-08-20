@@ -234,17 +234,35 @@ gh)
   ;;
 git)
   pushing="false"
+  explicit_default="false"
   for argument in "$@"; do
     [ "$argument" = push ] && pushing="true" && continue
-    if [ "$pushing" = true ] && { [ "$argument" = main ] || [ "$argument" = master ] || [ "${argument#*:}" = main ] || [ "${argument#*:}" = master ]; }; then
-      echo 'builder lane: direct push to the default branch is coordinator-only' >&2
-      exit 126
+    if [ "$pushing" = true ]; then
+      candidate="${argument#*:}"
+      candidate="${candidate#refs/heads/}"
+      case "$candidate" in */*) candidate="${candidate##*/}" ;; esac
+      if [ "$candidate" = main ] || [ "$candidate" = master ]; then
+        explicit_default="true"
+      fi
     fi
   done
+  # A push with no explicit ref (bare push, or push to a remote with no
+  # branch named) implicitly targets the current branch; argv scanning
+  # alone cannot see that, so ask the real git.
+  if [ "$pushing" = true ] && [ "$explicit_default" = false ]; then
+    current="$(%q symbolic-ref --short HEAD 2>/dev/null)"
+    if [ "$current" = main ] || [ "$current" = master ]; then
+      explicit_default="true"
+    fi
+  fi
+  if [ "$explicit_default" = true ]; then
+    echo 'builder lane: direct push to the default branch is coordinator-only' >&2
+    exit 126
+  fi
   ;;
 esac
 exec %q "$@"
-`, target)
+`, target, target)
 			if err := os.WriteFile(gate, []byte(gateScript), 0o755); err != nil {
 				return "", "", "", err
 			}
