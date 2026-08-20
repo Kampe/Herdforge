@@ -9589,7 +9589,7 @@ func (d *cliForgeDriver) ObserveReconciliation(ctx context.Context) error {
 		if agents, listErr := herdr.AgentList(); listErr == nil {
 			managed := false
 			for _, agent := range agents {
-				if strings.HasPrefix(agent.Name, "task-fac-") {
+				if taskRefFromAgentName(agent.Name) != "" {
 					managed = true
 					break
 				}
@@ -9602,7 +9602,7 @@ func (d *cliForgeDriver) ObserveReconciliation(ctx context.Context) error {
 	return err
 }
 
-// LaneState counts live task-fac-* builder agents that are working. A herdr
+// LaneState counts live task-* builder agents that are working. A herdr
 // read failure is UNKNOWN capacity, not free capacity (FAC-138). When the
 // FAC-158 reconciliation observer has a projection, prefer it; when that
 // projection is BLOCKED/unknown, refuse free capacity by reporting full busy.
@@ -9619,7 +9619,7 @@ func (d *cliForgeDriver) LaneState(ctx context.Context) (daemon.LaneState, error
 	}
 	busy := 0
 	for _, a := range agents {
-		if strings.HasPrefix(a.Name, "task-fac-") && (a.Status == "working" || a.Status == "starting") {
+		if taskRefFromAgentName(a.Name) != "" && (a.Status == "working" || a.Status == "starting") {
 			busy++
 		}
 	}
@@ -9639,13 +9639,13 @@ func (d *cliForgeDriver) Signals(ctx context.Context) (map[string]bool, map[stri
 		return nil, nil, fmt.Errorf("herdr agent list: %w", err)
 	}
 	for _, a := range agents {
-		if !strings.HasPrefix(a.Name, "task-fac-") {
+		ref := taskRefFromAgentName(a.Name)
+		if ref == "" {
 			continue
 		}
 		if a.Status == "working" || a.Status == "starting" {
 			continue
 		}
-		ref := strings.ToUpper(strings.TrimPrefix(a.Name, "task-"))
 		completed[ref] = true
 		wt := worktreePathForRef(ref)
 		if !worktreeExists(wt) {

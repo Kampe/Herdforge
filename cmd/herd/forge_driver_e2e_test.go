@@ -248,6 +248,7 @@ func TestCliForgeDriver_LaneStateCountsBusyAgents(t *testing.T) {
 			return `{"result":{"type":"agent_list","agents":[
 				{"name":"task-fac-1","agent_status":"working","pane_id":"p1","tab_id":"t1","workspace_id":"w"},
 				{"name":"task-fac-2","agent_status":"idle","pane_id":"p2","tab_id":"t2","workspace_id":"w"},
+				{"name":"task-cha-2009","agent_status":"working","pane_id":"p4","tab_id":"t4","workspace_id":"w"},
 				{"name":"assayer","agent_status":"working","pane_id":"p3","tab_id":"t3","workspace_id":"w"}
 			]}}`, nil
 		}
@@ -259,8 +260,34 @@ func TestCliForgeDriver_LaneStateCountsBusyAgents(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if ls.Busy != 1 || ls.Max != 3 {
-		t.Fatalf("LaneState = %+v want Busy=1 Max=3", ls)
+	if ls.Busy != 2 || ls.Max != 3 {
+		t.Fatalf("LaneState = %+v want Busy=2 Max=3", ls)
+	}
+}
+
+func TestCliForgeDriver_SignalsCountsTaskLanesForAnyProject(t *testing.T) {
+	restore := herdr.SetRunHerdrForTest(func(args ...string) (string, error) {
+		if len(args) >= 2 && args[0] == "agent" && args[1] == "list" {
+			return `{"result":{"type":"agent_list","agents":[
+				{"name":"task-fac-1","agent_status":"idle","pane_id":"p1","tab_id":"t1","workspace_id":"w"},
+				{"name":"task-cha-2009","agent_status":"idle","pane_id":"p2","tab_id":"t2","workspace_id":"w"},
+				{"name":"assayer","agent_status":"idle","pane_id":"p3","tab_id":"t3","workspace_id":"w"}
+			]}}`, nil
+		}
+		return "", errors.New("unexpected " + strings.Join(args, " "))
+	})
+	t.Cleanup(restore)
+
+	d := &cliForgeDriver{}
+	completed, verified, err := d.Signals(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !completed["FAC-1"] || !completed["CHA-2009"] {
+		t.Fatalf("completed = %#v, want FAC-1 and CHA-2009", completed)
+	}
+	if len(verified) != 0 {
+		t.Fatalf("verified = %#v, want no worktree-backed verifications", verified)
 	}
 }
 
