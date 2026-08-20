@@ -196,10 +196,28 @@ while IFS= read -r fingerprint; do
 done < "$leaks_findings"
 rm -f "$leaks_findings"
 
-typeset -a leak_stale
+# FAC-535: a baseline row is keyed commit:file:rule:line, and every PR merges
+# with rebase, which REWRITES commit SHAs. A row whose commit is no longer
+# reachable from HEAD can never be produced by `gitleaks git .` again, so
+# treating it as "stale" is wrong — it is simply unscannable here, and the same
+# row may still be reachable in a differently-cloned checkout (CI vs a local
+# single-branch clone). Skip those rows instead of erroring; only a row whose
+# commit IS reachable and yet went unseen is genuinely stale.
+typeset -a leak_stale leak_unreachable
 for fingerprint in ${(k)leak_expected}; do
-	[[ -n ${leak_seen[$fingerprint]-} ]] || leak_stale+=( "$fingerprint" )
+	[[ -n ${leak_seen[$fingerprint]-} ]] && continue
+	if git cat-file -e "${fingerprint%%:*}^{commit}" 2>/dev/null && \
+		git merge-base --is-ancestor "${fingerprint%%:*}" HEAD 2>/dev/null; then
+		leak_stale+=( "$fingerprint" )
+	else
+		leak_unreachable+=( "$fingerprint" )
+	fi
 done
+if (( ${#leak_unreachable} > 0 )); then
+	for fingerprint in ${(o)leak_unreachable}; do
+		print -u2 "note: gitleaks baseline entry not scannable in this checkout (rebased/unreachable commit): $fingerprint"
+	done
+fi
 if (( ${#leak_stale} > 0 )); then
 	for fingerprint in ${(o)leak_stale}; do
 		print -u2 "error: stale gitleaks baseline entry $fingerprint"
