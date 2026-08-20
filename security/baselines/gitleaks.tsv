@@ -1,8 +1,13 @@
 # fingerprint	classification	owner	expiry
+00d9f7fa92c7eb417629098034b066e6b31c20cb:pkg/envelope/envelope_test.go:generic-api-key:669	fixture	security-maintainers	2026-12-31
+0c5c4fc6231670a208224792651dda0de35f8484:pkg/agentscope/trusted_job_submission_test.go:generic-api-key:529	legacy fixture	security-maintainers	2026-12-31
+0c5c4fc6231670a208224792651dda0de35f8484:pkg/agentscope/trusted_job_test.go:generic-api-key:166	legacy fixture	security-maintainers	2026-12-31
 3386534260b90a0b40552c5169233e79144beb29:scripts/security-gate_test.zsh:github-pat:28	fixture history	security-maintainers	2026-12-31
 3386534260b90a0b40552c5169233e79144beb29:scripts/security-gate_test.zsh:github-pat:31	fixture history	security-maintainers	2026-12-31
-00d9f7fa92c7eb417629098034b066e6b31c20cb:pkg/envelope/envelope_test.go:generic-api-key:669	fixture	security-maintainers	2026-12-31
-e33f8ae69742c5c9b454a750a28afe03cdd7f413:pkg/signerboundary/worker_cannot_sign_test.go:generic-api-key:59	fixture	security-maintainers	2026-12-31
-0c5c4fc6231670a208224792651dda0de35f8484:pkg/agentscope/trusted_job_test.go:generic-api-key:166	legacy fixture	security-maintainers	2026-12-31
-0c5c4fc6231670a208224792651dda0de35f8484:pkg/agentscope/trusted_job_submission_test.go:generic-api-key:529	legacy fixture	security-maintainers	2026-12-31
+5fa59e27de8ec5972ec6d0e1c5ec405f5b62a476:pkg/agentscope/trusted_job_submission_test.go:generic-api-key:529	legacy fixture	security-maintainers	2026-12-31
+5fa59e27de8ec5972ec6d0e1c5ec405f5b62a476:pkg/agentscope/trusted_job_test.go:generic-api-key:166	legacy fixture	security-maintainers	2026-12-31
+79fff3d8030708884e4270305c016cf162f46aa9:pkg/envelope/envelope_test.go:generic-api-key:669	fixture	security-maintainers	2026-12-31
+a93d4272bf97d2605d082d949cd6d392ca93e82b:pkg/signerboundary/worker_cannot_sign_test.go:generic-api-key:59	fixture	security-maintainers	2026-12-31
+bc13493057e5684569e3eff7a78b70ac27920358:pkg/router/launch.go:generic-api-key:118	legacy fixture	security-maintainers	2026-12-31
 c02da6326a18d9bbf5c53a1c5fe04268e55fd039:pkg/router/launch.go:generic-api-key:118	legacy fixture	security-maintainers	2026-12-31
+e33f8ae69742c5c9b454a750a28afe03cdd7f413:pkg/signerboundary/worker_cannot_sign_test.go:generic-api-key:59	fixture	security-maintainers	2026-12-31
