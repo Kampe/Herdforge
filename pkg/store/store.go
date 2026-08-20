@@ -327,6 +327,33 @@ func (s *Store) BlockedSelectionHistorySince(limit int, since time.Time) ([]Bloc
 	return records, nil
 }
 
+// InvalidateBlockedSelections removes evidence whose referenced task is no
+// longer an active provider task. BLOCKED evidence is a claim about current
+// task state, so retaining it after archival or deletion would turn resolved
+// work into a live-looking coordinator blocker.
+func (s *Store) InvalidateBlockedSelections(ids []int64) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin blocked selection invalidation: %w", err)
+	}
+	defer tx.Rollback()
+	for _, id := range ids {
+		if id <= 0 {
+			return fmt.Errorf("invalidate blocked selection: invalid id %d", id)
+		}
+		if _, err := tx.Exec(`DELETE FROM blocked_selection_history WHERE id = ?`, id); err != nil {
+			return fmt.Errorf("invalidate blocked selection %d: %w", id, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit blocked selection invalidation: %w", err)
+	}
+	return nil
+}
+
 func (s *Store) RecordPulse(taskRef, taskID, role string) (*PulseRecord, error) {
 	res, err := s.db.Exec(
 		`INSERT INTO pulse_history (task_ref, task_id, role) VALUES (?, ?, ?)`,

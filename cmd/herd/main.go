@@ -1095,6 +1095,18 @@ func runStatus() {
 		fmt.Fprintf(os.Stderr, "Dependency evidence: UNREADABLE (%v)\n", err)
 		os.Exit(1)
 	}
+	if len(blocked) > 0 {
+		tp, providerErr := loadTaskProvider(cfg)
+		if providerErr != nil {
+			fmt.Fprintf(os.Stderr, "Dependency evidence: UNREADABLE (cannot revalidate provider task state: %v)\n", providerErr)
+			os.Exit(1)
+		}
+		blocked, err = revalidateBlockedEvidence(context.Background(), st, tp, blocked)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Dependency evidence: UNREADABLE (%v)\n", err)
+			os.Exit(1)
+		}
+	}
 	fmt.Printf("Dependency BLOCKED evidence: %d recent (last hour)\n", len(blocked))
 	for _, record := range blocked {
 		fmt.Printf("  BLOCKED %s [%s] %s\n", record.Ref, record.Code, record.Reason)
@@ -1136,6 +1148,53 @@ func runStatus() {
 			fleet.Working, fleet.Capacity, fleet.Standing, fleet.Preserved, fleet.Recovering, fleet.ControlSeats, fleet.Unknown)
 	}
 	reportWorkspacePlacement()
+}
+
+// revalidateBlockedEvidence removes task-scoped evidence that the provider no
+// longer considers live. Unknown provider failures are hard errors: status
+// must not report stale evidence or recommend coordinator-only remediation
+// without current task-state authority.
+func revalidateBlockedEvidence(ctx context.Context, st *store.Store, tp provider.TaskProvider, records []store.BlockedRecord) ([]store.BlockedRecord, error) {
+	if st == nil || tp == nil {
+		return nil, fmt.Errorf("blocked evidence revalidation requires store and provider")
+	}
+	invalidated := make([]int64, 0)
+	active := make([]store.BlockedRecord, 0, len(records))
+	for _, record := range records {
+		if strings.TrimSpace(record.TaskID) == "" {
+			active = append(active, record)
+			continue
+		}
+		task, err := tp.GetTask(ctx, record.TaskID)
+		if err != nil {
+			if providerTaskMissing(err) {
+				invalidated = append(invalidated, record.ID)
+				continue
+			}
+			return nil, fmt.Errorf("revalidate %s: %w", record.Ref, err)
+		}
+		if task == nil {
+			return nil, fmt.Errorf("revalidate %s: provider returned nil task", record.Ref)
+		}
+		if provider.NormalizeStatus(task.Status) == provider.StatusArchived {
+			invalidated = append(invalidated, record.ID)
+			continue
+		}
+		active = append(active, record)
+	}
+	if err := st.InvalidateBlockedSelections(invalidated); err != nil {
+		return nil, err
+	}
+	return active, nil
+}
+
+func providerTaskMissing(err error) bool {
+	var providerErr *provider.ProviderError
+	if errors.As(err, &providerErr) {
+		return providerErr.StatusCode == 404
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "task not found") || strings.Contains(message, "task deleted")
 }
 
 // statusRepoRoot prefers the canonical checkout for linked worktrees, while
