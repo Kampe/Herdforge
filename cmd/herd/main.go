@@ -1665,6 +1665,12 @@ func runStandingConfigMode(cfg *config.Config, herdrAvailable bool, mode standin
 			// Policy + route only — worktree prepare is a post-admission
 			// side effect owned by PrepareWorktree so dry-run/status never
 			// mutate the tree.
+			if err := validateLaneLaunchConfig(lane); err != nil {
+				return standing.Route{}, err
+			}
+			if err := admitStandingQuota(lane); err != nil {
+				return standing.Route{}, err
+			}
 			decision, err := launchAdmission(cfg, lane.Role, true, routedLaneDecision(context.Background(), nil))
 			if err != nil {
 				return standing.Route{}, err
@@ -1768,6 +1774,44 @@ func runStandingConfigMode(cfg *config.Config, herdrAvailable bool, mode standin
 		fmt.Println(standing.Summary(result))
 	}
 	return err
+}
+
+// admitStandingQuota checks the exact provider/model pool before a standing
+// lane can create a tab. Standing lanes use a configured route, so they do not
+// necessarily pass through SurfaceRouter.Pick's candidate waterfall. Missing,
+// stale, or exhausted quota is never treated as available here.
+func admitStandingQuota(lane *config.LaneDef) error {
+	if lane == nil {
+		return errors.New("standing quota admission requires a configured lane")
+	}
+	snap, err := usage.FetchSnapshot()
+	if err != nil {
+		return fmt.Errorf("standing lane %q live quota unavailable: %w", lane.Name, err)
+	}
+	if snap == nil || len(snap.Providers) == 0 {
+		return fmt.Errorf("standing lane %q live quota unavailable: empty snapshot", lane.Name)
+	}
+	computed := usage.NewQuotaEngine().ComputeAll(snap)
+	return admitStandingQuotaState(lane, computed)
+}
+
+func admitStandingQuotaState(lane *config.LaneDef, computed map[string]usage.BurnState) error {
+	if lane == nil {
+		return errors.New("standing quota admission requires a configured lane")
+	}
+	surface := quotasup.Surface{
+		Provider: quotasup.QuotaProvider(lane.Provider),
+		Pool:     quotasup.QuotaPool(lane.Provider, lane.Model),
+	}
+	burn := quotasup.BurnFor(computed, surface)
+	if burn == nil || !burn.Available {
+		reason := "unknown quota"
+		if burn != nil && strings.TrimSpace(burn.Reason) != "" {
+			reason = burn.Reason
+		}
+		return fmt.Errorf("standing lane %q refused: quota %s/%s unavailable (%s)", lane.Name, surface.Provider, surface.Pool, reason)
+	}
+	return nil
 }
 
 func runStanding() {

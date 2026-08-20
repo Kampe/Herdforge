@@ -655,3 +655,20 @@ func TestStandingGrokLaneCannotRerouteToClaude(t *testing.T) {
 		t.Fatalf("standing route was rerouted from its explicit tuple: %+v", d)
 	}
 }
+
+func TestStandingQuotaAdmissionFailsClosedForExhaustedPinnedPool(t *testing.T) {
+	lane := &config.LaneDef{Name: "grok-lane", Provider: "grok", Model: "grok-4.6"}
+	computed := map[string]usage.BurnState{
+		"grok": {Available: false, Reason: "exhausted", Used: 100, Remaining: 0},
+	}
+	if err := admitStandingQuotaState(lane, computed); err == nil || !strings.Contains(err.Error(), "grok/default") {
+		t.Fatalf("exhausted pinned pool must be refused, got %v", err)
+	}
+}
+
+func TestStandingQuotaAdmissionFailsClosedForUnknownPinnedPool(t *testing.T) {
+	lane := &config.LaneDef{Name: "grok-lane", Provider: "grok", Model: "grok-4.6"}
+	if err := admitStandingQuotaState(lane, nil); err == nil || !strings.Contains(err.Error(), "unknown quota") {
+		t.Fatalf("unknown pinned pool must be refused, got %v", err)
+	}
+}
