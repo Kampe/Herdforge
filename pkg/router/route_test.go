@@ -169,6 +169,25 @@ func TestProviderProbeRejectsMissingConfigurationAndRateLimit(t *testing.T) {
 	}
 }
 
+func TestProviderProbeSentinelMatching(t *testing.T) {
+	for _, tt := range []struct {
+		name   string
+		output string
+		wantOK bool
+	}{
+		{name: "exact sentinel", output: "HERD_PROVIDER_PROBE_OK", wantOK: true},
+		{name: "missing sentinel", output: "ready", wantOK: false},
+		{name: "extra output", output: "HERD_PROVIDER_PROBE_OK\nready", wantOK: false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			ok, _ := classifyProviderProbeOutput(tt.output, tt.output, nil, false)
+			if ok != tt.wantOK {
+				t.Fatalf("classifyProviderProbeOutput(%q)=%t, want %t", tt.output, ok, tt.wantOK)
+			}
+		})
+	}
+}
+
 func containsProbeArg(args []string, want string) bool {
 	for _, arg := range args {
 		if arg == want {
