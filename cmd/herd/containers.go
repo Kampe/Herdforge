@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"time"
@@ -210,4 +211,22 @@ func runContainersReconcile(args []string) {
 	for _, id := range report.Quarantined {
 		fmt.Printf("  quarantined (needs review): %s\n", id)
 	}
+}
+
+// reapVerifyStacks is shared by `herd cleanup` so the normal cleanup sweep
+// accounts for ephemeral verification Compose projects as well as Herdr tabs.
+func reapVerifyStacks(dryRun bool, maxAge time.Duration) (containerlifecycle.ReapVerifyStacksReport, error) {
+	if _, err := exec.LookPath("docker"); err != nil {
+		// A host without Docker cannot establish stack ownership or liveness.
+		// Report the uncertainty and leave everything untouched; tab cleanup
+		// remains useful in the same invocation.
+		return containerlifecycle.ReapVerifyStacksReport{
+			DryRun:  dryRun,
+			Blocked: []string{"docker-unavailable"},
+		}, nil
+	}
+	return containerlifecycle.ReapVerifyStacks(context.Background(), containerlifecycle.NewDockerComposeStackClient(), containerlifecycle.ReapVerifyStacksOptions{
+		DryRun: dryRun,
+		MaxAge: maxAge,
+	})
 }
