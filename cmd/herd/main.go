@@ -1430,102 +1430,99 @@ func runDaemon() {
 	}
 	defer st.Close()
 
-	ctx := context.Background()
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
 	pulseInterval := time.Duration(*interval) * time.Second
 
 	fmt.Printf("Daemon started (role=%s interval=%ds)\n", *role, *interval)
 	fmt.Println("Press Ctrl+C to stop.")
 
-	for {
-		select {
-		case <-ctx.Done():
-			fmt.Println("\nDaemon shutting down.")
-			return
-		default:
+	cycle := func(ctx context.Context) error {
+		// FAC-196: claim-to-dispatch is one transaction. Non-compensable
+		// prep (lane, routed decision, Herdr) happens before RunPulse.
+		// FAC-194 still owns removing any residual OpenCode ModelRouter
+		// constructions on other entrypoints; this path uses the
+		// authoritative launchAdmission + SurfaceRouter waterfall only.
+		lane := findLaneForRole(cfg, *role)
+		if lane == nil {
+			return fmt.Errorf("no lane configured for role %q", *role)
+		}
+		var tp provider.TaskProvider
+		decision, admitErr := launchAdmissionWithLifecycle(liveLaunchLifecycle{}, cfg, *role, herdr.IsAvailable(), routedLaneDecision(ctx, nil), func(_ *router.LaunchDecision) error {
+			var tpErr error
+			tp, tpErr = loadTaskProvider(cfg)
+			return tpErr
+		})
+		if admitErr != nil {
+			return fmt.Errorf("launch route rejected before claim: %w", admitErr)
+		}
+		if tp == nil {
+			return fmt.Errorf("task provider: not constructed after launch admission")
+		}
+		repository := repositoryIdentityForLaunch(cfg)
+		if repository == "" {
+			return fmt.Errorf("authenticated repository identity is required")
 		}
 
-		cycleErr := runDaemonCycle(ctx, requireFleetAdmission, func(ctx context.Context) error {
-			// FAC-196: claim-to-dispatch is one transaction. Non-compensable
-			// prep (lane, routed decision, Herdr) happens before RunPulse.
-			// FAC-194 still owns removing any residual OpenCode ModelRouter
-			// constructions on other entrypoints; this path uses the
-			// authoritative launchAdmission + SurfaceRouter waterfall only.
-			lane := findLaneForRole(cfg, *role)
-			if lane == nil {
-				return fmt.Errorf("no lane configured for role %q", *role)
-			}
-			var tp provider.TaskProvider
-			decision, admitErr := launchAdmissionWithLifecycle(liveLaunchLifecycle{}, cfg, *role, herdr.IsAvailable(), routedLaneDecision(ctx, nil), func(_ *router.LaunchDecision) error {
-				var tpErr error
-				tp, tpErr = loadTaskProvider(cfg)
-				return tpErr
-			})
-			if admitErr != nil {
-				return fmt.Errorf("launch route rejected before claim: %w", admitErr)
-			}
-			if tp == nil {
-				return fmt.Errorf("task provider: not constructed after launch admission")
-			}
-			repository := repositoryIdentityForLaunch(cfg)
-			if repository == "" {
-				return fmt.Errorf("authenticated repository identity is required")
-			}
+		wm := resolveCanonicalWorktreeManager()
+		v := verifier.NewVerifier(cfg.Verification.TestCommand)
+		eng := daemon.NewEngine(cfg, tp, nil, st, wm, v)
 
-			wm := resolveCanonicalWorktreeManager()
-			v := verifier.NewVerifier(cfg.Verification.TestCommand)
-			eng := daemon.NewEngine(cfg, tp, nil, st, wm, v)
-
-			standing := fmt.Sprintf("forge-%s", lane.Name)
-			rec, err := eng.RunDaemonTick(ctx, *role, daemon.TickOptions{
-				Decision:     decision,
-				Lane:         lane,
-				Repository:   repository,
-				Herdr:        dispatch.LiveHerdr{},
-				StandingName: standing,
-				ResolveStanding: func(_ context.Context, name string, req launch.Request) (*daemon.StandingAgent, error) {
-					tabLabel, rerr := herdr.ResolveAgentTabWithDecision(name, req)
-					if rerr != nil {
-						if authorizeEphemeralTaskAgent(rerr) != nil {
-							return nil, rerr
-						}
-						return nil, nil
-					}
-					// Readback exact agent identity for reuse gate.
-					agents, lerr := herdr.AgentList()
-					if lerr != nil {
-						return nil, lerr
-					}
-					for _, a := range agents {
-						if a.Name == name || a.Name == tabLabel {
-							return &daemon.StandingAgent{
-								Name:    a.Name,
-								TabID:   a.TabID,
-								PaneID:  a.PaneID,
-								Session: a.Session.Value,
-								CWD:     a.Cwd,
-								Model:   req.Decision.Model,
-								Harness: a.Kind,
-							}, nil
-						}
+		standing := fmt.Sprintf("forge-%s", lane.Name)
+		rec, err := eng.RunDaemonTick(ctx, *role, daemon.TickOptions{
+			Decision:     decision,
+			Lane:         lane,
+			Repository:   repository,
+			Herdr:        dispatch.LiveHerdr{},
+			StandingName: standing,
+			ResolveStanding: func(_ context.Context, name string, req launch.Request) (*daemon.StandingAgent, error) {
+				tabLabel, rerr := herdr.ResolveAgentTabWithDecision(name, req)
+				if rerr != nil {
+					if authorizeEphemeralTaskAgent(rerr) != nil {
+						return nil, rerr
 					}
 					return nil, nil
-				},
-			})
-			if err != nil {
-				return fmt.Errorf("daemon tick: %w", err)
-			}
-			if rec != nil && rec.Launched {
-				fmt.Printf("[%s] Dispatched: %s — agent=%s tab=%s model=%s/%s lease=g%d\n",
-					time.Now().Format(time.RFC3339), rec.TaskRef, rec.AgentName, rec.TabID, rec.Model, rec.Effort, rec.LeaseGeneration)
-			}
-			return nil
+				}
+				// Readback exact agent identity for reuse gate.
+				agents, lerr := herdr.AgentList()
+				if lerr != nil {
+					return nil, lerr
+				}
+				for _, a := range agents {
+					if a.Name == name || a.Name == tabLabel {
+						return &daemon.StandingAgent{
+							Name:    a.Name,
+							TabID:   a.TabID,
+							PaneID:  a.PaneID,
+							Session: a.Session.Value,
+							CWD:     a.Cwd,
+							Model:   req.Decision.Model,
+							Harness: a.Kind,
+						}, nil
+					}
+				}
+				return nil, nil
+			},
 		})
-		if cycleErr != nil {
-			fmt.Fprintf(os.Stderr, "daemon: %v\n", cycleErr)
+		if err != nil {
+			return fmt.Errorf("daemon tick: %w", err)
 		}
-
-		time.Sleep(pulseInterval)
+		if rec != nil && rec.Launched {
+			fmt.Printf("[%s] Dispatched: %s — agent=%s tab=%s model=%s/%s lease=g%d\n",
+				time.Now().Format(time.RFC3339), rec.TaskRef, rec.AgentName, rec.TabID, rec.Model, rec.Effort, rec.LeaseGeneration)
+		}
+		return nil
 	}
+	if err := daemon.RunPulseScheduler(ctx, daemon.PulseSchedulerOptions{Interval: pulseInterval}, func(ctx context.Context) error {
+		if err := runDaemonCycle(ctx, requireFleetAdmission, cycle); err != nil {
+			fmt.Fprintf(os.Stderr, "daemon: %v\n", err)
+		}
+		return nil
+	}); err != nil && !errors.Is(err, context.Canceled) {
+		fmt.Fprintf(os.Stderr, "daemon: scheduler stopped: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Println("\nDaemon shutting down.")
 }
 
 // runDaemonCycle is the production per-cycle admission seam. The cycle
