@@ -49,6 +49,13 @@ func markOperational(command string) {
 // subcommandUsage is the reserved help text for each herd subcommand.
 // Missing keys fall back to a generic line so the global help gate never
 // reaches operational parsers for unknown-but-routed names.
+// #nosec G101 -- help prose, not credentials: gosec matches credential-shaped
+// words (hostcreds, signer-boundary/sign, token) in user-facing usage strings and
+// reports the whole literal as one 52-250 span. A baseline row cannot hold it:
+// security-gate.zsh fingerprints sha256(rule|file|line), so adding or removing a
+// single help string shifts the end line, changes the fingerprint, and trips
+// both "unreviewed HIGH finding" and "stale baseline entry". Suppress at the
+// source, scoped to this literal, instead of a self-invalidating baseline entry.
 var subcommandUsage = map[string]string{
 	"control-surface":  "Usage: herd control-surface [--json]\n  Machine-readable discovery of public-agent operations only.",
 	"board-freeze":     "Usage: herd board-freeze [status|on|off]\n  Durable provider-mutation freeze; on requires --actor and --reason.",
