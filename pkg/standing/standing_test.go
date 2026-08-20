@@ -168,6 +168,28 @@ func TestConfiguredGoalTemplateReplacesGenericGoal(t *testing.T) {
 	}
 }
 
+func TestAuthorityEnvelopeContainsAllSixVerifiableFields(t *testing.T) {
+	lane := config.LaneDef{Name: "docs", Role: "docs", Prompt: ".herd/prompts/docs.md", Worktree: ".worktrees/docs", Authority: config.AuthorityWrite}
+	envelope := AuthorityEnvelopeForLane(lane)
+	for _, field := range []string{envelope.Grantor, envelope.PacketPath, envelope.BoundedAutonomy, envelope.MutationLimits} {
+		if strings.TrimSpace(field) == "" {
+			t.Fatal("authority envelope has an empty scalar field")
+		}
+	}
+	if len(envelope.ForbiddenActions) == 0 || len(envelope.StopConditions) == 0 {
+		t.Fatalf("authority envelope missing list fields: %+v", envelope)
+	}
+	if err := envelope.Validate(); err != nil {
+		t.Fatalf("generated envelope must validate: %v", err)
+	}
+	rendered := withContinuationGoal(lane, "packet")
+	for _, marker := range []string{"AUTHORITY ENVELOPE", "grantor:", "packet path:", "bounded autonomy:", "mutation limits:", "forbidden actions:", "stop conditions:"} {
+		if !strings.Contains(rendered, marker) {
+			t.Fatalf("launch transcript missing %q: %s", marker, rendered)
+		}
+	}
+}
+
 func TestSelectUnknownFailsClosed(t *testing.T) {
 	_, cfg := standingFixture(t)
 	_, err := Select(StandingLanes(cfg), []string{"not-a-lane"})

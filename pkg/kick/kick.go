@@ -25,6 +25,7 @@ import (
 
 	"github.com/Kampe/Herdforge/pkg/boardfreeze"
 	"github.com/Kampe/Herdforge/pkg/broadcast"
+	"github.com/Kampe/Herdforge/pkg/goalguard"
 	"github.com/Kampe/Herdforge/pkg/lifecycle"
 	"github.com/Kampe/Herdforge/pkg/posture"
 )
@@ -99,7 +100,9 @@ type Options struct {
 	// Repair bypasses the fleet freeze gate. Repair prompts are safe to send
 	// during a freeze because they restore an already-authorized change.
 	Repair bool
-	Freeze func() (bool, string, error)
+	// AuthorityEnvelope re-delivers the standing grant on every resume kick.
+	AuthorityEnvelope func(name string) (goalguard.AuthorityEnvelope, error)
+	Freeze            func() (bool, string, error)
 }
 
 // Result holds counts for one kick run.
@@ -447,6 +450,20 @@ func Run(opts Options) (*Result, error) {
 		}
 
 		msg := KickMessage(id, opts.Reason)
+		if opts.AuthorityEnvelope != nil {
+			envelope, envelopeErr := opts.AuthorityEnvelope(id)
+			if envelopeErr != nil {
+				result.Failed++
+				result.Entries = append(result.Entries, EntryResult{Name: id, Status: st, PaneID: paneID, Result: "failed", Reason: "authority envelope: " + envelopeErr.Error()})
+				continue
+			}
+			if err := envelope.Validate(); err != nil {
+				result.Failed++
+				result.Entries = append(result.Entries, EntryResult{Name: id, Status: st, PaneID: paneID, Result: "failed", Reason: "authority envelope: " + err.Error()})
+				continue
+			}
+			msg += "\n\n" + renderKickEnvelope(envelope)
+		}
 
 		// FAC-187: exact identity fence immediately before every prompt when
 		// the caller supplies bound + live identity.
@@ -532,6 +549,10 @@ func Run(opts Options) (*Result, error) {
 	}
 
 	return result, nil
+}
+
+func renderKickEnvelope(a goalguard.AuthorityEnvelope) string {
+	return fmt.Sprintf("AUTHORITY ENVELOPE (RESUME)\n- grantor: %s\n- packet path: %s\n- bounded autonomy: %s\n- mutation limits: %s\n- forbidden actions: %s\n- stop conditions: %s\nAUTHORITY ENVELOPE END", a.Grantor, a.PacketPath, a.BoundedAutonomy, a.MutationLimits, strings.Join(a.ForbiddenActions, "; "), strings.Join(a.StopConditions, "; "))
 }
 
 func cadenceFor(opts Options, id string) time.Duration {

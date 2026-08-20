@@ -28,6 +28,12 @@ func runGoalGuard() error {
 	generation := fs.Int64("generation", 0, "lease generation")
 	max := fs.Int("max", 0, "maximum continuations (0 = unbounded: run until the goal is met)")
 	expires := fs.String("expires", "", "RFC3339 expiry")
+	grantor := fs.String("grantor", "", "authority envelope grantor")
+	packet := fs.String("packet", "", "exact standing packet path")
+	autonomy := fs.String("autonomy", "", "bounded standing autonomy")
+	mutations := fs.String("mutations", "", "standing mutation limits")
+	forbidden := fs.String("forbidden", "", "comma-separated forbidden actions")
+	stopConditions := fs.String("stop-conditions", "", "comma-separated stop conditions")
 	if err := fs.Parse(os.Args[2:]); err != nil {
 		return err
 	}
@@ -54,6 +60,9 @@ func runGoalGuard() error {
 	if *set {
 		now := time.Now().UTC()
 		g := goalguard.Goal{SchemaVersion: goalguard.SchemaVersion, Lane: *lane, Task: *task, Owner: *owner, Generation: *generation, MaxContinuations: *max, CreatedAt: now, UpdatedAt: now}
+		if strings.TrimSpace(*grantor) != "" || strings.TrimSpace(*packet) != "" {
+			g.Authority = &goalguard.AuthorityEnvelope{Grantor: *grantor, PacketPath: *packet, BoundedAutonomy: *autonomy, MutationLimits: *mutations, ForbiddenActions: splitGoalCSV(*forbidden), StopConditions: splitGoalCSV(*stopConditions)}
+		}
 		if strings.TrimSpace(*expires) != "" {
 			expiry, parseErr := time.Parse(time.RFC3339Nano, *expires)
 			if parseErr != nil {
@@ -133,11 +142,27 @@ func runGoalGuardStopHook(s *goalguard.Store, payload []byte) error {
 	if !decision.Continue {
 		return writeGoalJSON(os.Stdout, decision)
 	}
+	if g.Authority == nil {
+		return errors.New("goal-guard: no verifiable authority envelope; refusing to assert continuation")
+	}
+	if err := g.Authority.Validate(); err != nil {
+		return fmt.Errorf("goal-guard: no verifiable authority envelope: %w", err)
+	}
 	block := map[string]string{
 		"decision": "block",
 		"reason":   fmt.Sprintf("goal-guard: goal %q on lane %q is not met (continuation %d). Keep working toward the goal; stop only when it is complete, then run `herd goal-guard --clear`.", g.Task, g.Lane, decision.Continuations),
 	}
 	return writeGoalJSON(os.Stdout, block)
+}
+
+func splitGoalCSV(raw string) []string {
+	var out []string
+	for _, item := range strings.Split(raw, ",") {
+		if item = strings.TrimSpace(item); item != "" {
+			out = append(out, item)
+		}
+	}
+	return out
 }
 
 // goalGuardLeaseHeld reads the same durable launch lease store used by the

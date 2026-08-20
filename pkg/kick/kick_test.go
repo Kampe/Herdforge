@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/Kampe/Herdforge/pkg/broadcast"
+	"github.com/Kampe/Herdforge/pkg/goalguard"
 	"github.com/Kampe/Herdforge/pkg/lifecycle"
 )
 
@@ -287,6 +288,19 @@ func TestRun_DryRun(t *testing.T) {
 	}
 	if result.Entries[0].Result != "dry-run" {
 		t.Fatalf("expected dry-run result, got %s", result.Entries[0].Result)
+	}
+}
+
+func TestRenderKickEnvelopeContainsGrant(t *testing.T) {
+	text := renderKickEnvelope(goalguard.AuthorityEnvelope{
+		Grantor: "coordinator", PacketPath: ".herd/prompts/worker.md",
+		BoundedAutonomy: "continue improving", MutationLimits: "isolated worktree",
+		ForbiddenActions: []string{"push"}, StopConditions: []string{"lease loss"},
+	})
+	for _, marker := range []string{"AUTHORITY ENVELOPE (RESUME)", "grantor:", "packet path:", "bounded autonomy:", "mutation limits:", "forbidden actions:", "stop conditions:"} {
+		if !strings.Contains(text, marker) {
+			t.Fatalf("resume envelope missing %q: %s", marker, text)
+		}
 	}
 }
 
