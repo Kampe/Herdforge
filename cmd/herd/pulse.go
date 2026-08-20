@@ -487,10 +487,12 @@ func readPulseCallbacks(ctx context.Context, act bool) ([]pulse.CallbackObservat
 func readPulseReview() pulse.ReviewObservation {
 	// Full drain scan is owned by `herd drain`. Pulse only needs a known
 	// posture bit; when the ledger is absent, review is known-empty rather
-	// than free capacity for launches that require review headroom.
+	// than free capacity for launches that require review headroom. RawVetoed
+	// is the ledger's unfiltered vetoed-SHA set and must not be conflated with
+	// drain's live unmerged-candidate NeedReview count.
 	path := drainLedgerPath()
 	if _, err := os.Stat(path); err != nil {
-		return pulse.ReviewObservation{Known: true, Pending: 0, NeedReview: 0}
+		return pulse.ReviewObservation{Known: true, Pending: 0, RawVetoed: 0}
 	}
 	// Ledger exists — verify it is readable. A corrupt ledger must surface
 	// as Known=false so an operator can detect the problem, not silently
@@ -521,7 +523,7 @@ func readPulseReview() pulse.ReviewObservation {
 	sort.Strings(needReviewRefs)
 	return pulse.ReviewObservation{
 		Known: true, Pending: len(pendingRefs), PendingRefs: pendingRefs,
-		NeedReview: len(needReviewRefs), NeedReviewRefs: needReviewRefs,
+		RawVetoed: len(needReviewRefs), RawVetoedRefs: needReviewRefs,
 	}
 }
 
