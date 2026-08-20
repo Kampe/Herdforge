@@ -898,6 +898,9 @@ func (r *SurfaceRouter) Decide(req LaunchRequest) (*LaunchDecision, error) {
 			}
 		}
 		if !ok {
+			if strings.HasPrefix(detail, "provider unavailable:") {
+				launchabilityFailure = fmt.Sprintf("%s/%s: %s", provider, model, strings.TrimPrefix(detail, "provider unavailable: "))
+			}
 			continue
 		}
 		if r.Probes != nil && r.Probes.Launchable != nil {

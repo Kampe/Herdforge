@@ -16,7 +16,7 @@ func clearRouteEnv(t *testing.T) {
 		"HERD_CLAUDE_ONLY", "HERD_NO_CLAUDE", "HERD_NO_GEMINI",
 		"HERD_ERA_PROVIDERS", "HERD_AVAILABLE_PROVIDERS", "HERD_UNAVAILABLE_PROVIDERS",
 		"HERD_ROUTE_FIT_WEIGHT", "HERD_ROUTE_PRESSURE_FLOOR", "HERD_OLLAMA_USE_KIMI",
-		"HERD_FAMILY_POSTURE",
+		"HERD_FAMILY_POSTURE", "HERD_KIMI_ENABLED",
 	} {
 		t.Setenv(k, "")
 	}
@@ -90,6 +90,46 @@ func TestPickCountsExactLiveModelAndRecoversAfterAgentExit(t *testing.T) {
 	}
 	if !strings.Contains(route.Availability, "live=0") {
 		t.Fatalf("route omitted reconciled live count: %q", route.Availability)
+	}
+}
+
+func TestPickRequiresProviderProbeAfterCLIProbe(t *testing.T) {
+	clearRouteEnv(t)
+	r := testRouter(nil, "claude")
+	seen := false
+	r.Probes.Launchable = func(provider, model string) (bool, string) {
+		seen = true
+		if provider != "claude" || model != "claude-fable-5" {
+			t.Fatalf("provider probe received %s/%s", provider, model)
+		}
+		return false, "rate limit before first token"
+	}
+	if _, err := r.Pick("coordinator", "claude", ""); err == nil || !strings.Contains(err.Error(), "no healthy provider") {
+		t.Fatalf("rate-limited provider must not be advertised: %v", err)
+	}
+	if !seen {
+		t.Fatal("provider probe was not consulted after CLI presence")
+	}
+}
+
+func TestForcedAvailabilityStillRequiresProviderProbe(t *testing.T) {
+	clearRouteEnv(t)
+	t.Setenv("HERD_AVAILABLE_PROVIDERS", "claude")
+	r := testRouter(nil, "claude")
+	r.Probes.Launchable = func(string, string) (bool, string) {
+		return false, "no configured provider/model"
+	}
+	if _, err := r.Pick("coordinator", "claude", ""); err == nil || !strings.Contains(err.Error(), "no healthy provider") {
+		t.Fatalf("forced availability must not bypass provider readiness: %v", err)
+	}
+}
+
+func TestDefaultProbeSuppressesUnconfiguredKimi(t *testing.T) {
+	clearRouteEnv(t)
+	probe := defaultProbes()
+	ok, reason := probe.Launchable("kimi", "")
+	if ok || !strings.Contains(reason, "not configured") {
+		t.Fatalf("kimi probe=(%t, %q), want unavailable with configuration reason", ok, reason)
 	}
 }
 

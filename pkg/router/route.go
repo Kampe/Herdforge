@@ -607,6 +607,12 @@ func defaultProbes() *Probes {
 			if !ok {
 				return false, fmt.Sprintf("unsupported routed provider %q", provider)
 			}
+			// Kimi is intentionally not configured on this host. A present CLI is
+			// not evidence of an account or usable provider, so keep it out of
+			// advertised routes unless an operator explicitly enables it.
+			if provider == "kimi" && os.Getenv("HERD_KIMI_ENABLED") != "1" {
+				return false, "kimi provider is not configured"
+			}
 			return ProbeSurface(surface)
 		},
 		Now: time.Now,
@@ -813,22 +819,33 @@ func (r *SurfaceRouter) available(provider, model, pool string) (bool, string) {
 	if un := os.Getenv("HERD_UNAVAILABLE_PROVIDERS"); un != "" && csvHas(un, provider) {
 		return false, "forced unavailable"
 	}
+	forcedAvailable := false
 	if forced := os.Getenv("HERD_AVAILABLE_PROVIDERS"); forced != "" {
 		if !csvHas(forced, provider) {
 			return false, "not in forced availability set"
 		}
-		// Divergence from zsh: structurally-forced providers here also skip
-		// the quota gate (zsh only skips CLI/auth/catalog probes). This env
-		// is a test/ops seam; keep the stronger bypass until the probe suite
-		// is ported.
-		return true, "forced available"
+		// Forced availability is an operator/test ranking seam, not proof that
+		// the exact provider/model can execute. Keep the executable and provider
+		// probes mandatory before advertising the surface.
+		forcedAvailable = true
 	}
 	if !r.Probes.CLIPresent(cliFor(provider)) {
 		return false, "CLI missing"
 	}
-	if st, ok := r.quotaState(provider, pool); ok {
-		if !st.Available && st.Reason != "no-quota-data" {
-			return false, "quota " + st.Reason
+	if r.Probes.Launchable != nil {
+		launchable, reason := r.Probes.Launchable(provider, model)
+		if !launchable {
+			if strings.TrimSpace(reason) == "" {
+				reason = "provider probe failed"
+			}
+			return false, "provider unavailable: " + reason
+		}
+	}
+	if !forcedAvailable {
+		if st, ok := r.quotaState(provider, pool); ok {
+			if !st.Available && st.Reason != "no-quota-data" {
+				return false, "quota " + st.Reason
+			}
 		}
 	}
 	if r.Probes.LiveCount != nil {
