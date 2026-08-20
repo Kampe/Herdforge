@@ -7,6 +7,29 @@ each kick and after a provider or lane-role change.
 
 ## Harness delivery
 
+The concrete live-pane delivery route is:
+
+```text
+herd send <agent> --file <path>
+```
+
+Put the complete multiline prompt or report in the file. Do not pass free-form
+payloads containing Markdown backticks, `$()`, pipes, redirects, or newlines
+through a positional argument or an interpolated shell string. A failed lookup
+or delivery attempt through any other mechanism is **not** evidence that the
+peer is absent: retry with the named `herd send <agent> --file <path>` route.
+If that route fails, report a delivery failure with the command outcome; never
+conclude that the peer does not exist.
+
+When pane delivery is unavailable, use the durable fallback:
+
+```text
+herd mail send --from <self> --to <peer> --file <path>
+```
+
+A queued durable-inbox copy is a successful delivery. It may not appear in the
+recipient's pane, so the recipient must read its durable inbox.
+
 - Claude may use the Stop hook for `/goal`, but must still read durable mail.
 - Codex, Grok, OpenCode, AGY, and other non-Stop-hook surfaces treat a settled
   pane as normal: durable mail plus the next Herdr kick is their inbox. Read
@@ -22,10 +45,12 @@ each kick and after a provider or lane-role change.
   coordinator. The coordinator merges, approves, and closes finished panes.
 - No lane sets a board card done. Lanes send evidence; the coordinator projects
   done only after origin/main proves the delivery.
-- For peer-to-peer reporting, use `herd send <pane|name> "<text>"` when the
-  recipient is live and must see the report in its pane. Use `herd mail send`
-  only for durable mailbox delivery, which is not surfaced in the pane; read
-  the recipient's durable inbox when using that path.
+- For peer-to-peer reporting, use `herd send <agent> --file <path>` when the
+  recipient is live and must see the report in its pane. Use
+  `herd mail send --from <self> --to <peer> --file <path>` only when pane
+  delivery is unavailable. A queued durable copy is SUCCESS for delivery even
+  though it is not surfaced in the pane; read the recipient's durable inbox
+  when using that fallback.
 
 ## Work discipline
 

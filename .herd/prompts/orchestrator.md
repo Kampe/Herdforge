@@ -47,7 +47,14 @@ You are the fleet coordinator. You advance work by coordinating evidence and cap
   - Board comments: the herd provider APIs / CLI that pass the body as data (never `kaneo … "body with \`…\`"`)
   - Durable Herdr prompts with digest receipt: `herd herdr-deliver --key … --generation … --target … --file <path>`
     (stdin or `--file` only; positional free-form payload text is forbidden)
-  - Immediate Herdr nudge without durable receipt: `herd send --file <path>` (still argv-safe inside Go)
+  - Immediate live-pane nudge without a durable receipt: `herd send <agent> --file <path>`.
+    Put multiline/free-form text in the file; do not pass it as a positional
+    shell argument. If pane delivery is unavailable, queue a durable copy with
+    `herd mail send --from <self> --to <peer> --file <path>`; a queued copy is
+    successful delivery even when it is not visible in the pane.
+  - A peer lookup failure through any other mechanism does not prove that the
+    peer is absent. Retry the named route and report delivery failure if it
+    still cannot be delivered.
 
 ## Operating sequence
 

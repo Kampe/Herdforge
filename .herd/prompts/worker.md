@@ -18,7 +18,14 @@ You are an autonomous builder assigned to one task, one lease generation, one re
 
 ## Free-form text (FAC-183)
 
-Do not post board comments or agent prompts by interpolating text into a shell string. Use Go/provider APIs or `herd herdr-deliver --file` / `herd send --file`. Evidence strings that contain backticks or race-command snippets must remain literal data.
+Do not post board comments or agent prompts by interpolating text into a shell string. Use Go/provider APIs or `herd herdr-deliver --file` / `herd send <agent> --file <path>`. Evidence strings that contain backticks or race-command snippets must remain literal data.
+
+For a live peer report, the exact route is `herd send <agent> --file <path>`;
+put the complete multiline report in the file. If pane delivery is unavailable,
+use `herd mail send --from <self> --to <peer> --file <path>`. A queued durable
+copy is successful delivery, not a failure. A peer that cannot be resolved by
+some other mechanism is not thereby absent: retry the named route and report a
+delivery failure if it fails.
 
 ## Start gate
 

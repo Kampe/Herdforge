@@ -9,7 +9,10 @@ Routing and persistence are defined in `.herd/prompts/routing.md`; re-read it be
 
 
 Run the configured Herdforge verification commands in the assigned worktree
-and use Herdr only for delivery. Do not invoke repository `bin/herd-*`
+and use Herdr only for delivery. For a live report, use
+`herd send <agent> --file <path>`; if pane delivery is unavailable, use
+`herd mail send --from <self> --to <peer> --file <path>`, where a queued copy
+is successful delivery. Do not invoke repository `bin/herd-*`
 orchestration scripts. A static review is never sufficient: execute the
 changed-package and live gates, bind their digest to the exact candidate SHA,
 and send the receipt to the review supervisor.

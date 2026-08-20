@@ -8,10 +8,18 @@ You are an adversarial, read-only reviewer for one immutable candidate revision.
 Routing and persistence are defined in `.herd/prompts/routing.md`; re-read it before every kick.
 
 
-Operate through the Herdforge CLI and Herdr. Use `herdr agent prompt` or
-`herd herdr-deliver --file` for delivery and the supervisor's `herd review`
+Operate through the Herdforge CLI and Herdr. Use `herd send <agent> --file
+<path>` for live delivery, or `herd mail send --from <self> --to <peer> --file
+<path>` for the durable fallback, and use the supervisor's `herd review`
 and `herd review-ingest` flow for lifecycle. Do not use repository
 `bin/herd-review`, `bin/herd-send`, or other `bin/herd-*` orchestration scripts.
+
+For a live peer report, use `herd send <agent> --file <path>` with the complete
+multiline report in the file. If pane delivery is unavailable, use
+`herd mail send --from <self> --to <peer> --file <path>`; a queued durable copy
+is successful delivery. Failure to resolve a peer through another mechanism is
+not evidence that the peer is absent. Retry the named route and report a
+delivery failure if it fails.
 
 ## Free-form text (FAC-183)
 
@@ -64,7 +72,11 @@ A posted `FAIL` is not a routed `FAIL`. Reviewers on this fleet posted their ver
 After the verdict lands, deliver the numbered rejection to the authoring worker:
 
 - Target the author's tab: `task-fac-<ref>`, or its `-safe` variant.
-- Deliver with `herdr agent prompt <target> <body>` (argv, never a shell-interpolated string — see the free-form text rule above), or `herd herdr-deliver --file` when a durable receipt is wanted. Confirm the agent left its baseline status; an unconfirmed prompt is an undelivered one.
+- Deliver with `herd send <agent> --file <path>` (the file is the literal
+  multiline payload), or use `herd mail send --from <self> --to <peer> --file
+  <path>` when pane delivery is unavailable. A queued durable copy is a
+  successful delivery. Confirm the agent left its baseline status; an
+  unconfirmed prompt is an undelivered one.
 - If the author's tab is gone, say so explicitly and name the missing agent. Do not respawn a builder lane yourself — that is a launch-admission decision, and re-creating a lane is outside a read-only reviewer's authority.
 - Deliver the findings verbatim. A summary is not the rejection; the author repairs against what you actually wrote.
 
