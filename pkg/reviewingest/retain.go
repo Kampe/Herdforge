@@ -41,7 +41,7 @@ func AuditIngested(root string, rows []reviewledger.LedgerRow) ([]IngestedAuditF
 		if entry.IsDir() || filepath.Base(filepath.Dir(path)) != "ingested" {
 			return nil
 		}
-		body, readErr := os.ReadFile(path)
+		body, readErr := os.ReadFile(path) // #nosec G122 -- the artifact path is supplied by the bounded WalkDir rooted at the configured review store.
 		if readErr != nil {
 			findings = append(findings, IngestedAuditFinding{Path: filepath.ToSlash(path), Reason: fmt.Sprintf("read artifact: %v", readErr)})
 			return nil

@@ -308,7 +308,7 @@ func copyTree(source, destination string) error {
 		if entry.IsDir() {
 			return os.MkdirAll(target, 0o755)
 		}
-		data, err := os.ReadFile(path)
+		data, err := os.ReadFile(path) // #nosec G122 -- the path is yielded by the bounded source WalkDir during an internal tree copy.
 		if err != nil {
 			return err
 		}

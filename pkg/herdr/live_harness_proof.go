@@ -224,7 +224,7 @@ func proveLiveHarness(kind, realBin, tmp string) (modelOK, toolOK, viaLA, contai
 	})
 	defer restore()
 
-	secret := "fac133-live-control-secret"
+	secret := "fac133-live-control-secret" // #nosec G101 -- test fixture only; grants no access and is used with a fake claim lookup.
 	policy, err := security.PolicyForLane(security.RoleWorker, wt, shared, "herdforge",
 		[]string{"herdforge"}, secret, []string{"pkg/security"})
 	if err != nil {
