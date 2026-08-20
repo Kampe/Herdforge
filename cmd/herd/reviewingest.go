@@ -23,20 +23,19 @@ import (
 // A bad verdict is indistinguishable from a good one once it lands, so every
 // refusal happens before the write.
 func runReviewIngest() {
-	fs := flag.NewFlagSet("review-ingest", flag.ExitOnError)
-	dryRun := fs.Bool("dry-run", false, "Validate without writing to the ledger")
-	audit := fs.Bool("audit", false, "Audit ingested artifacts for missing ledger verdicts")
-	auditRoot := fs.String("audit-root", filepath.Join(".herd", "review"), "Root containing ingested artifact directories")
-	ledgerPath := fs.String("ledger", filepath.Join(".herd", "review-ledger.jsonl"), "Ledger path")
-	fs.Parse(os.Args[2:])
+	parsed, err := parseReviewIngestArgs(os.Args[2:])
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "herd review-ingest: %v\n", err)
+		os.Exit(2)
+	}
 
-	files := fs.Args()
-	if *audit {
-		if len(files) != 0 || *dryRun {
+	files := parsed.files
+	if parsed.audit {
+		if len(files) != 0 || parsed.dryRun {
 			fmt.Fprintln(os.Stderr, "usage: herd review-ingest --audit [--audit-root <dir>]")
 			os.Exit(2)
 		}
-		ledger, err := reviewledger.NewReviewLedger(".", *ledgerPath)
+		ledger, err := reviewledger.NewReviewLedger(".", parsed.ledgerPath)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "herd review-ingest: open ledger: %v\n", err)
 			os.Exit(1)
@@ -46,7 +45,7 @@ func runReviewIngest() {
 			fmt.Fprintf(os.Stderr, "herd review-ingest: read ledger for audit: %v\n", err)
 			os.Exit(1)
 		}
-		findings, err := reviewingest.AuditIngested(*auditRoot, rows)
+		findings, err := reviewingest.AuditIngested(parsed.auditRoot, rows)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "herd review-ingest: audit failed: %v\n", err)
 			os.Exit(1)
@@ -84,9 +83,8 @@ func runReviewIngest() {
 	}
 
 	var ledger *reviewledger.Ledger
-	if !*dryRun {
-		var err error
-		ledger, err = reviewledger.NewReviewLedger(".", *ledgerPath)
+	if !parsed.dryRun {
+		ledger, err = reviewledger.NewReviewLedger(".", parsed.ledgerPath)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "herd review-ingest: open ledger: %v\n", err)
 			os.Exit(1)
@@ -112,7 +110,7 @@ func runReviewIngest() {
 			refused++
 			continue
 		}
-		if *dryRun {
+		if parsed.dryRun {
 			fmt.Printf("WOULD_ADMIT %s verdict=%s reviewer=%s sha=%s\n",
 				filepath.Base(f), a.Verdict, a.Reviewer, a.SHA[:12])
 			admitted++
@@ -181,6 +179,70 @@ func runReviewIngest() {
 	if refused > 0 {
 		os.Exit(1)
 	}
+}
+
+type reviewIngestArgs struct {
+	dryRun     bool
+	audit      bool
+	auditRoot  string
+	ledgerPath string
+	files      []string
+}
+
+// parseReviewIngestArgs parses flags independently of positional artifacts.
+// flag.FlagSet stops at the first positional argument, so using it directly
+// made `artifact --dry-run` treat the flag as another filename. Parsing the
+// complete argument list first keeps malformed invocations side-effect free.
+func parseReviewIngestArgs(args []string) (reviewIngestArgs, error) {
+	parsed := reviewIngestArgs{
+		auditRoot:  filepath.Join(".herd", "review"),
+		ledgerPath: filepath.Join(".herd", "review-ledger.jsonl"),
+	}
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--" {
+			parsed.files = append(parsed.files, args[i+1:]...)
+			break
+		}
+		if !strings.HasPrefix(arg, "-") {
+			parsed.files = append(parsed.files, arg)
+			continue
+		}
+		switch {
+		case arg == "--dry-run" || arg == "-dry-run":
+			parsed.dryRun = true
+		case arg == "--audit" || arg == "-audit":
+			parsed.audit = true
+		case strings.HasPrefix(arg, "--audit-root="):
+			parsed.auditRoot = strings.TrimPrefix(arg, "--audit-root=")
+		case strings.HasPrefix(arg, "--ledger="):
+			parsed.ledgerPath = strings.TrimPrefix(arg, "--ledger=")
+		case arg == "--audit-root" || arg == "-audit-root":
+			if i+1 >= len(args) || strings.HasPrefix(args[i+1], "-") {
+				return reviewIngestArgs{}, fmt.Errorf("%s requires a value", arg)
+			}
+			i++
+			parsed.auditRoot = args[i]
+		case arg == "--ledger" || arg == "-ledger":
+			if i+1 >= len(args) || strings.HasPrefix(args[i+1], "-") {
+				return reviewIngestArgs{}, fmt.Errorf("%s requires a value", arg)
+			}
+			i++
+			parsed.ledgerPath = args[i]
+		default:
+			return reviewIngestArgs{}, fmt.Errorf("unknown flag %q", arg)
+		}
+	}
+	if parsed.audit && parsed.dryRun {
+		return reviewIngestArgs{}, fmt.Errorf("--audit and --dry-run are mutually exclusive")
+	}
+	if parsed.audit && len(parsed.files) != 0 {
+		return reviewIngestArgs{}, fmt.Errorf("--audit cannot be combined with verdict artifacts")
+	}
+	if !parsed.audit && len(parsed.files) == 0 {
+		return reviewIngestArgs{}, fmt.Errorf("usage: herd review-ingest <verdict-artifact>... [--dry-run]")
+	}
+	return parsed, nil
 }
 
 type reviewIngestLedger interface {
