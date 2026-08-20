@@ -7589,9 +7589,16 @@ func runDrainCommand(args []string, out, errOut io.Writer) int {
 		fmt.Fprintln(errOut, "herd-drain: phase=harvest-scan")
 	}
 	h := harvest.NewHarvester(root)
-	harvestResult, err := h.Harvest(context.Background())
+	scanTimeout := drainScanTimeout()
+	scanCtx, cancelScan := context.WithTimeout(context.Background(), scanTimeout)
+	defer cancelScan()
+	harvestResult, err := h.HarvestReadOnly(scanCtx)
 	if err != nil {
-		fmt.Fprintf(errOut, "herd-drain: %v\n", err)
+		if scanCtx.Err() != nil {
+			fmt.Fprintf(errOut, "herd-drain: bounded scan exceeded %s: %v\n", scanTimeout, scanCtx.Err())
+		} else {
+			fmt.Fprintf(errOut, "herd-drain: %v\n", err)
+		}
 		return 1
 	}
 	harvestErrors := len(harvestResult.Errors) > 0
@@ -7602,9 +7609,13 @@ func runDrainCommand(args []string, out, errOut io.Writer) int {
 	if !*quiet {
 		fmt.Fprintln(errOut, "herd-drain: phase=review-scan")
 	}
-	report, err := d.Scan(context.Background(), harvestResult.UnmergedWorktrees)
+	report, err := d.Scan(scanCtx, harvestResult.UnmergedWorktrees)
 	if err != nil {
-		fmt.Fprintf(errOut, "herd-drain: %v\n", err)
+		if scanCtx.Err() != nil {
+			fmt.Fprintf(errOut, "herd-drain: bounded scan exceeded %s: %v\n", scanTimeout, scanCtx.Err())
+		} else {
+			fmt.Fprintf(errOut, "herd-drain: %v\n", err)
+		}
 		return 1
 	}
 	if cfgErr == nil {
@@ -7659,6 +7670,17 @@ func drainIntEnv(name string, fallback int) int {
 		return v
 	}
 	return fallback
+}
+
+const defaultDrainScanTimeout = 2 * time.Minute
+
+func drainScanTimeout() time.Duration {
+	if raw := strings.TrimSpace(os.Getenv("HERD_DRAIN_TIMEOUT")); raw != "" {
+		if timeout, err := time.ParseDuration(raw); err == nil && timeout > 0 {
+			return timeout
+		}
+	}
+	return defaultDrainScanTimeout
 }
 func minDrain(a, b int) int {
 	if a < b {

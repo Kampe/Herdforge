@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Kampe/Herdforge/pkg/review"
 )
@@ -23,6 +24,36 @@ func drainTestHooks(calls *map[string]int) drainActionHooks {
 		launchReview: func(context.Context, drainActionEvidence) error { (*calls)["review"]++; return nil },
 		dryRun:       func(context.Context, drainActionEvidence) error { (*calls)["dry-run"]++; return nil },
 		harvest:      func(context.Context, drainActionEvidence) error { (*calls)["harvest"]++; return nil },
+	}
+}
+
+func TestDrainJSONBoundsHangingScan(t *testing.T) {
+	t.Setenv("GIT_CONFIG_GLOBAL", filepath.Join(t.TempDir(), "gitconfig"))
+	binary := buildHerd(t)
+	repo := t.TempDir()
+	binDir := t.TempDir()
+	gitStub := filepath.Join(binDir, "git")
+	if err := os.WriteFile(gitStub, []byte("#!/bin/sh\nsleep 30\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HERD_DRAIN_TIMEOUT", "50ms")
+	t.Setenv("HERD_REVIEW_LEDGER", filepath.Join(repo, "ledger.jsonl"))
+	t.Setenv("HERD_STATE_DIR", filepath.Join(repo, "state"))
+	if err := os.WriteFile(filepath.Join(repo, "ledger.jsonl"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, binary, "drain", "--json")
+	cmd.Dir = repo
+	out, err := cmd.CombinedOutput()
+	if err != nil && errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		t.Fatalf("drain escaped its configured bound and hung: %v", err)
+	}
+	if err == nil || !strings.Contains(string(out), "bounded scan exceeded") {
+		t.Fatalf("expected bounded scan error, err=%v output=%s", err, out)
 	}
 }
 
