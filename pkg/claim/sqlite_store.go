@@ -874,6 +874,29 @@ func (s *SQLiteLeaseStore) ActiveClaims(ctx context.Context, now time.Time) ([]*
 	return leases, rows.Err()
 }
 
+// DistinctWorktreePaths returns every non-empty worktree_path this store has
+// ever recorded a lease against, active or released. It exists so a removal
+// fence can distinguish "this path was legitimately dispatched and its lease
+// later released" from "this path was never registered at all" -- the two
+// cases both have zero *active* claims, but only the first is safe to reap.
+func (s *SQLiteLeaseStore) DistinctWorktreePaths(ctx context.Context) ([]string, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT DISTINCT worktree_path FROM leases WHERE worktree_path != ''`)
+	if err != nil {
+		return nil, fmt.Errorf("distinct worktree paths: %w", err)
+	}
+	defer rows.Close()
+
+	var paths []string
+	for rows.Next() {
+		var p string
+		if err := rows.Scan(&p); err != nil {
+			return nil, fmt.Errorf("distinct worktree paths: scan: %w", err)
+		}
+		paths = append(paths, p)
+	}
+	return paths, rows.Err()
+}
+
 // ClaimCapacityRelease is a hard-disabled compatibility symbol. Production
 // settlement must use ClaimCapacityReleaseExact inside the lifecycle fence.
 func (s *SQLiteLeaseStore) ClaimCapacityRelease(ctx context.Context, settlerID string, staleAfter time.Duration, now time.Time, key *LeaseKey) ([]*Lease, error) {
