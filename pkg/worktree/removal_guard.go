@@ -12,18 +12,36 @@ import (
 	"github.com/Kampe/Herdforge/pkg/claim"
 )
 
-// RefuseRemovalWithLiveLease is the final coordinator-side removal fence.
-// When the claims database exists, every removal must prove BOTH that no
-// active, unexpired lease names the target path AND that the path was, at
-// some point, actually registered with the lease store. A path with zero
-// lease history at all was never dispatched through herd -- most likely a
-// manually created `git worktree add`, or something else entirely outside
-// herd's tracking -- and this fence has no basis to judge it safe to remove.
+// RefuseRemovalWithLiveLease is the final coordinator-side removal fence for
+// worktrees dispatched through herd's pkg/claim lease store (ordinary task
+// worktrees, harvest/merge cleanup, review-ingest cleanup). When the claims
+// database exists, removal must prove BOTH that no active, unexpired lease
+// names the target path AND that the path was, at some point, actually
+// registered with the lease store. A path with zero lease history at all
+// was never dispatched through herd -- most likely a manually created
+// `git worktree add`, or something else entirely outside herd's tracking --
+// and this fence has no basis to judge it safe to remove.
 // FAC-453: the previous version only checked *active* claims, so "never
 // registered" and "legitimately completed and released" were both treated
-// as "no active lease, proceed" -- silently unsafe for the former. Relative
-// paths in old rows are normalized against root before comparison.
+// as "no active lease, proceed" -- silently unsafe for the former.
 func RefuseRemovalWithLiveLease(ctx context.Context, root, target string) error {
+	return refuseRemoval(ctx, root, target, true)
+}
+
+// RefuseRemovalWithoutLeaseHistoryCheck is the removal fence for worktrees
+// tracked by a lease mechanism outside pkg/claim's SQLite store -- currently
+// only Pool, whose slots are leased and released via their own
+// self-contained slot.LeaseID bookkeeping and are never registered with
+// pkg/claim.Acquire. Using the full RefuseRemovalWithLiveLease here would
+// refuse every pool slot unconditionally, since none of them ever appear in
+// the claim store's lease history. This preserves the pre-FAC-453 check
+// (no *active* pkg/claim lease names the path) as defense-in-depth against
+// the path accidentally colliding with a real dispatched task worktree.
+func RefuseRemovalWithoutLeaseHistoryCheck(ctx context.Context, root, target string) error {
+	return refuseRemoval(ctx, root, target, false)
+}
+
+func refuseRemoval(ctx context.Context, root, target string, requireLeaseHistory bool) error {
 	root = strings.TrimSpace(root)
 	target = strings.TrimSpace(target)
 	if root == "" || target == "" {
@@ -59,6 +77,9 @@ func RefuseRemovalWithLiveLease(ctx context.Context, root, target string) error 
 		if leased == want {
 			return fmt.Errorf("worktree removal refused: live lease task=%s generation=%d path=%s", lease.TaskRef, lease.Generation, target)
 		}
+	}
+	if !requireLeaseHistory {
+		return nil
 	}
 	known, err := store.DistinctWorktreePaths(ctx)
 	if err != nil {

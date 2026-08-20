@@ -237,7 +237,10 @@ func (p *Pool) GC(ctx context.Context) error {
 			if slot.LeaseID != "" {
 				return fmt.Errorf("worktree pool: gc refused while slot %s is leased", slot.Name)
 			}
-			if err := RefuseRemovalWithLiveLease(ctx, p.RepoRoot, slot.Path); err != nil {
+			// Pool slots are tracked by their own slot.LeaseID above, never
+			// by pkg/claim -- the full RefuseRemovalWithLiveLease would
+			// refuse every slot unconditionally. See its doc comment.
+			if err := RefuseRemovalWithoutLeaseHistoryCheck(ctx, p.RepoRoot, slot.Path); err != nil {
 				return fmt.Errorf("worktree pool: gc lease fence for %s: %w", slot.Name, err)
 			}
 			cmd := exec.CommandContext(ctx, "git", "-C", p.RepoRoot, "worktree", "remove", "--force", slot.Path)

@@ -398,7 +398,10 @@ func runHarvestMerge() {
 	// Cleanup runs on the FAILURE path only — the worktree is deliberately kept
 	// on success so the coordinator can push from it.
 	cleanup := func() {
-		if guardErr := worktree.RefuseRemovalWithLiveLease(context.Background(), ".", dir); guardErr != nil {
+		// dir is a self-managed harvest-merge staging worktree created
+		// directly via `git worktree add` above, never through
+		// pkg/claim.Acquire -- it will never have lease history there.
+		if guardErr := worktree.RefuseRemovalWithoutLeaseHistoryCheck(context.Background(), ".", dir); guardErr != nil {
 			fmt.Fprintf(os.Stderr, "herd harvest-merge: cleanup refused: %v\n", guardErr)
 			return
 		}
