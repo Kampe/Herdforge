@@ -213,6 +213,43 @@ func TestPending(t *testing.T) {
 	}
 }
 
+func TestPendingExpiresUnverdictRecordsAndKeepsReviewerFanout(t *testing.T) {
+	now := time.Date(2025, 1, 3, 12, 0, 0, 0, time.UTC)
+	dir := t.TempDir()
+	l, err := NewReviewLedger(dir, filepath.Join(dir, "r.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	l.Now = func() time.Time { return now }
+	l.PendingTTL = 24 * time.Hour
+	for _, tc := range []struct {
+		sha      string
+		reviewer string
+		at       time.Time
+	}{
+		{sha: "old", reviewer: "abandoned", at: now.Add(-25 * time.Hour)},
+		{sha: "fresh", reviewer: "reviewer-a", at: now.Add(-time.Hour)},
+		{sha: "fresh", reviewer: "reviewer-b", at: now.Add(-time.Hour)},
+	} {
+		l.Now = func() time.Time { return tc.at }
+		if err := l.Record(RecordOpts{SHA: tc.sha, Reviewer: tc.reviewer}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	l.Now = func() time.Time { return now }
+
+	pending, err := l.Pending()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pending) != 2 {
+		t.Fatalf("pending = %d, want 2 fresh reviewer records: %+v", len(pending), pending)
+	}
+	if pending[0].Reviewer != "reviewer-a" || pending[1].Reviewer != "reviewer-b" {
+		t.Fatalf("pending reviewers = [%q, %q], want reviewer-a/reviewer-b", pending[0].Reviewer, pending[1].Reviewer)
+	}
+}
+
 func TestEligible_NoRecord(t *testing.T) {
 	dir := t.TempDir()
 	l, _ := NewReviewLedger(dir, filepath.Join(dir, "r.jsonl"))

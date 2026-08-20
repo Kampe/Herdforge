@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Kampe/Herdforge/pkg/claim"
 	"github.com/Kampe/Herdforge/pkg/deps"
@@ -618,6 +619,29 @@ func TestReadPulseReviewNamesRawVetoedSetExplicitly(t *testing.T) {
 	}
 	if _, ok := payload["need_review"]; ok {
 		t.Fatalf("pulse schema still exposes ambiguous need_review: %s", encoded)
+	}
+}
+
+func TestReadPulseReviewSaturatesAtDrainPressureCap(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "review-ledger.jsonl")
+	l, err := review.NewReviewLedger(t.TempDir(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	l.Now = func() time.Time { return now }
+	if err := l.Record(review.RecordOpts{SHA: "pending", Reviewer: "reviewer-a"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := l.Verdict(review.VerdictOpts{SHA: "vetoed", Reviewer: "reviewer-b", Verdict: review.VerdictFAIL}); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HERD_REVIEW_LEDGER", path)
+	t.Setenv("HERD_IN_REVIEW_CAP", "2")
+
+	obs := readPulseReview()
+	if !obs.Saturated {
+		t.Fatalf("review should be saturated at pending+need-review cap: %+v", obs)
 	}
 }
 

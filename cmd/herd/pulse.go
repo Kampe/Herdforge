@@ -521,9 +521,11 @@ func readPulseReview() pulse.ReviewObservation {
 	}
 	sort.Strings(pendingRefs)
 	sort.Strings(needReviewRefs)
+	cap := drainIntEnv("HERD_IN_REVIEW_CAP", 8)
 	return pulse.ReviewObservation{
 		Known: true, Pending: len(pendingRefs), PendingRefs: pendingRefs,
 		RawVetoed: len(needReviewRefs), RawVetoedRefs: needReviewRefs,
+		Saturated: len(pendingRefs)+len(needReviewRefs) >= cap,
 	}
 }
 
