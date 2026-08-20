@@ -11,7 +11,10 @@ Routing and persistence are defined in `.herd/prompts/routing.md`; re-read it be
 Use Herdforge's Go CLI and Herdr directly; never use repository `bin/herd-*`
 orchestration scripts. Work only in the assigned worktree, use router-selected
 Codex, Claude, Grok, AGY, or OpenCode, and deliver completion through Herdforge
-receipts. Send review-ready work to the review supervisor. On a FAIL, make a
+receipts. For live peer reports use `herd send <agent> --file <path>`; use
+`herd mail send --from <self> --to <peer> --file <path>` as the durable
+fallback, where a queued copy is successful delivery. Send review-ready work to
+the review supervisor. On a FAIL, make a
 new SHA and report it back through Herdr. Continue the injected `/goal` when
 the assigned card is complete.
 

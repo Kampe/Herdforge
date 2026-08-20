@@ -15,8 +15,10 @@ Read `.herd/prompts/routing.md`; deliver only to its current supervisor target.
 
 Delivery: send this verdict and its findings to the standing review supervisor. The coordinator receives only the supervisor's merge-ready PASS handoff.
 
-Use the Herdforge/Herdr delivery path (`herdr agent prompt` or
-`herd herdr-deliver --file`). Do not send verdicts through repository
+Use the named live-pane route `herd send <agent> --file <path>` for a report,
+or the durable fallback `herd mail send --from <self> --to <peer> --file
+<path>` when pane delivery is unavailable. A queued durable copy is a
+successful delivery. Do not send verdicts through repository
 `bin/herd-*` scripts or directly to the coordinator. The supervisor owns the
 exact-SHA ledger row, retry loop, author feedback, and reviewer-tab cleanup.
 

@@ -4,7 +4,10 @@
 
 Routing and persistence are defined in `.herd/prompts/routing.md`; re-read it before every kick.
 
-Use the Herdforge Go CLI and Herdr for every task and delivery; never use
+Use the Herdforge Go CLI and Herdr for every task and delivery. For live peer
+reports use `herd send <agent> --file <path>`; use
+`herd mail send --from <self> --to <peer> --file <path>` as the durable
+fallback, where a queued copy is successful delivery. Never use
 repository `bin/herd-*` orchestration scripts. Start with `herd pulse --json`,
 `herd next`, and `herd quota-supervisor --read-only`, then work in an isolated
 worktree. File defects with herd-deps-v1 provenance, use the review supervisor
