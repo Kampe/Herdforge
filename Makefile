@@ -34,15 +34,7 @@ check-go-toolchain:
 
 build: check-go-toolchain
 	@echo "==> Building herd binary..."
-	@mkdir -p bin
-	@root=$$(pwd -P) && top=$$(git rev-parse --show-toplevel 2>/dev/null) || { echo "build refused: Git toplevel does not resolve from the build directory" >&2; exit 1; }; \
-	if [ "$$top" != "$$root" ]; then echo "build refused: Git toplevel $$top does not match build directory $$root" >&2; exit 1; fi; \
-	rev=$$(git -C "$$root" rev-parse HEAD) && now=$$(date -u +%Y-%m-%dT%H:%M:%SZ) && \
-	tmp=$$(mktemp "$$root/bin/.herd.XXXXXX") && link=$$(mktemp "$$root/.herd-link.XXXXXX") && \
-	cleanup() { rm -f "$$tmp" "$$link"; }; trap cleanup EXIT INT TERM; \
-	go build -ldflags "-X github.com/Kampe/Herdforge/pkg/provenance.BinaryRevision=$$rev -X github.com/Kampe/Herdforge/pkg/provenance.BinaryBuildTime=$$now" -o "$$tmp" ./cmd/herd && \
-	"$$tmp" --version | grep -F "revision $$rev" >/dev/null || { echo "build refused: temporary herd failed provenance check" >&2; exit 1; }; \
-	mv -f "$$tmp" "$$root/bin/herd" && rm -f "$$link" && ln -s "bin/herd" "$$link" && mv -f "$$link" "$$root/herd"
+	@./scripts/build-herd.zsh "$$(pwd -P)"
 
 test: test-unit
 
