@@ -42,6 +42,29 @@ func TestCheckMainOriginDivergence_FailsClosedWithExactCounts(t *testing.T) {
 	}
 }
 
+func TestCheckRootGitConfigAcceptsActualRoot(t *testing.T) {
+	root := t.TempDir()
+	runGitDivergenceTest(t, root, "init", "-b", "main")
+	if err := CheckRootGitConfig(root); err != nil {
+		t.Fatalf("actual Git root rejected: %v", err)
+	}
+}
+
+func TestCheckRootGitConfigRejectsCoreWorktreeRedirect(t *testing.T) {
+	root := t.TempDir()
+	runGitDivergenceTest(t, root, "init", "-b", "main")
+	redirect := filepath.Join(t.TempDir(), "other-worktree")
+	runGitDivergenceTest(t, root, "config", "--local", "core.worktree", redirect)
+
+	err := CheckRootGitConfig(root)
+	if err == nil {
+		t.Fatal("core.worktree redirect was accepted")
+	}
+	if !strings.Contains(err.Error(), "core.worktree") || !strings.Contains(err.Error(), redirect) {
+		t.Fatalf("error = %q, want redirect diagnostic naming core.worktree and target", err)
+	}
+}
+
 func writeDivergenceTestFile(t *testing.T, root, contents string) {
 	t.Helper()
 	if err := os.WriteFile(filepath.Join(root, "state.txt"), []byte(contents+"\n"), 0o644); err != nil {

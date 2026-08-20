@@ -1,9 +1,30 @@
 package provenance
 
 import (
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 )
+
+func TestReadRejectsRedirectedGitRoot(t *testing.T) {
+	root := t.TempDir()
+	cmd := exec.Command("git", "init", "-b", "main")
+	cmd.Dir = root
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v\n%s", err, out)
+	}
+	redirect := filepath.Join(t.TempDir(), "other-worktree")
+	cmd = exec.Command("git", "config", "--local", "core.worktree", redirect)
+	cmd.Dir = root
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git config: %v\n%s", err, out)
+	}
+	_, err := Read(root)
+	if err == nil || !strings.Contains(err.Error(), "core.worktree") || !strings.Contains(err.Error(), redirect) {
+		t.Fatalf("Read() error = %v, want core.worktree redirect diagnostic", err)
+	}
+}
 
 func TestValidateBinarySource(t *testing.T) {
 	cases := []struct {

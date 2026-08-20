@@ -929,6 +929,10 @@ func runClone() {
 }
 
 func runPreflightStatic() {
+	if err := preflight.CheckRootGitConfig("."); err != nil {
+		fmt.Fprintf(os.Stderr, "Preflight failed: %v\n", err)
+		os.Exit(1)
+	}
 	if err := reportCurrentProvenance("."); err != nil {
 		fmt.Fprintf(os.Stderr, "Preflight failed: %v\n", err)
 		os.Exit(1)

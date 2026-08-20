@@ -28,7 +28,9 @@ ci:
 build:
 	@echo "==> Building herd binary..."
 	@mkdir -p bin
-	@rev=$$(git rev-parse HEAD) && now=$$(date -u +%Y-%m-%dT%H:%M:%SZ) && \
+	@root=$$(pwd -P) && top=$$(git rev-parse --show-toplevel 2>/dev/null) || { echo "build refused: Git toplevel does not resolve from the build directory" >&2; exit 1; }; \
+	if [ "$$top" != "$$root" ]; then echo "build refused: Git toplevel $$top does not match build directory $$root" >&2; exit 1; fi; \
+	rev=$$(git -C "$$root" rev-parse HEAD) && now=$$(date -u +%Y-%m-%dT%H:%M:%SZ) && \
 	go build -ldflags "-X github.com/Kampe/Herdforge/pkg/provenance.BinaryRevision=$$rev -X github.com/Kampe/Herdforge/pkg/provenance.BinaryBuildTime=$$now" -o bin/herd ./cmd/herd
 
 test: test-unit

@@ -22,6 +22,7 @@ import (
 var (
 	BinaryRevision  = ""
 	BinaryBuildTime = ""
+	errNotGitRoot   = errors.New("not a Git worktree")
 )
 
 type Info struct {
@@ -57,6 +58,9 @@ func Read(root string) (Info, error) {
 	if resolved, err := filepath.EvalSymlinks(path); err == nil {
 		path = resolved
 	}
+	if err := verifyGitRoot(root); err != nil && !errors.Is(err, errNotGitRoot) {
+		return Info{Path: path}, fmt.Errorf("provenance: %w", err)
+	}
 	source, err := gitValue(root, "rev-parse", "HEAD")
 	if err != nil {
 		return Info{Path: path}, fmt.Errorf("provenance: source revision: %w", err)
@@ -68,6 +72,9 @@ func Read(root string) (Info, error) {
 
 // ReadExecutable validates a selected executable path against root.
 func ReadExecutable(path, root string) (Info, error) {
+	if err := verifyGitRoot(root); err != nil {
+		return Info{Path: path}, fmt.Errorf("provenance: %w", err)
+	}
 	source, err := gitValue(root, "rev-parse", "HEAD")
 	if err != nil {
 		return Info{Path: path}, err
@@ -141,12 +148,44 @@ func executableInfo(path, root string) (Info, error) {
 	if err != nil {
 		return Info{}, err
 	}
+	if err := verifyGitRoot(root); err != nil {
+		return Info{}, err
+	}
 	source, err := gitValue(root, "rev-parse", "HEAD")
 	if err != nil {
 		return Info{}, err
 	}
 	revision, buildTime := binaryValuesFrom(path)
 	return Info{Path: path, SourceRevision: source, BinaryRevision: revision, BuildTime: buildTime}, nil
+}
+
+func verifyGitRoot(root string) error {
+	want, err := filepath.Abs(root)
+	if err != nil {
+		return fmt.Errorf("resolve source root: %w", err)
+	}
+	want, _ = filepath.EvalSymlinks(want)
+	config := exec.Command("git", "config", "--local", "--get", "core.worktree")
+	config.Dir = root
+	if out, configErr := config.Output(); configErr == nil && strings.TrimSpace(string(out)) != "" {
+		return fmt.Errorf("source Git core.worktree redirects to %q; refusing provenance", strings.TrimSpace(string(out)))
+	}
+	inside, err := gitValue(root, "rev-parse", "--is-inside-work-tree")
+	if err != nil {
+		return fmt.Errorf("%w: %v", errNotGitRoot, err)
+	}
+	if strings.TrimSpace(inside) != "true" {
+		return errNotGitRoot
+	}
+	top, err := gitValue(root, "rev-parse", "--show-toplevel")
+	if err != nil {
+		return fmt.Errorf("source toplevel: %w", err)
+	}
+	top, _ = filepath.EvalSymlinks(top)
+	if filepath.Clean(top) != filepath.Clean(want) {
+		return fmt.Errorf("source Git toplevel mismatch: expected %q, got %q; refusing provenance", want, top)
+	}
+	return nil
 }
 
 func binaryValues() (string, string) { return binaryValuesFrom("") }
