@@ -50,6 +50,7 @@ const (
 	OutcomePreview     Outcome = "preview"
 	OutcomeFailed      Outcome = "failed"
 	OutcomeLive        Outcome = "live"
+	OutcomeHeld        Outcome = "held"
 	OutcomeMissing     Outcome = "missing"
 	OutcomeUnraiseable Outcome = "unraiseable"
 	OutcomeWouldClose  Outcome = "would_close"
@@ -65,6 +66,7 @@ type Agent struct {
 	TabID     string
 	Workspace string
 	Cwd       string
+	LoopMode  LoopMode
 }
 
 // Tab is a created herdr tab.
@@ -118,16 +120,17 @@ type Options struct {
 
 // RoleResult records one standing role's outcome.
 type RoleResult struct {
-	LaneName  string  `json:"lane"`
-	AgentName string  `json:"agent"`
-	Role      string  `json:"role"`
-	CWD       string  `json:"cwd,omitempty"`
-	Outcome   Outcome `json:"outcome"`
-	Reason    string  `json:"reason,omitempty"`
-	TabID     string  `json:"tab_id,omitempty"`
-	PaneID    string  `json:"pane_id,omitempty"`
-	Provider  string  `json:"provider,omitempty"`
-	Model     string  `json:"model,omitempty"`
+	LaneName  string   `json:"lane"`
+	AgentName string   `json:"agent"`
+	Role      string   `json:"role"`
+	CWD       string   `json:"cwd,omitempty"`
+	Outcome   Outcome  `json:"outcome"`
+	LoopMode  LoopMode `json:"loop_mode,omitempty"`
+	Reason    string   `json:"reason,omitempty"`
+	TabID     string   `json:"tab_id,omitempty"`
+	PaneID    string   `json:"pane_id,omitempty"`
+	Provider  string   `json:"provider,omitempty"`
+	Model     string   `json:"model,omitempty"`
 }
 
 // Result is the full standing run report.
@@ -528,7 +531,14 @@ func runStatus(result *Result, lanes []config.LaneDef, live map[string]Agent, re
 		}
 		if actualName, a, ok := standingAgent(live, lane.Name, repository); ok && NameHeld(a.Status) {
 			rr.AgentName = actualName
+			rr.LoopMode = a.LoopMode
+			if rr.LoopMode == "" {
+				rr.LoopMode = LoopRunning
+			}
 			rr.Outcome = OutcomeLive
+			if rr.LoopMode == LoopHeld || rr.LoopMode == LoopOneShot {
+				rr.Outcome = OutcomeHeld
+			}
 			rr.Reason = "status=" + a.Status
 			rr.TabID = a.TabID
 			rr.PaneID = a.PaneID

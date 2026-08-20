@@ -256,6 +256,13 @@ func (a *HoldAuthority) migrate() error {
 	if err := ensureHoldColumn(a.db, "lifecycle_hold_state", "scope"); err != nil {
 		return err
 	}
+	if _, err := a.db.Exec(`CREATE TABLE IF NOT EXISTS lifecycle_lane_loop (
+		repository TEXT NOT NULL, owner TEXT NOT NULL, lane TEXT NOT NULL,
+		mode TEXT NOT NULL, goal TEXT NOT NULL, wakeup TEXT NOT NULL,
+		declared_goal TEXT NOT NULL, declared_wakeup TEXT NOT NULL,
+		PRIMARY KEY(repository, owner, lane))`); err != nil {
+		return fmt.Errorf("migrate lane loop state: %w", err)
+	}
 	_, err = a.db.Exec(`CREATE TABLE IF NOT EXISTS lifecycle_hold_events (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
 		repository TEXT NOT NULL, owner TEXT NOT NULL, lane TEXT NOT NULL, task TEXT NOT NULL, scope TEXT NOT NULL DEFAULT 'task',
@@ -376,6 +383,11 @@ func (a *HoldAuthority) holdIn(ctx context.Context, q holdSQL, identity HoldIden
 	result, insertErr := q.ExecContext(ctx, `INSERT INTO lifecycle_hold_events(repository,owner,lane,task,scope,generation,intent,actor,reason,code,created_at,expires_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`, identity.Repository, identity.Owner, identity.Lane, identity.Task, identity.Scope, generation, "hold", actor, reason, code, now, expires)
 	if err = exactOne(result, insertErr); err != nil {
 		return HoldRecord{}, fmt.Errorf("record hold event: %w", err)
+	}
+	if identity.Scope == "lane" {
+		if err := clearLoopIn(ctx, q, identity); err != nil {
+			return HoldRecord{}, fmt.Errorf("clear lane loop: %w", err)
+		}
 	}
 	return HoldRecord{HoldIdentity: identity, Actor: actor, Reason: reason, Code: code, Generation: generation, CreatedAt: now, ExpiresAt: cloneTime(expires), Held: true}, nil
 }

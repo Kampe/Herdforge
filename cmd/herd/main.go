@@ -1712,6 +1712,7 @@ func runStandingConfigMode(cfg *config.Config, herdrAvailable bool, mode standin
 				out = append(out, standing.Agent{
 					Name: a.Name, Status: a.Status, PaneID: a.PaneID,
 					TabID: a.TabID, Workspace: a.Workspace, Cwd: a.Cwd,
+					LoopMode: standing.LoopMode(a.LoopMode),
 				})
 			}
 			return out, nil

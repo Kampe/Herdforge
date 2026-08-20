@@ -1502,6 +1502,7 @@ type AgentEntry struct {
 	Name           string       `json:"name,omitempty"`
 	Kind           string       `json:"agent,omitempty"`
 	Status         string       `json:"agent_status,omitempty"`
+	LoopMode       string       `json:"loop_mode,omitempty"`
 	PaneID         string       `json:"pane_id,omitempty"`
 	TabID          string       `json:"tab_id,omitempty"`
 	Workspace      string       `json:"workspace_id,omitempty"`
