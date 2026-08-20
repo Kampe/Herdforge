@@ -125,6 +125,20 @@ func TestStandingLanesConfigOrderAndEphemeralExclusion(t *testing.T) {
 	}
 }
 
+func TestConfiguredGoalTemplateReplacesGenericGoal(t *testing.T) {
+	lane := config.LaneDef{Role: "docs", GoalTemplate: "/goal Reconcile the docs catalog for {{role}} and stop when current."}
+	got := withContinuationGoal(lane, "packet")
+	if !strings.Contains(got, "/goal Reconcile the docs catalog for docs and stop when current.") {
+		t.Fatalf("configured goal missing: %q", got)
+	}
+	if strings.Contains(got, "create the next actionable ticket") {
+		t.Fatalf("generic goal leaked into configured goal: %q", got)
+	}
+	if durableGoalTask(lane) != "Reconcile the docs catalog for docs and stop when current." {
+		t.Fatalf("durable task = %q", durableGoalTask(lane))
+	}
+}
+
 func TestSelectUnknownFailsClosed(t *testing.T) {
 	_, cfg := standingFixture(t)
 	_, err := Select(StandingLanes(cfg), []string{"not-a-lane"})
@@ -250,6 +264,37 @@ func TestRepeatedRaiseProducesOneOwner(t *testing.T) {
 	}
 	if creates != 4 {
 		t.Fatalf("after clear creates=%d want 4", creates)
+	}
+}
+
+func TestRaiseRefreshesDurableGoalForLiveLane(t *testing.T) {
+	repo, cfg := standingFixture(t)
+	cfg.Lanes[0].GoalTemplate = "first policy for {{role}}"
+	t.Chdir(repo)
+	live := map[string]Agent{"forge-orch": {Name: "forge-orch", Status: "idle", Cwd: filepath.Join(repo, ".worktrees", "orch")}}
+	var goals []string
+	opts := baseOpts(t, repo)
+	opts.Mode = ModeRaise
+	opts.Only = []string{"orch"}
+	opts.ListAgents = func() ([]Agent, error) { return []Agent{live["forge-orch"]}, nil }
+	opts.SetGoal = func(_, _, task, _ string) error { goals = append(goals, task); return nil }
+	result, err := Run(cfg, opts)
+	if err != nil {
+		t.Fatalf("raise: %v", err)
+	}
+	if result.Skipped != 1 || len(goals) != 1 || goals[0] != "first policy for orchestrator" {
+		t.Fatalf("result=%+v goals=%v", result, goals)
+	}
+
+	// A changed repo policy must replace the prior goal on the next raise.
+	cfg.Lanes[0].GoalTemplate = "corrective policy for {{role}}"
+	goals = nil
+	result, err = Run(cfg, opts)
+	if err != nil {
+		t.Fatalf("refresh raise: %v", err)
+	}
+	if result.Skipped != 1 || len(goals) != 1 || goals[0] != "corrective policy for orchestrator" || goals[0] == "first policy for orchestrator" {
+		t.Fatalf("refreshed result=%+v goals=%v", result, goals)
 	}
 }
 
