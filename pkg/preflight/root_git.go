@@ -3,6 +3,7 @@ package preflight
 import (
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -19,8 +20,12 @@ func CheckRootGitConfig(root string) error {
 
 	top, err := runCmd(root, "git", "rev-parse", "--show-toplevel")
 	if err != nil {
-		// Static preflight also supports a newly scaffolded directory.
-		return nil
+		// Static preflight supports a newly scaffolded directory, but must not
+		// turn a present and corrupted Git checkout into a false pass.
+		if _, statErr := os.Lstat(filepath.Join(root, ".git")); os.IsNotExist(statErr) {
+			return nil
+		}
+		return fmt.Errorf("inspect Git checkout at %q: %w", root, err)
 	}
 	got, err := canonicalPath(top)
 	if err != nil {
