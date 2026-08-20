@@ -1,11 +1,46 @@
 package standing
 
 import (
+	"fmt"
 	"regexp"
 	"sort"
 	"strings"
 	"sync"
 )
+
+// ErrConfiguration identifies a routing/authority contradiction. Callers
+// must not turn this into an idle observation: the addressed handoff needs a
+// different owner or an operator escalation.
+var ErrConfiguration = fmt.Errorf("standing: configuration error")
+
+// RefusedHandoffError is the loud, structured failure for an addressed lane
+// that refuses work it owns. Keeping the three identities in the error makes
+// operator output actionable and prevents a refusal from looking like an
+// ordinary empty-poll result.
+type RefusedHandoffError struct {
+	Lane      string
+	Handoff   string
+	Authority string
+}
+
+func (e RefusedHandoffError) Error() string {
+	return fmt.Sprintf("%v: lane %q refused owned handoff %q under conflicting authority %q; re-route or escalate the handoff", ErrConfiguration, e.Lane, e.Handoff, e.Authority)
+}
+
+func (RefusedHandoffError) Unwrap() error {
+	return ErrConfiguration
+}
+
+// ValidateRefusedHandoff converts an addressed owner's refusal into a hard
+// configuration error. It deliberately returns an error for every refusal;
+// there is no successful path that silently drops the handoff.
+func ValidateRefusedHandoff(lane, handoff, authority string) error {
+	return RefusedHandoffError{
+		Lane:      strings.TrimSpace(lane),
+		Handoff:   strings.TrimSpace(handoff),
+		Authority: strings.TrimSpace(authority),
+	}
+}
 
 var (
 	handoffTimestamp = regexp.MustCompile(`\b\d{4}-\d{2}-\d{2}[t ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:z|[+-]\d{2}:?\d{2})?\b`)
@@ -89,6 +124,13 @@ func (t *HandoffTracker) Observe(lane, content string) HandoffObservation {
 	previous.consecutive = observation.Consecutive
 	t.lanes[lane] = previous
 	return observation
+}
+
+// ObserveRefusal records the handoff before returning the hard refusal error.
+// The observation is available for telemetry, but callers must propagate the
+// error and re-route or escalate rather than continue polling.
+func (t *HandoffTracker) ObserveRefusal(lane, handoff, authority string) (HandoffObservation, error) {
+	return t.Observe(lane, handoff), ValidateRefusedHandoff(lane, handoff, authority)
 }
 
 // NormalizeHandoff returns a semantic fingerprint and whether the report is

@@ -277,6 +277,11 @@ lanes:
     standing: true
     authority: "read"
     capabilities: ["board-write"]
+    # This lane owns review admission and addressed NEEDS_REVIEW handoffs.
+    # Its repository authority remains read-only, but its standing goal must
+    # explicitly grant queue dispatch/review actions (FAC-522).
+    owns: ["review-queue", "review-handoffs"]
+    goal_template: "/goal Own the review queue for {{role}}: admit addressed NEEDS_REVIEW handoffs, dispatch independent reviewers, ingest verdicts and retry findings, and send only merge-ready PASS evidence to the coordinator. Never issue the review verdict, merge, push, or silently drop an addressed handoff; re-route or escalate any refusal. Continue until explicit stop, lease loss, or wind-down."
     incompatible_with: ["worker", "forge-smith", "harvest"]
 
   # harvest — the single-writer integration owner. Serializes reviewed
