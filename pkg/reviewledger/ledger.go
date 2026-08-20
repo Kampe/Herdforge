@@ -50,6 +50,24 @@ func NewReviewLedger(repoRoot, ledgerPath string) (*Ledger, error) {
 	}, nil
 }
 
+// NewReadOnlyReviewLedger opens a ledger for queries without creating its
+// parent directory, ledger file, or harvest queue. It is used by dry-run
+// commands whose read-only contract must hold even on a fresh repository.
+func NewReadOnlyReviewLedger(repoRoot, ledgerPath string) (*Ledger, error) {
+	if info, err := os.Stat(ledgerPath); err != nil && !os.IsNotExist(err) {
+		return nil, fmt.Errorf("stat ledger: %w", err)
+	} else if err == nil && info.IsDir() {
+		return nil, fmt.Errorf("ledger path is a directory: %s", ledgerPath)
+	}
+	return &Ledger{
+		RepoRoot:     repoRoot,
+		Path:         ledgerPath,
+		QueuePath:    filepath.Join(filepath.Dir(ledgerPath), "harvest-queue.jsonl"),
+		Now:          time.Now,
+		Coordinators: copyCoordSet(DefaultCoordinators),
+	}, nil
+}
+
 func copyCoordSet(src map[string]struct{}) map[string]struct{} {
 	dst := make(map[string]struct{}, len(src))
 	for k := range src {

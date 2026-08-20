@@ -91,13 +91,15 @@ func runReviewIngest() {
 		return len(strings.TrimSpace(string(out))) == 0, nil
 	}
 
-	var ledger *reviewledger.Ledger
-	if !parsed.dryRun {
+	var ledger reviewIngestLedger
+	if parsed.dryRun {
+		ledger, err = reviewledger.NewReadOnlyReviewLedger(".", parsed.ledgerPath)
+	} else {
 		ledger, err = reviewledger.NewReviewLedger(".", parsed.ledgerPath)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "herd review-ingest: open ledger: %v\n", err)
-			os.Exit(1)
-		}
+	}
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "herd review-ingest: open ledger: %v\n", err)
+		os.Exit(1)
 	}
 
 	admitted, refused := 0, 0
@@ -120,20 +122,36 @@ func runReviewIngest() {
 			continue
 		}
 		artifactName := reviewingest.RetainedArtifactName(a.SHA, a.Reviewer, body)
-		if parsed.dryRun {
-			if err := reviewingest.CheckMoveToIngested(f, artifactName); err != nil {
+		opts := reviewledger.IngestOpts{Verdict: reviewledger.VerdictOpts{
+			SHA:      a.SHA,
+			Reviewer: a.Reviewer,
+		}}
+		decision, err := reviewIngestAdmissionDecision(ledger, opts, f, artifactName)
+		if err != nil {
+			if parsed.dryRun {
 				fmt.Fprintf(os.Stderr, "REFUSED %s: %v\n", filepath.Base(f), err)
 				refused++
 				continue
 			}
-			fmt.Printf("WOULD_ADMIT %s verdict=%s reviewer=%s sha=%s\n",
-				filepath.Base(f), a.Verdict, a.Reviewer, a.SHA[:12])
+			fmt.Fprintf(os.Stderr, "herd review-ingest: preflight artifact move FAILED for %s: %v\n", filepath.Base(f), err)
+			os.Exit(1)
+		}
+		if parsed.dryRun {
+			if decision == reviewIngestSkipDuplicate {
+				fmt.Printf("WOULD_SKIP %s reason=duplicate verdict=%s reviewer=%s sha=%s\n",
+					filepath.Base(f), a.Verdict, a.Reviewer, a.SHA[:12])
+			} else {
+				fmt.Printf("WOULD_ADMIT %s verdict=%s reviewer=%s sha=%s\n",
+					filepath.Base(f), a.Verdict, a.Reviewer, a.SHA[:12])
+			}
 			admitted++
 			continue
 		}
-		if err := reviewingest.CheckMoveToIngested(f, artifactName); err != nil {
-			fmt.Fprintf(os.Stderr, "herd review-ingest: preflight artifact move FAILED for %s: %v\n", filepath.Base(f), err)
-			os.Exit(1)
+		if decision == reviewIngestSkipDuplicate {
+			fmt.Printf("DUPLICATE %s verdict=%s reviewer=%s sha=%s enqueued=false\n",
+				filepath.Base(f), a.Verdict, a.Reviewer, a.SHA[:12])
+			admitted++
+			continue
 		}
 		// Retain the validated artifact inside the repository before writing its
 		// ledger row. Reviewer panes use ephemeral /tmp worktrees and cleanup
@@ -276,6 +294,34 @@ type reviewIngestLedger interface {
 	VerdictForReviewer(string, string) (reviewledger.LedgerRow, bool, error)
 }
 
+type reviewIngestDecision string
+
+const (
+	reviewIngestAdmit         reviewIngestDecision = "admit"
+	reviewIngestSkipDuplicate reviewIngestDecision = "skip-duplicate"
+)
+
+// reviewIngestAdmissionDecision is the read-only gate shared by dry-run and
+// real ingestion. Keeping duplicate and destination checks here ensures both
+// modes report the same admission outcome.
+func reviewIngestAdmissionDecision(ledger reviewIngestLedger, opts reviewledger.IngestOpts, source, destinationName string) (reviewIngestDecision, error) {
+	sha := opts.Verdict.SHA
+	if sha == "" {
+		sha = destinationName
+	}
+	if opts.Verdict.Reviewer != "" {
+		if _, found, err := ledger.VerdictForReviewer(sha, opts.Verdict.Reviewer); err != nil {
+			return "", fmt.Errorf("read existing ledger verdict: %w", err)
+		} else if found {
+			return reviewIngestSkipDuplicate, nil
+		}
+	}
+	if err := reviewingest.CheckMoveToIngested(source, destinationName); err != nil {
+		return "", fmt.Errorf("preflight artifact move: %w", err)
+	}
+	return reviewIngestAdmit, nil
+}
+
 // admitVerdictAndMove makes the ledger row observable before moving the source
 // artifact. An append acknowledgement alone is not sufficient admission
 // evidence: a failed read-back must leave the artifact available for retry.
@@ -284,17 +330,14 @@ func admitVerdictAndMove(ledger reviewIngestLedger, opts reviewledger.IngestOpts
 	if sha == "" {
 		sha = destinationName
 	}
-	if opts.Verdict.Reviewer != "" {
-		if prior, found, err := ledger.VerdictForReviewer(sha, opts.Verdict.Reviewer); err != nil {
-			return false, fmt.Errorf("read existing ledger verdict: %w", err)
-		} else if found && prior.Reviewer == opts.Verdict.Reviewer {
-			// A duplicate handoff is a durable no-op. Leave the source available
-			// for inspection/retry; it must not be consumed as ingested evidence.
-			return false, nil
-		}
+	decision, err := reviewIngestAdmissionDecision(ledger, opts, source, destinationName)
+	if err != nil {
+		return false, err
 	}
-	if err := reviewingest.CheckMoveToIngested(source, destinationName); err != nil {
-		return false, fmt.Errorf("preflight artifact move: %w", err)
+	if decision == reviewIngestSkipDuplicate {
+		// A duplicate handoff is a durable no-op. Leave the source available
+		// for inspection/retry; it must not be consumed as ingested evidence.
+		return false, nil
 	}
 	destination, err := reviewingest.MoveToIngestedNamed(source, destinationName)
 	if err != nil {
