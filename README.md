@@ -103,6 +103,11 @@ make build
 
 `make ci` is the repository’s hermetic pre-push gate. It runs `go vet`, the full unit suite, and repo-boundary preflight without depending on user Git signing configuration.
 
+`make build` installs the single executable at `bin/herd` and refreshes the
+repository-root `herd` symlink used by cross-repository wrappers such as
+Chainseer’s `bin/herdforge`. Both paths therefore always select the same
+revision; use either path only after the build completes.
+
 ## Repository setup
 
 In a repository that will be managed by Herdforge:

@@ -6,8 +6,10 @@ the parity work; Chainseer-specific policy remains outside Herdforge core.
 
 ## Parity source of truth
 
-Parity measurements must invoke the built binary at `bin/herd`, not the stale
-repository-root `herd` file. The checked-in parity manifest is
+Parity measurements must invoke the built binary at `bin/herd`. The
+repository-root `herd` path is maintained as a symlink to that binary for
+cross-repository wrappers such as Chainseer’s `bin/herdforge`; it is not an
+independently writable install. The checked-in parity manifest is
 [`chainseer-bin-parity.json`](chainseer-bin-parity.json), and the audit is
 deterministic and read-only:
 
