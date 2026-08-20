@@ -21,13 +21,17 @@ import (
 //     concurrent fan-out / single bulk RPC) — never sequential per-task CLI.
 //   - One ListTasks hydration per SnapshotFence (not per TaskStatus).
 //   - Immutable snapshot reuse within a fence; Invalidate for final TOCTOU.
-//   - No long-lived unsafe cache across fences.
+//   - A short-lived complete snapshot cache coalesces run-state authority
+//     checks that do not share a launch fence; mutations invalidate it.
 type ProviderStore struct {
-	mu        sync.Mutex
-	TP        provider.TaskProvider
-	ProjectID string
-	refCache  map[string]*provider.Task
-	idCache   map[string]*provider.Task
+	mu             sync.Mutex
+	snapshotMu     sync.Mutex
+	TP             provider.TaskProvider
+	ProjectID      string
+	refCache       map[string]*provider.Task
+	idCache        map[string]*provider.Task
+	cachedSnapshot *GraphSnapshot
+	cachedAt       time.Time
 
 	// Test counters (optional observability for bounded-call tests).
 	ListTasksCalls     atomic.Int64
@@ -35,6 +39,12 @@ type ProviderStore struct {
 	BulkRelCalls       atomic.Int64 // ListProjectRelations
 	SnapshotGraphCalls atomic.Int64
 }
+
+// DefaultSnapshotCacheTTL bounds how long an unfenced graph authority check
+// may reuse a complete provider snapshot. Launch eligibility still uses a
+// SnapshotFence and scoped reads, while this short cache prevents repeated
+// dispatch run-state checks from re-fanning-out the entire board.
+const DefaultSnapshotCacheTTL = 15 * time.Second
 
 // NewProviderStore wraps a TaskProvider. Relation capability is explicit.
 func NewProviderStore(tp provider.TaskProvider, projectID string) *ProviderStore {
@@ -282,6 +292,24 @@ func (s *ProviderStore) SnapshotGraph(ctx context.Context) (*GraphSnapshot, erro
 			return snap, nil
 		}
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	// Serialize cold snapshots so concurrent unfenced authority checks share
+	// the result instead of stampeding the provider. The lock is intentionally
+	// held through the provider read; this path is bounded by ctx and the
+	// provider's own deadlines.
+	s.snapshotMu.Lock()
+	defer s.snapshotMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if s.cachedSnapshot != nil && time.Since(s.cachedAt) < DefaultSnapshotCacheTTL {
+		return cloneSnapshot(s.cachedSnapshot), nil
+	}
+	s.cachedSnapshot = nil
+	s.cachedAt = time.Time{}
 
 	rp, err := s.rel()
 	if err != nil {
@@ -324,7 +352,20 @@ func (s *ProviderStore) SnapshotGraph(ctx context.Context) (*GraphSnapshot, erro
 		}
 	}
 
-	return s.snapshotFromRelations(ctx, rels)
+	snap, err := s.snapshotFromRelations(ctx, rels)
+	if err != nil {
+		return nil, err
+	}
+	s.cachedSnapshot = cloneSnapshot(snap)
+	s.cachedAt = time.Now()
+	return snap, nil
+}
+
+func (s *ProviderStore) invalidateSnapshotCache() {
+	s.snapshotMu.Lock()
+	s.cachedSnapshot = nil
+	s.cachedAt = time.Time{}
+	s.snapshotMu.Unlock()
 }
 
 // SnapshotGraphForTask returns the complete relation component containing the
@@ -840,6 +881,7 @@ func (s *ProviderStore) CreateRelation(ctx context.Context, edge DependencyEdge)
 	if src == tgt {
 		return DependencyEdge{}, ErrSelfEdge
 	}
+	s.invalidateSnapshotCache()
 	typ := provider.RelationBlocks
 	if edge.Type == EdgeRelated {
 		typ = provider.RelationRelated
@@ -940,6 +982,7 @@ func (s *ProviderStore) DeleteRelation(ctx context.Context, relationID string, s
 	if fence := FenceFrom(ctx); fence != nil {
 		fence.Invalidate(false)
 	}
+	s.invalidateSnapshotCache()
 	if err := rp.DeleteRelation(ctx, relationID, string(sourceID), string(targetID)); err != nil {
 		if provider.IsAmbiguous(err) || provider.IsTimeout(err) {
 			return fmt.Errorf("%w: %v", ErrAmbiguousMutation, err)
