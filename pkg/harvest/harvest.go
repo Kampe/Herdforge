@@ -9,14 +9,14 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"strings"
 	"sync"
 
+	"github.com/Kampe/Herdforge/pkg/procsignal"
 	"github.com/Kampe/Herdforge/pkg/resources"
 )
 
-var execCommandContext = exec.CommandContext
+var execCommandContext = procsignal.CommandContext
 
 type UnmergedWork struct {
 	WorktreePath string   `json:"worktree_path"`
