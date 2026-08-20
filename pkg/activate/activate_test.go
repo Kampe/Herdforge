@@ -3,6 +3,8 @@ package activate
 import (
 	"errors"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -481,13 +483,31 @@ func TestResolveRoot_HERD_ROOT(t *testing.T) {
 	}
 }
 
-// TestResolveRoot_GitDiscovery verifies git discovery still resolves a
-// non-empty root when HERD_ROOT is unset and CWD is inside a git checkout
-// (the test binary always runs inside the herd repository).
+// TestResolveRoot_GitDiscovery verifies git discovery against a fixture so it
+// does not depend on the test process's checkout or its Git ownership policy.
 func TestResolveRoot_GitDiscovery(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skipf("git is unavailable: %v", err)
+	}
+
+	base := t.TempDir()
+	repo := filepath.Join(base, "repo")
+	if err := os.Mkdir(repo, 0o755); err != nil {
+		t.Fatalf("create fixture repo: %v", err)
+	}
+	cmd := testgit.Command(base, "init", repo)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git init fixture repo failed: %v\n%s", err, out)
+	}
+	want, err := filepath.EvalSymlinks(repo)
+	if err != nil {
+		t.Fatalf("resolve fixture repo path: %v", err)
+	}
+
 	t.Setenv("HERD_ROOT", "")
-	if got := resolveRepoRoot(); got == "" {
-		t.Fatal("expected git discovery to resolve a repo root, got empty")
+	chdirTest(t, repo)
+	if got := resolveRepoRoot(); got != want {
+		t.Fatalf("expected git discovery to resolve %q, got %q", want, got)
 	}
 }
 
