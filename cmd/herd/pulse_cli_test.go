@@ -12,6 +12,7 @@ import (
 	"github.com/Kampe/Herdforge/pkg/claim"
 	"github.com/Kampe/Herdforge/pkg/deps"
 	"github.com/Kampe/Herdforge/pkg/herdr"
+	"github.com/Kampe/Herdforge/pkg/provider"
 	"github.com/Kampe/Herdforge/pkg/pulse"
 	"github.com/Kampe/Herdforge/pkg/winddown"
 )
@@ -23,6 +24,41 @@ func TestPulseReviewPacketRoutesToSupervisor(t *testing.T) {
 	}
 	if !strings.Contains(packet, "reviewer dispatch, retries, verdict ingest") || !strings.Contains(packet, "Do not ask the coordinator") {
 		t.Fatalf("packet does not assign review lifecycle to supervisor: %s", packet)
+	}
+}
+
+func TestSelectPulseDispatchTaskSortsByPriorityThenRef(t *testing.T) {
+	got := selectPulseDispatchTask([]*provider.Task{
+		{Ref: "FAC-20", Status: provider.StatusToDo, Priority: provider.PriorityHigh},
+		{Ref: "FAC-2", Status: provider.StatusToDo, Priority: provider.PriorityHigh},
+		{Ref: "FAC-1", Status: provider.StatusInProgress, Priority: provider.PriorityUrgent},
+		{Ref: "FAC-3", Status: provider.StatusToDo, Priority: provider.PriorityUrgent},
+	})
+	if got == nil || got.Ref != "FAC-3" {
+		t.Fatalf("selected task=%+v want highest-priority claimable FAC-3", got)
+	}
+	if got = selectPulseDispatchTask([]*provider.Task{{Status: provider.StatusInProgress, Ref: "FAC-1"}}); got != nil {
+		t.Fatalf("in-progress-only board selected %+v", got)
+	}
+}
+
+func TestLivePulseActorDispatchUsesSharedDecision(t *testing.T) {
+	var got dispatchRequest
+	actor := &livePulseActor{
+		dispatch: func(_ context.Context, target, reason string) error {
+			got = dispatchRequest{TicketRef: "FAC-479", LaneName: target, LaneExplicit: true}
+			if reason == "" {
+				t.Fatal("pulse dispatch reason must be preserved")
+			}
+			return nil
+		},
+		dispatchRef: "FAC-479",
+	}
+	if err := actor.Dispatch(context.Background(), "smith", "bounded test dispatch"); err != nil {
+		t.Fatal(err)
+	}
+	if got.TicketRef != "FAC-479" || got.LaneName != "smith" || !got.LaneExplicit {
+		t.Fatalf("dispatch request=%+v", got)
 	}
 }
 

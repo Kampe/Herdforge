@@ -111,6 +111,7 @@ type ProviderObservation struct {
 	QueueDepth  int64  `json:"queue_depth"`
 	Claimable   int64  `json:"claimable"`
 	InProgress  int64  `json:"in_progress"`
+	NextTaskRef string `json:"next_task_ref,omitempty"`
 	ObservedSeq uint64 `json:"observed_seq,omitempty"`
 }
 
@@ -440,7 +441,7 @@ func Plan(obs Observation, opts Options) (Snapshot, error) {
 		blockReason = "quota exhausted"
 	case obs.Review.Saturated:
 		blockReason = "review saturated"
-	case obs.Provider.Claimable <= 0 && obs.Provider.QueueDepth <= 0:
+	case obs.Provider.Claimable <= 0:
 		blockReason = "no claimable work"
 	}
 	snap.DispatchBlocked = blockReason != ""
@@ -658,7 +659,7 @@ func Plan(obs Observation, opts Options) (Snapshot, error) {
 		// unreachable spawn-without-act already rejected
 	} else {
 		// Record withheld dispatch plan when there would be work under spawn.
-		if obs.Provider.Claimable > 0 || obs.Provider.QueueDepth > 0 {
+		if obs.Provider.Claimable > 0 {
 			hint := "--act --spawn"
 			reason := "would dispatch"
 			if snap.DispatchBlocked {
