@@ -1721,18 +1721,7 @@ func runStandingConfigMode(cfg *config.Config, herdrAvailable bool, mode standin
 			return err
 		},
 		SetGoal: func(cwd, lane, task, owner string) error {
-			self, err := os.Executable()
-			if err != nil {
-				return fmt.Errorf("resolve self for goal-guard: %w", err)
-			}
-			cmd := exec.Command(self, "goal-guard", "--set",
-				"--lane", lane, "--task", task, "--owner", owner, "--generation", "1")
-			cmd.Dir = cwd
-			out, err := cmd.CombinedOutput()
-			if err != nil {
-				return fmt.Errorf("goal-guard --set: %w: %s", err, strings.TrimSpace(string(out)))
-			}
-			return nil
+			return setDurableGoal(cwd, lane, task, owner, 1)
 		},
 		CloseTab: func(tabID string) error {
 			// Best-effort: StartPreparedAgent already reconciles most start
@@ -1873,6 +1862,25 @@ func runUp() {
 	}
 
 	fmt.Printf("Lane '%s' started: tab=%s pane=%s agent=%s\n", lane.Name, tab.ID, tab.Pane.ID, tabLabel)
+}
+
+// setDurableGoal replaces the lane-local goal atomically. Direct task launches
+// use this when no standing native role can be resolved, so their Stop hook has
+// the same durable lease-bound continuation contract as standing raises.
+func setDurableGoal(cwd, lane, task, owner string, generation int64) error {
+	self, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("resolve self for goal-guard: %w", err)
+	}
+	cmd := exec.Command(self, "goal-guard", "--set",
+		"--lane", lane, "--task", task, "--owner", owner,
+		"--generation", strconv.FormatInt(generation, 10))
+	cmd.Dir = cwd
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("goal-guard --set: %w: %s", err, strings.TrimSpace(string(out)))
+	}
+	return nil
 }
 
 // resolveBuilderWorkspace is the single workspace boundary for builder-lane
@@ -5393,6 +5401,7 @@ func runForgeE() error {
 					return compensateLaunchFailure(fmt.Errorf("forge launch decision rejected after claim: %w", bindErr))
 				}
 				standingName := fmt.Sprintf("forge-%s", lane.Name)
+				directLaunch := false
 				if lane.Worktree == "" {
 					return compensateLaunchFailure(fmt.Errorf("forge launch requires an isolated worktree"))
 				}
@@ -5402,6 +5411,7 @@ func runForgeE() error {
 						return fmt.Errorf("standing forge agent %s blocked: %w", standingName, resolveErr)
 					}
 					tabLabel = fmt.Sprintf("forge-%s-%s", strings.ToLower(lane.Name), strings.ToLower(task.Ref))
+					directLaunch = true
 					cwd := "."
 					if lane.Worktree != "" {
 						cwd = filepath.Join(".", lane.Worktree)
@@ -5428,6 +5438,11 @@ func runForgeE() error {
 				packet := fmt.Sprintf(`Task [%s]: %s\n\n%s\n\nWorktree: %s`, task.Ref, task.Title, task.Description, lane.Worktree)
 				if _, promptErr := herdr.AgentPrompt(tabLabel, packet, false); promptErr != nil {
 					return compensateLaunchFailure(fmt.Errorf("forge prompt failed: %w", promptErr))
+				}
+				if directLaunch {
+					if goalErr := setDurableGoal(filepath.Join(".", lane.Worktree), lane.Name, task.Ref, "coordinator", forgeLeaseGeneration); goalErr != nil {
+						return compensateLaunchFailure(fmt.Errorf("direct forge goal failed: %w", goalErr))
+					}
 				}
 				if receiptErr := persistForgeTaskReceipt(cfg, task, lane, forgeDecision, eng.LastClaimToken()); receiptErr != nil {
 					return compensateLaunchFailure(fmt.Errorf("forge launch receipt failed: %w", receiptErr))

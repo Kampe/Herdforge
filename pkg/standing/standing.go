@@ -167,9 +167,25 @@ func AgentName(laneName string) string {
 // understood by the supported harnesses and is intentionally part of the
 // prompt rather than an out-of-band shell command.
 func withContinuationGoal(lane config.LaneDef, prompt string) string {
-	return strings.TrimSpace(prompt) + fmt.Sprintf(`
+	goal := strings.TrimSpace(lane.GoalTemplate)
+	if goal == "" {
+		goal = fmt.Sprintf(`Continue as the standing %s lane. When the current assignment is complete or there is no ticket, inspect the repo and board, create the next actionable ticket with provenance, claim it, and work it in an isolated worktree. Report progress and blockers to the coordinator/review supervisor; stop only on an explicit stop, lease loss, or wind-down condition.`, strings.TrimSpace(lane.Role))
+	} else {
+		goal = strings.ReplaceAll(goal, "{{role}}", strings.TrimSpace(lane.Role))
+		goal = strings.TrimSpace(strings.TrimPrefix(goal, "/goal"))
+	}
+	return strings.TrimSpace(prompt) + "\n\n/goal " + goal
+}
 
-/goal Continue as the standing %s lane. When the current assignment is complete or there is no ticket, inspect the repo and board, create the next actionable ticket with provenance, claim it, and work it in an isolated worktree. Report progress and blockers to the coordinator/review supervisor; stop only on an explicit stop, lease loss, or wind-down condition.`, strings.TrimSpace(lane.Role))
+func durableGoalTask(lane config.LaneDef) string {
+	goal := strings.TrimSpace(lane.GoalTemplate)
+	if goal == "" {
+		goal = fmt.Sprintf("standing %s: continue until an explicit stop, lease loss, or wind-down condition", strings.TrimSpace(lane.Role))
+	} else {
+		goal = strings.ReplaceAll(goal, "{{role}}", strings.TrimSpace(lane.Role))
+		goal = strings.TrimSpace(strings.TrimPrefix(goal, "/goal"))
+	}
+	return strings.TrimSpace(goal)
 }
 
 // StandingLanes returns standing control roles in config declaration order.
@@ -610,6 +626,18 @@ func runRaise(result *Result, cfg *config.Config, lanes []config.LaneDef, repoRo
 			if a.Cwd != "" {
 				rr.CWD = a.Cwd
 			}
+			if opts.SetGoal != nil {
+				// Re-raising is also a policy refresh. Set replaces the atomic
+				// goal file, so a later corrective instruction cannot be shadowed
+				// by the previous durable wording.
+				goalCWD := rr.CWD
+				if goalCWD == "" {
+					goalCWD, _ = ValidateLane(*lane, repoRoot, opts.PromptReadable, opts.AbsPath)
+				}
+				if goalCWD != "" {
+					_ = opts.SetGoal(goalCWD, lane.Name, durableGoalTask(*lane), "coordinator")
+				}
+			}
 			result.Skipped++
 			result.Roles = append(result.Roles, rr)
 			continue
@@ -761,7 +789,7 @@ func runRaise(result *Result, cfg *config.Config, lanes []config.LaneDef, repoRo
 		}
 
 		if opts.SetGoal != nil {
-			task := fmt.Sprintf("standing %s: continue until an explicit stop, lease loss, or wind-down condition", strings.TrimSpace(lane.Role))
+			task := durableGoalTask(*lane)
 			// Best-effort: a lane launches successfully either way. Without a
 			// durable goal its Stop hook degrades to the quiet no-goal path
 			// rather than blocking, so a write failure here is not fatal.
