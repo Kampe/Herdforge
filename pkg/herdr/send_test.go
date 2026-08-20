@@ -33,8 +33,8 @@ func TestFormatSendResultExplainsDeliveryGuarantee(t *testing.T) {
 		status string
 		want   string
 	}{
-		{name: "working", status: "working", want: "herd send: worker -> working (delivery confirmed)"},
-		{name: "done", status: "done", want: "herd send: worker -> done (delivery confirmed)"},
+		{name: "working", status: "working", want: "herd send: worker -> working (consumption confirmed; task text observed in pane)"},
+		{name: "done", status: "done", want: "herd send: worker -> done (consumption confirmed; task text observed in pane)"},
 		{name: "submitted", status: "submitted", want: "herd send: worker -> submitted (UNVERIFIED: --no-verify)"},
 	}
 	for _, tc := range cases {
@@ -48,7 +48,7 @@ func TestFormatSendResultExplainsDeliveryGuarantee(t *testing.T) {
 }
 
 func TestFormatSendResultInWorkspaceAuditsAuthorizedRoute(t *testing.T) {
-	if got, want := FormatSendResultInWorkspace("wB:p391", "wB", "working"), "herd send: wB:p391 [workspace=wB] -> working (delivery confirmed)"; got != want {
+	if got, want := FormatSendResultInWorkspace("wB:p391", "wB", "working"), "herd send: wB:p391 [workspace=wB] -> working (consumption confirmed; task text observed in pane)"; got != want {
 		t.Fatalf("FormatSendResultInWorkspace() = %q, want %q", got, want)
 	}
 }
@@ -86,6 +86,7 @@ func TestSendPressesEnterImmediatelyAfterPrompt(t *testing.T) {
 
 	var calls []string
 	statusCalls := 0
+	paneReads := 0
 	runHerdr = func(args ...string) (string, error) {
 		calls = append(calls, strings.Join(args, " "))
 		if len(args) >= 2 && args[0] == "agent" && args[1] == "list" {
@@ -95,6 +96,13 @@ func TestSendPressesEnterImmediatelyAfterPrompt(t *testing.T) {
 				status = "idle"
 			}
 			return fmt.Sprintf(`{"result":{"agents":[{"name":"worker","pane_id":"pane-1","workspace_id":"wK","agent_status":%q}]}}`, status), nil
+		}
+		if len(args) >= 2 && args[0] == "pane" && args[1] == "read" {
+			paneReads++
+			if paneReads == 1 {
+				return `{"result":{"text":"empty pane"}}`, nil
+			}
+			return `{"result":{"text":"short kick"}}`, nil
 		}
 		return "{}", nil
 	}
@@ -110,6 +118,56 @@ func TestSendPressesEnterImmediatelyAfterPrompt(t *testing.T) {
 	}
 	if len(transportCalls) < 2 || transportCalls[0] != "agent prompt worker short kick" || transportCalls[1] != "agent send-keys worker Enter" {
 		t.Fatalf("herdr transport call order = %#v; all calls = %#v", transportCalls, calls)
+	}
+}
+
+func TestSendAcceptsBusyLaneOnlyWithTaskTextPaneEvidence(t *testing.T) {
+	t.Setenv("HERD_WORKSPACE", "wK")
+	oldRun := runHerdr
+	t.Cleanup(func() { runHerdr = oldRun })
+	paneReads := 0
+	runHerdr = func(args ...string) (string, error) {
+		if len(args) >= 2 && args[0] == "agent" && args[1] == "list" {
+			return `{"result":{"agents":[{"name":"worker","pane_id":"pane-busy","workspace_id":"wK","agent_status":"working"}]}}`, nil
+		}
+		if len(args) >= 2 && args[0] == "pane" && args[1] == "read" {
+			paneReads++
+			if paneReads == 1 {
+				return `{"result":{"text":"empty pane"}}`, nil
+			}
+			return `{"result":{"text":"❯ assigned command: go test ./pkg/herdr"}}`, nil
+		}
+		return "{}", nil
+	}
+
+	got, err := Send("worker", "assigned command: go test ./pkg/herdr", true, time.Second)
+	if err != nil || got != "working" {
+		t.Fatalf("busy delivery = %q, %v; want task-specific pane proof", got, err)
+	}
+}
+
+func TestSendRejectsStagedTextEvenWhenPaneStatusLooksHealthy(t *testing.T) {
+	t.Setenv("HERD_WORKSPACE", "wK")
+	oldRun := runHerdr
+	t.Cleanup(func() { runHerdr = oldRun })
+	paneReads := 0
+	runHerdr = func(args ...string) (string, error) {
+		if len(args) >= 2 && args[0] == "agent" && args[1] == "list" {
+			return `{"result":{"agents":[{"name":"worker","pane_id":"pane-staged","workspace_id":"wK","agent_status":"idle"}]}}`, nil
+		}
+		if len(args) >= 2 && args[0] == "pane" && args[1] == "read" {
+			paneReads++
+			if paneReads == 1 {
+				return `{"result":{"text":"empty pane"}}`, nil
+			}
+			return `{"result":{"text":"❯ [Pasted text #1]"}}`, nil
+		}
+		return "{}", nil
+	}
+
+	_, err := Send("worker", "assigned command: go test ./pkg/herdr", true, time.Millisecond)
+	if err == nil || !strings.Contains(err.Error(), "staged/unsubmitted") {
+		t.Fatalf("staged delivery error = %v; want explicit staged/unsubmitted failure", err)
 	}
 }
 

@@ -214,7 +214,7 @@ func performSpinAction(a spin.Assessment, agent herdr.AgentEntry, machine *lifec
 		// pane looks identical to a delivered one, and a nudge nobody
 		// consumed must be reported as a failure — spin already spent the
 		// budget slot on it.
-		_, err := herdr.Send(agent.PaneID, spinNudgeText(a), true, spinNudgeTimeout)
+		_, err := herdr.SendStatus(agent.PaneID, spinNudgeText(a), true, spinNudgeTimeout)
 		return err
 	case spin.ActionRecover:
 		if machine == nil || ts == nil {

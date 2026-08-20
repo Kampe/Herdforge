@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/Kampe/Herdforge/pkg/herdr"
 	"github.com/Kampe/Herdforge/pkg/worktree"
@@ -142,7 +143,7 @@ func runPoolReview(ref string) error {
 	if err := herdr.StartReviewAgent(tab.ID, agentName, tab.Pane.ID, *model); err != nil {
 		return fmt.Errorf("start OpenCode reviewer: %w", err)
 	}
-	if _, err := herdr.AgentPrompt(agentName, "Read and execute the review packet at "+packet+" in full.", false); err != nil {
+	if _, err := herdr.Send(agentName, "Read and execute the review packet at "+packet+" in full.", true, 30*time.Second); err != nil {
 		return errors.Join(fmt.Errorf("deliver review packet: %w", err), herdr.CloseReviewTab(tab.ID, agentName))
 	}
 	cleanupTab = false

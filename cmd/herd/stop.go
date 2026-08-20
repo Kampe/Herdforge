@@ -32,7 +32,7 @@ func (f herdrFleet) Agents() ([]stop.Agent, error) {
 }
 
 func (f herdrFleet) RequestStop(paneID string) error {
-	_, err := herdr.SendInWorkspace(paneID, stop.StopMessage, true, 30*time.Second, f.workspace)
+	_, err := herdr.SendStatusInWorkspace(paneID, stop.StopMessage, true, 30*time.Second, f.workspace)
 	return err
 }
 

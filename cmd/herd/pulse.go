@@ -869,7 +869,7 @@ func (a *livePulseActor) OpenReview(ctx context.Context, lane pulse.AgentObserva
 	}
 	target := standing.AgentNameForRepository(supervisor.Name, repositoryIdentityForLaunch(cfg))
 	packet := pulseReviewPacket(lane)
-	if _, err := herdr.AgentPrompt(target, packet, false); err != nil {
+	if _, err := herdr.Send(target, packet, true, 30*time.Second); err != nil {
 		return fmt.Errorf("pulse: notify review supervisor %s: %w", target, err)
 	}
 	_ = ctx

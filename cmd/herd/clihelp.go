@@ -126,8 +126,8 @@ var subcommandUsage = map[string]string{
                    Ordinary lane delivery remains workspace-fenced when this is omitted.
 
 Outcomes:
-  -> working  delivery confirmed; do not re-send.
-  -> done     delivery confirmed; do not re-send.
+  -> working  task text observed in the pane after consumption; do not re-send.
+  -> done     task text observed in the pane after consumption; do not re-send.
   -> submitted  UNVERIFIED (--no-verify); delivery is unknown, so re-send if needed.
   no result line  the pane never flipped; exits 1 and re-send is appropriate.
 

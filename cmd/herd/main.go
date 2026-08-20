@@ -1787,7 +1787,7 @@ func runStandingConfigMode(cfg *config.Config, herdrAvailable bool, mode standin
 			})
 		},
 		PromptAgent: func(agentName, promptText string) error {
-			_, err := herdr.AgentPrompt(agentName, promptText, false)
+			_, err := herdr.Send(agentName, promptText, true, 30*time.Second)
 			return err
 		},
 		SetGoal: func(cwd, lane, task, owner string) error {
@@ -2638,7 +2638,7 @@ func runReview() {
 		testCmd := scopedTestCommand(worktreeDir)
 		reviewPacket := reviewSpawnPacket(cfg, task, worktreeDir, testCmd)
 		// An undelivered review packet is a BLOCKED review, not a warning.
-		if _, err := herdr.AgentPrompt(targetLabel, reviewPacket, false); err != nil {
+		if _, err := herdr.Send(targetLabel, reviewPacket, true, 30*time.Second); err != nil {
 			life.fail("failed to deliver review packet (FAC-145 BLOCKED): %v", err)
 		}
 		fmt.Printf("  -> delivered review packet to %s\n", targetLabel)
@@ -5627,7 +5627,7 @@ func runForgeE() error {
 					}
 				}
 				packet := fmt.Sprintf(`Task [%s]: %s\n\n%s\n\nWorktree: %s`, task.Ref, task.Title, task.Description, lane.Worktree)
-				if _, promptErr := herdr.AgentPrompt(tabLabel, packet, false); promptErr != nil {
+				if _, promptErr := herdr.Send(tabLabel, packet, true, 30*time.Second); promptErr != nil {
 					return compensateLaunchFailure(fmt.Errorf("forge prompt failed: %w", promptErr))
 				}
 				if directLaunch {
@@ -5939,7 +5939,7 @@ func notifyReviewSupervisor(cfg *config.Config, task *provider.Task) error {
 	}
 	name := standing.AgentNameForRepository(lane.Name, repositoryIdentityForLaunch(cfg))
 	packet := fmt.Sprintf("REVIEW SUPERVISOR REQUEST\nTask: %s — %s\n\nThe task has entered in-review. You own the complete review lifecycle: inspect the exact candidate receipt/worktree, spawn a reviewer from a different model family, deliver findings back to the author lane, re-ping the reviewer after fixes, ingest the verdict, and close the ephemeral reviewer pane only after its verdict is durably recorded. Repeat until APPROVED. Only after exact PASS evidence, notify the coordinator that this task is ready to merge. Do not ask the coordinator to perform review work.\n\nReview dispatch and verdict ingest are feedback-independent: never wait for a FLEET_FEEDBACK census reply, coordinator wake, or other telemetry before processing this task. A wake-only or missing census epoch is void after the bounded observation window. On every beat, watchdog in-review pins; if one has no live reviewer and no dispatch for the configured timeout, re-dispatch or report the supervisor as wedged instead of treating the queue as empty.\n\nThe coordinator only performs the merge and sunsets implementation/review panes after your merge-ready handoff.\n\nTask description:\n%s", task.Ref, task.Title, strings.TrimSpace(task.Description))
-	if _, err := herdr.AgentPrompt(name, packet, false); err != nil {
+	if _, err := herdr.Send(name, packet, true, 30*time.Second); err != nil {
 		return fmt.Errorf("deliver to %s: %w", name, err)
 	}
 	return nil
