@@ -50,11 +50,36 @@ Use `herd <command> --help` at the checked-out revision before mutating state.
 herd pulse --role worker --spawn
 herd dispatch FAC-123
 herd review FAC-123
+herd review --pool FAC-123
 herd review-ingest <verdict-file>
 herd harvest-merge FAC-123
 herd approve FAC-123
 herd board-done FAC-123
 ```
+
+The `herd review --pool <ref>` path uses a filesystem worktree convention,
+not a Kaneo provenance lookup. `<ref>` must be a bare ticket-style identifier
+(for example `FAC-123`); paths and path separators are rejected. The ref is
+resolved case-insensitively to the existing candidate directory
+`.herd/worktrees/<lowercase-ref>`, so the command fails if that worktree is
+missing. In normal dispatch flow, `herd dispatch <ticket>` creates this
+directory, which can make the requirement look like a board binding, but the
+pool review code only checks the worktree and candidate commit.
+
+For un-ticketed work discovered outside the normal dispatch flow, mint or
+assign the ticket first, then make the existing branch available at the
+required path before starting review. For example, from the repository root:
+
+```bash
+git worktree add .herd/worktrees/fac-123 <existing-branch>
+herd review --pool FAC-123
+```
+
+If `<existing-branch>` is already checked out in another worktree, move or
+rename that ad hoc worktree first (or otherwise release the branch), then run
+`git worktree add` with the required `.herd/worktrees/<lowercase-ref>` path.
+The pool review command does not mint the ticket, locate an arbitrary branch,
+or validate a candidate SHA against a task card.
 
 ### Durable goal guard
 
