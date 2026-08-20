@@ -262,7 +262,7 @@ func removeOwnedTree(path string) error {
 		if entry.IsDir() {
 			mode |= 0o100
 		}
-		return os.Chmod(current, mode)
+		return os.Chmod(current, mode) // #nosec G122 -- the path is yielded by the bounded bootstrap WalkDir.
 	}); err != nil {
 		return err
 	}
