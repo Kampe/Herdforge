@@ -983,7 +983,18 @@ func (l *Ledger) Pending() ([]LedgerRow, error) {
 		ttl = DefaultPendingTTL
 	}
 	cutoff := now.Add(-ttl)
-	for k, rec := range newestRec {
+	// FAC-538: iterate the newest-record map in SORTED key order. Go randomises
+	// map iteration, so ranging directly made Pending() return reviewers in a
+	// different order on each run — nondeterministic output from a function
+	// callers compare and display, and a CI flake that only reproduces when
+	// the runtime happens to reorder.
+	keys := make([]string, 0, len(newestRec))
+	for k := range newestRec {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		rec := newestRec[k]
 		vi, hasVerdict := verdictIdx[k]
 		if !hasVerdict || vi < rec.index {
 			if rec.row.Timestamp != "" {
