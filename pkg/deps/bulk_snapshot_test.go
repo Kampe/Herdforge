@@ -212,6 +212,25 @@ func TestSnapshotGraph_FenceReuse_NoSecondProjectFanout(t *testing.T) {
 	}
 }
 
+// TestSnapshotGraph_ReusesShortLivedCacheAcrossCalls proves callers that do
+// not share a SnapshotFence (such as dispatch run-state admission) do not
+// re-fan-out the whole board for every graph authority check.
+func TestSnapshotGraph_ReusesShortLivedCacheAcrossCalls(t *testing.T) {
+	const n = 166
+	p := newDelayedBoard(n, 0, 5*time.Millisecond, true)
+	store := NewProviderStore(p, "proj")
+
+	if _, err := store.SnapshotGraph(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.SnapshotGraph(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := p.bulkCalls.Load(); got != 1 {
+		t.Fatalf("want one cold project fan-out for repeated graph checks, got %d", got)
+	}
+}
+
 // TestSnapshotGraph_CancelStopsBulkFanout ensures ctx cancel fails closed fast.
 func TestSnapshotGraph_CancelStopsBulkFanout(t *testing.T) {
 	p := newDelayedBoard(50, 0, 200*time.Millisecond, true)
