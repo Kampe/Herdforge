@@ -536,3 +536,63 @@ func TestQueueEmptyExit(t *testing.T) {
 		t.Errorf("expected empty, got %d", len(q))
 	}
 }
+
+// TestPendingExpiresAbandonedRecords proves a reviewer record with no verdict
+// stops counting as pending once it ages past PendingTTL. Without expiry a dead
+// reviewer launch inflates review pressure forever (observed: 408 pending rows,
+// none newer than two days).
+func TestPendingExpiresAbandonedRecords(t *testing.T) {
+	dir := t.TempDir()
+	l, _ := NewReviewLedger(dir, filepath.Join(dir, "r.jsonl"))
+
+	now := time.Date(2025, 1, 10, 0, 0, 0, 0, time.UTC)
+
+	// Abandoned: recorded well past the TTL, never got a verdict.
+	l.Now = func() time.Time { return now.Add(-PendingTTL - time.Hour) }
+	if err := l.Record(RecordOpts{SHA: "deadbeef", Reviewer: "reviewer-gone"}); err != nil {
+		t.Fatalf("Record abandoned: %v", err)
+	}
+
+	// Live: recorded inside the TTL, verdict still outstanding.
+	l.Now = func() time.Time { return now.Add(-time.Minute) }
+	if err := l.Record(RecordOpts{SHA: "cafe1234", Reviewer: "reviewer-live"}); err != nil {
+		t.Fatalf("Record live: %v", err)
+	}
+
+	l.Now = func() time.Time { return now }
+	p, err := l.Pending()
+	if err != nil {
+		t.Fatalf("Pending: %v", err)
+	}
+	if len(p) != 1 {
+		t.Fatalf("pending count = %d, want 1 (abandoned record must expire); got %+v", len(p), p)
+	}
+	if p[0].SHA != "cafe1234" {
+		t.Errorf("pending sha = %q, want cafe1234", p[0].SHA)
+	}
+}
+
+// TestPendingKeepsDistinctReviewersWithinTTL guards the (sha, reviewer) fan-out:
+// several independent reviewers on one SHA are several real pending reviews, and
+// the TTL must not collapse them.
+func TestPendingKeepsDistinctReviewersWithinTTL(t *testing.T) {
+	dir := t.TempDir()
+	l, _ := NewReviewLedger(dir, filepath.Join(dir, "r.jsonl"))
+
+	now := time.Date(2025, 1, 10, 0, 0, 0, 0, time.UTC)
+	l.Now = func() time.Time { return now.Add(-time.Minute) }
+	for _, r := range []string{"rev-a", "rev-b", "rev-c"} {
+		if err := l.Record(RecordOpts{SHA: "abc123", Reviewer: r}); err != nil {
+			t.Fatalf("Record %s: %v", r, err)
+		}
+	}
+
+	l.Now = func() time.Time { return now }
+	p, err := l.Pending()
+	if err != nil {
+		t.Fatalf("Pending: %v", err)
+	}
+	if len(p) != 3 {
+		t.Errorf("pending count = %d, want 3 (one per reviewer)", len(p))
+	}
+}

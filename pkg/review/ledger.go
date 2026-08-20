@@ -925,6 +925,14 @@ func (l *Ledger) Queued() ([]LedgerRow, error) {
 	return result, nil
 }
 
+// PendingTTL bounds how long a reviewer record with no verdict still counts as
+// pending. Past it the reviewer is presumed dead, not slow: a real review
+// round-trip is minutes, so a day of silence is an abandoned launch. Without
+// this bound dead launches inflate review pressure forever and every consumer
+// of Pending() (pulse saturation, drain pressure, drainExitCode) reads a number
+// that only ever grows.
+const PendingTTL = 24 * time.Hour
+
 // Pending returns launched-and-not-yet-verdict records, order-based.
 func (l *Ledger) Pending() ([]LedgerRow, error) {
 	rows, err := l.AllRows()
@@ -954,12 +962,28 @@ func (l *Ledger) Pending() ([]LedgerRow, error) {
 		}
 	}
 
+	// Records older than PendingTTL with no verdict are abandoned launches,
+	// not outstanding work. Rows are filtered on read; the ledger itself stays
+	// append-only.
+	now := time.Now
+	if l.Now != nil {
+		now = l.Now
+	}
+	cutoff := now().UTC().Add(-PendingTTL)
+
 	var pending []LedgerRow
 	for k, rec := range newestRec {
 		vi, hasVerdict := verdictIdx[k]
-		if !hasVerdict || vi < rec.index {
-			pending = append(pending, rec.row)
+		if hasVerdict && vi >= rec.index {
+			continue
 		}
+		// An unparseable timestamp is not evidence of freshness, but it is also
+		// not evidence of abandonment: keep the row so a malformed clock cannot
+		// silently drop real pending review.
+		if ts, err := time.Parse(time.RFC3339, rec.row.Timestamp); err == nil && ts.UTC().Before(cutoff) {
+			continue
+		}
+		pending = append(pending, rec.row)
 	}
 
 	sort.Slice(pending, func(i, j int) bool {

@@ -3,16 +3,19 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Kampe/Herdforge/pkg/claim"
 	"github.com/Kampe/Herdforge/pkg/deps"
 	"github.com/Kampe/Herdforge/pkg/herdr"
 	"github.com/Kampe/Herdforge/pkg/pulse"
+	"github.com/Kampe/Herdforge/pkg/review"
 	"github.com/Kampe/Herdforge/pkg/winddown"
 )
 
@@ -597,5 +600,106 @@ func TestHasCommittedWorkFailsClosedOnNoCommits(t *testing.T) {
 	runGitT(t, dir, "update-ref", "refs/remotes/origin/main", baseSHA)
 	if hasCommittedWork(dir) {
 		t.Fatal("no commits ahead of origin/main must not show committed work")
+	}
+}
+
+// writePendingLedger writes n fresh record-without-verdict rows so
+// readPulseReview sees exactly n pending reviews.
+func writePendingLedger(t *testing.T, n int) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "review-ledger.jsonl")
+	ts := time.Now().UTC().Format(time.RFC3339)
+	var b strings.Builder
+	for i := 0; i < n; i++ {
+		fmt.Fprintf(&b, `{"ts":%q,"event":"record","sha":"sha%03d","reviewer":"rev%03d"}`+"\n", ts, i, i)
+	}
+	if err := os.WriteFile(path, []byte(b.String()), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// TestReadPulseReviewSetsSaturatedAtCap proves the pulse dispatch gate at
+// pkg/pulse.deriveSnapshot ("review saturated") actually has a producer. Before
+// this, Saturated had zero writers in the tree, so the fleet dispatched builders
+// no matter how deep the review pile got.
+func TestReadPulseReviewSetsSaturatedAtCap(t *testing.T) {
+	t.Setenv("HERD_IN_REVIEW_CAP", "4")
+
+	t.Setenv("HERD_REVIEW_LEDGER", writePendingLedger(t, 3))
+	under := readPulseReview()
+	if !under.Known {
+		t.Fatalf("ledger must be readable: %+v", under)
+	}
+	if under.Pending != 3 {
+		t.Fatalf("pending = %d, want 3", under.Pending)
+	}
+	if under.Saturated {
+		t.Errorf("pending=3 cap=4 must not be saturated: %+v", under)
+	}
+
+	t.Setenv("HERD_REVIEW_LEDGER", writePendingLedger(t, 4))
+	at := readPulseReview()
+	if at.Pending != 4 {
+		t.Fatalf("pending = %d, want 4", at.Pending)
+	}
+	if !at.Saturated {
+		t.Errorf("pending=4 cap=4 must be saturated: %+v", at)
+	}
+}
+
+// TestReadPulseReviewExpiredPendingDoesNotSaturate is the coupling guard: the
+// saturation gate must read live pending only. Arming it against abandoned
+// reviewer records would deadlock every dispatch in the fleet.
+func TestReadPulseReviewExpiredPendingDoesNotSaturate(t *testing.T) {
+	t.Setenv("HERD_IN_REVIEW_CAP", "2")
+
+	path := filepath.Join(t.TempDir(), "review-ledger.jsonl")
+	stale := time.Now().UTC().Add(-review.PendingTTL - time.Hour).Format(time.RFC3339)
+	var b strings.Builder
+	for i := 0; i < 10; i++ {
+		fmt.Fprintf(&b, `{"ts":%q,"event":"record","sha":"old%03d","reviewer":"rev%03d"}`+"\n", stale, i, i)
+	}
+	if err := os.WriteFile(path, []byte(b.String()), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HERD_REVIEW_LEDGER", path)
+
+	obs := readPulseReview()
+	if obs.Pending != 0 {
+		t.Fatalf("pending = %d, want 0 (all records past PendingTTL)", obs.Pending)
+	}
+	if obs.Saturated {
+		t.Error("abandoned records must not saturate the dispatch gate")
+	}
+}
+
+// TestReadPulseReviewNeedReviewDoesNotSaturate proves the gate measures review
+// capacity, not builder backlog. NeedReview here is the raw unexpired Vetoed()
+// set (590 SHAs live); if it fed saturation, pulse would block the repair
+// dispatch that is the only thing able to drain it.
+func TestReadPulseReviewNeedReviewDoesNotSaturate(t *testing.T) {
+	t.Setenv("HERD_IN_REVIEW_CAP", "2")
+
+	path := filepath.Join(t.TempDir(), "review-ledger.jsonl")
+	ts := time.Now().UTC().Format(time.RFC3339)
+	var b strings.Builder
+	for i := 0; i < 10; i++ {
+		fmt.Fprintf(&b, `{"ts":%q,"event":"verdict","sha":"bad%03d","reviewer":"rev%03d","verdict":"FAIL"}`+"\n", ts, i, i)
+	}
+	if err := os.WriteFile(path, []byte(b.String()), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HERD_REVIEW_LEDGER", path)
+
+	obs := readPulseReview()
+	if obs.NeedReview != 10 {
+		t.Fatalf("need_review = %d, want 10", obs.NeedReview)
+	}
+	if obs.Pending != 0 {
+		t.Fatalf("pending = %d, want 0 (verdicts are not in-flight reviews)", obs.Pending)
+	}
+	if obs.Saturated {
+		t.Error("failed-verdict backlog must not saturate the dispatch gate")
 	}
 }

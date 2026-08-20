@@ -440,9 +440,22 @@ func readPulseReview() pulse.ReviewObservation {
 	}
 	sort.Strings(pendingRefs)
 	sort.Strings(needReviewRefs)
+	// Saturation is review *capacity*: how many reviews are in flight right now,
+	// against the same cap `herd drain` uses. Pulse previously read this ledger
+	// and derived no pressure verdict at all, leaving the "review saturated"
+	// dispatch gate with zero producers.
+	//
+	// NeedReview is deliberately excluded. Here it is the raw Vetoed() set --
+	// every SHA whose latest verdict was FAIL/BLOCKED, unexpired and unfiltered
+	// (590 live) -- which is not the same quantity as drain's NeedReview, and is
+	// builder backlog rather than review capacity. Work awaiting repair is work
+	// to dispatch, so counting it as pressure would block the very dispatch that
+	// clears it.
+	cap := drainIntEnv("HERD_IN_REVIEW_CAP", 8)
 	return pulse.ReviewObservation{
 		Known: true, Pending: len(pendingRefs), PendingRefs: pendingRefs,
 		NeedReview: len(needReviewRefs), NeedReviewRefs: needReviewRefs,
+		Saturated: cap > 0 && len(pendingRefs) >= cap,
 	}
 }
 
