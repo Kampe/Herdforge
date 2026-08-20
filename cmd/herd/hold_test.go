@@ -16,6 +16,7 @@ type adapterBoundary struct {
 	hasCurrent                                                  bool
 	holdCalls                                                   int
 	releaseCalls                                                int
+	rearmCalls                                                  int
 	checkCalls                                                  int
 	closeCalls                                                  int
 	lastGeneration                                              int64
@@ -48,6 +49,11 @@ func (b *adapterBoundary) Release(_ context.Context, identity lifecycle.HoldIden
 	b.releaseCalls++
 	b.lastGeneration = generation
 	return lifecycle.HoldRecord{HoldIdentity: identity, Actor: actor, Reason: reason, Code: code, Generation: generation, Held: false}, b.releaseErr
+}
+func (b *adapterBoundary) ReleaseAndRearm(_ context.Context, identity lifecycle.HoldIdentity, actor, reason string, generation int64) (lifecycle.LoopState, error) {
+	b.rearmCalls++
+	b.lastGeneration = generation
+	return lifecycle.LoopState{HoldIdentity: identity, Mode: lifecycle.LoopRunning, Goal: "goal", Wakeup: "wakeup"}, b.releaseErr
 }
 
 func adapterConfig() *config.Config {
@@ -221,6 +227,27 @@ func TestExecuteHoldCommandLaneScopeDefaultsOwnerToConfiguredRole(t *testing.T) 
 	receipt, ok := encoded[0].(lifecycle.HoldRecord)
 	if !ok || receipt.Repository != "github.com/example/repo" || receipt.Owner != "worker" || receipt.Lane != "smith" || receipt.Task != "" || receipt.Scope != "lane" || receipt.Generation != 1 || !receipt.Held {
 		t.Fatalf("lane receipt did not contain configured owner/lane identity: %#v", encoded[0])
+	}
+}
+
+func TestExecuteHoldCommandLaneReleaseUsesAtomicRearm(t *testing.T) {
+	boundary := &adapterBoundary{hasCurrent: true}
+	opens := 0
+	encoded := []any{}
+	flushes := 0
+	req := adapterRequest("off")
+	req.Scope = "lane"
+	req.Task = ""
+	req.Owner = ""
+	if err := executeHoldCommand(context.Background(), req, adapterDeps(boundary, "", &opens, &encoded, &flushes)); err != nil {
+		t.Fatal(err)
+	}
+	if boundary.rearmCalls != 1 || boundary.releaseCalls != 0 {
+		t.Fatalf("lane release calls: rearm=%d release=%d", boundary.rearmCalls, boundary.releaseCalls)
+	}
+	state, ok := encoded[0].(lifecycle.LoopState)
+	if !ok || state.Mode != lifecycle.LoopRunning || state.Goal != "goal" || state.Wakeup != "wakeup" {
+		t.Fatalf("lane release receipt = %#v", encoded[0])
 	}
 }
 
