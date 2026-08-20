@@ -169,7 +169,7 @@ func runGoalGuardStopHook(s *goalguard.Store, payload []byte) error {
 
 	block := map[string]string{
 		"decision": "block",
-		"reason":   fmt.Sprintf("goal-guard: goal %q on lane %q is not met (continuation %d). Keep working toward the goal; stop only when it is complete, then run `herd goal-guard --clear`.", g.Task, g.Lane, decision.Continuations),
+		"reason":   fmt.Sprintf("AUTOMATED STOP-HOOK OUTPUT — NOT AN ASSIGNMENT. goal-guard: goal %q on lane %q is not met (continuation %d). Keep working toward the goal; stop only when it is complete, then run `herd goal-guard --clear`.", g.Task, g.Lane, decision.Continuations),
 	}
 	return writeGoalJSON(os.Stdout, block)
 }

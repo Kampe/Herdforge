@@ -205,7 +205,7 @@ func WakeTextForTask(taskRef string) string {
 
 func wakeTextWithReference(reference string) string {
 	return fmt.Sprintf(
-		"Wake-up from the Herdforge coordinator (%s — provenance only, nothing for you to do with it). "+
+		"ADDRESSED ASSIGNMENT — issuer: coordinator — %s — NOT AUTOMATED STOP-HOOK OUTPUT. "+
 			"Read TASK-PACKET.md in your worktree root and continue that task.",
 		reference)
 }
