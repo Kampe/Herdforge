@@ -303,11 +303,15 @@ type LaneDef struct {
 	// GoalTemplate is the repo-defined durable continuation instruction for a
 	// standing lane. It replaces the historical generic board-only goal.
 	GoalTemplate string `yaml:"goal_template,omitempty"`
-	Worktree     string `yaml:"worktree,omitempty"`
-	Provider     string `yaml:"provider,omitempty"`
-	Model        string `yaml:"model,omitempty"`
-	Effort       string `yaml:"effort,omitempty"`
-	TaskShape    string `yaml:"task_shape,omitempty"`
+	// Owns declares the routing queues this standing lane is responsible for.
+	// An owner must have a goal that grants the actions needed to service each
+	// queue; this prevents a read-only monitor from becoming a silent sink.
+	Owns      []string `yaml:"owns,omitempty"`
+	Worktree  string   `yaml:"worktree,omitempty"`
+	Provider  string   `yaml:"provider,omitempty"`
+	Model     string   `yaml:"model,omitempty"`
+	Effort    string   `yaml:"effort,omitempty"`
+	TaskShape string   `yaml:"task_shape,omitempty"`
 	// FallbackModels are tried in order when Model probes unavailable
 	// (quota exhausted / no payment method). The first that probes healthy
 	// launches the lane, so a spent surface fails over instead of silently
@@ -481,6 +485,33 @@ func (c *Config) Validate() error {
 				return fmt.Errorf("lanes[%d]: duplicate standing owner for role %q (already owned by lane %q)", i, lane.Role, owner)
 			}
 			standingOwners[lane.Role] = lane.Name
+		}
+		if len(lane.Owns) > 0 {
+			if !lane.Standing {
+				return fmt.Errorf("lanes[%d]: queue owner %q must be a standing lane", i, lane.Name)
+			}
+			goal := strings.ToLower(strings.TrimSpace(lane.GoalTemplate))
+			if goal == "" {
+				return fmt.Errorf("lanes[%d]: standing queue owner %q is missing goal authority", i, lane.Name)
+			}
+			if strings.Contains(goal, "read-only") || strings.Contains(goal, "read only") {
+				return fmt.Errorf("lanes[%d]: standing queue owner %q has conflicting read-only goal authority", i, lane.Name)
+			}
+			for _, queue := range lane.Owns {
+				queue = strings.ToLower(strings.TrimSpace(queue))
+				if queue == "" {
+					return fmt.Errorf("lanes[%d]: queue owner %q declares an empty queue", i, lane.Name)
+				}
+				required := []string{"dispatch"}
+				if strings.Contains(queue, "review") {
+					required = append(required, "review")
+				}
+				for _, action := range required {
+					if !strings.Contains(goal, action) {
+						return fmt.Errorf("lanes[%d]: queue owner %q goal lacks %s authority for %q", i, lane.Name, action, queue)
+					}
+				}
+			}
 		}
 	}
 	return nil

@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -190,5 +191,34 @@ func TestLoadConfig_OnlyOneStandingOwnerAllowed(t *testing.T) {
 `)
 	if _, err := LoadConfig(cfgPath); err != nil {
 		t.Fatalf("expected valid config: only one lane claims the standing role, got error: %v", err)
+	}
+}
+
+func TestLoadConfig_QueueOwnerRequiresActionableGoal(t *testing.T) {
+	base := `
+version: "1"
+project: {name: "p", default_branch: "main"}
+task_provider: {type: "kaneo", project_id: "p"}
+lanes:
+  - name: "review-supervisor"
+    role: "review-supervisor"
+    standing: true
+    agent_kind: "claude"
+    model: "claude-sonnet-5"
+    prompt: ".herd/prompts/review-supervisor.md"
+    owns: ["review-queue"]
+`
+	if _, err := LoadConfig(writeConfig(t, base)); err == nil || !strings.Contains(err.Error(), "missing goal authority") {
+		t.Fatalf("missing queue-owner goal must fail closed, got %v", err)
+	}
+
+	readOnly := strings.Replace(base, `owns: ["review-queue"]`, "owns: [\"review-queue\"]\n    goal_template: \"read-only monitor\"", 1)
+	if _, err := LoadConfig(writeConfig(t, readOnly)); err == nil || !strings.Contains(err.Error(), "conflicting read-only") {
+		t.Fatalf("read-only queue-owner goal must fail loudly, got %v", err)
+	}
+
+	missingAction := strings.Replace(base, `owns: ["review-queue"]`, "owns: [\"review-queue\"]\n    goal_template: \"monitor the queue\"", 1)
+	if _, err := LoadConfig(writeConfig(t, missingAction)); err == nil || !strings.Contains(err.Error(), "lacks dispatch authority") {
+		t.Fatalf("non-actionable queue-owner goal must fail closed, got %v", err)
 	}
 }

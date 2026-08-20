@@ -1,6 +1,43 @@
 package standing
 
-import "testing"
+import (
+	"errors"
+	"strings"
+	"testing"
+)
+
+func TestValidateRefusedHandoffIsLoudAndActionable(t *testing.T) {
+	tests := []struct {
+		name      string
+		lane      string
+		handoff   string
+		authority string
+	}{
+		{name: "review harvest", lane: "forge-review-harvest-supervisor", handoff: "NEEDS_REVIEW sha-123", authority: "read-only monitor"},
+		{name: "verdict", lane: "forge-review-supervisor", handoff: "PASS sha-456", authority: "observation-only goal"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := ValidateRefusedHandoff(tc.lane, tc.handoff, tc.authority)
+			if err == nil || !errors.Is(err, ErrConfiguration) {
+				t.Fatalf("refusal error = %v, want configuration error", err)
+			}
+			for _, want := range []string{tc.lane, tc.handoff, tc.authority, "re-route or escalate"} {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("error %q missing %q", err, want)
+				}
+			}
+		})
+	}
+}
+
+func TestObserveRefusalCannotBecomeIdlePolling(t *testing.T) {
+	tracker := NewHandoffTracker()
+	observation, err := tracker.ObserveRefusal("forge-review-supervisor", "NEEDS_REVIEW sha-123", "read-only monitor")
+	if err == nil || observation.Lane != "forge-review-supervisor" || !observation.Progress {
+		t.Fatalf("refused handoff = observation=%+v err=%v; want recorded progress and hard error", observation, err)
+	}
+}
 
 func TestHandoffTrackerDetectsCosmeticRepeatedReportsAndKicksOnce(t *testing.T) {
 	tracker := NewHandoffTracker()
