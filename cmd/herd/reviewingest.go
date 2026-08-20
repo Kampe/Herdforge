@@ -23,6 +23,11 @@ import (
 // A bad verdict is indistinguishable from a good one once it lands, so every
 // refusal happens before the write.
 func runReviewIngest() {
+	repoRoot, err := filepath.Abs(".")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "herd review-ingest: resolve repository root: %v\n", err)
+		os.Exit(1)
+	}
 	parsed, err := parseReviewIngestArgs(os.Args[2:])
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "herd review-ingest: %v\n", err)
@@ -71,11 +76,15 @@ func runReviewIngest() {
 	coordinators["herdforge-orchestrator"] = struct{}{}
 
 	commitExists := func(sha string) bool {
-		return exec.Command("git", "rev-parse", "--verify", "-q", sha+"^{commit}").Run() == nil
+		cmd := exec.Command("git", "rev-parse", "--verify", "-q", sha+"^{commit}")
+		cmd.Dir = repoRoot
+		return cmd.Run() == nil
 	}
 
 	diffEmpty := func(sha string) (bool, error) {
-		out, err := exec.Command("git", "diff", "origin/main..."+sha).Output()
+		cmd := exec.Command("git", "diff", "origin/main..."+sha)
+		cmd.Dir = repoRoot
+		out, err := cmd.Output()
 		if err != nil {
 			return false, fmt.Errorf("git diff origin/main...%s: %w", sha[:min(12, len(sha))], err)
 		}
@@ -304,6 +313,11 @@ func admitVerdictAndMove(ledger reviewIngestLedger, opts reviewledger.IngestOpts
 // merge-complete would write. Binding comes from a recorded merge-admission
 // (--ref) or the explicit merge-admit fields.
 func runHarvestMerge() {
+	repoRoot, err := filepath.Abs(".")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "herd harvest-merge: resolve repository root: %v\n", err)
+		os.Exit(1)
+	}
 	fs := flag.NewFlagSet("harvest-merge", flag.ExitOnError)
 	branch := fs.String("branch", "", "Lane branch to harvest (required)")
 	title := fs.String("title", "", "PR title (required)")
@@ -403,7 +417,7 @@ func runHarvestMerge() {
 		os.Exit(1)
 	}
 
-	report, err := resolveHarvestCandidateWithReconstruction(*branch, *candidate, *reconstructedFrom, *contentProof)
+	report, err := resolveHarvestCandidateWithReconstructionAt(repoRoot, *branch, *candidate, *reconstructedFrom, *contentProof)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "herd harvest-merge: %v\n", err)
 		os.Exit(1)
@@ -483,8 +497,12 @@ func runHarvestMerge() {
 			fmt.Fprintf(os.Stderr, "herd harvest-merge: cleanup refused: %v\n", guardErr)
 			return
 		}
-		exec.Command("git", "worktree", "remove", "--force", "--", dir).Run()
-		exec.Command("git", "branch", "-D", "--", plan.TempBranch).Run()
+		removeCmd := exec.Command("git", "worktree", "remove", "--force", "--", dir)
+		removeCmd.Dir = repoRoot
+		_ = removeCmd.Run()
+		branchCmd := exec.Command("git", "branch", "-D", "--", plan.TempBranch)
+		branchCmd.Dir = repoRoot
+		_ = branchCmd.Run()
 	}
 
 	if err != nil {
@@ -518,11 +536,17 @@ func runHarvestMerge() {
 // when scoped mode is requested. Without a range it preserves the historical
 // branch-wide behavior, including its conflict self-abort gate.
 func harvestCommits(base, branch string, reviewed harvestmerge.CandidateRange) ([]string, error) {
+	repoRoot, err := filepath.Abs(".")
+	if err != nil {
+		return nil, fmt.Errorf("resolve repository root: %w", err)
+	}
 	cherryBase, target := base, branch
 	if reviewed.SHA != "" {
 		cherryBase, target = reviewed.Base, reviewed.SHA
 	}
-	cherry, err := exec.Command("git", "cherry", cherryBase, target).Output()
+	cmd := exec.Command("git", "cherry", cherryBase, target)
+	cmd.Dir = repoRoot
+	cherry, err := cmd.Output()
 	if err != nil {
 		return nil, fmt.Errorf("git cherry %s %s: %w", cherryBase, target, err)
 	}
@@ -546,7 +570,11 @@ type harvestCandidateReport struct {
 // permits an older reviewed ancestor, but still requires exact queue and
 // ledger evidence for that SHA.
 func resolveHarvestCandidate(branch, requested string) (harvestCandidateReport, error) {
-	return resolveHarvestCandidateWithReconstruction(branch, requested, "", "")
+	repoRoot, err := filepath.Abs(".")
+	if err != nil {
+		return harvestCandidateReport{}, fmt.Errorf("resolve repository root: %w", err)
+	}
+	return resolveHarvestCandidateWithReconstructionAt(repoRoot, branch, requested, "", "")
 }
 
 // resolveHarvestCandidateWithReconstruction preserves the normal ancestry
@@ -555,11 +583,22 @@ func resolveHarvestCandidate(branch, requested string) (harvestCandidateReport, 
 // a real commit reachable from the harvest branch. The substitution is only
 // accepted with a non-empty operator content-equality proof.
 func resolveHarvestCandidateWithReconstruction(branch, requested, reconstructedSHA, contentProof string) (harvestCandidateReport, error) {
+	repoRoot, err := filepath.Abs(".")
+	if err != nil {
+		return harvestCandidateReport{}, fmt.Errorf("resolve repository root: %w", err)
+	}
+	return resolveHarvestCandidateWithReconstructionAt(repoRoot, branch, requested, reconstructedSHA, contentProof)
+}
+
+func resolveHarvestCandidateWithReconstructionAt(repoRoot, branch, requested, reconstructedSHA, contentProof string) (harvestCandidateReport, error) {
+	var err error
 	branch = strings.TrimSpace(branch)
 	if branch == "" {
 		return harvestCandidateReport{}, fmt.Errorf("branch is required")
 	}
-	head, err := exec.Command("git", "rev-parse", "--verify", branch+"^{commit}").Output()
+	headCmd := exec.Command("git", "rev-parse", "--verify", branch+"^{commit}")
+	headCmd.Dir = repoRoot
+	head, err := headCmd.Output()
 	if err != nil {
 		return harvestCandidateReport{}, fmt.Errorf("cannot resolve %s: %w", branch, err)
 	}
@@ -568,7 +607,7 @@ func resolveHarvestCandidateWithReconstruction(branch, requested, reconstructedS
 		return harvestCandidateReport{}, fmt.Errorf("%s resolved to no commit", branch)
 	}
 
-	ledger, err := reviewledger.NewReviewLedger(".", filepath.Join(".herd", "review-ledger.jsonl"))
+	ledger, err := reviewledger.NewReviewLedger(repoRoot, filepath.Join(repoRoot, ".herd", "review-ledger.jsonl"))
 	if err != nil {
 		return harvestCandidateReport{}, fmt.Errorf("open review ledger: %w", err)
 	}
@@ -618,10 +657,14 @@ func resolveHarvestCandidateWithReconstruction(branch, requested, reconstructedS
 		if sha == "" {
 			return harvestCandidateReport{}, fmt.Errorf("--candidate is required with --reconstructed-from")
 		}
-		if _, err := exec.Command("git", "rev-parse", "--verify", reconstructedSHA+"^{commit}").Output(); err != nil {
+		reconstructedCmd := exec.Command("git", "rev-parse", "--verify", reconstructedSHA+"^{commit}")
+		reconstructedCmd.Dir = repoRoot
+		if _, err := reconstructedCmd.Output(); err != nil {
 			return harvestCandidateReport{}, fmt.Errorf("reconstructed harvest %s is not a commit: %w", reconstructedSHA, err)
 		}
-		if err := exec.Command("git", "merge-base", "--is-ancestor", reconstructedSHA, branch).Run(); err != nil {
+		ancestorCmd := exec.Command("git", "merge-base", "--is-ancestor", reconstructedSHA, branch)
+		ancestorCmd.Dir = repoRoot
+		if err := ancestorCmd.Run(); err != nil {
 			return harvestCandidateReport{}, fmt.Errorf("reconstructed harvest %s is not reachable from branch %s", reconstructedSHA, branch)
 		}
 	}
@@ -631,10 +674,14 @@ func resolveHarvestCandidateWithReconstruction(branch, requested, reconstructedS
 			return report, nil
 		}
 	} else if reconstructedSHA == "" {
-		if _, err := exec.Command("git", "rev-parse", "--verify", sha+"^{commit}").Output(); err != nil {
+		candidateCmd := exec.Command("git", "rev-parse", "--verify", sha+"^{commit}")
+		candidateCmd.Dir = repoRoot
+		if _, err := candidateCmd.Output(); err != nil {
 			return harvestCandidateReport{}, fmt.Errorf("candidate %s is not a commit: %w", sha, err)
 		}
-		if err := exec.Command("git", "merge-base", "--is-ancestor", sha, branch).Run(); err != nil {
+		ancestorCmd := exec.Command("git", "merge-base", "--is-ancestor", sha, branch)
+		ancestorCmd.Dir = repoRoot
+		if err := ancestorCmd.Run(); err != nil {
 			return harvestCandidateReport{}, fmt.Errorf("candidate %s is not reachable from branch %s", sha, branch)
 		}
 	}
@@ -658,11 +705,17 @@ func resolveHarvestCandidateWithReconstruction(branch, requested, reconstructedS
 // can run cleanup via a deferred function — os.Exit skips defers, which would
 // leak the worktree on exactly the failure paths where it matters most.
 func harvestBody(dir, base, tempBranch string, commits []string, allowMarkers bool, configuredUnionPaths ...[]string) error {
+	repoRoot, err := filepath.Abs(".")
+	if err != nil {
+		return fmt.Errorf("resolve repository root: %w", err)
+	}
 	unionConfig := harvestmerge.UnionMergeConfig{}
 	if len(configuredUnionPaths) > 0 {
 		unionConfig.Paths = configuredUnionPaths[0]
 	}
-	if out, addErr := exec.Command("git", "worktree", "add", "-B", tempBranch, "--", dir, base).CombinedOutput(); addErr != nil {
+	addCmd := exec.Command("git", "worktree", "add", "-B", tempBranch, "--", dir, base)
+	addCmd.Dir = repoRoot
+	if out, addErr := addCmd.CombinedOutput(); addErr != nil {
 		return fmt.Errorf("worktree add: %v: %s", addErr, out)
 	}
 	for _, c := range commits {

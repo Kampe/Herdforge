@@ -15,7 +15,8 @@ import (
 // reviewed candidate. Scoped mode must not select that history; the default
 // branch-wide mode must continue selecting it so harvestBody can self-abort.
 func TestHarvestCommitsCandidateRangeExcludesOutOfScopeHistory(t *testing.T) {
-	t.Chdir(t.TempDir())
+	root := t.TempDir()
+	t.Chdir(root)
 	gitCandidateTest(t, "init", "-q", "-b", "main")
 	gitCandidateTest(t, "config", "user.email", "test@example.com")
 	gitCandidateTest(t, "config", "user.name", "test")
@@ -70,7 +71,8 @@ func TestHarvestCommitsCandidateRangeExcludesOutOfScopeHistory(t *testing.T) {
 }
 
 func TestResolveHarvestCandidatePinsReviewedSHAAcrossTipDrift(t *testing.T) {
-	t.Chdir(t.TempDir())
+	root := t.TempDir()
+	t.Chdir(root)
 	gitCandidateTest(t, "init", "-q", "-b", "main")
 	gitCandidateTest(t, "config", "user.email", "test@example.com")
 	gitCandidateTest(t, "config", "user.name", "test")
@@ -87,7 +89,7 @@ func TestResolveHarvestCandidatePinsReviewedSHAAcrossTipDrift(t *testing.T) {
 	gitCandidateTest(t, "commit", "-q", "-m", "advanced")
 	advanced := gitCandidateOutput(t, "rev-parse", "HEAD")
 
-	l, err := reviewledger.NewReviewLedger(".", filepath.Join(".herd", "review-ledger.jsonl"))
+	l, err := reviewledger.NewReviewLedger(root, filepath.Join(root, ".herd", "review-ledger.jsonl"))
 	if err != nil {
 		t.Fatalf("open ledger: %v", err)
 	}
@@ -105,7 +107,7 @@ func TestResolveHarvestCandidatePinsReviewedSHAAcrossTipDrift(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := resolveHarvestCandidate("standing/lane", tt.requested)
+			got, err := resolveHarvestCandidateWithReconstructionAt(root, "standing/lane", tt.requested, "", "")
 			if err != nil {
 				t.Fatalf("resolve: %v", err)
 			}
@@ -119,14 +121,14 @@ func TestResolveHarvestCandidatePinsReviewedSHAAcrossTipDrift(t *testing.T) {
 	}
 
 	addCandidatePass(t, l, advanced, "standing/lane")
-	got, err := resolveHarvestCandidate("standing/lane", "")
+	got, err := resolveHarvestCandidateWithReconstructionAt(root, "standing/lane", "", "", "")
 	if err != nil {
 		t.Fatalf("resolve after fresh pass: %v", err)
 	}
 	if !got.Eligible || got.Pin.SHA != advanced || got.LastPassSHA != advanced {
 		t.Fatalf("fresh PASS did not admit exact new tip: %+v", got)
 	}
-	got, err = resolveHarvestCandidate("standing/lane", reviewed)
+	got, err = resolveHarvestCandidateWithReconstructionAt(root, "standing/lane", reviewed, "", "")
 	if err != nil {
 		t.Fatalf("resolve retained reviewed pin: %v", err)
 	}
@@ -136,7 +138,8 @@ func TestResolveHarvestCandidatePinsReviewedSHAAcrossTipDrift(t *testing.T) {
 }
 
 func TestResolveHarvestCandidateUsesCandidateSHAWhenQueueBranchIsReviewerTask(t *testing.T) {
-	t.Chdir(t.TempDir())
+	root := t.TempDir()
+	t.Chdir(root)
 	gitCandidateTest(t, "init", "-q", "-b", "main")
 	gitCandidateTest(t, "config", "user.email", "test@example.com")
 	gitCandidateTest(t, "config", "user.name", "test")
@@ -148,7 +151,7 @@ func TestResolveHarvestCandidateUsesCandidateSHAWhenQueueBranchIsReviewerTask(t 
 	gitCandidateTest(t, "commit", "-q", "-m", "reviewed")
 	reviewed := gitCandidateOutput(t, "rev-parse", "HEAD")
 
-	l, err := reviewledger.NewReviewLedger(".", filepath.Join(".herd", "review-ledger.jsonl"))
+	l, err := reviewledger.NewReviewLedger(root, filepath.Join(root, ".herd", "review-ledger.jsonl"))
 	if err != nil {
 		t.Fatalf("open ledger: %v", err)
 	}
@@ -166,7 +169,7 @@ func TestResolveHarvestCandidateUsesCandidateSHAWhenQueueBranchIsReviewerTask(t 
 		t.Fatalf("verdict: %v", err)
 	}
 
-	got, err := resolveHarvestCandidate("standing/nft-data-engineer", "")
+	got, err := resolveHarvestCandidateWithReconstructionAt(root, "standing/nft-data-engineer", "", "", "")
 	if err != nil {
 		t.Fatalf("resolve: %v", err)
 	}
@@ -176,7 +179,8 @@ func TestResolveHarvestCandidateUsesCandidateSHAWhenQueueBranchIsReviewerTask(t 
 }
 
 func TestResolveHarvestCandidateAcceptsAttestedReconstruction(t *testing.T) {
-	t.Chdir(t.TempDir())
+	root := t.TempDir()
+	t.Chdir(root)
 	gitCandidateTest(t, "init", "-q", "-b", "main")
 	gitCandidateTest(t, "config", "user.email", "test@example.com")
 	gitCandidateTest(t, "config", "user.name", "test")
@@ -194,16 +198,16 @@ func TestResolveHarvestCandidateAcceptsAttestedReconstruction(t *testing.T) {
 	reconstructed := gitCandidateOutput(t, "rev-parse", "HEAD")
 	gitCandidateTest(t, "branch", "-f", "standing/lane", reconstructed)
 
-	l, err := reviewledger.NewReviewLedger(".", filepath.Join(".herd", "review-ledger.jsonl"))
+	l, err := reviewledger.NewReviewLedger(root, filepath.Join(root, ".herd", "review-ledger.jsonl"))
 	if err != nil {
 		t.Fatalf("open ledger: %v", err)
 	}
 	addCandidatePass(t, l, reviewed, "standing/lane")
-	if _, err := resolveHarvestCandidate("standing/lane", reviewed); err == nil {
+	if _, err := resolveHarvestCandidateWithReconstructionAt(root, "standing/lane", reviewed, "", ""); err == nil {
 		t.Fatal("default candidate resolution must retain the ancestry refusal")
 	}
 
-	got, err := resolveHarvestCandidateWithReconstruction("standing/lane", reviewed, reconstructed, "reviewed content was reconstructed exactly")
+	got, err := resolveHarvestCandidateWithReconstructionAt(root, "standing/lane", reviewed, reconstructed, "reviewed content was reconstructed exactly")
 	if err != nil {
 		t.Fatalf("attested reconstruction: %v", err)
 	}

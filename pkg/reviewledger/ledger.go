@@ -59,7 +59,7 @@ func copyCoordSet(src map[string]struct{}) map[string]struct{} {
 }
 
 func (l *Ledger) nowISO() string {
-	return l.Now().UTC().Format(time.RFC3339)
+	return l.Now().UTC().Format(time.RFC3339Nano)
 }
 
 // appendRow writes a JSON row to the given file (append-only).
