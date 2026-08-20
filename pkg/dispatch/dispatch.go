@@ -1360,6 +1360,14 @@ func (d *Dispatcher) prepareConfinementOS(
 		realAgent = request.Decision.HarnessArgv[0]
 	}
 	// Optional extras (provider/argv0) for diagnostics only — harness is mandatory.
+	extraNames := []string{request.Decision.Provider, request.Decision.Argv[0]}
+	// Builder lanes must not be able to route around the review supervisor from
+	// their shell. These wrappers are installed in the same frozen,
+	// coordinator-owned PATH directory as the harness wrapper, so gh/git resolve
+	// through the structural command gate rather than prompt prose.
+	if request.Decision.Role == router.RoleWorker || request.Decision.Role == router.RoleForgeSmith || request.Decision.Role == router.RoleRecovery {
+		extraNames = append(extraNames, "gh", "git")
+	}
 	prep, err := enf.PrepareOS(
 		wtInfo.Path,
 		d.Worktree.RepoRoot(),
@@ -1368,8 +1376,7 @@ func (d *Dispatcher) prepareConfinementOS(
 		branch,
 		harness,
 		realAgent,
-		request.Decision.Provider,
-		request.Decision.Argv[0],
+		extraNames...,
 	)
 	if err != nil {
 		return nil, nil, err

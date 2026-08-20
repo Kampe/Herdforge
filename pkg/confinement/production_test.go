@@ -434,6 +434,38 @@ func TestWrapperNamesIncludesHarnessFirst(t *testing.T) {
 	}
 }
 
+func TestBuilderCommandWrapperBlocksReviewBypass(t *testing.T) {
+	profile := "/private/tmp/profile.sb"
+	digest := "digest"
+	for name, want := range map[string]string{
+		"gh":  "builder lane: gh pr merge/close is coordinator-only",
+		"git": "builder lane: direct push to the default branch is coordinator-only",
+	} {
+		t.Run(name, func(t *testing.T) {
+			script := wrapperScript(profile, digest, "/usr/bin/"+name, false)
+			if !strings.Contains(script, want) {
+				t.Fatalf("%s wrapper does not carry builder denial: %q", name, want)
+			}
+			if !strings.Contains(script, "${0##*/}") {
+				t.Fatalf("%s wrapper does not bind policy to resolved command name", name)
+			}
+		})
+	}
+}
+
+func TestBuilderWrapperNamesAreDistinctAndIncludeCommandGates(t *testing.T) {
+	names := WrapperNames("codex", "codex", "gh", "git")
+	want := []string{"codex", "gh", "git"}
+	if len(names) != len(want) {
+		t.Fatalf("names=%v, want %v", names, want)
+	}
+	for i := range want {
+		if names[i] != want[i] {
+			t.Fatalf("names[%d]=%q, want %q", i, names[i], want[i])
+		}
+	}
+}
+
 func TestVerifyAgentWrappersDetectsSwap(t *testing.T) {
 	issuer, err := NewHMACIssuer([]byte("secret"))
 	if err != nil {
