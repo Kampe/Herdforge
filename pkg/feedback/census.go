@@ -483,14 +483,11 @@ func Run(ctx context.Context, opts Options) error {
 		}
 	}
 
+	// Use the configured/default name only to inspect an outstanding census.
+	// Before opening a new one, resolve and validate it against the live roster.
 	coordinator := strings.TrimSpace(opts.Coordinator)
 	if coordinator == "" {
-		if agents, err := opts.ListAgents(); err == nil {
-			coordinator = CoordinatorTarget(agents, workspace)
-		}
-		if coordinator == "" {
-			coordinator = DefaultCoordinator
-		}
+		coordinator = DefaultCoordinator
 	}
 
 	if err := os.MkdirAll(opts.StateDir, 0o700); err != nil {
@@ -556,8 +553,12 @@ func Run(ctx context.Context, opts Options) error {
 	// never fail the whole command) and retry the request on the next tick.
 	agents, err := opts.ListAgents()
 	if err != nil {
-		fmt.Fprintf(opts.Stderr, "herd-feedback: WARN agent list unavailable, not opening a new census this cycle: %v\n", err)
-		return nil
+		return fmt.Errorf("herd-feedback: list agents for coordinator: %w", err)
+	}
+	coordinator, err = resolveCoordinatorTarget(agents, workspace, opts.Coordinator)
+	if err != nil {
+		fmt.Fprintf(opts.Stderr, "herd-feedback: refusing census: %v\n", err)
+		return err
 	}
 
 	durableMail := opts.DurableMail

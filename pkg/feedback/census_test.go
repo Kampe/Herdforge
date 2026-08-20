@@ -223,7 +223,7 @@ func TestRunOpensCensusWhenDue(t *testing.T) {
 			return []herdr.AgentEntry{
 				{Name: "smith", Workspace: "wF", Status: "idle"},
 				{Name: "scout", Workspace: "wF", Status: "working"},
-				{Name: "coordinator-1", Workspace: "wF", Status: "idle"},
+				{Name: "coordinator-1", Workspace: "wF", Status: "idle", PaneID: "coordinator-pane"},
 				{Name: "other-workspace-lane", Workspace: "wOther", Status: "idle"},
 			}, nil
 		},
@@ -260,6 +260,7 @@ func TestRunCensusDedupesRotatedStandingIdentity(t *testing.T) {
 		Workspace: "wF", Coordinator: "coordinator-1", Now: fixedNow(now),
 		ListAgents: func() ([]herdr.AgentEntry, error) {
 			return []herdr.AgentEntry{
+				{Name: "coordinator-1", Workspace: "wF", Status: "idle", PaneID: "coordinator-pane"},
 				{Name: "standing-reviewer", Workspace: "wF", TabID: "tab", PaneID: "pane", Session: herdr.AgentSession{Value: "old-session"}},
 				{Name: "standing-reviewer", Workspace: "wF", TabID: "tab", PaneID: "pane", Session: herdr.AgentSession{Value: "new-session"}},
 			}, nil
@@ -375,6 +376,49 @@ func TestRunWorkspaceUnresolvedRefusesFalseEmptyCensus(t *testing.T) {
 	}
 }
 
+func TestRunRefusesWhenNoLiveCoordinatorExists(t *testing.T) {
+	var stderr bytes.Buffer
+	opts := Options{
+		StateDir: t.TempDir(), MailDir: t.TempDir(), Workspace: "wF",
+		AdmissionGate: func(context.Context) error { return nil },
+		ListAgents: func() ([]herdr.AgentEntry, error) {
+			return []herdr.AgentEntry{{Name: "coordinator", Workspace: "wF", Status: "done", PaneID: "retired"}}, nil
+		},
+		Stderr: &stderr,
+	}
+	if err := Run(context.Background(), opts); err == nil {
+		t.Fatal("Run() must refuse a census without a live coordinator")
+	}
+	if !strings.Contains(stderr.String(), "no live coordinator") {
+		t.Fatalf("stderr = %q, want no-live-coordinator diagnostic", stderr.String())
+	}
+}
+
+func TestRunRejectsExplicitDeadCoordinator(t *testing.T) {
+	opts := Options{
+		StateDir: t.TempDir(), MailDir: t.TempDir(), Workspace: "wF", Coordinator: "coordinator",
+		AdmissionGate: func(context.Context) error { return nil },
+		ListAgents: func() ([]herdr.AgentEntry, error) {
+			return []herdr.AgentEntry{{Name: "coordinator", Workspace: "wF", Status: "done", PaneID: "retired"}}, nil
+		},
+	}
+	if err := Run(context.Background(), opts); err == nil {
+		t.Fatal("Run() must reject an explicitly supplied dead coordinator")
+	}
+}
+
+func TestRunPropagatesCoordinatorAgentListError(t *testing.T) {
+	sentinel := errors.New("agent inventory unavailable")
+	opts := Options{
+		StateDir: t.TempDir(), MailDir: t.TempDir(), Workspace: "wF",
+		AdmissionGate: func(context.Context) error { return nil },
+		ListAgents:    func() ([]herdr.AgentEntry, error) { return nil, sentinel },
+	}
+	if err := Run(context.Background(), opts); !errors.Is(err, sentinel) {
+		t.Fatalf("Run() error = %v, want %v", err, sentinel)
+	}
+}
+
 func TestRunAdmissionGateRejectionSkipsNewCensusWithoutError(t *testing.T) {
 	now := time.Unix(1_800_000_000, 0).UTC()
 	stateDir := t.TempDir()
@@ -417,7 +461,10 @@ func TestRunDefaultAdmissionGateHonorsRealWinddownState(t *testing.T) {
 		Interval: 1800, Grace: 600, StateDir: stateDir, MailDir: t.TempDir(),
 		Workspace: "wF", Coordinator: "coordinator-1", Now: fixedNow(now),
 		ListAgents: func() ([]herdr.AgentEntry, error) {
-			return []herdr.AgentEntry{{Name: "smith", Workspace: "wF", Status: "idle"}}, nil
+			return []herdr.AgentEntry{
+				{Name: "coordinator-1", Workspace: "wF", Status: "idle", PaneID: "coordinator-pane"},
+				{Name: "smith", Workspace: "wF", Status: "idle"},
+			}, nil
 		},
 		DurableMail: func(ctx context.Context, to, summary, body string) error { sent = append(sent, to); return nil },
 		// Kept hermetic: no real herdr wake call from a unit test.
@@ -470,11 +517,11 @@ func TestRunAgentListFailureSkipsCycleRatherThanOpeningFalseEmptyCensus(t *testi
 		ListAgents:    func() ([]herdr.AgentEntry, error) { return nil, sentinel },
 		Stderr:        &stderr,
 	}
-	if err := Run(context.Background(), opts); err != nil {
-		t.Fatalf("Run() = %v, want nil (a failing herdr must not fail the command)", err)
+	if err := Run(context.Background(), opts); !errors.Is(err, sentinel) {
+		t.Fatalf("Run() error = %v, want %v", err, sentinel)
 	}
-	if !strings.Contains(stderr.String(), "herd-feedback: WARN agent list unavailable") {
-		t.Fatalf("stderr missing the agent-list warning: %s", stderr.String())
+	if strings.Contains(stderr.String(), "WARN agent list unavailable") {
+		t.Fatalf("stderr retained the swallowed agent-list warning: %s", stderr.String())
 	}
 	if _, err := os.Stat(StatePath(stateDir)); !os.IsNotExist(err) {
 		t.Fatalf("a failed enumeration must not persist a false empty census, stat err=%v", err)
