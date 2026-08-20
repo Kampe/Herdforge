@@ -213,7 +213,7 @@ func TestRepeatedRaiseProducesOneOwner(t *testing.T) {
 		if repository == "" {
 			return errors.New("repository required")
 		}
-		live[agentName] = Agent{Name: agentName, Status: "idle", TabID: tab.ID, PaneID: tab.PaneID, Cwd: tab.Cwd}
+		live[agentName] = Agent{Name: agentName, Status: "idle", TabID: tab.ID, PaneID: tab.PaneID, Workspace: "wTEST", Cwd: tab.Cwd}
 		return nil
 	}
 	opts.PromptAgent = func(agentName, text string) error {
@@ -271,7 +271,7 @@ func TestRaiseRefreshesDurableGoalForLiveLane(t *testing.T) {
 	repo, cfg := standingFixture(t)
 	cfg.Lanes[0].GoalTemplate = "first policy for {{role}}"
 	t.Chdir(repo)
-	live := map[string]Agent{"forge-orch": {Name: "forge-orch", Status: "idle", Cwd: filepath.Join(repo, ".worktrees", "orch")}}
+	live := map[string]Agent{"forge-orch": {Name: "forge-orch", Status: "idle", Workspace: "wTEST", Cwd: filepath.Join(repo, ".worktrees", "orch")}}
 	var goals []string
 	opts := baseOpts(t, repo)
 	opts.Mode = ModeRaise
@@ -480,7 +480,7 @@ func TestStatusReportsLiveAndMissing(t *testing.T) {
 	opts.Mode = ModeStatus
 	opts.ListAgents = func() ([]Agent, error) {
 		return []Agent{
-			{Name: "forge-orch", Status: "idle", TabID: "t1", PaneID: "p1", Cwd: filepath.Join(repo, ".worktrees", "orch")},
+			{Name: "forge-orch", Status: "idle", TabID: "t1", PaneID: "p1", Workspace: "wTEST", Cwd: filepath.Join(repo, ".worktrees", "orch")},
 			// harvest missing
 			{Name: "forge-worker", Status: "working", TabID: "t9"}, // ephemeral — ignored
 		}, nil
@@ -500,6 +500,63 @@ func TestStatusReportsLiveAndMissing(t *testing.T) {
 	}
 }
 
+func TestStatusScopesSameNamedAgentsToWorkspaceAndRepository(t *testing.T) {
+	repo, cfg := standingFixture(t)
+	t.Chdir(repo)
+	opts := baseOpts(t, repo)
+	opts.Mode = ModeStatus
+	opts.Only = []string{"orch"}
+	foreignRepo := t.TempDir()
+	foreignCWD := filepath.Join(foreignRepo, "worktree")
+	if err := os.MkdirAll(foreignCWD, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	authorizedCWD := filepath.Join(repo, ".worktrees", "orch")
+	opts.ListAgents = func() ([]Agent, error) {
+		return []Agent{
+			{Name: "forge-orch", Status: "idle", Workspace: "other-workspace", Cwd: authorizedCWD},
+			{Name: "forge-orch", Status: "idle", Workspace: "wTEST", Cwd: foreignCWD},
+			{Name: "forge-orch", Status: "idle", Workspace: "wTEST", Cwd: authorizedCWD},
+		}, nil
+	}
+	r, err := Run(cfg, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.Live != 1 || r.Missing != 0 {
+		t.Fatalf("authorized same-name agent should be selected: %+v", r)
+	}
+	if got := r.Roles[0].CWD; filepath.Clean(got) != filepath.Clean(authorizedCWD) {
+		t.Fatalf("selected cwd=%q want %q", got, authorizedCWD)
+	}
+}
+
+func TestRaiseTreatsUnauthorizedSameNamedAgentAsMissing(t *testing.T) {
+	repo, cfg := standingFixture(t)
+	t.Chdir(repo)
+	foreignRepo := t.TempDir()
+	creates := 0
+	opts := baseOpts(t, repo)
+	opts.Mode = ModeRaise
+	opts.Only = []string{"orch"}
+	opts.ListAgents = func() ([]Agent, error) {
+		return []Agent{{Name: "forge-orch", Status: "idle", Workspace: "other-workspace", Cwd: filepath.Join(foreignRepo, "orch")}}, nil
+	}
+	opts.CreateTab = func(_, label, cwd string) (Tab, error) {
+		creates++
+		return Tab{ID: "t-" + label, Label: label, PaneID: "p-" + label, Cwd: cwd}, nil
+	}
+	opts.StartAgent = func(Tab, string, Route, *config.LaneDef, string) error { return nil }
+	opts.PromptAgent = func(string, string) error { return nil }
+	r, err := Run(cfg, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if creates != 1 || r.Raised != 1 || r.Skipped != 0 {
+		t.Fatalf("foreign same-name agent must not suppress raise: creates=%d result=%+v", creates, r)
+	}
+}
+
 // TestStatusReportsUnraiseableWhenHarnessMissing proves --status distinguishes
 // "not raised" (could be raised, just isn't) from "cannot be raised on this
 // host" (harness binary missing). When HarnessPresent returns false, missing
@@ -512,7 +569,7 @@ func TestStatusReportsUnraiseableWhenHarnessMissing(t *testing.T) {
 	opts.HarnessPresent = func(harness string) bool { return false }
 	opts.ListAgents = func() ([]Agent, error) {
 		return []Agent{
-			{Name: "forge-orch", Status: "idle", TabID: "t1", PaneID: "p1", Cwd: filepath.Join(repo, ".worktrees", "orch")},
+			{Name: "forge-orch", Status: "idle", TabID: "t1", PaneID: "p1", Workspace: "wTEST", Cwd: filepath.Join(repo, ".worktrees", "orch")},
 		}, nil
 	}
 	r, err := Run(cfg, opts)
@@ -557,7 +614,7 @@ func TestStatusReportsMissingWhenHarnessPresent(t *testing.T) {
 	opts.HarnessPresent = func(harness string) bool { return true }
 	opts.ListAgents = func() ([]Agent, error) {
 		return []Agent{
-			{Name: "forge-orch", Status: "idle", TabID: "t1", PaneID: "p1", Cwd: filepath.Join(repo, ".worktrees", "orch")},
+			{Name: "forge-orch", Status: "idle", TabID: "t1", PaneID: "p1", Workspace: "wTEST", Cwd: filepath.Join(repo, ".worktrees", "orch")},
 		}, nil
 	}
 	r, err := Run(cfg, opts)
@@ -583,8 +640,8 @@ func TestShutdownTouchesOnlyStanding(t *testing.T) {
 	opts.Mode = ModeShutdown
 	opts.ListAgents = func() ([]Agent, error) {
 		return []Agent{
-			{Name: "forge-orch", Status: "idle", TabID: "t-orch", PaneID: "p-orch"},
-			{Name: "forge-harvest", Status: "working", TabID: "t-harv", PaneID: "p-harv"},
+			{Name: "forge-orch", Status: "idle", TabID: "t-orch", PaneID: "p-orch", Workspace: "wTEST", Cwd: filepath.Join(repo, ".worktrees", "orch")},
+			{Name: "forge-harvest", Status: "working", TabID: "t-harv", PaneID: "p-harv", Workspace: "wTEST", Cwd: filepath.Join(repo, ".worktrees", "harvest")},
 			{Name: "forge-worker", Status: "idle", TabID: "t-worker", PaneID: "p-worker"},
 			{Name: "task-fac-1", Status: "idle", TabID: "t-task", PaneID: "p-task"},
 		}, nil
@@ -683,7 +740,7 @@ func TestNameHeldGateIsNonVacuous(t *testing.T) {
 	opts.ListAgents = func() ([]Agent, error) {
 		// Name present but status not held — must re-attempt raise (or still
 		// try create). Shell skips only NameHeld statuses.
-		return []Agent{{Name: "forge-orch", Status: "unknown", TabID: "t0"}}, nil
+		return []Agent{{Name: "forge-orch", Status: "unknown", TabID: "t0", Workspace: "wTEST", Cwd: filepath.Join(repo, ".worktrees", "orch")}}, nil
 	}
 	opts.CreateTab = func(_, label, cwd string) (Tab, error) {
 		creates++

@@ -350,15 +350,49 @@ func defaultPromptReadable(path string) error {
 	return nil
 }
 
-// indexAgents maps name -> Agent for O(1) live lookups.
-func indexAgents(agents []Agent) map[string]Agent {
+// indexAgents maps only authorized agents to name -> Agent for O(1) live
+// lookups. Agent names are fleet-global, so name alone is not an identity:
+// the live record must belong to the resolved workspace and its cwd must be
+// inside the repository being operated.
+func indexAgents(agents []Agent, workspace, repoRoot string) map[string]Agent {
 	idx := make(map[string]Agent, len(agents))
 	for _, a := range agents {
-		if a.Name != "" {
+		if a.Name != "" && authorizedAgent(a, workspace, repoRoot) {
 			idx[a.Name] = a
 		}
 	}
 	return idx
+}
+
+func authorizedAgent(agent Agent, workspace, repoRoot string) bool {
+	workspace = strings.TrimSpace(workspace)
+	if workspace == "" || strings.TrimSpace(agent.Workspace) != workspace || strings.TrimSpace(agent.Cwd) == "" {
+		return false
+	}
+	return pathWithin(repoRoot, agent.Cwd)
+}
+
+func pathWithin(root, candidate string) bool {
+	rootAbs, err := filepath.Abs(root)
+	if err != nil {
+		return false
+	}
+	candidateAbs, err := filepath.Abs(candidate)
+	if err != nil {
+		return false
+	}
+	// Resolve existing symlinks so a worktree cannot escape through an alias.
+	if resolved, resolveErr := filepath.EvalSymlinks(rootAbs); resolveErr == nil {
+		rootAbs = resolved
+	}
+	if resolved, resolveErr := filepath.EvalSymlinks(candidateAbs); resolveErr == nil {
+		candidateAbs = resolved
+	}
+	rel, err := filepath.Rel(filepath.Clean(rootAbs), filepath.Clean(candidateAbs))
+	if err != nil {
+		return false
+	}
+	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) && rel != ""
 }
 
 // Run executes standing raise/status/shutdown/dry-run against cfg.
@@ -397,17 +431,18 @@ func Run(cfg *config.Config, opts Options) (*Result, error) {
 		if err != nil {
 			return nil, fmt.Errorf("standing: list agents: %w", err)
 		}
-		live := indexAgents(agents)
-		if opts.ResolveWorkspace != nil {
-			ws, wsErr := opts.ResolveWorkspace(repoRoot, cfg)
-			if wsErr != nil {
-				return nil, fmt.Errorf("standing: workspace: %w", wsErr)
-			}
-			if strings.TrimSpace(ws) == "" {
-				return nil, errors.New("standing: workspace resolution returned empty id")
-			}
-			result.Workspace = ws
+		if opts.ResolveWorkspace == nil {
+			return nil, errors.New("standing: workspace resolver is required")
 		}
+		ws, wsErr := opts.ResolveWorkspace(repoRoot, cfg)
+		if wsErr != nil {
+			return nil, fmt.Errorf("standing: workspace: %w", wsErr)
+		}
+		if strings.TrimSpace(ws) == "" {
+			return nil, errors.New("standing: workspace resolution returned empty id")
+		}
+		result.Workspace = strings.TrimSpace(ws)
+		live := indexAgents(agents, result.Workspace, repoRoot)
 		if opts.Mode == ModeStatus {
 			return runStatus(result, lanes, live, repoRoot, opts)
 		}
@@ -568,7 +603,18 @@ func runRaise(result *Result, cfg *config.Config, lanes []config.LaneDef, repoRo
 		if err != nil {
 			return fmt.Errorf("standing: list agents: %w", err)
 		}
-		live = indexAgents(agents)
+		if opts.ResolveWorkspace == nil {
+			return errors.New("standing: workspace resolver is required")
+		}
+		ws, wsErr := opts.ResolveWorkspace(repoRoot, cfg)
+		if wsErr != nil {
+			return fmt.Errorf("standing: workspace: %w", wsErr)
+		}
+		if strings.TrimSpace(ws) == "" {
+			return errors.New("standing: workspace resolution returned empty id")
+		}
+		result.Workspace = strings.TrimSpace(ws)
+		live = indexAgents(agents, result.Workspace, repoRoot)
 		liveLoaded = true
 		return nil
 	}
