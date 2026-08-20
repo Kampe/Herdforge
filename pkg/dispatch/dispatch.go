@@ -28,6 +28,7 @@ import (
 	"github.com/Kampe/Herdforge/pkg/runstate"
 	"github.com/Kampe/Herdforge/pkg/scopefence"
 	"github.com/Kampe/Herdforge/pkg/security"
+	"github.com/Kampe/Herdforge/pkg/standing"
 	"github.com/Kampe/Herdforge/pkg/toolchild"
 	"github.com/Kampe/Herdforge/pkg/toolprobe"
 	"github.com/Kampe/Herdforge/pkg/worktree"
@@ -419,17 +420,28 @@ func (d *Dispatcher) coordinatorName() string {
 }
 
 func (d *Dispatcher) reviewSupervisorName() string {
+	laneName := "review-supervisor"
 	if d.Config == nil {
-		return "review-supervisor"
+		return standing.AgentName(laneName)
 	}
 	for _, role := range []string{"review-supervisor", "review_harvest_supervisor", "harvest-supervisor", "reviewer", "harvest"} {
 		for _, lane := range d.Config.Lanes {
 			if strings.ToLower(strings.TrimSpace(lane.Role)) == role && strings.TrimSpace(lane.Name) != "" {
-				return "forge-" + strings.TrimSpace(lane.Name)
+				laneName = strings.TrimSpace(lane.Name)
+				goto resolved
 			}
 		}
 	}
-	return "review-supervisor"
+
+resolved:
+	// Builder packets contain a delivery address, not a configured role
+	// reference. Standing lanes are repository-qualified in Herdr, so use the
+	// same live identity here as direct review handoffs do. Test/non-production
+	// dispatchers retain the legacy name only when identity resolution fails.
+	if repository, err := d.repositoryIdentity(); err == nil {
+		return standing.AgentNameForRepository(laneName, repository)
+	}
+	return standing.AgentName(laneName)
 }
 
 type ScopeAdmission interface {

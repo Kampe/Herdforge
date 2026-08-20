@@ -18,6 +18,7 @@ import (
 	"github.com/Kampe/Herdforge/pkg/recovery"
 	"github.com/Kampe/Herdforge/pkg/runstate"
 	"github.com/Kampe/Herdforge/pkg/scopefence"
+	"github.com/Kampe/Herdforge/pkg/standing"
 	"github.com/Kampe/Herdforge/pkg/worktree"
 	"github.com/Kampe/Herdforge/pkg/worktreebootstrap"
 )
@@ -52,8 +53,13 @@ func TestReviewSupervisorNamePrefersStandingSupervisorOverAssayer(t *testing.T) 
 		{Name: "review-supervisor", Role: "review-supervisor"},
 	}}}
 
-	if got := d.reviewSupervisorName(); got != "forge-review-supervisor" {
-		t.Fatalf("review supervisor name = %q, want forge-review-supervisor", got)
+	repository, err := d.repositoryIdentity()
+	if err != nil {
+		t.Fatalf("repository identity: %v", err)
+	}
+	want := standing.AgentNameForRepository("review-supervisor", repository)
+	if got := d.reviewSupervisorName(); got != want {
+		t.Fatalf("review supervisor name = %q, want %q", got, want)
 	}
 }
 
