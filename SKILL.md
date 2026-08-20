@@ -57,18 +57,22 @@ herd approve FAC-123
 herd board-done FAC-123
 ```
 
-The `herd review --pool <ref>` path uses a filesystem worktree convention,
-not a Kaneo provenance lookup. `<ref>` must be a bare ticket-style identifier
-(for example `FAC-123`); paths and path separators are rejected. The ref is
-resolved case-insensitively to the existing candidate directory
-`.herd/worktrees/<lowercase-ref>`, so the command fails if that worktree is
-missing. In normal dispatch flow, `herd dispatch <ticket>` creates this
-directory, which can make the requirement look like a board binding, but the
-pool review code only checks the worktree and candidate commit.
+The `herd review --pool <ref>` path does not perform a Kaneo provenance lookup.
+It accepts either an existing ticket ref or a real Git branch name. A bare
+ticket-style ref (for example `FAC-123`) is resolved case-insensitively to the
+candidate directory `.herd/worktrees/<lowercase-ref>`, preserving the normal
+`herd dispatch <ticket>` flow. If that ticket worktree is not present, a real
+branch name—including names with `/`—is resolved through Git's checked-out
+worktree metadata and branch verification. Branch names are looked up as Git
+data, not appended to a filesystem path, so a slash is not treated as path
+traversal. The command still requires the resolved candidate worktree and
+candidate commit to exist.
 
-For un-ticketed work discovered outside the normal dispatch flow, mint or
-assign the ticket first, then make the existing branch available at the
-required path before starting review. For example, from the repository root:
+For un-ticketed work discovered outside the normal dispatch flow, no ticket is
+required: run the pool review with the branch name already checked out in its
+worktree. If you want the conventional ticket workflow instead, mint or assign
+the ticket and make the existing branch available at the required path before
+starting review. For example, from the repository root:
 
 ```bash
 git worktree add .herd/worktrees/fac-123 <existing-branch>
@@ -78,8 +82,10 @@ herd review --pool FAC-123
 If `<existing-branch>` is already checked out in another worktree, move or
 rename that ad hoc worktree first (or otherwise release the branch), then run
 `git worktree add` with the required `.herd/worktrees/<lowercase-ref>` path.
-The pool review command does not mint the ticket, locate an arbitrary branch,
-or validate a candidate SHA against a task card.
+Alternatively, pass the existing branch name directly, such as
+`herd review --pool goal/review`. The pool review command does not mint a
+ticket, locate an arbitrary unregistered path, or validate a candidate SHA
+against a task card.
 
 ### Durable goal guard
 

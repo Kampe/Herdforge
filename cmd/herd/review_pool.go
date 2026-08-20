@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"flag"
@@ -21,9 +22,6 @@ func runPoolReview(ref string) error {
 	if strings.TrimSpace(ref) == "" {
 		return errors.New("candidate ref is required (usage: herd review <ref> --pool)")
 	}
-	if filepath.Base(ref) != ref || strings.ContainsAny(ref, `/\\`) {
-		return fmt.Errorf("candidate ref %q must be a ticket identifier, not a path", ref)
-	}
 	fs := flag.NewFlagSet("review --pool", flag.ContinueOnError)
 	shaFlag := fs.String("sha", "", "Exact candidate commit (default: HEAD of .herd/worktrees/<ref>)")
 	model := fs.String("model", "litellm/ollama/glm-5.2:cloud", "Persistent OpenCode model")
@@ -38,9 +36,9 @@ func runPoolReview(ref string) error {
 		ref = fs.Arg(0)
 	}
 	root := firstEnv("HERD_ROOT", "HERD_REPO_ROOT", ".")
-	candidateDir := worktreePathForRef(ref)
-	if !worktreeExists(candidateDir) {
-		return fmt.Errorf("candidate worktree %q does not exist", candidateDir)
+	candidateDir, err := resolvePoolReviewCandidate(root, ref)
+	if err != nil {
+		return err
 	}
 	sha := strings.TrimSpace(*shaFlag)
 	if sha == "" {
@@ -61,7 +59,7 @@ func runPoolReview(ref string) error {
 	if err := p.Ensure(context.Background()); err != nil {
 		return err
 	}
-	lease, err := p.Lease(context.Background(), "review-"+ref+"-"+shortSHA(sha))
+	lease, err := p.Lease(context.Background(), "review-"+safeReviewSurfacePart(ref)+"-"+shortSHA(sha))
 	if err != nil {
 		return err
 	}
@@ -137,6 +135,75 @@ func runPoolReview(ref string) error {
 	releaseOnFailure = false
 	fmt.Printf("reviewer launched ref=%s sha=%s lease=%s surface=%s tab=%s packet=%s\n", ref, shortSHA(sha), lease.LeaseID, surface, tabLabel, packet)
 	return nil
+}
+
+// resolvePoolReviewCandidate first preserves the dispatched ticket convention,
+// then resolves a real checked-out branch from Git's worktree metadata. Branch
+// names are data passed to Git, never path fragments appended to the repo root.
+func resolvePoolReviewCandidate(root, ref string) (string, error) {
+	if filepath.Base(ref) == ref && !strings.ContainsAny(ref, `/\\`) {
+		candidateDir := filepath.Join(root, worktreePathForRef(ref))
+		if worktreeExists(candidateDir) {
+			return candidateDir, nil
+		}
+	}
+
+	branchPath, err := checkedOutBranchWorktree(root, ref)
+	if err != nil {
+		return "", err
+	}
+	if branchPath != "" {
+		return branchPath, nil
+	}
+	if filepath.Base(ref) != ref || strings.ContainsAny(ref, `/\\`) {
+		return "", fmt.Errorf("candidate branch %q is not checked out in a worktree", ref)
+	}
+	return "", fmt.Errorf("candidate worktree %q does not exist", filepath.Join(root, worktreePathForRef(ref)))
+}
+
+func checkedOutBranchWorktree(root, ref string) (string, error) {
+	branchRef := "refs/heads/" + ref
+	if _, err := exec.Command("git", "-C", root, "rev-parse", "--verify", branchRef+"^{commit}").Output(); err != nil {
+		return "", nil
+	}
+	out, err := exec.Command("git", "-C", root, "worktree", "list", "--porcelain").Output()
+	if err != nil {
+		return "", fmt.Errorf("list Git worktrees: %w", err)
+	}
+
+	var path, branch string
+	match := func() string {
+		if branch == branchRef && worktreeExists(path) {
+			return path
+		}
+		return ""
+	}
+	reset := func() {
+		path = ""
+		branch = ""
+	}
+	scanner := bufio.NewScanner(strings.NewReader(string(out)))
+	for scanner.Scan() {
+		line := scanner.Text()
+		switch {
+		case strings.HasPrefix(line, "worktree "):
+			path = strings.TrimPrefix(line, "worktree ")
+		case strings.HasPrefix(line, "branch "):
+			branch = strings.TrimPrefix(line, "branch ")
+		case line == "":
+			if matched := match(); matched != "" {
+				return matched, nil
+			}
+			reset()
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return "", fmt.Errorf("read Git worktrees: %w", err)
+	}
+	if matched := match(); matched != "" {
+		return matched, nil
+	}
+	return "", nil
 }
 
 func safeReviewSurfacePart(ref string) string {
