@@ -199,7 +199,7 @@ func TestStopCLIMakesWinddownDurableAndDestroysNoWork(t *testing.T) {
 			t.Fatalf("stop invoked an unexpected herdr command: %q\nlog:\n%s", line, log)
 		}
 	}
-	if !strings.Contains(string(log), "agent prompt p1") {
+	if !strings.Contains(string(log), "agent prompt smith") {
 		t.Fatalf("no stop request was delivered: %s", log)
 	}
 }
