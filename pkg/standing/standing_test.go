@@ -611,20 +611,28 @@ func TestRaiseTreatsUnauthorizedSameNamedAgentAsMissing(t *testing.T) {
 func TestIndexAgentsFailsClosedOnDuplicateAuthorizedIdentity(t *testing.T) {
 	repo, _ := standingFixture(t)
 	cwd := filepath.Join(repo, ".worktrees", "orch")
+	// FAC-503: indexAgents now RETAINS same-named candidates so a lane's own
+	// configured cwd can disambiguate them. The fail-closed guarantee moved to
+	// standingAgent: an ambiguity it cannot resolve is refused, never decided
+	// by list order.
 	got := indexAgents([]Agent{
 		{Name: "forge-orch", Status: "idle", Workspace: "wTEST", Cwd: cwd},
 		{Name: "forge-orch", Status: "working", Workspace: "wTEST", Cwd: cwd},
 	}, "wTEST", repo)
-	if _, ok := got["forge-orch"]; ok {
-		t.Fatal("duplicate authorized identity must be absent rather than selected by list order")
+	if len(got["forge-orch"]) != 2 {
+		t.Fatalf("both authorized candidates must be retained, got %d", len(got["forge-orch"]))
 	}
-	// Prove the guard is specific to the duplicate case: one authorized
-	// record remains live while foreign records remain ignored.
+	if _, _, ok := standingAgent(got, "orch", "", ""); ok {
+		t.Fatal("unresolvable duplicate identity must be refused rather than selected by list order")
+	}
+
+	// Foreign-workspace records remain ignored, and a single authorized
+	// record resolves normally.
 	got = indexAgents([]Agent{
 		{Name: "forge-orch", Status: "idle", Workspace: "other", Cwd: cwd},
 		{Name: "forge-orch", Status: "working", Workspace: "wTEST", Cwd: cwd},
 	}, "wTEST", repo)
-	if got["forge-orch"].Status != "working" {
+	if got["forge-orch"][0].Status != "working" {
 		t.Fatalf("authorized identity = %+v, want working record", got["forge-orch"])
 	}
 }
