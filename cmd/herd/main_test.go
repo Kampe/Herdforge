@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -71,11 +72,52 @@ func TestMain(m *testing.M) {
 	// production signer-boundary check unchanged.
 	_ = os.Unsetenv("HERD_ROLE")
 
+	root, rootGitState, guardErr := snapshotRootGitState()
+	if guardErr != nil {
+		// Tests may be run from a non-repository source checkout. In that case
+		// there is no live root checkout whose configuration can be corrupted.
+		root = ""
+	}
 	code := m.Run()
+	if root != "" {
+		if after, err := readRootGitState(root); err != nil {
+			fmt.Fprintf(os.Stderr, "root git configuration guard failed: %v\n", err)
+			code = 1
+		} else if after != rootGitState {
+			fmt.Fprintln(os.Stderr, "root git configuration guard failed: tests changed the root checkout's git config or remotes")
+			code = 1
+		}
+	}
 	if dir := filepath.Dir(herdBinary); herdBinary != "" {
 		_ = os.RemoveAll(dir)
 	}
 	os.Exit(code)
+}
+
+func snapshotRootGitState() (string, string, error) {
+	root, err := filepath.Abs(".")
+	if err != nil {
+		return "", "", err
+	}
+	if _, err := readRootGitState(root); err != nil {
+		return "", "", err
+	}
+	state, err := readRootGitState(root)
+	return root, state, err
+}
+
+func readRootGitState(root string) (string, error) {
+	config := exec.Command("git", "-C", root, "config", "--local", "--null", "--list")
+	configOut, err := config.Output()
+	if err != nil {
+		return "", err
+	}
+	remotes := exec.Command("git", "-C", root, "remote", "-v")
+	remoteOut, err := remotes.Output()
+	if err != nil {
+		return "", err
+	}
+	return string(configOut) + "\x00---remotes---\x00" + string(remoteOut), nil
 }
 
 func TestForgeDriverBlocksCapacityWhenReconciliationUnavailable(t *testing.T) {
