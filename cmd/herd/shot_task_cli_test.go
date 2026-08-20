@@ -282,9 +282,15 @@ func decodeEvidence(t *testing.T, out string) shot.Evidence {
 func stubHarnessPATH(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()
+	// FAC-537: these stubs must be PROBE-FAITHFUL. FAC-480 made routing issue a
+	// REAL non-interactive request and require the exact readiness sentinel on
+	// stdout, so an `exit 0` no-op is correctly judged NOT READY and the whole
+	// roster becomes ineligible ("no eligible surface left ... tried 0"). Echo
+	// the sentinel so routing stays deterministic and host-independent.
 	for _, name := range []string{"claude", "grok"} {
 		p := filepath.Join(dir, name)
-		if err := os.WriteFile(p, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		body := "#!/bin/sh\nprintf '%s' 'HERD_PROVIDER_PROBE_OK'\nexit 0\n"
+		if err := os.WriteFile(p, []byte(body), 0o755); err != nil {
 			t.Fatalf("write stub %s: %v", name, err)
 		}
 	}
