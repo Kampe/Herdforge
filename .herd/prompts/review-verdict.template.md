@@ -7,6 +7,7 @@ reviewer-family: <your model family: anthropic|openai|google|xai|moonshot|...>
 builder-family: <the AUTHOR's family — must differ from yours>
 verdict: PASS | FAIL | BLOCKED
 reviewed-head: <output of `git rev-parse HEAD` in the tree you actually read>
+retry-of: <optional prior reviewer lane for an exact-head retry>
 ---
 Your evidence goes here, below the `---`.
 

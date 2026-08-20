@@ -178,8 +178,11 @@ func TestIngestEnsuresExactAdmissionBeforePassAndIsIdempotent(t *testing.T) {
 		if err != nil {
 			t.Fatalf("ingest attempt %d: %v", attempt+1, err)
 		}
-		if !enqueued {
-			t.Fatalf("ingest attempt %d did not report PASS queued", attempt+1)
+		if attempt == 0 && !enqueued {
+			t.Fatalf("first ingest did not report PASS queued")
+		}
+		if attempt == 1 && enqueued {
+			t.Fatalf("duplicate ingest reported PASS queued")
 		}
 	}
 	rows, err := l.AllRows()
@@ -717,12 +720,55 @@ func TestVerdictIdempotent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("second Verdict: %v", err)
 	}
-	if !enq2 {
-		t.Error("expected enqueued=true (replay returns last state)")
+	if enq2 {
+		t.Error("duplicate verdict must report enqueued=false")
 	}
 	rows, _ = l.AllRows()
 	if len(rows) != 1 {
 		t.Fatalf("expected still 1 row after duplicate verdict, got %d", len(rows))
+	}
+}
+
+func TestRetryPASSExplicitlySupersedesOnlyNamedReviewer(t *testing.T) {
+	l := newTestLedger(t)
+	const sha = "retry-candidate"
+	for _, reviewer := range []string{"reviewer-a", "reviewer-b", "reviewer-c", "reviewer-d"} {
+		if err := l.Record(RecordOpts{SHA: sha, Branch: "herd/fac-493", Reviewer: reviewer, BuilderFamily: "anthropic", ReviewerFamily: "openai"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := l.Verdict(VerdictOpts{SHA: sha, Reviewer: "reviewer-a", Verdict: VerdictFAIL, ReviewerFamily: "openai"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := l.Verdict(VerdictOpts{SHA: sha, Reviewer: "reviewer-b", Verdict: VerdictPASS, ReviewerFamily: "openai", RetryOf: "reviewer-a"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := l.Verdict(VerdictOpts{SHA: sha, Reviewer: "reviewer-c", Verdict: VerdictFAIL, ReviewerFamily: "openai"}); err != nil {
+		t.Fatal(err)
+	}
+	eligible, err := l.Eligible(sha, "")
+	if err == nil || eligible || !strings.Contains(err.Error(), "review veto") {
+		t.Fatalf("unrelated conflicting FAIL was not preserved: eligible=%v err=%v", eligible, err)
+	}
+	if _, err := l.Verdict(VerdictOpts{SHA: sha, Reviewer: "reviewer-d", Verdict: VerdictPASS, ReviewerFamily: "openai", RetryOf: "reviewer-c"}); err != nil {
+		t.Fatal(err)
+	}
+	eligible, err = l.Eligible(sha, "")
+	if err != nil || !eligible {
+		t.Fatalf("explicit retries should clear named vetoes: eligible=%v err=%v", eligible, err)
+	}
+	rows, err := l.AllRows()
+	if err != nil {
+		t.Fatal(err)
+	}
+	seenAudit := false
+	for _, row := range rows {
+		if row.Event == string(EventSupersession) && row.SHA == sha && row.RetryOf == "reviewer-a" {
+			seenAudit = true
+		}
+	}
+	if !seenAudit {
+		t.Fatal("retry PASS did not append an explicit supersession audit row")
 	}
 }
 

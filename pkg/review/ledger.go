@@ -19,12 +19,13 @@ import (
 type LedgerEvent string
 
 const (
-	EventRecord   LedgerEvent = "record"
-	EventVerdict  LedgerEvent = "verdict"
-	EventRepair   LedgerEvent = "repair"
-	EventConsumed LedgerEvent = "consumed"
-	EventEnqueue  LedgerEvent = "enqueue"
-	EventRevoked  LedgerEvent = "revoked"
+	EventRecord       LedgerEvent = "record"
+	EventVerdict      LedgerEvent = "verdict"
+	EventRepair       LedgerEvent = "repair"
+	EventConsumed     LedgerEvent = "consumed"
+	EventEnqueue      LedgerEvent = "enqueue"
+	EventRevoked      LedgerEvent = "revoked"
+	EventSupersession LedgerEvent = "supersession"
 )
 
 // Verdict values.
@@ -73,6 +74,7 @@ type LedgerRow struct {
 	Lane           string `json:"lane,omitempty"`
 	MergeSHA       string `json:"merge_sha,omitempty"`
 	Status         string `json:"status,omitempty"`
+	RetryOf        string `json:"retry_of,omitempty"`
 }
 
 // VerdictRecord is the small, stable view consumed by the drain coordinator.
@@ -802,6 +804,12 @@ func (l *Ledger) isCoordinator(name string) bool {
 // any PASS and no FAIL/BLOCKED, using the family ladder.
 func (l *Ledger) isPassVerdictLatest(sha string, latest map[string]LedgerRow, launch map[string]LedgerRow) bool {
 	var hasPass bool
+	superseded := make(map[string]bool)
+	for k, verdict := range latest {
+		if strings.HasPrefix(k, sha+"\x00") && verdict.Verdict == string(VerdictPASS) && verdict.RetryOf != "" {
+			superseded[verdict.RetryOf] = true
+		}
+	}
 	for k, verdict := range latest {
 		sparts := strings.SplitN(k, ":", 2)
 		if len(sparts) != 2 || sparts[0] != sha {
@@ -854,6 +862,9 @@ func (l *Ledger) isPassVerdictLatest(sha string, latest map[string]LedgerRow, la
 			hasPass = true
 		}
 		if verdict.Verdict == string(VerdictFAIL) || verdict.Verdict == string(VerdictBLOCKED) {
+			if superseded[reviewer] {
+				continue
+			}
 			return false
 		}
 	}

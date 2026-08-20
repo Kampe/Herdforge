@@ -205,6 +205,23 @@ func (l *Ledger) VerdictFor(sha string) (LedgerRow, bool, error) {
 	return LedgerRow{}, false, nil
 }
 
+// VerdictForReviewer reports the durable verdict for one exact SHA/reviewer
+// pair. It is used by ingest to distinguish a duplicate handoff from a new
+// verdict by another reviewer on the same candidate.
+func (l *Ledger) VerdictForReviewer(sha, reviewer string) (LedgerRow, bool, error) {
+	rows, err := l.AllRows()
+	if err != nil {
+		return LedgerRow{}, false, err
+	}
+	for i := len(rows) - 1; i >= 0; i-- {
+		row := rows[i]
+		if row.Event == string(EventVerdict) && row.SHA == sha && row.Reviewer == reviewer {
+			return row, true, nil
+		}
+	}
+	return LedgerRow{}, false, nil
+}
+
 // TierReport is the durable evidence surfaced by the review-ledger CLI.
 // Keeping the candidate SHA alongside its tier prevents an empty tier from
 // being mistaken for a successful lookup of a different candidate.
@@ -229,6 +246,7 @@ type VerdictOpts struct {
 	VfyDigest      string
 	FindingsRef    string
 	CandidateSHA   string
+	RetryOf        string
 }
 
 // Verdict appends a verdict event and side-writes to the queue.
@@ -254,7 +272,16 @@ func (l *Ledger) verdict(opts VerdictOpts) (enqueued bool, err error) {
 	}
 	for _, r := range rows {
 		if r.Event == string(EventVerdict) && r.SHA == opts.SHA && r.Reviewer == opts.Reviewer {
-			return opts.Verdict == VerdictPASS, nil
+			return false, nil
+		}
+	}
+	if opts.Verdict == VerdictPASS && strings.TrimSpace(opts.RetryOf) != "" {
+		if err := l.appendRow(l.Path, &LedgerRow{
+			Event: string(EventSupersession), SHA: opts.SHA, Task: opts.SHA,
+			Reviewer: opts.RetryOf, RetryOf: opts.RetryOf,
+			Reason: "explicit retry PASS supersedes prior reviewer verdict", Status: "superseded",
+		}); err != nil {
+			return false, err
 		}
 	}
 
@@ -270,6 +297,7 @@ func (l *Ledger) verdict(opts VerdictOpts) (enqueued bool, err error) {
 		VerificationDigest: opts.VfyDigest,
 		FindingsRef:        opts.FindingsRef,
 		CandidateSHA:       opts.CandidateSHA,
+		RetryOf:            opts.RetryOf,
 	}
 	if opts.ReviewerFamily != "" {
 		row.ReviewerFamily = opts.ReviewerFamily
@@ -482,7 +510,7 @@ func (l *Ledger) Eligible(sha, builderFamily string) (bool, error) {
 		if r.Event == string(EventRetired) && r.SHA == sha {
 			return false, fmt.Errorf("herd-review-ledger: refuse sha=%s reason=retired", sha)
 		}
-		if r.Event == string(EventSupersession) && r.Task == sha {
+		if r.Event == string(EventSupersession) && r.Task == sha && r.SHA != sha {
 			superseded = true
 		}
 	}
@@ -526,7 +554,14 @@ func (l *Ledger) Eligible(sha, builderFamily string) (bool, error) {
 		return false, fmt.Errorf("herd-review-ledger: refuse sha=%s reason=consumed", sha)
 	}
 
-	// SHA-level veto: any FAIL/BLOCKED from a valid reviewer blocks eligibility.
+	// SHA-level veto: any FAIL/BLOCKED from a valid reviewer blocks eligibility,
+	// unless a later PASS explicitly names that reviewer as a retry target.
+	supersededReviewers := make(map[string]bool)
+	for _, r := range rows {
+		if r.Event == string(EventSupersession) && r.SHA == sha && r.Task == sha && r.Reviewer != "" {
+			supersededReviewers[r.Reviewer] = true
+		}
+	}
 	hasVeto := false
 	for k, verdict := range latest {
 		sparts := strings.SplitN(k, ":", 2)
@@ -545,6 +580,9 @@ func (l *Ledger) Eligible(sha, builderFamily string) (bool, error) {
 		if hasLaunch {
 			lbf := launchRow.BuilderFamily
 			if lbf != "" && FamilyAllowlist[lbf] {
+				if supersededReviewers[verdict.Reviewer] {
+					continue
+				}
 				hasVeto = true
 				break
 			}
@@ -651,6 +689,12 @@ func (l *Ledger) isCoordinator(name string) bool {
 // any PASS and no FAIL/BLOCKED, using the family ladder.
 func (l *Ledger) isPassVerdictLatest(sha string, latest map[string]LedgerRow, launch map[string]LedgerRow) bool {
 	var hasPass bool
+	superseded := make(map[string]bool)
+	for k, verdict := range latest {
+		if strings.HasPrefix(k, sha+":") && verdict.Verdict == string(VerdictPASS) && verdict.RetryOf != "" {
+			superseded[verdict.RetryOf] = true
+		}
+	}
 	for k, verdict := range latest {
 		sparts := strings.SplitN(k, ":", 2)
 		if len(sparts) != 2 || sparts[0] != sha {
@@ -695,6 +739,9 @@ func (l *Ledger) isPassVerdictLatest(sha string, latest map[string]LedgerRow, la
 			hasPass = true
 		}
 		if verdict.Verdict == string(VerdictFAIL) || verdict.Verdict == string(VerdictBLOCKED) {
+			if superseded[reviewer] {
+				continue
+			}
 			return false
 		}
 	}
@@ -852,6 +899,12 @@ func (l *Ledger) PassSHAs() ([]string, error) {
 		hasPass := false
 		hasVeto := false
 		hasIndependent := false
+		supersededReviewers := make(map[string]bool)
+		for _, verdict := range vset {
+			if verdict.Verdict == string(VerdictPASS) && verdict.RetryOf != "" {
+				supersededReviewers[verdict.RetryOf] = true
+			}
+		}
 		for _, verdict := range vset {
 			reviewer := verdict.Reviewer
 			if l.isCoordinator(reviewer) {
@@ -886,6 +939,9 @@ func (l *Ledger) PassSHAs() ([]string, error) {
 				hasPass = true
 			}
 			if verdict.Verdict == string(VerdictFAIL) || verdict.Verdict == string(VerdictBLOCKED) {
+				if supersededReviewers[verdict.Reviewer] {
+					continue
+				}
 				hasVeto = true
 			}
 		}

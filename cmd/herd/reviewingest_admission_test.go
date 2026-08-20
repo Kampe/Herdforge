@@ -12,9 +12,12 @@ import (
 
 type fakeReviewIngestLedger struct {
 	readable bool
+	reviewer string
+	ingests  int
 }
 
 func (f *fakeReviewIngestLedger) Ingest(reviewledger.IngestOpts) (bool, error) {
+	f.ingests++
 	return true, nil
 }
 
@@ -22,7 +25,33 @@ func (f *fakeReviewIngestLedger) VerdictFor(sha string) (reviewledger.LedgerRow,
 	if !f.readable {
 		return reviewledger.LedgerRow{}, false, errors.New("simulated ledger read failure")
 	}
-	return reviewledger.LedgerRow{Event: string(reviewledger.EventVerdict), SHA: sha, Verdict: "PASS"}, true, nil
+	return reviewledger.LedgerRow{Event: string(reviewledger.EventVerdict), SHA: sha, Reviewer: f.reviewer, Verdict: "PASS"}, true, nil
+}
+
+func (f *fakeReviewIngestLedger) VerdictForReviewer(sha, reviewer string) (reviewledger.LedgerRow, bool, error) {
+	return f.VerdictFor(sha)
+}
+
+func TestReviewIngestDuplicateDoesNotMoveArtifact(t *testing.T) {
+	root := t.TempDir()
+	source := filepath.Join(root, "review.md")
+	if err := os.WriteFile(source, []byte("verdict"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ledger := &fakeReviewIngestLedger{readable: true, reviewer: "reviewer"}
+	got, err := admitVerdictAndMove(ledger, reviewledger.IngestOpts{Verdict: reviewledger.VerdictOpts{Reviewer: "reviewer"}}, source, "sha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got || ledger.ingests != 0 {
+		t.Fatalf("duplicate outcome = %v, ingests=%d; want false and no write", got, ledger.ingests)
+	}
+	if _, err := os.Stat(source); err != nil {
+		t.Fatalf("duplicate source artifact was consumed: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "ingested", "review.md")); !os.IsNotExist(err) {
+		t.Fatalf("duplicate artifact moved to ingested: %v", err)
+	}
 }
 
 func TestReviewIngestAdmissionAndMove(t *testing.T) {

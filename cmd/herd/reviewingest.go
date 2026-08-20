@@ -160,14 +160,20 @@ func runReviewIngest() {
 			BuilderFamily:  a.BuilderFamily,
 			Branch:         a.Branch,
 			CandidateSHA:   a.SHA,
+			RetryOf:        a.RetryOf,
 		}
 		enqueued, err := admitVerdictAndMove(ledger, reviewledger.IngestOpts{Record: recordOpts, Verdict: verdictOpts}, f, a.SHA)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "herd review-ingest: admission/verdict write FAILED for %s: %v\n", filepath.Base(f), err)
 			os.Exit(1)
 		}
-		fmt.Printf("ADMITTED %s verdict=%s reviewer=%s sha=%s enqueued=%v\n",
-			filepath.Base(f), a.Verdict, a.Reviewer, a.SHA[:12], enqueued)
+		if !enqueued && a.Verdict == "PASS" {
+			fmt.Printf("DUPLICATE %s verdict=%s reviewer=%s sha=%s enqueued=false\n",
+				filepath.Base(f), a.Verdict, a.Reviewer, a.SHA[:12])
+		} else {
+			fmt.Printf("ADMITTED %s verdict=%s reviewer=%s sha=%s enqueued=%v\n",
+				filepath.Base(f), a.Verdict, a.Reviewer, a.SHA[:12], enqueued)
+		}
 		admitted++
 	}
 
@@ -248,12 +254,20 @@ func parseReviewIngestArgs(args []string) (reviewIngestArgs, error) {
 type reviewIngestLedger interface {
 	Ingest(reviewledger.IngestOpts) (bool, error)
 	VerdictFor(string) (reviewledger.LedgerRow, bool, error)
+	VerdictForReviewer(string, string) (reviewledger.LedgerRow, bool, error)
 }
 
 // admitVerdictAndMove makes the ledger row observable before moving the source
 // artifact. An append acknowledgement alone is not sufficient admission
 // evidence: a failed read-back must leave the artifact available for retry.
 func admitVerdictAndMove(ledger reviewIngestLedger, opts reviewledger.IngestOpts, source, sha string) (bool, error) {
+	if prior, found, err := ledger.VerdictForReviewer(sha, opts.Verdict.Reviewer); err != nil {
+		return false, fmt.Errorf("read existing ledger verdict: %w", err)
+	} else if found && prior.Reviewer == opts.Verdict.Reviewer {
+		// A duplicate handoff is a durable no-op. Leave the source available
+		// for inspection/retry; it must not be consumed as ingested evidence.
+		return false, nil
+	}
 	enqueued, err := ledger.Ingest(opts)
 	if err != nil {
 		return false, err
@@ -579,6 +593,9 @@ func resolveHarvestCandidateWithReconstruction(branch, requested, reconstructedS
 	var latest reviewledger.LedgerRow
 	queuedBySHA := make(map[string]reviewledger.LedgerRow)
 	for _, row := range queued {
+		if row.Branch != "" && row.Branch != branch {
+			continue
+		}
 		queuedBySHA[row.SHA] = row
 		if row.Timestamp >= latest.Timestamp {
 			latest = row

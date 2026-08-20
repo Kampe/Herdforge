@@ -77,6 +77,7 @@ type LedgerRow struct {
 	VerificationDigest string `json:"verification_digest,omitempty"`
 	FindingsRef        string `json:"findings_ref,omitempty"`
 	CandidateSHA       string `json:"candidate_sha,omitempty"`
+	RetryOf            string `json:"retry_of,omitempty"`
 	Reason             string `json:"reason,omitempty"`
 	ContentProof       string `json:"content_proof,omitempty"`
 	Authority          string `json:"authority,omitempty"`
