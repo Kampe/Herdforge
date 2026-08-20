@@ -133,6 +133,51 @@ func TestDefaultProbeSuppressesUnconfiguredKimi(t *testing.T) {
 	}
 }
 
+func TestProviderProbeCommandsCoverEveryRoutedSurface(t *testing.T) {
+	for _, tt := range []struct {
+		provider, model, command, arg string
+	}{
+		{"claude", "claude-sonnet-5", "claude", "-p"},
+		{"agy", "gemini-3.1-pro-high", "agy", "--print"},
+		{"codex", "gpt-5.6-luna", "codex", "exec"},
+		{"grok", "grok-4.6", "grok", "--always-approve"},
+		{"kimi", "", "kimi", "--auto"},
+		{"opencode", "opencode/deepseek-v4-pro", "opencode", "run"},
+		{"ollama", "litellm/ollama/glm-5.2:cloud", "opencode", "run"},
+		{"lazer", "litellm/lazer/grok-4.6", "opencode", "run"},
+	} {
+		t.Run(tt.provider, func(t *testing.T) {
+			command, args, prompt, err := providerProbeCommand(tt.provider, tt.model)
+			if err != nil {
+				t.Fatalf("providerProbeCommand: %v", err)
+			}
+			if command != tt.command || !containsProbeArg(args, tt.arg) {
+				t.Fatalf("command=%q args=%v, want %q containing %q", command, args, tt.command, tt.arg)
+			}
+			if (tt.provider == "claude" || tt.provider == "codex" || tt.provider == "kimi") && strings.TrimSpace(prompt) == "" {
+				t.Fatal("stdin prompt missing")
+			}
+		})
+	}
+}
+
+func TestProviderProbeRejectsMissingConfigurationAndRateLimit(t *testing.T) {
+	for _, output := range []string{"no configured provider/model", "rate limit before first token", "429 Too Many Requests"} {
+		if ok, _ := classifyProviderProbeOutput(output, output, nil, false); ok {
+			t.Fatalf("output %q must be unavailable", output)
+		}
+	}
+}
+
+func containsProbeArg(args []string, want string) bool {
+	for _, arg := range args {
+		if arg == want {
+			return true
+		}
+	}
+	return false
+}
+
 // The verbatim tables from bin/herd-route. If one of these fails, the port
 // has drifted from the shell contract.
 func TestModelForTable(t *testing.T) {
