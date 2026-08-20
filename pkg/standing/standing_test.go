@@ -725,6 +725,82 @@ func TestShutdownTouchesOnlyStanding(t *testing.T) {
 	}
 }
 
+func TestLegacyStandingNamesAreAdopted(t *testing.T) {
+	tests := []struct {
+		name    string
+		mode    Mode
+		status  string
+		want    Outcome
+		wantTab string
+	}{
+		{name: "status reports legacy owner live", mode: ModeStatus, status: "idle", want: OutcomeLive, wantTab: "legacy-orch"},
+		{name: "shutdown closes legacy owner", mode: ModeShutdown, status: "idle", want: OutcomeClosed, wantTab: "legacy-orch"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			repo, cfg := standingFixture(t)
+			t.Chdir(repo)
+			closed := ""
+			opts := baseOpts(t, repo)
+			opts.Mode = tt.mode
+			opts.Only = []string{"orch"}
+			opts.ListAgents = func() ([]Agent, error) {
+				if closed != "" {
+					return nil, nil
+				}
+				return []Agent{{Name: AgentName("orch"), Status: tt.status, TabID: tt.wantTab, PaneID: "legacy-pane", Workspace: "wTEST", Cwd: filepath.Join(repo, ".worktrees", "orch")}}, nil
+			}
+			opts.CloseTab = func(tabID string) error {
+				closed = tabID
+				return nil
+			}
+			r, err := Run(cfg, opts)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(r.Roles) != 1 || r.Roles[0].Outcome != tt.want {
+				t.Fatalf("legacy %s result = %+v, want outcome %s", modeString(tt.mode), r.Roles, tt.want)
+			}
+			if r.Roles[0].TabID != tt.wantTab {
+				t.Fatalf("legacy %s tab = %q, want %q", modeString(tt.mode), r.Roles[0].TabID, tt.wantTab)
+			}
+			if tt.mode == ModeShutdown && closed != tt.wantTab {
+				t.Fatalf("closed tab = %q, want %q", closed, tt.wantTab)
+			}
+		})
+	}
+}
+
+func TestRaiseAdoptsLegacyStandingNameWithoutDuplicate(t *testing.T) {
+	repo, cfg := standingFixture(t)
+	t.Chdir(repo)
+	creates := 0
+	opts := baseOpts(t, repo)
+	opts.Mode = ModeRaise
+	opts.Only = []string{"orch"}
+	opts.ListAgents = func() ([]Agent, error) {
+		return []Agent{{Name: AgentName("orch"), Status: "idle", TabID: "legacy-orch", PaneID: "legacy-pane", Workspace: "wTEST", Cwd: filepath.Join(repo, ".worktrees", "orch")}}, nil
+	}
+	opts.CreateTab = func(string, string, string) (Tab, error) {
+		creates++
+		return Tab{}, errors.New("duplicate raise attempted")
+	}
+	opts.StartAgent = func(Tab, string, Route, *config.LaneDef, string) error {
+		t.Fatal("legacy owner must be adopted before start")
+		return nil
+	}
+	r, err := Run(cfg, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if creates != 0 {
+		t.Fatalf("legacy owner caused %d duplicate tab creations", creates)
+	}
+	if len(r.Roles) != 1 || r.Roles[0].Outcome != OutcomeSkippedLive || r.Roles[0].TabID != "legacy-orch" {
+		t.Fatalf("legacy raise result = %+v", r.Roles)
+	}
+}
+
 func TestWorkspaceResolutionFailureBlocks(t *testing.T) {
 	repo, cfg := standingFixture(t)
 	t.Chdir(repo)
