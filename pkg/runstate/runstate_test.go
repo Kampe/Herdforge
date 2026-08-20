@@ -3,6 +3,7 @@ package runstate
 import (
 	"context"
 	"errors"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -47,6 +48,58 @@ func TestCheckpointLoadResumeAndTerminalDispatchGate(t *testing.T) {
 	}
 	if err := loaded.Dispatchable("FAC-2"); !errors.Is(err, ErrTerminal) {
 		t.Fatalf("terminal redispatch err=%v", err)
+	}
+}
+
+func TestResumeGraphAuthorityModes(t *testing.T) {
+	tests := []struct {
+		name   string
+		scoped bool
+	}{
+		{name: "project graph", scoped: false},
+		{name: "task graph", scoped: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "run.db")
+			store, err := Open(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer store.Close()
+			providerStore := provider.NewMemoryProvider()
+			task := &provider.Task{ID: "task-1", Ref: "FAC-516", Status: "to-do"}
+			providerStore.AddTask(task)
+			state, err := FromTasks("dispatch:task-1", "dispatch", task.Ref, "graph-1", Policy{Lane: "dispatch", Model: "test"}, 0, 0, []*provider.Task{task})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := store.Checkpoint(context.Background(), state, 0); err != nil {
+				t.Fatal(err)
+			}
+			called := false
+			authority := Authority{Tasks: providerStore, Graph: func(context.Context) (string, error) {
+				if tt.scoped {
+					t.Fatal("project graph authority should not be called")
+				}
+				return "graph-1", nil
+			}}
+			if tt.scoped {
+				authority.GraphForTask = func(_ context.Context, saved TaskState) (string, error) {
+					called = true
+					if saved.ID != task.ID || saved.Ref != task.Ref {
+						t.Fatalf("wrong task: %+v", saved)
+					}
+					return "graph-1", nil
+				}
+			}
+			if _, err := store.Resume(context.Background(), state.ID, authority); err != nil {
+				t.Fatal(err)
+			}
+			if tt.scoped != called {
+				t.Fatalf("scoped authority called=%v, want %v", called, tt.scoped)
+			}
+		})
 	}
 }
 

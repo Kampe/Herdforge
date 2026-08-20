@@ -369,10 +369,11 @@ type Dispatcher struct {
 	// Dispatch checkpoints the first exact task observation, then always resumes
 	// it against live provider and graph evidence before any mutation. A terminal,
 	// stale, or ambiguous saved state therefore cannot enter redispatch.
-	RunStates     *runstate.Store
-	RunStateGraph runstate.GraphAuthority
-	Recovery      *recovery.Store
-	RecoveryActor string
+	RunStates            *runstate.Store
+	RunStateGraph        runstate.GraphAuthority
+	RunStateGraphForTask runstate.GraphAuthorityForTask
+	Recovery             *recovery.Store
+	RecoveryActor        string
 	// EnvironmentPlans is the FAC-241 durable capability authority. It is
 	// consulted before scope, worktree, board, harness, or credential effects.
 	EnvironmentPlans *envplan.Store
@@ -1119,14 +1120,14 @@ func (d *Dispatcher) admitRunState(ctx context.Context, task *provider.Task) (*r
 	if task == nil || strings.TrimSpace(task.ID) == "" || strings.TrimSpace(task.Ref) == "" {
 		return nil, fmt.Errorf("dispatch runstate: %w: incomplete task identity", runstate.ErrAmbiguous)
 	}
-	if d.RunStateGraph == nil {
+	if d.RunStateGraph == nil && d.RunStateGraphForTask == nil {
 		return nil, fmt.Errorf("dispatch runstate: %w: missing graph authority", runstate.ErrAmbiguous)
 	}
 	id := "dispatch:" + task.ID
-	authority := runstate.Authority{Tasks: d.TaskProvider, Graph: d.RunStateGraph}
+	authority := runstate.Authority{Tasks: d.TaskProvider, Graph: d.RunStateGraph, GraphForTask: d.RunStateGraphForTask}
 	state, err := d.RunStates.Resume(ctx, id, authority)
 	if errors.Is(err, runstate.ErrNotFound) {
-		graph, graphErr := d.RunStateGraph(ctx)
+		graph, graphErr := d.graphRevisionForTask(ctx, task)
 		if graphErr != nil || strings.TrimSpace(graph) == "" {
 			if graphErr != nil {
 				return nil, fmt.Errorf("dispatch runstate graph authority: %w", graphErr)
@@ -1150,7 +1151,7 @@ func (d *Dispatcher) admitRunState(ctx context.Context, task *provider.Task) (*r
 		if delErr := d.RunStates.Delete(ctx, id); delErr != nil {
 			return nil, fmt.Errorf("dispatch runstate stale recovery: %w", delErr)
 		}
-		graph, graphErr := d.RunStateGraph(ctx)
+		graph, graphErr := d.graphRevisionForTask(ctx, task)
 		if graphErr != nil || strings.TrimSpace(graph) == "" {
 			if graphErr != nil {
 				return nil, fmt.Errorf("dispatch runstate graph authority: %w", graphErr)
@@ -1185,6 +1186,16 @@ func (d *Dispatcher) admitRunState(ctx context.Context, task *provider.Task) (*r
 	return state, nil
 }
 
+func (d *Dispatcher) graphRevisionForTask(ctx context.Context, task *provider.Task) (string, error) {
+	if d.RunStateGraphForTask != nil {
+		return d.RunStateGraphForTask(ctx, runstate.TaskState{ID: task.ID, Ref: task.Ref})
+	}
+	if d.RunStateGraph == nil {
+		return "", fmt.Errorf("dispatch runstate: %w: missing graph authority", runstate.ErrAmbiguous)
+	}
+	return d.RunStateGraph(ctx)
+}
+
 // admitEnvironmentPlan derives the live FAC-235 binding and checks all plan
 // requests before scope admission. It deliberately has no side effects.
 func (d *Dispatcher) admitEnvironmentPlan(ctx context.Context, task *provider.Task, opts DispatchOptions) error {
@@ -1197,10 +1208,10 @@ func (d *Dispatcher) admitEnvironmentPlan(ctx context.Context, task *provider.Ta
 	if strings.TrimSpace(opts.EnvironmentPlanID) == "" {
 		return errors.New("dispatch envplan: plan id is required in production")
 	}
-	if task == nil || d.RunStates == nil || d.RunStateGraph == nil {
+	if task == nil || d.RunStates == nil || (d.RunStateGraph == nil && d.RunStateGraphForTask == nil) {
 		return errors.New("dispatch envplan: task and runstate authorities are required")
 	}
-	run, err := d.RunStates.Resume(ctx, "dispatch:"+task.ID, runstate.Authority{Tasks: d.TaskProvider, Graph: d.RunStateGraph})
+	run, err := d.RunStates.Resume(ctx, "dispatch:"+task.ID, runstate.Authority{Tasks: d.TaskProvider, Graph: d.RunStateGraph, GraphForTask: d.RunStateGraphForTask})
 	if err != nil {
 		return fmt.Errorf("dispatch envplan runstate: %w", err)
 	}
