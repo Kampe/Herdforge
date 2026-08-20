@@ -220,6 +220,7 @@ func TargetCap(e Evidence) (int, string) {
 func Decide(s Surface, e Evidence, prior State) Decision {
 	target, why := TargetCap(e)
 	target = clampCap(target)
+	unknownEvidence := (e.Capacity == Unknown || e.Capacity == Untracked) && e.Cooldown == ""
 
 	streak := 0
 	if e.Capacity == Healthy && e.Cooldown == "" {
@@ -227,28 +228,36 @@ func Decide(s Surface, e Evidence, prior State) Decision {
 	}
 
 	cap := clampCap(prior.Cap)
-	switch {
-	case target < cap:
-		cap = target
-		why += fmt.Sprintf("; cut %d->%d", prior.Cap, cap)
-	case target > cap:
-		if streak >= RecoveryStreak {
-			if rise := cap + MaxRisePerObservation; rise < target {
-				cap = rise
+	if unknownEvidence {
+		// Absence of quota evidence is not evidence of exhaustion. Preserve the
+		// last routeable cap and leave the surface open so --act cannot remove
+		// healthy capacity while the ledger is unavailable.
+		streak = 0
+		why += fmt.Sprintf("; holding %d: unknown evidence is not grounds to cool", cap)
+	} else {
+		switch {
+		case target < cap:
+			cap = target
+			why += fmt.Sprintf("; cut %d->%d", prior.Cap, cap)
+		case target > cap:
+			if streak >= RecoveryStreak {
+				if rise := cap + MaxRisePerObservation; rise < target {
+					cap = rise
+				} else {
+					cap = target
+				}
+				why += fmt.Sprintf("; recovery verified over %d observations, raised %d->%d (target %d)",
+					streak, prior.Cap, cap, target)
 			} else {
-				cap = target
+				why += fmt.Sprintf("; holding %d: recovery unverified (%d/%d consecutive healthy observations)",
+					cap, streak, RecoveryStreak)
 			}
-			why += fmt.Sprintf("; recovery verified over %d observations, raised %d->%d (target %d)",
-				streak, prior.Cap, cap, target)
-		} else {
-			why += fmt.Sprintf("; holding %d: recovery unverified (%d/%d consecutive healthy observations)",
-				cap, streak, RecoveryStreak)
 		}
 	}
 
 	posture := PostureOpen
 	switch {
-	case cap == 0:
+	case cap == 0 && e.Capacity != Healthy && !unknownEvidence:
 		posture = PostureBlocked
 	case e.Capacity == AtRisk || e.Cooldown != "":
 		posture = PostureDrain

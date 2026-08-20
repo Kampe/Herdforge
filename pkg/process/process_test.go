@@ -64,6 +64,9 @@ func TestProviderExhaustionReason(t *testing.T) {
 	if got := ProviderExhaustionReason("OpenCode: out of quota until reset"); got == "" {
 		t.Fatal("out-of-quota failure was not detected")
 	}
+	if got := ProviderExhaustionReason("Individual quota reached"); got == "" {
+		t.Fatal("Antigravity individual quota exhaustion was not detected")
+	}
 	if got := ProviderExhaustionReason("CONFIRMED: the rate limit exceeded path is covered"); got != "" {
 		t.Fatalf("review prose classified as provider failure: %q", got)
 	}
