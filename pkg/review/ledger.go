@@ -28,6 +28,11 @@ const (
 	EventSupersession LedgerEvent = "supersession"
 )
 
+// DefaultPendingTTL bounds how long a review launch without a verdict can
+// contribute to review pressure. Expired launches are ignored, not rewritten,
+// so the append-only ledger remains an audit trail.
+const DefaultPendingTTL = 24 * time.Hour
+
 // Verdict values.
 type Verdict string
 
@@ -280,10 +285,13 @@ type familyState struct {
 
 // Ledger is an append-only JSONL review-attempt ledger + harvest queue.
 type Ledger struct {
-	RepoRoot     string
-	Path         string
-	QueuePath    string
-	Now          func() time.Time
+	RepoRoot  string
+	Path      string
+	QueuePath string
+	Now       func() time.Time
+	// PendingTTL overrides DefaultPendingTTL for deterministic tests. A zero or
+	// negative value uses the documented production default.
+	PendingTTL   time.Duration
 	Coordinators map[string]struct{}
 }
 
@@ -966,9 +974,27 @@ func (l *Ledger) Pending() ([]LedgerRow, error) {
 	}
 
 	var pending []LedgerRow
+	now := time.Now().UTC()
+	if l.Now != nil {
+		now = l.Now().UTC()
+	}
+	ttl := l.PendingTTL
+	if ttl <= 0 {
+		ttl = DefaultPendingTTL
+	}
+	cutoff := now.Add(-ttl)
 	for k, rec := range newestRec {
 		vi, hasVerdict := verdictIdx[k]
 		if !hasVerdict || vi < rec.index {
+			if rec.row.Timestamp != "" {
+				at, err := parseRowTime(rec.row.Timestamp)
+				if err != nil {
+					return nil, fmt.Errorf("invalid pending record timestamp for %s: %w", k, err)
+				}
+				if at.Before(cutoff) {
+					continue
+				}
+			}
 			pending = append(pending, rec.row)
 		}
 	}
