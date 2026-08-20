@@ -87,6 +87,47 @@ func ReadExecutable(path, root string) (Info, error) {
 	return info, nil
 }
 
+// InstalledBinaryPaths is the complete set of consumer-visible herd paths.
+// The root entry is intentionally a symlink to bin/herd, so callers can audit
+// both names while the build only ever installs one executable inode.
+func InstalledBinaryPaths(root string) []string {
+	return []string{filepath.Join(root, "herd"), filepath.Join(root, "bin", "herd")}
+}
+
+// ValidateInstalled checks every installed consumer-visible path against the
+// same source revision. A successful check can therefore never describe only
+// whichever executable happened to launch the check.
+func ValidateInstalled(root string) error {
+	if err := verifyGitRoot(root); err != nil {
+		return fmt.Errorf("provenance: %w", err)
+	}
+	source, err := gitValue(root, "rev-parse", "HEAD")
+	if err != nil {
+		return fmt.Errorf("provenance: source revision: %w", err)
+	}
+	infos := make([]Info, 0, len(InstalledBinaryPaths(root)))
+	for _, path := range InstalledBinaryPaths(root) {
+		if _, err := os.Stat(path); err != nil {
+			return fmt.Errorf("installed herd binary %s: %w", path, err)
+		}
+		info := infoFor(path, source, root)
+		if !info.Comparable {
+			return fmt.Errorf("installed herd binary %s: source module %q does not match binary module %q", path, info.SourceModule, info.BinaryModule)
+		}
+		infos = append(infos, info)
+	}
+	return validateInstalledInfos(infos, source)
+}
+
+func validateInstalledInfos(infos []Info, source string) error {
+	for _, info := range infos {
+		if err := Validate(info, source); err != nil {
+			return fmt.Errorf("%s: %w", info.Path, err)
+		}
+	}
+	return nil
+}
+
 func infoFor(path, source, root string) Info {
 	revision, buildTime, binaryModule := binaryValuesFrom(path)
 	sourceModule := modulePath(root)

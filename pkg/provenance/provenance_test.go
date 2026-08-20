@@ -111,3 +111,49 @@ func TestFormatReportsAllProvenanceFields(t *testing.T) {
 		}
 	}
 }
+
+func TestValidateInstalledInfosChecksEveryPath(t *testing.T) {
+	cases := []struct {
+		name  string
+		infos []Info
+		want  string
+	}{
+		{
+			name: "all current",
+			infos: []Info{
+				{Path: "./herd", BinaryRevision: "source"},
+				{Path: "./bin/herd", BinaryRevision: "source"},
+			},
+		},
+		{
+			name: "reports stale sibling",
+			infos: []Info{
+				{Path: "./herd", BinaryRevision: "source"},
+				{Path: "./bin/herd", BinaryRevision: "old"},
+			},
+			want: "./bin/herd: stale herd binary",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateInstalledInfos(tc.infos, "source")
+			if tc.want == "" {
+				if err != nil {
+					t.Fatalf("validateInstalledInfos() error = %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("validateInstalledInfos() error = %v, want %q", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestInstalledBinaryPathsAreDeterministic(t *testing.T) {
+	got := InstalledBinaryPaths("/repo")
+	want := []string{"/repo/herd", "/repo/bin/herd"}
+	if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
+		t.Fatalf("InstalledBinaryPaths() = %v, want %v", got, want)
+	}
+}

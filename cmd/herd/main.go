@@ -7958,6 +7958,10 @@ func runVerify() {
 			fmt.Fprintf(os.Stderr, "herd verify: %v\n", err)
 			os.Exit(1)
 		}
+		if err := provenance.ValidateInstalled(wt); err != nil {
+			fmt.Fprintf(os.Stderr, "herd verify: %v\n", err)
+			os.Exit(1)
+		}
 	}
 
 	var c *verifier.CompletionCheck
