@@ -119,8 +119,11 @@ var subcommandUsage = map[string]string{
 	"board-sync":  "Usage: herd board-sync [flags]\n  Reconcile board status against git reality and live lanes (report only).\n  --fix: advance to-do cards to in-progress when a live lane or branch proves work is in flight.",
 	"sh":          "Usage: herd sh\n  Interactive REPL shell (alias: herd repl).",
 	"repl":        "Usage: herd repl\n  Interactive REPL shell (alias: herd sh).",
-	"send": `Usage: herd send <pane|name> "<text>" [--file path] [--no-verify] [--timeout s]
+	"send": `Usage: herd send <pane|name> "<text>" [--file path] [--no-verify] [--timeout s] [--workspace id]
   Deliver a prompt and report whether the agent consumed it.
+
+  --workspace id  explicitly authorize a repo-qualified peer coordinator in another Herdr workspace.
+                   Ordinary lane delivery remains workspace-fenced when this is omitted.
 
 Outcomes:
   -> working  delivery confirmed; do not re-send.

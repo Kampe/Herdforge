@@ -3948,8 +3948,31 @@ func runSend() {
 	noVerify := fs.Bool("no-verify", false, "Submit without waiting for the agent to flip to working")
 	file := fs.String("file", "", "Read the text to send from a file (for long packets)")
 	timeoutSec := fs.Int("timeout", 30, "Seconds to wait for consumption confirmation")
+	workspace := fs.String("workspace", "", "Explicitly authorize delivery to a peer in this Herdr workspace")
 	selftestFlag := fs.Bool("selftest", false, "Run status-extraction assertions and exit")
-	fs.Parse(os.Args[2:])
+
+	// Go's flag package stops parsing at the first positional argument. Move
+	// recognized flags ahead of positionals so the documented interleaved form
+	// (including `--workspace` after the message) cannot leak flag text into the
+	// delivered prompt.
+	flagArgs := make([]string, 0, len(os.Args)-2)
+	pos := make([]string, 0, len(os.Args)-2)
+	for i := 2; i < len(os.Args); i++ {
+		arg := os.Args[i]
+		switch arg {
+		case "--no-verify", "--selftest":
+			flagArgs = append(flagArgs, arg)
+		case "--file", "--timeout", "--workspace":
+			flagArgs = append(flagArgs, arg)
+			if i+1 < len(os.Args) {
+				i++
+				flagArgs = append(flagArgs, os.Args[i])
+			}
+		default:
+			pos = append(pos, arg)
+		}
+	}
+	fs.Parse(append(flagArgs, pos...))
 
 	if *selftestFlag {
 		agents := []herdr.AgentEntry{
@@ -3967,16 +3990,9 @@ func runSend() {
 		return
 	}
 
-	// Collect ALL positionals with flags interleaved anywhere: Go's flag
-	// package stops at the first positional, which let a trailing
-	// "--timeout 30" leak INTO the delivered prompt text.
-	var pos []string
-	rest := fs.Args()
-	for len(rest) > 0 {
-		pos = append(pos, rest[0])
-		fs.Parse(rest[1:])
-		rest = fs.Args()
-	}
+	// Flags have been normalized above; the remaining arguments are the target
+	// and message positionals.
+	pos = fs.Args()
 	if len(pos) == 0 {
 		fmt.Fprintf(os.Stderr, "Usage: herd send <pane|name> \"<text>\" [--file path] [--no-verify] [--timeout s]\n")
 		os.Exit(2)
@@ -4004,7 +4020,13 @@ func runSend() {
 		os.Exit(1)
 	}
 
-	status, err := herdr.Send(target, text, !*noVerify, time.Duration(*timeoutSec)*time.Second)
+	var status string
+	var err error
+	if strings.TrimSpace(*workspace) != "" {
+		status, err = herdr.SendInWorkspace(target, text, !*noVerify, time.Duration(*timeoutSec)*time.Second, strings.TrimSpace(*workspace))
+	} else {
+		status, err = herdr.Send(target, text, !*noVerify, time.Duration(*timeoutSec)*time.Second)
+	}
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "herd send: %v\n", err)
 		os.Exit(1)
@@ -4015,7 +4037,11 @@ func runSend() {
 			os.Exit(1)
 		}
 	}
-	fmt.Println(herdr.FormatSendResult(target, status))
+	if strings.TrimSpace(*workspace) != "" {
+		fmt.Println(herdr.FormatSendResultInWorkspace(target, *workspace, status))
+	} else {
+		fmt.Println(herdr.FormatSendResult(target, status))
+	}
 }
 
 // runHerdrDeliver is the durable operator boundary for free-form prompt bytes.

@@ -47,6 +47,34 @@ func TestFormatSendResultExplainsDeliveryGuarantee(t *testing.T) {
 	}
 }
 
+func TestFormatSendResultInWorkspaceAuditsAuthorizedRoute(t *testing.T) {
+	if got, want := FormatSendResultInWorkspace("wB:p391", "wB", "working"), "herd send: wB:p391 [workspace=wB] -> working (delivery confirmed)"; got != want {
+		t.Fatalf("FormatSendResultInWorkspace() = %q, want %q", got, want)
+	}
+}
+
+func TestSendInWorkspaceAllowsExplicitCrossWorkspacePeer(t *testing.T) {
+	prev := runHerdr
+	t.Cleanup(func() { runHerdr = prev })
+	prompted := false
+	runHerdr = func(args ...string) (string, error) {
+		if len(args) >= 2 && args[0] == "agent" && args[1] == "list" {
+			return `{"result":{"agents":[{"name":"forge-orchestrator","pane_id":"wB:p391","workspace_id":"wB","agent_status":"idle"}]}}`, nil
+		}
+		if len(args) >= 2 && args[0] == "agent" && args[1] == "prompt" {
+			prompted = true
+		}
+		return "{}", nil
+	}
+
+	if got, err := SendInWorkspace("wB:p391", "authorized coordinator packet", false, time.Second, "wB"); err != nil || got != "submitted" {
+		t.Fatalf("SendInWorkspace() = %q, %v; want submitted", got, err)
+	}
+	if !prompted {
+		t.Fatal("authorized peer must be prompted")
+	}
+}
+
 func TestSendPressesEnterImmediatelyAfterPrompt(t *testing.T) {
 	t.Setenv("HERD_WORKSPACE", "wK")
 	oldRun := runHerdr
