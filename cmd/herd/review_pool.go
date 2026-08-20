@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"flag"
 	"fmt"
@@ -124,7 +125,7 @@ func runPoolReview(ref string) error {
 	if err != nil {
 		return err
 	}
-	tabLabel := "review-" + safeReviewSurfacePart(ref) + "-" + shortSHA(sha)
+	tabLabel := reviewTabLabel(ref, sha)
 	tab, err := herdr.TabCreate(herdr.TabCreateOptions{Workspace: ws, Label: tabLabel, Cwd: surface, NoFocus: true, Env: []string{herdr.AgentRoleEnv}})
 	if err != nil {
 		return fmt.Errorf("create reviewer tab: %w", err)
@@ -133,15 +134,16 @@ func runPoolReview(ref string) error {
 	if err != nil {
 		return fmt.Errorf("herdr CLI lookup: %w", err)
 	}
-	start := exec.Command(herdrBin, "agent", "start", tabLabel, "--kind", "opencode", "--pane", tab.Pane.ID, "--", "--model", *model, "--auto")
+	agentName := reviewAgentName(ref, sha)
+	start := exec.Command(herdrBin, "agent", "start", agentName, "--kind", "opencode", "--pane", tab.Pane.ID, "--", "--model", *model, "--auto")
 	if out, err := start.CombinedOutput(); err != nil {
 		return fmt.Errorf("start OpenCode reviewer: %v (%s)", err, strings.TrimSpace(string(out)))
 	}
-	if _, err := herdr.AgentPrompt(tabLabel, "Read and execute the review packet at "+packet+" in full.", false); err != nil {
+	if _, err := herdr.AgentPrompt(agentName, "Read and execute the review packet at "+packet+" in full.", false); err != nil {
 		return fmt.Errorf("deliver review packet: %w", err)
 	}
 	releaseOnFailure = false
-	fmt.Printf("reviewer launched ref=%s sha=%s lease=%s surface=%s tab=%s packet=%s\n", ref, shortSHA(sha), lease.LeaseID, surface, tabLabel, packet)
+	fmt.Printf("reviewer launched ref=%s sha=%s lease=%s surface=%s tab=%s agent=%s packet=%s\n", ref, shortSHA(sha), lease.LeaseID, surface, tabLabel, agentName, packet)
 	return nil
 }
 
@@ -247,8 +249,38 @@ func safeReviewSurfacePart(ref string) string {
 		}
 	}
 	part := strings.Trim(b.String(), "-")
+	for strings.Contains(part, "--") {
+		part = strings.ReplaceAll(part, "--", "-")
+	}
 	if part == "" {
 		return "candidate"
 	}
 	return part
+}
+
+const reviewAgentNameLimit = 32
+
+func reviewAgentName(ref, sha string) string {
+	base := "review-" + safeReviewSurfacePart(ref) + "-" + shortSHA(sha)
+	if len(base) <= reviewAgentNameLimit {
+		return base
+	}
+	// Keep the name recognizable while retaining a stable ref-derived suffix so
+	// long refs with the same visible prefix cannot collide after truncation.
+	suffix := fmt.Sprintf("-%x", sha256.Sum256([]byte(strings.TrimSpace(ref))))[:9]
+	prefixLen := reviewAgentNameLimit - len(suffix)
+	return strings.TrimRight(base[:prefixLen], "-") + suffix
+}
+
+func reviewTabLabel(ref, sha string) string {
+	// Herdr currently accepts the same 1-32 character surface used by agent
+	// names, but keep this policy separate so a future tab-label limit can
+	// change without changing agent identity semantics.
+	base := "review-" + safeReviewSurfacePart(ref) + "-" + shortSHA(sha)
+	if len(base) <= reviewAgentNameLimit {
+		return base
+	}
+	suffix := fmt.Sprintf("-%x", sha256.Sum256([]byte(strings.TrimSpace(ref)+"\x00"+strings.TrimSpace(sha))))[:9]
+	prefixLen := reviewAgentNameLimit - len(suffix)
+	return strings.TrimRight(base[:prefixLen], "-") + suffix
 }
