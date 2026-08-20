@@ -72,12 +72,18 @@ type RunState struct {
 // read seam. Empty or unreadable evidence blocks resume.
 type GraphAuthority func(context.Context) (string, error)
 
+// GraphAuthorityForTask supplies the dependency revision for one saved task.
+// Dispatch uses this narrower authority so admission does not require a
+// project-wide relation snapshot for an unrelated board component.
+type GraphAuthorityForTask func(context.Context, TaskState) (string, error)
+
 // Authority provides the live authorities required to resume. TaskProvider is
 // intentionally the project provider interface; revisions use EncodeRevision,
 // the same encoding used by the provider CAS authority.
 type Authority struct {
-	Tasks provider.TaskProvider
-	Graph GraphAuthority
+	Tasks        provider.TaskProvider
+	Graph        GraphAuthority
+	GraphForTask GraphAuthorityForTask
 }
 
 // Store is a SQLite-backed, cross-process durable run-state store.
@@ -189,10 +195,18 @@ func (s *Store) Resume(ctx context.Context, id string, a Authority) (*RunState, 
 	if err != nil {
 		return nil, err
 	}
-	if a.Tasks == nil || a.Graph == nil {
+	if a.Tasks == nil || (a.Graph == nil && a.GraphForTask == nil) {
 		return nil, fmt.Errorf("%w: missing provider or graph authority", ErrAmbiguous)
 	}
-	graph, err := a.Graph(ctx)
+	var graph string
+	if a.GraphForTask != nil {
+		if len(state.Tasks) == 0 {
+			return nil, fmt.Errorf("%w: run has no task for scoped graph authority", ErrAmbiguous)
+		}
+		graph, err = a.GraphForTask(ctx, state.Tasks[0])
+	} else {
+		graph, err = a.Graph(ctx)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("%w: graph unreadable: %v", ErrStale, err)
 	}
