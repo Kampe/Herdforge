@@ -44,12 +44,7 @@ If the cwd is the shared checkout, the branch does not match the assignment, or 
 
 ## Test cadence
 
-While iterating, scope Go tests to the packages and tests changed by the current edit: run commands such as `go test ./<changed-package>/... -run <TestName>`. Run the broader or full suite only once, immediately before the final `herd verify` and `herd shot --report complete` call. These five failures are known pre-existing environment failures; do not self-block on them without first confirming that your diff did not cause them:
-
-- `TestShotReportPostsDurableCallback`
-- `TestShotReportBlockedCarriesDetail`
-- `TestShotRefusesDuplicateInvocation`
-- `TestStopCLIMakesWinddownDurableAndDestroysNoWork`
+While iterating, scope Go tests to the packages and tests changed by the current edit: run commands such as `go test ./<changed-package>/... -run <TestName>`. Run the broader or full suite only once, immediately before the final `herd verify` and `herd shot --report complete` call. The seven failures in `.herd/known-failures.json` are known pre-existing failures; do not self-block on them without first confirming that your diff did not cause them. Run `make known-failures` to detect drift. Load-dependent package timeouts are not in the manifest and remain failures.
 
 ## Rejection repair (FAC-140)
 

@@ -1,6 +1,6 @@
 # Herdforge Makefile
 
-.PHONY: all build test test-unit test-contracts test-hermetic-compile test-coverage test-mutation test-race test-e2e preflight lint security security-test security-deps self-test herd-up clean ci package-inventory bin-parity
+.PHONY: all build test test-unit test-contracts test-hermetic-compile test-coverage test-mutation test-race test-e2e preflight lint security security-test security-deps self-test herd-up clean ci package-inventory bin-parity known-failures
 
 # FAC-135: shared hermetic Git environment for every gate. Host signing, hooks,
 # and ambient credentials must not influence fixtures or coverage.
@@ -91,6 +91,14 @@ test-mutation:
 test-e2e:
 	@echo "==> Running factory e2e (compiled herd + protocol fakes)..."
 	$(HERMETIC_GIT) go test -count=1 -timeout=300s -run 'FactoryE2E_|CliForgeDriver_' ./cmd/herd/
+
+# FAC-490: compare the checked-in known-failure set against the actual baseline
+# run. The test command may exit non-zero by design; the exact-set comparison is
+# the gate that follows it.
+known-failures:
+	@report=$$(mktemp); trap 'rm -f "$$report"' EXIT; \
+		$(HERMETIC_GIT) go test -json -count=1 -shuffle=on -timeout=300s ./cmd/herd/ ./pkg/verifier/ >"$$report" 2>&1 || true; \
+		$(HERMETIC_GIT) go run ./scripts/knownfailures --manifest .herd/known-failures.json --report "$$report"
 
 preflight:
 	@echo "==> Running preflight workspace boundary, merge-policy, and main/origin drift checks..."
