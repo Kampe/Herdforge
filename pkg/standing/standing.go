@@ -20,6 +20,7 @@ import (
 	"strings"
 
 	"github.com/Kampe/Herdforge/pkg/config"
+	"github.com/Kampe/Herdforge/pkg/goalguard"
 	"github.com/Kampe/Herdforge/pkg/kick"
 	"github.com/Kampe/Herdforge/pkg/worktree"
 )
@@ -193,7 +194,26 @@ func withContinuationGoal(lane config.LaneDef, prompt string) string {
 		goal = strings.ReplaceAll(goal, "{{role}}", strings.TrimSpace(lane.Role))
 		goal = strings.TrimSpace(strings.TrimPrefix(goal, "/goal"))
 	}
-	return strings.TrimSpace(prompt) + "\n\n/goal " + goal
+	return strings.TrimSpace(prompt) + "\n\n" + RenderAuthorityEnvelope(AuthorityEnvelopeForLane(lane)) + "\n/goal " + goal
+}
+
+// AuthorityEnvelopeForLane builds the standing grant from repository
+// configuration. The packet path is deliberately the exact configured path,
+// so a lane can verify the grant from its own transcript and worktree.
+func AuthorityEnvelopeForLane(lane config.LaneDef) goalguard.AuthorityEnvelope {
+	return goalguard.AuthorityEnvelope{
+		Grantor:          "coordinator",
+		PacketPath:       filepath.Clean(lane.Prompt),
+		BoundedAutonomy:  fmt.Sprintf("Improve the standing %s lane indefinitely by selecting and completing the next actionable work item; do not self-grant new authority.", strings.TrimSpace(lane.Role)),
+		MutationLimits:   fmt.Sprintf("Only change files in the isolated worktree %s, using declared %s authority and capabilities.", filepath.Clean(lane.Worktree), lane.Authority),
+		ForbiddenActions: []string{"push", "open or update a PR", "merge", "self-review", "change standing policy or authority"},
+		StopConditions:   []string{"explicit coordinator stop", "lease loss", "wind-down", "completed goal with coordinator acknowledgement"},
+	}
+}
+
+// RenderAuthorityEnvelope is the transcript-visible, human-verifiable grant.
+func RenderAuthorityEnvelope(a goalguard.AuthorityEnvelope) string {
+	return fmt.Sprintf("AUTHORITY ENVELOPE\n- grantor: %s\n- packet path: %s\n- bounded autonomy: %s\n- mutation limits: %s\n- forbidden actions: %s\n- stop conditions: %s\nAUTHORITY ENVELOPE END", a.Grantor, a.PacketPath, a.BoundedAutonomy, a.MutationLimits, strings.Join(a.ForbiddenActions, "; "), strings.Join(a.StopConditions, "; "))
 }
 
 func durableGoalTask(lane config.LaneDef) string {
@@ -833,6 +853,17 @@ func runRaise(result *Result, cfg *config.Config, lanes []config.LaneDef, repoRo
 			}
 		}
 
+		if opts.SetGoal != nil {
+			if err := opts.SetGoal(cwd, lane.Name, durableGoalTask(*lane), "coordinator"); err != nil {
+				rr.Outcome = OutcomeFailed
+				rr.Reason = "authority goal: " + err.Error()
+				result.Failed++
+				failures = append(failures, fmt.Errorf("%s: %w", lane.Name, err))
+				result.Roles = append(result.Roles, rr)
+				continue
+			}
+		}
+
 		// Re-validate cwd after prepare: still not shared root, still isolated.
 		if _, err := ValidateLane(*lane, repoRoot, opts.PromptReadable, opts.AbsPath); err != nil {
 			rr.Outcome = OutcomeFailed
@@ -937,14 +968,6 @@ func runRaise(result *Result, cfg *config.Config, lanes []config.LaneDef, repoRo
 				result.Roles = append(result.Roles, rr)
 				continue
 			}
-		}
-
-		if opts.SetGoal != nil {
-			task := durableGoalTask(*lane)
-			// Best-effort: a lane launches successfully either way. Without a
-			// durable goal its Stop hook degrades to the quiet no-goal path
-			// rather than blocking, so a write failure here is not fatal.
-			_ = opts.SetGoal(cwd, lane.Name, task, "coordinator")
 		}
 
 		rr.Outcome = OutcomeRaised

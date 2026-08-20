@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/Kampe/Herdforge/pkg/claim"
+	"github.com/Kampe/Herdforge/pkg/goalguard"
 )
 
 func TestGoalGuardCLISetCheckAndClear(t *testing.T) {
@@ -135,5 +136,43 @@ func TestGoalGuardStopHookAllowsStopWhenLeaseIsLost(t *testing.T) {
 	}
 	if decision.Continue || decision.Reason != "lease_lost" {
 		t.Fatalf("stop-hook decision = %+v, want non-continuing lease_lost", decision)
+	}
+}
+
+func TestGoalGuardStopHookRejectsContinuationWithoutGrant(t *testing.T) {
+	dir := t.TempDir()
+	state := filepath.Join(dir, "goal.json")
+	dbPath := filepath.Join(dir, ".herd", "launch-claims.db")
+	t.Setenv("HERD_LEASE_DB", dbPath)
+	store, err := claim.NewSQLiteLeaseStore(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease, err := store.AcquireWithIdentity(context.Background(), claim.LeaseKey{Repo: "repo", Provider: "kaneo", Project: "project", TaskRef: "FAC-525"}, "owner-525", "worker", "", "repo", "worker", "forge-worker", time.Now().UTC(), time.Hour)
+	if err != nil {
+		_ = store.Close()
+		t.Fatal(err)
+	}
+	defer store.Close()
+	s, err := goalguard.Open(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	if err := s.Set(goalguard.Goal{Lane: "forge-worker", Task: "FAC-525", Owner: "coordinator", Generation: lease.Generation, MaxContinuations: 1, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	oldStdout := os.Stdout
+	read, write, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stdout = write
+	err = runGoalGuardStopHook(s, nil)
+	_ = write.Close()
+	os.Stdout = oldStdout
+	_ = read.Close()
+	if err == nil || !strings.Contains(err.Error(), "no verifiable authority envelope") {
+		t.Fatalf("missing grant result=%v, want loud refusal", err)
 	}
 }

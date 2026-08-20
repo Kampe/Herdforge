@@ -40,6 +40,7 @@ import (
 	"github.com/Kampe/Herdforge/pkg/dispatch"
 	"github.com/Kampe/Herdforge/pkg/envplan"
 	"github.com/Kampe/Herdforge/pkg/feedback"
+	"github.com/Kampe/Herdforge/pkg/goalguard"
 	"github.com/Kampe/Herdforge/pkg/harvest"
 	"github.com/Kampe/Herdforge/pkg/herdr"
 	"github.com/Kampe/Herdforge/pkg/kick"
@@ -1790,7 +1791,13 @@ func runStandingConfigMode(cfg *config.Config, herdrAvailable bool, mode standin
 			return err
 		},
 		SetGoal: func(cwd, lane, task, owner string) error {
-			return setDurableGoal(cwd, lane, task, owner, 1)
+			for _, configured := range cfg.Lanes {
+				if configured.Name == lane {
+					envelope := standing.AuthorityEnvelopeForLane(configured)
+					return setDurableGoal(cwd, lane, task, owner, 1, &envelope)
+				}
+			}
+			return errors.New("standing authority envelope: lane not found")
 		},
 		CloseTab: func(tabID string) error {
 			return herdr.CloseTabVerified(tabID)
@@ -1970,7 +1977,7 @@ func runUp() {
 // setDurableGoal replaces the lane-local goal atomically. Direct task launches
 // use this when no standing native role can be resolved, so their Stop hook has
 // the same durable lease-bound continuation contract as standing raises.
-func setDurableGoal(cwd, lane, task, owner string, generation int64) error {
+func setDurableGoal(cwd, lane, task, owner string, generation int64, envelope *goalguard.AuthorityEnvelope) error {
 	self, err := os.Executable()
 	if err != nil {
 		return fmt.Errorf("resolve self for goal-guard: %w", err)
@@ -1978,6 +1985,13 @@ func setDurableGoal(cwd, lane, task, owner string, generation int64) error {
 	cmd := exec.Command(self, "goal-guard", "--set",
 		"--lane", lane, "--task", task, "--owner", owner,
 		"--generation", strconv.FormatInt(generation, 10))
+	if envelope != nil {
+		cmd.Args = append(cmd.Args,
+			"--grantor", envelope.Grantor, "--packet", envelope.PacketPath,
+			"--autonomy", envelope.BoundedAutonomy, "--mutations", envelope.MutationLimits,
+			"--forbidden", strings.Join(envelope.ForbiddenActions, ","),
+			"--stop-conditions", strings.Join(envelope.StopConditions, ","))
+	}
 	cmd.Dir = cwd
 	out, err := cmd.CombinedOutput()
 	if err != nil {
@@ -5591,7 +5605,7 @@ func runForgeE() error {
 					return compensateLaunchFailure(fmt.Errorf("forge prompt failed: %w", promptErr))
 				}
 				if directLaunch {
-					if goalErr := setDurableGoal(filepath.Join(".", lane.Worktree), lane.Name, task.Ref, "coordinator", forgeLeaseGeneration); goalErr != nil {
+					if goalErr := setDurableGoal(filepath.Join(".", lane.Worktree), lane.Name, task.Ref, "coordinator", forgeLeaseGeneration, nil); goalErr != nil {
 						return compensateLaunchFailure(fmt.Errorf("direct forge goal failed: %w", goalErr))
 					}
 				}
@@ -6572,6 +6586,15 @@ func runKick() {
 			return authority.CurrentGeneration(ctx, identity)
 		},
 		ActiveTasks: activeResolver,
+		AuthorityEnvelope: func(id string) (goalguard.AuthorityEnvelope, error) {
+			laneID := strings.TrimPrefix(id, kick.ForgePrefix)
+			for _, lane := range kickConfig.Lanes {
+				if lane.Name == laneID && lane.Standing {
+					return standing.AuthorityEnvelopeForLane(lane), nil
+				}
+			}
+			return goalguard.AuthorityEnvelope{}, fmt.Errorf("no standing lane configuration for %s", id)
+		},
 	})
 	// Persist regardless of err: Run mutates lastKick in place for every
 	// kick it actually sent before any later failure. --dry-run never sends

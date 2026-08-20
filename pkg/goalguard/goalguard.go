@@ -37,21 +37,53 @@ type StopConditions struct {
 	WindDown  bool `json:"wind_down"`
 }
 
+// AuthorityEnvelope is the coordinator's verifiable grant for a standing
+// lane. It is persisted beside the goal so the Stop hook enforces a grant
+// that already exists; the hook never creates continuation authority.
+type AuthorityEnvelope struct {
+	Grantor          string   `json:"grantor"`
+	PacketPath       string   `json:"packet_path"`
+	BoundedAutonomy  string   `json:"bounded_autonomy"`
+	MutationLimits   string   `json:"mutation_limits"`
+	ForbiddenActions []string `json:"forbidden_actions"`
+	StopConditions   []string `json:"stop_conditions"`
+}
+
+func (a AuthorityEnvelope) Validate() error {
+	if strings.TrimSpace(a.Grantor) == "" || strings.TrimSpace(a.PacketPath) == "" ||
+		strings.TrimSpace(a.BoundedAutonomy) == "" || strings.TrimSpace(a.MutationLimits) == "" ||
+		len(nonBlank(a.ForbiddenActions)) == 0 || len(nonBlank(a.StopConditions)) == 0 {
+		return errors.New("goalguard: authority envelope is incomplete")
+	}
+	return nil
+}
+
+func nonBlank(values []string) []string {
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			out = append(out, value)
+		}
+	}
+	return out
+}
+
 // Goal is the durable standing-lane contract. Continuations is incremented
 // before a continue decision is returned, so a crash after the decision cannot
 // reset the budget and create an unbounded loop.
 type Goal struct {
-	SchemaVersion    int            `json:"schema_version"`
-	Lane             string         `json:"lane"`
-	Task             string         `json:"task"`
-	Owner            string         `json:"owner"`
-	Generation       int64          `json:"generation"`
-	MaxContinuations int            `json:"max_continuations"`
-	Continuations    int            `json:"continuations"`
-	Stop             StopConditions `json:"stop"`
-	CreatedAt        time.Time      `json:"created_at"`
-	UpdatedAt        time.Time      `json:"updated_at"`
-	ExpiresAt        *time.Time     `json:"expires_at,omitempty"`
+	SchemaVersion    int                `json:"schema_version"`
+	Lane             string             `json:"lane"`
+	Task             string             `json:"task"`
+	Owner            string             `json:"owner"`
+	Generation       int64              `json:"generation"`
+	MaxContinuations int                `json:"max_continuations"`
+	Continuations    int                `json:"continuations"`
+	Stop             StopConditions     `json:"stop"`
+	CreatedAt        time.Time          `json:"created_at"`
+	UpdatedAt        time.Time          `json:"updated_at"`
+	ExpiresAt        *time.Time         `json:"expires_at,omitempty"`
+	Authority        *AuthorityEnvelope `json:"authority,omitempty"`
 }
 
 // Evidence is the live authority snapshot supplied for one guard decision.
