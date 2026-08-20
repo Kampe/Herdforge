@@ -91,8 +91,8 @@ func TestResolveWorkspaceListErrorPropagates(t *testing.T) {
 
 func TestCoordinatorTargetMatchesFirstQualifyingAgent(t *testing.T) {
 	agents := []herdr.AgentEntry{
-		{Name: "worker-1", Workspace: "wF"},
-		{Name: "chainseer-orchestrator", Workspace: "wF", PaneID: "pane-9"},
+		{Name: "worker-1", Workspace: "wF", Status: "working", PaneID: "pane-1"},
+		{Name: "chainseer-orchestrator", Workspace: "wF", Status: "working", PaneID: "pane-9"},
 	}
 	if got := CoordinatorTarget(agents, "wF"); got != "chainseer-orchestrator" {
 		t.Fatalf("got %q, want chainseer-orchestrator", got)
@@ -100,7 +100,7 @@ func TestCoordinatorTargetMatchesFirstQualifyingAgent(t *testing.T) {
 }
 
 func TestCoordinatorTargetCaseInsensitive(t *testing.T) {
-	agents := []herdr.AgentEntry{{Name: "Coordinator", Workspace: "wF", PaneID: "pane-9"}}
+	agents := []herdr.AgentEntry{{Name: "Coordinator", Workspace: "wF", Status: "working", PaneID: "pane-9"}}
 	if got := CoordinatorTarget(agents, "wF"); got != "Coordinator" {
 		t.Fatalf("got %q, want Coordinator (case-insensitive match)", got)
 	}
@@ -114,15 +114,35 @@ func TestCoordinatorTargetUnnamedAgentNeverMatches(t *testing.T) {
 }
 
 func TestCoordinatorTargetScopedToWorkspace(t *testing.T) {
-	agents := []herdr.AgentEntry{{Name: "orchestrator", Workspace: "wOther"}}
+	agents := []herdr.AgentEntry{{Name: "orchestrator", Workspace: "wOther", Status: "working", PaneID: "pane-9"}}
 	if got := CoordinatorTarget(agents, "wF"); got != "" {
 		t.Fatalf("got %q, want empty (no match in workspace wF)", got)
 	}
 }
 
 func TestCoordinatorTargetNoMatchIsEmpty(t *testing.T) {
-	agents := []herdr.AgentEntry{{Name: "worker-1", Workspace: "wF"}}
+	agents := []herdr.AgentEntry{{Name: "worker-1", Workspace: "wF", Status: "working", PaneID: "pane-1"}}
 	if got := CoordinatorTarget(agents, "wF"); got != "" {
 		t.Fatalf("got %q, want empty", got)
+	}
+}
+
+func TestCoordinatorTargetPrefersLiveForgeOrchestratorOverRetiredCoordinator(t *testing.T) {
+	agents := []herdr.AgentEntry{
+		{Name: "coordinator", Workspace: "wF", Status: "done", PaneID: "old-pane"},
+		{Name: "forge-orchestrator", Workspace: "wF", Status: "working", PaneID: "live-pane"},
+	}
+	if got := CoordinatorTarget(agents, "wF"); got != "forge-orchestrator" {
+		t.Fatalf("got %q, want forge-orchestrator", got)
+	}
+}
+
+func TestCoordinatorTargetRequiresLivePaneAndStatus(t *testing.T) {
+	agents := []herdr.AgentEntry{
+		{Name: "coordinator", Workspace: "wF", Status: "working"},
+		{Name: "orchestrator", Workspace: "wF", Status: "done", PaneID: "dead-pane"},
+	}
+	if got := CoordinatorTarget(agents, "wF"); got != "" {
+		t.Fatalf("got %q, want no live coordinator", got)
 	}
 }

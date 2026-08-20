@@ -2,8 +2,10 @@ package feedback
 
 import (
 	"errors"
+	"fmt"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 
 	"github.com/Kampe/Herdforge/pkg/herdr"
@@ -14,6 +16,9 @@ import (
 var ErrWorkspaceUnknown = errors.New("herd-feedback: no workspace matched")
 
 var coordinatorPattern = regexp.MustCompile(`(?i)coordinator|orchestrator`)
+
+// ErrCoordinatorUnresolved is returned when no live reply target exists.
+var ErrCoordinatorUnresolved = errors.New("herd-feedback: no live coordinator or orchestrator")
 
 // ResolveWorkspace ports herd_resolve_workspace: an explicit override
 // (HERD_WORKSPACE) wins unconditionally with no herdr call at all; otherwise
@@ -56,20 +61,66 @@ func ResolveWorkspace(root, label, override string, list func() ([]herdr.Workspa
 	return "", ErrWorkspaceUnknown
 }
 
-// CoordinatorTarget ports herd_coordinator_target: the name of the first
-// workspace agent whose name matches coordinator|orchestrator
-// (case-insensitive). Empty when no agent matches. There is no pane-id
-// fallback: the match requires a non-empty name, so an agent could never
-// reach this point with one — the original jq `.name // .pane_id` is
-// unreachable for the same reason and is not ported.
-func CoordinatorTarget(agents []herdr.AgentEntry, workspace string) string {
+func coordinatorCanReceive(a herdr.AgentEntry) bool {
+	if strings.TrimSpace(a.Name) == "" || strings.TrimSpace(a.PaneID) == "" {
+		return false
+	}
+	if strings.EqualFold(strings.TrimSpace(a.Status), "idle") {
+		return true
+	}
+	switch herdr.NormalizeTaskStatus(a.Status) {
+	case "done", "unknown":
+		return false
+	default:
+		return true
+	}
+}
+
+func resolveCoordinatorTarget(agents []herdr.AgentEntry, workspace, requested string) (string, error) {
+	requested = strings.TrimSpace(requested)
+	if requested != "" {
+		for _, a := range agents {
+			if a.Workspace == workspace && strings.EqualFold(a.Name, requested) && coordinatorCanReceive(a) {
+				return a.Name, nil
+			}
+		}
+		return "", fmt.Errorf("%w: requested %q is not live in workspace %q", ErrCoordinatorUnresolved, requested, workspace)
+	}
+	type candidate struct {
+		name string
+		rank int
+	}
+	var candidates []candidate
 	for _, a := range agents {
-		if workspace != "" && a.Workspace != workspace {
+		if a.Workspace != workspace || !coordinatorCanReceive(a) || !coordinatorPattern.MatchString(a.Name) {
 			continue
 		}
-		if coordinatorPattern.MatchString(a.Name) {
-			return a.Name
+		rank := 3
+		switch strings.ToLower(a.Name) {
+		case "forge-orchestrator":
+			rank = 0
+		case "orchestrator":
+			rank = 1
+		case "coordinator":
+			rank = 2
 		}
+		candidates = append(candidates, candidate{name: a.Name, rank: rank})
 	}
-	return ""
+	if len(candidates) == 0 {
+		return "", ErrCoordinatorUnresolved
+	}
+	sort.Slice(candidates, func(i, j int) bool {
+		if candidates[i].rank != candidates[j].rank {
+			return candidates[i].rank < candidates[j].rank
+		}
+		return strings.ToLower(candidates[i].name) < strings.ToLower(candidates[j].name)
+	})
+	return candidates[0].name, nil
+}
+
+// CoordinatorTarget returns the live coordinator name, or empty when none
+// exists. Run uses the error-returning resolver to fail closed with context.
+func CoordinatorTarget(agents []herdr.AgentEntry, workspace string) string {
+	got, _ := resolveCoordinatorTarget(agents, workspace, "")
+	return got
 }
