@@ -155,6 +155,40 @@ func TestResolveHarvestCandidatePinsReviewedSHAAcrossTipDrift(t *testing.T) {
 	}
 }
 
+func TestVerifyHarvestSelectionUsesAssignedRepository(t *testing.T) {
+	root := t.TempDir()
+	for _, args := range [][]string{
+		{"init", "-q", "-b", "main"},
+		{"config", "user.email", "test@example.com"},
+		{"config", "user.name", "test"},
+		{"commit", "--allow-empty", "-q", "-m", "base"},
+		{"branch", "candidate"},
+		{"checkout", "-q", "candidate"},
+	} {
+		if out, err := testgit.Command(root, args...).CombinedOutput(); err != nil {
+			t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, out)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(root, "candidate.txt"), []byte("candidate\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range [][]string{{"add", "candidate.txt"}, {"commit", "-q", "-m", "candidate"}} {
+		if out, err := testgit.Command(root, args...).CombinedOutput(); err != nil {
+			t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, out)
+		}
+	}
+	candidate := strings.TrimSpace(gitCandidateOutputAt(t, root, "rev-parse", "HEAD"))
+
+	unrelated := t.TempDir()
+	if out, err := testgit.Command(unrelated, "init", "-q").CombinedOutput(); err != nil {
+		t.Fatalf("initialize unrelated repository: %v\n%s", err, out)
+	}
+	t.Chdir(unrelated)
+	if err := verifyHarvestSelection(root, "main", candidate, []string{candidate}); err != nil {
+		t.Fatalf("verification must use assigned repository: %v", err)
+	}
+}
+
 func TestResolveHarvestCandidateUsesCandidateSHAWhenQueueBranchIsReviewerTask(t *testing.T) {
 	root := t.TempDir()
 	t.Chdir(root)
@@ -281,6 +315,15 @@ func gitCandidateTest(t *testing.T, args ...string) {
 func gitCandidateOutput(t *testing.T, args ...string) string {
 	t.Helper()
 	out, err := testgit.Command(".", args...).Output()
+	if err != nil {
+		t.Fatalf("git %s: %v", strings.Join(args, " "), err)
+	}
+	return strings.TrimSpace(string(out))
+}
+
+func gitCandidateOutputAt(t *testing.T, dir string, args ...string) string {
+	t.Helper()
+	out, err := testgit.Command(dir, args...).Output()
 	if err != nil {
 		t.Fatalf("git %s: %v", strings.Join(args, " "), err)
 	}
