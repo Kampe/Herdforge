@@ -1400,6 +1400,26 @@ func agentStartProcess(name, kind, paneID string, agentArgs ...string) error {
 	return nil
 }
 
+// StartReviewAgent starts a warm-pool reviewer only after the pane shell has
+// become attachable, then proves that the named agent still owns the pane and
+// has a foreground process. A created tab or a successful start command is
+// not launch success. Any failed proof compensates the exact tab.
+func StartReviewAgent(tabID, name, paneID, model string) error {
+	if strings.TrimSpace(tabID) == "" || strings.TrimSpace(name) == "" || strings.TrimSpace(paneID) == "" {
+		return fmt.Errorf("review launch identity requires tab, agent, and pane")
+	}
+	if strings.TrimSpace(model) == "" {
+		return fmt.Errorf("review launch model is required")
+	}
+	if err := agentStartProcess(name, "opencode", paneID, "--model", model, "--auto"); err != nil {
+		return errors.Join(err, hardCloseTab(tabID, name))
+	}
+	if _, err := VerifyAgentLaunch(name, paneID, 15*time.Second); err != nil {
+		return errors.Join(err, hardCloseTab(tabID, name))
+	}
+	return nil
+}
+
 // LaneAgentArgs builds the launch args a lane's config demands: the
 // configured model, when set, always reaches the agent argv.
 func LaneAgentArgs(model string) []string {
@@ -1957,6 +1977,7 @@ func LoginOrAuthScreen(title, body string) bool {
 		"visit https://", "open the following url", "auth0", "oauth",
 		"chatgpt.com", "platform.openai.com", "please log in", "login required",
 		"not logged in", "api key", "enter your api key", "press enter to open",
+		"trust this folder", "trust this workspace", "allow access", "consent required",
 	}
 	for _, n := range needles {
 		if strings.Contains(s, n) {

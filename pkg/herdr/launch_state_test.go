@@ -73,6 +73,23 @@ func TestHasForegroundAgentProcessIgnoresShells(t *testing.T) {
 	}
 }
 
+func TestLoginOrAuthScreenTreatsTrustDialogsAsNotReady(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		text string
+	}{
+		{name: "folder", text: "Trust this folder to continue"},
+		{name: "workspace", text: "Trust this workspace?"},
+		{name: "consent", text: "Consent required before access"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if !LoginOrAuthScreen("", tc.text) {
+				t.Fatalf("dialog %q was accepted as a usable session", tc.text)
+			}
+		})
+	}
+}
+
 func TestVerifyAgentLaunchRejectsPaneIncarnationDrift(t *testing.T) {
 	old := runHerdr
 	defer func() { runHerdr = old }()

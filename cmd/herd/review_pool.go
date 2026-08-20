@@ -130,18 +130,22 @@ func runPoolReview(ref string) error {
 	if err != nil {
 		return fmt.Errorf("create reviewer tab: %w", err)
 	}
-	herdrBin, err := exec.LookPath("herdr")
-	if err != nil {
-		return fmt.Errorf("herdr CLI lookup: %w", err)
-	}
 	agentName := reviewAgentName(ref, sha)
-	start := exec.Command(herdrBin, "agent", "start", agentName, "--kind", "opencode", "--pane", tab.Pane.ID, "--", "--model", *model, "--auto")
-	if out, err := start.CombinedOutput(); err != nil {
-		return fmt.Errorf("start OpenCode reviewer: %v (%s)", err, strings.TrimSpace(string(out)))
+	cleanupTab := true
+	defer func() {
+		if cleanupTab {
+			// StartReviewAgent and the prompt path both use the exact tab/name
+			// identity; a failed launch must never leave a pool orphan behind.
+			_ = herdr.CloseReviewTab(tab.ID, agentName)
+		}
+	}()
+	if err := herdr.StartReviewAgent(tab.ID, agentName, tab.Pane.ID, *model); err != nil {
+		return fmt.Errorf("start OpenCode reviewer: %w", err)
 	}
 	if _, err := herdr.AgentPrompt(agentName, "Read and execute the review packet at "+packet+" in full.", false); err != nil {
-		return fmt.Errorf("deliver review packet: %w", err)
+		return errors.Join(fmt.Errorf("deliver review packet: %w", err), herdr.CloseReviewTab(tab.ID, agentName))
 	}
+	cleanupTab = false
 	releaseOnFailure = false
 	fmt.Printf("reviewer launched ref=%s sha=%s lease=%s surface=%s tab=%s agent=%s packet=%s\n", ref, shortSHA(sha), lease.LeaseID, surface, tabLabel, agentName, packet)
 	return nil
