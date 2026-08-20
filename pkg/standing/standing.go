@@ -393,19 +393,13 @@ func defaultPromptReadable(path string) error {
 // lookups. Agent names are fleet-global, so name alone is not an identity:
 // the live record must belong to the resolved workspace and its cwd must be
 // inside the repository being operated.
-func indexAgents(agents []Agent, workspace, repoRoot string) map[string]Agent {
-	idx := make(map[string]Agent, len(agents))
+func indexAgents(agents []Agent, workspace, repoRoot string) map[string][]Agent {
+	idx := make(map[string][]Agent, len(agents))
 	for _, a := range agents {
 		if a.Name == "" || !authorizedAgent(a, workspace, repoRoot) {
 			continue
 		}
-		if _, exists := idx[a.Name]; exists {
-			// A duplicate authorized identity is ambiguous. Do not let list
-			// ordering decide which tab status suppresses a raise or shutdown.
-			delete(idx, a.Name)
-			continue
-		}
-		idx[a.Name] = a
+		idx[a.Name] = append(idx[a.Name], a)
 	}
 	return idx
 }
@@ -414,24 +408,70 @@ func indexAgents(agents []Agent, workspace, repoRoot string) map[string]Agent {
 // unqualified owner only when no qualified record exists. The fallback keeps
 // lanes raised before repository-qualified naming from being reported missing
 // or raised a second time during the naming transition.
-func standingAgent(live map[string]Agent, laneName, repository string) (string, Agent, bool) {
-	qualified := AgentNameForRepository(laneName, repository)
-	if agent, ok := live[qualified]; ok {
-		return qualified, agent, true
+// standingAgent resolves a lane to its live agent. Within one workspace two
+// agents can share a name, so the lane's OWN configured cwd is the
+// disambiguator — not containment in repoRoot, which would reject lanes whose
+// worktrees legitimately sit outside the repository (FAC-503).
+func standingAgent(live map[string][]Agent, laneName, repository, laneCWD string) (string, Agent, bool) {
+	for _, name := range []string{AgentNameForRepository(laneName, repository), AgentName(laneName)} {
+		candidates := live[name]
+		if len(candidates) == 0 {
+			continue
+		}
+		if want := strings.TrimSpace(laneCWD); want != "" {
+			for _, a := range candidates {
+				if samePath(a.Cwd, want) {
+					return name, a, true
+				}
+			}
+		}
+		if len(candidates) == 1 {
+			return name, candidates[0], true
+		}
+		// Ambiguous and no configured cwd matched: refuse rather than let
+		// list order decide which tab's status is authoritative.
+		return name, Agent{}, false
 	}
-	legacy := AgentName(laneName)
-	if agent, ok := live[legacy]; ok {
-		return legacy, agent, true
-	}
-	return qualified, Agent{}, false
+	return AgentNameForRepository(laneName, repository), Agent{}, false
 }
 
-func authorizedAgent(agent Agent, workspace, repoRoot string) bool {
-	workspace = strings.TrimSpace(workspace)
-	if workspace == "" || strings.TrimSpace(agent.Workspace) != workspace || strings.TrimSpace(agent.Cwd) == "" {
+// samePath compares two paths after cleaning and resolving symlinks.
+func samePath(a, b string) bool {
+	ca, err := filepath.Abs(strings.TrimSpace(a))
+	if err != nil {
 		return false
 	}
-	return pathWithin(repoRoot, agent.Cwd)
+	cb, err := filepath.Abs(strings.TrimSpace(b))
+	if err != nil {
+		return false
+	}
+	if r, err := filepath.EvalSymlinks(ca); err == nil {
+		ca = r
+	}
+	if r, err := filepath.EvalSymlinks(cb); err == nil {
+		cb = r
+	}
+	return filepath.Clean(ca) == filepath.Clean(cb)
+}
+
+// authorizedAgent decides whether a live agent may satisfy THIS repository's
+// lane lookup. WORKSPACE is the authority: it is what separates two repos
+// sharing one control plane, and it alone correctly rejects a foreign
+// workspace's identically-named lane.
+//
+// FAC-503: repoRoot containment is deliberately NOT a condition. A standing
+// lane's worktree legitimately lives outside the repository directory —
+// sibling per-lane checkouts are the normal topology — so requiring
+// pathWithin(repoRoot, cwd) reported healthy lanes as missing and a raise
+// against that state would duplicate them. Rejecting a real lane is worse
+// than the cross-repo confusion this check was reaching for, which workspace
+// scoping already prevents.
+func authorizedAgent(agent Agent, workspace, repoRoot string) bool {
+	workspace = strings.TrimSpace(workspace)
+	if workspace == "" || strings.TrimSpace(agent.Workspace) != workspace {
+		return false
+	}
+	return strings.TrimSpace(agent.Cwd) != ""
 }
 
 func pathWithin(root, candidate string) bool {
@@ -534,7 +574,7 @@ func modeString(m Mode) string {
 	}
 }
 
-func runStatus(result *Result, lanes []config.LaneDef, live map[string]Agent, repoRoot, repository string, opts Options) (*Result, error) {
+func runStatus(result *Result, lanes []config.LaneDef, live map[string][]Agent, repoRoot, repository string, opts Options) (*Result, error) {
 	var failures []error
 	for i := range lanes {
 		lane := lanes[i]
@@ -549,7 +589,7 @@ func runStatus(result *Result, lanes []config.LaneDef, live map[string]Agent, re
 			result.Roles = append(result.Roles, rr)
 			continue
 		}
-		if actualName, a, ok := standingAgent(live, lane.Name, repository); ok && NameHeld(a.Status) {
+		if actualName, a, ok := standingAgent(live, lane.Name, repository, rr.CWD); ok && NameHeld(a.Status) {
 			rr.AgentName = actualName
 			rr.LoopMode = a.LoopMode
 			if rr.LoopMode == "" {
@@ -580,7 +620,7 @@ func runStatus(result *Result, lanes []config.LaneDef, live map[string]Agent, re
 	return result, errors.Join(failures...)
 }
 
-func runShutdown(result *Result, lanes []config.LaneDef, live map[string]Agent, repoRoot, repository string, opts Options) (*Result, error) {
+func runShutdown(result *Result, lanes []config.LaneDef, live map[string][]Agent, repoRoot, repository string, opts Options) (*Result, error) {
 	// Exact shutdown: only configured standing agent names. Ephemeral task
 	// workers (task-*, non-standing forge-*) are never selected.
 	standingNames := map[string]struct{}{}
@@ -591,7 +631,7 @@ func runShutdown(result *Result, lanes []config.LaneDef, live map[string]Agent, 
 	for _, lane := range lanes {
 		agentName := AgentNameForRepository(lane.Name, repository)
 		rr := RoleResult{LaneName: lane.Name, AgentName: agentName, Role: lane.Role}
-		actualName, a, ok := standingAgent(live, lane.Name, repository)
+		actualName, a, ok := standingAgent(live, lane.Name, repository, "")
 		if !ok || a.TabID == "" {
 			rr.Outcome = OutcomeMissing
 			rr.Reason = "not live"
@@ -685,7 +725,7 @@ func runRaise(result *Result, cfg *config.Config, lanes []config.LaneDef, repoRo
 
 	// Lazy fleet inventory: loaded only after the first successful AdmitRoute
 	// so a policy-only failure never pays for (or is masked by) herdr agent list.
-	var live map[string]Agent
+	var live map[string][]Agent
 	liveLoaded := false
 	loadLive := func() error {
 		if liveLoaded {
@@ -759,7 +799,7 @@ func runRaise(result *Result, cfg *config.Config, lanes []config.LaneDef, repoRo
 			result.Roles = append(result.Roles, rr)
 			continue
 		}
-		if actualName, a, ok := standingAgent(live, lane.Name, repository); ok && NameHeld(a.Status) {
+		if actualName, a, ok := standingAgent(live, lane.Name, repository, rr.CWD); ok && NameHeld(a.Status) {
 			rr.AgentName = actualName
 			if strings.EqualFold(strings.TrimSpace(a.Status), "done") && opts.CloseTab != nil {
 				if err := opts.CloseTab(a.TabID); err != nil {
@@ -975,7 +1015,7 @@ func runRaise(result *Result, cfg *config.Config, lanes []config.LaneDef, repoRo
 		result.Raised++
 		// Reflect into live index so a second selection in the same run
 		// cannot double-raise the same name (repeated raise safety).
-		live[agentName] = Agent{Name: agentName, Status: "starting", TabID: tab.ID, PaneID: tab.PaneID, Cwd: cwd, Workspace: result.Workspace}
+		live[agentName] = []Agent{{Name: agentName, Status: "starting", TabID: tab.ID, PaneID: tab.PaneID, Cwd: cwd, Workspace: result.Workspace}}
 		result.Roles = append(result.Roles, rr)
 	}
 
