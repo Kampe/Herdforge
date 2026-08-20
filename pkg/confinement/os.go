@@ -582,6 +582,29 @@ func wrapperScript(profilePath, digest, realAgent string, fake bool) string {
 		"PROFILE=" + shellSingleArg(profilePath) + "\n" +
 		"EXPECT=" + shellSingleArg(digest) + "\n" +
 		"REAL=" + shellSingleArg(realAgent) + "\n" +
+		"# Builder lanes cannot route around review by merging or closing PRs.\n" +
+		"case \"${0##*/}\" in\n" +
+		"gh)\n" +
+		"  previous=\"\"\n" +
+		"  for argument in \"$@\"; do\n" +
+		"    if [ \"$previous\" = pr ] && { [ \"$argument\" = merge ] || [ \"$argument\" = close ]; }; then\n" +
+		"      echo 'builder lane: gh pr merge/close is coordinator-only' >&2\n" +
+		"      exit 126\n" +
+		"    fi\n" +
+		"    previous=\"$argument\"\n" +
+		"  done\n" +
+		"  ;;\n" +
+		"git)\n" +
+		"  pushing=\"false\"\n" +
+		"  for argument in \"$@\"; do\n" +
+		"    [ \"$argument\" = push ] && pushing=\"true\" && continue\n" +
+		"    if [ \"$pushing\" = true ] && { [ \"$argument\" = main ] || [ \"$argument\" = master ] || [ \"${argument#*:}\" = main ] || [ \"${argument#*:}\" = master ]; }; then\n" +
+		"      echo 'builder lane: direct push to the default branch is coordinator-only' >&2\n" +
+		"      exit 126\n" +
+		"    fi\n" +
+		"  done\n" +
+		"  ;;\n" +
+		"esac\n" +
 		"ACTUAL=$(/usr/bin/shasum -a 256 \"$PROFILE\" 2>/dev/null | /usr/bin/awk '{print $1}')\n" +
 		"[ -n \"$ACTUAL\" ] && [ \"$ACTUAL\" = \"$EXPECT\" ] || exit 78\n" +
 		"exec /usr/bin/sandbox-exec -f \"$PROFILE\" \"$REAL\" \"$@\"\n"
