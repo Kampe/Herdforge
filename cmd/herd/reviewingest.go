@@ -522,7 +522,7 @@ func runHarvestMerge() {
 		fmt.Fprintf(os.Stderr, "herd harvest-merge: %v\n", err)
 		os.Exit(1)
 	}
-	if err := verifyHarvestSelection(selectionRange.Base, selectionRange.SHA, commits); err != nil {
+	if err := verifyHarvestSelection(repoRoot, selectionRange.Base, selectionRange.SHA, commits); err != nil {
 		fmt.Fprintf(os.Stderr, "herd harvest-merge: %v\n", err)
 		os.Exit(1)
 	}
@@ -540,7 +540,9 @@ func runHarvestMerge() {
 	if rangeSpec.SHA != "" {
 		diffTarget = rangeSpec.SHA
 	}
-	diffstatOut, diffErr := exec.Command("git", "diff", "--shortstat", *base+"..."+diffTarget).Output()
+	diffstatCmd := exec.Command("git", "diff", "--shortstat", *base+"..."+diffTarget)
+	diffstatCmd.Dir = repoRoot
+	diffstatOut, diffErr := diffstatCmd.Output()
 	if diffErr != nil {
 		fmt.Fprintf(os.Stderr, "herd harvest-merge: git diff --shortstat %s...%s: %v\n", *base, diffTarget, diffErr)
 		os.Exit(1)
@@ -651,13 +653,14 @@ func harvestCommits(base, branch string, reviewed harvestmerge.CandidateRange) (
 // selection. The harvest command must never write a worktree from a list that
 // differs from git cherry <base> <candidate>, even if selection code changes
 // later or a caller accidentally widens the target back to a branch tip.
-func verifyHarvestSelection(base, candidate string, selected []string) error {
+func verifyHarvestSelection(repoRoot, base, candidate string, selected []string) error {
 	base = strings.TrimSpace(base)
 	candidate = strings.TrimSpace(candidate)
 	if base == "" || candidate == "" {
 		return fmt.Errorf("harvest-merge: pinned candidate selection requires an exact base and candidate")
 	}
 	cmd := exec.Command("git", "cherry", base, candidate)
+	cmd.Dir = repoRoot
 	cherry, err := cmd.Output()
 	if err != nil {
 		return fmt.Errorf("git cherry %s %s for selection verification: %w", base, candidate, err)
@@ -1115,7 +1118,13 @@ func resolveVerifyLandedRequest(binding verifyLandedBinding, candidate string) (
 // matches branch. Returns "" when no worktree holds the branch. Used by
 // harvest-merge --verify-landed to locate the lane's worktree for LandedProof.
 func worktreeForBranch(branch string) string {
-	out, err := exec.Command("git", "worktree", "list", "--porcelain").Output()
+	repoRoot, err := filepath.Abs(".")
+	if err != nil {
+		return ""
+	}
+	cmd := exec.Command("git", "worktree", "list", "--porcelain")
+	cmd.Dir = repoRoot
+	out, err := cmd.Output()
 	if err != nil {
 		return ""
 	}

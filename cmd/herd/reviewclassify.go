@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -125,7 +126,13 @@ func runReviewClassify() {
 
 // diffStat resolves the changed paths and line counts between base and target.
 func diffStat(base, target string) ([]string, int, int, error) {
-	out, err := exec.Command("git", "diff", "--numstat", base+"..."+target).Output()
+	repoRoot, err := filepath.Abs(".")
+	if err != nil {
+		return nil, 0, 0, fmt.Errorf("resolve repository root: %w", err)
+	}
+	cmd := exec.Command("git", "diff", "--numstat", base+"..."+target)
+	cmd.Dir = repoRoot
+	out, err := cmd.Output()
 	if err != nil {
 		return nil, 0, 0, fmt.Errorf("git diff %s...%s: %w", base, target, err)
 	}
