@@ -19,6 +19,7 @@ import (
 	"github.com/Kampe/Herdforge/pkg/config"
 	"github.com/Kampe/Herdforge/pkg/deps"
 	"github.com/Kampe/Herdforge/pkg/herdr"
+	"github.com/Kampe/Herdforge/pkg/lifecycle"
 	"github.com/Kampe/Herdforge/pkg/mail"
 	"github.com/Kampe/Herdforge/pkg/provider"
 	"github.com/Kampe/Herdforge/pkg/pulse"
@@ -118,9 +119,21 @@ func gatherPulseObservation(ctx context.Context, act bool) (pulse.Observation, p
 		if strings.TrimSpace(providerObs.NextTaskRef) == "" {
 			return errors.New("pulse: no claimable task ref available for bounded dispatch")
 		}
-		_, _, err := dispatchTicketDecision(dispatchCtx, dispatchRequest{
+		cfg, err := config.LoadConfig(".herd/herd.yaml")
+		if err != nil {
+			return fmt.Errorf("pulse: bounded dispatch lane identity: load config: %w", err)
+		}
+		registry, err := canonicalLaneRegistry(cfg)
+		if err != nil {
+			return fmt.Errorf("pulse: bounded dispatch lane identity: %w", err)
+		}
+		laneName, err := resolvePulseDispatchLane(registry, target)
+		if err != nil {
+			return fmt.Errorf("pulse: bounded dispatch lane identity: %w", err)
+		}
+		_, _, err = dispatchTicketDecision(dispatchCtx, dispatchRequest{
 			TicketRef:    providerObs.NextTaskRef,
-			LaneName:     target,
+			LaneName:     laneName,
 			LaneExplicit: true,
 		}, io.Discard)
 		if err != nil {
@@ -170,6 +183,18 @@ func gatherPulseObservation(ctx context.Context, act bool) (pulse.Observation, p
 	}
 
 	return obs, actor
+}
+
+// resolvePulseDispatchLane converts the live agent ID discovered by Herdr
+// (forge-<lane>) into the configured lane name expected by dispatch. Keeping
+// the namespaces explicit prevents dispatch from treating a live ID as a
+// configured lane name and failing after selection.
+func resolvePulseDispatchLane(registry lifecycle.CanonicalLaneRegistry, liveID string) (string, error) {
+	lane, err := registry.ResolveLiveAgentID(liveID)
+	if err != nil {
+		return "", err
+	}
+	return lane.Name, nil
 }
 
 func readPulseProvider(ctx context.Context) (pulse.ProviderObservation, map[string]bool) {
