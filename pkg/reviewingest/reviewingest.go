@@ -40,6 +40,7 @@ type Artifact struct {
 	// worktree reports the pin without effort, and a wandering one has to
 	// state a mismatch or lie outright.
 	ReadHead string
+	RetryOf  string
 	Body     string
 	// UnknownHeaders are front-matter keys we did not recognise. Validate
 	// REFUSES on these — a write-only field would surface nothing, which is how
@@ -128,6 +129,8 @@ func Parse(text string) Artifact {
 				// anything else makes the wandering-reviewer gate dead code
 				// that fails OPEN with no warning.
 				a.ReadHead = value
+			case "retry-of":
+				a.RetryOf = value
 			default:
 				if unknownHeaderRe.MatchString(name) {
 					a.UnknownHeaders = append(a.UnknownHeaders, name)
@@ -171,7 +174,7 @@ func (a Artifact) Validate(coordinators map[string]struct{}, commitExists func(s
 	// unwritten contract would make every reviewer's first artifact a guess.
 	if len(a.UnknownHeaders) > 0 {
 		return fmt.Errorf("unrecognised front-matter key(s): %s; accepted keys are "+
-			"sha, branch, reviewer, authority, asserting-authority, reviewer-family, builder-family, verdict, reviewed-head "+
+			"sha, branch, reviewer, authority, asserting-authority, reviewer-family, builder-family, verdict, reviewed-head, retry-of "+
 			"(see .herd/prompts/review-verdict.template.md); a misspelled gate key silently "+
 			"disables its gate, so this is refused rather than ignored",
 			strings.Join(a.UnknownHeaders, ", "))
