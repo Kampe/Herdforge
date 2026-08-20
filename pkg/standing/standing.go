@@ -373,9 +373,16 @@ func defaultPromptReadable(path string) error {
 func indexAgents(agents []Agent, workspace, repoRoot string) map[string]Agent {
 	idx := make(map[string]Agent, len(agents))
 	for _, a := range agents {
-		if a.Name != "" && authorizedAgent(a, workspace, repoRoot) {
-			idx[a.Name] = a
+		if a.Name == "" || !authorizedAgent(a, workspace, repoRoot) {
+			continue
 		}
+		if _, exists := idx[a.Name]; exists {
+			// A duplicate authorized identity is ambiguous. Do not let list
+			// ordering decide which tab status suppresses a raise or shutdown.
+			delete(idx, a.Name)
+			continue
+		}
+		idx[a.Name] = a
 	}
 	return idx
 }

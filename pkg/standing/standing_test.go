@@ -586,6 +586,27 @@ func TestRaiseTreatsUnauthorizedSameNamedAgentAsMissing(t *testing.T) {
 	}
 }
 
+func TestIndexAgentsFailsClosedOnDuplicateAuthorizedIdentity(t *testing.T) {
+	repo, _ := standingFixture(t)
+	cwd := filepath.Join(repo, ".worktrees", "orch")
+	got := indexAgents([]Agent{
+		{Name: "forge-orch", Status: "idle", Workspace: "wTEST", Cwd: cwd},
+		{Name: "forge-orch", Status: "working", Workspace: "wTEST", Cwd: cwd},
+	}, "wTEST", repo)
+	if _, ok := got["forge-orch"]; ok {
+		t.Fatal("duplicate authorized identity must be absent rather than selected by list order")
+	}
+	// Prove the guard is specific to the duplicate case: one authorized
+	// record remains live while foreign records remain ignored.
+	got = indexAgents([]Agent{
+		{Name: "forge-orch", Status: "idle", Workspace: "other", Cwd: cwd},
+		{Name: "forge-orch", Status: "working", Workspace: "wTEST", Cwd: cwd},
+	}, "wTEST", repo)
+	if got["forge-orch"].Status != "working" {
+		t.Fatalf("authorized identity = %+v, want working record", got["forge-orch"])
+	}
+}
+
 // TestStatusReportsUnraiseableWhenHarnessMissing proves --status distinguishes
 // "not raised" (could be raised, just isn't) from "cannot be raised on this
 // host" (harness binary missing). When HarnessPresent returns false, missing
