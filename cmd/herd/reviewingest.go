@@ -261,12 +261,14 @@ type reviewIngestLedger interface {
 // artifact. An append acknowledgement alone is not sufficient admission
 // evidence: a failed read-back must leave the artifact available for retry.
 func admitVerdictAndMove(ledger reviewIngestLedger, opts reviewledger.IngestOpts, source, sha string) (bool, error) {
-	if prior, found, err := ledger.VerdictForReviewer(sha, opts.Verdict.Reviewer); err != nil {
-		return false, fmt.Errorf("read existing ledger verdict: %w", err)
-	} else if found && prior.Reviewer == opts.Verdict.Reviewer {
-		// A duplicate handoff is a durable no-op. Leave the source available
-		// for inspection/retry; it must not be consumed as ingested evidence.
-		return false, nil
+	if opts.Verdict.Reviewer != "" {
+		if prior, found, err := ledger.VerdictForReviewer(sha, opts.Verdict.Reviewer); err != nil {
+			return false, fmt.Errorf("read existing ledger verdict: %w", err)
+		} else if found && prior.Reviewer == opts.Verdict.Reviewer {
+			// A duplicate handoff is a durable no-op. Leave the source available
+			// for inspection/retry; it must not be consumed as ingested evidence.
+			return false, nil
+		}
 	}
 	enqueued, err := ledger.Ingest(opts)
 	if err != nil {
@@ -593,9 +595,10 @@ func resolveHarvestCandidateWithReconstruction(branch, requested, reconstructedS
 	var latest reviewledger.LedgerRow
 	queuedBySHA := make(map[string]reviewledger.LedgerRow)
 	for _, row := range queued {
-		if row.Branch != "" && row.Branch != branch {
-			continue
-		}
+		// The queue branch is the reviewer task that produced the verdict, not
+		// necessarily the standing builder branch being harvested. CandidateSHA
+		// and the exact ancestry/eligibility checks below are the provenance
+		// boundary between those two branches.
 		queuedBySHA[row.SHA] = row
 		if row.Timestamp >= latest.Timestamp {
 			latest = row
