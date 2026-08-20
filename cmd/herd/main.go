@@ -1534,13 +1534,13 @@ func runDaemon() {
 		v := verifier.NewVerifier(cfg.Verification.TestCommand)
 		eng := daemon.NewEngine(cfg, tp, nil, st, wm, v)
 
-		standing := fmt.Sprintf("forge-%s", lane.Name)
+		standingName := standing.AgentNameForRepository(lane.Name, repository)
 		rec, err := eng.RunDaemonTick(ctx, *role, daemon.TickOptions{
 			Decision:     decision,
 			Lane:         lane,
 			Repository:   repository,
 			Herdr:        dispatch.LiveHerdr{},
-			StandingName: standing,
+			StandingName: standingName,
 			ResolveStanding: func(_ context.Context, name string, req launch.Request) (*daemon.StandingAgent, error) {
 				tabLabel, rerr := herdr.ResolveAgentTabWithDecision(name, req)
 				if rerr != nil {
@@ -1945,7 +1945,7 @@ func runUp() {
 			cwd = filepath.Join(".", lane.Worktree)
 		}
 		req := launch.Request{Decision: admitted, TaskRef: lane.Name, Scope: router.ScopeLane, Repository: repository, Lane: lane.Name}
-		_, tab, tabErr = openWriteCapableTab(admitted, req, lane, workspace, fmt.Sprintf("forge-%s", lane.Name), cwd)
+		_, tab, tabErr = openWriteCapableTab(admitted, req, lane, workspace, standing.AgentNameForRepository(lane.Name, repository), cwd)
 		return tabErr
 	})
 	if err != nil {
@@ -1956,7 +1956,7 @@ func runUp() {
 		fmt.Fprintf(os.Stderr, "launch decision rejected before tab creation: %v\n", err)
 		os.Exit(1)
 	}
-	tabLabel := fmt.Sprintf("forge-%s", lane.Name)
+	tabLabel := standing.AgentNameForRepository(lane.Name, repository)
 	ready, readyErr := waitExactPaneBeforeStart(tab, nativePaneReadyTimeout)
 	if readyErr != nil {
 		closeErr := compensateExactLaunchTab(workspace, tab)
@@ -5594,7 +5594,7 @@ func runForgeE() error {
 				if bindErr != nil {
 					return compensateLaunchFailure(fmt.Errorf("forge launch decision rejected after claim: %w", bindErr))
 				}
-				standingName := fmt.Sprintf("forge-%s", lane.Name)
+				standingName := standing.AgentNameForRepository(lane.Name, repositoryIdentityForLaunch(cfg))
 				directLaunch := false
 				if lane.Worktree == "" {
 					return compensateLaunchFailure(fmt.Errorf("forge launch requires an isolated worktree"))

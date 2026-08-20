@@ -28,6 +28,8 @@ import (
 // ForgePrefix is the live herdr agent name prefix shared with pkg/kick.
 const ForgePrefix = kick.ForgePrefix
 
+const standingAgentNameLimit = 32
+
 // Mode selects the standing operation.
 type Mode int
 
@@ -162,7 +164,8 @@ func NameHeld(status string) bool {
 
 // AgentName returns the live herdr name for a configured lane.
 func AgentName(laneName string) string {
-	return ForgePrefix + strings.TrimSpace(laneName)
+	laneName = strings.TrimSpace(laneName)
+	return boundedAgentName(ForgePrefix+laneName, laneName)
 }
 
 // AgentNameForRepository qualifies a standing lane with its stable repository
@@ -176,7 +179,22 @@ func AgentNameForRepository(laneName, repository string) string {
 		return AgentName(laneName)
 	}
 	sum := sha256.Sum256([]byte(repository))
-	return fmt.Sprintf("%s%s-%s", ForgePrefix, laneName, hex.EncodeToString(sum[:])[:10])
+	base := fmt.Sprintf("%s%s-%s", ForgePrefix, laneName, hex.EncodeToString(sum[:])[:10])
+	return boundedAgentName(base, laneName+"\x00"+repository)
+}
+
+// boundedAgentName applies Herdr's 32-character name limit while retaining a
+// readable prefix and stable identity suffix. The suffix is derived from the
+// complete identity so distinct long lane/repository pairs cannot collide
+// after truncation.
+func boundedAgentName(base, identity string) string {
+	if len(base) <= standingAgentNameLimit {
+		return base
+	}
+	sum := sha256.Sum256([]byte(identity))
+	suffix := "-" + hex.EncodeToString(sum[:])[:8]
+	prefixLen := standingAgentNameLimit - len(suffix)
+	return strings.TrimRight(base[:prefixLen], "-_") + suffix
 }
 
 // withContinuationGoal makes the standing contract explicit in the first

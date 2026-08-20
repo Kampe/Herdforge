@@ -456,13 +456,16 @@ func drainAuthorModel(taskRef string) (string, error) {
 // liveDrainLauncher delivers to the standing reviewer only. Resolving it
 // through herdr is itself the receipt proof: ResolveAgentTabWithDecision
 // refuses an agent whose durable launch identity does not match the decision.
-type liveDrainLauncher struct{ lane string }
+type liveDrainLauncher struct {
+	lane       string
+	repository string
+}
 
 func (l liveDrainLauncher) LaunchReviewer(_ context.Context, req launch.Request, packet string) (drainLaunchProof, error) {
 	if !herdr.IsAvailable() {
 		return drainLaunchProof{}, fmt.Errorf("herdr CLI not found")
 	}
-	name := fmt.Sprintf("forge-%s", l.lane)
+	name := standing.AgentNameForRepository(l.lane, l.repository)
 	if _, err := herdr.ResolveAgentTabWithDecision(name, req); err != nil {
 		return drainLaunchProof{}, fmt.Errorf("standing reviewer %s has no proven durable launch identity: %w", name, err)
 	}
@@ -579,7 +582,7 @@ func newDrainAdapters(root, ledgerPath string, cfg *config.Config, tp provider.T
 		supervisor:  standing.AgentNameForRepository(supervisorLane.Name, repository),
 		tasks:       tp,
 		ledger:      ledger,
-		launcher:    liveDrainLauncher{lane: lane.Name},
+		launcher:    liveDrainLauncher{lane: lane.Name, repository: repository},
 		head:        drainGitHead(root),
 		patchID:     drainPatchID(root),
 		authorModel: drainAuthorModel,

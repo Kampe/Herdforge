@@ -138,8 +138,32 @@ func TestAgentNameForRepositoryIsStableAndDistinct(t *testing.T) {
 	if gotA == gotB {
 		t.Fatalf("same lane names collided across repositories: %q", gotA)
 	}
-	if !strings.HasPrefix(gotA, "forge-harvest-") || len(gotA) > 64 {
+	if !strings.HasPrefix(gotA, "forge-harvest-") || len(gotA) > 32 {
 		t.Fatalf("qualified name %q is not readable and bounded", gotA)
+	}
+}
+
+func TestAgentNameForRepositoryBoundsLongLaneNames(t *testing.T) {
+	got := AgentNameForRepository("coverage-integrity", testRepositoryIdentity)
+	if len(got) > 32 {
+		t.Fatalf("qualified standing name %q has length %d; want <= 32", got, len(got))
+	}
+	if got != AgentNameForRepository("coverage-integrity", testRepositoryIdentity) {
+		t.Fatalf("qualified standing name is not stable: %q", got)
+	}
+	if got == AgentNameForRepository("coverage-integrity-other", testRepositoryIdentity) {
+		t.Fatalf("distinct long lane names collided: %q", got)
+	}
+}
+
+func TestConfiguredStandingAgentNamesFitHerdrLimit(t *testing.T) {
+	_, cfg := standingFixture(t)
+	lanes := append(cfg.Lanes, config.LaneDef{Name: "coverage-integrity", Role: "coverage"})
+	for _, lane := range lanes {
+		name := AgentNameForRepository(lane.Name, testRepositoryIdentity)
+		if len(name) > 32 {
+			t.Fatalf("lane %q generated name %q with length %d; want <= 32", lane.Name, name, len(name))
+		}
 	}
 }
 
