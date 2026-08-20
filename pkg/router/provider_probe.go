@@ -9,7 +9,7 @@ import (
 	"time"
 )
 
-const providerProbeToken = "HERD_PROVIDER_PROBE_OK"
+const providerProbeSentinel = "HERD_PROVIDER_PROBE_OK"
 
 var providerProbeFailures = []string{
 	"no configured provider", "no configured model", "not logged in", "authentication",
@@ -50,7 +50,7 @@ func classifyProviderProbeOutput(output, combined string, runErr error, timedOut
 	if runErr != nil {
 		return false, "provider probe failed: " + firstProbeLine(combined, runErr.Error())
 	}
-	if strings.TrimSpace(output) != providerProbeToken {
+	if strings.TrimSpace(output) != providerProbeSentinel {
 		return false, "provider probe returned no exact readiness token"
 	}
 	return true, ""
@@ -62,7 +62,7 @@ func providerProbeCommand(provider, model string) (string, []string, string, err
 	if model == "" && provider != "kimi" {
 		return "", nil, "", fmt.Errorf("provider probe requires a model")
 	}
-	prompt := "Reply with exactly: " + providerProbeToken
+	prompt := "Reply with exactly: " + providerProbeSentinel
 	switch provider {
 	case "claude":
 		return "claude", []string{"--model", model, "-p"}, prompt, nil
