@@ -114,6 +114,7 @@ func gatherPulseObservation(ctx context.Context, act bool) (pulse.Observation, p
 	// refs for reap evidence — a lane whose ticket is done is reap-eligible.
 	providerObs, doneRefs := readPulseProvider(ctx)
 	obs.Provider = providerObs
+	obs.Broker = readPulseBroker()
 	actor.dispatchRef = providerObs.NextTaskRef
 	actor.dispatch = func(dispatchCtx context.Context, target, reason string) error {
 		if strings.TrimSpace(providerObs.NextTaskRef) == "" {
@@ -183,6 +184,19 @@ func gatherPulseObservation(ctx context.Context, act bool) (pulse.Observation, p
 	}
 
 	return obs, actor
+}
+
+func readPulseBroker() pulse.BrokerObservation {
+	root, err := canonicalHerdRoot()
+	if err != nil {
+		return pulse.BrokerObservation{Known: true, Error: err.Error()}
+	}
+	cfg, err := config.LoadConfig(filepath.Join(root, ".herd", "herd.yaml"))
+	if err != nil {
+		return pulse.BrokerObservation{Known: true, Error: err.Error()}
+	}
+	health := readBrokerHealth(root, cfg)
+	return pulse.BrokerObservation{Known: true, Serving: health.Serving, Socket: health.Socket, Error: health.Detail}
 }
 
 // resolvePulseDispatchLane converts the live agent ID discovered by Herdr

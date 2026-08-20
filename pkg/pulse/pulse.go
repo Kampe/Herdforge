@@ -223,6 +223,16 @@ type WindDownObservation struct {
 	Generation uint64 `json:"generation,omitempty"`
 }
 
+// BrokerObservation is the coordinator's receipt-gated provider control-plane
+// health. A missing broker is not free capacity: dispatch cannot safely launch
+// a lane until this probe is serving.
+type BrokerObservation struct {
+	Known   bool   `json:"known"`
+	Serving bool   `json:"serving"`
+	Socket  string `json:"socket,omitempty"`
+	Error   string `json:"error,omitempty"`
+}
+
 // Observation is the full one-shot source snapshot for a beat. Every field is
 // filled by a single read of its source; Plan never re-reads.
 type Observation struct {
@@ -233,6 +243,7 @@ type Observation struct {
 	Review    ReviewObservation     `json:"review"`
 	Quota     QuotaObservation      `json:"quota"`
 	WindDown  WindDownObservation   `json:"wind_down"`
+	Broker    BrokerObservation     `json:"broker"`
 	// NeedsReconcile is true when durable lifecycle/control events are pending.
 	NeedsReconcile bool `json:"needs_reconcile,omitempty"`
 }
@@ -426,6 +437,10 @@ func Plan(obs Observation, opts Options) (Snapshot, error) {
 	if !obs.WindDown.Known || strings.TrimSpace(obs.WindDown.Error) != "" {
 		unknownReasons = append(unknownReasons, "wind_down: "+unknownDetail(obs.WindDown.Known, obs.WindDown.Error))
 	}
+	brokerObserved := obs.Broker.Known || strings.TrimSpace(obs.Broker.Error) != "" || obs.Broker.Serving || strings.TrimSpace(obs.Broker.Socket) != ""
+	if brokerObserved && (!obs.Broker.Known || strings.TrimSpace(obs.Broker.Error) != "") {
+		unknownReasons = append(unknownReasons, "broker: "+unknownDetail(obs.Broker.Known, obs.Broker.Error))
+	}
 	// Review unknown is pressure uncertainty — block dispatch but do not alone
 	// force a broken beat unless it is the only critical path for launches.
 	reviewUnknown := !obs.Review.Known || strings.TrimSpace(obs.Review.Error) != ""
@@ -442,6 +457,8 @@ func Plan(obs Observation, opts Options) (Snapshot, error) {
 		blockReason = "review posture unknown: " + unknownDetail(obs.Review.Known, obs.Review.Error)
 	case obs.WindDown.Enabled:
 		blockReason = "wind-down enabled"
+	case brokerObserved && !obs.Broker.Serving:
+		blockReason = "coordinator broker unavailable"
 	case obs.Quota.Exhausted:
 		blockReason = "quota exhausted"
 	case obs.Review.Saturated:
@@ -954,6 +971,13 @@ func FormatHuman(snap Snapshot) string {
 	}
 	if snap.DispatchBlocked {
 		fmt.Fprintf(&b, "dispatch_blocked: %s\n", snap.DispatchBlockReason)
+	}
+	if brokerObserved := snap.Observation.Broker.Known || snap.Observation.Broker.Error != "" || snap.Observation.Broker.Serving || snap.Observation.Broker.Socket != ""; brokerObserved {
+		if snap.Observation.Broker.Serving {
+			fmt.Fprintf(&b, "broker: serving (%s)\n", snap.Observation.Broker.Socket)
+		} else {
+			fmt.Fprintf(&b, "broker: UNAVAILABLE (%s)\n", snap.Observation.Broker.Error)
+		}
 	}
 	fmt.Fprintf(&b, "agents:\n")
 	if len(snap.Agents) == 0 {
