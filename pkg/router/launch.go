@@ -160,32 +160,34 @@ type LaunchRequest struct {
 // reviewer launch. FAC-139 consumes this at every launch boundary; no field
 // may be left to harness defaults.
 type LaunchDecision struct {
-	Provider        string         `json:"provider"`
-	Model           string         `json:"model,omitempty"`
-	Harness         string         `json:"harness"`
-	HarnessArgv     []string       `json:"harness_argv,omitempty"`
-	HarnessSession  string         `json:"harness_session,omitempty"`
-	Effort          string         `json:"effort"`
-	Pool            string         `json:"quota_pool"`
-	Role            Role           `json:"role"`
-	Shape           string         `json:"task_shape"`
-	CandidateSHA    string         `json:"candidate_sha,omitempty"`
-	Risk            classify.Tier  `json:"risk,omitempty"`
-	Family          string         `json:"family"`
-	CapabilityTier  CapabilityTier `json:"capability_tier"`
-	ProbeKey        string         `json:"probe_key,omitempty"`
-	ProbeRequired   bool           `json:"probe_required"`
-	Rationale       string         `json:"rationale"`
-	Availability    string         `json:"availability,omitempty"`
-	QuotaPressure   int            `json:"quota_pressure"`
-	Score           int            `json:"score"`
-	LazerLastResort bool           `json:"lazer_last_resort"`
-	Argv            []string       `json:"argv,omitempty"`
-	TaskRef         string         `json:"task_ref,omitempty"`
-	LeaseGeneration int64          `json:"lease_generation,omitempty"`
-	Scope           string         `json:"scope,omitempty"`
-	Proof           string         `json:"proof"`
-	issuanceToken   [32]byte
+	Provider          string         `json:"provider"`
+	Model             string         `json:"model,omitempty"`
+	Harness           string         `json:"harness"`
+	HarnessArgv       []string       `json:"harness_argv,omitempty"`
+	HarnessSession    string         `json:"harness_session,omitempty"`
+	Effort            string         `json:"effort"`
+	EffortApplicable  bool           `json:"effort_applicable"`
+	Pool              string         `json:"quota_pool"`
+	Role              Role           `json:"role"`
+	Shape             string         `json:"task_shape"`
+	CandidateSHA      string         `json:"candidate_sha,omitempty"`
+	Risk              classify.Tier  `json:"risk,omitempty"`
+	Family            string         `json:"family"`
+	CapabilityTier    CapabilityTier `json:"capability_tier"`
+	ProbeKey          string         `json:"probe_key,omitempty"`
+	ProbeRequired     bool           `json:"probe_required"`
+	Rationale         string         `json:"rationale"`
+	Availability      string         `json:"availability,omitempty"`
+	QuotaPressure     int            `json:"quota_pressure"`
+	Score             int            `json:"score"`
+	LazerLastResort   bool           `json:"lazer_last_resort"`
+	Argv              []string       `json:"argv,omitempty"`
+	ArgvAuthoritative bool           `json:"argv_authoritative"`
+	TaskRef           string         `json:"task_ref,omitempty"`
+	LeaseGeneration   int64          `json:"lease_generation,omitempty"`
+	Scope             string         `json:"scope,omitempty"`
+	Proof             string         `json:"proof"`
+	issuanceToken     [32]byte
 }
 
 const decisionProofDomain = "herdforge-fac-175-launch-decision-v1"
@@ -308,7 +310,7 @@ func decisionProof(d LaunchDecision) string {
 		}
 		return v
 	}
-	canonical := fmt.Sprintf("%s|%s|%s|%s|%s|%s|%s|%s|%d|%s|%s|%s|%s|%s|%s|%s", decisionProofDomain, norm(string(d.Role)), norm(d.Shape), norm(d.Provider), norm(d.Model), norm(d.Harness), norm(d.Effort), d.CandidateSHA, d.LeaseGeneration, d.TaskRef, norm(d.Scope), d.ProbeKey, d.Rationale, d.HarnessSession, strings.Join(d.Argv, "\x00"), strings.Join(d.HarnessArgv, "\x00"))
+	canonical := fmt.Sprintf("%s|%s|%s|%s|%s|%s|%s|%t|%t|%s|%d|%s|%s|%s|%s|%s|%s|%s", decisionProofDomain, norm(string(d.Role)), norm(d.Shape), norm(d.Provider), norm(d.Model), norm(d.Harness), norm(d.Effort), d.EffortApplicable, d.ArgvAuthoritative, d.CandidateSHA, d.LeaseGeneration, d.TaskRef, norm(d.Scope), d.ProbeKey, d.Rationale, d.HarnessSession, strings.Join(d.Argv, "\x00"), strings.Join(d.HarnessArgv, "\x00"))
 	sum := sha256.Sum256([]byte(canonical))
 	return "sha256:" + hex.EncodeToString(sum[:])
 }
@@ -1119,27 +1121,29 @@ func (r *SurfaceRouter) Decide(req LaunchRequest) (*LaunchDecision, error) {
 		return nil, fmt.Errorf("herd-route: Pi harness: %w", err)
 	}
 	d := &LaunchDecision{
-		Provider:        best.provider,
-		Model:           model,
-		Harness:         harness,
-		HarnessArgv:     harnessArgv,
-		Effort:          effort,
-		Pool:            best.pool,
-		Role:            req.Role,
-		Shape:           shape,
-		CandidateSHA:    req.CandidateSHA,
-		Risk:            req.Risk,
-		Family:          best.family,
-		CapabilityTier:  best.cap,
-		ProbeKey:        best.probeKey,
-		ProbeRequired:   best.probeReq,
-		Rationale:       rationale,
-		Availability:    best.detail,
-		QuotaPressure:   best.pressure,
-		Score:           best.rank,
-		LazerLastResort: best.provider == "lazer",
-		Argv:            ArgvFor(best.provider, model, effort),
-		TaskRef:         req.TaskRef, LeaseGeneration: req.LeaseGeneration, Scope: req.Scope,
+		Provider:          best.provider,
+		Model:             model,
+		Harness:           harness,
+		HarnessArgv:       harnessArgv,
+		Effort:            effort,
+		EffortApplicable:  EffortApplicable(best.provider),
+		Pool:              best.pool,
+		Role:              req.Role,
+		Shape:             shape,
+		CandidateSHA:      req.CandidateSHA,
+		Risk:              req.Risk,
+		Family:            best.family,
+		CapabilityTier:    best.cap,
+		ProbeKey:          best.probeKey,
+		ProbeRequired:     best.probeReq,
+		Rationale:         rationale,
+		Availability:      best.detail,
+		QuotaPressure:     best.pressure,
+		Score:             best.rank,
+		LazerLastResort:   best.provider == "lazer",
+		Argv:              ArgvFor(best.provider, model, effort),
+		ArgvAuthoritative: true,
+		TaskRef:           req.TaskRef, LeaseGeneration: req.LeaseGeneration, Scope: req.Scope,
 	}
 	if _, err := cryptorand.Read(d.issuanceToken[:]); err != nil {
 		return nil, fmt.Errorf("issue launch capability: %w", err)

@@ -30,20 +30,31 @@ type SurfaceCapability struct {
 	VendorHarness bool
 	Headless      bool
 	ModelOptional bool
+	// EffortApplicable tells route consumers whether Effort is a launch
+	// control for this surface.  It is false when the surface ignores effort;
+	// consumers must never append it speculatively.
+	EffortApplicable bool
 }
 
 var surfaceCapabilities = []SurfaceCapability{
-	{Provider: "agy", Harness: "agy", CLI: "agy", VendorHarness: true, Headless: true},
-	{Provider: "claude", Harness: "claude", CLI: "claude", VendorHarness: true, Headless: true},
-	{Provider: "codex", Harness: "codex", CLI: "codex", VendorHarness: true, Headless: true},
-	{Provider: "grok", Harness: "grok", CLI: "grok", VendorHarness: true, Headless: true},
+	{Provider: "agy", Harness: "agy", CLI: "agy", VendorHarness: true, Headless: true, EffortApplicable: false},
+	{Provider: "claude", Harness: "claude", CLI: "claude", VendorHarness: true, Headless: true, EffortApplicable: true},
+	{Provider: "codex", Harness: "codex", CLI: "codex", VendorHarness: true, Headless: true, EffortApplicable: true},
+	{Provider: "grok", Harness: "grok", CLI: "grok", VendorHarness: true, Headless: true, EffortApplicable: true},
 	// Kimi is headless-only until Herdr advertises a native kimi tab kind.
 	// Keeping it in the surface table lets shot routing use its argv while
 	// preventing READY routes from reaching a lane launcher that cannot spawn it.
-	{Provider: "kimi", Harness: "kimi", CLI: "kimi", Headless: true, ModelOptional: true},
-	{Provider: "lazer", Harness: "opencode", CLI: "opencode", Headless: true},
-	{Provider: "ollama", Harness: "opencode", CLI: "opencode", Headless: true},
-	{Provider: "opencode", Harness: "opencode", CLI: "opencode", VendorHarness: true, Headless: true},
+	{Provider: "kimi", Harness: "kimi", CLI: "kimi", Headless: true, ModelOptional: true, EffortApplicable: false},
+	{Provider: "lazer", Harness: "opencode", CLI: "opencode", Headless: true, EffortApplicable: false},
+	{Provider: "ollama", Harness: "opencode", CLI: "opencode", Headless: true, EffortApplicable: false},
+	{Provider: "opencode", Harness: "opencode", CLI: "opencode", VendorHarness: true, Headless: true, EffortApplicable: false},
+}
+
+// EffortApplicable reports whether Effort may be applied to a route's
+// launch surface. Unknown surfaces are inapplicable so callers fail closed.
+func EffortApplicable(provider string) bool {
+	surface, ok := SurfaceFor(provider)
+	return ok && surface.EffortApplicable
 }
 
 var reviewCapabilities = []ReviewCapability{

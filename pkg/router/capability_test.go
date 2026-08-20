@@ -64,6 +64,31 @@ func TestKimiIsHeadlessOnlyUntilHerdrSupportsItsKind(t *testing.T) {
 	}
 }
 
+func TestEffortApplicabilityMatchesVerbatimArgvContract(t *testing.T) {
+	tests := []struct {
+		provider string
+		want     bool
+	}{
+		{"agy", false}, {"kimi", false}, {"opencode", false},
+		{"ollama", false}, {"lazer", false},
+		{"claude", true}, {"codex", true}, {"grok", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.provider, func(t *testing.T) {
+			if got := EffortApplicable(tt.provider); got != tt.want {
+				t.Fatalf("EffortApplicable(%q)=%v, want %v", tt.provider, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestRouteIdentityRejectsAGYFallback(t *testing.T) {
+	err := VerifyModelIdentity("agy", "claude-opus-4-6-thinking", "anthropic", "agy", "gemini-3.7-flash", "google")
+	if err == nil || !strings.Contains(err.Error(), "route identity mismatch") {
+		t.Fatalf("AGY fallback must fail post-launch identity verification: %v", err)
+	}
+}
+
 func TestRouterRejectsSurfaceWithoutLiveLaunchBinary(t *testing.T) {
 	r := NewRouter(nil, nil)
 	r.Probes = &Probes{
