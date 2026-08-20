@@ -123,31 +123,50 @@ func runGoalGuardStopHook(s *goalguard.Store, payload []byte) error {
 	if hook.StopHookActive {
 		return nil
 	}
+
+	// FAC-532: a Stop hook that RETURNS AN ERROR terminates the agent. Every
+	// error path below used to do exactly that, so a guard whose whole purpose
+	// is keeping lanes working was instead killing them on any unreadable
+	// state. Nothing here may return a non-nil error: an undeterminable guard
+	// reports on stderr and allows the stop, which is recoverable, rather than
+	// failing the hook, which is not.
 	g, err := s.Load()
-	if errors.Is(err, goalguard.ErrMissing) {
-		return nil
-	}
 	if err != nil {
-		return err
+		if !errors.Is(err, goalguard.ErrMissing) {
+			fmt.Fprintf(os.Stderr, "goal-guard: cannot read goal, allowing stop: %v\n", err)
+		}
+		return nil
 	}
 	leaseHeld, err := goalGuardLeaseHeld(g)
 	if err != nil {
-		return err
+		fmt.Fprintf(os.Stderr, "goal-guard: cannot read lease, allowing stop: %v\n", err)
+		return nil
 	}
 	evidence := goalguard.Evidence{Lane: g.Lane, Task: g.Task, Owner: g.Owner, Generation: g.Generation, LeaseHeld: leaseHeld, Now: time.Now().UTC()}
 	decision, err := s.Evaluate(evidence)
 	if err != nil {
-		return err
+		fmt.Fprintf(os.Stderr, "goal-guard: cannot evaluate goal, allowing stop: %v\n", err)
+		return nil
 	}
 	if !decision.Continue {
 		return writeGoalJSON(os.Stdout, decision)
 	}
-	if g.Authority == nil {
-		return errors.New("goal-guard: no verifiable authority envelope; refusing to assert continuation")
+
+	// A goal recorded before authority envelopes existed (FAC-525) is still an
+	// operator-granted goal — it predates the field, it is not unauthorized.
+	// Treat it as legacy-granted and keep the lane working, warning so the
+	// backlog of envelope-less goals stays visible. Refusing here would strand
+	// every lane whose goal was set before FAC-525 landed.
+	switch {
+	case g.Authority == nil:
+		fmt.Fprintf(os.Stderr, "goal-guard: goal %q on lane %q predates authority envelopes; continuing on legacy grant (re-set the goal to record one)\n", g.Task, g.Lane)
+	default:
+		if err := g.Authority.Validate(); err != nil {
+			fmt.Fprintf(os.Stderr, "goal-guard: authority envelope invalid, allowing stop: %v\n", err)
+			return nil
+		}
 	}
-	if err := g.Authority.Validate(); err != nil {
-		return fmt.Errorf("goal-guard: no verifiable authority envelope: %w", err)
-	}
+
 	block := map[string]string{
 		"decision": "block",
 		"reason":   fmt.Sprintf("goal-guard: goal %q on lane %q is not met (continuation %d). Keep working toward the goal; stop only when it is complete, then run `herd goal-guard --clear`.", g.Task, g.Lane, decision.Continuations),
