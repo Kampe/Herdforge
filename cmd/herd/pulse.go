@@ -863,7 +863,7 @@ func (a *livePulseActor) OpenReview(ctx context.Context, lane pulse.AgentObserva
 	if !herdr.IsAvailable() {
 		return errors.New("pulse: herdr CLI not found")
 	}
-	target := standing.AgentName(supervisor.Name)
+	target := standing.AgentNameForRepository(supervisor.Name, repositoryIdentityForLaunch(cfg))
 	packet := pulseReviewPacket(lane)
 	if _, err := herdr.AgentPrompt(target, packet, false); err != nil {
 		return fmt.Errorf("pulse: notify review supervisor %s: %w", target, err)

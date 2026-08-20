@@ -71,7 +71,7 @@ func configuredFeedbackRoster(cfg *config.Config, coordinator string) []string {
 		for _, lane := range cfg.Lanes {
 			if lane.Standing {
 				add(lane.Name)
-				add(standing.AgentName(lane.Name))
+				add(standing.AgentNameForRepository(lane.Name, repositoryIdentityForLaunch(cfg)))
 			}
 		}
 	}

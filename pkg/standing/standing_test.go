@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -111,6 +112,34 @@ func baseOpts(t *testing.T, repo string) Options {
 			}
 			return filepath.Abs(filepath.Join(repo, p))
 		},
+	}
+}
+
+const testRepositoryIdentity = "github.com/Kampe/Herdforge"
+
+func testAgentName(lane string) string {
+	return AgentNameForRepository(lane, testRepositoryIdentity)
+}
+
+func TestAgentNameForRepositoryIsStableAndDistinct(t *testing.T) {
+	tests := []struct {
+		name string
+		repo string
+		want string
+	}{
+		{name: "same lane same repository", repo: "repo-a"},
+		{name: "same lane other repository", repo: "repo-b"},
+	}
+	gotA := AgentNameForRepository("harvest", tests[0].repo)
+	if gotA != AgentNameForRepository("harvest", tests[0].repo) {
+		t.Fatal("repository-qualified standing name is not stable")
+	}
+	gotB := AgentNameForRepository("harvest", tests[1].repo)
+	if gotA == gotB {
+		t.Fatalf("same lane names collided across repositories: %q", gotA)
+	}
+	if !strings.HasPrefix(gotA, "forge-harvest-") || len(gotA) > 64 {
+		t.Fatalf("qualified name %q is not readable and bounded", gotA)
 	}
 }
 
@@ -271,12 +300,12 @@ func TestRaiseRefreshesDurableGoalForLiveLane(t *testing.T) {
 	repo, cfg := standingFixture(t)
 	cfg.Lanes[0].GoalTemplate = "first policy for {{role}}"
 	t.Chdir(repo)
-	live := map[string]Agent{"forge-orch": {Name: "forge-orch", Status: "idle", Workspace: "wTEST", Cwd: filepath.Join(repo, ".worktrees", "orch")}}
+	live := map[string]Agent{testAgentName("orch"): {Name: testAgentName("orch"), Status: "idle", Workspace: "wTEST", Cwd: filepath.Join(repo, ".worktrees", "orch")}}
 	var goals []string
 	opts := baseOpts(t, repo)
 	opts.Mode = ModeRaise
 	opts.Only = []string{"orch"}
-	opts.ListAgents = func() ([]Agent, error) { return []Agent{live["forge-orch"]}, nil }
+	opts.ListAgents = func() ([]Agent, error) { return []Agent{live[testAgentName("orch")]}, nil }
 	opts.SetGoal = func(_, _, task, _ string) error { goals = append(goals, task); return nil }
 	result, err := Run(cfg, opts)
 	if err != nil {
@@ -480,7 +509,7 @@ func TestStatusReportsLiveAndMissing(t *testing.T) {
 	opts.Mode = ModeStatus
 	opts.ListAgents = func() ([]Agent, error) {
 		return []Agent{
-			{Name: "forge-orch", Status: "idle", TabID: "t1", PaneID: "p1", Workspace: "wTEST", Cwd: filepath.Join(repo, ".worktrees", "orch")},
+			{Name: testAgentName("orch"), Status: "idle", TabID: "t1", PaneID: "p1", Workspace: "wTEST", Cwd: filepath.Join(repo, ".worktrees", "orch")},
 			// harvest missing
 			{Name: "forge-worker", Status: "working", TabID: "t9"}, // ephemeral — ignored
 		}, nil
@@ -514,9 +543,9 @@ func TestStatusScopesSameNamedAgentsToWorkspaceAndRepository(t *testing.T) {
 	authorizedCWD := filepath.Join(repo, ".worktrees", "orch")
 	opts.ListAgents = func() ([]Agent, error) {
 		return []Agent{
-			{Name: "forge-orch", Status: "idle", Workspace: "other-workspace", Cwd: authorizedCWD},
-			{Name: "forge-orch", Status: "idle", Workspace: "wTEST", Cwd: foreignCWD},
-			{Name: "forge-orch", Status: "idle", Workspace: "wTEST", Cwd: authorizedCWD},
+			{Name: testAgentName("orch"), Status: "idle", Workspace: "other-workspace", Cwd: authorizedCWD},
+			{Name: testAgentName("orch"), Status: "idle", Workspace: "wTEST", Cwd: foreignCWD},
+			{Name: testAgentName("orch"), Status: "idle", Workspace: "wTEST", Cwd: authorizedCWD},
 		}, nil
 	}
 	r, err := Run(cfg, opts)
@@ -540,7 +569,7 @@ func TestRaiseTreatsUnauthorizedSameNamedAgentAsMissing(t *testing.T) {
 	opts.Mode = ModeRaise
 	opts.Only = []string{"orch"}
 	opts.ListAgents = func() ([]Agent, error) {
-		return []Agent{{Name: "forge-orch", Status: "idle", Workspace: "other-workspace", Cwd: filepath.Join(foreignRepo, "orch")}}, nil
+		return []Agent{{Name: testAgentName("orch"), Status: "idle", Workspace: "other-workspace", Cwd: filepath.Join(foreignRepo, "orch")}}, nil
 	}
 	opts.CreateTab = func(_, label, cwd string) (Tab, error) {
 		creates++
@@ -569,7 +598,7 @@ func TestStatusReportsUnraiseableWhenHarnessMissing(t *testing.T) {
 	opts.HarnessPresent = func(harness string) bool { return false }
 	opts.ListAgents = func() ([]Agent, error) {
 		return []Agent{
-			{Name: "forge-orch", Status: "idle", TabID: "t1", PaneID: "p1", Workspace: "wTEST", Cwd: filepath.Join(repo, ".worktrees", "orch")},
+			{Name: testAgentName("orch"), Status: "idle", TabID: "t1", PaneID: "p1", Workspace: "wTEST", Cwd: filepath.Join(repo, ".worktrees", "orch")},
 		}, nil
 	}
 	r, err := Run(cfg, opts)
@@ -614,7 +643,7 @@ func TestStatusReportsMissingWhenHarnessPresent(t *testing.T) {
 	opts.HarnessPresent = func(harness string) bool { return true }
 	opts.ListAgents = func() ([]Agent, error) {
 		return []Agent{
-			{Name: "forge-orch", Status: "idle", TabID: "t1", PaneID: "p1", Workspace: "wTEST", Cwd: filepath.Join(repo, ".worktrees", "orch")},
+			{Name: testAgentName("orch"), Status: "idle", TabID: "t1", PaneID: "p1", Workspace: "wTEST", Cwd: filepath.Join(repo, ".worktrees", "orch")},
 		}, nil
 	}
 	r, err := Run(cfg, opts)
@@ -639,12 +668,15 @@ func TestShutdownTouchesOnlyStanding(t *testing.T) {
 	opts := baseOpts(t, repo)
 	opts.Mode = ModeShutdown
 	opts.ListAgents = func() ([]Agent, error) {
-		return []Agent{
-			{Name: "forge-orch", Status: "idle", TabID: "t-orch", PaneID: "p-orch", Workspace: "wTEST", Cwd: filepath.Join(repo, ".worktrees", "orch")},
-			{Name: "forge-harvest", Status: "working", TabID: "t-harv", PaneID: "p-harv", Workspace: "wTEST", Cwd: filepath.Join(repo, ".worktrees", "harvest")},
+		agents := []Agent{
+			{Name: testAgentName("harvest"), Status: "working", TabID: "t-harv", PaneID: "p-harv", Workspace: "wTEST", Cwd: filepath.Join(repo, ".worktrees", "harvest")},
 			{Name: "forge-worker", Status: "idle", TabID: "t-worker", PaneID: "p-worker"},
 			{Name: "task-fac-1", Status: "idle", TabID: "t-task", PaneID: "p-task"},
-		}, nil
+		}
+		if !slices.Contains(closed, "t-orch") {
+			agents = append(agents, Agent{Name: testAgentName("orch"), Status: "idle", TabID: "t-orch", PaneID: "p-orch", Workspace: "wTEST", Cwd: filepath.Join(repo, ".worktrees", "orch")})
+		}
+		return agents, nil
 	}
 	opts.CloseTab = func(id string) error {
 		closed = append(closed, id)
@@ -740,7 +772,7 @@ func TestNameHeldGateIsNonVacuous(t *testing.T) {
 	opts.ListAgents = func() ([]Agent, error) {
 		// Name present but status not held — must re-attempt raise (or still
 		// try create). Shell skips only NameHeld statuses.
-		return []Agent{{Name: "forge-orch", Status: "unknown", TabID: "t0", Workspace: "wTEST", Cwd: filepath.Join(repo, ".worktrees", "orch")}}, nil
+		return []Agent{{Name: testAgentName("orch"), Status: "unknown", TabID: "t0", Workspace: "wTEST", Cwd: filepath.Join(repo, ".worktrees", "orch")}}, nil
 	}
 	opts.CreateTab = func(_, label, cwd string) (Tab, error) {
 		creates++

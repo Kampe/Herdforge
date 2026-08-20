@@ -1136,7 +1136,7 @@ func runStatus() {
 	if len(observer.LiveAgents()) > 0 {
 		standingNames := make(map[string]bool)
 		for _, lane := range standing.StandingLanes(cfg) {
-			standingNames[standing.AgentName(lane.Name)] = true
+			standingNames[standing.AgentNameForRepository(lane.Name, repositoryIdentityForLaunch(cfg))] = true
 		}
 		fleet = herdr.ProjectLiveFleetStatus(observer.LiveAgents(), standingNames, cfg.Fleet.HerdrWorkspace, len(cfg.Lanes))
 	}
@@ -1792,11 +1792,7 @@ func runStandingConfigMode(cfg *config.Config, herdrAvailable bool, mode standin
 			return setDurableGoal(cwd, lane, task, owner, 1)
 		},
 		CloseTab: func(tabID string) error {
-			// Best-effort: StartPreparedAgent already reconciles most start
-			// failures. A second close of a gone tab must not mask the
-			// original start error.
-			_ = herdr.TabClose(tabID)
-			return nil
+			return herdr.CloseTabVerified(tabID)
 		},
 	}
 	if mode == standing.ModeShutdown && shutdownDry {
@@ -2643,9 +2639,9 @@ func runReview() {
 }
 
 func reviewSpawnPacket(cfg *config.Config, task *provider.Task, worktreeDir, testCmd string) string {
-	supervisor := standing.AgentName("review-supervisor")
+	supervisor := standing.AgentNameForRepository("review-supervisor", repositoryIdentityForLaunch(cfg))
 	if lane := findReviewSupervisorLane(cfg); lane != nil && strings.TrimSpace(lane.Name) != "" {
-		supervisor = standing.AgentName(lane.Name)
+		supervisor = standing.AgentNameForRepository(lane.Name, repositoryIdentityForLaunch(cfg))
 	}
 	return fmt.Sprintf(`REVIEW %s — verdict ONLY, edit nothing.
 REPORT_TARGET: %s (mandatory; never coordinator)
@@ -4166,7 +4162,7 @@ func configuredStandingAgentNames(cfg *config.Config) map[string]bool {
 			continue
 		}
 		out[name] = true
-		out[standing.AgentName(name)] = true
+		out[standing.AgentNameForRepository(name, repositoryIdentityForLaunch(cfg))] = true
 	}
 	return out
 }
@@ -5900,7 +5896,7 @@ func notifyReviewSupervisor(cfg *config.Config, task *provider.Task) error {
 	if !herdr.IsAvailable() {
 		return errors.New("herdr CLI not found")
 	}
-	name := standing.AgentName(lane.Name)
+	name := standing.AgentNameForRepository(lane.Name, repositoryIdentityForLaunch(cfg))
 	packet := fmt.Sprintf("REVIEW SUPERVISOR REQUEST\nTask: %s — %s\n\nThe task has entered in-review. You own the complete review lifecycle: inspect the exact candidate receipt/worktree, spawn a reviewer from a different model family, deliver findings back to the author lane, re-ping the reviewer after fixes, ingest the verdict, and close the ephemeral reviewer pane only after its verdict is durably recorded. Repeat until APPROVED. Only after exact PASS evidence, notify the coordinator that this task is ready to merge. Do not ask the coordinator to perform review work.\n\nReview dispatch and verdict ingest are feedback-independent: never wait for a FLEET_FEEDBACK census reply, coordinator wake, or other telemetry before processing this task. A wake-only or missing census epoch is void after the bounded observation window. On every beat, watchdog in-review pins; if one has no live reviewer and no dispatch for the configured timeout, re-dispatch or report the supervisor as wedged instead of treating the queue as empty.\n\nThe coordinator only performs the merge and sunsets implementation/review panes after your merge-ready handoff.\n\nTask description:\n%s", task.Ref, task.Title, strings.TrimSpace(task.Description))
 	if _, err := herdr.AgentPrompt(name, packet, false); err != nil {
 		return fmt.Errorf("deliver to %s: %w", name, err)

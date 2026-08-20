@@ -116,7 +116,7 @@ func buildWaveRuntime(ctx context.Context, cfg *config.Config, cfgErr error) (wa
 			for _, lane := range lanes {
 				out = append(out, wave.Lane{
 					Name:      lane.Name,
-					AgentName: standing.AgentName(lane.Name),
+					AgentName: standing.AgentNameForRepository(lane.Name, repositoryIdentityForLaunch(cfg)),
 				})
 			}
 			return out

@@ -568,13 +568,14 @@ func newDrainAdapters(root, ledgerPath string, cfg *config.Config, tp provider.T
 	if project == "" {
 		project = review.ResolveKaneoProject(root)
 	}
+	repository := repositoryIdentityForLaunch(cfg)
 	a := &drainAdapters{
 		root:        root,
 		project:     project,
-		repository:  repositoryIdentityForLaunch(cfg),
+		repository:  repository,
 		cap:         reviewCap,
 		lane:        lane,
-		supervisor:  standing.AgentName(supervisorLane.Name),
+		supervisor:  standing.AgentNameForRepository(supervisorLane.Name, repository),
 		tasks:       tp,
 		ledger:      ledger,
 		launcher:    liveDrainLauncher{lane: lane.Name},
