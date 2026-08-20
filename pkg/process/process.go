@@ -84,7 +84,7 @@ func ProviderExhaustionReason(text string) string {
 	if strings.TrimSpace(text) == "" {
 		return ""
 	}
-	quotaPat := regexp.MustCompile(`(?i)out of credits|out of quota|too many requests|429 too many|(rate.?limit|usage limit|weekly limit|daily limit|monthly limit|token quota|api quota|quota)[^.]{0,24}(exceeded|reached|throttled|hit|exhausted)|exceeded your (quota|rate|usage|limit)`)
+	quotaPat := regexp.MustCompile(`(?i)out of credits|out of quota|too many requests|429 too many|individual quota reached|(rate.?limit|usage limit|weekly limit|daily limit|monthly limit|token quota|api quota|quota)[^.]{0,24}(exceeded|reached|throttled|hit|exhausted)|exceeded your (quota|rate|usage|limit)`)
 	hasReviewMarker := regexp.MustCompile(`(?i)verdict:|merge recommendation:|\bconfirmed\b|\bfindings?\b|reviewing|pass/fail`)
 	if quotaPat.MatchString(text) && !hasReviewMarker.MatchString(text) {
 		return "provider quota or rate limit reported"

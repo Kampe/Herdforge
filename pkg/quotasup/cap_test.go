@@ -113,6 +113,57 @@ func TestLiveProviderErrorOverridesHealthyLedger(t *testing.T) {
 	}
 }
 
+func TestUnknownEvidenceNeverCoolsOrOverridesHealthyRecovery(t *testing.T) {
+	cases := []struct {
+		name        string
+		e           Evidence
+		prior       State
+		wantCap     int
+		wantPosture Posture
+	}{
+		{
+			name: "unknown ledger preserves a routeable family",
+			e:    Evidence{Capacity: Unknown, Active: 2}, prior: State{Cap: 2, Streak: 4},
+			wantCap: 2, wantPosture: PostureOpen,
+		},
+		{
+			name: "healthy partial recovery is not cooled",
+			e:    Evidence{Capacity: Healthy, BurnClass: usage.BurnOnpace, Active: 1}, prior: State{},
+			wantCap: 0, wantPosture: PostureOpen,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			d := Decide(Surface{Provider: "codex", Pool: "default"}, tc.e, tc.prior)
+			if d.Cap != tc.wantCap || d.Posture != tc.wantPosture {
+				t.Fatalf("decision = cap %d posture %s, want cap %d posture %s (%s)", d.Cap, d.Posture, tc.wantCap, tc.wantPosture, d.Reason)
+			}
+		})
+	}
+}
+
+func TestReportedMixedFleetCoolsOnlyAGYExhaustion(t *testing.T) {
+	decisions := []Decision{
+		Decide(Surface{Provider: "antigravity", Pool: "gemini"}, Evidence{
+			Capacity: Exhausted, ProviderErrors: []string{"Individual quota reached"}, Active: 2,
+		}, State{Cap: 3, Streak: 4}),
+		Decide(Surface{Provider: "anthropic", Pool: "default"}, Evidence{
+			Capacity: Healthy, BurnClass: usage.BurnOnpace, Active: 2,
+		}, State{Cap: 2, Streak: 4}),
+		Decide(Surface{Provider: "codex", Pool: "default"}, Evidence{
+			Capacity: Healthy, BurnClass: usage.BurnOnpace, Active: 2,
+		}, State{Cap: 2, Streak: 1}),
+	}
+	if decisions[0].Posture != PostureBlocked || decisions[0].Cap != 0 {
+		t.Fatalf("AGY exhaustion = cap %d posture %s, want 0/blocked", decisions[0].Cap, decisions[0].Posture)
+	}
+	for _, d := range decisions[1:] {
+		if d.Posture == PostureBlocked {
+			t.Fatalf("healthy %s was cooled: %s", d.Surface, d.Reason)
+		}
+	}
+}
+
 // A caller must not be able to switch the freshness gate off by leaving the
 // field at its zero value.
 func TestZeroMaxAgeFallsBackToTheDefaultRatherThanNoLimit(t *testing.T) {
