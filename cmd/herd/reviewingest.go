@@ -122,10 +122,28 @@ func runReviewIngest() {
 			continue
 		}
 		artifactName := reviewingest.RetainedArtifactName(a.SHA, a.Reviewer, body)
-		opts := reviewledger.IngestOpts{Verdict: reviewledger.VerdictOpts{
-			SHA:      a.SHA,
-			Reviewer: a.Reviewer,
-		}}
+		gate := "independent"
+		if strings.EqualFold(a.ReviewerFamily, "mechanical") || strings.EqualFold(a.BuilderFamily, "mechanical") {
+			gate = "mechanical"
+		}
+		recordOpts := reviewledger.RecordOpts{
+			SHA: a.SHA, Branch: a.Branch, BuilderFamily: a.BuilderFamily,
+			ReviewerFamily: a.ReviewerFamily, Reviewer: a.Reviewer,
+			Artifact: artifactName, Gate: gate, Task: a.Branch,
+		}
+		verdictOpts := reviewledger.VerdictOpts{
+			SHA: a.SHA, Reviewer: a.Reviewer, Verdict: reviewledger.Verdict(a.Verdict),
+			Artifact: artifactName, ReviewerFamily: a.ReviewerFamily,
+			BuilderFamily: a.BuilderFamily, Branch: a.Branch,
+			CandidateSHA: a.SHA, RetryOf: a.RetryOf,
+		}
+		opts := reviewledger.IngestOpts{Record: recordOpts, Verdict: verdictOpts}
+		if a.Verdict == "RETIRED" {
+			opts = reviewledger.IngestOpts{Retired: &reviewledger.RetireOpts{
+				SHA: a.SHA, Branch: a.Branch, Authority: a.Authority, Reason: a.Body,
+				Artifact: artifactName,
+			}}
+		}
 		decision, err := reviewIngestAdmissionDecision(ledger, opts, f, artifactName)
 		if err != nil {
 			if parsed.dryRun {
@@ -179,26 +197,8 @@ func runReviewIngest() {
 		// its exact-SHA admission record idempotently before the verdict row so
 		// harvest-merge can prove independent provenance even when the ephemeral
 		// launch pane has already been cleaned up.
-		gate := "independent"
-		if strings.EqualFold(a.ReviewerFamily, "mechanical") || strings.EqualFold(a.BuilderFamily, "mechanical") {
-			gate = "mechanical"
-		}
-		recordOpts := reviewledger.RecordOpts{
-			SHA: a.SHA, Branch: a.Branch, BuilderFamily: a.BuilderFamily,
-			ReviewerFamily: a.ReviewerFamily, Reviewer: a.Reviewer,
-			Artifact: retained, Gate: gate, Task: a.Branch,
-		}
-		verdictOpts := reviewledger.VerdictOpts{
-			SHA:            a.SHA,
-			Reviewer:       a.Reviewer,
-			Verdict:        reviewledger.Verdict(a.Verdict),
-			Artifact:       retained,
-			ReviewerFamily: a.ReviewerFamily,
-			BuilderFamily:  a.BuilderFamily,
-			Branch:         a.Branch,
-			CandidateSHA:   a.SHA,
-			RetryOf:        a.RetryOf,
-		}
+		recordOpts.Artifact = retained
+		verdictOpts.Artifact = retained
 		enqueued, err := admitVerdictAndMove(ledger, reviewledger.IngestOpts{Record: recordOpts, Verdict: verdictOpts}, f, artifactName)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "herd review-ingest: admission/verdict write FAILED for %s: %v\n", filepath.Base(f), err)
@@ -290,6 +290,7 @@ func parseReviewIngestArgs(args []string) (reviewIngestArgs, error) {
 
 type reviewIngestLedger interface {
 	Ingest(reviewledger.IngestOpts) (bool, error)
+	Validate(reviewledger.IngestOpts) error
 	VerdictFor(string) (reviewledger.LedgerRow, bool, error)
 	VerdictForReviewer(string, string) (reviewledger.LedgerRow, bool, error)
 }
@@ -308,6 +309,9 @@ func reviewIngestAdmissionDecision(ledger reviewIngestLedger, opts reviewledger.
 	sha := opts.Verdict.SHA
 	if sha == "" {
 		sha = destinationName
+	}
+	if err := ledger.Validate(opts); err != nil {
+		return "", err
 	}
 	if opts.Verdict.Reviewer != "" {
 		if _, found, err := ledger.VerdictForReviewer(sha, opts.Verdict.Reviewer); err != nil {
