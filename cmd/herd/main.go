@@ -1051,8 +1051,10 @@ func reportCurrentProvenance(root string) error {
 		return err
 	}
 	fmt.Println(provenance.Format(info))
-	if err := provenance.Validate(info, info.SourceRevision); err != nil && managedSelfGateExecutable(root) {
-		return err
+	if info.Comparable {
+		if err := provenance.Validate(info, info.SourceRevision); err != nil && managedSelfGateExecutable(root) {
+			return err
+		}
 	}
 	return nil
 }

@@ -30,6 +30,9 @@ type Info struct {
 	SourceRevision string
 	BinaryRevision string
 	BuildTime      string
+	SourceModule   string
+	BinaryModule   string
+	Comparable     bool
 	Current        bool
 }
 
@@ -45,8 +48,8 @@ func CurrentExecutable() (Info, error) {
 	if resolved, err := filepath.EvalSymlinks(path); err == nil {
 		path = resolved
 	}
-	revision, buildTime := binaryValuesFrom(path)
-	return Info{Path: path, BinaryRevision: revision, BuildTime: buildTime}, nil
+	revision, buildTime, module := binaryValuesFrom(path)
+	return Info{Path: path, BinaryRevision: revision, BuildTime: buildTime, BinaryModule: module}, nil
 }
 
 // Read returns the executable and source identity for root.
@@ -65,8 +68,8 @@ func Read(root string) (Info, error) {
 	if err != nil {
 		return Info{Path: path}, fmt.Errorf("provenance: source revision: %w", err)
 	}
-	info := infoFor(path, source)
-	info.Current = Validate(info, source) == nil
+	info := infoFor(path, source, root)
+	info.Current = info.Comparable && Validate(info, source) == nil
 	return info, nil
 }
 
@@ -79,14 +82,24 @@ func ReadExecutable(path, root string) (Info, error) {
 	if err != nil {
 		return Info{Path: path}, err
 	}
-	info := infoFor(path, source)
-	info.Current = Validate(info, source) == nil
+	info := infoFor(path, source, root)
+	info.Current = info.Comparable && Validate(info, source) == nil
 	return info, nil
 }
 
-func infoFor(path, source string) Info {
-	revision, buildTime := binaryValuesFrom(path)
-	return Info{Path: path, SourceRevision: source, BinaryRevision: revision, BuildTime: buildTime}
+func infoFor(path, source, root string) Info {
+	revision, buildTime, binaryModule := binaryValuesFrom(path)
+	sourceModule := modulePath(root)
+	comparable := sourceModule != "" && sourceModule == binaryModule
+	return Info{
+		Path:           path,
+		SourceRevision: source,
+		BinaryRevision: revision,
+		BuildTime:      buildTime,
+		SourceModule:   sourceModule,
+		BinaryModule:   binaryModule,
+		Comparable:     comparable,
+	}
 }
 
 // Validate rejects a binary that cannot be tied to the checked source.
@@ -155,8 +168,9 @@ func executableInfo(path, root string) (Info, error) {
 	if err != nil {
 		return Info{}, err
 	}
-	revision, buildTime := binaryValuesFrom(path)
-	return Info{Path: path, SourceRevision: source, BinaryRevision: revision, BuildTime: buildTime}, nil
+	revision, buildTime, module := binaryValuesFrom(path)
+	sourceModule := modulePath(root)
+	return Info{Path: path, SourceRevision: source, BinaryRevision: revision, BuildTime: buildTime, SourceModule: sourceModule, BinaryModule: module, Comparable: sourceModule != "" && sourceModule == module}, nil
 }
 
 func verifyGitRoot(root string) error {
@@ -188,10 +202,14 @@ func verifyGitRoot(root string) error {
 	return nil
 }
 
-func binaryValues() (string, string) { return binaryValuesFrom("") }
+func binaryValues() (string, string) {
+	revision, buildTime, _ := binaryValuesFrom("")
+	return revision, buildTime
+}
 
-func binaryValuesFrom(path string) (string, string) {
+func binaryValuesFrom(path string) (string, string, string) {
 	revision, buildTime := strings.TrimSpace(BinaryRevision), strings.TrimSpace(BinaryBuildTime)
+	module := ""
 	var bi *debug.BuildInfo
 	if path == "" {
 		bi, _ = debug.ReadBuildInfo()
@@ -199,6 +217,7 @@ func binaryValuesFrom(path string) (string, string) {
 		bi, _ = buildinfo.ReadFile(path)
 	}
 	if bi != nil {
+		module = bi.Main.Path
 		for _, setting := range bi.Settings {
 			switch setting.Key {
 			case "vcs.revision":
@@ -212,7 +231,21 @@ func binaryValuesFrom(path string) (string, string) {
 			}
 		}
 	}
-	return revision, buildTime
+	return revision, buildTime, module
+}
+
+func modulePath(root string) string {
+	contents, err := os.ReadFile(filepath.Join(root, "go.mod"))
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(string(contents), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) == 2 && fields[0] == "module" {
+			return fields[1]
+		}
+	}
+	return ""
 }
 
 func gitValue(root string, args ...string) (string, error) {
@@ -234,10 +267,12 @@ func short(value string) string {
 // Format produces stable, human-readable self-gate evidence.
 func Format(info Info) string {
 	current := "STALE"
-	if info.Current {
+	if !info.Comparable {
+		current = "UNKNOWN"
+	} else if info.Current {
 		current = "CURRENT"
 	}
-	return fmt.Sprintf("herd provenance: %s\n  binary path: %s\n  source revision: %s\n  binary build revision: %s\n  binary build time: %s", current, info.Path, info.SourceRevision, info.BinaryRevision, info.BuildTime)
+	return fmt.Sprintf("herd provenance: %s\n  binary path: %s\n  source revision: %s\n  binary build revision: %s\n  binary build source: %s\n  source module: %s\n  binary build time: %s", current, info.Path, info.SourceRevision, info.BinaryRevision, info.BinaryModule, info.SourceModule, info.BuildTime)
 }
 
 // ParseUnixTime is kept small and exported for table tests and future gate

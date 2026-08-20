@@ -1,11 +1,62 @@
 package provenance
 
 import (
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 )
+
+func TestReadExecutableConsumerRepositoryDoesNotCompareUnrelatedRevisions(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "go.mod"), "module example.com/consumer\n\ngo 1.25\n")
+	gitRun(t, root, "init", "-b", "main")
+	gitRun(t, root, "config", "user.email", "test@example.com")
+	gitRun(t, root, "config", "user.name", "test")
+	gitRun(t, root, "add", "go.mod")
+	gitRun(t, root, "commit", "-m", "init")
+
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatalf("test executable: %v", err)
+	}
+	// The test executable is built from Herdforge, while root is a consumer
+	// repository. Its revisions must never be compared.
+	info, err := ReadExecutable(executable, root)
+	if err != nil {
+		t.Fatalf("ReadExecutable() error = %v", err)
+	}
+	if info.Comparable {
+		t.Fatal("consumer repository must not be comparable to the Herdforge binary")
+	}
+	if info.Current {
+		t.Fatal("cross-repository provenance must not be reported as current")
+	}
+	got := Format(info)
+	if strings.Contains(got, "herd provenance: STALE") {
+		t.Fatalf("consumer provenance falsely reported stale:\n%s", got)
+	}
+	if !strings.Contains(got, "herd provenance: UNKNOWN") {
+		t.Fatalf("consumer provenance must be unknown:\n%s", got)
+	}
+}
+
+func writeFile(t *testing.T, path, contents string) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte(contents), 0o644); err != nil {
+		t.Fatalf("write %s: %v", path, err)
+	}
+}
+
+func gitRun(t *testing.T, dir string, args ...string) {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, out)
+	}
+}
 
 func TestReadRejectsRedirectedGitRoot(t *testing.T) {
 	root := t.TempDir()
@@ -53,7 +104,7 @@ func TestValidateBinarySource(t *testing.T) {
 }
 
 func TestFormatReportsAllProvenanceFields(t *testing.T) {
-	got := Format(Info{Path: "./bin/herd", SourceRevision: "source", BinaryRevision: "binary", BuildTime: "time"})
+	got := Format(Info{Path: "./bin/herd", SourceRevision: "source", BinaryRevision: "binary", BuildTime: "time", Comparable: true})
 	for _, want := range []string{"binary path: ./bin/herd", "source revision: source", "binary build revision: binary", "binary build time: time", "STALE"} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("Format() = %q, missing %q", got, want)
