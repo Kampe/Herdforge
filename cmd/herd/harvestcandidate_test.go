@@ -120,6 +120,24 @@ func TestResolveHarvestCandidatePinsReviewedSHAAcrossTipDrift(t *testing.T) {
 		})
 	}
 
+	selected, err := harvestCommits("main", "standing/lane", harvestmerge.CandidateRange{Base: "main", SHA: reviewed})
+	if err != nil {
+		t.Fatalf("select pinned candidate: %v", err)
+	}
+	if len(selected) != 1 {
+		t.Fatalf("pinned candidate selected %d commits, want exactly reviewed candidate: %v", len(selected), selected)
+	}
+	advancedFound, err := harvestCommits("main", "standing/lane", harvestmerge.CandidateRange{Base: "main", SHA: advanced})
+	if err != nil {
+		t.Fatalf("select advanced candidate: %v", err)
+	}
+	if len(advancedFound) != 2 {
+		t.Fatalf("advanced candidate selected %d commits, want reviewed and advanced: %v", len(advancedFound), advancedFound)
+	}
+	if _, err := harvestCommits("", "standing/lane", harvestmerge.CandidateRange{SHA: reviewed}); err == nil {
+		t.Fatal("pinned candidate with no base must refuse instead of widening selection")
+	}
+
 	addCandidatePass(t, l, advanced, "standing/lane")
 	got, err := resolveHarvestCandidateWithReconstructionAt(root, "standing/lane", "", "", "")
 	if err != nil {

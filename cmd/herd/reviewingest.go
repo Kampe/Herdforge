@@ -481,12 +481,6 @@ func runHarvestMerge() {
 		}
 		*candidate = rangeSpec.SHA
 	}
-	commits, err := harvestCommits(*base, *branch, rangeSpec)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "herd harvest-merge: %v\n", err)
-		os.Exit(1)
-	}
-
 	report, err := resolveHarvestCandidateWithReconstructionAt(repoRoot, *branch, *candidate, *reconstructedFrom, *contentProof)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "herd harvest-merge: %v\n", err)
@@ -504,6 +498,32 @@ func runHarvestMerge() {
 			return
 		}
 		fmt.Fprintf(os.Stderr, "herd harvest-merge: exact reviewed candidate is not eligible; branch tip drift requires --candidate <last_pass_sha> or a new PASS\n")
+		os.Exit(1)
+	}
+	// Resolve the exact eligible identity before selecting any commits. A
+	// standing branch may have advanced past the reviewed candidate; allowing
+	// harvestCommits to see that branch tip would make the eligibility decision
+	// and the harvested set describe different histories.
+	selectionRange := rangeSpec
+	if selectionRange.Base == "" {
+		selectionRange.Base = *base
+	}
+	if report.ReconstructedSHA != "" {
+		selectionRange.SHA = report.ReconstructedSHA
+	} else {
+		selectionRange.SHA = report.Pin.SHA
+	}
+	if selectionRange.Base == "" || selectionRange.SHA == "" {
+		fmt.Fprintln(os.Stderr, "herd harvest-merge: eligible candidate cannot be bounded to an exact base and candidate")
+		os.Exit(1)
+	}
+	commits, err := harvestCommits(selectionRange.Base, *branch, selectionRange)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "herd harvest-merge: %v\n", err)
+		os.Exit(1)
+	}
+	if err := verifyHarvestSelection(selectionRange.Base, selectionRange.SHA, commits); err != nil {
+		fmt.Fprintf(os.Stderr, "herd harvest-merge: %v\n", err)
 		os.Exit(1)
 	}
 	ledgerVerdict, vErr := harvestMergeVerdict(sha, *verdict)
@@ -602,9 +622,10 @@ func runHarvestMerge() {
 	// from it. Cleanup on success is the caller's, after publishing.
 }
 
-// harvestCommits selects only the commits represented by the reviewed range
-// when scoped mode is requested. Without a range it preserves the historical
-// branch-wide behavior, including its conflict self-abort gate.
+// harvestCommits selects only the commits represented by the reviewed range.
+// An empty range is retained for callers that intentionally need the legacy
+// branch-wide conflict self-abort behavior, but the harvest command always
+// supplies an exact range after resolving eligibility.
 func harvestCommits(base, branch string, reviewed harvestmerge.CandidateRange) ([]string, error) {
 	repoRoot, err := filepath.Abs(".")
 	if err != nil {
@@ -612,6 +633,9 @@ func harvestCommits(base, branch string, reviewed harvestmerge.CandidateRange) (
 	}
 	cherryBase, target := base, branch
 	if reviewed.SHA != "" {
+		if strings.TrimSpace(reviewed.Base) == "" {
+			return nil, fmt.Errorf("harvest-merge: pinned candidate requires an exact base")
+		}
 		cherryBase, target = reviewed.Base, reviewed.SHA
 	}
 	cmd := exec.Command("git", "cherry", cherryBase, target)
@@ -621,6 +645,28 @@ func harvestCommits(base, branch string, reviewed harvestmerge.CandidateRange) (
 		return nil, fmt.Errorf("git cherry %s %s: %w", cherryBase, target, err)
 	}
 	return harvestmerge.UniqueCommits(string(cherry)), nil
+}
+
+// verifyHarvestSelection repeats the exact immutable-range query after
+// selection. The harvest command must never write a worktree from a list that
+// differs from git cherry <base> <candidate>, even if selection code changes
+// later or a caller accidentally widens the target back to a branch tip.
+func verifyHarvestSelection(base, candidate string, selected []string) error {
+	base = strings.TrimSpace(base)
+	candidate = strings.TrimSpace(candidate)
+	if base == "" || candidate == "" {
+		return fmt.Errorf("harvest-merge: pinned candidate selection requires an exact base and candidate")
+	}
+	cmd := exec.Command("git", "cherry", base, candidate)
+	cherry, err := cmd.Output()
+	if err != nil {
+		return fmt.Errorf("git cherry %s %s for selection verification: %w", base, candidate, err)
+	}
+	expected := harvestmerge.UniqueCommits(string(cherry))
+	if strings.Join(expected, "\n") != strings.Join(selected, "\n") {
+		return fmt.Errorf("harvest-merge: selected commit set does not match pinned candidate %s", shortSHA12(candidate))
+	}
+	return nil
 }
 
 // harvestCandidateReport is the provenance-first decision made before any
