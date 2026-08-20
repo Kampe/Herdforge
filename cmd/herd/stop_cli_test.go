@@ -100,6 +100,7 @@ func stopRepo(t *testing.T) (repo, dirtyFile string) {
 // The whole point of the command: a forced stop makes "no new work" durable
 // and still destroys nothing.
 func TestStopCLIMakesWinddownDurableAndDestroysNoWork(t *testing.T) {
+	requireHerdrForLiveTest(t)
 	repo, dirtyFile := stopRepo(t)
 	binary := buildHerd(t)
 	binDir, herdrLog := fakeHerdr(t, `{"result":{"type":"agent_list","agents":[{"name":"smith","agent_status":"working","pane_id":"p1","tab_id":"t1","workspace_id":"wT"}]}}`)

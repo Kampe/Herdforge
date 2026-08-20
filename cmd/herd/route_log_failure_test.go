@@ -13,6 +13,7 @@ import (
 // (e.g. an unwritable directory) must not turn a successful route pick into
 // a hard command failure -- it is an audit-trail gap, not a routing failure.
 func TestRouteSucceedsWhenDecisionLogWriteFails(t *testing.T) {
+	requireRouteEnvironment(t)
 	binary := buildHerd(t)
 	dir := t.TempDir()
 
