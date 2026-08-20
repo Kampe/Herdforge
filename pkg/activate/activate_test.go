@@ -565,20 +565,15 @@ func TestNewDockerCompose_ExportsStackGuard(t *testing.T) {
 }
 
 // chdirTest changes the process test CWD, restoring it on test end.
+// chdirTest delegates to t.Chdir, which saves and restores the working
+// directory using the test framework's own bookkeeping. The previous
+// hand-rolled version called os.Getwd() to remember the old directory, and
+// that FAILS with "getwd: no such file or directory" when an earlier test
+// left the process inside a t.TempDir() that has since been cleaned up —
+// making this test order-dependent and red in CI.
 func chdirTest(t *testing.T, dir string) {
 	t.Helper()
-	prev, err := os.Getwd()
-	if err != nil {
-		t.Fatalf("getwd: %v", err)
-	}
-	if err := os.Chdir(dir); err != nil {
-		t.Fatalf("chdir %s: %v", dir, err)
-	}
-	t.Cleanup(func() {
-		if err := os.Chdir(prev); err != nil {
-			t.Errorf("restore cwd %s: %v", prev, err)
-		}
-	})
+	t.Chdir(dir)
 }
 
 func writeTestFile(t *testing.T, path, content string) {
