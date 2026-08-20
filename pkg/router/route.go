@@ -568,18 +568,20 @@ const MaxArgPromptBytes = 200 * 1024
 
 // Route is the routing decision, mirroring herd-route's route_json payload.
 type Route struct {
-	Provider        string   `json:"provider"`
-	Model           string   `json:"model,omitempty"`
-	Effort          string   `json:"effort"`
-	Family          string   `json:"family"`
-	Task            string   `json:"task"`
-	LazerLastResort bool     `json:"lazer_last_resort"`
-	Availability    string   `json:"availability"`
-	QuotaPool       string   `json:"quota_pool"`
-	QuotaPressure   int      `json:"quota_pressure"`
-	Score           int      `json:"score"`
-	Reason          string   `json:"reason"`
-	Argv            []string `json:"argv,omitempty"`
+	Provider          string   `json:"provider"`
+	Model             string   `json:"model,omitempty"`
+	Effort            string   `json:"effort"`
+	EffortApplicable  bool     `json:"effort_applicable"`
+	Family            string   `json:"family"`
+	Task              string   `json:"task"`
+	LazerLastResort   bool     `json:"lazer_last_resort"`
+	Availability      string   `json:"availability"`
+	QuotaPool         string   `json:"quota_pool"`
+	QuotaPressure     int      `json:"quota_pressure"`
+	Score             int      `json:"score"`
+	Reason            string   `json:"reason"`
+	Argv              []string `json:"argv,omitempty"`
+	ArgvAuthoritative bool     `json:"argv_authoritative"`
 }
 
 // Probes abstracts the live availability checks so tests are hermetic.
@@ -1072,17 +1074,19 @@ func (r *SurfaceRouter) Pick(shape, requestedProvider, excludedFamily string) (*
 	}
 
 	return &Route{
-		Provider:        best.provider,
-		Model:           model,
-		Effort:          effort,
-		Family:          FamilyFor(best.provider, model),
-		Task:            shape,
-		LazerLastResort: best.provider == "lazer",
-		Availability:    best.detail,
-		QuotaPool:       QuotaPoolFor(best.provider, model),
-		QuotaPressure:   best.pressure,
-		Score:           best.rank,
-		Reason:          reason,
-		Argv:            ArgvFor(best.provider, model, effort),
+		Provider:          best.provider,
+		Model:             model,
+		Effort:            effort,
+		EffortApplicable:  EffortApplicable(best.provider),
+		Family:            FamilyFor(best.provider, model),
+		Task:              shape,
+		LazerLastResort:   best.provider == "lazer",
+		Availability:      best.detail,
+		QuotaPool:         QuotaPoolFor(best.provider, model),
+		QuotaPressure:     best.pressure,
+		Score:             best.rank,
+		Reason:            reason,
+		Argv:              ArgvFor(best.provider, model, effort),
+		ArgvAuthoritative: true,
 	}, nil
 }
