@@ -14,9 +14,9 @@ import (
 // IngestedAuditFinding identifies an artifact under an ingested directory
 // that has no matching durable verdict event.
 type IngestedAuditFinding struct {
-		Path   string `json:"path"`
-		SHA    string `json:"sha,omitempty"`
-		Reason string `json:"reason"`
+	Path   string `json:"path"`
+	SHA    string `json:"sha,omitempty"`
+	Reason string `json:"reason"`
 }
 
 // AuditIngested walks ingested directories directly. It deliberately does not
@@ -65,14 +65,22 @@ func AuditIngested(root string, rows []reviewledger.LedgerRow) ([]IngestedAuditF
 // MoveToIngested moves an artifact only after its caller has proved ledger
 // admission. Existing same-content destinations are treated idempotently.
 func MoveToIngested(source string) (string, error) {
+	return MoveToIngestedNamed(source, filepath.Base(source))
+}
+
+// MoveToIngestedNamed moves an artifact to ingested under the supplied
+// basename. The destination is checked before the rename, and a different
+// existing artifact is always refused without consuming the source.
+func MoveToIngestedNamed(source, name string) (string, error) {
 	source = strings.TrimSpace(source)
-	if source == "" {
+	name = strings.TrimSpace(name)
+	if source == "" || name == "" || filepath.Base(name) != name {
 		return "", fmt.Errorf("artifact source is required")
 	}
 	if filepath.Base(filepath.Dir(source)) == "ingested" {
 		return source, nil
 	}
-	dst := filepath.Join(filepath.Dir(source), "ingested", filepath.Base(source))
+	dst := filepath.Join(filepath.Dir(source), "ingested", name)
 	if err := os.MkdirAll(filepath.Dir(dst), 0o700); err != nil {
 		return "", fmt.Errorf("create ingested directory: %w", err)
 	}
@@ -88,10 +96,42 @@ func MoveToIngested(source string) (string, error) {
 	} else if !os.IsNotExist(err) {
 		return "", fmt.Errorf("check ingested artifact: %w", err)
 	}
-	if err := os.Rename(source, dst); err != nil {
+	// Link publishes without replacing a destination that may appear after the
+	// preflight check. Remove the source only after publication succeeds.
+	if err := os.Link(source, dst); err != nil {
 		return "", fmt.Errorf("move artifact into ingested: %w", err)
 	}
+	if err := os.Remove(source); err != nil {
+		_ = os.Remove(dst)
+		return "", fmt.Errorf("remove source after move: %w", err)
+	}
 	return dst, nil
+}
+
+// CheckMoveToIngested verifies the destination without moving the source.
+// Dry-run uses the same collision check as the real move.
+func CheckMoveToIngested(source, name string) error {
+	source = strings.TrimSpace(source)
+	name = strings.TrimSpace(name)
+	if source == "" || name == "" || filepath.Base(name) != name {
+		return fmt.Errorf("artifact source and destination name are required")
+	}
+	dst := filepath.Join(filepath.Dir(source), "ingested", name)
+	existing, err := os.ReadFile(dst)
+	if err == nil {
+		incoming, readErr := os.ReadFile(source)
+		if readErr != nil {
+			return fmt.Errorf("read artifact before idempotent move: %w", readErr)
+		}
+		if string(existing) != string(incoming) {
+			return fmt.Errorf("ingested artifact %s exists with different content", dst)
+		}
+		return nil
+	}
+	if !os.IsNotExist(err) {
+		return fmt.Errorf("check ingested artifact: %w", err)
+	}
+	return nil
 }
 
 // InboxRel is the repository-relative durable review inbox. Reviewer panes
@@ -125,9 +165,9 @@ func RetainArtifact(root, source, sha, reviewer string) (string, error) {
 	if _, err := in.Seek(0, 0); err != nil {
 		return "", fmt.Errorf("rewind verdict artifact: %w", err)
 	}
-	name := sanitizeReviewerName(reviewer)
 	contentDigest := fmt.Sprintf("%x", digest.Sum(nil))[:16]
-	rel := filepath.ToSlash(filepath.Join(InboxRel, fmt.Sprintf("%s-%s-%s.md", strings.ToLower(shortSHA(sha)), name, contentDigest)))
+	name := fmt.Sprintf("%s-%s-%s.md", strings.ToLower(shortSHA(sha)), sanitizeReviewerName(reviewer), contentDigest)
+	rel := filepath.ToSlash(filepath.Join(InboxRel, name))
 	dst := filepath.Join(root, filepath.FromSlash(rel))
 	if err := os.MkdirAll(filepath.Dir(dst), 0o700); err != nil {
 		return "", fmt.Errorf("create review inbox: %w", err)
@@ -180,6 +220,13 @@ func RetainArtifact(root, source, sha, reviewer string) (string, error) {
 		return "", fmt.Errorf("retained artifact is empty after publish")
 	}
 	return rel, nil
+}
+
+// RetainedArtifactName returns the reviewer-qualified basename used for a
+// retained artifact and its matching ingested handoff.
+func RetainedArtifactName(sha, reviewer string, body []byte) string {
+	digest := sha256.Sum256(body)
+	return fmt.Sprintf("%s-%s-%x.md", strings.ToLower(shortSHA(strings.TrimSpace(sha))), sanitizeReviewerName(reviewer), digest[:8])
 }
 
 // IsInboxPath reports whether path is a repository-relative durable review

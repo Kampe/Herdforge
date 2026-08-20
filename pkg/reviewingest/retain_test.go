@@ -66,3 +66,27 @@ func TestIsInboxPath(t *testing.T) {
 		t.Fatal("temp chainseer path must not count as durable inbox")
 	}
 }
+
+func TestReviewerQualifiedIngestedNamesAllowSameSHA(t *testing.T) {
+	root := t.TempDir()
+	sha := strings.Repeat("a", 40)
+	first := filepath.Join(root, "first.md")
+	second := filepath.Join(root, "second.md")
+	if err := os.WriteFile(first, []byte("first"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(second, []byte("second"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	firstName := RetainedArtifactName(sha, "reviewer-one", []byte("first"))
+	secondName := RetainedArtifactName(sha, "reviewer-two", []byte("second"))
+	if firstName == secondName {
+		t.Fatalf("reviewer-qualified names collided: %q", firstName)
+	}
+	if _, err := MoveToIngestedNamed(first, firstName); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := MoveToIngestedNamed(second, secondName); err != nil {
+		t.Fatal(err)
+	}
+}

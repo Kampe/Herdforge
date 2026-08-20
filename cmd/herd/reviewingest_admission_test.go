@@ -39,7 +39,7 @@ func TestReviewIngestDuplicateDoesNotMoveArtifact(t *testing.T) {
 		t.Fatal(err)
 	}
 	ledger := &fakeReviewIngestLedger{readable: true, reviewer: "reviewer"}
-	got, err := admitVerdictAndMove(ledger, reviewledger.IngestOpts{Verdict: reviewledger.VerdictOpts{Reviewer: "reviewer"}}, source, "sha")
+	got, err := admitVerdictAndMove(ledger, reviewledger.IngestOpts{Verdict: reviewledger.VerdictOpts{Reviewer: "reviewer"}}, source, "review.md")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -71,7 +71,7 @@ func TestReviewIngestAdmissionAndMove(t *testing.T) {
 				t.Fatal(err)
 			}
 			ledger := &fakeReviewIngestLedger{readable: tc.readable}
-			_, err := admitVerdictAndMove(ledger, reviewledger.IngestOpts{}, source, sha)
+			_, err := admitVerdictAndMove(ledger, reviewledger.IngestOpts{}, source, "review.md")
 			if tc.wantErr {
 				if err == nil || !strings.Contains(err.Error(), "read back") {
 					t.Fatalf("expected read-back failure, got %v", err)
@@ -91,5 +91,30 @@ func TestReviewIngestAdmissionAndMove(t *testing.T) {
 				t.Fatalf("artifact was not moved after readable ledger row: %v", statErr)
 			}
 		})
+	}
+}
+
+func TestReviewIngestCollisionIsRefusedBeforeLedgerMutation(t *testing.T) {
+	root := t.TempDir()
+	source := filepath.Join(root, "review.md")
+	destination := filepath.Join(root, "ingested", "same-sha-new-reviewer.md")
+	if err := os.MkdirAll(filepath.Dir(destination), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(source, []byte("new verdict"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(destination, []byte("older verdict"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ledger := &fakeReviewIngestLedger{readable: true}
+	if _, err := admitVerdictAndMove(ledger, reviewledger.IngestOpts{}, source, filepath.Base(destination)); err == nil || !strings.Contains(err.Error(), "preflight") {
+		t.Fatalf("collision error = %v, want preflight refusal", err)
+	}
+	if ledger.ingests != 0 {
+		t.Fatalf("collision wrote %d ledger rows, want 0", ledger.ingests)
+	}
+	if _, err := os.Stat(source); err != nil {
+		t.Fatalf("collision consumed source: %v", err)
 	}
 }
