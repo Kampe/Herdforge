@@ -63,6 +63,28 @@ func TestPostCallback_ConcurrentDedupeAtMostOnce(t *testing.T) {
 	}
 }
 
+func TestPostCallback_CompleteSameRefAndLeaseGenerationAtMostOnce(t *testing.T) {
+	mailFile := filepath.Join(t.TempDir(), "mail.jsonl")
+	mb := NewMailbox(mailFile)
+	cb := Callback{
+		Ref: "FAC-508", Kind: CallbackComplete, SHA: "abc123",
+		Repo: "herdforge", LeaseGeneration: 3,
+	}
+	for i := 0; i < 3; i++ {
+		if _, err := mb.PostCallback("task-fac-508", cb); err != nil {
+			t.Fatalf("post callback %d: %v", i+1, err)
+		}
+	}
+
+	envs, err := mb.ReadInbox(CoordinatorInbox)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(envs) != 1 {
+		t.Fatalf("same complete ref/lease must produce one durable envelope, got %d", len(envs))
+	}
+}
+
 // FAC-145 supersession: the latest verdict on the bus wins — a REJECTED
 // posted after an APPROVED vetoes it, and only a FRESH later APPROVED
 // (distinct effect identity) restores approval.
