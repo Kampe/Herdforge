@@ -1,6 +1,6 @@
 # Herdforge Makefile
 
-.PHONY: all build test test-unit test-contracts test-hermetic-compile test-coverage test-mutation test-race test-e2e preflight lint security security-test security-deps self-test herd-up clean ci package-inventory bin-parity known-failures
+.PHONY: all build test test-unit test-contracts test-hermetic-compile test-coverage test-mutation test-race test-e2e preflight lint security security-test security-deps self-test herd-up clean ci package-inventory bin-parity known-failures check-go-toolchain
 
 # FAC-135: shared hermetic Git environment for every gate. Host signing, hooks,
 # and ambient credentials must not influence fixtures or coverage.
@@ -25,7 +25,14 @@ ci:
 	$(HERMETIC_GIT) $(MAKE) lint test-unit test-race preflight
 	@echo "==> CI gate PASSED"
 
-build:
+# FAC-486: must precede every go invocation. pkg/preflight.CheckGoToolchain
+# diagnoses the same condition, but reaching it requires compiling Go — which is
+# exactly what a GOROOT mismatch breaks — so it can only ever fire from an
+# already-built binary. This target is that check at the pre-compile layer.
+check-go-toolchain:
+	@./scripts/check-go-toolchain.zsh
+
+build: check-go-toolchain
 	@echo "==> Building herd binary..."
 	@mkdir -p bin
 	@root=$$(pwd -P) && top=$$(git rev-parse --show-toplevel 2>/dev/null) || { echo "build refused: Git toplevel does not resolve from the build directory" >&2; exit 1; }; \
@@ -53,7 +60,7 @@ test-hermetic-fac151: build test-hermetic-compile
 	@echo "==> Running FAC-151 hermetic Docker profile (herd verify-fac151)..."
 	./bin/herd verify-fac151
 
-test-unit: test-contracts test-hermetic-compile
+test-unit: check-go-toolchain test-contracts test-hermetic-compile
 	@echo "==> Running full unit test suite..."
 	# 300s: cmd/herd integration builds the binary multiple times; 180s is
 	# flaky/red on both main and this branch (pre-existing, not FAC-198).
@@ -102,7 +109,7 @@ known-failures:
 		$(HERMETIC_GIT) go test -json -count=1 -shuffle=on -timeout=300s ./cmd/herd/ ./pkg/verifier/ >"$$report" 2>&1 || true; \
 		$(HERMETIC_GIT) go run ./scripts/knownfailures --manifest .herd/known-failures.json --report "$$report"
 
-preflight:
+preflight: check-go-toolchain
 	@echo "==> Running preflight workspace boundary, merge-policy, and main/origin drift checks..."
 	$(HERMETIC_GIT) go run ./cmd/herd preflight
 
@@ -114,7 +121,7 @@ herd-up: build
 	@echo "==> Spawning Herdforge autonomous software factory daemon..."
 	./bin/herd pulse --act --spawn
 
-lint:
+lint: check-go-toolchain
 	@echo "==> Running go vet static analysis..."
 	go vet ./...
 	@echo "==> Running go vet on nested contract module (contracts/agentscope)..."
