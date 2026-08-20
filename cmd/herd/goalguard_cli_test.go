@@ -1,6 +1,7 @@
 package main
 
 import (
+	"io"
 	"context"
 	"encoding/json"
 	"os"
@@ -139,7 +140,12 @@ func TestGoalGuardStopHookAllowsStopWhenLeaseIsLost(t *testing.T) {
 	}
 }
 
-func TestGoalGuardStopHookRejectsContinuationWithoutGrant(t *testing.T) {
+// FAC-532: a goal recorded before authority envelopes existed is still an
+// operator-granted goal. The hook must WARN loudly rather than return an
+// error — a Stop hook that errors terminates the agent, so refusing here
+// stranded every lane whose goal predated FAC-525. The FAC-525 invariant is
+// preserved in that the hook never SILENTLY invents authority.
+func TestGoalGuardStopHookWarnsButContinuesOnLegacyGrant(t *testing.T) {
 	dir := t.TempDir()
 	state := filepath.Join(dir, "goal.json")
 	dbPath := filepath.Join(dir, ".herd", "launch-claims.db")
@@ -162,17 +168,33 @@ func TestGoalGuardStopHookRejectsContinuationWithoutGrant(t *testing.T) {
 	if err := s.Set(goalguard.Goal{Lane: "forge-worker", Task: "FAC-525", Owner: "coordinator", Generation: lease.Generation, MaxContinuations: 1, CreatedAt: now, UpdatedAt: now}); err != nil {
 		t.Fatal(err)
 	}
-	oldStdout := os.Stdout
-	read, write, err := os.Pipe()
+	oldStdout, oldStderr := os.Stdout, os.Stderr
+	outR, outW, err := os.Pipe()
 	if err != nil {
 		t.Fatal(err)
 	}
-	os.Stdout = write
-	err = runGoalGuardStopHook(s, nil)
-	_ = write.Close()
-	os.Stdout = oldStdout
-	_ = read.Close()
-	if err == nil || !strings.Contains(err.Error(), "no verifiable authority envelope") {
-		t.Fatalf("missing grant result=%v, want loud refusal", err)
+	errR, errW, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stdout, os.Stderr = outW, errW
+	hookErr := runGoalGuardStopHook(s, nil)
+	_ = outW.Close()
+	_ = errW.Close()
+	os.Stdout, os.Stderr = oldStdout, oldStderr
+	stdout, _ := io.ReadAll(outR)
+	stderr, _ := io.ReadAll(errR)
+	_ = outR.Close()
+	_ = errR.Close()
+
+	// The whole point: NEVER an error. An erroring Stop hook kills the agent.
+	if hookErr != nil {
+		t.Fatalf("stop hook must never return an error (it terminates the agent), got %v", hookErr)
+	}
+	if !strings.Contains(string(stderr), "predates authority envelopes") {
+		t.Fatalf("legacy grant must warn loudly, stderr=%q", stderr)
+	}
+	if !strings.Contains(string(stdout), `"decision": "block"`) && !strings.Contains(string(stdout), `"decision":"block"`) {
+		t.Fatalf("legacy grant must still block a premature stop, stdout=%q", stdout)
 	}
 }
