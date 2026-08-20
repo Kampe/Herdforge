@@ -3,6 +3,7 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -14,6 +15,7 @@ func TestSafeReviewSurfacePart(t *testing.T) {
 	}{
 		{name: "ticket", ref: "FAC-435", want: "fac-435"},
 		{name: "slashes and punctuation", ref: "review/CHA-12#r2", want: "review-cha-12-r2"},
+		{name: "repeated separators", ref: "review//standing---nft", want: "review-standing-nft"},
 		{name: "empty", ref: "!!!", want: "candidate"},
 	}
 	for _, tt := range tests {
@@ -22,6 +24,32 @@ func TestSafeReviewSurfacePart(t *testing.T) {
 				t.Fatalf("safeReviewSurfacePart(%q) = %q, want %q", tt.ref, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestReviewNamesAreStableBoundedAndDistinct(t *testing.T) {
+	sha := "c3c368c84bb02ea604a2b29f112dbe231b6159a3"
+	refs := []string{
+		"standing/nft-data-engineer",
+		"standing/nft-data-engineer-variant",
+	}
+	for _, ref := range refs {
+		name := reviewAgentName(ref, sha)
+		if len(name) > reviewAgentNameLimit || name == "" {
+			t.Fatalf("reviewAgentName(%q) = %q, length %d; want 1-%d characters", ref, name, len(name), reviewAgentNameLimit)
+		}
+		if name != reviewAgentName(ref, sha) {
+			t.Fatalf("reviewAgentName(%q) is not stable: %q", ref, name)
+		}
+		if name[0] == '-' || name[len(name)-1] == '-' || strings.Contains(name, "--") {
+			t.Fatalf("reviewAgentName(%q) has invalid dash shape: %q", ref, name)
+		}
+	}
+	if got := reviewAgentName(refs[0], sha); got == reviewAgentName(refs[1], sha) {
+		t.Fatalf("long refs collided after truncation: %q", got)
+	}
+	if got := reviewTabLabel(refs[0], sha); len(got) > reviewAgentNameLimit {
+		t.Fatalf("reviewTabLabel length = %d, want <= %d", len(got), reviewAgentNameLimit)
 	}
 }
 

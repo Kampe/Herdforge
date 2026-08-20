@@ -42,6 +42,10 @@ func TestReviewRefShapeAndVerboseMode(t *testing.T) {
 		{name: "task ref", ref: "FAC-437", want: reviewRefTask},
 		{name: "commit sha", ref: "0123456789abcdef0123456789abcdef01234567", want: reviewRefSHA},
 		{name: "herdr tab", ref: "wB:t365", want: reviewRefTab},
+		{name: "reported no-match tab", ref: "wB:t38V", want: reviewRefTab},
+		{name: "branch ref", ref: "standing/nft-data-engineer", want: reviewRefBranch},
+		{name: "reported long branch ref", ref: "review/standing/nft-data-engineer", want: reviewRefBranch},
+		{name: "reported no-match SHA", ref: "c3c368c84bb02ea604a2b29f112dbe231b6159a3", want: reviewRefSHA},
 		{name: "invalid", ref: "not a ref", want: reviewRefInvalid},
 	}
 	for _, tc := range cases {

@@ -2017,6 +2017,7 @@ const (
 	reviewRefTask    reviewRefShape = "task-ref"
 	reviewRefSHA     reviewRefShape = "commit-sha"
 	reviewRefTab     reviewRefShape = "herdr-tab-id"
+	reviewRefBranch  reviewRefShape = "branch-ref"
 	reviewRefInvalid reviewRefShape = "invalid"
 )
 
@@ -2041,6 +2042,9 @@ func classifyReviewRef(ref string) reviewRefShape {
 	if dash > 0 && dash < len(ref)-1 && isReviewRefPart(ref[:dash]) && isReviewRefDigits(ref[dash+1:]) {
 		return reviewRefTask
 	}
+	if isReviewBranchRef(ref) {
+		return reviewRefBranch
+	}
 	return reviewRefInvalid
 }
 
@@ -2052,6 +2056,17 @@ func isReviewRefPart(s string) bool {
 
 func isReviewRefDigits(s string) bool {
 	return s != "" && strings.IndexFunc(s, func(r rune) bool { return r < '0' || r > '9' }) == -1
+}
+
+func isReviewBranchRef(s string) bool {
+	if s == "" || strings.HasPrefix(s, "/") || strings.HasSuffix(s, "/") ||
+		strings.ContainsAny(s, " \t\r\n\\") || strings.Contains(s, "..") || strings.Contains(s, "@{") {
+		return false
+	}
+	return strings.IndexFunc(s, func(r rune) bool {
+		return !((r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') ||
+			(r >= '0' && r <= '9') || strings.ContainsRune("._/-", r))
+	}) == -1
 }
 
 func reviewVerboseMode(args []string) bool {
@@ -2197,7 +2212,8 @@ func runReview() {
 	}
 	if len(cands) == 0 {
 		if refArg != "" {
-			fmt.Printf("No in-progress review candidate matched ref %q (parsed as %s).\n", refArg, refShape)
+			fmt.Fprintf(os.Stderr, "review: no in-progress review candidate matched ref %q (parsed as %s)\n", refArg, refShape)
+			os.Exit(1)
 		} else {
 			fmt.Println("No tasks in-progress to review.")
 		}
