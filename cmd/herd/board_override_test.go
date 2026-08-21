@@ -45,7 +45,7 @@ func overrideFixture(t *testing.T) (*config.Config, *provider.MemoryProvider, st
 func TestOverrideClosesCardWithoutLaunchReceipt(t *testing.T) {
 	cfg, mp, root := overrideFixture(t)
 
-	res, err := approveByOverrideWithAcceptance(context.Background(), cfg, mp, root, "CHA-2165",
+	res, err := approveByOverrideWithAcceptance(context.Background(), cfg, mp, nil, root, "CHA-2165",
 		"$ pnpm test --filter adapters\n  42 passed in packages/adapters\n",
 		&hsync.OverrideRequest{
 			Policy:   "operator-external-merge",
@@ -53,28 +53,22 @@ func TestOverrideClosesCardWithoutLaunchReceipt(t *testing.T) {
 			Reason:   "PR #3083 rebase merged and activated outside the fleet path",
 			Evidence: "cross-family PASS ingested; shared-main rebuild and live readiness proof",
 		})
-	if err != nil {
-		t.Fatalf("an attributable override must not require the receipt it replaces: %v", err)
+	// FAC-566: the receipt gate is gone, but the FENCE is not. With no claim
+	// stack the close must refuse rather than write unfenced -- Kaneo rejects an
+	// unfenced mutation with "refused without X-Herd-Op", and a bypass here
+	// would be a real fail-open.
+	if err == nil {
+		t.Fatalf("an override with no claim stack must refuse to write unfenced, got %+v", res)
 	}
-	if res == nil {
-		t.Fatal("override close must return a result")
+	if !strings.Contains(err.Error(), "fence") && !strings.Contains(err.Error(), "FAC-147") {
+		t.Fatalf("refusal must name the fence requirement, got %v", err)
+	}
+	// It must have passed the RECEIPT gate to reach the fence check: a
+	// receipt-shaped failure would mean FAC-563 regressed.
+	if strings.Contains(err.Error(), "launch receipt") {
+		t.Fatalf("override must not fail on a launch receipt: %v", err)
 	}
 
-	// The attributable record must exist, naming policy, actor, reason, evidence.
-	log, err := hsync.ReadDoneLog(root)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(log) == 0 {
-		t.Fatal("override close must write an attributable done-log record")
-	}
-	rec := log[len(log)-1]
-	blob := strings.ToLower(rec.Ref + " " + describeOverride(rec))
-	for _, want := range []string{"cha-2165", "operator-external-merge", "coordinator"} {
-		if !strings.Contains(blob, want) {
-			t.Fatalf("done-log record must carry %q, got %+v", want, rec)
-		}
-	}
 }
 
 // describeOverride flattens the override attribution for assertion.
@@ -97,11 +91,11 @@ func TestOverrideRouteStaysFailClosed(t *testing.T) {
 		"missing reason": {Policy: "operator-external-merge", Actor: "a", Evidence: "e"},
 		"no evidence":    {Policy: "operator-external-merge", Actor: "a", Reason: "r"},
 	} {
-		if _, err := approveByOverride(context.Background(), cfg, mp, root, "CHA-2165", req); err == nil {
+		if _, err := approveByOverride(context.Background(), cfg, mp, nil, root, "CHA-2165", req); err == nil {
 			t.Fatalf("%s must be refused", name)
 		}
 	}
-	if _, err := approveByOverride(context.Background(), cfg, mp, root, "CHA-2165", nil); err == nil {
+	if _, err := approveByOverride(context.Background(), cfg, mp, nil, root, "CHA-2165", nil); err == nil {
 		t.Fatal("a nil override must be refused")
 	}
 }

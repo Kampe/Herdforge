@@ -1023,18 +1023,15 @@ func runHarvestVerifyLanded(branch string, binding verifyLandedBinding) error {
 		return fmt.Errorf("no worktree found for branch %s", branch)
 	}
 
-	// Capture the reviewed tip BEFORE LandedProof rebases the worktree onto
-	// origin/main (after which HEAD is no longer the candidate object).
-	candidate := strings.TrimSpace(binding.Candidate)
-	if candidate == "" {
-		out, err := exec.Command("git", "-C", wtDir, "rev-parse", "HEAD").Output()
-		if err != nil {
-			return fmt.Errorf("resolve candidate tip on %s: %w", branch, err)
-		}
-		candidate = strings.TrimSpace(string(out))
-	}
-	if candidate == "" {
-		return fmt.Errorf("candidate sha is required for --verify-landed receipt reconcile")
+	// FAC-566: a MOVING BRANCH HEAD IS NOT CANDIDATE IDENTITY. This used to
+	// fall back to the worktree HEAD, which is correct only while the work is
+	// still unmerged. For work already rebase-merged outside the fleet -- the
+	// exact class this path serves -- HEAD is the LANDED head, so the recorded
+	// candidate became the merge commit and Route B then refused the legitimate
+	// verdict it was supposed to authorize.
+	candidate, err := resolveVerifyLandedCandidate(wtDir, branch, binding)
+	if err != nil {
+		return err
 	}
 
 	if err := hsync.LandedProof(wtDir); err != nil {
