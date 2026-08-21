@@ -164,11 +164,8 @@ func (k *KaneoProvider) withReceiver(ctx context.Context, taskID string, expStat
 	}
 	// Production fenced status requires a live FenceBroker (or hermetic
 	// AtomicFenceServer). Fail closed before any remote/readback side effects.
-	if expStatus != "" && (k.RequireCASMeta || (opID != "" && hasFence)) {
-		if k.FenceBroker == nil && !k.AtomicFenceServer {
-			return fmt.Errorf("%w: fenced UpdateStatus requires live FenceBroker (herd fence-broker + HERD_FENCE_BROKER_URL); stock Kaneo has no server-side fence+op-dedupe",
-				claim.ErrProviderAmbiguous)
-		}
+	if err := k.guardFencedStatus(expStatus, opID, hasFence); err != nil {
+		return err
 	}
 	if k.Receiver == nil {
 		// Non-production / unfenced test path only.
@@ -291,8 +288,7 @@ func (k *KaneoProvider) mutateStatus(ctx context.Context, taskID, status string)
 			return k.FenceBroker.MutateStatus(ctx, taskID, status, fence, opID, capability)
 		}
 		if !k.AtomicFenceServer {
-			return fmt.Errorf("%w: fenced UpdateStatus requires live FenceBroker (herd fence-broker + HERD_FENCE_BROKER_URL); stock Kaneo has no server-side fence+op-dedupe",
-				claim.ErrProviderAmbiguous)
+			return errFenceInfrastructureMissing()
 		}
 		// AtomicFenceServer without FenceBroker: direct HTTP to enforcing board (tests).
 	}
@@ -534,4 +530,41 @@ func (k *KaneoProvider) addCommentRaw(ctx context.Context, taskID, body string) 
 		return err
 	}
 	return DecodeJSONResponse(resp, nil)
+}
+
+// errFenceInfrastructureMissing is the single definition of this refusal.
+//
+// FAC-571: the text lived at two call sites. A rule (or its wording) duplicated
+// across sites is the defect shape behind FAC-562, FAC-565 and FAC-569 in this
+// repository, so the message has one home even though the two guards fire at
+// different points in the mutate path.
+//
+// It classifies as ErrFenceInfrastructure, NOT ErrProviderAmbiguous: both call
+// sites refuse before any remote write, so nothing landed and retry is safe once
+// the broker is running. Calling that ambiguous told an operator to reconcile a
+// write that never happened.
+func errFenceInfrastructureMissing() error {
+	return fmt.Errorf("%w: fenced UpdateStatus needs a live FenceBroker because stock Kaneo has no "+
+		"server-side fence+op-dedupe. NOTHING WAS WRITTEN and no reconciliation is required; "+
+		"start the broker and retry:\n"+
+		"  herd fence-broker            # long-running; prints the exports below\n"+
+		"  export HERD_FENCE_BROKER_URL=<printed url>\n"+
+		"  export HERD_FENCE_BROKER_TOKEN=<printed token>",
+		claim.ErrFenceInfrastructure)
+}
+
+// guardFencedStatus refuses a fenced status write when no fence authority is
+// live. It runs before any remote call or readback, so a refusal means nothing
+// was written.
+func (k *KaneoProvider) guardFencedStatus(expStatus, opID string, hasFence bool) error {
+	if expStatus == "" {
+		return nil
+	}
+	if !k.RequireCASMeta && (opID == "" || !hasFence) {
+		return nil
+	}
+	if k.FenceBroker != nil || k.AtomicFenceServer {
+		return nil
+	}
+	return errFenceInfrastructureMissing()
 }
