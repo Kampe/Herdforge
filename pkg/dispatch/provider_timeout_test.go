@@ -14,12 +14,19 @@ import (
 
 type timeoutBoard struct {
 	listCalls atomic.Int32
+	getCalls  atomic.Int32
 	hangList  bool
 	tasks     []*provider.Task
 }
 
-func (t *timeoutBoard) GetTask(context.Context, string) (*provider.Task, error) {
-	return nil, errors.New("unused")
+func (t *timeoutBoard) GetTask(_ context.Context, id string) (*provider.Task, error) {
+	t.getCalls.Add(1)
+	for _, task := range t.tasks {
+		if task.ID == id || task.Ref == id {
+			return task, nil
+		}
+	}
+	return nil, errors.New("task not found")
 }
 func (t *timeoutBoard) ListTasks(ctx context.Context, projectID, status string) ([]*provider.Task, error) {
 	t.listCalls.Add(1)
@@ -124,5 +131,26 @@ func TestDispatch_ConfigurableDeadlineApplied(t *testing.T) {
 	}
 	if elapsed < 10*time.Millisecond {
 		t.Fatalf("deadline fired too early: %v", elapsed)
+	}
+}
+
+func TestDispatcher_GetTaskBoundAvoidsWholeBoardList(t *testing.T) {
+	board := &timeoutBoard{
+		hangList: true,
+		tasks:    []*provider.Task{{ID: "task-1", Ref: "FAC-1"}},
+	}
+	d := NewDispatcher(&config.Config{TaskProvider: config.TaskProvider{Deadlines: config.OpDeadlines{Get: "25ms", List: "25ms"}}}, board, nil)
+	task, err := d.getTaskBound(context.Background(), "task-1")
+	if err != nil {
+		t.Fatalf("getTaskBound: %v", err)
+	}
+	if task == nil || task.Ref != "FAC-1" {
+		t.Fatalf("task=%+v", task)
+	}
+	if board.getCalls.Load() != 1 {
+		t.Fatalf("GetTask calls=%d want 1", board.getCalls.Load())
+	}
+	if board.listCalls.Load() != 0 {
+		t.Fatalf("bounded task reread must not list the board: ListTasks calls=%d", board.listCalls.Load())
 	}
 }
