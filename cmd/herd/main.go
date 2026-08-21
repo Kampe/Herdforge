@@ -7723,20 +7723,33 @@ func runDrainCommand(args []string, out, errOut io.Writer) int {
 	// The item count is known exactly at this point, so review-scan gets its
 	// own budget scaled to it. Still bounded, and the derived budget is printed
 	// so an operator can see why it is what it is.
-	reviewTimeout := drainReviewTimeout(len(harvestResult.UnmergedWorktrees))
+	// FAC-559: scope the set BEFORE budgeting it. Consumer-declared semantics:
+	// audit/*-reachability, archive/* and unreceipted worktree-agent-* scratch
+	// are never product review candidates, while standing/* and herd/* carry
+	// real candidates and are therefore receipt-gated rather than excluded.
+	scanTargets, skippedCandidates := review.ScopeDrainCandidates(
+		harvestResult.UnmergedWorktrees, drainReceiptOracle(root))
+	if !*quiet && len(skippedCandidates) > 0 {
+		// Never drop input silently: a scan that quietly shrinks its own set
+		// reads as "nothing to drain".
+		for reason, n := range review.SummarizeSkips(skippedCandidates) {
+			fmt.Fprintf(errOut, "herd-drain: scoped out %d worktree(s): %s\n", n, reason)
+		}
+	}
+	reviewTimeout := drainReviewTimeout(len(scanTargets))
 	reviewCtx, cancelReview := context.WithTimeout(context.Background(), reviewTimeout)
 	defer cancelReview()
 	if !*quiet {
-		fmt.Fprintf(errOut, "herd-drain: review-scan budget=%s for %d worktree(s)\n",
-			reviewTimeout, len(harvestResult.UnmergedWorktrees))
+		fmt.Fprintf(errOut, "herd-drain: review-scan budget=%s for %d in-scope worktree(s) of %d scanned\n",
+			reviewTimeout, len(scanTargets), len(harvestResult.UnmergedWorktrees))
 	}
 	reviewStart := time.Now()
-	report, err := d.Scan(reviewCtx, harvestResult.UnmergedWorktrees)
+	report, err := d.Scan(reviewCtx, scanTargets)
 	reviewElapsed := time.Since(reviewStart).Round(time.Second)
 	if err != nil {
 		if reviewCtx.Err() != nil {
 			fmt.Fprintf(errOut, "herd-drain: review-scan exceeded its %s budget after %s for %d worktree(s) (harvest-scan took %s): %v\n",
-				reviewTimeout, reviewElapsed, len(harvestResult.UnmergedWorktrees), harvestElapsed, reviewCtx.Err())
+				reviewTimeout, reviewElapsed, len(scanTargets), harvestElapsed, reviewCtx.Err())
 			fmt.Fprintf(errOut, "herd-drain: raise it with HERD_DRAIN_REVIEW_PER_ITEM (currently %s/worktree) or HERD_DRAIN_REVIEW_TIMEOUT\n",
 				drainReviewPerItem())
 			// Emit the partial already in hand instead of only the deadline.
