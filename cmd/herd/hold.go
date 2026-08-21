@@ -283,7 +283,6 @@ func loadProductionActiveTaskResolver(ctx context.Context) (lifecycle.ActiveTask
 	if err != nil {
 		return nil, err
 	}
-	accepted := map[string]bool{"todo": true, "to-do": true, "backlog": true, "planned": true, "in-progress": true, "in_progress": true, "working": true, "started": true, "done": true, "complete": true, "closed": true, "blocked": true, "review": true, "in-review": true}
 	configured := map[string]bool{}
 	roleLanes := map[string]lifecycle.CanonicalLane{}
 	for _, lane := range cfg.Lanes {
@@ -300,7 +299,7 @@ func loadProductionActiveTaskResolver(ctx context.Context) (lifecycle.ActiveTask
 	active := map[string][]lifecycle.HoldIdentity{}
 	for _, task := range tasks {
 		status := strings.ToLower(strings.TrimSpace(task.Status))
-		if !accepted[status] {
+		if !activeResolverAcceptsStatus(status) {
 			return nil, fmt.Errorf("active task resolver: unknown provider status %q", task.Status)
 		}
 		isActive := status == "in-progress" || status == "in_progress" || status == "working" || status == "started"
@@ -464,4 +463,25 @@ func resolveLaneLoopMode(cfg *config.Config, laneName string) (standing.LoopMode
 		return "", nil
 	}
 	return standing.LoopMode(state.Mode), nil
+}
+
+// activeResolverAcceptsStatus reports whether a provider status is one the
+// active-task resolver understands.
+//
+// Every canonical provider status must be listed. "archived" was missing, so
+// one archived card made the resolver fail closed and took `herd attention`
+// down for the entire fleet -- pushing coordinators to raw herdr for triage
+// Herdforge was supposed to provide. Terminal statuses are accepted here and
+// then skipped as not active, exactly like done. A genuinely unknown status
+// still fails closed: silently treating it as inactive would hide real work.
+func activeResolverAcceptsStatus(status string) bool {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "todo", "to-do", "backlog", "planned",
+		"in-progress", "in_progress", "working", "started",
+		"review", "in-review",
+		"done", "complete", "closed", "blocked",
+		"archived", "archive":
+		return true
+	}
+	return false
 }
