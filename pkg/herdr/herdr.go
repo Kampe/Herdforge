@@ -1990,18 +1990,36 @@ func LookupAgent(name string) (*AgentEntry, error) {
 // on browser login / device auth and is NOT a model/tool session.
 func LoginOrAuthScreen(title, body string) bool {
 	s := strings.ToLower(title + "\n" + body)
+	// Every needle must express auth INTENT -- a demand to log in, trust, or
+	// supply a credential. Bare vendor domains and lone words like "oauth",
+	// "authorization", or "api key" are deliberately absent: they appear in
+	// ordinary harness output and refusing on them takes healthy panes down.
+	//
+	// FAC-549: "chatgpt.com" matched codex's own rotating marketing tip --
+	//   tip: try the desktop app. run 'codex app' or visit
+	//   https://chatgpt.com/codex?app-landing-page=true
+	// -- so a fully authenticated codex was refused as a login screen. The tip
+	// rotates, which is why it refused some launches and cleared on retry.
 	needles := []string{
-		"browser-login", "browser login", "log in", "sign in", "sign-in",
-		"login to continue", "authenticate", "authorization", "device code",
-		"visit https://", "open the following url", "auth0", "oauth",
-		"chatgpt.com", "platform.openai.com", "please log in", "login required",
-		"not logged in", "api key", "enter your api key", "press enter to open",
-		"trust this folder", "trust this workspace", "allow access", "consent required",
+		"browser-login", "browser login",
+		"log in to", "login to continue", "please log in", "login required",
+		"not logged in", "sign in to", "sign-in required", "sign in with",
+		"authentication required", "authentication failed", "please authenticate",
+		"device code", "enter your api key", "missing api key", "invalid api key",
+		"open the following url", "press enter to open",
+		"trust this folder", "trust this workspace", "consent required",
 	}
 	for _, n := range needles {
 		if strings.Contains(s, n) {
 			return true
 		}
+	}
+	// A credential-bearing URL only counts alongside an instruction to go there.
+	// "visit https://" on its own matches release notes and marketing tips.
+	if strings.Contains(s, "visit https://") &&
+		(strings.Contains(s, "to authenticate") || strings.Contains(s, "to log in") ||
+			strings.Contains(s, "to sign in") || strings.Contains(s, "authorize")) {
+		return true
 	}
 	return false
 }

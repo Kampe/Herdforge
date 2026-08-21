@@ -196,7 +196,10 @@ func (LiveHerdr) DeliverAndProve(target, text string, timeout time.Duration) (*h
 	}
 	return herdr.DeliverAndProve(target, text, timeout)
 }
-func (LiveHerdr) TabClose(tabID string) error { return herdr.TabClose(tabID) }
+// TabClose compensates a tab dispatch itself created. It uses the fenced
+// close path (FAC-550); the bare herdr.TabClose stub always refuses, which
+// leaked one tab per failed dispatch.
+func (LiveHerdr) TabClose(tabID string) error { return herdr.CloseOwnTab(tabID) }
 func (LiveHerdr) ResolveHealthyModel(ctx context.Context, primary string, fallbacks []string) (string, []herdr.ProbeResult) {
 	return herdr.ResolveHealthyModel(ctx, primary, fallbacks)
 }

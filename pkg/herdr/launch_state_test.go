@@ -273,3 +273,63 @@ func TestCompensateExactTab_AlreadyAbsentIsSuccess(t *testing.T) {
 		t.Fatalf("already-absent tab must count as compensated: %v", err)
 	}
 }
+
+// TestLoginOrAuthScreenIgnoresHarnessMarketingTips is the FAC-549 regression.
+// The captured text is verbatim from a live, fully authenticated codex pane;
+// classifying it as a login screen refused healthy launches intermittently,
+// because the tip rotates between startups.
+func TestLoginOrAuthScreenIgnoresHarnessMarketingTips(t *testing.T) {
+	healthy := []struct {
+		name, text string
+	}{
+		{
+			name: "codex desktop app tip",
+			text: "  tip: try the desktop app. run 'codex app' or visit\n" +
+				"  https://chatgpt.com/codex?app-landing-page=true\n",
+		},
+		{
+			name: "codex fast tip",
+			text: "  Tip: New Use /fast to enable our fastest inference with\n" +
+				"  increased plan usage.\n",
+		},
+		{
+			name: "banner mentioning the vendor domain",
+			text: "docs: https://platform.openai.com/docs\nmodel: gpt-5.6-luna",
+		},
+		{
+			name: "ordinary work mentioning an api key variable",
+			text: "export OPENAI_API_KEY is already set; skipping",
+		},
+		{
+			name: "release note mentioning oauth support",
+			text: "changelog: added oauth support for enterprise SSO",
+		},
+	}
+	for _, tc := range healthy {
+		t.Run(tc.name, func(t *testing.T) {
+			if LoginOrAuthScreen("Herdforge", tc.text) {
+				t.Fatalf("healthy pane refused as a login screen: %q", tc.text)
+			}
+		})
+	}
+
+	// Real auth demands must still be refused.
+	blocked := []struct {
+		name, title, text string
+	}{
+		{name: "browser login title", title: "codex · browser-login", text: ""},
+		{name: "please log in", title: "Codex", text: "Please log in to continue\nVisit https://chatgpt.com/..."},
+		{name: "sign in with", title: "lp-codex", text: "Sign in with your OpenAI account"},
+		{name: "device code", title: "", text: "Enter the device code shown below"},
+		{name: "missing key", title: "", text: "Missing API key: set ANTHROPIC_API_KEY"},
+		{name: "visit url to authenticate", title: "", text: "Visit https://example.test/dev to authenticate"},
+		{name: "trust dialog", title: "", text: "Trust this folder to continue"},
+	}
+	for _, tc := range blocked {
+		t.Run(tc.name, func(t *testing.T) {
+			if !LoginOrAuthScreen(tc.title, tc.text) {
+				t.Fatalf("auth demand accepted as usable: %q", tc.text)
+			}
+		})
+	}
+}
