@@ -56,9 +56,6 @@ type Drain struct {
 type Pipeline = Drain
 
 type DrainShas struct {
-	// ProbeUnknown could not be content-merge probed. Explicitly not merged and
-	// not harvestable: an unverifiable object must never be treated as either.
-	ProbeUnknown  []string `json:"probe_unknown_shas,omitempty"`
 	Harvestable   []string `json:"harvestable_shas"`
 	NeedReview    []string `json:"need_review_shas"`
 	ContentMerged []string `json:"content_merged_already_shas"`
@@ -278,10 +275,14 @@ func (d *Drain) Scan(ctx context.Context, unmerged []harvest.UnmergedWork) (*Dra
 		// the operator nor I could measure the real per-item cost and every
 		// budget was a guess.
 		if ctxErr := ctx.Err(); ctxErr != nil {
+			// Fail closed: the error is returned so no caller mistakes a
+			// truncated scan for a completed one. The report is returned
+			// ALONGSIDE it so the caller can show what was reached and the
+			// observed per-item cost.
 			r.ScanTruncated = true
 			r.ScannedTips = i
 			r.TotalTips = len(tips)
-			return r, nil
+			return r, ctxErr
 		}
 		if d.Progress != nil {
 			d.Progress(i, len(tips), u.Branch)
@@ -296,20 +297,15 @@ func (d *Drain) Scan(ctx context.Context, unmerged []harvest.UnmergedWork) (*Dra
 		r.ActionEvidence = append(r.ActionEvidence, DrainActionEvidence{SHA: sha, Branch: pin.Branch, Lane: pin.Lane, BuilderFamily: strings.ToLower(strings.TrimSpace(record.BuilderFamily)), Tier: record.Tier, TierRecorded: strings.TrimSpace(record.Tier) != "", Pending: pendingSHA[sha], Vetoed: veto[sha]})
 		merged, probeErr := harvest.ContentMerged(ctx, d.RepoRoot, "origin/main", sha)
 		if probeErr != nil {
-			// A cancelled context is the deadline, not a bad object.
-			if ctx.Err() != nil {
-				r.ScanTruncated = true
-				r.ScannedTips = i
-				r.TotalTips = len(tips)
-				return r, nil
-			}
-			// One unprobeable object must not abort the whole scan: a single
-			// bad SHA previously took down every other disposition. Record it
-			// as UNKNOWN -- never as merged or harvestable, which would be
-			// fail-open on the one thing we could not verify.
-			r.Errors = append(r.Errors, fmt.Sprintf("content-merge probe for %s: %v", sha, probeErr))
-			r.Shas.ProbeUnknown = append(r.Shas.ProbeUnknown, sha)
-			continue
+			// Unknown git evidence FAILS CLOSED. Continuing past an unprobeable
+			// object was tried and correctly rejected by
+			// TestPipelineContract_UnknownEvidenceFailsClosed: a disposition set
+			// built around an object we could not verify invites treating it as
+			// merged or harvestable, and that invariant outranks scan progress.
+			// The truncation report below covers the deadline case, which is a
+			// different failure.
+			r.ScannedTips, r.TotalTips = i, len(tips)
+			return nil, fmt.Errorf("content-merge probe for %s: %w", sha, probeErr)
 		}
 		if merged {
 			r.Shas.ContentMerged = append(r.Shas.ContentMerged, sha)

@@ -7767,8 +7767,18 @@ func runDrainCommand(args []string, out, errOut io.Writer) int {
 		if reviewCtx.Err() != nil {
 			fmt.Fprintf(errOut, "herd-drain: review-scan exceeded its %s budget after %s for %d worktree(s) (harvest-scan took %s): %v\n",
 				reviewTimeout, reviewElapsed, len(scanTargets), harvestElapsed, reviewCtx.Err())
-			fmt.Fprintf(errOut, "herd-drain: raise it with HERD_DRAIN_REVIEW_PER_ITEM (currently %s/worktree) or HERD_DRAIN_REVIEW_TIMEOUT\n",
-				drainReviewPerItem())
+			// The scan fails closed but hands back what it reached. Report the
+			// OBSERVED per-tip cost and a concrete override, so the next run is
+			// set from a measurement rather than another estimate.
+			if report != nil && report.ScanTruncated {
+				fmt.Fprintf(errOut, "herd-drain: TRUNCATED review-scan covered %d of %d tip(s) — %.1fs/tip observed\n",
+					report.ScannedTips, report.TotalTips, perTipSeconds(reviewElapsed, report.ScannedTips))
+				fmt.Fprintf(errOut, "herd-drain: set HERD_DRAIN_REVIEW_PER_ITEM=%s to finish this board\n",
+					suggestPerItem(reviewElapsed, report.ScannedTips))
+			} else {
+				fmt.Fprintf(errOut, "herd-drain: raise it with HERD_DRAIN_REVIEW_PER_ITEM (currently %s/worktree) or HERD_DRAIN_REVIEW_TIMEOUT\n",
+					drainReviewPerItem())
+			}
 			// Emit the partial already in hand instead of only the deadline.
 			emitDrainPartial(out, errOut, harvestResult, *asJSON)
 		} else {
@@ -7779,18 +7789,7 @@ func runDrainCommand(args []string, out, errOut io.Writer) int {
 	if !*quiet {
 		fmt.Fprintf(errOut, "herd-drain: phase=review-scan done in %s\n", reviewElapsed)
 	}
-	if report != nil && report.ScanTruncated {
-		// A truncated report carries real dispositions for what it reached, but
-		// must never be read as a complete drain decision.
-		fmt.Fprintf(errOut, "herd-drain: TRUNCATED review-scan covered %d of %d tip(s) in %s (%.1fs/tip observed) — dispositions are partial\n",
-			report.ScannedTips, report.TotalTips, reviewElapsed,
-			perTipSeconds(reviewElapsed, report.ScannedTips))
-		fmt.Fprintf(errOut, "herd-drain: set HERD_DRAIN_REVIEW_PER_ITEM=%s to finish this board\n",
-			suggestPerItem(reviewElapsed, report.ScannedTips))
-	}
-	for _, probeErr := range report.Errors {
-		fmt.Fprintf(errOut, "herd-drain: UNKNOWN disposition: %s\n", probeErr)
-	}
+
 	if cfgErr == nil {
 		for _, lane := range cfg.Lanes {
 			if lane.Standing {

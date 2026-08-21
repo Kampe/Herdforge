@@ -10,9 +10,10 @@ import (
 
 // TestScanReturnsPartialOnDeadline is the FAC-560 regression.
 //
-// review-scan consumed its entire budget and returned only a deadline error, so
-// neither the operator nor the maintainer could see how many tips it reached --
-// which made every budget a guess. It must now return what it scanned.
+// review-scan consumed its entire budget and returned only a deadline error with
+// NO report, so neither the operator nor the maintainer could see how many tips
+// it reached -- which made every budget a guess. It must still fail closed, but
+// hand back the partial alongside the error.
 func TestScanReturnsPartialOnDeadline(t *testing.T) {
 	tips := make([]harvest.UnmergedWork, 0, 8)
 	for i := 0; i < 8; i++ {
@@ -29,11 +30,14 @@ func TestScanReturnsPartialOnDeadline(t *testing.T) {
 	defer cancel()
 
 	report, err := d.Scan(ctx, tips)
-	if err != nil {
-		t.Fatalf("a deadline must yield a partial report, not an error: %v", err)
+	// Fail closed AND informative: the error must be returned so no caller
+	// mistakes a truncated scan for a completed one, and the report must come
+	// back alongside it so the caller can show what was reached.
+	if err == nil {
+		t.Fatal("a truncated scan must fail closed with an error")
 	}
 	if report == nil {
-		t.Fatal("a truncated scan must still return a report")
+		t.Fatal("a truncated scan must still return its partial report alongside the error")
 	}
 	if !report.ScanTruncated {
 		t.Fatal("report must be flagged truncated so it is not read as complete")
