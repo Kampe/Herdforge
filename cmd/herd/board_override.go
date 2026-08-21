@@ -39,10 +39,11 @@ func approveByOverride(
 	ctx context.Context,
 	cfg *config.Config,
 	tp provider.TaskProvider,
+	stack *provider.ClaimStack,
 	root, ref string,
 	override *hsync.OverrideRequest,
 ) (*hsync.DoneResult, error) {
-	return approveByOverrideWithAcceptance(ctx, cfg, tp, root, ref, "", override)
+	return approveByOverrideWithAcceptance(ctx, cfg, tp, stack, root, ref, "", override)
 }
 
 // approveByOverrideWithAcceptance is approveByOverride carrying the operator's
@@ -53,6 +54,7 @@ func approveByOverrideWithAcceptance(
 	ctx context.Context,
 	cfg *config.Config,
 	tp provider.TaskProvider,
+	stack *provider.ClaimStack,
 	root, ref, acceptanceEvidence string,
 	override *hsync.OverrideRequest,
 ) (*hsync.DoneResult, error) {
@@ -77,14 +79,37 @@ func approveByOverrideWithAcceptance(
 	}
 
 	fmt.Fprintf(os.Stderr,
-		"herd board-done: closing %s under policy %q by %s — no launch receipt, so the fenced provider path and completion callback are bypassed\n",
+		"herd board-done: closing %s under policy %q by %s — no launch receipt, so the completion callback is skipped; the board write stays fenced\n",
 		ref, override.Policy, override.Actor)
 	fmt.Fprintf(os.Stderr, "herd board-done: reason: %s\n", override.Reason)
 	fmt.Fprintf(os.Stderr, "herd board-done: evidence: %s\n", override.Evidence)
 
-	res, err := hsync.BoardDone(ctx, tp, req)
+	// FAC-566: the board write MUST stay fenced. FAC-563 routed overrides
+	// through the plain provider, and Kaneo correctly refused with "mutation
+	// refused without X-Herd-Op (unfenced bypass; FAC-147 fail-closed)". That
+	// refusal was right and the design was wrong: I had conflated the completion
+	// RECEIPT with the mutation FENCE. An override replaces proof that the work
+	// landed; it does not replace the coordinator's authority to write the board.
+	//
+	// fencedBoardDone acquires its own lease from the claim stack and mints
+	// coordinator op identity, neither of which needs a launch receipt, so the
+	// override closes through the same fenced path as a normal completion.
+	if stack == nil {
+		return nil, fmt.Errorf(
+			"override close for %s requires a claim stack to write the board under a fence (FAC-147 fail-closed)", ref)
+	}
+	task, err := resolveTaskByRef(ctx, tp, cfg.TaskProvider.ProjectID, ref)
 	if err != nil {
 		return nil, err
 	}
-	return res, nil
+	if req.Ref == "" {
+		req.Ref = task.Ref
+	}
+	if req.ProjectID == "" {
+		req.ProjectID = cfg.TaskProvider.ProjectID
+	}
+	if req.RepoDir == "" {
+		req.RepoDir = root
+	}
+	return fencedBoardDone(ctx, cfg, tp, stack, task, req)
 }

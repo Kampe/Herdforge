@@ -3569,7 +3569,7 @@ func approveOne(ctx context.Context, cfg *config.Config, tp provider.TaskProvide
 	// ever reached -- unusable for the pre-receipt and legacy cards it is for.
 	// Resume is receipt-bound crash recovery and is never an override.
 	if override != nil && resume == nil {
-		return approveByOverrideWithAcceptance(ctx, cfg, tp, root, ref, acceptanceEvidence, override)
+		return approveByOverrideWithAcceptance(ctx, cfg, tp, stack, root, ref, acceptanceEvidence, override)
 	}
 	btp, coord, err := boundBoardProvider(cfg, tp, root, ref)
 	if err != nil {
