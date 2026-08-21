@@ -283,7 +283,19 @@ func (k *KaneoProvider) mutateStatus(ctx context.Context, taskID, status string)
 				capability = issued
 			}
 			if capability == "" {
-				return fmt.Errorf("kaneo: pre-minted capability required (workers cannot mint; coordinator uses FenceBrokerMinter)")
+				// FAC-572: the old text said "coordinator uses FenceBrokerMinter",
+				// which reads as operator misconfiguration. It is not. NO
+				// production path constructs a coordinator minter today:
+				// NewFenceBrokerMinterFromEnv is disabled as forgeable, and
+				// NewFenceBrokerMinterFromClaimDir is blocked outside tests
+				// because a mode-0600 file in a shared claim dir is readable by
+				// any same-UID worker and is therefore not an authority
+				// boundary. Production mint authority is deferred to FAC-169.
+				//
+				// So a fenced Kaneo status write cannot complete in production
+				// for ANY card, receipt or override. Say that, instead of
+				// implying the caller failed to configure something.
+				return missingMintCapabilityError()
 			}
 			return k.FenceBroker.MutateStatus(ctx, taskID, status, fence, opID, capability)
 		}
@@ -567,4 +579,16 @@ func (k *KaneoProvider) guardFencedStatus(expStatus, opID string, hasFence bool)
 		return nil
 	}
 	return errFenceInfrastructureMissing()
+}
+
+// missingMintCapabilityError is the single definition of the no-mint-authority
+// refusal. See FAC-572: no production path constructs a coordinator minter, so
+// this is an unimplemented capability rather than a misconfiguration, and the
+// wording must not imply the caller failed to set something up.
+func missingMintCapabilityError() error {
+	return fmt.Errorf("kaneo: no capability and no coordinator mint authority exists in production yet " +
+		"(claim-dir mint is blocked as same-UID-readable; env mint is disabled as forgeable; " +
+		"real mint authority is deferred to FAC-169). NOTHING WAS WRITTEN. " +
+		"A fenced board write cannot complete until that lands; close through an " +
+		"authenticated provider path with recorded evidence instead of retrying this")
 }
