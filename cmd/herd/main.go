@@ -7617,21 +7617,24 @@ func reportStandingBuilderFamilyDrift(cfg *config.Config, rows []reviewledger.Le
 	return reviewledger.CompareStandingBuilderFamilies(cfg, rows, live)
 }
 
-func drainLedgerPath() string {
-	if path := strings.TrimSpace(os.Getenv("HERD_REVIEW_LEDGER")); path != "" {
-		return path
-	}
-	base := strings.TrimSpace(os.Getenv("HERD_STATE_DIR"))
-	if base == "" {
-		base = strings.TrimSpace(os.Getenv("XDG_STATE_HOME"))
-	}
-	if base == "" {
-		if home, err := os.UserHomeDir(); err == nil {
-			base = filepath.Join(home, ".local", "state")
-		}
-	}
-	return filepath.Join(base, "chainseer", "herd", "review-ledger.jsonl")
-}
+// drainLedgerPath resolves the ONE canonical review ledger.
+//
+// FAC-565: this used to return <XDG_STATE_HOME>/chainseer/herd/review-ledger.jsonl
+// while review-ingest, merge-admit and the review-ledger inspection commands all
+// wrote and read .herd/review-ledger.jsonl. So drain, pulse and board-done's
+// legacy review route read a DIFFERENT ledger from the one that admits verdicts:
+// on a live board the state ledger held 7040 unrelated rows and did not contain
+// the freshly admitted PASS at all, so an admitted candidate looked like it had
+// no review evidence.
+//
+// It also hardcoded the project name "chainseer", which made the path wrong for
+// every other repository including this one.
+//
+// reviewLedgerPath already documents the correct invariant -- review evidence is
+// repository-scoped so a worktree cannot silently inspect a different, empty
+// state ledger -- so there is now exactly one resolution and HERD_REVIEW_LEDGER
+// still overrides it.
+func drainLedgerPath() string { return reviewLedgerPath() }
 
 // runDrain computes one coordinator review-pile beat. All report modes use
 // the same precomputed report; --act is deliberately bounded and dry-run
