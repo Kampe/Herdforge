@@ -622,7 +622,7 @@ func TestArgvContracts(t *testing.T) {
 			[]string{"grok", "--model", "grok-4.6", "--reasoning-effort", "high", "--always-approve"}},
 		{"kimi", "", "high", []string{"kimi", "--auto"}},
 		{"agy", "claude-opus-4-6-thinking", "high",
-			[]string{"agy", "--model", "claude-opus-4-6-thinking", "--prompt-interactive"}},
+			[]string{"agy", "--model", "claude-opus-4-6-thinking", "--dangerously-skip-permissions"}},
 		{"ollama", "litellm/ollama/glm-5.2:cloud", "high",
 			[]string{"opencode", "--model", "litellm/ollama/glm-5.2:cloud", "--auto"}},
 		{"lazer", "litellm/lazer/grok-4.5", "xhigh",
@@ -651,6 +651,25 @@ func TestArgvContracts(t *testing.T) {
 				t.Errorf("ArgvFor(%s)[%d] = %q, want %q", c.p, i, got[i], c.want[i])
 			}
 		}
+	}
+}
+
+func TestAGYInteractiveArgvDoesNotRequirePrompt(t *testing.T) {
+	argv := ArgvFor("agy", "gemini-3.1-pro-high", "high")
+	for _, arg := range argv {
+		if arg == "--prompt-interactive" {
+			t.Fatalf("AGY interactive argv must not require a missing prompt: %v", argv)
+		}
+	}
+	found := false
+	for _, arg := range argv {
+		if arg == "--dangerously-skip-permissions" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("AGY interactive argv must preserve permission bypass: %v", argv)
 	}
 }
 
