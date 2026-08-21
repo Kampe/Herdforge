@@ -339,6 +339,21 @@ type OverrideRecord struct {
 	Evidence string `json:"evidence"`
 	Policy   string `json:"policy"`
 	Decision string `json:"decision"`
+
+	// Route records WHICH authority closed the card: an acceptance block plus
+	// literal output, or admitted cross-family review evidence for a legacy
+	// card. An audit that cannot tell the two apart cannot tell prospective
+	// evidence from retrospective.
+	Route string `json:"route,omitempty"`
+
+	// Legacy* are the admitted review facts when Route is the legacy route.
+	// They are copied from the review ledger, never supplied by the closer.
+	LegacyCandidateSHA   string `json:"legacy_candidate_sha,omitempty"`
+	LegacyArtifact       string `json:"legacy_artifact,omitempty"`
+	LegacyReviewer       string `json:"legacy_reviewer,omitempty"`
+	LegacyReviewerFamily string `json:"legacy_reviewer_family,omitempty"`
+	LegacyBuilderFamily  string `json:"legacy_builder_family,omitempty"`
+	LegacyMergeSHA       string `json:"legacy_merge_sha,omitempty"`
 }
 
 // OverrideRequest is what an operator supplies to close a card without a
