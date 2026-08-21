@@ -500,12 +500,19 @@ func BoardDoneFenced(
 	if err != nil {
 		return nil, err
 	}
+	// FAC-569: acceptance is validated AFTER the closing authority is resolved,
+	// and through the same two-route authority BoardDone uses.
+	//
+	// This function previously validated acceptance FIRST, before the override
+	// was even authorized, and never consulted the legacy review route at all.
+	// So once FAC-566 correctly sent overrides down the fenced path, Route B
+	// stopped being reachable: a legacy card with a current admitted
+	// cross-family PASS and a matching landed disposition still failed with
+	// "card has no herd-acceptance-v1 block". Two implementations of the same
+	// gate, and only one of them knew about the second route.
 	evidence := req.AcceptanceEvidence
 	if strings.TrimSpace(evidence) == "" && req.Receipt != nil {
 		evidence = req.Receipt.AcceptanceEvidence
-	}
-	if err := ValidateAcceptanceEvidence(task.Description, evidence); err != nil {
-		return nil, fmt.Errorf("%w for %s: %v", ErrNoEvidence, ref, err)
 	}
 
 	var proof string
@@ -546,6 +553,26 @@ func BoardDoneFenced(
 			"discovery hint, not proof. Supply the receipt the integration produced, or close it manually with "+
 			"--override-policy/--override-actor/--override-reason/--override-evidence",
 			ErrNoEvidence, ref, ReceiptPath(repoDir, ref))
+	}
+
+	// Same two-route authorization as the unfenced path: a pre-existing
+	// acceptance block plus literal output, or -- for a legacy-policy override
+	// on a card that never had a block -- an admitted cross-family review
+	// artifact with a verified merge disposition.
+	route, legacyEvidence, err := authorizeClosureEvidence(task.Description, evidence, override, req.LegacyReview, ref)
+	if err != nil {
+		return nil, fmt.Errorf("%w for %s: %v", ErrNoEvidence, ref, err)
+	}
+	if override != nil {
+		override.Route = route
+		if legacyEvidence != nil {
+			override.LegacyCandidateSHA = legacyEvidence.CandidateSHA
+			override.LegacyArtifact = legacyEvidence.Artifact
+			override.LegacyReviewer = legacyEvidence.Reviewer
+			override.LegacyReviewerFamily = legacyEvidence.ReviewerFamily
+			override.LegacyBuilderFamily = legacyEvidence.BuilderFamily
+			override.LegacyMergeSHA = legacyEvidence.MergeSHA
+		}
 	}
 
 	// Exactly-once: a receipt already recorded never advances the card again.

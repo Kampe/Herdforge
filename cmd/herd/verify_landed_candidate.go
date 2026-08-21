@@ -11,7 +11,10 @@ import (
 // FAC-566: resolution order matters, because the previous fallback silently
 // bound the wrong object. A branch head moves; candidate identity does not.
 //
-//  1. An explicit --candidate-sha always wins. The operator named it.
+//  1. An explicit --candidate always wins. The operator named it. The flag is
+//     --candidate, not --candidate-sha: an earlier version of this message and
+//     of my own operator guidance named a flag that does not exist, which sent
+//     a caller chasing a nonexistent option instead of the real one.
 //  2. Otherwise, with --ref, the candidate comes from the ref's current admitted
 //     PASS. That is the identity the review is ABOUT, so it is the only
 //     defensible answer for already-merged work.
@@ -45,7 +48,7 @@ func resolveVerifyLandedCandidate(wtDir, branch string, binding verifyLandedBind
 		return "", fmt.Errorf(
 			"refusing to use branch HEAD %s as the candidate: it is already contained in origin/main, "+
 				"so it is the landed commit rather than the reviewed candidate. "+
-				"Supply the reviewed object explicitly with --candidate-sha, or ensure the ref has a "+
+				"Supply the reviewed object explicitly with --candidate, or ensure the ref has a "+
 				"current admitted PASS so its candidate can be resolved from the review ledger",
 			shortSHA12(head))
 	}
