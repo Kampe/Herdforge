@@ -7714,13 +7714,31 @@ func runDrainCommand(args []string, out, errOut io.Writer) int {
 	if !*quiet {
 		fmt.Fprintln(errOut, "herd-drain: phase=review-scan")
 	}
+	// FAC-555 follow-up: review-scan's cost is O(unmerged worktrees), but it
+	// inherited whatever was left of a FIXED 2m budget already spent by
+	// harvest-scan. Measured on a real board: harvest took 41s for 64
+	// worktrees, leaving review-scan 79s for those same 64 -- not enough, so it
+	// timed out every pass regardless of how good the partial was.
+	//
+	// The item count is known exactly at this point, so review-scan gets its
+	// own budget scaled to it. Still bounded, and the derived budget is printed
+	// so an operator can see why it is what it is.
+	reviewTimeout := drainReviewTimeout(len(harvestResult.UnmergedWorktrees))
+	reviewCtx, cancelReview := context.WithTimeout(context.Background(), reviewTimeout)
+	defer cancelReview()
+	if !*quiet {
+		fmt.Fprintf(errOut, "herd-drain: review-scan budget=%s for %d worktree(s)\n",
+			reviewTimeout, len(harvestResult.UnmergedWorktrees))
+	}
 	reviewStart := time.Now()
-	report, err := d.Scan(scanCtx, harvestResult.UnmergedWorktrees)
+	report, err := d.Scan(reviewCtx, harvestResult.UnmergedWorktrees)
 	reviewElapsed := time.Since(reviewStart).Round(time.Second)
 	if err != nil {
-		if scanCtx.Err() != nil {
-			fmt.Fprintf(errOut, "herd-drain: bounded scan exceeded %s during phase=review-scan after %s (harvest-scan used %s of the shared budget): %v\n",
-				scanTimeout, reviewElapsed, harvestElapsed, scanCtx.Err())
+		if reviewCtx.Err() != nil {
+			fmt.Fprintf(errOut, "herd-drain: review-scan exceeded its %s budget after %s for %d worktree(s) (harvest-scan took %s): %v\n",
+				reviewTimeout, reviewElapsed, len(harvestResult.UnmergedWorktrees), harvestElapsed, reviewCtx.Err())
+			fmt.Fprintf(errOut, "herd-drain: raise it with HERD_DRAIN_REVIEW_PER_ITEM (currently %s/worktree) or HERD_DRAIN_REVIEW_TIMEOUT\n",
+				drainReviewPerItem())
 			// Emit the partial already in hand instead of only the deadline.
 			emitDrainPartial(out, errOut, harvestResult, *asJSON)
 		} else {
