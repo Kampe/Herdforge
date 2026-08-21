@@ -667,55 +667,41 @@ func (k *KaneoProvider) listTasksOnce(ctx context.Context, projectID, status str
 			statuses = []string{StatusToDo, StatusInProgress, StatusInReview, StatusDone, StatusPlanned, StatusArchived}
 		}
 
-		// Terminate only on EMPTY page; short pages continue. Duplicate pages
-		// and the page cap without empty termination are hard errors. Server may
-		// cap below --limit (observed 99/100), so short-page stop hides later cards.
-		const pageSize = 100
+		// Each status walk is an independent sequence of `kaneo` CLI spawns, so
+		// walking six of them serially made the unfiltered inventory cost the SUM
+		// of every column. Against a real board that exceeded the OpList deadline
+		// and every caller of the unfiltered list (deps migrate, dispatch fences)
+		// failed with a provider timeout. Walking columns concurrently makes the
+		// cost the slowest single column instead. Pagination semantics per column
+		// are unchanged: terminate only on an EMPTY page; short pages continue;
+		// duplicate pages and the page cap without empty termination stay fatal.
+		perStatus := make([][]kaneoTaskDTO, len(statuses))
+		errs := make([]error, len(statuses))
+		var wg sync.WaitGroup
+		for i, listStatus := range statuses {
+			wg.Add(1)
+			go func(i int, listStatus string) {
+				defer wg.Done()
+				perStatus[i], errs[i] = k.walkStatusPages(ctx, projectID, listStatus)
+			}(i, listStatus)
+		}
+		wg.Wait()
+		// Report the first failure in status order so the error is deterministic
+		// regardless of which goroutine finished first.
+		for _, err := range errs {
+			if err != nil {
+				return nil, err
+			}
+		}
+		// Merge in declared status order under one accumulator; a card that moved
+		// columns mid-walk must appear exactly once.
 		var all []kaneoTaskDTO
 		acc := NewPageAccumulator()
-		for _, listStatus := range statuses {
-			terminated := false
-			pageAcc := NewPageAccumulator()
-			for page := 1; page <= DefaultMaxListPages; page++ {
-				if err := ctx.Err(); err != nil {
-					return nil, AsTimeout("kaneo", "ListTasks", OpList, k.deadlines().For(OpList), err)
+		for _, dtos := range perStatus {
+			for _, d := range dtos {
+				if acc.Add(d.ID) {
+					all = append(all, d)
 				}
-				args := []string{"task", "list", "--project", projectID, "--json",
-					"--limit", fmt.Sprint(pageSize), "--page", fmt.Sprint(page), "--status", listStatus}
-				res, err := kaneoRunCLI(ctx, "kaneo", args...)
-				if err != nil {
-					return nil, fmt.Errorf("kaneo task list (status %s, page %d): %w", listStatus, page, err)
-				}
-				var dtos []kaneoTaskDTO
-				if err := DecodeJSONBytes(http.StatusOK, res.Stdout, &dtos); err != nil {
-					if pe, ok := err.(*ProviderError); ok {
-						pe.Provider = "kaneo"
-						pe.Op = "ListTasks"
-					}
-					return nil, fmt.Errorf("kaneo task list (status %s, page %d): %w", listStatus, page, err)
-				}
-				fresh := 0
-				for _, d := range dtos {
-					if pageAcc.Add(d.ID) {
-						fresh++
-					}
-					if acc.Add(d.ID) {
-						all = append(all, d)
-					}
-				}
-				dec := DecidePagination(len(dtos), fresh)
-				switch dec {
-				case PageStopEmpty:
-					terminated = true
-				case PageStopDuplicate:
-					return nil, fmt.Errorf("kaneo task list (status %s, page %d): %w", listStatus, page, ErrDuplicatePage)
-				}
-				if terminated {
-					break
-				}
-			}
-			if !terminated {
-				return nil, fmt.Errorf("kaneo task list (status %s): %w (maxPages=%d)", listStatus, ErrPaginationCap, DefaultMaxListPages)
 			}
 		}
 		return filterTasks(all, status), nil
@@ -740,6 +726,48 @@ func (k *KaneoProvider) listTasksOnce(ctx context.Context, projectID, status str
 		return nil, err
 	}
 	return filterTasks(dtos, status), nil
+}
+
+// walkStatusPages paginates one Kaneo column to exhaustion. Callers run these
+// concurrently, so it must not touch shared state: dedup within the column is
+// local, and cross-column dedup happens once in the caller.
+func (k *KaneoProvider) walkStatusPages(ctx context.Context, projectID, listStatus string) ([]kaneoTaskDTO, error) {
+	const pageSize = 100
+	var out []kaneoTaskDTO
+	pageAcc := NewPageAccumulator()
+	for page := 1; page <= DefaultMaxListPages; page++ {
+		if err := ctx.Err(); err != nil {
+			return nil, AsTimeout("kaneo", "ListTasks", OpList, k.deadlines().For(OpList), err)
+		}
+		args := []string{"task", "list", "--project", projectID, "--json",
+			"--limit", fmt.Sprint(pageSize), "--page", fmt.Sprint(page), "--status", listStatus}
+		res, err := kaneoRunCLI(ctx, "kaneo", args...)
+		if err != nil {
+			return nil, fmt.Errorf("kaneo task list (status %s, page %d): %w", listStatus, page, err)
+		}
+		var dtos []kaneoTaskDTO
+		if err := DecodeJSONBytes(http.StatusOK, res.Stdout, &dtos); err != nil {
+			if pe, ok := err.(*ProviderError); ok {
+				pe.Provider = "kaneo"
+				pe.Op = "ListTasks"
+			}
+			return nil, fmt.Errorf("kaneo task list (status %s, page %d): %w", listStatus, page, err)
+		}
+		fresh := 0
+		for _, d := range dtos {
+			if pageAcc.Add(d.ID) {
+				fresh++
+				out = append(out, d)
+			}
+		}
+		switch DecidePagination(len(dtos), fresh) {
+		case PageStopEmpty:
+			return out, nil
+		case PageStopDuplicate:
+			return nil, fmt.Errorf("kaneo task list (status %s, page %d): %w", listStatus, page, ErrDuplicatePage)
+		}
+	}
+	return nil, fmt.Errorf("kaneo task list (status %s): %w (maxPages=%d)", listStatus, ErrPaginationCap, DefaultMaxListPages)
 }
 
 func filterTasks(dtos []kaneoTaskDTO, status string) []*Task {

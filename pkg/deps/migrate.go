@@ -111,7 +111,9 @@ func PlanMigrationWithProgress(ctx context.Context, store RelationStore, tp prov
 		return nil, fmt.Errorf("deps migrate: relation capability required: %v", err)
 	}
 	ctx, _ = WithSnapshotFence(ctx)
-	tasks, err := tp.ListTasks(ctx, projectID, "")
+	// Active columns only: every terminal card is discarded just below, and the
+	// board's done column alone exceeded the list deadline.
+	tasks, err := provider.ListActiveTasks(ctx, tp, projectID)
 	if err != nil {
 		return nil, err
 	}

@@ -226,3 +226,18 @@ func DecodeJSONBytes(statusCode int, body []byte, v interface{}) error {
 	}
 	return nil
 }
+
+// ActiveStatuses lists the non-terminal columns, in board order. Callers that
+// drop done/archived should read StatusActive rather than the whole board.
+func ActiveStatuses() []string {
+	return []string{StatusToDo, StatusInProgress, StatusInReview, StatusPlanned}
+}
+
+// IsActiveStatus reports whether a card's own status is non-terminal.
+func IsActiveStatus(raw string) bool {
+	switch NormalizeStatus(raw) {
+	case StatusDone, StatusArchived:
+		return false
+	}
+	return true
+}
