@@ -202,6 +202,17 @@ func formatSendResult(target, workspace, status string) string {
 	return fmt.Sprintf("herd send: %s -> %s%s", route, status, qualifier)
 }
 
+// observationCount counts how many times the submitted task text appears in a
+// pane readback, comparing with whitespace removed so terminal wrapping (which
+// breaks at the column, not at word boundaries) does not hide an occurrence.
+func observationCount(text, pane string) int {
+	nt := normalizeForObservation(text)
+	if nt == "" {
+		return 0
+	}
+	return strings.Count(normalizeForObservation(pane), nt)
+}
+
 // taskTextObserved reports whether pane readback contains the submitted task
 // or one of its executable command lines. Long packets are often wrapped or
 // clipped from the recent pane tail, so requiring the entire packet would
@@ -253,10 +264,20 @@ func taskTextObserved(text, pane string) bool {
 	return false
 }
 
-// normalizeForObservation collapses every whitespace run to a single space so
-// wrapped pane output compares equal to the unwrapped source text.
+// normalizeForObservation strips ALL whitespace so wrapped pane output compares
+// equal to the unwrapped source text.
+//
+// FAC-545: collapsing to a single space is NOT sufficient. A terminal wraps at
+// the column, not at word boundaries, so a long token breaks mid-word — an
+// observed pane rendered "queued/non-consumed" as "queued/non-" + newline +
+// "consumed". Joining with a space reconstructs "queued/non- consumed", which
+// never matches the source, so a genuinely consumed assignment was reported
+// queued. Removing whitespace entirely is wrap-point independent.
+//
+// Chainseer proved the failure was deterministic on their payload and
+// unreproducible on mine precisely because mine happened to wrap at spaces.
 func normalizeForObservation(s string) string {
-	return strings.Join(strings.Fields(s), " ")
+	return strings.Join(strings.Fields(s), "")
 }
 
 func isExecutableTaskLine(line string) bool {
@@ -320,8 +341,17 @@ func sendInWorkspace(target, text string, verify bool, timeout time.Duration, wo
 				lastPane = pane
 				staged = strings.Contains(strings.ToLower(pane), "pasted text") && !taskTextObserved(text, pane)
 			}
+			// FAC-545: prove a NEW occurrence appeared, rather than requiring
+			// the text to be absent from the baseline. The old condition
+			// (!observed-in-baseline && observed-now) made an identical
+			// re-send STRUCTURALLY UNPROVABLE: once a pane retained a prior
+			// copy of the same assignment, every subsequent delivery of that
+			// text was reported queued-but-not-consumed forever, no matter how
+			// visibly the agent consumed it. Counting occurrences keeps the
+			// anti-staleness guarantee — old text alone still cannot prove a
+			// new delivery — while allowing a repeat to be proven.
 			if (st == "working" || st == "done") && paneErr == nil &&
-				!taskTextObserved(text, baselinePane) && taskTextObserved(text, pane) {
+				observationCount(text, pane) > observationCount(text, baselinePane) {
 				return st, nil
 			}
 		}
