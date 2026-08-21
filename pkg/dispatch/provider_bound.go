@@ -220,3 +220,18 @@ func formatBoardErr(op string, err error) error {
 	}
 	return fmt.Errorf("%s: %w", op, err)
 }
+
+// listActiveTasksBound resolves a ticket ref without walking terminal columns.
+//
+// A dispatchable ticket is by definition not done or archived, but the lookup
+// asked for the whole board and paid for it: this repository's done column
+// held 525 cards across 7 pages and exceeded the list deadline on its own, so
+// dispatch failed with BLOCKED(provider_timeout) while resolving a single ref.
+func (d *Dispatcher) listActiveTasksBound(ctx context.Context, projectID string) ([]*provider.Task, error) {
+	d.ensureDeadlinesApplied()
+	opCtx, cancel := provider.BoundOp(ctx, d.deadlines(), provider.OpList)
+	defer cancel()
+	tasks, err := provider.ListActiveTasks(opCtx, d.TaskProvider, projectID)
+	d.health.observe(err)
+	return tasks, err
+}

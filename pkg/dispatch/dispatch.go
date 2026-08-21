@@ -746,7 +746,7 @@ func (d *Dispatcher) Dispatch(ctx context.Context, opts DispatchOptions) (*Dispa
 			return nil, fmt.Errorf("task identity mismatch: requested %s got %v", opts.TicketRef, task)
 		}
 	} else {
-		tasks, listErr := d.listTasksBound(ctx, d.Config.TaskProvider.ProjectID, "")
+		tasks, listErr := d.listActiveTasksBound(ctx, d.Config.TaskProvider.ProjectID)
 		if listErr != nil {
 			return nil, formatBoardErr("failed to list tasks", listErr)
 		}
@@ -758,7 +758,9 @@ func (d *Dispatcher) Dispatch(ctx context.Context, opts DispatchOptions) (*Dispa
 		}
 	}
 	if task == nil {
-		return nil, fmt.Errorf("ticket %s not found", opts.TicketRef)
+		// Scoped to active columns, so say so: a ref that is merely done reads
+		// very differently from one that does not exist.
+		return nil, fmt.Errorf("ticket %s not found in any active column", opts.TicketRef)
 	}
 	_, err = d.admitRunState(ctx, task)
 	if err != nil {
