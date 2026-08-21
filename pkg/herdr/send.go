@@ -122,7 +122,16 @@ func requireAgentInWorkspace(target, expected string) (AgentEntry, error) {
 		// no mismatched workspace to reject in that case; retain the existing
 		// target resolution behavior until Herdr supplies the identity.
 		if agent.Workspace != "" && agent.Workspace != expected {
-			return AgentEntry{}, fmt.Errorf("agent '%s' resolves to workspace %q, but repo is registered to workspace %q; refusing cross-workspace delivery", target, agent.Workspace, expected)
+			// Name the authorized path. Cross-workspace coordinator delivery IS
+			// supported via an explicit workspace, but this message did not say
+			// so, so a peer coordinator read the refusal as policy and could not
+			// deliver a report at all. A guard that hides its own escape hatch
+			// reads as a broken feature.
+			return AgentEntry{}, fmt.Errorf(
+				"agent '%s' resolves to workspace %q, but repo is registered to workspace %q; "+
+					"refusing implicit cross-workspace delivery. To deliver across workspaces "+
+					"deliberately, pass the target workspace explicitly: --workspace %s",
+				target, agent.Workspace, expected, agent.Workspace)
 		}
 	}
 	if len(matches) > 1 {
