@@ -234,24 +234,8 @@ func (d *Drain) Scan(ctx context.Context, unmerged []harvest.UnmergedWork) (*Dra
 	for _, row := range pending {
 		pendingSHA[row.SHA] = true
 	}
-	queueLanes := map[string]string{}
-	seen := map[string]bool{}
-	tips := make([]harvest.UnmergedWork, 0)
-	for _, u := range unmerged {
-		for _, sha := range u.Unmerged {
-			if !seen[sha] {
-				seen[sha] = true
-				tips = append(tips, harvest.UnmergedWork{WorktreePath: u.WorktreePath, Branch: u.Branch, Unmerged: []string{sha}})
-			}
-		}
-	}
-	for _, q := range queued {
-		queueLanes[q.sha] = q.lane
-		if !seen[q.sha] {
-			seen[q.sha] = true
-			tips = append(tips, harvest.UnmergedWork{Branch: q.branch, Unmerged: []string{q.sha}})
-		}
-	}
+	tips, queueLanes := buildTipSet(unmerged, queued)
+
 	// The legacy packet key is retained, but this coordinator has no
 	// authoritative refactoring probe. -1 is explicit unknown, never a count
 	// inferred from the unmerged worktree list.
@@ -299,11 +283,23 @@ func (d *Drain) Scan(ctx context.Context, unmerged []harvest.UnmergedWork) (*Dra
 			r.TotalTips = len(tips)
 			return r, ctxErr
 		}
-		if d.Progress != nil {
-			d.Progress(i, len(tips), u.Branch)
-		}
 		sha := u.Unmerged[0]
-		pin := d.freshness(ctx, sha, u.Branch, u.WorktreePath)
+		if d.Progress != nil {
+			// Identify the tip even when it has no branch: queued ledger pins
+			// carry no worktree, and an unlabeled progress line makes a
+			// pathological object unfindable.
+			label := u.Branch
+			if label == "" {
+				label = "sha:" + shortSHA(sha)
+			}
+			d.Progress(i, len(tips), label)
+		}
+		// FAC-562: bound the WHOLE per-tip iteration, not just the content-merge
+		// probe. The reported 1m49s items were spent in freshness (behind count
+		// and conflict probe), which was outside the earlier probe-only bound,
+		// so the 20s cap never applied to the cost that actually mattered.
+		itemCtx, cancelItem := context.WithTimeout(ctx, d.probeBudget())
+		pin := d.freshness(itemCtx, sha, u.Branch, u.WorktreePath)
 		if u.WorktreePath == "" && queueLanes[sha] != "" {
 			pin.Lane = queueLanes[sha]
 		}
@@ -314,14 +310,13 @@ func (d *Drain) Scan(ctx context.Context, unmerged []harvest.UnmergedWork) (*Dra
 		// were sub-second, eating a whole budget by itself. Each probe is
 		// therefore individually bounded: a pathological object is reported by
 		// name instead of silently starving every remaining tip.
-		probeCtx, cancelProbe := context.WithTimeout(ctx, d.probeBudget())
-		merged, probeErr := harvest.ContentMerged(probeCtx, d.RepoRoot, "origin/main", sha)
-		// Read the probe's own deadline state BEFORE cancelling it. cancel()
-		// sets Err() to Canceled, so checking after cancel reports every fast
+		merged, probeErr := harvest.ContentMerged(itemCtx, d.RepoRoot, "origin/main", sha)
+		// Read the per-item deadline state BEFORE cancelling it. cancel() sets
+		// Err() to Canceled, so checking after cancel reports every fast
 		// failure as a timeout -- which misclassified unprobeable objects as
 		// merely slow and broke the fail-closed contract.
-		probeTimedOut := errors.Is(probeCtx.Err(), context.DeadlineExceeded)
-		cancelProbe()
+		probeTimedOut := errors.Is(itemCtx.Err(), context.DeadlineExceeded)
+		cancelItem()
 		if probeErr != nil {
 			// Distinguish OUR per-probe bound from unknown git evidence. A slow
 			// object is a cost problem; an unprobeable object is an evidence
@@ -351,6 +346,14 @@ func (d *Drain) Scan(ctx context.Context, unmerged []harvest.UnmergedWork) (*Dra
 			// merged or harvestable, and that invariant outranks scan progress.
 			r.ScannedTips, r.TotalTips = i, len(tips)
 			return nil, fmt.Errorf("content-merge probe for %s: %w", sha, probeErr)
+		}
+		if probeErr == nil && probeTimedOut {
+			// freshness consumed the item budget; the probe then had none left
+			// yet returned no error. Name it rather than silently recording a
+			// disposition derived from a truncated measurement.
+			r.SlowTips = append(r.SlowTips, SlowTip{Branch: u.Branch, SHA: sha, Budget: d.probeBudget().String()})
+			r.ScanTruncated = true
+			continue
 		}
 		if merged {
 			r.Shas.ContentMerged = append(r.Shas.ContentMerged, sha)

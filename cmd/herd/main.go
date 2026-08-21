@@ -7751,7 +7751,15 @@ func runDrainCommand(args []string, out, errOut io.Writer) int {
 	// SHA, so a worktree-count budget was off by the average commits per
 	// worktree: 54 in-scope worktrees expanded to 400 tips, giving the scan
 	// roughly an eighth of the time it needed.
-	tipCount := review.CountTips(scanTargets)
+	// Ask the drain itself how many tips it will iterate. The tip set is
+	// worktree SHAs PLUS queued ledger pins, so counting only the worktree half
+	// reported 170 while the scan traversed 402 -- the entire queue was missing
+	// from the budget.
+	tipCount, tipErr := d.PlanTipCount(scanTargets)
+	if tipErr != nil {
+		fmt.Fprintf(errOut, "herd-drain: cannot plan tip count: %v\n", tipErr)
+		return 1
+	}
 	reviewTimeout := drainReviewTimeout(tipCount)
 	reviewCtx, cancelReview := context.WithTimeout(context.Background(), reviewTimeout)
 	defer cancelReview()
