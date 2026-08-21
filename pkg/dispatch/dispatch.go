@@ -1964,8 +1964,11 @@ func (d *Dispatcher) launch(
 	if receiptErr != nil {
 		return &launchFailure{
 			Reason: "prompt_delivery_failed",
+			// Wrap receiptErr, not err: err is nil on this branch, so the
+			// operator saw "prompt consumption not proven: %!w(<nil>)" and the
+			// actual delivery failure was erased.
 			Err: closeTabLocal(h, tabID, "prompt_delivery_failed",
-				fmt.Errorf("worktree ready but prompt consumption not proven: %w", err)),
+				fmt.Errorf("worktree ready but prompt consumption not proven: %w", receiptErr)),
 		}
 	}
 	// Post-delivery live identity ownership — same liveLookup path.

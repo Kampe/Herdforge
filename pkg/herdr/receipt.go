@@ -77,14 +77,23 @@ func DeliverAndProve(target, text string, timeout time.Duration) (*PromptReceipt
 	}
 	// The prompt transport may finish before the pane has consumed the
 	// composer text.  Press Enter immediately to close that race (FAC-388).
-	_ = SendKeys(target, "Enter")
+	// Keep the error: when this Enter fails the assignment sits unsubmitted in
+	// the composer, and discarding it left the caller reporting a nil cause.
+	nudgeErr := SendKeys(target, "Enter")
 
 	if timeout <= 0 {
 		timeout = 60 * time.Second
 	}
 	poll := 2 * time.Second
 	deadline := time.Now().Add(timeout)
-	nudged := true
+	// Re-nudge budget. This was previously a bool initialized to true, which
+	// made the retry below unreachable: exactly one Enter was ever sent, fired
+	// immediately after AgentPrompt and therefore racing the composer. A codex
+	// TUI pane was observed holding the full assignment text unsubmitted while
+	// dispatch reported the launch as failed; a later Enter submitted it and
+	// the lane went to working at once.
+	const maxNudges = 3
+	nudges := 0
 	last := baseline
 	sawWorking := baseline == "working"
 	for time.Now().Before(deadline) {
@@ -107,9 +116,15 @@ func DeliverAndProve(target, text string, timeout time.Duration) (*PromptReceipt
 				}, nil
 			}
 		}
-		if !nudged && time.Now().Add(poll).After(deadline.Add(-timeout/2)) {
-			_ = SendKeys(target, "Enter")
-			nudged = true
+		// Re-press Enter only while the agent has not started working. An
+		// unsubmitted composer needs the key; a working agent must never be
+		// typed into, and once it has worked the loop is only waiting for the
+		// status transition.
+		if nudges < maxNudges && !sawWorking && last != "working" {
+			if err := SendKeys(target, "Enter"); err != nil && nudgeErr == nil {
+				nudgeErr = err
+			}
+			nudges++
 		}
 		time.Sleep(poll)
 	}
@@ -122,9 +137,18 @@ func DeliverAndProve(target, text string, timeout time.Duration) (*PromptReceipt
 		Duration:       time.Since(start),
 		SequenceToken:  sequenceToken(baseline, last),
 		SawWorking:     sawWorking,
-	}, fmt.Errorf("agent %q never confirmed prompt-correlated consumption (baseline %q last %q; working→working/done→done and a bare idle→done are not proof)", target, baseline, last)
+	}, fmt.Errorf("agent %q never confirmed prompt-correlated consumption (baseline %q last %q, submit attempts %d%s; working→working/done→done and a bare idle→done are not proof)", target, baseline, last, nudges+1, nudgeSuffix(nudgeErr))
 }
 
 func sequenceToken(baseline, final string) string {
 	return fmt.Sprintf("%s->%s", baseline, final)
+}
+
+// nudgeSuffix names a failed submit key so an assignment left sitting in a
+// composer reports why, instead of looking like the agent simply ignored it.
+func nudgeSuffix(err error) string {
+	if err == nil {
+		return ""
+	}
+	return fmt.Sprintf("; submit key failed: %v", err)
 }
