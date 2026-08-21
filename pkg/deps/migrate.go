@@ -50,12 +50,12 @@ type MigrateItem struct {
 
 // JournalEntry is a before-image for coordinator rollback after partial apply.
 type JournalEntry struct {
-	TaskID      string `json:"task_id"`
-	Ref         string `json:"ref"`
-	BeforeDesc  string `json:"before_description"`
-	AfterDesc   string `json:"after_description,omitempty"`
-	AppliedAt   string `json:"applied_at,omitempty"`
-	RolledBack  bool   `json:"rolled_back,omitempty"`
+	TaskID     string `json:"task_id"`
+	Ref        string `json:"ref"`
+	BeforeDesc string `json:"before_description"`
+	AfterDesc  string `json:"after_description,omitempty"`
+	AppliedAt  string `json:"applied_at,omitempty"`
+	RolledBack bool   `json:"rolled_back,omitempty"`
 }
 
 // Journal is the per-apply rollback log (coordinator-owned file under .herd/).
@@ -67,10 +67,41 @@ type Journal struct {
 
 const migrationProgressEvery = 10
 
+// MigrationProgress receives one item as soon as it has been planned. The
+// callback is deliberately per-card so long migrations expose forward
+// progress instead of appearing idle while a project-wide snapshot runs.
+type MigrationProgress func(item MigrateItem, processed, total int)
+
+type scopedSnapshotter interface {
+	SnapshotGraphForTask(context.Context, Ref, TaskID, []DependencyEdge) (*GraphSnapshot, error)
+}
+
+type migrationScopedSnapshotKey struct{}
+
+func migrationScopedContext(ctx context.Context) context.Context {
+	return context.WithValue(ctx, migrationScopedSnapshotKey{}, true)
+}
+
+func migrationScopedSnapshot(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	value, _ := ctx.Value(migrationScopedSnapshotKey{}).(bool)
+	return value
+}
+
 // PlanMigration builds a revision-fenced dry-run from a fresh snapshot.
 // Description fences + board relations only. Stale fences (missing task_id,
 // edge multiset mismatch) are repair_stale, not skip.
 func PlanMigration(ctx context.Context, store RelationStore, tp provider.TaskProvider, projectID string) (*MigratePlan, error) {
+	return PlanMigrationWithProgress(ctx, store, tp, projectID, nil)
+}
+
+// PlanMigrationWithProgress builds a migration plan without requiring a
+// whole-project relation snapshot when the adapter supports scoped reads.
+// The returned plan is non-nil when work was completed before a timeout; the
+// error remains non-nil so callers cannot mistake partial output for success.
+func PlanMigrationWithProgress(ctx context.Context, store RelationStore, tp provider.TaskProvider, projectID string, progress MigrationProgress) (*MigratePlan, error) {
 	plan := &MigratePlan{ProjectID: projectID, OK: true, Mode: "dry-run"}
 	if store == nil || tp == nil {
 		return nil, fmt.Errorf("deps migrate: store and task provider required")
@@ -79,11 +110,7 @@ func PlanMigration(ctx context.Context, store RelationStore, tp provider.TaskPro
 	if err != nil || !ok {
 		return nil, fmt.Errorf("deps migrate: relation capability required: %v", err)
 	}
-	snap, err := snapshotForMigration(ctx, store)
-	if err != nil {
-		return nil, fmt.Errorf("deps migrate: snapshot: %w", err)
-	}
-	plan.ProviderRevision = snap.ProviderRevision
+	ctx, _ = WithSnapshotFence(ctx)
 	tasks, err := tp.ListTasks(ctx, projectID, "")
 	if err != nil {
 		return nil, err
@@ -91,13 +118,40 @@ func PlanMigration(ctx context.Context, store RelationStore, tp provider.TaskPro
 	sort.Slice(tasks, func(i, j int) bool {
 		return provider.CompareRefs(tasks[i].Ref, tasks[j].Ref) < 0
 	})
+	active := make([]*provider.Task, 0, len(tasks))
 	for _, t := range tasks {
-		if t == nil {
-			continue
+		if t != nil && provider.NormalizeStatus(t.Status) != provider.StatusDone && provider.NormalizeStatus(t.Status) != provider.StatusArchived {
+			active = append(active, t)
 		}
-		st := provider.NormalizeStatus(t.Status)
-		if st == provider.StatusDone || st == provider.StatusArchived {
-			continue
+	}
+	scoped, hasScoped := store.(scopedSnapshotter)
+	var fatalErr error
+	for i, t := range active {
+		var snap *GraphSnapshot
+		if hasScoped {
+			snap, err = snapshotForTaskMigration(ctx, scoped, t)
+		} else {
+			// Compatibility fallback for stores without the scoped adapter. Live
+			// ProviderStore implements SnapshotGraphForTask; this path is for
+			// in-process/test stores and legacy adapters only.
+			snap, err = snapshotForMigration(ctx, store)
+		}
+		if err != nil {
+			item := MigrateItem{Ref: t.Ref, TaskID: t.ID, Status: provider.NormalizeStatus(t.Status), Action: "error", Detail: "snapshot: " + err.Error()}
+			plan.OK = false
+			plan.Errors = append(plan.Errors, t.Ref+": "+item.Detail)
+			plan.Items = append(plan.Items, item)
+			if progress != nil {
+				progress(item, i+1, len(active))
+			}
+			if len(plan.Items) == 1 {
+				return nil, fmt.Errorf("deps migrate: snapshot: %w", err)
+			}
+			fatalErr = fmt.Errorf("deps migrate: snapshot for %s: %w", t.Ref, err)
+			break
+		}
+		if plan.ProviderRevision == "" {
+			plan.ProviderRevision = snap.ProviderRevision
 		}
 		item := planOne(t, snap)
 		if item.Action == "error" {
@@ -105,8 +159,31 @@ func PlanMigration(ctx context.Context, store RelationStore, tp provider.TaskPro
 			plan.Errors = append(plan.Errors, t.Ref+": "+item.Detail)
 		}
 		plan.Items = append(plan.Items, item)
+		if progress != nil {
+			progress(item, i+1, len(active))
+		}
 	}
-	return plan, nil
+	return plan, fatalErr
+}
+
+func snapshotForTaskMigration(ctx context.Context, store scopedSnapshotter, task *provider.Task) (*GraphSnapshot, error) {
+	const maxAttempts = 2
+	var snap *GraphSnapshot
+	var err error
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		snap, err = store.SnapshotGraphForTask(migrationScopedContext(ctx), Ref(task.Ref), TaskID(task.ID), nil)
+		if err == nil || provider.ClassifyOpError(err) != provider.OpTimeout || attempt == maxAttempts {
+			return snap, err
+		}
+		timer := time.NewTimer(migrationSnapshotRetryBackoff)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, ctx.Err()
+		case <-timer.C:
+		}
+	}
+	return snap, err
 }
 
 const migrationSnapshotRetryBackoff = 100 * time.Millisecond
@@ -253,6 +330,7 @@ func ApplyMigration(ctx context.Context, store RelationStore, tp provider.TaskPr
 	if writer == nil {
 		return nil, fmt.Errorf("deps migrate apply: DescriptionWriter required (description fences are authority; no sidecar)")
 	}
+	ctx, _ = WithSnapshotFence(ctx)
 	plan := &MigratePlan{ProjectID: projectID, OK: true, Mode: "apply-description"}
 	base, err := PlanMigration(ctx, store, tp, projectID)
 	if err != nil {
@@ -283,8 +361,15 @@ func ApplyMigration(ctx context.Context, store RelationStore, tp provider.TaskPr
 			plan.Items = append(plan.Items, item)
 			continue
 		}
-		// Fresh snapshot per card (revision fence).
-		snap, serr := store.SnapshotGraph(ctx)
+		// Fresh scoped snapshot per card (revision fence). Live providers must
+		// not re-fan-out the whole project for every apply item either.
+		var snap *GraphSnapshot
+		var serr error
+		if scoped, ok := store.(scopedSnapshotter); ok {
+			snap, serr = snapshotForTaskMigration(ctx, scoped, &provider.Task{ID: item.TaskID, Ref: item.Ref})
+		} else {
+			snap, serr = snapshotForMigration(ctx, store)
+		}
 		if serr != nil {
 			item.Action = "error"
 			item.Detail = "fresh snapshot: " + serr.Error()

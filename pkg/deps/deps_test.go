@@ -141,6 +141,84 @@ func TestMigrate_DryRunAndApply(t *testing.T) {
 	}
 }
 
+// scopedMigrationStore proves migrate does not regress to the unbounded
+// project relation query when a provider exposes the per-task surface.
+type scopedMigrationStore struct {
+	*MemoryStore
+	bulkCalls   int
+	scopedCalls int
+	failAt      int
+}
+
+func (s *scopedMigrationStore) SnapshotGraph(context.Context) (*GraphSnapshot, error) {
+	s.bulkCalls++
+	return nil, fmt.Errorf("bulk snapshot must not be called")
+}
+
+func (s *scopedMigrationStore) SnapshotGraphForTask(ctx context.Context, ref Ref, id TaskID, _ []DependencyEdge) (*GraphSnapshot, error) {
+	s.scopedCalls++
+	if s.failAt > 0 && s.scopedCalls >= s.failAt {
+		return nil, provider.AsTimeout("test", "ListRelations", provider.OpList, time.Second, context.DeadlineExceeded)
+	}
+	return s.MemoryStore.SnapshotGraph(ctx)
+}
+
+func TestPlanMigrationUsesScopedSnapshotsAndStreamsProgress(t *testing.T) {
+	store := &scopedMigrationStore{MemoryStore: NewMemoryStore()}
+	tp := provider.NewMemoryProvider()
+	for i := 1; i <= 3; i++ {
+		id := fmt.Sprintf("id-%d", i)
+		ref := fmt.Sprintf("FAC-%d", i)
+		t := &provider.Task{ID: id, Ref: ref, Status: "to-do", ProjectID: "p"}
+		tp.AddTask(t)
+		store.AddTask(t)
+	}
+	var progress []string
+	plan, err := PlanMigrationWithProgress(context.Background(), store, tp, "p", func(item MigrateItem, processed, total int) {
+		progress = append(progress, fmt.Sprintf("%d/%d:%s", processed, total, item.Ref))
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan == nil || len(plan.Items) != 3 {
+		t.Fatalf("plan=%+v, want three items", plan)
+	}
+	if store.bulkCalls != 0 {
+		t.Fatalf("migration invoked bulk snapshot %d times", store.bulkCalls)
+	}
+	if store.scopedCalls != 3 {
+		t.Fatalf("scoped snapshot calls=%d, want 3", store.scopedCalls)
+	}
+	if got, want := strings.Join(progress, ","), "1/3:FAC-1,2/3:FAC-2,3/3:FAC-3"; got != want {
+		t.Fatalf("progress=%q, want %q", got, want)
+	}
+}
+
+func TestPlanMigrationReturnsPartialPlanOnScopedTimeout(t *testing.T) {
+	store := &scopedMigrationStore{MemoryStore: NewMemoryStore(), failAt: 2}
+	tp := provider.NewMemoryProvider()
+	for i := 1; i <= 3; i++ {
+		id := fmt.Sprintf("id-%d", i)
+		ref := fmt.Sprintf("FAC-%d", i)
+		t := &provider.Task{ID: id, Ref: ref, Status: "to-do", ProjectID: "p"}
+		tp.AddTask(t)
+		store.AddTask(t)
+	}
+	var processed, total int
+	plan, err := PlanMigrationWithProgress(context.Background(), store, tp, "p", func(_ MigrateItem, got, all int) {
+		processed, total = got, all
+	})
+	if err == nil || plan == nil || plan.OK {
+		t.Fatalf("partial timeout must fail with partial plan: plan=%+v err=%v", plan, err)
+	}
+	if len(plan.Items) != 2 || processed != 2 || total != 3 {
+		t.Fatalf("partial progress plan=%d processed=%d total=%d, want 2/3", len(plan.Items), processed, total)
+	}
+	if !strings.Contains(err.Error(), "FAC-2") {
+		t.Fatalf("timeout error=%v, want current task", err)
+	}
+}
+
 func TestApplyMigrationReportsPeriodicProgress(t *testing.T) {
 	mp := provider.NewMemoryProvider()
 	for i := 1; i <= 10; i++ {
