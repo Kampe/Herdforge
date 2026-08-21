@@ -81,7 +81,22 @@ func TestKaneoListProjectRelations_ExplicitCLIMode(t *testing.T) {
 	old := kaneoRunCLI
 	kaneoRunCLI = func(_ context.Context, _ string, args ...string) (*CLIResult, error) {
 		if len(args) >= 2 && args[0] == "task" && args[1] == "list" {
-			if listCalls.Add(1) > 1 {
+			listCalls.Add(1)
+			// Key off the requested page, not call order: pages are fetched
+			// concurrently so arrival order is not deterministic.
+			page := "1"
+			for i, a := range args {
+				if a == "--page" && i+1 < len(args) {
+					page = args[i+1]
+				}
+			}
+			status := ""
+			for i, a := range args {
+				if a == "--status" && i+1 < len(args) {
+					status = args[i+1]
+				}
+			}
+			if page != "1" || status != StatusToDo {
 				return &CLIResult{Stdout: []byte(`[]`)}, nil
 			}
 			return &CLIResult{Stdout: []byte(`[{"id":"task-1","ref":"CHA-1","status":"to-do","title":"t","projectId":"project"}]`)}, nil
@@ -162,10 +177,10 @@ func TestKaneoListProjectRelations_WithKey_HTTPFanoutNotCLI(t *testing.T) {
 				start, end = 1, 100
 			case "2":
 				start, end = 101, n
-			case "3":
-				return &CLIResult{Stdout: []byte(`[]`)}, nil
 			default:
-				t.Fatalf("unexpected task-list page %s", page)
+				// Page 3 terminates the column; batched fetching may also
+				// request page 4+ speculatively. Both return empty.
+				return &CLIResult{Stdout: []byte(`[]`)}, nil
 			}
 			var tasks []map[string]string
 			for i := start; i <= end; i++ {
@@ -211,8 +226,11 @@ func TestKaneoListProjectRelations_WithKey_HTTPFanoutNotCLI(t *testing.T) {
 	gotPages := fmt.Sprintf("1=%d 2=%d 3=%d", cliPageCount["1"], cliPageCount["2"], cliPageCount["3"])
 	cliMu.Unlock()
 	// Six status columns, each paginating 100 then 66 then an empty page.
-	if cliList.Load() != 18 || gotPages != "1=6 2=6 3=6" {
-		t.Fatalf("want complete-status 100+66+empty pagination for 6 columns; calls=%d pages=%s", cliList.Load(), gotPages)
+	// Pages are fetched in concurrent batches, so each column requests its
+	// whole first batch; what matters is that every column walked pages 1-3
+	// and terminated on the empty one.
+	if gotPages != "1=6 2=6 3=6" {
+		t.Fatalf("want every column to walk 100+66+empty; calls=%d pages=%s", cliList.Load(), gotPages)
 	}
 	// One HTTP GET per task id (fan-out), not sequential CLI.
 	if httpRels.Load() != int64(n) {
@@ -298,11 +316,10 @@ func TestKaneoListProjectRelations_DeadlineCancel(t *testing.T) {
 				page = args[i+1]
 			}
 		}
-		if page == "2" {
-			return &CLIResult{Stdout: []byte(`[]`)}, nil
-		}
+		// Pages are fetched in concurrent batches, so pages past the empty
+		// terminator may be requested speculatively and discarded.
 		if page != "1" {
-			t.Fatalf("unexpected page %s", page)
+			return &CLIResult{Stdout: []byte(`[]`)}, nil
 		}
 		var tasks []map[string]string
 		for i := 1; i <= 8; i++ {
