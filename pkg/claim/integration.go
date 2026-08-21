@@ -85,6 +85,17 @@ type ProviderCAS interface {
 // Callers must reconcile by opID / readback before retrying blindly.
 var ErrProviderAmbiguous = errors.New("claim: provider mutation outcome is ambiguous; reconcile before retry")
 
+// ErrFenceInfrastructure is a PRE-CONDITION failure: the mutation was refused
+// before any remote call, so nothing changed and no reconciliation is needed.
+//
+// FAC-571: the missing-fence-broker refusal used ErrProviderAmbiguous, which
+// tells an operator the write MAY have landed and must be reconciled before any
+// retry. It had not landed -- the check runs before any remote or readback side
+// effect -- so a correct operator reading that message stopped and escalated
+// instead of starting the broker and retrying. Misclassifying a clean refusal as
+// ambiguous is expensive precisely because the ambiguity contract is honored.
+var ErrFenceInfrastructure = errors.New("claim: refused before any provider call; required fence infrastructure is not running")
+
 // OutboxIntent is one durable, idempotent side effect a lease transition
 // wants applied to an external system (provider board update, git push,
 // chat notification, etc). IdempotencyKey must be stable for retries of
