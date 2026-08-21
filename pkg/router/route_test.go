@@ -289,8 +289,12 @@ func TestWaterfallTables(t *testing.T) {
 		"bounded":        {"codex", "claude", "ollama", "grok", "agy", "lazer"},
 		"advisory":       {"opencode", "ollama", "claude", "grok", "agy"},
 		"qa-light":       {"codex", "claude", "ollama", "grok", "lazer"},
-		"qa":             {"claude", "grok", "agy", "codex", "kimi", "ollama", "lazer"},
-		"adversarial":    {"grok", "claude", "agy", "codex", "kimi", "ollama", "lazer"},
+		// FAC-573: kimi is DECLARED in these tables but gated behind
+		// HERD_ENABLE_KIMI, so Waterfall (the selection input) omits it. The
+		// declaration itself is asserted separately below, so both facts stay
+		// pinned rather than one silently replacing the other.
+		"qa":             {"claude", "grok", "agy", "codex", "ollama", "lazer"},
+		"adversarial":    {"grok", "claude", "agy", "codex", "ollama", "lazer"},
 	}
 	for shape, exp := range want {
 		got, err := Waterfall(shape)
@@ -952,5 +956,27 @@ func TestCooldownForReportsSourceAndExpiry(t *testing.T) {
 	}
 	if got := CooldownFor(time.Unix(1800000601, 0).UTC(), "grok", "", "default"); got != nil {
 		t.Fatalf("expired cool still reported: %+v", got)
+	}
+}
+
+// TestWaterfallTableStillDeclaresGatedSurface keeps the DECLARATION visible.
+//
+// FAC-573 filtered kimi out of Waterfall because this fleet has no account, but
+// the underlying table must still declare it: silently deleting the entry would
+// lose the policy, and an environment that opts in would get a table with no
+// kimi at all rather than a gated one.
+func TestWaterfallTableStillDeclaresGatedSurface(t *testing.T) {
+	raw, err := waterfallForShape("adversarial")
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, p := range raw {
+		if p == "kimi" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("the declared table must still contain kimi, got %v", raw)
 	}
 }

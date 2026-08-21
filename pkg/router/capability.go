@@ -1,6 +1,7 @@
 package router
 
 import (
+	"os"
 	"fmt"
 	"os/exec"
 	"strings"
@@ -34,6 +35,24 @@ type SurfaceCapability struct {
 	// control for this surface.  It is false when the surface ignores effort;
 	// consumers must never append it speculatively.
 	EffortApplicable bool
+	// RequiresOptIn names an environment variable that must be set to "1"
+	// before this surface may be selected. Empty means always selectable.
+	//
+	// FAC-573: a surface with no credentials on this fleet must not be a
+	// fallback candidate. Selecting it turns provider exhaustion into a silent
+	// dead end -- a launch that dies or waits at an auth screen while the lane
+	// reports alive -- instead of an honest "no healthy provider" refusal.
+	RequiresOptIn string
+}
+
+// Selectable reports whether a surface may be chosen by routing. A surface
+// gated behind an opt-in is selectable only when that variable is exactly "1",
+// so an unset or accidental value fails closed.
+func (c SurfaceCapability) Selectable() bool {
+	if c.RequiresOptIn == "" {
+		return true
+	}
+	return strings.TrimSpace(os.Getenv(c.RequiresOptIn)) == "1"
 }
 
 var surfaceCapabilities = []SurfaceCapability{
@@ -41,10 +60,20 @@ var surfaceCapabilities = []SurfaceCapability{
 	{Provider: "claude", Harness: "claude", CLI: "claude", VendorHarness: true, Headless: true, EffortApplicable: true},
 	{Provider: "codex", Harness: "codex", CLI: "codex", VendorHarness: true, Headless: true, EffortApplicable: true},
 	{Provider: "grok", Harness: "grok", CLI: "grok", VendorHarness: true, Headless: true, EffortApplicable: true},
-	// Kimi is headless-only until Herdr advertises a native kimi tab kind.
-	// Keeping it in the surface table lets shot routing use its argv while
-	// preventing READY routes from reaching a lane launcher that cannot spawn it.
-	{Provider: "kimi", Harness: "kimi", CLI: "kimi", Headless: true, ModelOptional: true, EffortApplicable: false},
+	// Kimi is headless-only until Herdr advertises a native kimi tab kind, AND
+	// is unroutable by default (FAC-573).
+	//
+	// There is no Kimi account on this fleet, so selecting it is a guaranteed
+	// failure: the launch either dies or sits at an authentication screen while
+	// the lane looks alive. A dispatch was observed reaching a Kimi target and
+	// failing with agent_pane_busy after leaving an orphan tab. A surface that
+	// cannot possibly authenticate must not be a fallback candidate -- it turns
+	// provider exhaustion into a silent dead end instead of an honest refusal.
+	//
+	// The entry stays so its argv remains available to explicitly-forced
+	// routing, gated behind HERD_ENABLE_KIMI for an environment that genuinely
+	// has an account.
+	{Provider: "kimi", Harness: "kimi", CLI: "kimi", Headless: true, ModelOptional: true, EffortApplicable: false, RequiresOptIn: "HERD_ENABLE_KIMI"},
 	{Provider: "lazer", Harness: "opencode", CLI: "opencode", Headless: true, EffortApplicable: false},
 	{Provider: "ollama", Harness: "opencode", CLI: "opencode", Headless: true, EffortApplicable: false},
 	{Provider: "opencode", Harness: "opencode", CLI: "opencode", VendorHarness: true, Headless: true, EffortApplicable: false},
