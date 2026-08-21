@@ -112,6 +112,9 @@ type ProviderObservation struct {
 	Claimable   int64  `json:"claimable"`
 	InProgress  int64  `json:"in_progress"`
 	NextTaskRef string `json:"next_task_ref,omitempty"`
+	// NextTaskID is the provider identity captured with NextTaskRef. Dispatch
+	// uses it for an O(1) re-read instead of hydrating the whole board again.
+	NextTaskID  string `json:"next_task_id,omitempty"`
 	ObservedSeq uint64 `json:"observed_seq,omitempty"`
 }
 

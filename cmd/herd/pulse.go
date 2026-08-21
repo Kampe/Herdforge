@@ -110,12 +110,14 @@ func gatherPulseObservation(ctx context.Context, act bool) (pulse.Observation, p
 	var obs pulse.Observation
 	actor := &livePulseActor{}
 
-	// Provider / queue pressure (one ListTasks). Also captures done task
-	// refs for reap evidence — a lane whose ticket is done is reap-eligible.
+	// Provider / queue pressure (one scoped ListTasks). Pulse only needs the
+	// claimable queue for bounded dispatch; the old all-status hydration made
+	// beat latency grow with total board size.
 	providerObs, doneRefs := readPulseProvider(ctx)
 	obs.Provider = providerObs
 	obs.Broker = readPulseBroker()
 	actor.dispatchRef = providerObs.NextTaskRef
+	dispatchTaskID := providerObs.NextTaskID
 	actor.dispatch = func(dispatchCtx context.Context, target, reason string) error {
 		if strings.TrimSpace(providerObs.NextTaskRef) == "" {
 			return errors.New("pulse: no claimable task ref available for bounded dispatch")
@@ -134,6 +136,7 @@ func gatherPulseObservation(ctx context.Context, act bool) (pulse.Observation, p
 		}
 		_, _, err = dispatchTicketDecision(dispatchCtx, dispatchRequest{
 			TicketRef:    providerObs.NextTaskRef,
+			TaskID:       dispatchTaskID,
 			LaneName:     laneName,
 			LaneExplicit: true,
 		}, io.Discard)
@@ -221,7 +224,7 @@ func readPulseProvider(ctx context.Context) (pulse.ProviderObservation, map[stri
 		return pulse.ProviderObservation{Known: false, Error: err.Error()}, nil
 	}
 	project := strings.TrimSpace(cfg.TaskProvider.ProjectID)
-	tasks, err := tp.ListTasks(ctx, project, "")
+	tasks, err := tp.ListTasks(ctx, project, provider.StatusToDo)
 	if err != nil {
 		return pulse.ProviderObservation{Known: false, Error: err.Error()}, nil
 	}
@@ -253,6 +256,7 @@ func readPulseProvider(ctx context.Context) (pulse.ProviderObservation, map[stri
 	}
 	if next := selectPulseDispatchTask(claimableTasks); next != nil {
 		obs.NextTaskRef = strings.TrimSpace(next.Ref)
+		obs.NextTaskID = strings.TrimSpace(next.ID)
 	}
 	return obs, doneRefs
 }

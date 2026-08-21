@@ -115,6 +115,18 @@ func (d *Dispatcher) listTasksBound(ctx context.Context, projectID, status strin
 	return tasks, err
 }
 
+// getTaskBound is the O(1) task re-read used when selection already supplied
+// the provider identity. Keeping it separate makes the bounded operation
+// explicit and preserves the legacy list path for callers without an ID.
+func (d *Dispatcher) getTaskBound(ctx context.Context, taskID string) (*provider.Task, error) {
+	d.ensureDeadlinesApplied()
+	opCtx, cancel := provider.BoundOp(ctx, d.deadlines(), provider.OpGet)
+	defer cancel()
+	task, err := d.TaskProvider.GetTask(opCtx, taskID)
+	d.health.observe(err)
+	return task, err
+}
+
 func (d *Dispatcher) updateStatusBound(ctx context.Context, taskID, status string) error {
 	// When a ClaimStack is wired (production FAC-147), fail closed unless
 	// the caller uses updateStatusFenced with a live lease generation.

@@ -224,7 +224,11 @@ func (LiveHerdr) ReadControlTarget(target control.WakeTarget) (control.WakeTarge
 
 type DispatchOptions struct {
 	TicketRef string
-	Decision  *router.LaunchDecision
+	// TaskID is an optional provider identity from an earlier bounded selection
+	// read. When present, dispatch re-reads exactly this task instead of making
+	// an unbounded whole-project ListTasks call.
+	TaskID   string
+	Decision *router.LaunchDecision
 	// Probe is a current artifact-backed tool-probe PASS for Decision's surface
 	// (FAC-139). Production write-capable launches fail closed when absent or
 	// stale. Non-production tests may omit it; launch synthesizes a PASS bound
@@ -722,18 +726,32 @@ func (d *Dispatcher) Dispatch(ctx context.Context, opts DispatchOptions) (*Dispa
 		return nil, fmt.Errorf("dispatch requires an acquired claim lease (FAC-145 fail-closed; the canonical fence source is the claim store)")
 	}
 
-	// 1. Fetch ticket from Kaneo (bounded context + health observe, FAC-150)
+	// 1. Fetch ticket from the provider (bounded context + health observe,
+	// FAC-150). Pulse supplies TaskID from its pre-action queue snapshot so the
+	// spawn path stays O(1) after actions have begun.
 	// READ-ONLY — no worktree/status/comment/tab yet (FAC-159).
-	tasks, err := d.listTasksBound(ctx, d.Config.TaskProvider.ProjectID, "")
-	if err != nil {
-		return nil, formatBoardErr("failed to list tasks", err)
-	}
-
-	var task *provider.Task
-	for _, t := range tasks {
-		if t.Ref == opts.TicketRef {
-			task = t
-			break
+	var (
+		task *provider.Task
+		err  error
+	)
+	if strings.TrimSpace(opts.TaskID) != "" {
+		task, err = d.getTaskBound(ctx, opts.TaskID)
+		if err != nil {
+			return nil, formatBoardErr("failed to get task", err)
+		}
+		if task == nil || task.Ref != opts.TicketRef {
+			return nil, fmt.Errorf("task identity mismatch: requested %s got %v", opts.TicketRef, task)
+		}
+	} else {
+		tasks, listErr := d.listTasksBound(ctx, d.Config.TaskProvider.ProjectID, "")
+		if listErr != nil {
+			return nil, formatBoardErr("failed to list tasks", listErr)
+		}
+		for _, t := range tasks {
+			if t.Ref == opts.TicketRef {
+				task = t
+				break
+			}
 		}
 	}
 	if task == nil {

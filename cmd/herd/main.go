@@ -4506,6 +4506,7 @@ func runNext(args []string) {
 // Parsing never loads config, claims work, or opens durable stores.
 type dispatchRequest struct {
 	TicketRef         string
+	TaskID            string
 	NoLaunch          bool
 	LaneName          string
 	LaneExplicit      bool
@@ -4927,7 +4928,7 @@ func dispatchTicketDecision(ctx context.Context, req dispatchRequest, announce i
 				return err
 			}
 			var dispatchErr error
-			dispatchResult, dispatchErr = d.Dispatch(ctx, dispatch.DispatchOptions{TicketRef: ticketRef, NoLaunch: noLaunch, LaneName: laneName, Decision: admitted, EnvironmentPlanID: req.EnvironmentPlanID, LeaseID: leaseID, LeaseGeneration: leaseGen})
+			dispatchResult, dispatchErr = d.Dispatch(ctx, dispatch.DispatchOptions{TicketRef: ticketRef, TaskID: req.TaskID, NoLaunch: noLaunch, LaneName: laneName, Decision: admitted, EnvironmentPlanID: req.EnvironmentPlanID, LeaseID: leaseID, LeaseGeneration: leaseGen})
 			return dispatchErr
 		})
 		if err != nil {
@@ -4952,7 +4953,7 @@ func dispatchTicketDecision(ctx context.Context, req dispatchRequest, announce i
 			}
 			return nil, nil, fmt.Errorf("dispatch hold admission rejected: %w", err)
 		}
-		result, err = d.Dispatch(ctx, dispatch.DispatchOptions{TicketRef: ticketRef, NoLaunch: true, LaneName: laneName, Decision: decision, EnvironmentPlanID: req.EnvironmentPlanID, LeaseID: leaseID, LeaseGeneration: leaseGen})
+		result, err = d.Dispatch(ctx, dispatch.DispatchOptions{TicketRef: ticketRef, TaskID: req.TaskID, NoLaunch: true, LaneName: laneName, Decision: decision, EnvironmentPlanID: req.EnvironmentPlanID, LeaseID: leaseID, LeaseGeneration: leaseGen})
 	}
 	if err != nil {
 		// Durable compensation: a failed dispatch releases the exact lease
