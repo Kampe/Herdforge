@@ -44,7 +44,7 @@ func TestCandidateResolutionRefusesLandedHead(t *testing.T) {
 	if err == nil {
 		t.Fatal("a HEAD already contained in origin/main must not be used as the candidate")
 	}
-	for _, want := range []string{"already contained", "--candidate-sha"} {
+	for _, want := range []string{"already contained", "--candidate"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Fatalf("refusal must explain and name the remedy (%q), got %v", want, err)
 		}
