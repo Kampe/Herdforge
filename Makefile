@@ -30,7 +30,7 @@ ci:
 # exactly what a GOROOT mismatch breaks — so it can only ever fire from an
 # already-built binary. This target is that check at the pre-compile layer.
 check-go-toolchain:
-	@./scripts/check-go-toolchain.zsh
+	@./scripts/check-go-toolchain.sh
 
 build: check-go-toolchain
 	@echo "==> Building herd binary..."

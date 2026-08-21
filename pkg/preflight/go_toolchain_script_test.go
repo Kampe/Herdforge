@@ -10,10 +10,10 @@ import (
 
 // FAC-486: CheckGoToolchain is only reachable once Go has already compiled, so
 // under a real GOROOT mismatch it never runs — the compiler fails first. The
-// pre-compile guard is scripts/check-go-toolchain.zsh, and it must be exercised
+// pre-compile guard is scripts/check-go-toolchain.sh, and it must be exercised
 // as the real script. Faking the probe here would repeat the exact mistake this
 // ticket repairs.
-const goToolchainScript = "../../scripts/check-go-toolchain.zsh"
+const goToolchainScript = "../../scripts/check-go-toolchain.sh"
 
 func runGoToolchainScript(t *testing.T, goroot string, setGOROOT bool) (string, error) {
 	t.Helper()
