@@ -1499,20 +1499,21 @@ type AgentSession struct {
 // FAC-158 observation fields are filled by authority adapters / fixtures,
 // never invented from the raw agent list.
 type AgentEntry struct {
-	Name           string       `json:"name,omitempty"`
-	Kind           string       `json:"agent,omitempty"`
-	Status         string       `json:"agent_status,omitempty"`
-	LoopMode       string       `json:"loop_mode,omitempty"`
-	PaneID         string       `json:"pane_id,omitempty"`
-	TabID          string       `json:"tab_id,omitempty"`
-	Workspace      string       `json:"workspace_id,omitempty"`
-	TerminalID     string       `json:"terminal_id,omitempty"`
-	Cwd            string       `json:"cwd,omitempty"`
-	TerminalTitle  string       `json:"terminal_title,omitempty"` // UI title (login/auth detection)
-	ForegroundCwd  string       `json:"foreground_cwd,omitempty"`
-	Session        AgentSession `json:"agent_session,omitempty"`
-	Revision       uint64       `json:"revision,omitempty"`
-	StateChangeSeq uint64       `json:"state_change_seq,omitempty"`
+	Name             string       `json:"name,omitempty"`
+	Kind             string       `json:"agent,omitempty"`
+	Status           string       `json:"agent_status,omitempty"`
+	AssignmentStatus string       `json:"assignment_status,omitempty"`
+	LoopMode         string       `json:"loop_mode,omitempty"`
+	PaneID           string       `json:"pane_id,omitempty"`
+	TabID            string       `json:"tab_id,omitempty"`
+	Workspace        string       `json:"workspace_id,omitempty"`
+	TerminalID       string       `json:"terminal_id,omitempty"`
+	Cwd              string       `json:"cwd,omitempty"`
+	TerminalTitle    string       `json:"terminal_title,omitempty"` // UI title (login/auth detection)
+	ForegroundCwd    string       `json:"foreground_cwd,omitempty"`
+	Session          AgentSession `json:"agent_session,omitempty"`
+	Revision         uint64       `json:"revision,omitempty"`
+	StateChangeSeq   uint64       `json:"state_change_seq,omitempty"`
 	// TabGeneration is the immutable tab identity exposed by newer Herdr
 	// pulse/agent-list surfaces. It is deliberately distinct from
 	// StateChangeSeq, which only counts agent state transitions.

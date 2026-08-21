@@ -284,6 +284,37 @@ func TestProjectLiveFleetStatusClassifiesLiveAgentsWithoutReconciliationAuthorit
 	}
 }
 
+func TestProjectLiveFleetStatusSeparatesQueuedAssignmentFromWorkingGoal(t *testing.T) {
+	got := ProjectLiveFleetStatus([]AgentEntry{
+		{Name: "forge-worker", Status: "working", AssignmentStatus: "queued", Workspace: "wF"},
+		{Name: "forge-consumer", Status: "working", AssignmentStatus: "consumed", Workspace: "wF"},
+	}, nil, "wF", 2)
+	if got.Queued != 1 || got.Working != 1 {
+		t.Fatalf("fleet=%+v, want one queued and one consumed/working lane", got)
+	}
+	if got.Classes[TabQueued] != 1 {
+		t.Fatalf("queued class=%d, want 1: %+v", got.Classes[TabQueued], got.Classes)
+	}
+	if got.Capacity != 0 {
+		t.Fatalf("capacity=%d, want 0 while queued work owns a lane", got.Capacity)
+	}
+}
+
+func TestNormalizeAssignmentStatusIsFailClosed(t *testing.T) {
+	for _, tc := range []struct {
+		input, want string
+	}{
+		{"queued", "queued"},
+		{"staged", "queued"},
+		{"consumed", "consumed"},
+		{"mystery", "unknown"},
+	} {
+		if got := NormalizeAssignmentStatus(tc.input); got != tc.want {
+			t.Errorf("NormalizeAssignmentStatus(%q)=%q, want %q", tc.input, got, tc.want)
+		}
+	}
+}
+
 func TestActiveProjectionRequiresExactSessionProcessAndPane(t *testing.T) {
 	tests := []struct {
 		name  string
