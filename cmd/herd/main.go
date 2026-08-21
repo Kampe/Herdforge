@@ -387,6 +387,9 @@ func main() {
 	case "transcript":
 		runTranscript(os.Args[2:])
 
+	case "candidate":
+		runCandidate(os.Args[2:])
+
 	case "process":
 		runProcess()
 
