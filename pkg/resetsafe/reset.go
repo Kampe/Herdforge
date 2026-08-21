@@ -3,6 +3,7 @@
 package resetsafe
 
 import (
+	"github.com/Kampe/Herdforge/pkg/refname"
 	"context"
 	"fmt"
 	"io"
@@ -151,7 +152,7 @@ func New(ctx context.Context, repoRoot, worktreePath string, opts Options) (*Wor
 	}
 	if u != nil && len(u.Unmerged) > 0 {
 		plan.Unique = append([]string(nil), u.Unmerged...)
-		plan.PreserveBranch = "harvest/" + publishSafeSegment(branch) + "-" + short
+		plan.PreserveBranch = "harvest/" + refname.PublishSafeSegment(branch) + "-" + short
 		plan.authority.unique = append([]string(nil), u.Unmerged...)
 		plan.authority.preserveBranch = plan.PreserveBranch
 	}
@@ -323,23 +324,3 @@ func canonicalCommonDir(raw, owner string) (string, error) {
 	return canonical, nil
 }
 
-// publishSafeSegment turns a source branch name into a segment safe to embed in
-// a generated publish branch.
-//
-// FAC-571: a generated harvest branch inherited "current-main" from its source
-// branch, and a push-safety guard that matches "main" anywhere in a git push
-// command refused it as a direct-main push. Renaming the identical branch made
-// the push pass, so the guard was a false positive produced by OUR name.
-//
-// Identity lives in the short SHA appended by the caller, so the descriptive
-// portion is free to be rewritten. "main" becomes "trunk": readable, and it
-// cannot trip a substring guard. Slashes collapse so the generated ref stays
-// one segment deep.
-func publishSafeSegment(branch string) string {
-	seg := strings.ReplaceAll(strings.TrimSpace(branch), "/", "-")
-	// Case-insensitive: a guard matching "main" will also match "Main".
-	for _, variant := range []string{"main", "Main", "MAIN"} {
-		seg = strings.ReplaceAll(seg, variant, "trunk")
-	}
-	return seg
-}

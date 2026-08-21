@@ -13,6 +13,7 @@
 package harvestmerge
 
 import (
+	"github.com/Kampe/Herdforge/pkg/refname"
 	"fmt"
 	"regexp"
 	"strings"
@@ -200,7 +201,12 @@ func UniqueCommits(cherryOutput string) []string {
 // TempBranchName is the throwaway branch a harvest builds on. Deterministic
 // per lane and SHA so a retry reuses it instead of littering the ref namespace.
 func TempBranchName(lane, sha string) string {
-	safe := regexp.MustCompile(`[^A-Za-z0-9._-]`).ReplaceAllString(lane, "_")
+	// FAC-574: this is the generator a consumer actually invoked, and it
+	// produced harvest/reconstruct_cha-2197-current-main-17ccbb16ecc0 -- which a
+	// publication guard matching "main" refused. FAC-571 had fixed the OTHER
+	// generator (pkg/resetsafe), so the defect survived its own fix. Both now
+	// share one definition in pkg/refname.
+	safe := refname.PublishSafeSegment(lane)
 	if len(sha) > 12 {
 		sha = sha[:12]
 	}

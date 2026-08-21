@@ -3,42 +3,27 @@ package resetsafe
 import (
 	"strings"
 	"testing"
+
+	"github.com/Kampe/Herdforge/pkg/refname"
 )
 
-// TestPublishSafeSegmentAvoidsMainSubstring is the FAC-571 regression.
+// TestPreserveBranchUsesSharedDefinition is the FAC-574 follow-up.
 //
-// A generated harvest branch inherited "current-main" from its source branch,
-// and a push-safety guard matching "main" anywhere in a git push command refused
-// it as a direct-main push. Renaming the identical branch made the push pass, so
-// the guard was a false positive produced by our own generated name.
-func TestPublishSafeSegmentAvoidsMainSubstring(t *testing.T) {
-	cases := []string{
-		"reconstruct/cha-2195-current-main",
-		"review/cha-2172-current-main-refresh",
-		"feature/Main-thing",
-		"main",
+// FAC-571 fixed a LOCAL copy of this rule here, while the generator a consumer
+// actually invoked lived in pkg/harvestmerge with different sanitizing and no
+// main-stripping at all -- so the defect survived its own fix. Both callers now
+// share pkg/refname, and this asserts the delegation rather than re-testing the
+// helper (which pkg/refname covers).
+func TestPreserveBranchUsesSharedDefinition(t *testing.T) {
+	const source = "reconstruct/cha-2197-current-main"
+	got := refname.PublishSafeSegment(source)
+	if strings.Contains(strings.ToLower(got), "main") {
+		t.Fatalf("shared definition must strip main, got %q", got)
 	}
-	for _, in := range cases {
-		got := publishSafeSegment(in)
-		if strings.Contains(strings.ToLower(got), "main") {
-			t.Fatalf("generated segment for %q still contains main: %q", in, got)
-		}
-		if strings.Contains(got, "/") {
-			t.Fatalf("generated segment must be one path segment, got %q", got)
-		}
-		if got == "" {
-			t.Fatalf("segment for %q must not be empty", in)
-		}
-	}
-}
-
-// The descriptive portion must stay recognizable: identity is the appended SHA,
-// but an operator still has to know which branch a harvest came from.
-func TestPublishSafeSegmentStaysRecognizable(t *testing.T) {
-	got := publishSafeSegment("reconstruct/cha-2195-current-main")
-	for _, want := range []string{"reconstruct", "cha-2195", "trunk"} {
-		if !strings.Contains(got, want) {
-			t.Fatalf("segment %q must retain %q", got, want)
-		}
+	// The preserve-branch prefix plus this segment is what gets published, so a
+	// guard matching "main" must find nothing in either part.
+	full := "harvest/" + got + "-abc123def456"
+	if strings.Contains(strings.ToLower(full), "main") {
+		t.Fatalf("published name must not contain main: %q", full)
 	}
 }
