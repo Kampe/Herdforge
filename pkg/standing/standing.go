@@ -112,6 +112,13 @@ type Options struct {
 	AbsPath            func(path string) (string, error)
 	HarnessPresent     func(harness string) bool
 
+	// LaneLoopMode resolves a lane's loop contract from Herdforge's own durable
+	// hold store. It exists because the loop mode is NOT observable from the
+	// live agent list: herdr emits no loop_mode field at all, so reading it off
+	// an Agent left every lane defaulting to running and made OutcomeHeld
+	// unreachable in production. Nil falls back to the agent-reported value.
+	LaneLoopMode func(laneName string) (LoopMode, error)
+
 	// SetGoal installs the durable goal-guard.json a raised lane's Stop hook
 	// checks. It runs in the lane's own worktree cwd (never the coordinator's)
 	// so it resolves that lane's own state dir. Nil means no goal-guard wiring
@@ -641,6 +648,14 @@ func runStatus(result *Result, lanes []config.LaneDef, live map[string][]Agent, 
 		if actualName, a, ok := standingAgent(live, lane.Name, repository, rr.CWD); ok && NameHeld(a.Status) {
 			rr.AgentName = actualName
 			rr.LoopMode = a.LoopMode
+			// Prefer Herdforge's durable hold store over the agent list: a held
+			// lane must never be reported as running just because the terminal
+			// plane has no opinion about loop state.
+			if opts.LaneLoopMode != nil {
+				if mode, err := opts.LaneLoopMode(lane.Name); err == nil && mode != "" {
+					rr.LoopMode = mode
+				}
+			}
 			if rr.LoopMode == "" {
 				rr.LoopMode = LoopRunning
 			}
