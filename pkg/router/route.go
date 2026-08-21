@@ -44,7 +44,36 @@ func AllShapes() []string {
 }
 
 // Waterfall returns the preference-ordered candidate providers for a shape.
+//
+// FAC-573: the result is filtered through surface opt-in gating, so a provider
+// with no credentials on this fleet is never offered as a fallback. Kimi sat in
+// the qa and adversarial lists, so exhausting claude/grok/agy/codex would select
+// a surface that cannot authenticate -- turning provider exhaustion into a
+// launch that dies or waits at an auth screen while the lane reports alive,
+// instead of an honest "no healthy provider" refusal.
 func Waterfall(shape string) ([]string, error) {
+	providers, err := waterfallForShape(shape)
+	if err != nil {
+		return nil, err
+	}
+	return selectableProviders(providers), nil
+}
+
+// selectableProviders drops surfaces gated behind an unset opt-in. An unknown
+// provider is kept: this filter exists to remove known-unusable surfaces, not
+// to become a second, quieter allowlist.
+func selectableProviders(providers []string) []string {
+	out := make([]string, 0, len(providers))
+	for _, p := range providers {
+		if surface, ok := SurfaceFor(p); ok && !surface.Selectable() {
+			continue
+		}
+		out = append(out, p)
+	}
+	return out
+}
+
+func waterfallForShape(shape string) ([]string, error) {
 	switch shape {
 	case "coordinator":
 		// Coordinator identity is stable across provider failover. Keep the
