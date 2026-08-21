@@ -384,6 +384,9 @@ func main() {
 	case "attention":
 		runAttention()
 
+	case "transcript":
+		runTranscript(os.Args[2:])
+
 	case "process":
 		runProcess()
 
@@ -596,7 +599,10 @@ func printUsage() {
 	fmt.Println("  hostcreds       HostCreds oracle: diagnose|session|selftest (FAC-170; no OpenCode)")
 	fmt.Println("  control        Issue/drain authenticated control envelopes (FAC-133)")
 	fmt.Println("  netbroker-serve Durable network allowlist broker process (FAC-133)")
-	fmt.Println("  agent/pane operations  Use the herdr binary (for example: herdr agent list)")
+	fmt.Println("  transcript      Read a lane's recent output and final handoff (read-only)")
+	fmt.Println("  agent/pane MUTATION  Use the herdr binary (for example: herdr agent start).")
+	fmt.Println("                       Read-only transcript inspection is `herd transcript` — you")
+	fmt.Println("                       do not need raw herdr to read what a finished lane reported.")
 	fmt.Println("  --version       Show herd version")
 }
 

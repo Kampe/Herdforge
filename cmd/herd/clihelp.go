@@ -221,6 +221,7 @@ Commands:
 	"rescue": "Usage: herd rescue [<pane-id>] [--empty-siblings] [--workspace ID] [--label NAME] [--apply] [--json]\n" +
 		"  Diagnose cramped/split agent panes. Dry-run by default; --apply repairs one proven target.",
 	"attention":    "Usage: herd attention [flags]\n  Coordinator-eyes triage for the standing fleet.",
+	"transcript":   "Usage: herd transcript <agent-name> [--handoff] [--lines N] [--json]\n  Read-only: a lane's recent output and its final reported handoff.\n  Covers finished lanes, so raw herdr is not needed to read what a lane reported.\n  Never submits text, presses keys, or touches tab lifecycle.",
 	"process":      "Usage: herd process [flags]\n  Process-engine inspection.",
 	"resolve-lane": "Usage: herd resolve-lane [flags]\n  Resolve canonical lane identity.",
 	"route":        "Usage: herd route [flags]\n  Model / surface routing helpers.",
