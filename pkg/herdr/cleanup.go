@@ -40,6 +40,7 @@ const (
 	TabSafeOrphan      TabClass = "safe-orphan"
 	TabLegacyCleanup   TabClass = "legacy-cleanup"
 	TabRecovering      TabClass = "recovering"
+	TabQueued          TabClass = "queued-but-not-consumed"
 	TabBlocked         TabClass = "unknown/BLOCKED"
 )
 
@@ -155,8 +156,23 @@ func NormalizeTaskStatus(status string) string {
 	}
 }
 
+// NormalizeAssignmentStatus keeps prompt delivery state separate from the
+// agent's own work state. A queued assignment is not evidence that a lane is
+// consuming it, even when agent_status is already working on a standing goal.
+func NormalizeAssignmentStatus(status string) string {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "queued", "pending", "staged", "delivered":
+		return "queued"
+	case "consumed", "working", "done":
+		return "consumed"
+	default:
+		return "unknown"
+	}
+}
+
 type FleetStatus struct {
 	Working      int
+	Queued       int
 	Capacity     int
 	Unknown      int
 	Standing     int
@@ -221,6 +237,8 @@ func ProjectLiveFleetStatus(agents []AgentEntry, standing map[string]bool, works
 		switch {
 		case agent.Name == "":
 			class = TabUserShell
+		case NormalizeAssignmentStatus(agent.AssignmentStatus) == "queued":
+			class = TabQueued
 		case standing[agent.Name]:
 			class = TabStanding
 		case NormalizeTaskStatus(agent.Status) == "in-progress":
@@ -234,6 +252,8 @@ func ProjectLiveFleetStatus(agents []AgentEntry, standing map[string]bool, works
 		switch class {
 		case TabActive:
 			p.Working++
+		case TabQueued:
+			p.Queued++
 		case TabStanding:
 			p.Standing++
 		case TabRecovering:
@@ -244,7 +264,7 @@ func ProjectLiveFleetStatus(agents []AgentEntry, standing map[string]bool, works
 			p.Unknown++
 		}
 	}
-	p.Capacity = maxLanes - p.Working - p.Recovering
+	p.Capacity = maxLanes - p.Working - p.Queued - p.Recovering
 	if p.Unknown > 0 || p.Capacity < 0 {
 		p.Capacity = 0
 	}

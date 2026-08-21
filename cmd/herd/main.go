@@ -1148,11 +1148,11 @@ func runStatus() {
 		fleet = herdr.ProjectLiveFleetStatus(observer.LiveAgents(), standingNames, cfg.Fleet.HerdrWorkspace, len(cfg.Lanes))
 	}
 	if err != nil {
-		fmt.Printf("Reconciliation: BLOCKED (%v)\nFleet: working=%d capacity=%d standing=%d preserved=%d recovering=%d control=%d unknown=%d\n",
-			err, fleet.Working, fleet.Capacity, fleet.Standing, fleet.Preserved, fleet.Recovering, fleet.ControlSeats, fleet.Unknown)
+		fmt.Printf("Reconciliation: BLOCKED (%v)\nFleet: working=%d queued=%d capacity=%d standing=%d preserved=%d recovering=%d control=%d unknown=%d\n",
+			err, fleet.Working, fleet.Queued, fleet.Capacity, fleet.Standing, fleet.Preserved, fleet.Recovering, fleet.ControlSeats, fleet.Unknown)
 	} else {
-		fmt.Printf("Reconciliation: observed\nFleet: working=%d capacity=%d standing=%d preserved=%d recovering=%d control=%d unknown=%d\n",
-			fleet.Working, fleet.Capacity, fleet.Standing, fleet.Preserved, fleet.Recovering, fleet.ControlSeats, fleet.Unknown)
+		fmt.Printf("Reconciliation: observed\nFleet: working=%d queued=%d capacity=%d standing=%d preserved=%d recovering=%d control=%d unknown=%d\n",
+			fleet.Working, fleet.Queued, fleet.Capacity, fleet.Standing, fleet.Preserved, fleet.Recovering, fleet.ControlSeats, fleet.Unknown)
 	}
 	reportWorkspacePlacement()
 }

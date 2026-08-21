@@ -36,8 +36,8 @@ func RenderDashboardWithFleet(cfg *config.Config, tasks []*provider.Task, fleet 
 		sb.WriteString(fmt.Sprintf(" Task Engine   : %s\n", cfg.TaskProvider.Type))
 		sb.WriteString(fmt.Sprintf(" Configured Lanes: %d\n", len(cfg.Lanes)))
 	}
-	sb.WriteString(fmt.Sprintf(" Fleet Lanes   : working=%d capacity=%d standing=%d preserved=%d recovering=%d control=%d unknown=%d\n",
-		fleet.Working, fleet.Capacity, fleet.Standing, fleet.Preserved, fleet.Recovering, fleet.ControlSeats, fleet.Unknown))
+	sb.WriteString(fmt.Sprintf(" Fleet Lanes   : working=%d queued=%d capacity=%d standing=%d preserved=%d recovering=%d control=%d unknown=%d\n",
+		fleet.Working, fleet.Queued, fleet.Capacity, fleet.Standing, fleet.Preserved, fleet.Recovering, fleet.ControlSeats, fleet.Unknown))
 	sb.WriteString("------------------------------------------------------------------------\n")
 	sb.WriteString(" ACTIVE TASK QUEUE                                                      \n")
 	sb.WriteString("------------------------------------------------------------------------\n")
