@@ -733,41 +733,79 @@ func (k *KaneoProvider) listTasksOnce(ctx context.Context, projectID, status str
 // local, and cross-column dedup happens once in the caller.
 func (k *KaneoProvider) walkStatusPages(ctx context.Context, projectID, listStatus string) ([]kaneoTaskDTO, error) {
 	const pageSize = 100
+	// The server caps a page at 100 regardless of --limit, so a large column is
+	// a fixed number of round trips: this board's done column is 7 pages and
+	// ~45s serially, which exceeds the list deadline on its own. Pages are
+	// fetched in small concurrent batches and then CONSUMED STRICTLY IN PAGE
+	// ORDER, so empty-page termination, duplicate-page detection, and the page
+	// cap behave exactly as they did serially -- only the waiting overlaps.
+	const batch = 4
 	var out []kaneoTaskDTO
 	pageAcc := NewPageAccumulator()
-	for page := 1; page <= DefaultMaxListPages; page++ {
+	for first := 1; first <= DefaultMaxListPages; first += batch {
 		if err := ctx.Err(); err != nil {
 			return nil, AsTimeout("kaneo", "ListTasks", OpList, k.deadlines().For(OpList), err)
 		}
-		args := []string{"task", "list", "--project", projectID, "--json",
-			"--limit", fmt.Sprint(pageSize), "--page", fmt.Sprint(page), "--status", listStatus}
-		res, err := kaneoRunCLI(ctx, "kaneo", args...)
-		if err != nil {
-			return nil, fmt.Errorf("kaneo task list (status %s, page %d): %w", listStatus, page, err)
+		last := first + batch - 1
+		if last > DefaultMaxListPages {
+			last = DefaultMaxListPages
 		}
-		var dtos []kaneoTaskDTO
-		if err := DecodeJSONBytes(http.StatusOK, res.Stdout, &dtos); err != nil {
-			if pe, ok := err.(*ProviderError); ok {
-				pe.Provider = "kaneo"
-				pe.Op = "ListTasks"
+		n := last - first + 1
+		pages := make([][]kaneoTaskDTO, n)
+		errs := make([]error, n)
+		var wg sync.WaitGroup
+		for i := 0; i < n; i++ {
+			wg.Add(1)
+			go func(i int) {
+				defer wg.Done()
+				pages[i], errs[i] = k.fetchStatusPage(ctx, projectID, listStatus, first+i, pageSize)
+			}(i)
+		}
+		wg.Wait()
+
+		for i := 0; i < n; i++ {
+			page := first + i
+			// An error on a page later than the terminating one is irrelevant;
+			// consuming in order means it is never reached.
+			if errs[i] != nil {
+				return nil, errs[i]
 			}
-			return nil, fmt.Errorf("kaneo task list (status %s, page %d): %w", listStatus, page, err)
-		}
-		fresh := 0
-		for _, d := range dtos {
-			if pageAcc.Add(d.ID) {
-				fresh++
-				out = append(out, d)
+			fresh := 0
+			for _, d := range pages[i] {
+				if pageAcc.Add(d.ID) {
+					fresh++
+					out = append(out, d)
+				}
 			}
-		}
-		switch DecidePagination(len(dtos), fresh) {
-		case PageStopEmpty:
-			return out, nil
-		case PageStopDuplicate:
-			return nil, fmt.Errorf("kaneo task list (status %s, page %d): %w", listStatus, page, ErrDuplicatePage)
+			switch DecidePagination(len(pages[i]), fresh) {
+			case PageStopEmpty:
+				return out, nil
+			case PageStopDuplicate:
+				return nil, fmt.Errorf("kaneo task list (status %s, page %d): %w", listStatus, page, ErrDuplicatePage)
+			}
 		}
 	}
 	return nil, fmt.Errorf("kaneo task list (status %s): %w (maxPages=%d)", listStatus, ErrPaginationCap, DefaultMaxListPages)
+}
+
+// fetchStatusPage reads exactly one page. It holds no shared state so pages
+// may be fetched concurrently; ordering decisions belong to the caller.
+func (k *KaneoProvider) fetchStatusPage(ctx context.Context, projectID, listStatus string, page, pageSize int) ([]kaneoTaskDTO, error) {
+	args := []string{"task", "list", "--project", projectID, "--json",
+		"--limit", fmt.Sprint(pageSize), "--page", fmt.Sprint(page), "--status", listStatus}
+	res, err := kaneoRunCLI(ctx, "kaneo", args...)
+	if err != nil {
+		return nil, fmt.Errorf("kaneo task list (status %s, page %d): %w", listStatus, page, err)
+	}
+	var dtos []kaneoTaskDTO
+	if err := DecodeJSONBytes(http.StatusOK, res.Stdout, &dtos); err != nil {
+		if pe, ok := err.(*ProviderError); ok {
+			pe.Provider = "kaneo"
+			pe.Op = "ListTasks"
+		}
+		return nil, fmt.Errorf("kaneo task list (status %s, page %d): %w", listStatus, page, err)
+	}
+	return dtos, nil
 }
 
 func filterTasks(dtos []kaneoTaskDTO, status string) []*Task {
