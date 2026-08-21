@@ -27,6 +27,10 @@ TASK-CONTEXT.json
 # in every session and buried real changes in git status noise.
 .herd/control-mail.jsonl
 .herd/control-mail.jsonl.*
+# board-audit's accepted-inherited baseline is deliberately TRACKED, not ignored:
+# it decides which findings are historical, so a per-host copy would make the
+# same audit disagree between operators and let a new bypass look inherited.
+
 # Coordinator wind-down state and its lock (runtime, per-host).
 .herd/winddown.json
 .herd/winddown.json.lock
