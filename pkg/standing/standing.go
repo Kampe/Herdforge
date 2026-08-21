@@ -426,6 +426,37 @@ func indexAgents(agents []Agent, workspace, repoRoot string) map[string][]Agent 
 // unqualified owner only when no qualified record exists. The fallback keeps
 // lanes raised before repository-qualified naming from being reported missing
 // or raised a second time during the naming transition.
+// LiveAgentName resolves a lane to the agent name that ACTUALLY EXISTS in the
+// fleet: the repository-qualified name when an agent holds it, otherwise the
+// legacy unqualified name when a pre-qualification agent is still running.
+// Falls back to the qualified name when neither is live, so callers minting a
+// new identity keep current naming.
+//
+// FAC-547: every caller that TARGETS a live agent must resolve this way.
+// Targeting AgentNameForRepository directly broke pulse's review handoff: with
+// FAC-530 truncation, "review-harvest-supervisor" becomes
+// "forge-review-harvest-su-<digest>", which no agent held on a fleet whose
+// supervisor predated qualification — so five open_review actions in a row
+// failed against a nonexistent name and dispatch stayed review-saturated.
+// Only sites that MINT a new identity should use the raw qualified name.
+func LiveAgentName(agents []Agent, laneName, repository string) string {
+	qualified := AgentNameForRepository(laneName, repository)
+	legacy := AgentName(laneName)
+	haveQualified, haveLegacy := false, false
+	for _, a := range agents {
+		switch strings.TrimSpace(a.Name) {
+		case qualified:
+			haveQualified = true
+		case legacy:
+			haveLegacy = true
+		}
+	}
+	if haveQualified || !haveLegacy {
+		return qualified
+	}
+	return legacy
+}
+
 // standingAgent resolves a lane to its live agent. Within one workspace two
 // agents can share a name, so the lane's OWN configured cwd is the
 // disambiguator — not containment in repoRoot, which would reject lanes whose

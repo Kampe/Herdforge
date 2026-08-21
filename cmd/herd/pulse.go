@@ -881,13 +881,38 @@ func (a *livePulseActor) OpenReview(ctx context.Context, lane pulse.AgentObserva
 	if !herdr.IsAvailable() {
 		return errors.New("pulse: herdr CLI not found")
 	}
+	// FAC-547: resolve to the agent that actually exists. A fleet whose
+	// supervisor predates repo-qualified naming holds the legacy unqualified
+	// name, and targeting the qualified form sent every review handoff to a
+	// name no agent held.
 	target := standing.AgentNameForRepository(supervisor.Name, repositoryIdentityForLaunch(cfg))
+	if live, listErr := herdrStandingAgents(); listErr == nil {
+		target = standing.LiveAgentName(live, supervisor.Name, repositoryIdentityForLaunch(cfg))
+	}
 	packet := pulseReviewPacket(lane)
 	if _, err := herdr.Send(target, packet, true, 30*time.Second); err != nil {
 		return fmt.Errorf("pulse: notify review supervisor %s: %w", target, err)
 	}
 	_ = ctx
 	return nil
+}
+
+// herdrStandingAgents lists live agents in the standing shape used for
+// identity resolution. A listing failure is not fatal to the caller: it falls
+// back to the qualified name, which is the pre-FAC-547 behaviour.
+func herdrStandingAgents() ([]standing.Agent, error) {
+	raw, err := herdr.AgentList()
+	if err != nil {
+		return nil, err
+	}
+	out := make([]standing.Agent, 0, len(raw))
+	for _, a := range raw {
+		out = append(out, standing.Agent{
+			Name: a.Name, Status: a.Status, PaneID: a.PaneID,
+			TabID: a.TabID, Workspace: a.Workspace, Cwd: a.Cwd,
+		})
+	}
+	return out, nil
 }
 
 func pulseReviewPacket(lane pulse.AgentObservation) string {

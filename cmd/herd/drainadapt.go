@@ -82,6 +82,15 @@ type drainAdapters struct {
 	run func(ctx context.Context, sha string, adm harvest.AdmissionContext, dry bool) (*harvest.IntegrationResult, error)
 }
 
+// drainLiveAgentName resolves a lane to the live agent name, falling back to
+// the qualified form when the fleet cannot be listed.
+func drainLiveAgentName(laneName, repository string) string {
+	if live, err := herdrStandingAgents(); err == nil {
+		return standing.LiveAgentName(live, laneName, repository)
+	}
+	return standing.AgentNameForRepository(laneName, repository)
+}
+
 func (a *drainAdapters) hooks() drainActionHooks {
 	return drainActionHooks{
 		launchReview: a.launchReview,
@@ -579,7 +588,9 @@ func newDrainAdapters(root, ledgerPath string, cfg *config.Config, tp provider.T
 		repository:  repository,
 		cap:         reviewCap,
 		lane:        lane,
-		supervisor:  standing.AgentNameForRepository(supervisorLane.Name, repository),
+		// FAC-547: adopt a legacy-named live supervisor rather than targeting
+		// a qualified name no agent holds.
+		supervisor:  drainLiveAgentName(supervisorLane.Name, repository),
 		tasks:       tp,
 		ledger:      ledger,
 		launcher:    liveDrainLauncher{lane: lane.Name, repository: repository},
