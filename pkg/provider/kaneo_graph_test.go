@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -112,7 +113,11 @@ func TestKaneoListProjectRelations_WithKey_HTTPFanoutNotCLI(t *testing.T) {
 	var httpRels atomic.Int64
 	var cliRel atomic.Int64
 	var cliList atomic.Int64
-	var cliPages []string
+	// Status columns are walked concurrently, so the stub records pages under a
+	// mutex and the assertion below checks the per-page multiset rather than a
+	// serial sequence: cross-column interleaving is expected, not a defect.
+	var cliMu sync.Mutex
+	cliPageCount := map[string]int{}
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -148,7 +153,9 @@ func TestKaneoListProjectRelations_WithKey_HTTPFanoutNotCLI(t *testing.T) {
 					page = args[i+1]
 				}
 			}
-			cliPages = append(cliPages, page)
+			cliMu.Lock()
+			cliPageCount[page]++
+			cliMu.Unlock()
 			start, end := 0, 0
 			switch page {
 			case "1":
@@ -200,9 +207,12 @@ func TestKaneoListProjectRelations_WithKey_HTTPFanoutNotCLI(t *testing.T) {
 	if cliRel.Load() != 0 {
 		t.Fatalf("must not use CLI rel list when HTTP credentials present, got %d", cliRel.Load())
 	}
-	wantPages := strings.TrimSuffix(strings.Repeat("1,2,3,", 6), ",")
-	if cliList.Load() != 18 || strings.Join(cliPages, ",") != wantPages {
-		t.Fatalf("want complete-status 100+66+empty pagination pages; calls=%d pages=%v", cliList.Load(), cliPages)
+	cliMu.Lock()
+	gotPages := fmt.Sprintf("1=%d 2=%d 3=%d", cliPageCount["1"], cliPageCount["2"], cliPageCount["3"])
+	cliMu.Unlock()
+	// Six status columns, each paginating 100 then 66 then an empty page.
+	if cliList.Load() != 18 || gotPages != "1=6 2=6 3=6" {
+		t.Fatalf("want complete-status 100+66+empty pagination for 6 columns; calls=%d pages=%s", cliList.Load(), gotPages)
 	}
 	// One HTTP GET per task id (fan-out), not sequential CLI.
 	if httpRels.Load() != int64(n) {
