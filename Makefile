@@ -34,7 +34,7 @@ check-go-toolchain:
 
 build: check-go-toolchain
 	@echo "==> Building herd binary..."
-	@./scripts/build-herd.zsh "$$(pwd -P)"
+	@./scripts/build-herd.sh "$$(pwd -P)"
 
 test: test-unit
 

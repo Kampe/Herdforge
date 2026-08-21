@@ -61,7 +61,7 @@ chmod +x "$out"
 				t.Fatal(err)
 			}
 			env := append(os.Environ(), "HERD_GO="+fakeGo, "HERD_EXPECTED_REV="+strings.TrimSpace(string(revBytes)))
-			cmd := exec.Command("zsh", filepath.Join(repoRoot(t), "scripts", "build-herd.zsh"), repo)
+			cmd := exec.Command("sh", filepath.Join(repoRoot(t), "scripts", "build-herd.sh"), repo)
 			cmd.Env = env
 			out, err := cmd.CombinedOutput()
 			if tc.fail && err == nil {
