@@ -86,16 +86,26 @@ func TestScopeKeepsNonReachabilityAuditBranch(t *testing.T) {
 	}
 }
 
-// Without a receipt oracle nothing can be proven a non-candidate, so
-// receipt-gated classes must stay in scope rather than be hidden.
-func TestScopeFailsOpenWithoutReceiptOracle(t *testing.T) {
+// Without a receipt oracle, CONTROL LANES cannot be proven non-candidates and
+// stay in scope: hiding a real candidate is worse than a slow scan. Agent
+// scratch is the declared exception -- excluded by default unless a receipt
+// names it. This test originally asserted the opposite for agent scratch, which
+// is how a scratch branch stayed in scope on a board with no receipts.
+func TestScopeFailsOpenForControlLanesOnly(t *testing.T) {
 	kept, skipped := ScopeDrainCandidates([]harvest.UnmergedWork{
 		{Branch: "standing/nft-data-engineer"},
 		{Branch: "herd/cha-1804"},
 		{Branch: "worktree-agent-abc"},
 	}, nil)
-	if len(kept) != 3 {
-		t.Fatalf("no oracle must keep receipt-gated branches, kept=%d skipped=%v", len(kept), skipped)
+	keptSet := map[string]bool{}
+	for _, k := range kept {
+		keptSet[k.Branch] = true
+	}
+	if !keptSet["standing/nft-data-engineer"] || !keptSet["herd/cha-1804"] {
+		t.Fatalf("control lanes must stay in scope without an oracle, kept=%v", keptSet)
+	}
+	if keptSet["worktree-agent-abc"] {
+		t.Fatalf("agent scratch is excluded by default, kept=%v skipped=%v", keptSet, skipped)
 	}
 }
 

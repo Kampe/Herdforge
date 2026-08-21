@@ -53,9 +53,11 @@ type HasCandidateReceipt func(w harvest.UnmergedWork) bool
 //     they are control-lane state.
 //   - recon/*, reconstruct/*, review/*, fix/*, and anything unrecognized: kept.
 func ScopeDrainCandidates(unmerged []harvest.UnmergedWork, hasReceipt HasCandidateReceipt) (kept []harvest.UnmergedWork, skipped []SkippedCandidate) {
+	oracleAvailable := hasReceipt != nil
 	if hasReceipt == nil {
-		// Without a receipt oracle, receipt-gated classes cannot be proven
+		// Without a receipt oracle, control-lane classes cannot be proven
 		// non-candidates. Keep them: a slow scan beats a hidden candidate.
+		// Agent scratch is the documented exception -- see scopeReason.
 		hasReceipt = func(harvest.UnmergedWork) bool { return true }
 	}
 	for _, w := range unmerged {
@@ -65,7 +67,7 @@ func ScopeDrainCandidates(unmerged []harvest.UnmergedWork, hasReceipt HasCandida
 			kept = append(kept, w)
 			continue
 		}
-		if reason, skip := scopeReason(branch, w, hasReceipt); skip {
+		if reason, skip := scopeReason(branch, w, hasReceipt, oracleAvailable); skip {
 			skipped = append(skipped, SkippedCandidate{Branch: branch, Reason: reason})
 			continue
 		}
@@ -75,7 +77,7 @@ func ScopeDrainCandidates(unmerged []harvest.UnmergedWork, hasReceipt HasCandida
 	return kept, skipped
 }
 
-func scopeReason(branch string, w harvest.UnmergedWork, hasReceipt HasCandidateReceipt) (string, bool) {
+func scopeReason(branch string, w harvest.UnmergedWork, hasReceipt HasCandidateReceipt, receiptOracleAvailable bool) (string, bool) {
 	lower := strings.ToLower(branch)
 
 	// Narrow on purpose: only audit branches that are reachability proofs. A
@@ -87,7 +89,11 @@ func scopeReason(branch string, w harvest.UnmergedWork, hasReceipt HasCandidateR
 		return SkipArchived, true
 	}
 	if strings.HasPrefix(lower, "worktree-agent-") {
-		if hasReceipt(w) {
+		// Declared rule: exclude BY DEFAULT unless an explicit receipt names it.
+		// The generic fail-open below is wrong for this class -- it kept an
+		// agent scratch branch in scope on a board with no readable receipts,
+		// which is exactly what the consumer reported. Default is exclude.
+		if receiptOracleAvailable && hasReceipt(w) {
 			return "", false
 		}
 		return SkipAgentScratch, true
@@ -110,4 +116,28 @@ func SummarizeSkips(skipped []SkippedCandidate) map[string]int {
 		out[s.Reason]++
 	}
 	return out
+}
+
+// CountTips returns how many TIPS a worktree set expands to.
+//
+// FAC-561: review-scan iterates one tip per unmerged SHA, not one per worktree.
+// A budget computed from the worktree count was therefore off by the average
+// commits-per-worktree: 54 in-scope worktrees expanded to 400 tips, so a
+// 54-item budget (2m42s) covered roughly an eighth of the actual work and the
+// scan could never finish. Callers must budget on this number.
+//
+// It is deliberately pure and I/O-free so it can be called before budgeting.
+func CountTips(unmerged []harvest.UnmergedWork) int {
+	seen := map[string]bool{}
+	n := 0
+	for _, u := range unmerged {
+		for _, sha := range u.Unmerged {
+			if sha == "" || seen[sha] {
+				continue
+			}
+			seen[sha] = true
+			n++
+		}
+	}
+	return n
 }

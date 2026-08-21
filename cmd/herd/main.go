@@ -7736,12 +7736,17 @@ func runDrainCommand(args []string, out, errOut io.Writer) int {
 			fmt.Fprintf(errOut, "herd-drain: scoped out %d worktree(s): %s\n", n, reason)
 		}
 	}
-	reviewTimeout := drainReviewTimeout(len(scanTargets))
+	// Budget on TIPS, not worktrees. review-scan iterates one tip per unmerged
+	// SHA, so a worktree-count budget was off by the average commits per
+	// worktree: 54 in-scope worktrees expanded to 400 tips, giving the scan
+	// roughly an eighth of the time it needed.
+	tipCount := review.CountTips(scanTargets)
+	reviewTimeout := drainReviewTimeout(tipCount)
 	reviewCtx, cancelReview := context.WithTimeout(context.Background(), reviewTimeout)
 	defer cancelReview()
 	if !*quiet {
-		fmt.Fprintf(errOut, "herd-drain: review-scan budget=%s for %d in-scope worktree(s) of %d scanned\n",
-			reviewTimeout, len(scanTargets), len(harvestResult.UnmergedWorktrees))
+		fmt.Fprintf(errOut, "herd-drain: review-scan budget=%s for %d tip(s) across %d in-scope worktree(s) of %d scanned\n",
+			reviewTimeout, tipCount, len(scanTargets), len(harvestResult.UnmergedWorktrees))
 	}
 	// Emit per-item progress with elapsed time so the REAL per-item cost is
 	// measurable from one run. Guessing budgets from the outside is what made
@@ -7765,8 +7770,8 @@ func runDrainCommand(args []string, out, errOut io.Writer) int {
 	reviewElapsed := time.Since(reviewStart).Round(time.Second)
 	if err != nil {
 		if reviewCtx.Err() != nil {
-			fmt.Fprintf(errOut, "herd-drain: review-scan exceeded its %s budget after %s for %d worktree(s) (harvest-scan took %s): %v\n",
-				reviewTimeout, reviewElapsed, len(scanTargets), harvestElapsed, reviewCtx.Err())
+			fmt.Fprintf(errOut, "herd-drain: review-scan exceeded its %s budget after %s for %d tip(s) (harvest-scan took %s): %v\n",
+				reviewTimeout, reviewElapsed, tipCount, harvestElapsed, reviewCtx.Err())
 			// The scan fails closed but hands back what it reached. Report the
 			// OBSERVED per-tip cost and a concrete override, so the next run is
 			// set from a measurement rather than another estimate.
@@ -7775,6 +7780,10 @@ func runDrainCommand(args []string, out, errOut io.Writer) int {
 					report.ScannedTips, report.TotalTips, perTipSeconds(reviewElapsed, report.ScannedTips))
 				fmt.Fprintf(errOut, "herd-drain: set HERD_DRAIN_REVIEW_PER_ITEM=%s to finish this board\n",
 					suggestPerItem(reviewElapsed, report.ScannedTips))
+				for _, slow := range report.SlowTips {
+					fmt.Fprintf(errOut, "herd-drain: SLOW tip exceeded its %s probe bound: branch=%s sha=%s\n",
+						slow.Budget, slow.Branch, slow.SHA)
+				}
 			} else {
 				fmt.Fprintf(errOut, "herd-drain: raise it with HERD_DRAIN_REVIEW_PER_ITEM (currently %s/worktree) or HERD_DRAIN_REVIEW_TIMEOUT\n",
 					drainReviewPerItem())
