@@ -52,3 +52,28 @@ func drainReviewTimeout(items int) time.Duration {
 	}
 	return budget
 }
+
+// perTipSeconds is the observed per-tip cost, used to report why a budget was
+// insufficient instead of leaving an operator to guess.
+func perTipSeconds(elapsed time.Duration, scanned int) float64 {
+	if scanned <= 0 {
+		return 0
+	}
+	return elapsed.Seconds() / float64(scanned)
+}
+
+// suggestPerItem turns an observed per-tip cost into a concrete override, with
+// headroom. Reporting a measured number beats asking an operator to guess, and
+// beats me guessing a default from the outside.
+func suggestPerItem(elapsed time.Duration, scanned int) time.Duration {
+	per := perTipSeconds(elapsed, scanned)
+	if per <= 0 {
+		return defaultDrainReviewPerItem
+	}
+	// 50% headroom, rounded up to the next second.
+	suggested := time.Duration((per*1.5)+0.999) * time.Second
+	if suggested < defaultDrainReviewPerItem {
+		return defaultDrainReviewPerItem
+	}
+	return suggested
+}

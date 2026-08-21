@@ -41,6 +41,10 @@ type PinFreshness struct {
 // Drain is the dependency-light coordinator scan. Board access is injected so
 // review remains usable in offline fixtures and cannot silently guess a board.
 type Drain struct {
+	// Progress, when set, is called before each tip is probed so a caller can
+	// measure real per-item cost instead of guessing a budget.
+	Progress func(done, total int, branch string)
+
 	RepoRoot, StateDir, LedgerPath, LedgerBin string
 	Cap, MaxRelaunch, StaleBehind             int
 	ArtifactDir                               string
@@ -52,6 +56,9 @@ type Drain struct {
 type Pipeline = Drain
 
 type DrainShas struct {
+	// ProbeUnknown could not be content-merge probed. Explicitly not merged and
+	// not harvestable: an unverifiable object must never be treated as either.
+	ProbeUnknown  []string `json:"probe_unknown_shas,omitempty"`
 	Harvestable   []string `json:"harvestable_shas"`
 	NeedReview    []string `json:"need_review_shas"`
 	ContentMerged []string `json:"content_merged_already_shas"`
@@ -64,6 +71,13 @@ type DrainShas struct {
 // drain scan. It is distinct from pulse.ReviewObservation.RawVetoed, which is
 // the review ledger's unfiltered, unexpired vetoed-SHA set.
 type DrainReport struct {
+	// ScanTruncated reports that the tip loop stopped on its deadline, so
+	// dispositions cover ScannedTips of TotalTips only. A truncated report must
+	// never be read as a complete drain decision.
+	ScanTruncated bool `json:"scan_truncated,omitempty"`
+	ScannedTips   int  `json:"scanned_tips,omitempty"`
+	TotalTips     int  `json:"total_tips,omitempty"`
+
 	WindDown                                                                                                                                                    bool `json:"wind_down"`
 	Pending, HarvestQueue, RefactoringCount, Harvestable, NeedReview, ReviewPass, HarvestReady, ContentMerged, KaneoInReview, Cap, RebaseNeeded, StaleBehindMax int
 	Pressure                                                                                                                                                    string `json:"pressure"`
@@ -257,7 +271,21 @@ func (d *Drain) Scan(ctx context.Context, unmerged []harvest.UnmergedWork) (*Dra
 	}
 	sort.Strings(r.Shas.ReviewPass)
 	r.ReviewPass = len(r.Shas.ReviewPass)
-	for _, u := range tips {
+	for i, u := range tips {
+		// FAC-560: the per-tip work is a git merge-tree probe, so this loop is
+		// the O(N) cost. Report progress and stop cleanly on deadline: the scan
+		// previously consumed its whole budget and returned nothing, so neither
+		// the operator nor I could measure the real per-item cost and every
+		// budget was a guess.
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			r.ScanTruncated = true
+			r.ScannedTips = i
+			r.TotalTips = len(tips)
+			return r, nil
+		}
+		if d.Progress != nil {
+			d.Progress(i, len(tips), u.Branch)
+		}
 		sha := u.Unmerged[0]
 		pin := d.freshness(ctx, sha, u.Branch, u.WorktreePath)
 		if u.WorktreePath == "" && queueLanes[sha] != "" {
@@ -268,7 +296,20 @@ func (d *Drain) Scan(ctx context.Context, unmerged []harvest.UnmergedWork) (*Dra
 		r.ActionEvidence = append(r.ActionEvidence, DrainActionEvidence{SHA: sha, Branch: pin.Branch, Lane: pin.Lane, BuilderFamily: strings.ToLower(strings.TrimSpace(record.BuilderFamily)), Tier: record.Tier, TierRecorded: strings.TrimSpace(record.Tier) != "", Pending: pendingSHA[sha], Vetoed: veto[sha]})
 		merged, probeErr := harvest.ContentMerged(ctx, d.RepoRoot, "origin/main", sha)
 		if probeErr != nil {
-			return nil, fmt.Errorf("content-merge probe for %s: %w", sha, probeErr)
+			// A cancelled context is the deadline, not a bad object.
+			if ctx.Err() != nil {
+				r.ScanTruncated = true
+				r.ScannedTips = i
+				r.TotalTips = len(tips)
+				return r, nil
+			}
+			// One unprobeable object must not abort the whole scan: a single
+			// bad SHA previously took down every other disposition. Record it
+			// as UNKNOWN -- never as merged or harvestable, which would be
+			// fail-open on the one thing we could not verify.
+			r.Errors = append(r.Errors, fmt.Sprintf("content-merge probe for %s: %v", sha, probeErr))
+			r.Shas.ProbeUnknown = append(r.Shas.ProbeUnknown, sha)
+			continue
 		}
 		if merged {
 			r.Shas.ContentMerged = append(r.Shas.ContentMerged, sha)
