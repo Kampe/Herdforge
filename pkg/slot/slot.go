@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -131,7 +132,7 @@ func (s *Semaphore) Acquire(ctx context.Context, purpose string, wait time.Durat
 			s.breakIfStale(dir)
 			if err := os.Mkdir(dir, 0o755); err == nil {
 				token := randomToken()
-				if err := writeHolder(filepath.Join(dir, "holder"), purpose, token); err != nil {
+				if err := writeHolder(filepath.Join(dir, "holder"), purpose, token, processStartToken(os.Getpid())); err != nil {
 					_ = os.Remove(dir)
 					return nil, fmt.Errorf("heavy-phase slots: write holder: %w", err)
 				}
@@ -219,17 +220,31 @@ func (s *Semaphore) breakIfStale(dir string) bool {
 	}
 	data, _ := os.ReadFile(filepath.Join(dir, "holder"))
 	pid := 0
+	startedAt := ""
 	for _, line := range strings.Split(string(data), "\n") {
-		if strings.HasPrefix(line, "pid=") {
-			pid, _ = strconv.Atoi(strings.TrimPrefix(line, "pid="))
-			break
+		if v, ok := strings.CutPrefix(line, "pid="); ok {
+			pid, _ = strconv.Atoi(v)
+		} else if v, ok := strings.CutPrefix(line, "start="); ok {
+			startedAt = v
 		}
 	}
 	if pid > 0 {
 		err = syscall.Kill(pid, 0)
 		if err == nil || errors.Is(err, syscall.EPERM) {
-			if time.Since(info.ModTime()) <= s.maxAge {
-				return false
+			// A live PID alone does not prove it's still the same process:
+			// the recorded holder's PID can have been reused by an unrelated
+			// process after the real holder exited. Cross-check the process
+			// start time recorded at acquire time; a mismatch (or a startup
+			// that can no longer be read back) means the original holder is
+			// gone, so the slot is reclaimed immediately instead of waiting
+			// out maxAge against a process that was never the true holder.
+			if startedAt != "" && processStartToken(pid) == startedAt {
+				if time.Since(info.ModTime()) <= s.maxAge {
+					return false
+				}
+			} else {
+				_ = os.RemoveAll(dir)
+				return true
 			}
 		} else if errors.Is(err, syscall.ESRCH) || errors.Is(err, syscall.EINVAL) {
 			_ = os.RemoveAll(dir)
@@ -243,9 +258,20 @@ func (s *Semaphore) breakIfStale(dir string) bool {
 	return false
 }
 
-func writeHolder(path, purpose, token string) error {
-	data := fmt.Sprintf("pid=%d\npurpose=%s\ntoken=%s\n", os.Getpid(), strings.ReplaceAll(purpose, "\n", " "), token)
+func writeHolder(path, purpose, token, startedAt string) error {
+	data := fmt.Sprintf("pid=%d\npurpose=%s\ntoken=%s\nstart=%s\n", os.Getpid(), strings.ReplaceAll(purpose, "\n", " "), token, startedAt)
 	return os.WriteFile(path, []byte(data), 0o644)
+}
+
+// processStartToken fingerprints a live PID by its process start time, the
+// same identity primitive pkg/toolchild uses to detect PID reuse. Returns ""
+// when the lookup fails, e.g. the PID is already gone.
+func processStartToken(pid int) string {
+	out, err := exec.Command("ps", "-p", strconv.Itoa(pid), "-o", "lstart=").Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
 }
 
 func randomToken() string {
