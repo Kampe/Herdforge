@@ -1774,6 +1774,12 @@ func runStandingConfigMode(cfg *config.Config, herdrAvailable bool, mode standin
 			_, err := exec.LookPath(harness)
 			return err == nil
 		},
+		// Loop mode comes from Herdforge's own durable hold store, never from
+		// the agent list: herdr emits no loop_mode field, so a held lane would
+		// otherwise always be reported as running.
+		LaneLoopMode: func(laneName string) (standing.LoopMode, error) {
+			return resolveLaneLoopMode(cfg, laneName)
+		},
 		CreateTab: func(workspace, label, cwd string) (standing.Tab, error) {
 			if lastAdmit.decision == nil || lastAdmit.lane == nil {
 				return standing.Tab{}, errors.New("standing tab create requires prior AdmitRoute decision")

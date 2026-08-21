@@ -15,6 +15,7 @@ import (
 	"github.com/Kampe/Herdforge/pkg/config"
 	"github.com/Kampe/Herdforge/pkg/dispatch"
 	"github.com/Kampe/Herdforge/pkg/lifecycle"
+	"github.com/Kampe/Herdforge/pkg/standing"
 	"github.com/Kampe/Herdforge/pkg/worktree"
 )
 
@@ -422,4 +423,45 @@ func parseHoldExpiry(raw string, now func() time.Time) (*time.Time, error) {
 	}
 	t := now().Add(d)
 	return &t, nil
+}
+
+// resolveLaneLoopMode reads a lane's loop contract from the durable hold store.
+//
+// FAC-524: standing previously took this from the live agent list, but herdr
+// emits no loop_mode field at all, so every lane defaulted to running and a
+// held lane was indistinguishable from an available one. Herdforge owns this
+// state, so it is read from Herdforge's own store.
+//
+// A lane with no configured loop is not an error: it has simply never been
+// given a standing contract, and reports an empty mode so the caller keeps its
+// existing default.
+func resolveLaneLoopMode(cfg *config.Config, laneName string) (standing.LoopMode, error) {
+	if cfg == nil {
+		return "", errors.New("hold configuration is required")
+	}
+	registry, err := canonicalLaneRegistry(cfg)
+	if err != nil {
+		return "", err
+	}
+	lane, err := resolveHoldLane(registry, laneName, true)
+	if err != nil {
+		return "", err
+	}
+	repository, err := holdRepository()
+	if err != nil {
+		return "", err
+	}
+	authority, err := newProductionHoldAuthority()
+	if err != nil {
+		return "", err
+	}
+	defer authority.Close()
+
+	state, err := authority.Loop(context.Background(),
+		lifecycle.HoldIdentity{Repository: repository, Owner: lane.Role, Lane: lane.Name, Scope: "lane"})
+	if err != nil {
+		// No configured loop for this lane; not a failure.
+		return "", nil
+	}
+	return standing.LoopMode(state.Mode), nil
 }

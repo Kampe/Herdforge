@@ -974,3 +974,52 @@ func TestNameHeldGateIsNonVacuous(t *testing.T) {
 		t.Fatalf("unknown status must not count as live skip; creates=%d", creates)
 	}
 }
+
+// TestStatusUsesDurableLoopModeWhenAgentReportsNone is the FAC-524 production
+// shape. Live herdr emits no loop_mode field, so an Agent carries an empty
+// mode and the sibling test above -- which injects the mode through the Agent
+// -- can pass while every real lane reports running and OutcomeHeld is
+// unreachable. Here the terminal plane says nothing and the durable hold store
+// is the only source of truth.
+func TestStatusUsesDurableLoopModeWhenAgentReportsNone(t *testing.T) {
+	for _, tt := range []struct {
+		name      string
+		durable   LoopMode
+		wantMode  LoopMode
+		wantState Outcome
+	}{
+		{name: "held", durable: LoopHeld, wantMode: LoopHeld, wantState: OutcomeHeld},
+		{name: "one-shot", durable: LoopOneShot, wantMode: LoopOneShot, wantState: OutcomeHeld},
+		{name: "running", durable: LoopRunning, wantMode: LoopRunning, wantState: OutcomeLive},
+		{name: "unconfigured falls back", durable: "", wantMode: LoopRunning, wantState: OutcomeLive},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			repo, cfg := standingFixture(t)
+			t.Chdir(repo)
+			opts := baseOpts(t, repo)
+			opts.Mode = ModeStatus
+			opts.Only = []string{"orch"}
+			opts.ListAgents = func() ([]Agent, error) {
+				return []Agent{{
+					// No LoopMode: exactly what herdr returns in production.
+					Name: testAgentName("orch"), Status: "idle",
+					TabID: "tab", PaneID: "pane", Workspace: "wTEST",
+					Cwd: filepath.Join(repo, ".worktrees", "orch"),
+				}}, nil
+			}
+			opts.LaneLoopMode = func(lane string) (LoopMode, error) {
+				if lane != "orch" {
+					t.Fatalf("loop mode resolved for unexpected lane %q", lane)
+				}
+				return tt.durable, nil
+			}
+			result, err := Run(cfg, opts)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(result.Roles) != 1 || result.Roles[0].LoopMode != tt.wantMode || result.Roles[0].Outcome != tt.wantState {
+				t.Fatalf("status role = %+v, want mode=%q outcome=%q", result.Roles, tt.wantMode, tt.wantState)
+			}
+		})
+	}
+}
