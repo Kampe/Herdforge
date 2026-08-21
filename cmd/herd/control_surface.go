@@ -14,7 +14,7 @@ import (
 // FAC-240: controlSurfaceVersion is a compatibility boundary, not a display
 // number. Any command-contract change must add its new fingerprint below and
 // increment this value; ValidateControlSurfaceManifest rejects silent drift.
-const controlSurfaceVersion = 11
+const controlSurfaceVersion = 12
 
 type commandClass string
 
@@ -48,7 +48,7 @@ type controlSurfaceManifest struct {
 // list only: validation rejects omissions and duplicate classifications.
 var commandNamesByClass = map[commandClass][]string{
 	classPublicAgent: {
-		"board-audit", "control-surface", "mail", "preflight", "preflight-static", "process", "resources", "route", "scope", "selftest", "status", "tests-for", "throughput", "timeline", "tool-probe", "transcript", "unmerged", "verify", "worktrees",
+		"board-audit", "candidate", "control-surface", "mail", "preflight", "preflight-static", "process", "resources", "route", "scope", "selftest", "status", "tests-for", "throughput", "timeline", "tool-probe", "transcript", "unmerged", "verify", "worktrees",
 	},
 	classCoordinatorOnly: {
 		"activate", "approve", "attention", "board-done", "board-freeze", "board-frozen", "board-sync", "claude-only", "cleanup", "command", "commands", "containers", "control", "daemon", "deps", "dispatch", "doctor-models", "drain", "feedback", "fence-provision", "forge", "fresh-build", "goal-guard", "harvest", "harvest-merge", "herdr-deliver", "hold", "kick", "labels", "legacy-receipts", "lifecycle", "lock", "lost", "merge-admit", "merge-complete", "next", "no-claude", "overlap", "park", "posture", "pulse", "quota", "quota-supervisor", "receipt", "repl", "rescue", "reset-safe", "resolve-lane", "review", "review-classify", "review-ingest", "review-ledger", "send", "sh", "shoot", "shot", "slot", "spin", "standing", "stop", "task", "up", "usage", "watch", "wave", "wind-down", "verify-fac151",
@@ -122,6 +122,8 @@ var controlSurfaceCompatibility = map[int]string{
 	10: "081f52ef2421bbe00e12b839d4e9d2ccc36298106f3c9876c73424ec8484e5b9",
 	// 11 adds the read-only `transcript` command (FAC-551).
 	11: "b51d4a5b08dd8a89c4ce71d12024b107dc311f6be0aa060622e8ef87cb7ff3e2",
+	// 12 adds the read-only `candidate` identity command (FAC-568).
+	12: "b71cf3414849949c33a93f940b5f5e4f053bf17f2e919c2b9a52e47f037a13b9",
 }
 
 func controlSurfaceFingerprint(m controlSurfaceManifest) (string, error) {
