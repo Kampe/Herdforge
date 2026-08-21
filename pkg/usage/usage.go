@@ -43,6 +43,9 @@ type grokAuthEntry struct {
 var openUsageBinary = findOpenUsageBinary()
 
 func findOpenUsageBinary() string {
+	if override := strings.TrimSpace(os.Getenv("HERD_OPENUSAGE_BIN")); override != "" {
+		return override
+	}
 	paths := []string{
 		"/Applications/OpenUsage.app/Contents/Helpers/openusage",
 	}
