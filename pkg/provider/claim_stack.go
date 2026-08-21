@@ -1,6 +1,7 @@
 package provider
 
 import (
+	"sync"
 	"context"
 	"errors"
 	"fmt"
@@ -375,8 +376,55 @@ func RequireTaskRole(task *Task, role string) (string, error) {
 // Unknown sole labels are NOT accepted (mid-repair #4).
 var knownImplementationRoles = []string{"forge-smith", "worker", "builder", "coder"}
 
+// FAC-567: the generic vocabulary above is not sufficient on a real board. A
+// consumer's card labelled backend-api -- a canonical implementation lane in
+// THAT repository -- was refused because the list only knows generic nouns, so
+// a legitimate fence could not be minted for a project role.
+//
+// projectImplementationRoles EXTENDS the generic set with the active
+// repository's configured roles. It deliberately does not replace it, and an
+// unknown label is still refused: the point is to teach the check this
+// repository's vocabulary, not to accept any label at all.
+var (
+	projectRolesMu          sync.RWMutex
+	projectImplementationRoles []string
+)
+
+// RegisterProjectImplementationRoles records repository-configured ownership
+// roles. Empty and duplicate entries are ignored. Passing nil clears them,
+// which restores the generic-only vocabulary.
+func RegisterProjectImplementationRoles(roles []string) {
+	projectRolesMu.Lock()
+	defer projectRolesMu.Unlock()
+	projectImplementationRoles = nil
+	seen := map[string]bool{}
+	for _, generic := range knownImplementationRoles {
+		seen[strings.ToLower(generic)] = true
+	}
+	for _, role := range roles {
+		key := strings.ToLower(strings.TrimSpace(role))
+		if key == "" || seen[key] {
+			continue
+		}
+		seen[key] = true
+		projectImplementationRoles = append(projectImplementationRoles, strings.TrimSpace(role))
+	}
+}
+
+// KnownImplementationRoles is the effective vocabulary: generic roles plus any
+// registered project roles. Error messages use this so an operator sees what
+// the check actually accepts rather than a partial list.
+func KnownImplementationRoles() []string {
+	projectRolesMu.RLock()
+	defer projectRolesMu.RUnlock()
+	out := make([]string, 0, len(knownImplementationRoles)+len(projectImplementationRoles))
+	out = append(out, knownImplementationRoles...)
+	out = append(out, projectImplementationRoles...)
+	return out
+}
+
 func isKnownImplementationRole(role string) bool {
-	for _, want := range knownImplementationRoles {
+	for _, want := range KnownImplementationRoles() {
 		if strings.EqualFold(want, role) {
 			return true
 		}
@@ -400,7 +448,7 @@ func TaskOwnershipRole(task *Task, preferred string) (string, error) {
 	}
 	if task == nil || len(task.Labels) == 0 {
 		if preferred == "" {
-			return "", fmt.Errorf("provider: unlabeled task requires known preferred ownership role (%v)", knownImplementationRoles)
+			return "", fmt.Errorf("provider: unlabeled task requires known preferred ownership role (%v)", KnownImplementationRoles())
 		}
 		return preferred, nil
 	}
@@ -411,14 +459,16 @@ func TaskOwnershipRole(task *Task, preferred string) (string, error) {
 			}
 		}
 	}
-	for _, want := range knownImplementationRoles {
+	for _, want := range KnownImplementationRoles() {
 		for _, l := range task.Labels {
 			if strings.EqualFold(l, want) {
 				return l, nil
 			}
 		}
 	}
-	return "", fmt.Errorf("provider: no recognized implementation role in labels %v (known %v; refuse unknown sole-label ownership)", task.Labels, knownImplementationRoles)
+	return "", fmt.Errorf("provider: no recognized implementation role in labels %v (known %v; refuse unknown sole-label ownership). "+
+		"Register this repository's roles in .herd/herd.yaml lanes, or add them to task_provider.implementation_roles",
+		task.Labels, KnownImplementationRoles())
 }
 
 // AcquireLease acquires a durable claim lease for taskRef. role and

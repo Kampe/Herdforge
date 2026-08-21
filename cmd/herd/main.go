@@ -1257,6 +1257,12 @@ func reportWorkspacePlacement() {
 // loadTaskProvider activates the configured board provider with FAC-150
 // deadlines via provider.NewFromHerdConfig. Non-Kaneo types error (FAC-155).
 func loadTaskProvider(cfg *config.Config) (provider.TaskProvider, error) {
+	// FAC-567: teach ownership-role resolution THIS repository's vocabulary.
+	// The generic set (forge-smith/worker/builder/coder) refused a card whose
+	// only label was a canonical project lane, so a legitimate fence could not
+	// be minted. This extends the set; it never replaces it, and an unknown
+	// label is still refused.
+	provider.RegisterProjectImplementationRoles(projectImplementationRoleVocabulary(cfg))
 	if cfg != nil && strings.EqualFold(strings.TrimSpace(cfg.TaskProvider.Type), "kaneo") {
 		if err := provider.PrepareRuntimeDefaults("."); err != nil {
 			return nil, err
