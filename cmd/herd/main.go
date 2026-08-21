@@ -3563,6 +3563,14 @@ func pendingApproveIntents(root string, signer *dispatch.Signer) ([]approveInten
 // switch refuses), the evidence SHA is the recorded one, and no fresh
 // intent is appended.
 func approveOne(ctx context.Context, cfg *config.Config, tp provider.TaskProvider, stack *provider.ClaimStack, root, ref, receiptPath, acceptanceEvidence string, override *hsync.OverrideRequest, resume *approveIntent) (*hsync.DoneResult, error) {
+	// FAC-563: an attributable override must not require the launch receipt it
+	// exists to replace. boundBoardProvider below demands one, so an override
+	// previously failed with "no usable launch receipt" before authorization was
+	// ever reached -- unusable for the pre-receipt and legacy cards it is for.
+	// Resume is receipt-bound crash recovery and is never an override.
+	if override != nil && resume == nil {
+		return approveByOverrideWithAcceptance(ctx, cfg, tp, root, ref, acceptanceEvidence, override)
+	}
 	btp, coord, err := boundBoardProvider(cfg, tp, root, ref)
 	if err != nil {
 		return nil, err
