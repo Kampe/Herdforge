@@ -1042,6 +1042,33 @@ func runHarvestVerifyLanded(branch string, binding verifyLandedBinding) error {
 	}
 	fmt.Printf("herd harvest-merge: LANDED — %s worktree is on origin/main (rebase + empty diff)\n", branch)
 
+	// FAC-565: record the landing as a durable OBSERVATION before attempting to
+	// mint a sealed receipt. A verdict admitted before the merge carries no
+	// merge_sha, and receipt reconcile needs pre-merge provenance that cannot be
+	// recovered afterwards -- so an already-merged candidate had no way to prove
+	// its merge disposition at all. This disposition is not a receipt and says
+	// so; it records only what git can still show.
+	if ref := strings.TrimSpace(binding.Ref); ref != "" {
+		// The landed merge is origin/main's tip at the moment landing was
+		// proven: LandedProof establishes the candidate is contained there.
+		mergeSHA := ""
+		if out, gErr := exec.Command("git", "rev-parse", "origin/main").Output(); gErr == nil {
+			mergeSHA = strings.TrimSpace(string(out))
+		}
+		if mergeSHA != "" {
+			if rec, wErr := hsync.WriteLandedDisposition(".", hsync.LandedDisposition{
+				Ref: ref, CandidateSHA: candidate, MergeSHA: mergeSHA,
+				Branch: branch, Method: hsync.LandedByRebaseEmptyDiff,
+			}); wErr != nil {
+				fmt.Fprintf(os.Stderr, "herd harvest-merge: landed disposition not recorded: %v\n", wErr)
+			} else {
+				fmt.Printf("herd harvest-merge: DISPOSITION — %s candidate %s landed as %s (%s)\n  %s\n",
+					rec.Ref, shortSHA12(rec.CandidateSHA), shortSHA12(rec.MergeSHA), rec.Method,
+					hsync.LandedPath(".", rec.Ref))
+			}
+		}
+	}
+
 	req, err := resolveVerifyLandedRequest(binding, candidate)
 	if err != nil {
 		return err
