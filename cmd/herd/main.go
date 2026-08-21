@@ -4685,12 +4685,18 @@ func runDispatchCancel() {
 		fmt.Fprintf(os.Stderr, "dispatch cancel: config: %v\n", err)
 		os.Exit(1)
 	}
-	repository, err := dispatch.AuthenticatedRepositoryIdentity(root)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "dispatch cancel: repository identity: %v\n", err)
-		os.Exit(1)
+	// The lease key MUST be built exactly as the acquiring side builds it.
+	// Cancel used AuthenticatedRepositoryIdentity while dispatch acquires with
+	// RepositoryIdentityOrName; those disagree (observed:
+	// "github.com/Kampe/Herdforge" vs "herdforge-c9c51e38..."), so the
+	// recovery command printed in the conflict error could never match its own
+	// lease and every stuck generation had to be cleared by hand.
+	key := claim.LeaseKey{
+		Repo:     dispatch.RepositoryIdentityOrName(root, cfg.Project.Name),
+		Provider: cfg.TaskProvider.Type,
+		Project:  cfg.TaskProvider.ProjectID,
+		TaskRef:  hsync.NormalizeRef(req.TicketRef),
 	}
-	key := claim.LeaseKey{Repo: repository, Provider: cfg.TaskProvider.Type, Project: cfg.TaskProvider.ProjectID, TaskRef: hsync.NormalizeRef(req.TicketRef)}
 	if err := releaseCoordinationLeaseBounded(root, key, "coordinator-dispatch", req.LeaseGeneration); err != nil {
 		fmt.Fprintf(os.Stderr, "dispatch cancel: release %s generation %d: %v\n", req.TicketRef, req.LeaseGeneration, err)
 		os.Exit(1)
