@@ -9,6 +9,8 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 
@@ -32,6 +34,50 @@ type HarvestResult struct {
 type Harvester struct {
 	repoRoot      string
 	DiskAdmission resources.DiskAdmission
+
+	// FAC-543: worktrees of one repository SHARE an object store and refs, so
+	// `git fetch origin main` from any of them updates origin/main for all.
+	// Fetching per worktree therefore did N identical network round-trips —
+	// 93 worktrees x ~0.9s made `unmerged --all` take ~41s and look hung to
+	// any caller with a sane timeout. Dedupe by git common dir so the fetch
+	// happens once per repository per Harvester.
+	fetchOnce sync.Map // common git dir -> *sync.Once
+	fetchErr  sync.Map // common git dir -> error
+}
+
+// fetchOriginMainOnce runs `git fetch origin main` at most once per repository
+// (keyed by git common dir) for this Harvester, returning the same result to
+// every caller that shares the store.
+func (h *Harvester) fetchOriginMainOnce(ctx context.Context, dir string) error {
+	key := dir
+	if out, err := func() ([]byte, error) {
+		c := execCommandContext(ctx, "git", "rev-parse", "--git-common-dir")
+		c.Dir = dir
+		return c.Output()
+	}(); err == nil {
+		if common := strings.TrimSpace(string(out)); common != "" {
+			if abs, absErr := filepath.Abs(filepath.Join(dir, common)); absErr == nil {
+				key = abs
+			} else {
+				key = common
+			}
+		}
+	}
+	onceAny, _ := h.fetchOnce.LoadOrStore(key, &sync.Once{})
+	once := onceAny.(*sync.Once)
+	once.Do(func() {
+		cmd := execCommandContext(ctx, "git", "fetch", "origin", "main")
+		cmd.Dir = dir
+		if err := cmd.Run(); err != nil {
+			h.fetchErr.Store(key, err)
+		}
+	})
+	if e, ok := h.fetchErr.Load(key); ok {
+		if err, isErr := e.(error); isErr {
+			return err
+		}
+	}
+	return nil
 }
 
 // preadmittedFetch is an internal capability minted only after the complete
@@ -126,10 +172,26 @@ func (h *Harvester) harvest(ctx context.Context, fetch bool) (*HarvestResult, er
 		if err := validateHarvestTokensAfterAdmission(items, batch, requirement); err != nil {
 			return nil, err
 		}
+		// FAC-543: bound the fan-out. Previously every eligible worktree was
+		// launched at once — measured at 87 concurrent `git` processes on a
+		// 93-worktree repo, which saturated the machine (514% CPU, 146s SYSTEM
+		// time from contention) and made `unmerged --all` take ~42s. Work is
+		// per-worktree independent, so a bounded pool does the same work
+		// without thrashing. Same defect family as FAC-481's unbounded drain.
+		limit := runtime.NumCPU()
+		if limit < 2 {
+			limit = 2
+		}
+		if limit > 8 {
+			limit = 8
+		}
+		sem := make(chan struct{}, limit)
 		for _, item := range items {
 			token := item.token
 			wg.Add(1)
+			sem <- struct{}{}
 			go func(item *harvestFetchItem, admission *preadmittedFetch) {
+				defer func() { <-sem }()
 				defer wg.Done()
 				u, err := h.checkUnmergedMode(ctx, item.canonicalPath, false, batchFetch, admission)
 				if err != nil {
@@ -405,9 +467,7 @@ func (h *Harvester) checkUnmergedMode(ctx context.Context, worktreePath string, 
 	}
 
 	if mode == directFetch || mode == batchFetch {
-		fetchCmd := execCommandContext(ctx, "git", "fetch", "origin", "main")
-		fetchCmd.Dir = effectivePath
-		if err := fetchCmd.Run(); err != nil && strict {
+		if err := h.fetchOriginMainOnce(ctx, effectivePath); err != nil && strict {
 			return nil, fmt.Errorf("git fetch origin main: %w", err)
 		}
 	}
