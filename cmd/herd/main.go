@@ -1853,7 +1853,9 @@ func runStandingConfigMode(cfg *config.Config, herdrAvailable bool, mode standin
 			case standing.OutcomePreview:
 				fmt.Printf("herd-standing: DRY %s %s\n", rr.AgentName, rr.Reason)
 			case standing.OutcomeLive:
-				fmt.Printf("herd-standing: live %s %s cwd=%s\n", rr.AgentName, rr.Reason, rr.CWD)
+				fmt.Printf("herd-standing: live %s loop=%s %s cwd=%s\n", rr.AgentName, rr.LoopMode, rr.Reason, rr.CWD)
+			case standing.OutcomeHeld:
+				fmt.Printf("herd-standing: HELD %s loop=%s %s cwd=%s\n", rr.AgentName, rr.LoopMode, rr.Reason, rr.CWD)
 			case standing.OutcomeMissing:
 				fmt.Printf("herd-standing: missing %s\n", rr.AgentName)
 			case standing.OutcomeUnraiseable:
