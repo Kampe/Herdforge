@@ -1,6 +1,7 @@
 package review
 
 import (
+	"errors"
 	"bufio"
 	"context"
 	"encoding/json"
@@ -45,6 +46,9 @@ type Drain struct {
 	// measure real per-item cost instead of guessing a budget.
 	Progress func(done, total int, branch string)
 
+	// ProbeBudget bounds ONE content-merge probe. Zero uses the default.
+	ProbeBudget time.Duration
+
 	RepoRoot, StateDir, LedgerPath, LedgerBin string
 	Cap, MaxRelaunch, StaleBehind             int
 	ArtifactDir                               string
@@ -67,7 +71,18 @@ type DrainShas struct {
 // DrainReport.NeedReview is the live unmerged-candidate set discovered by the
 // drain scan. It is distinct from pulse.ReviewObservation.RawVetoed, which is
 // the review ledger's unfiltered, unexpired vetoed-SHA set.
+// SlowTip is one tip whose probe blew the per-probe bound.
+type SlowTip struct {
+	Branch string `json:"branch"`
+	SHA    string `json:"sha"`
+	Budget string `json:"budget"`
+}
+
 type DrainReport struct {
+	// SlowTips are tips whose individual probe exceeded the per-probe bound.
+	// Named so a pathological object can be investigated directly.
+	SlowTips []SlowTip `json:"slow_tips,omitempty"`
+
 	// ScanTruncated reports that the tip loop stopped on its deadline, so
 	// dispositions cover ScannedTips of TotalTips only. A truncated report must
 	// never be read as a complete drain decision.
@@ -295,15 +310,45 @@ func (d *Drain) Scan(ctx context.Context, unmerged []harvest.UnmergedWork) (*Dra
 		r.Pins = append(r.Pins, pin)
 		record := records[sha]
 		r.ActionEvidence = append(r.ActionEvidence, DrainActionEvidence{SHA: sha, Branch: pin.Branch, Lane: pin.Lane, BuilderFamily: strings.ToLower(strings.TrimSpace(record.BuilderFamily)), Tier: record.Tier, TierRecorded: strings.TrimSpace(record.Tier) != "", Pending: pendingSHA[sha], Vetoed: veto[sha]})
-		merged, probeErr := harvest.ContentMerged(ctx, d.RepoRoot, "origin/main", sha)
+		// FAC-561: a single tip was observed consuming 1m56.294s while its peers
+		// were sub-second, eating a whole budget by itself. Each probe is
+		// therefore individually bounded: a pathological object is reported by
+		// name instead of silently starving every remaining tip.
+		probeCtx, cancelProbe := context.WithTimeout(ctx, d.probeBudget())
+		merged, probeErr := harvest.ContentMerged(probeCtx, d.RepoRoot, "origin/main", sha)
+		// Read the probe's own deadline state BEFORE cancelling it. cancel()
+		// sets Err() to Canceled, so checking after cancel reports every fast
+		// failure as a timeout -- which misclassified unprobeable objects as
+		// merely slow and broke the fail-closed contract.
+		probeTimedOut := errors.Is(probeCtx.Err(), context.DeadlineExceeded)
+		cancelProbe()
 		if probeErr != nil {
+			// Distinguish OUR per-probe bound from unknown git evidence. A slow
+			// object is a cost problem; an unprobeable object is an evidence
+			// problem, and only the latter may abort the scan.
+			if probeTimedOut && ctx.Err() == nil {
+				r.ScanTruncated = true
+				r.ScannedTips = i
+				r.TotalTips = len(tips)
+				r.SlowTips = append(r.SlowTips, SlowTip{Branch: u.Branch, SHA: sha, Budget: d.probeBudget().String()})
+				continue
+			}
+			// The OUTER deadline commonly lands inside a probe rather than at
+			// the top-of-loop check. Returning nil here is why the measured
+			// per-tip summary never printed for the consumer: the caller had no
+			// report to read. Fail closed with the error, but hand back the
+			// partial alongside it.
+			if ctx.Err() != nil {
+				r.ScanTruncated = true
+				r.ScannedTips = i
+				r.TotalTips = len(tips)
+				return r, ctx.Err()
+			}
 			// Unknown git evidence FAILS CLOSED. Continuing past an unprobeable
 			// object was tried and correctly rejected by
 			// TestPipelineContract_UnknownEvidenceFailsClosed: a disposition set
 			// built around an object we could not verify invites treating it as
 			// merged or harvestable, and that invariant outranks scan progress.
-			// The truncation report below covers the deadline case, which is a
-			// different failure.
 			r.ScannedTips, r.TotalTips = i, len(tips)
 			return nil, fmt.Errorf("content-merge probe for %s: %w", sha, probeErr)
 		}
@@ -602,4 +647,16 @@ func ResolveKaneoProject(root string) string {
 		return context.ProjectID
 	}
 	return context.Project
+}
+
+// defaultProbeBudget bounds a single content-merge probe. One observed tip took
+// 1m56s while its peers were sub-second, so an unbounded probe can starve every
+// remaining tip in the scan.
+const defaultProbeBudget = 20 * time.Second
+
+func (d *Drain) probeBudget() time.Duration {
+	if d.ProbeBudget > 0 {
+		return d.ProbeBudget
+	}
+	return defaultProbeBudget
 }
