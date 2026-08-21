@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/Kampe/Herdforge/pkg/outbox"
@@ -109,6 +110,21 @@ func operatorReadbackPolicy(key, target, session string) textdelivery.ReadbackPo
 // working; we still poll for sawWorking evidence and sequence tokens so the
 // durable receipt matches DeliverAndProve semantics.
 func waitForOperatorConsumption(ctx context.Context, key, target, session, baseline, payloadSHA string, timeout time.Duration) (operatorReadback, error) {
+	return waitForOperatorConsumptionText(ctx, key, target, session, baseline, payloadSHA, "", timeout)
+}
+
+// waitForOperatorConsumptionText additionally accepts the payload text so
+// consumption can be proven by OBSERVING it in the pane, not only by catching a
+// transient status transition.
+//
+// FAC-545: proving consumption from status alone is racy. A lane that is idle
+// ("done"), consumes the assignment quickly, and returns to "done" can pass
+// through "working" entirely between polls — the loop samples every 2s for a
+// long timeout — so sawWorking never becomes true and a genuinely consumed
+// assignment is reported queued-but-not-consumed. Chainseer demonstrated this
+// deterministically on an idle lane whose pane visibly contained both the
+// assignment and the agent's exact reply.
+func waitForOperatorConsumptionText(ctx context.Context, key, target, session, baseline, payloadSHA, payloadText string, timeout time.Duration) (operatorReadback, error) {
 	if timeout <= 0 {
 		timeout = 30 * time.Second
 	}
@@ -130,7 +146,13 @@ func waitForOperatorConsumption(ctx context.Context, key, target, session, basel
 			if st == "working" {
 				sawWorking = true
 			}
-			if ConsumptionProvenSeen(baseline, st, sawWorking) {
+			observed := false
+			if strings.TrimSpace(payloadText) != "" {
+				if pane, readErr := PaneRead(target, 200); readErr == nil && taskTextObserved(payloadText, pane) {
+					observed = true
+				}
+			}
+			if observed || ConsumptionProvenSeen(baseline, st, sawWorking) {
 				return operatorReadback{
 					Version:        1,
 					Key:            key,
@@ -225,7 +247,7 @@ func deliverOperator(ctx context.Context, d OperatorDelivery, executor textdeliv
 		// submission.  An immediate Enter makes the send-text/send-keys
 		// sequence reliable (FAC-388); status polling remains authoritative.
 		_ = SendKeys(d.Target, "Enter")
-		proof, err := waitForOperatorConsumption(execCtx, d.Key, d.Target, d.Session, baseline, textdelivery.Digest(body), timeout)
+		proof, err := waitForOperatorConsumptionText(execCtx, d.Key, d.Target, d.Session, baseline, textdelivery.Digest(body), string(body), timeout)
 		if err != nil {
 			return nil, err
 		}
