@@ -431,12 +431,24 @@ func (d *Dispatcher) reviewSupervisorName() string {
 	if d.Config == nil {
 		return standing.AgentName(laneName)
 	}
-	for _, role := range []string{"review-supervisor", "review_harvest_supervisor", "harvest-supervisor", "reviewer", "harvest"} {
+	// FAC-522: resolve only through roles authorized to ACT on the review
+	// queue. The previous order included "reviewer", so a board without an
+	// explicit supervisor lane addressed the review packet to a read-only
+	// reviewer, which then had to refuse the handoff it was sent.
+	for _, role := range reviewOwnerRoleOrder {
 		for _, lane := range d.Config.Lanes {
-			if strings.ToLower(strings.TrimSpace(lane.Role)) == role && strings.TrimSpace(lane.Name) != "" {
-				laneName = strings.TrimSpace(lane.Name)
-				goto resolved
+			if strings.ToLower(strings.TrimSpace(lane.Role)) != role || strings.TrimSpace(lane.Name) == "" {
+				continue
 			}
+			// Fail loudly rather than address an unauthorized owner. A
+			// misconfigured owner is reported, never silently delivered into a
+			// lane that must drop it.
+			if err := authorizeQueueOwner(lane.Name, lane.Role, "the review queue"); err != nil {
+				fmt.Fprintf(os.Stderr, "herd dispatch: %v\n", err)
+				continue
+			}
+			laneName = strings.TrimSpace(lane.Name)
+			goto resolved
 		}
 	}
 
