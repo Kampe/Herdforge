@@ -1808,7 +1808,19 @@ func runStandingConfigMode(cfg *config.Config, herdrAvailable bool, mode standin
 			for _, configured := range cfg.Lanes {
 				if configured.Name == lane {
 					envelope := standing.AuthorityEnvelopeForLane(configured)
-					return setDurableGoal(cwd, lane, task, owner, 1, &envelope)
+					if err := setDurableGoal(cwd, lane, task, owner, 1, &envelope); err != nil {
+						return err
+					}
+					// FAC-546: DECLARE the lane's loop at raise time. Without
+					// this, lifecycle_lane_loop has no row for the lane, and a
+					// lane-scoped `hold ... off` fails with "read declared
+					// loop: sql: no rows in result set" — so ReleaseAndRearm
+					// could never restore a goal and wakeup it was never told
+					// about. ConfigureLoop had no production caller at all,
+					// which made FAC-524's atomic re-arm unreachable in
+					// practice even though the code existed.
+					declareStandingLoop(configured, task)
+					return nil
 				}
 			}
 			return errors.New("standing authority envelope: lane not found")
@@ -1991,6 +2003,36 @@ func runUp() {
 // setDurableGoal replaces the lane-local goal atomically. Direct task launches
 // use this when no standing native role can be resolved, so their Stop hook has
 // the same durable lease-bound continuation contract as standing raises.
+// declareStandingLoop records the lane's DECLARED loop contract so a later
+// lane-scoped release can atomically restore it. Declaration is best-effort:
+// a lane must still raise if the lifecycle store is unavailable, and the
+// release path already fails closed when no declaration exists.
+func declareStandingLoop(lane config.LaneDef, task string) {
+	// A standing lane's wake contract is "keep running until an explicit stop",
+	// which is what the goal itself encodes; record it explicitly so release
+	// has a non-empty declared wakeup to restore.
+	wakeup := "standing"
+	goal := strings.TrimSpace(task)
+	if goal == "" {
+		return
+	}
+	repository, repoErr := holdRepository()
+	if repoErr != nil {
+		fmt.Fprintf(os.Stderr, "herd standing: loop declaration skipped for lane %q: %v\n", lane.Name, repoErr)
+		return
+	}
+	authority, err := newProductionHoldAuthority()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "herd standing: loop declaration unavailable for lane %q: %v\n", lane.Name, err)
+		return
+	}
+	defer authority.Close()
+	id := lifecycle.HoldIdentity{Repository: repository, Owner: lane.Role, Lane: lane.Name, Scope: "lane"}
+	if err := authority.ConfigureLoop(context.Background(), id, goal, wakeup); err != nil {
+		fmt.Fprintf(os.Stderr, "herd standing: could not declare loop for lane %q: %v\n", lane.Name, err)
+	}
+}
+
 func setDurableGoal(cwd, lane, task, owner string, generation int64, envelope *goalguard.AuthorityEnvelope) error {
 	self, err := os.Executable()
 	if err != nil {
