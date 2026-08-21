@@ -575,6 +575,42 @@ func TestStatusReportsLiveAndMissing(t *testing.T) {
 	}
 }
 
+func TestStatusExposesPerLaneLoopMode(t *testing.T) {
+	tests := []struct {
+		name      string
+		loopMode  LoopMode
+		wantMode  LoopMode
+		wantState Outcome
+	}{
+		{name: "running", loopMode: LoopRunning, wantMode: LoopRunning, wantState: OutcomeLive},
+		{name: "held", loopMode: LoopHeld, wantMode: LoopHeld, wantState: OutcomeHeld},
+		{name: "one-shot", loopMode: LoopOneShot, wantMode: LoopOneShot, wantState: OutcomeHeld},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			repo, cfg := standingFixture(t)
+			t.Chdir(repo)
+			opts := baseOpts(t, repo)
+			opts.Mode = ModeStatus
+			opts.Only = []string{"orch"}
+			opts.ListAgents = func() ([]Agent, error) {
+				return []Agent{{
+					Name: testAgentName("orch"), Status: "idle", LoopMode: tt.loopMode,
+					TabID: "tab", PaneID: "pane", Workspace: "wTEST",
+					Cwd: filepath.Join(repo, ".worktrees", "orch"),
+				}}, nil
+			}
+			result, err := Run(cfg, opts)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(result.Roles) != 1 || result.Roles[0].LoopMode != tt.wantMode || result.Roles[0].Outcome != tt.wantState {
+				t.Fatalf("status role = %+v, want mode=%q outcome=%q", result.Roles, tt.wantMode, tt.wantState)
+			}
+		})
+	}
+}
+
 func TestStatusScopesSameNamedAgentsToWorkspaceAndRepository(t *testing.T) {
 	repo, cfg := standingFixture(t)
 	t.Chdir(repo)
