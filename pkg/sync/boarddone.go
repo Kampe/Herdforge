@@ -227,6 +227,10 @@ type DoneRequest struct {
 	// Override is the manual authority: explicit, policy-limited,
 	// attributable, and appended to the append-only done log.
 	Override *OverrideRequest
+	// LegacyReview resolves admitted cross-family review evidence for cards
+	// groomed before herd-acceptance-v1 existed. Nil disables Route B, so the
+	// legacy path is opt-in by the caller rather than implicit.
+	LegacyReview LegacyReviewAuthority
 	// AcceptanceEvidence is the literal pasted output from every command in
 	// the card's herd-acceptance-v1 block. It is required for every closure,
 	// including policy-limited manual overrides.
@@ -293,8 +297,26 @@ func BoardDone(ctx context.Context, tp provider.TaskProvider, req DoneRequest) (
 	if strings.TrimSpace(evidence) == "" && req.Receipt != nil {
 		evidence = req.Receipt.AcceptanceEvidence
 	}
-	if err := ValidateAcceptanceEvidence(task.Description, evidence); err != nil {
+	// FAC-564: two authorization routes. A pre-existing acceptance block plus
+	// literal output (preferred), or -- for a legacy operator-external-merge
+	// override on a card that never had a block -- an admitted cross-family
+	// review artifact with a verified merge disposition. Requiring a post-hoc
+	// fence instead would make the closer author the contract after seeing the
+	// result, which is weaker evidence dressed as stricter process.
+	route, legacyEvidence, err := authorizeClosureEvidence(task.Description, evidence, override, req.LegacyReview, ref)
+	if err != nil {
 		return nil, fmt.Errorf("%w for %s: %v", ErrNoEvidence, ref, err)
+	}
+	if override != nil {
+		override.Route = route
+		if legacyEvidence != nil {
+			override.LegacyCandidateSHA = legacyEvidence.CandidateSHA
+			override.LegacyArtifact = legacyEvidence.Artifact
+			override.LegacyReviewer = legacyEvidence.Reviewer
+			override.LegacyReviewerFamily = legacyEvidence.ReviewerFamily
+			override.LegacyBuilderFamily = legacyEvidence.BuilderFamily
+			override.LegacyMergeSHA = legacyEvidence.MergeSHA
+		}
 	}
 
 	// Exactly-once: a receipt already recorded in the append-only done log

@@ -60,6 +60,11 @@ func approveByOverrideWithAcceptance(
 		return nil, fmt.Errorf("override approve: no override request")
 	}
 	req, closeAuthority, err := buildDoneRequest(root, cfg.TaskProvider.ProjectID, ref, "", acceptanceEvidence, override)
+	// Route B: admitted cross-family review evidence for cards groomed before
+	// herd-acceptance-v1 existed. Supplying the authority does not authorize
+	// anything by itself -- BoardDone still tries the acceptance block first and
+	// only falls through for a legacy-policy override on a card with no block.
+	req.LegacyReview = newLedgerLegacyReview(drainLedgerPath())
 	if err != nil {
 		closeAuthority()
 		return nil, err
