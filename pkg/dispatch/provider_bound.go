@@ -229,9 +229,30 @@ func formatBoardErr(op string, err error) error {
 // dispatch failed with BLOCKED(provider_timeout) while resolving a single ref.
 func (d *Dispatcher) listActiveTasksBound(ctx context.Context, projectID string) ([]*provider.Task, error) {
 	d.ensureDeadlinesApplied()
-	opCtx, cancel := provider.BoundOp(ctx, d.deadlines(), provider.OpList)
+	// The bound is SCALED to the fan-out, not applied as if this were one call.
+	// ListActiveTasks reads every active column, and each inner ListTasks
+	// already carries its own OpList deadline and read retry. Budgeting the
+	// whole fan-out with a single per-op deadline made it expire before columns
+	// that individually answered well inside their own budget, so dispatch
+	// failed to resolve a ref that was sitting on the board.
+	//
+	// It must still be bounded: removing the ceiling entirely lets a stalled
+	// provider hang the caller forever (pkg/dispatch hung to a 600s test
+	// timeout when this was unbounded).
+	opCtx, cancel := context.WithTimeout(ctx, activeFanOutDeadline(d.deadlines()))
 	defer cancel()
 	tasks, err := provider.ListActiveTasks(opCtx, d.TaskProvider, projectID)
 	d.health.observe(err)
 	return tasks, err
+}
+
+// activeFanOutDeadline is the per-column list budget multiplied by the number
+// of columns the fan-out reads, so a wider board gets proportionally more time
+// while the operation stays bounded. A caller deadline still wins.
+func activeFanOutDeadline(d provider.Deadlines) time.Duration {
+	columns := len(provider.ActiveStatuses())
+	if columns < 1 {
+		columns = 1
+	}
+	return d.For(provider.OpList) * time.Duration(columns)
 }
