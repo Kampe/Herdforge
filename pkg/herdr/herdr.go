@@ -1155,8 +1155,9 @@ func TabCreateForTask(workspaceID, label, cwd string, noFocus bool, env ...strin
 // lane's configured model MUST reach the launch argv or the agent silently
 // runs on the harness default (observed: worker lane configured for
 // deepseek-v4-flash launched on the opencode default instead).
-// Newly created tabs may need a brief moment before the pane shell is ready;
-// we sleep and retry once if herdr reports agent_pane_busy.
+// Newly created tabs may need several seconds before the pane shell is
+// ready, especially on AGY cold launches. Keep this shared so dispatch and
+// review-pool launches have identical readiness behavior.
 func AgentStart(name, kind string, paneID string, agentArgs ...string) error {
 	// Raw starts are the incident path. There is no trustworthy role, shape,
 	// provider, effort, or decision provenance in this API, so it can never
@@ -1259,6 +1260,21 @@ func AgentStartWithDecision(name, kind, paneID string, req launch.Request) error
 		}
 		_ = launch.RecordRejected(req, nil, err.Error())
 		return err
+	}
+	// AGY exits back to the shell when given the old --prompt-interactive
+	// contract. Probe the exact pane immediately after start so dispatch
+	// reports a launch failure and compensates the reserved tab instead of
+	// delivering a kickoff to a shell.
+	if req.Decision.Harness == "agy" {
+		observation, err := VerifyAgentLaunch(name, paneID, 3*time.Second)
+		if err != nil {
+			probeErr := fmt.Errorf("herdr AGY launch %s: %w (%s)", observation.State, err, observation.Reason)
+			if rollbackErr := rollbackToolChild(tabForPane(paneID), paneID, lc, "startup-probe-failed"); rollbackErr != nil {
+				probeErr = errors.Join(probeErr, rollbackErr)
+			}
+			_ = launch.RecordRejected(req, nil, probeErr.Error())
+			return probeErr
+		}
 	}
 	// FAC-172: prove shell/tree and exact routed agent credentials BEFORE
 	// binding tool-child inventory — a wrong-UID process must never become
@@ -1364,8 +1380,9 @@ func tabCloseRaw(tabID string) error {
 }
 
 func agentStartProcess(name, kind, paneID string, agentArgs ...string) error {
-	// small delay to let the pane shell initialize
-	time.Sleep(500 * time.Millisecond)
+	// A cold AGY tab was observed to require three seconds before its shell
+	// accepts agent start. The retries below remain useful under heavier load.
+	time.Sleep(3 * time.Second)
 
 	args := []string{"agent", "start", name, "--kind", kind, "--pane", paneID}
 	// FAC-172: daemon-hosted uid flags only from negotiated capability.
@@ -1389,7 +1406,7 @@ func agentStartProcess(name, kind, paneID string, agentArgs ...string) error {
 	// A freshly created tab's shell can take several seconds to become an
 	// available target on a loaded host (observed: dispatch launch failing
 	// with agent_pane_busy under swap pressure while the 1.5s retry gave up).
-	// Back off up to ~12s before failing.
+	// Back off up to ~15s before failing.
 	for attempt := 0; err != nil && strings.Contains(string(output), "agent_pane_busy") && attempt < 6; attempt++ {
 		time.Sleep(2 * time.Second)
 		output, err = runHerdr(args...)

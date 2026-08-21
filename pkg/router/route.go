@@ -464,7 +464,10 @@ func ArgvFor(provider, model, effort string) []string {
 		}
 		return compiled
 	case "agy":
-		return []string{"agy", "--model", model, "--prompt-interactive"}
+		// --prompt-interactive requires a prompt argument. Interactive fleet
+		// launches deliver the kickoff after the process is attached, so this
+		// flag makes AGY print help and exit instead of opening a session.
+		return []string{"agy", "--model", model, "--dangerously-skip-permissions"}
 	case "codex":
 		base := []string{"codex", "--model", model, "-c", "model_reasoning_effort=" + pe, "-a", "never", "-c", toolpolicy.CodexDisableCodeReviewGraph}
 		// FAC-173: multi_agent collaboration must be disabled before start.
