@@ -379,7 +379,7 @@ func (s *ProviderStore) SnapshotGraphForTask(ctx context.Context, taskRef Ref, t
 	if s == nil || s.TP == nil {
 		return nil, ErrCapabilityUnknown
 	}
-	if fence := FenceFrom(ctx); fence != nil {
+	if fence := FenceFrom(ctx); fence != nil && !migrationScopedSnapshot(ctx) {
 		if snap := fence.GetSnap(); snap != nil {
 			return snap, nil
 		}
@@ -496,7 +496,7 @@ func (s *ProviderStore) snapshotFromRelations(ctx context.Context, rels []provid
 		Edges:            out,
 		ProviderRevision: hex.EncodeToString(h.Sum(nil)),
 	}
-	if fence := FenceFrom(ctx); fence != nil {
+	if fence := FenceFrom(ctx); fence != nil && !migrationScopedSnapshot(ctx) {
 		fence.setSnap(snap)
 	}
 	return cloneSnapshot(snap), nil

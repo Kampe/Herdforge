@@ -231,9 +231,17 @@ func runDepsMigrate() {
 
 	// Default path: revision-fenced dry-run. Workers ship this; they never apply live.
 	if !*apply {
-		plan, perr := deps.PlanMigration(ctx, store, tp, cfg.TaskProvider.ProjectID)
+		totalCards, processedCards := 0, 0
+		plan, perr := deps.PlanMigrationWithProgress(ctx, store, tp, cfg.TaskProvider.ProjectID, func(item deps.MigrateItem, processed, total int) {
+			totalCards, processedCards = total, processed
+			fmt.Fprintf(os.Stderr, "herd deps migrate dry-run: processed %d/%d cards (current=%s action=%s)\n", processed, total, item.Ref, item.Action)
+		})
 		if perr != nil {
-			fmt.Fprintf(os.Stderr, "migrate dry-run: %v\n", perr)
+			fmt.Fprintf(os.Stderr, "migrate dry-run: partial progress migrated=%d remaining=%d: %v\n", processedCards, totalCards-processedCards, perr)
+			if *asJSON && plan != nil {
+				b, _ := json.MarshalIndent(plan, "", "  ")
+				fmt.Println(string(b))
+			}
 			os.Exit(1)
 		}
 		if *asJSON {
