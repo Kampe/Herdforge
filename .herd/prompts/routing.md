@@ -40,7 +40,10 @@ recipient's pane, so the recipient must read its durable inbox.
 ## Authority and routing
 
 - NEEDS_REVIEW, verdicts, retry findings, and cleanup candidates go only to the
-  standing review-harvest supervisor.
+  standing `review-supervisor` lane, which owns the review queue and addressed
+  handoffs. Keep this target aligned with the `review-supervisor` roster entry;
+  an addressed handoff must never be delivered to an unnamed or read-only
+  monitor.
 - The supervisor sends only exact PASS plus merge-ready evidence to the
   coordinator. The coordinator merges, approves, and closes finished panes.
 - No lane sets a board card done. Lanes send evidence; the coordinator projects
