@@ -7675,6 +7675,13 @@ func runDrainCommand(args []string, out, errOut io.Writer) int {
 	} else if !*asJSON {
 		fmt.Fprintf(errOut, "herd-drain: UNKNOWN Kaneo review-cap posture: %v\n", cfgErr)
 	}
+	// FAC-555: the two scans SHARE one budget, so harvest-scan consuming most
+	// of it left review-scan to die on the remainder -- reported live as
+	// harvest-scan immediately, review-scan at ~60s, deadline at ~120s, with no
+	// counts, identities, or partial results before failing. A bounded command
+	// that returns nothing actionable is indistinguishable from a broken one.
+	// Each phase is now timed and reports what it produced, and a timeout emits
+	// the partial that was already in hand.
 	if !*quiet {
 		fmt.Fprintln(errOut, "herd-drain: phase=harvest-scan")
 	}
@@ -7682,14 +7689,22 @@ func runDrainCommand(args []string, out, errOut io.Writer) int {
 	scanTimeout := drainScanTimeout()
 	scanCtx, cancelScan := context.WithTimeout(context.Background(), scanTimeout)
 	defer cancelScan()
+	harvestStart := time.Now()
 	harvestResult, err := h.HarvestReadOnly(scanCtx)
+	harvestElapsed := time.Since(harvestStart).Round(time.Second)
 	if err != nil {
 		if scanCtx.Err() != nil {
-			fmt.Fprintf(errOut, "herd-drain: bounded scan exceeded %s: %v\n", scanTimeout, scanCtx.Err())
+			fmt.Fprintf(errOut, "herd-drain: bounded scan exceeded %s during phase=harvest-scan after %s: %v\n",
+				scanTimeout, harvestElapsed, scanCtx.Err())
+			fmt.Fprintln(errOut, "herd-drain: partial=none — harvest-scan produced no result; raise the bound with HERD_DRAIN_TIMEOUT (e.g. HERD_DRAIN_TIMEOUT=6m) to see counts")
 		} else {
 			fmt.Fprintf(errOut, "herd-drain: %v\n", err)
 		}
 		return 1
+	}
+	if !*quiet {
+		fmt.Fprintf(errOut, "herd-drain: phase=harvest-scan done in %s: unmerged_worktrees=%d input_errors=%d\n",
+			harvestElapsed, len(harvestResult.UnmergedWorktrees), len(harvestResult.Errors))
 	}
 	harvestErrors := len(harvestResult.Errors) > 0
 	for _, harvestErr := range harvestResult.Errors {
@@ -7699,14 +7714,22 @@ func runDrainCommand(args []string, out, errOut io.Writer) int {
 	if !*quiet {
 		fmt.Fprintln(errOut, "herd-drain: phase=review-scan")
 	}
+	reviewStart := time.Now()
 	report, err := d.Scan(scanCtx, harvestResult.UnmergedWorktrees)
+	reviewElapsed := time.Since(reviewStart).Round(time.Second)
 	if err != nil {
 		if scanCtx.Err() != nil {
-			fmt.Fprintf(errOut, "herd-drain: bounded scan exceeded %s: %v\n", scanTimeout, scanCtx.Err())
+			fmt.Fprintf(errOut, "herd-drain: bounded scan exceeded %s during phase=review-scan after %s (harvest-scan used %s of the shared budget): %v\n",
+				scanTimeout, reviewElapsed, harvestElapsed, scanCtx.Err())
+			// Emit the partial already in hand instead of only the deadline.
+			emitDrainPartial(out, errOut, harvestResult, *asJSON)
 		} else {
 			fmt.Fprintf(errOut, "herd-drain: %v\n", err)
 		}
 		return 1
+	}
+	if !*quiet {
+		fmt.Fprintf(errOut, "herd-drain: phase=review-scan done in %s\n", reviewElapsed)
 	}
 	if cfgErr == nil {
 		for _, lane := range cfg.Lanes {
