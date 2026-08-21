@@ -62,18 +62,24 @@ dispatch and bound to one task/revision.
 | Harvest/integration owner | `harvest` | yes | serializes approved merges, reconciles the board, and cleans exact resources |
 | Recovery sentinel | `recovery-sentinel` | yes | detects lost callbacks, stale leases, root bleed, and stranded work |
 | Recovery (mender) | `mender` | yes | fixes the forge itself — the gates, evidence checks, and lifecycle bugs that cost the fleet whole sessions |
-| Worker | `smith` | no | implements a bounded task in an owned worktree |
+| Worker | `smith` | no | implements a bounded task in an owned worktree (codex `gpt-5.6-luna`) |
+| Worker | `smith-grok`, `smith-grok-2` | no | same worker contract, pinned to grok `grok-4.6` |
+| Worker | `smith-claude`, `smith-claude-2` | no | same worker contract, pinned to claude `claude-sonnet-5` |
 | Forge-smith | `scout` | no | surveys the board and grooms bare cards into dispatch-ready specs |
 | Reviewer | `assayer` | no | performs read-only, different-family review of an exact SHA |
 | Verification gate | `verification-gate` | no | runs deterministic checks and records evidence for an exact SHA |
 
-One lane per role is enforced: `CanonicalLaneRegistry` requires it so a lane may
-be resolved by either its name or its role unambiguously, and
-`validateLaneLaunchConfig` accepts eleven roles, pinning each to exactly one
-task shape. Adding a standing lane therefore needs a free role, not just a new
-config block — which is why the forge-repair lane is named `mender` and carries
-the `recovery` role. Ten of the eleven roles are occupied above; `assayer` is
-the one still free.
+`CanonicalLaneRegistry` enforces unique lane **names**, not one lane per role:
+several lanes may share a role, and the five worker lanes above do. Resolving a
+lane *by role* therefore returns the first match, so address a specific lane by
+name whenever more than one carries its role.
+
+Roles are still a fixed set — `validateLaneLaunchConfig` accepts eleven, pinning
+each to exactly one task shape — so a lane needs an existing role, not an
+invented one. That is why the forge-repair lane is named `mender` and carries the
+`recovery` role. Ten roles are occupied above; the unoccupied one is the
+`assayer` *role*, which is distinct from the lane named `assayer` (that lane
+carries the `reviewer` role).
 
 Worker, forge-smith, and recovery lanes have checked-in Codex/Luna defaults,
 but live routing may select another configured vendor harness and model. Pi is
@@ -81,11 +87,16 @@ not part of the supported fleet. Runtime model selection belongs to routing
 policy; author and reviewer must not be pinned to the same model family for
 R1–R3 work.
 
-Spawn-ready prompt contracts are in `.herd/prompts/`. Runtime model selection belongs to routing policy; author and reviewer must not be pinned to the same model family for R1–R3 work.
+The `smith-grok*` and `smith-claude*` lanes exist to make that guarantee
+schedulable rather than aspirational: each is pinned to one family, so the
+fleet can always place an author and a reviewer in different families even
+when one vendor is exhausted or cooled.
+
+Spawn-ready prompt contracts are in `.herd/prompts/`.
 
 ## Requirements
 
-- Go 1.24 or newer
+- Go 1.25 or newer (go.mod requires 1.25.0)
 - Git
 - Herdr
 - a configured task-provider CLI or API; Kaneo is the checked-in default
