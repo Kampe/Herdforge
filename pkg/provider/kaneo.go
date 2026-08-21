@@ -641,7 +641,19 @@ func (k *KaneoProvider) ListTasks(ctx context.Context, projectID string, status 
 		projectID = k.ProjectID
 	}
 	dls := k.deadlines()
-	ctx, cancel := WithOpDeadline(ctx, dls, OpList)
+	// An unfiltered read walks every column including the terminal ones. On a
+	// mature board that is irreducibly slow: this board's done column alone is
+	// 7 pages, and pages served concurrently slow to 14-30s each under load,
+	// putting a full read around 45s. The ordinary 30s list deadline is a
+	// filtered-read budget and cannot express that, so a whole-board read gets
+	// the same large-board allowance relation snapshots already use. A shorter
+	// caller deadline still wins, and filtered reads are unchanged.
+	listCtx, cancel := WithOpDeadline(ctx, dls, OpList)
+	if strings.TrimSpace(status) == "" {
+		cancel()
+		listCtx, cancel = context.WithTimeout(ctx, wholeBoardListDeadline(dls))
+	}
+	ctx = listCtx
 	defer cancel()
 
 	var tasks []*Task
@@ -790,7 +802,41 @@ func (k *KaneoProvider) walkStatusPages(ctx context.Context, projectID, listStat
 
 // fetchStatusPage reads exactly one page. It holds no shared state so pages
 // may be fetched concurrently; ordering decisions belong to the caller.
+// kaneoListSlots bounds how many kaneo CLI reads may be in flight across the
+// WHOLE process, not per column. Columns and pages are both fetched
+// concurrently, so an unbounded fan-out reached 24 simultaneous CLI processes
+// and the server began failing reads outright ("kaneo: exit status 1"). Six
+// keeps the overlap that removes the deadline pressure while staying inside
+// what the board tolerates.
+var kaneoListSlots = make(chan struct{}, 6)
+
+// wholeBoardListDeadline is the allowance for an unfiltered read. It never
+// shortens a configured list deadline that is already longer.
+func wholeBoardListDeadline(d Deadlines) time.Duration {
+	const wholeBoardMinimum = 3 * time.Minute
+	if configured := d.For(OpList); configured > wholeBoardMinimum {
+		return configured
+	}
+	return wholeBoardMinimum
+}
+
+func acquireKaneoListSlot(ctx context.Context) error {
+	select {
+	case kaneoListSlots <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func releaseKaneoListSlot() { <-kaneoListSlots }
+
 func (k *KaneoProvider) fetchStatusPage(ctx context.Context, projectID, listStatus string, page, pageSize int) ([]kaneoTaskDTO, error) {
+	if err := acquireKaneoListSlot(ctx); err != nil {
+		return nil, AsTimeout("kaneo", "ListTasks", OpList, k.deadlines().For(OpList), err)
+	}
+	defer releaseKaneoListSlot()
+
 	args := []string{"task", "list", "--project", projectID, "--json",
 		"--limit", fmt.Sprint(pageSize), "--page", fmt.Sprint(page), "--status", listStatus}
 	res, err := kaneoRunCLI(ctx, "kaneo", args...)
