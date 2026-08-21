@@ -152,6 +152,12 @@ func finishBoardDone(out io.Writer, res *hsync.DoneResult, release func(string))
 func runBoardAudit() {
 	fs := flag.NewFlagSet("board-audit", flag.ExitOnError)
 	asJSON := fs.Bool("json", false, "Emit findings as JSON")
+	// FAC-553: 528 undifferentiated findings is not a control. The baseline
+	// separates inherited damage from a fresh bypass so the actionable count
+	// starts at zero and any increase is a real regression.
+	newOnly := fs.Bool("new-only", false, "Report only violations that are not in the accepted baseline")
+	acceptBaseline := fs.Bool("accept-baseline", false, "Record the current unclosed set as inherited-historical (requires --actor)")
+	actor := fs.String("actor", "", "Who is accepting the baseline, for attribution")
 	fs.Parse(os.Args[2:])
 
 	cfg, err := config.LoadConfig(".herd/herd.yaml")
@@ -178,13 +184,55 @@ func runBoardAudit() {
 			fmt.Fprintf(os.Stderr, "herd board-audit: %v\n", err)
 			os.Exit(1)
 		}
-	} else {
-		for _, f := range findings {
-			fmt.Printf("%-16s [%s] %s\n  %s\n", f.Kind, f.Ref, f.Title, f.Detail)
+		if len(findings) > 0 {
+			os.Exit(3)
 		}
-		fmt.Printf("\nherd board-audit: %d done card(s) not closed by a completion receipt\n", len(findings))
+		return
 	}
-	if len(findings) > 0 {
+
+	baseline, baseErr := hsync.ReadAuditBaseline(".")
+	if baseErr != nil {
+		// Fail closed: a corrupt baseline must not degrade to "all historical".
+		fmt.Fprintf(os.Stderr, "herd board-audit: %v\n", baseErr)
+		os.Exit(1)
+	}
+
+	if *acceptBaseline {
+		ids := make([]string, 0, len(findings))
+		for _, f := range findings {
+			if f.Kind != hsync.AuditOverride {
+				ids = append(ids, f.TaskID)
+			}
+		}
+		written, werr := hsync.WriteAuditBaseline(".", *actor, ids)
+		if werr != nil {
+			fmt.Fprintf(os.Stderr, "herd board-audit: %v\n", werr)
+			os.Exit(1)
+		}
+		fmt.Printf("herd board-audit: accepted %d inherited finding(s) as baseline (actor=%s at %s)\n",
+			len(written.TaskIDs), written.Actor, written.CapturedAt)
+		fmt.Println("  This is NOT evidence of completion. New bypasses now report as violations.")
+		return
+	}
+
+	violations, historical := hsync.PartitionFindings(findings, baseline)
+
+	for _, f := range violations {
+		fmt.Printf("%-16s [%s] %s\n  %s\n", f.Kind, f.Ref, f.Title, f.Detail)
+	}
+	if !*newOnly {
+		for _, f := range historical {
+			fmt.Printf("%-16s [%s] %s (inherited)\n  %s\n", f.Kind, f.Ref, f.Title, f.Detail)
+		}
+	}
+	fmt.Printf("\nherd board-audit: %d new violation(s), %d inherited\n", len(violations), len(historical))
+	if baseline == nil {
+		fmt.Println("  No baseline accepted yet, so every finding counts as new.")
+		fmt.Println("  Accept the inherited set once: herd board-audit --accept-baseline --actor <who>")
+	}
+	// Exit non-zero only on NEW violations. A permanently red audit trains
+	// operators to ignore it, which is how 528 findings accumulated.
+	if len(violations) > 0 {
 		os.Exit(3)
 	}
 }
