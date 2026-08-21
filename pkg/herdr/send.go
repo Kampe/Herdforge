@@ -209,20 +209,54 @@ func formatSendResult(target, workspace, status string) string {
 // mandatory at the call site, which prevents old pane text from proving a new
 // delivery.
 func taskTextObserved(text, pane string) bool {
-	if strings.TrimSpace(text) == "" || strings.Contains(pane, text) {
-		return strings.TrimSpace(text) == "" || strings.Contains(pane, text)
+	if strings.TrimSpace(text) == "" {
+		return true
 	}
+	if strings.Contains(pane, text) {
+		return true
+	}
+
+	// FAC-544: pane readback WRAPS long lines, so an exact substring match
+	// fails for text the agent genuinely received. Compare with whitespace
+	// normalised on both sides. Without this, every PROSE assignment — which
+	// is what a standing goal prompt is — was reported queued-but-not-consumed
+	// even after the agent had visibly acted on it, and that broke
+	// `standing --only <lane>` outright.
+	normPane := normalizeForObservation(pane)
+	if norm := normalizeForObservation(text); norm != "" && strings.Contains(normPane, norm) {
+		return true
+	}
+
+	// A long packet may also be clipped from the recent tail. Match the
+	// longest distinctive normalised line instead of requiring the whole body.
+	best := ""
+	for _, raw := range strings.Split(text, "\n") {
+		line := normalizeForObservation(strings.TrimLeft(strings.TrimSpace(raw), "`>*-0123456789. )\t"))
+		if len(line) > len(best) {
+			best = line
+		}
+	}
+	if len(best) >= 12 && strings.Contains(normPane, best) {
+		return true
+	}
+
 	for _, raw := range strings.Split(text, "\n") {
 		line := strings.TrimSpace(raw)
 		line = strings.TrimLeft(line, "`>*-0123456789. )\t")
 		if len(line) < 4 || !isExecutableTaskLine(line) {
 			continue
 		}
-		if strings.Contains(pane, line) {
+		if strings.Contains(pane, line) || strings.Contains(normPane, normalizeForObservation(line)) {
 			return true
 		}
 	}
 	return false
+}
+
+// normalizeForObservation collapses every whitespace run to a single space so
+// wrapped pane output compares equal to the unwrapped source text.
+func normalizeForObservation(s string) string {
+	return strings.Join(strings.Fields(s), " ")
 }
 
 func isExecutableTaskLine(line string) bool {
