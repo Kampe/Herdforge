@@ -1,18 +1,23 @@
-#!/bin/zsh
+#!/bin/sh
 
 # Build herd without ever truncating an executable that a live lane may be
 # running. The temporary output and both final paths are on the repository
 # filesystem, so each rename is atomic for readers.
-set -euo pipefail
+#
+# FAC-542: POSIX sh, not zsh. This script is invoked by `make build`, which
+# also runs inside CI containers that have no zsh — there it died with
+# `./scripts/build-herd.zsh: not found` (exit 127), failing the hermetic
+# profile before any build happened.
+set -eu
 
 root=${1:-$(pwd -P)}
 root=$(cd "$root" && pwd -P)
-top=$(git -C "$root" rev-parse --show-toplevel 2>/dev/null) || {
-  print -u2 "build refused: Git toplevel does not resolve from the build directory"
+if ! top=$(git -C "$root" rev-parse --show-toplevel 2>/dev/null); then
+  printf '%s\n' "build refused: Git toplevel does not resolve from the build directory" >&2
   exit 1
-}
-if [[ "$top" != "$root" ]]; then
-  print -u2 "build refused: Git toplevel $top does not match build directory $root"
+fi
+if [ "$top" != "$root" ]; then
+  printf '%s\n' "build refused: Git toplevel $top does not match build directory $root" >&2
   exit 1
 fi
 
@@ -21,7 +26,7 @@ rev=$(git -C "$root" rev-parse HEAD)
 now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 tmp=$(mktemp "$root/bin/.herd.XXXXXX")
 link=$(mktemp "$root/.herd-link.XXXXXX")
-cleanup() { rm -f "$tmp" "$link" }
+cleanup() { rm -f "$tmp" "$link"; }
 trap cleanup EXIT INT TERM
 
 go_cmd=${HERD_GO:-go}
@@ -30,7 +35,7 @@ go_cmd=${HERD_GO:-go}
   -o "$tmp" ./cmd/herd
 
 if ! "$tmp" --version | grep -F "revision $rev" >/dev/null; then
-  print -u2 "build refused: temporary herd failed provenance check"
+  printf '%s\n' "build refused: temporary herd failed provenance check" >&2
   exit 1
 fi
 
