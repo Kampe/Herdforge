@@ -340,6 +340,7 @@ func readPulseHerdr(ctx context.Context, doneRefs map[string]bool) pulse.HerdrOb
 			ForegroundProcess: processName,
 			TabID:             a.TabID,
 			Workspace:         a.Workspace,
+			Worktree:          a.Cwd,
 			TabGeneration:     a.TabGeneration,
 			TabRevision:       a.Revision,
 		}
@@ -895,7 +896,10 @@ func (a *livePulseActor) OpenReview(ctx context.Context, lane pulse.AgentObserva
 	if live, listErr := herdrStandingAgents(); listErr == nil {
 		target = standing.LiveAgentName(live, supervisor.Name, repositoryIdentityForLaunch(cfg))
 	}
-	packet := pulseReviewPacket(lane)
+	// Resolve exact identity here, from git, rather than asking the receiver to
+	// re-derive it from a tab id.
+	commits, resolveErr := harvest.UnlandedCommits(context.Background(), lane.Worktree, "origin/main")
+	packet := pulseReviewPacket(lane, harvest.SubstantiveCommits(commits), resolveErr)
 	if _, err := herdr.Send(target, packet, true, 30*time.Second); err != nil {
 		return fmt.Errorf("pulse: notify review supervisor %s: %w", target, err)
 	}
@@ -921,6 +925,49 @@ func herdrStandingAgents() ([]standing.Agent, error) {
 	return out, nil
 }
 
-func pulseReviewPacket(lane pulse.AgentObservation) string {
-	return fmt.Sprintf("PULSE REVIEW HANDOFF\nLane: %s\nTab: %s\nWorkspace: %s\n\nInspect this finished lane's exact worktree and candidate receipt. Admit and review only an exact candidate SHA with valid verification evidence. You own reviewer dispatch, retries, verdict ingest, and reviewer-pane cleanup; send only a merge-ready PASS handoff to the coordinator. Do not ask the coordinator to perform review work.", lane.Name, lane.TabID, lane.Workspace)
+// pulseReviewPacket builds the handoff body.
+//
+// FAC-566: this used to carry ONLY lane, tab and workspace. A receiver could not
+// confirm the handoff was still valid, and a lane holding several unlanded
+// commits collapsed into one ambiguous assertion -- one observed lane had 29
+// unlanded commits against 8 already patch-equivalent, which a tab-level handoff
+// cannot express. A stale resident transcript in the target pane then made the
+// wrong candidate look plausible.
+//
+// The exact unlanded commits are named. When none can be resolved the packet
+// SAYS SO rather than implying a candidate exists: an unverifiable handoff must
+// not read like a verified one.
+func pulseReviewPacket(lane pulse.AgentObservation, commits []harvest.UnlandedCommit, resolveErr error) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "PULSE REVIEW HANDOFF\nLane: %s\nTab: %s\nWorkspace: %s\nWorktree: %s\n",
+		lane.Name, lane.TabID, lane.Workspace, lane.Worktree)
+
+	switch {
+	case resolveErr != nil:
+		fmt.Fprintf(&b, "\nCANDIDATES: UNRESOLVED — %v\n", resolveErr)
+		b.WriteString("Do not treat this as a candidate assertion. Resolve identity in the worktree before admitting anything.\n")
+	case len(commits) == 0:
+		b.WriteString("\nCANDIDATES: NONE unlanded (every commit is already on origin/main by patch identity).\n")
+		b.WriteString("This handoff carries no reviewable work; do not open a review for it.\n")
+	default:
+		fmt.Fprintf(&b, "\nCANDIDATES: %d commit(s) genuinely not on origin/main (patch-equivalent commits excluded):\n", len(commits))
+		for _, c := range commits {
+			fmt.Fprintf(&b, "  %s  %s\n", c.SHA, c.Subject)
+		}
+		if len(commits) > 1 {
+			b.WriteString("\nEach needs its own receipt. Do NOT treat the branch tip as one harvestable candidate.\n")
+		}
+	}
+
+	b.WriteString("\nAdmit and review only an exact candidate SHA from the list above, with a valid " +
+		"cross-family verdict. Ignore any stale transcript in the target pane: the list above is " +
+		"computed fresh from git, the pane is not.\n")
+	// Responsibility assignment, preserved verbatim in intent from the original
+	// packet. Rewriting the body dropped it once, and the existing test caught
+	// that: the supervisor owns the review lifecycle end to end, and the
+	// coordinator is not a fallback for any part of it.
+	b.WriteString("\nYou own candidate discovery, receipt admission, reviewer dispatch, retries, " +
+		"verdict ingest, and reviewer-pane cleanup. Do not ask the coordinator to perform any " +
+		"of them.\n")
+	return b.String()
 }
