@@ -1,6 +1,7 @@
 package main
 
 import (
+	"github.com/Kampe/Herdforge/pkg/harvest"
 	"context"
 	cryptorand "crypto/rand"
 	"encoding/hex"
@@ -849,22 +850,23 @@ func gitRevParse(cwd, ref string) (string, error) {
 	return strings.TrimSpace(string(out)), nil
 }
 
-// hasCommittedWork reports whether the worktree at cwd has at least one
-// commit ahead of origin/main whose subject is not an anchor or wip marker.
-// Git errors return false (fail closed — no evidence of committed work).
+// hasCommittedWork reports whether the worktree at cwd holds work that is
+// genuinely not on origin/main -- not merely absent from its ancestry.
+//
+// FAC-576: this used `git log origin/main..HEAD`, which is ancestry-only. A
+// rebase-merge rewrites the SHA, so landed work is never an ancestor and the
+// lane looked unlanded forever. Pulse re-emitted a candidate that had already
+// been reviewed and merged as an equivalent patch, and `herd candidate` was
+// meanwhile reporting it already-on-main -- the same question answered two ways.
+//
+// Patch-equivalence now comes from harvest.UnlandedSubjects, the single
+// definition. Git errors fail closed: no evidence of unlanded work.
 func hasCommittedWork(cwd string) bool {
-	out, err := exec.Command("git", "-C", cwd, "log", "--format=%s", "origin/main..HEAD").Output()
+	subjects, err := harvest.UnlandedSubjects(context.Background(), cwd, "origin/main")
 	if err != nil {
 		return false
 	}
-	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
-		subj := strings.TrimSpace(line)
-		if subj == "" || strings.HasPrefix(subj, "chore: anchor") || strings.HasPrefix(subj, "wip:") {
-			continue
-		}
-		return true
-	}
-	return false
+	return len(harvest.SubstantiveSubjects(subjects)) > 0
 }
 
 func (a *livePulseActor) OpenReview(ctx context.Context, lane pulse.AgentObservation) error {
