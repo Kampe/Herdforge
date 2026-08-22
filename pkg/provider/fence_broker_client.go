@@ -64,7 +64,7 @@ func NewFenceBrokerClientFromEnv() (*FenceBrokerClient, error) {
 func (c *FenceBrokerClient) bindURL(url string) error {
 	if strings.HasPrefix(url, "unix://") {
 		c.UnixSocket = strings.TrimPrefix(url, "unix://")
-		c.BaseURL = "http://unix"
+		c.BaseURL = unixBaseURL
 		return nil
 	}
 	if strings.HasPrefix(url, "http://") || strings.HasPrefix(url, "https://") {
@@ -314,7 +314,7 @@ func NewFenceBrokerClientForTest(b *FenceBroker) *FenceBrokerClient {
 	c := &FenceBrokerClient{Token: b.token}
 	if sock := b.UnixSocket(); sock != "" {
 		c.UnixSocket = sock
-		c.BaseURL = "http://unix"
+		c.BaseURL = unixBaseURL
 	} else {
 		c.BaseURL = b.ClientBaseURL()
 	}

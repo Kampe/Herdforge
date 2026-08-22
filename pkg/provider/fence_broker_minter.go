@@ -82,24 +82,43 @@ func NewFenceBrokerMinterFromClaimDir(claimDir, brokerURL string) (*FenceBrokerM
 		return nil, err
 	}
 	// Refuse if env still carries mint secret (worker leakage) — scrub first.
-	if envTok := strings.TrimSpace(os.Getenv(envFenceBrokerMintToken)); envTok != "" {
-		if envTok == secret {
-			return nil, fmt.Errorf("provider: mint secret present in env (worker leakage); call ScrubWorkerMintEnv / refuse shared env")
-		}
-		// Env has different token — still refuse env-based authority.
-		return nil, fmt.Errorf("provider: refuse minter while %s is set in environment (scrub worker env)", envFenceBrokerMintToken)
+	if envTok := strings.TrimSpace(os.Getenv(envFenceBrokerMintToken)); envTok != "" && envTok == secret {
+		return nil, fmt.Errorf("provider: mint secret present in env (worker leakage); call ScrubWorkerMintEnv / refuse shared env")
 	}
-	if brokerURL == "" {
-		brokerURL = strings.TrimSpace(os.Getenv(envFenceBrokerURL))
+	if err := refuseEnvMintLeak(); err != nil {
+		return nil, err
 	}
-	if brokerURL == "" {
-		return nil, fmt.Errorf("provider: broker URL required for minter")
+	brokerURL, err = resolveMinterBrokerURL(brokerURL)
+	if err != nil {
+		return nil, err
 	}
 	m := &FenceBrokerMinter{mintSecret: secret, claimDir: abs}
 	if err := m.bindURL(brokerURL); err != nil {
 		return nil, err
 	}
 	return m, nil
+}
+
+// refuseEnvMintLeak refuses whenever mint material is present in the process
+// environment. One definition, because both constructors enforce it and a copy
+// that drifted would silently accept an env-forged authority.
+func refuseEnvMintLeak() error {
+	if strings.TrimSpace(os.Getenv(envFenceBrokerMintToken)) != "" {
+		return fmt.Errorf("provider: refuse minter while %s is set in environment (scrub worker env)", envFenceBrokerMintToken)
+	}
+	return nil
+}
+
+// resolveMinterBrokerURL applies the single rule for where a minter's broker
+// endpoint comes from: the explicit argument, else the environment, else refuse.
+func resolveMinterBrokerURL(explicit string) (string, error) {
+	if url := strings.TrimSpace(explicit); url != "" {
+		return url, nil
+	}
+	if url := strings.TrimSpace(os.Getenv(envFenceBrokerURL)); url != "" {
+		return url, nil
+	}
+	return "", fmt.Errorf("provider: broker URL required for minter")
 }
 
 func readMintCredentialFile(path string) (string, error) {
@@ -128,7 +147,7 @@ func readMintCredentialFile(path string) (string, error) {
 func (m *FenceBrokerMinter) bindURL(url string) error {
 	if strings.HasPrefix(url, "unix://") {
 		m.unixSocket = strings.TrimPrefix(url, "unix://")
-		m.baseURL = "http://unix"
+		m.baseURL = unixBaseURL
 		return nil
 	}
 	if strings.HasPrefix(url, "http://") || strings.HasPrefix(url, "https://") {
@@ -263,7 +282,7 @@ func newMinterForTest(b *FenceBroker) *FenceBrokerMinter {
 	m := &FenceBrokerMinter{mintSecret: b.mintToken, claimDir: b.claimDir}
 	if sock := b.UnixSocket(); sock != "" {
 		m.unixSocket = sock
-		m.baseURL = "http://unix"
+		m.baseURL = unixBaseURL
 	} else {
 		m.baseURL = b.ClientBaseURL()
 	}

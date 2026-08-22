@@ -32,6 +32,9 @@ const (
 	envFenceBrokerListen    = "HERD_FENCE_BROKER_LISTEN"
 	brokerLockLeaf          = "fence-broker.lock"
 	brokerSockLeaf          = "fence-broker.sock"
+	// unixBaseURL is the HTTP host used for every unix-socket broker endpoint.
+	// Written seven times across this package before FAC-564.
+	unixBaseURL = "http://unix"
 	brokerAuthHeader        = "X-Herd-Broker-Token"
 	leasesDBLeaf            = "leases.db"
 )
@@ -214,8 +217,17 @@ func StartFenceBroker(cfg FenceBrokerConfig) (*FenceBroker, error) {
 	}
 	b.ln = ln
 	b.srv = &http.Server{Handler: b.routeAuth(mux), ReadHeaderTimeout: 10 * time.Second}
-	// Coordinator mint credential lives only as claim-dir file mode 0600 — never env.
-	if err := b.writeMintCredential(); err != nil {
+	// FAC-564: production no longer writes the mint secret to the claim dir at
+	// all. A mode-0600 file in a shared claim dir is readable by any same-UID
+	// worker, so writing it created exactly the weak surface the blocked
+	// claim-dir constructor refuses to read. Production authority is the
+	// address space (CoordinatorMinterInProcess) or an inherited descriptor
+	// (GrantMintToChild); neither needs a file.
+	//
+	// Hermetic tests still exercise the claim-dir constructor, so the file is
+	// written under testing.Testing() only. A stale file from an older broker
+	// is removed so it cannot be mistaken for live authority.
+	if err := b.reconcileMintCredential(); err != nil {
 		_ = ln.Close()
 		_ = grantDB.Close()
 		_ = leases.Close()
@@ -342,7 +354,7 @@ func (b *FenceBroker) ClientBaseURL() string {
 		return ""
 	}
 	if b.network == "unix" {
-		return "http://unix"
+		return unixBaseURL
 	}
 	return "http://" + b.ln.Addr().String()
 }
@@ -658,6 +670,31 @@ func (b *FenceBroker) writeMintCredential() error {
 		return err
 	}
 	return os.Chmod(path, 0o600)
+}
+
+// reconcileMintCredential writes the claim-dir credential in hermetic tests and
+// ensures production leaves NO such file behind.
+func (b *FenceBroker) reconcileMintCredential() error {
+	return b.reconcileMintCredentialFor(testing.Testing())
+}
+
+// reconcileMintCredentialFor takes the hermetic decision as a parameter so the
+// PRODUCTION branch is testable. Reading testing.Testing() directly would make
+// the production behaviour unreachable from a test, which is how a same-UID
+// credential file could keep being written with a passing suite.
+func (b *FenceBroker) reconcileMintCredentialFor(hermetic bool) error {
+	if hermetic {
+		return b.writeMintCredential()
+	}
+	if b == nil || b.claimDir == "" {
+		return nil
+	}
+	// Remove a credential left by an older broker: an operator reading a stale
+	// file would believe mint authority is available when it is not.
+	if err := os.Remove(filepath.Join(b.claimDir, mintCredLeaf)); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("remove stale mint credential: %w", err)
+	}
+	return nil
 }
 
 const mintCredLeaf = "fence-mint.cred"
