@@ -3,6 +3,7 @@ package herdr
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -83,7 +84,28 @@ func hardCloseTab(tabID, name string) error {
 						TabRevision: a.Revision,
 						Nonce:       "live-proof-close-" + strconv.FormatInt(time.Now().UnixNano(), 36),
 					}); err != nil {
-						return fmt.Errorf("FAC-133 cleanup compare-and-close: %w", err)
+						// FAC-577: when the installed herdr has no
+						// compare-close VERB at all, refusing here strands the
+						// exact tab we just created as an orphan an operator
+						// must close by hand. That is strictly worse than the
+						// risk compare-and-close exists to prevent.
+						//
+						// The invariant that matters is resulting ABSENCE, and
+						// the loop below still proves it by readback. So degrade
+						// only for a missing verb, loudly, and only for a pane
+						// whose identity this process owns. A real CAS conflict
+						// (stale generation, attachment changed, active
+						// mutation, protected) is a genuine refusal and still
+						// propagates untouched.
+						if !closeVerbUnsupported(err) {
+							return fmt.Errorf("FAC-133 cleanup compare-and-close: %w", err)
+						}
+						fmt.Fprintf(os.Stderr,
+							"herdr: WARN installed herdr has no tab compare-close verb (%v); closing tab %s unfenced and proving absence by readback\n",
+							err, a.TabID)
+						if rerr := tabCloseRaw(a.TabID); rerr != nil {
+							return fmt.Errorf("FAC-133 cleanup: compare-close unavailable and plain close failed: %w", errors.Join(err, rerr))
+						}
 					}
 					closeAttempted = true
 				}
@@ -530,4 +552,38 @@ func proveLiveHarness(kind, realBin, tmp string) (modelOK, toolOK, viaLA, contai
 	}
 	evidence += " harness_deny_escape=ok positive_marker=ok"
 	return true, true, true, true, true, evidence, "", nil
+}
+
+
+// closeVerbUnsupported reports whether an error means the installed herdr does
+// not implement compare-close AT ALL, as opposed to refusing this particular
+// close.
+//
+// The distinction is the whole point: a missing verb is a capability gap that
+// must degrade to close-plus-absence-readback so a failed launch cannot orphan
+// its own tab, while a stale generation or changed attachment is a real
+// conflict that must keep refusing.
+func closeVerbUnsupported(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	for _, conflict := range []string{
+		"stale-generation", "attachment-changed", "active-mutation", "protected",
+		"unresolved intent", "without resulting absence",
+	} {
+		if strings.Contains(msg, conflict) {
+			return false
+		}
+	}
+	for _, missing := range []string{
+		"unknown command", "unrecognized command", "unknown subcommand",
+		"invalid choice", "not a herdr command", "no such command",
+		"unknown flag", "command not found", "usage:",
+	} {
+		if strings.Contains(msg, missing) {
+			return true
+		}
+	}
+	return false
 }
