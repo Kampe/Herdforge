@@ -338,6 +338,10 @@ func readPulseHerdr(ctx context.Context, doneRefs map[string]bool) pulse.HerdrOb
 			PaneID:            a.PaneID,
 			PaneState:         a.Status,
 			ForegroundProcess: processName,
+			// FAC-418: carry the harness kind. Idle detection is not equally
+			// trustworthy across harnesses, and the reap decision needs to know
+			// which one it is looking at.
+			Kind:              a.Kind,
 			TabID:             a.TabID,
 			Workspace:         a.Workspace,
 			Worktree:          a.Cwd,
