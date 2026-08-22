@@ -266,10 +266,25 @@ func OpenClaimStack(dir string, tp TaskProvider) (*ClaimStack, error) {
 				envFenceBrokerURL, envFenceCoordinator)
 		}
 		k, _ := UnwrapTaskProvider(tp).(*KaneoProvider)
+		// FAC-575: take the upstream from the PROVIDER being attached, not from
+		// the environment. Reading HERD_KANEO_URL/HERD_KANEO_PROJECT meant the
+		// broker had no upstream on any host that configures Kaneo in
+		// .herd/herd.yaml — which is every host — so a fenced write reached the
+		// broker and died with "APIURL required for AtomicFenceServer mutate".
+		//
+		// The provider already resolved these from config. Using its values
+		// rather than a second source is the point: a broker and the provider it
+		// fronts must not be able to disagree about which board they are
+		// writing to.
+		upstreamURL, upstreamProject, upstreamCLI := "", "", false
+		if k != nil {
+			upstreamURL, upstreamProject, upstreamCLI = k.APIURL, k.ProjectID, k.UseCLI
+		}
 		cb, cerr := StartCoordinatorBroker(CoordinatorBrokerOptions{
 			ClaimDir:        dir,
-			UpstreamURL:     strings.TrimSpace(os.Getenv("HERD_KANEO_URL")),
-			UpstreamProject: strings.TrimSpace(os.Getenv("HERD_KANEO_PROJECT")),
+			UpstreamURL:     upstreamURL,
+			UpstreamProject: upstreamProject,
+			UpstreamCLI:     upstreamCLI,
 		})
 		if cerr != nil {
 			_ = stack.Close()
