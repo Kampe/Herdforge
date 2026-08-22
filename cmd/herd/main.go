@@ -1705,6 +1705,10 @@ func runStandingE() error {
 	only := fs.String("only", "", "Comma-separated lane or forge-<lane> names to operate on")
 	quiet := fs.Bool("quiet", false, "Suppress non-error progress lines")
 	asJSON := fs.Bool("json", false, "Emit the structured run report instead of prose")
+	// FAC-578: a standing lane that PAUSED its goal reports idle, and a plain
+	// raise skipped it as "already live" — so a settled supervisor stayed dead
+	// forever while its queue grew. --keep-alive recycles those.
+	keepAlive := fs.Bool("keep-alive", false, "Recycle standing lanes that have stopped working (idle or done), then raise any missing")
 	if err := fs.Parse(os.Args[2:]); err != nil {
 		return err
 	}
@@ -1757,8 +1761,15 @@ func runStandingE() error {
 		// human text. Human output stays the default and unchanged.
 		return runStandingJSON(cfg, mode, onlyList, *quiet, *dryRun && *shutdown)
 	}
+	if *keepAlive {
+		standingRecycleIdle = true
+	}
 	return runStandingConfigMode(cfg, herdr.IsAvailable(), mode, onlyList, *quiet, *dryRun && *shutdown)
 }
+
+// standingRecycleIdle carries --keep-alive into the options builder, which is
+// shared with the JSON path (FAC-556) and must stay a single construction site.
+var standingRecycleIdle bool
 
 func splitCSV(s string) []string {
 	s = strings.TrimSpace(s)
@@ -1806,7 +1817,8 @@ func runStandingConfigMode(cfg *config.Config, herdrAvailable bool, mode standin
 		decision *router.LaunchDecision
 	}
 	opts := standing.Options{
-		Mode:     mode,
+		Mode:        mode,
+		RecycleIdle: standingRecycleIdle,
 		// FAC-556: branch/HEAD come from the lane's own worktree. The seam
 		// returns an error when it cannot tell, so those fields are omitted
 		// rather than emitted as a plausible empty string.
@@ -1834,6 +1846,10 @@ func runStandingConfigMode(cfg *config.Config, herdrAvailable bool, mode standin
 					Name: a.Name, Status: a.Status, PaneID: a.PaneID,
 					TabID: a.TabID, Workspace: a.Workspace, Cwd: a.Cwd,
 					LoopMode: standing.LoopMode(a.LoopMode),
+					// FAC-578: the recycle decision must know which harness it
+					// is judging, because idle is not equally trustworthy across
+					// them.
+					Kind: a.Kind,
 				})
 			}
 			return out, nil

@@ -70,6 +70,10 @@ type Agent struct {
 	Workspace string
 	Cwd       string
 	LoopMode  LoopMode
+	// Kind is the harness behind the pane. FAC-578: recycling a settled lane
+	// depends on trusting its reported status, and idle is not equally
+	// trustworthy across harnesses.
+	Kind string
 }
 
 // Tab is a created herdr tab.
@@ -111,6 +115,16 @@ type Options struct {
 	PromptReadable     func(path string) error
 	AbsPath            func(path string) (string, error)
 	HarnessPresent     func(harness string) bool
+
+	// RecycleIdle closes and re-raises a standing lane that reports idle.
+	//
+	// FAC-578: a raise recycled a live lane only when it reported "done", so a
+	// goal-driven agent that PAUSED its goal — which reports idle — was
+	// classified "already live" and skipped forever. The review supervisor sat
+	// paused with 43 queued candidates and 0 reviewed while every raise skipped
+	// it. Off by default because a just-started lane is also briefly idle; the
+	// keep-alive path sets it.
+	RecycleIdle bool
 
 	// LaneLoopMode resolves a lane's loop contract from Herdforge's own durable
 	// hold store. It exists because the loop mode is NOT observable from the
@@ -173,6 +187,59 @@ type Result struct {
 	Missing     int          `json:"missing"`
 	Live        int          `json:"live"`
 	Unraiseable int          `json:"unraiseable"`
+}
+
+// unreliableIdleKinds mirrors pulse: herdr reports idle for an actively-working
+// OpenCode pane, so idle cannot be read as "stopped" for those harnesses.
+var unreliableIdleKinds = map[string]bool{
+	"opencode": true, "ollama": true, "lazer": true,
+}
+
+// SettledStandingLane reports whether a LIVE standing lane has stopped doing the
+// thing it exists to do, and should therefore be recycled rather than skipped.
+//
+// FAC-578: a raise recycled a live lane only when its status was "done". A
+// goal-driven agent that finishes or pauses its goal reports "idle", so it was
+// classified "already live" and skipped — forever. The review supervisor paused
+// with 43 queued candidates and 0 reviewed, and every subsequent raise left it
+// exactly there. One rule applied to one of the two settled states.
+//
+// A standing lane exists only while it is working. Idle is not rest for such a
+// lane, it is a stopped engine.
+//
+// Two exclusions, both deliberate:
+//   - a HELD or one-shot lane is idle on purpose; recycling it would fight the
+//     operator's own hold.
+//   - a harness whose idle is known-unreliable (the OpenCode family) may be
+//     working while reporting idle, and recycling it would kill live work. That
+//     is the FAC-418 asymmetry: leaving a lane idle costs a beat, killing a
+//     working one costs the work.
+func SettledStandingLane(a Agent, recycleIdle bool) bool {
+	status := strings.ToLower(strings.TrimSpace(a.Status))
+	if status == "done" {
+		return true
+	}
+	if status != "idle" {
+		return false
+	}
+	// Idle recycling is OPT-IN, and the reason is a real limitation rather than
+	// caution: a freshly started agent is briefly idle before it consumes its
+	// prompt, and the agent list carries no timestamp, so "idle because it just
+	// started" and "idle because its goal ended" are indistinguishable from a
+	// single observation. Recycling unconditionally would thrash — start, see
+	// idle, kill, start again.
+	//
+	// The keep-alive caller supplies the missing information by running on an
+	// interval: by the time it looks, a healthy lane has had time to reach
+	// working. An ordinary raise keeps the historical skip-if-live contract,
+	// which a test defends.
+	if !recycleIdle {
+		return false
+	}
+	if a.LoopMode == LoopHeld || a.LoopMode == LoopOneShot {
+		return false
+	}
+	return !unreliableIdleKinds[strings.ToLower(strings.TrimSpace(a.Kind))]
 }
 
 // NameHeld reports whether an agent_status means the live name is held and
@@ -891,7 +958,10 @@ func runRaise(result *Result, cfg *config.Config, lanes []config.LaneDef, repoRo
 		}
 		if actualName, a, ok := standingAgent(live, lane.Name, repository, rr.CWD); ok && NameHeld(a.Status) {
 			rr.AgentName = actualName
-			if strings.EqualFold(strings.TrimSpace(a.Status), "done") && opts.CloseTab != nil {
+			// FAC-578: recycle any SETTLED standing lane, not only "done". A
+			// paused goal reports idle, and skipping it left the lane alive and
+			// permanently useless.
+			if SettledStandingLane(a, opts.RecycleIdle) && opts.CloseTab != nil {
 				if err := opts.CloseTab(a.TabID); err != nil {
 					rr.Outcome = OutcomeFailed
 					rr.Reason = "retired owner close: " + err.Error()
@@ -920,7 +990,7 @@ func runRaise(result *Result, cfg *config.Config, lanes []config.LaneDef, repoRo
 				delete(live, actualName)
 			} else {
 				rr.Outcome = OutcomeSkippedLive
-				rr.Reason = "already live status=" + a.Status
+				rr.Reason = "already live and working status=" + a.Status
 				rr.TabID = a.TabID
 				rr.PaneID = a.PaneID
 				if a.Cwd != "" {
