@@ -6,8 +6,8 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/Kampe/Herdforge/pkg/gitroot"
 	"github.com/Kampe/Herdforge/pkg/mail"
-	"github.com/Kampe/Herdforge/pkg/worktree"
 )
 
 // canonicalHandoffMailbox resolves the ONE shared handoff bus for this
@@ -27,8 +27,18 @@ import (
 // A divergent worktree-local file is REPORTED rather than ignored: silently
 // switching buses could orphan entries someone is waiting on.
 func canonicalHandoffMailbox() string {
-	root, err := worktree.ResolveCanonicalRoot(context.Background(), ".",
-		firstEnv("HERD_ROOT", "HERD_REPO_ROOT", ""))
+	// FAC-573: the PROJECT control root, not HERD_ROOT. HERD_ROOT names the
+	// LANE, and a supervisor launched into its own worktree inherited it — so
+	// this resolved a lane-local mailbox, reported no pending handoffs, and left
+	// five real ones unread in the project mailbox. An explicit cd could not
+	// repair it, because an inherited override outranks the working directory by
+	// design: correct for a lane root, wrong for a project root.
+	root, laneOverride, err := gitroot.ProjectRoot(context.Background(), ".")
+	if laneOverride != "" {
+		fmt.Fprintf(os.Stderr,
+			"herd: note: %s=%s names a lane, not this project; the project control root is %s\n",
+			gitroot.EnvLaneRoot, laneOverride, root)
+	}
 	if err != nil || root == "" {
 		// Fail soft to the previous behaviour rather than refusing to read any
 		// queue at all; the disclosed path makes the fallback visible.

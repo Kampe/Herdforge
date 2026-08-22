@@ -16,6 +16,7 @@ package gitroot
 import (
 	"context"
 	"fmt"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -68,4 +69,73 @@ func Toplevel(ctx context.Context, startDir string) (string, error) {
 		return "", fmt.Errorf("git toplevel from %q: empty result", startDir)
 	}
 	return filepath.Clean(top), nil
+}
+
+// EnvProjectRoot names the canonical PROJECT CONTROL root.
+//
+// FAC-573: HERD_ROOT was overloaded. The launch environment sets it to the
+// LANE's root — a supervisor launched with cwd
+// ./review-harvest-supervisor inherits HERD_ROOT pointing there — while the
+// mailbox and review-root resolvers read it as the project control root. So the
+// two resolvers agreed with each other and were both wrong: the live supervisor
+// resolved a lane-local mailbox, reported no pending handoffs, and five real
+// ones sat unread in the project mailbox.
+//
+// An explicit cd could not repair it, because an inherited override outranks the
+// working directory by design. That is the correct precedence for a lane root
+// and the wrong precedence for a project root, which is the tell that these are
+// two different values wearing one name.
+const EnvProjectRoot = "HERD_PROJECT_ROOT"
+
+// EnvLaneRoot is the lane's own root. It is deliberately NOT consulted when
+// resolving the project control root.
+const EnvLaneRoot = "HERD_ROOT"
+
+// ProjectRoot is the canonical project control-plane root for startDir.
+//
+// Precedence, and the reasoning for it:
+//
+//  1. HERD_PROJECT_ROOT, when set. A dedicated name for a dedicated concept, so
+//     an operator or launcher can state the project root without it being
+//     confused for a lane root.
+//  2. The git common directory's parent. This is worktree-INVARIANT: every
+//     worktree of a repository resolves the same value, which is exactly the
+//     property a control plane needs and the property a lane root lacks.
+//
+// HERD_ROOT is never used here. It names the lane, and trusting it is the defect
+// this function exists to remove.
+//
+// laneOverride reports a HERD_ROOT that disagrees with the resolved project
+// root, so the divergence can be surfaced rather than silently tolerated.
+func ProjectRoot(ctx context.Context, startDir string) (root string, laneOverride string, err error) {
+	if explicit := strings.TrimSpace(os.Getenv(EnvProjectRoot)); explicit != "" {
+		abs, absErr := filepath.Abs(explicit)
+		if absErr != nil {
+			return "", "", fmt.Errorf("%s=%q is not resolvable: %w", EnvProjectRoot, explicit, absErr)
+		}
+		return filepath.Clean(abs), divergentLane(abs), nil
+	}
+	common, err := CommonDir(ctx, startDir)
+	if err != nil {
+		return "", "", err
+	}
+	resolved := filepath.Dir(common)
+	return resolved, divergentLane(resolved), nil
+}
+
+// divergentLane returns a HERD_ROOT that names somewhere other than the project
+// root. Empty when unset or in agreement.
+func divergentLane(projectRoot string) string {
+	lane := strings.TrimSpace(os.Getenv(EnvLaneRoot))
+	if lane == "" {
+		return ""
+	}
+	abs, err := filepath.Abs(lane)
+	if err != nil {
+		return lane
+	}
+	if filepath.Clean(abs) == filepath.Clean(projectRoot) {
+		return ""
+	}
+	return filepath.Clean(abs)
 }

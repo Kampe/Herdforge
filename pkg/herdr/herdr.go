@@ -1,6 +1,7 @@
 package herdr
 
 import (
+	"context"
 	"bytes"
 	"encoding/json"
 	"errors"
@@ -16,6 +17,8 @@ import (
 	"github.com/Kampe/Herdforge/pkg/launch"
 	"github.com/Kampe/Herdforge/pkg/router"
 	"github.com/Kampe/Herdforge/pkg/toolchild"
+
+	"github.com/Kampe/Herdforge/pkg/gitroot"
 )
 
 const (
@@ -1060,6 +1063,18 @@ const (
 //
 // HERD_WORKSPACE_OVERRIDE_IGNORED is durable child evidence that an inherited
 // HERD_WORKSPACE was present and deliberately superseded.
+// projectRootFor resolves the canonical project control root to hand a child.
+//
+// Falls back to the lane root when git cannot answer: a child with no project
+// root at all would resolve one itself and land back on the lane, which is the
+// defect being fixed.
+func projectRootFor(laneRoot string) string {
+	if p, _, err := gitroot.ProjectRoot(context.Background(), laneRoot); err == nil && strings.TrimSpace(p) != "" {
+		return p
+	}
+	return laneRoot
+}
+
 func bindChildWorkspaceEnv(root, workspace string, env []string) []string {
 	root = strings.TrimSpace(root)
 	workspace = strings.TrimSpace(workspace)
@@ -1073,6 +1088,12 @@ func bindChildWorkspaceEnv(root, workspace string, env []string) []string {
 	}
 	bound = append(bound,
 		"HERD_ROOT="+root,
+		// FAC-573: export the PROJECT control root alongside the lane root.
+		// HERD_ROOT names this lane, and a lane inheriting only that made the
+		// mailbox and review-root resolvers agree on a lane-local answer. A
+		// dedicated name means a lane can carry both facts without either being
+		// mistaken for the other.
+		gitroot.EnvProjectRoot+"="+projectRootFor(root),
 		"HERD_WORKSPACE="+workspace,
 		"HERDR_WORKSPACE_ID="+workspace,
 		childWorkspaceSourceEnv+"=launch-target",
