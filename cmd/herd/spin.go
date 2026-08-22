@@ -295,11 +295,10 @@ func taskRefForWorktree(dir string) string {
 	if dir == "" {
 		return ""
 	}
-	out, err := exec.Command("git", "-C", dir, "rev-parse", "--abbrev-ref", "HEAD").Output()
+	branch, err := currentBranch(dir)
 	if err != nil {
 		return ""
 	}
-	branch := strings.TrimSpace(string(out))
 	if !strings.HasPrefix(branch, "herd/") {
 		return ""
 	}

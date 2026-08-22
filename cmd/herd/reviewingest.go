@@ -102,22 +102,23 @@ func runReviewIngest() {
 		os.Exit(1)
 	}
 
+	emit := &reviewIngestEmitter{asJSON: parsed.asJSON}
 	admitted, refused := 0, 0
 	for _, f := range files {
 		body, err := os.ReadFile(f)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "REFUSED %s: %v\n", filepath.Base(f), err)
+			emit.refused(f, err)
 			refused++
 			continue
 		}
 		a := reviewingest.Parse(string(body))
 		if err := a.Validate(coordinators, commitExists); err != nil {
-			fmt.Fprintf(os.Stderr, "REFUSED %s: %v\n", filepath.Base(f), err)
+			emit.refused(f, err)
 			refused++
 			continue
 		}
 		if err := a.ValidatePassDiff(diffEmpty); err != nil {
-			fmt.Fprintf(os.Stderr, "REFUSED %s: %v\n", filepath.Base(f), err)
+			emit.refused(f, err)
 			refused++
 			continue
 		}
@@ -147,27 +148,38 @@ func runReviewIngest() {
 		decision, err := reviewIngestAdmissionDecision(ledger, opts, f, artifactName)
 		if err != nil {
 			if parsed.dryRun {
-				fmt.Fprintf(os.Stderr, "REFUSED %s: %v\n", filepath.Base(f), err)
+				emit.refused(f, err)
 				refused++
 				continue
 			}
 			fmt.Fprintf(os.Stderr, "herd review-ingest: preflight artifact move FAILED for %s: %v\n", filepath.Base(f), err)
 			os.Exit(1)
 		}
+		base := reviewIngestOutcome{
+			Artifact: filepath.Base(f), Path: f, SHA: a.SHA, Branch: a.Branch,
+			Reviewer: a.Reviewer, ReviewerFamily: a.ReviewerFamily,
+			BuilderFamily: a.BuilderFamily, Verdict: a.Verdict, Gate: gate,
+		}
 		if parsed.dryRun {
 			if decision == reviewIngestSkipDuplicate {
-				fmt.Printf("WOULD_SKIP %s reason=duplicate verdict=%s reviewer=%s sha=%s\n",
-					filepath.Base(f), a.Verdict, a.Reviewer, a.SHA[:12])
+				o := base
+				o.Disposition, o.Reason = "would_skip", "duplicate"
+				emit.record(o, fmt.Sprintf("WOULD_SKIP %s reason=duplicate verdict=%s reviewer=%s sha=%s\n",
+					filepath.Base(f), a.Verdict, a.Reviewer, a.SHA[:12]), false)
 			} else {
-				fmt.Printf("WOULD_ADMIT %s verdict=%s reviewer=%s sha=%s\n",
-					filepath.Base(f), a.Verdict, a.Reviewer, a.SHA[:12])
+				o := base
+				o.Disposition = "would_admit"
+				emit.record(o, fmt.Sprintf("WOULD_ADMIT %s verdict=%s reviewer=%s sha=%s\n",
+					filepath.Base(f), a.Verdict, a.Reviewer, a.SHA[:12]), false)
 			}
 			admitted++
 			continue
 		}
 		if decision == reviewIngestSkipDuplicate {
-			fmt.Printf("DUPLICATE %s verdict=%s reviewer=%s sha=%s enqueued=false\n",
-				filepath.Base(f), a.Verdict, a.Reviewer, a.SHA[:12])
+			o := base
+			o.Disposition, o.Enqueued = "duplicate", boolPtr(false)
+			emit.record(o, fmt.Sprintf("DUPLICATE %s verdict=%s reviewer=%s sha=%s enqueued=false\n",
+				filepath.Base(f), a.Verdict, a.Reviewer, a.SHA[:12]), false)
 			admitted++
 			continue
 		}
@@ -189,7 +201,9 @@ func runReviewIngest() {
 				fmt.Fprintf(os.Stderr, "herd review-ingest: retirement write FAILED for %s: %v\n", filepath.Base(f), err)
 				os.Exit(1)
 			}
-			fmt.Printf("RETIRED %s authority=%s sha=%s\n", filepath.Base(f), a.Authority, a.SHA[:12])
+			o := base
+			o.Disposition, o.Authority = "retired", a.Authority
+			emit.record(o, fmt.Sprintf("RETIRED %s authority=%s sha=%s\n", filepath.Base(f), a.Authority, a.SHA[:12]), false)
 			admitted++
 			continue
 		}
@@ -205,16 +219,23 @@ func runReviewIngest() {
 			os.Exit(1)
 		}
 		if !enqueued && a.Verdict == "PASS" {
-			fmt.Printf("DUPLICATE %s verdict=%s reviewer=%s sha=%s enqueued=false\n",
-				filepath.Base(f), a.Verdict, a.Reviewer, a.SHA[:12])
+			o := base
+			o.Disposition, o.Enqueued = "duplicate", boolPtr(false)
+			emit.record(o, fmt.Sprintf("DUPLICATE %s verdict=%s reviewer=%s sha=%s enqueued=false\n",
+				filepath.Base(f), a.Verdict, a.Reviewer, a.SHA[:12]), false)
 		} else {
-			fmt.Printf("ADMITTED %s verdict=%s reviewer=%s sha=%s enqueued=%v\n",
-				filepath.Base(f), a.Verdict, a.Reviewer, a.SHA[:12], enqueued)
+			o := base
+			o.Disposition, o.Enqueued = "admitted", boolPtr(enqueued)
+			emit.record(o, fmt.Sprintf("ADMITTED %s verdict=%s reviewer=%s sha=%s enqueued=%v\n",
+				filepath.Base(f), a.Verdict, a.Reviewer, a.SHA[:12], enqueued), false)
 		}
 		admitted++
 	}
 
-	fmt.Printf("herd review-ingest: admitted=%d refused=%d\n", admitted, refused)
+	if err := emit.summary(admitted, refused); err != nil {
+		fmt.Fprintf(os.Stderr, "herd review-ingest: encode: %v\n", err)
+		os.Exit(1)
+	}
 	// ANY refusal is a non-zero exit. Exiting 0 on a partial batch let
 	// `herd review-ingest *.md && <next step>` proceed with silently rejected
 	// verdicts, which is precisely the fail-open this gate exists to prevent
@@ -230,6 +251,8 @@ type reviewIngestArgs struct {
 	auditRoot  string
 	ledgerPath string
 	files      []string
+	// asJSON emits structured outcomes instead of prose (FAC-556).
+	asJSON bool
 }
 
 // parseReviewIngestArgs parses flags independently of positional artifacts.
@@ -252,6 +275,8 @@ func parseReviewIngestArgs(args []string) (reviewIngestArgs, error) {
 			continue
 		}
 		switch {
+		case arg == "--json" || arg == "-json":
+			parsed.asJSON = true
 		case arg == "--dry-run" || arg == "-dry-run":
 			parsed.dryRun = true
 		case arg == "--audit" || arg == "-audit":

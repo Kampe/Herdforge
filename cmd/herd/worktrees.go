@@ -210,7 +210,11 @@ func runWorktrees() {
 			Files:    []string{},
 		}
 
-		r.Branch = runGitOrDefault(ctx, e.Path, "?", "rev-parse", "--abbrev-ref", "HEAD")
+		if b, err := currentBranch(e.Path); err == nil {
+			r.Branch = b
+		} else {
+			r.Branch = "?"
+		}
 		r.Head = runGitOrDefault(ctx, e.Path, "?", "rev-parse", "--short", "HEAD")
 		r.CandidateSHA = runGitOrDefault(ctx, e.Path, "", "rev-parse", "HEAD")
 
