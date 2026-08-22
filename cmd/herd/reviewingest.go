@@ -493,6 +493,12 @@ func runHarvestMerge() {
 	sha := report.Pin.SHA
 	fmt.Printf("herd harvest-merge: tip=%s last_pass_sha=%s eligible=%t\n",
 		shortSHA12(report.Tip), shortSHA12(report.LastPassSHA), report.Eligible)
+	// Never filter silently: a candidate an operator expected must be visible
+	// along with the reason it was not selected.
+	for _, other := range report.OffBranchQueued {
+		fmt.Printf("herd harvest-merge: queued candidate %s belongs to another branch; not selected for %s\n",
+			shortSHA12(other), *branch)
+	}
 	if report.Retired {
 		fmt.Printf("herd harvest-merge: branch %s is settled as RETIRED at %s; no merge is authorized\n", *branch, shortSHA12(report.Pin.SHA))
 		return
@@ -682,6 +688,11 @@ type harvestCandidateReport struct {
 	Pin              harvestmerge.CandidatePin
 	Tip              string
 	LastPassSHA      string
+	// OffBranchQueued are queued candidates that belong to other branches.
+	// Reported so a suppressed candidate is visible rather than silently
+	// filtered: an operator who expected one of these needs to see why it was
+	// not selected.
+	OffBranchQueued  []string
 	Eligible         bool
 	ReconstructedSHA string
 	Retired          bool
@@ -755,6 +766,7 @@ func resolveHarvestCandidateWithReconstructionAt(repoRoot, branch, requested, re
 		return harvestCandidateReport{}, fmt.Errorf("read harvest queue: %w", err)
 	}
 	var latest reviewledger.LedgerRow
+	var offBranch []string
 	queuedBySHA := make(map[string]reviewledger.LedgerRow)
 	for _, row := range queued {
 		// The queue branch is the reviewer task that produced the verdict, not
@@ -762,6 +774,20 @@ func resolveHarvestCandidateWithReconstructionAt(repoRoot, branch, requested, re
 		// and the exact ancestry/eligibility checks below are the provenance
 		// boundary between those two branches.
 		queuedBySHA[row.SHA] = row
+
+		// FAC-561: last-PASS selection used to be latest-wins across the WHOLE
+		// queue, with no branch scoping. With two candidates admitted together
+		// it reported the other ref's candidate: harvest-merge for
+		// reconstruct/cha-2185-fresh named CHA-2205's 1d5ce367acd4 while the
+		// branch's own candidate was 991ce0757eeb. Newest is not the same
+		// question as "this branch's".
+		//
+		// Latest-WITHIN-branch is still correct and intentional: repeated
+		// reviews of one branch legitimately supersede each other.
+		if !reachableFromBranch(repoRoot, row.SHA, branch) {
+			offBranch = append(offBranch, row.SHA)
+			continue
+		}
 		if row.Timestamp >= latest.Timestamp {
 			latest = row
 		}
@@ -769,6 +795,7 @@ func resolveHarvestCandidateWithReconstructionAt(repoRoot, branch, requested, re
 	if latest.SHA != "" {
 		report.LastPassSHA = latest.SHA
 	}
+	report.OffBranchQueued = offBranch
 
 	sha := strings.TrimSpace(requested)
 	reconstructedSHA = strings.TrimSpace(reconstructedSHA)
@@ -802,9 +829,7 @@ func resolveHarvestCandidateWithReconstructionAt(repoRoot, branch, requested, re
 		if _, err := candidateCmd.Output(); err != nil {
 			return harvestCandidateReport{}, fmt.Errorf("candidate %s is not a commit: %w", sha, err)
 		}
-		ancestorCmd := exec.Command("git", "merge-base", "--is-ancestor", sha, branch)
-		ancestorCmd.Dir = repoRoot
-		if err := ancestorCmd.Run(); err != nil {
+		if !reachableFromBranch(repoRoot, sha, branch) {
 			return harvestCandidateReport{}, fmt.Errorf("candidate %s is not reachable from branch %s", sha, branch)
 		}
 	}
@@ -1169,4 +1194,20 @@ func worktreeForBranch(branch string) string {
 		}
 	}
 	return ""
+}
+
+// reachableFromBranch reports whether an object is contained in a branch.
+//
+// FAC-561: this question was asked in two places in this file -- once for
+// eligibility and, missing entirely, at candidate SELECTION. One definition now
+// serves both, so the selector and the gate cannot disagree about what "on this
+// branch" means. Six other copies of this git call exist elsewhere in the tree
+// and are tracked for consolidation.
+func reachableFromBranch(repoRoot, sha, branch string) bool {
+	if strings.TrimSpace(sha) == "" || strings.TrimSpace(branch) == "" {
+		return false
+	}
+	cmd := exec.Command("git", "merge-base", "--is-ancestor", sha, branch)
+	cmd.Dir = repoRoot
+	return cmd.Run() == nil
 }
