@@ -17,10 +17,16 @@ import (
 // side-file, the same shape the callback consumer already uses for its own
 // progress. One definition, so "handled" cannot come to mean two things.
 
-// ackPath is the handled-state file for a mailbox.
-func ackPath(mailFile string) string {
+// HandledStatePath is the handled-state file for a mailbox.
+//
+// Exported because callers need to DISPLAY it: the handoffs command printed the
+// suffix itself, which duplicated this rule and was caught by the duplicate-rule
+// gate. A path only this package knows how to build should only be built here.
+func HandledStatePath(mailFile string) string {
 	return mailFile + ".handled.json"
 }
+
+func ackPath(mailFile string) string { return HandledStatePath(mailFile) }
 
 type ackState struct {
 	// Handled maps recipient -> envelope ids that reached a disposition.

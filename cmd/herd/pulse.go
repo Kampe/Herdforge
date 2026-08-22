@@ -912,7 +912,7 @@ func (a *livePulseActor) OpenReview(ctx context.Context, lane pulse.AgentObserva
 	subject := fmt.Sprintf("PULSE REVIEW HANDOFF %s (%d candidate(s))", lane.Name, len(substantive))
 	id := handoffEnvelopeID(lane.Name, substantive)
 	queued, qErr := enqueueReviewHandoff(context.Background(),
-		mail.CallbackMailPath("."), "pulse", target, subject, packet, id)
+		canonicalHandoffMailbox(), "pulse", target, subject, packet, id)
 	if qErr != nil {
 		// Refuse rather than deliver something that can be lost silently.
 		return fmt.Errorf("pulse: %w", qErr)
