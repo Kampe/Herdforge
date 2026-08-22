@@ -100,7 +100,7 @@ func runDepsCheck() {
 	}
 	ref := fs.Arg(0)
 
-	cfg, err := config.LoadConfig(".herd/herd.yaml")
+	cfg, err := config.LoadConfig(config.DefaultConfigPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "config: %v\n", err)
 		os.Exit(1)
@@ -157,7 +157,7 @@ func runDepsReconcile() {
 	}
 	ref := fs.Arg(0)
 
-	cfg, err := config.LoadConfig(".herd/herd.yaml")
+	cfg, err := config.LoadConfig(config.DefaultConfigPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "config: %v\n", err)
 		os.Exit(1)
@@ -216,7 +216,7 @@ func runDepsMigrate() {
 	journalDir := fs.String("journal", filepath.Join(".herd", "migrate-journal"), "Per-apply before-image journal dir (repo-relative)")
 	_ = fs.Parse(os.Args[3:])
 
-	cfg, err := config.LoadConfig(".herd/herd.yaml")
+	cfg, err := config.LoadConfig(config.DefaultConfigPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "config: %v\n", err)
 		os.Exit(1)

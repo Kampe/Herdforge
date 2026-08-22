@@ -72,7 +72,7 @@ func registeredWorkspaceForCwd(cwd string) (string, bool) {
 		return "", false
 	}
 	for dir := abs; ; dir = filepath.Dir(dir) {
-		configPath := filepath.Join(dir, ".herd", "herd.yaml")
+		configPath := config.PathFor(dir)
 		if _, statErr := os.Stat(configPath); statErr == nil {
 			cfg, loadErr := config.LoadConfig(configPath)
 			if loadErr != nil {
@@ -282,14 +282,14 @@ func registeredWorkspace(repoRoot string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("herdr workspace: resolve repository root: %w", err)
 	}
-	cfg, err := config.LoadConfig(filepath.Join(root, ".herd", "herd.yaml"))
+	cfg, err := config.LoadConfig(config.PathFor(root))
 	if err != nil {
 		if os.IsNotExist(err) {
 			return "", nil
 		}
 		// Worktree callers may provide a root without a Herdforge config. Keep
 		// resolution compatible, but never hide a malformed existing config.
-		if _, statErr := os.Stat(filepath.Join(root, ".herd", "herd.yaml")); statErr == nil {
+		if _, statErr := os.Stat(config.PathFor(root)); statErr == nil {
 			return "", fmt.Errorf("herdr workspace: load repository binding: %w", err)
 		}
 		return "", nil
