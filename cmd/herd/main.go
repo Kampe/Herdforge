@@ -942,17 +942,42 @@ func runClone() {
 }
 
 func runPreflightStatic() {
-	if err := preflight.CheckRootGitConfig("."); err != nil {
-		fmt.Fprintf(os.Stderr, "Preflight failed: %v\n", err)
-		os.Exit(1)
+	rec := &preflightRecorder{asJSON: hasPreflightJSONFlag(os.Args[2:])}
+	runPreflightChecks(rec)
+	rec.finish()
+}
+
+// hasPreflightJSONFlag reports whether --json was requested. Preflight takes
+// bare positional flags rather than a FlagSet, so this matches that convention.
+func hasPreflightJSONFlag(args []string) bool {
+	for _, a := range args {
+		if a == "--json" || a == "-json" {
+			return true
+		}
 	}
-	if err := reportCurrentProvenance("."); err != nil {
-		fmt.Fprintf(os.Stderr, "Preflight failed: %v\n", err)
-		os.Exit(1)
+	return false
+}
+
+// runPreflightChecks records every check through rec.
+//
+// FAC-556: the checks and their names are declared once here, so the prose and
+// the --json document are two renderings of the same records rather than one
+// being scraped from the other.
+func runPreflightChecks(rec *preflightRecorder) {
+	if err := preflight.CheckRootGitConfig("."); err != nil {
+		rec.fail("root-git-config", err)
+	} else {
+		rec.pass("root-git-config", "")
+	}
+	if err := reportCurrentProvenanceQuiet(".", rec.asJSON); err != nil {
+		rec.fail("provenance", err)
+	} else {
+		rec.pass("provenance", "")
 	}
 	if err := preflight.CheckGoToolchain(); err != nil {
-		fmt.Fprintf(os.Stderr, "Preflight failed: %v\n", err)
-		os.Exit(1)
+		rec.fail("go-toolchain", err)
+	} else {
+		rec.pass("go-toolchain", "")
 	}
 	var allowlist []string
 	if cfg, err := config.LoadConfig(filepath.Join(".herd", "herd.yaml")); err == nil {
@@ -965,30 +990,34 @@ func runPreflightStatic() {
 		}
 	}
 	if err := boundaryCheck(".", allowlist); err != nil {
-		fmt.Fprintf(os.Stderr, "Preflight failed: %v\n", err)
-		os.Exit(1)
+		rec.fail("worktree-boundary", err)
+	} else {
+		rec.pass("worktree-boundary", "Preflight boundary check passed. Zero absolute path leaks detected.")
 	}
-	fmt.Println("Preflight boundary check passed. Zero absolute path leaks detected.")
 	if err := preflight.CheckDangerousSignalLiterals("."); err != nil {
-		fmt.Fprintf(os.Stderr, "Preflight failed: %v\n", err)
-		os.Exit(1)
+		rec.fail("signal-literals", err)
+	} else {
+		rec.pass("signal-literals", "Preflight signal-literal check passed. No host-wide kill literals in production sources.")
 	}
-	fmt.Println("Preflight signal-literal check passed. No host-wide kill literals in production sources.")
 	// FAC-135: lint the repository's declared merge policy. This is a
-	// declaration check, not per-candidate admission: it fails a repo that
-	// claims protection while declaring no required checks or no
-	// different-family review. Runtime admission is reviewledger.Admit.
+	// declaration check, not per-candidate admission.
 	if err := preflight.RefuseAutonomousMerge("."); err != nil {
-		fmt.Fprintf(os.Stderr, "Preflight failed: %v\n", err)
-		os.Exit(1)
+		rec.fail("merge-policy", err)
+	} else {
+		rec.pass("merge-policy", "Preflight merge-policy check passed. Required CI and different-family review declared.")
 	}
-	fmt.Println("Preflight merge-policy check passed. Required CI and different-family review declared.")
 	// FAC-563: state the fence-broker requirement BEFORE work depends on it.
-	// A report, not a gate: most preflight runs are not about to perform a
-	// fenced board write, and failing them all would train operators to ignore
-	// the check. The point is that the dependency is never first learned from a
-	// refusal in the middle of a mutation.
-	reportFenceBrokerReadiness()
+	// A warning, not a gate: most preflight runs are not about to perform a
+	// fenced board write.
+	claimDir := ""
+	if dir, err := provider.CanonicalClaimDir(".", firstEnv("HERD_ROOT", "HERD_REPO_ROOT", "")); err == nil {
+		claimDir = dir
+	}
+	if r := preflight.CheckFenceBroker(claimDir); r.Ready {
+		rec.pass("fence-broker", "Preflight fence-broker check passed. "+r.Detail)
+	} else {
+		rec.warn("fence-broker", r.Detail+"\n"+r.Remedy)
+	}
 }
 
 func reportFenceBrokerReadiness() {
@@ -1005,25 +1034,31 @@ func reportFenceBrokerReadiness() {
 }
 
 func runPreflight() {
-	runPreflightStatic()
+	// FAC-556: ONE recorder spans the static and extended phases, so --json
+	// emits a single document. Finishing after the static phase left the
+	// extended checks printing prose after a closed document, which is not
+	// parseable output even though each half looked correct.
+	rec := &preflightRecorder{asJSON: hasPreflightJSONFlag(os.Args[2:])}
+	runPreflightChecks(rec)
 	// Static preflight is also useful in an uninitialised directory. Only run
 	// the ref comparison when the command is operating inside a Git worktree.
 	// Once refs exist, missing or divergent refs remain hard failures.
 	if _, err := exec.Command("git", "rev-parse", "--is-inside-work-tree").Output(); err == nil {
 		if report, err := preflight.CheckMainOriginDivergence("."); err != nil {
-			fmt.Fprintf(os.Stderr, "Preflight failed: %v\n", err)
-			os.Exit(1)
+			rec.fail("main-origin-divergence", err)
 		} else {
-			fmt.Printf("Preflight main/origin-main check passed. main ahead=%d, origin/main ahead=%d.\n", report.LocalAhead, report.RemoteAhead)
+			rec.pass("main-origin-divergence", fmt.Sprintf("Preflight main/origin-main check passed. main ahead=%d, origin/main ahead=%d.", report.LocalAhead, report.RemoteAhead))
 		}
 	}
 	if !productionMode() {
 		// FAC-367: local Herdr panes do not have hosted HostCreds or fleet
 		// attestation state. Static boundary, signal, and merge-policy checks
 		// remain mandatory, while production keeps the signed readiness gate.
-		fmt.Println("FAC-133 hosted fleet readiness skipped in local mode.")
+		rec.pass("fleet-readiness", "FAC-133 hosted fleet readiness skipped in local mode.")
+		rec.finish()
 		return
 	}
+	defer rec.finish()
 
 	// FAC-133 fleet readiness: optional live refresh, then consume attestation.
 	// HERD_LIVE_HARNESS_PROOF=1 or HERD_REFRESH_READINESS=1 triggers a single-flight
@@ -1073,6 +1108,15 @@ func runSelfTest() {
 }
 
 func reportCurrentProvenance(root string) error {
+	return reportCurrentProvenanceQuiet(root, false)
+}
+
+// reportCurrentProvenanceQuiet suppresses the human provenance block.
+//
+// FAC-556: this printed to stdout unconditionally, which corrupted the
+// --json document with a prose preamble. Machine-readable output means the
+// whole stream, not just the part we remembered to encode.
+func reportCurrentProvenanceQuiet(root string, quiet bool) error {
 	info, err := provenance.Read(root)
 	if err != nil {
 		// A new directory without Git has no source revision to compare. Once
@@ -1082,7 +1126,9 @@ func reportCurrentProvenance(root string) error {
 		}
 		return err
 	}
-	fmt.Println(provenance.Format(info))
+	if !quiet {
+		fmt.Println(provenance.Format(info))
+	}
 	if info.Comparable {
 		if err := provenance.Validate(info, info.SourceRevision); err != nil && managedSelfGateExecutable(root) {
 			return err
@@ -1653,6 +1699,7 @@ func runStandingE() error {
 	shutdown := fs.Bool("shutdown", false, "Close settled standing owners only (never ephemeral task workers)")
 	only := fs.String("only", "", "Comma-separated lane or forge-<lane> names to operate on")
 	quiet := fs.Bool("quiet", false, "Suppress non-error progress lines")
+	asJSON := fs.Bool("json", false, "Emit the structured run report instead of prose")
 	if err := fs.Parse(os.Args[2:]); err != nil {
 		return err
 	}
@@ -1690,13 +1737,20 @@ func runStandingE() error {
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
 	}
-	if mode == standing.ModeStatus {
+	if mode == standing.ModeStatus && !*asJSON {
 		broker := readBrokerHealth(".", cfg)
 		if broker.Serving {
 			fmt.Printf("Broker: serving (%s)\n", broker.Socket)
 		} else {
 			fmt.Printf("Broker: UNAVAILABLE (%s)\n", broker.Detail)
 		}
+	}
+	if *asJSON {
+		// FAC-556: a coordinator automating a bounded reaction was parsing
+		// decorative prose such as "status=idle". Emit the structured report the
+		// run already produces, so there is a source of truth that is not the
+		// human text. Human output stays the default and unchanged.
+		return runStandingJSON(cfg, mode, onlyList, *quiet, *dryRun && *shutdown)
 	}
 	return runStandingConfigMode(cfg, herdr.IsAvailable(), mode, onlyList, *quiet, *dryRun && *shutdown)
 }
@@ -1723,6 +1777,12 @@ func runStandingConfig(cfg *config.Config, herdrAvailable bool) error {
 	return runStandingConfigMode(cfg, herdrAvailable, standing.ModeRaise, nil, false, false)
 }
 
+// runStandingConfigMode runs standing and prints the human report.
+//
+// FAC-556: the options wiring below is shared with the --json path through
+// standingRunFor. Building it twice would let the two surfaces observe different
+// seams, so the structured output could disagree with the prose about the same
+// run.
 func runStandingConfigMode(cfg *config.Config, herdrAvailable bool, mode standing.Mode, only []string, quiet bool, shutdownDry bool) error {
 	if !herdrAvailable && mode != standing.ModeDryRun && mode != standing.ModeStatus {
 		// Status may still want a workspace; raise/shutdown need herdr.
@@ -1742,6 +1802,10 @@ func runStandingConfigMode(cfg *config.Config, herdrAvailable bool, mode standin
 	}
 	opts := standing.Options{
 		Mode:     mode,
+		// FAC-556: branch/HEAD come from the lane's own worktree. The seam
+		// returns an error when it cannot tell, so those fields are omitted
+		// rather than emitted as a plausible empty string.
+		WorktreeHead: worktreeHeadFor,
 		Only:     only,
 		Quiet:    quiet,
 		RepoRoot: ".",
@@ -1885,6 +1949,9 @@ func runStandingConfigMode(cfg *config.Config, herdrAvailable bool, mode standin
 	}
 
 	result, err := standing.Run(cfg, opts)
+	if standingResultSink != nil {
+		standingResultSink(result)
+	}
 	if result != nil && !quiet {
 		for _, rr := range result.Roles {
 			switch rr.Outcome {
@@ -1915,6 +1982,22 @@ func runStandingConfigMode(cfg *config.Config, herdrAvailable bool, mode standin
 	}
 	return err
 }
+
+// standingRunFor runs standing and returns the structured report WITHOUT
+// printing. It reuses the same wiring as the human path by delegating through a
+// capture seam, so --json and prose can never describe different runs.
+func standingRunFor(cfg *config.Config, mode standing.Mode, only []string, quiet, shutdownDry bool) (*standing.Result, error) {
+	var captured *standing.Result
+	prev := standingResultSink
+	standingResultSink = func(r *standing.Result) { captured = r }
+	defer func() { standingResultSink = prev }()
+	err := runStandingConfigMode(cfg, herdr.IsAvailable(), mode, only, true, shutdownDry)
+	_ = quiet
+	return captured, err
+}
+
+// standingResultSink observes the run report. Nil in the normal human path.
+var standingResultSink func(*standing.Result)
 
 // admitStandingQuota checks the exact provider/model pool before a standing
 // lane can create a tab. Standing lanes use a configured route, so they do not

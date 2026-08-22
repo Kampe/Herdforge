@@ -126,6 +126,12 @@ type Options struct {
 	// the raise, since a missing goal degrades to the Stop hook's quiet
 	// no-goal path rather than blocking the agent.
 	SetGoal func(cwd, lane, task, owner string) error
+
+	// WorktreeHead reports a lane's checked-out branch and HEAD from its own
+	// worktree. Nil means those fields stay absent rather than falsely empty
+	// (FAC-556): a consumer automating from --json must be able to distinguish
+	// "not known" from "empty".
+	WorktreeHead func(cwd string) (branch, head string, err error)
 }
 
 // RoleResult records one standing role's outcome.
@@ -141,6 +147,17 @@ type RoleResult struct {
 	PaneID    string   `json:"pane_id,omitempty"`
 	Provider  string   `json:"provider,omitempty"`
 	Model     string   `json:"model,omitempty"`
+	// FAC-556: fields a coordinator previously had to scrape out of prose.
+	//
+	// Every one is omitempty ON PURPOSE. A consumer automating from this must be
+	// able to tell "Herdforge does not know" from "the value is empty", so an
+	// unattestable field is ABSENT rather than a plausible zero. AgentStatus is
+	// the raw agent_status behind Outcome; Branch and HEAD come from the lane's
+	// own worktree, which Herdforge can read directly.
+	AgentStatus string `json:"agent_status,omitempty"`
+	Branch      string `json:"branch,omitempty"`
+	HEAD        string `json:"head,omitempty"`
+	Workspace   string `json:"workspace,omitempty"`
 }
 
 // Result is the full standing run report.
@@ -664,6 +681,8 @@ func runStatus(result *Result, lanes []config.LaneDef, live map[string][]Agent, 
 				rr.Outcome = OutcomeHeld
 			}
 			rr.Reason = "status=" + a.Status
+			rr.AgentStatus = a.Status
+			rr.Workspace = a.Workspace
 			rr.TabID = a.TabID
 			rr.PaneID = a.PaneID
 			if a.Cwd != "" {
@@ -678,6 +697,13 @@ func runStatus(result *Result, lanes []config.LaneDef, live map[string][]Agent, 
 			rr.Outcome = OutcomeMissing
 			rr.Reason = "not live — needs raising"
 			result.Missing++
+		}
+		// Branch and HEAD are read from the lane's own worktree, not inferred.
+		// Absent on failure, which is why they are omitempty.
+		if opts.WorktreeHead != nil && strings.TrimSpace(rr.CWD) != "" {
+			if branch, head, err := opts.WorktreeHead(rr.CWD); err == nil {
+				rr.Branch, rr.HEAD = branch, head
+			}
 		}
 		result.Roles = append(result.Roles, rr)
 	}
