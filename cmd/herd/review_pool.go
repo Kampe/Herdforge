@@ -15,6 +15,7 @@ import (
 
 	"github.com/Kampe/Herdforge/pkg/herdr"
 	"github.com/Kampe/Herdforge/pkg/router"
+	"github.com/Kampe/Herdforge/pkg/security"
 	"github.com/Kampe/Herdforge/pkg/usage"
 	"github.com/Kampe/Herdforge/pkg/worktree"
 )
@@ -423,29 +424,51 @@ func resolvePoolReviewer(provider, model, excludeFamily string) (poolReviewer, e
 	}, nil
 }
 
-// preflightReviewerReadiness proves the resolved provider can actually execute a
-// request BEFORE any lease or tab exists.
+// preflightReviewerReadiness proves the resolved reviewer can actually be
+// launched BEFORE any lease or tab exists.
 //
-// FAC-577: quota being healthy and the host CLI reporting an interactive login
-// are NOT worker credential readiness. A routed claude reviewer launched into a
-// pane that was sitting at an authentication screen, which surfaced only after
-// the lease and tab had been created and had to be compensated by hand.
+// FAC-579: the previous version ran a real generation as a CHILD OF THIS
+// PROCESS and reported Available, then the pane launch failed with "pane is at
+// a login or authentication screen". Both statements were true: a probe in the
+// coordinator's own process proves the COORDINATOR's credential context, and
+// the reviewer runs in a pane with a different one. A preflight that cannot
+// observe the boundary it claims to check is worse than none, because it
+// converts an honest failure into a false pass.
 //
-// The probe runs a real minimal generation and requires the exact probe token,
-// so it exercises the same boundary the launch will hit rather than a cheaper
-// proxy for it. A login screen, a missing credential handle, or an unconfigured
-// model all fail here, before anything needs cleaning up.
+// The gate is now the same authority the launch path itself consults —
+// security.DiagnoseKindAuthReadiness — which reports whether worker credentials
+// for this harness kind can actually be brokered. It is non-spawning and costs
+// nothing, and it is exactly what `herd hostcreds diagnose --kind <k>` reports,
+// so the preflight and the diagnostic can no longer disagree.
+//
+// The in-process generation probe is kept as a SECONDARY signal only, and only
+// to catch a quota or model failure early. It can never turn a brokerability
+// refusal into a pass.
 func preflightReviewerReadiness(r poolReviewer) error {
+	auth := security.DiagnoseKindAuthReadiness(r.Kind)
+	if !auth.Brokerable {
+		return fmt.Errorf(
+			"reviewer %s/%s cannot be launched: %s\n"+
+				"  %s\n"+
+				"  An interactive host login is not worker credential readiness: the pane runs\n"+
+				"  in a different credential context than this process, so `auth status` saying\n"+
+				"  logged-in does not make a spawned reviewer able to authenticate.\n"+
+				"  Same check as: herd hostcreds diagnose --kind %s\n"+
+				"  No lease or tab was created.",
+			r.Provider, r.Model, auth.Blocker, auth.RecommendedAction, r.Kind)
+	}
+	// Secondary: a surface that is brokerable can still be out of quota or
+	// pointed at a model that does not exist. This probe runs in this process,
+	// so it proves nothing about the pane's credentials and is never allowed to
+	// stand in for the brokerability gate above.
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
-	res := herdr.ProbeProviderModel(ctx, r.Provider, r.Model, "")
-	if res.Available {
-		return nil
+	if res := herdr.ProbeProviderModel(ctx, r.Provider, r.Model, ""); !res.Available {
+		return fmt.Errorf(
+			"reviewer %s/%s failed a request in this process: %s\n"+
+				"  Worker credentials are brokerable, so this is a quota or model problem\n"+
+				"  rather than an authentication one. No lease or tab was created.",
+			r.Provider, r.Model, res.Reason)
 	}
-	return fmt.Errorf(
-		"reviewer %s/%s is not ready to execute a request: %s\n"+
-			"  Quota and an interactive host login are not worker credential readiness.\n"+
-			"  Provision an approved credential handle for this surface, or route another\n"+
-			"  surface with --provider. No lease or tab was created.",
-		r.Provider, r.Model, res.Reason)
+	return nil
 }

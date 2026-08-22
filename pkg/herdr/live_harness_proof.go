@@ -75,7 +75,25 @@ func hardCloseTab(tabID, name string) error {
 				found = true
 				if !closeAttempted {
 					if a.StateChangeSeq == 0 {
-						return fmt.Errorf("FAC-133 cleanup: tab %s has no immutable generation", a.TabID)
+						// FAC-579: this returned BEFORE the missing-verb
+						// degradation below, so the degradation was unreachable
+						// for exactly the herdr build that needed it. A herdr
+						// with no compare-close verb also reports no immutable
+						// generation, so every failed launch on such a build
+						// stranded its own tab as an orphan.
+						//
+						// No generation means the build has no CAS support at
+						// all, which is the same capability gap as a missing
+						// verb: degrade loudly to plain close plus the absence
+						// readback this loop already performs.
+						fmt.Fprintf(os.Stderr,
+							"herdr: WARN tab %s reports no immutable generation, so this herdr has no compare-and-close support; closing unfenced and proving absence by readback\n",
+							a.TabID)
+						if rerr := tabCloseRaw(a.TabID); rerr != nil {
+							return fmt.Errorf("FAC-133 cleanup: no generation available and plain close failed: %w", rerr)
+						}
+						closeAttempted = true
+						break
 					}
 					if err := TabCloseCAS(CloseRequest{
 						WorkspaceID: a.Workspace,
