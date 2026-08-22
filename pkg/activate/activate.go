@@ -19,6 +19,7 @@
 package activate
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -28,6 +29,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/Kampe/Herdforge/pkg/gitroot"
 )
 
 // DefaultDeployables is the canonical five-deployable runtime set.
@@ -329,7 +332,7 @@ func resolveRepoRoot() string {
 	if r := os.Getenv("HERD_ROOT"); r != "" {
 		return r
 	}
-	out, err := exec.Command("git", "rev-parse", "--path-format=absolute", "--git-common-dir").Output()
+	out, err := gitCommonDirBytes()
 	if err != nil {
 		return ""
 	}
@@ -348,7 +351,7 @@ func resolveRepoRoot() string {
 // other location (linked worktree, nested dir) is refused to prevent
 // forked bind mounts against an unguarded stack.
 func ensureCanonicalCheckout() error {
-	out, err := exec.Command("git", "rev-parse", "--path-format=absolute", "--git-common-dir").Output()
+	out, err := gitCommonDirBytes()
 	if err != nil {
 		return fmt.Errorf("herd-activate: not a git checkout (git rev-parse --git-common-dir failed): %w", err)
 	}
@@ -529,4 +532,15 @@ func (f herdKickFleet) Kick(reason string) error {
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	return cmd.Run()
+}
+
+// gitCommonDirBytes preserves this file's byte-oriented call shape while routing
+// the actual resolution through the single definition (FAC-565). Two call sites
+// here each re-derived the shared git directory independently.
+func gitCommonDirBytes() ([]byte, error) {
+	common, err := gitroot.CommonDir(context.Background(), ".")
+	if err != nil {
+		return nil, err
+	}
+	return []byte(common + "\n"), nil
 }

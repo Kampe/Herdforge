@@ -1,6 +1,7 @@
 package confinement
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -10,6 +11,8 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+
+	"github.com/Kampe/Herdforge/pkg/gitroot"
 )
 
 // ErrOSUnavailable is returned when production requires OS write isolation
@@ -806,17 +809,14 @@ func absoluteGitDir(worktree string) (string, error) {
 }
 
 // absoluteGitCommonDir returns the absolute common git directory (object store).
-func absoluteGitCommonDir(worktree string) (string, error) {
-	out, err := exec.Command("git", "-C", worktree, "rev-parse", "--git-common-dir").Output()
+func absoluteGitCommonDir(wt string) (string, error) {
+	// FAC-565: this asked git for the common dir WITHOUT
+	// --path-format=absolute and then hand-rolled the absolutization. Correct,
+	// but it is the same rule written again — and one of a dozen copies. The
+	// shared definition already guarantees absolute.
+	path, err := gitroot.CommonDir(context.Background(), wt)
 	if err != nil {
-		return "", fmt.Errorf("git rev-parse --git-common-dir: %w", err)
-	}
-	path := strings.TrimSpace(string(out))
-	if path == "" {
-		return "", fmt.Errorf("empty git-common-dir")
-	}
-	if !filepath.IsAbs(path) {
-		path = filepath.Join(worktree, path)
+		return "", err
 	}
 	return realPath(path)
 }

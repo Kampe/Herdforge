@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+
+	"github.com/Kampe/Herdforge/pkg/gitroot"
 )
 
 // ResolveCanonicalRoot resolves the true repository root regardless of
@@ -27,14 +29,9 @@ func ResolveCanonicalRoot(ctx context.Context, startDir, override string) (strin
 	if startDir == "" {
 		startDir = "."
 	}
-	cmd := execCommandContext(ctx, "git", "-C", startDir, "rev-parse", "--path-format=absolute", "--git-common-dir")
-	out, err := cmd.CombinedOutput()
+	common, err := GitCommonDir(ctx, startDir)
 	if err != nil {
-		return "", fmt.Errorf("resolve canonical root from %q: git-common-dir: %v (%s)", startDir, err, strings.TrimSpace(string(out)))
-	}
-	common := strings.TrimSpace(string(out))
-	if common == "" {
-		return "", fmt.Errorf("resolve canonical root from %q: empty git-common-dir", startDir)
+		return "", fmt.Errorf("resolve canonical root from %q: %w", startDir, err)
 	}
 	parent := filepath.Dir(common)
 	if parent == "" || parent == "." {
@@ -134,4 +131,23 @@ func pathsEqual(a, b string) bool {
 
 func caseInsensitiveFS() bool {
 	return runtime.GOOS == "darwin" || runtime.GOOS == "windows"
+}
+
+// GitCommonDir is THE definition of "where is this repository's shared git
+// directory".
+//
+// FAC-565: this exact invocation was written in twelve places, and two of them
+// omitted --path-format=absolute, so they could return a RELATIVE path while
+// every other caller assumed absolute. That is not a style difference; it is a
+// divergence that produces a different answer depending on the caller's working
+// directory, which is precisely how the handoff mailbox (FAC-572's predecessor)
+// and the review root (FAC-572) came to disagree about where a project lives.
+//
+// Always absolute, always fail-closed on an empty or failed resolution.
+func GitCommonDir(ctx context.Context, startDir string) (string, error) {
+	common, err := gitroot.CommonDir(ctx, startDir)
+	if err != nil {
+		return "", err
+	}
+	return normalizePath(common), nil
 }

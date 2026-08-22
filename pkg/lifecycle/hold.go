@@ -5,10 +5,11 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/Kampe/Herdforge/pkg/gitroot"
 )
 
 var (
@@ -136,13 +137,10 @@ func CanonicalStatePath(repoRoot string) string {
 // for unit tests that are not git repositories.
 func CanonicalStatePathForLaunchDB(launchDB string) (string, error) {
 	root := filepath.Dir(filepath.Dir(launchDB))
-	out, err := exec.Command("git", "-C", root, "rev-parse", "--path-format=absolute", "--git-common-dir").Output()
+	// FAC-565: one definition of "this repository's shared git directory".
+	common, err := gitroot.CommonDir(context.Background(), root)
 	if err != nil {
 		return "", fmt.Errorf("resolve git-common state root from %q: %w", root, err)
-	}
-	common := strings.TrimSpace(string(out))
-	if common == "" {
-		return "", errors.New("resolve git-common state root: empty git-common-dir")
 	}
 	return CanonicalStatePath(filepath.Dir(common)), nil
 }

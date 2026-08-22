@@ -57,6 +57,21 @@ var ubiquitous = map[string]bool{
 	// gate must keep firing on it.
 	"--format=%(refname)": true, "--format=%(refname:short)": true,
 	"--format=%H": true, "--format=%(objectname)": true,
+	// FAC-565: protocol and format vocabulary. A MIME type, a URL scheme, or a
+	// well-known manifest filename carries no project decision — every file
+	// that speaks HTTP names "application/json" for the same reason every file
+	// that speaks git names origin/main. Counting these as duplicated rules
+	// inflated the backlog with 100+ entries that no consolidation could ever
+	// legitimately remove, which devalues the real findings underneath.
+	//
+	// Deliberately NOT here: git flags that select a POLICY, such as
+	// --is-ancestor, --git-common-dir, --show-toplevel and --abbrev-ref. Those
+	// each answer a question the project must answer one way, and two of them
+	// have already caused consumer-visible divergences.
+	"application/": true, "application/json": true, "text/plain": true,
+	"http:/": true, "https:/": true, "http://": true, "https://": true,
+	"unix:/": true, "unix://": true,
+	"package.json": true, "pnpm-lock.yaml": true, "go.mod": true, "go.sum": true,
 }
 
 // Distinctive reports whether a literal is the kind that encodes a rule.
@@ -105,7 +120,13 @@ func indexKeys(value string) []string {
 	keys := []string{value}
 	if i := strings.Index(value, "/"); i > 0 {
 		prefix := value[:i+1]
-		if prefix != value && len(prefix) >= 6 {
+		// FAC-565: the ubiquitous exclusion was applied to the literal but NOT
+		// to the derived prefix, so ".herd/review-ledger.jsonl" contributed a
+		// ".herd/" key even though ".herd/" is explicitly shared vocabulary.
+		// That made the two largest entries in the backlog — 37 and 11
+		// locations — artifacts of the index rather than real duplication, and
+		// no consolidation could ever have removed them.
+		if prefix != value && len(prefix) >= 6 && !ubiquitous[prefix] {
 			keys = append(keys, prefix)
 		}
 	}
