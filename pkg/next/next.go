@@ -60,7 +60,7 @@ func NewNextPicker(cfg *config.Config, tp provider.TaskProvider) *NextPicker {
 		// cannot read a different corpus than review-ingest wrote to.
 		ReviewArtifact: reviewroot.Resolve(".").Inbox(),
 		InboxDir:       reviewroot.Resolve(".").Inbox(),
-		LedgerPath:     filepath.Join(".herd", "review-ledger.jsonl"),
+		LedgerPath:     reviewledger.DefaultPath(""),
 	}
 }
 

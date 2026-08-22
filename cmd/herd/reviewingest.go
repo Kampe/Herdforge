@@ -278,7 +278,7 @@ func parseReviewIngestArgs(args []string) (reviewIngestArgs, error) {
 		// FAC-572: resolved through the ONE review-root resolver, so this
 		// command cannot audit a different corpus than the queue refers to.
 		auditRoot:  reviewroot.Resolve(".").Root,
-		ledgerPath: filepath.Join(".herd", "review-ledger.jsonl"),
+		ledgerPath: reviewledger.DefaultPath(""),
 	}
 	for i := 0; i < len(args); i++ {
 		arg := args[i]
@@ -654,7 +654,7 @@ func runHarvestMerge() {
 		os.Exit(1)
 	}
 	if report.ReconstructedSHA != "" {
-		ledger, ledgerErr := reviewledger.NewReviewLedger(".", filepath.Join(".herd", "review-ledger.jsonl"))
+		ledger, ledgerErr := reviewledger.NewReviewLedger(".", reviewledger.DefaultPath(""))
 		if ledgerErr != nil {
 			fmt.Fprintf(os.Stderr, "herd harvest-merge: open review ledger for reconstruction: %v\n", ledgerErr)
 			os.Exit(1)
@@ -782,7 +782,7 @@ func resolveHarvestCandidateWithReconstructionAt(repoRoot, branch, requested, re
 		return harvestCandidateReport{}, fmt.Errorf("%s resolved to no commit", branch)
 	}
 
-	ledger, err := reviewledger.NewReviewLedger(repoRoot, filepath.Join(repoRoot, ".herd", "review-ledger.jsonl"))
+	ledger, err := reviewledger.NewReviewLedger(repoRoot, reviewledger.DefaultPath(repoRoot))
 	if err != nil {
 		return harvestCandidateReport{}, fmt.Errorf("open review ledger: %w", err)
 	}
@@ -1042,7 +1042,7 @@ func harvestMergeVerdict(sha, operatorVeto string) (harvestmerge.Verdict, error)
 			"Only FAIL/BLOCKED may be supplied here, and only to refuse", v)
 	}
 
-	ledger, err := reviewledger.NewReviewLedger(".", filepath.Join(".herd", "review-ledger.jsonl"))
+	ledger, err := reviewledger.NewReviewLedger(".", reviewledger.DefaultPath(""))
 	if err != nil {
 		return "", fmt.Errorf("open review ledger: %w", err)
 	}

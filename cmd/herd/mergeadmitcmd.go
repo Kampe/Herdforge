@@ -236,7 +236,7 @@ func buildMergeGate(ref, taskID string, prNumber int) (*mergeadmit.Gate, error) 
 	if err != nil {
 		return nil, fmt.Errorf("merge policy: %w", err)
 	}
-	ledger, err := reviewledger.NewReviewLedger(".", filepath.Join(".herd", "review-ledger.jsonl"))
+	ledger, err := reviewledger.NewReviewLedger(".", reviewledger.DefaultPath(""))
 	if err != nil {
 		return nil, fmt.Errorf("open review ledger: %w", err)
 	}

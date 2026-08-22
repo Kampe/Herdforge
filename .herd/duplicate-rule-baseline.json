@@ -167,14 +167,6 @@
       "pkg/agentpolicy/compile.go",
       "pkg/harness/harness.go"
     ],
-    "--untracked-files=all": [
-      "cmd/herd/main.go",
-      "pkg/verifier/verifier.go"
-    ],
-    "--untracked-files=no": [
-      "pkg/preflight/preflight.go",
-      "pkg/verifier/hermetic_docker_runner.go"
-    ],
     "./cmd/herd": [
       "pkg/security/harness_probe.go",
       "pkg/security/hostcreds_mitm.go"
@@ -199,15 +191,12 @@
     ],
     ".herd/herd.yaml": [
       "cmd/herd/boarddone.go",
-      "cmd/herd/deps.go",
       "cmd/herd/envplan.go",
       "cmd/herd/feedback.go",
-      "cmd/herd/hold.go",
       "cmd/herd/main.go",
       "cmd/herd/mergeadmitcmd.go",
       "cmd/herd/pulse.go",
       "cmd/herd/stop.go",
-      "cmd/herd/wave.go",
       "pkg/classify/rules.go"
     ],
     ".herd/lane-registry.json": [
@@ -320,12 +309,6 @@
       "pkg/provider/fence_broker.go",
       "pkg/provider/fence_broker_minter.go"
     ],
-    "/v1/chat/completions": [
-      "cmd/herd/hostcreds.go",
-      "pkg/security/hostcreds_author_causal.go",
-      "pkg/security/hostcreds_proof.go",
-      "pkg/security/hostcreds_types.go"
-    ],
     "/v1/ops/": [
       "pkg/provider/fence_broker.go",
       "pkg/provider/fence_broker_client.go"
@@ -427,18 +410,6 @@
     "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa": [
       "pkg/signerboundary/launch.go",
       "pkg/signerboundary/prove_sep.go"
-    ],
-    "api.anthropic.com": [
-      "pkg/security/host_creds.go",
-      "pkg/security/hostcreds_types.go",
-      "pkg/security/verify_tools.go"
-    ],
-    "api.openai.com": [
-      "pkg/security/host_creds.go",
-      "pkg/security/hostcreds_session.go",
-      "pkg/security/hostcreds_types.go",
-      "pkg/security/kind_auth.go",
-      "pkg/security/verify_tools.go"
     ],
     "approve refuses mutation without live lease: %w": [
       "cmd/herd/fac147_fence.go",
@@ -699,12 +670,6 @@
       "pkg/verifier/hermetic_docker_policy.go",
       "pkg/verifier/hermetic_docker_runner.go"
     ],
-    "litellm/": [
-      "cmd/herd/main.go",
-      "pkg/launch/launch.go",
-      "pkg/router/launch.go",
-      "pkg/router/route.go"
-    ],
     "litellm/codex/": [
       "pkg/launch/launch.go",
       "pkg/router/launch.go"
@@ -760,7 +725,6 @@
       "pkg/process/process.go"
     ],
     "origin/main..HEAD": [
-      "cmd/herd/main.go",
       "pkg/sync/sync.go",
       "pkg/verifier/completion.go"
     ],
@@ -849,10 +813,8 @@
     "review-ledger.jsonl": [
       "cmd/herd/drainselftest.go",
       "cmd/herd/main.go",
-      "cmd/herd/mergeadmitcmd.go",
-      "cmd/herd/reviewingest.go",
       "cmd/herd/shot_task.go",
-      "pkg/next/next.go"
+      "pkg/reviewledger/path.go"
     ],
     "reviewer family matches author family (self-verdict)": [
       "pkg/reviewledger/admission.go",
