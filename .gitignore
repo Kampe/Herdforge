@@ -120,3 +120,12 @@ TASK-PACKET.md
 **/.herd/legacy-tab-state.jsonl
 .herd/command-sessions.db
 .herd/container-lifecycle.db
+
+# Runtime ledger and queue state. These are per-checkout operational files, not
+# source: tracking them makes a live fleet's state a merge conflict, and an
+# empty tracked copy would overwrite a real one on checkout. Two were swept in
+# by a `git add -A` that ran after a command created them.
+.herd/review-ledger.jsonl
+.herd/harvest-queue.jsonl
+.herd/review-ledger.jsonl.*
+.herd/harvest-queue.jsonl.*
