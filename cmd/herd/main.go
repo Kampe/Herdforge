@@ -41,6 +41,7 @@ import (
 	"github.com/Kampe/Herdforge/pkg/envplan"
 	"github.com/Kampe/Herdforge/pkg/feedback"
 	"github.com/Kampe/Herdforge/pkg/goalguard"
+	"github.com/Kampe/Herdforge/pkg/gitroot"
 	"github.com/Kampe/Herdforge/pkg/harvest"
 	"github.com/Kampe/Herdforge/pkg/herdr"
 	"github.com/Kampe/Herdforge/pkg/kick"
@@ -9862,11 +9863,12 @@ func reportBrokerUnavailable(ref, sock string, cause error) error {
 // repoRootFromWorktree resolves the main repository root from inside any
 // git worktree via the shared common dir.
 func repoRootFromWorktree(dir string) (string, error) {
-	out, err := exec.Command("git", "-C", dir, "rev-parse", "--path-format=absolute", "--git-common-dir").Output()
+	// FAC-565: one definition of the shared git directory.
+	common, err := gitroot.CommonDir(context.Background(), dir)
 	if err != nil {
 		return "", fmt.Errorf("git common dir: %w", err)
 	}
-	return filepath.Dir(strings.TrimSpace(string(out))), nil
+	return filepath.Dir(common), nil
 }
 
 // isManagedWorktree reports whether path is one of the fleet's dispatched

@@ -20,6 +20,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/Kampe/Herdforge/pkg/gitroot"
 )
 
 // ============================================================================
@@ -279,10 +281,9 @@ func repoRoot() string {
 	if r := os.Getenv("HERD_REPO_ROOT"); r != "" {
 		return r
 	}
-	// Fall back to git rev-parse.
-	out, err := exec.Command("git", "rev-parse", "--show-toplevel").Output()
-	if err == nil {
-		return strings.TrimSpace(string(out))
+	// Fall back to git. FAC-565: one definition of the working-tree root.
+	if top, err := gitroot.Toplevel(context.Background(), "."); err == nil {
+		return top
 	}
 	return "."
 }

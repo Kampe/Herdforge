@@ -1,6 +1,7 @@
 package dispatch
 
 import (
+	"context"
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/sha256"
@@ -12,6 +13,8 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+
+	"github.com/Kampe/Herdforge/pkg/gitroot"
 )
 
 var randRead = rand.Read
@@ -146,11 +149,11 @@ func RepositoryIdentity(repoRoot, configuredName string) (string, error) {
 		// No remote: fall back to the repository's COMMON git dir, which is
 		// shared by every worktree of the same repository — a per-worktree
 		// path would mint a different identity (and key) per worktree.
-		out, err := exec.Command("git", "-C", repoRoot, "rev-parse", "--path-format=absolute", "--git-common-dir").Output()
+		// FAC-565: one definition of the shared git directory.
+		common, err := gitroot.CommonDir(context.Background(), repoRoot)
 		if err != nil {
 			return "", fmt.Errorf("repository identity: no origin and no git common dir at %s: %w", repoRoot, err)
 		}
-		common := strings.TrimSpace(string(out))
 		if resolved, rErr := filepath.EvalSymlinks(common); rErr == nil {
 			common = resolved
 		}
