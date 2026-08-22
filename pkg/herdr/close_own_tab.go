@@ -55,24 +55,13 @@ func CloseOwnTab(tabID string) error {
 	}
 
 	// No agent row: the launch failed before the agent registered, so there is
-	// nothing to fence against. Close the exact tab and prove it is gone.
+	// no fencing evidence to compare against. FAC-569: even this path goes
+	// through the single definition, so the degrade-versus-refuse decision and
+	// the absence readback cannot fork a third time. With no agent row there is
+	// no generation, which CloseExactTab treats as the capability gap it is.
 	workspace := workspaceForTab(tabID, agents)
-	if err := tabCloseRaw(tabID); err != nil {
+	if _, err := CloseExactTab(ExactTabIdentity{Workspace: workspace, TabID: tabID}); err != nil {
 		return fmt.Errorf("herdr close own tab %s: %w", tabID, err)
-	}
-	if workspace == "" {
-		// Without a workspace the absence readback is not available. The close
-		// itself succeeded; report that rather than inventing a proof.
-		return nil
-	}
-	tabs, err := TabList(workspace)
-	if err != nil {
-		return fmt.Errorf("herdr close own tab %s: absence readback: %w", tabID, err)
-	}
-	for _, tab := range tabs {
-		if tab.TabID == tabID {
-			return fmt.Errorf("herdr close own tab %s: tab still present after close", tabID)
-		}
 	}
 	return nil
 }

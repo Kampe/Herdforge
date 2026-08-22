@@ -3,7 +3,6 @@ package herdr
 import (
 	"crypto/rand"
 	"encoding/hex"
-	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -74,56 +73,20 @@ func hardCloseTab(tabID, name string) error {
 			if (tabID != "" && a.TabID == tabID) || (name != "" && a.Name == name) {
 				found = true
 				if !closeAttempted {
-					if a.StateChangeSeq == 0 {
-						// FAC-579: this returned BEFORE the missing-verb
-						// degradation below, so the degradation was unreachable
-						// for exactly the herdr build that needed it. A herdr
-						// with no compare-close verb also reports no immutable
-						// generation, so every failed launch on such a build
-						// stranded its own tab as an orphan.
-						//
-						// No generation means the build has no CAS support at
-						// all, which is the same capability gap as a missing
-						// verb: degrade loudly to plain close plus the absence
-						// readback this loop already performs.
-						fmt.Fprintf(os.Stderr,
-							"herdr: WARN tab %s reports no immutable generation, so this herdr has no compare-and-close support; closing unfenced and proving absence by readback\n",
-							a.TabID)
-						if rerr := tabCloseRaw(a.TabID); rerr != nil {
-							return fmt.Errorf("FAC-133 cleanup: no generation available and plain close failed: %w", rerr)
-						}
-						closeAttempted = true
-						break
+					// FAC-569: this used to carry its own attempt/degrade/prove
+					// logic, which disagreed with the cleanup path's copy about
+					// whether a stale generation may be delegated. One
+					// definition now decides.
+					out, cerr := CloseExactTab(exactIdentityFor(a))
+					if cerr != nil {
+						return fmt.Errorf("FAC-133 cleanup: %w", cerr)
 					}
-					if err := TabCloseCAS(CloseRequest{
-						WorkspaceID: a.Workspace,
-						TabID:       a.TabID,
-						Generation:  strconv.FormatUint(a.StateChangeSeq, 10),
-						TabRevision: a.Revision,
-						Nonce:       "live-proof-close-" + strconv.FormatInt(time.Now().UnixNano(), 36),
-					}); err != nil {
-						// FAC-577: when the installed herdr has no
-						// compare-close VERB at all, refusing here strands the
-						// exact tab we just created as an orphan an operator
-						// must close by hand. That is strictly worse than the
-						// risk compare-and-close exists to prevent.
-						//
-						// The invariant that matters is resulting ABSENCE, and
-						// the loop below still proves it by readback. So degrade
-						// only for a missing verb, loudly, and only for a pane
-						// whose identity this process owns. A real CAS conflict
-						// (stale generation, attachment changed, active
-						// mutation, protected) is a genuine refusal and still
-						// propagates untouched.
-						if !closeVerbUnsupported(err) {
-							return fmt.Errorf("FAC-133 cleanup compare-and-close: %w", err)
-						}
+					if out.Delegated {
+						// Human-facing path, so surface the degradation here
+						// rather than from the shared definition.
 						fmt.Fprintf(os.Stderr,
-							"herdr: WARN installed herdr has no tab compare-close verb (%v); closing tab %s unfenced and proving absence by readback\n",
-							err, a.TabID)
-						if rerr := tabCloseRaw(a.TabID); rerr != nil {
-							return fmt.Errorf("FAC-133 cleanup: compare-close unavailable and plain close failed: %w", errors.Join(err, rerr))
-						}
+							"herdr: WARN tab %s could not be fenced (this herdr has no compare-and-close support); closed directly with absence proven by readback\n",
+							a.TabID)
 					}
 					closeAttempted = true
 				}
@@ -136,6 +99,26 @@ func hardCloseTab(tabID, name string) error {
 		time.Sleep(150 * time.Millisecond)
 	}
 	return fmt.Errorf("FAC-133 cleanup: tab %s / name %s still present after close", tabID, name)
+}
+
+// exactIdentityFor projects a live agent row into the close identity. Copying
+// the whole row here (rather than a field-by-field literal elsewhere) is what
+// keeps a new identity field from being silently dropped.
+func exactIdentityFor(a AgentEntry) ExactTabIdentity {
+	id := ExactTabIdentity{
+		Workspace: a.Workspace,
+		TabID:     a.TabID,
+		Name:      a.Name,
+		PaneID:    a.PaneID,
+		SessionID: a.Session.Value,
+		Kind:      a.Kind,
+		Revision:  a.Revision,
+		Nonce:     "live-proof-close-" + strconv.FormatInt(time.Now().UnixNano(), 36),
+	}
+	if a.StateChangeSeq != 0 {
+		id.Generation = strconv.FormatUint(a.StateChangeSeq, 10)
+	}
+	return id
 }
 
 // CloseTabVerified closes an exact tab through the fenced path and confirms
@@ -573,35 +556,3 @@ func proveLiveHarness(kind, realBin, tmp string) (modelOK, toolOK, viaLA, contai
 }
 
 
-// closeVerbUnsupported reports whether an error means the installed herdr does
-// not implement compare-close AT ALL, as opposed to refusing this particular
-// close.
-//
-// The distinction is the whole point: a missing verb is a capability gap that
-// must degrade to close-plus-absence-readback so a failed launch cannot orphan
-// its own tab, while a stale generation or changed attachment is a real
-// conflict that must keep refusing.
-func closeVerbUnsupported(err error) bool {
-	if err == nil {
-		return false
-	}
-	msg := strings.ToLower(err.Error())
-	for _, conflict := range []string{
-		"stale-generation", "attachment-changed", "active-mutation", "protected",
-		"unresolved intent", "without resulting absence",
-	} {
-		if strings.Contains(msg, conflict) {
-			return false
-		}
-	}
-	for _, missing := range []string{
-		"unknown command", "unrecognized command", "unknown subcommand",
-		"invalid choice", "not a herdr command", "no such command",
-		"unknown flag", "command not found", "usage:",
-	} {
-		if strings.Contains(msg, missing) {
-			return true
-		}
-	}
-	return false
-}
