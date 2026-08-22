@@ -68,15 +68,19 @@ func CapabilityGapReason(err error) bool {
 
 // ExactTabIdentity is everything needed to close one tab and prove it is gone.
 type ExactTabIdentity struct {
-	Workspace  string
-	TabID      string
-	Name       string
-	PaneID     string
-	SessionID  string
-	Kind       string
-	Revision   uint64
-	Generation string // empty when the build exposes none
-	Nonce      string
+	Workspace string
+	TabID     string
+	Name      string
+	PaneID    string
+	SessionID string
+	// SessionGeneration accompanies SessionID. Both or neither: the close
+	// contract refuses a session id without its generation, so sending one
+	// alone converts a closable tab into a permanent refusal.
+	SessionGeneration string
+	Kind              string
+	Revision          uint64
+	Generation        string // empty when the build exposes none
+	Nonce             string
 }
 
 // CloseExactTabOutcome is the result of one close attempt.
@@ -96,26 +100,7 @@ func CloseExactTab(id ExactTabIdentity) (CloseExactTabOutcome, error) {
 	if strings.TrimSpace(id.TabID) == "" {
 		return CloseExactTabOutcome{}, fmt.Errorf("close exact tab: tab id is required")
 	}
-	nonce := id.Nonce
-	if strings.TrimSpace(nonce) == "" {
-		nonce = fmt.Sprintf("close-exact-%s-%d", id.TabID, id.Revision)
-	}
-	req := CloseRequest{
-		WorkspaceID: id.Workspace,
-		TabID:       id.TabID,
-		Generation:  id.Generation,
-		TabRevision: id.Revision,
-		Nonce:       nonce,
-	}
-	if id.PaneID != "" {
-		req.PaneIDs = []string{id.PaneID}
-	}
-	if id.SessionID != "" {
-		req.SessionID = id.SessionID
-	}
-	if id.Kind != "" {
-		req.Agent = id.Kind
-	}
+	req := closeRequestFor(id)
 
 	delegated := false
 	if err := TabCloseCAS(req); err != nil {
@@ -193,4 +178,44 @@ func stillPresent(id ExactTabIdentity, delegated bool) (CloseExactTabOutcome, er
 		}
 	}
 	return out, fmt.Errorf("close exact tab %s: absence readback: still present after close", id.TabID)
+}
+
+// closeRequestFor builds the fenced close request for one exact identity.
+//
+// Extracted so the session-identity rule below is testable without a live
+// herdr: it was inline, and the rule it encodes had already caused a
+// fleet-wide outage once.
+func closeRequestFor(id ExactTabIdentity) CloseRequest {
+	nonce := id.Nonce
+	if strings.TrimSpace(nonce) == "" {
+		nonce = fmt.Sprintf("close-exact-%s-%d", id.TabID, id.Revision)
+	}
+	req := CloseRequest{
+		WorkspaceID: id.Workspace,
+		TabID:       id.TabID,
+		Generation:  id.Generation,
+		TabRevision: id.Revision,
+		Nonce:       nonce,
+	}
+	if id.PaneID != "" {
+		req.PaneIDs = []string{id.PaneID}
+	}
+	// FAC-577: include the session identity ONLY when its generation is also
+	// known. ExpandCloseRequest refuses a session_id without a positive session
+	// generation, and the agent list has no session-generation field at all, so
+	// carrying the id alone made every agent-derived close fail with "session
+	// generation evidence is required with session_id".
+	//
+	// That blocked an entire fleet: five standing lanes could not be closed, so
+	// standing --shutdown could not cycle any of them. The pre-consolidation
+	// hardCloseTab omitted the session id for exactly this reason; carrying it
+	// over in FAC-569 was my regression. Fence on the identity we can evidence.
+	if id.SessionID != "" && strings.TrimSpace(id.SessionGeneration) != "" {
+		req.SessionID = id.SessionID
+		req.SessionGeneration = id.SessionGeneration
+	}
+	if id.Kind != "" {
+		req.Agent = id.Kind
+	}
+	return req
 }
