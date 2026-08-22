@@ -192,6 +192,61 @@ Those columns are not sufficient evidence by themselves:
 
 Unknown provider state, failed delivery, stale review SHA, same-family review, dirty shared checkout, or missing merge evidence must stop the transition.
 
+### The fence broker is required infrastructure
+
+Every board status write is **fenced**: it carries an operation id and a fence
+token, and it must be rejected if a newer fence has already advanced. Stock Kaneo
+cannot enforce that — it has no native fence receiver and no operation dedupe —
+so a fenced write needs something that does, or it fails closed.
+
+That "something" is the fence broker. Without it a restored checkout has fence
+state in `.herd/claim/fences.db` and no way to complete a close, and the first
+symptom is a failed board write in the middle of a mutation. `herd preflight`
+now reports this before work depends on it.
+
+Pick exactly one of three postures:
+
+**1. The coordinator hosts the broker in its own process.** Recommended for a
+coordinator, and the intended contract rather than an implementation detail.
+
+```zsh
+export HERD_FENCE_COORDINATOR=1
+herd board-done <ref>
+```
+
+Mint authority is the process address space: both credentials are generated in
+the coordinator and never written to a file, an environment variable, or the
+wire, so no same-UID worker can read them. Do not also run a standalone broker —
+one live broker per claim volume is enforced by the claim-directory lock, and
+hosting is refused when a broker URL is already configured.
+
+**2. A standalone broker, with other processes as its clients.** Use this when
+several processes must share one broker.
+
+```zsh
+herd fence-broker --claim-dir ./.herd/claim
+export HERD_FENCE_BROKER_URL=<printed url>
+export HERD_FENCE_BROKER_TOKEN=<printed worker token>
+```
+
+A worker receives only the worker token and can never mint a capability. The
+mint token stays with whoever owns the broker process.
+
+**3. An upstream board that natively enforces fence and operation dedupe.**
+
+```zsh
+export HERD_FENCE_ATOMIC_SERVER=1
+```
+
+Only set this against a board that genuinely enforces both. Stock Kaneo does
+not, and asserting it there converts a fail-closed refusal into silent
+double-application.
+
+Hosting is never automatic. Taking the claim-directory lock would lock out every
+other coordinator and any standalone broker on that volume, so it stays an
+explicit choice. Workers, builders, and reviewers are refused outright: a worker
+that hosted a broker would hold mint authority.
+
 ## Configuration
 
 The repository-local config lives at `.herd/herd.yaml` and describes the project, task provider, lanes, routing candidates, and verification commands. Paths stored in configuration and generated artifacts must remain repository-relative.

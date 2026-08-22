@@ -983,6 +983,25 @@ func runPreflightStatic() {
 		os.Exit(1)
 	}
 	fmt.Println("Preflight merge-policy check passed. Required CI and different-family review declared.")
+	// FAC-563: state the fence-broker requirement BEFORE work depends on it.
+	// A report, not a gate: most preflight runs are not about to perform a
+	// fenced board write, and failing them all would train operators to ignore
+	// the check. The point is that the dependency is never first learned from a
+	// refusal in the middle of a mutation.
+	reportFenceBrokerReadiness()
+}
+
+func reportFenceBrokerReadiness() {
+	claimDir := ""
+	if dir, err := provider.CanonicalClaimDir(".", firstEnv("HERD_ROOT", "HERD_REPO_ROOT", "")); err == nil {
+		claimDir = dir
+	}
+	r := preflight.CheckFenceBroker(claimDir)
+	if r.Ready {
+		fmt.Printf("Preflight fence-broker check passed. %s\n", r.Detail)
+		return
+	}
+	fmt.Fprintf(os.Stderr, "Preflight WARNING: %s\n%s\n", r.Detail, r.Remedy)
 }
 
 func runPreflight() {
