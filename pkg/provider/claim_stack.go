@@ -34,6 +34,9 @@ type ClaimStack struct {
 	Manager *claim.ClaimManager
 	TP      TaskProvider
 	Minter  *FenceBrokerMinter // coordinator only; nil on workers
+	// OwnedBroker is set when THIS process hosts the fence broker (FAC-564).
+	// Its lifetime is the stack's, so Close releases the claim-dir lock.
+	OwnedBroker *CoordinatorBroker
 }
 
 // CanonicalClaimDir resolves the single shared claim/fence/outbox directory.
@@ -247,10 +250,46 @@ func OpenClaimStack(dir string, tp TaskProvider) (*ClaimStack, error) {
 		Manager: mgr,
 		TP:      tp,
 	}
-	// Never auto-load minter: claim-dir fence-mint.cred is same-UID readable and
-	// is not an authority boundary (FAC-169). Coordinators must call
-	// AttachCoordinatorMinter explicitly after a non-forgeable launch path.
-	// Workers never receive minter.
+	// FAC-564: a coordinator may host the broker itself, which is the
+	// production mint authority. The boundary is the address space: both
+	// credentials are generated in this process and never written to the claim
+	// dir or the environment, so no same-UID worker can read them.
+	//
+	// Opt-in and explicit. A worker must never take this path, and it is
+	// refused when a broker URL is already configured, because that means a
+	// standalone broker owns the claim volume and this process is a client of
+	// it, not its owner.
+	if isRealKaneoProvider(tp) && coordinatorOwnsBroker() {
+		if url := strings.TrimSpace(os.Getenv(envFenceBrokerURL)); url != "" {
+			_ = stack.Close()
+			return nil, fmt.Errorf("provider: %s is set, so a standalone broker owns this claim volume; unset it to host the broker in-process, or drop %s to act as a client",
+				envFenceBrokerURL, envFenceCoordinator)
+		}
+		k, _ := UnwrapTaskProvider(tp).(*KaneoProvider)
+		cb, cerr := StartCoordinatorBroker(CoordinatorBrokerOptions{
+			ClaimDir:        dir,
+			UpstreamURL:     strings.TrimSpace(os.Getenv("HERD_KANEO_URL")),
+			UpstreamProject: strings.TrimSpace(os.Getenv("HERD_KANEO_PROJECT")),
+		})
+		if cerr != nil {
+			_ = stack.Close()
+			return nil, fmt.Errorf("provider: coordinator-owned broker: %w", cerr)
+		}
+		if err := ConfigureKaneoFenceBroker(k, cb.Client); err != nil {
+			_ = cb.Close()
+			_ = stack.Close()
+			return nil, fmt.Errorf("provider: attach coordinator broker: %w", err)
+		}
+		if err := AttachCoordinatorMinter(k, cb.Minter); err != nil {
+			_ = cb.Close()
+			_ = stack.Close()
+			return nil, fmt.Errorf("provider: attach coordinator minter: %w", err)
+		}
+		stack.Minter = cb.Minter
+		stack.OwnedBroker = cb
+	}
+	// Otherwise never auto-load a minter: claim-dir fence-mint.cred is same-UID
+	// readable and is not an authority boundary. Workers never receive one.
 	return stack, nil
 }
 
@@ -260,6 +299,13 @@ func (s *ClaimStack) Close() error {
 		return nil
 	}
 	var first error
+	// The broker holds the claim-dir flock; release it before the stores so a
+	// later process is not refused by a lock this one already finished with.
+	if s.OwnedBroker != nil {
+		if err := s.OwnedBroker.Close(); err != nil && first == nil {
+			first = err
+		}
+	}
 	if s.CAS != nil {
 		if err := s.CAS.Close(); err != nil && first == nil {
 			first = err
