@@ -3,10 +3,15 @@ package main
 import (
 	"path/filepath"
 	"testing"
+
+	"github.com/Kampe/Herdforge/pkg/reviewroot"
 )
 
 func TestParseReviewIngestArgs(t *testing.T) {
-	defaultRoot := filepath.Join(".herd", "review")
+	// FAC-572: the default review root is no longer cwd-relative. It comes from
+	// the one canonical resolver, so this command cannot audit a different
+	// corpus than the queue refers to depending on where it was run.
+	defaultRoot := reviewroot.Resolve(".").Root
 	defaultLedger := filepath.Join(".herd", "review-ledger.jsonl")
 	tests := []struct {
 		name      string

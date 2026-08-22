@@ -20,6 +20,8 @@ import (
 	"github.com/Kampe/Herdforge/pkg/reviewingest"
 	"github.com/Kampe/Herdforge/pkg/reviewledger"
 	hsync "github.com/Kampe/Herdforge/pkg/sync"
+
+	"github.com/Kampe/Herdforge/pkg/reviewroot"
 )
 
 var sha40Re = regexp.MustCompile(`^[0-9a-f]{40}$`)
@@ -127,13 +129,13 @@ func New(opts IndexOptions) *CandidateIndex {
 		opts.MailPath = mail.CallbackMailPath(opts.RepoRoot)
 	}
 	if opts.LedgerPath == "" && opts.RepoRoot != "" {
-		opts.LedgerPath = filepath.Join(opts.RepoRoot, ".herd", "review", "ledger.jsonl")
+		opts.LedgerPath = reviewroot.Resolve(opts.RepoRoot).Ledger()
 	}
 	if opts.QueuePath == "" && opts.RepoRoot != "" {
-		opts.QueuePath = filepath.Join(opts.RepoRoot, ".herd", "review", "queue.jsonl")
+		opts.QueuePath = reviewroot.Resolve(opts.RepoRoot).Queue()
 	}
 	if opts.InboxDir == "" && opts.RepoRoot != "" {
-		opts.InboxDir = filepath.Join(opts.RepoRoot, ".herd", "review", "inbox")
+		opts.InboxDir = reviewroot.Resolve(opts.RepoRoot).Inbox()
 	}
 	if opts.WorktreesDir == "" && opts.RepoRoot != "" {
 		opts.WorktreesDir = filepath.Join(opts.RepoRoot, ".herd", "worktrees")
