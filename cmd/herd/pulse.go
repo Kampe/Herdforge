@@ -997,5 +997,17 @@ func pulseReviewPacket(lane pulse.AgentObservation, commits []harvest.UnlandedCo
 	b.WriteString("\nYou own candidate discovery, receipt admission, reviewer dispatch, retries, " +
 		"verdict ingest, and reviewer-pane cleanup. Do not ask the coordinator to perform any " +
 		"of them.\n")
+	// FAC-569: a live supervisor consumed two sequential nudges and reported
+	// "The latest handoff supersedes the DeFi request", processing only the
+	// newer one and leaving BOTH durable records unread. Retention alone did
+	// not help because the supervisor treated the pane as the queue. The packet
+	// must state that it is not the queue.
+	b.WriteString("\nTHIS NUDGE DOES NOT SUPERSEDE ANY EARLIER HANDOFF. Handoffs are queued " +
+		"durably and each is independent work; a newer one never cancels an older one. " +
+		"Your DURABLE INBOX is the authority, not this pane:\n" +
+		"  herd handoffs list                 # every pending handoff addressed to you\n" +
+		"  herd handoffs done <id>            # only after that handoff reaches a disposition\n" +
+		"Drain the inbox before acting on pane text. An unread entry always means unfinished " +
+		"work, so never mark one done to clear the list.\n")
 	return b.String()
 }

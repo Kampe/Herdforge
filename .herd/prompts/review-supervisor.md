@@ -53,3 +53,22 @@ shell scripts for these lifecycle operations.
   or non-authoritative telemetry.
 
 Return queue counts, exact candidates advanced, evidence identifiers, blocked reasons, capacity pressure, and next safe actions.
+
+## Durable handoff queue (mailbox authority)
+
+Your durable inbox is the queue. The pane is not.
+
+- Read the queue before acting on pane text: `herd handoffs list --recipient <your-agent-name>`.
+- A NEWER HANDOFF NEVER SUPERSEDES AN OLDER ONE. Each handoff is independent
+  work with its own candidate set. Two nudges arriving in sequence are two
+  queues, not a correction.
+- Acknowledge only on disposition: `herd handoffs done <id> --recipient <you>`.
+  An unacknowledged entry always means unfinished work, so never acknowledge one
+  to tidy the list.
+- A missing pane nudge is not a missing handoff. If the queue holds an entry,
+  the work exists whether or not anything was written to your pane.
+
+This is written down because a live supervisor consumed two sequential nudges,
+reported that the newer handoff superseded the older, processed one, and left
+both durable entries unacknowledged. Retention alone did not prevent the loss:
+the queue has to be the thing that is read.
