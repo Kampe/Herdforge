@@ -19,7 +19,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/Kampe/Herdforge/pkg/worktree"
+	"github.com/Kampe/Herdforge/pkg/gitroot"
 )
 
 // Rel is the review root relative to a repository root.
@@ -36,6 +36,10 @@ type Paths struct {
 	// one, empty when there is none. Reported so an existing corpus is never
 	// silently orphaned.
 	Divergent string
+	// LaneOverride is a HERD_ROOT that names somewhere other than the project
+	// root. Surfaced because that override silently redirected the whole
+	// resolution before FAC-573.
+	LaneOverride string
 }
 
 func (p Paths) Inbox() string  { return filepath.Join(p.Root, "inbox") }
@@ -52,9 +56,13 @@ func Resolve(startDir string) Paths {
 	if startDir == "" {
 		startDir = "."
 	}
-	override := firstEnv("HERD_ROOT", "HERD_REPO_ROOT")
 	p := Paths{}
-	root, err := worktree.ResolveCanonicalRoot(context.Background(), startDir, override)
+	// FAC-573: resolve the PROJECT control root, not HERD_ROOT. The launch
+	// environment sets HERD_ROOT to the LANE root, so reading it here made a
+	// live supervisor resolve a lane-local corpus while five real handoffs sat
+	// unread in the project one.
+	root, laneOverride, err := gitroot.ProjectRoot(context.Background(), startDir)
+	p.LaneOverride = laneOverride
 	if err != nil || strings.TrimSpace(root) == "" {
 		// Fail SOFT, not closed: refusing to name any review root would stop a
 		// supervisor from reading its own corpus. The Canonical flag makes the
@@ -96,6 +104,10 @@ func (p Paths) Describe() string {
 	fmt.Fprintf(&b, "review root: %s", p.Root)
 	if !p.Canonical {
 		b.WriteString(" (NOT canonical: resolved relative to the current directory)")
+	}
+	if p.LaneOverride != "" {
+		fmt.Fprintf(&b, "\n  note: %s=%s names a lane, not this project; it is deliberately ignored here",
+			gitroot.EnvLaneRoot, p.LaneOverride)
 	}
 	if p.Divergent != "" {
 		fmt.Fprintf(&b, "\n  WARNING: a different, non-empty review root exists at %s;"+

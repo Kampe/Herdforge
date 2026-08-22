@@ -95,3 +95,111 @@ func TestOutsideARepositoryFailsClosed(t *testing.T) {
 		t.Error("a non-repository must not yield a toplevel")
 	}
 }
+
+// TestLaneRootDoesNotHijackTheProjectRoot is the FAC-573 gate.
+//
+// HERD_ROOT was overloaded. The launch environment sets it to the LANE root, so
+// a supervisor launched into its own worktree inherited it — and the mailbox and
+// review-root resolvers, both reading HERD_ROOT as the PROJECT root, agreed with
+// each other and were both wrong. The live supervisor resolved a lane-local
+// mailbox, reported no pending handoffs, and five real ones sat unread.
+//
+// An explicit cd could not repair it: an inherited override outranks the working
+// directory by design. Correct for a lane root, wrong for a project root — which
+// is the tell that these were two values sharing one name.
+func TestLaneRootDoesNotHijackTheProjectRoot(t *testing.T) {
+	base := t.TempDir()
+	repo := filepath.Join(base, "repo")
+	if err := os.MkdirAll(repo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	grGit(t, repo, "init", "-q", "-b", "main")
+	grGit(t, repo, "commit", "-q", "--allow-empty", "-m", "base")
+	lane := filepath.Join(base, "lane")
+	grGit(t, repo, "worktree", "add", "-q", "-b", "feature", lane)
+
+	if err := os.Unsetenv(EnvProjectRoot); err != nil {
+		t.Fatal(err)
+	}
+	// Exactly the live condition: HERD_ROOT points at the lane.
+	t.Setenv(EnvLaneRoot, lane)
+
+	root, laneOverride, err := ProjectRoot(context.Background(), lane)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantRoot, err := filepath.EvalSymlinks(repo)
+	if err != nil {
+		wantRoot = repo
+	}
+	gotRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		gotRoot = root
+	}
+	if gotRoot != wantRoot {
+		t.Fatalf("the lane override must not become the project root:\n  got:  %s\n  want: %s", gotRoot, wantRoot)
+	}
+	if laneOverride == "" {
+		t.Error("a divergent lane override must be surfaced, not silently ignored")
+	}
+	// And resolving from the project itself gives the same answer, because a
+	// control root must be worktree-invariant.
+	fromRepo, _, err := ProjectRoot(context.Background(), repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a, b := evalOrSelf(fromRepo), gotRoot; a != b {
+		t.Errorf("the project root must be worktree-invariant: %s vs %s", a, b)
+	}
+}
+
+// The dedicated variable is honoured, since a launcher or operator must be able
+// to state the project root explicitly.
+func TestExplicitProjectRootWins(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv(EnvProjectRoot, dir)
+	t.Setenv(EnvLaneRoot, filepath.Join(dir, "lane"))
+	root, laneOverride, err := ProjectRoot(context.Background(), ".")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if evalOrSelf(root) != evalOrSelf(dir) {
+		t.Errorf("%s must win, got %s", EnvProjectRoot, root)
+	}
+	if laneOverride == "" {
+		t.Error("a lane root that disagrees must still be surfaced")
+	}
+}
+
+// An agreeing HERD_ROOT is not a divergence and must not produce noise.
+func TestAgreeingLaneRootIsNotReported(t *testing.T) {
+	base := t.TempDir()
+	repo := filepath.Join(base, "repo")
+	if err := os.MkdirAll(repo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	grGit(t, repo, "init", "-q", "-b", "main")
+	grGit(t, repo, "commit", "-q", "--allow-empty", "-m", "base")
+	if err := os.Unsetenv(EnvProjectRoot); err != nil {
+		t.Fatal(err)
+	}
+	root, _, err := ProjectRoot(context.Background(), repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(EnvLaneRoot, root)
+	_, laneOverride, err := ProjectRoot(context.Background(), repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if laneOverride != "" {
+		t.Errorf("an agreeing lane root is not a divergence, got %q", laneOverride)
+	}
+}
+
+func evalOrSelf(p string) string {
+	if r, err := filepath.EvalSymlinks(p); err == nil {
+		return r
+	}
+	return p
+}
