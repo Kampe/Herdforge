@@ -165,3 +165,32 @@ func TestObservedUsageBannerIsACapabilityGap(t *testing.T) {
 		t.Error("a stale generation reported with a banner is still a refusal")
 	}
 }
+
+// TestSessionIdentityRequiresItsGeneration is the FAC-577 regression.
+//
+// ExpandCloseRequest refuses a session_id without a positive session generation,
+// and the agent list has NO session-generation field — so carrying the id alone
+// made every agent-derived close fail with "session generation evidence is
+// required with session_id". Five standing lanes could not be closed and
+// `standing --shutdown` could not cycle any of them.
+//
+// The pre-consolidation hardCloseTab omitted the session id for exactly this
+// reason; carrying it over in FAC-569 was the regression.
+func TestSessionIdentityRequiresItsGeneration(t *testing.T) {
+	// An identity with a session id but no generation must not send either,
+	// because sending the id alone is a guaranteed refusal.
+	id := ExactTabIdentity{Workspace: "wB", TabID: "wB:t1", SessionID: "sess-abc"}
+	req := closeRequestFor(id)
+	if req.SessionID != "" {
+		t.Error("a session id without its generation must be omitted, not sent")
+	}
+	if req.SessionGeneration != "" {
+		t.Error("no generation must be invented")
+	}
+	// With both, both are sent: the stronger fence is used when it is available.
+	full := ExactTabIdentity{Workspace: "wB", TabID: "wB:t1", SessionID: "sess-abc", SessionGeneration: "7"}
+	req = closeRequestFor(full)
+	if req.SessionID != "sess-abc" || req.SessionGeneration != "7" {
+		t.Errorf("both must be sent when both are known, got %+v", req)
+	}
+}

@@ -140,18 +140,29 @@ func requireAgentInWorkspace(target, expected string) (AgentEntry, error) {
 	return matches[0], nil
 }
 
-// PaneSendKeys presses keys in a PANE by id, without going through an agent
-// name.
+// PaneSendKeys presses keys for a pane's agent.
 //
-// FAC-576: the workspace trust dialog is the harness's own TUI, not a prompt
-// turn, and it can be present before the agent name is usable. Addressing the
-// pane directly is what lets it be answered.
+// FAC-577: this ran `herdr pane send-keys`, which DOES NOT EXIST on the
+// installed herdr — `pane` has no send verb at all, only `agent send-keys` and
+// `agent prompt`. So the FAC-576 trust confirmation could never press anything,
+// and it went unnoticed because the review surface happened to sit inside an
+// already-trusted repository. A keystroke path that silently does nothing is
+// worse than none: the caller reports having answered a dialog it never touched.
+//
+// Resolves the agent owning the pane and sends through the verb that exists. A
+// pane with no agent cannot be typed into, and saying so is better than
+// pretending.
 func PaneSendKeys(paneID, keys string) error {
-	out, err := runHerdr("pane", "send-keys", paneID, keys)
+	agents, err := AgentList()
 	if err != nil {
-		return fmt.Errorf("herdr pane send-keys: %s: %w", out, err)
+		return fmt.Errorf("herdr send-keys: resolve agent for pane %s: %w", paneID, err)
 	}
-	return nil
+	for _, a := range agents {
+		if a.PaneID == paneID && strings.TrimSpace(a.Name) != "" {
+			return SendKeys(a.Name, keys)
+		}
+	}
+	return fmt.Errorf("herdr send-keys: no agent owns pane %s", paneID)
 }
 
 // SendKeys presses keys in an agent pane (used for the single Enter nudge:
