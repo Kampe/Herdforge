@@ -1080,7 +1080,10 @@ func bindChildWorkspaceEnv(root, workspace string, env []string) []string {
 	if ignored != "" {
 		bound = append(bound, childWorkspaceOverrideIgnored+"="+ignored)
 	}
-	return bound
+	// FAC-558: normalize the Go toolchain for lanes we launch, so a stale
+	// exported GOROOT inherited from the launcher cannot break every Go command
+	// inside the lane and force env -u GOROOT on each one.
+	return withGoToolchainPinned(bound)
 }
 
 // TabForAgent creates an agent pane WITHOUT a task worktree cwd (standing
