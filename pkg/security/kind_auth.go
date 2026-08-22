@@ -34,13 +34,34 @@ func DiagnoseKindAuthReadinessWith(kind string, auth CredentialAuthority) KindAu
 		return d
 	}
 
-	if kind == AuthorKindAGY || kind == "antigravity" {
+	// FAC-576: harness-authenticated kinds. These hold their own session
+	// through their own CLI login and never present a brokered host credential,
+	// so "is a handle installed for their API host" is the wrong question.
+	//
+	// agy was already exempt here by name. claude was not, even though it is
+	// used exclusively through its harness on this fleet — so a logged-in claude
+	// reported brokerable=false with a demand for an api.anthropic.com handle it
+	// will never use, and every reviewer launch was refused before it started.
+	// One rule, applied to every kind it describes.
+	if harnessAuthenticated(kind) {
 		d.Class = KindAuthOK
 		d.Brokerable = true
 		d.AuthorityClass = "native"
 		d.ReasonCode = "native_auth"
 		d.Blocker = ""
 		d.RecommendedAction = ""
+		// A harness that is present but NOT logged in is a real blocker, and
+		// the preflight exists to say so before a pane is created. Inability to
+		// ask is not evidence of being logged out, so an unanswerable probe
+		// leaves the verdict alone and the launch-time check remains the
+		// backstop.
+		if state := HarnessLoginState(kind); state == HarnessLoggedOut {
+			d.Class = KindAuthExternal
+			d.Brokerable = false
+			d.ReasonCode = "harness_not_logged_in"
+			d.Blocker = fmt.Sprintf("FAC-576 BLOCKED: the %s harness is installed but not logged in", kind)
+			d.RecommendedAction = fmt.Sprintf("log in with the %s CLI on this host; no API key is used or wanted", kind)
+		}
 		return d
 	}
 

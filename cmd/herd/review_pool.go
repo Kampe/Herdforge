@@ -165,7 +165,13 @@ func runPoolReview(ref string) error {
 			_ = herdr.CloseReviewTab(tab.ID, agentName)
 		}
 	}()
-	if err := herdr.StartReviewAgent(tab.ID, agentName, tab.Pane.ID, reviewer.Kind, reviewer.Argv...); err != nil {
+	// FAC-576: pass the FLAGS, not the whole argv. herdr's `agent start ... --
+	// <args>` appends these after the harness command it resolves from --kind,
+	// so including argv[0] ran `claude claude --model ...` and the extra
+	// positional made the pane land somewhere the launch check reads as an auth
+	// screen. The pre-FAC-574 code passed flags only; carrying argv[0] over was
+	// my regression.
+	if err := herdr.StartReviewAgent(tab.ID, agentName, tab.Pane.ID, reviewer.Kind, reviewer.LaunchFlags()...); err != nil {
 		return fmt.Errorf("start %s reviewer (%s): %w", reviewer.Kind, reviewer.Model, err)
 	}
 	if _, err := herdr.Send(agentName, "Read and execute the review packet at "+packet+" in full.", true, 30*time.Second); err != nil {
@@ -363,6 +369,23 @@ func truncatedReviewIdentity(ref, sha string) string {
 	suffix := fmt.Sprintf("-%x", sha256.Sum256([]byte(strings.TrimSpace(ref)+"\x00"+strings.TrimSpace(sha))))[:9]
 	prefixLen := reviewAgentNameLimit - len(suffix)
 	return strings.TrimRight(base[:prefixLen], "-") + suffix
+}
+
+// LaunchFlags returns the argv WITHOUT the harness command itself.
+//
+// herdr resolves the command from --kind and appends these after `--`, so
+// argv[0] must not be repeated: doing so passes the harness name to itself as a
+// positional argument.
+func (r poolReviewer) LaunchFlags() []string {
+	if len(r.Argv) == 0 {
+		return nil
+	}
+	if strings.EqualFold(strings.TrimSpace(r.Argv[0]), strings.TrimSpace(r.Kind)) {
+		return r.Argv[1:]
+	}
+	// A harness whose argv[0] is not the kind (a wrapper, for example) is passed
+	// through whole rather than silently truncated.
+	return r.Argv
 }
 
 // poolReviewer is the resolved launch identity for one exact-SHA review.

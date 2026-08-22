@@ -120,6 +120,17 @@ func VerifyAgentLaunch(name, paneID string, timeout time.Duration) (LaunchObserv
 					continue
 				}
 				body, _ := PaneRead(paneID, 20)
+				// FAC-576: the workspace trust dialog is resolvable by us and
+				// must be answered BEFORE the auth check, which cannot tell it
+				// apart from a credential screen. A fleet agent launches into a
+				// directory Herdforge just created, so this fires on nearly
+				// every launch; refusing instead meant no interactive agent
+				// could start in a fresh worktree.
+				if WorkspaceTrustPrompt(body) {
+					if ConfirmWorkspaceTrust(paneID) {
+						body, _ = PaneRead(paneID, 20)
+					}
+				}
 				if LoginOrAuthScreen(agent.TerminalTitle, body) {
 					last.State = LaunchRefused
 					last.Reason = "pane is at a login or authentication screen"
@@ -198,6 +209,14 @@ func WaitExactPaneReady(tabID, paneID, terminalID string, timeout time.Duration)
 		}
 		last.TabID, last.TerminalID = found.TabID, found.TerminalID
 		body, _ := PaneRead(paneID, 20)
+		// FAC-576: answer the resolvable trust dialog before the auth check, as
+		// in the loop above. Both sites needed it; patching one would have left
+		// whichever path a given launch takes still refusing.
+		if WorkspaceTrustPrompt(body) {
+			if ConfirmWorkspaceTrust(paneID) {
+				body, _ = PaneRead(paneID, 20)
+			}
+		}
 		if LoginOrAuthScreen(found.TerminalTitle, body) {
 			last.State = LaunchFailed
 			last.Reason = "pane is at a login or authentication screen"

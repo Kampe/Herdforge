@@ -46,6 +46,12 @@ func CapabilityGapReason(err error) bool {
 		"unknown command", "unrecognized command", "unknown subcommand",
 		"invalid choice", "not a herdr command", "no such command",
 		"unknown flag", "command not found", "usage:",
+		// FAC-576: the installed herdr answers an unknown `tab` subcommand by
+		// printing its subcommand banner, which says "herdr tab commands:" and
+		// never the word "usage". Matching only "usage:" meant the gap went
+		// undetected on the exact build that has the gap, so a failed launch
+		// still stranded its tab. Observed verbatim on this host.
+		"tab commands:", "commands:",
 		"no immutable generation", "generation evidence is unavailable",
 		// "generation is required" means we could not SUPPLY generation
 		// evidence, so this build/row cannot be fenced at all. That is a gap.

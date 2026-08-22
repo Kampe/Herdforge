@@ -130,7 +130,14 @@ const DefaultSessionTTL = 30 * time.Minute
 func RequiredBrokerHostsForKind(kind string) []string {
 	switch strings.ToLower(strings.TrimSpace(kind)) {
 	case AuthorKindClaude:
-		return []string{"api.anthropic.com"}
+		// FAC-576: none. Claude is used through its HARNESS on this fleet and
+		// never through an API key, so there is no host credential to broker.
+		// Returning api.anthropic.com made worker admission demand a
+		// handle-backed credential for a host the harness never contacts with a
+		// user key, so a fully logged-in claude reported
+		// brokerable=false / hosts_creds=[] / authority=none and no reviewer
+		// could launch. That is a category error, not a missing credential.
+		return nil
 	case AuthorKindCodex:
 		return []string{"api.openai.com"}
 	case AuthorKindGrok:

@@ -486,6 +486,19 @@ func ArgvFor(provider, model, effort string) []string {
 		} else {
 			base = []string{"claude", "--model", model, "--effort", effort}
 		}
+		// FAC-576: an autonomous lane must not sit at a permission prompt.
+		//
+		// Nothing set a permission mode, so a fleet claude pane asked to trust
+		// its worktree and waited. The launch-state check reads "trust this
+		// folder" as a login-or-auth screen — correctly, it IS a modal the agent
+		// cannot get past — and refused the launch. The reported symptom was
+		// "pane is at a login or authentication screen" on a host where claude
+		// was fully logged in, which is why it read as a credential problem.
+		//
+		// acceptEdits is not enough: it still prompts for the ordinary shell
+		// commands a reviewer needs to run tests, so a reviewer would stall
+		// mid-review instead of at startup.
+		base = append(base, "--permission-mode", "bypassPermissions")
 		// FAC-173: Agent/Task tools must not be exposed on fleet Claude surfaces.
 		compiled, err := agentpolicy.CompileClaudeArgs(base)
 		if err != nil {
