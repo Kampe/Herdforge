@@ -899,9 +899,37 @@ func (a *livePulseActor) OpenReview(ctx context.Context, lane pulse.AgentObserva
 	// Resolve exact identity here, from git, rather than asking the receiver to
 	// re-derive it from a tab id.
 	commits, resolveErr := harvest.UnlandedCommits(context.Background(), lane.Worktree, "origin/main")
-	packet := pulseReviewPacket(lane, harvest.SubstantiveCommits(commits), resolveErr)
+	substantive := harvest.SubstantiveCommits(commits)
+	packet := pulseReviewPacket(lane, substantive, resolveErr)
+
+	// FAC-567: queue DURABLY first, then nudge the pane.
+	//
+	// Sequential pane delivery let a later handoff supersede an earlier one, so
+	// two real queues (29 API commits and 2 DeFi) could not both be delivered.
+	// Consumption is not retention: text that reached a pane can still be
+	// displaced by the next thing written there. The durable entry is the
+	// delivery; the pane send is a nudge on top of a record that already exists.
+	subject := fmt.Sprintf("PULSE REVIEW HANDOFF %s (%d candidate(s))", lane.Name, len(substantive))
+	id := handoffEnvelopeID(lane.Name, substantive)
+	queued, qErr := enqueueReviewHandoff(context.Background(),
+		mail.CallbackMailPath("."), "pulse", target, subject, packet, id)
+	if qErr != nil {
+		// Refuse rather than deliver something that can be lost silently.
+		return fmt.Errorf("pulse: %w", qErr)
+	}
+	if !queued {
+		// This exact handoff is already pending. Re-nudging is safe and helps a
+		// starved supervisor, but it must not be reported as new work.
+		fmt.Fprintf(os.Stderr, "pulse: handoff for %s already pending (%s); re-nudging only\n", lane.Name, id)
+	}
+
+	// Nudge is best-effort BECAUSE the durable record exists. A failed nudge is
+	// reported, never fatal: failing here would discard a handoff that is
+	// already safely queued.
 	if _, err := herdr.Send(target, packet, true, 30*time.Second); err != nil {
-		return fmt.Errorf("pulse: notify review supervisor %s: %w", target, err)
+		fmt.Fprintf(os.Stderr,
+			"pulse: durably queued handoff for %s but pane nudge failed (%v); supervisor drains its inbox at next idle\n",
+			target, err)
 	}
 	_ = ctx
 	return nil

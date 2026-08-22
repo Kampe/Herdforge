@@ -123,9 +123,23 @@ func FindDuplicateLiterals(repoRoot string, roots []string) ([]Occurrence, error
 				return nil
 			}
 			rel, _ := filepath.Rel(repoRoot, path)
+			// Import paths are structure, never policy. Excluding them
+			// STRUCTURALLY beats blacklisting path prefixes: the first version
+			// excluded github.com/ and golang.org/ and was then flagged on
+			// crypto/sha256 and encoding/hex. A denylist of vendors was always
+			// going to be incomplete; the AST already knows what an import is.
+			importLits := map[token.Pos]bool{}
+			for _, imp := range file.Imports {
+				if imp.Path != nil {
+					importLits[imp.Path.Pos()] = true
+				}
+			}
 			ast.Inspect(file, func(n ast.Node) bool {
 				lit, ok := n.(*ast.BasicLit)
 				if !ok || lit.Kind != token.STRING {
+					return true
+				}
+				if importLits[lit.Pos()] {
 					return true
 				}
 				value := strings.Trim(lit.Value, "`\"")
