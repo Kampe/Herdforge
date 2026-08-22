@@ -70,6 +70,25 @@ func runPoolReview(ref string) error {
 		return fmt.Errorf("candidate %s is not a commit: %s", sha[:min(12, len(sha))], strings.TrimSpace(string(out)))
 	}
 
+	// FAC-577: resolve AND preflight the reviewer before the pool lease, not
+	// just before the tab. A launch that dies on an unusable provider used to
+	// take a warm-pool slot and a tab with it; the previous change only moved
+	// this ahead of the tab create, so the lease was still acquired first.
+	//
+	// Skipped when --no-launch: that path deliberately prepares a surface
+	// without starting a harness, so provider readiness is not its business.
+	reviewer := poolReviewer{}
+	if !*noLaunch {
+		resolved, err := resolvePoolReviewer(*provider, *model, *excludeFamily)
+		if err != nil {
+			return err
+		}
+		if err := preflightReviewerReadiness(resolved); err != nil {
+			return err
+		}
+		reviewer = resolved
+	}
+
 	p := worktree.NewPool(root, *poolRoot, 2)
 	if err := p.Ensure(context.Background()); err != nil {
 		return err
@@ -126,12 +145,6 @@ func runPoolReview(ref string) error {
 	}
 	if !herdr.IsAvailable() {
 		return errors.New("herdr CLI is unavailable; use --no-launch to prepare the surface")
-	}
-	// Resolve the harness BEFORE any tab side effect: an unroutable reviewer
-	// must fail without leaving an orphan tab or a held pool lease behind.
-	reviewer, err := resolvePoolReviewer(*provider, *model, *excludeFamily)
-	if err != nil {
-		return err
 	}
 	ws, err := herdr.RequireWorkspace(root)
 	if err != nil {
@@ -408,4 +421,31 @@ func resolvePoolReviewer(provider, model, excludeFamily string) (poolReviewer, e
 		Family: router.FamilyFor(route.Provider, pickedModel),
 		Argv:   argv, Reason: route.Reason,
 	}, nil
+}
+
+// preflightReviewerReadiness proves the resolved provider can actually execute a
+// request BEFORE any lease or tab exists.
+//
+// FAC-577: quota being healthy and the host CLI reporting an interactive login
+// are NOT worker credential readiness. A routed claude reviewer launched into a
+// pane that was sitting at an authentication screen, which surfaced only after
+// the lease and tab had been created and had to be compensated by hand.
+//
+// The probe runs a real minimal generation and requires the exact probe token,
+// so it exercises the same boundary the launch will hit rather than a cheaper
+// proxy for it. A login screen, a missing credential handle, or an unconfigured
+// model all fail here, before anything needs cleaning up.
+func preflightReviewerReadiness(r poolReviewer) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	res := herdr.ProbeProviderModel(ctx, r.Provider, r.Model, "")
+	if res.Available {
+		return nil
+	}
+	return fmt.Errorf(
+		"reviewer %s/%s is not ready to execute a request: %s\n"+
+			"  Quota and an interactive host login are not worker credential readiness.\n"+
+			"  Provision an approved credential handle for this surface, or route another\n"+
+			"  surface with --provider. No lease or tab was created.",
+		r.Provider, r.Model, res.Reason)
 }
