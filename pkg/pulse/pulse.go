@@ -288,6 +288,17 @@ type Counts struct {
 	ConsumeCallback int `json:"consume_callbacks"`
 	Dispatch        int `json:"dispatch"`
 	OpenReview      int `json:"open_review"`
+	// ReviewsInFlight counts lanes whose review is ALREADY MOVING: pinned out
+	// for review, or awaiting a verdict.
+	//
+	// FAC-562: open_review is an ACTION count — lanes that still need a review
+	// OPENED. A lane already out for review is deliberately excluded from it,
+	// so a busy conveyor legitimately reports open_review=0. A consumer read
+	// that as "no review work" while an admitted FAIL was under repair and
+	// other exact reviews were in flight, and the summary gave them no way to
+	// tell the two apart. Counting activity separately from work-to-plan means
+	// zero of one no longer implies zero of the other.
+	ReviewsInFlight int `json:"reviews_in_flight"`
 	ReapLanes       int `json:"reap_lanes"`
 	WouldRun        int `json:"would_run"`
 	Reconcile       int `json:"reconcile"`
@@ -777,6 +788,11 @@ func needsRenew(l LeaseObservation, now time.Time, within time.Duration) bool {
 func CountActions(agents []AgentObservation, actions []Action) Counts {
 	c := Counts{Agents: len(agents), Actions: len(actions)}
 	for _, a := range agents {
+		// A lane pinned out for review, or awaiting a verdict it must act on,
+		// IS review activity even though there is nothing to open for it.
+		if strings.TrimSpace(a.SafeRef) != "" || a.AwaitingVerdict {
+			c.ReviewsInFlight++
+		}
 		switch a.Status {
 		case StatusHealthyIdle:
 			c.HealthyIdle++
@@ -947,9 +963,9 @@ func FormatHuman(snap Snapshot) string {
 	}
 	fmt.Fprintf(&b, "beat_sequence: %d observed_at: %s\n", snap.BeatSequence, snap.ObservedAt.UTC().Format(time.RFC3339Nano))
 	c := snap.Counts
-	fmt.Fprintf(&b, "counts: agents=%d healthy_idle=%d busy=%d blocked=%d done=%d stale=%d unknown=%d actions=%d renew_leases=%d consume_callbacks=%d dispatch=%d open_review=%d reap_lanes=%d would_run=%d reconcile=%d applied=%d\n",
+	fmt.Fprintf(&b, "counts: agents=%d healthy_idle=%d busy=%d blocked=%d done=%d stale=%d unknown=%d actions=%d renew_leases=%d consume_callbacks=%d dispatch=%d open_review=%d reviews_in_flight=%d reap_lanes=%d would_run=%d reconcile=%d applied=%d\n",
 		c.Agents, c.HealthyIdle, c.Busy, c.Blocked, c.Done, c.Stale, c.Unknown,
-		c.Actions, c.RenewLeases, c.ConsumeCallback, c.Dispatch, c.OpenReview, c.ReapLanes, c.WouldRun, c.Reconcile, c.Applied)
+		c.Actions, c.RenewLeases, c.ConsumeCallback, c.Dispatch, c.OpenReview, c.ReviewsInFlight, c.ReapLanes, c.WouldRun, c.Reconcile, c.Applied)
 	if snap.UnknownCritical {
 		fmt.Fprintf(&b, "unknown_critical: true\n")
 		for _, r := range snap.UnknownReasons {
