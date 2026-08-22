@@ -248,11 +248,12 @@ func TestJSONAndHumanCountsIdentical(t *testing.T) {
 		t.Fatalf("JSON counts %+v != snap counts %+v", decoded.Counts, snap.Counts)
 	}
 	// Human must embed the same numeric tallies.
-	want := fmt.Sprintf("agents=%d healthy_idle=%d busy=%d blocked=%d done=%d stale=%d unknown=%d actions=%d renew_leases=%d consume_callbacks=%d dispatch=%d open_review=%d reap_lanes=%d would_run=%d reconcile=%d applied=%d",
+	want := fmt.Sprintf("agents=%d healthy_idle=%d busy=%d blocked=%d done=%d stale=%d unknown=%d actions=%d renew_leases=%d consume_callbacks=%d dispatch=%d open_review=%d reviews_in_flight=%d reap_lanes=%d would_run=%d reconcile=%d applied=%d",
 		snap.Counts.Agents, snap.Counts.HealthyIdle, snap.Counts.Busy, snap.Counts.Blocked,
 		snap.Counts.Done, snap.Counts.Stale, snap.Counts.Unknown, snap.Counts.Actions,
 		snap.Counts.RenewLeases, snap.Counts.ConsumeCallback, snap.Counts.Dispatch,
-		snap.Counts.OpenReview, snap.Counts.ReapLanes, snap.Counts.WouldRun, snap.Counts.Reconcile, snap.Counts.Applied)
+		snap.Counts.OpenReview, snap.Counts.ReviewsInFlight, snap.Counts.ReapLanes,
+		snap.Counts.WouldRun, snap.Counts.Reconcile, snap.Counts.Applied)
 	if !strings.Contains(human, want) {
 		t.Fatalf("human missing counts line %q\n---\n%s", want, human)
 	}
