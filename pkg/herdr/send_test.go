@@ -26,6 +26,10 @@ func TestStatusFromList(t *testing.T) {
 	}
 }
 
+// FAC-579: the qualifier no longer names the MECHANISM. Consumption is proven
+// by an echoed prompt where the harness echoes it, and by a status transition
+// plus an advanced pane where it does not (Claude Code never echoes). Claiming
+// "task text observed in pane" made the line a lie on the second path.
 func TestFormatSendResultExplainsDeliveryGuarantee(t *testing.T) {
 	t.Parallel()
 	cases := []struct {
@@ -33,8 +37,8 @@ func TestFormatSendResultExplainsDeliveryGuarantee(t *testing.T) {
 		status string
 		want   string
 	}{
-		{name: "working", status: "working", want: "herd send: worker -> working (consumption confirmed; task text observed in pane)"},
-		{name: "done", status: "done", want: "herd send: worker -> done (consumption confirmed; task text observed in pane)"},
+		{name: "working", status: "working", want: "herd send: worker -> working (consumption confirmed)"},
+		{name: "done", status: "done", want: "herd send: worker -> done (consumption confirmed)"},
 		{name: "queued", status: "queued", want: "herd send: worker -> queued (queued but not consumed; explicit retry or defer required)"},
 		{name: "submitted", status: "submitted", want: "herd send: worker -> submitted (UNVERIFIED: --no-verify)"},
 	}
@@ -49,7 +53,7 @@ func TestFormatSendResultExplainsDeliveryGuarantee(t *testing.T) {
 }
 
 func TestFormatSendResultInWorkspaceAuditsAuthorizedRoute(t *testing.T) {
-	if got, want := FormatSendResultInWorkspace("wB:p391", "wB", "working"), "herd send: wB:p391 [workspace=wB] -> working (consumption confirmed; task text observed in pane)"; got != want {
+	if got, want := FormatSendResultInWorkspace("wB:p391", "wB", "working"), "herd send: wB:p391 [workspace=wB] -> working (consumption confirmed)"; got != want {
 		t.Fatalf("FormatSendResultInWorkspace() = %q, want %q", got, want)
 	}
 }

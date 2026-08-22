@@ -223,7 +223,11 @@ func formatSendResult(target, workspace, status string) string {
 	qualifier := ""
 	switch status {
 	case "working", "done":
-		qualifier = " (consumption confirmed; task text observed in pane)"
+		// FAC-579: no longer claims the mechanism. Consumption is proven by an
+		// echoed prompt where the harness echoes, and by a status transition
+		// plus an advanced pane where it does not. Naming only the echo made
+		// the line a lie on the second path.
+		qualifier = " (consumption confirmed)"
 	case "submitted":
 		qualifier = " (UNVERIFIED: --no-verify)"
 	case "queued":
@@ -234,6 +238,34 @@ func formatSendResult(target, workspace, status string) string {
 		route = fmt.Sprintf("%s [workspace=%s]", target, workspace)
 	}
 	return fmt.Sprintf("herd send: %s -> %s%s", route, status, qualifier)
+}
+
+// harnessEchoesPrompt reports whether a harness keeps the submitted prompt
+// visible in its pane, which is what makes echo-based proof possible.
+//
+// Codex echoes, which is why delivery verification has always worked there.
+// Claude Code does not. Listing the echoing harnesses rather than the silent
+// ones keeps the strong proof as the default for anything unrecognised.
+func harnessEchoesPrompt(kind string) bool {
+	switch strings.ToLower(strings.TrimSpace(kind)) {
+	case "codex", "opencode", "ollama", "lazer", "pi":
+		return true
+	default:
+		return false
+	}
+}
+
+// paneAdvanced reports whether a pane changed since before the send.
+//
+// Trimmed comparison, because a status line that merely re-renders its elapsed
+// timer is not evidence that anything was consumed.
+func paneAdvanced(before, after string) bool {
+	b := strings.TrimSpace(normalizeForObservation(before))
+	a := strings.TrimSpace(normalizeForObservation(after))
+	if a == "" {
+		return false
+	}
+	return a != b
 }
 
 // observationCount counts how many times the submitted task text appears in a
@@ -384,9 +416,31 @@ func sendInWorkspace(target, text string, verify bool, timeout time.Duration, wo
 			// visibly the agent consumed it. Counting occurrences keeps the
 			// anti-staleness guarantee — old text alone still cannot prove a
 			// new delivery — while allowing a repeat to be proven.
-			if (st == "working" || st == "done") && paneErr == nil &&
-				observationCount(text, pane) > observationCount(text, baselinePane) {
-				return st, nil
+			if (st == "working" || st == "done") && paneErr == nil {
+				if observationCount(text, pane) > observationCount(text, baselinePane) {
+					// Strongest proof: the harness echoed the submitted text.
+					return st, nil
+				}
+				// FAC-579: some harnesses NEVER echo the prompt, so requiring
+				// the echo makes their deliveries structurally unprovable.
+				//
+				// Claude Code renders a compact transcript — "Marinating…",
+				// "Ran 9 commands" — and does not keep the submitted text
+				// visible. So every claude delivery was reported
+				// queued-but-not-consumed while the agent was demonstrably
+				// working on it, and `herd review --pool` treated that as a
+				// failed launch and closed the reviewer it had just started.
+				// The review backlog could not move: 43 candidates queued, 0
+				// reviewed, every launch discarded at the last step.
+				//
+				// The fallback is deliberately narrower than "trust the
+				// status". It requires BOTH a working/done status AND that the
+				// pane actually changed since before the send: a pane that
+				// ignored the input does not change. That is weaker evidence
+				// than an echo, and it is the strongest this harness exposes.
+				if !harnessEchoesPrompt(resolved.Kind) && paneAdvanced(baselinePane, pane) {
+					return st, nil
+				}
 			}
 		}
 		if !nudged && time.Now().Add(poll).After(deadline.Add(-timeout/2)) {
