@@ -14,6 +14,8 @@ import (
 	"time"
 
 	"github.com/Kampe/Herdforge/pkg/herdr"
+	"github.com/Kampe/Herdforge/pkg/router"
+	"github.com/Kampe/Herdforge/pkg/usage"
 	"github.com/Kampe/Herdforge/pkg/worktree"
 )
 
@@ -33,7 +35,13 @@ func runPoolReview(ref string) error {
 	}
 	fs := flag.NewFlagSet("review --pool", flag.ContinueOnError)
 	shaFlag := fs.String("sha", parsedSHA, "Exact candidate commit (default: HEAD of .herd/worktrees/<ref>)")
-	model := fs.String("model", "litellm/ollama/glm-5.2:cloud", "Persistent OpenCode model")
+	// FAC-574: this defaulted to an Ollama proxy model, so every exact review
+	// went through OpenCode regardless of native quota. There is no default
+	// harness any more — the router picks it, and --provider/--model are
+	// explicit operator overrides that the router still has to admit.
+	provider := fs.String("provider", "", "Force a reviewer provider (default: router pick)")
+	model := fs.String("model", "", "Force an exact reviewer model (requires --provider)")
+	excludeFamily := fs.String("exclude-family", "", "Refuse a model family (use the builder's family for a disjoint review)")
 	poolRoot := fs.String("pool-root", filepath.Join(".herd", "pool"), "Warm review pool root")
 	surfaceRoot := fs.String("surface-root", filepath.Join(".herd", "review-surfaces"), "Review surface symlink root")
 	packetRoot := fs.String("packet-root", filepath.Join(".herd", "review-packets"), "Review packet root")
@@ -122,6 +130,12 @@ func runPoolReview(ref string) error {
 	if !herdr.IsAvailable() {
 		return errors.New("herdr CLI is unavailable; use --no-launch to prepare the surface")
 	}
+	// Resolve the harness BEFORE any tab side effect: an unroutable reviewer
+	// must fail without leaving an orphan tab or a held pool lease behind.
+	reviewer, err := resolvePoolReviewer(*provider, *model, *excludeFamily)
+	if err != nil {
+		return err
+	}
 	ws, err := herdr.RequireWorkspace(root)
 	if err != nil {
 		return err
@@ -140,15 +154,15 @@ func runPoolReview(ref string) error {
 			_ = herdr.CloseReviewTab(tab.ID, agentName)
 		}
 	}()
-	if err := herdr.StartReviewAgent(tab.ID, agentName, tab.Pane.ID, *model); err != nil {
-		return fmt.Errorf("start OpenCode reviewer: %w", err)
+	if err := herdr.StartReviewAgent(tab.ID, agentName, tab.Pane.ID, reviewer.Kind, reviewer.Argv...); err != nil {
+		return fmt.Errorf("start %s reviewer (%s): %w", reviewer.Kind, reviewer.Model, err)
 	}
 	if _, err := herdr.Send(agentName, "Read and execute the review packet at "+packet+" in full.", true, 30*time.Second); err != nil {
 		return errors.Join(fmt.Errorf("deliver review packet: %w", err), herdr.CloseReviewTab(tab.ID, agentName))
 	}
 	cleanupTab = false
 	releaseOnFailure = false
-	fmt.Printf("reviewer launched ref=%s sha=%s lease=%s surface=%s tab=%s agent=%s packet=%s\n", ref, shortSHA(sha), lease.LeaseID, surface, tabLabel, agentName, packet)
+	fmt.Printf("reviewer launched ref=%s sha=%s lease=%s surface=%s tab=%s agent=%s packet=%s harness=%s provider=%s model=%s family=%s\n", ref, shortSHA(sha), lease.LeaseID, surface, tabLabel, agentName, packet, reviewer.Kind, reviewer.Provider, reviewer.Model, reviewer.Family)
 	return nil
 }
 
@@ -266,21 +280,29 @@ func safeReviewSurfacePart(ref string) string {
 const reviewAgentNameLimit = 32
 
 func reviewAgentName(ref, sha string) string {
-	base := "review-" + safeReviewSurfacePart(ref) + "-" + shortSHA(sha)
-	if len(base) <= reviewAgentNameLimit {
-		return base
-	}
-	// Keep the name recognizable while retaining a stable ref-derived suffix so
-	// long refs with the same visible prefix cannot collide after truncation.
-	suffix := fmt.Sprintf("-%x", sha256.Sum256([]byte(strings.TrimSpace(ref))))[:9]
-	prefixLen := reviewAgentNameLimit - len(suffix)
-	return strings.TrimRight(base[:prefixLen], "-") + suffix
+	// FAC-574: the truncation suffix used to hash the REF ONLY, so two distinct
+	// SHAs on the same branch produced the SAME agent name and the second
+	// reviewer collided with the first still-active one. Identity must include
+	// the candidate, because reviewing a second exact SHA on one branch is
+	// normal and is the whole point of exact-SHA review.
+	//
+	// reviewTabLabel three lines below already hashed ref+sha correctly, so the
+	// right implementation was adjacent to the wrong one. Both now call one
+	// definition.
+	return truncatedReviewIdentity(ref, sha)
 }
 
 func reviewTabLabel(ref, sha string) string {
 	// Herdr currently accepts the same 1-32 character surface used by agent
 	// names, but keep this policy separate so a future tab-label limit can
 	// change without changing agent identity semantics.
+	return truncatedReviewIdentity(ref, sha)
+}
+
+// truncatedReviewIdentity builds a bounded identity that stays unique per
+// (ref, sha). The disambiguating hash covers BOTH, so truncation can never
+// merge two candidates on one branch into one identity.
+func truncatedReviewIdentity(ref, sha string) string {
 	base := "review-" + safeReviewSurfacePart(ref) + "-" + shortSHA(sha)
 	if len(base) <= reviewAgentNameLimit {
 		return base
@@ -288,4 +310,60 @@ func reviewTabLabel(ref, sha string) string {
 	suffix := fmt.Sprintf("-%x", sha256.Sum256([]byte(strings.TrimSpace(ref)+"\x00"+strings.TrimSpace(sha))))[:9]
 	prefixLen := reviewAgentNameLimit - len(suffix)
 	return strings.TrimRight(base[:prefixLen], "-") + suffix
+}
+
+// poolReviewer is the resolved launch identity for one exact-SHA review.
+type poolReviewer struct {
+	Kind     string
+	Provider string
+	Model    string
+	Family   string
+	Argv     []string
+	Reason   string
+}
+
+// resolvePoolReviewer routes the reviewer through the same quota-aware router
+// every other launch uses.
+//
+// FAC-574: the pool used to hardcode OpenCode with an Ollama default model, so
+// a native Claude reviewer was unreachable through the exact-SHA pool lifecycle
+// no matter what the operator asked for — and when that proxy was rate limited
+// the whole exact-review path was dead with no alternative route. Routing here
+// means a spent surface reroutes instead of retrying into the same wall.
+func resolvePoolReviewer(provider, model, excludeFamily string) (poolReviewer, error) {
+	if strings.TrimSpace(model) != "" && strings.TrimSpace(provider) == "" {
+		return poolReviewer{}, errors.New("--model requires --provider (a model without its surface is not a route)")
+	}
+	engine := usage.NewQuotaEngine()
+	computed := map[string]usage.BurnState{}
+	if snap, err := usage.FetchSnapshot(); err == nil {
+		computed = engine.ComputeAll(snap)
+	} else {
+		// Fail loud but keep routing on availability: a quota outage must not
+		// silently collapse back onto a single hardcoded surface.
+		fmt.Fprintf(os.Stderr, "review --pool: WARN live quota unavailable (%v); routing on availability only\n", err)
+	}
+	route, err := router.NewRouter(engine, computed).Pick("qa", strings.TrimSpace(provider), strings.TrimSpace(excludeFamily))
+	if err != nil {
+		return poolReviewer{}, fmt.Errorf("route reviewer: %w", err)
+	}
+	pickedModel := route.Model
+	if override := strings.TrimSpace(model); override != "" {
+		pickedModel = override
+	}
+	kind, argv, err := router.HarnessArgvFor(route.Provider, pickedModel, route.Effort)
+	if err != nil {
+		return poolReviewer{}, fmt.Errorf("reviewer launch argv for %s/%s: %w", route.Provider, pickedModel, err)
+	}
+	if len(argv) == 0 {
+		return poolReviewer{}, fmt.Errorf("reviewer launch argv for %s/%s resolved empty", route.Provider, pickedModel)
+	}
+	return poolReviewer{
+		Kind: kind, Provider: route.Provider, Model: pickedModel,
+		// Recompute the family from the pair that actually launches: an
+		// operator --model override can change family, and a stale family
+		// makes a legitimate override look like a launch/verdict conflict.
+		Family: router.FamilyFor(route.Provider, pickedModel),
+		Argv:   argv, Reason: route.Reason,
+	}, nil
 }
