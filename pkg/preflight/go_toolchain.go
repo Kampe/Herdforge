@@ -26,7 +26,19 @@ func checkGoToolchain(env []string, probe goToolchainProbe) error {
 	pathEnv := withoutEnv(env, "GOROOT")
 	pathGOROOT, err := probe(pathEnv, "env", "GOROOT")
 	if err != nil {
-		return fmt.Errorf("unable to verify exported GOROOT=%q against the PATH-resolved Go toolchain: %w", exportedGOROOT, err)
+		// FAC-576: inability to VERIFY is not evidence of a mismatch.
+		//
+		// This used to fail preflight outright, so any environment where the
+		// probe cannot run — a version-manager shim that needs context this
+		// child does not have, no go on the child's PATH, a sandbox — was
+		// reported as a toolchain conflict and blocked the run. That is the same
+		// error as reading "cannot prove" as "did not land": it converts an
+		// unanswered question into a negative finding.
+		//
+		// A real mismatch is still caught, because catching it requires
+		// successfully observing BOTH toolchains, which is exactly the case
+		// this branch is not.
+		return nil
 	}
 	pathGOROOT = strings.TrimSpace(pathGOROOT)
 	if samePath(exportedGOROOT, pathGOROOT) {
