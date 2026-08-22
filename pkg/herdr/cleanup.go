@@ -42,6 +42,23 @@ const (
 	TabRecovering      TabClass = "recovering"
 	TabQueued          TabClass = "queued-but-not-consumed"
 	TabBlocked         TabClass = "unknown/BLOCKED"
+	// TabUnfenceable: this herdr build supplies no immutable tab generation, so
+	// the tab CANNOT be fenced — as opposed to a tab whose state we failed to
+	// read, or whose generation is stale.
+	//
+	// FAC-571: a missing generation used to be TabBlocked, which made
+	// reconciliation report a blanket BLOCKED for every tab on such a build and
+	// jammed the subsystem. A per-item capability gap must not halt the whole
+	// projection.
+	//
+	// THE RECORDED DECISION: unfenceable is a KNOWN state, not an unknown one.
+	// We know exactly what it is and why, so it does not consume capacity the
+	// way genuine uncertainty does. It never authorizes a mutation:
+	// CloseEligible stays false, because nothing may be closed without fencing
+	// evidence. Read-only classification and reporting are permitted; mutation
+	// is not. A STALE generation remains TabBlocked, because that is a real
+	// conflict rather than an absent capability.
+	TabUnfenceable TabClass = "unfenceable"
 )
 
 // EvidenceState distinguishes an authoritative absence from an unread or
@@ -179,7 +196,12 @@ type FleetStatus struct {
 	Preserved    int
 	Recovering   int
 	ControlSeats int
-	Classes      map[TabClass]int
+	// Unfenceable counts tabs this herdr build cannot fence. Reported
+	// separately from Unknown so an operator can see the difference between
+	// "we could not read this" and "this build has no compare-and-close"
+	// (FAC-571).
+	Unfenceable int
+	Classes     map[TabClass]int
 }
 
 // ProjectFleetStatus excludes user shells, standing tabs, and BLOCKED tabs
@@ -193,6 +215,12 @@ func ProjectFleetStatus(decisions []TabDecision, maxLanes int) FleetStatus {
 		}
 		if d.Class == TabBlocked {
 			p.Unknown++
+		}
+		// Unfenceable is deliberately NOT counted as unknown: it is a known,
+		// explained state, and counting it as uncertainty zeroed capacity for
+		// every lane on a build that never supplies generations.
+		if d.Class == TabUnfenceable {
+			p.Unfenceable++
 		}
 		if d.Class == TabLegacyCleanup {
 			// A tombstone suppresses repeated noise, but it does not prove
@@ -286,7 +314,34 @@ func reconcileBoundTab(tab TabObservation) TabDecision {
 		return blocked("exact tab binding missing")
 	}
 	if tab.Binding.Generation == "" {
-		return blocked("missing immutable tab generation")
+		// FAC-571: a capability gap, not a failure to read state.
+		//
+		// But NARROWLY. A tab bound to a TASK must still be BLOCKED: an active
+		// worker whose identity cannot be fenced is genuinely unsafe to reason
+		// about, and that refusal is a deliberate pre-existing invariant with
+		// tests defending it. Downgrading it would trade a jammed subsystem for
+		// an unsound one.
+		//
+		// The case worth reclassifying is the one where blocking is pure noise:
+		// no task binding, so there is no in-flight work whose safety depends on
+		// fencing. Reconciliation then keeps reporting actionable state instead
+		// of halting on every tab, and still authorizes nothing —
+		// CloseEligible stays false.
+		// Reclassify ONLY the unambiguously inert case: no task binding and no
+		// live agent attached. Anything with work or a process behind it stays
+		// blocked, because that is the case where being unable to fence the
+		// identity actually matters.
+		inert := strings.TrimSpace(tab.Binding.TaskRef) == "" &&
+			tab.Authorities.Agent.State == EvidenceAbsent &&
+			tab.Authorities.Process.State == EvidenceAbsent
+		if !inert {
+			return blocked("missing immutable tab generation")
+		}
+		d.Class = TabUnfenceable
+		d.CloseEligible = false
+		d.Evidence = append(d.Evidence,
+			"UNFENCEABLE: this herdr build supplies no immutable tab generation and the tab is not bound to a task; it cannot be compare-and-closed, so it is classified read-only")
+		return d
 	}
 	a := tab.Authorities
 	checks := []struct {

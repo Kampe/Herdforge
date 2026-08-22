@@ -238,9 +238,33 @@ func (o *ProductionReconciliationObserver) ObserveReconciliation(ctx context.Con
 			return fmt.Errorf("reconciliation record: %w", err)
 		}
 	}
+	// FAC-571: report EVERY blocked tab, not just the first.
+	//
+	// Returning on the first one made a multi-tab problem look like a
+	// single-tab one, and an operator could not tell whether fixing that tab
+	// would unblock reconciliation or reveal four more behind it. The decision
+	// set is already complete and recorded above; only the message was lossy.
+	var blockedTabs []string
 	for _, d := range decisions {
 		if d.Class == TabBlocked {
-			return fmt.Errorf("reconciliation BLOCKED: tab %s: %s", d.TabID, d.Evidence)
+			blockedTabs = append(blockedTabs, fmt.Sprintf("tab %s: %s", d.TabID, strings.Join(d.Evidence, "; ")))
+		}
+	}
+	if len(blockedTabs) > 0 {
+		return fmt.Errorf("reconciliation BLOCKED (%d of %d tabs): %s",
+			len(blockedTabs), len(decisions), strings.Join(blockedTabs, " | "))
+	}
+	// FAC-571: an unfenceable tab is REPORTED, not fatal. Returning an error
+	// here is what made a build with no generation support look like a broken
+	// fleet: every tab tripped it, so reconciliation never reached the reap
+	// step below and the whole subsystem stayed jammed. Nothing is closed
+	// without fencing evidence either way — CloseEligible is false for these —
+	// so continuing costs no safety.
+	for _, d := range decisions {
+		if d.Class == TabUnfenceable {
+			fmt.Fprintf(os.Stderr,
+				"herdr: reconciliation: tab %s is unfenceable (%s); classified read-only and not eligible for close\n",
+				d.TabID, strings.Join(d.Evidence, "; "))
 		}
 	}
 	if _, err := o.ReapCompletedTaskLanes(ctx); err != nil {
