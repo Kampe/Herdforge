@@ -33,7 +33,7 @@ func NewReviewLedger(repoRoot, ledgerPath string) (*Ledger, error) {
 		}
 		f.Close()
 	}
-	queuePath := filepath.Join(dir, "harvest-queue.jsonl")
+	queuePath := QueuePathFor(ledgerPath)
 	if _, err := os.Stat(queuePath); os.IsNotExist(err) {
 		f, err := os.Create(queuePath)
 		if err != nil {
@@ -62,7 +62,7 @@ func NewReadOnlyReviewLedger(repoRoot, ledgerPath string) (*Ledger, error) {
 	return &Ledger{
 		RepoRoot:     repoRoot,
 		Path:         ledgerPath,
-		QueuePath:    filepath.Join(filepath.Dir(ledgerPath), "harvest-queue.jsonl"),
+		QueuePath:    QueuePathFor(ledgerPath),
 		Now:          time.Now,
 		Coordinators: copyCoordSet(DefaultCoordinators),
 	}, nil
