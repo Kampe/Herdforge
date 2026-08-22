@@ -49,6 +49,14 @@ var ubiquitous = map[string]bool{
 	"origin/main": true, "origin/": true, "refs/heads": true, "refs/heads/": true,
 	"refs/remotes": true, "refs/remotes/": true, "refs/tags/": true,
 	"origin/HEAD": true, "HEAD": true, ".herd/": true, "herd/": true,
+	// git's own output-format tokens are vocabulary too: two files asking git
+	// to print a refname are not two copies of a decision, any more than two
+	// files naming origin/main are. Note what is deliberately NOT here:
+	// "--is-ancestor". That one IS a rule — FAC-561 was caused by two copies of
+	// the ancestry check disagreeing about what "on this branch" meant — so the
+	// gate must keep firing on it.
+	"--format=%(refname)": true, "--format=%(refname:short)": true,
+	"--format=%H": true, "--format=%(objectname)": true,
 }
 
 // Distinctive reports whether a literal is the kind that encodes a rule.

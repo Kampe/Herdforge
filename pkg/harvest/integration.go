@@ -403,7 +403,7 @@ func ensureCandidateOnBranch(ctx context.Context, worktreePath, sha string) erro
 	if _, err := gitOutput(ctx, worktreePath, "rev-parse", "--verify", "-q", sha+"^{commit}"); err != nil {
 		return fmt.Errorf("candidate sha %s is not a commit in worktree: %w", sha, err)
 	}
-	if err := runGit(ctx, worktreePath, "merge-base", "--is-ancestor", sha, "HEAD"); err != nil {
+	if !IsAncestor(ctx, worktreePath, sha, "HEAD") {
 		return fmt.Errorf("candidate sha %s is not on current branch HEAD (stale integration tip)", sha)
 	}
 	return nil
