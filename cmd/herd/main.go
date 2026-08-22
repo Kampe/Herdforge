@@ -390,6 +390,9 @@ func main() {
 	case "candidate":
 		runCandidate(os.Args[2:])
 
+	case "handoffs":
+		runHandoffs(os.Args[2:])
+
 	case "process":
 		runProcess()
 

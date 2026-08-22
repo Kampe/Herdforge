@@ -82,6 +82,10 @@ func enqueueReviewHandoff(ctx context.Context, mailPath, sender, recipient, subj
 // PendingReviewHandoffs lists a recipient's undelivered handoffs, so the pending
 // set is inspectable rather than inferred from pane contents.
 func PendingReviewHandoffs(mailPath, recipient string) ([]*mail.Envelope, error) {
+	return pendingReviewHandoffsIn(mailPath, recipient)
+}
+
+func pendingReviewHandoffsIn(mailPath, recipient string) ([]*mail.Envelope, error) {
 	box := mail.NewMailbox(mailPath)
 	all, err := box.ReadInbox(recipient)
 	if err != nil {
@@ -89,7 +93,17 @@ func PendingReviewHandoffs(mailPath, recipient string) ([]*mail.Envelope, error)
 	}
 	var pending []*mail.Envelope
 	for _, env := range all {
-		if env.Read || !strings.HasPrefix(env.ID, "pulse-review-") {
+		if !strings.HasPrefix(env.ID, "pulse-review-") {
+			continue
+		}
+		// FAC-569: this filtered on env.Read, which NOTHING ever sets -- so the
+		// filter was a no-op and every handoff stayed "pending" forever,
+		// including settled ones. Handled state is explicit now.
+		handled, hErr := box.Handled(recipient, env.ID)
+		if hErr != nil {
+			return nil, hErr
+		}
+		if handled {
 			continue
 		}
 		pending = append(pending, env)
