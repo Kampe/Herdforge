@@ -1380,7 +1380,11 @@ func runQuota() {
 	among := fs.String("among", "", "Comma-separated providers for --pick (default: codex,claude)")
 	oneProvider := fs.String("provider", "", "Query one provider")
 	onePool := fs.String("pool", "all", "Model pool for --provider")
-	_ = fs.Bool("force", false, "Bypass openusage cache")
+	// FAC-433: this advertised "Bypass openusage cache", but the value was
+	// discarded and pkg/usage exposes no bypass, so the flag never did anything.
+	// Accepted for compatibility with existing call sites, and now says so
+	// rather than promising a behaviour that does not exist.
+	_ = fs.Bool("force", false, "Accepted for compatibility; IGNORED (no openusage cache bypass exists)")
 	exhaustedPct := fs.Float64("exhausted-at", usage.DefaultExhaustedPct, "Exhausted threshold percent")
 	fs.Parse(os.Args[2:])
 
@@ -2298,6 +2302,8 @@ func notRunningOr(res *activate.Result, fallback string) string {
 func parseReviewArgs(args []string) (ref string, spawn bool) {
 	fs := flag.NewFlagSet("review", flag.ExitOnError)
 	spawnFlag := fs.Bool("spawn", false, "Spawn reviewer agent in herdr")
+	// Registration-only: the value is read by reviewVerboseMode from argv, not
+	// from this FlagSet. Registered here so the outer parser accepts the flag.
 	_ = fs.Bool("verbose", false, "Show ref parsing and candidate search diagnostics")
 	// The outer parser owns ExitOnError semantics and must accept the COMPLETE
 	// review command line before dispatching the pool-specific tail. It
@@ -10716,11 +10722,28 @@ func deriveAutoMaxLanes(ctx context.Context, cfg *config.Config, tp provider.Tas
 	return active + plan.Desired, nil
 }
 
+// effectiveMaxTicks resolves the tick bound from --loop and --ticks.
+//
+// --loop=false asks for one pass. An explicit --ticks is honoured over it,
+// because a caller naming a count knows what they want; --loop=false only fills
+// in the bound they otherwise left at "run until drained".
+func effectiveMaxTicks(loop bool, ticks int) int {
+	if !loop && ticks == 0 {
+		return 1
+	}
+	return ticks
+}
+
 // forgeLoopMain returns the process exit code so every path releases the
 // coordinator fence — os.Exit skips deferred releases (FAC-138).
 func forgeLoopMain() int {
 	fs := flag.NewFlagSet("forge-loop", flag.ExitOnError)
-	_ = fs.Bool("loop", true, "run the autonomous loop")
+	// FAC-433: this was registered and DISCARDED, so `--loop=false` was
+	// silently ignored and an operator asking for a single pass got the
+	// autonomous loop anyway. A flag whose help text promises behaviour it does
+	// not deliver is worse than an absent flag: the operator believes they
+	// disabled something.
+	loopMode := fs.Bool("loop", true, "run the autonomous loop; --loop=false runs a single tick")
 	maxLanesArg := fs.String("max-lanes", "3", "max concurrent builder lanes, or auto")
 	environmentPlanID := fs.String("environment-plan", "", "Exact operator-managed environment plan ID for dispatched work")
 	interval := fs.Int("interval", 15, "seconds between ticks")
@@ -10884,7 +10907,10 @@ func forgeLoopMain() int {
 	fmt.Printf("herd forge --loop: max-lanes=%d interval=%ds — driving the board autonomously\n", maxLanes, *interval)
 	err = eng.ForgeLoop(ctx, driver, daemon.ForgeLoopOptions{
 		Interval:               time.Duration(*interval) * time.Second,
-		MaxTicks:               *ticks,
+		// FAC-433: --loop=false means a single tick. An explicit --ticks still
+		// wins, so the two do not fight; --loop=false only supplies the bound
+		// the operator clearly intended when they asked not to loop.
+		MaxTicks:               effectiveMaxTicks(*loopMode, *ticks),
 		StopEmpty:              *stopEmpty,
 		Feedback:               feedbackRunner,
 		FeedbackInterval:       feedbackInterval,
