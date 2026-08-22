@@ -44,8 +44,18 @@ type Paths struct {
 
 func (p Paths) Inbox() string  { return filepath.Join(p.Root, "inbox") }
 func (p Paths) Outbox() string { return filepath.Join(p.Root, "outbox") }
-func (p Paths) Ledger() string { return filepath.Join(p.Root, "ledger.jsonl") }
-func (p Paths) Queue() string  { return filepath.Join(p.Root, "queue.jsonl") }
+// CandidateIndexLedger and CandidateIndexQueue are the candidate INDEX's own
+// files under the review root. They are NOT the review ledger.
+//
+// FAC-573: these were named Ledger() and Queue(), which reads as "the review
+// ledger" — and the review ledger is .herd/review-ledger.jsonl
+// (reviewledger.DefaultPath), a different file entirely. Worse,
+// .herd/review/ledger.jsonl does not exist on this host, so the candidate index
+// defaults to a path that is not there. Repointing it would change which data
+// it reads and is tracked separately rather than guessed at here; the immediate
+// fix is that the names no longer imply authority they do not have.
+func (p Paths) CandidateIndexLedger() string { return filepath.Join(p.Root, "ledger.jsonl") }
+func (p Paths) CandidateIndexQueue() string  { return filepath.Join(p.Root, "queue.jsonl") }
 
 // Resolve returns the canonical review root for the project containing startDir.
 //

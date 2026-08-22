@@ -129,10 +129,10 @@ func New(opts IndexOptions) *CandidateIndex {
 		opts.MailPath = mail.CallbackMailPath(opts.RepoRoot)
 	}
 	if opts.LedgerPath == "" && opts.RepoRoot != "" {
-		opts.LedgerPath = reviewroot.Resolve(opts.RepoRoot).Ledger()
+		opts.LedgerPath = reviewroot.Resolve(opts.RepoRoot).CandidateIndexLedger()
 	}
 	if opts.QueuePath == "" && opts.RepoRoot != "" {
-		opts.QueuePath = reviewroot.Resolve(opts.RepoRoot).Queue()
+		opts.QueuePath = reviewroot.Resolve(opts.RepoRoot).CandidateIndexQueue()
 	}
 	if opts.InboxDir == "" && opts.RepoRoot != "" {
 		opts.InboxDir = reviewroot.Resolve(opts.RepoRoot).Inbox()

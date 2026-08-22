@@ -80,6 +80,19 @@ var ubiquitous = map[string]bool{
 	// flag across distinct questions is vocabulary, sharing it across the SAME
 	// question is duplication.
 	"--untracked-files=all": true, "--untracked-files=no": true,
+	// FAC-573: provider endpoint vocabulary. A hostname or a well-known API
+	// route is a fact about somebody else's service, not a decision this project
+	// makes: every file that talks to OpenAI names api.openai.com for the same
+	// reason every file that talks to git names origin/main. Consolidating them
+	// behind a constant would add indirection without removing a way to be
+	// wrong.
+	//
+	// The distinction that matters: a PATH we choose (where the ledger lives,
+	// where the config lives) is a rule, because we could choose differently and
+	// two callers choosing differently is a defect. An endpoint we are given is
+	// vocabulary.
+	"api.openai.com": true, "api.anthropic.com": true, "api.x.ai": true,
+	"/v1/chat/completions": true, "litellm/": true,
 }
 
 // Distinctive reports whether a literal is the kind that encodes a rule.
