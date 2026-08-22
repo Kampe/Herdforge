@@ -40,11 +40,29 @@ type Occurrence struct {
 // mostly noise ("json", "main").
 const minLiteralLen = 12
 
+// ubiquitous are literals that are shared vocabulary rather than a duplicated
+// decision. Excluding them is not weakening the gate: a git ref every file
+// legitimately names, or an import path, carries no policy. The gate fired on
+// exactly these when first run against a real change, which is how the list was
+// found rather than guessed.
+var ubiquitous = map[string]bool{
+	"origin/main": true, "origin/": true, "refs/heads": true, "refs/heads/": true,
+	"refs/remotes": true, "refs/remotes/": true, "refs/tags/": true,
+	"origin/HEAD": true, "HEAD": true, ".herd/": true, "herd/": true,
+}
+
 // Distinctive reports whether a literal is the kind that encodes a rule.
 //
 // A bare word duplicated across files is usually coincidence. A path, a CLI
 // flag, a filename, or a long sentence is a rule someone wrote down twice.
 func Distinctive(s string) bool {
+	if ubiquitous[s] {
+		return false
+	}
+	// An import path is structure, not policy.
+	if strings.Contains(s, "github.com/") || strings.HasPrefix(s, "golang.org/") {
+		return false
+	}
 	// A ref/path prefix is structural even when short: "harvest/" is 8 chars
 	// and was the FAC-574 duplicate. Require a separator so bare words do not
 	// qualify at this length.
