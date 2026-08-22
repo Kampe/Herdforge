@@ -72,6 +72,14 @@ var ubiquitous = map[string]bool{
 	"http:/": true, "https:/": true, "http://": true, "https://": true,
 	"unix:/": true, "unix://": true,
 	"package.json": true, "pnpm-lock.yaml": true, "go.mod": true, "go.sum": true,
+	// FAC-430: --untracked-files is a MODIFIER on several different questions,
+	// not a rule in itself. One caller asks "is this tree clean", another asks
+	// "what does this change touch"; they legitimately share the flag while
+	// answering different things. Contrast --is-ancestor, which always answers
+	// exactly one question (reachability) and therefore stays gated: sharing a
+	// flag across distinct questions is vocabulary, sharing it across the SAME
+	// question is duplication.
+	"--untracked-files=all": true, "--untracked-files=no": true,
 }
 
 // Distinctive reports whether a literal is the kind that encodes a rule.

@@ -10907,19 +10907,33 @@ func forgeLoopMain() int {
 	}
 }
 
+// changedFilesIncludingUncommitted delegates to the ONE definition of what a
+// change touches (FAC-430). It existed here as a second copy, which omitted new
+// files in exactly the same way the boundary gate did.
+func changedFilesIncludingUncommitted(worktree string) []string {
+	paths, err := preflight.ChangedPaths(worktree)
+	if err != nil {
+		return nil
+	}
+	return paths
+}
+
 // scopedTestCommand (FAC-131) derives a TARGETED go test command from a
 // worktree's diff against origin/main — only the Go packages that actually
 // changed, so a small-context reviewer runs a focused suite instead of the
 // whole repo. Falls back to `go test ./...` when the diff can't be read.
 func scopedTestCommand(worktree string) string {
-	cmd := exec.Command("git", "diff", "--name-only", "origin/main..HEAD")
-	cmd.Dir = worktree
-	out, err := cmd.Output()
-	if err != nil {
+	// FAC-430: this diffed origin/main..HEAD only, so UNCOMMITTED work was
+	// invisible and a reviewer was handed a "scoped" suite that did not cover
+	// the change under review. A narrow suite derived from a stale diff is worse
+	// than the full suite, because it reads as targeted while testing nothing
+	// relevant.
+	changed := changedFilesIncludingUncommitted(worktree)
+	if len(changed) == 0 {
 		return "go test ./..."
 	}
 	pkgs := map[string]bool{}
-	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+	for _, line := range changed {
 		line = strings.TrimSpace(line)
 		if !strings.HasSuffix(line, ".go") {
 			continue

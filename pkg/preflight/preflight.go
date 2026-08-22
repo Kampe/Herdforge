@@ -122,6 +122,17 @@ func checkWorktreeBoundaryFiles(rootDir string, paths []string, allowlist []stri
 // branch: committed changes since the merge-base with origin/main, plus
 // tracked files still uncommitted. Untracked and ignored files are lane-local
 // scratch state and must not be reported as fleet-blocking leaks (FAC-443).
+// ChangedPaths is THE definition of "files this change touches": committed
+// against origin/main, plus staged, unstaged, and new-but-not-ignored.
+//
+// FAC-430: two callers each derived this independently — the boundary gate and
+// the reviewer's scoped test command — and both got it wrong in the same way by
+// omitting new files. A scope rule written twice is how a gate and the suite
+// meant to defend it end up disagreeing about what changed.
+func ChangedPaths(rootDir string) ([]string, error) {
+	return changedPaths(rootDir)
+}
+
 func changedPaths(rootDir string) ([]string, error) {
 	paths := make([]string, 0)
 	seen := map[string]struct{}{}
@@ -150,7 +161,16 @@ func changedPaths(rootDir string) ([]string, error) {
 		}
 	}
 
-	status, err := runCmd(rootDir, "git", "status", "--porcelain", "--untracked-files=no")
+	// FAC-430: this used --untracked-files=no, so a BRAND NEW file was invisible
+	// to the gate. The result was a vacuous pass exactly when the gate matters
+	// most: a new file containing an absolute path leak passed preflight, then
+	// failed the identical check once committed. A pre-commit gate that cannot
+	// see the file being added is validating work that already shipped.
+	//
+	// --untracked-files=all lists individual files rather than just a directory
+	// name, and it still honours .gitignore, so build output and runtime state
+	// stay excluded while new source appears.
+	status, err := runCmd(rootDir, "git", "status", "--porcelain", "--untracked-files=all")
 	if err != nil {
 		if len(paths) > 0 {
 			return paths, nil
