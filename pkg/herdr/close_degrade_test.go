@@ -146,3 +146,22 @@ func TestAbsenceProvenAgainstTabsNotOnlyAgents(t *testing.T) {
 		t.Errorf("failure should name the surviving tab, got: %v", err)
 	}
 }
+
+// TestObservedUsageBannerIsACapabilityGap is the FAC-576 correction.
+//
+// The installed herdr answers an unknown `tab` subcommand by printing its
+// subcommand banner, which says "herdr tab commands:" and never the word
+// "usage". Matching only "usage:" meant the gap went undetected on the exact
+// build that HAS the gap, so a failed launch still stranded its tab — observed
+// live, verbatim.
+func TestObservedUsageBannerIsACapabilityGap(t *testing.T) {
+	observed := errors.New("herdr tab compare-close: herdr tab commands:\n  herdr tab list [--workspace <workspace_id>]\n  herdr tab create ...")
+	if !CapabilityGapReason(observed) {
+		t.Error("a subcommand banner in place of the verb is a capability gap")
+	}
+	// A conflict reported alongside a banner is still a conflict.
+	conflict := errors.New("compare-and-close: stale-generation\nherdr tab commands:\n  herdr tab list")
+	if CapabilityGapReason(conflict) {
+		t.Error("a stale generation reported with a banner is still a refusal")
+	}
+}

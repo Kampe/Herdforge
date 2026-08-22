@@ -140,6 +140,20 @@ func requireAgentInWorkspace(target, expected string) (AgentEntry, error) {
 	return matches[0], nil
 }
 
+// PaneSendKeys presses keys in a PANE by id, without going through an agent
+// name.
+//
+// FAC-576: the workspace trust dialog is the harness's own TUI, not a prompt
+// turn, and it can be present before the agent name is usable. Addressing the
+// pane directly is what lets it be answered.
+func PaneSendKeys(paneID, keys string) error {
+	out, err := runHerdr("pane", "send-keys", paneID, keys)
+	if err != nil {
+		return fmt.Errorf("herdr pane send-keys: %s: %w", out, err)
+	}
+	return nil
+}
+
 // SendKeys presses keys in an agent pane (used for the single Enter nudge:
 // a stray suggestion/dialog can swallow a submit).
 func SendKeys(target, keys string) error {

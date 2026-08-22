@@ -132,3 +132,34 @@ func TestModelRequiresProviderAtParseTime(t *testing.T) {
 		t.Fatalf("--provider with --model is a valid route: %v", err)
 	}
 }
+
+// TestLaunchFlagsDoNotRepeatTheHarness is the FAC-576 regression for a bug I
+// introduced in FAC-574.
+//
+// herdr's `agent start ... -- <args>` appends these after the harness command it
+// resolves from --kind, so including argv[0] ran `claude claude --model ...`,
+// passing the harness name to itself as a positional. The pre-FAC-574 code
+// passed flags only.
+func TestLaunchFlagsDoNotRepeatTheHarness(t *testing.T) {
+	r := poolReviewer{
+		Kind: "claude",
+		Argv: []string{"claude", "--model", "claude-sonnet-5", "--effort", "medium"},
+	}
+	flags := r.LaunchFlags()
+	if len(flags) == 0 || flags[0] == "claude" {
+		t.Fatalf("the harness command must not be repeated in the flags: %v", flags)
+	}
+	if flags[0] != "--model" {
+		t.Errorf("flags should begin at the first real flag, got %v", flags)
+	}
+	// A wrapper whose argv[0] is not the kind is passed through whole rather
+	// than silently truncated — dropping its first element would corrupt it.
+	w := poolReviewer{Kind: "claude", Argv: []string{"wrapper", "--model", "m"}}
+	if got := w.LaunchFlags(); len(got) != 3 || got[0] != "wrapper" {
+		t.Errorf("a wrapper argv must pass through whole, got %v", got)
+	}
+	// Empty argv must not panic.
+	if got := (poolReviewer{Kind: "claude"}).LaunchFlags(); len(got) != 0 {
+		t.Errorf("empty argv yields no flags, got %v", got)
+	}
+}

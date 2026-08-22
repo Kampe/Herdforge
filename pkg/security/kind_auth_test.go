@@ -14,7 +14,16 @@ func TestDiagnoseKindAuthReadiness_NoAPIKeys_External(t *testing.T) {
 		t.Setenv(k, "")
 		_ = os.Unsetenv(k)
 	}
-	for _, kind := range []string{"codex", "claude", "grok"} {
+	// FAC-576: claude is deliberately absent from this list now. It is used
+	// through its HARNESS on this fleet and never through an API key, so it has
+	// no brokered host credential to be missing — asserting it must be
+	// unbrokerable without HostCreds encoded the category error that refused
+	// every reviewer launch on a fully logged-in host. Its own behaviour is
+	// covered by TestClaudeDiagnosisIsBrokerable.
+	//
+	// codex and grok stay: they genuinely authenticate by API key, and raw env
+	// keys still must not count as production authority.
+	for _, kind := range []string{"codex", "grok"} {
 		d := DiagnoseKindAuthReadiness(kind)
 		if d.Brokerable {
 			t.Fatalf("%s: must not be brokerable without HostCreds", kind)
@@ -50,7 +59,15 @@ func TestDiagnoseKindAuthReadiness_RawAPIKeyNotProductionAuthority(t *testing.T)
 }
 
 func TestRequiredBrokerHostsForKind_KindAuthSurface(t *testing.T) {
-	if got := RequiredBrokerHostsForKind("claude"); len(got) == 0 || got[0] != "api.anthropic.com" {
+	// FAC-576: claude requires NO brokered host. This asserted
+	// api.anthropic.com, which is the host the harness never contacts with a
+	// user key on this fleet. Covered positively by
+	// TestClaudeNeedsNoBrokeredHostCredential.
+	if got := RequiredBrokerHostsForKind("claude"); len(got) != 0 {
+		t.Fatalf("claude is harness-authenticated and needs no brokered host, got %v", got)
+	}
+	// A kind that does use an API key must still name its host.
+	if got := RequiredBrokerHostsForKind("codex"); len(got) == 0 || got[0] != "api.openai.com" {
 		t.Fatal(got)
 	}
 	if RequiredBrokerHostsForKind("nope") != nil {
