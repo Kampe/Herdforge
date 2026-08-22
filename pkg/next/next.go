@@ -15,6 +15,8 @@ import (
 	"github.com/Kampe/Herdforge/pkg/provider"
 	"github.com/Kampe/Herdforge/pkg/reviewingest"
 	"github.com/Kampe/Herdforge/pkg/reviewledger"
+
+	"github.com/Kampe/Herdforge/pkg/reviewroot"
 )
 
 type Priority int
@@ -54,8 +56,10 @@ func NewNextPicker(cfg *config.Config, tp provider.TaskProvider) *NextPicker {
 	return &NextPicker{
 		Config:         cfg,
 		TaskProvider:   tp,
-		ReviewArtifact: ".herd/review/inbox",
-		InboxDir:       ".herd/review/inbox",
+		// FAC-572: resolved through the one review-root resolver, so the picker
+		// cannot read a different corpus than review-ingest wrote to.
+		ReviewArtifact: reviewroot.Resolve(".").Inbox(),
+		InboxDir:       reviewroot.Resolve(".").Inbox(),
 		LedgerPath:     filepath.Join(".herd", "review-ledger.jsonl"),
 	}
 }

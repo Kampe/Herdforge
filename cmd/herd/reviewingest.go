@@ -13,6 +13,7 @@ import (
 	"github.com/Kampe/Herdforge/pkg/mergeadmit"
 	"github.com/Kampe/Herdforge/pkg/reviewingest"
 	"github.com/Kampe/Herdforge/pkg/reviewledger"
+	"github.com/Kampe/Herdforge/pkg/reviewroot"
 	hsync "github.com/Kampe/Herdforge/pkg/sync"
 	"github.com/Kampe/Herdforge/pkg/worktree"
 )
@@ -32,6 +33,14 @@ func runReviewIngest() {
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "herd review-ingest: %v\n", err)
 		os.Exit(2)
+	}
+
+	// Resolve the review corpus ONCE, before any branch, and say which one it
+	// is. A review tool that does not name its corpus makes "ingested"
+	// unattributable, which is exactly how two roots diverged unnoticed.
+	reviewRoot := resolvedReviewRoot(".")
+	if !parsed.asJSON {
+		fmt.Println("herd review-ingest: " + reviewRoot.Paths.Describe())
 	}
 
 	files := parsed.files
@@ -188,7 +197,12 @@ func runReviewIngest() {
 		// may race ingest; a ledger row pointing at a vanished path is not
 		// durable review authority. Native review-ingest is the only PASS
 		// admission path and prints ADMITTED only after this retain (FAC-373).
-		retained, retainErr := reviewingest.RetainArtifact(".", f, a.SHA, a.Reviewer)
+		// FAC-572: retain into the CANONICAL project root, not the cwd. Passing
+		// "." here is what let a supervisor in a worktree write its artifacts
+		// into a corpus nobody else read: 255 artifacts in one root, 63 in the
+		// other, and the ledger pointing at whichever the writer happened to
+		// resolve.
+		retained, retainErr := reviewingest.RetainArtifact(reviewRoot.RepoRoot, f, a.SHA, a.Reviewer)
 		if retainErr != nil {
 			fmt.Fprintf(os.Stderr, "herd review-ingest: retain artifact FAILED for %s: %v\n", filepath.Base(f), retainErr)
 			os.Exit(1)
@@ -261,7 +275,9 @@ type reviewIngestArgs struct {
 // complete argument list first keeps malformed invocations side-effect free.
 func parseReviewIngestArgs(args []string) (reviewIngestArgs, error) {
 	parsed := reviewIngestArgs{
-		auditRoot:  filepath.Join(".herd", "review"),
+		// FAC-572: resolved through the ONE review-root resolver, so this
+		// command cannot audit a different corpus than the queue refers to.
+		auditRoot:  reviewroot.Resolve(".").Root,
 		ledgerPath: filepath.Join(".herd", "review-ledger.jsonl"),
 	}
 	for i := 0; i < len(args); i++ {
