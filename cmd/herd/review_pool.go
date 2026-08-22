@@ -34,23 +34,20 @@ func runPoolReview(ref string) error {
 		ref = parsedRef
 	}
 	fs := flag.NewFlagSet("review --pool", flag.ContinueOnError)
-	shaFlag := fs.String("sha", parsedSHA, "Exact candidate commit (default: HEAD of .herd/worktrees/<ref>)")
-	// FAC-574: this defaulted to an Ollama proxy model, so every exact review
-	// went through OpenCode regardless of native quota. There is no default
-	// harness any more — the router picks it, and --provider/--model are
-	// explicit operator overrides that the router still has to admit.
-	provider := fs.String("provider", "", "Force a reviewer provider (default: router pick)")
-	model := fs.String("model", "", "Force an exact reviewer model (requires --provider)")
-	excludeFamily := fs.String("exclude-family", "", "Refuse a model family (use the builder's family for a disjoint review)")
-	poolRoot := fs.String("pool-root", filepath.Join(".herd", "pool"), "Warm review pool root")
-	surfaceRoot := fs.String("surface-root", filepath.Join(".herd", "review-surfaces"), "Review surface symlink root")
-	packetRoot := fs.String("packet-root", filepath.Join(".herd", "review-packets"), "Review packet root")
-	noLaunch := fs.Bool("no-launch", false, "Prepare and print the surface without starting Herdr")
-	// The command line was validated and parsed above. Parse the operational
-	// options again to retain their defaults and values for this invocation;
-	// --pool is deliberately registered so the selector is consumed here too.
-	_ = fs.Bool("pool", false, "Select the warm-pool review path")
+	opts := registerPoolReviewFlags(fs)
 	if err := fs.Parse(leadingPositionalArgs(os.Args[2:])); err != nil {
+		return err
+	}
+	shaFlag, provider, model := opts.SHA, opts.Provider, opts.Model
+	excludeFamily, poolRoot := opts.ExcludeFamily, opts.PoolRoot
+	surfaceRoot, packetRoot, noLaunch := opts.SurfaceRoot, opts.PacketRoot, opts.NoLaunch
+	if strings.TrimSpace(*shaFlag) == "" {
+		*shaFlag = parsedSHA
+	}
+	// Argument validation is the cheapest gate, so it runs before any git or
+	// pool work: a malformed option must not be reported only after candidate
+	// resolution has already failed for an unrelated reason.
+	if err := opts.Validate(); err != nil {
 		return err
 	}
 	root := firstEnv("HERD_ROOT", "HERD_REPO_ROOT", ".")
@@ -242,13 +239,7 @@ func checkedOutBranchWorktree(root, ref string) (string, error) {
 func parseReviewPoolArgs(args []string) (ref, sha string, err error) {
 	fs := flag.NewFlagSet("review --pool", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
-	_ = fs.Bool("pool", false, "Select the warm-pool review path")
-	shaFlag := fs.String("sha", "", "Exact candidate commit")
-	_ = fs.String("model", "", "Persistent reviewer model")
-	_ = fs.String("pool-root", "", "Warm review pool root")
-	_ = fs.String("surface-root", "", "Review surface symlink root")
-	_ = fs.String("packet-root", "", "Review packet root")
-	_ = fs.Bool("no-launch", false, "Prepare and print the surface without starting Herdr")
+	shaFlag := registerPoolReviewFlags(fs).SHA
 	if err := fs.Parse(leadingPositionalArgs(args)); err != nil {
 		return "", "", err
 	}
@@ -275,6 +266,54 @@ func safeReviewSurfacePart(ref string) string {
 		return "candidate"
 	}
 	return part
+}
+
+// poolReviewOptions is THE definition of the `herd review --pool` option
+// schema.
+//
+// FAC-574: this schema existed in THREE hand-maintained copies -- the outer
+// parseReviewArgs in main.go, parseReviewPoolArgs here, and runPoolReview's own
+// operational FlagSet. Adding --provider/--exclude-family to only the
+// operational copy made the native route unreachable: the outer ExitOnError
+// parser rejected `flag provided but not defined: -provider` before any lease
+// or tab existed. Every parsing pass now registers from this one function, so a
+// new option cannot be accepted by one pass and refused by another.
+type poolReviewOptions struct {
+	Pool          *bool
+	SHA           *string
+	Provider      *string
+	Model         *string
+	ExcludeFamily *string
+	PoolRoot      *string
+	SurfaceRoot   *string
+	PacketRoot    *string
+	NoLaunch      *bool
+}
+
+// Validate rejects option combinations that are not routes. It lives on the
+// schema so every parsing pass shares one notion of a valid pool command line.
+func (o *poolReviewOptions) Validate() error {
+	if strings.TrimSpace(*o.Model) != "" && strings.TrimSpace(*o.Provider) == "" {
+		return errors.New("--model requires --provider (a model without its surface is not a route)")
+	}
+	return nil
+}
+
+// registerPoolReviewFlags registers the complete pool option schema on fs.
+// Callers that only need the command line accepted may discard the result.
+func registerPoolReviewFlags(fs *flag.FlagSet) *poolReviewOptions {
+	return &poolReviewOptions{
+		Pool:     fs.Bool("pool", false, "Select the warm-pool review path"),
+		SHA:      fs.String("sha", "", "Exact candidate commit (default: HEAD of .herd/worktrees/<ref>)"),
+		Provider: fs.String("provider", "", "Force a reviewer provider (default: router pick)"),
+		Model:    fs.String("model", "", "Force an exact reviewer model (requires --provider)"),
+		ExcludeFamily: fs.String("exclude-family", "",
+			"Refuse a model family (use the builder's family for a disjoint review)"),
+		PoolRoot:    fs.String("pool-root", filepath.Join(".herd", "pool"), "Warm review pool root"),
+		SurfaceRoot: fs.String("surface-root", filepath.Join(".herd", "review-surfaces"), "Review surface symlink root"),
+		PacketRoot:  fs.String("packet-root", filepath.Join(".herd", "review-packets"), "Review packet root"),
+		NoLaunch:    fs.Bool("no-launch", false, "Prepare and print the surface without starting Herdr"),
+	}
 }
 
 const reviewAgentNameLimit = 32
@@ -331,8 +370,11 @@ type poolReviewer struct {
 // the whole exact-review path was dead with no alternative route. Routing here
 // means a spent surface reroutes instead of retrying into the same wall.
 func resolvePoolReviewer(provider, model, excludeFamily string) (poolReviewer, error) {
-	if strings.TrimSpace(model) != "" && strings.TrimSpace(provider) == "" {
-		return poolReviewer{}, errors.New("--model requires --provider (a model without its surface is not a route)")
+	// Defense in depth: the command line was validated at parse time, but this
+	// function is also reachable directly, and one definition of the rule keeps
+	// the two from disagreeing.
+	if err := (&poolReviewOptions{Model: &model, Provider: &provider}).Validate(); err != nil {
+		return poolReviewer{}, err
 	}
 	engine := usage.NewQuotaEngine()
 	computed := map[string]usage.BurnState{}
