@@ -129,10 +129,18 @@ func New(opts IndexOptions) *CandidateIndex {
 		opts.MailPath = mail.CallbackMailPath(opts.RepoRoot)
 	}
 	if opts.LedgerPath == "" && opts.RepoRoot != "" {
-		opts.LedgerPath = reviewroot.Resolve(opts.RepoRoot).CandidateIndexLedger()
+		// FAC-575: this defaulted to .herd/review/ledger.jsonl, which nothing
+		// writes and which does not exist. The scan below builds a
+		// reviewledger.Ledger — the same type the real review ledger uses — so
+		// this was unambiguously meant to read THE review ledger and had been
+		// reading nothing. Step 3 of indexing was inert for every caller that
+		// did not pass an explicit path.
+		opts.LedgerPath = reviewledger.DefaultPath(opts.RepoRoot)
 	}
 	if opts.QueuePath == "" && opts.RepoRoot != "" {
-		opts.QueuePath = reviewroot.Resolve(opts.RepoRoot).CandidateIndexQueue()
+		// The queue is only meaningful relative to its ledger, so derive it from
+		// the ledger rather than resolving a second path independently.
+		opts.QueuePath = reviewledger.QueuePathFor(opts.LedgerPath)
 	}
 	if opts.InboxDir == "" && opts.RepoRoot != "" {
 		opts.InboxDir = reviewroot.Resolve(opts.RepoRoot).Inbox()

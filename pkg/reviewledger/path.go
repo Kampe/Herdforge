@@ -26,3 +26,16 @@ func DefaultPath(root string) string {
 	}
 	return filepath.Join(root, ".herd", Leaf)
 }
+
+// QueueLeaf is the harvest queue's filename, which lives beside the ledger.
+const QueueLeaf = "harvest-queue.jsonl"
+
+// QueuePathFor derives the harvest queue path from a ledger path.
+//
+// FAC-575: NewReviewLedger derived this inline and a second constructor
+// repeated it. The queue is only meaningful relative to its ledger, so deriving
+// it in two places is how a caller ends up reading a ledger and a queue that do
+// not belong to each other.
+func QueuePathFor(ledgerPath string) string {
+	return filepath.Join(filepath.Dir(ledgerPath), QueueLeaf)
+}
