@@ -22,7 +22,7 @@ import (
 )
 
 func TestPulseReviewPacketRoutesToSupervisor(t *testing.T) {
-	packet := pulseReviewPacket(pulse.AgentObservation{Name: "api-crusader", TabID: "wB:t2WF", Workspace: "wB"})
+	packet := pulseReviewPacket(pulse.AgentObservation{Name: "api-crusader", TabID: "wB:t2WF", Workspace: "wB"}, nil, nil)
 	if !strings.Contains(packet, "PULSE REVIEW HANDOFF") || !strings.Contains(packet, "wB:t2WF") {
 		t.Fatalf("packet lacks exact lane identity: %s", packet)
 	}

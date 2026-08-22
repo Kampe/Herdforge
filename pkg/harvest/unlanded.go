@@ -6,6 +6,60 @@ import (
 	"strings"
 )
 
+// UnlandedCommit is one commit that is genuinely not on the main ref.
+type UnlandedCommit struct {
+	SHA     string `json:"sha"`
+	Subject string `json:"subject"`
+}
+
+// UnlandedCommits returns the commits in a worktree that are genuinely NOT on
+// the main ref, with their exact object names.
+//
+// FAC-566: a handoff that names only a tab cannot be validated by its receiver
+// and cannot express a lane holding several unlanded commits -- one observed
+// lane had 29 unlanded against 8 already-equivalent. The exact SHAs are the
+// identity a receiver needs, so they are returned rather than re-derived.
+func UnlandedCommits(ctx context.Context, worktreeDir, mainRef string) ([]UnlandedCommit, error) {
+	if strings.TrimSpace(worktreeDir) == "" {
+		return nil, fmt.Errorf("harvest: worktree dir required")
+	}
+	if strings.TrimSpace(mainRef) == "" {
+		mainRef = "origin/main"
+	}
+	out, err := gitOutput(ctx, worktreeDir, "cherry", "-v", mainRef, "HEAD")
+	if err != nil {
+		return nil, err
+	}
+	var commits []UnlandedCommit
+	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "+ ") {
+			continue
+		}
+		fields := strings.SplitN(line, " ", 3)
+		if len(fields) < 3 {
+			continue
+		}
+		commits = append(commits, UnlandedCommit{
+			SHA:     strings.TrimSpace(fields[1]),
+			Subject: strings.TrimSpace(fields[2]),
+		})
+	}
+	return commits, nil
+}
+
+// SubstantiveCommits drops bookkeeping commits, mirroring SubstantiveSubjects
+// so the two cannot disagree about what counts as work.
+func SubstantiveCommits(commits []UnlandedCommit) []UnlandedCommit {
+	var out []UnlandedCommit
+	for _, c := range commits {
+		if len(SubstantiveSubjects([]string{c.Subject})) == 1 {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
 // UnlandedSubjects returns the commit subjects in a worktree that are genuinely
 // NOT on the main ref -- neither as an ancestor nor as an equivalent patch.
 //

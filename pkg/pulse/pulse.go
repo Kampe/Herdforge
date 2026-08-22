@@ -144,6 +144,10 @@ type AgentObservation struct {
 	TabID string `json:"tab_id,omitempty"`
 	// Workspace is the herdr workspace the tab lives in (reap close target).
 	Workspace string `json:"workspace,omitempty"`
+	// Worktree is the lane's checkout. FAC-566: a review handoff that names only
+	// a tab cannot be validated by its receiver, so the exact worktree is
+	// carried and the exact candidate SHAs are computed from it.
+	Worktree string `json:"worktree,omitempty"`
 	// CommittedWork is true when the lane's worktree has committed (non-empty)
 	// work. An idle agent with uncommitted work is never reaped.
 	CommittedWork bool `json:"committed_work,omitempty"`
