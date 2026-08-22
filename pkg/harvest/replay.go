@@ -367,7 +367,7 @@ func classifyAndApply(ctx context.Context, repo, source string) (ReplayItem, err
 	}
 	item.PatchID = patch
 
-	exact := gitExit(ctx, repo, "merge-base", "--is-ancestor", source, "HEAD") == nil
+	exact := IsAncestor(ctx, repo, source, "HEAD")
 	paths, err := commitPaths(ctx, repo, source)
 	if err != nil {
 		return item, err
@@ -460,7 +460,7 @@ func emptyAnchorParentAccountedAt(ctx context.Context, repo, source string, prio
 			return true, nil
 		}
 	}
-	if gitExit(ctx, repo, "merge-base", "--is-ancestor", parent, head) == nil {
+	if IsAncestor(ctx, repo, parent, head) {
 		return true, nil
 	}
 	// An independently mapped parent is acceptable when its canonical patch

@@ -73,9 +73,26 @@ func NewViolations(found []Occurrence, base *Baseline) []Occurrence {
 				added = append(added, f)
 			}
 		}
-		if len(added) > 0 {
-			out = append(out, Occurrence{Literal: occ.Literal, Files: added})
+		if len(added) == 0 {
+			continue
 		}
+		// FAC-557: a NEW FILE is not the same thing as a NEW DUPLICATE.
+		//
+		// This flagged a change that consolidated three copies of the ancestry
+		// check into one, because the surviving copy lived in a file the
+		// baseline had never seen. Failing a change that strictly reduces
+		// duplication is worse than not firing at all: the next person reaches
+		// for the baseline regenerator, and a gate that gets baselined away
+		// once is gone for good.
+		//
+		// Duplication is a COUNT of distinct locations, so that is what to
+		// compare. Moving a copy is neutral, consolidating is an improvement,
+		// and only genuinely adding a location is the defect this exists to
+		// catch.
+		if len(occ.Files) <= len(known) {
+			continue
+		}
+		out = append(out, Occurrence{Literal: occ.Literal, Files: added})
 	}
 	return out
 }
