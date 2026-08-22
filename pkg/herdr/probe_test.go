@@ -172,8 +172,12 @@ echo PROBE_OK`)
 
 func TestProbeProviderModel_FailsClosed(t *testing.T) {
 	t.Run("unsupported provider", func(t *testing.T) {
-		result := ProbeProviderModel(context.Background(), "claude", "claude-sonnet-5", "medium")
-		if result.Available || !strings.Contains(result.Reason, "unsupported probe provider") {
+		// FAC-578: this case used to assert that native CLAUDE was unsupported,
+		// which is precisely the defect — a provider the router can route and
+		// launch was unprobeable, so any preflight built on the probe refused a
+		// valid route. A genuinely unlaunchable provider is the real subject.
+		result := ProbeProviderModel(context.Background(), "definitely-not-a-provider", "m", "medium")
+		if result.Available || !strings.Contains(result.Reason, "cannot probe what cannot be launched") {
 			t.Fatalf("unsupported provider did not fail closed: %+v", result)
 		}
 	})
