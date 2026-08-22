@@ -137,7 +137,7 @@ func runLegacyReceipts() {
 		fmt.Fprintf(os.Stderr, "herd legacy-receipts: %v\n", err)
 		os.Exit(1)
 	}
-	cfg, err := config.LoadConfig(filepath.Join(root, ".herd", "herd.yaml"))
+	cfg, err := config.LoadConfig(config.PathFor(root))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "herd legacy-receipts: load config: %v\n", err)
 		os.Exit(1)

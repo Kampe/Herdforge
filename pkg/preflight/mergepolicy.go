@@ -41,7 +41,7 @@ func DefaultProtectedPolicy() MergePolicy {
 // omitted merge_policy yields DefaultProtectedPolicy so absence cannot
 // silently open autonomous merge.
 func LoadMergePolicy(root string) (MergePolicy, error) {
-	path := filepath.Join(root, ".herd", "herd.yaml")
+	path := config.PathFor(root)
 	if root == "" || root == "." {
 		path = config.RuntimeConfigPath()
 	}

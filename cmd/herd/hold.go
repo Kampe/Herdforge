@@ -267,7 +267,7 @@ func productionActiveTasks(ctx context.Context, lane string) ([]lifecycle.HoldId
 }
 
 func loadProductionActiveTaskResolver(ctx context.Context) (lifecycle.ActiveTaskResolver, error) {
-	cfg, err := config.LoadConfig(".herd/herd.yaml")
+	cfg, err := config.LoadConfig(config.DefaultConfigPath)
 	if err != nil {
 		return nil, err
 	}
@@ -385,7 +385,7 @@ func runHold() {
 		fmt.Fprintln(os.Stderr, "hold: task scope requires explicit --lane and --owner")
 		os.Exit(2)
 	}
-	cfg, cfgErr := config.LoadConfig(".herd/herd.yaml")
+	cfg, cfgErr := config.LoadConfig(config.DefaultConfigPath)
 	if cfgErr != nil {
 		fmt.Fprintf(os.Stderr, "hold: %v\n", cfgErr)
 		os.Exit(1)

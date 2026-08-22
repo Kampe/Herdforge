@@ -519,8 +519,27 @@ func (c *Config) Validate() error {
 
 var (
 	DefaultConfigPath = filepath.Join(".herd", "herd.yaml")
-	DefaultHerdDir    = ".herd"
+
+	DefaultHerdDir = ".herd"
 )
+
+// PathFor returns the project config path under root.
+//
+// FAC-574: DefaultConfigPath already existed, but eleven callers rebuilt the
+// same path from segments instead of using it, and five of those needed a root
+// prefix DefaultConfigPath could not express — so they hand-joined it. Location
+// divergence has already produced two consumer-visible defects here (the handoff
+// mailbox and the review corpus each resolving differently by working
+// directory), and the config is what tells a lane which fleet it belongs to.
+//
+// An empty root yields the repo-relative default, so this is a drop-in for both
+// call shapes.
+func PathFor(root string) string {
+	if strings.TrimSpace(root) == "" {
+		return DefaultConfigPath
+	}
+	return filepath.Join(root, DefaultConfigPath)
+}
 
 // ConfiguredHarnessKinds returns the deduplicated, sorted list of harness kinds
 // declared across all configured lanes.

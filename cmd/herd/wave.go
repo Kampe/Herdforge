@@ -46,7 +46,7 @@ func runWave() {
 	opts := wave.Options{Standing: *doStanding, Up: *up}
 	ctx := context.Background()
 
-	cfg, cfgErr := config.LoadConfig(".herd/herd.yaml")
+	cfg, cfgErr := config.LoadConfig(config.DefaultConfigPath)
 	src, raiser := buildWaveRuntime(ctx, cfg, cfgErr)
 
 	rep, err := wave.Run(ctx, src, opts, raiser)
