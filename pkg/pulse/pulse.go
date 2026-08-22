@@ -170,6 +170,41 @@ type AgentObservation struct {
 	TabGeneration uint64 `json:"tab_generation,omitempty"`
 	// TabRevision is the herdr tab revision counter at observation time.
 	TabRevision uint64 `json:"tab_revision,omitempty"`
+	// Kind is the harness behind the pane (opencode, claude, codex, agy...).
+	//
+	// FAC-418: it is here because idle detection is not equally trustworthy
+	// across harnesses. herdr's screen detection reports agent_status=idle for
+	// an OpenCode 1.18.x pane that is actively mid-turn, so for those panes
+	// "idle" and "dead" are indistinguishable without reading the pane.
+	Kind string `json:"kind,omitempty"`
+}
+
+// unreliableIdleKinds are harnesses whose reported idle status cannot be
+// trusted to mean "not working".
+//
+// FAC-418: herdr's screen detection does not parse the OpenCode 1.18.x TUI busy
+// indicator, so a genuinely working reviewer reports idle. That is upstream and
+// not fixable here, but the CONSEQUENCE is ours: pulse plans a reap from exactly
+// that status, so a misreported pane with a done ticket or a review pin could be
+// closed mid-turn and lose the work in it.
+var unreliableIdleKinds = map[string]bool{
+	"opencode": true, "ollama": true, "lazer": true,
+}
+
+// IdleCorroborated reports whether this observation's idle/done status is
+// trustworthy enough to authorize a DESTRUCTIVE action.
+//
+// For a harness with reliable detection, idle means idle. For one with known
+// unreliable detection it requires a second signal, and the only one available
+// without reading the pane is the absence of a live foreground process. When
+// neither can be established the answer is false, because the cost of being
+// wrong is asymmetric: refusing to reap leaks a pane an operator can close,
+// while reaping a working agent destroys work that was never reviewed.
+func (a AgentObservation) IdleCorroborated() bool {
+	if !unreliableIdleKinds[strings.ToLower(strings.TrimSpace(a.Kind))] {
+		return true
+	}
+	return strings.TrimSpace(a.ForegroundProcess) == ""
 }
 
 // LeaseObservation is one durable claim lease row.
@@ -644,6 +679,24 @@ func Plan(obs Observation, opts Options) (Snapshot, error) {
 			reasonParts = append(reasonParts, "branch out for review at "+a.SafeRef)
 		}
 		reason := "reap idle lane: " + strings.Join(reasonParts, "; ")
+		// FAC-418: an idle status that cannot be corroborated must not
+		// authorize a close. herdr reports idle for an actively-working
+		// OpenCode pane, and this loop reaps from that status, so the
+		// misreport becomes destroyed work. Surface the reap with the exact
+		// way to corroborate it instead of applying it.
+		if !a.IdleCorroborated() {
+			actions = append(actions, Action{
+				Kind:   ActionWouldRun,
+				Target: target,
+				WouldRun: "reap_lane " + target,
+				Reason: "reap WITHHELD: " + reason + "; harness " + a.Kind +
+					" misreports idle for an actively-working pane, and a live foreground process (" +
+					strings.TrimSpace(a.ForegroundProcess) + ") contradicts it. Corroborate with `herdr pane read " +
+					a.PaneID + "` before closing.",
+				Safe: false,
+			})
+			continue
+		}
 		act := Action{
 			Kind:   ActionReapLane,
 			Target: target,
