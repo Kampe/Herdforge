@@ -59,10 +59,18 @@ func TestPreflightRefusesUnreadyReviewer(t *testing.T) {
 	}
 }
 
-// The probe must be a REAL request, not a credential-presence check: a host CLI
-// that reports loggedIn=true while its pane opens at an auth screen is exactly
-// the case that got through.
-func TestPreflightUsesARealGenerationProbe(t *testing.T) {
+// FAC-579 corrected this test's premise.
+//
+// It used to require that the preflight "execute a request" and forbid any
+// mention of an auth check, on the belief that a real generation was the
+// strongest available evidence. That belief was wrong: the generation ran in
+// THIS process, so it proved the coordinator's credential context while the
+// reviewer runs in a pane with a different one. The probe passed and the launch
+// then failed at an authentication screen.
+//
+// What must hold is that the preflight checks the boundary the LAUNCH hits, and
+// that an in-process signal can never substitute for it.
+func TestPreflightChecksTheBoundaryTheLaunchHits(t *testing.T) {
 	src, err := os.ReadFile("review_pool.go")
 	if err != nil {
 		t.Fatal(err)
@@ -71,10 +79,16 @@ func TestPreflightUsesARealGenerationProbe(t *testing.T) {
 	if !ok {
 		t.Fatal("cannot locate preflightReviewerReadiness")
 	}
-	if !strings.Contains(body, "herdr.ProbeProviderModel") {
-		t.Error("preflight must run a real generation probe, not an auth-status check")
+	if !strings.Contains(body, "DiagnoseKindAuthReadiness") {
+		t.Error("preflight must gate on worker credential brokerability")
 	}
-	if strings.Contains(body, "auth status") || strings.Contains(body, "LookPath") {
-		t.Error("credential presence is not readiness; probe must execute a request")
+	if !strings.Contains(body, "Brokerable") {
+		t.Error("preflight must act on the brokerability verdict, not merely consult it")
+	}
+	// An in-process probe may remain as a secondary quota/model signal, but the
+	// brokerability gate must be able to refuse on its own.
+	gate := strings.Index(body, "!auth.Brokerable")
+	if gate < 0 {
+		t.Error("brokerability must be a refusal on its own, not advisory")
 	}
 }

@@ -2,6 +2,8 @@ package herdr
 
 import (
 	"errors"
+	"os"
+	"strings"
 	"testing"
 )
 
@@ -52,4 +54,44 @@ func TestConflictWinsOverUsageNoise(t *testing.T) {
 	if closeVerbUnsupported(err) {
 		t.Error("a stale generation reported with usage text is still a refusal")
 	}
+}
+
+// TestNoGenerationDegradesInsteadOfStranding is the FAC-579 gate.
+//
+// The FAC-577 missing-verb degradation was UNREACHABLE for the build that
+// needed it: a herdr with no compare-close verb also reports no immutable
+// generation, and the generation check returned first. So every failed launch on
+// such a build stranded its own tab as an orphan for an operator to close by
+// hand — exactly the outcome the degradation existed to prevent.
+//
+// The gate is structural because the surrounding loop needs a live herdr: assert
+// that the generation branch closes and continues rather than returning.
+func TestNoGenerationDegradesInsteadOfStranding(t *testing.T) {
+	src, err := readSourceFile("live_harness_proof.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	idx := strings.Index(src, "a.StateChangeSeq == 0")
+	if idx < 0 {
+		t.Fatal("cannot locate the generation check")
+	}
+	// Look at the branch body only.
+	branch := src[idx:]
+	if end := strings.Index(branch, "\n\t\t\t\t\t}"); end > 0 {
+		branch = branch[:end]
+	}
+	if strings.Contains(branch, "return fmt.Errorf(\"FAC-133 cleanup: tab") {
+		t.Error("a missing generation must not strand the tab; degrade to close plus absence readback")
+	}
+	if !strings.Contains(branch, "tabCloseRaw") {
+		t.Error("the no-generation branch must still attempt a real close")
+	}
+	if !strings.Contains(branch, "closeAttempted = true") {
+		t.Error("the degraded close must be recorded so the absence readback runs")
+	}
+}
+
+func readSourceFile(name string) (string, error) {
+	b, err := os.ReadFile(name)
+	return string(b), err
 }
