@@ -1005,8 +1005,11 @@ func pulseReviewPacket(lane pulse.AgentObservation, commits []harvest.UnlandedCo
 	b.WriteString("\nTHIS NUDGE DOES NOT SUPERSEDE ANY EARLIER HANDOFF. Handoffs are queued " +
 		"durably and each is independent work; a newer one never cancels an older one. " +
 		"Your DURABLE INBOX is the authority, not this pane:\n" +
-		"  herd handoffs list                 # every pending handoff addressed to you\n" +
+		"  herd handoffs list                 # your pending handoffs; resolves your own name\n" +
 		"  herd handoffs done <id>            # only after that handoff reaches a disposition\n" +
+		"Do NOT pass a role id as --recipient. The commands resolve your exact agent name from\n" +
+		"your pane; a role id names an inbox that does not exist and returns an empty list,\n" +
+		"which is indistinguishable from having no work.\n" +
 		"Drain the inbox before acting on pane text. An unread entry always means unfinished " +
 		"work, so never mark one done to clear the list.\n")
 	return b.String()

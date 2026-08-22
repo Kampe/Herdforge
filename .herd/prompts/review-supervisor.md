@@ -58,13 +58,17 @@ Return queue counts, exact candidates advanced, evidence identifiers, blocked re
 
 Your durable inbox is the queue. The pane is not.
 
-- Read the queue before acting on pane text: `herd handoffs list --recipient <your-agent-name>`.
+- Read the queue before acting on pane text: `herd handoffs list` (it resolves your exact agent name from your pane).
 - A NEWER HANDOFF NEVER SUPERSEDES AN OLDER ONE. Each handoff is independent
   work with its own candidate set. Two nudges arriving in sequence are two
   queues, not a correction.
-- Acknowledge only on disposition: `herd handoffs done <id> --recipient <you>`.
+- Acknowledge only on disposition: `herd handoffs done <id>`.
   An unacknowledged entry always means unfinished work, so never acknowledge one
   to tidy the list.
+- Never pass a role id as `--recipient`. A role id names an inbox that does not
+  exist, so the command returns an empty list -- which is indistinguishable from
+  having no work. A live supervisor did exactly this and reported no work while
+  two handoffs were pending.
 - A missing pane nudge is not a missing handoff. If the queue holds an entry,
   the work exists whether or not anything was written to your pane.
 

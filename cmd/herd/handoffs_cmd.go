@@ -61,10 +61,20 @@ func handoffRecipient(args []string) (string, bool, []string) {
 func runHandoffsList(args []string) {
 	recipient, asJSON, _ := handoffRecipient(args)
 	if strings.TrimSpace(recipient) == "" {
-		// Fail closed: listing "everyone's" queue would invite acting on
-		// another lane's work.
-		fmt.Fprintln(os.Stderr, "herd handoffs list: --recipient <agent> is required")
-		os.Exit(2)
+		// FAC-570: resolve the caller's own identity rather than demanding a
+		// value an agent cannot know. The packet used to say
+		// "--recipient <your-agent-name>", which is unresolvable from inside a
+		// pane: a live supervisor substituted its role id, saw an empty inbox,
+		// and concluded there was no work while two records were pending.
+		self, err := resolveSelfAgentName()
+		if err != nil {
+			// Loud, never an empty list. Unresolved identity and an empty queue
+			// must not look the same.
+			fmt.Fprintf(os.Stderr, "herd handoffs list: %v\n", err)
+			os.Exit(1)
+		}
+		recipient = self
+		fmt.Printf("herd handoffs: resolved your agent name as %s\n", recipient)
 	}
 	pending, err := PendingReviewHandoffs(mail.CallbackMailPath("."), recipient)
 	if err != nil {
@@ -94,9 +104,17 @@ func runHandoffsList(args []string) {
 
 func runHandoffsDone(args []string) {
 	recipient, _, rest := handoffRecipient(args)
-	if strings.TrimSpace(recipient) == "" || len(rest) != 1 {
-		fmt.Fprintln(os.Stderr, "usage: herd handoffs done <id> --recipient <agent>")
+	if len(rest) != 1 {
+		fmt.Fprintln(os.Stderr, "usage: herd handoffs done <id> [--recipient <agent>]")
 		os.Exit(2)
+	}
+	if strings.TrimSpace(recipient) == "" {
+		self, err := resolveSelfAgentName()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "herd handoffs done: %v\n", err)
+			os.Exit(1)
+		}
+		recipient = self
 	}
 	id := rest[0]
 	box := mail.NewMailbox(mail.CallbackMailPath("."))
