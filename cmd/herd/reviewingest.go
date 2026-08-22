@@ -156,13 +156,21 @@ func runReviewIngest() {
 		}
 		decision, err := reviewIngestAdmissionDecision(ledger, opts, f, artifactName)
 		if err != nil {
-			if parsed.dryRun {
-				emit.refused(f, err)
-				refused++
-				continue
-			}
-			fmt.Fprintf(os.Stderr, "herd review-ingest: preflight artifact move FAILED for %s: %v\n", filepath.Base(f), err)
-			os.Exit(1)
+			// FAC-580: refuse the ARTIFACT, not the batch.
+			//
+			// This exited the process, so a single malformed artifact aborted
+			// the whole run and nothing after it was ingested. One file
+			// declaring an unprovable builder family stalled 99 good verdicts
+			// behind it, which is invisible from the outside: the command
+			// reports a failure for one name and silently never reaches the
+			// rest.
+			//
+			// Still fail-closed. The bad artifact is refused, not admitted, and
+			// the run exits non-zero at the end because refused > 0 — the same
+			// guarantee, without letting one file hold up a backlog.
+			emit.refused(f, err)
+			refused++
+			continue
 		}
 		base := reviewIngestOutcome{
 			Artifact: filepath.Base(f), Path: f, SHA: a.SHA, Branch: a.Branch,
@@ -204,16 +212,20 @@ func runReviewIngest() {
 		// resolve.
 		retained, retainErr := reviewingest.RetainArtifact(reviewRoot.RepoRoot, f, a.SHA, a.Reviewer)
 		if retainErr != nil {
-			fmt.Fprintf(os.Stderr, "herd review-ingest: retain artifact FAILED for %s: %v\n", filepath.Base(f), retainErr)
-			os.Exit(1)
+			// FAC-580: per-artifact, not per-batch. See the admission refusal
+			// above: aborting here stalled every later verdict behind one file.
+			emit.refused(f, fmt.Errorf("retain artifact: %w", retainErr))
+			refused++
+			continue
 		}
 		if a.Verdict == "RETIRED" {
 			if _, err := ledger.Ingest(reviewledger.IngestOpts{Retired: &reviewledger.RetireOpts{
 				SHA: a.SHA, Branch: a.Branch, Authority: a.Authority,
 				Reason: a.Body, Artifact: retained,
 			}}); err != nil {
-				fmt.Fprintf(os.Stderr, "herd review-ingest: retirement write FAILED for %s: %v\n", filepath.Base(f), err)
-				os.Exit(1)
+				emit.refused(f, fmt.Errorf("retirement write: %w", err))
+				refused++
+				continue
 			}
 			o := base
 			o.Disposition, o.Authority = "retired", a.Authority
@@ -229,8 +241,12 @@ func runReviewIngest() {
 		verdictOpts.Artifact = retained
 		enqueued, err := admitVerdictAndMove(ledger, reviewledger.IngestOpts{Record: recordOpts, Verdict: verdictOpts}, f, artifactName)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "herd review-ingest: admission/verdict write FAILED for %s: %v\n", filepath.Base(f), err)
-			os.Exit(1)
+			// A genuinely broken ledger will refuse EVERY artifact loudly,
+			// which is strictly more informative than truncating the batch at
+			// the first one.
+			emit.refused(f, fmt.Errorf("admission/verdict write: %w", err))
+			refused++
+			continue
 		}
 		if !enqueued && a.Verdict == "PASS" {
 			o := base
