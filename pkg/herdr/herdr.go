@@ -1421,14 +1421,26 @@ func agentStartProcess(name, kind, paneID string, agentArgs ...string) error {
 // become attachable, then proves that the named agent still owns the pane and
 // has a foreground process. A created tab or a successful start command is
 // not launch success. Any failed proof compensates the exact tab.
-func StartReviewAgent(tabID, name, paneID, model string) error {
+// StartReviewAgent launches a reviewer on an explicit harness.
+//
+// kind and args come from the router, not from this function: hardcoding a
+// harness here is what made native Claude unreachable for exact review.
+func StartReviewAgent(tabID, name, paneID, kind string, args ...string) error {
 	if strings.TrimSpace(tabID) == "" || strings.TrimSpace(name) == "" || strings.TrimSpace(paneID) == "" {
 		return fmt.Errorf("review launch identity requires tab, agent, and pane")
 	}
-	if strings.TrimSpace(model) == "" {
-		return fmt.Errorf("review launch model is required")
+	if strings.TrimSpace(kind) == "" {
+		return fmt.Errorf("review launch harness kind is required")
 	}
-	if err := agentStartProcess(name, "opencode", paneID, "--model", model, "--auto"); err != nil {
+	if len(args) == 0 {
+		return fmt.Errorf("review launch argv is required")
+	}
+	// FAC-574: the harness was hardwired to opencode, so the exact-review pool
+	// could ONLY launch an OpenCode proxy. With native Claude at 90% quota the
+	// pool still drove Ollama through repeated RateLimitError and no exact
+	// review could complete. A reviewer surface must be routable like every
+	// other launch.
+	if err := agentStartProcess(name, kind, paneID, args...); err != nil {
 		return errors.Join(err, hardCloseTab(tabID, name))
 	}
 	if _, err := VerifyAgentLaunch(name, paneID, 15*time.Second); err != nil {
