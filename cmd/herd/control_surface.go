@@ -14,7 +14,7 @@ import (
 // FAC-240: controlSurfaceVersion is a compatibility boundary, not a display
 // number. Any command-contract change must add its new fingerprint below and
 // increment this value; ValidateControlSurfaceManifest rejects silent drift.
-const controlSurfaceVersion = 13
+const controlSurfaceVersion = 15
 
 type commandClass string
 
@@ -51,7 +51,7 @@ var commandNamesByClass = map[commandClass][]string{
 		"board-audit", "candidate", "handoffs", "control-surface", "mail", "preflight", "preflight-static", "process", "resources", "route", "scope", "selftest", "status", "tests-for", "throughput", "timeline", "tool-probe", "transcript", "unmerged", "verify", "worktrees",
 	},
 	classCoordinatorOnly: {
-		"activate", "approve", "attention", "board-done", "board-freeze", "board-frozen", "board-sync", "claude-only", "cleanup", "command", "commands", "containers", "control", "daemon", "deps", "dispatch", "doctor-models", "drain", "feedback", "fence-provision", "forge", "fresh-build", "goal-guard", "harvest", "harvest-merge", "herdr-deliver", "hold", "kick", "labels", "legacy-receipts", "lifecycle", "lock", "lost", "merge-admit", "merge-complete", "next", "no-claude", "overlap", "park", "posture", "pulse", "quota", "quota-supervisor", "receipt", "repl", "rescue", "reset-safe", "resolve-lane", "review", "review-classify", "review-ingest", "review-ledger", "send", "sh", "shoot", "shot", "slot", "spin", "standing", "stop", "task", "up", "usage", "watch", "wave", "wind-down", "verify-fac151",
+		"activate", "approve", "attention", "board-done", "board-freeze", "board-frozen", "board-sync", "claude-only", "cleanup", "command", "commands", "containers", "control", "daemon", "deps", "dispatch", "doctor-models", "drain", "feedback", "fence-provision", "finish", "forge", "fresh-build", "goal-guard", "harvest", "harvest-merge", "herdr-deliver", "hold", "kick", "labels", "legacy-receipts", "lifecycle", "lock", "lost", "merge-admit", "merge-complete", "next", "no-claude", "overlap", "park", "posture", "pool", "pulse", "quota", "quota-supervisor", "receipt", "repl", "rescue", "reset-safe", "resolve-lane", "review", "review-classify", "review-ingest", "review-ledger", "send", "sh", "shoot", "shot", "slot", "spin", "standing", "stop", "task", "up", "usage", "watch", "wave", "wind-down", "verify-fac151",
 	},
 	classOperatorOnly: {
 		"clone", "envplan", "hostcreds", "init", "seed-lane-state", "signer-boundary", "stash", "validate-config",
@@ -126,6 +126,11 @@ var controlSurfaceCompatibility = map[int]string{
 	12: "b71cf3414849949c33a93f940b5f5e4f053bf17f2e919c2b9a52e47f037a13b9",
 	// 13 adds the read-only `handoffs` queue command (FAC-569).
 	13: "bc787445e6e85201ac7f2da06852a4c62a96b12498f16329b7515dad92e5da99",
+	// 14 registers `pool`, whose switch case existed but was never admitted
+	// (FAC-573): warm-pool leases could be taken and never released.
+	14: "175e34fc0291a5679d68aa11d7bc584c3b1061287b23da5aad7c502b4cedeba9",
+	// 15 also registers `finish`, likewise unreachable (FAC-573).
+	15: "05e09fdccaf952a41518b354ed526c3e2496b3b4634fce27b47b0bc47d86a454",
 }
 
 func controlSurfaceFingerprint(m controlSurfaceManifest) (string, error) {
