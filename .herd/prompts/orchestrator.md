@@ -96,3 +96,70 @@ Before issuing ANY instruction that rewrites history (rebase, reset, branch swit
 `safe/fac-<ref>` at the current tip and VERIFY the ref resolves. Do not trust that the tag exists
 because the command exited zero — three lanes destroyed their own commits in one session with
 `git reset --hard origin/main`, and one recovery tag silently failed to create.
+
+## Environment facts that have already burned a coordinator
+
+These are not style notes. Each one produced a live defect that a consumer, not
+a test, had to find.
+
+**`HERD_ROOT` is the LANE root. It is NOT the project control root.** Launch sets
+it to the lane's own root, so a supervisor launched into its own worktree
+inherits it. Two resolvers — the durable handoff mailbox and the review corpus —
+both read it as the project root, agreed with each other, and were both wrong:
+the supervisor resolved a lane-local mailbox, reported no pending handoffs, and
+five real ones sat unread. An explicit `cd` cannot repair it, because an
+inherited override outranks the working directory by design.
+
+Use `HERD_PROJECT_ROOT`, or let the code resolve it from the git common
+directory's parent, which is worktree-invariant. Never derive a control-plane
+path from `HERD_ROOT`. If you see `note: HERD_ROOT=... names a lane, not this
+project`, that is the guard working — not a warning to silence.
+
+**A clean gate run proves nothing about a file you have not committed.** This was
+true until recently: the boundary check asked git for changed files with
+untracked files EXCLUDED, so a brand-new file was invisible and passed
+vacuously, then failed the identical check once staged. It is fixed, but the
+lesson generalizes to every gate you did not write: ask what set of files it
+actually inspects before you trust a green run.
+
+**Verify the instrument, not just the result.** Three times in one session a
+check passed while the thing it claimed to verify was broken: a readiness probe
+run in the coordinator's own process (which proves the coordinator's credentials,
+not the pane's), an option schema verified by reading the code instead of running
+the command, and a root resolver tested from a clean shell that never had the
+inherited override that breaks it. If a test cannot fail when the defect is
+present, it is not evidence. Mutation-prove anything load-bearing: break the fix,
+watch the test go red, restore it.
+
+**One rule, one definition.** The single largest source of defects here is a rule
+implemented twice whose copies diverge, so a fix lands on one of them. It has
+produced: a candidate selector and its eligibility gate disagreeing about "on
+this branch"; three tab-close paths disagreeing about whether a refusal may be
+downgraded; a mailbox and a review root disagreeing about where the project is.
+`pkg/invariant`'s duplicate-rule gate fails the build on a new one — when it
+fires, extract a definition rather than reaching for the baseline regenerator. A
+gate that gets baselined away once is gone for good.
+
+**Credential readiness is not quota and not an interactive login.** `claude auth
+status` reporting logged-in says nothing about whether a spawned worker can
+authenticate: the pane runs in a different credential context. Check
+`herd hostcreds diagnose --kind <k>`. At the time of writing only `agy` is
+brokerable on this host; `claude`, `codex` and `grok` all report
+`brokerable=false` pending handle-backed HostCreds, so a native reviewer cannot
+launch at all until an operator provisions `HERD_HOSTCREDS_HANDLES`. Do not
+route around this with a proxy surface.
+
+**A fenced board write needs infrastructure that is not automatic.** `herd
+preflight` now reports fence-broker readiness with the exact command. A
+coordinator can host the broker in-process with `HERD_FENCE_COORDINATOR=1`, which
+makes mint authority the process address space; hosting is never automatic
+because taking the claim-directory lock would lock out every other coordinator on
+that volume. Closing a card still requires acceptance evidence — a pre-existing
+`herd-acceptance-v1` block or an admitted cross-family PASS — and an override
+policy does not substitute for it.
+
+**Ancestry is the wrong question for a rebase-merge.** Every PR here is
+rebase-merged, which rewrites SHAs, so a reviewed commit is normally NOT an
+ancestor of `origin/main` even though its patch shipped. Attest landing by patch
+identity (`harvest.AttestLanded`), and never read "cannot prove" as "did not
+land" — that conflation is how reviewed work gets deleted as orphaned.
