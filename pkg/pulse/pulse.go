@@ -403,27 +403,7 @@ func Plan(obs Observation, opts Options) (Snapshot, error) {
 		} else if a.Stale {
 			st = StatusStale
 		}
-		agents = append(agents, AgentObservation{
-			Name:              name,
-			Status:            st,
-			Raw:               raw,
-			PaneID:            a.PaneID,
-			PaneState:         a.PaneState,
-			ForegroundProcess: a.ForegroundProcess,
-			ExitReason:        a.ExitReason,
-			LastError:         a.LastError,
-			ContextWarning:    a.ContextWarning,
-			Stale:             a.Stale || st == StatusStale,
-			TabID:             a.TabID,
-			Workspace:         a.Workspace,
-			CommittedWork:     a.CommittedWork,
-			TicketDone:        a.TicketDone,
-			SafeRef:           a.SafeRef,
-			AwaitingVerdict:   a.AwaitingVerdict,
-			PacketPending:     a.PacketPending,
-			TabGeneration:     a.TabGeneration,
-			TabRevision:       a.TabRevision,
-		})
+		agents = append(agents, projectAgent(a, name, st, raw))
 	}
 	sort.Slice(agents, func(i, j int) bool {
 		return agents[i].Name < agents[j].Name
@@ -1038,4 +1018,27 @@ func Beat(ctx context.Context, obs Observation, opts Options, actor Actor) (Snap
 		return snap, nil
 	}
 	return Apply(ctx, snap, actor)
+}
+
+// projectAgent rebuilds one observation for the classified snapshot.
+//
+// FAC-566 follow-up: this was an inline struct literal that copied 19 of 20
+// fields. The one it dropped was Worktree -- set correctly by the Herdr read,
+// gone by the time Apply and OpenReview saw it -- so every handoff reported
+// "CANDIDATES: UNRESOLVED — worktree dir required" while Herdr had the right cwd
+// the whole time.
+//
+// A field-by-field copy of a growing struct fails SILENTLY by construction: the
+// compiler is satisfied and only behaviour reveals the omission. So it now
+// COPIES THE WHOLE VALUE and overrides only what classification changes. Adding a
+// field to AgentObservation can no longer drop it here, and
+// TestProjectAgentCopiesEveryField asserts that by reflection rather than by
+// anyone remembering.
+func projectAgent(a AgentObservation, name string, st AgentStatus, raw string) AgentObservation {
+	out := a
+	out.Name = name
+	out.Status = st
+	out.Raw = raw
+	out.Stale = a.Stale || st == StatusStale
+	return out
 }
