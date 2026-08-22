@@ -1,6 +1,7 @@
 package main
 
 import (
+	"path/filepath"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -76,7 +77,22 @@ func runHandoffsList(args []string) {
 		recipient = self
 		fmt.Printf("herd handoffs: resolved your agent name as %s\n", recipient)
 	}
-	pending, err := PendingReviewHandoffs(mail.CallbackMailPath("."), recipient)
+	// FAC-572: disclose WHICH mailbox is being read.
+	//
+	// A coordinator listing --recipient X saw two entries pending while the
+	// target's own self-resolved list reported none. That question is
+	// unanswerable from the output, because CallbackMailPath is CWD-relative:
+	// a coordinator at the repo root and an agent in its worktree can resolve
+	// different files, and nothing printed said so. A queue tool that does not
+	// name its queue makes "pending" and "handled" unattributable.
+	// Resolve ONCE: the resolver also emits the divergent-mailbox note, and
+	// calling it per use printed that note twice for one command.
+	bus := canonicalHandoffMailbox()
+	mailPath, pathErr := filepath.Abs(bus)
+	if pathErr != nil {
+		mailPath = bus
+	}
+	pending, err := PendingReviewHandoffs(bus, recipient)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "herd handoffs list: %v\n", err)
 		os.Exit(1)
@@ -84,18 +100,27 @@ func runHandoffsList(args []string) {
 	if asJSON {
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")
-		if err := enc.Encode(pending); err != nil {
+		// The mailbox path is part of the answer, not decoration: two callers
+		// disagreeing about "pending" is usually two different files.
+		payload := map[string]any{
+			"recipient": recipient,
+			"mailbox":   mailPath,
+			"handled_state": mail.HandledStatePath(mailPath),
+			"pending":   pending,
+		}
+		if err := enc.Encode(payload); err != nil {
 			fmt.Fprintf(os.Stderr, "herd handoffs list: encode: %v\n", err)
 			os.Exit(1)
 		}
 		return
 	}
 	if len(pending) == 0 {
-		fmt.Printf("herd handoffs: no pending handoffs for %s\n", recipient)
+		fmt.Printf("herd handoffs: no pending handoffs for %s\n  mailbox: %s\n  handled: %s\n",
+			recipient, mailPath, mail.HandledStatePath(mailPath))
 		return
 	}
-	fmt.Printf("herd handoffs: %d pending for %s — each is independent work; none supersedes another\n",
-		len(pending), recipient)
+	fmt.Printf("herd handoffs: %d pending for %s — each is independent work; none supersedes another\n  mailbox: %s\n  handled: %s\n",
+		len(pending), recipient, mailPath, mail.HandledStatePath(mailPath))
 	for _, env := range pending {
 		fmt.Printf("  %s  seq=%d  %s\n", env.ID, env.Sequence, env.Subject)
 	}
@@ -117,7 +142,7 @@ func runHandoffsDone(args []string) {
 		recipient = self
 	}
 	id := rest[0]
-	box := mail.NewMailbox(mail.CallbackMailPath("."))
+	box := mail.NewMailbox(canonicalHandoffMailbox())
 	if err := box.MarkHandled(recipient, id); err != nil {
 		fmt.Fprintf(os.Stderr, "herd handoffs done: %v\n", err)
 		os.Exit(1)
