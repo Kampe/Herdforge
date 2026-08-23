@@ -28,8 +28,12 @@ var unknownHeaderRe = regexp.MustCompile(`^[a-z][a-z0-9._-]*$`)
 
 // Artifact is a parsed reviewer verdict.
 type Artifact struct {
-	SHA            string
-	Branch         string
+	SHA    string
+	Branch string
+	// TaskRef is the board card this verdict belongs to. Without it a ledger
+	// row carries only sha+verdict, so no verdict can be tied back to a card
+	// and a corrupted board cannot be rebuilt from review history (FAC-578).
+	TaskRef        string
 	Reviewer       string
 	Authority      string
 	ReviewerFamily string
@@ -113,6 +117,8 @@ func Parse(text string) Artifact {
 				a.SHA = value
 			case "branch":
 				a.Branch = value
+			case "task", "task-id", "card", "ticket":
+				a.TaskRef = NormalizeTaskRef(value)
 			case "reviewer":
 				a.Reviewer = value
 			case "authority", "asserting-authority":
@@ -142,6 +148,9 @@ func Parse(text string) Artifact {
 		body.WriteString("\n")
 	}
 	a.Body = body.String()
+	if a.TaskRef == "" {
+		a.TaskRef = inferTaskRef(a.Body, a.Reviewer)
+	}
 	return a
 }
 
@@ -174,7 +183,7 @@ func (a Artifact) Validate(coordinators map[string]struct{}, commitExists func(s
 	// unwritten contract would make every reviewer's first artifact a guess.
 	if len(a.UnknownHeaders) > 0 {
 		return fmt.Errorf("unrecognised front-matter key(s): %s; accepted keys are "+
-			"sha, branch, reviewer, authority, asserting-authority, reviewer-family, builder-family, verdict, reviewed-head, retry-of "+
+			"sha, branch, task, task-id, card, ticket, reviewer, authority, asserting-authority, reviewer-family, builder-family, verdict, reviewed-head, retry-of "+
 			"(see .herd/prompts/review-verdict.template.md); a misspelled gate key silently "+
 			"disables its gate, so this is refused rather than ignored",
 			strings.Join(a.UnknownHeaders, ", "))
@@ -281,4 +290,44 @@ func shortSHA(s string) string {
 		return s[:12]
 	}
 	return s
+}
+
+// taskRefRe matches a board card reference such as CHA-2345.
+var taskRefRe = regexp.MustCompile(`(?i)\b([a-z]{2,6})-([0-9]{1,6})\b`)
+
+// bodyTaskRefRe matches only an explicit, self-declared card line in the body,
+// e.g. "Task ID: CHA-2345". A bare ref anywhere in the prose is NOT accepted:
+// reviews routinely cite sibling cards, and attributing a verdict to a merely
+// mentioned card silently credits the wrong work.
+var bodyTaskRefRe = regexp.MustCompile(`(?im)^\s*(?:task|task[ -]?id|card|ticket)\s*:\s*([a-z]{2,6}-[0-9]{1,6})\b`)
+
+// reviewerSlugRe matches the card baked into a reviewer name, e.g.
+// "review-cha-2345-claude". The reviewer name is minted from the card under
+// review, so it is authoritative in a way that body prose is not.
+var reviewerSlugRe = regexp.MustCompile(`(?i)review[-_]([a-z]{2,6}[-_][0-9]{1,6})`)
+
+// NormalizeTaskRef canonicalises a card reference to upper-case PREFIX-NUMBER.
+// It returns "" for anything that is not shaped like a card ref, so a malformed
+// value is recorded as absent rather than as a plausible-looking wrong card.
+func NormalizeTaskRef(v string) string {
+	m := taskRefRe.FindStringSubmatch(strings.TrimSpace(v))
+	if m == nil {
+		return ""
+	}
+	return strings.ToUpper(m[1]) + "-" + m[2]
+}
+
+// inferTaskRef recovers the card from an artifact that did not declare a
+// `task:` header, using only authoritative sources: an explicit body
+// declaration, then the reviewer name slug. Returns "" when neither is
+// present — an unattributed verdict is strictly better than a misattributed
+// one.
+func inferTaskRef(body, reviewer string) string {
+	if m := bodyTaskRefRe.FindStringSubmatch(body); m != nil {
+		return NormalizeTaskRef(m[1])
+	}
+	if m := reviewerSlugRe.FindStringSubmatch(reviewer); m != nil {
+		return NormalizeTaskRef(strings.ReplaceAll(m[1], "_", "-"))
+	}
+	return ""
 }

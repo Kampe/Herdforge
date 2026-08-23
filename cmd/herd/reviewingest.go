@@ -145,6 +145,11 @@ func runReviewIngest() {
 			SHA: a.SHA, Reviewer: a.Reviewer, Verdict: reviewledger.Verdict(a.Verdict),
 			Artifact: artifactName, ReviewerFamily: a.ReviewerFamily,
 			BuilderFamily: a.BuilderFamily, Branch: a.Branch,
+			// FAC-578: without the card ref a verdict row carries only
+			// sha+verdict, so no verdict can be tied back to a card and a
+			// corrupted board cannot be rebuilt from review history. Empty when
+			// the artifact declares no card — unattributed beats misattributed.
+			Task:         a.TaskRef,
 			CandidateSHA: a.SHA, RetryOf: a.RetryOf,
 		}
 		opts := reviewledger.IngestOpts{Record: recordOpts, Verdict: verdictOpts}
