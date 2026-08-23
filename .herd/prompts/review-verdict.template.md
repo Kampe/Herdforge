@@ -2,6 +2,7 @@ sha: <the 40-hex commit id this verdict is ABOUT>
 
 Routing and persistence are defined in `.herd/prompts/routing.md`; deliver only to the standing review supervisor.
 branch: <the branch the candidate lives on>
+task: <the board card this review is ABOUT, e.g. CHA-2345 — omit only if there is genuinely no card>
 reviewer: <your lane name — never a coordinator>
 reviewer-family: <your model family: anthropic|openai|google|xai|moonshot|...>
 builder-family: <the AUTHOR's family — must differ from yours>
@@ -10,6 +11,12 @@ reviewed-head: <output of `git rev-parse HEAD` in the tree you actually read>
 retry-of: <optional prior reviewer lane for an exact-head retry>
 ---
 Your evidence goes here, below the `---`.
+
+Declare the card in the `task:` header. Without it the ledger row records only
+sha+verdict, so the verdict cannot be tied back to a card and a corrupted board
+cannot be rebuilt from review history. A bare card ref mentioned in this body is
+NOT attribution — reviews routinely cite sibling cards, and harvesting a
+mention credits the wrong work.
 
 Read `.herd/prompts/routing.md`; deliver only to its current supervisor target.
 
