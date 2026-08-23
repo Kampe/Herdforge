@@ -222,6 +222,16 @@ func DecodeJSONBytes(statusCode int, body []byte, v interface{}) error {
 		return nil
 	}
 	if err := json.Unmarshal(body, v); err != nil {
+		// One raw control byte in a free-text field (a card description written
+		// by any agent) is enough for encoding/json to reject the entire page.
+		// Repair only unescaped C0 bytes inside string literals and retry ONCE;
+		// if it still does not parse the payload is genuinely malformed and the
+		// original error is reported, not the repaired one.
+		if repaired, changed := escapeRawControlsInStrings(body); changed {
+			if err2 := json.Unmarshal(repaired, v); err2 == nil {
+				return nil
+			}
+		}
 		return fmt.Errorf("decode JSON: %w", err)
 	}
 	return nil
