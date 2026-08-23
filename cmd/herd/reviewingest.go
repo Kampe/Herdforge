@@ -194,7 +194,7 @@ func runReviewIngest() {
 		}
 		if decision == reviewIngestSkipDuplicate {
 			o := base
-			o.Disposition, o.Enqueued = "duplicate", boolPtr(false)
+			o.Disposition, o.Enqueued = dispositionDuplicate, boolPtr(false)
 			emit.record(o, fmt.Sprintf("DUPLICATE %s verdict=%s reviewer=%s sha=%s enqueued=false\n",
 				filepath.Base(f), a.Verdict, a.Reviewer, a.SHA[:12]), false)
 			admitted++
@@ -248,14 +248,14 @@ func runReviewIngest() {
 			refused++
 			continue
 		}
-		if !enqueued && a.Verdict == "PASS" {
+		if ingestDisposition(enqueued, a.Verdict) == dispositionDuplicate {
 			o := base
-			o.Disposition, o.Enqueued = "duplicate", boolPtr(false)
+			o.Disposition, o.Enqueued = dispositionDuplicate, boolPtr(false)
 			emit.record(o, fmt.Sprintf("DUPLICATE %s verdict=%s reviewer=%s sha=%s enqueued=false\n",
 				filepath.Base(f), a.Verdict, a.Reviewer, a.SHA[:12]), false)
 		} else {
 			o := base
-			o.Disposition, o.Enqueued = "admitted", boolPtr(enqueued)
+			o.Disposition, o.Enqueued = dispositionAdmitted, boolPtr(enqueued)
 			emit.record(o, fmt.Sprintf("ADMITTED %s verdict=%s reviewer=%s sha=%s enqueued=%v\n",
 				filepath.Base(f), a.Verdict, a.Reviewer, a.SHA[:12], enqueued), false)
 		}
@@ -357,7 +357,28 @@ type reviewIngestDecision string
 const (
 	reviewIngestAdmit         reviewIngestDecision = "admit"
 	reviewIngestSkipDuplicate reviewIngestDecision = "skip-duplicate"
+
+	dispositionDuplicate = "duplicate"
+	dispositionAdmitted  = "admitted"
 )
+
+// ingestDisposition reports how an artifact whose ledger write returned
+// enqueued should be dispositioned. enqueued == false means the verdict row
+// already existed, which is a duplicate regardless of verdict polarity.
+//
+// FAC-581: this used to read `!enqueued && verdict == "PASS"`, so a re-ingested
+// FAIL was reported as freshly ADMITTED. A bulk replay of the historical inbox
+// therefore re-applied days-old FAIL transitions and reverted current cards to
+// to-do. Duplicate suppression must not depend on which way the verdict went.
+// verdict is accepted so that every disposition rule lives here, where the
+// polarity-independence test can hold it, rather than back at the call site.
+func ingestDisposition(enqueued bool, verdict string) string {
+	_ = verdict
+	if !enqueued {
+		return dispositionDuplicate
+	}
+	return dispositionAdmitted
+}
 
 // reviewIngestAdmissionDecision is the read-only gate shared by dry-run and
 // real ingestion. Keeping duplicate and destination checks here ensures both
