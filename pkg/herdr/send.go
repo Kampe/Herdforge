@@ -416,11 +416,24 @@ func sendInWorkspace(target, text string, verify bool, timeout time.Duration, wo
 			// visibly the agent consumed it. Counting occurrences keeps the
 			// anti-staleness guarantee — old text alone still cannot prove a
 			// new delivery — while allowing a repeat to be proven.
-			if (st == "working" || st == "done") && paneErr == nil {
-				if observationCount(text, pane) > observationCount(text, baselinePane) {
-					// Strongest proof: the harness echoed the submitted text.
-					return st, nil
+			//
+			// FAC-589: an echo above baseline is proof ON ITS OWN, so it is
+			// checked BEFORE any status gate. Requiring the status and the echo
+			// to coincide in the SAME poll iteration threw away proof already in
+			// hand: a codex pane cycles idle -> done -> working -> idle within
+			// seconds, so a poll that happened to land on "idle" discarded an
+			// echo visible at that very moment and reported
+			// queued-but-not-consumed for a reviewer that was demonstrably
+			// running. A pane cannot echo text it never received, and the
+			// baseline comparison still prevents old text from proving a new
+			// delivery, so the status check adds nothing here.
+			if paneErr == nil && observationCount(text, pane) > observationCount(text, baselinePane) {
+				if st == "" {
+					st = "working"
 				}
+				return st, nil
+			}
+			if (st == "working" || st == "done") && paneErr == nil {
 				// FAC-579: some harnesses NEVER echo the prompt, so requiring
 				// the echo makes their deliveries structurally unprovable.
 				//
