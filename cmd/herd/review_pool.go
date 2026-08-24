@@ -135,7 +135,7 @@ func runPoolReview(ref string) error {
 	if err := os.MkdirAll(*packetRoot, 0o755); err != nil {
 		return fmt.Errorf("create review packet root: %w", err)
 	}
-	packetBody := fmt.Sprintf("REVIEW %s — verdict only, edit nothing.\n\nCandidate: %s\nSurface: %s\nRead docs/prompts/review-contract.md, inspect only this candidate, and report the required verdict artifact to the review supervisor.\n", ref, sha, surface)
+	packetBody := reviewPacketBody(ref, sha, surface)
 	if err := os.WriteFile(packet, []byte(packetBody), 0o600); err != nil {
 		return fmt.Errorf("write review packet: %w", err)
 	}
@@ -494,4 +494,47 @@ func preflightReviewerReadiness(r poolReviewer) error {
 			r.Provider, r.Model, res.Reason)
 	}
 	return nil
+}
+
+// reviewPacketBody is the reviewer's instruction sheet.
+//
+// FAC-583: it used to say "report the required verdict artifact" without ever
+// stating the artifact's shape. review-ingest REFUSES anything whose front
+// matter is not the leading block ("front matter must be the leading block
+// ending in ---"), so a reviewer that opened with prose had its verdict thrown
+// away after doing all the work. A real Opus review of PR-3115 — which caught a
+// fabricated eth_call response causing a 1e12 money error — was refused for
+// exactly this reason and never reached the ledger.
+//
+// The contract is therefore inlined WITH the known values prefilled, so the
+// reviewer's output is ingestible by construction rather than by luck. sha and
+// task are filled here because we know them; the reviewer supplies only what
+// only it can know.
+func reviewPacketBody(ref, sha, surface string) string {
+	return fmt.Sprintf(`REVIEW %s — verdict only, edit nothing.
+
+Candidate: %s
+Surface: %s
+
+Read docs/prompts/review-contract.md, inspect only this candidate, and report
+the verdict artifact to the review supervisor.
+
+The artifact MUST begin with this front-matter block, as the very first bytes of
+the file. Any prose above it makes review-ingest refuse the whole verdict and
+your review is discarded. Do not wrap it in a code fence.
+
+sha: %s
+branch: <the branch this candidate lives on>
+task: %s
+reviewer: <your lane name — never a coordinator>
+reviewer-family: <your model family: anthropic|openai|google|xai|...>
+builder-family: <the AUTHOR's family — must differ from yours>
+verdict: PASS|FAIL|BLOCKED
+reviewed-head: <output of git rev-parse HEAD in the tree you actually read>
+---
+
+Your evidence goes below the --- line. Keep the task: header accurate: it is
+what ties this verdict to a board card, and a verdict that names no card cannot
+be joined back to one.
+`, ref, sha, surface, sha, ref)
 }
