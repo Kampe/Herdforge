@@ -12,7 +12,7 @@ import (
 //
 // Both defaults are relative (".herd/review-surfaces", ".herd/review-packets"),
 // and the observed failures were:
-//   - reviewers running with cwd=/Users/kampe, reading a tree with nothing to do
+//   - reviewers running with cwd=$HOME, reading a tree with nothing to do
 //     with the candidate while still writing a verdict
 //   - a reviewer told to read ".herd/review-packets/review-cha-2202-….md",
 //     resolving it to ~/.herd/review-packets/…, finding nothing, and correctly
