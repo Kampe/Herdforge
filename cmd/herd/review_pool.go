@@ -230,7 +230,7 @@ func runPoolReview(ref string) error {
 	// $HOME. A reviewer sitting in $HOME reads a tree that has nothing to do
 	// with the candidate and still writes a verdict — the worst possible
 	// outcome, because the artifact looks legitimate. Observed live: two lanes
-	// with cwd=/Users/kampe while their surface symlinks were perfectly correct.
+	// with cwd=$HOME while their surface symlinks were perfectly correct.
 	//
 	// Verified absolute rather than assumed: a cwd that cannot be resolved must
 	// fail the launch, never fall back to somewhere plausible.

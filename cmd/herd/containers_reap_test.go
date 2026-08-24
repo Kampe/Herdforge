@@ -30,21 +30,21 @@ func TestReapReasonRequiresPositiveEvidence(t *testing.T) {
 		{
 			name: "compose stack rooted in a pool slot is per-run",
 			c: dockerContainer{State: "Up 5 hours", Labels: map[string]string{
-				"com.docker.compose.project.working_dir": "/Users/k/Personal/chainseer/.herd/pool/pool-03",
+				"com.docker.compose.project.working_dir": "/repo/Personal/chainseer/.herd/pool/pool-03",
 			}},
 			wantRe: true,
 		},
 		{
 			name: "compose stack rooted in a worktree is per-run",
 			c: dockerContainer{State: "Up 5 hours", Labels: map[string]string{
-				"com.docker.compose.project.working_dir": "/Users/k/Personal/chainseer/.herd/worktrees/cha-2255",
+				"com.docker.compose.project.working_dir": "/repo/Personal/chainseer/.herd/worktrees/cha-2255",
 			}},
 			wantRe: true,
 		},
 		{
 			name: "unrecognised long-lived container is KEPT",
 			c: dockerContainer{State: "Up 6 days", Labels: map[string]string{
-				"com.docker.compose.project.working_dir": "/Users/k/Personal/some-other-app",
+				"com.docker.compose.project.working_dir": "/repo/Personal/some-other-app",
 			}},
 			wantRe: false,
 		},
@@ -68,15 +68,15 @@ func TestReapReasonRequiresPositiveEvidence(t *testing.T) {
 // independently of the protected-project allowlist. Two guards are better than
 // one when the failure mode is a fleet-wide outage.
 func TestEphemeralWorkDirDoesNotMatchTheRepoRoot(t *testing.T) {
-	if ephemeralWorkDir("/Users/kampe/Personal/chainseer") {
+	if ephemeralWorkDir("/repo/Personal/chainseer") {
 		t.Error("the repo root is where the shared dev stack lives; it is not ephemeral")
 	}
 	for _, dir := range []string{
-		"/Users/kampe/Personal/chainseer/.herd/pool/pool-01",
-		"/Users/kampe/Personal/chainseer/.herd/worktrees/cha-1",
+		"/repo/Personal/chainseer/.herd/pool/pool-01",
+		"/repo/Personal/chainseer/.herd/worktrees/cha-1",
 		"/tmp/ci-local-run",
 		"/private/tmp/whatever",
-		"/Users/kampe/Personal/Herdforge/.worktrees/orchestrator",
+		"/repo/Personal/Herdforge/.worktrees/orchestrator",
 	} {
 		if !ephemeralWorkDir(dir) {
 			t.Errorf("%q is a per-run location and must be reapable", dir)
