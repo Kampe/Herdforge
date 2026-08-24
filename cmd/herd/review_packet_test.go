@@ -18,7 +18,8 @@ import (
 // reviewer that follows it is ingestible by construction.
 func TestReviewPacketCarriesIngestibleFrontMatterContract(t *testing.T) {
 	body := reviewPacketBody("PR-3115", "8867353f0ba9fe569feeb28989c10d0fefdc6ca1",
-		".herd/review-surfaces/review-pr-3115", "/repo/.herd/review/inbox/8867353f0ba9-review-pr-3115.md")
+		".herd/review-surfaces/review-pr-3115", "/repo/.herd/review/inbox/8867353f0ba9-review-pr-3115.md",
+		"review-supervisor")
 
 	for _, key := range []string{
 		"sha:", "branch:", "task:", "reviewer:", "reviewer-family:",
@@ -47,7 +48,7 @@ func TestReviewPacketCarriesIngestibleFrontMatterContract(t *testing.T) {
 // The contract the packet advertises must be the contract the parser accepts.
 // If these two drift, reviewers follow instructions and still get refused.
 func TestPacketContractMatchesParserAcceptedKeys(t *testing.T) {
-	body := reviewPacketBody("CHA-1", strings.Repeat("a", 40), "surface", "/repo/.herd/review/inbox/a-review-cha-1.md")
+	body := reviewPacketBody("CHA-1", strings.Repeat("a", 40), "surface", "/repo/.herd/review/inbox/a-review-cha-1.md", "review-supervisor")
 
 	// Build a minimal artifact the way a compliant reviewer would, using the
 	// packet's own block, and confirm the parser extracts what we expect.
@@ -87,7 +88,7 @@ func TestPacketContractMatchesParserAcceptedKeys(t *testing.T) {
 func TestReviewPacketNamesAnAbsoluteVerdictDestination(t *testing.T) {
 	dest := "/repo/.herd/review/inbox/8867353f0ba9-review-cha-2255-8867353f0ba9.md"
 	body := reviewPacketBody("CHA-2255", "8867353f0ba9fe569feeb28989c10d0fefdc6ca1",
-		"/repo/.herd/review-surfaces/review-cha-2255", dest)
+		"/repo/.herd/review-surfaces/review-cha-2255", dest, "review-supervisor")
 
 	if !strings.Contains(body, dest) {
 		t.Errorf("packet must state the exact destination path, got:\n%s", body)
@@ -104,5 +105,25 @@ func TestReviewPacketNamesAnAbsoluteVerdictDestination(t *testing.T) {
 	// than as boilerplate it can improve on.
 	if !strings.Contains(strings.ToLower(body), "never read") {
 		t.Error("packet should state the consequence: a verdict written elsewhere is never read")
+	}
+}
+
+// FAC-603: a reviewer that finishes must be told who to tell. Without a named
+// owner, completion is discoverable only by polling every pane, which is how 89
+// finished reviews ended up sitting unowned in one inbox.
+func TestReviewPacketNamesTheSupervisorToReportTo(t *testing.T) {
+	body := reviewPacketBody("PR-3115", "8867353f0ba9fe569feeb28989c10d0fefdc6ca1",
+		".herd/review-surfaces/review-pr-3115", "/repo/.herd/review/inbox/v.md",
+		"review-harvest-supervisor")
+
+	if !strings.Contains(body, "review-harvest-supervisor") {
+		t.Error("packet must name the supervisor the reviewer reports to")
+	}
+	// A negative verdict is a result the supervisor needs in order to release the
+	// slot; silence on FAIL is the one outcome that helps nobody.
+	for _, want := range []string{"FAIL", "BLOCKED"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("packet must require reporting home on %s too", want)
+		}
 	}
 }
