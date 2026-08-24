@@ -123,7 +123,27 @@ func runPoolReview(ref string) error {
 	} else if !os.IsNotExist(statErr) {
 		return fmt.Errorf("inspect review surface: %w", statErr)
 	}
-	relTarget, err := filepath.Rel(filepath.Dir(surface), lease.Path)
+	// FAC-588: filepath.Rel refuses to mix an absolute base with a relative
+	// target, and the two sides come from different places — the lease path is
+	// always absolute (built from the repo root) while --surface-root defaults to
+	// the relative ".herd/review-surfaces". So every `herd review --pool` that did
+	// not pass an absolute --surface-root died here with
+	//
+	//	Rel: can't make /abs/.herd/pool/pool-02 relative to .herd/review-surfaces
+	//
+	// after leasing a slot but before launching anything. To a caller that lost
+	// stderr it looked like the command silently did nothing, which is what made
+	// the reviewer pool appear permanently unfillable. Absolutise both sides so
+	// the default flag values work.
+	surfaceDirAbs, err := filepath.Abs(filepath.Dir(surface))
+	if err != nil {
+		return fmt.Errorf("resolve review surface dir: %w", err)
+	}
+	leasePathAbs, err := filepath.Abs(lease.Path)
+	if err != nil {
+		return fmt.Errorf("resolve pool lease path: %w", err)
+	}
+	relTarget, err := filepath.Rel(surfaceDirAbs, leasePathAbs)
 	if err != nil {
 		return fmt.Errorf("make repo-relative review surface target: %w", err)
 	}
