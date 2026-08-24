@@ -137,6 +137,7 @@ var subcommandUsage = map[string]string{
 	"board-done": "Usage: herd board-done <ref> [--receipt <path>] [--acceptance-output <path>] [--override-policy <p> --override-actor <who> --override-reason <why> --override-evidence <what>]\n" +
 		"  Close a card from its task-bound completion receipt, or by an attributable manual override.",
 	"board-audit": "Usage: herd board-audit [--json]\n  Report Done cards no completion receipt closed. Read-only; never mutates the board.",
+	"hooks-pin":   "Usage: herd hooks-pin [--provider claude] [--file PATH] [--dry-run]\n  Refresh the pinned hook policy set against the harness's LIVE hooks.\n  Drops policies whose handler no longer exists (those ground every launch\n  with hook.policy_mismatch) and adds newly discovered hooks as optional.\n  Preserves existing classifications; verifies the result binds before writing.",
 	"board-sync":  "Usage: herd board-sync [flags]\n  Reconcile board status against git reality and live lanes (report only).\n  --fix: advance to-do cards to in-progress when a live lane or branch proves work is in flight.",
 	"sh":          "Usage: herd sh\n  Interactive REPL shell (alias: herd repl).",
 	"repl":        "Usage: herd repl\n  Interactive REPL shell (alias: herd sh).",
@@ -241,10 +242,10 @@ Commands:
 	"overlap": "Usage: herd overlap [flags]\n  Overlap / collision analysis.",
 	"rescue": "Usage: herd rescue [<pane-id>] [--empty-siblings] [--workspace ID] [--label NAME] [--apply] [--json]\n" +
 		"  Diagnose cramped/split agent panes. Dry-run by default; --apply repairs one proven target.",
-	"attention":    "Usage: herd attention [flags]\n  Coordinator-eyes triage for the standing fleet.",
-	"transcript":   "Usage: herd transcript <agent-name> [--handoff] [--lines N] [--json]\n  Read-only: a lane's recent output and its final reported handoff.\n  Covers finished lanes, so raw herdr is not needed to read what a lane reported.\n  Never submits text, presses keys, or touches tab lifecycle.",
-	"candidate":    "Usage: herd candidate <ref>... [--json]\n  Read-only: exact candidate SHA, the branches that ACTUALLY contain it,\n  worktree, families, verdict, landing, and one disposition.\n  Branch comes from git, never from the review artifact: an artifact was\n  observed naming a branch that did not contain its own valid SHA.",
-	"handoffs":     "Usage: herd handoffs <list|done> [--recipient <agent>] [--json]\n  Pending durable review handoffs. Resolves YOUR agent name from your pane;\n  --recipient is only for inspecting another lane. Never pass a role id: it\n  names an inbox that does not exist and returns an empty list. Each is independent work; a newer handoff\n  NEVER supersedes an older one. Mark one done only after it reaches a\n  disposition — an unread entry always means unfinished work.",
+	"attention":  "Usage: herd attention [flags]\n  Coordinator-eyes triage for the standing fleet.",
+	"transcript": "Usage: herd transcript <agent-name> [--handoff] [--lines N] [--json]\n  Read-only: a lane's recent output and its final reported handoff.\n  Covers finished lanes, so raw herdr is not needed to read what a lane reported.\n  Never submits text, presses keys, or touches tab lifecycle.",
+	"candidate":  "Usage: herd candidate <ref>... [--json]\n  Read-only: exact candidate SHA, the branches that ACTUALLY contain it,\n  worktree, families, verdict, landing, and one disposition.\n  Branch comes from git, never from the review artifact: an artifact was\n  observed naming a branch that did not contain its own valid SHA.",
+	"handoffs":   "Usage: herd handoffs <list|done> [--recipient <agent>] [--json]\n  Pending durable review handoffs. Resolves YOUR agent name from your pane;\n  --recipient is only for inspecting another lane. Never pass a role id: it\n  names an inbox that does not exist and returns an empty list. Each is independent work; a newer handoff\n  NEVER supersedes an older one. Mark one done only after it reaches a\n  disposition — an unread entry always means unfinished work.",
 	"pool": "Usage: herd pool [--size N] [--root DIR] <ensure|lease|release|gc|list>\n" +
 		"  Warm review-surface pool. release frees a held lease; list shows current holders.\n" +
 		"  A lease taken for a review must be released when that review settles, or the\n" +

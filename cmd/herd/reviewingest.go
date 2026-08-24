@@ -768,9 +768,9 @@ func verifyHarvestSelection(repoRoot, base, candidate string, selected []string)
 // harvestCandidateReport is the provenance-first decision made before any
 // cherry-pick. Tip is observational; LastPassSHA comes from the durable queue.
 type harvestCandidateReport struct {
-	Pin              harvestmerge.CandidatePin
-	Tip              string
-	LastPassSHA      string
+	Pin         harvestmerge.CandidatePin
+	Tip         string
+	LastPassSHA string
 	// OffBranchQueued are queued candidates that belong to other branches.
 	// Reported so a suppressed candidate is visible rather than silently
 	// filtered: an operator who expected one of these needs to see why it was

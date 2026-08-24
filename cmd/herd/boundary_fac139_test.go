@@ -41,10 +41,10 @@ func TestSixLaunchPaths_BoundaryFailClosedAndArgvFromDecision(t *testing.T) {
 		t.Run(path+"/missing-probe", func(t *testing.T) {
 			opened := 0
 			_, _, _, err := launch.Open(tabCountOpener{n: &opened}, launch.BoundarySpec{
-				Decision: d,
-				Request:  launch.Request{Decision: d, TaskRef: "worker", Scope: router.ScopeLane},
-				Probe:    nil,
-				Lane:     &config.LaneDef{Name: path, Role: "worker", Authority: config.AuthorityWrite},
+				Decision:  d,
+				Request:   launch.Request{Decision: d, TaskRef: "worker", Scope: router.ScopeLane},
+				Probe:     nil,
+				Lane:      &config.LaneDef{Name: path, Role: "worker", Authority: config.AuthorityWrite},
 				Workspace: "w1", Label: "forge-" + path, Cwd: t.TempDir(), NoFocus: true,
 				Now: func() time.Time { return now },
 			})
@@ -56,10 +56,10 @@ func TestSixLaunchPaths_BoundaryFailClosedAndArgvFromDecision(t *testing.T) {
 			opened := 0
 			var gotEnv []string
 			plan, tabID, paneID, err := launch.Open(tabCountOpener{n: &opened, envOut: &gotEnv}, launch.BoundarySpec{
-				Decision: d,
-				Request:  launch.Request{Decision: d, TaskRef: "worker", Scope: router.ScopeLane},
-				Probe:    &pass,
-				Lane:     &config.LaneDef{Name: path, Role: "worker", Authority: config.AuthorityWrite},
+				Decision:  d,
+				Request:   launch.Request{Decision: d, TaskRef: "worker", Scope: router.ScopeLane},
+				Probe:     &pass,
+				Lane:      &config.LaneDef{Name: path, Role: "worker", Authority: config.AuthorityWrite},
 				Workspace: "w1", Label: "forge-" + path, Cwd: t.TempDir(),
 				Env: []string{"HERD_PATH=" + path}, NoFocus: true,
 				Now: func() time.Time { return now },

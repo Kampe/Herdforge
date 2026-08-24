@@ -1,10 +1,10 @@
 package main
 
 import (
-	"path/filepath"
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/Kampe/Herdforge/pkg/mail"
@@ -103,10 +103,10 @@ func runHandoffsList(args []string) {
 		// The mailbox path is part of the answer, not decoration: two callers
 		// disagreeing about "pending" is usually two different files.
 		payload := map[string]any{
-			"recipient": recipient,
-			"mailbox":   mailPath,
+			"recipient":     recipient,
+			"mailbox":       mailPath,
 			"handled_state": mail.HandledStatePath(mailPath),
-			"pending":   pending,
+			"pending":       pending,
 		}
 		if err := enc.Encode(payload); err != nil {
 			fmt.Fprintf(os.Stderr, "herd handoffs list: encode: %v\n", err)

@@ -185,6 +185,12 @@ func main() {
 	case "posture":
 		runFamilyPosture()
 
+	case "hooks-pin":
+		if err := runHooksPin(os.Args[2:]); err != nil {
+			fmt.Fprintf(os.Stderr, "herd hooks-pin: %v\n", err)
+			os.Exit(1)
+		}
+
 	case "claude-only":
 		// Legacy alias: prefer `herd posture claude-only|no-claude|clear|status`.
 		runPosture(posture.ClaudeOnly)

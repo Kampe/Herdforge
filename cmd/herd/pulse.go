@@ -1,13 +1,13 @@
 package main
 
 import (
-	"github.com/Kampe/Herdforge/pkg/harvest"
 	"context"
 	cryptorand "crypto/rand"
 	"encoding/hex"
 	"errors"
 	"flag"
 	"fmt"
+	"github.com/Kampe/Herdforge/pkg/harvest"
 	"io"
 	"os"
 	"os/exec"
@@ -341,12 +341,12 @@ func readPulseHerdr(ctx context.Context, doneRefs map[string]bool) pulse.HerdrOb
 			// FAC-418: carry the harness kind. Idle detection is not equally
 			// trustworthy across harnesses, and the reap decision needs to know
 			// which one it is looking at.
-			Kind:              a.Kind,
-			TabID:             a.TabID,
-			Workspace:         a.Workspace,
-			Worktree:          a.Cwd,
-			TabGeneration:     a.TabGeneration,
-			TabRevision:       a.Revision,
+			Kind:          a.Kind,
+			TabID:         a.TabID,
+			Workspace:     a.Workspace,
+			Worktree:      a.Cwd,
+			TabGeneration: a.TabGeneration,
+			TabRevision:   a.Revision,
 		}
 		if warning := herdr.DetectContextWarning(paneBody); warning != "" {
 			agent.ContextWarning = warning
