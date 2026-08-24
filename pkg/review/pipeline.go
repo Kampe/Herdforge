@@ -423,6 +423,18 @@ func (d *Drain) Scan(ctx context.Context, unmerged []harvest.UnmergedWork) (*Dra
 	} else {
 		r.KaneoError = "provider unavailable"
 	}
+	// Pressure above was computed before the board was consulted, and the
+	// OVER_CAP recheck lives only on the success path. An unreachable board
+	// therefore left KaneoInReview at its -1 unknown sentinel while pressure
+	// still read "ok" -- a review cap that fails OPEN, reporting free headroom
+	// derived from no data at all. Unknown board state is not an absence of
+	// pressure.
+	// Only the unearned "ok" is replaced. PIN_PRESSURE and OVER_CAP are derived
+	// from local git state, so they stay: an unknown board must never downgrade
+	// a posture that is already known-bad.
+	if !r.KaneoOK && r.Pressure == "ok" {
+		r.Pressure = "UNKNOWN"
+	}
 	return r, nil
 }
 
