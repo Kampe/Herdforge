@@ -73,7 +73,7 @@ func TestEveryPoolParsingPassUsesOneSchema(t *testing.T) {
 	// the full pool option set" and makes a legitimately added flag look like a
 	// broken invariant, while saying nothing about which option is missing.
 	want := map[string]bool{
-		"allow-unproven-builder": true, "exclude-family": true, "model": true,
+		"allow-unproven-builder": true, "builder-family": true, "exclude-family": true, "model": true,
 		"no-launch": true, "packet-root": true, "pool": true, "pool-root": true,
 		"provider": true, "sha": true, "surface-root": true,
 	}
