@@ -91,6 +91,13 @@ func runPoolReview(ref string) error {
 	}
 
 	p := worktree.NewPool(root, *poolRoot, 2)
+	// FAC-591: teach the pool which lease holders are still alive so it can
+	// reclaim the rest itself. Every launch that died after leasing used to
+	// leave an ownerless lease no command could free, and the pool wedged at
+	// "no available clean slots" while reporting itself saturated with zero live
+	// reviewers. Self-healing here means no operator or coordinator has to
+	// notice and unstick it.
+	p.HolderLive = reviewHolderLive
 	if err := p.Ensure(context.Background()); err != nil {
 		return err
 	}
@@ -557,4 +564,41 @@ Your evidence goes below the --- line. Keep the task: header accurate: it is
 what ties this verdict to a board card, and a verdict that names no card cannot
 be joined back to one.
 `, ref, sha, surface, sha, ref)
+}
+
+// settledAgentStatuses are the states in which a reviewer is no longer doing
+// work and its pool lease must not keep a slot out of circulation.
+//
+// "done" and "idle" both count. A reviewer that finished is done; a reviewer
+// that was launched and never consumed its packet sits idle forever. Treating
+// idle as live is what let a launch failure hold a slot indefinitely.
+var settledAgentStatuses = map[string]bool{
+	"done": true, "idle": true, "": true,
+}
+
+// reviewHolderLive reports whether a pool lease's holder is still working.
+//
+// It answers false for an ABSENT agent as well as a settled one: the common
+// failure was a lease whose agent never existed because the launch died between
+// leasing and starting, and an agent that cannot be found cannot be working.
+//
+// A herdr failure returns true — refusing to reclaim. Inability to ask is not
+// evidence that a reviewer is dead, and reclaiming a live reviewer's slot would
+// reset the tree out from under it mid-review.
+func reviewHolderLive(purpose string) bool {
+	name := strings.TrimSpace(purpose)
+	if name == "" {
+		return false
+	}
+	agents, err := herdr.AgentList()
+	if err != nil {
+		return true
+	}
+	for _, a := range agents {
+		if strings.TrimSpace(a.Name) != name {
+			continue
+		}
+		return !settledAgentStatuses[strings.ToLower(strings.TrimSpace(a.Status))]
+	}
+	return false
 }
