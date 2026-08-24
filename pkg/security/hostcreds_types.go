@@ -127,6 +127,12 @@ type RequestRule struct {
 const DefaultSessionTTL = 30 * time.Minute
 
 // RequiredBrokerHostsForKind returns the exact host(s) for one kind — not a global list.
+//
+// This answers "which host would a brokered key be FOR", which is a different
+// question from "does this kind need one". Harness-authenticated kinds are
+// exempted by DiagnoseKindAuthReadiness via harnessAuthenticated, not by
+// blanking this map: the broker's own host machinery still needs a real
+// mapping, and emptying it reported every kind as unbrokerable_kind.
 func RequiredBrokerHostsForKind(kind string) []string {
 	switch strings.ToLower(strings.TrimSpace(kind)) {
 	case AuthorKindClaude:

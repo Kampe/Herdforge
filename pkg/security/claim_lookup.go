@@ -52,7 +52,7 @@ func (c ClaimManagerLookup) LookupActiveClaim(ctx context.Context, taskRef strin
 // Nothing assumes .herd/claims.db or ambient generation alone.
 // Production wires the merged FAC-147 authority via RegisterClaimAuthority.
 var (
-	claimAuthMu   sync.Mutex
+	claimAuthMu    sync.Mutex
 	claimAuthority LiveClaimLookup
 )
 

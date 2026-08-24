@@ -29,16 +29,16 @@ import (
 //     allowlisted model hosts — never placed in agent environment.
 type HostAllowBroker struct {
 	AllowHosts   []string
-	Token        string // proxy token (agent-visible)
-	ControlToken string // coordinator-only
+	Token        string            // proxy token (agent-visible)
+	ControlToken string            // coordinator-only
 	HostCreds    map[string]string // host -> Authorization header value
 
-	ln         net.Listener // proxy
-	ctrlLn     net.Listener // control (may be nil for pure inline unit tests)
-	addr       string
-	ctrlAddr   string
-	mu         sync.Mutex
-	closed     bool
+	ln            net.Listener // proxy
+	ctrlLn        net.Listener // control (may be nil for pure inline unit tests)
+	addr          string
+	ctrlAddr      string
+	mu            sync.Mutex
+	closed        bool
 	ctrlIdentity  string
 	ctrlTabID     string
 	ctrlSession   string

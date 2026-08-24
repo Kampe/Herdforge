@@ -218,8 +218,8 @@ type LaunchPolicy struct {
 
 	// PackageAllowlist, when non-empty and ExclusivePackages, restricts
 	// AuthorizePath to those package prefixes under FilesystemRoot.
-	PackageAllowlist   []string
-	ExclusivePackages  bool
+	PackageAllowlist  []string
+	ExclusivePackages bool
 
 	// Events records denials and injection indicators.
 	Events EventSink
@@ -227,20 +227,20 @@ type LaunchPolicy struct {
 
 // Sentinel errors (fail-closed, exit-propagating at CLI).
 var (
-	ErrUnknownPolicy       = errors.New("security: unknown or incomplete launch policy (fail-closed)")
-	ErrUnknownProvenance   = errors.New("security: unknown content provenance (fail-closed)")
-	ErrProviderAuthority   = errors.New("security: provider text cannot alter control authority")
-	ErrSharedRoot          = errors.New("security: shared checkout / sibling path denied")
-	ErrRepoNotAllowlisted  = errors.New("security: repository not in allowlist")
-	ErrPathDenied          = errors.New("security: filesystem path denied")
-	ErrToolDenied          = errors.New("security: tool not allowlisted")
-	ErrNetworkDenied       = errors.New("security: network access denied")
-	ErrSecretPresent       = errors.New("security: forbidden secret in agent environment")
-	ErrExternalLinkDenied  = errors.New("security: external link denied by policy")
-	ErrIntegrationCreds    = errors.New("security: integration credentials denied for role")
+	ErrUnknownPolicy        = errors.New("security: unknown or incomplete launch policy (fail-closed)")
+	ErrUnknownProvenance    = errors.New("security: unknown content provenance (fail-closed)")
+	ErrProviderAuthority    = errors.New("security: provider text cannot alter control authority")
+	ErrSharedRoot           = errors.New("security: shared checkout / sibling path denied")
+	ErrRepoNotAllowlisted   = errors.New("security: repository not in allowlist")
+	ErrPathDenied           = errors.New("security: filesystem path denied")
+	ErrToolDenied           = errors.New("security: tool not allowlisted")
+	ErrNetworkDenied        = errors.New("security: network access denied")
+	ErrSecretPresent        = errors.New("security: forbidden secret in agent environment")
+	ErrExternalLinkDenied   = errors.New("security: external link denied by policy")
+	ErrIntegrationCreds     = errors.New("security: integration credentials denied for role")
 	ErrMissingControlSecret = errors.New("security: HERD_CONTROL_SECRET required (fail-closed)")
-	ErrReviewerWrite       = errors.New("security: reviewer is read-only")
-	ErrBuilderIntegration  = errors.New("security: builder cannot access integration credentials")
+	ErrReviewerWrite        = errors.New("security: reviewer is read-only")
+	ErrBuilderIntegration   = errors.New("security: builder cannot access integration credentials")
 )
 
 // DefaultSecretDeny is the env deny-list for builder/reviewer launches.

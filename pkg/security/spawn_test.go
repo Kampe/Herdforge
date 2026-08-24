@@ -1,13 +1,13 @@
 package security
 
 import (
-	"time"
 	"errors"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 )
 
 // recordingSpawner captures process-boundary CreateTab env for mutation probes.

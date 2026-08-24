@@ -1,11 +1,11 @@
 package security
 
 import (
-	"time"
 	"os"
 	"path/filepath"
 	"runtime"
 	"testing"
+	"time"
 )
 
 type stickyResolver struct {
@@ -38,15 +38,15 @@ func TestCLILaunch_WorkerAndReviewerPaths(t *testing.T) {
 			}
 			logPath := filepath.Join(t.TempDir(), "events.jsonl")
 			res, err := (CLILaunch{
-				Spawner:        sp,
-				ControlSecret:  "secret",
-				RepoIdentity:   "herdforge",
-				RepoAllowlist:  []string{"herdforge"},
-				SharedCheckout: shared,
-				Worktree:       wt,
-				Role:           role,
-				EventLogPath:   logPath,
-				TaskRef:        "FAC-133",
+				Spawner:         sp,
+				ControlSecret:   "secret",
+				RepoIdentity:    "herdforge",
+				RepoAllowlist:   []string{"herdforge"},
+				SharedCheckout:  shared,
+				Worktree:        wt,
+				Role:            role,
+				EventLogPath:    logPath,
+				TaskRef:         "FAC-133",
 				LeaseGeneration: "1", ClaimLookup: MapClaimLookup{"FAC-133": {TaskRef: "FAC-133", Generation: 1, ExpiresAt: time.Now().Add(time.Hour)}},
 				SessionResolver: &stickyResolver{sp: sp},
 			}).Run("w1", "agent-"+role, "true", "model-x")
