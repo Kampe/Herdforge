@@ -63,7 +63,7 @@ var subcommandUsage = map[string]string{
 	"broker":           "Usage: herd broker [ensure]\n  Serve or ensure the local broker runtime.",
 	"claude-only":      "Usage: herd claude-only <on|off|status>\n  Legacy alias for herd posture claude-only.",
 	"commands":         "Usage: herd commands [flags]\n  Inspect retained command sessions and run recovery sweeps.",
-	"containers":       "Usage: herd containers [status|reconcile] [flags]\n  Inspect durable container lifecycle state and unowned containers.",
+	"containers":       "Usage: herd containers [status|reconcile|reap] [flags]\n  Inspect durable container lifecycle state and unowned containers.\n  reap [--apply] [--older-than 45m] [--protect proj,...]: reclaim ABANDONED\n  containers by evidence of ephemerality (testcontainers, long-exited, or a\n  compose stack rooted in a pool slot/worktree/tmp). Dry run by default.\n  Protected projects are never candidates; unrecognised containers are kept.",
 	"control":          "Usage: herd control <issue|drain> [flags]\n  Issue or drain authenticated control envelopes.",
 	"init":             "Usage: herd init [--full]\n  Scaffold .herd/ config (optionally full 3-lane forge).",
 	"clone":            "Usage: herd clone <repo-url> [target-dir]\n  Clone a repository and run herd init --full.",
