@@ -42,7 +42,7 @@ type hooksPinProvider struct {
 func runHooksPin(argv []string) error {
 	fs := flag.NewFlagSet("hooks-pin", flag.ContinueOnError)
 	provider := fs.String("provider", "claude", "Harness provider to pin")
-	path := fs.String("file", filepath.Join(".herd", "harness-hooks.json"), "Pin file to write")
+	path := fs.String("file", filepath.Join(".herd", harnessHooksLeaf), "Pin file to write")
 	dryRun := fs.Bool("dry-run", false, "Report the delta without writing")
 	if err := fs.Parse(argv); err != nil {
 		return err
