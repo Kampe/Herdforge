@@ -1,6 +1,7 @@
 package main
 
 import (
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -17,7 +18,7 @@ import (
 // reviewer that follows it is ingestible by construction.
 func TestReviewPacketCarriesIngestibleFrontMatterContract(t *testing.T) {
 	body := reviewPacketBody("PR-3115", "8867353f0ba9fe569feeb28989c10d0fefdc6ca1",
-		".herd/review-surfaces/review-pr-3115")
+		".herd/review-surfaces/review-pr-3115", "/repo/.herd/review/inbox/8867353f0ba9-review-pr-3115.md")
 
 	for _, key := range []string{
 		"sha:", "branch:", "task:", "reviewer:", "reviewer-family:",
@@ -46,7 +47,7 @@ func TestReviewPacketCarriesIngestibleFrontMatterContract(t *testing.T) {
 // The contract the packet advertises must be the contract the parser accepts.
 // If these two drift, reviewers follow instructions and still get refused.
 func TestPacketContractMatchesParserAcceptedKeys(t *testing.T) {
-	body := reviewPacketBody("CHA-1", strings.Repeat("a", 40), "surface")
+	body := reviewPacketBody("CHA-1", strings.Repeat("a", 40), "surface", "/repo/.herd/review/inbox/a-review-cha-1.md")
 
 	// Build a minimal artifact the way a compliant reviewer would, using the
 	// packet's own block, and confirm the parser extracts what we expect.
@@ -74,5 +75,34 @@ func TestPacketContractMatchesParserAcceptedKeys(t *testing.T) {
 		if !strings.Contains(body, key) {
 			t.Errorf("packet lost key %q", key)
 		}
+	}
+}
+
+// FAC-597: the packet must NAME its destination. Both .herd/review/inbox and
+// .herd/review/outbox exist and MoveToIngestedNamed is location-agnostic, so a
+// packet that did not say where to write left reviewers inferring the location
+// from nearby files. A pool-01 reviewer for CHA-2255 wrote to outbox because
+// other files were already there, and review-ingest never saw it — a completed
+// review lost with no error anywhere.
+func TestReviewPacketNamesAnAbsoluteVerdictDestination(t *testing.T) {
+	dest := "/repo/.herd/review/inbox/8867353f0ba9-review-cha-2255-8867353f0ba9.md"
+	body := reviewPacketBody("CHA-2255", "8867353f0ba9fe569feeb28989c10d0fefdc6ca1",
+		"/repo/.herd/review-surfaces/review-cha-2255", dest)
+
+	if !strings.Contains(body, dest) {
+		t.Errorf("packet must state the exact destination path, got:\n%s", body)
+	}
+	if !filepath.IsAbs(dest) {
+		t.Fatal("fixture destination must be absolute")
+	}
+	// The instruction has to forbid inference explicitly, because the observed
+	// failure was a reviewer reasonably copying its neighbours.
+	if !strings.Contains(strings.ToLower(body), "do not infer") {
+		t.Error("packet must forbid inferring the output location")
+	}
+	// And it must say why, so the reviewer treats it as load-bearing rather
+	// than as boilerplate it can improve on.
+	if !strings.Contains(strings.ToLower(body), "never read") {
+		t.Error("packet should state the consequence: a verdict written elsewhere is never read")
 	}
 }

@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/Kampe/Herdforge/pkg/herdr"
+	"github.com/Kampe/Herdforge/pkg/reviewingest"
 	"github.com/Kampe/Herdforge/pkg/router"
 	"github.com/Kampe/Herdforge/pkg/security"
 	"github.com/Kampe/Herdforge/pkg/usage"
@@ -162,7 +163,27 @@ func runPoolReview(ref string) error {
 	if err := os.MkdirAll(*packetRoot, 0o755); err != nil {
 		return fmt.Errorf("create review packet root: %w", err)
 	}
-	packetBody := reviewPacketBody(ref, sha, surface)
+	// FAC-597: name the exact destination. Both .herd/review/inbox and
+	// .herd/review/outbox exist, MoveToIngestedNamed is location-agnostic (it
+	// creates ingested/ beside whatever it is handed), and the packet never said
+	// where to write. So reviewers inferred the location by pattern-matching
+	// nearby files: a pool-01 reviewer for CHA-2255 wrote to outbox because
+	// other files were already there, and review-ingest never saw it.
+	//
+	// A reviewer that infers its output location can silently write to the one
+	// the coordinator is not watching, which loses a completed review with no
+	// error anywhere. inbox is canonical per reviewingest.InboxRel and
+	// IsInboxPath ("durable review inbox artifact"); the packet now states an
+	// absolute path so there is nothing left to infer.
+	inboxAbs, err := filepath.Abs(filepath.Join(root, reviewingest.InboxRel))
+	if err != nil {
+		return fmt.Errorf("resolve review inbox: %w", err)
+	}
+	if err := os.MkdirAll(inboxAbs, 0o700); err != nil {
+		return fmt.Errorf("create review inbox: %w", err)
+	}
+	verdictPath := filepath.Join(inboxAbs, fmt.Sprintf("%s-%s.md", shortSHA(sha), reviewAgentName(ref, sha)))
+	packetBody := reviewPacketBody(ref, sha, surface, verdictPath)
 	if err := os.WriteFile(packet, []byte(packetBody), 0o600); err != nil {
 		return fmt.Errorf("write review packet: %w", err)
 	}
@@ -568,14 +589,22 @@ func preflightReviewerReadiness(r poolReviewer) error {
 // reviewer's output is ingestible by construction rather than by luck. sha and
 // task are filled here because we know them; the reviewer supplies only what
 // only it can know.
-func reviewPacketBody(ref, sha, surface string) string {
+func reviewPacketBody(ref, sha, surface, verdictPath string) string {
 	return fmt.Sprintf(`REVIEW %s — verdict only, edit nothing.
 
 Candidate: %s
 Surface: %s
 
-Read docs/prompts/review-contract.md, inspect only this candidate, and report
-the verdict artifact to the review supervisor.
+Read docs/prompts/review-contract.md and inspect only this candidate.
+
+WRITE YOUR VERDICT ARTIFACT TO EXACTLY THIS PATH:
+
+  %s
+
+Do not infer the location from other files you find nearby. Two review
+directories exist and only this one is watched by the ingest step; a verdict
+written elsewhere is silently never read, and the review is lost with no error
+reported anywhere.
 
 The artifact MUST begin with this front-matter block, as the very first bytes of
 the file. Any prose above it makes review-ingest refuse the whole verdict and
@@ -594,7 +623,7 @@ reviewed-head: <output of git rev-parse HEAD in the tree you actually read>
 Your evidence goes below the --- line. Keep the task: header accurate: it is
 what ties this verdict to a board card, and a verdict that names no card cannot
 be joined back to one.
-`, ref, sha, surface, sha, ref)
+`, ref, sha, surface, verdictPath, sha, ref)
 }
 
 // settledAgentStatuses are the states in which a reviewer is no longer doing
