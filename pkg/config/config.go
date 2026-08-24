@@ -535,6 +535,21 @@ var (
 // An empty root yields the repo-relative default, so this is a drop-in for both
 // call shapes.
 func PathFor(root string) string {
+	// FAC-600: an explicit operator profile wins over the repository default,
+	// which is the entire purpose of HERD_CONFIG_PATH. PathFor builds an
+	// ABSOLUTE path, and LoadConfig only consults the override when handed the
+	// relative DefaultConfigPath — so every caller resolving through PathFor
+	// silently bypassed the override.
+	//
+	// That made a second host impossible to configure. .herd/herd.yaml is
+	// tracked and pins a host-specific fleet.herdr_workspace, so a WSL review
+	// node was refused with "HERD_WORKSPACE=w2, registered workspace=wB;
+	// refusing cross-workspace mutation" regardless of which profile it
+	// selected. The only remaining option was editing a tracked file per host,
+	// which conflicts on every pull.
+	if override := strings.TrimSpace(os.Getenv("HERD_CONFIG_PATH")); override != "" {
+		return override
+	}
 	if strings.TrimSpace(root) == "" {
 		return DefaultConfigPath
 	}
