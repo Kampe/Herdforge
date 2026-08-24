@@ -1,6 +1,7 @@
 package main
 
 import (
+	"github.com/Kampe/Herdforge/pkg/reviewledger"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -125,5 +126,30 @@ func TestReviewPacketNamesTheSupervisorToReportTo(t *testing.T) {
 		if !strings.Contains(body, want) {
 			t.Errorf("packet must require reporting home on %s too", want)
 		}
+	}
+}
+
+// A harness name is not a vendor family. The packet used to say
+// "anthropic|openai|google|xai|..." and the trailing ellipsis invited a guess: a
+// codex-harness reviewer wrote reviewer-family "codex", which is not in
+// FamilyAllowlist, so ingest refused the verdict and the review was lost.
+func TestReviewPacketEnumeratesFamiliesAndRejectsHarnessNames(t *testing.T) {
+	body := reviewPacketBody("CHA-9", strings.Repeat("b", 40), "surface",
+		"/repo/.herd/review/inbox/v.md", "review-supervisor")
+
+	for family := range reviewledger.FamilyAllowlist {
+		if !strings.Contains(body, family) {
+			t.Errorf("packet must enumerate allowed family %q; a reviewer cannot pick from a set it was never shown", family)
+		}
+	}
+	// The harness-to-family mapping must be explicit, since the harness name is
+	// the intuitive-but-wrong answer.
+	for _, pair := range []string{"codex", "grok", "agy"} {
+		if !strings.Contains(body, pair) {
+			t.Errorf("packet must map harness %q to its vendor family", pair)
+		}
+	}
+	if strings.Contains(body, "anthropic|openai|google|xai|...") {
+		t.Error("the open-ended family list is what caused the bad guess; it must be gone")
 	}
 }
