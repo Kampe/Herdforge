@@ -88,6 +88,34 @@ func runPoolReview(ref string) error {
 	if familyErr != nil {
 		return fmt.Errorf("resolve builder family for %s: %w", shortSHA(sha), familyErr)
 	}
+	// FAC-612: --allow-unproven-builder alone was a DEAD END. It skipped this
+	// check, so the review ran, and then ingest refused the verdict anyway for the
+	// same missing provenance -- a full lane spent to produce something
+	// unadmittable. Worse, the six mergeable PRs on the board could never merge:
+	// the merge policy wants a verdict, a verdict wants provable provenance, and
+	// nothing could supply it. The gate turned a wasted review into a deadlock.
+	//
+	// Asserting a family now RECORDS it, which is the difference between an
+	// operator taking attributable responsibility for provenance and a reviewer
+	// silently guessing it. The launch row is what admission reads, so the
+	// resulting verdict is admissible by construction.
+	if asserted := strings.TrimSpace(*opts.BuilderFamily); asserted != "" {
+		if !reviewledger.FamilyAllowlist[asserted] {
+			return fmt.Errorf("--builder-family %q is not an allowed vendor family", asserted)
+		}
+		if provenFamily != "" && !strings.EqualFold(provenFamily, asserted) {
+			return fmt.Errorf(
+				"--builder-family %q contradicts the recorded launch family %q for %s; the ledger is authoritative",
+				asserted, provenFamily, shortSHA(sha))
+		}
+		if provenFamily == "" {
+			if err := recordAssertedBuilderLaunch(root, ref, sha, asserted); err != nil {
+				return fmt.Errorf("record asserted builder family: %w", err)
+			}
+			fmt.Printf("recorded asserted builder-family=%s for %s (operator-attributed provenance)\n", asserted, shortSHA(sha))
+		}
+		provenFamily = asserted
+	}
 	if provenFamily == "" && !*opts.AllowUnprovenBuilder {
 		return fmt.Errorf(
 			"candidate %s has no provable builder family: no launch record for this exact sha carries an allowlisted builder_family, "+
@@ -427,6 +455,7 @@ type poolReviewOptions struct {
 	PacketRoot           *string
 	NoLaunch             *bool
 	AllowUnprovenBuilder *bool
+	BuilderFamily        *string
 }
 
 // Validate rejects option combinations that are not routes. It lives on the
@@ -452,6 +481,8 @@ func registerPoolReviewFlags(fs *flag.FlagSet) *poolReviewOptions {
 		SurfaceRoot: fs.String("surface-root", filepath.Join(".herd", "review-surfaces"), "Review surface symlink root"),
 		PacketRoot:  fs.String("packet-root", filepath.Join(".herd", "review-packets"), "Review packet root"),
 		NoLaunch:    fs.Bool("no-launch", false, "Prepare and print the surface without starting Herdr"),
+		BuilderFamily: fs.String("builder-family", "",
+			"Assert the candidate's builder family and RECORD it, so the resulting verdict is admissible."),
 		AllowUnprovenBuilder: fs.Bool("allow-unproven-builder", false,
 			"Dispatch even when no launch record proves the candidate's builder family. The verdict will need hand admission."),
 	}
@@ -640,6 +671,23 @@ func builderFamilyOrUnproven(family string) string {
 		return "unproven"
 	}
 	return family
+}
+
+// recordAssertedBuilderLaunch writes the launch row admission reads, so an
+// operator-asserted family produces an ADMISSIBLE verdict rather than a review
+// that is refused after it has already been paid for.
+func recordAssertedBuilderLaunch(root, ref, sha, family string) error {
+	l, err := reviewledger.NewReviewLedger(root, reviewledger.DefaultPath(root))
+	if err != nil {
+		return err
+	}
+	return l.EnsureRecord(reviewledger.RecordOpts{
+		SHA:           sha,
+		BuilderFamily: family,
+		Reviewer:      reviewAgentName(ref, sha),
+		Task:          ref,
+		Gate:          "operator-asserted",
+	})
 }
 
 // provenBuilderFamily resolves the candidate's recorded builder family, or "" if
