@@ -20,7 +20,7 @@ import (
 func TestReviewPacketCarriesIngestibleFrontMatterContract(t *testing.T) {
 	body := reviewPacketBody("PR-3115", "8867353f0ba9fe569feeb28989c10d0fefdc6ca1",
 		".herd/review-surfaces/review-pr-3115", "/repo/.herd/review/inbox/8867353f0ba9-review-pr-3115.md",
-		"review-supervisor")
+		"review-supervisor", "openai")
 
 	for _, key := range []string{
 		"sha:", "branch:", "task:", "reviewer:", "reviewer-family:",
@@ -49,7 +49,7 @@ func TestReviewPacketCarriesIngestibleFrontMatterContract(t *testing.T) {
 // The contract the packet advertises must be the contract the parser accepts.
 // If these two drift, reviewers follow instructions and still get refused.
 func TestPacketContractMatchesParserAcceptedKeys(t *testing.T) {
-	body := reviewPacketBody("CHA-1", strings.Repeat("a", 40), "surface", "/repo/.herd/review/inbox/a-review-cha-1.md", "review-supervisor")
+	body := reviewPacketBody("CHA-1", strings.Repeat("a", 40), "surface", "/repo/.herd/review/inbox/a-review-cha-1.md", "review-supervisor", "openai")
 
 	// Build a minimal artifact the way a compliant reviewer would, using the
 	// packet's own block, and confirm the parser extracts what we expect.
@@ -89,7 +89,7 @@ func TestPacketContractMatchesParserAcceptedKeys(t *testing.T) {
 func TestReviewPacketNamesAnAbsoluteVerdictDestination(t *testing.T) {
 	dest := "/repo/.herd/review/inbox/8867353f0ba9-review-cha-2255-8867353f0ba9.md"
 	body := reviewPacketBody("CHA-2255", "8867353f0ba9fe569feeb28989c10d0fefdc6ca1",
-		"/repo/.herd/review-surfaces/review-cha-2255", dest, "review-supervisor")
+		"/repo/.herd/review-surfaces/review-cha-2255", dest, "review-supervisor", "openai")
 
 	if !strings.Contains(body, dest) {
 		t.Errorf("packet must state the exact destination path, got:\n%s", body)
@@ -115,7 +115,7 @@ func TestReviewPacketNamesAnAbsoluteVerdictDestination(t *testing.T) {
 func TestReviewPacketNamesTheSupervisorToReportTo(t *testing.T) {
 	body := reviewPacketBody("PR-3115", "8867353f0ba9fe569feeb28989c10d0fefdc6ca1",
 		".herd/review-surfaces/review-pr-3115", "/repo/.herd/review/inbox/v.md",
-		"review-harvest-supervisor")
+		"review-harvest-supervisor", "openai")
 
 	if !strings.Contains(body, "review-harvest-supervisor") {
 		t.Error("packet must name the supervisor the reviewer reports to")
@@ -135,7 +135,7 @@ func TestReviewPacketNamesTheSupervisorToReportTo(t *testing.T) {
 // FamilyAllowlist, so ingest refused the verdict and the review was lost.
 func TestReviewPacketEnumeratesFamiliesAndRejectsHarnessNames(t *testing.T) {
 	body := reviewPacketBody("CHA-9", strings.Repeat("b", 40), "surface",
-		"/repo/.herd/review/inbox/v.md", "review-supervisor")
+		"/repo/.herd/review/inbox/v.md", "review-supervisor", "openai")
 
 	for family := range reviewledger.FamilyAllowlist {
 		if !strings.Contains(body, family) {
@@ -151,5 +151,31 @@ func TestReviewPacketEnumeratesFamiliesAndRejectsHarnessNames(t *testing.T) {
 	}
 	if strings.Contains(body, "anthropic|openai|google|xai|...") {
 		t.Error("the open-ended family list is what caused the bad guess; it must be gone")
+	}
+}
+
+// FAC-608: the packet must PREFILL the builder family from the launch record.
+// Leaving it as a placeholder is what made honest reviewers write "unknown",
+// which admission then refused -- 25 discarded reviews in one inbox.
+func TestReviewPacketPrefillsBuilderFamily(t *testing.T) {
+	body := reviewPacketBody("CHA-7", strings.Repeat("c", 40), "surface",
+		"/repo/.herd/review/inbox/v.md", "review-supervisor", "xai")
+
+	if !strings.Contains(body, "builder-family: xai") {
+		t.Error("packet must prefill the recorded builder family, not ask the reviewer to derive it")
+	}
+	if strings.Contains(body, "builder-family: <") {
+		t.Error("builder-family must not remain a placeholder")
+	}
+}
+
+// A blank family must never render as an empty header, which a reviewer would
+// fill in by guessing. It says "unproven" so the reviewer reports it honestly.
+func TestReviewPacketMarksUnprovenBuilderFamilyExplicitly(t *testing.T) {
+	body := reviewPacketBody("CHA-8", strings.Repeat("d", 40), "surface",
+		"/repo/.herd/review/inbox/v.md", "review-supervisor", "")
+
+	if !strings.Contains(body, "builder-family: unproven") {
+		t.Error("an absent family must render as an explicit 'unproven', never blank")
 	}
 }
