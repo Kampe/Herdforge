@@ -140,6 +140,14 @@ const (
 	DiskReasonTempVolumeDivergence  = "temp_volume_divergence"
 	DiskReasonUnavailable           = "unavailable"
 	DiskReasonInvalid               = "invalid"
+	// DiskReasonInvalidRequest separates a malformed CALLER REQUEST from a real
+	// capacity problem. Both used to report reason="invalid" with a zeroed
+	// DiskEvidence, so a harvest request that simply named no byte/inode
+	// requirement surfaced as
+	//   state=BLOCKED {"kind":"disk_pressure","reason":"invalid","free_bytes":0,...}
+	// which reads as a full disk. A lane hit exactly this and went to check df,
+	// which showed 114 GiB free. The gate was right to refuse and wrong about why.
+	DiskReasonInvalidRequest        = "invalid_request"
 	DiskReasonInvalidPolicy         = "invalid_policy"
 	DiskReasonAdditionalUnavailable = "additional_volume_unavailable"
 	DiskReasonAdditionalInvalid     = "additional_volume_invalid"
@@ -226,6 +234,16 @@ type DiskAdmissionError struct {
 
 func (e *DiskAdmissionError) Error() string {
 	evidence := marshalDiskEvidence(e.Decision.Evidence)
+	// A malformed request is not a capacity problem, so it must not be announced
+	// as the "disk capacity gate" blocking on zeroed capacity evidence. That
+	// phrasing sent a lane to check df, which reported 114 GiB free, and the real
+	// fault -- a harvest request naming no byte/inode requirement -- went unread.
+	if e.Decision.Evidence.Reason == DiskReasonInvalidRequest {
+		return fmt.Sprintf("harvest admission request is malformed (scope %s): state=%s evidence=%s; "+
+			"the disk was never the problem: no byte/inode requirement was supplied, so capacity was never evaluated. "+
+			"Fix the caller's DiskRequest; retrying the capacity probe cannot help",
+			e.Scope, e.Decision.State, evidence)
+	}
 	message := fmt.Sprintf("disk capacity gate blocked scope %s: state=%s evidence=%s", e.Scope, e.Decision.State, evidence)
 	if e.Decision.Evidence.NextAction == DiskActionRecoverSpace {
 		message += "; next step: host-level intervention is required; contact your operator"
@@ -331,7 +349,7 @@ func (g *CapacityGate) PlanDiskAdmission(requests []DiskRequest) (DiskAdmissionP
 	paths := make(map[string]string)
 	for _, request := range requests {
 		if request.RequiredBytes == 0 || request.RequiredInodes == 0 {
-			return DiskAdmissionPlan{}, &DiskAdmissionError{Scope: "plan", Decision: diskBlocked(DiskEvidence{Operation: "harvest_batch", RequiredBytes: request.RequiredBytes, RequiredInodes: request.RequiredInodes}, DiskReasonInvalid)}
+			return DiskAdmissionPlan{}, &DiskAdmissionError{Scope: "plan", Decision: diskBlocked(DiskEvidence{Operation: "harvest_batch", RequiredBytes: request.RequiredBytes, RequiredInodes: request.RequiredInodes}, DiskReasonInvalidRequest)}
 		}
 		seen := make(map[string]struct{})
 		seenVolumes := make(map[string]struct{})
@@ -378,7 +396,7 @@ func (g *CapacityGate) PlanDiskAdmission(requests []DiskRequest) (DiskAdmissionP
 		plan.Requests = append(plan.Requests, DiskRequest{Operation: "harvest_batch", Path: paths[id], RequiredBytes: totals[id].Bytes, RequiredInodes: totals[id].Inodes})
 	}
 	if len(plan.Requests) == 0 {
-		return DiskAdmissionPlan{}, &DiskAdmissionError{Scope: "plan", Decision: diskBlocked(DiskEvidence{Operation: "harvest_batch"}, DiskReasonInvalid)}
+		return DiskAdmissionPlan{}, &DiskAdmissionError{Scope: "plan", Decision: diskBlocked(DiskEvidence{Operation: "harvest_batch"}, DiskReasonInvalidRequest)}
 	}
 	return plan, nil
 }
@@ -615,6 +633,9 @@ func diskBlocked(e DiskEvidence, reason string) DiskDecision {
 	e.Reason = reason
 	switch reason {
 	case DiskReasonInvalidPolicy:
+		e.NextAction = DiskActionFixPolicy
+	case DiskReasonInvalidRequest:
+		// Retrying the probe cannot fix a caller that supplied no requirement.
 		e.NextAction = DiskActionFixPolicy
 	case DiskReasonUnavailable, DiskReasonInvalid, DiskReasonAdditionalUnavailable, DiskReasonAdditionalInvalid:
 		e.NextAction = DiskActionRetryProbe
