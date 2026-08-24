@@ -25,6 +25,13 @@ func runContainers() {
 		runContainersReconcile(os.Args[3:])
 		return
 	}
+	// FAC-598: reconcile only reclaims RECEIPTED containers, and nothing
+	// registers ownership, so it can never act on the abandoned ones. reap works
+	// from evidence of ephemerality instead.
+	if len(os.Args) > 2 && os.Args[2] == "reap" {
+		runContainersReap(os.Args[3:])
+		return
+	}
 	runContainersStatus(os.Args[2:])
 }
 
