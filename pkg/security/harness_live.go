@@ -12,7 +12,7 @@ import (
 // liveHarnessProof, when set (by herdr.RegisterLiveHarnessProof or tests), is
 // the only function that may return RealHerdrSession=true.
 var (
-	liveProofMu   sync.RWMutex
+	liveProofMu      sync.RWMutex
 	liveHarnessProof func(kind, realBin, tmp string) (modelOK, toolOK, viaLA, contained, herdrOK bool, evidence, blocker string, err error)
 )
 

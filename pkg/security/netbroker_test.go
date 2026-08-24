@@ -58,7 +58,9 @@ func TestControlPing_RequiresAuth(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer b.Close()
-	if err := b.EnableControl("ident-1", "tab-1", "ses", "", time.Now().Unix()); err != nil { t.Fatal(err) }
+	if err := b.EnableControl("ident-1", "tab-1", "ses", "", time.Now().Unix()); err != nil {
+		t.Fatal(err)
+	}
 	// control on separate listener
 	// No auth
 	c, err := net.DialTimeout("tcp", b.ControlAddr(), time.Second)

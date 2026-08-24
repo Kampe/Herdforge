@@ -21,25 +21,35 @@ func TestDiagnoseKindAuthReadiness_NoAPIKeys_External(t *testing.T) {
 	// every reviewer launch on a fully logged-in host. Its own behaviour is
 	// covered by TestClaudeDiagnosisIsBrokerable.
 	//
-	// codex and grok stay: they genuinely authenticate by API key, and raw env
-	// keys still must not count as production authority.
+	// FAC-587: codex and grok join claude. This fleet runs every agent as a
+	// harness inside a herdr pane, never against a provider API, so demanding a
+	// handle-backed credential refused their launches for something that does not
+	// exist here. Verified on this host: ~/.codex/auth.json is auth_mode=chatgpt
+	// with an OAuth token and an empty OPENAI_API_KEY, and `codex exec` runs with
+	// no key present.
+	//
+	// The secret-hygiene half of this test is the part that still matters, and it
+	// is kept: a diagnosis must never carry key material, brokerable or not.
 	for _, kind := range []string{"codex", "grok"} {
 		d := DiagnoseKindAuthReadiness(kind)
-		if d.Brokerable {
-			t.Fatalf("%s: must not be brokerable without HostCreds", kind)
+		if !d.Brokerable {
+			t.Errorf("%s runs as a harness on this fleet and must be brokerable", kind)
 		}
-		if d.Class != KindAuthExternal && d.Class != KindAuthConfig && d.Class != KindAuthPlatform {
-			t.Fatalf("%s class=%s", kind, d.Class)
+		if d.AuthorityClass != "native" {
+			t.Errorf("%s authority must be native (its own harness session), got %q",
+				kind, d.AuthorityClass)
 		}
-		if d.Blocker == "" || !strings.Contains(d.Blocker, "FAC-170 BLOCKED") {
-			t.Fatalf("blocker: %q", d.Blocker)
-		}
-		// Packet must not contain bearer-looking secrets.
 		pkt := FormatKindAuthBlocker(d)
 		if strings.Contains(strings.ToLower(pkt), "sk-") || strings.Contains(pkt, "Bearer ") {
 			t.Fatalf("packet leaked secret material: %s", pkt)
 		}
 		t.Logf("%s: %s", kind, pkt)
+	}
+
+	// A kind that is NOT a harness must still be refused, or this stops being a
+	// gate at all. opencode is a gateway proxy and deliberately out of scope.
+	if d := DiagnoseKindAuthReadiness("opencode"); d.Brokerable {
+		t.Error("opencode is not a harness kind and must not be brokerable")
 	}
 }
 
@@ -49,9 +59,17 @@ func TestDiagnoseKindAuthReadiness_RawAPIKeyNotProductionAuthority(t *testing.T)
 	t.Setenv("XAI_API_KEY", "")
 	_ = os.Unsetenv(envHostCredsHandles)
 	d := DiagnoseKindAuthReadiness("codex")
-	// Raw env keys alone must not make production brokerable (FAC-170).
-	if d.Brokerable {
-		t.Fatal("raw OPENAI_API_KEY must not make codex brokerable")
+
+	// FAC-170's property, restated for FAC-587. codex is brokerable because it is
+	// harness-authenticated, so "not brokerable" can no longer express this. What
+	// must hold is that the raw env key is NOT the thing granting authority: the
+	// authority class stays native, and the key is never echoed.
+	if d.AuthorityClass != "native" || d.ReasonCode != "native_auth" {
+		t.Errorf("authority must be the harness session, not the env key: class=%q reason=%q",
+			d.AuthorityClass, d.ReasonCode)
+	}
+	if !EnvRawAPIKeysPresent() {
+		t.Error("the raw key must still be DETECTED; it is simply never authority")
 	}
 	if strings.Contains(FormatKindAuthBlocker(d), "sk-test") {
 		t.Fatal("must not echo API key")

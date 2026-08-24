@@ -22,7 +22,7 @@ import (
 // BrokerControlState (.ctrl.json) only.
 type DurableBrokerState struct {
 	PID           int      `json:"pid"`
-	Addr          string   `json:"addr"` // proxy listen
+	Addr          string   `json:"addr"`  // proxy listen
 	Token         string   `json:"token"` // proxy token only
 	TabID         string   `json:"tab_id"`
 	SessionID     string   `json:"session_id"`
@@ -686,15 +686,15 @@ func ParseBrokerPort(addr string) (int, error) {
 
 // BrokerLaunch is the result of starting durable or inline broker.
 type BrokerLaunch struct {
-	ProxyURL   string
-	Endpoint   string
-	Inline     *HostAllowBroker
-	StatePath  string
+	ProxyURL    string
+	Endpoint    string
+	Inline      *HostAllowBroker
+	StatePath   string
 	ControlPath string
-	AltPaths   []string
-	TabKey     string
-	Identity   string
-	PID        int
+	AltPaths    []string
+	TabKey      string
+	Identity    string
+	PID         int
 }
 
 func (bl *BrokerLaunch) Close() error {

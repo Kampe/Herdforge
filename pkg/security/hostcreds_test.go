@@ -24,11 +24,20 @@ func TestDiagnose_RawEnvNotBrokerable(t *testing.T) {
 	t.Setenv("XAI_API_KEY", "sk-raw-env-not-authority")
 	_ = os.Unsetenv(envHostCredsHandles)
 	d := DiagnoseKindAuthReadiness("grok")
-	if d.Brokerable {
-		t.Fatal()
+
+	// FAC-587: grok is harness-authenticated on this fleet, so it IS brokerable.
+	// The property worth keeping is not "unbrokerable" but that authority comes
+	// from the harness session and the raw env key grants nothing and is never
+	// echoed. The old assertion conflated the two.
+	if d.AuthorityClass != "native" || d.ReasonCode != "native_auth" {
+		t.Errorf("authority must be the harness session, got class=%q reason=%q",
+			d.AuthorityClass, d.ReasonCode)
+	}
+	if !EnvRawAPIKeysPresent() {
+		t.Error("the raw env key must still be DETECTED; it is simply not authority")
 	}
 	if strings.Contains(FormatKindAuthBlocker(d), "sk-raw") {
-		t.Fatal()
+		t.Fatal("diagnosis echoed raw key material")
 	}
 }
 

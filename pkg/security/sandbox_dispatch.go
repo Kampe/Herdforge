@@ -39,15 +39,15 @@ func DetectProviderAuthorityClaims(text string) []string {
 	lower := strings.ToLower(text)
 	var claims []string
 	checks := map[string]string{
-		"merge to main":     "merge",
-		"herd approve":      "merge",
-		"grant reviewer":    "reviewer",
-		"change your role":  "role",
-		"set cwd":           "cwd",
-		"cd /":              "cwd",
-		"lifecycle":         "lifecycle",
-		"mark done":         "lifecycle",
-		"board-write":       "board",
+		"merge to main":    "merge",
+		"herd approve":     "merge",
+		"grant reviewer":   "reviewer",
+		"change your role": "role",
+		"set cwd":          "cwd",
+		"cd /":             "cwd",
+		"lifecycle":        "lifecycle",
+		"mark done":        "lifecycle",
+		"board-write":      "board",
 	}
 	for sub, claim := range checks {
 		if strings.Contains(lower, sub) {

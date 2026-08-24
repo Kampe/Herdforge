@@ -16,16 +16,16 @@ import (
 // BrokerControlState is coordinator-only durable control material.
 // NEVER written into agent-visible proxy state or agent env/argv/worktree.
 type BrokerControlState struct {
-	ControlToken  string `json:"control_token"`
-	ControlAddr   string `json:"control_addr"` // 127.0.0.1:port
-	ControlURL    string `json:"control_url"`  // http://127.0.0.1:port/__herd_control
-	Identity      string `json:"identity"`
-	PID           int    `json:"pid"`
-	ProxyAddr     string `json:"proxy_addr"`
-	TabID         string `json:"tab_id"`
-	SessionID     string `json:"session_id"`
-	StatePath     string `json:"state_path"`     // agent-visible proxy state
-	ControlPath   string `json:"control_path"`   // this file
+	ControlToken  string   `json:"control_token"`
+	ControlAddr   string   `json:"control_addr"` // 127.0.0.1:port
+	ControlURL    string   `json:"control_url"`  // http://127.0.0.1:port/__herd_control
+	Identity      string   `json:"identity"`
+	PID           int      `json:"pid"`
+	ProxyAddr     string   `json:"proxy_addr"`
+	TabID         string   `json:"tab_id"`
+	SessionID     string   `json:"session_id"`
+	StatePath     string   `json:"state_path"`   // agent-visible proxy state
+	ControlPath   string   `json:"control_path"` // this file
 	AllowHosts    []string `json:"allow_hosts"`
 	StartedAtUnix int64    `json:"started_at_unix"`
 	Exe           string   `json:"exe,omitempty"`

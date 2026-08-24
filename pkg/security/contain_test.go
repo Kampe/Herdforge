@@ -221,7 +221,7 @@ func TestDarwinSeatbelt_ExclusivePackage(t *testing.T) {
 	st := StructureTask("FAC-133", "t", "d", RoleWorker, wt, "", "", false)
 	grant, err := p.AuthorizeLaunch(LaunchRequest{
 		CWD: wt, Role: RoleWorker, Tools: []string{"read-file"},
-		Paths: []string{filepath.Join(wt, "pkg", "envelope", "a.go")},
+		Paths:      []string{filepath.Join(wt, "pkg", "envelope", "a.go")},
 		Structured: st, ProviderText: "d",
 	})
 	if err != nil {

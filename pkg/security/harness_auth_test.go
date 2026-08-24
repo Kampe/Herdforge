@@ -15,10 +15,14 @@ func TestClaudeNeedsNoBrokeredHostCredential(t *testing.T) {
 	if hosts := RequiredBrokerHostsForKind(AuthorKindClaude); len(hosts) != 0 {
 		t.Errorf("claude is harness-authenticated and needs no brokered host, got %v", hosts)
 	}
-	// The kinds that genuinely use an API key must keep their requirement.
+	// RequiredBrokerHostsForKind answers which host a brokered key would be FOR,
+	// which is a different question from whether the kind needs one. codex and
+	// grok keep a real mapping here because the broker's host machinery needs it;
+	// FAC-587 exempts them at admission via harnessAuthenticated instead. Blanking
+	// this map reported every kind as unbrokerable_kind.
 	for _, kind := range []string{AuthorKindCodex, AuthorKindGrok} {
 		if hosts := RequiredBrokerHostsForKind(kind); len(hosts) == 0 {
-			t.Errorf("%s still authenticates by API key and must keep its host requirement", kind)
+			t.Errorf("%s must keep a host mapping for the broker machinery", kind)
 		}
 	}
 }
@@ -26,15 +30,22 @@ func TestClaudeNeedsNoBrokeredHostCredential(t *testing.T) {
 // A harness-authenticated kind must classify as native, exactly as agy already
 // did. agy was exempt by name; claude was not, though the same reasoning applies.
 func TestHarnessAuthenticatedKindsClassifyNative(t *testing.T) {
-	for _, kind := range []string{AuthorKindClaude, AuthorKindAGY, "antigravity"} {
+	for _, kind := range []string{
+		AuthorKindClaude, AuthorKindAGY, "antigravity",
+		// FAC-587: codex and grok belong here too. They run as harnesses in
+		// herdr panes with their own CLI logins, verified on this host:
+		// ~/.codex/auth.json is auth_mode=chatgpt with an OAuth token and an
+		// empty OPENAI_API_KEY, and `codex exec` executes with no key present.
+		AuthorKindCodex, AuthorKindGrok,
+	} {
 		if !harnessAuthenticated(kind) {
-			t.Errorf("%s authenticates through its own harness", kind)
+			t.Errorf("%s authenticates through its own harness on this fleet", kind)
 		}
 	}
-	for _, kind := range []string{AuthorKindCodex, AuthorKindGrok, "opencode"} {
-		if harnessAuthenticated(kind) {
-			t.Errorf("%s must not be treated as harness-authenticated", kind)
-		}
+	// opencode is still not a harness-auth kind: it is a gateway proxy, not a
+	// CLI holding its own provider session, and it remains out of scope.
+	if harnessAuthenticated("opencode") {
+		t.Error("opencode is a gateway proxy and must not be treated as harness-authenticated")
 	}
 }
 

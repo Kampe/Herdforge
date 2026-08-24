@@ -8,7 +8,7 @@ import (
 // tabBrokerRegistry owns broker lifetime keyed by tab ID. CloseTab / rollback
 // must call CloseTabBroker so listeners cannot leak past the agent session.
 type tabBrokerRegistry struct {
-	mu   sync.Mutex
+	mu    sync.Mutex
 	byTab map[string]*HostAllowBroker
 }
 
