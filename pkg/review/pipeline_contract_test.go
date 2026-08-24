@@ -34,11 +34,19 @@ func TestPipelineContract_EmptyIsDeterministicAndUnknownBoardFailsClosed(t *test
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !r.WindDown || r.Pressure != "ok" || r.Pending != 0 || r.Harvestable != 0 || r.NeedReview != 0 {
+	if !r.WindDown || r.Pending != 0 || r.Harvestable != 0 || r.NeedReview != 0 {
 		t.Fatalf("empty report=%+v", r)
 	}
 	if r.KaneoOK || r.KaneoInReview != -1 || r.KaneoError == "" {
 		t.Fatalf("unknown board was not fail-closed: %+v", r)
+	}
+	// This assertion previously required Pressure == "ok" here, which pinned the
+	// exact fail-OPEN behaviour it was named to forbid: with the board
+	// unreachable and the in-review count still at its -1 unknown sentinel, the
+	// posture line advertised free review headroom derived from no data. Unknown
+	// board state must not read as an absence of pressure.
+	if r.Pressure != "UNKNOWN" {
+		t.Fatalf("unreachable board must not report pressure %q: %+v", r.Pressure, r)
 	}
 	var packet map[string]json.RawMessage
 	b, err := json.Marshal(r)
