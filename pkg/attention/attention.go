@@ -237,6 +237,17 @@ func Triage(
 
 // Summary returns a one-line human-readable triage summary.
 func Summary(r Result) string {
+	// FAC-604: scanning nothing is not a clean bill of health. When the standing
+	// roster resolves empty -- as it does whenever lane-registry.json parses with
+	// lanes but no standing flags, since that path never falls back to
+	// .herd/herd.yaml -- every lane is invisible and Needing is trivially 0. This
+	// reported "fleet healthy — 0 lane(s) scanned" while the orchestrator sat
+	// done and the review supervisor sat idle, so coordinator-eyes triage was a
+	// false green and no loop could use it as a wake signal.
+	if r.Total == 0 {
+		return "herd-attention: UNKNOWN — no standing lanes resolved, so nothing was scanned; " +
+			"this is not a healthy fleet, it is an unresolved roster (check lane-registry.json standing flags vs .herd/herd.yaml)"
+	}
 	if r.Needing == 0 {
 		return fmt.Sprintf("herd-attention: fleet healthy — %d lane(s) scanned, none need eyes", r.Total)
 	}

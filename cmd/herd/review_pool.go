@@ -17,6 +17,7 @@ import (
 	"github.com/Kampe/Herdforge/pkg/reviewingest"
 	"github.com/Kampe/Herdforge/pkg/router"
 	"github.com/Kampe/Herdforge/pkg/security"
+	"github.com/Kampe/Herdforge/pkg/standing"
 	"github.com/Kampe/Herdforge/pkg/usage"
 	"github.com/Kampe/Herdforge/pkg/worktree"
 )
@@ -183,7 +184,7 @@ func runPoolReview(ref string) error {
 		return fmt.Errorf("create review inbox: %w", err)
 	}
 	verdictPath := filepath.Join(inboxAbs, fmt.Sprintf("%s-%s.md", shortSHA(sha), reviewAgentName(ref, sha)))
-	packetBody := reviewPacketBody(ref, sha, surface, verdictPath)
+	packetBody := reviewPacketBody(ref, sha, surface, verdictPath, reviewSupervisorTarget())
 	if err := os.WriteFile(packet, []byte(packetBody), 0o600); err != nil {
 		return fmt.Errorf("write review packet: %w", err)
 	}
@@ -604,7 +605,25 @@ func preflightReviewerReadiness(r poolReviewer) error {
 // reviewer's output is ingestible by construction rather than by luck. sha and
 // task are filled here because we know them; the reviewer supplies only what
 // only it can know.
-func reviewPacketBody(ref, sha, surface, verdictPath string) string {
+// reviewSupervisorTarget names the lane a finished reviewer reports home to.
+//
+// FAC-603: the packet used to name no owner at all, so a reviewer that finished
+// had no way to announce it. Completion was discoverable only by the supervisor
+// polling every pane, which meant a verdict sat unowned until the next beat --
+// and when the supervisor believed the host was saturated, it stopped looking.
+// A reviewer that can report home turns completion into an event instead of
+// something waiting to be noticed.
+//
+// The override exists because the supervisor's live agent name carries a
+// per-launch suffix, so the canonical standing name is only the fallback.
+func reviewSupervisorTarget() string {
+	if v := strings.TrimSpace(os.Getenv("HERD_REVIEW_SUPERVISOR")); v != "" {
+		return v
+	}
+	return standing.AgentName("review-supervisor")
+}
+
+func reviewPacketBody(ref, sha, surface, verdictPath, supervisor string) string {
 	return fmt.Sprintf(`REVIEW %s — verdict only, edit nothing.
 
 Candidate: %s
@@ -638,7 +657,26 @@ reviewed-head: <output of git rev-parse HEAD in the tree you actually read>
 Your evidence goes below the --- line. Keep the task: header accurate: it is
 what ties this verdict to a board card, and a verdict that names no card cannot
 be joined back to one.
-`, ref, sha, surface, verdictPath, sha, ref)
+
+THEN REPORT HOME. This is not optional and it is the last thing you do:
+
+  herd mail send --from %s --to %s --file %s
+
+Writing the verdict is not finishing. Until the supervisor knows this review is
+done, the verdict is not ingested, the card does not move, nothing merges, and
+your pool slot stays out of circulation. A verdict nobody is told about is
+indistinguishable from a review that never ran -- 85 finished reviews were found
+sitting unowned in this inbox for exactly that reason.
+
+Report home even when the verdict is FAIL or BLOCKED. A negative verdict is a
+result the supervisor needs in order to release the slot and re-plan; silence is
+the only outcome that helps nobody.
+
+If you are reviewing on a host other than the one holding the ledger, ALSO push
+your verdict artifact to the verdicts/<this-host-workspace> branch. The mail
+above does not cross hosts; the branch is the only transport that does, and a
+verdict that stays on this filesystem is invisible to the ledger.
+`, ref, sha, surface, verdictPath, sha, ref, reviewAgentName(ref, sha), supervisor, verdictPath)
 }
 
 // settledAgentStatuses are the states in which a reviewer is no longer doing
