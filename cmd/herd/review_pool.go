@@ -648,11 +648,22 @@ sha: %s
 branch: <the branch this candidate lives on>
 task: %s
 reviewer: <your lane name — never a coordinator>
-reviewer-family: <your model family: anthropic|openai|google|xai|...>
-builder-family: <the AUTHOR's family — must differ from yours>
+reviewer-family: <your VENDOR family — see the exact list below>
+builder-family: <the AUTHOR's vendor family — must differ from yours>
 verdict: PASS|FAIL|BLOCKED
 reviewed-head: <output of git rev-parse HEAD in the tree you actually read>
 ---
+
+FAMILY VALUES ARE A CLOSED SET. Use exactly one of:
+
+  anthropic  openai  google  xai  zhipu  moonshot  alibaba  deepseek
+  open-weight  antigravity  proxy
+
+These are VENDOR families, not harness names. Your harness is not a family: a
+reviewer running under codex writes openai, claude writes anthropic, grok writes
+xai, agy writes google. A verdict recorded as reviewer-family "codex" is refused
+as an unknown family and the whole review is discarded, which has already
+happened in this inbox.
 
 Your evidence goes below the --- line. Keep the task: header accurate: it is
 what ties this verdict to a board card, and a verdict that names no card cannot
