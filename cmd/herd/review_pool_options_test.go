@@ -69,8 +69,26 @@ func TestEveryPoolParsingPassUsesOneSchema(t *testing.T) {
 			t.Errorf("%s %s registers a pool option by hand; call registerPoolReviewFlags instead: %s", p.file, p.fn, code)
 		}
 	}
-	if got := schemaFlagNames(t); len(got) != 9 {
-		t.Errorf("schema options = %v, expected the full pool option set", got)
+	// Asserted by NAME, not by count. A bare length check fails with "expected
+	// the full pool option set" and makes a legitimately added flag look like a
+	// broken invariant, while saying nothing about which option is missing.
+	want := map[string]bool{
+		"allow-unproven-builder": true, "exclude-family": true, "model": true,
+		"no-launch": true, "packet-root": true, "pool": true, "pool-root": true,
+		"provider": true, "sha": true, "surface-root": true,
+	}
+	got := schemaFlagNames(t)
+	seen := map[string]bool{}
+	for _, name := range got {
+		seen[name] = true
+		if !want[name] {
+			t.Errorf("pool option %q is not in the declared schema set", name)
+		}
+	}
+	for name := range want {
+		if !seen[name] {
+			t.Errorf("pool option %q is missing from the schema", name)
+		}
 	}
 }
 

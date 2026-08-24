@@ -15,6 +15,7 @@ import (
 
 	"github.com/Kampe/Herdforge/pkg/herdr"
 	"github.com/Kampe/Herdforge/pkg/reviewingest"
+	"github.com/Kampe/Herdforge/pkg/reviewledger"
 	"github.com/Kampe/Herdforge/pkg/router"
 	"github.com/Kampe/Herdforge/pkg/security"
 	"github.com/Kampe/Herdforge/pkg/standing"
@@ -71,6 +72,28 @@ func runPoolReview(ref string) error {
 	}
 	if out, err := exec.Command("git", "-C", root, "rev-parse", "--verify", sha+"^{commit}").CombinedOutput(); err != nil {
 		return fmt.Errorf("candidate %s is not a commit: %s", sha[:min(12, len(sha))], strings.TrimSpace(string(out)))
+	}
+
+	// FAC-608: prove the candidate's builder family BEFORE spending anything.
+	// Admission refuses a verdict whose builder-family is not provable, and it
+	// refused 25 of 41 artifacts in one inbox for exactly that -- each one after a
+	// full review lane, wall clock and quota had already been consumed. The same
+	// question is free to ask here. Declining now costs a command; declining at
+	// ingest costs the entire review.
+	//
+	// --allow-unproven-builder exists because refusing outright would stop the
+	// review pipeline dead on a repo whose history predates launch records, which
+	// is a worse failure than a review that has to be admitted by hand.
+	provenFamily, familyErr := provenBuilderFamily(root, sha)
+	if familyErr != nil {
+		return fmt.Errorf("resolve builder family for %s: %w", shortSHA(sha), familyErr)
+	}
+	if provenFamily == "" && !*opts.AllowUnprovenBuilder {
+		return fmt.Errorf(
+			"candidate %s has no provable builder family: no launch record for this exact sha carries an allowlisted builder_family, "+
+				"so review-ingest will refuse any verdict produced for it no matter how good the review is. "+
+				"Record the builder launch, or pass --allow-unproven-builder to review it anyway and admit the verdict by hand",
+			shortSHA(sha))
 	}
 
 	// FAC-577: resolve AND preflight the reviewer before the pool lease, not
@@ -184,7 +207,7 @@ func runPoolReview(ref string) error {
 		return fmt.Errorf("create review inbox: %w", err)
 	}
 	verdictPath := filepath.Join(inboxAbs, fmt.Sprintf("%s-%s.md", shortSHA(sha), reviewAgentName(ref, sha)))
-	packetBody := reviewPacketBody(ref, sha, surface, verdictPath, reviewSupervisorTarget())
+	packetBody := reviewPacketBody(ref, sha, surface, verdictPath, reviewSupervisorTarget(), provenFamily)
 	if err := os.WriteFile(packet, []byte(packetBody), 0o600); err != nil {
 		return fmt.Errorf("write review packet: %w", err)
 	}
@@ -394,15 +417,16 @@ func safeReviewSurfacePart(ref string) string {
 // or tab existed. Every parsing pass now registers from this one function, so a
 // new option cannot be accepted by one pass and refused by another.
 type poolReviewOptions struct {
-	Pool          *bool
-	SHA           *string
-	Provider      *string
-	Model         *string
-	ExcludeFamily *string
-	PoolRoot      *string
-	SurfaceRoot   *string
-	PacketRoot    *string
-	NoLaunch      *bool
+	Pool                 *bool
+	SHA                  *string
+	Provider             *string
+	Model                *string
+	ExcludeFamily        *string
+	PoolRoot             *string
+	SurfaceRoot          *string
+	PacketRoot           *string
+	NoLaunch             *bool
+	AllowUnprovenBuilder *bool
 }
 
 // Validate rejects option combinations that are not routes. It lives on the
@@ -428,6 +452,8 @@ func registerPoolReviewFlags(fs *flag.FlagSet) *poolReviewOptions {
 		SurfaceRoot: fs.String("surface-root", filepath.Join(".herd", "review-surfaces"), "Review surface symlink root"),
 		PacketRoot:  fs.String("packet-root", filepath.Join(".herd", "review-packets"), "Review packet root"),
 		NoLaunch:    fs.Bool("no-launch", false, "Prepare and print the surface without starting Herdr"),
+		AllowUnprovenBuilder: fs.Bool("allow-unproven-builder", false,
+			"Dispatch even when no launch record proves the candidate's builder family. The verdict will need hand admission."),
 	}
 }
 
@@ -605,6 +631,28 @@ func preflightReviewerReadiness(r poolReviewer) error {
 // reviewer's output is ingestible by construction rather than by luck. sha and
 // task are filled here because we know them; the reviewer supplies only what
 // only it can know.
+// builderFamilyOrUnproven keeps the packet honest when provenance is absent. A
+// blank value would render "builder-family:" with nothing after it, which a
+// reviewer would fill in by guessing -- the exact behaviour that produced 25
+// refusals.
+func builderFamilyOrUnproven(family string) string {
+	if strings.TrimSpace(family) == "" {
+		return "unproven"
+	}
+	return family
+}
+
+// provenBuilderFamily resolves the candidate's recorded builder family, or "" if
+// no launch record proves one. An unreadable ledger is an error, never a quiet
+// "unprovable" -- that would decline every candidate on an IO fault.
+func provenBuilderFamily(root, sha string) (string, error) {
+	l, err := reviewledger.NewReadOnlyReviewLedger(root, reviewledger.DefaultPath(root))
+	if err != nil {
+		return "", err
+	}
+	return l.ProvenBuilderFamily(sha)
+}
+
 // reviewSupervisorTarget names the lane a finished reviewer reports home to.
 //
 // FAC-603: the packet used to name no owner at all, so a reviewer that finished
@@ -623,7 +671,7 @@ func reviewSupervisorTarget() string {
 	return standing.AgentName("review-supervisor")
 }
 
-func reviewPacketBody(ref, sha, surface, verdictPath, supervisor string) string {
+func reviewPacketBody(ref, sha, surface, verdictPath, supervisor, builderFamily string) string {
 	return fmt.Sprintf(`REVIEW %s — verdict only, edit nothing.
 
 Candidate: %s
@@ -649,10 +697,17 @@ branch: <the branch this candidate lives on>
 task: %s
 reviewer: <your lane name — never a coordinator>
 reviewer-family: <your VENDOR family — see the exact list below>
-builder-family: <the AUTHOR's vendor family — must differ from yours>
+builder-family: %s
 verdict: PASS|FAIL|BLOCKED
 reviewed-head: <output of git rev-parse HEAD in the tree you actually read>
 ---
+
+The builder-family above is PREFILLED from this candidate's launch record. Do not
+change it and do not re-derive it: it is the recorded provenance, and a verdict
+that disagrees with the ledger is refused as a launch/verdict identity conflict.
+If it reads "unproven", this review was dispatched with
+--allow-unproven-builder and its verdict will need hand admission -- say so in
+your evidence.
 
 FAMILY VALUES ARE A CLOSED SET. Use exactly one of:
 
@@ -687,7 +742,7 @@ If you are reviewing on a host other than the one holding the ledger, ALSO push
 your verdict artifact to the verdicts/<this-host-workspace> branch. The mail
 above does not cross hosts; the branch is the only transport that does, and a
 verdict that stays on this filesystem is invisible to the ledger.
-`, ref, sha, surface, verdictPath, sha, ref, reviewAgentName(ref, sha), supervisor, verdictPath)
+`, ref, sha, surface, verdictPath, sha, ref, builderFamilyOrUnproven(builderFamily), reviewAgentName(ref, sha), supervisor, verdictPath)
 }
 
 // settledAgentStatuses are the states in which a reviewer is no longer doing
