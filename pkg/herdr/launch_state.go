@@ -336,3 +336,57 @@ func hasForegroundAgentProcess(processes []PaneProcess) bool {
 	}
 	return false
 }
+
+// AwaitInteractiveReady blocks until herdr reports the agent's harness will
+// accept input, or the budget expires.
+//
+// FAC-601: VerifyAgentLaunch proves the agent is LISTED and its pane exists. It
+// never proved the TUI was accepting input, so a caller could deliver into a
+// harness that was still starting. That is invisible on a warm host and fatal on
+// a cold one: on the WSL review node claude needs about six seconds, the packet
+// was sent immediately, the text was dropped, and the launch reported
+// queued-but-not-consumed with the pane still idle.
+//
+// An older herdr omits interactive_ready entirely. That is NOT treated as "not
+// ready" — a missing field would otherwise block every delivery forever on hosts
+// whose herdr predates the field. Absence means unknown, and unknown falls back
+// to the existing behaviour of proceeding, which is what those hosts already do
+// today.
+func AwaitInteractiveReady(name string, budget time.Duration) (bool, error) {
+	if strings.TrimSpace(name) == "" {
+		return false, fmt.Errorf("interactive readiness requires an agent name")
+	}
+	if budget <= 0 {
+		budget = 20 * time.Second
+	}
+	deadline := time.Now().Add(budget)
+	sawField := false
+	for {
+		agents, err := AgentList()
+		if err == nil {
+			for _, a := range agents {
+				if strings.TrimSpace(a.Name) != strings.TrimSpace(name) {
+					continue
+				}
+				if a.InteractiveReady == nil {
+					// Field absent on this herdr. Nothing to wait for.
+					return false, nil
+				}
+				sawField = true
+				if *a.InteractiveReady {
+					return true, nil
+				}
+			}
+		}
+		if !time.Now().Before(deadline) {
+			if sawField {
+				return false, fmt.Errorf("agent %q did not become interactive within %s", name, budget)
+			}
+			// Never observed the agent at all: let the caller's own launch
+			// verification report that, rather than masking it as a readiness
+			// timeout.
+			return false, nil
+		}
+		time.Sleep(400 * time.Millisecond)
+	}
+}

@@ -1,8 +1,8 @@
 package herdr
 
 import (
-	"context"
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -1565,8 +1565,19 @@ type AgentEntry struct {
 	TerminalTitle    string       `json:"terminal_title,omitempty"` // UI title (login/auth detection)
 	ForegroundCwd    string       `json:"foreground_cwd,omitempty"`
 	Session          AgentSession `json:"agent_session,omitempty"`
-	Revision         uint64       `json:"revision,omitempty"`
-	StateChangeSeq   uint64       `json:"state_change_seq,omitempty"`
+	// InteractiveReady is herdr's own statement that the harness TUI will accept
+	// input. A POINTER because absent and false are different facts: an older
+	// herdr omits the field entirely, and treating that as "not ready" would
+	// block every delivery on it.
+	//
+	// FAC-601: this was never surfaced, so the review launch sent its packet as
+	// soon as the agent was merely LISTED. On a warm host that raced through; on
+	// the WSL node, where claude takes about six seconds to become interactive,
+	// the packet landed in a TUI that was not accepting input yet, was lost, and
+	// the launch reported queued-but-not-consumed with the pane still idle.
+	InteractiveReady *bool  `json:"interactive_ready,omitempty"`
+	Revision         uint64 `json:"revision,omitempty"`
+	StateChangeSeq   uint64 `json:"state_change_seq,omitempty"`
 	// TabGeneration is the immutable tab identity exposed by newer Herdr
 	// pulse/agent-list surfaces. It is deliberately distinct from
 	// StateChangeSeq, which only counts agent state transitions.
