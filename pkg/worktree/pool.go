@@ -38,6 +38,17 @@ type Pool struct {
 	Size        int
 	DefaultBase string
 	Now         func() time.Time
+	// HolderLive reports whether a lease's holder is still a live, unsettled
+	// worker. It is injected so this package stays free of any dependency on the
+	// terminal plane.
+	//
+	// FAC-591: without it the pool had no way to tell a working reviewer from a
+	// dead one. Every lease taken by a launch that later died stayed held
+	// forever — GC refuses while anything is leased, and Release needs a lease
+	// id nobody recorded — so the pool wedged at "no available clean slots" with
+	// zero live reviewers and reported itself saturated. That happened
+	// repeatedly and each time needed a human to unstick it.
+	HolderLive func(purpose string) bool
 }
 
 func NewPool(repoRoot, root string, size int) *Pool {
@@ -177,9 +188,110 @@ func (p *Pool) Lease(ctx context.Context, purpose string) (*PoolSlot, error) {
 			result = &copy
 			return p.writeState(state)
 		}
-		return errors.New("worktree pool: no available clean slots")
+		// FAC-591: before declaring the pool full, reclaim any lease whose holder
+		// is gone. A launch that dies after leasing leaves an ownerless lease
+		// that nothing else can free, so without this the pool wedges
+		// permanently and reports saturation with no reviewer running.
+		reclaimed, rerr := p.reclaimDeadLocked(ctx, state)
+		if rerr != nil {
+			return rerr
+		}
+		if len(reclaimed) == 0 {
+			return errors.New("worktree pool: no available clean slots")
+		}
+		if err := p.writeState(state); err != nil {
+			return err
+		}
+		for i := range state.Slots {
+			slot := &state.Slots[i]
+			if slot.LeaseID != "" {
+				continue
+			}
+			clean, err := gitClean(ctx, p.RepoRoot, slot.Path)
+			if err != nil || !clean {
+				continue
+			}
+			stamp := p.Now
+			if stamp == nil {
+				stamp = time.Now
+			}
+			slot.Purpose, slot.LeasedAt = purpose, stamp().UTC()
+			slot.LeaseID = fmt.Sprintf("%s-%d", slot.Name, slot.LeasedAt.UnixNano())
+			copy := *slot
+			result = &copy
+			return p.writeState(state)
+		}
+		return fmt.Errorf("worktree pool: reclaimed %d dead lease(s) but no slot became leasable", len(reclaimed))
 	})
 	return result, err
+}
+
+// reclaimDeadLocked frees leases whose holder is no longer live. The caller
+// must hold the pool lock and must persist state afterwards. It returns the
+// names of the slots it freed.
+//
+// A slot whose reset fails keeps its lease: handing out a dirty tree is worse
+// than reporting the pool full, because the reviewer would read the wrong
+// content and its verdict would be about a commit nobody asked for.
+func (p *Pool) reclaimDeadLocked(ctx context.Context, state poolState) ([]string, error) {
+	if p.HolderLive == nil {
+		return nil, nil
+	}
+	base := p.DefaultBase
+	if base == "" {
+		base = "origin/main"
+	}
+	var freed []string
+	for i := range state.Slots {
+		slot := &state.Slots[i]
+		if slot.LeaseID == "" {
+			continue
+		}
+		// An empty purpose cannot be attributed to any holder, so it can never
+		// be proven live and would otherwise be held forever.
+		if strings.TrimSpace(slot.Purpose) != "" && p.HolderLive(slot.Purpose) {
+			continue
+		}
+		if out, err := exec.CommandContext(ctx, "git", "-C", slot.Path, "reset", "--hard", base).CombinedOutput(); err != nil {
+			return freed, fmt.Errorf("worktree pool: reclaim reset %s: %v (%s)", slot.Name, err, strings.TrimSpace(string(out)))
+		}
+		if out, err := exec.CommandContext(ctx, "git", "-C", slot.Path, "clean", "-fd").CombinedOutput(); err != nil {
+			return freed, fmt.Errorf("worktree pool: reclaim clean %s: %v (%s)", slot.Name, err, strings.TrimSpace(string(out)))
+		}
+		clean, err := gitClean(ctx, p.RepoRoot, slot.Path)
+		if err != nil {
+			return freed, err
+		}
+		if !clean {
+			continue
+		}
+		slot.Purpose, slot.LeaseID = "", ""
+		slot.LeasedAt = time.Time{}
+		freed = append(freed, slot.Name)
+	}
+	return freed, nil
+}
+
+// ReclaimDead frees every lease whose holder is no longer live and reports the
+// slots it freed. Exposed so an operator or a sweep can unstick the pool
+// without taking a lease.
+func (p *Pool) ReclaimDead(ctx context.Context) ([]string, error) {
+	var freed []string
+	err := p.withLock(func() error {
+		state, err := p.readState()
+		if err != nil {
+			return err
+		}
+		freed, err = p.reclaimDeadLocked(ctx, state)
+		if err != nil {
+			return err
+		}
+		if len(freed) == 0 {
+			return nil
+		}
+		return p.writeState(state)
+	})
+	return freed, err
 }
 
 // Release resets a leased slot to the configured base and verifies it is
