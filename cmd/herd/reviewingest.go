@@ -1,12 +1,15 @@
 package main
 
 import (
+	"bufio"
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/Kampe/Herdforge/pkg/harvestmerge"
@@ -74,7 +77,16 @@ func runReviewIngest() {
 		return
 	}
 	if len(files) == 0 {
-		fmt.Fprintln(os.Stderr, "usage: herd review-ingest <verdict-artifact>... [--dry-run]")
+		// An empty --sweep is a CLEAN INBOX, which is the healthy steady state and
+		// the whole point of running it on a schedule. Reporting it as a usage
+		// error with exit 2 would make every quiet run look like a broken command
+		// and train the operator (or a cron) to ignore the one signal that says
+		// the queue is drained.
+		if parsed.sweep {
+			fmt.Println("herd review-ingest: sweep found no uningested verdicts (inbox is drained)")
+			return
+		}
+		fmt.Fprintln(os.Stderr, "usage: herd review-ingest (<verdict-artifact>... | --sweep) [--dry-run]")
 		os.Exit(2)
 	}
 
@@ -281,7 +293,10 @@ func runReviewIngest() {
 }
 
 type reviewIngestArgs struct {
-	dryRun     bool
+	dryRun bool
+	// sweep discovers the uningested artifacts itself instead of requiring the
+	// caller to enumerate them (FAC-606).
+	sweep      bool
 	audit      bool
 	auditRoot  string
 	ledgerPath string
@@ -316,6 +331,8 @@ func parseReviewIngestArgs(args []string) (reviewIngestArgs, error) {
 			parsed.asJSON = true
 		case arg == "--dry-run" || arg == "-dry-run":
 			parsed.dryRun = true
+		case arg == "--sweep" || arg == "-sweep":
+			parsed.sweep = true
 		case arg == "--audit" || arg == "-audit":
 			parsed.audit = true
 		case strings.HasPrefix(arg, "--audit-root="):
@@ -338,6 +355,23 @@ func parseReviewIngestArgs(args []string) (reviewIngestArgs, error) {
 			return reviewIngestArgs{}, fmt.Errorf("unknown flag %q", arg)
 		}
 	}
+	if parsed.sweep && parsed.audit {
+		return reviewIngestArgs{}, fmt.Errorf("--sweep and --audit are mutually exclusive")
+	}
+	if parsed.sweep && len(parsed.files) != 0 {
+		return reviewIngestArgs{}, fmt.Errorf("--sweep discovers artifacts itself; do not also name them")
+	}
+	if parsed.sweep {
+		found, err := sweepUningestedArtifacts(parsed.auditRoot, parsed.ledgerPath)
+		if err != nil {
+			return reviewIngestArgs{}, err
+		}
+		// An empty sweep is a legitimate clean result, not a usage error. The
+		// files==0 check below would otherwise print the usage line and exit
+		// non-zero on a healthy inbox, which reads as a broken command.
+		parsed.files = found
+		return parsed, nil
+	}
 	if parsed.audit && parsed.dryRun {
 		return reviewIngestArgs{}, fmt.Errorf("--audit and --dry-run are mutually exclusive")
 	}
@@ -345,9 +379,88 @@ func parseReviewIngestArgs(args []string) (reviewIngestArgs, error) {
 		return reviewIngestArgs{}, fmt.Errorf("--audit cannot be combined with verdict artifacts")
 	}
 	if !parsed.audit && len(parsed.files) == 0 {
-		return reviewIngestArgs{}, fmt.Errorf("usage: herd review-ingest <verdict-artifact>... [--dry-run]")
+		return reviewIngestArgs{}, fmt.Errorf("usage: herd review-ingest (<verdict-artifact>... | --sweep) [--dry-run]")
 	}
 	return parsed, nil
+}
+
+// sweepUningestedArtifacts lists inbox verdicts that the ledger has never
+// recorded.
+//
+// FAC-606: review-ingest required EXPLICIT paths and never scanned, so a verdict
+// landing in the inbox was inert until a human or agent enumerated it by hand.
+// 89 finished reviews were found sitting there, unowned -- reviews that had
+// really run, against real candidates, producing nothing. Instructing the fleet
+// to enumerate the inbox every beat did not hold: the pile rebuilt to the same 89
+// within the hour. A discovery step that must be remembered is not a discovery
+// step.
+//
+// Membership is decided on the artifact BASENAME, because the ledger records the
+// path as it was at ingest time and reviewers on a second host write under a
+// different absolute prefix. Comparing full paths would re-ingest every remote
+// verdict on every sweep.
+func sweepUningestedArtifacts(reviewRoot, ledgerPath string) ([]string, error) {
+	inbox := filepath.Join(reviewRoot, "inbox")
+	entries, err := os.ReadDir(inbox)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("read review inbox %s: %w", inbox, err)
+	}
+	seen, err := ledgerArtifactBasenames(ledgerPath)
+	if err != nil {
+		// Fail closed. An unreadable ledger means every artifact looks unseen, and
+		// sweeping on that assumption would re-ingest the entire corpus.
+		return nil, fmt.Errorf("read review ledger %s: %w", ledgerPath, err)
+	}
+	var out []string
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() || !strings.HasSuffix(name, ".md") {
+			continue
+		}
+		if _, ok := seen[name]; ok {
+			continue
+		}
+		out = append(out, filepath.Join(inbox, name))
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
+func ledgerArtifactBasenames(ledgerPath string) (map[string]struct{}, error) {
+	seen := map[string]struct{}{}
+	f, err := os.Open(ledgerPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			// No ledger yet is a real, readable state: nothing has been ingested.
+			return seen, nil
+		}
+		return nil, err
+	}
+	defer f.Close()
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 0, 256*1024), 4*1024*1024)
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if line == "" {
+			continue
+		}
+		var row struct {
+			Artifact string `json:"artifact"`
+		}
+		if err := json.Unmarshal([]byte(line), &row); err != nil {
+			continue
+		}
+		if a := strings.TrimSpace(row.Artifact); a != "" {
+			seen[filepath.Base(a)] = struct{}{}
+		}
+	}
+	if err := sc.Err(); err != nil {
+		return nil, err
+	}
+	return seen, nil
 }
 
 type reviewIngestLedger interface {
