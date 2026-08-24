@@ -179,7 +179,24 @@ func runPoolReview(ref string) error {
 		return err
 	}
 	tabLabel := reviewTabLabel(ref, sha)
-	tab, err := herdr.TabCreate(herdr.TabCreateOptions{Workspace: ws, Label: tabLabel, Cwd: surface, NoFocus: true, Env: []string{herdr.AgentRoleEnv}})
+	// FAC-592: the tab cwd MUST be absolute. --surface-root defaults to the
+	// relative ".herd/review-surfaces", and herdr cannot resolve a relative cwd
+	// against this process's directory, so it silently started the reviewer in
+	// $HOME. A reviewer sitting in $HOME reads a tree that has nothing to do
+	// with the candidate and still writes a verdict — the worst possible
+	// outcome, because the artifact looks legitimate. Observed live: two lanes
+	// with cwd=/Users/kampe while their surface symlinks were perfectly correct.
+	//
+	// Verified absolute rather than assumed: a cwd that cannot be resolved must
+	// fail the launch, never fall back to somewhere plausible.
+	surfaceAbs, err := filepath.Abs(surface)
+	if err != nil {
+		return fmt.Errorf("resolve review surface for reviewer cwd: %w", err)
+	}
+	if st, statErr := os.Stat(surfaceAbs); statErr != nil || !st.IsDir() {
+		return fmt.Errorf("reviewer cwd %q does not resolve to a directory: %v", surfaceAbs, statErr)
+	}
+	tab, err := herdr.TabCreate(herdr.TabCreateOptions{Workspace: ws, Label: tabLabel, Cwd: surfaceAbs, NoFocus: true, Env: []string{herdr.AgentRoleEnv}})
 	if err != nil {
 		return fmt.Errorf("create reviewer tab: %w", err)
 	}
@@ -201,7 +218,21 @@ func runPoolReview(ref string) error {
 	if err := herdr.StartReviewAgent(tab.ID, agentName, tab.Pane.ID, reviewer.Kind, reviewer.LaunchFlags()...); err != nil {
 		return fmt.Errorf("start %s reviewer (%s): %w", reviewer.Kind, reviewer.Model, err)
 	}
-	if _, err := herdr.Send(agentName, "Read and execute the review packet at "+packet+" in full.", true, 30*time.Second); err != nil {
+	// FAC-592: the delivered path must be ABSOLUTE. --packet-root defaults to the
+	// relative ".herd/review-packets", and the reviewer resolves it against its
+	// own cwd — which is the pool slot, not the repo root, so the packet is not
+	// there. A reviewer whose cwd fell back to $HOME looked for
+	// ~/.herd/review-packets/... and correctly refused to execute a different
+	// file instead. An absolute path removes the ambiguity entirely rather than
+	// depending on where the reviewer happens to stand.
+	packetAbs, err := filepath.Abs(packet)
+	if err != nil {
+		return errors.Join(fmt.Errorf("resolve review packet path: %w", err), herdr.CloseReviewTab(tab.ID, agentName))
+	}
+	if _, statErr := os.Stat(packetAbs); statErr != nil {
+		return errors.Join(fmt.Errorf("review packet %q is not readable: %w", packetAbs, statErr), herdr.CloseReviewTab(tab.ID, agentName))
+	}
+	if _, err := herdr.Send(agentName, "Read and execute the review packet at "+packetAbs+" in full.", true, 30*time.Second); err != nil {
 		return errors.Join(fmt.Errorf("deliver review packet: %w", err), herdr.CloseReviewTab(tab.ID, agentName))
 	}
 	cleanupTab = false
