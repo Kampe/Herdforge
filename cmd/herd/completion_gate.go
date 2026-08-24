@@ -348,7 +348,7 @@ func useHarnessHooksFromWorktree(wt string) func() {
 	if strings.TrimSpace(os.Getenv("HERD_HARNESS_HOOKS_FILE")) != "" {
 		return func() {}
 	}
-	path := filepath.Join(wt, ".herd", "harness-hooks.json")
+	path := filepath.Join(wt, ".herd", harnessHooksLeaf)
 	if info, err := os.Stat(path); err != nil || !info.Mode().IsRegular() {
 		return func() {}
 	}

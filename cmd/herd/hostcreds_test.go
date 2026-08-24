@@ -25,22 +25,45 @@ func TestHostCredsCLI_Selftest(t *testing.T) {
 	}
 }
 
-func TestHostCredsCLI_DiagnoseBlockedWithoutKeys(t *testing.T) {
+// FAC-614: this was TestHostCredsCLI_DiagnoseBlockedWithoutKeys, and it asserted
+// that `hostcreds diagnose --kind grok` exits 2 BLOCKED when the API-key
+// environment variables are absent.
+//
+// FAC-587 deliberately removed that behaviour. Every kind this fleet launches --
+// claude, grok, codex, agy -- is harness-authenticated: it holds its own CLI
+// login session and never presents a brokered host credential, so the absence of
+// XAI_API_KEY is not evidence of anything. The old test filtered env vars and
+// read that absence as "no credentials", which is the same category error
+// FAC-587 fixed in the product code, left behind in its test.
+//
+// It has failed on origin/main ever since, on any host and in CI, and its name
+// asserted a contract the code had stopped honouring.
+//
+// What is actually contractual now: a harness-authenticated kind reports OK via
+// native_auth without env keys, and the real blocker -- a harness that is present
+// but logged OUT -- is still a blocker. The second half is the safety property
+// worth keeping, so it is asserted rather than dropped.
+func TestHostCredsCLI_HarnessKindIsNativeAuthWithoutEnvKeys(t *testing.T) {
 	bin := buildHerdForHostCreds(t)
 	cmd := exec.Command(bin, "hostcreds", "diagnose", "--kind", "grok")
 	cmd.Env = filterEnv(os.Environ(), "XAI_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "HERD_HOST_CREDS")
 	out, err := cmd.CombinedOutput()
-	if err == nil {
-		t.Fatalf("expected non-zero exit without keys; out=%s", out)
-	}
-	ee, ok := err.(*exec.ExitError)
-	if !ok || ee.ExitCode() != 2 {
-		t.Fatalf("want exit 2 BLOCKED, got %v out=%s", err, out)
-	}
 	s := string(out)
-	if !strings.Contains(s, "BLOCKED") {
-		t.Fatalf("want BLOCKED packet: %s", s)
+
+	// A logged-out harness is a genuine blocker and this host may legitimately be
+	// in that state, so accept it explicitly rather than letting it fail as a
+	// surprise.
+	if err != nil {
+		if !strings.Contains(s, "BLOCKED") {
+			t.Fatalf("non-zero exit must carry a BLOCKED packet: %s", s)
+		}
+		if !strings.Contains(s, "logged") && !strings.Contains(s, "login") {
+			t.Fatalf("the only legitimate blocker for a harness kind is a logged-out harness: %s", s)
+		}
+	} else if !strings.Contains(s, "native_auth") {
+		t.Fatalf("a harness-authenticated kind without env keys must report native_auth, got: %s", s)
 	}
+
 	if strings.Contains(s, "sk-") {
 		t.Fatal("secret shape in diagnose output")
 	}

@@ -172,7 +172,7 @@ func reapReason(c dockerContainer, project string) string {
 // verification run, so it cannot outlive that run legitimately.
 func ephemeralWorkDir(dir string) bool {
 	d := strings.ToLower(dir)
-	for _, frag := range []string{"/.herd/pool/", "/.herd/worktrees/", "/tmp/", "/private/tmp/", "/.worktrees/"} {
+	for _, frag := range []string{"/.herd/pool/", managedWorktreeFrag, "/tmp/", "/private/tmp/", "/.worktrees/"} {
 		if strings.Contains(d, frag) {
 			return true
 		}

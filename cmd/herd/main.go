@@ -9907,7 +9907,7 @@ func isManagedWorktree(path string) bool {
 	if err != nil {
 		abs = path
 	}
-	return strings.Contains(filepath.ToSlash(abs), "/.herd/worktrees/")
+	return strings.Contains(filepath.ToSlash(abs), managedWorktreeFrag)
 }
 
 // runToolProbe (FAC-96): `herd tool-probe <model>` exits 0 only if the model
