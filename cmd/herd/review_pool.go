@@ -716,7 +716,40 @@ func reviewSupervisorTarget() string {
 	if v := strings.TrimSpace(os.Getenv("HERD_REVIEW_SUPERVISOR")); v != "" {
 		return v
 	}
-	return standing.AgentName("review-supervisor")
+	canonical := standing.AgentName("review-supervisor")
+	// FAC-616: the canonical lane name is NOT the live agent name. Live agents
+	// carry a per-launch suffix -- the running supervisor is
+	// forge-review-harvest-su-467b70d7, not forge-review-supervisor -- so
+	// FAC-603's "report home" instruction addressed a mailbox nobody drains.
+	// Mail sent there sat unread for four days. A fix that turns completion into
+	// an event is worthless if the event is delivered to a dead letterbox.
+	//
+	// Resolve the live lane by prefix and fall back to the canonical name only
+	// when nothing is running, so the packet still names something meaningful in
+	// a cold fleet.
+	if live := liveAgentByPrefix("forge-review-harvest", "forge-review-supervisor", canonical); live != "" {
+		return live
+	}
+	return canonical
+}
+
+// liveAgentByPrefix returns the first live agent whose name starts with any of
+// the given prefixes, preferring earlier prefixes. An unreachable herdr yields
+// "" so the caller falls back rather than guessing.
+func liveAgentByPrefix(prefixes ...string) string {
+	agents, err := herdr.AgentList()
+	if err != nil {
+		return ""
+	}
+	for _, prefix := range prefixes {
+		for _, a := range agents {
+			name := strings.TrimSpace(a.Name)
+			if name != "" && strings.HasPrefix(name, prefix) {
+				return name
+			}
+		}
+	}
+	return ""
 }
 
 func reviewPacketBody(ref, sha, surface, verdictPath, supervisor, builderFamily string) string {
