@@ -583,11 +583,11 @@ func newDrainAdapters(root, ledgerPath string, cfg *config.Config, tp provider.T
 	}
 	repository := repositoryIdentityForLaunch(cfg)
 	a := &drainAdapters{
-		root:        root,
-		project:     project,
-		repository:  repository,
-		cap:         reviewCap,
-		lane:        lane,
+		root:       root,
+		project:    project,
+		repository: repository,
+		cap:        reviewCap,
+		lane:       lane,
 		// FAC-547: adopt a legacy-named live supervisor rather than targeting
 		// a qualified name no agent holds.
 		supervisor:  drainLiveAgentName(supervisorLane.Name, repository),

@@ -33,8 +33,8 @@ func TestBothHandoffsSurvive(t *testing.T) {
 	defi := commitsN("d", 2)
 
 	for _, h := range []struct {
-		lane     string
-		commits  []harvest.UnlandedCommit
+		lane    string
+		commits []harvest.UnlandedCommit
 	}{{"forge-api-crusader", api}, {"forge-defi-crusader", defi}} {
 		queued, err := enqueueReviewHandoff(context.Background(), mailPath, "pulse", supervisor,
 			"PULSE REVIEW HANDOFF "+h.lane, "body for "+h.lane,
