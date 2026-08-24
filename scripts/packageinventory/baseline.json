@@ -4,9 +4,9 @@
   "generated_by": "scripts/packageinventory/inventory.go",
   "class_counts": {
     "internal": 1,
-    "production": 93,
+    "production": 98,
     "secondary": 1,
-    "unwired": 23
+    "unwired": 24
   },
   "packages": [
     {
@@ -78,6 +78,12 @@
     {
       "path": "github.com/Kampe/Herdforge/pkg/buildherd",
       "class": "unwired",
+      "test_importers": 0,
+      "has_own_tests": true
+    },
+    {
+      "path": "github.com/Kampe/Herdforge/pkg/candidate",
+      "class": "production",
       "test_importers": 0,
       "has_own_tests": true
     },
@@ -238,6 +244,12 @@
       "has_own_tests": true
     },
     {
+      "path": "github.com/Kampe/Herdforge/pkg/gitroot",
+      "class": "production",
+      "test_importers": 0,
+      "has_own_tests": true
+    },
+    {
       "path": "github.com/Kampe/Herdforge/pkg/goalguard",
       "class": "production",
       "test_importers": 2,
@@ -252,7 +264,7 @@
     {
       "path": "github.com/Kampe/Herdforge/pkg/harness",
       "class": "production",
-      "test_importers": 1,
+      "test_importers": 2,
       "has_own_tests": true
     },
     {
@@ -271,6 +283,12 @@
       "path": "github.com/Kampe/Herdforge/pkg/herdr",
       "class": "production",
       "test_importers": 5,
+      "has_own_tests": true
+    },
+    {
+      "path": "github.com/Kampe/Herdforge/pkg/invariant",
+      "class": "unwired",
+      "test_importers": 0,
       "has_own_tests": true
     },
     {
@@ -432,13 +450,19 @@
     {
       "path": "github.com/Kampe/Herdforge/pkg/quotasup",
       "class": "production",
-      "test_importers": 0,
+      "test_importers": 1,
       "has_own_tests": true
     },
     {
       "path": "github.com/Kampe/Herdforge/pkg/recovery",
       "class": "production",
       "test_importers": 2,
+      "has_own_tests": true
+    },
+    {
+      "path": "github.com/Kampe/Herdforge/pkg/refname",
+      "class": "production",
+      "test_importers": 1,
       "has_own_tests": true
     },
     {
@@ -492,7 +516,7 @@
     {
       "path": "github.com/Kampe/Herdforge/pkg/reviewingest",
       "class": "production",
-      "test_importers": 0,
+      "test_importers": 1,
       "has_own_tests": true
     },
     {
@@ -505,6 +529,12 @@
       "path": "github.com/Kampe/Herdforge/pkg/reviewledger",
       "class": "production",
       "test_importers": 5,
+      "has_own_tests": true
+    },
+    {
+      "path": "github.com/Kampe/Herdforge/pkg/reviewroot",
+      "class": "production",
+      "test_importers": 1,
       "has_own_tests": true
     },
     {
@@ -594,7 +624,7 @@
     {
       "path": "github.com/Kampe/Herdforge/pkg/standing",
       "class": "production",
-      "test_importers": 2,
+      "test_importers": 1,
       "has_own_tests": true
     },
     {
@@ -655,6 +685,12 @@
       "path": "github.com/Kampe/Herdforge/pkg/toolprobe",
       "class": "production",
       "test_importers": 3,
+      "has_own_tests": true
+    },
+    {
+      "path": "github.com/Kampe/Herdforge/pkg/transcript",
+      "class": "production",
+      "test_importers": 0,
       "has_own_tests": true
     },
     {
