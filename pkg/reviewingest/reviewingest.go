@@ -65,6 +65,17 @@ func Parse(text string) Artifact {
 	// A BOM makes the first key parse as "\ufeffsha", which ends the header
 	// region and reports a missing sha instead of the real cause.
 	text = strings.TrimPrefix(text, "\ufeff")
+	// FAC-584: accept the universal YAML convention of OPENING with `---`.
+	// Without this, a leading delimiter ends the header region on line 1, every
+	// real header is swallowed as body, and the artifact is refused for a
+	// "missing sha" that is sitting right there in the file. Reviewers who wrote
+	// textbook front matter were the ones punished: a finished cross-family PASS
+	// on PR-3114 was refused exactly this way.
+	//
+	// Only ONE leading delimiter is consumed, and only as the first non-empty
+	// line, so a document whose body genuinely starts with `---` still yields an
+	// empty header region and fails closed as before.
+	text = cutLeadingDelimiter(text)
 	sc := bufio.NewScanner(strings.NewReader(text))
 	sc.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
 	inBody := false
@@ -330,4 +341,36 @@ func inferTaskRef(body, reviewer string) string {
 		return NormalizeTaskRef(strings.ReplaceAll(m[1], "_", "-"))
 	}
 	return ""
+}
+
+// cutLeadingDelimiter removes a single opening `---` fence, plus any blank
+// lines above it, so that both accepted front-matter shapes parse identically:
+//
+//	sha: ...        and     ---
+//	---                     sha: ...
+//	body                    ---
+//	                        body
+//
+// It is intentionally conservative: it consumes at most one delimiter and only
+// when that delimiter is the first non-empty line. Anything else is left for
+// the existing header scan, which fails closed on a malformed region.
+func cutLeadingDelimiter(text string) string {
+	rest := strings.TrimLeft(text, "\r\n\t ")
+	if !strings.HasPrefix(rest, "---") {
+		return text
+	}
+	// Must be a bare delimiter line, not a `---foo` header-ish line.
+	nl := strings.IndexAny(rest, "\r\n")
+	first := rest
+	if nl >= 0 {
+		first = rest[:nl]
+	}
+	if strings.TrimSpace(first) != "---" {
+		return text
+	}
+	if nl < 0 {
+		// A document that is only a delimiter has no headers and no body.
+		return ""
+	}
+	return strings.TrimLeft(rest[nl:], "\r\n")
 }
