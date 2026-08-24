@@ -239,6 +239,21 @@ func runPoolReview(ref string) error {
 	if err := herdr.StartReviewAgent(tab.ID, agentName, tab.Pane.ID, reviewer.Kind, reviewer.LaunchFlags()...); err != nil {
 		return fmt.Errorf("start %s reviewer (%s): %w", reviewer.Kind, reviewer.Model, err)
 	}
+	// FAC-601: wait for the harness to actually accept input before delivering
+	// the packet. StartReviewAgent proves the agent is LISTED and its pane
+	// exists; it never proved the TUI was ready. Sending immediately raced
+	// through on this warm host and failed every time on the WSL review node,
+	// where claude needs about six seconds to become interactive: the packet
+	// landed in a TUI that was not accepting input, was dropped, and the launch
+	// reported queued-but-not-consumed with the pane still idle.
+	//
+	// A readiness timeout is NOT fatal here. The delivery below has its own
+	// verification with a real consumption check, so the worst case of
+	// proceeding is the same error we already report — whereas refusing on a
+	// slow-but-healthy harness would throw away a working reviewer.
+	if _, readyErr := herdr.AwaitInteractiveReady(agentName, 30*time.Second); readyErr != nil {
+		fmt.Fprintf(os.Stderr, "review --pool: %s not interactive yet (%v); delivering anyway\n", agentName, readyErr)
+	}
 	// FAC-592: the delivered path must be ABSOLUTE. --packet-root defaults to the
 	// relative ".herd/review-packets", and the reviewer resolves it against its
 	// own cwd — which is the pool slot, not the repo root, so the packet is not
