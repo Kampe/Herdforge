@@ -117,8 +117,20 @@ func ModelFor(provider, shape string) string {
 	switch provider + ":" + shape {
 	case "claude:coordinator":
 		return "claude-fable-5"
-	case "claude:architecture", "claude:qa", "claude:adversarial":
+	case "claude:architecture", "claude:adversarial":
 		return "claude-opus-5"
+	case "claude:qa":
+		// FAC-595: reviews run on Sonnet, by operator policy. `qa` is the shape
+		// every review lane resolves through, so pinning it to Opus put the
+		// fleet's highest-volume workload on its most expensive model — claude
+		// reached 74% of its weekly window while codex sat at 0% and grok at 1%.
+		//
+		// architecture and adversarial keep Opus: those are low-volume,
+		// deep-reasoning shapes where the spend is the point. Review throughput
+		// is the opposite — many candidates, bounded diffs, and a verdict
+		// contract Sonnet satisfies. Spelled out as its own case so this reads
+		// as a deliberate pin rather than a downgrade by omission.
+		return "claude-sonnet-5"
 	case "claude:qa-light", "claude:bounded":
 		return "claude-haiku-4-5"
 	}
