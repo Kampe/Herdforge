@@ -40,8 +40,8 @@ import (
 	"github.com/Kampe/Herdforge/pkg/dispatch"
 	"github.com/Kampe/Herdforge/pkg/envplan"
 	"github.com/Kampe/Herdforge/pkg/feedback"
-	"github.com/Kampe/Herdforge/pkg/goalguard"
 	"github.com/Kampe/Herdforge/pkg/gitroot"
+	"github.com/Kampe/Herdforge/pkg/goalguard"
 	"github.com/Kampe/Herdforge/pkg/harvest"
 	"github.com/Kampe/Herdforge/pkg/herdr"
 	"github.com/Kampe/Herdforge/pkg/kick"
@@ -1823,9 +1823,9 @@ func runStandingConfigMode(cfg *config.Config, herdrAvailable bool, mode standin
 		// returns an error when it cannot tell, so those fields are omitted
 		// rather than emitted as a plausible empty string.
 		WorktreeHead: worktreeHeadFor,
-		Only:     only,
-		Quiet:    quiet,
-		RepoRoot: ".",
+		Only:         only,
+		Quiet:        quiet,
+		RepoRoot:     ".",
 		ListAgents: func() ([]standing.Agent, error) {
 			// Policy unit tests pass herdrAvailable=true without a live
 			// herdr binary; an empty inventory is correct until a real
@@ -10722,6 +10722,18 @@ func deriveAutoMaxLanes(ctx context.Context, cfg *config.Config, tp provider.Tas
 	if err := json.Unmarshal(body, &snapshot); err != nil {
 		return 0, fmt.Errorf("decode live quota snapshot: %w", err)
 	}
+	// FAC-593: refuse to plan capacity from a stale snapshot. This path called
+	// PlanLanes with no age check at all, while pkg/quotasup gates every other
+	// consumer at DefaultMaxObservationAge. A four-day-old snapshot on this fleet
+	// still asserted grok exhausted at 100% and claude blocked, when live grok
+	// was 1% used and codex 0% — so every lane piled onto claude until it hit
+	// 74% while two full pools sat idle.
+	//
+	// Fail closed rather than plan from fiction: a wrong capacity plan spends
+	// real quota on the wrong surface, and the fix is one refresh away.
+	if err := quotaSnapshotFresh(snapshot, quotasup.DefaultMaxObservationAge); err != nil {
+		return 0, err
+	}
 	roster := make([]string, 0, len(cfg.Lanes))
 	for _, lane := range cfg.Lanes {
 		if !lane.Standing && strings.EqualFold(strings.TrimSpace(lane.Role), "worker") {
@@ -10922,7 +10934,7 @@ func forgeLoopMain() int {
 
 	fmt.Printf("herd forge --loop: max-lanes=%d interval=%ds — driving the board autonomously\n", maxLanes, *interval)
 	err = eng.ForgeLoop(ctx, driver, daemon.ForgeLoopOptions{
-		Interval:               time.Duration(*interval) * time.Second,
+		Interval: time.Duration(*interval) * time.Second,
 		// FAC-433: --loop=false means a single tick. An explicit --ticks still
 		// wins, so the two do not fight; --loop=false only supplies the bound
 		// the operator clearly intended when they asked not to loop.
