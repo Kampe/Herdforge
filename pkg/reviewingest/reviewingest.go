@@ -149,6 +149,19 @@ func Parse(text string) Artifact {
 			case "retry-of":
 				a.RetryOf = value
 			default:
+				// FAC-590: an ADVISORY key is accepted and ignored rather than
+				// refused. The unknown-key gate exists to catch a MISSPELLED gate
+				// key, because a typo'd `reviewed-head` silently disables the
+				// wandering-reviewer check. It was never meant to discard a whole
+				// verdict over an extra informational line, and reviewers keep
+				// emitting `merge-recommendation` on their own — real FAIL verdicts
+				// for CHA-2701 and CHA-2703 died at ingest for exactly that.
+				//
+				// Only keys that are NOT near-misses of a gate key qualify, so a
+				// typo of a real key still lands in UnknownHeaders and is refused.
+				if advisoryHeader(name) {
+					continue
+				}
 				if unknownHeaderRe.MatchString(name) {
 					a.UnknownHeaders = append(a.UnknownHeaders, name)
 				}
@@ -373,4 +386,78 @@ func cutLeadingDelimiter(text string) string {
 		return ""
 	}
 	return strings.TrimLeft(rest[nl:], "\r\n")
+}
+
+// advisoryHeaders are keys reviewers volunteer that carry no gate. They are
+// accepted and ignored so an extra line cannot discard a finished verdict.
+//
+// Each entry must be safe to IGNORE. Nothing here may gate admission, or
+// tolerating a typo of it would silently disable that gate — which is the exact
+// failure the unknown-key refusal exists to prevent.
+var advisoryHeaders = map[string]bool{
+	"merge-recommendation": true,
+	"recommendation":       true,
+	"confidence":           true,
+	"skills-used":          true,
+	"model-family":         true,
+	"provider":             true,
+	"model":                true,
+}
+
+// gateHeaders are the keys that DO gate admission. An advisory key that is a
+// near-miss of one of these is refused rather than ignored, so a typo cannot
+// smuggle itself in as harmless.
+var gateHeaders = []string{
+	"sha", "branch", "task", "task-id", "card", "ticket", "reviewer",
+	"authority", "asserting-authority", "reviewer-family", "builder-family",
+	"verdict", "reviewed-head", "retry-of",
+}
+
+// advisoryHeader reports whether a key may be accepted and ignored.
+func advisoryHeader(name string) bool {
+	if !advisoryHeaders[name] {
+		return false
+	}
+	// Defence in depth: never treat something one edit away from a gate key as
+	// advisory, even if it were listed above by mistake.
+	for _, gate := range gateHeaders {
+		if nearMiss(name, gate) {
+			return false
+		}
+	}
+	return true
+}
+
+// nearMiss reports whether a and b differ by at most one character edit. It is
+// a bounded check, not a general distance: only length differences of 0 or 1
+// can qualify, which is all a typo of a short key can be.
+func nearMiss(a, b string) bool {
+	if a == b {
+		return true
+	}
+	if len(a) == len(b) {
+		diff := 0
+		for i := range a {
+			if a[i] != b[i] {
+				diff++
+				if diff > 1 {
+					return false
+				}
+			}
+		}
+		return diff == 1
+	}
+	longer, shorter := a, b
+	if len(b) > len(a) {
+		longer, shorter = b, a
+	}
+	if len(longer)-len(shorter) != 1 {
+		return false
+	}
+	for i := 0; i < len(longer); i++ {
+		if longer[:i]+longer[i+1:] == shorter {
+			return true
+		}
+	}
+	return false
 }
