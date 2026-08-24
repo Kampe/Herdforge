@@ -9,8 +9,8 @@ import (
 )
 
 const (
-	Window5h      = 18000
-	WindowWeekly  = 604800
+	Window5h            = 18000
+	WindowWeekly        = 604800
 	DefaultExhaustedPct = 95.0
 )
 
@@ -25,28 +25,28 @@ const (
 )
 
 type BurnState struct {
-	Resource         string    `json:"resource"`
-	Window           string    `json:"window"`
-	WindowSeconds    int       `json:"windowSeconds"`
-	Used             float64   `json:"used"`
-	Remaining        float64   `json:"remaining"`
-	ResetsAt         string    `json:"resetsAt,omitempty"`
-	ResetsIn         string    `json:"resetsIn"`
-	Class            BurnClass `json:"class"`
-	Pace             int       `json:"pace"`
-	Pressure         float64   `json:"pressure"`
-	RunwayMinutes    *int      `json:"runwayMinutes,omitempty"`
-	ExhaustsBeforeReset *bool `json:"exhaustsBeforeReset,omitempty"`
-	SoonestResetWindow string  `json:"soonestResetWindow,omitempty"`
-	SoonestResetIn   string    `json:"soonestResetIn,omitempty"`
-	PressureResource string    `json:"pressureResource,omitempty"`
-	RunwayResource   string    `json:"runwayResource,omitempty"`
-	Available        bool      `json:"available"`
-	Reason           string    `json:"reason"`
-	Stale            bool      `json:"stale"`
-	Plan             string    `json:"plan,omitempty"`
-	Windows          []BurnState `json:"windows,omitempty"`
-	Pools            map[string]BurnState `json:"pools,omitempty"`
+	Resource            string               `json:"resource"`
+	Window              string               `json:"window"`
+	WindowSeconds       int                  `json:"windowSeconds"`
+	Used                float64              `json:"used"`
+	Remaining           float64              `json:"remaining"`
+	ResetsAt            string               `json:"resetsAt,omitempty"`
+	ResetsIn            string               `json:"resetsIn"`
+	Class               BurnClass            `json:"class"`
+	Pace                int                  `json:"pace"`
+	Pressure            float64              `json:"pressure"`
+	RunwayMinutes       *int                 `json:"runwayMinutes,omitempty"`
+	ExhaustsBeforeReset *bool                `json:"exhaustsBeforeReset,omitempty"`
+	SoonestResetWindow  string               `json:"soonestResetWindow,omitempty"`
+	SoonestResetIn      string               `json:"soonestResetIn,omitempty"`
+	PressureResource    string               `json:"pressureResource,omitempty"`
+	RunwayResource      string               `json:"runwayResource,omitempty"`
+	Available           bool                 `json:"available"`
+	Reason              string               `json:"reason"`
+	Stale               bool                 `json:"stale"`
+	Plan                string               `json:"plan,omitempty"`
+	Windows             []BurnState          `json:"windows,omitempty"`
+	Pools               map[string]BurnState `json:"pools,omitempty"`
 }
 
 type QuotaEngine struct {
@@ -68,7 +68,7 @@ func (e *QuotaEngine) now() time.Time {
 
 func NewQuotaEngine() *QuotaEngine {
 	return &QuotaEngine{
-		ExhaustedPct:  DefaultExhaustedPct,
+		ExhaustedPct: DefaultExhaustedPct,
 		AliasProvider: func(name string) string {
 			if name == "agy" {
 				return "antigravity"
@@ -154,10 +154,32 @@ func computeBinding(prov ProviderUsage, resourceNames map[string]bool, exhausted
 		if !ok {
 			continue
 		}
-		if r.Used == 0 || r.Unit != "percent" {
+		// FAC-596: zero usage IS data, and the most useful kind. Skipping it
+		// conflated "this resource reports nothing" with "this resource reports
+		// nothing used", so a completely unused provider produced an empty
+		// window set, computeBinding returned nil, and decorate reported
+		// no-quota-data — meaning unavailable.
+		//
+		// That was self-perpetuating: codex sat at 0% used, was therefore judged
+		// to have no quota data, was therefore never routed to, and therefore
+		// stayed at 0%. Meanwhile claude carried the whole fleet to 95% of its
+		// 5h window, and grok was usable only because it happened to have 0.03%
+		// on the clock. A provider with full headroom must be the most
+		// attractive surface, not an unusable one.
+		//
+		// The discriminator is whether the window proves itself LIVE, not whether
+		// it happens to be non-zero. A resource carrying a parseable reset
+		// timestamp is a real tracked window, so 0% used is a genuine reading. A
+		// 0%-used resource with no reset timestamp stays skipped: that is
+		// indistinguishable from absent data, which is the case the original
+		// guard was protecting against.
+		if r.Unit != "percent" {
 			continue
 		}
 		rin := resetsIn(r.ResetsAt, now)
+		if r.Used == 0 && rin == nil {
+			continue
+		}
 		cls, pace, pressure := classPace(r.Used, ws, r.ResetsAt, exhaustedPct, now)
 
 		var elapsedSeconds float64
@@ -188,17 +210,17 @@ func computeBinding(prov ProviderUsage, resourceNames map[string]bool, exhausted
 		}
 
 		windows = append(windows, BurnState{
-			Resource:      rk,
-			Window:        wn,
-			WindowSeconds: ws,
-			Used:          r.Used,
-			Remaining:     math.Max(100-r.Used, 0),
-			ResetsAt:      r.ResetsAt,
-			ResetsIn:      ri,
-			Class:         cls,
-			Pace:          pace,
-			Pressure:      pressure,
-			RunwayMinutes: runwayMinutes,
+			Resource:            rk,
+			Window:              wn,
+			WindowSeconds:       ws,
+			Used:                r.Used,
+			Remaining:           math.Max(100-r.Used, 0),
+			ResetsAt:            r.ResetsAt,
+			ResetsIn:            ri,
+			Class:               cls,
+			Pace:                pace,
+			Pressure:            pressure,
+			RunwayMinutes:       runwayMinutes,
 			ExhaustsBeforeReset: exhaustsBeforeReset,
 		})
 	}
@@ -242,20 +264,20 @@ func computeBinding(prov ProviderUsage, resourceNames map[string]bool, exhausted
 	}
 
 	result := BurnState{
-		Used:            b.Used,
-		Remaining:       b.Remaining,
-		Window:          b.Window,
-		WindowSeconds:   b.WindowSeconds,
-		Resource:        b.Resource,
-		ResetsAt:        b.ResetsAt,
-		ResetsIn:        b.ResetsIn,
+		Used:               b.Used,
+		Remaining:          b.Remaining,
+		Window:             b.Window,
+		WindowSeconds:      b.WindowSeconds,
+		Resource:           b.Resource,
+		ResetsAt:           b.ResetsAt,
+		ResetsIn:           b.ResetsIn,
 		SoonestResetWindow: soonestReset.Window,
-		SoonestResetIn:  soonestReset.ResetsIn,
-		Class:           burn.Class,
-		Pace:            burn.Pace,
-		Pressure:        burn.Pressure,
-		PressureResource: burn.Resource,
-		Windows:         windows,
+		SoonestResetIn:     soonestReset.ResetsIn,
+		Class:              burn.Class,
+		Pace:               burn.Pace,
+		Pressure:           burn.Pressure,
+		PressureResource:   burn.Resource,
+		Windows:            windows,
 	}
 	if runwayState != nil {
 		result.ExhaustsBeforeReset = boolPtr(true)

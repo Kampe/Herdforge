@@ -352,3 +352,68 @@ func TestComputeBinding_UntrackedWindow(t *testing.T) {
 		t.Errorf("expected untracked, got %s", bs.Class)
 	}
 }
+
+// FAC-596: zero usage is data, and the most useful kind. The old guard skipped
+// any resource at 0% used, so a completely unused provider yielded an empty
+// window set, computeBinding returned nil, and the provider was reported
+// no-quota-data — unavailable.
+//
+// That was self-perpetuating: codex sat at 0%, was judged to have no quota data,
+// was never routed to, and stayed at 0%, while claude carried the fleet to 95%
+// of its 5h window. grok was usable only because it happened to have 0.03% on
+// the clock.
+func TestComputeBindingAcceptsZeroUsageOnALiveWindow(t *testing.T) {
+	now := freezeTime()
+	prov := ProviderUsage{Resources: map[string]ResourceUsage{
+		"weekly": {
+			Unit:          "percent",
+			Used:          0,
+			WindowSeconds: WindowWeekly,
+			ResetsAt:      now.Add(72 * time.Hour).UTC().Format(time.RFC3339),
+		},
+	}}
+	bs := computeBinding(prov, nil, DefaultExhaustedPct, now)
+	if bs == nil {
+		t.Fatal("a live window at 0% used must produce a binding; a provider with full headroom is the most attractive surface, not an unusable one")
+	}
+	if bs.Used != 0 {
+		t.Errorf("used = %v want 0", bs.Used)
+	}
+	if bs.Remaining != 100 {
+		t.Errorf("remaining = %v want 100", bs.Remaining)
+	}
+	if bs.Class != BurnUnderspent {
+		t.Errorf("class = %v want underspent", bs.Class)
+	}
+}
+
+// The original protection is preserved: 0% used with NO reset timestamp is
+// indistinguishable from absent data and must still be skipped. This is the
+// case TestComputeBinding_ClaudeSessionFull covers, asserted here explicitly so
+// the reasoning is not implicit in a fixture.
+func TestComputeBindingStillSkipsZeroUsageWithNoResetStamp(t *testing.T) {
+	now := freezeTime()
+	prov := ProviderUsage{Resources: map[string]ResourceUsage{
+		"session": {Unit: "percent", Used: 0, WindowSeconds: Window5h},
+	}}
+	if bs := computeBinding(prov, nil, DefaultExhaustedPct, now); bs != nil {
+		t.Errorf("0%% used with no reset stamp is absent data, not a live window: %+v", bs)
+	}
+}
+
+// A non-percent unit is still rejected regardless of usage, so a byte or token
+// counter cannot be mistaken for a percentage window.
+func TestComputeBindingRejectsNonPercentUnits(t *testing.T) {
+	now := freezeTime()
+	prov := ProviderUsage{Resources: map[string]ResourceUsage{
+		"tokens": {
+			Unit:          "tokens",
+			Used:          10,
+			WindowSeconds: WindowWeekly,
+			ResetsAt:      now.Add(time.Hour).UTC().Format(time.RFC3339),
+		},
+	}}
+	if bs := computeBinding(prov, nil, DefaultExhaustedPct, now); bs != nil {
+		t.Errorf("non-percent unit must be rejected: %+v", bs)
+	}
+}
