@@ -202,9 +202,13 @@ func containsProbeArg(args []string, want string) bool {
 func TestModelForTable(t *testing.T) {
 	clearRouteEnv(t)
 	cases := map[[2]string]string{
-		{"claude", "coordinator"}:      "claude-fable-5",
-		{"claude", "architecture"}:     "claude-opus-5",
-		{"claude", "qa"}:               "claude-opus-5",
+		{"claude", "coordinator"}:  "claude-fable-5",
+		{"claude", "architecture"}: "claude-opus-5",
+		// FAC-595: reviews run on Sonnet by operator policy. `qa` is the shape
+		// every review lane resolves through, so Opus here put the fleet's
+		// highest-volume workload on its priciest model. architecture and
+		// adversarial keep Opus deliberately.
+		{"claude", "qa"}:               "claude-sonnet-5",
 		{"claude", "adversarial"}:      "claude-opus-5",
 		{"claude", "qa-light"}:         "claude-haiku-4-5",
 		{"claude", "bounded"}:          "claude-haiku-4-5",
@@ -293,8 +297,8 @@ func TestWaterfallTables(t *testing.T) {
 		// HERD_ENABLE_KIMI, so Waterfall (the selection input) omits it. The
 		// declaration itself is asserted separately below, so both facts stay
 		// pinned rather than one silently replacing the other.
-		"qa":             {"claude", "grok", "agy", "codex", "ollama", "lazer"},
-		"adversarial":    {"grok", "claude", "agy", "codex", "ollama", "lazer"},
+		"qa":          {"claude", "grok", "agy", "codex", "ollama", "lazer"},
+		"adversarial": {"grok", "claude", "agy", "codex", "ollama", "lazer"},
 	}
 	for shape, exp := range want {
 		got, err := Waterfall(shape)
@@ -535,7 +539,10 @@ func TestPickReviewFitWeightDominates(t *testing.T) {
 		t.Fatalf("Pick: %v", err)
 	}
 	// claude: 45*100+0 = 4500; grok: 41*100+1*60*100+1 = 10101 -> claude
-	if route.Provider != "claude" || route.Model != "claude-opus-5" {
+	//
+	// The assertion is that fit weight keeps CLAUDE over grok; the model is
+	// incidental and became sonnet-5 in FAC-595 when reviews moved off Opus.
+	if route.Provider != "claude" || route.Model != "claude-sonnet-5" {
 		t.Fatalf("qa fit weight must keep first healthy reviewer, got %+v", route)
 	}
 }
@@ -612,14 +619,19 @@ func TestExpiredCooldownIgnored(t *testing.T) {
 }
 
 func TestArgvContracts(t *testing.T) {
+	// The claude argv carries --permission-mode bypassPermissions, which is
+	// the claude equivalent of agy --dangerously-skip-permissions, grok
+	// --always-approve and the opencode/kimi --auto flags: an autonomous fleet
+	// lane cannot sit on a permission prompt. This expectation was stale and
+	// had been failing on main independently of FAC-595.
 	cases := []struct {
 		p, m, e string
 		want    []string
 	}{
 		{"claude", "claude-fable-5", "medium",
-			[]string{"claude", "--mcp-config", `{"mcpServers":{}}`, "--strict-mcp-config", "--disable-slash-commands", "--disallowed-tools", "Agent", "Task", "ToolSearch", "--model", "claude-fable-5", "--effort", "medium", "--fallback-model", "claude-sonnet-5"}},
+			[]string{"claude", "--mcp-config", `{"mcpServers":{}}`, "--strict-mcp-config", "--disable-slash-commands", "--disallowed-tools", "Agent", "Task", "ToolSearch", "--model", "claude-fable-5", "--effort", "medium", "--fallback-model", "claude-sonnet-5", "--permission-mode", "bypassPermissions"}},
 		{"claude", "claude-sonnet-5", "high",
-			[]string{"claude", "--mcp-config", `{"mcpServers":{}}`, "--strict-mcp-config", "--disable-slash-commands", "--disallowed-tools", "Agent", "Task", "ToolSearch", "--model", "claude-sonnet-5", "--effort", "high"}},
+			[]string{"claude", "--mcp-config", `{"mcpServers":{}}`, "--strict-mcp-config", "--disable-slash-commands", "--disallowed-tools", "Agent", "Task", "ToolSearch", "--model", "claude-sonnet-5", "--effort", "high", "--permission-mode", "bypassPermissions"}},
 		{"codex", "gpt-5.6-luna", "xhigh",
 			[]string{"codex", "--disable", "multi_agent", "--disable", "multi_agent_v2", "--model", "gpt-5.6-luna", "-c", "model_reasoning_effort=high", "-a", "never", "-c", "mcp_servers.code-review-graph={command=\"false\",enabled=false}"}},
 		{"grok", "grok-4.6", "max",

@@ -412,12 +412,17 @@ func TestDecideReviewerMissingAuthorFamilyFailsClosed(t *testing.T) {
 
 func TestDecideFlashAuthorFrontierHighRejected(t *testing.T) {
 	clearRouteEnv(t)
-	// Force only frontier reviewers (claude qa → opus-5 frontier) with high effort
-	// and a flash author — must fail closed when no coherent alternative exists.
+	// Force only frontier reviewers with high effort and a flash author — must
+	// fail closed when no coherent alternative exists.
+	//
+	// FAC-595 moved claude:qa to sonnet-5, so `qa` no longer reaches a frontier
+	// reviewer and can no longer construct this scenario. The invariant under
+	// test is the capability-coherence rule, not the qa mapping, so the shape is
+	// now `adversarial`, which still resolves to opus-5 deliberately.
 	r := testRouter(nil, "claude")
 	_, err := r.Decide(LaunchRequest{
 		Role:              RoleReviewer,
-		Shape:             "qa",
+		Shape:             "adversarial",
 		Risk:              classify.TierR3,
 		FinalPass:         true, // effort high
 		AuthorFamily:      "deepseek",
