@@ -598,6 +598,11 @@ func readPulseReview() pulse.ReviewObservation {
 		Known: true, Pending: len(pendingRefs), PendingRefs: pendingRefs,
 		InboxUningested: uningested,
 		RawVetoed:       len(needReviewRefs), RawVetoedRefs: needReviewRefs,
+		// FAC-650: Cap is carried so the block decision can compare it against
+		// LIVE review concurrency. Saturated stays for compatibility but is no
+		// longer what gates dispatch: pending+raw_vetoed counted a historical
+		// vetoed set, so old FAIL/BLOCKED candidates saturated the fleet forever.
+		Cap:       cap,
 		Saturated: len(pendingRefs)+len(needReviewRefs) >= cap,
 	}
 }

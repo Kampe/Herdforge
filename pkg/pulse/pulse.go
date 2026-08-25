@@ -256,7 +256,11 @@ type ReviewObservation struct {
 	InboxUningested int      `json:"inbox_uningested"`
 	RawVetoed       int      `json:"raw_vetoed"`
 	RawVetoedRefs   []string `json:"raw_vetoed_refs,omitempty"`
-	Saturated       bool     `json:"saturated,omitempty"`
+	// Cap is the configured in-review concurrency bound, carried so the block
+	// decision can compare it against LIVE review activity instead of a
+	// historical set (FAC-650).
+	Cap       int  `json:"cap,omitempty"`
+	Saturated bool `json:"saturated,omitempty"`
 }
 
 // QuotaObservation is one read of capacity/quota posture.
@@ -504,8 +508,8 @@ func Plan(obs Observation, opts Options) (Snapshot, error) {
 		blockReason = "coordinator broker unavailable"
 	case obs.Quota.Exhausted:
 		blockReason = "quota exhausted"
-	case obs.Review.Saturated:
-		blockReason = "review saturated"
+	case reviewSaturated(obs, agents):
+		blockReason = reviewSaturationReason(obs, agents)
 	case obs.Provider.Claimable <= 0:
 		blockReason = "no claimable work"
 	}
@@ -845,6 +849,48 @@ func needsRenew(l LeaseObservation, now time.Time, within time.Duration) bool {
 		threshold = 30 * time.Second
 	}
 	return remaining <= threshold
+}
+
+// reviewSaturated reports whether LIVE review concurrency has reached the cap.
+//
+// FAC-650: Saturated was computed as pending+RAW_VETOED >= cap, where RawVetoed
+// is the ledger's historical set of vetoed SHAs. A vetoed SHA stays vetoed
+// forever, so 31 old FAIL/BLOCKED candidates permanently saturated the gate and
+// dispatch_blocked=review-saturated became a permanent state: measured live,
+// pending=0 and raw_vetoed=31 against cap=3 while only 2 reviews were actually
+// in flight. The fleet had capacity and was told it did not.
+//
+// readPulseReview's own comment warns that RawVetoed "must not be conflated with
+// drain's live unmerged-candidate NeedReview count" -- and the Saturated
+// expression three lines below it did exactly that.
+//
+// A concurrency bound must be compared against concurrency. Live in-flight
+// reviews use the same predicate CountActions uses, so the number that blocks
+// dispatch is the number the summary reports. Cap<=0 means unconfigured, which
+// is not a bound of zero.
+func reviewSaturated(obs Observation, agents []AgentObservation) bool {
+	cap := obs.Review.Cap
+	if cap <= 0 {
+		return false
+	}
+	return liveReviewsInFlight(agents) >= cap
+}
+
+func reviewSaturationReason(obs Observation, agents []AgentObservation) string {
+	return fmt.Sprintf("review saturated: %d reviews in flight >= cap %d",
+		liveReviewsInFlight(agents), obs.Review.Cap)
+}
+
+// liveReviewsInFlight mirrors CountActions exactly: a lane pinned out for review
+// or awaiting a verdict is review activity.
+func liveReviewsInFlight(agents []AgentObservation) int {
+	n := 0
+	for _, a := range agents {
+		if strings.TrimSpace(a.SafeRef) != "" || a.AwaitingVerdict {
+			n++
+		}
+	}
+	return n
 }
 
 // CountActions tallies agent statuses and action kinds. Shared by JSON and human.
