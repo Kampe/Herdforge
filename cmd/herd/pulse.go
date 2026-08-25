@@ -310,7 +310,39 @@ func readPulseHerdr(ctx context.Context, doneRefs map[string]bool) pulse.HerdrOb
 	// capacity or reap evidence; otherwise a focused workspace from another
 	// checkout (for example Chainseer) is treated as Herdforge's fleet.
 	if workspace := pulseHerdrWorkspace(); workspace != "" {
-		agents = filterPulseAgentsWorkspace(agents, workspace)
+		scoped := filterPulseAgentsWorkspace(agents, workspace)
+		// FAC-649: a scope that matches NOTHING against a non-empty fleet is a
+		// wrong scope, not an empty fleet.
+		//
+		// This filter reported a confident agents=0 whenever the configured
+		// workspace did not exist. Measured live on the review host: running pulse
+		// without HERD_CONFIG_PATH resolves .herd/herd.yaml, which registers the
+		// COORDINATOR's workspace (wB) -- a workspace that host has never had. The
+		// filter dropped all 7 live reviewers and pulse answered agents=0,
+		// capacity=0, reviews_in_flight=0. Setting the correct config path turned
+		// the same command into agents=7 on the same beat.
+		//
+		// The cost was not a wrong number. An orchestrator read that zero as "the
+		// review host cannot spawn", stopped dispatching, closed finished panes
+		// without replacing them, and reported a control-plane outage for an hour
+		// while eight reviewers were running the whole time.
+		//
+		// An honestly empty fleet still reports zero: the guard only fires when
+		// Herdr returned agents and this scope excluded every one of them.
+		if len(scoped) == 0 && len(agents) > 0 {
+			live := map[string]int{}
+			for _, a := range agents {
+				live[strings.TrimSpace(a.Workspace)]++
+			}
+			return pulse.HerdrObservation{
+				Known: false,
+				Error: fmt.Sprintf("configured workspace %q holds none of the %d live agents (live workspaces: %v); "+
+					"this is a wrong scope, not an idle fleet -- check fleet.herdr_workspace for THIS host "+
+					"(HERD_CONFIG_PATH may be selecting another host's profile)",
+					workspace, len(agents), live),
+			}
+		}
+		agents = scoped
 	}
 	ev := loadReapEvidence(ctx, agents, doneRefs)
 	out := make([]pulse.AgentObservation, 0, len(agents))
