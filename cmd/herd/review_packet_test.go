@@ -194,9 +194,9 @@ func TestReviewPacketUsesBranchTransportWhenNoSupervisorIsReachable(t *testing.T
 	if strings.Contains(body, "herd mail send --from") {
 		t.Error("with no reachable supervisor the packet must not instruct a mail send that cannot cross hosts")
 	}
-	for _, want := range []string{"verdicts/", "git push", "MAIL WILL NOT WORK"} {
+	for _, want := range []string{"herd verdict-push", "MAIL WILL NOT WORK"} {
 		if !strings.Contains(body, want) {
-			t.Errorf("packet must make the branch push the primary report (%q missing)", want)
+			t.Errorf("packet must make verdict-push the primary report (%q missing)", want)
 		}
 	}
 }
@@ -229,12 +229,18 @@ func TestReviewPacketBranchLineNamesARealWorkspace(t *testing.T) {
 	if strings.Contains(body, "herd config workspace") {
 		t.Error("packet must not interpolate a subcommand that does not exist")
 	}
-	if !strings.Contains(body, "refs/heads/verdicts/w2") {
-		t.Error("branch line must name the resolved workspace literally")
+	if !strings.Contains(body, "--workspace w2") {
+		t.Error("transport command must name the resolved workspace literally")
 	}
-	if strings.Contains(body, "verdicts/\n") || strings.Contains(body, "verdicts/ ") {
-		t.Error("branch line must never render an empty ref")
+	if !strings.Contains(body, "herd verdict-push") {
+		t.Error("packet must instruct the command that works, not a hand-rolled git recipe")
 	}
+	// Assert on the INSTRUCTION, not the word: the warning prose necessarily says
+	// "git add stages nothing", which is the sentence explaining the trap.
+	if strings.Contains(body, "  git add ") {
+		t.Error("git add of a verdict silently no-ops under .gitignore /.herd/*; the packet must not instruct it")
+	}
+
 }
 
 // An unresolvable workspace must leave a visible placeholder, not an empty ref
@@ -243,10 +249,10 @@ func TestReviewPacketBranchLinePlaceholderWhenWorkspaceUnknown(t *testing.T) {
 	body := reviewPacketBody("CHA-1", strings.Repeat("a", 40), "s",
 		"/repo/.herd/review/inbox/v.md", "", "xai", "")
 
-	if strings.Contains(body, "verdicts/\n") {
-		t.Fatal("an unknown workspace must not render an empty ref")
-	}
-	if !strings.Contains(body, "workspace-id") {
-		t.Error("an unknown workspace must render a visible placeholder")
+	// With no workspace the flag is omitted entirely, so verdict-push resolves it
+	// itself and refuses loudly if it cannot -- strictly better than emitting a
+	// ref that looks valid and fails only at push time.
+	if strings.Contains(body, "--workspace \n") || strings.Contains(body, "--workspace  ") {
+		t.Fatal("an unknown workspace must omit the flag, never pass it empty")
 	}
 }

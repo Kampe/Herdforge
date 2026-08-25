@@ -686,15 +686,22 @@ func preflightReviewerReadiness(r poolReviewer) error {
 // afterthought appended below a mail command that cannot work.
 func reportHomeInstruction(agent, supervisor, verdictPath, workspace string) string {
 	if strings.TrimSpace(supervisor) == "" {
-		branch := strings.TrimSpace(workspace)
-		if branch == "" {
-			branch = "<this-host-workspace-id, e.g. w2>"
+		ws := strings.TrimSpace(workspace)
+		cmd := "  herd verdict-push --artifact " + verdictPath
+		if ws != "" {
+			cmd += " --workspace " + ws
 		}
-		return "  git add " + verdictPath + " && git commit -m \"verdict: " + agent + "\" &&\n" +
-			"  git push origin HEAD:refs/heads/verdicts/" + branch + "\n\n" +
+		// FAC-620: this replaces a three-step git recipe that could not work.
+		// `git add` silently no-ops because .gitignore covers /.herd/*, and
+		// pushing HEAD to the shared verdicts branch is a non-fast-forward.
+		// verdict-push uses plumbing, writes past the ignore, takes its own ref,
+		// and reads the ref back before reporting success.
+		return cmd + "\n\n" +
 			"No review supervisor is reachable from this host, so MAIL WILL NOT WORK: herd mail send\n" +
-			"writes a file in this checkout and nothing carries it to the ledger host. The verdicts\n" +
-			"branch is the only transport that crosses hosts. Pushing it IS your report home."
+			"writes a file in this checkout and nothing carries it to the ledger host. Git is the only\n" +
+			"transport that crosses hosts, and the command above IS your report home.\n\n" +
+			"Do NOT hand-roll this with git add/commit/push. That was tried and it fails silently:\n" +
+			".gitignore covers /.herd/*, so git add stages nothing and reports a clean tree."
 	}
 	return "  herd mail send --from " + agent + " --to " + supervisor + " --file " + verdictPath
 }
