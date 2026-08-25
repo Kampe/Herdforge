@@ -26,6 +26,7 @@ import (
 	"github.com/Kampe/Herdforge/pkg/pulse"
 	"github.com/Kampe/Herdforge/pkg/quotasup"
 	"github.com/Kampe/Herdforge/pkg/review"
+	"github.com/Kampe/Herdforge/pkg/reviewroot"
 	"github.com/Kampe/Herdforge/pkg/standing"
 	"github.com/Kampe/Herdforge/pkg/usage"
 	"github.com/Kampe/Herdforge/pkg/winddown"
@@ -546,9 +547,16 @@ func readPulseReview() pulse.ReviewObservation {
 	sort.Strings(pendingRefs)
 	sort.Strings(needReviewRefs)
 	cap := drainIntEnv("HERD_IN_REVIEW_CAP", 8)
+	// FAC-624: surface the inbox backlog alongside the ledger posture. Pending
+	// alone reported 0 with 88 verdicts waiting to be admitted.
+	uningested := 0
+	if found, sweepErr := sweepUningestedArtifacts(reviewroot.Resolve(".").Root, path); sweepErr == nil {
+		uningested = len(found)
+	}
 	return pulse.ReviewObservation{
 		Known: true, Pending: len(pendingRefs), PendingRefs: pendingRefs,
-		RawVetoed: len(needReviewRefs), RawVetoedRefs: needReviewRefs,
+		InboxUningested: uningested,
+		RawVetoed:       len(needReviewRefs), RawVetoedRefs: needReviewRefs,
 		Saturated: len(pendingRefs)+len(needReviewRefs) >= cap,
 	}
 }
