@@ -362,3 +362,41 @@ func TestDrainDefaultActionsRefuseWithoutAuthority(t *testing.T) {
 		})
 	}
 }
+
+// FAC-645: rebase-mail delivery is unimplemented -- the branch printed the
+// FAC-182 refusal without consulting any delivery path, and there is no success
+// path in executeDrainActions at all. Reported per candidate, one missing
+// capability inflated a beat that already carried 905 refusals, which is how a
+// 1327-tip scan read as a fleet-wide failure instead of one unbuilt feature.
+func TestDrainRebaseMailCollapsesToOneRefusalForManyCandidates(t *testing.T) {
+	r := drainTestReport()
+	r.StandingLanes = []string{"standing-worker"}
+	ev := make([]drainActionEvidence, 0, 7)
+	for _, sha := range []string{"aaaaaaaaaaaa1", "aaaaaaaaaaaa2", "aaaaaaaaaaaa3", "aaaaaaaaaaaa4", "aaaaaaaaaaaa5", "aaaaaaaaaaaa6", "aaaaaaaaaaaa7"} {
+		ev = append(ev, drainActionEvidence{SHA: sha, Lane: "standing-worker", RebaseNeeded: true})
+	}
+	var out bytes.Buffer
+	result := executeDrainActions(context.Background(), r, ev, 0, 0, 1, "", &out, drainTestHooks(&map[string]int{}))
+	text := out.String()
+
+	if result.Refusals != 1 {
+		t.Errorf("7 stranded candidates must be one refusal for one missing capability, got %d", result.Refusals)
+	}
+	if !result.Failed {
+		t.Error("the run must still fail: rebase-needed candidates stay stuck until delivery exists")
+	}
+	if strings.Count(text, "REFUSED rebase-mail") != 1 {
+		t.Errorf("expected exactly one rebase-mail refusal line:\n%s", text)
+	}
+	if !strings.Contains(text, "x7 candidates") || !strings.Contains(text, "not 7 bad candidates") {
+		t.Errorf("the line must report the affected count and exonerate the candidates:\n%s", text)
+	}
+	if !strings.Contains(text, "rebase_blocked=7") {
+		t.Errorf("the summary must carry the stranded count so it is not invisible:\n%s", text)
+	}
+	// The relaunch bound was silently truncating which candidates were even
+	// mentioned; say so rather than letting it hide the true total.
+	if !strings.Contains(text, "relaunch bound 1 would have truncated") {
+		t.Errorf("a truncating bound must be stated:\n%s", text)
+	}
+}

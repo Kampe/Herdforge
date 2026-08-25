@@ -8330,7 +8330,9 @@ func executeDrainActions(ctx context.Context, r *review.DrainReport, evidence []
 		return result
 	}
 	allowed := drainAllowedTiers(autoTiers)
-	reviewCount, harvestCount, harvestAttempts, relaunchCount := 0, 0, 0, 0
+	reviewCount, harvestCount, harvestAttempts := 0, 0, 0
+	// FAC-645: candidates needing rebase mail that no implemented path can reach.
+	var rebaseBlocked []string
 	seenBranches := make(map[string]bool)
 	for _, e := range evidence {
 		if e.RebaseNeeded && os.Getenv("HERD_DRAIN_REBASE_MAIL") != "0" {
@@ -8338,14 +8340,26 @@ func executeDrainActions(ctx context.Context, r *review.DrainReport, evidence []
 				fmt.Fprintf(out, "REFUSED rebase-mail %s: invalid standing lane identity %q\n", e.SHA, e.Lane)
 				result.Failed = true
 				result.Refusals++
-			} else if relaunchCount < maxRelaunch {
-				fmt.Fprintf(out, "REFUSED rebase-mail %s: FAC-182 durable control-envelope delivery is unavailable; OPERATOR_RESOLUTION_REQUIRED ticket=rebase-mail/%s/%s\n", e.SHA, e.Lane, e.SHA[:minDrain(12, len(e.SHA))])
-				result.Failed = true
-				result.Refusals++
-				relaunchCount++
 			} else {
-				fmt.Fprintf(out, "REFUSED rebase-mail %s: max relaunch bound reached\n", e.SHA)
-				result.Refusals++
+				// FAC-645: rebase-mail delivery is UNIMPLEMENTED, not failing.
+				//
+				// This branch never attempted anything: it printed the FAC-182
+				// refusal unconditionally, without consulting any delivery path.
+				// There is no success path in this function, so rebase_mail=0 is
+				// structural and drain's exit 1 is structural.
+				//
+				// Reported per candidate, one missing feature became hundreds of
+				// refusals in a beat that already had 905, which is how a 1327-tip
+				// scan read as a fleet-wide failure. A capability nobody wrote is
+				// one fact about the build, not N facts about N candidates. Count
+				// it once, name the operator ticket once, and report the affected
+				// candidates as a number.
+				//
+				// The exit stays non-zero: this IS unresolved work, and every
+				// rebase-needed candidate stays stuck until it is delivered. That
+				// is why reviewed PASS candidates sit CONFLICTING against main
+				// with nothing telling their builder to rebase.
+				rebaseBlocked = append(rebaseBlocked, e.SHA)
 			}
 		}
 		if e.HarvestReady && harvestAttempts < maxHarvest {
@@ -8420,10 +8434,25 @@ func executeDrainActions(ctx context.Context, r *review.DrainReport, evidence []
 		}
 		seenBranches[e.Branch] = true
 		reviewCount++
-		relaunchCount++
 		result.Reviews++
 	}
-	fmt.Fprintf(out, "act_reviews=%d act_harvests=%d dry_runs=%d rebase_mail=0 refusals=%d\n", result.Reviews, result.Harvests, result.DryRuns, result.Refusals)
+	// FAC-645: one line for one unimplemented capability, with the number of
+	// candidates it strands, instead of one refusal per candidate. The bound is
+	// reported too, since it was silently capping how many were even mentioned.
+	if len(rebaseBlocked) > 0 {
+		result.Failed = true
+		result.Refusals++
+		fmt.Fprintf(out, "REFUSED rebase-mail (x%d candidates): FAC-182 durable control-envelope delivery is UNIMPLEMENTED "+
+			"-- no delivery is attempted and there is no success path, so every rebase-needed candidate stays stuck "+
+			"(a reviewed PASS will sit CONFLICTING with nothing telling its builder to rebase). "+
+			"This is one missing capability, not %d bad candidates. OPERATOR_RESOLUTION_REQUIRED ticket=rebase-mail/%s\n",
+			len(rebaseBlocked), len(rebaseBlocked), rebaseBlocked[0][:minDrain(12, len(rebaseBlocked[0]))])
+		if maxRelaunch > 0 && len(rebaseBlocked) > maxRelaunch {
+			fmt.Fprintf(out, "  note: relaunch bound %d would have truncated this list to %d of %d\n", maxRelaunch, maxRelaunch, len(rebaseBlocked))
+		}
+	}
+	fmt.Fprintf(out, "act_reviews=%d act_harvests=%d dry_runs=%d rebase_mail=0 rebase_blocked=%d refusals=%d\n",
+		result.Reviews, result.Harvests, result.DryRuns, len(rebaseBlocked), result.Refusals)
 	return result
 }
 
