@@ -7841,6 +7841,28 @@ func reviewLedgerPath() string {
 	if path := strings.TrimSpace(os.Getenv("HERD_REVIEW_LEDGER")); path != "" {
 		return path
 	}
+	// FAC-643: resolve the PROJECT control root, not the caller's cwd.
+	//
+	// Found by herd-smith: this returned a cwd-relative ".herd/review-ledger.jsonl"
+	// while readPulseReview's own inbox sweep resolves reviewroot.Resolve(".").Root.
+	// The two disagreed, so from a standing worktree the gating os.Stat missed a
+	// ledger that exists at the project root, took the absent-ledger branch, and
+	// never ran the sweep at all. Measured seconds apart on one binary:
+	//
+	//   cwd ../herd-smith  -> pending=0 inbox_uningested=0
+	//   cwd ../chainseer   -> pending=0 inbox_uningested=102 raw_vetoed=252
+	//
+	// with 123 files in the canonical inbox. Same class as FAC-641 (readiness read
+	// a 0-byte worktree ledger and called 71 reviewed heads unreviewed) -- that fix
+	// went into pkg/reviewledger and missed this sibling path, which every ledger
+	// consumer here routes through: pulse, drain, and candidate.
+	// reviewroot.Resolve().Root is the REVIEW root (.herd/review) -- which is why
+	// the sweep passes it as its own first argument -- so the ledger must be
+	// anchored on the PROJECT root instead. Fail soft: a caller outside a
+	// checkout keeps the relative path rather than being refused outright.
+	if root, _, err := gitroot.ProjectRoot(context.Background(), "."); err == nil && strings.TrimSpace(root) != "" {
+		return filepath.Join(root, ".herd", "review-ledger.jsonl")
+	}
 	return filepath.Join(".herd", "review-ledger.jsonl")
 }
 
