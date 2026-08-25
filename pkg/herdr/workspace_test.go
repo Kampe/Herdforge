@@ -250,3 +250,21 @@ func TestResolveWorkspaceWithConfig_EnvOverridesConfig(t *testing.T) {
 		t.Errorf("env should override config, got %q", got)
 	}
 }
+
+// FAC-648: a REGISTERED workspace is as capable of being stale as an exported
+// one, and only the export was ever validated. Measured live on the review host:
+// the host profile named w3, herdr had only w1 and w4, and every remote review
+// launch died with workspace_not_found while the host merely looked idle.
+func TestRequireWorkspaceRefusesRegisteredWorkspaceMissingFromLiveList(t *testing.T) {
+	entries := []WorkspaceEntry{{WorkspaceID: "w1"}, {WorkspaceID: "w4"}}
+	live, ok := workspaceInList(entries, "w3")
+	if ok {
+		t.Fatal("w3 must not be found in a list that does not contain it")
+	}
+	if len(live) != 2 || live[0] != "w1" || live[1] != "w4" {
+		t.Fatalf("the refusal must be able to name the live workspaces, got %v", live)
+	}
+	if _, ok := workspaceInList(entries, "w4"); !ok {
+		t.Fatal("w4 is present and must be found")
+	}
+}

@@ -554,5 +554,3 @@ func proveLiveHarness(kind, realBin, tmp string) (modelOK, toolOK, viaLA, contai
 	evidence += " harness_deny_escape=ok positive_marker=ok"
 	return true, true, true, true, true, evidence, "", nil
 }
-
-

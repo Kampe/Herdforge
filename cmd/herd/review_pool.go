@@ -56,7 +56,9 @@ func runPoolReview(ref string) error {
 		return err
 	}
 	root := firstEnv("HERD_ROOT", "HERD_REPO_ROOT", ".")
-	candidateDir, err := resolvePoolReviewCandidate(root, ref)
+	// FAC-648: the exact SHA participates in candidate resolution, because a
+	// detached exact-SHA surface is a legitimate candidate and used to be refused.
+	candidateDir, err := resolvePoolReviewCandidateAt(root, ref, strings.TrimSpace(*shaFlag))
 	if err != nil {
 		return err
 	}
@@ -374,11 +376,48 @@ func runPoolReview(ref string) error {
 // resolvePoolReviewCandidate first preserves the dispatched ticket convention,
 // then resolves a real checked-out branch from Git's worktree metadata. Branch
 // names are data passed to Git, never path fragments appended to the repo root.
+// resolvePoolReviewCandidate keeps the branch-only behaviour for callers that
+// have no exact SHA to verify against.
 func resolvePoolReviewCandidate(root, ref string) (string, error) {
-	if filepath.Base(ref) == ref && !strings.ContainsAny(ref, `/\\`) {
-		candidateDir := filepath.Join(root, worktreePathForRef(ref))
-		if worktreeExists(candidateDir) {
-			return candidateDir, nil
+	return resolvePoolReviewCandidateAt(root, ref, "")
+}
+
+// resolvePoolReviewCandidateAt resolves the candidate surface, accepting a
+// DETACHED worktree when its HEAD is the exact SHA under review.
+//
+// FAC-648: two defects met here and blocked every branch-style remote review.
+//
+//  1. Pool.Ensure creates slots with `git worktree add --detach`, and the remote
+//     launcher prepares its surface the same way, but resolution accepted only a
+//     porcelain `branch refs/heads/<ref>` line. A detached surface has no such
+//     line, so `herd review <branch> --pool --sha <SHA>` always failed with
+//     "candidate branch is not checked out in a worktree" -- for a surface that
+//     was already sitting at exactly the right commit.
+//
+//  2. The directory probe was skipped entirely for any ref containing '/', and
+//     even when tried it built the path with worktreePathForRef (lowercase only,
+//     slashes KEPT) while the launcher names the directory with
+//     safeReviewSurfacePart (every non-[a-z0-9-] to '-'). So the surface was
+//     created at .herd/worktrees/feat-cha-2794-... and looked for at
+//     .herd/worktrees/feat/cha-2794-... -- two sanitizers for one path, the same
+//     mismatch class as the launcher's own verification grep.
+//
+// Requiring a named branch was never the safety property. The pool resets the
+// slot --hard to the exact SHA regardless, so what matters is that the surface
+// IS that SHA -- which is verified here rather than assumed from a branch name.
+// With no SHA to check, the old branch-only behaviour is unchanged.
+func resolvePoolReviewCandidateAt(root, ref, sha string) (string, error) {
+	// Probe both spellings: the raw-ref path for historical ticket-style refs and
+	// the launcher's sanitized path, so one sanitizer cannot hide the other's dir.
+	for _, dir := range candidateSurfaceDirs(root, ref) {
+		if !worktreeExists(dir) {
+			continue
+		}
+		if sha == "" {
+			return dir, nil
+		}
+		if headMatchesSHA(dir, sha) {
+			return dir, nil
 		}
 	}
 
@@ -389,10 +428,90 @@ func resolvePoolReviewCandidate(root, ref string) (string, error) {
 	if branchPath != "" {
 		return branchPath, nil
 	}
+	if sha != "" {
+		if dir := detachedSurfaceAtSHA(root, sha); dir != "" {
+			return dir, nil
+		}
+		return "", fmt.Errorf("no worktree holds candidate %q at exact sha %s: neither a checked-out branch nor a detached surface with that HEAD (looked in %v)",
+			ref, shortSHA(sha), candidateSurfaceDirs(root, ref))
+	}
 	if filepath.Base(ref) != ref || strings.ContainsAny(ref, `/\\`) {
 		return "", fmt.Errorf("candidate branch %q is not checked out in a worktree", ref)
 	}
 	return "", fmt.Errorf("candidate worktree %q does not exist", filepath.Join(root, worktreePathForRef(ref)))
+}
+
+// candidateSurfaceDirs returns every directory spelling a candidate surface may
+// legitimately have: the historical raw-ref path and the launcher's sanitized
+// path. Deduplicated so a slash-free ref yields one entry.
+func candidateSurfaceDirs(root, ref string) []string {
+	raw := filepath.Join(root, worktreePathForRef(ref))
+	safe := filepath.Join(root, ".herd", "worktrees", safeReviewSurfacePart(ref))
+	if raw == safe {
+		return []string{raw}
+	}
+	return []string{raw, safe}
+}
+
+// headMatchesSHA reports whether dir's HEAD is exactly sha. A resolution error
+// is NOT a match: an unreadable surface is unknown, never confirmation.
+func headMatchesSHA(dir, sha string) bool {
+	out, err := exec.Command("git", "-C", dir, "rev-parse", "HEAD").Output()
+	if err != nil {
+		return false
+	}
+	head := strings.TrimSpace(string(out))
+	if len(head) < 12 || len(sha) < 12 {
+		return false
+	}
+	return strings.EqualFold(head, sha) || strings.HasPrefix(strings.ToLower(head), strings.ToLower(sha))
+}
+
+// detachedSurfaceAtSHA finds any registered worktree whose HEAD is the exact
+// SHA, so a surface prepared under an unexpected directory name still resolves.
+func detachedSurfaceAtSHA(root, sha string) string {
+	out, err := exec.Command("git", "-C", root, "worktree", "list", "--porcelain").Output()
+	if err != nil {
+		return ""
+	}
+	absRoot, _ := filepath.Abs(root)
+	var path, head string
+	// Only a DETACHED, non-root worktree qualifies. My first version matched on
+	// HEAD alone and happily returned the main worktree, because the repo root is
+	// usually sitting at the SHA under review -- which would have run the review
+	// against the shared checkout instead of an isolated surface. Caught by the
+	// wrong-SHA test, which passed for the wrong reason until the root was excluded.
+	consider := func(detached bool) string {
+		if !detached || path == "" || head == "" {
+			return ""
+		}
+		if abs, err := filepath.Abs(path); err == nil && abs == absRoot {
+			return ""
+		}
+		if !worktreeExists(path) || len(head) < 12 || len(sha) < 12 {
+			return ""
+		}
+		if strings.HasPrefix(strings.ToLower(head), strings.ToLower(sha)) {
+			return path
+		}
+		return ""
+	}
+	scanner := bufio.NewScanner(strings.NewReader(string(out)))
+	for scanner.Scan() {
+		line := scanner.Text()
+		switch {
+		case strings.HasPrefix(line, "worktree "):
+			path = strings.TrimPrefix(line, "worktree ")
+			head = ""
+		case strings.HasPrefix(line, "HEAD "):
+			head = strings.TrimSpace(strings.TrimPrefix(line, "HEAD "))
+		case line == "detached":
+			if match := consider(true); match != "" {
+				return match
+			}
+		}
+	}
+	return ""
 }
 
 func checkedOutBranchWorktree(root, ref string) (string, error) {

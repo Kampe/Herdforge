@@ -2,6 +2,7 @@ package main
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -133,5 +134,85 @@ func TestParseReviewPoolArgs(t *testing.T) {
 				t.Fatalf("parseReviewPoolArgs(%v) = (%q, %q), want (%q, %q)", tt.args, gotRef, gotSHA, tt.wantRef, tt.wantSHA)
 			}
 		})
+	}
+}
+
+// FAC-648: a DETACHED worktree sitting at the exact SHA is a legitimate candidate.
+// Pool.Ensure creates slots with `git worktree add --detach` and the remote
+// launcher prepares its surface the same way, but resolution accepted only a
+// porcelain `branch refs/heads/<ref>` line -- so every branch-style remote review
+// failed with "candidate branch is not checked out in a worktree" against a
+// surface already at exactly the right commit. Requiring a branch was never the
+// safety property: the pool resets --hard to the SHA regardless.
+func TestResolvePoolCandidateAcceptsDetachedSurfaceAtExactSHA(t *testing.T) {
+	root := t.TempDir()
+	run := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", append([]string{"-C", root}, args...)...)
+		cmd.Env = append(os.Environ(), "GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@t", "GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@t")
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+	run("init", "-q", "-b", "main", ".")
+	if err := os.WriteFile(filepath.Join(root, "a.txt"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run("add", ".")
+	run("commit", "-qm", "base")
+	run("branch", "feat/deep/candidate")
+
+	shaOut, err := exec.Command("git", "-C", root, "rev-parse", "refs/heads/feat/deep/candidate").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sha := strings.TrimSpace(string(shaOut))
+
+	// The launcher's sanitized directory name, checked out DETACHED -- exactly
+	// what the remote launcher and Pool.Ensure produce.
+	surface := filepath.Join(root, ".herd", "worktrees", safeReviewSurfacePart("feat/deep/candidate"))
+	run("worktree", "add", "-q", "--detach", surface, sha)
+
+	got, err := resolvePoolReviewCandidateAt(root, "feat/deep/candidate", sha)
+	if err != nil {
+		t.Fatalf("a detached surface at the exact SHA must resolve: %v", err)
+	}
+	if got != surface {
+		t.Fatalf("resolved %q, want the prepared surface %q", got, surface)
+	}
+}
+
+// The SHA is VERIFIED, not assumed: a detached surface at the wrong commit must
+// not be accepted just because its directory name matches.
+func TestResolvePoolCandidateRejectsDetachedSurfaceAtWrongSHA(t *testing.T) {
+	root := t.TempDir()
+	run := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", append([]string{"-C", root}, args...)...)
+		cmd.Env = append(os.Environ(), "GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@t", "GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@t")
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+	run("init", "-q", "-b", "main", ".")
+	if err := os.WriteFile(filepath.Join(root, "a.txt"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run("add", ".")
+	run("commit", "-qm", "base")
+	first, _ := exec.Command("git", "-C", root, "rev-parse", "HEAD").Output()
+	if err := os.WriteFile(filepath.Join(root, "b.txt"), []byte("y"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run("add", ".")
+	run("commit", "-qm", "second")
+	second, _ := exec.Command("git", "-C", root, "rev-parse", "HEAD").Output()
+
+	surface := filepath.Join(root, ".herd", "worktrees", safeReviewSurfacePart("feat/deep/candidate"))
+	run("worktree", "add", "-q", "--detach", surface, strings.TrimSpace(string(first)))
+
+	// Ask for the SECOND sha; the surface holds the first.
+	if _, err := resolvePoolReviewCandidateAt(root, "feat/deep/candidate", strings.TrimSpace(string(second))); err == nil {
+		t.Fatal("a surface at the wrong commit must not resolve; the SHA is verified, not assumed")
 	}
 }
