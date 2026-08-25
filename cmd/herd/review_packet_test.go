@@ -179,3 +179,41 @@ func TestReviewPacketMarksUnprovenBuilderFamilyExplicitly(t *testing.T) {
 		t.Error("an absent family must render as an explicit 'unproven', never blank")
 	}
 }
+
+// FAC-617: mail is host-local -- herd mail send appends to a file in the local
+// checkout. A reviewer on the second host, where no supervisor is reachable,
+// must be told to push the verdicts branch instead of composing a message the
+// ledger host will never read.
+func TestReviewPacketUsesBranchTransportWhenNoSupervisorIsReachable(t *testing.T) {
+	body := reviewPacketBody("CHA-5", strings.Repeat("e", 40), "surface",
+		"/repo/.herd/review/inbox/v.md", "", "xai")
+
+	// Assert on the COMMAND, not the phrase: the warning prose necessarily says
+	// "herd mail send writes a file in this checkout", so a bare substring check
+	// fails on the very sentence that explains the problem.
+	if strings.Contains(body, "herd mail send --from") {
+		t.Error("with no reachable supervisor the packet must not instruct a mail send that cannot cross hosts")
+	}
+	for _, want := range []string{"verdicts/", "git push", "MAIL WILL NOT WORK"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("packet must make the branch push the primary report (%q missing)", want)
+		}
+	}
+}
+
+// On the ledger host, where the supervisor IS reachable, mail remains the direct
+// signal and must still be named.
+func TestReviewPacketUsesMailWhenSupervisorIsReachable(t *testing.T) {
+	body := reviewPacketBody("CHA-6", strings.Repeat("f", 40), "surface",
+		"/repo/.herd/review/inbox/v.md", "forge-review-harvest-su-467b70d7", "xai")
+
+	if !strings.Contains(body, "herd mail send --from") {
+		t.Error("a reachable supervisor must still get a direct mail report")
+	}
+	if !strings.Contains(body, "forge-review-harvest-su-467b70d7") {
+		t.Error("packet must name the live supervisor it resolved")
+	}
+	if strings.Contains(body, "MAIL WILL NOT WORK") {
+		t.Error("the unreachable-host warning must not appear when mail works")
+	}
+}
