@@ -106,6 +106,28 @@ func validateRecord(opts RecordOpts) error {
 		if opts.BuilderFamily != "" && opts.BuilderFamily != "mechanical" {
 			return fmt.Errorf("mechanical record must not carry builder family %q", opts.BuilderFamily)
 		}
+	} else if opts.Gate == GateProvenanceUnrecorded {
+		// FAC-627: an HONEST "provenance was never recorded" must not discard a
+		// completed review.
+		//
+		// Nothing writes a launch receipt when a standing lane commits -- the
+		// live fleet has 10 receipts, all claude, all days stale, while it runs
+		// grok and codex. So FAC-608's dispatch gate refused EVERY candidate and
+		// the review host sat with 7 free lanes and ~20 reviewable PRs it was
+		// forbidden to touch. The supervisor diagnosed this correctly and stopped
+		// rather than burning lanes on it.
+		//
+		// Worse, the old rule punished honesty and rewarded assertion: a reviewer
+		// writing "unrecorded" had its whole review thrown away, while one
+		// asserting "xai" was admitted with no verification whatsoever.
+		//
+		// This gate admits the review and PRESERVES the safety property by
+		// marking it: a row recorded here can never satisfy a cross-family
+		// independence claim, because the family is explicitly not known.
+		if opts.BuilderFamily != FamilyUnrecorded {
+			return fmt.Errorf("gate %q records builder family %q; use %q when provenance was never recorded",
+				GateProvenanceUnrecorded, opts.BuilderFamily, FamilyUnrecorded)
+		}
 	} else {
 		if opts.BuilderFamily == "" {
 			return fmt.Errorf("record needs --builder-family for an independent review")

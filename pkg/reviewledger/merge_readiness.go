@@ -23,13 +23,18 @@ import (
 // FAIL or BLOCKED blocks, and disagreement blocks rather than resolving to the
 // favourable side.
 type MergeReadiness struct {
-	SHA      string   `json:"sha"`
-	Ready    bool     `json:"ready"`
-	Passes   int      `json:"passes"`
-	Failures int      `json:"failures"`
-	Blocked  int      `json:"blocked"`
-	Reason   string   `json:"reason"`
-	Verdicts []string `json:"verdicts,omitempty"`
+	SHA   string `json:"sha"`
+	Ready bool   `json:"ready"`
+	// ProvenanceUnrecorded counts verdicts admitted under
+	// GateProvenanceUnrecorded. Those reviews are real and are preserved, but the
+	// builder family is explicitly unknown, so they cannot support a cross-family
+	// independence claim and must not silently read as a clean pass.
+	ProvenanceUnrecorded int      `json:"provenance_unrecorded"`
+	Passes               int      `json:"passes"`
+	Failures             int      `json:"failures"`
+	Blocked              int      `json:"blocked"`
+	Reason               string   `json:"reason"`
+	Verdicts             []string `json:"verdicts,omitempty"`
 }
 
 // shaMatches reports whether a ledger SHA and a caller SHA identify the same
@@ -67,6 +72,7 @@ func (l *Ledger) MergeReadinessFor(sha string) (MergeReadiness, error) {
 		return MergeReadiness{SHA: sha, Reason: "review ledger unreadable"}, err
 	}
 	reviewers := map[string]string{}
+	unrecorded := map[string]bool{}
 	for _, row := range rows {
 		// Match by PREFIX. The ledger stores 40-char SHAs while callers routinely
 		// hold a 12-char short form (PR head refs, packet names, pane names).
@@ -82,7 +88,11 @@ func (l *Ledger) MergeReadinessFor(sha string) (MergeReadiness, error) {
 		}
 		// Later verdicts from the SAME reviewer supersede earlier ones; verdicts
 		// from DIFFERENT reviewers never supersede each other.
-		reviewers[strings.TrimSpace(row.Reviewer)] = verdict
+		name := strings.TrimSpace(row.Reviewer)
+		reviewers[name] = verdict
+		if row.Gate == GateProvenanceUnrecorded || strings.EqualFold(strings.TrimSpace(row.BuilderFamily), FamilyUnrecorded) {
+			unrecorded[name] = true
+		}
 	}
 	if len(reviewers) == 0 {
 		out.Reason = "no verdict recorded for this candidate"
@@ -96,6 +106,9 @@ func (l *Ledger) MergeReadinessFor(sha string) (MergeReadiness, error) {
 	for _, name := range names {
 		v := reviewers[name]
 		out.Verdicts = append(out.Verdicts, name+"="+v)
+		if unrecorded[name] {
+			out.ProvenanceUnrecorded++
+		}
 		switch v {
 		case string(VerdictPASS):
 			out.Passes++
@@ -113,6 +126,11 @@ func (l *Ledger) MergeReadinessFor(sha string) (MergeReadiness, error) {
 			out.Passes, out.Failures)
 	case out.Failures > 0:
 		out.Reason = fmt.Sprintf("%d reviewer(s) recorded FAIL", out.Failures)
+	case out.ProvenanceUnrecorded > 0 && out.ProvenanceUnrecorded >= out.Passes:
+		// Every passing review lacks provable authorship. The review is kept and
+		// visible; the independence claim is not granted.
+		out.Reason = fmt.Sprintf("%d PASS but provenance was never recorded; review is admitted, "+
+			"cross-family independence cannot be claimed", out.Passes)
 	default:
 		out.Ready = true
 		out.Reason = fmt.Sprintf("%d PASS, no dissent", out.Passes)

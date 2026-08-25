@@ -116,12 +116,16 @@ func runPoolReview(ref string) error {
 		}
 		provenFamily = asserted
 	}
-	if provenFamily == "" && !*opts.AllowUnprovenBuilder {
-		return fmt.Errorf(
-			"candidate %s has no provable builder family: no launch record for this exact sha carries an allowlisted builder_family, "+
-				"so review-ingest will refuse any verdict produced for it no matter how good the review is. "+
-				"Record the builder launch, or pass --allow-unproven-builder to review it anyway and admit the verdict by hand",
-			shortSHA(sha))
+	// FAC-627: an unprovable candidate is now REVIEWABLE, with the verdict
+	// admitted under the provenance-unrecorded gate. Nothing writes a launch
+	// receipt when a standing lane commits, so refusing here blocked every
+	// candidate on the board and left the review host idle with ~20 reviewable
+	// PRs. The review is worth having; the independence claim is what must be
+	// withheld, and MergeReadiness withholds it.
+	if provenFamily == "" {
+		fmt.Printf("provenance UNRECORDED for %s: dispatching anyway; the verdict will be admitted "+
+			"under gate=%s and cannot support a cross-family independence claim\n",
+			shortSHA(sha), reviewledger.GateProvenanceUnrecorded)
 	}
 
 	// FAC-577: resolve AND preflight the reviewer before the pool lease, not
@@ -496,8 +500,12 @@ func registerPoolReviewFlags(fs *flag.FlagSet) *poolReviewOptions {
 		NoLaunch:    fs.Bool("no-launch", false, "Prepare and print the surface without starting Herdr"),
 		BuilderFamily: fs.String("builder-family", "",
 			"Assert the candidate's builder family and RECORD it, so the resulting verdict is admissible."),
+		// Retained as an accepted no-op: FAC-627 made unprovable candidates
+		// reviewable by default, admitting the verdict under
+		// gate=provenance-unrecorded. Removing the flag would break callers that
+		// still pass it, and silently ignoring an unknown flag is worse.
 		AllowUnprovenBuilder: fs.Bool("allow-unproven-builder", false,
-			"Dispatch even when no launch record proves the candidate's builder family. The verdict will need hand admission."),
+			"Deprecated no-op: unprovable candidates are now reviewable and their verdicts are admitted as provenance-unrecorded."),
 	}
 }
 
