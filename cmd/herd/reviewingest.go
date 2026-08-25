@@ -429,6 +429,26 @@ func sweepUningestedArtifacts(reviewRoot, ledgerPath string) ([]string, error) {
 		// sweeping on that assumption would re-ingest the entire corpus.
 		return nil, fmt.Errorf("read review ledger %s: %w", ledgerPath, err)
 	}
+	// FAC-647: an artifact is ingested if its VERDICT is recorded, not if its
+	// FILENAME is.
+	//
+	// This matched inbox basenames against the ledger's artifact field while
+	// ingestion dedups on sha+reviewer. A verdict admitted under a different
+	// artifact filename -- a retry, a re-push from another host, a rename in
+	// transport -- therefore counted as un-ingested forever. Measured live: of 599
+	// inbox files, 596 had a verdict row for their SHA, only 300 matched by
+	// basename, and 296 were reported as a backlog that did not exist. Re-running
+	// the sweep printed "admitted=296" while every line said DUPLICATE
+	// enqueued=false and inbox_uningested never moved.
+	//
+	// That is the mirror of the absence-as-negative defects: a phantom POSITIVE.
+	// It sent an operator hunting for 299 lost reviews that were already recorded,
+	// and I reported the same false number upstream myself. So the sweep now uses
+	// the ledger's own admission identity.
+	verdicted, err := ledgerVerdictedSHAs(ledgerPath)
+	if err != nil {
+		return nil, fmt.Errorf("read review ledger verdicts %s: %w", ledgerPath, err)
+	}
 	var out []string
 	for _, e := range entries {
 		name := e.Name()
@@ -438,9 +458,76 @@ func sweepUningestedArtifacts(reviewRoot, ledgerPath string) ([]string, error) {
 		if _, ok := seen[name]; ok {
 			continue
 		}
+		if sha := artifactSHAPrefix(name); sha != "" {
+			if _, ok := verdicted[sha]; ok {
+				continue
+			}
+		}
 		out = append(out, filepath.Join(inbox, name))
 	}
 	sort.Strings(out)
+	return out, nil
+}
+
+// artifactSHAPrefix reads the candidate SHA an inbox artifact is named for.
+// Transport names every verdict "<sha12>-<reviewer>.md", so the prefix is the
+// candidate identity even when the rest of the filename differs between hosts.
+// Returns "" when the leading field is not hex, so an unparseable name is never
+// silently treated as some candidate's verdict.
+func artifactSHAPrefix(name string) string {
+	base := strings.TrimSuffix(name, ".md")
+	head := base
+	if i := strings.Index(base, "-"); i > 0 {
+		head = base[:i]
+	}
+	if len(head) < 12 {
+		return ""
+	}
+	head = strings.ToLower(head[:12])
+	for _, r := range head {
+		if !strings.ContainsRune("0123456789abcdef", r) {
+			return ""
+		}
+	}
+	return head
+}
+
+// ledgerVerdictedSHAs returns the 12-hex prefix of every SHA that already has a
+// verdict row, which is the identity ingestion itself dedups on.
+func ledgerVerdictedSHAs(ledgerPath string) (map[string]struct{}, error) {
+	out := map[string]struct{}{}
+	f, err := os.Open(ledgerPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return out, nil
+		}
+		return nil, err
+	}
+	defer f.Close()
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 0, 256*1024), 4*1024*1024)
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if line == "" {
+			continue
+		}
+		var row struct {
+			Event string `json:"event"`
+			SHA   string `json:"sha"`
+		}
+		if err := json.Unmarshal([]byte(line), &row); err != nil {
+			continue
+		}
+		if row.Event != string(reviewledger.EventVerdict) {
+			continue
+		}
+		if sha := strings.ToLower(strings.TrimSpace(row.SHA)); len(sha) >= 12 {
+			out[sha[:12]] = struct{}{}
+		}
+	}
+	if err := sc.Err(); err != nil {
+		return nil, err
+	}
 	return out, nil
 }
 
@@ -520,6 +607,28 @@ func honestlyUnrecordedFamily(raw string) (string, bool) {
 	for _, sentinel := range []string{"unknown", "unrecorded", "unspecified", "unproven", "none", "n/a"} {
 		if v == sentinel || strings.HasPrefix(v, sentinel+" ") || strings.HasPrefix(v, sentinel+"(") ||
 			strings.HasPrefix(v, sentinel+":") || strings.HasPrefix(v, sentinel+",") {
+			return reviewledger.FamilyUnrecorded, true
+		}
+	}
+	// FAC-647: a HEDGED family claim is honest provenance, not a broken field.
+	//
+	// A reviewer wrote: `openai — inferred, not fabricated: both new describe-block
+	// additions name their tests security-sentinel ... No stronger per-commit
+	// attribution exists (commits are authored as the shared human identity, no
+	// trailers, per repo policy)`. FAC-628 taught this parser to accept a leading
+	// "unknown"-style sentinel with trailing prose, but not a leading REAL family
+	// with trailing prose, so that whole review was refused as unprovable.
+	//
+	// It is routed to `unrecorded` rather than accepted as `openai`, deliberately.
+	// The reviewer inferred the family and said so; the family gate exists to PROVE
+	// reviewer/builder disjointness, and an inference is not a proof. Recording it
+	// as proven would overstate the evidence. So the review is kept and the
+	// provenance claim is not upgraded -- exactly what FAC-627's sentinel is for.
+	//
+	// An exact bare family (no hedging prose) is untouched and still resolves
+	// normally, so this cannot launder a clean claim into an unrecorded one.
+	for _, hedge := range []string{"inferred", "not fabricated", "no stronger", "cannot prove", "unprovable", "best guess", "presumed", "likely"} {
+		if strings.Contains(v, hedge) {
 			return reviewledger.FamilyUnrecorded, true
 		}
 	}
