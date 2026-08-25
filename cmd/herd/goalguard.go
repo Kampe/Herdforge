@@ -188,10 +188,24 @@ func splitGoalCSV(raw string) []string {
 // coordinator and pulse. A missing store has no live lease, while an existing
 // store that cannot be read is an error so the Stop hook never invents live
 // authority from an unavailable claim database.
+// goalGuardLeaseHeld reports whether this lane still owns its launch lease.
+//
+// FAC-626: a MISSING lease store used to return false, which Evaluate reads as
+// !LeaseHeld and converts into reason="lease_lost", continue=false. A standing
+// lane whose worktree has no .herd/launch-claims.db was therefore told its lease
+// had been LOST on every single stop, so the review-harvest supervisor completed
+// one beat and halted, forever. Measured on the live lane: no lease db exists,
+// goal Stop.LeaseLost is false, and the hook still returned lease_lost.
+//
+// Absence of a lease store is UNKNOWN, not loss. The distinction is the whole
+// safety property: a store that EXISTS and does not list this lane is a genuine
+// loss and must still stop it. Only the unprovable case now continues.
 func goalGuardLeaseHeld(g goalguard.Goal) (bool, error) {
 	path := leaseDBPath()
 	if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
-		return false, nil
+		// No store: nothing can be proven either way. Treat as held so an active
+		// goal is not killed by a file that was never created.
+		return true, nil
 	} else if err != nil {
 		return false, fmt.Errorf("goal-guard: inspect lease store: %w", err)
 	}
