@@ -34,6 +34,15 @@ const (
 )
 
 // FamilyAllowlist defines the 11 known builder families.
+// FamilyUnrecorded marks a candidate whose builder provenance was never
+// recorded. It is deliberately NOT in FamilyAllowlist: a review carrying it is
+// admissible, but can never satisfy a cross-family independence claim.
+const FamilyUnrecorded = "unrecorded"
+
+// GateProvenanceUnrecorded admits a completed review for a candidate with no
+// launch receipt, rather than discarding the reviewer's work.
+const GateProvenanceUnrecorded = "provenance-unrecorded"
+
 var FamilyAllowlist = map[string]bool{
 	"anthropic":   true,
 	"openai":      true,

@@ -129,3 +129,64 @@ func TestMergeReadiness_RejectsTooShortPrefix(t *testing.T) {
 		t.Fatalf("a 6-char prefix must not match; collision risk: %+v", got)
 	}
 }
+
+// FAC-627: an honest "provenance was never recorded" must PRESERVE the review
+// but must not grant the independence claim. Discarding it is what left the
+// review host with 7 free lanes and ~20 candidates it was forbidden to touch.
+func TestMergeReadiness_UnrecordedProvenancePassIsAdmittedButNotReady(t *testing.T) {
+	l := ledgerWith(t,
+		`{"event":"verdict","sha":"aaa1111111111111111111111111111111111111","reviewer":"r1","verdict":"PASS","gate":"provenance-unrecorded","builder_family":"unrecorded"}`)
+	got, err := l.MergeReadinessFor("aaa1111111111111111111111111111111111111")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Passes != 1 {
+		t.Fatalf("the review must be preserved, not discarded: %+v", got)
+	}
+	if got.Ready {
+		t.Fatalf("unprovable authorship must not read as a clean pass: %+v", got)
+	}
+	if got.ProvenanceUnrecorded != 1 {
+		t.Fatalf("the unrecorded provenance must be counted and visible: %+v", got)
+	}
+}
+
+// A candidate with BOTH an unrecorded pass and a genuine cross-family pass is
+// ready: the provable review carries it.
+func TestMergeReadiness_ProvableePassAlongsideUnrecordedIsReady(t *testing.T) {
+	sha := "bbb1111111111111111111111111111111111111"
+	l := ledgerWith(t,
+		`{"event":"verdict","sha":"`+sha+`","reviewer":"r1","verdict":"PASS","gate":"provenance-unrecorded","builder_family":"unrecorded"}`,
+		`{"event":"verdict","sha":"`+sha+`","reviewer":"r2","verdict":"PASS","gate":"independent","builder_family":"openai"}`)
+	got, _ := l.MergeReadinessFor(sha)
+	if !got.Ready {
+		t.Fatalf("a provable PASS must still carry the candidate: %+v", got)
+	}
+}
+
+// A FAIL under the unrecorded gate still blocks -- admitting the review does not
+// weaken a negative verdict.
+func TestMergeReadiness_UnrecordedFailStillBlocks(t *testing.T) {
+	sha := "ccc1111111111111111111111111111111111111"
+	l := ledgerWith(t,
+		`{"event":"verdict","sha":"`+sha+`","reviewer":"r1","verdict":"FAIL","gate":"provenance-unrecorded","builder_family":"unrecorded"}`)
+	got, _ := l.MergeReadinessFor(sha)
+	if got.Ready {
+		t.Fatalf("a FAIL must block regardless of provenance: %+v", got)
+	}
+}
+
+// The unrecorded gate must reject a real family: it exists for the honest
+// unknown case only, not as a bypass for recording a family without proof.
+func TestValidateRecord_UnrecordedGateRejectsARealFamily(t *testing.T) {
+	err := validateRecord(RecordOpts{Gate: GateProvenanceUnrecorded, BuilderFamily: "xai"})
+	if err == nil {
+		t.Fatal("the unrecorded gate must not accept an asserted family; that is the bypass it exists to avoid")
+	}
+}
+
+func TestValidateRecord_UnrecordedGateAcceptsUnrecorded(t *testing.T) {
+	if err := validateRecord(RecordOpts{Gate: GateProvenanceUnrecorded, BuilderFamily: FamilyUnrecorded}); err != nil {
+		t.Fatalf("honest unrecorded provenance must be admissible: %v", err)
+	}
+}
