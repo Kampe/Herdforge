@@ -168,6 +168,30 @@ func runPoolReview(ref string) error {
 			_ = p.Release(context.Background(), lease.LeaseID)
 		}
 	}()
+	// FAC-632: evict any process still living in this slot BEFORE resetting it.
+	//
+	// The reset below rewrites the worktree to a different candidate's SHA. A
+	// reviewer already running in that directory does not notice: its subsequent
+	// reads return the NEW candidate's code while it still believes it is
+	// reviewing the old one, so it emits a plausible verdict for a commit it never
+	// examined -- and that verdict is admitted as genuine.
+	//
+	// Measured on the live review host: FIVE of eight slots each held two live
+	// claude reviewers, the stale one 2-4x older than the lease holder. pool-01's
+	// lease was review-cha-pr3270-c8a62372005d at HEAD c8a623720 while the older
+	// occupant was working on CHA-2307/2757/2765/2774/2779 and sha 6adb55fa9078.
+	//
+	// A leftover pane is a capacity problem. A leftover PROCESS in a reset
+	// worktree is a correctness problem, and it is the one that has to be closed
+	// here rather than swept up afterwards.
+	if evicted, err := evictPoolSlotOccupants(lease.Path, agentNameFor(ref, sha)); err != nil {
+		// Fail closed: resetting a slot we could not clear risks exactly the
+		// wrong-SHA verdict this guard exists to prevent.
+		return fmt.Errorf("evict stale occupants of %s before pinning: %w", lease.Name, err)
+	} else if evicted > 0 {
+		fmt.Printf("evicted %d stale occupant(s) from %s before pinning %s\n",
+			evicted, lease.Name, shortSHA(sha))
+	}
 	if out, err := exec.Command("git", "-C", lease.Path, "reset", "--hard", sha).CombinedOutput(); err != nil {
 		return fmt.Errorf("pin pool slot %s: %v (%s)", lease.Name, err, strings.TrimSpace(string(out)))
 	}
@@ -782,6 +806,57 @@ func provenBuilderFamily(root, sha string) (string, error) {
 		return "", err
 	}
 	return l.ProvenBuilderFamily(sha)
+}
+
+// agentNameFor is the name this dispatch will give its reviewer, so eviction can
+// spare a pane that is already the legitimate holder (an idempotent re-dispatch).
+func agentNameFor(ref, sha string) string { return reviewAgentName(ref, sha) }
+
+// evictPoolSlotOccupants closes every pane whose foreground process is living
+// inside slotPath, except one already named keepAgent.
+//
+// FAC-632: liveness and ownership are judged by the pane's foreground process
+// CWD, not by the agent registry. That registry loses registrations while panes
+// keep running, which is exactly how five stale reviewers went unnoticed.
+func evictPoolSlotOccupants(slotPath, keepAgent string) (int, error) {
+	abs, err := filepath.Abs(slotPath)
+	if err != nil {
+		return 0, err
+	}
+	panes, err := herdr.PaneList()
+	if err != nil {
+		// No pane inventory means we cannot prove the slot is clear.
+		return 0, fmt.Errorf("pane inventory unavailable: %w", err)
+	}
+	evicted := 0
+	for _, pane := range panes {
+		procs, procErr := herdr.PaneProcessInfo(pane.PaneID)
+		if procErr != nil || len(procs) == 0 {
+			// Unknowable: never evict on a failed probe. An unreadable pane is not
+			// evidence of a stale occupant.
+			continue
+		}
+		resolved, absErr := filepath.Abs(strings.TrimSpace(procs[0].Cwd))
+		if absErr != nil || resolved != abs && !strings.HasPrefix(resolved, abs+string(filepath.Separator)) {
+			continue
+		}
+		// Spare an idempotent re-dispatch of the same candidate.
+		if keepAgent != "" && (pane.Name == keepAgent || strings.Contains(pane.Name, keepAgent)) {
+			continue
+		}
+		var closeErr error
+		if strings.TrimSpace(pane.TabID) != "" {
+			closeErr = herdr.TabClose(pane.TabID)
+		}
+		if closeErr != nil || strings.TrimSpace(pane.TabID) == "" {
+			closeErr = herdr.PaneClose(pane.PaneID)
+		}
+		if closeErr != nil {
+			return evicted, fmt.Errorf("close stale occupant %s: %w", pane.PaneID, closeErr)
+		}
+		evicted++
+	}
+	return evicted, nil
 }
 
 // reviewSupervisorTarget names the lane a finished reviewer reports home to.

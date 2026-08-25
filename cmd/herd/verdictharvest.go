@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 )
 
@@ -20,6 +21,33 @@ import (
 // That is the same shape as the inbox before --sweep existed. A recovery step
 // that has to be remembered is not a recovery step, and instructing the fleet to
 // remember it did not work the last two times. So it is a command.
+// gitShowToFile materialises one path from a ref without staging it.
+func gitShowToFile(root, ref, path string) (string, error) {
+	cmd := exec.Command("git", "-C", root, "show", ref+":"+path)
+	blob, err := cmd.Output()
+	if err != nil {
+		return strings.TrimSpace(string(blob)), err
+	}
+	full := filepath.Join(root, path)
+	if mkErr := os.MkdirAll(filepath.Dir(full), 0o755); mkErr != nil {
+		return "", mkErr
+	}
+	// Never clobber: the caller has already established this path is absent, and
+	// an exclusive create keeps a concurrent harvest from racing it.
+	fh, openErr := os.OpenFile(full, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if openErr != nil {
+		if os.IsExist(openErr) {
+			return "", nil
+		}
+		return "", openErr
+	}
+	defer fh.Close()
+	if _, wErr := fh.Write(blob); wErr != nil {
+		return "", wErr
+	}
+	return "", nil
+}
+
 func runVerdictHarvest() error {
 	fs := flag.NewFlagSet("verdict-harvest", flag.ContinueOnError)
 	remote := fs.String("remote", "origin", "Git remote carrying verdicts/* refs")
@@ -68,7 +96,17 @@ func runVerdictHarvest() error {
 				harvested++
 				continue
 			}
-			if out, coErr := git("checkout", ref, "--", path); coErr != nil {
+			// FAC-633: write the file WITHOUT touching the index.
+			//
+			// `git checkout <ref> -- <path>` stages what it extracts. Harvesting
+			// therefore left dozens of verdict artifacts staged in whoever ran it,
+			// and chainseer's em-dash guard then blocked three unrelated commits of
+			// mine on prose inside those artifacts. A read-only collection step must
+			// not mutate the caller's index.
+			//
+			// `git show <ref>:<path>` reads the blob and writes it directly, which is
+			// what harvesting actually means.
+			if out, coErr := gitShowToFile(root, ref, path); coErr != nil {
 				fmt.Fprintf(os.Stderr, "herd verdict-harvest: could not extract %s: %s\n", path, out)
 				continue
 			}
