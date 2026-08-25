@@ -705,3 +705,28 @@ func TestStandingQuotaAdmissionStillRefusesWhenEverySurfaceIsSpent(t *testing.T)
 		t.Errorf("the refusal must say the alternatives were checked, not just that the pin was spent: %v", err)
 	}
 }
+
+// FAC-643: found by herd-smith. reviewLedgerPath was cwd-relative while
+// readPulseReview's own inbox sweep resolves the PROJECT root, so from a standing
+// worktree the gating stat missed the real ledger, took the absent branch, and
+// never swept -- reporting inbox_uningested=0 next to 123 waiting verdict files.
+func TestReviewLedgerPathResolvesProjectRootNotCwd(t *testing.T) {
+	t.Setenv("HERD_REVIEW_LEDGER", "")
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, ".herd"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// A nested directory stands in for a lane worktree: the ledger is at the
+	// project root, the caller is somewhere below it.
+	nested := filepath.Join(root, "pkg", "deep")
+	if err := os.MkdirAll(nested, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	got := reviewLedgerPath()
+	if got == filepath.Join(".herd", "review-ledger.jsonl") {
+		t.Fatal("reviewLedgerPath returned a bare cwd-relative path; a caller outside the project root resolves the wrong ledger (or none)")
+	}
+	if !filepath.IsAbs(got) {
+		t.Errorf("expected a root-anchored path so every ledger consumer agrees, got %q", got)
+	}
+}

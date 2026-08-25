@@ -517,7 +517,16 @@ func readPulseReview() pulse.ReviewObservation {
 	// drain's live unmerged-candidate NeedReview count.
 	path := drainLedgerPath()
 	if _, err := os.Stat(path); err != nil {
-		return pulse.ReviewObservation{Known: true, Pending: 0, RawVetoed: 0}
+		// FAC-643: an absent ledger does not mean an empty INBOX. Verdicts land
+		// in the inbox before anything admits them to a ledger, so returning
+		// early here reported inbox_uningested=0 next to a directory holding 123
+		// real verdict files -- the backlog FAC-624 added this field to surface.
+		// Sweep anyway and report what is actually waiting.
+		obs := pulse.ReviewObservation{Known: true, Pending: 0, RawVetoed: 0}
+		if found, sweepErr := sweepUningestedArtifacts(reviewroot.Resolve(".").Root, path); sweepErr == nil {
+			obs.InboxUningested = len(found)
+		}
+		return obs
 	}
 	// Ledger exists — verify it is readable. A corrupt ledger must surface
 	// as Known=false so an operator can detect the problem, not silently

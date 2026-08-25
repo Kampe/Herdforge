@@ -19,12 +19,21 @@ func TestOneCanonicalLedgerAuthority(t *testing.T) {
 	t.Setenv("HERD_STATE_DIR", t.TempDir())
 	t.Setenv("XDG_STATE_HOME", t.TempDir())
 
-	want := filepath.Join(".herd", "review-ledger.jsonl")
-	if got := reviewLedgerPath(); got != want {
-		t.Fatalf("inspection path = %q, want repository-canonical %q", got, want)
+	// FAC-643: the requirement here is that every consumer resolves the SAME
+	// ledger, which this originally expressed as a hardcoded relative string.
+	// That relative form turned out to be a second way for consumers to
+	// disagree -- from a standing worktree it resolved a different (or absent)
+	// ledger than the project checkout did -- so agreement is now asserted
+	// directly, and the path must be root-anchored so it holds from any cwd.
+	inspection, drain := reviewLedgerPath(), drainLedgerPath()
+	if inspection != drain {
+		t.Fatalf("consumers disagree: inspection=%q drain/pulse/board-done=%q", inspection, drain)
 	}
-	if got := drainLedgerPath(); got != want {
-		t.Fatalf("drain/pulse/board-done path = %q, want repository-canonical %q", got, want)
+	if filepath.Base(inspection) != "review-ledger.jsonl" {
+		t.Fatalf("ledger path = %q, want a path ending in review-ledger.jsonl", inspection)
+	}
+	if !filepath.IsAbs(inspection) {
+		t.Fatalf("ledger path %q is not root-anchored, so two cwds resolve two ledgers", inspection)
 	}
 	// The old path hardcoded a project name, which was wrong for every other
 	// repository including this one.
