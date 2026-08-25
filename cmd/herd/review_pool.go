@@ -687,7 +687,17 @@ func preflightReviewerReadiness(r poolReviewer) error {
 func reportHomeInstruction(agent, supervisor, verdictPath, workspace string) string {
 	if strings.TrimSpace(supervisor) == "" {
 		ws := strings.TrimSpace(workspace)
-		cmd := "  herd verdict-push --artifact " + verdictPath
+		// FAC-622: name the binary by ABSOLUTE PATH. `herd` is not on a reviewer's
+		// PATH -- verified on the review host, where `command -v herd` finds
+		// nothing in a pool worktree under a non-login shell, and only
+		// ~/Projects/Herdforge/bin/herd resolves. A blocked reviewer reported it
+		// as "herd isn't installed here" while holding a finished PASS verdict it
+		// could not transport.
+		//
+		// Every previous version of this instruction was tested from an operator
+		// shell that had the binary resolved already, which is why six attempts
+		// looked correct and none ran.
+		cmd := "  " + herdBinaryPathForPacket() + " verdict-push --artifact " + verdictPath
 		if ws != "" {
 			cmd += " --workspace " + ws
 		}
@@ -704,6 +714,20 @@ func reportHomeInstruction(agent, supervisor, verdictPath, workspace string) str
 			".gitignore covers /.herd/*, so git add stages nothing and reports a clean tree."
 	}
 	return "  herd mail send --from " + agent + " --to " + supervisor + " --file " + verdictPath
+}
+
+// herdBinaryPathForPacket resolves the absolute path of the running binary, so
+// the packet names a command the reviewer can actually execute. Falls back to
+// the bare name only when the executable cannot be located, which is strictly
+// better than emitting nothing.
+func herdBinaryPathForPacket() string {
+	if exe, err := os.Executable(); err == nil {
+		if resolved, rErr := filepath.EvalSymlinks(exe); rErr == nil {
+			return resolved
+		}
+		return exe
+	}
+	return "herd"
 }
 
 // builderFamilyOrUnproven keeps the packet honest when provenance is absent. A

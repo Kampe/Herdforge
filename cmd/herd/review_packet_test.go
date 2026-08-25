@@ -194,7 +194,7 @@ func TestReviewPacketUsesBranchTransportWhenNoSupervisorIsReachable(t *testing.T
 	if strings.Contains(body, "herd mail send --from") {
 		t.Error("with no reachable supervisor the packet must not instruct a mail send that cannot cross hosts")
 	}
-	for _, want := range []string{"herd verdict-push", "MAIL WILL NOT WORK"} {
+	for _, want := range []string{"verdict-push --artifact", "MAIL WILL NOT WORK"} {
 		if !strings.Contains(body, want) {
 			t.Errorf("packet must make verdict-push the primary report (%q missing)", want)
 		}
@@ -232,7 +232,9 @@ func TestReviewPacketBranchLineNamesARealWorkspace(t *testing.T) {
 	if !strings.Contains(body, "--workspace w2") {
 		t.Error("transport command must name the resolved workspace literally")
 	}
-	if !strings.Contains(body, "herd verdict-push") {
+	// FAC-622 made this an absolute binary path, so match the subcommand rather
+	// than a bare "herd verdict-push" that no longer appears.
+	if !strings.Contains(body, "verdict-push --artifact") {
 		t.Error("packet must instruct the command that works, not a hand-rolled git recipe")
 	}
 	// Assert on the INSTRUCTION, not the word: the warning prose necessarily says
@@ -254,5 +256,31 @@ func TestReviewPacketBranchLinePlaceholderWhenWorkspaceUnknown(t *testing.T) {
 	// ref that looks valid and fails only at push time.
 	if strings.Contains(body, "--workspace \n") || strings.Contains(body, "--workspace  ") {
 		t.Fatal("an unknown workspace must omit the flag, never pass it empty")
+	}
+}
+
+// FAC-622: `herd` is not on a reviewer's PATH. Verified on the review host:
+// `command -v herd` finds nothing in a pool worktree under a non-login shell,
+// and only the absolute path resolves. A blocked reviewer reported it as "herd
+// isn't installed here" while holding a finished PASS verdict it could not
+// transport. The packet must name a command the reviewer can execute.
+func TestReviewPacketNamesAnExecutableBinaryPath(t *testing.T) {
+	body := reviewPacketBody("CHA-1", strings.Repeat("a", 40), "s",
+		"/repo/.herd/review/inbox/v.md", "", "xai", "w2")
+
+	if !strings.Contains(body, "verdict-push") {
+		t.Fatal("packet must instruct verdict-push")
+	}
+	// The transport line must not begin with a bare `herd`, which resolves only
+	// in a shell that already has it on PATH -- i.e. the operator's, not the
+	// reviewer's.
+	for _, line := range strings.Split(body, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "verdict-push") {
+			t.Fatalf("transport line lost its binary entirely: %q", trimmed)
+		}
+		if strings.HasPrefix(trimmed, "herd verdict-push") {
+			t.Fatalf("transport line names a bare `herd`, which is not on a reviewer's PATH: %q", trimmed)
+		}
 	}
 }
