@@ -148,6 +148,21 @@ func runReviewIngest() {
 		if strings.EqualFold(a.ReviewerFamily, "mechanical") || strings.EqualFold(a.BuilderFamily, "mechanical") {
 			gate = "mechanical"
 		}
+		// FAC-628: FAC-627 taught the LEDGER to accept honestly-unrecorded
+		// provenance, but nothing taught INGEST to route a verdict there, so 69
+		// completed reviews were still refused with `unknown builder family`. Same
+		// shape as FAC-604, where the human summary was fixed and the JSON surface
+		// left reporting a false green: the write path was fixed and the read path
+		// was not.
+		//
+		// Reviewers write what they can prove. On this fleet that is genuinely
+		// nothing -- commits are authored under the shared human identity with no
+		// trailers -- so they write "unknown", or prose explaining why. Those
+		// reviews are real and must not be destroyed for being candid.
+		if family, honest := honestlyUnrecordedFamily(a.BuilderFamily); honest {
+			gate = reviewledger.GateProvenanceUnrecorded
+			a.BuilderFamily = family
+		}
 		recordOpts := reviewledger.RecordOpts{
 			SHA: a.SHA, Branch: a.Branch, BuilderFamily: a.BuilderFamily,
 			ReviewerFamily: a.ReviewerFamily, Reviewer: a.Reviewer,
@@ -490,6 +505,27 @@ const (
 // to-do. Duplicate suppression must not depend on which way the verdict went.
 // verdict is accepted so that every disposition rule lives here, where the
 // polarity-independence test can hold it, rather than back at the call site.
+// honestlyUnrecordedFamily reports whether a builder-family value is a candid
+// "I could not determine this", and normalises it.
+//
+// It deliberately does NOT accept a near-miss of a real family. A reviewer that
+// typos "anthropc" is asserting authorship it did not verify, and FAC-590 exists
+// to refuse exactly that. Only an explicit unknown -- optionally followed by the
+// reviewer's explanation, which several write at length -- is honest.
+func honestlyUnrecordedFamily(raw string) (string, bool) {
+	v := strings.ToLower(strings.TrimSpace(raw))
+	if v == "" {
+		return "", false
+	}
+	for _, sentinel := range []string{"unknown", "unrecorded", "unspecified", "unproven", "none", "n/a"} {
+		if v == sentinel || strings.HasPrefix(v, sentinel+" ") || strings.HasPrefix(v, sentinel+"(") ||
+			strings.HasPrefix(v, sentinel+":") || strings.HasPrefix(v, sentinel+",") {
+			return reviewledger.FamilyUnrecorded, true
+		}
+	}
+	return "", false
+}
+
 func ingestDisposition(enqueued bool, verdict string) string {
 	_ = verdict
 	if !enqueued {
