@@ -126,14 +126,27 @@ type Receipt struct {
 	LeaseGeneration   int64     `json:"lease_generation,omitempty"`
 	SessionGeneration int64     `json:"session_generation,omitempty"`
 	Repository        string    `json:"repository,omitempty"`
-	Lane              string    `json:"lane,omitempty"`
-	Generation        int64     `json:"generation,omitempty"`
-	TabID             string    `json:"tab_id,omitempty"`
-	HerdrSession      string    `json:"herdr_session,omitempty"`
-	CWD               string    `json:"cwd,omitempty"`
-	ProcessIdentity   string    `json:"process_identity,omitempty"`
-	StartToken        string    `json:"start_token,omitempty"`
-	PacketDigest      string    `json:"packet_digest,omitempty"`
+	// Branch and Worktree tie this launch to the commits it will produce.
+	//
+	// FAC-637: without them a receipt recorded WHO was launched but nothing that
+	// could be joined to a SHA, so builder provenance for every commit stayed
+	// unrecorded. 28 reviewed-and-passing PRs could not claim cross-family
+	// independence for that reason alone, and the class grew with every commit.
+	//
+	// A receipt saying "lane X ran provider grok on branch Y", plus a commit that
+	// is on branch Y, is traceable provenance. It is not the domain inference a
+	// reviewer correctly refused ("apps/api is nominally api-crusader's") -- it is
+	// the launch record for the branch the commit actually sits on.
+	Branch          string `json:"branch,omitempty"`
+	Worktree        string `json:"worktree,omitempty"`
+	Lane            string `json:"lane,omitempty"`
+	Generation      int64  `json:"generation,omitempty"`
+	TabID           string `json:"tab_id,omitempty"`
+	HerdrSession    string `json:"herdr_session,omitempty"`
+	CWD             string `json:"cwd,omitempty"`
+	ProcessIdentity string `json:"process_identity,omitempty"`
+	StartToken      string `json:"start_token,omitempty"`
+	PacketDigest    string `json:"packet_digest,omitempty"`
 	// Fleet-execution contract fields (FAC-173). Independent of checkout-local
 	// AGENTS files; recovery re-reads these with the exact lease generation.
 	FleetPolicyDigest string `json:"fleet_policy_digest,omitempty"`

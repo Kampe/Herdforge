@@ -33,15 +33,32 @@ import (
 func runVerdictPush() error {
 	fs := flag.NewFlagSet("verdict-push", flag.ContinueOnError)
 	artifact := fs.String("artifact", "", "Path to the verdict artifact to transport")
+	sweep := fs.Bool("sweep", false,
+		"Push every local verdict that is not yet on the remote, instead of one named artifact")
 	workspace := fs.String("workspace", "", "Workspace id (default: resolved from config/env)")
 	remote := fs.String("remote", "origin", "Git remote to push to")
 	dryRun := fs.Bool("dry-run", false, "Build the commit and report the ref without pushing")
 	if err := fs.Parse(os.Args[2:]); err != nil {
 		return err
 	}
+	if *sweep {
+		// FAC-638: do not depend on the reviewer remembering to push.
+		//
+		// Measured on the review host: 88 verdicts written locally, 84 refs on the
+		// remote. SEVEN completed reviews existed only on that host's disk, so the
+		// ledger never saw them and the supervisor had to poll for something that
+		// was never coming. Reviewers were doing the work and dropping the last
+		// step -- which is a predictable outcome of making delivery the reviewer's
+		// responsibility rather than the system's.
+		//
+		// Sweeping is idempotent and safe to schedule: a verdict already on the
+		// remote is skipped, so running it every few minutes converts "the reviewer
+		// remembered" into "the transport happened".
+		return sweepVerdictPush(*remote, strings.TrimSpace(*workspace), *dryRun)
+	}
 	path := strings.TrimSpace(*artifact)
 	if path == "" {
-		return fmt.Errorf("--artifact is required (usage: herd verdict-push --artifact <path>)")
+		return fmt.Errorf("--artifact is required, or use --sweep (usage: herd verdict-push --artifact <path> | --sweep)")
 	}
 	info, err := os.Stat(path)
 	if err != nil || !info.Mode().IsRegular() {
@@ -134,4 +151,84 @@ func gitMkTree(root, blob, leaf string) (string, error) {
 		tree = strings.TrimSpace(string(o))
 	}
 	return tree, nil
+}
+
+// sweepVerdictPush pushes every local verdict artifact that has no ref on the
+// remote yet.
+//
+// FAC-638: this exists because delivery was the reviewer's job and reviewers
+// dropped it 7 times out of 88. A step that must be remembered is a step that is
+// sometimes skipped; a sweep makes the transport a property of the system.
+func sweepVerdictPush(remote, workspace string, dryRun bool) error {
+	root := firstEnv("HERD_ROOT", "HERD_REPO_ROOT", ".")
+	ws := strings.TrimSpace(workspace)
+	if ws == "" {
+		if resolved, err := herdr.RequireWorkspace(root); err == nil {
+			ws = strings.TrimSpace(resolved)
+		} else {
+			ws = strings.TrimSpace(os.Getenv("HERD_WORKSPACE"))
+		}
+	}
+	if ws == "" {
+		return fmt.Errorf("cannot resolve a workspace id; pass --workspace so verdict refs are not written under an empty name")
+	}
+
+	inbox := filepath.Join(root, ".herd", "review", "inbox")
+	entries, err := os.ReadDir(inbox)
+	if err != nil {
+		if os.IsNotExist(err) {
+			fmt.Println("verdict-push sweep: no inbox; nothing to transport")
+			return nil
+		}
+		return fmt.Errorf("read inbox %s: %w", inbox, err)
+	}
+
+	// One remote listing, not one per artifact: 88 artifacts would otherwise mean
+	// 88 network round trips.
+	existing := map[string]bool{}
+	out, lsErr := exec.Command("git", "-C", root, "ls-remote", "--heads", remote, "verdicts/*").Output()
+	if lsErr != nil {
+		// Fail closed: an unreachable remote is not proof that nothing is pushed,
+		// and assuming so would re-push everything on every sweep.
+		return fmt.Errorf("list remote verdict refs: %w", lsErr)
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		if i := strings.Index(line, "refs/heads/"); i >= 0 {
+			existing[strings.TrimSpace(line[i+len("refs/heads/"):])] = true
+		}
+	}
+
+	pushed, skipped, failed := 0, 0, 0
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() || !strings.HasSuffix(name, ".md") {
+			continue
+		}
+		ref := fmt.Sprintf("verdicts/%s-%s", ws, strings.TrimSuffix(name, ".md"))
+		if len(ref) > 220 {
+			ref = ref[:220]
+		}
+		if existing[ref] {
+			skipped++
+			continue
+		}
+		if dryRun {
+			fmt.Printf("WOULD_PUSH %s -> %s\n", name, ref)
+			pushed++
+			continue
+		}
+		os.Args = []string{"herd", "verdict-push", "--artifact", filepath.Join(inbox, name), "--workspace", ws, "--remote", remote}
+		if err := runVerdictPush(); err != nil {
+			fmt.Fprintf(os.Stderr, "verdict-push sweep: %s: %v\n", name, err)
+			failed++
+			continue
+		}
+		pushed++
+	}
+	fmt.Printf("verdict-push sweep: pushed=%d already_present=%d failed=%d workspace=%s\n",
+		pushed, skipped, failed, ws)
+	if failed > 0 {
+		return fmt.Errorf("%d verdict(s) could not be transported", failed)
+	}
+	return nil
 }

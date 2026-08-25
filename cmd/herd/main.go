@@ -249,6 +249,15 @@ func main() {
 	case "review-classify":
 		runReviewClassify()
 
+	case "launch-record":
+		// FAC-637: the dispatch path the fleet actually uses (herdr-dispatch ->
+		// herdr-agent-tab) never touched Herdforge, so builder provenance was
+		// never written for any commit.
+		if err := runLaunchRecord(); err != nil {
+			fmt.Fprintln(os.Stderr, "herd launch-record:", err)
+			os.Exit(1)
+		}
+		return
 	case "verdict-harvest":
 		// FAC-621: collect verdicts other hosts pushed, so admission can see them.
 		if err := runVerdictHarvest(); err != nil {
