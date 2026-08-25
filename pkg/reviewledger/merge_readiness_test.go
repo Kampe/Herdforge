@@ -190,3 +190,52 @@ func TestValidateRecord_UnrecordedGateAcceptsUnrecorded(t *testing.T) {
 		t.Fatalf("honest unrecorded provenance must be admissible: %v", err)
 	}
 }
+
+// FAC-641: an EMPTY ledger is not "nothing has been reviewed". The coordinator
+// runs from a worktree whose ledger is a 0-byte file while the shared one holds
+// 1968 rows; reading the empty one reported all 71 open heads as no-verdict,
+// which would have dispatched 71 redundant reviews and hidden 4 ready candidates.
+func TestMergeReadiness_EmptyLedgerFailsClosed(t *testing.T) {
+	l := ledgerWith(t) // no rows at all
+	got, err := l.MergeReadinessFor(strings.Repeat("a", 40))
+	if err == nil {
+		t.Fatal("an empty ledger must be an error, not a silent no-verdict")
+	}
+	if got.Ready {
+		t.Fatal("an empty ledger must never report ready")
+	}
+	if !strings.Contains(got.Reason, "EMPTY") {
+		t.Errorf("the reason must name the empty ledger so the caller can tell it is pointed at the wrong file: %q", got.Reason)
+	}
+}
+
+// A populated ledger with no verdict for THIS sha is a genuine no-verdict and
+// must still report normally, so the guard cannot be satisfied by always erroring.
+func TestMergeReadiness_PopulatedLedgerStillReportsGenuineNoVerdict(t *testing.T) {
+	l := ledgerWith(t, `{"event":"verdict","sha":"`+strings.Repeat("b", 40)+`","reviewer":"r1","verdict":"PASS"}`)
+	got, err := l.MergeReadinessFor(strings.Repeat("a", 40))
+	if err != nil {
+		t.Fatalf("a populated ledger must not error for an unknown sha: %v", err)
+	}
+	if got.Ready {
+		t.Fatal("an unknown sha must not be ready")
+	}
+	if !strings.Contains(got.Reason, "no verdict recorded") {
+		t.Errorf("a genuine no-verdict must still be reportable: %q", got.Reason)
+	}
+}
+
+// FAC-641: a lane in its own worktree must be able to address the authoritative
+// ledger without cd-ing into the shared checkout, because coordinator residency
+// in a private worktree is the correct arrangement and must not be traded away
+// for read access.
+func TestDefaultPath_HonoursExplicitLedgerOverride(t *testing.T) {
+	t.Setenv("HERD_REVIEW_LEDGER", "/shared/.herd/review-ledger.jsonl")
+	if got := DefaultPath("/some/private/worktree"); got != "/shared/.herd/review-ledger.jsonl" {
+		t.Fatalf("override must win over cwd-derived path, got %q", got)
+	}
+	t.Setenv("HERD_REVIEW_LEDGER", "")
+	if got := DefaultPath("/some/private/worktree"); got == "/shared/.herd/review-ledger.jsonl" {
+		t.Fatal("a blank override must fall through to the root-derived path")
+	}
+}

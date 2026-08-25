@@ -71,6 +71,22 @@ func (l *Ledger) MergeReadinessFor(sha string) (MergeReadiness, error) {
 		// Fail closed: an unreadable ledger is not an absence of dissent.
 		return MergeReadiness{SHA: sha, Reason: "review ledger unreadable"}, err
 	}
+	// FAC-641: an EMPTY ledger is not "nothing has been reviewed".
+	//
+	// The coordinator runs from its own worktree, whose .herd/review-ledger.jsonl
+	// is a 0-byte file while the authoritative shared ledger holds 1968 rows. Read
+	// against the empty one, this reported all 71 open heads as no-verdict --
+	// which would have dispatched 71 reviews for work that was already reviewed,
+	// and reported 4 genuinely-ready candidates as unreviewed.
+	//
+	// That is the exact defect this type exists to prevent, committed inside it: an
+	// absence treated as a definitive negative. A ledger with no rows at all means
+	// the caller is pointed at the wrong file, not that the fleet has never
+	// reviewed anything, so it fails closed and says so.
+	if len(rows) == 0 {
+		return MergeReadiness{SHA: sha, Reason: "review ledger is EMPTY; refusing to report no-verdict from a ledger with zero rows (wrong repo root?)"},
+			fmt.Errorf("review ledger has no rows: refusing to infer review state from an empty ledger")
+	}
 	reviewers := map[string]string{}
 	unrecorded := map[string]bool{}
 	for _, row := range rows {

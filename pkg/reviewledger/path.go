@@ -1,6 +1,7 @@
 package reviewledger
 
 import (
+	"os"
 	"path/filepath"
 	"strings"
 )
@@ -21,6 +22,18 @@ const Leaf = "review-ledger.jsonl"
 // An empty root yields the repo-relative form, so this is a drop-in for both
 // call shapes.
 func DefaultPath(root string) string {
+	// FAC-641: an explicit override wins, so a lane running from its OWN worktree
+	// can still read the authoritative ledger without changing directory.
+	//
+	// The coordinator lives in /Users/kampe/Personal/chainseer-orchestrator, whose
+	// .herd/review-ledger.jsonl is a 0-byte file, while the shared checkout holds
+	// 1968 rows. Resolving purely from cwd made every readiness query answer from
+	// the wrong file and report 71 reviewed heads as unreviewed. Coordinator
+	// residency in its own worktree is correct -- it must not put it in the shared
+	// tree -- so the LEDGER has to be addressable from outside.
+	if p := strings.TrimSpace(os.Getenv("HERD_REVIEW_LEDGER")); p != "" {
+		return p
+	}
 	if strings.TrimSpace(root) == "" {
 		return filepath.Join(".herd", Leaf)
 	}
