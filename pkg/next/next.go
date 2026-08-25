@@ -54,8 +54,8 @@ type NextPicker struct {
 
 func NewNextPicker(cfg *config.Config, tp provider.TaskProvider) *NextPicker {
 	return &NextPicker{
-		Config:         cfg,
-		TaskProvider:   tp,
+		Config:       cfg,
+		TaskProvider: tp,
 		// FAC-572: resolved through the one review-root resolver, so the picker
 		// cannot read a different corpus than review-ingest wrote to.
 		ReviewArtifact: reviewroot.Resolve(".").Inbox(),
@@ -179,6 +179,9 @@ func (p *NextPicker) evalAll(ctx context.Context) ([]*NextAction, error) {
 // ClaimPreview is the pre-claim admission summary. It reports what can be
 // proven from board descriptions before lease/worker side effects occur.
 type ClaimPreview struct {
+	// Role is the filter this preview was computed under, so a zero result can
+	// say WHY it is zero instead of implying an empty queue.
+	Role              string
 	Claimable         int
 	ProvenanceBlocked int
 	BlockedRefs       []string
@@ -187,6 +190,21 @@ type ClaimPreview struct {
 func (p ClaimPreview) Description() string {
 	if p.Claimable == 0 && p.ProvenanceBlocked > 0 {
 		return fmt.Sprintf("No claimable task yet — repair provenance for %d blocked card(s): %s", p.ProvenanceBlocked, strings.Join(p.BlockedRefs, ", "))
+	}
+	if p.Claimable == 0 && p.ProvenanceBlocked == 0 {
+		// FAC-623: "No blocking actions - 0 claimable" reads as a healthy idle
+		// queue. It is not: it is emitted when NOTHING matched, and an operator
+		// reasonably concluded the review-in-progress cap was throttling dispatch.
+		// The cap is advisory (priority 4) and never gates claiming; zero here
+		// means no pending task passed the role filter at all.
+		//
+		// Same shape as the rest of this session's defects: an unmatched filter
+		// reported as an absence of work.
+		if strings.TrimSpace(p.Role) != "" {
+			return fmt.Sprintf("0 claimable — no pending task carries the %q role label "+
+				"(this is a filter result, not an idle queue; check role labels before assuming capacity)", p.Role)
+		}
+		return "0 claimable — no pending task matched (this is a filter result, not an idle queue)"
 	}
 	if p.ProvenanceBlocked == 0 {
 		return fmt.Sprintf("No blocking actions — %d claimable pending task(s)", p.Claimable)
@@ -222,7 +240,7 @@ func PreviewClaimQueue(ctx context.Context, tp provider.TaskProvider, cfg *confi
 		}
 		return provider.CompareRefs(tasks[i].Ref, tasks[j].Ref) < 0
 	})
-	preview := ClaimPreview{}
+	preview := ClaimPreview{Role: role}
 	for _, task := range tasks {
 		if task == nil || strings.TrimSpace(task.Ref) == "" {
 			continue
