@@ -727,10 +727,17 @@ func reviewSupervisorTarget() string {
 	// Resolve the live lane by prefix and fall back to the canonical name only
 	// when nothing is running, so the packet still names something meaningful in
 	// a cold fleet.
-	if live := liveAgentByPrefix("forge-review-harvest", "forge-review-supervisor", canonical); live != "" {
-		return live
-	}
-	return canonical
+	//
+	// FAC-617: when nothing matches, return "" rather than the canonical name.
+	// The emptiness is MEANINGFUL -- reviewPacketBody uses it to render the git
+	// verdicts branch as the primary report home. A canonical fallback would
+	// print a mail command that cannot work from a non-ledger host, because
+	// herd mail send writes .herd/control-mail.jsonl in the LOCAL checkout and
+	// mail never crosses hosts. On the WSL review host the supervisor is not in
+	// the local agent list at all, so this path is the normal case there, not an
+	// edge case.
+	_ = canonical
+	return liveAgentByPrefix("forge-review-harvest", "forge-review-supervisor")
 }
 
 // liveAgentByPrefix returns the first live agent whose name starts with any of
