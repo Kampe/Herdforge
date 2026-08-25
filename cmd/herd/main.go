@@ -249,6 +249,13 @@ func main() {
 	case "review-classify":
 		runReviewClassify()
 
+	case "verdict-harvest":
+		// FAC-621: collect verdicts other hosts pushed, so admission can see them.
+		if err := runVerdictHarvest(); err != nil {
+			fmt.Fprintln(os.Stderr, "herd verdict-harvest:", err)
+			os.Exit(1)
+		}
+		return
 	case "verdict-push":
 		// FAC-619: one command a reviewer can run to transport its verdict to the
 		// ledger host, replacing a git recipe that could not work.
