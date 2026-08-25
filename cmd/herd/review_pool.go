@@ -235,7 +235,20 @@ func runPoolReview(ref string) error {
 		return fmt.Errorf("create review inbox: %w", err)
 	}
 	verdictPath := filepath.Join(inboxAbs, fmt.Sprintf("%s-%s.md", shortSHA(sha), reviewAgentName(ref, sha)))
-	packetBody := reviewPacketBody(ref, sha, surface, verdictPath, reviewSupervisorTarget(), provenFamily)
+	// FAC-618: resolve the workspace BEFORE rendering the packet. The branch
+	// transport line used to interpolate $(herd config workspace) -- a subcommand
+	// that does not exist -- so it expanded to an empty string and the reviewer
+	// was told to push refs/heads/verdicts/, an invalid ref. The push fails and
+	// the verdict never leaves the review host.
+	//
+	// A resolution failure here is not fatal: the packet still renders, with the
+	// workspace left for the reviewer to supply, which is strictly better than a
+	// command that silently produces a broken ref.
+	packetWorkspace, wsErr := herdr.RequireWorkspace(root)
+	if wsErr != nil {
+		packetWorkspace = strings.TrimSpace(os.Getenv("HERD_WORKSPACE"))
+	}
+	packetBody := reviewPacketBody(ref, sha, surface, verdictPath, reviewSupervisorTarget(), provenFamily, packetWorkspace)
 	if err := os.WriteFile(packet, []byte(packetBody), 0o600); err != nil {
 		return fmt.Errorf("write review packet: %w", err)
 	}
@@ -671,10 +684,14 @@ func preflightReviewerReadiness(r poolReviewer) error {
 // supervisor is reachable locally, the git branch is the ONLY transport that
 // crosses hosts, so it becomes the primary instruction rather than an
 // afterthought appended below a mail command that cannot work.
-func reportHomeInstruction(agent, supervisor, verdictPath string) string {
+func reportHomeInstruction(agent, supervisor, verdictPath, workspace string) string {
 	if strings.TrimSpace(supervisor) == "" {
+		branch := strings.TrimSpace(workspace)
+		if branch == "" {
+			branch = "<this-host-workspace-id, e.g. w2>"
+		}
 		return "  git add " + verdictPath + " && git commit -m \"verdict: " + agent + "\" &&\n" +
-			"  git push origin HEAD:refs/heads/verdicts/$(herd config workspace)\n\n" +
+			"  git push origin HEAD:refs/heads/verdicts/" + branch + "\n\n" +
 			"No review supervisor is reachable from this host, so MAIL WILL NOT WORK: herd mail send\n" +
 			"writes a file in this checkout and nothing carries it to the ledger host. The verdicts\n" +
 			"branch is the only transport that crosses hosts. Pushing it IS your report home."
@@ -779,7 +796,7 @@ func liveAgentByPrefix(prefixes ...string) string {
 	return ""
 }
 
-func reviewPacketBody(ref, sha, surface, verdictPath, supervisor, builderFamily string) string {
+func reviewPacketBody(ref, sha, surface, verdictPath, supervisor, builderFamily, workspace string) string {
 	return fmt.Sprintf(`REVIEW %s — verdict only, edit nothing.
 
 Candidate: %s
@@ -847,7 +864,7 @@ result the supervisor needs in order to release the slot and re-plan; silence is
 the only outcome that helps nobody.
 
 A verdict that stays on this filesystem is invisible to the ledger.
-`, ref, sha, surface, verdictPath, sha, ref, builderFamilyOrUnproven(builderFamily), reportHomeInstruction(reviewAgentName(ref, sha), supervisor, verdictPath))
+`, ref, sha, surface, verdictPath, sha, ref, builderFamilyOrUnproven(builderFamily), reportHomeInstruction(reviewAgentName(ref, sha), supervisor, verdictPath, workspace))
 }
 
 // settledAgentStatuses are the states in which a reviewer is no longer doing

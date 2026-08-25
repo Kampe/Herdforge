@@ -20,7 +20,7 @@ import (
 func TestReviewPacketCarriesIngestibleFrontMatterContract(t *testing.T) {
 	body := reviewPacketBody("PR-3115", "8867353f0ba9fe569feeb28989c10d0fefdc6ca1",
 		".herd/review-surfaces/review-pr-3115", "/repo/.herd/review/inbox/8867353f0ba9-review-pr-3115.md",
-		"review-supervisor", "openai")
+		"review-supervisor", "openai", "w2")
 
 	for _, key := range []string{
 		"sha:", "branch:", "task:", "reviewer:", "reviewer-family:",
@@ -49,7 +49,7 @@ func TestReviewPacketCarriesIngestibleFrontMatterContract(t *testing.T) {
 // The contract the packet advertises must be the contract the parser accepts.
 // If these two drift, reviewers follow instructions and still get refused.
 func TestPacketContractMatchesParserAcceptedKeys(t *testing.T) {
-	body := reviewPacketBody("CHA-1", strings.Repeat("a", 40), "surface", "/repo/.herd/review/inbox/a-review-cha-1.md", "review-supervisor", "openai")
+	body := reviewPacketBody("CHA-1", strings.Repeat("a", 40), "surface", "/repo/.herd/review/inbox/a-review-cha-1.md", "review-supervisor", "openai", "w2")
 
 	// Build a minimal artifact the way a compliant reviewer would, using the
 	// packet's own block, and confirm the parser extracts what we expect.
@@ -89,7 +89,7 @@ func TestPacketContractMatchesParserAcceptedKeys(t *testing.T) {
 func TestReviewPacketNamesAnAbsoluteVerdictDestination(t *testing.T) {
 	dest := "/repo/.herd/review/inbox/8867353f0ba9-review-cha-2255-8867353f0ba9.md"
 	body := reviewPacketBody("CHA-2255", "8867353f0ba9fe569feeb28989c10d0fefdc6ca1",
-		"/repo/.herd/review-surfaces/review-cha-2255", dest, "review-supervisor", "openai")
+		"/repo/.herd/review-surfaces/review-cha-2255", dest, "review-supervisor", "openai", "w2")
 
 	if !strings.Contains(body, dest) {
 		t.Errorf("packet must state the exact destination path, got:\n%s", body)
@@ -115,7 +115,7 @@ func TestReviewPacketNamesAnAbsoluteVerdictDestination(t *testing.T) {
 func TestReviewPacketNamesTheSupervisorToReportTo(t *testing.T) {
 	body := reviewPacketBody("PR-3115", "8867353f0ba9fe569feeb28989c10d0fefdc6ca1",
 		".herd/review-surfaces/review-pr-3115", "/repo/.herd/review/inbox/v.md",
-		"review-harvest-supervisor", "openai")
+		"review-harvest-supervisor", "openai", "w2")
 
 	if !strings.Contains(body, "review-harvest-supervisor") {
 		t.Error("packet must name the supervisor the reviewer reports to")
@@ -135,7 +135,7 @@ func TestReviewPacketNamesTheSupervisorToReportTo(t *testing.T) {
 // FamilyAllowlist, so ingest refused the verdict and the review was lost.
 func TestReviewPacketEnumeratesFamiliesAndRejectsHarnessNames(t *testing.T) {
 	body := reviewPacketBody("CHA-9", strings.Repeat("b", 40), "surface",
-		"/repo/.herd/review/inbox/v.md", "review-supervisor", "openai")
+		"/repo/.herd/review/inbox/v.md", "review-supervisor", "openai", "w2")
 
 	for family := range reviewledger.FamilyAllowlist {
 		if !strings.Contains(body, family) {
@@ -159,7 +159,7 @@ func TestReviewPacketEnumeratesFamiliesAndRejectsHarnessNames(t *testing.T) {
 // which admission then refused -- 25 discarded reviews in one inbox.
 func TestReviewPacketPrefillsBuilderFamily(t *testing.T) {
 	body := reviewPacketBody("CHA-7", strings.Repeat("c", 40), "surface",
-		"/repo/.herd/review/inbox/v.md", "review-supervisor", "xai")
+		"/repo/.herd/review/inbox/v.md", "review-supervisor", "xai", "w2")
 
 	if !strings.Contains(body, "builder-family: xai") {
 		t.Error("packet must prefill the recorded builder family, not ask the reviewer to derive it")
@@ -173,7 +173,7 @@ func TestReviewPacketPrefillsBuilderFamily(t *testing.T) {
 // fill in by guessing. It says "unproven" so the reviewer reports it honestly.
 func TestReviewPacketMarksUnprovenBuilderFamilyExplicitly(t *testing.T) {
 	body := reviewPacketBody("CHA-8", strings.Repeat("d", 40), "surface",
-		"/repo/.herd/review/inbox/v.md", "review-supervisor", "")
+		"/repo/.herd/review/inbox/v.md", "review-supervisor", "", "w2")
 
 	if !strings.Contains(body, "builder-family: unproven") {
 		t.Error("an absent family must render as an explicit 'unproven', never blank")
@@ -186,7 +186,7 @@ func TestReviewPacketMarksUnprovenBuilderFamilyExplicitly(t *testing.T) {
 // ledger host will never read.
 func TestReviewPacketUsesBranchTransportWhenNoSupervisorIsReachable(t *testing.T) {
 	body := reviewPacketBody("CHA-5", strings.Repeat("e", 40), "surface",
-		"/repo/.herd/review/inbox/v.md", "", "xai")
+		"/repo/.herd/review/inbox/v.md", "", "xai", "w2")
 
 	// Assert on the COMMAND, not the phrase: the warning prose necessarily says
 	// "herd mail send writes a file in this checkout", so a bare substring check
@@ -205,7 +205,7 @@ func TestReviewPacketUsesBranchTransportWhenNoSupervisorIsReachable(t *testing.T
 // signal and must still be named.
 func TestReviewPacketUsesMailWhenSupervisorIsReachable(t *testing.T) {
 	body := reviewPacketBody("CHA-6", strings.Repeat("f", 40), "surface",
-		"/repo/.herd/review/inbox/v.md", "forge-review-harvest-su-467b70d7", "xai")
+		"/repo/.herd/review/inbox/v.md", "forge-review-harvest-su-467b70d7", "xai", "w2")
 
 	if !strings.Contains(body, "herd mail send --from") {
 		t.Error("a reachable supervisor must still get a direct mail report")
@@ -215,5 +215,38 @@ func TestReviewPacketUsesMailWhenSupervisorIsReachable(t *testing.T) {
 	}
 	if strings.Contains(body, "MAIL WILL NOT WORK") {
 		t.Error("the unreachable-host warning must not appear when mail works")
+	}
+}
+
+// FAC-618: the branch line used to interpolate $(herd config workspace) -- a
+// subcommand that does not exist -- so it expanded to nothing and instructed a
+// push to refs/heads/verdicts/, an invalid ref that always fails. The third
+// consecutive report-home mechanism that could not work.
+func TestReviewPacketBranchLineNamesARealWorkspace(t *testing.T) {
+	body := reviewPacketBody("CHA-1", strings.Repeat("a", 40), "s",
+		"/repo/.herd/review/inbox/v.md", "", "xai", "w2")
+
+	if strings.Contains(body, "herd config workspace") {
+		t.Error("packet must not interpolate a subcommand that does not exist")
+	}
+	if !strings.Contains(body, "refs/heads/verdicts/w2") {
+		t.Error("branch line must name the resolved workspace literally")
+	}
+	if strings.Contains(body, "verdicts/\n") || strings.Contains(body, "verdicts/ ") {
+		t.Error("branch line must never render an empty ref")
+	}
+}
+
+// An unresolvable workspace must leave a visible placeholder, not an empty ref
+// that looks valid and fails at push time.
+func TestReviewPacketBranchLinePlaceholderWhenWorkspaceUnknown(t *testing.T) {
+	body := reviewPacketBody("CHA-1", strings.Repeat("a", 40), "s",
+		"/repo/.herd/review/inbox/v.md", "", "xai", "")
+
+	if strings.Contains(body, "verdicts/\n") {
+		t.Fatal("an unknown workspace must not render an empty ref")
+	}
+	if !strings.Contains(body, "workspace-id") {
+		t.Error("an unknown workspace must render a visible placeholder")
 	}
 }
