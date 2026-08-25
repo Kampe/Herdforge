@@ -2078,14 +2078,55 @@ func admitStandingQuotaState(lane *config.LaneDef, computed map[string]usage.Bur
 		Pool:     quotasup.QuotaPool(lane.Provider, lane.Model),
 	}
 	burn := quotasup.BurnFor(computed, surface)
-	if burn == nil || !burn.Available {
-		reason := "unknown quota"
-		if burn != nil && strings.TrimSpace(burn.Reason) != "" {
-			reason = burn.Reason
-		}
-		return fmt.Errorf("standing lane %q refused: quota %s/%s unavailable (%s)", lane.Name, surface.Provider, surface.Pool, reason)
+	if burn != nil && burn.Available {
+		return nil
 	}
-	return nil
+	reason := "unknown quota"
+	if burn != nil && strings.TrimSpace(burn.Reason) != "" {
+		reason = burn.Reason
+	}
+	// FAC-642: for a STANDING lane the configured provider/model is only a
+	// PREFERENCE -- launchStandingLane sends it as PreferredProvider/
+	// PreferredModel (not Requested), so the router is explicitly free to route
+	// the lane onto a different healthy surface. Refusing the lane here because
+	// its preferred pool is spent kills it before the router ever gets the
+	// chance to do that: an exhausted preference treated as a definitive
+	// negative for the whole lane.
+	//
+	// This is why operators hand-edit provider pins in .herd/herd.yaml during a
+	// crunch (chainseer PR #3210 rerouted 6 lanes codex->grok by hand). The pins
+	// were never the problem; this gate was. Hand-editing also goes stale
+	// immediately -- by the time that PR was reviewed, codex was the HEALTHIEST
+	// surface (58% remaining, default pool 91%) and grok the scarcer one (29%),
+	// so the manual reroute had inverted itself.
+	//
+	// So a spent preference is not a refusal while some other surface is
+	// available. The router remains the real gate and still fails closed: it
+	// rejects an unroutable provider and re-checks launchability before creating
+	// a pane, and a genuinely PINNED builder role sends RequestedProvider, which
+	// the router refuses on its own. This only stops admission from answering a
+	// question it was never the authority on.
+	if alt := firstAvailableSurface(computed, surface); alt != "" {
+		fmt.Printf("PREFERENCE-SPENT %s: preferred %s/%s unavailable (%s); admitting for routing (%s is available)\n",
+			lane.Name, surface.Provider, surface.Pool, reason, alt)
+		return nil
+	}
+	return fmt.Errorf("standing lane %q refused: quota %s/%s unavailable (%s) and no other surface has capacity", lane.Name, surface.Provider, surface.Pool, reason)
+}
+
+// firstAvailableSurface names any surface other than `except` with capacity, or
+// "" when the whole fleet is genuinely spent. Deterministic order so the
+// admission message is reproducible.
+func firstAvailableSurface(computed map[string]usage.BurnState, except quotasup.Surface) string {
+	for _, s := range quotasup.Surfaces(computed, nil) {
+		if s == except {
+			continue
+		}
+		if b := quotasup.BurnFor(computed, s); b != nil && b.Available {
+			return s.String()
+		}
+	}
+	return ""
 }
 
 func runStanding() {

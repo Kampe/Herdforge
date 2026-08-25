@@ -672,3 +672,36 @@ func TestStandingQuotaAdmissionFailsClosedForUnknownPinnedPool(t *testing.T) {
 		t.Fatalf("unknown pinned pool must be refused, got %v", err)
 	}
 }
+
+// FAC-642: a standing lane's provider/model is a PREFERENCE -- launchStandingLane
+// sends it as PreferredProvider/PreferredModel, so the router may route the lane
+// elsewhere. Refusing at admission because the preferred pool is spent killed the
+// lane before the router could, which is why operators hand-edited pins in
+// .herd/herd.yaml during a crunch (chainseer PR #3210).
+func TestStandingQuotaAdmissionAdmitsSpentPreferenceWhenAnotherSurfaceHasCapacity(t *testing.T) {
+	lane := &config.LaneDef{Name: "grok-lane", Provider: "grok", Model: "grok-4.6"}
+	computed := map[string]usage.BurnState{
+		"grok":  {Available: false, Reason: "exhausted", Used: 100, Remaining: 0},
+		"codex": {Available: true, Used: 42, Remaining: 58},
+	}
+	if err := admitStandingQuotaState(lane, computed); err != nil {
+		t.Fatalf("a spent PREFERENCE must not refuse the lane while another surface has capacity; the router is the real gate: %v", err)
+	}
+}
+
+// The whole fleet being spent is still a genuine refusal, so the fix cannot be
+// satisfied by always admitting.
+func TestStandingQuotaAdmissionStillRefusesWhenEverySurfaceIsSpent(t *testing.T) {
+	lane := &config.LaneDef{Name: "grok-lane", Provider: "grok", Model: "grok-4.6"}
+	computed := map[string]usage.BurnState{
+		"grok":  {Available: false, Reason: "exhausted"},
+		"codex": {Available: false, Reason: "exhausted"},
+	}
+	err := admitStandingQuotaState(lane, computed)
+	if err == nil {
+		t.Fatal("a genuinely spent fleet must still be refused")
+	}
+	if !strings.Contains(err.Error(), "no other surface has capacity") {
+		t.Errorf("the refusal must say the alternatives were checked, not just that the pin was spent: %v", err)
+	}
+}
