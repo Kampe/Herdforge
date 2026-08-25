@@ -73,6 +73,8 @@ type drainAdapters struct {
 	head func(ctx context.Context, branch string) (string, error)
 	// patchID computes an independent patch identity for a candidate SHA.
 	patchID func(ctx context.Context, sha string) (string, error)
+	// leaseProbe caches whether this ledger records lease generations at all.
+	leaseProbe *bool
 	// authorModel resolves the builder's model from its own durable launch
 	// receipt — provenance the board's free-text labels cannot supply.
 	authorModel func(taskRef string) (string, error)
@@ -258,6 +260,30 @@ func (a *drainAdapters) integrate(ctx context.Context, e drainActionEvidence, dr
 	return fmt.Errorf("harvest: exact candidate %s was not merged", sha)
 }
 
+// ledgerRecordsLeases reports whether ANY row in this ledger carries a lease
+// generation. When none do, every per-candidate lease refusal is really one
+// recorder defect, and saying so is the difference between an operator
+// investigating 905 candidates and fixing one writer. Computed once per beat.
+func (a *drainAdapters) ledgerRecordsLeases() bool {
+	if a.leaseProbe == nil {
+		found := false
+		if rows, err := a.ledger.AllRows(); err == nil {
+			for i := range rows {
+				if strings.TrimSpace(rows[i].Lease) != "" {
+					found = true
+					break
+				}
+			}
+		} else {
+			// Fail toward the per-candidate message: an unreadable ledger is not
+			// evidence that leases are unrecorded.
+			found = true
+		}
+		a.leaseProbe = &found
+	}
+	return *a.leaseProbe
+}
+
 // admission binds the merge context Admit validates. Task and lease come from
 // the durable launch record written at review launch; the patch id is computed
 // from git. Admit then requires the reviewer's own verdict row to agree.
@@ -277,11 +303,48 @@ func (a *drainAdapters) admission(ctx context.Context, sha string) (harvest.Admi
 		return harvest.AdmissionContext{}, fmt.Errorf("no durable review launch record for exact candidate %s", sha)
 	}
 	if strings.TrimSpace(record.Task) == "" || strings.TrimSpace(record.Lease) == "" {
+		// FAC-644: name the side that is actually broken.
+		//
+		// Ledger.Admit binds four fields: task, lease, patch id and verification
+		// digest. Measured on a live project ledger (2177 rows): the keys
+		// "lease", "patch_url" and "verification_digest" do not appear ANYWHERE,
+		// and only 329 of 1087 verdict rows even carry "task". So the binding is
+		// required by every consumer and written by no producer -- structurally
+		// unsatisfiable, which is why a 1327-tip drain reported 318 harvestable
+		// and act_harvests=0.
+		//
+		// The old message blamed the candidate ("this record carries no
+		// provenance"), so an unsatisfiable recorder defect was reported 905
+		// times as 905 suspect candidates. Those demand opposite responses:
+		// investigate one candidate, versus fix the recorder. Say which it is.
+		if !a.ledgerRecordsLeases() {
+			return harvest.AdmissionContext{}, fmt.Errorf(
+				"harvest admission is UNSATISFIABLE on this ledger: no row records a lease generation, "+
+					"so no candidate can ever be admitted (candidate %s is not itself suspect). "+
+					"The review launch/verdict recorder must persist task+lease+patch id+verification digest; "+
+					"until it does, drain cannot harvest and this is a recorder defect, not a candidate defect", sha)
+		}
 		return harvest.AdmissionContext{}, fmt.Errorf("review launch record for %s carries no task/lease provenance", sha)
 	}
 	family := strings.ToLower(strings.TrimSpace(record.BuilderFamily))
 	if !review.LedgerFamilyAllowlist[family] {
-		return harvest.AdmissionContext{}, fmt.Errorf("review launch record for %s has unknown builder family %q", sha, record.BuilderFamily)
+		// FAC-644: "unrecorded" is the honest sentinel FAC-627 introduced for a
+		// builder family nobody recorded -- but it is deliberately NOT in the
+		// allowlist, because the family gate exists to prove reviewer/builder
+		// family disjointness and an unknown family cannot prove it. Refusing is
+		// correct. Resolving it from evidence first is better: FAC-637 already
+		// writes launch receipts that name the provider and model, so ask them
+		// before giving up. 149 of 1090 record rows carry this sentinel.
+		if resolved := strings.ToLower(strings.TrimSpace(builderFamilyFromReceipts(a.root, sha))); resolved != "" && review.LedgerFamilyAllowlist[resolved] {
+			family = resolved
+		} else if family == reviewledger.FamilyUnrecorded {
+			return harvest.AdmissionContext{}, fmt.Errorf(
+				"builder family for %s is honestly unrecorded and no launch receipt resolves it, so reviewer/builder "+
+					"family disjointness cannot be proven; refusing (record a launch receipt with `herd launch-record` "+
+					"to make this candidate admissible)", sha)
+		} else {
+			return harvest.AdmissionContext{}, fmt.Errorf("review launch record for %s has unknown builder family %q", sha, record.BuilderFamily)
+		}
 	}
 	patch, err := a.patchID(ctx, sha)
 	if err != nil {
