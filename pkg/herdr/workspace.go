@@ -162,6 +162,20 @@ func ResolveWorkspaceWithConfig(repoRoot string, cfg *config.Config) string {
 	return resolveWorkspace(envVal, configVal, entries, repoName)
 }
 
+// workspaceInList reports every live workspace id and whether want is among
+// them. Extracted so the staleness rule is testable without a live herdr.
+func workspaceInList(entries []WorkspaceEntry, want string) ([]string, bool) {
+	live := make([]string, 0, len(entries))
+	found := false
+	for _, e := range entries {
+		live = append(live, e.WorkspaceID)
+		if e.WorkspaceID == want {
+			found = true
+		}
+	}
+	return live, found
+}
+
 // RequireWorkspace resolves a herdr workspace or returns an error.
 // Never falls back to a hardcoded workspace ID (FAC-121). Order:
 //  1. HERD_WORKSPACE env (must be non-empty)
@@ -180,6 +194,30 @@ func RequireWorkspace(repoRoot string) (string, error) {
 	if registeredWS != "" {
 		if envWS != "" && envWS != registeredWS {
 			return "", fmt.Errorf("herdr workspace mismatch for repo %q: HERD_WORKSPACE=%q, registered workspace=%q; refusing cross-workspace mutation", filepath.Base(repoRoot), envWS, registeredWS)
+		}
+		// FAC-648: a REGISTERED workspace is exactly as capable of being stale as
+		// an exported one, and until now only the export was checked.
+		//
+		// Twenty-five lines below, the env path calls a stale export "silent
+		// poison" and validates it against the live list before honouring it. This
+		// path returned the config value with no liveness check at all, so a host
+		// profile naming a workspace that no longer exists routed every dispatch
+		// at a dead id. Measured live on the review host: the profile named w3,
+		// herdr had only w1 and w4, and every remote review launch died with
+		// workspace_not_found while the host looked merely idle.
+		//
+		// A list we cannot read is not proof of absence, so a failed WorkspaceList
+		// still honours the registered value -- refusing there would break every
+		// command whenever herdr is down. Only a readable list that does NOT
+		// contain the id is proof, and that fails closed and names both sides.
+		if entries, listErr := WorkspaceList(); listErr == nil && len(entries) > 0 {
+			live, found := workspaceInList(entries, registeredWS)
+			if !found {
+				return "", fmt.Errorf("registered herdr workspace %q for repo %q does not exist; live workspaces are %v. "+
+					"A host profile naming a dead workspace routes every dispatch into the void and reads as an idle fleet; "+
+					"update fleet.herdr_workspace in this host's config",
+					registeredWS, filepath.Base(repoRoot), live)
+			}
 		}
 		return registeredWS, nil
 	}
