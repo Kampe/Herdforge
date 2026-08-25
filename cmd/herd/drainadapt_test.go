@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -375,4 +376,86 @@ func drainAdaptersWithRecord(t *testing.T) *drainAdapters {
 		t.Fatalf("seed launch record: %v", err)
 	}
 	return a
+}
+
+// FAC-644: the live chainseer ledger records NO lease on any of its 2177 rows
+// (the keys "lease", "patch_url" and "verification_digest" never appear), so
+// Ledger.Admit -- which binds all four -- could never admit anything. A
+// 1327-tip drain reported 318 harvestable and act_harvests=0 with 905 refusals.
+//
+// The old message blamed each candidate for carrying no provenance, so one
+// recorder defect was reported 905 times as 905 suspect candidates. Those need
+// opposite responses: investigate a candidate, versus fix the writer. This pins
+// the distinction, which the pre-existing provenance test could not catch
+// because its synthetic ledger writes Lease "7" -- it proved the gate READS
+// provenance, never that any writer PRODUCES it.
+func TestAdmissionNamesTheRecorderWhenNoLedgerRowRecordsALease(t *testing.T) {
+	a := drainAdaptersWithRecord(t)
+	// Strip the lease from every row, reproducing the live ledger's shape.
+	rows, err := a.ledger.AllRows()
+	if err != nil {
+		t.Fatalf("read rows: %v", err)
+	}
+	var buf strings.Builder
+	for i := range rows {
+		rows[i].Lease = ""
+		b, err := json.Marshal(rows[i])
+		if err != nil {
+			t.Fatal(err)
+		}
+		buf.Write(b)
+		buf.WriteByte('\n')
+	}
+	if err := os.WriteFile(a.ledger.Path, []byte(buf.String()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = a.admission(context.Background(), drainSelftestSHA)
+	if err == nil {
+		t.Fatal("a missing lease must still refuse; the binding is real anti-stale-verdict safety")
+	}
+	if !strings.Contains(err.Error(), "UNSATISFIABLE") {
+		t.Errorf("the refusal must name the unsatisfiable gate so an operator fixes the recorder instead of auditing candidates: %v", err)
+	}
+	if !strings.Contains(err.Error(), "not itself suspect") {
+		t.Errorf("the refusal must exonerate the candidate: %v", err)
+	}
+}
+
+// A ledger that DOES record leases elsewhere keeps the per-candidate message,
+// so the unsatisfiable-gate branch cannot swallow a genuine one-candidate gap.
+func TestAdmissionKeepsPerCandidateMessageWhenLeasesAreRecordedElsewhere(t *testing.T) {
+	a := drainAdaptersWithRecord(t)
+	rows, err := a.ledger.AllRows()
+	if err != nil {
+		t.Fatalf("read rows: %v", err)
+	}
+	var buf strings.Builder
+	for i := range rows {
+		// This candidate loses its lease; a second row keeps one.
+		rows[i].Lease = ""
+		b, _ := json.Marshal(rows[i])
+		buf.Write(b)
+		buf.WriteByte('\n')
+	}
+	other := rows[0]
+	other.SHA = strings.Repeat("c", 40)
+	other.Lease = "9"
+	b, _ := json.Marshal(other)
+	buf.Write(b)
+	buf.WriteByte('\n')
+	if err := os.WriteFile(a.ledger.Path, []byte(buf.String()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = a.admission(context.Background(), drainSelftestSHA)
+	if err == nil {
+		t.Fatal("a missing lease must refuse")
+	}
+	if strings.Contains(err.Error(), "UNSATISFIABLE") {
+		t.Errorf("a ledger that records leases elsewhere is a per-candidate gap, not an unsatisfiable gate: %v", err)
+	}
+	if !strings.Contains(err.Error(), "carries no task/lease provenance") {
+		t.Errorf("expected the per-candidate message: %v", err)
+	}
 }
