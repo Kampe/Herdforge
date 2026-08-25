@@ -662,6 +662,26 @@ func preflightReviewerReadiness(r poolReviewer) error {
 // reviewer's output is ingestible by construction rather than by luck. sha and
 // task are filled here because we know them; the reviewer supplies only what
 // only it can know.
+// reportHomeInstruction renders the transport that actually works from THIS
+// host.
+//
+// FAC-617: mail is host-local. herd mail send appends to .herd/control-mail.jsonl
+// in the local checkout, so a reviewer on the second host can compose a
+// perfectly-formed message that the ledger host will never see. When no
+// supervisor is reachable locally, the git branch is the ONLY transport that
+// crosses hosts, so it becomes the primary instruction rather than an
+// afterthought appended below a mail command that cannot work.
+func reportHomeInstruction(agent, supervisor, verdictPath string) string {
+	if strings.TrimSpace(supervisor) == "" {
+		return "  git add " + verdictPath + " && git commit -m \"verdict: " + agent + "\" &&\n" +
+			"  git push origin HEAD:refs/heads/verdicts/$(herd config workspace)\n\n" +
+			"No review supervisor is reachable from this host, so MAIL WILL NOT WORK: herd mail send\n" +
+			"writes a file in this checkout and nothing carries it to the ledger host. The verdicts\n" +
+			"branch is the only transport that crosses hosts. Pushing it IS your report home."
+	}
+	return "  herd mail send --from " + agent + " --to " + supervisor + " --file " + verdictPath
+}
+
 // builderFamilyOrUnproven keeps the packet honest when provenance is absent. A
 // blank value would render "builder-family:" with nothing after it, which a
 // reviewer would fill in by guessing -- the exact behaviour that produced 25
@@ -727,10 +747,16 @@ func reviewSupervisorTarget() string {
 	// Resolve the live lane by prefix and fall back to the canonical name only
 	// when nothing is running, so the packet still names something meaningful in
 	// a cold fleet.
-	if live := liveAgentByPrefix("forge-review-harvest", "forge-review-supervisor", canonical); live != "" {
-		return live
-	}
-	return canonical
+	// FAC-617: an empty target means "no supervisor is reachable from THIS host",
+	// which the packet renders as branch-push-primary. Returning the canonical
+	// name here instead would print a mail command that cannot work: herd mail
+	// send writes .herd/control-mail.jsonl, a file in the LOCAL checkout, so mail
+	// never crosses hosts. On the WSL review host -- where reviews actually run --
+	// the supervisor is not in the local agent list at all, so FAC-616's live
+	// lookup finds nothing and the old canonical fallback sent every reviewer to
+	// compose a message into a file the ledger host never reads.
+	_ = canonical
+	return liveAgentByPrefix("forge-review-harvest", "forge-review-supervisor")
 }
 
 // liveAgentByPrefix returns the first live agent whose name starts with any of
@@ -807,7 +833,7 @@ be joined back to one.
 
 THEN REPORT HOME. This is not optional and it is the last thing you do:
 
-  herd mail send --from %s --to %s --file %s
+%s
 
 Writing the verdict is not finishing. Until the supervisor knows this review is
 done, the verdict is not ingested, the card does not move, nothing merges, and
@@ -819,11 +845,8 @@ Report home even when the verdict is FAIL or BLOCKED. A negative verdict is a
 result the supervisor needs in order to release the slot and re-plan; silence is
 the only outcome that helps nobody.
 
-If you are reviewing on a host other than the one holding the ledger, ALSO push
-your verdict artifact to the verdicts/<this-host-workspace> branch. The mail
-above does not cross hosts; the branch is the only transport that does, and a
-verdict that stays on this filesystem is invisible to the ledger.
-`, ref, sha, surface, verdictPath, sha, ref, builderFamilyOrUnproven(builderFamily), reviewAgentName(ref, sha), supervisor, verdictPath)
+A verdict that stays on this filesystem is invisible to the ledger.
+`, ref, sha, surface, verdictPath, sha, ref, builderFamilyOrUnproven(builderFamily), reportHomeInstruction(reviewAgentName(ref, sha), supervisor, verdictPath))
 }
 
 // settledAgentStatuses are the states in which a reviewer is no longer doing
