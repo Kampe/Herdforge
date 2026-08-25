@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"encoding/json"
 	"os"
+	"path/filepath"
 	"strings"
 )
 
@@ -16,7 +17,25 @@ func DefaultReceiptPath() string {
 	if p := strings.TrimSpace(os.Getenv("HERD_LAUNCH_RECEIPTS")); p != "" {
 		return p
 	}
-	return ".herd/launch-receipts.jsonl"
+	return filepath.Join(".herd", "launch-receipts.jsonl")
+}
+
+// ReceiptPathFor anchors the receipt log on an explicit repository root.
+//
+// FAC-646: DefaultReceiptPath is cwd-relative, which is the third instance of
+// the FAC-643 class in this tree (after the review ledger and the pulse sweep).
+// Callers that already KNOW the repository root were silently reading whichever
+// receipt log happened to sit under the process's cwd -- measured from the
+// Herdforge checkout it returned that repo's 12 receipts instead of the target
+// project's. A caller holding the root must be able to say so.
+func ReceiptPathFor(root string) string {
+	if p := strings.TrimSpace(os.Getenv("HERD_LAUNCH_RECEIPTS")); p != "" {
+		return p
+	}
+	if strings.TrimSpace(root) == "" {
+		return DefaultReceiptPath()
+	}
+	return filepath.Join(root, ".herd", "launch-receipts.jsonl")
 }
 
 // ReadReceipts returns every parseable receipt, oldest first. A missing log is

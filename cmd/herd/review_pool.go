@@ -824,7 +824,11 @@ func provenBuilderFamily(root, sha string) (string, error) {
 // builderFamilyFromReceipts resolves authorship by joining a commit to the
 // branch of a recorded launch. Returns "" when no receipt's branch contains it.
 func builderFamilyFromReceipts(root, sha string) string {
-	receipts, err := launch.ReadReceipts(launch.DefaultReceiptPath())
+	// FAC-646: anchor on the caller's root. This function already takes `root`
+	// and used a cwd-relative receipt path anyway, so a caller outside the
+	// project read the wrong receipt log and resolved the wrong builder family
+	// -- or none, which FAC-644 then reports as unresolvable provenance.
+	receipts, err := launch.ReadReceipts(launch.ReceiptPathFor(root))
 	if err != nil {
 		return ""
 	}
