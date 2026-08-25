@@ -8,7 +8,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
+	"github.com/Kampe/Herdforge/pkg/feedback"
 	"github.com/Kampe/Herdforge/pkg/herdr"
 	"github.com/Kampe/Herdforge/pkg/mail"
 )
@@ -136,6 +138,63 @@ func warnUnknownMailParticipants(sender, recipient string) {
 	}
 }
 
+// readFeedbackMailbox returns envelopes from the feedback producer's per-recipient
+// mailbox. An absent file is not an error: most lanes are never polled.
+func readFeedbackMailbox(recipient string) ([]*mail.Envelope, error) {
+	if recipient == "" {
+		return nil, nil
+	}
+	// One resolver, shared with the writer, so the two cannot drift apart.
+	path := filepath.Join(feedback.FleetMailDir(firstEnv("HERD_ROOT", "HERD_REPO_ROOT", ".")), recipient+".jsonl")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	var out []*mail.Envelope
+	for _, line := range strings.Split(string(raw), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		// The feedback producer uses a DIFFERENT SCHEMA from the control bus, and
+		// that is the real split -- not just two paths. Feedback writes
+		// id(int)/from/to/summary/message/read_at; mail.Envelope expects
+		// id(string)/sender/recipient/subject/body/read. A direct unmarshal fails
+		// on the id type alone, which is why the first cut of this fix returned
+		// zero envelopes from a file that plainly had two.
+		var fb struct {
+			ID      int64   `json:"id"`
+			From    string  `json:"from"`
+			To      string  `json:"to"`
+			When    string  `json:"timestamp"`
+			Summary string  `json:"summary"`
+			Message string  `json:"message"`
+			ReadAt  *string `json:"read_at"`
+		}
+		if err := json.Unmarshal([]byte(line), &fb); err != nil {
+			// Reported, never silently dropped: a feedback request nobody can
+			// parse is still a request that was made.
+			fmt.Fprintf(os.Stderr, "mail: unparseable feedback envelope in %s: %v\n", path, err)
+			continue
+		}
+		ts, _ := time.Parse(time.RFC3339, fb.When)
+		out = append(out, &mail.Envelope{
+			ID:        fmt.Sprintf("feedback-%d", fb.ID),
+			Sequence:  fb.ID,
+			Sender:    fb.From,
+			Recipient: fb.To,
+			Subject:   fb.Summary,
+			Body:      fb.Message,
+			Read:      fb.ReadAt != nil && strings.TrimSpace(*fb.ReadAt) != "",
+			Timestamp: ts,
+		})
+	}
+	return out, nil
+}
+
 func runMailInbox(mode string, args []string) {
 	fs := flag.NewFlagSet("mail "+mode, flag.ContinueOnError)
 	recipient := fs.String("recipient", "", "inbox recipient")
@@ -157,12 +216,33 @@ func runMailInbox(mode string, args []string) {
 		fmt.Fprintf(os.Stderr, "mail %s: %v\n", mode, err)
 		os.Exit(1)
 	}
-	if !result.RecipientSeen {
-		fmt.Fprintf(os.Stderr, "mail %s: recipient %q has no mailbox history\n", mode, strings.TrimSpace(*recipient))
-	}
 	envelopes := result.Envelopes
 	if envelopes == nil {
 		envelopes = make([]*mail.Envelope, 0)
+	}
+	// FAC-629: also drain the FEEDBACK mailbox.
+	//
+	// pkg/feedback writes each lane's FLEET_FEEDBACK request to
+	// <state>/mail/<recipient>.jsonl, and nothing could read it back. `herd mail
+	// inbox` only ever read .herd/control-mail.jsonl, so a lane asked for feedback
+	// was told "recipient has no mailbox history" while its requests sat unread on
+	// disk. The herd-smith lane -- whose ENTIRE JOB is aggregating fleet feedback
+	// and reporting it -- had two unread requests and no way to reach them.
+	//
+	// A feedback agent that cannot read its feedback is not a partial failure, it
+	// is the whole function missing. Both mailboxes are now drained by one
+	// command, because a recipient should not have to know which producer wrote
+	// to it.
+	feedbackEnvelopes, feedbackErr := readFeedbackMailbox(strings.TrimSpace(*recipient))
+	if feedbackErr != nil {
+		// Report and continue: a missing feedback mailbox is normal for lanes that
+		// were never polled, and must not fail a control-mail read.
+		fmt.Fprintf(os.Stderr, "mail %s: feedback mailbox: %v\n", mode, feedbackErr)
+	}
+	envelopes = append(envelopes, feedbackEnvelopes...)
+
+	if !result.RecipientSeen && len(feedbackEnvelopes) == 0 {
+		fmt.Fprintf(os.Stderr, "mail %s: recipient %q has no mailbox history\n", mode, strings.TrimSpace(*recipient))
 	}
 	if err := json.NewEncoder(os.Stdout).Encode(envelopes); err != nil {
 		fmt.Fprintf(os.Stderr, "mail %s: encode response: %v\n", mode, err)
