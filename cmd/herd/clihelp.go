@@ -123,6 +123,7 @@ var subcommandUsage = map[string]string{
 	"quota-supervisor": "Usage: herd quota-supervisor [flags]\n  Convert quota and process evidence into surface concurrency caps.",
 	"receipt":          "Usage: herd receipt <issue|recover|release> [flags]\n  Issue, recover, or release signed task receipts.",
 	"review-classify":  "Usage: herd review-classify <branch> [--tier R0|R1|R2|R3] [--pin SHA] [--json]\n  Classify candidate risk before review dispatch.",
+	"verdict-push":     "Usage: herd verdict-push --artifact <path> [--workspace <id>] [--dry-run]\n  Transport one verdict artifact to the ledger host over git. Uses plumbing only:\n  never checks out, stashes, or switches a branch in the reviewer's worktree, and\n  writes past .gitignore, which silently no-ops a plain git add of .herd/*.",
 	"review-ingest":    "Usage: herd review-ingest (<verdict-artifact>... | --sweep) [--dry-run] [--json]\n  Validate, admit, and audit reviewer verdict artifacts.\n  --sweep: ingest every inbox verdict the ledger has never recorded. Without it\n  artifacts must be named explicitly, so a verdict nobody enumerates stays inert.",
 	"role-inject":      "Usage: herd role-inject [flags]\n  Bind a session to its worker contract at session start.",
 	"scope":            "Usage: herd scope [flags]\n  Publish the trusted task scope resolved by dispatch.",

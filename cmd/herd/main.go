@@ -249,6 +249,14 @@ func main() {
 	case "review-classify":
 		runReviewClassify()
 
+	case "verdict-push":
+		// FAC-619: one command a reviewer can run to transport its verdict to the
+		// ledger host, replacing a git recipe that could not work.
+		if err := runVerdictPush(); err != nil {
+			fmt.Fprintln(os.Stderr, "herd verdict-push:", err)
+			os.Exit(1)
+		}
+		return
 	case "review-ingest":
 		runReviewIngest()
 
