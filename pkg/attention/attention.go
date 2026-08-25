@@ -405,8 +405,44 @@ func findAttentionAgent(agents []kick.AgentEntry, name string) (kick.AgentEntry,
 	return kick.AgentEntry{}, false
 }
 
-// MarshalJSON ensures Result (with its map) serializes cleanly.
+// MarshalJSON ensures Result (with its map) serializes cleanly, and carries the
+// same UNKNOWN discriminator the human summary reports.
+//
+// FAC-634: FAC-604 fixed Summary() so a zero-lane scan stopped claiming "fleet
+// healthy", and left this surface emitting {total:0, needing:0, items:null} with
+// exit 0. A machine consumer therefore still read a false green from exactly the
+// state that fix existed to flag -- the write path corrected and the read path
+// not, which is the same shape as FAC-627/628.
+//
+// `scanned` is the discriminator: false means the roster resolved empty and
+// nothing was examined, so needing:0 carries no information. A caller must be
+// able to tell "nothing needs eyes" from "nothing was looked at" without parsing
+// prose.
 func (r Result) MarshalJSON() ([]byte, error) {
 	type alias Result
-	return json.Marshal(alias(r))
+	return json.Marshal(struct {
+		alias
+		Scanned bool   `json:"scanned"`
+		State   string `json:"state"`
+		Summary string `json:"summary"`
+	}{
+		alias:   alias(r),
+		Scanned: r.Total > 0,
+		State:   attentionState(r),
+		Summary: Summary(r),
+	})
+}
+
+// attentionState is the machine-readable verdict: UNKNOWN when nothing was
+// scanned, ATTENTION when lanes need eyes, HEALTHY only after a real scan found
+// nothing wrong.
+func attentionState(r Result) string {
+	switch {
+	case r.Total == 0:
+		return "UNKNOWN"
+	case r.Needing > 0:
+		return "ATTENTION"
+	default:
+		return "HEALTHY"
+	}
 }

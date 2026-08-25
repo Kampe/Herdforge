@@ -162,7 +162,9 @@ func (h *Harvester) harvest(ctx context.Context, fetch bool) (*HarvestResult, er
 		for _, item := range items {
 			requests = append(requests, item.request)
 		}
-		batch, err := h.admitHarvestBatch(requests)
+		// Size admission for the fan-out we actually run, not the queue depth.
+		// The semaphore below caps concurrency at min(max(NumCPU,2),8).
+		batch, err := h.admitHarvestBatchBounded(requests, harvestFanOutLimit())
 		if err != nil {
 			return nil, err
 		}
@@ -306,7 +308,26 @@ func (h *Harvester) isNonMutatingRoot(ctx context.Context, root string) (bool, e
 	}
 }
 
+// harvestFanOutLimit mirrors the semaphore bound used for the fetch fan-out, so
+// disk admission is sized for peak concurrency rather than queue depth. Kept
+// beside its only consumers; if the semaphore bound changes, this must change
+// with it or the gate is sized for a concurrency the pipeline never reaches.
+func harvestFanOutLimit() int {
+	limit := runtime.NumCPU()
+	if limit < 2 {
+		limit = 2
+	}
+	if limit > 8 {
+		limit = 8
+	}
+	return limit
+}
+
 func (h *Harvester) admitHarvestBatch(requests []resources.DiskRequest) (*preadmittedBatch, error) {
+	return h.admitHarvestBatchBounded(requests, 0)
+}
+
+func (h *Harvester) admitHarvestBatchBounded(requests []resources.DiskRequest, maxConcurrent int) (*preadmittedBatch, error) {
 	provider, ok := h.DiskAdmission.(resources.DiskPlanProvider)
 	if !ok {
 		return nil, harvestDiskError(resources.DiskReasonUnavailable, resources.DiskRequirement{})
@@ -314,7 +335,16 @@ func (h *Harvester) admitHarvestBatch(requests []resources.DiskRequest) (*preadm
 	if _, ok := h.DiskAdmission.(resources.BatchDiskAdmission); !ok {
 		return nil, harvestDiskError(resources.DiskReasonUnavailable, resources.DiskRequirement{})
 	}
-	plan, err := provider.PlanDiskAdmission(requests)
+	bounded, ok := provider.(interface {
+		PlanDiskAdmissionBounded([]resources.DiskRequest, int) (resources.DiskAdmissionPlan, error)
+	})
+	var plan resources.DiskAdmissionPlan
+	var err error
+	if ok && maxConcurrent > 0 {
+		plan, err = bounded.PlanDiskAdmissionBounded(requests, maxConcurrent)
+	} else {
+		plan, err = provider.PlanDiskAdmission(requests)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("disk capacity gate: plan harvest batch: %w", err)
 	}

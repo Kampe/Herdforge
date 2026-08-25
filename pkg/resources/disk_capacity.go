@@ -37,6 +37,18 @@ type DiskPolicy struct {
 	RecoveryPercent               float64
 }
 
+// FAC-635: PlanDiskAdmission summed the requirement of EVERY request in a batch,
+// so a harvest over 333 candidate worktrees demanded 333 x 192 MiB = 62 GiB up
+// front. The harvest fan-out is bounded by a semaphore at min(max(NumCPU,2),8),
+// so at most EIGHT run at once and the real peak is 1.5 GiB. The gate refused
+// work on a disk with 77 GB free, and it tightened as the backlog grew: the more
+// work waiting, the more certainly harvest was blocked. Past roughly 420
+// worktrees it would have exceeded the whole volume and harvest could never have
+// run again regardless of free space.
+//
+// Sum-of-all-work is the wrong measure for a bounded pipeline; peak-concurrent is
+// the right one.
+
 // DiskRequirement describes bounded headroom for one disk-growing operation.
 type DiskRequirement struct {
 	Bytes  uint64
@@ -133,13 +145,13 @@ const (
 )
 
 const (
-	DiskReasonNone                  = "none"
-	DiskReasonBelowThreshold        = "below_threshold"
-	DiskReasonHysteresis            = "hysteresis"
-	DiskReasonInodeExhaustion       = "inode_exhaustion"
-	DiskReasonTempVolumeDivergence  = "temp_volume_divergence"
-	DiskReasonUnavailable           = "unavailable"
-	DiskReasonInvalid               = "invalid"
+	DiskReasonNone                 = "none"
+	DiskReasonBelowThreshold       = "below_threshold"
+	DiskReasonHysteresis           = "hysteresis"
+	DiskReasonInodeExhaustion      = "inode_exhaustion"
+	DiskReasonTempVolumeDivergence = "temp_volume_divergence"
+	DiskReasonUnavailable          = "unavailable"
+	DiskReasonInvalid              = "invalid"
 	// DiskReasonInvalidRequest separates a malformed CALLER REQUEST from a real
 	// capacity problem. Both used to report reason="invalid" with a zeroed
 	// DiskEvidence, so a harvest request that simply named no byte/inode
@@ -342,11 +354,19 @@ func (g *CapacityGate) Admit(request DiskRequest) DiskDecision {
 // aggregates bytes/inodes with overflow checks. Each volume receives the
 // total headroom for all operations that can grow it.
 func (g *CapacityGate) PlanDiskAdmission(requests []DiskRequest) (DiskAdmissionPlan, error) {
+	return g.PlanDiskAdmissionBounded(requests, 0)
+}
+
+// PlanDiskAdmissionBounded sizes the plan for at most maxConcurrent simultaneous
+// operations per filesystem. maxConcurrent <= 0 is unbounded, preserving the old
+// behaviour for callers that genuinely need every operation admitted at once.
+func (g *CapacityGate) PlanDiskAdmissionBounded(requests []DiskRequest, maxConcurrent int) (DiskAdmissionPlan, error) {
 	if g == nil || g.Backend == nil {
 		return DiskAdmissionPlan{}, fmt.Errorf("disk capacity gate unavailable")
 	}
 	totals := make(map[string]DiskRequirement)
 	paths := make(map[string]string)
+	seenPerVolume := make(map[string]int)
 	for _, request := range requests {
 		if request.RequiredBytes == 0 || request.RequiredInodes == 0 {
 			return DiskAdmissionPlan{}, &DiskAdmissionError{Scope: "plan", Decision: diskBlocked(DiskEvidence{Operation: "harvest_batch", RequiredBytes: request.RequiredBytes, RequiredInodes: request.RequiredInodes}, DiskReasonInvalidRequest)}
@@ -381,6 +401,15 @@ func (g *CapacityGate) PlanDiskAdmission(requests []DiskRequest) (DiskAdmissionP
 			combined, err := AggregateDiskRequirement(current, DiskRequirement{Bytes: request.RequiredBytes, Inodes: request.RequiredInodes})
 			if err != nil {
 				return DiskAdmissionPlan{}, &DiskAdmissionError{Scope: id, Decision: diskBlocked(DiskEvidence{Operation: "harvest_batch", FilesystemID: id, RequiredBytes: request.RequiredBytes, RequiredInodes: request.RequiredInodes}, DiskReasonInvalid)}
+			}
+			// Cap the per-filesystem aggregate at the pipeline's real peak. Past
+			// maxConcurrent items the total stops growing, because no more than
+			// that many ever exist on disk at the same moment.
+			if maxConcurrent > 0 {
+				if seenPerVolume[id] >= maxConcurrent {
+					continue
+				}
+				seenPerVolume[id]++
 			}
 			totals[id] = combined
 			paths[id] = canonical
