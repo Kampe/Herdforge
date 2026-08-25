@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/Kampe/Herdforge/pkg/herdr"
+	"github.com/Kampe/Herdforge/pkg/launch"
 	"github.com/Kampe/Herdforge/pkg/reviewingest"
 	"github.com/Kampe/Herdforge/pkg/reviewledger"
 	"github.com/Kampe/Herdforge/pkg/router"
@@ -805,7 +806,45 @@ func provenBuilderFamily(root, sha string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return l.ProvenBuilderFamily(sha)
+	family, err := l.ProvenBuilderFamily(sha)
+	if err != nil || family != "" {
+		return family, err
+	}
+	// FAC-637: fall back to the LAUNCH RECEIPTS. A receipt records "lane X ran
+	// provider grok on branch Y"; if the candidate commit is reachable from
+	// branch Y, the launch that produced it is known and the family is provable.
+	//
+	// This is not the domain inference a reviewer correctly refused ("apps/api is
+	// nominally api-crusader's territory"). It is the recorded launch for the
+	// branch the commit actually sits on, joined by git reachability rather than
+	// by guessing which lane owns a directory.
+	return builderFamilyFromReceipts(root, sha), nil
+}
+
+// builderFamilyFromReceipts resolves authorship by joining a commit to the
+// branch of a recorded launch. Returns "" when no receipt's branch contains it.
+func builderFamilyFromReceipts(root, sha string) string {
+	receipts, err := launch.ReadReceipts(launch.DefaultReceiptPath())
+	if err != nil {
+		return ""
+	}
+	for i := len(receipts) - 1; i >= 0; i-- {
+		r := receipts[i]
+		branch := strings.TrimSpace(r.Branch)
+		if branch == "" || strings.TrimSpace(r.Provider) == "" {
+			continue
+		}
+		family := router.FamilyFor(r.Provider, r.Model)
+		if family == "" || !reviewledger.FamilyAllowlist[family] {
+			continue
+		}
+		// Reachability, not equality: the commit need not be the branch tip, it
+		// only has to have been produced on that branch.
+		if err := exec.Command("git", "-C", root, "merge-base", "--is-ancestor", sha, branch).Run(); err == nil {
+			return family
+		}
+	}
+	return ""
 }
 
 // agentNameFor is the name this dispatch will give its reviewer, so eviction can
