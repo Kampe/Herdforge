@@ -7711,6 +7711,52 @@ func runReviewLedger() {
 			fmt.Fprintf(os.Stderr, "review-ledger: encode tier report: %v\n", err)
 			os.Exit(1)
 		}
+	case "readiness":
+		// FAC-636: MergeReadiness existed only as a Go API, so the coordinator had
+		// no way to classify candidates except grepping the ledger -- which is
+		// exactly how verdict ROWS get counted instead of verdict VALUES read. I
+		// made that mistake twice in one session and told the review supervisor to
+		// merge eight PRs that reviewers had FAILED. A safety rule with no callable
+		// surface is a rule nobody follows.
+		//
+		// Reads any number of SHAs, one verdict decision each, so a caller can pipe
+		// a whole open-PR list through it and act on the answer.
+		if len(os.Args) < 4 {
+			fmt.Fprintln(os.Stderr, "Usage: herd review-ledger readiness <sha>... (or - to read SHAs from stdin)")
+			os.Exit(2)
+		}
+		shas := os.Args[3:]
+		if len(shas) == 1 && shas[0] == "-" {
+			shas = nil
+			sc := bufio.NewScanner(os.Stdin)
+			for sc.Scan() {
+				if f := strings.Fields(sc.Text()); len(f) > 0 {
+					shas = append(shas, f[len(f)-1])
+				}
+			}
+		}
+		out := make([]reviewledger.MergeReadiness, 0, len(shas))
+		exit := 0
+		for _, sha := range shas {
+			r, rErr := l.MergeReadinessFor(sha)
+			if rErr != nil {
+				// Fail closed: an unreadable ledger is not an absence of dissent.
+				fmt.Fprintf(os.Stderr, "review-ledger readiness %s: %v\n", sha, rErr)
+				exit = 1
+				continue
+			}
+			out = append(out, r)
+			if !r.Ready {
+				exit = 1
+			}
+		}
+		if err := json.NewEncoder(os.Stdout).Encode(out); err != nil {
+			fmt.Fprintf(os.Stderr, "review-ledger: encode readiness: %v\n", err)
+			os.Exit(1)
+		}
+		// Non-zero when ANY candidate is not ready, so a shell caller cannot
+		// mistake "some blocked" for "all clear".
+		os.Exit(exit)
 	case "drift":
 		cfg, err := config.LoadConfig(".herd/herd.yaml")
 		if err != nil {
