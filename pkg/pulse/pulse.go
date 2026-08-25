@@ -240,13 +240,23 @@ type CallbackObservation struct {
 // unfiltered, unexpired SHA set from the review ledger; it is intentionally
 // distinct from drain's NeedReview, which is the live unmerged-candidate set.
 type ReviewObservation struct {
-	Known         bool     `json:"known"`
-	Error         string   `json:"error,omitempty"`
-	Pending       int      `json:"pending"`
-	PendingRefs   []string `json:"pending_refs,omitempty"`
-	RawVetoed     int      `json:"raw_vetoed"`
-	RawVetoedRefs []string `json:"raw_vetoed_refs,omitempty"`
-	Saturated     bool     `json:"saturated,omitempty"`
+	Known       bool     `json:"known"`
+	Error       string   `json:"error,omitempty"`
+	Pending     int      `json:"pending"`
+	PendingRefs []string `json:"pending_refs,omitempty"`
+	// InboxUningested counts verdict artifacts sitting in the review inbox that
+	// the ledger has never recorded.
+	//
+	// FAC-624: Pending counts ledger PENDING ROWS, which is correct for its
+	// definition and was reported as 0 while 88 un-ingested verdicts sat in the
+	// inbox. A careful observer read "review.pending=0, known=true" as "no review
+	// work waiting" -- a reasonable reading of that name, and wrong. The
+	// operationally meaningful backlog was invisible to pulse entirely, so
+	// nothing surfaced the queue that actually needed draining.
+	InboxUningested int      `json:"inbox_uningested"`
+	RawVetoed       int      `json:"raw_vetoed"`
+	RawVetoedRefs   []string `json:"raw_vetoed_refs,omitempty"`
+	Saturated       bool     `json:"saturated,omitempty"`
 }
 
 // QuotaObservation is one read of capacity/quota posture.
@@ -686,8 +696,8 @@ func Plan(obs Observation, opts Options) (Snapshot, error) {
 		// way to corroborate it instead of applying it.
 		if !a.IdleCorroborated() {
 			actions = append(actions, Action{
-				Kind:   ActionWouldRun,
-				Target: target,
+				Kind:     ActionWouldRun,
+				Target:   target,
 				WouldRun: "reap_lane " + target,
 				Reason: "reap WITHHELD: " + reason + "; harness " + a.Kind +
 					" misreports idle for an actively-working pane, and a live foreground process (" +
