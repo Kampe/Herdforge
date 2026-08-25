@@ -32,11 +32,11 @@ func TestHonestlyUnrecordedFamily_AcceptsCandidUnknowns(t *testing.T) {
 // not verify. FAC-590 refuses those and this must not become a bypass.
 func TestHonestlyUnrecordedFamily_RejectsTyposAndRealFamilies(t *testing.T) {
 	for _, in := range []string{
-		"anthropc",   // typo of anthropic
-		"anthropic",  // a real family: must go through the normal gate
+		"anthropc",  // typo of anthropic
+		"anthropic", // a real family: must go through the normal gate
 		"openai",
 		"xai",
-		"codex",      // a harness name, wrong but still an assertion
+		"codex", // a harness name, wrong but still an assertion
 		"",
 		"Kampe",      // the human git identity, seen in the wild
 		"unknownish", // not a sentinel, must not prefix-match loosely

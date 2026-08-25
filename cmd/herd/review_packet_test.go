@@ -175,8 +175,8 @@ func TestReviewPacketMarksUnprovenBuilderFamilyExplicitly(t *testing.T) {
 	body := reviewPacketBody("CHA-8", strings.Repeat("d", 40), "surface",
 		"/repo/.herd/review/inbox/v.md", "review-supervisor", "", "w2")
 
-	if !strings.Contains(body, "builder-family: unproven") {
-		t.Error("an absent family must render as an explicit 'unproven', never blank")
+	if !strings.Contains(body, "builder-family: unrecorded") {
+		t.Error("an absent family must render the canonical unrecorded sentinel, never blank")
 	}
 }
 
@@ -282,5 +282,26 @@ func TestReviewPacketNamesAnExecutableBinaryPath(t *testing.T) {
 		if strings.HasPrefix(trimmed, "herd verdict-push") {
 			t.Fatalf("transport line names a bare `herd`, which is not on a reviewer's PATH: %q", trimmed)
 		}
+	}
+}
+
+// FAC-630: the packet emitted the bare literal "unproven" while the ledger's
+// canonical sentinel is reviewledger.FamilyUnrecorded ("unrecorded"). Two
+// spellings for one concept survived only because ingest happened to accept both.
+// Pin them together so a future rename of either cannot silently desynchronise
+// what reviewers are told to write from what admission recognises.
+func TestPacketUnrecordedSentinelMatchesTheLedgerConstant(t *testing.T) {
+	got := builderFamilyOrUnrecorded("")
+	if got != reviewledger.FamilyUnrecorded {
+		t.Fatalf("packet emits %q but the ledger sentinel is %q; reviewers would write a value admission does not canonically recognise",
+			got, reviewledger.FamilyUnrecorded)
+	}
+	body := reviewPacketBody("CHA-1", strings.Repeat("a", 40), "s",
+		"/repo/.herd/review/inbox/v.md", "", "", "w2")
+	if !strings.Contains(body, "builder-family: "+reviewledger.FamilyUnrecorded) {
+		t.Errorf("packet must instruct the canonical sentinel; body lacks it")
+	}
+	if strings.Contains(body, "builder-family: unproven") {
+		t.Error("the stale 'unproven' spelling must not reappear in the packet")
 	}
 }

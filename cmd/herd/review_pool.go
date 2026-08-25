@@ -738,13 +738,20 @@ func herdBinaryPathForPacket() string {
 	return "herd"
 }
 
-// builderFamilyOrUnproven keeps the packet honest when provenance is absent. A
+// builderFamilyOrUnrecorded keeps the packet honest when provenance is absent. A
 // blank value would render "builder-family:" with nothing after it, which a
 // reviewer would fill in by guessing -- the exact behaviour that produced 25
 // refusals.
-func builderFamilyOrUnproven(family string) string {
+//
+// FAC-630: this emitted the bare literal "unproven" while the ledger's canonical
+// sentinel is reviewledger.FamilyUnrecorded ("unrecorded"). Two spellings for one
+// concept, which is the duplicate-rule defect FAC-613 removed from this repo, and
+// it meant every reviewer following the packet wrote a value that only survived
+// because ingest happened to accept both. It now emits the constant, so the
+// packet and the ledger cannot drift.
+func builderFamilyOrUnrecorded(family string) string {
 	if strings.TrimSpace(family) == "" {
-		return "unproven"
+		return reviewledger.FamilyUnrecorded
 	}
 	return family
 }
@@ -903,7 +910,7 @@ result the supervisor needs in order to release the slot and re-plan; silence is
 the only outcome that helps nobody.
 
 A verdict that stays on this filesystem is invisible to the ledger.
-`, ref, sha, surface, verdictPath, sha, ref, builderFamilyOrUnproven(builderFamily), reportHomeInstruction(reviewAgentName(ref, sha), supervisor, verdictPath, workspace))
+`, ref, sha, surface, verdictPath, sha, ref, builderFamilyOrUnrecorded(builderFamily), reportHomeInstruction(reviewAgentName(ref, sha), supervisor, verdictPath, workspace))
 }
 
 // settledAgentStatuses are the states in which a reviewer is no longer doing
