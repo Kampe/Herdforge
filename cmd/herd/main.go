@@ -388,6 +388,12 @@ func main() {
 	case "harvest":
 		runHarvest()
 
+	case "review-host":
+		if err := runReviewHostFence(os.Args[2:]); err != nil {
+			fmt.Fprintf(os.Stderr, "herd review-host: %v\n", err)
+			os.Exit(1)
+		}
+
 	case "capacity":
 		if err := runCapacity(os.Args[2:]); err != nil {
 			fmt.Fprintf(os.Stderr, "herd capacity: %v\n", err)
