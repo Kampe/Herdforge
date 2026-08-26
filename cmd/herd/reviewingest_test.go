@@ -178,3 +178,29 @@ func TestIngestTaskIdentityIsSharedByBothRows(t *testing.T) {
 		t.Errorf("whitespace-only must not count as a card ref, got %q", got)
 	}
 }
+
+// FAC-675: a pool slot was leased at launch and released only when the launching
+// command returned. A reviewer that outlives its launcher -- the normal case,
+// since the launcher exits as soon as the agent starts -- left the lease held
+// with nothing running behind it. The pool then reported itself saturated while
+// slots sat idle, and dispatch waited on capacity that existed.
+func TestPoolReclaimIsSilentWithoutARecordedLease(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("HERD_ROOT", root)
+	t.Setenv("HERD_REVIEW_LEDGER", filepath.Join(root, "ledger.jsonl"))
+	if err := os.WriteFile(filepath.Join(root, "ledger.jsonl"),
+		[]byte(`{"event":"record","sha":"`+strings.Repeat("a", 40)+`","reviewer":"r1"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// A launch predating FAC-656 has no recorded lease. There is nothing to
+	// reclaim and nothing to report: it must not error, and must not guess at a
+	// slot from the surface path, because a guess could release a slot another
+	// reviewer has since taken.
+	reclaimReviewPoolSlotFor(strings.Repeat("a", 40))
+}
+
+// An empty sha identifies nothing and must never trigger a release.
+func TestPoolReclaimRefusesAnEmptySHA(t *testing.T) {
+	t.Setenv("HERD_ROOT", t.TempDir())
+	reclaimReviewPoolSlotFor("   ")
+}
