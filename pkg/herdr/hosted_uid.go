@@ -836,6 +836,41 @@ func SignalHostedPaneTree(paneID string) error {
 	return first
 }
 
+// ReapHostedPaneSnapshot terminates only processes captured while an exact
+// pane identity was still live. Every signal revalidates PID plus start token,
+// so a PID reused after tab close is refused rather than killed.
+func ReapHostedPaneSnapshot(info *HostedPaneIdentity) error {
+	if info == nil || strings.TrimSpace(info.PaneID) == "" || len(info.Tree) == 0 {
+		return fmt.Errorf("%w: captured pane process tree is empty", ErrHostedUIDProofFailed)
+	}
+	var first error
+	self := osGetpid()
+	seen := map[int]bool{self: true}
+	var targets []HostedProcessIdentity
+	for _, p := range info.Tree {
+		if p.PID <= 0 || strings.TrimSpace(p.StartToken) == "" || seen[p.PID] {
+			continue
+		}
+		seen[p.PID] = true
+		targets = append(targets, p)
+	}
+	if len(targets) == 0 {
+		return fmt.Errorf("%w: captured pane process tree has no signalable identities", ErrHostedUIDProofFailed)
+	}
+	for _, p := range targets {
+		if err := signalBoundIdentity(p, syscall.SIGTERM); err != nil && first == nil {
+			first = err
+		}
+	}
+	sleepBrief()
+	for _, p := range targets {
+		if err := signalBoundIdentity(p, syscall.SIGKILL); err != nil && first == nil {
+			first = err
+		}
+	}
+	return first
+}
+
 // TerminateHostedPaneTree signals the isolation tree then closes the tab.
 // Prefer SignalHostedPaneTree + lifecycle rollback + tab close when a tool-child
 // lifecycle is bound (so Invalidate/dropToolChild still run).
