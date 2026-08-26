@@ -198,6 +198,22 @@ type DiskEvidence struct {
 	FailedFreePercent  *float64 `json:"failed_free_percent,omitempty"`
 	FailedFreeInodes   *uint64  `json:"failed_free_inodes,omitempty"`
 	NextAction         string   `json:"next_action"`
+	// Reclaimable names where space can be recovered WITHOUT touching fleet
+	// state, largest first (FAC-654). A gate that reports only "below
+	// threshold" tells an operator that they are stuck; it does not tell them
+	// that gigabytes of rebuildable cache are sitting next to the reserve.
+	Reclaimable []ReclaimableClass `json:"reclaimable,omitempty"`
+}
+
+// ReclaimableClass is one bucket of space that can be recovered without
+// deleting any unique work: build caches, download caches, dead cache
+// generations. Never worktrees, branches, leases, or ledgers -- those are
+// fleet state and are the operator's call, not a gate's suggestion.
+type ReclaimableClass struct {
+	Path    string `json:"path"`
+	Bytes   uint64 `json:"bytes"`
+	Kind    string `json:"kind"`
+	Rebuild string `json:"rebuild"`
 }
 
 type DiskDecision struct {
@@ -670,6 +686,15 @@ func diskBlocked(e DiskEvidence, reason string) DiskDecision {
 		e.NextAction = DiskActionRetryProbe
 	default:
 		e.NextAction = DiskActionRecoverSpace
+		// FAC-654: attach WHERE the space is. "recover_capacity_without_cleanup"
+		// told an operator they were stuck without telling them what to do, and
+		// the only large thing they could see was worktrees -- which can hold
+		// uncommitted work or an unmerged branch. Reporting rebuildable caches
+		// makes the obvious action also the safe one. Best-effort: a scan that
+		// finds nothing simply omits the field, and never blocks the refusal.
+		if home, hErr := os.UserHomeDir(); hErr == nil {
+			e.Reclaimable = ScanReclaimable(home)
+		}
 	}
 	return DiskDecision{State: DiskBlocked, Evidence: e}
 }
