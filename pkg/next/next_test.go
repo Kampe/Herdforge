@@ -166,3 +166,56 @@ func TestSelftest(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// FAC-664: the blocked refs were named and the claimable ones were not, so the
+// line read "2 claimable, 7 blocked by ...: CHA-3193, CHA-3194, ...". An
+// operator could see exactly what to REPAIR and nothing about what to DO. A
+// count is reportable; only an identity is dispatchable.
+func TestClaimPreviewNamesTheTasksAnOperatorCanActOn(t *testing.T) {
+	p := ClaimPreview{
+		Claimable:         2,
+		ClaimableRefs:     []string{"CHA-100", "CHA-101"},
+		ProvenanceBlocked: 1,
+		BlockedRefs:       []string{"CHA-999"},
+	}
+	got := p.Description()
+	for _, want := range []string{"CHA-100", "CHA-101", "CHA-999"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("description must name %q so it can be dispatched: %q", want, got)
+		}
+	}
+}
+
+// The no-blockers path must name them too, or the healthy case is the one that
+// stays undispatchable.
+func TestClaimPreviewNamesClaimableEvenWithNoBlockers(t *testing.T) {
+	got := ClaimPreview{Claimable: 1, ClaimableRefs: []string{"CHA-7"}}.Description()
+	if !strings.Contains(got, "CHA-7") {
+		t.Errorf("a clean queue must still name its claimable task: %q", got)
+	}
+}
+
+// A long queue is truncated for readability, but a truncated list SAYS so: a
+// silently capped list is a count wearing an identity's clothes.
+func TestClaimPreviewTruncationAnnouncesItself(t *testing.T) {
+	var refs []string
+	for i := 0; i < 12; i++ {
+		refs = append(refs, "CHA-"+string(rune('a'+i)))
+	}
+	got := ClaimPreview{Claimable: 12, ClaimableRefs: refs}.Description()
+	if !strings.Contains(got, "+4 more") {
+		t.Errorf("truncation must be stated, not silent: %q", got)
+	}
+}
+
+// Zero claimable must not gain a stray suffix, and must keep saying it is a
+// filter result rather than an idle queue (FAC-623).
+func TestClaimPreviewZeroStillExplainsItself(t *testing.T) {
+	got := ClaimPreview{Role: "scout-planner"}.Description()
+	if !strings.Contains(got, "filter result") {
+		t.Errorf("zero must stay explained as a filter result: %q", got)
+	}
+	if strings.Contains(got, ": ,") || strings.HasSuffix(strings.TrimSpace(got), ":") {
+		t.Errorf("no dangling ref suffix on zero: %q", got)
+	}
+}
