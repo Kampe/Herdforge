@@ -11,7 +11,7 @@ import (
 )
 
 func healthy() CapacityObservation {
-	return CapacityObservation{HerdrRunning: true, AgentsListed: true, MemAvailMiB: 36000, SwapUsedMiB: 0}
+	return CapacityObservation{HerdrRunning: true, AgentsListed: true, MemAvailMiB: 36000, SwapUsedMiB: 0, SwapTotalMiB: 8192, PressurePct: 0.2}
 }
 
 func TestCapacityRefusesWhenHerdrIsDown(t *testing.T) {
@@ -124,33 +124,6 @@ func TestAdmissionLeaseIsExclusiveThenReclaimableAfterExpiry(t *testing.T) {
 	// crash into an outage.
 	if _, held4, err := holdAdmissionLease(0); err != nil || !held4 {
 		t.Fatalf("an expired lease was not reclaimable: held=%v err=%v", held4, err)
-	}
-}
-
-// FAC-686: swap-in-use is an EARLIER signal than free bytes. W4 held 5GB of
-// swap with active writeback while the Normal zone sat at its minimum watermark
-// and MemAvailable still looked survivable. Fragmentation is invisible to
-// MemAvailable; swapping is not.
-func TestCapacityRefusesAHostThatHasStartedSwapping(t *testing.T) {
-	o := healthy()
-	o.MemAvailMiB = 30000 // plenty by the free-bytes test alone
-	o.SwapUsedMiB = 5120
-	c := decideCapacity(o, 4, 4096, 6144)
-	if c.Admit {
-		t.Fatal("admitted a reviewer onto a host that was already swapping")
-	}
-	if !strings.Contains(c.Reason, "swapping") {
-		t.Fatalf("refusal does not name swap as the cause: %s", c.Reason)
-	}
-}
-
-func TestIncidentalSwapDoesNotRefuse(t *testing.T) {
-	// A host that reclaimed a few pages is not degrading. Refusing at one byte
-	// of swap would fence healthy hosts permanently.
-	o := healthy()
-	o.SwapUsedMiB = 64
-	if c := decideCapacity(o, 4, 4096, 6144); !c.Admit {
-		t.Fatalf("incidental swap use refused a healthy host: %s", c.Reason)
 	}
 }
 
@@ -277,5 +250,64 @@ func TestFreshMemoryReadingIsUsable(t *testing.T) {
 	v, ok := r.Value()
 	if !ok || v.TotalMiB != 48173 {
 		t.Fatalf("a fresh reading was not usable: %+v ok=%v", v, ok)
+	}
+}
+
+// FAC-693: stale swap is a scar, not a wound. After the incident W4 carried
+// 1.7GB of swap while completely idle -- zero paging activity, PSI 0.26%,
+// 23.9GB available, 0 reviewers -- and the level-based gate refused every
+// launch. Nothing the fleet could do would clear it; only a manual swapoff.
+func TestStaleSwapOnAnIdleHostDoesNotRefuse(t *testing.T) {
+	o := healthy()
+	o.SwapUsedMiB, o.SwapTotalMiB = 1751, 8192 // residue from an earlier incident
+	o.PressurePct = 0.26                       // measured: no pressure at all
+	c := decideCapacity(o, 3, 4096, 6144)
+	if !c.Admit {
+		t.Fatalf("a healthy idle host was fenced by swap RESIDUE: %s", c.Reason)
+	}
+}
+
+func TestRealMemoryPressureRefuses(t *testing.T) {
+	// The thing that actually hurts: work stalling on memory right now.
+	o := healthy()
+	o.PressurePct = 35
+	c := decideCapacity(o, 3, 4096, 6144)
+	if c.Admit {
+		t.Fatal("admitted a reviewer onto a host where work is stalling on memory")
+	}
+	if !strings.Contains(c.Reason, "PSI") {
+		t.Fatalf("refusal does not name the pressure signal: %s", c.Reason)
+	}
+}
+
+func TestUnavailablePSIDoesNotRefuse(t *testing.T) {
+	// A kernel without PSI must not be fenced for lacking an instrument.
+	o := healthy()
+	o.PressurePct = -1
+	if c := decideCapacity(o, 3, 4096, 6144); !c.Admit {
+		t.Fatalf("unmeasurable pressure was treated as high pressure: %s", c.Reason)
+	}
+}
+
+func TestNearlyFullSwapStillRefusesAsABackstop(t *testing.T) {
+	// Level is kept as a far backstop: swap genuinely near full is exhaustion,
+	// not residue, and there is nowhere left to page into.
+	o := healthy()
+	o.SwapUsedMiB, o.SwapTotalMiB = 7000, 8192 // ~85%
+	c := decideCapacity(o, 3, 4096, 6144)
+	if c.Admit {
+		t.Fatal("admitted with swap nearly exhausted")
+	}
+	if !strings.Contains(c.Reason, "consumed") {
+		t.Fatalf("refusal does not name swap exhaustion: %s", c.Reason)
+	}
+}
+
+func TestUnknownSwapTotalCannotTripTheBackstop(t *testing.T) {
+	// Never divide by an invented total.
+	o := healthy()
+	o.SwapUsedMiB, o.SwapTotalMiB = 5000, -1
+	if c := decideCapacity(o, 3, 4096, 6144); !c.Admit {
+		t.Fatalf("unreadable swap total produced a refusal: %s", c.Reason)
 	}
 }

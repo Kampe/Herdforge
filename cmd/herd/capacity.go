@@ -150,7 +150,11 @@ type CapacityObservation struct {
 	HerdrDetail  string `json:"herdr_detail,omitempty"`
 	MemTotalMiB  int64  `json:"mem_total_mib"`     // -1 unknown
 	MemAvailMiB  int64  `json:"mem_available_mib"` // -1 unknown
-	SwapUsedMiB  int64  `json:"swap_used_mib"`     // -1 unknown
+	SwapUsedMiB  int64  `json:"swap_used_mib"`
+	SwapTotalMiB int64  `json:"swap_total_mib"`
+	// PressurePct is PSI "some avg10" for memory: the share of the last 10s
+	// that work stalled waiting on memory. -1 where PSI is unavailable.
+	PressurePct float64 `json:"memory_pressure_pct"` // -1 unknown
 	// Processes/Threads/FDs, not RSS, are the plausible binding constraints
 	// here -- see the note on hostProcessLoad. -1 means unmeasured.
 	Processes int `json:"processes"`
@@ -209,10 +213,32 @@ func (c Capacity) String() string {
 // Gate order matters: report the cause that actually stopped the launch, not
 // the first one that happens to be checkable. herdr being down is the cause of
 // the incident this exists for, so it is named first.
-// swapDegradedMiB is the point at which swap use stops being incidental. Zero
-// would refuse on a single reclaimed page; this is "the host has started paying
-// for memory it does not have".
-const swapDegradedMiB = 512
+// FAC-693: this gate used to refuse whenever swap USE exceeded 512MiB. That
+// permanently fenced a healthy host.
+//
+// Swap use is HYSTERETIC. Linux does not fault pages back in when memory frees
+// up -- they sit in swap until something touches them, or until swapoff. So
+// after the 2026-08-26 incident W4 carried 1.7GB of stale swap while completely
+// idle, and the gate refused every launch. Measured at that moment:
+//
+//	pswpin/pswpout   UNCHANGED over 5s -- zero paging activity
+//	PSI some avg10   0.26%             -- no pressure at all
+//	MemAvailable     23.9GB
+//	reviewers        0
+//
+// The host was fine. The gate was reading a scar as a wound, and nothing the
+// fleet could do would clear it -- only a manual swapoff. A gate nobody can
+// satisfy is an outage, not a safety property.
+//
+// The phenomenon is a RATE, so measure the rate. PSI reports the share of time
+// work is stalled waiting on memory, which is exactly "is memory hurting right
+// now". 20% matches the operator's own alerting guidance for this host.
+const memoryPressurePct = 20
+
+// swapExhaustedPct keeps a LEVEL check only as a far backstop: swap genuinely
+// near full is real exhaustion rather than residue, and there is nowhere left
+// to page into.
+const swapExhaustedPct = 75
 
 func decideCapacity(o CapacityObservation, limit int, perReviewerMiB, floorMiB int64) Capacity {
 	c := Capacity{CapacityObservation: o, ReviewLimit: limit, NeedMiB: perReviewerMiB + floorMiB}
@@ -239,14 +265,19 @@ func decideCapacity(o CapacityObservation, limit int, perReviewerMiB, floorMiB i
 			c.Reason += fmt.Sprintf("; %d of them are idle and reapable: %s",
 				o.ReviewersIdle, strings.Join(o.IdleReviewerID, " "))
 		}
-	case o.SwapUsedMiB > swapDegradedMiB:
-		// Swapping means the host is already losing, and it degrades long before
-		// MemAvailable looks alarming. W4 held 5GB of swap with active writeback
-		// while free memory sat at the kernel's minimum watermark.
-		c.Reason = fmt.Sprintf("host is already swapping (%dMiB in use): it is degrading now, and another reviewer accelerates it", o.SwapUsedMiB)
+	case o.PressurePct >= memoryPressurePct:
+		// Memory PRESSURE, not swap residue. PSI reports the share of time work
+		// is stalled waiting on memory, which is the thing that actually hurts.
+		c.Reason = fmt.Sprintf("host is under memory pressure (PSI some avg10=%.2f%%, threshold %.0f%%): work is stalling on memory now",
+			o.PressurePct, float64(memoryPressurePct))
 		if o.ReviewersIdle > 0 {
 			c.Reason += fmt.Sprintf("; reap %d idle reviewer(s) first", o.ReviewersIdle)
 		}
+	case o.SwapTotalMiB > 0 && o.SwapUsedMiB*100/o.SwapTotalMiB >= swapExhaustedPct:
+		// Level, kept ONLY as a far backstop: swap genuinely near full is real
+		// exhaustion, not residue.
+		c.Reason = fmt.Sprintf("swap is %d%% consumed (%dMiB of %dMiB): the host is out of room to page into",
+			o.SwapUsedMiB*100/o.SwapTotalMiB, o.SwapUsedMiB, o.SwapTotalMiB)
 	case o.MemAvailMiB >= 0 && o.MemAvailMiB < c.NeedMiB:
 		c.Reason = fmt.Sprintf("%dMiB available, one reviewer needs %dMiB plus a %dMiB floor", o.MemAvailMiB, perReviewerMiB, floorMiB)
 		if o.ReviewersIdle > 0 {
@@ -272,7 +303,7 @@ func decideCapacity(o CapacityObservation, limit int, perReviewerMiB, floorMiB i
 }
 
 func observeCapacity() CapacityObservation {
-	o := CapacityObservation{MemTotalMiB: -1, MemAvailMiB: -1, SwapUsedMiB: -1, Processes: -1, Threads: -1, FDLimit: -1}
+	o := CapacityObservation{MemTotalMiB: -1, MemAvailMiB: -1, SwapUsedMiB: -1, SwapTotalMiB: -1, PressurePct: -1, Processes: -1, Threads: -1, FDLimit: -1}
 	o.HerdrRunning, o.HerdrDetail = herdrServerRunning()
 	// FAC-690: the memory reading now goes through pkg/freshness rather than
 	// three hand-rolled -1 sentinels. That package exists so an UNKNOWN cannot
@@ -285,6 +316,8 @@ func observeCapacity() CapacityObservation {
 	} else {
 		o.MemTotalMiB, o.MemAvailMiB, o.SwapUsedMiB = -1, -1, -1
 	}
+	o.SwapTotalMiB = hostSwapTotalMiB()
+	o.PressurePct = hostMemoryPressurePct()
 	o.MemorySource = mem.MustExplain(time.Now())
 	o.Processes, o.Threads, o.FDLimit = hostProcessLoad()
 	o.HarnessCapped, o.HarnessPath = harnessIsMemoryCapped("claude")
@@ -573,4 +606,59 @@ func readHostMemory() freshness.Reading[hostMemory] {
 	}
 	return freshness.Fresh(now.Format(time.RFC3339)+" /proc/meminfo", now,
 		hostMemory{TotalMiB: total, AvailMiB: avail, SwapUsedMiB: swapUsed})
+}
+
+// hostMemoryPressurePct reads PSI "some avg10" for memory: the share of the
+// last ten seconds that some task stalled waiting on memory.
+//
+// Returns -1 where PSI is unavailable, which the decision treats as unmeasured
+// and therefore NOT a refusal. A kernel without PSI must not be fenced for
+// lacking an instrument.
+func hostMemoryPressurePct() float64 {
+	raw, err := os.ReadFile("/proc/pressure/memory")
+	if err != nil {
+		return -1
+	}
+	for _, line := range strings.Split(string(raw), "\n") {
+		if !strings.HasPrefix(line, "some ") {
+			continue
+		}
+		for _, f := range strings.Fields(line) {
+			k, v, ok := strings.Cut(f, "=")
+			if !ok || k != "avg10" {
+				continue
+			}
+			n, err := strconv.ParseFloat(v, 64)
+			if err != nil {
+				return -1
+			}
+			return n
+		}
+	}
+	return -1
+}
+
+// hostSwapTotalMiB reports configured swap. -1 where unreadable, so the
+// backstop below cannot divide by an invented total.
+func hostSwapTotalMiB() int64 {
+	raw, err := os.ReadFile("/proc/meminfo")
+	if err != nil {
+		return -1
+	}
+	for _, line := range strings.Split(string(raw), "\n") {
+		k, v, ok := strings.Cut(line, ":")
+		if !ok || k != "SwapTotal" {
+			continue
+		}
+		fields := strings.Fields(v)
+		if len(fields) == 0 {
+			return -1
+		}
+		n, err := strconv.ParseInt(fields[0], 10, 64)
+		if err != nil {
+			return -1
+		}
+		return n / 1024
+	}
+	return -1
 }
