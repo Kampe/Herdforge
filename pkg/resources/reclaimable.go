@@ -87,18 +87,34 @@ func pnpmVersionNum(name string) int {
 	return n
 }
 
-// dirBytes sums a directory subtree. A directory that cannot be walked reports
-// what was readable rather than failing: an under-count understates how much is
-// reclaimable, which is the safe direction for a hint.
+// maxScanFiles bounds the walk. A build cache holds hundreds of thousands of
+// small files, and this runs inside a FAIL-CLOSED admission gate: a gate that
+// takes minutes to explain itself is worse than one that explains less. The
+// number only has to be good enough to rank classes and show an operator that
+// gigabytes are sitting there, so it stops early and reports a floor.
+const maxScanFiles = 20000
+
+// dirBytes sums a directory subtree, bounded.
+//
+// A directory that cannot be walked reports what was readable rather than
+// failing, and a subtree larger than the bound reports the bound's worth rather
+// than walking it all. Both under-count, which is the safe direction: an
+// under-count understates how much is reclaimable and can never talk an operator
+// into deleting something on a promise the scan did not verify.
 func dirBytes(root string) uint64 {
 	st, err := os.Stat(root)
 	if err != nil || !st.IsDir() {
 		return 0
 	}
 	var total uint64
+	var seen int
 	_ = filepath.WalkDir(root, func(_ string, d os.DirEntry, err error) error {
 		if err != nil || d.IsDir() {
 			return nil
+		}
+		seen++
+		if seen > maxScanFiles {
+			return filepath.SkipAll
 		}
 		if info, statErr := d.Info(); statErr == nil {
 			total += uint64(info.Size())

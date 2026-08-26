@@ -93,3 +93,30 @@ func TestScanReclaimableNeverSuggestsFleetState(t *testing.T) {
 		}
 	}
 }
+
+// FAC-654: the walk runs inside a FAIL-CLOSED admission gate, and a build cache
+// holds hundreds of thousands of small files. An unbounded walk makes the gate
+// slow exactly when the disk is full and the operator is already stuck, so it
+// stops early and reports a floor. Under-counting is the safe direction: it can
+// never talk an operator into deleting something the scan did not verify.
+func TestScanReclaimableIsBoundedAndUnderCounts(t *testing.T) {
+	home := t.TempDir()
+	dir := filepath.Join(home, "Library", "Caches", "go-build")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	const files = 64
+	for i := 0; i < files; i++ {
+		write(t, filepath.Join(dir, "f", string(rune('a'+i%26))+string(rune('a'+i/26))), 1000)
+	}
+	got := ScanReclaimable(home)
+	if len(got) == 0 {
+		t.Fatal("a populated cache must be reported")
+	}
+	if got[0].Bytes == 0 {
+		t.Error("a bounded scan must still report a usable floor, not zero")
+	}
+	if maxScanFiles <= 0 {
+		t.Fatal("the bound must be positive or the walk reports nothing")
+	}
+}

@@ -14,7 +14,7 @@ import (
 // FAC-240: controlSurfaceVersion is a compatibility boundary, not a display
 // number. Any command-contract change must add its new fingerprint below and
 // increment this value; ValidateControlSurfaceManifest rejects silent drift.
-const controlSurfaceVersion = 19
+const controlSurfaceVersion = 20
 
 type commandClass string
 
@@ -51,7 +51,7 @@ var commandNamesByClass = map[commandClass][]string{
 		"board-audit", "candidate", "handoffs", "control-surface", "mail", "preflight", "preflight-static", "process", "resources", "route", "scope", "selftest", "status", "tests-for", "throughput", "timeline", "tool-probe", "transcript", "unmerged", "verify", "worktrees",
 	},
 	classCoordinatorOnly: {
-		"activate", "approve", "attention", "board-done", "board-freeze", "board-frozen", "board-sync", "claude-only", "cleanup", "command", "commands", "containers", "control", "daemon", "deps", "dispatch", "doctor-models", "drain", "feedback", "fence-provision", "finish", "forge", "fresh-build", "goal-guard", "harvest", "harvest-merge", "hooks-pin", "herdr-deliver", "hold", "kick", "labels", "legacy-receipts", "lifecycle", "lock", "lost", "merge-admit", "merge-complete", "next", "no-claude", "overlap", "park", "posture", "pool", "pulse", "quota", "quota-supervisor", "receipt", "repl", "rescue", "reset-safe", "resolve-lane", "review", "review-classify", "review-ingest", "launch-record", "review-ledger", "verdict-harvest", "verdict-push", "send", "sh", "shoot", "shot", "slot", "spin", "standing", "stop", "task", "up", "usage", "watch", "wave", "wind-down", "verify-fac151",
+		"activate", "approve", "attention", "board-done", "board-freeze", "board-frozen", "board-sync", "claude-only", "cleanup", "command", "commands", "containers", "control", "daemon", "deps", "dispatch", "doctor-models", "drain", "feedback", "fence-provision", "finish", "forge", "fresh-build", "goal-guard", "harvest", "harvest-merge", "hooks-pin", "herdr-deliver", "hold", "kick", "labels", "lane-cut", "legacy-receipts", "lifecycle", "lock", "lost", "merge-admit", "merge-complete", "next", "no-claude", "overlap", "park", "posture", "pool", "pulse", "quota", "quota-supervisor", "receipt", "repl", "rescue", "reset-safe", "resolve-lane", "review", "review-classify", "review-ingest", "launch-record", "review-ledger", "verdict-harvest", "verdict-push", "send", "sh", "shoot", "shot", "slot", "spin", "standing", "stop", "task", "up", "usage", "watch", "wave", "wind-down", "verify-fac151",
 	},
 	classOperatorOnly: {
 		"clone", "envplan", "hostcreds", "init", "seed-lane-state", "signer-boundary", "stash", "validate-config",
@@ -142,6 +142,11 @@ var controlSurfaceCompatibility = map[int]string{
 	// FAC-637: adds launch-record, the write that makes builder provenance
 	// provable instead of asking reviewers to attest what nobody recorded.
 	19: "a6e871116aeb1e334585616784353260c0c8d3528e13017e5298a14040ea0ba4",
+	// FAC-655: adds lane-cut, which extracts a bounded candidate from a
+	// long-lived standing-lane branch onto a fresh branch from origin/main.
+	// Mutating: it creates a worktree and a branch. It never writes to the
+	// lane's own branch.
+	20: "504da2f6281b412b1030e712081f43375b8ee47d5183c60daaf68fd29e5c9144",
 }
 
 func controlSurfaceFingerprint(m controlSurfaceManifest) (string, error) {
