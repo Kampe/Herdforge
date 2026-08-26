@@ -6,6 +6,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"github.com/Kampe/Herdforge/pkg/progress"
 	"io"
 	"os"
 	"strings"
@@ -174,11 +175,10 @@ func runGoalGuardStopHook(s *goalguard.Store, payload []byte) error {
 	return writeGoalJSON(os.Stdout, block)
 }
 
-// goalGuardPlateauAfter is how many continuations may pass before the guard
-// stops saying "keep working" and starts describing a plateau. Three is
-// deliberate: one continuation is normal, two can be a slow beat, and by the
-// third an unchanged lane is looping rather than progressing.
-const goalGuardPlateauAfter = 3
+// goalGuardPlateauAfter is the shared plateau threshold, taken from the package
+// that owns what progress MEANS rather than redefined here (FAC-665). A second
+// copy of one rule is how the two drift.
+const goalGuardPlateauAfter = progress.PlateauAfter
 
 // goalGuardContinueReason is the instruction a blocked lane actually reads.
 //

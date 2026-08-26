@@ -91,6 +91,17 @@ func (r Record) Observe(now time.Time, action Class, artifact string) (Record, b
 	return out, true
 }
 
+// PlateauAfter is the shared threshold for "this lane is looping, not
+// progressing". One continuation is normal, two can be a slow beat, and by the
+// third an unchanged lane is repeating itself.
+//
+// FAC-665: goal-guard defined its own copy of this number. Two definitions of
+// one rule is how they drift, and this codebase has spent the session fixing
+// exactly that shape -- a workspace pinned in four places, a task written from
+// two sources, a hygiene threshold that did not match the gate it served. The
+// threshold lives here because this package owns what progress MEANS.
+const PlateauAfter = 3
+
 // Plateaued reports whether a lane has gone this many beats without advancing.
 func (r Record) Plateaued(after int) bool {
 	return after > 0 && r.UnchangedBeats >= after
