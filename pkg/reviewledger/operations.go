@@ -862,7 +862,7 @@ func (l *Ledger) isCoordinator(name string) bool {
 
 // isPassVerdictLatest checks whether the latest verdict set for a sha has
 // any PASS and no FAIL/BLOCKED, using the family ladder.
-func (l *Ledger) isPassVerdictLatest(sha string, latest map[string]LedgerRow, launch map[string]LedgerRow) bool {
+func (l *Ledger) isPassVerdictLatest(sha string, latest map[string]LedgerRow, launch map[string]LedgerRow, allowUnrecorded bool) bool {
 	var hasPass bool
 	superseded := make(map[string]bool)
 	for k, verdict := range latest {
@@ -907,7 +907,15 @@ func (l *Ledger) isPassVerdictLatest(sha string, latest map[string]LedgerRow, la
 		}
 
 		if lbf == "" || !FamilyAllowlist[lbf] {
-			continue
+			// FAC-671: the THIRD site with this same family check. An
+			// unrecorded PASS was skipped here too, so Queued() excluded the
+			// candidate, so harvest-merge's queue lookup missed it and returned
+			// ineligible BEFORE either later gate could consult the operator's
+			// decision. Threading the acceptance into only the last gate left
+			// two earlier ones silently deciding first.
+			if !(allowUnrecorded && isUnrecordedProvenance(gate, lbf)) {
+				continue
+			}
 		}
 
 		if verdict.Verdict == string(VerdictPASS) {
@@ -924,7 +932,15 @@ func (l *Ledger) isPassVerdictLatest(sha string, latest map[string]LedgerRow, la
 }
 
 // Queued returns PASS verdicts waiting for harvest (consumed excluded).
-func (l *Ledger) Queued() ([]LedgerRow, error) {
+// Queued is the default fail-closed harvest queue.
+func (l *Ledger) Queued() ([]LedgerRow, error) { return l.queued(false) }
+
+// QueuedAllowingUnrecordedProvenance includes candidates whose only bar is an
+// unrecorded builder family, so an operator's explicit acceptance reaches the
+// queue lookup that runs BEFORE the eligibility gates (FAC-671).
+func (l *Ledger) QueuedAllowingUnrecordedProvenance() ([]LedgerRow, error) { return l.queued(true) }
+
+func (l *Ledger) queued(allowUnrecorded bool) ([]LedgerRow, error) {
 	rows, err := l.AllRows()
 	if err != nil {
 		return nil, err
@@ -979,7 +995,7 @@ func (l *Ledger) Queued() ([]LedgerRow, error) {
 		if done[sha] {
 			continue
 		}
-		if l.isPassVerdictLatest(sha, latest, launch) {
+		if l.isPassVerdictLatest(sha, latest, launch, allowUnrecorded) {
 			result = append(result, eq.row)
 		}
 	}
