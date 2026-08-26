@@ -4,19 +4,21 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"github.com/Kampe/Herdforge/pkg/config"
-	"github.com/Kampe/Herdforge/pkg/launch"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
+
+	"github.com/Kampe/Herdforge/pkg/config"
+	"github.com/Kampe/Herdforge/pkg/launch"
 )
 
 // reapRow is one classified worktree.
 type reapRow struct {
 	Path   string `json:"path"`
 	Branch string `json:"branch,omitempty"`
+	Head   string `json:"head,omitempty"`
 	Class  string `json:"class"`
 	Reason string `json:"reason,omitempty"`
 }
@@ -69,7 +71,7 @@ func runWorktreeReap(args []string) error {
 	}
 	var landed, kept []reapRow
 	for _, e := range entries {
-		r := reapRow{Path: e.Path, Branch: e.Branch}
+		r := reapRow{Path: e.Path, Branch: e.Branch, Head: e.Head}
 		switch {
 		case e.IsMain:
 			r.Class, r.Reason = "main", "the repository's own checkout"
@@ -222,30 +224,78 @@ func runWorktreeReap(args []string) error {
 // did, so the confirmation has to be independent of the claim.
 func retireLanded(root string, landed []reapRow) (retired, failed []map[string]string) {
 	for _, l := range landed {
-		out, err := exec.Command("git", "-C", root, "worktree", "remove", "--force", l.Path).CombinedOutput()
-		if err != nil {
-			// One escalation: git needs a second --force for a locked surface.
-			out, err = exec.Command("git", "-C", root, "worktree", "remove", "--force", "--force", l.Path).CombinedOutput()
-		}
-		if err == nil && worktreeExists(l.Path) {
-			// Exit status said yes and the directory is still there. Trust the
-			// filesystem over the claim.
-			err = fmt.Errorf("git reported success but %s still exists", l.Path)
-		}
+		err := retireLandedOne(root, l, runReapGit)
 		if err != nil {
 			failed = append(failed, map[string]string{
 				"path":   l.Path,
 				"branch": l.Branch,
-				"error":  strings.TrimSpace(string(out)) + " (" + err.Error() + ")",
+				"error":  err.Error(),
 			})
 			continue
 		}
-		// The branch is fully merged, so deleting it is lossless too. -d refuses
-		// anything unmerged, which is a second independent check on top of ours.
-		_, _ = exec.Command("git", "-C", root, "branch", "-d", l.Branch).CombinedOutput()
 		retired = append(retired, map[string]string{"path": l.Path, "branch": l.Branch})
 	}
 	return retired, failed
+}
+
+type reapGitRunner func(root string, args ...string) ([]byte, error)
+
+func runReapGit(root string, args ...string) ([]byte, error) {
+	return exec.Command("git", append([]string{"-C", root}, args...)...).CombinedOutput()
+}
+
+// retireLandedOne makes worktree and branch retirement one reported outcome.
+// The caller has already proved the patch landed. If branch deletion fails
+// after the required worktree removal, the still-existing branch is used to
+// restore the exact worktree path before failure is returned.
+func retireLandedOne(root string, l reapRow, run reapGitRunner) error {
+	if strings.TrimSpace(l.Head) == "" {
+		return fmt.Errorf("retire %s: observed worktree HEAD is required", l.Path)
+	}
+	ref := "refs/heads/" + strings.TrimSpace(l.Branch)
+	observed, observeErr := run(root, "rev-parse", "--verify", ref)
+	if observeErr != nil || strings.TrimSpace(string(observed)) != strings.TrimSpace(l.Head) {
+		return fmt.Errorf("retire %s: branch identity changed or unreadable (observed=%q want=%q error=%v)",
+			l.Path, strings.TrimSpace(string(observed)), strings.TrimSpace(l.Head), observeErr)
+	}
+	out, err := run(root, "worktree", "remove", "--force", l.Path)
+	if err != nil {
+		// One escalation: git needs a second --force for a locked surface.
+		out, err = run(root, "worktree", "remove", "--force", "--force", l.Path)
+	}
+	if err == nil && worktreeExists(l.Path) {
+		err = fmt.Errorf("git reported success but worktree still exists")
+	}
+	if err != nil {
+		return fmt.Errorf("remove worktree %s: %s (%w)", l.Path, strings.TrimSpace(string(out)), err)
+	}
+
+	// Compare-and-delete the exact ref observed during classification. A plain
+	// branch -D can delete a replacement commit that appeared after the
+	// patch-landed proof.
+	branchOut, branchErr := run(root, "update-ref", "-d", ref, strings.TrimSpace(l.Head))
+	verifyOut, verifyErr := run(root, "show-ref", "--verify", "--quiet", ref)
+	if branchErr == nil && verifyErr != nil {
+		return nil
+	}
+	if branchErr == nil {
+		branchErr = fmt.Errorf("compare-and-delete reported success but ref remains at %s", strings.TrimSpace(string(verifyOut)))
+	}
+
+	// Compensate the partial mutation. The branch is the durable copy and still
+	// exists when deletion fails, so restore the exact surface rather than
+	// reporting a half-retirement as success.
+	restoreOut, restoreErr := run(root, "worktree", "add", "--", l.Path, l.Branch)
+	if restoreErr == nil && !worktreeExists(l.Path) {
+		restoreErr = fmt.Errorf("git reported success but restored worktree is absent")
+	}
+	if restoreErr != nil {
+		return fmt.Errorf("delete branch %s after worktree removal: %s (%v); compensation failed: %s (%v)",
+			l.Branch, strings.TrimSpace(string(branchOut)), branchErr,
+			strings.TrimSpace(string(restoreOut)), restoreErr)
+	}
+	return fmt.Errorf("delete branch %s after worktree removal: %s (%w); worktree restored at %s",
+		l.Branch, strings.TrimSpace(string(branchOut)), branchErr, l.Path)
 }
 
 // isResidentHome reports whether a worktree is a standing lane's home rather
@@ -355,6 +405,7 @@ func configuredLaneNames(root string) []string {
 type worktreeEntry struct {
 	Path       string
 	Branch     string
+	Head       string
 	Detached   bool
 	Locked     bool
 	LockReason string
@@ -390,6 +441,8 @@ func listWorktreeEntries(root string) ([]worktreeEntry, error) {
 			cur = &worktreeEntry{Path: strings.TrimPrefix(line, "worktree ")}
 		case cur == nil:
 			continue
+		case strings.HasPrefix(line, "HEAD "):
+			cur.Head = strings.TrimSpace(strings.TrimPrefix(line, "HEAD "))
 		case strings.HasPrefix(line, "branch "):
 			cur.Branch = strings.TrimPrefix(strings.TrimPrefix(line, "branch "), "refs/heads/")
 		case line == "detached":
