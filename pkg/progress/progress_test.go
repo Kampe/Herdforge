@@ -106,3 +106,24 @@ func TestWaitingMustNameItsEvent(t *testing.T) {
 		t.Error("a wait on a NAMED event is legitimate for a standing lane")
 	}
 }
+
+// FAC-665: goal-guard kept its own copy of the plateau threshold. Two
+// definitions of one rule is how they drift, and this codebase spent a session
+// fixing exactly that shape: a workspace pinned in four places, a task written
+// from two sources, a cache threshold that did not match the gate it served.
+func TestPlateauThresholdIsShared(t *testing.T) {
+	if PlateauAfter <= 0 {
+		t.Fatal("the shared threshold must be positive or nothing ever plateaus")
+	}
+	r := Record{Lane: "x", TaskRef: "CHA-1"}
+	for i := 0; i < PlateauAfter-1; i++ {
+		r, _ = r.Observe(t0, ClassProbe, "same")
+	}
+	if r.Plateaued(PlateauAfter) {
+		t.Errorf("must not plateau before the threshold (%d beats of %d)", r.UnchangedBeats, PlateauAfter)
+	}
+	r, _ = r.Observe(t0, ClassProbe, "same")
+	if !r.Plateaued(PlateauAfter) {
+		t.Errorf("must plateau AT the threshold, got %d beats", r.UnchangedBeats)
+	}
+}
