@@ -13,6 +13,14 @@ import (
 	"strings"
 )
 
+// reapRow is one classified worktree.
+type reapRow struct {
+	Path   string `json:"path"`
+	Branch string `json:"branch,omitempty"`
+	Class  string `json:"class"`
+	Reason string `json:"reason,omitempty"`
+}
+
 // runWorktreeReap retires worktrees whose work has demonstrably LANDED.
 //
 // FAC-672: worktree creation is automatic and retirement is not, so the two
@@ -59,15 +67,9 @@ func runWorktreeReap(args []string) error {
 	if err != nil {
 		return err
 	}
-	type row struct {
-		Path   string `json:"path"`
-		Branch string `json:"branch,omitempty"`
-		Class  string `json:"class"`
-		Reason string `json:"reason,omitempty"`
-	}
-	var landed, kept []row
+	var landed, kept []reapRow
 	for _, e := range entries {
-		r := row{Path: e.Path, Branch: e.Branch}
+		r := reapRow{Path: e.Path, Branch: e.Branch}
 		switch {
 		case e.IsMain:
 			r.Class, r.Reason = "main", "the repository's own checkout"
@@ -124,9 +126,41 @@ func runWorktreeReap(args []string) error {
 	}
 	sort.Slice(landed, func(i, j int) bool { return landed[i].Path < landed[j].Path })
 
+	// FAC-681: DO the work before reporting it.
+	//
+	// The JSON branch used to return here, before the removal loop, while
+	// reporting applied=true -- so `--apply --json` claimed success and retired
+	// nothing. Reported live: harvest-forge-coverage-integrit-355f96a2 was listed
+	// as landed with applied=true and exit 0, and the directory and registration
+	// were still there afterwards.
+	//
+	// And `applied` echoed the FLAG, not the outcome. Even the text path was
+	// reporting what was ASKED rather than what HAPPENED. A reaper that says it
+	// retired something it did not is worse than one that retires nothing: the
+	// caller stops checking.
+	var retired, failed []map[string]string
+	if *apply {
+		retired, failed = retireLanded(root, landed)
+	}
+
 	if *asJSON {
-		out := map[string]any{"landed": landed, "kept": kept, "applied": *apply}
-		return json.NewEncoder(os.Stdout).Encode(out)
+		out := map[string]any{
+			"landed": landed,
+			"kept":   kept,
+			// applied reports what actually happened. With --apply it is true only
+			// when at least one surface was really retired; without it, false.
+			"applied":         *apply && len(retired) > 0,
+			"apply_requested": *apply,
+			"retired":         retired,
+			"failed":          failed,
+		}
+		if err := json.NewEncoder(os.Stdout).Encode(out); err != nil {
+			return err
+		}
+		if len(failed) > 0 {
+			return fmt.Errorf("%d landed worktree(s) could not be retired", len(failed))
+		}
+		return nil
 	}
 
 	byClass := map[string]int{}
@@ -164,21 +198,54 @@ func runWorktreeReap(args []string) error {
 		return nil
 	}
 
-	removed, failed := 0, 0
+	for _, f := range failed {
+		// Report by exact identity; never silently skip.
+		fmt.Fprintf(os.Stderr, "worktree-reap: KEPT %s: %s\n", f["path"], f["error"])
+	}
+	fmt.Printf("worktree-reap: retired=%d kept=%d\n", len(retired), len(failed))
+	if len(failed) > 0 {
+		return fmt.Errorf("%d landed worktree(s) could not be retired", len(failed))
+	}
+	return nil
+}
+
+// retireLanded removes each landed surface and reports EXACTLY what happened.
+//
+// FAC-681: git refuses `worktree remove --force` for a surface it considers
+// locked or otherwise held, and the operator observed that a second --force
+// succeeded where one did not. So a single attempt that fails is escalated once,
+// and if it still fails the path is reported as KEPT with git's own message
+// rather than counted as retired.
+//
+// Removal is verified by looking, not by trusting the exit status: the whole
+// defect being fixed here is a command that reported success for work it never
+// did, so the confirmation has to be independent of the claim.
+func retireLanded(root string, landed []reapRow) (retired, failed []map[string]string) {
 	for _, l := range landed {
-		if out, err := exec.Command("git", "-C", root, "worktree", "remove", "--force", l.Path).CombinedOutput(); err != nil {
-			// Report by exact identity; never silently skip.
-			fmt.Fprintf(os.Stderr, "worktree-reap: KEPT %s: %s\n", l.Path, strings.TrimSpace(string(out)))
-			failed++
+		out, err := exec.Command("git", "-C", root, "worktree", "remove", "--force", l.Path).CombinedOutput()
+		if err != nil {
+			// One escalation: git needs a second --force for a locked surface.
+			out, err = exec.Command("git", "-C", root, "worktree", "remove", "--force", "--force", l.Path).CombinedOutput()
+		}
+		if err == nil && worktreeExists(l.Path) {
+			// Exit status said yes and the directory is still there. Trust the
+			// filesystem over the claim.
+			err = fmt.Errorf("git reported success but %s still exists", l.Path)
+		}
+		if err != nil {
+			failed = append(failed, map[string]string{
+				"path":   l.Path,
+				"branch": l.Branch,
+				"error":  strings.TrimSpace(string(out)) + " (" + err.Error() + ")",
+			})
 			continue
 		}
 		// The branch is fully merged, so deleting it is lossless too. -d refuses
 		// anything unmerged, which is a second independent check on top of ours.
 		_, _ = exec.Command("git", "-C", root, "branch", "-d", l.Branch).CombinedOutput()
-		removed++
+		retired = append(retired, map[string]string{"path": l.Path, "branch": l.Branch})
 	}
-	fmt.Printf("worktree-reap: retired=%d kept=%d\n", removed, failed)
-	return nil
+	return retired, failed
 }
 
 // isResidentHome reports whether a worktree is a standing lane's home rather

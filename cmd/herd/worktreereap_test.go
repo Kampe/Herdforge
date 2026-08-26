@@ -162,3 +162,58 @@ func TestLaneAttributionPrefersTheLongestLaneName(t *testing.T) {
 		t.Errorf("an unowned surface must be claimed by nobody, got %q", got)
 	}
 }
+
+// FAC-681: `--apply --json` reported applied=true with the path listed as landed
+// and exited 0, while the directory and its registration were still there. The
+// JSON branch returned BEFORE the removal loop, and `applied` echoed the FLAG
+// rather than the outcome -- so it reported what was ASKED, not what HAPPENED.
+//
+// A reaper that claims it retired something it did not is worse than one that
+// retires nothing, because the caller stops checking.
+func TestRetireLandedReportsOnlyWhatItActuallyRemoved(t *testing.T) {
+	root := t.TempDir()
+	run := func(a ...string) {
+		t.Helper()
+		c := exec.Command("git", append([]string{"-C", root}, a...)...)
+		c.Env = append(os.Environ(), "GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@t", "GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@t")
+		if out, err := c.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", a, err, out)
+		}
+	}
+	run("init", "-q", "-b", "main", ".")
+	os.WriteFile(filepath.Join(root, "a.txt"), []byte("x"), 0o644)
+	run("add", ".")
+	run("commit", "-qm", "base")
+
+	dir := filepath.Join(root, "wt-landed")
+	run("worktree", "add", "-q", "-b", "landed-branch", dir)
+
+	retired, failed := retireLanded(root, []reapRow{{Path: dir, Branch: "landed-branch", Class: "landed"}})
+	if len(retired) != 1 || len(failed) != 0 {
+		t.Fatalf("a real removal must be reported as retired: retired=%v failed=%v", retired, failed)
+	}
+	// The claim is verified against the filesystem, not the exit status -- the
+	// whole defect was a command trusting its own success report.
+	if worktreeExists(dir) {
+		t.Fatal("reported retired while the directory still exists")
+	}
+}
+
+// A path that cannot be removed must be reported as FAILED, never counted as
+// retired. Nothing is worse here than a silent overcount.
+func TestRetireLandedReportsAFailureRatherThanClaimingSuccess(t *testing.T) {
+	root := t.TempDir()
+	exec.Command("git", "-C", root, "init", "-q").Run()
+	retired, failed := retireLanded(root, []reapRow{
+		{Path: filepath.Join(root, "does-not-exist"), Branch: "nope", Class: "landed"},
+	})
+	if len(retired) != 0 {
+		t.Fatalf("nothing was removed, so nothing may be reported retired: %v", retired)
+	}
+	if len(failed) != 1 {
+		t.Fatalf("a failure must be reported by exact identity: %v", failed)
+	}
+	if failed[0]["error"] == "" {
+		t.Error("the failure must carry git's own message so it is actionable")
+	}
+}
