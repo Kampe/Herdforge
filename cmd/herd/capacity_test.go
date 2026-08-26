@@ -1,10 +1,13 @@
 package main
 
 import (
+	"errors"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/Kampe/Herdforge/pkg/freshness"
 )
 
 func healthy() CapacityObservation {
@@ -245,5 +248,34 @@ func TestAbsentHarnessIsUnmeasuredNotUncapped(t *testing.T) {
 	o.HarnessPath, o.HarnessCapped = "", false
 	if c := decideCapacity(o, 5, 4096, 6144); strings.Contains(c.Reason, "NOT memory-capped") {
 		t.Fatalf("an unmeasured harness produced an uncapped claim: %s", c.Reason)
+	}
+}
+
+// FAC-690: the memory reading goes through pkg/freshness so an UNKNOWN cannot
+// be read as a value by forgetting to check. -1 invites exactly that mistake,
+// because -1 IS a value every consumer must remember means "unmeasured".
+func TestUnknownMemoryReadingYieldsNotOkNotZero(t *testing.T) {
+	var unknown freshness.Reading[hostMemory]
+	unknown = freshness.Degrade[hostMemory](unknown, "/proc/meminfo",
+		errors.New("absent"), "run on the review host")
+	v, ok := unknown.Value()
+	if ok {
+		t.Fatal("an unmeasured host reported a usable memory value")
+	}
+	if v.AvailMiB != 0 || v.TotalMiB != 0 {
+		t.Fatalf("unknown reading leaked a non-zero value: %+v", v)
+	}
+	// The whole point: a consumer that ignores ok gets zero, and zero available
+	// memory must not silently become a refusal reason with no explanation.
+	if !strings.Contains(unknown.MustExplain(time.Now()), "/proc/meminfo") {
+		t.Fatalf("unknown reading does not name its source: %s", unknown.MustExplain(time.Now()))
+	}
+}
+
+func TestFreshMemoryReadingIsUsable(t *testing.T) {
+	r := freshness.Fresh("/proc/meminfo", time.Now(), hostMemory{TotalMiB: 48173, AvailMiB: 40658})
+	v, ok := r.Value()
+	if !ok || v.TotalMiB != 48173 {
+		t.Fatalf("a fresh reading was not usable: %+v ok=%v", v, ok)
 	}
 }

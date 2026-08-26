@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -11,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Kampe/Herdforge/pkg/freshness"
 	"github.com/Kampe/Herdforge/pkg/herdr"
 )
 
@@ -157,6 +159,9 @@ type CapacityObservation struct {
 	// HarnessCapped states whether the harness this host launches is actually
 	// wrapped in a memory-bounded scope. Reported, never assumed: "we wired
 	// run-capped" is a claim, and a claim is not a cgroup.
+	// MemorySource is freshness's own sentence about the memory reading, so an
+	// unmeasured host reports WHY rather than rendering -1 as a number.
+	MemorySource  string `json:"memory_source,omitempty"`
 	HarnessCapped bool   `json:"harness_capped"`
 	HarnessPath   string `json:"harness_path,omitempty"`
 	AgentsListed  bool   `json:"agents_listed"`
@@ -269,7 +274,18 @@ func decideCapacity(o CapacityObservation, limit int, perReviewerMiB, floorMiB i
 func observeCapacity() CapacityObservation {
 	o := CapacityObservation{MemTotalMiB: -1, MemAvailMiB: -1, SwapUsedMiB: -1, Processes: -1, Threads: -1, FDLimit: -1}
 	o.HerdrRunning, o.HerdrDetail = herdrServerRunning()
-	o.MemTotalMiB, o.MemAvailMiB, o.SwapUsedMiB = hostMemoryMiB()
+	// FAC-690: the memory reading now goes through pkg/freshness rather than
+	// three hand-rolled -1 sentinels. That package exists so an UNKNOWN cannot
+	// be read as a value by forgetting to check the second return -- which is
+	// exactly the mistake -1 invites, because -1 IS a value and every consumer
+	// has to remember it means "nothing was measured".
+	mem := readHostMemory()
+	if v, ok := mem.Value(); ok {
+		o.MemTotalMiB, o.MemAvailMiB, o.SwapUsedMiB = v.TotalMiB, v.AvailMiB, v.SwapUsedMiB
+	} else {
+		o.MemTotalMiB, o.MemAvailMiB, o.SwapUsedMiB = -1, -1, -1
+	}
+	o.MemorySource = mem.MustExplain(time.Now())
 	o.Processes, o.Threads, o.FDLimit = hostProcessLoad()
 	o.HarnessCapped, o.HarnessPath = harnessIsMemoryCapped("claude")
 
@@ -529,4 +545,32 @@ func harnessIsMemoryCapped(kind string) (capped bool, path string) {
 		}
 	}
 	return false, resolved
+}
+
+// hostMemory is one coherent memory observation. The three numbers come from a
+// single /proc/meminfo read, so they must succeed or fail together -- reporting
+// a total without an available is a half-truth the caller cannot use.
+type hostMemory struct {
+	TotalMiB    int64
+	AvailMiB    int64
+	SwapUsedMiB int64
+}
+
+// readHostMemory wraps the /proc/meminfo read in a freshness.Reading.
+//
+// An unreadable /proc/meminfo is UNKNOWN, not zero and not -1. Value() then
+// returns ok=false, so a consumer cannot accidentally treat "we could not
+// measure this host" as "this host has no memory available" -- which would
+// refuse every launch on a platform that simply does not expose /proc.
+func readHostMemory() freshness.Reading[hostMemory] {
+	total, avail, swapUsed := hostMemoryMiB()
+	now := time.Now()
+	if total < 0 && avail < 0 {
+		return freshness.Degrade[hostMemory](
+			freshness.Reading[hostMemory]{}, "/proc/meminfo",
+			errors.New("no /proc/meminfo on this host"),
+			"run the capacity check on the review host itself; memory gating is skipped where it cannot be measured")
+	}
+	return freshness.Fresh(now.Format(time.RFC3339)+" /proc/meminfo", now,
+		hostMemory{TotalMiB: total, AvailMiB: avail, SwapUsedMiB: swapUsed})
 }
