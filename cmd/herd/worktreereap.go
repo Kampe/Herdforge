@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"github.com/Kampe/Herdforge/pkg/launch"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -38,6 +39,16 @@ func runWorktreeReap(args []string) error {
 	apply := fs.Bool("apply", false, "remove the landed worktrees; without it, report only")
 	asJSON := fs.Bool("json", false, "emit the classification as JSON")
 	base := fs.String("base", "origin/main", "ref that defines 'landed'")
+	// FAC-673: retire by the PR's own closure, not only by branch state.
+	//
+	// worktree-reap alone is a SWEEP: it must be run, and between runs the leak
+	// accumulates. A launch receipt that records its PR turns retirement into a
+	// lifecycle transition -- the PR closed, the patch is verifiably in base,
+	// therefore the surface is spent. The verification is the point: a closed PR
+	// whose patch did NOT land is abandoned work, not finished work, and
+	// retiring it would destroy the only copy.
+	byPR := fs.Bool("by-pr", false,
+		"also retire worktrees whose recorded PR is closed AND whose patch is verifiably in base")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -82,6 +93,17 @@ func runWorktreeReap(args []string) error {
 			// two apart on its own.
 			r.Class, r.Reason = "resident-home", "standing lane home; tracks base by design and is not a task worktree"
 		default:
+			if *byPR {
+				if closed, why := prClosedAndLanded(root, e.Branch, *base); closed {
+					r.Class, r.Reason = "landed", why
+					landed = append(landed, r)
+					continue
+				} else if why != "" {
+					r.Class, r.Reason = "pr-open", why
+					kept = append(kept, r)
+					continue
+				}
+			}
 			ahead := commitsAhead(root, *base, e.Branch)
 			switch {
 			case ahead < 0:
@@ -161,6 +183,75 @@ func isResidentHome(branch, path string) bool {
 		}
 	}
 	return false
+}
+
+// prClosedAndLanded reports whether this branch's recorded PR has closed AND its
+// patch is verifiably in base.
+//
+// Both halves are required. A closed PR whose patch did NOT land is ABANDONED
+// work, not finished work, and its worktree may hold the only copy -- retiring
+// it on closure alone would destroy it. Patch identity rather than ancestry is
+// used deliberately: a rebase-merge or squash changes the SHA, so ancestry
+// reports a false negative for work that genuinely landed (verified earlier in
+// this session that patch-id is stable across a clean rebase).
+//
+// The second return explains a decline so a caller can report it by identity;
+// empty means "no recorded PR for this branch", which is simply not this
+// function's business.
+func prClosedAndLanded(root, branch, base string) (bool, string) {
+	receipts, err := launch.ReadReceipts(launch.ReceiptPathFor(root))
+	if err != nil {
+		return false, ""
+	}
+	var pr string
+	for i := len(receipts) - 1; i >= 0; i-- {
+		if strings.TrimSpace(receipts[i].Branch) == branch && strings.TrimSpace(receipts[i].PullRequest) != "" {
+			pr = strings.TrimSpace(receipts[i].PullRequest)
+			break
+		}
+	}
+	if pr == "" {
+		return false, ""
+	}
+	state := strings.ToUpper(strings.TrimSpace(ghPRState(root, pr)))
+	if state == "" {
+		return false, fmt.Sprintf("PR %s state is unknown; not retiring on an unreadable answer", pr)
+	}
+	if state == "OPEN" {
+		return false, fmt.Sprintf("PR %s is still open", pr)
+	}
+	if !patchIsInBase(root, branch, base) {
+		// Closed but not landed. This is the case that makes verification
+		// mandatory rather than decorative.
+		return false, fmt.Sprintf("PR %s is %s but its patch is NOT in %s; abandoned work, kept", pr, state, base)
+	}
+	return true, fmt.Sprintf("PR %s is %s and its patch is verifiably in %s", pr, state, base)
+}
+
+func ghPRState(root, pr string) string {
+	out, err := exec.Command("gh", "pr", "view", pr, "--json", "state", "--jq", ".state").Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// patchIsInBase reports whether the branch's net change is already present in
+// base, by patch identity rather than commit ancestry.
+func patchIsInBase(root, branch, base string) bool {
+	if commitsAhead(root, base, branch) == 0 {
+		return true
+	}
+	out, err := exec.Command("git", "-C", root, "cherry", base, branch).Output()
+	if err != nil {
+		return false
+	}
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "+") {
+			return false // at least one patch is not upstream
+		}
+	}
+	return true
 }
 
 type worktreeEntry struct {
