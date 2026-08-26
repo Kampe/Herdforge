@@ -185,6 +185,14 @@ type ClaimPreview struct {
 	Claimable         int
 	ProvenanceBlocked int
 	BlockedRefs       []string
+	// ClaimableRefs names the tasks that are actually claimable.
+	//
+	// FAC-664: the blocked refs were named and the claimable ones were not, so
+	// the line read "2 claimable, 7 blocked by ...: CHA-3193, CHA-3194, ...".
+	// An operator could see exactly what to repair and nothing about what to
+	// DO. A count is reportable; only an identity is dispatchable, which is the
+	// selector defect pkg/broker exists to make unrepresentable.
+	ClaimableRefs []string
 }
 
 func (p ClaimPreview) Description() string {
@@ -207,9 +215,24 @@ func (p ClaimPreview) Description() string {
 		return "0 claimable — no pending task matched (this is a filter result, not an idle queue)"
 	}
 	if p.ProvenanceBlocked == 0 {
-		return fmt.Sprintf("No blocking actions — %d claimable pending task(s)", p.Claimable)
+		return fmt.Sprintf("No blocking actions — %d claimable pending task(s)%s", p.Claimable, refSuffix(p.ClaimableRefs))
 	}
-	return fmt.Sprintf("Claim next pending task (%d claimable, %d blocked by missing/invalid herd-deps-v1: %s)", p.Claimable, p.ProvenanceBlocked, strings.Join(p.BlockedRefs, ", "))
+	return fmt.Sprintf("Claim next pending task (%d claimable%s, %d blocked by missing/invalid herd-deps-v1: %s)",
+		p.Claimable, refSuffix(p.ClaimableRefs), p.ProvenanceBlocked, strings.Join(p.BlockedRefs, ", "))
+}
+
+// refSuffix renders the exact refs a caller can act on, bounded so a large queue
+// stays readable while still naming enough to dispatch. A truncated list SAYS it
+// is truncated: a silently capped list is a count wearing an identity's clothes.
+func refSuffix(refs []string) string {
+	if len(refs) == 0 {
+		return ""
+	}
+	const max = 8
+	if len(refs) <= max {
+		return ": " + strings.Join(refs, ", ")
+	}
+	return fmt.Sprintf(": %s (+%d more)", strings.Join(refs[:max], ", "), len(refs)-max)
 }
 
 // PreviewClaimQueue performs the cheap, deterministic portion of claim
@@ -255,6 +278,7 @@ func PreviewClaimQueue(ctx context.Context, tp provider.TaskProvider, cfg *confi
 			continue
 		}
 		preview.Claimable++
+		preview.ClaimableRefs = append(preview.ClaimableRefs, task.Ref)
 	}
 	return preview, nil
 }
