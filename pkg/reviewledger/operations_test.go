@@ -217,3 +217,72 @@ func TestCompletingAnUnrecordedRecordPreservesItsGate(t *testing.T) {
 		t.Errorf("family = %q; completion must never upgrade unprovable provenance", last.BuilderFamily)
 	}
 }
+
+// FAC-670: FAC-668 made unrecorded provenance operator-decidable in
+// `review-ledger readiness`, but readiness only REPORTS. harvest-merge is the
+// only supported local-evidence merge path and it calls Eligible strictly, where
+// an `unrecorded` family fails the allowlist and the PASS is skipped entirely --
+// so hasPass never became true. The decision could be expressed and could not
+// reach the thing that merges. Reported against PR #3308, which readiness called
+// ready under the flag while harvest-merge still refused it.
+func TestEligibleAcceptsAnExplicitlyAllowedUnrecordedPass(t *testing.T) {
+	sha := strings.Repeat("a", 40)
+	l := ledgerWith(t,
+		`{"event":"record","sha":"`+sha+`","reviewer":"pool-06","gate":"provenance-unrecorded","builder_family":"unrecorded"}`,
+		`{"event":"verdict","sha":"`+sha+`","reviewer":"pool-06","verdict":"PASS","gate":"provenance-unrecorded","builder_family":"unrecorded"}`)
+
+	strict, err := l.Eligible(sha, "")
+	if err == nil && strict {
+		t.Fatal("the DEFAULT gate must still refuse an unrecorded-provenance PASS")
+	}
+	ok, err := l.EligibleAllowingUnrecordedProvenance(sha, "")
+	if err != nil {
+		t.Fatalf("explicit acceptance must not error: %v", err)
+	}
+	if !ok {
+		t.Fatal("an explicitly accepted unrecorded PASS must be eligible, or the operator decision cannot reach the merge")
+	}
+}
+
+// The acceptance must NEVER override dissent. This is the property that keeps it
+// a decision about unknown provenance rather than a bypass.
+func TestEligibleAcceptanceNeverOverridesDissent(t *testing.T) {
+	sha := strings.Repeat("b", 40)
+	for _, bad := range []string{"FAIL", "BLOCKED"} {
+		l := ledgerWith(t,
+			`{"event":"record","sha":"`+sha+`","reviewer":"pool-06","gate":"provenance-unrecorded","builder_family":"unrecorded"}`,
+			`{"event":"verdict","sha":"`+sha+`","reviewer":"pool-06","verdict":"`+bad+`","gate":"provenance-unrecorded","builder_family":"unrecorded"}`)
+		ok, _ := l.EligibleAllowingUnrecordedProvenance(sha, "")
+		if ok {
+			t.Fatalf("%s must never become eligible; the flag accepts unknown PROVENANCE, not dissent", bad)
+		}
+	}
+}
+
+// A candidate with no verdict at all stays ineligible: the flag cannot conjure a
+// review that was never performed.
+func TestEligibleAcceptanceCannotConjureAMissingReview(t *testing.T) {
+	sha := strings.Repeat("c", 40)
+	l := ledgerWith(t,
+		`{"event":"record","sha":"`+sha+`","reviewer":"pool-06","gate":"provenance-unrecorded","builder_family":"unrecorded"}`)
+	if ok, _ := l.EligibleAllowingUnrecordedProvenance(sha, ""); ok {
+		t.Fatal("no verdict means no merge, flag or not")
+	}
+}
+
+// The marking is exact: a merely-missing or misspelled family is not the
+// FAC-627 unrecorded marking and must not be accepted.
+func TestUnrecordedProvenanceMarkingIsExact(t *testing.T) {
+	if isUnrecordedProvenance("independent", FamilyUnrecorded) {
+		t.Error("the gate must match too, not just the family")
+	}
+	if isUnrecordedProvenance(GateProvenanceUnrecorded, "") {
+		t.Error("an empty family is not the honest unrecorded marking")
+	}
+	if isUnrecordedProvenance(GateProvenanceUnrecorded, "unrecorded ") {
+		t.Log("whitespace tolerated by design")
+	}
+	if !isUnrecordedProvenance(GateProvenanceUnrecorded, FamilyUnrecorded) {
+		t.Error("the exact marking must be recognised")
+	}
+}

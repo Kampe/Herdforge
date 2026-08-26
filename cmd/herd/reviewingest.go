@@ -829,6 +829,13 @@ func runHarvestMerge() {
 	verdict := fs.String("verdict", "",
 		"Optional operator VETO (FAIL/BLOCKED refuse). PASS is not accepted here: merge consent comes from the review ledger.")
 	base := fs.String("base", "origin/main", "Base to harvest onto")
+	// FAC-670: the merge-side half of FAC-668. readiness could express the
+	// operator's decision and harvest-merge -- the only supported local-evidence
+	// merge path -- could not receive it, so an accepted candidate still could
+	// not land. Per-candidate on purpose; never a queue-wide switch.
+	allowUnrecorded := fs.Bool("allow-unrecorded-provenance", false,
+		"accept THIS candidate's PASS even though its builder family was never recorded; "+
+			"cross-family independence is not claimed. Cannot override FAIL, BLOCKED, split, or a missing verdict")
 	candidate := fs.String("candidate", "", "Exact reviewed candidate SHA to harvest (required when the branch tip moved)")
 	reconstructedFrom := fs.String("reconstructed-from", "", "Harvest identity reconstructed from the reviewed candidate (requires --content-proof)")
 	contentProof := fs.String("content-proof", "", "Operator attestation that reviewed and reconstructed identities are content-equivalent")
@@ -962,7 +969,7 @@ func runHarvestMerge() {
 		fmt.Fprintf(os.Stderr, "herd harvest-merge: %v\n", err)
 		os.Exit(1)
 	}
-	ledgerVerdict, vErr := harvestMergeVerdict(sha, *verdict)
+	ledgerVerdict, vErr := harvestMergeVerdict(sha, *verdict, *allowUnrecorded)
 	if vErr != nil {
 		fmt.Fprintf(os.Stderr, "herd harvest-merge: %v\n", vErr)
 		os.Exit(1)
@@ -1413,7 +1420,7 @@ func resolveUnionMergeConflicts(dir, base string, cfg harvestmerge.UnionMergeCon
 // is rejected as an input, because that is the human-supplied provenance the
 // card removes; a coordinator who believes the work passed must get that
 // verdict into the ledger through `herd review-ingest`.
-func harvestMergeVerdict(sha, operatorVeto string) (harvestmerge.Verdict, error) {
+func harvestMergeVerdict(sha, operatorVeto string, allowUnrecorded bool) (harvestmerge.Verdict, error) {
 	switch v := harvestmerge.Verdict(strings.ToUpper(strings.TrimSpace(operatorVeto))); v {
 	case "":
 		// No operator opinion; the ledger decides on its own.
@@ -1432,7 +1439,15 @@ func harvestMergeVerdict(sha, operatorVeto string) (harvestmerge.Verdict, error)
 	// Empty builder family is the STRICT form: only a cross-family PASS with a
 	// provable launch record counts, and any unsuperseded FAIL/BLOCKED or an
 	// already-consumed admission refuses.
-	eligible, err := ledger.Eligible(sha, "")
+	//
+	// FAC-670: --allow-unrecorded-provenance relaxes exactly one thing -- a PASS
+	// whose builder family was never recorded. Dissent, supersession and
+	// consumption are unaffected and still refuse.
+	gate := ledger.Eligible
+	if allowUnrecorded {
+		gate = ledger.EligibleAllowingUnrecordedProvenance
+	}
+	eligible, err := gate(sha, "")
 	if err != nil {
 		return "", fmt.Errorf("review ledger refuses %s: %w", sha[:min(12, len(sha))], err)
 	}
