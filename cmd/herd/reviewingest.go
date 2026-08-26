@@ -313,6 +313,7 @@ func runReviewIngest() {
 			emit.record(o, fmt.Sprintf("ADMITTED %s verdict=%s reviewer=%s sha=%s enqueued=%v\n",
 				filepath.Base(f), a.Verdict, a.Reviewer, a.SHA[:12], enqueued), false)
 			postReviewCompleteCallback(a.SHA, a.Branch, a.Reviewer, a.Verdict)
+			reclaimReviewPoolSlotFor(a.SHA)
 		}
 		admitted++
 	}
@@ -682,6 +683,62 @@ func honestlyUnrecordedFamily(raw string) (string, bool) {
 //
 // DedupeID is sha+reviewer, the same identity the ledger dedups on, so the
 // idempotent re-ingest sweep cannot post the same completion twice.
+
+// reclaimReviewPoolSlotFor releases the pool slot a completed review was holding.
+//
+// FAC-675: a slot was leased at launch and released only when the launching
+// command returned. A reviewer that outlived its launcher -- which is the normal
+// case, since the launcher exits as soon as the agent starts -- left the lease
+// held with nothing running behind it. The pool then reported itself saturated
+// while slots sat idle, and dispatch waited on capacity that existed.
+//
+// The verdict's ADMISSION is the right moment to reclaim. Not reviewer exit: a
+// reviewer can exit having written nothing, and reclaiming then would free a
+// slot whose work is lost. Admission is the first point at which the review is
+// durably finished, which is exactly why FAC-651 chose it for the completion
+// event too.
+//
+// FAC-656 records the lease id on the launch row, so the slot is identified
+// EXACTLY rather than guessed from the surface path -- a guess would risk
+// releasing a slot another reviewer had since taken.
+//
+// Best-effort by construction: the verdict is already admitted and that is the
+// durable outcome. A failed reclaim costs one slot until the reaper notices,
+// which is strictly better than failing an admitted verdict over housekeeping.
+func reclaimReviewPoolSlotFor(sha string) {
+	sha = strings.TrimSpace(sha)
+	if sha == "" {
+		return
+	}
+	root := firstEnv("HERD_ROOT", "HERD_REPO_ROOT", ".")
+	l, err := reviewledger.NewReviewLedger(root, reviewLedgerPath())
+	if err != nil {
+		return
+	}
+	rows, err := l.AllRows()
+	if err != nil {
+		return
+	}
+	lease := ""
+	for i := range rows {
+		if rows[i].Event == string(reviewledger.EventRecord) &&
+			l.NormalizeSHA(rows[i].SHA) == l.NormalizeSHA(sha) &&
+			strings.TrimSpace(rows[i].Lease) != "" {
+			lease = strings.TrimSpace(rows[i].Lease)
+		}
+	}
+	if lease == "" {
+		// No recorded lease: pre-FAC-656 launches, or a review that never held a
+		// pool slot. Nothing to reclaim and nothing to report.
+		return
+	}
+	p := worktree.NewPool(root, "", 2)
+	if err := p.Release(context.Background(), lease); err != nil {
+		fmt.Fprintf(os.Stderr, "review-ingest: verdict for %s admitted but pool lease %s could not be released (%v); "+
+			"the slot stays held until the pool reclaims it\n", sha[:minInt(12, len(sha))], lease, err)
+	}
+}
+
 func postReviewCompleteCallback(sha, branch, reviewer, verdict string) {
 	sha = strings.TrimSpace(sha)
 	if sha == "" {
