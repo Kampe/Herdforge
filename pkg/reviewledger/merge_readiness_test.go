@@ -239,3 +239,75 @@ func TestDefaultPath_HonoursExplicitLedgerOverride(t *testing.T) {
 		t.Fatal("a blank override must fall through to the root-derived path")
 	}
 }
+
+// FAC-668: "provenance was never recorded" was a permanent verdict on work that
+// had a real PASS. On a fleet where commits are authored under one shared human
+// identity with no trailers, the builder family is genuinely unknowable after
+// the fact -- so seven candidates sat blocked forever and a reviewer reporting
+// "cannot merge, provenance not set" was correct with nowhere to go. A gate
+// nobody can satisfy is not a safety property, it is an outage.
+func TestUnrecordedProvenanceIsOperatorDecidableNotADeadEnd(t *testing.T) {
+	sha := strings.Repeat("f", 40)
+	l := ledgerWith(t,
+		`{"event":"verdict","sha":"`+sha+`","reviewer":"pool-06","verdict":"PASS","gate":"provenance-unrecorded","builder_family":"unrecorded"}`)
+
+	got, err := l.MergeReadinessFor(sha)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Ready {
+		t.Fatal("the default posture must stay fail-closed")
+	}
+	if !got.OperatorDecidable {
+		t.Error("a candidate blocked ONLY by unrecorded provenance must be marked decidable, not merely failed")
+	}
+	// The refusal must say what would unblock it. A dead end that does not name
+	// its exit is what left the reviewer stuck.
+	for _, want := range []string{"--allow-unrecorded-provenance", "herd launch-record"} {
+		if !strings.Contains(got.Reason, want) {
+			t.Errorf("the refusal must name the path forward %q: %q", want, got.Reason)
+		}
+	}
+}
+
+// Accepting it is explicit and AUDITABLE: the result records that the choice was
+// made, and still refuses to claim the independence it cannot prove.
+func TestAcceptingUnrecordedProvenanceIsRecordedOnTheResult(t *testing.T) {
+	sha := strings.Repeat("f", 40)
+	l := ledgerWith(t,
+		`{"event":"verdict","sha":"`+sha+`","reviewer":"pool-06","verdict":"PASS","gate":"provenance-unrecorded","builder_family":"unrecorded"}`)
+
+	got, err := l.MergeReadinessAllowingUnrecordedProvenance(sha)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.Ready {
+		t.Fatal("explicit acceptance must make it mergeable")
+	}
+	if !got.AdmittedWithoutProvenance {
+		t.Error("the choice must be recorded on the result, not implicit")
+	}
+	if !strings.Contains(got.Reason, "NOT claimed") {
+		t.Errorf("it must still refuse to claim independence it cannot prove: %q", got.Reason)
+	}
+}
+
+// The escape hatch must NOT rescue a genuine failure. A FAIL stays a FAIL even
+// with the flag, or this would be a bypass rather than a decision.
+func TestAcceptingUnrecordedProvenanceNeverRescuesAFailure(t *testing.T) {
+	sha := strings.Repeat("f", 40)
+	for _, verdict := range []string{"FAIL", "BLOCKED"} {
+		l := ledgerWith(t,
+			`{"event":"verdict","sha":"`+sha+`","reviewer":"r1","verdict":"`+verdict+`","gate":"provenance-unrecorded","builder_family":"unrecorded"}`)
+		got, err := l.MergeReadinessAllowingUnrecordedProvenance(sha)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.Ready {
+			t.Fatalf("%s must never become ready; the flag accepts unknown PROVENANCE, not dissent", verdict)
+		}
+		if got.OperatorDecidable {
+			t.Errorf("%s is not operator-decidable: something other than provenance is wrong", verdict)
+		}
+	}
+}

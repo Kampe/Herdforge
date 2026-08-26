@@ -35,6 +35,25 @@ type MergeReadiness struct {
 	Blocked              int      `json:"blocked"`
 	Reason               string   `json:"reason"`
 	Verdicts             []string `json:"verdicts,omitempty"`
+	// OperatorDecidable marks a candidate that is blocked ONLY because builder
+	// provenance was never recorded -- no FAIL, no BLOCKED, no missing verdict.
+	//
+	// FAC-668: this class had no path forward. On a fleet where commits are
+	// authored under one shared human identity with no trailers, the builder
+	// family is genuinely unknowable after the fact, so "provenance was never
+	// recorded" was a permanent verdict on work that had a real PASS. Seven
+	// candidates sat there, and a reviewer reporting "cannot merge, provenance
+	// not set" was correct and had nowhere to go.
+	//
+	// A gate nobody can satisfy is not a safety property, it is an outage. This
+	// does not weaken the gate: it names the class so an operator can decide,
+	// and so the decision is visible instead of being taken by bypassing the
+	// gate entirely.
+	OperatorDecidable bool `json:"operator_decidable,omitempty"`
+	// AdmittedWithoutProvenance is set when the caller explicitly accepted an
+	// unrecorded-provenance candidate. It is recorded on the result so the
+	// choice is auditable rather than implicit.
+	AdmittedWithoutProvenance bool `json:"admitted_without_provenance,omitempty"`
 }
 
 // shaMatches reports whether a ledger SHA and a caller SHA identify the same
@@ -59,7 +78,20 @@ func shaMatches(ledgerSHA, want string) bool {
 }
 
 // MergeReadinessFor aggregates every verdict recorded for a candidate SHA.
+// MergeReadinessFor reports readiness with the default fail-closed posture.
 func (l *Ledger) MergeReadinessFor(sha string) (MergeReadiness, error) {
+	return l.mergeReadinessFor(sha, false)
+}
+
+// MergeReadinessAllowingUnrecordedProvenance is the same decision with the
+// unrecorded-provenance class explicitly accepted. The caller is asserting that
+// a review it cannot prove was cross-family is good enough for THIS merge; the
+// result records that so the choice is auditable (FAC-668).
+func (l *Ledger) MergeReadinessAllowingUnrecordedProvenance(sha string) (MergeReadiness, error) {
+	return l.mergeReadinessFor(sha, true)
+}
+
+func (l *Ledger) mergeReadinessFor(sha string, allowUnrecorded bool) (MergeReadiness, error) {
 	sha = strings.TrimSpace(sha)
 	out := MergeReadiness{SHA: sha}
 	if sha == "" {
@@ -144,9 +176,21 @@ func (l *Ledger) MergeReadinessFor(sha string) (MergeReadiness, error) {
 		out.Reason = fmt.Sprintf("%d reviewer(s) recorded FAIL", out.Failures)
 	case out.ProvenanceUnrecorded > 0 && out.ProvenanceUnrecorded >= out.Passes:
 		// Every passing review lacks provable authorship. The review is kept and
-		// visible; the independence claim is not granted.
+		// visible; the independence claim is not granted. Nothing else is wrong
+		// with this candidate, which is exactly what makes it decidable rather
+		// than failed (FAC-668).
+		out.OperatorDecidable = true
+		if allowUnrecorded {
+			out.Ready = true
+			out.AdmittedWithoutProvenance = true
+			out.Reason = fmt.Sprintf("%d PASS, admitted WITHOUT provable builder provenance by explicit operator choice; "+
+				"cross-family independence is NOT claimed for this merge", out.Passes)
+			break
+		}
 		out.Reason = fmt.Sprintf("%d PASS but provenance was never recorded; review is admitted, "+
-			"cross-family independence cannot be claimed", out.Passes)
+			"cross-family independence cannot be claimed. Nothing else blocks this candidate: "+
+			"re-run with --allow-unrecorded-provenance to merge on that basis, or record the builder "+
+			"family at dispatch with `herd launch-record` so future candidates carry it", out.Passes)
 	default:
 		out.Ready = true
 		out.Reason = fmt.Sprintf("%d PASS, no dissent", out.Passes)
