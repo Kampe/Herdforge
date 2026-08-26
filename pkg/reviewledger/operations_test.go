@@ -98,3 +98,73 @@ func TestCompleteLaunchProvenanceRefusesEmptyBindings(t *testing.T) {
 		t.Errorf("a real lease alone must be recordable: %v", err)
 	}
 }
+
+// FAC-659: a backfill may add EVIDENCE about a verdict; it may never change what
+// the verdict SAID. A backfill that could turn a FAIL into a PASS would be far
+// worse than the gap it closes, so the verdict value, reviewer and families are
+// inherited from the row being completed and cannot be supplied by the caller.
+func TestCompleteVerdictProvenanceCannotChangeTheVerdict(t *testing.T) {
+	dir := t.TempDir()
+	l, err := NewReviewLedger(dir, DefaultPath(dir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sha := strings.Repeat("c", 40)
+	if err := l.EnsureRecord(RecordOpts{SHA: sha, Reviewer: "r1", Task: "CHA-1", BuilderFamily: "openai"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := l.Verdict(VerdictOpts{SHA: sha, Reviewer: "r1", Verdict: VerdictFAIL, BuilderFamily: "openai"}); err != nil {
+		t.Fatalf("seed verdict: %v", err)
+	}
+
+	if err := l.CompleteVerdictProvenance(sha, "r1", "CHA-1", "patch123", "digest456", ""); err != nil {
+		t.Fatalf("complete: %v", err)
+	}
+
+	rows, _ := l.AllRows()
+	var last *LedgerRow
+	for i := range rows {
+		if rows[i].Event == string(EventVerdict) && rows[i].SHA == sha && rows[i].Reviewer == "r1" {
+			last = &rows[i]
+		}
+	}
+	if last == nil {
+		t.Fatal("no verdict row")
+	}
+	if last.Verdict != string(VerdictFAIL) {
+		t.Fatalf("the verdict VALUE must be inherited, got %q from a FAIL", last.Verdict)
+	}
+	if last.PatchURL != "patch123" || last.VerificationDigest != "digest456" {
+		t.Errorf("recoverable bindings must be written: %+v", last)
+	}
+	if strings.TrimSpace(last.Lease) != "" {
+		t.Error("a historical lease is unrecoverable and must never be invented")
+	}
+	if last.Gate != GateBackfilledProvenance {
+		t.Errorf("a reconstructed binding must be distinguishable from one recorded at launch, gate=%q", last.Gate)
+	}
+}
+
+// Re-running a backfill must not grow the ledger once there is nothing new.
+func TestCompleteVerdictProvenanceIsIdempotent(t *testing.T) {
+	dir := t.TempDir()
+	l, _ := NewReviewLedger(dir, DefaultPath(dir))
+	sha := strings.Repeat("d", 40)
+	l.EnsureRecord(RecordOpts{SHA: sha, Reviewer: "r1", Task: "CHA-1", BuilderFamily: "openai"})
+	l.Verdict(VerdictOpts{SHA: sha, Reviewer: "r1", Verdict: VerdictPASS, BuilderFamily: "openai"})
+	for i := 0; i < 3; i++ {
+		if err := l.CompleteVerdictProvenance(sha, "r1", "CHA-1", "p", "d", ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rows, _ := l.AllRows()
+	var n int
+	for _, r := range rows {
+		if r.Event == string(EventVerdict) && r.SHA == sha {
+			n++
+		}
+	}
+	if n != 2 {
+		t.Fatalf("expected the original plus ONE completion, got %d; a repeated backfill must not grow the ledger", n)
+	}
+}

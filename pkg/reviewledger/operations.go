@@ -1136,3 +1136,70 @@ func (l *Ledger) VetoSHAs() ([]string, error) {
 	})
 	return shas, nil
 }
+
+// CompleteVerdictProvenance appends a verdict row that repeats an EXISTING
+// verdict with the admission bindings filled in.
+//
+// FAC-659: the writers were fixed in FAC-656/657/658, but 1129 record rows and
+// 1087 verdict rows were already on disk with every binding empty. Fixing a
+// writer does not fix history, so candidates with real PASS verdicts stayed
+// permanently inadmissible for a bookkeeping gap rather than a review problem.
+//
+// Admit takes the LAST verdict row per sha+reviewer, so completion is an append
+// here too: the original row survives exactly as written and is superseded, not
+// rewritten. Ledger.verdict() cannot be used because it is idempotent on
+// sha+reviewer by design and would silently no-op.
+//
+// The VERDICT VALUE, reviewer and families are INHERITED from the row being
+// completed and can never be supplied by the caller. This is the property that
+// keeps a backfill from being a laundering path: it may add evidence about a
+// verdict, it may never change what the verdict SAID. A backfill that could turn
+// a FAIL into a PASS would be far worse than the gap it closes.
+func (l *Ledger) CompleteVerdictProvenance(sha, reviewer string, task, patchURL, vfyDigest, lease string) error {
+	sha = strings.TrimSpace(sha)
+	reviewer = strings.TrimSpace(reviewer)
+	if sha == "" || reviewer == "" {
+		return fmt.Errorf("completing a verdict requires an exact sha and reviewer")
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	rows, err := readRows(l.Path)
+	if err != nil {
+		return err
+	}
+	var prior *LedgerRow
+	for i := range rows {
+		if rows[i].Event == string(EventVerdict) && rows[i].SHA == sha && rows[i].Reviewer == reviewer {
+			prior = &rows[i]
+		}
+	}
+	if prior == nil {
+		return fmt.Errorf("no verdict for sha %s reviewer %q to complete", sha, reviewer)
+	}
+	row := *prior
+	// Only the bindings may be written, and only where the caller has real
+	// evidence. An empty value never overwrites something already recorded.
+	if strings.TrimSpace(task) != "" {
+		row.Task = task
+	}
+	if strings.TrimSpace(patchURL) != "" {
+		row.PatchURL = patchURL
+	}
+	if strings.TrimSpace(vfyDigest) != "" {
+		row.VerificationDigest = vfyDigest
+	}
+	if strings.TrimSpace(lease) != "" {
+		row.Lease = lease
+	}
+	if row.Task == prior.Task && row.PatchURL == prior.PatchURL &&
+		row.VerificationDigest == prior.VerificationDigest && row.Lease == prior.Lease {
+		return nil // nothing new to record; do not grow the ledger for no reason
+	}
+	row.Gate = GateBackfilledProvenance
+	return l.appendRow(l.Path, &row)
+}
+
+// GateBackfilledProvenance marks a row whose bindings were recovered from
+// durable evidence after the fact, so a reader can always tell a binding that
+// was recorded at launch from one reconstructed later.
+const GateBackfilledProvenance = "backfilled-provenance"

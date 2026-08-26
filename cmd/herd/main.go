@@ -7767,6 +7767,12 @@ func runReviewLedger() {
 			fmt.Fprintf(os.Stderr, "review-ledger: encode tier report: %v\n", err)
 			os.Exit(1)
 		}
+	case "backfill":
+		if err := runLedgerBackfill(os.Args[3:]); err != nil {
+			fmt.Fprintf(os.Stderr, "review-ledger backfill: %v\n", err)
+			os.Exit(1)
+		}
+
 	case "readiness":
 		// FAC-636: MergeReadiness existed only as a Go API, so the coordinator had
 		// no way to classify candidates except grepping the ledger -- which is
