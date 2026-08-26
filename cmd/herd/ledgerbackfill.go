@@ -59,21 +59,33 @@ func runLedgerBackfill(args []string) error {
 	artifacts := indexReviewArtifacts(reviewRoot)
 
 	type target struct{ sha, reviewer, artifact string }
-	var todo []target
-	seen := map[string]bool{}
+	// Read the LAST verdict row per sha+reviewer, exactly as Admit does.
+	//
+	// The first version kept the FIRST row it saw, which is always the ORIGINAL
+	// with empty bindings, so a completed candidate still looked incomplete and
+	// the dry run reported 1044 rows as needing recovery immediately after
+	// recovering all 1044 of them. The write path was idempotent so nothing was
+	// corrupted, but a tool whose report never converges cannot tell an operator
+	// whether the work is done -- which is the whole reason to run it.
+	latest := map[string]reviewledger.LedgerRow{}
+	var order []string
 	for i := range rows {
 		r := rows[i]
 		if r.Event != string(reviewledger.EventVerdict) {
 			continue
 		}
+		key := r.SHA + ":" + r.Reviewer
+		if _, seen := latest[key]; !seen {
+			order = append(order, key)
+		}
+		latest[key] = r
+	}
+	var todo []target
+	for _, key := range order {
+		r := latest[key]
 		if strings.TrimSpace(r.PatchURL) != "" && strings.TrimSpace(r.VerificationDigest) != "" {
 			continue // already complete on the bindings we can recover
 		}
-		key := r.SHA + ":" + r.Reviewer
-		if seen[key] {
-			continue
-		}
-		seen[key] = true
 		todo = append(todo, target{sha: r.SHA, reviewer: r.Reviewer, artifact: r.Artifact})
 	}
 
