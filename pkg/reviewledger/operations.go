@@ -622,7 +622,41 @@ func resolveFamily(lbf, lrf, vbf, vrf string) familyState {
 
 // Eligible returns true if sha is harvestable for the given builderFamily.
 // A SHA-level FAIL/BLOCKED veto blocks eligibility regardless of PASS from other reviewers.
+
+// isUnrecordedProvenance reports the exact FAC-627 marking: the honest
+// `unrecorded` family under the provenance-unrecorded gate. It is deliberately
+// narrow so a merely-missing or misspelled family can never be mistaken for an
+// operator-decidable one.
+func isUnrecordedProvenance(gate, builderFamily string) bool {
+	return gate == GateProvenanceUnrecorded &&
+		strings.EqualFold(strings.TrimSpace(builderFamily), FamilyUnrecorded)
+}
+
+// Eligible is the default fail-closed merge gate.
 func (l *Ledger) Eligible(sha, builderFamily string) (bool, error) {
+	return l.eligible(sha, builderFamily, false)
+}
+
+// EligibleAllowingUnrecordedProvenance is Eligible with the ONE class FAC-668
+// made operator-decidable explicitly accepted: a real PASS whose builder family
+// was never recorded.
+//
+// FAC-670: FAC-668 added that acceptance to `review-ledger readiness`, but
+// readiness only REPORTS. harvest-merge is the only supported local-evidence
+// merge path, and it calls Eligible strictly -- where an `unrecorded` family
+// fails the allowlist check and the PASS is skipped entirely, so hasPass never
+// becomes true. The operator's decision could be expressed and could not reach
+// the thing that merges. Reported by the orchestrator against PR #3308, which
+// readiness called ready under the flag while harvest-merge still refused it.
+//
+// Everything else still refuses: FAIL, BLOCKED, split, superseded, consumed,
+// retired, and no-record are untouched by this and cannot be overridden. It
+// accepts unknown PROVENANCE, never dissent.
+func (l *Ledger) EligibleAllowingUnrecordedProvenance(sha, builderFamily string) (bool, error) {
+	return l.eligible(sha, builderFamily, true)
+}
+
+func (l *Ledger) eligible(sha, builderFamily string, allowUnrecorded bool) (bool, error) {
 	rows, err := readRows(l.Path)
 	if err != nil {
 		return false, fmt.Errorf("herd-review-ledger: refuse sha=%s reason=ledger read error: %w", sha, err)
@@ -762,6 +796,15 @@ func (l *Ledger) Eligible(sha, builderFamily string) (bool, error) {
 		}
 
 		if lbf == "" || !FamilyAllowlist[lbf] {
+			// FAC-670: an explicitly-accepted unrecorded-provenance PASS counts.
+			//
+			// The family is genuinely unknown, so this PASS can never support a
+			// cross-family independence claim -- and it does not claim one. It
+			// counts only because an operator said, for this candidate, that a
+			// review they cannot prove was cross-family is good enough.
+			if allowUnrecorded && isUnrecordedProvenance(gate, lbf) {
+				hasPass = true
+			}
 			continue
 		}
 

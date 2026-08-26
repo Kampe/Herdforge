@@ -17,7 +17,7 @@ const hmSHA = "d11b37b0000000000000000000000000000000bb"
 // never that a reviewer had said so.
 func TestHarvestMergeRefusesOperatorSuppliedPass(t *testing.T) {
 	for _, consent := range []string{"PASS", "pass", " Pass "} {
-		v, err := harvestMergeVerdict(hmSHA, consent)
+		v, err := harvestMergeVerdict(hmSHA, consent, false)
 		if err == nil {
 			t.Fatalf("--verdict %q was accepted as merge consent (got verdict %q)", consent, v)
 		}
@@ -30,7 +30,7 @@ func TestHarvestMergeRefusesOperatorSuppliedPass(t *testing.T) {
 // A refusal from the operator is honoured in the one safe direction: stop.
 func TestHarvestMergeHonoursOperatorVeto(t *testing.T) {
 	for _, veto := range []string{"FAIL", "BLOCKED", "blocked"} {
-		if _, err := harvestMergeVerdict(hmSHA, veto); err == nil {
+		if _, err := harvestMergeVerdict(hmSHA, veto, false); err == nil {
 			t.Fatalf("operator veto %q did not refuse the merge", veto)
 		}
 	}
@@ -44,7 +44,7 @@ func TestHarvestMergeRefusesWithoutAnAdmissibleLedgerVerdict(t *testing.T) {
 		t.Fatalf("mkdir: %v", err)
 	}
 
-	if _, err := harvestMergeVerdict(hmSHA, ""); err == nil {
+	if _, err := harvestMergeVerdict(hmSHA, "", false); err == nil {
 		t.Fatal("an empty review ledger read as consent to merge")
 	}
 
@@ -66,7 +66,7 @@ func TestHarvestMergeRefusesWithoutAnAdmissibleLedgerVerdict(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("verdict: %v", err)
 	}
-	if _, err := harvestMergeVerdict(hmSHA, ""); err == nil {
+	if _, err := harvestMergeVerdict(hmSHA, "", false); err == nil {
 		t.Fatal("a PASS for another sha read as consent for this candidate")
 	}
 }
@@ -96,7 +96,7 @@ func TestHarvestMergeAcceptsLedgerPassForExactCandidate(t *testing.T) {
 		t.Fatalf("verdict: %v", err)
 	}
 
-	v, err := harvestMergeVerdict(hmSHA, "")
+	v, err := harvestMergeVerdict(hmSHA, "", false)
 	if err != nil {
 		t.Fatalf("an admissible independent PASS was refused: %v", err)
 	}
@@ -117,7 +117,7 @@ func TestHarvestMergeAcceptsLedgerPassForExactCandidate(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("veto verdict: %v", err)
 	}
-	if _, err := harvestMergeVerdict(hmSHA, ""); err == nil {
+	if _, err := harvestMergeVerdict(hmSHA, "", false); err == nil {
 		t.Fatal("an unsuperseded FAIL for the exact candidate still yielded consent")
 	}
 }
