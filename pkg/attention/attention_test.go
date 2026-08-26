@@ -429,3 +429,42 @@ func TestFindAttentionAgentStillReportsAGenuinelyAbsentLane(t *testing.T) {
 		t.Fatal("a lane with no live agent must report absent")
 	}
 }
+
+// FAC-694: Triage used a plain map[name]agent index and exact equality, while
+// findAttentionAgent in the same file did lane matching. The two lookups
+// disagreed about the same fleet.
+//
+// A live standing lane is spelled forge-<lane>-<digest>; the roster spells it
+// forge-<lane>. So Triage reported live lanes "missing" and told the operator
+// to RAISE agents that were already running and idle -- while the real problem,
+// an idle fleet, went unreported. Measured live before the fix:
+// forge-scout-planner-2918de97b5 reported missing.
+func TestTriageMatchesDigestSuffixedStandingAgents(t *testing.T) {
+	agents := []kick.AgentEntry{
+		{Name: "forge-scout-planner-2918de97b5", Status: "idle", PaneID: "wB:p454"},
+	}
+	r := Triage(agents, []string{"forge-scout-planner"}, noHold, noDeath)
+	for _, it := range r.Items {
+		if it.Level == LevelMissing {
+			t.Fatalf("a live lane was reported missing: %+v", it)
+		}
+		if it.Status != "idle" {
+			t.Fatalf("live lane status not carried through: %+v", it)
+		}
+	}
+}
+
+func TestTriageStillReportsGenuinelyAbsentLanes(t *testing.T) {
+	// The fix must not make every roster entry resolve to whatever is running.
+	// A lane with no live agent is a real fleet gap and must stay visible.
+	agents := []kick.AgentEntry{
+		{Name: "forge-scout-planner-2918de97b5", Status: "idle"},
+	}
+	r := Triage(agents, []string{"forge-recovery-sentinel"}, noHold, noDeath)
+	if len(r.Items) == 0 {
+		t.Fatal("an absent lane produced no item")
+	}
+	if r.Items[0].Level != LevelMissing {
+		t.Fatalf("an absent lane was claimed live by an unrelated agent: %+v", r.Items[0])
+	}
+}

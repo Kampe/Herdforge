@@ -190,6 +190,23 @@ func Triage(
 	for _, id := range standingIDs {
 		a, found := index[id]
 		if !found {
+			// FAC-694: exact equality alone is the FAC-660 defect, fixed in
+			// findAttentionAgent below and left here -- so the two lookups in
+			// this one file disagreed about the same fleet.
+			//
+			// A live standing lane is spelled forge-<lane>-<digest>; the roster
+			// spells it forge-<lane>. Exact lookup misses every one, so Triage
+			// reported four lanes "missing" and told the operator to raise
+			// them while they were running and idle. The genuinely idle lanes
+			// were never surfaced at all, and the fleet sat still with the
+			// health check reporting a fleet gap that did not exist.
+			//
+			// Measured live: forge-scout-planner-2918de97b5 was reported
+			// missing while kick.LaneForAgent matched it to lane
+			// "scout-planner" from the same roster entry.
+			a, found = findAttentionAgent(agents, id)
+		}
+		if !found {
 			// Missing standing agent — fleet gap.
 			item := Item{
 				Name:   id,
