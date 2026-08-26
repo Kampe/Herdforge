@@ -175,6 +175,10 @@ func gatherPulseObservation(ctx context.Context, act bool) (pulse.Observation, p
 
 	// Quota (one usage snapshot).
 	obs.Quota = readPulseQuota()
+	// FAC-674: worktree accumulation was invisible until someone ran a sweep, so
+	// it reached 403 registrations before anyone looked. Surfacing it here makes
+	// the leak visible on every beat instead of on remembering.
+	obs.Worktrees = readPulseWorktrees()
 
 	// Wind-down (one Read).
 	obs.WindDown = readPulseWindDown(ctx)
@@ -605,6 +609,45 @@ func readPulseReview() pulse.ReviewObservation {
 		Cap:       cap,
 		Saturated: len(pendingRefs)+len(needReviewRefs) >= cap,
 	}
+}
+
+// readPulseWorktrees classifies the worktree population using the SAME logic
+// worktree-reap uses, so pulse and the reaper can never disagree about what is
+// reclaimable (FAC-674). A second classifier would be a second definition of one
+// decision, which is the defect pkg/invariant exists to catch.
+func readPulseWorktrees() pulse.WorktreeObservation {
+	root := firstEnv("HERD_ROOT", "HERD_REPO_ROOT", ".")
+	entries, err := listWorktreeEntries(root)
+	if err != nil {
+		return pulse.WorktreeObservation{Known: false, Error: err.Error()}
+	}
+	out := pulse.WorktreeObservation{Known: true, Total: len(entries)}
+	for _, e := range entries {
+		switch {
+		case e.IsMain:
+			// The repository's own checkout is not a task surface.
+		case e.Detached:
+			out.Detached++
+		case e.Locked:
+			out.Locked++
+		case e.Branch == "":
+			out.Unknown++
+		case e.Dirty:
+			out.Dirty++
+		case isResidentHome(e.Branch, e.Path):
+			out.ResidentHome++
+		default:
+			switch ahead := commitsAhead(root, "origin/main", e.Branch); {
+			case ahead < 0:
+				out.Unknown++
+			case ahead == 0:
+				out.Landed++
+			default:
+				out.Unmerged++
+			}
+		}
+	}
+	return out.Summarize()
 }
 
 func readPulseQuota() pulse.QuotaObservation {
