@@ -169,9 +169,49 @@ func runGoalGuardStopHook(s *goalguard.Store, payload []byte) error {
 
 	block := map[string]string{
 		"decision": "block",
-		"reason":   fmt.Sprintf("AUTOMATED STOP-HOOK OUTPUT — NOT AN ASSIGNMENT. goal-guard: goal %q on lane %q is not met (continuation %d). Keep working toward the goal; stop only when it is complete, then run `herd goal-guard --clear`.", g.Task, g.Lane, decision.Continuations),
+		"reason":   goalGuardContinueReason(g.Task, g.Lane, decision.Continuations),
 	}
 	return writeGoalJSON(os.Stdout, block)
+}
+
+// goalGuardPlateauAfter is how many continuations may pass before the guard
+// stops saying "keep working" and starts describing a plateau. Three is
+// deliberate: one continuation is normal, two can be a slow beat, and by the
+// third an unchanged lane is looping rather than progressing.
+const goalGuardPlateauAfter = 3
+
+// goalGuardContinueReason is the instruction a blocked lane actually reads.
+//
+// FAC-652: this said "Keep working toward the goal; stop only when it is
+// complete" on EVERY continuation, with no concept of having nothing to do. A
+// standing lane whose queue is momentarily empty was therefore told to keep
+// working, forever, and the only behaviours available to it were to spin or to
+// die. Both were observed on the live fleet: perf-cost-guard emitted
+// near-identical reports every one to two minutes, and herd-smith reached
+// continuation 42 doing twenty-minute waits for a review cap to move -- burning
+// a provider at 8% remaining to produce no artifact at all.
+//
+// Waiting is not failure. A standing lane is a loop, and a loop with no work
+// available should be parked on an event, not asked to re-probe unchanged state.
+// So past a plateau threshold the instruction changes shape: report the plateau
+// ONCE with the counts that prove it, then wait for a real transition. The lane
+// still may not stop -- the goal is still unmet and the guard still blocks --
+// but "block" now means "hold, quietly" instead of "keep trying things".
+//
+// The events named here are the ones that actually exist: FAC-651 made an
+// admitted verdict post a completion callback, and pool slots free on reap.
+func goalGuardContinueReason(task, lane string, continuations int) string {
+	const preamble = "AUTOMATED STOP-HOOK OUTPUT — NOT AN ASSIGNMENT. goal-guard: "
+	if continuations < goalGuardPlateauAfter {
+		return fmt.Sprintf(preamble+"goal %q on lane %q is not met (continuation %d). Keep working toward the goal; stop only when it is complete, then run `herd goal-guard --clear`.",
+			task, lane, continuations)
+	}
+	return fmt.Sprintf(preamble+"goal %q on lane %q is not met (continuation %d). "+
+		"You have continued %d times. If you produced NO new artifact since the last continuation, you are PLATEAUED, and repeating the same probe is not work: it spends quota to re-observe unchanged state. "+
+		"Do this instead: (1) say ONCE what you are waiting on, with the counts that prove there is nothing claimable right now; (2) do NOT repeat that report on later continuations; (3) WAIT for a real transition -- a verdict callback, a freed pool slot, a dependency card closing, or new claimable work -- rather than re-running the probe that just returned unchanged. "+
+		"Waiting on an event IS valid progress for a standing lane; a lane with genuinely nothing to claim is correctly idle, not failing. "+
+		"If you DID produce an artifact since the last continuation, ignore all of the above and keep going. Stop only when the goal is complete, then run `herd goal-guard --clear`.",
+		task, lane, continuations, continuations)
 }
 
 func splitGoalCSV(raw string) []string {
