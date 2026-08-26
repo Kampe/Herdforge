@@ -96,3 +96,43 @@ func TestStandingIDsFallsThroughWhenARegistryCarriesNoStandingFlags(t *testing.T
 		t.Fatalf("a registry with standing flags must remain authoritative, got %v", got)
 	}
 }
+
+// FAC-699: the launcher truncates an agent name to a fixed width without
+// respecting hyphen boundaries. Lane "review-harvest-supervisor" launched as
+// forge-review-harvest-su-467b70d7, so the live segment is a strict prefix cut
+// INSIDE "supervisor". Boundary matching can never succeed against that, which
+// is why attention reported the lane missing while its agent was live.
+func TestTruncatedLaneNameStillResolves(t *testing.T) {
+	lanes := []string{"forge-review-harvest-supervisor", "forge-orchestrator", "forge-harvest"}
+	if got := LaneForAgent("forge-review-harvest-su-467b70d7", lanes); got != "review-harvest-supervisor" {
+		t.Fatalf("truncated lane did not resolve: got %q", got)
+	}
+}
+
+func TestAmbiguousTruncationRefusesToGuess(t *testing.T) {
+	// Two lanes share the surviving prefix, so the truncation destroyed the
+	// distinction. Binding to the wrong lane is worse than no binding: the
+	// wrong lane looks healthy while the real one looks missing, and a reaper
+	// acting on that closes the wrong pane.
+	lanes := []string{"forge-review-harvest-supervisor", "forge-review-harvest-superviser-two"}
+	if got := LaneForAgent("forge-review-harvest-su-467b70d7", lanes); got != "" {
+		t.Fatalf("an ambiguous truncation was guessed: got %q", got)
+	}
+}
+
+func TestShortPrefixDoesNotClaimALane(t *testing.T) {
+	// A short surviving prefix is ambiguous by nature.
+	lanes := []string{"forge-review-harvest-supervisor"}
+	if got := LaneForAgent("forge-rev-467b70d7", lanes); got != "" {
+		t.Fatalf("a short prefix claimed a lane: got %q", got)
+	}
+}
+
+func TestExactMatchStillWinsOverTruncation(t *testing.T) {
+	// The truncation path is a FALLBACK only. An agent that matches a lane
+	// exactly must never be reassigned to a longer lane it merely prefixes.
+	lanes := []string{"forge-harvest", "forge-harvest-supervisor"}
+	if got := LaneForAgent("forge-harvest-467b70d7", lanes); got != "harvest" {
+		t.Fatalf("exact/boundary match lost to truncation fallback: got %q", got)
+	}
+}
