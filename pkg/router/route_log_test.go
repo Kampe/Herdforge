@@ -54,3 +54,39 @@ func TestAppendRouteDecisionTable(t *testing.T) {
 		})
 	}
 }
+
+func TestAppendRouteDecisionRejectsMalformedOrUnknownExistingRecord(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		data string
+		want string
+	}{
+		{name: "concatenated objects", data: `{"timestamp":"2026-08-19T13:41:20Z","provider":"codex","task":"implementation"}{"timestamp":"2026-08-19T13:42:20Z","provider":"codex","task":"implementation"}` + "\n", want: "malformed record"},
+		{name: "unknown task shape", data: `{"timestamp":"2026-08-19T13:41:20Z","provider":"codex","task":"unknown-lane"}` + "\n", want: "unknown task shape"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "route-decisions.log")
+			if err := os.WriteFile(path, []byte(tc.data), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			err := AppendRouteDecision(path, &Route{Provider: "codex", Task: "implementation"}, nil)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("AppendRouteDecision error = %v, want %q", err, tc.want)
+			}
+			got, readErr := os.ReadFile(path)
+			if readErr != nil {
+				t.Fatal(readErr)
+			}
+			if string(got) != tc.data {
+				t.Fatalf("malformed evidence changed: got %q, want %q", got, tc.data)
+			}
+		})
+	}
+}
+
+func TestAppendRouteDecisionRejectsUnknownProvider(t *testing.T) {
+	err := AppendRouteDecision(filepath.Join(t.TempDir(), "route-decisions.log"), &Route{Provider: "unknown-lane", Task: "implementation"}, nil)
+	if err == nil || !strings.Contains(err.Error(), `unknown provider "unknown-lane"`) {
+		t.Fatalf("AppendRouteDecision error = %v, want unknown provider", err)
+	}
+}
