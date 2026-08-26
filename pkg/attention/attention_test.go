@@ -468,3 +468,62 @@ func TestTriageStillReportsGenuinelyAbsentLanes(t *testing.T) {
 		t.Fatalf("an absent lane was claimed live by an unrelated agent: %+v", r.Items[0])
 	}
 }
+
+// FAC-698: one lane's unresolvable hold authority used to abort the whole scan
+// via authorityFailure, which returned Total=1. Against the live chainseer
+// fleet that produced "1 of 1 lane(s) need eyes" while 14 lanes were running:
+// a partial failure rendered as a complete answer, which is worse than an
+// error because it looks like a result.
+func TestDegradedLaneDoesNotTruncateTheScan(t *testing.T) {
+	base := Result{
+		Items: []Item{
+			{Name: "forge-a", Status: "idle", Level: LevelMedium},
+			{Name: "forge-b", Status: "working", Level: LevelNone},
+		},
+		Counts:  map[AttentionLevel]int{LevelMedium: 1, LevelNone: 1},
+		Total:   2,
+		Needing: 1,
+	}
+	got := applyDegradedAuthority(base, map[string]string{"forge-a": "hold authority unavailable: ambiguous binding"})
+
+	if got.Total != 2 {
+		t.Fatalf("a degraded lane changed the fleet total: got %d want 2", got.Total)
+	}
+	if len(got.Items) != 2 {
+		t.Fatalf("the scan was truncated: %d items", len(got.Items))
+	}
+	var a Item
+	for _, it := range got.Items {
+		if it.Name == "forge-a" {
+			a = it
+		}
+	}
+	if a.Level != LevelCritical {
+		t.Fatalf("degraded lane was not raised to critical: %+v", a)
+	}
+	// The other lane must survive untouched -- that is the whole point.
+	for _, it := range got.Items {
+		if it.Name == "forge-b" && it.Level != LevelNone {
+			t.Fatalf("an unrelated lane was disturbed by another lane's failure: %+v", it)
+		}
+	}
+}
+
+func TestDegradedLaneNotAlreadyInTheReportIsAdded(t *testing.T) {
+	base := Result{Items: []Item{{Name: "forge-b", Level: LevelNone}}, Counts: map[AttentionLevel]int{LevelNone: 1}, Total: 1}
+	got := applyDegradedAuthority(base, map[string]string{"forge-z": "hold authority unavailable: boom"})
+	if got.Total != 2 || len(got.Items) != 2 {
+		t.Fatalf("a degraded lane outside the report was dropped: total=%d items=%d", got.Total, len(got.Items))
+	}
+	if got.Counts[LevelCritical] != 1 {
+		t.Fatalf("critical count not incremented: %+v", got.Counts)
+	}
+}
+
+func TestNoDegradedLanesLeavesTheResultUntouched(t *testing.T) {
+	base := Result{Items: []Item{{Name: "forge-b", Level: LevelNone}}, Counts: map[AttentionLevel]int{LevelNone: 1}, Total: 1}
+	got := applyDegradedAuthority(base, nil)
+	if got.Total != 1 || len(got.Items) != 1 || got.Items[0].Level != LevelNone {
+		t.Fatalf("a clean scan was modified: %+v", got)
+	}
+}

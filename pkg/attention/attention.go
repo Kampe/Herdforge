@@ -373,13 +373,29 @@ func RunWithHoldReaderAndTasks(reader lifecycle.HoldReader, repository string, r
 		return nil, fmt.Errorf("herd-attention: %w", err)
 	}
 	heldFacts := map[string]string{}
+	// FAC-698: one lane's unresolvable authority used to abort the WHOLE scan.
+	// Run against the chainseer fleet, attention reported
+	//
+	//	herd-attention: 1 of 1 lane(s) need eyes -- 1 critical
+	//	active task binding is unknown or ambiguous: lane=api-crusader
+	//
+	// and stopped. Thirteen other live lanes were never examined, and "1 of 1"
+	// reads as a one-lane fleet rather than as a scan that died on its first
+	// entry. A partial failure rendered as a complete answer is worse than an
+	// error, because it looks like a result.
+	//
+	// An authority failure on ONE lane is now that lane's finding. The scan
+	// continues, so the other lanes are still triaged and the operator sees
+	// both the broken binding and the rest of the fleet.
+	degraded := map[string]string{}
 	for _, name := range kick.StandingIDs() {
 		if _, live := findAttentionAgent(agents, name); !live {
 			continue
 		}
 		lane, resolveErr := registry.ResolveLiveAgentID(name)
 		if resolveErr != nil {
-			return authorityFailure(name, resolveErr)
+			degraded[name] = "hold authority unavailable: " + resolveErr.Error()
+			continue
 		}
 		generation := func(ctx context.Context, identity lifecycle.HoldIdentity) (int64, error) {
 			if source, ok := reader.(interface {
@@ -395,11 +411,16 @@ func RunWithHoldReaderAndTasks(reader lifecycle.HoldReader, repository string, r
 				heldFacts[name] = err.Error()
 				continue
 			}
-			return authorityFailure(name, err)
+			degraded[name] = "hold authority unavailable: " + err.Error()
+			continue
 		}
 	}
 	check := func(name string) (string, bool) { reason, held := heldFacts[name]; return reason, held }
 	r := Triage(agents, kick.StandingIDs(), check, kick.ProviderDeathCheck)
+	// A degraded lane is CRITICAL and must not be silently downgraded to
+	// whatever its live status happened to be: an ambiguous task binding is a
+	// real finding, not a healthy idle lane.
+	r = applyDegradedAuthority(r, degraded)
 	return &r, nil
 }
 
@@ -480,4 +501,49 @@ func attentionState(r Result) string {
 	default:
 		return "HEALTHY"
 	}
+}
+
+// applyDegradedAuthority marks lanes whose hold authority could not be resolved,
+// without discarding the rest of the scan.
+//
+// FAC-698: these used to abort the whole run via authorityFailure, so a single
+// ambiguous binding reduced a 14-lane fleet to a one-item report.
+func applyDegradedAuthority(r Result, degraded map[string]string) Result {
+	if len(degraded) == 0 {
+		return r
+	}
+	if r.Counts == nil {
+		r.Counts = map[AttentionLevel]int{}
+	}
+	seen := map[string]int{}
+	for i, it := range r.Items {
+		seen[it.Name] = i
+	}
+	for name, reason := range degraded {
+		if i, ok := seen[name]; ok {
+			if r.Items[i].Level != LevelCritical {
+				r.Counts[r.Items[i].Level]--
+				r.Counts[LevelCritical]++
+				if !NeedsEyes(r.Items[i].Level) {
+					r.Needing++
+				}
+			}
+			r.Items[i].Level = LevelCritical
+			r.Items[i].Reason = reason
+			continue
+		}
+		r.Items = append(r.Items, Item{Name: name, Status: "unknown", Level: LevelCritical, Reason: reason})
+		r.Counts[LevelCritical]++
+		r.Total++
+		r.Needing++
+	}
+	// Same deterministic ordering the main triage uses: urgency DESC, name ASC.
+	sort.SliceStable(r.Items, func(i, j int) bool {
+		ri, rj := urgencyRank(r.Items[i].Level), urgencyRank(r.Items[j].Level)
+		if ri != rj {
+			return ri > rj
+		}
+		return r.Items[i].Name < r.Items[j].Name
+	})
+	return r
 }
