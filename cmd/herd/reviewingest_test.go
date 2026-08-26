@@ -157,3 +157,24 @@ func TestReviewCompletionCallbackRefusesAnEmptySHA(t *testing.T) {
 		t.Fatalf("an empty SHA must not announce anything, got %d", len(cbs))
 	}
 }
+
+// FAC-657: the record and verdict rows must name the SAME task, because
+// Ledger.Admit compares them for equality. They were written from different
+// sources -- record.Task from the BRANCH, verdict.Task from the CARD REF -- so
+// on the live ledger 0 of 1027 SHAs had them equal and 726 verdict rows carried
+// none at all. The comparison could never succeed.
+func TestIngestTaskIdentityIsSharedByBothRows(t *testing.T) {
+	// With a card ref, both rows take the card ref.
+	got := ingestTaskIdentityFor("CHA-2796", "feat/some-branch")
+	if got != "CHA-2796" {
+		t.Errorf("the card ref is the task identity, got %q", got)
+	}
+	// Without one, BOTH fall back to the branch together. Falling back on only
+	// one side is exactly how they diverged.
+	if got := ingestTaskIdentityFor("", "feat/some-branch"); got != "feat/some-branch" {
+		t.Errorf("both rows must fall back together, got %q", got)
+	}
+	if got := ingestTaskIdentityFor("  ", "  feat/x  "); got != "feat/x" {
+		t.Errorf("whitespace-only must not count as a card ref, got %q", got)
+	}
+}
