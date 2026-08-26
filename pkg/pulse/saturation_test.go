@@ -1,6 +1,9 @@
 package pulse
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 // FAC-650: a concurrency bound must be compared against concurrency. Saturated
 // was pending+RAW_VETOED >= cap, and RawVetoed is the ledger's HISTORICAL vetoed
@@ -104,5 +107,42 @@ func TestTheBuilderExemptionIsExactNotFuzzy(t *testing.T) {
 		if reviewSaturationOnly(near, obs, agents) {
 			t.Errorf("%q must not inherit the builder exemption by resemblance", near)
 		}
+	}
+}
+
+// FAC-674: worktree accumulation was invisible until someone ran a sweep, so it
+// reached 403 registrations before anyone looked -- 73 holding already-landed
+// work. A leak nobody can see is a leak nobody fixes.
+//
+// The classes are mutually exclusive on purpose. A single "worktrees: 403" is
+// the same unactionable number as "4 claimable" with no identities: it says
+// something is large without saying what to do.
+func TestWorktreeObservationNamesTheActionNotJustTheCount(t *testing.T) {
+	// Landed work is reclaimable right now, and that is what to say.
+	got := WorktreeObservation{Known: true, Total: 10, Landed: 3, Unmerged: 4}.Summarize()
+	if !strings.Contains(got.Action, "worktree-reap --apply") {
+		t.Errorf("landed surfaces must name the reclaim action: %q", got.Action)
+	}
+	if !strings.Contains(got.Action, "lossless") {
+		t.Errorf("the action must say WHY it is safe: %q", got.Action)
+	}
+
+	// With nothing landed, the remaining problem is unmerged work -- and the
+	// action must be merge-or-close, never reap. Reaping it destroys work.
+	got = WorktreeObservation{Known: true, Total: 10, Landed: 0, Unmerged: 4}.Summarize()
+	if !strings.Contains(got.Action, "never reap") {
+		t.Errorf("unmerged work must be explicitly excluded from reaping: %q", got.Action)
+	}
+	if strings.Contains(got.Action, "--apply") {
+		t.Errorf("unmerged work must NOT be offered to the reaper: %q", got.Action)
+	}
+
+	// A clean population needs no action at all.
+	if a := (WorktreeObservation{Known: true, Total: 5, Detached: 5}).Summarize().Action; a != "" {
+		t.Errorf("a clean population must propose nothing, got %q", a)
+	}
+	// Unknown proposes nothing: an unreadable population cannot authorise work.
+	if a := (WorktreeObservation{Known: false}).Summarize().Action; a != "" {
+		t.Errorf("an unknown population must propose nothing, got %q", a)
 	}
 }

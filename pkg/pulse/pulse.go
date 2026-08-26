@@ -271,6 +271,53 @@ type QuotaObservation struct {
 	AtRisk    bool   `json:"at_risk,omitempty"`
 }
 
+// WorktreeObservation reports worktree population by MUTUALLY EXCLUSIVE class.
+//
+// FAC-674: worktree accumulation was invisible until someone ran a sweep, so it
+// grew to 403 registrations before anyone looked -- 73 of them holding work that
+// had already landed. A leak nobody can see is a leak nobody fixes.
+//
+// The classes are exclusive on purpose. A single "worktrees: 403" is the same
+// unactionable count as "4 claimable" with no identities: it says something is
+// large without saying what to do. Landed surfaces are reclaimable right now;
+// unmerged ones are work waiting to be merged; resident homes must never be
+// touched. Those demand different actions, so they are different numbers.
+type WorktreeObservation struct {
+	Known bool   `json:"known"`
+	Error string `json:"error,omitempty"`
+	// Landed is retirable right now: the commits are already in base.
+	Landed int `json:"landed"`
+	// Unmerged holds work that has not landed. NOT garbage, and never reaped.
+	Unmerged int `json:"unmerged"`
+	// Detached are review-pool surfaces, reclaimed by the pool rather than here.
+	Detached int `json:"detached"`
+	// ResidentHome is a standing lane's home. It tracks base and so LOOKS
+	// landed; retiring one evicts a live lane from the directory it works in.
+	ResidentHome int `json:"resident_home"`
+	Dirty        int `json:"dirty"`
+	Locked       int `json:"locked"`
+	Unknown      int `json:"unknown"`
+	Total        int `json:"total"`
+	// Action names the one thing worth doing, or "" when nothing is.
+	Action string `json:"action,omitempty"`
+}
+
+// Summarize fills Action so the count is actionable rather than merely alarming.
+func (w WorktreeObservation) Summarize() WorktreeObservation {
+	if !w.Known {
+		return w
+	}
+	switch {
+	case w.Landed > 0:
+		w.Action = "herd worktree-reap --apply retires " + itoa(w.Landed) + " landed worktree(s); removal is lossless because the commits are already in base"
+	case w.Unmerged > 0:
+		w.Action = itoa(w.Unmerged) + " worktree(s) hold unmerged work: merge or close them, never reap them"
+	}
+	return w
+}
+
+func itoa(n int) string { return fmt.Sprintf("%d", n) }
+
 // WindDownObservation is one read of the fleet wind-down gate.
 type WindDownObservation struct {
 	Known      bool   `json:"known"`
@@ -298,6 +345,7 @@ type Observation struct {
 	Callbacks []CallbackObservation `json:"callbacks,omitempty"`
 	Review    ReviewObservation     `json:"review"`
 	Quota     QuotaObservation      `json:"quota"`
+	Worktrees WorktreeObservation   `json:"worktrees"`
 	WindDown  WindDownObservation   `json:"wind_down"`
 	Broker    BrokerObservation     `json:"broker"`
 	// NeedsReconcile is true when durable lifecycle/control events are pending.
