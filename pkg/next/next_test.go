@@ -2,6 +2,7 @@ package next
 
 import (
 	"context"
+	"github.com/Kampe/Herdforge/pkg/broker"
 	"os"
 	"path/filepath"
 	"strings"
@@ -217,5 +218,57 @@ func TestClaimPreviewZeroStillExplainsItself(t *testing.T) {
 	}
 	if strings.Contains(got, ": ,") || strings.HasSuffix(strings.TrimSpace(got), ":") {
 		t.Errorf("no dangling ref suffix on zero: %q", got)
+	}
+}
+
+// FAC-697: pkg/broker was written to make the selector defect unrepresentable
+// and never given a caller. These pin that the seam actually enforces it.
+func TestClaimPreviewWithCountButNoRefIsRejected(t *testing.T) {
+	// The exact defect the package exists to forbid: a number an operator can
+	// print and nobody can dispatch.
+	p := ClaimPreview{Role: "worker", Claimable: 2}
+	if _, err := p.Decision("forge-worker"); err == nil {
+		t.Fatal("a claimable count with no ref produced a decision; the invariant is not enforced")
+	}
+}
+
+func TestClaimPreviewWithRefsYieldsAnExactWorkDecision(t *testing.T) {
+	p := ClaimPreview{Role: "worker", Claimable: 2, ClaimableRefs: []string{"CHA-3193", "CHA-3194"}}
+	d, err := p.Decision("forge-worker")
+	if err != nil {
+		t.Fatalf("a preview naming refs failed to decide: %v", err)
+	}
+	if d.Outcome != broker.OutcomeWork || d.Task == nil || d.Task.Ref != "CHA-3193" {
+		t.Fatalf("decision does not name an exact task: %+v", d)
+	}
+}
+
+func TestEmptyQueueBecomesAWaitThatNamesTheEvent(t *testing.T) {
+	// An empty queue is legitimate and is NOT a failure -- but an unnamed wait
+	// is indistinguishable from a spin, so Validate must force a reason.
+	p := ClaimPreview{Role: "worker"}
+	d, err := p.Decision("forge-worker")
+	if err != nil {
+		t.Fatalf("an empty queue failed to decide: %v", err)
+	}
+	if d.Outcome != broker.OutcomeWait {
+		t.Fatalf("empty queue did not become a wait: %+v", d)
+	}
+	if d.WaitReason == "" {
+		t.Fatal("wait names no event; it cannot be told apart from a spin")
+	}
+	if !strings.Contains(d.WaitReason, "filter result") {
+		t.Fatalf("wait reason does not distinguish an unmatched filter from an idle queue: %q", d.WaitReason)
+	}
+}
+
+func TestProvenanceBlockedQueueWaitsAndNamesTheBlockedRefs(t *testing.T) {
+	p := ClaimPreview{Role: "worker", ProvenanceBlocked: 2, BlockedRefs: []string{"CHA-1", "CHA-2"}}
+	d, err := p.Decision("forge-worker")
+	if err != nil {
+		t.Fatalf("a blocked queue failed to decide: %v", err)
+	}
+	if d.Outcome != broker.OutcomeWait || len(d.Blocked) != 2 {
+		t.Fatalf("blocked refs were not carried into the decision: %+v", d)
 	}
 }

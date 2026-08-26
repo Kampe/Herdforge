@@ -4,9 +4,9 @@
   "generated_by": "scripts/packageinventory/inventory.go",
   "class_counts": {
     "internal": 1,
-    "production": 100,
+    "production": 101,
     "secondary": 1,
-    "unwired": 25
+    "unwired": 24
   },
   "packages": [
     {
@@ -71,8 +71,8 @@
     },
     {
       "path": "github.com/Kampe/Herdforge/pkg/broker",
-      "class": "unwired",
-      "test_importers": 0,
+      "class": "production",
+      "test_importers": 1,
       "has_own_tests": true
     },
     {
@@ -444,7 +444,7 @@
     {
       "path": "github.com/Kampe/Herdforge/pkg/progress",
       "class": "production",
-      "test_importers": 0,
+      "test_importers": 1,
       "has_own_tests": true
     },
     {

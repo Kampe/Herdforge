@@ -3,6 +3,7 @@ package next
 import (
 	"context"
 	"fmt"
+	"github.com/Kampe/Herdforge/pkg/broker"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -442,4 +443,52 @@ func (p *NextPicker) Selftest(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+// Decision converts this preview into a broker.Decision, which is the type that
+// makes the selector defect unrepresentable.
+//
+// FAC-697: pkg/broker was written for exactly this and never given a caller.
+// ClaimPreview can still express the shape the package exists to forbid -- a
+// Claimable count above zero with no ClaimableRefs -- because nothing enforces
+// the correspondence. broker.Decision cannot: Validate() rejects a work outcome
+// with no exact task ref, and rejects a wait with no named event.
+//
+// So the invariant stops being a comment and becomes a type. A caller that
+// routes through here either gets an identity it can dispatch or a reason it
+// can report, and never a number it can only print.
+func (p ClaimPreview) Decision(lane string) (broker.Decision, error) {
+	if p.Claimable > 0 && len(p.ClaimableRefs) == 0 {
+		// The exact defect. Report it as a defect rather than emitting a
+		// decision nobody can act on.
+		return broker.Decision{}, fmt.Errorf(
+			"claim preview reports %d claimable for role %q but names no ref: a count without an identity is reportable, not dispatchable",
+			p.Claimable, p.Role)
+	}
+
+	if len(p.ClaimableRefs) > 0 {
+		d := broker.Decision{
+			Outcome: broker.OutcomeWork,
+			Task:    &broker.Task{Ref: p.ClaimableRefs[0], Kind: broker.KindBuild},
+		}
+		if err := d.Validate(); err != nil {
+			return broker.Decision{}, err
+		}
+		return d, nil
+	}
+
+	// No claimable work is a legitimate WAIT, and it must name the event.
+	// Description() already distinguishes "blocked on provenance" from "the
+	// filter matched nothing", which is precisely the named event a wait needs.
+	d := broker.Decision{Outcome: broker.OutcomeWait, WaitReason: p.Description()}
+	if len(p.BlockedRefs) > 0 {
+		d.Blocked = map[string]string{}
+		for _, ref := range p.BlockedRefs {
+			d.Blocked[ref] = "missing or invalid herd-deps-v1 provenance"
+		}
+	}
+	if err := d.Validate(); err != nil {
+		return broker.Decision{}, err
+	}
+	return d, nil
 }
