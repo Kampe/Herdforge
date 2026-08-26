@@ -1,9 +1,11 @@
 package main
 
 import (
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -187,8 +189,9 @@ func TestRetireLandedReportsOnlyWhatItActuallyRemoved(t *testing.T) {
 
 	dir := filepath.Join(root, "wt-landed")
 	run("worktree", "add", "-q", "-b", "landed-branch", dir)
+	head, _ := exec.Command("git", "-C", dir, "rev-parse", "HEAD").Output()
 
-	retired, failed := retireLanded(root, []reapRow{{Path: dir, Branch: "landed-branch", Class: "landed"}})
+	retired, failed := retireLanded(root, []reapRow{{Path: dir, Branch: "landed-branch", Head: strings.TrimSpace(string(head)), Class: "landed"}})
 	if len(retired) != 1 || len(failed) != 0 {
 		t.Fatalf("a real removal must be reported as retired: retired=%v failed=%v", retired, failed)
 	}
@@ -196,6 +199,113 @@ func TestRetireLandedReportsOnlyWhatItActuallyRemoved(t *testing.T) {
 	// whole defect was a command trusting its own success report.
 	if worktreeExists(dir) {
 		t.Fatal("reported retired while the directory still exists")
+	}
+	if out, err := exec.Command("git", "-C", root, "show-ref", "--verify", "--quiet", "refs/heads/landed-branch").CombinedOutput(); err == nil {
+		t.Fatalf("reported retired while the branch still exists: %s", out)
+	}
+}
+
+// A patch-equivalent rebase/cherry-pick is landed but not merged by ancestry.
+// `git branch -d` refuses that branch; retirement must use the prior patch proof
+// as authority and remove both the worktree and branch.
+func TestRetireLandedDeletesPatchLandedNonAncestorBranch(t *testing.T) {
+	root := t.TempDir()
+	run := func(a ...string) {
+		t.Helper()
+		c := exec.Command("git", append([]string{"-C", root}, a...)...)
+		c.Env = append(os.Environ(), "GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@t", "GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@t")
+		if out, err := c.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", a, err, out)
+		}
+	}
+	run("init", "-q", "-b", "main", ".")
+	os.WriteFile(filepath.Join(root, "base.txt"), []byte("base\n"), 0o644)
+	run("add", ".")
+	run("commit", "-qm", "base")
+	dir := filepath.Join(root, "wt-patch-landed")
+	run("worktree", "add", "-q", "-b", "patch-landed", dir)
+	os.WriteFile(filepath.Join(dir, "change.txt"), []byte("landed\n"), 0o644)
+	run("-C", dir, "add", ".")
+	run("-C", dir, "commit", "-qm", "change")
+	// Force main to a different parent before cherry-pick, so patch identity is
+	// equal while ancestry and commit SHA are provably different.
+	run("commit", "--allow-empty", "-qm", "main diverges")
+	run("cherry-pick", "patch-landed")
+	head, _ := exec.Command("git", "-C", dir, "rev-parse", "HEAD").Output()
+
+	retired, failed := retireLanded(root, []reapRow{{Path: dir, Branch: "patch-landed", Head: strings.TrimSpace(string(head)), Class: "landed"}})
+	if len(retired) != 1 || len(failed) != 0 {
+		t.Fatalf("patch-landed branch must retire transactionally: retired=%v failed=%v", retired, failed)
+	}
+	if worktreeExists(dir) {
+		t.Fatal("worktree survived transactional retirement")
+	}
+	if err := exec.Command("git", "-C", root, "show-ref", "--verify", "--quiet", "refs/heads/patch-landed").Run(); err == nil {
+		t.Fatal("branch survived transactional retirement")
+	}
+}
+
+func TestRetireLandedRestoresWorktreeWhenBranchDeletionFails(t *testing.T) {
+	root := t.TempDir()
+	exec.Command("git", "-C", root, "init", "-q", "-b", "main").Run()
+	exec.Command("git", "-C", root, "config", "user.email", "t@t").Run()
+	exec.Command("git", "-C", root, "config", "user.name", "t").Run()
+	os.WriteFile(filepath.Join(root, "a"), []byte("x"), 0o644)
+	exec.Command("git", "-C", root, "add", ".").Run()
+	exec.Command("git", "-C", root, "commit", "-qm", "base").Run()
+	dir := filepath.Join(root, "wt")
+	exec.Command("git", "-C", root, "worktree", "add", "-q", "-b", "landed", dir).Run()
+	head, _ := exec.Command("git", "-C", dir, "rev-parse", "HEAD").Output()
+
+	run := func(repo string, args ...string) ([]byte, error) {
+		if len(args) > 0 && args[0] == "update-ref" {
+			for _, arg := range args[1:] {
+				if arg == "-d" {
+					return []byte("simulated protected branch"), fmt.Errorf("branch deletion refused")
+				}
+			}
+		}
+		return runReapGit(repo, args...)
+	}
+	err := retireLandedOne(root, reapRow{Path: dir, Branch: "landed", Head: strings.TrimSpace(string(head)), Class: "landed"}, run)
+	if err == nil || !strings.Contains(err.Error(), "worktree restored") {
+		t.Fatalf("branch failure must report compensated retirement, got %v", err)
+	}
+	if !worktreeExists(dir) {
+		t.Fatal("branch deletion failure must restore the exact worktree")
+	}
+	if err := exec.Command("git", "-C", root, "show-ref", "--verify", "--quiet", "refs/heads/landed").Run(); err != nil {
+		t.Fatal("compensation lost the branch")
+	}
+}
+
+func TestRetireLandedRefusesBranchThatAdvancedAfterClassification(t *testing.T) {
+	root := t.TempDir()
+	run := func(dir string, args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
+		cmd.Env = append(os.Environ(), "GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@t", "GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@t")
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+	run(root, "init", "-q", "-b", "main", ".")
+	os.WriteFile(filepath.Join(root, "a"), []byte("base"), 0o644)
+	run(root, "add", ".")
+	run(root, "commit", "-qm", "base")
+	dir := filepath.Join(root, "wt")
+	run(root, "worktree", "add", "-q", "-b", "landed", dir)
+	observed, _ := exec.Command("git", "-C", dir, "rev-parse", "HEAD").Output()
+	os.WriteFile(filepath.Join(dir, "later"), []byte("new work"), 0o644)
+	run(dir, "add", ".")
+	run(dir, "commit", "-qm", "branch advanced")
+
+	err := retireLandedOne(root, reapRow{Path: dir, Branch: "landed", Head: strings.TrimSpace(string(observed)), Class: "landed"}, runReapGit)
+	if err == nil || !strings.Contains(err.Error(), "branch identity changed") {
+		t.Fatalf("advanced branch must fail closed, got %v", err)
+	}
+	if !worktreeExists(dir) {
+		t.Fatal("identity mismatch must refuse before removing the worktree")
 	}
 }
 
@@ -205,7 +315,7 @@ func TestRetireLandedReportsAFailureRatherThanClaimingSuccess(t *testing.T) {
 	root := t.TempDir()
 	exec.Command("git", "-C", root, "init", "-q").Run()
 	retired, failed := retireLanded(root, []reapRow{
-		{Path: filepath.Join(root, "does-not-exist"), Branch: "nope", Class: "landed"},
+		{Path: filepath.Join(root, "does-not-exist"), Branch: "nope", Head: strings.Repeat("a", 40), Class: "landed"},
 	})
 	if len(retired) != 0 {
 		t.Fatalf("nothing was removed, so nothing may be reported retired: %v", retired)
