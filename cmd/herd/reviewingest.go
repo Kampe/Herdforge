@@ -1238,9 +1238,7 @@ func resolveHarvestCandidateWithReconstructionAt(repoRoot, branch, requested, re
 		if _, err := reconstructedCmd.Output(); err != nil {
 			return harvestCandidateReport{}, fmt.Errorf("reconstructed harvest %s is not a commit: %w", reconstructedSHA, err)
 		}
-		ancestorCmd := exec.Command("git", "merge-base", "--is-ancestor", reconstructedSHA, branch)
-		ancestorCmd.Dir = repoRoot
-		if err := ancestorCmd.Run(); err != nil {
+		if !commitIsAncestor(repoRoot, reconstructedSHA, branch) {
 			return harvestCandidateReport{}, fmt.Errorf("reconstructed harvest %s is not reachable from branch %s", reconstructedSHA, branch)
 		}
 	}
@@ -1633,7 +1631,5 @@ func reachableFromBranch(repoRoot, sha, branch string) bool {
 	if strings.TrimSpace(sha) == "" || strings.TrimSpace(branch) == "" {
 		return false
 	}
-	cmd := exec.Command("git", "merge-base", "--is-ancestor", sha, branch)
-	cmd.Dir = repoRoot
-	return cmd.Run() == nil
+	return commitIsAncestor(repoRoot, sha, branch)
 }
