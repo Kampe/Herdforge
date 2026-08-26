@@ -140,10 +140,16 @@ func runPoolReview(ref string) error {
 	// without starting a harness, so provider readiness is not its business.
 	reviewer := poolReviewer{}
 	if !*noLaunch {
+		// FAC-677: the route resolution fetches live quota across every provider
+		// and can take tens of seconds -- measured between 29s and 272s on this
+		// fleet, tracking provider API latency. It said nothing while it ran.
+		routeStart := time.Now()
+		fmt.Println("resolving reviewer route (live quota across providers; can take 30s+)")
 		resolved, err := resolvePoolReviewer(*provider, *model, *excludeFamily)
 		if err != nil {
 			return err
 		}
+		fmt.Printf("route resolved in %s: %s/%s\n", time.Since(routeStart).Round(time.Second), resolved.Provider, resolved.Model)
 		if err := preflightReviewerReadiness(resolved); err != nil {
 			return err
 		}
@@ -375,6 +381,11 @@ func runPoolReview(ref string) error {
 	// positional made the pane land somewhere the launch check reads as an auth
 	// screen. The pre-FAC-574 code passed flags only; carrying argv[0] over was
 	// my regression.
+	// FAC-677: agent start creates a pane and waits for the harness to become
+	// interactive, which measured ~20s here. Silent, it is the third stretch a
+	// bounded caller cannot tell apart from a hang.
+	startedAt := time.Now()
+	fmt.Printf("starting %s agent %s in pane %s\n", reviewer.Kind, agentName, tab.Pane.ID)
 	if err := herdr.StartReviewAgent(tab.ID, agentName, tab.Pane.ID, reviewer.Kind, reviewer.LaunchFlags()...); err != nil {
 		return fmt.Errorf("start %s reviewer (%s): %w", reviewer.Kind, reviewer.Model, err)
 	}
@@ -412,6 +423,7 @@ func runPoolReview(ref string) error {
 	}
 	cleanupTab = false
 	releaseOnFailure = false
+	fmt.Printf("agent started in %s\n", time.Since(startedAt).Round(time.Second))
 	fmt.Printf("reviewer launched ref=%s sha=%s lease=%s surface=%s tab=%s agent=%s packet=%s harness=%s provider=%s model=%s family=%s\n", ref, shortSHA(sha), lease.LeaseID, surface, tabLabel, agentName, packet, reviewer.Kind, reviewer.Provider, reviewer.Model, reviewer.Family)
 	return nil
 }
@@ -855,9 +867,25 @@ func preflightReviewerReadiness(r poolReviewer) error {
 	// pointed at a model that does not exist. This probe runs in this process,
 	// so it proves nothing about the pane's credentials and is never allowed to
 	// stand in for the brokerability gate above.
+	// FAC-677: say what this is doing before it does it.
+	//
+	// This probe sends a real request and may take up to 60 seconds, and it
+	// produced NO output while it ran. A silent minute is indistinguishable from
+	// a hang, so an operator bounding the command at a reasonable timeout kills
+	// it right at the boundary and reports a hang -- which is exactly what
+	// happened: "printed only 'provenance UNRECORDED' then hung indefinitely
+	// with no lease/agent/pane". Measured here: --no-launch returns in 1.4s and
+	// the same launch completes in 60-90s, all of it in this probe.
+	//
+	// The command was working. It just could not say so. Nothing is slower for
+	// announcing itself, and a bounded caller now knows whether to wait.
+	fmt.Printf("probing %s/%s can serve a request (up to 60s; this is the slow step)\n", r.Provider, r.Model)
+	probeStart := time.Now()
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
-	if res := herdr.ProbeProviderModel(ctx, r.Provider, r.Model, ""); !res.Available {
+	res := herdr.ProbeProviderModel(ctx, r.Provider, r.Model, "")
+	fmt.Printf("probe finished in %s available=%v\n", time.Since(probeStart).Round(time.Second), res.Available)
+	if !res.Available {
 		return fmt.Errorf(
 			"reviewer %s/%s failed a request in this process: %s\n"+
 				"  Worker credentials are brokerable, so this is a quota or model problem\n"+
