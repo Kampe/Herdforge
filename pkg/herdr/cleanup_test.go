@@ -357,3 +357,42 @@ func TestActiveProjectionRequiresExactSessionProcessAndPane(t *testing.T) {
 		t.Fatalf("valid active projection=%+v", d)
 	}
 }
+
+// FAC-660: an exact map lookup could not recognise a standing lane, because the
+// roster holds "forge-<lane>" while a live agent is "forge-<lane>-<digest>" or
+// "standing-<lane>". In the census that produced contradictory counts. Here it
+// is worse: an unrecognised standing agent falls through and becomes eligible to
+// be CLOSED. A roster that cannot recognise its own lanes hands them to the
+// reaper, and they then look like they stopped on their own.
+func TestStandingLanesAreNeverReapedWhateverTheyAreNamed(t *testing.T) {
+	standing := map[string]bool{"forge-herd-smith": true, "forge-platform-ops": true}
+	for _, name := range []string{
+		"forge-herd-smith-2918de97b5", // repository-qualified: the live form
+		"standing-herd-smith",         // standing-raiser form
+		"forge-platform-ops-abc123",
+		"forge-herd-smith", // exact form still works
+	} {
+		if !isStandingAgent(name, standing) {
+			t.Errorf("standing lane %q was not recognised and would be reaped", name)
+		}
+	}
+}
+
+// A non-standing agent must still be reapable, or spent reviewers accumulate and
+// hold pool leases forever.
+func TestNonStandingAgentsRemainReapable(t *testing.T) {
+	standing := map[string]bool{"forge-herd-smith": true}
+	for _, name := range []string{"review-cha-2796-abc123", "forge-other-lane", "shot-cha-1"} {
+		if isStandingAgent(name, standing) {
+			t.Errorf("%q is not a standing lane but was treated as one; spent agents would never be reaped", name)
+		}
+	}
+}
+
+// An empty roster must not make everything look standing, which would disable
+// reaping entirely.
+func TestEmptyRosterDoesNotProtectEverything(t *testing.T) {
+	if isStandingAgent("forge-anything-123", map[string]bool{}) {
+		t.Fatal("an empty roster must protect nothing, or reaping silently stops")
+	}
+}

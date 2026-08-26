@@ -396,9 +396,27 @@ func authorityFailure(name string, err error) (*Result, error) {
 	}, err
 }
 
+// findAttentionAgent resolves a roster entry to the LIVE agent serving it.
+//
+// FAC-660: this compared the roster name to the agent name for exact equality,
+// and the two never match for a running lane. The roster holds "forge-<lane>";
+// a live agent is "forge-<lane>-<repository digest>" or "standing-<lane>". So
+// every standing lane looked absent, attention scanned nothing, and it reported
+// state=UNKNOWN with a full fleet running -- while pulse, counting the same
+// agents a different way, reported nine busy.
+//
+// Exact equality is still tried first: it is the cheapest case and it is what a
+// non-standing target uses. Lane matching is the fallback, so a roster entry can
+// find its lane whichever spelling the fleet launched it under.
 func findAttentionAgent(agents []kick.AgentEntry, name string) (kick.AgentEntry, bool) {
 	for _, agent := range agents {
 		if agent.Name == name || agent.Label == name {
+			return agent, true
+		}
+	}
+	lanes := []string{name}
+	for _, agent := range agents {
+		if kick.LaneForAgent(agent.Name, lanes) != "" || kick.LaneForAgent(agent.Label, lanes) != "" {
 			return agent, true
 		}
 	}

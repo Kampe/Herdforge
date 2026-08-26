@@ -3,6 +3,7 @@ package herdr
 import (
 	"errors"
 	"fmt"
+	"github.com/Kampe/Herdforge/pkg/kick"
 	"sort"
 	"strings"
 	"sync"
@@ -267,7 +268,7 @@ func ProjectLiveFleetStatus(agents []AgentEntry, standing map[string]bool, works
 			class = TabUserShell
 		case NormalizeAssignmentStatus(agent.AssignmentStatus) == "queued":
 			class = TabQueued
-		case standing[agent.Name]:
+		case isStandingAgent(agent.Name, standing):
 			class = TabStanding
 		case NormalizeTaskStatus(agent.Status) == "in-progress":
 			class = TabActive
@@ -517,14 +518,44 @@ func AuthorizeClose(decision TabDecision, current TabObservation) (CloseRequest,
 // Observe-only: candidates are not a close authorization. Actual close still
 // requires FAC-180 TabCloseCAS with a durable generation fence (Cleanup and
 // TabClose fail closed without it).
+
+// isStandingAgent reports whether a live agent belongs to the standing roster.
+//
+// FAC-660: this was an exact map lookup on the agent's name, and the roster and
+// the fleet never spell a lane the same way. The roster holds "forge-<lane>";
+// a live agent is "forge-<lane>-<repository digest>" or "standing-<lane>". So a
+// running standing lane did not match its own roster entry.
+//
+// In the census that produced contradictory counts. HERE it is worse: an
+// unrecognised standing agent falls through to SelectCleanupCandidates and
+// becomes eligible to be CLOSED. A roster that cannot recognise its own lanes
+// hands them to the reaper, which is how standing lanes get killed and then look
+// like they "stopped on their own".
+//
+// Matching is by lane, with a hyphen boundary and longest-lane-wins, so a lane
+// named "review" cannot claim an agent belonging to "review-harvest".
+func isStandingAgent(name string, standing map[string]bool) bool {
+	if standing[name] {
+		return true // exact match still counts, and is the cheapest case
+	}
+	if len(standing) == 0 || strings.TrimSpace(name) == "" {
+		return false
+	}
+	lanes := make([]string, 0, len(standing))
+	for k := range standing {
+		lanes = append(lanes, k)
+	}
+	return kick.LaneForAgent(name, lanes) != ""
+}
+
 func SelectCleanupCandidates(agents []AgentEntry, standing map[string]bool) []CleanupCandidate {
 	var out []CleanupCandidate
 	for _, a := range agents {
 		if a.Name == "" {
 			continue // unnamed panes are the operator's, never ours to close
 		}
-		if standing[a.Name] {
-			continue // standing fleet is re-kicked by design
+		if isStandingAgent(a.Name, standing) {
+			continue // standing fleet is re-kicked by design, never reaped
 		}
 		if strings.Contains(strings.ToLower(a.Name), "orchestrator") {
 			continue
