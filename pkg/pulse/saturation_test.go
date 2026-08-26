@@ -48,6 +48,29 @@ func TestUnconfiguredCapIsNotAZeroBound(t *testing.T) {
 	}
 }
 
+func TestReviewSaturationDoesNotBlockReadyBuilder(t *testing.T) {
+	obs := Observation{
+		Provider: ProviderObservation{Known: true, Claimable: 1, NextTaskRef: "FAC-581", NextTaskID: "eow6"},
+		Review:   ReviewObservation{Known: true, Cap: 2},
+		Herdr: HerdrObservation{Known: true, Agents: []AgentObservation{
+			{Name: "r1", SafeRef: "a"},
+			{Name: "r2", SafeRef: "b"},
+		}},
+		Quota:    QuotaObservation{Known: true},
+		WindDown: WindDownObservation{Known: true},
+	}
+	if !reviewSaturated(obs, obs.Herdr.Agents) {
+		t.Fatal("fixture must be review-saturated")
+	}
+	snap, err := Plan(obs, Options{Act: true, Spawn: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snap.DispatchBlocked {
+		t.Fatalf("ready builder FAC-581 must not be blocked by a full review slot: %s", snap.DispatchBlockReason)
+	}
+}
+
 func contains(s, sub string) bool {
 	return len(s) >= len(sub) && (func() bool {
 		for i := 0; i+len(sub) <= len(s); i++ {

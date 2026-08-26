@@ -10,8 +10,20 @@ import (
 	"github.com/Kampe/Herdforge/pkg/config"
 	"github.com/Kampe/Herdforge/pkg/launch"
 	"github.com/Kampe/Herdforge/pkg/router"
+	"github.com/Kampe/Herdforge/pkg/workbroker"
 	"github.com/Kampe/Herdforge/pkg/worktree"
 )
+
+func TestWorkBrokerSelectorWithoutIdentityFailsClosed(t *testing.T) {
+	_, err := workbroker.ValidateBrokerRecord(workbroker.BrokerRecord{
+		Admission: workbroker.AdmissionAdmitBuilder,
+		Kind:      workbroker.BrokerKindBuilder,
+		Progress:  workbroker.ProgressUseful,
+	})
+	if err == nil {
+		t.Fatal("builder admission without a task identity must fail closed")
+	}
+}
 
 func TestOwnershipClaimerRepositoryIdentityFailureFailsBeforeOpen(t *testing.T) {
 	for _, tc := range []struct {

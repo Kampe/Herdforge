@@ -4,7 +4,7 @@
   "generated_by": "scripts/packageinventory/inventory.go",
   "class_counts": {
     "internal": 1,
-    "production": 98,
+    "production": 99,
     "secondary": 1,
     "unwired": 24
   },
@@ -438,7 +438,7 @@
     {
       "path": "github.com/Kampe/Herdforge/pkg/provider",
       "class": "production",
-      "test_importers": 11,
+      "test_importers": 12,
       "has_own_tests": true
     },
     {
@@ -733,6 +733,12 @@
       "path": "github.com/Kampe/Herdforge/pkg/winddown",
       "class": "production",
       "test_importers": 2,
+      "has_own_tests": true
+    },
+    {
+      "path": "github.com/Kampe/Herdforge/pkg/workbroker",
+      "class": "production",
+      "test_importers": 3,
       "has_own_tests": true
     },
     {

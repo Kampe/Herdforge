@@ -31,6 +31,7 @@ import (
 
 	"github.com/Kampe/Herdforge/pkg/kick"
 	"github.com/Kampe/Herdforge/pkg/lifecycle"
+	"github.com/Kampe/Herdforge/pkg/workbroker"
 )
 
 // AttentionLevel ranks how urgently a lane needs coordinator eyes.
@@ -94,6 +95,16 @@ func urgencyRank(l AttentionLevel) int {
 // LevelNone (working/starting) is the only level that does not.
 func NeedsEyes(l AttentionLevel) bool {
 	return l != LevelNone
+}
+
+// ClassifyBrokerProgress maps work-broker progress onto attention. Unchanged
+// probes, sleep, and acknowledgement-only handoffs are parked event-waits,
+// not operator-facing work.
+func ClassifyBrokerProgress(progress workbroker.ProgressClass) (AttentionLevel, string) {
+	if workbroker.UsefulProgress(progress) {
+		return LevelNone, "useful work"
+	}
+	return LevelLow, "event wait: " + string(progress) + " is not useful work"
 }
 
 // classifyStatus maps a raw agent status string to an attention level

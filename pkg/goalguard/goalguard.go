@@ -17,6 +17,7 @@ import (
 
 	"github.com/Kampe/Herdforge/pkg/lock"
 	"github.com/Kampe/Herdforge/pkg/posture"
+	"github.com/Kampe/Herdforge/pkg/workbroker"
 )
 
 const SchemaVersion = 1
@@ -97,6 +98,12 @@ type Evidence struct {
 	Held       bool      `json:"held"`
 	WindDown   bool      `json:"wind_down"`
 	Now        time.Time `json:"now"`
+	// Signal and artifact fields are optional. When present they feed the
+	// work-broker progress classifier so sleep, acknowledgement, and
+	// unchanged probes cannot spend a continuation.
+	Signal       string `json:"signal,omitempty"`
+	LastArtifact string `json:"last_artifact,omitempty"`
+	Artifact     string `json:"artifact,omitempty"`
 }
 
 type Decision struct {
@@ -246,6 +253,12 @@ func (s *Store) Evaluate(e Evidence) (Decision, error) {
 	}
 	if g.Stop.WindDown || e.WindDown {
 		return Decision{Reason: "wind_down", Continuations: g.Continuations}, nil
+	}
+	if strings.TrimSpace(e.Signal) != "" || (strings.TrimSpace(e.LastArtifact) != "" && strings.TrimSpace(e.Artifact) != "") {
+		progress := workbroker.ClassifyProgress(e.Signal, e.LastArtifact, e.Artifact)
+		if !workbroker.UsefulProgress(progress) {
+			return Decision{Reason: "event_wait", Continuations: g.Continuations}, nil
+		}
 	}
 	if g.MaxContinuations > 0 && g.Continuations >= g.MaxContinuations {
 		return Decision{Reason: "max_continuations", Continuations: g.Continuations}, nil

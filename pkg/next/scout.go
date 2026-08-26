@@ -5,6 +5,7 @@ import (
 	"sort"
 
 	"github.com/Kampe/Herdforge/pkg/provider"
+	"github.com/Kampe/Herdforge/pkg/workbroker"
 )
 
 // FAC-114: the scout-planner. It ranks the claimable to-do queue so the forge
@@ -16,10 +17,10 @@ import (
 
 // ScoutRow is one ranked claimable card.
 type ScoutRow struct {
-	Ref      string
-	Title    string
-	Priority provider.Priority
-	Blocked  bool     // true when held back by an open dependency
+	Ref       string
+	Title     string
+	Priority  provider.Priority
+	Blocked   bool     // true when held back by an open dependency
 	BlockedBy []string // open refs blocking this one (empty when claimable)
 }
 
@@ -70,4 +71,17 @@ func ScoutQueue(ctx context.Context, tp provider.TaskProvider, projectID string,
 	rank(claimable)
 	rank(blocked)
 	return claimable, blocked, nil
+}
+
+// ScoutBrokerSnapshot projects scout rows onto the work-broker seam so pulse
+// and next share one identity-or-wait decision.
+func ScoutBrokerSnapshot(claimable, blocked []ScoutRow, reviewInFlight, reviewCap int, signal string) workbroker.BrokerSnapshot {
+	cands := make([]workbroker.BrokerCandidate, 0, len(claimable)+len(blocked))
+	for _, row := range claimable {
+		cands = append(cands, workbroker.BrokerCandidate{Ref: row.Ref, Priority: workbroker.PriorityRank(row.Priority), Ready: true})
+	}
+	for _, row := range blocked {
+		cands = append(cands, workbroker.BrokerCandidate{Ref: row.Ref, Priority: workbroker.PriorityRank(row.Priority), Ready: false, BlockedBy: append([]string(nil), row.BlockedBy...)})
+	}
+	return workbroker.BrokerSnapshot{Candidates: cands, ReviewInFlight: reviewInFlight, ReviewCap: reviewCap, Signal: signal}
 }

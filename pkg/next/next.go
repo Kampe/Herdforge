@@ -129,13 +129,19 @@ func (p *NextPicker) evalAll(ctx context.Context) ([]*NextAction, error) {
 		})
 	}
 
-	// Priority 4-5: Review pipeline
+	preview, err := PreviewClaimQueue(ctx, p.TaskProvider, p.Config, p.Role)
+	if err != nil {
+		return nil, err
+	}
+
+	// Priority 4-5: Review pipeline. The in-review cap is advisory (FAC-623 /
+	// CHA-3174): it must not suppress an independent dependency-ready builder.
 	inReview, needReview, blockedReview, err := reviewPipelineCounts(ctx, p.TaskProvider, p.Config)
 	if err != nil {
 		return nil, err
 	}
 	reviewCap := 3
-	if inReview >= reviewCap {
+	if inReview >= reviewCap && preview.Claimable == 0 {
 		actions = append(actions, &NextAction{
 			Type:        ActionReview,
 			Priority:    4,
@@ -144,7 +150,7 @@ func (p *NextPicker) evalAll(ctx context.Context) ([]*NextAction, error) {
 			AutoSafe:    false,
 		})
 	}
-	if needReview > 0 {
+	if needReview > 0 && preview.Claimable == 0 {
 		actions = append(actions, &NextAction{
 			Type:        ActionNeed,
 			Priority:    5,
@@ -154,13 +160,6 @@ func (p *NextPicker) evalAll(ctx context.Context) ([]*NextAction, error) {
 		})
 	}
 
-	// Priority 6: Claim new task (default if nothing blocking). Preview the
-	// provenance gate before presenting a claim action so missing herd-deps-v1
-	// is repaired before a Forge cycle spends a lease and then fails.
-	preview, err := PreviewClaimQueue(ctx, p.TaskProvider, p.Config, p.Role)
-	if err != nil {
-		return nil, err
-	}
 	claimCommand := "herd pulse --spawn"
 	if preview.Claimable == 0 && preview.ProvenanceBlocked > 0 {
 		claimCommand = "herd deps migrate"
@@ -185,6 +184,8 @@ type ClaimPreview struct {
 	Claimable         int
 	ProvenanceBlocked int
 	BlockedRefs       []string
+	NextRef           string
+	NextID            string
 }
 
 func (p ClaimPreview) Description() string {
@@ -206,8 +207,15 @@ func (p ClaimPreview) Description() string {
 		}
 		return "0 claimable — no pending task matched (this is a filter result, not an idle queue)"
 	}
+	nextRef := strings.TrimSpace(p.NextRef)
 	if p.ProvenanceBlocked == 0 {
+		if nextRef != "" {
+			return fmt.Sprintf("Claim %s — %d claimable pending task(s)", nextRef, p.Claimable)
+		}
 		return fmt.Sprintf("No blocking actions — %d claimable pending task(s)", p.Claimable)
+	}
+	if nextRef != "" {
+		return fmt.Sprintf("Claim %s (%d claimable, %d blocked by missing/invalid herd-deps-v1: %s)", nextRef, p.Claimable, p.ProvenanceBlocked, strings.Join(p.BlockedRefs, ", "))
 	}
 	return fmt.Sprintf("Claim next pending task (%d claimable, %d blocked by missing/invalid herd-deps-v1: %s)", p.Claimable, p.ProvenanceBlocked, strings.Join(p.BlockedRefs, ", "))
 }
@@ -255,6 +263,10 @@ func PreviewClaimQueue(ctx context.Context, tp provider.TaskProvider, cfg *confi
 			continue
 		}
 		preview.Claimable++
+		if preview.NextRef == "" {
+			preview.NextRef = strings.TrimSpace(task.Ref)
+			preview.NextID = strings.TrimSpace(task.ID)
+		}
 	}
 	return preview, nil
 }

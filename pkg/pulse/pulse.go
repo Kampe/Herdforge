@@ -508,7 +508,10 @@ func Plan(obs Observation, opts Options) (Snapshot, error) {
 		blockReason = "coordinator broker unavailable"
 	case obs.Quota.Exhausted:
 		blockReason = "quota exhausted"
-	case reviewSaturated(obs, agents):
+	case reviewSaturated(obs, agents) && strings.TrimSpace(obs.Provider.NextTaskRef) == "":
+		// CHA-3174 / FAC-581: a full review slot is a review-adapter bound.
+		// It must not suppress an independent dependency-ready builder that
+		// already has an exact task identity.
 		blockReason = reviewSaturationReason(obs, agents)
 	case obs.Provider.Claimable <= 0:
 		blockReason = "no claimable work"

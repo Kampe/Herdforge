@@ -20,6 +20,7 @@ import (
 	"github.com/Kampe/Herdforge/pkg/dispatch"
 	"github.com/Kampe/Herdforge/pkg/mail"
 	"github.com/Kampe/Herdforge/pkg/provider"
+	"github.com/Kampe/Herdforge/pkg/workbroker"
 )
 
 // cannedTransport serves adapter-shaped responses in-process and records
@@ -512,4 +513,73 @@ func TestBrokerConformance_AllProviders(t *testing.T) {
 	if eff.Kind != mail.CallbackBlocked {
 		t.Fatalf("REJECTED must be the effective verdict, got %s", eff.Kind)
 	}
+}
+
+func TestWorkBrokerDecisionConformance(t *testing.T) {
+	t.Run("record fields", func(t *testing.T) {
+		rec, err := workbroker.DecideBroker(workbroker.BrokerSnapshot{
+			Signal: "work",
+			Candidates: []workbroker.BrokerCandidate{{
+				Ref: "FAC-581", ID: "eow6wtnnj7dm7q159dcuwsz6", Priority: 4, Ready: true,
+			}},
+			CurrentArtifact: "sha-builder",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if rec.TaskRef == "" || rec.TaskID == "" || rec.Admission == "" || rec.Progress == "" {
+			t.Fatalf("hermetic record missing required fields: %+v", rec)
+		}
+		if !rec.DependencyReady || rec.WaitReason != "" {
+			t.Fatalf("ready builder must not wait: %+v", rec)
+		}
+	})
+	t.Run("review saturation independent", func(t *testing.T) {
+		rec, err := workbroker.DecideBroker(workbroker.BrokerSnapshot{
+			Signal:         "work",
+			ReviewInFlight: 8,
+			ReviewCap:      3,
+			Candidates: []workbroker.BrokerCandidate{
+				{Ref: "FAC-581", ID: "builder", Priority: 4, Ready: true},
+			},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if rec.Admission != workbroker.AdmissionAdmitBuilder || rec.TaskRef != "FAC-581" {
+			t.Fatalf("full review slot suppressed builder: %+v", rec)
+		}
+	})
+	t.Run("dependency blocked", func(t *testing.T) {
+		rec, err := workbroker.DecideBroker(workbroker.BrokerSnapshot{
+			Signal: "work",
+			Candidates: []workbroker.BrokerCandidate{{
+				Ref: "FAC-75", ID: "t1", Priority: 4, Ready: false, BlockedBy: []string{"FAC-136"},
+			}},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if rec.WaitReason != "dependency_blocked" || rec.TaskRef != "FAC-75" {
+			t.Fatalf("blocked dependency: %+v", rec)
+		}
+	})
+	t.Run("event wait", func(t *testing.T) {
+		rec, err := workbroker.DecideBroker(workbroker.BrokerSnapshot{Signal: "sleep", LastArtifact: "a", CurrentArtifact: "a"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if rec.Admission != workbroker.AdmissionWait || rec.WaitReason != "sleep_is_not_progress" {
+			t.Fatalf("sleep scored as work: %+v", rec)
+		}
+	})
+	t.Run("missing identity", func(t *testing.T) {
+		_, err := workbroker.ValidateBrokerRecord(workbroker.BrokerRecord{
+			Admission: workbroker.AdmissionAdmitBuilder,
+			Progress:  workbroker.ProgressUseful,
+		})
+		if err == nil {
+			t.Fatal("selector output without a task identity must fail")
+		}
+	})
 }

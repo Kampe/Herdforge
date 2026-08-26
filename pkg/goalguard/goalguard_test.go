@@ -126,6 +126,21 @@ func TestContradictoryGoalCannotBePersisted(t *testing.T) {
 	}
 }
 
+func TestEvaluateDoesNotSpendContinuationOnUnchangedProbe(t *testing.T) {
+	s, _, e := testGoal(t)
+	e.Signal = "probe"
+	e.LastArtifact = "sha-a"
+	e.Artifact = "sha-a"
+	got, err := s.Evaluate(e)
+	if err != nil || got.Continue || got.Reason != "event_wait" || got.Continuations != 0 {
+		t.Fatalf("unchanged probe must event-wait without spending budget: %+v err=%v", got, err)
+	}
+	loaded, err := s.Load()
+	if err != nil || loaded.Continuations != 0 {
+		t.Fatalf("durable budget moved on a non-useful probe: %+v err=%v", loaded, err)
+	}
+}
+
 func TestUnboundedGoalContinuesUntilStopCondition(t *testing.T) {
 	s, err := Open(filepath.Join(t.TempDir(), "goal.json"))
 	if err != nil {

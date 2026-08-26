@@ -142,6 +142,27 @@ func TestEval_ReviewAtCap(t *testing.T) {
 	}
 }
 
+func TestEval_ReviewAtCapDoesNotSuppressReadyBuilder(t *testing.T) {
+	cfg := testConfig()
+	tp := newTestProvider([]testTask{
+		{ref: "FAC-1", status: "review", priority: "high"},
+		{ref: "FAC-2", status: "review", priority: "medium"},
+		{ref: "FAC-3", status: "review", priority: "medium"},
+		{ref: "FAC-581", status: "to-do", priority: "urgent", description: "```herd-deps-v1\n{\"version\":1,\"task_ref\":\"FAC-581\",\"task_id\":\"t581\",\"edges\":[]}\n```"},
+	})
+	p := NewNextPicker(cfg, tp)
+	act, err := p.Eval(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if act.Type != ActionClaim {
+		t.Fatalf("ready builder must beat a full review slot, got %s", act.Type)
+	}
+	if !strings.Contains(act.Description, "FAC-581") {
+		t.Fatalf("claim action must name the exact builder identity: %s", act.Description)
+	}
+}
+
 func TestEval_NeedReview(t *testing.T) {
 	cfg := testConfig()
 	tp := newTestProvider([]testTask{

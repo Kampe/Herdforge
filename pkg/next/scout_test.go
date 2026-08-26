@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/Kampe/Herdforge/pkg/provider"
+	"github.com/Kampe/Herdforge/pkg/workbroker"
 )
 
 func scoutTP(t *testing.T, tasks ...*provider.Task) provider.TaskProvider {
@@ -54,6 +55,23 @@ func TestScoutQueue_BlockedCardsHeldBack(t *testing.T) {
 	}
 	if len(blocked) != 1 || blocked[0].Ref != "FAC-63" || blocked[0].BlockedBy[0] != "FAC-87" {
 		t.Fatalf("FAC-63 must be blocked by FAC-87, got %v", blocked)
+	}
+}
+
+func TestScoutBrokerSnapshotWaitsOnOpenBlocker(t *testing.T) {
+	claimable, blocked, err := ScoutQueue(context.Background(), scoutTP(t,
+		&provider.Task{ID: "1", Ref: "FAC-63", Status: "to-do", Priority: provider.PriorityUrgent},
+		&provider.Task{ID: "2", Ref: "FAC-64", Status: "to-do", Priority: provider.PriorityLow},
+	), "p1", Blockers{"FAC-63": {"FAC-87"}}, map[string]bool{"FAC-87": true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec, err := workbroker.DecideBroker(ScoutBrokerSnapshot(claimable, blocked, 9, 3, "work"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.Admission != workbroker.AdmissionAdmitBuilder || rec.TaskRef != "FAC-64" {
+		t.Fatalf("independent ready builder must win a full review slot, got %+v", rec)
 	}
 }
 

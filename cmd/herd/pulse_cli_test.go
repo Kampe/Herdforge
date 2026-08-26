@@ -44,6 +44,9 @@ func TestSelectPulseDispatchTaskSortsByPriorityThenRef(t *testing.T) {
 	if got = selectPulseDispatchTask([]*provider.Task{{Status: provider.StatusInProgress, Ref: "FAC-1"}}); got != nil {
 		t.Fatalf("in-progress-only board selected %+v", got)
 	}
+	if got = selectPulseDispatchTask([]*provider.Task{{Status: provider.StatusToDo, ID: "no-ref"}}); got != nil {
+		t.Fatalf("identity-less selector output must not dispatch: %+v", got)
+	}
 }
 
 func TestLivePulseActorDispatchUsesSharedDecision(t *testing.T) {

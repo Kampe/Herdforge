@@ -8,6 +8,20 @@ import (
 	"github.com/Kampe/Herdforge/pkg/kick"
 )
 
+func TestClassifyBrokerProgressParksUnchangedProbes(t *testing.T) {
+	level, reason := ClassifyBrokerProgress("unchanged")
+	if level != LevelLow || !strings.Contains(reason, "not useful work") {
+		t.Fatalf("unchanged probe must be event-wait, got %s %q", level, reason)
+	}
+	if NeedsEyes(level) && level == LevelNone {
+		t.Fatal("inconsistent eyes")
+	}
+	work, _ := ClassifyBrokerProgress("useful")
+	if work != LevelNone {
+		t.Fatalf("useful work must not page the coordinator, got %s", work)
+	}
+}
+
 func TestNeedsEyes(t *testing.T) {
 	tests := []struct {
 		level AttentionLevel

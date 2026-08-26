@@ -30,6 +30,7 @@ import (
 	"github.com/Kampe/Herdforge/pkg/standing"
 	"github.com/Kampe/Herdforge/pkg/usage"
 	"github.com/Kampe/Herdforge/pkg/winddown"
+	"github.com/Kampe/Herdforge/pkg/workbroker"
 	"github.com/Kampe/Herdforge/pkg/worktree"
 )
 
@@ -263,35 +264,26 @@ func readPulseProvider(ctx context.Context) (pulse.ProviderObservation, map[stri
 	return obs, doneRefs
 }
 
-// selectPulseDispatchTask keeps pulse's one-dispatch bound deterministic and
-// aligned with the fleet task-selection contract: priority descending, then
-// ticket reference ascending. Nil and ref-less tasks cannot be dispatched.
+// selectPulseDispatchTask keeps pulse's one-dispatch bound on the work-broker
+// seam: exact task identity, priority then ref, independent of review slots.
 func selectPulseDispatchTask(tasks []*provider.Task) *provider.Task {
-	priority := func(p provider.Priority) int {
-		switch p {
-		case provider.PriorityUrgent:
-			return 4
-		case provider.PriorityHigh:
-			return 3
-		case provider.PriorityMedium:
-			return 2
-		case provider.PriorityLow:
-			return 1
-		default:
-			return 0
-		}
-	}
-	var best *provider.Task
+	claimable := make([]*provider.Task, 0, len(tasks))
+	byRef := make(map[string]*provider.Task, len(tasks))
 	for _, task := range tasks {
 		if task == nil || (task.Status != "" && task.Status != provider.StatusToDo) || strings.TrimSpace(task.Ref) == "" {
 			continue
 		}
-		if best == nil || priority(task.Priority) > priority(best.Priority) ||
-			(priority(task.Priority) == priority(best.Priority) && strings.TrimSpace(task.Ref) < strings.TrimSpace(best.Ref)) {
-			best = task
-		}
+		claimable = append(claimable, task)
+		byRef[strings.TrimSpace(task.Ref)] = task
 	}
-	return best
+	rec, err := workbroker.BuilderFromTasks(claimable, nil, 0, 0, "work")
+	if err != nil || rec.Admission != workbroker.AdmissionAdmitBuilder {
+		return nil
+	}
+	if task := byRef[strings.TrimSpace(rec.TaskRef)]; task != nil {
+		return task
+	}
+	return nil
 }
 
 // readPulseHerdr reads the live fleet and enriches each agent with reap
