@@ -192,7 +192,13 @@ func runReviewIngest() {
 			// sha+verdict, so no verdict can be tied back to a card and a
 			// corrupted board cannot be rebuilt from review history. Empty when
 			// the artifact declares no card — unattributed beats misattributed.
-			Task:         taskIdentity,
+			Task: taskIdentity,
+			// FAC-658: the last of Admit's four bindings. Digests ONLY the
+			// verification the reviewer states it ran, so a reviewer that records
+			// nothing gets no digest and stays inadmissible -- which is correct,
+			// not a bug. Synthesising one would certify verification that never
+			// happened.
+			VfyDigest:    a.VerificationDigest(),
 			CandidateSHA: a.SHA, RetryOf: a.RetryOf,
 		}
 		opts := reviewledger.IngestOpts{Record: recordOpts, Verdict: verdictOpts}
