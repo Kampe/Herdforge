@@ -168,3 +168,52 @@ func TestCompleteVerdictProvenanceIsIdempotent(t *testing.T) {
 		t.Fatalf("expected the original plus ONE completion, got %d; a repeated backfill must not grow the ledger", n)
 	}
 }
+
+// FAC-667: validation accepts the `unrecorded` family ONLY under the
+// provenance-unrecorded gate -- that pairing is what marks a row as unable to
+// support a cross-family independence claim (FAC-627). A completion that
+// inherited `unrecorded` while relabelling the gate was rejected, so on the
+// ORDINARY launch path -- where provenance is honestly unrecorded, which is most
+// launches -- the lease and patch bindings still could not be written at all.
+func TestCompletingAnUnrecordedRecordPreservesItsGate(t *testing.T) {
+	dir := t.TempDir()
+	l, err := NewReviewLedger(dir, DefaultPath(dir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sha := strings.Repeat("e", 40)
+	if err := l.EnsureRecord(RecordOpts{
+		SHA: sha, Reviewer: "r1", Task: "feat/x",
+		BuilderFamily: FamilyUnrecorded, Gate: GateProvenanceUnrecorded,
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	if err := l.CompleteLaunchProvenance(RecordOpts{
+		SHA: sha, Reviewer: "r1", Task: "feat/x",
+		Lease: "pool-05-1", PatchURL: "abc", Gate: "launch-provenance",
+	}); err != nil {
+		t.Fatalf("completing an unrecorded-provenance record must succeed: %v", err)
+	}
+
+	rows, _ := l.AllRows()
+	var last *LedgerRow
+	for i := range rows {
+		if rows[i].Event == string(EventRecord) && rows[i].SHA == sha {
+			last = &rows[i]
+		}
+	}
+	if last == nil {
+		t.Fatal("no record row")
+	}
+	if last.Lease != "pool-05-1" || last.PatchURL != "abc" {
+		t.Errorf("the bindings must be written: %+v", last)
+	}
+	// The safety marking must survive: completion adds bindings and changes
+	// nothing about what the row CLAIMS.
+	if last.Gate != GateProvenanceUnrecorded {
+		t.Errorf("gate = %q; an unrecorded-family row must keep its gate or it would imply provable provenance", last.Gate)
+	}
+	if last.BuilderFamily != FamilyUnrecorded {
+		t.Errorf("family = %q; completion must never upgrade unprovable provenance", last.BuilderFamily)
+	}
+}

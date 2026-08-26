@@ -969,9 +969,33 @@ func completeReviewLaunchProvenance(root, ref, sha, leaseID string) error {
 	if err != nil {
 		return err
 	}
+	reviewer := reviewAgentName(ref, sha)
+	// FAC-667: ensure the record row EXISTS before completing it.
+	//
+	// FAC-656 completed a launch record, and completion requires a prior row --
+	// but only the operator-asserted --builder-family path writes one. On the
+	// ordinary path, where provenance is honestly unrecorded, no record row was
+	// ever written, so the completion failed with "provenance cannot be
+	// completed for a launch that was never recorded" and the lease and patch id
+	// still went unrecorded. That is the MAJORITY of launches: the exact case
+	// the binding work existed to fix.
+	//
+	// I verified FAC-656 on the asserted path and generalised without exercising
+	// this one. The seed carries the honest `unrecorded` family, so it asserts
+	// nothing about who built the candidate; it only gives the lease and patch
+	// bindings a row to live on.
+	if err := l.EnsureRecord(reviewledger.RecordOpts{
+		SHA:           sha,
+		Reviewer:      reviewer,
+		Task:          ref,
+		BuilderFamily: reviewledger.FamilyUnrecorded,
+		Gate:          reviewledger.GateProvenanceUnrecorded,
+	}); err != nil {
+		return fmt.Errorf("seed launch record: %w", err)
+	}
 	return l.CompleteLaunchProvenance(reviewledger.RecordOpts{
 		SHA:      sha,
-		Reviewer: reviewAgentName(ref, sha),
+		Reviewer: reviewer,
 		Task:     ref,
 		Lease:    strings.TrimSpace(leaseID),
 		PatchURL: patch,
