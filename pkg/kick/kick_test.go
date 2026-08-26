@@ -717,3 +717,40 @@ func TestRun_StandingAssayerIsKickable(t *testing.T) {
 		}
 	}
 }
+
+// FAC-695: kick is the tool that wakes an idle lane, and exact-equality lookup
+// meant it could not find a single standing lane. `herd kick` reported every
+// one "missing (not live)" and finished kicked=0 while four were live and idle.
+// The one command for restarting a stalled fleet was inert.
+func TestLookupAgentMatchesDigestSuffixedStandingLane(t *testing.T) {
+	agents := []AgentEntry{{Name: "forge-scout-planner-2918de97b5", Status: "idle", PaneID: "wB:p454"}}
+	status, pane, found := LookupAgent(agents, "forge-scout-planner")
+	if !found {
+		t.Fatal("a live standing lane was reported missing; kick would refuse to wake it")
+	}
+	if status != "idle" || pane != "wB:p454" {
+		t.Fatalf("resolved the lane but lost its state: status=%q pane=%q", status, pane)
+	}
+}
+
+func TestLookupAgentPrefersAnExactMatch(t *testing.T) {
+	// Exact must win, or a digest-suffixed sibling could shadow the precise
+	// target a non-standing caller asked for.
+	agents := []AgentEntry{
+		{Name: "forge-review-2918de97b5", Status: "idle", PaneID: "wB:p1"},
+		{Name: "forge-review", Status: "working", PaneID: "wB:p2"},
+	}
+	status, pane, found := LookupAgent(agents, "forge-review")
+	if !found || status != "working" || pane != "wB:p2" {
+		t.Fatalf("exact match did not win: status=%q pane=%q found=%v", status, pane, found)
+	}
+}
+
+func TestLookupAgentDoesNotClaimAnUnrelatedLane(t *testing.T) {
+	// The fallback must not let any running agent satisfy any roster entry, or
+	// a missing lane silently looks healthy and never gets raised.
+	agents := []AgentEntry{{Name: "forge-scout-planner-2918de97b5", Status: "idle"}}
+	if _, _, found := LookupAgent(agents, "forge-recovery-sentinel"); found {
+		t.Fatal("an absent lane was satisfied by an unrelated agent")
+	}
+}

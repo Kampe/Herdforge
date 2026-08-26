@@ -180,8 +180,43 @@ func FetchAgentList() ([]AgentEntry, error) {
 	return result.Result.Agents, nil
 }
 
-// LookupAgent finds an agent by name in the list and returns its status and pane ID.
+// LookupAgent finds an agent by name and returns its status and pane ID.
+//
+// FAC-695: exact equality alone made this the THIRD place carrying the FAC-660
+// defect, after the census and herd attention -- and this one was the worst,
+// because kick is the tool that wakes an idle lane.
+//
+// A live standing lane is spelled forge-<lane>-<digest>; the roster spells it
+// forge-<lane>. So `herd kick` reported every standing lane
+// "missing (not live)" and finished with kicked=0 while four of them were live
+// and idle. The one command for restarting a stalled fleet could not act on a
+// single lane, and reported a fleet gap instead of the idleness it was run to
+// fix. Measured live: forge-scout-planner-2918de97b5 idle, reported missing.
+//
+// LaneForAgent already lived in this package. The matcher was here the whole
+// time; this function simply did not call it.
+//
+// Exact equality is still tried first: it is the cheap path and it is what a
+// non-standing target uses. Lane matching is the fallback only.
 func LookupAgent(agents []AgentEntry, name string) (status, paneID string, found bool) {
+	if st, pane, ok := lookupExact(agents, name); ok {
+		return st, pane, true
+	}
+	lanes := []string{name}
+	for _, a := range agents {
+		if LaneForAgent(a.Name, lanes) == "" && LaneForAgent(a.Label, lanes) == "" {
+			continue
+		}
+		st := a.Status
+		if st == "" {
+			st = "unknown"
+		}
+		return st, a.PaneID, true
+	}
+	return "", "", false
+}
+
+func lookupExact(agents []AgentEntry, name string) (status, paneID string, found bool) {
 	for _, a := range agents {
 		an := a.Name
 		if an == "" {
