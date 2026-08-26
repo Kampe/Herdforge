@@ -229,6 +229,11 @@ Commands:
   full rebuild; if parity still fails the run exits non-zero (BLOCKED) and the
   emitted plan broadens to the full profile instead of narrowing.`,
 	"harvest": "Usage: herd harvest [--quiet] [--json]\n  Fleet-wide worktree harvest sweep.",
+	"worktree-reap": "Usage: herd worktree-reap [--apply] [--json] [--base origin/main]\n" +
+		"  Retire worktrees whose work has LANDED: no unique commits against base, so\n" +
+		"  removal is provably lossless. Never touches unmerged, dirty, locked or\n" +
+		"  detached worktrees -- unmerged work is not garbage. Everything declined is\n" +
+		"  reported by exact identity rather than silently skipped.",
 	"lane-cut": "Usage: herd lane-cut --branch <lane-branch> --scope <path> [--scope <path>...] [--task <ref>] [--base origin/main] [--name <branch>] [--dry-run]\n" +
 		"  Extract ONE bounded candidate from a long-lived standing-lane branch onto a\n" +
 		"  fresh branch cut from origin/main. Takes the NET DIFF for the scoped paths\n" +
