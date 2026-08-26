@@ -174,3 +174,70 @@ func TestCheckGoToolchain_AllowsUnsetAndMatchingGOROOT(t *testing.T) {
 		})
 	}
 }
+
+// FAC-700: a file git is configured to IGNORE cannot reach the repository, so
+// it cannot leak a host path into it. The scout-planner worktree preserved 72
+// untracked guard/receipt artifacts whose contents legitimately record where a
+// snapshot lives, and preflight failed the whole worktree on them -- blocking
+// CHA-3176/CHA-3180 while the orchestrator checkout, holding no such artifacts,
+// passed.
+func TestIgnoredRuntimeArtifactDoesNotFailTheBoundaryCheck(t *testing.T) {
+	dir := t.TempDir()
+	gitInit(t, dir)
+	// A receipt doing its job: it records an absolute path on purpose.
+	mustWrite(t, filepath.Join(dir, "receipts"), "CHA-15.identity.json",
+		`{"ref":"CHA-15","prewrite_snapshot":"/Users/kampe/Personal/scout-planner/receipts/CHA-15.snapshot.json"}`)
+	mustWrite(t, dir, ".gitignore", "receipts/\n")
+
+	if err := CheckWorktreeBoundary(dir); err != nil {
+		t.Fatalf("an ignored runtime artifact failed the boundary check: %v", err)
+	}
+}
+
+func TestTrackedFileWithAbsolutePathStillFails(t *testing.T) {
+	// The gate must keep doing its job. A file that CAN be committed is
+	// exactly what the boundary check exists for.
+	dir := t.TempDir()
+	gitInit(t, dir)
+	mustWrite(t, dir, "config.json", `{"path":"/Users/kampe/Personal/thing"}`)
+
+	if err := CheckWorktreeBoundary(dir); err == nil {
+		t.Fatal("a committable file with an absolute path passed the boundary check")
+	}
+}
+
+func TestUnignoredUntrackedFileStillFails(t *testing.T) {
+	// Untracked but NOT ignored means it can still be added, so it stays in
+	// scope. Only an explicit ignore rule exempts a file.
+	dir := t.TempDir()
+	gitInit(t, dir)
+	mustWrite(t, dir, "stray.json", `{"path":"/Users/kampe/Personal/thing"}`)
+
+	if err := CheckWorktreeBoundary(dir); err == nil {
+		t.Fatal("an untracked, unignored file with an absolute path passed the boundary check")
+	}
+}
+
+func gitInit(t *testing.T, dir string) {
+	t.Helper()
+	for _, args := range [][]string{
+		{"init", "-q", "-b", "main"},
+		{"config", "user.email", "t@t"},
+		{"config", "user.name", "t"},
+	} {
+		c := exec.Command("git", append([]string{"-C", dir}, args...)...)
+		if out, err := c.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+}
+
+func mustWrite(t *testing.T, dir, name, body string) {
+	t.Helper()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
