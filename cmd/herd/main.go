@@ -7788,6 +7788,20 @@ func runReviewLedger() {
 			os.Exit(2)
 		}
 		shas := os.Args[3:]
+		// FAC-668: an explicit, auditable way to accept the one class that had
+		// no path forward -- a real PASS whose builder family was never
+		// recorded. The default stays fail-closed; this makes the operator's
+		// choice visible instead of being taken by bypassing the gate.
+		allowUnrecorded := false
+		filtered := shas[:0]
+		for _, a := range shas {
+			if a == "--allow-unrecorded-provenance" {
+				allowUnrecorded = true
+				continue
+			}
+			filtered = append(filtered, a)
+		}
+		shas = filtered
 		if len(shas) == 1 && shas[0] == "-" {
 			shas = nil
 			sc := bufio.NewScanner(os.Stdin)
@@ -7800,7 +7814,11 @@ func runReviewLedger() {
 		out := make([]reviewledger.MergeReadiness, 0, len(shas))
 		exit := 0
 		for _, sha := range shas {
-			r, rErr := l.MergeReadinessFor(sha)
+			readiness := l.MergeReadinessFor
+			if allowUnrecorded {
+				readiness = l.MergeReadinessAllowingUnrecordedProvenance
+			}
+			r, rErr := readiness(sha)
 			if rErr != nil {
 				// Fail closed: an unreadable ledger is not an absence of dissent.
 				fmt.Fprintf(os.Stderr, "review-ledger readiness %s: %v\n", sha, rErr)
