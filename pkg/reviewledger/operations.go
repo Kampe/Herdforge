@@ -23,6 +23,10 @@ type RecordOpts struct {
 	Tier            string
 	Task            string
 	Lease           string
+	// PatchURL is the candidate's independent patch identity. Admit binds it,
+	// and it is stable across a clean rebase, which is what lets a rebased
+	// candidate keep its verdict instead of being re-reviewed (FAC-656).
+	PatchURL string
 }
 
 // IngestOpts is the authenticated handoff from a reviewer verdict artifact.
@@ -98,6 +102,7 @@ func (l *Ledger) record(opts RecordOpts) error {
 		Tier:            opts.Tier,
 		Task:            opts.Task,
 		Lease:           opts.Lease,
+		PatchURL:        opts.PatchURL,
 	})
 }
 
@@ -159,6 +164,67 @@ func (l *Ledger) ensureRecord(opts RecordOpts) error {
 		if row.Event == string(EventRecord) && row.SHA == opts.SHA && row.Reviewer == opts.Reviewer {
 			return nil
 		}
+	}
+	return l.record(opts)
+}
+
+// CompleteLaunchProvenance appends a record row carrying the binding fields that
+// are not knowable when the FIRST record row is written.
+//
+// FAC-656: Ledger.Admit binds task, lease, patch id and verification digest, and
+// on a live ledger of 2210 rows the keys "lease", "patch_url" and
+// "verification_digest" appeared ZERO times. Harvest admission was therefore
+// structurally unsatisfiable: required by every consumer, written by no
+// producer, so a 1327-tip drain reported 318 harvestable and act_harvests=0.
+//
+// The structural cause is ORDERING, not intent. The review launch writes its
+// record row BEFORE it leases a pool slot, so at that moment no lease exists to
+// record. EnsureRecord then no-ops on a second call, so nothing could ever fill
+// it in afterwards.
+//
+// The ledger is append-only and admission already takes the LAST matching record
+// row, so completing provenance is an APPEND, not an amendment: the original row
+// stays exactly as written and a later, more complete row supersedes it. Nothing
+// is rewritten and no history is lost.
+//
+// Empty values are refused rather than appended. A row asserting an empty lease
+// would satisfy the shape of the binding while proving nothing, which is worse
+// than the current honest absence.
+func (l *Ledger) CompleteLaunchProvenance(opts RecordOpts) error {
+	if strings.TrimSpace(opts.SHA) == "" || strings.TrimSpace(opts.Reviewer) == "" {
+		return fmt.Errorf("completing launch provenance requires an exact sha and reviewer")
+	}
+	if strings.TrimSpace(opts.Lease) == "" && strings.TrimSpace(opts.PatchURL) == "" {
+		return fmt.Errorf("completing launch provenance requires a lease or a patch id; appending an empty binding would satisfy the shape of the admission gate while proving nothing")
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	// Provenance is INHERITED from the row being completed, never re-asserted by
+	// the caller. Letting a completion supply its own builder family would make
+	// this a laundering path: append a row claiming a different family and the
+	// last-row-wins rule would silently adopt it. Completion may add the lease
+	// and patch bindings; it may not change who built the candidate.
+	rows, err := readRows(l.Path)
+	if err != nil {
+		return err
+	}
+	var prior *LedgerRow
+	for i := range rows {
+		if rows[i].Event == string(EventRecord) && rows[i].SHA == opts.SHA && rows[i].Reviewer == opts.Reviewer {
+			prior = &rows[i]
+		}
+	}
+	if prior == nil {
+		return fmt.Errorf("no launch record for sha %s reviewer %q to complete; provenance cannot be completed for a launch that was never recorded", opts.SHA, opts.Reviewer)
+	}
+	opts.BuilderFamily = prior.BuilderFamily
+	opts.BuilderIdentity = prior.BuilderIdentity
+	opts.ReviewerFamily = prior.ReviewerFamily
+	if strings.TrimSpace(opts.Task) == "" {
+		opts.Task = prior.Task
+	}
+	if strings.TrimSpace(opts.Branch) == "" {
+		opts.Branch = prior.Branch
 	}
 	return l.record(opts)
 }
