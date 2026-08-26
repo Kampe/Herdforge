@@ -304,6 +304,47 @@ func TestRenderKickEnvelopeContainsGrant(t *testing.T) {
 	}
 }
 
+func TestReportLaneMinCadenceFloorsPerfCostGuardToOneHour(t *testing.T) {
+	if ReportLaneMinCadence("forge-perf-cost-guard") != time.Hour {
+		t.Fatal("perf-cost-guard must have a one-hour kick floor")
+	}
+	if ReportLaneMinCadence("perf-cost-guard") != time.Hour {
+		t.Fatal("unprefixed perf-cost-guard must have the same floor")
+	}
+	if ReportLaneMinCadence("forge-worker") != 0 {
+		t.Fatal("other standing lanes must not inherit the report-lane floor")
+	}
+}
+
+func TestRun_PerfCostGuardCadenceFloorSuppressesTwoMinuteRepeat(t *testing.T) {
+	now := time.Date(2026, time.August, 25, 12, 0, 0, 0, time.UTC)
+	last := map[string]time.Time{}
+	opts := Options{
+		Names: []string{"forge-perf-cost-guard"}, DryRun: true, Quiet: true, RaiseMissing: false,
+		Cadence: 0, LastKick: last, Now: func() time.Time { return now },
+		Freeze:     func() (bool, string, error) { return false, "", nil },
+		HoldReader: allowAllHolds{}, Identity: testIdentity, ActiveTasks: testActiveTasks,
+		Generation: testGeneration, FetchAgents: emptyAgentList,
+	}
+	first, err := Run(opts)
+	if err != nil || first.Kicked != 1 {
+		t.Fatalf("first kick=%+v err=%v", first, err)
+	}
+	now = now.Add(2 * time.Minute)
+	second, err := Run(opts)
+	if err != nil || second.Kicked != 0 || second.Skipped != 1 {
+		t.Fatalf("unchanged 2-minute repeat must wait, kick=%+v err=%v", second, err)
+	}
+	if !strings.Contains(second.Entries[0].Reason, "cadence:") {
+		t.Fatalf("reason=%q", second.Entries[0].Reason)
+	}
+	now = now.Add(time.Hour)
+	third, err := Run(opts)
+	if err != nil || third.Kicked != 1 {
+		t.Fatalf("hour-later kick is a real cadence tick, kick=%+v err=%v", third, err)
+	}
+}
+
 func TestRun_CadenceSuppressesSecondKick(t *testing.T) {
 	now := time.Date(2026, time.August, 18, 12, 0, 0, 0, time.UTC)
 	last := map[string]time.Time{}

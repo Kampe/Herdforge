@@ -556,10 +556,27 @@ func renderKickEnvelope(a goalguard.AuthorityEnvelope) string {
 }
 
 func cadenceFor(opts Options, id string) time.Duration {
-	if d, ok := opts.LaneCadence[id]; ok {
-		return d
+	d := opts.Cadence
+	if lane, ok := opts.LaneCadence[id]; ok {
+		d = lane
 	}
-	return opts.Cadence
+	if min := ReportLaneMinCadence(id); min > 0 && d < min {
+		return min
+	}
+	return d
+}
+
+// ReportLaneMinCadence is the CHA-2738 hour floor for bounded report lanes.
+// Kick cadence of 0 (the CLI default) otherwise re-prompts perf-cost-guard
+// the moment it goes idle, which with the packet idle rule is another
+// identical snapshot within 1-2 minutes. A longer explicit --cadence still
+// wins. Other standing lanes are unchanged.
+func ReportLaneMinCadence(id string) time.Duration {
+	name := strings.TrimPrefix(strings.TrimSpace(id), ForgePrefix)
+	if name == "perf-cost-guard" {
+		return time.Hour
+	}
+	return 0
 }
 
 // CadenceStatePath is the default durable location for LastKick timestamps.

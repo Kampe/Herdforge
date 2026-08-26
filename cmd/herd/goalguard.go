@@ -152,6 +152,20 @@ func runGoalGuardStopHook(s *goalguard.Store, payload []byte) error {
 		return writeGoalJSON(os.Stdout, decision)
 	}
 
+	// CHA-2738: FAC-652 changed the plateau *prose* but still emitted
+	// decision=block, so every stop started another model turn. Combined with
+	// perf-cost-guard's packet idle rule, that was one identical snapshot every
+	// 1-2 minutes. After the plateau threshold, allow the stop. Kick cadence
+	// (hours, not minutes) is what re-engages a report lane; a real kick or
+	// new assignment is a new user turn, not a Stop-hook continuation.
+	if !goalGuardBlocksStop(decision.Continuations) {
+		return writeGoalJSON(os.Stdout, goalguard.Decision{
+			Continue:      false,
+			Reason:        "event_wait",
+			Continuations: decision.Continuations,
+		})
+	}
+
 	// A goal recorded before authority envelopes existed (FAC-525) is still an
 	// operator-granted goal — it predates the field, it is not unauthorized.
 	// Treat it as legacy-granted and keep the lane working, warning so the
@@ -179,6 +193,13 @@ func runGoalGuardStopHook(s *goalguard.Store, payload []byte) error {
 // deliberate: one continuation is normal, two can be a slow beat, and by the
 // third an unchanged lane is looping rather than progressing.
 const goalGuardPlateauAfter = 3
+
+// goalGuardBlocksStop is the CHA-2738 cadence gate: early continuations still
+// force work; a plateaued lane is allowed to go idle instead of being
+// re-prompted every minute.
+func goalGuardBlocksStop(continuations int) bool {
+	return continuations < goalGuardPlateauAfter
+}
 
 // goalGuardContinueReason is the instruction a blocked lane actually reads.
 //

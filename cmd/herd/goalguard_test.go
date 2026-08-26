@@ -32,10 +32,16 @@ func TestGoalGuardPlateauInstructsEventWaitNotRepolling(t *testing.T) {
 			t.Errorf("plateau reason must contain %q: %q", want, got)
 		}
 	}
-	// It must still BLOCK the stop -- the goal is unmet, the lane holds its
-	// lease, and a plateau is not permission to exit.
-	if !strings.Contains(got, "is not met") {
-		t.Errorf("a plateau must still be an unmet goal: %q", got)
+}
+
+// CHA-2738: a plateaued Stop hook must allow the stop. Blocking it was the
+// 1-2 minute identical-snapshot loop: each blocked stop became another pass.
+func TestGoalGuardPlateauDoesNotBlockStop(t *testing.T) {
+	if !goalGuardBlocksStop(0) || !goalGuardBlocksStop(goalGuardPlateauAfter-1) {
+		t.Fatal("early continuations must still block so a real delta keeps working")
+	}
+	if goalGuardBlocksStop(goalGuardPlateauAfter) || goalGuardBlocksStop(goalGuardPlateauAfter+9) {
+		t.Fatal("plateaued continuations must allow stop rather than emit another pass")
 	}
 }
 

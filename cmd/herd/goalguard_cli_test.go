@@ -201,3 +201,67 @@ func TestGoalGuardStopHookWarnsButContinuesOnLegacyGrant(t *testing.T) {
 		t.Fatalf("stop-hook output must be distinguishable from assignments, stdout=%q", stdout)
 	}
 }
+
+func captureStopHook(t *testing.T, s *goalguard.Store) string {
+	t.Helper()
+	oldStdout := os.Stdout
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stdout = w
+	if err := runGoalGuardStopHook(s, []byte(`{}`)); err != nil {
+		_ = w.Close()
+		os.Stdout = oldStdout
+		t.Fatal(err)
+	}
+	_ = w.Close()
+	os.Stdout = oldStdout
+	out, err := io.ReadAll(r)
+	_ = r.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(out)
+}
+
+// CHA-2738: unchanged Stop-hook continuations past the plateau must not emit
+// another block (that was a new model turn / identical snapshot every 1-2 min).
+// Early continuations still block so a real delta keeps working.
+func TestGoalGuardStopHookAllowsStopAfterPlateau(t *testing.T) {
+	dir := t.TempDir()
+	state := filepath.Join(dir, "goal.json")
+	dbPath := filepath.Join(dir, ".herd", "launch-claims.db")
+	t.Setenv("HERD_LEASE_DB", dbPath)
+	store, err := claim.NewSQLiteLeaseStore(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	lease, err := store.AcquireWithIdentity(context.Background(), claim.LeaseKey{Repo: "repo", Provider: "kaneo", Project: "project", TaskRef: "CHA-2738"}, "owner", "worker", "", "repo", "perf-cost-guard", "perf-cost-guard", time.Now().UTC(), time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, err := goalguard.Open(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	if err := s.Set(goalguard.Goal{Lane: "perf-cost-guard", Task: "CHA-2738", Owner: "coordinator", Generation: lease.Generation, MaxContinuations: 0, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+
+	for i := 1; i < goalGuardPlateauAfter; i++ {
+		out := captureStopHook(t, s)
+		if !strings.Contains(out, `"decision":"block"`) && !strings.Contains(out, `"decision": "block"`) {
+			t.Fatalf("continuation %d must still block so a real delta triggers work, out=%q", i, out)
+		}
+	}
+	out := captureStopHook(t, s)
+	if strings.Contains(out, `"decision":"block"`) || strings.Contains(out, `"decision": "block"`) {
+		t.Fatalf("plateaued stop must allow idle rather than start another pass, out=%q", out)
+	}
+	if !strings.Contains(out, `"event_wait"`) && !strings.Contains(out, `"reason": "event_wait"`) {
+		t.Fatalf("plateaued stop must name event_wait, out=%q", out)
+	}
+}
