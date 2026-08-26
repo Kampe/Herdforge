@@ -72,6 +72,7 @@ func checkWorktreeBoundaryFiles(rootDir string, paths []string, allowlist []stri
 			}
 		}
 	} else {
+		ignored := gitIgnoredPaths(rootDir)
 		err = fs.WalkDir(root.FS(), ".", func(path string, d fs.DirEntry, walkErr error) error {
 			if walkErr != nil {
 				return walkErr
@@ -100,6 +101,29 @@ func checkWorktreeBoundaryFiles(rootDir string, paths []string, allowlist []stri
 			}
 
 			if d.Name() == ".mcp.json" {
+				return nil
+			}
+
+			// FAC-700: a file git is configured to IGNORE cannot reach the
+			// repository, so it cannot leak a host path into it. Scanning it
+			// answers a question the boundary check is not asking.
+			//
+			// Reported live: the scout-planner worktree preserves 72 untracked
+			// guard/receipt artifacts (.scout-planner-batchN-guard/*.json) whose
+			// contents legitimately record where a snapshot lives:
+			//
+			//	{"ref":"CHA-15","prewrite_snapshot":
+			//	 "/Users/kampe/Personal/scout-planner/.../CHA-15.prewrite.snapshot.json"}
+			//
+			// That is a receipt doing its job. Preflight failed the whole
+			// worktree on it, blocking CHA-3176/CHA-3180 while the orchestrator
+			// checkout -- which holds no such artifacts -- passed. The evidence
+			// was correct and the gate was asking the wrong question of it.
+			//
+			// This mirrors the .herd/bootstrap skip directly above: a runtime
+			// subtree may carry host paths by design, and the TRACKED
+			// repository boundary stays covered.
+			if ignored[path] {
 				return nil
 			}
 
@@ -325,4 +349,28 @@ func runCmd(dir, name string, args ...string) (string, error) {
 		return "", fmt.Errorf("command %s %v: %w\n%s", name, args, err, string(out))
 	}
 	return strings.TrimSpace(string(out)), nil
+}
+
+// gitIgnoredPaths lists files git is configured to ignore, relative to rootDir.
+//
+// Returns an EMPTY set when git cannot answer -- no repository, no git binary,
+// a command failure. An unknown ignore status must not silently exempt a file
+// from the boundary check, so the fallback is to scan everything, which is
+// exactly the behaviour before this existed.
+func gitIgnoredPaths(rootDir string) map[string]bool {
+	ignored := map[string]bool{}
+	if strings.TrimSpace(rootDir) == "" {
+		return ignored
+	}
+	cmd := exec.Command("git", "-C", rootDir, "ls-files", "--others", "--ignored", "--exclude-standard")
+	out, err := cmd.Output()
+	if err != nil {
+		return ignored
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		if p := strings.TrimSpace(line); p != "" {
+			ignored[p] = true
+		}
+	}
+	return ignored
 }
