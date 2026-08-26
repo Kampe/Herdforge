@@ -388,6 +388,12 @@ func main() {
 	case "harvest":
 		runHarvest()
 
+	case "lane-cut":
+		if err := runLaneCut(os.Args[2:]); err != nil {
+			fmt.Fprintf(os.Stderr, "herd lane-cut: %v\n", err)
+			os.Exit(1)
+		}
+
 	case "unmerged":
 		runUnmerged()
 

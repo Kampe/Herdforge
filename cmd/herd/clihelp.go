@@ -228,7 +228,14 @@ Commands:
   covers the tracked-source manifest. Incomplete parity triggers one bounded
   full rebuild; if parity still fails the run exits non-zero (BLOCKED) and the
   emitted plan broadens to the full profile instead of narrowing.`,
-	"harvest":    "Usage: herd harvest [--quiet] [--json]\n  Fleet-wide worktree harvest sweep.",
+	"harvest": "Usage: herd harvest [--quiet] [--json]\n  Fleet-wide worktree harvest sweep.",
+	"lane-cut": "Usage: herd lane-cut --branch <lane-branch> --scope <path> [--scope <path>...] [--task <ref>] [--base origin/main] [--name <branch>] [--dry-run]\n" +
+		"  Extract ONE bounded candidate from a long-lived standing-lane branch onto a\n" +
+		"  fresh branch cut from origin/main. Takes the NET DIFF for the scoped paths\n" +
+		"  rather than replaying history, so a branch hundreds of commits behind main\n" +
+		"  still yields a mergeable candidate. The lane branch is never modified: this\n" +
+		"  is an extraction, so a failed cut leaves nothing behind. --scope is required;\n" +
+		"  an unscoped cut would rebuild the same unreviewable branch under a new name.",
 	"unmerged":   "Usage: herd unmerged [--all|<worktree>]\n  List unmerged commits in worktrees.",
 	"lost":       "Usage: herd lost [flags]\n  Find lost / orphaned work.",
 	"throughput": "Usage: herd throughput [flags]\n  Throughput metrics.",
