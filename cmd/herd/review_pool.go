@@ -156,6 +156,31 @@ func runPoolReview(ref string) error {
 		reviewer = resolved
 	}
 
+	// FAC-682: refuse to launch INTO a shared checkout that is already dirty.
+	//
+	// A reviewer proving a test non-vacuous swaps a file for its parent-commit
+	// blob and restores it afterwards. Done in the wrong directory that rewrites
+	// canonical shared main, which is what happened on 2026-08-26: the shared
+	// index and working tree had one path replaced with the candidate's parent
+	// blob, HEAD unchanged, no MERGE_HEAD.
+	//
+	// Checking here does two things. It stops a new reviewer inheriting a
+	// corrupted shared tree, and it surfaces the damage at the next launch rather
+	// than whenever someone happens to look -- which is how this went unnoticed
+	// long enough to need a hand repair.
+	if dirty := sharedCheckoutDirtyPaths(root); len(dirty) > 0 {
+		fmt.Fprintf(os.Stderr,
+			"review --pool: REFUSING to launch: the canonical shared checkout at %s has uncommitted changes:\n  %s\n"+
+				"  A review surface is isolated; the shared checkout should never be modified by one.\n"+
+				"  This is the signature of a non-vacuity swap run in the wrong directory: a file replaced\n"+
+				"  with its parent-commit blob and never restored.\n"+
+				"  Inspect and restore before launching (`git -C %s status`, then `git -C %s checkout -- <path>`\n"+
+				"  once you have confirmed the content is not someone's real work), or set\n"+
+				"  HERD_ALLOW_DIRTY_SHARED_CHECKOUT=1 if these changes are intentional.\n",
+			root, strings.Join(dirty, "\n  "), root, root)
+		return fmt.Errorf("canonical shared checkout is dirty; refusing to launch a reviewer into an unclean repository")
+	}
+
 	// FAC-653: refuse a DUPLICATE launch before touching the pool.
 	//
 	// The agent name is derived deterministically from ref+sha, so relaunching
@@ -1039,6 +1064,33 @@ func builderFamilyOrUnrecorded(family string) string {
 	return family
 }
 
+// sharedCheckoutDirtyPaths reports uncommitted paths in the canonical checkout.
+//
+// Returns nothing when the operator has declared the state intentional, because
+// a gate that cannot be satisfied gets bypassed wholesale rather than
+// understood. Returns nothing on an unreadable status too: an unanswerable
+// question must not block a launch.
+func sharedCheckoutDirtyPaths(root string) []string {
+	if strings.TrimSpace(os.Getenv("HERD_ALLOW_DIRTY_SHARED_CHECKOUT")) == "1" {
+		return nil
+	}
+	out, err := exec.Command("git", "-C", root, "status", "--porcelain").Output()
+	if err != nil {
+		return nil
+	}
+	var dirty []string
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		if line = strings.TrimSpace(line); line != "" {
+			dirty = append(dirty, line)
+		}
+		if len(dirty) >= 10 {
+			dirty = append(dirty, "... (truncated)")
+			break
+		}
+	}
+	return dirty
+}
+
 // completeReviewLaunchProvenance records the lease and an independent patch
 // identity for the exact candidate, so Ledger.Admit has the bindings it requires.
 //
@@ -1315,6 +1367,26 @@ func liveAgentByPrefix(prefixes ...string) string {
 
 func reviewPacketBody(ref, sha, surface, verdictPath, supervisor, builderFamily, workspace string) string {
 	return fmt.Sprintf(`REVIEW %s — verdict only, edit nothing.
+
+ISOLATION — READ THIS BEFORE RUNNING ANY GIT COMMAND
+Your cwd is an isolated review surface. Every command you run must stay inside it.
+NEVER run git, or any command that writes, against the canonical shared checkout.
+
+This is not hypothetical. Proving a test non-vacuous by swapping a file for its
+parent-commit blob is GOOD practice and 132 verdicts in this corpus do it. Done in
+the wrong directory it silently rewrites shared main: on 2026-08-26 the canonical
+checkout's index and working tree had apps/api/src/routes.ts replaced with the
+parent blob of the candidate under review, with HEAD unchanged and no MERGE_HEAD,
+and a coordinator had to restore it by hand.
+
+If you swap a file to prove non-vacuity:
+  1. confirm where you are first: git rev-parse --show-toplevel
+     it MUST be your surface. If it names the shared checkout, STOP.
+  2. do the swap, run the test, then restore: git checkout -- <path>
+  3. confirm clean before writing your verdict: git status --porcelain
+Never pass -C, --git-dir or --work-tree pointing outside your surface, and never
+cd out of it to run a build or test. If something seems to require the shared
+checkout, that is a finding to report, not a step to take.
 
 Candidate: %s
 Surface: %s

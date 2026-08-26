@@ -323,3 +323,60 @@ func TestNoSurfaceIsPreparedForAnUnresolvableSHA(t *testing.T) {
 		t.Fatal("a sha too short to verify must never create a surface")
 	}
 }
+
+// FAC-682: a reviewer proving a test non-vacuous swaps a file for its
+// parent-commit blob and restores it afterwards. 132 verdicts in the live corpus
+// do exactly that, and it is good practice. Done in the WRONG directory it
+// rewrites canonical shared main -- which happened on 2026-08-26: the shared
+// index and working tree had one path replaced with the candidate's parent blob,
+// HEAD unchanged, no MERGE_HEAD, and a coordinator restored it by hand.
+func TestDirtySharedCheckoutIsDetected(t *testing.T) {
+	root := t.TempDir()
+	run := func(a ...string) {
+		t.Helper()
+		c := exec.Command("git", append([]string{"-C", root}, a...)...)
+		c.Env = append(os.Environ(), "GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@t", "GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@t")
+		if out, err := c.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", a, err, out)
+		}
+	}
+	run("init", "-q", "-b", "main", ".")
+	os.WriteFile(filepath.Join(root, "routes.ts"), []byte("current\n"), 0o644)
+	run("add", ".")
+	run("commit", "-qm", "base")
+
+	t.Setenv("HERD_ALLOW_DIRTY_SHARED_CHECKOUT", "")
+	if got := sharedCheckoutDirtyPaths(root); len(got) != 0 {
+		t.Fatalf("a clean checkout must report nothing, got %v", got)
+	}
+
+	// The exact reported shape: one path replaced, nothing else touched.
+	os.WriteFile(filepath.Join(root, "routes.ts"), []byte("parent blob\n"), 0o644)
+	got := sharedCheckoutDirtyPaths(root)
+	if len(got) == 0 {
+		t.Fatal("a modified shared checkout must be detected; this is what went unnoticed until a hand repair")
+	}
+	if !strings.Contains(strings.Join(got, "\n"), "routes.ts") {
+		t.Errorf("the dirty path must be named so it is actionable: %v", got)
+	}
+}
+
+// An operator who declares the state intentional must be able to proceed. A gate
+// that cannot be satisfied gets bypassed wholesale rather than understood.
+func TestIntentionalDirtyStateCanBeDeclared(t *testing.T) {
+	root := t.TempDir()
+	exec.Command("git", "-C", root, "init", "-q").Run()
+	os.WriteFile(filepath.Join(root, "x.txt"), []byte("y"), 0o644)
+	t.Setenv("HERD_ALLOW_DIRTY_SHARED_CHECKOUT", "1")
+	if got := sharedCheckoutDirtyPaths(root); len(got) != 0 {
+		t.Fatalf("a declared-intentional state must not block, got %v", got)
+	}
+}
+
+// An unreadable status is an unanswerable question and must not block a launch.
+func TestUnreadableStatusDoesNotBlockLaunch(t *testing.T) {
+	t.Setenv("HERD_ALLOW_DIRTY_SHARED_CHECKOUT", "")
+	if got := sharedCheckoutDirtyPaths(filepath.Join(t.TempDir(), "not-a-repo")); len(got) != 0 {
+		t.Fatalf("an unreadable status must not manufacture a blocker, got %v", got)
+	}
+}
