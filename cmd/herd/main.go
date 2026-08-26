@@ -2673,7 +2673,23 @@ func runReview() {
 
 	btp, _, berr := boundBoardProvider(cfg, tp, reviewRoot, task.Ref)
 	if berr != nil {
+		// FAC-680: the refusal is correct -- a receipt has a 24h TTL precisely so
+		// an abandoned worktree cannot hold immortal mutation authority -- but it
+		// named no remedy, so a lane hitting it could only report being stuck.
+		//
+		// Observed live: "receipt FAC-548 expired at 2026-08-22" refused a board
+		// transition four days later. Nothing was wrong except that the authority
+		// had aged out, and the way to get a fresh one is to re-dispatch the card.
+		// A refusal that does not say that is the same dead end the unrecorded
+		// provenance gate was before FAC-668.
 		fmt.Fprintf(os.Stderr, "review status transition unbound (FAC-145): %v\n", berr)
+		fmt.Fprintf(os.Stderr,
+			"  A receipt authorizes board mutations for %s and is minted at DISPATCH.\n"+
+				"  An expired one is not a fault: it is the TTL doing its job, so an\n"+
+				"  abandoned worktree cannot keep mutating the board forever.\n"+
+				"  To proceed: re-dispatch this card (`herd dispatch %s`), which mints a\n"+
+				"  fresh receipt. Do NOT extend or reuse the expired one.\n",
+			dispatch.DefaultReceiptTTL, task.Ref)
 		os.Exit(1)
 	}
 
