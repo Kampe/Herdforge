@@ -164,10 +164,25 @@ func runReviewIngest() {
 			gate = reviewledger.GateProvenanceUnrecorded
 			a.BuilderFamily = family
 		}
+		// FAC-657: the record and verdict rows must name the SAME task, because
+		// Ledger.Admit compares them for equality.
+		//
+		// They were written from different sources: record.Task from the BRANCH
+		// and verdict.Task from the CARD REF. Measured on the live ledger, 0 of
+		// 1027 SHAs had them equal, and 726 verdict rows had none at all. The
+		// comparison could therefore never succeed, which is one of the four
+		// reasons harvest admission had never admitted a candidate.
+		//
+		// The card ref is the real task identity and is what FAC-578 put on the
+		// verdict row so a verdict can be tied back to a card. The branch is a
+		// location, not a task. So both rows now take the card ref, and BOTH fall
+		// back to the branch together when the artifact declares no card --
+		// falling back on only one side is how they diverged in the first place.
+		taskIdentity := ingestTaskIdentityFor(a.TaskRef, a.Branch)
 		recordOpts := reviewledger.RecordOpts{
 			SHA: a.SHA, Branch: a.Branch, BuilderFamily: a.BuilderFamily,
 			ReviewerFamily: a.ReviewerFamily, Reviewer: a.Reviewer,
-			Artifact: artifactName, Gate: gate, Task: a.Branch,
+			Artifact: artifactName, Gate: gate, Task: taskIdentity,
 		}
 		verdictOpts := reviewledger.VerdictOpts{
 			SHA: a.SHA, Reviewer: a.Reviewer, Verdict: reviewledger.Verdict(a.Verdict),
@@ -177,7 +192,7 @@ func runReviewIngest() {
 			// sha+verdict, so no verdict can be tied back to a card and a
 			// corrupted board cannot be rebuilt from review history. Empty when
 			// the artifact declares no card — unattributed beats misattributed.
-			Task:         a.TaskRef,
+			Task:         taskIdentity,
 			CandidateSHA: a.SHA, RetryOf: a.RetryOf,
 		}
 		opts := reviewledger.IngestOpts{Record: recordOpts, Verdict: verdictOpts}
@@ -688,6 +703,15 @@ func minInt(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// ingestTaskIdentityFor is the single source both ledger rows take their task
+// from, so they cannot disagree by construction (FAC-657).
+func ingestTaskIdentityFor(taskRef, branch string) string {
+	if t := strings.TrimSpace(taskRef); t != "" {
+		return t
+	}
+	return strings.TrimSpace(branch)
 }
 
 func ingestDisposition(enqueued bool, verdict string) string {
