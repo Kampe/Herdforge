@@ -2,6 +2,7 @@ package dispatch
 
 import (
 	"encoding/json"
+	"github.com/Kampe/Herdforge/pkg/provider"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -303,5 +304,47 @@ func TestWriteTaskContext_InvalidContextWritesNothing(t *testing.T) {
 	}
 	if len(entries) != 0 {
 		t.Errorf("failed validation must leave no files, found %d", len(entries))
+	}
+}
+
+// FAC-680: an expired receipt is not a fault, it is the TTL doing its job -- a
+// day covers any legitimate build without leaving immortal mutation authority in
+// an abandoned worktree. Observed live: "receipt FAC-548 expired at 2026-08-22"
+// refused a board transition four days later, correctly.
+//
+// What was missing was the remedy. The refusal named the expiry and nothing
+// else, so a lane hitting it could only report being stuck -- the same dead end
+// the unrecorded-provenance gate was before it became operator-decidable.
+func TestExpiredReceiptAuthorizesNothingAndSaysWhen(t *testing.T) {
+	tc := TaskContext{
+		TaskRef:    "FAC-548",
+		Role:       "reviewer",
+		AllowedOps: []string{"update_status"},
+		ExpiresAt:  time.Now().Add(-96 * time.Hour),
+	}
+	err := tc.Authorize(time.Now(), provider.OpKind("update_status"))
+	if err == nil {
+		t.Fatal("an expired receipt must authorize nothing, however well-formed")
+	}
+	if !strings.Contains(err.Error(), "expired") {
+		t.Errorf("the refusal must name expiry as the cause: %v", err)
+	}
+	// A receipt inside its window still authorizes its own ops, or the TTL would
+	// simply break every legitimate build.
+	tc.ExpiresAt = time.Now().Add(time.Hour)
+	if err := tc.Authorize(time.Now(), provider.OpKind("update_status")); err != nil {
+		t.Errorf("a live receipt must still authorize its allowed op: %v", err)
+	}
+	// And it never authorizes an op outside its grant, expired or not.
+	if err := tc.Authorize(time.Now(), provider.OpKind("delete_task")); err == nil {
+		t.Error("a live receipt must not authorize an op outside its grant")
+	}
+}
+
+// The TTL is a day on purpose: long enough for any real build, short enough that
+// an abandoned worktree cannot mutate the board indefinitely.
+func TestReceiptTTLIsBoundedToADay(t *testing.T) {
+	if DefaultReceiptTTL != 24*time.Hour {
+		t.Fatalf("TTL = %v; a day is the balance between a long build and an immortal authority", DefaultReceiptTTL)
 	}
 }
