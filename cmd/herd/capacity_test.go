@@ -196,3 +196,54 @@ func TestDerivedReviewLimitNeverReturnsZero(t *testing.T) {
 		t.Fatalf("tiny host derived %d slots, want 1", got)
 	}
 }
+
+// FAC-688: a blocked reviewer holds a slot and makes no progress. Counting it
+// only in the live total hides the accumulation that preceded the incident --
+// W4 came back with three reviewers of which two were blocked, and the record
+// reported that as indistinguishable from three healthy reviews.
+func TestBlockedReviewersAreNamedWhenTheyHoldTheCap(t *testing.T) {
+	o := healthy()
+	o.Reviewers, o.ReviewersBlocked = 5, 2
+	o.BlockedReviewerID = []string{"review-security-cha-320", "review-review-cha2191-c"}
+	c := decideCapacity(o, 5, 4096, 6144)
+	if c.Admit {
+		t.Fatal("admitted past the cap")
+	}
+	if !strings.Contains(c.Reason, "BLOCKED") || !strings.Contains(c.Reason, "review-security-cha-320") {
+		t.Fatalf("refusal hides which slots are stalled: %s", c.Reason)
+	}
+}
+
+// FAC-688: an uncapped harness WARNS but must not refuse. Refusing would fence
+// every host that has not adopted the wrapper, trading a bounded risk for a
+// certain outage -- while the memory, swap and derived-slot gates already bound
+// the aggregate. Visible, not fatal.
+func TestUncappedHarnessWarnsWithoutRefusing(t *testing.T) {
+	o := healthy()
+	o.HarnessPath, o.HarnessCapped = "/home/kampe/.local/bin/claude", false
+	c := decideCapacity(o, 5, 4096, 6144)
+	if !c.Admit {
+		t.Fatalf("an uncapped harness fenced the host: %s", c.Reason)
+	}
+	if !strings.Contains(c.Reason, "NOT memory-capped") {
+		t.Fatalf("an uncapped harness was admitted silently: %s", c.Reason)
+	}
+}
+
+func TestCappedHarnessAddsNoWarning(t *testing.T) {
+	o := healthy()
+	o.HarnessPath, o.HarnessCapped = "/home/kampe/.local/bin/claude", true
+	if c := decideCapacity(o, 5, 4096, 6144); strings.Contains(c.Reason, "NOT memory-capped") {
+		t.Fatalf("a capped harness still warned: %s", c.Reason)
+	}
+}
+
+func TestAbsentHarnessIsUnmeasuredNotUncapped(t *testing.T) {
+	// No harness on PATH is unmeasured. Warning that an absent binary is
+	// uncapped is a confident claim about something never observed.
+	o := healthy()
+	o.HarnessPath, o.HarnessCapped = "", false
+	if c := decideCapacity(o, 5, 4096, 6144); strings.Contains(c.Reason, "NOT memory-capped") {
+		t.Fatalf("an unmeasured harness produced an uncapped claim: %s", c.Reason)
+	}
+}

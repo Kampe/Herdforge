@@ -151,14 +151,24 @@ type CapacityObservation struct {
 	SwapUsedMiB  int64  `json:"swap_used_mib"`     // -1 unknown
 	// Processes/Threads/FDs, not RSS, are the plausible binding constraints
 	// here -- see the note on hostProcessLoad. -1 means unmeasured.
-	Processes      int      `json:"processes"`
-	Threads        int      `json:"threads"`
-	FDLimit        int      `json:"fd_limit"`
-	AgentsListed   bool     `json:"agents_listed"`
-	Agents         int      `json:"agents_total"`
-	Reviewers      int      `json:"reviewers_live"`
-	ReviewersIdle  int      `json:"reviewers_idle"`
-	IdleReviewerID []string `json:"reviewers_idle_names,omitempty"`
+	Processes int `json:"processes"`
+	Threads   int `json:"threads"`
+	FDLimit   int `json:"fd_limit"`
+	// HarnessCapped states whether the harness this host launches is actually
+	// wrapped in a memory-bounded scope. Reported, never assumed: "we wired
+	// run-capped" is a claim, and a claim is not a cgroup.
+	HarnessCapped bool   `json:"harness_capped"`
+	HarnessPath   string `json:"harness_path,omitempty"`
+	AgentsListed  bool   `json:"agents_listed"`
+	Agents        int    `json:"agents_total"`
+	Reviewers     int    `json:"reviewers_live"`
+	ReviewersIdle int    `json:"reviewers_idle"`
+	// Blocked reviewers hold a slot and make no progress. They are neither
+	// healthy work nor reapable garbage, and counting them only in the live
+	// total hides the exact accumulation that preceded the W4 incident.
+	ReviewersBlocked  int      `json:"reviewers_blocked"`
+	BlockedReviewerID []string `json:"reviewers_blocked_names,omitempty"`
+	IdleReviewerID    []string `json:"reviewers_idle_names,omitempty"`
 }
 
 // Capacity is the observation plus one decision with a named reason.
@@ -184,8 +194,8 @@ func (c Capacity) String() string {
 	if c.Processes >= 0 {
 		procs = fmt.Sprintf("%d/%dthr", c.Processes, c.Threads)
 	}
-	return fmt.Sprintf("%s herdr=%v reviewers=%d/%d idle=%d mem_available=%s procs=%s need=%dMiB: %s",
-		verdict, c.HerdrRunning, c.Reviewers, c.ReviewLimit, c.ReviewersIdle, mem, procs, c.NeedMiB, c.Reason)
+	return fmt.Sprintf("%s herdr=%v reviewers=%d/%d idle=%d blocked=%d mem_available=%s procs=%s need=%dMiB: %s",
+		verdict, c.HerdrRunning, c.Reviewers, c.ReviewLimit, c.ReviewersIdle, c.ReviewersBlocked, mem, procs, c.NeedMiB, c.Reason)
 }
 
 // decideCapacity is the whole policy, separated from measurement so it is
@@ -216,6 +226,10 @@ func decideCapacity(o CapacityObservation, limit int, perReviewerMiB, floorMiB i
 		c.Reason = "herdr reports running but the agent census could not be read; refusing rather than treating an unreadable census as an idle host"
 	case o.Reviewers >= limit:
 		c.Reason = fmt.Sprintf("%d reviewers already live against a cap of %d (live census, not configured slots)", o.Reviewers, limit)
+		if o.ReviewersBlocked > 0 {
+			c.Reason += fmt.Sprintf("; %d are BLOCKED and holding slots without progressing: %s",
+				o.ReviewersBlocked, strings.Join(o.BlockedReviewerID, " "))
+		}
 		if o.ReviewersIdle > 0 {
 			c.Reason += fmt.Sprintf("; %d of them are idle and reapable: %s",
 				o.ReviewersIdle, strings.Join(o.IdleReviewerID, " "))
@@ -240,6 +254,14 @@ func decideCapacity(o CapacityObservation, limit int, perReviewerMiB, floorMiB i
 		if o.MemAvailMiB < 0 {
 			c.Reason += " (memory unmeasurable here; admitted on herdr and census alone)"
 		}
+		if o.HarnessPath != "" && !o.HarnessCapped {
+			// Deliberately a WARNING, not a refusal. Refusing would fence every
+			// host that has not adopted the wrapper yet, which trades a bounded
+			// risk for a certain outage -- and the memory, swap and derived-slot
+			// gates already bound the aggregate. But it must be VISIBLE, because
+			// the whole failure mode was a per-agent heap nobody was limiting.
+			c.Reason += "; WARNING harness " + o.HarnessPath + " is NOT memory-capped, so a single runaway review is bounded only by this host's total RAM"
+		}
 	}
 	return c
 }
@@ -249,6 +271,7 @@ func observeCapacity() CapacityObservation {
 	o.HerdrRunning, o.HerdrDetail = herdrServerRunning()
 	o.MemTotalMiB, o.MemAvailMiB, o.SwapUsedMiB = hostMemoryMiB()
 	o.Processes, o.Threads, o.FDLimit = hostProcessLoad()
+	o.HarnessCapped, o.HarnessPath = harnessIsMemoryCapped("claude")
 
 	agents, err := herdr.AgentList()
 	if err != nil {
@@ -264,9 +287,17 @@ func observeCapacity() CapacityObservation {
 		o.Reviewers++
 		// "idle" here means resident and doing nothing -- the class the
 		// default done-only reaper misses, and the class that held 2 GiB on W4.
-		if strings.EqualFold(a.Status, "idle") || strings.EqualFold(a.Status, "done") {
+		switch {
+		case strings.EqualFold(a.Status, "idle"), strings.EqualFold(a.Status, "done"):
 			o.ReviewersIdle++
 			o.IdleReviewerID = append(o.IdleReviewerID, a.Name)
+		case strings.EqualFold(a.Status, "blocked"):
+			// NOT reaped here. Blocked usually means waiting on a permission
+			// prompt, which is recoverable -- closing it would throw away a
+			// review that only needed an answer. It is reported so a slot held
+			// by stalled work is visible instead of looking like throughput.
+			o.ReviewersBlocked++
+			o.BlockedReviewerID = append(o.BlockedReviewerID, a.Name)
 		}
 	}
 	return o
@@ -464,4 +495,38 @@ func hostProcessLoad() (processes, threads, fdLimit int) {
 		}
 	}
 	return processes, threads, fdLimit
+}
+
+// harnessIsMemoryCapped reports whether the harness this host would launch is
+// wrapped in a memory-bounded scope (systemd-run/run-capped).
+//
+// herdr resolves the harness executable itself from --kind and offers no
+// command override, so the only place a cap can be applied is the binary PATH
+// resolves to. That makes "is it capped" a question about a file, and one worth
+// answering out loud: run-capped existing on a host proves nothing about
+// whether anything uses it. On W4 it was installed and the harness was not
+// wrapped, so every launch was still unbounded.
+//
+// Returns ("", false) when the harness is absent, which is unmeasured rather
+// than uncapped, and reads as no warning.
+func harnessIsMemoryCapped(kind string) (capped bool, path string) {
+	resolved, err := exec.LookPath(kind)
+	if err != nil {
+		return false, ""
+	}
+	body, err := os.ReadFile(resolved)
+	if err != nil {
+		// A real ELF we cannot classify. Do not claim it is uncapped.
+		return false, ""
+	}
+	text := string(body)
+	if len(text) > 8192 {
+		text = text[:8192]
+	}
+	for _, marker := range []string{"run-capped", "systemd-run", "MemoryMax"} {
+		if strings.Contains(text, marker) {
+			return true, resolved
+		}
+	}
+	return false, resolved
 }
