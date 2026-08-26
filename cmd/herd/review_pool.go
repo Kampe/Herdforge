@@ -311,6 +311,22 @@ func runPoolReview(ref string) error {
 		return fmt.Errorf("write review packet: %w", err)
 	}
 
+	// FAC-656: complete the launch record now that a lease EXISTS.
+	//
+	// The first record row is written before the pool is leased, so it cannot
+	// carry a lease -- which is why every one of 2210 live ledger rows had an
+	// empty lease and harvest admission could never admit anything. Appending a
+	// completed row here is what makes Admit satisfiable at all.
+	//
+	// Best-effort: the reviewer is already launching and the ledger write is not
+	// the authority for that. A failure here costs admissibility later, which is
+	// recoverable and visible, whereas failing the launch would waste a leased
+	// slot and a provider call for a bookkeeping problem.
+	if err := completeReviewLaunchProvenance(root, ref, sha, lease.LeaseID); err != nil {
+		fmt.Fprintf(os.Stderr, "review --pool: reviewer launched but launch provenance is INCOMPLETE (%v); "+
+			"this candidate will be refused at harvest admission until a record row carries its lease and patch id\n", err)
+	}
+
 	if *noLaunch {
 		fmt.Printf("review surface ready ref=%s sha=%s lease=%s path=%s packet=%s\n", ref, shortSHA(sha), lease.LeaseID, surface, packet)
 		return nil
@@ -936,6 +952,57 @@ func builderFamilyOrUnrecorded(family string) string {
 		return reviewledger.FamilyUnrecorded
 	}
 	return family
+}
+
+// completeReviewLaunchProvenance records the lease and an independent patch
+// identity for the exact candidate, so Ledger.Admit has the bindings it requires.
+//
+// Patch identity comes from git, never from the reviewer: it is what allows a
+// REBASED candidate to keep its verdict rather than be re-reviewed, and it must
+// therefore be computed from the tree rather than asserted by anyone.
+func completeReviewLaunchProvenance(root, ref, sha, leaseID string) error {
+	patch, err := candidatePatchIdentity(root, sha)
+	if err != nil {
+		return fmt.Errorf("patch identity for %s: %w", shortSHA(sha), err)
+	}
+	l, err := reviewledger.NewReviewLedger(root, reviewledger.DefaultPath(root))
+	if err != nil {
+		return err
+	}
+	return l.CompleteLaunchProvenance(reviewledger.RecordOpts{
+		SHA:      sha,
+		Reviewer: reviewAgentName(ref, sha),
+		Task:     ref,
+		Lease:    strings.TrimSpace(leaseID),
+		PatchURL: patch,
+		Gate:     "launch-provenance",
+	})
+}
+
+// candidatePatchIdentity computes the stable patch id for a candidate against
+// its merge base. Verified stable across a clean rebase, which is the property
+// the admission binding depends on.
+func candidatePatchIdentity(root, sha string) (string, error) {
+	base, err := exec.Command("git", "-C", root, "merge-base", sha, "origin/main").Output()
+	if err != nil {
+		return "", fmt.Errorf("resolve merge base: %w", err)
+	}
+	diff := exec.Command("git", "-C", root, "diff", strings.TrimSpace(string(base)), sha)
+	pipe := exec.Command("git", "-C", root, "patch-id", "--stable")
+	out, err := diff.Output()
+	if err != nil {
+		return "", fmt.Errorf("read candidate diff: %w", err)
+	}
+	pipe.Stdin = strings.NewReader(string(out))
+	id, err := pipe.Output()
+	if err != nil {
+		return "", fmt.Errorf("compute patch id: %w", err)
+	}
+	fields := strings.Fields(string(id))
+	if len(fields) == 0 || strings.TrimSpace(fields[0]) == "" {
+		return "", fmt.Errorf("git produced no patch id (empty diff?)")
+	}
+	return fields[0], nil
 }
 
 // recordAssertedBuilderLaunch writes the launch row admission reads, so an
