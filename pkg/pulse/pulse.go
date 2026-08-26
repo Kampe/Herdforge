@@ -369,6 +369,13 @@ type Snapshot struct {
 	UnknownReasons      []string           `json:"unknown_reasons,omitempty"`
 	DispatchBlocked     bool               `json:"dispatch_blocked"`
 	DispatchBlockReason string             `json:"dispatch_block_reason,omitempty"`
+	// BuilderDispatchBlocked is DispatchBlocked minus review-capacity reasons.
+	//
+	// FAC-666: review capacity bounds REVIEW work. A builder claiming an
+	// independent, dependency-ready task consumes no review slot, so a full
+	// review queue is not a fact about whether it may work. Keeping one global
+	// flag is what let a review cap stop builders.
+	BuilderDispatchBlocked bool `json:"builder_dispatch_blocked"`
 	// ExitCode is 0 when the beat is healthy; non-zero when unknown critical
 	// state is present or an applied action failed hard.
 	ExitCode int `json:"exit_code"`
@@ -515,6 +522,22 @@ func Plan(obs Observation, opts Options) (Snapshot, error) {
 	}
 	snap.DispatchBlocked = blockReason != ""
 	snap.DispatchBlockReason = blockReason
+	// FAC-666: review saturation must not gate BUILDER dispatch.
+	//
+	// FAC-650 fixed how saturation is MEASURED (live concurrency, not the
+	// ledger's historical vetoed set), but it stayed a cause of the GLOBAL
+	// DispatchBlocked, so a full review queue still stopped builders. That is
+	// the same leak pkg/broker was built to close, still live in the surface
+	// that actually decides: measured on this fleet, dispatch blocked with 6
+	// healthy-idle lanes while 2 reviews ran against a cap of 3.
+	//
+	// Review capacity bounds REVIEW work. A builder claiming an independent,
+	// dependency-ready task consumes no review slot, so a full review queue is
+	// not a fact about whether it may work. Every other block reason -- unknown
+	// critical source, unreadable review posture, wind-down, broker unavailable,
+	// exhausted quota, nothing claimable -- still stops everything, because each
+	// of those genuinely does apply to a builder.
+	snap.BuilderDispatchBlocked = snap.DispatchBlocked && !reviewSaturationOnly(blockReason, obs, agents)
 
 	var actions []Action
 
@@ -727,7 +750,7 @@ func Plan(obs Observation, opts Options) (Snapshot, error) {
 	}
 
 	// Dispatch: only when act+spawn and not blocked. Observe/act print would-run.
-	if opts.Act && opts.Spawn && !snap.DispatchBlocked {
+	if opts.Act && opts.Spawn && !snap.BuilderDispatchBlocked {
 		// Prefer a healthy idle lane as target; else generic queue. A held lease
 		// names the canonical lane it protects, so exclude it before selecting
 		// the one bounded dispatch target for this beat.
@@ -849,6 +872,17 @@ func needsRenew(l LeaseObservation, now time.Time, within time.Duration) bool {
 		threshold = 30 * time.Second
 	}
 	return remaining <= threshold
+}
+
+// reviewSaturationOnly reports whether the ONLY thing blocking dispatch is
+// review capacity. It is deliberately narrow: it returns true for exactly the
+// saturation reason and nothing else, so a future block reason cannot silently
+// inherit the builder exemption by resembling this one.
+func reviewSaturationOnly(blockReason string, obs Observation, agents []AgentObservation) bool {
+	if blockReason == "" {
+		return false
+	}
+	return blockReason == reviewSaturationReason(obs, agents)
 }
 
 // reviewSaturated reports whether LIVE review concurrency has reached the cap.

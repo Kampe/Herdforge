@@ -58,3 +58,51 @@ func contains(s, sub string) bool {
 		return false
 	})()
 }
+
+// FAC-666: FAC-650 fixed how saturation is MEASURED but it stayed a cause of the
+// GLOBAL DispatchBlocked, so a full review queue still stopped builders. That is
+// the leak pkg/broker was built to close, still live in the surface that
+// actually decides: measured on this fleet, dispatch blocked with 6 healthy-idle
+// lanes while 2 reviews ran against a cap of 3.
+func TestReviewSaturationDoesNotBlockBuilderDispatch(t *testing.T) {
+	obs := Observation{Review: ReviewObservation{Known: true, Cap: 2}}
+	agents := []AgentObservation{{Name: "r1", SafeRef: "a"}, {Name: "r2", SafeRef: "b"}}
+	reason := reviewSaturationReason(obs, agents)
+
+	if !reviewSaturationOnly(reason, obs, agents) {
+		t.Fatal("the saturation reason must be recognised as review-only")
+	}
+	// Any OTHER block reason must still stop builders: each of those genuinely
+	// applies to a builder too.
+	for _, other := range []string{
+		"wind-down enabled",
+		"quota exhausted",
+		"coordinator broker unavailable",
+		"no claimable work",
+		"unknown critical source: provider",
+	} {
+		if reviewSaturationOnly(other, obs, agents) {
+			t.Errorf("%q must still block builders; only review capacity is exempt", other)
+		}
+	}
+	// An empty reason is not a block at all.
+	if reviewSaturationOnly("", obs, agents) {
+		t.Error("no block reason is not a review-only block")
+	}
+}
+
+// The exemption must be exact, so a future reason cannot inherit it by merely
+// resembling this one.
+func TestTheBuilderExemptionIsExactNotFuzzy(t *testing.T) {
+	obs := Observation{Review: ReviewObservation{Known: true, Cap: 3}}
+	agents := []AgentObservation{{Name: "r1", SafeRef: "a"}}
+	for _, near := range []string{
+		"review saturated",
+		"review saturated: something else",
+		"review capacity is full",
+	} {
+		if reviewSaturationOnly(near, obs, agents) {
+			t.Errorf("%q must not inherit the builder exemption by resemblance", near)
+		}
+	}
+}
