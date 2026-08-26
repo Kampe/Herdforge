@@ -79,7 +79,7 @@ import (
 func runCapacity(args []string) error {
 	fs := flag.NewFlagSet("capacity", flag.ContinueOnError)
 	asJSON := fs.Bool("json", false, "emit the structured capacity record")
-	limit := fs.Int("review-limit", envInt("HERD_REVIEW_CONCURRENCY", 4), "max concurrent live reviewers on this host")
+	limit := fs.Int("review-limit", 0, "max concurrent live reviewers; 0 derives it from this host's memory budget")
 	perReviewer := fs.Int64("reviewer-mib", envInt64("HERD_REVIEWER_RSS_MIB", 4096), "expected TOTAL cost of one reviewer including the toolchain it spawns, in MiB")
 	floor := fs.Int64("floor-mib", envInt64("HERD_MEM_FLOOR_MIB", 6144), "memory that must remain free AFTER the new reviewer, for sshd/herdr and the host OS")
 	claim := fs.Bool("claim", false, "hold an admission lease across the caller's launch, so concurrent callers cannot all pass the same check")
@@ -114,7 +114,23 @@ func runCapacity(args []string) error {
 		defer release()
 	}
 
-	c := decideCapacity(observeCapacity(), *limit, *perReviewer, *floor)
+	obs := observeCapacity()
+	// FAC-686: 4 was a guess. A slot ceiling has to be arithmetic on the host's
+	// real memory, or it is the 512MiB mistake again in a different variable:
+	// a number that looks like a policy and is actually a hope.
+	//
+	// slots x per-reviewer <= budget, where the budget is a FRACTION of total
+	// RAM rather than all of it. The incident ran to ~41GB of 48GB (85%) before
+	// the kernel could not find a page; a host is already unwell well before its
+	// last byte. 50% leaves room for page cache, the control plane, and -- on
+	// WSL2 -- the Windows host that shares the machine.
+	effectiveLimit := *limit
+	if effectiveLimit <= 0 {
+		effectiveLimit = derivedReviewLimit(obs.MemTotalMiB, *perReviewer)
+	}
+
+	c := decideCapacity(obs, effectiveLimit, *perReviewer, *floor)
+	c.LimitDerived = *limit <= 0
 
 	emitCapacity(c, *asJSON)
 	if !c.Admit {
@@ -130,6 +146,7 @@ func runCapacity(args []string) error {
 type CapacityObservation struct {
 	HerdrRunning bool   `json:"herdr_running"`
 	HerdrDetail  string `json:"herdr_detail,omitempty"`
+	MemTotalMiB  int64  `json:"mem_total_mib"`     // -1 unknown
 	MemAvailMiB  int64  `json:"mem_available_mib"` // -1 unknown
 	SwapUsedMiB  int64  `json:"swap_used_mib"`     // -1 unknown
 	// Processes/Threads/FDs, not RSS, are the plausible binding constraints
@@ -147,10 +164,11 @@ type CapacityObservation struct {
 // Capacity is the observation plus one decision with a named reason.
 type Capacity struct {
 	CapacityObservation
-	ReviewLimit int    `json:"review_limit"`
-	NeedMiB     int64  `json:"need_mib"`
-	Admit       bool   `json:"admit"`
-	Reason      string `json:"reason"`
+	ReviewLimit  int    `json:"review_limit"`
+	LimitDerived bool   `json:"review_limit_derived"`
+	NeedMiB      int64  `json:"need_mib"`
+	Admit        bool   `json:"admit"`
+	Reason       string `json:"reason"`
 }
 
 func (c Capacity) String() string {
@@ -227,9 +245,9 @@ func decideCapacity(o CapacityObservation, limit int, perReviewerMiB, floorMiB i
 }
 
 func observeCapacity() CapacityObservation {
-	o := CapacityObservation{MemAvailMiB: -1, SwapUsedMiB: -1, Processes: -1, Threads: -1, FDLimit: -1}
+	o := CapacityObservation{MemTotalMiB: -1, MemAvailMiB: -1, SwapUsedMiB: -1, Processes: -1, Threads: -1, FDLimit: -1}
 	o.HerdrRunning, o.HerdrDetail = herdrServerRunning()
-	o.MemAvailMiB, o.SwapUsedMiB = hostMemoryMiB()
+	o.MemTotalMiB, o.MemAvailMiB, o.SwapUsedMiB = hostMemoryMiB()
 	o.Processes, o.Threads, o.FDLimit = hostProcessLoad()
 
 	agents, err := herdr.AgentList()
@@ -278,10 +296,10 @@ func herdrServerRunning() (bool, string) {
 
 // hostMemoryMiB reads /proc/meminfo. Returns (-1, -1) where that does not
 // exist, which the decision treats as unmeasured rather than as zero.
-func hostMemoryMiB() (avail, swapUsed int64) {
+func hostMemoryMiB() (total, avail, swapUsed int64) {
 	raw, err := os.ReadFile("/proc/meminfo")
 	if err != nil {
-		return -1, -1
+		return -1, -1, -1
 	}
 	kb := map[string]int64{}
 	for _, line := range strings.Split(string(raw), "\n") {
@@ -299,14 +317,37 @@ func hostMemoryMiB() (avail, swapUsed int64) {
 		}
 		kb[k] = n
 	}
-	avail, swapUsed = -1, -1
+	total, avail, swapUsed = -1, -1, -1
+	if v, ok := kb["MemTotal"]; ok {
+		total = v / 1024
+	}
 	if v, ok := kb["MemAvailable"]; ok {
 		avail = v / 1024
 	}
 	if total, ok := kb["SwapTotal"]; ok {
 		swapUsed = (total - kb["SwapFree"]) / 1024
 	}
-	return avail, swapUsed
+	return total, avail, swapUsed
+}
+
+// derivedReviewLimit sizes the slot ceiling from the host's own memory.
+//
+// Returns 1 when total memory is unmeasurable: unknown must not read as
+// unlimited. One reviewer still makes progress, and the memory/swap gates
+// remain in front of it.
+func derivedReviewLimit(memTotalMiB, perReviewerMiB int64) int {
+	if memTotalMiB <= 0 || perReviewerMiB <= 0 {
+		return 1
+	}
+	pct := int64(envInt("HERD_REVIEW_BUDGET_PCT", 50))
+	if pct <= 0 || pct > 100 {
+		pct = 50
+	}
+	slots := (memTotalMiB * pct / 100) / perReviewerMiB
+	if slots < 1 {
+		return 1
+	}
+	return int(slots)
 }
 
 func envInt(key string, def int) int {

@@ -161,3 +161,38 @@ func TestReviewerIsSizedByItsToolchainNotItsAgentRSS(t *testing.T) {
 		t.Fatalf("admitted a review that does not fit once its toolchain is counted: %s", c.Reason)
 	}
 }
+
+// FAC-686: the slot ceiling must be arithmetic on the host's real memory. A
+// hardcoded 4 is the 512MiB mistake in a different variable -- a number that
+// looks like policy and is actually a hope.
+func TestDerivedReviewLimitScalesWithHostMemory(t *testing.T) {
+	// 48GiB VM at 50% budget, 4GiB per reviewer -> 6 slots.
+	if got := derivedReviewLimit(48*1024, 4096); got != 6 {
+		t.Fatalf("48GiB host derived %d slots, want 6", got)
+	}
+	// Same host capped to 32GiB by .wslconfig -> 4 slots, no code change.
+	if got := derivedReviewLimit(32*1024, 4096); got != 4 {
+		t.Fatalf("32GiB host derived %d slots, want 4", got)
+	}
+	// The incident ran to ~41GiB of 48GiB. The derived budget must sit well
+	// below that, or it authorises the thing that broke the host.
+	if budget := int64(6) * 4096; budget >= 41*1024 {
+		t.Fatalf("derived budget %dMiB reaches the level that failed", budget)
+	}
+}
+
+func TestDerivedReviewLimitTreatsUnknownMemoryAsOneNotUnlimited(t *testing.T) {
+	for _, total := range []int64{-1, 0} {
+		if got := derivedReviewLimit(total, 4096); got != 1 {
+			t.Fatalf("unmeasurable memory derived %d slots; unknown must not read as unlimited", got)
+		}
+	}
+}
+
+func TestDerivedReviewLimitNeverReturnsZero(t *testing.T) {
+	// A host smaller than one reviewer still makes progress with one, behind
+	// the memory and swap gates. Zero would fence it permanently.
+	if got := derivedReviewLimit(1024, 4096); got != 1 {
+		t.Fatalf("tiny host derived %d slots, want 1", got)
+	}
+}
