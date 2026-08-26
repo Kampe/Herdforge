@@ -487,6 +487,26 @@ func resolvePoolReviewCandidateAt(root, ref, sha string) (string, error) {
 		if dir := detachedSurfaceAtSHA(root, sha); dir != "" {
 			return dir, nil
 		}
+		// FAC-678: prepare the surface rather than demanding the caller did.
+		//
+		// Reported as "the wrapper demands a checked-out branch despite exact
+		// remote head availability". Reproduced: the branch existed locally, the
+		// SHA resolved, and resolution still refused because no worktree happened
+		// to hold it -- so every caller had to remember a manual
+		// `git worktree add --detach` first, and two dispatches were rejected for
+		// forgetting a step the command can do itself.
+		//
+		// This creates ONLY a detached surface at the exact SHA, under the
+		// managed worktrees path, and only when the SHA is a real commit. It
+		// never checks out a branch, so it cannot move anyone's work, and it
+		// never reuses an existing directory.
+		if dir, err := prepareCandidateSurface(root, ref, sha); err == nil && dir != "" {
+			fmt.Printf("prepared review surface %s at %s\n", dir, shortSHA(sha))
+			return dir, nil
+		} else if err != nil {
+			return "", fmt.Errorf("no worktree holds candidate %q at exact sha %s and one could not be prepared: %w",
+				ref, shortSHA(sha), err)
+		}
 		// FAC-653: a SHA too short to verify is a bad ARGUMENT, not a missing
 		// worktree. headMatchesSHA and detachedSurfaceAtSHA both require >=12
 		// hex so an abbreviation cannot ambiguously match the wrong commit --
@@ -505,6 +525,35 @@ func resolvePoolReviewCandidateAt(root, ref, sha string) (string, error) {
 		return "", fmt.Errorf("candidate branch %q is not checked out in a worktree", ref)
 	}
 	return "", fmt.Errorf("candidate worktree %q does not exist", filepath.Join(root, worktreePathForRef(ref)))
+}
+
+// prepareCandidateSurface creates a detached worktree at the exact candidate.
+//
+// Detached on purpose: checking out the BRANCH would move a ref someone else may
+// be working on, while a detached surface at an exact SHA is inert. Returns ""
+// with no error when the SHA is not a commit here, so the caller falls through
+// to its normal refusal rather than reporting a preparation failure for a
+// candidate that never existed.
+func prepareCandidateSurface(root, ref, sha string) (string, error) {
+	if len(strings.TrimSpace(sha)) < 12 {
+		return "", nil
+	}
+	if err := exec.Command("git", "-C", root, "rev-parse", "--verify", "-q", sha+"^{commit}").Run(); err != nil {
+		return "", nil // not a commit here; not ours to prepare
+	}
+	dir := filepath.Join(root, ".herd", "worktrees", safeReviewSurfacePart(ref)+"-"+shortSHA(sha))
+	if worktreeExists(dir) {
+		// Someone prepared it between the lookup and now. Use it only if it is
+		// actually at the candidate, never merely because the path exists.
+		if headMatchesSHA(dir, sha) {
+			return dir, nil
+		}
+		return "", fmt.Errorf("surface %s exists but is not at %s", dir, shortSHA(sha))
+	}
+	if out, err := exec.Command("git", "-C", root, "worktree", "add", "-q", "--detach", dir, sha).CombinedOutput(); err != nil {
+		return "", fmt.Errorf("%v: %s", err, strings.TrimSpace(string(out)))
+	}
+	return dir, nil
 }
 
 // candidateSurfaceDirs returns every directory spelling a candidate surface may

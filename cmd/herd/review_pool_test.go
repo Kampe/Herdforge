@@ -211,9 +211,24 @@ func TestResolvePoolCandidateRejectsDetachedSurfaceAtWrongSHA(t *testing.T) {
 	surface := filepath.Join(root, ".herd", "worktrees", safeReviewSurfacePart("feat/deep/candidate"))
 	run("worktree", "add", "-q", "--detach", surface, strings.TrimSpace(string(first)))
 
-	// Ask for the SECOND sha; the surface holds the first.
-	if _, err := resolvePoolReviewCandidateAt(root, "feat/deep/candidate", strings.TrimSpace(string(second))); err == nil {
-		t.Fatal("a surface at the wrong commit must not resolve; the SHA is verified, not assumed")
+	// Ask for the SECOND sha; the existing surface holds the first.
+	//
+	// FAC-678 strengthened this. Previously resolution refused outright. Now it
+	// refuses to USE the wrong-SHA surface and prepares a correct one instead --
+	// so the invariant to assert is the one that actually matters: whatever comes
+	// back is AT the requested commit. "Must error" was a weaker restatement of
+	// that, and would now fail for a strictly better outcome.
+	want := strings.TrimSpace(string(second))
+	got, err := resolvePoolReviewCandidateAt(root, "feat/deep/candidate", want)
+	if err != nil {
+		// Refusing is still acceptable; reviewing the wrong commit is not.
+		return
+	}
+	if !headMatchesSHA(got, want) {
+		t.Fatalf("resolved %s which is NOT at %s; a reviewer would read the wrong code", got, shortSHA(want))
+	}
+	if got == surface {
+		t.Fatal("the stale surface must never be reused for a different candidate")
 	}
 }
 
@@ -247,5 +262,64 @@ func TestResolvePoolCandidateStillReportsAGenuineWorktreeMiss(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "no worktree holds") {
 		t.Errorf("expected the worktree-miss message: %v", err)
+	}
+}
+
+// FAC-678: reported as "the wrapper demands a checked-out branch despite exact
+// remote head availability". Reproduced: the branch existed locally, the SHA
+// resolved, and resolution still refused because no worktree happened to hold
+// it -- so every caller had to remember a manual `git worktree add --detach`,
+// and two dispatches (#3340, #3339) were rejected for forgetting a step the
+// command can do itself.
+func TestCandidateSurfaceIsPreparedWhenTheSHAResolves(t *testing.T) {
+	root := t.TempDir()
+	run := func(a ...string) {
+		t.Helper()
+		c := exec.Command("git", append([]string{"-C", root}, a...)...)
+		c.Env = append(os.Environ(), "GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@t", "GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@t")
+		if out, err := c.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", a, err, out)
+		}
+	}
+	run("init", "-q", "-b", "main", ".")
+	os.WriteFile(filepath.Join(root, "a.txt"), []byte("x"), 0o644)
+	run("add", ".")
+	run("commit", "-qm", "base")
+	shaOut, _ := exec.Command("git", "-C", root, "rev-parse", "HEAD").Output()
+	sha := strings.TrimSpace(string(shaOut))
+
+	dir, err := prepareCandidateSurface(root, "feat/thing", sha)
+	if err != nil {
+		t.Fatalf("preparing a surface for a resolvable sha must succeed: %v", err)
+	}
+	if dir == "" {
+		t.Fatal("a resolvable sha must yield a surface")
+	}
+	if !headMatchesSHA(dir, sha) {
+		t.Error("the prepared surface must be AT the candidate")
+	}
+	// Detached on purpose: checking out the branch would move a ref someone else
+	// may be working on. A detached surface at an exact SHA is inert.
+	if exec.Command("git", "-C", dir, "symbolic-ref", "-q", "HEAD").Run() == nil {
+		t.Error("the surface must be DETACHED so no branch ref is moved")
+	}
+}
+
+// A sha that is not a commit here is not ours to prepare, and must fall through
+// to the normal refusal rather than reporting a preparation failure for a
+// candidate that never existed.
+func TestNoSurfaceIsPreparedForAnUnresolvableSHA(t *testing.T) {
+	root := t.TempDir()
+	exec.Command("git", "-C", root, "init", "-q").Run()
+	dir, err := prepareCandidateSurface(root, "feat/thing", strings.Repeat("0", 40))
+	if err != nil {
+		t.Errorf("an unresolvable sha is not an error, it is not ours: %v", err)
+	}
+	if dir != "" {
+		t.Fatal("nothing may be created for a sha that does not exist here")
+	}
+	// A short sha cannot be verified and must not be prepared either.
+	if d, _ := prepareCandidateSurface(root, "feat/thing", "abc123"); d != "" {
+		t.Fatal("a sha too short to verify must never create a surface")
 	}
 }
