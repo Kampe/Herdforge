@@ -7845,6 +7845,17 @@ func runReviewLedger() {
 				allowUnrecorded = true
 				continue
 			}
+			// FAC-685: any OTHER dash-prefixed argument was accepted as a
+			// candidate SHA. `readiness --sha <x>` therefore reported
+			//   {"sha":"--sha","ready":false,"reason":"no verdict recorded"}
+			// -- a confident negative about a candidate that does not exist,
+			// printed alongside the real answer where a caller reading the
+			// first element sees not-ready. A mistyped flag must not be able
+			// to manufacture a false verdict.
+			if strings.HasPrefix(a, "-") && a != "-" {
+				fmt.Fprintf(os.Stderr, "review-ledger readiness: unknown flag %q (a SHA never begins with '-')\n", a)
+				os.Exit(2)
+			}
 			filtered = append(filtered, a)
 		}
 		shas = filtered

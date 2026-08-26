@@ -997,7 +997,35 @@ func runHarvestMerge() {
 		if *dryRun {
 			return
 		}
-		fmt.Fprintf(os.Stderr, "herd harvest-merge: exact reviewed candidate is not eligible; branch tip drift requires --candidate <last_pass_sha> or a new PASS\n")
+		// FAC-685: this used to print one message for two different situations,
+		// and for the commoner one it named a remedy that could not be followed.
+		//
+		// Reported live: `herd review-ledger readiness` said ready=true for
+		// CHA-2265 40b9006a (1 PASS, no dissent, provenance_unrecorded=0) while
+		// harvest refused with "last_pass_sha empty", which reads as "there is
+		// no PASS". There was a PASS; no ref reached that commit, so it was not
+		// selectable FOR THIS BRANCH. Readiness and harvest were never
+		// contradicting -- they answer different questions, and harvest did not
+		// say which one it had answered.
+		//
+		// Telling the operator to pass `--candidate <last_pass_sha>` when
+		// last_pass_sha is empty is a correct refusal that names no remedy,
+		// which stops work exactly as effectively as a wrong one.
+		switch {
+		case report.LastPassSHA == "" && len(report.OffBranchQueued) > 0:
+			fmt.Fprintf(os.Stderr, "herd harvest-merge: %d PASSed candidate(s) exist but NONE is reachable from %s, so none is selectable for this branch.\n",
+				len(report.OffBranchQueued), *branch)
+			fmt.Fprintf(os.Stderr, "  This is not the same as having no verdict: `herd review-ledger readiness %s` can legitimately report ready=true.\n",
+				shortSHA12(report.OffBranchQueued[0]))
+			fmt.Fprintf(os.Stderr, "  Harvest asks a narrower question -- is a reviewed candidate reachable from THIS branch.\n")
+			fmt.Fprintf(os.Stderr, "  Remedy: harvest the exact candidate with --candidate %s, or push a ref that reaches it.\n",
+				report.OffBranchQueued[0])
+		case report.LastPassSHA == "":
+			fmt.Fprintf(os.Stderr, "herd harvest-merge: no PASSed candidate is queued for %s at all; this branch needs a review, not a different flag\n", *branch)
+		default:
+			fmt.Fprintf(os.Stderr, "herd harvest-merge: branch tip %s has drifted past the reviewed candidate; harvest it exactly with --candidate %s, or obtain a new PASS at the tip\n",
+				shortSHA12(report.Tip), report.LastPassSHA)
+		}
 		os.Exit(1)
 	}
 	// Resolve the exact eligible identity before selecting any commits. A
