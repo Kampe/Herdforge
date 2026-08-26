@@ -3,8 +3,10 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
+	"github.com/Kampe/Herdforge/pkg/mail"
 	"github.com/Kampe/Herdforge/pkg/reviewledger"
 )
 
@@ -91,5 +93,67 @@ func TestBareFamilyIsNotTreatedAsUnrecorded(t *testing.T) {
 	// And a near-miss typo is still refused (the FAC-628 guarantee).
 	if _, honest := honestlyUnrecordedFamily("anthropc"); honest {
 		t.Error("a typo must not be accepted as honest provenance")
+	}
+}
+
+// FAC-651: the callback bus already existed (mail.Callback, CallbackComplete,
+// PostCallback with effect-level dedupe, pulse's ConsumeCallback/ack loop) and
+// `herd shot` used all of it, while the review path used none. Every stage after
+// a verdict was therefore discovered by polling: a verdict admitted at 21:04
+// could sit until the next beat purely because nothing announced it.
+func TestReviewAdmissionPostsACompletionCallback(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("HERD_ROOT", root)
+	sha := strings.Repeat("a", 40)
+
+	postReviewCompleteCallback(sha, "feat/thing", "pool-03", "PASS")
+
+	cbs, err := mail.NewMailbox(mail.CallbackMailPath(root)).DrainCallbacks()
+	if err != nil {
+		t.Fatalf("drain callbacks: %v", err)
+	}
+	if len(cbs) != 1 {
+		t.Fatalf("an admitted verdict must announce itself exactly once, got %d", len(cbs))
+	}
+	got := cbs[0]
+	if got.Kind != mail.CallbackComplete {
+		t.Errorf("kind = %q, want complete", got.Kind)
+	}
+	if got.SHA != sha {
+		t.Errorf("the exact candidate SHA must ride the event: got %q", got.SHA)
+	}
+	if got.Ref != "feat/thing" {
+		t.Errorf("ref = %q, want the branch so the consumer can act without a lookup", got.Ref)
+	}
+}
+
+// The ingest sweep is idempotent and re-runs constantly, so re-announcing the
+// same admitted verdict must not enqueue a second event.
+func TestReviewCompletionCallbackIsDedupedAcrossReIngest(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("HERD_ROOT", root)
+	sha := strings.Repeat("b", 40)
+
+	for i := 0; i < 3; i++ {
+		postReviewCompleteCallback(sha, "feat/thing", "pool-03", "PASS")
+	}
+	cbs, err := mail.NewMailbox(mail.CallbackMailPath(root)).DrainCallbacks()
+	if err != nil {
+		t.Fatalf("drain: %v", err)
+	}
+	if len(cbs) != 1 {
+		t.Fatalf("three re-ingests of one verdict must yield ONE event, got %d", len(cbs))
+	}
+}
+
+// A verdict with no SHA is not an announceable event, and must not post a
+// callback naming nothing.
+func TestReviewCompletionCallbackRefusesAnEmptySHA(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("HERD_ROOT", root)
+	postReviewCompleteCallback("   ", "feat/thing", "pool-03", "PASS")
+	cbs, _ := mail.NewMailbox(mail.CallbackMailPath(root)).DrainCallbacks()
+	if len(cbs) != 0 {
+		t.Fatalf("an empty SHA must not announce anything, got %d", len(cbs))
 	}
 }

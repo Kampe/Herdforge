@@ -13,6 +13,7 @@ import (
 	"strings"
 
 	"github.com/Kampe/Herdforge/pkg/harvestmerge"
+	"github.com/Kampe/Herdforge/pkg/mail"
 	"github.com/Kampe/Herdforge/pkg/mergeadmit"
 	"github.com/Kampe/Herdforge/pkg/reviewingest"
 	"github.com/Kampe/Herdforge/pkg/reviewledger"
@@ -290,6 +291,7 @@ func runReviewIngest() {
 			o.Disposition, o.Enqueued = dispositionAdmitted, boolPtr(enqueued)
 			emit.record(o, fmt.Sprintf("ADMITTED %s verdict=%s reviewer=%s sha=%s enqueued=%v\n",
 				filepath.Base(f), a.Verdict, a.Reviewer, a.SHA[:12], enqueued), false)
+			postReviewCompleteCallback(a.SHA, a.Branch, a.Reviewer, a.Verdict)
 		}
 		admitted++
 	}
@@ -633,6 +635,59 @@ func honestlyUnrecordedFamily(raw string) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+// postReviewCompleteCallback announces that a verdict is now ADMITTED, so the
+// next stage runs on an event instead of a poll.
+//
+// FAC-651: the callback bus already existed -- mail.Callback, CallbackComplete,
+// PostCallback with effect-level dedupe, and pulse's ConsumeCallback/ack loop --
+// and `herd shot` used all of it. The review path used none of it, so every
+// stage after a verdict was discovered by someone polling: the supervisor slept,
+// woke, harvested, swept, and only then noticed a candidate had become
+// mergeable. A verdict admitted at 21:04 could sit until the next beat for no
+// reason other than that nothing said it had happened.
+//
+// Admission is the right event to announce, not reviewer exit. A reviewer that
+// has written its artifact has not necessarily produced an admissible verdict --
+// it may be refused for an empty diff, an unprovable family, or a missing
+// digest. Admission is the first moment the fact is durable and authoritative,
+// and it is where merge eligibility actually changes.
+//
+// Best-effort by construction: the ledger write already succeeded and IS the
+// durable record. A failed announcement must never turn an admitted verdict into
+// a refusal, so this reports to stderr and returns. Losing the event costs one
+// polling interval, which is exactly the behaviour that existed before.
+//
+// DedupeID is sha+reviewer, the same identity the ledger dedups on, so the
+// idempotent re-ingest sweep cannot post the same completion twice.
+func postReviewCompleteCallback(sha, branch, reviewer, verdict string) {
+	sha = strings.TrimSpace(sha)
+	if sha == "" {
+		return
+	}
+	ref := strings.TrimSpace(branch)
+	if ref == "" {
+		ref = sha
+	}
+	root := firstEnv("HERD_ROOT", "HERD_REPO_ROOT", ".")
+	cb := mail.Callback{
+		Ref:      ref,
+		Kind:     mail.CallbackComplete,
+		SHA:      sha,
+		Detail:   fmt.Sprintf("review verdict %s admitted by %s", strings.TrimSpace(verdict), strings.TrimSpace(reviewer)),
+		DedupeID: "review-admitted:" + sha + ":" + strings.ToLower(strings.TrimSpace(reviewer)),
+	}
+	if _, err := mail.NewMailbox(mail.CallbackMailPath(root)).PostCallback("review-ingest", cb); err != nil {
+		fmt.Fprintf(os.Stderr, "review-ingest: verdict for %s was ADMITTED but its completion callback could not be posted (%v); the next stage will fall back to polling\n", sha[:minInt(12, len(sha))], err)
+	}
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 func ingestDisposition(enqueued bool, verdict string) string {
