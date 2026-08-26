@@ -137,8 +137,28 @@ type Receipt struct {
 	// is on branch Y, is traceable provenance. It is not the domain inference a
 	// reviewer correctly refused ("apps/api is nominally api-crusader's") -- it is
 	// the launch record for the branch the commit actually sits on.
-	Branch          string `json:"branch,omitempty"`
-	Worktree        string `json:"worktree,omitempty"`
+	Branch   string `json:"branch,omitempty"`
+	Worktree string `json:"worktree,omitempty"`
+	// PullRequest is the PR this launch's work is proposed through, and
+	// CandidateSHA the exact commit it produced.
+	//
+	// FAC-673: FAC-637 tied a launch to its BRANCH, which made provenance
+	// traceable. It did not tie a launch to the thing whose CLOSURE should
+	// retire it. Worktree creation is automatic and retirement is not, so 403
+	// registrations accumulated with 73 of them holding work that had already
+	// landed -- the leak FAC-672 can now sweep but cannot PREVENT, because a
+	// sweep has to be run while a lifecycle just happens.
+	//
+	// With the PR recorded, "this PR merged or closed" becomes a fact the
+	// control plane can act on: verify the patch actually landed, then retire
+	// the worktree and branch as one transaction. Without it, retirement can
+	// only ever be a periodic guess at which surfaces are spent.
+	//
+	// Both are optional. A launch that has not produced a candidate yet, or work
+	// that will never become a PR, records what it knows and nothing more --
+	// an empty field is honest, a fabricated one is not.
+	PullRequest     string `json:"pull_request,omitempty"`
+	CandidateSHA    string `json:"candidate_sha,omitempty"`
 	Lane            string `json:"lane,omitempty"`
 	Generation      int64  `json:"generation,omitempty"`
 	TabID           string `json:"tab_id,omitempty"`

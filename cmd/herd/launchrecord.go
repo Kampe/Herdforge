@@ -39,6 +39,12 @@ func runLaunchRecord() error {
 	taskRef := fs.String("task-ref", "", "optional card ref")
 	role := fs.String("role", "worker", "lane role")
 	shape := fs.String("task-shape", "implementation", "task shape")
+	// FAC-673: the PR is what CLOSES, and closure is the event that should retire
+	// a worktree. Recording it turns retirement from a periodic sweep into a
+	// lifecycle transition. Optional: a launch with no PR yet records what it
+	// knows, because an empty field is honest and a fabricated one is not.
+	pr := fs.String("pr", "", "pull request this launch's work is proposed through (optional)")
+	candidate := fs.String("candidate-sha", "", "exact candidate commit this launch produced (optional)")
 	if err := fs.Parse(os.Args[2:]); err != nil {
 		return err
 	}
@@ -62,17 +68,19 @@ func runLaunchRecord() error {
 
 	sink := launch.DefaultSink()
 	if err := sink.Write(launch.Receipt{
-		CreatedAt: time.Now().UTC(),
-		TaskRef:   strings.TrimSpace(*taskRef),
-		Lane:      strings.TrimSpace(*lane),
-		Name:      strings.TrimSpace(*lane),
-		Role:      strings.TrimSpace(*role),
-		TaskShape: strings.TrimSpace(*shape),
-		Provider:  strings.TrimSpace(*provider),
-		Model:     strings.TrimSpace(*model),
-		CWD:       strings.TrimSpace(*cwd),
-		Branch:    branch,
-		Accepted:  true,
+		CreatedAt:    time.Now().UTC(),
+		TaskRef:      strings.TrimSpace(*taskRef),
+		Lane:         strings.TrimSpace(*lane),
+		Name:         strings.TrimSpace(*lane),
+		Role:         strings.TrimSpace(*role),
+		TaskShape:    strings.TrimSpace(*shape),
+		Provider:     strings.TrimSpace(*provider),
+		Model:        strings.TrimSpace(*model),
+		CWD:          strings.TrimSpace(*cwd),
+		Branch:       branch,
+		PullRequest:  strings.TrimSpace(*pr),
+		CandidateSHA: strings.TrimSpace(*candidate),
+		Accepted:     true,
 	}); err != nil {
 		return fmt.Errorf("write launch receipt: %w", err)
 	}
