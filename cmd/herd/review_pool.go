@@ -847,7 +847,15 @@ func resolvePoolReviewer(provider, model, excludeFamily string) (poolReviewer, e
 	}
 	engine := usage.NewQuotaEngine()
 	computed := map[string]usage.BurnState{}
-	if snap, err := usage.FetchSnapshot(); err == nil {
+	// FAC-679: reuse a RECENT quota reading rather than refetching every provider
+	// on every launch. Measured: this fetch was 29-272s while the rest of the
+	// launch was 1.4s. The reading's age is reported rather than hidden, because
+	// routing on quota that is silently minutes old can spend a request against a
+	// surface that has since gone to zero.
+	if snap, age, err := usage.FetchSnapshotCached(); err == nil {
+		if age > 0 {
+			fmt.Printf("using quota reading from %s ago\n", age.Round(time.Second))
+		}
 		computed = engine.ComputeAll(snap)
 	} else {
 		// Fail loud but keep routing on availability: a quota outage must not
