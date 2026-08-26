@@ -220,6 +220,20 @@ func (l *Ledger) CompleteLaunchProvenance(opts RecordOpts) error {
 	opts.BuilderFamily = prior.BuilderFamily
 	opts.BuilderIdentity = prior.BuilderIdentity
 	opts.ReviewerFamily = prior.ReviewerFamily
+	// FAC-667: the gate must stay consistent with the family it carries.
+	//
+	// Validation accepts the `unrecorded` family ONLY under the
+	// provenance-unrecorded gate -- that pairing is what marks a row as unable
+	// to support a cross-family independence claim (FAC-627). A completion that
+	// inherited `unrecorded` while relabelling the gate was rejected, so on the
+	// ordinary launch path the lease and patch bindings still could not be
+	// written.
+	//
+	// Preserving the gate keeps the safety marking exactly as it was: completion
+	// adds the bindings and changes nothing about what the row CLAIMS.
+	if strings.EqualFold(strings.TrimSpace(prior.BuilderFamily), FamilyUnrecorded) {
+		opts.Gate = GateProvenanceUnrecorded
+	}
 	if strings.TrimSpace(opts.Task) == "" {
 		opts.Task = prior.Task
 	}
