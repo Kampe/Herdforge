@@ -1351,6 +1351,11 @@ func TestReviewCLI_IsolatedDetachedReviewWorktree(t *testing.T) {
 	stubDir := stubHarnessPATH(t)
 	cmd := herdCmdWithFake(binary, dir, keyDir, fakeBin, fakeLog, "review", "--spawn", "FAC-1")
 	prependToPath(cmd, stubDir)
+	// FAC-684: the review launch path now consults live quota (it previously
+	// built its router with none, which is the production defect that let a lane
+	// launch into an exhausted pool). This test must therefore pin quota, or its
+	// verdict depends on the operator's provider balance at the moment it runs.
+	pinSubprocessQuota(t, cmd)
 	out, _ := cmd.CombinedOutput()
 	reviewDir := filepath.Join(dir, ".herd", "reviews", "fac-1-"+candidate[:12])
 	if fi, err := os.Stat(reviewDir); err != nil || !fi.IsDir() {
@@ -2385,4 +2390,25 @@ func TestReviewCLI_CandidateIndexMergedDiscovery(t *testing.T) {
 	if got := atomic.LoadInt32(&fk.patches); got != 0 {
 		t.Fatalf("read-only listing must not mutate provider, saw %d patches", got)
 	}
+}
+
+// pinSubprocessQuota makes a herd subprocess see a fixed, healthy quota
+// snapshot instead of the machine's live provider balances.
+func pinSubprocessQuota(t *testing.T, cmd *exec.Cmd) {
+	t.Helper()
+	dir := t.TempDir()
+	stub := filepath.Join(dir, "openusage")
+	body := `{"generatedAt":"2026-08-26T00:00:00.000Z","schema":"openusage.limits.v1","providers":{` +
+		`"claude":{"displayName":"claude","stale":false,"resources":{"weekly":{"kind":"consumption","limit":100,"remaining":90,"resetsAt":"2099-01-01T00:00:00Z","unit":"percent","used":10,"utilization":0.1,"windowSeconds":604800}}},` +
+		`"codex":{"displayName":"codex","stale":false,"resources":{"weekly":{"kind":"consumption","limit":100,"remaining":90,"resetsAt":"2099-01-01T00:00:00Z","unit":"percent","used":10,"utilization":0.1,"windowSeconds":604800}}},` +
+		`"grok":{"displayName":"grok","stale":false,"resources":{"weekly":{"kind":"consumption","limit":100,"remaining":90,"resetsAt":"2099-01-01T00:00:00Z","unit":"percent","used":10,"utilization":0.1,"windowSeconds":604800}}}}}`
+	if err := os.WriteFile(stub, []byte("#!/bin/sh\ncat <<'JSON'\n"+body+"\nJSON\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cmd.Env = append(cmd.Env,
+		"HERD_OPENUSAGE_BIN="+stub,
+		// The snapshot cache is persisted per-user, so without its own path the
+		// subprocess reads the operator's real cached numbers regardless.
+		"HERD_QUOTA_CACHE_PATH="+filepath.Join(dir, "quota.json"),
+	)
 }

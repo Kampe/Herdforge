@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -153,6 +154,7 @@ func TestCustomStandingRoleRoutesThroughNativeWorkerAuthority(t *testing.T) {
 	}
 	t.Setenv("PATH", dir)
 	t.Setenv("HERDR_ROUTE_STATE_DIR", t.TempDir())
+	pinHealthyQuota(t, dir, "codex")
 	lane := &config.LaneDef{
 		Name: "docs-custodian", Role: "docs-custodian", Standing: true,
 		StandingRolePolicy: &config.StandingRolePolicy{NativeRole: launch.WorkerRole},
@@ -497,6 +499,7 @@ func TestLaneLaunchDecisionBindsConfiguredCodexHarnessWithoutPi(t *testing.T) {
 	}
 	t.Setenv("PATH", dir)
 	t.Setenv("HERDR_ROUTE_STATE_DIR", t.TempDir())
+	pinHealthyQuota(t, dir, "codex")
 	lane := &config.LaneDef{Name: "smith", Role: launch.WorkerRole, AgentKind: "codex", Harness: "codex", Provider: launch.WorkerProvider, Model: launch.WorkerModel, Effort: launch.WorkerEffort, TaskShape: launch.Implementation}
 
 	decision, err := laneLaunchDecisionWithProbe(context.Background(), lane, nil, func(_ context.Context, _, model, _ string) herdr.ProbeResult {
@@ -585,6 +588,7 @@ func TestLaneLaunchDecisionSucceedsWithHarnessBinary(t *testing.T) {
 	}
 	t.Setenv("PATH", dir)
 	t.Setenv("HERDR_ROUTE_STATE_DIR", t.TempDir())
+	pinHealthyQuota(t, dir, "codex")
 	lane := &config.LaneDef{
 		Name: "smith", Role: launch.WorkerRole, AgentKind: "codex", Harness: "codex",
 		Provider: launch.WorkerProvider, Model: launch.WorkerModel, Effort: launch.WorkerEffort, TaskShape: launch.Implementation,
@@ -615,6 +619,7 @@ func TestReviewerLaunchDecisionBindsReroutedVendorHarness(t *testing.T) {
 	t.Setenv("HERD_USE_PI", "0")
 	routeDir := t.TempDir()
 	t.Setenv("HERDR_ROUTE_STATE_DIR", routeDir)
+	pinHealthyQuota(t, dir, "claude", "grok")
 	if err := os.WriteFile(filepath.Join(routeDir, "claude.cooldown.json"), []byte(`{"expiresAt":4102444800,"provider":"claude","reason":"exhausted"}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -635,10 +640,22 @@ func TestReviewerLaunchDecisionBindsReroutedVendorHarness(t *testing.T) {
 
 func TestStandingGrokLaneCannotRerouteToClaude(t *testing.T) {
 	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "grok"), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
-		t.Fatal(err)
+	// BOTH harnesses must be present. With only grok on PATH the waterfall had
+	// nothing else to pick, so this test passed even with the standing family
+	// boundary disabled outright -- it asserted a property it never exercised.
+	// claude is here so a released boundary is actually reachable and fails.
+	for _, harness := range []string{"grok", "claude"} {
+		if err := os.WriteFile(filepath.Join(dir, harness), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
 	}
+	// FAC-684: this test read the MACHINE's live cooldowns and live quota, so
+	// it passed or failed by time of day -- it failed on a day grok was
+	// genuinely exhausted, reporting a routing regression that did not exist
+	// while hiding whether the boundary logic still held. Pin both.
 	t.Setenv("PATH", dir)
+	t.Setenv("HERDR_ROUTE_STATE_DIR", t.TempDir())
+	pinHealthyQuota(t, dir, "grok", "claude")
 	t.Setenv("HERD_MODE", "local")
 	t.Setenv("HERD_USE_PI", "0")
 	lane := &config.LaneDef{
@@ -729,4 +746,96 @@ func TestReviewLedgerPathResolvesProjectRootNotCwd(t *testing.T) {
 	if !filepath.IsAbs(got) {
 		t.Errorf("expected a root-anchored path so every ledger consumer agrees, got %q", got)
 	}
+}
+
+// FAC-684 end-to-end: the exact live report -- "standing launch admitted a spent
+// Grok preference and started forge-herd-smith into 0% weekly quota even though
+// dry-run said Claude/default was available. After cooling Grok, standing
+// refused no healthy candidate."
+//
+// Standing admission ADMITS a spent preference (FAC-642) on the stated grounds
+// that the router will reroute. This proves the router actually does.
+func TestStandingLaneWithSpentPreferenceReroutesInsteadOfLaunchingIntoZero(t *testing.T) {
+	dir := t.TempDir()
+	for _, harness := range []string{"grok", "claude"} {
+		if err := os.WriteFile(filepath.Join(dir, harness), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	pinQuota(t, dir, map[string]float64{"grok": 100, "claude": 10})
+	t.Setenv("HERDR_ROUTE_STATE_DIR", t.TempDir())
+	t.Setenv("HERD_MODE", "local")
+	t.Setenv("HERD_USE_PI", "0")
+	t.Setenv("HERD_ERA_PROVIDERS", "claude grok")
+
+	lane := &config.LaneDef{
+		Name: "scout-planner", Role: launch.ScoutPlannerRole, AgentKind: "grok", Harness: "grok",
+		Provider: "grok", Model: "grok-4.6", Effort: "medium", TaskShape: "architecture", Standing: true,
+	}
+	d, err := laneLaunchDecisionWithProbe(context.Background(), lane, nil, func(_ context.Context, _, model, _ string) herdr.ProbeResult {
+		return herdr.ProbeResult{Model: model, Available: true}
+	})
+	if err != nil {
+		t.Fatalf("standing lane refused rather than rerouted off its spent preference: %v", err)
+	}
+	if d.Provider == "grok" {
+		t.Fatalf("standing lane launched into its EXHAUSTED preferred provider: %+v", d)
+	}
+}
+
+// pinHealthyQuota makes a lane-launch test independent of the MACHINE's live
+// provider quota.
+//
+// FAC-684: laneLaunchDecisionWithProbe used to build its router with no quota
+// data at all, so these tests could not see quota even in principle. Fixing that
+// blindness -- the actual production defect -- exposed that they had never
+// controlled it: they began failing on a day grok and codex were genuinely
+// exhausted, reporting a routing regression that did not exist. A test whose
+// verdict depends on the time of day is not evidence either way.
+func pinHealthyQuota(t *testing.T, dir string, providers ...string) {
+	t.Helper()
+	used := map[string]float64{}
+	for _, name := range providers {
+		used[name] = 10
+	}
+	pinQuota(t, dir, used)
+}
+
+// pinQuota pins each named provider's weekly window to an exact used percent.
+func pinQuota(t *testing.T, dir string, used map[string]float64) {
+	t.Helper()
+	res := func(used float64) map[string]any {
+		return map[string]any{"kind": "consumption", "limit": 100, "remaining": 100 - used,
+			"resetsAt": "2099-01-01T00:00:00Z", "unit": "percent", "used": used,
+			"utilization": used / 100, "windowSeconds": 604800}
+	}
+	entries := map[string]any{}
+	for name, pct := range used {
+		entries[name] = map[string]any{"displayName": name, "stale": false,
+			"resources": map[string]any{"weekly": res(pct)}}
+	}
+	body, err := json.Marshal(map[string]any{
+		"generatedAt": "2026-08-26T00:00:00.000Z", "schema": "openusage.limits.v1",
+		"providers": entries,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stub := filepath.Join(dir, "openusage")
+	if err := os.WriteFile(stub, []byte("#!/bin/sh\ncat <<'JSON'\n"+string(body)+"\nJSON\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HERD_OPENUSAGE_BIN", stub)
+	// The snapshot cache is per-USER and persisted to disk (FAC-679), so a stub
+	// binary alone does not isolate anything: the real machine's cached quota
+	// is served before the stub is ever run. Point the cache somewhere empty.
+	t.Setenv("HERD_QUOTA_CACHE_PATH", filepath.Join(t.TempDir(), "quota.json"))
+	// The cache is also in-memory and PROCESS-wide, so whichever test ran first
+	// pins the real machine's quota for every test after it. Drop it on entry
+	// and on exit, or this helper isolates nothing after the first call.
+	usage.InvalidateSnapshotCache()
+	t.Cleanup(usage.InvalidateSnapshotCache)
+	// The reroute target must not additionally trip the real machine's claude
+	// hook-policy pin, which is not what these tests are about.
+	t.Setenv("HOME", t.TempDir())
 }

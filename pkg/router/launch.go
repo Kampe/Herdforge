@@ -797,7 +797,32 @@ func (r *SurfaceRouter) Decide(req LaunchRequest) (*LaunchDecision, error) {
 	}
 	requestedProvider := req.RequestedProvider
 	if req.Standing && strings.TrimSpace(req.PreferredProvider) != "" {
-		requestedProvider = req.PreferredProvider
+		// A standing lane's preference is normally a hard provider-family
+		// boundary: it may fall back within its provider, never into the global
+		// waterfall.
+		//
+		// FAC-684: that boundary outlived its own justification. Standing
+		// admission deliberately ADMITS a lane whose preferred pool is spent
+		// (FAC-642), printing PREFERENCE-SPENT and reasoning that "the router is
+		// explicitly free to route the lane onto a different healthy surface".
+		// For standing lanes that was simply false -- this promotion made the
+		// preference hard again, so the lane launched into a pool at 0% weekly
+		// while another surface was healthy (forge-herd-smith, observed live).
+		// Cooling the spent provider by hand did not recover it either: with the
+		// family boundary still hard, removing the only member left nothing, and
+		// standing then refused with "no healthy launch candidate" -- a lane
+		// killed by its own preference twice over.
+		//
+		// So the boundary holds only while the preferred provider can actually
+		// take work. UNKNOWN quota keeps the boundary: not knowing is not
+		// evidence of exhaustion, and widening a family boundary on ignorance
+		// would let a standing lane wander families for no proven reason.
+		// Only a provider PROVEN to have no capacity releases it.
+		if r.standingProviderSpent(req.PreferredProvider, req.PreferredModel) {
+			requestedProvider = req.RequestedProvider
+		} else {
+			requestedProvider = req.PreferredProvider
+		}
 	}
 	candidates, err := r.candidateProviders(mode, shape, requestedProvider)
 	if err != nil {
@@ -1192,4 +1217,62 @@ func (r *SurfaceRouter) candidateProviders(mode posture.Mode, shape, requestedPr
 		return nil, fmt.Errorf("herd-route: claude-only posture leaves NO candidate for shape %q", shape)
 	}
 	return candidates, nil
+}
+
+// standingProviderSpent reports whether a standing lane's preferred provider is
+// PROVEN to have no capacity: its own pool is unavailable or at the weekly cap,
+// and no other pool on that provider can take the lane either.
+//
+// Returns false when quota is unknown. That is deliberate and it is the whole
+// safety property: an unmeasured pool is not an exhausted one, and treating
+// absence as a definitive negative here would silently dissolve every standing
+// lane's family boundary the first time a snapshot failed to load.
+func (r *SurfaceRouter) standingProviderSpent(provider, model string) bool {
+	provider = strings.TrimSpace(provider)
+	if provider == "" {
+		return false
+	}
+	spent := func(pool string) (bad, known bool) {
+		st, ok := r.quotaState(provider, pool)
+		if !ok {
+			return false, false
+		}
+		if weeklyAtOrOverCap(st) {
+			return true, true
+		}
+		return !st.Available && st.Reason != "no-quota-data", true
+	}
+
+	bad, known := spent(QuotaPoolFor(provider, model))
+	if !known || !bad {
+		// Unknown, or the configured pool is fine: the boundary stands.
+		return false
+	}
+	// The configured pool is spent. A sibling pool on the SAME provider is a
+	// within-family fallback, which the standing boundary already permits, so
+	// the boundary only releases when the provider as a whole is spent.
+	for _, altPool := range providerPools(provider) {
+		if altPool == QuotaPoolFor(provider, model) {
+			continue
+		}
+		if bad, known := spent(altPool); known && !bad {
+			return false
+		}
+	}
+	return true
+}
+
+// providerPools lists the quota pools a provider meters independently, mirroring
+// QuotaPoolFor. Keep the two in step: a pool missing here is a within-family
+// fallback the boundary will not see.
+func providerPools(provider string) []string {
+	switch provider {
+	case "claude":
+		return []string{"default", "fable"}
+	case "agy":
+		return []string{"gemini", "nonGemini"}
+	case "codex":
+		return []string{"default", "spark"}
+	}
+	return []string{"default"}
 }

@@ -388,6 +388,12 @@ func main() {
 	case "harvest":
 		runHarvest()
 
+	case "capacity":
+		if err := runCapacity(os.Args[2:]); err != nil {
+			fmt.Fprintf(os.Stderr, "herd capacity: %v\n", err)
+			os.Exit(1)
+		}
+
 	case "worktree-reap":
 		if err := runWorktreeReap(os.Args[2:]); err != nil {
 			fmt.Fprintf(os.Stderr, "herd worktree-reap: %v\n", err)
@@ -6416,7 +6422,25 @@ func laneLaunchDecisionWithProbe(ctx context.Context, lane *config.LaneDef, task
 		// Herdr owns the real launch and reports startup failure directly.
 		request.ProbeResults = map[string]bool{router.ProbeKey(provider, model): true}
 	}
-	r := router.NewRouter(nil, nil)
+	// FAC-684: this was NewRouter(nil, nil) -- a router with no quota data at
+	// all. Every quota gate inside Decide is keyed on quotaState, which returns
+	// "not known" for every surface when Computed is nil, so the lane launch
+	// path was structurally blind to exhaustion. That is why a standing lane
+	// started forge-herd-smith into a pool at 0% weekly while `herd route`
+	// (which DOES load quota) reported another surface healthy: the dry run and
+	// the launch were not consulting the same facts.
+	//
+	// Quota is read best-effort. An unavailable snapshot warns and routes on
+	// availability alone, exactly as liveScorer does -- degraded routing beats
+	// refusing every launch because openusage is down.
+	engine := usage.NewQuotaEngine()
+	computed := map[string]usage.BurnState{}
+	if snap, _, err := usage.FetchSnapshotCached(); err == nil && snap != nil {
+		computed = engine.ComputeAll(snap)
+	} else if err != nil {
+		fmt.Fprintf(os.Stderr, "herd: WARN lane %q live quota unavailable (%v); routing on availability only\n", lane.Name, err)
+	}
+	r := router.NewRouter(engine, computed)
 	// The lane's configured harness was LookPath-checked above. Do not let the
 	// router's legacy Pi availability probe veto this direct vendor launch.
 	r.Probes = &router.Probes{CLIPresent: func(string) bool { return true }, Now: time.Now}
