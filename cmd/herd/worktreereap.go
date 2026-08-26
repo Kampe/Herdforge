@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"github.com/Kampe/Herdforge/pkg/config"
 	"github.com/Kampe/Herdforge/pkg/launch"
 	"os"
 	"os/exec"
@@ -142,6 +143,19 @@ func runWorktreeReap(args []string) error {
 	for _, c := range classes {
 		fmt.Printf("  %-18s: %d\n", c, byClass[c])
 	}
+	// FAC-676: name lanes taking surfaces faster than they finish them. This is
+	// the accumulation MECHANISM, distinct from the retirement leak above.
+	if lanes := configuredLaneNames(root); len(lanes) > 0 {
+		if over := laneAllocations(entries, lanes); len(over) > 0 {
+			fmt.Printf("\nlanes holding more than one task worktree (contract is one + resident home): %d\n", len(over))
+			for _, a := range over[:minInt(6, len(over))] {
+				fmt.Printf("  %-26s %d task worktrees (+%d over)\n", a.Lane, len(a.TaskPaths), a.Excess)
+			}
+			fmt.Println("  these are REPORTED, never reaped: the extras may hold real unmerged work.")
+			fmt.Println("  merge or close them; that is a decision about work, not about capacity.")
+		}
+	}
+
 	if !*apply {
 		fmt.Println("DRY RUN: pass --apply to retire the landed worktrees")
 		for _, l := range landed[:minInt(5, len(landed))] {
@@ -252,6 +266,23 @@ func patchIsInBase(root, branch, base string) bool {
 		}
 	}
 	return true
+}
+
+// configuredLaneNames reads the lane roster this repository declares, so lane
+// attribution comes from configuration rather than a hardcoded list that would
+// go stale the moment a lane is added.
+func configuredLaneNames(root string) []string {
+	cfg, err := config.LoadConfig(filepath.Join(root, ".herd", "herd.yaml"))
+	if err != nil || cfg == nil {
+		return nil
+	}
+	out := make([]string, 0, len(cfg.Lanes))
+	for _, l := range cfg.Lanes {
+		if n := strings.TrimSpace(l.Name); n != "" {
+			out = append(out, n)
+		}
+	}
+	return out
 }
 
 type worktreeEntry struct {

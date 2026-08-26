@@ -106,3 +106,59 @@ func TestPRClosureCheckIsSilentWithoutARecordedPR(t *testing.T) {
 		t.Errorf("absence of a PR is not a decline reason, got %q", why)
 	}
 }
+
+// FAC-676: the contract is one standing lane = one mutable task worktree plus
+// its resident home. Nothing enforced or even measured it, so lanes accumulated
+// surfaces silently: 10 lanes over-allocated on the live repository, with
+// perf-cost-guard holding 15. That is the accumulation MECHANISM, distinct from
+// the retirement leak -- fixing only retirement means sweeping forever.
+func TestLaneAllocationNamesOverAllocatedLanes(t *testing.T) {
+	lanes := []string{"docs-custodian", "qa-sentinel"}
+	entries := []worktreeEntry{
+		{Path: "/x/wt/docs-custodian", Branch: "standing/docs-custodian"}, // home: entitled
+		{Path: "/x/a", Branch: "harvest/docs-custodian-1"},
+		{Path: "/x/b", Branch: "harvest/docs-custodian-2"},
+		{Path: "/x/c", Branch: "fix/qa-sentinel-only-one"},
+	}
+	got := laneAllocations(entries, lanes)
+	if len(got) != 1 {
+		t.Fatalf("only the over-allocated lane must be reported, got %+v", got)
+	}
+	if got[0].Lane != "docs-custodian" {
+		t.Errorf("wrong lane: %q", got[0].Lane)
+	}
+	// The home is entitled and must NOT count, or every healthy lane reads as
+	// over-allocated by one.
+	if len(got[0].TaskPaths) != 2 || got[0].Excess != 1 {
+		t.Errorf("home must be excluded from the task count: %+v", got[0])
+	}
+	if got[0].Home == "" {
+		t.Error("the home should still be identified, just not counted")
+	}
+}
+
+// A lane at exactly one task worktree is meeting the contract, not violating it.
+func TestLaneAtTheContractIsNotReported(t *testing.T) {
+	got := laneAllocations([]worktreeEntry{
+		{Path: "/x/home", Branch: "standing/qa-sentinel"},
+		{Path: "/x/one", Branch: "fix/qa-sentinel-task"},
+	}, []string{"qa-sentinel"})
+	if len(got) != 0 {
+		t.Fatalf("one task worktree plus a home is the contract: %+v", got)
+	}
+}
+
+// A lane whose name prefixes another must not claim the other's surfaces --
+// the same boundary rule agent identity needed in FAC-660.
+func TestLaneAttributionPrefersTheLongestLaneName(t *testing.T) {
+	lanes := []string{"review", "review-harvest"}
+	if got := laneOwning("fix/review-harvest-thing", "/x/p", lanes); got != "review-harvest" {
+		t.Errorf("longest lane must win, got %q", got)
+	}
+	if got := laneOwning("fix/review-thing", "/x/p", lanes); got != "review" {
+		t.Errorf("short lane must still match its own, got %q", got)
+	}
+	if got := laneOwning("fix/unrelated", "/x/p", lanes); got != "" {
+		t.Errorf("an unowned surface must be claimed by nobody, got %q", got)
+	}
+}
