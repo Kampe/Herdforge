@@ -74,7 +74,22 @@ func StandingIDs() []string {
 					ids = append(ids, ForgePrefix+l.ID)
 				}
 			}
-			return sortedUnique(ids)
+			// FAC-660: a registry that lists lanes but marks NONE of them
+			// standing has not told us the roster is empty -- it has told us it
+			// does not carry standing flags. Returning here treated the second
+			// as the first.
+			//
+			// Measured live: docs/agent/lane-registry.json holds 14 lanes with 0
+			// standing, while .herd/herd.yaml beside it marks 14 standing. The
+			// early return meant the config was never read, so the roster came
+			// back empty, attention scanned nothing and reported UNKNOWN with a
+			// full fleet running, and the reaper saw no lanes to protect.
+			//
+			// A registry that DOES mark standing lanes is still authoritative and
+			// still returns here; only the zero case falls through to the config.
+			if len(ids) > 0 {
+				return sortedUnique(ids)
+			}
 		}
 	}
 	if cfg, err := config.LoadConfig(config.DefaultConfigPath); err == nil {

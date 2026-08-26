@@ -402,3 +402,30 @@ func TestUrgencyRank_Ordered(t *testing.T) {
 		t.Fatal("low must outrank none")
 	}
 }
+
+// FAC-660: the roster and the fleet never spell a lane the same way, so exact
+// equality found no standing lane at all. attention reported state=UNKNOWN with
+// a full fleet running, while pulse counted the same agents and reported nine
+// busy. Two numbers describing one fleet at one instant is the tell.
+func TestFindAttentionAgentResolvesTheLiveSpellingOfALane(t *testing.T) {
+	agents := []kick.AgentEntry{
+		{Name: "forge-herd-smith-2918de97b5"},
+		{Name: "review-cha-2796-abc"},
+	}
+	got, ok := findAttentionAgent(agents, "forge-herd-smith")
+	if !ok {
+		t.Fatal("a running standing lane must be found under its repository-qualified name")
+	}
+	if got.Name != "forge-herd-smith-2918de97b5" {
+		t.Errorf("resolved the wrong agent: %q", got.Name)
+	}
+}
+
+// A roster entry with no live agent must still report absent, or attention would
+// claim coverage it does not have.
+func TestFindAttentionAgentStillReportsAGenuinelyAbsentLane(t *testing.T) {
+	agents := []kick.AgentEntry{{Name: "review-cha-2796-abc"}}
+	if _, ok := findAttentionAgent(agents, "forge-herd-smith"); ok {
+		t.Fatal("a lane with no live agent must report absent")
+	}
+}
