@@ -4,9 +4,9 @@
   "generated_by": "scripts/packageinventory/inventory.go",
   "class_counts": {
     "internal": 1,
-    "production": 98,
+    "production": 99,
     "secondary": 1,
-    "unwired": 24
+    "unwired": 26
   },
   "packages": [
     {
@@ -67,6 +67,12 @@
       "path": "github.com/Kampe/Herdforge/pkg/broadcast",
       "class": "production",
       "test_importers": 1,
+      "has_own_tests": true
+    },
+    {
+      "path": "github.com/Kampe/Herdforge/pkg/broker",
+      "class": "unwired",
+      "test_importers": 0,
       "has_own_tests": true
     },
     {
@@ -228,6 +234,12 @@
     {
       "path": "github.com/Kampe/Herdforge/pkg/freshbuild",
       "class": "production",
+      "test_importers": 0,
+      "has_own_tests": true
+    },
+    {
+      "path": "github.com/Kampe/Herdforge/pkg/freshness",
+      "class": "unwired",
       "test_importers": 0,
       "has_own_tests": true
     },
@@ -427,6 +439,12 @@
       "path": "github.com/Kampe/Herdforge/pkg/procsignal",
       "class": "production",
       "test_importers": 1,
+      "has_own_tests": true
+    },
+    {
+      "path": "github.com/Kampe/Herdforge/pkg/progress",
+      "class": "production",
+      "test_importers": 0,
       "has_own_tests": true
     },
     {
