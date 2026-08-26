@@ -754,3 +754,33 @@ func TestLookupAgentDoesNotClaimAnUnrelatedLane(t *testing.T) {
 		t.Fatal("an absent lane was satisfied by an unrelated agent")
 	}
 }
+
+// FAC-696: a paused goal-driven lane cannot consume a plain prompt. Every
+// standing lane on the live fleet sat at "Goal paused (/goal resume)", so kick
+// sent a normal message, the agent ignored it, and kick reported
+// "FAIL unconsumed prompt" -- correct, and useless.
+func TestPausedGoalIsDetectedFromPaneText(t *testing.T) {
+	for _, marker := range []string{
+		"gpt-5.6-luna high · ~/Personal/scout-planner   Goal paused (/goal resume)",
+		"Goal stalled (/goal resume)",
+		"Goal achieved",
+		"Goal blocked",
+	} {
+		if !containsPausedGoalMarker(marker) {
+			t.Fatalf("terminal goal state not detected in %q; kick would send a prompt the lane cannot consume", marker)
+		}
+	}
+}
+
+func TestHealthyPaneIsNotTreatedAsPaused(t *testing.T) {
+	// Sending a resume verb into a working lane is its own failure.
+	for _, text := range []string{
+		"• Ran 5 commands · ctrl + t to view transcript",
+		"› Ask Codex to do anything",
+		"",
+	} {
+		if containsPausedGoalMarker(text) {
+			t.Fatalf("healthy pane text was read as a paused goal: %q", text)
+		}
+	}
+}

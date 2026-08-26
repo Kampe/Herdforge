@@ -549,7 +549,21 @@ func Run(opts Options) (*Result, error) {
 			continue
 		}
 
-		sendOut, err := HerdSend(paneID, msg)
+		// FAC-696: a goal-driven lane that reached a terminal goal state cannot
+		// consume a plain follow-up prompt. Every standing lane on this fleet
+		// was sitting at "Goal paused (/goal resume)", so kick sent a normal
+		// message, the agent ignored it, and kick reported
+		// "FAIL unconsumed prompt" -- correctly, and uselessly. Waking the lane
+		// requires the resume verb, not more text.
+		//
+		// Unknown pane content is NOT treated as paused: a failed read sends
+		// the normal prompt, which is exactly the prior behaviour and cannot
+		// regress a healthy lane.
+		outbound := msg
+		if paneShowsPausedGoal(paneID) {
+			outbound = goalResumeVerb
+		}
+		sendOut, err := HerdSend(paneID, outbound)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "herd-kick: FAIL unconsumed prompt %s pane=%s: %s\n", id, paneID, sendOut)
 			result.Failed++
@@ -724,4 +738,35 @@ func LoadBroadcastMarkers(path string) (map[string][]broadcast.ExclusionKind, er
 		}
 	}
 	return out, nil
+}
+
+// goalResumeVerb is what a paused goal-driven lane actually accepts.
+const goalResumeVerb = "/goal resume"
+
+// paneShowsPausedGoal reports whether a pane is sitting at a terminal goal
+// state, which the harness renders with its own resume hint.
+//
+// Returns false when the pane cannot be read. An unreadable pane is unknown,
+// not paused, and guessing "paused" would send a resume verb into a healthy
+// working lane.
+func paneShowsPausedGoal(paneID string) bool {
+	if strings.TrimSpace(paneID) == "" {
+		return false
+	}
+	out, err := exec.Command("herdr", "pane", "read", paneID, "--source", "recent-unwrapped").Output()
+	if err != nil {
+		return false
+	}
+	return containsPausedGoalMarker(string(out))
+}
+
+// containsPausedGoalMarker is the pure predicate, split out so the detection
+// is testable without a live pane.
+func containsPausedGoalMarker(text string) bool {
+	for _, marker := range []string{"Goal paused", "Goal stalled", "Goal achieved", "Goal blocked", goalResumeVerb} {
+		if strings.Contains(text, marker) {
+			return true
+		}
+	}
+	return false
 }
